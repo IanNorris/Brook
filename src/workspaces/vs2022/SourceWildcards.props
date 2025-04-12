@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+	<PropertyGroup>
+		<RootWildcard>../../**/</RootWildcard>
+		
+		<BuildSourceFiles>$(RootWildcard)*.cpp;$(RootWildcard)*.c;$(RootWildcard)*.h;$(RootWildcard)*.asm</BuildSourceFiles>
+		<AuxFiles>$(RootWildcard)*.ld;$(RootWildcard)*.txt</AuxFiles>
+		<ScriptFiles>$(RootWildcard)*.py;$(RootWildcard)*.sh</ScriptFiles>
+		
+		<SourceWildcards>$(BuildSourceFiles);$(AuxFiles);$(ScriptFiles)</SourceWildcards>
+	</PropertyGroup>
+</Project>
