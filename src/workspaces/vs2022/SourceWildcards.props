@@ -4,8 +4,8 @@
 		<RootWildcard>../../**/</RootWildcard>
 		
 		<BuildSourceFiles>$(RootWildcard)*.cpp;$(RootWildcard)*.c;$(RootWildcard)*.h;$(RootWildcard)*.asm</BuildSourceFiles>
-		<AuxFiles>$(RootWildcard)*.ld;$(RootWildcard)*.txt</AuxFiles>
-		<ScriptFiles>$(RootWildcard)*.py;$(RootWildcard)*.sh</ScriptFiles>
+		<AuxFiles>$(RootWildcard)*.ld;$(RootWildcard)*.txt;$(RootWildcard)*.build</AuxFiles>
+		<ScriptFiles>$(RootWildcard)*.py</ScriptFiles>
 		
 		<SourceWildcards>$(BuildSourceFiles);$(AuxFiles);$(ScriptFiles)</SourceWildcards>
 	</PropertyGroup>
