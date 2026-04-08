@@ -17,34 +17,37 @@ fi
 mkdir -p "${ESP_DIR}"
 cp "${BOOTLOADER}" "${ESP_DIR}/BOOTX64.EFI"
 
-# Find OVMF firmware - check common locations
-OVMF_CODE=""
-OVMF_VARS=""
-OVMF_SEARCH_PATHS=(
-    # NixOS
-    "/run/current-system/sw/share/OVMF"
-    "/nix/var/nix/profiles/default/share/OVMF"
-    # Debian/Ubuntu
-    "/usr/share/OVMF"
-    "/usr/share/ovmf"
-    # Arch
-    "/usr/share/edk2-ovmf/x64"
-    "/usr/share/edk2/ovmf"
-    # Fedora
-    "/usr/share/edk2/ovmf"
-)
+# Find OVMF firmware - check env vars first (set by shell.nix), then common paths
+OVMF_CODE="${OVMF_CODE:-}"
+OVMF_VARS="${OVMF_VARS:-}"
 
-for dir in "${OVMF_SEARCH_PATHS[@]}"; do
-    if [ -f "${dir}/OVMF_CODE.fd" ]; then
-        OVMF_CODE="${dir}/OVMF_CODE.fd"
-        OVMF_VARS="${dir}/OVMF_VARS.fd"
-        break
-    elif [ -f "${dir}/OVMF.fd" ]; then
-        OVMF_CODE="${dir}/OVMF.fd"
-        OVMF_VARS="${dir}/OVMF.fd"
-        break
-    fi
-done
+if [ -z "${OVMF_CODE}" ]; then
+    OVMF_SEARCH_PATHS=(
+        # NixOS system profile
+        "/run/current-system/sw/share/OVMF"
+        "/nix/var/nix/profiles/default/share/OVMF"
+        # Debian/Ubuntu
+        "/usr/share/OVMF"
+        "/usr/share/ovmf"
+        # Arch
+        "/usr/share/edk2-ovmf/x64"
+        "/usr/share/edk2/ovmf"
+        # Fedora
+        "/usr/share/edk2/ovmf"
+    )
+
+    for dir in "${OVMF_SEARCH_PATHS[@]}"; do
+        if [ -f "${dir}/OVMF_CODE.fd" ]; then
+            OVMF_CODE="${dir}/OVMF_CODE.fd"
+            OVMF_VARS="${dir}/OVMF_VARS.fd"
+            break
+        elif [ -f "${dir}/OVMF.fd" ]; then
+            OVMF_CODE="${dir}/OVMF.fd"
+            OVMF_VARS="${dir}/OVMF.fd"
+            break
+        fi
+    done
+fi
 
 if [ -z "${OVMF_CODE}" ]; then
     echo "Error: OVMF firmware not found."
