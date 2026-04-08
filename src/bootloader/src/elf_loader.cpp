@@ -87,8 +87,8 @@ KernelEntryFn LoadKernelElf(
     UINT64 kernelSize = highestVAddr - lowestVAddr;
 
     ConsolePrint(u"Kernel size: ");
-    ConsolePrintDec(kernelSize / 1024);
-    ConsolePrintLine(u" KB");
+    ConsolePrintDec(kernelSize);
+    ConsolePrintLine(u" bytes");
 
     // Allocate physical pages for the kernel.
     // The kernel is linked with lowestVAddr == KernelPhysicalBase so virtual == physical for now.
@@ -115,7 +115,7 @@ KernelEntryFn LoadKernelElf(
         }
     }
 
-    ConsolePrint(u"Kernel physical base: 0x");
+    ConsolePrint(u"Kernel physical base: ");
     ConsolePrintHex(physBase);
     ConsolePrintLine(u"");
 
@@ -149,7 +149,7 @@ KernelEntryFn LoadKernelElf(
     // Entry point: adjust from virtual to physical
     uint64_t entryPhysical = physBase + (header->entry - lowestVAddr);
 
-    ConsolePrint(u"Kernel entry: 0x");
+    ConsolePrint(u"Kernel entry: ");
     ConsolePrintHex(entryPhysical);
     ConsolePrintLine(u"");
 

@@ -66,7 +66,7 @@ void ConsolePrintDec(UINT64 value)
 
 [[noreturn]] void Halt(EFI_STATUS status, const char16_t* message)
 {
-    ConsolePrint(u"\r\nFATAL ERROR (0x");
+    ConsolePrint(u"\r\nFATAL ERROR (");
     ConsolePrintHex((UINT64)status);
     ConsolePrint(u"): ");
     ConsolePrintLine(message);
