@@ -1,0 +1,41 @@
+# Brook OS clang-tidy configuration
+Checks: >
+  clang-diagnostic-*,
+  clang-analyzer-*,
+  bugprone-*,
+  modernize-use-nullptr,
+  modernize-use-override,
+  modernize-use-default-member-init,
+  modernize-loop-convert,
+  performance-*,
+  readability-identifier-naming,
+  readability-qualified-auto,
+  readability-redundant-member-init,
+  readability-simplify-boolean-expr,
+  -bugprone-easily-swappable-parameters,
+  -readability-magic-numbers,
+  -readability-identifier-length,
+  -clang-analyzer-security.insecureAPI*,
+
+WarningsAsErrors: >
+  clang-diagnostic-*,
+  clang-analyzer-*,
+  bugprone-*,
+
+HeaderFilterRegex: '^((?!vendor).)*$'
+
+CheckOptions:
+  - key:   readability-identifier-naming.VariableCase
+    value: camelCase
+  - key:   readability-identifier-naming.FunctionCase
+    value: CamelCase
+  - key:   readability-identifier-naming.ClassCase
+    value: CamelCase
+  - key:   readability-identifier-naming.StructCase
+    value: CamelCase
+  - key:   readability-identifier-naming.EnumCase
+    value: CamelCase
+  - key:   readability-identifier-naming.ConstantCase
+    value: UPPER_CASE
+  - key:   readability-identifier-naming.MacroDefinitionCase
+    value: UPPER_CASE

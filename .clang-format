@@ -1,0 +1,51 @@
+# Brook OS clang-format configuration
+BasedOnStyle:                      LLVM
+IndentWidth:                       4
+TabWidth:                          4
+UseTab:                            Never
+ColumnLimit:                       120
+
+# Braces
+BreakBeforeBraces:                 Allman
+BraceWrapping:
+  AfterControlStatement:           true
+  AfterFunction:                   true
+  AfterClass:                      true
+  AfterStruct:                     true
+  AfterEnum:                       true
+  AfterNamespace:                  false
+  BeforeElse:                      true
+
+# Functions
+AllowShortFunctionsOnASingleLine:  None
+AllowShortLambdasOnASingleLine:    Empty
+AlwaysBreakAfterReturnType:        None
+
+# Control flow
+AllowShortIfStatementsOnASingleLine:     Never
+AllowShortLoopsOnASingleLine:            false
+AllowShortBlocksOnASingleLine:           Empty
+
+# Spacing
+SpaceBeforeParens:                 ControlStatements
+SpacesInParentheses:               false
+SpaceAfterCStyleCast:              true
+
+# Includes
+SortIncludes:                      CaseSensitive
+IncludeBlocks:                     Regroup
+IncludeCategories:
+  - Regex:    '^<Uefi'
+    Priority: 1
+  - Regex:    '^<'
+    Priority: 2
+  - Regex:    '"'
+    Priority: 3
+
+# Alignment
+AlignConsecutiveDeclarations:      false
+AlignConsecutiveAssignments:       false
+AlignTrailingComments:             true
+
+# Pointers
+PointerAlignment:                  Right

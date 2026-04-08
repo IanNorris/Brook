@@ -1,3 +1,3 @@
-[submodule "src/vendor/uefi-headers"]
-	path = src/vendor/uefi-headers
+[submodule "vendor/uefi-headers"]
+	path = vendor/uefi-headers
 	url = https://github.com/kiznit/uefi-headers.git
