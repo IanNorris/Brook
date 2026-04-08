@@ -68,9 +68,11 @@ if [ -z "${OVMF_CODE}" ]; then
     exit 1
 fi
 
-# Copy OVMF vars to a writable location (UEFI needs writable NVRAM)
-OVMF_VARS_COPY="${BUILD_DIR}/OVMF_VARS.fd"
+# Copy OVMF vars to a writable location (UEFI needs writable NVRAM for boot entries etc.)
+# Use /tmp so we don't need write access to the build directory just to start QEMU.
+OVMF_VARS_COPY="$(mktemp /tmp/brook-OVMF_VARS-XXXXXX.fd)"
 cp "${OVMF_VARS}" "${OVMF_VARS_COPY}"
+trap 'rm -f "${OVMF_VARS_COPY}"' EXIT
 
 echo "Starting QEMU..."
 echo "  OVMF: ${OVMF_CODE}"
