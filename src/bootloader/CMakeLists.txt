@@ -12,6 +12,7 @@ set(UEFI_INCLUDE_DIRS
 
 set(SHARED_INCLUDE_DIRS
     "${BROOK_ROOT}/src/shared"
+    "${BROOK_ROOT}/src/shared/inc_km"
 )
 
 add_executable(bootloader
@@ -20,6 +21,8 @@ add_executable(bootloader
     src/graphics.cpp
     src/memory.cpp
     src/acpi.cpp
+    src/fs.cpp
+    src/elf_loader.cpp
     src/runtime.cpp
 )
 

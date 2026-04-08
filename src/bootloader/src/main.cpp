@@ -3,6 +3,8 @@
 #include "graphics.h"
 #include "memory.h"
 #include "acpi.h"
+#include "elf_loader.h"
+#include "fs.h"
 #include "boot_protocol/boot_protocol.h"
 
 extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* systemTable)
@@ -28,9 +30,24 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     }
     ConsolePrintLine(u"ACPI located");
 
+    // --- Load kernel ---
+    UINTN kernelSize = 0;
+    uint8_t* kernelData = ReadFile(imageHandle, systemTable->BootServices, u"KERNEL\\BROOK.ELF", &kernelSize);
+    if (kernelData == nullptr)
+    {
+        Halt(EFI_NOT_FOUND, u"Kernel not found at KERNEL\\BROOK.ELF");
+    }
+    ConsolePrintLine(u"Kernel file read");
+
+    KernelEntryFn kernelEntry = LoadKernelElf(systemTable->BootServices, kernelData, kernelSize);
+    ConsolePrintLine(u"Kernel loaded");
+
+    // Free the temporary ELF file buffer (segments already copied out)
+    FreePages(systemTable->BootServices, (EFI_PHYSICAL_ADDRESS)(UINTN)kernelData, kernelSize);
+
     // --- Memory map (must be last before ExitBootServices) ---
-    brook::MemoryDescriptor* memoryMap  = nullptr;
-    UINT32 memoryMapCount               = 0;
+    brook::MemoryDescriptor* memoryMap = nullptr;
+    UINT32 memoryMapCount              = 0;
     UINTN mapKey = BuildMemoryMap(systemTable->BootServices, &memoryMap, &memoryMapCount);
     ConsolePrintLine(u"Memory map built");
 
@@ -38,7 +55,6 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     EFI_STATUS status = systemTable->BootServices->ExitBootServices(imageHandle, mapKey);
     if (EFI_ERROR(status))
     {
-        // Map changed - retry once with fresh key
         mapKey = BuildMemoryMap(systemTable->BootServices, &memoryMap, &memoryMapCount);
         status = systemTable->BootServices->ExitBootServices(imageHandle, mapKey);
         if (EFI_ERROR(status))
@@ -47,25 +63,18 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
         }
     }
 
-    // After ExitBootServices, we cannot use ConOut or BootServices.
-    // Draw a pixel to the framebuffer to prove we got here.
-    if (framebuffer.physicalBase != 0)
-    {
-        UINT32* fb = reinterpret_cast<UINT32*>(framebuffer.physicalBase);
-        // Draw a 10x10 green square at (10,10)
-        for (UINT32 y = 10; y < 20; y++)
-        {
-            for (UINT32 x = 10; x < 20; x++)
-            {
-                fb[y * (framebuffer.stride / 4) + x] = 0x0000FF00u; // green
-            }
-        }
-    }
+    // Build boot protocol to hand to the kernel
+    brook::BootProtocol bootProtocol{};
+    bootProtocol.magic          = brook::BootProtocolMagic;
+    bootProtocol.version        = brook::BootProtocolVersion;
+    bootProtocol.framebuffer    = framebuffer;
+    bootProtocol.acpi           = acpi;
+    bootProtocol.memoryMap      = memoryMap;
+    bootProtocol.memoryMapCount = memoryMapCount;
 
-    // TODO: load kernel, set up page tables, jump
+    // Jump to kernel
+    kernelEntry(&bootProtocol);
 
-    for (;;)
-    {
-        __asm__ volatile("hlt");
-    }
+    // Should never reach here
+    for (;;) { __asm__ volatile("hlt"); }
 }

@@ -17,6 +17,16 @@ fi
 mkdir -p "${ESP_DIR}"
 cp "${BOOTLOADER}" "${ESP_DIR}/BOOTX64.EFI"
 
+KERNEL_ELF="${BUILD_DIR}/kernel/BROOK.elf"
+KERNEL_ESP_DIR="${BUILD_DIR}/esp/KERNEL"
+
+if [ ! -f "${KERNEL_ELF}" ]; then
+    echo "Warning: kernel not found at ${KERNEL_ELF}, running without kernel"
+else
+    mkdir -p "${KERNEL_ESP_DIR}"
+    cp "${KERNEL_ELF}" "${KERNEL_ESP_DIR}/BROOK.ELF"
+fi
+
 # Find OVMF firmware - check env vars first (set by shell.nix), then common paths
 OVMF_CODE="${OVMF_CODE:-}"
 OVMF_VARS="${OVMF_VARS:-}"
