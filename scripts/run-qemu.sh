@@ -23,7 +23,7 @@ OVMF_VARS="${OVMF_VARS:-}"
 
 if [ -z "${OVMF_CODE}" ]; then
     OVMF_SEARCH_PATHS=(
-        # NixOS system profile
+        # NixOS system profile (if OVMF added to environment.systemPackages)
         "/run/current-system/sw/share/OVMF"
         "/nix/var/nix/profiles/default/share/OVMF"
         # Debian/Ubuntu
@@ -49,11 +49,22 @@ if [ -z "${OVMF_CODE}" ]; then
     done
 fi
 
+# NixOS fallback: ask Nix where OVMF lives in the store
+if [ -z "${OVMF_CODE}" ] && command -v nix-build &>/dev/null; then
+    echo "Locating OVMF via nix-build..."
+    OVMF_STORE="$(nix-build '<nixpkgs>' -A OVMF.fd --no-out-link 2>/dev/null || true)"
+    if [ -n "${OVMF_STORE}" ] && [ -f "${OVMF_STORE}/FV/OVMF_CODE.fd" ]; then
+        OVMF_CODE="${OVMF_STORE}/FV/OVMF_CODE.fd"
+        OVMF_VARS="${OVMF_STORE}/FV/OVMF_VARS.fd"
+    fi
+fi
+
 if [ -z "${OVMF_CODE}" ]; then
     echo "Error: OVMF firmware not found."
-    echo "On NixOS: nix-shell -p OVMF"
-    echo "On Debian: sudo apt install ovmf"
-    echo "Or set OVMF_CODE env var to the firmware path."
+    echo "Easiest fix — run from the repo's nix-shell which sets \$OVMF_CODE automatically:"
+    echo "  cd $(dirname "$SCRIPT_DIR") && nix-shell && ./scripts/run-qemu.sh"
+    echo ""
+    echo "Or set manually: export OVMF_CODE=/path/to/OVMF_CODE.fd"
     exit 1
 fi
 
