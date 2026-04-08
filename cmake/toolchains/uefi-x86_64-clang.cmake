@@ -4,8 +4,11 @@
 set(CMAKE_SYSTEM_NAME       Generic)
 set(CMAKE_SYSTEM_PROCESSOR  x86_64)
 
-# Prevent CMake from trying to link an executable during compiler detection
+# Skip CMake's compiler sanity checks - we're a freestanding cross-compilation
+# target and the test program won't compile/link in a hosted environment.
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+set(CMAKE_C_COMPILER_WORKS   1 CACHE BOOL "" FORCE)
+set(CMAKE_CXX_COMPILER_WORKS 1 CACHE BOOL "" FORCE)
 
 find_program(CLANG_C   NAMES clang   REQUIRED)
 find_program(CLANG_CXX NAMES clang++ REQUIRED)
@@ -20,8 +23,11 @@ set(CMAKE_CXX_COMPILER_TARGET x86_64-unknown-windows)
 find_program(LLD_LINK NAMES lld-link REQUIRED)
 set(CMAKE_LINKER ${LLD_LINK})
 
-# Base compile flags for UEFI freestanding environment
+# Base compile flags for UEFI freestanding environment.
+# --target must be in the flags (not just CMAKE_CXX_COMPILER_TARGET) to ensure
+# Clang emits COFF objects regardless of the host platform's default.
 set(_UEFI_COMMON_FLAGS
+    "--target=x86_64-unknown-windows"
     "-ffreestanding"
     "-fno-stack-protector"
     "-fshort-wchar"
