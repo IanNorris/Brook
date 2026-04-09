@@ -56,7 +56,9 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
         reinterpret_cast<EFI_PHYSICAL_ADDRESS>(kernelData), kernelFileSize);
 
     // --- Allocate page table memory (must be before ExitBootServices) ---
-    PageTableAllocation pageTableAlloc = AllocatePageTables(systemTable->BootServices);
+    // Pass kernelPhysPages so AllocatePageTables can size the kernel PT pool.
+    // It also scans the UEFI memory map internally to size the identity map.
+    PageTableAllocation pageTableAlloc = AllocatePageTables(systemTable->BootServices, kernelPhysPages);
     ConsolePrintLine(u"Page table memory allocated");
 
     // --- Memory map (must be last thing before ExitBootServices) ---

@@ -13,9 +13,9 @@ namespace brook {
 // ---------------------------------------------------------------------------
 
 static constexpr uint64_t PAGE_SIZE       = 4096;
-static constexpr uint64_t MAX_PHYS_GB     = 64;
+static constexpr uint64_t MAX_PHYS_GB     = 128;
 static constexpr uint64_t MAX_PHYS_PAGES  = (MAX_PHYS_GB * 1024ULL * 1024 * 1024) / PAGE_SIZE;
-static constexpr uint64_t BITMAP_WORDS    = MAX_PHYS_PAGES / 64; // 262144 words = 2MB
+static constexpr uint64_t BITMAP_WORDS    = MAX_PHYS_PAGES / 64; // 524288 words = 4MB
 
 static uint64_t g_bitmap[BITMAP_WORDS]; // in BSS, starts zeroed
 static uint64_t g_totalPages = 0;       // highest tracked page index
@@ -92,10 +92,14 @@ void PmmInit(const BootProtocol* proto)
     g_totalPages = 0;
     g_nextHint   = 0;
 
-    // Step 2: Determine total tracked page count from highest physical address.
+    // Step 2: Determine total tracked page count from the HIGHEST conventional
+    // memory address. Skip MMIO entries — they live at high physical addresses
+    // (PCIe BARs etc.) and would otherwise inflate totalPages to the cap.
     for (uint32_t i = 0; i < proto->memoryMapCount; i++)
     {
         const MemoryDescriptor& d = proto->memoryMap[i];
+        if (d.type == MemoryType::Mmio)    continue;
+        if (d.type == MemoryType::Reserved) continue;
         uint64_t endPage = (d.physicalStart / PAGE_SIZE) + d.pageCount;
         if (endPage > g_totalPages) g_totalPages = endPage;
     }

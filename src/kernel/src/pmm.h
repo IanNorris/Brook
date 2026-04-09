@@ -8,7 +8,7 @@ namespace brook {
 // Physical Memory Manager — bitmap allocator for 4KB page frames.
 //
 // Convention: bitmap bit = 0 means free, 1 means used/reserved.
-// Supports up to 64GB of physical RAM (2MB bitmap in BSS).
+// Supports up to 128GB of physical RAM (4MB bitmap in BSS).
 //
 // Must be called once before any allocation, after the kernel is running
 // with its own page tables and the boot protocol is accessible.
