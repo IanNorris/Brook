@@ -45,6 +45,15 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     // Free the temporary ELF file buffer (segments already copied out)
     FreePages(systemTable->BootServices, (EFI_PHYSICAL_ADDRESS)(UINTN)kernelData, kernelSize);
 
+    // Print framebuffer info before ExitBootServices so we can see it
+    ConsolePrint(u"Framebuffer base: ");
+    ConsolePrintHex(framebuffer.physicalBase);
+    ConsolePrint(u"  size: ");
+    ConsolePrintDec(framebuffer.width);
+    ConsolePrint(u"x");
+    ConsolePrintDec(framebuffer.height);
+    ConsolePrintLine(u"");
+
     // --- Memory map (must be last before ExitBootServices) ---
     brook::MemoryDescriptor* memoryMap = nullptr;
     UINT32 memoryMapCount              = 0;
@@ -60,6 +69,22 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
         if (EFI_ERROR(status))
         {
             Halt(status, u"ExitBootServices failed");
+        }
+    }
+
+    // --- Diagnostic: draw a cyan stripe from the bootloader to confirm ---
+    // framebuffer is accessible and ExitBootServices succeeded.
+    // If you see cyan but not dark blue, the kernel isn't executing.
+    // If you see dark blue but not white, the kernel magic check is failing.
+    {
+        UINT32* fb      = reinterpret_cast<UINT32*>(framebuffer.physicalBase);
+        UINT32 stride   = framebuffer.stride / 4;
+        for (UINT32 y = 0; y < 10; y++)
+        {
+            for (UINT32 x = 0; x < framebuffer.width; x++)
+            {
+                fb[y * stride + x] = 0x0000FFFFu; // cyan
+            }
         }
     }
 
