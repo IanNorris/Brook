@@ -15,6 +15,8 @@ add_executable(kernel
     src/gdt.cpp
     src/idt.cpp
     src/pmm.cpp
+    src/vmm.cpp
+    src/heap.cpp
     "${BROOK_ROOT}/src/shared/src_km/serial.cpp"
 )
 

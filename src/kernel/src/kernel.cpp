@@ -3,6 +3,8 @@
 #include "gdt.h"
 #include "idt.h"
 #include "pmm.h"
+#include "vmm.h"
+#include "heap.h"
 
 // Draw a filled rectangle to the framebuffer using the given colour.
 static void DrawRect(
@@ -47,6 +49,9 @@ extern "C" __attribute__((sysv_abi)) void KernelMain(brook::BootProtocol* bootPr
     brook::SerialPrintf("PMM ready: %u free pages (%u MB)\n",
                         static_cast<uint32_t>(brook::PmmGetFreePageCount()),
                         static_cast<uint32_t>((brook::PmmGetFreePageCount() * 4096) / (1024*1024)));
+
+    brook::VmmInit();
+    brook::HeapInit();
 
     const brook::Framebuffer& fb = bootProtocol->framebuffer;
     brook::SerialPrintf("Framebuffer: %ux%u @ 0x%p\n",
