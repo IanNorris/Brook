@@ -73,6 +73,7 @@ add_custom_command(
 
 add_executable(kernel
     src/kernel.cpp
+    src/cpu.cpp
     src/gdt.cpp
     src/idt.cpp
     src/pmm.cpp
@@ -97,7 +98,18 @@ target_compile_options(kernel PRIVATE
     -Werror
     -Wshadow
     -Wno-unused-parameter
-    -mgeneral-regs-only
+    -msse2
+    -mfpmath=sse   # use SSE for scalar float, not x87 (cleaner ABI)
+)
+
+# Interrupt handler files must NOT use SSE/FPU registers.
+# -mgeneral-regs-only overrides the global -msse2/-mfpmath=sse for these files.
+# Combined with __attribute__((interrupt)) this guarantees no XMM state is
+# touched in ISRs, so no FXSAVE/FXRSTOR is needed in the interrupt path.
+set_source_files_properties(
+    src/idt.cpp
+    src/apic.cpp
+    PROPERTIES COMPILE_OPTIONS "-mgeneral-regs-only;-mno-sse;-mno-sse2;-mfpmath="
 )
 
 set_target_properties(kernel PROPERTIES

@@ -131,6 +131,22 @@ void SerialPrintf(const char* fmt, ...)
                 PrintHex(static_cast<unsigned long>(val));
                 break;
             }
+            case 'l': {
+                fmt++;
+                if (*fmt == 'u') {
+                    PrintUlong(va_arg(args, unsigned long));
+                } else if (*fmt == 'x') {
+                    PrintHex(va_arg(args, unsigned long));
+                } else if (*fmt == 'd') {
+                    long val = va_arg(args, long);
+                    if (val < 0) { SerialPutChar('-'); PrintUlong(static_cast<unsigned long>(-val)); }
+                    else PrintUlong(static_cast<unsigned long>(val));
+                } else {
+                    SerialPutChar('l');
+                    SerialPutChar(*fmt);
+                }
+                break;
+            }
             case 'p': {
                 void* ptr = va_arg(args, void*);
                 PrintPtr(reinterpret_cast<unsigned long>(ptr));

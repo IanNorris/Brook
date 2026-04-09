@@ -1,5 +1,6 @@
 #include "boot_protocol/boot_protocol.h"
 #include "serial.h"
+#include "cpu.h"
 #include "gdt.h"
 #include "idt.h"
 #include "pmm.h"
@@ -24,7 +25,8 @@ extern "C" __attribute__((sysv_abi)) void KernelMain(brook::BootProtocol* bootPr
     }
 
     GdtInit();
-    brook::SerialPuts("GDT loaded\n");
+    CpuInitFpu();
+    brook::SerialPuts("GDT+FPU loaded\n");
 
     IdtInit(&bootProtocol->framebuffer);
     brook::SerialPuts("IDT loaded\n");
