@@ -1,18 +1,10 @@
 #include "idt.h"
 #include "gdt.h"
 #include "serial.h"
-
-// ---- Port I/O helpers ----
-static inline void outb(uint16_t port, uint8_t val)
-{
-    __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
-}
-
-// ---- Panic state ----
-static brook::Framebuffer* g_panicFb = nullptr;
+#include "panic.h"
 
 // ---- IDT storage ----
-static IdtEntry     g_idt[256];
+static IdtEntry      g_idt[256];
 static IdtDescriptor g_idtDesc;
 
 // ---- Helper to fill one IDT entry ----
@@ -28,40 +20,116 @@ static void SetIdtEntry(uint8_t vector, void* handler)
     g_idt[vector]._reserved  = 0;
 }
 
-// ---- Common exception handler ----
-static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t errorCode)
+// ---- Exception name table ----
+static const char* const g_excNames[32] = {
+    "#DE Divide Error",            // 0
+    "#DB Debug",                   // 1
+    "NMI",                         // 2
+    "#BP Breakpoint",              // 3
+    "#OF Overflow",                // 4
+    "#BR Bound Range Exceeded",    // 5
+    "#UD Invalid Opcode",          // 6
+    "#NM Device Not Available",    // 7
+    "#DF Double Fault",            // 8
+    "Coprocessor Segment Overrun", // 9
+    "#TS Invalid TSS",             // 10
+    "#NP Segment Not Present",     // 11
+    "#SS Stack-Segment Fault",     // 12
+    "#GP General Protection",      // 13
+    "#PF Page Fault",              // 14
+    "Reserved (15)",               // 15
+    "#MF x87 FPU Exception",       // 16
+    "#AC Alignment Check",         // 17
+    "#MC Machine Check",           // 18
+    "#XF SIMD Exception",          // 19
+    "#VE Virtualization Exception",// 20
+    "#CP Control Protection",      // 21
+    "Reserved (22)",               // 22
+    "Reserved (23)",               // 23
+    "Reserved (24)",               // 24
+    "Reserved (25)",               // 25
+    "Reserved (26)",               // 26
+    "Reserved (27)",               // 27
+    "#HV Hypervisor Injection",    // 28
+    "#VC VMM Communication",       // 29
+    "#SX Security Exception",      // 30
+    "Reserved (31)",               // 31
+};
+
+// ---- Common exception dispatch ----
+// Called from the __attribute__((interrupt)) stubs below.
+// KernelPanic is [[noreturn]] so this never returns.
+static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t errorCode, bool hasErrorCode)
 {
-    (void)errorCode;
-    brook::SerialPrintf("EXCEPTION %u at RIP=0x%p\n",
-                        static_cast<unsigned>(vector),
-                        reinterpret_cast<void*>(frame->ip));
+    // Read CR2 here (page fault address) — valid before any stack manipulation.
+    uint64_t cr2 = 0;
+    __asm__ volatile("movq %%cr2, %0" : "=r"(cr2));
 
-    if (g_panicFb) {
-        uint32_t* pixels = reinterpret_cast<uint32_t*>(g_panicFb->physicalBase);
-        uint32_t  stride = g_panicFb->stride / 4;
-        for (uint32_t y = 0; y < g_panicFb->height; y++) {
-            for (uint32_t x = 0; x < g_panicFb->width; x++) {
-                pixels[y * stride + x] = 0x00FF0000u;  // red
-            }
-        }
+    const char* name = (vector < 32) ? g_excNames[vector] : "Unknown";
+
+    if (vector == 14) // #PF — include fault address and error code breakdown
+    {
+        KernelPanic(
+            "Exception %u: %s\n"
+            "  Fault addr  0x%lx\n"
+            "  Error code  0x%lx  [%s%s%s%s]\n"
+            "  RIP  0x%lx   CS   0x%lx\n"
+            "  RSP  0x%lx   SS   0x%lx\n"
+            "  RFLAGS 0x%lx\n",
+            static_cast<unsigned>(vector), name,
+            cr2,
+            errorCode,
+            (errorCode & 1) ? "P " : "NP ",   // Present
+            (errorCode & 2) ? "W " : "R ",    // Write/Read
+            (errorCode & 4) ? "U " : "K ",    // User/Kernel
+            (errorCode & 8) ? "RSVD " : "",   // Reserved write
+            frame->ip, frame->cs,
+            frame->sp, frame->ss,
+            frame->flags
+        );
     }
-
-    __asm__ volatile("cli");
-    for (;;) { __asm__ volatile("hlt"); }
+    else if (hasErrorCode)
+    {
+        KernelPanic(
+            "Exception %u: %s\n"
+            "  Error code  0x%lx\n"
+            "  RIP  0x%lx   CS   0x%lx\n"
+            "  RSP  0x%lx   SS   0x%lx\n"
+            "  RFLAGS 0x%lx\n",
+            static_cast<unsigned>(vector), name,
+            errorCode,
+            frame->ip, frame->cs,
+            frame->sp, frame->ss,
+            frame->flags
+        );
+    }
+    else
+    {
+        KernelPanic(
+            "Exception %u: %s\n"
+            "  RIP  0x%lx   CS   0x%lx\n"
+            "  RSP  0x%lx   SS   0x%lx\n"
+            "  RFLAGS 0x%lx\n",
+            static_cast<unsigned>(vector), name,
+            frame->ip, frame->cs,
+            frame->sp, frame->ss,
+            frame->flags
+        );
+    }
 }
 
 // ---- Exception stubs: no error code ----
 #define EXC_NOERR(N) \
     __attribute__((interrupt)) \
     static void ExceptionHandler##N(InterruptFrame* frame) { \
-        HandleException(N, frame, 0); \
+        HandleException(N, frame, 0, false); \
     }
 
 // ---- Exception stubs: with error code ----
 #define EXC_ERR(N) \
     __attribute__((interrupt)) \
     static void ExceptionHandler##N(InterruptFrame* frame, uintptr_t err) { \
-        HandleException(N, frame, static_cast<uint64_t>(err)); \
+        HandleException(N, frame, static_cast<uint64_t>(err), true); \
     }
 
 EXC_NOERR(0)   // #DE Divide Error
@@ -97,40 +165,31 @@ EXC_ERR(29)    // #VC VMM Communication
 EXC_ERR(30)    // #SX Security Exception
 EXC_NOERR(31)  // Reserved
 
-// ---- IRQ stubs (vectors 32-47) ----
-// Master PIC IRQs 0-7 → vectors 32-39: EOI to master only
-#define IRQ_MASTER(N) \
+// ---- Spurious IRQ stubs (vectors 32-47) ----
+// The legacy 8259 PIC is disabled and fully masked during ApicInit().
+// These vectors should never fire; if they do, panic rather than silently ignore.
+#define IRQ_SPURIOUS(N) \
     __attribute__((interrupt)) \
     static void IrqHandler##N(InterruptFrame* frame) { \
-        (void)frame; \
-        outb(0x20, 0x20); \
+        HandleException(N, frame, 0, false); \
     }
 
-// Slave PIC IRQs 8-15 → vectors 40-47: EOI to slave then master
-#define IRQ_SLAVE(N) \
-    __attribute__((interrupt)) \
-    static void IrqHandler##N(InterruptFrame* frame) { \
-        (void)frame; \
-        outb(0xA0, 0x20); \
-        outb(0x20, 0x20); \
-    }
-
-IRQ_MASTER(32)
-IRQ_MASTER(33)
-IRQ_MASTER(34)
-IRQ_MASTER(35)
-IRQ_MASTER(36)
-IRQ_MASTER(37)
-IRQ_MASTER(38)
-IRQ_MASTER(39)
-IRQ_SLAVE(40)
-IRQ_SLAVE(41)
-IRQ_SLAVE(42)
-IRQ_SLAVE(43)
-IRQ_SLAVE(44)
-IRQ_SLAVE(45)
-IRQ_SLAVE(46)
-IRQ_SLAVE(47)
+IRQ_SPURIOUS(32)
+IRQ_SPURIOUS(33)
+IRQ_SPURIOUS(34)
+IRQ_SPURIOUS(35)
+IRQ_SPURIOUS(36)
+IRQ_SPURIOUS(37)
+IRQ_SPURIOUS(38)
+IRQ_SPURIOUS(39)
+IRQ_SPURIOUS(40)
+IRQ_SPURIOUS(41)
+IRQ_SPURIOUS(42)
+IRQ_SPURIOUS(43)
+IRQ_SPURIOUS(44)
+IRQ_SPURIOUS(45)
+IRQ_SPURIOUS(46)
+IRQ_SPURIOUS(47)
 
 void IdtInstallHandler(uint8_t vector, void* handler)
 {
@@ -140,7 +199,7 @@ void IdtInstallHandler(uint8_t vector, void* handler)
 
 void IdtInit(brook::Framebuffer* fb)
 {
-    g_panicFb = fb;
+    (void)fb; // KernelPanic handles the framebuffer via TtyReady()
 
     // Exception handlers 0-31
     SetIdtEntry( 0, reinterpret_cast<void*>(ExceptionHandler0));
@@ -176,7 +235,7 @@ void IdtInit(brook::Framebuffer* fb)
     SetIdtEntry(30, reinterpret_cast<void*>(ExceptionHandler30));
     SetIdtEntry(31, reinterpret_cast<void*>(ExceptionHandler31));
 
-    // IRQ stubs 32-47
+    // Spurious IRQ stubs 32-47 (PIC disabled; these should never fire)
     SetIdtEntry(32, reinterpret_cast<void*>(IrqHandler32));
     SetIdtEntry(33, reinterpret_cast<void*>(IrqHandler33));
     SetIdtEntry(34, reinterpret_cast<void*>(IrqHandler34));
