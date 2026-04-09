@@ -40,9 +40,20 @@ inline uint32_t PciBarMemBase32(uint32_t bar) { return bar & ~0xFu; }
 
 // ---- Enumeration ----
 
-// Scan all PCI buses (0-255) for a device matching vendorId:deviceId.
+// Scan all PCI buses for a device matching vendorId:deviceId.
 // Returns true and fills 'out' on first match.
 bool PciFindDevice(uint16_t vendorId, uint16_t deviceId, PciDevice& out);
+
+// Find the next device matching vendorId:deviceId after 'after'.
+// Pass the previously found PciDevice as 'after' to walk through all matches.
+// Returns false when no further matches exist.
+bool PciFindNextDevice(uint16_t vendorId, uint16_t deviceId,
+                       const PciDevice& after, PciDevice& out);
+
+// Enumerate all matching devices, calling cb(dev) for each.
+// Stops early if cb returns false.
+void PciEnumerate(uint16_t vendorId, uint16_t deviceId,
+                  bool (*cb)(const PciDevice& dev, void* ctx), void* ctx);
 
 // Enable Bus Master and I/O Space access in the PCI command register.
 void PciEnableBusMaster(const PciDevice& dev);
@@ -54,3 +65,4 @@ void PciEnableMemSpace(const PciDevice& dev);
 void PciScanPrint();
 
 } // namespace brook
+

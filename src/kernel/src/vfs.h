@@ -65,6 +65,10 @@ void VfsInit();
 // Returns true on success.
 bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv);
 
+// Unmount the filesystem at mountPoint.  The mount entry is cleared and
+// f_unmount is called.  Returns true if a matching mount was found.
+bool VfsUnmount(const char* mountPoint);
+
 // Open a file or directory.  Caller owns the returned Vnode*; call VfsClose().
 // Returns nullptr on error.
 Vnode* VfsOpen(const char* path, int flags = 0);

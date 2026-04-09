@@ -136,36 +136,95 @@ extern "C" __attribute__((sysv_abi)) void KernelMain(brook::BootProtocol* bootPr
         brook::KPuts("VFS: ramdisk init failed\n");
     }
 
-    // ---- virtio-blk (if QEMU exposes a disk) ----
-    // Scan PCI and print what's there, then attempt virtio-blk init.
+    // ---- virtio-blk: enumerate all PCI virtio drives ----
+    // Each virtio drive is probed for a BROOK.MNT file at its root.
+    // BROOK.MNT contains a single line: the VFS mount path for that volume.
+    // If found, the drive is mounted at that path automatically.
+    // Drives without BROOK.MNT are registered but not auto-mounted.
     brook::PciScanPrint();
-    brook::Device* vioDev = brook::VirtioBlkInit();
-    if (vioDev)
+    uint32_t vioCount = brook::VirtioBlkInitAll();
+    if (vioCount > 0)
     {
-        // Bind virtio0 to FatFS physical drive 1 and mount at /boot.
-        brook::FatFsBindDrive(1, vioDev);
-        if (brook::VfsMount("/boot", "fatfs", 1))
+        brook::KPrintf("virtio: found %u device(s)\n", vioCount);
+
+        // Probe each virtio drive: bind to FatFS, look for BROOK.MNT.
+        // FatFS physical drives: 0 = ramdisk, 1..N = virtio0..N-1
+        for (uint32_t i = 0; i < vioCount; ++i)
         {
-            brook::Vnode* cfg = brook::VfsOpen("/boot/BROOK.CFG");
-            if (cfg)
+            char name[16] = "virtio";
+            // Simple uint-to-string for drive index.
+            name[6] = static_cast<char>('0' + i);
+            name[7] = '\0';
+            brook::Device* vd = brook::DeviceFind(name);
+            if (!vd) continue;
+
+            uint8_t pdrv = static_cast<uint8_t>(i + 1); // pdrv 1+ for virtio
+            brook::FatFsBindDrive(pdrv, vd);
+
+            // Try mounting — FatFS will return FR_OK only if it sees a valid FAT volume.
+            if (!brook::VfsMount("/mnt/probe", "fatfs", pdrv))
             {
-                char buf[128] = {};
-                uint64_t off = 0;
-                int n = brook::VfsRead(cfg, buf, sizeof(buf) - 1, &off);
-                brook::VfsClose(cfg);
-                if (n > 0)
-                    brook::KPrintf("virtio: /boot/BROOK.CFG (%d bytes): %s", n, buf);
+                brook::SerialPrintf("virtio: %s — not a FAT volume or mount failed\n", name);
+                continue;
+            }
+
+            // Read BROOK.MNT to discover the intended mount path.
+            brook::Vnode* mnt = brook::VfsOpen("/mnt/probe/BROOK.MNT");
+            if (!mnt)
+            {
+                brook::SerialPrintf("virtio: %s mounted at /mnt/probe (no BROOK.MNT)\n", name);
+                continue;
+            }
+
+            char mntPath[64] = {};
+            uint64_t off = 0;
+            int n = brook::VfsRead(mnt, mntPath, sizeof(mntPath) - 1, &off);
+            brook::VfsClose(mnt);
+
+            if (n <= 0)
+            {
+                brook::SerialPrintf("virtio: %s — BROOK.MNT empty\n", name);
+                continue;
+            }
+
+            // Strip trailing whitespace/newline from the path.
+            for (int j = n - 1; j >= 0; --j)
+            {
+                if (mntPath[j] == '\n' || mntPath[j] == '\r' || mntPath[j] == ' ')
+                    mntPath[j] = '\0';
                 else
-                    brook::KPuts("virtio: /boot/BROOK.CFG open OK but empty\n");
+                    break;
+            }
+
+            // Remount at the target path.
+            brook::VfsUnmount("/mnt/probe");
+            if (brook::VfsMount(mntPath, "fatfs", pdrv))
+            {
+                brook::KPrintf("virtio: %s mounted at %s\n", name, mntPath);
+
+                // Read BROOK.CFG from the mounted volume as a sanity check.
+                char cfgPath[80] = {};
+                // Build "<mntPath>/BROOK.CFG"
+                uint32_t plen = 0;
+                while (mntPath[plen]) cfgPath[plen] = mntPath[plen++];
+                const char* suffix = "/BROOK.CFG";
+                for (uint32_t j = 0; suffix[j]; ++j) cfgPath[plen++] = suffix[j];
+
+                brook::Vnode* cfg = brook::VfsOpen(cfgPath);
+                if (cfg)
+                {
+                    char buf[256] = {};
+                    uint64_t coff = 0;
+                    int nr = brook::VfsRead(cfg, buf, sizeof(buf) - 1, &coff);
+                    brook::VfsClose(cfg);
+                    if (nr > 0)
+                        brook::KPrintf("virtio: %s (%d bytes): %s", cfgPath, nr, buf);
+                }
             }
             else
             {
-                brook::KPuts("virtio: /boot/BROOK.CFG not found (mount OK)\n");
+                brook::KPrintf("virtio: %s — remount at %s failed\n", name, mntPath);
             }
-        }
-        else
-        {
-            brook::KPuts("virtio: VfsMount /boot failed\n");
         }
     }
 

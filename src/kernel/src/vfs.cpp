@@ -249,6 +249,27 @@ bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
     return true;
 }
 
+bool VfsUnmount(const char* mountPoint)
+{
+    if (!mountPoint) return false;
+    for (uint32_t i = 0; i < VFS_MAX_MOUNTS; ++i)
+    {
+        if (!g_mounts[i].used) continue;
+        if (!StrEq(g_mounts[i].mountPoint, mountPoint)) continue;
+
+        char fatPath[8];
+        fatPath[0] = static_cast<char>('0' + g_mounts[i].pdrv);
+        fatPath[1] = ':'; fatPath[2] = '\0';
+        f_unmount(fatPath);
+        kfree(g_mounts[i].fs);
+        g_mounts[i].fs   = nullptr;
+        g_mounts[i].used = false;
+        SerialPrintf("VFS: unmounted '%s'\n", mountPoint);
+        return true;
+    }
+    return false;
+}
+
 Vnode* VfsOpen(const char* path, int flags)
 {
     const char* relPath = nullptr;

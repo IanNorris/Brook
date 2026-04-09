@@ -2,8 +2,9 @@
 """Create a FAT16 disk image for virtio-blk testing.
 
 Produces a 1MB raw FAT16 image at <build_dir>/brook_disk.img containing:
-  - BROOK.CFG   (boot config sample)
-  - TEST/HELLO.TXT
+  BROOK.MNT   (mount target declaration — tells the kernel where to mount this volume)
+  BROOK.CFG   (boot config sample)
+  TEST/HELLO.TXT
 
 Usage:
   python3 scripts/make_disk_image.py <build_dir>
@@ -36,8 +37,12 @@ def main():
     # 1MB = 1024 KB FAT16 image
     run(["mformat", "-C", "-f", "1024", "-v", "BROOKDISK", "-i", img_path, "::"])
 
-    # Create test directory structure in a temp dir.
     with tempfile.TemporaryDirectory() as tmp:
+        # BROOK.MNT — tells the kernel to mount this volume at /boot
+        mnt = os.path.join(tmp, "BROOK.MNT")
+        with open(mnt, "w") as f:
+            f.write("/boot\n")
+
         cfg = os.path.join(tmp, "BROOK.CFG")
         with open(cfg, "w") as f:
             f.write("# Brook OS virtio disk config\n")
@@ -50,12 +55,13 @@ def main():
         with open(hello, "w") as f:
             f.write("Hello from virtio-blk!\n")
 
-        # Copy files into the image.
+        run(["mcopy", "-i", img_path, mnt, "::BROOK.MNT"])
         run(["mcopy", "-i", img_path, cfg, "::BROOK.CFG"])
-        run(["mmd", "-i", img_path, "::TEST"])
+        run(["mmd",   "-i", img_path, "::TEST"])
         run(["mcopy", "-i", img_path, hello, "::TEST/HELLO.TXT"])
 
     print(f"Disk image written to {img_path}")
 
 if __name__ == "__main__":
     main()
+

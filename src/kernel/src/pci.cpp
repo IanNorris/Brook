@@ -83,22 +83,29 @@ static void ReadDevice(uint8_t bus, uint8_t dev, uint8_t fn, PciDevice& out)
 
 // ---- Public API ----
 
-bool PciFindDevice(uint16_t vendorId, uint16_t deviceId, PciDevice& out)
+// Internal: scan from (startBus, startDev, startFn), exclusive of the start position.
+static bool ScanFrom(uint16_t vendorId, uint16_t deviceId,
+                     uint32_t startBus, uint32_t startDev, uint32_t startFn,
+                     bool skipStart, PciDevice& out)
 {
-    for (uint32_t bus = 0; bus < 256; ++bus)
+    for (uint32_t bus = startBus; bus < 256; ++bus)
     {
-        for (uint32_t dev = 0; dev < 32; ++dev)
+        uint32_t devBegin = (bus == startBus) ? startDev : 0;
+        for (uint32_t dev = devBegin; dev < 32; ++dev)
         {
-            // Check if function 0 exists.
             uint32_t id0 = PciConfigRead32(bus, dev, 0, 0x00);
-            if ((id0 & 0xFFFF) == 0xFFFF) continue; // no device
+            if ((id0 & 0xFFFF) == 0xFFFF) continue;
 
-            // Check all functions (support multi-function devices).
             uint8_t hdrType = PciConfigRead8(bus, dev, 0, 0x0E);
             uint32_t fnCount = (hdrType & 0x80) ? 8u : 1u;
 
-            for (uint32_t fn = 0; fn < fnCount; ++fn)
+            uint32_t fnBegin = (bus == startBus && dev == startDev) ? startFn : 0;
+            for (uint32_t fn = fnBegin; fn < fnCount; ++fn)
             {
+                // Skip the exact start position when requested (for FindNext).
+                if (skipStart && bus == startBus && dev == startDev && fn == startFn)
+                    continue;
+
                 uint32_t id = PciConfigRead32(bus, dev, fn, 0x00);
                 if ((id & 0xFFFF) == 0xFFFF) continue;
                 if ((id & 0xFFFF) == vendorId && (id >> 16) == deviceId)
@@ -110,6 +117,32 @@ bool PciFindDevice(uint16_t vendorId, uint16_t deviceId, PciDevice& out)
         }
     }
     return false;
+}
+
+bool PciFindDevice(uint16_t vendorId, uint16_t deviceId, PciDevice& out)
+{
+    return ScanFrom(vendorId, deviceId, 0, 0, 0, false, out);
+}
+
+bool PciFindNextDevice(uint16_t vendorId, uint16_t deviceId,
+                       const PciDevice& after, PciDevice& out)
+{
+    return ScanFrom(vendorId, deviceId,
+                    after.bus, after.dev, after.fn, /*skipStart=*/true, out);
+}
+
+void PciEnumerate(uint16_t vendorId, uint16_t deviceId,
+                  bool (*cb)(const PciDevice& dev, void* ctx), void* ctx)
+{
+    PciDevice cur;
+    if (!PciFindDevice(vendorId, deviceId, cur)) return;
+    for (;;)
+    {
+        if (!cb(cur, ctx)) return;
+        PciDevice next;
+        if (!PciFindNextDevice(vendorId, deviceId, cur, next)) return;
+        cur = next;
+    }
 }
 
 void PciEnableBusMaster(const PciDevice& dev)

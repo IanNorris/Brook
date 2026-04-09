@@ -324,19 +324,17 @@ static const BlockDeviceOps g_virtioBlkOps = {
     .block_size  = VirtioBlkBlockSize,
 };
 
-// ---- Public init ----
+// ---- Per-device init (internal) ----
 
-Device* VirtioBlkInit()
+// Device names are static strings indexed by slot.
+static const char* const g_virtioNames[] = {
+    "virtio0", "virtio1", "virtio2", "virtio3",
+    "virtio4", "virtio5", "virtio6", "virtio7",
+};
+static constexpr uint32_t VIRTIO_MAX_DEVS = 8;
+
+static Device* InitOnePciDevice(const PciDevice& pci, uint32_t slot)
 {
-    PciDevice pci;
-    // Vendor 0x1AF4 = Red Hat (virtio), Device 0x1001 = legacy virtio-blk
-    if (!PciFindDevice(0x1AF4, 0x1001, pci))
-    {
-        SerialPuts("virtio-blk: no legacy virtio-blk device found\n");
-        return nullptr;
-    }
-
-    // BAR0 must be an I/O BAR for legacy virtio.
     if (!PciBarIsIo(pci.bar[0]))
     {
         SerialPuts("virtio-blk: BAR0 is not I/O space (not legacy device?)\n");
@@ -346,23 +344,20 @@ Device* VirtioBlkInit()
     uint16_t ioBase = PciBarIoBase(pci.bar[0]);
     PciEnableBusMaster(pci);
 
-    SerialPrintf("virtio-blk: found %02x:%02x.%x, BAR0 I/O base 0x%x\n",
+    SerialPrintf("virtio-blk: found %02x:%02x.%x as %s, I/O base 0x%x\n",
                  pci.bus, pci.dev, pci.fn,
+                 g_virtioNames[slot],
                  static_cast<unsigned>(ioBase));
-
-    // --- Virtio initialisation sequence ---
 
     // 1. Reset device.
     VioWrite8(ioBase, VIRTIO_PCI_STATUS, 0);
 
-    // 2. Acknowledge device.
+    // 2. Acknowledge + driver.
     VioWrite8(ioBase, VIRTIO_PCI_STATUS,
               VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
 
-    // 3. Read features and accept a minimal subset (no special features needed).
+    // 3. Feature negotiation — accept everything the host offers.
     uint32_t features = VioRead32(ioBase, VIRTIO_PCI_HOST_FEATURES);
-    SerialPrintf("virtio-blk: host features: 0x%x\n", features);
-    // Accept everything the host offers (legacy devices don't do feature negotiation strictly).
     VioWrite32(ioBase, VIRTIO_PCI_GUEST_FEATURES, features);
 
     // 4. Set up virtqueue 0.
@@ -370,19 +365,18 @@ Device* VirtioBlkInit()
     uint16_t qSize = VioRead16(ioBase, VIRTIO_PCI_QUEUE_SIZE);
     if (qSize == 0 || qSize > QUEUE_SIZE)
     {
-        SerialPrintf("virtio-blk: unexpected queue size %u\n",
+        SerialPrintf("virtio-blk: unexpected queue size %u, skipping\n",
                      static_cast<unsigned>(qSize));
         return nullptr;
     }
-    SerialPrintf("virtio-blk: queue size = %u\n", static_cast<unsigned>(qSize));
 
     auto* state = static_cast<VirtioBlkState*>(kmalloc(sizeof(VirtioBlkState)));
     if (!state) return nullptr;
     for (uint32_t i = 0; i < sizeof(VirtioBlkState); ++i)
         reinterpret_cast<uint8_t*>(state)[i] = 0;
-    state->ioBase    = ioBase;
-    state->availIdx  = 0;
-    state->usedIdx   = 0;
+    state->ioBase   = ioBase;
+    state->availIdx = 0;
+    state->usedIdx  = 0;
 
     if (!AllocVirtqueue(*state))
     {
@@ -391,29 +385,26 @@ Device* VirtioBlkInit()
         return nullptr;
     }
 
-    // Tell the device the physical page of our queue.
+    // Write queue PFN.
     uint32_t pfn = static_cast<uint32_t>(state->queuePhys >> 12);
     VioWrite32(ioBase, VIRTIO_PCI_QUEUE_PFN, pfn);
-    SerialPrintf("virtio-blk: queue PFN = 0x%x (phys=0x%lx)\n",
-                 pfn, state->queuePhys);
 
     // 5. Driver OK.
     VioWrite8(ioBase, VIRTIO_PCI_STATUS,
               VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_DRIVER_OK);
 
-    // Read sector count from device config space.
-    // Config space at BAR0 + 0x14 (legacy) — two 32-bit reads for 64-bit value.
+    // Read capacity (two 32-bit reads for the 64-bit sector count).
     uint32_t capLo = inl(ioBase + VIRTIO_PCI_BLK_CAPACITY);
     uint32_t capHi = inl(ioBase + VIRTIO_PCI_BLK_CAPACITY + 4);
     state->sectorCount = (static_cast<uint64_t>(capHi) << 32) | capLo;
-    SerialPrintf("virtio-blk: %lu sectors (%lu MB)\n",
+    SerialPrintf("virtio-blk: %s — %lu sectors (%lu MB)\n",
+                 g_virtioNames[slot],
                  state->sectorCount,
                  (state->sectorCount * 512) / (1024 * 1024));
 
-    // Register in device table.
     auto* dev = static_cast<Device*>(kmalloc(sizeof(Device)));
     dev->ops  = reinterpret_cast<const DeviceOps*>(&g_virtioBlkOps);
-    dev->name = "virtio0";
+    dev->name = g_virtioNames[slot];
     dev->type = DeviceType::Block;
     dev->priv = state;
 
@@ -425,6 +416,29 @@ Device* VirtioBlkInit()
     }
 
     return dev;
+}
+
+// ---- Public init ----
+
+uint32_t VirtioBlkInitAll()
+{
+    uint32_t count = 0;
+    PciDevice pci;
+
+    if (!PciFindDevice(0x1AF4, 0x1001, pci)) return 0;
+
+    for (;;)
+    {
+        if (count >= VIRTIO_MAX_DEVS) break;
+        InitOnePciDevice(pci, count);
+        ++count;
+
+        PciDevice next;
+        if (!PciFindNextDevice(0x1AF4, 0x1001, pci, next)) break;
+        pci = next;
+    }
+
+    return count;
 }
 
 } // namespace brook
