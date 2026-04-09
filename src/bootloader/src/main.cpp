@@ -97,8 +97,22 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     bootProtocol.memoryMap      = memoryMap;
     bootProtocol.memoryMapCount = memoryMapCount;
 
-    // Jump to kernel
-    kernelEntry(&bootProtocol);
+    // Jump to kernel using explicit SysV ABI:
+    // The bootloader is compiled with MS x64 ABI (args in RCX/RDX/R8/R9).
+    // The kernel ELF uses SysV ABI (first arg in RDI).
+    // We use inline asm to ensure the argument lands in RDI regardless of
+    // what the compiler would normally generate for a function pointer call.
+    {
+        void* entry    = reinterpret_cast<void*>(kernelEntry);
+        void* protocol = &bootProtocol;
+        asm volatile(
+            "mov %1, %%rdi\n\t"   // protocol -> RDI (SysV first arg)
+            "jmp *%0\n\t"         // jump to kernel entry point
+            :
+            : "r"(entry), "r"(protocol)
+            : "rdi"
+        );
+    }
 
     // Should never reach here
     for (;;) { __asm__ volatile("hlt"); }
