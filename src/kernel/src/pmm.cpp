@@ -1,8 +1,13 @@
 #include "pmm.h"
 #include "serial.h"
 
-// heap.h included below for PmmEnableTracking — forward-declared to avoid circular dep.
-namespace brook { void* kmalloc(uint64_t); }
+// Forward-declared to avoid circular headers: vmm.h ↔ pmm.h.
+// VMM_WRITABLE = bit 1; MemTag::KernelData = 2; KernelPid = 0.
+namespace brook {
+    void*    kmalloc(uint64_t);
+    uint64_t VmmAllocPages(uint64_t pageCount, uint64_t flags,
+                           MemTag tag, uint16_t pid);
+}
 
 // Linker-defined symbol — end of the kernel image (virtual address).
 // Declared outside any namespace so the linker resolves it correctly.
@@ -30,14 +35,64 @@ static uint64_t g_nextHint   = 0;       // search hint for fast sequential alloc
 // Null until then; all tag/pid operations are no-ops before that.
 // ---------------------------------------------------------------------------
 
-static MemTag*   g_pageTags = nullptr;   // [g_totalPages] uint8_t
-static uint16_t* g_pagePids = nullptr;   // [g_totalPages] uint16_t
+static PageDescriptor* g_pageDescs = nullptr;  // [g_totalPages], via kmalloc
 
-static inline void TrackSet(uint64_t pageIdx, MemTag tag, uint16_t pid)
+// Per-PID doubly-linked page lists.  Static (16KB), indexed by PID.
+static PidList g_pidLists[PMM_MAX_PIDS] = {};
+
+// ---------------------------------------------------------------------------
+// Internal list helpers (all require g_pageDescs != nullptr)
+// ---------------------------------------------------------------------------
+
+static inline PageDescriptor& Desc(uint32_t idx) { return g_pageDescs[idx]; }
+
+// Remove a page from whatever PID list it currently belongs to.
+// Does NOT reset the descriptor's tag/pid — caller must do that.
+static void ListRemove(uint32_t idx)
 {
-    if (!g_pageTags || pageIdx >= g_totalPages) return;
-    g_pageTags[pageIdx] = tag;
-    g_pagePids[pageIdx] = pid;
+    PageDescriptor& d = Desc(idx);
+    uint16_t pid = d.pid;
+
+    if (d.prev != PMM_NULL_PAGE)
+        Desc(d.prev).next = d.next;
+    else
+        g_pidLists[pid].head = d.next;  // idx was the head
+
+    if (d.next != PMM_NULL_PAGE)
+        Desc(d.next).prev = d.prev;
+    else
+        g_pidLists[pid].tail = d.prev;  // idx was the tail
+
+    if (g_pidLists[pid].pageCount > 0)
+        g_pidLists[pid].pageCount--;
+
+    d.next = d.prev = PMM_NULL_PAGE;
+}
+
+// Append a page to the tail of a PID's list and set its tag.
+// The page must NOT currently be in any list (next/prev == PMM_NULL_PAGE).
+static void ListAppend(uint32_t idx, uint16_t pid, MemTag tag)
+{
+    PageDescriptor& d = Desc(idx);
+    d.pid  = pid;
+    d.tag  = static_cast<uint8_t>(tag);
+    d.next = PMM_NULL_PAGE;
+    d.prev = g_pidLists[pid].tail;
+
+    if (g_pidLists[pid].tail != PMM_NULL_PAGE)
+        Desc(g_pidLists[pid].tail).next = idx;
+    else
+        g_pidLists[pid].head = idx;  // list was empty
+
+    g_pidLists[pid].tail = idx;
+    g_pidLists[pid].pageCount++;
+}
+
+static inline void TrackAlloc(uint32_t pageIdx, MemTag tag, uint16_t pid)
+{
+    // Free pages are not in any list; just append to the new owner's list.
+    if (!g_pageDescs) return;
+    ListAppend(pageIdx, pid, tag);
 }
 
 // ---------------------------------------------------------------------------
@@ -186,7 +241,7 @@ uint64_t PmmAllocPage(MemTag tag, uint16_t pid)
             SetUsed(idx);
             g_freePages--;
             g_nextHint = idx + 1;
-            TrackSet(idx, tag, pid);
+            TrackAlloc(static_cast<uint32_t>(idx), tag, pid);
             return idx * PAGE_SIZE;
         }
     }
@@ -214,7 +269,7 @@ uint64_t PmmAllocPages(uint64_t count, MemTag tag, uint16_t pid)
                 {
                     SetUsed(runStart + i);
                     g_freePages--;
-                    TrackSet(runStart + i, tag, pid);
+                    TrackAlloc(static_cast<uint32_t>(runStart + i), tag, pid);
                 }
                 return runStart * PAGE_SIZE;
             }
@@ -239,55 +294,165 @@ void PmmFreePage(uint64_t physAddr)
     SetFree(idx);
     g_freePages++;
     if (idx < g_nextHint) g_nextHint = idx;
-    TrackSet(idx, MemTag::Free, 0);
+
+    if (g_pageDescs)
+    {
+        // Remove from PID's list; free pages are not tracked in any list.
+        ListRemove(static_cast<uint32_t>(idx));
+        PageDescriptor& d = Desc(static_cast<uint32_t>(idx));
+        d.pid = 0;
+        d.tag = static_cast<uint8_t>(MemTag::Free);
+    }
 }
 
 void PmmSetOwner(uint64_t physAddr, MemTag tag, uint16_t pid)
 {
     if ((physAddr & (PAGE_SIZE - 1)) != 0) return;
-    TrackSet(physAddr / PAGE_SIZE, tag, pid);
+    if (!g_pageDescs) return;
+    uint64_t idx64 = physAddr / PAGE_SIZE;
+    if (idx64 >= g_totalPages) return;
+    uint32_t idx = static_cast<uint32_t>(idx64);
+    // If page is currently in a list, remove it first.
+    if (Desc(idx).pid != 0 || Desc(idx).tag != static_cast<uint8_t>(MemTag::Free))
+        ListRemove(idx);
+    ListAppend(idx, pid, tag);
 }
 
 MemTag PmmGetTag(uint64_t physAddr)
 {
-    if (!g_pageTags) return MemTag::KernelData; // tracking not yet enabled
+    if (!g_pageDescs) return MemTag::KernelData;
     uint64_t idx = physAddr / PAGE_SIZE;
-    if (idx >= g_totalPages) return MemTag::Reserved;
-    return g_pageTags[idx];
+    if (idx >= g_totalPages) return MemTag::System;
+    return static_cast<MemTag>(Desc(static_cast<uint32_t>(idx)).tag);
 }
 
 uint16_t PmmGetPid(uint64_t physAddr)
 {
-    if (!g_pagePids) return KernelPid;
+    if (!g_pageDescs) return KernelPid;
     uint64_t idx = physAddr / PAGE_SIZE;
     if (idx >= g_totalPages) return KernelPid;
-    return g_pagePids[idx];
+    return Desc(static_cast<uint32_t>(idx)).pid;
 }
 
 void PmmEnableTracking()
 {
-    // Allocate tag and PID arrays sized to actual RAM detected at init.
-    g_pageTags = reinterpret_cast<MemTag*>(kmalloc(g_totalPages * sizeof(MemTag)));
-    g_pagePids = reinterpret_cast<uint16_t*>(kmalloc(g_totalPages * sizeof(uint16_t)));
+    // Allocate descriptor array via VmmAllocPages — too large for a single
+    // kmalloc call (g_totalPages * 12B can be ~768KB). As a permanent
+    // system-lifetime allocation, bypassing the heap is appropriate.
+    static constexpr uint64_t PAGE_SIZE_LOCAL = 4096;
+    static constexpr uint64_t VMM_WRITABLE_LOCAL = (1ULL << 1);
+    uint64_t descBytes = g_totalPages * sizeof(PageDescriptor);
+    uint64_t descPages = (descBytes + PAGE_SIZE_LOCAL - 1) / PAGE_SIZE_LOCAL;
+    uint64_t descVirt  = VmmAllocPages(descPages, VMM_WRITABLE_LOCAL,
+                                       MemTag::KernelData, KernelPid);
+    g_pageDescs = reinterpret_cast<PageDescriptor*>(descVirt);
 
-    if (!g_pageTags || !g_pagePids)
+    if (descVirt == 0)
     {
+        g_pageDescs = nullptr;
         SerialPuts("PMM: WARNING: tracking allocation failed — ownership disabled\n");
-        g_pageTags = nullptr;
-        g_pagePids = nullptr;
         return;
     }
 
-    // Backfill: mark all currently-used pages as KernelData, free pages as Free.
-    for (uint64_t i = 0; i < g_totalPages; i++)
+    // Initialise all lists to empty.
+    for (uint32_t i = 0; i < PMM_MAX_PIDS; i++)
+        g_pidLists[i] = { PMM_NULL_PAGE, PMM_NULL_PAGE, 0, 0 };
+
+    // Initialise all descriptors to a known state before building lists.
+    for (uint32_t i = 0; i < static_cast<uint32_t>(g_totalPages); i++)
     {
-        g_pageTags[i] = IsUsed(i) ? MemTag::KernelData : MemTag::Free;
-        g_pagePids[i] = KernelPid;
+        g_pageDescs[i] = { PMM_NULL_PAGE, PMM_NULL_PAGE, 0,
+                           static_cast<uint8_t>(MemTag::Free), 0 };
     }
 
-    SerialPrintf("PMM: tracking enabled — %u pages (tag+pid arrays: %u KB)\n",
+    // Backfill: add used pages to KernelPid's list; free pages are left
+    // out of all lists (the bitmap IS the free pool — no list needed).
+    uint32_t usedCount = 0, freeCount = 0;
+    for (uint32_t i = 0; i < static_cast<uint32_t>(g_totalPages); i++)
+    {
+        if (IsUsed(i))
+        {
+            ListAppend(i, KernelPid, MemTag::KernelData);
+            usedCount++;
+        }
+        else
+        {
+            // Free page: descriptor stays initialised to Free/0/PMM_NULL_PAGE.
+            freeCount++;
+        }
+    }
+
+    SerialPrintf("PMM: tracking enabled — %u pages (%u used, %u free), "
+                 "descriptors: %u KB\n",
                  static_cast<uint32_t>(g_totalPages),
-                 static_cast<uint32_t>((g_totalPages * 3) / 1024));
+                 usedCount, freeCount,
+                 static_cast<uint32_t>(g_totalPages * sizeof(PageDescriptor) / 1024));
+}
+
+void PmmKillPid(uint16_t pid)
+{
+    if (!g_pageDescs) return;
+    if (pid == KernelPid) return;  // never kill kernel pages
+
+    uint32_t idx = g_pidLists[pid].head;
+    uint32_t count = 0;
+
+    while (idx != PMM_NULL_PAGE)
+    {
+        uint32_t next = Desc(idx).next;
+
+        // Clear bitmap bit and update stats.
+        if (IsUsed(idx))
+        {
+            SetFree(idx);
+            g_freePages++;
+            if (idx < g_nextHint) g_nextHint = idx;
+        }
+
+        // Reset descriptor to free state (not in any list).
+        Desc(idx) = { PMM_NULL_PAGE, PMM_NULL_PAGE, 0,
+                      static_cast<uint8_t>(MemTag::Free), 0 };
+        count++;
+
+        idx = next;
+    }
+
+    g_pidLists[pid] = { PMM_NULL_PAGE, PMM_NULL_PAGE, 0, 0 };
+
+    SerialPrintf("PMM: PmmKillPid(%u): freed %u pages\n",
+                 static_cast<uint32_t>(pid), count);
+}
+
+void PmmEnumeratePid(uint16_t pid,
+                     bool (*callback)(uint64_t physAddr, MemTag tag, void* ctx),
+                     void* ctx)
+{
+    if (!g_pageDescs) return;
+
+    uint32_t idx = g_pidLists[pid].head;
+    while (idx != PMM_NULL_PAGE)
+    {
+        uint32_t next = Desc(idx).next;
+        if (!callback(static_cast<uint64_t>(idx) * PAGE_SIZE,
+                      static_cast<MemTag>(Desc(idx).tag), ctx))
+            break;
+        idx = next;
+    }
+}
+
+void PmmDumpPidStats()
+{
+    if (!g_pageDescs)
+    {
+        SerialPuts("PMM: tracking not enabled\n");
+        return;
+    }
+    SerialPuts("PMM: per-PID page counts:\n");
+    for (uint32_t p = 0; p < PMM_MAX_PIDS; p++)
+    {
+        if (g_pidLists[p].pageCount > 0)
+            SerialPrintf("  PID %u: %u pages\n", p, g_pidLists[p].pageCount);
+    }
 }
 
 uint64_t PmmGetFreePageCount()  { return g_freePages;  }

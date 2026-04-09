@@ -8,8 +8,10 @@ namespace brook {
 // Constants
 // ---------------------------------------------------------------------------
 
-static constexpr uint64_t PAGE_SIZE     = 4096;
-static constexpr uint64_t PHYS_MASK    = ~(PAGE_SIZE - 1);
+static constexpr uint64_t PAGE_SIZE  = 4096;
+// Physical address occupies bits [51:12] in a PTE.
+// Bits [11:0] are flags, bits [62:52] are used for PID, bit 63 is NX.
+static constexpr uint64_t PHYS_MASK = 0x000FFFFFFFFFF000ULL;
 
 // ---------------------------------------------------------------------------
 // VMALLOC bump allocator state
@@ -128,7 +130,8 @@ void VmmInit()
     SerialPuts("VMM: initialized\n");
 }
 
-bool VmmMapPage(uint64_t virtAddr, uint64_t physAddr, uint64_t flags)
+bool VmmMapPage(uint64_t virtAddr, uint64_t physAddr, uint64_t flags,
+                MemTag tag, uint16_t pid)
 {
     // Enforce null pointer guard: reject any mapping in the first 1GB.
     if (virtAddr < VIRTUAL_NULL_GUARD)
@@ -141,7 +144,13 @@ bool VmmMapPage(uint64_t virtAddr, uint64_t physAddr, uint64_t flags)
     uint64_t* pte = WalkToPtr(virtAddr, /*create=*/true);
     if (!pte) return false;
 
-    *pte = (physAddr & PHYS_MASK) | VMM_PRESENT | (flags & ~VMM_PRESENT);
+    // Encode tag in bits [9-11] and PID in bits [52-62].
+    *pte = (physAddr & PHYS_MASK)
+         | VMM_PRESENT
+         | (flags & ~(VMM_PRESENT | PTE_TAG_MASK | PTE_PID_MASK | VMM_NO_EXEC))
+         | (((uint64_t)(uint8_t)tag & 0x7) << PTE_TAG_SHIFT)
+         | (((uint64_t)pid & 0x7FF) << PTE_PID_SHIFT)
+         | (flags & VMM_NO_EXEC);
     Invlpg(virtAddr);
     return true;
 }
@@ -186,7 +195,7 @@ uint64_t VmmAllocPages(uint64_t pageCount, uint64_t flags, MemTag tag, uint16_t 
             return 0;
         }
 
-        if (!VmmMapPage(virtBase + i * PAGE_SIZE, phys, flags))
+        if (!VmmMapPage(virtBase + i * PAGE_SIZE, phys, flags, tag, pid))
         {
             PmmFreePage(phys);
             for (uint64_t j = 0; j < i; j++)
@@ -255,6 +264,39 @@ const VmmAllocation* VmmGetAllocation(uint64_t virtAddr)
             return &a;
     }
     return nullptr;
+}
+
+MemTag VmmGetPageTag(uint64_t virtAddr)
+{
+    uint64_t* pte = WalkToPtr(virtAddr, false);
+    if (!pte || !(*pte & VMM_PRESENT)) return MemTag::Free;
+    return static_cast<MemTag>((*pte & PTE_TAG_MASK) >> PTE_TAG_SHIFT);
+}
+
+uint16_t VmmGetPagePid(uint64_t virtAddr)
+{
+    uint64_t* pte = WalkToPtr(virtAddr, false);
+    if (!pte || !(*pte & VMM_PRESENT)) return KernelPid;
+    return static_cast<uint16_t>((*pte & PTE_PID_MASK) >> PTE_PID_SHIFT);
+}
+
+void VmmKillPid(uint16_t pid)
+{
+    if (pid == KernelPid) return;
+
+    // Walk the registration table and free all allocations for this PID.
+    for (uint32_t i = 0; i < VMM_MAX_ALLOCS; i++)
+    {
+        VmmAllocation& a = g_vmmAllocs[i];
+        if (a.virtBase != 0 && a.pid == pid)
+        {
+            VmmFreePages(a.virtBase, a.pageCount);
+            // VmmFreePages clears virtBase; loop continues from fresh state.
+        }
+    }
+
+    // Free any physical pages that were tracked at the PMM level.
+    PmmKillPid(pid);
 }
 
 } // namespace brook

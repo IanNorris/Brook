@@ -1,6 +1,7 @@
 #include "test_framework.h"
 #include "pmm.h"
 #include "vmm.h"
+#include "heap.h"
 
 TEST_MAIN("vmm", {
     brook::PmmInit(brook::test::g_protocol);
@@ -77,5 +78,35 @@ TEST_MAIN("vmm", {
     ASSERT_EQ(alloc->pageCount, (uint64_t)4);
     ASSERT_EQ((uint8_t)alloc->tag, (uint8_t)brook::MemTag::KernelData);
 
-    brook::SerialPrintf("VMM test: null guard OK, alloc tracking OK\n");
+    // -----------------------------------------------------------------------
+    // PTE tag/PID encoding tests
+    // -----------------------------------------------------------------------
+    brook::HeapInit();
+    brook::PmmEnableTracking();
+
+    // Allocate with explicit tag and PID — encoded in PTE available bits.
+    uint64_t tagged = brook::VmmAllocPages(2, brook::VMM_WRITABLE,
+                                           brook::MemTag::Heap, 42);
+    ASSERT_TRUE(tagged != 0);
+
+    // VmmGetPageTag/Pid must read back from the live PTE.
+    ASSERT_EQ(brook::VmmGetPageTag(tagged),          brook::MemTag::Heap);
+    ASSERT_EQ(brook::VmmGetPageTag(tagged + 4096),   brook::MemTag::Heap);
+    ASSERT_EQ(brook::VmmGetPagePid(tagged),          (uint16_t)42);
+    ASSERT_EQ(brook::VmmGetPagePid(tagged + 4096),   (uint16_t)42);
+
+    // Unmapped address must return Free/KernelPid.
+    ASSERT_EQ(brook::VmmGetPageTag(0xDEAD000000ULL), brook::MemTag::Free);
+    ASSERT_EQ(brook::VmmGetPagePid(0xDEAD000000ULL), brook::KernelPid);
+
+    // VmmKillPid frees virtual allocation and physical pages.
+    uint64_t freeBeforeKill = brook::PmmGetFreePageCount();
+    brook::VmmKillPid(42);
+    ASSERT_EQ(brook::PmmGetFreePageCount(), freeBeforeKill + 2);
+
+    // After kill, VmmGetAllocation should return nullptr for the freed range.
+    ASSERT_TRUE(brook::VmmGetAllocation(tagged) == nullptr);
+
+    brook::SerialPrintf("VMM test: null guard OK, PTE tag/pid roundtrip OK, "
+                        "VmmKillPid OK\n");
 })

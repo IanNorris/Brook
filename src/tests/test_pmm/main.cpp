@@ -1,5 +1,7 @@
 #include "test_framework.h"
 #include "pmm.h"
+#include "vmm.h"
+#include "heap.h"
 
 TEST_MAIN("pmm", {
     // --- Basic init ---
@@ -68,7 +70,58 @@ TEST_MAIN("pmm", {
     // checking it's not returned in a fresh allocation sequence.
     // Cheapest proxy: p1..p3 were all non-zero (already asserted above).
 
-    brook::SerialPrintf("PMM test: %u/%u pages free after test\n",
+    brook::SerialPrintf("PMM basic: %u/%u pages free\n",
                         (uint32_t)brook::PmmGetFreePageCount(),
                         (uint32_t)brook::PmmGetTotalPageCount());
+
+    // -----------------------------------------------------------------------
+    // Ownership tracking tests — requires full heap stack
+    // -----------------------------------------------------------------------
+    brook::VmmInit();
+    brook::HeapInit();
+    brook::PmmEnableTracking();
+
+    // Allocate pages tagged for PID 1 and verify tracking.
+    uint64_t tracked1 = brook::PmmAllocPage(brook::MemTag::KernelData, 1);
+    ASSERT_TRUE(tracked1 != 0);
+    ASSERT_EQ(brook::PmmGetTag(tracked1), brook::MemTag::KernelData);
+    ASSERT_EQ(brook::PmmGetPid(tracked1), (uint16_t)1);
+
+    uint64_t tracked2 = brook::PmmAllocPage(brook::MemTag::User, 1);
+    ASSERT_TRUE(tracked2 != 0);
+    ASSERT_EQ(brook::PmmGetTag(tracked2), brook::MemTag::User);
+    ASSERT_EQ(brook::PmmGetPid(tracked2), (uint16_t)1);
+
+    uint64_t freeBeforeKill = brook::PmmGetFreePageCount();
+
+    // PmmKillPid should return all PID 1 pages to the free pool.
+    brook::PmmKillPid(1);
+
+    // Both tracked pages should now be free.
+    ASSERT_EQ(brook::PmmGetFreePageCount(), freeBeforeKill + 2);
+    ASSERT_EQ(brook::PmmGetTag(tracked1), brook::MemTag::Free);
+    ASSERT_EQ(brook::PmmGetTag(tracked2), brook::MemTag::Free);
+    ASSERT_EQ(brook::PmmGetPid(tracked1), (uint16_t)0);
+
+    // PmmKillPid(0) = KernelPid must be a no-op.
+    uint64_t freeAfterKillKernel = brook::PmmGetFreePageCount();
+    brook::PmmKillPid(0);
+    ASSERT_EQ(brook::PmmGetFreePageCount(), freeAfterKillKernel);
+
+    // PmmDumpPidStats must not crash.
+    brook::PmmDumpPidStats();
+
+    // Enumerate PID 0 kernel pages (just check it completes without crash).
+    uint32_t enumCount = 0;
+    brook::PmmEnumeratePid(0, [](uint64_t, brook::MemTag, void* ctx) -> bool {
+        (*reinterpret_cast<uint32_t*>(ctx))++;
+        return true;
+    }, &enumCount);
+    ASSERT_TRUE(enumCount > 0);
+
+    brook::SerialPrintf("PMM tracking: %u/%u pages free, PID0 has %u pages\n",
+                        (uint32_t)brook::PmmGetFreePageCount(),
+                        (uint32_t)brook::PmmGetTotalPageCount(),
+                        enumCount);
 })
+
