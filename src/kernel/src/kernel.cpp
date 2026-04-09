@@ -11,6 +11,8 @@
 #include "acpi.h"
 #include "apic.h"
 #include "keyboard.h"
+#include "ksymtab.h"
+#include "module.h"
 #include "tty.h"
 #include "device.h"
 #include "pci.h"
@@ -227,6 +229,10 @@ extern "C" __attribute__((sysv_abi)) void KernelMain(brook::BootProtocol* bootPr
             }
         }
     }
+
+    // ---- Module loader: dump exported symbols, then discover /boot/drivers/ ----
+    brook::KsymDump();
+    brook::ModuleDiscoverAndLoad("/boot/drivers");
 
     // Keyboard init (after I/O APIC is set up).
     if (acpiOk) brook::KbdInit();

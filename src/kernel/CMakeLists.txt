@@ -112,6 +112,8 @@ add_executable(kernel
     src/idt.cpp
     src/keyboard.cpp
     src/kprintf.cpp
+    src/ksymtab.cpp
+    src/module.cpp
     src/panic.cpp
     src/pmm.cpp
     src/pci.cpp
@@ -182,4 +184,93 @@ target_link_options(kernel PRIVATE
 )
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "" FORCE)
+
+# ---------------------------------------------------------------------------
+# Driver module build system
+# ---------------------------------------------------------------------------
+# Modules are relocatable ELF64 objects (ET_REL) that the kernel loads at
+# runtime via ModuleLoad().  They are compiled with the same freestanding
+# kernel flags but linked with -r (partial link) instead of producing an
+# executable.
+#
+# Usage:
+#   add_driver_module(virtio_blk
+#       src/virtio_blk_mod.cpp
+#       src/pci.cpp
+#   )
+#
+# Output: build/drivers/<name>.mod
+# The run-qemu.sh script copies *.mod into build/esp/drivers/ so they
+# appear at /boot/drivers/ in the QEMU virtual FAT filesystem.
+
+set(DRIVER_MODULE_FLAGS
+    "--target=x86_64-elf"
+    "-ffreestanding"
+    "-fno-stack-protector"
+    "-mno-red-zone"
+    "-fno-asynchronous-unwind-tables"
+    "-mcmodel=kernel"
+    "-fno-exceptions"
+    "-fno-rtti"
+    "-g"
+    "-Wall" "-Wextra" "-Werror"
+    "-Wshadow"
+    "-Wno-unused-parameter"
+    "-msse2" "-mfpmath=sse"
+)
+
+set(DRIVER_MODULE_INCLUDE_DIRS
+    ${SHARED_INCLUDE_DIRS}
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${BROOK_ROOT}/src/third_party/fatfs/source"
+)
+
+# Output directory for .mod files.
+set(DRIVER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/drivers")
+file(MAKE_DIRECTORY "${DRIVER_OUTPUT_DIR}")
+
+function(add_driver_module mod_name)
+    set(MOD_SOURCES ${ARGN})
+    set(MOD_OBJ  "${DRIVER_OUTPUT_DIR}/${mod_name}.mod")
+
+    # Compile each source to an object, then partial-link with -r.
+    set(OBJ_FILES)
+    foreach(src IN LISTS MOD_SOURCES)
+        get_filename_component(src_name "${src}" NAME_WE)
+        set(obj "${DRIVER_OUTPUT_DIR}/${mod_name}_${src_name}.o")
+
+        add_custom_command(
+            OUTPUT  "${obj}"
+            COMMAND "${CMAKE_CXX_COMPILER}"
+                    ${DRIVER_MODULE_FLAGS}
+                    -I${DRIVER_MODULE_INCLUDE_DIRS}
+                    -c "${src}" -o "${obj}"
+            DEPENDS "${src}"
+            COMMENT "Compiling module source ${src}"
+            VERBATIM
+        )
+        list(APPEND OBJ_FILES "${obj}")
+    endforeach()
+
+    # Partial link → relocatable ELF (.mod).
+    add_custom_command(
+        OUTPUT  "${MOD_OBJ}"
+        COMMAND "${CMAKE_CXX_COMPILER}"
+                "--target=x86_64-elf"
+                "-nostdlib" "-r"
+                ${OBJ_FILES}
+                -o "${MOD_OBJ}"
+        DEPENDS ${OBJ_FILES}
+        COMMENT "Linking driver module ${mod_name}.mod"
+        VERBATIM
+    )
+
+    add_custom_target("module_${mod_name}" ALL DEPENDS "${MOD_OBJ}")
+endfunction()
+
+# Add driver module subdirectory (will be populated when drivers are extracted).
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/drivers/CMakeLists.txt")
+    add_subdirectory(drivers)
+endif()
+
 

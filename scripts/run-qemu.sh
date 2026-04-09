@@ -104,6 +104,15 @@ echo "  ESP:  ${BUILD_DIR}/esp"
 DISK_IMG="${BUILD_DIR}/brook_disk.img"
 python3 "${SCRIPT_DIR}/make_disk_image.py" "${BUILD_DIR}"
 
+# Install driver modules into the ESP under /drivers/
+# (served by QEMU as /boot/drivers/ once virtio disk is mounted at /boot)
+DRIVERS_DIR="${BUILD_DIR}/esp/drivers"
+mkdir -p "${DRIVERS_DIR}"
+if ls "${BUILD_DIR}/kernel/drivers/"*.mod &>/dev/null 2>&1; then
+    cp "${BUILD_DIR}/kernel/drivers/"*.mod "${DRIVERS_DIR}/"
+    echo "Installed driver modules: $(ls "${DRIVERS_DIR}"/*.mod | xargs -n1 basename | tr '\n' ' ')"
+fi
+
 qemu-system-x86_64 \
     -machine q35 \
     -cpu qemu64 \

@@ -13,6 +13,13 @@ SECTIONS
         *(.rodata .rodata.*)
     }
 
+    /* Kernel symbol export table — bounded by __start/__stop for KsymLookup. */
+    .ksymtab : ALIGN(8) {
+        __start_ksymtab = .;
+        *(.ksymtab)
+        __stop_ksymtab = .;
+    }
+
     .data : ALIGN(4096) {
         *(.data .data.*)
     }
