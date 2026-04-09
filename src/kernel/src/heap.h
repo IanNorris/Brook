@@ -16,19 +16,19 @@ namespace brook {
 // Expansion: the heap grows by calling VmmAllocPages() when exhausted.
 
 // Initialise the heap. Must be called after VmmInit().
-void HeapInit();
+extern "C" void HeapInit();
 
 // Allocate at least 'size' bytes. Returns a 16-byte-aligned pointer, or
 // nullptr on failure. Requesting 0 bytes returns nullptr.
-void* kmalloc(uint64_t size);
+extern "C" void* kmalloc(uint64_t size);
 
 // Free a pointer returned by kmalloc. No-op on nullptr.
 // Writes a trap value over the header if HEAP_POISON is defined.
-void kfree(void* ptr);
+extern "C" void kfree(void* ptr);
 
 // Resize an allocation. Equivalent to alloc+copy+free if the block cannot
 // be extended in-place. Returns nullptr (and leaves ptr untouched) on failure.
-void* krealloc(void* ptr, uint64_t newSize);
+extern "C" void* krealloc(void* ptr, uint64_t newSize);
 
 // Diagnostic: return number of free bytes in the current heap region.
 uint64_t HeapFreeBytes();

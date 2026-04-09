@@ -18,6 +18,9 @@ extern "C" brook::KernelSymbol __stop_ksymtab[];
 #include "fatfs_glue.h"
 #include "serial.h"
 #include "panic.h"
+#include "pci.h"
+#include "virtio_blk.h"
+#include "keyboard.h"
 
 // Bring all brook:: names into scope so EXPORT_SYMBOL(fn) resolves correctly.
 using namespace brook;
@@ -58,6 +61,21 @@ EXPORT_SYMBOL(VfsReaddir);
 
 // FatFS glue
 EXPORT_SYMBOL(FatFsBindDrive);
+
+// PCI
+EXPORT_SYMBOL(PciFindDevice);
+EXPORT_SYMBOL(PciFindNextDevice);
+EXPORT_SYMBOL(PciEnumerate);
+EXPORT_SYMBOL(PciEnableBusMaster);
+
+// virtio-blk
+EXPORT_SYMBOL(VirtioBlkInitAll);
+
+// Keyboard
+EXPORT_SYMBOL(KbdInit);
+EXPORT_SYMBOL(KbdGetChar);
+EXPORT_SYMBOL(KbdPeekChar);
+EXPORT_SYMBOL(KbdIsAvailable);
 
 // Panic
 EXPORT_SYMBOL(KernelPanic);

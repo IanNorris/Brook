@@ -69,17 +69,17 @@ void VmmUnmapPage(uint64_t virtAddr);
 // tag/pid are recorded in the VMM allocation table and stamped on each
 // backing physical page via PmmSetOwner.
 // Returns the virtual base address, or 0 on failure.
-uint64_t VmmAllocPages(uint64_t pageCount,
+extern "C" uint64_t VmmAllocPages(uint64_t pageCount,
                        uint64_t flags = VMM_WRITABLE,
                        MemTag tag     = MemTag::KernelData,
                        uint16_t pid   = KernelPid);
 
 // Free pages previously allocated with VmmAllocPages.
-void VmmFreePages(uint64_t virtAddr, uint64_t pageCount);
+extern "C" void VmmFreePages(uint64_t virtAddr, uint64_t pageCount);
 
 // Translate virtual → physical by walking the live page tables.
 // Returns 0 if the address is not mapped.
-uint64_t VmmVirtToPhys(uint64_t virtAddr);
+extern "C" uint64_t VmmVirtToPhys(uint64_t virtAddr);
 
 // Look up the allocation record for a VMALLOC address. Returns nullptr if not found.
 const VmmAllocation* VmmGetAllocation(uint64_t virtAddr);

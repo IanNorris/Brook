@@ -53,11 +53,11 @@ void PmmEnableTracking();
 // Allocate a single 4KB page frame.
 // tag and pid default to KernelData/KernelPid for convenience.
 // Returns the physical address on success, 0 on out-of-memory.
-uint64_t PmmAllocPage(MemTag tag = MemTag::KernelData, uint16_t pid = KernelPid);
+extern "C" uint64_t PmmAllocPage(MemTag tag = MemTag::KernelData, uint16_t pid = KernelPid);
 
 // Allocate 'count' contiguous 4KB page frames with the given tag/pid.
 // Returns the physical base address on success, 0 if no contiguous run found.
-uint64_t PmmAllocPages(uint64_t count,
+extern "C" uint64_t PmmAllocPages(uint64_t count,
                        MemTag tag = MemTag::KernelData,
                        uint16_t pid = KernelPid);
 

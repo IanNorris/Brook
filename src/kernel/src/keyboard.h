@@ -21,13 +21,18 @@ static constexpr uint8_t KBD_IRQ_VECTOR = 33;
 
 // Initialise the PS/2 keyboard: install the IRQ1 handler and unmask it
 // in the I/O APIC.
-void KbdInit();
+extern "C" void KbdInit();
+
+// Returns true if KbdInit() has been called successfully.
+// Callers that want to use the keyboard (e.g. an echo loop) should check
+// this before blocking on KbdGetChar().
+extern "C" bool KbdIsAvailable();
 
 // Non-blocking: return the next character from the ring buffer,
 // or 0 if the buffer is empty.
-char KbdPeekChar();
+extern "C" char KbdPeekChar();
 
 // Blocking: spin until a character is available, then return it.
-char KbdGetChar();
+extern "C" char KbdGetChar();
 
 } // namespace brook

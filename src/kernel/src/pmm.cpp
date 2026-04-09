@@ -3,10 +3,11 @@
 
 // Forward-declared to avoid circular headers: vmm.h ↔ pmm.h.
 // VMM_WRITABLE = bit 1; MemTag::KernelData = 2; KernelPid = 0.
+// extern "C" must match the declarations in vmm.h / heap.h.
 namespace brook {
-    void*    kmalloc(uint64_t);
-    uint64_t VmmAllocPages(uint64_t pageCount, uint64_t flags,
-                           MemTag tag, uint16_t pid);
+    extern "C" void*    kmalloc(uint64_t);
+    extern "C" uint64_t VmmAllocPages(uint64_t pageCount, uint64_t flags,
+                                      MemTag tag, uint16_t pid);
 }
 
 // Linker-defined symbol — end of the kernel image (virtual address).

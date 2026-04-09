@@ -56,36 +56,36 @@ struct VnodeStat {
 // ---- VFS API ----
 
 // Initialise the VFS subsystem (call once at boot).
-void VfsInit();
+extern "C" void VfsInit();
 
 // Mount a filesystem at a path prefix.
 // fsName identifies the filesystem type ("fatfs" for now).
 // pdrv is the FatFS physical drive number that was bound via FatFsBindDrive().
 // mountPoint must start with '/' (e.g. "/", "/boot").
 // Returns true on success.
-bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv);
+extern "C" bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv);
 
 // Unmount the filesystem at mountPoint.  The mount entry is cleared and
 // f_unmount is called.  Returns true if a matching mount was found.
-bool VfsUnmount(const char* mountPoint);
+extern "C" bool VfsUnmount(const char* mountPoint);
 
 // Open a file or directory.  Caller owns the returned Vnode*; call VfsClose().
 // Returns nullptr on error.
-Vnode* VfsOpen(const char* path, int flags = 0);
+extern "C" Vnode* VfsOpen(const char* path, int flags = 0);
 
 // Read from a file vnode.  Wrapper around vn->ops->read.
-int VfsRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset);
+extern "C" int VfsRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset);
 
 // Write to a file vnode.
-int VfsWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset);
+extern "C" int VfsWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset);
 
 // Read directory entries.  *cookie starts at 0.
-int VfsReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie);
+extern "C" int VfsReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie);
 
 // Stat a vnode.
 int VfsStat(Vnode* vn, VnodeStat* st);
 
 // Close and free a vnode.
-void VfsClose(Vnode* vn);
+extern "C" void VfsClose(Vnode* vn);
 
 } // namespace brook

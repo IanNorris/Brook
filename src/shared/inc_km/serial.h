@@ -3,11 +3,14 @@
 
 namespace brook {
 
-void SerialInit();
-void SerialPutChar(char c);
-void SerialPuts(const char* str);
+// All functions have C linkage so driver modules can call them
+// by unmangled name via the kernel symbol table (KsymLookup).
+
+extern "C" void SerialInit();
+extern "C" void SerialPutChar(char c);
+extern "C" void SerialPuts(const char* str);
 // Minimal printf-like: supports %s %d %u %x %lu %lx %ld %p %c %%
-void SerialPrintf(const char* fmt, ...);
-void SerialVPrintf(const char* fmt, __builtin_va_list args);
+extern "C" void SerialPrintf(const char* fmt, ...);
+extern "C" void SerialVPrintf(const char* fmt, __builtin_va_list args);
 
 } // namespace brook

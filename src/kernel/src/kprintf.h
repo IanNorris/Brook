@@ -10,13 +10,13 @@
 namespace brook {
 
 // Must be called once SerialInit() has been called.  No-op after that.
-void KPrintfInit();
+extern "C" void KPrintfInit();
 
 // Output a null-terminated string to serial + TTY.
-void KPuts(const char* str);
+extern "C" void KPuts(const char* str);
 
 // printf-style output to serial + TTY.
 // Supports: %s %d %u %x %lu %lx %ld %p %c %%
-void KPrintf(const char* fmt, ...);
+extern "C" void KPrintf(const char* fmt, ...);
 
 } // namespace brook

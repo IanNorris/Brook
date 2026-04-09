@@ -273,6 +273,9 @@ static void KbdIrqHandler(InterruptFrame* frame)
 // Public API
 // ---------------------------------------------------------------------------
 
+// Tracks whether KbdInit() has been called.
+static bool g_kbdInitialized = false;
+
 void KbdInit()
 {
     // Flush any stale bytes in the PS/2 output buffer.
@@ -283,7 +286,13 @@ void KbdInit()
                       reinterpret_cast<void*>(KbdIrqHandler));
     IoApicUnmaskIrq(1, KBD_IRQ_VECTOR);
 
+    g_kbdInitialized = true;
     KPuts("KBD: PS/2 keyboard ready (IRQ1 → vector 33)\n");
+}
+
+bool KbdIsAvailable()
+{
+    return g_kbdInitialized;
 }
 
 char KbdPeekChar()

@@ -18,7 +18,7 @@ namespace brook {
 
 // Scan PCI, initialise ALL virtio-blk devices found, register each in the device
 // registry as "virtio0", "virtio1", ...  Returns the number of devices registered.
-uint32_t VirtioBlkInitAll();
+extern "C" uint32_t VirtioBlkInitAll();
 
 // Marker filename written to each disk image to identify its mount purpose.
 // A disk containing this file at its root gets mounted at the path it specifies.

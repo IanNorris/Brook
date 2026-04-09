@@ -233,6 +233,12 @@ function(add_driver_module mod_name)
     set(MOD_SOURCES ${ARGN})
     set(MOD_OBJ  "${DRIVER_OUTPUT_DIR}/${mod_name}.mod")
 
+    # Build -I flags from the list.
+    set(INCLUDE_FLAGS)
+    foreach(inc IN LISTS DRIVER_MODULE_INCLUDE_DIRS)
+        list(APPEND INCLUDE_FLAGS "-I${inc}")
+    endforeach()
+
     # Compile each source to an object, then partial-link with -r.
     set(OBJ_FILES)
     foreach(src IN LISTS MOD_SOURCES)
@@ -243,7 +249,7 @@ function(add_driver_module mod_name)
             OUTPUT  "${obj}"
             COMMAND "${CMAKE_CXX_COMPILER}"
                     ${DRIVER_MODULE_FLAGS}
-                    -I${DRIVER_MODULE_INCLUDE_DIRS}
+                    ${INCLUDE_FLAGS}
                     -c "${src}" -o "${obj}"
             DEPENDS "${src}"
             COMMENT "Compiling module source ${src}"

@@ -2,8 +2,9 @@
 """Create a FAT16 disk image for virtio-blk testing.
 
 Produces a 1MB raw FAT16 image at <build_dir>/brook_disk.img containing:
-  BROOK.MNT   (mount target declaration — tells the kernel where to mount this volume)
-  BROOK.CFG   (boot config sample)
+  BROOK.MNT       (mount target: /boot)
+  BROOK.CFG       (boot config sample)
+  DRIVERS/        (driver modules copied from <build_dir>/kernel/drivers/*.mod)
   TEST/HELLO.TXT
 
 Usage:
@@ -13,7 +14,7 @@ Usage:
 import subprocess
 import sys
 import os
-import shutil
+import glob
 import tempfile
 
 def run(cmd):
@@ -60,8 +61,21 @@ def main():
         run(["mmd",   "-i", img_path, "::TEST"])
         run(["mcopy", "-i", img_path, hello, "::TEST/HELLO.TXT"])
 
+        # DRIVERS/ — copy any .mod files from build/kernel/drivers/
+        mod_dir = os.path.join(build_dir, "kernel", "drivers")
+        mod_files = sorted(glob.glob(os.path.join(mod_dir, "*.mod")))
+        if mod_files:
+            run(["mmd", "-i", img_path, "::DRIVERS"])
+            for mod in mod_files:
+                mod_name = os.path.basename(mod).upper()
+                run(["mcopy", "-i", img_path, mod, f"::DRIVERS/{mod_name}"])
+                print(f"  Added module: DRIVERS/{mod_name} ({os.path.getsize(mod)} bytes)")
+        else:
+            print(f"  No .mod files found in {mod_dir} (run build first)")
+
     print(f"Disk image written to {img_path}")
 
 if __name__ == "__main__":
     main()
+
 

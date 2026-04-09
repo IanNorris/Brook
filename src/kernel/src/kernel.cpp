@@ -230,34 +230,55 @@ extern "C" __attribute__((sysv_abi)) void KernelMain(brook::BootProtocol* bootPr
         }
     }
 
-    // ---- Module loader: dump exported symbols, then discover /boot/drivers/ ----
+    // ---- Module loader ----
+    // Phase 1: load early modules from embedded ramdisk (mounted at "/").
+    //   These run before virtio, so they can't access /boot yet.
+    //   Keyboard is NOT here — it needs APIC which is already set up, but
+    //   we prefer loading it from the virtio disk for demonstration.
     brook::KsymDump();
+    brook::ModuleDiscoverAndLoad("/drivers");
+
+    // Phase 2: load late modules from /boot/drivers (virtio disk).
+    //   ps2_kbd.mod and virtio_blk.mod live here.
     brook::ModuleDiscoverAndLoad("/boot/drivers");
 
-    // Keyboard init (after I/O APIC is set up).
-    if (acpiOk) brook::KbdInit();
+    // Keyboard: the ps2_kbd module calls KbdInit(). If the module wasn't
+    // loaded (e.g. no /boot), fall back to initialising directly.
+    if (acpiOk && !brook::KbdIsAvailable())
+    {
+        brook::KPuts("KBD: ps2_kbd module not loaded — falling back to direct init\n");
+        brook::KbdInit();
+    }
 
     // Enable interrupts.
     __asm__ volatile("sti");
 
     // Simple echo loop — type to see output on TTY and serial.
-    brook::KPuts("\nType something (keyboard echo):\n> ");
-    for (;;)
+    if (brook::KbdIsAvailable())
     {
-        char c = brook::KbdGetChar();
-        if (c == '\b')
+        brook::KPuts("\nType something (keyboard echo):\n> ");
+        for (;;)
         {
-            // Rudimentary backspace: overwrite with space.
-            brook::KPuts("\b \b");
+            char c = brook::KbdGetChar();
+            if (c == '\b')
+            {
+                // Rudimentary backspace: overwrite with space.
+                brook::KPuts("\b \b");
+            }
+            else if (c == '\n')
+            {
+                brook::KPuts("\n> ");
+            }
+            else
+            {
+                char buf[2] = { c, '\0' };
+                brook::KPuts(buf);
+            }
         }
-        else if (c == '\n')
-        {
-            brook::KPuts("\n> ");
-        }
-        else
-        {
-            char buf[2] = { c, '\0' };
-            brook::KPuts(buf);
-        }
+    }
+    else
+    {
+        brook::KPuts("\nNo keyboard available — halting.\n");
+        for (;;) { __asm__ volatile("hlt"); }
     }
 }

@@ -65,14 +65,14 @@ struct Device {
 
 // Register a device.  Returns true on success; false if the table is full
 // or a device with the same name is already registered.
-bool DeviceRegister(Device* dev);
+extern "C" bool DeviceRegister(Device* dev);
 
 // Find a device by exact name.  Returns nullptr if not found.
-Device* DeviceFind(const char* name);
+extern "C" Device* DeviceFind(const char* name);
 
 // Iterate over all devices of a given type.
 // Calls cb(dev, ctx) for each match.  Stops if cb returns false.
-void DeviceIterate(DeviceType type, bool (*cb)(Device* dev, void* ctx), void* ctx);
+extern "C" void DeviceIterate(DeviceType type, bool (*cb)(Device* dev, void* ctx), void* ctx);
 
 // ---- Convenience wrappers for block devices ----
 

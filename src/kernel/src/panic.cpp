@@ -126,7 +126,7 @@ static int PanicFormatStr(char* buf, int cap, const char* fmt, __builtin_va_list
 
 // ---- KernelPanic ------------------------------------------------------------
 
-[[noreturn]] void KernelPanic(const char* fmt, ...)
+__attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
 {
     __asm__ volatile("cli");
 
