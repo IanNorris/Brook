@@ -6,9 +6,18 @@ TEST_MAIN("vmm", {
     brook::PmmInit(brook::test::g_protocol);
     brook::VmmInit();
 
-    // --- VmmAllocPages returns page-aligned non-zero address ---
-    uint64_t p = brook::VmmAllocPages(1);
+    // --- Null guard: mapping below 1GB must be rejected ---
+    bool nullMapped = brook::VmmMapPage(0, 0x1000, brook::VMM_WRITABLE);
+    ASSERT_FALSE(nullMapped);
+    bool lowMapped = brook::VmmMapPage(0x10000, 0x1000, brook::VMM_WRITABLE);
+    ASSERT_FALSE(lowMapped);
+    bool guardEdge = brook::VmmMapPage(brook::VIRTUAL_NULL_GUARD - 4096, 0x1000, brook::VMM_WRITABLE);
+    ASSERT_FALSE(guardEdge);
+
+    // --- VmmAllocPages returns page-aligned non-zero address (above guard) ---
+    uint64_t p = brook::VmmAllocPages(1, brook::VMM_WRITABLE, brook::MemTag::KernelData);
     ASSERT_TRUE(p != 0);
+    ASSERT_TRUE(p >= brook::VIRTUAL_NULL_GUARD);
     ASSERT_EQ(p & 0xFFF, (uint64_t)0);
 
     // --- Write and read back across the page ---
@@ -21,42 +30,37 @@ TEST_MAIN("vmm", {
     // --- VmmVirtToPhys returns consistent physical address ---
     uint64_t phys = brook::VmmVirtToPhys(p);
     ASSERT_TRUE(phys != 0);
-    ASSERT_EQ(phys & 0xFFF, (uint64_t)0); // page-aligned
+    ASSERT_EQ(phys & 0xFFF, (uint64_t)0);
 
-    // The physical page is also accessible via identity map (phys == virt):
+    // Physical page accessible via identity map (phys == virt):
     uint32_t* physPage = reinterpret_cast<uint32_t*>(phys);
     ASSERT_EQ(physPage[0], (uint32_t)0xDEAD0000);
     ASSERT_EQ(physPage[42], (uint32_t)(0xDEAD0000 + 42));
 
-    // --- VmmMapPage: map the SAME physical page at a second virtual address ---
-    uint64_t p2 = brook::VmmAllocPages(1);
+    // --- Alias: remap p2's virtual to the same physical page as p ---
+    uint64_t p2 = brook::VmmAllocPages(1, brook::VMM_WRITABLE, brook::MemTag::KernelData);
     ASSERT_TRUE(p2 != 0);
-    ASSERT_NE(p, p2); // distinct virtual addresses
+    ASSERT_NE(p, p2);
 
-    // Remap p2's virtual to p's physical.
-    brook::VmmUnmapPage(p2);           // drop the page VmmAllocPages gave it
+    brook::VmmUnmapPage(p2);
     bool ok = brook::VmmMapPage(p2, phys, brook::VMM_WRITABLE);
     ASSERT_TRUE(ok);
 
     uint32_t* alias = reinterpret_cast<uint32_t*>(p2);
-    ASSERT_EQ(alias[0], (uint32_t)0xDEAD0000);  // same physical page
-
-    // Write through alias, read back through original.
+    ASSERT_EQ(alias[0], (uint32_t)0xDEAD0000);
     alias[0] = 0xCAFEBABE;
     ASSERT_EQ(page[0], (uint32_t)0xCAFEBABE);
 
-    // --- VmmFreePages releases physical pages back to PMM ---
+    // --- PMM free count accounting ---
     uint64_t freeBefore = brook::PmmGetFreePageCount();
     brook::VmmFreePages(p, 1);
-    uint64_t freeAfter = brook::PmmGetFreePageCount();
-    ASSERT_EQ(freeAfter, freeBefore + 1);
+    ASSERT_EQ(brook::PmmGetFreePageCount(), freeBefore + 1);
 
     // --- Multi-page allocation ---
-    uint64_t multi = brook::VmmAllocPages(4);
+    uint64_t multi = brook::VmmAllocPages(4, brook::VMM_WRITABLE, brook::MemTag::KernelData);
     ASSERT_TRUE(multi != 0);
     ASSERT_EQ(multi & 0xFFF, (uint64_t)0);
 
-    // All 4 pages should be accessible and distinct phys addresses.
     uint64_t prev_phys = 0;
     for (int i = 0; i < 4; i++) {
         uint64_t virt = multi + (uint64_t)i * 4096;
@@ -66,6 +70,12 @@ TEST_MAIN("vmm", {
         prev_phys = ph;
     }
 
-    brook::SerialPrintf("VMM test: VMALLOC next=0x%p\n",
-        reinterpret_cast<void*>(brook::VMALLOC_BASE));
+    // --- VmmGetAllocation: registration table populated ---
+    const brook::VmmAllocation* alloc = brook::VmmGetAllocation(multi);
+    ASSERT_TRUE(alloc != nullptr);
+    ASSERT_EQ(alloc->virtBase, multi);
+    ASSERT_EQ(alloc->pageCount, (uint64_t)4);
+    ASSERT_EQ((uint8_t)alloc->tag, (uint8_t)brook::MemTag::KernelData);
+
+    brook::SerialPrintf("VMM test: null guard OK, alloc tracking OK\n");
 })

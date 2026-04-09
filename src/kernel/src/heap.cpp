@@ -1,6 +1,7 @@
 #include "heap.h"
 #include "vmm.h"
 #include "serial.h"
+#include "mem_tag.h"
 
 namespace brook {
 
@@ -115,7 +116,7 @@ static void WriteBlock(uint8_t* base, uint32_t size, uint32_t free)
 // Expand the heap by EXPAND_PAGES via VMM. Returns false on failure.
 static bool ExpandHeap()
 {
-    uint64_t newVirt = VmmAllocPages(EXPAND_PAGES);
+    uint64_t newVirt = VmmAllocPages(EXPAND_PAGES, VMM_WRITABLE, MemTag::Heap, KernelPid);
     if (newVirt == 0) return false;
 
     uint8_t* newRegion = reinterpret_cast<uint8_t*>(newVirt);
@@ -175,7 +176,7 @@ static bool ExpandHeap()
 
 void HeapInit()
 {
-    uint64_t virtBase = VmmAllocPages(INITIAL_PAGES);
+    uint64_t virtBase = VmmAllocPages(INITIAL_PAGES, VMM_WRITABLE, MemTag::Heap, KernelPid);
     if (virtBase == 0)
     {
         SerialPuts("Heap: FATAL: initial allocation failed\n");

@@ -39,10 +39,13 @@ endfunction()
 add_brook_test(test_memory_map)
 add_brook_test(test_pmm
     "${BROOK_ROOT}/src/kernel/src/pmm.cpp"
+    "${BROOK_ROOT}/src/kernel/src/vmm.cpp"
+    "${BROOK_ROOT}/src/kernel/src/heap.cpp"
 )
 add_brook_test(test_vmm
     "${BROOK_ROOT}/src/kernel/src/pmm.cpp"
     "${BROOK_ROOT}/src/kernel/src/vmm.cpp"
+    "${BROOK_ROOT}/src/kernel/src/heap.cpp"
 )
 add_brook_test(test_heap
     "${BROOK_ROOT}/src/kernel/src/pmm.cpp"

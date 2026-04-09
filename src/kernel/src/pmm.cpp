@@ -1,6 +1,9 @@
 #include "pmm.h"
 #include "serial.h"
 
+// heap.h included below for PmmEnableTracking — forward-declared to avoid circular dep.
+namespace brook { void* kmalloc(uint64_t); }
+
 // Linker-defined symbol — end of the kernel image (virtual address).
 // Declared outside any namespace so the linker resolves it correctly.
 extern "C" uint8_t __kernel_end_sym[] __asm__("__kernel_end");
@@ -8,7 +11,7 @@ extern "C" uint8_t __kernel_end_sym[] __asm__("__kernel_end");
 namespace brook {
 
 // ---------------------------------------------------------------------------
-// Bitmap storage — 2MB in BSS (zeroed by ELF loader), covers 64GB physical.
+// Bitmap storage — 4MB in BSS (zeroed by ELF loader), covers 128GB physical.
 // Bit = 0 means free, bit = 1 means used/reserved.
 // ---------------------------------------------------------------------------
 
@@ -21,6 +24,21 @@ static uint64_t g_bitmap[BITMAP_WORDS]; // in BSS, starts zeroed
 static uint64_t g_totalPages = 0;       // highest tracked page index
 static uint64_t g_freePages  = 0;
 static uint64_t g_nextHint   = 0;       // search hint for fast sequential alloc
+
+// ---------------------------------------------------------------------------
+// Ownership tracking — dynamically allocated after PmmEnableTracking().
+// Null until then; all tag/pid operations are no-ops before that.
+// ---------------------------------------------------------------------------
+
+static MemTag*   g_pageTags = nullptr;   // [g_totalPages] uint8_t
+static uint16_t* g_pagePids = nullptr;   // [g_totalPages] uint16_t
+
+static inline void TrackSet(uint64_t pageIdx, MemTag tag, uint16_t pid)
+{
+    if (!g_pageTags || pageIdx >= g_totalPages) return;
+    g_pageTags[pageIdx] = tag;
+    g_pagePids[pageIdx] = pid;
+}
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -145,7 +163,7 @@ void PmmInit(const BootProtocol* proto)
                  static_cast<uint32_t>((g_totalPages * PAGE_SIZE) / (1024 * 1024)));
 }
 
-uint64_t PmmAllocPage()
+uint64_t PmmAllocPage(MemTag tag, uint16_t pid)
 {
     // Search from hint forward, then wrap around once.
     uint64_t startWord = g_nextHint / 64;
@@ -168,16 +186,17 @@ uint64_t PmmAllocPage()
             SetUsed(idx);
             g_freePages--;
             g_nextHint = idx + 1;
+            TrackSet(idx, tag, pid);
             return idx * PAGE_SIZE;
         }
     }
     return 0; // out of memory
 }
 
-uint64_t PmmAllocPages(uint64_t count)
+uint64_t PmmAllocPages(uint64_t count, MemTag tag, uint16_t pid)
 {
     if (count == 0) return 0;
-    if (count == 1) return PmmAllocPage();
+    if (count == 1) return PmmAllocPage(tag, pid);
 
     // Linear scan for a contiguous run of 'count' free pages.
     uint64_t runStart = 0;
@@ -191,11 +210,11 @@ uint64_t PmmAllocPages(uint64_t count)
             runLen++;
             if (runLen == count)
             {
-                // Mark the run as used and return.
                 for (uint64_t i = 0; i < count; i++)
                 {
                     SetUsed(runStart + i);
                     g_freePages--;
+                    TrackSet(runStart + i, tag, pid);
                 }
                 return runStart * PAGE_SIZE;
             }
@@ -219,7 +238,56 @@ void PmmFreePage(uint64_t physAddr)
 
     SetFree(idx);
     g_freePages++;
-    if (idx < g_nextHint) g_nextHint = idx; // update hint for faster next alloc
+    if (idx < g_nextHint) g_nextHint = idx;
+    TrackSet(idx, MemTag::Free, 0);
+}
+
+void PmmSetOwner(uint64_t physAddr, MemTag tag, uint16_t pid)
+{
+    if ((physAddr & (PAGE_SIZE - 1)) != 0) return;
+    TrackSet(physAddr / PAGE_SIZE, tag, pid);
+}
+
+MemTag PmmGetTag(uint64_t physAddr)
+{
+    if (!g_pageTags) return MemTag::KernelData; // tracking not yet enabled
+    uint64_t idx = physAddr / PAGE_SIZE;
+    if (idx >= g_totalPages) return MemTag::Reserved;
+    return g_pageTags[idx];
+}
+
+uint16_t PmmGetPid(uint64_t physAddr)
+{
+    if (!g_pagePids) return KernelPid;
+    uint64_t idx = physAddr / PAGE_SIZE;
+    if (idx >= g_totalPages) return KernelPid;
+    return g_pagePids[idx];
+}
+
+void PmmEnableTracking()
+{
+    // Allocate tag and PID arrays sized to actual RAM detected at init.
+    g_pageTags = reinterpret_cast<MemTag*>(kmalloc(g_totalPages * sizeof(MemTag)));
+    g_pagePids = reinterpret_cast<uint16_t*>(kmalloc(g_totalPages * sizeof(uint16_t)));
+
+    if (!g_pageTags || !g_pagePids)
+    {
+        SerialPuts("PMM: WARNING: tracking allocation failed — ownership disabled\n");
+        g_pageTags = nullptr;
+        g_pagePids = nullptr;
+        return;
+    }
+
+    // Backfill: mark all currently-used pages as KernelData, free pages as Free.
+    for (uint64_t i = 0; i < g_totalPages; i++)
+    {
+        g_pageTags[i] = IsUsed(i) ? MemTag::KernelData : MemTag::Free;
+        g_pagePids[i] = KernelPid;
+    }
+
+    SerialPrintf("PMM: tracking enabled — %u pages (tag+pid arrays: %u KB)\n",
+                 static_cast<uint32_t>(g_totalPages),
+                 static_cast<uint32_t>((g_totalPages * 3) / 1024));
 }
 
 uint64_t PmmGetFreePageCount()  { return g_freePages;  }

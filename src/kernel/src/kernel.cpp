@@ -52,6 +52,7 @@ extern "C" __attribute__((sysv_abi)) void KernelMain(brook::BootProtocol* bootPr
 
     brook::VmmInit();
     brook::HeapInit();
+    brook::PmmEnableTracking();
 
     const brook::Framebuffer& fb = bootProtocol->framebuffer;
     brook::SerialPrintf("Framebuffer: %ux%u @ 0x%p\n",

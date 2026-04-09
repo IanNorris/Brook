@@ -9,13 +9,36 @@ namespace brook {
 // ---------------------------------------------------------------------------
 
 static constexpr uint64_t PAGE_SIZE     = 4096;
-static constexpr uint64_t PHYS_MASK    = ~(PAGE_SIZE - 1);  // mask off flag bits
+static constexpr uint64_t PHYS_MASK    = ~(PAGE_SIZE - 1);
 
 // ---------------------------------------------------------------------------
 // VMALLOC bump allocator state
 // ---------------------------------------------------------------------------
 
 static uint64_t g_vmallocNext = VMALLOC_BASE;
+
+// ---------------------------------------------------------------------------
+// Allocation registration table — 1024 static slots.
+// Tracks every VmmAllocPages call for diagnostics and ownership queries.
+// ---------------------------------------------------------------------------
+
+static constexpr uint32_t VMM_MAX_ALLOCS = 1024;
+static VmmAllocation g_vmmAllocs[VMM_MAX_ALLOCS] = {};
+
+static VmmAllocation* FindAllocSlot(uint64_t virtBase)
+{
+    // Exact match on virtBase.
+    for (uint32_t i = 0; i < VMM_MAX_ALLOCS; i++)
+        if (g_vmmAllocs[i].virtBase == virtBase) return &g_vmmAllocs[i];
+    return nullptr;
+}
+
+static VmmAllocation* FindFreeSlot()
+{
+    for (uint32_t i = 0; i < VMM_MAX_ALLOCS; i++)
+        if (g_vmmAllocs[i].virtBase == 0) return &g_vmmAllocs[i];
+    return nullptr;
+}
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -33,47 +56,39 @@ static inline void Invlpg(uint64_t virtAddr)
     __asm__ volatile("invlpg (%0)" : : "r"(virtAddr) : "memory");
 }
 
-// Zero a physical page. We access it via the identity map (phys == virt).
 static inline void ZeroPage(uint64_t physAddr)
 {
     uint64_t* p = reinterpret_cast<uint64_t*>(physAddr);
     for (int i = 0; i < 512; i++) p[i] = 0;
 }
 
-// Decode PML4/PDPT/PD/PT indices from a virtual address.
 static inline uint64_t Pml4Index(uint64_t v) { return (v >> 39) & 0x1FF; }
 static inline uint64_t PdptIndex(uint64_t v) { return (v >> 30) & 0x1FF; }
 static inline uint64_t PdIndex(uint64_t v)   { return (v >> 21) & 0x1FF; }
 static inline uint64_t PtIndex(uint64_t v)   { return (v >> 12) & 0x1FF; }
 
-// Return a pointer to a child table entry, allocating the child page if absent.
-// 'parent' is the virtual address of the parent table (= physical addr, identity map).
-// 'idx' is the entry index in the parent.
-// Returns nullptr if the PMM is out of memory.
-// NOTE: this must NOT be called for an entry that already holds a huge page (PS=1).
+// Allocate a page table page — tagged PageTable so it shows up clearly in PMM dumps.
+static uint64_t AllocTablePage()
+{
+    return PmmAllocPage(MemTag::PageTable, KernelPid);
+}
+
 static uint64_t* GetOrAllocEntry(uint64_t* parent, uint64_t idx)
 {
     if (!(parent[idx] & VMM_PRESENT))
     {
-        uint64_t childPhys = PmmAllocPage();
+        uint64_t childPhys = AllocTablePage();
         if (childPhys == 0) return nullptr;
         ZeroPage(childPhys);
-        // Mark writable so lower levels can be written regardless of flags.
         parent[idx] = childPhys | VMM_PRESENT | VMM_WRITABLE;
     }
-    // Physical address of the child table (strip flag bits).
     uint64_t childPhys = parent[idx] & PHYS_MASK;
-    // Identity map: virtual address == physical address.
     return reinterpret_cast<uint64_t*>(childPhys);
 }
 
-// Walk (and optionally create) the page table path to the PTE for virtAddr.
-// Returns a pointer to the PTE (which may be 0/not-present).
-// Returns nullptr if an intermediate table could not be allocated.
-// Set create=false to do a read-only walk (returns nullptr if any level missing).
 static uint64_t* WalkToPtr(uint64_t virtAddr, bool create)
 {
-    uint64_t cr3  = ReadCR3() & PHYS_MASK;
+    uint64_t cr3   = ReadCR3() & PHYS_MASK;
     uint64_t* pml4 = reinterpret_cast<uint64_t*>(cr3);
 
     uint64_t* pdpt = create
@@ -90,9 +105,8 @@ static uint64_t* WalkToPtr(uint64_t virtAddr, bool create)
             : nullptr;
     if (!pd) return nullptr;
 
-    // Guard: if this PD entry has the PS bit set, it's a 2MB page — don't
-    // walk further. Callers mapping new 4KB pages should not hit a 2MB entry.
-    if (pd[PdIndex(virtAddr)] & (1ULL << 7)) return nullptr; // PS bit
+    // Guard: PS bit set means this is a 2MB page — don't descend further.
+    if (pd[PdIndex(virtAddr)] & (1ULL << 7)) return nullptr;
 
     uint64_t* pt = create
         ? GetOrAllocEntry(pd, PdIndex(virtAddr))
@@ -116,11 +130,18 @@ void VmmInit()
 
 bool VmmMapPage(uint64_t virtAddr, uint64_t physAddr, uint64_t flags)
 {
+    // Enforce null pointer guard: reject any mapping in the first 1GB.
+    if (virtAddr < VIRTUAL_NULL_GUARD)
+    {
+        SerialPrintf("VMM: rejected mapping at 0x%p (below null guard)\n",
+                     reinterpret_cast<void*>(virtAddr));
+        return false;
+    }
+
     uint64_t* pte = WalkToPtr(virtAddr, /*create=*/true);
     if (!pte) return false;
 
-    uint64_t entry = (physAddr & PHYS_MASK) | VMM_PRESENT | (flags & ~VMM_PRESENT);
-    *pte = entry;
+    *pte = (physAddr & PHYS_MASK) | VMM_PRESENT | (flags & ~VMM_PRESENT);
     Invlpg(virtAddr);
     return true;
 }
@@ -135,11 +156,10 @@ void VmmUnmapPage(uint64_t virtAddr)
     }
 }
 
-uint64_t VmmAllocPages(uint64_t pageCount, uint64_t flags)
+uint64_t VmmAllocPages(uint64_t pageCount, uint64_t flags, MemTag tag, uint16_t pid)
 {
     if (pageCount == 0) return 0;
 
-    // Check we won't overflow the VMALLOC region.
     if (g_vmallocNext + pageCount * PAGE_SIZE > VMALLOC_BASE + VMALLOC_SIZE)
         return 0;
 
@@ -148,29 +168,9 @@ uint64_t VmmAllocPages(uint64_t pageCount, uint64_t flags)
 
     for (uint64_t i = 0; i < pageCount; i++)
     {
-        uint64_t phys = PmmAllocPage();
+        uint64_t phys = PmmAllocPage(tag, pid);
         if (phys == 0)
         {
-            // Out of physical memory — unmap what we already set up and fail.
-            for (uint64_t j = 0; j < i; j++)
-            {
-                uint64_t v = virtBase + j * PAGE_SIZE;
-                uint64_t* pte = WalkToPtr(v, false);
-                if (pte && (*pte & VMM_PRESENT))
-                {
-                    PmmFreePage(*pte & PHYS_MASK);
-                    *pte = 0;
-                    Invlpg(v);
-                }
-            }
-            g_vmallocNext = virtBase; // reclaim virtual space (bump alloc)
-            return 0;
-        }
-
-        if (!VmmMapPage(virtBase + i * PAGE_SIZE, phys, flags))
-        {
-            PmmFreePage(phys);
-            // Unwind previous mappings.
             for (uint64_t j = 0; j < i; j++)
             {
                 uint64_t v = virtBase + j * PAGE_SIZE;
@@ -185,6 +185,34 @@ uint64_t VmmAllocPages(uint64_t pageCount, uint64_t flags)
             g_vmallocNext = virtBase;
             return 0;
         }
+
+        if (!VmmMapPage(virtBase + i * PAGE_SIZE, phys, flags))
+        {
+            PmmFreePage(phys);
+            for (uint64_t j = 0; j < i; j++)
+            {
+                uint64_t v = virtBase + j * PAGE_SIZE;
+                uint64_t* pte = WalkToPtr(v, false);
+                if (pte && (*pte & VMM_PRESENT))
+                {
+                    PmmFreePage(*pte & PHYS_MASK);
+                    *pte = 0;
+                    Invlpg(v);
+                }
+            }
+            g_vmallocNext = virtBase;
+            return 0;
+        }
+    }
+
+    // Register the allocation.
+    VmmAllocation* slot = FindFreeSlot();
+    if (slot)
+    {
+        slot->virtBase  = virtBase;
+        slot->pageCount = pageCount;
+        slot->tag       = tag;
+        slot->pid       = pid;
     }
 
     return virtBase;
@@ -203,6 +231,10 @@ void VmmFreePages(uint64_t virtAddr, uint64_t pageCount)
             Invlpg(v);
         }
     }
+
+    // Clear registration.
+    VmmAllocation* alloc = FindAllocSlot(virtAddr);
+    if (alloc) alloc->virtBase = 0;
 }
 
 uint64_t VmmVirtToPhys(uint64_t virtAddr)
@@ -210,6 +242,19 @@ uint64_t VmmVirtToPhys(uint64_t virtAddr)
     uint64_t* pte = WalkToPtr(virtAddr, false);
     if (!pte || !(*pte & VMM_PRESENT)) return 0;
     return (*pte & PHYS_MASK) | (virtAddr & (PAGE_SIZE - 1));
+}
+
+const VmmAllocation* VmmGetAllocation(uint64_t virtAddr)
+{
+    // Find the allocation record whose range contains virtAddr.
+    for (uint32_t i = 0; i < VMM_MAX_ALLOCS; i++)
+    {
+        const VmmAllocation& a = g_vmmAllocs[i];
+        if (a.virtBase == 0) continue;
+        if (virtAddr >= a.virtBase && virtAddr < a.virtBase + a.pageCount * PAGE_SIZE)
+            return &a;
+    }
+    return nullptr;
 }
 
 } // namespace brook
