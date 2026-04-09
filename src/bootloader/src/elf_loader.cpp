@@ -16,7 +16,8 @@ KernelEntryFn LoadKernelElf(
     EFI_BOOT_SERVICES*    bootServices,
     const uint8_t*        elfData,
     UINTN                 elfSize,
-    EFI_PHYSICAL_ADDRESS& outPhysBase)
+    EFI_PHYSICAL_ADDRESS& outPhysBase,
+    UINTN&                outPhysPages)
 {
     if (elfSize < sizeof(Elf64Header))
     {
@@ -86,6 +87,7 @@ KernelEntryFn LoadKernelElf(
     }
 
     UINT64 kernelSize = highestVAddr - lowestVAddr;
+    UINT64 kernelPages = (kernelSize + EFI_PAGE_SIZE - 1) / EFI_PAGE_SIZE;
 
     ConsolePrint(u"Kernel size: ");
     ConsolePrintDec(kernelSize);
@@ -97,7 +99,7 @@ KernelEntryFn LoadKernelElf(
     EFI_STATUS status = bootServices->AllocatePages(
         AllocateAddress,
         EfiLoaderData,
-        (kernelSize + EFI_PAGE_SIZE - 1) / EFI_PAGE_SIZE,
+        kernelPages,
         &physBase);
 
     if (EFI_ERROR(status))
@@ -107,7 +109,7 @@ KernelEntryFn LoadKernelElf(
         status = bootServices->AllocatePages(
             AllocateAnyPages,
             EfiLoaderData,
-            (kernelSize + EFI_PAGE_SIZE - 1) / EFI_PAGE_SIZE,
+            kernelPages,
             &physBase);
 
         if (EFI_ERROR(status))
@@ -147,7 +149,8 @@ KernelEntryFn LoadKernelElf(
         }
     }
 
-    outPhysBase = physBase;
+    outPhysBase  = physBase;
+    outPhysPages = kernelPages;
 
     // Return the VIRTUAL entry point from the ELF header.
     // This is the address the CPU will jump to AFTER our page tables are loaded.

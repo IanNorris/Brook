@@ -27,9 +27,9 @@ PageTableAllocation AllocatePageTables(EFI_BOOT_SERVICES* bootServices);
 
 // Fill in page table entries:
 //   - Identity map 0-4GB with 2MB pages
-//   - Map kernelPhysBase at KernelVirtualBase (2MB page)
+//   - Map kernelPhysPages of memory at KernelVirtualBase using 2MB pages
 // Call AFTER ExitBootServices. No UEFI services used.
-void BuildPageTables(const PageTableAllocation& pt, UINT64 kernelPhysBase);
+void BuildPageTables(const PageTableAllocation& pt, UINT64 kernelPhysBase, UINT64 kernelPhysPages);
 
 // Load the PML4 physical address into CR3, activating our page tables.
 // Call immediately after BuildPageTables, before jumping to kernel.

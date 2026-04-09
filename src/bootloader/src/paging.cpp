@@ -38,7 +38,7 @@ PageTableAllocation AllocatePageTables(EFI_BOOT_SERVICES* bootServices)
     return alloc;
 }
 
-void BuildPageTables(const PageTableAllocation& pt, UINT64 kernelPhysBase)
+void BuildPageTables(const PageTableAllocation& pt, UINT64 kernelPhysBase, UINT64 kernelPhysPages)
 {
     // ----------------------------------------------------------------
     // Identity map 0-4GB using 2MB pages.
@@ -71,9 +71,14 @@ void BuildPageTables(const PageTableAllocation& pt, UINT64 kernelPhysBase)
     pt.pml4[511]     = reinterpret_cast<UINT64>(pt.pdptHigh) | PAGE_PRESENT | PAGE_WRITABLE;
     pt.pdptHigh[510] = reinterpret_cast<UINT64>(pt.pdKernel) | PAGE_PRESENT | PAGE_WRITABLE;
 
-    // kernelPhysBase is already 2MB-aligned (0x400000).
-    // Mask off low bits just to be safe.
-    pt.pdKernel[0] = (kernelPhysBase & ~(PAGE_SIZE_2MB - 1)) | PAGE_PRESENT | PAGE_WRITABLE | PAGE_2MB;
+    // Map each 2MB chunk of the kernel image. kernelPhysBase is 2MB-aligned.
+    // pdKernel has 512 entries (covers 1GB) — more than enough.
+    UINT64 numEntries = (kernelPhysPages * PAGE_SIZE_4K + PAGE_SIZE_2MB - 1) / PAGE_SIZE_2MB;
+    for (UINT64 i = 0; i < numEntries; i++)
+    {
+        UINT64 physChunk = (kernelPhysBase & ~(PAGE_SIZE_2MB - 1)) + i * PAGE_SIZE_2MB;
+        pt.pdKernel[i]   = physChunk | PAGE_PRESENT | PAGE_WRITABLE | PAGE_2MB;
+    }
 }
 
 void LoadCR3(const PageTableAllocation& pt)

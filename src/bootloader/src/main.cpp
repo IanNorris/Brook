@@ -46,8 +46,9 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     ConsolePrintLine(u"Kernel file read");
 
     EFI_PHYSICAL_ADDRESS kernelPhysBase = 0;
+    UINTN kernelPhysPages = 0;
     KernelEntryFn kernelVirtualEntry = LoadKernelElf(
-        systemTable->BootServices, kernelData, kernelFileSize, kernelPhysBase);
+        systemTable->BootServices, kernelData, kernelFileSize, kernelPhysBase, kernelPhysPages);
     ConsolePrintLine(u"Kernel loaded");
 
     // Free the temporary ELF file buffer (segments already copied out)
@@ -81,7 +82,7 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     // --- Build and activate page tables ---
     // After this, virtual 0xFFFFFFFF80000000 maps to kernelPhysBase.
     // Low memory 0-4GB is identity-mapped so bootloader code continues running.
-    BuildPageTables(pageTableAlloc, kernelPhysBase);
+    BuildPageTables(pageTableAlloc, kernelPhysBase, kernelPhysPages);
     LoadCR3(pageTableAlloc);
 
     // --- Build boot protocol ---
@@ -94,6 +95,8 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     bootProtocol.acpi           = acpi;
     bootProtocol.memoryMap      = memoryMap;
     bootProtocol.memoryMapCount = memoryMapCount;
+    bootProtocol.kernelPhysBase  = kernelPhysBase;
+    bootProtocol.kernelPhysPages = kernelPhysPages;
 
     // --- Jump to kernel at virtual address ---
     // Use inline asm to ensure SysV calling convention:

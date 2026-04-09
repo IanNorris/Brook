@@ -2,6 +2,7 @@
 #include "serial.h"
 #include "gdt.h"
 #include "idt.h"
+#include "pmm.h"
 
 // Draw a filled rectangle to the framebuffer using the given colour.
 static void DrawRect(
@@ -41,6 +42,11 @@ extern "C" __attribute__((sysv_abi)) void KernelMain(brook::BootProtocol* bootPr
 
     IdtInit(&bootProtocol->framebuffer);
     brook::SerialPuts("IDT loaded\n");
+
+    brook::PmmInit(bootProtocol);
+    brook::SerialPrintf("PMM ready: %u free pages (%u MB)\n",
+                        static_cast<uint32_t>(brook::PmmGetFreePageCount()),
+                        static_cast<uint32_t>((brook::PmmGetFreePageCount() * 4096) / (1024*1024)));
 
     const brook::Framebuffer& fb = bootProtocol->framebuffer;
     brook::SerialPrintf("Framebuffer: %ux%u @ 0x%p\n",

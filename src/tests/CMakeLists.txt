@@ -11,13 +11,18 @@ set(SHARED_INCLUDE_DIRS
     "${BROOK_ROOT}/src/tests/common"
 )
 
-# Helper function to add a test binary
+# Helper function to add a test binary.
+# Usage: add_brook_test(TEST_NAME [extra_source1 extra_source2 ...])
 function(add_brook_test TEST_NAME)
     add_executable(${TEST_NAME}
         ${TEST_NAME}/main.cpp
         "${BROOK_ROOT}/src/shared/src_km/serial.cpp"
+        ${ARGN}
     )
-    target_include_directories(${TEST_NAME} PRIVATE ${SHARED_INCLUDE_DIRS})
+    target_include_directories(${TEST_NAME} PRIVATE
+        ${SHARED_INCLUDE_DIRS}
+        "${BROOK_ROOT}/src/kernel/src"
+    )
     target_compile_options(${TEST_NAME} PRIVATE
         -Wall -Wextra -Werror -Wshadow -Wno-unused-parameter
     )
@@ -32,5 +37,8 @@ function(add_brook_test TEST_NAME)
 endfunction()
 
 add_brook_test(test_memory_map)
+add_brook_test(test_pmm
+    "${BROOK_ROOT}/src/kernel/src/pmm.cpp"
+)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "" FORCE)

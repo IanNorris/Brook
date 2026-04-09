@@ -73,6 +73,9 @@ struct BootProtocol
     MemoryDescriptor* memoryMap;   // Array of MemoryDescriptor, in physical address order
     uint32_t          memoryMapCount;
     uint32_t          _reserved;
+
+    uint64_t kernelPhysBase;    // Physical address of the loaded kernel image
+    uint64_t kernelPhysPages;   // Size of kernel image in 4KB pages (includes BSS)
 };
 
 } // namespace brook
