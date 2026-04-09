@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Create a FAT16 disk image for virtio-blk testing.
 
-Produces a 1MB raw FAT16 image at <build_dir>/brook_disk.img containing:
+Produces a 4MB raw FAT16 image at <build_dir>/brook_disk.img containing:
   BROOK.MNT       (mount target: /boot)
   BROOK.CFG       (boot config sample)
   DRIVERS/        (driver modules copied from <build_dir>/kernel/drivers/*.mod)
   TEST/HELLO.TXT
+
+Requires: mkfs.fat (dosfstools), mcopy/mmd (mtools).
 
 Usage:
   python3 scripts/make_disk_image.py <build_dir>
@@ -35,8 +37,13 @@ def main():
     os.makedirs(build_dir, exist_ok=True)
     img_path = os.path.join(build_dir, "brook_disk.img")
 
-    # 1MB = 1024 KB FAT16 image
-    run(["mformat", "-C", "-f", "1024", "-v", "BROOKDISK", "-i", img_path, "::"])
+    # 16MB raw image formatted as FAT16.
+    # mformat -f only accepts standard floppy sizes; use dd+mkfs.fat instead.
+    # mkfs.fat 4.x requires at least ~16MB for FAT16.
+    DISK_SIZE = 16 * 1024 * 1024
+    with open(img_path, "wb") as f:
+        f.write(b"\x00" * DISK_SIZE)
+    run(["mkfs.fat", "-F", "16", "-n", "BROOKDISK", img_path])
 
     with tempfile.TemporaryDirectory() as tmp:
         # BROOK.MNT — tells the kernel to mount this volume at /boot
