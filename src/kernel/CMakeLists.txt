@@ -114,8 +114,10 @@ add_executable(kernel
     src/kprintf.cpp
     src/panic.cpp
     src/pmm.cpp
+    src/pci.cpp
     src/ramdisk.cpp
     src/vfs.cpp
+    src/virtio_blk.cpp
     src/vmm.cpp
     src/heap.cpp
     src/acpi.cpp

@@ -100,6 +100,10 @@ echo "Starting QEMU..."
 echo "  OVMF: ${OVMF_CODE}"
 echo "  ESP:  ${BUILD_DIR}/esp"
 
+# Create/update virtio-blk test disk image.
+DISK_IMG="${BUILD_DIR}/brook_disk.img"
+python3 "${SCRIPT_DIR}/make_disk_image.py" "${BUILD_DIR}"
+
 qemu-system-x86_64 \
     -machine q35 \
     -cpu qemu64 \
@@ -107,6 +111,7 @@ qemu-system-x86_64 \
     -drive if=pflash,format=raw,readonly=on,file="${OVMF_CODE}" \
     -drive if=pflash,format=raw,file="${OVMF_VARS_COPY}" \
     -drive format=raw,file=fat:rw:"${BUILD_DIR}/esp" \
+    -drive if=virtio,format=raw,file="${DISK_IMG}" \
     -serial stdio \
     -display gtk \
     -monitor none \

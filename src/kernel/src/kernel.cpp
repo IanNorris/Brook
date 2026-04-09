@@ -13,9 +13,11 @@
 #include "keyboard.h"
 #include "tty.h"
 #include "device.h"
+#include "pci.h"
 #include "ramdisk.h"
 #include "fatfs_glue.h"
 #include "vfs.h"
+#include "virtio_blk.h"
 #include "fat_test_image.h"
 
 // Kernel entry point. Called by the bootloader via SysV ABI (argument in RDI).
@@ -132,6 +134,39 @@ extern "C" __attribute__((sysv_abi)) void KernelMain(brook::BootProtocol* bootPr
     else
     {
         brook::KPuts("VFS: ramdisk init failed\n");
+    }
+
+    // ---- virtio-blk (if QEMU exposes a disk) ----
+    // Scan PCI and print what's there, then attempt virtio-blk init.
+    brook::PciScanPrint();
+    brook::Device* vioDev = brook::VirtioBlkInit();
+    if (vioDev)
+    {
+        // Bind virtio0 to FatFS physical drive 1 and mount at /boot.
+        brook::FatFsBindDrive(1, vioDev);
+        if (brook::VfsMount("/boot", "fatfs", 1))
+        {
+            brook::Vnode* cfg = brook::VfsOpen("/boot/BROOK.CFG");
+            if (cfg)
+            {
+                char buf[128] = {};
+                uint64_t off = 0;
+                int n = brook::VfsRead(cfg, buf, sizeof(buf) - 1, &off);
+                brook::VfsClose(cfg);
+                if (n > 0)
+                    brook::KPrintf("virtio: /boot/BROOK.CFG (%d bytes): %s", n, buf);
+                else
+                    brook::KPuts("virtio: /boot/BROOK.CFG open OK but empty\n");
+            }
+            else
+            {
+                brook::KPuts("virtio: /boot/BROOK.CFG not found (mount OK)\n");
+            }
+        }
+        else
+        {
+            brook::KPuts("virtio: VfsMount /boot failed\n");
+        }
     }
 
     // Keyboard init (after I/O APIC is set up).
