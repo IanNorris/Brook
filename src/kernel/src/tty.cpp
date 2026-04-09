@@ -251,11 +251,8 @@ static void TtyPrintPtr(unsigned long val)
     }
 }
 
-void TtyPrintf(const char* fmt, ...)
+void TtyVPrintf(const char* fmt, __builtin_va_list args)
 {
-    __builtin_va_list args;
-    __builtin_va_start(args, fmt);
-
     while (*fmt)
     {
         if (*fmt != '%') { TtyPutChar(*fmt++); continue; }
@@ -273,8 +270,13 @@ void TtyPrintf(const char* fmt, ...)
         case 'x': TtyPrintHex((unsigned long)__builtin_va_arg(args, unsigned int));   break;
         case 'l':
             ++fmt;
-            if (*fmt == 'u') TtyPrintUlong(__builtin_va_arg(args, unsigned long));
+            if      (*fmt == 'u') TtyPrintUlong(__builtin_va_arg(args, unsigned long));
             else if (*fmt == 'x') TtyPrintHex(__builtin_va_arg(args, unsigned long));
+            else if (*fmt == 'd') {
+                long v = __builtin_va_arg(args, long);
+                if (v < 0) { TtyPutChar('-'); TtyPrintUlong((unsigned long)-v); }
+                else TtyPrintUlong((unsigned long)v);
+            }
             else { TtyPutChar('l'); TtyPutChar(*fmt); }
             break;
         case 'p': TtyPrintPtr((unsigned long)__builtin_va_arg(args, void*)); break;
@@ -284,7 +286,13 @@ void TtyPrintf(const char* fmt, ...)
         }
         ++fmt;
     }
+}
 
+void TtyPrintf(const char* fmt, ...)
+{
+    __builtin_va_list args;
+    __builtin_va_start(args, fmt);
+    TtyVPrintf(fmt, args);
     __builtin_va_end(args);
 }
 

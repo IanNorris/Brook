@@ -76,6 +76,9 @@ add_executable(kernel
     src/cpu.cpp
     src/gdt.cpp
     src/idt.cpp
+    src/keyboard.cpp
+    src/kprintf.cpp
+    src/panic.cpp
     src/pmm.cpp
     src/vmm.cpp
     src/heap.cpp
@@ -102,13 +105,16 @@ target_compile_options(kernel PRIVATE
     -mfpmath=sse   # use SSE for scalar float, not x87 (cleaner ABI)
 )
 
-# Interrupt handler files must NOT use SSE/FPU registers.
+# Interrupt handler files and panic must NOT use SSE/FPU registers.
 # -mgeneral-regs-only overrides the global -msse2/-mfpmath=sse for these files.
 # Combined with __attribute__((interrupt)) this guarantees no XMM state is
 # touched in ISRs, so no FXSAVE/FXRSTOR is needed in the interrupt path.
+# panic.cpp is included because KernelPanic may be called from interrupt context.
 set_source_files_properties(
     src/idt.cpp
     src/apic.cpp
+    src/keyboard.cpp
+    src/panic.cpp
     PROPERTIES COMPILE_OPTIONS "-mgeneral-regs-only;-mno-sse;-mno-sse2;-mfpmath="
 )
 

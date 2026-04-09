@@ -280,4 +280,107 @@ uint64_t ApicGetLapicVirtBase()
     return g_lapicVirt;
 }
 
+// ---------------------------------------------------------------------------
+// I/O APIC
+// ---------------------------------------------------------------------------
+//
+// The I/O APIC is accessed through two MMIO registers:
+//   IOREGSEL (offset 0x00): write the register index to read/write.
+//   IOWIN    (offset 0x10): read or write the selected register.
+//
+// Redirection table entries start at register index 0x10 (entry 0 low) and
+// are 64 bits wide, accessed as two consecutive 32-bit registers:
+//   lo = 0x10 + 2 * entry
+//   hi = 0x11 + 2 * entry
+//
+// Each entry format:
+//   bits  7:0  = delivery vector
+//   bits 10:8  = delivery mode (000 = fixed)
+//   bit  11    = destination mode (0 = physical APIC ID)
+//   bit  13    = polarity (0 = active high)
+//   bit  15    = trigger mode (0 = edge, 1 = level)
+//   bit  16    = mask (1 = masked)
+//   bits 63:56 = destination APIC ID (in hi register)
+
+static uint64_t  g_ioApicVirt   = 0;
+static uint32_t  g_ioApicGsiBase = 0;
+
+static inline void IoApicWrite(uint8_t reg, uint32_t val)
+{
+    *reinterpret_cast<volatile uint32_t*>(g_ioApicVirt + 0x00) = reg;
+    *reinterpret_cast<volatile uint32_t*>(g_ioApicVirt + 0x10) = val;
+}
+
+static inline uint32_t IoApicRead(uint8_t reg)
+{
+    *reinterpret_cast<volatile uint32_t*>(g_ioApicVirt + 0x00) = reg;
+    return *reinterpret_cast<volatile uint32_t*>(g_ioApicVirt + 0x10);
+}
+
+bool IoApicInit(uint64_t ioApicPhysical, uint32_t gsiBase)
+{
+    if (ioApicPhysical == 0)
+    {
+        SerialPuts("IOAPIC: no I/O APIC address\n");
+        return false;
+    }
+
+    g_ioApicVirt = VmmAllocPages(1, VMM_WRITABLE, MemTag::Device, KernelPid);
+    if (g_ioApicVirt == 0)
+    {
+        SerialPuts("IOAPIC: failed to allocate virtual page\n");
+        return false;
+    }
+
+    uint64_t oldPhys = VmmVirtToPhys(g_ioApicVirt);
+    VmmUnmapPage(g_ioApicVirt);
+    if (oldPhys) PmmFreePage(oldPhys);
+
+    if (!VmmMapPage(g_ioApicVirt, ioApicPhysical,
+                    VMM_WRITABLE | VMM_NO_EXEC,
+                    MemTag::Device, KernelPid))
+    {
+        SerialPuts("IOAPIC: failed to map MMIO\n");
+        return false;
+    }
+
+    g_ioApicGsiBase = gsiBase;
+
+    uint32_t version  = IoApicRead(0x01);
+    uint32_t maxEntry = (version >> 16) & 0xFF;
+
+    // Mask all redirection entries at startup.
+    for (uint32_t i = 0; i <= maxEntry; ++i)
+    {
+        IoApicWrite(static_cast<uint8_t>(0x10 + 2 * i),     0x00010000u); // masked
+        IoApicWrite(static_cast<uint8_t>(0x11 + 2 * i),     0x00000000u);
+    }
+
+    SerialPrintf("IOAPIC: mapped phys 0x%p → virt 0x%p, %u entries, GSI base %u\n",
+                 reinterpret_cast<void*>(ioApicPhysical),
+                 reinterpret_cast<void*>(g_ioApicVirt),
+                 maxEntry + 1u, gsiBase);
+    return true;
+}
+
+void IoApicUnmaskIrq(uint8_t irq, uint8_t vector)
+{
+    uint32_t entry = irq; // entry index = IRQ - gsiBase (caller adjusts if needed)
+    uint8_t  dest  = ApicGetId();
+
+    // hi: destination LAPIC ID in bits 31:24
+    IoApicWrite(static_cast<uint8_t>(0x11 + 2 * entry),
+                static_cast<uint32_t>(dest) << 24);
+    // lo: vector, fixed delivery, edge-triggered, active-high, unmasked
+    IoApicWrite(static_cast<uint8_t>(0x10 + 2 * entry),
+                static_cast<uint32_t>(vector));
+}
+
+void IoApicMaskIrq(uint8_t irq)
+{
+    uint32_t entry = irq;
+    uint32_t lo = IoApicRead(static_cast<uint8_t>(0x10 + 2 * entry));
+    IoApicWrite(static_cast<uint8_t>(0x10 + 2 * entry), lo | 0x00010000u);
+}
+
 } // namespace brook

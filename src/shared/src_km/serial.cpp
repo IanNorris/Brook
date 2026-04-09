@@ -1,11 +1,5 @@
 #include "serial.h"
 
-// Clang provides va_list as a builtin; no header needed in freestanding mode.
-typedef __builtin_va_list va_list;
-#define va_start(ap, last)  __builtin_va_start(ap, last)
-#define va_arg(ap, type)    __builtin_va_arg(ap, type)
-#define va_end(ap)          __builtin_va_end(ap)
-
 namespace brook {
 
 static constexpr uint16_t COM1_BASE = 0x3F8;
@@ -92,11 +86,8 @@ static void PrintPtr(unsigned long val)
     }
 }
 
-void SerialPrintf(const char* fmt, ...)
+void SerialVPrintf(const char* fmt, __builtin_va_list args)
 {
-    va_list args;
-    va_start(args, fmt);
-
     while (*fmt) {
         if (*fmt != '%') {
             SerialPutChar(*fmt++);
@@ -107,12 +98,12 @@ void SerialPrintf(const char* fmt, ...)
 
         switch (*fmt) {
             case 's': {
-                const char* s = va_arg(args, const char*);
+                const char* s = __builtin_va_arg(args, const char*);
                 SerialPuts(s ? s : "(null)");
                 break;
             }
             case 'd': {
-                int val = va_arg(args, int);
+                int val = __builtin_va_arg(args, int);
                 if (val < 0) {
                     SerialPutChar('-');
                     PrintUlong(static_cast<unsigned long>(-static_cast<long>(val)));
@@ -122,23 +113,23 @@ void SerialPrintf(const char* fmt, ...)
                 break;
             }
             case 'u': {
-                unsigned int val = va_arg(args, unsigned int);
+                unsigned int val = __builtin_va_arg(args, unsigned int);
                 PrintUlong(static_cast<unsigned long>(val));
                 break;
             }
             case 'x': {
-                unsigned int val = va_arg(args, unsigned int);
+                unsigned int val = __builtin_va_arg(args, unsigned int);
                 PrintHex(static_cast<unsigned long>(val));
                 break;
             }
             case 'l': {
                 fmt++;
                 if (*fmt == 'u') {
-                    PrintUlong(va_arg(args, unsigned long));
+                    PrintUlong(__builtin_va_arg(args, unsigned long));
                 } else if (*fmt == 'x') {
-                    PrintHex(va_arg(args, unsigned long));
+                    PrintHex(__builtin_va_arg(args, unsigned long));
                 } else if (*fmt == 'd') {
-                    long val = va_arg(args, long);
+                    long val = __builtin_va_arg(args, long);
                     if (val < 0) { SerialPutChar('-'); PrintUlong(static_cast<unsigned long>(-val)); }
                     else PrintUlong(static_cast<unsigned long>(val));
                 } else {
@@ -148,12 +139,12 @@ void SerialPrintf(const char* fmt, ...)
                 break;
             }
             case 'p': {
-                void* ptr = va_arg(args, void*);
+                void* ptr = __builtin_va_arg(args, void*);
                 PrintPtr(reinterpret_cast<unsigned long>(ptr));
                 break;
             }
             case 'c': {
-                int c = va_arg(args, int);
+                int c = __builtin_va_arg(args, int);
                 SerialPutChar(static_cast<char>(c));
                 break;
             }
@@ -169,8 +160,14 @@ void SerialPrintf(const char* fmt, ...)
         }
         fmt++;
     }
+}
 
-    va_end(args);
+void SerialPrintf(const char* fmt, ...)
+{
+    __builtin_va_list args;
+    __builtin_va_start(args, fmt);
+    SerialVPrintf(fmt, args);
+    __builtin_va_end(args);
 }
 
 } // namespace brook

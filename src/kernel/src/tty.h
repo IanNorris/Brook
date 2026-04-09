@@ -30,8 +30,9 @@ void TtyPutChar(char c);
 void TtyPuts(const char* str);
 
 // printf-style formatted output.  Supports the same specifiers as SerialPrintf:
-// %s %d %u %x %p  (no width/precision modifiers except %p which is 0-padded 16 hex digits)
+// %s %d %u %x %lu %lx %ld %p %c %%  (no width/precision modifiers except %p)
 void TtyPrintf(const char* fmt, ...);
+void TtyVPrintf(const char* fmt, __builtin_va_list args);
 
 // Set foreground and background colours (0x00RRGGBB — top byte ignored).
 void TtySetColors(uint32_t fg, uint32_t bg);
