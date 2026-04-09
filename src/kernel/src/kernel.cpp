@@ -19,15 +19,23 @@ static void DrawRect(
     }
 }
 
-// Kernel entry point. Called by the bootloader with SysV ABI.
+// Kernel entry point. Called by the bootloader via SysV ABI (argument in RDI).
 // At this stage: UEFI page tables still active, running at physical address.
-extern "C" void KernelMain(brook::BootProtocol* bootProtocol)
+extern "C" __attribute__((sysv_abi)) void KernelMain(brook::BootProtocol* bootProtocol)
 {
-    // Validate boot protocol
+    // Validate boot protocol — draw red if invalid so we know we got here
+    // but received a bad handoff rather than silently halting.
     if (bootProtocol == nullptr ||
         bootProtocol->magic != brook::BootProtocolMagic)
     {
-        // Can't do anything without a valid boot protocol - halt
+        // Try to write directly to a known framebuffer address as last resort
+        // (framebuffer is typically mapped at a fixed physical address by firmware)
+        uint32_t* fb = reinterpret_cast<uint32_t*>(
+            bootProtocol ? bootProtocol->framebuffer.physicalBase : 0xB8000u);
+        if (fb)
+        {
+            for (int i = 0; i < 640 * 100; i++) { fb[i] = 0x00FF0000u; } // red band
+        }
         for (;;) { __asm__ volatile("hlt"); }
     }
 

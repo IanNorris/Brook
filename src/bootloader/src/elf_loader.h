@@ -8,9 +8,10 @@ namespace brook
 namespace bootloader
 {
 
-// Kernel entry point signature. The bootloader jumps here after loading.
-// Defined with SysV ABI since the kernel is an ELF (not PE/COFF).
-using KernelEntryFn = void (*)(brook::BootProtocol* bootProtocol);
+// Kernel entry point signature.
+// __attribute__((sysv_abi)) ensures the bootloader (compiled with MS x64 ABI)
+// calls this with SysV calling convention — argument in RDI, not RCX.
+using KernelEntryFn = void (__attribute__((sysv_abi)) *)(brook::BootProtocol* bootProtocol);
 
 // Validate and load a kernel ELF image into memory.
 //
