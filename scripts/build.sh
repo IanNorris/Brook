@@ -10,7 +10,8 @@ echo "Brook OS Build — ${BUILD_TYPE}"
 echo "Root: ${ROOT_DIR}"
 
 # Initialize submodules if needed
-if [ ! -f "${ROOT_DIR}/vendor/uefi-headers/Include/Uefi.h" ]; then
+if [ ! -f "${ROOT_DIR}/vendor/uefi-headers/Include/Uefi.h" ] || \
+   [ ! -f "${ROOT_DIR}/src/third_party/fatfs/source/ff.c" ]; then
     echo "Initializing submodules..."
     git -C "${ROOT_DIR}" submodule update --init --recursive
 fi

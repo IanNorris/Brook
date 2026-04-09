@@ -31,6 +31,10 @@ pkgs.mkShell {
     # Font baking (build-time TTF → kernel glyph atlas)
     pkgs.hack-font
     (pkgs.python3.withPackages (ps: [ ps.freetype-py ]))
+
+    # Storage image creation (build-time FAT32 ramdisk image for VFS tests)
+    pkgs.mtools
+    pkgs.dosfstools
   ];
 
   # Point clang to its own resource dir so freestanding headers are found.

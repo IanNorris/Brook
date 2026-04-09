@@ -6,15 +6,21 @@ set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 set(CMAKE_C_COMPILER_WORKS   1 CACHE BOOL "" FORCE)
 set(CMAKE_CXX_COMPILER_WORKS 1 CACHE BOOL "" FORCE)
 
+find_program(CLANG_CC  NAMES clang  REQUIRED)
 find_program(CLANG_CXX NAMES clang++ REQUIRED)
+set(CMAKE_C_COMPILER   ${CLANG_CC})
 set(CMAKE_CXX_COMPILER ${CLANG_CXX})
+set(CMAKE_C_COMPILER_TARGET   x86_64-elf)
 set(CMAKE_CXX_COMPILER_TARGET x86_64-elf)
 
 find_program(LD_LLD NAMES ld.lld REQUIRED)
 set(CMAKE_LINKER ${LD_LLD})
 
-set(CMAKE_CXX_FLAGS_INIT
-    "--target=x86_64-elf -ffreestanding -fno-stack-protector -mno-red-zone -fno-asynchronous-unwind-tables -mcmodel=kernel -fno-exceptions -fno-rtti -nostdlib")
+set(KERNEL_FLAGS
+    "--target=x86_64-elf -ffreestanding -fno-stack-protector -mno-red-zone -fno-asynchronous-unwind-tables -mcmodel=kernel -nostdlib")
+
+set(CMAKE_C_FLAGS_INIT   "${KERNEL_FLAGS}")
+set(CMAKE_CXX_FLAGS_INIT "${KERNEL_FLAGS} -fno-exceptions -fno-rtti")
 
 # Use ld.lld directly for linking
 set(CMAKE_CXX_LINK_EXECUTABLE

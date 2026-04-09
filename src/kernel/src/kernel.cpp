@@ -12,6 +12,11 @@
 #include "apic.h"
 #include "keyboard.h"
 #include "tty.h"
+#include "device.h"
+#include "ramdisk.h"
+#include "fatfs_glue.h"
+#include "vfs.h"
+#include "fat_test_image.h"
 
 // Kernel entry point. Called by the bootloader via SysV ABI (argument in RDI).
 // At this stage: UEFI page tables still active, running at physical address.
@@ -89,6 +94,45 @@ extern "C" __attribute__((sysv_abi)) void KernelMain(brook::BootProtocol* bootPr
     }
 
     brook::KPuts("\nKernel running.\n");
+
+    // ---- Device / VFS layer ----
+    brook::VfsInit();
+
+    // Mount the embedded FAT16 test image as a ramdisk.
+    // The image is read-only from the kernel's perspective (const data section).
+    // We cast away const for the ramdisk: writes go to a separate copy if needed;
+    // for now read-only access is sufficient.
+    brook::Device* rd = brook::RamdiskCreate(
+        const_cast<void*>(static_cast<const void*>(g_fatTestImage)),
+        g_fatTestImageSize, 512, "ramdisk0");
+    if (rd && brook::DeviceRegister(rd))
+    {
+        brook::FatFsBindDrive(0, rd);
+        if (brook::VfsMount("/", "fatfs", 0))
+        {
+            // Smoke-test: open and read BROOK.CFG
+            brook::Vnode* cfg = brook::VfsOpen("/BROOK.CFG");
+            if (cfg)
+            {
+                char buf[128] = {};
+                uint64_t off = 0;
+                int n = brook::VfsRead(cfg, buf, sizeof(buf) - 1, &off);
+                brook::VfsClose(cfg);
+                if (n > 0)
+                    brook::KPrintf("VFS: /BROOK.CFG (%d bytes): %s", n, buf);
+                else
+                    brook::KPuts("VFS: /BROOK.CFG open OK but read returned 0\n");
+            }
+            else
+            {
+                brook::KPuts("VFS: could not open /BROOK.CFG\n");
+            }
+        }
+    }
+    else
+    {
+        brook::KPuts("VFS: ramdisk init failed\n");
+    }
 
     // Keyboard init (after I/O APIC is set up).
     if (acpiOk) brook::KbdInit();

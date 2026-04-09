@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(brook-kernel CXX)
+project(brook-kernel C CXX)
 
 if(NOT DEFINED BROOK_ROOT)
     set(BROOK_ROOT "${CMAKE_SOURCE_DIR}/../..")
@@ -34,6 +34,7 @@ endif()
 
 set(BROOK_FONT_SIZE 16)
 set(FONT_ATLAS_CPP "${CMAKE_CURRENT_BINARY_DIR}/font_atlas.cpp")
+set(FAT_IMAGE_CPP  "${CMAKE_CURRENT_BINARY_DIR}/fat_test_image.cpp")
 
 find_program(PYTHON3 python3 REQUIRED)
 
@@ -68,31 +69,71 @@ add_custom_command(
 )
 
 # ---------------------------------------------------------------------------
+# FAT test image baking — generates a small FAT16 ramdisk embedded in the kernel.
+# ---------------------------------------------------------------------------
+
+set(FAT_IMAGE_SIZE_KB 360)
+message(STATUS "Baking FAT test image (${FAT_IMAGE_SIZE_KB} KB)")
+execute_process(
+    COMMAND ${PYTHON3}
+            "${BROOK_ROOT}/scripts/make_fat_image.py"
+            "${FAT_IMAGE_CPP}"
+            "${FAT_IMAGE_SIZE_KB}"
+    RESULT_VARIABLE FAT_RESULT
+    OUTPUT_VARIABLE FAT_OUTPUT
+    ERROR_VARIABLE  FAT_ERROR
+)
+if(NOT FAT_RESULT EQUAL 0)
+    message(FATAL_ERROR "FAT image baking failed:\n${FAT_ERROR}")
+endif()
+message(STATUS "${FAT_OUTPUT}")
+
+add_custom_command(
+    OUTPUT  "${FAT_IMAGE_CPP}"
+    COMMAND ${PYTHON3}
+            "${BROOK_ROOT}/scripts/make_fat_image.py"
+            "${FAT_IMAGE_CPP}"
+            "${FAT_IMAGE_SIZE_KB}"
+    DEPENDS "${BROOK_ROOT}/scripts/make_fat_image.py"
+    COMMENT "Baking FAT test image (${FAT_IMAGE_SIZE_KB} KB)"
+    VERBATIM
+)
+
+# ---------------------------------------------------------------------------
 # Kernel executable
 # ---------------------------------------------------------------------------
 
 add_executable(kernel
     src/kernel.cpp
     src/cpu.cpp
+    src/device.cpp
+    src/fatfs_glue.cpp
     src/gdt.cpp
     src/idt.cpp
     src/keyboard.cpp
     src/kprintf.cpp
     src/panic.cpp
     src/pmm.cpp
+    src/ramdisk.cpp
+    src/vfs.cpp
     src/vmm.cpp
     src/heap.cpp
     src/acpi.cpp
     src/apic.cpp
     src/tty.cpp
     "${FONT_ATLAS_CPP}"
+    "${FAT_IMAGE_CPP}"
     "${BROOK_ROOT}/src/shared/src_km/serial.cpp"
+    # FatFS (C source — compiled as part of the kernel)
+    "${BROOK_ROOT}/src/third_party/fatfs/source/ff.c"
+    "${BROOK_ROOT}/src/third_party/fatfs/source/ffsystem.c"
 )
 
 target_include_directories(kernel PRIVATE
     ${SHARED_INCLUDE_DIRS}
-    "${CMAKE_CURRENT_SOURCE_DIR}/src"      # so font_atlas.cpp can find font_atlas.h
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"      # kernel src (ffconf.h here shadows submodule's)
     "${CMAKE_CURRENT_BINARY_DIR}"          # for the generated font_atlas.cpp
+    "${BROOK_ROOT}/src/third_party/fatfs/source"  # ff.h, diskio.h
 )
 
 target_compile_options(kernel PRIVATE
@@ -116,6 +157,14 @@ set_source_files_properties(
     src/keyboard.cpp
     src/panic.cpp
     PROPERTIES COMPILE_OPTIONS "-mgeneral-regs-only;-mno-sse;-mno-sse2;-mfpmath="
+)
+
+# FatFS is third-party C code — suppress extra warnings that would fail -Werror.
+set_source_files_properties(
+    "${BROOK_ROOT}/src/third_party/fatfs/source/ff.c"
+    "${BROOK_ROOT}/src/third_party/fatfs/source/ffsystem.c"
+    PROPERTIES COMPILE_OPTIONS
+        "-Wno-unused-parameter;-Wno-unused-function;-Wno-sign-compare;-Wno-implicit-fallthrough"
 )
 
 set_target_properties(kernel PROPERTIES
