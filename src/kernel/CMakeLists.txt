@@ -12,6 +12,9 @@ set(SHARED_INCLUDE_DIRS
 
 add_executable(kernel
     src/kernel.cpp
+    src/gdt.cpp
+    src/idt.cpp
+    "${BROOK_ROOT}/src/shared/src_km/serial.cpp"
 )
 
 target_include_directories(kernel PRIVATE
@@ -24,6 +27,7 @@ target_compile_options(kernel PRIVATE
     -Werror
     -Wshadow
     -Wno-unused-parameter
+    -mgeneral-regs-only
 )
 
 set_target_properties(kernel PROPERTIES

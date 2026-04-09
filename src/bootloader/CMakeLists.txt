@@ -17,6 +17,7 @@ set(SHARED_INCLUDE_DIRS
 
 add_executable(bootloader
     src/main.cpp
+    src/config.cpp
     src/console.cpp
     src/graphics.cpp
     src/memory.cpp

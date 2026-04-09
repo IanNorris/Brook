@@ -33,3 +33,16 @@ ExternalProject_Add(kernel
     BUILD_ALWAYS  TRUE
     INSTALL_COMMAND ""
 )
+
+# Tests - use same kernel toolchain
+ExternalProject_Add(tests
+    SOURCE_DIR  ${BROOK_ROOT}/src/tests
+    BINARY_DIR  ${CMAKE_BINARY_DIR}/tests
+    CMAKE_ARGS
+        -DCMAKE_TOOLCHAIN_FILE=${BROOK_ROOT}/cmake/toolchains/kernel-x86_64-clang.cmake
+        -DCMAKE_BUILD_TYPE=${BROOK_BUILD_TYPE}
+        -DBROOK_ROOT=${BROOK_ROOT}
+    BUILD_ALWAYS  TRUE
+    INSTALL_COMMAND ""
+    DEPENDS kernel
+)

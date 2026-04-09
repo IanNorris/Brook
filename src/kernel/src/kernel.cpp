@@ -1,4 +1,7 @@
 #include "boot_protocol/boot_protocol.h"
+#include "serial.h"
+#include "gdt.h"
+#include "idt.h"
 
 // Draw a filled rectangle to the framebuffer using the given colour.
 static void DrawRect(
@@ -23,6 +26,9 @@ static void DrawRect(
 // At this stage: UEFI page tables still active, running at physical address.
 extern "C" __attribute__((sysv_abi)) void KernelMain(brook::BootProtocol* bootProtocol)
 {
+    brook::SerialInit();
+    brook::SerialPrintf("Brook kernel starting...\n");
+
     // Validate boot protocol
     if (bootProtocol == nullptr ||
         bootProtocol->magic != brook::BootProtocolMagic)
@@ -30,7 +36,16 @@ extern "C" __attribute__((sysv_abi)) void KernelMain(brook::BootProtocol* bootPr
         for (;;) { __asm__ volatile("hlt"); }
     }
 
+    GdtInit();
+    brook::SerialPuts("GDT loaded\n");
+
+    IdtInit(&bootProtocol->framebuffer);
+    brook::SerialPuts("IDT loaded\n");
+
     const brook::Framebuffer& fb = bootProtocol->framebuffer;
+    brook::SerialPrintf("Framebuffer: %ux%u @ 0x%p\n",
+                        fb.width, fb.height,
+                        reinterpret_cast<void*>(fb.physicalBase));
 
     // Clear to dark blue to show the kernel owns the screen now
     DrawRect(fb, 0, 0, fb.width, fb.height, 0x00001A3A);
@@ -38,6 +53,9 @@ extern "C" __attribute__((sysv_abi)) void KernelMain(brook::BootProtocol* bootPr
     // Draw a white rectangle as proof-of-life
     DrawRect(fb, 50, 50, 200, 100, 0x00FFFFFF);
 
-    // Halt
+    brook::SerialPuts("Kernel running — waiting for interrupts\n");
+
+    // Enable interrupts and halt
+    __asm__ volatile("sti");
     for (;;) { __asm__ volatile("hlt"); }
 }

@@ -1,5 +1,6 @@
 #include <Uefi.h>
 #include "console.h"
+#include "config.h"
 #include "graphics.h"
 #include "memory.h"
 #include "acpi.h"
@@ -14,6 +15,9 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
 
     ConsoleInit(systemTable->ConOut);
     ConsolePrintLine(u"Brook bootloader starting...");
+
+    // --- Config ---
+    LoadConfig(imageHandle, systemTable->BootServices);
 
     // --- Graphics ---
     brook::Framebuffer framebuffer{};
@@ -34,10 +38,10 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     // --- Load kernel ---
     UINTN kernelFileSize = 0;
     uint8_t* kernelData = ReadFile(imageHandle, systemTable->BootServices,
-        u"KERNEL\\BROOK.ELF", &kernelFileSize);
+        g_bootConfig.target, &kernelFileSize);
     if (kernelData == nullptr)
     {
-        Halt(EFI_NOT_FOUND, u"Kernel not found at KERNEL\\BROOK.ELF");
+        Halt(EFI_NOT_FOUND, u"Kernel not found");
     }
     ConsolePrintLine(u"Kernel file read");
 

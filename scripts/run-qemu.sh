@@ -27,6 +27,18 @@ else
     cp "${KERNEL_ELF}" "${KERNEL_ESP_DIR}/BROOK.ELF"
 fi
 
+# Write default BROOK.CFG if not already present
+BROOK_CFG="${BUILD_DIR}/esp/BROOK.CFG"
+if [ ! -f "${BROOK_CFG}" ]; then
+    cat > "${BROOK_CFG}" <<'EOF'
+# Brook OS boot configuration
+TARGET=KERNEL\BROOK.ELF
+DEBUG_TEXT=0
+LOG_MEMORY=0
+LOG_INTERRUPTS=0
+EOF
+fi
+
 # Find OVMF firmware - check env vars first (set by shell.nix), then common paths
 OVMF_CODE="${OVMF_CODE:-}"
 OVMF_VARS="${OVMF_VARS:-}"
