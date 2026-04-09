@@ -27,6 +27,10 @@ pkgs.mkShell {
 
     # Dev tools
     llvm.clang-tools      # clangd, clang-tidy, clang-format
+
+    # Font baking (build-time TTF → kernel glyph atlas)
+    pkgs.hack-font
+    (pkgs.python3.withPackages (ps: [ ps.freetype-py ]))
   ];
 
   # Point clang to its own resource dir so freestanding headers are found.
@@ -35,6 +39,7 @@ pkgs.mkShell {
     export CXX="${llvm.clang-unwrapped}/bin/clang++"
     export OVMF_CODE="${pkgs.OVMF.fd}/FV/OVMF_CODE.fd"
     export OVMF_VARS="${pkgs.OVMF.fd}/FV/OVMF_VARS.fd"
+    export HACK_FONT_TTF="${pkgs.hack-font}/share/fonts/truetype/Hack-Regular.ttf"
     echo "Brook dev shell ready (Clang $(clang --version | head -1))"
   '';
 }

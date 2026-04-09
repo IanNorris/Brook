@@ -1,0 +1,45 @@
+#pragma once
+
+#include <stdint.h>
+#include "boot_protocol/boot_protocol.h"
+
+// Kernel TTY — renders text to the UEFI framebuffer using a pre-baked glyph atlas.
+//
+// Features:
+//   - Hack 16px anti-aliased glyphs (baked at build time, no FPU needed at runtime)
+//   - Automatic word-wrap and newline handling
+//   - Scrolling: when the cursor hits the bottom, all rows scroll up by one line
+//   - Configurable foreground/background colour
+//
+// Lifecycle:
+//   TtyInit() must be called after VmmInit() + HeapInit() + PmmEnableTracking().
+//   After that, TtyPrintf/TtyPuts/TtyPutChar are safe to call from any kernel context
+//   that is NOT inside an interrupt handler (framebuffer writes are not re-entrant).
+
+namespace brook {
+
+// Initialise the TTY: maps the framebuffer into virtual address space,
+// clears it to the default background colour, and resets the cursor.
+// Returns true on success; false if the VMM cannot map the framebuffer.
+bool TtyInit(const Framebuffer& fb);
+
+// Output a single character.  Handles \n, \r, \t.  Word-wraps at screen edge.
+void TtyPutChar(char c);
+
+// Output a null-terminated string.
+void TtyPuts(const char* str);
+
+// printf-style formatted output.  Supports the same specifiers as SerialPrintf:
+// %s %d %u %x %p  (no width/precision modifiers except %p which is 0-padded 16 hex digits)
+void TtyPrintf(const char* fmt, ...);
+
+// Set foreground and background colours (0x00RRGGBB — top byte ignored).
+void TtySetColors(uint32_t fg, uint32_t bg);
+
+// Move cursor to the top-left and clear the screen.
+void TtyClear();
+
+// Return true if TtyInit() has completed successfully.
+bool TtyReady();
+
+} // namespace brook
