@@ -14,7 +14,7 @@ find_program(LD_LLD NAMES ld.lld REQUIRED)
 set(CMAKE_LINKER ${LD_LLD})
 
 set(CMAKE_CXX_FLAGS_INIT
-    "--target=x86_64-elf -ffreestanding -fno-stack-protector -mno-red-zone -fno-asynchronous-unwind-tables -mcmodel=large -fno-exceptions -fno-rtti -nostdlib")
+    "--target=x86_64-elf -ffreestanding -fno-stack-protector -mno-red-zone -fno-asynchronous-unwind-tables -mcmodel=kernel -fno-exceptions -fno-rtti -nostdlib")
 
 # Use ld.lld directly for linking
 set(CMAKE_CXX_LINK_EXECUTABLE

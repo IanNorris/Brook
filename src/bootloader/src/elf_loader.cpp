@@ -13,9 +13,10 @@ namespace bootloader
 static constexpr EFI_PHYSICAL_ADDRESS KernelPhysicalBase = 0x400000ULL;
 
 KernelEntryFn LoadKernelElf(
-    EFI_BOOT_SERVICES* bootServices,
-    const uint8_t*     elfData,
-    UINTN              elfSize)
+    EFI_BOOT_SERVICES*    bootServices,
+    const uint8_t*        elfData,
+    UINTN                 elfSize,
+    EFI_PHYSICAL_ADDRESS& outPhysBase)
 {
     if (elfSize < sizeof(Elf64Header))
     {
@@ -146,14 +147,15 @@ KernelEntryFn LoadKernelElf(
         }
     }
 
-    // Entry point: adjust from virtual to physical
-    uint64_t entryPhysical = physBase + (header->entry - lowestVAddr);
+    outPhysBase = physBase;
 
-    ConsolePrint(u"Kernel entry: ");
-    ConsolePrintHex(entryPhysical);
+    // Return the VIRTUAL entry point from the ELF header.
+    // This is the address the CPU will jump to AFTER our page tables are loaded.
+    ConsolePrint(u"Kernel virtual entry: ");
+    ConsolePrintHex(header->entry);
     ConsolePrintLine(u"");
 
-    return reinterpret_cast<KernelEntryFn>(entryPhysical);
+    return reinterpret_cast<KernelEntryFn>(header->entry);
 }
 
 } // namespace bootloader

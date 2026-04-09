@@ -8,25 +8,20 @@ namespace brook
 namespace bootloader
 {
 
-// Kernel entry point signature.
-// __attribute__((sysv_abi)) ensures the bootloader (compiled with MS x64 ABI)
-// calls this with SysV calling convention — argument in RDI, not RCX.
+// Kernel entry point function type. Called with SysV ABI (arg in RDI).
 using KernelEntryFn = void (__attribute__((sysv_abi)) *)(brook::BootProtocol* bootProtocol);
 
-// Validate and load a kernel ELF image into memory.
+// Load a kernel ELF into memory.
 //
-// elfData:     Pointer to the raw ELF file bytes in memory.
-// elfSize:     Size of the ELF file in bytes.
-// bootServices: Used for page allocation.
+// Returns the VIRTUAL entry point (from the ELF e_entry field directly).
+// Sets outPhysBase to the physical address where the kernel was loaded.
 //
-// On success: allocates pages, loads all PT_LOAD segments, zeros BSS,
-//             records the loaded region in bootProtocol's memory map,
-//             returns the kernel entry point.
-// On failure: calls Halt().
+// The virtual entry is only valid to call AFTER page tables are loaded.
 KernelEntryFn LoadKernelElf(
-    EFI_BOOT_SERVICES*  bootServices,
-    const uint8_t*      elfData,
-    UINTN               elfSize);
+    EFI_BOOT_SERVICES*    bootServices,
+    const uint8_t*        elfData,
+    UINTN                 elfSize,
+    EFI_PHYSICAL_ADDRESS& outPhysBase);
 
 } // namespace bootloader
 } // namespace brook

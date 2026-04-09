@@ -23,6 +23,7 @@ add_executable(bootloader
     src/acpi.cpp
     src/fs.cpp
     src/elf_loader.cpp
+    src/paging.cpp
     src/runtime.cpp
 )
 

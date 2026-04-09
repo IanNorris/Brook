@@ -1,9 +1,9 @@
-/* Brook kernel linker script - initial physical load at 4MB */
+/* Brook kernel linker script - high virtual address */
 ENTRY(KernelMain)
 
 SECTIONS
 {
-    . = 0x400000;
+    . = 0xFFFFFFFF80000000;
 
     .text : {
         *(.text .text.*)

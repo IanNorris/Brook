@@ -5,6 +5,7 @@
 #include "acpi.h"
 #include "elf_loader.h"
 #include "fs.h"
+#include "paging.h"
 #include "boot_protocol/boot_protocol.h"
 
 extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* systemTable)
@@ -31,21 +32,29 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     ConsolePrintLine(u"ACPI located");
 
     // --- Load kernel ---
-    UINTN kernelSize = 0;
-    uint8_t* kernelData = ReadFile(imageHandle, systemTable->BootServices, u"KERNEL\\BROOK.ELF", &kernelSize);
+    UINTN kernelFileSize = 0;
+    uint8_t* kernelData = ReadFile(imageHandle, systemTable->BootServices,
+        u"KERNEL\\BROOK.ELF", &kernelFileSize);
     if (kernelData == nullptr)
     {
         Halt(EFI_NOT_FOUND, u"Kernel not found at KERNEL\\BROOK.ELF");
     }
     ConsolePrintLine(u"Kernel file read");
 
-    KernelEntryFn kernelEntry = LoadKernelElf(systemTable->BootServices, kernelData, kernelSize);
+    EFI_PHYSICAL_ADDRESS kernelPhysBase = 0;
+    KernelEntryFn kernelVirtualEntry = LoadKernelElf(
+        systemTable->BootServices, kernelData, kernelFileSize, kernelPhysBase);
     ConsolePrintLine(u"Kernel loaded");
 
     // Free the temporary ELF file buffer (segments already copied out)
-    FreePages(systemTable->BootServices, (EFI_PHYSICAL_ADDRESS)(UINTN)kernelData, kernelSize);
+    FreePages(systemTable->BootServices,
+        reinterpret_cast<EFI_PHYSICAL_ADDRESS>(kernelData), kernelFileSize);
 
-    // --- Memory map (must be last before ExitBootServices) ---
+    // --- Allocate page table memory (must be before ExitBootServices) ---
+    PageTableAllocation pageTableAlloc = AllocatePageTables(systemTable->BootServices);
+    ConsolePrintLine(u"Page table memory allocated");
+
+    // --- Memory map (must be last thing before ExitBootServices) ---
     brook::MemoryDescriptor* memoryMap = nullptr;
     UINT32 memoryMapCount              = 0;
     UINTN mapKey = BuildMemoryMap(systemTable->BootServices, &memoryMap, &memoryMapCount);
@@ -63,7 +72,17 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
         }
     }
 
-    // Build boot protocol to hand to the kernel
+    // From here: no UEFI services available. No console output.
+
+    // --- Build and activate page tables ---
+    // After this, virtual 0xFFFFFFFF80000000 maps to kernelPhysBase.
+    // Low memory 0-4GB is identity-mapped so bootloader code continues running.
+    BuildPageTables(pageTableAlloc, kernelPhysBase);
+    LoadCR3(pageTableAlloc);
+
+    // --- Build boot protocol ---
+    // This struct is on the stack (in identity-mapped low memory), accessible
+    // from both the current low address and after the kernel takes over.
     brook::BootProtocol bootProtocol{};
     bootProtocol.magic          = brook::BootProtocolMagic;
     bootProtocol.version        = brook::BootProtocolVersion;
@@ -72,17 +91,15 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     bootProtocol.memoryMap      = memoryMap;
     bootProtocol.memoryMapCount = memoryMapCount;
 
-    // Jump to kernel using explicit SysV ABI:
-    // The bootloader is compiled with MS x64 ABI (args in RCX/RDX/R8/R9).
-    // The kernel ELF uses SysV ABI (first arg in RDI).
-    // We use inline asm to ensure the argument lands in RDI regardless of
-    // what the compiler would normally generate for a function pointer call.
+    // --- Jump to kernel at virtual address ---
+    // Use inline asm to ensure SysV calling convention:
+    // first argument (bootProtocol ptr) goes in RDI, not RCX.
     {
-        void* entry    = reinterpret_cast<void*>(kernelEntry);
+        void* entry    = reinterpret_cast<void*>(kernelVirtualEntry);
         void* protocol = &bootProtocol;
         asm volatile(
-            "mov %1, %%rdi\n\t"   // protocol -> RDI (SysV first arg)
-            "jmp *%0\n\t"         // jump to kernel entry point
+            "mov %1, %%rdi\n\t"
+            "jmp *%0\n\t"
             :
             : "r"(entry), "r"(protocol)
             : "rdi"
