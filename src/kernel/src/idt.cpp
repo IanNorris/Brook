@@ -12,7 +12,7 @@ static inline void outb(uint16_t port, uint8_t val)
 static brook::Framebuffer* g_panicFb = nullptr;
 
 // ---- IDT storage ----
-static IdtEntry     g_idt[48];
+static IdtEntry     g_idt[256];
 static IdtDescriptor g_idtDesc;
 
 // ---- Helper to fill one IDT entry ----
@@ -131,6 +131,12 @@ IRQ_SLAVE(44)
 IRQ_SLAVE(45)
 IRQ_SLAVE(46)
 IRQ_SLAVE(47)
+
+void IdtInstallHandler(uint8_t vector, void* handler)
+{
+    SetIdtEntry(vector, handler);
+    __asm__ volatile("lidt %0" : : "m"(g_idtDesc));
+}
 
 void IdtInit(brook::Framebuffer* fb)
 {

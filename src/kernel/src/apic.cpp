@@ -1,0 +1,283 @@
+#include "apic.h"
+#include "idt.h"
+#include "vmm.h"
+#include "pmm.h"
+#include "serial.h"
+
+namespace brook {
+
+// ---------------------------------------------------------------------------
+// Port I/O
+// ---------------------------------------------------------------------------
+
+static inline void outb(uint16_t port, uint8_t val)
+{
+    __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
+}
+
+static inline uint8_t inb(uint16_t port)
+{
+    uint8_t val;
+    __asm__ volatile("inb %1, %0" : "=a"(val) : "Nd"(port));
+    return val;
+}
+
+// Short I/O delay using an unused port.
+static inline void IoDelay()
+{
+    outb(0x80, 0);
+}
+
+// ---------------------------------------------------------------------------
+// MSR access
+// ---------------------------------------------------------------------------
+
+static inline uint64_t ReadMsr(uint32_t msr)
+{
+    uint32_t lo, hi;
+    __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return (static_cast<uint64_t>(hi) << 32) | lo;
+}
+
+static inline void WriteMsr(uint32_t msr, uint64_t val)
+{
+    __asm__ volatile("wrmsr" : : "c"(msr),
+                     "a"(static_cast<uint32_t>(val)),
+                     "d"(static_cast<uint32_t>(val >> 32)));
+}
+
+// ---------------------------------------------------------------------------
+// LAPIC MMIO access
+// ---------------------------------------------------------------------------
+
+static uint64_t g_lapicVirt = 0;
+static uint32_t g_timerTicksPerMs = 0;
+
+static inline uint32_t LapicRead(uint32_t offset)
+{
+    return *reinterpret_cast<volatile uint32_t*>(g_lapicVirt + offset);
+}
+
+static inline void LapicWrite(uint32_t offset, uint32_t val)
+{
+    *reinterpret_cast<volatile uint32_t*>(g_lapicVirt + offset) = val;
+}
+
+// ---------------------------------------------------------------------------
+// Step 1: Disable the legacy 8259 PIC
+// ---------------------------------------------------------------------------
+
+static void DisablePic()
+{
+    // Send ICW1 to both PICs.
+    outb(0x20, 0x11);  IoDelay();
+    outb(0xA0, 0x11);  IoDelay();
+    // ICW2: remap master → vectors 32-39, slave → vectors 40-47.
+    outb(0x21, 0x20);  IoDelay();
+    outb(0xA1, 0x28);  IoDelay();
+    // ICW3: cascade.
+    outb(0x21, 0x04);  IoDelay();
+    outb(0xA1, 0x02);  IoDelay();
+    // ICW4: 8086 mode.
+    outb(0x21, 0x01);  IoDelay();
+    outb(0xA1, 0x01);  IoDelay();
+    // Mask ALL interrupts on both PICs.
+    outb(0x21, 0xFF);
+    outb(0xA1, 0xFF);
+    SerialPuts("APIC: 8259 PIC disabled\n");
+}
+
+// ---------------------------------------------------------------------------
+// Step 2: Enable LAPIC via IA32_APIC_BASE MSR
+// ---------------------------------------------------------------------------
+
+static constexpr uint32_t IA32_APIC_BASE_MSR   = 0x1B;
+static constexpr uint64_t APIC_BASE_GLOBAL_EN  = (1ULL << 11);
+
+static bool EnableLapicMsr()
+{
+    uint64_t base = ReadMsr(IA32_APIC_BASE_MSR);
+    base |= APIC_BASE_GLOBAL_EN;
+    WriteMsr(IA32_APIC_BASE_MSR, base);
+
+    // Verify it's still enabled.
+    uint64_t verify = ReadMsr(IA32_APIC_BASE_MSR);
+    if (!(verify & APIC_BASE_GLOBAL_EN))
+    {
+        SerialPuts("APIC: failed to enable via MSR\n");
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Step 3: Map LAPIC MMIO into virtual address space
+// ---------------------------------------------------------------------------
+
+static bool MapLapic(uint64_t physBase)
+{
+    // LAPIC is a single 4KB page.
+    g_lapicVirt = VmmAllocPages(1, VMM_WRITABLE, MemTag::Device, KernelPid);
+    if (g_lapicVirt == 0)
+    {
+        SerialPuts("APIC: failed to allocate virtual page for LAPIC\n");
+        return false;
+    }
+
+    // Remap the allocated virtual page to the LAPIC physical page.
+    // VmmAllocPages already mapped a physical page there — unmap it first,
+    // free the backing page, then map LAPIC physical.
+    uint64_t oldPhys = VmmVirtToPhys(g_lapicVirt);
+    VmmUnmapPage(g_lapicVirt);
+    if (oldPhys) PmmFreePage(oldPhys);
+
+    if (!VmmMapPage(g_lapicVirt, physBase,
+                    VMM_WRITABLE | VMM_NO_EXEC,
+                    MemTag::Device, KernelPid))
+    {
+        SerialPuts("APIC: failed to map LAPIC MMIO\n");
+        return false;
+    }
+
+    SerialPrintf("APIC: LAPIC mapped phys 0x%p → virt 0x%p\n",
+                 reinterpret_cast<void*>(physBase),
+                 reinterpret_cast<void*>(g_lapicVirt));
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Step 4: Software-enable the LAPIC and set spurious vector
+// ---------------------------------------------------------------------------
+
+static void SoftEnableLapic()
+{
+    // Set spurious interrupt vector and enable bit.
+    LapicWrite(LapicReg::SVR,
+               LAPIC_SVR_ENABLE | LAPIC_SPURIOUS_VECTOR);
+
+    // Zero the Task Priority Register — accept all interrupt classes.
+    LapicWrite(LapicReg::TPR, 0);
+}
+
+// ---------------------------------------------------------------------------
+// LAPIC timer spurious ISR — just send EOI.
+// ---------------------------------------------------------------------------
+
+static volatile uint64_t g_timerTicks = 0;
+
+__attribute__((interrupt))
+static void LapicTimerHandler(InterruptFrame* frame)
+{
+    (void)frame;
+    g_timerTicks++;
+    LapicWrite(LapicReg::EOI, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Step 5: Calibrate LAPIC timer against PIT channel 2 (~10ms)
+//
+// PIT channel 2 is connected to the PC speaker gate but can be used as a
+// one-shot timer without enabling the speaker.  We gate it for ~10ms and
+// count how many LAPIC timer ticks that takes.
+// ---------------------------------------------------------------------------
+
+static constexpr uint32_t PIT_FREQUENCY      = 1193182;   // Hz
+static constexpr uint32_t CALIBRATION_MS     = 10;
+static constexpr uint32_t PIT_TICKS_10MS     = (PIT_FREQUENCY * CALIBRATION_MS) / 1000;
+// ~11931 ticks for 10ms
+
+static uint32_t CalibrateLapicTimer()
+{
+    // Set LAPIC timer divide by 16.
+    LapicWrite(LapicReg::TIMER_DIVIDE, 0x3);
+
+    // Configure PIT channel 2 for one-shot mode.
+    // Port 0x61: bit 0 = gate, bit 1 = speaker enable (keep 0)
+    uint8_t prev61 = inb(0x61);
+    outb(0x61, (prev61 & ~0x02) | 0x01);  // gate on, speaker off
+
+    // Select channel 2, lo/hi byte, mode 0 (interrupt on terminal count).
+    outb(0x43, 0xB0);
+    outb(0x42, static_cast<uint8_t>(PIT_TICKS_10MS & 0xFF));
+    outb(0x42, static_cast<uint8_t>(PIT_TICKS_10MS >> 8));
+
+    // Start LAPIC timer counting down from max.
+    LapicWrite(LapicReg::TIMER_INIT_CNT, 0xFFFFFFFF);
+
+    // Wait for PIT to complete (bit 5 of port 0x61 goes high when done).
+    while (!(inb(0x61) & 0x20)) {}
+
+    // Read remaining LAPIC count and compute elapsed ticks.
+    uint32_t remaining = LapicRead(LapicReg::TIMER_CUR_CNT);
+    LapicWrite(LapicReg::TIMER_INIT_CNT, 0);  // stop timer
+
+    // Restore port 0x61.
+    outb(0x61, prev61);
+
+    uint32_t elapsed = 0xFFFFFFFF - remaining;
+    uint32_t ticksPerMs = elapsed / CALIBRATION_MS;
+
+    SerialPrintf("APIC: LAPIC timer calibrated — %u ticks/ms "
+                 "(%u ticks in %u ms)\n",
+                 ticksPerMs, elapsed, CALIBRATION_MS);
+    return ticksPerMs;
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+bool ApicInit(uint64_t localApicPhysical)
+{
+    if (localApicPhysical == 0)
+    {
+        SerialPuts("APIC: no LAPIC address\n");
+        return false;
+    }
+
+    DisablePic();
+
+    if (!EnableLapicMsr())   return false;
+    if (!MapLapic(localApicPhysical)) return false;
+
+    SoftEnableLapic();
+
+    // Install LAPIC timer handler at vector 32 (replaces PIC IRQ0 stub).
+    IdtInstallHandler(LAPIC_TIMER_VECTOR,
+                      reinterpret_cast<void*>(LapicTimerHandler));
+
+    g_timerTicksPerMs = CalibrateLapicTimer();
+
+    // Program the LAPIC timer: periodic, ~1ms interval.
+    LapicWrite(LapicReg::TIMER_DIVIDE, 0x3);  // divide by 16
+    LapicWrite(LapicReg::LVT_TIMER,
+               LAPIC_TIMER_PERIODIC | LAPIC_TIMER_VECTOR);
+    LapicWrite(LapicReg::TIMER_INIT_CNT, g_timerTicksPerMs);  // 1ms period
+
+    SerialPrintf("APIC: LAPIC ID=%u, version=0x%x, timer running at 1ms intervals\n",
+                 ApicGetId(),
+                 LapicRead(LapicReg::VERSION) & 0xFF);
+    return true;
+}
+
+void ApicSendEoi()
+{
+    LapicWrite(LapicReg::EOI, 0);
+}
+
+uint8_t ApicGetId()
+{
+    return static_cast<uint8_t>(LapicRead(LapicReg::ID) >> 24);
+}
+
+uint32_t ApicGetTimerTicksPerMs()
+{
+    return g_timerTicksPerMs;
+}
+
+uint64_t ApicGetLapicVirtBase()
+{
+    return g_lapicVirt;
+}
+
+} // namespace brook

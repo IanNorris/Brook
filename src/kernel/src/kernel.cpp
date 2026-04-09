@@ -5,6 +5,8 @@
 #include "pmm.h"
 #include "vmm.h"
 #include "heap.h"
+#include "acpi.h"
+#include "apic.h"
 
 // Draw a filled rectangle to the framebuffer using the given colour.
 static void DrawRect(
@@ -53,6 +55,19 @@ extern "C" __attribute__((sysv_abi)) void KernelMain(brook::BootProtocol* bootPr
     brook::VmmInit();
     brook::HeapInit();
     brook::PmmEnableTracking();
+
+    // ACPI: parse tables to get LAPIC/IOAPIC addresses.
+    bool acpiOk = brook::AcpiInit(bootProtocol->acpi.rsdpPhysical);
+    if (acpiOk)
+    {
+        // APIC: disable legacy PIC, enable LAPIC, calibrate + start timer.
+        const brook::MadtInfo& madt = brook::AcpiGetMadt();
+        brook::ApicInit(madt.localApicPhysical);
+    }
+    else
+    {
+        brook::SerialPuts("WARNING: ACPI init failed — running without LAPIC\n");
+    }
 
     const brook::Framebuffer& fb = bootProtocol->framebuffer;
     brook::SerialPrintf("Framebuffer: %ux%u @ 0x%p\n",

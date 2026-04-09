@@ -28,3 +28,8 @@ struct InterruptFrame {
 // Set up 32 exception handlers and 16 IRQ stubs, then load the IDT via lidt.
 // fb is stored for use in the panic screen.
 void IdtInit(brook::Framebuffer* fb);
+
+// Install a handler for any vector 0-255.  Safe to call after IdtInit().
+// handler must be a function with C linkage and standard interrupt ABI
+// (__attribute__((interrupt)) or raw ISR that saves all registers).
+void IdtInstallHandler(uint8_t vector, void* handler);
