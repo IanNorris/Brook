@@ -259,30 +259,91 @@ void TtyVPrintf(const char* fmt, __builtin_va_list args)
         ++fmt;
         if (*fmt == '\0') break;
 
+        // Parse flags
+        bool leftAlign = false;
+        bool zeroPad   = false;
+        while (*fmt == '-' || *fmt == '0') {
+            if (*fmt == '-') leftAlign = true;
+            if (*fmt == '0') zeroPad   = true;
+            fmt++;
+        }
+        if (leftAlign) zeroPad = false;
+
+        // Parse width
+        int width = 0;
+        while (*fmt >= '0' && *fmt <= '9') {
+            width = width * 10 + (*fmt - '0');
+            fmt++;
+        }
+        if (*fmt == '\0') break;
+
+        // Parse 'l' length modifier
+        bool isLong = false;
+        if (*fmt == 'l') { isLong = true; fmt++; }
+        if (*fmt == '\0') break;
+
+        char buf[24];
+        int len = 0;
+
         switch (*fmt)
         {
-        case 's': { const char* s = __builtin_va_arg(args, const char*); TtyPuts(s ? s : "(null)"); break; }
-        case 'd': { int v = __builtin_va_arg(args, int);
-                    if (v < 0) { TtyPutChar('-'); TtyPrintUlong((unsigned long)-(long)v); }
-                    else TtyPrintUlong((unsigned long)v);
-                    break; }
-        case 'u': TtyPrintUlong((unsigned long)__builtin_va_arg(args, unsigned int)); break;
-        case 'x': TtyPrintHex((unsigned long)__builtin_va_arg(args, unsigned int));   break;
-        case 'l':
-            ++fmt;
-            if      (*fmt == 'u') TtyPrintUlong(__builtin_va_arg(args, unsigned long));
-            else if (*fmt == 'x') TtyPrintHex(__builtin_va_arg(args, unsigned long));
-            else if (*fmt == 'd') {
-                long v = __builtin_va_arg(args, long);
-                if (v < 0) { TtyPutChar('-'); TtyPrintUlong((unsigned long)-v); }
-                else TtyPrintUlong((unsigned long)v);
-            }
-            else { TtyPutChar('l'); TtyPutChar(*fmt); }
+        case 's': {
+            const char* s = __builtin_va_arg(args, const char*);
+            if (!s) s = "(null)";
+            const char* p = s;
+            while (*p) { ++p; ++len; }
+            if (!leftAlign) { for (int i = len; i < width; ++i) TtyPutChar(' '); }
+            TtyPuts(s);
+            if (leftAlign) { for (int i = len; i < width; ++i) TtyPutChar(' '); }
             break;
+        }
+        case 'd': {
+            long val;
+            if (isLong) val = __builtin_va_arg(args, long);
+            else        val = static_cast<long>(__builtin_va_arg(args, int));
+            bool neg = val < 0;
+            unsigned long uval = neg ? static_cast<unsigned long>(-val) : static_cast<unsigned long>(val);
+            len = 0;
+            if (uval == 0) { buf[len++] = '0'; }
+            else { while (uval > 0) { buf[len++] = static_cast<char>('0' + (uval % 10)); uval /= 10; } }
+            int totalLen = len + (neg ? 1 : 0);
+            if (!leftAlign && !zeroPad) { for (int i = totalLen; i < width; ++i) TtyPutChar(' '); }
+            if (neg) TtyPutChar('-');
+            if (!leftAlign && zeroPad) { for (int i = totalLen; i < width; ++i) TtyPutChar('0'); }
+            while (len > 0) TtyPutChar(buf[--len]);
+            if (leftAlign) { for (int i = totalLen; i < width; ++i) TtyPutChar(' '); }
+            break;
+        }
+        case 'u': {
+            unsigned long val;
+            if (isLong) val = __builtin_va_arg(args, unsigned long);
+            else        val = static_cast<unsigned long>(__builtin_va_arg(args, unsigned int));
+            len = 0;
+            if (val == 0) { buf[len++] = '0'; }
+            else { while (val > 0) { buf[len++] = static_cast<char>('0' + (val % 10)); val /= 10; } }
+            char padCh = zeroPad ? '0' : ' ';
+            if (!leftAlign) { for (int i = len; i < width; ++i) TtyPutChar(padCh); }
+            while (len > 0) TtyPutChar(buf[--len]);
+            if (leftAlign) { for (int i = len; i < width; ++i) TtyPutChar(' '); }
+            break;
+        }
+        case 'x': {
+            unsigned long val;
+            if (isLong) val = __builtin_va_arg(args, unsigned long);
+            else        val = static_cast<unsigned long>(__builtin_va_arg(args, unsigned int));
+            len = 0;
+            if (val == 0) { buf[len++] = '0'; }
+            else { while (val > 0) { int n = static_cast<int>(val & 0xF); buf[len++] = static_cast<char>(n < 10 ? '0' + n : 'a' + n - 10); val >>= 4; } }
+            char padCh = zeroPad ? '0' : ' ';
+            if (!leftAlign) { for (int i = len; i < width; ++i) TtyPutChar(padCh); }
+            while (len > 0) TtyPutChar(buf[--len]);
+            if (leftAlign) { for (int i = len; i < width; ++i) TtyPutChar(' '); }
+            break;
+        }
         case 'p': TtyPrintPtr((unsigned long)__builtin_va_arg(args, void*)); break;
         case 'c': TtyPutChar(static_cast<char>(__builtin_va_arg(args, int))); break;
         case '%': TtyPutChar('%'); break;
-        default:  TtyPutChar('%'); TtyPutChar(*fmt); break;
+        default:  TtyPutChar('%'); if (isLong) TtyPutChar('l'); TtyPutChar(*fmt); break;
         }
         ++fmt;
     }

@@ -8,16 +8,13 @@ namespace brook {
 
 static int RamdiskRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
 {
-    SerialPuts("RamdiskRead: entered\n");
     auto* p = static_cast<RamdiskPriv*>(dev->priv);
-    SerialPrintf("RamdiskRead: p=%p size=%lu\n", (void*)p, p ? p->size : 0UL);
     if (offset >= p->size) return 0;
     if (offset + len > p->size) len = p->size - offset;
 
     const uint8_t* src = p->data + offset;
     uint8_t*       dst = static_cast<uint8_t*>(buf);
     for (uint64_t i = 0; i < len; ++i) dst[i] = src[i];
-    SerialPuts("RamdiskRead: done\n");
     return static_cast<int>(len);
 }
 

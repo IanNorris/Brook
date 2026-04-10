@@ -96,46 +96,88 @@ void SerialVPrintf(const char* fmt, __builtin_va_list args)
         fmt++;  // skip '%'
         if (*fmt == '\0') break;
 
+        // Parse flags
+        bool leftAlign = false;
+        bool zeroPad   = false;
+        while (*fmt == '-' || *fmt == '0') {
+            if (*fmt == '-') leftAlign = true;
+            if (*fmt == '0') zeroPad   = true;
+            fmt++;
+        }
+        if (leftAlign) zeroPad = false;  // '-' overrides '0'
+
+        // Parse width
+        int width = 0;
+        while (*fmt >= '0' && *fmt <= '9') {
+            width = width * 10 + (*fmt - '0');
+            fmt++;
+        }
+        if (*fmt == '\0') break;
+
+        // Parse 'l' length modifier
+        bool isLong = false;
+        if (*fmt == 'l') { isLong = true; fmt++; }
+        if (*fmt == '\0') break;
+
+        // Temporary buffer for formatted number/string
+        char buf[24];
+        int len = 0;
+
         switch (*fmt) {
             case 's': {
                 const char* s = __builtin_va_arg(args, const char*);
-                SerialPuts(s ? s : "(null)");
+                if (!s) s = "(null)";
+                // Count length
+                const char* p = s;
+                while (*p) { ++p; ++len; }
+                // Pad right (left-align: print string then spaces)
+                if (!leftAlign) { for (int i = len; i < width; ++i) SerialPutChar(' '); }
+                SerialPuts(s);
+                if (leftAlign) { for (int i = len; i < width; ++i) SerialPutChar(' '); }
                 break;
             }
             case 'd': {
-                int val = __builtin_va_arg(args, int);
-                if (val < 0) {
-                    SerialPutChar('-');
-                    PrintUlong(static_cast<unsigned long>(-static_cast<long>(val)));
-                } else {
-                    PrintUlong(static_cast<unsigned long>(val));
-                }
+                long val;
+                if (isLong) val = __builtin_va_arg(args, long);
+                else        val = static_cast<long>(__builtin_va_arg(args, int));
+                bool neg = val < 0;
+                unsigned long uval = neg ? static_cast<unsigned long>(-val) : static_cast<unsigned long>(val);
+                len = 0;
+                if (uval == 0) { buf[len++] = '0'; }
+                else { while (uval > 0) { buf[len++] = static_cast<char>('0' + (uval % 10)); uval /= 10; } }
+                int totalLen = len + (neg ? 1 : 0);
+                char padChar = zeroPad ? '0' : ' ';
+                if (!leftAlign && !zeroPad) { for (int i = totalLen; i < width; ++i) SerialPutChar(' '); }
+                if (neg) SerialPutChar('-');
+                if (!leftAlign && zeroPad) { for (int i = totalLen; i < width; ++i) SerialPutChar('0'); }
+                while (len > 0) SerialPutChar(buf[--len]);
+                if (leftAlign) { for (int i = totalLen; i < width; ++i) SerialPutChar(' '); }
                 break;
             }
             case 'u': {
-                unsigned int val = __builtin_va_arg(args, unsigned int);
-                PrintUlong(static_cast<unsigned long>(val));
+                unsigned long val;
+                if (isLong) val = __builtin_va_arg(args, unsigned long);
+                else        val = static_cast<unsigned long>(__builtin_va_arg(args, unsigned int));
+                len = 0;
+                if (val == 0) { buf[len++] = '0'; }
+                else { while (val > 0) { buf[len++] = static_cast<char>('0' + (val % 10)); val /= 10; } }
+                char padChar = zeroPad ? '0' : ' ';
+                if (!leftAlign) { for (int i = len; i < width; ++i) SerialPutChar(padChar); }
+                while (len > 0) SerialPutChar(buf[--len]);
+                if (leftAlign) { for (int i = len; i < width; ++i) SerialPutChar(' '); }
                 break;
             }
             case 'x': {
-                unsigned int val = __builtin_va_arg(args, unsigned int);
-                PrintHex(static_cast<unsigned long>(val));
-                break;
-            }
-            case 'l': {
-                fmt++;
-                if (*fmt == 'u') {
-                    PrintUlong(__builtin_va_arg(args, unsigned long));
-                } else if (*fmt == 'x') {
-                    PrintHex(__builtin_va_arg(args, unsigned long));
-                } else if (*fmt == 'd') {
-                    long val = __builtin_va_arg(args, long);
-                    if (val < 0) { SerialPutChar('-'); PrintUlong(static_cast<unsigned long>(-val)); }
-                    else PrintUlong(static_cast<unsigned long>(val));
-                } else {
-                    SerialPutChar('l');
-                    SerialPutChar(*fmt);
-                }
+                unsigned long val;
+                if (isLong) val = __builtin_va_arg(args, unsigned long);
+                else        val = static_cast<unsigned long>(__builtin_va_arg(args, unsigned int));
+                len = 0;
+                if (val == 0) { buf[len++] = '0'; }
+                else { while (val > 0) { int n = static_cast<int>(val & 0xF); buf[len++] = static_cast<char>(n < 10 ? '0' + n : 'a' + n - 10); val >>= 4; } }
+                char padChar = zeroPad ? '0' : ' ';
+                if (!leftAlign) { for (int i = len; i < width; ++i) SerialPutChar(padChar); }
+                while (len > 0) SerialPutChar(buf[--len]);
+                if (leftAlign) { for (int i = len; i < width; ++i) SerialPutChar(' '); }
                 break;
             }
             case 'p': {
@@ -154,6 +196,7 @@ void SerialVPrintf(const char* fmt, __builtin_va_list args)
             }
             default: {
                 SerialPutChar('%');
+                if (isLong) SerialPutChar('l');
                 SerialPutChar(*fmt);
                 break;
             }
