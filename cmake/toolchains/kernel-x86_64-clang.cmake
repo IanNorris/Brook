@@ -17,7 +17,7 @@ find_program(LD_LLD NAMES ld.lld REQUIRED)
 set(CMAKE_LINKER ${LD_LLD})
 
 set(KERNEL_FLAGS
-    "--target=x86_64-elf --no-default-config -ffreestanding -fno-stack-protector -mno-red-zone -fno-asynchronous-unwind-tables -fno-omit-frame-pointer -mcmodel=kernel -nostdlib")
+    "--target=x86_64-elf --no-default-config -ffreestanding -fno-builtin -fno-stack-protector -mno-red-zone -fno-asynchronous-unwind-tables -fno-omit-frame-pointer -mcmodel=kernel -nostdlib")
 
 set(CMAKE_C_FLAGS_INIT   "${KERNEL_FLAGS}")
 set(CMAKE_CXX_FLAGS_INIT "${KERNEL_FLAGS} -fno-exceptions -fno-rtti")
