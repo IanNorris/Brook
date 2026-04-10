@@ -2,13 +2,20 @@
 #include <stdint.h>
 
 // GDT selector constants (byte offsets into the GDT table).
-// Index 0: null, 1: kernel code (0x08), 2: kernel data (0x10),
-//          3: user code (0x18), 4: user data (0x20), 5-6: TSS (0x28)
+// Layout is chosen so that SYSCALL/SYSRET work with the STAR MSR:
+//   STAR[47:32] = 0x08 → SYSCALL loads CS=0x08 (kernel code), SS=0x10 (kernel data)
+//   STAR[63:48] = 0x18 → SYSRET  loads SS=0x20 (user data),   CS=0x28 (user code)
+// Index 0: null, 1: kernel code, 2: kernel data,
+//       3: null (SYSRET anchor), 4: user data, 5: user code, 6-7: TSS
 static constexpr uint16_t GDT_KERNEL_CODE = 0x08;
 static constexpr uint16_t GDT_KERNEL_DATA = 0x10;
-static constexpr uint16_t GDT_USER_CODE   = 0x18 | 3;
 static constexpr uint16_t GDT_USER_DATA   = 0x20 | 3;
-static constexpr uint16_t GDT_TSS         = 0x28;   // TSS selector (RPL=0)
+static constexpr uint16_t GDT_USER_CODE   = 0x28 | 3;
+static constexpr uint16_t GDT_TSS         = 0x30;   // TSS selector (RPL=0)
+
+// STAR MSR fields.
+static constexpr uint16_t GDT_STAR_KERNEL = 0x08;  // STAR[47:32]
+static constexpr uint16_t GDT_STAR_USER   = 0x18;  // STAR[63:48]
 
 // IST slots in the TSS (1-indexed; 0 = no IST).
 static constexpr uint8_t IST_DOUBLE_FAULT = 1;  // IST1 → dedicated double-fault stack

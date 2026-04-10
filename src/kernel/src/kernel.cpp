@@ -42,6 +42,7 @@ extern "C" __attribute__((sysv_abi, noreturn)) void KernelMain(brook::BootProtoc
 
 __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootProtocol)
 {
+    extern void* g_kernelStackTop;
     brook::SerialInit();
     brook::KPrintfInit();
     brook::KPuts("Brook kernel starting...\n");
@@ -72,15 +73,30 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::HeapInit();
     brook::PmmEnableTracking();
 
-    // Install a guard page below the kernel stack.  The stack grows downward
-    // from g_kernelStackTop; g_kernelStack[0] is the lowest byte.  Unmapping
-    // the page just below catches stack overflows with a clean #PF instead of
-    // silent corruption.
+    // Allocate a proper kernel stack with a guard page.  The initial BSS stack
+    // is contiguous with other kernel data, so we can't safely unmap below it.
+    // VmmAllocPages gives us fresh pages; we skip mapping the first page (guard).
     {
-        extern uint8_t g_kernelStack[];
-        uint64_t guardAddr = reinterpret_cast<uint64_t>(g_kernelStack) & ~0xFFFULL;
-        if (guardAddr >= 0x1000) // don't unmap page 0
-            brook::VmmUnmapPage(guardAddr - 0x1000);
+        constexpr uint64_t STACK_PAGES = 8;   // 32 KB
+        constexpr uint64_t GUARD_PAGES = 1;   // 4 KB unmapped guard
+        constexpr uint64_t TOTAL_PAGES = STACK_PAGES + GUARD_PAGES;
+
+        // Reserve virtual address range, then map only the stack portion.
+        uint64_t base = brook::VmmAllocPages(TOTAL_PAGES, brook::VMM_WRITABLE,
+                                             brook::MemTag::KernelData, brook::KernelPid);
+        if (base)
+        {
+            // Unmap the first page to create the guard.
+            brook::VmmUnmapPage(base);
+
+            // New stack top is end of allocation, 16-byte aligned.
+            void* newTop = reinterpret_cast<void*>(base + TOTAL_PAGES * 0x1000 - 16);
+            g_kernelStackTop = newTop;
+
+            // Switch to the new stack.  We're deep enough in init that nothing
+            // important lives on the old BSS stack anymore.
+            __asm__ volatile("movq %0, %%rsp" :: "r"(newTop) : "memory");
+        }
     }
 
     // ACPI: parse tables to get LAPIC/IOAPIC addresses.

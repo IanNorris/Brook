@@ -14,15 +14,18 @@ static uint8_t g_dfStack[4096];       // 4 KB
 void* g_kernelStackTop = static_cast<void*>(g_kernelStack + sizeof(g_kernelStack) - 16);
 
 // ---- GDT storage ----
-// The GDT must be contiguous: [null, k-code, k-data, u-code, u-data, TSS(16B)].
+// Layout: [null, k-code, k-data, null(sysret anchor), u-data, u-code, TSS(16B)].
+// The null at slot 3 is required by the STAR MSR: SYSRET uses STAR[63:48]+8
+// for SS and STAR[63:48]+16 for CS.  With STAR[63:48]=0x18, SS=0x20, CS=0x28.
 // TSS takes two 8-byte GDT slots (a 64-bit system descriptor).
 struct GdtTable {
-    GdtEntry     null_entry;
-    GdtEntry     kernelCode;
-    GdtEntry     kernelData;
-    GdtEntry     userCode;
-    GdtEntry     userData;
-    TssDescriptor tss;         // 16 bytes (occupies slots 5+6)
+    GdtEntry      null_entry;   // 0x00
+    GdtEntry      kernelCode;   // 0x08
+    GdtEntry      kernelData;   // 0x10
+    GdtEntry      sysretAnchor; // 0x18 — null (STAR[63:48] points here)
+    GdtEntry      userData;     // 0x20
+    GdtEntry      userCode;     // 0x28
+    TssDescriptor tss;          // 0x30 (occupies slots 6+7)
 } __attribute__((packed));
 
 static GdtTable      g_gdtTable;
@@ -57,12 +60,13 @@ static void SetTssDescriptor(TssDescriptor& d, const Tss64* tss)
 
 void GdtInit()
 {
-    // Set up the 5 regular segment descriptors.
-    SetGdtEntry(g_gdtTable.null_entry, 0, 0, 0x00, 0x00);
-    SetGdtEntry(g_gdtTable.kernelCode, 0, 0xFFFF, 0x9A, 0x20);   // Ring 0 64-bit code
-    SetGdtEntry(g_gdtTable.kernelData, 0, 0xFFFF, 0x92, 0x00);   // Ring 0 data
-    SetGdtEntry(g_gdtTable.userCode,   0, 0xFFFF, 0xFA, 0x20);   // Ring 3 64-bit code
-    SetGdtEntry(g_gdtTable.userData,   0, 0xFFFF, 0xF2, 0x00);   // Ring 3 data
+    // Set up the segment descriptors.
+    SetGdtEntry(g_gdtTable.null_entry,   0, 0, 0x00, 0x00);
+    SetGdtEntry(g_gdtTable.kernelCode,   0, 0xFFFF, 0x9A, 0x20);   // Ring 0 64-bit code
+    SetGdtEntry(g_gdtTable.kernelData,   0, 0xFFFF, 0x92, 0x00);   // Ring 0 data
+    SetGdtEntry(g_gdtTable.sysretAnchor, 0, 0, 0x00, 0x00);        // null (STAR anchor)
+    SetGdtEntry(g_gdtTable.userData,     0, 0xFFFF, 0xF2, 0x00);   // Ring 3 data
+    SetGdtEntry(g_gdtTable.userCode,     0, 0xFFFF, 0xFA, 0x20);   // Ring 3 64-bit code
 
     // Populate TSS: only IST1 (double-fault emergency stack).
     // ist[] is 0-indexed: ist[0] = IST1, ist[1] = IST2, etc.
