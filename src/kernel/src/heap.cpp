@@ -1,5 +1,6 @@
 #include "heap.h"
 #include "vmm.h"
+#include "pmm.h"
 #include "serial.h"
 #include "mem_tag.h"
 
@@ -12,8 +13,12 @@ namespace brook {
 static constexpr uint32_t HEADER_MAGIC  = 0xB10CBEEF;
 static constexpr uint32_t FOOTER_MAGIC  = 0xB10CBEE2;
 static constexpr uint64_t ALIGN         = 16;
-static constexpr uint64_t INITIAL_PAGES = 64;          // 256KB initial heap
-static constexpr uint64_t EXPAND_PAGES  = 64;          // expand by 256KB at a time
+static constexpr uint64_t INITIAL_PAGES = 256;         // 1MB initial heap
+static constexpr uint64_t EXPAND_PAGES  = 256;         // expand by 1MB at a time
+
+// Dedicated virtual region for the heap (PML4[385] — separate from VMALLOC).
+static constexpr uint64_t HEAP_VIRT_BASE = 0xFFFFC08000000000ULL;
+static constexpr uint64_t HEAP_VIRT_MAX  = 0xFFFFC0FF00000000ULL; // 508GB max
 
 // ---------------------------------------------------------------------------
 // Block layout
@@ -113,60 +118,66 @@ static void WriteBlock(uint8_t* base, uint32_t size, uint32_t free)
     f->magic  = FOOTER_MAGIC;
 }
 
-// Expand the heap by EXPAND_PAGES via VMM. Returns false on failure.
+// Map physical pages into the heap's dedicated virtual region.
+// Returns true on success.
+static bool HeapMapPages(uint64_t virtStart, uint64_t pageCount)
+{
+    for (uint64_t i = 0; i < pageCount; i++)
+    {
+        uint64_t virt = virtStart + i * 4096;
+        uint64_t phys = PmmAllocPage(MemTag::Heap, KernelPid);
+        if (!phys) return false;
+        if (!VmmMapPage(virt, phys, VMM_WRITABLE, MemTag::Heap, KernelPid))
+        {
+            PmmFreePage(phys);
+            return false;
+        }
+    }
+    return true;
+}
+
+// Expand the heap by EXPAND_PAGES. Always contiguous since we control the
+// virtual address region.
 static bool ExpandHeap()
 {
-    uint64_t newVirt = VmmAllocPages(EXPAND_PAGES, VMM_WRITABLE, MemTag::Heap, KernelPid);
-    if (newVirt == 0) return false;
-
-    uint8_t* newRegion = reinterpret_cast<uint8_t*>(newVirt);
-
-    // If the new region is physically contiguous with the current heap end
-    // we can merge them. Otherwise treat it as a separate free block and
-    // leave a sentinel to prevent walking past the boundary.
-    if (newRegion == g_heapEnd)
+    uint64_t expandVirt = reinterpret_cast<uint64_t>(g_heapEnd);
+    if (expandVirt + EXPAND_PAGES * 4096 > HEAP_VIRT_MAX)
     {
-        // Walk from start to find the last valid block.
-        BlockHeader* cur  = reinterpret_cast<BlockHeader*>(g_heapStart);
-        BlockHeader* prev = nullptr;
-        while (reinterpret_cast<uint8_t*>(cur) < g_heapEnd - HEADER_SIZE
-               && IsValidHeader(cur))
-        {
-            prev = cur;
-            cur  = NextBlock(cur);
-        }
+        SerialPuts("Heap: expansion would exceed max virtual region\n");
+        return false;
+    }
 
-        if (prev && prev->free)
-        {
-            // Absorb the new pages into this free block.
-            uint32_t extra = static_cast<uint32_t>(EXPAND_PAGES * 4096);
-            WriteBlock(reinterpret_cast<uint8_t*>(prev), prev->size + extra, 1);
-            g_heapEnd  += extra;
-            g_freeBytes += extra;
-        }
-        else
-        {
-            // Last block is in use: add a new free block.
-            uint32_t blockSize = static_cast<uint32_t>(EXPAND_PAGES * 4096);
-            WriteBlock(g_heapEnd, blockSize, 1);
-            g_heapEnd   += blockSize;
-            g_freeBytes += blockSize - OVERHEAD;
-        }
+    if (!HeapMapPages(expandVirt, EXPAND_PAGES))
+    {
+        SerialPuts("Heap: expansion page mapping failed\n");
+        return false;
+    }
+
+    // Always contiguous — merge with the last block or add a new free block.
+    BlockHeader* cur  = reinterpret_cast<BlockHeader*>(g_heapStart);
+    BlockHeader* prev = nullptr;
+    while (reinterpret_cast<uint8_t*>(cur) < g_heapEnd - HEADER_SIZE
+           && IsValidHeader(cur))
+    {
+        prev = cur;
+        cur  = NextBlock(cur);
+    }
+
+    uint32_t extra = static_cast<uint32_t>(EXPAND_PAGES * 4096);
+    if (prev && prev->free)
+    {
+        WriteBlock(reinterpret_cast<uint8_t*>(prev), prev->size + extra, 1);
     }
     else
     {
-        // Non-contiguous: start a fresh free block in the new region.
-        uint32_t blockSize = static_cast<uint32_t>(EXPAND_PAGES * 4096);
-        WriteBlock(newRegion, blockSize, 1);
-        // Update g_heapEnd to the new region (we walk from g_heapStart,
-        // so non-contiguous regions are just not reachable by the walker).
-        // For simplicity, only extend if contiguous. Otherwise log a warning.
-        SerialPuts("Heap: warning: non-contiguous expansion (fragmented vmalloc)\n");
-        // Mark it free for use by treating it as if it's contiguous.
-        g_heapEnd   = newRegion + blockSize;
-        g_heapStart = (g_heapStart == nullptr) ? newRegion : g_heapStart;
-        g_freeBytes += blockSize - OVERHEAD;
+        WriteBlock(g_heapEnd, extra, 1);
     }
+    g_heapEnd   += extra;
+    g_freeBytes += extra;
+
+    SerialPrintf("Heap: expanded by %u KB (total %lu KB)\n",
+                 extra / 1024,
+                 (unsigned long)(g_heapEnd - g_heapStart) / 1024);
     return true;
 }
 
@@ -176,14 +187,13 @@ static bool ExpandHeap()
 
 void HeapInit()
 {
-    uint64_t virtBase = VmmAllocPages(INITIAL_PAGES, VMM_WRITABLE, MemTag::Heap, KernelPid);
-    if (virtBase == 0)
+    if (!HeapMapPages(HEAP_VIRT_BASE, INITIAL_PAGES))
     {
         SerialPuts("Heap: FATAL: initial allocation failed\n");
         return;
     }
 
-    g_heapStart = reinterpret_cast<uint8_t*>(virtBase);
+    g_heapStart = reinterpret_cast<uint8_t*>(HEAP_VIRT_BASE);
     g_heapEnd   = g_heapStart + INITIAL_PAGES * 4096;
 
     // Write a single free block filling the entire region.
@@ -193,7 +203,7 @@ void HeapInit()
 
     SerialPrintf("Heap: %u KB initial region at 0x%p\n",
                  static_cast<uint32_t>((INITIAL_PAGES * 4096) / 1024),
-                 reinterpret_cast<void*>(virtBase));
+                 reinterpret_cast<void*>(HEAP_VIRT_BASE));
 }
 
 void* kmalloc(uint64_t size)
@@ -216,16 +226,18 @@ void* kmalloc(uint64_t size)
 
             if (cur->free && cur->size >= needed)
             {
-                // Split only if the remainder is large enough to be useful.
+                uint32_t allocSize = cur->size; // consume entire free block
                 if (cur->size >= needed + static_cast<uint32_t>(MIN_BLOCK))
                 {
+                    // Split: remainder is large enough to be its own block
                     uint32_t remSize = cur->size - needed;
                     WriteBlock(reinterpret_cast<uint8_t*>(cur) + needed, remSize, 1);
                     g_freeBytes += remSize - OVERHEAD;
+                    allocSize = needed;
                 }
 
-                WriteBlock(reinterpret_cast<uint8_t*>(cur), needed, 0);
-                g_freeBytes -= needed;
+                WriteBlock(reinterpret_cast<uint8_t*>(cur), allocSize, 0);
+                g_freeBytes -= allocSize;
                 return UserPtr(cur);
             }
 
@@ -269,7 +281,6 @@ void kfree(void* ptr)
         }
     }
 }
-
 void* krealloc(void* ptr, uint64_t newSize)
 {
     if (ptr == nullptr) return kmalloc(newSize);

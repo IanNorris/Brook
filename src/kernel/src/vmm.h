@@ -11,7 +11,8 @@ namespace brook {
 //   0x0000_0000_0000_0000..0x0000_0000_3FFF_FFFF  NULL GUARD — always unmapped (1GB)
 //   0x0000_0000_4000_0000..0x0000_7FFF_FFFF_FFFF  User space (future, starts at 1GB)
 //   0x0000_0000_0000_0000..0x0000_00FF_FFFF_FFFF  Bootloader identity map (transition)
-//   0xFFFF_C000_0000_0000..0xFFFF_DFFF_FFFF_FFFF  VMALLOC region (PML4[384])
+//   0xFFFF_C000_0000_0000..0xFFFF_C07F_FFFF_FFFF  VMALLOC region (PML4[384])
+//   0xFFFF_C080_0000_0000..0xFFFF_C0FF_0000_0000  Kernel heap (PML4[385])
 //   0xFFFF_FFFF_8000_0000..0xFFFF_FFFF_FFFF_FFFF  Kernel image (PML4[511])
 //
 // Null guard: VmmMapPage refuses any mapping below VIRTUAL_NULL_GUARD.

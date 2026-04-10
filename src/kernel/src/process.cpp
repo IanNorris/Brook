@@ -3,6 +3,7 @@
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "process.h"
+#include "vfs.h"
 #include "vmm.h"
 #include "pmm.h"
 #include "heap.h"
@@ -300,14 +301,20 @@ void ProcessDestroy(Process* proc)
 {
     if (!proc) return;
 
-    // Close all file descriptors
+    // Close all file descriptors, releasing VFS/device resources
     for (uint32_t i = 0; i < MAX_FDS; ++i)
     {
-        if (proc->fds[i].type != FdType::None)
-            FdFree(proc, static_cast<int>(i));
+        FdEntry& fde = proc->fds[i];
+        if (fde.type == FdType::None) continue;
+
+        if (fde.type == FdType::Vnode && fde.handle)
+            VfsClose(static_cast<Vnode*>(fde.handle));
+
+        FdFree(proc, static_cast<int>(i));
     }
 
-    // TODO: Free user-mode pages (need per-PID page tracking in PMM)
+    // Free all VMM page allocations owned by this process
+    VmmKillPid(proc->pid);
 
     if (g_currentProcess == proc)
         g_currentProcess = nullptr;
