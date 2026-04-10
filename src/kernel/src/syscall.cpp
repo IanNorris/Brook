@@ -825,10 +825,228 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
 
     // tcgetattr/tcsetattr arrive as ioctl on stdin (fd 0)
     // TCGETS = 0x5401, TCSETS/TCSETSW/TCSETSF = 0x5402-0x5404
-    if (fd == 0 && cmd >= 0x5401 && cmd <= 0x5404)
+    if (fd <= 2 && cmd >= 0x5401 && cmd <= 0x5404)
         return 0; // stub success
 
+    // TIOCGWINSZ = 0x5413 — terminal window size
+    if (fd <= 2 && cmd == 0x5413)
+    {
+        struct winsize { uint16_t ws_row, ws_col, ws_xpixel, ws_ypixel; };
+        auto* ws = reinterpret_cast<winsize*>(arg);
+        ws->ws_row = 25;
+        ws->ws_col = 80;
+        ws->ws_xpixel = 0;
+        ws->ws_ypixel = 0;
+        return 0;
+    }
+
+    SerialPrintf("sys_ioctl: unhandled fd=%lu cmd=0x%lx\n", fd, cmd);
     return -ENOSYS;
+}
+
+// ---------------------------------------------------------------------------
+// sys_stat (4) / sys_lstat (6) / sys_fstat (5) / sys_newfstatat (262)
+// ---------------------------------------------------------------------------
+
+// Linux x86-64 struct stat layout (musl)
+struct LinuxStat {
+    uint64_t st_dev;
+    uint64_t st_ino;
+    uint64_t st_nlink;
+    uint32_t st_mode;
+    uint32_t st_uid;
+    uint32_t st_gid;
+    uint32_t __pad0;
+    uint64_t st_rdev;
+    int64_t  st_size;
+    int64_t  st_blksize;
+    int64_t  st_blocks;
+    uint64_t st_atime_sec;
+    uint64_t st_atime_nsec;
+    uint64_t st_mtime_sec;
+    uint64_t st_mtime_nsec;
+    uint64_t st_ctime_sec;
+    uint64_t st_ctime_nsec;
+    int64_t  __unused[3];
+};
+
+static void FillStat(LinuxStat* st, const VnodeStat& vs)
+{
+    auto* raw = reinterpret_cast<uint8_t*>(st);
+    for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+
+    st->st_ino = 1;
+    st->st_nlink = 1;
+    st->st_blksize = 4096;
+    st->st_size = static_cast<int64_t>(vs.size);
+    st->st_blocks = (st->st_size + 511) / 512;
+
+    if (vs.isDir)
+        st->st_mode = 0040755; // S_IFDIR | rwxr-xr-x
+    else
+        st->st_mode = 0100644; // S_IFREG | rw-r--r--
+}
+
+static int64_t sys_stat(uint64_t pathAddr, uint64_t statAddr, uint64_t,
+                         uint64_t, uint64_t, uint64_t)
+{
+    const char* path = reinterpret_cast<const char*>(pathAddr);
+    auto* st = reinterpret_cast<LinuxStat*>(statAddr);
+
+    Vnode* vn = VfsOpen(path, 0);
+    if (!vn) return -ENOENT;
+
+    VnodeStat vs; vs.size = 0; vs.isDir = false;
+    int ret = VfsStat(vn, &vs);
+    VfsClose(vn);
+    if (ret < 0) return -ENOENT;
+
+    FillStat(st, vs);
+    return 0;
+}
+
+static int64_t sys_lstat(uint64_t pathAddr, uint64_t statAddr, uint64_t,
+                          uint64_t, uint64_t, uint64_t)
+{
+    return sys_stat(pathAddr, statAddr, 0, 0, 0, 0);
+}
+
+static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
+                          uint64_t, uint64_t, uint64_t)
+{
+    auto* st = reinterpret_cast<LinuxStat*>(statAddr);
+
+    if (fd <= 2) {
+        auto* raw = reinterpret_cast<uint8_t*>(st);
+        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        st->st_mode = 0020666; // S_IFCHR | rw-rw-rw-
+        st->st_rdev = 0x8800 + fd;
+        st->st_blksize = 4096;
+        return 0;
+    }
+
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+    FdEntry* fde = FdGet(proc, static_cast<int>(fd));
+    if (!fde) return -EBADF;
+
+    if (fde->type == FdType::Vnode && fde->handle) {
+        auto* vn = static_cast<Vnode*>(fde->handle);
+        VnodeStat vs; vs.size = 0; vs.isDir = false;
+        if (VfsStat(vn, &vs) < 0) return -EBADF;
+        FillStat(st, vs);
+        return 0;
+    }
+
+    if (fde->type == FdType::DevFramebuf) {
+        auto* raw = reinterpret_cast<uint8_t*>(st);
+        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        st->st_mode = 0020666; // S_IFCHR
+        st->st_rdev = 0x1D00;
+        st->st_blksize = 4096;
+        return 0;
+    }
+
+    return -EBADF;
+}
+
+static int64_t sys_newfstatat(uint64_t dirfd, uint64_t pathAddr, uint64_t statAddr,
+                               uint64_t flags, uint64_t, uint64_t)
+{
+    (void)dirfd; (void)flags;
+    const char* path = reinterpret_cast<const char*>(pathAddr);
+    if (!path || path[0] == '\0')
+        return sys_fstat(dirfd, statAddr, 0, 0, 0, 0);
+    return sys_stat(pathAddr, statAddr, 0, 0, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// sys_getdents64 (217) -- directory listing
+// ---------------------------------------------------------------------------
+
+struct LinuxDirent64 {
+    uint64_t d_ino;
+    int64_t  d_off;
+    uint16_t d_reclen;
+    uint8_t  d_type;
+    char     d_name[];
+};
+
+static int64_t sys_getdents64(uint64_t fd, uint64_t bufAddr, uint64_t count,
+                               uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+    FdEntry* fde = FdGet(proc, static_cast<int>(fd));
+    if (!fde || fde->type != FdType::Vnode || !fde->handle) return -EBADF;
+
+    auto* vn = static_cast<Vnode*>(fde->handle);
+    auto* buf = reinterpret_cast<uint8_t*>(bufAddr);
+    uint64_t pos = 0;
+    uint32_t cookie = static_cast<uint32_t>(fde->seekPos);
+
+    DirEntry de; de.name[0] = 0; de.size = 0; de.isDir = false;
+    while (pos < count) {
+        int ret = VfsReaddir(vn, &de, &cookie);
+        if (ret <= 0) break;
+
+        uint64_t nameLen = 0;
+        while (de.name[nameLen] && nameLen < 255) ++nameLen;
+
+        // d_name starts at offset 19 in LinuxDirent64
+        uint64_t reclen = (19 + nameLen + 1 + 7) & ~7ULL;
+        if (pos + reclen > count) break;
+
+        auto* ent = reinterpret_cast<LinuxDirent64*>(buf + pos);
+        ent->d_ino = cookie + 1;
+        ent->d_off = static_cast<int64_t>(cookie);
+        ent->d_reclen = static_cast<uint16_t>(reclen);
+        ent->d_type = de.isDir ? 4 : 8; // DT_DIR : DT_REG
+
+        for (uint64_t i = 0; i < nameLen; ++i) ent->d_name[i] = de.name[i];
+        ent->d_name[nameLen] = '\0';
+        for (uint64_t i = nameLen + 1; i < reclen - 19; ++i)
+            ent->d_name[i] = '\0';
+
+        pos += reclen;
+    }
+
+    fde->seekPos = cookie;
+    return static_cast<int64_t>(pos);
+}
+
+// ---------------------------------------------------------------------------
+// Identity syscalls: getuid/getgid/geteuid/getegid/setuid/setgid
+// ---------------------------------------------------------------------------
+
+static int64_t sys_getuid(uint64_t, uint64_t, uint64_t,
+                           uint64_t, uint64_t, uint64_t) { return 0; }
+static int64_t sys_getgid(uint64_t, uint64_t, uint64_t,
+                           uint64_t, uint64_t, uint64_t) { return 0; }
+static int64_t sys_geteuid(uint64_t, uint64_t, uint64_t,
+                            uint64_t, uint64_t, uint64_t) { return 0; }
+static int64_t sys_getegid(uint64_t, uint64_t, uint64_t,
+                            uint64_t, uint64_t, uint64_t) { return 0; }
+static int64_t sys_setuid(uint64_t, uint64_t, uint64_t,
+                           uint64_t, uint64_t, uint64_t) { return 0; }
+static int64_t sys_setgid(uint64_t, uint64_t, uint64_t,
+                           uint64_t, uint64_t, uint64_t) { return 0; }
+
+// ---------------------------------------------------------------------------
+// Signal stubs: rt_sigaction (13), rt_sigprocmask (14)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_rt_sigaction(uint64_t, uint64_t, uint64_t,
+                                 uint64_t, uint64_t, uint64_t) { return 0; }
+
+static int64_t sys_rt_sigprocmask(uint64_t, uint64_t, uint64_t oldAddr,
+                                   uint64_t sigsetsize, uint64_t, uint64_t)
+{
+    if (oldAddr && sigsetsize > 0) {
+        auto* p = reinterpret_cast<uint8_t*>(oldAddr);
+        for (uint64_t i = 0; i < sigsetsize; ++i) p[i] = 0;
+    }
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -836,7 +1054,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
 // ---------------------------------------------------------------------------
 
 static int64_t sys_prlimit64(uint64_t, uint64_t, uint64_t,
-                              uint64_t, uint64_t, uint64_t)
+                               uint64_t, uint64_t, uint64_t)
 {
     return -ENOSYS;
 }
@@ -846,10 +1064,9 @@ static int64_t sys_prlimit64(uint64_t, uint64_t, uint64_t,
 // ---------------------------------------------------------------------------
 
 static int64_t sys_getrandom(uint64_t bufAddr, uint64_t count, uint64_t,
-                              uint64_t, uint64_t, uint64_t)
+                               uint64_t, uint64_t, uint64_t)
 {
     auto* buf = reinterpret_cast<uint8_t*>(bufAddr);
-    // Deterministic PRNG (sufficient for stack canary init)
     uint64_t state = 0xB4005E4D12340001ULL;
     for (uint64_t i = 0; i < count; ++i)
     {
@@ -862,30 +1079,14 @@ static int64_t sys_getrandom(uint64_t bufAddr, uint64_t count, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
-// sys_openat (257) -- delegate to sys_open for now
+// sys_openat (257) -- delegate to sys_open
 // ---------------------------------------------------------------------------
 
 static int64_t sys_openat(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
                            uint64_t mode, uint64_t, uint64_t)
 {
-    // Ignore dirfd, treat path as absolute
+    (void)dirfd;
     return sys_open(pathAddr, flags, mode, 0, 0, 0);
-}
-
-// ---------------------------------------------------------------------------
-// sys_newfstatat (262) / sys_fstat (5) -- stub
-// ---------------------------------------------------------------------------
-
-static int64_t sys_fstat(uint64_t, uint64_t, uint64_t,
-                          uint64_t, uint64_t, uint64_t)
-{
-    return -ENOSYS;
-}
-
-static int64_t sys_newfstatat(uint64_t, uint64_t, uint64_t,
-                               uint64_t, uint64_t, uint64_t)
-{
-    return -ENOSYS;
 }
 
 // ---------------------------------------------------------------------------
@@ -937,12 +1138,16 @@ void SyscallTableInit()
     g_syscallTable[SYS_WRITE]           = sys_write;
     g_syscallTable[SYS_OPEN]            = sys_open;
     g_syscallTable[SYS_CLOSE]           = sys_close;
+    g_syscallTable[SYS_STAT]            = sys_stat;
     g_syscallTable[SYS_FSTAT]           = sys_fstat;
+    g_syscallTable[SYS_LSTAT]           = sys_lstat;
     g_syscallTable[SYS_LSEEK]           = sys_lseek;
     g_syscallTable[SYS_MMAP]            = sys_mmap;
     g_syscallTable[SYS_MPROTECT]        = sys_mprotect;
     g_syscallTable[SYS_MUNMAP]          = sys_munmap;
     g_syscallTable[SYS_BRK]             = sys_brk;
+    g_syscallTable[SYS_RT_SIGACTION]    = sys_rt_sigaction;
+    g_syscallTable[SYS_RT_SIGPROCMASK]  = sys_rt_sigprocmask;
     g_syscallTable[SYS_IOCTL]           = sys_ioctl;
     g_syscallTable[SYS_READV]           = sys_readv;
     g_syscallTable[SYS_WRITEV]          = sys_writev;
@@ -954,7 +1159,14 @@ void SyscallTableInit()
     g_syscallTable[SYS_FCNTL]           = sys_fcntl;
     g_syscallTable[SYS_GETCWD]          = sys_getcwd;
     g_syscallTable[SYS_GETTIMEOFDAY]    = sys_gettimeofday;
+    g_syscallTable[SYS_GETUID]          = sys_getuid;
+    g_syscallTable[SYS_GETGID]          = sys_getgid;
+    g_syscallTable[SYS_SETUID]          = sys_setuid;
+    g_syscallTable[SYS_SETGID]          = sys_setgid;
+    g_syscallTable[SYS_GETEUID]         = sys_geteuid;
+    g_syscallTable[SYS_GETEGID]         = sys_getegid;
     g_syscallTable[SYS_ARCH_PRCTL]      = sys_arch_prctl;
+    g_syscallTable[SYS_GETDENTS64]      = sys_getdents64;
     g_syscallTable[SYS_SET_TID_ADDRESS] = sys_set_tid_address;
     g_syscallTable[SYS_CLOCK_GETTIME]   = sys_clock_gettime;
     g_syscallTable[SYS_CLOCK_NANOSLEEP] = sys_clock_nanosleep;

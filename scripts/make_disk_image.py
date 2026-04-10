@@ -81,7 +81,7 @@ def main():
             print(f"  No .mod files found in {mod_dir} (run build first)")
 
         # BIN/ — copy any user-mode test binaries
-        bin_names = ["hello_test", "hello_musl"]
+        bin_names = ["hello_test", "hello_musl", "hello", "cowsay", "busybox"]
         has_bins = any(os.path.exists(os.path.join(build_dir, n)) for n in bin_names)
         if has_bins:
             run(["mmd", "-i", img_path, "::BIN"])

@@ -341,69 +341,64 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         g_kernelEnv->syscallTable = reinterpret_cast<uint64_t>(brook::SyscallGetTable());
     }
 
-    // ---- User-mode ELF binary ----
-    // Try to load DOOM, falling back to hello_musl test binary.
+    // ---- User-mode ELF binaries ----
+    // Run each available binary in order; they exit back to kernel sequentially.
     {
-        struct BinaryDef { const char* path1; const char* path2; const char* name; };
-        BinaryDef bins[] = {
-            { "/boot/DOOM",            "/boot/doom",            "doom" },
-            { "/boot/bin/HELLO_MUSL",  "/boot/bin/hello_musl",  "hello_musl" },
-            { "/boot/bin/HELLO_TEST",  "/boot/bin/hello_test",  "hello_test" },
+        struct BinaryDef {
+            const char* path1; const char* path2; const char* name;
+            const char* const* argv; int argc;
         };
 
-        brook::Vnode* vn = nullptr;
-        const char* binaryName = nullptr;
+        const char* argv_hello[]  = { "hello", nullptr };
+        const char* argv_cowsay[] = { "cowsay", "Brook OS lives!", nullptr };
+        const char* argv_ls[]     = { "ls", "/boot", nullptr };
+        const char* argv_doom[]   = { "doom", "-iwad", "/boot/DOOM1.WAD", nullptr };
+
+        BinaryDef bins[] = {
+            { "/boot/bin/HELLO",   "/boot/bin/hello",   "hello",   argv_hello,  1 },
+            { "/boot/bin/COWSAY",  "/boot/bin/cowsay",  "cowsay",  argv_cowsay, 2 },
+            { "/boot/bin/BUSYBOX", "/boot/bin/busybox", "ls",      argv_ls,     2 },
+            { "/boot/DOOM",        "/boot/doom",        "doom",    argv_doom,   3 },
+        };
+        const char* envp[] = { "HOME=/", nullptr };
+
         for (auto& b : bins)
         {
-            vn = brook::VfsOpen(b.path1, 0);
+            brook::Vnode* vn = brook::VfsOpen(b.path1, 0);
             if (!vn) vn = brook::VfsOpen(b.path2, 0);
-            if (vn) { binaryName = b.name; break; }
-        }
+            if (!vn) continue;
 
-        if (vn)
-        {
-            // Allocate large buffer via VMM for the ELF binary
-            constexpr uint64_t MAX_ELF_SIZE = 1024 * 1024; // 1 MB
+            constexpr uint64_t MAX_ELF_SIZE = 2 * 1024 * 1024; // 2 MB (busybox is 1.4MB)
             constexpr uint64_t ELF_BUF_PAGES = MAX_ELF_SIZE / 4096;
             uint64_t elfBufAddr = brook::VmmAllocPages(ELF_BUF_PAGES,
                 brook::VMM_WRITABLE, brook::MemTag::Heap, brook::KernelPid);
             brook::SerialPrintf("ELF buf at 0x%lx (%lu pages)\n",
                                 elfBufAddr, ELF_BUF_PAGES);
 
-            if (elfBufAddr)
+            if (!elfBufAddr) { brook::VfsClose(vn); continue; }
+
+            auto* elfBuf = reinterpret_cast<uint8_t*>(elfBufAddr);
+            uint64_t totalRead = 0;
+            uint64_t offset = 0;
+            while (totalRead < MAX_ELF_SIZE)
             {
-                auto* elfBuf = reinterpret_cast<uint8_t*>(elfBufAddr);
-                uint64_t totalRead = 0;
-                uint64_t offset = 0;
-                while (totalRead < MAX_ELF_SIZE)
-                {
-                    int ret = brook::VfsRead(vn, elfBuf + totalRead,
-                                              4096, &offset);
-                    if (ret <= 0) break;
-                    totalRead += static_cast<uint64_t>(ret);
-                }
-                brook::VfsClose(vn);
+                int ret = brook::VfsRead(vn, elfBuf + totalRead, 4096, &offset);
+                if (ret <= 0) break;
+                totalRead += static_cast<uint64_t>(ret);
+            }
+            brook::VfsClose(vn);
 
-                brook::SerialPrintf("USER: loaded '%s' (%lu bytes)\n",
-                                     binaryName, totalRead);
+            brook::SerialPrintf("USER: loaded '%s' (%lu bytes)\n",
+                                 b.name, totalRead);
 
-                // DOOM needs -iwad argument pointing to the WAD file
-                const char* argv_doom[] = { "doom", "-iwad", "/boot/DOOM1.WAD", nullptr };
-                const char* argv_test[] = { binaryName, nullptr };
-                const char* envp[] = { "HOME=/", nullptr };
+            auto* proc = brook::ProcessCreate(elfBuf, totalRead,
+                                               b.argc, b.argv,
+                                               1, envp);
 
-                bool isDoom = (binaryName[0] == 'd' && binaryName[1] == 'o');
-                const char* const* argv = isDoom ? argv_doom : argv_test;
-                int argc = isDoom ? 3 : 1;
+            brook::SerialPrintf("Freeing ELF buf at 0x%lx\n", elfBufAddr);
+            brook::VmmFreePages(elfBufAddr, ELF_BUF_PAGES);
 
-                auto* proc = brook::ProcessCreate(elfBuf, totalRead,
-                                                   argc, argv,
-                                                   1, envp);
-
-                brook::SerialPrintf("Freeing ELF buf at 0x%lx\n", elfBufAddr);
-                brook::VmmFreePages(elfBufAddr, ELF_BUF_PAGES);
-
-                if (proc)
+            if (proc)
                 {
                     brook::SerialPuts("USER: entering ring 3...\n");
 
@@ -418,24 +413,14 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
                     brook::SwitchToUserMode(proc->stackTop,
                                              proc->elf.entryPoint);
 
-                    brook::SerialPuts("USER: returned from ring 3 successfully!\n");
+                    brook::SerialPrintf("USER: '%s' returned from ring 3\n", b.name);
                     brook::ProcessDestroy(proc);
                 }
                 else
                 {
-                    brook::SerialPuts("USER: ProcessCreate failed\n");
+                    brook::SerialPrintf("USER: ProcessCreate failed for '%s'\n", b.name);
                 }
-            }
-            else
-            {
-                brook::VfsClose(vn);
-                brook::SerialPuts("USER: failed to allocate ELF buffer\n");
-            }
-        }
-        else
-        {
-            brook::SerialPuts("USER: no user-mode binary found\n");
-        }
+        } // end for each binary
     }
 
     // Keyboard: the ps2_kbd module calls KbdInit(). If the module wasn't
