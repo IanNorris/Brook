@@ -415,6 +415,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
                     brook::SerialPrintf("USER: '%s' returned from ring 3\n", b.name);
                     brook::ProcessDestroy(proc);
+
+                    // Reset TTY colors after each process (in case it left ANSI state dirty)
+                    brook::TtySetColors(0x00E0E0E0, 0x00001A3A);
                 }
                 else
                 {

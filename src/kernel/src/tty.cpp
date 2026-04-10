@@ -171,9 +171,73 @@ bool TtyInit(const Framebuffer& fb)
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// ANSI escape sequence parser (CSI sequences only: ESC [ ... m)
+// ---------------------------------------------------------------------------
+
+static enum { TTY_NORMAL, TTY_ESC, TTY_CSI } g_ansiState = TTY_NORMAL;
+static int g_ansiParams[8];
+static int g_ansiParamCount = 0;
+
+// Map ANSI SGR color code (30-37, 90-97) to 0xRRGGBB
+static uint32_t AnsiToRgb(int code)
+{
+    // Standard colors (30-37)
+    static const uint32_t colors[] = {
+        0x000000, 0xAA0000, 0x00AA00, 0xAA5500,
+        0x5555FF, 0xAA00AA, 0x00AAAA, 0xAAAAAA,
+    };
+    // Bright colors (90-97)
+    static const uint32_t bright[] = {
+        0x555555, 0xFF5555, 0x55FF55, 0xFFFF55,
+        0x5555FF, 0xFF55FF, 0x55FFFF, 0xFFFFFF,
+    };
+    if (code >= 30 && code <= 37) return colors[code - 30];
+    if (code >= 90 && code <= 97) return bright[code - 90];
+    return 0xE0E0E0; // default
+}
+
+static void AnsiApplySgr()
+{
+    for (int i = 0; i < g_ansiParamCount; ++i)
+    {
+        int p = g_ansiParams[i];
+        if (p == 0) { g_fgColor = 0x00E0E0E0; g_bgColor = 0x00001A3A; } // reset
+        else if (p == 1) { /* bold — brighten fg */ }
+        else if (p >= 30 && p <= 37) g_fgColor = AnsiToRgb(p);
+        else if (p == 39) g_fgColor = 0x00E0E0E0; // default fg
+        else if (p >= 40 && p <= 47) g_bgColor = AnsiToRgb(p - 10);
+        else if (p == 49) g_bgColor = 0x00001A3A; // default bg
+        else if (p >= 90 && p <= 97) g_fgColor = AnsiToRgb(p);
+    }
+}
+
 void TtyPutChar(char c)
 {
     if (!g_fbPixels) return;
+
+    // ANSI escape sequence state machine
+    if (g_ansiState == TTY_ESC) {
+        if (c == '[') { g_ansiState = TTY_CSI; g_ansiParamCount = 0; g_ansiParams[0] = 0; return; }
+        g_ansiState = TTY_NORMAL; // not a CSI sequence, fall through
+    }
+    if (g_ansiState == TTY_CSI) {
+        if (c >= '0' && c <= '9') {
+            if (g_ansiParamCount == 0) g_ansiParamCount = 1;
+            g_ansiParams[g_ansiParamCount - 1] = g_ansiParams[g_ansiParamCount - 1] * 10 + (c - '0');
+            return;
+        }
+        if (c == ';') {
+            if (g_ansiParamCount < 8) { g_ansiParams[g_ansiParamCount] = 0; g_ansiParamCount++; }
+            return;
+        }
+        // Final byte — apply command
+        if (c == 'm') AnsiApplySgr();
+        // Other CSI commands (J, K, H, etc.) — silently ignore for now
+        g_ansiState = TTY_NORMAL;
+        return;
+    }
+    if (c == '\033') { g_ansiState = TTY_ESC; return; }
 
     const FontAtlas& fa = g_fontAtlas;
     int code = static_cast<uint8_t>(c);
