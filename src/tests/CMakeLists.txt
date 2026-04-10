@@ -25,6 +25,7 @@ function(add_brook_test TEST_NAME)
     )
     target_compile_options(${TEST_NAME} PRIVATE
         -Wall -Wextra -Werror -Wshadow -Wno-unused-parameter
+        -mno-sse -mno-sse2 -mgeneral-regs-only -fno-builtin
     )
     set_target_properties(${TEST_NAME} PROPERTIES
         OUTPUT_NAME "${TEST_NAME}"
@@ -52,5 +53,7 @@ add_brook_test(test_heap
     "${BROOK_ROOT}/src/kernel/src/vmm.cpp"
     "${BROOK_ROOT}/src/kernel/src/heap.cpp"
 )
+
+add_brook_test(test_string)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "" FORCE)
