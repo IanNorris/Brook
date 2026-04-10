@@ -81,8 +81,8 @@ static MountEntry* FindMount(const char* absPath, const char** relPath)
             if (absPath[j] != g_mounts[i].mountPoint[j]) { match = false; break; }
         }
         if (!match) continue;
-        // After the prefix, the next char must be '/' or '\0'.
-        if (absPath[mpLen] != '\0' && absPath[mpLen] != '/') continue;
+        // Root mount "/" matches everything; for others, the next char must be '/' or '\0'.
+        if (mpLen > 1 && absPath[mpLen] != '\0' && absPath[mpLen] != '/') continue;
         if (mpLen > bestLen) { bestLen = mpLen; best = &g_mounts[i]; }
     }
 
