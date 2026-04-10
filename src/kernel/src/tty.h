@@ -43,4 +43,9 @@ void TtyClear();
 // Return true if TtyInit() has completed successfully.
 bool TtyReady();
 
+// Retrieve framebuffer info for direct rendering (e.g. QR panic screen).
+// Returns false if TTY is not initialised.
+bool TtyGetFramebuffer(uint32_t** outPixels, uint32_t* outWidth,
+                       uint32_t* outHeight, uint32_t* outStride);
+
 } // namespace brook

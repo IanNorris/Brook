@@ -116,6 +116,8 @@ add_executable(kernel
     src/ksymtab.cpp
     src/module.cpp
     src/panic.cpp
+    src/panic_qr.cpp
+    src/base45.cpp
     src/pmm.cpp
     src/pci.cpp
     src/ramdisk.cpp
@@ -133,6 +135,8 @@ add_executable(kernel
     # FatFS (C source — compiled as part of the kernel)
     "${BROOK_ROOT}/src/third_party/fatfs/source/ff.c"
     "${BROOK_ROOT}/src/third_party/fatfs/source/ffsystem.c"
+    # Nayuki QR Code Generator (C source)
+    "${BROOK_ROOT}/src/third_party/qrcodegen/qrcodegen.c"
 )
 
 target_include_directories(kernel PRIVATE
@@ -140,6 +144,7 @@ target_include_directories(kernel PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"      # kernel src (ffconf.h here shadows submodule's)
     "${CMAKE_CURRENT_BINARY_DIR}"          # for the generated font_atlas.cpp
     "${BROOK_ROOT}/src/third_party/fatfs/source"  # ff.h, diskio.h
+    "${BROOK_ROOT}/src/third_party/qrcodegen"    # qrcodegen.h
 )
 
 target_compile_options(kernel PRIVATE
@@ -169,6 +174,7 @@ set_source_files_properties(
 set_source_files_properties(
     "${BROOK_ROOT}/src/third_party/fatfs/source/ff.c"
     "${BROOK_ROOT}/src/third_party/fatfs/source/ffsystem.c"
+    "${BROOK_ROOT}/src/third_party/qrcodegen/qrcodegen.c"
     PROPERTIES COMPILE_OPTIONS
         "-Wno-unused-parameter;-Wno-unused-function;-Wno-sign-compare;-Wno-implicit-fallthrough"
 )

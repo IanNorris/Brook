@@ -3,9 +3,9 @@
 #include "panic.h"
 #include "serial.h"
 #include "tty.h"
+#include "panic_qr.h"
 
 // ---- Register capture -------------------------------------------------------
-// Captured immediately on entry to KernelPanic before any stack usage changes.
 struct PanicRegs {
     uint64_t rsp;
     uint64_t rip;
@@ -28,6 +28,69 @@ static void CapturePanicRegs(PanicRegs& r)
         :
         : "rax"
     );
+}
+
+// Full CPU state capture for QR panic code
+static void CaptureFullRegs(brook::PanicCPURegs& r)
+{
+    __asm__ volatile(
+        "movq %%rax, %0\n\t"
+        "movq %%rbx, %1\n\t"
+        "movq %%rcx, %2\n\t"
+        "movq %%rdx, %3\n\t"
+        "movq %%rsi, %4\n\t"
+        "movq %%rdi, %5\n\t"
+        : "=m"(r.rax), "=m"(r.rbx), "=m"(r.rcx),
+          "=m"(r.rdx), "=m"(r.rsi), "=m"(r.rdi)
+    );
+    __asm__ volatile(
+        "movq %%r8,  %0\n\t"
+        "movq %%r9,  %1\n\t"
+        "movq %%r10, %2\n\t"
+        "movq %%r11, %3\n\t"
+        "movq %%r12, %4\n\t"
+        "movq %%r13, %5\n\t"
+        "movq %%r14, %6\n\t"
+        "movq %%r15, %7\n\t"
+        : "=m"(r.r8), "=m"(r.r9), "=m"(r.r10), "=m"(r.r11),
+          "=m"(r.r12), "=m"(r.r13), "=m"(r.r14), "=m"(r.r15)
+    );
+    __asm__ volatile(
+        "leaq 1f(%%rip), %%rax\n\t"
+        "movq %%rax, %0\n\t"
+        "movq %%rsp, %1\n\t"
+        "movq %%rbp, %2\n\t"
+        "pushfq\n\t"
+        "popq %3\n\t"
+        "1:"
+        : "=m"(r.rip), "=m"(r.rsp), "=m"(r.rbp), "=m"(r.rflags)
+        :
+        : "rax"
+    );
+    __asm__ volatile(
+        "movq %%cr0, %%rax\n\t"
+        "movq %%rax, %0\n\t"
+        "movq %%cr2, %%rax\n\t"
+        "movq %%rax, %1\n\t"
+        "movq %%cr3, %%rax\n\t"
+        "movq %%rax, %2\n\t"
+        "movq %%cr4, %%rax\n\t"
+        "movq %%rax, %3\n\t"
+        : "=m"(r.cr0), "=m"(r.cr2), "=m"(r.cr3), "=m"(r.cr4)
+        :
+        : "rax"
+    );
+    __asm__ volatile(
+        "movw %%cs, %0\n\t"
+        "movw %%ds, %1\n\t"
+        "movw %%ss, %2\n\t"
+        "movw %%es, %3\n\t"
+        "movw %%fs, %4\n\t"
+        "movw %%gs, %5\n\t"
+        : "=m"(r.cs), "=m"(r.ds), "=m"(r.ss),
+          "=m"(r.es), "=m"(r.fs), "=m"(r.gs)
+    );
+    r.reserved = 0;
 }
 
 // ---- Minimal hex printer (no va_list needed) --------------------------------
@@ -145,6 +208,9 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
     PanicRegs regs;
     CapturePanicRegs(regs);
 
+    brook::PanicCPURegs fullRegs;
+    CaptureFullRegs(fullRegs);
+
     // Format the message into a static buffer.
     __builtin_va_list args;
     __builtin_va_start(args, fmt);
@@ -172,6 +238,14 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
         brook::TtyPuts("\nCR2 "); TtyPutHex64(regs.cr2);
         brook::TtyPuts("  CR3 "); TtyPutHex64(regs.cr3);
         brook::TtyPuts("\nSystem halted.\n");
+    }
+
+    // -- QR code (if framebuffer is available) ---------------------------------
+    uint32_t* fbPixels = nullptr;
+    uint32_t fbW = 0, fbH = 0, fbStride = 0;
+    if (brook::TtyGetFramebuffer(&fbPixels, &fbW, &fbH, &fbStride))
+    {
+        brook::PanicRenderQR(fbPixels, fbW, fbH, fbStride, &fullRegs);
     }
 
     for (;;) { __asm__ volatile("hlt"); }

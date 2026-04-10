@@ -355,4 +355,15 @@ bool TtyReady()
     return g_fbPixels != nullptr;
 }
 
+bool TtyGetFramebuffer(uint32_t** outPixels, uint32_t* outWidth,
+                       uint32_t* outHeight, uint32_t* outStride)
+{
+    if (!g_fbPixels) return false;
+    *outPixels = const_cast<uint32_t*>(const_cast<volatile uint32_t**>(&g_fbPixels)[0]);
+    *outWidth  = g_fbWidth;
+    *outHeight = g_fbHeight;
+    *outStride = g_fbStride * 4; // convert from pixel stride to byte stride
+    return true;
+}
+
 } // namespace brook
