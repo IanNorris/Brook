@@ -92,6 +92,16 @@ def main():
                     run(["mcopy", "-i", img_path, bin_path, f"::BIN/{dest_name}"])
                     print(f"  Added binary: BIN/{dest_name} ({os.path.getsize(bin_path)} bytes)")
 
+        # DOOM — copy doom binary and WAD file
+        doom_bin = os.path.join(build_dir, "doom", "doom")
+        doom_wad = os.path.join(build_dir, "doom1.wad")
+        if os.path.exists(doom_bin):
+            run(["mcopy", "-i", img_path, doom_bin, "::DOOM"])
+            print(f"  Added: DOOM ({os.path.getsize(doom_bin)} bytes)")
+        if os.path.exists(doom_wad):
+            run(["mcopy", "-i", img_path, doom_wad, "::DOOM1.WAD"])
+            print(f"  Added: DOOM1.WAD ({os.path.getsize(doom_wad)} bytes)")
+
     print(f"Disk image written to {img_path}")
 
 if __name__ == "__main__":

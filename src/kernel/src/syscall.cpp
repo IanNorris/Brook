@@ -11,6 +11,8 @@
 #include "vmm.h"
 #include "pmm.h"
 #include "vfs.h"
+#include "tty.h"
+#include "input.h"
 
 // Forward declaration
 extern "C" __attribute__((naked)) void ReturnToKernel();
@@ -44,7 +46,9 @@ extern "C" __attribute__((naked, used)) void BrookSyscallDispatcher()
         "cmp $400, %%rax\n\t"
         "jae .Lsyscall_invalid\n\t"
         "mov %%gs:16, %%r12\n\t"
+        "sti\n\t"                       // Re-enable interrupts for syscall handlers
         "call *(%%r12, %%rax, 8)\n\t"
+        "cli\n\t"                       // Disable interrupts for sysret sequence
         "jmp .Lsyscall_return\n\t"
         ".Lsyscall_invalid:\n\t"
         "mov $-38, %%rax\n\t"
@@ -79,8 +83,10 @@ static constexpr int64_t ENOENT  = 2;
 static constexpr int64_t EBADF   = 9;
 static constexpr int64_t ENOMEM  = 12;
 static constexpr int64_t EFAULT  = 14;
+static constexpr int64_t ENODEV  = 19;
 static constexpr int64_t EINVAL  = 22;
 static constexpr int64_t EMFILE  = 24;
+static constexpr int64_t ERANGE  = 34;
 static constexpr int64_t ENOSYS  = 38;
 
 // ---------------------------------------------------------------------------
@@ -133,8 +139,27 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         auto* vn = static_cast<Vnode*>(fde->handle);
         int64_t ret = VfsRead(vn, reinterpret_cast<void*>(bufAddr),
                               static_cast<uint32_t>(count), &fde->seekPos);
-        if (ret > 0) fde->seekPos += static_cast<uint64_t>(ret);
+        // VfsRead already updates seekPos via the offset pointer; don't double-add.
         return ret;
+    }
+
+    if (fde->type == FdType::DevKeyboard)
+    {
+        // Non-blocking read of raw scancodes from input subsystem
+        auto* buf = reinterpret_cast<uint8_t*>(bufAddr);
+        uint64_t bytesRead = 0;
+        while (bytesRead < count)
+        {
+            InputEvent ev;
+            if (!InputPollEvent(&ev)) break;
+
+            // Encode as PS/2-style scancode: bit 7 = release
+            uint8_t sc = ev.scanCode;
+            if (ev.type == InputEventType::KeyRelease)
+                sc |= 0x80;
+            buf[bytesRead++] = sc;
+        }
+        return static_cast<int64_t>(bytesRead);
     }
 
     return -EBADF;
@@ -143,6 +168,13 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
 // ---------------------------------------------------------------------------
 // sys_open (2)
 // ---------------------------------------------------------------------------
+
+// Simple string comparison helper
+static bool StrEq(const char* a, const char* b)
+{
+    while (*a && *b) { if (*a++ != *b++) return false; }
+    return *a == *b;
+}
 
 static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
                          uint64_t, uint64_t, uint64_t)
@@ -153,9 +185,22 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
 
-    // Special device paths
-    // TODO: proper /dev mount, for now hardcode
-    // /dev/fb0 and /dev/keyboard handled via FdType
+    // Device paths
+    if (StrEq(path, "/dev/fb0"))
+    {
+        int fd = FdAlloc(proc, FdType::DevFramebuf, nullptr);
+        if (fd < 0) return -EMFILE;
+        SerialPrintf("sys_open: /dev/fb0 → fd %d\n", fd);
+        return fd;
+    }
+
+    if (StrEq(path, "keyboard") || StrEq(path, "/dev/keyboard"))
+    {
+        int fd = FdAlloc(proc, FdType::DevKeyboard, nullptr);
+        if (fd < 0) return -EMFILE;
+        SerialPrintf("sys_open: keyboard → fd %d\n", fd);
+        return fd;
+    }
 
     Vnode* vn = VfsOpen(path, static_cast<uint32_t>(flags));
     if (!vn)
@@ -220,8 +265,16 @@ static int64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
         fde->seekPos = static_cast<uint64_t>(static_cast<int64_t>(fde->seekPos) + soff);
         break;
     case SEEK_END:
-        // TODO: need file size from VFS
-        return -EINVAL;
+    {
+        if (fde->type != FdType::Vnode || !fde->handle) return -EINVAL;
+        auto* vn = static_cast<Vnode*>(fde->handle);
+        VnodeStat st{};
+        if (VfsStat(vn, &st) < 0) return -EINVAL;
+        int64_t newPos = static_cast<int64_t>(st.size) + soff;
+        if (newPos < 0) return -EINVAL;
+        fde->seekPos = static_cast<uint64_t>(newPos);
+        break;
+    }
     default:
         return -EINVAL;
     }
@@ -241,13 +294,20 @@ static int64_t sys_brk(uint64_t newBreak, uint64_t, uint64_t,
 
     // brk(0) = query current break
     if (newBreak == 0)
+    {
+        SerialPrintf("sys_brk: query → 0x%lx\n", proc->programBreak);
         return static_cast<int64_t>(proc->programBreak);
+    }
 
     // Validate within program break limits
     if (newBreak < proc->elf.programBreakLow)
         return static_cast<int64_t>(proc->programBreak);
     if (newBreak > proc->elf.programBreakHigh)
+    {
+        SerialPrintf("sys_brk: 0x%lx exceeds limit 0x%lx\n",
+                     newBreak, proc->elf.programBreakHigh);
         return static_cast<int64_t>(proc->programBreak);
+    }
 
     // Map any new pages needed between old and new break
     uint64_t oldPage = (proc->programBreak + 4095) & ~4095ULL;
@@ -255,21 +315,23 @@ static int64_t sys_brk(uint64_t newBreak, uint64_t, uint64_t,
 
     for (uint64_t addr = oldPage; addr < newPage; addr += 4096)
     {
-        // Check if page is already mapped (might be from ELF loader)
-        uint64_t phys = VmmVirtToPhys(addr);
-        if (phys == 0)
-        {
-            phys = PmmAllocPage(MemTag::User, proc->pid);
-            if (!phys) return static_cast<int64_t>(proc->programBreak);
-            if (!VmmMapPage(addr, phys, VMM_WRITABLE | VMM_USER, MemTag::User, proc->pid))
-                return static_cast<int64_t>(proc->programBreak);
+        // Must allocate a new user-accessible page. If the address has
+        // a pre-existing mapping (e.g. from UEFI identity mapping), it
+        // won't have the USER bit — we must replace it.
+        uint64_t phys = PmmAllocPage(MemTag::User, proc->pid);
+        if (!phys) return static_cast<int64_t>(proc->programBreak);
 
-            // Zero the page
-            auto* p = reinterpret_cast<uint8_t*>(addr);
-            for (uint64_t b = 0; b < 4096; ++b) p[b] = 0;
-        }
+        // Unmap any existing mapping first (UEFI identity-mapped pages)
+        VmmUnmapPage(addr);
+
+        if (!VmmMapPage(addr, phys, VMM_WRITABLE | VMM_USER, MemTag::User, proc->pid))
+            return static_cast<int64_t>(proc->programBreak);
+
+        auto* p = reinterpret_cast<uint8_t*>(addr);
+        for (uint64_t b = 0; b < 4096; ++b) p[b] = 0;
     }
 
+    SerialPrintf("sys_brk: 0x%lx → 0x%lx\n", proc->programBreak, newBreak);
     proc->programBreak = newBreak;
     return static_cast<int64_t>(newBreak);
 }
@@ -304,9 +366,51 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         return static_cast<int64_t>(vaddr);
     }
 
-    // File-backed mmap (for WAD loading etc.)
+    // Device or file-backed mmap
     FdEntry* fde = FdGet(proc, static_cast<int>(fd));
-    if (!fde || fde->type != FdType::Vnode || !fde->handle)
+    if (!fde) return -EBADF;
+
+    // Framebuffer device: map physical framebuffer memory into user space
+    if (fde->type == FdType::DevFramebuf)
+    {
+        uint64_t physBase;
+        uint32_t fbW, fbH, fbStride;
+        if (!TtyGetFramebufferPhys(&physBase, &fbW, &fbH, &fbStride))
+            return -ENODEV;
+
+        uint64_t fbSize = static_cast<uint64_t>(fbStride) * fbH;
+        uint64_t fbPages = (fbSize + 4095) / 4096;
+        if (pages > fbPages) pages = fbPages;
+
+        // Allocate virtual address range, then remap to physical framebuffer
+        uint64_t vaddr = VmmAllocPages(pages, VMM_WRITABLE | VMM_USER,
+                                        MemTag::Device, proc->pid);
+        if (!vaddr) return -ENOMEM;
+
+        // Replace allocated pages with physical framebuffer pages
+        for (uint64_t i = 0; i < pages; ++i)
+        {
+            uint64_t v = vaddr + i * 4096;
+            uint64_t oldPhys = VmmVirtToPhys(v);
+            VmmUnmapPage(v);
+            if (oldPhys) PmmFreePage(oldPhys);
+
+            if (!VmmMapPage(v, physBase + i * 4096,
+                            VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
+                            MemTag::Device, proc->pid))
+            {
+                SerialPrintf("sys_mmap: failed to map fb page %lu\n", i);
+                return -ENOMEM;
+            }
+        }
+
+        SerialPrintf("sys_mmap: fb mapped %lu pages at virt 0x%lx\n", pages, vaddr);
+
+        return static_cast<int64_t>(vaddr);
+    }
+
+    // File-backed mmap
+    if (fde->type != FdType::Vnode || !fde->handle)
         return -EBADF;
 
     // Allocate pages and read file into them
@@ -318,10 +422,9 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     auto* p = reinterpret_cast<uint8_t*>(vaddr);
     for (uint64_t b = 0; b < pages * 4096; ++b) p[b] = 0;
 
-    // Read file data
-    // TODO: proper seek + read at offset
+    // Read file data at the requested offset
     auto* vn = static_cast<Vnode*>(fde->handle);
-    uint64_t readOff = 0;
+    uint64_t readOff = offset;
     VfsRead(vn, reinterpret_cast<void*>(vaddr), static_cast<uint32_t>(length), &readOff);
 
     return static_cast<int64_t>(vaddr);
@@ -402,13 +505,32 @@ static int64_t sys_exit(uint64_t status, uint64_t, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
-// sys_writev (20)
+// sys_readv (19)
 // ---------------------------------------------------------------------------
 
 struct iovec {
     uint64_t iov_base;
     uint64_t iov_len;
 };
+
+static int64_t sys_readv(uint64_t fd, uint64_t iovAddr, uint64_t iovcnt,
+                          uint64_t, uint64_t, uint64_t)
+{
+    const auto* iov = reinterpret_cast<const iovec*>(iovAddr);
+    int64_t total = 0;
+    for (uint64_t i = 0; i < iovcnt; ++i)
+    {
+        int64_t ret = sys_read(fd, iov[i].iov_base, iov[i].iov_len, 0, 0, 0);
+        if (ret < 0) return (total > 0) ? total : ret;
+        total += ret;
+        if (static_cast<uint64_t>(ret) < iov[i].iov_len) break; // short read
+    }
+    return total;
+}
+
+// ---------------------------------------------------------------------------
+// sys_writev (20)
+// ---------------------------------------------------------------------------
 
 static int64_t sys_writev(uint64_t fd, uint64_t iovAddr, uint64_t iovcnt,
                            uint64_t, uint64_t, uint64_t)
@@ -570,13 +692,143 @@ static int64_t sys_access(uint64_t pathAddr, uint64_t, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
-// sys_ioctl (16) -- stub
+// sys_ioctl (16) -- framebuffer and keyboard ioctls
 // ---------------------------------------------------------------------------
 
-static int64_t sys_ioctl(uint64_t, uint64_t, uint64_t,
+// Linux framebuffer ioctl commands
+static constexpr uint64_t FBIOGET_VSCREENINFO = 0x4600;
+static constexpr uint64_t FBIOPUT_VSCREENINFO = 0x4601;
+static constexpr uint64_t FBIOGET_FSCREENINFO = 0x4602;
+
+// Linux fb_var_screeninfo (simplified — only fields DOOM uses)
+struct FbVarScreeninfo {
+    uint32_t xres;
+    uint32_t yres;
+    uint32_t xres_virtual;
+    uint32_t yres_virtual;
+    uint32_t xoffset;
+    uint32_t yoffset;
+    uint32_t bits_per_pixel;
+    uint32_t grayscale;
+    // red/green/blue/transp bitfields (4 x 3 uint32_t each = 48 bytes)
+    uint32_t red_offset, red_length, red_msb_right;
+    uint32_t green_offset, green_length, green_msb_right;
+    uint32_t blue_offset, blue_length, blue_msb_right;
+    uint32_t transp_offset, transp_length, transp_msb_right;
+    // rest
+    uint32_t nonstd;
+    uint32_t activate;
+    uint32_t height;    // mm
+    uint32_t width;     // mm
+    uint32_t accel_flags;
+    uint32_t pixclock;
+    uint32_t left_margin, right_margin, upper_margin, lower_margin;
+    uint32_t hsync_len, vsync_len;
+    uint32_t sync;
+    uint32_t vmode;
+    uint32_t rotate;
+    uint32_t colorspace;
+    uint32_t reserved[4];
+};
+
+// Linux fb_fix_screeninfo (simplified)
+struct FbFixScreeninfo {
+    char     id[16];
+    uint64_t smem_start;     // physical start of framebuffer memory
+    uint32_t smem_len;       // length of framebuffer memory
+    uint32_t type;
+    uint32_t type_aux;
+    uint32_t visual;
+    uint16_t xpanstep;
+    uint16_t ypanstep;
+    uint16_t ywrapstep;
+    uint32_t line_length;    // bytes per scanline
+    uint64_t mmio_start;
+    uint32_t mmio_len;
+    uint32_t accel;
+    uint16_t capabilities;
+    uint16_t reserved[2];
+};
+
+static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
                           uint64_t, uint64_t, uint64_t)
 {
-    return -ENOSYS; // TODO: implement for framebuffer/keyboard
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+    FdEntry* fde = FdGet(proc, static_cast<int>(fd));
+    if (!fde) return -EBADF;
+
+    if (fde->type == FdType::DevFramebuf)
+    {
+        uint64_t physBase;
+        uint32_t fbW, fbH, fbStride;
+        if (!TtyGetFramebufferPhys(&physBase, &fbW, &fbH, &fbStride))
+            return -ENODEV;
+
+        if (cmd == FBIOGET_VSCREENINFO)
+        {
+            auto* info = reinterpret_cast<FbVarScreeninfo*>(arg);
+            // Zero the whole struct first
+            auto* raw = reinterpret_cast<uint8_t*>(info);
+            for (uint64_t i = 0; i < sizeof(FbVarScreeninfo); ++i) raw[i] = 0;
+
+            info->xres = fbW;
+            info->yres = fbH;
+            info->xres_virtual = fbW;
+            info->yres_virtual = fbH;
+            info->bits_per_pixel = 32;
+            // BGRA pixel format (common UEFI framebuffer)
+            info->blue_offset  = 0;  info->blue_length  = 8;
+            info->green_offset = 8;  info->green_length = 8;
+            info->red_offset   = 16; info->red_length   = 8;
+            info->transp_offset = 24; info->transp_length = 8;
+            return 0;
+        }
+
+        if (cmd == FBIOGET_FSCREENINFO)
+        {
+            auto* info = reinterpret_cast<FbFixScreeninfo*>(arg);
+            auto* raw = reinterpret_cast<uint8_t*>(info);
+            for (uint64_t i = 0; i < sizeof(FbFixScreeninfo); ++i) raw[i] = 0;
+
+            // Name
+            const char* name = "brook_fb";
+            for (int i = 0; name[i] && i < 15; ++i) info->id[i] = name[i];
+
+            info->smem_start  = physBase;
+            info->smem_len    = fbStride * fbH;
+            info->type        = 0; // FB_TYPE_PACKED_PIXELS
+            info->visual      = 2; // FB_VISUAL_TRUECOLOR
+            info->line_length = fbStride;
+            info->mmio_start  = physBase;
+            info->mmio_len    = fbStride * fbH;
+            return 0;
+        }
+
+        if (cmd == FBIOPUT_VSCREENINFO)
+            return 0; // pretend success
+
+        SerialPrintf("sys_ioctl: fb unknown cmd 0x%lx\n", cmd);
+        return -EINVAL;
+    }
+
+    if (fde->type == FdType::DevKeyboard)
+    {
+        // Custom ioctl 1 = enter non-blocking mode (Enkel compat)
+        if (cmd == 1)
+        {
+            fde->flags |= 1; // mark as non-blocking
+            return 0;
+        }
+        return 0;
+    }
+
+    // tcgetattr/tcsetattr arrive as ioctl on stdin (fd 0)
+    // TCGETS = 0x5401, TCSETS/TCSETSW/TCSETSF = 0x5402-0x5404
+    if (fd == 0 && cmd >= 0x5401 && cmd <= 0x5404)
+        return 0; // stub success
+
+    return -ENOSYS;
 }
 
 // ---------------------------------------------------------------------------
@@ -637,6 +889,30 @@ static int64_t sys_newfstatat(uint64_t, uint64_t, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
+// sys_getcwd (79)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_getcwd(uint64_t bufAddr, uint64_t size, uint64_t,
+                           uint64_t, uint64_t, uint64_t)
+{
+    if (size < 2) return -ERANGE;
+    auto* buf = reinterpret_cast<char*>(bufAddr);
+    buf[0] = '/';
+    buf[1] = '\0';
+    return static_cast<int64_t>(bufAddr);
+}
+
+// ---------------------------------------------------------------------------
+// sys_fcntl (72) -- stub
+// ---------------------------------------------------------------------------
+
+static int64_t sys_fcntl(uint64_t, uint64_t, uint64_t,
+                          uint64_t, uint64_t, uint64_t)
+{
+    return 0; // pretend success
+}
+
+// ---------------------------------------------------------------------------
 // sys_not_implemented
 // ---------------------------------------------------------------------------
 
@@ -668,12 +944,15 @@ void SyscallTableInit()
     g_syscallTable[SYS_MUNMAP]          = sys_munmap;
     g_syscallTable[SYS_BRK]             = sys_brk;
     g_syscallTable[SYS_IOCTL]           = sys_ioctl;
+    g_syscallTable[SYS_READV]           = sys_readv;
     g_syscallTable[SYS_WRITEV]          = sys_writev;
     g_syscallTable[SYS_ACCESS]          = sys_access;
     g_syscallTable[SYS_NANOSLEEP]       = sys_nanosleep;
     g_syscallTable[SYS_GETPID]          = sys_getpid;
     g_syscallTable[SYS_EXIT]            = sys_exit;
     g_syscallTable[SYS_UNAME]           = sys_uname;
+    g_syscallTable[SYS_FCNTL]           = sys_fcntl;
+    g_syscallTable[SYS_GETCWD]          = sys_getcwd;
     g_syscallTable[SYS_GETTIMEOFDAY]    = sys_gettimeofday;
     g_syscallTable[SYS_ARCH_PRCTL]      = sys_arch_prctl;
     g_syscallTable[SYS_SET_TID_ADDRESS] = sys_set_tid_address;

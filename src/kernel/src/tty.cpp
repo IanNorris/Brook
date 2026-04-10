@@ -11,9 +11,10 @@ namespace brook {
 // ---------------------------------------------------------------------------
 
 static volatile uint32_t* g_fbPixels  = nullptr; // virtual address of framebuffer
-static uint32_t   g_fbWidth           = 0;
-static uint32_t   g_fbHeight          = 0;
-static uint32_t   g_fbStride          = 0;        // stride in pixels (not bytes)
+static uint64_t  g_fbPhysBase         = 0;        // physical base of framebuffer
+static uint32_t  g_fbWidth            = 0;
+static uint32_t  g_fbHeight           = 0;
+static uint32_t  g_fbStride           = 0;        // stride in pixels (not bytes)
 
 static int        g_curX              = 0;        // current pen X (pixels)
 static int        g_curY              = 0;        // current line top Y (pixels)
@@ -148,6 +149,7 @@ bool TtyInit(const Framebuffer& fb)
     }
 
     g_fbPixels = reinterpret_cast<volatile uint32_t*>(fbVirt);
+    g_fbPhysBase = physBase;
     g_fbWidth  = fb.width;
     g_fbHeight = fb.height;
     g_fbStride = fb.stride / 4u;
@@ -363,6 +365,17 @@ bool TtyGetFramebuffer(uint32_t** outPixels, uint32_t* outWidth,
     *outWidth  = g_fbWidth;
     *outHeight = g_fbHeight;
     *outStride = g_fbStride * 4; // convert from pixel stride to byte stride
+    return true;
+}
+
+bool TtyGetFramebufferPhys(uint64_t* outPhysBase, uint32_t* outWidth,
+                           uint32_t* outHeight, uint32_t* outStride)
+{
+    if (!g_fbPixels) return false;
+    *outPhysBase = g_fbPhysBase;
+    *outWidth    = g_fbWidth;
+    *outHeight   = g_fbHeight;
+    *outStride   = g_fbStride * 4; // byte stride
     return true;
 }
 

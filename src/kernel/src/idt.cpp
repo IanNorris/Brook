@@ -149,6 +149,65 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
         brook::SerialPuts("\n");
     }
 
+    // For page faults, walk the page table hierarchy to diagnose the mapping.
+    // Uses the direct physical map (DIRECT_MAP_BASE) to read page tables safely.
+    if (vector == 14)
+    {
+        static constexpr uint64_t DMAP = 0xFFFF800000000000ULL;
+
+        uint64_t cr3val;
+        __asm__ volatile("movq %%cr3, %0" : "=r"(cr3val));
+        cr3val &= 0x000FFFFFFFFFF000ULL;
+
+        brook::SerialPuts("  --- page table walk ---\n");
+        brook::SerialPuts("  CR3   "); ExcPutHex(cr3val); brook::SerialPuts("\n");
+
+        uint64_t* pml4 = reinterpret_cast<uint64_t*>(DMAP + cr3val);
+        uint64_t pml4idx = (cr2 >> 39) & 0x1FF;
+        uint64_t pml4e = pml4[pml4idx];
+        brook::SerialPuts("  PML4["); ExcPutHex(pml4idx); brook::SerialPuts("] = ");
+        ExcPutHex(pml4e); brook::SerialPuts("\n");
+
+        if (pml4e & 1)
+        {
+            uint64_t* pdpt = reinterpret_cast<uint64_t*>(DMAP + (pml4e & 0x000FFFFFFFFFF000ULL));
+            uint64_t pdptidx = (cr2 >> 30) & 0x1FF;
+            uint64_t pdpte = pdpt[pdptidx];
+            brook::SerialPuts("  PDPT["); ExcPutHex(pdptidx); brook::SerialPuts("] = ");
+            ExcPutHex(pdpte); brook::SerialPuts("\n");
+
+            if (pdpte & 1)
+            {
+                uint64_t* pd = reinterpret_cast<uint64_t*>(DMAP + (pdpte & 0x000FFFFFFFFFF000ULL));
+                uint64_t pdidx = (cr2 >> 21) & 0x1FF;
+                uint64_t pde = pd[pdidx];
+                brook::SerialPuts("  PD["); ExcPutHex(pdidx); brook::SerialPuts("] = ");
+                ExcPutHex(pde); brook::SerialPuts("\n");
+
+                if ((pde & 1) && !(pde & (1ULL << 7)))
+                {
+                    uint64_t* pt = reinterpret_cast<uint64_t*>(DMAP + (pde & 0x000FFFFFFFFFF000ULL));
+                    uint64_t ptidx = (cr2 >> 12) & 0x1FF;
+                    uint64_t pte = pt[ptidx];
+                    brook::SerialPuts("  PT["); ExcPutHex(ptidx); brook::SerialPuts("] = ");
+                    ExcPutHex(pte); brook::SerialPuts("\n");
+                }
+            }
+            else
+            {
+                brook::SerialPuts("  PDPT entry NOT PRESENT — page table corrupted?\n");
+                brook::SerialPuts("  PDPT page dump:\n");
+                for (int d = 0; d < 8; ++d)
+                {
+                    brook::SerialPuts("    ["); ExcPutHex(static_cast<uint64_t>(d));
+                    brook::SerialPuts("] = "); ExcPutHex(pdpt[d]);
+                    brook::SerialPuts("\n");
+                }
+            }
+        }
+        brook::SerialPuts("  --- end walk ---\n");
+    }
+
     // Walk the frame-pointer chain from the exception context.
     // For interrupt handlers, RBP in the handler frame points back through
     // the interrupted code's frame chain.

@@ -42,6 +42,18 @@ static constexpr uint64_t PTE_PID_MASK   = (0x7FFULL << PTE_PID_SHIFT);
 static constexpr uint64_t VMALLOC_BASE  = 0xFFFFC00000000000ULL;
 static constexpr uint64_t VMALLOC_SIZE  = 32ULL * 1024 * 1024 * 1024; // 32GB
 
+// Direct physical map: all physical RAM mapped here by the bootloader (2MB pages).
+// Used by the VMM to access page-table pages safely, even after the low identity
+// map (PML4[0]) is modified by user-space ELF loading.
+static constexpr uint64_t DIRECT_MAP_BASE = 0xFFFF800000000000ULL;
+
+// Convert a physical address to its kernel-accessible virtual address via
+// the direct physical map.  Must only be used for physical RAM addresses.
+inline uint64_t PhysToVirt(uint64_t phys) { return DIRECT_MAP_BASE + phys; }
+
+// Convert a direct-map virtual address back to its physical address.
+inline uint64_t VirtToPhys(uint64_t virt) { return virt - DIRECT_MAP_BASE; }
+
 // Module-space region: within the kernel's ±2GB window for R_X86_64_32S relocations.
 // The kernel image occupies 0xFFFFFFFF80000000..~0xFFFFFFFF805xxxxx.
 // Module code is placed starting at 0xFFFFFFFF90000000 (256 MB).

@@ -48,4 +48,8 @@ bool TtyReady();
 bool TtyGetFramebuffer(uint32_t** outPixels, uint32_t* outWidth,
                        uint32_t* outHeight, uint32_t* outStride);
 
+// Retrieve physical framebuffer info for user-mode mmap.
+bool TtyGetFramebufferPhys(uint64_t* outPhysBase, uint32_t* outWidth,
+                           uint32_t* outHeight, uint32_t* outStride);
+
 } // namespace brook

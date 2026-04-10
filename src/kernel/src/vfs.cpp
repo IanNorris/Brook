@@ -2,6 +2,7 @@
 #include "fatfs_glue.h"
 #include "heap.h"
 #include "serial.h"
+#include "vmm.h"
 
 extern "C" {
 #include "ff.h"
@@ -96,11 +97,104 @@ static MountEntry* FindMount(const char* absPath, const char** relPath)
 
 // ---- FatFS vnode ops ----
 
+// Cached file: entire file contents loaded into memory for fast random access.
+struct CachedFile {
+    FIL*     fil;
+    uint8_t* data;
+    uint64_t size;
+};
+
 static int FatFileOpen(Vnode* vn, int flags)
 {
     (void)vn; (void)flags;
     return 0; // Already open by VfsOpen()
 }
+
+// Preload file into memory. Called on first read for files > threshold.
+static CachedFile* CacheFile(FIL* fil)
+{
+    uint64_t size = f_size(fil);
+    auto* cf = static_cast<CachedFile*>(kmalloc(sizeof(CachedFile)));
+    if (!cf) return nullptr;
+
+    cf->fil  = fil;
+    cf->size = size;
+
+    // Use VmmAllocPages for large allocations (kmalloc can't do multi-MB).
+    uint64_t numPages = (size + 4095) / 4096;
+    cf->data = static_cast<uint8_t*>(
+        reinterpret_cast<void*>(VmmAllocPages(numPages, VMM_WRITABLE, MemTag::KernelData)));
+    if (!cf->data) {
+        SerialPrintf("VFS: cache alloc failed (%lu pages)\n", (unsigned long)numPages);
+        kfree(cf);
+        return nullptr;
+    }
+
+    // Read entire file
+    f_lseek(fil, 0);
+    uint64_t remaining = size;
+    uint64_t off = 0;
+    while (remaining > 0) {
+        UINT chunk = (remaining > 32768) ? 32768 : static_cast<UINT>(remaining);
+        UINT br = 0;
+        FRESULT res = f_read(fil, cf->data + off, chunk, &br);
+        if (res != FR_OK || br == 0) {
+            SerialPrintf("VFS: cache read failed at off=%lu (res=%u)\n",
+                         (unsigned long)off, (unsigned)res);
+            VmmFreePages(reinterpret_cast<uint64_t>(cf->data), numPages);
+            kfree(cf);
+            return nullptr;
+        }
+        off += br;
+        remaining -= br;
+    }
+    SerialPrintf("VFS: cached file (%lu bytes, %lu pages)\n",
+                 (unsigned long)size, (unsigned long)numPages);
+    return cf;
+}
+
+static int CachedFileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
+{
+    auto* cf = static_cast<CachedFile*>(vn->priv);
+    if (*offset >= cf->size) return 0;
+    uint64_t avail = cf->size - *offset;
+    if (len > avail) len = avail;
+    auto* dst = static_cast<uint8_t*>(buf);
+    auto* src = cf->data + *offset;
+    for (uint64_t i = 0; i < len; ++i) dst[i] = src[i];
+    *offset += len;
+    return static_cast<int>(len);
+}
+
+static void CachedFileClose(Vnode* vn)
+{
+    auto* cf = static_cast<CachedFile*>(vn->priv);
+    if (cf) {
+        if (cf->fil) f_close(cf->fil);
+        if (cf->data) {
+            uint64_t numPages = (cf->size + 4095) / 4096;
+            VmmFreePages(reinterpret_cast<uint64_t>(cf->data), numPages);
+        }
+        kfree(cf);
+    }
+}
+
+static int CachedFileStat(Vnode* vn, VnodeStat* st)
+{
+    auto* cf = static_cast<CachedFile*>(vn->priv);
+    st->size  = cf->size;
+    st->isDir = false;
+    return 0;
+}
+
+static const VnodeOps g_cachedFileOps = {
+    .open    = FatFileOpen,
+    .read    = CachedFileRead,
+    .write   = nullptr,
+    .readdir = nullptr,
+    .close   = CachedFileClose,
+    .stat    = CachedFileStat,
+};
 
 static int FatFileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
 {
@@ -116,6 +210,7 @@ static int FatFileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
     UINT br = 0;
     FRESULT res = f_read(fil, buf, static_cast<UINT>(len), &br);
     if (res != FR_OK) return -1;
+
     *offset += br;
     return static_cast<int>(br);
 }
@@ -248,6 +343,12 @@ bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
     slot->used = true;
     StrCopy(slot->mountPoint, mountPoint, sizeof(slot->mountPoint));
 
+    // Diagnostic: show physical page backing the FATFS.win buffer
+    uint64_t winVirt = reinterpret_cast<uint64_t>(&fs->win[0]);
+    uint64_t winPhys = VmmVirtToPhys(winVirt);
+    SerialPrintf("VFS: FATFS.win virt=0x%lx phys=0x%lx (sizeof FATFS=%lu)\n",
+                 winVirt, winPhys, static_cast<unsigned long>(sizeof(FATFS)));
+
     SerialPrintf("VFS: mounted fatfs drive %u at '%s'\n", pdrv, mountPoint);
     return true;
 }
@@ -293,16 +394,37 @@ Vnode* VfsOpen(const char* path, int flags)
     if (!fil) return nullptr;
 
     BYTE mode = (flags & 1) ? FA_READ | FA_WRITE : FA_READ;
+    SerialPrintf("VFS: f_open('%s', mode=0x%x)\n", fatPath, mode);
     FRESULT res = f_open(fil, fatPath, mode);
+    if (res != FR_OK)
+        SerialPrintf("VFS: f_open('%s') result: %d\n", fatPath, (int)res);
     if (res == FR_OK)
     {
         auto* vn = static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
         if (!vn) { f_close(fil); kfree(fil); return nullptr; }
+
+        // Cache large read-only files entirely in memory for fast random access.
+        static constexpr uint64_t CACHE_THRESHOLD = 64 * 1024; // 64 KB
+        uint64_t fileSize = f_size(fil);
+        if (!(flags & 1) && fileSize >= CACHE_THRESHOLD)
+        {
+            CachedFile* cf = CacheFile(fil);
+            if (cf) {
+                vn->ops  = &g_cachedFileOps;
+                vn->type = VnodeType::File;
+                vn->priv = cf;
+                return vn;
+            }
+            // Cache failed — fall through to uncached path
+        }
+
         vn->ops  = &g_fatFileOps;
         vn->type = VnodeType::File;
         vn->priv = fil;
         return vn;
     }
+    if (res != FR_NO_FILE && res != FR_NO_PATH)
+        SerialPrintf("VFS: f_open('%s') failed: %d\n", fatPath, (int)res);
     kfree(fil);
 
     // Try as a directory.

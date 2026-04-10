@@ -127,6 +127,10 @@ struct VirtioBlkState {
     uint64_t      reqBufPhys;
     uint8_t*      statusBuf;
     uint64_t      statusBufPhys;
+
+    // Persistent page-aligned DMA data buffer (4KB = 8 sectors)
+    uint8_t*      dmaBuf;
+    uint64_t      dmaBufPhys;
 };
 
 // ---- Register helpers ----
@@ -163,8 +167,14 @@ static bool AllocVirtqueue(VirtioBlkState& s)
     uint32_t totalSize = AlignUp(usedOff + usedSize, 4096);
     uint32_t totalPages = totalSize / 4096 + 1; // +1 for req/status buffers
 
+    SerialPrintf("virtio: alloc queue: N=%u descSz=%u availSz=%u usedOff=%u usedSz=%u totalPg=%u\n",
+                 N, descSize, availSize, usedOff, usedSize, totalPages);
+
     uint64_t qVirt = VmmAllocPages(totalPages, VMM_WRITABLE, MemTag::Device, KernelPid);
     if (!qVirt) return false;
+    SerialPrintf("virtio: queue virt=0x%lx pages=%u usedIdx_virt=0x%lx\n",
+                 qVirt, totalPages,
+                 qVirt + usedOff + 2);
 
     // Zero the pages.
     uint8_t* base = reinterpret_cast<uint8_t*>(qVirt);
@@ -193,6 +203,18 @@ static bool AllocVirtqueue(VirtioBlkState& s)
     s.statusBuf      = reinterpret_cast<uint8_t*>(extraVirt + sizeof(VirtioBlkReq));
     s.statusBufPhys  = s.reqBufPhys + sizeof(VirtioBlkReq);
 
+    SerialPrintf("virtio: queuePhys=0x%lx reqBufPhys=0x%lx\n",
+                 s.queuePhys, s.reqBufPhys);
+    // CRITICAL: check if any DMA physical address targets the PDPT at 0x101000
+    if ((s.queuePhys & ~0xFFFULL) == 0x101000 ||
+        (s.reqBufPhys & ~0xFFFULL) == 0x101000 ||
+        (s.statusBufPhys & ~0xFFFULL) == 0x101000)
+    {
+        SerialPrintf("virtio: CRITICAL — DMA buffer overlaps PDPT at 0x101000!\n");
+        SerialPrintf("  queuePhys=0x%lx reqBufPhys=0x%lx statusPhys=0x%lx\n",
+                     s.queuePhys, s.reqBufPhys, s.statusBufPhys);
+    }
+
     return true;
 }
 
@@ -200,14 +222,12 @@ static bool AllocVirtqueue(VirtioBlkState& s)
 
 static bool SubmitRequest(VirtioBlkState& s,
                           uint32_t type, uint64_t sector,
-                          void* dataBuf, uint32_t dataLen)
+                          uint64_t dataBufPhys, uint32_t dataLen)
 {
     // Descriptor 0: request header (device-readable)
     s.reqBuf->type     = type;
     s.reqBuf->reserved = 0;
     s.reqBuf->sector   = sector;
-
-    uint64_t dataBufPhys = VmmVirtToPhys(reinterpret_cast<uint64_t>(dataBuf));
 
     s.descTable[0].addr  = s.reqBufPhys;
     s.descTable[0].len   = sizeof(VirtioBlkReq);
@@ -267,41 +287,46 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
     if (len == 0) return 0;
 
     static constexpr uint32_t SECTOR_SIZE = 512;
+    static constexpr uint32_t PAGE_SIZE   = 4096;
+    static constexpr uint32_t SECTORS_PER_PAGE = PAGE_SIZE / SECTOR_SIZE; // 8
+
     uint64_t startSector = offset / SECTOR_SIZE;
     uint64_t endSector   = (offset + len + SECTOR_SIZE - 1) / SECTOR_SIZE;
 
-    // DMA buffers must be physically contiguous.  Since kmalloc may return
-    // virtual addresses spanning non-contiguous physical pages, we read one
-    // sector at a time using a single-page DMA buffer.
+    // DMA buffers must be physically contiguous and page-aligned.
+    // Use the persistent page-aligned DMA buffer (8 sectors per request).
     uint8_t* dstBytes = static_cast<uint8_t*>(buf);
     uint64_t bytesRead = 0;
 
-    // Allocate a single-sector DMA buffer (guaranteed within one page).
-    auto* sectorBuf = static_cast<uint8_t*>(kmalloc(SECTOR_SIZE));
-    if (!sectorBuf) { brook::SerialPuts("virtio-blk: read OOM\n"); return -1; }
-
-    for (uint64_t sec = startSector; sec < endSector && bytesRead < len; ++sec)
+    uint64_t sec = startSector;
+    while (sec < endSector && bytesRead < len)
     {
-        if (!SubmitRequest(*s, VIRTIO_BLK_T_IN, sec, sectorBuf, SECTOR_SIZE))
+        uint32_t batch = static_cast<uint32_t>(endSector - sec);
+        if (batch > SECTORS_PER_PAGE) batch = SECTORS_PER_PAGE;
+        uint32_t dmaLen = batch * SECTOR_SIZE;
+
+        if (!SubmitRequest(*s, VIRTIO_BLK_T_IN, sec, s->dmaBufPhys, dmaLen))
         {
             brook::SerialPrintf("virtio-blk: read failed at sector %lu\n",
                                 static_cast<unsigned long>(sec));
-            kfree(sectorBuf);
             return -1;
         }
 
-        // Copy the relevant portion of this sector into the output buffer.
-        uint64_t sectorStart = sec * SECTOR_SIZE;
-        uint64_t copyStart   = (sectorStart < offset) ? (offset - sectorStart) : 0;
-        uint64_t copyEnd     = SECTOR_SIZE;
-        uint64_t remaining   = len - bytesRead;
-        if (copyEnd - copyStart > remaining) copyEnd = copyStart + remaining;
+        // Copy relevant bytes from the DMA buffer into the output.
+        for (uint32_t i = 0; i < batch && bytesRead < len; ++i, ++sec)
+        {
+            uint64_t sectorStart = sec * SECTOR_SIZE;
+            uint64_t copyStart   = (sectorStart < offset) ? (offset - sectorStart) : 0;
+            uint64_t copyEnd     = SECTOR_SIZE;
+            uint64_t remaining   = len - bytesRead;
+            if (copyEnd - copyStart > remaining) copyEnd = copyStart + remaining;
 
-        for (uint64_t i = copyStart; i < copyEnd; ++i)
-            dstBytes[bytesRead++] = sectorBuf[i];
+            uint8_t* srcSector = s->dmaBuf + (i * SECTOR_SIZE);
+            for (uint64_t j = copyStart; j < copyEnd; ++j)
+                dstBytes[bytesRead++] = srcSector[j];
+        }
     }
 
-    kfree(sectorBuf);
     return static_cast<int>(bytesRead);
 }
 
@@ -317,8 +342,7 @@ static int VirtioBlkWrite(Device* dev, uint64_t offset, const void* buf, uint64_
     const uint8_t* srcBytes = static_cast<const uint8_t*>(buf);
     uint64_t bytesWritten = 0;
 
-    auto* sectorBuf = static_cast<uint8_t*>(kmalloc(SECTOR_SIZE));
-    if (!sectorBuf) return -1;
+    auto* sectorBuf = s->dmaBuf;
 
     for (uint64_t sec = startSector; sec < endSector && bytesWritten < len; ++sec)
     {
@@ -336,14 +360,12 @@ static int VirtioBlkWrite(Device* dev, uint64_t offset, const void* buf, uint64_
         for (uint64_t i = copyStart; i < copyEnd; ++i)
             sectorBuf[i] = srcBytes[bytesWritten++];
 
-        if (!SubmitRequest(*s, VIRTIO_BLK_T_OUT, sec, sectorBuf, SECTOR_SIZE))
+        if (!SubmitRequest(*s, VIRTIO_BLK_T_OUT, sec, s->dmaBufPhys, SECTOR_SIZE))
         {
-            kfree(sectorBuf);
             return -1;
         }
     }
 
-    kfree(sectorBuf);
     return static_cast<int>(bytesWritten);
 }
 
@@ -421,6 +443,8 @@ static Device* InitOnePciDevice(const PciDevice& pci, uint32_t slot)
     }
     // Cap to our maximum — the device advertises its max, we use the smaller.
     if (qSize > MAX_QUEUE_SIZE) qSize = MAX_QUEUE_SIZE;
+    SerialPrintf("virtio-blk: queue size=%u (device advertised, capped to max=%u)\n",
+                 qSize, MAX_QUEUE_SIZE);
 
     auto* state = static_cast<VirtioBlkState*>(kmalloc(sizeof(VirtioBlkState)));
     if (!state) return nullptr;
@@ -437,6 +461,16 @@ static Device* InitOnePciDevice(const PciDevice& pci, uint32_t slot)
         kfree(state);
         return nullptr;
     }
+
+    // Allocate persistent page-aligned DMA data buffer.
+    state->dmaBufPhys = PmmAllocPage(MemTag::KernelData);
+    if (state->dmaBufPhys == 0)
+    {
+        SerialPuts("virtio-blk: DMA buffer allocation failed\n");
+        kfree(state);
+        return nullptr;
+    }
+    state->dmaBuf = reinterpret_cast<uint8_t*>(PhysToVirt(state->dmaBufPhys));
 
     // Write queue PFN.
     uint32_t pfn = static_cast<uint32_t>(state->queuePhys >> 12);

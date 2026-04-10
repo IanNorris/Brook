@@ -111,7 +111,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         auto* env = static_cast<KernelCpuEnv*>(brook::kmalloc(sizeof(KernelCpuEnv)));
         if (env)
         {
-            constexpr uint64_t SYSCALL_STACK_PAGES = 4;  // 16 KB
+            constexpr uint64_t SYSCALL_STACK_PAGES = 16;  // 64 KB
             constexpr uint64_t GUARD_PAGES = 1;
             uint64_t scBase = brook::VmmAllocPages(
                 SYSCALL_STACK_PAGES + GUARD_PAGES,
@@ -341,21 +341,38 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         g_kernelEnv->syscallTable = reinterpret_cast<uint64_t>(brook::SyscallGetTable());
     }
 
-    // ---- User-mode ELF test ----
-    // Try to load and run a user-mode ELF binary from the virtio disk.
+    // ---- User-mode ELF binary ----
+    // Try to load DOOM, falling back to hello_musl test binary.
     {
-        brook::Vnode* vn = brook::VfsOpen("/boot/bin/HELLO_MUSL", 0);
-        if (!vn)
-            vn = brook::VfsOpen("/boot/bin/hello_musl", 0);
+        struct BinaryDef { const char* path1; const char* path2; const char* name; };
+        BinaryDef bins[] = {
+            { "/boot/DOOM",            "/boot/doom",            "doom" },
+            { "/boot/bin/HELLO_MUSL",  "/boot/bin/hello_musl",  "hello_musl" },
+            { "/boot/bin/HELLO_TEST",  "/boot/bin/hello_test",  "hello_test" },
+        };
+
+        brook::Vnode* vn = nullptr;
+        const char* binaryName = nullptr;
+        for (auto& b : bins)
+        {
+            vn = brook::VfsOpen(b.path1, 0);
+            if (!vn) vn = brook::VfsOpen(b.path2, 0);
+            if (vn) { binaryName = b.name; break; }
+        }
 
         if (vn)
         {
-            // Read the entire file into a kernel buffer
-            // First, read in chunks (we don't have fstat yet)
-            constexpr uint64_t MAX_ELF_SIZE = 128 * 1024; // 128 KB max
-            auto* elfBuf = static_cast<uint8_t*>(brook::kmalloc(MAX_ELF_SIZE));
-            if (elfBuf)
+            // Allocate large buffer via VMM for the ELF binary
+            constexpr uint64_t MAX_ELF_SIZE = 1024 * 1024; // 1 MB
+            constexpr uint64_t ELF_BUF_PAGES = MAX_ELF_SIZE / 4096;
+            uint64_t elfBufAddr = brook::VmmAllocPages(ELF_BUF_PAGES,
+                brook::VMM_WRITABLE, brook::MemTag::Heap, brook::KernelPid);
+            brook::SerialPrintf("ELF buf at 0x%lx (%lu pages)\n",
+                                elfBufAddr, ELF_BUF_PAGES);
+
+            if (elfBufAddr)
             {
+                auto* elfBuf = reinterpret_cast<uint8_t*>(elfBufAddr);
                 uint64_t totalRead = 0;
                 uint64_t offset = 0;
                 while (totalRead < MAX_ELF_SIZE)
@@ -367,22 +384,29 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
                 }
                 brook::VfsClose(vn);
 
-                brook::SerialPrintf("USER: loaded ELF binary (%lu bytes)\n", totalRead);
+                brook::SerialPrintf("USER: loaded '%s' (%lu bytes)\n",
+                                     binaryName, totalRead);
 
-                const char* argv[] = { "hello_musl", nullptr };
+                // DOOM needs -iwad argument pointing to the WAD file
+                const char* argv_doom[] = { "doom", "-iwad", "/boot/DOOM1.WAD", nullptr };
+                const char* argv_test[] = { binaryName, nullptr };
                 const char* envp[] = { "HOME=/", nullptr };
 
+                bool isDoom = (binaryName[0] == 'd' && binaryName[1] == 'o');
+                const char* const* argv = isDoom ? argv_doom : argv_test;
+                int argc = isDoom ? 3 : 1;
+
                 auto* proc = brook::ProcessCreate(elfBuf, totalRead,
-                                                   1, argv,
+                                                   argc, argv,
                                                    1, envp);
 
-                brook::kfree(elfBuf);
+                brook::SerialPrintf("Freeing ELF buf at 0x%lx\n", elfBufAddr);
+                brook::VmmFreePages(elfBufAddr, ELF_BUF_PAGES);
 
                 if (proc)
                 {
                     brook::SerialPuts("USER: entering ring 3...\n");
 
-                    // Set FS base if TLS was set up
                     if (proc->fsBase)
                     {
                         uint32_t lo = static_cast<uint32_t>(proc->fsBase);
@@ -410,7 +434,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         }
         else
         {
-            brook::SerialPuts("USER: no test binary found at /boot/bin/HELLO_MUSL\n");
+            brook::SerialPuts("USER: no user-mode binary found\n");
         }
     }
 

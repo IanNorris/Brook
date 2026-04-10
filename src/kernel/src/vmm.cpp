@@ -63,6 +63,14 @@ static inline void Invlpg(uint64_t virtAddr)
 
 static inline void ZeroPage(uint64_t physAddr)
 {
+    uint64_t* p = reinterpret_cast<uint64_t*>(PhysToVirt(physAddr));
+    for (int i = 0; i < 512; i++) p[i] = 0;
+}
+
+// Zero a page via identity mapping. Only safe during early init before the
+// identity map is modified by ELF loading.
+static inline void ZeroPageIdentity(uint64_t physAddr)
+{
     uint64_t* p = reinterpret_cast<uint64_t*>(physAddr);
     for (int i = 0; i < 512; i++) p[i] = 0;
 }
@@ -93,25 +101,25 @@ static uint64_t* GetOrAllocEntry(uint64_t* parent, uint64_t idx, uint64_t extraF
         parent[idx] |= VMM_USER;
     }
     uint64_t childPhys = parent[idx] & PHYS_MASK;
-    return reinterpret_cast<uint64_t*>(childPhys);
+    return reinterpret_cast<uint64_t*>(PhysToVirt(childPhys));
 }
 
 static uint64_t* WalkToPtr(uint64_t virtAddr, bool create, uint64_t flags = 0)
 {
     uint64_t cr3   = ReadCR3() & PHYS_MASK;
-    uint64_t* pml4 = reinterpret_cast<uint64_t*>(cr3);
+    uint64_t* pml4 = reinterpret_cast<uint64_t*>(PhysToVirt(cr3));
 
     uint64_t* pdpt = create
         ? GetOrAllocEntry(pml4, Pml4Index(virtAddr), flags)
         : (pml4[Pml4Index(virtAddr)] & VMM_PRESENT)
-            ? reinterpret_cast<uint64_t*>(pml4[Pml4Index(virtAddr)] & PHYS_MASK)
+            ? reinterpret_cast<uint64_t*>(PhysToVirt(pml4[Pml4Index(virtAddr)] & PHYS_MASK))
             : nullptr;
     if (!pdpt) return nullptr;
 
     uint64_t* pd = create
         ? GetOrAllocEntry(pdpt, PdptIndex(virtAddr), flags)
         : (pdpt[PdptIndex(virtAddr)] & VMM_PRESENT)
-            ? reinterpret_cast<uint64_t*>(pdpt[PdptIndex(virtAddr)] & PHYS_MASK)
+            ? reinterpret_cast<uint64_t*>(PhysToVirt(pdpt[PdptIndex(virtAddr)] & PHYS_MASK))
             : nullptr;
     if (!pd) return nullptr;
 
@@ -130,7 +138,7 @@ static uint64_t* WalkToPtr(uint64_t virtAddr, bool create, uint64_t flags = 0)
         ZeroPage(ptPhys);
 
         // Fill 512 PTE entries to preserve the existing 2MB identity mapping
-        uint64_t* pt = reinterpret_cast<uint64_t*>(ptPhys);
+        uint64_t* pt = reinterpret_cast<uint64_t*>(PhysToVirt(ptPhys));
         for (uint64_t i = 0; i < 512; ++i)
             pt[i] = (hugeBase + i * 4096) | (oldFlags & ~(1ULL << 7)) | VMM_PRESENT;
 
@@ -150,7 +158,7 @@ static uint64_t* WalkToPtr(uint64_t virtAddr, bool create, uint64_t flags = 0)
     uint64_t* pt = create
         ? GetOrAllocEntry(pd, PdIndex(virtAddr), flags)
         : (pd[PdIndex(virtAddr)] & VMM_PRESENT)
-            ? reinterpret_cast<uint64_t*>(pd[PdIndex(virtAddr)] & PHYS_MASK)
+            ? reinterpret_cast<uint64_t*>(PhysToVirt(pd[PdIndex(virtAddr)] & PHYS_MASK))
             : nullptr;
     if (!pt) return nullptr;
 
@@ -164,6 +172,50 @@ static uint64_t* WalkToPtr(uint64_t virtAddr, bool create, uint64_t flags = 0)
 void VmmInit()
 {
     g_vmallocNext = VMALLOC_BASE;
+
+    // Set up the direct physical map at DIRECT_MAP_BASE (PML4[256]).
+    // This maps all physical RAM using 2MB pages, providing a safe way
+    // to access page tables even after the low identity map (PML4[0])
+    // is modified by user-space ELF loading.
+    //
+    // At this point the identity map is still intact, so we can access
+    // the PML4 via CR3's physical address directly.
+    uint64_t cr3 = ReadCR3() & PHYS_MASK;
+    uint64_t* pml4 = reinterpret_cast<uint64_t*>(cr3); // identity-mapped
+
+    // Allocate PDPT for PML4[256]
+    uint64_t pdptPhys = PmmAllocPage(MemTag::PageTable, KernelPid);
+    if (!pdptPhys) { SerialPuts("VMM: FATAL cannot alloc dmap PDPT\n"); return; }
+    ZeroPageIdentity(pdptPhys);
+
+    // We map up to 4GB of physical RAM (4 PDPT entries × 1GB each).
+    // Each PDPT entry points to a PD with 512 × 2MB page entries.
+    static constexpr uint64_t DMAP_GB = 4;
+    static constexpr uint64_t PAGE_2MB = 0x80ULL; // PS bit
+
+    uint64_t* pdptPtr = reinterpret_cast<uint64_t*>(pdptPhys); // identity-mapped
+    for (uint64_t g = 0; g < DMAP_GB; g++)
+    {
+        uint64_t pdPhys = PmmAllocPage(MemTag::PageTable, KernelPid);
+        if (!pdPhys) { SerialPuts("VMM: FATAL cannot alloc dmap PD\n"); return; }
+        ZeroPageIdentity(pdPhys);
+
+        uint64_t* pdPtr = reinterpret_cast<uint64_t*>(pdPhys); // identity-mapped
+        for (uint64_t j = 0; j < 512; j++)
+        {
+            uint64_t physAddr = (g << 30) | (j << 21);
+            pdPtr[j] = physAddr | VMM_PRESENT | VMM_WRITABLE | PAGE_2MB;
+        }
+
+        pdptPtr[g] = pdPhys | VMM_PRESENT | VMM_WRITABLE;
+    }
+
+    pml4[256] = pdptPhys | VMM_PRESENT | VMM_WRITABLE;
+
+    // Flush TLB for the entire direct map range
+    __asm__ volatile("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
+
+    SerialPuts("VMM: direct physical map active at 0xFFFF800000000000\n");
     SerialPuts("VMM: initialized\n");
 }
 
