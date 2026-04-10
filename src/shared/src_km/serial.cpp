@@ -50,32 +50,7 @@ void SerialPuts(const char* str)
     while (*str) SerialPutChar(*str++);
 }
 
-// ---- Internal helpers for SerialPrintf ----
-
-static void PrintUlong(unsigned long val)
-{
-    if (val == 0) { SerialPutChar('0'); return; }
-    char buf[20];
-    int i = 0;
-    while (val > 0) {
-        buf[i++] = static_cast<char>('0' + (val % 10));
-        val /= 10;
-    }
-    while (i > 0) SerialPutChar(buf[--i]);
-}
-
-static void PrintHex(unsigned long val)
-{
-    if (val == 0) { SerialPutChar('0'); return; }
-    char buf[16];
-    int i = 0;
-    while (val > 0) {
-        int nibble = static_cast<int>(val & 0xF);
-        buf[i++] = static_cast<char>(nibble < 10 ? '0' + nibble : 'a' + nibble - 10);
-        val >>= 4;
-    }
-    while (i > 0) SerialPutChar(buf[--i]);
-}
+// ---- Internal helper for SerialPrintf ----
 
 static void PrintPtr(unsigned long val)
 {
