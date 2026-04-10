@@ -8,12 +8,12 @@ static IdtEntry      g_idt[256];
 static IdtDescriptor g_idtDesc;
 
 // ---- Helper to fill one IDT entry ----
-static void SetIdtEntry(uint8_t vector, void* handler)
+static void SetIdtEntry(uint8_t vector, void* handler, uint8_t ist = 0)
 {
     uintptr_t addr = reinterpret_cast<uintptr_t>(handler);
     g_idt[vector].offsetLow  = static_cast<uint16_t>(addr & 0xFFFF);
     g_idt[vector].selector   = GDT_KERNEL_CODE;
-    g_idt[vector].ist        = 0;
+    g_idt[vector].ist        = ist;
     g_idt[vector].typeAttr   = 0x8E;
     g_idt[vector].offsetMid  = static_cast<uint16_t>((addr >> 16) & 0xFFFF);
     g_idt[vector].offsetHigh = static_cast<uint32_t>((addr >> 32) & 0xFFFFFFFF);
@@ -210,13 +210,15 @@ void IdtInit(brook::Framebuffer* fb)
     SetIdtEntry( 5, reinterpret_cast<void*>(ExceptionHandler5));
     SetIdtEntry( 6, reinterpret_cast<void*>(ExceptionHandler6));
     SetIdtEntry( 7, reinterpret_cast<void*>(ExceptionHandler7));
-    SetIdtEntry( 8, reinterpret_cast<void*>(ExceptionHandler8));
+    // #DF double-fault MUST use IST1 so it fires even if the kernel stack is corrupt.
+    SetIdtEntry( 8, reinterpret_cast<void*>(ExceptionHandler8),  IST_DOUBLE_FAULT);
     SetIdtEntry( 9, reinterpret_cast<void*>(ExceptionHandler9));
     SetIdtEntry(10, reinterpret_cast<void*>(ExceptionHandler10));
     SetIdtEntry(11, reinterpret_cast<void*>(ExceptionHandler11));
-    SetIdtEntry(12, reinterpret_cast<void*>(ExceptionHandler12));
-    SetIdtEntry(13, reinterpret_cast<void*>(ExceptionHandler13));
-    SetIdtEntry(14, reinterpret_cast<void*>(ExceptionHandler14));
+    // #SS, #GP, #PF also use IST1 so they fire even if RSP is bad.
+    SetIdtEntry(12, reinterpret_cast<void*>(ExceptionHandler12), IST_DOUBLE_FAULT);
+    SetIdtEntry(13, reinterpret_cast<void*>(ExceptionHandler13), IST_DOUBLE_FAULT);
+    SetIdtEntry(14, reinterpret_cast<void*>(ExceptionHandler14), IST_DOUBLE_FAULT);
     SetIdtEntry(15, reinterpret_cast<void*>(ExceptionHandler15));
     SetIdtEntry(16, reinterpret_cast<void*>(ExceptionHandler16));
     SetIdtEntry(17, reinterpret_cast<void*>(ExceptionHandler17));

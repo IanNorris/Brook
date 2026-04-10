@@ -22,9 +22,25 @@
 #include "virtio_blk.h"
 #include "fat_test_image.h"
 
+// All kernel initialization and runtime — called by KernelMain after stack switch.
+__attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootProtocol);
+
 // Kernel entry point. Called by the bootloader via SysV ABI (argument in RDI).
-// At this stage: UEFI page tables still active, running at physical address.
-extern "C" __attribute__((sysv_abi)) void KernelMain(brook::BootProtocol* bootProtocol)
+// Immediately switches to a dedicated kernel stack, then tail-calls KernelMainBody.
+extern "C" __attribute__((sysv_abi, noreturn)) void KernelMain(brook::BootProtocol* bootProtocol)
+{
+    // g_kernelStackTop: allocated in BSS (always mapped from kernel start).
+    // Switch RSP before the compiler can spill bootProtocol anywhere on the old stack.
+    // bootProtocol lives in RDI throughout; "noreturn" prevents the compiler generating
+    // any callee-save/restore code that would reference the old stack after this.
+    extern void* g_kernelStackTop;
+    void* newSp = g_kernelStackTop;
+    __asm__ volatile("movq %0, %%rsp\n\t" :: "r"(newSp) : "memory");
+    KernelMainBody(bootProtocol);
+    __builtin_unreachable();
+}
+
+__attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootProtocol)
 {
     brook::SerialInit();
     brook::KPrintfInit();

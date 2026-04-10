@@ -2,10 +2,16 @@
 #include <stdint.h>
 
 // GDT selector constants (byte offsets into the GDT table).
+// Index 0: null, 1: kernel code (0x08), 2: kernel data (0x10),
+//          3: user code (0x18), 4: user data (0x20), 5-6: TSS (0x28)
 static constexpr uint16_t GDT_KERNEL_CODE = 0x08;
 static constexpr uint16_t GDT_KERNEL_DATA = 0x10;
 static constexpr uint16_t GDT_USER_CODE   = 0x18 | 3;
 static constexpr uint16_t GDT_USER_DATA   = 0x20 | 3;
+static constexpr uint16_t GDT_TSS         = 0x28;   // TSS selector (RPL=0)
+
+// IST slots in the TSS (1-indexed; 0 = no IST).
+static constexpr uint8_t IST_DOUBLE_FAULT = 1;  // IST1 → dedicated double-fault stack
 
 struct GdtEntry {
     uint16_t limitLow;
@@ -16,10 +22,34 @@ struct GdtEntry {
     uint8_t  baseHigh;
 } __attribute__((packed));
 
+// A 64-bit TSS descriptor occupies TWO consecutive 8-byte GDT slots.
+struct TssDescriptor {
+    uint16_t limitLow;
+    uint16_t baseLow;
+    uint8_t  baseMid;
+    uint8_t  access;       // 0x89 = Present | Type=TSS available
+    uint8_t  limitHighFlags;
+    uint8_t  baseHigh;
+    uint32_t baseUpper;
+    uint32_t _reserved;
+} __attribute__((packed));
+
 struct GdtDescriptor {
     uint16_t limit;
     uint64_t base;
 } __attribute__((packed));
 
-// Populate the GDT, load it via lgdt, and reload all segment registers.
+// 64-bit Task State Segment.
+struct Tss64 {
+    uint32_t _reserved0;
+    uint64_t rsp[3];         // RSP0–RSP2: ring-transition stacks
+    uint64_t _reserved1;
+    uint64_t ist[7];         // IST1–IST7: interrupt stack table
+    uint64_t _reserved2;
+    uint16_t _reserved3;
+    uint16_t ioBitmapOffset; // set to sizeof(Tss64) to disable I/O bitmap
+} __attribute__((packed));
+
+// Populate the GDT (with TSS), load it via lgdt, reload segment registers,
+// and load the TSS via ltr.  Must be called before IdtInit.
 void GdtInit();
