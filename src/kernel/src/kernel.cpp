@@ -72,6 +72,17 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::HeapInit();
     brook::PmmEnableTracking();
 
+    // Install a guard page below the kernel stack.  The stack grows downward
+    // from g_kernelStackTop; g_kernelStack[0] is the lowest byte.  Unmapping
+    // the page just below catches stack overflows with a clean #PF instead of
+    // silent corruption.
+    {
+        extern uint8_t g_kernelStack[];
+        uint64_t guardAddr = reinterpret_cast<uint64_t>(g_kernelStack) & ~0xFFFULL;
+        if (guardAddr >= 0x1000) // don't unmap page 0
+            brook::VmmUnmapPage(guardAddr - 0x1000);
+    }
+
     // ACPI: parse tables to get LAPIC/IOAPIC addresses.
     bool acpiOk = brook::AcpiInit(bootProtocol->acpi.rsdpPhysical);
     if (acpiOk)
