@@ -215,10 +215,11 @@ void IdtInit(brook::Framebuffer* fb)
     SetIdtEntry( 9, reinterpret_cast<void*>(ExceptionHandler9));
     SetIdtEntry(10, reinterpret_cast<void*>(ExceptionHandler10));
     SetIdtEntry(11, reinterpret_cast<void*>(ExceptionHandler11));
-    // #SS, #GP, #PF also use IST1 so they fire even if RSP is bad.
-    SetIdtEntry(12, reinterpret_cast<void*>(ExceptionHandler12), IST_DOUBLE_FAULT);
-    SetIdtEntry(13, reinterpret_cast<void*>(ExceptionHandler13), IST_DOUBLE_FAULT);
-    SetIdtEntry(14, reinterpret_cast<void*>(ExceptionHandler14), IST_DOUBLE_FAULT);
+    // #SS, #GP, #PF use the normal kernel stack (ist=0) — it's safe now that
+    // we have a dedicated 32KB stack.  Only #DF needs IST1.
+    SetIdtEntry(12, reinterpret_cast<void*>(ExceptionHandler12));
+    SetIdtEntry(13, reinterpret_cast<void*>(ExceptionHandler13));
+    SetIdtEntry(14, reinterpret_cast<void*>(ExceptionHandler14));
     SetIdtEntry(15, reinterpret_cast<void*>(ExceptionHandler15));
     SetIdtEntry(16, reinterpret_cast<void*>(ExceptionHandler16));
     SetIdtEntry(17, reinterpret_cast<void*>(ExceptionHandler17));

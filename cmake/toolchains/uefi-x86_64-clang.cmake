@@ -28,6 +28,7 @@ set(CMAKE_LINKER ${LLD_LINK})
 # Clang emits COFF objects regardless of the host platform's default.
 set(_UEFI_COMMON_FLAGS
     "--target=x86_64-unknown-windows"
+    "--no-default-config"
     "-ffreestanding"
     "-fno-stack-protector"
     "-fshort-wchar"

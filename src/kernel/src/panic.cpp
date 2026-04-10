@@ -126,9 +126,21 @@ static int PanicFormatStr(char* buf, int cap, const char* fmt, __builtin_va_list
 
 // ---- KernelPanic ------------------------------------------------------------
 
+// Re-entrance guard — if the panic handler itself faults (e.g. TTY rendering
+// hits an unmapped page), we detect it and emit a minimal serial message + halt.
+static volatile int g_panicNesting = 0;
+
 __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
 {
     __asm__ volatile("cli");
+
+    int depth = __atomic_add_fetch(&g_panicNesting, 1, __ATOMIC_SEQ_CST);
+    if (depth > 1)
+    {
+        // Nested panic — the handler itself faulted.  Serial-only, minimal output.
+        brook::SerialPuts("\n*** DOUBLE PANIC (handler faulted) ***\n");
+        for (;;) { __asm__ volatile("hlt"); }
+    }
 
     PanicRegs regs;
     CapturePanicRegs(regs);
