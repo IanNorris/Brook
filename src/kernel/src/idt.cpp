@@ -59,63 +59,63 @@ static const char* const g_excNames[32] = {
 // ---- Common exception dispatch ----
 // Called from the __attribute__((interrupt)) stubs below.
 // KernelPanic is [[noreturn]] so this never returns.
+
+// Minimal hex printer for exception context — no dependencies beyond serial port.
+static void ExcPutHex(uint64_t v)
+{
+    brook::SerialPuts("0x");
+    for (int shift = 60; shift >= 0; shift -= 4)
+    {
+        int nib = static_cast<int>((v >> shift) & 0xF);
+        brook::SerialPutChar(static_cast<char>(nib < 10 ? '0' + nib : 'a' + nib - 10));
+    }
+}
+
 static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t errorCode, bool hasErrorCode)
 {
-    // Read CR2 here (page fault address) — valid before any stack manipulation.
+    __asm__ volatile("cli");
+
     uint64_t cr2 = 0;
     __asm__ volatile("movq %%cr2, %0" : "=r"(cr2));
 
     const char* name = (vector < 32) ? g_excNames[vector] : "Unknown";
 
-    if (vector == 14) // #PF — include fault address and error code breakdown
+    // Direct serial dump — guaranteed to produce readable output regardless
+    // of va_list ABI issues or format buffer corruption.
+    brook::SerialPuts("\n=== EXCEPTION ===\n");
+    brook::SerialPuts("Vector: ");
     {
-        KernelPanic(
-            "Exception %u: %s\n"
-            "  Fault addr  0x%lx\n"
-            "  Error code  0x%lx  [%s%s%s%s]\n"
-            "  RIP  0x%lx   CS   0x%lx\n"
-            "  RSP  0x%lx   SS   0x%lx\n"
-            "  RFLAGS 0x%lx\n",
-            static_cast<unsigned>(vector), name,
-            cr2,
-            errorCode,
-            (errorCode & 1) ? "P " : "NP ",   // Present
-            (errorCode & 2) ? "W " : "R ",    // Write/Read
-            (errorCode & 4) ? "U " : "K ",    // User/Kernel
-            (errorCode & 8) ? "RSVD " : "",   // Reserved write
-            frame->ip, frame->cs,
-            frame->sp, frame->ss,
-            frame->flags
-        );
+        char vbuf[4] = {'0','0','0','\0'};
+        vbuf[0] = static_cast<char>('0' + (vector / 100) % 10);
+        vbuf[1] = static_cast<char>('0' + (vector / 10) % 10);
+        vbuf[2] = static_cast<char>('0' + vector % 10);
+        brook::SerialPuts(vbuf);
     }
-    else if (hasErrorCode)
-    {
-        KernelPanic(
-            "Exception %u: %s\n"
-            "  Error code  0x%lx\n"
-            "  RIP  0x%lx   CS   0x%lx\n"
-            "  RSP  0x%lx   SS   0x%lx\n"
-            "  RFLAGS 0x%lx\n",
-            static_cast<unsigned>(vector), name,
-            errorCode,
-            frame->ip, frame->cs,
-            frame->sp, frame->ss,
-            frame->flags
-        );
+    brook::SerialPuts(" ("); brook::SerialPuts(name); brook::SerialPuts(")\n");
+    brook::SerialPuts("  RIP   "); ExcPutHex(frame->ip);    brook::SerialPuts("\n");
+    brook::SerialPuts("  RSP   "); ExcPutHex(frame->sp);    brook::SerialPuts("\n");
+    brook::SerialPuts("  CS    "); ExcPutHex(frame->cs);    brook::SerialPuts("\n");
+    brook::SerialPuts("  SS    "); ExcPutHex(frame->ss);    brook::SerialPuts("\n");
+    brook::SerialPuts("  FLAGS "); ExcPutHex(frame->flags); brook::SerialPuts("\n");
+    brook::SerialPuts("  CR2   "); ExcPutHex(cr2);          brook::SerialPuts("\n");
+    if (hasErrorCode) {
+        brook::SerialPuts("  ERR   "); ExcPutHex(errorCode);
+        if (vector == 14) {
+            brook::SerialPuts(" [");
+            brook::SerialPuts((errorCode & 1) ? "P " : "NP ");
+            brook::SerialPuts((errorCode & 2) ? "W " : "R ");
+            brook::SerialPuts((errorCode & 4) ? "U " : "K ");
+            if (errorCode & 8) brook::SerialPuts("RSVD ");
+            brook::SerialPuts("]");
+        }
+        brook::SerialPuts("\n");
     }
-    else
-    {
-        KernelPanic(
-            "Exception %u: %s\n"
-            "  RIP  0x%lx   CS   0x%lx\n"
-            "  RSP  0x%lx   SS   0x%lx\n"
-            "  RFLAGS 0x%lx\n",
-            static_cast<unsigned>(vector), name,
-            frame->ip, frame->cs,
-            frame->sp, frame->ss,
-            frame->flags
-        );
-    }
+    brook::SerialPuts("=== HALTED ===\n");
+
+    // Halt here — KernelPanic's va_list formatting is unreliable with
+    // -mgeneral-regs-only.  The direct serial dump above is the authoritative
+    // exception output.
+    for (;;) { __asm__ volatile("hlt"); }
 }
 
 // ---- Exception stubs: no error code ----
