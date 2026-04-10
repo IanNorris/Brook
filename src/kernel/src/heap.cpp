@@ -317,4 +317,46 @@ uint64_t HeapFreeBytes()
     return g_freeBytes;
 }
 
+bool HeapCheckIntegrity()
+{
+    if (!g_heapStart) return true;
+
+    uint32_t blockCount = 0;
+    BlockHeader* cur = reinterpret_cast<BlockHeader*>(g_heapStart);
+
+    while (reinterpret_cast<uint8_t*>(cur) < g_heapEnd)
+    {
+        if (!IsValidHeader(cur))
+        {
+            uint64_t off = reinterpret_cast<uint8_t*>(cur) - g_heapStart;
+            SerialPrintf("HeapCheck: corrupt header at block #%u offset 0x%lx "
+                         "(magic=0x%x)\n", blockCount, (unsigned long)off, cur->magic);
+            return false;
+        }
+
+        if (cur->size < MIN_BLOCK || cur->size > static_cast<uint32_t>(g_heapEnd - g_heapStart))
+        {
+            uint64_t off = reinterpret_cast<uint8_t*>(cur) - g_heapStart;
+            SerialPrintf("HeapCheck: invalid size %u at block #%u offset 0x%lx\n",
+                         cur->size, blockCount, (unsigned long)off);
+            return false;
+        }
+
+        BlockFooter* f = GetFooter(cur);
+        if (f->magic != FOOTER_MAGIC || f->size != cur->size)
+        {
+            uint64_t off = reinterpret_cast<uint8_t*>(cur) - g_heapStart;
+            SerialPrintf("HeapCheck: footer mismatch at block #%u offset 0x%lx "
+                         "(ftr_magic=0x%x ftr_size=%u hdr_size=%u)\n",
+                         blockCount, (unsigned long)off, f->magic, f->size, cur->size);
+            return false;
+        }
+
+        blockCount++;
+        cur = NextBlock(cur);
+    }
+
+    return true;
+}
+
 } // namespace brook

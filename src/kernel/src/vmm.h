@@ -124,4 +124,8 @@ uint16_t VmmGetPagePid(uint64_t virtAddr);
 // No-op if tracking is not enabled or pid == KernelPid.
 void VmmKillPid(uint16_t pid);
 
+// Count active VMALLOC allocations, optionally filtered by PID.
+// Pass KernelPid+1 or any invalid PID to count all allocations.
+uint32_t VmmCountAllocations(uint16_t filterPid = 0xFFFF);
+
 } // namespace brook

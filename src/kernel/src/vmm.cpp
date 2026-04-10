@@ -448,4 +448,16 @@ void VmmKillPid(uint16_t pid)
     PmmKillPid(pid);
 }
 
+uint32_t VmmCountAllocations(uint16_t filterPid)
+{
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < VMM_MAX_ALLOCS; i++)
+    {
+        if (g_vmmAllocs[i].virtBase == 0) continue;
+        if (filterPid == 0xFFFF || g_vmmAllocs[i].pid == filterPid)
+            count++;
+    }
+    return count;
+}
+
 } // namespace brook

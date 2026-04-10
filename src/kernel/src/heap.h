@@ -33,4 +33,9 @@ extern "C" void* krealloc(void* ptr, uint64_t newSize);
 // Diagnostic: return number of free bytes in the current heap region.
 uint64_t HeapFreeBytes();
 
+// Walk all heap blocks and verify integrity (magic values, sizes).
+// Returns true if the heap is consistent, false if corruption is found.
+// Logs details of the first corrupt block to serial.
+bool HeapCheckIntegrity();
+
 } // namespace brook

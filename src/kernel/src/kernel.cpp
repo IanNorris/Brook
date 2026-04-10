@@ -362,6 +362,17 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         };
         const char* envp[] = { "HOME=/", nullptr };
 
+        // Snapshot baseline resource state before running any user processes.
+        uint64_t baselineFreePages  = brook::PmmGetFreePageCount();
+        uint64_t baselineHeapFree   = brook::HeapFreeBytes();
+        uint32_t baselineVmmAllocs  = brook::VmmCountAllocations();
+
+        brook::SerialPrintf("RESCHECK: baseline — PMM %lu free pages, "
+                            "heap %lu free, VMM %u allocs\n",
+                            (unsigned long)baselineFreePages,
+                            (unsigned long)baselineHeapFree,
+                            baselineVmmAllocs);
+
         for (auto& b : bins)
         {
             brook::Vnode* vn = brook::VfsOpen(b.path1, 0);
@@ -418,6 +429,66 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
                     // Reset TTY colors after each process (in case it left ANSI state dirty)
                     brook::TtySetColors(0x00E0E0E0, 0x00001A3A);
+
+                    // ---- Resource leak / integrity checks ----
+                    bool clean = true;
+
+                    // 1. Heap integrity
+                    if (!brook::HeapCheckIntegrity())
+                    {
+                        brook::SerialPrintf("RESCHECK FAIL: heap corruption after '%s'\n", b.name);
+                        clean = false;
+                    }
+
+                    // 2. Heap free bytes should return to baseline
+                    uint64_t heapFreeNow = brook::HeapFreeBytes();
+                    if (heapFreeNow < baselineHeapFree)
+                    {
+                        uint64_t leaked = baselineHeapFree - heapFreeNow;
+                        brook::SerialPrintf("RESCHECK WARN: heap leak after '%s': "
+                                            "%lu bytes not freed\n",
+                                            b.name, (unsigned long)leaked);
+                        clean = false;
+                    }
+
+                    // 3. VMM allocation count should return to baseline
+                    uint32_t vmmAllocsNow = brook::VmmCountAllocations();
+                    if (vmmAllocsNow > baselineVmmAllocs)
+                    {
+                        brook::SerialPrintf("RESCHECK WARN: VMM alloc leak after '%s': "
+                                            "%u allocs (baseline %u)\n",
+                                            b.name, vmmAllocsNow, baselineVmmAllocs);
+                        clean = false;
+                    }
+
+                    // 4. PMM free pages should return to baseline (allow small delta
+                    //    for page table pages that can't easily be reclaimed)
+                    uint64_t freeNow = brook::PmmGetFreePageCount();
+                    if (freeNow + 16 < baselineFreePages)
+                    {
+                        uint64_t leaked = baselineFreePages - freeNow;
+                        brook::SerialPrintf("RESCHECK WARN: PMM leak after '%s': "
+                                            "%lu pages not freed\n",
+                                            b.name, (unsigned long)leaked);
+                        clean = false;
+                    }
+
+                    // 5. ProcessCurrent should be nullptr
+                    if (brook::ProcessCurrent() != nullptr)
+                    {
+                        brook::SerialPrintf("RESCHECK FAIL: ProcessCurrent non-null "
+                                            "after '%s'\n", b.name);
+                        clean = false;
+                    }
+
+                    if (clean)
+                        brook::SerialPrintf("RESCHECK OK: '%s' — clean teardown\n", b.name);
+
+                    // Update baseline for next iteration (page tables are
+                    // not freed, so PMM baseline drifts slightly)
+                    baselineFreePages = freeNow;
+                    baselineHeapFree  = heapFreeNow;
+                    baselineVmmAllocs = vmmAllocsNow;
                 }
                 else
                 {
