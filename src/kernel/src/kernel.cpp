@@ -101,6 +101,37 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         }
     }
 
+    // Set up per-CPU kernel environment for SWAPGS.
+    // Allocate a 16KB syscall stack (with guard page) and a KernelCpuEnv.
+    {
+        auto* env = static_cast<KernelCpuEnv*>(brook::kmalloc(sizeof(KernelCpuEnv)));
+        if (env)
+        {
+            constexpr uint64_t SYSCALL_STACK_PAGES = 4;  // 16 KB
+            constexpr uint64_t GUARD_PAGES = 1;
+            uint64_t scBase = brook::VmmAllocPages(
+                SYSCALL_STACK_PAGES + GUARD_PAGES,
+                brook::VMM_WRITABLE, brook::MemTag::KernelData, brook::KernelPid);
+            if (scBase)
+            {
+                brook::VmmUnmapPage(scBase); // guard page
+                uint64_t scTop = scBase + (SYSCALL_STACK_PAGES + GUARD_PAGES) * 0x1000 - 16;
+                env->syscallStack = scTop;
+            }
+            else
+            {
+                env->syscallStack = 0;
+            }
+            env->syscallTable = 0;  // no syscall table yet
+            env->savedUserRsp = 0;
+            env->currentPid   = 0;  // kernel
+
+            CpuSetKernelGsBase(env);
+            brook::KPrintf("CPU: kernel GS env at %p, syscall stack top 0x%016lx\n",
+                           reinterpret_cast<void*>(env), env->syscallStack);
+        }
+    }
+
     // ACPI: parse tables to get LAPIC/IOAPIC addresses.
     bool acpiOk = brook::AcpiInit(bootProtocol->acpi.rsdpPhysical);
     if (acpiOk)
