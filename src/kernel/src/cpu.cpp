@@ -1,4 +1,5 @@
 #include "cpu.h"
+#include "gdt.h"
 #include "serial.h"
 
 // ---------------------------------------------------------------------------
@@ -48,4 +49,45 @@ bool CpuHasSse2()
     uint32_t edx;
     __asm__ volatile("cpuid" : "=d"(edx) : "a"(1) : "ebx", "ecx");
     return (edx >> 26) & 1;
+}
+
+// ---------------------------------------------------------------------------
+// SYSCALL / SYSRET MSR setup
+// ---------------------------------------------------------------------------
+
+void CpuInitSyscallMsrs(uint64_t lstarEntry)
+{
+    // STAR MSR: [63:48] = SYSRET CS/SS base, [47:32] = SYSCALL CS
+    // SYSCALL: CS = STAR[47:32], SS = STAR[47:32] + 8
+    // SYSRET:  SS = STAR[63:48] + 8, CS = STAR[63:48] + 16 (64-bit mode)
+    uint64_t star = (static_cast<uint64_t>(GDT_STAR_USER) << 48) |
+                    (static_cast<uint64_t>(GDT_STAR_KERNEL) << 32);
+    WriteMsr(MSR_STAR, star);
+
+    // LSTAR: the RIP that SYSCALL jumps to.
+    WriteMsr(MSR_LSTAR, lstarEntry);
+
+    // CSTAR: compatibility-mode SYSCALL target.  We don't support compat mode;
+    // set to 0 so it faults immediately if somehow reached.
+    WriteMsr(MSR_CSTAR, 0);
+
+    // FMASK: RFLAGS bits to clear on SYSCALL.
+    // Clear IF (bit 9) so interrupts are disabled on entry.
+    // Clear TF (bit 8) so we don't single-step the kernel entry.
+    // Clear DF (bit 10) so string ops go forward.
+    WriteMsr(MSR_FMASK, (1ULL << 9) | (1ULL << 8) | (1ULL << 10));
+
+    // Enable the SCE (SysCall Enable) bit in EFER.
+    uint64_t efer = ReadMsr(MSR_EFER);
+    efer |= EFER_SCE;
+    WriteMsr(MSR_EFER, efer);
+
+    brook::SerialPrintf("CPU: SYSCALL/SYSRET enabled (STAR=0x%016lx LSTAR=0x%016lx)\n",
+                        star, lstarEntry);
+}
+
+void CpuSetKernelGsBase(KernelCpuEnv* env)
+{
+    env->selfPtr = reinterpret_cast<uint64_t>(env);
+    WriteMsr(MSR_KERNEL_GS_BASE, reinterpret_cast<uint64_t>(env));
 }

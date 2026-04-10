@@ -20,6 +20,7 @@
 #include "fatfs_glue.h"
 #include "vfs.h"
 #include "virtio_blk.h"
+#include "syscall.h"
 #include "fat_test_image.h"
 
 // All kernel initialization and runtime — called by KernelMain after stack switch.
@@ -59,7 +60,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
     GdtInit();
     CpuInitFpu();
-    brook::KPuts("GDT+FPU loaded\n");
+    CpuInitSyscallMsrs(SyscallGetEntryStub());
+    brook::KPuts("GDT+FPU+SYSCALL loaded\n");
 
     IdtInit(&bootProtocol->framebuffer);
     brook::KPuts("IDT loaded\n");

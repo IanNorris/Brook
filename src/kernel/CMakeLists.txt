@@ -118,6 +118,7 @@ add_executable(kernel
     src/pmm.cpp
     src/pci.cpp
     src/ramdisk.cpp
+    src/syscall.cpp
     src/vfs.cpp
     src/virtio_blk.cpp
     src/vmm.cpp
