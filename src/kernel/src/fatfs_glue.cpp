@@ -57,9 +57,10 @@ DRESULT disk_read(BYTE pdrv, BYTE* buff, LBA_t sector, UINT count)
     brook::Device* dev = brook::g_fatfsDrives[pdrv];
     if (!dev) return RES_NOTRDY;
 
-    uint32_t bs     = brook::DeviceBlockSize(dev);
-    uint64_t offset = static_cast<uint64_t>(sector) * bs;
-    uint64_t len    = static_cast<uint64_t>(count)  * bs;
+    // FF_MIN_SS == FF_MAX_SS == 512, so block size is always 512.
+    static constexpr uint32_t SECTOR_SIZE = 512;
+    uint64_t offset = static_cast<uint64_t>(sector) * SECTOR_SIZE;
+    uint64_t len    = static_cast<uint64_t>(count)  * SECTOR_SIZE;
 
     int ret = dev->ops->read(dev, offset, buff, len);
     return (ret == static_cast<int>(len)) ? RES_OK : RES_ERROR;
@@ -71,9 +72,9 @@ DRESULT disk_write(BYTE pdrv, const BYTE* buff, LBA_t sector, UINT count)
     brook::Device* dev = brook::g_fatfsDrives[pdrv];
     if (!dev) return RES_NOTRDY;
 
-    uint32_t bs     = brook::DeviceBlockSize(dev);
-    uint64_t offset = static_cast<uint64_t>(sector) * bs;
-    uint64_t len    = static_cast<uint64_t>(count)  * bs;
+    static constexpr uint32_t SECTOR_SIZE = 512;
+    uint64_t offset = static_cast<uint64_t>(sector) * SECTOR_SIZE;
+    uint64_t len    = static_cast<uint64_t>(count)  * SECTOR_SIZE;
 
     int ret = dev->ops->write(dev, offset, buff, len);
     return (ret == static_cast<int>(len)) ? RES_OK : RES_ERROR;
@@ -96,8 +97,7 @@ DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void* buff)
         return RES_OK;
 
     case GET_SECTOR_SIZE:
-        *static_cast<WORD*>(buff) =
-            static_cast<WORD>(brook::DeviceBlockSize(dev));
+        *static_cast<WORD*>(buff) = 512;  // FF_MIN_SS == FF_MAX_SS == 512
         return RES_OK;
 
     case GET_BLOCK_SIZE:
