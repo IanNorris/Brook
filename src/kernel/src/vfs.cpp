@@ -140,9 +140,12 @@ static int FatDirReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
 
     FILINFO fno;
     FRESULT res = f_readdir(dir, &fno);
-    if (res != FR_OK) return -1;
+    if (res != FR_OK) { SerialPrintf("VFS: readdir failed (res=%u)\n", static_cast<unsigned>(res)); return -1; }
     if (fno.fname[0] == '\0') return 0; // end of directory
 
+    SerialPrintf("VFS: readdir entry: '%s' (%s, %lu bytes)\n",
+                 fno.fname, (fno.fattrib & AM_DIR) ? "dir" : "file",
+                 static_cast<unsigned long>(fno.fsize));
     StrCopy(out->name, fno.fname, sizeof(out->name));
     out->size  = fno.fsize;
     out->isDir = (fno.fattrib & AM_DIR) != 0;
@@ -307,6 +310,7 @@ Vnode* VfsOpen(const char* path, int flags)
     res = f_opendir(dir, fatPath);
     if (res == FR_OK)
     {
+        SerialPrintf("VFS: opened dir '%s' (fatpath='%s')\n", path, fatPath);
         auto* vn = static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
         if (!vn) { f_closedir(dir); kfree(dir); return nullptr; }
         vn->ops  = &g_fatDirOps;

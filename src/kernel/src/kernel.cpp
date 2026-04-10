@@ -284,9 +284,10 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
                 char cfgPath[80] = {};
                 // Build "<mntPath>/BROOK.CFG"
                 uint32_t plen = 0;
-                while (mntPath[plen]) cfgPath[plen] = mntPath[plen++];
+                while (mntPath[plen]) { cfgPath[plen] = mntPath[plen]; ++plen; }
                 const char* suffix = "/BROOK.CFG";
                 for (uint32_t j = 0; suffix[j]; ++j) cfgPath[plen++] = suffix[j];
+                cfgPath[plen] = '\0';
 
                 brook::Vnode* cfg = brook::VfsOpen(cfgPath);
                 if (cfg)
@@ -312,11 +313,14 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     //   Keyboard is NOT here — it needs APIC which is already set up, but
     //   we prefer loading it from the virtio disk for demonstration.
     brook::KsymDump();
+    brook::SerialPuts("module: Phase 1 — loading from /drivers (ramdisk)\n");
     brook::ModuleDiscoverAndLoad("/drivers");
 
     // Phase 2: load late modules from /boot/drivers (virtio disk).
     //   ps2_kbd.mod and virtio_blk.mod live here.
+    brook::SerialPuts("module: Phase 2 — loading from /boot/drivers (virtio)\n");
     brook::ModuleDiscoverAndLoad("/boot/drivers");
+    brook::SerialPuts("module: Phase 2 — done\n");
 
     // Keyboard: the ps2_kbd module calls KbdInit(). If the module wasn't
     // loaded (e.g. no /boot), fall back to initialising directly.

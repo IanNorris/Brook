@@ -23,6 +23,17 @@ static uint32_t ModStrLen(const char* s)
     return n;
 }
 
+static char ModToLower(char c)
+{
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : c;
+}
+
+static bool ModStrEqI(const char* a, const char* b)
+{
+    while (*a && *b) { if (ModToLower(*a++) != ModToLower(*b++)) return false; }
+    return *a == *b;
+}
+
 static bool ModStrEq(const char* a, const char* b)
 {
     while (*a && *b) { if (*a++ != *b++) return false; }
@@ -34,7 +45,7 @@ static bool ModStrEndsWith(const char* str, const char* suffix)
     uint32_t slen = ModStrLen(str);
     uint32_t xlen = ModStrLen(suffix);
     if (xlen > slen) return false;
-    return ModStrEq(str + slen - xlen, suffix);
+    return ModStrEqI(str + slen - xlen, suffix);
 }
 
 // Zero a byte range using a volatile pointer so the compiler can't replace
@@ -281,7 +292,7 @@ static bool ParseAndLoad(const uint8_t* data, uint64_t size, ParseResult& out)
     uint64_t pageCount = (totalSize + 4095) / 4096;
     // VMM_WRITABLE | VMM_EXEC (exec flag = 0 currently means executable since
     // the kernel's VMM doesn't set NX by default)
-    uint64_t baseVirt = VmmAllocPages(pageCount, VMM_WRITABLE, MemTag::Device, KernelPid);
+    uint64_t baseVirt = VmmAllocModulePages(pageCount, VMM_WRITABLE, MemTag::Device, KernelPid);
     if (!baseVirt)
     {
         SerialPuts("module: VMM allocation failed\n");
@@ -563,7 +574,7 @@ uint32_t ModuleDiscoverAndLoad(const char* dirPath)
     ModCopy(pathBuf, dirPath, dirLen);
     pathBuf[dirLen] = '/';
 
-    while (VfsReaddir(dir, &entry, &cookie) >= 0)
+    while (VfsReaddir(dir, &entry, &cookie) > 0)
     {
         // Only load files ending in ".mod"
         if (!ModStrEndsWith(entry.name, ".mod")) continue;

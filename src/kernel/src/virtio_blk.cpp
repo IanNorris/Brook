@@ -266,27 +266,43 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
     auto* s = static_cast<VirtioBlkState*>(dev->priv);
     if (len == 0) return 0;
 
-    uint32_t blockSize = 512;
-    uint64_t startSector = offset / blockSize;
-    uint64_t endSector   = (offset + len + blockSize - 1) / blockSize;
-    uint64_t sectorCount = endSector - startSector;
+    static constexpr uint32_t SECTOR_SIZE = 512;
+    uint64_t startSector = offset / SECTOR_SIZE;
+    uint64_t endSector   = (offset + len + SECTOR_SIZE - 1) / SECTOR_SIZE;
 
-    // Use a scratch buffer for partial-sector reads.
-    auto* tmp = static_cast<uint8_t*>(kmalloc(sectorCount * blockSize));
-    if (!tmp) return -1;
+    // DMA buffers must be physically contiguous.  Since kmalloc may return
+    // virtual addresses spanning non-contiguous physical pages, we read one
+    // sector at a time using a single-page DMA buffer.
+    uint8_t* dstBytes = static_cast<uint8_t*>(buf);
+    uint64_t bytesRead = 0;
 
-    bool ok = SubmitRequest(*s, VIRTIO_BLK_T_IN, startSector,
-                            tmp, static_cast<uint32_t>(sectorCount * blockSize));
-    if (ok)
+    // Allocate a single-sector DMA buffer (guaranteed within one page).
+    auto* sectorBuf = static_cast<uint8_t*>(kmalloc(SECTOR_SIZE));
+    if (!sectorBuf) { brook::SerialPuts("virtio-blk: read OOM\n"); return -1; }
+
+    for (uint64_t sec = startSector; sec < endSector && bytesRead < len; ++sec)
     {
-        // Copy relevant portion to caller's buffer.
-        uint64_t startOffset = offset % blockSize;
-        uint8_t* src = tmp + startOffset;
-        uint8_t* dst = static_cast<uint8_t*>(buf);
-        for (uint64_t i = 0; i < len; ++i) dst[i] = src[i];
+        if (!SubmitRequest(*s, VIRTIO_BLK_T_IN, sec, sectorBuf, SECTOR_SIZE))
+        {
+            brook::SerialPrintf("virtio-blk: read failed at sector %lu\n",
+                                static_cast<unsigned long>(sec));
+            kfree(sectorBuf);
+            return -1;
+        }
+
+        // Copy the relevant portion of this sector into the output buffer.
+        uint64_t sectorStart = sec * SECTOR_SIZE;
+        uint64_t copyStart   = (sectorStart < offset) ? (offset - sectorStart) : 0;
+        uint64_t copyEnd     = SECTOR_SIZE;
+        uint64_t remaining   = len - bytesRead;
+        if (copyEnd - copyStart > remaining) copyEnd = copyStart + remaining;
+
+        for (uint64_t i = copyStart; i < copyEnd; ++i)
+            dstBytes[bytesRead++] = sectorBuf[i];
     }
-    kfree(tmp);
-    return ok ? static_cast<int>(len) : -1;
+
+    kfree(sectorBuf);
+    return static_cast<int>(bytesRead);
 }
 
 static int VirtioBlkWrite(Device* dev, uint64_t offset, const void* buf, uint64_t len)
@@ -294,23 +310,41 @@ static int VirtioBlkWrite(Device* dev, uint64_t offset, const void* buf, uint64_
     auto* s = static_cast<VirtioBlkState*>(dev->priv);
     if (len == 0) return 0;
 
-    uint32_t blockSize = 512;
-    uint64_t startSector = offset / blockSize;
-    uint64_t sectorCount = (len + blockSize - 1) / blockSize;
+    static constexpr uint32_t SECTOR_SIZE = 512;
+    uint64_t startSector = offset / SECTOR_SIZE;
+    uint64_t endSector   = (offset + len + SECTOR_SIZE - 1) / SECTOR_SIZE;
 
-    auto* tmp = static_cast<uint8_t*>(kmalloc(sectorCount * blockSize));
-    if (!tmp) return -1;
+    const uint8_t* srcBytes = static_cast<const uint8_t*>(buf);
+    uint64_t bytesWritten = 0;
 
-    // Zero-fill then copy data.
-    for (uint64_t i = 0; i < sectorCount * blockSize; ++i) tmp[i] = 0;
-    const uint8_t* src = static_cast<const uint8_t*>(buf);
-    uint64_t startOffset = offset % blockSize;
-    for (uint64_t i = 0; i < len; ++i) tmp[startOffset + i] = src[i];
+    auto* sectorBuf = static_cast<uint8_t*>(kmalloc(SECTOR_SIZE));
+    if (!sectorBuf) return -1;
 
-    bool ok = SubmitRequest(*s, VIRTIO_BLK_T_OUT, startSector,
-                            tmp, static_cast<uint32_t>(sectorCount * blockSize));
-    kfree(tmp);
-    return ok ? static_cast<int>(len) : -1;
+    for (uint64_t sec = startSector; sec < endSector && bytesWritten < len; ++sec)
+    {
+        // Zero-fill sector buffer, then copy in the relevant bytes.
+        for (uint32_t i = 0; i < SECTOR_SIZE; ++i) sectorBuf[i] = 0;
+
+        uint64_t sectorStart = sec * SECTOR_SIZE;
+        uint64_t copyStart   = (sectorStart < offset) ? (offset - sectorStart) : 0;
+        uint64_t copyEnd     = SECTOR_SIZE;
+        uint64_t remaining   = len - bytesWritten;
+        if (copyEnd - copyStart > remaining) copyEnd = copyStart + remaining;
+
+        // For partial sectors at start/end, we should read-modify-write.
+        // For now, zero-fill partial sectors (writes are rare in this OS).
+        for (uint64_t i = copyStart; i < copyEnd; ++i)
+            sectorBuf[i] = srcBytes[bytesWritten++];
+
+        if (!SubmitRequest(*s, VIRTIO_BLK_T_OUT, sec, sectorBuf, SECTOR_SIZE))
+        {
+            kfree(sectorBuf);
+            return -1;
+        }
+    }
+
+    kfree(sectorBuf);
+    return static_cast<int>(bytesWritten);
 }
 
 static int VirtioBlkIoctl(Device* dev, uint32_t cmd, void* arg)

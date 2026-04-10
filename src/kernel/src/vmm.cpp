@@ -19,6 +19,9 @@ static constexpr uint64_t PHYS_MASK = 0x000FFFFFFFFFF000ULL;
 
 static uint64_t g_vmallocNext = VMALLOC_BASE;
 
+// Module-space bump allocator
+static uint64_t g_moduleNext = MODULE_BASE;
+
 // ---------------------------------------------------------------------------
 // Allocation registration table — 1024 static slots.
 // Tracks every VmmAllocPages call for diagnostics and ownership queries.
@@ -215,6 +218,66 @@ uint64_t VmmAllocPages(uint64_t pageCount, uint64_t flags, MemTag tag, uint16_t 
     }
 
     // Register the allocation.
+    VmmAllocation* slot = FindFreeSlot();
+    if (slot)
+    {
+        slot->virtBase  = virtBase;
+        slot->pageCount = pageCount;
+        slot->tag       = tag;
+        slot->pid       = pid;
+    }
+
+    return virtBase;
+}
+
+uint64_t VmmAllocModulePages(uint64_t pageCount, uint64_t flags, MemTag tag, uint16_t pid)
+{
+    if (pageCount == 0) return 0;
+    if (g_moduleNext + pageCount * PAGE_SIZE > MODULE_BASE + MODULE_SIZE)
+        return 0;
+
+    uint64_t virtBase = g_moduleNext;
+    g_moduleNext += pageCount * PAGE_SIZE;
+
+    for (uint64_t i = 0; i < pageCount; i++)
+    {
+        uint64_t phys = PmmAllocPage(tag, pid);
+        if (phys == 0)
+        {
+            for (uint64_t j = 0; j < i; j++)
+            {
+                uint64_t v = virtBase + j * PAGE_SIZE;
+                uint64_t* pte = WalkToPtr(v, false);
+                if (pte && (*pte & VMM_PRESENT))
+                {
+                    PmmFreePage(*pte & PHYS_MASK);
+                    *pte = 0;
+                    Invlpg(v);
+                }
+            }
+            g_moduleNext = virtBase;
+            return 0;
+        }
+
+        if (!VmmMapPage(virtBase + i * PAGE_SIZE, phys, flags, tag, pid))
+        {
+            PmmFreePage(phys);
+            for (uint64_t j = 0; j < i; j++)
+            {
+                uint64_t v = virtBase + j * PAGE_SIZE;
+                uint64_t* pte = WalkToPtr(v, false);
+                if (pte && (*pte & VMM_PRESENT))
+                {
+                    PmmFreePage(*pte & PHYS_MASK);
+                    *pte = 0;
+                    Invlpg(v);
+                }
+            }
+            g_moduleNext = virtBase;
+            return 0;
+        }
+    }
+
     VmmAllocation* slot = FindFreeSlot();
     if (slot)
     {

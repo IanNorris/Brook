@@ -40,6 +40,12 @@ static constexpr uint64_t PTE_PID_MASK   = (0x7FFULL << PTE_PID_SHIFT);
 static constexpr uint64_t VMALLOC_BASE  = 0xFFFFC00000000000ULL;
 static constexpr uint64_t VMALLOC_SIZE  = 32ULL * 1024 * 1024 * 1024; // 32GB
 
+// Module-space region: within the kernel's ±2GB window for R_X86_64_32S relocations.
+// The kernel image occupies 0xFFFFFFFF80000000..~0xFFFFFFFF805xxxxx.
+// Module code is placed starting at 0xFFFFFFFF90000000 (256 MB).
+static constexpr uint64_t MODULE_BASE  = 0xFFFFFFFF90000000ULL;
+static constexpr uint64_t MODULE_SIZE  = 256ULL * 1024 * 1024; // 256 MB
+
 // Record of a single VmmAllocPages call — for diagnostics and ownership tracking.
 struct VmmAllocation
 {
@@ -80,6 +86,13 @@ extern "C" void VmmFreePages(uint64_t virtAddr, uint64_t pageCount);
 // Translate virtual → physical by walking the live page tables.
 // Returns 0 if the address is not mapped.
 extern "C" uint64_t VmmVirtToPhys(uint64_t virtAddr);
+
+// Allocate pages in the kernel module region (within ±2GB of kernel image).
+// Used for loading driver modules that are compiled with -mcmodel=kernel.
+uint64_t VmmAllocModulePages(uint64_t pageCount,
+                             uint64_t flags = VMM_WRITABLE,
+                             MemTag tag     = MemTag::Device,
+                             uint16_t pid   = KernelPid);
 
 // Look up the allocation record for a VMALLOC address. Returns nullptr if not found.
 const VmmAllocation* VmmGetAllocation(uint64_t virtAddr);
