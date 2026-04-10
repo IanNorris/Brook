@@ -896,13 +896,8 @@ static int64_t sys_stat(uint64_t pathAddr, uint64_t statAddr, uint64_t,
     const char* path = reinterpret_cast<const char*>(pathAddr);
     auto* st = reinterpret_cast<LinuxStat*>(statAddr);
 
-    Vnode* vn = VfsOpen(path, 0);
-    if (!vn) return -ENOENT;
-
     VnodeStat vs; vs.size = 0; vs.isDir = false;
-    int ret = VfsStat(vn, &vs);
-    VfsClose(vn);
-    if (ret < 0) return -ENOENT;
+    if (VfsStatPath(path, &vs) < 0) return -ENOENT;
 
     FillStat(st, vs);
     return 0;

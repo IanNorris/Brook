@@ -472,6 +472,34 @@ int VfsStat(Vnode* vn, VnodeStat* st)
     return vn->ops->stat(vn, st);
 }
 
+int VfsStatPath(const char* path, VnodeStat* st)
+{
+    if (!path || !path[0] || !st) return -1;
+
+    const char* relPath = nullptr;
+    MountEntry* mount   = FindMount(path, &relPath);
+    if (!mount) return -1;
+
+    char fatPath[256];
+    BuildFatPath(fatPath, sizeof(fatPath), mount->pdrv, relPath);
+
+    // Check for root directory
+    bool isRoot = (relPath[0] == '/' && relPath[1] == '\0') || relPath[0] == '\0';
+    if (isRoot) {
+        st->size  = 0;
+        st->isDir = true;
+        return 0;
+    }
+
+    FILINFO fno;
+    FRESULT res = f_stat(fatPath, &fno);
+    if (res != FR_OK) return -1;
+
+    st->isDir = (fno.fattrib & AM_DIR) != 0;
+    st->size  = st->isDir ? 0 : fno.fsize;
+    return 0;
+}
+
 void VfsClose(Vnode* vn)
 {
     if (!vn) return;
