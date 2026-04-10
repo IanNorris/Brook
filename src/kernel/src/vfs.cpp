@@ -233,6 +233,7 @@ bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
 
     SerialPrintf("VFS: f_mount '%s' fs=%p...\n", fatPath, (void*)fs);
     FRESULT res = f_mount(fs, fatPath, 1);
+    SerialPrintf("VFS: f_mount returned %u\n", (unsigned)res);
     if (res != FR_OK)
     {
         SerialPrintf("VFS: f_mount failed (res=%u) for drive %u\n",
