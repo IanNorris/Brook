@@ -60,3 +60,7 @@ struct Tss64 {
 // Populate the GDT (with TSS), load it via lgdt, reload segment registers,
 // and load the TSS via ltr.  Must be called before IdtInit.
 void GdtInit();
+
+// Set TSS.RSP0 — the kernel stack loaded by the CPU on ring 3 → ring 0
+// transitions (interrupts, exceptions, but NOT SYSCALL).
+void GdtSetTssRsp0(uint64_t stackTop);

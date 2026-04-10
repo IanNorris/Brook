@@ -78,33 +78,38 @@ static uint64_t AllocTablePage()
     return PmmAllocPage(MemTag::PageTable, KernelPid);
 }
 
-static uint64_t* GetOrAllocEntry(uint64_t* parent, uint64_t idx)
+static uint64_t* GetOrAllocEntry(uint64_t* parent, uint64_t idx, uint64_t extraFlags = 0)
 {
     if (!(parent[idx] & VMM_PRESENT))
     {
         uint64_t childPhys = AllocTablePage();
         if (childPhys == 0) return nullptr;
         ZeroPage(childPhys);
-        parent[idx] = childPhys | VMM_PRESENT | VMM_WRITABLE;
+        parent[idx] = childPhys | VMM_PRESENT | VMM_WRITABLE | (extraFlags & VMM_USER);
+    }
+    else if ((extraFlags & VMM_USER) && !(parent[idx] & VMM_USER))
+    {
+        // Promote: an existing kernel-only intermediate entry now needs USER access.
+        parent[idx] |= VMM_USER;
     }
     uint64_t childPhys = parent[idx] & PHYS_MASK;
     return reinterpret_cast<uint64_t*>(childPhys);
 }
 
-static uint64_t* WalkToPtr(uint64_t virtAddr, bool create)
+static uint64_t* WalkToPtr(uint64_t virtAddr, bool create, uint64_t flags = 0)
 {
     uint64_t cr3   = ReadCR3() & PHYS_MASK;
     uint64_t* pml4 = reinterpret_cast<uint64_t*>(cr3);
 
     uint64_t* pdpt = create
-        ? GetOrAllocEntry(pml4, Pml4Index(virtAddr))
+        ? GetOrAllocEntry(pml4, Pml4Index(virtAddr), flags)
         : (pml4[Pml4Index(virtAddr)] & VMM_PRESENT)
             ? reinterpret_cast<uint64_t*>(pml4[Pml4Index(virtAddr)] & PHYS_MASK)
             : nullptr;
     if (!pdpt) return nullptr;
 
     uint64_t* pd = create
-        ? GetOrAllocEntry(pdpt, PdptIndex(virtAddr))
+        ? GetOrAllocEntry(pdpt, PdptIndex(virtAddr), flags)
         : (pdpt[PdptIndex(virtAddr)] & VMM_PRESENT)
             ? reinterpret_cast<uint64_t*>(pdpt[PdptIndex(virtAddr)] & PHYS_MASK)
             : nullptr;
@@ -114,7 +119,7 @@ static uint64_t* WalkToPtr(uint64_t virtAddr, bool create)
     if (pd[PdIndex(virtAddr)] & (1ULL << 7)) return nullptr;
 
     uint64_t* pt = create
-        ? GetOrAllocEntry(pd, PdIndex(virtAddr))
+        ? GetOrAllocEntry(pd, PdIndex(virtAddr), flags)
         : (pd[PdIndex(virtAddr)] & VMM_PRESENT)
             ? reinterpret_cast<uint64_t*>(pd[PdIndex(virtAddr)] & PHYS_MASK)
             : nullptr;
@@ -144,7 +149,7 @@ bool VmmMapPage(uint64_t virtAddr, uint64_t physAddr, uint64_t flags,
         return false;
     }
 
-    uint64_t* pte = WalkToPtr(virtAddr, /*create=*/true);
+    uint64_t* pte = WalkToPtr(virtAddr, /*create=*/true, flags);
     if (!pte) return false;
 
     // Encode tag in bits [9-11] and PID in bits [52-62].

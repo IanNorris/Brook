@@ -107,4 +107,9 @@ void GdtInit()
     __asm__ volatile("ltr %0" : : "r"(static_cast<uint16_t>(GDT_TSS)));
 }
 
+void GdtSetTssRsp0(uint64_t stackTop)
+{
+    g_tss.rsp[0] = stackTop;
+}
+
 

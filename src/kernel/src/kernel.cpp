@@ -26,6 +26,9 @@
 // All kernel initialization and runtime — called by KernelMain after stack switch.
 __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootProtocol);
 
+// Global kernel CPU environment (needed to set syscall table after init).
+static KernelCpuEnv* g_kernelEnv = nullptr;
+
 // Kernel entry point. Called by the bootloader via SysV ABI (argument in RDI).
 // Immediately switches to a dedicated kernel stack, then tail-calls KernelMainBody.
 extern "C" __attribute__((sysv_abi, noreturn)) void KernelMain(brook::BootProtocol* bootProtocol)
@@ -60,7 +63,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
     GdtInit();
     CpuInitFpu();
-    CpuInitSyscallMsrs(SyscallGetEntryStub());
+    CpuInitSyscallMsrs(brook::SyscallGetEntryPoint());
     brook::KPuts("GDT+FPU+SYSCALL loaded\n");
 
     IdtInit(&bootProtocol->framebuffer);
@@ -122,11 +125,19 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             {
                 env->syscallStack = 0;
             }
-            env->syscallTable = 0;  // no syscall table yet
-            env->savedUserRsp = 0;
+            env->syscallTable = 0;  // set later when syscall table is ready
+            env->kernelRbp    = 0;
+            env->kernelRsp    = 0;
             env->currentPid   = 0;  // kernel
 
             CpuSetKernelGsBase(env);
+            g_kernelEnv = env;
+
+            // Set TSS.RSP0 so ring 3 → ring 0 exception transitions
+            // use the syscall stack (SYSCALL itself uses LSTAR, not TSS).
+            if (env->syscallStack)
+                GdtSetTssRsp0(env->syscallStack);
+
             brook::KPrintf("CPU: kernel GS env at %p, syscall stack top 0x%016lx\n",
                            reinterpret_cast<void*>(env), env->syscallStack);
         }
@@ -321,6 +332,92 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::SerialPuts("module: Phase 2 — loading from /boot/drivers (virtio)\n");
     brook::ModuleDiscoverAndLoad("/boot/drivers");
     brook::SerialPuts("module: Phase 2 — done\n");
+
+    // ---- Syscall table ----
+    brook::SyscallTableInit();
+    if (g_kernelEnv)
+    {
+        g_kernelEnv->syscallTable = reinterpret_cast<uint64_t>(brook::SyscallGetTable());
+    }
+
+    // ---- User-mode test ----
+    // Allocate a user-accessible page, write a tiny program that calls
+    // sys_write("Hello from ring 3!\n") then sys_exit(0), and jump to it.
+    {
+        uint64_t codeBase = brook::VmmAllocPages(1,
+            brook::VMM_WRITABLE | brook::VMM_USER, brook::MemTag::User, 1);
+        uint64_t stackBase = brook::VmmAllocPages(1,
+            brook::VMM_WRITABLE | brook::VMM_USER, brook::MemTag::User, 1);
+
+        if (codeBase && stackBase)
+        {
+            // Hand-assemble a tiny ring-3 program:
+            //   0x00: mov rdi, 1              (7)   fd = stdout
+            //   0x07: lea rsi, [rip+0x1D]     (7)   buf = msg
+            //   0x0E: mov rdx, 19             (7)   count
+            //   0x15: mov rax, 1              (7)   SYS_WRITE
+            //   0x1C: syscall                 (2)
+            //   0x1E: xor rdi, rdi            (3)   status = 0
+            //   0x21: mov rax, 60             (7)   SYS_EXIT
+            //   0x28: syscall                 (2)
+            //   0x2A: hlt                     (1)
+            //   0x2B: "Hello from ring 3!\n"  (20)
+            uint8_t* code = reinterpret_cast<uint8_t*>(codeBase);
+            uint32_t off = 0;
+
+            // mov rdi, 1
+            code[off++] = 0x48; code[off++] = 0xc7; code[off++] = 0xc7;
+            code[off++] = 0x01; code[off++] = 0x00; code[off++] = 0x00; code[off++] = 0x00;
+
+            // lea rsi, [rip + 0x1D]  (msg at 0x2B, RIP after insn = 0x0E)
+            code[off++] = 0x48; code[off++] = 0x8d; code[off++] = 0x35;
+            code[off++] = 0x1D; code[off++] = 0x00; code[off++] = 0x00; code[off++] = 0x00;
+
+            // mov rdx, 19
+            code[off++] = 0x48; code[off++] = 0xc7; code[off++] = 0xc2;
+            code[off++] = 19;   code[off++] = 0x00; code[off++] = 0x00; code[off++] = 0x00;
+
+            // mov rax, 1 (SYS_WRITE)
+            code[off++] = 0x48; code[off++] = 0xc7; code[off++] = 0xc0;
+            code[off++] = 0x01; code[off++] = 0x00; code[off++] = 0x00; code[off++] = 0x00;
+
+            // syscall
+            code[off++] = 0x0f; code[off++] = 0x05;
+
+            // xor rdi, rdi
+            code[off++] = 0x48; code[off++] = 0x31; code[off++] = 0xff;
+
+            // mov rax, 60 (SYS_EXIT)
+            code[off++] = 0x48; code[off++] = 0xc7; code[off++] = 0xc0;
+            code[off++] = 60;   code[off++] = 0x00; code[off++] = 0x00; code[off++] = 0x00;
+
+            // syscall
+            code[off++] = 0x0f; code[off++] = 0x05;
+
+            // hlt (safety)
+            code[off++] = 0xf4;
+
+            // msg at offset 0x2B
+            const char* m = "Hello from ring 3!\n";
+            for (uint32_t i = 0; m[i]; ++i)
+                code[off++] = static_cast<uint8_t>(m[i]);
+            code[off++] = 0;
+
+            uint64_t userStackTop = stackBase + 0x1000 - 16;
+
+            brook::SerialPrintf("USER: test program at 0x%lx, stack top 0x%lx\n",
+                                codeBase, userStackTop);
+            brook::SerialPuts("USER: entering ring 3...\n");
+
+            brook::SwitchToUserMode(userStackTop, codeBase);
+
+            brook::SerialPuts("USER: returned from ring 3 successfully!\n");
+        }
+        else
+        {
+            brook::SerialPuts("USER: failed to allocate user pages\n");
+        }
+    }
 
     // Keyboard: the ps2_kbd module calls KbdInit(). If the module wasn't
     // loaded (e.g. no /boot), fall back to initialising directly.

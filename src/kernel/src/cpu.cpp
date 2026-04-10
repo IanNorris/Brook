@@ -89,5 +89,8 @@ void CpuInitSyscallMsrs(uint64_t lstarEntry)
 void CpuSetKernelGsBase(KernelCpuEnv* env)
 {
     env->selfPtr = reinterpret_cast<uint64_t>(env);
-    WriteMsr(MSR_KERNEL_GS_BASE, reinterpret_cast<uint64_t>(env));
+    // Set GS.base so the kernel can access env via gs: directly.
+    // MSR_KERNEL_GS_BASE is what SWAPGS swaps with — set to 0 (user GS).
+    WriteMsr(MSR_GS_BASE, reinterpret_cast<uint64_t>(env));
+    WriteMsr(MSR_KERNEL_GS_BASE, 0);
 }

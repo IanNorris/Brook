@@ -56,8 +56,9 @@ struct KernelCpuEnv {
     uint64_t selfPtr;       // [gs:0]  — pointer to this struct (for sanity checks)
     uint64_t syscallStack;  // [gs:8]  — top of per-CPU syscall kernel stack
     uint64_t syscallTable;  // [gs:16] — pointer to the active syscall table
-    uint64_t savedUserRsp;  // [gs:24] — user RSP saved during SYSCALL
-    uint64_t currentPid;    // [gs:32] — PID of the currently running process
+    uint64_t kernelRbp;     // [gs:24] — kernel RBP saved by SwitchToUserMode
+    uint64_t kernelRsp;     // [gs:32] — kernel RSP saved by SwitchToUserMode
+    uint64_t currentPid;    // [gs:40] — PID of the currently running process
 };
 
 // Initialise SYSCALL/SYSRET MSRs.  Call after GdtInit().
