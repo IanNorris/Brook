@@ -215,31 +215,8 @@ void TtyPuts(const char* str)
 }
 
 // ---------------------------------------------------------------------------
-// TtyPrintf — mirrors SerialPrintf's format specifiers.
+// TtyVPrintf — mirrors SerialPrintf's format specifiers with width/padding.
 // ---------------------------------------------------------------------------
-
-static void TtyPrintUlong(unsigned long val)
-{
-    if (val == 0) { TtyPutChar('0'); return; }
-    char buf[20];
-    int  i = 0;
-    while (val > 0) { buf[i++] = static_cast<char>('0' + val % 10); val /= 10; }
-    while (i > 0)   TtyPutChar(buf[--i]);
-}
-
-static void TtyPrintHex(unsigned long val)
-{
-    if (val == 0) { TtyPutChar('0'); return; }
-    char buf[16];
-    int  i = 0;
-    while (val > 0)
-    {
-        int nib = static_cast<int>(val & 0xF);
-        buf[i++] = static_cast<char>(nib < 10 ? '0' + nib : 'a' + nib - 10);
-        val >>= 4;
-    }
-    while (i > 0) TtyPutChar(buf[--i]);
-}
 
 static void TtyPrintPtr(unsigned long val)
 {

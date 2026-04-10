@@ -146,7 +146,6 @@ void SerialVPrintf(const char* fmt, __builtin_va_list args)
                 if (uval == 0) { buf[len++] = '0'; }
                 else { while (uval > 0) { buf[len++] = static_cast<char>('0' + (uval % 10)); uval /= 10; } }
                 int totalLen = len + (neg ? 1 : 0);
-                char padChar = zeroPad ? '0' : ' ';
                 if (!leftAlign && !zeroPad) { for (int i = totalLen; i < width; ++i) SerialPutChar(' '); }
                 if (neg) SerialPutChar('-');
                 if (!leftAlign && zeroPad) { for (int i = totalLen; i < width; ++i) SerialPutChar('0'); }
