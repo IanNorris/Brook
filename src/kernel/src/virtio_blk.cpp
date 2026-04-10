@@ -81,25 +81,13 @@ struct __attribute__((packed)) VirtqDesc {
     uint16_t next;
 };
 
-static constexpr uint32_t QUEUE_SIZE = 64; // must be power of 2
-
-struct __attribute__((packed)) VirtqAvail {
-    uint16_t flags;
-    uint16_t idx;
-    uint16_t ring[QUEUE_SIZE];
-    uint16_t used_event;
-};
+// Maximum queue size we're willing to handle.  The device may advertise
+// up to 32768; we cap to keep DMA allocation bounded (~32 KB total).
+static constexpr uint32_t MAX_QUEUE_SIZE = 256;
 
 struct __attribute__((packed)) VirtqUsedElem {
     uint32_t id;
     uint32_t len;
-};
-
-struct __attribute__((packed)) VirtqUsed {
-    uint16_t          flags;
-    uint16_t          idx;
-    VirtqUsedElem     ring[QUEUE_SIZE];
-    uint16_t          avail_event;
 };
 
 // virtio-blk request header (placed before the data buffer)
@@ -113,15 +101,24 @@ struct __attribute__((packed)) VirtioBlkReq {
 
 struct VirtioBlkState {
     uint16_t    ioBase;         // BAR0 I/O port base
+    uint16_t    queueSize;      // negotiated queue size (power of 2)
 
-    // Virtqueue memory (physically contiguous, 4KB-aligned)
+    // Virtqueue memory (physically contiguous, 4KB-aligned).
+    // Accessed via pointers — layout is size-dependent.
     VirtqDesc*  descTable;
-    VirtqAvail* availRing;
-    VirtqUsed*  usedRing;
+    // Available ring: [flags(2)] [idx(2)] [ring[queueSize](2*N)] [used_event(2)]
+    uint16_t*   availFlags;
+    uint16_t*   availIdx;
+    uint16_t*   availRing;      // points to ring[0]
+    // Used ring: [flags(2)] [idx(2)] [ring[queueSize](8*N)] [avail_event(2)]
+    uint16_t*       usedFlags;
+    volatile uint16_t* usedIdx;
+    VirtqUsedElem*  usedRing;   // points to ring[0]
+
     uint64_t    queuePhys;      // physical base of descriptor table
 
-    uint16_t    availIdx;       // next available ring index to write
-    uint16_t    usedIdx;        // last consumed used ring index
+    uint16_t    availIdxShadow; // next available ring index to write
+    uint16_t    usedIdxShadow;  // last consumed used ring index
 
     uint64_t    sectorCount;    // total sectors on the device
 
@@ -146,31 +143,51 @@ static inline void VioWrite16(uint16_t base, uint8_t reg, uint16_t v)
 static inline void VioWrite8 (uint16_t base, uint8_t reg, uint8_t v)  { outb(base + reg, v); }
 
 // ---- Virtqueue DMA allocation ----
-// Layout: [Desc table (1K)] [Avail ring (~140B)] [pad to 4K] [Used ring (~520B)]
-// We allocate 2 pages (8KB) to hold everything.
+// Virtio 1.0 legacy layout for a queue of size N:
+//   Descriptor table:  16 * N bytes
+//   Available ring:    6 + 2*N bytes  (flags + idx + ring[N] + used_event)
+//   [padding to next page boundary]
+//   Used ring:         6 + 8*N bytes  (flags + idx + ring[N] + avail_event)
+// We also allocate 1 extra page for req header + status byte DMA buffers.
 
-static constexpr uint32_t DESC_TABLE_SIZE   = sizeof(VirtqDesc)  * QUEUE_SIZE;
-static constexpr uint32_t AVAIL_RING_OFFSET = DESC_TABLE_SIZE;
-// Used ring must start at the next page boundary after avail ring.
-static constexpr uint32_t USED_RING_OFFSET  = 4096; // second page
+static uint32_t AlignUp(uint32_t v, uint32_t a) { return (v + a - 1) & ~(a - 1); }
 
 static bool AllocVirtqueue(VirtioBlkState& s)
 {
-    // 2 pages for the virtqueue, 1 page for req + status buffers.
-    uint64_t qVirt = VmmAllocPages(3, VMM_WRITABLE, MemTag::Device, KernelPid);
+    uint32_t N = s.queueSize;
+
+    uint32_t descSize  = 16 * N;
+    uint32_t availSize = 6 + 2 * N;
+    uint32_t usedOff   = AlignUp(descSize + availSize, 4096);
+    uint32_t usedSize  = 6 + 8 * N;
+    uint32_t totalSize = AlignUp(usedOff + usedSize, 4096);
+    uint32_t totalPages = totalSize / 4096 + 1; // +1 for req/status buffers
+
+    uint64_t qVirt = VmmAllocPages(totalPages, VMM_WRITABLE, MemTag::Device, KernelPid);
     if (!qVirt) return false;
 
     // Zero the pages.
     uint8_t* base = reinterpret_cast<uint8_t*>(qVirt);
-    for (uint32_t i = 0; i < 3 * 4096; ++i) base[i] = 0;
+    for (uint32_t i = 0; i < totalPages * 4096; ++i) base[i] = 0;
 
-    s.descTable  = reinterpret_cast<VirtqDesc*> (qVirt + 0);
-    s.availRing  = reinterpret_cast<VirtqAvail*>(qVirt + AVAIL_RING_OFFSET);
-    s.usedRing   = reinterpret_cast<VirtqUsed*> (qVirt + USED_RING_OFFSET);
-    s.queuePhys  = VmmVirtToPhys(qVirt);
+    s.descTable  = reinterpret_cast<VirtqDesc*>(qVirt);
 
-    // Request/status buffers live on page 3.
-    uint64_t extraVirt = qVirt + 2 * 4096;
+    // Available ring immediately after descriptor table.
+    uint8_t* availBase = base + descSize;
+    s.availFlags = reinterpret_cast<uint16_t*>(availBase);
+    s.availIdx   = reinterpret_cast<uint16_t*>(availBase + 2);
+    s.availRing  = reinterpret_cast<uint16_t*>(availBase + 4);
+
+    // Used ring starts at the next page boundary.
+    uint8_t* usedBase = base + usedOff;
+    s.usedFlags = reinterpret_cast<uint16_t*>(usedBase);
+    s.usedIdx   = reinterpret_cast<volatile uint16_t*>(usedBase + 2);
+    s.usedRing  = reinterpret_cast<VirtqUsedElem*>(usedBase + 4);
+
+    s.queuePhys = VmmVirtToPhys(qVirt);
+
+    // Request/status buffers on the last page.
+    uint64_t extraVirt = qVirt + (totalPages - 1) * 4096;
     s.reqBuf         = reinterpret_cast<VirtioBlkReq*>(extraVirt);
     s.reqBufPhys     = VmmVirtToPhys(extraVirt);
     s.statusBuf      = reinterpret_cast<uint8_t*>(extraVirt + sizeof(VirtioBlkReq));
@@ -216,10 +233,10 @@ static bool SubmitRequest(VirtioBlkState& s,
     __asm__ volatile("mfence" ::: "memory");
 
     // Add head descriptor (0) to available ring.
-    uint16_t slot = s.availIdx % QUEUE_SIZE;
-    s.availRing->ring[slot] = 0;
+    uint16_t slot = s.availIdxShadow % s.queueSize;
+    s.availRing[slot] = 0;
     __asm__ volatile("mfence" ::: "memory");
-    s.availRing->idx = ++s.availIdx;
+    *s.availIdx = ++s.availIdxShadow;
     __asm__ volatile("mfence" ::: "memory");
 
     // Notify device that queue 0 has work.
@@ -227,7 +244,7 @@ static bool SubmitRequest(VirtioBlkState& s,
 
     // Poll used ring until device consumes the request.
     uint32_t spins = 0;
-    while (s.usedRing->idx == s.usedIdx)
+    while (*s.usedIdx == s.usedIdxShadow)
     {
         __asm__ volatile("pause");
         if (++spins > 10000000u)
@@ -237,7 +254,7 @@ static bool SubmitRequest(VirtioBlkState& s,
         }
     }
     __asm__ volatile("mfence" ::: "memory");
-    ++s.usedIdx;
+    ++s.usedIdxShadow;
 
     return (*s.statusBuf == VIRTIO_BLK_S_OK);
 }
@@ -363,20 +380,22 @@ static Device* InitOnePciDevice(const PciDevice& pci, uint32_t slot)
     // 4. Set up virtqueue 0.
     VioWrite16(ioBase, VIRTIO_PCI_QUEUE_SEL, 0);
     uint16_t qSize = VioRead16(ioBase, VIRTIO_PCI_QUEUE_SIZE);
-    if (qSize == 0 || qSize > QUEUE_SIZE)
+    if (qSize == 0)
     {
-        SerialPrintf("virtio-blk: unexpected queue size %u, skipping\n",
-                     static_cast<unsigned>(qSize));
+        SerialPuts("virtio-blk: queue size is 0, skipping\n");
         return nullptr;
     }
+    // Cap to our maximum — the device advertises its max, we use the smaller.
+    if (qSize > MAX_QUEUE_SIZE) qSize = MAX_QUEUE_SIZE;
 
     auto* state = static_cast<VirtioBlkState*>(kmalloc(sizeof(VirtioBlkState)));
     if (!state) return nullptr;
     for (uint32_t i = 0; i < sizeof(VirtioBlkState); ++i)
         reinterpret_cast<uint8_t*>(state)[i] = 0;
-    state->ioBase   = ioBase;
-    state->availIdx = 0;
-    state->usedIdx  = 0;
+    state->ioBase         = ioBase;
+    state->queueSize      = qSize;
+    state->availIdxShadow = 0;
+    state->usedIdxShadow  = 0;
 
     if (!AllocVirtqueue(*state))
     {
