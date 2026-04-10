@@ -7,6 +7,7 @@
 // Compiled as C++ but exposes the C functions FatFS expects.
 
 #include "fatfs_glue.h"
+#include "ramdisk.h"
 #include "device.h"
 #include "serial.h"
 
@@ -91,14 +92,22 @@ DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void* buff)
     brook::Device* dev = brook::g_fatfsDrives[pdrv];
     if (!dev) return RES_NOTRDY;
 
+    brook::SerialPrintf("disk_ioctl: pdrv=%u cmd=%u\n", (unsigned)pdrv, (unsigned)cmd);
+
     switch (cmd)
     {
     case CTRL_SYNC:
         return RES_OK;
 
     case GET_SECTOR_COUNT:
-        *static_cast<LBA_t*>(buff) =
-            static_cast<LBA_t>(brook::DeviceBlockCount(dev));
+        // DeviceBlockCount uses reinterpret_cast inline function — same crash risk.
+        // Compute directly from priv->size / 512 instead.
+        {
+            auto* p = static_cast<brook::RamdiskPriv*>(dev->priv);
+            LBA_t cnt = p ? static_cast<LBA_t>(p->size / 512u) : 0;
+            brook::SerialPrintf("disk_ioctl: GET_SECTOR_COUNT=%lu\n", (unsigned long)cnt);
+            *static_cast<LBA_t*>(buff) = cnt;
+        }
         return RES_OK;
 
     case GET_SECTOR_SIZE:

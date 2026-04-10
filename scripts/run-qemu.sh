@@ -100,6 +100,17 @@ echo "Starting QEMU..."
 echo "  OVMF: ${OVMF_CODE}"
 echo "  ESP:  ${BUILD_DIR}/esp"
 
+# Check for --debug flag: adds QEMU GDB stub on port 1234.
+DEBUG_FLAGS=""
+for arg in "$@"; do
+    if [ "$arg" = "--debug" ]; then
+        DEBUG_FLAGS="-s"
+        echo "  GDB:  listening on localhost:1234 (run scripts/gdb-kernel.sh in another terminal)"
+        shift
+        break
+    fi
+done
+
 # Create/update virtio-blk test disk image (includes .mod files from build/kernel/drivers/).
 DISK_IMG="${BUILD_DIR}/brook_disk.img"
 python3 "${SCRIPT_DIR}/make_disk_image.py" "${BUILD_DIR}"
@@ -115,4 +126,5 @@ qemu-system-x86_64 \
     -serial stdio \
     -display gtk \
     -monitor none \
+    ${DEBUG_FLAGS} \
     "$@"

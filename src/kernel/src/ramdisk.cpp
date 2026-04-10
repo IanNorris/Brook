@@ -4,14 +4,6 @@
 
 namespace brook {
 
-// ---- Private state ----
-
-struct RamdiskPriv {
-    uint8_t*  data;
-    uint64_t  size;       // total bytes
-    uint32_t  blockSize;
-};
-
 // ---- DeviceOps implementation ----
 
 static int RamdiskRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
