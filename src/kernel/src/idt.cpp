@@ -71,12 +71,50 @@ static void ExcPutHex(uint64_t v)
     }
 }
 
+// Frame-pointer-based stack walk.  RBP chain: [RBP] → saved_RBP, [RBP+8] → return_RIP.
+struct StackFrame {
+    StackFrame* rbp;
+    uint64_t    rip;
+};
+
+static void ExcStackWalk(uint64_t rbp, int maxFrames)
+{
+    brook::SerialPuts("  --- stack trace ---\n");
+    auto* fp = reinterpret_cast<StackFrame*>(rbp);
+    StackFrame* prev = nullptr;
+
+    for (int i = 0; i < maxFrames; ++i)
+    {
+        if (fp == nullptr || fp == prev || fp->rip == 0)
+            break;
+
+        // Basic sanity: the frame pointer should be in a plausible kernel range.
+        auto addr = reinterpret_cast<uint64_t>(fp);
+        if (addr < 0xFFFF800000000000ULL && addr > 0x100000000ULL)
+            break;  // not a valid kernel-space pointer
+
+        brook::SerialPuts("  #");
+        brook::SerialPutChar(static_cast<char>('0' + (i / 10) % 10));
+        brook::SerialPutChar(static_cast<char>('0' + i % 10));
+        brook::SerialPuts("  ");
+        ExcPutHex(fp->rip);
+        brook::SerialPuts("\n");
+
+        prev = fp;
+        fp = fp->rbp;
+    }
+    brook::SerialPuts("  --- end trace ---\n");
+}
+
 static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t errorCode, bool hasErrorCode)
 {
     __asm__ volatile("cli");
 
     uint64_t cr2 = 0;
     __asm__ volatile("movq %%cr2, %0" : "=r"(cr2));
+
+    uint64_t rbp = 0;
+    __asm__ volatile("movq %%rbp, %0" : "=r"(rbp));
 
     const char* name = (vector < 32) ? g_excNames[vector] : "Unknown";
 
@@ -110,6 +148,12 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
         }
         brook::SerialPuts("\n");
     }
+
+    // Walk the frame-pointer chain from the exception context.
+    // For interrupt handlers, RBP in the handler frame points back through
+    // the interrupted code's frame chain.
+    ExcStackWalk(rbp, 32);
+
     brook::SerialPuts("=== HALTED ===\n");
 
     // Halt here — KernelPanic's va_list formatting is unreliable with
