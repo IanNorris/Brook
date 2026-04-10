@@ -110,6 +110,7 @@ add_executable(kernel
     src/fatfs_glue.cpp
     src/gdt.cpp
     src/idt.cpp
+    src/input.cpp
     src/keyboard.cpp
     src/kprintf.cpp
     src/ksymtab.cpp

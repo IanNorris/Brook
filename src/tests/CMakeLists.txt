@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(brook-tests CXX)
+project(brook-tests C CXX)
 
 if(NOT DEFINED BROOK_ROOT)
     set(BROOK_ROOT "${CMAKE_SOURCE_DIR}/../..")
@@ -55,5 +55,33 @@ add_brook_test(test_heap
 )
 
 add_brook_test(test_string)
+
+add_brook_test(test_device_registry
+    "${BROOK_ROOT}/src/kernel/src/device.cpp"
+)
+
+add_brook_test(test_vfs
+    "${BROOK_ROOT}/src/kernel/src/vfs.cpp"
+    "${BROOK_ROOT}/src/kernel/src/fatfs_glue.cpp"
+    "${BROOK_ROOT}/src/kernel/src/device.cpp"
+    "${BROOK_ROOT}/src/kernel/src/ramdisk.cpp"
+    "${BROOK_ROOT}/src/kernel/src/heap.cpp"
+    "${BROOK_ROOT}/src/kernel/src/pmm.cpp"
+    "${BROOK_ROOT}/src/kernel/src/vmm.cpp"
+)
+target_include_directories(test_vfs PRIVATE
+    "${BROOK_ROOT}/src/third_party/fatfs/source"
+)
+target_sources(test_vfs PRIVATE
+    "${BROOK_ROOT}/src/third_party/fatfs/source/ff.c"
+    "${BROOK_ROOT}/src/third_party/fatfs/source/ffunicode.c"
+)
+set_source_files_properties(
+    "${BROOK_ROOT}/src/third_party/fatfs/source/ff.c"
+    "${BROOK_ROOT}/src/third_party/fatfs/source/ffunicode.c"
+    TARGET_DIRECTORY test_vfs
+    PROPERTIES COMPILE_OPTIONS
+        "-Wno-unused-parameter;-Wno-unused-function;-Wno-sign-compare;-Wno-implicit-fallthrough"
+)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "" FORCE)

@@ -21,6 +21,7 @@ extern "C" brook::KernelSymbol __stop_ksymtab[];
 #include "pci.h"
 #include "virtio_blk.h"
 #include "keyboard.h"
+#include "input.h"
 
 // Bring all brook:: names into scope so EXPORT_SYMBOL(fn) resolves correctly.
 using namespace brook;
@@ -76,6 +77,13 @@ EXPORT_SYMBOL(KbdInit);
 EXPORT_SYMBOL(KbdGetChar);
 EXPORT_SYMBOL(KbdPeekChar);
 EXPORT_SYMBOL(KbdIsAvailable);
+
+// Input subsystem
+EXPORT_SYMBOL(InputInit);
+EXPORT_SYMBOL(InputRegister);
+EXPORT_SYMBOL(InputPollEvent);
+EXPORT_SYMBOL(InputWaitEvent);
+EXPORT_SYMBOL(InputHasEvents);
 
 // Panic
 EXPORT_SYMBOL(KernelPanic);

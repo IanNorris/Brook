@@ -275,6 +275,8 @@ bool VfsUnmount(const char* mountPoint)
 
 Vnode* VfsOpen(const char* path, int flags)
 {
+    if (!path || !path[0]) return nullptr;
+
     const char* relPath = nullptr;
     MountEntry* mount   = FindMount(path, &relPath);
     if (!mount)
