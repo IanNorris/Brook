@@ -15,6 +15,8 @@ static constexpr uint8_t  ELFMAG3       = 'F';
 static constexpr uint8_t  ELFCLASS64    = 2;    // 64-bit
 static constexpr uint8_t  ELFDATA2LSB   = 1;    // little-endian
 static constexpr uint8_t  ET_REL        = 1;    // relocatable object
+static constexpr uint16_t ET_EXEC       = 2;    // executable
+static constexpr uint16_t ET_DYN        = 3;    // shared object / PIE
 static constexpr uint16_t EM_X86_64     = 62;
 
 // ---- ELF header ----
@@ -103,3 +105,39 @@ static constexpr uint32_t R_X86_64_PLT32   = 4;  // L + A - P        (treated sa
 static constexpr uint32_t R_X86_64_32      = 10; // S + A            (32-bit zero-extended)
 static constexpr uint32_t R_X86_64_32S     = 11; // S + A            (32-bit sign-extended)
 static constexpr uint32_t R_X86_64_PC64    = 24; // S + A - P        (64-bit PC-relative)
+
+// Additional relocation types for ET_EXEC/ET_DYN loading
+static constexpr uint32_t R_X86_64_GLOB_DAT   = 6;   // S             (GOT data)
+static constexpr uint32_t R_X86_64_JUMP_SLOT  = 7;   // S             (PLT slot)
+static constexpr uint32_t R_X86_64_RELATIVE   = 8;   // B + A         (base-relative)
+static constexpr uint32_t R_X86_64_TPOFF64    = 18;  // S             (TLS offset)
+static constexpr uint32_t R_X86_64_IRELATIVE  = 37;  // indirect(B+A) (ifunc)
+
+// ---- Program header ----
+
+static constexpr uint32_t PT_NULL    = 0;
+static constexpr uint32_t PT_LOAD    = 1;    // Loadable segment
+static constexpr uint32_t PT_DYNAMIC = 2;    // Dynamic linking info
+static constexpr uint32_t PT_INTERP  = 3;    // Interpreter path
+static constexpr uint32_t PT_NOTE    = 4;    // Auxiliary info
+static constexpr uint32_t PT_PHDR    = 6;    // Program header table
+static constexpr uint32_t PT_TLS     = 7;    // Thread-local storage template
+static constexpr uint32_t PT_GNU_EH_FRAME = 0x6474E550;
+static constexpr uint32_t PT_GNU_STACK    = 0x6474E551;
+static constexpr uint32_t PT_GNU_RELRO    = 0x6474E552;
+
+// Program header flags
+static constexpr uint32_t PF_X = 0x1;   // Execute
+static constexpr uint32_t PF_W = 0x2;   // Write
+static constexpr uint32_t PF_R = 0x4;   // Read
+
+struct Elf64_Phdr {
+    uint32_t p_type;      // Segment type
+    uint32_t p_flags;     // Segment flags
+    uint64_t p_offset;    // Offset in file
+    uint64_t p_vaddr;     // Virtual address
+    uint64_t p_paddr;     // Physical address (usually ignored)
+    uint64_t p_filesz;    // Size in file
+    uint64_t p_memsz;     // Size in memory (>= p_filesz, difference is BSS)
+    uint64_t p_align;     // Alignment
+};

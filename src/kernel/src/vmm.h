@@ -20,7 +20,9 @@ namespace brook {
 // range, so user-mode null dereferences always fault.
 
 // Virtual addresses below this are permanently reserved (null pointer guard).
-static constexpr uint64_t VIRTUAL_NULL_GUARD = 1ULL << 30; // 1GB
+// 64KB is enough to catch null dereferences while allowing ELF user binaries
+// loaded at the standard 0x400000 (4MB) base address.
+static constexpr uint64_t VIRTUAL_NULL_GUARD = 64 * 1024; // 64KB
 
 // Page flag bits (match x86-64 PTE format).
 static constexpr uint64_t VMM_PRESENT   = (1ULL << 0);

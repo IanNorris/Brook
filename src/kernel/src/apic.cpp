@@ -163,13 +163,15 @@ static void SoftEnableLapic()
 // LAPIC timer spurious ISR — just send EOI.
 // ---------------------------------------------------------------------------
 
-static volatile uint64_t g_timerTicks = 0;
+// Global tick counter (incremented every ~1ms by LAPIC timer).
+// Used by syscall timing (clock_gettime, nanosleep).
+uint64_t g_lapicTickCount = 0;
 
 __attribute__((interrupt))
 static void LapicTimerHandler(InterruptFrame* frame)
 {
     (void)frame;
-    g_timerTicks++;
+    g_lapicTickCount++;
     LapicWrite(LapicReg::EOI, 0);
 }
 

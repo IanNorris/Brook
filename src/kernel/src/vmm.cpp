@@ -115,8 +115,37 @@ static uint64_t* WalkToPtr(uint64_t virtAddr, bool create, uint64_t flags = 0)
             : nullptr;
     if (!pd) return nullptr;
 
-    // Guard: PS bit set means this is a 2MB page — don't descend further.
-    if (pd[PdIndex(virtAddr)] & (1ULL << 7)) return nullptr;
+    // If PD entry has PS bit set, it's a 2MB page. Split it into 4KB pages
+    // so we can map individual pages within this range.
+    if (pd[PdIndex(virtAddr)] & (1ULL << 7))
+    {
+        if (!create) return nullptr;
+
+        uint64_t oldEntry = pd[PdIndex(virtAddr)];
+        uint64_t hugeBase = oldEntry & PHYS_MASK; // 2MB-aligned physical base
+        uint64_t oldFlags = oldEntry & ~PHYS_MASK & ~(1ULL << 7); // remove PS bit
+
+        uint64_t ptPhys = AllocTablePage();
+        if (ptPhys == 0) return nullptr;
+        ZeroPage(ptPhys);
+
+        // Fill 512 PTE entries to preserve the existing 2MB identity mapping
+        uint64_t* pt = reinterpret_cast<uint64_t*>(ptPhys);
+        for (uint64_t i = 0; i < 512; ++i)
+            pt[i] = (hugeBase + i * 4096) | (oldFlags & ~(1ULL << 7)) | VMM_PRESENT;
+
+        // Replace PD entry (remove PS, point to new page table)
+        pd[PdIndex(virtAddr)] = ptPhys | VMM_PRESENT | VMM_WRITABLE
+                                | (oldFlags & VMM_USER)
+                                | (flags & VMM_USER);
+
+        // Flush all TLB entries in this 2MB range
+        uint64_t base2M = (virtAddr >> 21) << 21;
+        for (uint64_t i = 0; i < 512; ++i)
+            Invlpg(base2M + i * 4096);
+
+        return &pt[PtIndex(virtAddr)];
+    }
 
     uint64_t* pt = create
         ? GetOrAllocEntry(pd, PdIndex(virtAddr), flags)
@@ -141,7 +170,7 @@ void VmmInit()
 bool VmmMapPage(uint64_t virtAddr, uint64_t physAddr, uint64_t flags,
                 MemTag tag, uint16_t pid)
 {
-    // Enforce null pointer guard: reject any mapping in the first 1GB.
+    // Enforce null pointer guard: reject any mapping below 64KB.
     if (virtAddr < VIRTUAL_NULL_GUARD)
     {
         SerialPrintf("VMM: rejected mapping at 0x%p (below null guard)\n",

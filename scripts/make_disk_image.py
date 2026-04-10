@@ -80,6 +80,18 @@ def main():
         else:
             print(f"  No .mod files found in {mod_dir} (run build first)")
 
+        # BIN/ — copy any user-mode test binaries
+        bin_names = ["hello_test", "hello_musl"]
+        has_bins = any(os.path.exists(os.path.join(build_dir, n)) for n in bin_names)
+        if has_bins:
+            run(["mmd", "-i", img_path, "::BIN"])
+            for name in bin_names:
+                bin_path = os.path.join(build_dir, name)
+                if os.path.exists(bin_path):
+                    dest_name = name.upper()
+                    run(["mcopy", "-i", img_path, bin_path, f"::BIN/{dest_name}"])
+                    print(f"  Added binary: BIN/{dest_name} ({os.path.getsize(bin_path)} bytes)")
+
     print(f"Disk image written to {img_path}")
 
 if __name__ == "__main__":

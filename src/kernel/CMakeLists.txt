@@ -122,6 +122,8 @@ add_executable(kernel
     src/pci.cpp
     src/ramdisk.cpp
     src/syscall.cpp
+    src/process.cpp
+    src/elf_loader.cpp
     src/vfs.cpp
     src/virtio_blk.cpp
     src/vmm.cpp
@@ -135,6 +137,7 @@ add_executable(kernel
     # FatFS (C source — compiled as part of the kernel)
     "${BROOK_ROOT}/src/third_party/fatfs/source/ff.c"
     "${BROOK_ROOT}/src/third_party/fatfs/source/ffsystem.c"
+    "${BROOK_ROOT}/src/third_party/fatfs/source/ffunicode.c"
     # Nayuki QR Code Generator (C source)
     "${BROOK_ROOT}/src/third_party/qrcodegen/qrcodegen.c"
 )
@@ -174,9 +177,10 @@ set_source_files_properties(
 set_source_files_properties(
     "${BROOK_ROOT}/src/third_party/fatfs/source/ff.c"
     "${BROOK_ROOT}/src/third_party/fatfs/source/ffsystem.c"
+    "${BROOK_ROOT}/src/third_party/fatfs/source/ffunicode.c"
     "${BROOK_ROOT}/src/third_party/qrcodegen/qrcodegen.c"
     PROPERTIES COMPILE_OPTIONS
-        "-Wno-unused-parameter;-Wno-unused-function;-Wno-sign-compare;-Wno-implicit-fallthrough"
+        "-Wno-unused-parameter;-Wno-unused-function;-Wno-sign-compare;-Wno-implicit-fallthrough;-Wno-unused-variable"
 )
 
 set_target_properties(kernel PROPERTIES
