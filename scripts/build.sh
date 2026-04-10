@@ -18,6 +18,19 @@ fi
 
 mkdir -p "${BUILD_DIR}"
 
+# If the cache was built from a different source directory (e.g. different
+# machine or workspace), wipe it so CMake doesn't error out.
+CACHE_FILE="${BUILD_DIR}/CMakeCache.txt"
+if [ -f "${CACHE_FILE}" ]; then
+    CACHED_SRC=$(grep "^CMAKE_HOME_DIRECTORY" "${CACHE_FILE}" 2>/dev/null | cut -d= -f2)
+    if [ -n "${CACHED_SRC}" ] && [ "${CACHED_SRC}" != "${ROOT_DIR}" ]; then
+        echo "CMake cache path mismatch (cached: ${CACHED_SRC}, current: ${ROOT_DIR})"
+        echo "Wiping build directory..."
+        rm -rf "${BUILD_DIR}"
+        mkdir -p "${BUILD_DIR}"
+    fi
+fi
+
 echo "Configuring..."
 cmake \
     -S "${ROOT_DIR}" \
