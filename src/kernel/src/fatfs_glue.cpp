@@ -62,7 +62,12 @@ DRESULT disk_read(BYTE pdrv, BYTE* buff, LBA_t sector, UINT count)
     uint64_t offset = static_cast<uint64_t>(sector) * SECTOR_SIZE;
     uint64_t len    = static_cast<uint64_t>(count)  * SECTOR_SIZE;
 
+    brook::SerialPrintf("disk_read: dev=%p ops=%p read=%p off=%lu len=%lu\n",
+                        (void*)dev, (void*)dev->ops,
+                        (void*)dev->ops->read,
+                        (unsigned long)offset, (unsigned long)len);
     int ret = dev->ops->read(dev, offset, buff, len);
+    brook::SerialPrintf("disk_read: ret=%d\n", ret);
     return (ret == static_cast<int>(len)) ? RES_OK : RES_ERROR;
 }
 
