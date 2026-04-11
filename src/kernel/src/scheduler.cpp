@@ -202,9 +202,23 @@ void SchedulerInit()
 }
 
 // Trampoline for processes that haven't run yet.
+// Because context_switch jumps here instead of returning to DoSwitch,
+// we must manually drain the pending requeue that DoSwitch set up.
 static void ProcessTrampoline()
 {
     uint32_t cpu = ThisCpu();
+
+    // Drain the per-CPU requeue set by DoSwitch before context_switch.
+    Process* toRequeue = g_perCpu[cpu].pendingRequeue;
+    g_perCpu[cpu].pendingRequeue = nullptr;
+    if (toRequeue)
+    {
+        uint64_t rlf = SchedLockAcquire(g_readyLock);
+        if (toRequeue->state == ProcessState::Ready)
+            ReadyQueueInsertLocked(toRequeue);
+        SchedLockRelease(g_readyLock, rlf);
+    }
+
     Process* proc = g_perCpu[cpu].currentProcess;
     SerialPrintf("SCHED: CPU%u entering user mode for '%s' (pid %u)\n",
                  cpu, proc->name, proc->pid);

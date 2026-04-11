@@ -3,12 +3,41 @@
 # Commands: run, set, wait, help, ls, ps, mem, clear, shutdown, reboot
 # Programs are searched in /boot/BIN/, /boot/, and by absolute path.
 
-# Configure layout: 2x2, scale factor 2
-set grid 2x2
-set scale 2
+# Configure layout: 8x4 grid, scale 4 => 160x100 cells => 1280x400
+# DOOM binary compiled with 640x400 internal res, so VFB must match.
+set grid 8x4
+set scale 4
 set vfb 640x400
 
-# Launch 4 DOOM instances
+# Launch 32 DOOM instances
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
 run doom -iwad /boot/DOOM1.WAD
 run doom -iwad /boot/DOOM1.WAD
 run doom -iwad /boot/DOOM1.WAD
