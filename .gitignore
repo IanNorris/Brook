@@ -25,6 +25,7 @@ compile_commands.json
 
 # QEMU runtime files
 OVMF_VARS.fd
+brook_disk.img
 
 # VS Code
 .vscode/settings.json

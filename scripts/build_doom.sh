@@ -8,7 +8,8 @@ BUILD_DIR="/workspace/brook/build/doom"
 
 mkdir -p "$BUILD_DIR"
 
-CC="musl-gcc"
+# Use musl cross-compiler from nix (pkgsCross.musl64.stdenv.cc)
+CC="${MUSL_CC:-x86_64-unknown-linux-musl-gcc}"
 CFLAGS="-static -Os -fno-stack-protector -std=gnu11 -DNORMALUNIX -DBROOK -D_DEFAULT_SOURCE -Wall -Wno-unused-result"
 
 # All DOOM source files (from the original Makefile, minus the Enkel platform file)

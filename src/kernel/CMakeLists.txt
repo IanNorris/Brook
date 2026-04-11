@@ -100,6 +100,28 @@ add_custom_command(
 )
 
 # ---------------------------------------------------------------------------
+# FatFS build-directory copy
+# ---------------------------------------------------------------------------
+# FatFS ff.c uses #include "ffconf.h" which always finds the co-located file.
+# To override settings without modifying the submodule, we copy the FatFS
+# sources into the build tree and overlay our custom ffconf.h.
+
+set(FATFS_SRC_DIR "${BROOK_ROOT}/src/third_party/fatfs/source")
+set(FATFS_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/fatfs")
+
+file(MAKE_DIRECTORY "${FATFS_BUILD_DIR}")
+file(COPY
+    "${FATFS_SRC_DIR}/ff.c"
+    "${FATFS_SRC_DIR}/ff.h"
+    "${FATFS_SRC_DIR}/ffsystem.c"
+    "${FATFS_SRC_DIR}/ffunicode.c"
+    "${FATFS_SRC_DIR}/diskio.h"
+    DESTINATION "${FATFS_BUILD_DIR}"
+)
+# Overlay our custom config (LFN=1, VOLUMES=4, etc.)
+file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/src/ffconf.h" DESTINATION "${FATFS_BUILD_DIR}")
+
+# ---------------------------------------------------------------------------
 # Kernel executable
 # ---------------------------------------------------------------------------
 
@@ -136,20 +158,21 @@ add_executable(kernel
     "${FONT_ATLAS_CPP}"
     "${FAT_IMAGE_CPP}"
     "${BROOK_ROOT}/src/shared/src_km/serial.cpp"
-    # FatFS (C source — compiled as part of the kernel)
-    "${BROOK_ROOT}/src/third_party/fatfs/source/ff.c"
-    "${BROOK_ROOT}/src/third_party/fatfs/source/ffsystem.c"
-    "${BROOK_ROOT}/src/third_party/fatfs/source/ffunicode.c"
+    # FatFS (C source — compiled from a build-dir copy so our ffconf.h overlay
+    # is found naturally by #include "ffconf.h" in ff.c / ff.h).
+    "${FATFS_BUILD_DIR}/ff.c"
+    "${FATFS_BUILD_DIR}/ffsystem.c"
+    "${FATFS_BUILD_DIR}/ffunicode.c"
     # Nayuki QR Code Generator (C source)
     "${BROOK_ROOT}/src/third_party/qrcodegen/qrcodegen.c"
 )
 
 target_include_directories(kernel PRIVATE
     ${SHARED_INCLUDE_DIRS}
-    "${CMAKE_CURRENT_SOURCE_DIR}/src"      # kernel src (ffconf.h here shadows submodule's)
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"      # kernel src
     "${CMAKE_CURRENT_SOURCE_DIR}/src/memory" # memory subsystem headers
     "${CMAKE_CURRENT_BINARY_DIR}"          # for the generated font_atlas.cpp
-    "${BROOK_ROOT}/src/third_party/fatfs/source"  # ff.h, diskio.h
+    "${FATFS_BUILD_DIR}"                  # ff.h, diskio.h, our ffconf.h overlay
     "${BROOK_ROOT}/src/third_party/qrcodegen"    # qrcodegen.h
 )
 
@@ -178,9 +201,9 @@ set_source_files_properties(
 
 # FatFS is third-party C code — suppress extra warnings that would fail -Werror.
 set_source_files_properties(
-    "${BROOK_ROOT}/src/third_party/fatfs/source/ff.c"
-    "${BROOK_ROOT}/src/third_party/fatfs/source/ffsystem.c"
-    "${BROOK_ROOT}/src/third_party/fatfs/source/ffunicode.c"
+    "${FATFS_BUILD_DIR}/ff.c"
+    "${FATFS_BUILD_DIR}/ffsystem.c"
+    "${FATFS_BUILD_DIR}/ffunicode.c"
     "${BROOK_ROOT}/src/third_party/qrcodegen/qrcodegen.c"
     PROPERTIES COMPILE_OPTIONS
         "-Wno-unused-parameter;-Wno-unused-function;-Wno-sign-compare;-Wno-implicit-fallthrough;-Wno-unused-variable"

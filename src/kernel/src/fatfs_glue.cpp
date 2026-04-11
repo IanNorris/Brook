@@ -87,8 +87,6 @@ DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void* buff)
     brook::Device* dev = brook::g_fatfsDrives[pdrv];
     if (!dev) return RES_NOTRDY;
 
-    brook::SerialPrintf("disk_ioctl: pdrv=%u cmd=%u\n", (unsigned)pdrv, (unsigned)cmd);
-
     switch (cmd)
     {
     case CTRL_SYNC:
@@ -96,18 +94,17 @@ DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void* buff)
 
     case GET_SECTOR_COUNT:
         {
-            auto* p = static_cast<brook::RamdiskPriv*>(dev->priv);
-            LBA_t cnt = p ? static_cast<LBA_t>(p->size / 512u) : 0;
-            *static_cast<LBA_t*>(buff) = cnt;
+            uint64_t sectors = brook::DeviceBlockCount(dev);
+            *static_cast<LBA_t*>(buff) = static_cast<LBA_t>(sectors);
         }
         return RES_OK;
 
     case GET_SECTOR_SIZE:
-        *static_cast<WORD*>(buff) = 512;  // FF_MIN_SS == FF_MAX_SS == 512
+        *static_cast<WORD*>(buff) = static_cast<WORD>(brook::DeviceBlockSize(dev));
         return RES_OK;
 
     case GET_BLOCK_SIZE:
-        *static_cast<DWORD*>(buff) = 1; // erase block = 1 sector for ramdisk
+        *static_cast<DWORD*>(buff) = 1; // erase block = 1 sector
         return RES_OK;
 
     default:

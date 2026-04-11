@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# Sync build artifacts and user content into the persistent Brook disk image.
+#
+# This uses mcopy's overwrite mode to update files that have changed,
+# similar to a one-way rsync. It's safe to run repeatedly.
+#
+# Usage:
+#   scripts/update_disk.sh [--create]   # --create will auto-create if missing
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+DISK_IMG="${BROOK_DISK_IMG:-${ROOT_DIR}/brook_disk.img}"
+
+AUTO_CREATE=0
+for arg in "$@"; do
+    [ "$arg" = "--create" ] && AUTO_CREATE=1
+done
+
+if [ ! -f "${DISK_IMG}" ]; then
+    if [ "${AUTO_CREATE}" -eq 1 ]; then
+        "${SCRIPT_DIR}/create_disk.sh"
+    else
+        echo "Disk image not found at ${DISK_IMG}"
+        echo "Run: scripts/create_disk.sh"
+        exit 1
+    fi
+fi
+
+# mcopy -o = overwrite existing files without prompting
+# mcopy -n = no overwrite (skip existing) — we use -o for sync semantics
+
+sync_file() {
+    local src="$1"
+    local dest="$2"
+    if [ -f "$src" ]; then
+        mcopy -o -i "${DISK_IMG}" "$src" "::${dest}"
+        echo "  synced: ${dest} ($(stat -c%s "$src") bytes)"
+    fi
+}
+
+sync_dir_contents() {
+    local src_dir="$1"
+    local dest_dir="$2"
+    local pattern="${3:-*}"
+
+    if [ ! -d "$src_dir" ]; then
+        return
+    fi
+
+    # Ensure destination directory exists (mmd returns non-zero if it already exists)
+    mmd -D s -i "${DISK_IMG}" "::${dest_dir}" 2>/dev/null || true
+
+    for f in "${src_dir}"/${pattern}; do
+        [ -f "$f" ] || continue
+        local name
+        name="$(basename "$f" | tr '[:lower:]' '[:upper:]')"
+        mcopy -o -i "${DISK_IMG}" "$f" "::${dest_dir}/${name}"
+        echo "  synced: ${dest_dir}/${name} ($(stat -c%s "$f") bytes)"
+    done
+}
+
+echo "Updating disk image: ${DISK_IMG}"
+
+# --- Driver modules (from most recent build) ---
+# Check debug first, then release
+for build_type in debug release; do
+    mod_dir="${ROOT_DIR}/build/${build_type}/kernel/drivers"
+    if [ -d "$mod_dir" ] && ls "$mod_dir"/*.mod &>/dev/null; then
+        echo "Drivers (from ${build_type} build):"
+        sync_dir_contents "$mod_dir" "DRIVERS" "*.mod"
+        break
+    fi
+done
+
+# --- User binaries ---
+echo "User binaries:"
+# Check build/*/user/ directories
+for build_type in debug release; do
+    user_dir="${ROOT_DIR}/build/${build_type}/user"
+    if [ -d "$user_dir" ]; then
+        mmd -D s -i "${DISK_IMG}" "::BIN" 2>/dev/null || true
+        sync_dir_contents "$user_dir" "BIN"
+        break
+    fi
+done
+
+# --- DOOM binary ---
+doom_bin="${ROOT_DIR}/build/doom/doom"
+if [ -f "$doom_bin" ]; then
+    echo "DOOM:"
+    sync_file "$doom_bin" "DOOM"
+fi
+
+# --- DOOM WAD (check workspace root) ---
+for wad_path in "${ROOT_DIR}/doom1.wad" "/workspace/doom1.wad"; do
+    if [ -f "$wad_path" ]; then
+        echo "DOOM WAD:"
+        sync_file "$wad_path" "DOOM1.WAD"
+        break
+    fi
+done
+
+# --- Static binaries from nix (busybox etc.) ---
+# These are added manually once; this section just reports what's present.
+
+echo ""
+echo "Current disk contents:"
+mdir -i "${DISK_IMG}" :: 2>&1 | grep -v "^$"

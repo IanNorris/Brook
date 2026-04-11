@@ -123,9 +123,14 @@ if [ -n "${DEBUG_FLAGS}" ]; then
     echo "  GDB:  listening on localhost:1234 (run scripts/gdb-kernel.sh in another terminal)"
 fi
 
-# Create/update virtio-blk test disk image (includes .mod files from build/kernel/drivers/).
-DISK_IMG="${BUILD_DIR}/brook_disk.img"
-python3 "${SCRIPT_DIR}/make_disk_image.py" "${BUILD_DIR}"
+# Use persistent disk image (shared between debug/release).
+# Create it automatically on first run if missing.
+DISK_IMG="${BROOK_DISK_IMG:-${ROOT_DIR}/brook_disk.img}"
+if [ ! -f "${DISK_IMG}" ]; then
+    echo "Creating persistent disk image..."
+    "${SCRIPT_DIR}/create_disk.sh"
+    "${SCRIPT_DIR}/update_disk.sh"
+fi
 
 qemu-system-x86_64 \
     -machine q35 \

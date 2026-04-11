@@ -61,6 +61,20 @@ add_brook_test(test_device_registry
     "${BROOK_ROOT}/src/kernel/src/device.cpp"
 )
 
+# FatFS build-directory copy for tests (same approach as kernel — see kernel CMakeLists)
+set(FATFS_SRC_DIR "${BROOK_ROOT}/src/third_party/fatfs/source")
+set(FATFS_TEST_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/fatfs")
+file(MAKE_DIRECTORY "${FATFS_TEST_BUILD_DIR}")
+file(COPY
+    "${FATFS_SRC_DIR}/ff.c"
+    "${FATFS_SRC_DIR}/ff.h"
+    "${FATFS_SRC_DIR}/ffsystem.c"
+    "${FATFS_SRC_DIR}/ffunicode.c"
+    "${FATFS_SRC_DIR}/diskio.h"
+    DESTINATION "${FATFS_TEST_BUILD_DIR}"
+)
+file(COPY "${BROOK_ROOT}/src/kernel/src/ffconf.h" DESTINATION "${FATFS_TEST_BUILD_DIR}")
+
 add_brook_test(test_vfs
     "${BROOK_ROOT}/src/kernel/src/vfs.cpp"
     "${BROOK_ROOT}/src/kernel/src/fatfs_glue.cpp"
@@ -71,15 +85,15 @@ add_brook_test(test_vfs
     "${BROOK_ROOT}/src/kernel/src/memory/virtual_memory.cpp"
 )
 target_include_directories(test_vfs PRIVATE
-    "${BROOK_ROOT}/src/third_party/fatfs/source"
+    "${FATFS_TEST_BUILD_DIR}"
 )
 target_sources(test_vfs PRIVATE
-    "${BROOK_ROOT}/src/third_party/fatfs/source/ff.c"
-    "${BROOK_ROOT}/src/third_party/fatfs/source/ffunicode.c"
+    "${FATFS_TEST_BUILD_DIR}/ff.c"
+    "${FATFS_TEST_BUILD_DIR}/ffunicode.c"
 )
 set_source_files_properties(
-    "${BROOK_ROOT}/src/third_party/fatfs/source/ff.c"
-    "${BROOK_ROOT}/src/third_party/fatfs/source/ffunicode.c"
+    "${FATFS_TEST_BUILD_DIR}/ff.c"
+    "${FATFS_TEST_BUILD_DIR}/ffunicode.c"
     TARGET_DIRECTORY test_vfs
     PROPERTIES COMPILE_OPTIONS
         "-Wno-unused-parameter;-Wno-unused-function;-Wno-sign-compare;-Wno-implicit-fallthrough;-Wno-unused-variable"
