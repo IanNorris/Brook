@@ -173,10 +173,10 @@ void SchedulerTimerTick();
 // Forward-declare compositor tick (defined in compositor.cpp).
 void CompositorTick();
 
-__attribute__((interrupt))
-static void LapicTimerHandler(InterruptFrame* frame)
+// C handler called from the naked ISR wrapper below.
+// This is a regular function — NOT __attribute__((interrupt)).
+static void LapicTimerHandlerInner()
 {
-    (void)frame;
     g_lapicTickCount++;
     LapicWrite(LapicReg::EOI, 0);
 
@@ -185,6 +185,59 @@ static void LapicTimerHandler(InterruptFrame* frame)
 
     // Drive the scheduler — checks timeslice expiry and blocked wakeups.
     SchedulerTimerTick();
+}
+
+// Naked ISR entry for LAPIC timer (vector 32).
+// Performs swapgs when entering from ring 3 so that gs-relative kernel data
+// (KernelCpuEnv at gs:0) is accessible throughout the handler.
+__attribute__((naked))
+static void LapicTimerHandler(void)
+{
+    __asm__ volatile(
+        // If interrupted from ring 3, CS (at RSP+8) has CPL bits set.
+        "testq $3, 8(%%rsp)\n\t"
+        "jz 1f\n\t"
+        "swapgs\n\t"
+        "1:\n\t"
+
+        // Save all caller-saved GPRs (callee-saved are preserved by C ABI).
+        "push %%rax\n\t"
+        "push %%rcx\n\t"
+        "push %%rdx\n\t"
+        "push %%rsi\n\t"
+        "push %%rdi\n\t"
+        "push %%r8\n\t"
+        "push %%r9\n\t"
+        "push %%r10\n\t"
+        "push %%r11\n\t"
+
+        // Align stack to 16 bytes (9 pushes = 72 bytes + 5 CPU-pushed = 40 → 112)
+        // 112 is already 16-byte aligned, so no adjustment needed.
+
+        "cld\n\t"
+        "call %P0\n\t"
+
+        // Restore GPRs
+        "pop %%r11\n\t"
+        "pop %%r10\n\t"
+        "pop %%r9\n\t"
+        "pop %%r8\n\t"
+        "pop %%rdi\n\t"
+        "pop %%rsi\n\t"
+        "pop %%rdx\n\t"
+        "pop %%rcx\n\t"
+        "pop %%rax\n\t"
+
+        // If returning to ring 3, swap gs back.
+        "testq $3, 8(%%rsp)\n\t"
+        "jz 2f\n\t"
+        "swapgs\n\t"
+        "2:\n\t"
+        "iretq\n\t"
+        :
+        : "i"(LapicTimerHandlerInner)
+        : "memory"
+    );
 }
 
 // ---------------------------------------------------------------------------

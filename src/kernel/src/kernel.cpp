@@ -30,7 +30,8 @@
 __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootProtocol);
 
 // Global kernel CPU environment (needed to set syscall table after init).
-static KernelCpuEnv* g_kernelEnv = nullptr;
+// Non-static so the scheduler can update syscallStack on context switch.
+KernelCpuEnv* g_kernelEnv = nullptr;
 
 // Kernel entry point. Called by the bootloader via SysV ABI (argument in RDI).
 // Immediately switches to a dedicated kernel stack, then tail-calls KernelMainBody.

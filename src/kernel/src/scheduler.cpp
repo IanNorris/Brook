@@ -1,5 +1,6 @@
 #include "scheduler.h"
 #include "process.h"
+#include "cpu.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "memory/heap.h"
@@ -25,12 +26,16 @@ namespace brook {
 // Helpers
 // ---------------------------------------------------------------------------
 
-// Update gs:8 (per-CPU syscall stack pointer) to the given process's kernel
-// stack top. This ensures each process uses its own kernel stack for syscalls
-// and ring3→ring0 interrupt transitions.
+// Update the per-CPU syscall stack pointer so each process uses its own kernel
+// stack for syscalls. We write to KernelCpuEnv directly (not via gs:8) because
+// the timer ISR can fire from user mode where gs hasn't been swapped to kernel.
+// The SYSCALL entry path reads gs:8 after swapgs, so it sees the updated value.
+extern "C" KernelCpuEnv* g_kernelEnv;
+
 static inline void SetSyscallStack(uint64_t stackTop)
 {
-    __asm__ volatile("movq %0, %%gs:8" : : "r"(stackTop) : "memory");
+    if (g_kernelEnv)
+        g_kernelEnv->syscallStack = stackTop;
 }
 
 // ---------------------------------------------------------------------------
@@ -226,14 +231,14 @@ uint32_t SchedulerReadyCount()
 // Context switch logic
 // ---------------------------------------------------------------------------
 
-// Pick the next process to run. Returns idle if queue is empty.
+// Pick the next process to run. Removes it from the ready queue.
+// Returns idle if queue is empty.
 static Process* PickNext()
 {
     if (g_readyHead)
     {
         Process* next = g_readyHead;
-        // Rotate the queue so the next call picks the following process.
-        g_readyHead = g_readyHead->schedNext;
+        ReadyQueueRemove(next);
         return next;
     }
     return g_idleProcess;
@@ -373,11 +378,10 @@ void SchedulerYield()
     if (!next || next == old)
     {
         // Nothing else to run — keep running.
+        // PickNext already removed `next` from the queue, so if
+        // next==old it was dequeued. Just restore Running state.
         if (old->state == ProcessState::Ready)
-        {
             old->state = ProcessState::Running;
-            ReadyQueueRemove(old);
-        }
         return;
     }
 
