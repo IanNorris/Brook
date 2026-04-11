@@ -4,6 +4,15 @@
 #include "memory/heap.h"
 #include "memory/physical_memory.h"
 #include "memory/virtual_memory.h"
+#include "process.h"
+
+// Scheduler stubs for KMutex — test_vfs is single-threaded so these are trivial.
+static brook::Process g_stubProcess = {};
+namespace brook {
+    Process* SchedulerCurrentProcess() { return &g_stubProcess; }
+    void SchedulerBlock(Process*) {}
+    void SchedulerUnblock(Process*) {}
+}
 
 TEST_MAIN("vfs", {
 

@@ -83,6 +83,7 @@ add_brook_test(test_vfs
     "${BROOK_ROOT}/src/kernel/src/memory/heap.cpp"
     "${BROOK_ROOT}/src/kernel/src/memory/physical_memory.cpp"
     "${BROOK_ROOT}/src/kernel/src/memory/virtual_memory.cpp"
+    "${BROOK_ROOT}/src/kernel/src/sync/kmutex.cpp"
 )
 target_include_directories(test_vfs PRIVATE
     "${FATFS_TEST_BUILD_DIR}"

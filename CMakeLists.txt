@@ -47,15 +47,5 @@ ExternalProject_Add(tests
     DEPENDS kernel
 )
 
-# Host-native tests (pthreads-based, run on the build host)
-ExternalProject_Add(host_tests
-    SOURCE_DIR  ${BROOK_ROOT}/src/tests/host
-    BINARY_DIR  ${CMAKE_BINARY_DIR}/host_tests
-    CMAKE_ARGS
-        -DCMAKE_C_COMPILER=clang
-        -DCMAKE_CXX_COMPILER=clang++
-        -DCMAKE_BUILD_TYPE=${BROOK_BUILD_TYPE}
-        -DBROOK_ROOT=${BROOK_ROOT}
-    BUILD_ALWAYS  TRUE
-    INSTALL_COMMAND ""
-)
+# Host-native tests are built separately (see scripts/build.sh).
+# They require a working host C++ compiler with pthreads support.

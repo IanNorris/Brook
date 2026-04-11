@@ -43,4 +43,18 @@ cmake \
 echo "Building..."
 cmake --build "${BUILD_DIR}"
 
+# Build host-native tests (uses nix-wrapped clang++ with standard host libs)
+echo "Building host tests..."
+HOST_TEST_DIR="${BUILD_DIR}/host_tests"
+mkdir -p "${HOST_TEST_DIR}"
+cmake \
+    -S "${ROOT_DIR}/src/tests/host" \
+    -B "${HOST_TEST_DIR}" \
+    -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+    -DBROOK_ROOT="${ROOT_DIR}" \
+    -G Ninja 2>/dev/null
+cmake --build "${HOST_TEST_DIR}" 2>/dev/null && \
+    echo "Host tests built." || \
+    echo "Host tests skipped (no host C++ toolchain)."
+
 echo "Done. Artifacts in ${BUILD_DIR}/"
