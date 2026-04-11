@@ -203,6 +203,10 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     proc->pid = SchedulerAllocPid();
     proc->state = ProcessState::Ready;
 
+    // Default working directory
+    proc->cwd[0] = '/'; proc->cwd[1] = 'b'; proc->cwd[2] = 'o';
+    proc->cwd[3] = 'o'; proc->cwd[4] = 't'; proc->cwd[5] = '\0';
+
     // Allocate per-process kernel stack (for ring 3→0 transitions).
     VirtualAddress kstackAddr = VmmAllocPages(KERNEL_STACK_PAGES,
         VMM_WRITABLE, MemTag::KernelData, proc->pid);

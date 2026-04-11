@@ -206,6 +206,22 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
 
+    // Resolve relative paths against the process's CWD.
+    char resolvedPath[256];
+    const char* lookupPath = path;
+    if (path[0] != '/' && proc->cwd[0] != '\0')
+    {
+        uint32_t ci = 0;
+        for (uint32_t j = 0; proc->cwd[j] && ci < 250; ++j)
+            resolvedPath[ci++] = proc->cwd[j];
+        if (ci > 0 && resolvedPath[ci - 1] != '/')
+            resolvedPath[ci++] = '/';
+        for (uint32_t j = 0; path[j] && ci < 254; ++j)
+            resolvedPath[ci++] = path[j];
+        resolvedPath[ci] = '\0';
+        lookupPath = resolvedPath;
+    }
+
     // Device paths
     if (StrEq(path, "/dev/fb0"))
     {
@@ -223,10 +239,10 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         return fd;
     }
 
-    Vnode* vn = VfsOpen(path, static_cast<uint32_t>(flags));
+    Vnode* vn = VfsOpen(lookupPath, static_cast<uint32_t>(flags));
     if (!vn)
     {
-        SerialPrintf("sys_open: not found: %s\n", path);
+        SerialPrintf("sys_open: not found: %s\n", lookupPath);
         return -ENOENT;
     }
 
