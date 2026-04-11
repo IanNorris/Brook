@@ -9,6 +9,7 @@
 #include "gdt.h"
 #include "serial.h"
 #include "spinlock.h"
+#include "sched_ops.h"
 
 #include <stdint.h>
 
@@ -82,8 +83,18 @@ static inline void SetSyscallStack(uint32_t cpuIdx, uint64_t stackTop)
 // Scheduler state
 // ---------------------------------------------------------------------------
 
-// Circular doubly-linked ready queue (global, shared by all CPUs).
-static Process* g_readyHead  = nullptr;
+// Default priority for new user processes (passed to policy InitProcess).
+static constexpr uint8_t SCHED_PRIORITY_NORMAL = 2;
+
+// Pluggable scheduling policy (loaded at init, called through vtable).
+static const SchedOps* g_schedOps = nullptr;
+static uint8_t g_schedStateStorage[4096] __attribute__((aligned(16)));
+static void*   g_schedState = g_schedStateStorage;
+
+// PID → Process* lookup (for converting PickNext pid back to Process*).
+static Process* g_pidToProcess[SCHED_MAX_PIDS] = {};
+
+// Global scheduler lock (interrupt-safe, protects all policy calls).
 static SchedLock g_readyLock;
 
 // All processes (for blocked-process scanning).
@@ -98,7 +109,7 @@ static uint16_t g_nextPid = 1;
 static volatile bool g_schedulerRunning = false;
 
 // ---------------------------------------------------------------------------
-// Ready queue operations (circular doubly-linked list)
+// Ready queue operations — delegate to the pluggable policy module.
 // Caller must hold g_readyLock.
 // ---------------------------------------------------------------------------
 
@@ -113,48 +124,19 @@ static void ReadyQueueInsertLocked(Process* proc)
                      proc->name, proc->pid, cpu, (int)proc->state);
         for (;;) __asm__ volatile("hlt");
     }
-    // Guard: process must not already be in the ready queue.
-    if (proc->inReadyQueue)
-    {
-        SerialPrintf("SCHED BUG: double-insert '%s' (pid %u) into ready queue! "
-                     "state=%d schedNext=%p\n",
-                     proc->name, proc->pid, (int)proc->state, (void*)proc->schedNext);
-        for (;;) __asm__ volatile("hlt");
-    }
-    proc->inReadyQueue = 1;
-
-    if (!g_readyHead)
-    {
-        proc->schedNext = proc;
-        proc->schedPrev = proc;
-        g_readyHead = proc;
-    }
-    else
-    {
-        Process* tail = g_readyHead->schedPrev;
-        proc->schedNext = g_readyHead;
-        proc->schedPrev = tail;
-        tail->schedNext = proc;
-        g_readyHead->schedPrev = proc;
-    }
+    g_schedOps->Enqueue(g_schedState, proc->pid);
 }
 
 static void ReadyQueueRemoveLocked(Process* proc)
 {
-    proc->inReadyQueue = 0;
-    if (proc->schedNext == proc)
-    {
-        g_readyHead = nullptr;
-    }
-    else
-    {
-        proc->schedPrev->schedNext = proc->schedNext;
-        proc->schedNext->schedPrev = proc->schedPrev;
-        if (g_readyHead == proc)
-            g_readyHead = proc->schedNext;
-    }
-    proc->schedNext = nullptr;
-    proc->schedPrev = nullptr;
+    g_schedOps->Remove(g_schedState, proc->pid);
+}
+
+static Process* PickNextLocked()
+{
+    uint16_t pid = g_schedOps->PickNext(g_schedState);
+    if (pid == SCHED_PID_NONE) return nullptr;
+    return g_pidToProcess[pid];
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +157,19 @@ static void IdleLoop()
 
 void SchedulerInit()
 {
+    // Load the scheduling policy module.
+    // For now, use the statically-linked default (sched_rr).
+    // Future: load from INIT.RC via ModuleLoad("sched_mlfq.mod").
+    g_schedOps = GetSchedOps();
+    if (g_schedOps->stateSize > sizeof(g_schedStateStorage))
+    {
+        SerialPrintf("SCHED FATAL: policy state %zu > storage %zu\n",
+                     g_schedOps->stateSize, sizeof(g_schedStateStorage));
+        for (;;) __asm__ volatile("hlt");
+    }
+    g_schedOps->Init(g_schedState);
+    SerialPrintf("SCHED: loaded policy '%s'\n", g_schedOps->name);
+
     // Create idle process for BSP (CPU 0).
     auto* idle = static_cast<Process*>(kmalloc(sizeof(Process)));
     __builtin_memset(idle, 0, sizeof(Process));
@@ -239,6 +234,11 @@ void SchedulerAddProcess(Process* proc)
     proc->savedCtx.cr3 = proc->pageTable.pml4.raw();
     proc->savedCtx.fsBase = proc->fsBase;
 
+    // Register with pid lookup and policy module.
+    if (proc->pid < SCHED_MAX_PIDS)
+        g_pidToProcess[proc->pid] = proc;
+    g_schedOps->InitProcess(g_schedState, proc->pid, SCHED_PRIORITY_NORMAL);
+
     uint64_t rlf1 = SchedLockAcquire(g_readyLock);
     ReadyQueueInsertLocked(proc);
     SchedLockRelease(g_readyLock, rlf1);
@@ -255,7 +255,7 @@ void SchedulerAddProcess(Process* proc)
 void SchedulerRemoveProcess(Process* proc)
 {
     uint64_t rlf2 = SchedLockAcquire(g_readyLock);
-    if (proc->state == ProcessState::Ready && proc->schedNext)
+    if (proc->state == ProcessState::Ready)
         ReadyQueueRemoveLocked(proc);
     SchedLockRelease(g_readyLock, rlf2);
 
@@ -281,8 +281,8 @@ void SchedulerBlock(Process* proc)
 
     uint64_t rlf3 = SchedLockAcquire(g_readyLock);
     proc->state = ProcessState::Blocked;
-    if (proc->schedNext)
-        ReadyQueueRemoveLocked(proc);
+    g_schedOps->VoluntaryYield(g_schedState, proc->pid);
+    ReadyQueueRemoveLocked(proc);
     SchedLockRelease(g_readyLock, rlf3);
 
     uint32_t cpu = ThisCpu();
@@ -318,10 +318,7 @@ void SchedulerUnblock(Process* proc)
 uint32_t SchedulerReadyCount()
 {
     uint64_t rlf5 = SchedLockAcquire(g_readyLock);
-    if (!g_readyHead) { SchedLockRelease(g_readyLock, rlf5); return 0; }
-    uint32_t count = 1;
-    for (Process* p = g_readyHead->schedNext; p != g_readyHead; p = p->schedNext)
-        ++count;
+    uint32_t count = g_schedOps->ReadyCount(g_schedState);
     SchedLockRelease(g_readyLock, rlf5);
     return count;
 }
@@ -335,18 +332,6 @@ Process* SchedulerCurrentProcess()
 // ---------------------------------------------------------------------------
 // Context switch logic
 // ---------------------------------------------------------------------------
-
-// Pick the next process to run. Caller must hold g_readyLock.
-static Process* PickNextLocked()
-{
-    if (g_readyHead)
-    {
-        Process* next = g_readyHead;
-        ReadyQueueRemoveLocked(next);
-        return next;
-    }
-    return nullptr; // caller should fall back to idle
-}
 
 // Check blocked processes for timed wakeups (called with NO locks held).
 static void CheckBlockedWakeups()
@@ -472,12 +457,16 @@ void SchedulerTimerTick()
     if (!g_schedulerRunning)
         return;
 
-    // Only BSP (CPU 0) does wakeup checks and reaping to avoid contention.
+    // Only BSP (CPU 0) does wakeup checks, reaping, and policy ticks.
     uint32_t cpu = ThisCpu();
     if (cpu == 0)
     {
         CheckBlockedWakeups();
         ReapTerminated();
+        // Notify policy of time passing (for anti-starvation boosts etc.).
+        uint64_t rlf_tick = SchedLockAcquire(g_readyLock);
+        g_schedOps->Tick(g_schedState, g_lapicTickCount);
+        SchedLockRelease(g_readyLock, rlf_tick);
     }
 
     Process* cur = g_perCpu[cpu].currentProcess;
@@ -495,8 +484,9 @@ void SchedulerTimerTick()
         return;
     }
 
-    // Check timeslice.
-    if (g_lapicTickCount - g_perCpu[cpu].sliceStartTick < SCHED_TIMESLICE_MS)
+    // Check timeslice (per-process, from policy module).
+    uint64_t timeslice = g_schedOps->Timeslice(g_schedState, cur->pid);
+    if (g_lapicTickCount - g_perCpu[cpu].sliceStartTick < timeslice)
         return;
 
     // Only preempt if the process is still Running. It might have been
@@ -505,11 +495,9 @@ void SchedulerTimerTick()
     if (cur->state != ProcessState::Running)
         return;
 
-    // Timeslice expired — pick the next process and switch.
-    // We do NOT insert cur into the ready queue here; DoSwitch will
-    // re-enqueue it after context_switch saves its state, preventing
-    // another CPU from picking it up while it's still mid-switch.
+    // Timeslice expired — notify policy, pick next, and switch.
     uint64_t rlf8 = SchedLockAcquire(g_readyLock);
+    g_schedOps->TimesliceExpired(g_schedState, cur->pid);
     Process* next = PickNextLocked();
     SchedLockRelease(g_readyLock, rlf8);
 
@@ -568,8 +556,7 @@ void SchedulerYield()
     proc->state = ProcessState::Terminated;
 
     uint64_t rlf10 = SchedLockAcquire(g_readyLock);
-    if (proc->schedNext)
-        ReadyQueueRemoveLocked(proc);
+    ReadyQueueRemoveLocked(proc);
     Process* next = PickNextLocked();
     SchedLockRelease(g_readyLock, rlf10);
 

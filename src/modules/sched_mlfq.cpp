@@ -21,7 +21,7 @@ static constexpr uint64_t MLFQ_TIMESLICE[MLFQ_NUM_PRIORITIES] = {
 
 static constexpr uint64_t MLFQ_BOOST_INTERVAL_MS = 1000;
 
-static constexpr uint16_t NONE = UINT16_MAX;
+static constexpr uint16_t NONE = SCHED_PID_NONE;
 
 struct MlfqProcInfo {
     bool     active;

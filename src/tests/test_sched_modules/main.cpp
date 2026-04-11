@@ -42,7 +42,7 @@ static const char* g_currentModule = "";
     } \
 } while(0)
 
-static constexpr uint16_t NONE = UINT16_MAX;
+static constexpr uint16_t NONE = brook::SCHED_PID_NONE;
 
 // ---------------------------------------------------------------------------
 // dlopen harness

@@ -26,7 +26,7 @@ struct RrState {
     uint32_t   readyCount;
 };
 
-static constexpr uint16_t NONE = UINT16_MAX;
+static constexpr uint16_t NONE = SCHED_PID_NONE;
 
 // ---------------------------------------------------------------------------
 // Queue helpers

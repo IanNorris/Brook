@@ -22,6 +22,9 @@ namespace brook {
 // Maximum PIDs the policy must support (must match kernel MAX_PROCESSES).
 static constexpr uint32_t SCHED_MAX_PIDS = 64;
 
+// Sentinel value: no process (returned by PickNext when queue is empty).
+static constexpr uint16_t SCHED_PID_NONE = 0xFFFF;
+
 // Scheduler policy vtable.
 //
 // All functions receive an opaque `state` pointer (allocated by the caller,
@@ -45,7 +48,7 @@ struct SchedOps {
     // Add a process to the ready queue.
     void (*Enqueue)(void* state, uint16_t pid);
 
-    // Pick the highest-priority ready process. Returns pid, or UINT16_MAX if empty.
+    // Pick the highest-priority ready process. Returns pid, or SCHED_PID_NONE if empty.
     uint16_t (*PickNext)(void* state);
 
     // Remove a specific process from the ready queue (e.g. when blocking).
