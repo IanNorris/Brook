@@ -4,7 +4,7 @@
 
 // Primary kernel stack — we switch to this at the very start of KernelMain.
 // Grows downward; stack top = &g_kernelStack[sizeof(g_kernelStack)].
-uint8_t g_kernelStack[32768];  // 32 KB
+uint8_t g_kernelStack[65536];  // 64 KB
 
 // Dedicated double-fault stack (IST1) — now per-CPU, see g_dfStacks.
 

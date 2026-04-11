@@ -136,7 +136,7 @@ qemu-system-x86_64 \
     -machine q35 \
     -cpu qemu64 \
     -smp 8 \
-    -m 1G \
+    -m 4G \
     -drive if=pflash,format=raw,readonly=on,file="${OVMF_CODE}" \
     -drive if=pflash,format=raw,file="${OVMF_VARS_COPY}" \
     -drive format=raw,file=fat:rw:"${BUILD_DIR}/esp" \

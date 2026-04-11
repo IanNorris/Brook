@@ -9,7 +9,7 @@ namespace brook {
 static constexpr uint32_t MAX_FDS = 64;
 
 // Maximum concurrent processes.
-static constexpr uint32_t MAX_PROCESSES = 16;
+static constexpr uint32_t MAX_PROCESSES = 64;
 
 // Program break limit (max heap size per process).
 static constexpr uint64_t PROGRAM_BREAK_SIZE = 64 * 1024 * 1024; // 64 MB
@@ -177,13 +177,16 @@ struct Process
     // When non-null, fb mmap maps this buffer instead of the physical FB.
     uint32_t* fbVirtual;        // Kernel-mapped virtual framebuffer
     uint32_t  fbVirtualSize;    // Size in bytes
+    uint32_t  fbVfbWidth;       // VFB width in pixels
+    uint32_t  fbVfbHeight;      // VFB height in pixels
+    uint32_t  fbVfbStride;      // VFB stride in pixels (= fbVfbWidth)
 
     // Compositor placement: position and downscale factor on the physical FB.
     // The virtual FB is the full resolution the process thinks it has.
-    // The compositor blits it at (fbDestX, fbDestY) scaled down by fbScale:1.
+    // The compositor blits the VFB at (fbDestX, fbDestY) with 1:1 pixel mapping.
     int16_t   fbDestX;          // Destination X on physical FB
     int16_t   fbDestY;          // Destination Y on physical FB
-    uint8_t   fbScale;          // Downscale factor (1 = 1:1, 2 = half, etc.), 0 = no compositing
+    uint8_t   fbScale;          // Downscale factor when blitting to phys FB (1=1:1, 2=half, etc.)
 
     // Process name (for debug output)
     char name[32];
