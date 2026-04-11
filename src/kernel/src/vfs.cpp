@@ -116,8 +116,9 @@ static int FatFileOpen(Vnode* vn, int flags)
 }
 
 // Preload file into memory. Called on first read for files > threshold.
-// CacheFile — caller MUST hold g_vfsLock.
-static CachedFile* CacheFileLocked(FIL* fil)
+// CacheFile — locks internally per-chunk so other CPUs can interleave.
+// Caller must NOT hold g_vfsLock.
+static CachedFile* CacheFileUnlocked(FIL* fil)
 {
     uint64_t size = f_size(fil);
     auto* cf = static_cast<CachedFile*>(kmalloc(sizeof(CachedFile)));
@@ -136,14 +137,20 @@ static CachedFile* CacheFileLocked(FIL* fil)
         return nullptr;
     }
 
-    // Read entire file
-    f_lseek(fil, 0);
+    // Read entire file — acquire VFS lock per chunk to allow interleaving.
+    {
+        uint64_t lf = SpinLockAcquire(&g_vfsLock);
+        f_lseek(fil, 0);
+        SpinLockRelease(&g_vfsLock, lf);
+    }
     uint64_t remaining = size;
     uint64_t off = 0;
     while (remaining > 0) {
         UINT chunk = (remaining > 32768) ? 32768 : static_cast<UINT>(remaining);
         UINT br = 0;
+        uint64_t lf = SpinLockAcquire(&g_vfsLock);
         FRESULT res = f_read(fil, cf->data + off, chunk, &br);
+        SpinLockRelease(&g_vfsLock, lf);
         if (res != FR_OK || br == 0) {
             SerialPrintf("VFS: cache read failed at off=%lu (res=%u)\n",
                          (unsigned long)off, (unsigned)res);
@@ -448,8 +455,8 @@ Vnode* VfsOpen(const char* path, int flags)
         uint64_t fileSize = f_size(fil);
         if (!(flags & VFS_O_WRITE) && fileSize >= CACHE_THRESHOLD)
         {
-            CachedFile* cf = CacheFileLocked(fil);
             SpinLockRelease(&g_vfsLock, lockFlags);
+            CachedFile* cf = CacheFileUnlocked(fil);
             if (cf) {
                 vn->ops  = &g_cachedFileOps;
                 vn->type = VnodeType::File;

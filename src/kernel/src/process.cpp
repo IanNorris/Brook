@@ -200,6 +200,15 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     auto* raw = reinterpret_cast<uint8_t*>(proc);
     for (uint64_t i = 0; i < sizeof(Process); ++i) raw[i] = 0;
 
+    // Initialize FPU/SSE state with safe defaults so fxrstor works correctly
+    // on the first context switch to this process.
+    // FCW (bytes 0-1): 0x037F = mask all FPU exceptions
+    // MXCSR (bytes 24-27): 0x1F80 = mask all SSE exceptions
+    proc->fxsave.data[0] = 0x7F;
+    proc->fxsave.data[1] = 0x03;
+    proc->fxsave.data[24] = 0x80;
+    proc->fxsave.data[25] = 0x1F;
+
     proc->pid = SchedulerAllocPid();
     proc->state = ProcessState::Ready;
 

@@ -535,7 +535,11 @@ static int64_t sys_arch_prctl(uint64_t code, uint64_t addr, uint64_t,
         __asm__ volatile("wrmsr" : : "a"(lo), "d"(hi), "c"(0xC0000100U));
 
         Process* proc = ProcessCurrent();
-        if (proc) proc->fsBase = addr;
+        if (proc)
+        {
+            proc->fsBase = addr;
+            proc->savedCtx.fsBase = addr;
+        }
 
         SerialPrintf("arch_prctl: SET_FS 0x%lx\n", addr);
         return 0;

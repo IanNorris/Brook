@@ -56,9 +56,15 @@ context_switch:
     movq %cr3, %rax
     movq %rax, 72(%rdi)
 
-    // Save RCX (new FxsaveArea*) — we need it after stack switch.
-    // Stash in R8 which is caller-saved and we don't need to preserve.
-    movq %rcx, %r8
+    // Save FS base (IA32_FS_BASE = 0xC0000100) — must happen before
+    // we clobber RCX/RDX for the new FxsaveArea* stash.
+    movq %rcx, %r8              // stash new FxsaveArea* in R8 early
+    movl $0xC0000100, %ecx
+    rdmsr
+    movl %eax, %ecx
+    shlq $32, %rdx
+    orq  %rcx, %rdx
+    movq %rdx, 80(%rdi)         // old->fsBase
 
     // --- Restore new context ---
 
@@ -80,8 +86,12 @@ context_switch:
     wrmsr
 .Lskip_fsbase:
 
-    // Restore RFLAGS
+    // Restore RFLAGS — but keep IF cleared so a timer interrupt cannot
+    // fire in the middle of the register restore.  Interrupts are properly
+    // re-enabled later by iretq (preempted process) or sti (new process
+    // via ProcessTrampoline).
     movq 64(%rsi), %rax
+    andq $~0x200, %rax          // clear IF bit
     pushq %rax
     popfq
 
@@ -99,6 +109,16 @@ context_switch:
     // Restore SSE/FPU state (R8 = new FxsaveArea*)
     fxrstor (%r8)
 
+    // Validate saved RIP is a canonical kernel address before jumping.
+    movq 56(%rsi), %rax
+    movq %rax, %rcx
+    shrq $47, %rcx
+    cmpq $0x1FFFF, %rcx
+    je .Lrip_ok
+    // RIP is corrupted — halt.
+    cli
+    ud2
+.Lrip_ok:
     // Jump to saved RIP
     jmpq *56(%rsi)
 
