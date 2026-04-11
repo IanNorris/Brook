@@ -211,6 +211,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
 
     proc->pid = SchedulerAllocPid();
     proc->state = ProcessState::Ready;
+    proc->runningOnCpu = -1;
 
     // Default working directory
     proc->cwd[0] = '/'; proc->cwd[1] = 'b'; proc->cwd[2] = 'o';

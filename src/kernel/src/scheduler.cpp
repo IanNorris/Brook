@@ -104,6 +104,25 @@ static volatile bool g_schedulerRunning = false;
 
 static void ReadyQueueInsertLocked(Process* proc)
 {
+    // Guard: process must not already be running on a CPU.
+    int32_t cpu = __atomic_load_n(&proc->runningOnCpu, __ATOMIC_ACQUIRE);
+    if (cpu != -1)
+    {
+        SerialPrintf("SCHED BUG: inserting RUNNING proc '%s' (pid %u) into ready queue! "
+                     "runningOnCpu=%d state=%d\n",
+                     proc->name, proc->pid, cpu, (int)proc->state);
+        for (;;) __asm__ volatile("hlt");
+    }
+    // Guard: process must not already be in the ready queue.
+    if (proc->inReadyQueue)
+    {
+        SerialPrintf("SCHED BUG: double-insert '%s' (pid %u) into ready queue! "
+                     "state=%d schedNext=%p\n",
+                     proc->name, proc->pid, (int)proc->state, (void*)proc->schedNext);
+        for (;;) __asm__ volatile("hlt");
+    }
+    proc->inReadyQueue = 1;
+
     if (!g_readyHead)
     {
         proc->schedNext = proc;
@@ -122,6 +141,7 @@ static void ReadyQueueInsertLocked(Process* proc)
 
 static void ReadyQueueRemoveLocked(Process* proc)
 {
+    proc->inReadyQueue = 0;
     if (proc->schedNext == proc)
     {
         g_readyHead = nullptr;
@@ -164,6 +184,7 @@ void SchedulerInit()
 
     idle->pid = 0;
     idle->state = ProcessState::Ready;
+    idle->runningOnCpu = -1;
     __builtin_memcpy(idle->name, "idle0", 6);
 
     idle->kernelStackBase = reinterpret_cast<uint64_t>(g_idleStacks[0]);
@@ -238,6 +259,12 @@ void SchedulerRemoveProcess(Process* proc)
 
 void SchedulerBlock(Process* proc)
 {
+    // Disable interrupts across the entire block+yield sequence to prevent
+    // SchedulerTimerTick from firing between setting Blocked and yielding,
+    // which would overwrite the Blocked state with Ready.
+    uint64_t flags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+
     uint64_t rlf3 = SchedLockAcquire(g_readyLock);
     proc->state = ProcessState::Blocked;
     if (proc->schedNext)
@@ -247,12 +274,23 @@ void SchedulerBlock(Process* proc)
     uint32_t cpu = ThisCpu();
     if (proc == g_perCpu[cpu].currentProcess)
         SchedulerYield();
+
+    // Restore interrupts after yield (the context_switch + iretq path
+    // will re-enable interrupts for us, but if we didn't yield we need
+    // to restore).
+    if (flags & 0x200)
+        __asm__ volatile("sti" ::: "memory");
 }
 
 void SchedulerUnblock(Process* proc)
 {
     uint64_t rlf4 = SchedLockAcquire(g_readyLock);
-    if (proc->state != ProcessState::Blocked)
+    // The process must be fully Blocked (state=Blocked AND no longer running
+    // on any CPU). Between SchedulerBlock setting state=Blocked and DoSwitch
+    // clearing runningOnCpu, the process is in a transient state visible to
+    // other CPUs — we must not unblock it until the context switch completes.
+    if (proc->state != ProcessState::Blocked ||
+        __atomic_load_n(&proc->runningOnCpu, __ATOMIC_ACQUIRE) != -1)
     {
         SchedLockRelease(g_readyLock, rlf4);
         return;
@@ -302,7 +340,8 @@ static void CheckBlockedWakeups()
     for (uint32_t i = 0; i < g_processCount; ++i)
     {
         Process* p = g_allProcesses[i];
-        if (p->state == ProcessState::Blocked && p->wakeupTick != 0 && now >= p->wakeupTick)
+        if (p->state == ProcessState::Blocked && p->wakeupTick != 0 && now >= p->wakeupTick
+            && __atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) == -1)
         {
             if (unblockCount < MAX_PROCESSES)
                 toUnblock[unblockCount++] = p;
@@ -354,6 +393,20 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
     __asm__ volatile("cli");
 
     uint32_t cpu = ThisCpu();
+
+    // Double-schedule detection: newProc must not already be running on another CPU.
+    int32_t prevCpu = __atomic_exchange_n(&newProc->runningOnCpu, (int32_t)cpu, __ATOMIC_ACQ_REL);
+    if (prevCpu != -1)
+    {
+        SerialPrintf("SCHED FATAL: double-schedule! '%s' (pid %u) already on CPU%d, "
+                     "now CPU%u. oldProc='%s' pid=%u\n",
+                     newProc->name, newProc->pid, prevCpu, cpu,
+                     oldProc->name, oldProc->pid);
+        for (;;) __asm__ volatile("hlt");
+    }
+
+    // Mark old process as no longer running on this CPU.
+    __atomic_store_n(&oldProc->runningOnCpu, (int32_t)-1, __ATOMIC_RELEASE);
 
     g_perCpu[cpu].currentProcess = newProc;
     newProc->state = ProcessState::Running;
@@ -426,6 +479,12 @@ void SchedulerTimerTick()
     if (g_lapicTickCount - g_perCpu[cpu].sliceStartTick < SCHED_TIMESLICE_MS)
         return;
 
+    // Only preempt if the process is still Running. It might have been
+    // marked Blocked (by SchedulerBlock in a syscall) between the lock
+    // release and the yield — the timer fired in that window.
+    if (cur->state != ProcessState::Running)
+        return;
+
     // Timeslice expired — pick the next process and switch.
     // We do NOT insert cur into the ready queue here; DoSwitch will
     // re-enqueue it after context_switch saves its state, preventing
@@ -496,8 +555,11 @@ void SchedulerYield()
 
     if (!next) next = g_perCpu[cpu].idleProcess;
 
+    __atomic_store_n(&proc->runningOnCpu, (int32_t)-1, __ATOMIC_RELEASE);
+
     g_perCpu[cpu].currentProcess = next;
     next->state = ProcessState::Running;
+    __atomic_store_n(&next->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
     GdtSetTssRsp0ForCpu(cpu, next->kernelStackTop);
     SetSyscallStack(cpu, next->kernelStackTop);
@@ -523,6 +585,7 @@ void SchedulerYield()
 
     g_perCpu[cpu].currentProcess = first;
     first->state = ProcessState::Running;
+    __atomic_store_n(&first->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
     GdtSetTssRsp0ForCpu(cpu, first->kernelStackTop);
     SetSyscallStack(cpu, first->kernelStackTop);
@@ -563,6 +626,7 @@ void SchedulerYield()
 
     g_perCpu[cpu].currentProcess = first;
     first->state = ProcessState::Running;
+    __atomic_store_n(&first->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
     GdtSetTssRsp0ForCpu(cpu, first->kernelStackTop);
     SetSyscallStack(cpu, first->kernelStackTop);
@@ -605,6 +669,7 @@ void SchedulerInitApIdle(uint32_t cpuIndex)
     idle->fxsave.data[24] = 0x80; idle->fxsave.data[25] = 0x1F; // MXCSR = 0x1F80
     idle->pid = 0;
     idle->state = ProcessState::Ready;
+    idle->runningOnCpu = -1;
     char name[] = "idle0";
     name[4] = static_cast<char>('0' + (cpuIndex % 10));
     __builtin_memcpy(idle->name, name, 6);

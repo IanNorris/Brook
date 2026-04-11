@@ -136,11 +136,12 @@ struct Process
     uint16_t pid;
     ProcessState state;
     uint8_t  _pad0;
-    uint32_t _pad1;
+    int32_t  runningOnCpu;   // CPU index (-1 = not running, used for double-schedule detection)
 
     // Scheduler linked-list pointers (circular doubly-linked ready queue)
     Process* schedNext;
     Process* schedPrev;
+    volatile uint32_t inReadyQueue;  // 0 or 1 — debug guard against double-insert
 
     // Blocking info (e.g. nanosleep wakeup tick)
     uint64_t wakeupTick;        // g_lapicTickCount value to unblock at (0 = N/A)
