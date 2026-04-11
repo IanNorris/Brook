@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(brook-kernel C CXX)
+project(brook-kernel C CXX ASM)
 
 if(NOT DEFINED BROOK_ROOT)
     set(BROOK_ROOT "${CMAKE_SOURCE_DIR}/../..")
@@ -145,6 +145,8 @@ add_executable(kernel
     src/runtime.cpp
     src/syscall.cpp
     src/process.cpp
+    src/scheduler.cpp
+    src/context_switch.S
     src/elf_loader.cpp
     src/vfs.cpp
     src/virtio_blk.cpp

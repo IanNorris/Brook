@@ -3,6 +3,7 @@
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "process.h"
+#include "scheduler.h"
 #include "vfs.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
@@ -13,16 +14,7 @@
 
 namespace brook {
 
-// ---------------------------------------------------------------------------
-// Global current process (single-process for now)
-// ---------------------------------------------------------------------------
-
-static Process* g_currentProcess = nullptr;
-
-Process* ProcessCurrent()
-{
-    return g_currentProcess;
-}
+// ProcessCurrent() is now in scheduler.cpp (g_currentProcess lives there).
 
 // ---------------------------------------------------------------------------
 // File descriptor operations
@@ -208,7 +200,20 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     auto* raw = reinterpret_cast<uint8_t*>(proc);
     for (uint64_t i = 0; i < sizeof(Process); ++i) raw[i] = 0;
 
-    proc->pid = 1; // First user process
+    proc->pid = SchedulerAllocPid();
+    proc->state = ProcessState::Ready;
+
+    // Allocate per-process kernel stack (for ring 3→0 transitions).
+    VirtualAddress kstackAddr = VmmAllocPages(KERNEL_STACK_PAGES,
+        VMM_WRITABLE, MemTag::KernelData, proc->pid);
+    if (!kstackAddr)
+    {
+        SerialPuts("PROC: kernel stack allocation failed\n");
+        kfree(proc);
+        return nullptr;
+    }
+    proc->kernelStackBase = kstackAddr.raw();
+    proc->kernelStackTop  = kstackAddr.raw() + KERNEL_STACK_SIZE;
 
     // Create per-process page table
     proc->pageTable = VmmCreateUserPageTable();
@@ -351,8 +356,6 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
         }
     }
 
-    g_currentProcess = proc;
-
     SerialPrintf("PROC: created pid=%u, entry=0x%lx, stack=0x%lx, brk=0x%lx, cr3=0x%lx\n",
                  proc->pid, proc->elf.entryPoint, proc->stackTop,
                  proc->programBreak, proc->pageTable.pml4.raw());
@@ -379,14 +382,18 @@ void ProcessDestroy(Process* proc)
         FdFree(proc, static_cast<int>(i));
     }
 
+    // Free per-process kernel stack
+    if (proc->kernelStackBase)
+        VmmFreePages(VirtualAddress(proc->kernelStackBase), KERNEL_STACK_PAGES);
+
     // Free all VMM page allocations owned by this process
     VmmKillPid(proc->pid);
 
     // Free per-process page table pages
     VmmDestroyUserPageTable(proc->pageTable);
 
-    if (g_currentProcess == proc)
-        g_currentProcess = nullptr;
+    // Remove from scheduler tracking
+    SchedulerRemoveProcess(proc);
 
     kfree(proc);
 }

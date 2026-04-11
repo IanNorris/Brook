@@ -8,11 +8,21 @@ namespace brook {
 // Maximum number of open file descriptors per process.
 static constexpr uint32_t MAX_FDS = 64;
 
+// Maximum concurrent processes.
+static constexpr uint32_t MAX_PROCESSES = 16;
+
 // Program break limit (max heap size per process).
 static constexpr uint64_t PROGRAM_BREAK_SIZE = 64 * 1024 * 1024; // 64 MB
 
 // Default user stack size.
 static constexpr uint64_t USER_STACK_SIZE = 128 * 1024; // 128 KB
+
+// Per-process kernel stack size (2 pages = 8 KB).
+static constexpr uint64_t KERNEL_STACK_SIZE = 8 * 1024;
+static constexpr uint64_t KERNEL_STACK_PAGES = KERNEL_STACK_SIZE / 4096;
+
+// Scheduler time slice in milliseconds (~10ms).
+static constexpr uint64_t SCHED_TIMESLICE_MS = 10;
 
 // User-space virtual address where ELF binaries are loaded.
 // This is in the lower canonical half (user space).
@@ -24,6 +34,49 @@ static constexpr uint64_t USER_MMAP_END  = 0x700000000000ULL; // well below stac
 
 // User stack top (grows down from here).
 static constexpr uint64_t USER_STACK_TOP = 0x7FFFFFFFE000ULL;
+
+// ---------------------------------------------------------------------------
+// Process scheduling state
+// ---------------------------------------------------------------------------
+
+enum class ProcessState : uint8_t
+{
+    Ready,          // In the run queue, eligible for scheduling
+    Running,        // Currently executing on CPU
+    Blocked,        // Waiting (sleep, I/O, mutex) — not in run queue
+    Terminated,     // Finished, awaiting cleanup
+};
+
+// ---------------------------------------------------------------------------
+// Saved CPU context — stored on context switch
+// ---------------------------------------------------------------------------
+// Layout must match the context_switch asm (push/pop order).
+
+struct SavedContext
+{
+    // General-purpose registers
+    uint64_t r15;
+    uint64_t r14;
+    uint64_t r13;
+    uint64_t r12;
+    uint64_t rbx;
+    uint64_t rbp;
+    // RIP is implicitly saved as the return address on the kernel stack
+    // RSP is the stack pointer when we switch away
+    uint64_t rsp;       // Kernel stack pointer at switch point
+    uint64_t rip;       // Resume address (set for first switch, then implicit)
+    uint64_t rflags;
+
+    // Segment bases
+    uint64_t cr3;       // Page table physical address
+    uint64_t fsBase;    // FS segment base (TLS)
+};
+
+// FXSAVE area must be 16-byte aligned, 512 bytes.
+struct alignas(16) FxsaveArea
+{
+    uint8_t data[512];
+};
 
 // ---------------------------------------------------------------------------
 // File descriptor entry
@@ -79,8 +132,24 @@ struct ElfBinary
 struct Process
 {
     uint16_t pid;
-    uint16_t _pad0;
+    ProcessState state;
+    uint8_t  _pad0;
     uint32_t _pad1;
+
+    // Scheduler linked-list pointers (circular doubly-linked ready queue)
+    Process* schedNext;
+    Process* schedPrev;
+
+    // Blocking info (e.g. nanosleep wakeup tick)
+    uint64_t wakeupTick;        // g_lapicTickCount value to unblock at (0 = N/A)
+
+    // Saved CPU context (written by context_switch asm)
+    SavedContext savedCtx;
+    FxsaveArea   fxsave;
+
+    // Per-process kernel stack (for ring 3→0 transitions and syscalls)
+    uint64_t kernelStackBase;   // Bottom of kernel stack allocation
+    uint64_t kernelStackTop;    // Top of kernel stack (initial RSP0)
 
     // Per-process page table
     PageTable pageTable;
@@ -101,6 +170,9 @@ struct Process
 
     // File descriptors
     FdEntry  fds[MAX_FDS];
+
+    // Process name (for debug output)
+    char name[32];
 };
 
 // ---------------------------------------------------------------------------
