@@ -22,7 +22,7 @@ namespace brook {
 struct Process;
 
 // Forward-declared wait-queue node embedded in Process (added below).
-// Each blocked waiter links to the next via Process::mutexNext.
+// Each blocked waiter links to the next via Process::syncNext.
 
 struct KMutex {
     volatile uint32_t locked;     // 1 = held, 0 = free

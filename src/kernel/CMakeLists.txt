@@ -160,6 +160,8 @@ add_executable(kernel
     src/apic.cpp
     src/tty.cpp
     src/sync/kmutex.cpp
+    src/sync/krwlock.cpp
+    src/sync/ksemaphore.cpp
     # Memory subsystem
     src/memory/virtual_memory.cpp
     src/memory/physical_memory.cpp

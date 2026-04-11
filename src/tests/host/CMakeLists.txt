@@ -28,3 +28,5 @@ endfunction()
 enable_testing()
 
 add_host_test(test_kmutex)
+add_host_test(test_krwlock)
+add_host_test(test_ksemaphore)

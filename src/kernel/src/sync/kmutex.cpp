@@ -64,9 +64,9 @@ void KMutexLock(KMutex* m)
     }
 
     // Contended — add ourselves to the wait queue and block.
-    self->mutexNext = nullptr;
+    self->syncNext = nullptr;
     if (m->waitTail)
-        m->waitTail->mutexNext = self;
+        m->waitTail->syncNext = self;
     else
         m->waitHead = self;
     m->waitTail = self;
@@ -98,10 +98,10 @@ void KMutexUnlock(KMutex* m)
     if (waiter)
     {
         // Transfer ownership to the first waiter.
-        m->waitHead = waiter->mutexNext;
+        m->waitHead = waiter->syncNext;
         if (!m->waitHead)
             m->waitTail = nullptr;
-        waiter->mutexNext = nullptr;
+        waiter->syncNext = nullptr;
 
         m->ownerPid = waiter->pid;
         // m->locked remains 1 — ownership transferred, not released.

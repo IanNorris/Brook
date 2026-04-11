@@ -28,7 +28,7 @@ enum class ProcessState : uint8_t {
 struct Process {
     uint16_t pid;
     volatile ProcessState state;
-    Process* mutexNext;
+    Process* syncNext;
 
     // Host-side threading support.
     pthread_mutex_t   hostMtx;
@@ -108,9 +108,9 @@ void KMutexLock(KMutex* m)
     }
 
     // Contended — enqueue and block.
-    self->mutexNext = nullptr;
+    self->syncNext = nullptr;
     if (m->waitTail)
-        m->waitTail->mutexNext = self;
+        m->waitTail->syncNext = self;
     else
         m->waitHead = self;
     m->waitTail = self;
@@ -133,10 +133,10 @@ void KMutexUnlock(KMutex* m)
     Process* waiter = m->waitHead;
     if (waiter)
     {
-        m->waitHead = waiter->mutexNext;
+        m->waitHead = waiter->syncNext;
         if (!m->waitHead)
             m->waitTail = nullptr;
-        waiter->mutexNext = nullptr;
+        waiter->syncNext = nullptr;
 
         m->ownerPid = waiter->pid;
 
@@ -201,7 +201,7 @@ static Process* MakeProcess(uint16_t pid)
     auto* p = new Process{};
     p->pid = pid;
     p->state = ProcessState::Running;
-    p->mutexNext = nullptr;
+    p->syncNext = nullptr;
     p->hostWoken = false;
     pthread_mutex_init(&p->hostMtx, nullptr);
     pthread_cond_init(&p->hostCond, nullptr);
