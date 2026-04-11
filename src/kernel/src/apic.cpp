@@ -165,7 +165,7 @@ static void SoftEnableLapic()
 
 // Global tick counter (incremented every ~1ms by LAPIC timer).
 // Used by syscall timing (clock_gettime, nanosleep).
-uint64_t g_lapicTickCount = 0;
+volatile uint64_t g_lapicTickCount = 0;
 
 __attribute__((interrupt))
 static void LapicTimerHandler(InterruptFrame* frame)

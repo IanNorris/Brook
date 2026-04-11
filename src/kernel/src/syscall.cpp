@@ -615,7 +615,7 @@ static int64_t sys_set_tid_address(uint64_t, uint64_t, uint64_t,
 
 // Simple monotonic counter based on LAPIC timer interrupts.
 // The LAPIC fires every 1ms, so we track a global tick count.
-extern uint64_t g_lapicTickCount; // defined in apic.cpp
+extern volatile uint64_t g_lapicTickCount; // defined in apic.cpp
 
 struct timespec {
     int64_t  tv_sec;
