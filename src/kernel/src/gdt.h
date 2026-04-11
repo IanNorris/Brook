@@ -57,10 +57,27 @@ struct Tss64 {
     uint16_t ioBitmapOffset; // set to sizeof(Tss64) to disable I/O bitmap
 } __attribute__((packed));
 
+// Maximum CPUs supported.
+static constexpr uint32_t GDT_MAX_CPUS = 64;
+
 // Populate the GDT (with TSS), load it via lgdt, reload segment registers,
 // and load the TSS via ltr.  Must be called before IdtInit.
 void GdtInit();
 
+// Initialise per-CPU GDT/TSS for an AP. Allocates a new TSS, patches the
+// BSP's GDT table (adding a new TSS descriptor), and returns the TSS selector.
+// The AP must then lgdt + ltr on its own core.
+uint16_t GdtInitAp(uint32_t cpuIndex);
+
+// Load the GDT and TSS selector on the current CPU (for AP use after GdtInitAp).
+void GdtLoadOnAp(uint16_t tssSelector);
+
 // Set TSS.RSP0 — the kernel stack loaded by the CPU on ring 3 → ring 0
 // transitions (interrupts, exceptions, but NOT SYSCALL).
 void GdtSetTssRsp0(uint64_t stackTop);
+
+// Per-CPU version: set RSP0 on a specific CPU's TSS.
+void GdtSetTssRsp0ForCpu(uint32_t cpuIndex, uint64_t stackTop);
+
+// Get the TSS for a specific CPU.
+Tss64* GdtGetTss(uint32_t cpuIndex);

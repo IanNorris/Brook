@@ -1,6 +1,7 @@
 #include "scheduler.h"
 #include "process.h"
 #include "cpu.h"
+#include "smp.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "memory/heap.h"
@@ -23,40 +24,63 @@ namespace brook { void SwitchToUserMode(uint64_t userRsp, uint64_t userRip); }
 namespace brook {
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Spinlock — simple ticket lock for SMP safety
 // ---------------------------------------------------------------------------
 
-// Update the per-CPU syscall stack pointer so each process uses its own kernel
-// stack for syscalls. We write to KernelCpuEnv directly (not via gs:8) because
-// the timer ISR can fire from user mode where gs hasn't been swapped to kernel.
-// The SYSCALL entry path reads gs:8 after swapgs, so it sees the updated value.
-extern "C" KernelCpuEnv* g_kernelEnv;
+struct Spinlock {
+    volatile uint32_t next   = 0;
+    volatile uint32_t serving = 0;
+};
 
-static inline void SetSyscallStack(uint64_t stackTop)
+static inline void SpinlockAcquire(Spinlock& lock)
 {
-    if (g_kernelEnv)
-        g_kernelEnv->syscallStack = stackTop;
+    uint32_t ticket = __atomic_fetch_add(&lock.next, 1, __ATOMIC_RELAXED);
+    while (__atomic_load_n(&lock.serving, __ATOMIC_ACQUIRE) != ticket)
+        __asm__ volatile("pause" ::: "memory");
+}
+
+static inline void SpinlockRelease(Spinlock& lock)
+{
+    __atomic_fetch_add(&lock.serving, 1, __ATOMIC_RELEASE);
+}
+
+// ---------------------------------------------------------------------------
+// Per-CPU state
+// ---------------------------------------------------------------------------
+
+static constexpr uint32_t SCHED_MAX_CPUS = 64;
+
+struct PerCpuSchedState {
+    Process*         currentProcess;
+    Process*         idleProcess;
+    uint64_t         sliceStartTick;
+    KernelCpuEnv*    cpuEnv;
+};
+
+static PerCpuSchedState g_perCpu[SCHED_MAX_CPUS] = {};
+
+// Helpers
+static inline uint32_t ThisCpu() { return SmpCurrentCpuIndex(); }
+
+// Update the per-CPU syscall stack pointer.
+static inline void SetSyscallStack(uint32_t cpuIdx, uint64_t stackTop)
+{
+    if (g_perCpu[cpuIdx].cpuEnv)
+        g_perCpu[cpuIdx].cpuEnv->syscallStack = stackTop;
 }
 
 // ---------------------------------------------------------------------------
 // Scheduler state
 // ---------------------------------------------------------------------------
 
-// Circular doubly-linked ready queue. Head points to the next process to run.
+// Circular doubly-linked ready queue (global, shared by all CPUs).
 static Process* g_readyHead  = nullptr;
-
-// The currently running process (may be nullptr only during init).
-static Process* g_currentProcess = nullptr;
-
-// The idle process — runs when nothing else is ready.
-static Process* g_idleProcess = nullptr;
-
-// Tick at which the current timeslice started.
-static uint64_t g_sliceStartTick = 0;
+static Spinlock g_readyLock;
 
 // All processes (for blocked-process scanning).
 static Process* g_allProcesses[MAX_PROCESSES] = {};
 static uint32_t g_processCount = 0;
+static Spinlock g_allProcLock;
 
 // Next PID to allocate.
 static uint16_t g_nextPid = 1;
@@ -66,9 +90,10 @@ static volatile bool g_schedulerRunning = false;
 
 // ---------------------------------------------------------------------------
 // Ready queue operations (circular doubly-linked list)
+// Caller must hold g_readyLock.
 // ---------------------------------------------------------------------------
 
-static void ReadyQueueInsert(Process* proc)
+static void ReadyQueueInsertLocked(Process* proc)
 {
     if (!g_readyHead)
     {
@@ -78,7 +103,6 @@ static void ReadyQueueInsert(Process* proc)
     }
     else
     {
-        // Insert before head (i.e. at the tail of the queue).
         Process* tail = g_readyHead->schedPrev;
         proc->schedNext = g_readyHead;
         proc->schedPrev = tail;
@@ -87,11 +111,10 @@ static void ReadyQueueInsert(Process* proc)
     }
 }
 
-static void ReadyQueueRemove(Process* proc)
+static void ReadyQueueRemoveLocked(Process* proc)
 {
     if (proc->schedNext == proc)
     {
-        // Only element.
         g_readyHead = nullptr;
     }
     else
@@ -106,12 +129,10 @@ static void ReadyQueueRemove(Process* proc)
 }
 
 // ---------------------------------------------------------------------------
-// Idle process — halts until next interrupt
+// Idle process — halts until next interrupt (one per CPU)
 // ---------------------------------------------------------------------------
 
-// The idle process runs entirely in kernel mode (ring 0). It just halts.
-// It has a minimal kernel stack but no user-space mapping.
-static uint8_t g_idleStack[4096] __attribute__((aligned(16)));
+static uint8_t g_idleStacks[SCHED_MAX_CPUS][4096] __attribute__((aligned(16)));
 
 static void IdleLoop()
 {
@@ -125,34 +146,36 @@ static void IdleLoop()
 
 void SchedulerInit()
 {
-    g_idleProcess = static_cast<Process*>(kmalloc(sizeof(Process)));
-    __builtin_memset(g_idleProcess, 0, sizeof(Process));
+    // Create idle process for BSP (CPU 0).
+    auto* idle = static_cast<Process*>(kmalloc(sizeof(Process)));
+    __builtin_memset(idle, 0, sizeof(Process));
 
-    g_idleProcess->pid = 0;
-    g_idleProcess->state = ProcessState::Ready;
-    __builtin_memcpy(g_idleProcess->name, "idle", 5);
+    idle->pid = 0;
+    idle->state = ProcessState::Ready;
+    __builtin_memcpy(idle->name, "idle0", 6);
 
-    g_idleProcess->kernelStackBase = reinterpret_cast<uint64_t>(g_idleStack);
-    g_idleProcess->kernelStackTop  = reinterpret_cast<uint64_t>(g_idleStack) + sizeof(g_idleStack);
+    idle->kernelStackBase = reinterpret_cast<uint64_t>(g_idleStacks[0]);
+    idle->kernelStackTop  = reinterpret_cast<uint64_t>(g_idleStacks[0]) + sizeof(g_idleStacks[0]);
+    idle->savedCtx.rsp = idle->kernelStackTop - 8;
+    idle->savedCtx.rip = reinterpret_cast<uint64_t>(&IdleLoop);
+    idle->savedCtx.rflags = 0x202;
+    idle->savedCtx.cr3 = VmmKernelCR3().pml4.raw();
+    idle->pageTable = VmmKernelCR3();
 
-    g_idleProcess->savedCtx.rsp = g_idleProcess->kernelStackTop - 8;
-    g_idleProcess->savedCtx.rip = reinterpret_cast<uint64_t>(&IdleLoop);
-    g_idleProcess->savedCtx.rflags = 0x202;
-    g_idleProcess->savedCtx.cr3 = VmmKernelCR3().pml4.raw();
+    g_perCpu[0].idleProcess = idle;
+    g_perCpu[0].currentProcess = nullptr;
 
     SerialPuts("SCHED: scheduler initialised\n");
 }
 
-// Trampoline for processes that haven't run yet. When context_switch
-// restores a new process's savedCtx, it jumps here. We enter user mode
-// via the existing SwitchToUserMode path.
+// Trampoline for processes that haven't run yet.
 static void ProcessTrampoline()
 {
-    Process* proc = g_currentProcess;
-    SerialPrintf("SCHED: entering user mode for '%s' (pid %u)\n",
-                 proc->name, proc->pid);
+    uint32_t cpu = ThisCpu();
+    Process* proc = g_perCpu[cpu].currentProcess;
+    SerialPrintf("SCHED: CPU%u entering user mode for '%s' (pid %u)\n",
+                 cpu, proc->name, proc->pid);
 
-    // Enable interrupts — context_switch leaves them disabled.
     __asm__ volatile("sti");
 
     SwitchToUserMode(proc->stackTop, proc->elf.entryPoint);
@@ -163,20 +186,20 @@ void SchedulerAddProcess(Process* proc)
 {
     proc->state = ProcessState::Ready;
 
-    // Set up savedCtx so context_switch can start this process.
-    // RSP points to the top of the per-process kernel stack (minus 8
-    // for the fake return address slot that context_switch expects).
     proc->savedCtx.rsp = proc->kernelStackTop - 8;
     proc->savedCtx.rip = reinterpret_cast<uint64_t>(&ProcessTrampoline);
-    proc->savedCtx.rflags = 0x202; // IF set
+    proc->savedCtx.rflags = 0x202;
     proc->savedCtx.cr3 = proc->pageTable.pml4.raw();
     proc->savedCtx.fsBase = proc->fsBase;
 
-    ReadyQueueInsert(proc);
+    SpinlockAcquire(g_readyLock);
+    ReadyQueueInsertLocked(proc);
+    SpinlockRelease(g_readyLock);
 
-    // Track in global list for blocked-process scanning.
+    SpinlockAcquire(g_allProcLock);
     if (g_processCount < MAX_PROCESSES)
         g_allProcesses[g_processCount++] = proc;
+    SpinlockRelease(g_allProcLock);
 
     SerialPrintf("SCHED: added '%s' (pid %u) to ready queue\n",
                  proc->name, proc->pid);
@@ -184,10 +207,12 @@ void SchedulerAddProcess(Process* proc)
 
 void SchedulerRemoveProcess(Process* proc)
 {
-    if (proc->state == ProcessState::Ready)
-        ReadyQueueRemove(proc);
+    SpinlockAcquire(g_readyLock);
+    if (proc->state == ProcessState::Ready && proc->schedNext)
+        ReadyQueueRemoveLocked(proc);
+    SpinlockRelease(g_readyLock);
 
-    // Remove from global list.
+    SpinlockAcquire(g_allProcLock);
     for (uint32_t i = 0; i < g_processCount; ++i)
     {
         if (g_allProcesses[i] == proc)
@@ -196,34 +221,44 @@ void SchedulerRemoveProcess(Process* proc)
             break;
         }
     }
+    SpinlockRelease(g_allProcLock);
 }
 
 void SchedulerBlock(Process* proc)
 {
+    SpinlockAcquire(g_readyLock);
     proc->state = ProcessState::Blocked;
     if (proc->schedNext)
-        ReadyQueueRemove(proc);
+        ReadyQueueRemoveLocked(proc);
+    SpinlockRelease(g_readyLock);
 
-    if (proc == g_currentProcess)
+    uint32_t cpu = ThisCpu();
+    if (proc == g_perCpu[cpu].currentProcess)
         SchedulerYield();
 }
 
 void SchedulerUnblock(Process* proc)
 {
+    SpinlockAcquire(g_readyLock);
     if (proc->state != ProcessState::Blocked)
+    {
+        SpinlockRelease(g_readyLock);
         return;
-
+    }
     proc->state = ProcessState::Ready;
     proc->wakeupTick = 0;
-    ReadyQueueInsert(proc);
+    ReadyQueueInsertLocked(proc);
+    SpinlockRelease(g_readyLock);
 }
 
 uint32_t SchedulerReadyCount()
 {
-    if (!g_readyHead) return 0;
+    SpinlockAcquire(g_readyLock);
+    if (!g_readyHead) { SpinlockRelease(g_readyLock); return 0; }
     uint32_t count = 1;
     for (Process* p = g_readyHead->schedNext; p != g_readyHead; p = p->schedNext)
         ++count;
+    SpinlockRelease(g_readyLock);
     return count;
 }
 
@@ -231,65 +266,82 @@ uint32_t SchedulerReadyCount()
 // Context switch logic
 // ---------------------------------------------------------------------------
 
-// Pick the next process to run. Removes it from the ready queue.
-// Returns idle if queue is empty.
-static Process* PickNext()
+// Pick the next process to run. Caller must hold g_readyLock.
+static Process* PickNextLocked()
 {
     if (g_readyHead)
     {
         Process* next = g_readyHead;
-        ReadyQueueRemove(next);
+        ReadyQueueRemoveLocked(next);
         return next;
     }
-    return g_idleProcess;
+    return nullptr; // caller should fall back to idle
 }
 
-// Check blocked processes for timed wakeups.
+// Check blocked processes for timed wakeups (called with NO locks held).
 static void CheckBlockedWakeups()
 {
     uint64_t now = g_lapicTickCount;
+    // Snapshot processes to unblock without holding lock during unblock.
+    Process* toUnblock[MAX_PROCESSES];
+    uint32_t unblockCount = 0;
+
+    SpinlockAcquire(g_allProcLock);
     for (uint32_t i = 0; i < g_processCount; ++i)
     {
         Process* p = g_allProcesses[i];
         if (p->state == ProcessState::Blocked && p->wakeupTick != 0 && now >= p->wakeupTick)
-            SchedulerUnblock(p);
+        {
+            if (unblockCount < MAX_PROCESSES)
+                toUnblock[unblockCount++] = p;
+        }
     }
+    SpinlockRelease(g_allProcLock);
+
+    for (uint32_t i = 0; i < unblockCount; ++i)
+        SchedulerUnblock(toUnblock[i]);
 }
 
-// Reap terminated processes (can't destroy while running on their stack).
+// Reap terminated processes.
 static void ReapTerminated()
 {
+    uint32_t cpu = ThisCpu();
+    SpinlockAcquire(g_allProcLock);
     for (uint32_t i = 0; i < g_processCount; )
     {
         Process* p = g_allProcesses[i];
-        if (p->state == ProcessState::Terminated && p != g_currentProcess)
+        if (p->state == ProcessState::Terminated && p != g_perCpu[cpu].currentProcess)
         {
+            SpinlockRelease(g_allProcLock);
             SerialPrintf("SCHED: reaping '%s' (pid %u)\n", p->name, p->pid);
             ProcessDestroy(p);
-            // ProcessDestroy calls SchedulerRemoveProcess which updates g_allProcesses
+            // ProcessDestroy calls SchedulerRemoveProcess
+            SpinlockAcquire(g_allProcLock);
+            // Restart scan — list was modified.
+            i = 0;
         }
         else
         {
             ++i;
         }
     }
+    SpinlockRelease(g_allProcLock);
 }
 
 // Perform a context switch from `oldProc` to `newProc`.
-// Must be called with interrupts disabled (or from ISR context).
 static void DoSwitch(Process* oldProc, Process* newProc)
 {
-    // Disable interrupts to prevent reentrant timer during the switch.
     __asm__ volatile("cli");
 
-    g_currentProcess = newProc;
+    uint32_t cpu = ThisCpu();
+    g_perCpu[cpu].currentProcess = newProc;
     newProc->state = ProcessState::Running;
-    g_sliceStartTick = g_lapicTickCount;
+    g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
 
-    GdtSetTssRsp0(newProc->kernelStackTop);
-    SetSyscallStack(newProc->kernelStackTop);
+    GdtSetTssRsp0ForCpu(cpu, newProc->kernelStackTop);
+    SetSyscallStack(cpu, newProc->kernelStackTop);
 
-    // Validate FxsaveArea alignment (FXSAVE/FXRSTOR require 16-byte).
+    // Validate FxsaveArea alignment.
     auto oldFxAddr = reinterpret_cast<uintptr_t>(&oldProc->fxsave);
     auto newFxAddr = reinterpret_cast<uintptr_t>(&newProc->fxsave);
     if ((oldFxAddr & 0xF) || (newFxAddr & 0xF))
@@ -299,19 +351,8 @@ static void DoSwitch(Process* oldProc, Process* newProc)
         for (;;) __asm__ volatile("hlt");
     }
 
-    // Validate new context RIP before switching.
-    uint64_t newRip = newProc->savedCtx.rip;
-    if (newRip != 0 && newRip < 0xFFFFFFFF80000000ULL)
-    {
-        SerialPrintf("SCHED FATAL: bad RIP 0x%lx for '%s' (pid %u)\n",
-                     newRip, newProc->name, newProc->pid);
-        for (;;) __asm__ volatile("hlt");
-    }
-
     context_switch(&oldProc->savedCtx, &newProc->savedCtx,
                    &oldProc->fxsave, &newProc->fxsave);
-
-    // When we return here, we've been switched BACK to oldProc.
 }
 
 void SchedulerTimerTick()
@@ -319,67 +360,84 @@ void SchedulerTimerTick()
     if (!g_schedulerRunning)
         return;
 
-    CheckBlockedWakeups();
-    ReapTerminated();
+    // Only BSP (CPU 0) does wakeup checks and reaping to avoid contention.
+    uint32_t cpu = ThisCpu();
+    if (cpu == 0)
+    {
+        CheckBlockedWakeups();
+        ReapTerminated();
+    }
 
-    if (!g_currentProcess)
+    Process* cur = g_perCpu[cpu].currentProcess;
+    if (!cur)
         return;
 
-    // Don't preempt the idle process — it yields naturally via hlt.
-    if (g_currentProcess == g_idleProcess)
+    // Idle — if something became ready, switch to it.
+    if (cur == g_perCpu[cpu].idleProcess)
     {
-        // If something became ready, switch to it.
-        if (g_readyHead)
-        {
-            Process* next = PickNext();
-            DoSwitch(g_idleProcess, next);
-        }
+        SpinlockAcquire(g_readyLock);
+        Process* next = PickNextLocked();
+        SpinlockRelease(g_readyLock);
+        if (next)
+            DoSwitch(cur, next);
         return;
     }
 
-    // Check if timeslice has expired.
-    if (g_lapicTickCount - g_sliceStartTick < SCHED_TIMESLICE_MS)
+    // Check timeslice.
+    if (g_lapicTickCount - g_perCpu[cpu].sliceStartTick < SCHED_TIMESLICE_MS)
         return;
 
     // Timeslice expired — put current back in queue and switch.
-    if (g_currentProcess->state == ProcessState::Running)
+    SpinlockAcquire(g_readyLock);
+    if (cur->state == ProcessState::Running)
     {
-        g_currentProcess->state = ProcessState::Ready;
-        ReadyQueueInsert(g_currentProcess);
+        cur->state = ProcessState::Ready;
+        ReadyQueueInsertLocked(cur);
     }
 
-    Process* old = g_currentProcess;
-    Process* next = PickNext();
-    if (next == old)
+    Process* next = PickNextLocked();
+    SpinlockRelease(g_readyLock);
+
+    if (!next || next == cur)
     {
-        // Same process — just reset timeslice.
-        old->state = ProcessState::Running;
-        g_sliceStartTick = g_lapicTickCount;
+        // Nothing else — keep running.
+        cur->state = ProcessState::Running;
+        g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
         return;
     }
 
-    DoSwitch(old, next);
+    DoSwitch(cur, next);
 }
 
 void SchedulerYield()
 {
-    if (!g_currentProcess)
+    uint32_t cpu = ThisCpu();
+    Process* old = g_perCpu[cpu].currentProcess;
+    if (!old)
         return;
 
-    // Put current back in ready queue (unless blocked/terminated).
-    Process* old = g_currentProcess;
+    SpinlockAcquire(g_readyLock);
     if (old->state == ProcessState::Running)
     {
         old->state = ProcessState::Ready;
-        ReadyQueueInsert(old);
+        ReadyQueueInsertLocked(old);
     }
 
-    Process* next = PickNext();
+    Process* next = PickNextLocked();
+    SpinlockRelease(g_readyLock);
+
     if (!next || next == old)
     {
-        // Nothing else to run — keep running.
-        // PickNext already removed `next` from the queue, so if
-        // next==old it was dequeued. Just restore Running state.
+        // If the process is Blocked/Terminated, it must NOT continue running.
+        // Switch to the idle process so the CPU is available for other work
+        // and the blocked process can be properly rescheduled when unblocked.
+        if (old->state == ProcessState::Blocked ||
+            old->state == ProcessState::Terminated)
+        {
+            next = g_perCpu[cpu].idleProcess;
+            DoSwitch(old, next);
+            return;
+        }
         if (old->state == ProcessState::Ready)
             old->state = ProcessState::Running;
         return;
@@ -390,32 +448,30 @@ void SchedulerYield()
 
 [[noreturn]] void SchedulerExitCurrentProcess(int status)
 {
-    Process* proc = g_currentProcess;
+    uint32_t cpu = ThisCpu();
+    Process* proc = g_perCpu[cpu].currentProcess;
     SerialPrintf("SCHED: '%s' (pid %u) exited with status %d\n",
                  proc->name, proc->pid, status);
 
     proc->state = ProcessState::Terminated;
 
-    // Remove from ready queue if still there.
+    SpinlockAcquire(g_readyLock);
     if (proc->schedNext)
-        ReadyQueueRemove(proc);
+        ReadyQueueRemoveLocked(proc);
+    Process* next = PickNextLocked();
+    SpinlockRelease(g_readyLock);
 
-    // Pick next process.
-    Process* next = PickNext();
-    if (!next) next = g_idleProcess;
+    if (!next) next = g_perCpu[cpu].idleProcess;
 
-    g_currentProcess = next;
+    g_perCpu[cpu].currentProcess = next;
     next->state = ProcessState::Running;
-    g_sliceStartTick = g_lapicTickCount;
-    GdtSetTssRsp0(next->kernelStackTop);
-    SetSyscallStack(next->kernelStackTop);
+    g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
+    GdtSetTssRsp0ForCpu(cpu, next->kernelStackTop);
+    SetSyscallStack(cpu, next->kernelStackTop);
 
-    // We can't call DoSwitch because we don't want to save state for the
-    // terminated process. Just restore the next process's context directly.
     context_switch(&proc->savedCtx, &next->savedCtx,
                    &proc->fxsave, &next->fxsave);
 
-    // Should never reach here.
     __builtin_unreachable();
 }
 
@@ -424,18 +480,20 @@ void SchedulerYield()
     SerialPrintf("SCHED: starting scheduler, %u processes ready\n",
                  SchedulerReadyCount());
 
-    Process* first = PickNext();
-    if (!first) first = g_idleProcess;
+    uint32_t cpu = ThisCpu();
 
-    g_currentProcess = first;
+    SpinlockAcquire(g_readyLock);
+    Process* first = PickNextLocked();
+    SpinlockRelease(g_readyLock);
+
+    if (!first) first = g_perCpu[cpu].idleProcess;
+
+    g_perCpu[cpu].currentProcess = first;
     first->state = ProcessState::Running;
-    g_sliceStartTick = g_lapicTickCount;
-    GdtSetTssRsp0(first->kernelStackTop);
-    SetSyscallStack(first->kernelStackTop);
+    g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
+    GdtSetTssRsp0ForCpu(cpu, first->kernelStackTop);
+    SetSyscallStack(cpu, first->kernelStackTop);
 
-    // For the first process we need to set up CR3 and enter user mode.
-    // The process's savedCtx.rip points to a trampoline that does iretq
-    // into ring 3.
     VmmSwitchPageTable(first->pageTable);
 
     if (first->fsBase)
@@ -445,8 +503,8 @@ void SchedulerYield()
         __asm__ volatile("wrmsr" : : "a"(lo), "d"(hi), "c"(0xC0000100U));
     }
 
-    SerialPrintf("SCHED: entering user mode for '%s' (pid %u)\n",
-                 first->name, first->pid);
+    SerialPrintf("SCHED: CPU%u entering user mode for '%s' (pid %u)\n",
+                 cpu, first->name, first->pid);
 
     g_schedulerRunning = true;
     SwitchToUserMode(first->stackTop, first->elf.entryPoint);
@@ -454,9 +512,79 @@ void SchedulerYield()
     __builtin_unreachable();
 }
 
+// AP entry into the scheduler — called from SmpActivateAPs via the AP wake path.
+[[noreturn]] void SchedulerStartAp()
+{
+    uint32_t cpu = ThisCpu();
+
+    // Wait for BSP to set g_schedulerRunning.
+    while (!__atomic_load_n(&g_schedulerRunning, __ATOMIC_ACQUIRE))
+        __asm__ volatile("pause" ::: "memory");
+
+    // Try to pick a process from the global queue.
+    SpinlockAcquire(g_readyLock);
+    Process* first = PickNextLocked();
+    SpinlockRelease(g_readyLock);
+
+    if (!first) first = g_perCpu[cpu].idleProcess;
+
+    g_perCpu[cpu].currentProcess = first;
+    first->state = ProcessState::Running;
+    g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
+    GdtSetTssRsp0ForCpu(cpu, first->kernelStackTop);
+    SetSyscallStack(cpu, first->kernelStackTop);
+
+    VmmSwitchPageTable(first->pageTable);
+
+    if (first == g_perCpu[cpu].idleProcess)
+    {
+        SerialPrintf("SCHED: CPU%u entering idle\n", cpu);
+        __asm__ volatile("sti");
+        for (;;)
+            __asm__ volatile("hlt" ::: "memory");
+    }
+
+    if (first->fsBase)
+    {
+        uint32_t lo = static_cast<uint32_t>(first->fsBase);
+        uint32_t hi = static_cast<uint32_t>(first->fsBase >> 32);
+        __asm__ volatile("wrmsr" : : "a"(lo), "d"(hi), "c"(0xC0000100U));
+    }
+
+    SerialPrintf("SCHED: CPU%u entering user mode for '%s' (pid %u)\n",
+                 cpu, first->name, first->pid);
+
+    SwitchToUserMode(first->stackTop, first->elf.entryPoint);
+    __builtin_unreachable();
+}
+
+void SchedulerSetCpuEnv(uint32_t cpuIndex, KernelCpuEnv* env)
+{
+    g_perCpu[cpuIndex].cpuEnv = env;
+}
+
+void SchedulerInitApIdle(uint32_t cpuIndex)
+{
+    auto* idle = static_cast<Process*>(kmalloc(sizeof(Process)));
+    __builtin_memset(idle, 0, sizeof(Process));
+    idle->pid = 0;
+    idle->state = ProcessState::Ready;
+    char name[] = "idle0";
+    name[4] = static_cast<char>('0' + (cpuIndex % 10));
+    __builtin_memcpy(idle->name, name, 6);
+    idle->kernelStackBase = reinterpret_cast<uint64_t>(g_idleStacks[cpuIndex]);
+    idle->kernelStackTop  = reinterpret_cast<uint64_t>(g_idleStacks[cpuIndex]) + sizeof(g_idleStacks[cpuIndex]);
+    idle->savedCtx.rsp = idle->kernelStackTop - 8;
+    idle->savedCtx.rip = reinterpret_cast<uint64_t>(&IdleLoop);
+    idle->savedCtx.rflags = 0x202;
+    idle->savedCtx.cr3 = VmmKernelCR3().pml4.raw();
+    idle->pageTable = VmmKernelCR3();
+    g_perCpu[cpuIndex].idleProcess = idle;
+}
+
 Process* ProcessCurrent()
 {
-    return g_currentProcess;
+    return g_perCpu[ThisCpu()].currentProcess;
 }
 
 uint16_t SchedulerAllocPid()

@@ -77,4 +77,8 @@ void IoApicUnmaskIrq(uint8_t irq, uint8_t vector);
 // Mask (disable) an I/O APIC IRQ line.
 void IoApicMaskIrq(uint8_t irq);
 
+// Start the LAPIC timer on the calling AP. Uses the BSP's calibrated
+// ticks-per-ms value. Must be called after the AP has enabled its LAPIC.
+void ApicInitTimerOnAp();
+
 } // namespace brook

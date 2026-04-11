@@ -1237,6 +1237,11 @@ SyscallFn* SyscallGetTable()
     return g_syscallTable;
 }
 
+uint64_t SyscallGetTableAddress()
+{
+    return reinterpret_cast<uint64_t>(g_syscallTable);
+}
+
 // ---------------------------------------------------------------------------
 // Entry point address (for LSTAR MSR)
 // ---------------------------------------------------------------------------

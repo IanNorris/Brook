@@ -3,6 +3,7 @@
 #include "physical_memory.h"
 #include "serial.h"
 #include "mem_tag.h"
+#include "spinlock.h"
 
 namespace brook {
 
@@ -64,6 +65,9 @@ static constexpr uint64_t MIN_BLOCK     = OVERHEAD + ALIGN; // smallest useful b
 static uint8_t* g_heapStart   = nullptr;
 static uint8_t* g_heapEnd     = nullptr;  // exclusive
 static uint64_t g_freeBytes   = 0;
+
+// SMP lock protecting all heap metadata.
+static SpinLock g_heapLock;
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -210,6 +214,8 @@ void* kmalloc(uint64_t size)
 {
     if (size == 0 || g_heapStart == nullptr) return nullptr;
 
+    uint64_t lf = SpinLockAcquire(&g_heapLock);
+
     // Round size up to alignment, then account for overhead.
     uint64_t aligned = (size + ALIGN - 1) & ~(ALIGN - 1);
     uint32_t needed  = static_cast<uint32_t>(aligned + OVERHEAD);
@@ -238,6 +244,7 @@ void* kmalloc(uint64_t size)
 
                 WriteBlock(reinterpret_cast<uint8_t*>(cur), allocSize, 0);
                 g_freeBytes -= allocSize;
+                SpinLockRelease(&g_heapLock, lf);
                 return UserPtr(cur);
             }
 
@@ -245,9 +252,10 @@ void* kmalloc(uint64_t size)
         }
 
         // First pass exhausted — try to expand.
-        if (pass == 0 && !ExpandHeap()) return nullptr;
+        if (pass == 0 && !ExpandHeap()) { SpinLockRelease(&g_heapLock, lf); return nullptr; }
     }
 
+    SpinLockRelease(&g_heapLock, lf);
     return nullptr;
 }
 
@@ -255,9 +263,11 @@ void kfree(void* ptr)
 {
     if (ptr == nullptr) return;
 
+    uint64_t lf = SpinLockAcquire(&g_heapLock);
+
     BlockHeader* h = ToHeader(ptr);
-    if (!IsValidHeader(h)) return; // corrupt or double-free
-    if (h->free) return;           // already free — silent (tests expect this)
+    if (!IsValidHeader(h)) { SpinLockRelease(&g_heapLock, lf); return; }
+    if (h->free) { SpinLockRelease(&g_heapLock, lf); return; }
 
     h->free = 1;
     g_freeBytes += h->size;
@@ -280,6 +290,8 @@ void kfree(void* ptr)
             WriteBlock(reinterpret_cast<uint8_t*>(prev), prev->size + h->size, 1);
         }
     }
+
+    SpinLockRelease(&g_heapLock, lf);
 }
 void* krealloc(void* ptr, uint64_t newSize)
 {

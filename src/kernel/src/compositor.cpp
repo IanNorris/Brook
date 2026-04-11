@@ -18,8 +18,10 @@ static constexpr uint32_t MAX_COMPOSITED = 32;
 static Process* g_compositedProcs[MAX_COMPOSITED] = {};
 static uint32_t g_compositedCount = 0;
 
-// Composite every N ticks (1ms each). 16 ≈ 60fps, 33 ≈ 30fps.
-static constexpr uint32_t COMPOSITE_INTERVAL = 16;
+// Composite every N ticks (1ms each). 16 ≈ 60fps, 33 ≈ 30fps, 100 ≈ 10fps.
+// Under emulation, compositing 4× full-screen VFBs is very expensive;
+// use a higher interval to avoid starving CPU0 processes.
+static constexpr uint32_t COMPOSITE_INTERVAL = 100;
 static uint32_t g_tickCounter = 0;
 
 void CompositorInit()
