@@ -292,7 +292,7 @@ static bool ParseAndLoad(const uint8_t* data, uint64_t size, ParseResult& out)
     uint64_t pageCount = (totalSize + 4095) / 4096;
     // VMM_WRITABLE | VMM_EXEC (exec flag = 0 currently means executable since
     // the kernel's VMM doesn't set NX by default)
-    uint64_t baseVirt = VmmAllocModulePages(pageCount, VMM_WRITABLE, MemTag::Device, KernelPid);
+    uint64_t baseVirt = VmmAllocModulePages(pageCount, VMM_WRITABLE, MemTag::Device, KernelPid).raw();
     if (!baseVirt)
     {
         SerialPuts("module: VMM allocation failed\n");
@@ -347,7 +347,7 @@ static bool ParseAndLoad(const uint8_t* data, uint64_t size, ParseResult& out)
     if (!symtab || !strtab)
     {
         SerialPuts("module: no symbol table\n");
-        VmmFreePages(baseVirt, pageCount);
+        VmmFreePages(VirtualAddress(baseVirt), pageCount);
         return false;
     }
 
@@ -357,7 +357,7 @@ static bool ParseAndLoad(const uint8_t* data, uint64_t size, ParseResult& out)
         if (shdrs[i].sh_type != SHT_RELA) continue;
         if (!ApplyRela(&shdrs[i], data, shdrs, shnum, symtab, symCount, strtab, secs))
         {
-            VmmFreePages(baseVirt, pageCount);
+            VmmFreePages(VirtualAddress(baseVirt), pageCount);
             return false;
         }
     }
@@ -382,14 +382,14 @@ static bool ParseAndLoad(const uint8_t* data, uint64_t size, ParseResult& out)
     if (!modInfo)
     {
         SerialPuts("module: no .modinfo section — missing DECLARE_MODULE?\n");
-        VmmFreePages(baseVirt, pageCount);
+        VmmFreePages(VirtualAddress(baseVirt), pageCount);
         return false;
     }
 
     if (modInfo->magic != MODULE_MAGIC)
     {
         SerialPrintf("module: bad magic 0x%x\n", modInfo->magic);
-        VmmFreePages(baseVirt, pageCount);
+        VmmFreePages(VirtualAddress(baseVirt), pageCount);
         return false;
     }
 
@@ -397,7 +397,7 @@ static bool ParseAndLoad(const uint8_t* data, uint64_t size, ParseResult& out)
     {
         SerialPrintf("module: ABI version mismatch (module=%u kernel=%u)\n",
                      modInfo->abiVersion, MODULE_ABI_VERSION);
-        VmmFreePages(baseVirt, pageCount);
+        VmmFreePages(VirtualAddress(baseVirt), pageCount);
         return false;
     }
 
@@ -491,7 +491,7 @@ ModuleHandle* ModuleLoad(const char* path)
         {
             SerialPrintf("module: '%s' init() returned %d — unloading\n",
                          pr.info->name, rc);
-            VmmFreePages(pr.baseVirt, pr.pageCount);
+            VmmFreePages(VirtualAddress(pr.baseVirt), pr.pageCount);
             return nullptr;
         }
     }
@@ -512,7 +512,7 @@ void ModuleUnload(ModuleHandle* handle)
     if (!handle || !handle->active) return;
     if (handle->info && handle->info->exit)
         handle->info->exit();
-    VmmFreePages(handle->baseVirt, handle->pageCount);
+    VmmFreePages(VirtualAddress(handle->baseVirt), handle->pageCount);
     handle->active    = false;
     handle->info      = nullptr;
     handle->baseVirt  = 0;

@@ -35,3 +35,4 @@ OVMF_VARS.fd
 *.swo
 *~
 .DS_Store
+*.wad

@@ -121,6 +121,7 @@ add_executable(kernel
     src/pmm.cpp
     src/pci.cpp
     src/ramdisk.cpp
+    src/runtime.cpp
     src/syscall.cpp
     src/process.cpp
     src/elf_loader.cpp

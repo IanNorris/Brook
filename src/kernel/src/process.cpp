@@ -3,6 +3,7 @@
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "process.h"
+#include "vfs.h"
 #include "vmm.h"
 #include "pmm.h"
 #include "heap.h"
@@ -112,12 +113,21 @@ static uint64_t SetupUserStack(Process* proc,
     // Work from the top of the stack downward.
     uint64_t sp = proc->stackTop;
 
-    // Helper: push bytes onto the stack
+    // Translate user vaddr to kernel-writable pointer via direct map.
+    auto toKernel = [&](uint64_t userAddr) -> uint8_t* {
+        PhysicalAddress phys = VmmVirtToPhys(proc->pageTable, VirtualAddress(userAddr));
+        return phys ? reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw()) : nullptr;
+    };
+
+    // Helper: push bytes onto the stack (writes via direct map)
     auto pushBytes = [&](const void* data, uint64_t len) -> uint64_t {
         sp -= len;
-        auto* dst = reinterpret_cast<uint8_t*>(sp);
         const auto* src = reinterpret_cast<const uint8_t*>(data);
-        for (uint64_t i = 0; i < len; ++i) dst[i] = src[i];
+        for (uint64_t i = 0; i < len; ++i)
+        {
+            uint8_t* dst = toKernel(sp + i);
+            if (dst) *dst = src[i];
+        }
         return sp;
     };
 
@@ -184,7 +194,8 @@ static uint64_t SetupUserStack(Process* proc,
 // ---------------------------------------------------------------------------
 
 // Forward declaration — implemented in elf_loader.cpp
-bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out);
+bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
+             PageTable pt, uint16_t pid);
 
 Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
                        int argc, const char* const* argv,
@@ -199,34 +210,63 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
 
     proc->pid = 1; // First user process
 
-    // Load ELF binary
-    if (!ElfLoad(elfData, elfSize, &proc->elf))
+    // Create per-process page table
+    proc->pageTable = VmmCreateUserPageTable();
+    if (!proc->pageTable)
+    {
+        SerialPuts("PROC: page table allocation failed\n");
+        kfree(proc);
+        return nullptr;
+    }
+
+    // Load ELF binary into the process's page table (no CR3 switch needed —
+    // ElfLoad writes via the direct physical map).
+    if (!ElfLoad(elfData, elfSize, &proc->elf, proc->pageTable, proc->pid))
     {
         SerialPuts("PROC: ELF load failed\n");
+        VmmDestroyUserPageTable(proc->pageTable);
         kfree(proc);
         return nullptr;
     }
 
     proc->programBreak = proc->elf.programBreakLow;
+    proc->mmapNext = USER_MMAP_BASE;
 
-    // Allocate user stack
+    // Allocate user stack at fixed user-space addresses (below USER_STACK_TOP).
+    // Physical pages are allocated individually and mapped into the process
+    // page table.  No VMALLOC — the stack lives entirely in user-half.
     uint64_t stackPages = USER_STACK_SIZE / 4096;
     uint64_t guardPages = 1;
-    uint64_t stackBase = VmmAllocPages(stackPages + guardPages,
-                                        VMM_WRITABLE | VMM_USER,
-                                        MemTag::User, proc->pid);
-    if (!stackBase)
+    uint64_t totalStackPages = stackPages + guardPages;
+    uint64_t stackVirtTop = USER_STACK_TOP;            // 0x7FFFFFFFE000
+    uint64_t stackVirtBase = stackVirtTop - totalStackPages * 4096;
+
+    bool stackOk = true;
+    for (uint64_t i = guardPages; i < totalStackPages; i++)
+    {
+        VirtualAddress vaddr(stackVirtBase + i * 4096);
+        PhysicalAddress phys = PmmAllocPage(MemTag::User, proc->pid);
+        if (!phys || !VmmMapPage(proc->pageTable, vaddr, phys,
+                                  VMM_WRITABLE | VMM_USER,
+                                  MemTag::User, proc->pid))
+        {
+            stackOk = false;
+            break;
+        }
+        auto* p = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
+        for (uint64_t b = 0; b < 4096; b++) p[b] = 0;
+    }
+    if (!stackOk)
     {
         SerialPuts("PROC: stack allocation failed\n");
+        PmmKillPid(proc->pid);
+        VmmDestroyUserPageTable(proc->pageTable);
         kfree(proc);
         return nullptr;
     }
-
-    // Guard page at the bottom
-    VmmUnmapPage(stackBase);
-
-    proc->stackBase = stackBase + guardPages * 4096;
-    proc->stackTop  = stackBase + (stackPages + guardPages) * 4096 - 8;
+    // Guard page (first page) is left unmapped — faults on stack overflow.
+    proc->stackBase = stackVirtBase + guardPages * 4096;
+    proc->stackTop  = stackVirtTop - 8;
 
     // Set up standard file descriptors
     // fd 0 = stdin (TODO: wire to keyboard)
@@ -248,39 +288,63 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     // Set up TLS if the ELF has a PT_TLS segment
     if (proc->elf.tlsTotalSize > 0)
     {
-        // Allocate TLS block: variant II (x86-64), FS:0 points to the TCB
-        // at the END of the TLS block.
+        // Allocate TLS block at a user-space virtual address.
+        // Place it just below the stack guard page.
         uint64_t tlsPages = (proc->elf.tlsTotalSize + 64 + 4095) / 4096;
-        uint64_t tlsBase = VmmAllocPages(tlsPages, VMM_WRITABLE | VMM_USER,
-                                          MemTag::User, proc->pid);
-        if (tlsBase)
-        {
-            uint8_t* tlsMem = reinterpret_cast<uint8_t*>(tlsBase);
-            // Zero the whole region
-            for (uint64_t i = 0; i < tlsPages * 4096; ++i)
-                tlsMem[i] = 0;
+        uint64_t tlsBase = stackVirtBase - guardPages * 4096 - tlsPages * 4096;
 
-            // Copy initial TLS data
+        // Helper: translate user vaddr to kernel pointer via direct map
+        auto tlsToKernel = [&](uint64_t userAddr) -> uint8_t* {
+            PhysicalAddress phys = VmmVirtToPhys(proc->pageTable, VirtualAddress(userAddr));
+            return phys ? reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw()) : nullptr;
+        };
+
+        bool tlsOk = true;
+        for (uint64_t i = 0; i < tlsPages; i++)
+        {
+            VirtualAddress vaddr(tlsBase + i * 4096);
+            PhysicalAddress phys = PmmAllocPage(MemTag::User, proc->pid);
+            if (!phys || !VmmMapPage(proc->pageTable, vaddr, phys,
+                                      VMM_WRITABLE | VMM_USER,
+                                      MemTag::User, proc->pid))
+            {
+                tlsOk = false;
+                break;
+            }
+            auto* p = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
+            for (uint64_t b = 0; b < 4096; b++) p[b] = 0;
+        }
+
+        if (tlsOk)
+        {
+            // Copy initial TLS data via direct map.
+            // tlsInitData points to user vaddr in the loaded ELF image.
             if (proc->elf.tlsInitData && proc->elf.tlsInitSize > 0)
             {
                 for (uint64_t i = 0; i < proc->elf.tlsInitSize; ++i)
-                    tlsMem[i] = proc->elf.tlsInitData[i];
+                {
+                    uint8_t* src = tlsToKernel(
+                        reinterpret_cast<uint64_t>(proc->elf.tlsInitData) + i);
+                    uint8_t* dst = tlsToKernel(tlsBase + i);
+                    if (src && dst) *dst = *src;
+                }
             }
 
-            // TCB pointer: variant II, FS:0 = pointer to self
-            // Place TCB at end of TLS block
+            // TCB pointer: variant II (x86-64), FS:0 = pointer to self
             uint64_t tcbAddr = tlsBase + proc->elf.tlsTotalSize;
-            // Align up to 16 bytes
             tcbAddr = (tcbAddr + 15) & ~15ULL;
-            auto* tcb = reinterpret_cast<uint64_t*>(tcbAddr);
-            tcb[0] = tcbAddr; // Self-pointer (required by musl/glibc)
+
+            // Write self-pointer via direct map
+            auto* tcbSlot = reinterpret_cast<uint64_t*>(tlsToKernel(tcbAddr));
+            if (tcbSlot) *tcbSlot = tcbAddr; // Self-pointer (user vaddr)
 
             // Stack canary at offset 40 (0x28) from FS base
             uint64_t canary = 0x57a0000012345678ULL;
             if (tcbAddr + 48 < tlsBase + tlsPages * 4096)
             {
-                auto* canarySlot = reinterpret_cast<uint64_t*>(tcbAddr + 0x28);
-                *canarySlot = canary;
+                auto* canarySlot = reinterpret_cast<uint64_t*>(
+                    tlsToKernel(tcbAddr + 0x28));
+                if (canarySlot) *canarySlot = canary;
             }
 
             proc->fsBase = tcbAddr;
@@ -289,9 +353,9 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
 
     g_currentProcess = proc;
 
-    SerialPrintf("PROC: created pid=%u, entry=0x%lx, stack=0x%lx, brk=0x%lx\n",
+    SerialPrintf("PROC: created pid=%u, entry=0x%lx, stack=0x%lx, brk=0x%lx, cr3=0x%lx\n",
                  proc->pid, proc->elf.entryPoint, proc->stackTop,
-                 proc->programBreak);
+                 proc->programBreak, proc->pageTable.pml4.raw());
 
     return proc;
 }
@@ -300,14 +364,26 @@ void ProcessDestroy(Process* proc)
 {
     if (!proc) return;
 
-    // Close all file descriptors
+    // Ensure we're on the kernel page table before tearing down
+    VmmSwitchPageTable(VmmKernelCR3());
+
+    // Close all file descriptors, releasing VFS/device resources
     for (uint32_t i = 0; i < MAX_FDS; ++i)
     {
-        if (proc->fds[i].type != FdType::None)
-            FdFree(proc, static_cast<int>(i));
+        FdEntry& fde = proc->fds[i];
+        if (fde.type == FdType::None) continue;
+
+        if (fde.type == FdType::Vnode && fde.handle)
+            VfsClose(static_cast<Vnode*>(fde.handle));
+
+        FdFree(proc, static_cast<int>(i));
     }
 
-    // TODO: Free user-mode pages (need per-PID page tracking in PMM)
+    // Free all VMM page allocations owned by this process
+    VmmKillPid(proc->pid);
+
+    // Free per-process page table pages
+    VmmDestroyUserPageTable(proc->pageTable);
 
     if (g_currentProcess == proc)
         g_currentProcess = nullptr;

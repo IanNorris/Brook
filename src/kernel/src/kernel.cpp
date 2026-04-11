@@ -88,15 +88,13 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         constexpr uint64_t TOTAL_PAGES = STACK_PAGES + GUARD_PAGES;
 
         // Reserve virtual address range, then map only the stack portion.
-        uint64_t base = brook::VmmAllocPages(TOTAL_PAGES, brook::VMM_WRITABLE,
+        brook::VirtualAddress base = brook::VmmAllocPages(TOTAL_PAGES, brook::VMM_WRITABLE,
                                              brook::MemTag::KernelData, brook::KernelPid);
         if (base)
         {
-            // Unmap the first page to create the guard.
-            brook::VmmUnmapPage(base);
+            brook::VmmUnmapPage(brook::KernelPageTable, base);
 
-            // New stack top is end of allocation, 16-byte aligned.
-            void* newTop = reinterpret_cast<void*>(base + TOTAL_PAGES * 0x1000 - 16);
+            void* newTop = reinterpret_cast<void*>(base.raw() + TOTAL_PAGES * 0x1000 - 16);
             g_kernelStackTop = newTop;
 
             // Switch to the new stack.  We're deep enough in init that nothing
@@ -113,13 +111,13 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         {
             constexpr uint64_t SYSCALL_STACK_PAGES = 16;  // 64 KB
             constexpr uint64_t GUARD_PAGES = 1;
-            uint64_t scBase = brook::VmmAllocPages(
+            brook::VirtualAddress scBase = brook::VmmAllocPages(
                 SYSCALL_STACK_PAGES + GUARD_PAGES,
                 brook::VMM_WRITABLE, brook::MemTag::KernelData, brook::KernelPid);
             if (scBase)
             {
-                brook::VmmUnmapPage(scBase); // guard page
-                uint64_t scTop = scBase + (SYSCALL_STACK_PAGES + GUARD_PAGES) * 0x1000 - 16;
+                brook::VmmUnmapPage(brook::KernelPageTable, scBase); // guard page
+                uint64_t scTop = scBase.raw() + (SYSCALL_STACK_PAGES + GUARD_PAGES) * 0x1000 - 16;
                 env->syscallStack = scTop;
             }
             else
@@ -362,6 +360,17 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         };
         const char* envp[] = { "HOME=/", nullptr };
 
+        // Snapshot baseline resource state before running any user processes.
+        uint64_t baselineFreePages  = brook::PmmGetFreePageCount();
+        uint64_t baselineHeapFree   = brook::HeapFreeBytes();
+        uint32_t baselineVmmAllocs  = brook::VmmCountAllocations();
+
+        brook::SerialPrintf("RESCHECK: baseline — PMM %lu free pages, "
+                            "heap %lu free, VMM %u allocs\n",
+                            (unsigned long)baselineFreePages,
+                            (unsigned long)baselineHeapFree,
+                            baselineVmmAllocs);
+
         for (auto& b : bins)
         {
             brook::Vnode* vn = brook::VfsOpen(b.path1, 0);
@@ -370,14 +379,14 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
             constexpr uint64_t MAX_ELF_SIZE = 2 * 1024 * 1024; // 2 MB (busybox is 1.4MB)
             constexpr uint64_t ELF_BUF_PAGES = MAX_ELF_SIZE / 4096;
-            uint64_t elfBufAddr = brook::VmmAllocPages(ELF_BUF_PAGES,
+            brook::VirtualAddress elfBufAddr = brook::VmmAllocPages(ELF_BUF_PAGES,
                 brook::VMM_WRITABLE, brook::MemTag::Heap, brook::KernelPid);
             brook::SerialPrintf("ELF buf at 0x%lx (%lu pages)\n",
-                                elfBufAddr, ELF_BUF_PAGES);
+                                elfBufAddr.raw(), ELF_BUF_PAGES);
 
             if (!elfBufAddr) { brook::VfsClose(vn); continue; }
 
-            auto* elfBuf = reinterpret_cast<uint8_t*>(elfBufAddr);
+            auto* elfBuf = reinterpret_cast<uint8_t*>(elfBufAddr.raw());
             uint64_t totalRead = 0;
             uint64_t offset = 0;
             while (totalRead < MAX_ELF_SIZE)
@@ -395,7 +404,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
                                                b.argc, b.argv,
                                                1, envp);
 
-            brook::SerialPrintf("Freeing ELF buf at 0x%lx\n", elfBufAddr);
+            brook::SerialPrintf("Freeing ELF buf at 0x%lx\n", elfBufAddr.raw());
             brook::VmmFreePages(elfBufAddr, ELF_BUF_PAGES);
 
             if (proc)
@@ -410,6 +419,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
                                          "c"(0xC0000100U));
                     }
 
+                    // Switch to process page table before entering user mode
+                    brook::VmmSwitchPageTable(proc->pageTable);
+
                     brook::SwitchToUserMode(proc->stackTop,
                                              proc->elf.entryPoint);
 
@@ -418,6 +430,66 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
                     // Reset TTY colors after each process (in case it left ANSI state dirty)
                     brook::TtySetColors(0x00E0E0E0, 0x00001A3A);
+
+                    // ---- Resource leak / integrity checks ----
+                    bool clean = true;
+
+                    // 1. Heap integrity
+                    if (!brook::HeapCheckIntegrity())
+                    {
+                        brook::SerialPrintf("RESCHECK FAIL: heap corruption after '%s'\n", b.name);
+                        clean = false;
+                    }
+
+                    // 2. Heap free bytes should return to baseline
+                    uint64_t heapFreeNow = brook::HeapFreeBytes();
+                    if (heapFreeNow < baselineHeapFree)
+                    {
+                        uint64_t leaked = baselineHeapFree - heapFreeNow;
+                        brook::SerialPrintf("RESCHECK WARN: heap leak after '%s': "
+                                            "%lu bytes not freed\n",
+                                            b.name, (unsigned long)leaked);
+                        clean = false;
+                    }
+
+                    // 3. VMM allocation count should return to baseline
+                    uint32_t vmmAllocsNow = brook::VmmCountAllocations();
+                    if (vmmAllocsNow > baselineVmmAllocs)
+                    {
+                        brook::SerialPrintf("RESCHECK WARN: VMM alloc leak after '%s': "
+                                            "%u allocs (baseline %u)\n",
+                                            b.name, vmmAllocsNow, baselineVmmAllocs);
+                        clean = false;
+                    }
+
+                    // 4. PMM free pages should return to baseline (allow small delta
+                    //    for page table pages that can't easily be reclaimed)
+                    uint64_t freeNow = brook::PmmGetFreePageCount();
+                    if (freeNow + 16 < baselineFreePages)
+                    {
+                        uint64_t leaked = baselineFreePages - freeNow;
+                        brook::SerialPrintf("RESCHECK WARN: PMM leak after '%s': "
+                                            "%lu pages not freed\n",
+                                            b.name, (unsigned long)leaked);
+                        clean = false;
+                    }
+
+                    // 5. ProcessCurrent should be nullptr
+                    if (brook::ProcessCurrent() != nullptr)
+                    {
+                        brook::SerialPrintf("RESCHECK FAIL: ProcessCurrent non-null "
+                                            "after '%s'\n", b.name);
+                        clean = false;
+                    }
+
+                    if (clean)
+                        brook::SerialPrintf("RESCHECK OK: '%s' — clean teardown\n", b.name);
+
+                    // Update baseline for next iteration (page tables are
+                    // not freed, so PMM baseline drifts slightly)
+                    baselineFreePages = freeNow;
+                    baselineHeapFree  = heapFreeNow;
+                    baselineVmmAllocs = vmmAllocsNow;
                 }
                 else
                 {

@@ -117,7 +117,7 @@ static bool EnableLapicMsr()
 static bool MapLapic(uint64_t physBase)
 {
     // LAPIC is a single 4KB page.
-    g_lapicVirt = VmmAllocPages(1, VMM_WRITABLE, MemTag::Device, KernelPid);
+    g_lapicVirt = VmmAllocPages(1, VMM_WRITABLE, MemTag::Device, KernelPid).raw();
     if (g_lapicVirt == 0)
     {
         SerialPuts("APIC: failed to allocate virtual page for LAPIC\n");
@@ -127,11 +127,11 @@ static bool MapLapic(uint64_t physBase)
     // Remap the allocated virtual page to the LAPIC physical page.
     // VmmAllocPages already mapped a physical page there — unmap it first,
     // free the backing page, then map LAPIC physical.
-    uint64_t oldPhys = VmmVirtToPhys(g_lapicVirt);
-    VmmUnmapPage(g_lapicVirt);
+    PhysicalAddress oldPhys = VmmVirtToPhys(KernelPageTable, VirtualAddress(g_lapicVirt));
+    VmmUnmapPage(KernelPageTable, VirtualAddress(g_lapicVirt));
     if (oldPhys) PmmFreePage(oldPhys);
 
-    if (!VmmMapPage(g_lapicVirt, physBase,
+    if (!VmmMapPage(KernelPageTable, VirtualAddress(g_lapicVirt), PhysicalAddress(physBase),
                     VMM_WRITABLE | VMM_NO_EXEC,
                     MemTag::Device, KernelPid))
     {
@@ -327,18 +327,18 @@ bool IoApicInit(uint64_t ioApicPhysical, uint32_t gsiBase)
         return false;
     }
 
-    g_ioApicVirt = VmmAllocPages(1, VMM_WRITABLE, MemTag::Device, KernelPid);
+    g_ioApicVirt = VmmAllocPages(1, VMM_WRITABLE, MemTag::Device, KernelPid).raw();
     if (g_ioApicVirt == 0)
     {
         SerialPuts("IOAPIC: failed to allocate virtual page\n");
         return false;
     }
 
-    uint64_t oldPhys = VmmVirtToPhys(g_ioApicVirt);
-    VmmUnmapPage(g_ioApicVirt);
+    PhysicalAddress oldPhys = VmmVirtToPhys(KernelPageTable, VirtualAddress(g_ioApicVirt));
+    VmmUnmapPage(KernelPageTable, VirtualAddress(g_ioApicVirt));
     if (oldPhys) PmmFreePage(oldPhys);
 
-    if (!VmmMapPage(g_ioApicVirt, ioApicPhysical,
+    if (!VmmMapPage(KernelPageTable, VirtualAddress(g_ioApicVirt), PhysicalAddress(ioApicPhysical),
                     VMM_WRITABLE | VMM_NO_EXEC,
                     MemTag::Device, KernelPid))
     {

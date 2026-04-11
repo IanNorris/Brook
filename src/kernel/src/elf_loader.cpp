@@ -23,7 +23,8 @@ static inline uint64_t AlignDown(uint64_t val, uint64_t align)
     return val & ~(align - 1);
 }
 
-bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out)
+bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
+             PageTable pt, uint16_t pid)
 {
     if (size < sizeof(Elf64_Ehdr))
     {
@@ -98,12 +99,21 @@ bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out)
     SerialPrintf("ELF: loading at 0x%lx-0x%lx (%lu pages)\n",
                  loadBase, loadEnd, loadPages);
 
+    // Helper: translate a user virtual address to a kernel-writable pointer
+    // via the direct physical map, so we can write to user pages without
+    // switching CR3.
+    auto userToKernel = [&](uint64_t userVaddr) -> uint8_t* {
+        PhysicalAddress phys = VmmVirtToPhys(pt, VirtualAddress(userVaddr));
+        if (!phys) return nullptr;
+        return reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
+    };
+
     // Allocate pages for the binary segments only.
     // Program break pages are allocated lazily by sys_brk.
     for (uint64_t page = 0; page < loadPages; ++page)
     {
-        uint64_t vaddr = loadBase + page * 4096;
-        uint64_t phys = PmmAllocPage(MemTag::User, 1);
+        VirtualAddress vaddr(loadBase + page * 4096);
+        PhysicalAddress phys = PmmAllocPage(MemTag::User, pid);
         if (!phys)
         {
             SerialPrintf("ELF: out of memory at page %lu\n", page);
@@ -112,14 +122,13 @@ bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out)
 
         uint64_t flags = VMM_WRITABLE | VMM_USER;
 
-        if (!VmmMapPage(vaddr, phys, flags, MemTag::User, 1))
+        if (!VmmMapPage(pt, vaddr, phys, flags, MemTag::User, pid))
         {
-            SerialPrintf("ELF: failed to map vaddr 0x%lx\n", vaddr);
+            SerialPrintf("ELF: failed to map vaddr 0x%lx\n", vaddr.raw());
             return false;
         }
 
-        // Zero the page
-        auto* p = reinterpret_cast<uint8_t*>(vaddr);
+        auto* p = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
         for (uint64_t b = 0; b < 4096; ++b) p[b] = 0;
     }
 
@@ -135,12 +144,13 @@ bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out)
 
         if (phdr.p_type == PT_LOAD)
         {
-            // Copy file data
-            auto* dst = reinterpret_cast<uint8_t*>(phdr.p_vaddr);
+            // Copy file data via direct map
             const auto* src = data + phdr.p_offset;
-
             for (uint64_t b = 0; b < phdr.p_filesz; ++b)
-                dst[b] = src[b];
+            {
+                uint8_t* dst = userToKernel(phdr.p_vaddr + b);
+                if (dst) *dst = src[b];
+            }
 
             // BSS (p_memsz > p_filesz) is already zeroed from page init above
 
@@ -150,7 +160,8 @@ bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out)
         }
         else if (phdr.p_type == PT_TLS)
         {
-            // TLS template: initial data at p_vaddr, total size = p_memsz
+            // TLS template: record user vaddr and sizes.
+            // The actual data will be copied in ProcessCreate via direct map.
             out->tlsInitData  = reinterpret_cast<uint8_t*>(phdr.p_vaddr);
             out->tlsInitSize  = phdr.p_filesz;
             out->tlsTotalSize = phdr.p_memsz;

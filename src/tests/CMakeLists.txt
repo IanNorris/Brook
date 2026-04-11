@@ -81,7 +81,7 @@ set_source_files_properties(
     "${BROOK_ROOT}/src/third_party/fatfs/source/ffunicode.c"
     TARGET_DIRECTORY test_vfs
     PROPERTIES COMPILE_OPTIONS
-        "-Wno-unused-parameter;-Wno-unused-function;-Wno-sign-compare;-Wno-implicit-fallthrough"
+        "-Wno-unused-parameter;-Wno-unused-function;-Wno-sign-compare;-Wno-implicit-fallthrough;-Wno-unused-variable"
 )
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "" FORCE)

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include "address.h"
 
 namespace brook {
 
@@ -16,6 +17,10 @@ static constexpr uint64_t USER_STACK_SIZE = 128 * 1024; // 128 KB
 // User-space virtual address where ELF binaries are loaded.
 // This is in the lower canonical half (user space).
 static constexpr uint64_t USER_LOAD_BASE = 0x400000;
+
+// User mmap region starts at 256MB (above ELF load area, below stack).
+static constexpr uint64_t USER_MMAP_BASE = 0x10000000ULL;   // 256 MB
+static constexpr uint64_t USER_MMAP_END  = 0x700000000000ULL; // well below stack
 
 // User stack top (grows down from here).
 static constexpr uint64_t USER_STACK_TOP = 0x7FFFFFFFE000ULL;
@@ -77,11 +82,15 @@ struct Process
     uint16_t _pad0;
     uint32_t _pad1;
 
+    // Per-process page table
+    PageTable pageTable;
+
     // ELF binary info
     ElfBinary elf;
 
     // Memory
     uint64_t programBreak;      // Current brk() position
+    uint64_t mmapNext;          // Next free user-space mmap virtual address
 
     // User stack
     uint64_t stackBase;         // Bottom of stack allocation (lowest address)

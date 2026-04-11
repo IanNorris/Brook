@@ -85,6 +85,9 @@ extern "C" int VfsReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie);
 // Stat a vnode.
 int VfsStat(Vnode* vn, VnodeStat* st);
 
+// Stat by path — uses directory metadata only, does NOT open the file.
+extern "C" int VfsStatPath(const char* path, VnodeStat* st);
+
 // Close and free a vnode.
 extern "C" void VfsClose(Vnode* vn);
 

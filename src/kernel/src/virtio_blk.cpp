@@ -170,36 +170,32 @@ static bool AllocVirtqueue(VirtioBlkState& s)
     SerialPrintf("virtio: alloc queue: N=%u descSz=%u availSz=%u usedOff=%u usedSz=%u totalPg=%u\n",
                  N, descSize, availSize, usedOff, usedSize, totalPages);
 
-    uint64_t qVirt = VmmAllocPages(totalPages, VMM_WRITABLE, MemTag::Device, KernelPid);
+    uint64_t qVirt = VmmAllocPages(totalPages, VMM_WRITABLE, MemTag::Device, KernelPid).raw();
     if (!qVirt) return false;
     SerialPrintf("virtio: queue virt=0x%lx pages=%u usedIdx_virt=0x%lx\n",
                  qVirt, totalPages,
                  qVirt + usedOff + 2);
 
-    // Zero the pages.
     uint8_t* base = reinterpret_cast<uint8_t*>(qVirt);
     for (uint32_t i = 0; i < totalPages * 4096; ++i) base[i] = 0;
 
     s.descTable  = reinterpret_cast<VirtqDesc*>(qVirt);
 
-    // Available ring immediately after descriptor table.
     uint8_t* availBase = base + descSize;
     s.availFlags = reinterpret_cast<uint16_t*>(availBase);
     s.availIdx   = reinterpret_cast<uint16_t*>(availBase + 2);
     s.availRing  = reinterpret_cast<uint16_t*>(availBase + 4);
 
-    // Used ring starts at the next page boundary.
     uint8_t* usedBase = base + usedOff;
     s.usedFlags = reinterpret_cast<uint16_t*>(usedBase);
     s.usedIdx   = reinterpret_cast<volatile uint16_t*>(usedBase + 2);
     s.usedRing  = reinterpret_cast<VirtqUsedElem*>(usedBase + 4);
 
-    s.queuePhys = VmmVirtToPhys(qVirt);
+    s.queuePhys = VmmVirtToPhys(KernelPageTable, VirtualAddress(qVirt)).raw();
 
-    // Request/status buffers on the last page.
     uint64_t extraVirt = qVirt + (totalPages - 1) * 4096;
     s.reqBuf         = reinterpret_cast<VirtioBlkReq*>(extraVirt);
-    s.reqBufPhys     = VmmVirtToPhys(extraVirt);
+    s.reqBufPhys     = VmmVirtToPhys(KernelPageTable, VirtualAddress(extraVirt)).raw();
     s.statusBuf      = reinterpret_cast<uint8_t*>(extraVirt + sizeof(VirtioBlkReq));
     s.statusBufPhys  = s.reqBufPhys + sizeof(VirtioBlkReq);
 
@@ -463,14 +459,14 @@ static Device* InitOnePciDevice(const PciDevice& pci, uint32_t slot)
     }
 
     // Allocate persistent page-aligned DMA data buffer.
-    state->dmaBufPhys = PmmAllocPage(MemTag::KernelData);
+    state->dmaBufPhys = PmmAllocPage(MemTag::KernelData).raw();
     if (state->dmaBufPhys == 0)
     {
         SerialPuts("virtio-blk: DMA buffer allocation failed\n");
         kfree(state);
         return nullptr;
     }
-    state->dmaBuf = reinterpret_cast<uint8_t*>(PhysToVirt(state->dmaBufPhys));
+    state->dmaBuf = reinterpret_cast<uint8_t*>(PhysToVirt(PhysicalAddress(state->dmaBufPhys)).raw());
 
     // Write queue PFN.
     uint32_t pfn = static_cast<uint32_t>(state->queuePhys >> 12);
