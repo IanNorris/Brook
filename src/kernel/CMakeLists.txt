@@ -164,7 +164,7 @@ add_executable(kernel
     src/sync/ksemaphore.cpp
     src/sched_policy.cpp
     # Scheduler modules (statically linked for now; will be .mod later)
-    "${BROOK_ROOT}/src/modules/sched_rr.cpp"
+    "${BROOK_ROOT}/src/modules/sched_mlfq.cpp"
     # Memory subsystem
     src/memory/virtual_memory.cpp
     src/memory/physical_memory.cpp

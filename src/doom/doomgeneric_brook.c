@@ -192,6 +192,18 @@ static void handleKeyInput(void)
     }
 }
 
+static int uptime = 0;
+static int s_FrameCount = 0;
+static int s_FrameLimit = 0;  // 0 = unlimited
+static long s_StartTimeMs = 0;
+
+static long getWallTimeMs(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
 void DG_DrawFrame()
 {
     if (FrameBuffer)
@@ -207,16 +219,21 @@ void DG_DrawFrame()
     handleKeyInput();
 
     s_FrameCount++;
+    if (s_FrameCount == 1)
+        s_StartTimeMs = getWallTimeMs();
+
     if (s_FrameLimit > 0 && s_FrameCount >= s_FrameLimit)
     {
-        printf("BENCH: %d frames completed in %d ms\n", s_FrameCount, uptime);
-        exit(0);
+        long elapsed = getWallTimeMs() - s_StartTimeMs;
+        printf("BENCH: %d frames in %ld ms (wall)\n", s_FrameCount, elapsed);
+        // Spin forever instead of exit() — process exit has a known bug
+        // with page table cleanup. This lets all instances report results.
+        for (;;) {
+            struct timespec ts = { 1, 0 };
+            nanosleep(&ts, NULL);
+        }
     }
 }
-
-static int uptime = 0;
-static int s_FrameCount = 0;
-static int s_FrameLimit = 0;  // 0 = unlimited
 
 void DG_SleepMs(uint32_t ms)
 {
@@ -258,6 +275,20 @@ void DG_SetWindowTitle(const char* title)
 
 int main(int argc, char** argv)
 {
+    // Parse and strip -frames N before passing argv to DOOM engine.
+    for (int i = 1; i < argc - 1; i++)
+    {
+        if (strcmp(argv[i], "-frames") == 0)
+        {
+            s_FrameLimit = atoi(argv[i + 1]);
+            // Remove -frames N from argv by shifting remaining args down.
+            for (int j = i; j < argc - 2; j++)
+                argv[j] = argv[j + 2];
+            argc -= 2;
+            break;
+        }
+    }
+
     doomgeneric_Create(argc, argv);
 
     for (;;)

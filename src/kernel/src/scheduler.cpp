@@ -285,8 +285,8 @@ void SchedulerBlock(Process* proc)
 
     uint64_t rlf3 = SchedLockAcquire(g_readyLock);
     proc->state = ProcessState::Blocked;
-    g_schedOps->VoluntaryYield(g_schedState, proc->pid);
     ReadyQueueRemoveLocked(proc);
+    g_schedOps->VoluntaryYield(g_schedState, proc->pid);
     SchedLockRelease(g_readyLock, rlf3);
 
     uint32_t cpu = ThisCpu();

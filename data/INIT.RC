@@ -10,35 +10,35 @@ set scale 4
 set vfb 640x400
 
 # Launch 32 DOOM instances
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
-run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000

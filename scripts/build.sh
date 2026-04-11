@@ -43,13 +43,17 @@ cmake \
 echo "Building..."
 cmake --build "${BUILD_DIR}"
 
-# Build host-native tests (uses nix-wrapped clang++ with standard host libs)
+# Build host-native tests (uses nix-wrapped clang++ with standard host libs).
+# HOST_CXX is set by shell.nix to the wrapped Clang+libc++ toolchain;
+# CC/CXX remain the unwrapped Clang used for kernel cross-compilation.
 echo "Building host tests..."
 HOST_TEST_DIR="${BUILD_DIR}/host_tests"
 mkdir -p "${HOST_TEST_DIR}"
+HOST_COMPILER="${HOST_CXX:-${CXX:-c++}}"
 cmake \
     -S "${ROOT_DIR}/src/tests/host" \
     -B "${HOST_TEST_DIR}" \
+    -DCMAKE_CXX_COMPILER="${HOST_COMPILER}" \
     -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
     -DBROOK_ROOT="${ROOT_DIR}" \
     -G Ninja 2>/dev/null
