@@ -1,8 +1,10 @@
 // context_switch.S — Low-level context switch for Brook OS scheduler.
 //
-// void context_switch(SavedContext* old, SavedContext* new);
+// void context_switch(SavedContext* old, SavedContext* new,
+//                     FxsaveArea* oldFx, FxsaveArea* newFx);
 //
-// Saves callee-saved registers into `old`, restores from `new`.
+// Saves callee-saved registers + SSE state into old/oldFx,
+// restores from new/newFx.
 // If old->cr3 != new->cr3, writes CR3 to switch page tables.
 // Sets IA32_FS_BASE MSR from new->fsBase for TLS.
 //
@@ -24,10 +26,13 @@
 .type context_switch, @function
 
 context_switch:
-    // --- Save current (old) context ---
     // RDI = old SavedContext*, RSI = new SavedContext*
+    // RDX = old FxsaveArea*,  RCX = new FxsaveArea*
 
-    // Save callee-saved GPRs
+    // --- Save SSE/FPU state first (before any XMM clobber) ---
+    fxsave (%rdx)
+
+    // --- Save callee-saved GPRs ---
     movq %r15,  0(%rdi)
     movq %r14,  8(%rdi)
     movq %r13, 16(%rdi)
@@ -38,8 +43,7 @@ context_switch:
     // Save stack pointer
     movq %rsp, 48(%rdi)
 
-    // Save return address as RIP (caller's return address is on the stack)
-    // We use a label so the old context resumes right after the switch.
+    // Save resume address
     leaq .Lresume(%rip), %rax
     movq %rax, 56(%rdi)
 
@@ -52,21 +56,9 @@ context_switch:
     movq %cr3, %rax
     movq %rax, 72(%rdi)
 
-    // --- FXSAVE old SSE/FPU state ---
-    // old FxsaveArea is at offset sizeof(SavedContext) = 88 bytes in Process,
-    // but we receive SavedContext*, not Process*. The caller passes
-    // &proc->savedCtx, and fxsave is the next field. So fxsaveArea is at
-    // savedCtx + sizeof(SavedContext) = +88.
-    // Actually, let's compute it: SavedContext has 11 uint64_t = 88 bytes.
-    // But FxsaveArea must be 16-byte aligned. The struct is alignas(16).
-    // In the Process struct, savedCtx is followed by fxsave.
-    // offset of fxsave from savedCtx = sizeof(SavedContext) padded to 16.
-    // SavedContext = 88 bytes, padded to 96 for alignment.
-    // So fxsave is at savedCtx + 96.
-    // Wait — we should just pass the fxsave pointer separately or compute
-    // from Process*. For simplicity, we'll save/restore fxsave from C++ side.
-    // The asm only handles GPRs + CR3 + fsBase. FXSAVE/FXRSTOR is done by
-    // the scheduler C++ code bracketing this call.
+    // Save RCX (new FxsaveArea*) — we need it after stack switch.
+    // Stash in R8 which is caller-saved and we don't need to preserve.
+    movq %rcx, %r8
 
     // --- Restore new context ---
 
@@ -85,7 +77,6 @@ context_switch:
     movl $0xC0000100, %ecx
     movq %rax, %rdx
     shrq $32, %rdx
-    // RAX already has low 32 bits (wrmsr uses EAX:EDX)
     wrmsr
 .Lskip_fsbase:
 
@@ -105,12 +96,14 @@ context_switch:
     // Restore stack pointer
     movq 48(%rsi), %rsp
 
+    // Restore SSE/FPU state (R8 = new FxsaveArea*)
+    fxrstor (%r8)
+
     // Jump to saved RIP
     jmpq *56(%rsi)
 
 .Lresume:
-    // We arrive here when this context is switched BACK to.
-    // The C++ caller's stack frame is intact, so we just return.
+    // Switched back to this context. C++ call frame is intact.
     ret
 
 .size context_switch, . - context_switch

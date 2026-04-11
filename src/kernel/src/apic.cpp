@@ -167,12 +167,18 @@ static void SoftEnableLapic()
 // Used by syscall timing (clock_gettime, nanosleep).
 volatile uint64_t g_lapicTickCount = 0;
 
+// Forward-declare scheduler tick (defined in scheduler.cpp).
+void SchedulerTimerTick();
+
 __attribute__((interrupt))
 static void LapicTimerHandler(InterruptFrame* frame)
 {
     (void)frame;
     g_lapicTickCount++;
     LapicWrite(LapicReg::EOI, 0);
+
+    // Drive the scheduler — checks timeslice expiry and blocked wakeups.
+    SchedulerTimerTick();
 }
 
 // ---------------------------------------------------------------------------

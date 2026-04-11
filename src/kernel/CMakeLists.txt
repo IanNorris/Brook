@@ -196,6 +196,7 @@ target_compile_options(kernel PRIVATE
 set_source_files_properties(
     src/idt.cpp
     src/apic.cpp
+    src/scheduler.cpp
     src/keyboard.cpp
     src/panic.cpp
     PROPERTIES COMPILE_OPTIONS "-mgeneral-regs-only;-mno-sse;-mno-sse2;-mfpmath="

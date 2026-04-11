@@ -22,6 +22,7 @@
 #include "virtio_blk.h"
 #include "syscall.h"
 #include "process.h"
+#include "scheduler.h"
 #include "fat_test_image.h"
 
 // All kernel initialization and runtime — called by KernelMain after stack switch.
@@ -340,7 +341,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     }
 
     // ---- User-mode ELF binaries ----
-    // Run each available binary in order; they exit back to kernel sequentially.
+    // Create all processes and hand them to the scheduler.
     {
         struct BinaryDef {
             const char* path1; const char* path2; const char* name;
@@ -360,16 +361,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         };
         const char* envp[] = { "HOME=/", nullptr };
 
-        // Snapshot baseline resource state before running any user processes.
-        uint64_t baselineFreePages  = brook::PmmGetFreePageCount();
-        uint64_t baselineHeapFree   = brook::HeapFreeBytes();
-        uint32_t baselineVmmAllocs  = brook::VmmCountAllocations();
-
-        brook::SerialPrintf("RESCHECK: baseline — PMM %lu free pages, "
-                            "heap %lu free, VMM %u allocs\n",
-                            (unsigned long)baselineFreePages,
-                            (unsigned long)baselineHeapFree,
-                            baselineVmmAllocs);
+        // Initialise the scheduler (creates idle process).
+        brook::SchedulerInit();
 
         for (auto& b : bins)
         {
@@ -377,12 +370,10 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             if (!vn) vn = brook::VfsOpen(b.path2, 0);
             if (!vn) continue;
 
-            constexpr uint64_t MAX_ELF_SIZE = 2 * 1024 * 1024; // 2 MB (busybox is 1.4MB)
+            constexpr uint64_t MAX_ELF_SIZE = 2 * 1024 * 1024;
             constexpr uint64_t ELF_BUF_PAGES = MAX_ELF_SIZE / 4096;
             brook::VirtualAddress elfBufAddr = brook::VmmAllocPages(ELF_BUF_PAGES,
                 brook::VMM_WRITABLE, brook::MemTag::Heap, brook::KernelPid);
-            brook::SerialPrintf("ELF buf at 0x%lx (%lu pages)\n",
-                                elfBufAddr.raw(), ELF_BUF_PAGES);
 
             if (!elfBufAddr) { brook::VfsClose(vn); continue; }
 
@@ -404,137 +395,34 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
                                                b.argc, b.argv,
                                                1, envp);
 
-            brook::SerialPrintf("Freeing ELF buf at 0x%lx\n", elfBufAddr.raw());
             brook::VmmFreePages(elfBufAddr, ELF_BUF_PAGES);
 
             if (proc)
-                {
-                    brook::SerialPuts("USER: entering ring 3...\n");
-
-                    if (proc->fsBase)
-                    {
-                        uint32_t lo = static_cast<uint32_t>(proc->fsBase);
-                        uint32_t hi = static_cast<uint32_t>(proc->fsBase >> 32);
-                        __asm__ volatile("wrmsr" : : "a"(lo), "d"(hi),
-                                         "c"(0xC0000100U));
-                    }
-
-                    // Switch to process page table before entering user mode
-                    brook::VmmSwitchPageTable(proc->pageTable);
-
-                    brook::SwitchToUserMode(proc->stackTop,
-                                             proc->elf.entryPoint);
-
-                    brook::SerialPrintf("USER: '%s' returned from ring 3\n", b.name);
-                    brook::ProcessDestroy(proc);
-
-                    // Reset TTY colors after each process (in case it left ANSI state dirty)
-                    brook::TtySetColors(0x00E0E0E0, 0x00001A3A);
-
-                    // ---- Resource leak / integrity checks ----
-                    bool clean = true;
-
-                    // 1. Heap integrity
-                    if (!brook::HeapCheckIntegrity())
-                    {
-                        brook::SerialPrintf("RESCHECK FAIL: heap corruption after '%s'\n", b.name);
-                        clean = false;
-                    }
-
-                    // 2. Heap free bytes should return to baseline
-                    uint64_t heapFreeNow = brook::HeapFreeBytes();
-                    if (heapFreeNow < baselineHeapFree)
-                    {
-                        uint64_t leaked = baselineHeapFree - heapFreeNow;
-                        brook::SerialPrintf("RESCHECK WARN: heap leak after '%s': "
-                                            "%lu bytes not freed\n",
-                                            b.name, (unsigned long)leaked);
-                        clean = false;
-                    }
-
-                    // 3. VMM allocation count should return to baseline
-                    uint32_t vmmAllocsNow = brook::VmmCountAllocations();
-                    if (vmmAllocsNow > baselineVmmAllocs)
-                    {
-                        brook::SerialPrintf("RESCHECK WARN: VMM alloc leak after '%s': "
-                                            "%u allocs (baseline %u)\n",
-                                            b.name, vmmAllocsNow, baselineVmmAllocs);
-                        clean = false;
-                    }
-
-                    // 4. PMM free pages should return to baseline (allow small delta
-                    //    for page table pages that can't easily be reclaimed)
-                    uint64_t freeNow = brook::PmmGetFreePageCount();
-                    if (freeNow + 16 < baselineFreePages)
-                    {
-                        uint64_t leaked = baselineFreePages - freeNow;
-                        brook::SerialPrintf("RESCHECK WARN: PMM leak after '%s': "
-                                            "%lu pages not freed\n",
-                                            b.name, (unsigned long)leaked);
-                        clean = false;
-                    }
-
-                    // 5. ProcessCurrent should be nullptr
-                    if (brook::ProcessCurrent() != nullptr)
-                    {
-                        brook::SerialPrintf("RESCHECK FAIL: ProcessCurrent non-null "
-                                            "after '%s'\n", b.name);
-                        clean = false;
-                    }
-
-                    if (clean)
-                        brook::SerialPrintf("RESCHECK OK: '%s' — clean teardown\n", b.name);
-
-                    // Update baseline for next iteration (page tables are
-                    // not freed, so PMM baseline drifts slightly)
-                    baselineFreePages = freeNow;
-                    baselineHeapFree  = heapFreeNow;
-                    baselineVmmAllocs = vmmAllocsNow;
-                }
-                else
-                {
-                    brook::SerialPrintf("USER: ProcessCreate failed for '%s'\n", b.name);
-                }
-        } // end for each binary
-    }
-
-    // Keyboard: the ps2_kbd module calls KbdInit(). If the module wasn't
-    // loaded (e.g. no /boot), fall back to initialising directly.
-    if (acpiOk && !brook::KbdIsAvailable())
-    {
-        brook::KPuts("KBD: ps2_kbd module not loaded — falling back to direct init\n");
-        brook::KbdInit();
-    }
-
-    // Enable interrupts.
-    __asm__ volatile("sti");
-
-    // Simple echo loop — type to see output on TTY and serial.
-    if (brook::KbdIsAvailable())
-    {
-        brook::KPuts("\nType something (keyboard echo):\n> ");
-        for (;;)
-        {
-            char c = brook::KbdGetChar();
-            if (c == '\b')
             {
-                // Rudimentary backspace: overwrite with space.
-                brook::KPuts("\b \b");
-            }
-            else if (c == '\n')
-            {
-                brook::KPuts("\n> ");
+                // Copy name into process struct for debug output.
+                for (int i = 0; b.name[i] && i < 31; ++i)
+                    proc->name[i] = b.name[i];
+                brook::SchedulerAddProcess(proc);
             }
             else
             {
-                char buf[2] = { c, '\0' };
-                brook::KPuts(buf);
+                brook::SerialPrintf("USER: ProcessCreate failed for '%s'\n", b.name);
             }
         }
+
+        brook::SerialPrintf("SCHED: all processes created, starting scheduler...\n");
+
+        // Initialise keyboard before entering user mode (DOOM needs it).
+        if (acpiOk && !brook::KbdIsAvailable())
+        {
+            brook::KPuts("KBD: ps2_kbd module not loaded — falling back to direct init\n");
+            brook::KbdInit();
+        }
+
+        brook::SchedulerStart();
+        // SchedulerStart never returns.
     }
-    else
-    {
-        brook::KPuts("\nNo keyboard available — halting.\n");
-        for (;;) { __asm__ volatile("hlt"); }
-    }
+
+    // Unreachable — SchedulerStart is [[noreturn]].
+    for (;;) { __asm__ volatile("hlt"); }
 }

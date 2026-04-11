@@ -8,6 +8,7 @@
 #include "serial.h"
 #include "panic.h"
 #include "process.h"
+#include "scheduler.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "vfs.h"
@@ -24,51 +25,68 @@ extern "C" __attribute__((naked)) void ReturnToKernel();
 extern "C" __attribute__((naked, used)) void BrookSyscallDispatcher()
 {
     __asm__ volatile(
-        "push %%rcx\n\t"
         "swapgs\n\t"
-        "mov %%rsp, %%rcx\n\t"
+        "movq %%r11, %%gs:24\n\t"      // stash user RFLAGS
+        "mov %%rsp, %%r11\n\t"          // r11 = user RSP
         "mov %%gs:8, %%rsp\n\t"
         "and $~0xF, %%rsp\n\t"
-        "push %%rcx\n\t"
-        "push %%r11\n\t"
-        "push %%rbp\n\t"
+        "push %%r11\n\t"               // [1] user RSP
+        "push %%rcx\n\t"               // [2] user return address
+        "movq %%gs:24, %%r11\n\t"       // reload user RFLAGS
+        "push %%r11\n\t"               // [3] user RFLAGS
+        "push %%rbp\n\t"               // [4]
         "mov %%rsp, %%rbp\n\t"
-        "push %%rdx\n\t"
-        "push %%rsi\n\t"
-        "push %%rdi\n\t"
-        "push %%r8\n\t"
-        "push %%r9\n\t"
-        "push %%r11\n\t"
-        "push %%r12\n\t"
-        "push %%r14\n\t"
-        "push %%r15\n\t"
+        "push %%rdx\n\t"               // [5]
+        "push %%rsi\n\t"               // [6]
+        "push %%rdi\n\t"               // [7]
+        "push %%r8\n\t"                // [8]
+        "push %%r9\n\t"                // [9]
+        "push %%r10\n\t"               // [10] preserve R10
+        "push %%r11\n\t"               // [11]
+        "push %%r12\n\t"               // [12]
+        "push %%r14\n\t"               // [13]
+        "push %%r15\n\t"               // [14] — 14 pushes = 112 bytes, aligned
         "mov %%r10, %%rcx\n\t"
         "cmp $400, %%rax\n\t"
         "jae .Lsyscall_invalid\n\t"
         "mov %%gs:16, %%r12\n\t"
-        "sti\n\t"                       // Re-enable interrupts for syscall handlers
+        "sti\n\t"
         "call *(%%r12, %%rax, 8)\n\t"
-        "cli\n\t"                       // Disable interrupts for sysret sequence
+        "cli\n\t"
         "jmp .Lsyscall_return\n\t"
         ".Lsyscall_invalid:\n\t"
         "mov $-38, %%rax\n\t"
         ".Lsyscall_return:\n\t"
-        "pop %%r15\n\t"
-        "pop %%r14\n\t"
-        "pop %%r12\n\t"
-        "pop %%r11\n\t"
-        "pop %%r9\n\t"
-        "pop %%r8\n\t"
-        "pop %%rdi\n\t"
-        "pop %%rsi\n\t"
-        "pop %%rdx\n\t"
-        "pop %%rbp\n\t"
-        "popfq\n\t"
-        "pop %%rsp\n\t"
+        "pop %%r15\n\t"                // [14]
+        "pop %%r14\n\t"                // [13]
+        "pop %%r12\n\t"                // [12]
+        "pop %%r11\n\t"                // [11]
+        "pop %%r10\n\t"                // [10]
+        "pop %%r9\n\t"                 // [9]
+        "pop %%r8\n\t"                 // [8]
+        "pop %%rdi\n\t"                // [7]
+        "pop %%rsi\n\t"                // [6]
+        "pop %%rdx\n\t"                // [5]
+        "pop %%rbp\n\t"                // [4]
+        "pop %%r11\n\t"                // [3] user RFLAGS
+        "pop %%rcx\n\t"                // [2] user return address
+        // Validate RCX is a canonical user-mode address before sysret.
+        // Use bt to test bit 47 without clobbering any GPR.
+        "bt $47, %%rcx\n\t"
+        "jc .Lsysret_bad_rcx\n\t"
         "swapgs\n\t"
-        "pop %%rcx\n\t"
+        "mov (%%rsp), %%rsp\n\t"       // [1] user RSP
         ".byte 0x48\n\t"
         "sysret\n\t"
+        ".Lsysret_bad_rcx:\n\t"
+        "mov $0x3F8, %%dx\n\t"
+        "mov $0x58, %%al\n\t"
+        "outb %%al, (%%dx)\n\t"
+        "int3\n\t"
+        "cli\n\t"
+        ".Lsysret_halt:\n\t"
+        "hlt\n\t"
+        "jmp .Lsysret_halt\n\t"
         ::: "memory"
     );
 }
@@ -509,7 +527,8 @@ static int64_t sys_exit(uint64_t status, uint64_t, uint64_t,
                          uint64_t, uint64_t, uint64_t)
 {
     SerialPrintf("sys_exit: process exited with status %lu\n", status);
-    ReturnToKernel();
+    SchedulerExitCurrentProcess(static_cast<int>(status));
+    // never reached
     return 0;
 }
 
@@ -664,9 +683,14 @@ static int64_t sys_nanosleep(uint64_t reqAddr, uint64_t remAddr, uint64_t,
     uint64_t sleepMs = static_cast<uint64_t>(req->tv_sec) * 1000 +
                        static_cast<uint64_t>(req->tv_nsec) / 1000000;
 
-    uint64_t target = g_lapicTickCount + sleepMs;
-    while (g_lapicTickCount < target)
-        __asm__ volatile("pause");
+    if (sleepMs > 0)
+    {
+        // Block the process and let the scheduler wake us up.
+        Process* proc = ProcessCurrent();
+        proc->wakeupTick = g_lapicTickCount + sleepMs;
+        SchedulerBlock(proc);
+        // When we return here, the scheduler has woken us up.
+    }
 
     if (remAddr)
     {

@@ -209,8 +209,25 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
     }
 
     // Walk the frame-pointer chain from the exception context.
-    // For interrupt handlers, RBP in the handler frame points back through
-    // the interrupted code's frame chain.
+    // For user-mode faults, dump a few values from the user stack to help debug.
+    if ((frame->cs & 3) == 3)  // user mode
+    {
+        brook::SerialPuts("  --- user stack dump (RSP) ---\n");
+        auto userRsp = frame->sp;
+        // Read up to 8 values from the user stack for debugging.
+        for (int i = 0; i < 8; ++i)
+        {
+            auto addr = userRsp + static_cast<uint64_t>(i) * 8;
+            if (addr >= 0x800000000000ULL) break;  // not user space
+            uint64_t val = *reinterpret_cast<uint64_t*>(addr);
+            brook::SerialPuts("    [RSP+");
+            ExcPutHex(static_cast<uint64_t>(i * 8));
+            brook::SerialPuts("] = ");
+            ExcPutHex(val);
+            brook::SerialPuts("\n");
+        }
+        brook::SerialPuts("  --- end user stack ---\n");
+    }
     ExcStackWalk(rbp, 32);
 
     brook::SerialPuts("=== HALTED ===\n");

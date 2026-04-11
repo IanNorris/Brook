@@ -13,7 +13,8 @@
 namespace brook { extern volatile uint64_t g_lapicTickCount; }
 
 // Context switch — implemented in context_switch.S
-extern "C" void context_switch(brook::SavedContext* oldCtx, brook::SavedContext* newCtx);
+extern "C" void context_switch(brook::SavedContext* oldCtx, brook::SavedContext* newCtx,
+                                brook::FxsaveArea* oldFx, brook::FxsaveArea* newFx);
 
 // Enter user mode for the first time (existing function in syscall.cpp).
 namespace brook { void SwitchToUserMode(uint64_t userRsp, uint64_t userRip); }
@@ -104,8 +105,6 @@ static void IdleLoop()
 
 void SchedulerInit()
 {
-    // Create the idle process (pid 0). It doesn't go in the ready queue —
-    // the scheduler falls back to it when the queue is empty.
     g_idleProcess = static_cast<Process*>(kmalloc(sizeof(Process)));
     __builtin_memset(g_idleProcess, 0, sizeof(Process));
 
@@ -113,14 +112,12 @@ void SchedulerInit()
     g_idleProcess->state = ProcessState::Ready;
     __builtin_memcpy(g_idleProcess->name, "idle", 5);
 
-    // Idle runs on a static kernel stack, ring 0 only.
     g_idleProcess->kernelStackBase = reinterpret_cast<uint64_t>(g_idleStack);
     g_idleProcess->kernelStackTop  = reinterpret_cast<uint64_t>(g_idleStack) + sizeof(g_idleStack);
 
-    // Set up saved context so context_switch "returns" into IdleLoop.
     g_idleProcess->savedCtx.rsp = g_idleProcess->kernelStackTop - 8;
     g_idleProcess->savedCtx.rip = reinterpret_cast<uint64_t>(&IdleLoop);
-    g_idleProcess->savedCtx.rflags = 0x202; // IF set
+    g_idleProcess->savedCtx.rflags = 0x202;
     g_idleProcess->savedCtx.cr3 = VmmKernelCR3().pml4.raw();
 
     SerialPuts("SCHED: scheduler initialised\n");
@@ -158,13 +155,9 @@ void SchedulerRemoveProcess(Process* proc)
 void SchedulerBlock(Process* proc)
 {
     proc->state = ProcessState::Blocked;
-    if (proc->schedNext) // still in ready queue
+    if (proc->schedNext)
         ReadyQueueRemove(proc);
 
-    SerialPrintf("SCHED: blocked '%s' (pid %u), wakeup at tick %lu\n",
-                 proc->name, proc->pid, proc->wakeupTick);
-
-    // If we just blocked the current process, we must reschedule now.
     if (proc == g_currentProcess)
         SchedulerYield();
 }
@@ -217,31 +210,67 @@ static void CheckBlockedWakeups()
     }
 }
 
+// Reap terminated processes (can't destroy while running on their stack).
+static void ReapTerminated()
+{
+    for (uint32_t i = 0; i < g_processCount; )
+    {
+        Process* p = g_allProcesses[i];
+        if (p->state == ProcessState::Terminated && p != g_currentProcess)
+        {
+            SerialPrintf("SCHED: reaping '%s' (pid %u)\n", p->name, p->pid);
+            ProcessDestroy(p);
+            // ProcessDestroy calls SchedulerRemoveProcess which updates g_allProcesses
+        }
+        else
+        {
+            ++i;
+        }
+    }
+}
+
 // Perform a context switch from `oldProc` to `newProc`.
+// Must be called with interrupts disabled (or from ISR context).
 static void DoSwitch(Process* oldProc, Process* newProc)
 {
+    // Disable interrupts to prevent reentrant timer during the switch.
+    __asm__ volatile("cli");
+
     g_currentProcess = newProc;
     newProc->state = ProcessState::Running;
     g_sliceStartTick = g_lapicTickCount;
 
-    // Update TSS RSP0 so ring 3→0 transitions land on the new process's
-    // kernel stack.
     GdtSetTssRsp0(newProc->kernelStackTop);
 
-    // Save/restore SSE/FPU state around the GPR context switch.
-    __asm__ volatile("fxsave %0" : "=m"(oldProc->fxsave));
+    // Validate FxsaveArea alignment (FXSAVE/FXRSTOR require 16-byte).
+    auto oldFxAddr = reinterpret_cast<uintptr_t>(&oldProc->fxsave);
+    auto newFxAddr = reinterpret_cast<uintptr_t>(&newProc->fxsave);
+    if ((oldFxAddr & 0xF) || (newFxAddr & 0xF))
+    {
+        SerialPrintf("SCHED FATAL: FxsaveArea misaligned! old=%p new=%p\n",
+                     (void*)oldFxAddr, (void*)newFxAddr);
+        for (;;) __asm__ volatile("hlt");
+    }
 
-    // The actual register save/restore + CR3 switch happens in asm.
-    context_switch(&oldProc->savedCtx, &newProc->savedCtx);
+    // Validate new context RIP before switching.
+    uint64_t newRip = newProc->savedCtx.rip;
+    if (newRip != 0 && newRip < 0xFFFFFFFF80000000ULL)
+    {
+        SerialPrintf("SCHED FATAL: bad RIP 0x%lx for '%s' (pid %u)\n",
+                     newRip, newProc->name, newProc->pid);
+        for (;;) __asm__ volatile("hlt");
+    }
+
+    context_switch(&oldProc->savedCtx, &newProc->savedCtx,
+                   &oldProc->fxsave, &newProc->fxsave);
 
     // When we return here, we've been switched BACK to oldProc.
-    // Restore our SSE state.
-    __asm__ volatile("fxrstor %0" : : "m"(g_currentProcess->fxsave));
 }
 
 void SchedulerTimerTick()
 {
     CheckBlockedWakeups();
+    ReapTerminated();
 
     if (!g_currentProcess)
         return;
@@ -333,7 +362,8 @@ void SchedulerYield()
 
     // We can't call DoSwitch because we don't want to save state for the
     // terminated process. Just restore the next process's context directly.
-    context_switch(&proc->savedCtx, &next->savedCtx);
+    context_switch(&proc->savedCtx, &next->savedCtx,
+                   &proc->fxsave, &next->fxsave);
 
     // Should never reach here.
     __builtin_unreachable();
