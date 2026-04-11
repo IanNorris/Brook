@@ -26,6 +26,7 @@
 #include "compositor.h"
 #include "smp.h"
 #include "shell.h"
+#include "boot_logo.h"
 #include "fat_test_image.h"
 
 // All kernel initialization and runtime — called by KernelMain after stack switch.
@@ -170,7 +171,13 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         brook::KPuts("TTY init failed — display output unavailable\n");
     }
 
+    // Show boot logo with progress bar (TTY text goes to serial only while logo is up).
+    brook::BootLogoInit();
+    brook::BootLogoProgress(5, "Memory");
+
     // From here on KPrintf fans to both serial and TTY automatically.
+    // (TTY text is suppressed visually while boot logo is displayed,
+    //  but serial always gets it.)
     brook::KPuts("Brook OS\n");
     brook::KPuts("--------\n");
     brook::KPrintf("Framebuffer  %ux%u\n", fb.width, fb.height);
@@ -189,6 +196,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     }
 
     brook::KPuts("\nKernel running.\n");
+    brook::BootLogoProgress(20, "ACPI");
 
     // ---- SMP: boot Application Processors ----
     if (acpiOk)
@@ -196,8 +204,10 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         uint32_t cpuCount = brook::SmpInit();
         brook::KPrintf("SMP          %u CPU(s) online\n", cpuCount);
     }
+    brook::BootLogoProgress(30, "SMP");
 
     // ---- Device / VFS layer ----
+    brook::BootLogoProgress(35, "Filesystem");
     brook::VfsInit();
 
     // Mount the embedded FAT16 test image as a ramdisk.
@@ -249,6 +259,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     }
 
     // ---- virtio-blk: enumerate all PCI virtio drives ----
+    brook::BootLogoProgress(50, "Storage");
     // Each virtio drive is probed for a BROOK.MNT file at its root.
     // BROOK.MNT contains a single line: the VFS mount path for that volume.
     // If found, the drive is mounted at that path automatically.
@@ -342,6 +353,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     }
 
     // ---- Module loader ----
+    brook::BootLogoProgress(65, "Modules");
     // Phase 1: load early modules from embedded ramdisk (mounted at "/").
     //   These run before virtio, so they can't access /boot yet.
     //   Keyboard is NOT here — it needs APIC which is already set up, but
@@ -357,6 +369,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::SerialPuts("module: Phase 2 — done\n");
 
     // ---- Syscall table ----
+    brook::BootLogoProgress(80, "Syscalls");
     brook::SyscallTableInit();
     if (g_kernelEnv)
     {
@@ -370,6 +383,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     // Initialise the scheduler (creates idle process) and compositor,
     // then run the boot script and enter the interactive shell.
     {
+        brook::BootLogoProgress(90, "Scheduler");
         brook::SchedulerInit();
         brook::CompositorInit();
 
@@ -382,6 +396,11 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
         // Activate APs — they will set up per-CPU state and enter the scheduler.
         brook::SmpActivateAPs();
+
+        brook::BootLogoProgress(100, "Ready");
+
+        // Clear the boot logo before starting the shell/processes.
+        brook::BootLogoClear();
 
         // Execute the boot script if present.
         brook::ShellExecScript("/boot/INIT.RC");
