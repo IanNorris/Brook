@@ -25,6 +25,7 @@
 #include "scheduler.h"
 #include "compositor.h"
 #include "smp.h"
+#include "shell.h"
 #include "fat_test_image.h"
 
 // All kernel initialization and runtime — called by KernelMain after stack switch.
@@ -366,112 +367,13 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::SchedulerSetCpuEnv(0, g_kernelEnv);
 
     // ---- User-mode ELF binaries ----
-    // Create all processes and hand them to the scheduler.
+    // Initialise the scheduler (creates idle process) and compositor,
+    // then run the boot script and enter the interactive shell.
     {
-        const char* envp[] = { "HOME=/", nullptr };
-        const char* argv_doom[] = { "doom", "-iwad", "/boot/DOOM1.WAD", nullptr };
-
-        // Initialise the scheduler (creates idle process) and compositor.
         brook::SchedulerInit();
         brook::CompositorInit();
 
-        uint64_t fbPhys;
-        uint32_t fbW, fbH, fbStride;
-        brook::TtyGetFramebufferPhys(&fbPhys, &fbW, &fbH, &fbStride);
-
-        // ---- Grid layout for 32 DOOM instances ----
-        // DOOM renders at 640×400 (DOOMGENERIC_RESX/Y). Each VFB is 640×400.
-        // Compositor downscales by scale factor when blitting to physical FB.
-        // With scale=3: each cell ≈ 213×133 pixels on screen.
-        // 8 columns × 4 rows = 32 instances.
-        constexpr uint32_t DOOM_VFB_W = 640;
-        constexpr uint32_t DOOM_VFB_H = 400;
-        constexpr uint8_t  DOOM_SCALE = 3;
-        constexpr int GRID_COLS = 8;
-        constexpr int GRID_ROWS = 4;
-        constexpr int NUM_DOOMS = GRID_COLS * GRID_ROWS;
-
-        uint32_t cellW = DOOM_VFB_W / DOOM_SCALE; // 213
-        uint32_t cellH = DOOM_VFB_H / DOOM_SCALE; // 133
-
-        // Center the grid on the physical framebuffer.
-        int16_t gridX0 = static_cast<int16_t>((fbW - cellW * GRID_COLS) / 2);
-        int16_t gridY0 = static_cast<int16_t>((fbH - cellH * GRID_ROWS) / 2);
-
-        // Load DOOM ELF into memory once, create 4 processes from it.
-        brook::Vnode* doomVn = brook::VfsOpen("/boot/DOOM", 0);
-        if (!doomVn) doomVn = brook::VfsOpen("/boot/doom", 0);
-
-        uint8_t* elfBuf = nullptr;
-        uint64_t elfSize = 0;
-        constexpr uint64_t MAX_ELF_SIZE = 2 * 1024 * 1024;
-        constexpr uint64_t ELF_BUF_PAGES = MAX_ELF_SIZE / 4096;
-        brook::VirtualAddress elfBufAddr{};
-
-        if (doomVn)
-        {
-            elfBufAddr = brook::VmmAllocPages(ELF_BUF_PAGES,
-                brook::VMM_WRITABLE, brook::MemTag::Heap, brook::KernelPid);
-            if (elfBufAddr)
-            {
-                elfBuf = reinterpret_cast<uint8_t*>(elfBufAddr.raw());
-                uint64_t offset = 0;
-                while (elfSize < MAX_ELF_SIZE)
-                {
-                    int ret = brook::VfsRead(doomVn, elfBuf + elfSize, 4096, &offset);
-                    if (ret <= 0) break;
-                    elfSize += static_cast<uint64_t>(ret);
-                }
-            }
-            brook::VfsClose(doomVn);
-            brook::SerialPrintf("USER: loaded DOOM (%lu bytes)\n", elfSize);
-        }
-
-        // Disable interrupts during bulk process creation to avoid timer ISR
-        // interference with page table/heap operations.
-        __asm__ volatile("cli");
-
-        // Create 32 DOOM processes in an 8×4 grid.
-        for (int d = 0; d < NUM_DOOMS && elfBuf; ++d)
-        {
-            auto* proc = brook::ProcessCreate(elfBuf, elfSize,
-                                               3, argv_doom,
-                                               1, envp);
-            if (!proc)
-            {
-                brook::SerialPrintf("USER: ProcessCreate failed for doom #%d\n", d);
-                continue;
-            }
-
-            // Set process name: doom00..doom31.
-            proc->name[0] = 'd'; proc->name[1] = 'o';
-            proc->name[2] = 'o'; proc->name[3] = 'm';
-            proc->name[4] = static_cast<char>('0' + (d / 10));
-            proc->name[5] = static_cast<char>('0' + (d % 10));
-            proc->name[6] = '\0';
-
-            int col = d % GRID_COLS;
-            int row = d / GRID_COLS;
-            int16_t destX = gridX0 + static_cast<int16_t>(col * cellW);
-            int16_t destY = gridY0 + static_cast<int16_t>(row * cellH);
-
-            brook::CompositorSetupProcess(proc, destX, destY,
-                                           DOOM_VFB_W, DOOM_VFB_H, DOOM_SCALE);
-
-            brook::SchedulerAddProcess(proc);
-            brook::SerialPrintf("USER: doom #%d → grid(%d,%d) dest=(%d,%d)\n",
-                                 d, col, row, destX, destY);
-        }
-
-        // Re-enable interrupts.
-        __asm__ volatile("sti");
-
-        if (elfBufAddr)
-            brook::VmmFreePages(elfBufAddr, ELF_BUF_PAGES);
-
-        brook::SerialPrintf("SCHED: all processes created, starting scheduler...\n");
-
-        // Initialise keyboard before entering user mode (DOOM needs it).
+        // Initialise keyboard before shell (needs it for interactive mode).
         if (acpiOk && !brook::KbdIsAvailable())
         {
             brook::KPuts("KBD: ps2_kbd module not loaded — falling back to direct init\n");
@@ -481,10 +383,35 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         // Activate APs — they will set up per-CPU state and enter the scheduler.
         brook::SmpActivateAPs();
 
-        brook::SchedulerStart();
-        // SchedulerStart never returns.
+        // Execute the boot script if present.
+        brook::ShellExecScript("/boot/INIT.RC");
+
+        // Start the scheduler on all queued processes.
+        // The BSP enters the shell's interactive loop after starting the scheduler,
+        // but only if we DON'T have processes to run yet.
+        // If processes were spawned by the script, start the scheduler.
+        if (brook::SchedulerReadyCount() > 0)
+        {
+            // We have processes — start scheduler.
+            // But we also want to enter the interactive shell eventually.
+            // For now, the BSP runs the scheduler; the shell would need
+            // to be a separate concept (e.g., a kernel thread).
+            //
+            // Compromise: start the scheduler which never returns.
+            // Interactive shell will come when we have kernel threads.
+            brook::SerialPrintf("SHELL: %u processes queued, starting scheduler\n",
+                                 brook::SchedulerReadyCount());
+            brook::SchedulerStart();
+            // SchedulerStart never returns.
+        }
+        else
+        {
+            // No processes from script — go straight to interactive shell.
+            brook::ShellInteractive();
+            // ShellInteractive never returns.
+        }
     }
 
-    // Unreachable — SchedulerStart is [[noreturn]].
+    // Unreachable — SchedulerStart/ShellInteractive are [[noreturn]].
     for (;;) { __asm__ volatile("hlt"); }
 }

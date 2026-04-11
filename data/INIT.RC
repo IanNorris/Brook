@@ -1,0 +1,43 @@
+# Brook OS boot script
+# Lines starting with # are comments.
+# Commands: run, set, wait, help, ls, ps, mem, clear, shutdown, reboot
+# Programs are searched in /boot/BIN/, /boot/, and by absolute path.
+
+# Configure layout: 8 columns x 4 rows, scale factor 3
+set grid 8x4
+set scale 3
+set vfb 640x400
+
+# Launch 32 DOOM instances
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
