@@ -104,11 +104,51 @@ static MountEntry* FindMount(const char* absPath, const char** relPath)
 // ---- FatFS vnode ops ----
 
 // Cached file: entire file contents loaded into memory for fast random access.
+// Multiple vnodes can share the same CachedFile via refCount.
 struct CachedFile {
-    FIL*     fil;
+    FIL*     fil;       // Original FatFS handle (closed when refCount→0)
     uint8_t* data;
     uint64_t size;
+    int32_t  refCount;  // Number of vnodes sharing this cache entry
+    char     path[64];  // Canonical path for dedup (e.g. "0:/DOOM1.WAD")
 };
+
+// Global shared file cache — small fixed table for dedup across openers.
+static constexpr uint32_t FILE_CACHE_MAX = 16;
+static CachedFile* g_fileCache[FILE_CACHE_MAX] = {};
+
+// Look up an existing cache entry by FatFS path (caller must hold g_vfsLock).
+static CachedFile* FileCacheLookup(const char* fatPath)
+{
+    for (uint32_t i = 0; i < FILE_CACHE_MAX; ++i) {
+        if (g_fileCache[i] && StrEq(g_fileCache[i]->path, fatPath))
+            return g_fileCache[i];
+    }
+    return nullptr;
+}
+
+// Insert a new cache entry (caller must hold g_vfsLock). Returns false if table full.
+static bool FileCacheInsert(CachedFile* cf)
+{
+    for (uint32_t i = 0; i < FILE_CACHE_MAX; ++i) {
+        if (!g_fileCache[i]) {
+            g_fileCache[i] = cf;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Remove a cache entry (caller must hold g_vfsLock).
+static void FileCacheRemove(CachedFile* cf)
+{
+    for (uint32_t i = 0; i < FILE_CACHE_MAX; ++i) {
+        if (g_fileCache[i] == cf) {
+            g_fileCache[i] = nullptr;
+            return;
+        }
+    }
+}
 
 static int FatFileOpen(Vnode* vn, int flags)
 {
@@ -118,15 +158,20 @@ static int FatFileOpen(Vnode* vn, int flags)
 
 // Preload file into memory. Called on first read for files > threshold.
 // CacheFile — locks internally per-chunk so other CPUs can interleave.
-// Caller must NOT hold g_vfsLock.
-static CachedFile* CacheFileUnlocked(FIL* fil)
+// Caller must NOT hold g_vfsLock. fatPath is stored for dedup lookups.
+static CachedFile* CacheFileUnlocked(FIL* fil, const char* fatPath)
 {
     uint64_t size = f_size(fil);
     auto* cf = static_cast<CachedFile*>(kmalloc(sizeof(CachedFile)));
     if (!cf) return nullptr;
 
-    cf->fil  = fil;
-    cf->size = size;
+    cf->fil      = fil;
+    cf->size     = size;
+    cf->refCount = 1;
+    // Store path for dedup lookups
+    uint32_t pi = 0;
+    for (; fatPath[pi] && pi < sizeof(cf->path) - 1; ++pi) cf->path[pi] = fatPath[pi];
+    cf->path[pi] = '\0';
 
     // Use VmmAllocPages for large allocations (kmalloc can't do multi-MB).
     uint64_t numPages = (size + 4095) / 4096;
@@ -183,7 +228,16 @@ static int CachedFileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
 static void CachedFileClose(Vnode* vn)
 {
     auto* cf = static_cast<CachedFile*>(vn->priv);
-    if (cf) {
+    if (!cf) return;
+
+    // Decrement refcount under VFS lock (protects the cache table).
+    KMutexLock(&g_vfsLock);
+    int32_t refs = --cf->refCount;
+    if (refs <= 0)
+        FileCacheRemove(cf);
+    KMutexUnlock(&g_vfsLock);
+
+    if (refs <= 0) {
         if (cf->fil) f_close(cf->fil);
         if (cf->data) {
             uint64_t numPages = (cf->size + 4095) / 4096;
@@ -440,6 +494,32 @@ Vnode* VfsOpen(const char* path, int flags)
     if (flags & VFS_O_TRUNC)  mode |= FA_CREATE_ALWAYS;
     SerialPrintf("VFS: f_open('%s', mode=0x%x)\n", fatPath, mode);
 
+    // Check shared cache first (read-only opens only).
+    if (!(flags & VFS_O_WRITE)) {
+        KMutexLock(&g_vfsLock);
+        CachedFile* existing = FileCacheLookup(fatPath);
+        if (existing) {
+            existing->refCount++;
+            KMutexUnlock(&g_vfsLock);
+            kfree(fil); // Don't need FatFS handle — sharing cached data
+
+            auto* vn = static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
+            if (!vn) {
+                KMutexLock(&g_vfsLock);
+                existing->refCount--;
+                KMutexUnlock(&g_vfsLock);
+                return nullptr;
+            }
+            vn->ops  = &g_cachedFileOps;
+            vn->type = VnodeType::File;
+            vn->priv = existing;
+            SerialPrintf("VFS: sharing cached '%s' (refCount=%d)\n",
+                         fatPath, existing->refCount);
+            return vn;
+        }
+        KMutexUnlock(&g_vfsLock);
+    }
+
     KMutexLock(&g_vfsLock);
     FRESULT res = f_open(fil, fatPath, mode);
     if (res != FR_OK)
@@ -458,8 +538,13 @@ Vnode* VfsOpen(const char* path, int flags)
         if (!(flags & VFS_O_WRITE) && fileSize >= CACHE_THRESHOLD)
         {
             KMutexUnlock(&g_vfsLock);
-            CachedFile* cf = CacheFileUnlocked(fil);
+            CachedFile* cf = CacheFileUnlocked(fil, fatPath);
             if (cf) {
+                // Insert into shared cache table.
+                KMutexLock(&g_vfsLock);
+                FileCacheInsert(cf); // Best-effort; dedup still works if table full
+                KMutexUnlock(&g_vfsLock);
+
                 vn->ops  = &g_cachedFileOps;
                 vn->type = VnodeType::File;
                 vn->priv = cf;
