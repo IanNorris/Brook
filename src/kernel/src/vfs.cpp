@@ -3,12 +3,17 @@
 #include "memory/heap.h"
 #include "serial.h"
 #include "memory/virtual_memory.h"
+#include "spinlock.h"
 
 extern "C" {
 #include "ff.h"
 }
 
 namespace brook {
+
+// Global lock protecting all FatFS operations. FatFS is NOT thread-safe —
+// concurrent f_read/f_open/f_lseek calls corrupt shared internal state.
+static SpinLock g_vfsLock;
 
 // ---- Mount table ----
 
@@ -111,7 +116,8 @@ static int FatFileOpen(Vnode* vn, int flags)
 }
 
 // Preload file into memory. Called on first read for files > threshold.
-static CachedFile* CacheFile(FIL* fil)
+// CacheFile — caller MUST hold g_vfsLock.
+static CachedFile* CacheFileLocked(FIL* fil)
 {
     uint64_t size = f_size(fil);
     auto* cf = static_cast<CachedFile*>(kmalloc(sizeof(CachedFile)));
@@ -200,15 +206,22 @@ static int FatFileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
 {
     FIL* fil = static_cast<FIL*>(vn->priv);
 
+    uint64_t flags = SpinLockAcquire(&g_vfsLock);
+
     // Seek if needed.
     if (f_tell(fil) != *offset)
     {
         if (f_lseek(fil, static_cast<FSIZE_t>(*offset)) != FR_OK)
+        {
+            SpinLockRelease(&g_vfsLock, flags);
             return -1;
+        }
     }
 
     UINT br = 0;
     FRESULT res = f_read(fil, buf, static_cast<UINT>(len), &br);
+    SpinLockRelease(&g_vfsLock, flags);
+
     if (res != FR_OK) return -1;
 
     *offset += br;
@@ -218,11 +231,18 @@ static int FatFileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
 static int FatFileWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset)
 {
     FIL* fil = static_cast<FIL*>(vn->priv);
+
+    uint64_t flags = SpinLockAcquire(&g_vfsLock);
     if (f_tell(fil) != *offset) {
-        if (f_lseek(fil, static_cast<FSIZE_t>(*offset)) != FR_OK) return -1;
+        if (f_lseek(fil, static_cast<FSIZE_t>(*offset)) != FR_OK) {
+            SpinLockRelease(&g_vfsLock, flags);
+            return -1;
+        }
     }
     UINT bw = 0;
     FRESULT res = f_write(fil, buf, static_cast<UINT>(len), &bw);
+    SpinLockRelease(&g_vfsLock, flags);
+
     if (res != FR_OK) return -1;
     *offset += bw;
     return static_cast<int>(bw);
@@ -233,8 +253,11 @@ static int FatDirReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
     DIR* dir = static_cast<DIR*>(vn->priv);
     (void)cookie; // FatFS DIR maintains its own iterator state
 
+    uint64_t flags = SpinLockAcquire(&g_vfsLock);
     FILINFO fno;
     FRESULT res = f_readdir(dir, &fno);
+    SpinLockRelease(&g_vfsLock, flags);
+
     if (res != FR_OK) { SerialPrintf("VFS: readdir failed (res=%u)\n", static_cast<unsigned>(res)); return -1; }
     if (fno.fname[0] == '\0') return 0; // end of directory
 
@@ -249,6 +272,7 @@ static int FatDirReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
 
 static void FatFileClose(Vnode* vn)
 {
+    uint64_t flags = SpinLockAcquire(&g_vfsLock);
     if (vn->type == VnodeType::File)
     {
         FIL* fil = static_cast<FIL*>(vn->priv);
@@ -261,6 +285,7 @@ static void FatFileClose(Vnode* vn)
         f_closedir(dir);
         kfree(dir);
     }
+    SpinLockRelease(&g_vfsLock, flags);
 }
 
 static int FatStat(Vnode* vn, VnodeStat* st)
@@ -329,7 +354,10 @@ bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
     fatPath[0] = static_cast<char>('0' + pdrv);
     fatPath[1] = ':'; fatPath[2] = '\0';
 
+    uint64_t flags = SpinLockAcquire(&g_vfsLock);
     FRESULT res = f_mount(fs, fatPath, 1);
+    SpinLockRelease(&g_vfsLock, flags);
+
     if (res != FR_OK)
     {
         SerialPrintf("VFS: f_mount failed (res=%u) for drive %u\n",
@@ -364,7 +392,11 @@ bool VfsUnmount(const char* mountPoint)
         char fatPath[8];
         fatPath[0] = static_cast<char>('0' + g_mounts[i].pdrv);
         fatPath[1] = ':'; fatPath[2] = '\0';
+
+        uint64_t flags = SpinLockAcquire(&g_vfsLock);
         f_unmount(fatPath);
+        SpinLockRelease(&g_vfsLock, flags);
+
         kfree(g_mounts[i].fs);
         g_mounts[i].fs   = nullptr;
         g_mounts[i].used = false;
@@ -395,20 +427,26 @@ Vnode* VfsOpen(const char* path, int flags)
 
     BYTE mode = (flags & 1) ? FA_READ | FA_WRITE : FA_READ;
     SerialPrintf("VFS: f_open('%s', mode=0x%x)\n", fatPath, mode);
+
+    uint64_t lockFlags = SpinLockAcquire(&g_vfsLock);
     FRESULT res = f_open(fil, fatPath, mode);
     if (res != FR_OK)
+    {
+        SpinLockRelease(&g_vfsLock, lockFlags);
         SerialPrintf("VFS: f_open('%s') result: %d\n", fatPath, (int)res);
+    }
     if (res == FR_OK)
     {
         auto* vn = static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
-        if (!vn) { f_close(fil); kfree(fil); return nullptr; }
+        if (!vn) { f_close(fil); SpinLockRelease(&g_vfsLock, lockFlags); kfree(fil); return nullptr; }
 
         // Cache large read-only files entirely in memory for fast random access.
         static constexpr uint64_t CACHE_THRESHOLD = 64 * 1024; // 64 KB
         uint64_t fileSize = f_size(fil);
         if (!(flags & 1) && fileSize >= CACHE_THRESHOLD)
         {
-            CachedFile* cf = CacheFile(fil);
+            CachedFile* cf = CacheFileLocked(fil);
+            SpinLockRelease(&g_vfsLock, lockFlags);
             if (cf) {
                 vn->ops  = &g_cachedFileOps;
                 vn->type = VnodeType::File;
@@ -416,6 +454,10 @@ Vnode* VfsOpen(const char* path, int flags)
                 return vn;
             }
             // Cache failed — fall through to uncached path
+        }
+        else
+        {
+            SpinLockRelease(&g_vfsLock, lockFlags);
         }
 
         vn->ops  = &g_fatFileOps;
@@ -431,12 +473,21 @@ Vnode* VfsOpen(const char* path, int flags)
     auto* dir = static_cast<DIR*>(kmalloc(sizeof(DIR)));
     if (!dir) return nullptr;
 
+    lockFlags = SpinLockAcquire(&g_vfsLock);
     res = f_opendir(dir, fatPath);
+    SpinLockRelease(&g_vfsLock, lockFlags);
+
     if (res == FR_OK)
     {
         SerialPrintf("VFS: opened dir '%s' (fatpath='%s')\n", path, fatPath);
         auto* vn = static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
-        if (!vn) { f_closedir(dir); kfree(dir); return nullptr; }
+        if (!vn) {
+            lockFlags = SpinLockAcquire(&g_vfsLock);
+            f_closedir(dir);
+            SpinLockRelease(&g_vfsLock, lockFlags);
+            kfree(dir);
+            return nullptr;
+        }
         vn->ops  = &g_fatDirOps;
         vn->type = VnodeType::Dir;
         vn->priv = dir;
@@ -492,7 +543,10 @@ int VfsStatPath(const char* path, VnodeStat* st)
     }
 
     FILINFO fno;
+    uint64_t flags = SpinLockAcquire(&g_vfsLock);
     FRESULT res = f_stat(fatPath, &fno);
+    SpinLockRelease(&g_vfsLock, flags);
+
     if (res != FR_OK) return -1;
 
     st->isDir = (fno.fattrib & AM_DIR) != 0;
