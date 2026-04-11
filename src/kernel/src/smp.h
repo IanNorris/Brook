@@ -20,6 +20,11 @@ struct CpuInfo {
 // Returns the number of CPUs brought online (including BSP).
 uint32_t SmpInit();
 
+// Activate APs into the scheduler. Must be called after SchedulerInit()
+// and after all processes have been added. Sets up per-CPU GDT/TSS,
+// KernelCpuEnv, SYSCALL MSRs, LAPIC timer, then enters scheduler loop.
+void SmpActivateAPs();
+
 // Get the number of online CPUs.
 uint32_t SmpGetCpuCount();
 

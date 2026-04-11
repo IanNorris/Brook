@@ -2,6 +2,25 @@
 
 namespace brook {
 
+// Simple ticket spinlock for serialising serial output across CPUs.
+struct SerialSpinlock {
+    volatile uint32_t next;
+    volatile uint32_t serving;
+};
+static SerialSpinlock g_serialLock = {0, 0};
+
+static inline void SerialLockAcquire()
+{
+    uint32_t ticket = __atomic_fetch_add(&g_serialLock.next, 1, __ATOMIC_RELAXED);
+    while (__atomic_load_n(&g_serialLock.serving, __ATOMIC_ACQUIRE) != ticket)
+        __asm__ volatile("pause" ::: "memory");
+}
+
+static inline void SerialLockRelease()
+{
+    __atomic_fetch_add(&g_serialLock.serving, 1, __ATOMIC_RELEASE);
+}
+
 static constexpr uint16_t COM1_BASE = 0x3F8;
 static constexpr uint16_t COM1_DATA = COM1_BASE + 0;
 static constexpr uint16_t COM1_IER  = COM1_BASE + 1;
@@ -47,14 +66,26 @@ void SerialPutChar(char c)
 void SerialPuts(const char* str)
 {
     if (!str) return;
+    SerialLockAcquire();
+    while (*str) SerialPutChar(*str++);
+    SerialLockRelease();
+}
+
+// Unlocked puts — for use inside already-locked contexts (SerialVPrintf etc.).
+static void SerialPutsRaw(const char* str)
+{
+    if (!str) return;
     while (*str) SerialPutChar(*str++);
 }
+
+void SerialLock()  { SerialLockAcquire(); }
+void SerialUnlock() { SerialLockRelease(); }
 
 // ---- Internal helper for SerialPrintf ----
 
 static void PrintPtr(unsigned long val)
 {
-    SerialPuts("0x");
+    SerialPutsRaw("0x");
     for (int shift = 60; shift >= 0; shift -= 4) {
         int nibble = static_cast<int>((val >> shift) & 0xF);
         SerialPutChar(static_cast<char>(nibble < 10 ? '0' + nibble : 'a' + nibble - 10));
@@ -107,7 +138,7 @@ void SerialVPrintf(const char* fmt, __builtin_va_list args)
                 while (*p) { ++p; ++len; }
                 // Pad right (left-align: print string then spaces)
                 if (!leftAlign) { for (int i = len; i < width; ++i) SerialPutChar(' '); }
-                SerialPuts(s);
+                SerialPutsRaw(s);
                 if (leftAlign) { for (int i = len; i < width; ++i) SerialPutChar(' '); }
                 break;
             }
@@ -183,7 +214,9 @@ void SerialPrintf(const char* fmt, ...)
 {
     __builtin_va_list args;
     __builtin_va_start(args, fmt);
+    SerialLockAcquire();
     SerialVPrintf(fmt, args);
+    SerialLockRelease();
     __builtin_va_end(args);
 }
 

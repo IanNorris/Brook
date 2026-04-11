@@ -1,5 +1,6 @@
 #include "physical_memory.h"
 #include "serial.h"
+#include "spinlock.h"
 
 // Forward-declared to avoid circular headers.
 namespace brook {
@@ -28,6 +29,9 @@ static uint64_t g_bitmap[BITMAP_WORDS]; // in BSS, starts zeroed
 static uint64_t g_totalPages = 0;       // highest tracked page index
 static uint64_t g_freePages  = 0;
 static uint64_t g_nextHint   = 0;       // search hint for fast sequential alloc
+
+// SMP lock protecting the bitmap, free count, and page descriptors.
+static SpinLock g_pmmLock;
 
 // ---------------------------------------------------------------------------
 // Ownership tracking — dynamically allocated after PmmEnableTracking().
@@ -219,6 +223,8 @@ void PmmInit(const BootProtocol* proto)
 
 PhysicalAddress PmmAllocPage(MemTag tag, uint16_t pid)
 {
+    uint64_t flags = SpinLockAcquire(&g_pmmLock);
+
     // Search from hint forward, then wrap around once.
     uint64_t startWord = g_nextHint / 64;
     uint64_t endWord   = (g_totalPages + 63) / 64;
@@ -235,15 +241,17 @@ PhysicalAddress PmmAllocPage(MemTag tag, uint16_t pid)
             // Find first free bit in this word.
             int bit = __builtin_ctzll(~g_bitmap[w]);
             uint64_t idx = w * 64 + static_cast<uint64_t>(bit);
-            if (idx >= g_totalPages) return PhysicalAddress{};
+            if (idx >= g_totalPages) { SpinLockRelease(&g_pmmLock, flags); return PhysicalAddress{}; }
 
             SetUsed(idx);
             g_freePages--;
             g_nextHint = idx + 1;
             TrackAlloc(static_cast<uint32_t>(idx), tag, pid);
+            SpinLockRelease(&g_pmmLock, flags);
             return PhysicalAddress(idx * PAGE_SIZE);
         }
     }
+    SpinLockRelease(&g_pmmLock, flags);
     return PhysicalAddress{}; // out of memory
 }
 
@@ -251,6 +259,8 @@ PhysicalAddress PmmAllocPages(uint64_t count, MemTag tag, uint16_t pid)
 {
     if (count == 0) return PhysicalAddress{};
     if (count == 1) return PmmAllocPage(tag, pid);
+
+    uint64_t flags = SpinLockAcquire(&g_pmmLock);
 
     // Linear scan for a contiguous run of 'count' free pages.
     uint64_t runStart = 0;
@@ -270,6 +280,7 @@ PhysicalAddress PmmAllocPages(uint64_t count, MemTag tag, uint16_t pid)
                     g_freePages--;
                     TrackAlloc(static_cast<uint32_t>(runStart + i), tag, pid);
                 }
+                SpinLockRelease(&g_pmmLock, flags);
                 return PhysicalAddress(runStart * PAGE_SIZE);
             }
         }
@@ -278,6 +289,7 @@ PhysicalAddress PmmAllocPages(uint64_t count, MemTag tag, uint16_t pid)
             runLen = 0;
         }
     }
+    SpinLockRelease(&g_pmmLock, flags);
     return PhysicalAddress{}; // no contiguous run found
 }
 
@@ -288,7 +300,10 @@ void PmmFreePage(PhysicalAddress physAddr)
 
     uint64_t idx = physAddr.raw() / PAGE_SIZE;
     if (idx >= g_totalPages) return;
-    if (!IsUsed(idx)) return;
+
+    uint64_t flags = SpinLockAcquire(&g_pmmLock);
+
+    if (!IsUsed(idx)) { SpinLockRelease(&g_pmmLock, flags); return; }
 
     if (g_pageDescs)
     {
@@ -308,6 +323,8 @@ void PmmFreePage(PhysicalAddress physAddr)
         d.pid = 0;
         d.tag = static_cast<uint8_t>(MemTag::Free);
     }
+
+    SpinLockRelease(&g_pmmLock, flags);
 }
 
 void PmmSetOwner(PhysicalAddress physAddr, MemTag tag, uint16_t pid)

@@ -177,13 +177,18 @@ void CompositorTick();
 // This is a regular function — NOT __attribute__((interrupt)).
 static void LapicTimerHandlerInner()
 {
-    g_lapicTickCount++;
     LapicWrite(LapicReg::EOI, 0);
 
-    // Composite virtual framebuffers onto the physical display.
-    CompositorTick();
+    // Only BSP maintains the global tick and composites framebuffers.
+    // Using LAPIC ID check (cheaper than SmpCurrentCpuIndex).
+    uint8_t cpuId = static_cast<uint8_t>(LapicRead(LapicReg::ID) >> 24);
+    if (cpuId == 0)
+    {
+        g_lapicTickCount++;
+        CompositorTick();
+    }
 
-    // Drive the scheduler — checks timeslice expiry and blocked wakeups.
+    // Drive the scheduler on every CPU.
     SchedulerTimerTick();
 }
 
@@ -448,6 +453,16 @@ void IoApicMaskIrq(uint8_t irq)
     uint32_t entry = irq;
     uint32_t lo = IoApicRead(static_cast<uint8_t>(0x10 + 2 * entry));
     IoApicWrite(static_cast<uint8_t>(0x10 + 2 * entry), lo | 0x00010000u);
+}
+
+void ApicInitTimerOnAp()
+{
+    // Start the LAPIC timer on this AP using the BSP's calibrated ticks/ms.
+    // The LAPIC is already enabled and MMIO-mapped (shared virtual address).
+    LapicWrite(LapicReg::TIMER_DIVIDE, 0x3);  // divide by 16
+    LapicWrite(LapicReg::LVT_TIMER,
+               LAPIC_TIMER_PERIODIC | LAPIC_TIMER_VECTOR);
+    LapicWrite(LapicReg::TIMER_INIT_CNT, g_timerTicksPerMs);  // 1ms period
 }
 
 } // namespace brook

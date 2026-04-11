@@ -2,45 +2,51 @@
 
 #include "process.h"
 
+struct KernelCpuEnv;
+
 namespace brook {
 
 // ---------------------------------------------------------------------------
-// Scheduler — preemptive round-robin
+// Scheduler — preemptive round-robin with SMP support
 // ---------------------------------------------------------------------------
 
-// Initialise the scheduler. Creates the idle process.
-// Must be called after memory subsystem and LAPIC are ready.
+// Initialise the scheduler. Creates the idle process for the BSP.
 void SchedulerInit();
 
-// Add a process to the ready queue. The process must be in Ready state.
+// Create an idle process for an AP. Must be called from BSP before AP starts.
+void SchedulerInitApIdle(uint32_t cpuIndex);
+
+// Set the KernelCpuEnv pointer for a CPU (for syscall stack updates).
+void SchedulerSetCpuEnv(uint32_t cpuIndex, KernelCpuEnv* env);
+
+// Add a process to the ready queue.
 void SchedulerAddProcess(Process* proc);
 
-// Remove a process from the ready queue (on exit or block).
+// Remove a process from the ready queue.
 void SchedulerRemoveProcess(Process* proc);
 
-// Block the current process (e.g. nanosleep). Triggers an immediate reschedule.
-// The caller must set proc->wakeupTick before calling if a timed wakeup is needed.
+// Block the current process. Triggers an immediate reschedule.
 void SchedulerBlock(Process* proc);
 
 // Unblock a process — move it from Blocked back to Ready queue.
 void SchedulerUnblock(Process* proc);
 
-// Called from the LAPIC timer ISR. Checks if the current timeslice has expired
-// and performs a context switch if needed. Only preempts user-mode code.
-// `interruptFrame` is the CPU-pushed interrupt frame on the kernel stack.
+// Called from the LAPIC timer ISR on each CPU.
 void SchedulerTimerTick();
 
-// Yield the current timeslice voluntarily (e.g. after unblocking another process).
+// Yield the current timeslice voluntarily.
 void SchedulerYield();
 
-// Start the scheduler — picks the first ready process and enters user mode.
-// This function never returns.
+// Start the scheduler on the BSP — picks the first ready process and enters user mode.
 [[noreturn]] void SchedulerStart();
+
+// Start the scheduler on an AP — enters the scheduling loop.
+[[noreturn]] void SchedulerStartAp();
 
 // Terminate the current process and reschedule. Never returns.
 [[noreturn]] void SchedulerExitCurrentProcess(int status);
 
-// Get the number of processes in the run queue (for debug).
+// Get the number of processes in the run queue.
 uint32_t SchedulerReadyCount();
 
 // Allocate a unique PID.

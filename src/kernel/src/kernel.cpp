@@ -350,6 +350,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         g_kernelEnv->syscallTable = reinterpret_cast<uint64_t>(brook::SyscallGetTable());
     }
 
+    // Register BSP's KernelCpuEnv with the scheduler.
+    brook::SchedulerSetCpuEnv(0, g_kernelEnv);
+
     // ---- User-mode ELF binaries ----
     // Create all processes and hand them to the scheduler.
     {
@@ -443,6 +446,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             brook::KPuts("KBD: ps2_kbd module not loaded — falling back to direct init\n");
             brook::KbdInit();
         }
+
+        // Activate APs — they will set up per-CPU state and enter the scheduler.
+        brook::SmpActivateAPs();
 
         brook::SchedulerStart();
         // SchedulerStart never returns.

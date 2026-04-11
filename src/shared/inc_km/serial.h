@@ -13,4 +13,9 @@ extern "C" void SerialPuts(const char* str);
 extern "C" void SerialPrintf(const char* fmt, ...);
 extern "C" void SerialVPrintf(const char* fmt, __builtin_va_list args);
 
+// Lock/unlock for callers that want to do atomic multi-call sequences
+// (e.g. KPrintf serialises serial + TTY output together).
+void SerialLock();
+void SerialUnlock();
+
 } // namespace brook

@@ -66,6 +66,9 @@ void SyscallTableInit();
 // Get pointer to the syscall table (for storing in KernelCpuEnv).
 SyscallFn* SyscallGetTable();
 
+// Get the syscall table address as uint64_t (for per-CPU env setup).
+uint64_t SyscallGetTableAddress();
+
 // Switch to user mode.
 // Saves kernel state, builds IRETQ frame, SWAPGS, jumps to ring 3.
 // When the user process calls sys_exit, control returns here.
