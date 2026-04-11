@@ -110,6 +110,15 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
 {
     __asm__ volatile("cli");
 
+    // Prevent recursive exceptions from eating the entire stack.
+    static volatile int excDepth = 0;
+    if (excDepth > 0)
+    {
+        brook::SerialPuts("\n=== NESTED EXCEPTION — halting ===\n");
+        for (;;) __asm__ volatile("hlt");
+    }
+    ++excDepth;
+
     uint64_t cr2 = 0;
     __asm__ volatile("movq %%cr2, %0" : "=r"(cr2));
 

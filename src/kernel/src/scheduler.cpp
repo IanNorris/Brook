@@ -44,6 +44,9 @@ static uint32_t g_processCount = 0;
 // Next PID to allocate.
 static uint16_t g_nextPid = 1;
 
+// Guard: timer ticks are ignored until SchedulerStart sets this.
+static volatile bool g_schedulerRunning = false;
+
 // ---------------------------------------------------------------------------
 // Ready queue operations (circular doubly-linked list)
 // ---------------------------------------------------------------------------
@@ -269,6 +272,9 @@ static void DoSwitch(Process* oldProc, Process* newProc)
 
 void SchedulerTimerTick()
 {
+    if (!g_schedulerRunning)
+        return;
+
     CheckBlockedWakeups();
     ReapTerminated();
 
@@ -396,6 +402,8 @@ void SchedulerYield()
 
     SerialPrintf("SCHED: entering user mode for '%s' (pid %u)\n",
                  first->name, first->pid);
+
+    g_schedulerRunning = true;
     SwitchToUserMode(first->stackTop, first->elf.entryPoint);
 
     __builtin_unreachable();
