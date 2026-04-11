@@ -146,10 +146,15 @@ void CompositorTick()
         return;
     g_tickCounter = 0;
 
+    // Ensure we're using the kernel page table for reading virtual FBs.
+    // The timer may fire while a process CR3 is loaded, but kernel
+    // higher-half pages are shared so this should be safe.
     for (uint32_t i = 0; i < g_compositedCount; ++i)
     {
         Process* p = g_compositedProcs[i];
         if (!p || p->state == ProcessState::Terminated)
+            continue;
+        if (!p->fbVirtual || p->fbScale == 0)
             continue;
         BlitProcess(p);
     }

@@ -126,9 +126,35 @@ void SchedulerInit()
     SerialPuts("SCHED: scheduler initialised\n");
 }
 
+// Trampoline for processes that haven't run yet. When context_switch
+// restores a new process's savedCtx, it jumps here. We enter user mode
+// via the existing SwitchToUserMode path.
+static void ProcessTrampoline()
+{
+    Process* proc = g_currentProcess;
+    SerialPrintf("SCHED: entering user mode for '%s' (pid %u)\n",
+                 proc->name, proc->pid);
+
+    // Enable interrupts — context_switch leaves them disabled.
+    __asm__ volatile("sti");
+
+    SwitchToUserMode(proc->stackTop, proc->elf.entryPoint);
+    __builtin_unreachable();
+}
+
 void SchedulerAddProcess(Process* proc)
 {
     proc->state = ProcessState::Ready;
+
+    // Set up savedCtx so context_switch can start this process.
+    // RSP points to the top of the per-process kernel stack (minus 8
+    // for the fake return address slot that context_switch expects).
+    proc->savedCtx.rsp = proc->kernelStackTop - 8;
+    proc->savedCtx.rip = reinterpret_cast<uint64_t>(&ProcessTrampoline);
+    proc->savedCtx.rflags = 0x202; // IF set
+    proc->savedCtx.cr3 = proc->pageTable.pml4.raw();
+    proc->savedCtx.fsBase = proc->fsBase;
+
     ReadyQueueInsert(proc);
 
     // Track in global list for blocked-process scanning.
