@@ -4,6 +4,7 @@
 #include "serial.h"
 #include "tty.h"
 #include "panic_qr.h"
+#include "compositor.h"
 
 // ---- Register capture -------------------------------------------------------
 struct PanicRegs {
@@ -196,6 +197,9 @@ static volatile int g_panicNesting = 0;
 __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
 {
     __asm__ volatile("cli");
+
+    // Stop the compositor so APs don't overwrite the panic screen.
+    brook::CompositorHalt();
 
     int depth = __atomic_add_fetch(&g_panicNesting, 1, __ATOMIC_SEQ_CST);
     if (depth > 1)

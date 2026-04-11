@@ -24,4 +24,7 @@ bool CompositorSetupProcess(Process* proc, int16_t destX, int16_t destY,
 // Called from the timer tick at a configurable interval.
 void CompositorTick();
 
+// Halt the compositor — called during panic to prevent overwriting the QR code.
+void CompositorHalt();
+
 } // namespace brook
