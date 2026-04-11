@@ -23,6 +23,7 @@
 #include "panic.h"
 #include "memory/physical_memory.h"
 #include "apic.h"
+#include "klog.h"
 
 namespace brook {
 
@@ -478,6 +479,13 @@ static int ExecCommand(int argc, const char* const* argv)
         KernelPanic("SHELL: %s\n", msg);
     }
 
+    // Built-in: log — dump kernel log
+    if (StrEq(cmd, "log"))
+    {
+        KLogDump();
+        return 0;
+    }
+
     // Try as a program name (implicit run)
     char resolved[128];
     if (ResolveBinaryPath(cmd, resolved, sizeof(resolved)))
@@ -510,6 +518,7 @@ static void CmdHelp()
     KPrintf("  shutdown           Power off\n");
     KPrintf("  reboot             Reboot\n");
     KPrintf("  panic [msg]        Trigger test panic\n");
+    KPrintf("  log                Dump kernel log\n");
     KPrintf("  help               Show this help\n");
 }
 

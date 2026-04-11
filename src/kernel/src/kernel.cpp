@@ -28,6 +28,7 @@
 #include "smp.h"
 #include "shell.h"
 #include "boot_logo.h"
+#include "klog.h"
 #include "fat_test_image.h"
 
 // All kernel initialization and runtime — called by KernelMain after stack switch.
@@ -273,7 +274,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
         // Probe each virtio drive: bind to FatFS, look for BROOK.MNT.
         // FatFS physical drives: 0 = ramdisk, 1..N = virtio0..N-1
-        for (uint32_t i = 0; i < vioCount; ++i)
+        bool bootVolumeFound = false;
+        for (uint32_t i = 0; i < vioCount && !bootVolumeFound; ++i)
         {
             char name[16] = "virtio";
             // Simple uint-to-string for drive index.
@@ -296,7 +298,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             brook::Vnode* mnt = brook::VfsOpen("/mnt/probe/BROOK.MNT");
             if (!mnt)
             {
-                brook::SerialPrintf("virtio: %s mounted at /mnt/probe (no BROOK.MNT)\n", name);
+                brook::SerialPrintf("virtio: %s — no BROOK.MNT, skipping\n", name);
+                brook::VfsUnmount("/mnt/probe");
                 continue;
             }
 
@@ -325,6 +328,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             if (brook::VfsMount(mntPath, "fatfs", pdrv))
             {
                 brook::KPrintf("virtio: %s mounted at %s\n", name, mntPath);
+                bootVolumeFound = true;
 
                 // Read BROOK.CFG from the mounted volume as a sanity check.
                 char cfgPath[80] = {};
@@ -351,10 +355,19 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
                 brook::KPrintf("virtio: %s — remount at %s failed\n", name, mntPath);
             }
         }
+        if (!bootVolumeFound)
+            brook::KPuts("WARNING: no boot volume found (no BROOK.MNT on any virtio drive)\n");
     }
 
     // ---- Module loader ----
     brook::BootLogoProgress(65, "Modules");
+
+    // Initialise kernel file logger now that the boot volume is available.
+    brook::KLogInit();
+    brook::KLog("PMM: %lu MB free of %lu MB total",
+                 (unsigned long)(brook::PmmGetFreePageCount() * 4 / 1024),
+                 (unsigned long)(brook::PmmGetTotalPageCount() * 4 / 1024));
+
     // Phase 1: load early modules from embedded ramdisk (mounted at "/").
     //   These run before virtio, so they can't access /boot yet.
     //   Keyboard is NOT here — it needs APIC which is already set up, but
@@ -372,6 +385,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     // ---- Syscall table ----
     brook::BootLogoProgress(80, "Syscalls");
     brook::SyscallTableInit();
+    brook::KLog("SYSCALL: table initialised");
     if (g_kernelEnv)
     {
         g_kernelEnv->syscallTable = reinterpret_cast<uint64_t>(brook::SyscallGetTable());
@@ -397,8 +411,11 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
         // Activate APs — they will set up per-CPU state and enter the scheduler.
         brook::SmpActivateAPs();
+        brook::KLog("SMP: all APs activated");
 
         brook::BootLogoProgress(100, "Ready");
+        brook::KLog("BOOT: complete, entering shell/scheduler");
+        brook::KLogSync();
 
         // Clear the boot logo before starting the shell/processes.
         brook::BootLogoClear();

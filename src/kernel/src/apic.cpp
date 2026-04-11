@@ -465,4 +465,9 @@ void ApicInitTimerOnAp()
     LapicWrite(LapicReg::TIMER_INIT_CNT, g_timerTicksPerMs);  // 1ms period
 }
 
+uint64_t ApicTickCount()
+{
+    return g_lapicTickCount;
+}
+
 } // namespace brook
