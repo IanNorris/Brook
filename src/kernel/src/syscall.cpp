@@ -413,7 +413,11 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         if (!TtyGetFramebufferPhys(&physBase, &fbW, &fbH, &fbStride))
             return -ENODEV;
 
-        uint64_t fbSize = static_cast<uint64_t>(fbStride) * fbH;
+        bool useVirtFb = (proc->fbVirtual != nullptr);
+        uint64_t fbSize = useVirtFb
+            ? proc->fbVirtualSize
+            : static_cast<uint64_t>(fbStride) * fbH;
+
         uint64_t fbPages = (fbSize + 4095) / 4096;
         if (pages > fbPages) pages = fbPages;
 
@@ -422,11 +426,24 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         if (vaddr + pages * 4096 > USER_MMAP_END) return -ENOMEM;
         proc->mmapNext = vaddr + pages * 4096;
 
-        // Map directly to physical framebuffer pages
+        // Map pages — if using a virtual FB, resolve each page's physical
+        // address individually (VmmAllocPages may not be contiguous).
         for (uint64_t i = 0; i < pages; ++i)
         {
+            PhysicalAddress pagePhys;
+            if (useVirtFb)
+            {
+                auto kernVirt = VirtualAddress(
+                    reinterpret_cast<uint64_t>(proc->fbVirtual) + i * 4096);
+                pagePhys = VmmVirtToPhys(KernelPageTable, kernVirt);
+            }
+            else
+            {
+                pagePhys = PhysicalAddress(physBase + i * 4096);
+            }
+
             if (!VmmMapPage(proc->pageTable, VirtualAddress(vaddr + i * 4096),
-                            PhysicalAddress(physBase + i * 4096),
+                            pagePhys,
                             VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
                             MemTag::Device, proc->pid))
             {
@@ -435,7 +452,10 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             }
         }
 
-        SerialPrintf("sys_mmap: fb mapped %lu pages at virt 0x%lx\n", pages, vaddr);
+        SerialPrintf("sys_mmap: fb mapped %lu pages at virt 0x%lx (%s, scale=%u)\n",
+                     pages, vaddr,
+                     useVirtFb ? "virtual" : "physical",
+                     proc->fbScale);
         return static_cast<int64_t>(vaddr);
     }
 

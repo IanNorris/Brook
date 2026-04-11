@@ -23,6 +23,7 @@
 #include "syscall.h"
 #include "process.h"
 #include "scheduler.h"
+#include "compositor.h"
 #include "fat_test_image.h"
 
 // All kernel initialization and runtime — called by KernelMain after stack switch.
@@ -343,72 +344,87 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     // ---- User-mode ELF binaries ----
     // Create all processes and hand them to the scheduler.
     {
-        struct BinaryDef {
-            const char* path1; const char* path2; const char* name;
-            const char* const* argv; int argc;
-        };
-
-        const char* argv_hello[]  = { "hello", nullptr };
-        const char* argv_cowsay[] = { "cowsay", "Brook OS lives!", nullptr };
-        const char* argv_ls[]     = { "ls", "/boot", nullptr };
-        const char* argv_doom[]   = { "doom", "-iwad", "/boot/DOOM1.WAD", nullptr };
-
-        BinaryDef bins[] = {
-            { "/boot/bin/HELLO",   "/boot/bin/hello",   "hello",   argv_hello,  1 },
-            { "/boot/bin/COWSAY",  "/boot/bin/cowsay",  "cowsay",  argv_cowsay, 2 },
-            { "/boot/bin/BUSYBOX", "/boot/bin/busybox", "ls",      argv_ls,     2 },
-            { "/boot/DOOM",        "/boot/doom",        "doom",    argv_doom,   3 },
-        };
         const char* envp[] = { "HOME=/", nullptr };
+        const char* argv_doom[] = { "doom", "-iwad", "/boot/DOOM1.WAD", nullptr };
 
-        // Initialise the scheduler (creates idle process).
+        // Initialise the scheduler (creates idle process) and compositor.
         brook::SchedulerInit();
+        brook::CompositorInit();
 
-        for (auto& b : bins)
+        // Get framebuffer dimensions for quadrant layout.
+        uint64_t fbPhys;
+        uint32_t fbW, fbH, fbStride;
+        brook::TtyGetFramebufferPhys(&fbPhys, &fbW, &fbH, &fbStride);
+        int16_t halfW = static_cast<int16_t>(fbW / 2);
+        int16_t halfH = static_cast<int16_t>(fbH / 2);
+
+        // Quadrant positions: TL, TR, BL, BR — each scaled 2:1.
+        struct QuadrantDef { int16_t x; int16_t y; };
+        QuadrantDef quads[] = {
+            { 0,     0     },   // top-left
+            { halfW, 0     },   // top-right
+            { 0,     halfH },   // bottom-left
+            { halfW, halfH },   // bottom-right
+        };
+
+        // Load DOOM ELF into memory once, create 4 processes from it.
+        brook::Vnode* doomVn = brook::VfsOpen("/boot/DOOM", 0);
+        if (!doomVn) doomVn = brook::VfsOpen("/boot/doom", 0);
+
+        uint8_t* elfBuf = nullptr;
+        uint64_t elfSize = 0;
+        constexpr uint64_t MAX_ELF_SIZE = 2 * 1024 * 1024;
+        constexpr uint64_t ELF_BUF_PAGES = MAX_ELF_SIZE / 4096;
+        brook::VirtualAddress elfBufAddr{};
+
+        if (doomVn)
         {
-            brook::Vnode* vn = brook::VfsOpen(b.path1, 0);
-            if (!vn) vn = brook::VfsOpen(b.path2, 0);
-            if (!vn) continue;
-
-            constexpr uint64_t MAX_ELF_SIZE = 2 * 1024 * 1024;
-            constexpr uint64_t ELF_BUF_PAGES = MAX_ELF_SIZE / 4096;
-            brook::VirtualAddress elfBufAddr = brook::VmmAllocPages(ELF_BUF_PAGES,
+            elfBufAddr = brook::VmmAllocPages(ELF_BUF_PAGES,
                 brook::VMM_WRITABLE, brook::MemTag::Heap, brook::KernelPid);
-
-            if (!elfBufAddr) { brook::VfsClose(vn); continue; }
-
-            auto* elfBuf = reinterpret_cast<uint8_t*>(elfBufAddr.raw());
-            uint64_t totalRead = 0;
-            uint64_t offset = 0;
-            while (totalRead < MAX_ELF_SIZE)
+            if (elfBufAddr)
             {
-                int ret = brook::VfsRead(vn, elfBuf + totalRead, 4096, &offset);
-                if (ret <= 0) break;
-                totalRead += static_cast<uint64_t>(ret);
+                elfBuf = reinterpret_cast<uint8_t*>(elfBufAddr.raw());
+                uint64_t offset = 0;
+                while (elfSize < MAX_ELF_SIZE)
+                {
+                    int ret = brook::VfsRead(doomVn, elfBuf + elfSize, 4096, &offset);
+                    if (ret <= 0) break;
+                    elfSize += static_cast<uint64_t>(ret);
+                }
             }
-            brook::VfsClose(vn);
-
-            brook::SerialPrintf("USER: loaded '%s' (%lu bytes)\n",
-                                 b.name, totalRead);
-
-            auto* proc = brook::ProcessCreate(elfBuf, totalRead,
-                                               b.argc, b.argv,
-                                               1, envp);
-
-            brook::VmmFreePages(elfBufAddr, ELF_BUF_PAGES);
-
-            if (proc)
-            {
-                // Copy name into process struct for debug output.
-                for (int i = 0; b.name[i] && i < 31; ++i)
-                    proc->name[i] = b.name[i];
-                brook::SchedulerAddProcess(proc);
-            }
-            else
-            {
-                brook::SerialPrintf("USER: ProcessCreate failed for '%s'\n", b.name);
-            }
+            brook::VfsClose(doomVn);
+            brook::SerialPrintf("USER: loaded DOOM (%lu bytes)\n", elfSize);
         }
+
+        // Create 4 DOOM processes, each in a different quadrant.
+        constexpr int NUM_DOOMS = 4;
+        for (int d = 0; d < NUM_DOOMS && elfBuf; ++d)
+        {
+            auto* proc = brook::ProcessCreate(elfBuf, elfSize,
+                                               3, argv_doom,
+                                               1, envp);
+            if (!proc)
+            {
+                brook::SerialPrintf("USER: ProcessCreate failed for doom #%d\n", d);
+                continue;
+            }
+
+            // Set process name.
+            const char* base = "doom0";
+            for (int i = 0; base[i] && i < 31; ++i)
+                proc->name[i] = base[i];
+            proc->name[4] = static_cast<char>('0' + d);
+
+            // Assign compositor quadrant (scale 2:1).
+            brook::CompositorSetupProcess(proc, quads[d].x, quads[d].y, 2);
+
+            brook::SchedulerAddProcess(proc);
+            brook::SerialPrintf("USER: doom #%d → quadrant (%d, %d)\n",
+                                 d, quads[d].x, quads[d].y);
+        }
+
+        if (elfBufAddr)
+            brook::VmmFreePages(elfBufAddr, ELF_BUF_PAGES);
 
         brook::SerialPrintf("SCHED: all processes created, starting scheduler...\n");
 

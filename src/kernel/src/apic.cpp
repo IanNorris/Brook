@@ -170,12 +170,18 @@ volatile uint64_t g_lapicTickCount = 0;
 // Forward-declare scheduler tick (defined in scheduler.cpp).
 void SchedulerTimerTick();
 
+// Forward-declare compositor tick (defined in compositor.cpp).
+void CompositorTick();
+
 __attribute__((interrupt))
 static void LapicTimerHandler(InterruptFrame* frame)
 {
     (void)frame;
     g_lapicTickCount++;
     LapicWrite(LapicReg::EOI, 0);
+
+    // Composite virtual framebuffers onto the physical display.
+    CompositorTick();
 
     // Drive the scheduler — checks timeslice expiry and blocked wakeups.
     SchedulerTimerTick();

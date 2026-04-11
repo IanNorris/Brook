@@ -146,6 +146,7 @@ add_executable(kernel
     src/syscall.cpp
     src/process.cpp
     src/scheduler.cpp
+    src/compositor.cpp
     src/context_switch.S
     src/elf_loader.cpp
     src/vfs.cpp
@@ -197,6 +198,7 @@ set_source_files_properties(
     src/idt.cpp
     src/apic.cpp
     src/scheduler.cpp
+    src/compositor.cpp
     src/keyboard.cpp
     src/panic.cpp
     PROPERTIES COMPILE_OPTIONS "-mgeneral-regs-only;-mno-sse;-mno-sse2;-mfpmath="

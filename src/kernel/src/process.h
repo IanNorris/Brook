@@ -171,6 +171,18 @@ struct Process
     // File descriptors
     FdEntry  fds[MAX_FDS];
 
+    // Per-process virtual framebuffer (for compositor)
+    // When non-null, fb mmap maps this buffer instead of the physical FB.
+    uint32_t* fbVirtual;        // Kernel-mapped virtual framebuffer
+    uint32_t  fbVirtualSize;    // Size in bytes
+
+    // Compositor placement: position and downscale factor on the physical FB.
+    // The virtual FB is the full resolution the process thinks it has.
+    // The compositor blits it at (fbDestX, fbDestY) scaled down by fbScale:1.
+    int16_t   fbDestX;          // Destination X on physical FB
+    int16_t   fbDestY;          // Destination Y on physical FB
+    uint8_t   fbScale;          // Downscale factor (1 = 1:1, 2 = half, etc.), 0 = no compositing
+
     // Process name (for debug output)
     char name[32];
 };
