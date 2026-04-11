@@ -20,6 +20,7 @@
 #include "memory/virtual_memory.h"
 #include "serial.h"
 #include "smp.h"
+#include "panic.h"
 #include "memory/physical_memory.h"
 #include "apic.h"
 
@@ -470,6 +471,13 @@ static int ExecCommand(int argc, const char* const* argv)
         for (;;) __asm__ volatile("hlt");
     }
 
+    // Built-in: panic [message] — deliberately trigger a kernel panic (for testing)
+    if (StrEq(cmd, "panic"))
+    {
+        const char* msg = (argc >= 2) ? argv[1] : "deliberate test panic";
+        KernelPanic("SHELL: %s\n", msg);
+    }
+
     // Try as a program name (implicit run)
     char resolved[128];
     if (ResolveBinaryPath(cmd, resolved, sizeof(resolved)))
@@ -501,6 +509,7 @@ static void CmdHelp()
     KPrintf("  clear              Clear screen\n");
     KPrintf("  shutdown           Power off\n");
     KPrintf("  reboot             Reboot\n");
+    KPrintf("  panic [msg]        Trigger test panic\n");
     KPrintf("  help               Show this help\n");
 }
 

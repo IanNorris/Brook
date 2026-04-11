@@ -144,8 +144,14 @@ static void BlitProcess(Process* proc)
     }
 }
 
+// Global halt flag — set by panic to stop compositing.
+static volatile bool g_compositorHalted = false;
+
 void CompositorTick()
 {
+    if (g_compositorHalted)
+        return;
+
     if (!g_physFb || g_compositedCount == 0)
         return;
 
@@ -162,6 +168,11 @@ void CompositorTick()
             continue;
         BlitProcess(p);
     }
+}
+
+void CompositorHalt()
+{
+    g_compositorHalted = true;
 }
 
 } // namespace brook
