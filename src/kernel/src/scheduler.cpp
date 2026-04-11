@@ -22,6 +22,18 @@ namespace brook { void SwitchToUserMode(uint64_t userRsp, uint64_t userRip); }
 namespace brook {
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// Update gs:8 (per-CPU syscall stack pointer) to the given process's kernel
+// stack top. This ensures each process uses its own kernel stack for syscalls
+// and ring3→ring0 interrupt transitions.
+static inline void SetSyscallStack(uint64_t stackTop)
+{
+    __asm__ volatile("movq %0, %%gs:8" : : "r"(stackTop) : "memory");
+}
+
+// ---------------------------------------------------------------------------
 // Scheduler state
 // ---------------------------------------------------------------------------
 
@@ -270,6 +282,7 @@ static void DoSwitch(Process* oldProc, Process* newProc)
     g_sliceStartTick = g_lapicTickCount;
 
     GdtSetTssRsp0(newProc->kernelStackTop);
+    SetSyscallStack(newProc->kernelStackTop);
 
     // Validate FxsaveArea alignment (FXSAVE/FXRSTOR require 16-byte).
     auto oldFxAddr = reinterpret_cast<uintptr_t>(&oldProc->fxsave);
@@ -391,6 +404,7 @@ void SchedulerYield()
     next->state = ProcessState::Running;
     g_sliceStartTick = g_lapicTickCount;
     GdtSetTssRsp0(next->kernelStackTop);
+    SetSyscallStack(next->kernelStackTop);
 
     // We can't call DoSwitch because we don't want to save state for the
     // terminated process. Just restore the next process's context directly.
@@ -413,6 +427,7 @@ void SchedulerYield()
     first->state = ProcessState::Running;
     g_sliceStartTick = g_lapicTickCount;
     GdtSetTssRsp0(first->kernelStackTop);
+    SetSyscallStack(first->kernelStackTop);
 
     // For the first process we need to set up CR3 and enter user mode.
     // The process's savedCtx.rip points to a trampoline that does iretq

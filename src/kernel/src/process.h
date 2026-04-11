@@ -17,8 +17,10 @@ static constexpr uint64_t PROGRAM_BREAK_SIZE = 64 * 1024 * 1024; // 64 MB
 // Default user stack size.
 static constexpr uint64_t USER_STACK_SIZE = 128 * 1024; // 128 KB
 
-// Per-process kernel stack size (2 pages = 8 KB).
-static constexpr uint64_t KERNEL_STACK_SIZE = 8 * 1024;
+// Per-process kernel stack size (16 pages = 64 KB).
+// Must be large enough for syscalls (VFS/FatFS stack depth) and interrupts.
+// Each process's kernel stack is also used as its syscall stack (gs:8).
+static constexpr uint64_t KERNEL_STACK_SIZE = 64 * 1024;
 static constexpr uint64_t KERNEL_STACK_PAGES = KERNEL_STACK_SIZE / 4096;
 
 // Scheduler time slice in milliseconds (~10ms).
