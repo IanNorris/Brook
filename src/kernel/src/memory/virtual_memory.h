@@ -23,6 +23,7 @@ static constexpr uint64_t VMM_PRESENT   = (1ULL << 0);
 static constexpr uint64_t VMM_WRITABLE  = (1ULL << 1);
 static constexpr uint64_t VMM_USER      = (1ULL << 2);
 static constexpr uint64_t VMM_NO_EXEC   = (1ULL << 63); // requires EFER.NXE
+static constexpr uint64_t VMM_FORCE_MAP = (1ULL << 62); // bypass null guard (SMP trampoline)
 
 // PTE available-bit encoding for ownership tracking.
 static constexpr uint64_t PTE_TAG_SHIFT  = 9;

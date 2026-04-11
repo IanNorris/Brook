@@ -222,12 +222,14 @@ void VmmInit()
 bool VmmMapPage(PageTable pt, VirtualAddress virtAddr, PhysicalAddress physAddr,
                 uint64_t flags, MemTag tag, uint16_t pid)
 {
-    if (virtAddr.raw() < VIRTUAL_NULL_GUARD)
+    if (!(flags & VMM_FORCE_MAP) && virtAddr.raw() < VIRTUAL_NULL_GUARD)
     {
         SerialPrintf("VMM: rejected mapping at 0x%p (below null guard)\n",
                      reinterpret_cast<void*>(virtAddr.raw()));
         return false;
     }
+    // Strip the force flag before writing the PTE
+    flags &= ~VMM_FORCE_MAP;
 
     uint64_t* pte = WalkToPtr(pt, virtAddr, /*create=*/true, flags);
     if (!pte) return false;

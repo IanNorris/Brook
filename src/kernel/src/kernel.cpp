@@ -24,6 +24,7 @@
 #include "process.h"
 #include "scheduler.h"
 #include "compositor.h"
+#include "smp.h"
 #include "fat_test_image.h"
 
 // All kernel initialization and runtime — called by KernelMain after stack switch.
@@ -187,6 +188,13 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     }
 
     brook::KPuts("\nKernel running.\n");
+
+    // ---- SMP: boot Application Processors ----
+    if (acpiOk)
+    {
+        uint32_t cpuCount = brook::SmpInit();
+        brook::KPrintf("SMP          %u CPU(s) online\n", cpuCount);
+    }
 
     // ---- Device / VFS layer ----
     brook::VfsInit();
