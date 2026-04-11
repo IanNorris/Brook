@@ -30,3 +30,9 @@ enable_testing()
 add_host_test(test_kmutex)
 add_host_test(test_krwlock)
 add_host_test(test_ksemaphore)
+add_host_test(test_sched_policy
+    "${BROOK_ROOT}/src/kernel/src/sched_policy.cpp"
+)
+target_compile_options(test_sched_policy PRIVATE
+    "-iquote${BROOK_ROOT}/src/kernel/src"
+)

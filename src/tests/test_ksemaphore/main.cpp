@@ -24,6 +24,7 @@ static pthread_mutex_t g_schedMutex = PTHREAD_MUTEX_INITIALIZER;
 struct ProcessExt {
     pthread_cond_t cond;
     bool blocked;
+    int pendingUnblocks;
 };
 
 static constexpr int MAX_MOCK_PROCS = 128;
@@ -37,6 +38,7 @@ static ProcessExt* GetOrCreateExt(Process* p) {
     g_mockProcs[idx].proc = p;
     pthread_cond_init(&g_mockProcs[idx].ext.cond, nullptr);
     g_mockProcs[idx].ext.blocked = false;
+    g_mockProcs[idx].ext.pendingUnblocks = 0;
     return &g_mockProcs[idx].ext;
 }
 
@@ -48,6 +50,11 @@ namespace brook {
     void SchedulerBlock(Process* p) {
         pthread_mutex_lock(&g_schedMutex);
         ProcessExt* ext = GetOrCreateExt(p);
+        if (ext->pendingUnblocks > 0) {
+            ext->pendingUnblocks--;
+            pthread_mutex_unlock(&g_schedMutex);
+            return;
+        }
         ext->blocked = true;
         while (ext->blocked)
             pthread_cond_wait(&ext->cond, &g_schedMutex);
@@ -57,8 +64,12 @@ namespace brook {
     void SchedulerUnblock(Process* p) {
         pthread_mutex_lock(&g_schedMutex);
         ProcessExt* ext = GetOrCreateExt(p);
-        ext->blocked = false;
-        pthread_cond_signal(&ext->cond);
+        if (ext->blocked) {
+            ext->blocked = false;
+            pthread_cond_signal(&ext->cond);
+        } else {
+            ext->pendingUnblocks++;
+        }
         pthread_mutex_unlock(&g_schedMutex);
     }
 }

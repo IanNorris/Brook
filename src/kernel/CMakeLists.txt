@@ -162,6 +162,7 @@ add_executable(kernel
     src/sync/kmutex.cpp
     src/sync/krwlock.cpp
     src/sync/ksemaphore.cpp
+    src/sched_policy.cpp
     # Memory subsystem
     src/memory/virtual_memory.cpp
     src/memory/physical_memory.cpp
