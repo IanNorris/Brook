@@ -36,3 +36,33 @@ add_host_test(test_sched_policy
 target_compile_options(test_sched_policy PRIVATE
     "-iquote${BROOK_ROOT}/src/kernel/src"
 )
+
+# ---------------------------------------------------------------------------
+# Scheduler module shared libraries (.so) for dlopen-based testing
+# ---------------------------------------------------------------------------
+
+add_library(sched_rr SHARED "${BROOK_ROOT}/src/modules/sched_rr.cpp")
+target_include_directories(sched_rr PRIVATE "${BROOK_ROOT}/src/kernel/src")
+set_target_properties(sched_rr PROPERTIES PREFIX "lib" SUFFIX ".so")
+
+add_library(sched_mlfq SHARED "${BROOK_ROOT}/src/modules/sched_mlfq.cpp")
+target_include_directories(sched_mlfq PRIVATE "${BROOK_ROOT}/src/kernel/src")
+set_target_properties(sched_mlfq PROPERTIES PREFIX "lib" SUFFIX ".so")
+
+# test_sched_modules — dlopen-based test that loads the .so modules
+add_executable(test_sched_modules
+    "${BROOK_ROOT}/src/tests/test_sched_modules/main.cpp"
+)
+target_compile_options(test_sched_modules PRIVATE
+    -Wall -Wextra -Werror -O2
+    "-iquote${BROOK_ROOT}/src/kernel/src"
+)
+target_link_libraries(test_sched_modules PRIVATE ${CMAKE_DL_LIBS})
+add_dependencies(test_sched_modules sched_rr sched_mlfq)
+
+# Pass .so paths to the test binary.
+add_test(NAME test_sched_modules
+    COMMAND test_sched_modules
+        "$<TARGET_FILE:sched_rr>"
+        "$<TARGET_FILE:sched_mlfq>"
+)

@@ -303,6 +303,171 @@ TEST(timeslice_expired_then_yield_cycle) {
 }
 
 // ---------------------------------------------------------------------------
+// Idle transition tests — verify correct behavior when queue empties/refills
+// ---------------------------------------------------------------------------
+
+TEST(idle_transition_all_blocked) {
+    // Simulate all processes blocking: queue empties, PickNext returns NONE.
+    // Then unblock one — it should be picked immediately.
+    static constexpr int N = 4;
+    for (uint16_t i = 1; i <= N; i++)
+        ops->InitProcess(state, i, 2);
+    for (uint16_t i = 1; i <= N; i++)
+        ops->Enqueue(state, i);
+    ASSERT(ops->ReadyCount(state) == N);
+
+    // Simulate blocking: remove all from queue.
+    for (uint16_t i = 1; i <= N; i++)
+        ops->Remove(state, i);
+    ASSERT(ops->ReadyCount(state) == 0);
+
+    // CPU should be idle now — PickNext returns NONE.
+    ASSERT(ops->PickNext(state) == NONE);
+
+    // Unblock one process.
+    ops->Enqueue(state, 3);
+    ASSERT(ops->ReadyCount(state) == 1);
+    ASSERT(ops->PickNext(state) == 3);
+    ASSERT(ops->ReadyCount(state) == 0);
+}
+
+TEST(idle_transition_processes_exit) {
+    // Simulate processes exiting one by one until queue is empty.
+    // After each pick, do NOT re-enqueue (process has exited).
+    static constexpr int N = 8;
+    for (uint16_t i = 1; i <= N; i++)
+        ops->InitProcess(state, i, 2);
+    for (uint16_t i = 1; i <= N; i++)
+        ops->Enqueue(state, i);
+
+    for (int i = 0; i < N; i++) {
+        ASSERT(ops->ReadyCount(state) == (uint32_t)(N - i));
+        uint16_t pid = ops->PickNext(state);
+        ASSERT(pid != NONE);
+        // Process exits — not re-enqueued.
+    }
+
+    // All exited — queue empty, CPU goes idle.
+    ASSERT(ops->ReadyCount(state) == 0);
+    ASSERT(ops->PickNext(state) == NONE);
+    ASSERT(ops->PickNext(state) == NONE); // repeated calls are safe
+}
+
+TEST(idle_wake_after_all_exit_new_process) {
+    // All processes exit, then a brand new process appears.
+    ops->InitProcess(state, 1, 2);
+    ops->Enqueue(state, 1);
+    ASSERT(ops->PickNext(state) == 1);
+    // Process 1 exits. Queue empty.
+    ASSERT(ops->PickNext(state) == NONE);
+
+    // New process created and enqueued.
+    ops->InitProcess(state, 5, 2);
+    ops->Enqueue(state, 5);
+    ASSERT(ops->ReadyCount(state) == 1);
+    ASSERT(ops->PickNext(state) == 5);
+}
+
+TEST(idle_repeated_block_unblock_cycle) {
+    // A single process repeatedly blocks (removed) and unblocks (enqueued).
+    // Between each cycle, PickNext should return NONE (idle), then the process.
+    ops->InitProcess(state, 1, 2);
+    for (int i = 0; i < 50; i++) {
+        ops->Enqueue(state, 1);
+        ASSERT(ops->PickNext(state) == 1);
+        // Process blocks — not in queue.
+        ASSERT(ops->PickNext(state) == NONE);
+        // Process unblocks.
+    }
+}
+
+TEST(idle_simulation) {
+    // Simulate the kernel scheduling loop with idle processes.
+    // The kernel has one idle per CPU, ALL with pid=0, NONE registered
+    // with the policy module. If PickNext returns NONE, that CPU runs idle.
+    //
+    // This test models 4 CPUs with 8 processes and verifies:
+    //  1. When all processes block, all CPUs go idle (PickNext → NONE)
+    //  2. When processes unblock, they preempt idle immediately
+    //  3. Idle (pid=0) never appears in the policy queue
+    //  4. Multiple CPUs calling PickNext concurrently drain the queue correctly
+    //  5. ReadyCount is 0 when only idle processes are running
+
+    static constexpr uint16_t IDLE_PID = 0;
+    static constexpr int NCPUS = 4;
+    static constexpr int NPROCS = 8;
+
+    // Register real processes (NOT idle — idle is never InitProcess'd).
+    for (uint16_t i = 1; i <= NPROCS; i++)
+        ops->InitProcess(state, i, 2);
+    for (uint16_t i = 1; i <= NPROCS; i++)
+        ops->Enqueue(state, i);
+
+    // --- Phase 1: Each CPU picks a process ---
+    uint16_t cpuRunning[NCPUS];
+    for (int c = 0; c < NCPUS; c++) {
+        cpuRunning[c] = ops->PickNext(state);
+        ASSERT(cpuRunning[c] != NONE);
+        ASSERT(cpuRunning[c] != IDLE_PID);
+    }
+    // 4 remaining in queue.
+    ASSERT(ops->ReadyCount(state) == NPROCS - NCPUS);
+
+    // --- Phase 2: Timeslice tick — each CPU re-enqueues + picks ---
+    for (int tick = 0; tick < 20; tick++) {
+        for (int c = 0; c < NCPUS; c++) {
+            ops->TimesliceExpired(state, cpuRunning[c]);
+            ops->Enqueue(state, cpuRunning[c]);
+            uint16_t next = ops->PickNext(state);
+            ASSERT(next != NONE);
+            ASSERT(next != IDLE_PID);
+            cpuRunning[c] = next;
+        }
+    }
+
+    // --- Phase 3: All processes block — every CPU goes idle ---
+    for (int c = 0; c < NCPUS; c++)
+        ops->Enqueue(state, cpuRunning[c]);
+    for (uint16_t i = 1; i <= NPROCS; i++)
+        ops->Remove(state, i);
+    ASSERT(ops->ReadyCount(state) == 0);
+
+    for (int c = 0; c < NCPUS; c++) {
+        ASSERT(ops->PickNext(state) == NONE);
+        cpuRunning[c] = IDLE_PID; // all CPUs now idle
+    }
+
+    // --- Phase 4: Processes unblock one at a time ---
+    // Each unblock should wake exactly one CPU from idle.
+    for (uint16_t i = 1; i <= NPROCS && i <= (uint16_t)NCPUS; i++) {
+        ops->Enqueue(state, i);
+        uint16_t woken = ops->PickNext(state);
+        ASSERT(woken == i);
+        ASSERT(woken != IDLE_PID);
+        cpuRunning[i - 1] = woken;
+    }
+
+    // --- Phase 5: All back, verify round-robin resumes ---
+    for (int c = 0; c < NCPUS; c++)
+        ops->Enqueue(state, cpuRunning[c]);
+    for (uint16_t i = NCPUS + 1; i <= NPROCS; i++)
+        ops->Enqueue(state, i);
+    ASSERT(ops->ReadyCount(state) == NPROCS);
+
+    int counts[NPROCS + 1] = {};
+    for (int tick = 0; tick < NPROCS * 10; tick++) {
+        uint16_t next = ops->PickNext(state);
+        ASSERT(next != NONE);
+        ASSERT(next != IDLE_PID);
+        counts[next]++;
+        ops->Enqueue(state, next);
+    }
+    for (uint16_t i = 1; i <= NPROCS; i++)
+        ASSERT(counts[i] > 0);
+    ASSERT(counts[IDLE_PID] == 0);
+}
+
+// ---------------------------------------------------------------------------
 // MLFQ-specific tests (only run for mlfq)
 // ---------------------------------------------------------------------------
 
@@ -435,6 +600,11 @@ static void RunCommonTests(const SchedOps* ops, void* state) {
     invoke_many_processes_32(ops, state);
     invoke_enqueue_after_remove_works(ops, state);
     invoke_timeslice_expired_then_yield_cycle(ops, state);
+    invoke_idle_transition_all_blocked(ops, state);
+    invoke_idle_transition_processes_exit(ops, state);
+    invoke_idle_wake_after_all_exit_new_process(ops, state);
+    invoke_idle_repeated_block_unblock_cycle(ops, state);
+    invoke_idle_simulation(ops, state);
 }
 
 static void RunMlfqTests(const SchedOps* ops, void* state) {

@@ -205,9 +205,18 @@ void DG_DrawFrame()
     }
 
     handleKeyInput();
+
+    s_FrameCount++;
+    if (s_FrameLimit > 0 && s_FrameCount >= s_FrameLimit)
+    {
+        printf("BENCH: %d frames completed in %d ms\n", s_FrameCount, uptime);
+        exit(0);
+    }
 }
 
 static int uptime = 0;
+static int s_FrameCount = 0;
+static int s_FrameLimit = 0;  // 0 = unlimited
 
 void DG_SleepMs(uint32_t ms)
 {

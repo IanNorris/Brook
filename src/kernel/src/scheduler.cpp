@@ -115,6 +115,9 @@ static volatile bool g_schedulerRunning = false;
 
 static void ReadyQueueInsertLocked(Process* proc)
 {
+    // Idle processes (pid=0) are never managed by the policy module.
+    if (proc->pid == 0) return;
+
     // Guard: process must not already be running on a CPU.
     int32_t cpu = __atomic_load_n(&proc->runningOnCpu, __ATOMIC_ACQUIRE);
     if (cpu != -1)
@@ -129,6 +132,7 @@ static void ReadyQueueInsertLocked(Process* proc)
 
 static void ReadyQueueRemoveLocked(Process* proc)
 {
+    if (proc->pid == 0) return; // idle never in policy queue
     g_schedOps->Remove(g_schedState, proc->pid);
 }
 
