@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include "address.h"
 #include "boot_protocol/boot_protocol.h"
 #include "mem_tag.h"
 
@@ -51,24 +52,22 @@ void PmmInit(const BootProtocol* proto);
 void PmmEnableTracking();
 
 // Allocate a single 4KB page frame.
-// tag and pid default to KernelData/KernelPid for convenience.
-// Returns the physical address on success, 0 on out-of-memory.
-extern "C" uint64_t PmmAllocPage(MemTag tag = MemTag::KernelData, uint16_t pid = KernelPid);
+// Returns the physical address on success, null PhysicalAddress on OOM.
+PhysicalAddress PmmAllocPage(MemTag tag = MemTag::KernelData, uint16_t pid = KernelPid);
 
-// Allocate 'count' contiguous 4KB page frames with the given tag/pid.
-// Returns the physical base address on success, 0 if no contiguous run found.
-extern "C" uint64_t PmmAllocPages(uint64_t count,
-                       MemTag tag = MemTag::KernelData,
-                       uint16_t pid = KernelPid);
+// Allocate 'count' contiguous 4KB page frames.
+// Returns the physical base address on success, null PhysicalAddress if no run found.
+PhysicalAddress PmmAllocPages(uint64_t count,
+                              MemTag tag = MemTag::KernelData,
+                              uint16_t pid = KernelPid);
 
-// Free a previously allocated page frame. No-op if physAddr is 0.
-void PmmFreePage(uint64_t physAddr);
+// Free a previously allocated page frame. No-op if null.
+void PmmFreePage(PhysicalAddress physAddr);
 
 // Ownership: set/get tag and PID for a page.
-// SetOwner is safe to call before PmmEnableTracking (no-op until then).
-void     PmmSetOwner(uint64_t physAddr, MemTag tag, uint16_t pid = KernelPid);
-MemTag   PmmGetTag(uint64_t physAddr);
-uint16_t PmmGetPid(uint64_t physAddr);
+void     PmmSetOwner(PhysicalAddress physAddr, MemTag tag, uint16_t pid = KernelPid);
+MemTag   PmmGetTag(PhysicalAddress physAddr);
+uint16_t PmmGetPid(PhysicalAddress physAddr);
 
 // Free all physical pages owned by a PID and return them to the free pool.
 // Walks the PID's page list (O(pages owned)), clears bitmap bits, then resets
@@ -76,10 +75,8 @@ uint16_t PmmGetPid(uint64_t physAddr);
 void PmmKillPid(uint16_t pid);
 
 // Enumerate pages owned by a PID. Calls callback(physAddr, tag, ctx) for each.
-// Callback returns false to stop early. Safe to call before PmmEnableTracking
-// (no-op if tracking not yet enabled).
 void PmmEnumeratePid(uint16_t pid,
-                     bool (*callback)(uint64_t physAddr, MemTag tag, void* ctx),
+                     bool (*callback)(PhysicalAddress physAddr, MemTag tag, void* ctx),
                      void* ctx);
 
 // Print a per-PID page count summary to serial (for debugging).

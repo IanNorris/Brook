@@ -123,7 +123,7 @@ bool TtyInit(const Framebuffer& fb)
     uint64_t physBase = fb.physicalBase;
 
     // Allocate virtual address range for the framebuffer.
-    uint64_t fbVirt = VmmAllocPages(fbPages, VMM_WRITABLE, MemTag::Device, KernelPid);
+    uint64_t fbVirt = VmmAllocPages(fbPages, VMM_WRITABLE, MemTag::Device, KernelPid).raw();
     if (fbVirt == 0)
     {
         SerialPuts("TTY: VmmAllocPages failed for framebuffer\n");
@@ -134,12 +134,12 @@ bool TtyInit(const Framebuffer& fb)
     // Replace each with the matching framebuffer physical page.
     for (uint64_t i = 0; i < fbPages; i++)
     {
-        uint64_t virt    = fbVirt + i * 4096u;
-        uint64_t oldPhys = VmmVirtToPhys(0, virt);
-        VmmUnmapPage(0, virt);
+        VirtualAddress virt(fbVirt + i * 4096u);
+        PhysicalAddress oldPhys = VmmVirtToPhys(KernelPageTable, virt);
+        VmmUnmapPage(KernelPageTable, virt);
         if (oldPhys) PmmFreePage(oldPhys);
 
-        if (!VmmMapPage(0, virt, physBase + i * 4096u,
+        if (!VmmMapPage(KernelPageTable, virt, PhysicalAddress(physBase + i * 4096u),
                         VMM_WRITABLE | VMM_NO_EXEC,
                         MemTag::Device, KernelPid))
         {

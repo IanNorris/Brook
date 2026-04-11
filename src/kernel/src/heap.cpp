@@ -125,9 +125,9 @@ static bool HeapMapPages(uint64_t virtStart, uint64_t pageCount)
     for (uint64_t i = 0; i < pageCount; i++)
     {
         uint64_t virt = virtStart + i * 4096;
-        uint64_t phys = PmmAllocPage(MemTag::Heap, KernelPid);
+        PhysicalAddress phys = PmmAllocPage(MemTag::Heap, KernelPid);
         if (!phys) return false;
-        if (!VmmMapPage(0, virt, phys, VMM_WRITABLE, MemTag::Heap, KernelPid))
+        if (!VmmMapPage(KernelPageTable, VirtualAddress(virt), phys, VMM_WRITABLE, MemTag::Heap, KernelPid))
         {
             PmmFreePage(phys);
             return false;

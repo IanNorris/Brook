@@ -88,15 +88,13 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         constexpr uint64_t TOTAL_PAGES = STACK_PAGES + GUARD_PAGES;
 
         // Reserve virtual address range, then map only the stack portion.
-        uint64_t base = brook::VmmAllocPages(TOTAL_PAGES, brook::VMM_WRITABLE,
+        brook::VirtualAddress base = brook::VmmAllocPages(TOTAL_PAGES, brook::VMM_WRITABLE,
                                              brook::MemTag::KernelData, brook::KernelPid);
         if (base)
         {
-            // Unmap the first page to create the guard.
-            brook::VmmUnmapPage(0, base);
+            brook::VmmUnmapPage(brook::KernelPageTable, base);
 
-            // New stack top is end of allocation, 16-byte aligned.
-            void* newTop = reinterpret_cast<void*>(base + TOTAL_PAGES * 0x1000 - 16);
+            void* newTop = reinterpret_cast<void*>(base.raw() + TOTAL_PAGES * 0x1000 - 16);
             g_kernelStackTop = newTop;
 
             // Switch to the new stack.  We're deep enough in init that nothing
@@ -113,13 +111,13 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         {
             constexpr uint64_t SYSCALL_STACK_PAGES = 16;  // 64 KB
             constexpr uint64_t GUARD_PAGES = 1;
-            uint64_t scBase = brook::VmmAllocPages(
+            brook::VirtualAddress scBase = brook::VmmAllocPages(
                 SYSCALL_STACK_PAGES + GUARD_PAGES,
                 brook::VMM_WRITABLE, brook::MemTag::KernelData, brook::KernelPid);
             if (scBase)
             {
-                brook::VmmUnmapPage(0, scBase); // guard page
-                uint64_t scTop = scBase + (SYSCALL_STACK_PAGES + GUARD_PAGES) * 0x1000 - 16;
+                brook::VmmUnmapPage(brook::KernelPageTable, scBase); // guard page
+                uint64_t scTop = scBase.raw() + (SYSCALL_STACK_PAGES + GUARD_PAGES) * 0x1000 - 16;
                 env->syscallStack = scTop;
             }
             else
@@ -381,14 +379,14 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
             constexpr uint64_t MAX_ELF_SIZE = 2 * 1024 * 1024; // 2 MB (busybox is 1.4MB)
             constexpr uint64_t ELF_BUF_PAGES = MAX_ELF_SIZE / 4096;
-            uint64_t elfBufAddr = brook::VmmAllocPages(ELF_BUF_PAGES,
+            brook::VirtualAddress elfBufAddr = brook::VmmAllocPages(ELF_BUF_PAGES,
                 brook::VMM_WRITABLE, brook::MemTag::Heap, brook::KernelPid);
             brook::SerialPrintf("ELF buf at 0x%lx (%lu pages)\n",
-                                elfBufAddr, ELF_BUF_PAGES);
+                                elfBufAddr.raw(), ELF_BUF_PAGES);
 
             if (!elfBufAddr) { brook::VfsClose(vn); continue; }
 
-            auto* elfBuf = reinterpret_cast<uint8_t*>(elfBufAddr);
+            auto* elfBuf = reinterpret_cast<uint8_t*>(elfBufAddr.raw());
             uint64_t totalRead = 0;
             uint64_t offset = 0;
             while (totalRead < MAX_ELF_SIZE)
@@ -406,7 +404,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
                                                b.argc, b.argv,
                                                1, envp);
 
-            brook::SerialPrintf("Freeing ELF buf at 0x%lx\n", elfBufAddr);
+            brook::SerialPrintf("Freeing ELF buf at 0x%lx\n", elfBufAddr.raw());
             brook::VmmFreePages(elfBufAddr, ELF_BUF_PAGES);
 
             if (proc)
@@ -422,7 +420,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
                     }
 
                     // Switch to process page table before entering user mode
-                    brook::VmmSwitchPageTable(proc->cr3Phys);
+                    brook::VmmSwitchPageTable(proc->pageTable);
 
                     brook::SwitchToUserMode(proc->stackTop,
                                              proc->elf.entryPoint);

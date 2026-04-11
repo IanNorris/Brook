@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include "address.h"
 
 namespace brook {
 
@@ -81,8 +82,8 @@ struct Process
     uint16_t _pad0;
     uint32_t _pad1;
 
-    // Per-process page table (physical address of PML4)
-    uint64_t cr3Phys;
+    // Per-process page table
+    PageTable pageTable;
 
     // ELF binary info
     ElfBinary elf;

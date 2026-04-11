@@ -115,8 +115,8 @@ static uint64_t SetupUserStack(Process* proc,
 
     // Translate user vaddr to kernel-writable pointer via direct map.
     auto toKernel = [&](uint64_t userAddr) -> uint8_t* {
-        uint64_t phys = VmmVirtToPhys(proc->cr3Phys, userAddr);
-        return phys ? reinterpret_cast<uint8_t*>(PhysToVirt(phys)) : nullptr;
+        PhysicalAddress phys = VmmVirtToPhys(proc->pageTable, VirtualAddress(userAddr));
+        return phys ? reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw()) : nullptr;
     };
 
     // Helper: push bytes onto the stack (writes via direct map)
@@ -195,7 +195,7 @@ static uint64_t SetupUserStack(Process* proc,
 
 // Forward declaration — implemented in elf_loader.cpp
 bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
-             uint64_t pml4Phys, uint16_t pid);
+             PageTable pt, uint16_t pid);
 
 Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
                        int argc, const char* const* argv,
@@ -211,8 +211,8 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     proc->pid = 1; // First user process
 
     // Create per-process page table
-    proc->cr3Phys = VmmCreateUserPageTable();
-    if (!proc->cr3Phys)
+    proc->pageTable = VmmCreateUserPageTable();
+    if (!proc->pageTable)
     {
         SerialPuts("PROC: page table allocation failed\n");
         kfree(proc);
@@ -221,10 +221,10 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
 
     // Load ELF binary into the process's page table (no CR3 switch needed —
     // ElfLoad writes via the direct physical map).
-    if (!ElfLoad(elfData, elfSize, &proc->elf, proc->cr3Phys, proc->pid))
+    if (!ElfLoad(elfData, elfSize, &proc->elf, proc->pageTable, proc->pid))
     {
         SerialPuts("PROC: ELF load failed\n");
-        VmmDestroyUserPageTable(proc->cr3Phys);
+        VmmDestroyUserPageTable(proc->pageTable);
         kfree(proc);
         return nullptr;
     }
@@ -244,24 +244,23 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     bool stackOk = true;
     for (uint64_t i = guardPages; i < totalStackPages; i++)
     {
-        uint64_t vaddr = stackVirtBase + i * 4096;
-        uint64_t phys = PmmAllocPage(MemTag::User, proc->pid);
-        if (!phys || !VmmMapPage(proc->cr3Phys, vaddr, phys,
+        VirtualAddress vaddr(stackVirtBase + i * 4096);
+        PhysicalAddress phys = PmmAllocPage(MemTag::User, proc->pid);
+        if (!phys || !VmmMapPage(proc->pageTable, vaddr, phys,
                                   VMM_WRITABLE | VMM_USER,
                                   MemTag::User, proc->pid))
         {
             stackOk = false;
             break;
         }
-        // Zero via direct map (kernel CR3 is active)
-        auto* p = reinterpret_cast<uint8_t*>(PhysToVirt(phys));
+        auto* p = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
         for (uint64_t b = 0; b < 4096; b++) p[b] = 0;
     }
     if (!stackOk)
     {
         SerialPuts("PROC: stack allocation failed\n");
         PmmKillPid(proc->pid);
-        VmmDestroyUserPageTable(proc->cr3Phys);
+        VmmDestroyUserPageTable(proc->pageTable);
         kfree(proc);
         return nullptr;
     }
@@ -296,24 +295,23 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
 
         // Helper: translate user vaddr to kernel pointer via direct map
         auto tlsToKernel = [&](uint64_t userAddr) -> uint8_t* {
-            uint64_t phys = VmmVirtToPhys(proc->cr3Phys, userAddr);
-            return phys ? reinterpret_cast<uint8_t*>(PhysToVirt(phys)) : nullptr;
+            PhysicalAddress phys = VmmVirtToPhys(proc->pageTable, VirtualAddress(userAddr));
+            return phys ? reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw()) : nullptr;
         };
 
         bool tlsOk = true;
         for (uint64_t i = 0; i < tlsPages; i++)
         {
-            uint64_t vaddr = tlsBase + i * 4096;
-            uint64_t phys = PmmAllocPage(MemTag::User, proc->pid);
-            if (!phys || !VmmMapPage(proc->cr3Phys, vaddr, phys,
+            VirtualAddress vaddr(tlsBase + i * 4096);
+            PhysicalAddress phys = PmmAllocPage(MemTag::User, proc->pid);
+            if (!phys || !VmmMapPage(proc->pageTable, vaddr, phys,
                                       VMM_WRITABLE | VMM_USER,
                                       MemTag::User, proc->pid))
             {
                 tlsOk = false;
                 break;
             }
-            // Zero via direct map
-            auto* p = reinterpret_cast<uint8_t*>(PhysToVirt(phys));
+            auto* p = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
             for (uint64_t b = 0; b < 4096; b++) p[b] = 0;
         }
 
@@ -357,7 +355,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
 
     SerialPrintf("PROC: created pid=%u, entry=0x%lx, stack=0x%lx, brk=0x%lx, cr3=0x%lx\n",
                  proc->pid, proc->elf.entryPoint, proc->stackTop,
-                 proc->programBreak, proc->cr3Phys);
+                 proc->programBreak, proc->pageTable.pml4.raw());
 
     return proc;
 }
@@ -385,7 +383,7 @@ void ProcessDestroy(Process* proc)
     VmmKillPid(proc->pid);
 
     // Free per-process page table pages
-    VmmDestroyUserPageTable(proc->cr3Phys);
+    VmmDestroyUserPageTable(proc->pageTable);
 
     if (g_currentProcess == proc)
         g_currentProcess = nullptr;

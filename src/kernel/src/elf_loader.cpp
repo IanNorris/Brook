@@ -24,7 +24,7 @@ static inline uint64_t AlignDown(uint64_t val, uint64_t align)
 }
 
 bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
-             uint64_t pml4Phys, uint16_t pid)
+             PageTable pt, uint16_t pid)
 {
     if (size < sizeof(Elf64_Ehdr))
     {
@@ -103,17 +103,17 @@ bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
     // via the direct physical map, so we can write to user pages without
     // switching CR3.
     auto userToKernel = [&](uint64_t userVaddr) -> uint8_t* {
-        uint64_t phys = VmmVirtToPhys(pml4Phys, userVaddr);
+        PhysicalAddress phys = VmmVirtToPhys(pt, VirtualAddress(userVaddr));
         if (!phys) return nullptr;
-        return reinterpret_cast<uint8_t*>(PhysToVirt(phys));
+        return reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
     };
 
     // Allocate pages for the binary segments only.
     // Program break pages are allocated lazily by sys_brk.
     for (uint64_t page = 0; page < loadPages; ++page)
     {
-        uint64_t vaddr = loadBase + page * 4096;
-        uint64_t phys = PmmAllocPage(MemTag::User, pid);
+        VirtualAddress vaddr(loadBase + page * 4096);
+        PhysicalAddress phys = PmmAllocPage(MemTag::User, pid);
         if (!phys)
         {
             SerialPrintf("ELF: out of memory at page %lu\n", page);
@@ -122,14 +122,13 @@ bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
 
         uint64_t flags = VMM_WRITABLE | VMM_USER;
 
-        if (!VmmMapPage(pml4Phys, vaddr, phys, flags, MemTag::User, pid))
+        if (!VmmMapPage(pt, vaddr, phys, flags, MemTag::User, pid))
         {
-            SerialPrintf("ELF: failed to map vaddr 0x%lx\n", vaddr);
+            SerialPrintf("ELF: failed to map vaddr 0x%lx\n", vaddr.raw());
             return false;
         }
 
-        // Zero the page via direct map (kernel can't access user vaddrs)
-        auto* p = reinterpret_cast<uint8_t*>(PhysToVirt(phys));
+        auto* p = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
         for (uint64_t b = 0; b < 4096; ++b) p[b] = 0;
     }
 

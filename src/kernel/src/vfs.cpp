@@ -123,7 +123,7 @@ static CachedFile* CacheFile(FIL* fil)
     // Use VmmAllocPages for large allocations (kmalloc can't do multi-MB).
     uint64_t numPages = (size + 4095) / 4096;
     cf->data = static_cast<uint8_t*>(
-        reinterpret_cast<void*>(VmmAllocPages(numPages, VMM_WRITABLE, MemTag::KernelData)));
+        reinterpret_cast<void*>(VmmAllocPages(numPages, VMM_WRITABLE, MemTag::KernelData).raw()));
     if (!cf->data) {
         SerialPrintf("VFS: cache alloc failed (%lu pages)\n", (unsigned long)numPages);
         kfree(cf);
@@ -141,7 +141,7 @@ static CachedFile* CacheFile(FIL* fil)
         if (res != FR_OK || br == 0) {
             SerialPrintf("VFS: cache read failed at off=%lu (res=%u)\n",
                          (unsigned long)off, (unsigned)res);
-            VmmFreePages(reinterpret_cast<uint64_t>(cf->data), numPages);
+            VmmFreePages(VirtualAddress(reinterpret_cast<uint64_t>(cf->data)), numPages);
             kfree(cf);
             return nullptr;
         }
@@ -173,7 +173,7 @@ static void CachedFileClose(Vnode* vn)
         if (cf->fil) f_close(cf->fil);
         if (cf->data) {
             uint64_t numPages = (cf->size + 4095) / 4096;
-            VmmFreePages(reinterpret_cast<uint64_t>(cf->data), numPages);
+            VmmFreePages(VirtualAddress(reinterpret_cast<uint64_t>(cf->data)), numPages);
         }
         kfree(cf);
     }
@@ -345,7 +345,7 @@ bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
 
     // Diagnostic: show physical page backing the FATFS.win buffer
     uint64_t winVirt = reinterpret_cast<uint64_t>(&fs->win[0]);
-    uint64_t winPhys = VmmVirtToPhys(0, winVirt);
+    uint64_t winPhys = VmmVirtToPhys(KernelPageTable, VirtualAddress(winVirt)).raw();
     SerialPrintf("VFS: FATFS.win virt=0x%lx phys=0x%lx (sizeof FATFS=%lu)\n",
                  winVirt, winPhys, static_cast<unsigned long>(sizeof(FATFS)));
 

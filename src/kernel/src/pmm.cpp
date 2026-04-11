@@ -1,13 +1,11 @@
 #include "pmm.h"
 #include "serial.h"
 
-// Forward-declared to avoid circular headers: vmm.h ↔ pmm.h.
-// VMM_WRITABLE = bit 1; MemTag::KernelData = 2; KernelPid = 0.
-// extern "C" must match the declarations in vmm.h / heap.h.
+// Forward-declared to avoid circular headers.
 namespace brook {
-    extern "C" void*    kmalloc(uint64_t);
-    extern "C" uint64_t VmmAllocPages(uint64_t pageCount, uint64_t flags,
-                                      MemTag tag, uint16_t pid);
+    extern "C" void* kmalloc(uint64_t);
+    VirtualAddress VmmAllocPages(uint64_t pageCount, uint64_t flags,
+                                 MemTag tag, uint16_t pid);
 }
 
 // Linker-defined symbol — end of the kernel image (virtual address).
@@ -219,7 +217,7 @@ void PmmInit(const BootProtocol* proto)
                  static_cast<uint32_t>((g_totalPages * PAGE_SIZE) / (1024 * 1024)));
 }
 
-uint64_t PmmAllocPage(MemTag tag, uint16_t pid)
+PhysicalAddress PmmAllocPage(MemTag tag, uint16_t pid)
 {
     // Search from hint forward, then wrap around once.
     uint64_t startWord = g_nextHint / 64;
@@ -237,21 +235,21 @@ uint64_t PmmAllocPage(MemTag tag, uint16_t pid)
             // Find first free bit in this word.
             int bit = __builtin_ctzll(~g_bitmap[w]);
             uint64_t idx = w * 64 + static_cast<uint64_t>(bit);
-            if (idx >= g_totalPages) return 0;
+            if (idx >= g_totalPages) return PhysicalAddress{};
 
             SetUsed(idx);
             g_freePages--;
             g_nextHint = idx + 1;
             TrackAlloc(static_cast<uint32_t>(idx), tag, pid);
-            return idx * PAGE_SIZE;
+            return PhysicalAddress(idx * PAGE_SIZE);
         }
     }
-    return 0; // out of memory
+    return PhysicalAddress{}; // out of memory
 }
 
-uint64_t PmmAllocPages(uint64_t count, MemTag tag, uint16_t pid)
+PhysicalAddress PmmAllocPages(uint64_t count, MemTag tag, uint16_t pid)
 {
-    if (count == 0) return 0;
+    if (count == 0) return PhysicalAddress{};
     if (count == 1) return PmmAllocPage(tag, pid);
 
     // Linear scan for a contiguous run of 'count' free pages.
@@ -272,7 +270,7 @@ uint64_t PmmAllocPages(uint64_t count, MemTag tag, uint16_t pid)
                     g_freePages--;
                     TrackAlloc(static_cast<uint32_t>(runStart + i), tag, pid);
                 }
-                return runStart * PAGE_SIZE;
+                return PhysicalAddress(runStart * PAGE_SIZE);
             }
         }
         else
@@ -280,24 +278,23 @@ uint64_t PmmAllocPages(uint64_t count, MemTag tag, uint16_t pid)
             runLen = 0;
         }
     }
-    return 0; // no contiguous run found
+    return PhysicalAddress{}; // no contiguous run found
 }
 
-void PmmFreePage(uint64_t physAddr)
+void PmmFreePage(PhysicalAddress physAddr)
 {
-    if (physAddr == 0) return;
-    if ((physAddr & (PAGE_SIZE - 1)) != 0) return; // not page-aligned, ignore
+    if (!physAddr) return;
+    if ((physAddr.raw() & (PAGE_SIZE - 1)) != 0) return;
 
-    uint64_t idx = physAddr / PAGE_SIZE;
+    uint64_t idx = physAddr.raw() / PAGE_SIZE;
     if (idx >= g_totalPages) return;
-    if (!IsUsed(idx)) return; // double-free, silently ignore for now
+    if (!IsUsed(idx)) return;
 
-    // Catch accidental frees of page table pages
     if (g_pageDescs)
     {
         PageDescriptor& d = Desc(static_cast<uint32_t>(idx));
         if (d.tag == static_cast<uint8_t>(MemTag::PageTable))
-            SerialPrintf("PMM: WARNING freeing PageTable page 0x%lx!\n", physAddr);
+            SerialPrintf("PMM: WARNING freeing PageTable page 0x%lx!\n", physAddr.raw());
     }
 
     SetFree(idx);
@@ -306,7 +303,6 @@ void PmmFreePage(uint64_t physAddr)
 
     if (g_pageDescs)
     {
-        // Remove from PID's list; free pages are not tracked in any list.
         ListRemove(static_cast<uint32_t>(idx));
         PageDescriptor& d = Desc(static_cast<uint32_t>(idx));
         d.pid = 0;
@@ -314,31 +310,30 @@ void PmmFreePage(uint64_t physAddr)
     }
 }
 
-void PmmSetOwner(uint64_t physAddr, MemTag tag, uint16_t pid)
+void PmmSetOwner(PhysicalAddress physAddr, MemTag tag, uint16_t pid)
 {
-    if ((physAddr & (PAGE_SIZE - 1)) != 0) return;
+    if ((physAddr.raw() & (PAGE_SIZE - 1)) != 0) return;
     if (!g_pageDescs) return;
-    uint64_t idx64 = physAddr / PAGE_SIZE;
+    uint64_t idx64 = physAddr.raw() / PAGE_SIZE;
     if (idx64 >= g_totalPages) return;
     uint32_t idx = static_cast<uint32_t>(idx64);
-    // If page is currently in a list, remove it first.
     if (Desc(idx).pid != 0 || Desc(idx).tag != static_cast<uint8_t>(MemTag::Free))
         ListRemove(idx);
     ListAppend(idx, pid, tag);
 }
 
-MemTag PmmGetTag(uint64_t physAddr)
+MemTag PmmGetTag(PhysicalAddress physAddr)
 {
     if (!g_pageDescs) return MemTag::KernelData;
-    uint64_t idx = physAddr / PAGE_SIZE;
+    uint64_t idx = physAddr.raw() / PAGE_SIZE;
     if (idx >= g_totalPages) return MemTag::System;
     return static_cast<MemTag>(Desc(static_cast<uint32_t>(idx)).tag);
 }
 
-uint16_t PmmGetPid(uint64_t physAddr)
+uint16_t PmmGetPid(PhysicalAddress physAddr)
 {
     if (!g_pageDescs) return KernelPid;
-    uint64_t idx = physAddr / PAGE_SIZE;
+    uint64_t idx = physAddr.raw() / PAGE_SIZE;
     if (idx >= g_totalPages) return KernelPid;
     return Desc(static_cast<uint32_t>(idx)).pid;
 }
@@ -352,11 +347,11 @@ void PmmEnableTracking()
     static constexpr uint64_t VMM_WRITABLE_LOCAL = (1ULL << 1);
     uint64_t descBytes = g_totalPages * sizeof(PageDescriptor);
     uint64_t descPages = (descBytes + PAGE_SIZE_LOCAL - 1) / PAGE_SIZE_LOCAL;
-    uint64_t descVirt  = VmmAllocPages(descPages, VMM_WRITABLE_LOCAL,
-                                       MemTag::KernelData, KernelPid);
-    g_pageDescs = reinterpret_cast<PageDescriptor*>(descVirt);
+    VirtualAddress descVirt = VmmAllocPages(descPages, VMM_WRITABLE_LOCAL,
+                                            MemTag::KernelData, KernelPid);
+    g_pageDescs = reinterpret_cast<PageDescriptor*>(descVirt.raw());
 
-    if (descVirt == 0)
+    if (!descVirt)
     {
         g_pageDescs = nullptr;
         SerialPuts("PMM: WARNING: tracking allocation failed — ownership disabled\n");
@@ -433,7 +428,7 @@ void PmmKillPid(uint16_t pid)
 }
 
 void PmmEnumeratePid(uint16_t pid,
-                     bool (*callback)(uint64_t physAddr, MemTag tag, void* ctx),
+                     bool (*callback)(PhysicalAddress physAddr, MemTag tag, void* ctx),
                      void* ctx)
 {
     if (!g_pageDescs) return;
@@ -442,7 +437,7 @@ void PmmEnumeratePid(uint16_t pid,
     while (idx != PMM_NULL_PAGE)
     {
         uint32_t next = Desc(idx).next;
-        if (!callback(static_cast<uint64_t>(idx) * PAGE_SIZE,
+        if (!callback(PhysicalAddress(static_cast<uint64_t>(idx) * PAGE_SIZE),
                       static_cast<MemTag>(Desc(idx).tag), ctx))
             break;
         idx = next;

@@ -318,10 +318,10 @@ static int64_t sys_brk(uint64_t newBreak, uint64_t, uint64_t,
 
     for (uint64_t addr = oldPage; addr < newPage; addr += 4096)
     {
-        uint64_t phys = PmmAllocPage(MemTag::User, proc->pid);
+        PhysicalAddress phys = PmmAllocPage(MemTag::User, proc->pid);
         if (!phys) return static_cast<int64_t>(proc->programBreak);
 
-        if (!VmmMapPage(proc->cr3Phys, addr, phys,
+        if (!VmmMapPage(proc->pageTable, VirtualAddress(addr), phys,
                         VMM_WRITABLE | VMM_USER, MemTag::User, proc->pid))
             return static_cast<int64_t>(proc->programBreak);
 
@@ -359,9 +359,9 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 
         for (uint64_t i = 0; i < pages; i++)
         {
-            uint64_t phys = PmmAllocPage(tag, proc->pid);
+            PhysicalAddress phys = PmmAllocPage(tag, proc->pid);
             if (!phys) return 0;
-            if (!VmmMapPage(proc->cr3Phys, vaddr + i * 4096, phys,
+            if (!VmmMapPage(proc->pageTable, VirtualAddress(vaddr + i * 4096), phys,
                             VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
                             tag, proc->pid))
             {
@@ -407,8 +407,8 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         // Map directly to physical framebuffer pages
         for (uint64_t i = 0; i < pages; ++i)
         {
-            if (!VmmMapPage(proc->cr3Phys, vaddr + i * 4096,
-                            physBase + i * 4096,
+            if (!VmmMapPage(proc->pageTable, VirtualAddress(vaddr + i * 4096),
+                            PhysicalAddress(physBase + i * 4096),
                             VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
                             MemTag::Device, proc->pid))
             {
