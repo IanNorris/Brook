@@ -135,11 +135,11 @@ bool TtyInit(const Framebuffer& fb)
     for (uint64_t i = 0; i < fbPages; i++)
     {
         uint64_t virt    = fbVirt + i * 4096u;
-        uint64_t oldPhys = VmmVirtToPhys(virt);
-        VmmUnmapPage(virt);
+        uint64_t oldPhys = VmmVirtToPhys(0, virt);
+        VmmUnmapPage(0, virt);
         if (oldPhys) PmmFreePage(oldPhys);
 
-        if (!VmmMapPage(virt, physBase + i * 4096u,
+        if (!VmmMapPage(0, virt, physBase + i * 4096u,
                         VMM_WRITABLE | VMM_NO_EXEC,
                         MemTag::Device, KernelPid))
         {

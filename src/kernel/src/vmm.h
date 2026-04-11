@@ -73,20 +73,27 @@ struct VmmAllocation
 // Initialise the VMM. Must be called after PmmInit().
 void VmmInit();
 
+// All page-table-walking functions take an explicit pml4Phys parameter:
+//   0         → use the kernel page table (VmmKernelCR3)
+//   non-zero  → use the given PML4 physical address
+// This forces callers to be explicit about which address space they target.
+
 // Map a single 4KB page: virtual virtAddr → physical physAddr.
 // virtAddr must be >= VIRTUAL_NULL_GUARD (null guard enforced).
 // flags: combination of VMM_WRITABLE, VMM_USER, VMM_NO_EXEC.
 // VMM_PRESENT is always set automatically.
 // tag/pid are encoded in PTE available bits [9-11] and [52-62].
 // Returns false on null-guard violation or page table allocation failure.
-bool VmmMapPage(uint64_t virtAddr, uint64_t physAddr, uint64_t flags,
+bool VmmMapPage(uint64_t pml4Phys, uint64_t virtAddr, uint64_t physAddr,
+                uint64_t flags,
                 MemTag tag = MemTag::KernelData, uint16_t pid = KernelPid);
 
 // Unmap a single 4KB page. Issues INVLPG. No-op if not mapped.
-void VmmUnmapPage(uint64_t virtAddr);
+void VmmUnmapPage(uint64_t pml4Phys, uint64_t virtAddr);
 
 // Allocate 'pageCount' contiguous virtual pages from the VMALLOC region,
 // backing each with a fresh physical page from the PMM.
+// Always maps into the kernel page table (VMALLOC is kernel-only).
 // tag/pid are recorded in the VMM allocation table and stamped on each
 // backing physical page via PmmSetOwner.
 // Returns the virtual base address, or 0 on failure.
@@ -95,12 +102,12 @@ extern "C" uint64_t VmmAllocPages(uint64_t pageCount,
                        MemTag tag     = MemTag::KernelData,
                        uint16_t pid   = KernelPid);
 
-// Free pages previously allocated with VmmAllocPages.
+// Free pages previously allocated with VmmAllocPages (kernel page table).
 extern "C" void VmmFreePages(uint64_t virtAddr, uint64_t pageCount);
 
-// Translate virtual → physical by walking the live page tables.
+// Translate virtual → physical by walking the given page table.
 // Returns 0 if the address is not mapped.
-extern "C" uint64_t VmmVirtToPhys(uint64_t virtAddr);
+extern "C" uint64_t VmmVirtToPhys(uint64_t pml4Phys, uint64_t virtAddr);
 
 // Allocate pages in the kernel module region (within ±2GB of kernel image).
 // Used for loading driver modules that are compiled with -mcmodel=kernel.
@@ -114,15 +121,31 @@ const VmmAllocation* VmmGetAllocation(uint64_t virtAddr);
 
 // Extract the MemTag encoded in a mapped page's PTE available bits.
 // Returns MemTag::Free if the address is not mapped.
-MemTag VmmGetPageTag(uint64_t virtAddr);
+MemTag VmmGetPageTag(uint64_t pml4Phys, uint64_t virtAddr);
 
 // Extract the PID encoded in a mapped page's PTE available bits.
 // Returns KernelPid if the address is not mapped.
-uint16_t VmmGetPagePid(uint64_t virtAddr);
+uint16_t VmmGetPagePid(uint64_t pml4Phys, uint64_t virtAddr);
 
 // Free all virtual allocations owned by a PID, then call PmmKillPid.
 // No-op if tracking is not enabled or pid == KernelPid.
 void VmmKillPid(uint16_t pid);
+
+// Create a new user-mode page table: allocates a PML4 page and copies
+// the kernel's upper-half entries (PML4[256..511]) so kernel mappings
+// are shared.  Returns the physical address of the new PML4, or 0 on failure.
+uint64_t VmmCreateUserPageTable();
+
+// Free a per-process PML4 and all intermediate page-table pages in the
+// user-half (PML4[0..255]).  Does NOT free the physical data pages — those
+// are freed by VmmKillPid / PmmKillPid.
+void VmmDestroyUserPageTable(uint64_t pml4Phys);
+
+// Get the kernel's PML4 physical address (the CR3 value set at boot).
+uint64_t VmmKernelCR3();
+
+// Switch the active page table.  Writes cr3 and flushes the TLB.
+void VmmSwitchPageTable(uint64_t pml4Phys);
 
 // Count active VMALLOC allocations, optionally filtered by PID.
 // Pass KernelPid+1 or any invalid PID to count all allocations.

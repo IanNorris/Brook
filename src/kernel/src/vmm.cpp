@@ -19,6 +19,9 @@ static constexpr uint64_t PHYS_MASK = 0x000FFFFFFFFFF000ULL;
 
 static uint64_t g_vmallocNext = VMALLOC_BASE;
 
+// The kernel's PML4 physical address, captured at init time.
+static uint64_t g_kernelCR3 = 0;
+
 // Module-space bump allocator
 static uint64_t g_moduleNext = MODULE_BASE;
 
@@ -104,10 +107,16 @@ static uint64_t* GetOrAllocEntry(uint64_t* parent, uint64_t idx, uint64_t extraF
     return reinterpret_cast<uint64_t*>(PhysToVirt(childPhys));
 }
 
-static uint64_t* WalkToPtr(uint64_t virtAddr, bool create, uint64_t flags = 0)
+// Resolve pml4Phys: 0 means kernel page table.
+static inline uint64_t ResolvePml4(uint64_t pml4Phys)
 {
-    uint64_t cr3   = ReadCR3() & PHYS_MASK;
-    uint64_t* pml4 = reinterpret_cast<uint64_t*>(PhysToVirt(cr3));
+    return pml4Phys ? pml4Phys : g_kernelCR3;
+}
+
+static uint64_t* WalkToPtr(uint64_t pml4Phys, uint64_t virtAddr,
+                            bool create, uint64_t flags = 0)
+{
+    uint64_t* pml4 = reinterpret_cast<uint64_t*>(PhysToVirt(ResolvePml4(pml4Phys)));
 
     uint64_t* pdpt = create
         ? GetOrAllocEntry(pml4, Pml4Index(virtAddr), flags)
@@ -172,6 +181,7 @@ static uint64_t* WalkToPtr(uint64_t virtAddr, bool create, uint64_t flags = 0)
 void VmmInit()
 {
     g_vmallocNext = VMALLOC_BASE;
+    g_kernelCR3 = ReadCR3() & PHYS_MASK;
 
     // Set up the direct physical map at DIRECT_MAP_BASE (PML4[256]).
     // This maps all physical RAM using 2MB pages, providing a safe way
@@ -219,8 +229,8 @@ void VmmInit()
     SerialPuts("VMM: initialized\n");
 }
 
-bool VmmMapPage(uint64_t virtAddr, uint64_t physAddr, uint64_t flags,
-                MemTag tag, uint16_t pid)
+bool VmmMapPage(uint64_t pml4Phys, uint64_t virtAddr, uint64_t physAddr,
+                uint64_t flags, MemTag tag, uint16_t pid)
 {
     // Enforce null pointer guard: reject any mapping below 64KB.
     if (virtAddr < VIRTUAL_NULL_GUARD)
@@ -230,7 +240,7 @@ bool VmmMapPage(uint64_t virtAddr, uint64_t physAddr, uint64_t flags,
         return false;
     }
 
-    uint64_t* pte = WalkToPtr(virtAddr, /*create=*/true, flags);
+    uint64_t* pte = WalkToPtr(pml4Phys, virtAddr, /*create=*/true, flags);
     if (!pte) return false;
 
     // Encode tag in bits [9-11] and PID in bits [52-62].
@@ -244,9 +254,9 @@ bool VmmMapPage(uint64_t virtAddr, uint64_t physAddr, uint64_t flags,
     return true;
 }
 
-void VmmUnmapPage(uint64_t virtAddr)
+void VmmUnmapPage(uint64_t pml4Phys, uint64_t virtAddr)
 {
-    uint64_t* pte = WalkToPtr(virtAddr, /*create=*/false);
+    uint64_t* pte = WalkToPtr(pml4Phys, virtAddr, /*create=*/false);
     if (pte && (*pte & VMM_PRESENT))
     {
         *pte = 0;
@@ -272,7 +282,7 @@ uint64_t VmmAllocPages(uint64_t pageCount, uint64_t flags, MemTag tag, uint16_t 
             for (uint64_t j = 0; j < i; j++)
             {
                 uint64_t v = virtBase + j * PAGE_SIZE;
-                uint64_t* pte = WalkToPtr(v, false);
+                uint64_t* pte = WalkToPtr(0, v, false);
                 if (pte && (*pte & VMM_PRESENT))
                 {
                     PmmFreePage(*pte & PHYS_MASK);
@@ -284,13 +294,13 @@ uint64_t VmmAllocPages(uint64_t pageCount, uint64_t flags, MemTag tag, uint16_t 
             return 0;
         }
 
-        if (!VmmMapPage(virtBase + i * PAGE_SIZE, phys, flags, tag, pid))
+        if (!VmmMapPage(0, virtBase + i * PAGE_SIZE, phys, flags, tag, pid))
         {
             PmmFreePage(phys);
             for (uint64_t j = 0; j < i; j++)
             {
                 uint64_t v = virtBase + j * PAGE_SIZE;
-                uint64_t* pte = WalkToPtr(v, false);
+                uint64_t* pte = WalkToPtr(0, v, false);
                 if (pte && (*pte & VMM_PRESENT))
                 {
                     PmmFreePage(*pte & PHYS_MASK);
@@ -333,7 +343,7 @@ uint64_t VmmAllocModulePages(uint64_t pageCount, uint64_t flags, MemTag tag, uin
             for (uint64_t j = 0; j < i; j++)
             {
                 uint64_t v = virtBase + j * PAGE_SIZE;
-                uint64_t* pte = WalkToPtr(v, false);
+                uint64_t* pte = WalkToPtr(0, v, false);
                 if (pte && (*pte & VMM_PRESENT))
                 {
                     PmmFreePage(*pte & PHYS_MASK);
@@ -345,13 +355,13 @@ uint64_t VmmAllocModulePages(uint64_t pageCount, uint64_t flags, MemTag tag, uin
             return 0;
         }
 
-        if (!VmmMapPage(virtBase + i * PAGE_SIZE, phys, flags, tag, pid))
+        if (!VmmMapPage(0, virtBase + i * PAGE_SIZE, phys, flags, tag, pid))
         {
             PmmFreePage(phys);
             for (uint64_t j = 0; j < i; j++)
             {
                 uint64_t v = virtBase + j * PAGE_SIZE;
-                uint64_t* pte = WalkToPtr(v, false);
+                uint64_t* pte = WalkToPtr(0, v, false);
                 if (pte && (*pte & VMM_PRESENT))
                 {
                     PmmFreePage(*pte & PHYS_MASK);
@@ -381,7 +391,7 @@ void VmmFreePages(uint64_t virtAddr, uint64_t pageCount)
     for (uint64_t i = 0; i < pageCount; i++)
     {
         uint64_t v = virtAddr + i * PAGE_SIZE;
-        uint64_t* pte = WalkToPtr(v, false);
+        uint64_t* pte = WalkToPtr(0, v, false);
         if (pte && (*pte & VMM_PRESENT))
         {
             PmmFreePage(*pte & PHYS_MASK);
@@ -395,9 +405,9 @@ void VmmFreePages(uint64_t virtAddr, uint64_t pageCount)
     if (alloc) alloc->virtBase = 0;
 }
 
-uint64_t VmmVirtToPhys(uint64_t virtAddr)
+uint64_t VmmVirtToPhys(uint64_t pml4Phys, uint64_t virtAddr)
 {
-    uint64_t* pte = WalkToPtr(virtAddr, false);
+    uint64_t* pte = WalkToPtr(pml4Phys, virtAddr, false);
     if (!pte || !(*pte & VMM_PRESENT)) return 0;
     return (*pte & PHYS_MASK) | (virtAddr & (PAGE_SIZE - 1));
 }
@@ -415,16 +425,16 @@ const VmmAllocation* VmmGetAllocation(uint64_t virtAddr)
     return nullptr;
 }
 
-MemTag VmmGetPageTag(uint64_t virtAddr)
+MemTag VmmGetPageTag(uint64_t pml4Phys, uint64_t virtAddr)
 {
-    uint64_t* pte = WalkToPtr(virtAddr, false);
+    uint64_t* pte = WalkToPtr(pml4Phys, virtAddr, false);
     if (!pte || !(*pte & VMM_PRESENT)) return MemTag::Free;
     return static_cast<MemTag>((*pte & PTE_TAG_MASK) >> PTE_TAG_SHIFT);
 }
 
-uint16_t VmmGetPagePid(uint64_t virtAddr)
+uint16_t VmmGetPagePid(uint64_t pml4Phys, uint64_t virtAddr)
 {
-    uint64_t* pte = WalkToPtr(virtAddr, false);
+    uint64_t* pte = WalkToPtr(pml4Phys, virtAddr, false);
     if (!pte || !(*pte & VMM_PRESENT)) return KernelPid;
     return static_cast<uint16_t>((*pte & PTE_PID_MASK) >> PTE_PID_SHIFT);
 }
@@ -458,6 +468,71 @@ uint32_t VmmCountAllocations(uint16_t filterPid)
             count++;
     }
     return count;
+}
+
+// ---------------------------------------------------------------------------
+// Per-process page tables
+// ---------------------------------------------------------------------------
+
+uint64_t VmmKernelCR3()
+{
+    return g_kernelCR3;
+}
+
+void VmmSwitchPageTable(uint64_t pml4Phys)
+{
+    __asm__ volatile("mov %0, %%cr3" : : "r"(pml4Phys) : "memory");
+}
+
+uint64_t VmmCreateUserPageTable()
+{
+    uint64_t pml4Phys = AllocTablePage();
+    if (!pml4Phys) return 0;
+    ZeroPage(pml4Phys);
+
+    // Copy kernel-half entries (PML4[256..511]) from the kernel PML4.
+    // These point to the same physical PDPT pages, so kernel mappings
+    // (direct map, VMALLOC, heap, kernel image) are shared.
+    uint64_t* newPml4  = reinterpret_cast<uint64_t*>(PhysToVirt(pml4Phys));
+    uint64_t* kernPml4 = reinterpret_cast<uint64_t*>(PhysToVirt(g_kernelCR3));
+
+    for (uint64_t i = 256; i < 512; i++)
+        newPml4[i] = kernPml4[i];
+
+    return pml4Phys;
+}
+
+// Recursively free page-table pages at a given level.
+// level: 3=PDPT, 2=PD, 1=PT.  Does NOT free leaf data pages.
+static void FreeTableLevel(uint64_t tablePhys, int level)
+{
+    uint64_t* table = reinterpret_cast<uint64_t*>(PhysToVirt(tablePhys));
+    if (level > 1)
+    {
+        for (uint64_t i = 0; i < 512; i++)
+        {
+            if (!(table[i] & VMM_PRESENT)) continue;
+            if (table[i] & (1ULL << 7)) continue; // huge page, skip
+            FreeTableLevel(table[i] & PHYS_MASK, level - 1);
+        }
+    }
+    PmmFreePage(tablePhys);
+}
+
+void VmmDestroyUserPageTable(uint64_t pml4Phys)
+{
+    if (!pml4Phys) return;
+
+    uint64_t* pml4 = reinterpret_cast<uint64_t*>(PhysToVirt(pml4Phys));
+
+    // Only free user-half entries (0..255).  Kernel-half entries are shared.
+    for (uint64_t i = 0; i < 256; i++)
+    {
+        if (!(pml4[i] & VMM_PRESENT)) continue;
+        FreeTableLevel(pml4[i] & PHYS_MASK, 3);
+    }
+
+    PmmFreePage(pml4Phys);
 }
 
 } // namespace brook

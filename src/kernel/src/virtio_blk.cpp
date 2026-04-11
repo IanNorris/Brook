@@ -194,12 +194,12 @@ static bool AllocVirtqueue(VirtioBlkState& s)
     s.usedIdx   = reinterpret_cast<volatile uint16_t*>(usedBase + 2);
     s.usedRing  = reinterpret_cast<VirtqUsedElem*>(usedBase + 4);
 
-    s.queuePhys = VmmVirtToPhys(qVirt);
+    s.queuePhys = VmmVirtToPhys(0, qVirt);
 
     // Request/status buffers on the last page.
     uint64_t extraVirt = qVirt + (totalPages - 1) * 4096;
     s.reqBuf         = reinterpret_cast<VirtioBlkReq*>(extraVirt);
-    s.reqBufPhys     = VmmVirtToPhys(extraVirt);
+    s.reqBufPhys     = VmmVirtToPhys(0, extraVirt);
     s.statusBuf      = reinterpret_cast<uint8_t*>(extraVirt + sizeof(VirtioBlkReq));
     s.statusBufPhys  = s.reqBufPhys + sizeof(VirtioBlkReq);
 

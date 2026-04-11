@@ -318,18 +318,14 @@ static int64_t sys_brk(uint64_t newBreak, uint64_t, uint64_t,
 
     for (uint64_t addr = oldPage; addr < newPage; addr += 4096)
     {
-        // Must allocate a new user-accessible page. If the address has
-        // a pre-existing mapping (e.g. from UEFI identity mapping), it
-        // won't have the USER bit — we must replace it.
         uint64_t phys = PmmAllocPage(MemTag::User, proc->pid);
         if (!phys) return static_cast<int64_t>(proc->programBreak);
 
-        // Unmap any existing mapping first (UEFI identity-mapped pages)
-        VmmUnmapPage(addr);
-
-        if (!VmmMapPage(addr, phys, VMM_WRITABLE | VMM_USER, MemTag::User, proc->pid))
+        if (!VmmMapPage(proc->cr3Phys, addr, phys,
+                        VMM_WRITABLE | VMM_USER, MemTag::User, proc->pid))
             return static_cast<int64_t>(proc->programBreak);
 
+        // Zero via user address (process CR3 is active during syscall)
         auto* p = reinterpret_cast<uint8_t*>(addr);
         for (uint64_t b = 0; b < 4096; ++b) p[b] = 0;
     }
@@ -355,14 +351,32 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 
     uint64_t pages = (length + 4095) / 4096;
 
+    // Helper: allocate user-space virtual pages backed by physical memory.
+    auto allocUserPages = [&](MemTag tag) -> uint64_t {
+        uint64_t vaddr = proc->mmapNext;
+        if (vaddr + pages * 4096 > USER_MMAP_END) return 0;
+        proc->mmapNext = vaddr + pages * 4096;
+
+        for (uint64_t i = 0; i < pages; i++)
+        {
+            uint64_t phys = PmmAllocPage(tag, proc->pid);
+            if (!phys) return 0;
+            if (!VmmMapPage(proc->cr3Phys, vaddr + i * 4096, phys,
+                            VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
+                            tag, proc->pid))
+            {
+                PmmFreePage(phys);
+                return 0;
+            }
+        }
+        return vaddr;
+    };
+
     if (flags & MAP_ANONYMOUS)
     {
-        // Allocate anonymous memory
-        uint64_t vaddr = VmmAllocPages(pages, VMM_WRITABLE | VMM_USER,
-                                        MemTag::User, proc->pid);
+        uint64_t vaddr = allocUserPages(MemTag::User);
         if (!vaddr) return -ENOMEM;
 
-        // Zero it
         auto* p = reinterpret_cast<uint8_t*>(vaddr);
         for (uint64_t b = 0; b < pages * 4096; ++b) p[b] = 0;
 
@@ -385,20 +399,16 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         uint64_t fbPages = (fbSize + 4095) / 4096;
         if (pages > fbPages) pages = fbPages;
 
-        // Allocate virtual address range, then remap to physical framebuffer
-        uint64_t vaddr = VmmAllocPages(pages, VMM_WRITABLE | VMM_USER,
-                                        MemTag::Device, proc->pid);
-        if (!vaddr) return -ENOMEM;
+        // Reserve user virtual address range
+        uint64_t vaddr = proc->mmapNext;
+        if (vaddr + pages * 4096 > USER_MMAP_END) return -ENOMEM;
+        proc->mmapNext = vaddr + pages * 4096;
 
-        // Replace allocated pages with physical framebuffer pages
+        // Map directly to physical framebuffer pages
         for (uint64_t i = 0; i < pages; ++i)
         {
-            uint64_t v = vaddr + i * 4096;
-            uint64_t oldPhys = VmmVirtToPhys(v);
-            VmmUnmapPage(v);
-            if (oldPhys) PmmFreePage(oldPhys);
-
-            if (!VmmMapPage(v, physBase + i * 4096,
+            if (!VmmMapPage(proc->cr3Phys, vaddr + i * 4096,
+                            physBase + i * 4096,
                             VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
                             MemTag::Device, proc->pid))
             {
@@ -408,7 +418,6 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         }
 
         SerialPrintf("sys_mmap: fb mapped %lu pages at virt 0x%lx\n", pages, vaddr);
-
         return static_cast<int64_t>(vaddr);
     }
 
@@ -416,16 +425,13 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     if (fde->type != FdType::Vnode || !fde->handle)
         return -EBADF;
 
-    // Allocate pages and read file into them
-    uint64_t vaddr = VmmAllocPages(pages, VMM_WRITABLE | VMM_USER,
-                                    MemTag::User, proc->pid);
+    uint64_t vaddr = allocUserPages(MemTag::User);
     if (!vaddr) return -ENOMEM;
 
-    // Zero first
+    // Zero then read file data
     auto* p = reinterpret_cast<uint8_t*>(vaddr);
     for (uint64_t b = 0; b < pages * 4096; ++b) p[b] = 0;
 
-    // Read file data at the requested offset
     auto* vn = static_cast<Vnode*>(fde->handle);
     uint64_t readOff = offset;
     VfsRead(vn, reinterpret_cast<void*>(vaddr), static_cast<uint32_t>(length), &readOff);

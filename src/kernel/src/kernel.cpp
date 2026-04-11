@@ -93,7 +93,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         if (base)
         {
             // Unmap the first page to create the guard.
-            brook::VmmUnmapPage(base);
+            brook::VmmUnmapPage(0, base);
 
             // New stack top is end of allocation, 16-byte aligned.
             void* newTop = reinterpret_cast<void*>(base + TOTAL_PAGES * 0x1000 - 16);
@@ -118,7 +118,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
                 brook::VMM_WRITABLE, brook::MemTag::KernelData, brook::KernelPid);
             if (scBase)
             {
-                brook::VmmUnmapPage(scBase); // guard page
+                brook::VmmUnmapPage(0, scBase); // guard page
                 uint64_t scTop = scBase + (SYSCALL_STACK_PAGES + GUARD_PAGES) * 0x1000 - 16;
                 env->syscallStack = scTop;
             }
@@ -420,6 +420,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
                         __asm__ volatile("wrmsr" : : "a"(lo), "d"(hi),
                                          "c"(0xC0000100U));
                     }
+
+                    // Switch to process page table before entering user mode
+                    brook::VmmSwitchPageTable(proc->cr3Phys);
 
                     brook::SwitchToUserMode(proc->stackTop,
                                              proc->elf.entryPoint);

@@ -127,11 +127,11 @@ static bool MapLapic(uint64_t physBase)
     // Remap the allocated virtual page to the LAPIC physical page.
     // VmmAllocPages already mapped a physical page there — unmap it first,
     // free the backing page, then map LAPIC physical.
-    uint64_t oldPhys = VmmVirtToPhys(g_lapicVirt);
-    VmmUnmapPage(g_lapicVirt);
+    uint64_t oldPhys = VmmVirtToPhys(0, g_lapicVirt);
+    VmmUnmapPage(0, g_lapicVirt);
     if (oldPhys) PmmFreePage(oldPhys);
 
-    if (!VmmMapPage(g_lapicVirt, physBase,
+    if (!VmmMapPage(0, g_lapicVirt, physBase,
                     VMM_WRITABLE | VMM_NO_EXEC,
                     MemTag::Device, KernelPid))
     {
@@ -334,11 +334,11 @@ bool IoApicInit(uint64_t ioApicPhysical, uint32_t gsiBase)
         return false;
     }
 
-    uint64_t oldPhys = VmmVirtToPhys(g_ioApicVirt);
-    VmmUnmapPage(g_ioApicVirt);
+    uint64_t oldPhys = VmmVirtToPhys(0, g_ioApicVirt);
+    VmmUnmapPage(0, g_ioApicVirt);
     if (oldPhys) PmmFreePage(oldPhys);
 
-    if (!VmmMapPage(g_ioApicVirt, ioApicPhysical,
+    if (!VmmMapPage(0, g_ioApicVirt, ioApicPhysical,
                     VMM_WRITABLE | VMM_NO_EXEC,
                     MemTag::Device, KernelPid))
     {
