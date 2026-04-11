@@ -159,6 +159,7 @@ add_executable(kernel
     src/acpi.cpp
     src/apic.cpp
     src/tty.cpp
+    src/sync/kmutex.cpp
     # Memory subsystem
     src/memory/virtual_memory.cpp
     src/memory/physical_memory.cpp

@@ -326,6 +326,12 @@ uint32_t SchedulerReadyCount()
     return count;
 }
 
+Process* SchedulerCurrentProcess()
+{
+    uint32_t cpu = ThisCpu();
+    return g_perCpu[cpu].currentProcess;
+}
+
 // ---------------------------------------------------------------------------
 // Context switch logic
 // ---------------------------------------------------------------------------

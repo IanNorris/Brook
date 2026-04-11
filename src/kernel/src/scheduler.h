@@ -46,6 +46,9 @@ void SchedulerYield();
 // Terminate the current process and reschedule. Never returns.
 [[noreturn]] void SchedulerExitCurrentProcess(int status);
 
+// Get the current process running on this CPU (nullptr if none).
+Process* SchedulerCurrentProcess();
+
 // Get the number of processes in the run queue.
 uint32_t SchedulerReadyCount();
 

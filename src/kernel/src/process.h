@@ -146,6 +146,9 @@ struct Process
     // Blocking info (e.g. nanosleep wakeup tick)
     uint64_t wakeupTick;        // g_lapicTickCount value to unblock at (0 = N/A)
 
+    // Mutex wait-queue linkage (used by KMutex when process is blocked on a lock)
+    Process* mutexNext;         // Next process in the mutex wait queue (nullptr = tail)
+
     // Saved CPU context (written by context_switch asm)
     SavedContext savedCtx;
     FxsaveArea   fxsave;
