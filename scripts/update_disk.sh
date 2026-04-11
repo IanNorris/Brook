@@ -104,6 +104,13 @@ done
 # --- Static binaries from nix (busybox etc.) ---
 # These are added manually once; this section just reports what's present.
 
+# --- Boot script (INIT.RC) ---
+init_rc="${ROOT_DIR}/data/INIT.RC"
+if [ -f "$init_rc" ]; then
+    echo "Boot script:"
+    sync_file "$init_rc" "INIT.RC"
+fi
+
 echo ""
 echo "Current disk contents:"
 mdir -i "${DISK_IMG}" :: 2>&1 | grep -v "^$"

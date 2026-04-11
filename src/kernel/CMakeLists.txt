@@ -147,6 +147,7 @@ add_executable(kernel
     src/process.cpp
     src/scheduler.cpp
     src/compositor.cpp
+    src/shell.cpp
     src/smp.cpp
     src/ap_trampoline.S
     src/context_switch.S
