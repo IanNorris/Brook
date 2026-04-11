@@ -40,6 +40,11 @@ void TtySetColors(uint32_t fg, uint32_t bg);
 // Move cursor to the top-left and clear the screen.
 void TtyClear();
 
+// Constrain TTY output to a rectangular region of the framebuffer.
+// All rendering and scrolling is limited to this region.  Passing all-zero
+// resets to the full framebuffer.  The region is specified in pixels.
+void TtySetRegion(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+
 // Return true if TtyInit() has completed successfully.
 bool TtyReady();
 

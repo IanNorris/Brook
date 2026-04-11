@@ -14,6 +14,7 @@
 #include "ksymtab.h"
 #include "module.h"
 #include "tty.h"
+#include "font_atlas.h"
 #include "device.h"
 #include "pci.h"
 #include "ramdisk.h"
@@ -402,22 +403,24 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         // Clear the boot logo before starting the shell/processes.
         brook::BootLogoClear();
 
+        // Constrain TTY to a status bar at the bottom of the screen so boot
+        // script output doesn't overwrite the compositor area.
+        {
+            constexpr uint32_t STATUS_BAR_LINES = 6;
+            uint32_t barH = STATUS_BAR_LINES * static_cast<uint32_t>(brook::g_fontAtlas.lineHeight);
+            uint32_t fbW = 0, fbH = 0, fbStride = 0;
+            uint32_t* fbPtr = nullptr;
+            brook::TtyGetFramebuffer(&fbPtr, &fbW, &fbH, &fbStride);
+            if (fbH > barH)
+                brook::TtySetRegion(0, fbH - barH, fbW, barH);
+        }
+
         // Execute the boot script if present.
         brook::ShellExecScript("/boot/INIT.RC");
 
         // Start the scheduler on all queued processes.
-        // The BSP enters the shell's interactive loop after starting the scheduler,
-        // but only if we DON'T have processes to run yet.
-        // If processes were spawned by the script, start the scheduler.
         if (brook::SchedulerReadyCount() > 0)
         {
-            // We have processes — start scheduler.
-            // But we also want to enter the interactive shell eventually.
-            // For now, the BSP runs the scheduler; the shell would need
-            // to be a separate concept (e.g., a kernel thread).
-            //
-            // Compromise: start the scheduler which never returns.
-            // Interactive shell will come when we have kernel threads.
             brook::SerialPrintf("SHELL: %u processes queued, starting scheduler\n",
                                  brook::SchedulerReadyCount());
             brook::SchedulerStart();
@@ -425,7 +428,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         }
         else
         {
-            // No processes from script — go straight to interactive shell.
+            // No processes from script — full-screen TTY for interactive shell.
+            brook::TtySetRegion(0, 0, 0, 0);
             brook::ShellInteractive();
             // ShellInteractive never returns.
         }
