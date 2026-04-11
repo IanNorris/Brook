@@ -200,39 +200,51 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::VfsInit();
 
     // Mount the embedded FAT16 test image as a ramdisk.
-    // The image is read-only from the kernel's perspective (const data section).
-    // We cast away const for the ramdisk: writes go to a separate copy if needed;
-    // for now read-only access is sufficient.
-    brook::Device* rd = brook::RamdiskCreate(
-        const_cast<void*>(static_cast<const void*>(g_fatTestImage)),
-        g_fatTestImageSize, 512, "ramdisk0");
-    if (rd && brook::DeviceRegister(rd))
+    // The image lives in .rodata (read-only pages), so we must copy it to
+    // writable memory before mounting.  This lets FatFS writes (e.g. DOOM
+    // saving config) succeed without page faults.
+    uint64_t rdPages = (g_fatTestImageSize + 4095) / 4096;
+    brook::VirtualAddress rdBuf = brook::VmmAllocPages(rdPages,
+        brook::VMM_WRITABLE, brook::MemTag::KernelData, brook::KernelPid);
+    if (rdBuf)
     {
-        brook::FatFsBindDrive(0, rd);
-        if (brook::VfsMount("/", "fatfs", 0))
+        auto* dst = reinterpret_cast<uint8_t*>(rdBuf.raw());
+        for (uint32_t i = 0; i < g_fatTestImageSize; ++i)
+            dst[i] = g_fatTestImage[i];
+
+        brook::Device* rd = brook::RamdiskCreate(dst, g_fatTestImageSize, 512, "ramdisk0");
+        if (rd && brook::DeviceRegister(rd))
         {
-            // Smoke-test: open and read BROOK.CFG
-            brook::Vnode* cfg = brook::VfsOpen("/BROOK.CFG");
-            if (cfg)
+            brook::FatFsBindDrive(0, rd);
+            if (brook::VfsMount("/", "fatfs", 0))
             {
-                char buf[128] = {};
-                uint64_t off = 0;
-                int n = brook::VfsRead(cfg, buf, sizeof(buf) - 1, &off);
-                brook::VfsClose(cfg);
-                if (n > 0)
-                    brook::KPrintf("VFS: /BROOK.CFG (%d bytes): %s", n, buf);
+                // Smoke-test: open and read BROOK.CFG
+                brook::Vnode* cfg = brook::VfsOpen("/BROOK.CFG");
+                if (cfg)
+                {
+                    char buf[128] = {};
+                    uint64_t off = 0;
+                    int n = brook::VfsRead(cfg, buf, sizeof(buf) - 1, &off);
+                    brook::VfsClose(cfg);
+                    if (n > 0)
+                        brook::KPrintf("VFS: /BROOK.CFG (%d bytes): %s", n, buf);
+                    else
+                        brook::KPuts("VFS: /BROOK.CFG open OK but read returned 0\n");
+                }
                 else
-                    brook::KPuts("VFS: /BROOK.CFG open OK but read returned 0\n");
+                {
+                    brook::KPuts("VFS: could not open /BROOK.CFG\n");
+                }
             }
-            else
-            {
-                brook::KPuts("VFS: could not open /BROOK.CFG\n");
-            }
+        }
+        else
+        {
+            brook::KPuts("VFS: ramdisk init failed\n");
         }
     }
     else
     {
-        brook::KPuts("VFS: ramdisk init failed\n");
+        brook::KPuts("VFS: ramdisk buffer allocation failed\n");
     }
 
     // ---- virtio-blk: enumerate all PCI virtio drives ----
