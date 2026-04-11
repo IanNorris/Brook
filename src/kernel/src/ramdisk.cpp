@@ -1,5 +1,5 @@
 #include "ramdisk.h"
-#include "heap.h"
+#include "memory/heap.h"
 #include "serial.h"
 
 namespace brook {

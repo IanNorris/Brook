@@ -22,6 +22,14 @@ set(KERNEL_FLAGS
 set(CMAKE_C_FLAGS_INIT   "${KERNEL_FLAGS}")
 set(CMAKE_CXX_FLAGS_INIT "${KERNEL_FLAGS} -fno-exceptions -fno-rtti")
 
+# Build type flags (CMake defaults are suppressed by --no-default-config)
+set(CMAKE_C_FLAGS_DEBUG_INIT          "-O0 -g -DBROOK_DEBUG")
+set(CMAKE_CXX_FLAGS_DEBUG_INIT        "-O0 -g -DBROOK_DEBUG")
+set(CMAKE_C_FLAGS_RELEASE_INIT        "-O2 -DNDEBUG")
+set(CMAKE_CXX_FLAGS_RELEASE_INIT      "-O2 -DNDEBUG")
+set(CMAKE_C_FLAGS_RELWITHDEBINFO_INIT   "-O2 -g -DNDEBUG")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO_INIT "-O2 -g -DNDEBUG")
+
 # Use ld.lld directly for linking
 set(CMAKE_CXX_LINK_EXECUTABLE
     "<CMAKE_LINKER> <LINK_FLAGS> <OBJECTS> -o <TARGET> <LINK_LIBRARIES>")

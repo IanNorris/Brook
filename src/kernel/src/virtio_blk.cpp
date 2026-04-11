@@ -1,8 +1,8 @@
 #include "virtio_blk.h"
 #include "pci.h"
-#include "vmm.h"
-#include "pmm.h"
-#include "heap.h"
+#include "memory/virtual_memory.h"
+#include "memory/physical_memory.h"
+#include "memory/heap.h"
 #include "serial.h"
 #include "mem_tag.h"
 

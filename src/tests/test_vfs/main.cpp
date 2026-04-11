@@ -1,9 +1,9 @@
 #include "test_framework.h"
 #include "vfs.h"
 #include "device.h"
-#include "heap.h"
-#include "pmm.h"
-#include "vmm.h"
+#include "memory/heap.h"
+#include "memory/physical_memory.h"
+#include "memory/virtual_memory.h"
 
 TEST_MAIN("vfs", {
 

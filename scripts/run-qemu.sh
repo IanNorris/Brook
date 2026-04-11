@@ -3,13 +3,32 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-BUILD_DIR="${ROOT_DIR}/build"
+
+# Parse arguments
+BUILD_TYPE="debug"
+DEBUG_FLAGS=""
+EXTRA_ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --release)
+            BUILD_TYPE="release"
+            ;;
+        --debug)
+            DEBUG_FLAGS="-s"
+            ;;
+        *)
+            EXTRA_ARGS+=("$arg")
+            ;;
+    esac
+done
+
+BUILD_DIR="${ROOT_DIR}/build/${BUILD_TYPE}"
 ESP_DIR="${BUILD_DIR}/esp/EFI/BOOT"
 BOOTLOADER="${BUILD_DIR}/bootloader/BOOTX64.efi"
 
 if [ ! -f "${BOOTLOADER}" ]; then
     echo "Bootloader not found at ${BOOTLOADER}"
-    echo "Run scripts/build.sh first."
+    echo "Run: scripts/build.sh $(echo "${BUILD_TYPE}" | sed 's/./\U&/') first."
     exit 1
 fi
 
@@ -96,20 +115,13 @@ OVMF_VARS_COPY="$(mktemp /tmp/brook-OVMF_VARS-XXXXXX.fd)"
 cp "${OVMF_VARS}" "${OVMF_VARS_COPY}"
 trap 'rm -f "${OVMF_VARS_COPY}"' EXIT
 
-echo "Starting QEMU..."
+echo "Starting QEMU (${BUILD_TYPE})..."
 echo "  OVMF: ${OVMF_CODE}"
 echo "  ESP:  ${BUILD_DIR}/esp"
 
-# Check for --debug flag: adds QEMU GDB stub on port 1234.
-DEBUG_FLAGS=""
-for arg in "$@"; do
-    if [ "$arg" = "--debug" ]; then
-        DEBUG_FLAGS="-s"
-        echo "  GDB:  listening on localhost:1234 (run scripts/gdb-kernel.sh in another terminal)"
-        shift
-        break
-    fi
-done
+if [ -n "${DEBUG_FLAGS}" ]; then
+    echo "  GDB:  listening on localhost:1234 (run scripts/gdb-kernel.sh in another terminal)"
+fi
 
 # Create/update virtio-blk test disk image (includes .mod files from build/kernel/drivers/).
 DISK_IMG="${BUILD_DIR}/brook_disk.img"
@@ -127,4 +139,4 @@ qemu-system-x86_64 \
     -display gtk \
     -monitor none \
     ${DEBUG_FLAGS} \
-    "$@"
+    "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"

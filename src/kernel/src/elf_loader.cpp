@@ -6,8 +6,8 @@
 
 #include "elf.h"
 #include "process.h"
-#include "vmm.h"
-#include "pmm.h"
+#include "memory/virtual_memory.h"
+#include "memory/physical_memory.h"
 #include "serial.h"
 
 namespace brook {

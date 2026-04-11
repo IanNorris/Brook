@@ -1,8 +1,8 @@
 #include "vfs.h"
 #include "fatfs_glue.h"
-#include "heap.h"
+#include "memory/heap.h"
 #include "serial.h"
-#include "vmm.h"
+#include "memory/virtual_memory.h"
 
 extern "C" {
 #include "ff.h"

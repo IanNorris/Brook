@@ -22,6 +22,7 @@ function(add_brook_test TEST_NAME)
     target_include_directories(${TEST_NAME} PRIVATE
         ${SHARED_INCLUDE_DIRS}
         "${BROOK_ROOT}/src/kernel/src"
+        "${BROOK_ROOT}/src/kernel/src/memory"
     )
     target_compile_options(${TEST_NAME} PRIVATE
         -Wall -Wextra -Werror -Wshadow -Wno-unused-parameter
@@ -39,19 +40,19 @@ endfunction()
 
 add_brook_test(test_memory_map)
 add_brook_test(test_pmm
-    "${BROOK_ROOT}/src/kernel/src/pmm.cpp"
-    "${BROOK_ROOT}/src/kernel/src/vmm.cpp"
-    "${BROOK_ROOT}/src/kernel/src/heap.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/physical_memory.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/virtual_memory.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/heap.cpp"
 )
 add_brook_test(test_vmm
-    "${BROOK_ROOT}/src/kernel/src/pmm.cpp"
-    "${BROOK_ROOT}/src/kernel/src/vmm.cpp"
-    "${BROOK_ROOT}/src/kernel/src/heap.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/physical_memory.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/virtual_memory.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/heap.cpp"
 )
 add_brook_test(test_heap
-    "${BROOK_ROOT}/src/kernel/src/pmm.cpp"
-    "${BROOK_ROOT}/src/kernel/src/vmm.cpp"
-    "${BROOK_ROOT}/src/kernel/src/heap.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/physical_memory.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/virtual_memory.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/heap.cpp"
 )
 
 add_brook_test(test_string)
@@ -65,9 +66,9 @@ add_brook_test(test_vfs
     "${BROOK_ROOT}/src/kernel/src/fatfs_glue.cpp"
     "${BROOK_ROOT}/src/kernel/src/device.cpp"
     "${BROOK_ROOT}/src/kernel/src/ramdisk.cpp"
-    "${BROOK_ROOT}/src/kernel/src/heap.cpp"
-    "${BROOK_ROOT}/src/kernel/src/pmm.cpp"
-    "${BROOK_ROOT}/src/kernel/src/vmm.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/heap.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/physical_memory.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/virtual_memory.cpp"
 )
 target_include_directories(test_vfs PRIVATE
     "${BROOK_ROOT}/src/third_party/fatfs/source"

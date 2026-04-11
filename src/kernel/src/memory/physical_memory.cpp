@@ -1,4 +1,4 @@
-#include "pmm.h"
+#include "physical_memory.h"
 #include "serial.h"
 
 // Forward-declared to avoid circular headers.

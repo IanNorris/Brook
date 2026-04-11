@@ -12,7 +12,8 @@
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-ELF="${ROOT_DIR}/build/kernel/BROOK.elf"
+BUILD_TYPE="${1:-debug}"
+ELF="${ROOT_DIR}/build/${BUILD_TYPE}/kernel/BROOK.elf"
 
 if [ ! -f "$ELF" ]; then
     echo "ERROR: $ELF not found — run scripts/build.sh first"

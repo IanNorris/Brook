@@ -1,7 +1,7 @@
 #pragma once
 
 #include <stdint.h>
-#include "address.h"
+#include "memory/address.h"
 
 namespace brook {
 

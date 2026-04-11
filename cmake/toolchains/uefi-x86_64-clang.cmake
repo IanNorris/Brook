@@ -39,6 +39,12 @@ set(_UEFI_COMMON_FLAGS
 string(JOIN " " CMAKE_C_FLAGS_INIT   ${_UEFI_COMMON_FLAGS})
 string(JOIN " " CMAKE_CXX_FLAGS_INIT ${_UEFI_COMMON_FLAGS} "-fno-exceptions" "-fno-rtti")
 
+# Build type flags
+set(CMAKE_C_FLAGS_DEBUG_INIT          "-O0 -g")
+set(CMAKE_CXX_FLAGS_DEBUG_INIT        "-O0 -g")
+set(CMAKE_C_FLAGS_RELEASE_INIT        "-O2 -DNDEBUG")
+set(CMAKE_CXX_FLAGS_RELEASE_INIT      "-O2 -DNDEBUG")
+
 # lld-link flags: no default libs, EFI application subsystem
 # Note: entry point is set per-target in the bootloader CMakeLists
 set(CMAKE_EXE_LINKER_FLAGS_INIT "/nodefaultlib /subsystem:efi_application")

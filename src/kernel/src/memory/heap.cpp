@@ -1,6 +1,6 @@
 #include "heap.h"
-#include "vmm.h"
-#include "pmm.h"
+#include "virtual_memory.h"
+#include "physical_memory.h"
 #include "serial.h"
 #include "mem_tag.h"
 

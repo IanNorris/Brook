@@ -9,10 +9,10 @@ extern "C" brook::KernelSymbol __stop_ksymtab[];
 // ---- Exported kernel symbols ----
 // Include the headers that declare each symbol we want to export.
 
-#include "heap.h"
+#include "memory/heap.h"
 #include "kprintf.h"
-#include "vmm.h"
-#include "pmm.h"
+#include "memory/virtual_memory.h"
+#include "memory/physical_memory.h"
 #include "device.h"
 #include "vfs.h"
 #include "fatfs_glue.h"

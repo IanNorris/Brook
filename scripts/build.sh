@@ -4,10 +4,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 BUILD_TYPE="${1:-Debug}"
-BUILD_DIR="${ROOT_DIR}/build"
+BUILD_TYPE_LOWER="$(echo "${BUILD_TYPE}" | tr '[:upper:]' '[:lower:]')"
+BUILD_DIR="${ROOT_DIR}/build/${BUILD_TYPE_LOWER}"
 
 echo "Brook OS Build — ${BUILD_TYPE}"
 echo "Root: ${ROOT_DIR}"
+echo "Build dir: ${BUILD_DIR}"
 
 # Initialize submodules if needed
 if [ ! -f "${ROOT_DIR}/vendor/uefi-headers/Include/Uefi.h" ] || \

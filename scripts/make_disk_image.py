@@ -82,12 +82,21 @@ def main():
 
         # BIN/ — copy any user-mode test binaries
         bin_names = ["hello_test", "hello_musl", "hello", "cowsay", "busybox"]
-        has_bins = any(os.path.exists(os.path.join(build_dir, n)) for n in bin_names)
+        # Search both <build_dir>/ and <build_dir>/user/ for binaries.
+        bin_search_dirs = [build_dir, os.path.join(build_dir, "user")]
+        def find_bin(name):
+            for d in bin_search_dirs:
+                p = os.path.join(d, name)
+                if os.path.exists(p):
+                    return p
+            return None
+
+        has_bins = any(find_bin(n) for n in bin_names)
         if has_bins:
             run(["mmd", "-i", img_path, "::BIN"])
             for name in bin_names:
-                bin_path = os.path.join(build_dir, name)
-                if os.path.exists(bin_path):
+                bin_path = find_bin(name)
+                if bin_path:
                     dest_name = name.upper()
                     run(["mcopy", "-i", img_path, bin_path, f"::BIN/{dest_name}"])
                     print(f"  Added binary: BIN/{dest_name} ({os.path.getsize(bin_path)} bytes)")
@@ -95,6 +104,11 @@ def main():
         # DOOM — copy doom binary and WAD file
         doom_bin = os.path.join(build_dir, "doom", "doom")
         doom_wad = os.path.join(build_dir, "doom1.wad")
+        # Also check workspace root for the WAD (not committed to repo)
+        if not os.path.exists(doom_wad):
+            workspace_wad = os.path.join(os.path.dirname(os.path.dirname(build_dir)), "doom1.wad")
+            if os.path.exists(workspace_wad):
+                doom_wad = workspace_wad
         if os.path.exists(doom_bin):
             run(["mcopy", "-i", img_path, doom_bin, "::DOOM"])
             print(f"  Added: DOOM ({os.path.getsize(doom_bin)} bytes)")

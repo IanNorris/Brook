@@ -118,7 +118,6 @@ add_executable(kernel
     src/panic.cpp
     src/panic_qr.cpp
     src/base45.cpp
-    src/pmm.cpp
     src/pci.cpp
     src/ramdisk.cpp
     src/runtime.cpp
@@ -127,11 +126,13 @@ add_executable(kernel
     src/elf_loader.cpp
     src/vfs.cpp
     src/virtio_blk.cpp
-    src/vmm.cpp
-    src/heap.cpp
     src/acpi.cpp
     src/apic.cpp
     src/tty.cpp
+    # Memory subsystem
+    src/memory/virtual_memory.cpp
+    src/memory/physical_memory.cpp
+    src/memory/heap.cpp
     "${FONT_ATLAS_CPP}"
     "${FAT_IMAGE_CPP}"
     "${BROOK_ROOT}/src/shared/src_km/serial.cpp"
@@ -146,6 +147,7 @@ add_executable(kernel
 target_include_directories(kernel PRIVATE
     ${SHARED_INCLUDE_DIRS}
     "${CMAKE_CURRENT_SOURCE_DIR}/src"      # kernel src (ffconf.h here shadows submodule's)
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/memory" # memory subsystem headers
     "${CMAKE_CURRENT_BINARY_DIR}"          # for the generated font_atlas.cpp
     "${BROOK_ROOT}/src/third_party/fatfs/source"  # ff.h, diskio.h
     "${BROOK_ROOT}/src/third_party/qrcodegen"    # qrcodegen.h
@@ -235,6 +237,7 @@ set(DRIVER_MODULE_FLAGS
 set(DRIVER_MODULE_INCLUDE_DIRS
     ${SHARED_INCLUDE_DIRS}
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/memory"
     "${BROOK_ROOT}/src/third_party/fatfs/source"
 )
 

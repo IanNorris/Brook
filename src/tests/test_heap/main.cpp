@@ -1,7 +1,7 @@
 #include "test_framework.h"
-#include "pmm.h"
-#include "vmm.h"
-#include "heap.h"
+#include "memory/physical_memory.h"
+#include "memory/virtual_memory.h"
+#include "memory/heap.h"
 
 TEST_MAIN("heap", {
     brook::PmmInit(brook::test::g_protocol);
