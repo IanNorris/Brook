@@ -190,6 +190,9 @@ struct Process
 
     // Process name (for debug output)
     char name[32];
+
+    // Working directory (for relative path resolution)
+    char cwd[64];
 };
 
 // ---------------------------------------------------------------------------

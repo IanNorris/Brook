@@ -45,6 +45,9 @@ static uint32_t g_vfbHeight = 400;
 // Track spawned process count for auto-tiling placement
 static uint32_t g_spawnCount = 0;
 
+// True while executing a boot script (before scheduler starts)
+static bool g_scriptMode = false;
+
 // Default environment for spawned processes
 static const char* g_defaultEnvp[] = { "HOME=/", nullptr };
 
@@ -444,6 +447,15 @@ static int ExecCommand(int argc, const char* const* argv)
     // Built-in: wait — block until all user processes finish
     if (StrEq(cmd, "wait"))
     {
+        // In script mode, 'wait' is a no-op — the scheduler hasn't started yet.
+        // Processes will begin running after the script finishes and
+        // SchedulerStart() is called. In interactive mode (future), this could
+        // block until all child processes have exited.
+        if (g_scriptMode)
+        {
+            KPrintf("(wait deferred until scheduler starts)\n");
+            return 0;
+        }
         KPrintf("Waiting for processes...\n");
         while (SchedulerReadyCount() > 0)
         {
@@ -657,6 +669,7 @@ int ShellExecScript(const char* path)
 
     KPrintf("Executing %s\n", path);
     SerialPrintf("SHELL: executing script '%s'\n", path);
+    g_scriptMode = true;
 
     char line[MAX_LINE];
     uint64_t offset = 0;
@@ -682,6 +695,7 @@ int ShellExecScript(const char* path)
     }
 
     VfsClose(vn);
+    g_scriptMode = false;
 
     SerialPrintf("SHELL: script '%s' finished\n", path);
     return 0;
