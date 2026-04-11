@@ -81,4 +81,8 @@ void IoApicMaskIrq(uint8_t irq);
 // ticks-per-ms value. Must be called after the AP has enabled its LAPIC.
 void ApicInitTimerOnAp();
 
+// Return the global monotonic tick count (incremented once per LAPIC timer
+// interrupt on the BSP — approximately 1 ms resolution).
+uint64_t ApicTickCount();
+
 } // namespace brook

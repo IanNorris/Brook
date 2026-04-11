@@ -53,6 +53,13 @@ struct VnodeStat {
     bool     isDir;
 };
 
+// ---- VFS open flags ----
+static constexpr int VFS_O_READ   = 0x00;  // Open for reading (default)
+static constexpr int VFS_O_WRITE  = 0x01;  // Open for writing
+static constexpr int VFS_O_CREATE = 0x02;  // Create file if it doesn't exist
+static constexpr int VFS_O_TRUNC  = 0x04;  // Truncate existing file
+static constexpr int VFS_O_APPEND = 0x08;  // Seek to end after open
+
 // ---- VFS API ----
 
 // Initialise the VFS subsystem (call once at boot).
@@ -90,5 +97,8 @@ extern "C" int VfsStatPath(const char* path, VnodeStat* st);
 
 // Close and free a vnode.
 extern "C" void VfsClose(Vnode* vn);
+
+// Flush pending writes on a writable file vnode.
+int VfsSync(Vnode* vn);
 
 } // namespace brook

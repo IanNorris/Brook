@@ -425,7 +425,10 @@ Vnode* VfsOpen(const char* path, int flags)
     auto* fil = static_cast<FIL*>(kmalloc(sizeof(FIL)));
     if (!fil) return nullptr;
 
-    BYTE mode = (flags & 1) ? FA_READ | FA_WRITE : FA_READ;
+    BYTE mode = FA_READ;
+    if (flags & VFS_O_WRITE)  mode |= FA_WRITE;
+    if (flags & VFS_O_CREATE) mode |= (flags & VFS_O_TRUNC) ? FA_CREATE_ALWAYS : FA_OPEN_ALWAYS;
+    if (flags & VFS_O_TRUNC)  mode |= FA_CREATE_ALWAYS;
     SerialPrintf("VFS: f_open('%s', mode=0x%x)\n", fatPath, mode);
 
     uint64_t lockFlags = SpinLockAcquire(&g_vfsLock);
@@ -443,7 +446,7 @@ Vnode* VfsOpen(const char* path, int flags)
         // Cache large read-only files entirely in memory for fast random access.
         static constexpr uint64_t CACHE_THRESHOLD = 64 * 1024; // 64 KB
         uint64_t fileSize = f_size(fil);
-        if (!(flags & 1) && fileSize >= CACHE_THRESHOLD)
+        if (!(flags & VFS_O_WRITE) && fileSize >= CACHE_THRESHOLD)
         {
             CachedFile* cf = CacheFileLocked(fil);
             SpinLockRelease(&g_vfsLock, lockFlags);
@@ -463,6 +466,15 @@ Vnode* VfsOpen(const char* path, int flags)
         vn->ops  = &g_fatFileOps;
         vn->type = VnodeType::File;
         vn->priv = fil;
+
+        // Seek to end for append mode.
+        if (flags & VFS_O_APPEND)
+        {
+            uint64_t lockF2 = SpinLockAcquire(&g_vfsLock);
+            f_lseek(fil, f_size(fil));
+            SpinLockRelease(&g_vfsLock, lockF2);
+        }
+
         return vn;
     }
     if (res != FR_NO_FILE && res != FR_NO_PATH)
@@ -552,6 +564,18 @@ int VfsStatPath(const char* path, VnodeStat* st)
     st->isDir = (fno.fattrib & AM_DIR) != 0;
     st->size  = st->isDir ? 0 : fno.fsize;
     return 0;
+}
+
+int VfsSync(Vnode* vn)
+{
+    if (!vn || vn->type != VnodeType::File) return -1;
+    // Only works for direct FatFS files (not cached).
+    if (vn->ops != &g_fatFileOps) return 0;
+    FIL* fil = static_cast<FIL*>(vn->priv);
+    uint64_t flags = SpinLockAcquire(&g_vfsLock);
+    FRESULT res = f_sync(fil);
+    SpinLockRelease(&g_vfsLock, flags);
+    return (res == FR_OK) ? 0 : -1;
 }
 
 void VfsClose(Vnode* vn)
