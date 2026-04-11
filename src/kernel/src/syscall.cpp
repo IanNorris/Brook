@@ -452,10 +452,10 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             }
         }
 
-        SerialPrintf("sys_mmap: fb mapped %lu pages at virt 0x%lx (%s, scale=%u)\n",
+        SerialPrintf("sys_mmap: fb mapped %lu pages at virt 0x%lx (%s, vfb=%ux%u)\n",
                      pages, vaddr,
                      useVirtFb ? "virtual" : "physical",
-                     proc->fbScale);
+                     proc->fbVfbWidth, proc->fbVfbHeight);
         return static_cast<int64_t>(vaddr);
     }
 
@@ -818,17 +818,21 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
         if (!TtyGetFramebufferPhys(&physBase, &fbW, &fbH, &fbStride))
             return -ENODEV;
 
+        // If process has a virtual framebuffer, report its dimensions instead.
+        uint32_t repW = (proc->fbVfbWidth  > 0) ? proc->fbVfbWidth  : fbW;
+        uint32_t repH = (proc->fbVfbHeight > 0) ? proc->fbVfbHeight : fbH;
+        uint32_t repStride = repW * 4; // bytes per line
+
         if (cmd == FBIOGET_VSCREENINFO)
         {
             auto* info = reinterpret_cast<FbVarScreeninfo*>(arg);
-            // Zero the whole struct first
             auto* raw = reinterpret_cast<uint8_t*>(info);
             for (uint64_t i = 0; i < sizeof(FbVarScreeninfo); ++i) raw[i] = 0;
 
-            info->xres = fbW;
-            info->yres = fbH;
-            info->xres_virtual = fbW;
-            info->yres_virtual = fbH;
+            info->xres = repW;
+            info->yres = repH;
+            info->xres_virtual = repW;
+            info->yres_virtual = repH;
             info->bits_per_pixel = 32;
             // BGRA pixel format (common UEFI framebuffer)
             info->blue_offset  = 0;  info->blue_length  = 8;
@@ -844,17 +848,16 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
             auto* raw = reinterpret_cast<uint8_t*>(info);
             for (uint64_t i = 0; i < sizeof(FbFixScreeninfo); ++i) raw[i] = 0;
 
-            // Name
             const char* name = "brook_fb";
             for (int i = 0; name[i] && i < 15; ++i) info->id[i] = name[i];
 
             info->smem_start  = physBase;
-            info->smem_len    = fbStride * fbH;
+            info->smem_len    = repStride * repH;
             info->type        = 0; // FB_TYPE_PACKED_PIXELS
             info->visual      = 2; // FB_VISUAL_TRUECOLOR
-            info->line_length = fbStride;
+            info->line_length = repStride;
             info->mmio_start  = physBase;
-            info->mmio_len    = fbStride * fbH;
+            info->mmio_len    = repStride * repH;
             return 0;
         }
 

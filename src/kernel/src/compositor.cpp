@@ -14,13 +14,11 @@ static uint32_t           g_physFbHeight = 0;
 static uint32_t           g_physFbStride = 0; // in pixels
 
 // Registered process slots for compositing.
-static constexpr uint32_t MAX_COMPOSITED = 32;
+static constexpr uint32_t MAX_COMPOSITED = 64;
 static Process* g_compositedProcs[MAX_COMPOSITED] = {};
 static uint32_t g_compositedCount = 0;
 
-// Composite every N ticks (1ms each). 16 ≈ 60fps, 33 ≈ 30fps, 100 ≈ 10fps.
-// Under emulation, compositing 4× full-screen VFBs is very expensive;
-// use a higher interval to avoid starving CPU0 processes.
+// Composite every N ticks (1ms each). Higher = less CPU overhead.
 static constexpr uint32_t COMPOSITE_INTERVAL = 100;
 static uint32_t g_tickCounter = 0;
 
@@ -43,74 +41,82 @@ void CompositorInit()
                  g_physFbWidth, g_physFbHeight, g_physFbStride);
 }
 
-bool CompositorSetupProcess(Process* proc, int16_t destX, int16_t destY, uint8_t scale)
+void CompositorGetPhysDims(uint32_t* w, uint32_t* h)
+{
+    if (w) *w = g_physFbWidth;
+    if (h) *h = g_physFbHeight;
+}
+
+bool CompositorSetupProcess(Process* proc, int16_t destX, int16_t destY,
+                             uint32_t vfbWidth, uint32_t vfbHeight, uint8_t scale)
 {
     if (!g_physFb || !proc) return false;
-    if (scale == 0)
+
+    if (vfbWidth == 0 || vfbHeight == 0)
     {
-        // No compositing — process writes directly to physical FB.
-        proc->fbVirtual     = nullptr;
         proc->fbVirtual     = nullptr;
         proc->fbVirtualSize = 0;
+        proc->fbVfbWidth    = 0;
+        proc->fbVfbHeight   = 0;
+        proc->fbVfbStride   = 0;
         proc->fbDestX       = 0;
         proc->fbDestY       = 0;
         proc->fbScale       = 0;
         return true;
     }
 
-    // Allocate a virtual framebuffer the same size as the physical one.
-    // This way the process sees xres/yres matching the real screen and
-    // its internal scaling logic works unmodified.
-    uint64_t fbSizeBytes = static_cast<uint64_t>(g_physFbStride) * g_physFbHeight * 4;
+    uint32_t stride = vfbWidth;
+    uint64_t fbSizeBytes = static_cast<uint64_t>(stride) * vfbHeight * 4;
     uint64_t fbPages     = (fbSizeBytes + 4095) / 4096;
 
-    // Allocate physical pages for the virtual framebuffer.
     VirtualAddress vfbAddr = VmmAllocPages(fbPages, VMM_WRITABLE, MemTag::Device, proc->pid);
     if (!vfbAddr)
     {
-        SerialPrintf("COMPOSITOR: failed to alloc %lu pages for virtual fb\n", fbPages);
+        SerialPrintf("COMPOSITOR: failed to alloc %lu pages for vfb %ux%u\n",
+                     fbPages, vfbWidth, vfbHeight);
         return false;
     }
 
     auto* vfbPtr = reinterpret_cast<uint32_t*>(vfbAddr.raw());
 
-    // Clear the virtual framebuffer to black.
     for (uint64_t i = 0; i < (fbSizeBytes / 4); ++i)
         vfbPtr[i] = 0;
 
     proc->fbVirtual     = vfbPtr;
     proc->fbVirtualSize = static_cast<uint32_t>(fbSizeBytes);
+    proc->fbVfbWidth    = vfbWidth;
+    proc->fbVfbHeight   = vfbHeight;
+    proc->fbVfbStride   = stride;
     proc->fbDestX       = destX;
     proc->fbDestY       = destY;
-    proc->fbScale       = scale;
+    proc->fbScale       = (scale > 0) ? scale : 1;
 
-    // Register for compositing.
     if (g_compositedCount < MAX_COMPOSITED)
         g_compositedProcs[g_compositedCount++] = proc;
 
-    SerialPrintf("COMPOSITOR: proc '%s' pid %u → vfb at 0x%lx, dest=(%d,%d) scale=%u\n",
-                 proc->name, proc->pid, vfbAddr.raw(),
+    SerialPrintf("COMPOSITOR: proc '%s' pid %u → vfb %ux%u at 0x%lx, dest=(%d,%d) scale=%u\n",
+                 proc->name, proc->pid, vfbWidth, vfbHeight, vfbAddr.raw(),
                  destX, destY, scale);
     return true;
 }
 
-// Blit a single process's virtual FB onto the physical FB.
+// Blit a process's VFB onto the physical FB with optional downscaling.
 static void BlitProcess(Process* proc)
 {
-    if (!proc->fbVirtual || proc->fbScale == 0) return;
+    if (!proc->fbVirtual || proc->fbVfbWidth == 0) return;
 
     const uint32_t* src = proc->fbVirtual;
-    const uint32_t  srcW = g_physFbWidth;
-    const uint32_t  srcH = g_physFbHeight;
-    const uint32_t  srcStride = g_physFbStride;
+    const uint32_t  srcW = proc->fbVfbWidth;
+    const uint32_t  srcH = proc->fbVfbHeight;
+    const uint32_t  srcStride = proc->fbVfbStride;
+    const uint32_t  scale = proc->fbScale;
 
-    const int scale = proc->fbScale;
     const int dstX0 = proc->fbDestX;
     const int dstY0 = proc->fbDestY;
 
     // Destination dimensions after downscale.
-    const uint32_t dstW = srcW / static_cast<uint32_t>(scale);
-    const uint32_t dstH = srcH / static_cast<uint32_t>(scale);
+    const uint32_t dstW = srcW / scale;
+    const uint32_t dstH = srcH / scale;
 
     for (uint32_t dy = 0; dy < dstH; ++dy)
     {
@@ -118,8 +124,7 @@ static void BlitProcess(Process* proc)
         if (physY < 0) continue;
         if (static_cast<uint32_t>(physY) >= g_physFbHeight) break;
 
-        // Source row — nearest-neighbour sampling.
-        uint32_t srcY = dy * static_cast<uint32_t>(scale);
+        uint32_t srcY = dy * scale;
         if (srcY >= srcH) break;
         const uint32_t* srcRow = src + srcY * srcStride;
 
@@ -131,7 +136,7 @@ static void BlitProcess(Process* proc)
             if (physX < 0) continue;
             if (static_cast<uint32_t>(physX) >= g_physFbWidth) break;
 
-            uint32_t srcX = dx * static_cast<uint32_t>(scale);
+            uint32_t srcX = dx * scale;
             if (srcX >= srcW) break;
 
             dstRow[physX] = srcRow[srcX];
@@ -148,15 +153,12 @@ void CompositorTick()
         return;
     g_tickCounter = 0;
 
-    // Ensure we're using the kernel page table for reading virtual FBs.
-    // The timer may fire while a process CR3 is loaded, but kernel
-    // higher-half pages are shared so this should be safe.
     for (uint32_t i = 0; i < g_compositedCount; ++i)
     {
         Process* p = g_compositedProcs[i];
         if (!p || p->state == ProcessState::Terminated)
             continue;
-        if (!p->fbVirtual || p->fbScale == 0)
+        if (!p->fbVirtual || p->fbVfbWidth == 0)
             continue;
         BlitProcess(p);
     }

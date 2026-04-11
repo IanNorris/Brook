@@ -363,21 +363,28 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         brook::SchedulerInit();
         brook::CompositorInit();
 
-        // Get framebuffer dimensions for quadrant layout.
         uint64_t fbPhys;
         uint32_t fbW, fbH, fbStride;
         brook::TtyGetFramebufferPhys(&fbPhys, &fbW, &fbH, &fbStride);
-        int16_t halfW = static_cast<int16_t>(fbW / 2);
-        int16_t halfH = static_cast<int16_t>(fbH / 2);
 
-        // Quadrant positions: TL, TR, BL, BR — each scaled 2:1.
-        struct QuadrantDef { int16_t x; int16_t y; };
-        QuadrantDef quads[] = {
-            { 0,     0     },   // top-left
-            { halfW, 0     },   // top-right
-            { 0,     halfH },   // bottom-left
-            { halfW, halfH },   // bottom-right
-        };
+        // ---- Grid layout for 32 DOOM instances ----
+        // DOOM renders at 640×400 (DOOMGENERIC_RESX/Y). Each VFB is 640×400.
+        // Compositor downscales by scale factor when blitting to physical FB.
+        // With scale=3: each cell ≈ 213×133 pixels on screen.
+        // 8 columns × 4 rows = 32 instances.
+        constexpr uint32_t DOOM_VFB_W = 640;
+        constexpr uint32_t DOOM_VFB_H = 400;
+        constexpr uint8_t  DOOM_SCALE = 3;
+        constexpr int GRID_COLS = 8;
+        constexpr int GRID_ROWS = 4;
+        constexpr int NUM_DOOMS = GRID_COLS * GRID_ROWS;
+
+        uint32_t cellW = DOOM_VFB_W / DOOM_SCALE; // 213
+        uint32_t cellH = DOOM_VFB_H / DOOM_SCALE; // 133
+
+        // Center the grid on the physical framebuffer.
+        int16_t gridX0 = static_cast<int16_t>((fbW - cellW * GRID_COLS) / 2);
+        int16_t gridY0 = static_cast<int16_t>((fbH - cellH * GRID_ROWS) / 2);
 
         // Load DOOM ELF into memory once, create 4 processes from it.
         brook::Vnode* doomVn = brook::VfsOpen("/boot/DOOM", 0);
@@ -408,8 +415,11 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             brook::SerialPrintf("USER: loaded DOOM (%lu bytes)\n", elfSize);
         }
 
-        // Create 4 DOOM processes, each in a different quadrant.
-        constexpr int NUM_DOOMS = 4;
+        // Disable interrupts during bulk process creation to avoid timer ISR
+        // interference with page table/heap operations.
+        __asm__ volatile("cli");
+
+        // Create 32 DOOM processes in an 8×4 grid.
         for (int d = 0; d < NUM_DOOMS && elfBuf; ++d)
         {
             auto* proc = brook::ProcessCreate(elfBuf, elfSize,
@@ -421,19 +431,28 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
                 continue;
             }
 
-            // Set process name.
-            const char* base = "doom0";
-            for (int i = 0; base[i] && i < 31; ++i)
-                proc->name[i] = base[i];
-            proc->name[4] = static_cast<char>('0' + d);
+            // Set process name: doom00..doom31.
+            proc->name[0] = 'd'; proc->name[1] = 'o';
+            proc->name[2] = 'o'; proc->name[3] = 'm';
+            proc->name[4] = static_cast<char>('0' + (d / 10));
+            proc->name[5] = static_cast<char>('0' + (d % 10));
+            proc->name[6] = '\0';
 
-            // Assign compositor quadrant (scale 2:1).
-            brook::CompositorSetupProcess(proc, quads[d].x, quads[d].y, 2);
+            int col = d % GRID_COLS;
+            int row = d / GRID_COLS;
+            int16_t destX = gridX0 + static_cast<int16_t>(col * cellW);
+            int16_t destY = gridY0 + static_cast<int16_t>(row * cellH);
+
+            brook::CompositorSetupProcess(proc, destX, destY,
+                                           DOOM_VFB_W, DOOM_VFB_H, DOOM_SCALE);
 
             brook::SchedulerAddProcess(proc);
-            brook::SerialPrintf("USER: doom #%d → quadrant (%d, %d)\n",
-                                 d, quads[d].x, quads[d].y);
+            brook::SerialPrintf("USER: doom #%d → grid(%d,%d) dest=(%d,%d)\n",
+                                 d, col, row, destX, destY);
         }
+
+        // Re-enable interrupts.
+        __asm__ volatile("sti");
 
         if (elfBufAddr)
             brook::VmmFreePages(elfBufAddr, ELF_BUF_PAGES);

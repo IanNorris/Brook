@@ -10,12 +10,15 @@ struct Process;
 // Must be called after TtyInit().
 void CompositorInit();
 
-// Allocate a per-process virtual framebuffer that is the same size as
-// the physical FB. The process sees a full-resolution screen; the
-// compositor downscales it by `scale`:1 and places it at (destX, destY)
-// on the physical framebuffer.
-// scale=0 means no compositing (direct physical FB mapping, legacy mode).
-bool CompositorSetupProcess(Process* proc, int16_t destX, int16_t destY, uint8_t scale);
+// Get physical framebuffer dimensions.
+void CompositorGetPhysDims(uint32_t* w, uint32_t* h);
+
+// Allocate a per-process virtual framebuffer of size vfbWidth × vfbHeight.
+// The process sees this as its screen. The compositor blits it 1:1 at
+// (destX, destY) on the physical framebuffer, clipping to screen bounds.
+// vfbWidth=0 or vfbHeight=0 means no compositing.
+bool CompositorSetupProcess(Process* proc, int16_t destX, int16_t destY,
+                             uint32_t vfbWidth, uint32_t vfbHeight, uint8_t scale = 1);
 
 // Composite all active virtual framebuffers onto the physical framebuffer.
 // Called from the timer tick at a configurable interval.
