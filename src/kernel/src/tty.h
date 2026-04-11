@@ -43,6 +43,11 @@ void TtyClear();
 // Return true if TtyInit() has completed successfully.
 bool TtyReady();
 
+// Suppress framebuffer rendering.  While suppressed, TtyPutChar/TtyPuts/TtyPrintf
+// still output to the serial console but skip all framebuffer writes.
+// Used during boot-logo display to prevent TTY from overwriting the logo.
+void TtySuppressDisplay(bool suppress);
+
 // Retrieve framebuffer info for direct rendering (e.g. QR panic screen).
 // Returns false if TTY is not initialised.
 bool TtyGetFramebuffer(uint32_t** outPixels, uint32_t* outWidth,

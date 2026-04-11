@@ -22,6 +22,8 @@ static int        g_curY              = 0;        // current line top Y (pixels)
 static uint32_t   g_fgColor           = 0x00E0E0E0; // light grey
 static uint32_t   g_bgColor           = 0x00001A3A; // dark blue (matches kernel bg)
 
+static bool       g_displaySuppressed = false;      // when true, skip FB writes
+
 // ---------------------------------------------------------------------------
 // Pixel helpers — pure integer arithmetic, no FPU.
 // ---------------------------------------------------------------------------
@@ -215,6 +217,7 @@ static void AnsiApplySgr()
 void TtyPutChar(char c)
 {
     if (!g_fbPixels) return;
+    if (g_displaySuppressed) return;   // logo is showing — skip FB writes
 
     // ANSI escape sequence state machine
     if (g_ansiState == TTY_ESC) {
@@ -419,6 +422,11 @@ void TtyClear()
 bool TtyReady()
 {
     return g_fbPixels != nullptr;
+}
+
+void TtySuppressDisplay(bool suppress)
+{
+    g_displaySuppressed = suppress;
 }
 
 bool TtyGetFramebuffer(uint32_t** outPixels, uint32_t* outWidth,
