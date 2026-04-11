@@ -24,6 +24,30 @@ static uint32_t   g_bgColor           = 0x00001A3A; // dark blue (matches kernel
 
 static bool       g_displaySuppressed = false;      // when true, skip FB writes
 
+// Region — the sub-rectangle of the framebuffer the TTY renders into.
+// Defaults to the entire framebuffer after TtyInit().
+static uint32_t  g_regionX           = 0;
+static uint32_t  g_regionY           = 0;
+static uint32_t  g_regionW           = 0;        // 0 = full width
+static uint32_t  g_regionH           = 0;        // 0 = full height
+
+// Effective region bounds (computed from g_region* or full FB).
+static uint32_t  g_rx  = 0;  // left edge
+static uint32_t  g_ry  = 0;  // top edge
+static uint32_t  g_rw  = 0;  // width
+static uint32_t  g_rh  = 0;  // height
+
+static void RecalcRegion()
+{
+    g_rx = g_regionX;
+    g_ry = g_regionY;
+    g_rw = (g_regionW > 0) ? g_regionW : g_fbWidth;
+    g_rh = (g_regionH > 0) ? g_regionH : g_fbHeight;
+    // Clamp to framebuffer
+    if (g_rx + g_rw > g_fbWidth)  g_rw = g_fbWidth - g_rx;
+    if (g_ry + g_rh > g_fbHeight) g_rh = g_fbHeight - g_ry;
+}
+
 // ---------------------------------------------------------------------------
 // Pixel helpers — pure integer arithmetic, no FPU.
 // ---------------------------------------------------------------------------
@@ -38,7 +62,11 @@ static inline uint32_t BlendChannel(uint32_t fg, uint32_t bg, uint32_t cov)
 
 static inline void WritePixel(int x, int y, uint8_t coverage)
 {
-    if ((uint32_t)x >= g_fbWidth || (uint32_t)y >= g_fbHeight) return;
+    // x,y are relative to the region
+    int absX = static_cast<int>(g_rx) + x;
+    int absY = static_cast<int>(g_ry) + y;
+    if (absX < 0 || absY < 0) return;
+    if ((uint32_t)absX >= g_rx + g_rw || (uint32_t)absY >= g_ry + g_rh) return;
 
     uint32_t fg = g_fgColor;
     uint32_t bg = g_bgColor;
@@ -48,7 +76,7 @@ static inline void WritePixel(int x, int y, uint8_t coverage)
     uint32_t g = BlendChannel((fg >>  8) & 0xFF, (bg >>  8) & 0xFF, cov);
     uint32_t b = BlendChannel( fg        & 0xFF,  bg        & 0xFF, cov);
 
-    g_fbPixels[y * g_fbStride + x] = (r << 16) | (g << 8) | b;
+    g_fbPixels[absY * g_fbStride + absX] = (r << 16) | (g << 8) | b;
 }
 
 // ---------------------------------------------------------------------------
@@ -58,18 +86,20 @@ static inline void WritePixel(int x, int y, uint8_t coverage)
 static void ScrollUp()
 {
     int lh = g_fontAtlas.lineHeight;
-    // Move rows [lh .. height-1] up to [0 .. height-1-lh].
-    for (uint32_t row = 0; (int)row + lh < (int)g_fbHeight; row++)
+    // Move rows within the region up by one line height.
+    for (uint32_t row = 0; (int)row + lh < (int)g_rh; row++)
     {
-        const volatile uint32_t* src = g_fbPixels + (row + (uint32_t)lh) * g_fbStride;
-        volatile uint32_t*       dst = g_fbPixels + row * g_fbStride;
-        for (uint32_t col = 0; col < g_fbWidth; col++)
+        uint32_t srcRow = g_ry + row + (uint32_t)lh;
+        uint32_t dstRow = g_ry + row;
+        const volatile uint32_t* src = g_fbPixels + srcRow * g_fbStride + g_rx;
+        volatile uint32_t*       dst = g_fbPixels + dstRow * g_fbStride + g_rx;
+        for (uint32_t col = 0; col < g_rw; col++)
             dst[col] = src[col];
     }
-    // Clear the bottom lh rows.
-    for (uint32_t row = g_fbHeight - (uint32_t)lh; row < g_fbHeight; row++)
-        for (uint32_t col = 0; col < g_fbWidth; col++)
-            g_fbPixels[row * g_fbStride + col] = g_bgColor;
+    // Clear the bottom lh rows within the region.
+    for (uint32_t row = g_rh - (uint32_t)lh; row < g_rh; row++)
+        for (uint32_t col = 0; col < g_rw; col++)
+            g_fbPixels[(g_ry + row) * g_fbStride + (g_rx + col)] = g_bgColor;
 }
 
 // Advance cursor to the next line, scrolling if needed.
@@ -77,10 +107,10 @@ static void Newline()
 {
     g_curX  = 0;
     g_curY += g_fontAtlas.lineHeight;
-    if ((uint32_t)(g_curY + g_fontAtlas.lineHeight) > g_fbHeight)
+    if ((uint32_t)(g_curY + g_fontAtlas.lineHeight) > g_rh)
     {
         ScrollUp();
-        g_curY = (int)g_fbHeight - g_fontAtlas.lineHeight;
+        g_curY = (int)g_rh - g_fontAtlas.lineHeight;
     }
 }
 
@@ -157,6 +187,10 @@ bool TtyInit(const Framebuffer& fb)
     g_fbStride = fb.stride / 4u;
     g_curX     = 0;
     g_curY     = 0;
+
+    // Default region = full framebuffer.
+    g_regionX = g_regionY = g_regionW = g_regionH = 0;
+    RecalcRegion();
 
     // Clear framebuffer to background colour.
     for (uint32_t y = 0; y < g_fbHeight; y++)
@@ -259,7 +293,7 @@ void TtyPutChar(char c)
         int spAdv = fa.glyphCount > 0 ? fa.glyphs[0].advance : 8;
         int tabStop = spAdv * 8;
         g_curX = ((g_curX / tabStop) + 1) * tabStop;
-        if ((uint32_t)g_curX >= g_fbWidth) Newline();
+        if ((uint32_t)g_curX >= g_rw) Newline();
         return;
     }
     default:
@@ -270,7 +304,7 @@ void TtyPutChar(char c)
     if (code >= (int)fa.firstChar && code < (int)(fa.firstChar + fa.glyphCount))
     {
         int adv = fa.glyphs[code - (int)fa.firstChar].advance;
-        if ((uint32_t)(g_curX + adv) > g_fbWidth)
+        if ((uint32_t)(g_curX + adv) > g_rw)
             Newline();
     }
 
@@ -412,9 +446,9 @@ void TtySetColors(uint32_t fg, uint32_t bg)
 void TtyClear()
 {
     if (!g_fbPixels) return;
-    for (uint32_t y = 0; y < g_fbHeight; y++)
-        for (uint32_t x = 0; x < g_fbWidth; x++)
-            g_fbPixels[y * g_fbStride + x] = g_bgColor;
+    for (uint32_t y = 0; y < g_rh; y++)
+        for (uint32_t x = 0; x < g_rw; x++)
+            g_fbPixels[(g_ry + y) * g_fbStride + (g_rx + x)] = g_bgColor;
     g_curX = 0;
     g_curY = 0;
 }
@@ -422,6 +456,20 @@ void TtyClear()
 bool TtyReady()
 {
     return g_fbPixels != nullptr;
+}
+
+void TtySetRegion(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    g_regionX = x;
+    g_regionY = y;
+    g_regionW = w;
+    g_regionH = h;
+    RecalcRegion();
+    // Reset cursor to top-left of the new region.
+    g_curX = 0;
+    g_curY = 0;
+    // Clear the region.
+    TtyClear();
 }
 
 void TtySuppressDisplay(bool suppress)
