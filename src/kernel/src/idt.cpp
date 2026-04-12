@@ -2,6 +2,7 @@
 #include "gdt.h"
 #include "serial.h"
 #include "panic.h"
+#include "process.h"
 
 // ---- IDT storage ----
 static IdtEntry      g_idt[256];
@@ -139,6 +140,28 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
         brook::SerialPuts(vbuf);
     }
     brook::SerialPuts(" ("); brook::SerialPuts(name); brook::SerialPuts(")\n");
+
+    // Print current process info if available.
+    brook::Process* cur = brook::ProcessCurrent();
+    if (cur) {
+        brook::SerialPuts("  PID   ");
+        {
+            char pbuf[6];
+            uint16_t pid = cur->pid;
+            pbuf[0] = static_cast<char>('0' + (pid / 10000) % 10);
+            pbuf[1] = static_cast<char>('0' + (pid / 1000) % 10);
+            pbuf[2] = static_cast<char>('0' + (pid / 100) % 10);
+            pbuf[3] = static_cast<char>('0' + (pid / 10) % 10);
+            pbuf[4] = static_cast<char>('0' + pid % 10);
+            pbuf[5] = '\0';
+            // Skip leading zeros.
+            const char* p = pbuf;
+            while (*p == '0' && p[1] != '\0') ++p;
+            brook::SerialPuts(p);
+        }
+        brook::SerialPuts(" ("); brook::SerialPuts(cur->name); brook::SerialPuts(")\n");
+    }
+
     brook::SerialPuts("  RIP   "); ExcPutHex(frame->ip);    brook::SerialPuts("\n");
     brook::SerialPuts("  RSP   "); ExcPutHex(frame->sp);    brook::SerialPuts("\n");
     brook::SerialPuts("  CS    "); ExcPutHex(frame->cs);    brook::SerialPuts("\n");

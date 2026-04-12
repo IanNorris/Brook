@@ -24,9 +24,9 @@ volatile uint32_t* CompositorGetPhysFb(uint32_t* stride);
 bool CompositorSetupProcess(Process* proc, int16_t destX, int16_t destY,
                              uint32_t vfbWidth, uint32_t vfbHeight, uint8_t scale = 1);
 
-// Composite all active virtual framebuffers onto the physical framebuffer.
-// Called from the timer tick at a configurable interval.
-void CompositorTick();
+// Start the compositor kernel thread. Must be called after CompositorInit()
+// and after all processes have been spawned (or at least after SchedulerInit).
+void CompositorStartThread();
 
 // Halt the compositor — called during panic to prevent overwriting the QR code.
 void CompositorHalt();

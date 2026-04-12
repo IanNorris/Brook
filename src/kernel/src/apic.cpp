@@ -170,9 +170,6 @@ volatile uint64_t g_lapicTickCount = 0;
 // Forward-declare scheduler tick (defined in scheduler.cpp).
 void SchedulerTimerTick();
 
-// Forward-declare compositor tick (defined in compositor.cpp).
-void CompositorTick();
-
 // C handler called from the naked ISR wrapper below.
 // This is a regular function — NOT __attribute__((interrupt)).
 static void LapicTimerHandlerInner()
@@ -185,7 +182,6 @@ static void LapicTimerHandlerInner()
     if (cpuId == 0)
     {
         g_lapicTickCount++;
-        CompositorTick();
     }
 
     // Drive the scheduler on every CPU.

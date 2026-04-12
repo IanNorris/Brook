@@ -263,7 +263,11 @@ void SchedulerAddProcess(Process* proc)
 {
     proc->state = ProcessState::Ready;
 
-    proc->savedCtx.rsp = proc->kernelStackTop - 8;
+    // Kernel threads store fn/arg at kernelStackTop[-16] and [-8], so RSP
+    // must start below those slots to avoid the function prologue overwriting them.
+    proc->savedCtx.rsp = proc->isKernelThread
+        ? proc->kernelStackTop - 24   // below fn/arg slots (16 bytes) + alignment
+        : proc->kernelStackTop - 8;
     proc->savedCtx.rip = proc->isKernelThread
         ? reinterpret_cast<uint64_t>(&KernelThreadTrampoline)
         : reinterpret_cast<uint64_t>(&ProcessTrampoline);

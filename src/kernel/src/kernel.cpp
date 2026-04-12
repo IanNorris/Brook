@@ -439,6 +439,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         // Execute the boot script if present.
         brook::ShellExecScript("/boot/INIT.RC");
 
+        // Start the compositor kernel thread (blits VFBs to physical FB).
+        brook::CompositorStartThread();
+
         // Start the scheduler on all queued processes.
         if (brook::SchedulerReadyCount() > 0)
         {

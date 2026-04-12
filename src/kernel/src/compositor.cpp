@@ -1,11 +1,14 @@
 #include "compositor.h"
 #include "process.h"
+#include "scheduler.h"
 #include "tty.h"
 #include "serial.h"
 #include "memory/virtual_memory.h"
 #include "memory/address.h"
 
 namespace brook {
+
+extern volatile uint64_t g_lapicTickCount;
 
 // Cached physical framebuffer info.
 static volatile uint32_t* g_physFb       = nullptr;
@@ -18,9 +21,8 @@ static constexpr uint32_t MAX_COMPOSITED = 64;
 static Process* g_compositedProcs[MAX_COMPOSITED] = {};
 static uint32_t g_compositedCount = 0;
 
-// Composite every N ticks (1ms each). ~33ms ≈ 30 Hz display refresh.
+// Compositor thread wakes every COMPOSITE_INTERVAL ms (~30 Hz).
 static constexpr uint32_t COMPOSITE_INTERVAL = 33;
-static uint32_t g_tickCounter = 0;
 
 // Force-blit all processes every N ms regardless of dirty flag,
 // so we see output even during init before DOOM signals dirty.
@@ -183,17 +185,10 @@ static void BlitProcess(Process* proc, bool forceAll)
 // Global halt flag — set by panic to stop compositing.
 static volatile bool g_compositorHalted = false;
 
-void CompositorTick()
+static void CompositorLoop()
 {
-    if (g_compositorHalted)
-        return;
-
     if (!g_physFb || g_compositedCount == 0)
         return;
-
-    if (++g_tickCounter < COMPOSITE_INTERVAL)
-        return;
-    g_tickCounter = 0;
 
     // Every FORCE_BLIT_INTERVAL_MS, blit all processes regardless of dirty
     // flag. This ensures we see output during init (before DOOM signals dirty).
@@ -210,6 +205,34 @@ void CompositorTick()
             continue;
         BlitProcess(p, forceAll);
     }
+}
+
+static void CompositorThreadFn(void* /*arg*/)
+{
+    SerialPrintf("COMPOSITOR: thread started (%ux%u, %u processes)\n",
+                 g_physFbWidth, g_physFbHeight, g_compositedCount);
+
+    for (;;)
+    {
+        if (!g_compositorHalted)
+            CompositorLoop();
+
+        Process* self = ProcessCurrent();
+        self->wakeupTick = g_lapicTickCount + COMPOSITE_INTERVAL;
+        SchedulerBlock(self);
+    }
+}
+
+void CompositorStartThread()
+{
+    Process* thread = KernelThreadCreate("compositor", CompositorThreadFn, nullptr);
+    if (!thread)
+    {
+        SerialPuts("COMPOSITOR: failed to create thread\n");
+        return;
+    }
+    SchedulerAddProcess(thread);
+    SerialPrintf("COMPOSITOR: thread created pid=%u\n", thread->pid);
 }
 
 void CompositorHalt()
