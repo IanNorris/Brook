@@ -1,0 +1,2 @@
+# Brook OS boot script — Lua interpreter test
+run /boot/BIN/LUA /boot/TEST.LUA

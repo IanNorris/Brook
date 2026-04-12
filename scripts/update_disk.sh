@@ -119,6 +119,17 @@ if [ -f "$init_rc" ]; then
     sync_file "$init_rc" "INIT.RC"
 fi
 
+# --- Data files (Lua scripts, etc.) ---
+data_scripts="${ROOT_DIR}/data/scripts"
+if [ -d "$data_scripts" ]; then
+    for f in "$data_scripts"/*.lua; do
+        [ -f "$f" ] || continue
+        dname="$(basename "$f" | tr '[:lower:]' '[:upper:]')"
+        mcopy -o -i "${DISK_IMG}" "$f" "::${dname}"
+        echo "  synced data: ${dname}"
+    done
+fi
+
 echo ""
 echo "Current disk contents:"
 mdir -i "${DISK_IMG}" :: 2>&1 | grep -v "^$"
