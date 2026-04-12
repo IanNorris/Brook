@@ -503,4 +503,210 @@ void ProcessDestroy(Process* proc)
     kfree(proc);
 }
 
+// ---------------------------------------------------------------------------
+// ProcessFork -- create a child process that is a copy of the parent.
+// ---------------------------------------------------------------------------
+// Copies the entire user-space address space (full copy, no CoW).
+// The child inherits open file descriptors (shallow copy).
+// The child's trampoline returns to user mode with RAX=0 (fork return value).
+
+// Helper: walk a 4-level page table and copy all leaf pages.
+static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt, uint16_t dstPid)
+{
+    static constexpr uint64_t PTE_PHYS_MASK = 0x000FFFFFFFFFF000ULL;
+
+    auto* srcPml4 = reinterpret_cast<uint64_t*>(
+        PhysToVirt(srcPt.pml4).raw());
+
+    // Only copy user-half (PML4 entries 0..255)
+    for (uint64_t i4 = 0; i4 < 256; i4++)
+    {
+        if (!(srcPml4[i4] & VMM_PRESENT)) continue;
+
+        auto* srcPdpt = reinterpret_cast<uint64_t*>(
+            PhysToVirt(PhysicalAddress(srcPml4[i4] & PTE_PHYS_MASK)).raw());
+
+        for (uint64_t i3 = 0; i3 < 512; i3++)
+        {
+            if (!(srcPdpt[i3] & VMM_PRESENT)) continue;
+            if (srcPdpt[i3] & (1ULL << 7)) continue; // 1GB huge page, skip
+
+            auto* srcPd = reinterpret_cast<uint64_t*>(
+                PhysToVirt(PhysicalAddress(srcPdpt[i3] & PTE_PHYS_MASK)).raw());
+
+            for (uint64_t i2 = 0; i2 < 512; i2++)
+            {
+                if (!(srcPd[i2] & VMM_PRESENT)) continue;
+                if (srcPd[i2] & (1ULL << 7)) continue; // 2MB huge page, skip
+
+                auto* srcPt4 = reinterpret_cast<uint64_t*>(
+                    PhysToVirt(PhysicalAddress(srcPd[i2] & PTE_PHYS_MASK)).raw());
+
+                for (uint64_t i1 = 0; i1 < 512; i1++)
+                {
+                    if (!(srcPt4[i1] & VMM_PRESENT)) continue;
+
+                    // Reconstruct the virtual address
+                    uint64_t vaddr = (i4 << 39) | (i3 << 30) | (i2 << 21) | (i1 << 12);
+                    // Sign-extend if needed (not needed for user half, bits 47:0)
+
+                    PhysicalAddress srcPhys(srcPt4[i1] & PTE_PHYS_MASK);
+                    uint64_t flags = srcPt4[i1] & 0xFFF; // low 12 bits = flags
+
+                    // Determine page flags for the child mapping
+                    uint64_t mapFlags = 0;
+                    if (flags & (1ULL << 1)) mapFlags |= VMM_WRITABLE;
+                    if (flags & (1ULL << 2)) mapFlags |= VMM_USER;
+
+                    // Allocate a new physical page for the child
+                    PhysicalAddress dstPhys = PmmAllocPage(MemTag::User, dstPid);
+                    if (!dstPhys)
+                    {
+                        SerialPrintf("FORK: OOM copying page at vaddr 0x%lx\n", vaddr);
+                        return false;
+                    }
+
+                    // Copy page contents via direct map
+                    auto* src = reinterpret_cast<uint8_t*>(PhysToVirt(srcPhys).raw());
+                    auto* dst = reinterpret_cast<uint8_t*>(PhysToVirt(dstPhys).raw());
+                    for (uint64_t b = 0; b < 4096; b += 8)
+                        *reinterpret_cast<uint64_t*>(dst + b) =
+                            *reinterpret_cast<uint64_t*>(src + b);
+
+                    // Map into child's page table
+                    if (!VmmMapPage(dstPt, VirtualAddress(vaddr), dstPhys,
+                                    mapFlags, MemTag::User, dstPid))
+                    {
+                        SerialPrintf("FORK: failed to map page at vaddr 0x%lx\n", vaddr);
+                        PmmFreePage(dstPhys);
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+Process* ProcessFork(Process* parent, uint64_t userRip,
+                     uint64_t userRsp, uint64_t userRflags)
+{
+    if (!parent || parent->isKernelThread) return nullptr;
+
+    auto* child = static_cast<Process*>(kmalloc(sizeof(Process)));
+    if (!child) return nullptr;
+
+    // Copy entire parent process struct as a starting point
+    auto* rawDst = reinterpret_cast<uint8_t*>(child);
+    auto* rawSrc = reinterpret_cast<const uint8_t*>(parent);
+    for (uint64_t i = 0; i < sizeof(Process); i++) rawDst[i] = rawSrc[i];
+
+    // Allocate new PID
+    child->pid = SchedulerAllocPid();
+    child->parentPid = parent->pid;
+    if (child->pid == 0)
+    {
+        SerialPuts("FORK: PID allocation failed\n");
+        kfree(child);
+        return nullptr;
+    }
+
+    // Reset scheduler state
+    child->state = ProcessState::Ready;
+    child->runningOnCpu = -1;
+    child->reapable = false;
+    child->schedNext = nullptr;
+    child->schedPrev = nullptr;
+    child->inReadyQueue = 0;
+    child->wakeupTick = 0;
+    child->syncNext = nullptr;
+    child->pendingWakeup = 0;
+
+    // Set fork-child trampoline state
+    child->isForkChild = true;
+    child->forkReturnRip = userRip;
+    child->forkReturnRsp = userRsp;
+    child->forkReturnRflags = userRflags;
+
+    // Clear framebuffer state (child starts without a VFB)
+    child->fbVirtual = nullptr;
+    child->fbVirtualSize = 0;
+    child->fbVfbWidth = 0;
+    child->fbVfbHeight = 0;
+    child->fbVfbStride = 0;
+    child->fbDestX = 0;
+    child->fbDestY = 0;
+    child->fbScale = 0;
+    child->fbDirty = 0;
+    child->fbExitColor = 0;
+
+    // Allocate per-process kernel stack
+    VirtualAddress kstackAddr = VmmAllocKernelStack(KERNEL_STACK_PAGES,
+        MemTag::KernelData, child->pid);
+    if (!kstackAddr)
+    {
+        SerialPuts("FORK: kernel stack allocation failed\n");
+        kfree(child);
+        return nullptr;
+    }
+    child->kernelStackBase = kstackAddr.raw();
+    child->kernelStackTop  = kstackAddr.raw() + KERNEL_STACK_SIZE;
+
+    // Create new page table (shares kernel upper half)
+    child->pageTable = VmmCreateUserPageTable();
+    if (!child->pageTable)
+    {
+        SerialPuts("FORK: page table allocation failed\n");
+        VmmFreeKernelStack(kstackAddr, KERNEL_STACK_PAGES);
+        kfree(child);
+        return nullptr;
+    }
+
+    // Copy all user-space pages from parent to child (full copy)
+    if (!ForkCopyUserPages(parent->pageTable, child->pageTable, child->pid))
+    {
+        SerialPuts("FORK: address space copy failed\n");
+        VmmDestroyUserPageTable(child->pageTable);
+        VmmFreeKernelStack(kstackAddr, KERNEL_STACK_PAGES);
+        kfree(child);
+        return nullptr;
+    }
+
+    // Duplicate file descriptors (shallow copy — share VFS handles)
+    // fd 0/1/2 (keyboard/serial) don't need refcounting.
+    // VFS Vnodes: we don't increment refcount currently (single-owner model).
+    // This is acceptable for now — child gets independent seek positions.
+    for (uint32_t i = 0; i < MAX_FDS; i++)
+    {
+        if (parent->fds[i].type == FdType::Vnode && parent->fds[i].handle)
+        {
+            // Re-open the same file for the child to get independent state
+            // For now, just copy the fd entry (shares the Vnode pointer)
+            child->fds[i] = parent->fds[i];
+        }
+    }
+
+    // Update child's TLS fsBase to point to the new address space's TLS
+    // (same virtual address, but backed by the child's physical pages)
+    // No change needed — the virtual address is the same and the page table
+    // now maps it to the child's copy.
+
+    // Set child's name
+    {
+        const char* suffix = "_child";
+        uint32_t nameLen = 0;
+        while (nameLen < 24 && parent->name[nameLen]) nameLen++;
+        for (uint32_t i = 0; i < nameLen; i++) child->name[i] = parent->name[i];
+        for (uint32_t i = 0; suffix[i] && nameLen + i < 31; i++)
+            child->name[nameLen + i] = suffix[i];
+        child->name[31] = '\0';
+    }
+
+    SerialPrintf("FORK: parent pid=%u -> child pid=%u '%s', rip=0x%lx rsp=0x%lx\n",
+                 parent->pid, child->pid, child->name, userRip, userRsp);
+
+    return child;
+}
+
 } // namespace brook

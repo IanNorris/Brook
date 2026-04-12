@@ -59,4 +59,11 @@ uint32_t SchedulerReadyCount();
 // Allocate a unique PID.
 uint16_t SchedulerAllocPid();
 
+// Find a terminated child of parentPid. If pid == -1, any child; otherwise
+// matches a specific child PID. Returns the child Process* or nullptr.
+Process* SchedulerFindTerminatedChild(uint16_t parentPid, int64_t pid);
+
+// Reap (destroy) a terminated child process after wait4 collects its status.
+void SchedulerReapChild(Process* child);
+
 } // namespace brook

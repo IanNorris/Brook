@@ -59,6 +59,16 @@ struct KernelCpuEnv {
     uint64_t kernelRbp;     // [gs:24] — kernel RBP saved by SwitchToUserMode
     uint64_t kernelRsp;     // [gs:32] — kernel RSP saved by SwitchToUserMode
     uint64_t currentPid;    // [gs:40] — PID of the currently running process
+    uint64_t syscallUserRip;   // [gs:48] — user RCX (return address) saved by dispatcher
+    uint64_t syscallUserRsp;   // [gs:56] — user RSP saved by dispatcher
+    uint64_t syscallUserRflags;// [gs:64] — user R11 (RFLAGS) saved by dispatcher
+    // Callee-saved user registers, saved by dispatcher for fork()
+    uint64_t syscallUserRbx;   // [gs:72]
+    uint64_t syscallUserRbp;   // [gs:80]
+    uint64_t syscallUserR12;   // [gs:88]
+    uint64_t syscallUserR13;   // [gs:96]
+    uint64_t syscallUserR14;   // [gs:104]
+    uint64_t syscallUserR15;   // [gs:112]
 };
 
 // Initialise SYSCALL/SYSRET MSRs.  Call after GdtInit().

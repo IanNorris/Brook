@@ -8,6 +8,7 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 BUILD_TYPE="debug"
 DEBUG_FLAGS=""
 SCRIPT_NAME=""
+HEADLESS=0
 EXTRA_ARGS=()
 for arg in "$@"; do
     case "$arg" in
@@ -16,6 +17,9 @@ for arg in "$@"; do
             ;;
         --debug)
             DEBUG_FLAGS="-s"
+            ;;
+        --headless)
+            HEADLESS=1
             ;;
         --script=*)
             SCRIPT_NAME="${arg#--script=}"
@@ -166,6 +170,14 @@ if [ -n "${SCRIPT_NAME}" ]; then
     mcopy -o -i "${DISK_IMG}" "${SCRIPT_FILE}" "::INIT.RC"
 fi
 
+if [ "$HEADLESS" -eq 1 ]; then
+    SERIAL_OPT="-serial file:/tmp/brook_serial.log"
+    DISPLAY_OPT="-display none"
+else
+    SERIAL_OPT="-serial stdio"
+    DISPLAY_OPT="-display gtk"
+fi
+
 qemu-system-x86_64 \
     -machine q35 \
     -cpu qemu64 \
@@ -175,8 +187,9 @@ qemu-system-x86_64 \
     -drive if=pflash,format=raw,file="${OVMF_VARS_COPY}" \
     -drive format=raw,file=fat:rw:"${BUILD_DIR}/esp" \
     -drive if=virtio,format=raw,file="${DISK_IMG}" \
-    -serial stdio \
-    -display gtk \
-    -monitor none \
+    ${SERIAL_OPT} \
+    ${DISPLAY_OPT} \
+    -monitor unix:/tmp/qemu_monitor.sock,server,nowait \
+    -no-reboot \
     ${DEBUG_FLAGS} \
     "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"

@@ -1,7 +1,10 @@
 # Brook OS boot script — userspace test apps
-# Runs hello, sysinfo, fibonacci, and memtest in sequence.
+# Runs hello, sysinfo, fibonacci, memtest, mandelbrot, primes, and coremark.
 
 run /boot/BIN/HELLO
 run /boot/BIN/SYSINFO
 run /boot/BIN/FIBONACCI
 run /boot/BIN/MEMTEST
+run /boot/BIN/MANDELBROT
+run /boot/BIN/PRIMES
+run /boot/BIN/COREMARK

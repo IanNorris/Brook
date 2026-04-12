@@ -243,6 +243,67 @@ static void ProcessTrampoline()
     __builtin_unreachable();
 }
 
+// Trampoline for forked child processes.
+// Returns to the instruction after the fork() syscall with RAX=0.
+// Uses SYSRET to enter user mode (same mechanism the parent's syscall
+// return would use), with RCX=user RIP, R11=user RFLAGS.
+static void ForkChildTrampoline()
+{
+    uint32_t cpu = ThisCpu();
+    DrainPostSwitch(cpu);
+
+    Process* proc = g_perCpu[cpu].currentProcess;
+    DbgPrintf("SCHED: CPU%u fork child '%s' (pid %u) entering user mode at rip=0x%lx\n",
+                 cpu, proc->name, proc->pid, proc->forkReturnRip);
+
+    uint64_t userRip = proc->forkReturnRip;
+    uint64_t userRsp = proc->forkReturnRsp;
+    uint64_t userRflags = proc->forkReturnRflags;
+    uint64_t userRbx = proc->forkRbx;
+    uint64_t userRbp = proc->forkRbp;
+    uint64_t userR12 = proc->forkR12;
+    uint64_t userR13 = proc->forkR13;
+    uint64_t userR14 = proc->forkR14;
+    uint64_t userR15 = proc->forkR15;
+    proc->isForkChild = false;
+
+    __asm__ volatile("sti");
+
+    // Enter user mode via SYSRET with all callee-saved registers restored.
+    // We build a small struct on the stack and load from it to avoid
+    // register pressure issues with 9 operands.
+    struct ForkRegs {
+        uint64_t rip, rflags, rsp, rbx, rbp, r12, r13, r14, r15;
+    } regs = { userRip, userRflags, userRsp, userRbx, userRbp,
+               userR12, userR13, userR14, userR15 };
+
+    __asm__ volatile(
+        "mov %[base], %%rax\n\t"
+        "mov 24(%%rax), %%rbx\n\t"     // restore RBX
+        "mov 32(%%rax), %%rbp\n\t"     // restore RBP
+        "mov 40(%%rax), %%r12\n\t"     // restore R12
+        "mov 48(%%rax), %%r13\n\t"     // restore R13
+        "mov 56(%%rax), %%r14\n\t"     // restore R14
+        "mov 64(%%rax), %%r15\n\t"     // restore R15
+        "mov 0(%%rax), %%rcx\n\t"      // RCX = user RIP
+        "mov 8(%%rax), %%r11\n\t"      // R11 = user RFLAGS
+        "mov 16(%%rax), %%rsp\n\t"     // RSP = user stack
+        "xor %%rax, %%rax\n\t"         // RAX = 0 (fork child return)
+        "xor %%rdx, %%rdx\n\t"
+        "xor %%rsi, %%rsi\n\t"
+        "xor %%rdi, %%rdi\n\t"
+        "xor %%r8, %%r8\n\t"
+        "xor %%r9, %%r9\n\t"
+        "xor %%r10, %%r10\n\t"
+        "swapgs\n\t"
+        ".byte 0x48\n\t"               // REX.W prefix for sysretq
+        "sysret\n\t"
+        :: [base] "r"(&regs)
+        : "memory"
+    );
+    __builtin_unreachable();
+}
+
 // Trampoline for kernel threads. Like ProcessTrampoline but stays in ring 0.
 // fn and arg are stored at the top of the kernel stack by KernelThreadCreate.
 void KernelThreadTrampoline()
@@ -277,9 +338,14 @@ void SchedulerAddProcess(Process* proc)
     proc->savedCtx.rsp = proc->isKernelThread
         ? proc->kernelStackTop - 24   // below fn/arg slots (16 bytes) + alignment
         : proc->kernelStackTop - 8;
-    proc->savedCtx.rip = proc->isKernelThread
-        ? reinterpret_cast<uint64_t>(&KernelThreadTrampoline)
-        : reinterpret_cast<uint64_t>(&ProcessTrampoline);
+
+    if (proc->isKernelThread)
+        proc->savedCtx.rip = reinterpret_cast<uint64_t>(&KernelThreadTrampoline);
+    else if (proc->isForkChild)
+        proc->savedCtx.rip = reinterpret_cast<uint64_t>(&ForkChildTrampoline);
+    else
+        proc->savedCtx.rip = reinterpret_cast<uint64_t>(&ProcessTrampoline);
+
     proc->savedCtx.rflags = 0x202;
     proc->savedCtx.cr3 = proc->pageTable.pml4.raw();
     proc->savedCtx.fsBase = proc->fsBase;
@@ -431,7 +497,8 @@ static void ReapTerminated()
         Process* p = g_allProcesses[i];
         if (p->state == ProcessState::Terminated
             && __atomic_load_n(&p->reapable, __ATOMIC_ACQUIRE)
-            && p != g_perCpu[cpu].currentProcess)
+            && p != g_perCpu[cpu].currentProcess
+            && p->parentPid == 0)  // Don't reap if parent may call wait4
         {
             SchedLockRelease(g_allProcLock, alf);
             DbgPrintf("SCHED: reaping '%s' (pid %u)\n", p->name, p->pid);
@@ -615,6 +682,7 @@ void SchedulerYield()
         proc->fbExitColor = (status < 0) ? 0x00CC0000u : 0x00001A3Au;
 
     proc->state = ProcessState::Terminated;
+    proc->exitStatus = status;
 
     uint64_t rlf10 = SchedLockAcquire(g_readyLock);
     ReadyQueueRemoveLocked(proc);
@@ -797,6 +865,31 @@ Process* ProcessCurrent()
 uint16_t SchedulerAllocPid()
 {
     return g_nextPid++;
+}
+
+Process* SchedulerFindTerminatedChild(uint16_t parentPid, int64_t pid)
+{
+    uint64_t alf = SchedLockAcquire(g_allProcLock);
+    for (uint32_t i = 0; i < g_processCount; i++)
+    {
+        Process* p = g_allProcesses[i];
+        if (p->parentPid == parentPid
+            && p->state == ProcessState::Terminated
+            && __atomic_load_n(&p->reapable, __ATOMIC_ACQUIRE)
+            && (pid == -1 || pid == static_cast<int64_t>(p->pid)))
+        {
+            SchedLockRelease(g_allProcLock, alf);
+            return p;
+        }
+    }
+    SchedLockRelease(g_allProcLock, alf);
+    return nullptr;
+}
+
+void SchedulerReapChild(Process* child)
+{
+    DbgPrintf("SCHED: reaping child '%s' (pid %u)\n", child->name, child->pid);
+    ProcessDestroy(child);
 }
 
 } // namespace brook

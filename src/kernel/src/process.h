@@ -135,10 +135,12 @@ struct ElfBinary
 struct Process
 {
     uint16_t pid;
+    uint16_t parentPid;          // Parent process PID (0 if no parent)
     ProcessState state;
     uint8_t  schedPriority;  // Initial scheduler priority (0=RT, 1=High, 2=Normal, 3=Low)
     int32_t  runningOnCpu;   // CPU index (-1 = not running, used for double-schedule detection)
     volatile bool reapable;  // Set after context_switch completes away from this process
+    int32_t exitStatus;      // Exit status (stored when process exits, for wait4)
 
     // Scheduler linked-list pointers (circular doubly-linked ready queue)
     Process* schedNext;
@@ -206,6 +208,20 @@ struct Process
 
     // True if this is a kernel-mode thread (ring 0, kernel CR3, no user stack).
     bool isKernelThread;
+
+    // Fork child state: when true, the trampoline enters user mode at
+    // forkReturnRip with RAX=0 (child's fork() return value).
+    bool isForkChild;
+    uint64_t forkReturnRip;     // User-mode RIP to resume at (instruction after syscall)
+    uint64_t forkReturnRsp;     // User-mode RSP at time of fork
+    uint64_t forkReturnRflags;  // User-mode RFLAGS at time of fork
+    // Callee-saved registers that must be preserved across syscall for child
+    uint64_t forkRbx;
+    uint64_t forkRbp;
+    uint64_t forkR12;
+    uint64_t forkR13;
+    uint64_t forkR14;
+    uint64_t forkR15;
 };
 
 // Kernel thread entry point signature.
@@ -231,6 +247,12 @@ Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
 
 // Destroy a process and free all its resources.
 void ProcessDestroy(Process* proc);
+
+// Fork the current process, creating a child with a copy of its address space.
+// The caller must provide the user-mode context so the child can resume.
+// Returns the child Process* on success, or null on failure.
+Process* ProcessFork(Process* parent, uint64_t userRip,
+                     uint64_t userRsp, uint64_t userRflags);
 
 // File descriptor operations
 int       FdAlloc(Process* proc, FdType type, void* handle);

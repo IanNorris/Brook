@@ -35,22 +35,46 @@ extern "C" __attribute__((naked, used)) void BrookSyscallDispatcher()
         "push %%rcx\n\t"               // [2] user return address
         "movq %%gs:24, %%r11\n\t"       // reload user RFLAGS
         "push %%r11\n\t"               // [3] user RFLAGS
-        "push %%rbp\n\t"               // [4]
+        "push %%rbp\n\t"               // [4] user RBP
         "mov %%rsp, %%rbp\n\t"
         "push %%rdx\n\t"               // [5]
         "push %%rsi\n\t"               // [6]
         "push %%rdi\n\t"               // [7]
         "push %%r8\n\t"                // [8]
         "push %%r9\n\t"                // [9]
-        "push %%r10\n\t"               // [10] preserve R10
+        "push %%r10\n\t"               // [10]
         "push %%r11\n\t"               // [11]
         "push %%r12\n\t"               // [12]
-        "push %%r14\n\t"               // [13]
-        "push %%r15\n\t"               // [14] — 14 pushes = 112 bytes, aligned
+        "push %%r13\n\t"               // [13]
+        "push %%r14\n\t"               // [14]
+        "push %%r15\n\t"               // [15]
+        "push %%rbx\n\t"               // [16] — 16 pushes = 128 bytes, aligned
         "mov %%r10, %%rcx\n\t"
         "cmp $400, %%rax\n\t"
         "jae .Lsyscall_invalid\n\t"
         "mov %%gs:16, %%r12\n\t"
+        // Save user context in KernelCpuEnv for fork().
+        // Use R15 as temp (saved at [rbp-88]).
+        "mov 16(%%rbp), %%r15\n\t"       // user RCX (return addr)
+        "movq %%r15, %%gs:48\n\t"        // -> syscallUserRip
+        "mov 24(%%rbp), %%r15\n\t"       // user RSP
+        "movq %%r15, %%gs:56\n\t"        // -> syscallUserRsp
+        "mov 8(%%rbp), %%r15\n\t"        // user RFLAGS (R11)
+        "movq %%r15, %%gs:64\n\t"        // -> syscallUserRflags
+        // Save callee-saved registers for fork child
+        "mov -96(%%rbp), %%r15\n\t"      // RBX at [rbp-96]
+        "movq %%r15, %%gs:72\n\t"        // -> syscallUserRbx
+        "mov 0(%%rbp), %%r15\n\t"        // user RBP at [rbp+0]
+        "movq %%r15, %%gs:80\n\t"        // -> syscallUserRbp
+        "mov -64(%%rbp), %%r15\n\t"      // R12 at [rbp-64]
+        "movq %%r15, %%gs:88\n\t"        // -> syscallUserR12
+        "mov -72(%%rbp), %%r15\n\t"      // R13 at [rbp-72]
+        "movq %%r15, %%gs:96\n\t"        // -> syscallUserR13
+        "mov -80(%%rbp), %%r15\n\t"      // R14 at [rbp-80]
+        "movq %%r15, %%gs:104\n\t"       // -> syscallUserR14
+        "mov -88(%%rbp), %%r15\n\t"      // R15 at [rbp-88]
+        "movq %%r15, %%gs:112\n\t"       // -> syscallUserR15
+        "mov -88(%%rbp), %%r15\n\t"      // restore R15 from saved slot
         "sti\n\t"
         "call *(%%r12, %%rax, 8)\n\t"
         "cli\n\t"
@@ -58,8 +82,10 @@ extern "C" __attribute__((naked, used)) void BrookSyscallDispatcher()
         ".Lsyscall_invalid:\n\t"
         "mov $-38, %%rax\n\t"
         ".Lsyscall_return:\n\t"
-        "pop %%r15\n\t"                // [14]
-        "pop %%r14\n\t"                // [13]
+        "pop %%rbx\n\t"                // [16]
+        "pop %%r15\n\t"                // [15]
+        "pop %%r14\n\t"                // [14]
+        "pop %%r13\n\t"                // [13]
         "pop %%r12\n\t"                // [12]
         "pop %%r11\n\t"                // [11]
         "pop %%r10\n\t"                // [10]
@@ -676,6 +702,128 @@ static int64_t sys_getpid(uint64_t, uint64_t, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
+// sys_getppid (110)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_getppid(uint64_t, uint64_t, uint64_t,
+                            uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    return proc ? proc->parentPid : 0;
+}
+
+// ---------------------------------------------------------------------------
+// sys_fork (57) / sys_clone (56) / sys_vfork (58)
+// ---------------------------------------------------------------------------
+// The fork syscall needs access to the user-mode return address (RCX) and
+// RFLAGS (R11) that were saved on the kernel stack by BrookSyscallDispatcher.
+// These are at known offsets from the current kernel stack frame.
+
+static int64_t sys_fork(uint64_t, uint64_t, uint64_t,
+                         uint64_t, uint64_t, uint64_t)
+{
+    Process* parent = ProcessCurrent();
+    if (!parent) return -ENOSYS;
+
+    // Read user context from KernelCpuEnv (saved by BrookSyscallDispatcher).
+    uint64_t userRip, userRsp, userRflags;
+    __asm__ volatile(
+        "movq %%gs:48, %0\n\t"   // syscallUserRip
+        "movq %%gs:56, %1\n\t"   // syscallUserRsp
+        "movq %%gs:64, %2\n\t"   // syscallUserRflags
+        : "=r"(userRip), "=r"(userRsp), "=r"(userRflags)
+    );
+
+    Process* child = ProcessFork(parent, userRip, userRsp, userRflags);
+    if (!child) return -ENOMEM;
+
+    // Save callee-saved registers from KernelCpuEnv for child to restore
+    __asm__ volatile(
+        "movq %%gs:72,  %0\n\t"
+        "movq %%gs:80,  %1\n\t"
+        "movq %%gs:88,  %2\n\t"
+        "movq %%gs:96,  %3\n\t"
+        "movq %%gs:104, %4\n\t"
+        "movq %%gs:112, %5\n\t"
+        : "=r"(child->forkRbx), "=r"(child->forkRbp),
+          "=r"(child->forkR12), "=r"(child->forkR13),
+          "=r"(child->forkR14), "=r"(child->forkR15)
+    );
+
+    SchedulerAddProcess(child);
+
+    DbgPrintf("FORK: pid=%u forked child pid=%u\n", parent->pid, child->pid);
+    return static_cast<int64_t>(child->pid);
+}
+
+static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t,
+                          uint64_t, uint64_t, uint64_t)
+{
+    // For now, clone without CLONE_VM/CLONE_THREAD is equivalent to fork.
+    // Ignore flags and newStack for the initial implementation.
+    (void)flags;
+    (void)newStack;
+    return sys_fork(0, 0, 0, 0, 0, 0);
+}
+
+static int64_t sys_vfork(uint64_t, uint64_t, uint64_t,
+                          uint64_t, uint64_t, uint64_t)
+{
+    // vfork is like fork but parent blocks until child exec/exit.
+    // For now, implement as plain fork (parent doesn't block).
+    return sys_fork(0, 0, 0, 0, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// sys_wait4 (61)
+// ---------------------------------------------------------------------------
+// Wait for a child process to terminate. Supports pid=-1 (any child)
+// or a specific child PID. WNOHANG (options & 1) returns 0 if no child
+// has exited yet instead of blocking.
+
+static constexpr uint64_t WNOHANG = 1;
+
+static int64_t sys_wait4(uint64_t pidArg, uint64_t statusAddr, uint64_t options,
+                          uint64_t, uint64_t, uint64_t)
+{
+    Process* parent = ProcessCurrent();
+    if (!parent) return -ENOSYS;
+
+    int64_t targetPid = static_cast<int64_t>(static_cast<int32_t>(pidArg));
+    // pid < -1 means wait for any child in process group |pid| — treat as -1
+    if (targetPid < -1) targetPid = -1;
+    // pid == 0 means wait for any child in same process group — treat as -1
+    if (targetPid == 0) targetPid = -1;
+
+    // Spin until a terminated child is found (or return immediately for WNOHANG)
+    for (;;)
+    {
+        Process* child = SchedulerFindTerminatedChild(parent->pid, targetPid);
+        if (child)
+        {
+            int32_t childPid = child->pid;
+            int32_t childStatus = child->exitStatus;
+
+            if (statusAddr)
+            {
+                // Linux wait status encoding: (status & 0xFF) << 8 for normal exit
+                auto* wstatus = reinterpret_cast<int32_t*>(statusAddr);
+                *wstatus = (childStatus & 0xFF) << 8;
+            }
+
+            SchedulerReapChild(child);
+            return static_cast<int64_t>(childPid);
+        }
+
+        if (options & WNOHANG)
+            return 0;
+
+        // Yield and retry — simple polling wait
+        SchedulerYield();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // sys_set_tid_address (218)
 // ---------------------------------------------------------------------------
 
@@ -1254,7 +1402,11 @@ void SyscallTableInit()
     g_syscallTable[SYS_SCHED_YIELD]     = sys_sched_yield;
     g_syscallTable[SYS_NANOSLEEP]       = sys_nanosleep;
     g_syscallTable[SYS_GETPID]          = sys_getpid;
+    g_syscallTable[SYS_CLONE]           = sys_clone;
+    g_syscallTable[SYS_FORK]            = sys_fork;
+    g_syscallTable[SYS_VFORK]           = sys_vfork;
     g_syscallTable[SYS_EXIT]            = sys_exit;
+    g_syscallTable[SYS_WAIT4]           = sys_wait4;
     g_syscallTable[SYS_UNAME]           = sys_uname;
     g_syscallTable[SYS_FCNTL]           = sys_fcntl;
     g_syscallTable[SYS_GETCWD]          = sys_getcwd;
@@ -1265,6 +1417,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_SETGID]          = sys_setgid;
     g_syscallTable[SYS_GETEUID]         = sys_geteuid;
     g_syscallTable[SYS_GETEGID]         = sys_getegid;
+    g_syscallTable[SYS_GETPPID]         = sys_getppid;
     g_syscallTable[SYS_ARCH_PRCTL]      = sys_arch_prctl;
     g_syscallTable[SYS_GETDENTS64]      = sys_getdents64;
     g_syscallTable[SYS_SET_TID_ADDRESS] = sys_set_tid_address;

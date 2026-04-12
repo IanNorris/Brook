@@ -1,0 +1,2 @@
+# Brook OS boot script — fork test
+run /boot/BIN/FORKTEST
