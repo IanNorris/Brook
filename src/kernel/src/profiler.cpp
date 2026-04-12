@@ -25,26 +25,27 @@ namespace brook { extern volatile uint64_t g_lapicTickCount; }
 namespace brook {
 
 // ---------------------------------------------------------------------------
-// Sample record — 16 bytes, packed for binary output
+// Sample record — variable-length stack trace
 // ---------------------------------------------------------------------------
 
-struct __attribute__((packed)) ProfileSample {
-    uint32_t tick;    // relative to profiler start
+static constexpr uint32_t MAX_STACK_DEPTH = 8;
+
+struct ProfileSample {
+    uint32_t tick;                     // relative to profiler start
     uint16_t pid;
     uint8_t  cpu;
-    uint8_t  flags;   // bit 0: ring (0=kernel, 1=user)
-    uint64_t rip;
+    uint8_t  flags;                    // bit 0: ring (0=kernel, 1=user)
+    uint64_t rip[MAX_STACK_DEPTH];     // [0] = leaf, [1..] = callers via RBP chain
+    uint8_t  depth;                    // number of valid frames
 };
-
-static_assert(sizeof(ProfileSample) == 16, "ProfileSample must be 16 bytes");
 
 // ---------------------------------------------------------------------------
 // Per-CPU lock-free ring buffer (single-producer ISR, single-consumer thread)
 // ---------------------------------------------------------------------------
-// 2048 samples per CPU × 16 bytes = 32 KB per CPU.
-// At 100 Hz (SAMPLE_DIVIDER=10), holds ~20 seconds of data per CPU.
+// Each sample is ~80 bytes with 8 stack frames.
+// 512 samples per CPU, drained every 100ms by the profiler thread.
 
-static constexpr uint32_t SAMPLES_PER_CPU = 2048;
+static constexpr uint32_t SAMPLES_PER_CPU = 512;
 
 struct PerCpuBuffer {
     ProfileSample samples[SAMPLES_PER_CPU];
@@ -74,7 +75,7 @@ static Process*          g_profilerThread    = nullptr;
 // per CPU.  8 CPUs × 100 Hz × 8s = 6400 samples ≈ 100 KB on disk.
 static constexpr uint32_t SAMPLE_DIVIDER = 10;
 
-void ProfilerSample(uint64_t interruptedRip, uint64_t interruptedCs)
+void ProfilerSample(uint64_t interruptedRip, uint64_t interruptedCs, uint64_t interruptedRbp)
 {
     if (!g_profilerEnabled) return;
 
@@ -106,11 +107,39 @@ void ProfilerSample(uint64_t interruptedRip, uint64_t interruptedCs)
     uint16_t pid = proc ? proc->pid : 0xFFFF;
     bool userMode = (interruptedCs & 3) != 0;
 
-    buf.samples[wi].tick  = static_cast<uint32_t>(now - g_profilerStartTick);
-    buf.samples[wi].pid   = pid;
-    buf.samples[wi].cpu   = static_cast<uint8_t>(cpu);
-    buf.samples[wi].flags = userMode ? 1 : 0;
-    buf.samples[wi].rip   = interruptedRip;
+    ProfileSample& s = buf.samples[wi];
+    s.tick  = static_cast<uint32_t>(now - g_profilerStartTick);
+    s.pid   = pid;
+    s.cpu   = static_cast<uint8_t>(cpu);
+    s.flags = userMode ? 1 : 0;
+
+    // Frame 0 = leaf (interrupted RIP)
+    s.rip[0] = interruptedRip;
+    uint8_t depth = 1;
+
+    // Walk frame pointer chain for kernel-mode samples only.
+    // User-mode RBP might be invalid or in a different address space.
+    if (!userMode && interruptedRbp != 0) {
+        uint64_t rbp = interruptedRbp;
+        // Kernel addresses are >= 0xffffffff80000000
+        constexpr uint64_t KERNEL_BASE = 0xffffffff80000000ULL;
+        constexpr uint64_t KERNEL_END  = 0xffffffffffffffffULL;
+        while (depth < MAX_STACK_DEPTH) {
+            // Validate RBP is in kernel range and aligned
+            if (rbp < KERNEL_BASE || rbp >= KERNEL_END - 16 || (rbp & 7) != 0)
+                break;
+            // RBP points to: [saved_rbp, return_addr]
+            const uint64_t* frame = reinterpret_cast<const uint64_t*>(rbp);
+            uint64_t retAddr = frame[1];
+            if (retAddr < KERNEL_BASE || retAddr >= KERNEL_END)
+                break;
+            s.rip[depth++] = retAddr;
+            uint64_t nextRbp = frame[0];
+            if (nextRbp <= rbp) break; // stack grows down; prevent loops
+            rbp = nextRbp;
+        }
+    }
+    s.depth = depth;
 
     // Release store ensures sample data is visible before advancing writeIdx
     __atomic_store_n(&buf.writeIdx, nextWi, __ATOMIC_RELEASE);
@@ -125,9 +154,24 @@ static const char kHexDigits[] = "0123456789abcdef";
 // ---------------------------------------------------------------------------
 // Drain samples to serial in parseable text format
 // ---------------------------------------------------------------------------
-// Output format (one line per sample):
-//   PROF <tick_hex> <pid_hex> <cpu> <flags> <rip_hex>
+// Output format (one line per sample, stack frames separated by semicolons):
+//   P <tick_dec> <pid_hex> <cpu> <flags> <rip0_hex>;<rip1_hex>;...
 // Delimited by PROF_BEGIN / PROF_END markers.
+
+static void SerialPutHex16(uint64_t v)
+{
+    for (int i = 15; i >= 0; --i)
+        SerialPutChar(kHexDigits[(v >> (i * 4)) & 0xF]);
+}
+
+static void SerialPutDec(uint32_t v)
+{
+    char tb[11]; int ti = 10; tb[ti] = '\0';
+    if (v == 0) { tb[--ti] = '0'; }
+    else { while (v > 0) { tb[--ti] = '0' + (v % 10); v /= 10; } }
+    const char* p = &tb[ti];
+    while (*p) SerialPutChar(*p++);
+}
 
 static uint32_t DrainToSerial()
 {
@@ -141,42 +185,27 @@ static uint32_t DrainToSerial()
         uint32_t wi = __atomic_load_n(&buf.writeIdx, __ATOMIC_ACQUIRE);
         if (ri == wi) continue;
 
-        // Hold serial lock for entire CPU buffer to avoid priority inversion.
-        // Use SerialPutChar directly — NOT SerialPuts which re-acquires the lock.
         SerialLock();
         while (ri != wi) {
             const ProfileSample& s = buf.samples[ri];
 
             SerialPutChar('P');
             SerialPutChar(' ');
-            // tick (decimal)
-            {
-                char tb[11]; int ti = 10; tb[ti] = '\0';
-                uint32_t v = s.tick;
-                if (v == 0) { tb[--ti] = '0'; }
-                else { while (v > 0) { tb[--ti] = '0' + (v % 10); v /= 10; } }
-                const char* p = &tb[ti];
-                while (*p) SerialPutChar(*p++);
-            }
+            SerialPutDec(s.tick);
             SerialPutChar(' ');
-            // pid (4 hex digits)
             SerialPutChar(kHexDigits[(s.pid >> 12) & 0xF]);
             SerialPutChar(kHexDigits[(s.pid >> 8) & 0xF]);
             SerialPutChar(kHexDigits[(s.pid >> 4) & 0xF]);
             SerialPutChar(kHexDigits[s.pid & 0xF]);
             SerialPutChar(' ');
-            // cpu (single digit)
             SerialPutChar('0' + s.cpu);
             SerialPutChar(' ');
-            // flags (single digit)
             SerialPutChar('0' + s.flags);
             SerialPutChar(' ');
-            // rip (16 hex digits)
-            {
-                uint64_t v = s.rip;
-                for (int i = 15; i >= 0; --i) {
-                    SerialPutChar(kHexDigits[(v >> (i * 4)) & 0xF]);
-                }
+            // Stack frames: rip0;rip1;rip2;...
+            for (uint8_t d = 0; d < s.depth; d++) {
+                if (d > 0) SerialPutChar(';');
+                SerialPutHex16(s.rip[d]);
             }
             SerialPutChar('\n');
 
@@ -198,37 +227,56 @@ static void ProfilerThreadFn(void* /*arg*/)
     SerialPrintf("PROFILER: thread started\n");
 
     for (;;) {
-        // Sleep until profiling completes (flush requested)
-        while (!g_profilerFlushReq) {
+        // Sleep until profiling starts
+        while (!g_profilerEnabled && !g_profilerFlushReq) {
             Process* self = ProcessCurrent();
             if (self) {
-                self->wakeupTick = g_lapicTickCount + 50;
+                self->wakeupTick = g_lapicTickCount + 100;
                 SchedulerBlock(self);
             }
         }
 
-        // Count dropped samples
-        uint32_t cpuCount = SmpGetCpuCount();
-        uint32_t totalDropped = 0;
-        for (uint32_t c = 0; c < cpuCount; c++) {
-            totalDropped += g_cpuBuf[c].dropped;
+        if (g_profilerEnabled) {
+            // Profiling is active — emit header and start continuous drain
+            uint32_t cpuCount = SmpGetCpuCount();
+            SerialPrintf("PROF_BEGIN %u %lu\n", cpuCount, g_profilerStartTick);
+
+            uint32_t totalWritten = 0;
+
+            // Continuously drain while profiling is active
+            while (g_profilerEnabled) {
+                totalWritten += DrainToSerial();
+
+                Process* self = ProcessCurrent();
+                if (self) {
+                    // Drain every 100ms — fast enough to keep up with 100Hz per CPU
+                    self->wakeupTick = g_lapicTickCount + 100;
+                    SchedulerBlock(self);
+                }
+            }
+
+            // Final drain after profiling stopped
+            totalWritten += DrainToSerial();
+
+            uint32_t totalDropped = 0;
+            for (uint32_t c = 0; c < cpuCount; c++)
+                totalDropped += g_cpuBuf[c].dropped;
+
+            SerialPrintf("PROF_END %u %u\n", totalWritten, totalDropped);
+            SerialPrintf("PROFILER: done — %u samples, %u dropped\n", totalWritten, totalDropped);
+
+            g_profilerFlushReq = false;
+
+            // Reset buffers for next run
+            for (uint32_t c = 0; c < cpuCount; c++) {
+                g_cpuBuf[c].writeIdx = 0;
+                g_cpuBuf[c].readIdx  = 0;
+                g_cpuBuf[c].dropped  = 0;
+            }
         }
-
-        // Write all samples to serial (no VFS contention!)
-        SerialPrintf("PROF_BEGIN %u %lu\n", cpuCount, g_profilerStartTick);
-
-        uint32_t written = DrainToSerial();
-
-        SerialPrintf("PROF_END %u %u\n", written, totalDropped);
-        SerialPrintf("PROFILER: done — %u samples, %u dropped\n", written, totalDropped);
-
-        g_profilerFlushReq = false;
-
-        // Reset buffers for next run
-        for (uint32_t c = 0; c < cpuCount; c++) {
-            g_cpuBuf[c].writeIdx = 0;
-            g_cpuBuf[c].readIdx  = 0;
-            g_cpuBuf[c].dropped  = 0;
+        else if (g_profilerFlushReq) {
+            // Legacy: flush without continuous drain (shouldn't normally hit)
+            g_profilerFlushReq = false;
         }
     }
 }

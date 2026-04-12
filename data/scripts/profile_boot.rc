@@ -1,0 +1,9 @@
+# Brook OS boot profile — captures loading phase
+# Profiler starts immediately to capture the entire boot + app loading.
+profile 30000
+run /boot/BIN/HELLO
+run /boot/BIN/SYSINFO
+run /boot/BIN/FIBONACCI
+run /boot/BIN/MANDELBROT
+run /boot/BIN/PRIMES
+run /boot/BIN/COWSAY "Brook OS"

@@ -171,12 +171,13 @@ volatile uint64_t g_lapicTickCount = 0;
 void SchedulerTimerTick();
 
 // Forward-declare profiler sample (defined in profiler.cpp).
-void ProfilerSample(uint64_t interruptedRip, uint64_t interruptedCs);
+void ProfilerSample(uint64_t interruptedRip, uint64_t interruptedCs, uint64_t interruptedRbp);
 
 // C handler called from the naked ISR wrapper below.
-// interruptedRip/interruptedCs are passed from the naked handler (extracted
-// from the CPU interrupt frame on the stack).
-static void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interruptedCs)
+// interruptedRip/interruptedCs/interruptedRbp are passed from the naked
+// handler (extracted from the CPU interrupt frame on the stack).
+static void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interruptedCs,
+                                    uint64_t interruptedRbp)
 {
     LapicWrite(LapicReg::EOI, 0);
 
@@ -189,7 +190,7 @@ static void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interrupted
     }
 
     // Record a profiler sample (fast no-op when profiling is disabled).
-    ProfilerSample(interruptedRip, interruptedCs);
+    ProfilerSample(interruptedRip, interruptedCs, interruptedRbp);
 
     // Drive the scheduler on every CPU.
     SchedulerTimerTick();
@@ -227,9 +228,11 @@ static void LapicTimerHandler(void)
         //   RSP+88  = interrupted RFLAGS
         //   RSP+96  = interrupted RSP
         //   RSP+104 = interrupted SS
-        // Load RIP→RDI (arg1), CS→RSI (arg2) for LapicTimerHandlerInner.
+        // Load RIP→RDI (arg1), CS→RSI (arg2), RBP→RDX (arg3).
+        // RBP is callee-saved, so it still holds the interrupted value.
         "movq 72(%%rsp), %%rdi\n\t"
         "movq 80(%%rsp), %%rsi\n\t"
+        "movq %%rbp, %%rdx\n\t"
 
         "cld\n\t"
         "call %P0\n\t"

@@ -1,19 +1,16 @@
 #pragma once
 
-// profiler.h — Sampling profiler that captures RIP from timer ISR
+// profiler.h — Sampling profiler with stack trace capture
 //
 // Each LAPIC timer tick (~1ms per CPU), the profiler records the interrupted
-// RIP, current PID, CPU index, and privilege ring into a per-CPU lock-free
-// ring buffer.  A background kernel thread periodically drains all buffers
-// to a binary file on disk.  A host-side script converts the binary dump
+// RIP, walks the RBP frame chain for a stack trace, captures the current PID,
+// CPU index, and privilege ring into a per-CPU lock-free ring buffer.
+// A background kernel thread continuously drains samples to serial output.
+// A host-side script (profiler_to_speedscope.py) converts the text dump
 // to Speedscope JSON for visualization.
 //
-// Binary format (per sample, 16 bytes):
-//   uint32_t tick   — relative to profiler start (ms)
-//   uint16_t pid    — process ID
-//   uint8_t  cpu    — CPU index
-//   uint8_t  flags  — bit 0: ring (0=kernel, 1=user)
-//   uint64_t rip    — instruction pointer at interrupt time
+// Serial format (per sample):
+//   P <tick_dec> <pid_hex> <cpu> <flags> <rip0_hex>;<rip1_hex>;...
 
 #include <stdint.h>
 
@@ -23,7 +20,6 @@ namespace brook {
 void ProfilerInit();
 
 // Start profiling for 'durationMs' milliseconds (0 = until ProfilerStop).
-// Samples are written to /profiler.bin on disk.
 void ProfilerStart(uint32_t durationMs);
 
 // Stop profiling early and flush remaining samples.
@@ -32,7 +28,8 @@ void ProfilerStop();
 // Called from the LAPIC timer ISR on every CPU.
 // interruptedRip: the RIP from the interrupt frame.
 // interruptedCs:  the CS from the interrupt frame (to determine ring).
+// interruptedRbp: the RBP at interrupt time (for frame pointer walking).
 // Must be safe for ISR context: no locks, no memory allocation.
-void ProfilerSample(uint64_t interruptedRip, uint64_t interruptedCs);
+void ProfilerSample(uint64_t interruptedRip, uint64_t interruptedCs, uint64_t interruptedRbp);
 
 } // namespace brook

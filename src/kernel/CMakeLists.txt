@@ -202,6 +202,7 @@ target_compile_options(kernel PRIVATE
     -Wno-unused-command-line-argument
     -msse2
     -mfpmath=sse   # use SSE for scalar float, not x87 (cleaner ABI)
+    -fno-omit-frame-pointer  # enable RBP frame chain for profiler stack walking
 )
 
 # Interrupt handler files and panic must NOT use SSE/FPU registers.

@@ -65,8 +65,8 @@ def resolve_rip(rip, syms, sorted_addrs):
     return f"{name}+0x{offset:x}"
 
 
-# Regex for sample lines: P <tick> <pid_hex> <cpu> <flags> <rip_hex>
-SAMPLE_RE = re.compile(r'^P (\d+) ([0-9a-fA-F]{1,4}) (\d+) (\d) ([0-9a-fA-F]{1,16})$')
+# Regex for sample lines: P <tick> <pid_hex> <cpu> <flags> <rip0;rip1;...>
+SAMPLE_RE = re.compile(r'^P (\d+) ([0-9a-fA-F]{1,4}) (\d+) (\d) (.+)$')
 
 
 def parse_serial_log(path):
@@ -106,9 +106,11 @@ def parse_serial_log(path):
                     pid = int(m.group(2), 16)
                     cpu = int(m.group(3))
                     flags = int(m.group(4))
-                    rip = int(m.group(5), 16)
+                    rip_str = m.group(5)
                     ring = 'user' if (flags & 1) else 'kernel'
-                    samples.append((tick, pid, cpu, ring, rip))
+                    # Parse stack: rip0;rip1;rip2;...
+                    stack = [int(r, 16) for r in rip_str.split(';') if r]
+                    samples.append((tick, pid, cpu, ring, stack))
 
     return cpuCount, startTick, samples, dropped
 
@@ -164,11 +166,21 @@ def main():
     # Group by CPU and PID
     by_cpu = defaultdict(list)
     by_pid = defaultdict(list)
-    for tick, pid, cpu, ring, rip in samples:
-        by_cpu[cpu].append((tick, pid, ring, rip))
-        by_pid[pid].append((tick, cpu, ring, rip))
+    for tick, pid, cpu, ring, stack in samples:
+        by_cpu[cpu].append((tick, pid, ring, stack))
+        by_pid[pid].append((tick, cpu, ring, stack))
 
     profiles = []
+
+    def make_sample_stack(ring, stack):
+        """Convert a stack trace to Speedscope frame indices (bottom-to-top)."""
+        # stack[0] = leaf (deepest), stack[-1] = root (shallowest)
+        # Speedscope wants bottom-to-top: [root, ..., leaf]
+        frame_indices = []
+        for rip in reversed(stack):
+            fi = get_frame(rip, ring)
+            frame_indices.append(fi)
+        return frame_indices
 
     # Per-CPU profiles
     for cpu in sorted(by_cpu.keys()):
@@ -177,9 +189,8 @@ def main():
             continue
         ss = []
         weights = []
-        for tick, pid, ring, rip in cpu_samples:
-            fi = get_frame(rip, ring)
-            ss.append([fi])
+        for tick, pid, ring, stack in cpu_samples:
+            ss.append(make_sample_stack(ring, stack))
             weights.append(10)  # 10ms per sample at 100Hz
         profiles.append({
             "type": "sampled",
@@ -198,9 +209,8 @@ def main():
             continue
         ss = []
         weights = []
-        for tick, cpu, ring, rip in pid_samples:
-            fi = get_frame(rip, ring)
-            ss.append([fi])
+        for tick, cpu, ring, stack in pid_samples:
+            ss.append(make_sample_stack(ring, stack))
             weights.append(10)
         pid_name = f"PID {pid}" if pid != 0xFFFF else "idle/none"
         profiles.append({
