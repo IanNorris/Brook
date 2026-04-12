@@ -5,6 +5,9 @@
 #include "memory/virtual_memory.h"
 #include "sync/kmutex.h"
 
+// Forward-declare SchedulerYield — weak so test builds link without the scheduler.
+namespace brook { __attribute__((weak)) void SchedulerYield(); }
+
 extern "C" {
 #include "ff.h"
 }
@@ -507,9 +510,9 @@ Vnode* VfsOpen(const char* path, int flags)
             kfree(fil); // Don't need FatFS handle — sharing cached data
 
             // If another thread is still loading this file, yield until done.
-            // Use a simple timed spin — SchedulerYield is not available in test builds.
             while (__atomic_load_n(&existing->loading, __ATOMIC_ACQUIRE)) {
-                for (volatile int i = 0; i < 1000; ++i) {}  // Brief spin then re-check
+                if (SchedulerYield)
+                    SchedulerYield();
             }
 
             if (!existing->data) {
