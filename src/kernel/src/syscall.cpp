@@ -15,6 +15,8 @@
 #include "tty.h"
 #include "input.h"
 #include "serial_writer.h"
+#include "pipe.h"
+#include "memory/heap.h"
 
 // Forward declaration
 extern "C" __attribute__((naked)) void ReturnToKernel();
@@ -52,6 +54,7 @@ extern "C" __attribute__((naked, used)) void BrookSyscallDispatcher()
         "mov %%r10, %%rcx\n\t"
         "cmp $400, %%rax\n\t"
         "jae .Lsyscall_invalid\n\t"
+        "movq %%rax, %%gs:120\n\t"       // save syscall number for debug
         "mov %%gs:16, %%r12\n\t"
         // Save user context in KernelCpuEnv for fork().
         // Use R15 as temp (saved at [rbp-88]).
@@ -133,6 +136,7 @@ static constexpr int64_t ENODEV  = 19;
 static constexpr int64_t EINVAL  = 22;
 static constexpr int64_t ENOEXEC = 8;
 static constexpr int64_t EMFILE  = 24;
+static constexpr int64_t EPIPE   = 32;
 static constexpr int64_t ERANGE  = 34;
 static constexpr int64_t ENOSYS  = 38;
 
@@ -144,7 +148,6 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
                           uint64_t, uint64_t, uint64_t)
 {
     // fd 3 = debug serial — writes directly, bypassing the async ring buffer.
-    // Use for diagnostics that must appear immediately (e.g. benchmark results).
     if (fd == 3)
     {
         const char* buf = reinterpret_cast<const char*>(bufAddr);
@@ -153,14 +156,22 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
         return static_cast<int64_t>(count);
     }
 
+    // For fd 0/1/2: check if they've been redirected via dup2 first
     if (fd == 1 || fd == 2)
     {
-        const char* buf = reinterpret_cast<const char*>(bufAddr);
-        // Enqueue to async serial writer — decouples userspace from baud rate.
-        // Both stdout and stderr go through the ring buffer.
-        if (count > 0)
-            SerialWriterEnqueue(buf, static_cast<uint32_t>(count));
-        return static_cast<int64_t>(count);
+        Process* proc = ProcessCurrent();
+        FdEntry* fde = (proc ? FdGet(proc, static_cast<int>(fd)) : nullptr);
+        // Redirected if FD entry is a pipe or other non-default type.
+        // Default: Vnode with null handle = serial output
+        if (!fde || fde->type == FdType::None ||
+            (fde->type == FdType::Vnode && !fde->handle))
+        {
+            const char* buf = reinterpret_cast<const char*>(bufAddr);
+            if (count > 0)
+                SerialWriterEnqueue(buf, static_cast<uint32_t>(count));
+            return static_cast<int64_t>(count);
+        }
+        // Fall through to FD-table-based write below
     }
 
     // File descriptor write
@@ -183,6 +194,28 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
     {
         proc->fbDirty = 1;
         return static_cast<int64_t>(count);
+    }
+
+    // Write to pipe — block until at least some bytes are written
+    if (fde->type == FdType::Pipe && fde->handle)
+    {
+        auto* pipe = static_cast<PipeBuffer*>(fde->handle);
+        const char* src = reinterpret_cast<const char*>(bufAddr);
+        uint64_t written = 0;
+
+        while (written < count)
+        {
+            // If no readers, return EPIPE
+            if (__atomic_load_n(&pipe->readers, __ATOMIC_ACQUIRE) == 0)
+                return written > 0 ? static_cast<int64_t>(written) : -EPIPE;
+
+            uint32_t chunk = pipe->write(src + written,
+                static_cast<uint32_t>(count - written > 4096 ? 4096 : count - written));
+            written += chunk;
+            if (written > 0) break;  // Return partial writes immediately
+            SchedulerYield();
+        }
+        return static_cast<int64_t>(written);
     }
 
     return -EBADF;
@@ -226,6 +259,27 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             buf[bytesRead++] = sc;
         }
         return static_cast<int64_t>(bytesRead);
+    }
+
+    // Read from pipe — block until data available or all writers closed
+    if (fde->type == FdType::Pipe && fde->handle)
+    {
+        auto* pipe = static_cast<PipeBuffer*>(fde->handle);
+        auto* dst = reinterpret_cast<char*>(bufAddr);
+
+        for (;;)
+        {
+            uint32_t got = pipe->read(dst, static_cast<uint32_t>(
+                count > 4096 ? 4096 : count));
+            if (got > 0)
+                return static_cast<int64_t>(got);
+
+            // EOF — no writers left and buffer empty
+            if (__atomic_load_n(&pipe->writers, __ATOMIC_ACQUIRE) == 0)
+                return 0;
+
+            SchedulerYield();
+        }
     }
 
     return -EBADF;
@@ -316,8 +370,138 @@ static int64_t sys_close(uint64_t fd, uint64_t, uint64_t,
     if (fde->type == FdType::Vnode && fde->handle)
         VfsClose(static_cast<Vnode*>(fde->handle));
 
+    if (fde->type == FdType::Pipe && fde->handle)
+    {
+        auto* pipe = static_cast<PipeBuffer*>(fde->handle);
+        // flags bit 0: 1=write end, 0=read end
+        if (fde->flags & 1)
+            __atomic_fetch_sub(&pipe->writers, 1, __ATOMIC_RELEASE);
+        else
+            __atomic_fetch_sub(&pipe->readers, 1, __ATOMIC_RELEASE);
+
+        // Free pipe buffer when both ends are closed
+        if (__atomic_load_n(&pipe->readers, __ATOMIC_ACQUIRE) == 0 &&
+            __atomic_load_n(&pipe->writers, __ATOMIC_ACQUIRE) == 0)
+        {
+            kfree(pipe);
+        }
+    }
+
     FdFree(proc, static_cast<int>(fd));
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// sys_pipe (22)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_pipe(uint64_t pipefdAddr, uint64_t, uint64_t,
+                         uint64_t, uint64_t, uint64_t)
+{
+    auto* pipefd = reinterpret_cast<int32_t*>(pipefdAddr);
+    if (!pipefd) return -EFAULT;
+
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EMFILE;
+
+    // Allocate pipe buffer
+    auto* pipe = static_cast<PipeBuffer*>(kmalloc(sizeof(PipeBuffer)));
+    if (!pipe) return -ENOMEM;
+
+    // Zero-init
+    for (uint64_t i = 0; i < sizeof(PipeBuffer); i++)
+        reinterpret_cast<uint8_t*>(pipe)[i] = 0;
+    pipe->readers = 1;
+    pipe->writers = 1;
+
+    // Allocate read end (flags=0) and write end (flags=1)
+    int readFd = FdAlloc(proc, FdType::Pipe, pipe);
+    if (readFd < 0) { kfree(pipe); return -EMFILE; }
+    proc->fds[readFd].flags = 0;  // read end
+
+    int writeFd = FdAlloc(proc, FdType::Pipe, pipe);
+    if (writeFd < 0)
+    {
+        FdFree(proc, readFd);
+        kfree(pipe);
+        return -EMFILE;
+    }
+    proc->fds[writeFd].flags = 1;  // write end
+
+    pipefd[0] = readFd;
+    pipefd[1] = writeFd;
+
+    DbgPrintf("sys_pipe: fd[%d,%d] for pid %u\n", readFd, writeFd, proc->pid);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// sys_dup (32) / sys_dup2 (33)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_dup(uint64_t oldfd, uint64_t, uint64_t,
+                        uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+    FdEntry* old = FdGet(proc, static_cast<int>(oldfd));
+    if (!old) return -EBADF;
+
+    // Find lowest free fd
+    int newfd = FdAlloc(proc, old->type, old->handle);
+    if (newfd < 0) return -EMFILE;
+
+    proc->fds[newfd].flags = old->flags;
+    proc->fds[newfd].seekPos = old->seekPos;
+
+    // Bump pipe refcount
+    if (old->type == FdType::Pipe && old->handle)
+    {
+        auto* pipe = static_cast<PipeBuffer*>(old->handle);
+        if (old->flags & 1)
+            __atomic_fetch_add(&pipe->writers, 1, __ATOMIC_RELEASE);
+        else
+            __atomic_fetch_add(&pipe->readers, 1, __ATOMIC_RELEASE);
+    }
+
+    return newfd;
+}
+
+static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd, uint64_t,
+                         uint64_t, uint64_t, uint64_t)
+{
+    if (oldfd == newfd) return static_cast<int64_t>(newfd);
+
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+    FdEntry* old = FdGet(proc, static_cast<int>(oldfd));
+    if (!old) return -EBADF;
+
+    if (newfd >= MAX_FDS) return -EBADF;
+
+    // Close newfd if open
+    FdEntry* existing = FdGet(proc, static_cast<int>(newfd));
+    if (existing)
+        sys_close(newfd, 0, 0, 0, 0, 0);
+
+    // Copy the FD entry
+    proc->fds[newfd].type = old->type;
+    proc->fds[newfd].flags = old->flags;
+    proc->fds[newfd].handle = old->handle;
+    proc->fds[newfd].seekPos = old->seekPos;
+    proc->fds[newfd].refCount = 1;
+
+    // Bump pipe refcount
+    if (old->type == FdType::Pipe && old->handle)
+    {
+        auto* pipe = static_cast<PipeBuffer*>(old->handle);
+        if (old->flags & 1)
+            __atomic_fetch_add(&pipe->writers, 1, __ATOMIC_RELEASE);
+        else
+            __atomic_fetch_add(&pipe->readers, 1, __ATOMIC_RELEASE);
+    }
+
+    return static_cast<int64_t>(newfd);
 }
 
 // ---------------------------------------------------------------------------
@@ -1044,7 +1228,7 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
         return -ENOEXEC;
     }
 
-    DbgPrintf("sys_execve: loaded '%s' (%lu bytes) for pid %u\n",
+    SerialPrintf("sys_execve: loaded '%s' (%lu bytes) for pid %u\n",
               lookupPath, elfSize, proc->pid);
 
     // --- Replace the process image ---
@@ -1075,6 +1259,9 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
         ni++;
     }
     proc->name[ni] = '\0';
+
+    SerialPrintf("sys_execve: entering user mode for '%s' entry=0x%lx sp=0x%lx\n",
+                 proc->name, newEntry, newStackPtr);
 
     // --- Switch to new address space and enter user mode ---
     // Load the new page table
@@ -1645,6 +1832,13 @@ static int64_t sys_fcntl(uint64_t, uint64_t, uint64_t,
 static int64_t sys_not_implemented(uint64_t, uint64_t, uint64_t,
                                     uint64_t, uint64_t, uint64_t)
 {
+    // Log the syscall number from the saved register state
+    Process* proc = ProcessCurrent();
+    uint64_t syscallNum = 0;
+    // The syscall number is in RAX, which is available in the gs:env
+    __asm__ volatile("mov %%gs:120, %0" : "=r"(syscallNum));
+    SerialPrintf("UNIMPL: syscall %lu from pid %u ('%s')\n",
+                 syscallNum, proc ? proc->pid : 0, proc ? proc->name : "?");
     return -ENOSYS;
 }
 
@@ -1680,6 +1874,9 @@ void SyscallTableInit()
     g_syscallTable[SYS_SCHED_YIELD]     = sys_sched_yield;
     g_syscallTable[SYS_NANOSLEEP]       = sys_nanosleep;
     g_syscallTable[SYS_GETPID]          = sys_getpid;
+    g_syscallTable[SYS_PIPE]            = sys_pipe;
+    g_syscallTable[SYS_DUP]             = sys_dup;
+    g_syscallTable[SYS_DUP2]            = sys_dup2;
     g_syscallTable[SYS_CLONE]           = sys_clone;
     g_syscallTable[SYS_FORK]            = sys_fork;
     g_syscallTable[SYS_VFORK]           = sys_vfork;

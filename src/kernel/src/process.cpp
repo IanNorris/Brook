@@ -5,6 +5,7 @@
 #include "process.h"
 #include "scheduler.h"
 #include "vfs.h"
+#include "pipe.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "memory/heap.h"
@@ -679,11 +680,19 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     // This is acceptable for now — child gets independent seek positions.
     for (uint32_t i = 0; i < MAX_FDS; i++)
     {
-        if (parent->fds[i].type == FdType::Vnode && parent->fds[i].handle)
+        if (parent->fds[i].type != FdType::None)
         {
-            // Re-open the same file for the child to get independent state
-            // For now, just copy the fd entry (shares the Vnode pointer)
             child->fds[i] = parent->fds[i];
+
+            // Increment pipe reader/writer counts for the child's copy
+            if (parent->fds[i].type == FdType::Pipe && parent->fds[i].handle)
+            {
+                auto* pipe = static_cast<PipeBuffer*>(parent->fds[i].handle);
+                if (parent->fds[i].flags & 1)
+                    __atomic_fetch_add(&pipe->writers, 1, __ATOMIC_RELEASE);
+                else
+                    __atomic_fetch_add(&pipe->readers, 1, __ATOMIC_RELEASE);
+            }
         }
     }
 

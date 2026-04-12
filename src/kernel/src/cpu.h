@@ -69,6 +69,7 @@ struct KernelCpuEnv {
     uint64_t syscallUserR13;   // [gs:96]
     uint64_t syscallUserR14;   // [gs:104]
     uint64_t syscallUserR15;   // [gs:112]
+    uint64_t syscallNumber;    // [gs:120] — syscall number (RAX) saved by dispatcher
 };
 
 // Initialise SYSCALL/SYSRET MSRs.  Call after GdtInit().

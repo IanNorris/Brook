@@ -1,0 +1,2 @@
+# pipetest.rc — Boot script for testing pipe + dup2
+run /boot/BIN/PIPETEST

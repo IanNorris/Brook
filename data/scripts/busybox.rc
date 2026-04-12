@@ -1,0 +1,2 @@
+# busybox.rc — Boot script for testing busybox
+run /boot/BIN/BUSYBOX echo Hello from busybox!

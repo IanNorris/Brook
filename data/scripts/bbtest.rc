@@ -1,0 +1,2 @@
+# bbtest.rc — Boot script for busybox testing
+run /boot/BIN/BBTEST
