@@ -23,6 +23,9 @@ extern "C" brook::KernelSymbol __stop_ksymtab[];
 #include "keyboard.h"
 #include "input.h"
 #include "scheduler.h"
+#include "display.h"
+#include "tty.h"
+#include "compositor.h"
 
 // Bring all brook:: names into scope so EXPORT_SYMBOL(fn) resolves correctly.
 using namespace brook;
@@ -70,6 +73,18 @@ EXPORT_SYMBOL(PciFindDevice);
 EXPORT_SYMBOL(PciFindNextDevice);
 EXPORT_SYMBOL(PciEnumerate);
 EXPORT_SYMBOL(PciEnableBusMaster);
+EXPORT_SYMBOL(PciEnableMemSpace);
+
+// Display
+EXPORT_SYMBOL(DisplayRegister);
+
+// TTY
+EXPORT_SYMBOL(TtyGetFramebuffer);
+EXPORT_SYMBOL(TtyGetFramebufferPhys);
+EXPORT_SYMBOL(TtyRemap);
+
+// Compositor
+EXPORT_SYMBOL(CompositorRemap);
 
 // virtio-blk
 EXPORT_SYMBOL(VirtioBlkInitAll);

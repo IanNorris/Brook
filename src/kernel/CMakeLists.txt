@@ -147,6 +147,7 @@ add_executable(kernel
     src/process.cpp
     src/scheduler.cpp
     src/compositor.cpp
+    src/display.cpp
     src/clock_overlay.cpp
     src/shell.cpp
     src/boot_logo.cpp

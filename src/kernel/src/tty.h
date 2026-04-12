@@ -55,11 +55,17 @@ void TtySuppressDisplay(bool suppress);
 
 // Retrieve framebuffer info for direct rendering (e.g. QR panic screen).
 // Returns false if TTY is not initialised.
-bool TtyGetFramebuffer(uint32_t** outPixels, uint32_t* outWidth,
+extern "C" bool TtyGetFramebuffer(uint32_t** outPixels, uint32_t* outWidth,
                        uint32_t* outHeight, uint32_t* outStride);
 
 // Retrieve physical framebuffer info for user-mode mmap.
-bool TtyGetFramebufferPhys(uint64_t* outPhysBase, uint32_t* outWidth,
+extern "C" bool TtyGetFramebufferPhys(uint64_t* outPhysBase, uint32_t* outWidth,
                            uint32_t* outHeight, uint32_t* outStride);
+
+// Hot-swap the framebuffer to a new physical address and dimensions.
+// Called by PCI display drivers (e.g. bochs_display) when they take over.
+// stridePixels is the row stride in pixels (not bytes).
+extern "C" void TtyRemap(uint64_t newPhysBase, uint32_t w, uint32_t h,
+                          uint32_t stridePixels);
 
 } // namespace brook

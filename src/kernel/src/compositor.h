@@ -31,4 +31,10 @@ void CompositorStartThread();
 // Halt the compositor — called during panic to prevent overwriting the QR code.
 void CompositorHalt();
 
+// Hot-swap the physical framebuffer (called by display driver on mode change).
+// Must be called AFTER TtyRemap (uses TtyGetFramebuffer to get the new mapping).
+// stridePixels is the row stride in pixels (not bytes).
+extern "C" void CompositorRemap(uint64_t fbPhys, uint32_t w, uint32_t h,
+                                uint32_t stridePixels);
+
 } // namespace brook

@@ -514,4 +514,58 @@ bool TtyGetFramebufferPhys(uint64_t* outPhysBase, uint32_t* outWidth,
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// TtyRemap — hot-swap the framebuffer (e.g. when a PCI display driver loads)
+// ---------------------------------------------------------------------------
+
+void TtyRemap(uint64_t newPhysBase, uint32_t w, uint32_t h, uint32_t stridePixels)
+{
+    uint64_t fbBytes = static_cast<uint64_t>(stridePixels) * 4 * h;
+    uint64_t fbPages = (fbBytes + 4095u) / 4096u;
+
+    // Allocate virtual address range for the new framebuffer.
+    uint64_t fbVirt = VmmAllocPages(fbPages, VMM_WRITABLE, MemTag::Device, KernelPid).raw();
+    if (fbVirt == 0) {
+        SerialPuts("TTY: TtyRemap VmmAllocPages failed\n");
+        return;
+    }
+
+    // Replace backing pages with framebuffer physical pages.
+    for (uint64_t i = 0; i < fbPages; i++) {
+        VirtualAddress virt(fbVirt + i * 4096u);
+        PhysicalAddress oldPhys = VmmVirtToPhys(KernelPageTable, virt);
+        VmmUnmapPage(KernelPageTable, virt);
+        if (oldPhys) PmmFreePage(oldPhys);
+
+        if (!VmmMapPage(KernelPageTable, virt, PhysicalAddress(newPhysBase + i * 4096u),
+                        VMM_WRITABLE | VMM_NO_EXEC,
+                        MemTag::Device, KernelPid))
+        {
+            SerialPrintf("TTY: TtyRemap VmmMapPage failed at page %lu\n", i);
+            return;
+        }
+    }
+
+    // Update TTY state atomically (no lock needed — caller ensures serialisation).
+    g_fbPixels   = reinterpret_cast<volatile uint32_t*>(fbVirt);
+    g_fbPhysBase = newPhysBase;
+    g_fbWidth    = w;
+    g_fbHeight   = h;
+    g_fbStride   = stridePixels;
+
+    // Reset cursor and region.
+    g_curX = 0;
+    g_curY = 0;
+    g_regionX = g_regionY = g_regionW = g_regionH = 0;
+    RecalcRegion();
+
+    // Clear to background colour.
+    for (uint32_t y2 = 0; y2 < h; y2++)
+        for (uint32_t x2 = 0; x2 < w; x2++)
+            g_fbPixels[y2 * stridePixels + x2] = g_bgColor;
+
+    SerialPrintf("TTY: remapped to %ux%u at phys 0x%lx, virt 0x%lx\n",
+                 w, h, newPhysBase, fbVirt);
+}
+
 } // namespace brook

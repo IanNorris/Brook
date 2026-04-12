@@ -1,0 +1,11 @@
+# Brook OS boot script — display driver test
+# Tests bochs_display module with mode switching
+
+# Show initial display info
+display
+
+# Try switching to 800x600
+display 800x600
+
+# Show updated info
+display

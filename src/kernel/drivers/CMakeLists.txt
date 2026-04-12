@@ -13,3 +13,7 @@ add_driver_module(sched_mlfq
     "${BROOK_ROOT}/src/drivers/sched_mlfq/sched_mlfq_mod.cpp"
     "${BROOK_ROOT}/src/modules/sched_mlfq.cpp"
 )
+
+add_driver_module(bochs_display
+    "${BROOK_ROOT}/src/drivers/bochs_display/bochs_display_mod.cpp"
+)

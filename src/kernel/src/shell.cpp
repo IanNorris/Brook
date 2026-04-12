@@ -14,6 +14,7 @@
 #include "scheduler.h"
 #include "compositor.h"
 #include "tty.h"
+#include "display.h"
 #include "font_atlas.h"
 #include "kprintf.h"
 #include "keyboard.h"
@@ -618,6 +619,35 @@ static int ExecCommand(int argc, const char* const* argv)
         return 0;
     }
 
+    // Built-in: display [WxH] — show or change display mode
+    if (StrEq(cmd, "display") || StrEq(cmd, "mode"))
+    {
+        if (argc < 2)
+        {
+            DisplayMode dm;
+            DisplayGetMode(&dm);
+            const DisplayOps* active = DisplayGetActive();
+            KPrintf("Display: %s, %ux%u @ %ubpp, stride=%u\n",
+                    active->name, dm.width, dm.height, dm.bpp, dm.stride);
+            return 0;
+        }
+        // Parse WxH
+        uint32_t w = 0, h = 0;
+        const char* p = argv[1];
+        while (*p >= '0' && *p <= '9') w = w * 10 + (*p++ - '0');
+        if (*p == 'x' || *p == 'X') p++;
+        while (*p >= '0' && *p <= '9') h = h * 10 + (*p++ - '0');
+        if (w == 0 || h == 0) {
+            KPrintf("Usage: display <width>x<height>  (e.g. display 1280x720)\n");
+            return -1;
+        }
+        if (DisplaySetMode(w, h))
+            KPrintf("Display mode set to %ux%u\n", w, h);
+        else
+            KPrintf("Failed to set display mode %ux%u\n", w, h);
+        return 0;
+    }
+
     // Try as a program name (implicit run)
     char resolved[128];
     if (ResolveBinaryPath(cmd, resolved, sizeof(resolved)))
@@ -655,6 +685,7 @@ static void CmdHelp()
     KPrintf("  modunload <name>   Unload a kernel module\n");
     KPrintf("  modlist            List loaded modules\n");
     KPrintf("  sched [policy]     Show/switch scheduler policy\n");
+    KPrintf("  display [WxH]      Show/change display mode\n");
     KPrintf("  help               Show this help\n");
 }
 

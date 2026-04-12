@@ -274,4 +274,22 @@ void CompositorHalt()
     g_compositorHalted = true;
 }
 
+void CompositorRemap(uint64_t fbPhys, uint32_t w, uint32_t h, uint32_t stridePixels)
+{
+    // The TTY has already mapped the new framebuffer. Get its virtual pointer.
+    uint32_t* pixels;
+    uint32_t tw, th, tStride;
+    if (!TtyGetFramebuffer(&pixels, &tw, &th, &tStride)) {
+        SerialPuts("COMPOSITOR: CompositorRemap — TtyGetFramebuffer failed\n");
+        return;
+    }
+
+    g_physFb       = reinterpret_cast<volatile uint32_t*>(pixels);
+    g_physFbWidth  = w;
+    g_physFbHeight = h;
+    g_physFbStride = stridePixels;
+
+    SerialPrintf("COMPOSITOR: remapped to %ux%u stride=%u\n", w, h, stridePixels);
+}
+
 } // namespace brook
