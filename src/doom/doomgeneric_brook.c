@@ -235,7 +235,7 @@ void DG_DrawFrame()
         int len = snprintf(buf, sizeof(buf),
             "BENCH: %d frames in %ld ms (wall), %ld fps avg\n",
             s_FrameCount, elapsed, fps);
-        write(STDERR_FILENO, buf, len);
+        write(3, buf, len);  // fd 3 = debug serial (immediate, bypasses ring buffer)
         exit(0);
     }
 }

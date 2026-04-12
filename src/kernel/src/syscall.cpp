@@ -115,6 +115,16 @@ static constexpr int64_t ENOSYS  = 38;
 static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
                           uint64_t, uint64_t, uint64_t)
 {
+    // fd 3 = debug serial — writes directly, bypassing the async ring buffer.
+    // Use for diagnostics that must appear immediately (e.g. benchmark results).
+    if (fd == 3)
+    {
+        const char* buf = reinterpret_cast<const char*>(bufAddr);
+        for (uint64_t i = 0; i < count; i++)
+            brook::SerialPutChar(buf[i]);
+        return static_cast<int64_t>(count);
+    }
+
     if (fd == 1 || fd == 2)
     {
         const char* buf = reinterpret_cast<const char*>(bufAddr);
