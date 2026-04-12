@@ -58,8 +58,35 @@ static constexpr uint64_t SYS_CLOCK_NANOSLEEP = 230;
 static constexpr uint64_t SYS_EXIT_GROUP      = 231;
 static constexpr uint64_t SYS_OPENAT          = 257;
 static constexpr uint64_t SYS_NEWFSTATAT      = 262;
+static constexpr uint64_t SYS_READLINKAT      = 267;
+static constexpr uint64_t SYS_PPOLL           = 271;
+static constexpr uint64_t SYS_PIPE2           = 293;
 static constexpr uint64_t SYS_PRLIMIT64       = 302;
 static constexpr uint64_t SYS_GETRANDOM       = 318;
+
+// Additional syscalls
+static constexpr uint64_t SYS_POLL            = 7;
+static constexpr uint64_t SYS_RT_SIGRETURN    = 15;
+static constexpr uint64_t SYS_SELECT          = 23;
+static constexpr uint64_t SYS_SENDFILE        = 40;
+static constexpr uint64_t SYS_KILL            = 62;
+static constexpr uint64_t SYS_CHDIR           = 80;
+static constexpr uint64_t SYS_FCHDIR          = 81;
+static constexpr uint64_t SYS_READLINK        = 89;
+static constexpr uint64_t SYS_UMASK           = 95;
+static constexpr uint64_t SYS_GETRLIMIT       = 97;
+static constexpr uint64_t SYS_GETRUSAGE       = 98;
+static constexpr uint64_t SYS_SYSINFO         = 99;
+static constexpr uint64_t SYS_SETPGID         = 109;
+static constexpr uint64_t SYS_GETPGRP         = 111;
+static constexpr uint64_t SYS_GETPGID         = 121;
+static constexpr uint64_t SYS_GETSID          = 124;
+static constexpr uint64_t SYS_SIGALTSTACK     = 131;
+static constexpr uint64_t SYS_STATFS          = 137;
+static constexpr uint64_t SYS_FSTATFS         = 138;
+static constexpr uint64_t SYS_GETTID          = 186;
+static constexpr uint64_t SYS_TKILL           = 200;
+static constexpr uint64_t SYS_TGKILL          = 234;
 
 // Syscall function type -- same signature as Linux: returns int64_t,
 // up to 6 arguments via rdi, rsi, rdx, r10->rcx, r8, r9.

@@ -1826,6 +1826,446 @@ static int64_t sys_fcntl(uint64_t, uint64_t, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
+// sys_poll (7) — basic poll implementation
+// ---------------------------------------------------------------------------
+
+struct pollfd {
+    int   fd;
+    short events;
+    short revents;
+};
+
+static constexpr short POLLIN  = 0x0001;
+static constexpr short POLLOUT = 0x0004;
+static constexpr short POLLERR = 0x0008;
+static constexpr short POLLHUP = 0x0010;
+static constexpr short POLLNVAL = 0x0020;
+
+static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
+                         uint64_t, uint64_t, uint64_t)
+{
+    if (nfds == 0) return 0;
+    auto* fds = reinterpret_cast<pollfd*>(fdsAddr);
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EFAULT;
+
+    int ready = 0;
+    for (uint64_t i = 0; i < nfds; i++)
+    {
+        fds[i].revents = 0;
+        if (fds[i].fd < 0) continue;
+
+        FdEntry* fde = FdGet(proc, fds[i].fd);
+        if (!fde || fde->type == FdType::None)
+        {
+            fds[i].revents = POLLNVAL;
+            ready++;
+            continue;
+        }
+
+        // Pipes: check readability/writability
+        if (fde->type == FdType::Pipe && fde->handle)
+        {
+            auto* pb = static_cast<PipeBuffer*>(fde->handle);
+            bool isWrite = (fde->flags & 1);
+            if (!isWrite && (fds[i].events & POLLIN))
+            {
+                if (pb->count() > 0 || pb->writers == 0)
+                {
+                    fds[i].revents |= (pb->count() > 0) ? POLLIN : POLLHUP;
+                    ready++;
+                }
+            }
+            if (isWrite && (fds[i].events & POLLOUT))
+            {
+                if (pb->count() < PIPE_BUF_SIZE || pb->readers == 0)
+                {
+                    fds[i].revents |= (pb->readers > 0) ? POLLOUT : POLLERR;
+                    ready++;
+                }
+            }
+            continue;
+        }
+
+        // Regular files are always ready
+        if (fde->type == FdType::Vnode)
+        {
+            if (fds[i].events & POLLIN)  fds[i].revents |= POLLIN;
+            if (fds[i].events & POLLOUT) fds[i].revents |= POLLOUT;
+            if (fds[i].revents) ready++;
+            continue;
+        }
+
+        // Keyboard device: check if input available
+        if (fde->type == FdType::DevKeyboard)
+        {
+            if (fds[i].events & POLLIN)
+            {
+                if (InputHasEvents())
+                {
+                    fds[i].revents |= POLLIN;
+                    ready++;
+                }
+            }
+            continue;
+        }
+
+        // Default: assume ready for whatever was asked
+        fds[i].revents = fds[i].events;
+        ready++;
+    }
+
+    // If nothing ready and timeout > 0, yield once and re-check
+    if (ready == 0 && timeout_ms != 0)
+    {
+        SchedulerYield();
+        // Re-scan after yield (simple single-retry, not full blocking)
+        for (uint64_t i = 0; i < nfds; i++)
+        {
+            fds[i].revents = 0;
+            if (fds[i].fd < 0) continue;
+            FdEntry* fde = FdGet(proc, fds[i].fd);
+            if (!fde || fde->type == FdType::None) { fds[i].revents = POLLNVAL; ready++; continue; }
+            if (fde->type == FdType::Pipe && fde->handle)
+            {
+                auto* pb = static_cast<PipeBuffer*>(fde->handle);
+                bool isWrite = (fde->flags & 1);
+                if (!isWrite && (fds[i].events & POLLIN) && (pb->count() > 0 || pb->writers == 0))
+                { fds[i].revents |= (pb->count() > 0) ? POLLIN : POLLHUP; ready++; }
+                if (isWrite && (fds[i].events & POLLOUT) && (pb->count() < PIPE_BUF_SIZE || pb->readers == 0))
+                { fds[i].revents |= (pb->readers > 0) ? POLLOUT : POLLERR; ready++; }
+                continue;
+            }
+            if (fde->type == FdType::Vnode)
+            {
+                if (fds[i].events & POLLIN)  fds[i].revents |= POLLIN;
+                if (fds[i].events & POLLOUT) fds[i].revents |= POLLOUT;
+                if (fds[i].revents) ready++;
+                continue;
+            }
+            if (fde->type == FdType::DevKeyboard && (fds[i].events & POLLIN) && InputHasEvents())
+            { fds[i].revents |= POLLIN; ready++; continue; }
+            fds[i].revents = fds[i].events; ready++;
+        }
+    }
+
+    return ready;
+}
+
+// sys_ppoll (271) — redirects to poll
+static int64_t sys_ppoll(uint64_t fdsAddr, uint64_t nfds, uint64_t tspecAddr,
+                          uint64_t, uint64_t, uint64_t)
+{
+    int timeout_ms = -1;
+    if (tspecAddr)
+    {
+        auto* ts = reinterpret_cast<const uint64_t*>(tspecAddr);
+        timeout_ms = static_cast<int>(ts[0] * 1000 + ts[1] / 1000000);
+    }
+    return sys_poll(fdsAddr, nfds, static_cast<uint64_t>(timeout_ms), 0, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// sys_readlink (89) / sys_readlinkat (267)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_readlink(uint64_t pathAddr, uint64_t bufAddr, uint64_t bufsiz,
+                             uint64_t, uint64_t, uint64_t)
+{
+    auto* path = reinterpret_cast<const char*>(pathAddr);
+    auto* buf  = reinterpret_cast<char*>(bufAddr);
+
+    // /proc/self/exe → return the process's executable path
+    auto streq = [](const char* a, const char* b) {
+        while (*a && *a == *b) { a++; b++; }
+        return *a == *b;
+    };
+    if (streq(path, "/proc/self/exe"))
+    {
+        const char* exe = "/boot/BIN/UNKNOWN";
+        Process* proc = ProcessCurrent();
+        if (proc && proc->name[0])
+        {
+            // Build "/boot/BIN/<NAME>" from process name
+            static __thread char exePath[128];
+            int len = 0;
+            const char* prefix = "/boot/BIN/";
+            for (int i = 0; prefix[i]; i++) exePath[len++] = prefix[i];
+            for (int i = 0; proc->name[i] && len < 120; i++) exePath[len++] = proc->name[i];
+            exePath[len] = '\0';
+            exe = exePath;
+        }
+        uint64_t slen = 0;
+        while (exe[slen]) slen++;
+        if (slen > bufsiz) slen = bufsiz;
+        __builtin_memcpy(buf, exe, slen);
+        return static_cast<int64_t>(slen);
+    }
+
+    return -EINVAL; // no symlinks in our FS
+}
+
+static int64_t sys_readlinkat(uint64_t dirfd, uint64_t pathAddr, uint64_t bufAddr,
+                               uint64_t bufsiz, uint64_t, uint64_t)
+{
+    (void)dirfd;
+    return sys_readlink(pathAddr, bufAddr, bufsiz, 0, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// sys_pipe2 (293) — like pipe() but with flags
+// ---------------------------------------------------------------------------
+
+static int64_t sys_pipe2(uint64_t pipefdAddr, uint64_t flags, uint64_t,
+                          uint64_t, uint64_t, uint64_t)
+{
+    (void)flags; // O_CLOEXEC etc. — ignore for now
+    return sys_pipe(pipefdAddr, 0, 0, 0, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// sys_sendfile (40) — stub: copies between fds in kernel
+// ---------------------------------------------------------------------------
+
+static int64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd, uint64_t offsetAddr,
+                             uint64_t count, uint64_t, uint64_t)
+{
+    (void)offsetAddr;
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+    FdEntry* in_fde = FdGet(proc, static_cast<int>(in_fd));
+    FdEntry* out_fde = FdGet(proc, static_cast<int>(out_fd));
+    if (!in_fde || !out_fde) return -EBADF;
+
+    // Simple implementation: read from in_fd, write to out_fd via syscalls
+    // For now, just return 0 (no bytes transferred) — apps will fallback to read+write
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// sys_getrusage (98) — stub
+// ---------------------------------------------------------------------------
+
+static int64_t sys_getrusage(uint64_t who, uint64_t usageAddr, uint64_t,
+                              uint64_t, uint64_t, uint64_t)
+{
+    (void)who;
+    if (!usageAddr) return -EFAULT;
+    __builtin_memset(reinterpret_cast<void*>(usageAddr), 0, 144); // sizeof(struct rusage)
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// sys_sysinfo (99) — basic system info
+// ---------------------------------------------------------------------------
+
+static int64_t sys_sysinfo(uint64_t infoAddr, uint64_t, uint64_t,
+                            uint64_t, uint64_t, uint64_t)
+{
+    if (!infoAddr) return -EFAULT;
+    struct sysinfo_s {
+        int64_t  uptime;
+        uint64_t loads[3];
+        uint64_t totalram;
+        uint64_t freeram;
+        uint64_t sharedram;
+        uint64_t bufferram;
+        uint64_t totalswap;
+        uint64_t freeswap;
+        uint16_t procs;
+        uint16_t pad;
+        uint32_t pad2;
+        uint64_t totalhigh;
+        uint64_t freehigh;
+        uint32_t mem_unit;
+    };
+    auto* info = reinterpret_cast<sysinfo_s*>(infoAddr);
+    __builtin_memset(info, 0, sizeof(sysinfo_s));
+    info->uptime = 60; // placeholder
+    info->totalram = 6ULL * 1024 * 1024 * 1024;
+    info->freeram  = 4ULL * 1024 * 1024 * 1024;
+    info->procs = 32;
+    info->mem_unit = 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// sys_umask (95) — stub, always returns 022
+// ---------------------------------------------------------------------------
+
+static int64_t sys_umask(uint64_t, uint64_t, uint64_t,
+                          uint64_t, uint64_t, uint64_t)
+{
+    return 022;
+}
+
+// ---------------------------------------------------------------------------
+// sys_chdir (80) / sys_fchdir (81) — stub
+// ---------------------------------------------------------------------------
+
+static int64_t sys_chdir(uint64_t, uint64_t, uint64_t,
+                          uint64_t, uint64_t, uint64_t)
+{
+    return 0; // pretend success — we only have root dir
+}
+
+static int64_t sys_fchdir(uint64_t, uint64_t, uint64_t,
+                           uint64_t, uint64_t, uint64_t)
+{
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// sys_sigaltstack (131) — stub
+// ---------------------------------------------------------------------------
+
+static int64_t sys_sigaltstack(uint64_t, uint64_t, uint64_t,
+                                uint64_t, uint64_t, uint64_t)
+{
+    return 0; // pretend success
+}
+
+// ---------------------------------------------------------------------------
+// sys_rt_sigreturn (15) — stub
+// ---------------------------------------------------------------------------
+
+static int64_t sys_rt_sigreturn(uint64_t, uint64_t, uint64_t,
+                                 uint64_t, uint64_t, uint64_t)
+{
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// sys_getpgrp (111) / sys_getpgid (121) / sys_setpgid (109) / sys_getsid (124)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_getpgrp(uint64_t, uint64_t, uint64_t,
+                            uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    return proc ? proc->pid : 1;
+}
+
+static int64_t sys_getpgid(uint64_t, uint64_t, uint64_t,
+                            uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    return proc ? proc->pid : 1;
+}
+
+static int64_t sys_setpgid(uint64_t, uint64_t, uint64_t,
+                            uint64_t, uint64_t, uint64_t)
+{
+    return 0; // pretend success
+}
+
+static int64_t sys_getsid(uint64_t, uint64_t, uint64_t,
+                           uint64_t, uint64_t, uint64_t)
+{
+    return 1; // session 1
+}
+
+// ---------------------------------------------------------------------------
+// sys_gettid (186) / sys_tgkill (234) / sys_tkill (200)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_gettid(uint64_t, uint64_t, uint64_t,
+                           uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    return proc ? proc->pid : 1;
+}
+
+static int64_t sys_tgkill(uint64_t, uint64_t, uint64_t,
+                           uint64_t, uint64_t, uint64_t)
+{
+    return 0; // ignore signals for now
+}
+
+static int64_t sys_tkill(uint64_t, uint64_t, uint64_t,
+                          uint64_t, uint64_t, uint64_t)
+{
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// sys_kill (62) — stub
+// ---------------------------------------------------------------------------
+
+static int64_t sys_kill(uint64_t, uint64_t, uint64_t,
+                         uint64_t, uint64_t, uint64_t)
+{
+    return 0; // ignore
+}
+
+// ---------------------------------------------------------------------------
+// sys_getrlimit (97) — stub
+// ---------------------------------------------------------------------------
+
+static int64_t sys_getrlimit(uint64_t resource, uint64_t rlimAddr, uint64_t,
+                              uint64_t, uint64_t, uint64_t)
+{
+    (void)resource;
+    if (!rlimAddr) return -EFAULT;
+    auto* rlim = reinterpret_cast<uint64_t*>(rlimAddr);
+    rlim[0] = 0x7FFFFFFFFFFFFFFFULL; // rlim_cur = unlimited
+    rlim[1] = 0x7FFFFFFFFFFFFFFFULL; // rlim_max = unlimited
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// sys_statfs (137) / sys_fstatfs (138) — stub
+// ---------------------------------------------------------------------------
+
+static int64_t sys_statfs(uint64_t, uint64_t bufAddr, uint64_t,
+                           uint64_t, uint64_t, uint64_t)
+{
+    if (!bufAddr) return -EFAULT;
+    __builtin_memset(reinterpret_cast<void*>(bufAddr), 0, 120); // sizeof(struct statfs)
+    return 0;
+}
+
+static int64_t sys_fstatfs(uint64_t, uint64_t bufAddr, uint64_t,
+                            uint64_t, uint64_t, uint64_t)
+{
+    return sys_statfs(0, bufAddr, 0, 0, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// sys_select (23) — minimal implementation
+// ---------------------------------------------------------------------------
+
+static int64_t sys_select(uint64_t nfds, uint64_t readfdsAddr, uint64_t writefdsAddr,
+                           uint64_t exceptfdsAddr, uint64_t timeoutAddr, uint64_t)
+{
+    (void)exceptfdsAddr;
+    (void)timeoutAddr;
+
+    // For simplicity, report all FDs as ready
+    // This is sufficient for many programs that just use select as a timeout
+    int ready = 0;
+    if (readfdsAddr)
+    {
+        auto* rfds = reinterpret_cast<uint64_t*>(readfdsAddr);
+        for (uint64_t fd = 0; fd < nfds && fd < 64; fd++)
+        {
+            if (rfds[fd / 64] & (1ULL << (fd % 64)))
+                ready++;
+        }
+    }
+    if (writefdsAddr)
+    {
+        auto* wfds = reinterpret_cast<uint64_t*>(writefdsAddr);
+        for (uint64_t fd = 0; fd < nfds && fd < 64; fd++)
+        {
+            if (wfds[fd / 64] & (1ULL << (fd % 64)))
+                ready++;
+        }
+    }
+    return ready ? ready : 1; // at least 1 to avoid blocking
+}
+
+// ---------------------------------------------------------------------------
 // sys_not_implemented
 // ---------------------------------------------------------------------------
 
@@ -1904,6 +2344,33 @@ void SyscallTableInit()
     g_syscallTable[SYS_NEWFSTATAT]      = sys_newfstatat;
     g_syscallTable[SYS_PRLIMIT64]       = sys_prlimit64;
     g_syscallTable[SYS_GETRANDOM]       = sys_getrandom;
+
+    // New syscalls
+    g_syscallTable[SYS_POLL]            = sys_poll;
+    g_syscallTable[SYS_RT_SIGRETURN]    = sys_rt_sigreturn;
+    g_syscallTable[SYS_SELECT]          = sys_select;
+    g_syscallTable[SYS_SENDFILE]        = sys_sendfile;
+    g_syscallTable[SYS_KILL]            = sys_kill;
+    g_syscallTable[SYS_CHDIR]           = sys_chdir;
+    g_syscallTable[SYS_FCHDIR]          = sys_fchdir;
+    g_syscallTable[SYS_READLINK]        = sys_readlink;
+    g_syscallTable[SYS_UMASK]           = sys_umask;
+    g_syscallTable[SYS_GETRLIMIT]       = sys_getrlimit;
+    g_syscallTable[SYS_GETRUSAGE]       = sys_getrusage;
+    g_syscallTable[SYS_SYSINFO]         = sys_sysinfo;
+    g_syscallTable[SYS_SETPGID]         = sys_setpgid;
+    g_syscallTable[SYS_GETPGRP]         = sys_getpgrp;
+    g_syscallTable[SYS_GETPGID]         = sys_getpgid;
+    g_syscallTable[SYS_GETSID]          = sys_getsid;
+    g_syscallTable[SYS_SIGALTSTACK]     = sys_sigaltstack;
+    g_syscallTable[SYS_STATFS]          = sys_statfs;
+    g_syscallTable[SYS_FSTATFS]         = sys_fstatfs;
+    g_syscallTable[SYS_GETTID]          = sys_gettid;
+    g_syscallTable[SYS_TKILL]           = sys_tkill;
+    g_syscallTable[SYS_TGKILL]          = sys_tgkill;
+    g_syscallTable[SYS_READLINKAT]      = sys_readlinkat;
+    g_syscallTable[SYS_PPOLL]           = sys_ppoll;
+    g_syscallTable[SYS_PIPE2]           = sys_pipe2;
 
     uint32_t count = 0;
     for (uint64_t i = 0; i < SYSCALL_MAX; ++i)
