@@ -199,10 +199,20 @@ static void CompositorLoop()
     for (uint32_t i = 0; i < g_compositedCount; ++i)
     {
         Process* p = g_compositedProcs[i];
-        if (!p || p->state == ProcessState::Terminated)
-            continue;
+        if (!p) continue;
         if (!p->fbVirtual || p->fbVfbWidth == 0)
             continue;
+
+        // Blit terminated processes one final time (exit status color fill),
+        // then remove them from the composited list.
+        if (p->state == ProcessState::Terminated)
+        {
+            if (p->fbDirty)
+                BlitProcess(p, true);
+            g_compositedProcs[i] = nullptr;
+            continue;
+        }
+
         BlitProcess(p, forceAll);
     }
 }
