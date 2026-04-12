@@ -28,10 +28,9 @@ static Process* g_writerProc = nullptr;
 
 static void SerialWriterThreadFn(void* /*arg*/)
 {
-    char batch[64];  // Small batches to avoid holding the serial lock too long
+    char batch[16];  // Small batches — serial lock is held with cli for entire batch
 
     for (;;) {
-        // Drain one batch per wake cycle, then yield.
         uint32_t n = g_serialBuf.read(batch, sizeof(batch));
 
         if (n > 0) {

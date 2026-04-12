@@ -2599,13 +2599,18 @@ static int64_t sys_select(uint64_t nfds, uint64_t readfdsAddr, uint64_t writefds
 static int64_t sys_not_implemented(uint64_t, uint64_t, uint64_t,
                                     uint64_t, uint64_t, uint64_t)
 {
-    // Log the syscall number from the saved register state
+    // Rate-limit: log first 8 per-syscall, then every 256th, to avoid
+    // serial lock contention when many processes hit unimplemented syscalls.
+    static volatile uint32_t s_unimplCount = 0;
+    uint32_t n = __atomic_fetch_add(&s_unimplCount, 1, __ATOMIC_RELAXED);
+
     Process* proc = ProcessCurrent();
     uint64_t syscallNum = 0;
-    // The syscall number is in RAX, which is available in the gs:env
     __asm__ volatile("mov %%gs:120, %0" : "=r"(syscallNum));
-    SerialPrintf("UNIMPL: syscall %lu from pid %u ('%s')\n",
-                 syscallNum, proc ? proc->pid : 0, proc ? proc->name : "?");
+
+    if (n < 8 || (n & 0xFF) == 0)
+        SerialPrintf("UNIMPL: syscall %lu from pid %u ('%s') [#%u]\n",
+                     syscallNum, proc ? proc->pid : 0, proc ? proc->name : "?", n);
     return -ENOSYS;
 }
 

@@ -90,10 +90,12 @@ static void MouseIrqHandler(InterruptFrame* frame)
 {
     (void)frame;
 
+    // On IOAPIC-based systems, the status register may already be clear
+    // by the time we read it. Since IRQ12 only fires for mouse data,
+    // just read the data byte directly. If OBF isn't set, send EOI and
+    // return (spurious interrupt).
     uint8_t status = inb(0x64);
-
-    // Bit 0: output buffer full, Bit 5: auxiliary data (mouse, not keyboard)
-    if (!(status & 0x01) || !(status & 0x20))
+    if (!(status & 0x01))
     {
         ApicSendEoi();
         return;
@@ -101,9 +103,19 @@ static void MouseIrqHandler(InterruptFrame* frame)
 
     uint8_t data = inb(0x60);
 
-    // Synchronise to packet boundary: byte 0 always has bit 3 set.
+    // Track IRQ count for diagnostics
+    static volatile uint32_t s_irqCount = 0;
+    uint32_t count = ++s_irqCount;
+    if (count <= 3 || (count & 0xFF) == 0)
+    {
+        SerialPrintf("MOUSE IRQ: #%u status=0x%02x data=0x%02x idx=%u\n",
+                     count, status, data, g_packetIdx);
+    }
+
+    // Synchronise to packet boundary: status byte (byte 0) always has bit 3 set.
     if (g_packetIdx == 0 && !(data & 0x08))
     {
+        // Out of sync — discard and wait for a valid status byte
         ApicSendEoi();
         return;
     }

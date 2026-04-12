@@ -71,7 +71,7 @@ void SerialInit()
     outb(COM1_DATA, 0x01);  // Divisor low byte (115200 baud)
     outb(COM1_IER,  0x00);  // Divisor high byte
     outb(COM1_LCR, 0x03);   // Clear DLAB; 8N1
-    outb(COM1_FCR, 0x00);   // Disable FIFO
+    outb(COM1_FCR, 0xC7);   // Enable FIFO, 14-byte trigger, clear TX/RX
     outb(COM1_MCR, 0x03);   // DTR + RTS
 }
 
