@@ -19,3 +19,10 @@ void SerialLock();
 void SerialUnlock();
 
 } // namespace brook
+
+// Debug-only logging — compiles to nothing in Release builds.
+#ifdef NDEBUG
+#define DbgPrintf(...) ((void)0)
+#else
+#define DbgPrintf(...) brook::SerialPrintf(__VA_ARGS__)
+#endif

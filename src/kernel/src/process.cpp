@@ -371,7 +371,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
         }
     }
 
-    SerialPrintf("PROC: created pid=%u, entry=0x%lx, stack=0x%lx, brk=0x%lx, cr3=0x%lx\n",
+    DbgPrintf("PROC: created pid=%u, entry=0x%lx, stack=0x%lx, brk=0x%lx, cr3=0x%lx\n",
                  proc->pid, proc->elf.entryPoint, proc->stackTop,
                  proc->programBreak, proc->pageTable.pml4.raw());
 
@@ -425,7 +425,7 @@ Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
     for (uint32_t i = 0; i < 31 && name[i]; ++i)
         proc->name[i] = name[i];
 
-    SerialPrintf("KTHREAD: created '%s' pid=%u, stack=0x%lx\n",
+    DbgPrintf("KTHREAD: created '%s' pid=%u, stack=0x%lx\n",
                  proc->name, proc->pid, proc->kernelStackTop);
 
     return proc;

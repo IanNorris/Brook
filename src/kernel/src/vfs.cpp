@@ -207,7 +207,7 @@ static CachedFile* CacheFileUnlocked(FIL* fil, const char* fatPath)
         off += br;
         remaining -= br;
     }
-    SerialPrintf("VFS: cached file (%lu bytes, %lu pages)\n",
+    DbgPrintf("VFS: cached file (%lu bytes, %lu pages)\n",
                  (unsigned long)size, (unsigned long)numPages);
     return cf;
 }
@@ -323,7 +323,7 @@ static int FatDirReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
     if (res != FR_OK) { SerialPrintf("VFS: readdir failed (res=%u)\n", static_cast<unsigned>(res)); return -1; }
     if (fno.fname[0] == '\0') return 0; // end of directory
 
-    SerialPrintf("VFS: readdir entry: '%s' (%s, %lu bytes)\n",
+    DbgPrintf("VFS: readdir entry: '%s' (%s, %lu bytes)\n",
                  fno.fname, (fno.fattrib & AM_DIR) ? "dir" : "file",
                  static_cast<unsigned long>(fno.fsize));
     StrCopy(out->name, fno.fname, sizeof(out->name));
@@ -437,10 +437,10 @@ bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
     // Diagnostic: show physical page backing the FATFS.win buffer
     uint64_t winVirt = reinterpret_cast<uint64_t>(&fs->win[0]);
     uint64_t winPhys = VmmVirtToPhys(KernelPageTable, VirtualAddress(winVirt)).raw();
-    SerialPrintf("VFS: FATFS.win virt=0x%lx phys=0x%lx (sizeof FATFS=%lu)\n",
+    DbgPrintf("VFS: FATFS.win virt=0x%lx phys=0x%lx (sizeof FATFS=%lu)\n",
                  winVirt, winPhys, static_cast<unsigned long>(sizeof(FATFS)));
 
-    SerialPrintf("VFS: mounted fatfs drive %u at '%s'\n", pdrv, mountPoint);
+    DbgPrintf("VFS: mounted fatfs drive %u at '%s'\n", pdrv, mountPoint);
     return true;
 }
 
@@ -492,7 +492,7 @@ Vnode* VfsOpen(const char* path, int flags)
     if (flags & VFS_O_WRITE)  mode |= FA_WRITE;
     if (flags & VFS_O_CREATE) mode |= (flags & VFS_O_TRUNC) ? FA_CREATE_ALWAYS : FA_OPEN_ALWAYS;
     if (flags & VFS_O_TRUNC)  mode |= FA_CREATE_ALWAYS;
-    SerialPrintf("VFS: f_open('%s', mode=0x%x)\n", fatPath, mode);
+    DbgPrintf("VFS: f_open('%s', mode=0x%x)\n", fatPath, mode);
 
     // Check shared cache first (read-only opens only).
     if (!(flags & VFS_O_WRITE)) {
@@ -513,7 +513,7 @@ Vnode* VfsOpen(const char* path, int flags)
             vn->ops  = &g_cachedFileOps;
             vn->type = VnodeType::File;
             vn->priv = existing;
-            SerialPrintf("VFS: sharing cached '%s' (refCount=%d)\n",
+            DbgPrintf("VFS: sharing cached '%s' (refCount=%d)\n",
                          fatPath, existing->refCount);
             return vn;
         }
@@ -525,7 +525,7 @@ Vnode* VfsOpen(const char* path, int flags)
     if (res != FR_OK)
     {
         KMutexUnlock(&g_vfsLock);
-        SerialPrintf("VFS: f_open('%s') result: %d\n", fatPath, (int)res);
+        DbgPrintf("VFS: f_open('%s') result: %d\n", fatPath, (int)res);
     }
     if (res == FR_OK)
     {
@@ -572,7 +572,7 @@ Vnode* VfsOpen(const char* path, int flags)
         return vn;
     }
     if (res != FR_NO_FILE && res != FR_NO_PATH)
-        SerialPrintf("VFS: f_open('%s') failed: %d\n", fatPath, (int)res);
+        DbgPrintf("VFS: f_open('%s') failed: %d\n", fatPath, (int)res);
     kfree(fil);
 
     // Try as a directory.
@@ -585,7 +585,7 @@ Vnode* VfsOpen(const char* path, int flags)
 
     if (res == FR_OK)
     {
-        SerialPrintf("VFS: opened dir '%s' (fatpath='%s')\n", path, fatPath);
+        DbgPrintf("VFS: opened dir '%s' (fatpath='%s')\n", path, fatPath);
         auto* vn = static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
         if (!vn) {
             KMutexLock(&g_vfsLock);

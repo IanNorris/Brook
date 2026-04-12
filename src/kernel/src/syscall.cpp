@@ -117,13 +117,14 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if (fd == 1 || fd == 2)
     {
         const char* buf = reinterpret_cast<const char*>(bufAddr);
-        SerialLock();
-        for (uint64_t i = 0; i < count; ++i)
+        // Only echo stderr (fd 2) to serial — stdout is too noisy with 32 DOOMs.
+        if (fd == 2)
         {
-            SerialPutChar(buf[i]);
-            TtyPutChar(buf[i]);
+            SerialLock();
+            for (uint64_t i = 0; i < count; ++i)
+                SerialPutChar(buf[i]);
+            SerialUnlock();
         }
-        SerialUnlock();
         return static_cast<int64_t>(count);
     }
 
@@ -236,7 +237,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     {
         int fd = FdAlloc(proc, FdType::DevFramebuf, nullptr);
         if (fd < 0) return -EMFILE;
-        SerialPrintf("sys_open: /dev/fb0 → fd %d\n", fd);
+        DbgPrintf("sys_open: /dev/fb0 → fd %d\n", fd);
         return fd;
     }
 
@@ -244,14 +245,14 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     {
         int fd = FdAlloc(proc, FdType::DevKeyboard, nullptr);
         if (fd < 0) return -EMFILE;
-        SerialPrintf("sys_open: keyboard → fd %d\n", fd);
+        DbgPrintf("sys_open: keyboard → fd %d\n", fd);
         return fd;
     }
 
     Vnode* vn = VfsOpen(lookupPath, static_cast<uint32_t>(flags));
     if (!vn)
     {
-        SerialPrintf("sys_open: not found: %s\n", lookupPath);
+        DbgPrintf("sys_open: not found: %s\n", lookupPath);
         return -ENOENT;
     }
 
@@ -341,7 +342,7 @@ static int64_t sys_brk(uint64_t newBreak, uint64_t, uint64_t,
     // brk(0) = query current break
     if (newBreak == 0)
     {
-        SerialPrintf("sys_brk: query → 0x%lx\n", proc->programBreak);
+        DbgPrintf("sys_brk: query → 0x%lx\n", proc->programBreak);
         return static_cast<int64_t>(proc->programBreak);
     }
 
@@ -373,7 +374,7 @@ static int64_t sys_brk(uint64_t newBreak, uint64_t, uint64_t,
         for (uint64_t b = 0; b < 4096; ++b) p[b] = 0;
     }
 
-    SerialPrintf("sys_brk: 0x%lx → 0x%lx\n", proc->programBreak, newBreak);
+    DbgPrintf("sys_brk: 0x%lx → 0x%lx\n", proc->programBreak, newBreak);
     proc->programBreak = newBreak;
     return static_cast<int64_t>(newBreak);
 }
@@ -477,7 +478,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             }
         }
 
-        SerialPrintf("sys_mmap: fb mapped %lu pages at virt 0x%lx (%s, vfb=%ux%u)\n",
+        DbgPrintf("sys_mmap: fb mapped %lu pages at virt 0x%lx (%s, vfb=%ux%u)\n",
                      pages, vaddr,
                      useVirtFb ? "virtual" : "physical",
                      proc->fbVfbWidth, proc->fbVfbHeight);
@@ -550,7 +551,7 @@ static int64_t sys_arch_prctl(uint64_t code, uint64_t addr, uint64_t,
             proc->savedCtx.fsBase = addr;
         }
 
-        SerialPrintf("arch_prctl: SET_FS 0x%lx\n", addr);
+        DbgPrintf("arch_prctl: SET_FS 0x%lx\n", addr);
         return 0;
     }
     case ARCH_GET_FS:

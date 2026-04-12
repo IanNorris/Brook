@@ -216,7 +216,7 @@ static void ProcessTrampoline()
     }
 
     Process* proc = g_perCpu[cpu].currentProcess;
-    SerialPrintf("SCHED: CPU%u entering user mode for '%s' (pid %u)\n",
+    DbgPrintf("SCHED: CPU%u entering user mode for '%s' (pid %u)\n",
                  cpu, proc->name, proc->pid);
 
     __asm__ volatile("sti");
@@ -243,7 +243,7 @@ void KernelThreadTrampoline()
     }
 
     Process* proc = g_perCpu[cpu].currentProcess;
-    SerialPrintf("SCHED: CPU%u starting kernel thread '%s' (pid %u)\n",
+    DbgPrintf("SCHED: CPU%u starting kernel thread '%s' (pid %u)\n",
                  cpu, proc->name, proc->pid);
 
     __asm__ volatile("sti");
@@ -289,7 +289,7 @@ void SchedulerAddProcess(Process* proc)
         g_allProcesses[g_processCount++] = proc;
     SchedLockRelease(g_allProcLock, alf1);
 
-    SerialPrintf("SCHED: added '%s' (pid %u) to ready queue\n",
+    DbgPrintf("SCHED: added '%s' (pid %u) to ready queue\n",
                  proc->name, proc->pid);
 }
 
@@ -410,7 +410,7 @@ static void ReapTerminated()
         if (p->state == ProcessState::Terminated && p != g_perCpu[cpu].currentProcess)
         {
             SchedLockRelease(g_allProcLock, alf);
-            SerialPrintf("SCHED: reaping '%s' (pid %u)\n", p->name, p->pid);
+            DbgPrintf("SCHED: reaping '%s' (pid %u)\n", p->name, p->pid);
             ProcessDestroy(p);
             // ProcessDestroy calls SchedulerRemoveProcess
             alf = SchedLockAcquire(g_allProcLock);
@@ -647,7 +647,7 @@ void SchedulerYield()
         __asm__ volatile("wrmsr" : : "a"(lo), "d"(hi), "c"(0xC0000100U));
     }
 
-    SerialPrintf("SCHED: CPU%u entering user mode for '%s' (pid %u)\n",
+    DbgPrintf("SCHED: CPU%u entering user mode for '%s' (pid %u)\n",
                  cpu, first->name, first->pid);
 
     g_schedulerRunning = true;
@@ -714,7 +714,7 @@ void SchedulerYield()
         __asm__ volatile("wrmsr" : : "a"(lo), "d"(hi), "c"(0xC0000100U));
     }
 
-    SerialPrintf("SCHED: CPU%u entering user mode for '%s' (pid %u)\n",
+    DbgPrintf("SCHED: CPU%u entering user mode for '%s' (pid %u)\n",
                  cpu, first->name, first->pid);
 
     if (first->isKernelThread)

@@ -240,7 +240,7 @@ static Process* SpawnProcess(const char* path, int argc, const char* const* argv
         return nullptr;
     }
 
-    SerialPrintf("SHELL: loaded '%s' (%lu bytes)\n", path, elfSize);
+    DbgPrintf("SHELL: loaded '%s' (%lu bytes)\n", path, elfSize);
 
     // Disable interrupts during process creation to avoid timer ISR interference
     __asm__ volatile("cli");
@@ -283,7 +283,7 @@ static Process* SpawnProcess(const char* path, int argc, const char* const* argv
     CompositorSetupProcess(proc, destX, destY, g_vfbWidth, g_vfbHeight, g_scale);
     SchedulerAddProcess(proc);
 
-    SerialPrintf("SHELL: spawned '%s' pid=%u at (%d,%d) grid=%ux%u scale=%u\n",
+    DbgPrintf("SHELL: spawned '%s' pid=%u at (%d,%d) grid=%ux%u scale=%u\n",
                   proc->name, proc->pid, destX, destY, cols, rows, g_scale);
     KPrintf("  → %s (pid %u)\n", proc->name, proc->pid);
 
@@ -684,7 +684,7 @@ int ShellExecScript(const char* path)
         while (IsWhitespace(*p)) ++p;
         if (*p == '\0' || *p == '#') continue;
 
-        SerialPrintf("SHELL: [%u] %s\n", lineNum, line);
+        DbgPrintf("SHELL: [%u] %s\n", lineNum, line);
 
         const char* argv[MAX_ARGS];
         int argc = ParseLine(line, argv, MAX_ARGS);

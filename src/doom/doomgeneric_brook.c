@@ -154,12 +154,12 @@ void DG_Init()
             exit(4);
         }
 
-        printf("Brook DOOM: framebuffer %ux%u, render at (%u,%u)\n",
+        fprintf(stderr, "Brook DOOM: framebuffer %ux%u, render at (%u,%u)\n",
                s_ScreenWidth, s_ScreenHeight, s_PositionX, s_PositionY);
     }
     else
     {
-        printf("Error: framebuffer device not available.\n");
+        fprintf(stderr, "Error: framebuffer device not available.\n");
     }
 
     enableRawMode();
@@ -231,7 +231,7 @@ void DG_DrawFrame()
     {
         long elapsed = getWallTimeMs() - s_StartTimeMs;
         long fps = (elapsed > 0) ? (s_FrameCount * 1000L) / elapsed : 0;
-        printf("BENCH: %d frames in %ld ms (wall), %ld fps avg\n",
+        fprintf(stderr, "BENCH: %d frames in %ld ms (wall), %ld fps avg\n",
                s_FrameCount, elapsed, fps);
         // Spin forever instead of exit() — process exit has a known bug
         // with page table cleanup. This lets all instances report results.

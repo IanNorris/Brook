@@ -96,7 +96,7 @@ bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
     uint64_t loadSize = loadEnd - loadBase;
     uint64_t loadPages = loadSize / 4096;
 
-    SerialPrintf("ELF: loading at 0x%lx-0x%lx (%lu pages)\n",
+    DbgPrintf("ELF: loading at 0x%lx-0x%lx (%lu pages)\n",
                  loadBase, loadEnd, loadPages);
 
     // Helper: translate a user virtual address to a kernel-writable pointer
@@ -154,7 +154,7 @@ bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
 
             // BSS (p_memsz > p_filesz) is already zeroed from page init above
 
-            SerialPrintf("ELF:   PT_LOAD 0x%lx-0x%lx (%lu bytes, %lu BSS)\n",
+            DbgPrintf("ELF:   PT_LOAD 0x%lx-0x%lx (%lu bytes, %lu BSS)\n",
                          phdr.p_vaddr, phdr.p_vaddr + phdr.p_memsz,
                          phdr.p_filesz, phdr.p_memsz - phdr.p_filesz);
         }
@@ -167,7 +167,7 @@ bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
             out->tlsTotalSize = phdr.p_memsz;
             out->tlsAlign     = static_cast<uint16_t>(phdr.p_align);
 
-            SerialPrintf("ELF:   PT_TLS init=%lu total=%lu align=%u\n",
+            DbgPrintf("ELF:   PT_TLS init=%lu total=%lu align=%u\n",
                          phdr.p_filesz, phdr.p_memsz, out->tlsAlign);
         }
     }
@@ -201,7 +201,7 @@ bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
     out->phdrNum         = ehdr->e_phnum;
     out->phdrEntSize     = ehdr->e_phentsize;
 
-    SerialPrintf("ELF: loaded OK, entry=0x%lx, break=0x%lx-0x%lx\n",
+    DbgPrintf("ELF: loaded OK, entry=0x%lx, break=0x%lx-0x%lx\n",
                  out->entryPoint, out->programBreakLow, out->programBreakHigh);
 
     return true;

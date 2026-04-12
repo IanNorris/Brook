@@ -108,7 +108,7 @@ bool CompositorSetupProcess(Process* proc, int16_t destX, int16_t destY,
     if (g_compositedCount < MAX_COMPOSITED)
         g_compositedProcs[g_compositedCount++] = proc;
 
-    SerialPrintf("COMPOSITOR: proc '%s' pid %u → vfb %ux%u at 0x%lx, dest=(%d,%d) scale=%u\n",
+    DbgPrintf("COMPOSITOR: proc '%s' pid %u → vfb %ux%u at 0x%lx, dest=(%d,%d) scale=%u\n",
                  proc->name, proc->pid, vfbWidth, vfbHeight, vfbAddr.raw(),
                  destX, destY, scale);
     return true;
