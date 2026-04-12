@@ -191,13 +191,20 @@ struct Process
     int16_t   fbDestX;          // Destination X on physical FB
     int16_t   fbDestY;          // Destination Y on physical FB
     uint8_t   fbScale;          // Downscale factor when blitting to phys FB (1=1:1, 2=half, etc.)
+    volatile uint8_t fbDirty;   // Set by process (via write to fb fd), cleared by compositor
 
     // Process name (for debug output)
     char name[32];
 
     // Working directory (for relative path resolution)
     char cwd[64];
+
+    // True if this is a kernel-mode thread (ring 0, kernel CR3, no user stack).
+    bool isKernelThread;
 };
+
+// Kernel thread entry point signature.
+using KernelThreadFn = void (*)(void* arg);
 
 // ---------------------------------------------------------------------------
 // API
@@ -211,6 +218,10 @@ Process* ProcessCurrent();
 Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
                        int argc, const char* const* argv,
                        int envc, const char* const* envp);
+
+// Create a kernel-mode thread. Runs `fn(arg)` in ring 0 with the kernel's
+// page table. Has its own kernel stack and is scheduled like any process.
+Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg);
 
 // Destroy a process and free all its resources.
 void ProcessDestroy(Process* proc);

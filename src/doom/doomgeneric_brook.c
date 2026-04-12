@@ -20,6 +20,7 @@
 
 #include <termios.h>
 #include <time.h>
+#include <sched.h>
 
 static int FrameBufferFd = -1;
 static int* FrameBuffer = 0;
@@ -214,6 +215,10 @@ void DG_DrawFrame()
                    DG_ScreenBuffer + i * DOOMGENERIC_RESX,
                    DOOMGENERIC_RESX * 4);
         }
+
+        // Signal compositor that this framebuffer has new content.
+        if (FrameBufferFd >= 0)
+            write(FrameBufferFd, "", 1);
     }
 
     handleKeyInput();
@@ -225,7 +230,9 @@ void DG_DrawFrame()
     if (s_FrameLimit > 0 && s_FrameCount >= s_FrameLimit)
     {
         long elapsed = getWallTimeMs() - s_StartTimeMs;
-        printf("BENCH: %d frames in %ld ms (wall)\n", s_FrameCount, elapsed);
+        long fps = (elapsed > 0) ? (s_FrameCount * 1000L) / elapsed : 0;
+        printf("BENCH: %d frames in %ld ms (wall), %ld fps avg\n",
+               s_FrameCount, elapsed, fps);
         // Spin forever instead of exit() — process exit has a known bug
         // with page table cleanup. This lets all instances report results.
         for (;;) {
@@ -237,20 +244,17 @@ void DG_DrawFrame()
 
 void DG_SleepMs(uint32_t ms)
 {
-    uint64_t sec = ms / 1000;
-    uint64_t ns = (ms - (sec * 1000)) * 1000000ULL; // ms → ns
-
-    struct timespec ts;
-    ts.tv_sec = sec;
-    ts.tv_nsec = ns;
-    nanosleep(&ts, NULL);
-
+    // Yield the timeslice instead of actually sleeping. DOOM still runs as
+    // fast as possible but voluntarily gives up the CPU when it would have
+    // slept, reducing contention and letting the scheduler work efficiently.
+    (void)ms;
     uptime += ms;
+    sched_yield();
 }
 
 uint32_t DG_GetTicksMs()
 {
-    return uptime;
+    return (uint32_t)getWallTimeMs();
 }
 
 int DG_GetKey(int* pressed, unsigned char* doomKey)

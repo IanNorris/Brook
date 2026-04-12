@@ -117,11 +117,13 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if (fd == 1 || fd == 2)
     {
         const char* buf = reinterpret_cast<const char*>(bufAddr);
+        SerialLock();
         for (uint64_t i = 0; i < count; ++i)
         {
             SerialPutChar(buf[i]);
             TtyPutChar(buf[i]);
         }
+        SerialUnlock();
         return static_cast<int64_t>(count);
     }
 
@@ -138,6 +140,13 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
                                static_cast<uint32_t>(count), &fde->seekPos);
         if (ret > 0) fde->seekPos += static_cast<uint64_t>(ret);
         return ret;
+    }
+
+    // Write to /dev/fb0 signals a frame is complete (sets dirty flag).
+    if (fde->type == FdType::DevFramebuf)
+    {
+        proc->fbDirty = 1;
+        return static_cast<int64_t>(count);
     }
 
     return -EBADF;
@@ -711,6 +720,17 @@ static int64_t sys_gettimeofday(uint64_t tvAddr, uint64_t, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
+// sys_sched_yield (24)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_sched_yield(uint64_t, uint64_t, uint64_t,
+                                uint64_t, uint64_t, uint64_t)
+{
+    SchedulerYield();
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // sys_nanosleep (35) / sys_clock_nanosleep (230)
 // ---------------------------------------------------------------------------
 
@@ -1223,6 +1243,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_READV]           = sys_readv;
     g_syscallTable[SYS_WRITEV]          = sys_writev;
     g_syscallTable[SYS_ACCESS]          = sys_access;
+    g_syscallTable[SYS_SCHED_YIELD]     = sys_sched_yield;
     g_syscallTable[SYS_NANOSLEEP]       = sys_nanosleep;
     g_syscallTable[SYS_GETPID]          = sys_getpid;
     g_syscallTable[SYS_EXIT]            = sys_exit;

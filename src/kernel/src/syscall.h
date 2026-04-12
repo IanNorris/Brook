@@ -27,6 +27,7 @@ static constexpr uint64_t SYS_PREAD64         = 17;
 static constexpr uint64_t SYS_READV           = 19;
 static constexpr uint64_t SYS_WRITEV          = 20;
 static constexpr uint64_t SYS_ACCESS          = 21;
+static constexpr uint64_t SYS_SCHED_YIELD     = 24;
 static constexpr uint64_t SYS_NANOSLEEP       = 35;
 static constexpr uint64_t SYS_GETPID          = 39;
 static constexpr uint64_t SYS_EXECVE          = 59;

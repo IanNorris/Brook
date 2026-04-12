@@ -377,6 +377,57 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     return proc;
 }
 
+Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg)
+{
+    auto* proc = static_cast<Process*>(kmalloc(sizeof(Process)));
+    if (!proc) return nullptr;
+
+    // Zero-initialize
+    auto* raw = reinterpret_cast<uint8_t*>(proc);
+    for (uint64_t i = 0; i < sizeof(Process); ++i) raw[i] = 0;
+
+    // Initialize FPU/SSE state
+    proc->fxsave.data[0] = 0x7F;
+    proc->fxsave.data[1] = 0x03;
+    proc->fxsave.data[24] = 0x80;
+    proc->fxsave.data[25] = 0x1F;
+
+    proc->pid = SchedulerAllocPid();
+    proc->state = ProcessState::Ready;
+    proc->runningOnCpu = -1;
+    proc->isKernelThread = true;
+
+    // Kernel threads use the kernel's page table
+    proc->pageTable = VmmKernelCR3();
+
+    // Allocate kernel stack
+    VirtualAddress kstackAddr = VmmAllocPages(KERNEL_STACK_PAGES,
+        VMM_WRITABLE, MemTag::KernelData, proc->pid);
+    if (!kstackAddr)
+    {
+        SerialPuts("KTHREAD: kernel stack allocation failed\n");
+        kfree(proc);
+        return nullptr;
+    }
+    proc->kernelStackBase = kstackAddr.raw();
+    proc->kernelStackTop  = kstackAddr.raw() + KERNEL_STACK_SIZE;
+
+    // Store fn and arg at the top of the kernel stack for the trampoline.
+    // stackSlots[-2] = fn, stackSlots[-1] = arg
+    auto* stackSlots = reinterpret_cast<uint64_t*>(proc->kernelStackTop);
+    stackSlots[-2] = reinterpret_cast<uint64_t>(fn);
+    stackSlots[-1] = reinterpret_cast<uint64_t>(arg);
+
+    // Copy name
+    for (uint32_t i = 0; i < 31 && name[i]; ++i)
+        proc->name[i] = name[i];
+
+    SerialPrintf("KTHREAD: created '%s' pid=%u, stack=0x%lx\n",
+                 proc->name, proc->pid, proc->kernelStackTop);
+
+    return proc;
+}
+
 void ProcessDestroy(Process* proc)
 {
     if (!proc) return;
@@ -403,8 +454,9 @@ void ProcessDestroy(Process* proc)
     // Free all VMM page allocations owned by this process
     VmmKillPid(proc->pid);
 
-    // Free per-process page table pages
-    VmmDestroyUserPageTable(proc->pageTable);
+    // Free per-process page table pages (not for kernel threads — they share kernel CR3)
+    if (!proc->isKernelThread)
+        VmmDestroyUserPageTable(proc->pageTable);
 
     // Remove from scheduler tracking
     SchedulerRemoveProcess(proc);

@@ -18,9 +18,14 @@ static constexpr uint32_t MAX_COMPOSITED = 64;
 static Process* g_compositedProcs[MAX_COMPOSITED] = {};
 static uint32_t g_compositedCount = 0;
 
-// Composite every N ticks (1ms each). Higher = less CPU overhead.
-static constexpr uint32_t COMPOSITE_INTERVAL = 100;
+// Composite every N ticks (1ms each). ~33ms ≈ 30 Hz display refresh.
+static constexpr uint32_t COMPOSITE_INTERVAL = 33;
 static uint32_t g_tickCounter = 0;
+
+// Force-blit all processes every N ms regardless of dirty flag,
+// so we see output even during init before DOOM signals dirty.
+static constexpr uint32_t FORCE_BLIT_INTERVAL_MS = 500;
+static uint32_t g_forceBlitCounter = 0;
 
 void CompositorInit()
 {
@@ -45,6 +50,12 @@ void CompositorGetPhysDims(uint32_t* w, uint32_t* h)
 {
     if (w) *w = g_physFbWidth;
     if (h) *h = g_physFbHeight;
+}
+
+volatile uint32_t* CompositorGetPhysFb(uint32_t* stride)
+{
+    if (stride) *stride = g_physFbStride;
+    return g_physFb;
 }
 
 bool CompositorSetupProcess(Process* proc, int16_t destX, int16_t destY,
@@ -90,6 +101,7 @@ bool CompositorSetupProcess(Process* proc, int16_t destX, int16_t destY,
     proc->fbDestX       = destX;
     proc->fbDestY       = destY;
     proc->fbScale       = (scale > 0) ? scale : 1;
+    proc->fbDirty       = 1;  // ensure first composite renders
 
     if (g_compositedCount < MAX_COMPOSITED)
         g_compositedProcs[g_compositedCount++] = proc;
@@ -101,9 +113,12 @@ bool CompositorSetupProcess(Process* proc, int16_t destX, int16_t destY,
 }
 
 // Blit a process's VFB onto the physical FB with optional downscaling.
-static void BlitProcess(Process* proc)
+// If forceAll is true, blit regardless of dirty flag (periodic refresh).
+static void BlitProcess(Process* proc, bool forceAll)
 {
     if (!proc->fbVirtual || proc->fbVfbWidth == 0) return;
+    if (!forceAll && !proc->fbDirty) return;
+    proc->fbDirty = 0;
 
     const uint32_t* src = proc->fbVirtual;
     const uint32_t  srcW = proc->fbVfbWidth;
@@ -118,28 +133,49 @@ static void BlitProcess(Process* proc)
     const uint32_t dstW = srcW / scale;
     const uint32_t dstH = srcH / scale;
 
-    for (uint32_t dy = 0; dy < dstH; ++dy)
+    // Precompute clipping.
+    uint32_t startDy = 0, startDx = 0;
+    if (dstY0 < 0) startDy = static_cast<uint32_t>(-dstY0);
+    if (dstX0 < 0) startDx = static_cast<uint32_t>(-dstX0);
+
+    uint32_t endDy = dstH;
+    uint32_t endDx = dstW;
+    if (dstY0 + static_cast<int>(endDy) > static_cast<int>(g_physFbHeight))
+        endDy = g_physFbHeight - static_cast<uint32_t>(dstY0);
+    if (dstX0 + static_cast<int>(endDx) > static_cast<int>(g_physFbWidth))
+        endDx = g_physFbWidth - static_cast<uint32_t>(dstX0);
+
+    if (scale == 1)
     {
-        int physY = dstY0 + static_cast<int>(dy);
-        if (physY < 0) continue;
-        if (static_cast<uint32_t>(physY) >= g_physFbHeight) break;
-
-        uint32_t srcY = dy * scale;
-        if (srcY >= srcH) break;
-        const uint32_t* srcRow = src + srcY * srcStride;
-
-        volatile uint32_t* dstRow = g_physFb + static_cast<uint32_t>(physY) * g_physFbStride;
-
-        for (uint32_t dx = 0; dx < dstW; ++dx)
+        // Fast path: memcpy entire rows.
+        uint32_t copyWidth = (endDx - startDx) * 4;
+        for (uint32_t dy = startDy; dy < endDy; ++dy)
         {
-            int physX = dstX0 + static_cast<int>(dx);
-            if (physX < 0) continue;
-            if (static_cast<uint32_t>(physX) >= g_physFbWidth) break;
+            const uint32_t* srcRow = src + dy * srcStride + startDx;
+            volatile uint32_t* dstRow = g_physFb +
+                static_cast<uint32_t>(dstY0 + dy) * g_physFbStride +
+                static_cast<uint32_t>(dstX0 + startDx);
+            __builtin_memcpy(const_cast<uint32_t*>(dstRow), srcRow, copyWidth);
+        }
+    }
+    else
+    {
+        // Scaled path: sample every `scale` pixels.
+        for (uint32_t dy = startDy; dy < endDy; ++dy)
+        {
+            uint32_t srcY = dy * scale;
+            if (srcY >= srcH) break;
+            const uint32_t* srcRow = src + srcY * srcStride;
 
-            uint32_t srcX = dx * scale;
-            if (srcX >= srcW) break;
+            volatile uint32_t* dstRow = g_physFb +
+                static_cast<uint32_t>(dstY0 + dy) * g_physFbStride;
 
-            dstRow[physX] = srcRow[srcX];
+            for (uint32_t dx = startDx; dx < endDx; ++dx)
+            {
+                uint32_t srcX = dx * scale;
+                if (srcX >= srcW) break;
+                dstRow[dstX0 + dx] = srcRow[srcX];
+            }
         }
     }
 }
@@ -159,6 +195,12 @@ void CompositorTick()
         return;
     g_tickCounter = 0;
 
+    // Every FORCE_BLIT_INTERVAL_MS, blit all processes regardless of dirty
+    // flag. This ensures we see output during init (before DOOM signals dirty).
+    g_forceBlitCounter += COMPOSITE_INTERVAL;
+    bool forceAll = (g_forceBlitCounter >= FORCE_BLIT_INTERVAL_MS);
+    if (forceAll) g_forceBlitCounter = 0;
+
     for (uint32_t i = 0; i < g_compositedCount; ++i)
     {
         Process* p = g_compositedProcs[i];
@@ -166,7 +208,7 @@ void CompositorTick()
             continue;
         if (!p->fbVirtual || p->fbVfbWidth == 0)
             continue;
-        BlitProcess(p);
+        BlitProcess(p, forceAll);
     }
 }
 

@@ -228,12 +228,48 @@ static void ProcessTrampoline()
     __builtin_unreachable();
 }
 
+// Trampoline for kernel threads. Like ProcessTrampoline but stays in ring 0.
+// fn and arg are stored at the top of the kernel stack by KernelThreadCreate.
+static void KernelThreadTrampoline()
+{
+    uint32_t cpu = ThisCpu();
+
+    // Drain pending requeue (same as ProcessTrampoline).
+    Process* toRequeue = g_perCpu[cpu].pendingRequeue;
+    g_perCpu[cpu].pendingRequeue = nullptr;
+    if (toRequeue)
+    {
+        uint64_t rlf = SchedLockAcquire(g_readyLock);
+        if (toRequeue->state == ProcessState::Ready)
+            ReadyQueueInsertLocked(toRequeue);
+        SchedLockRelease(g_readyLock, rlf);
+    }
+
+    Process* proc = g_perCpu[cpu].currentProcess;
+    SerialPrintf("SCHED: CPU%u starting kernel thread '%s' (pid %u)\n",
+                 cpu, proc->name, proc->pid);
+
+    __asm__ volatile("sti");
+
+    // Read fn and arg from the top of the kernel stack (placed by KernelThreadCreate).
+    auto* stackSlots = reinterpret_cast<uint64_t*>(proc->kernelStackBase + KERNEL_STACK_SIZE);
+    KernelThreadFn fn = reinterpret_cast<KernelThreadFn>(stackSlots[-2]);
+    void* arg = reinterpret_cast<void*>(stackSlots[-1]);
+
+    fn(arg);
+
+    // If fn returns, terminate this thread.
+    SchedulerExitCurrentProcess(0);
+}
+
 void SchedulerAddProcess(Process* proc)
 {
     proc->state = ProcessState::Ready;
 
     proc->savedCtx.rsp = proc->kernelStackTop - 8;
-    proc->savedCtx.rip = reinterpret_cast<uint64_t>(&ProcessTrampoline);
+    proc->savedCtx.rip = proc->isKernelThread
+        ? reinterpret_cast<uint64_t>(&KernelThreadTrampoline)
+        : reinterpret_cast<uint64_t>(&ProcessTrampoline);
     proc->savedCtx.rflags = 0x202;
     proc->savedCtx.cr3 = proc->pageTable.pml4.raw();
     proc->savedCtx.fsBase = proc->fsBase;

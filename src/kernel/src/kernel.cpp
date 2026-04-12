@@ -25,6 +25,7 @@
 #include "process.h"
 #include "scheduler.h"
 #include "compositor.h"
+#include "clock_overlay.h"
 #include "smp.h"
 #include "shell.h"
 #include "boot_logo.h"
@@ -431,6 +432,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             if (fbH > barH)
                 brook::TtySetRegion(0, fbH - barH, fbW, barH);
         }
+
+        // Start the clock overlay kernel thread (renders uptime on screen).
+        brook::ClockOverlayStart();
 
         // Execute the boot script if present.
         brook::ShellExecScript("/boot/INIT.RC");

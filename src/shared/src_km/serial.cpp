@@ -2,23 +2,46 @@
 
 namespace brook {
 
-// Simple ticket spinlock for serialising serial output across CPUs.
+// IRQ-safe ticket spinlock for serialising serial output across CPUs.
+// Disables interrupts while held to prevent ISR-on-same-CPU deadlock.
 struct SerialSpinlock {
     volatile uint32_t next;
     volatile uint32_t serving;
 };
 static SerialSpinlock g_serialLock = {0, 0};
 
+// Per-CPU saved flags (max 64 CPUs). Nesting not supported — serial lock
+// is never taken recursively.
+static uint64_t g_serialSavedFlags[64];
+
+static inline uint32_t SerialThisCpu()
+{
+    uint32_t id;
+    __asm__ volatile("mov $1, %%eax; cpuid; shr $24, %%ebx; mov %%ebx, %0"
+                     : "=r"(id) : : "eax","ebx","ecx","edx");
+    return id < 64 ? id : 0;
+}
+
 static inline void SerialLockAcquire()
 {
+    // Save flags and disable interrupts BEFORE taking the ticket.
+    uint64_t flags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+
     uint32_t ticket = __atomic_fetch_add(&g_serialLock.next, 1, __ATOMIC_RELAXED);
     while (__atomic_load_n(&g_serialLock.serving, __ATOMIC_ACQUIRE) != ticket)
         __asm__ volatile("pause" ::: "memory");
+
+    g_serialSavedFlags[SerialThisCpu()] = flags;
 }
 
 static inline void SerialLockRelease()
 {
+    uint64_t flags = g_serialSavedFlags[SerialThisCpu()];
     __atomic_fetch_add(&g_serialLock.serving, 1, __ATOMIC_RELEASE);
+
+    // Restore interrupt flag after releasing the lock.
+    __asm__ volatile("push %0; popfq" :: "r"(flags) : "memory");
 }
 
 static constexpr uint16_t COM1_BASE = 0x3F8;
