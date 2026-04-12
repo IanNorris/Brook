@@ -28,14 +28,13 @@ static Process* g_writerProc = nullptr;
 
 static void SerialWriterThreadFn(void* /*arg*/)
 {
-    char batch[256];  // Drain in 256-byte chunks
+    char batch[64];  // Small batches to avoid holding the serial lock too long
 
     for (;;) {
-        // Drain everything currently in the buffer.
-        for (;;) {
-            uint32_t n = g_serialBuf.read(batch, sizeof(batch));
-            if (n == 0) break;
+        // Drain one batch per wake cycle, then yield.
+        uint32_t n = g_serialBuf.read(batch, sizeof(batch));
 
+        if (n > 0) {
             SerialLock();
             for (uint32_t i = 0; i < n; ++i)
                 SerialPutChar(batch[i]);
@@ -48,11 +47,11 @@ static void SerialWriterThreadFn(void* /*arg*/)
             }
         }
 
-        // Sleep 5ms then check again.  Short sleep keeps latency low
-        // while avoiding busy-spin.
+        // Sleep briefly then check again. Keeps serial responsive
+        // without starving user processes.
         Process* self = ProcessCurrent();
         if (self) {
-            self->wakeupTick = g_lapicTickCount + 5;
+            self->wakeupTick = g_lapicTickCount + (g_serialBuf.empty() ? 10 : 1);
             SchedulerBlock(self);
         }
     }
@@ -65,7 +64,7 @@ static void SerialWriterThreadFn(void* /*arg*/)
 void SerialWriterInit()
 {
     g_writerProc = KernelThreadCreate("serial_wr", SerialWriterThreadFn, nullptr,
-                                       1 /* HIGH priority — below RT, above normal */);
+                                       2 /* NORMAL priority — don't starve user processes */);
     if (g_writerProc)
         SerialPrintf("SERIAL_WRITER: thread created pid=%u\n", g_writerProc->pid);
 }
