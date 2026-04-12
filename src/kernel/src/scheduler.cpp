@@ -653,10 +653,18 @@ void SchedulerYield()
 
     if (first->isKernelThread)
     {
-        // Kernel threads stay in ring 0. Enable interrupts and call the
-        // trampoline directly (it reads fn/arg from the kernel stack).
-        __asm__ volatile("sti");
-        KernelThreadTrampoline();
+        // Kernel threads stay in ring 0. Switch to the thread's own kernel
+        // stack, enable interrupts, and call the trampoline.
+        uint64_t newRsp = first->kernelStackTop - 16; // below fn/arg slots
+        __asm__ volatile(
+            "movq %0, %%rsp\n\t"
+            "sti\n\t"
+            "call *%1\n\t"
+            "ud2\n\t"
+            :: "r"(newRsp),
+               "r"(reinterpret_cast<uint64_t>(&KernelThreadTrampoline))
+            : "memory"
+        );
         __builtin_unreachable();
     }
 
@@ -710,8 +718,16 @@ void SchedulerYield()
 
     if (first->isKernelThread)
     {
-        __asm__ volatile("sti");
-        KernelThreadTrampoline();
+        uint64_t newRsp = first->kernelStackTop - 16;
+        __asm__ volatile(
+            "movq %0, %%rsp\n\t"
+            "sti\n\t"
+            "call *%1\n\t"
+            "ud2\n\t"
+            :: "r"(newRsp),
+               "r"(reinterpret_cast<uint64_t>(&KernelThreadTrampoline))
+            : "memory"
+        );
         __builtin_unreachable();
     }
 
