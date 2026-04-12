@@ -600,7 +600,7 @@ void SchedulerYield()
     //   Red  for abnormal termination (negative status = signal/fault)
     //   Blue for normal exit
     if (proc->fbVfbWidth > 0)
-        proc->fbExitColor = (status < 0) ? 0xFF0000CCu : 0xFFAA4400u;
+        proc->fbExitColor = (status < 0) ? 0x00CC0000u : 0x00001A3Au;
 
     proc->state = ProcessState::Terminated;
 
