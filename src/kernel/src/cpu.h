@@ -70,6 +70,14 @@ struct KernelCpuEnv {
     uint64_t syscallUserR14;   // [gs:104]
     uint64_t syscallUserR15;   // [gs:112]
     uint64_t syscallNumber;    // [gs:120] — syscall number (RAX) saved by dispatcher
+    // Caller-saved user registers, saved by dispatcher for fork()
+    // Linux preserves ALL registers across fork (except RAX=child pid/0).
+    uint64_t syscallUserRdi;   // [gs:128]
+    uint64_t syscallUserRsi;   // [gs:136]
+    uint64_t syscallUserRdx;   // [gs:144]
+    uint64_t syscallUserR8;    // [gs:152]
+    uint64_t syscallUserR9;    // [gs:160]
+    uint64_t syscallUserR10;   // [gs:168]
 };
 
 // Initialise SYSCALL/SYSRET MSRs.  Call after GdtInit().

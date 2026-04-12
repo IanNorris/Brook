@@ -271,17 +271,26 @@ static void ForkChildTrampoline()
     uint64_t userR13 = proc->forkR13;
     uint64_t userR14 = proc->forkR14;
     uint64_t userR15 = proc->forkR15;
+    uint64_t userRdi = proc->forkRdi;
+    uint64_t userRsi = proc->forkRsi;
+    uint64_t userRdx = proc->forkRdx;
+    uint64_t userR8  = proc->forkR8;
+    uint64_t userR9  = proc->forkR9;
+    uint64_t userR10 = proc->forkR10;
     proc->isForkChild = false;
 
     __asm__ volatile("sti");
 
-    // Enter user mode via SYSRET with all callee-saved registers restored.
-    // We build a small struct on the stack and load from it to avoid
-    // register pressure issues with 9 operands.
+    // Enter user mode via SYSRET with ALL registers restored.
+    // Linux preserves every register across fork except RAX (0 for child).
+    // We build a struct on the stack and load from it to avoid
+    // register pressure issues with 15 operands.
     struct ForkRegs {
         uint64_t rip, rflags, rsp, rbx, rbp, r12, r13, r14, r15;
+        uint64_t rdi, rsi, rdx, r8, r9, r10;
     } regs = { userRip, userRflags, userRsp, userRbx, userRbp,
-               userR12, userR13, userR14, userR15 };
+               userR12, userR13, userR14, userR15,
+               userRdi, userRsi, userRdx, userR8, userR9, userR10 };
 
     __asm__ volatile(
         "mov %[base], %%rax\n\t"
@@ -291,16 +300,16 @@ static void ForkChildTrampoline()
         "mov 48(%%rax), %%r13\n\t"     // restore R13
         "mov 56(%%rax), %%r14\n\t"     // restore R14
         "mov 64(%%rax), %%r15\n\t"     // restore R15
+        "mov 72(%%rax), %%rdi\n\t"     // restore RDI
+        "mov 80(%%rax), %%rsi\n\t"     // restore RSI
+        "mov 88(%%rax), %%rdx\n\t"     // restore RDX
+        "mov 96(%%rax), %%r8\n\t"      // restore R8
+        "mov 104(%%rax), %%r9\n\t"     // restore R9
+        "mov 112(%%rax), %%r10\n\t"    // restore R10
         "mov 0(%%rax), %%rcx\n\t"      // RCX = user RIP
         "mov 8(%%rax), %%r11\n\t"      // R11 = user RFLAGS
         "mov 16(%%rax), %%rsp\n\t"     // RSP = user stack
         "xor %%rax, %%rax\n\t"         // RAX = 0 (fork child return)
-        "xor %%rdx, %%rdx\n\t"
-        "xor %%rsi, %%rsi\n\t"
-        "xor %%rdi, %%rdi\n\t"
-        "xor %%r8, %%r8\n\t"
-        "xor %%r9, %%r9\n\t"
-        "xor %%r10, %%r10\n\t"
         "swapgs\n\t"
         ".byte 0x48\n\t"               // REX.W prefix for sysretq
         "sysret\n\t"

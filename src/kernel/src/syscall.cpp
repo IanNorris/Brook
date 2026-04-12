@@ -77,6 +77,19 @@ extern "C" __attribute__((naked, used)) void BrookSyscallDispatcher()
         "movq %%r15, %%gs:104\n\t"       // -> syscallUserR14
         "mov -88(%%rbp), %%r15\n\t"      // R15 at [rbp-88]
         "movq %%r15, %%gs:112\n\t"       // -> syscallUserR15
+        // Caller-saved registers (needed for fork — Linux preserves all regs)
+        "mov -24(%%rbp), %%r15\n\t"      // RDI at [rbp-24]
+        "movq %%r15, %%gs:128\n\t"       // -> syscallUserRdi
+        "mov -16(%%rbp), %%r15\n\t"      // RSI at [rbp-16]
+        "movq %%r15, %%gs:136\n\t"       // -> syscallUserRsi
+        "mov -8(%%rbp), %%r15\n\t"       // RDX at [rbp-8]
+        "movq %%r15, %%gs:144\n\t"       // -> syscallUserRdx
+        "mov -32(%%rbp), %%r15\n\t"      // R8 at [rbp-32]
+        "movq %%r15, %%gs:152\n\t"       // -> syscallUserR8
+        "mov -40(%%rbp), %%r15\n\t"      // R9 at [rbp-40]
+        "movq %%r15, %%gs:160\n\t"       // -> syscallUserR9
+        "mov -48(%%rbp), %%r15\n\t"      // R10 at [rbp-48]
+        "movq %%r15, %%gs:168\n\t"       // -> syscallUserR10
         "mov -88(%%rbp), %%r15\n\t"      // restore R15 from saved slot
         "sti\n\t"
         "call *(%%r12, %%rax, 8)\n\t"
@@ -1111,6 +1124,20 @@ static int64_t sys_fork(uint64_t, uint64_t, uint64_t,
         : "=r"(child->forkRbx), "=r"(child->forkRbp),
           "=r"(child->forkR12), "=r"(child->forkR13),
           "=r"(child->forkR14), "=r"(child->forkR15)
+    );
+
+    // Save caller-saved registers — Linux preserves ALL regs across fork
+    // (musl __clone uses R9 for thread fn pointer across syscall)
+    __asm__ volatile(
+        "movq %%gs:128, %0\n\t"
+        "movq %%gs:136, %1\n\t"
+        "movq %%gs:144, %2\n\t"
+        "movq %%gs:152, %3\n\t"
+        "movq %%gs:160, %4\n\t"
+        "movq %%gs:168, %5\n\t"
+        : "=r"(child->forkRdi), "=r"(child->forkRsi),
+          "=r"(child->forkRdx), "=r"(child->forkR8),
+          "=r"(child->forkR9), "=r"(child->forkR10)
     );
 
     SchedulerAddProcess(child);

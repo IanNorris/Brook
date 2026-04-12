@@ -197,41 +197,47 @@ void MouseInit()
     // Flush any stale bytes
     while (inb(0x64) & 0x01) inb(0x60);
 
-    // Enable the auxiliary (mouse) port on the 8042 controller.
+    // Enable the auxiliary (mouse) port on the 8042 controller first.
+    CtrlCmd(0xA8);
+
     // Read current config byte, set bit 1 (enable IRQ12), clear bit 5 (enable aux clock).
     CtrlCmd(0x20);           // Read command byte
     WaitRead();
     uint8_t cfg = inb(0x60);
+    SerialPrintf("MOUSE: 8042 config byte = 0x%02x\n", cfg);
     cfg |=  0x02;            // Enable IRQ12 (auxiliary interrupt)
     cfg &= ~0x20;            // Enable auxiliary clock
     CtrlCmd(0x60);           // Write command byte
     WaitWrite();
     outb(0x60, cfg);
 
-    // Enable the auxiliary port
-    CtrlCmd(0xA8);
-
     // Reset mouse
     MouseCmd(0xFF);
     // The reset sends back 0xFA (ACK) + 0xAA (self-test passed) + 0x00 (device ID)
     // We already consumed ACK in MouseCmd. Read the remaining bytes.
-    WaitRead(); inb(0x60); // 0xAA
-    WaitRead(); inb(0x60); // 0x00
+    WaitRead();
+    uint8_t selfTest = inb(0x60);
+    WaitRead();
+    uint8_t devId = inb(0x60);
+    SerialPrintf("MOUSE: reset response: self-test=0x%02x id=0x%02x\n", selfTest, devId);
+
+    if (selfTest != 0xAA) {
+        SerialPuts("MOUSE: self-test failed, aborting\n");
+        return;
+    }
 
     // Use default settings
     MouseCmd(0xF6);
 
     // Set sample rate to 100 samples/sec
     MouseCmd(0xF3);
-    WaitWrite();
-    outb(0x64, 0xD4);
-    WaitWrite();
-    outb(0x60, 100);
-    WaitRead();
-    inb(0x60); // ACK
+    MouseCmd(100);  // Send rate as a mouse command (gets 0xD4 prefix + ACK)
 
     // Enable data reporting
     MouseCmd(0xF4);
+
+    // Flush any residual data from init
+    while (inb(0x64) & 0x01) inb(0x60);
 
     // Register with the input subsystem
     InputRegister(&g_mouseInputDev);

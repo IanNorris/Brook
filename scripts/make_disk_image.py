@@ -112,7 +112,9 @@ def main():
             if os.path.exists(workspace_wad):
                 doom_wad = workspace_wad
         if os.path.exists(doom_bin):
-            run(["mcopy", "-i", img_path, doom_bin, "::DOOM"])
+            if not has_bins:
+                run(["mmd", "-i", img_path, "::BIN"])
+            run(["mcopy", "-i", img_path, doom_bin, "::BIN/DOOM"])
             print(f"  Added: DOOM ({os.path.getsize(doom_bin)} bytes)")
         if os.path.exists(doom_wad):
             run(["mcopy", "-i", img_path, doom_wad, "::DOOM1.WAD"])

@@ -227,6 +227,13 @@ struct Process
     uint64_t forkR13;
     uint64_t forkR14;
     uint64_t forkR15;
+    // Caller-saved registers — Linux preserves all regs across fork
+    uint64_t forkRdi;
+    uint64_t forkRsi;
+    uint64_t forkRdx;
+    uint64_t forkR8;
+    uint64_t forkR9;
+    uint64_t forkR10;
 };
 
 // Kernel thread entry point signature.
