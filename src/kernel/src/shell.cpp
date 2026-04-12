@@ -673,7 +673,7 @@ int ShellExecScript(const char* path)
 
     char line[MAX_LINE];
     uint64_t offset = 0;
-    uint32_t lineNum = 0;
+    [[maybe_unused]] uint32_t lineNum = 0;
 
     while (ReadScriptLine(vn, &offset, line, MAX_LINE) >= 0)
     {

@@ -436,7 +436,7 @@ bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
 
     // Diagnostic: show physical page backing the FATFS.win buffer
     uint64_t winVirt = reinterpret_cast<uint64_t>(&fs->win[0]);
-    uint64_t winPhys = VmmVirtToPhys(KernelPageTable, VirtualAddress(winVirt)).raw();
+    [[maybe_unused]] uint64_t winPhys = VmmVirtToPhys(KernelPageTable, VirtualAddress(winVirt)).raw();
     DbgPrintf("VFS: FATFS.win virt=0x%lx phys=0x%lx (sizeof FATFS=%lu)\n",
                  winVirt, winPhys, static_cast<unsigned long>(sizeof(FATFS)));
 
