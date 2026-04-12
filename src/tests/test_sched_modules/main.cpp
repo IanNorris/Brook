@@ -508,7 +508,7 @@ static void run_mlfq_boost(const SchedOps* ops, void* state) {
     ops->Tick(state, 0);    // initial time
     ops->Tick(state, 1001); // past boost interval
     // Process should now be at HIGH priority
-    uint64_t ts = ops->Timeslice(state, 0);
+    [[maybe_unused]] uint64_t ts = ops->Timeslice(state, 0);
     assert(ts == 10); // HIGH timeslice
 }
 
