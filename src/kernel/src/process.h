@@ -254,6 +254,14 @@ void ProcessDestroy(Process* proc);
 Process* ProcessFork(Process* parent, uint64_t userRip,
                      uint64_t userRsp, uint64_t userRflags);
 
+// Replace the current process's address space with a new ELF binary.
+// On success, returns the new user entry point (and sets *outStackPtr).
+// On failure, returns 0 (the process is left in a broken state and should exit).
+uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
+                     int argc, const char* const* argv,
+                     int envc, const char* const* envp,
+                     uint64_t* outStackPtr);
+
 // File descriptor operations
 int       FdAlloc(Process* proc, FdType type, void* handle);
 void      FdFree(Process* proc, int fd);

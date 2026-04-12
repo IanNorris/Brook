@@ -441,6 +441,53 @@ void PmmKillPid(uint16_t pid)
                  static_cast<uint32_t>(pid), count);
 }
 
+void PmmFreeByTag(uint16_t pid, MemTag tag)
+{
+    if (!g_pageDescs) return;
+    if (pid == KernelPid) return;
+
+    uint64_t flags = SpinLockAcquire(&g_pmmLock);
+
+    uint32_t idx = g_pidLists[pid].head;
+    uint32_t count = 0;
+
+    while (idx != PMM_NULL_PAGE)
+    {
+        uint32_t next = Desc(idx).next;
+
+        if (static_cast<MemTag>(Desc(idx).tag) == tag && IsUsed(idx))
+        {
+            // Remove from PID list
+            uint32_t prev = Desc(idx).prev;
+            if (prev != PMM_NULL_PAGE)
+                Desc(prev).next = next;
+            else
+                g_pidLists[pid].head = next;
+            if (next != PMM_NULL_PAGE)
+                Desc(next).prev = prev;
+            else
+                g_pidLists[pid].tail = prev;
+            g_pidLists[pid].pageCount--;
+
+            // Free the page
+            SetFree(idx);
+            g_freePages++;
+            if (idx < g_nextHint) g_nextHint = idx;
+            Desc(idx) = { PMM_NULL_PAGE, PMM_NULL_PAGE, 0,
+                          static_cast<uint8_t>(MemTag::Free), 0 };
+            count++;
+        }
+
+        idx = next;
+    }
+
+    SpinLockRelease(&g_pmmLock, flags);
+
+    (void)count;
+    DbgPrintf("PMM: PmmFreeByTag(%u, %u): freed %u pages\n",
+              static_cast<uint32_t>(pid), static_cast<uint32_t>(tag), count);
+}
+
 void PmmEnumeratePid(uint16_t pid,
                      bool (*callback)(PhysicalAddress physAddr, MemTag tag, void* ctx),
                      void* ctx)

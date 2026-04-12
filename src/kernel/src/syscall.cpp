@@ -125,11 +125,13 @@ namespace brook {
 // ---------------------------------------------------------------------------
 
 static constexpr int64_t ENOENT  = 2;
+static constexpr int64_t ESRCH   = 3;
 static constexpr int64_t EBADF   = 9;
 static constexpr int64_t ENOMEM  = 12;
 static constexpr int64_t EFAULT  = 14;
 static constexpr int64_t ENODEV  = 19;
 static constexpr int64_t EINVAL  = 22;
+static constexpr int64_t ENOEXEC = 8;
 static constexpr int64_t EMFILE  = 24;
 static constexpr int64_t ERANGE  = 34;
 static constexpr int64_t ENOSYS  = 38;
@@ -824,6 +826,282 @@ static int64_t sys_wait4(uint64_t pidArg, uint64_t statusAddr, uint64_t options,
 }
 
 // ---------------------------------------------------------------------------
+// sys_execve (59)
+// ---------------------------------------------------------------------------
+// Replace the current process image with a new ELF binary.
+// rdi = pathname, rsi = argv[], rdx = envp[]
+// This function does NOT return on success — it enters the new program.
+
+static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAddr,
+                           uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+
+    const char* userPath = reinterpret_cast<const char*>(pathAddr);
+    if (!userPath) return -EFAULT;
+
+    // --- Copy filename from user memory into kernel buffer ---
+    char kPath[256];
+    {
+        uint32_t i = 0;
+        while (i < 255 && userPath[i]) { kPath[i] = userPath[i]; i++; }
+        kPath[i] = '\0';
+    }
+
+    // Resolve path: try as-is, then /boot/BIN/<UPPER>, then /boot/<UPPER>
+    char resolvedPath[256];
+    bool found = false;
+
+    // Try path as-is (or with CWD prefix)
+    const char* lookupPath = kPath;
+    if (kPath[0] != '/' && proc->cwd[0] != '\0')
+    {
+        uint32_t ci = 0;
+        for (uint32_t j = 0; proc->cwd[j] && ci < 250; ++j)
+            resolvedPath[ci++] = proc->cwd[j];
+        if (ci > 0 && resolvedPath[ci - 1] != '/')
+            resolvedPath[ci++] = '/';
+        for (uint32_t j = 0; kPath[j] && ci < 254; ++j)
+            resolvedPath[ci++] = kPath[j];
+        resolvedPath[ci] = '\0';
+        lookupPath = resolvedPath;
+    }
+
+    {
+        VnodeStat st;
+        if (VfsStatPath(lookupPath, &st) == 0 && !st.isDir)
+            found = true;
+    }
+
+    if (!found)
+    {
+        // Try /boot/BIN/<UPPER>
+        char upper[64] = {};
+        const char* baseName = kPath;
+        for (const char* p = kPath; *p; ++p)
+            if (*p == '/') baseName = p + 1;
+
+        uint32_t i = 0;
+        while (baseName[i] && i < 62)
+        {
+            char c = baseName[i];
+            if (c >= 'a' && c <= 'z') c -= 32;
+            upper[i] = c;
+            ++i;
+        }
+        upper[i] = '\0';
+
+        char tryPath[128] = "/boot/BIN/";
+        uint32_t pLen = 10;
+        for (uint32_t j = 0; upper[j] && pLen < 126; ++j)
+            tryPath[pLen++] = upper[j];
+        tryPath[pLen] = '\0';
+
+        VnodeStat st;
+        if (VfsStatPath(tryPath, &st) == 0 && !st.isDir)
+        {
+            lookupPath = tryPath;
+            // Copy to resolvedPath so it persists
+            for (uint32_t k = 0; k < 128; ++k) resolvedPath[k] = tryPath[k];
+            lookupPath = resolvedPath;
+            found = true;
+        }
+
+        if (!found)
+        {
+            // Try /boot/<UPPER>
+            char tryPath2[128] = "/boot/";
+            pLen = 6;
+            for (uint32_t j = 0; upper[j] && pLen < 126; ++j)
+                tryPath2[pLen++] = upper[j];
+            tryPath2[pLen] = '\0';
+
+            if (VfsStatPath(tryPath2, &st) == 0 && !st.isDir)
+            {
+                for (uint32_t k = 0; k < 128; ++k) resolvedPath[k] = tryPath2[k];
+                lookupPath = resolvedPath;
+                found = true;
+            }
+        }
+    }
+
+    if (!found)
+    {
+        DbgPrintf("sys_execve: not found: %s\n", kPath);
+        return -ENOENT;
+    }
+
+    // --- Copy argv from user memory ---
+    static constexpr int MAX_EXEC_ARGS = 64;
+    static constexpr int MAX_EXEC_ENVP = 64;
+    static constexpr uint64_t MAX_STR_LEN = 4096;
+
+    const char* kArgv[MAX_EXEC_ARGS];
+    // Kernel-side string storage (simple: one big buffer)
+    static constexpr uint64_t ARG_BUF_SIZE = 16384;
+    char argBuf[ARG_BUF_SIZE];
+    uint32_t argBufPos = 0;
+    int argc = 0;
+
+    if (argvAddr)
+    {
+        auto** userArgv = reinterpret_cast<const char**>(argvAddr);
+        for (int i = 0; i < MAX_EXEC_ARGS - 1; i++)
+        {
+            const char* arg = userArgv[i];
+            if (!arg) break;
+
+            uint32_t len = 0;
+            while (len < MAX_STR_LEN && arg[len]) len++;
+            if (argBufPos + len + 1 > ARG_BUF_SIZE) break;
+
+            for (uint32_t j = 0; j < len; j++)
+                argBuf[argBufPos + j] = arg[j];
+            argBuf[argBufPos + len] = '\0';
+            kArgv[argc] = &argBuf[argBufPos];
+            argBufPos += len + 1;
+            argc++;
+        }
+    }
+
+    // If no argv provided, use the path as argv[0]
+    if (argc == 0)
+    {
+        uint32_t len = 0;
+        while (kPath[len]) len++;
+        if (len + 1 <= ARG_BUF_SIZE)
+        {
+            for (uint32_t j = 0; j <= len; j++)
+                argBuf[j] = kPath[j];
+            kArgv[0] = argBuf;
+            argBufPos = len + 1;
+            argc = 1;
+        }
+    }
+
+    // --- Copy envp from user memory ---
+    const char* kEnvp[MAX_EXEC_ENVP];
+    int envc = 0;
+    char envBuf[ARG_BUF_SIZE];
+    uint32_t envBufPos = 0;
+
+    if (envpAddr)
+    {
+        auto** userEnvp = reinterpret_cast<const char**>(envpAddr);
+        for (int i = 0; i < MAX_EXEC_ENVP - 1; i++)
+        {
+            const char* env = userEnvp[i];
+            if (!env) break;
+
+            uint32_t len = 0;
+            while (len < MAX_STR_LEN && env[len]) len++;
+            if (envBufPos + len + 1 > ARG_BUF_SIZE) break;
+
+            for (uint32_t j = 0; j < len; j++)
+                envBuf[envBufPos + j] = env[j];
+            envBuf[envBufPos + len] = '\0';
+            kEnvp[envc] = &envBuf[envBufPos];
+            envBufPos += len + 1;
+            envc++;
+        }
+    }
+
+    // --- Load ELF from VFS ---
+    Vnode* vn = VfsOpen(lookupPath, 0);
+    if (!vn)
+    {
+        DbgPrintf("sys_execve: VfsOpen failed: %s\n", lookupPath);
+        return -ENOENT;
+    }
+
+    constexpr uint64_t MAX_ELF_SIZE = 2 * 1024 * 1024;
+    constexpr uint64_t ELF_BUF_PAGES = MAX_ELF_SIZE / 4096;
+
+    VirtualAddress bufAddr = VmmAllocPages(ELF_BUF_PAGES,
+        VMM_WRITABLE, MemTag::Heap, KernelPid);
+    if (!bufAddr)
+    {
+        VfsClose(vn);
+        return -ENOMEM;
+    }
+
+    auto* elfBuf = reinterpret_cast<uint8_t*>(bufAddr.raw());
+    uint64_t elfSize = 0;
+    uint64_t offset = 0;
+    while (elfSize < MAX_ELF_SIZE)
+    {
+        int ret = VfsRead(vn, elfBuf + elfSize, 4096, &offset);
+        if (ret <= 0) break;
+        elfSize += static_cast<uint64_t>(ret);
+    }
+    VfsClose(vn);
+
+    if (elfSize < 64) // Too small to be a valid ELF
+    {
+        VmmFreePages(bufAddr, ELF_BUF_PAGES);
+        DbgPrintf("sys_execve: file too small (%lu bytes)\n", elfSize);
+        return -ENOEXEC;
+    }
+
+    DbgPrintf("sys_execve: loaded '%s' (%lu bytes) for pid %u\n",
+              lookupPath, elfSize, proc->pid);
+
+    // --- Replace the process image ---
+    uint64_t newStackPtr = 0;
+    uint64_t newEntry = ProcessExec(proc, elfBuf, elfSize,
+                                     argc, kArgv, envc, kEnvp,
+                                     &newStackPtr);
+
+    // Free ELF buffer
+    VmmFreePages(bufAddr, ELF_BUF_PAGES);
+
+    if (!newEntry)
+    {
+        SerialPrintf("sys_execve: ProcessExec failed for pid %u\n", proc->pid);
+        // Process is in a broken state — kill it
+        SchedulerExitCurrentProcess(-1);
+        __builtin_unreachable();
+    }
+
+    // Update process name to reflect new binary
+    const char* baseName = lookupPath;
+    for (const char* p = lookupPath; *p; ++p)
+        if (*p == '/') baseName = p + 1;
+    uint32_t ni = 0;
+    while (baseName[ni] && ni < 30)
+    {
+        proc->name[ni] = baseName[ni];
+        ni++;
+    }
+    proc->name[ni] = '\0';
+
+    // --- Switch to new address space and enter user mode ---
+    // Load the new page table
+    __asm__ volatile("mov %0, %%cr3" : : "r"(proc->pageTable.pml4.raw()) : "memory");
+
+    // Set FS base for the new TLS
+    if (proc->fsBase)
+    {
+        uint64_t lo = proc->fsBase & 0xFFFFFFFF;
+        uint64_t hi = proc->fsBase >> 32;
+        __asm__ volatile(
+            "mov $0xC0000100, %%ecx\n\t"
+            "mov %0, %%eax\n\t"
+            "mov %1, %%edx\n\t"
+            "wrmsr\n\t"
+            : : "r"(static_cast<uint32_t>(lo)),
+                "r"(static_cast<uint32_t>(hi))
+            : "ecx", "eax", "edx"
+        );
+    }
+
+    // Enter user mode — this does NOT return
+    SwitchToUserMode(newStackPtr, newEntry);
+    __builtin_unreachable();
+}
+
+// ---------------------------------------------------------------------------
 // sys_set_tid_address (218)
 // ---------------------------------------------------------------------------
 
@@ -1405,6 +1683,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_CLONE]           = sys_clone;
     g_syscallTable[SYS_FORK]            = sys_fork;
     g_syscallTable[SYS_VFORK]           = sys_vfork;
+    g_syscallTable[SYS_EXECVE]          = sys_execve;
     g_syscallTable[SYS_EXIT]            = sys_exit;
     g_syscallTable[SYS_WAIT4]           = sys_wait4;
     g_syscallTable[SYS_UNAME]           = sys_uname;

@@ -1,0 +1,3 @@
+# exectest.rc — Boot script for testing fork+execve
+# Runs exectest which fork()s a child, the child execve()s hello.
+run /boot/BIN/EXECTEST

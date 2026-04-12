@@ -709,4 +709,144 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     return child;
 }
 
+// ---------------------------------------------------------------------------
+// ProcessExec -- replace a process's address space with a new ELF binary.
+// ---------------------------------------------------------------------------
+
+uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
+                     int argc, const char* const* argv,
+                     int envc, const char* const* envp,
+                     uint64_t* outStackPtr)
+{
+    if (!proc || proc->isKernelThread) return 0;
+
+    // 1. Free all user-space pages and destroy old page table.
+    // Only free User-tagged pages — keep kernel stack (KernelData tag) intact.
+    VmmDestroyUserPageTable(proc->pageTable);
+    PmmFreeByTag(proc->pid, MemTag::User);
+
+    // 2. Create fresh page table
+    proc->pageTable = VmmCreateUserPageTable();
+    if (!proc->pageTable)
+    {
+        SerialPuts("EXEC: page table allocation failed\n");
+        return 0;
+    }
+
+    // 3. Load the new ELF binary
+    if (!ElfLoad(elfData, elfSize, &proc->elf, proc->pageTable, proc->pid))
+    {
+        SerialPuts("EXEC: ELF load failed\n");
+        return 0;
+    }
+
+    proc->programBreak = proc->elf.programBreakLow;
+    proc->mmapNext = USER_MMAP_BASE;
+
+    // 4. Allocate new user stack
+    uint64_t stackPages = USER_STACK_SIZE / 4096;
+    uint64_t guardPages = 1;
+    uint64_t totalStackPages = stackPages + guardPages;
+    uint64_t stackVirtTop = USER_STACK_TOP;
+    uint64_t stackVirtBase = stackVirtTop - totalStackPages * 4096;
+
+    for (uint64_t i = guardPages; i < totalStackPages; i++)
+    {
+        VirtualAddress vaddr(stackVirtBase + i * 4096);
+        PhysicalAddress phys = PmmAllocPage(MemTag::User, proc->pid);
+        if (!phys || !VmmMapPage(proc->pageTable, vaddr, phys,
+                                  VMM_WRITABLE | VMM_USER,
+                                  MemTag::User, proc->pid))
+        {
+            SerialPuts("EXEC: stack allocation failed\n");
+            return 0;
+        }
+        auto* p = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
+        for (uint64_t b = 0; b < 4096; b++) p[b] = 0;
+    }
+    proc->stackBase = stackVirtBase + guardPages * 4096;
+    proc->stackTop  = stackVirtTop - 8;
+
+    // 5. Build user stack with argc/argv/envp/auxv
+    uint64_t userSP = SetupUserStack(proc, argc, argv, envc, envp);
+    proc->stackTop = userSP;
+
+    // 6. Set up TLS
+    proc->fsBase = 0;
+    if (proc->elf.tlsTotalSize > 0)
+    {
+        uint64_t tlsPages = (proc->elf.tlsTotalSize + 64 + 4095) / 4096;
+        uint64_t tlsBase = stackVirtBase - guardPages * 4096 - tlsPages * 4096;
+
+        auto tlsToKernel = [&](uint64_t userAddr) -> uint8_t* {
+            PhysicalAddress phys = VmmVirtToPhys(proc->pageTable, VirtualAddress(userAddr));
+            return phys ? reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw()) : nullptr;
+        };
+
+        bool tlsOk = true;
+        for (uint64_t i = 0; i < tlsPages; i++)
+        {
+            VirtualAddress vaddr(tlsBase + i * 4096);
+            PhysicalAddress phys = PmmAllocPage(MemTag::User, proc->pid);
+            if (!phys || !VmmMapPage(proc->pageTable, vaddr, phys,
+                                      VMM_WRITABLE | VMM_USER,
+                                      MemTag::User, proc->pid))
+            {
+                tlsOk = false;
+                break;
+            }
+            auto* p = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
+            for (uint64_t b = 0; b < 4096; b++) p[b] = 0;
+        }
+
+        if (tlsOk)
+        {
+            if (proc->elf.tlsInitData && proc->elf.tlsInitSize > 0)
+            {
+                for (uint64_t i = 0; i < proc->elf.tlsInitSize; ++i)
+                {
+                    uint8_t* src = tlsToKernel(
+                        reinterpret_cast<uint64_t>(proc->elf.tlsInitData) + i);
+                    uint8_t* dst = tlsToKernel(tlsBase + i);
+                    if (src && dst) *dst = *src;
+                }
+            }
+
+            uint64_t tcbAddr = tlsBase + proc->elf.tlsTotalSize;
+            tcbAddr = (tcbAddr + 15) & ~15ULL;
+
+            auto* tcbSlot = reinterpret_cast<uint64_t*>(tlsToKernel(tcbAddr));
+            if (tcbSlot) *tcbSlot = tcbAddr;
+
+            uint64_t canary = 0x57a0000012345678ULL;
+            if (tcbAddr + 48 < tlsBase + tlsPages * 4096)
+            {
+                auto* canarySlot = reinterpret_cast<uint64_t*>(
+                    tlsToKernel(tcbAddr + 0x28));
+                if (canarySlot) *canarySlot = canary;
+            }
+
+            proc->fsBase = tcbAddr;
+        }
+    }
+
+    // 7. Clear framebuffer state (new program starts fresh)
+    proc->fbVirtual = nullptr;
+    proc->fbVirtualSize = 0;
+    proc->fbVfbWidth = 0;
+    proc->fbVfbHeight = 0;
+    proc->fbVfbStride = 0;
+    proc->fbDestX = 0;
+    proc->fbDestY = 0;
+    proc->fbScale = 0;
+    proc->fbDirty = 0;
+    proc->fbExitColor = 0;
+
+    // 8. Close O_CLOEXEC fds (we don't track this flag yet, so keep all open)
+    // For now, FDs 0/1/2 are preserved (stdin/stdout/stderr).
+
+    *outStackPtr = userSP;
+    return proc->elf.entryPoint;
+}
+
 } // namespace brook

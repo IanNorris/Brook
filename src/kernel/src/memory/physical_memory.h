@@ -74,6 +74,10 @@ uint16_t PmmGetPid(PhysicalAddress physAddr);
 // the PID list. PmmKillPid(KernelPid) is a no-op to protect kernel pages.
 void PmmKillPid(uint16_t pid);
 
+// Free all physical pages owned by a PID that have the given MemTag.
+// Leaves other pages (e.g., kernel stack) untouched.
+void PmmFreeByTag(uint16_t pid, MemTag tag);
+
 // Enumerate pages owned by a PID. Calls callback(physAddr, tag, ctx) for each.
 void PmmEnumeratePid(uint16_t pid,
                      bool (*callback)(PhysicalAddress physAddr, MemTag tag, void* ctx),
