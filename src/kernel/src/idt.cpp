@@ -3,6 +3,7 @@
 #include "serial.h"
 #include "panic.h"
 #include "process.h"
+#include "scheduler.h"
 
 // ---- IDT storage ----
 static IdtEntry      g_idt[256];
@@ -262,11 +263,20 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
     }
     ExcStackWalk(rbp, 32);
 
+    // If the fault came from user mode (ring 3), kill the process and continue.
+    // Kernel-mode faults are unrecoverable — halt.
+    if ((frame->cs & 3) == 3)
+    {
+        brook::SerialPuts("=== KILLING PROCESS ===\n");
+        --excDepth;
+        __asm__ volatile("sti");
+        brook::SchedulerExitCurrentProcess(-static_cast<int>(vector));
+        // Never reached.
+    }
+
     brook::SerialPuts("=== HALTED ===\n");
 
-    // Halt here — KernelPanic's va_list formatting is unreliable with
-    // -mgeneral-regs-only.  The direct serial dump above is the authoritative
-    // exception output.
+    // Halt here — kernel-mode exception is unrecoverable.
     for (;;) { __asm__ volatile("hlt"); }
 }
 

@@ -17,7 +17,7 @@ DOOM_SRCS="
 dummy.c am_map.c doomdef.c doomstat.c dstrings.c d_event.c d_items.c d_iwad.c
 d_loop.c d_main.c d_mode.c d_net.c f_finale.c f_wipe.c g_game.c hu_lib.c
 hu_stuff.c info.c i_cdmus.c i_endoom.c i_joystick.c i_scale.c i_sound.c
-i_system.c i_timer.c memio.c m_argv.c m_bbox.c m_cheat.c m_config.c
+i_timer.c memio.c m_argv.c m_bbox.c m_cheat.c m_config.c
 m_controls.c m_fixed.c m_menu.c m_misc.c m_random.c p_ceilng.c p_doors.c
 p_enemy.c p_floor.c p_inter.c p_lights.c p_map.c p_maputl.c p_mobj.c
 p_plats.c p_pspr.c p_saveg.c p_setup.c p_sight.c p_spec.c p_switch.c
@@ -38,10 +38,14 @@ for src in $DOOM_SRCS; do
     OBJS="$OBJS $obj"
 done
 
-# Compile Brook platform file
+# Compile Brook platform file and overrides
 echo "  CC  doomgeneric_brook.c"
 $CC $CFLAGS -I"$DOOM_SRC" -c "$BROOK_SRC/doomgeneric_brook.c" -o "$BUILD_DIR/doomgeneric_brook.o"
 OBJS="$OBJS $BUILD_DIR/doomgeneric_brook.o"
+
+echo "  CC  i_system.c (Brook override)"
+$CC $CFLAGS -I"$DOOM_SRC" -c "$BROOK_SRC/i_system.c" -o "$BUILD_DIR/i_system_brook.o"
+OBJS="$OBJS $BUILD_DIR/i_system_brook.o"
 
 # Link
 echo "  LD  doom"

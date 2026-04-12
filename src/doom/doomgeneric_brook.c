@@ -236,12 +236,7 @@ void DG_DrawFrame()
             "BENCH: %d frames in %ld ms (wall), %ld fps avg\n",
             s_FrameCount, elapsed, fps);
         write(STDERR_FILENO, buf, len);
-        // Spin forever instead of exit() — process exit has a known bug
-        // with page table cleanup. This lets all instances report results.
-        for (;;) {
-            struct timespec ts = { 1, 0 };
-            nanosleep(&ts, NULL);
-        }
+        exit(0);
     }
 }
 
