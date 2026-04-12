@@ -172,7 +172,7 @@ fi
 
 if [ "$HEADLESS" -eq 1 ]; then
     SERIAL_OPT="-serial file:/tmp/brook_serial.log"
-    DISPLAY_OPT="-display none"
+    DISPLAY_OPT="-vnc none"
 else
     SERIAL_OPT="-serial stdio"
     DISPLAY_OPT="-display gtk"

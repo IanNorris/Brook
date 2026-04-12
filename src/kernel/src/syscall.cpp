@@ -196,6 +196,10 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
         return static_cast<int64_t>(count);
     }
 
+    // /dev/null — discard all writes
+    if (fde->type == FdType::DevNull)
+        return static_cast<int64_t>(count);
+
     // Write to pipe — block until at least some bytes are written
     if (fde->type == FdType::Pipe && fde->handle)
     {
@@ -242,23 +246,167 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         return ret;
     }
 
+    // /dev/null — always EOF
+    if (fde->type == FdType::DevNull)
+        return 0;
+
     if (fde->type == FdType::DevKeyboard)
     {
-        // Non-blocking read of raw scancodes from input subsystem
         auto* buf = reinterpret_cast<uint8_t*>(bufAddr);
-        uint64_t bytesRead = 0;
-        while (bytesRead < count)
+
+        // Non-blocking raw scancode mode (DOOM uses ioctl cmd=1 to enable this)
+        if (fde->flags & 1)
+        {
+            uint64_t bytesRead = 0;
+            while (bytesRead < count)
+            {
+                InputEvent ev;
+                if (!InputPollEvent(&ev)) break;
+                uint8_t sc = ev.scanCode;
+                if (ev.type == InputEventType::KeyRelease)
+                    sc |= 0x80;
+                buf[bytesRead++] = sc;
+            }
+            return static_cast<int64_t>(bytesRead);
+        }
+
+        // Non-canonical (raw) terminal mode: return ASCII chars as they arrive.
+        // Shells like ash use this for line editing.
+        if (!proc->ttyCanonical)
+        {
+            uint64_t bytesRead = 0;
+            while (bytesRead < count)
+            {
+                InputEvent ev;
+                if (!InputPollEvent(&ev))
+                {
+                    if (bytesRead > 0) break; // return what we have
+                    SchedulerYield();
+                    continue;
+                }
+                if (ev.type != InputEventType::KeyPress) continue;
+                char c = ev.ascii;
+                if (c == 0) continue; // non-printable (arrows, etc.) — skip
+
+                // Map Enter scancode to '\n'
+                if (ev.scanCode == 0x1C) c = '\n';
+
+                // Ctrl+C → send interrupt character
+                if ((ev.modifiers & INPUT_MOD_CTRL) && (ev.scanCode == 0x2E))
+                    c = '\x03';
+
+                // Ctrl+D → EOF
+                if ((ev.modifiers & INPUT_MOD_CTRL) && (ev.scanCode == 0x20))
+                {
+                    if (bytesRead == 0) return 0; // EOF
+                    break;
+                }
+
+                buf[bytesRead++] = static_cast<uint8_t>(c);
+
+                // Echo if enabled
+                if (proc->ttyEcho)
+                {
+                    if (c == '\n')
+                        SerialWriterEnqueue("\r\n", 2);
+                    else if (c >= ' ' && c <= '~')
+                        SerialWriterEnqueue(&c, 1);
+                    else if (c == '\x7f' || c == '\b')
+                        SerialWriterEnqueue("\b \b", 3);
+                }
+            }
+            return static_cast<int64_t>(bytesRead);
+        }
+
+        // Cooked terminal mode: blocking, ASCII translation, line buffering, echo.
+        // Buffer a full line (until Enter), then return it.
+        // This matches canonical terminal behavior that shells expect.
+        static constexpr uint32_t LINE_BUF_MAX = 256;
+        char lineBuf[LINE_BUF_MAX];
+        uint32_t lineLen = 0;
+
+        for (;;)
         {
             InputEvent ev;
-            if (!InputPollEvent(&ev)) break;
+            if (!InputPollEvent(&ev))
+            {
+                SchedulerYield();
+                continue;
+            }
 
-            // Encode as PS/2-style scancode: bit 7 = release
-            uint8_t sc = ev.scanCode;
-            if (ev.type == InputEventType::KeyRelease)
-                sc |= 0x80;
-            buf[bytesRead++] = sc;
+            // Only process key presses, ignore releases
+            if (ev.type != InputEventType::KeyPress)
+                continue;
+
+            char c = ev.ascii;
+
+            // Ctrl+C → interrupt (for now, just send '\x03')
+            if ((ev.modifiers & INPUT_MOD_CTRL) && (ev.scanCode == 0x2E)) // 'C'
+            {
+                // Echo ^C and return empty line
+                SerialWriterEnqueue("^C\n", 3);
+                buf[0] = '\n';
+                return 1;
+            }
+
+            // Ctrl+D → EOF
+            if ((ev.modifiers & INPUT_MOD_CTRL) && (ev.scanCode == 0x20)) // 'D'
+            {
+                if (lineLen == 0) return 0; // EOF
+                // Otherwise flush current line
+                break;
+            }
+
+            // Enter/Return
+            if (c == '\r' || c == '\n' || ev.scanCode == 0x1C)
+            {
+                SerialWriterEnqueue("\n", 1);
+                if (lineLen < LINE_BUF_MAX)
+                    lineBuf[lineLen++] = '\n';
+                break;
+            }
+
+            // Backspace
+            if (c == '\b' || ev.scanCode == 0x0E)
+            {
+                if (lineLen > 0)
+                {
+                    lineLen--;
+                    SerialWriterEnqueue("\b \b", 3); // erase character
+                }
+                continue;
+            }
+
+            // Tab → send tab character
+            if (ev.scanCode == 0x0F)
+            {
+                if (lineLen < LINE_BUF_MAX - 1)
+                {
+                    lineBuf[lineLen++] = '\t';
+                    SerialWriterEnqueue("\t", 1);
+                }
+                continue;
+            }
+
+            // Regular printable character
+            if (c >= ' ' && c <= '~')
+            {
+                if (lineLen < LINE_BUF_MAX - 1)
+                {
+                    lineBuf[lineLen++] = c;
+                    SerialWriterEnqueue(&c, 1); // echo
+                }
+                continue;
+            }
+
+            // Ignore non-printable keys (arrows, function keys, etc.)
         }
-        return static_cast<int64_t>(bytesRead);
+
+        // Copy line buffer to user buffer
+        uint64_t copyLen = lineLen;
+        if (copyLen > count) copyLen = count;
+        __builtin_memcpy(buf, lineBuf, copyLen);
+        return static_cast<int64_t>(copyLen);
     }
 
     // Read from pipe — block until data available or all writers closed
@@ -335,6 +483,23 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         int fd = FdAlloc(proc, FdType::DevKeyboard, nullptr);
         if (fd < 0) return -EMFILE;
         DbgPrintf("sys_open: keyboard → fd %d\n", fd);
+        return fd;
+    }
+
+    // /dev/tty — controlling terminal (returns keyboard for read, serial for write)
+    if (StrEq(path, "/dev/tty") || StrEq(path, "/dev/console"))
+    {
+        int fd = FdAlloc(proc, FdType::DevKeyboard, nullptr);
+        if (fd < 0) return -EMFILE;
+        DbgPrintf("sys_open: %s → fd %d (keyboard/tty)\n", path, fd);
+        return fd;
+    }
+
+    // /dev/null — discard writes, EOF on read
+    if (StrEq(path, "/dev/null"))
+    {
+        int fd = FdAlloc(proc, FdType::DevNull, nullptr);
+        if (fd < 0) return -EMFILE;
         return fd;
     }
 
@@ -1549,13 +1714,119 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
             fde->flags |= 1; // mark as non-blocking
             return 0;
         }
+
+        // TCGETS — return current termios state
+        if (cmd == 0x5401)
+        {
+            auto* t = reinterpret_cast<uint32_t*>(arg);
+            t[0] = 0x0500;   // c_iflag: ICRNL | IXON
+            t[1] = 0x0005;   // c_oflag: OPOST | ONLCR
+            t[2] = 0x00BF;   // c_cflag: CS8 | CREAD | HUPCL | B38400
+            // Build c_lflag from actual state
+            uint32_t lflag = 0x8A31; // base: ECHOE|ECHOK|ISIG|IEXTEN|ECHOCTL|ECHOKE
+            if (proc->ttyCanonical) lflag |= 0x0002; // ICANON
+            if (proc->ttyEcho)      lflag |= 0x0008; // ECHO
+            t[3] = lflag;
+            auto* cc = reinterpret_cast<uint8_t*>(&t[4]);
+            cc[0] = 0;
+            __builtin_memset(&cc[1], 0, 19);
+            cc[1] = 0x03;  // VINTR
+            cc[2] = 0x1C;  // VQUIT
+            cc[3] = 0x7F;  // VERASE
+            cc[4] = 0x15;  // VKILL
+            cc[5] = 0x04;  // VEOF
+            return 0;
+        }
+
+        // TCSETS/TCSETSW/TCSETSF — track ICANON and ECHO flags
+        if (cmd >= 0x5402 && cmd <= 0x5404)
+        {
+            auto* t = reinterpret_cast<const uint32_t*>(arg);
+            Process* cur = ProcessCurrent();
+            if (cur)
+            {
+                uint32_t lflag = t[3];
+                cur->ttyCanonical = (lflag & 0x0002) != 0; // ICANON
+                cur->ttyEcho      = (lflag & 0x0008) != 0; // ECHO
+            }
+            return 0;
+        }
+
+        // TIOCGPGRP
+        if (cmd == 0x540F)
+        {
+            auto* pgrp = reinterpret_cast<int*>(arg);
+            Process* cur = ProcessCurrent();
+            *pgrp = cur ? static_cast<int>(cur->pid) : 1;
+            return 0;
+        }
+
+        // TIOCSPGRP, TIOCSCTTY
+        if (cmd == 0x5410 || cmd == 0x540E)
+            return 0;
+
+        // TIOCGWINSZ
+        if (cmd == 0x5413)
+        {
+            auto* ws = reinterpret_cast<uint16_t*>(arg);
+            ws[0] = 25; ws[1] = 80; ws[2] = 0; ws[3] = 0;
+            return 0;
+        }
+
         return 0;
     }
 
     // tcgetattr/tcsetattr arrive as ioctl on stdin (fd 0)
     // TCGETS = 0x5401, TCSETS/TCSETSW/TCSETSF = 0x5402-0x5404
-    if (fd <= 2 && cmd >= 0x5401 && cmd <= 0x5404)
-        return 0; // stub success
+    if (fd <= 2 && cmd == 0x5401)
+    {
+        auto* t = reinterpret_cast<uint32_t*>(arg);
+        t[0] = 0x0500;   // c_iflag: ICRNL | IXON
+        t[1] = 0x0005;   // c_oflag: OPOST | ONLCR
+        t[2] = 0x00BF;   // c_cflag: CS8 | CREAD | HUPCL | B38400
+        uint32_t lflag = 0x8A31; // base: ECHOE|ECHOK|ISIG|IEXTEN|ECHOCTL|ECHOKE
+        if (proc->ttyCanonical) lflag |= 0x0002; // ICANON
+        if (proc->ttyEcho)      lflag |= 0x0008; // ECHO
+        t[3] = lflag;
+        auto* cc = reinterpret_cast<uint8_t*>(&t[4]);
+        cc[0] = 0;
+        __builtin_memset(&cc[1], 0, 19);
+        cc[1] = 0x03;  // VINTR = Ctrl+C
+        cc[2] = 0x1C;  // VQUIT = Ctrl+backslash
+        cc[3] = 0x7F;  // VERASE = DEL
+        cc[4] = 0x15;  // VKILL = Ctrl+U
+        cc[5] = 0x04;  // VEOF = Ctrl+D
+        return 0;
+    }
+    if (fd <= 2 && cmd >= 0x5402 && cmd <= 0x5404)
+    {
+        auto* t = reinterpret_cast<const uint32_t*>(arg);
+        Process* cur = ProcessCurrent();
+        if (cur)
+        {
+            uint32_t lflag = t[3];
+            cur->ttyCanonical = (lflag & 0x0002) != 0; // ICANON
+            cur->ttyEcho      = (lflag & 0x0008) != 0; // ECHO
+        }
+        return 0;
+    }
+
+    // TIOCGPGRP = 0x540F — get foreground process group
+    if (fd <= 2 && cmd == 0x540F)
+    {
+        auto* pgrp = reinterpret_cast<int*>(arg);
+        Process* cur = ProcessCurrent();
+        *pgrp = cur ? static_cast<int>(cur->pid) : 1;
+        return 0;
+    }
+
+    // TIOCSPGRP = 0x5410 — set foreground process group
+    if (fd <= 2 && cmd == 0x5410)
+        return 0;
+
+    // TIOCSCTTY = 0x540E — set controlling terminal
+    if (fd <= 2 && cmd == 0x540E)
+        return 0;
 
     // TIOCGWINSZ = 0x5413 — terminal window size
     if (fd <= 2 && cmd == 0x5413)
@@ -1667,6 +1938,23 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
         for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
         st->st_mode = 0020666; // S_IFCHR
         st->st_rdev = 0x1D00;
+        st->st_blksize = 4096;
+        return 0;
+    }
+
+    if (fde->type == FdType::DevKeyboard || fde->type == FdType::DevNull) {
+        auto* raw = reinterpret_cast<uint8_t*>(st);
+        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        st->st_mode = 0020666; // S_IFCHR
+        st->st_rdev = (fde->type == FdType::DevNull) ? 0x0103 : 0x0400;
+        st->st_blksize = 4096;
+        return 0;
+    }
+
+    if (fde->type == FdType::Pipe) {
+        auto* raw = reinterpret_cast<uint8_t*>(st);
+        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        st->st_mode = 0010666; // S_IFIFO | rw-rw-rw-
         st->st_blksize = 4096;
         return 0;
     }

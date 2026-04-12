@@ -372,6 +372,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
                  (unsigned long)(brook::PmmGetFreePageCount() * 4 / 1024),
                  (unsigned long)(brook::PmmGetTotalPageCount() * 4 / 1024));
 
+    // Initialise input subsystem before modules so keyboard module can register.
+    brook::InputInit();
+
     // Phase 1: load early modules from embedded ramdisk (mounted at "/").
     //   These run before virtio, so they can't access /boot yet.
     //   Keyboard is NOT here — it needs APIC which is already set up, but
@@ -406,8 +409,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         brook::SchedulerInit();
         brook::CompositorInit();
 
-        // Initialise input subsystem, then keyboard.
-        brook::InputInit();
+        // If keyboard module wasn't loaded, fall back to direct init.
         if (acpiOk && !brook::KbdIsAvailable())
         {
             brook::KPuts("KBD: ps2_kbd module not loaded — falling back to direct init\n");

@@ -91,7 +91,8 @@ enum class FdType : uint8_t
     Vnode,         // Regular VFS file
     DevFramebuf,   // /dev/fb0
     DevKeyboard,   // /dev/keyboard
-    Pipe,          // Future
+    Pipe,          // pipe() read/write end
+    DevNull,       // /dev/null — discard writes, EOF on read
 };
 
 struct FdEntry
@@ -208,6 +209,10 @@ struct Process
 
     // True if this is a kernel-mode thread (ring 0, kernel CR3, no user stack).
     bool isKernelThread;
+
+    // TTY mode: true = canonical (line buffered), false = raw (char at a time)
+    bool ttyCanonical;
+    bool ttyEcho;
 
     // Fork child state: when true, the trampoline enters user mode at
     // forkReturnRip with RAX=0 (child's fork() return value).

@@ -432,16 +432,46 @@ static int ExecCommand(int argc, const char* const* argv)
         return 0;
     }
 
-    // Built-in: run <path> [args...] — explicit run command
+    // Built-in: run [--as <name>] <path> [args...] — explicit run command
+    // --as overrides argv[0] for the spawned process (useful for busybox applets)
     if (StrEq(cmd, "run") && argc >= 2)
     {
-        char resolved[128];
-        if (!ResolveBinaryPath(argv[1], resolved, sizeof(resolved)))
+        int pathIdx = 1;
+        const char* argv0Override = nullptr;
+
+        if (argc >= 4 && StrEq(argv[1], "--as"))
         {
-            KPrintf("shell: '%s' not found\n", argv[1]);
+            argv0Override = argv[2];
+            pathIdx = 3;
+        }
+
+        if (pathIdx >= argc)
+        {
+            KPrintf("usage: run [--as <name>] <path> [args...]\n");
             return -1;
         }
-        SpawnProcess(resolved, argc - 1, argv + 1);
+
+        char resolved[128];
+        if (!ResolveBinaryPath(argv[pathIdx], resolved, sizeof(resolved)))
+        {
+            KPrintf("shell: '%s' not found\n", argv[pathIdx]);
+            return -1;
+        }
+
+        if (argv0Override)
+        {
+            // Build a new argv with the override as argv[0]
+            const int newArgc = argc - pathIdx;
+            const char* newArgv[32];
+            newArgv[0] = argv0Override;
+            for (int i = 1; i < newArgc && i < 31; ++i)
+                newArgv[i] = argv[pathIdx + i];
+            SpawnProcess(resolved, newArgc, newArgv);
+        }
+        else
+        {
+            SpawnProcess(resolved, argc - pathIdx, argv + pathIdx);
+        }
         return 0;
     }
 
@@ -533,7 +563,7 @@ static int ExecCommand(int argc, const char* const* argv)
 static void CmdHelp()
 {
     KPrintf("Brook shell commands:\n");
-    KPrintf("  run <prog> [args]  Launch a program\n");
+    KPrintf("  run [--as name] <prog> [args]  Launch a program\n");
     KPrintf("  <prog> [args]      Same as 'run <prog>'\n");
     KPrintf("  wait               Wait for all processes to exit\n");
     KPrintf("  ps                 List running processes\n");

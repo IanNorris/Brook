@@ -199,6 +199,7 @@ target_compile_options(kernel PRIVATE
     -Werror
     -Wshadow
     -Wno-unused-parameter
+    -Wno-unused-command-line-argument
     -msse2
     -mfpmath=sse   # use SSE for scalar float, not x87 (cleaner ABI)
 )
@@ -275,6 +276,7 @@ set(DRIVER_MODULE_FLAGS
     "-Wall" "-Wextra" "-Werror"
     "-Wshadow"
     "-Wno-unused-parameter"
+    "-Wno-unused-command-line-argument"
     "-msse2" "-mfpmath=sse"
 )
 

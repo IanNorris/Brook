@@ -1,4 +1,21 @@
-# Brook OS — Dynamic Driver Module Loading
+# Brook OS — Roadmap
+
+## Recently Completed
+- **pipe() + dup2()** — 4KB ring buffer pipes, FD duplication, refcounting
+- **Busybox working** — echo, uname, cat-via-pipe, ash shell all pass
+- **76 syscalls** implemented (was 51): poll, readlink, pipe2, kill, chdir, getrlimit, sysinfo, gettid, sigaltstack, statfs, select, sendfile, etc.
+- **Linux open() flag translation** — O_LARGEFILE etc. properly mapped to VFS flags
+- **syscheck test** — 28/28 comprehensive syscall compatibility tests pass
+- **Lua 5.4 interpreter** — runs arithmetic, strings, tables, fibonacci, factorial, coroutines
+- **Stress test** — 40/40 fork+pipe+wait cycles pass under concurrent load
+- **fork + waitpid + execve** — full POSIX process lifecycle
+
+## Current Branch: fix/smp-scheduler-races
+Latest commit: a088da4 (stress test)
+
+---
+
+## Phase: Dynamic Driver Module Loading
 
 ## Problem & Approach
 

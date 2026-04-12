@@ -1,0 +1,2 @@
+# Brook OS boot script — interactive echo test (keyboard input)
+run /boot/BIN/ECHOTEST

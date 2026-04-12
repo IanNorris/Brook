@@ -332,6 +332,10 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     proc->fds[2].type = FdType::Vnode; // treated as serial stderr in syscall
     proc->fds[2].refCount = 1;
 
+    // Default TTY mode: canonical with echo
+    proc->ttyCanonical = true;
+    proc->ttyEcho = true;
+
     // Build user stack with argc/argv/envp/auxv
     uint64_t userSP = SetupUserStack(proc, argc, argv, envc, envp);
 
@@ -700,6 +704,10 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     // (same virtual address, but backed by the child's physical pages)
     // No change needed — the virtual address is the same and the page table
     // now maps it to the child's copy.
+
+    // Inherit terminal mode from parent
+    child->ttyCanonical = parent->ttyCanonical;
+    child->ttyEcho = parent->ttyEcho;
 
     // Set child's name
     {

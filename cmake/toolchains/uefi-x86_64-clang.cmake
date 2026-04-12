@@ -29,6 +29,8 @@ set(CMAKE_LINKER ${LLD_LINK})
 set(_UEFI_COMMON_FLAGS
     "--target=x86_64-unknown-windows"
     "--no-default-config"
+    "-Wno-unused-command-line-argument"
+    "-fno-pic"
     "-ffreestanding"
     "-fno-stack-protector"
     "-fshort-wchar"
