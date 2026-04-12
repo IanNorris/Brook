@@ -113,6 +113,14 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
 {
     __asm__ volatile("cli");
 
+    // The __attribute__((interrupt)) stubs do NOT perform SWAPGS.
+    // If we entered from user mode (ring 3), GS base is the user's TLS pointer.
+    // We must swap to get the kernel per-CPU pointer so that later code
+    // (context_switch, etc.) leaves GS in a consistent state.
+    bool fromUser = (frame->cs & 3) != 0;
+    if (fromUser)
+        __asm__ volatile("swapgs");
+
     // Prevent recursive exceptions from eating the entire stack.
     static volatile int excDepth = 0;
     if (excDepth > 0)
