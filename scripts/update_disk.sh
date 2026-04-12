@@ -85,6 +85,14 @@ for build_type in debug release; do
     fi
 done
 
+# --- Test apps (static musl binaries) ---
+apps_dir="${ROOT_DIR}/build/apps"
+if [ -d "$apps_dir" ] && ls "$apps_dir"/* &>/dev/null 2>&1; then
+    echo "Apps:"
+    mmd -D s -i "${DISK_IMG}" "::BIN" 2>/dev/null || true
+    sync_dir_contents "$apps_dir" "BIN"
+fi
+
 # --- DOOM binary ---
 doom_bin="${ROOT_DIR}/build/doom/doom"
 if [ -f "$doom_bin" ]; then

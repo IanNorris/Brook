@@ -39,7 +39,17 @@ else
     echo ""
 fi
 
-# 3. Update disk image
+# 3. Userspace test apps (requires musl cross-compiler)
+if command -v x86_64-unknown-linux-musl-gcc &>/dev/null; then
+    echo "--- Apps ---"
+    "${SCRIPT_DIR}/build_apps.sh"
+    echo ""
+else
+    echo "--- Apps (skipped — x86_64-unknown-linux-musl-gcc not found) ---"
+    echo ""
+fi
+
+# 4. Update disk image
 echo "--- Disk Image ---"
 "${SCRIPT_DIR}/update_disk.sh" --create
 echo ""
