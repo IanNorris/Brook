@@ -467,14 +467,8 @@ void ProcessDestroy(Process* proc)
 {
     if (!proc) return;
 
-    // Save the current page table — we must not corrupt the running process's
-    // CR3 while reaping a terminated process on this CPU.
-    uint64_t savedCR3;
-    __asm__ volatile("mov %%cr3, %0" : "=r"(savedCR3));
-
-    // Switch to kernel page table for safe teardown (VmmDestroyUserPageTable
-    // walks via DMAP so this is belt-and-suspenders).
-    VmmSwitchPageTable(VmmKernelCR3());
+    // NOTE: All page table teardown uses the DMAP (direct physical map) for
+    // safe access regardless of the current CR3. No CR3 switch needed.
 
     // Close all file descriptors, releasing VFS/device resources
     for (uint32_t i = 0; i < MAX_FDS; ++i)
@@ -507,9 +501,6 @@ void ProcessDestroy(Process* proc)
     SchedulerRemoveProcess(proc);
 
     kfree(proc);
-
-    // Restore the page table of whatever process is actually running on this CPU.
-    __asm__ volatile("mov %0, %%cr3" : : "r"(savedCR3) : "memory");
 }
 
 } // namespace brook
