@@ -1,0 +1,2 @@
+# Brook OS boot script — stress test (fork+pipe+wait)
+run /boot/BIN/STRESSTEST
