@@ -138,6 +138,7 @@ struct Process
     ProcessState state;
     uint8_t  schedPriority;  // Initial scheduler priority (0=RT, 1=High, 2=Normal, 3=Low)
     int32_t  runningOnCpu;   // CPU index (-1 = not running, used for double-schedule detection)
+    volatile bool reapable;  // Set after context_switch completes away from this process
 
     // Scheduler linked-list pointers (circular doubly-linked ready queue)
     Process* schedNext;

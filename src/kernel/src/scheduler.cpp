@@ -65,12 +65,16 @@ struct PerCpuSchedState {
     uint64_t         sliceStartTick;
     KernelCpuEnv*    cpuEnv;
     Process*         pendingRequeue;   // Set before context_switch; consumed after
+    Process*         pendingRetire;    // Terminated process to mark reapable after context_switch
 };
 
 static PerCpuSchedState g_perCpu[SCHED_MAX_CPUS] = {};
 
 // Helpers
 static inline uint32_t ThisCpu() { return SmpCurrentCpuIndex(); }
+
+// Drain per-CPU bookkeeping after context_switch — forward declared, defined below.
+static void DrainPostSwitch(uint32_t cpu);
 
 // Update the per-CPU syscall stack pointer.
 static inline void SetSyscallStack(uint32_t cpuIdx, uint64_t stackTop)
@@ -140,6 +144,30 @@ static Process* PickNextLocked()
     return g_pidToProcess[pid];
 }
 
+// Drain per-CPU bookkeeping that was set before a context_switch.
+// Must be called after every context_switch resumption point (DoSwitch,
+// ProcessTrampoline, KernelThreadTrampoline).
+static void DrainPostSwitch(uint32_t cpu)
+{
+    // Mark any terminated process as safe to reap — by this point the CPU's
+    // RSP is on the NEW process's kernel stack, so the old stack is unused.
+    Process* retired = g_perCpu[cpu].pendingRetire;
+    g_perCpu[cpu].pendingRetire = nullptr;
+    if (retired)
+        __atomic_store_n(&retired->reapable, true, __ATOMIC_RELEASE);
+
+    // Re-enqueue the process we were switched away from.
+    Process* toRequeue = g_perCpu[cpu].pendingRequeue;
+    g_perCpu[cpu].pendingRequeue = nullptr;
+    if (toRequeue)
+    {
+        uint64_t rlf = SchedLockAcquire(g_readyLock);
+        if (toRequeue->state == ProcessState::Ready)
+            ReadyQueueInsertLocked(toRequeue);
+        SchedLockRelease(g_readyLock, rlf);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Idle process — halts until next interrupt (one per CPU)
 // ---------------------------------------------------------------------------
@@ -199,21 +227,11 @@ void SchedulerInit()
 
 // Trampoline for processes that haven't run yet.
 // Because context_switch jumps here instead of returning to DoSwitch,
-// we must manually drain the pending requeue that DoSwitch set up.
+// we must manually drain per-CPU bookkeeping that DoSwitch set up.
 static void ProcessTrampoline()
 {
     uint32_t cpu = ThisCpu();
-
-    // Drain the per-CPU requeue set by DoSwitch before context_switch.
-    Process* toRequeue = g_perCpu[cpu].pendingRequeue;
-    g_perCpu[cpu].pendingRequeue = nullptr;
-    if (toRequeue)
-    {
-        uint64_t rlf = SchedLockAcquire(g_readyLock);
-        if (toRequeue->state == ProcessState::Ready)
-            ReadyQueueInsertLocked(toRequeue);
-        SchedLockRelease(g_readyLock, rlf);
-    }
+    DrainPostSwitch(cpu);
 
     Process* proc = g_perCpu[cpu].currentProcess;
     DbgPrintf("SCHED: CPU%u entering user mode for '%s' (pid %u)\n",
@@ -231,16 +249,7 @@ void KernelThreadTrampoline()
 {
     uint32_t cpu = ThisCpu();
 
-    // Drain pending requeue (same as ProcessTrampoline).
-    Process* toRequeue = g_perCpu[cpu].pendingRequeue;
-    g_perCpu[cpu].pendingRequeue = nullptr;
-    if (toRequeue)
-    {
-        uint64_t rlf = SchedLockAcquire(g_readyLock);
-        if (toRequeue->state == ProcessState::Ready)
-            ReadyQueueInsertLocked(toRequeue);
-        SchedLockRelease(g_readyLock, rlf);
-    }
+    DrainPostSwitch(cpu);
 
     Process* proc = g_perCpu[cpu].currentProcess;
     DbgPrintf("SCHED: CPU%u starting kernel thread '%s' (pid %u)\n",
@@ -407,7 +416,9 @@ static void ReapTerminated()
     for (uint32_t i = 0; i < g_processCount; )
     {
         Process* p = g_allProcesses[i];
-        if (p->state == ProcessState::Terminated && p != g_perCpu[cpu].currentProcess)
+        if (p->state == ProcessState::Terminated
+            && __atomic_load_n(&p->reapable, __ATOMIC_ACQUIRE)
+            && p != g_perCpu[cpu].currentProcess)
         {
             SchedLockRelease(g_allProcLock, alf);
             DbgPrintf("SCHED: reaping '%s' (pid %u)\n", p->name, p->pid);
@@ -478,19 +489,7 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
                    &oldProc->fxsave, &newProc->fxsave);
 
     // --- We return here when another CPU (or this one) switches back to us ---
-    // Read the per-CPU pendingRequeue that was set by THIS physical CPU
-    // just before the context_switch that resumed us.
-    uint32_t resumedCpu = ThisCpu();
-    Process* toRequeue = g_perCpu[resumedCpu].pendingRequeue;
-    g_perCpu[resumedCpu].pendingRequeue = nullptr;
-
-    if (toRequeue)
-    {
-        uint64_t rlf6 = SchedLockAcquire(g_readyLock);
-        if (toRequeue->state == ProcessState::Ready)
-            ReadyQueueInsertLocked(toRequeue);
-        SchedLockRelease(g_readyLock, rlf6);
-    }
+    DrainPostSwitch(ThisCpu());
 }
 
 void SchedulerTimerTick()
@@ -619,6 +618,11 @@ void SchedulerYield()
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
     GdtSetTssRsp0ForCpu(cpu, next->kernelStackTop);
     SetSyscallStack(cpu, next->kernelStackTop);
+
+    // Mark this terminated process for deferred reap — DrainPostSwitch on the
+    // resumed process will set reapable once the context_switch is complete
+    // and this kernel stack is no longer in use.
+    g_perCpu[cpu].pendingRetire = proc;
 
     context_switch(&proc->savedCtx, &next->savedCtx,
                    &proc->fxsave, &next->fxsave);
