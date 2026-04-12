@@ -408,6 +408,8 @@ void PmmKillPid(uint16_t pid)
     if (!g_pageDescs) return;
     if (pid == KernelPid) return;  // never kill kernel pages
 
+    uint64_t flags = SpinLockAcquire(&g_pmmLock);
+
     uint32_t idx = g_pidLists[pid].head;
     uint32_t count = 0;
 
@@ -432,6 +434,8 @@ void PmmKillPid(uint16_t pid)
     }
 
     g_pidLists[pid] = { PMM_NULL_PAGE, PMM_NULL_PAGE, 0, 0 };
+
+    SpinLockRelease(&g_pmmLock, flags);
 
     SerialPrintf("PMM: PmmKillPid(%u): freed %u pages\n",
                  static_cast<uint32_t>(pid), count);

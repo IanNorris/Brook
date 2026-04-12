@@ -186,7 +186,7 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
     // Uses the direct physical map (DIRECT_MAP_BASE) to read page tables safely.
     if (vector == 14)
     {
-        static constexpr uint64_t DMAP = 0xFFFF800000000000ULL;
+        static constexpr uint64_t DMAP_USR = 0xFFFF800000000000ULL;
 
         uint64_t cr3val;
         __asm__ volatile("movq %%cr3, %0" : "=r"(cr3val));
@@ -195,7 +195,7 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
         brook::SerialPuts("  --- page table walk ---\n");
         brook::SerialPuts("  CR3   "); ExcPutHex(cr3val); brook::SerialPuts("\n");
 
-        uint64_t* pml4 = reinterpret_cast<uint64_t*>(DMAP + cr3val);
+        uint64_t* pml4 = reinterpret_cast<uint64_t*>(DMAP_USR + cr3val);
         uint64_t pml4idx = (cr2 >> 39) & 0x1FF;
         uint64_t pml4e = pml4[pml4idx];
         brook::SerialPuts("  PML4["); ExcPutHex(pml4idx); brook::SerialPuts("] = ");
@@ -203,7 +203,7 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
 
         if (pml4e & 1)
         {
-            uint64_t* pdpt = reinterpret_cast<uint64_t*>(DMAP + (pml4e & 0x000FFFFFFFFFF000ULL));
+            uint64_t* pdpt = reinterpret_cast<uint64_t*>(DMAP_USR + (pml4e & 0x000FFFFFFFFFF000ULL));
             uint64_t pdptidx = (cr2 >> 30) & 0x1FF;
             uint64_t pdpte = pdpt[pdptidx];
             brook::SerialPuts("  PDPT["); ExcPutHex(pdptidx); brook::SerialPuts("] = ");
@@ -211,7 +211,7 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
 
             if (pdpte & 1)
             {
-                uint64_t* pd = reinterpret_cast<uint64_t*>(DMAP + (pdpte & 0x000FFFFFFFFFF000ULL));
+                uint64_t* pd = reinterpret_cast<uint64_t*>(DMAP_USR + (pdpte & 0x000FFFFFFFFFF000ULL));
                 uint64_t pdidx = (cr2 >> 21) & 0x1FF;
                 uint64_t pde = pd[pdidx];
                 brook::SerialPuts("  PD["); ExcPutHex(pdidx); brook::SerialPuts("] = ");
@@ -219,7 +219,7 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
 
                 if ((pde & 1) && !(pde & (1ULL << 7)))
                 {
-                    uint64_t* pt = reinterpret_cast<uint64_t*>(DMAP + (pde & 0x000FFFFFFFFFF000ULL));
+                    uint64_t* pt = reinterpret_cast<uint64_t*>(DMAP_USR + (pde & 0x000FFFFFFFFFF000ULL));
                     uint64_t ptidx = (cr2 >> 12) & 0x1FF;
                     uint64_t pte = pt[ptidx];
                     brook::SerialPuts("  PT["); ExcPutHex(ptidx); brook::SerialPuts("] = ");
@@ -241,18 +241,41 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
         brook::SerialPuts("  --- end walk ---\n");
     }
 
-    // Walk the frame-pointer chain from the exception context.
-    // For user-mode faults, dump a few values from the user stack to help debug.
+    // For user-mode faults, dump a few values from the user stack.
+    // Walk the page table first to avoid nested faults on corrupted mappings.
     if ((frame->cs & 3) == 3)  // user mode
     {
         brook::SerialPuts("  --- user stack dump (RSP) ---\n");
         auto userRsp = frame->sp;
-        // Read up to 8 values from the user stack for debugging.
+        static constexpr uint64_t DMAP_USR = 0xFFFF800000000000ULL;
+        uint64_t cr3val;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3val));
         for (int i = 0; i < 8; ++i)
         {
             auto addr = userRsp + static_cast<uint64_t>(i) * 8;
-            if (addr >= 0x800000000000ULL) break;  // not user space
-            uint64_t val = *reinterpret_cast<uint64_t*>(addr);
+            if (addr >= 0x800000000000ULL) break;
+
+            // Safe read: walk page table via DMAP to verify mapping exists
+            uint64_t* l4 = reinterpret_cast<uint64_t*>(DMAP_USR + (cr3val & 0x000FFFFFFFFFF000ULL));
+            uint64_t l4e = l4[(addr >> 39) & 0x1FF];
+            if (!(l4e & 1)) { brook::SerialPuts("    (unmapped PML4)\n"); break; }
+            uint64_t* l3 = reinterpret_cast<uint64_t*>(DMAP_USR + (l4e & 0x000FFFFFFFFFF000ULL));
+            uint64_t l3e = l3[(addr >> 30) & 0x1FF];
+            if (!(l3e & 1)) { brook::SerialPuts("    (unmapped PDPT)\n"); break; }
+            uint64_t* l2 = reinterpret_cast<uint64_t*>(DMAP_USR + (l3e & 0x000FFFFFFFFFF000ULL));
+            uint64_t l2e = l2[(addr >> 21) & 0x1FF];
+            if (!(l2e & 1)) { brook::SerialPuts("    (unmapped PD)\n"); break; }
+            uint64_t physPage;
+            if (l2e & 0x80) { // 2MB page
+                physPage = (l2e & 0x000FFFFFFFE00000ULL) + (addr & 0x1FFFFF);
+            } else {
+                uint64_t* l1 = reinterpret_cast<uint64_t*>(DMAP_USR + (l2e & 0x000FFFFFFFFFF000ULL));
+                uint64_t l1e = l1[(addr >> 12) & 0x1FF];
+                if (!(l1e & 1)) { brook::SerialPuts("    (unmapped PT)\n"); break; }
+                physPage = (l1e & 0x000FFFFFFFFFF000ULL) + (addr & 0xFFF);
+            }
+            uint64_t val = *reinterpret_cast<uint64_t*>(DMAP_USR + physPage);
+
             brook::SerialPuts("    [RSP+");
             ExcPutHex(static_cast<uint64_t>(i * 8));
             brook::SerialPuts("] = ");
