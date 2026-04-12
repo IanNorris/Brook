@@ -305,13 +305,6 @@ void PmmFreePage(PhysicalAddress physAddr)
 
     if (!IsUsed(idx)) { SpinLockRelease(&g_pmmLock, flags); return; }
 
-    if (g_pageDescs)
-    {
-        PageDescriptor& d = Desc(static_cast<uint32_t>(idx));
-        if (d.tag == static_cast<uint8_t>(MemTag::PageTable))
-            SerialPrintf("PMM: WARNING freeing PageTable page 0x%lx!\n", physAddr.raw());
-    }
-
     SetFree(idx);
     g_freePages++;
     if (idx < g_nextHint) g_nextHint = idx;

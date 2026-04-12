@@ -454,12 +454,16 @@ void ProcessDestroy(Process* proc)
     if (proc->kernelStackBase)
         VmmFreePages(VirtualAddress(proc->kernelStackBase), KERNEL_STACK_PAGES);
 
-    // Free all VMM page allocations owned by this process
-    VmmKillPid(proc->pid);
-
-    // Free per-process page table pages (not for kernel threads — they share kernel CR3)
+    // Free per-process page table pages FIRST — must happen before PmmKillPid
+    // frees the data pages, because freed pages can be immediately reallocated
+    // by other CPUs. Walking the page table after data pages are freed is safe
+    // (FreeTableLevel only frees intermediate table pages, not leaf data pages),
+    // but freed-and-reallocated pages would have wrong descriptors.
     if (!proc->isKernelThread)
         VmmDestroyUserPageTable(proc->pageTable);
+
+    // Now free all VMM page allocations and PMM-tracked pages for this process.
+    VmmKillPid(proc->pid);
 
     // Remove from scheduler tracking
     SchedulerRemoveProcess(proc);
