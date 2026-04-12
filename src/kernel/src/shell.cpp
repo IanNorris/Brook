@@ -14,6 +14,7 @@
 #include "scheduler.h"
 #include "compositor.h"
 #include "tty.h"
+#include "font_atlas.h"
 #include "kprintf.h"
 #include "keyboard.h"
 #include "memory/heap.h"
@@ -423,6 +424,25 @@ static int ExecCommand(int argc, const char* const* argv)
                 g_vfbWidth = w;
                 g_vfbHeight = h;
                 KPrintf("vfb: %ux%u\n", w, h);
+            }
+        }
+        else if (StrEq(argv[1], "tty"))
+        {
+            if (StrEq(argv[2], "full"))
+            {
+                brook::TtySetRegion(0, 0, 0, 0);
+                KPrintf("tty: full screen\n");
+            }
+            else if (StrEq(argv[2], "bar"))
+            {
+                constexpr uint32_t STATUS_BAR_LINES = 6;
+                uint32_t barH = STATUS_BAR_LINES * static_cast<uint32_t>(brook::g_fontAtlas.lineHeight);
+                uint32_t fbW = 0, fbH = 0, fbStride = 0;
+                uint32_t* fbPtr = nullptr;
+                brook::TtyGetFramebuffer(&fbPtr, &fbW, &fbH, &fbStride);
+                if (fbH > barH)
+                    brook::TtySetRegion(0, fbH - barH, fbW, barH);
+                KPrintf("tty: status bar\n");
             }
         }
         else

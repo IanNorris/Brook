@@ -270,7 +270,22 @@ void TtyPutChar(char c)
         }
         // Final byte — apply command
         if (c == 'm') AnsiApplySgr();
-        // Other CSI commands (J, K, H, etc.) — silently ignore for now
+        else if (c == 'J') {
+            // ESC[2J — clear entire screen
+            int param = (g_ansiParamCount > 0) ? g_ansiParams[0] : 0;
+            if (param == 2) {
+                for (uint32_t row = 0; row < g_rh; row++)
+                    for (uint32_t col = 0; col < g_rw; col++)
+                        g_fbPixels[(g_ry + row) * g_fbStride + (g_rx + col)] = g_bgColor;
+                g_curX = 0;
+                g_curY = 0;
+            }
+        }
+        else if (c == 'H') {
+            // ESC[H — cursor home
+            g_curX = 0;
+            g_curY = 0;
+        }
         g_ansiState = TTY_NORMAL;
         return;
     }

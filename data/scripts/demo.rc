@@ -1,0 +1,3 @@
+# Brook OS demo — single process with ASCII art + cowsay
+set tty full
+run /boot/BIN/DEMO
