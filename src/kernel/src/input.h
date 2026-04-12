@@ -20,8 +20,11 @@ namespace brook {
 
 // Input event types.
 enum class InputEventType : uint8_t {
-    KeyPress   = 0,
-    KeyRelease = 1,
+    KeyPress        = 0,
+    KeyRelease      = 1,
+    MouseMove       = 2,
+    MouseButtonDown = 3,
+    MouseButtonUp   = 4,
 };
 
 // A single input event.

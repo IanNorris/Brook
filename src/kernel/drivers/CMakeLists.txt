@@ -17,3 +17,7 @@ add_driver_module(sched_mlfq
 add_driver_module(bochs_display
     "${BROOK_ROOT}/src/drivers/bochs_display/bochs_display_mod.cpp"
 )
+
+add_driver_module(ps2_mouse
+    "${BROOK_ROOT}/src/drivers/ps2_mouse/mouse_mod.cpp"
+)

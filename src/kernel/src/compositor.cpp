@@ -5,6 +5,7 @@
 #include "serial.h"
 #include "memory/virtual_memory.h"
 #include "memory/address.h"
+#include "mouse.h"
 
 namespace brook {
 
@@ -182,15 +183,109 @@ static void BlitProcess(Process* proc, bool forceAll)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Hardware cursor — simple 12×16 arrow pointer
+// ---------------------------------------------------------------------------
+
+// 1 = white, 2 = black outline, 0 = transparent
+static const uint8_t g_cursorBitmap[16][12] = {
+    {2,0,0,0,0,0,0,0,0,0,0,0},
+    {2,2,0,0,0,0,0,0,0,0,0,0},
+    {2,1,2,0,0,0,0,0,0,0,0,0},
+    {2,1,1,2,0,0,0,0,0,0,0,0},
+    {2,1,1,1,2,0,0,0,0,0,0,0},
+    {2,1,1,1,1,2,0,0,0,0,0,0},
+    {2,1,1,1,1,1,2,0,0,0,0,0},
+    {2,1,1,1,1,1,1,2,0,0,0,0},
+    {2,1,1,1,1,1,1,1,2,0,0,0},
+    {2,1,1,1,1,1,1,1,1,2,0,0},
+    {2,1,1,1,1,1,2,2,2,2,2,0},
+    {2,1,1,2,1,1,2,0,0,0,0,0},
+    {2,1,2,0,2,1,1,2,0,0,0,0},
+    {2,2,0,0,2,1,1,2,0,0,0,0},
+    {2,0,0,0,0,2,1,1,2,0,0,0},
+    {0,0,0,0,0,2,2,2,2,0,0,0},
+};
+
+static constexpr uint32_t CURSOR_W = 12;
+static constexpr uint32_t CURSOR_H = 16;
+
+// Saved pixels under the cursor (for restore before re-blit)
+static uint32_t g_cursorSave[CURSOR_W * CURSOR_H];
+static int32_t  g_cursorSaveX = -1;
+static int32_t  g_cursorSaveY = -1;
+static bool     g_cursorVisible = false;
+
+static void CursorSaveUnder(int32_t cx, int32_t cy)
+{
+    for (uint32_t row = 0; row < CURSOR_H; row++)
+    {
+        int32_t sy = cy + static_cast<int32_t>(row);
+        if (sy < 0 || static_cast<uint32_t>(sy) >= g_physFbHeight) continue;
+        for (uint32_t col = 0; col < CURSOR_W; col++)
+        {
+            int32_t sx = cx + static_cast<int32_t>(col);
+            if (sx < 0 || static_cast<uint32_t>(sx) >= g_physFbWidth) continue;
+            g_cursorSave[row * CURSOR_W + col] =
+                const_cast<uint32_t*>(g_physFb)[sy * g_physFbStride + sx];
+        }
+    }
+    g_cursorSaveX = cx;
+    g_cursorSaveY = cy;
+    g_cursorVisible = true;
+}
+
+static void CursorRestore()
+{
+    if (!g_cursorVisible) return;
+    int32_t cx = g_cursorSaveX;
+    int32_t cy = g_cursorSaveY;
+    for (uint32_t row = 0; row < CURSOR_H; row++)
+    {
+        int32_t sy = cy + static_cast<int32_t>(row);
+        if (sy < 0 || static_cast<uint32_t>(sy) >= g_physFbHeight) continue;
+        for (uint32_t col = 0; col < CURSOR_W; col++)
+        {
+            int32_t sx = cx + static_cast<int32_t>(col);
+            if (sx < 0 || static_cast<uint32_t>(sx) >= g_physFbWidth) continue;
+            g_physFb[sy * g_physFbStride + sx] = g_cursorSave[row * CURSOR_W + col];
+        }
+    }
+    g_cursorVisible = false;
+}
+
+static void CursorDraw(int32_t cx, int32_t cy)
+{
+    CursorSaveUnder(cx, cy);
+    for (uint32_t row = 0; row < CURSOR_H; row++)
+    {
+        int32_t sy = cy + static_cast<int32_t>(row);
+        if (sy < 0 || static_cast<uint32_t>(sy) >= g_physFbHeight) continue;
+        for (uint32_t col = 0; col < CURSOR_W; col++)
+        {
+            uint8_t px = g_cursorBitmap[row][col];
+            if (px == 0) continue; // transparent
+            int32_t sx = cx + static_cast<int32_t>(col);
+            if (sx < 0 || static_cast<uint32_t>(sx) >= g_physFbWidth) continue;
+            g_physFb[sy * g_physFbStride + sx] = (px == 1) ? 0x00FFFFFF : 0x00000000;
+        }
+    }
+}
+
 // Global halt flag — set by panic to stop compositing.
 static volatile bool g_compositorHalted = false;
 
 static void CompositorLoop()
 {
-    if (!g_physFb || g_compositedCount == 0)
+    if (!g_physFb)
         return;
 
-    // Every FORCE_BLIT_INTERVAL_MS, blit all processes regardless of dirty
+    // Restore pixels under the old cursor position before blitting.
+    CursorRestore();
+
+    if (g_compositedCount > 0)
+    {
+        // Every FORCE_BLIT_INTERVAL_MS, blit all processes regardless of dirty
     // flag. This ensures we see output during init (before DOOM signals dirty).
     g_forceBlitCounter += COMPOSITE_INTERVAL;
     bool forceAll = (g_forceBlitCounter >= FORCE_BLIT_INTERVAL_MS);
@@ -238,6 +333,15 @@ static void CompositorLoop()
             continue;
 
         BlitProcess(p, forceAll);
+    }
+    } // end if (g_compositedCount > 0)
+
+    // Draw mouse cursor on top of everything.
+    if (MouseIsAvailable())
+    {
+        int32_t mx, my;
+        MouseGetPosition(&mx, &my);
+        CursorDraw(mx, my);
     }
 }
 
@@ -288,6 +392,9 @@ void CompositorRemap(uint64_t fbPhys, uint32_t w, uint32_t h, uint32_t stridePix
     g_physFbWidth  = w;
     g_physFbHeight = h;
     g_physFbStride = stridePixels;
+
+    // Update mouse cursor bounds to match new resolution.
+    MouseSetBounds(w, h);
 
     SerialPrintf("COMPOSITOR: remapped to %ux%u stride=%u\n", w, h, stridePixels);
 }

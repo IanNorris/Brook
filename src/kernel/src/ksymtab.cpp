@@ -26,6 +26,7 @@ extern "C" brook::KernelSymbol __stop_ksymtab[];
 #include "display.h"
 #include "tty.h"
 #include "compositor.h"
+#include "mouse.h"
 
 // Bring all brook:: names into scope so EXPORT_SYMBOL(fn) resolves correctly.
 using namespace brook;
@@ -85,6 +86,13 @@ EXPORT_SYMBOL(TtyRemap);
 
 // Compositor
 EXPORT_SYMBOL(CompositorRemap);
+
+// Mouse
+EXPORT_SYMBOL(MouseInit);
+EXPORT_SYMBOL(MouseIsAvailable);
+EXPORT_SYMBOL(MouseGetPosition);
+EXPORT_SYMBOL(MouseSetBounds);
+EXPORT_SYMBOL(MouseGetButtons);
 
 // virtio-blk
 EXPORT_SYMBOL(VirtioBlkInitAll);

@@ -148,6 +148,7 @@ add_executable(kernel
     src/scheduler.cpp
     src/compositor.cpp
     src/display.cpp
+    src/mouse.cpp
     src/clock_overlay.cpp
     src/shell.cpp
     src/boot_logo.cpp
@@ -217,6 +218,7 @@ set_source_files_properties(
     src/scheduler.cpp
     src/compositor.cpp
     src/keyboard.cpp
+    src/mouse.cpp
     src/panic.cpp
     src/profiler.cpp
     src/smp.cpp
