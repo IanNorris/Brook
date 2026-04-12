@@ -338,10 +338,22 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         return fd;
     }
 
-    Vnode* vn = VfsOpen(lookupPath, static_cast<uint32_t>(flags));
+    // Translate Linux open flags to VFS flags
+    uint32_t vfsFlags = VFS_O_READ;
+    static constexpr uint64_t LINUX_O_WRONLY = 1;
+    static constexpr uint64_t LINUX_O_RDWR   = 2;
+    static constexpr uint64_t LINUX_O_CREAT  = 0x40;
+    static constexpr uint64_t LINUX_O_TRUNC  = 0x200;
+    static constexpr uint64_t LINUX_O_APPEND = 0x400;
+    if (flags & LINUX_O_WRONLY || flags & LINUX_O_RDWR) vfsFlags |= VFS_O_WRITE;
+    if (flags & LINUX_O_CREAT)  vfsFlags |= VFS_O_CREATE;
+    if (flags & LINUX_O_TRUNC)  vfsFlags |= VFS_O_TRUNC;
+    if (flags & LINUX_O_APPEND) vfsFlags |= VFS_O_APPEND;
+
+    Vnode* vn = VfsOpen(lookupPath, vfsFlags);
     if (!vn)
     {
-        DbgPrintf("sys_open: not found: %s\n", lookupPath);
+        DbgPrintf("sys_open: not found: '%s' (flags=0x%x)\n", lookupPath, vfsFlags);
         return -ENOENT;
     }
 

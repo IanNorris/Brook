@@ -1,0 +1,2 @@
+# Brook OS boot script — comprehensive syscall check
+run /boot/BIN/SYSCHECK
