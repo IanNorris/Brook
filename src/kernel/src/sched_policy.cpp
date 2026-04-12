@@ -100,8 +100,9 @@ SchedProcess* SchedPolicyPickNext(SchedPolicyState* state)
 void SchedPolicyTimesliceExpired(SchedProcess* proc)
 {
     proc->sched.preemptCount++;
-    // Demote: move down one priority (clamped to lowest).
-    if (proc->sched.priority < SCHED_PRIORITY_LOW)
+    // Demote: move down one priority (clamped to lowest). Never demote REALTIME.
+    if (proc->sched.priority > SCHED_PRIORITY_REALTIME &&
+        proc->sched.priority < SCHED_PRIORITY_LOW)
         proc->sched.priority++;
 }
 

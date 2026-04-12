@@ -135,7 +135,7 @@ struct Process
 {
     uint16_t pid;
     ProcessState state;
-    uint8_t  _pad0;
+    uint8_t  schedPriority;  // Initial scheduler priority (0=RT, 1=High, 2=Normal, 3=Low)
     int32_t  runningOnCpu;   // CPU index (-1 = not running, used for double-schedule detection)
 
     // Scheduler linked-list pointers (circular doubly-linked ready queue)
@@ -221,7 +221,8 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
 
 // Create a kernel-mode thread. Runs `fn(arg)` in ring 0 with the kernel's
 // page table. Has its own kernel stack and is scheduled like any process.
-Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg);
+Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
+                            uint8_t priority = 2);
 
 // Destroy a process and free all its resources.
 void ProcessDestroy(Process* proc);

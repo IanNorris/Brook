@@ -212,6 +212,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     proc->pid = SchedulerAllocPid();
     proc->state = ProcessState::Ready;
     proc->runningOnCpu = -1;
+    proc->schedPriority = 2;  // SCHED_PRIORITY_NORMAL
 
     // Default working directory
     proc->cwd[0] = '/'; proc->cwd[1] = 'b'; proc->cwd[2] = 'o';
@@ -377,7 +378,8 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     return proc;
 }
 
-Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg)
+Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
+                            uint8_t priority)
 {
     auto* proc = static_cast<Process*>(kmalloc(sizeof(Process)));
     if (!proc) return nullptr;
@@ -396,6 +398,7 @@ Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg)
     proc->state = ProcessState::Ready;
     proc->runningOnCpu = -1;
     proc->isKernelThread = true;
+    proc->schedPriority = priority;
 
     // Kernel threads use the kernel's page table
     proc->pageTable = VmmKernelCR3();

@@ -83,9 +83,6 @@ static inline void SetSyscallStack(uint32_t cpuIdx, uint64_t stackTop)
 // Scheduler state
 // ---------------------------------------------------------------------------
 
-// Default priority for new user processes (passed to policy InitProcess).
-static constexpr uint8_t SCHED_PRIORITY_NORMAL = 2;
-
 // Pluggable scheduling policy (loaded at init, called through vtable).
 static const SchedOps* g_schedOps = nullptr;
 static uint8_t g_schedStateStorage[4096] __attribute__((aligned(16)));
@@ -277,7 +274,7 @@ void SchedulerAddProcess(Process* proc)
     // Register with pid lookup and policy module.
     if (proc->pid < SCHED_MAX_PIDS)
         g_pidToProcess[proc->pid] = proc;
-    g_schedOps->InitProcess(g_schedState, proc->pid, SCHED_PRIORITY_NORMAL);
+    g_schedOps->InitProcess(g_schedState, proc->pid, proc->schedPriority);
 
     uint64_t rlf1 = SchedLockAcquire(g_readyLock);
     ReadyQueueInsertLocked(proc);
@@ -377,7 +374,6 @@ Process* SchedulerCurrentProcess()
 static void CheckBlockedWakeups()
 {
     uint64_t now = g_lapicTickCount;
-    // Snapshot processes to unblock without holding lock during unblock.
     Process* toUnblock[MAX_PROCESSES];
     uint32_t unblockCount = 0;
 
@@ -385,7 +381,8 @@ static void CheckBlockedWakeups()
     for (uint32_t i = 0; i < g_processCount; ++i)
     {
         Process* p = g_allProcesses[i];
-        if (p->state == ProcessState::Blocked && p->wakeupTick != 0 && now >= p->wakeupTick
+        if (p->state == ProcessState::Blocked && p->wakeupTick != 0
+            && now >= p->wakeupTick
             && __atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) == -1)
         {
             if (unblockCount < MAX_PROCESSES)
