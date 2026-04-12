@@ -43,6 +43,7 @@ static uint32_t g_gridRows  = 0;
 static uint8_t  g_scale     = 3;    // Default downscale factor
 static uint32_t g_vfbWidth  = 640;  // Default VFB dimensions
 static uint32_t g_vfbHeight = 400;
+static bool     g_ttyFull   = false; // When true, skip VFB for spawned processes
 
 // Track spawned process count for auto-tiling placement
 static uint32_t g_spawnCount = 0;
@@ -277,16 +278,17 @@ static Process* SpawnProcess(const char* path, int argc, const char* const* argv
     proc->name[ni++] = static_cast<char>('0' + g_spawnCount % 10);
     proc->name[ni] = '\0';
 
-    // Set up compositor placement
-    int16_t destX, destY;
-    uint32_t cols, rows;
-    ComputeGridPosition(g_spawnCount, &destX, &destY, &cols, &rows);
-
-    CompositorSetupProcess(proc, destX, destY, g_vfbWidth, g_vfbHeight, g_scale);
+    // Set up compositor placement (skip VFB in full-screen TTY mode)
+    if (!g_ttyFull)
+    {
+        int16_t destX, destY;
+        uint32_t cols, rows;
+        ComputeGridPosition(g_spawnCount, &destX, &destY, &cols, &rows);
+        CompositorSetupProcess(proc, destX, destY, g_vfbWidth, g_vfbHeight, g_scale);
+        DbgPrintf("SHELL: spawned '%s' pid=%u at (%d,%d) grid=%ux%u scale=%u\n",
+                      proc->name, proc->pid, destX, destY, cols, rows, g_scale);
+    }
     SchedulerAddProcess(proc);
-
-    DbgPrintf("SHELL: spawned '%s' pid=%u at (%d,%d) grid=%ux%u scale=%u\n",
-                  proc->name, proc->pid, destX, destY, cols, rows, g_scale);
     KPrintf("  → %s (pid %u)\n", proc->name, proc->pid);
 
     ++g_spawnCount;
@@ -431,6 +433,7 @@ static int ExecCommand(int argc, const char* const* argv)
             if (StrEq(argv[2], "full"))
             {
                 brook::TtySetRegion(0, 0, 0, 0);
+                g_ttyFull = true;
                 KPrintf("tty: full screen\n");
             }
             else if (StrEq(argv[2], "bar"))
@@ -442,6 +445,7 @@ static int ExecCommand(int argc, const char* const* argv)
                 brook::TtyGetFramebuffer(&fbPtr, &fbW, &fbH, &fbStride);
                 if (fbH > barH)
                     brook::TtySetRegion(0, fbH - barH, fbW, barH);
+                g_ttyFull = false;
                 KPrintf("tty: status bar\n");
             }
         }
