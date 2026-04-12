@@ -1,0 +1,41 @@
+# Profile 32×DOOM after loading completes
+# Delay profiler start so it captures rendering, not loading.
+set grid 8x4
+set scale 4
+set vfb 640x400
+
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+run doom -iwad /boot/DOOM1.WAD -frames 1000
+
+# Start profiler late — captures rendering phase (after WAD loading)
+profile 10000

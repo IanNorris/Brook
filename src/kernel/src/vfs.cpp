@@ -506,10 +506,10 @@ Vnode* VfsOpen(const char* path, int flags)
             KMutexUnlock(&g_vfsLock);
             kfree(fil); // Don't need FatFS handle — sharing cached data
 
-            // If another thread is still loading this file, spin-wait.
-            while (existing->loading) {
-                // Yield CPU while waiting for the loading thread.
-                __asm__ volatile("pause");
+            // If another thread is still loading this file, yield until done.
+            // Use a simple timed spin — SchedulerYield is not available in test builds.
+            while (__atomic_load_n(&existing->loading, __ATOMIC_ACQUIRE)) {
+                for (volatile int i = 0; i < 1000; ++i) {}  // Brief spin then re-check
             }
 
             if (!existing->data) {
