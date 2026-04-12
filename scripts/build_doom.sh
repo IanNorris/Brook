@@ -2,9 +2,12 @@
 # Build DOOM for Brook OS (static musl-libc binary)
 set -euo pipefail
 
-DOOM_SRC="/workspace/doomgeneric_enkel/doomgeneric"
-BROOK_SRC="/workspace/brook/src/doom"
-BUILD_DIR="/workspace/brook/build/doom"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BROOK_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+DOOM_SRC="${DOOM_SRC:-$(cd "$BROOK_ROOT/../doomgeneric_enkel/doomgeneric" 2>/dev/null && pwd)}"
+BROOK_SRC="$BROOK_ROOT/src/doom"
+BUILD_DIR="$BROOK_ROOT/build/doom"
 
 mkdir -p "$BUILD_DIR"
 
