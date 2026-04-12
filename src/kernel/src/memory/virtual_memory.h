@@ -96,6 +96,18 @@ VirtualAddress VmmAllocPages(uint64_t pageCount,
 // Free pages previously allocated with VmmAllocPages.
 void VmmFreePages(VirtualAddress virtAddr, uint64_t pageCount);
 
+// Allocate a kernel stack with guard pages at both ends.
+// Returns the base of the usable stack region (guard pages are unmapped).
+// The virtual layout is: [guard page] [usable pages] [guard page].
+// Pass the returned address and pageCount to VmmFreeKernelStack to free.
+VirtualAddress VmmAllocKernelStack(uint64_t pageCount,
+                                   MemTag tag     = MemTag::KernelData,
+                                   uint16_t pid   = KernelPid);
+
+// Free a kernel stack allocated with VmmAllocKernelStack.
+// virtAddr is the usable base (as returned by VmmAllocKernelStack).
+void VmmFreeKernelStack(VirtualAddress virtAddr, uint64_t pageCount);
+
 // Allocate pages in the kernel module region (within ±2GB of kernel image).
 VirtualAddress VmmAllocModulePages(uint64_t pageCount,
                                    uint64_t flags = VMM_WRITABLE,

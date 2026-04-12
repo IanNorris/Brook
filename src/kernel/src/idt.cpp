@@ -295,6 +295,27 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
     }
     ExcStackWalk(rbp, 32);
 
+    // Detect kernel stack guard page hits for #PF.
+    if (vector == 14)
+    {
+        brook::Process* guardProc = brook::ProcessCurrent();
+        if (guardProc && guardProc->kernelStackBase)
+        {
+            // Guard page is one page below kernelStackBase.
+            uint64_t guardLow  = guardProc->kernelStackBase - 4096;
+            // Guard page is one page above kernelStackTop.
+            uint64_t guardHigh = guardProc->kernelStackBase + brook::KERNEL_STACK_SIZE;
+            if (cr2 >= guardLow && cr2 < guardProc->kernelStackBase)
+            {
+                brook::SerialPuts("\n*** KERNEL STACK OVERFLOW (bottom guard page hit) ***\n");
+            }
+            else if (cr2 >= guardHigh && cr2 < guardHigh + 4096)
+            {
+                brook::SerialPuts("\n*** KERNEL STACK OVERFLOW (top guard page hit) ***\n");
+            }
+        }
+    }
+
     // If the fault came from user mode (ring 3), kill the process and continue.
     // Kernel-mode faults are unrecoverable — halt.
     if ((frame->cs & 3) == 3)

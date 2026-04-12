@@ -365,6 +365,88 @@ VirtualAddress VmmAllocPages(uint64_t pageCount, uint64_t flags, MemTag tag, uin
     return VirtualAddress(virtBase);
 }
 
+VirtualAddress VmmAllocKernelStack(uint64_t pageCount, MemTag tag, uint16_t pid)
+{
+    if (pageCount == 0) return VirtualAddress{};
+
+    // Reserve pageCount + 2 virtual pages: [guard] [usable * pageCount] [guard]
+    uint64_t totalPages = pageCount + 2;
+
+    uint64_t lf = SpinLockAcquire(&g_vmmLock);
+
+    if (g_vmallocNext + totalPages * PAGE_SIZE > VMALLOC_BASE + VMALLOC_SIZE)
+    {
+        SpinLockRelease(&g_vmmLock, lf);
+        return VirtualAddress{};
+    }
+
+    uint64_t virtBase = g_vmallocNext;
+    g_vmallocNext += totalPages * PAGE_SIZE;
+
+    // Map only the middle pages — guard pages stay unmapped.
+    uint64_t usableBase = virtBase + PAGE_SIZE;  // skip bottom guard
+    for (uint64_t i = 0; i < pageCount; i++)
+    {
+        PhysicalAddress phys = PmmAllocPage(tag, pid);
+        if (!phys)
+        {
+            for (uint64_t j = 0; j < i; j++)
+            {
+                VirtualAddress v(usableBase + j * PAGE_SIZE);
+                uint64_t* pte = WalkToPtr(KernelPageTable, v, false);
+                if (pte && (*pte & VMM_PRESENT))
+                {
+                    PmmFreePage(PhysicalAddress(*pte & PHYS_MASK));
+                    *pte = 0;
+                    Invlpg(v);
+                }
+            }
+            g_vmallocNext = virtBase;
+            SpinLockRelease(&g_vmmLock, lf);
+            return VirtualAddress{};
+        }
+
+        if (!VmmMapPage(KernelPageTable, VirtualAddress(usableBase + i * PAGE_SIZE), phys, VMM_WRITABLE, tag, pid))
+        {
+            PmmFreePage(phys);
+            for (uint64_t j = 0; j < i; j++)
+            {
+                VirtualAddress v(usableBase + j * PAGE_SIZE);
+                uint64_t* pte = WalkToPtr(KernelPageTable, v, false);
+                if (pte && (*pte & VMM_PRESENT))
+                {
+                    PmmFreePage(PhysicalAddress(*pte & PHYS_MASK));
+                    *pte = 0;
+                    Invlpg(v);
+                }
+            }
+            g_vmallocNext = virtBase;
+            SpinLockRelease(&g_vmmLock, lf);
+            return VirtualAddress{};
+        }
+    }
+
+    VmmAllocation* slot = FindFreeSlot();
+    if (slot)
+    {
+        slot->virtBase  = usableBase;
+        slot->pageCount = pageCount;
+        slot->tag       = tag;
+        slot->pid       = pid;
+    }
+
+    SpinLockRelease(&g_vmmLock, lf);
+    return VirtualAddress(usableBase);
+}
+
+void VmmFreeKernelStack(VirtualAddress virtAddr, uint64_t pageCount)
+{
+    // Free the mapped pages (guard pages have no physical backing).
+    VmmFreePages(virtAddr, pageCount);
+    // The guard page virtual addresses are simply leaked from the vmalloc region.
+    // This is acceptable — kernel stacks are long-lived and few in number.
+}
+
 VirtualAddress VmmAllocModulePages(uint64_t pageCount, uint64_t flags, MemTag tag, uint16_t pid)
 {
     if (pageCount == 0) return VirtualAddress{};

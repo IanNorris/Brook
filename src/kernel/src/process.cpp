@@ -218,9 +218,9 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     proc->cwd[0] = '/'; proc->cwd[1] = 'b'; proc->cwd[2] = 'o';
     proc->cwd[3] = 'o'; proc->cwd[4] = 't'; proc->cwd[5] = '\0';
 
-    // Allocate per-process kernel stack (for ring 3→0 transitions).
-    VirtualAddress kstackAddr = VmmAllocPages(KERNEL_STACK_PAGES,
-        VMM_WRITABLE, MemTag::KernelData, proc->pid);
+    // Allocate per-process kernel stack with guard pages (for ring 3→0 transitions).
+    VirtualAddress kstackAddr = VmmAllocKernelStack(KERNEL_STACK_PAGES,
+        MemTag::KernelData, proc->pid);
     if (!kstackAddr)
     {
         SerialPuts("PROC: kernel stack allocation failed\n");
@@ -435,9 +435,9 @@ Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
     // Kernel threads use the kernel's page table
     proc->pageTable = VmmKernelCR3();
 
-    // Allocate kernel stack
-    VirtualAddress kstackAddr = VmmAllocPages(KERNEL_STACK_PAGES,
-        VMM_WRITABLE, MemTag::KernelData, proc->pid);
+    // Allocate kernel stack with guard pages
+    VirtualAddress kstackAddr = VmmAllocKernelStack(KERNEL_STACK_PAGES,
+        MemTag::KernelData, proc->pid);
     if (!kstackAddr)
     {
         SerialPuts("KTHREAD: kernel stack allocation failed\n");
@@ -482,9 +482,9 @@ void ProcessDestroy(Process* proc)
         FdFree(proc, static_cast<int>(i));
     }
 
-    // Free per-process kernel stack
+    // Free per-process kernel stack (includes guard page accounting)
     if (proc->kernelStackBase)
-        VmmFreePages(VirtualAddress(proc->kernelStackBase), KERNEL_STACK_PAGES);
+        VmmFreeKernelStack(VirtualAddress(proc->kernelStackBase), KERNEL_STACK_PAGES);
 
     // Free per-process page table pages FIRST — must happen before PmmKillPid
     // frees the data pages, because freed pages can be immediately reallocated
