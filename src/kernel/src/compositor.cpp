@@ -123,6 +123,17 @@ static void BlitProcess(Process* proc, bool forceAll)
     if (!forceAll && !proc->fbDirty) return;
     proc->fbDirty = 0;
 
+    // One-time diagnostic: log first blit for each process
+    static uint32_t s_blitLogMask = 0;
+    uint32_t bit = (proc->pid < 32) ? (1u << proc->pid) : 0;
+    if (bit && !(s_blitLogMask & bit)) {
+        s_blitLogMask |= bit;
+        SerialPrintf("COMPOSITOR: first blit pid %u '%s' vfb=%ux%u dest=(%d,%d) scale=%u fb=0x%lx\n",
+                     proc->pid, proc->name, proc->fbVfbWidth, proc->fbVfbHeight,
+                     proc->fbDestX, proc->fbDestY, proc->fbScale,
+                     reinterpret_cast<uint64_t>(g_physFb));
+    }
+
     const uint32_t* src = proc->fbVirtual;
     const uint32_t  srcW = proc->fbVfbWidth;
     const uint32_t  srcH = proc->fbVfbHeight;
