@@ -7,6 +7,7 @@
 #include "serial_writer.h"
 #include "kringbuf.h"
 #include "serial.h"
+#include "tty.h"
 #include "process.h"
 #include "scheduler.h"
 
@@ -39,6 +40,12 @@ static void SerialWriterThreadFn(void* /*arg*/)
             for (uint32_t i = 0; i < n; ++i)
                 SerialPutChar(batch[i]);
             SerialUnlock();
+
+            // Also echo to TTY (framebuffer console) if available.
+            if (TtyReady()) {
+                for (uint32_t i = 0; i < n; ++i)
+                    TtyPutChar(batch[i]);
+            }
         }
 
         // Sleep 5ms then check again.  Short sleep keeps latency low
