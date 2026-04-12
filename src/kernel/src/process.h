@@ -150,6 +150,8 @@ struct Process
 
     // Mutex wait-queue linkage (used by KMutex when process is blocked on a lock)
     Process* syncNext;          // Next process in sync wait queue (mutex/rwlock/semaphore)
+    volatile uint32_t pendingWakeup; // Set by KMutexUnlock before SchedulerUnblock;
+                                     // checked by SchedulerBlock to avoid lost wakeups.
 
     // Saved CPU context (written by context_switch asm)
     SavedContext savedCtx;

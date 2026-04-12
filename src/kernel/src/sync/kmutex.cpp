@@ -65,6 +65,7 @@ void KMutexLock(KMutex* m)
 
     // Contended — add ourselves to the wait queue and block.
     self->syncNext = nullptr;
+    __atomic_store_n(&self->pendingWakeup, 0, __ATOMIC_RELEASE);
     if (m->waitTail)
         m->waitTail->syncNext = self;
     else
@@ -80,6 +81,12 @@ void KMutexLock(KMutex* m)
     // SchedulerBlock sets state=Blocked and yields to another process.
     // When we wake up (via KMutexUnlock calling SchedulerUnblock),
     // we'll resume here with the mutex held.
+    //
+    // IMPORTANT: SchedulerBlock checks pendingWakeup to avoid a lost-wakeup
+    // race.  If KMutexUnlock fires between GuardRelease above and the
+    // SchedulerBlock call below, it sets pendingWakeup=1 and calls
+    // SchedulerUnblock (which returns early because we're still Running).
+    // SchedulerBlock sees pendingWakeup and skips the actual block.
     SchedulerBlock(self);
 }
 
@@ -105,6 +112,13 @@ void KMutexUnlock(KMutex* m)
 
         m->ownerPid = waiter->pid;
         // m->locked remains 1 — ownership transferred, not released.
+
+        // Signal the waiter BEFORE releasing the guard.  If the waiter
+        // hasn't called SchedulerBlock yet (still between GuardRelease
+        // and SchedulerBlock in KMutexLock), SchedulerUnblock would bail
+        // because the process is still Running.  pendingWakeup lets
+        // SchedulerBlock detect the missed wake and skip blocking.
+        __atomic_store_n(&waiter->pendingWakeup, 1, __ATOMIC_RELEASE);
 
         GuardRelease(m, flags);
 

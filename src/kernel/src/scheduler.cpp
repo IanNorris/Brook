@@ -330,6 +330,19 @@ void SchedulerBlock(Process* proc)
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
 
     uint64_t rlf3 = SchedLockAcquire(g_readyLock);
+
+    // Check for a pending wakeup that raced with us (e.g. KMutexUnlock
+    // calling SchedulerUnblock before we got here).  If set, the waker
+    // already transferred mutex ownership; we should NOT block.
+    if (__atomic_load_n(&proc->pendingWakeup, __ATOMIC_ACQUIRE))
+    {
+        __atomic_store_n(&proc->pendingWakeup, 0, __ATOMIC_RELEASE);
+        SchedLockRelease(g_readyLock, rlf3);
+        if (flags & 0x200)
+            __asm__ volatile("sti" ::: "memory");
+        return;
+    }
+
     proc->state = ProcessState::Blocked;
     ReadyQueueRemoveLocked(proc);
     g_schedOps->VoluntaryYield(g_schedState, proc->pid);
