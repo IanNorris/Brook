@@ -37,6 +37,10 @@ void SchedulerTimerTick();
 // Yield the current timeslice voluntarily.
 void SchedulerYield();
 
+// Trampoline for kernel threads — drains requeue, enables interrupts,
+// reads fn/arg from the kernel stack, and calls fn(arg).
+void KernelThreadTrampoline();
+
 // Start the scheduler on the BSP — picks the first ready process and enters user mode.
 [[noreturn]] void SchedulerStart();
 

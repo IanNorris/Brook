@@ -230,7 +230,7 @@ static void ProcessTrampoline()
 
 // Trampoline for kernel threads. Like ProcessTrampoline but stays in ring 0.
 // fn and arg are stored at the top of the kernel stack by KernelThreadCreate.
-static void KernelThreadTrampoline()
+void KernelThreadTrampoline()
 {
     uint32_t cpu = ThisCpu();
 
@@ -650,6 +650,16 @@ void SchedulerYield()
                  cpu, first->name, first->pid);
 
     g_schedulerRunning = true;
+
+    if (first->isKernelThread)
+    {
+        // Kernel threads stay in ring 0. Enable interrupts and call the
+        // trampoline directly (it reads fn/arg from the kernel stack).
+        __asm__ volatile("sti");
+        KernelThreadTrampoline();
+        __builtin_unreachable();
+    }
+
     SwitchToUserMode(first->stackTop, first->elf.entryPoint);
 
     __builtin_unreachable();
@@ -697,6 +707,13 @@ void SchedulerYield()
 
     SerialPrintf("SCHED: CPU%u entering user mode for '%s' (pid %u)\n",
                  cpu, first->name, first->pid);
+
+    if (first->isKernelThread)
+    {
+        __asm__ volatile("sti");
+        KernelThreadTrampoline();
+        __builtin_unreachable();
+    }
 
     SwitchToUserMode(first->stackTop, first->elf.entryPoint);
     __builtin_unreachable();
