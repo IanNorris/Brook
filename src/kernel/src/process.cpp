@@ -249,6 +249,38 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
         return nullptr;
     }
 
+    // Verify page table integrity: ELF load area (PML4[0]) must have USER bit.
+    {
+        auto* pml4 = reinterpret_cast<volatile uint64_t*>(PhysToVirt(proc->pageTable.pml4).raw());
+        uint64_t pml4e = pml4[0]; // PML4 entry for vaddr 0x000000-0x7FFFFFFFFF
+        if (pml4e && !(pml4e & 4))
+            SerialPrintf("PROC: BUG: pid %u PML4[0]=0x%lx missing USER bit!\n",
+                         proc->pid, pml4e);
+
+        if (pml4e & 1) // present
+        {
+            auto* pdpt = reinterpret_cast<volatile uint64_t*>(
+                PhysToVirt(PhysicalAddress(pml4e & 0x000FFFFFFFFFF000ULL)).raw());
+            uint64_t pdpte = pdpt[0];
+            if (pdpte && !(pdpte & 4))
+                SerialPrintf("PROC: BUG: pid %u PDPT[0]=0x%lx missing USER bit!\n",
+                             proc->pid, pdpte);
+
+            if (pdpte & 1)
+            {
+                auto* pd = reinterpret_cast<volatile uint64_t*>(
+                    PhysToVirt(PhysicalAddress(pdpte & 0x000FFFFFFFFFF000ULL)).raw());
+                uint64_t pde = pd[2]; // PD[2] = 0x400000-0x5FFFFF
+                if (pde & 0x80)
+                    SerialPrintf("PROC: BUG: pid %u PD[2]=0x%lx is 2MB page (should be 4KB PT)!\n",
+                                 proc->pid, pde);
+                else if (pde && !(pde & 4))
+                    SerialPrintf("PROC: BUG: pid %u PD[2]=0x%lx missing USER bit!\n",
+                                 proc->pid, pde);
+            }
+        }
+    }
+
     proc->programBreak = proc->elf.programBreakLow;
     proc->mmapNext = USER_MMAP_BASE;
 

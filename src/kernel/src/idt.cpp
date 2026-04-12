@@ -90,10 +90,11 @@ static void ExcStackWalk(uint64_t rbp, int maxFrames)
         if (fp == nullptr || fp == prev || fp->rip == 0)
             break;
 
-        // Basic sanity: the frame pointer should be in a plausible kernel range.
+        // Only follow pointers in kernel space; user-mode RBP values
+        // could reference corrupted page tables and trigger nested faults.
         auto addr = reinterpret_cast<uint64_t>(fp);
-        if (addr < 0xFFFF800000000000ULL && addr > 0x100000000ULL)
-            break;  // not a valid kernel-space pointer
+        if (addr < 0xFFFF800000000000ULL)
+            break;
 
         brook::SerialPuts("  #");
         brook::SerialPutChar(static_cast<char>('0' + (i / 10) % 10));

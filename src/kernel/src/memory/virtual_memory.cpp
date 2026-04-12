@@ -74,7 +74,7 @@ static inline void Invlpg(VirtualAddress virtAddr)
 
 static inline void ZeroPage(PhysicalAddress physAddr)
 {
-    uint64_t* p = reinterpret_cast<uint64_t*>(PhysToVirt(physAddr).raw());
+    volatile uint64_t* p = reinterpret_cast<volatile uint64_t*>(PhysToVirt(physAddr).raw());
     for (int i = 0; i < 512; i++) p[i] = 0;
 }
 
@@ -104,6 +104,21 @@ static uint64_t* GetOrAllocEntry(uint64_t* parent, uint64_t idx, uint64_t extraF
         PhysicalAddress childPhys = AllocTablePage();
         if (!childPhys) return nullptr;
         ZeroPage(childPhys);
+
+        // Verify the page was actually zeroed (diagnostic for stale data bug).
+        volatile uint64_t* check = reinterpret_cast<volatile uint64_t*>(PhysToVirt(childPhys).raw());
+        for (int i = 0; i < 512; i++)
+        {
+            if (check[i] != 0)
+            {
+                SerialPrintf("VMM: BUG: ZeroPage failed! page=0x%lx [%d]=0x%lx\n",
+                             childPhys.raw(), i, static_cast<uint64_t>(check[i]));
+                // Re-zero with volatile writes
+                for (int j = 0; j < 512; j++) check[j] = 0;
+                break;
+            }
+        }
+
         parent[idx] = childPhys.raw() | VMM_PRESENT | VMM_WRITABLE | (extraFlags & VMM_USER);
     }
     else if ((extraFlags & VMM_USER) && !(parent[idx] & VMM_USER))
