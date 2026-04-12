@@ -62,14 +62,48 @@ static const char* const g_excNames[32] = {
 // Called from the __attribute__((interrupt)) stubs below.
 // KernelPanic is [[noreturn]] so this never returns.
 
-// Minimal hex printer for exception context — no dependencies beyond serial port.
+// ---------------------------------------------------------------------------
+// Lockless serial output for exception handlers.
+// These bypass the serial spinlock entirely — during a fault we cannot risk
+// spinning on a lock that another CPU (or this CPU's interrupted code) holds.
+// Output may interleave with other CPUs but will always make progress.
+// ---------------------------------------------------------------------------
+
+static inline void ExcOutb(uint16_t port, uint8_t val)
+{
+    __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
+}
+
+static inline uint8_t ExcInb(uint16_t port)
+{
+    uint8_t ret;
+    __asm__ volatile("inb %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
+}
+
+static void ExcPutCharRaw(char c)
+{
+    if (c == '\n') {
+        while ((ExcInb(0x3FD) & 0x20) == 0) {}
+        ExcOutb(0x3F8, '\r');
+    }
+    while ((ExcInb(0x3FD) & 0x20) == 0) {}
+    ExcOutb(0x3F8, static_cast<uint8_t>(c));
+}
+
+static void ExcPutsRaw(const char* s)
+{
+    if (!s) return;
+    while (*s) ExcPutCharRaw(*s++);
+}
+
 static void ExcPutHex(uint64_t v)
 {
-    brook::SerialPuts("0x");
+    ExcPutsRaw("0x");
     for (int shift = 60; shift >= 0; shift -= 4)
     {
         int nib = static_cast<int>((v >> shift) & 0xF);
-        brook::SerialPutChar(static_cast<char>(nib < 10 ? '0' + nib : 'a' + nib - 10));
+        ExcPutCharRaw(static_cast<char>(nib < 10 ? '0' + nib : 'a' + nib - 10));
     }
 }
 
@@ -81,7 +115,7 @@ struct StackFrame {
 
 static void ExcStackWalk(uint64_t rbp, int maxFrames)
 {
-    brook::SerialPuts("  --- stack trace ---\n");
+    ExcPutsRaw("  --- stack trace ---\n");
     auto* fp = reinterpret_cast<StackFrame*>(rbp);
     StackFrame* prev = nullptr;
 
@@ -96,17 +130,17 @@ static void ExcStackWalk(uint64_t rbp, int maxFrames)
         if (addr < 0xFFFF800000000000ULL)
             break;
 
-        brook::SerialPuts("  #");
-        brook::SerialPutChar(static_cast<char>('0' + (i / 10) % 10));
-        brook::SerialPutChar(static_cast<char>('0' + i % 10));
-        brook::SerialPuts("  ");
+        ExcPutsRaw("  #");
+        ExcPutCharRaw(static_cast<char>('0' + (i / 10) % 10));
+        ExcPutCharRaw(static_cast<char>('0' + i % 10));
+        ExcPutsRaw("  ");
         ExcPutHex(fp->rip);
-        brook::SerialPuts("\n");
+        ExcPutsRaw("\n");
 
         prev = fp;
         fp = fp->rbp;
     }
-    brook::SerialPuts("  --- end trace ---\n");
+    ExcPutsRaw("  --- end trace ---\n");
 }
 
 static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t errorCode, bool hasErrorCode)
@@ -121,14 +155,26 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
     if (fromUser)
         __asm__ volatile("swapgs");
 
-    // Prevent recursive exceptions from eating the entire stack.
-    static volatile int excDepth = 0;
-    if (excDepth > 0)
+    // Per-CPU nesting guard — uses LAPIC ID to index, avoiding any lock.
+    // 64 entries covers typical SMP configs.  Falls back to entry 0 for
+    // LAPIC IDs >= 64 (safe — two CPUs sharing an entry just means a
+    // slightly wider nesting window, still no deadlock).
+    static volatile int excDepthPerCpu[64] = {};
+    uint32_t lapicId;
+    __asm__ volatile("mov $1, %%eax; cpuid; shr $24, %%ebx; mov %%ebx, %0"
+                     : "=r"(lapicId) : : "eax","ebx","ecx","edx");
+    uint32_t cpuSlot = (lapicId < 64) ? lapicId : 0;
+
+    if (excDepthPerCpu[cpuSlot] > 0)
     {
-        brook::SerialPuts("\n=== NESTED EXCEPTION — halting ===\n");
+        ExcPutsRaw("\n=== NESTED EXCEPTION on CPU ");
+        ExcPutCharRaw(static_cast<char>('0' + cpuSlot % 10));
+        ExcPutsRaw(" — halting ===\n");
+        ExcPutsRaw("  RIP   "); ExcPutHex(frame->ip); ExcPutsRaw("\n");
+        ExcPutsRaw("  RSP   "); ExcPutHex(frame->sp); ExcPutsRaw("\n");
         for (;;) __asm__ volatile("hlt");
     }
-    ++excDepth;
+    ++excDepthPerCpu[cpuSlot];
 
     uint64_t cr2 = 0;
     __asm__ volatile("movq %%cr2, %0" : "=r"(cr2));
@@ -140,21 +186,21 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
 
     // Direct serial dump — guaranteed to produce readable output regardless
     // of va_list ABI issues or format buffer corruption.
-    brook::SerialPuts("\n=== EXCEPTION ===\n");
-    brook::SerialPuts("Vector: ");
+    ExcPutsRaw("\n=== EXCEPTION ===\n");
+    ExcPutsRaw("Vector: ");
     {
         char vbuf[4] = {'0','0','0','\0'};
         vbuf[0] = static_cast<char>('0' + (vector / 100) % 10);
         vbuf[1] = static_cast<char>('0' + (vector / 10) % 10);
         vbuf[2] = static_cast<char>('0' + vector % 10);
-        brook::SerialPuts(vbuf);
+        ExcPutsRaw(vbuf);
     }
-    brook::SerialPuts(" ("); brook::SerialPuts(name); brook::SerialPuts(")\n");
+    ExcPutsRaw(" ("); ExcPutsRaw(name); ExcPutsRaw(")\n");
 
     // Print current process info if available.
     brook::Process* cur = brook::ProcessCurrent();
     if (cur) {
-        brook::SerialPuts("  PID   ");
+        ExcPutsRaw("  PID   ");
         {
             char pbuf[6];
             uint16_t pid = cur->pid;
@@ -167,28 +213,28 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
             // Skip leading zeros.
             const char* p = pbuf;
             while (*p == '0' && p[1] != '\0') ++p;
-            brook::SerialPuts(p);
+            ExcPutsRaw(p);
         }
-        brook::SerialPuts(" ("); brook::SerialPuts(cur->name); brook::SerialPuts(")\n");
+        ExcPutsRaw(" ("); ExcPutsRaw(cur->name); ExcPutsRaw(")\n");
     }
 
-    brook::SerialPuts("  RIP   "); ExcPutHex(frame->ip);    brook::SerialPuts("\n");
-    brook::SerialPuts("  RSP   "); ExcPutHex(frame->sp);    brook::SerialPuts("\n");
-    brook::SerialPuts("  CS    "); ExcPutHex(frame->cs);    brook::SerialPuts("\n");
-    brook::SerialPuts("  SS    "); ExcPutHex(frame->ss);    brook::SerialPuts("\n");
-    brook::SerialPuts("  FLAGS "); ExcPutHex(frame->flags); brook::SerialPuts("\n");
-    brook::SerialPuts("  CR2   "); ExcPutHex(cr2);          brook::SerialPuts("\n");
+    ExcPutsRaw("  RIP   "); ExcPutHex(frame->ip);    ExcPutsRaw("\n");
+    ExcPutsRaw("  RSP   "); ExcPutHex(frame->sp);    ExcPutsRaw("\n");
+    ExcPutsRaw("  CS    "); ExcPutHex(frame->cs);    ExcPutsRaw("\n");
+    ExcPutsRaw("  SS    "); ExcPutHex(frame->ss);    ExcPutsRaw("\n");
+    ExcPutsRaw("  FLAGS "); ExcPutHex(frame->flags); ExcPutsRaw("\n");
+    ExcPutsRaw("  CR2   "); ExcPutHex(cr2);          ExcPutsRaw("\n");
     if (hasErrorCode) {
-        brook::SerialPuts("  ERR   "); ExcPutHex(errorCode);
+        ExcPutsRaw("  ERR   "); ExcPutHex(errorCode);
         if (vector == 14) {
-            brook::SerialPuts(" [");
-            brook::SerialPuts((errorCode & 1) ? "P " : "NP ");
-            brook::SerialPuts((errorCode & 2) ? "W " : "R ");
-            brook::SerialPuts((errorCode & 4) ? "U " : "K ");
-            if (errorCode & 8) brook::SerialPuts("RSVD ");
-            brook::SerialPuts("]");
+            ExcPutsRaw(" [");
+            ExcPutsRaw((errorCode & 1) ? "P " : "NP ");
+            ExcPutsRaw((errorCode & 2) ? "W " : "R ");
+            ExcPutsRaw((errorCode & 4) ? "U " : "K ");
+            if (errorCode & 8) ExcPutsRaw("RSVD ");
+            ExcPutsRaw("]");
         }
-        brook::SerialPuts("\n");
+        ExcPutsRaw("\n");
     }
 
     // For page faults, walk the page table hierarchy to diagnose the mapping.
@@ -201,60 +247,60 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
         __asm__ volatile("movq %%cr3, %0" : "=r"(cr3val));
         cr3val &= 0x000FFFFFFFFFF000ULL;
 
-        brook::SerialPuts("  --- page table walk ---\n");
-        brook::SerialPuts("  CR3   "); ExcPutHex(cr3val); brook::SerialPuts("\n");
+        ExcPutsRaw("  --- page table walk ---\n");
+        ExcPutsRaw("  CR3   "); ExcPutHex(cr3val); ExcPutsRaw("\n");
 
         uint64_t* pml4 = reinterpret_cast<uint64_t*>(DMAP_USR + cr3val);
         uint64_t pml4idx = (cr2 >> 39) & 0x1FF;
         uint64_t pml4e = pml4[pml4idx];
-        brook::SerialPuts("  PML4["); ExcPutHex(pml4idx); brook::SerialPuts("] = ");
-        ExcPutHex(pml4e); brook::SerialPuts("\n");
+        ExcPutsRaw("  PML4["); ExcPutHex(pml4idx); ExcPutsRaw("] = ");
+        ExcPutHex(pml4e); ExcPutsRaw("\n");
 
         if (pml4e & 1)
         {
             uint64_t* pdpt = reinterpret_cast<uint64_t*>(DMAP_USR + (pml4e & 0x000FFFFFFFFFF000ULL));
             uint64_t pdptidx = (cr2 >> 30) & 0x1FF;
             uint64_t pdpte = pdpt[pdptidx];
-            brook::SerialPuts("  PDPT["); ExcPutHex(pdptidx); brook::SerialPuts("] = ");
-            ExcPutHex(pdpte); brook::SerialPuts("\n");
+            ExcPutsRaw("  PDPT["); ExcPutHex(pdptidx); ExcPutsRaw("] = ");
+            ExcPutHex(pdpte); ExcPutsRaw("\n");
 
             if (pdpte & 1)
             {
                 uint64_t* pd = reinterpret_cast<uint64_t*>(DMAP_USR + (pdpte & 0x000FFFFFFFFFF000ULL));
                 uint64_t pdidx = (cr2 >> 21) & 0x1FF;
                 uint64_t pde = pd[pdidx];
-                brook::SerialPuts("  PD["); ExcPutHex(pdidx); brook::SerialPuts("] = ");
-                ExcPutHex(pde); brook::SerialPuts("\n");
+                ExcPutsRaw("  PD["); ExcPutHex(pdidx); ExcPutsRaw("] = ");
+                ExcPutHex(pde); ExcPutsRaw("\n");
 
                 if ((pde & 1) && !(pde & (1ULL << 7)))
                 {
                     uint64_t* pt = reinterpret_cast<uint64_t*>(DMAP_USR + (pde & 0x000FFFFFFFFFF000ULL));
                     uint64_t ptidx = (cr2 >> 12) & 0x1FF;
                     uint64_t pte = pt[ptidx];
-                    brook::SerialPuts("  PT["); ExcPutHex(ptidx); brook::SerialPuts("] = ");
-                    ExcPutHex(pte); brook::SerialPuts("\n");
+                    ExcPutsRaw("  PT["); ExcPutHex(ptidx); ExcPutsRaw("] = ");
+                    ExcPutHex(pte); ExcPutsRaw("\n");
                 }
             }
             else
             {
-                brook::SerialPuts("  PDPT entry NOT PRESENT — page table corrupted?\n");
-                brook::SerialPuts("  PDPT page dump:\n");
+                ExcPutsRaw("  PDPT entry NOT PRESENT — page table corrupted?\n");
+                ExcPutsRaw("  PDPT page dump:\n");
                 for (int d = 0; d < 8; ++d)
                 {
-                    brook::SerialPuts("    ["); ExcPutHex(static_cast<uint64_t>(d));
-                    brook::SerialPuts("] = "); ExcPutHex(pdpt[d]);
-                    brook::SerialPuts("\n");
+                    ExcPutsRaw("    ["); ExcPutHex(static_cast<uint64_t>(d));
+                    ExcPutsRaw("] = "); ExcPutHex(pdpt[d]);
+                    ExcPutsRaw("\n");
                 }
             }
         }
-        brook::SerialPuts("  --- end walk ---\n");
+        ExcPutsRaw("  --- end walk ---\n");
     }
 
     // For user-mode faults, dump a few values from the user stack.
     // Walk the page table first to avoid nested faults on corrupted mappings.
     if ((frame->cs & 3) == 3)  // user mode
     {
-        brook::SerialPuts("  --- user stack dump (RSP) ---\n");
+        ExcPutsRaw("  --- user stack dump (RSP) ---\n");
         auto userRsp = frame->sp;
         static constexpr uint64_t DMAP_USR = 0xFFFF800000000000ULL;
         uint64_t cr3val;
@@ -267,31 +313,31 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
             // Safe read: walk page table via DMAP to verify mapping exists
             uint64_t* l4 = reinterpret_cast<uint64_t*>(DMAP_USR + (cr3val & 0x000FFFFFFFFFF000ULL));
             uint64_t l4e = l4[(addr >> 39) & 0x1FF];
-            if (!(l4e & 1)) { brook::SerialPuts("    (unmapped PML4)\n"); break; }
+            if (!(l4e & 1)) { ExcPutsRaw("    (unmapped PML4)\n"); break; }
             uint64_t* l3 = reinterpret_cast<uint64_t*>(DMAP_USR + (l4e & 0x000FFFFFFFFFF000ULL));
             uint64_t l3e = l3[(addr >> 30) & 0x1FF];
-            if (!(l3e & 1)) { brook::SerialPuts("    (unmapped PDPT)\n"); break; }
+            if (!(l3e & 1)) { ExcPutsRaw("    (unmapped PDPT)\n"); break; }
             uint64_t* l2 = reinterpret_cast<uint64_t*>(DMAP_USR + (l3e & 0x000FFFFFFFFFF000ULL));
             uint64_t l2e = l2[(addr >> 21) & 0x1FF];
-            if (!(l2e & 1)) { brook::SerialPuts("    (unmapped PD)\n"); break; }
+            if (!(l2e & 1)) { ExcPutsRaw("    (unmapped PD)\n"); break; }
             uint64_t physPage;
             if (l2e & 0x80) { // 2MB page
                 physPage = (l2e & 0x000FFFFFFFE00000ULL) + (addr & 0x1FFFFF);
             } else {
                 uint64_t* l1 = reinterpret_cast<uint64_t*>(DMAP_USR + (l2e & 0x000FFFFFFFFFF000ULL));
                 uint64_t l1e = l1[(addr >> 12) & 0x1FF];
-                if (!(l1e & 1)) { brook::SerialPuts("    (unmapped PT)\n"); break; }
+                if (!(l1e & 1)) { ExcPutsRaw("    (unmapped PT)\n"); break; }
                 physPage = (l1e & 0x000FFFFFFFFFF000ULL) + (addr & 0xFFF);
             }
             uint64_t val = *reinterpret_cast<uint64_t*>(DMAP_USR + physPage);
 
-            brook::SerialPuts("    [RSP+");
+            ExcPutsRaw("    [RSP+");
             ExcPutHex(static_cast<uint64_t>(i * 8));
-            brook::SerialPuts("] = ");
+            ExcPutsRaw("] = ");
             ExcPutHex(val);
-            brook::SerialPuts("\n");
+            ExcPutsRaw("\n");
         }
-        brook::SerialPuts("  --- end user stack ---\n");
+        ExcPutsRaw("  --- end user stack ---\n");
     }
     ExcStackWalk(rbp, 32);
 
@@ -307,11 +353,11 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
             uint64_t guardHigh = guardProc->kernelStackBase + brook::KERNEL_STACK_SIZE;
             if (cr2 >= guardLow && cr2 < guardProc->kernelStackBase)
             {
-                brook::SerialPuts("\n*** KERNEL STACK OVERFLOW (bottom guard page hit) ***\n");
+                ExcPutsRaw("\n*** KERNEL STACK OVERFLOW (bottom guard page hit) ***\n");
             }
             else if (cr2 >= guardHigh && cr2 < guardHigh + 4096)
             {
-                brook::SerialPuts("\n*** KERNEL STACK OVERFLOW (top guard page hit) ***\n");
+                ExcPutsRaw("\n*** KERNEL STACK OVERFLOW (top guard page hit) ***\n");
             }
         }
     }
@@ -320,14 +366,14 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
     // Kernel-mode faults are unrecoverable — halt.
     if ((frame->cs & 3) == 3)
     {
-        brook::SerialPuts("=== KILLING PROCESS ===\n");
-        --excDepth;
+        ExcPutsRaw("=== KILLING PROCESS ===\n");
+        --excDepthPerCpu[cpuSlot];
         __asm__ volatile("sti");
         brook::SchedulerExitCurrentProcess(-static_cast<int>(vector));
         // Never reached.
     }
 
-    brook::SerialPuts("=== HALTED ===\n");
+    ExcPutsRaw("=== HALTED ===\n");
 
     // Halt here — kernel-mode exception is unrecoverable.
     for (;;) { __asm__ volatile("hlt"); }
