@@ -1,0 +1,15 @@
+# Brook boot script: Profile 4x DOOM
+# Usage: ./scripts/run-qemu.sh --script profile_doom4
+
+# Start profiler for 5 seconds
+profile 5000
+
+# Configure 2x2 grid
+grid 2 2
+scale 2
+
+# Launch 4 DOOM instances (200 frames)
+doom -frames 200
+doom -frames 200
+doom -frames 200
+doom -frames 200

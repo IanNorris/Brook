@@ -24,6 +24,7 @@
 #include "memory/physical_memory.h"
 #include "apic.h"
 #include "klog.h"
+#include "profiler.h"
 
 namespace brook {
 
@@ -495,6 +496,21 @@ static int ExecCommand(int argc, const char* const* argv)
     if (StrEq(cmd, "log"))
     {
         KLogDump();
+        return 0;
+    }
+
+    // Built-in: profile <duration_ms> — start sampling profiler
+    if (StrEq(cmd, "profile"))
+    {
+        uint32_t ms = 0;
+        if (argc >= 2) {
+            // Simple atoi
+            const char* s = argv[1];
+            while (*s >= '0' && *s <= '9')
+                ms = ms * 10 + (*s++ - '0');
+        }
+        if (ms == 0) ms = 10000;  // default 10 seconds
+        ProfilerStart(ms);
         return 0;
     }
 

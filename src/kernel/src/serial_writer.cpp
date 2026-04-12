@@ -65,8 +65,10 @@ void SerialWriterInit()
 {
     g_writerProc = KernelThreadCreate("serial_wr", SerialWriterThreadFn, nullptr,
                                        2 /* NORMAL priority — don't starve user processes */);
-    if (g_writerProc)
+    if (g_writerProc) {
+        SchedulerAddProcess(g_writerProc);
         SerialPrintf("SERIAL_WRITER: thread created pid=%u\n", g_writerProc->pid);
+    }
 }
 
 void SerialWriterEnqueue(const char* buf, uint32_t len)

@@ -27,6 +27,7 @@
 #include "scheduler.h"
 #include "compositor.h"
 #include "serial_writer.h"
+#include "profiler.h"
 #include "clock_overlay.h"
 #include "smp.h"
 #include "shell.h"
@@ -439,11 +440,16 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         // Start the clock overlay kernel thread (renders uptime on screen).
         brook::ClockOverlayStart();
 
-        // Execute the boot script if present.
-        brook::ShellExecScript("/boot/INIT.RC");
-
         // Start the async serial/TTY writer thread.
         brook::SerialWriterInit();
+
+        // Start the profiler kernel thread (sampling disabled until ProfilerStart).
+        brook::ProfilerInit();
+
+        // Execute the boot script if present.
+        // This may call ProfilerStart() via the "profile" command,
+        // so the profiler thread must already exist.
+        brook::ShellExecScript("/boot/INIT.RC");
 
         // Start the compositor kernel thread (blits VFBs to physical FB).
         brook::CompositorStartThread();

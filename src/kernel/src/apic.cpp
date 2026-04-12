@@ -170,9 +170,13 @@ volatile uint64_t g_lapicTickCount = 0;
 // Forward-declare scheduler tick (defined in scheduler.cpp).
 void SchedulerTimerTick();
 
+// Forward-declare profiler sample (defined in profiler.cpp).
+void ProfilerSample(uint64_t interruptedRip, uint64_t interruptedCs);
+
 // C handler called from the naked ISR wrapper below.
-// This is a regular function — NOT __attribute__((interrupt)).
-static void LapicTimerHandlerInner()
+// interruptedRip/interruptedCs are passed from the naked handler (extracted
+// from the CPU interrupt frame on the stack).
+static void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interruptedCs)
 {
     LapicWrite(LapicReg::EOI, 0);
 
@@ -184,6 +188,9 @@ static void LapicTimerHandlerInner()
         g_lapicTickCount++;
     }
 
+    // Record a profiler sample (fast no-op when profiling is disabled).
+    ProfilerSample(interruptedRip, interruptedCs);
+
     // Drive the scheduler on every CPU.
     SchedulerTimerTick();
 }
@@ -191,6 +198,8 @@ static void LapicTimerHandlerInner()
 // Naked ISR entry for LAPIC timer (vector 32).
 // Performs swapgs when entering from ring 3 so that gs-relative kernel data
 // (KernelCpuEnv at gs:0) is accessible throughout the handler.
+// Passes the interrupted RIP (rdi) and CS (rsi) to the inner handler for
+// profiler sampling.
 __attribute__((naked))
 static void LapicTimerHandler(void)
 {
@@ -212,8 +221,15 @@ static void LapicTimerHandler(void)
         "push %%r10\n\t"
         "push %%r11\n\t"
 
-        // Align stack to 16 bytes (9 pushes = 72 bytes + 5 CPU-pushed = 40 → 112)
-        // 112 is already 16-byte aligned, so no adjustment needed.
+        // Stack layout after 9 pushes (72 bytes):
+        //   RSP+72  = interrupted RIP  (CPU-pushed interrupt frame)
+        //   RSP+80  = interrupted CS
+        //   RSP+88  = interrupted RFLAGS
+        //   RSP+96  = interrupted RSP
+        //   RSP+104 = interrupted SS
+        // Load RIP→RDI (arg1), CS→RSI (arg2) for LapicTimerHandlerInner.
+        "movq 72(%%rsp), %%rdi\n\t"
+        "movq 80(%%rsp), %%rsi\n\t"
 
         "cld\n\t"
         "call %P0\n\t"

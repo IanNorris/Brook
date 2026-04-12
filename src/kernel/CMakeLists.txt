@@ -164,6 +164,7 @@ add_executable(kernel
     src/sync/krwlock.cpp
     src/sync/ksemaphore.cpp
     src/serial_writer.cpp
+    src/profiler.cpp
     src/sched_policy.cpp
     # Scheduler modules (statically linked for now; will be .mod later)
     "${BROOK_ROOT}/src/modules/sched_mlfq.cpp"
@@ -214,6 +215,7 @@ set_source_files_properties(
     src/compositor.cpp
     src/keyboard.cpp
     src/panic.cpp
+    src/profiler.cpp
     src/smp.cpp
     PROPERTIES COMPILE_OPTIONS "-mgeneral-regs-only;-mno-sse;-mno-sse2;-mfpmath="
 )
@@ -317,11 +319,13 @@ function(add_driver_module mod_name)
     endforeach()
 
     # Partial link → relocatable ELF (.mod).
+    # Use ld.lld directly — clang driver with --target=x86_64-elf fails
+    # if it can't find a GCC cross-toolchain for driver detection.
+    find_program(LLD_LINKER ld.lld REQUIRED)
     add_custom_command(
         OUTPUT  "${MOD_OBJ}"
-        COMMAND "${CMAKE_CXX_COMPILER}"
-                "--target=x86_64-elf"
-                "-nostdlib" "-r"
+        COMMAND "${LLD_LINKER}"
+                "-r"
                 ${OBJ_FILES}
                 -o "${MOD_OBJ}"
         DEPENDS ${OBJ_FILES}
