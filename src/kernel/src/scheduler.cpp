@@ -594,6 +594,18 @@ void SchedulerYield()
     SerialPrintf("SCHED: '%s' (pid %u) exited with status %d\n",
                  proc->name, proc->pid, status);
 
+    // Fill the process's virtual framebuffer with a status colour:
+    //   Red  (0xFFCC0000) for abnormal termination (negative status = signal/fault)
+    //   Blue (0xFF0044AA) for normal exit
+    if (proc->fbVirtual && proc->fbVirtualSize)
+    {
+        uint32_t color = (status < 0) ? 0xFF0000CCu : 0xFFAA4400u; // BGRA: red / blue
+        uint32_t pixels = proc->fbVirtualSize / sizeof(uint32_t);
+        for (uint32_t i = 0; i < pixels; i++)
+            proc->fbVirtual[i] = color;
+        proc->fbDirty = 1;
+    }
+
     proc->state = ProcessState::Terminated;
 
     uint64_t rlf10 = SchedLockAcquire(g_readyLock);
