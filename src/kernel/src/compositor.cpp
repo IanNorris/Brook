@@ -200,18 +200,42 @@ static void CompositorLoop()
     {
         Process* p = g_compositedProcs[i];
         if (!p) continue;
-        if (!p->fbVirtual || p->fbVfbWidth == 0)
-            continue;
 
-        // Blit terminated processes one final time (exit status color fill),
-        // then remove them from the composited list.
-        if (p->state == ProcessState::Terminated)
+        // Handle exit color fill: paint the physical FB region directly
+        // (no VFB read needed — safe even after VFB pages are freed).
+        uint32_t exitColor = __atomic_load_n(&p->fbExitColor, __ATOMIC_ACQUIRE);
+        if (exitColor)
         {
-            if (p->fbDirty)
-                BlitProcess(p, true);
+            uint32_t scale = p->fbScale ? p->fbScale : 1;
+            uint32_t dstW = p->fbVfbWidth / scale;
+            uint32_t dstH = p->fbVfbHeight / scale;
+            int dstX0 = p->fbDestX;
+            int dstY0 = p->fbDestY;
+
+            for (uint32_t dy = 0; dy < dstH; ++dy)
+            {
+                int y = dstY0 + static_cast<int>(dy);
+                if (y < 0 || static_cast<uint32_t>(y) >= g_physFbHeight) continue;
+                volatile uint32_t* row = g_physFb + y * g_physFbStride;
+                for (uint32_t dx = 0; dx < dstW; ++dx)
+                {
+                    int x = dstX0 + static_cast<int>(dx);
+                    if (x < 0 || static_cast<uint32_t>(x) >= g_physFbWidth) continue;
+                    row[x] = exitColor;
+                }
+            }
+            __atomic_store_n(&p->fbExitColor, 0u, __ATOMIC_RELEASE);
             g_compositedProcs[i] = nullptr;
             continue;
         }
+
+        if (p->state == ProcessState::Terminated)
+        {
+            g_compositedProcs[i] = nullptr;
+            continue;
+        }
+        if (!p->fbVirtual || p->fbVfbWidth == 0)
+            continue;
 
         BlitProcess(p, forceAll);
     }

@@ -193,6 +193,7 @@ struct Process
     int16_t   fbDestY;          // Destination Y on physical FB
     uint8_t   fbScale;          // Downscale factor when blitting to phys FB (1=1:1, 2=half, etc.)
     volatile uint8_t fbDirty;   // Set by process (via write to fb fd), cleared by compositor
+    volatile uint32_t fbExitColor; // Non-zero: compositor should fill region with this color and clear it
 
     // Process name (for debug output)
     char name[32];
