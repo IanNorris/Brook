@@ -14,6 +14,7 @@
 #include "vfs.h"
 #include "tty.h"
 #include "input.h"
+#include "serial_writer.h"
 
 // Forward declaration
 extern "C" __attribute__((naked)) void ReturnToKernel();
@@ -117,14 +118,10 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if (fd == 1 || fd == 2)
     {
         const char* buf = reinterpret_cast<const char*>(bufAddr);
-        // Only echo stderr (fd 2) to serial — stdout is too noisy with 32 DOOMs.
-        if (fd == 2)
-        {
-            SerialLock();
-            for (uint64_t i = 0; i < count; ++i)
-                SerialPutChar(buf[i]);
-            SerialUnlock();
-        }
+        // Enqueue to async serial writer — decouples userspace from baud rate.
+        // Both stdout and stderr go through the ring buffer.
+        if (count > 0)
+            SerialWriterEnqueue(buf, static_cast<uint32_t>(count));
         return static_cast<int64_t>(count);
     }
 

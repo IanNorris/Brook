@@ -163,6 +163,7 @@ add_executable(kernel
     src/sync/kmutex.cpp
     src/sync/krwlock.cpp
     src/sync/ksemaphore.cpp
+    src/serial_writer.cpp
     src/sched_policy.cpp
     # Scheduler modules (statically linked for now; will be .mod later)
     "${BROOK_ROOT}/src/modules/sched_mlfq.cpp"

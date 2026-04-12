@@ -25,6 +25,7 @@
 #include "process.h"
 #include "scheduler.h"
 #include "compositor.h"
+#include "serial_writer.h"
 #include "clock_overlay.h"
 #include "smp.h"
 #include "shell.h"
@@ -438,6 +439,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
         // Execute the boot script if present.
         brook::ShellExecScript("/boot/INIT.RC");
+
+        // Start the async serial/TTY writer thread.
+        brook::SerialWriterInit();
 
         // Start the compositor kernel thread (blits VFBs to physical FB).
         brook::CompositorStartThread();
