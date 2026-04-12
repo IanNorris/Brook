@@ -5,6 +5,7 @@
 #include "memory/heap.h"
 #include "vfs.h"
 #include "serial.h"
+#include "kprintf.h"
 #include "mem_tag.h"
 
 namespace brook {
@@ -533,20 +534,18 @@ ModuleHandle* ModuleFind(const char* name)
 
 void ModuleDump()
 {
-    SerialPuts("Loaded modules:\n");
+    KPrintf("Loaded modules:\n");
     uint32_t count = 0;
     for (uint32_t i = 0; i < MODULE_MAX; ++i)
     {
         if (!g_modules[i].active) continue;
-        SerialPrintf("  %-20s  v%-8s  0x%016lx  (%lu pages)  %s\n",
-                     g_modules[i].info->name,
-                     g_modules[i].info->version,
-                     g_modules[i].baseVirt,
-                     g_modules[i].pageCount,
-                     g_modules[i].info->description);
+        KPrintf("  %-16s v%-6s %s\n",
+                g_modules[i].info->name,
+                g_modules[i].info->version,
+                g_modules[i].info->description);
         ++count;
     }
-    if (!count) SerialPuts("  (none)\n");
+    if (!count) KPrintf("  (none)\n");
 }
 
 uint32_t ModuleDiscoverAndLoad(const char* dirPath)

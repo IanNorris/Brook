@@ -1,13 +1,14 @@
 #pragma once
 
 #include "process.h"
+#include "sched_ops.h"
 
 struct KernelCpuEnv;
 
 namespace brook {
 
 // ---------------------------------------------------------------------------
-// Scheduler — preemptive round-robin with SMP support
+// Scheduler — preemptive with pluggable policy and SMP support
 // ---------------------------------------------------------------------------
 
 // Initialise the scheduler. Creates the idle process for the BSP.
@@ -65,5 +66,16 @@ Process* SchedulerFindTerminatedChild(uint16_t parentPid, int64_t pid);
 
 // Reap (destroy) a terminated child process after wait4 collects its status.
 void SchedulerReapChild(Process* child);
+
+// Register a scheduling policy. Called by scheduler modules during init().
+// Multiple policies can be registered; only the active one is used.
+extern "C" void SchedulerRegisterPolicy(const SchedOps* ops);
+
+// Switch to a registered policy by name. Returns true on success.
+// Safe to call at runtime — migrates all processes to the new policy.
+bool SchedulerSwitchPolicy(const char* name);
+
+// Get the name of the currently active scheduling policy.
+const char* SchedulerPolicyName();
 
 } // namespace brook

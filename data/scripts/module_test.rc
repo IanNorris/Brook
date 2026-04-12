@@ -1,0 +1,18 @@
+# module_test.rc — Test dynamic module loading and scheduler switching
+#
+# Demonstrates: modlist, loading sched_mlfq module, switching scheduler
+# policy at runtime, then running test apps.
+
+modlist
+sched
+
+# The sched_mlfq module was already auto-loaded from /boot/drivers at boot.
+# Switch scheduler policy to MLFQ.
+sched mlfq
+
+# List modules again to show the new one
+modlist
+
+# Run some test apps to verify scheduling works
+run /boot/BIN/SYSCHECK
+run /boot/BIN/STRESSTEST

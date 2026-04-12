@@ -92,6 +92,11 @@ static const SchedOps* g_schedOps = nullptr;
 static uint8_t g_schedStateStorage[4096] __attribute__((aligned(16)));
 static void*   g_schedState = g_schedStateStorage;
 
+// Policy registry — modules register here; we can switch at runtime.
+static constexpr uint32_t MAX_SCHED_POLICIES = 8;
+static const SchedOps* g_registeredPolicies[MAX_SCHED_POLICIES] = {};
+static uint32_t g_registeredPolicyCount = 0;
+
 // PID → Process* lookup (for converting PickNext pid back to Process*).
 static Process* g_pidToProcess[SCHED_MAX_PIDS] = {};
 
@@ -187,12 +192,13 @@ static void IdleLoop()
 void SchedulerInit()
 {
     // Load the scheduling policy module.
-    // For now, use the statically-linked default (sched_rr).
-    // Future: load from INIT.RC via ModuleLoad("sched_mlfq.mod").
+    // The statically-linked default (sched_rr) is always available.
+    // Dynamic modules can register additional policies at runtime.
     g_schedOps = GetSchedOps();
+    SchedulerRegisterPolicy(g_schedOps);  // register built-in as first policy
     if (g_schedOps->stateSize > sizeof(g_schedStateStorage))
     {
-        SerialPrintf("SCHED FATAL: policy state %zu > storage %zu\n",
+        SerialPrintf("SCHED FATAL: policy state %lu > storage %lu\n",
                      g_schedOps->stateSize, sizeof(g_schedStateStorage));
         for (;;) __asm__ volatile("hlt");
     }
@@ -890,6 +896,120 @@ void SchedulerReapChild(Process* child)
 {
     DbgPrintf("SCHED: reaping child '%s' (pid %u)\n", child->name, child->pid);
     ProcessDestroy(child);
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic policy registration and switching
+// ---------------------------------------------------------------------------
+
+void SchedulerRegisterPolicy(const SchedOps* ops)
+{
+    if (!ops || !ops->name)
+    {
+        SerialPuts("SCHED: register — null policy\n");
+        return;
+    }
+    // Check for duplicate
+    for (uint32_t i = 0; i < g_registeredPolicyCount; ++i)
+    {
+        if (g_registeredPolicies[i] == ops) return; // already registered
+        // Compare names
+        const char* a = g_registeredPolicies[i]->name;
+        const char* b = ops->name;
+        bool same = true;
+        for (uint32_t j = 0; a[j] || b[j]; ++j)
+        {
+            if (a[j] != b[j]) { same = false; break; }
+        }
+        if (same)
+        {
+            // Replace existing registration with new pointer
+            g_registeredPolicies[i] = ops;
+            SerialPrintf("SCHED: updated policy '%s'\n", ops->name);
+            return;
+        }
+    }
+    if (g_registeredPolicyCount >= MAX_SCHED_POLICIES)
+    {
+        SerialPrintf("SCHED: policy registry full, cannot register '%s'\n", ops->name);
+        return;
+    }
+    g_registeredPolicies[g_registeredPolicyCount++] = ops;
+    SerialPrintf("SCHED: registered policy '%s' (state=%lu bytes)\n",
+                 ops->name, ops->stateSize);
+}
+
+static bool StrEq(const char* a, const char* b)
+{
+    while (*a && *b) { if (*a++ != *b++) return false; }
+    return *a == *b;
+}
+
+bool SchedulerSwitchPolicy(const char* name)
+{
+    const SchedOps* newOps = nullptr;
+    for (uint32_t i = 0; i < g_registeredPolicyCount; ++i)
+    {
+        if (StrEq(g_registeredPolicies[i]->name, name))
+        {
+            newOps = g_registeredPolicies[i];
+            break;
+        }
+    }
+    if (!newOps)
+    {
+        SerialPrintf("SCHED: policy '%s' not registered\n", name);
+        return false;
+    }
+    if (newOps == g_schedOps)
+    {
+        SerialPrintf("SCHED: already using '%s'\n", name);
+        return true;
+    }
+    if (newOps->stateSize > sizeof(g_schedStateStorage))
+    {
+        SerialPrintf("SCHED: policy '%s' state %lu > storage %lu\n",
+                     name, newOps->stateSize, sizeof(g_schedStateStorage));
+        return false;
+    }
+
+    // Switch under the scheduler lock — migrate all active processes.
+    uint64_t flags = SchedLockAcquire(g_readyLock);
+
+    const SchedOps* oldOps = g_schedOps;
+    SerialPrintf("SCHED: switching '%s' → '%s'\n", oldOps->name, newOps->name);
+
+    // Initialize new policy state
+    __builtin_memset(g_schedStateStorage, 0, sizeof(g_schedStateStorage));
+    g_schedOps = newOps;
+    newOps->Init(g_schedState);
+
+    // Re-register all active processes and enqueue ready ones
+    uint64_t allFlags = SchedLockAcquire(g_allProcLock);
+    for (uint32_t i = 0; i < g_processCount; ++i)
+    {
+        Process* p = g_allProcesses[i];
+        if (!p) continue;
+        // Skip idle processes (pid 0 or idle-named)
+        if (p->name[0] == 'i' && p->name[1] == 'd' &&
+            p->name[2] == 'l' && p->name[3] == 'e')
+            continue;
+        newOps->InitProcess(g_schedState, p->pid, 2); // default priority
+        if (p->state == ProcessState::Ready)
+            newOps->Enqueue(g_schedState, p->pid);
+    }
+    SchedLockRelease(g_allProcLock, allFlags);
+
+    SchedLockRelease(g_readyLock, flags);
+
+    SerialPrintf("SCHED: now using '%s' (%u ready)\n",
+                 newOps->name, newOps->ReadyCount(g_schedState));
+    return true;
+}
+
+const char* SchedulerPolicyName()
+{
+    return g_schedOps ? g_schedOps->name : "none";
 }
 
 } // namespace brook

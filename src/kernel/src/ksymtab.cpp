@@ -22,6 +22,7 @@ extern "C" brook::KernelSymbol __stop_ksymtab[];
 #include "virtio_blk.h"
 #include "keyboard.h"
 #include "input.h"
+#include "scheduler.h"
 
 // Bring all brook:: names into scope so EXPORT_SYMBOL(fn) resolves correctly.
 using namespace brook;
@@ -85,6 +86,9 @@ EXPORT_SYMBOL(InputRegister);
 EXPORT_SYMBOL(InputPollEvent);
 EXPORT_SYMBOL(InputWaitEvent);
 EXPORT_SYMBOL(InputHasEvents);
+
+// Scheduler — for dynamic policy modules
+EXPORT_SYMBOL(SchedulerRegisterPolicy);
 
 // Panic
 EXPORT_SYMBOL(KernelPanic);

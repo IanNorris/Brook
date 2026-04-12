@@ -26,6 +26,7 @@
 #include "apic.h"
 #include "klog.h"
 #include "profiler.h"
+#include "module.h"
 
 namespace brook {
 
@@ -568,6 +569,55 @@ static int ExecCommand(int argc, const char* const* argv)
         return 0;
     }
 
+    // Built-in: modload <path> — load a kernel module
+    if (StrEq(cmd, "modload") && argc >= 2)
+    {
+        ModuleHandle* h = ModuleLoad(argv[1]);
+        if (h)
+            KPrintf("Loaded module '%s' v%s\n", h->info->name, h->info->version);
+        else
+            KPrintf("Failed to load '%s'\n", argv[1]);
+        return h ? 0 : -1;
+    }
+
+    // Built-in: modunload <name> — unload a kernel module
+    if (StrEq(cmd, "modunload") && argc >= 2)
+    {
+        ModuleHandle* h = ModuleFind(argv[1]);
+        if (h)
+        {
+            KPrintf("Unloading module '%s'\n", argv[1]);
+            ModuleUnload(h);
+        }
+        else
+        {
+            KPrintf("Module '%s' not found\n", argv[1]);
+        }
+        return 0;
+    }
+
+    // Built-in: modlist — list loaded modules
+    if (StrEq(cmd, "modlist") || StrEq(cmd, "lsmod"))
+    {
+        ModuleDump();
+        return 0;
+    }
+
+    // Built-in: sched [policy_name] — show or switch scheduler policy
+    if (StrEq(cmd, "sched"))
+    {
+        if (argc < 2)
+        {
+            KPrintf("Scheduler policy: %s\n", SchedulerPolicyName());
+            return 0;
+        }
+        if (SchedulerSwitchPolicy(argv[1]))
+            KPrintf("Switched to '%s'\n", argv[1]);
+        else
+            KPrintf("Failed to switch to '%s'\n", argv[1]);
+        return 0;
+    }
+
     // Try as a program name (implicit run)
     char resolved[128];
     if (ResolveBinaryPath(cmd, resolved, sizeof(resolved)))
@@ -601,6 +651,10 @@ static void CmdHelp()
     KPrintf("  reboot             Reboot\n");
     KPrintf("  panic [msg]        Trigger test panic\n");
     KPrintf("  log                Dump kernel log\n");
+    KPrintf("  modload <path>     Load a kernel module\n");
+    KPrintf("  modunload <name>   Unload a kernel module\n");
+    KPrintf("  modlist            List loaded modules\n");
+    KPrintf("  sched [policy]     Show/switch scheduler policy\n");
     KPrintf("  help               Show this help\n");
 }
 
