@@ -15,6 +15,9 @@ let
 
   # A properly wrapped Clang+libc++ toolchain for host-target builds.
   hostCC = llvm.libcxxStdenv.cc;
+
+  # Musl cross-compiler for building static userspace binaries (DOOM, etc.).
+  muslCC = pkgs.pkgsCross.musl64.stdenv.cc;
 in
 pkgs.mkShellNoCC {
   name = "brook-dev";
@@ -27,6 +30,9 @@ pkgs.mkShellNoCC {
 
     # Host-target compiler (wrapped Clang+libc++) for unit tests and tools.
     hostCC
+
+    # Musl cross-compiler for static userspace binaries.
+    muslCC
 
     pkgs.cmake
     pkgs.ninja
@@ -55,6 +61,9 @@ pkgs.mkShellNoCC {
     # Host-target compiler (wrapped Clang+libc++ for native builds)
     export HOST_CC="${hostCC}/bin/cc"
     export HOST_CXX="${hostCC}/bin/c++"
+
+    # Musl cross-compiler for static userspace binaries (DOOM, etc.)
+    export MUSL_CC="${muslCC}/bin/x86_64-unknown-linux-musl-gcc"
 
     # Library paths for host linking
     export LIBRARY_PATH="${llvm.libcxx}/lib:${pkgs.glibc}/lib"
