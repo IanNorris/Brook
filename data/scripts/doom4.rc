@@ -1,0 +1,10 @@
+# Brook OS boot script — 4×DOOM (2x2 grid)
+
+set grid 2x2
+set scale 2
+set vfb 640x400
+
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD

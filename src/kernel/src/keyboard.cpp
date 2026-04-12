@@ -1,5 +1,6 @@
 // keyboard.cpp — compiled with -mgeneral-regs-only (ISR file).
 #include "keyboard.h"
+#include "input.h"
 #include "idt.h"
 #include "apic.h"
 #include "serial.h"
@@ -197,6 +198,10 @@ static volatile char  g_kbdBuf[KBD_BUF_SIZE];
 static volatile int   g_kbdHead = 0; // write index (ISR writes)
 static volatile int   g_kbdTail = 0; // read  index (kernel reads)
 
+// Input subsystem device — pushes raw scan code events for userspace consumers.
+static InputDeviceOps g_kbdInputOps = { "ps2_kbd", nullptr };
+static InputDevice    g_kbdInputDev = { &g_kbdInputOps, {}, 0, 0, nullptr };
+
 static inline bool BufFull()  { return ((g_kbdHead + 1) % KBD_BUF_SIZE) == g_kbdTail; }
 static inline bool BufEmpty() { return g_kbdHead == g_kbdTail; }
 
@@ -237,6 +242,12 @@ static void KbdIrqHandler(InterruptFrame* frame)
     bool release = (sc & 0x80) != 0;
     uint8_t key  = sc & 0x7F;
 
+    // Build modifier bitmask for the input event.
+    uint8_t mods = 0;
+    if (g_shiftHeld) mods |= INPUT_MOD_LSHIFT;
+    if (g_capsLock)  mods |= INPUT_MOD_CAPSLOCK;
+
+    // Track modifier state.
     if (key == 0x2A || key == 0x36) // L-Shift or R-Shift
     {
         g_shiftHeld = !release;
@@ -245,23 +256,47 @@ static void KbdIrqHandler(InterruptFrame* frame)
     {
         g_capsLock = !g_capsLock;
     }
-    else if (!release && key < 128)
+
+    // Push raw scan code event to input subsystem (for userspace consumers like DOOM).
+    // All keys (including modifiers) and both press/release are forwarded.
+    {
+        InputEvent ev;
+        ev.type = release ? InputEventType::KeyRelease : InputEventType::KeyPress;
+        ev.scanCode = key;
+        ev.modifiers = mods;
+
+        // Translate to ASCII for press events on non-modifier keys.
+        ev.ascii = 0;
+        if (!release && key < 128)
+        {
+            bool shifted = g_shiftHeld ^ g_capsLock;
+            if (g_capsLock && !g_shiftHeld)
+            {
+                char c = g_scancodeToAsciiShift[key];
+                ev.ascii = (c >= 'A' && c <= 'Z') ? c : g_scancodeToAscii[key];
+            }
+            else
+            {
+                ev.ascii = shifted ? g_scancodeToAsciiShift[key] : g_scancodeToAscii[key];
+            }
+        }
+        InputDevicePush(&g_kbdInputDev, ev);
+    }
+
+    // Also push ASCII to the legacy ring buffer (for kernel shell / KbdGetChar).
+    if (!release && key < 128)
     {
         bool shifted = g_shiftHeld ^ g_capsLock;
-        // Caps lock only affects letters — revert non-letters back.
         char c;
         if (g_capsLock && !g_shiftHeld)
         {
-            // Caps: uppercase letters only.
             c = g_scancodeToAsciiShift[key];
-            // If not a letter, use normal.
             if (c < 'A' || c > 'Z') c = g_scancodeToAscii[key];
         }
         else
         {
             c = shifted ? g_scancodeToAsciiShift[key] : g_scancodeToAscii[key];
         }
-
         if (c) BufPush(c);
     }
 
@@ -280,6 +315,9 @@ void KbdInit()
 {
     // Flush any stale bytes in the PS/2 output buffer.
     while (inb(0x64) & 0x01) inb(0x60);
+
+    // Register with the generic input subsystem.
+    InputRegister(&g_kbdInputDev);
 
     // Install the IRQ handler and unmask IRQ1 in the I/O APIC.
     IdtInstallHandler(KBD_IRQ_VECTOR,

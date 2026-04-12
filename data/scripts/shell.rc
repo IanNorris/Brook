@@ -1,0 +1,3 @@
+# Brook OS boot script — interactive shell
+# (Currently the kernel enters interactive shell mode when no processes
+# are queued after script execution.)

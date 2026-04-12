@@ -1,0 +1,7 @@
+# Brook OS boot script — single DOOM instance (full screen)
+
+set grid 1x1
+set scale 1
+set vfb 640x400
+
+run doom -iwad /boot/DOOM1.WAD

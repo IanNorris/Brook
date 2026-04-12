@@ -7,6 +7,7 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 # Parse arguments
 BUILD_TYPE="debug"
 DEBUG_FLAGS=""
+SCRIPT_NAME=""
 EXTRA_ARGS=()
 for arg in "$@"; do
     case "$arg" in
@@ -16,8 +17,19 @@ for arg in "$@"; do
         --debug)
             DEBUG_FLAGS="-s"
             ;;
+        --script=*)
+            SCRIPT_NAME="${arg#--script=}"
+            ;;
+        --script)
+            # Next arg will be consumed below
+            SCRIPT_NAME="__NEXT__"
+            ;;
         *)
-            EXTRA_ARGS+=("$arg")
+            if [ "$SCRIPT_NAME" = "__NEXT__" ]; then
+                SCRIPT_NAME="$arg"
+            else
+                EXTRA_ARGS+=("$arg")
+            fi
             ;;
     esac
 done
@@ -130,6 +142,28 @@ if [ ! -f "${DISK_IMG}" ]; then
     echo "Creating persistent disk image..."
     "${SCRIPT_DIR}/create_disk.sh"
     "${SCRIPT_DIR}/update_disk.sh"
+fi
+
+# Select boot script: --script <name> copies data/scripts/<name>.rc to INIT.RC
+# on the disk image. Without --script, the existing INIT.RC is used.
+if [ -n "${SCRIPT_NAME}" ]; then
+    # Try exact path first, then data/scripts/<name>.rc, then data/scripts/<name>
+    if [ -f "${SCRIPT_NAME}" ]; then
+        SCRIPT_FILE="${SCRIPT_NAME}"
+    elif [ -f "${ROOT_DIR}/data/scripts/${SCRIPT_NAME}.rc" ]; then
+        SCRIPT_FILE="${ROOT_DIR}/data/scripts/${SCRIPT_NAME}.rc"
+    elif [ -f "${ROOT_DIR}/data/scripts/${SCRIPT_NAME}" ]; then
+        SCRIPT_FILE="${ROOT_DIR}/data/scripts/${SCRIPT_NAME}"
+    else
+        echo "Error: boot script '${SCRIPT_NAME}' not found."
+        echo "Available scripts:"
+        ls "${ROOT_DIR}/data/scripts/"*.rc 2>/dev/null | while read -r f; do
+            basename "$f" .rc
+        done
+        exit 1
+    fi
+    echo "  Boot script: ${SCRIPT_FILE}"
+    mcopy -o -i "${DISK_IMG}" "${SCRIPT_FILE}" "::INIT.RC"
 fi
 
 qemu-system-x86_64 \

@@ -10,6 +10,7 @@
 #include "memory/heap.h"
 #include "acpi.h"
 #include "apic.h"
+#include "input.h"
 #include "keyboard.h"
 #include "ksymtab.h"
 #include "module.h"
@@ -404,7 +405,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         brook::SchedulerInit();
         brook::CompositorInit();
 
-        // Initialise keyboard before shell (needs it for interactive mode).
+        // Initialise input subsystem, then keyboard.
+        brook::InputInit();
         if (acpiOk && !brook::KbdIsAvailable())
         {
             brook::KPuts("KBD: ps2_kbd module not loaded — falling back to direct init\n");
