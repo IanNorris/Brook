@@ -164,7 +164,7 @@ void DG_Init()
 
     enableRawMode();
 
-    KeyboardFd = open("keyboard", 0);
+    KeyboardFd = open("/dev/keyboard", 0);
 
     if (KeyboardFd >= 0)
     {

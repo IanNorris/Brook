@@ -67,6 +67,10 @@ struct Device {
 // or a device with the same name is already registered.
 extern "C" bool DeviceRegister(Device* dev);
 
+// Unregister a device by pointer.  Returns true if found and removed.
+// Does NOT call dev->ops->close() — caller is responsible for shutdown.
+extern "C" bool DeviceUnregister(Device* dev);
+
 // Find a device by exact name.  Returns nullptr if not found.
 extern "C" Device* DeviceFind(const char* name);
 

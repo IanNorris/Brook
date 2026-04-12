@@ -1,16 +1,14 @@
 # Brook boot script: Profile 4x DOOM during rendering
 # Usage: ./scripts/run-qemu.sh --script profile_doom4
 
-# Configure 2x2 grid
-grid 2 2
-scale 2
+set grid 2x2
+set scale 2
+set vfb 640x400
 
-# Launch 4 DOOM instances (500 frames — enough to profile rendering)
-doom -frames 500
-doom -frames 500
-doom -frames 500
-doom -frames 500
+run doom -iwad /boot/DOOM1.WAD -frames 500
+run doom -iwad /boot/DOOM1.WAD -frames 500
+run doom -iwad /boot/DOOM1.WAD -frames 500
+run doom -iwad /boot/DOOM1.WAD -frames 500
 
-# Start profiler for 8 seconds AFTER doom spawned — captures end of
-# WAD loading + rendering phase.
+# Start profiler late — captures rendering phase (after WAD loading)
 profile 8000

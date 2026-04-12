@@ -52,6 +52,26 @@ bool DeviceRegister(Device* dev)
     return true;
 }
 
+bool DeviceUnregister(Device* dev)
+{
+    if (!dev) return false;
+
+    for (uint32_t i = 0; i < g_deviceCount; ++i)
+    {
+        if (g_devices[i] == dev)
+        {
+            SerialPrintf("DEV: unregistered '%s'\n", dev->name);
+
+            // Shift remaining entries down.
+            for (uint32_t j = i; j + 1 < g_deviceCount; ++j)
+                g_devices[j] = g_devices[j + 1];
+            g_devices[--g_deviceCount] = nullptr;
+            return true;
+        }
+    }
+    return false;
+}
+
 Device* DeviceFind(const char* name)
 {
     if (!name) return nullptr;

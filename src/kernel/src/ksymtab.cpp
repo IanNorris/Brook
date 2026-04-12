@@ -48,6 +48,7 @@ EXPORT_SYMBOL(VmmVirtToPhys);
 
 // Device registry
 EXPORT_SYMBOL(DeviceRegister);
+EXPORT_SYMBOL(DeviceUnregister);
 EXPORT_SYMBOL(DeviceFind);
 EXPORT_SYMBOL(DeviceIterate);
 
