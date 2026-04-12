@@ -107,9 +107,10 @@ static MountEntry* FindMount(const char* absPath, const char** relPath)
 // Multiple vnodes can share the same CachedFile via refCount.
 struct CachedFile {
     FIL*     fil;       // Original FatFS handle (closed when refCount→0)
-    uint8_t* data;
+    uint8_t* data;      // nullptr while loading
     uint64_t size;
     int32_t  refCount;  // Number of vnodes sharing this cache entry
+    volatile bool loading; // True while initial load in progress
     char     path[64];  // Canonical path for dedup (e.g. "0:/DOOM1.WAD")
 };
 
@@ -168,6 +169,7 @@ static CachedFile* CacheFileUnlocked(FIL* fil, const char* fatPath)
     cf->fil      = fil;
     cf->size     = size;
     cf->refCount = 1;
+    cf->loading  = false;
     // Store path for dedup lookups
     uint32_t pi = 0;
     for (; fatPath[pi] && pi < sizeof(cf->path) - 1; ++pi) cf->path[pi] = fatPath[pi];
@@ -184,6 +186,7 @@ static CachedFile* CacheFileUnlocked(FIL* fil, const char* fatPath)
     }
 
     // Read entire file — acquire VFS lock per chunk to allow interleaving.
+    // Use 64 KB chunks to match the VirtIO DMA buffer size.
     {
         KMutexLock(&g_vfsLock);
         f_lseek(fil, 0);
@@ -192,7 +195,7 @@ static CachedFile* CacheFileUnlocked(FIL* fil, const char* fatPath)
     uint64_t remaining = size;
     uint64_t off = 0;
     while (remaining > 0) {
-        UINT chunk = (remaining > 32768) ? 32768 : static_cast<UINT>(remaining);
+        UINT chunk = (remaining > 65536) ? 65536 : static_cast<UINT>(remaining);
         UINT br = 0;
         KMutexLock(&g_vfsLock);
         FRESULT res = f_read(fil, cf->data + off, chunk, &br);
@@ -503,6 +506,20 @@ Vnode* VfsOpen(const char* path, int flags)
             KMutexUnlock(&g_vfsLock);
             kfree(fil); // Don't need FatFS handle — sharing cached data
 
+            // If another thread is still loading this file, spin-wait.
+            while (existing->loading) {
+                // Yield CPU while waiting for the loading thread.
+                __asm__ volatile("pause");
+            }
+
+            if (!existing->data) {
+                // Loading failed — treat as uncached open
+                KMutexLock(&g_vfsLock);
+                existing->refCount--;
+                KMutexUnlock(&g_vfsLock);
+                return nullptr;
+            }
+
             auto* vn = static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
             if (!vn) {
                 KMutexLock(&g_vfsLock);
@@ -537,14 +554,48 @@ Vnode* VfsOpen(const char* path, int flags)
         uint64_t fileSize = f_size(fil);
         if (!(flags & VFS_O_WRITE) && fileSize >= CACHE_THRESHOLD)
         {
+            // Insert a "loading" placeholder into the cache table immediately
+            // so other openers can wait for us instead of starting their own load.
+            auto* placeholder = static_cast<CachedFile*>(kmalloc(sizeof(CachedFile)));
+            if (placeholder) {
+                placeholder->fil      = fil;
+                placeholder->data     = nullptr;
+                placeholder->size     = fileSize;
+                placeholder->refCount = 1;
+                placeholder->loading  = true;
+                uint32_t pi = 0;
+                for (; fatPath[pi] && pi < sizeof(placeholder->path) - 1; ++pi)
+                    placeholder->path[pi] = fatPath[pi];
+                placeholder->path[pi] = '\0';
+                FileCacheInsert(placeholder);
+            }
             KMutexUnlock(&g_vfsLock);
-            CachedFile* cf = CacheFileUnlocked(fil, fatPath);
-            if (cf) {
-                // Insert into shared cache table.
-                KMutexLock(&g_vfsLock);
-                FileCacheInsert(cf); // Best-effort; dedup still works if table full
-                KMutexUnlock(&g_vfsLock);
 
+            CachedFile* cf = CacheFileUnlocked(fil, fatPath);
+            if (cf && placeholder) {
+                // Transfer loaded data into the placeholder (which others may be waiting on).
+                placeholder->data = cf->data;
+                placeholder->size = cf->size;
+                __atomic_store_n(&placeholder->loading, false, __ATOMIC_RELEASE);
+
+                // Free the temporary CachedFile from CacheFileUnlocked (data ownership transferred).
+                cf->data = nullptr;
+                kfree(cf);
+
+                vn->ops  = &g_cachedFileOps;
+                vn->type = VnodeType::File;
+                vn->priv = placeholder;
+                return vn;
+            }
+            if (placeholder) {
+                // Loading failed — mark placeholder as done (data=nullptr signals failure)
+                __atomic_store_n(&placeholder->loading, false, __ATOMIC_RELEASE);
+            }
+            if (cf) {
+                // No placeholder but cache succeeded — insert directly
+                KMutexLock(&g_vfsLock);
+                FileCacheInsert(cf);
+                KMutexUnlock(&g_vfsLock);
                 vn->ops  = &g_cachedFileOps;
                 vn->type = VnodeType::File;
                 vn->priv = cf;

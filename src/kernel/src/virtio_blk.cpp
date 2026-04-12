@@ -128,7 +128,9 @@ struct VirtioBlkState {
     uint8_t*      statusBuf;
     uint64_t      statusBufPhys;
 
-    // Persistent page-aligned DMA data buffer (4KB = 8 sectors)
+    // Persistent page-aligned DMA data buffer (64 KB = 128 sectors).
+    // Larger buffer means fewer SubmitRequest round-trips for big reads.
+    static constexpr uint32_t DMA_BUF_PAGES = 16;
     uint8_t*      dmaBuf;
     uint64_t      dmaBufPhys;
 };
@@ -283,14 +285,14 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
     if (len == 0) return 0;
 
     static constexpr uint32_t SECTOR_SIZE = 512;
-    static constexpr uint32_t PAGE_SIZE   = 4096;
-    static constexpr uint32_t SECTORS_PER_PAGE = PAGE_SIZE / SECTOR_SIZE; // 8
+    static constexpr uint32_t DMA_BUF_SIZE = VirtioBlkState::DMA_BUF_PAGES * 4096;
+    static constexpr uint32_t SECTORS_PER_DMA = DMA_BUF_SIZE / SECTOR_SIZE; // 128
 
     uint64_t startSector = offset / SECTOR_SIZE;
     uint64_t endSector   = (offset + len + SECTOR_SIZE - 1) / SECTOR_SIZE;
 
     // DMA buffers must be physically contiguous and page-aligned.
-    // Use the persistent page-aligned DMA buffer (8 sectors per request).
+    // Use the persistent 64 KB DMA buffer (up to 128 sectors per request).
     uint8_t* dstBytes = static_cast<uint8_t*>(buf);
     uint64_t bytesRead = 0;
 
@@ -298,7 +300,7 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
     while (sec < endSector && bytesRead < len)
     {
         uint32_t batch = static_cast<uint32_t>(endSector - sec);
-        if (batch > SECTORS_PER_PAGE) batch = SECTORS_PER_PAGE;
+        if (batch > SECTORS_PER_DMA) batch = SECTORS_PER_DMA;
         uint32_t dmaLen = batch * SECTOR_SIZE;
 
         if (!SubmitRequest(*s, VIRTIO_BLK_T_IN, sec, s->dmaBufPhys, dmaLen))
@@ -332,34 +334,43 @@ static int VirtioBlkWrite(Device* dev, uint64_t offset, const void* buf, uint64_
     if (len == 0) return 0;
 
     static constexpr uint32_t SECTOR_SIZE = 512;
+    static constexpr uint32_t DMA_BUF_SIZE = VirtioBlkState::DMA_BUF_PAGES * 4096;
+    static constexpr uint32_t SECTORS_PER_DMA = DMA_BUF_SIZE / SECTOR_SIZE;
+
     uint64_t startSector = offset / SECTOR_SIZE;
     uint64_t endSector   = (offset + len + SECTOR_SIZE - 1) / SECTOR_SIZE;
 
     const uint8_t* srcBytes = static_cast<const uint8_t*>(buf);
     uint64_t bytesWritten = 0;
+    auto* dmaBuf = s->dmaBuf;
 
-    auto* sectorBuf = s->dmaBuf;
-
-    for (uint64_t sec = startSector; sec < endSector && bytesWritten < len; ++sec)
+    uint64_t sec = startSector;
+    while (sec < endSector && bytesWritten < len)
     {
-        // Zero-fill sector buffer, then copy in the relevant bytes.
-        for (uint32_t i = 0; i < SECTOR_SIZE; ++i) sectorBuf[i] = 0;
+        uint32_t batch = static_cast<uint32_t>(endSector - sec);
+        if (batch > SECTORS_PER_DMA) batch = SECTORS_PER_DMA;
+        uint32_t dmaLen = batch * SECTOR_SIZE;
 
-        uint64_t sectorStart = sec * SECTOR_SIZE;
-        uint64_t copyStart   = (sectorStart < offset) ? (offset - sectorStart) : 0;
-        uint64_t copyEnd     = SECTOR_SIZE;
-        uint64_t remaining   = len - bytesWritten;
-        if (copyEnd - copyStart > remaining) copyEnd = copyStart + remaining;
+        // Zero-fill entire batch region, then copy in relevant bytes.
+        for (uint32_t i = 0; i < dmaLen; ++i) dmaBuf[i] = 0;
 
-        // For partial sectors at start/end, we should read-modify-write.
-        // For now, zero-fill partial sectors (writes are rare in this OS).
-        for (uint64_t i = copyStart; i < copyEnd; ++i)
-            sectorBuf[i] = srcBytes[bytesWritten++];
-
-        if (!SubmitRequest(*s, VIRTIO_BLK_T_OUT, sec, s->dmaBufPhys, SECTOR_SIZE))
+        for (uint32_t i = 0; i < batch && bytesWritten < len; ++i)
         {
-            return -1;
+            uint64_t sectorStart = (sec + i) * SECTOR_SIZE;
+            uint64_t copyStart   = (sectorStart < offset) ? (offset - sectorStart) : 0;
+            uint64_t copyEnd     = SECTOR_SIZE;
+            uint64_t remaining   = len - bytesWritten;
+            if (copyEnd - copyStart > remaining) copyEnd = copyStart + remaining;
+
+            uint8_t* dstSector = dmaBuf + (i * SECTOR_SIZE);
+            for (uint64_t j = copyStart; j < copyEnd; ++j)
+                dstSector[j] = srcBytes[bytesWritten++];
         }
+
+        if (!SubmitRequest(*s, VIRTIO_BLK_T_OUT, sec, s->dmaBufPhys, dmaLen))
+            return -1;
+
+        sec += batch;
     }
 
     return static_cast<int>(bytesWritten);
@@ -458,8 +469,8 @@ static Device* InitOnePciDevice(const PciDevice& pci, uint32_t slot)
         return nullptr;
     }
 
-    // Allocate persistent page-aligned DMA data buffer.
-    state->dmaBufPhys = PmmAllocPage(MemTag::KernelData).raw();
+    // Allocate persistent page-aligned DMA data buffer (64 KB).
+    state->dmaBufPhys = PmmAllocPages(VirtioBlkState::DMA_BUF_PAGES, MemTag::KernelData).raw();
     if (state->dmaBufPhys == 0)
     {
         SerialPuts("virtio-blk: DMA buffer allocation failed\n");
