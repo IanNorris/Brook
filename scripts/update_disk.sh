@@ -63,8 +63,8 @@ sync_dir_contents() {
 echo "Updating disk image: ${DISK_IMG}"
 
 # --- Driver modules (from most recent build) ---
-# Check debug first, then release
-for build_type in debug release; do
+# Check release first, then debug
+for build_type in release debug; do
     mod_dir="${ROOT_DIR}/build/${build_type}/kernel/drivers"
     if [ -d "$mod_dir" ] && ls "$mod_dir"/*.mod &>/dev/null; then
         echo "Drivers (from ${build_type} build):"
@@ -76,7 +76,7 @@ done
 # --- User binaries ---
 echo "User binaries:"
 # Check build/*/user/ directories
-for build_type in debug release; do
+for build_type in release debug; do
     user_dir="${ROOT_DIR}/build/${build_type}/user"
     if [ -d "$user_dir" ]; then
         mmd -D s -i "${DISK_IMG}" "::BIN" 2>/dev/null || true
