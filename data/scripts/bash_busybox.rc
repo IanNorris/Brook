@@ -1,0 +1,2 @@
+# Brook OS boot script — busybox coreutils through bash (all on one line)
+run /boot/BIN/BASH --norc --noprofile -c "echo TEST_START; busybox echo ECHO_OK; busybox pwd; busybox id; busybox uname -r; busybox cat /etc/passwd; busybox ls /boot/BIN/; busybox wc -c /etc/passwd; echo TEST_DONE; exit 0"

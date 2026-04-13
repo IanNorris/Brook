@@ -1,0 +1,1 @@
+run /boot/BIN/BASH --norc --noprofile -c "busybox echo ECHO_OK; busybox pwd; busybox uname -r; echo BB1_DONE; exit 0"

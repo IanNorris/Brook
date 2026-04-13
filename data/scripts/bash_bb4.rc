@@ -1,0 +1,1 @@
+run /boot/BIN/BASH --norc --noprofile -c "busybox cat /etc/passwd; echo CAT_DONE; busybox wc -c /etc/passwd; echo WC_DONE; exit 0"

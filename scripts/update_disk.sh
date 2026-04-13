@@ -110,7 +110,15 @@ for wad_path in "${ROOT_DIR}/doom1.wad" "/workspace/doom1.wad"; do
 done
 
 # --- Static binaries from nix (busybox etc.) ---
-# These are added manually once; this section just reports what's present.
+busybox_static="${ROOT_DIR}/busybox_static"
+if [ -f "$busybox_static" ]; then
+    echo "Busybox (static):"
+    mmd -D s -i "${DISK_IMG}" "::BIN" 2>/dev/null || true
+    # Delete any existing uppercase BUSYBOX to avoid conflicts
+    mdel -i "${DISK_IMG}" "::BIN/BUSYBOX" 2>/dev/null || true
+    mcopy -o -i "${DISK_IMG}" "$busybox_static" "::BIN/busybox"
+    echo "  synced: BIN/busybox ($(stat -c%s "$busybox_static") bytes)"
+fi
 
 # --- Dynamic libraries (/lib) ---
 dynlibs_dir="${ROOT_DIR}/dynlibs"

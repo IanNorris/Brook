@@ -1,0 +1,2 @@
+# Brook OS boot script — bash PATH test
+run /boot/BIN/BASH --norc --noprofile -c "echo PATH=$PATH; echo which_echo=$(type echo); echo which_cat=$(type cat); echo PATH_DONE; exit 0"

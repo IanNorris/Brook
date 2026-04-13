@@ -1618,50 +1618,27 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
 
     if (!found)
     {
-        // Try /boot/BIN/<UPPER>
-        char upper[64] = {};
+        // Extract basename for fallback lookups
         const char* baseName = kPath;
         for (const char* p = kPath; *p; ++p)
             if (*p == '/') baseName = p + 1;
 
-        uint32_t i = 0;
-        while (baseName[i] && i < 62)
+        // FAT is case-insensitive, so try the original name first, then uppercased
+        const char* prefixes[] = { "/boot/BIN/", "/boot/" };
+        for (int pi = 0; pi < 2 && !found; ++pi)
         {
-            char c = baseName[i];
-            if (c >= 'a' && c <= 'z') c -= 32;
-            upper[i] = c;
-            ++i;
-        }
-        upper[i] = '\0';
+            char tryPath[128];
+            uint32_t pLen = 0;
+            for (const char* s = prefixes[pi]; *s && pLen < 120; ++s)
+                tryPath[pLen++] = *s;
+            for (const char* s = baseName; *s && pLen < 126; ++s)
+                tryPath[pLen++] = *s;
+            tryPath[pLen] = '\0';
 
-        char tryPath[128] = "/boot/BIN/";
-        uint32_t pLen = 10;
-        for (uint32_t j = 0; upper[j] && pLen < 126; ++j)
-            tryPath[pLen++] = upper[j];
-        tryPath[pLen] = '\0';
-
-        VnodeStat st;
-        if (VfsStatPath(tryPath, &st) == 0 && !st.isDir)
-        {
-            lookupPath = tryPath;
-            // Copy to resolvedPath so it persists
-            for (uint32_t k = 0; k < 128; ++k) resolvedPath[k] = tryPath[k];
-            lookupPath = resolvedPath;
-            found = true;
-        }
-
-        if (!found)
-        {
-            // Try /boot/<UPPER>
-            char tryPath2[128] = "/boot/";
-            pLen = 6;
-            for (uint32_t j = 0; upper[j] && pLen < 126; ++j)
-                tryPath2[pLen++] = upper[j];
-            tryPath2[pLen] = '\0';
-
-            if (VfsStatPath(tryPath2, &st) == 0 && !st.isDir)
+            VnodeStat st;
+            if (VfsStatPath(tryPath, &st) == 0 && !st.isDir)
             {
-                for (uint32_t k = 0; k < 128; ++k) resolvedPath[k] = tryPath2[k];
+                for (uint32_t k = 0; k <= pLen; ++k) resolvedPath[k] = tryPath[k];
                 lookupPath = resolvedPath;
                 found = true;
             }
@@ -2441,6 +2418,24 @@ static int64_t sys_setuid(uint64_t, uint64_t, uint64_t,
                            uint64_t, uint64_t, uint64_t) { return 0; }
 static int64_t sys_setgid(uint64_t, uint64_t, uint64_t,
                            uint64_t, uint64_t, uint64_t) { return 0; }
+
+// getgroups(115): return supplementary group list
+static int64_t sys_getgroups(uint64_t size, uint64_t listAddr, uint64_t,
+                              uint64_t, uint64_t, uint64_t)
+{
+    // Root has one supplementary group: 0
+    if (size == 0) return 1;  // just return count
+    if (size >= 1 && listAddr)
+    {
+        auto* list = reinterpret_cast<uint32_t*>(listAddr);
+        list[0] = 0;
+    }
+    return 1;
+}
+
+// setgroups(116): stub — always succeed
+static int64_t sys_setgroups(uint64_t, uint64_t, uint64_t,
+                              uint64_t, uint64_t, uint64_t) { return 0; }
 
 // ---------------------------------------------------------------------------
 // Signal: rt_sigaction (13), rt_sigprocmask (14)
@@ -3423,6 +3418,8 @@ void SyscallTableInit()
     g_syscallTable[SYS_GETEUID]         = sys_geteuid;
     g_syscallTable[SYS_GETEGID]         = sys_getegid;
     g_syscallTable[SYS_GETPPID]         = sys_getppid;
+    g_syscallTable[SYS_GETGROUPS]       = sys_getgroups;
+    g_syscallTable[SYS_SETGROUPS]       = sys_setgroups;
     g_syscallTable[SYS_ARCH_PRCTL]      = sys_arch_prctl;
     g_syscallTable[SYS_GETDENTS64]      = sys_getdents64;
     g_syscallTable[SYS_SET_TID_ADDRESS] = sys_set_tid_address;

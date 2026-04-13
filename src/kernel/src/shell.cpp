@@ -54,7 +54,15 @@ static uint32_t g_spawnCount = 0;
 static bool g_scriptMode = false;
 
 // Default environment for spawned processes
-static const char* g_defaultEnvp[] = { "HOME=/", nullptr };
+static const char* g_defaultEnvp[] = {
+    "HOME=/",
+    "PATH=/boot/BIN:/boot/bin:/usr/bin:/bin",
+    "TERM=linux",
+    "SHELL=/boot/BIN/BASH",
+    "USER=root",
+    "LOGNAME=root",
+    nullptr
+};
 
 // ---------------------------------------------------------------------------
 // String helpers (kernel has no libc)
@@ -250,8 +258,12 @@ static Process* SpawnProcess(const char* path, int argc, const char* const* argv
     // Disable interrupts during process creation to avoid timer ISR interference
     __asm__ volatile("cli");
 
+    // Count environment entries
+    int envc = 0;
+    while (g_defaultEnvp[envc]) ++envc;
+
     Process* proc = ProcessCreate(elfBuf, elfSize, argc, argv,
-                                   1, g_defaultEnvp);
+                                   envc, g_defaultEnvp);
 
     __asm__ volatile("sti");
 

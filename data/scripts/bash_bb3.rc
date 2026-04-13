@@ -1,0 +1,1 @@
+run /boot/BIN/BASH --norc --noprofile -c "busybox ls /boot/BIN/; echo LS_DONE; exit 0"

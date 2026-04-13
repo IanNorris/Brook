@@ -1,0 +1,2 @@
+# Brook OS boot script — test PATH-based command execution
+run /boot/BIN/BASH --norc --noprofile -c "busybox echo PATH_LOOKUP_OK; busybox ls /boot/BIN/; echo PATHEXEC_DONE; exit 0"

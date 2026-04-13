@@ -1,0 +1,3 @@
+# Brook OS boot script — test coreutils via busybox
+# First copy busybox as lowercase
+run /boot/BIN/BASH --norc --noprofile -c "echo PATH=$PATH; /boot/BIN/busybox echo BUSYBOX_ECHO_OK; /boot/BIN/busybox whoami; /boot/BIN/busybox uname -a; echo ALL_TESTS_DONE; exit 0"

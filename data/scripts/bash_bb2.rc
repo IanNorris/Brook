@@ -1,0 +1,1 @@
+run /boot/BIN/BASH --norc --noprofile -c "busybox id; echo ID_DONE; exit 0"
