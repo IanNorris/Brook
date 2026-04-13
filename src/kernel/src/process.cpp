@@ -595,7 +595,12 @@ void ProcessCloseAllFds(Process* proc)
         if (fde.type == FdType::None) continue;
 
         if (fde.type == FdType::Vnode && fde.handle)
-            VfsClose(static_cast<Vnode*>(fde.handle));
+        {
+            auto* vn = static_cast<Vnode*>(fde.handle);
+            uint32_t prev = __atomic_fetch_sub(&vn->refCount, 1, __ATOMIC_ACQ_REL);
+            if (prev <= 1)
+                VfsClose(vn);
+        }
 
         // Pipe cleanup: decrement reader/writer counts and wake waiters
         if (fde.type == FdType::Pipe && fde.handle)
@@ -857,6 +862,13 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
                     __atomic_fetch_add(&pipe->writers, 1, __ATOMIC_RELEASE);
                 else
                     __atomic_fetch_add(&pipe->readers, 1, __ATOMIC_RELEASE);
+            }
+
+            // Increment Vnode refcount for the child's copy
+            if (parent->fds[i].type == FdType::Vnode && parent->fds[i].handle)
+            {
+                auto* vn = static_cast<Vnode*>(parent->fds[i].handle);
+                __atomic_fetch_add(&vn->refCount, 1, __ATOMIC_RELEASE);
             }
         }
     }

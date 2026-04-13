@@ -1,0 +1,1 @@
+run /boot/BIN/BASH --norc --noprofile -c "echo WRITING; echo test_data_123 > /test_rw.txt; busybox wc -c /test_rw.txt; busybox cat /test_rw.txt; echo WRITE2_DONE; exit 0"

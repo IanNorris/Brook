@@ -39,7 +39,8 @@ struct VnodeOps {
 struct Vnode {
     const VnodeOps* ops;
     VnodeType       type;
-    void*           priv;  // filesystem-private state (e.g. FIL* or DIR*)
+    void*           priv;     // filesystem-private state (e.g. FIL* or DIR*)
+    uint32_t        refCount; // reference count for fork/dup sharing
 };
 
 struct DirEntry {

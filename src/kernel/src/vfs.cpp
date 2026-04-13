@@ -530,9 +530,10 @@ Vnode* VfsOpen(const char* path, int flags)
                 KMutexUnlock(&g_vfsLock);
                 return nullptr;
             }
-            vn->ops  = &g_cachedFileOps;
-            vn->type = VnodeType::File;
-            vn->priv = existing;
+            vn->ops      = &g_cachedFileOps;
+            vn->type     = VnodeType::File;
+            vn->priv     = existing;
+            vn->refCount = 1;
             DbgPrintf("VFS: sharing cached '%s' (refCount=%d)\n",
                          fatPath, existing->refCount);
             return vn;
@@ -585,9 +586,10 @@ Vnode* VfsOpen(const char* path, int flags)
                 cf->data = nullptr;
                 kfree(cf);
 
-                vn->ops  = &g_cachedFileOps;
-                vn->type = VnodeType::File;
-                vn->priv = placeholder;
+                vn->ops      = &g_cachedFileOps;
+                vn->type     = VnodeType::File;
+                vn->priv     = placeholder;
+                vn->refCount = 1;
                 return vn;
             }
             if (placeholder) {
@@ -599,9 +601,10 @@ Vnode* VfsOpen(const char* path, int flags)
                 KMutexLock(&g_vfsLock);
                 FileCacheInsert(cf);
                 KMutexUnlock(&g_vfsLock);
-                vn->ops  = &g_cachedFileOps;
-                vn->type = VnodeType::File;
-                vn->priv = cf;
+                vn->ops      = &g_cachedFileOps;
+                vn->type     = VnodeType::File;
+                vn->priv     = cf;
+                vn->refCount = 1;
                 return vn;
             }
             // Cache failed — fall through to uncached path
@@ -611,9 +614,10 @@ Vnode* VfsOpen(const char* path, int flags)
             KMutexUnlock(&g_vfsLock);
         }
 
-        vn->ops  = &g_fatFileOps;
-        vn->type = VnodeType::File;
-        vn->priv = fil;
+        vn->ops      = &g_fatFileOps;
+        vn->type     = VnodeType::File;
+        vn->priv     = fil;
+        vn->refCount = 1;
 
         // Seek to end for append mode.
         if (flags & VFS_O_APPEND)
@@ -648,9 +652,10 @@ Vnode* VfsOpen(const char* path, int flags)
             kfree(dir);
             return nullptr;
         }
-        vn->ops  = &g_fatDirOps;
-        vn->type = VnodeType::Dir;
-        vn->priv = dir;
+        vn->ops      = &g_fatDirOps;
+        vn->type     = VnodeType::Dir;
+        vn->priv     = dir;
+        vn->refCount = 1;
         return vn;
     }
     kfree(dir);

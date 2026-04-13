@@ -696,7 +696,13 @@ static int64_t sys_close(uint64_t fd, uint64_t, uint64_t,
     if (!fde) return -EBADF;
 
     if (fde->type == FdType::Vnode && fde->handle)
-        VfsClose(static_cast<Vnode*>(fde->handle));
+    {
+        auto* vn = static_cast<Vnode*>(fde->handle);
+        uint32_t prev = __atomic_fetch_sub(&vn->refCount, 1, __ATOMIC_ACQ_REL);
+        if (prev <= 1)
+            VfsClose(vn);
+        // else: other processes still reference this vnode
+    }
 
     if (fde->type == FdType::Pipe && fde->handle)
     {
@@ -812,6 +818,10 @@ static int64_t sys_dup(uint64_t oldfd, uint64_t, uint64_t,
             __atomic_fetch_add(&pipe->readers, 1, __ATOMIC_RELEASE);
     }
 
+    // Bump vnode refcount
+    if (old->type == FdType::Vnode && old->handle)
+        __atomic_fetch_add(&static_cast<Vnode*>(old->handle)->refCount, 1, __ATOMIC_RELEASE);
+
     return newfd;
 }
 
@@ -848,6 +858,10 @@ static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd, uint64_t,
         else
             __atomic_fetch_add(&pipe->readers, 1, __ATOMIC_RELEASE);
     }
+
+    // Bump vnode refcount
+    if (old->type == FdType::Vnode && old->handle)
+        __atomic_fetch_add(&static_cast<Vnode*>(old->handle)->refCount, 1, __ATOMIC_RELEASE);
 
     return static_cast<int64_t>(newfd);
 }
@@ -2629,6 +2643,11 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
             else
                 __atomic_fetch_add(&pipe->readers, 1, __ATOMIC_RELEASE);
         }
+
+        // Bump vnode refcount
+        if (fde->type == FdType::Vnode && fde->handle)
+            __atomic_fetch_add(&static_cast<Vnode*>(fde->handle)->refCount, 1, __ATOMIC_RELEASE);
+
         return newfd;
     }
     case F_GETFD:
