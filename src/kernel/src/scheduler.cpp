@@ -456,14 +456,24 @@ void SchedulerUnblock(Process* proc)
     // on any CPU). Between SchedulerBlock setting state=Blocked and DoSwitch
     // clearing runningOnCpu, the process is in a transient state visible to
     // other CPUs — we must not unblock it until the context switch completes.
-    if (proc->state != ProcessState::Blocked ||
-        __atomic_load_n(&proc->runningOnCpu, __ATOMIC_ACQUIRE) != -1)
+    if (proc->state != ProcessState::Blocked)
     {
+        SchedLockRelease(g_readyLock, rlf4);
+        return;
+    }
+    if (__atomic_load_n(&proc->runningOnCpu, __ATOMIC_ACQUIRE) != -1)
+    {
+        // Process is Blocked but still mid-context-switch on another CPU.
+        // We can't insert it into the ready queue yet.  Set pendingWakeup
+        // so CheckBlockedWakeups (timer tick) will retry the unblock once
+        // the context switch completes and runningOnCpu is cleared.
+        __atomic_store_n(&proc->pendingWakeup, 1, __ATOMIC_RELEASE);
         SchedLockRelease(g_readyLock, rlf4);
         return;
     }
     proc->state = ProcessState::Ready;
     proc->wakeupTick = 0;
+    __atomic_store_n(&proc->pendingWakeup, 0, __ATOMIC_RELEASE);
     ReadyQueueInsertLocked(proc);
     SchedLockRelease(g_readyLock, rlf4);
 }
@@ -497,9 +507,14 @@ static void CheckBlockedWakeups()
     for (uint32_t i = 0; i < g_processCount; ++i)
     {
         Process* p = g_allProcesses[i];
-        if (p->state == ProcessState::Blocked && p->wakeupTick != 0
-            && now >= p->wakeupTick
-            && __atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) == -1)
+        if (p->state != ProcessState::Blocked) continue;
+        if (__atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) != -1) continue;
+
+        // Timed wakeup OR deferred wakeup from SchedulerUnblock race
+        bool timedWake = (p->wakeupTick != 0 && now >= p->wakeupTick);
+        bool pendingWake = __atomic_load_n(&p->pendingWakeup, __ATOMIC_ACQUIRE) != 0;
+
+        if (timedWake || pendingWake)
         {
             if (unblockCount < MAX_PROCESSES)
                 toUnblock[unblockCount++] = p;
