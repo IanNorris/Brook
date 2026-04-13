@@ -103,6 +103,7 @@ struct FdEntry
     uint8_t  fdFlags;      // FD-level flags: FD_CLOEXEC (bit 0)
     uint8_t  _pad;
     uint32_t refCount;
+    uint32_t statusFlags;  // Linux O_* flags from open (for F_GETFL/F_SETFL)
     void*    handle;       // VFS Vnode* or device-specific state
     uint64_t seekPos;      // Current file offset (for lseek)
 };
@@ -221,6 +222,7 @@ struct Process
     // TTY mode: true = canonical (line buffered), false = raw (char at a time)
     bool ttyCanonical;
     bool ttyEcho;
+    bool straceEnabled;  // Per-process syscall tracing
 
     // Fork child state: when true, the trampoline enters user mode at
     // forkReturnRip with RAX=0 (child's fork() return value).

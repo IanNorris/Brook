@@ -141,6 +141,66 @@ if [ -f "$bash_dyn" ]; then
     sync_file "$bash_dyn" "BIN/BASH"
 fi
 
+# --- TCC compiler and sysroot ---
+tcc_sysroot="${ROOT_DIR}/tcc_sysroot"
+if [ -d "$tcc_sysroot" ] && [ -f "$tcc_sysroot/tcc" ]; then
+    echo "TCC compiler:"
+    mmd -D s -i "${DISK_IMG}" "::BIN" 2>/dev/null || true
+    mcopy -o -i "${DISK_IMG}" "$tcc_sysroot/tcc" "::BIN/tcc"
+    echo "  synced: BIN/tcc ($(stat -c%s "$tcc_sysroot/tcc") bytes)"
+
+    # TCC library dir (libtcc1.a + tcc includes)
+    mmd -D s -i "${DISK_IMG}" "::TCC" 2>/dev/null || true
+    mmd -D s -i "${DISK_IMG}" "::TCC/lib" 2>/dev/null || true
+    mmd -D s -i "${DISK_IMG}" "::TCC/lib/tcc" 2>/dev/null || true
+    mmd -D s -i "${DISK_IMG}" "::TCC/lib/tcc/include" 2>/dev/null || true
+    mcopy -o -i "${DISK_IMG}" "$tcc_sysroot/lib/tcc/libtcc1.a" "::TCC/lib/tcc/libtcc1.a"
+    echo "  synced: TCC/lib/tcc/libtcc1.a"
+    for f in "$tcc_sysroot"/lib/tcc/include/*.h; do
+        [ -f "$f" ] || continue
+        mcopy -o -i "${DISK_IMG}" "$f" "::TCC/lib/tcc/include/$(basename "$f")"
+    done
+    echo "  synced: TCC/lib/tcc/include/*.h"
+
+    # Musl include tree
+    mmd -D s -i "${DISK_IMG}" "::TCC/include" 2>/dev/null || true
+    # Top-level headers
+    for f in "$tcc_sysroot"/include/*.h; do
+        [ -f "$f" ] || continue
+        mcopy -o -i "${DISK_IMG}" "$f" "::TCC/include/$(basename "$f")"
+    done
+    # Subdirectories (sys/, bits/, arpa/, net/, netinet/, etc.)
+    for subdir in "$tcc_sysroot"/include/*/; do
+        [ -d "$subdir" ] || continue
+        dname="$(basename "$subdir")"
+        mmd -D s -i "${DISK_IMG}" "::TCC/include/${dname}" 2>/dev/null || true
+        for f in "$subdir"*; do
+            [ -f "$f" ] || continue
+            mcopy -o -i "${DISK_IMG}" "$f" "::TCC/include/${dname}/$(basename "$f")"
+        done
+    done
+    echo "  synced: TCC/include/ (musl headers)"
+
+    # Musl CRT and libc.a
+    for f in crt1.o crti.o crtn.o libc.a; do
+        if [ -f "$tcc_sysroot/lib/$f" ]; then
+            mcopy -o -i "${DISK_IMG}" "$tcc_sysroot/lib/$f" "::TCC/lib/$f"
+            echo "  synced: TCC/lib/$f"
+        fi
+    done
+fi
+
+# --- TCC test source files ---
+tcc_test_dir="${ROOT_DIR}/data/tcc_test"
+if [ -d "$tcc_test_dir" ]; then
+    mmd -D s -i "${DISK_IMG}" "::SRC" 2>/dev/null || true
+    for f in "$tcc_test_dir"/*.c "$tcc_test_dir"/*.sh; do
+        [ -f "$f" ] || continue
+        mcopy -o -i "${DISK_IMG}" "$f" "::SRC/$(basename "$f")"
+        echo "  synced: SRC/$(basename "$f")"
+    done
+fi
+
 # --- Boot script (INIT.RC) ---
 init_rc="${ROOT_DIR}/data/INIT.RC"
 if [ -f "$init_rc" ]; then

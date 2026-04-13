@@ -731,6 +731,57 @@ int VfsSync(Vnode* vn)
     return (res == FR_OK) ? 0 : -1;
 }
 
+int VfsUnlink(const char* path)
+{
+    if (!path || !path[0]) return -1;
+    const char* relPath = nullptr;
+    MountEntry* mount = FindMount(path, &relPath);
+    if (!mount) return -1;
+
+    char fatPath[256];
+    BuildFatPath(fatPath, sizeof(fatPath), mount->pdrv, relPath);
+
+    KMutexLock(&g_vfsLock);
+    FRESULT res = f_unlink(fatPath);
+    KMutexUnlock(&g_vfsLock);
+    return (res == FR_OK) ? 0 : -1;
+}
+
+int VfsMkdir(const char* path)
+{
+    if (!path || !path[0]) return -1;
+    const char* relPath = nullptr;
+    MountEntry* mount = FindMount(path, &relPath);
+    if (!mount) return -1;
+
+    char fatPath[256];
+    BuildFatPath(fatPath, sizeof(fatPath), mount->pdrv, relPath);
+
+    KMutexLock(&g_vfsLock);
+    FRESULT res = f_mkdir(fatPath);
+    KMutexUnlock(&g_vfsLock);
+    return (res == FR_OK || res == FR_EXIST) ? 0 : -1;
+}
+
+int VfsRename(const char* oldPath, const char* newPath)
+{
+    if (!oldPath || !newPath || !oldPath[0] || !newPath[0]) return -1;
+    const char* relOld = nullptr;
+    const char* relNew = nullptr;
+    MountEntry* mountOld = FindMount(oldPath, &relOld);
+    MountEntry* mountNew = FindMount(newPath, &relNew);
+    if (!mountOld || !mountNew || mountOld != mountNew) return -1;
+
+    char fatOld[256], fatNew[256];
+    BuildFatPath(fatOld, sizeof(fatOld), mountOld->pdrv, relOld);
+    BuildFatPath(fatNew, sizeof(fatNew), mountNew->pdrv, relNew);
+
+    KMutexLock(&g_vfsLock);
+    FRESULT res = f_rename(fatOld, fatNew);
+    KMutexUnlock(&g_vfsLock);
+    return (res == FR_OK) ? 0 : -1;
+}
+
 void VfsClose(Vnode* vn)
 {
     if (!vn) return;

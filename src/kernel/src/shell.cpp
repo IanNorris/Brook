@@ -29,6 +29,11 @@
 #include "profiler.h"
 #include "module.h"
 
+// Strace control (defined in syscall.cpp)
+bool StraceEnablePid(uint32_t pid, bool enable);
+int  StraceEnableName(const char* name, bool enable);
+void StraceEnableAll(bool enable);
+
 namespace brook {
 
 // ---------------------------------------------------------------------------
@@ -476,16 +481,24 @@ static int ExecCommand(int argc, const char* const* argv)
     {
         int pathIdx = 1;
         const char* argv0Override = nullptr;
+        bool strace = false;
 
-        if (argc >= 4 && StrEq(argv[1], "--as"))
-        {
-            argv0Override = argv[2];
-            pathIdx = 3;
+        // Parse flags before the path
+        while (pathIdx < argc) {
+            if (StrEq(argv[pathIdx], "--as") && pathIdx + 1 < argc) {
+                argv0Override = argv[pathIdx + 1];
+                pathIdx += 2;
+            } else if (StrEq(argv[pathIdx], "--strace")) {
+                strace = true;
+                pathIdx++;
+            } else {
+                break;
+            }
         }
 
         if (pathIdx >= argc)
         {
-            KPrintf("usage: run [--as <name>] <path> [args...]\n");
+            KPrintf("usage: run [--as <name>] [--strace] <path> [args...]\n");
             return -1;
         }
 
@@ -496,19 +509,24 @@ static int ExecCommand(int argc, const char* const* argv)
             return -1;
         }
 
+        Process* proc = nullptr;
         if (argv0Override)
         {
-            // Build a new argv with the override as argv[0]
             const int newArgc = argc - pathIdx;
             const char* newArgv[32];
             newArgv[0] = argv0Override;
             for (int i = 1; i < newArgc && i < 31; ++i)
                 newArgv[i] = argv[pathIdx + i];
-            SpawnProcess(resolved, newArgc, newArgv);
+            proc = SpawnProcess(resolved, newArgc, newArgv);
         }
         else
         {
-            SpawnProcess(resolved, argc - pathIdx, argv + pathIdx);
+            proc = SpawnProcess(resolved, argc - pathIdx, argv + pathIdx);
+        }
+
+        if (proc && strace) {
+            proc->straceEnabled = true;
+            KPrintf("[strace enabled for pid %u]\n", proc->pid);
         }
         return 0;
     }
@@ -681,6 +699,38 @@ static int ExecCommand(int argc, const char* const* argv)
         return 0;
     }
 
+    // Built-in: strace <pid|name|all> [off] — enable/disable syscall tracing
+    if (StrEq(cmd, "strace"))
+    {
+        if (argc < 2) {
+            KPrintf("Usage: strace <pid|name|all> [off]\n");
+            return 0;
+        }
+        bool enable = !(argc >= 3 && StrEq(argv[2], "off"));
+
+        if (StrEq(argv[1], "all")) {
+            StraceEnableAll(enable);
+            KPrintf("strace %s for all processes\n", enable ? "ON" : "OFF");
+        } else {
+            // Try as pid first
+            uint32_t pid = 0;
+            const char* s = argv[1];
+            while (*s >= '0' && *s <= '9')
+                pid = pid * 10 + (*s++ - '0');
+            if (*s == '\0' && pid > 0) {
+                if (StraceEnablePid(pid, enable))
+                    KPrintf("strace %s for pid %u\n", enable ? "ON" : "OFF", pid);
+                else
+                    KPrintf("pid %u not found\n", pid);
+            } else {
+                int count = StraceEnableName(argv[1], enable);
+                KPrintf("strace %s for %d process(es) matching '%s'\n",
+                        enable ? "ON" : "OFF", count, argv[1]);
+            }
+        }
+        return 0;
+    }
+
     // Try as a program name (implicit run)
     char resolved[128];
     if (ResolveBinaryPath(cmd, resolved, sizeof(resolved)))
@@ -719,6 +769,7 @@ static void CmdHelp()
     KPrintf("  modlist            List loaded modules\n");
     KPrintf("  sched [policy]     Show/switch scheduler policy\n");
     KPrintf("  display [WxH]      Show/change display mode\n");
+    KPrintf("  strace <pid|name|all> [off]  Syscall tracing\n");
     KPrintf("  help               Show this help\n");
 }
 

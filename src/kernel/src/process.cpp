@@ -441,12 +441,19 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     proc->fds[0].refCount = 1;
     proc->fds[1].type = FdType::Vnode; // treated as serial stdout in syscall
     proc->fds[1].refCount = 1;
+    proc->fds[1].statusFlags = 1; // O_WRONLY
     proc->fds[2].type = FdType::Vnode; // treated as serial stderr in syscall
     proc->fds[2].refCount = 1;
+    proc->fds[2].statusFlags = 2; // O_RDWR
+    // fd 3 = debug serial (hardcoded in sys_write); reserve it
+    proc->fds[3].type = FdType::DevNull;
+    proc->fds[3].refCount = 1;
+    proc->fds[3].statusFlags = 1; // O_WRONLY
 
     // Default TTY mode: canonical with echo
     proc->ttyCanonical = true;
     proc->ttyEcho = true;
+    proc->straceEnabled = false;
 
     // Build user stack with argc/argv/envp/auxv
     uint64_t userSP = SetupUserStack(proc, argc, argv, envc, envp, interpBase);
@@ -881,6 +888,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     // Inherit terminal mode from parent
     child->ttyCanonical = parent->ttyCanonical;
     child->ttyEcho = parent->ttyEcho;
+    child->straceEnabled = parent->straceEnabled;
 
     // Set child's name
     {

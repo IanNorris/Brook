@@ -96,6 +96,15 @@ int VfsStat(Vnode* vn, VnodeStat* st);
 // Stat by path — uses directory metadata only, does NOT open the file.
 extern "C" int VfsStatPath(const char* path, VnodeStat* st);
 
+// Delete a file by path.
+int VfsUnlink(const char* path);
+
+// Create a directory.
+int VfsMkdir(const char* path);
+
+// Rename a file or directory.
+int VfsRename(const char* oldPath, const char* newPath);
+
 // Close and free a vnode.
 extern "C" void VfsClose(Vnode* vn);
 

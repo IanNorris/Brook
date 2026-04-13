@@ -23,6 +23,22 @@
 extern "C" __attribute__((naked)) void ReturnToKernel();
 
 // ---------------------------------------------------------------------------
+// C dispatch wrapper — reads syscall number from GS:120, applies strace.
+// Must be extern "C" for the assembly call instruction.
+// ---------------------------------------------------------------------------
+
+namespace brook { int64_t SyscallDispatchInternal(uint64_t num, uint64_t a0, uint64_t a1,
+                                                   uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5); }
+
+extern "C" int64_t SyscallDispatchC(uint64_t a0, uint64_t a1, uint64_t a2,
+                                     uint64_t a3, uint64_t a4, uint64_t a5)
+{
+    uint64_t num;
+    asm volatile("movq %%gs:120, %0" : "=r"(num));
+    return brook::SyscallDispatchInternal(num, a0, a1, a2, a3, a4, a5);
+}
+
+// ---------------------------------------------------------------------------
 // SYSCALL dispatcher -- naked assembly, pointed to by LSTAR MSR.
 // ---------------------------------------------------------------------------
 
@@ -93,7 +109,7 @@ extern "C" __attribute__((naked, used)) void BrookSyscallDispatcher()
         "movq %%r15, %%gs:168\n\t"       // -> syscallUserR10
         "mov -88(%%rbp), %%r15\n\t"      // restore R15 from saved slot
         "sti\n\t"
-        "call *(%%r12, %%rax, 8)\n\t"
+        "call SyscallDispatchC\n\t"
         "cli\n\t"
         "jmp .Lsyscall_return\n\t"
         ".Lsyscall_invalid:\n\t"
@@ -208,7 +224,7 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
         auto* vn = static_cast<Vnode*>(fde->handle);
         int64_t ret = VfsWrite(vn, reinterpret_cast<const void*>(bufAddr),
                                static_cast<uint32_t>(count), &fde->seekPos);
-        if (ret > 0) fde->seekPos += static_cast<uint64_t>(ret);
+        // Note: VfsWrite already updates *offset (fde->seekPos), don't double-update
         return ret;
     }
 
@@ -679,6 +695,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         VfsClose(vn);
         return -EMFILE;
     }
+    proc->fds[fd].statusFlags = static_cast<uint32_t>(flags);
 
     return fd;
 }
@@ -772,6 +789,7 @@ static int64_t sys_pipe(uint64_t pipefdAddr, uint64_t, uint64_t,
     int readFd = FdAlloc(proc, FdType::Pipe, pipe);
     if (readFd < 0) { kfree(pipe); return -EMFILE; }
     proc->fds[readFd].flags = 0;  // read end
+    proc->fds[readFd].statusFlags = 0;  // O_RDONLY
 
     int writeFd = FdAlloc(proc, FdType::Pipe, pipe);
     if (writeFd < 0)
@@ -781,6 +799,7 @@ static int64_t sys_pipe(uint64_t pipefdAddr, uint64_t, uint64_t,
         return -EMFILE;
     }
     proc->fds[writeFd].flags = 1;  // write end
+    proc->fds[writeFd].statusFlags = 1;  // O_WRONLY
 
     pipefd[0] = readFd;
     pipefd[1] = writeFd;
@@ -807,6 +826,7 @@ static int64_t sys_dup(uint64_t oldfd, uint64_t, uint64_t,
 
     proc->fds[newfd].flags = old->flags;
     proc->fds[newfd].seekPos = old->seekPos;
+    proc->fds[newfd].statusFlags = old->statusFlags;
 
     // Bump pipe refcount
     if (old->type == FdType::Pipe && old->handle)
@@ -847,6 +867,7 @@ static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd, uint64_t,
     proc->fds[newfd].flags = old->flags;
     proc->fds[newfd].handle = old->handle;
     proc->fds[newfd].seekPos = old->seekPos;
+    proc->fds[newfd].statusFlags = old->statusFlags;
     proc->fds[newfd].refCount = 1;
 
     // Bump pipe refcount
@@ -2632,6 +2653,7 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
         proc->fds[newfd].fdFlags = (cmd == F_DUPFD_CLOEXEC) ? FD_CLOEXEC : 0;
         proc->fds[newfd].handle = fde->handle;
         proc->fds[newfd].seekPos = fde->seekPos;
+        proc->fds[newfd].statusFlags = fde->statusFlags;
         proc->fds[newfd].refCount = 1;
 
         // Bump pipe refcount
@@ -2656,12 +2678,7 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
         fde->fdFlags = static_cast<uint8_t>(arg & FD_CLOEXEC);
         return 0;
     case F_GETFL:
-    {
-        int fl = 0;
-        if (fde->flags & 1) fl |= 1; // O_WRONLY for pipe write end
-        // O_NONBLOCK
-        return fl;
-    }
+        return fde->statusFlags;
     case F_SETFL:
         // We don't really support changing flags yet, but return success
         return 0;
@@ -3023,6 +3040,78 @@ static int64_t sys_fchdir(uint64_t, uint64_t, uint64_t,
                            uint64_t, uint64_t, uint64_t)
 {
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// sys_unlink (87) — delete a file
+// ---------------------------------------------------------------------------
+
+static int64_t sys_unlink(uint64_t pathAddr, uint64_t, uint64_t,
+                           uint64_t, uint64_t, uint64_t)
+{
+    const char* path = reinterpret_cast<const char*>(pathAddr);
+    if (!path) return -EFAULT;
+
+    // Try as-is first, then with /boot prefix
+    if (VfsUnlink(path) == 0) return 0;
+
+    char bootPath[256] = "/boot";
+    uint32_t bi = 5;
+    for (const char* p = path; *p && bi + 1 < sizeof(bootPath); ++p)
+        bootPath[bi++] = *p;
+    bootPath[bi] = '\0';
+    if (VfsUnlink(bootPath) == 0) return 0;
+
+    return -ENOENT;
+}
+
+// ---------------------------------------------------------------------------
+// sys_rename (82) — rename a file or directory
+// ---------------------------------------------------------------------------
+
+static int64_t sys_rename(uint64_t oldAddr, uint64_t newAddr, uint64_t,
+                           uint64_t, uint64_t, uint64_t)
+{
+    const char* oldPath = reinterpret_cast<const char*>(oldAddr);
+    const char* newPath = reinterpret_cast<const char*>(newAddr);
+    if (!oldPath || !newPath) return -EFAULT;
+
+    if (VfsRename(oldPath, newPath) == 0) return 0;
+
+    // Try with /boot prefix on both
+    char bootOld[256] = "/boot", bootNew[256] = "/boot";
+    uint32_t oi = 5, ni = 5;
+    for (const char* p = oldPath; *p && oi + 1 < sizeof(bootOld); ++p)
+        bootOld[oi++] = *p;
+    bootOld[oi] = '\0';
+    for (const char* p = newPath; *p && ni + 1 < sizeof(bootNew); ++p)
+        bootNew[ni++] = *p;
+    bootNew[ni] = '\0';
+    if (VfsRename(bootOld, bootNew) == 0) return 0;
+
+    return -ENOENT;
+}
+
+// ---------------------------------------------------------------------------
+// sys_mkdir (83) — create a directory
+// ---------------------------------------------------------------------------
+
+static int64_t sys_mkdir(uint64_t pathAddr, uint64_t, uint64_t,
+                          uint64_t, uint64_t, uint64_t)
+{
+    const char* path = reinterpret_cast<const char*>(pathAddr);
+    if (!path) return -EFAULT;
+
+    if (VfsMkdir(path) == 0) return 0;
+
+    char bootPath[256] = "/boot";
+    uint32_t bi = 5;
+    for (const char* p = path; *p && bi + 1 < sizeof(bootPath); ++p)
+        bootPath[bi++] = *p;
+    bootPath[bi] = '\0';
+    if (VfsMkdir(bootPath) == 0) return 0;
+
+    return -ENOENT;
 }
 
 // ---------------------------------------------------------------------------
@@ -3458,6 +3547,9 @@ void SyscallTableInit()
     g_syscallTable[SYS_KILL]            = sys_kill;
     g_syscallTable[SYS_CHDIR]           = sys_chdir;
     g_syscallTable[SYS_FCHDIR]          = sys_fchdir;
+    g_syscallTable[SYS_RENAME]          = sys_rename;
+    g_syscallTable[SYS_MKDIR]           = sys_mkdir;
+    g_syscallTable[SYS_UNLINK]          = sys_unlink;
     g_syscallTable[SYS_READLINK]        = sys_readlink;
     g_syscallTable[SYS_UMASK]           = sys_umask;
     g_syscallTable[SYS_GETRLIMIT]       = sys_getrlimit;
@@ -3518,6 +3610,128 @@ uint64_t SyscallGetEntryPoint()
 }
 
 // ---------------------------------------------------------------------------
+// Strace — syscall tracing facility
+// ---------------------------------------------------------------------------
+
+static const char* SyscallName(uint64_t num)
+{
+    switch (num) {
+    case 0: return "read";        case 1: return "write";
+    case 2: return "open";        case 3: return "close";
+    case 4: return "stat";        case 5: return "fstat";
+    case 6: return "lstat";       case 7: return "poll";
+    case 8: return "lseek";       case 9: return "mmap";
+    case 10: return "mprotect";   case 11: return "munmap";
+    case 12: return "brk";        case 13: return "rt_sigaction";
+    case 14: return "rt_sigprocmask"; case 15: return "rt_sigreturn";
+    case 16: return "ioctl";      case 17: return "pread64";
+    case 19: return "readv";      case 20: return "writev";
+    case 21: return "access";     case 22: return "pipe";
+    case 23: return "select";     case 24: return "sched_yield";
+    case 32: return "dup";        case 33: return "dup2";
+    case 35: return "nanosleep";  case 39: return "getpid";
+    case 40: return "sendfile";   case 56: return "clone";
+    case 57: return "fork";       case 58: return "vfork";
+    case 59: return "execve";     case 60: return "exit";
+    case 61: return "wait4";      case 62: return "kill";
+    case 63: return "uname";      case 72: return "fcntl";
+    case 79: return "getcwd";     case 80: return "chdir";
+    case 81: return "fchdir";     case 82: return "rename";
+    case 83: return "mkdir";      case 87: return "unlink";
+    case 89: return "readlink";   case 95: return "umask";
+    case 96: return "gettimeofday"; case 97: return "getrlimit";
+    case 98: return "getrusage";  case 99: return "sysinfo";
+    case 102: return "getuid";    case 104: return "getgid";
+    case 105: return "setuid";    case 106: return "setgid";
+    case 107: return "geteuid";   case 108: return "getegid";
+    case 109: return "setpgid";   case 110: return "getppid";
+    case 111: return "getpgrp";   case 112: return "setsid";
+    case 115: return "getgroups"; case 116: return "setgroups";
+    case 117: return "getresuid"; case 120: return "getresgid";
+    case 121: return "getpgid";   case 124: return "getsid";
+    case 131: return "sigaltstack"; case 134: return "statfs";
+    case 135: return "fstatfs";   case 157: return "prctl";
+    case 158: return "arch_prctl"; case 186: return "gettid";
+    case 200: return "tkill";     case 217: return "getdents64";
+    case 218: return "set_tid_address"; case 228: return "clock_gettime";
+    case 230: return "clock_nanosleep"; case 231: return "exit_group";
+    case 234: return "tgkill";    case 257: return "openat";
+    case 262: return "newfstatat"; case 267: return "readlinkat";
+    case 271: return "ppoll";     case 273: return "set_robust_list";
+    case 289: return "prlimit64"; case 292: return "dup3";
+    case 293: return "pipe2";     case 302: return "rseq";
+    case 318: return "getrandom"; case 334: return "faccessat";
+    case 439: return "faccessat2";
+    default: return nullptr;
+    }
+}
+
+static int64_t SyscallDispatchTraced(uint64_t num, uint64_t a0, uint64_t a1,
+                                      uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+{
+    Process* proc = ProcessCurrent();
+    const char* name = SyscallName(num);
+
+    // Log entry — format depends on syscall type for readability
+    if (num == SYS_OPEN || num == SYS_OPENAT) {
+        const char* path = (num == SYS_OPENAT)
+            ? reinterpret_cast<const char*>(a1)
+            : reinterpret_cast<const char*>(a0);
+        uint64_t flags = (num == SYS_OPENAT) ? a2 : a1;
+        SerialPrintf("[strace:%u] %s(\"%s\", 0x%lx)",
+                     proc->pid, name ? name : "?", path ? path : "(null)", flags);
+    } else if (num == SYS_EXECVE) {
+        const char* path = reinterpret_cast<const char*>(a0);
+        SerialPrintf("[strace:%u] execve(\"%s\")", proc->pid, path ? path : "(null)");
+    } else if (num == SYS_READ || num == SYS_WRITE) {
+        SerialPrintf("[strace:%u] %s(%lu, ..., %lu)",
+                     proc->pid, name ? name : "?", a0, a2);
+    } else if (num == SYS_CLOSE || num == SYS_DUP || num == SYS_FSTAT) {
+        SerialPrintf("[strace:%u] %s(%lu)",
+                     proc->pid, name ? name : "?", a0);
+    } else if (num == SYS_DUP2 || num == SYS_DUP3) {
+        SerialPrintf("[strace:%u] %s(%lu, %lu)",
+                     proc->pid, name ? name : "?", a0, a1);
+    } else if (num == SYS_MMAP) {
+        SerialPrintf("[strace:%u] mmap(0x%lx, %lu, 0x%lx, 0x%lx, %ld, 0x%lx)",
+                     proc->pid, a0, a1, a2, a3, (int64_t)a4, a5);
+    } else if (num == SYS_LSEEK) {
+        SerialPrintf("[strace:%u] lseek(%lu, %ld, %lu)",
+                     proc->pid, a0, (int64_t)a1, a2);
+    } else if (num == SYS_FCNTL) {
+        SerialPrintf("[strace:%u] fcntl(%lu, %lu, 0x%lx)",
+                     proc->pid, a0, a1, a2);
+    } else if (name) {
+        SerialPrintf("[strace:%u] %s(0x%lx, 0x%lx, 0x%lx)",
+                     proc->pid, name, a0, a1, a2);
+    } else {
+        SerialPrintf("[strace:%u] syscall_%lu(0x%lx, 0x%lx, 0x%lx)",
+                     proc->pid, num, a0, a1, a2);
+    }
+
+    int64_t ret = g_syscallTable[num](a0, a1, a2, a3, a4, a5);
+
+    // Log return value
+    if (ret < 0 && ret > -4096)
+        SerialPrintf(" = -%lu (err)\n", -ret);
+    else if (num == SYS_MMAP || num == SYS_BRK)
+        SerialPrintf(" = 0x%lx\n", static_cast<uint64_t>(ret));
+    else
+        SerialPrintf(" = %ld\n", ret);
+
+    return ret;
+}
+
+int64_t SyscallDispatchInternal(uint64_t num, uint64_t a0, uint64_t a1,
+                                 uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+{
+    Process* proc = ProcessCurrent();
+    if (proc && proc->straceEnabled)
+        return SyscallDispatchTraced(num, a0, a1, a2, a3, a4, a5);
+    return g_syscallTable[num](a0, a1, a2, a3, a4, a5);
+}
+
+// ---------------------------------------------------------------------------
 // SwitchToUserMode -- enter ring 3 via IRETQ (naked)
 // ---------------------------------------------------------------------------
 
@@ -3569,6 +3783,51 @@ __attribute__((naked)) void SwitchToUserMode(uint64_t, uint64_t)
 }
 
 } // namespace brook
+
+// ---------------------------------------------------------------------------
+// Strace control functions
+// ---------------------------------------------------------------------------
+
+bool StraceEnablePid(uint32_t pid, bool enable)
+{
+    using namespace brook;
+    Process* p = ProcessFindByPid(static_cast<uint16_t>(pid));
+    if (!p) return false;
+    p->straceEnabled = enable;
+    return true;
+}
+
+int StraceEnableName(const char* name, bool enable)
+{
+    using namespace brook;
+    int count = 0;
+    for (uint16_t pid = 1; pid < 256; pid++) {
+        Process* p = ProcessFindByPid(pid);
+        if (p && p->name[0]) {
+            bool match = false;
+            for (const char* s = p->name; *s; s++) {
+                const char* a = s;
+                const char* b = name;
+                while (*a && *b && *a == *b) { a++; b++; }
+                if (!*b) { match = true; break; }
+            }
+            if (match) {
+                p->straceEnabled = enable;
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
+void StraceEnableAll(bool enable)
+{
+    using namespace brook;
+    for (uint16_t pid = 1; pid < 256; pid++) {
+        Process* p = ProcessFindByPid(pid);
+        if (p) p->straceEnabled = enable;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ReturnToKernel
