@@ -585,6 +585,34 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     if (flags & LINUX_O_APPEND) vfsFlags |= VFS_O_APPEND;
 
     Vnode* vn = VfsOpen(lookupPath, vfsFlags);
+
+    // Fallback: if path starts with /lib/ or /nix/, try /boot/lib/<filename>.
+    // Our boot disk is mounted at /boot, but dynamic linkers expect /lib/.
+    if (!vn && lookupPath[0] == '/')
+    {
+        // Try /boot prefix first
+        char bootPath[256] = "/boot";
+        uint32_t bi = 5;
+        const char* p = lookupPath;
+        while (*p && bi + 1 < sizeof(bootPath)) bootPath[bi++] = *p++;
+        bootPath[bi] = '\0';
+        vn = VfsOpen(bootPath, vfsFlags);
+
+        // If that fails, try /boot/lib/<basename> for .so files
+        if (!vn)
+        {
+            const char* fname = lookupPath;
+            for (p = lookupPath; *p; ++p)
+                if (*p == '/') fname = p + 1;
+
+            char libPath[256] = "/boot/lib/";
+            uint32_t li = 10;
+            while (*fname && li + 1 < sizeof(libPath)) libPath[li++] = *fname++;
+            libPath[li] = '\0';
+            vn = VfsOpen(libPath, vfsFlags);
+        }
+    }
+
     if (!vn)
     {
         DbgPrintf("sys_open: not found: '%s' (flags=0x%x)\n", lookupPath, vfsFlags);
@@ -854,9 +882,9 @@ static int64_t sys_brk(uint64_t newBreak, uint64_t, uint64_t,
                         VMM_WRITABLE | VMM_USER, MemTag::User, proc->pid))
             return static_cast<int64_t>(proc->programBreak);
 
-        // Zero via user address (process CR3 is active during syscall)
-        auto* p = reinterpret_cast<uint8_t*>(addr);
-        for (uint64_t b = 0; b < 4096; ++b) p[b] = 0;
+        // Zero via kernel direct map (safe regardless of page permissions)
+        auto* kp = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
+        for (uint64_t b = 0; b < 4096; ++b) kp[b] = 0;
     }
 
     DbgPrintf("sys_brk: 0x%lx → 0x%lx\n", proc->programBreak, newBreak);
@@ -947,17 +975,28 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         return true;
     };
 
+    // Helper: zero a user page via the kernel direct physical map (works
+    // regardless of user-space page permissions).
+    auto zeroUserPage = [&](uint64_t userVA) {
+        PhysicalAddress phys = VmmVirtToPhys(proc->pageTable,
+                                             VirtualAddress(userVA));
+        if (!phys) return;
+        auto* kp = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
+        // PhysToVirt includes page offset; align to page start
+        kp = reinterpret_cast<uint8_t*>(
+            reinterpret_cast<uint64_t>(kp) & ~0xFFFULL);
+        for (uint64_t b = 0; b < 4096; ++b) kp[b] = 0;
+    };
+
     if (flags & MAP_ANONYMOUS)
     {
         uint64_t vaddr = pickAddr();
         if (!vaddr) return -ENOMEM;
         if (!allocAt(vaddr, MemTag::User)) return -ENOMEM;
 
-        // Zero the pages (only if writable).
-        if (prot & PROT_WRITE) {
-            auto* p = reinterpret_cast<uint8_t*>(vaddr);
-            for (uint64_t b = 0; b < pages * 4096; ++b) p[b] = 0;
-        }
+        // Zero via direct map (safe even for PROT_NONE / read-only pages).
+        for (uint64_t p = 0; p < pages; ++p)
+            zeroUserPage(vaddr + p * 4096);
 
         return static_cast<int64_t>(vaddr);
     }
@@ -1024,13 +1063,28 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     if (!vaddr) return -ENOMEM;
     if (!allocAt(vaddr, MemTag::User)) return -ENOMEM;
 
-    // Zero then read file data
-    auto* p = reinterpret_cast<uint8_t*>(vaddr);
-    for (uint64_t b = 0; b < pages * 4096; ++b) p[b] = 0;
+    // Zero then read file data (via direct map for permission safety)
+    for (uint64_t pg = 0; pg < pages; ++pg)
+        zeroUserPage(vaddr + pg * 4096);
 
     auto* vn = static_cast<Vnode*>(fde->handle);
     uint64_t readOff = offset;
-    VfsRead(vn, reinterpret_cast<void*>(vaddr), length, &readOff);
+
+    // Read file data into a kernel-side buffer then copy through direct map
+    uint64_t bytesLeft = length;
+    uint64_t dstOff = 0;
+    while (bytesLeft > 0)
+    {
+        uint64_t chunk = (bytesLeft > 4096) ? 4096 : bytesLeft;
+        uint64_t userVA = vaddr + dstOff;
+        PhysicalAddress phys = VmmVirtToPhys(proc->pageTable,
+                                             VirtualAddress(userVA));
+        if (!phys) break;
+        auto* kp = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
+        VfsRead(vn, kp, chunk, &readOff);
+        dstOff += chunk;
+        bytesLeft -= chunk;
+    }
 
     return static_cast<int64_t>(vaddr);
 }
@@ -1039,20 +1093,58 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 // sys_mprotect (10) -- stub
 // ---------------------------------------------------------------------------
 
-static int64_t sys_mprotect(uint64_t, uint64_t, uint64_t,
+static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
                              uint64_t, uint64_t, uint64_t)
 {
-    return 0; // pretend success
+    if (len == 0) return 0;
+    if (addr & 0xFFF) return -EINVAL;
+
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+
+    uint64_t pages = (len + 4095) / 4096;
+    uint64_t newFlags = ProtToVmmFlags(prot);
+
+    for (uint64_t i = 0; i < pages; ++i)
+    {
+        VirtualAddress va(addr + i * 4096);
+        PhysicalAddress phys = VmmVirtToPhys(proc->pageTable, va);
+        if (!phys) continue; // Page not mapped — skip (Linux does this)
+
+        // Remap the page with the new flags.
+        VmmUnmapPage(proc->pageTable, va);
+        VmmMapPage(proc->pageTable, va, phys, newFlags, MemTag::User, proc->pid);
+    }
+
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
 // sys_munmap (11) -- stub
 // ---------------------------------------------------------------------------
 
-static int64_t sys_munmap(uint64_t, uint64_t, uint64_t,
+static int64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t,
                            uint64_t, uint64_t, uint64_t)
 {
-    // TODO: actually free pages
+    if (addr & 0xFFF) return -EINVAL;
+    if (length == 0) return 0;
+
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+
+    uint64_t pages = (length + 4095) / 4096;
+
+    for (uint64_t i = 0; i < pages; ++i)
+    {
+        VirtualAddress va(addr + i * 4096);
+        PhysicalAddress phys = VmmVirtToPhys(proc->pageTable, va);
+        if (phys)
+        {
+            VmmUnmapPage(proc->pageTable, va);
+            PmmFreePage(phys);
+        }
+    }
+
     return 0;
 }
 
@@ -2107,7 +2199,12 @@ static void FillStat(LinuxStat* st, const VnodeStat& vs)
     auto* raw = reinterpret_cast<uint8_t*>(st);
     for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
 
-    st->st_ino = 1;
+    // Generate a unique inode number from the file's attributes.
+    // This is critical: musl's dynamic linker uses dev+ino to detect
+    // already-loaded libraries.  Every distinct file MUST have a distinct ino.
+    static volatile uint64_t s_nextIno = 100;
+    st->st_ino = __atomic_fetch_add(&s_nextIno, 1, __ATOMIC_RELAXED);
+    st->st_dev = 1;
     st->st_nlink = 1;
     st->st_blksize = 4096;
     st->st_size = static_cast<int64_t>(vs.size);

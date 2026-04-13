@@ -112,6 +112,27 @@ done
 # --- Static binaries from nix (busybox etc.) ---
 # These are added manually once; this section just reports what's present.
 
+# --- Dynamic libraries (/lib) ---
+dynlibs_dir="${ROOT_DIR}/dynlibs"
+if [ -d "$dynlibs_dir" ] && ls "$dynlibs_dir"/*.so* &>/dev/null 2>&1; then
+    echo "Dynamic libraries:"
+    mmd -D s -i "${DISK_IMG}" "::LIB" 2>/dev/null || true
+    for f in "$dynlibs_dir"/*.so*; do
+        [ -f "$f" ] || continue
+        local_name="$(basename "$f")"
+        mcopy -o -i "${DISK_IMG}" "$f" "::LIB/${local_name}"
+        echo "  synced: LIB/${local_name} ($(stat -c%s "$f") bytes)"
+    done
+fi
+
+# --- Dynamic bash binary ---
+bash_dyn="${ROOT_DIR}/bash_dynamic"
+if [ -f "$bash_dyn" ]; then
+    echo "Bash (dynamic):"
+    mmd -D s -i "${DISK_IMG}" "::BIN" 2>/dev/null || true
+    sync_file "$bash_dyn" "BIN/BASH"
+fi
+
 # --- Boot script (INIT.RC) ---
 init_rc="${ROOT_DIR}/data/INIT.RC"
 if [ -f "$init_rc" ]; then

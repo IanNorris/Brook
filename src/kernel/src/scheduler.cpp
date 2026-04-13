@@ -245,7 +245,7 @@ static void ProcessTrampoline()
 
     __asm__ volatile("sti");
 
-    SwitchToUserMode(proc->stackTop, proc->elf.entryPoint);
+    SwitchToUserMode(proc->stackTop, proc->initialEntry);
     __builtin_unreachable();
 }
 
@@ -831,7 +831,7 @@ parent_done:
         __builtin_unreachable();
     }
 
-    SwitchToUserMode(first->stackTop, first->elf.entryPoint);
+    SwitchToUserMode(first->stackTop, first->initialEntry);
 
     __builtin_unreachable();
 }
@@ -894,8 +894,7 @@ parent_done:
         __builtin_unreachable();
     }
 
-    SwitchToUserMode(first->stackTop, first->elf.entryPoint);
-    __builtin_unreachable();
+    SwitchToUserMode(first->stackTop, first->initialEntry);    __builtin_unreachable();
 }
 
 void SchedulerSetCpuEnv(uint32_t cpuIndex, KernelCpuEnv* env)

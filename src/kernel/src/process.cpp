@@ -102,7 +102,8 @@ static uint64_t SimpleRand(uint64_t seed)
 
 static uint64_t SetupUserStack(Process* proc,
                                 int argc, const char* const* argv,
-                                int envc, const char* const* envp)
+                                int envc, const char* const* envp,
+                                uint64_t interpBase = 0)
 {
     // Work from the top of the stack downward.
     uint64_t sp = proc->stackTop;
@@ -161,7 +162,7 @@ static uint64_t SetupUserStack(Process* proc,
     pushU64(0); pushU64(AT_NULL);                               // AT_NULL
     pushU64(randomAddr); pushU64(AT_RANDOM);                    // AT_RANDOM
     pushU64(proc->elf.entryPoint); pushU64(AT_ENTRY);           // AT_ENTRY
-    pushU64(0); pushU64(AT_BASE);                               // AT_BASE (no interp)
+    pushU64(interpBase); pushU64(AT_BASE);                       // AT_BASE (interpreter load addr, 0 if static)
     pushU64(4096); pushU64(AT_PAGESZ);                          // AT_PAGESZ
     pushU64(proc->elf.phdrNum); pushU64(AT_PHNUM);              // AT_PHNUM
     pushU64(proc->elf.phdrEntSize); pushU64(AT_PHENT);          // AT_PHENT
@@ -190,6 +191,96 @@ static uint64_t SetupUserStack(Process* proc,
 // Forward declaration — implemented in elf_loader.cpp
 bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
              PageTable pt, uint16_t pid);
+uint64_t ElfLoadAt(const uint8_t* data, uint64_t size,
+                   uint64_t base, PageTable pt, uint16_t pid);
+
+// Base address where the dynamic linker / interpreter is loaded.
+static constexpr uint64_t INTERP_LOAD_BASE = 0x40000000ULL; // 1 GB
+
+// ---------------------------------------------------------------------------
+// LoadInterpreter -- Read and load the ELF interpreter specified in
+// proc->elf.interpPath.  Returns the interpreter entry point, or 0 on
+// failure.  The interpreter is loaded at INTERP_LOAD_BASE.
+// ---------------------------------------------------------------------------
+static uint64_t LoadInterpreter(Process* proc)
+{
+    if (proc->elf.interpPath[0] == '\0') return 0;
+
+    SerialPrintf("INTERP: loading '%s' for pid %u\n",
+                 proc->elf.interpPath, proc->pid);
+
+    // Try the exact path first.
+    Vnode* vn = VfsOpen(proc->elf.interpPath);
+
+    // Fallback: try /boot prefix.
+    if (!vn)
+    {
+        char bootPath[256] = "/boot";
+        uint32_t bi = 5;
+        const char* p = proc->elf.interpPath;
+        while (*p && bi + 1 < sizeof(bootPath)) bootPath[bi++] = *p++;
+        bootPath[bi] = '\0';
+        vn = VfsOpen(bootPath);
+    }
+
+    // Fallback: extract filename and look in /boot/lib/.
+    if (!vn)
+    {
+        const char* fname = proc->elf.interpPath;
+        for (const char* p = proc->elf.interpPath; *p; ++p)
+            if (*p == '/') fname = p + 1;
+
+        char libPath[256] = "/boot/lib/";
+        uint32_t li = 10;
+        while (*fname && li + 1 < sizeof(libPath)) libPath[li++] = *fname++;
+        libPath[li] = '\0';
+
+        SerialPrintf("INTERP: trying '%s'\n", libPath);
+        vn = VfsOpen(libPath);
+    }
+
+    if (!vn)
+    {
+        SerialPrintf("INTERP: failed to open '%s'\n", proc->elf.interpPath);
+        return 0;
+    }
+
+    VnodeStat st;
+    if (VfsStat(vn, &st) != 0 || st.size == 0)
+    {
+        SerialPrintf("INTERP: failed to stat '%s'\n", proc->elf.interpPath);
+        VfsClose(vn);
+        return 0;
+    }
+
+    auto* buf = static_cast<uint8_t*>(kmalloc(st.size));
+    if (!buf)
+    {
+        SerialPrintf("INTERP: OOM for %lu bytes\n", st.size);
+        VfsClose(vn);
+        return 0;
+    }
+
+    uint64_t off = 0;
+    int rd = VfsRead(vn, buf, st.size, &off);
+    VfsClose(vn);
+
+    if (rd < 0 || static_cast<uint64_t>(rd) != st.size)
+    {
+        SerialPrintf("INTERP: read error (%d/%lu)\n", rd, st.size);
+        kfree(buf);
+        return 0;
+    }
+
+    uint64_t entry = ElfLoadAt(buf, st.size, INTERP_LOAD_BASE,
+                               proc->pageTable, proc->pid);
+    kfree(buf);
+
+    if (!entry)
+        SerialPrintf("INTERP: ElfLoadAt failed for '%s'\n", proc->elf.interpPath);
+
+    return entry;
+}
 
 Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
                        int argc, const char* const* argv,
@@ -286,6 +377,24 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     proc->programBreak = proc->elf.programBreakLow;
     proc->mmapNext = USER_MMAP_BASE;
 
+    // Load dynamic linker if the ELF specifies PT_INTERP.
+    uint64_t interpEntry = 0;
+    uint64_t interpBase  = 0;
+    if (proc->elf.interpPath[0] != '\0')
+    {
+        interpEntry = LoadInterpreter(proc);
+        if (!interpEntry)
+        {
+            SerialPrintf("PROC: failed to load interpreter '%s'\n",
+                         proc->elf.interpPath);
+            PmmKillPid(proc->pid);
+            VmmDestroyUserPageTable(proc->pageTable);
+            kfree(proc);
+            return nullptr;
+        }
+        interpBase = INTERP_LOAD_BASE;
+    }
+
     // Allocate user stack at fixed user-space addresses (below USER_STACK_TOP).
     // Physical pages are allocated individually and mapped into the process
     // page table.  No VMALLOC — the stack lives entirely in user-half.
@@ -338,7 +447,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     proc->ttyEcho = true;
 
     // Build user stack with argc/argv/envp/auxv
-    uint64_t userSP = SetupUserStack(proc, argc, argv, envc, envp);
+    uint64_t userSP = SetupUserStack(proc, argc, argv, envc, envp, interpBase);
 
     // Store the final SP for SwitchToUserMode
     proc->stackTop = userSP;
@@ -409,8 +518,11 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
         }
     }
 
+    // Set actual initial entry point (interpreter entry if dynamically linked).
+    proc->initialEntry = interpEntry ? interpEntry : proc->elf.entryPoint;
+
     DbgPrintf("PROC: created pid=%u, entry=0x%lx, stack=0x%lx, brk=0x%lx, cr3=0x%lx\n",
-                 proc->pid, proc->elf.entryPoint, proc->stackTop,
+                 proc->pid, proc->initialEntry, proc->stackTop,
                  proc->programBreak, proc->pageTable.pml4.raw());
 
     return proc;
@@ -771,6 +883,21 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     proc->programBreak = proc->elf.programBreakLow;
     proc->mmapNext = USER_MMAP_BASE;
 
+    // Load dynamic linker if the ELF specifies PT_INTERP.
+    uint64_t interpEntry = 0;
+    uint64_t interpBase  = 0;
+    if (proc->elf.interpPath[0] != '\0')
+    {
+        interpEntry = LoadInterpreter(proc);
+        if (!interpEntry)
+        {
+            SerialPrintf("EXEC: failed to load interpreter '%s'\n",
+                         proc->elf.interpPath);
+            return 0;
+        }
+        interpBase = INTERP_LOAD_BASE;
+    }
+
     // 4. Allocate new user stack
     uint64_t stackPages = USER_STACK_SIZE / 4096;
     uint64_t guardPages = 1;
@@ -796,7 +923,7 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     proc->stackTop  = stackVirtTop - 8;
 
     // 5. Build user stack with argc/argv/envp/auxv
-    uint64_t userSP = SetupUserStack(proc, argc, argv, envc, envp);
+    uint64_t userSP = SetupUserStack(proc, argc, argv, envc, envp, interpBase);
     proc->stackTop = userSP;
 
     // 6. Set up TLS
@@ -874,7 +1001,9 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     // For now, FDs 0/1/2 are preserved (stdin/stdout/stderr).
 
     *outStackPtr = userSP;
-    return proc->elf.entryPoint;
+    // If dynamically linked, start at the interpreter's entry point;
+    // otherwise, start at the main binary's entry.
+    return interpEntry ? interpEntry : proc->elf.entryPoint;
 }
 
 } // namespace brook

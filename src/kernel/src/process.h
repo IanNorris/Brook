@@ -127,6 +127,9 @@ struct ElfBinary
     uint64_t tlsInitSize;       // Size of initialized TLS data (p_filesz)
     uint64_t tlsTotalSize;      // Total TLS size including BSS (p_memsz)
     uint16_t tlsAlign;          // TLS alignment
+
+    // Dynamic linking: PT_INTERP path (empty if statically linked)
+    char interpPath[128];
 };
 
 // ---------------------------------------------------------------------------
@@ -169,6 +172,7 @@ struct Process
 
     // ELF binary info
     ElfBinary elf;
+    uint64_t  initialEntry;     // Actual entry point (interpreter entry if dynamically linked)
 
     // Memory
     uint64_t programBreak;      // Current brk() position
