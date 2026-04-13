@@ -1612,6 +1612,18 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
     SerialPrintf("sys_execve: entering user mode for '%s' entry=0x%lx sp=0x%lx\n",
                  proc->name, newEntry, newStackPtr);
 
+    // Validate that entry point and stack are mapped in the new address space.
+    {
+        PhysicalAddress entryPhys = VmmVirtToPhys(proc->pageTable, VirtualAddress(newEntry));
+        PhysicalAddress stackPhys = VmmVirtToPhys(proc->pageTable, VirtualAddress(newStackPtr & ~0xFFFULL));
+        if (!entryPhys || !stackPhys) {
+            SerialPrintf("sys_execve: FATAL unmapped pages! entry phys=0x%lx stack phys=0x%lx\n",
+                         entryPhys.raw(), stackPhys.raw());
+            SchedulerExitCurrentProcess(-1);
+            __builtin_unreachable();
+        }
+    }
+
     // --- Switch to new address space and enter user mode ---
     // Load the new page table
     __asm__ volatile("mov %0, %%cr3" : : "r"(proc->pageTable.pml4.raw()) : "memory");
