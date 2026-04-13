@@ -281,6 +281,9 @@ static void KbdIrqHandler(InterruptFrame* frame)
             }
         }
         InputDevicePush(&g_kbdInputDev, ev);
+
+        // Wake any process blocked waiting for input events.
+        InputWakeWaiters();
     }
 
     // Also push ASCII to the legacy ring buffer (for kernel shell / KbdGetChar).

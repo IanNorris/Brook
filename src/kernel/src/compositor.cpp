@@ -22,13 +22,14 @@ static constexpr uint32_t MAX_COMPOSITED = 64;
 static Process* g_compositedProcs[MAX_COMPOSITED] = {};
 static uint32_t g_compositedCount = 0;
 
-// Compositor thread wakes every COMPOSITE_INTERVAL ms (~30 Hz).
-static constexpr uint32_t COMPOSITE_INTERVAL = 33;
+// Compositor fallback interval: if no event-driven wakeup arrives within
+// this many ms, the compositor wakes anyway (for cursor updates, etc.).
+static constexpr uint32_t COMPOSITE_INTERVAL = 16; // ~60 Hz fallback
 
 // Force-blit all processes every N ms regardless of dirty flag,
 // so we see output even during init before DOOM signals dirty.
 static constexpr uint32_t FORCE_BLIT_INTERVAL_MS = 500;
-static uint32_t g_forceBlitCounter = 0;
+static uint64_t g_lastForceBlitTick = 0;
 
 void CompositorInit()
 {
@@ -286,6 +287,9 @@ static void CursorDraw(int32_t cx, int32_t cy)
 // Global halt flag — set by panic to stop compositing.
 static volatile bool g_compositorHalted = false;
 
+// The compositor Process pointer — set once the thread starts.
+static Process* g_compositorProcess = nullptr;
+
 static void CompositorLoop()
 {
     if (!g_physFb)
@@ -298,9 +302,9 @@ static void CompositorLoop()
     {
         // Every FORCE_BLIT_INTERVAL_MS, blit all processes regardless of dirty
     // flag. This ensures we see output during init (before DOOM signals dirty).
-    g_forceBlitCounter += COMPOSITE_INTERVAL;
-    bool forceAll = (g_forceBlitCounter >= FORCE_BLIT_INTERVAL_MS);
-    if (forceAll) g_forceBlitCounter = 0;
+    uint64_t now = g_lapicTickCount;
+    bool forceAll = (now - g_lastForceBlitTick >= FORCE_BLIT_INTERVAL_MS);
+    if (forceAll) g_lastForceBlitTick = now;
 
     for (uint32_t i = 0; i < g_compositedCount; ++i)
     {
@@ -358,6 +362,7 @@ static void CompositorLoop()
 
 static void CompositorThreadFn(void* /*arg*/)
 {
+    g_compositorProcess = ProcessCurrent();
     SerialPrintf("COMPOSITOR: thread started (%ux%u, %u processes)\n",
                  g_physFbWidth, g_physFbHeight, g_compositedCount);
 
@@ -366,6 +371,9 @@ static void CompositorThreadFn(void* /*arg*/)
         if (!g_compositorHalted)
             CompositorLoop();
 
+        // Block until either a process signals dirty (CompositorWake) or
+        // the fallback interval elapses (ensures cursor updates even with
+        // no dirty frames).
         Process* self = ProcessCurrent();
         self->wakeupTick = g_lapicTickCount + COMPOSITE_INTERVAL;
         SchedulerBlock(self);
@@ -387,6 +395,13 @@ void CompositorStartThread()
 void CompositorHalt()
 {
     g_compositorHalted = true;
+}
+
+void CompositorWake()
+{
+    Process* p = g_compositorProcess;
+    if (p && p->state == ProcessState::Blocked)
+        SchedulerUnblock(p);
 }
 
 void CompositorRemap(uint64_t fbPhys, uint32_t w, uint32_t h, uint32_t stridePixels)

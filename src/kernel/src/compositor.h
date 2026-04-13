@@ -31,6 +31,9 @@ void CompositorStartThread();
 // Halt the compositor — called during panic to prevent overwriting the QR code.
 void CompositorHalt();
 
+// Wake the compositor thread immediately (e.g. when a process signals a dirty frame).
+void CompositorWake();
+
 // Hot-swap the physical framebuffer (called by display driver on mode change).
 // Must be called AFTER TtyRemap (uses TtyGetFramebuffer to get the new mapping).
 // stridePixels is the row stride in pixels (not bytes).

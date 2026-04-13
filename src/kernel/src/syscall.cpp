@@ -17,6 +17,7 @@
 #include "serial_writer.h"
 #include "pipe.h"
 #include "memory/heap.h"
+#include "compositor.h"
 
 // Forward declaration
 extern "C" __attribute__((naked)) void ReturnToKernel();
@@ -210,6 +211,7 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if (fde->type == FdType::DevFramebuf)
     {
         proc->fbDirty = 1;
+        CompositorWake();
         return static_cast<int64_t>(count);
     }
 
@@ -298,7 +300,9 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 if (!InputPollEvent(&ev))
                 {
                     if (bytesRead > 0) break; // return what we have
-                    SchedulerYield();
+                    // Block until the keyboard ISR wakes us.
+                    InputAddWaiter(proc);
+                    SchedulerBlock(proc);
                     continue;
                 }
                 if (ev.type != InputEventType::KeyPress) continue;
@@ -347,7 +351,9 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             InputEvent ev;
             if (!InputPollEvent(&ev))
             {
-                SchedulerYield();
+                // Block until the keyboard ISR wakes us.
+                InputAddWaiter(proc);
+                SchedulerBlock(proc);
                 continue;
             }
 

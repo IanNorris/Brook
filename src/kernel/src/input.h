@@ -98,26 +98,47 @@ InputEvent InputWaitEvent();
 bool InputHasEvents();
 
 // ---------------------------------------------------------------------------
+// Waiter support — processes blocked waiting for input events
+// ---------------------------------------------------------------------------
+
+// Maximum number of processes that can block on input simultaneously.
+static constexpr uint32_t INPUT_MAX_WAITERS = 8;
+
+// Add the current process as a waiter (call BEFORE SchedulerBlock).
+void InputAddWaiter(struct Process* proc);
+
+// Remove a process from the waiter list (called on wakeup or cancel).
+void InputRemoveWaiter(struct Process* proc);
+
+// Wake all waiting processes. Called from ISR after pushing events.
+// Safe to call from ISR context (SchedulerUnblock is ISR-safe since
+// all scheduler lock holders have interrupts disabled).
+void InputWakeWaiters();
+
+// ---------------------------------------------------------------------------
 // Driver-side helpers — call from ISR or driver code to enqueue events
 // ---------------------------------------------------------------------------
 
 // Push an event into a device's ring buffer.
-// Safe to call from ISR context.
+// Safe to call from ISR context.  Uses atomic stores so that the
+// consumer (on another CPU) sees a consistent head/tail.
 inline void InputDevicePush(InputDevice* dev, const InputEvent& ev)
 {
-    uint32_t next = (dev->head + 1) & (INPUT_RING_SIZE - 1);
-    if (next == dev->tail) return; // buffer full, drop event
-    dev->ring[dev->head] = ev;
-    dev->head = next;
+    uint32_t head = __atomic_load_n(&dev->head, __ATOMIC_RELAXED);
+    uint32_t next = (head + 1) & (INPUT_RING_SIZE - 1);
+    if (next == __atomic_load_n(&dev->tail, __ATOMIC_ACQUIRE)) return; // full
+    dev->ring[head] = ev;
+    __atomic_store_n(&dev->head, next, __ATOMIC_RELEASE);
 }
 
 // Pop an event from a device's ring buffer.
 // Returns true if an event was dequeued.
 inline bool InputDevicePop(InputDevice* dev, InputEvent* out)
 {
-    if (dev->tail == dev->head) return false;
-    *out = dev->ring[dev->tail];
-    dev->tail = (dev->tail + 1) & (INPUT_RING_SIZE - 1);
+    uint32_t tail = __atomic_load_n(&dev->tail, __ATOMIC_RELAXED);
+    if (tail == __atomic_load_n(&dev->head, __ATOMIC_ACQUIRE)) return false;
+    *out = dev->ring[tail];
+    __atomic_store_n(&dev->tail, (tail + 1) & (INPUT_RING_SIZE - 1), __ATOMIC_RELEASE);
     return true;
 }
 
