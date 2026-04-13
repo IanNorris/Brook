@@ -17,6 +17,12 @@ static uint32_t           g_physFbWidth  = 0;
 static uint32_t           g_physFbHeight = 0;
 static uint32_t           g_physFbStride = 0; // in pixels
 
+// Double-buffer: compose into cached RAM, then bulk-copy to MMIO FB.
+// MMIO writes are 10-100× slower than cached RAM; sequential bulk copy
+// via memcpy is much faster than scattered pixel writes.
+static uint32_t* g_backBuffer     = nullptr;
+static uint32_t  g_backBufStride  = 0; // in pixels (matches physFb stride)
+
 // Registered process slots for compositing.
 static constexpr uint32_t MAX_COMPOSITED = 64;
 static Process* g_compositedProcs[MAX_COMPOSITED] = {};
@@ -45,6 +51,23 @@ void CompositorInit()
     g_physFbWidth  = w;
     g_physFbHeight = h;
     g_physFbStride = strideBytes / 4; // convert byte stride to pixel stride
+
+    // Allocate a cached-RAM backbuffer for double-buffering.
+    g_backBufStride = g_physFbStride;
+    uint64_t bbSizeBytes = static_cast<uint64_t>(g_backBufStride) * h * 4;
+    uint64_t bbPages = (bbSizeBytes + 4095) / 4096;
+    VirtualAddress bbAddr = VmmAllocPages(bbPages, VMM_WRITABLE, MemTag::Device, 0);
+    if (bbAddr)
+    {
+        g_backBuffer = reinterpret_cast<uint32_t*>(bbAddr.raw());
+        __builtin_memset(g_backBuffer, 0, bbSizeBytes);
+        SerialPrintf("COMPOSITOR: backbuffer %lu KB at 0x%lx\n",
+                     bbSizeBytes / 1024, bbAddr.raw());
+    }
+    else
+    {
+        SerialPuts("COMPOSITOR: WARNING — backbuffer alloc failed, direct MMIO path\n");
+    }
 
     // Set mouse cursor bounds to match screen resolution.
     MouseSetBounds(w, h);
@@ -163,6 +186,10 @@ static void BlitProcess(Process* proc, bool forceAll)
     if (dstX0 + static_cast<int>(endDx) > static_cast<int>(g_physFbWidth))
         endDx = g_physFbWidth - static_cast<uint32_t>(dstX0);
 
+    // Destination surface: backbuffer (fast cached RAM) or MMIO FB (slow).
+    uint32_t*       dstBase   = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
+    const uint32_t  dstStride = g_backBuffer ? g_backBufStride : g_physFbStride;
+
     if (scale == 1)
     {
         // Fast path: memcpy entire rows.
@@ -170,10 +197,10 @@ static void BlitProcess(Process* proc, bool forceAll)
         for (uint32_t dy = startDy; dy < endDy; ++dy)
         {
             const uint32_t* srcRow = src + dy * srcStride + startDx;
-            volatile uint32_t* dstRow = g_physFb +
-                static_cast<uint32_t>(dstY0 + dy) * g_physFbStride +
+            uint32_t* dstRow = dstBase +
+                static_cast<uint32_t>(dstY0 + dy) * dstStride +
                 static_cast<uint32_t>(dstX0 + startDx);
-            __builtin_memcpy(const_cast<uint32_t*>(dstRow), srcRow, copyWidth);
+            __builtin_memcpy(dstRow, srcRow, copyWidth);
         }
     }
     else
@@ -185,8 +212,8 @@ static void BlitProcess(Process* proc, bool forceAll)
             if (srcY >= srcH) break;
             const uint32_t* srcRow = src + srcY * srcStride;
 
-            volatile uint32_t* dstRow = g_physFb +
-                static_cast<uint32_t>(dstY0 + dy) * g_physFbStride;
+            uint32_t* dstRow = dstBase +
+                static_cast<uint32_t>(dstY0 + dy) * dstStride;
 
             for (uint32_t dx = startDx; dx < endDx; ++dx)
             {
@@ -233,6 +260,8 @@ static bool     g_cursorVisible = false;
 
 static void CursorSaveUnder(int32_t cx, int32_t cy)
 {
+    uint32_t* buf = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
+    uint32_t  stride = g_backBuffer ? g_backBufStride : g_physFbStride;
     for (uint32_t row = 0; row < CURSOR_H; row++)
     {
         int32_t sy = cy + static_cast<int32_t>(row);
@@ -241,8 +270,7 @@ static void CursorSaveUnder(int32_t cx, int32_t cy)
         {
             int32_t sx = cx + static_cast<int32_t>(col);
             if (sx < 0 || static_cast<uint32_t>(sx) >= g_physFbWidth) continue;
-            g_cursorSave[row * CURSOR_W + col] =
-                const_cast<uint32_t*>(g_physFb)[sy * g_physFbStride + sx];
+            g_cursorSave[row * CURSOR_W + col] = buf[sy * stride + sx];
         }
     }
     g_cursorSaveX = cx;
@@ -253,6 +281,8 @@ static void CursorSaveUnder(int32_t cx, int32_t cy)
 static void CursorRestore()
 {
     if (!g_cursorVisible) return;
+    uint32_t* buf = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
+    uint32_t  stride = g_backBuffer ? g_backBufStride : g_physFbStride;
     int32_t cx = g_cursorSaveX;
     int32_t cy = g_cursorSaveY;
     for (uint32_t row = 0; row < CURSOR_H; row++)
@@ -263,7 +293,7 @@ static void CursorRestore()
         {
             int32_t sx = cx + static_cast<int32_t>(col);
             if (sx < 0 || static_cast<uint32_t>(sx) >= g_physFbWidth) continue;
-            g_physFb[sy * g_physFbStride + sx] = g_cursorSave[row * CURSOR_W + col];
+            buf[sy * stride + sx] = g_cursorSave[row * CURSOR_W + col];
         }
     }
     g_cursorVisible = false;
@@ -272,6 +302,8 @@ static void CursorRestore()
 static void CursorDraw(int32_t cx, int32_t cy)
 {
     CursorSaveUnder(cx, cy);
+    uint32_t* buf = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
+    uint32_t  stride = g_backBuffer ? g_backBufStride : g_physFbStride;
     for (uint32_t row = 0; row < CURSOR_H; row++)
     {
         int32_t sy = cy + static_cast<int32_t>(row);
@@ -282,7 +314,7 @@ static void CursorDraw(int32_t cx, int32_t cy)
             if (px == 0) continue; // transparent
             int32_t sx = cx + static_cast<int32_t>(col);
             if (sx < 0 || static_cast<uint32_t>(sx) >= g_physFbWidth) continue;
-            g_physFb[sy * g_physFbStride + sx] = (px == 1) ? 0x00FFFFFF : 0x00000000;
+            buf[sy * stride + sx] = (px == 1) ? 0x00FFFFFF : 0x00000000;
         }
     }
 }
@@ -314,11 +346,13 @@ static void CompositorLoop()
         Process* p = g_compositedProcs[i];
         if (!p) continue;
 
-        // Handle exit color fill: paint the physical FB region directly
+        // Handle exit color fill: paint to backbuffer
         // (no VFB read needed — safe even after VFB pages are freed).
         uint32_t exitColor = __atomic_load_n(&p->fbExitColor, __ATOMIC_ACQUIRE);
         if (exitColor)
         {
+            uint32_t* dstBase = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
+            uint32_t  dstStride = g_backBuffer ? g_backBufStride : g_physFbStride;
             uint32_t scale = p->fbScale ? p->fbScale : 1;
             uint32_t dstW = p->fbVfbWidth / scale;
             uint32_t dstH = p->fbVfbHeight / scale;
@@ -329,7 +363,7 @@ static void CompositorLoop()
             {
                 int y = dstY0 + static_cast<int>(dy);
                 if (y < 0 || static_cast<uint32_t>(y) >= g_physFbHeight) continue;
-                volatile uint32_t* row = g_physFb + y * g_physFbStride;
+                uint32_t* row = dstBase + y * dstStride;
                 for (uint32_t dx = 0; dx < dstW; ++dx)
                 {
                     int x = dstX0 + static_cast<int>(dx);
@@ -360,6 +394,19 @@ static void CompositorLoop()
         int32_t mx, my;
         MouseGetPosition(&mx, &my);
         CursorDraw(mx, my);
+    }
+
+    // Flip: copy backbuffer → MMIO framebuffer in one sequential pass.
+    // This is dramatically faster than scattered MMIO writes during compositing.
+    if (g_backBuffer)
+    {
+        for (uint32_t y = 0; y < g_physFbHeight; ++y)
+        {
+            __builtin_memcpy(
+                const_cast<uint32_t*>(g_physFb + y * g_physFbStride),
+                g_backBuffer + y * g_backBufStride,
+                g_physFbWidth * 4);
+        }
     }
 }
 
@@ -434,6 +481,18 @@ void CompositorRemap(uint64_t fbPhys, uint32_t w, uint32_t h, uint32_t stridePix
     g_physFbWidth  = w;
     g_physFbHeight = h;
     g_physFbStride = stridePixels;
+
+    // Reallocate backbuffer for new resolution.
+    // (old backbuffer leaked — acceptable for rare resolution changes)
+    g_backBufStride = stridePixels;
+    uint64_t bbSizeBytes = static_cast<uint64_t>(stridePixels) * h * 4;
+    uint64_t bbPages = (bbSizeBytes + 4095) / 4096;
+    VirtualAddress bbAddr = VmmAllocPages(bbPages, VMM_WRITABLE, MemTag::Device, 0);
+    if (bbAddr)
+    {
+        g_backBuffer = reinterpret_cast<uint32_t*>(bbAddr.raw());
+        __builtin_memset(g_backBuffer, 0, bbSizeBytes);
+    }
 
     // Update mouse cursor bounds to match new resolution.
     MouseSetBounds(w, h);

@@ -317,11 +317,20 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 if (!InputPollEvent(&ev))
                 {
                     if (bytesRead > 0) break; // return what we have
-                    // Block until the keyboard ISR wakes us.
+                    // Register as waiter BEFORE re-checking, to close the
+                    // race where a key arrives between the poll and block.
                     InputAddWaiter(proc);
+                    // Re-check after registration — if data arrived between
+                    // the first poll and AddWaiter, consume it immediately.
+                    if (InputPollEvent(&ev))
+                    {
+                        InputRemoveWaiter(proc);
+                        goto got_event_nc;
+                    }
                     SchedulerBlock(proc);
                     continue;
                 }
+            got_event_nc:
                 if (ev.type != InputEventType::KeyPress) continue;
                 char c = ev.ascii;
                 if (c == 0) continue; // non-printable (arrows, etc.) — skip
@@ -368,11 +377,17 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             InputEvent ev;
             if (!InputPollEvent(&ev))
             {
-                // Block until the keyboard ISR wakes us.
+                // Register as waiter BEFORE re-checking to close the race.
                 InputAddWaiter(proc);
+                if (InputPollEvent(&ev))
+                {
+                    InputRemoveWaiter(proc);
+                    goto got_event_cooked;
+                }
                 SchedulerBlock(proc);
                 continue;
             }
+        got_event_cooked:
 
             // Only process key presses, ignore releases
             if (ev.type != InputEventType::KeyPress)
@@ -2375,7 +2390,9 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
     // If nothing ready and timeout != 0, block and retry
     if (ready == 0 && timeout_ms != 0)
     {
-        // Register as waiter for input events (covers keyboard/pipe wakeups)
+        // Register as waiter BEFORE re-checking data availability.
+        // This closes the race where data arrives between the initial
+        // scan and the block call.
         Process* self = ProcessCurrent();
 
         // For pipe FDs, register as waiter on the pipe
@@ -2394,13 +2411,34 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
                 InputAddWaiter(self);
         }
 
-        // Set timed wakeup if timeout > 0
-        if (timeout_ms > 0 && timeout_ms != static_cast<uint64_t>(-1))
+        // Re-check data availability after registration.
+        // If data arrived between the initial scan and registration,
+        // we catch it here instead of blocking forever.
+        for (uint64_t i = 0; i < nfds; i++)
         {
-            extern volatile uint64_t g_lapicTickCount;
-            self->wakeupTick = g_lapicTickCount + timeout_ms;
+            if (fds[i].fd < 0) continue;
+            FdEntry* fde = FdGet(proc, fds[i].fd);
+            if (!fde) continue;
+            if (fde->type == FdType::DevKeyboard && (fds[i].events & POLLIN) && InputHasEvents())
+            { ready++; break; }
+            if (fde->type == FdType::Pipe && fde->handle && (fds[i].events & POLLIN))
+            {
+                auto* pb = static_cast<PipeBuffer*>(fde->handle);
+                if (!(fde->flags & 1) && (pb->count() > 0 || pb->writers == 0))
+                { ready++; break; }
+            }
         }
-        SchedulerBlock(self);
+
+        if (ready == 0)
+        {
+            // Set timed wakeup if timeout > 0
+            if (timeout_ms > 0 && timeout_ms != static_cast<uint64_t>(-1))
+            {
+                extern volatile uint64_t g_lapicTickCount;
+                self->wakeupTick = g_lapicTickCount + timeout_ms;
+            }
+            SchedulerBlock(self);
+        }
 
         // Clean up waiters
         InputRemoveWaiter(self);
@@ -2417,7 +2455,8 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
             }
         }
 
-        // Re-scan after wake
+        // Re-scan after wake — reset ready count
+        ready = 0;
         for (uint64_t i = 0; i < nfds; i++)
         {
             fds[i].revents = 0;

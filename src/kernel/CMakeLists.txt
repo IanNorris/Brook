@@ -130,6 +130,7 @@ add_executable(kernel
     src/cpu.cpp
     src/device.cpp
     src/fatfs_glue.cpp
+    src/fw_cfg.cpp
     src/gdt.cpp
     src/idt.cpp
     src/input.cpp

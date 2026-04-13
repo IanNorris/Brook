@@ -35,6 +35,7 @@
 #include "boot_logo.h"
 #include "klog.h"
 #include "fat_test_image.h"
+#include "fw_cfg.h"
 
 // All kernel initialization and runtime — called by KernelMain after stack switch.
 __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootProtocol);
@@ -264,6 +265,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     {
         brook::KPuts("VFS: ramdisk buffer allocation failed\n");
     }
+
+    // ---- QEMU fw_cfg ----
+    brook::FwCfgInit();
 
     // ---- virtio-blk: enumerate all PCI virtio drives ----
     brook::BootLogoProgress(50, "Storage");
