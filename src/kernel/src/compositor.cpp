@@ -165,7 +165,11 @@ bool CompositorSetupProcess(Process* proc, int16_t destX, int16_t destY,
     proc->fbDirty       = 1;  // ensure first composite renders
 
     if (g_compositedCount < MAX_COMPOSITED)
-        g_compositedProcs[g_compositedCount++] = proc;
+    {
+        uint32_t idx = g_compositedCount;
+        __atomic_store_n(&g_compositedProcs[idx], proc, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_compositedCount, idx + 1, __ATOMIC_RELEASE);
+    }
 
     DbgPrintf("COMPOSITOR: proc '%s' pid %u → vfb %ux%u at 0x%lx, dest=(%d,%d) scale=%u\n",
                  proc->name, proc->pid, vfbWidth, vfbHeight, vfbAddr.raw(),
@@ -369,7 +373,8 @@ static void CompositorLoop()
     // Restore pixels under the old cursor position before blitting.
     CursorRestore();
 
-    if (g_compositedCount > 0)
+    uint32_t compCount = __atomic_load_n(&g_compositedCount, __ATOMIC_ACQUIRE);
+    if (compCount > 0)
     {
         // Every FORCE_BLIT_INTERVAL_MS, blit all processes regardless of dirty
     // flag. This ensures we see output during init (before DOOM signals dirty).
@@ -377,48 +382,45 @@ static void CompositorLoop()
     bool forceAll = (now - g_lastForceBlitTick >= FORCE_BLIT_INTERVAL_MS);
     if (forceAll) g_lastForceBlitTick = now;
 
-    for (uint32_t i = 0; i < g_compositedCount; ++i)
+    for (uint32_t i = 0; i < compCount; ++i)
     {
-        Process* p = g_compositedProcs[i];
+        Process* p = __atomic_load_n(&g_compositedProcs[i], __ATOMIC_ACQUIRE);
         if (!p) continue;
 
-        // Handle exit color fill: paint to backbuffer
-        // (no VFB read needed — safe even after VFB pages are freed).
-        uint32_t exitColor = __atomic_load_n(&p->fbExitColor, __ATOMIC_ACQUIRE);
-        if (exitColor)
-        {
-            uint32_t* dstBase = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
-            uint32_t  dstStride = g_backBuffer ? g_backBufStride : g_physFbStride;
-            uint32_t scale = p->fbScale ? p->fbScale : 1;
-            uint32_t dstW = p->fbVfbWidth / scale;
-            uint32_t dstH = p->fbVfbHeight / scale;
-            int dstX0 = p->fbDestX;
-            int dstY0 = p->fbDestY;
-
-            for (uint32_t dy = 0; dy < dstH; ++dy)
-            {
-                int y = dstY0 + static_cast<int>(dy);
-                if (y < 0 || static_cast<uint32_t>(y) >= g_physFbHeight) continue;
-                uint32_t* row = dstBase + y * dstStride;
-                for (uint32_t dx = 0; dx < dstW; ++dx)
-                {
-                    int x = dstX0 + static_cast<int>(dx);
-                    if (x < 0 || static_cast<uint32_t>(x) >= g_physFbWidth) continue;
-                    row[x] = exitColor;
-                }
-            }
-            __atomic_store_n(&p->fbExitColor, 0u, __ATOMIC_RELEASE);
-            g_compositedProcs[i] = nullptr;
-            uint32_t minY = (dstY0 >= 0) ? static_cast<uint32_t>(dstY0) : 0;
-            uint32_t maxY = static_cast<uint32_t>(dstY0) + dstH;
-            if (maxY > g_physFbHeight) maxY = g_physFbHeight;
-            MarkDirtyRows(minY, maxY);
-            continue;
-        }
-
+        // Check termination first — once terminated, stop accessing the struct.
         if (p->state == ProcessState::Terminated)
         {
-            g_compositedProcs[i] = nullptr;
+            // Handle exit color fill if set (safe: fbExitColor is set before termination).
+            uint32_t exitColor = __atomic_load_n(&p->fbExitColor, __ATOMIC_ACQUIRE);
+            if (exitColor)
+            {
+                uint32_t* dstBase = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
+                uint32_t  dstStride = g_backBuffer ? g_backBufStride : g_physFbStride;
+                uint32_t scale = p->fbScale ? p->fbScale : 1;
+                uint32_t dstW = p->fbVfbWidth / scale;
+                uint32_t dstH = p->fbVfbHeight / scale;
+                int dstX0 = p->fbDestX;
+                int dstY0 = p->fbDestY;
+
+                for (uint32_t dy = 0; dy < dstH; ++dy)
+                {
+                    int y = dstY0 + static_cast<int>(dy);
+                    if (y < 0 || static_cast<uint32_t>(y) >= g_physFbHeight) continue;
+                    uint32_t* row = dstBase + y * dstStride;
+                    for (uint32_t dx = 0; dx < dstW; ++dx)
+                    {
+                        int x = dstX0 + static_cast<int>(dx);
+                        if (x < 0 || static_cast<uint32_t>(x) >= g_physFbWidth) continue;
+                        row[x] = exitColor;
+                    }
+                }
+                __atomic_store_n(&p->fbExitColor, 0u, __ATOMIC_RELEASE);
+                uint32_t minY = (dstY0 >= 0) ? static_cast<uint32_t>(dstY0) : 0;
+                uint32_t maxY = static_cast<uint32_t>(dstY0) + dstH;
+                if (maxY > g_physFbHeight) maxY = g_physFbHeight;
+                MarkDirtyRows(minY, maxY);
+            }
+            __atomic_store_n(&g_compositedProcs[i], static_cast<Process*>(nullptr), __ATOMIC_RELEASE);
             continue;
         }
         if (!p->fbVirtual || p->fbVfbWidth == 0)
@@ -522,11 +524,12 @@ void CompositorMarkDirty()
 void CompositorUnregisterProcess(Process* proc)
 {
     if (!proc) return;
-    for (uint32_t i = 0; i < g_compositedCount; ++i)
+    uint32_t count = __atomic_load_n(&g_compositedCount, __ATOMIC_ACQUIRE);
+    for (uint32_t i = 0; i < count; ++i)
     {
-        if (g_compositedProcs[i] == proc)
+        if (__atomic_load_n(&g_compositedProcs[i], __ATOMIC_ACQUIRE) == proc)
         {
-            g_compositedProcs[i] = nullptr;
+            __atomic_store_n(&g_compositedProcs[i], static_cast<Process*>(nullptr), __ATOMIC_RELEASE);
             break;
         }
     }
