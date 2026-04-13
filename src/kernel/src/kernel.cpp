@@ -30,6 +30,7 @@
 #include "profiler.h"
 #include "clock_overlay.h"
 #include "smp.h"
+#include "mouse.h"
 #include "shell.h"
 #include "boot_logo.h"
 #include "klog.h"
@@ -414,6 +415,13 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         {
             brook::KPuts("KBD: ps2_kbd module not loaded — falling back to direct init\n");
             brook::KbdInit();
+        }
+
+        // If mouse module wasn't loaded, fall back to direct init.
+        if (acpiOk && !brook::MouseIsAvailable())
+        {
+            brook::KPuts("MOUSE: ps2_mouse module not loaded — falling back to direct init\n");
+            brook::MouseInit();
         }
 
         // Activate APs — they will set up per-CPU state and enter the scheduler.

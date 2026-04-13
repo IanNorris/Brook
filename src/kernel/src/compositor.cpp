@@ -46,6 +46,9 @@ void CompositorInit()
     g_physFbHeight = h;
     g_physFbStride = strideBytes / 4; // convert byte stride to pixel stride
 
+    // Set mouse cursor bounds to match screen resolution.
+    MouseSetBounds(w, h);
+
     SerialPrintf("COMPOSITOR: initialised, %ux%u stride=%u\n",
                  g_physFbWidth, g_physFbHeight, g_physFbStride);
 }

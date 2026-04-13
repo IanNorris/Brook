@@ -6,6 +6,7 @@
 
 #include "mouse.h"
 #include "input.h"
+#include "compositor.h"
 #include "idt.h"
 #include "apic.h"
 #include "serial.h"
@@ -197,11 +198,14 @@ static void MouseIrqHandler(InterruptFrame* frame)
         }
     }
 
+    // Wake the compositor so the cursor redraws immediately.
+    CompositorWake();
+
+    // Wake any processes blocked on input (e.g. for future /dev/mouse reads).
+    InputWakeWaiters();
+
     ApicSendEoi();
 }
-
-// ---------------------------------------------------------------------------
-// Public API
 // ---------------------------------------------------------------------------
 
 void MouseInit()
