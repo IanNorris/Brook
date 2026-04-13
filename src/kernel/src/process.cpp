@@ -556,12 +556,13 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt, uint16_t dstPid)
                     // Sign-extend if needed (not needed for user half, bits 47:0)
 
                     PhysicalAddress srcPhys(srcPt4[i1] & PTE_PHYS_MASK);
-                    uint64_t flags = srcPt4[i1] & 0xFFF; // low 12 bits = flags
+                    uint64_t flags = srcPt4[i1] & (0xFFF | VMM_NO_EXEC); // low 12 bits + NX
 
                     // Determine page flags for the child mapping
                     uint64_t mapFlags = 0;
                     if (flags & (1ULL << 1)) mapFlags |= VMM_WRITABLE;
                     if (flags & (1ULL << 2)) mapFlags |= VMM_USER;
+                    if (flags & VMM_NO_EXEC) mapFlags |= VMM_NO_EXEC;
 
                     // Allocate a new physical page for the child
                     PhysicalAddress dstPhys = PmmAllocPage(MemTag::User, dstPid);
