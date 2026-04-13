@@ -732,6 +732,27 @@ void SchedulerYield()
     proc->state = ProcessState::Terminated;
     proc->exitStatus = status;
 
+    // Wake the parent process if it's blocked (likely in wait4).
+    if (proc->parentPid != 0)
+    {
+        uint64_t alf = SchedLockAcquire(g_allProcLock);
+        for (uint32_t i = 0; i < g_processCount; i++)
+        {
+            if (g_allProcesses[i]->pid == proc->parentPid)
+            {
+                Process* parent = g_allProcesses[i];
+                SchedLockRelease(g_allProcLock, alf);
+                // Set pendingWakeup in case parent hasn't blocked yet
+                __atomic_store_n(&parent->pendingWakeup, 1, __ATOMIC_RELEASE);
+                if (parent->state == ProcessState::Blocked)
+                    SchedulerUnblock(parent);
+                goto parent_done;
+            }
+        }
+        SchedLockRelease(g_allProcLock, alf);
+    }
+parent_done:
+
     uint64_t rlf10 = SchedLockAcquire(g_readyLock);
     ReadyQueueRemoveLocked(proc);
     Process* next = PickNextLocked();

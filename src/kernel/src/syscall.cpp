@@ -238,8 +238,22 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
             uint32_t chunk = pipe->write(src + written,
                 static_cast<uint32_t>(count - written > 4096 ? 4096 : count - written));
             written += chunk;
-            if (written > 0) break;  // Return partial writes immediately
-            SchedulerYield();
+            if (written > 0)
+            {
+                // Wake blocked reader
+                Process* reader = pipe->readerWaiter;
+                if (reader)
+                {
+                    pipe->readerWaiter = nullptr;
+                    __atomic_store_n(&reader->pendingWakeup, 1, __ATOMIC_RELEASE);
+                    SchedulerUnblock(reader);
+                }
+                break;  // Return partial writes immediately
+            }
+            // Buffer full — block until reader drains some
+            Process* self = ProcessCurrent();
+            pipe->writerWaiter = self;
+            SchedulerBlock(self);
         }
         return static_cast<int64_t>(written);
     }
@@ -446,13 +460,26 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             uint32_t got = pipe->read(dst, static_cast<uint32_t>(
                 count > 4096 ? 4096 : count));
             if (got > 0)
+            {
+                // Wake blocked writer
+                Process* writer = pipe->writerWaiter;
+                if (writer)
+                {
+                    pipe->writerWaiter = nullptr;
+                    __atomic_store_n(&writer->pendingWakeup, 1, __ATOMIC_RELEASE);
+                    SchedulerUnblock(writer);
+                }
                 return static_cast<int64_t>(got);
+            }
 
             // EOF — no writers left and buffer empty
             if (__atomic_load_n(&pipe->writers, __ATOMIC_ACQUIRE) == 0)
                 return 0;
 
-            SchedulerYield();
+            // Block until writer puts data
+            Process* self = ProcessCurrent();
+            pipe->readerWaiter = self;
+            SchedulerBlock(self);
         }
     }
 
@@ -578,9 +605,29 @@ static int64_t sys_close(uint64_t fd, uint64_t, uint64_t,
         auto* pipe = static_cast<PipeBuffer*>(fde->handle);
         // flags bit 0: 1=write end, 0=read end
         if (fde->flags & 1)
+        {
             __atomic_fetch_sub(&pipe->writers, 1, __ATOMIC_RELEASE);
+            // Wake blocked reader so it sees EOF
+            Process* reader = pipe->readerWaiter;
+            if (reader)
+            {
+                pipe->readerWaiter = nullptr;
+                __atomic_store_n(&reader->pendingWakeup, 1, __ATOMIC_RELEASE);
+                SchedulerUnblock(reader);
+            }
+        }
         else
+        {
             __atomic_fetch_sub(&pipe->readers, 1, __ATOMIC_RELEASE);
+            // Wake blocked writer so it sees EPIPE
+            Process* writer = pipe->writerWaiter;
+            if (writer)
+            {
+                pipe->writerWaiter = nullptr;
+                __atomic_store_n(&writer->pendingWakeup, 1, __ATOMIC_RELEASE);
+                SchedulerUnblock(writer);
+            }
+        }
 
         // Free pipe buffer when both ends are closed
         if (__atomic_load_n(&pipe->readers, __ATOMIC_ACQUIRE) == 0 &&
@@ -1287,8 +1334,8 @@ static int64_t sys_wait4(uint64_t pidArg, uint64_t statusAddr, uint64_t options,
         if (options & WNOHANG)
             return 0;
 
-        // Yield and retry — simple polling wait
-        SchedulerYield();
+        // Block until a child exits and wakes us
+        SchedulerBlock(parent);
     }
 }
 

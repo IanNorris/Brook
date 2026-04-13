@@ -5,8 +5,10 @@
 
 namespace brook {
 
+struct Process;  // forward declaration for waiter
+
 // Kernel pipe buffer — fixed-size ring buffer with reader/writer reference counts.
-// Blocking read/write via SchedulerYield() when buffer is empty/full.
+// Blocking read/write via SchedulerBlock() when buffer is empty/full.
 static constexpr uint32_t PIPE_BUF_SIZE = 4096;
 
 struct PipeBuffer
@@ -18,6 +20,10 @@ struct PipeBuffer
 
     volatile uint32_t readers = 0;   // Number of FDs open for reading
     volatile uint32_t writers = 0;   // Number of FDs open for writing
+
+    // Waiter processes (set before blocking, cleared on wake)
+    Process* volatile readerWaiter = nullptr;
+    Process* volatile writerWaiter = nullptr;
 
     uint32_t count() const
     {
