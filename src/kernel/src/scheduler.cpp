@@ -543,9 +543,32 @@ static void ReapTerminated()
         Process* p = g_allProcesses[i];
         if (p->state == ProcessState::Terminated
             && __atomic_load_n(&p->reapable, __ATOMIC_ACQUIRE)
-            && p != g_perCpu[cpu].currentProcess
-            && p->parentPid == 0)  // Don't reap if parent may call wait4
+            && p != g_perCpu[cpu].currentProcess)
         {
+            // If parentPid != 0, check if the parent still exists.
+            // If the parent is gone, reparent to 0 so we can reap.
+            if (p->parentPid != 0)
+            {
+                bool parentAlive = false;
+                for (uint32_t j = 0; j < g_processCount; j++)
+                {
+                    if (g_allProcesses[j]->pid == p->parentPid
+                        && g_allProcesses[j]->state != ProcessState::Terminated)
+                    {
+                        parentAlive = true;
+                        break;
+                    }
+                }
+                if (parentAlive)
+                {
+                    // Parent may still call wait4 — skip for now
+                    ++i;
+                    continue;
+                }
+                // Parent is gone — reparent to init (0) for reaping
+                p->parentPid = 0;
+            }
+
             SchedLockRelease(g_allProcLock, alf);
             DbgPrintf("SCHED: reaping '%s' (pid %u)\n", p->name, p->pid);
             ProcessDestroy(p);
@@ -725,6 +748,18 @@ void SchedulerYield()
     // This must happen before marking as Terminated — the parent may be
     // blocked on a pipe read that this process had the write end of.
     ProcessCloseAllFds(proc);
+
+    // Reparent any children of this process to init (parentPid=0).
+    // This ensures they can be reaped even after this parent is gone.
+    {
+        uint64_t alf = SchedLockAcquire(g_allProcLock);
+        for (uint32_t i = 0; i < g_processCount; i++)
+        {
+            if (g_allProcesses[i]->parentPid == proc->pid)
+                g_allProcesses[i]->parentPid = 0;
+        }
+        SchedLockRelease(g_allProcLock, alf);
+    }
 
     // Signal the compositor to fill this process's screen region with an exit
     // status colour on its next pass. No VFB access needed — avoids races with
