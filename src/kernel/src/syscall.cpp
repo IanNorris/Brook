@@ -169,7 +169,10 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
         const char* buf = reinterpret_cast<const char*>(bufAddr);
         brook::SerialLock();
         for (uint64_t i = 0; i < count; i++)
-            brook::SerialPutChar(buf[i]);
+        {
+            if (buf[i]) // skip null bytes (binary padding in buffers)
+                brook::SerialPutChar(buf[i]);
+        }
         brook::SerialUnlock();
         return static_cast<int64_t>(count);
     }

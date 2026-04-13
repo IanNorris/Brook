@@ -298,8 +298,10 @@ void* krealloc(void* ptr, uint64_t newSize)
     if (ptr == nullptr) return kmalloc(newSize);
     if (newSize == 0) { kfree(ptr); return nullptr; }
 
+    uint64_t lf = SpinLockAcquire(&g_heapLock);
+
     BlockHeader* h = ToHeader(ptr);
-    if (!IsValidHeader(h)) return nullptr;
+    if (!IsValidHeader(h)) { SpinLockRelease(&g_heapLock, lf); return nullptr; }
 
     uint64_t aligned = (newSize + ALIGN - 1) & ~(ALIGN - 1);
     uint32_t needed  = static_cast<uint32_t>(aligned + OVERHEAD);
@@ -307,14 +309,17 @@ void* krealloc(void* ptr, uint64_t newSize)
         needed = static_cast<uint32_t>(MIN_BLOCK);
 
     // Block is already large enough.
-    if (h->size >= needed) return ptr;
+    if (h->size >= needed) { SpinLockRelease(&g_heapLock, lf); return ptr; }
+
+    // Snapshot the copy size while we still hold the lock and the block is valid.
+    uint64_t copyBytes = h->size - OVERHEAD;
+    if (copyBytes > newSize) copyBytes = newSize;
+
+    SpinLockRelease(&g_heapLock, lf);
 
     // Allocate new block, copy, free old.
     void* newPtr = kmalloc(newSize);
     if (!newPtr) return nullptr;
-
-    uint64_t copyBytes = h->size - OVERHEAD;
-    if (copyBytes > newSize) copyBytes = newSize;
 
     const uint8_t* src = reinterpret_cast<const uint8_t*>(ptr);
     uint8_t*       dst = reinterpret_cast<uint8_t*>(newPtr);
