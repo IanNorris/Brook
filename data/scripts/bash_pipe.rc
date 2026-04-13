@@ -1,0 +1,2 @@
+# Brook OS boot script — bash pipe test
+run /boot/BIN/BASH --norc --noprofile -c "echo PIPE_START; echo hello_pipe | /boot/BIN/BUSYBOX cat; echo PIPE_DONE; exit 0"

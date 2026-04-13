@@ -93,13 +93,15 @@ enum class FdType : uint8_t
     DevKeyboard,   // /dev/keyboard
     Pipe,          // pipe() read/write end
     DevNull,       // /dev/null — discard writes, EOF on read
+    SyntheticMem,  // In-memory synthetic file (e.g. /etc/passwd)
 };
 
 struct FdEntry
 {
     FdType   type;
-    uint8_t  flags;        // O_NONBLOCK, etc.
-    uint16_t _pad;
+    uint8_t  flags;        // O_NONBLOCK, pipe direction, etc.
+    uint8_t  fdFlags;      // FD-level flags: FD_CLOEXEC (bit 0)
+    uint8_t  _pad;
     uint32_t refCount;
     void*    handle;       // VFS Vnode* or device-specific state
     uint64_t seekPos;      // Current file offset (for lseek)
@@ -140,6 +142,8 @@ struct Process
 {
     uint16_t pid;
     uint16_t parentPid;          // Parent process PID (0 if no parent)
+    uint16_t pgid;               // Process group ID
+    uint16_t sid;                // Session ID
     ProcessState state;
     uint8_t  schedPriority;  // Initial scheduler priority (0=RT, 1=High, 2=Normal, 3=Low)
     int32_t  runningOnCpu;   // CPU index (-1 = not running, used for double-schedule detection)
@@ -250,6 +254,9 @@ using KernelThreadFn = void (*)(void* arg);
 // Get the current process (for syscall handlers).
 Process* ProcessCurrent();
 
+// Find a process by PID (returns nullptr if not found).
+Process* ProcessFindByPid(uint16_t pid);
+
 // Create a new process, loading an ELF binary from a memory buffer.
 // Returns null on failure.
 Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
@@ -281,6 +288,11 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
 // File descriptor operations
 int       FdAlloc(Process* proc, FdType type, void* handle);
 void      FdFree(Process* proc, int fd);
+FdEntry*  FdGet(Process* proc, int fd);
+
+// Close all file descriptors for a process (called at exit time).
+// Properly handles pipe refcounting and wakes blocked readers/writers.
+void ProcessCloseAllFds(Process* proc);
 FdEntry*  FdGet(Process* proc, int fd);
 
 } // namespace brook

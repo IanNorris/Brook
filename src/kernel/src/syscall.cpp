@@ -143,6 +143,7 @@ namespace brook {
 
 static constexpr int64_t ENOENT  = 2;
 static constexpr int64_t ESRCH   = 3;
+static constexpr int64_t EPERM   = 1;
 static constexpr int64_t EBADF   = 9;
 static constexpr int64_t ENOMEM  = 12;
 static constexpr int64_t EFAULT  = 14;
@@ -286,6 +287,25 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     // /dev/null — always EOF
     if (fde->type == FdType::DevNull)
         return 0;
+
+    // Synthetic in-memory files (/etc/passwd, /etc/group, etc.)
+    if (fde->type == FdType::SyntheticMem && fde->handle)
+    {
+        auto* content = static_cast<const char*>(fde->handle);
+        uint64_t contentLen = 0;
+        while (content[contentLen]) contentLen++;
+
+        uint64_t pos = fde->seekPos;
+        if (pos >= contentLen) return 0; // EOF
+
+        uint64_t avail = contentLen - pos;
+        uint64_t toRead = (count < avail) ? count : avail;
+        auto* dst = reinterpret_cast<char*>(bufAddr);
+        for (uint64_t i = 0; i < toRead; i++)
+            dst[i] = content[pos + i];
+        fde->seekPos += toRead;
+        return static_cast<int64_t>(toRead);
+    }
 
     if (fde->type == FdType::DevKeyboard)
     {
@@ -489,12 +509,17 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             }
 
             // EOF — no writers left and buffer empty
-            if (__atomic_load_n(&pipe->writers, __ATOMIC_ACQUIRE) == 0)
+            uint32_t wr = __atomic_load_n(&pipe->writers, __ATOMIC_ACQUIRE);
+            if (wr == 0)
                 return 0;
 
-            // Block until writer puts data
+            // Block until writer puts data or writer closes
             Process* self = ProcessCurrent();
             pipe->readerWaiter = self;
+            // Use timed wakeup to recheck writer count periodically
+            // (avoids permanent deadlock if close notification was missed)
+            extern volatile uint64_t g_lapicTickCount;
+            self->wakeupTick = g_lapicTickCount + 10; // recheck every ~10ms
             SchedulerBlock(self);
         }
     }
@@ -571,6 +596,35 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         if (fd < 0) return -EMFILE;
         return fd;
     }
+
+    // Synthetic memory files: /etc/passwd, /etc/group, /proc/self/...
+    {
+        struct SyntheticFile { const char* path; const char* content; };
+        static const SyntheticFile syntheticFiles[] = {
+            { "/etc/passwd", "root:x:0:0:root:/:/boot/BIN/BASH\n" },
+            { "/etc/group",  "root:x:0:\n" },
+            { "/etc/shells", "/boot/BIN/BASH\n" },
+            { "/etc/hostname", "brook\n" },
+            { "/etc/nsswitch.conf", "passwd: files\ngroup: files\n" },
+            { nullptr, nullptr }
+        };
+
+        for (auto* sf = syntheticFiles; sf->path; ++sf)
+        {
+            if (StrEq(lookupPath, sf->path))
+            {
+                // Store pointer to static content in handle, seekPos=0
+                int fd = FdAlloc(proc, FdType::SyntheticMem, const_cast<char*>(sf->content));
+                if (fd < 0) return -EMFILE;
+                proc->fds[fd].seekPos = 0;
+                return fd;
+            }
+        }
+    }
+
+    // /proc/self/exe → return ENOENT for now (readlink handles it)
+    if (StrEq(lookupPath, "/proc/self/exe"))
+        return -ENOENT;
 
     // Translate Linux open flags to VFS flags
     uint32_t vfsFlags = VFS_O_READ;
@@ -796,6 +850,21 @@ static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd, uint64_t,
     }
 
     return static_cast<int64_t>(newfd);
+}
+
+// sys_dup3 (292) — like dup2 with flags (O_CLOEXEC)
+static int64_t sys_dup3(uint64_t oldfd, uint64_t newfd, uint64_t flags,
+                         uint64_t, uint64_t, uint64_t)
+{
+    if (oldfd == newfd) return -EINVAL; // dup3 differs from dup2 here
+
+    int64_t ret = sys_dup2(oldfd, newfd, 0, 0, 0, 0);
+    if (ret >= 0 && (flags & 0x80000)) // O_CLOEXEC
+    {
+        Process* proc = ProcessCurrent();
+        if (proc) proc->fds[newfd].fdFlags = 1; // FD_CLOEXEC
+    }
+    return ret;
 }
 
 // ---------------------------------------------------------------------------
@@ -2374,15 +2443,50 @@ static int64_t sys_setgid(uint64_t, uint64_t, uint64_t,
                            uint64_t, uint64_t, uint64_t) { return 0; }
 
 // ---------------------------------------------------------------------------
-// Signal stubs: rt_sigaction (13), rt_sigprocmask (14)
+// Signal: rt_sigaction (13), rt_sigprocmask (14)
 // ---------------------------------------------------------------------------
 
-static int64_t sys_rt_sigaction(uint64_t, uint64_t, uint64_t,
-                                 uint64_t, uint64_t, uint64_t) { return 0; }
+struct KernelSigaction {
+    uint64_t handler;
+    uint64_t flags;
+    uint64_t restorer;
+    uint64_t mask;
+};
 
-static int64_t sys_rt_sigprocmask(uint64_t, uint64_t, uint64_t oldAddr,
+static KernelSigaction g_sigHandlers[MAX_PROCESSES][64];
+
+static int64_t sys_rt_sigaction(uint64_t signum, uint64_t actAddr, uint64_t oldactAddr,
+                                 uint64_t sigsetsize, uint64_t, uint64_t)
+{
+    if (signum < 1 || signum > 64) return -EINVAL;
+    if (sigsetsize != 8) return -EINVAL;
+
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+
+    uint32_t idx = static_cast<uint32_t>(signum) - 1;
+    uint16_t pid = proc->pid;
+    if (pid >= MAX_PROCESSES) return -EINVAL;
+
+    if (oldactAddr)
+    {
+        auto* old = reinterpret_cast<KernelSigaction*>(oldactAddr);
+        *old = g_sigHandlers[pid][idx];
+    }
+
+    if (actAddr)
+    {
+        auto* act = reinterpret_cast<const KernelSigaction*>(actAddr);
+        g_sigHandlers[pid][idx] = *act;
+    }
+
+    return 0;
+}
+
+static int64_t sys_rt_sigprocmask(uint64_t how, uint64_t setAddr, uint64_t oldAddr,
                                    uint64_t sigsetsize, uint64_t, uint64_t)
 {
+    (void)how; (void)setAddr;
     if (oldAddr && sigsetsize > 0) {
         auto* p = reinterpret_cast<uint8_t*>(oldAddr);
         for (uint64_t i = 0; i < sigsetsize; ++i) p[i] = 0;
@@ -2394,10 +2498,37 @@ static int64_t sys_rt_sigprocmask(uint64_t, uint64_t, uint64_t oldAddr,
 // sys_prlimit64 (302)
 // ---------------------------------------------------------------------------
 
-static int64_t sys_prlimit64(uint64_t, uint64_t, uint64_t,
-                               uint64_t, uint64_t, uint64_t)
+struct rlimit64 { uint64_t rlim_cur; uint64_t rlim_max; };
+static constexpr uint64_t RLIM_INFINITY = ~0ULL;
+
+static int64_t sys_prlimit64(uint64_t pid, uint64_t resource, uint64_t newlimitAddr,
+                               uint64_t oldlimitAddr, uint64_t, uint64_t)
 {
-    return -ENOSYS;
+    (void)pid; (void)newlimitAddr;
+
+    if (oldlimitAddr)
+    {
+        auto* old = reinterpret_cast<rlimit64*>(oldlimitAddr);
+        switch (resource)
+        {
+        case 7: // RLIMIT_NOFILE
+            old->rlim_cur = MAX_FDS;
+            old->rlim_max = MAX_FDS;
+            break;
+        case 0: // RLIMIT_CPU
+        case 1: // RLIMIT_FSIZE
+        case 2: // RLIMIT_DATA
+        case 3: // RLIMIT_STACK
+            old->rlim_cur = 8 * 1024 * 1024; // 8MB stack
+            old->rlim_max = RLIM_INFINITY;
+            break;
+        default:
+            old->rlim_cur = RLIM_INFINITY;
+            old->rlim_max = RLIM_INFINITY;
+            break;
+        }
+    }
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -2445,13 +2576,84 @@ static int64_t sys_getcwd(uint64_t bufAddr, uint64_t size, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
-// sys_fcntl (72) -- stub
+// sys_fcntl (72)
 // ---------------------------------------------------------------------------
 
-static int64_t sys_fcntl(uint64_t, uint64_t, uint64_t,
+static constexpr int F_DUPFD         = 0;
+static constexpr int F_GETFD         = 1;
+static constexpr int F_SETFD         = 2;
+static constexpr int F_GETFL         = 3;
+static constexpr int F_SETFL         = 4;
+static constexpr int F_DUPFD_CLOEXEC = 1030;
+
+static constexpr int FD_CLOEXEC = 1;
+
+// Linux file flags (used in fcntl F_GETFL/F_SETFL and dup3)
+[[maybe_unused]] static constexpr int O_NONBLOCK  = 0x800;
+[[maybe_unused]] static constexpr int O_CLOEXEC   = 0x80000;
+
+static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
                           uint64_t, uint64_t, uint64_t)
 {
-    return 0; // pretend success
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+    FdEntry* fde = FdGet(proc, static_cast<int>(fd));
+    if (!fde) return -EBADF;
+
+    switch (static_cast<int>(cmd))
+    {
+    case F_DUPFD:
+    case F_DUPFD_CLOEXEC:
+    {
+        // Find lowest free fd >= arg
+        int minFd = static_cast<int>(arg);
+        int newfd = -1;
+        for (int i = minFd; i < static_cast<int>(MAX_FDS); i++)
+        {
+            if (proc->fds[i].type == FdType::None)
+            {
+                newfd = i;
+                break;
+            }
+        }
+        if (newfd < 0) return -EMFILE;
+
+        proc->fds[newfd].type = fde->type;
+        proc->fds[newfd].flags = fde->flags;
+        proc->fds[newfd].fdFlags = (cmd == F_DUPFD_CLOEXEC) ? FD_CLOEXEC : 0;
+        proc->fds[newfd].handle = fde->handle;
+        proc->fds[newfd].seekPos = fde->seekPos;
+        proc->fds[newfd].refCount = 1;
+
+        // Bump pipe refcount
+        if (fde->type == FdType::Pipe && fde->handle)
+        {
+            auto* pipe = static_cast<PipeBuffer*>(fde->handle);
+            if (fde->flags & 1)
+                __atomic_fetch_add(&pipe->writers, 1, __ATOMIC_RELEASE);
+            else
+                __atomic_fetch_add(&pipe->readers, 1, __ATOMIC_RELEASE);
+        }
+        return newfd;
+    }
+    case F_GETFD:
+        return fde->fdFlags;
+    case F_SETFD:
+        fde->fdFlags = static_cast<uint8_t>(arg & FD_CLOEXEC);
+        return 0;
+    case F_GETFL:
+    {
+        int fl = 0;
+        if (fde->flags & 1) fl |= 1; // O_WRONLY for pipe write end
+        // O_NONBLOCK
+        return fl;
+    }
+    case F_SETFL:
+        // We don't really support changing flags yet, but return success
+        return 0;
+    default:
+        return 0; // Unknown command, pretend success
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2837,26 +3039,62 @@ static int64_t sys_getpgrp(uint64_t, uint64_t, uint64_t,
                             uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
-    return proc ? proc->pid : 1;
+    return proc ? proc->pgid : 1;
 }
 
-static int64_t sys_getpgid(uint64_t, uint64_t, uint64_t,
+static int64_t sys_getpgid(uint64_t pid, uint64_t, uint64_t,
+                            uint64_t, uint64_t, uint64_t)
+{
+    if (pid == 0)
+    {
+        Process* proc = ProcessCurrent();
+        return proc ? proc->pgid : 1;
+    }
+    // Look up by pid
+    Process* target = ProcessFindByPid(static_cast<uint16_t>(pid));
+    if (!target) return -ESRCH;
+    return target->pgid;
+}
+
+static int64_t sys_setpgid(uint64_t pid, uint64_t pgid, uint64_t,
                             uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
-    return proc ? proc->pid : 1;
+    if (!proc) return -ESRCH;
+
+    Process* target = (pid == 0) ? proc : ProcessFindByPid(static_cast<uint16_t>(pid));
+    if (!target) return -ESRCH;
+
+    // pgid=0 means set pgid to the target's pid
+    uint16_t newPgid = (pgid == 0) ? target->pid : static_cast<uint16_t>(pgid);
+    target->pgid = newPgid;
+    return 0;
 }
 
-static int64_t sys_setpgid(uint64_t, uint64_t, uint64_t,
-                            uint64_t, uint64_t, uint64_t)
-{
-    return 0; // pretend success
-}
-
-static int64_t sys_getsid(uint64_t, uint64_t, uint64_t,
+static int64_t sys_getsid(uint64_t pid, uint64_t, uint64_t,
                            uint64_t, uint64_t, uint64_t)
 {
-    return 1; // session 1
+    if (pid == 0)
+    {
+        Process* proc = ProcessCurrent();
+        return proc ? proc->sid : 1;
+    }
+    Process* target = ProcessFindByPid(static_cast<uint16_t>(pid));
+    if (!target) return -ESRCH;
+    return target->sid;
+}
+
+// sys_setsid (112) — create a new session
+static int64_t sys_setsid(uint64_t, uint64_t, uint64_t,
+                           uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EPERM;
+
+    // Process becomes session leader and process group leader
+    proc->sid = proc->pid;
+    proc->pgid = proc->pid;
+    return proc->pid;
 }
 
 // ---------------------------------------------------------------------------
@@ -3211,6 +3449,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_SYSINFO]         = sys_sysinfo;
     g_syscallTable[SYS_SETPGID]         = sys_setpgid;
     g_syscallTable[SYS_GETPGRP]         = sys_getpgrp;
+    g_syscallTable[SYS_SETSID]          = sys_setsid;
     g_syscallTable[SYS_GETPGID]         = sys_getpgid;
     g_syscallTable[SYS_GETSID]          = sys_getsid;
     g_syscallTable[SYS_SIGALTSTACK]     = sys_sigaltstack;
@@ -3222,6 +3461,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_READLINKAT]      = sys_readlinkat;
     g_syscallTable[SYS_PPOLL]           = sys_ppoll;
     g_syscallTable[SYS_PIPE2]           = sys_pipe2;
+    g_syscallTable[SYS_DUP3]            = sys_dup3;
 
     // Bash / POSIX compatibility
     g_syscallTable[SYS_PREAD64]         = sys_pread64;

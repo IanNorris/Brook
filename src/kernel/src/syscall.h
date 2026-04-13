@@ -79,6 +79,7 @@ static constexpr uint64_t SYS_GETRUSAGE       = 98;
 static constexpr uint64_t SYS_SYSINFO         = 99;
 static constexpr uint64_t SYS_SETPGID         = 109;
 static constexpr uint64_t SYS_GETPGRP         = 111;
+static constexpr uint64_t SYS_SETSID          = 112;
 static constexpr uint64_t SYS_GETRESUID       = 118;
 static constexpr uint64_t SYS_GETRESGID       = 120;
 static constexpr uint64_t SYS_GETPGID         = 121;
@@ -93,6 +94,7 @@ static constexpr uint64_t SYS_TKILL           = 200;
 static constexpr uint64_t SYS_SET_ROBUST_LIST = 273;
 static constexpr uint64_t SYS_TGKILL          = 234;
 static constexpr uint64_t SYS_FACCESSAT       = 269;
+static constexpr uint64_t SYS_DUP3            = 292;
 static constexpr uint64_t SYS_RSEQ            = 334;
 static constexpr uint64_t SYS_FACCESSAT2      = 439;
 

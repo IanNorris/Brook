@@ -1,0 +1,3 @@
+# Brook OS boot script — bash interactive test  
+# Run bash with minimal settings, provide commands via stdin
+run /boot/BIN/BASH --norc --noprofile -c "echo INTERACTIVE_START; echo HELLO_WORLD; x=42; echo VAL_IS_$x; echo INTERACTIVE_DONE; exit 0"

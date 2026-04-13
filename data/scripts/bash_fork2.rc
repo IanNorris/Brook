@@ -1,0 +1,2 @@
+# Brook OS boot script — bash fork+exec test 
+run /boot/BIN/BASH --norc --noprofile -c "echo FORK_START; /boot/BIN/HELLO; echo CHILD_EXIT=DONE; echo FORK_DONE; exit 0"

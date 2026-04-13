@@ -303,6 +303,8 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     proc->fxsave.data[25] = 0x1F;
 
     proc->pid = SchedulerAllocPid();
+    proc->pgid = proc->pid;
+    proc->sid = proc->pid;
     proc->state = ProcessState::Ready;
     proc->runningOnCpu = -1;
     proc->schedPriority = 2;  // SCHED_PRIORITY_NORMAL
@@ -545,6 +547,8 @@ Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
     proc->fxsave.data[25] = 0x1F;
 
     proc->pid = SchedulerAllocPid();
+    proc->pgid = proc->pid;
+    proc->sid = proc->pid;
     proc->state = ProcessState::Ready;
     proc->runningOnCpu = -1;
     proc->isKernelThread = true;
@@ -581,14 +585,10 @@ Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
     return proc;
 }
 
-void ProcessDestroy(Process* proc)
+void ProcessCloseAllFds(Process* proc)
 {
     if (!proc) return;
 
-    // NOTE: All page table teardown uses the DMAP (direct physical map) for
-    // safe access regardless of the current CR3. No CR3 switch needed.
-
-    // Close all file descriptors, releasing VFS/device resources
     for (uint32_t i = 0; i < MAX_FDS; ++i)
     {
         FdEntry& fde = proc->fds[i];
@@ -597,8 +597,50 @@ void ProcessDestroy(Process* proc)
         if (fde.type == FdType::Vnode && fde.handle)
             VfsClose(static_cast<Vnode*>(fde.handle));
 
+        // Pipe cleanup: decrement reader/writer counts and wake waiters
+        if (fde.type == FdType::Pipe && fde.handle)
+        {
+            auto* pipe = static_cast<PipeBuffer*>(fde.handle);
+            if (fde.flags & 1) // write end
+            {
+                __atomic_fetch_sub(&pipe->writers, 1, __ATOMIC_RELEASE);
+                Process* reader = pipe->readerWaiter;
+                if (reader)
+                {
+                    pipe->readerWaiter = nullptr;
+                    __atomic_store_n(&reader->pendingWakeup, 1, __ATOMIC_RELEASE);
+                    SchedulerUnblock(reader);
+                }
+            }
+            else // read end
+            {
+                __atomic_fetch_sub(&pipe->readers, 1, __ATOMIC_RELEASE);
+                Process* writer = pipe->writerWaiter;
+                if (writer)
+                {
+                    pipe->writerWaiter = nullptr;
+                    __atomic_store_n(&writer->pendingWakeup, 1, __ATOMIC_RELEASE);
+                    SchedulerUnblock(writer);
+                }
+            }
+
+            if (__atomic_load_n(&pipe->readers, __ATOMIC_ACQUIRE) == 0 &&
+                __atomic_load_n(&pipe->writers, __ATOMIC_ACQUIRE) == 0)
+            {
+                kfree(pipe);
+            }
+        }
+
         FdFree(proc, static_cast<int>(i));
     }
+}
+
+void ProcessDestroy(Process* proc)
+{
+    if (!proc) return;
+
+    // Close any remaining FDs (most should already be closed at exit time)
+    ProcessCloseAllFds(proc);
 
     // Free per-process kernel stack (includes guard page accounting)
     if (proc->kernelStackBase)
@@ -727,6 +769,8 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     // Allocate new PID
     child->pid = SchedulerAllocPid();
     child->parentPid = parent->pid;
+    child->pgid = parent->pgid;      // Inherit process group from parent
+    child->sid = parent->sid;         // Inherit session from parent
     if (child->pid == 0)
     {
         SerialPuts("FORK: PID allocation failed\n");

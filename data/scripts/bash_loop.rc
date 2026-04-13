@@ -1,0 +1,2 @@
+# Brook OS boot script — bash loop test
+run /boot/BIN/BASH --norc --noprofile -c "echo LOOP_START; for i in a b c; do echo ITEM_$i; done; echo LOOP_DONE; exit 0"

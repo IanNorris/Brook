@@ -721,6 +721,11 @@ void SchedulerYield()
     SerialPrintf("SCHED: '%s' (pid %u) exited with status %d\n",
                  proc->name, proc->pid, status);
 
+    // Close all FDs immediately so pipe readers/writers get unblocked.
+    // This must happen before marking as Terminated — the parent may be
+    // blocked on a pipe read that this process had the write end of.
+    ProcessCloseAllFds(proc);
+
     // Signal the compositor to fill this process's screen region with an exit
     // status colour on its next pass. No VFB access needed — avoids races with
     // the reaper freeing VFB pages.
@@ -928,6 +933,22 @@ void SchedulerInitApIdle(uint32_t cpuIndex)
 Process* ProcessCurrent()
 {
     return g_perCpu[ThisCpu()].currentProcess;
+}
+
+Process* ProcessFindByPid(uint16_t pid)
+{
+    uint64_t alf = SchedLockAcquire(g_allProcLock);
+    Process* result = nullptr;
+    for (uint32_t i = 0; i < g_processCount; i++)
+    {
+        if (g_allProcesses[i]->pid == pid)
+        {
+            result = g_allProcesses[i];
+            break;
+        }
+    }
+    SchedLockRelease(g_allProcLock, alf);
+    return result;
 }
 
 uint16_t SchedulerAllocPid()

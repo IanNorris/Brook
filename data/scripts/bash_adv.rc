@@ -1,0 +1,2 @@
+# Brook OS boot script — advanced bash test
+run /boot/BIN/BASH --norc --noprofile -c "echo T1_VAR; x=hello; echo ${x}_world; echo T2_ARITH; echo $((2+3)); echo T3_SUBSHELL; z=$(echo inner); echo outer_${z}; echo T4_IF; if true; then echo IF_OK; fi; echo T5_FOR; for i in a b c; do echo ITEM_$i; done; echo ALL_DONE; exit 0"
