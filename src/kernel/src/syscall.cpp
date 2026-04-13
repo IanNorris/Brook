@@ -161,11 +161,15 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
                           uint64_t, uint64_t, uint64_t)
 {
     // fd 3 = debug serial — writes directly, bypassing the async ring buffer.
+    // Hold the serial lock across the entire write so multi-CPU output
+    // doesn't interleave character-by-character.
     if (fd == 3)
     {
         const char* buf = reinterpret_cast<const char*>(bufAddr);
+        brook::SerialLock();
         for (uint64_t i = 0; i < count; i++)
             brook::SerialPutChar(buf[i]);
+        brook::SerialUnlock();
         return static_cast<int64_t>(count);
     }
 
