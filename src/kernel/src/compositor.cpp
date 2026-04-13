@@ -23,9 +23,23 @@ static uint32_t           g_physFbStride = 0; // in pixels
 static uint32_t* g_backBuffer     = nullptr;
 static uint32_t  g_backBufStride  = 0; // in pixels (matches physFb stride)
 
-// Set when any blit/cursor/exit-color modified the backbuffer this frame.
-// Only copy backbuffer → MMIO when dirty, to avoid redundant 8MB copies.
-static bool g_backBufDirty = false;
+// Dirty-region tracking: only copy scanlines that changed to MMIO.
+// At 1920×1080×4, a full flip is ~8MB of MMIO writes.  With dirty tracking
+// we typically copy only the DOOM windows + cursor region (~1-2MB).
+static uint32_t g_dirtyMinY = 0xFFFFFFFFu; // inclusive
+static uint32_t g_dirtyMaxY = 0;          // exclusive
+
+static inline void MarkDirtyRows(uint32_t minY, uint32_t maxY)
+{
+    if (minY < g_dirtyMinY) g_dirtyMinY = minY;
+    if (maxY > g_dirtyMaxY) g_dirtyMaxY = maxY;
+}
+
+static inline void MarkAllDirty()
+{
+    g_dirtyMinY = 0;
+    g_dirtyMaxY = g_physFbHeight;
+}
 
 // Registered process slots for compositing.
 static constexpr uint32_t MAX_COMPOSITED = 64;
@@ -166,7 +180,6 @@ static void BlitProcess(Process* proc, bool forceAll)
     if (!proc->fbVirtual || proc->fbVfbWidth == 0) return;
     if (!forceAll && !proc->fbDirty) return;
     proc->fbDirty = 0;
-    g_backBufDirty = true;
 
     // One-time diagnostic: log first blit for each process
     static uint32_t s_blitLogMask = 0;
@@ -203,6 +216,11 @@ static void BlitProcess(Process* proc, bool forceAll)
         endDy = g_physFbHeight - static_cast<uint32_t>(dstY0);
     if (dstX0 + static_cast<int>(endDx) > static_cast<int>(g_physFbWidth))
         endDx = g_physFbWidth - static_cast<uint32_t>(dstX0);
+
+    // Track dirty scanlines for this blit.
+    uint32_t blitMinY = static_cast<uint32_t>(dstY0) + startDy;
+    uint32_t blitMaxY = static_cast<uint32_t>(dstY0) + endDy;
+    MarkDirtyRows(blitMinY, blitMaxY);
 
     // Destination surface: backbuffer (fast cached RAM) or MMIO FB (slow).
     uint32_t*       dstBase   = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
@@ -391,7 +409,10 @@ static void CompositorLoop()
             }
             __atomic_store_n(&p->fbExitColor, 0u, __ATOMIC_RELEASE);
             g_compositedProcs[i] = nullptr;
-            g_backBufDirty = true;
+            uint32_t minY = (dstY0 >= 0) ? static_cast<uint32_t>(dstY0) : 0;
+            uint32_t maxY = static_cast<uint32_t>(dstY0) + dstH;
+            if (maxY > g_physFbHeight) maxY = g_physFbHeight;
+            MarkDirtyRows(minY, maxY);
             continue;
         }
 
@@ -414,15 +435,32 @@ static void CompositorLoop()
         MouseGetPosition(&mx, &my);
         // Only redraw if cursor moved
         if (mx != g_cursorSaveX || my != g_cursorSaveY || !g_cursorVisible)
-            g_backBufDirty = true;
+        {
+            // Dirty the old cursor region (where CursorRestore wrote).
+            if (g_cursorVisible) {
+                uint32_t oldMinY = (g_cursorSaveY >= 0) ? static_cast<uint32_t>(g_cursorSaveY) : 0;
+                uint32_t oldMaxY = static_cast<uint32_t>(g_cursorSaveY) + CURSOR_H;
+                if (oldMaxY > g_physFbHeight) oldMaxY = g_physFbHeight;
+                MarkDirtyRows(oldMinY, oldMaxY);
+            }
+            // Dirty the new cursor region.
+            uint32_t newMinY = (my >= 0) ? static_cast<uint32_t>(my) : 0;
+            uint32_t newMaxY = static_cast<uint32_t>(my) + CURSOR_H;
+            if (newMaxY > g_physFbHeight) newMaxY = g_physFbHeight;
+            MarkDirtyRows(newMinY, newMaxY);
+        }
         CursorDraw(mx, my);
     }
 
-    // Flip: copy backbuffer → MMIO framebuffer only when something changed.
-    if (g_backBuffer && g_backBufDirty)
+    // Flip: copy only dirty scanlines from backbuffer → MMIO framebuffer.
+    if (g_backBuffer && g_dirtyMinY < g_dirtyMaxY)
     {
-        g_backBufDirty = false;
-        for (uint32_t y = 0; y < g_physFbHeight; ++y)
+        uint32_t minY = g_dirtyMinY;
+        uint32_t maxY = g_dirtyMaxY;
+        if (maxY > g_physFbHeight) maxY = g_physFbHeight;
+        g_dirtyMinY = 0xFFFFFFFFu;
+        g_dirtyMaxY = 0;
+        for (uint32_t y = minY; y < maxY; ++y)
         {
             __builtin_memcpy(
                 const_cast<uint32_t*>(g_physFb + y * g_physFbStride),
@@ -478,7 +516,7 @@ void CompositorWake()
 
 void CompositorMarkDirty()
 {
-    g_backBufDirty = true;
+    MarkAllDirty();
 }
 
 void CompositorUnregisterProcess(Process* proc)
@@ -518,11 +556,18 @@ void CompositorRemap(uint64_t fbPhys, uint32_t w, uint32_t h, uint32_t stridePix
     if (bbAddr)
     {
         g_backBuffer = reinterpret_cast<uint32_t*>(bbAddr.raw());
-        __builtin_memset(g_backBuffer, 0, bbSizeBytes);
+        // Seed from MMIO to preserve current screen content.
+        for (uint32_t y = 0; y < h; ++y)
+            __builtin_memcpy(
+                g_backBuffer + y * stridePixels,
+                const_cast<uint32_t*>(reinterpret_cast<volatile uint32_t*>(pixels) + y * stridePixels),
+                w * 4);
+        TtyRedirectToBackbuffer(g_backBuffer);
     }
 
     // Update mouse cursor bounds to match new resolution.
     MouseSetBounds(w, h);
+    MarkAllDirty();
 
     SerialPrintf("COMPOSITOR: remapped to %ux%u stride=%u\n", w, h, stridePixels);
 }
