@@ -11,6 +11,7 @@
 #include <time.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <grp.h>
 
 static int g_pass = 0, g_fail = 0;
 
@@ -159,8 +160,77 @@ int main(void)
     }
     printf("\n");
 
+    // --- Groups ---
+    printf("[Groups]\n");
+    {
+        gid_t groups[16];
+        int ng = getgroups(16, groups);
+        CHECK("getgroups", ng >= 0);
+        if (ng > 0) CHECK("group[0]=0", groups[0] == 0);
+    }
+    printf("\n");
+
+    // --- Fcntl ---
+    printf("[Fcntl]\n");
+    {
+        int pfd[2];
+        pipe(pfd);
+        int fl = fcntl(pfd[0], F_GETFL);
+        CHECK("F_GETFL", fl >= 0);
+        int fd_flags = fcntl(pfd[0], F_GETFD);
+        CHECK("F_GETFD", fd_flags >= 0);
+        int r = fcntl(pfd[0], F_SETFD, FD_CLOEXEC);
+        CHECK("F_SETFD", r == 0);
+        fd_flags = fcntl(pfd[0], F_GETFD);
+        CHECK("FD_CLOEXEC set", fd_flags & FD_CLOEXEC);
+        close(pfd[0]);
+        close(pfd[1]);
+    }
+    printf("\n");
+
+    // --- Synthetic files ---
+    printf("[Synthetic Files]\n");
+    {
+        int fd = open("/etc/passwd", O_RDONLY);
+        CHECK("/etc/passwd", fd >= 0);
+        if (fd >= 0)
+        {
+            char buf[128] = {};
+            int n = read(fd, buf, sizeof(buf) - 1);
+            CHECK("passwd read", n > 0);
+            if (n > 0) CHECK("passwd:root", strstr(buf, "root") != NULL);
+            close(fd);
+        }
+    }
+    printf("\n");
+
+    // --- Process groups ---
+    printf("[Process Groups]\n");
+    {
+        CHECK("getpgrp", getpgrp() >= 0);
+        CHECK("getsid", getsid(0) >= 0);
+    }
+    printf("\n");
+
+    // --- Directory listing ---
+    printf("[Directory]\n");
+    {
+        // getdents64 via opendir/readdir requires dirent.h
+        // Just test that we can open a directory path
+        struct stat dst;
+        CHECK("stat(/boot)", stat("/boot", &dst) == 0);
+    }
+    printf("\n");
+
     // --- Summary ---
     printf("=== SYSCHECK COMPLETE: %d passed, %d failed ===\n",
            g_pass, g_fail);
+
+    // Small delay to let the async serial writer flush all output
+    {
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 }; // 100ms
+        nanosleep(&ts, NULL);
+    }
+
     return g_fail > 0 ? 1 : 0;
 }
