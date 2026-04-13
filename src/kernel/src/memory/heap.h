@@ -38,4 +38,11 @@ uint64_t HeapFreeBytes();
 // Logs details of the first corrupt block to serial.
 bool HeapCheckIntegrity();
 
+// Enable/disable poison fill on alloc/free. Enabled by default.
+// Disabling improves performance for allocation-heavy workloads.
+void HeapSetPoison(bool enable);
+
+// Dump heap statistics to serial: total blocks, free/used counts, sizes.
+void HeapDumpStats();
+
 } // namespace brook

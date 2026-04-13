@@ -570,6 +570,27 @@ static int ExecCommand(int argc, const char* const* argv)
         return 0;
     }
 
+    // Built-in: heap [check|poison on|poison off] — heap diagnostics
+    if (StrEq(cmd, "heap"))
+    {
+        if (argc >= 2 && StrEq(argv[1], "check"))
+        {
+            bool ok = HeapCheckIntegrity();
+            KPrintf("Heap integrity: %s\n", ok ? "OK" : "CORRUPT");
+        }
+        else if (argc >= 3 && StrEq(argv[1], "poison"))
+        {
+            bool on = StrEq(argv[2], "on");
+            HeapSetPoison(on);
+            KPrintf("Heap poison: %s\n", on ? "enabled" : "disabled");
+        }
+        else
+        {
+            HeapDumpStats();
+        }
+        return 0;
+    }
+
     // Built-in: modload <path> — load a kernel module
     if (StrEq(cmd, "modload") && argc >= 2)
     {

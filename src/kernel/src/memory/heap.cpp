@@ -21,6 +21,13 @@ static constexpr uint64_t EXPAND_PAGES  = 256;         // expand by 1MB at a tim
 static constexpr uint64_t HEAP_VIRT_BASE = 0xFFFFC08000000000ULL;
 static constexpr uint64_t HEAP_VIRT_MAX  = 0xFFFFC0FF00000000ULL; // 508GB max
 
+// Poison fill patterns for debugging
+static constexpr uint8_t  POISON_ALLOC  = 0xCD;  // uninitialized alloc
+static constexpr uint32_t POISON_FREE4  = 0xDFDFDFDF;  // freed memory
+
+// Global toggle — can be disabled at runtime for performance-sensitive paths.
+static volatile bool g_heapPoisonEnabled = true;
+
 // ---------------------------------------------------------------------------
 // Block layout
 //
@@ -120,6 +127,16 @@ static void WriteBlock(uint8_t* base, uint32_t size, uint32_t free)
     auto* f   = GetFooter(h);
     f->size   = size;
     f->magic  = FOOTER_MAGIC;
+
+    // Poison free blocks so the write-after-free check in kmalloc works
+    // for all free blocks (initial, split remainders, and kfree'd).
+    if (free && g_heapPoisonEnabled && size > OVERHEAD)
+    {
+        uint32_t* p32 = reinterpret_cast<uint32_t*>(base + HEADER_SIZE);
+        uint64_t count32 = (size - OVERHEAD) / 4;
+        for (uint64_t i = 0; i < count32; i++)
+            p32[i] = POISON_FREE4;
+    }
 }
 
 // Map physical pages into the heap's dedicated virtual region.
@@ -232,6 +249,28 @@ void* kmalloc(uint64_t size)
 
             if (cur->free && cur->size >= needed)
             {
+                // Verify free-poison is intact — detect write-after-free.
+                if (g_heapPoisonEnabled)
+                {
+                    const uint32_t* p32 = reinterpret_cast<const uint32_t*>(
+                        reinterpret_cast<uint8_t*>(cur) + HEADER_SIZE);
+                    uint64_t check = (cur->size - OVERHEAD) / 4;
+                    if (check > 16) check = 16; // spot-check first 64 bytes
+                    for (uint64_t i = 0; i < check; i++)
+                    {
+                        if (p32[i] != POISON_FREE4)
+                        {
+                            SerialPrintf("HEAP: write-after-free detected! "
+                                         "block at 0x%lx size=%u, offset %lu: "
+                                         "expected 0x%x got 0x%x\n",
+                                         reinterpret_cast<uint64_t>(cur),
+                                         cur->size,
+                                         (unsigned long)(i * 4), POISON_FREE4, p32[i]);
+                            break;
+                        }
+                    }
+                }
+
                 uint32_t allocSize = cur->size; // consume entire free block
                 if (cur->size >= needed + static_cast<uint32_t>(MIN_BLOCK))
                 {
@@ -244,8 +283,19 @@ void* kmalloc(uint64_t size)
 
                 WriteBlock(reinterpret_cast<uint8_t*>(cur), allocSize, 0);
                 g_freeBytes -= allocSize;
+                void* result = UserPtr(cur);
+
+                // Poison freshly allocated memory to catch use-of-uninitialized.
+                if (g_heapPoisonEnabled)
+                {
+                    uint64_t userBytes = allocSize - OVERHEAD;
+                    uint8_t* dst = reinterpret_cast<uint8_t*>(result);
+                    for (uint64_t i = 0; i < userBytes; i++)
+                        dst[i] = POISON_ALLOC;
+                }
+
                 SpinLockRelease(&g_heapLock, lf);
-                return UserPtr(cur);
+                return result;
             }
 
             cur = NextBlock(cur);
@@ -269,16 +319,19 @@ void kfree(void* ptr)
     if (!IsValidHeader(h)) { SpinLockRelease(&g_heapLock, lf); return; }
     if (h->free) { SpinLockRelease(&g_heapLock, lf); return; }
 
-    h->free = 1;
     g_freeBytes += h->size;
 
     // Coalesce with next block if free.
     BlockHeader* next = NextBlock(h);
+    uint32_t totalSize = h->size;
     if (reinterpret_cast<uint8_t*>(next) < g_heapEnd && IsValidHeader(next) && next->free)
     {
-        g_freeBytes -= OVERHEAD; // the header+footer we're absorbing
-        WriteBlock(reinterpret_cast<uint8_t*>(h), h->size + next->size, 1);
+        g_freeBytes -= OVERHEAD;
+        totalSize += next->size;
     }
+
+    // WriteBlock marks free=1 and poisons user data in one pass.
+    WriteBlock(reinterpret_cast<uint8_t*>(h), totalSize, 1);
 
     // Coalesce with previous block if free (and we're not at the heap start).
     if (reinterpret_cast<uint8_t*>(h) > g_heapStart)
@@ -374,6 +427,57 @@ bool HeapCheckIntegrity()
     }
 
     return true;
+}
+
+void HeapSetPoison(bool enable)
+{
+    g_heapPoisonEnabled = enable;
+}
+
+void HeapDumpStats()
+{
+    if (!g_heapStart) { SerialPuts("Heap: not initialised\n"); return; }
+
+    uint64_t lf = SpinLockAcquire(&g_heapLock);
+
+    uint32_t totalBlocks = 0, freeBlocks = 0, usedBlocks = 0;
+    uint64_t freeBytes = 0, usedBytes = 0;
+    uint32_t largestFree = 0;
+
+    BlockHeader* cur = reinterpret_cast<BlockHeader*>(g_heapStart);
+    while (reinterpret_cast<uint8_t*>(cur) < g_heapEnd && IsValidHeader(cur))
+    {
+        totalBlocks++;
+        if (cur->free)
+        {
+            freeBlocks++;
+            freeBytes += cur->size - OVERHEAD;
+            if (cur->size > largestFree) largestFree = cur->size;
+        }
+        else
+        {
+            usedBlocks++;
+            usedBytes += cur->size - OVERHEAD;
+        }
+        cur = NextBlock(cur);
+    }
+
+    uint64_t heapSize = static_cast<uint64_t>(g_heapEnd - g_heapStart);
+
+    SpinLockRelease(&g_heapLock, lf);
+
+    SerialPrintf("=== HEAP STATS ===\n");
+    SerialPrintf("  Region: 0x%lx - 0x%lx (%lu KB)\n",
+                 reinterpret_cast<uint64_t>(g_heapStart),
+                 reinterpret_cast<uint64_t>(g_heapEnd),
+                 (unsigned long)(heapSize / 1024));
+    SerialPrintf("  Blocks: %u total (%u used, %u free)\n",
+                 totalBlocks, usedBlocks, freeBlocks);
+    SerialPrintf("  Used:   %lu bytes\n", (unsigned long)usedBytes);
+    SerialPrintf("  Free:   %lu bytes (largest block: %u)\n",
+                 (unsigned long)freeBytes, largestFree);
+    SerialPrintf("  Poison: %s\n", g_heapPoisonEnabled ? "enabled" : "disabled");
+    SerialPrintf("==================\n");
 }
 
 } // namespace brook
