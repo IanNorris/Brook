@@ -404,6 +404,19 @@ void CompositorWake()
         SchedulerUnblock(p);
 }
 
+void CompositorUnregisterProcess(Process* proc)
+{
+    if (!proc) return;
+    for (uint32_t i = 0; i < g_compositedCount; ++i)
+    {
+        if (g_compositedProcs[i] == proc)
+        {
+            g_compositedProcs[i] = nullptr;
+            break;
+        }
+    }
+}
+
 void CompositorRemap(uint64_t fbPhys, uint32_t w, uint32_t h, uint32_t stridePixels)
 {
     // The TTY has already mapped the new framebuffer. Get its virtual pointer.

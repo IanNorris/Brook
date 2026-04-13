@@ -34,6 +34,9 @@ void CompositorHalt();
 // Wake the compositor thread immediately (e.g. when a process signals a dirty frame).
 void CompositorWake();
 
+// Unregister a process from the compositor (called before the Process is freed).
+void CompositorUnregisterProcess(Process* proc);
+
 // Hot-swap the physical framebuffer (called by display driver on mode change).
 // Must be called AFTER TtyRemap (uses TtyGetFramebuffer to get the new mapping).
 // stridePixels is the row stride in pixels (not bytes).

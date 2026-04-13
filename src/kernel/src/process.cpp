@@ -11,6 +11,7 @@
 #include "memory/heap.h"
 #include "serial.h"
 #include "kprintf.h"
+#include "compositor.h"
 #include "string.h"
 
 namespace brook {
@@ -505,6 +506,9 @@ void ProcessDestroy(Process* proc)
     // Remove from scheduler tracking
     SchedulerRemoveProcess(proc);
 
+    // Remove from compositor before freeing the struct
+    CompositorUnregisterProcess(proc);
+
     kfree(proc);
 }
 
@@ -738,9 +742,15 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
 {
     if (!proc || proc->isKernelThread) return 0;
 
+    // Save the old page table and switch CR3 to the kernel's page table
+    // BEFORE destroying the old one. This avoids a use-after-free: the
+    // CPU's CR3 would point to a freed PML4 page otherwise.
+    PageTable oldPt = proc->pageTable;
+    PageTable kernelPt = VmmKernelCR3();
+    __asm__ volatile("mov %0, %%cr3" : : "r"(kernelPt.pml4.raw()) : "memory");
+
     // 1. Free all user-space pages and destroy old page table.
-    // Only free User-tagged pages — keep kernel stack (KernelData tag) intact.
-    VmmDestroyUserPageTable(proc->pageTable);
+    VmmDestroyUserPageTable(oldPt);
     PmmFreeByTag(proc->pid, MemTag::User);
 
     // 2. Create fresh page table
