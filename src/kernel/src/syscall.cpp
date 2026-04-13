@@ -1334,7 +1334,11 @@ static int64_t sys_wait4(uint64_t pidArg, uint64_t statusAddr, uint64_t options,
         if (options & WNOHANG)
             return 0;
 
-        // Block until a child exits and wakes us
+        // Block until a child exits and wakes us. Use a short timed
+        // wakeup because the child may already be Terminated but not yet
+        // reapable (DrainPostSwitch hasn't run to set the flag).
+        extern volatile uint64_t g_lapicTickCount;
+        parent->wakeupTick = g_lapicTickCount + 5;
         SchedulerBlock(parent);
     }
 }
@@ -2368,11 +2372,52 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
         ready++;
     }
 
-    // If nothing ready and timeout > 0, yield once and re-check
+    // If nothing ready and timeout != 0, block and retry
     if (ready == 0 && timeout_ms != 0)
     {
-        SchedulerYield();
-        // Re-scan after yield (simple single-retry, not full blocking)
+        // Register as waiter for input events (covers keyboard/pipe wakeups)
+        Process* self = ProcessCurrent();
+
+        // For pipe FDs, register as waiter on the pipe
+        for (uint64_t i = 0; i < nfds && i < 16; i++)
+        {
+            if (fds[i].fd < 0) continue;
+            FdEntry* fde = FdGet(proc, fds[i].fd);
+            if (!fde) continue;
+            if (fde->type == FdType::Pipe && fde->handle && (fds[i].events & POLLIN))
+            {
+                auto* pb = static_cast<PipeBuffer*>(fde->handle);
+                if (!(fde->flags & 1)) // read end
+                    pb->readerWaiter = self;
+            }
+            if (fde->type == FdType::DevKeyboard && (fds[i].events & POLLIN))
+                InputAddWaiter(self);
+        }
+
+        // Set timed wakeup if timeout > 0
+        if (timeout_ms > 0 && timeout_ms != static_cast<uint64_t>(-1))
+        {
+            extern volatile uint64_t g_lapicTickCount;
+            self->wakeupTick = g_lapicTickCount + timeout_ms;
+        }
+        SchedulerBlock(self);
+
+        // Clean up waiters
+        InputRemoveWaiter(self);
+        for (uint64_t i = 0; i < nfds && i < 16; i++)
+        {
+            if (fds[i].fd < 0) continue;
+            FdEntry* fde = FdGet(proc, fds[i].fd);
+            if (!fde) continue;
+            if (fde->type == FdType::Pipe && fde->handle && (fds[i].events & POLLIN))
+            {
+                auto* pb = static_cast<PipeBuffer*>(fde->handle);
+                if (!(fde->flags & 1) && pb->readerWaiter == self)
+                    pb->readerWaiter = nullptr;
+            }
+        }
+
+        // Re-scan after wake
         for (uint64_t i = 0; i < nfds; i++)
         {
             fds[i].revents = 0;
