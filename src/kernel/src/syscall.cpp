@@ -53,7 +53,7 @@ extern "C" __attribute__((naked, used)) void BrookSyscallDispatcher()
         "push %%r15\n\t"               // [15]
         "push %%rbx\n\t"               // [16] — 16 pushes = 128 bytes, aligned
         "mov %%r10, %%rcx\n\t"
-        "cmp $400, %%rax\n\t"
+        "cmp $512, %%rax\n\t"
         "jae .Lsyscall_invalid\n\t"
         "movq %%rax, %%gs:120\n\t"       // save syscall number for debug
         "mov %%gs:16, %%r12\n\t"
@@ -153,6 +153,7 @@ static constexpr int64_t EMFILE  = 24;
 static constexpr int64_t EPIPE   = 32;
 static constexpr int64_t ERANGE  = 34;
 static constexpr int64_t ENOSYS  = 38;
+static constexpr int64_t EAGAIN  = 11;
 
 // ---------------------------------------------------------------------------
 // sys_write (1)
@@ -867,7 +868,28 @@ static int64_t sys_brk(uint64_t newBreak, uint64_t, uint64_t,
 // sys_mmap (9)
 // ---------------------------------------------------------------------------
 
-static constexpr uint64_t MAP_ANONYMOUS = 0x20;
+enum MmapFlags : uint64_t {
+    MAP_SHARED    = 0x01,
+    MAP_PRIVATE   = 0x02,
+    MAP_FIXED     = 0x10,
+    MAP_ANONYMOUS = 0x20,
+    MAP_DENYWRITE = 0x0800,
+};
+
+enum MmapProt : uint64_t {
+    PROT_READ     = 0x1,
+    PROT_WRITE    = 0x2,
+    PROT_EXEC     = 0x4,
+};
+
+// Convert prot flags to VMM page flags.
+static uint64_t ProtToVmmFlags(uint64_t prot)
+{
+    uint64_t f = VMM_USER;
+    if (prot & PROT_WRITE) f |= VMM_WRITABLE;
+    if (!(prot & PROT_EXEC)) f |= VMM_NO_EXEC;
+    return f;
+}
 
 static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                          uint64_t flags, uint64_t fd, uint64_t offset)
@@ -878,35 +900,64 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     if (!proc) return -ENOMEM;
 
     uint64_t pages = (length + 4095) / 4096;
+    uint64_t vmmFlags = ProtToVmmFlags(prot);
 
-    // Helper: allocate user-space virtual pages backed by physical memory.
-    auto allocUserPages = [&](MemTag tag) -> uint64_t {
-        uint64_t vaddr = proc->mmapNext;
-        if (vaddr + pages * 4096 > USER_MMAP_END) return 0;
-        proc->mmapNext = vaddr + pages * 4096;
+    // Determine virtual address.
+    auto pickAddr = [&]() -> uint64_t {
+        if (flags & MAP_FIXED) {
+            if (addr == 0) return 0; // Fail
+            // Unmap any existing pages in the range.
+            for (uint64_t i = 0; i < pages; i++) {
+                VirtualAddress va(addr + i * 4096);
+                PhysicalAddress existing = VmmVirtToPhys(proc->pageTable, va);
+                if (existing) {
+                    VmmUnmapPage(proc->pageTable, va);
+                    PmmFreePage(existing);
+                }
+            }
+            return addr;
+        }
+        // Non-fixed: use addr as hint if valid, otherwise allocate.
+        uint64_t base = proc->mmapNext;
+        if (addr >= USER_MMAP_BASE && addr + pages * 4096 <= USER_MMAP_END) {
+            // Check if hint range is free.
+            bool free = true;
+            for (uint64_t i = 0; i < pages && free; i++)
+                if (VmmVirtToPhys(proc->pageTable, VirtualAddress(addr + i * 4096)))
+                    free = false;
+            if (free) base = addr;
+        }
+        if (base + pages * 4096 > USER_MMAP_END) return 0;
+        if (base >= proc->mmapNext)
+            proc->mmapNext = base + pages * 4096;
+        return base;
+    };
 
-        for (uint64_t i = 0; i < pages; i++)
-        {
+    // Helper: allocate pages at a specific address.
+    auto allocAt = [&](uint64_t vaddr, MemTag tag) -> bool {
+        for (uint64_t i = 0; i < pages; i++) {
             PhysicalAddress phys = PmmAllocPage(tag, proc->pid);
-            if (!phys) return 0;
+            if (!phys) return false;
             if (!VmmMapPage(proc->pageTable, VirtualAddress(vaddr + i * 4096), phys,
-                            VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
-                            tag, proc->pid))
-            {
+                            vmmFlags, tag, proc->pid)) {
                 PmmFreePage(phys);
-                return 0;
+                return false;
             }
         }
-        return vaddr;
+        return true;
     };
 
     if (flags & MAP_ANONYMOUS)
     {
-        uint64_t vaddr = allocUserPages(MemTag::User);
+        uint64_t vaddr = pickAddr();
         if (!vaddr) return -ENOMEM;
+        if (!allocAt(vaddr, MemTag::User)) return -ENOMEM;
 
-        auto* p = reinterpret_cast<uint8_t*>(vaddr);
-        for (uint64_t b = 0; b < pages * 4096; ++b) p[b] = 0;
+        // Zero the pages (only if writable).
+        if (prot & PROT_WRITE) {
+            auto* p = reinterpret_cast<uint8_t*>(vaddr);
+            for (uint64_t b = 0; b < pages * 4096; ++b) p[b] = 0;
+        }
 
         return static_cast<int64_t>(vaddr);
     }
@@ -931,13 +982,9 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         uint64_t fbPages = (fbSize + 4095) / 4096;
         if (pages > fbPages) pages = fbPages;
 
-        // Reserve user virtual address range
-        uint64_t vaddr = proc->mmapNext;
-        if (vaddr + pages * 4096 > USER_MMAP_END) return -ENOMEM;
-        proc->mmapNext = vaddr + pages * 4096;
+        uint64_t vaddr = pickAddr();
+        if (!vaddr) return -ENOMEM;
 
-        // Map pages — if using a virtual FB, resolve each page's physical
-        // address individually (VmmAllocPages may not be contiguous).
         for (uint64_t i = 0; i < pages; ++i)
         {
             PhysicalAddress pagePhys;
@@ -973,8 +1020,9 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     if (fde->type != FdType::Vnode || !fde->handle)
         return -EBADF;
 
-    uint64_t vaddr = allocUserPages(MemTag::User);
+    uint64_t vaddr = pickAddr();
     if (!vaddr) return -ENOMEM;
+    if (!allocAt(vaddr, MemTag::User)) return -ENOMEM;
 
     // Zero then read file data
     auto* p = reinterpret_cast<uint8_t*>(vaddr);
@@ -982,7 +1030,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 
     auto* vn = static_cast<Vnode*>(fde->handle);
     uint64_t readOff = offset;
-    VfsRead(vn, reinterpret_cast<void*>(vaddr), static_cast<uint32_t>(length), &readOff);
+    VfsRead(vn, reinterpret_cast<void*>(vaddr), length, &readOff);
 
     return static_cast<int64_t>(vaddr);
 }
@@ -2837,6 +2885,158 @@ static int64_t sys_not_implemented(uint64_t, uint64_t, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
+// sys_getresuid (118) / sys_getresgid (120)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_getresuid(uint64_t ruidAddr, uint64_t euidAddr, uint64_t suidAddr,
+                              uint64_t, uint64_t, uint64_t)
+{
+    if (ruidAddr) *reinterpret_cast<uint32_t*>(ruidAddr) = 0;
+    if (euidAddr) *reinterpret_cast<uint32_t*>(euidAddr) = 0;
+    if (suidAddr) *reinterpret_cast<uint32_t*>(suidAddr) = 0;
+    return 0;
+}
+
+static int64_t sys_getresgid(uint64_t rgidAddr, uint64_t egidAddr, uint64_t sgidAddr,
+                              uint64_t, uint64_t, uint64_t)
+{
+    if (rgidAddr) *reinterpret_cast<uint32_t*>(rgidAddr) = 0;
+    if (egidAddr) *reinterpret_cast<uint32_t*>(egidAddr) = 0;
+    if (sgidAddr) *reinterpret_cast<uint32_t*>(sgidAddr) = 0;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// sys_pread64 (17) — read at offset without changing file position
+// ---------------------------------------------------------------------------
+
+static int64_t sys_pread64(uint64_t fd, uint64_t bufAddr, uint64_t count,
+                            uint64_t offset, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+    FdEntry* fde = FdGet(proc, static_cast<int>(fd));
+    if (!fde) return -EBADF;
+
+    if (fde->type == FdType::Vnode && fde->handle)
+    {
+        auto* vn = static_cast<Vnode*>(fde->handle);
+        uint64_t pos = offset;
+        return VfsRead(vn, reinterpret_cast<void*>(bufAddr),
+                       count, &pos);
+    }
+
+    return -EBADF;
+}
+
+// ---------------------------------------------------------------------------
+// sys_prctl (157) — process control
+// ---------------------------------------------------------------------------
+
+static int64_t sys_prctl(uint64_t option, uint64_t, uint64_t,
+                          uint64_t, uint64_t, uint64_t)
+{
+    (void)option;
+    // Most prctl options are not relevant for Brook.
+    // Return success for harmless ones, EINVAL for unknown.
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// sys_faccessat (269) / sys_faccessat2 (439)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_faccessat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
+                              uint64_t, uint64_t, uint64_t)
+{
+    (void)dirfd; (void)mode;
+    const char* path = reinterpret_cast<const char*>(pathAddr);
+    if (!path) return -EFAULT;
+
+    // Resolve relative paths
+    char resolved[256];
+    const char* lookup = path;
+    if (path[0] != '/') {
+        Process* proc = ProcessCurrent();
+        uint32_t ci = 0;
+        if (proc && proc->cwd[0]) {
+            for (uint32_t j = 0; proc->cwd[j] && ci < 250; ++j)
+                resolved[ci++] = proc->cwd[j];
+            if (ci > 0 && resolved[ci - 1] != '/')
+                resolved[ci++] = '/';
+        }
+        for (uint32_t j = 0; path[j] && ci < 254; ++j)
+            resolved[ci++] = path[j];
+        resolved[ci] = '\0';
+        lookup = resolved;
+    }
+
+    Vnode* vn = VfsOpen(lookup, 0);
+    if (!vn) return -ENOENT;
+    VfsClose(vn);
+    return 0;
+}
+
+static int64_t sys_faccessat2(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
+                               uint64_t flags, uint64_t, uint64_t)
+{
+    (void)flags;
+    return sys_faccessat(dirfd, pathAddr, mode, 0, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// sys_set_robust_list (273) — robust futex list (stub)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_set_robust_list(uint64_t, uint64_t, uint64_t,
+                                    uint64_t, uint64_t, uint64_t)
+{
+    return 0; // Success stub — no futex support yet
+}
+
+// ---------------------------------------------------------------------------
+// sys_rseq (334) — restartable sequences (stub)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_rseq(uint64_t, uint64_t, uint64_t,
+                         uint64_t, uint64_t, uint64_t)
+{
+    return -ENOSYS; // Not supported — musl handles this gracefully
+}
+
+// ---------------------------------------------------------------------------
+// sys_futex (202) — fast userspace mutex (minimal stub)
+// ---------------------------------------------------------------------------
+
+static constexpr int FUTEX_WAIT         = 0;
+static constexpr int FUTEX_WAKE         = 1;
+static constexpr int FUTEX_PRIVATE_FLAG = 128;
+
+static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
+                          uint64_t, uint64_t, uint64_t)
+{
+    int op = static_cast<int>(opVal) & ~FUTEX_PRIVATE_FLAG;
+
+    if (op == FUTEX_WAKE) {
+        // Wake up to `val` waiters — since we have no wait queue, return 0
+        (void)val;
+        return 0;
+    }
+
+    if (op == FUTEX_WAIT) {
+        // Check if *uaddr == val; if not, return EAGAIN
+        auto* uaddr = reinterpret_cast<volatile uint32_t*>(uaddrVal);
+        if (__atomic_load_n(uaddr, __ATOMIC_ACQUIRE) != static_cast<uint32_t>(val))
+            return -EAGAIN;
+        // For now, just yield and return — proper blocking requires a wait queue
+        SchedulerYield();
+        return -EAGAIN;
+    }
+
+    return -ENOSYS;
+}
+
+// ---------------------------------------------------------------------------
 // Syscall table
 // ---------------------------------------------------------------------------
 
@@ -2925,6 +3125,17 @@ void SyscallTableInit()
     g_syscallTable[SYS_READLINKAT]      = sys_readlinkat;
     g_syscallTable[SYS_PPOLL]           = sys_ppoll;
     g_syscallTable[SYS_PIPE2]           = sys_pipe2;
+
+    // Bash / POSIX compatibility
+    g_syscallTable[SYS_PREAD64]         = sys_pread64;
+    g_syscallTable[SYS_GETRESUID]       = sys_getresuid;
+    g_syscallTable[SYS_GETRESGID]       = sys_getresgid;
+    g_syscallTable[SYS_PRCTL]           = sys_prctl;
+    g_syscallTable[SYS_FUTEX]           = sys_futex;
+    g_syscallTable[SYS_SET_ROBUST_LIST] = sys_set_robust_list;
+    g_syscallTable[SYS_FACCESSAT]       = sys_faccessat;
+    g_syscallTable[SYS_RSEQ]            = sys_rseq;
+    g_syscallTable[SYS_FACCESSAT2]      = sys_faccessat2;
 
     uint32_t count = 0;
     for (uint64_t i = 0; i < SYSCALL_MAX; ++i)

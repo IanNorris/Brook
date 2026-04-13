@@ -1,0 +1,2 @@
+# Brook OS boot script — bash test
+run /boot/BIN/BASH --norc --noprofile -c "echo BASH_OK; exit 0"

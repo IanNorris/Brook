@@ -5,7 +5,7 @@
 namespace brook {
 
 // Maximum number of syscalls. Must match the dispatcher bounds check.
-static constexpr uint64_t SYSCALL_MAX = 400;
+static constexpr uint64_t SYSCALL_MAX = 512;
 
 // Syscall numbers (Linux x86-64 ABI)
 static constexpr uint64_t SYS_READ            = 0;
@@ -79,14 +79,22 @@ static constexpr uint64_t SYS_GETRUSAGE       = 98;
 static constexpr uint64_t SYS_SYSINFO         = 99;
 static constexpr uint64_t SYS_SETPGID         = 109;
 static constexpr uint64_t SYS_GETPGRP         = 111;
+static constexpr uint64_t SYS_GETRESUID       = 118;
+static constexpr uint64_t SYS_GETRESGID       = 120;
 static constexpr uint64_t SYS_GETPGID         = 121;
 static constexpr uint64_t SYS_GETSID          = 124;
 static constexpr uint64_t SYS_SIGALTSTACK     = 131;
 static constexpr uint64_t SYS_STATFS          = 137;
 static constexpr uint64_t SYS_FSTATFS         = 138;
+static constexpr uint64_t SYS_PRCTL           = 157;
 static constexpr uint64_t SYS_GETTID          = 186;
+static constexpr uint64_t SYS_FUTEX           = 202;
 static constexpr uint64_t SYS_TKILL           = 200;
+static constexpr uint64_t SYS_SET_ROBUST_LIST = 273;
 static constexpr uint64_t SYS_TGKILL          = 234;
+static constexpr uint64_t SYS_FACCESSAT       = 269;
+static constexpr uint64_t SYS_RSEQ            = 334;
+static constexpr uint64_t SYS_FACCESSAT2      = 439;
 
 // Syscall function type -- same signature as Linux: returns int64_t,
 // up to 6 arguments via rdi, rsi, rdx, r10->rcx, r8, r9.
