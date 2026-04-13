@@ -49,7 +49,7 @@ bool ApicInit(uint64_t localApicPhysical);
 
 // Send End-of-Interrupt to the LAPIC.  Must be called at the end of every
 // LAPIC-sourced interrupt handler.
-void ApicSendEoi();
+extern "C" void ApicSendEoi();
 
 // Read the LAPIC ID of the current CPU.
 uint8_t ApicGetId();
@@ -72,7 +72,7 @@ bool IoApicInit(uint64_t ioApicPhysical, uint32_t gsiBase);
 // Program an I/O APIC redirection table entry to deliver irq at vector,
 // edge-triggered, active-high, to the BSP (LAPIC ID from ApicGetId()).
 // irq is the ISA IRQ number (0-based from GSI base).
-void IoApicUnmaskIrq(uint8_t irq, uint8_t vector);
+extern "C" void IoApicUnmaskIrq(uint8_t irq, uint8_t vector);
 
 // Mask (disable) an I/O APIC IRQ line.
 void IoApicMaskIrq(uint8_t irq);

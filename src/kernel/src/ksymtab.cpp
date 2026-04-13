@@ -27,6 +27,8 @@ extern "C" brook::KernelSymbol __stop_ksymtab[];
 #include "tty.h"
 #include "compositor.h"
 #include "mouse.h"
+#include "idt.h"
+#include "apic.h"
 
 // Bring all brook:: names into scope so EXPORT_SYMBOL(fn) resolves correctly.
 using namespace brook;
@@ -50,6 +52,11 @@ EXPORT_SYMBOL(PmmFreePage);
 EXPORT_SYMBOL(VmmAllocPages);
 EXPORT_SYMBOL(VmmFreePages);
 EXPORT_SYMBOL(VmmVirtToPhys);
+// Also export with mangled names for C++ modules that include the header.
+EXPORT_SYMBOL_NAMED(VmmAllocPages, "_ZN5brook13VmmAllocPagesEmmNS_6MemTagEt");
+EXPORT_SYMBOL_NAMED(VmmVirtToPhys, "_ZN5brook13VmmVirtToPhysENS_9PageTableENS_14VirtualAddressE");
+EXPORT_SYMBOL_NAMED(VmmFreePages,  "_ZN5brook12VmmFreePagesENS_14VirtualAddressEm");
+EXPORT_SYMBOL_NAMED(VmmMapPage,    "_ZN5brook10VmmMapPageENS_9PageTableENS_14VirtualAddressENS_15PhysicalAddressEmNS_6MemTagEt");
 
 // Device registry
 EXPORT_SYMBOL(DeviceRegister);
@@ -75,6 +82,9 @@ EXPORT_SYMBOL(PciFindNextDevice);
 EXPORT_SYMBOL(PciEnumerate);
 EXPORT_SYMBOL(PciEnableBusMaster);
 EXPORT_SYMBOL(PciEnableMemSpace);
+EXPORT_SYMBOL(PciConfigRead32);
+EXPORT_SYMBOL(PciConfigRead16);
+EXPORT_SYMBOL(PciConfigRead8);
 
 // Display
 EXPORT_SYMBOL(DisplayRegister);
@@ -86,6 +96,8 @@ EXPORT_SYMBOL(TtyRemap);
 
 // Compositor
 EXPORT_SYMBOL(CompositorRemap);
+EXPORT_SYMBOL(CompositorGetPhysDims);
+EXPORT_SYMBOL(CompositorWake);
 
 // Mouse
 EXPORT_SYMBOL(MouseInit);
@@ -93,6 +105,9 @@ EXPORT_SYMBOL(MouseIsAvailable);
 EXPORT_SYMBOL(MouseGetPosition);
 EXPORT_SYMBOL(MouseSetBounds);
 EXPORT_SYMBOL(MouseGetButtons);
+EXPORT_SYMBOL(MouseSetPosition);
+EXPORT_SYMBOL(MouseSetButtons);
+EXPORT_SYMBOL(MouseSetAvailable);
 
 // virtio-blk
 EXPORT_SYMBOL(VirtioBlkInitAll);
@@ -109,12 +124,18 @@ EXPORT_SYMBOL(InputRegister);
 EXPORT_SYMBOL(InputPollEvent);
 EXPORT_SYMBOL(InputWaitEvent);
 EXPORT_SYMBOL(InputHasEvents);
+EXPORT_SYMBOL(InputWakeWaiters);
 
 // Scheduler — for dynamic policy modules
 EXPORT_SYMBOL(SchedulerRegisterPolicy);
 
 // Panic
 EXPORT_SYMBOL(KernelPanic);
+
+// IDT / APIC — for driver IRQ setup
+EXPORT_SYMBOL(IdtInstallHandler);
+EXPORT_SYMBOL(IoApicUnmaskIrq);
+EXPORT_SYMBOL(ApicSendEoi);
 
 namespace brook {
 

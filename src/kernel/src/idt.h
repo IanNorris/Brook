@@ -31,4 +31,4 @@ void IdtInit(brook::Framebuffer* fb);
 // Install a handler for any vector 0-255.  Safe to call after IdtInit().
 // handler must be a function with C linkage and standard interrupt ABI
 // (__attribute__((interrupt)) or raw ISR that saves all registers).
-void IdtInstallHandler(uint8_t vector, void* handler);
+extern "C" void IdtInstallHandler(uint8_t vector, void* handler);

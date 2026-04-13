@@ -11,7 +11,7 @@ struct Process;
 void CompositorInit();
 
 // Get physical framebuffer dimensions.
-void CompositorGetPhysDims(uint32_t* w, uint32_t* h);
+extern "C" void CompositorGetPhysDims(uint32_t* w, uint32_t* h);
 
 // Get physical framebuffer pointer and stride (for kernel threads that
 // need direct FB access, e.g. clock overlay).
@@ -32,7 +32,7 @@ void CompositorStartThread();
 void CompositorHalt();
 
 // Wake the compositor thread immediately (e.g. when a process signals a dirty frame).
-void CompositorWake();
+extern "C" void CompositorWake();
 
 // Mark the backbuffer as dirty so the next compositor loop copies it to MMIO.
 // Called by the TTY after rendering text into the backbuffer.

@@ -194,6 +194,7 @@ qemu-system-x86_64 \
     -drive if=pflash,format=raw,file="${OVMF_VARS_COPY}" \
     -drive format=raw,file=fat:rw:"${BUILD_DIR}/esp" \
     -drive if=virtio,format=raw,file="${DISK_IMG}",file.locking=off \
+    -device virtio-tablet-pci \
     ${SERIAL_OPT} \
     ${DISPLAY_OPT} \
     -monitor unix:/tmp/qemu_monitor.sock,server,nowait \

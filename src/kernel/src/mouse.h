@@ -37,4 +37,13 @@ extern "C" void MouseSetBounds(uint32_t maxX, uint32_t maxY);
 // Get current button state bitmask.
 extern "C" uint8_t MouseGetButtons();
 
+// Set cursor position directly (used by absolute-positioning devices like virtio-tablet).
+extern "C" void MouseSetPosition(int32_t x, int32_t y);
+
+// Set button state directly (used by absolute-positioning devices).
+extern "C" void MouseSetButtons(uint8_t buttons);
+
+// Mark the mouse subsystem as available (called by non-PS/2 mouse drivers).
+extern "C" void MouseSetAvailable(bool available);
+
 } // namespace brook

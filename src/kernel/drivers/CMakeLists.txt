@@ -21,3 +21,8 @@ add_driver_module(bochs_display
 add_driver_module(ps2_mouse
     "${BROOK_ROOT}/src/drivers/ps2_mouse/mouse_mod.cpp"
 )
+
+add_driver_module(virtio_input
+    "${BROOK_ROOT}/src/drivers/virtio_input/virtio_input_mod.cpp"
+    EXTRA_FLAGS "-mgeneral-regs-only" "-mno-sse" "-mno-sse2" "-mfpmath="
+)

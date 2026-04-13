@@ -322,4 +322,24 @@ uint8_t MouseGetButtons()
     return g_buttons;
 }
 
+void MouseSetPosition(int32_t x, int32_t y)
+{
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x >= static_cast<int32_t>(g_maxX)) x = static_cast<int32_t>(g_maxX) - 1;
+    if (y >= static_cast<int32_t>(g_maxY)) y = static_cast<int32_t>(g_maxY) - 1;
+    g_mouseX = x;
+    g_mouseY = y;
+}
+
+void MouseSetButtons(uint8_t buttons)
+{
+    g_buttons = buttons;
+}
+
+void MouseSetAvailable(bool available)
+{
+    g_mouseInit = available;
+}
+
 } // namespace brook

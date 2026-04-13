@@ -82,20 +82,20 @@ static constexpr uint32_t INPUT_MAX_DEVICES = 8;
 // ---------------------------------------------------------------------------
 
 // Initialise the input subsystem.  Call once at boot.
-void InputInit();
+extern "C" void InputInit();
 
 // Register an input device.  Returns true on success.
-bool InputRegister(InputDevice* dev);
+extern "C" bool InputRegister(InputDevice* dev);
 
 // Dequeue the next event from any registered device.
 // Returns true if an event was available, false if all queues are empty.
-bool InputPollEvent(InputEvent* out);
+extern "C" bool InputPollEvent(InputEvent* out);
 
 // Blocking: spin until an event is available, then return it.
-InputEvent InputWaitEvent();
+extern "C" InputEvent InputWaitEvent();
 
 // Check if any input device has queued events.
-bool InputHasEvents();
+extern "C" bool InputHasEvents();
 
 // ---------------------------------------------------------------------------
 // Waiter support — processes blocked waiting for input events
@@ -113,7 +113,7 @@ void InputRemoveWaiter(struct Process* proc);
 // Wake all waiting processes. Called from ISR after pushing events.
 // Safe to call from ISR context (SchedulerUnblock is ISR-safe since
 // all scheduler lock holders have interrupts disabled).
-void InputWakeWaiters();
+extern "C" void InputWakeWaiters();
 
 // ---------------------------------------------------------------------------
 // Driver-side helpers — call from ISR or driver code to enqueue events

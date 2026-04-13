@@ -9,9 +9,9 @@ namespace brook {
 
 // ---- Config space read/write (32-bit) ----
 
-uint32_t PciConfigRead32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t offset);
-uint16_t PciConfigRead16(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t offset);
-uint8_t  PciConfigRead8 (uint8_t bus, uint8_t dev, uint8_t fn, uint8_t offset);
+extern "C" uint32_t PciConfigRead32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t offset);
+extern "C" uint16_t PciConfigRead16(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t offset);
+extern "C" uint8_t  PciConfigRead8 (uint8_t bus, uint8_t dev, uint8_t fn, uint8_t offset);
 void     PciConfigWrite32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t offset, uint32_t val);
 void     PciConfigWrite16(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t offset, uint16_t val);
 

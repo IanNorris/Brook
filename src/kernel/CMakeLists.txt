@@ -297,7 +297,9 @@ set(DRIVER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/drivers")
 file(MAKE_DIRECTORY "${DRIVER_OUTPUT_DIR}")
 
 function(add_driver_module mod_name)
-    set(MOD_SOURCES ${ARGN})
+    # Parse optional EXTRA_FLAGS argument.
+    cmake_parse_arguments(MOD "" "" "EXTRA_FLAGS" ${ARGN})
+    set(MOD_SOURCES ${MOD_UNPARSED_ARGUMENTS})
     set(MOD_OBJ  "${DRIVER_OUTPUT_DIR}/${mod_name}.mod")
 
     # Build -I flags from the list.
@@ -316,6 +318,7 @@ function(add_driver_module mod_name)
             OUTPUT  "${obj}"
             COMMAND "${CMAKE_CXX_COMPILER}"
                     ${DRIVER_MODULE_FLAGS}
+                    ${MOD_EXTRA_FLAGS}
                     ${INCLUDE_FLAGS}
                     -c "${src}" -o "${obj}"
             DEPENDS "${src}"
