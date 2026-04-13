@@ -178,15 +178,22 @@ else
     DISPLAY_OPT="-display gtk"
 fi
 
+KVM_FLAGS=""
+if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] && [ "${NO_KVM:-}" != "1" ]; then
+    KVM_FLAGS="-enable-kvm -cpu host"
+else
+    KVM_FLAGS="-cpu qemu64"
+fi
+
 qemu-system-x86_64 \
     -machine q35 \
-    -cpu qemu64 \
+    ${KVM_FLAGS} \
     -smp 8 \
     -m 4G \
     -drive if=pflash,format=raw,readonly=on,file="${OVMF_CODE}" \
     -drive if=pflash,format=raw,file="${OVMF_VARS_COPY}" \
     -drive format=raw,file=fat:rw:"${BUILD_DIR}/esp" \
-    -drive if=virtio,format=raw,file="${DISK_IMG}" \
+    -drive if=virtio,format=raw,file="${DISK_IMG}",file.locking=off \
     ${SERIAL_OPT} \
     ${DISPLAY_OPT} \
     -monitor unix:/tmp/qemu_monitor.sock,server,nowait \

@@ -113,9 +113,9 @@ struct StackFrame {
     uint64_t    rip;
 };
 
-static void ExcStackWalk(uint64_t rbp, int maxFrames)
+static void ExcStackWalk(uint64_t rbp, int maxFrames, const char* tag)
 {
-    ExcPutsRaw("  --- stack trace ---\n");
+    ExcPutsRaw(tag); ExcPutsRaw("  --- stack trace ---\n");
     auto* fp = reinterpret_cast<StackFrame*>(rbp);
     StackFrame* prev = nullptr;
 
@@ -130,7 +130,7 @@ static void ExcStackWalk(uint64_t rbp, int maxFrames)
         if (addr < 0xFFFF800000000000ULL)
             break;
 
-        ExcPutsRaw("  #");
+        ExcPutsRaw(tag); ExcPutsRaw("  #");
         ExcPutCharRaw(static_cast<char>('0' + (i / 10) % 10));
         ExcPutCharRaw(static_cast<char>('0' + i % 10));
         ExcPutsRaw("  ");
@@ -140,7 +140,7 @@ static void ExcStackWalk(uint64_t rbp, int maxFrames)
         prev = fp;
         fp = fp->rbp;
     }
-    ExcPutsRaw("  --- end trace ---\n");
+    ExcPutsRaw(tag); ExcPutsRaw("  --- end trace ---\n");
 }
 
 static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t errorCode, bool hasErrorCode)
@@ -172,9 +172,14 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
         ExcPutsRaw(" — halting ===\n");
         ExcPutsRaw("  RIP   "); ExcPutHex(frame->ip); ExcPutsRaw("\n");
         ExcPutsRaw("  RSP   "); ExcPutHex(frame->sp); ExcPutsRaw("\n");
-        for (;;) __asm__ volatile("hlt");
+        for (;;) __asm__ volatile("cli; hlt");
     }
     ++excDepthPerCpu[cpuSlot];
+
+    // Build a CPU tag prefix like "[C3] " so interleaved lockless output
+    // from multiple CPUs can be disambiguated.
+    char cpuTag[6] = {'[','C','0',']',' ','\0'};
+    cpuTag[2] = static_cast<char>('0' + cpuSlot % 10);
 
     uint64_t cr2 = 0;
     __asm__ volatile("movq %%cr2, %0" : "=r"(cr2));
@@ -186,8 +191,10 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
 
     // Direct serial dump — guaranteed to produce readable output regardless
     // of va_list ABI issues or format buffer corruption.
-    ExcPutsRaw("\n=== EXCEPTION ===\n");
-    ExcPutsRaw("Vector: ");
+    // Every line is prefixed with [CN] so interleaved output from multiple
+    // CPUs is still parseable.
+    ExcPutsRaw("\n"); ExcPutsRaw(cpuTag); ExcPutsRaw("=== EXCEPTION ===\n");
+    ExcPutsRaw(cpuTag); ExcPutsRaw("Vector: ");
     {
         char vbuf[4] = {'0','0','0','\0'};
         vbuf[0] = static_cast<char>('0' + (vector / 100) % 10);
@@ -200,7 +207,7 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
     // Print current process info if available.
     brook::Process* cur = brook::ProcessCurrent();
     if (cur) {
-        ExcPutsRaw("  PID   ");
+        ExcPutsRaw(cpuTag); ExcPutsRaw("  PID   ");
         {
             char pbuf[6];
             uint16_t pid = cur->pid;
@@ -218,14 +225,14 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
         ExcPutsRaw(" ("); ExcPutsRaw(cur->name); ExcPutsRaw(")\n");
     }
 
-    ExcPutsRaw("  RIP   "); ExcPutHex(frame->ip);    ExcPutsRaw("\n");
-    ExcPutsRaw("  RSP   "); ExcPutHex(frame->sp);    ExcPutsRaw("\n");
-    ExcPutsRaw("  CS    "); ExcPutHex(frame->cs);    ExcPutsRaw("\n");
-    ExcPutsRaw("  SS    "); ExcPutHex(frame->ss);    ExcPutsRaw("\n");
-    ExcPutsRaw("  FLAGS "); ExcPutHex(frame->flags); ExcPutsRaw("\n");
-    ExcPutsRaw("  CR2   "); ExcPutHex(cr2);          ExcPutsRaw("\n");
+    ExcPutsRaw(cpuTag); ExcPutsRaw("  RIP   "); ExcPutHex(frame->ip);    ExcPutsRaw("\n");
+    ExcPutsRaw(cpuTag); ExcPutsRaw("  RSP   "); ExcPutHex(frame->sp);    ExcPutsRaw("\n");
+    ExcPutsRaw(cpuTag); ExcPutsRaw("  CS    "); ExcPutHex(frame->cs);    ExcPutsRaw("\n");
+    ExcPutsRaw(cpuTag); ExcPutsRaw("  SS    "); ExcPutHex(frame->ss);    ExcPutsRaw("\n");
+    ExcPutsRaw(cpuTag); ExcPutsRaw("  FLAGS "); ExcPutHex(frame->flags); ExcPutsRaw("\n");
+    ExcPutsRaw(cpuTag); ExcPutsRaw("  CR2   "); ExcPutHex(cr2);          ExcPutsRaw("\n");
     if (hasErrorCode) {
-        ExcPutsRaw("  ERR   "); ExcPutHex(errorCode);
+        ExcPutsRaw(cpuTag); ExcPutsRaw("  ERR   "); ExcPutHex(errorCode);
         if (vector == 14) {
             ExcPutsRaw(" [");
             ExcPutsRaw((errorCode & 1) ? "P " : "NP ");
@@ -247,13 +254,13 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
         __asm__ volatile("movq %%cr3, %0" : "=r"(cr3val));
         cr3val &= 0x000FFFFFFFFFF000ULL;
 
-        ExcPutsRaw("  --- page table walk ---\n");
-        ExcPutsRaw("  CR3   "); ExcPutHex(cr3val); ExcPutsRaw("\n");
+        ExcPutsRaw(cpuTag); ExcPutsRaw("  --- page table walk ---\n");
+        ExcPutsRaw(cpuTag); ExcPutsRaw("  CR3   "); ExcPutHex(cr3val); ExcPutsRaw("\n");
 
         uint64_t* pml4 = reinterpret_cast<uint64_t*>(DMAP_USR + cr3val);
         uint64_t pml4idx = (cr2 >> 39) & 0x1FF;
         uint64_t pml4e = pml4[pml4idx];
-        ExcPutsRaw("  PML4["); ExcPutHex(pml4idx); ExcPutsRaw("] = ");
+        ExcPutsRaw(cpuTag); ExcPutsRaw("  PML4["); ExcPutHex(pml4idx); ExcPutsRaw("] = ");
         ExcPutHex(pml4e); ExcPutsRaw("\n");
 
         if (pml4e & 1)
@@ -261,7 +268,7 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
             uint64_t* pdpt = reinterpret_cast<uint64_t*>(DMAP_USR + (pml4e & 0x000FFFFFFFFFF000ULL));
             uint64_t pdptidx = (cr2 >> 30) & 0x1FF;
             uint64_t pdpte = pdpt[pdptidx];
-            ExcPutsRaw("  PDPT["); ExcPutHex(pdptidx); ExcPutsRaw("] = ");
+            ExcPutsRaw(cpuTag); ExcPutsRaw("  PDPT["); ExcPutHex(pdptidx); ExcPutsRaw("] = ");
             ExcPutHex(pdpte); ExcPutsRaw("\n");
 
             if (pdpte & 1)
@@ -269,7 +276,7 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
                 uint64_t* pd = reinterpret_cast<uint64_t*>(DMAP_USR + (pdpte & 0x000FFFFFFFFFF000ULL));
                 uint64_t pdidx = (cr2 >> 21) & 0x1FF;
                 uint64_t pde = pd[pdidx];
-                ExcPutsRaw("  PD["); ExcPutHex(pdidx); ExcPutsRaw("] = ");
+                ExcPutsRaw(cpuTag); ExcPutsRaw("  PD["); ExcPutHex(pdidx); ExcPutsRaw("] = ");
                 ExcPutHex(pde); ExcPutsRaw("\n");
 
                 if ((pde & 1) && !(pde & (1ULL << 7)))
@@ -277,32 +284,31 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
                     uint64_t* pt = reinterpret_cast<uint64_t*>(DMAP_USR + (pde & 0x000FFFFFFFFFF000ULL));
                     uint64_t ptidx = (cr2 >> 12) & 0x1FF;
                     uint64_t pte = pt[ptidx];
-                    ExcPutsRaw("  PT["); ExcPutHex(ptidx); ExcPutsRaw("] = ");
+                    ExcPutsRaw(cpuTag); ExcPutsRaw("  PT["); ExcPutHex(ptidx); ExcPutsRaw("] = ");
                     ExcPutHex(pte); ExcPutsRaw("\n");
                 }
             }
             else
             {
-                ExcPutsRaw("  PDPT entry NOT PRESENT — page table corrupted?\n");
-                ExcPutsRaw("  PDPT page dump:\n");
+                ExcPutsRaw(cpuTag); ExcPutsRaw("  PDPT entry NOT PRESENT\n");
+                ExcPutsRaw(cpuTag); ExcPutsRaw("  PDPT page dump:\n");
                 for (int d = 0; d < 8; ++d)
                 {
-                    ExcPutsRaw("    ["); ExcPutHex(static_cast<uint64_t>(d));
+                    ExcPutsRaw(cpuTag); ExcPutsRaw("    ["); ExcPutHex(static_cast<uint64_t>(d));
                     ExcPutsRaw("] = "); ExcPutHex(pdpt[d]);
                     ExcPutsRaw("\n");
                 }
             }
         }
-        ExcPutsRaw("  --- end walk ---\n");
+        ExcPutsRaw(cpuTag); ExcPutsRaw("  --- end walk ---\n");
     }
 
     // For user-mode faults, dump a few values from the user stack.
-    // Walk the page table first to avoid nested faults on corrupted mappings.
-    if ((frame->cs & 3) == 3)  // user mode
+    if ((frame->cs & 3) == 3)
     {
-        ExcPutsRaw("  --- user stack dump (RSP) ---\n");
+        ExcPutsRaw(cpuTag); ExcPutsRaw("  --- user stack dump (RSP) ---\n");
         auto userRsp = frame->sp;
-        static constexpr uint64_t DMAP_USR = 0xFFFF800000000000ULL;
+        static constexpr uint64_t DMAP_USR2 = 0xFFFF800000000000ULL;
         uint64_t cr3val;
         __asm__ volatile("mov %%cr3, %0" : "=r"(cr3val));
         for (int i = 0; i < 8; ++i)
@@ -310,36 +316,35 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
             auto addr = userRsp + static_cast<uint64_t>(i) * 8;
             if (addr >= 0x800000000000ULL) break;
 
-            // Safe read: walk page table via DMAP to verify mapping exists
-            uint64_t* l4 = reinterpret_cast<uint64_t*>(DMAP_USR + (cr3val & 0x000FFFFFFFFFF000ULL));
+            uint64_t* l4 = reinterpret_cast<uint64_t*>(DMAP_USR2 + (cr3val & 0x000FFFFFFFFFF000ULL));
             uint64_t l4e = l4[(addr >> 39) & 0x1FF];
-            if (!(l4e & 1)) { ExcPutsRaw("    (unmapped PML4)\n"); break; }
-            uint64_t* l3 = reinterpret_cast<uint64_t*>(DMAP_USR + (l4e & 0x000FFFFFFFFFF000ULL));
+            if (!(l4e & 1)) { ExcPutsRaw(cpuTag); ExcPutsRaw("    (unmapped PML4)\n"); break; }
+            uint64_t* l3 = reinterpret_cast<uint64_t*>(DMAP_USR2 + (l4e & 0x000FFFFFFFFFF000ULL));
             uint64_t l3e = l3[(addr >> 30) & 0x1FF];
-            if (!(l3e & 1)) { ExcPutsRaw("    (unmapped PDPT)\n"); break; }
-            uint64_t* l2 = reinterpret_cast<uint64_t*>(DMAP_USR + (l3e & 0x000FFFFFFFFFF000ULL));
+            if (!(l3e & 1)) { ExcPutsRaw(cpuTag); ExcPutsRaw("    (unmapped PDPT)\n"); break; }
+            uint64_t* l2 = reinterpret_cast<uint64_t*>(DMAP_USR2 + (l3e & 0x000FFFFFFFFFF000ULL));
             uint64_t l2e = l2[(addr >> 21) & 0x1FF];
-            if (!(l2e & 1)) { ExcPutsRaw("    (unmapped PD)\n"); break; }
+            if (!(l2e & 1)) { ExcPutsRaw(cpuTag); ExcPutsRaw("    (unmapped PD)\n"); break; }
             uint64_t physPage;
-            if (l2e & 0x80) { // 2MB page
+            if (l2e & 0x80) {
                 physPage = (l2e & 0x000FFFFFFFE00000ULL) + (addr & 0x1FFFFF);
             } else {
-                uint64_t* l1 = reinterpret_cast<uint64_t*>(DMAP_USR + (l2e & 0x000FFFFFFFFFF000ULL));
+                uint64_t* l1 = reinterpret_cast<uint64_t*>(DMAP_USR2 + (l2e & 0x000FFFFFFFFFF000ULL));
                 uint64_t l1e = l1[(addr >> 12) & 0x1FF];
-                if (!(l1e & 1)) { ExcPutsRaw("    (unmapped PT)\n"); break; }
+                if (!(l1e & 1)) { ExcPutsRaw(cpuTag); ExcPutsRaw("    (unmapped PT)\n"); break; }
                 physPage = (l1e & 0x000FFFFFFFFFF000ULL) + (addr & 0xFFF);
             }
-            uint64_t val = *reinterpret_cast<uint64_t*>(DMAP_USR + physPage);
+            uint64_t val = *reinterpret_cast<uint64_t*>(DMAP_USR2 + physPage);
 
-            ExcPutsRaw("    [RSP+");
+            ExcPutsRaw(cpuTag); ExcPutsRaw("    [RSP+");
             ExcPutHex(static_cast<uint64_t>(i * 8));
             ExcPutsRaw("] = ");
             ExcPutHex(val);
             ExcPutsRaw("\n");
         }
-        ExcPutsRaw("  --- end user stack ---\n");
+        ExcPutsRaw(cpuTag); ExcPutsRaw("  --- end user stack ---\n");
     }
-    ExcStackWalk(rbp, 32);
+    ExcStackWalk(rbp, 32, cpuTag);
 
     // Detect kernel stack guard page hits for #PF.
     if (vector == 14)
@@ -353,11 +358,11 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
             uint64_t guardHigh = guardProc->kernelStackBase + brook::KERNEL_STACK_SIZE;
             if (cr2 >= guardLow && cr2 < guardProc->kernelStackBase)
             {
-                ExcPutsRaw("\n*** KERNEL STACK OVERFLOW (bottom guard page hit) ***\n");
+                ExcPutsRaw(cpuTag); ExcPutsRaw("\n*** KERNEL STACK OVERFLOW (bottom guard page hit) ***\n");
             }
             else if (cr2 >= guardHigh && cr2 < guardHigh + 4096)
             {
-                ExcPutsRaw("\n*** KERNEL STACK OVERFLOW (top guard page hit) ***\n");
+                ExcPutsRaw(cpuTag); ExcPutsRaw("\n*** KERNEL STACK OVERFLOW (top guard page hit) ***\n");
             }
         }
     }
@@ -366,17 +371,18 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
     // Kernel-mode faults are unrecoverable — halt.
     if ((frame->cs & 3) == 3)
     {
-        ExcPutsRaw("=== KILLING PROCESS ===\n");
+        ExcPutsRaw(cpuTag); ExcPutsRaw("=== KILLING PROCESS ===\n");
         --excDepthPerCpu[cpuSlot];
         __asm__ volatile("sti");
         brook::SchedulerExitCurrentProcess(-static_cast<int>(vector));
         // Never reached.
     }
 
-    ExcPutsRaw("=== HALTED ===\n");
+    ExcPutsRaw(cpuTag); ExcPutsRaw("=== HALTED ===\n");
 
     // Halt here — kernel-mode exception is unrecoverable.
-    for (;;) { __asm__ volatile("hlt"); }
+    // Use cli before hlt so timer interrupts don't wake us.
+    for (;;) { __asm__ volatile("cli; hlt"); }
 }
 
 // ---- Exception stubs: no error code ----

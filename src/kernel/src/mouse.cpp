@@ -103,13 +103,17 @@ static void MouseIrqHandler(InterruptFrame* frame)
 
     uint8_t data = inb(0x60);
 
-    // Track IRQ count for diagnostics
+    // Track IRQ count — lockless UART output to avoid serial-lock deadlock
+    // in ISR context (the serial lock may be held with sti during spin-wait).
     static volatile uint32_t s_irqCount = 0;
     uint32_t count = ++s_irqCount;
     if (count <= 3 || (count & 0xFF) == 0)
     {
-        SerialPrintf("MOUSE IRQ: #%u status=0x%02x data=0x%02x idx=%u\n",
-                     count, status, data, g_packetIdx);
+        const char* msg = "MOUSE IRQ\r\n";
+        while (*msg) {
+            while ((inb(0x3FD) & 0x20) == 0) {}
+            outb(0x3F8, static_cast<uint8_t>(*msg++));
+        }
     }
 
     // Synchronise to packet boundary: status byte (byte 0) always has bit 3 set.

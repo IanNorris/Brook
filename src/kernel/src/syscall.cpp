@@ -1101,19 +1101,21 @@ static int64_t sys_fork(uint64_t, uint64_t, uint64_t,
     Process* parent = ProcessCurrent();
     if (!parent) return -ENOSYS;
 
-    // Read user context from KernelCpuEnv (saved by BrookSyscallDispatcher).
+    // Snapshot ALL user registers from gs: IMMEDIATELY — before any function
+    // that might enable interrupts (e.g. serial lock spin-wait).  If a timer
+    // fires and the scheduler switches to another process that does a syscall,
+    // gs: fields would be overwritten.  Capturing here is always safe because
+    // FMASK cleared IF on syscall entry and nothing has re-enabled it yet.
     uint64_t userRip, userRsp, userRflags;
+    uint64_t savedRbx, savedRbp, savedR12, savedR13, savedR14, savedR15;
+    uint64_t savedRdi, savedRsi, savedRdx, savedR8, savedR9, savedR10;
+
     __asm__ volatile(
         "movq %%gs:48, %0\n\t"   // syscallUserRip
         "movq %%gs:56, %1\n\t"   // syscallUserRsp
         "movq %%gs:64, %2\n\t"   // syscallUserRflags
         : "=r"(userRip), "=r"(userRsp), "=r"(userRflags)
     );
-
-    Process* child = ProcessFork(parent, userRip, userRsp, userRflags);
-    if (!child) return -ENOMEM;
-
-    // Save callee-saved registers from KernelCpuEnv for child to restore
     __asm__ volatile(
         "movq %%gs:72,  %0\n\t"
         "movq %%gs:80,  %1\n\t"
@@ -1121,13 +1123,10 @@ static int64_t sys_fork(uint64_t, uint64_t, uint64_t,
         "movq %%gs:96,  %3\n\t"
         "movq %%gs:104, %4\n\t"
         "movq %%gs:112, %5\n\t"
-        : "=r"(child->forkRbx), "=r"(child->forkRbp),
-          "=r"(child->forkR12), "=r"(child->forkR13),
-          "=r"(child->forkR14), "=r"(child->forkR15)
+        : "=r"(savedRbx), "=r"(savedRbp),
+          "=r"(savedR12), "=r"(savedR13),
+          "=r"(savedR14), "=r"(savedR15)
     );
-
-    // Save caller-saved registers — Linux preserves ALL regs across fork
-    // (musl __clone uses R9 for thread fn pointer across syscall)
     __asm__ volatile(
         "movq %%gs:128, %0\n\t"
         "movq %%gs:136, %1\n\t"
@@ -1135,10 +1134,27 @@ static int64_t sys_fork(uint64_t, uint64_t, uint64_t,
         "movq %%gs:152, %3\n\t"
         "movq %%gs:160, %4\n\t"
         "movq %%gs:168, %5\n\t"
-        : "=r"(child->forkRdi), "=r"(child->forkRsi),
-          "=r"(child->forkRdx), "=r"(child->forkR8),
-          "=r"(child->forkR9), "=r"(child->forkR10)
+        : "=r"(savedRdi), "=r"(savedRsi),
+          "=r"(savedRdx), "=r"(savedR8),
+          "=r"(savedR9), "=r"(savedR10)
     );
+
+    Process* child = ProcessFork(parent, userRip, userRsp, userRflags);
+    if (!child) return -ENOMEM;
+
+    // Write captured register values into the child process struct.
+    child->forkRbx = savedRbx;
+    child->forkRbp = savedRbp;
+    child->forkR12 = savedR12;
+    child->forkR13 = savedR13;
+    child->forkR14 = savedR14;
+    child->forkR15 = savedR15;
+    child->forkRdi = savedRdi;
+    child->forkRsi = savedRsi;
+    child->forkRdx = savedRdx;
+    child->forkR8  = savedR8;
+    child->forkR9  = savedR9;
+    child->forkR10 = savedR10;
 
     SchedulerAddProcess(child);
 
@@ -1149,11 +1165,61 @@ static int64_t sys_fork(uint64_t, uint64_t, uint64_t,
 static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t,
                           uint64_t, uint64_t, uint64_t)
 {
-    // For now, clone without CLONE_VM/CLONE_THREAD is equivalent to fork.
-    // Ignore flags and newStack for the initial implementation.
+    // clone with a new stack: use fork but override the child's RSP.
+    // musl's __clone pushes the arg+fn onto newStack before the syscall,
+    // then the child does pop %rdi; call *%r9 using that stack.
     (void)flags;
-    (void)newStack;
-    return sys_fork(0, 0, 0, 0, 0, 0);
+
+    Process* parent = ProcessCurrent();
+    if (!parent) return -ENOSYS;
+
+    // Snapshot ALL user registers from gs: before anything can clobber them.
+    uint64_t userRip, userRsp, userRflags;
+    uint64_t savedRbx, savedRbp, savedR12, savedR13, savedR14, savedR15;
+    uint64_t savedRdi, savedRsi, savedRdx, savedR8, savedR9, savedR10;
+
+    __asm__ volatile(
+        "movq %%gs:48, %0\n\t"
+        "movq %%gs:56, %1\n\t"
+        "movq %%gs:64, %2\n\t"
+        : "=r"(userRip), "=r"(userRsp), "=r"(userRflags)
+    );
+    __asm__ volatile(
+        "movq %%gs:72,  %0\n\t"  "movq %%gs:80,  %1\n\t"
+        "movq %%gs:88,  %2\n\t"  "movq %%gs:96,  %3\n\t"
+        "movq %%gs:104, %4\n\t"  "movq %%gs:112, %5\n\t"
+        : "=r"(savedRbx), "=r"(savedRbp),
+          "=r"(savedR12), "=r"(savedR13),
+          "=r"(savedR14), "=r"(savedR15)
+    );
+    __asm__ volatile(
+        "movq %%gs:128, %0\n\t"  "movq %%gs:136, %1\n\t"
+        "movq %%gs:144, %2\n\t"  "movq %%gs:152, %3\n\t"
+        "movq %%gs:160, %4\n\t"  "movq %%gs:168, %5\n\t"
+        : "=r"(savedRdi), "=r"(savedRsi),
+          "=r"(savedRdx), "=r"(savedR8),
+          "=r"(savedR9), "=r"(savedR10)
+    );
+
+    // If caller provided a new stack, use it for the child.
+    if (newStack)
+        userRsp = newStack;
+
+    Process* child = ProcessFork(parent, userRip, userRsp, userRflags);
+    if (!child) return -ENOMEM;
+
+    child->forkRbx = savedRbx;  child->forkRbp = savedRbp;
+    child->forkR12 = savedR12;  child->forkR13 = savedR13;
+    child->forkR14 = savedR14;  child->forkR15 = savedR15;
+    child->forkRdi = savedRdi;  child->forkRsi = savedRsi;
+    child->forkRdx = savedRdx;  child->forkR8  = savedR8;
+    child->forkR9  = savedR9;   child->forkR10 = savedR10;
+
+    SchedulerAddProcess(child);
+
+    SerialPrintf("FORK: parent pid=%u -> child pid=%u '%s', rip=0x%lx rsp=0x%lx\n",
+                 parent->pid, child->pid, child->name, userRip, userRsp);
+    return static_cast<int64_t>(child->pid);
 }
 
 static int64_t sys_vfork(uint64_t, uint64_t, uint64_t,

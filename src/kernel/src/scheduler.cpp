@@ -281,8 +281,13 @@ static void ForkChildTrampoline()
 
     __asm__ volatile("sti");
 
-    // Enter user mode via SYSRET with ALL registers restored.
+    // Enter user mode via IRETQ with ALL registers restored.
     // Linux preserves every register across fork except RAX (0 for child).
+    // We use IRETQ instead of SYSRET because SYSRET faults are delivered in
+    // ring 0 with the user RSP — making crash diagnostics unreliable and
+    // potentially corrupting state.  IRETQ faults are delivered properly
+    // via the TSS RSP0 stack.
+    //
     // We build a struct on the stack and load from it to avoid
     // register pressure issues with 15 operands.
     struct ForkRegs {
@@ -306,13 +311,17 @@ static void ForkChildTrampoline()
         "mov 96(%%rax), %%r8\n\t"      // restore R8
         "mov 104(%%rax), %%r9\n\t"     // restore R9
         "mov 112(%%rax), %%r10\n\t"    // restore R10
-        "mov 0(%%rax), %%rcx\n\t"      // RCX = user RIP
-        "mov 8(%%rax), %%r11\n\t"      // R11 = user RFLAGS
-        "mov 16(%%rax), %%rsp\n\t"     // RSP = user stack
-        "xor %%rax, %%rax\n\t"         // RAX = 0 (fork child return)
+        "mov 8(%%rax), %%r11\n\t"      // R11 = user RFLAGS (preserved)
+        "mov 0(%%rax), %%rcx\n\t"      // RCX = user RIP (preserved)
+        // Build IRETQ frame: push SS, RSP, RFLAGS, CS, RIP
+        "pushq $0x23\n\t"              // SS = user data segment
+        "pushq 16(%%rax)\n\t"          // RSP = user stack
+        "pushq 8(%%rax)\n\t"           // RFLAGS
+        "pushq $0x2B\n\t"              // CS = user code segment
+        "pushq 0(%%rax)\n\t"           // RIP = user return address
+        "xor %%eax, %%eax\n\t"         // RAX = 0 (fork child return)
         "swapgs\n\t"
-        ".byte 0x48\n\t"               // REX.W prefix for sysretq
-        "sysret\n\t"
+        "iretq\n\t"
         :: [base] "r"(&regs)
         : "memory"
     );
@@ -503,8 +512,15 @@ static void CheckBlockedWakeups()
 }
 
 // Reap terminated processes.
+static volatile uint32_t g_reapInProgress = 0;
+
 static void ReapTerminated()
 {
+    // Guard against re-entry: if PmmKillPid→SerialPrintf→serial-lock-sti
+    // lets the timer fire again while we're mid-reap, don't nest.
+    if (__atomic_exchange_n(&g_reapInProgress, 1, __ATOMIC_ACQUIRE))
+        return;
+
     uint32_t cpu = ThisCpu();
     uint64_t alf = SchedLockAcquire(g_allProcLock);
     for (uint32_t i = 0; i < g_processCount; )
@@ -529,6 +545,8 @@ static void ReapTerminated()
         }
     }
     SchedLockRelease(g_allProcLock, alf);
+
+    __atomic_store_n(&g_reapInProgress, 0, __ATOMIC_RELEASE);
 }
 
 // Perform a context switch from `oldProc` to `newProc`.
