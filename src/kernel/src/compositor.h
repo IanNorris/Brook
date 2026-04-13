@@ -34,6 +34,10 @@ void CompositorHalt();
 // Wake the compositor thread immediately (e.g. when a process signals a dirty frame).
 void CompositorWake();
 
+// Mark the backbuffer as dirty so the next compositor loop copies it to MMIO.
+// Called by the TTY after rendering text into the backbuffer.
+void CompositorMarkDirty();
+
 // Unregister a process from the compositor (called before the Process is freed).
 void CompositorUnregisterProcess(Process* proc);
 

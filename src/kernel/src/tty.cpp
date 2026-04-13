@@ -3,8 +3,12 @@
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "serial.h"
+#include "compositor.h"
 
 namespace brook {
+
+// Set when TTY has been redirected to a compositor backbuffer.
+static bool g_ttyUsingBackbuffer = false;
 
 // ---------------------------------------------------------------------------
 // TTY state
@@ -298,6 +302,7 @@ void TtyPutChar(char c)
     {
     case '\n':
         Newline();
+        if (g_ttyUsingBackbuffer) CompositorMarkDirty();
         return;
     case '\r':
         g_curX = 0;
@@ -324,6 +329,8 @@ void TtyPutChar(char c)
     }
 
     RenderGlyph(code);
+    if (g_ttyUsingBackbuffer)
+        CompositorMarkDirty();
 }
 
 void TtyPuts(const char* str)
@@ -466,6 +473,7 @@ void TtyClear()
             g_fbPixels[(g_ry + y) * g_fbStride + (g_rx + x)] = g_bgColor;
     g_curX = 0;
     g_curY = 0;
+    if (g_ttyUsingBackbuffer) CompositorMarkDirty();
 }
 
 bool TtyReady()
@@ -566,6 +574,17 @@ void TtyRemap(uint64_t newPhysBase, uint32_t w, uint32_t h, uint32_t stridePixel
 
     SerialPrintf("TTY: remapped to %ux%u at phys 0x%lx, virt 0x%lx\n",
                  w, h, newPhysBase, fbVirt);
+}
+
+void TtyRedirectToBackbuffer(uint32_t* backbuffer)
+{
+    if (backbuffer)
+    {
+        g_fbPixels = reinterpret_cast<volatile uint32_t*>(backbuffer);
+        g_ttyUsingBackbuffer = true;
+        SerialPrintf("TTY: redirected to backbuffer 0x%lx\n",
+                     reinterpret_cast<uint64_t>(backbuffer));
+    }
 }
 
 } // namespace brook

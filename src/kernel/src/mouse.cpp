@@ -92,10 +92,11 @@ static void MouseIrqHandler(InterruptFrame* frame)
     (void)frame;
 
     // On IOAPIC-based systems, IRQ12 fires specifically for mouse data.
-    // Check that output buffer is full (bit 0 OBF) AND the data is from
-    // the auxiliary port (bit 5 AUXB). If not, it's spurious or a keyboard byte.
+    // Check that output buffer is full (bit 0 OBF). We intentionally do NOT
+    // require the AUXB bit (bit 5) because some QEMU/KVM versions don't set
+    // it reliably. Since IRQ12 only fires for mouse, OBF alone is sufficient.
     uint8_t status = inb(0x64);
-    if ((status & 0x21) != 0x21)
+    if (!(status & 0x01))
     {
         ApicSendEoi();
         return;

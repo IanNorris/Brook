@@ -68,4 +68,10 @@ extern "C" bool TtyGetFramebufferPhys(uint64_t* outPhysBase, uint32_t* outWidth,
 extern "C" void TtyRemap(uint64_t newPhysBase, uint32_t w, uint32_t h,
                           uint32_t stridePixels);
 
+// Redirect TTY rendering to a compositor backbuffer.
+// After this call, TtyPutChar/TtyPuts/TtyPrintf render into the backbuffer
+// instead of the MMIO framebuffer, eliminating the double-write problem.
+// Pass nullptr to revert to the MMIO framebuffer.
+void TtyRedirectToBackbuffer(uint32_t* backbuffer);
+
 } // namespace brook

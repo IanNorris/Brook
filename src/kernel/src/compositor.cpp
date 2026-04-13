@@ -23,6 +23,10 @@ static uint32_t           g_physFbStride = 0; // in pixels
 static uint32_t* g_backBuffer     = nullptr;
 static uint32_t  g_backBufStride  = 0; // in pixels (matches physFb stride)
 
+// Set when any blit/cursor/exit-color modified the backbuffer this frame.
+// Only copy backbuffer → MMIO when dirty, to avoid redundant 8MB copies.
+static bool g_backBufDirty = false;
+
 // Registered process slots for compositing.
 static constexpr uint32_t MAX_COMPOSITED = 64;
 static Process* g_compositedProcs[MAX_COMPOSITED] = {};
@@ -60,9 +64,22 @@ void CompositorInit()
     if (bbAddr)
     {
         g_backBuffer = reinterpret_cast<uint32_t*>(bbAddr.raw());
-        __builtin_memset(g_backBuffer, 0, bbSizeBytes);
+        // Copy current MMIO framebuffer content (boot logo, TTY text) into the
+        // backbuffer so the compositor preserves existing screen content.
+        for (uint32_t y = 0; y < h; ++y)
+        {
+            __builtin_memcpy(
+                g_backBuffer + y * g_backBufStride,
+                const_cast<uint32_t*>(g_physFb + y * g_physFbStride),
+                w * 4);
+        }
         SerialPrintf("COMPOSITOR: backbuffer %lu KB at 0x%lx\n",
                      bbSizeBytes / 1024, bbAddr.raw());
+
+        // Redirect the TTY to render into the backbuffer instead of MMIO.
+        // This ensures TTY text (clock, shell) appears in the compositor's
+        // buffer and isn't overwritten on each frame flip.
+        TtyRedirectToBackbuffer(g_backBuffer);
     }
     else
     {
@@ -149,6 +166,7 @@ static void BlitProcess(Process* proc, bool forceAll)
     if (!proc->fbVirtual || proc->fbVfbWidth == 0) return;
     if (!forceAll && !proc->fbDirty) return;
     proc->fbDirty = 0;
+    g_backBufDirty = true;
 
     // One-time diagnostic: log first blit for each process
     static uint32_t s_blitLogMask = 0;
@@ -373,6 +391,7 @@ static void CompositorLoop()
             }
             __atomic_store_n(&p->fbExitColor, 0u, __ATOMIC_RELEASE);
             g_compositedProcs[i] = nullptr;
+            g_backBufDirty = true;
             continue;
         }
 
@@ -393,13 +412,16 @@ static void CompositorLoop()
     {
         int32_t mx, my;
         MouseGetPosition(&mx, &my);
+        // Only redraw if cursor moved
+        if (mx != g_cursorSaveX || my != g_cursorSaveY || !g_cursorVisible)
+            g_backBufDirty = true;
         CursorDraw(mx, my);
     }
 
-    // Flip: copy backbuffer → MMIO framebuffer in one sequential pass.
-    // This is dramatically faster than scattered MMIO writes during compositing.
-    if (g_backBuffer)
+    // Flip: copy backbuffer → MMIO framebuffer only when something changed.
+    if (g_backBuffer && g_backBufDirty)
     {
+        g_backBufDirty = false;
         for (uint32_t y = 0; y < g_physFbHeight; ++y)
         {
             __builtin_memcpy(
@@ -452,6 +474,11 @@ void CompositorWake()
     Process* p = g_compositorProcess;
     if (p && p->state == ProcessState::Blocked)
         SchedulerUnblock(p);
+}
+
+void CompositorMarkDirty()
+{
+    g_backBufDirty = true;
 }
 
 void CompositorUnregisterProcess(Process* proc)
