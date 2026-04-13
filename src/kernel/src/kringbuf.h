@@ -63,6 +63,36 @@ struct KRingBuffer {
         SpinLockRelease(&lock, flags);
         return maxLen;
     }
+
+    // Dequeue bytes up to and including the first newline, or up to maxLen
+    // if no newline is found. Returns bytes read. This allows line-buffered
+    // output so serial messages don't interleave mid-line.
+    uint32_t readUntilNewline(char* dst, uint32_t maxLen)
+    {
+        uint64_t flags = SpinLockAcquire(&lock);
+
+        uint32_t avail = (head - tail + Capacity) % Capacity;
+        if (maxLen > avail) maxLen = avail;
+
+        // Scan for newline to determine how many bytes to dequeue.
+        uint32_t limit = maxLen;
+        uint32_t scan = tail;
+        for (uint32_t i = 0; i < maxLen; ++i) {
+            if (data[scan] == '\n') {
+                limit = i + 1; // include the newline
+                break;
+            }
+            scan = (scan + 1) % Capacity;
+        }
+
+        for (uint32_t i = 0; i < limit; ++i) {
+            dst[i] = data[tail];
+            tail = (tail + 1) % Capacity;
+        }
+
+        SpinLockRelease(&lock, flags);
+        return limit;
+    }
 };
 
 } // namespace brook

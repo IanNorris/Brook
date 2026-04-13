@@ -28,10 +28,13 @@ static Process* g_writerProc = nullptr;
 
 static void SerialWriterThreadFn(void* /*arg*/)
 {
-    char batch[16];  // Small batches — serial lock is held with cli for entire batch
+    // Line-buffered drain: read up to one line at a time so each serial
+    // lock acquisition outputs a coherent line.  Falls back to a full
+    // batch if no newline is found (binary output / very long lines).
+    char batch[256];
 
     for (;;) {
-        uint32_t n = g_serialBuf.read(batch, sizeof(batch));
+        uint32_t n = g_serialBuf.readUntilNewline(batch, sizeof(batch));
 
         if (n > 0) {
             SerialLock();

@@ -237,6 +237,15 @@ static void KbdIrqHandler(InterruptFrame* frame)
 {
     (void)frame;
 
+    // Check that OBF is set and the byte is NOT from the auxiliary (mouse) port.
+    // If bit 5 (AUXB) is set, this is mouse data — don't consume it here.
+    uint8_t status = inb(0x64);
+    if (!(status & 0x01) || (status & 0x20))
+    {
+        ApicSendEoi();
+        return;
+    }
+
     uint8_t sc = inb(0x60); // read scan code from PS/2 data port
 
     bool release = (sc & 0x80) != 0;

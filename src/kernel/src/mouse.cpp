@@ -91,12 +91,11 @@ static void MouseIrqHandler(InterruptFrame* frame)
 {
     (void)frame;
 
-    // On IOAPIC-based systems, the status register may already be clear
-    // by the time we read it. Since IRQ12 only fires for mouse data,
-    // just read the data byte directly. If OBF isn't set, send EOI and
-    // return (spurious interrupt).
+    // On IOAPIC-based systems, IRQ12 fires specifically for mouse data.
+    // Check that output buffer is full (bit 0 OBF) AND the data is from
+    // the auxiliary port (bit 5 AUXB). If not, it's spurious or a keyboard byte.
     uint8_t status = inb(0x64);
-    if (!(status & 0x01))
+    if ((status & 0x21) != 0x21)
     {
         ApicSendEoi();
         return;
@@ -224,22 +223,37 @@ void MouseInit()
     CtrlCmd(0x20);           // Read command byte
     WaitRead();
     uint8_t cfg = inb(0x60);
-    SerialPrintf("MOUSE: 8042 config byte = 0x%02x\n", cfg);
+    SerialPrintf("MOUSE: 8042 config byte = 0x%x\n", cfg);
     cfg |=  0x02;            // Enable IRQ12 (auxiliary interrupt)
     cfg &= ~0x20;            // Enable auxiliary clock
     CtrlCmd(0x60);           // Write command byte
     WaitWrite();
     outb(0x60, cfg);
 
-    // Reset mouse
+    // Reset mouse — sends 0xFF via auxiliary port.
+    // Response: 0xFA (ACK) + 0xAA (self-test) + 0x00 (device ID)
+    // MouseCmd already consumes the ACK; read the remaining two bytes.
     MouseCmd(0xFF);
-    // The reset sends back 0xFA (ACK) + 0xAA (self-test passed) + 0x00 (device ID)
-    // We already consumed ACK in MouseCmd. Read the remaining bytes.
-    WaitRead();
-    uint8_t selfTest = inb(0x60);
-    WaitRead();
-    uint8_t devId = inb(0x60);
-    SerialPrintf("MOUSE: reset response: self-test=0x%02x id=0x%02x\n", selfTest, devId);
+
+    // The self-test response can take up to 500ms. Retry reads.
+    uint8_t selfTest = 0;
+    for (int retry = 0; retry < 10; retry++)
+    {
+        WaitRead();
+        uint8_t b = inb(0x60);
+        if (b == 0xAA) { selfTest = b; break; }
+        if (b == 0xFC) { selfTest = b; break; } // self-test failed
+        // 0xFA is a late ACK — skip it
+    }
+
+    uint8_t devId = 0;
+    if (selfTest == 0xAA)
+    {
+        WaitRead();
+        devId = inb(0x60);
+    }
+
+    SerialPrintf("MOUSE: reset response: self-test=0x%x id=0x%x\n", selfTest, devId);
 
     if (selfTest != 0xAA) {
         SerialPuts("MOUSE: self-test failed, aborting\n");
@@ -251,10 +265,21 @@ void MouseInit()
 
     // Set sample rate to 100 samples/sec
     MouseCmd(0xF3);
-    MouseCmd(100);  // Send rate as a mouse command (gets 0xD4 prefix + ACK)
+    MouseCmd(100);
 
-    // Enable data reporting
+    // Set resolution to 4 counts/mm (highest)
+    MouseCmd(0xE8);
+    MouseCmd(0x03);
+
+    // Enable data reporting — this is critical: without it, the mouse
+    // generates no data (and thus no IRQ12).
     MouseCmd(0xF4);
+
+    // Re-read config to confirm IRQ12 is enabled
+    CtrlCmd(0x20);
+    WaitRead();
+    uint8_t cfgAfter = inb(0x60);
+    SerialPrintf("MOUSE: 8042 config after init = 0x%x\n", cfgAfter);
 
     // Flush any residual data from init
     while (inb(0x64) & 0x01) inb(0x60);
