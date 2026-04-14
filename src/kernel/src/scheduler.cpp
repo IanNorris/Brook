@@ -773,6 +773,7 @@ void SchedulerYield()
     proc->exitStatus = status;
 
     // Wake the parent process if it's blocked (likely in wait4).
+    // Also send SIGCHLD to the parent.
     if (proc->parentPid != 0)
     {
         uint64_t alf = SchedLockAcquire(g_allProcLock);
@@ -782,6 +783,12 @@ void SchedulerYield()
             {
                 Process* parent = g_allProcesses[i];
                 SchedLockRelease(g_allProcLock, alf);
+
+                // Send SIGCHLD (17) to parent
+                constexpr int SIGCHLD = 17;
+                uint64_t bit = 1ULL << (SIGCHLD - 1);
+                __atomic_or_fetch(&parent->sigPending, bit, __ATOMIC_RELEASE);
+
                 // Set pendingWakeup in case parent hasn't blocked yet
                 __atomic_store_n(&parent->pendingWakeup, 1, __ATOMIC_RELEASE);
                 if (parent->state == ProcessState::Blocked)

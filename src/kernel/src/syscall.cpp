@@ -266,9 +266,15 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
 
         while (written < count)
         {
-            // If no readers, return EPIPE
+            // If no readers, send SIGPIPE and return EPIPE
             if (__atomic_load_n(&pipe->readers, __ATOMIC_ACQUIRE) == 0)
+            {
+                constexpr int SIGPIPE = 13;
+                Process* self = ProcessCurrent();
+                if (self)
+                    ProcessSendSignal(self, SIGPIPE);
                 return written > 0 ? static_cast<int64_t>(written) : -EPIPE;
+            }
 
             uint32_t chunk = pipe->write(src + written,
                 static_cast<uint32_t>(count - written > 4096 ? 4096 : count - written));
