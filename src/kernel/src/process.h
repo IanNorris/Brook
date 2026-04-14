@@ -192,6 +192,7 @@ struct FdEntry
     uint32_t statusFlags;  // Linux O_* flags from open (for F_GETFL/F_SETFL)
     void*    handle;       // VFS Vnode* or device-specific state
     uint64_t seekPos;      // Current file offset (for lseek)
+    char     dirPath[64];  // For directory fds: path prefix for openat resolution
 };
 
 // ---------------------------------------------------------------------------

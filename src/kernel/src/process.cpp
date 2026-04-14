@@ -35,6 +35,7 @@ int FdAlloc(Process* proc, FdType type, void* handle)
             proc->fds[i].refCount = 1;
             proc->fds[i].handle   = handle;
             proc->fds[i].seekPos  = 0;
+            proc->fds[i].dirPath[0] = '\0';
             return static_cast<int>(i);
         }
     }

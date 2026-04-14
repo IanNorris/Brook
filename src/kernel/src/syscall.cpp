@@ -179,6 +179,7 @@ static constexpr int64_t ERANGE  = 34;
 static constexpr int64_t ENOSYS  = 38;
 static constexpr int64_t EAGAIN  = 11;
 static constexpr int64_t EINTR   = 4;
+static constexpr int64_t ENOTDIR = 20;
 
 // Check if the current process has deliverable signals pending.
 // Call after SchedulerBlock() returns to decide whether to return -EINTR.
@@ -775,6 +776,17 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         return -EMFILE;
     }
     proc->fds[fd].statusFlags = static_cast<uint32_t>(flags);
+
+    // Store directory path for openat resolution
+    if (vn->type == VnodeType::Dir)
+    {
+        uint32_t pi = 0;
+        while (lookupPath[pi] && pi < 62) { proc->fds[fd].dirPath[pi] = lookupPath[pi]; pi++; }
+        // Ensure trailing slash
+        if (pi > 0 && proc->fds[fd].dirPath[pi-1] != '/' && pi < 63)
+            proc->fds[fd].dirPath[pi++] = '/';
+        proc->fds[fd].dirPath[pi] = '\0';
+    }
 
     return fd;
 }
@@ -2824,10 +2836,32 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
 static int64_t sys_newfstatat(uint64_t dirfd, uint64_t pathAddr, uint64_t statAddr,
                                uint64_t flags, uint64_t, uint64_t)
 {
-    (void)dirfd; (void)flags;
     const char* path = reinterpret_cast<const char*>(pathAddr);
     if (!path || path[0] == '\0')
         return sys_fstat(dirfd, statAddr, 0, 0, 0, 0);
+
+    // Resolve relative path against dirfd if needed
+    static constexpr int64_t AT_FDCWD = -100;
+    if (path[0] != '/' && static_cast<int64_t>(dirfd) != AT_FDCWD)
+    {
+        Process* proc = ProcessCurrent();
+        if (proc)
+        {
+            FdEntry* fde = FdGet(proc, static_cast<int>(dirfd));
+            if (fde && fde->dirPath[0])
+            {
+                char resolved[256];
+                uint32_t ri = 0;
+                for (uint32_t i = 0; fde->dirPath[i] && ri < 250; ++i)
+                    resolved[ri++] = fde->dirPath[i];
+                for (uint32_t i = 0; path[i] && ri < 254; ++i)
+                    resolved[ri++] = path[i];
+                resolved[ri] = '\0';
+                return sys_stat(reinterpret_cast<uint64_t>(resolved), statAddr, 0, 0, 0, 0);
+            }
+        }
+    }
+
     return sys_stat(pathAddr, statAddr, 0, 0, 0, 0);
 }
 
@@ -3057,8 +3091,31 @@ static int64_t sys_getrandom(uint64_t bufAddr, uint64_t count, uint64_t,
 static int64_t sys_openat(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
                            uint64_t mode, uint64_t, uint64_t)
 {
-    (void)dirfd;
-    return sys_open(pathAddr, flags, mode, 0, 0, 0);
+    const char* path = reinterpret_cast<const char*>(pathAddr);
+    if (!path) return -EFAULT;
+
+    // If path is absolute or dirfd is AT_FDCWD, delegate to sys_open
+    static constexpr int64_t AT_FDCWD = -100;
+    if (path[0] == '/' || static_cast<int64_t>(dirfd) == AT_FDCWD)
+        return sys_open(pathAddr, flags, mode, 0, 0, 0);
+
+    // Resolve relative path against dirfd's directory path
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+    FdEntry* fde = FdGet(proc, static_cast<int>(dirfd));
+    if (!fde || fde->dirPath[0] == '\0')
+        return sys_open(pathAddr, flags, mode, 0, 0, 0);
+
+    // Build absolute path: dirPath + relative path
+    char resolved[256];
+    uint32_t ri = 0;
+    for (uint32_t i = 0; fde->dirPath[i] && ri < 250; ++i)
+        resolved[ri++] = fde->dirPath[i];
+    for (uint32_t i = 0; path[i] && ri < 254; ++i)
+        resolved[ri++] = path[i];
+    resolved[ri] = '\0';
+
+    return sys_open(reinterpret_cast<uint64_t>(resolved), flags, mode, 0, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -3521,15 +3578,59 @@ static int64_t sys_umask(uint64_t, uint64_t, uint64_t,
 // sys_chdir (80) / sys_fchdir (81) — stub
 // ---------------------------------------------------------------------------
 
-static int64_t sys_chdir(uint64_t, uint64_t, uint64_t,
+static int64_t sys_chdir(uint64_t pathAddr, uint64_t, uint64_t,
                           uint64_t, uint64_t, uint64_t)
 {
-    return 0; // pretend success — we only have root dir
+    const char* path = reinterpret_cast<const char*>(pathAddr);
+    if (!path) return -EFAULT;
+
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+
+    // Resolve relative paths against current CWD
+    char resolved[64];
+    const char* newCwd = path;
+    if (path[0] != '/')
+    {
+        uint32_t ri = 0;
+        for (uint32_t i = 0; proc->cwd[i] && ri < 58; ++i)
+            resolved[ri++] = proc->cwd[i];
+        if (ri > 0 && resolved[ri-1] != '/')
+            resolved[ri++] = '/';
+        for (uint32_t i = 0; path[i] && ri < 62; ++i)
+            resolved[ri++] = path[i];
+        resolved[ri] = '\0';
+        newCwd = resolved;
+    }
+
+    // Verify path exists and is a directory
+    VnodeStat vs; vs.size = 0; vs.isDir = false;
+    if (VfsStatPath(newCwd, &vs) < 0) return -ENOENT;
+    if (!vs.isDir) return -ENOTDIR;
+
+    // Update CWD
+    uint32_t ci = 0;
+    while (newCwd[ci] && ci < 62) { proc->cwd[ci] = newCwd[ci]; ci++; }
+    proc->cwd[ci] = '\0';
+
+    return 0;
 }
 
-static int64_t sys_fchdir(uint64_t, uint64_t, uint64_t,
+static int64_t sys_fchdir(uint64_t fd, uint64_t, uint64_t,
                            uint64_t, uint64_t, uint64_t)
 {
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+    FdEntry* fde = FdGet(proc, static_cast<int>(fd));
+    if (!fde || fde->dirPath[0] == '\0') return -EBADF;
+
+    // Use the stored dirPath (without trailing slash)
+    uint32_t ci = 0;
+    while (fde->dirPath[ci] && ci < 62) { proc->cwd[ci] = fde->dirPath[ci]; ci++; }
+    // Remove trailing slash if not root
+    if (ci > 1 && proc->cwd[ci-1] == '/') ci--;
+    proc->cwd[ci] = '\0';
+
     return 0;
 }
 
