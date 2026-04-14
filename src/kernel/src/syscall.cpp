@@ -19,6 +19,7 @@
 #include "memory/heap.h"
 #include "compositor.h"
 #include "window.h"
+#include "terminal.h"
 
 // Forward declaration
 extern "C" __attribute__((naked)) void ReturnToKernel();
@@ -177,6 +178,16 @@ static constexpr int64_t EPIPE   = 32;
 static constexpr int64_t ERANGE  = 34;
 static constexpr int64_t ENOSYS  = 38;
 static constexpr int64_t EAGAIN  = 11;
+static constexpr int64_t EINTR   = 4;
+
+// Check if the current process has deliverable signals pending.
+// Call after SchedulerBlock() returns to decide whether to return -EINTR.
+static bool HasPendingSignals()
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return false;
+    return (proc->sigPending & ~proc->sigMask) != 0;
+}
 
 // ---------------------------------------------------------------------------
 // sys_write (1)
@@ -301,6 +312,8 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
             Process* self = ProcessCurrent();
             pipe->writerWaiter = self;
             SchedulerBlock(self);
+            if (HasPendingSignals())
+                return written > 0 ? static_cast<int64_t>(written) : -EINTR;
         }
         return static_cast<int64_t>(written);
     }
@@ -399,6 +412,8 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                         goto got_event_nc;
                     }
                     SchedulerBlock(proc);
+                    if (HasPendingSignals())
+                        return bytesRead > 0 ? static_cast<int64_t>(bytesRead) : -EINTR;
                     continue;
                 }
             got_event_nc:
@@ -449,6 +464,8 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                     goto got_event_cooked;
                 }
                 SchedulerBlock(proc);
+                if (HasPendingSignals())
+                    return lineLen > 0 ? static_cast<int64_t>(lineLen) : -EINTR;
                 continue;
             }
         got_event_cooked:
@@ -569,6 +586,8 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             extern volatile uint64_t g_lapicTickCount;
             self->wakeupTick = g_lapicTickCount + 10; // recheck every ~10ms
             SchedulerBlock(self);
+            if (HasPendingSignals())
+                return -EINTR;
         }
     }
 
@@ -1659,6 +1678,8 @@ static int64_t sys_wait4(uint64_t pidArg, uint64_t statusAddr, uint64_t options,
         extern volatile uint64_t g_lapicTickCount;
         parent->wakeupTick = g_lapicTickCount + 5;
         SchedulerBlock(parent);
+        if (HasPendingSignals())
+            return -EINTR;
     }
 }
 
@@ -2108,6 +2129,20 @@ static int64_t sys_nanosleep(uint64_t reqAddr, uint64_t remAddr, uint64_t,
         proc->wakeupTick = g_lapicTickCount + sleepMs;
         SchedulerBlock(proc);
         // When we return here, the scheduler has woken us up.
+        if (HasPendingSignals())
+        {
+            // Fill remainder if caller wants it
+            if (remAddr)
+            {
+                auto* rem = reinterpret_cast<timespec*>(remAddr);
+                // Approximate remaining time (may be 0 if wakeup was near end)
+                uint64_t elapsed = g_lapicTickCount - (proc->wakeupTick - sleepMs);
+                uint64_t remainMs = (elapsed < sleepMs) ? (sleepMs - elapsed) : 0;
+                rem->tv_sec = static_cast<int64_t>(remainMs / 1000);
+                rem->tv_nsec = static_cast<int64_t>((remainMs % 1000) * 1000000);
+            }
+            return -EINTR;
+        }
     }
 
     if (remAddr)
@@ -2348,12 +2383,41 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
         {
             auto* pgrp = reinterpret_cast<int*>(arg);
             Process* cur = ProcessCurrent();
-            *pgrp = cur ? static_cast<int>(cur->pid) : 1;
+            if (cur)
+            {
+                Terminal* term = TerminalFindByProcess(cur);
+                if (term)
+                    *pgrp = static_cast<int>(term->foregroundPgid);
+                else
+                    *pgrp = static_cast<int>(cur->pgid);
+            }
+            else
+            {
+                *pgrp = 1;
+            }
             return 0;
         }
 
-        // TIOCSPGRP, TIOCSCTTY
-        if (cmd == 0x5410 || cmd == 0x540E)
+        // TIOCSPGRP
+        if (cmd == 0x5410)
+        {
+            auto* pgrpPtr = reinterpret_cast<const int*>(arg);
+            int newPgid = *pgrpPtr;
+            Process* cur = ProcessCurrent();
+            if (cur)
+            {
+                Terminal* term = TerminalFindByProcess(cur);
+                if (term)
+                {
+                    term->foregroundPgid = static_cast<uint16_t>(newPgid);
+                    DbgPrintf("TIOCSPGRP: pid %u set fg pgid to %d\n", cur->pid, newPgid);
+                }
+            }
+            return 0;
+        }
+
+        // TIOCSCTTY
+        if (cmd == 0x540E)
             return 0;
 
         // TIOCGWINSZ
@@ -2411,13 +2475,38 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
     {
         auto* pgrp = reinterpret_cast<int*>(arg);
         Process* cur = ProcessCurrent();
-        *pgrp = cur ? static_cast<int>(cur->pid) : 1;
+        if (cur)
+        {
+            Terminal* term = TerminalFindByProcess(cur);
+            if (term)
+                *pgrp = static_cast<int>(term->foregroundPgid);
+            else
+                *pgrp = static_cast<int>(cur->pgid);
+        }
+        else
+        {
+            *pgrp = 1;
+        }
         return 0;
     }
 
     // TIOCSPGRP = 0x5410 — set foreground process group
     if (isTtyFd && cmd == 0x5410)
+    {
+        auto* pgrpPtr = reinterpret_cast<const int*>(arg);
+        int newPgid = *pgrpPtr;
+        Process* cur = ProcessCurrent();
+        if (cur)
+        {
+            Terminal* term = TerminalFindByProcess(cur);
+            if (term)
+            {
+                term->foregroundPgid = static_cast<uint16_t>(newPgid);
+                DbgPrintf("TIOCSPGRP: pid %u set fg pgid to %d\n", cur->pid, newPgid);
+            }
+        }
         return 0;
+    }
 
     // TIOCSCTTY = 0x540E — set controlling terminal
     if (isTtyFd && cmd == 0x540E)
@@ -3114,6 +3203,24 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
                 self->wakeupTick = g_lapicTickCount + timeout_ms;
             }
             SchedulerBlock(self);
+            if (HasPendingSignals())
+            {
+                // Clean up waiters before returning
+                InputRemoveWaiter(self);
+                for (uint64_t i = 0; i < nfds && i < 16; i++)
+                {
+                    if (fds[i].fd < 0) continue;
+                    FdEntry* fde2 = FdGet(proc, fds[i].fd);
+                    if (!fde2) continue;
+                    if (fde2->type == FdType::Pipe && fde2->handle && (fds[i].events & POLLIN))
+                    {
+                        auto* pb2 = static_cast<PipeBuffer*>(fde2->handle);
+                        if (!(fde2->flags & 1) && pb2->readerWaiter == self)
+                            pb2->readerWaiter = nullptr;
+                    }
+                }
+                return -EINTR;
+            }
         }
 
         // Clean up waiters

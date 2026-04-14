@@ -21,6 +21,7 @@ struct Terminal
     uint32_t  bgColor;         // current background (XRGB)
     void*     stdinPipe;       // PipeBuffer* — terminal writes here, bash reads
     void*     stdoutPipe;      // PipeBuffer* — bash writes here, terminal reads
+    uint16_t  foregroundPgid;  // foreground process group (for Ctrl+C)
     bool      active;
     bool      dirty;           // VFB needs compositor blit
 };
@@ -37,5 +38,9 @@ Terminal* TerminalGet(int idx);
 
 // Get the terminal associated with a kernel thread process.
 Terminal* TerminalGetByThread(Process* proc);
+
+// Get the terminal whose child (bash) is the given process or whose
+// child is an ancestor of the given process.
+Terminal* TerminalFindByProcess(Process* proc);
 
 } // namespace brook

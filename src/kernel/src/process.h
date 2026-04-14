@@ -428,6 +428,10 @@ FdEntry*  FdGet(Process* proc, int fd);
 // Returns 0 on success, -ESRCH if not found, -EINVAL if bad signal.
 int ProcessSendSignal(Process* proc, int signum);
 
+// Send a signal to all processes in the given process group.
+// Returns the number of processes signalled.
+int ProcessSendSignalToGroup(uint16_t pgid, int signum);
+
 } // namespace brook
 
 // Called from asm syscall return path (extern "C").

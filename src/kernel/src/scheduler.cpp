@@ -1012,6 +1012,30 @@ Process* ProcessFindByPid(uint16_t pid)
     return result;
 }
 
+int ProcessSendSignalToGroup(uint16_t pgid, int signum)
+{
+    // Collect matching processes under the lock, then signal outside
+    Process* targets[MAX_PROCESSES];
+    uint32_t count = 0;
+
+    uint64_t alf = SchedLockAcquire(g_allProcLock);
+    for (uint32_t i = 0; i < g_processCount; i++)
+    {
+        Process* p = g_allProcesses[i];
+        if (p->pgid == pgid && p->state != ProcessState::Terminated)
+        {
+            if (count < MAX_PROCESSES) targets[count++] = p;
+        }
+    }
+    SchedLockRelease(g_allProcLock, alf);
+
+    SerialPrintf("SIGNAL: SendToGroup pgid=%u sig=%d -> %u procs\n", pgid, signum, count);
+    for (uint32_t i = 0; i < count; i++)
+        ProcessSendSignal(targets[i], signum);
+
+    return static_cast<int>(count);
+}
+
 uint16_t SchedulerAllocPid()
 {
     return g_nextPid++;

@@ -547,6 +547,7 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     }
 
     t->child = child;
+    t->foregroundPgid = child->pgid; // default: bash's own group
 
     // Create the terminal's kernel thread
     Process* thread = KernelThreadCreate("terminal", TerminalThreadFn, t);
@@ -591,25 +592,39 @@ void TerminalWriteInput(int termIdx, const char* data, uint32_t len)
 
     auto* pipe = static_cast<PipeBuffer*>(t->stdinPipe);
 
-    // Local echo: always render printable input to the terminal VFB.
-    // bash/readline turns off ECHO and handles display via stdout writes,
-    // but with TERM=dumb, readline's echo is delayed (buffered in the pipe).
-    // Immediate local echo gives responsive feedback. If readline also echoes,
-    // both render to the same cursor position — harmless overwrite.
     for (uint32_t i = 0; i < len; i++)
     {
         char ch = data[i];
-        if (ch == '\r') ch = '\n';
-        if (ch >= 32 || ch == '\n' || ch == '\b')
+
+        // Ctrl+C (ETX, 0x03) → echo ^C and newline, don't pass to pipe
+        // (signal delivery is handled by the compositor)
+        if (ch == 0x03)
         {
-            TermRenderGlyph(t, ch);
+            TermRenderGlyph(t, '^');
+            TermRenderGlyph(t, 'C');
+            TermRenderGlyph(t, '\n');
+            t->dirty = true;
+            t->child->fbDirty = 1;
+            CompositorWake();
+            continue;
         }
+
+        // Local echo for printable input
+        char echo = ch;
+        if (echo == '\r') echo = '\n';
+        if (echo >= 32 || echo == '\n' || echo == '\b')
+            TermRenderGlyph(t, echo);
     }
     t->dirty = true;
     t->child->fbDirty = 1;
     CompositorWake();
 
-    pipe->write(data, len);
+    // Write non-signal bytes to pipe
+    for (uint32_t i = 0; i < len; i++)
+    {
+        if (data[i] == 0x03) continue;
+        pipe->write(&data[i], 1);
+    }
 
     // Wake bash if it's blocked on stdin read
     if (t->child && t->child->state == ProcessState::Blocked)
@@ -630,6 +645,29 @@ Terminal* TerminalGetByThread(Process* proc)
     for (uint32_t i = 0; i < g_terminalCount; i++)
     {
         if (g_terminals[i].thread == proc) return &g_terminals[i];
+    }
+    return nullptr;
+}
+
+Terminal* TerminalFindByProcess(Process* proc)
+{
+    if (!proc) return nullptr;
+    for (uint32_t i = 0; i < g_terminalCount; i++)
+    {
+        if (g_terminals[i].child == proc) return &g_terminals[i];
+    }
+    // Check if proc is a descendant of any terminal's child
+    for (uint32_t i = 0; i < g_terminalCount; i++)
+    {
+        if (!g_terminals[i].child) continue;
+        // Walk up parentPid chain
+        Process* p = proc;
+        for (int depth = 0; depth < 16 && p; depth++)
+        {
+            if (p == g_terminals[i].child) return &g_terminals[i];
+            if (p->parentPid == 0) break;
+            p = ProcessFindByPid(p->parentPid);
+        }
     }
     return nullptr;
 }

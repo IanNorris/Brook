@@ -586,13 +586,20 @@ static void CompositorLoopWM()
 
             if (signum)
             {
-                // Find the terminal's child process and send signal
+                // Find the terminal's child process and send signal to its group
                 for (uint32_t ti = 0; ti < MAX_TERMINALS; ti++)
                 {
                     Terminal* t = TerminalGet(static_cast<int>(ti));
                     if (t && t->child == focused->proc)
                     {
-                        ProcessSendSignal(t->child, signum);
+                        // Echo ^C to terminal
+                        if (signum == 2)
+                        {
+                            char ctrlc = 0x03;
+                            TerminalWriteInput(static_cast<int>(ti), &ctrlc, 1);
+                        }
+                        // Send signal to foreground process group
+                        ProcessSendSignalToGroup(t->foregroundPgid, signum);
                         break;
                     }
                 }
