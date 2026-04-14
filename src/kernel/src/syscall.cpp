@@ -406,26 +406,9 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
 
                 buf[bytesRead++] = static_cast<uint8_t>(c);
 
-                // In non-canonical mode, bash without readline cannot echo
-                // typed characters itself. Always echo to TTY framebuffer.
-                // Skip serial echo here — bash writes prompts/output to
-                // stderr which already goes to serial.
-                {
-                    if (c == '\n')
-                    {
-                        TtyPutChar('\n');
-                    }
-                    else if (c >= ' ' && c <= '~')
-                    {
-                        TtyPutChar(c);
-                    }
-                    else if (c == '\x7f' || c == '\b')
-                    {
-                        TtyPutChar('\b');
-                        TtyPutChar(' ');
-                        TtyPutChar('\b');
-                    }
-                }
+                // Don't echo here — bash handles its own echo in
+                // non-canonical mode by redisplaying the line on Enter.
+                // Kernel echo would duplicate every character.
             }
             return static_cast<int64_t>(bytesRead);
         }
@@ -1833,6 +1816,74 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
 
     SerialPrintf("sys_execve: loaded '%s' (%lu bytes) for pid %u\n",
               lookupPath, elfSize, proc->pid);
+
+    // --- Shebang (#!) support ---
+    // If the file starts with "#!", extract the interpreter path and re-exec.
+    if (elfSize >= 2 && elfBuf[0] == '#' && elfBuf[1] == '!')
+    {
+        // Parse interpreter line: "#!<interp> [arg]\n"
+        // Do this BEFORE freeing the buffer.
+        const char* line = reinterpret_cast<const char*>(elfBuf);
+        const char* lineEnd = line + (elfSize < 256 ? elfSize : 256);
+        const char* p = line + 2;
+
+        // Skip whitespace
+        while (p < lineEnd && (*p == ' ' || *p == '\t')) p++;
+
+        // Extract interpreter path
+        char interpPath[128];
+        uint32_t interpLen = 0;
+        while (p < lineEnd && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r' && *p != '\0')
+        {
+            if (interpLen < sizeof(interpPath) - 1)
+                interpPath[interpLen++] = *p;
+            p++;
+        }
+        interpPath[interpLen] = '\0';
+
+        // Skip whitespace to optional arg
+        while (p < lineEnd && (*p == ' ' || *p == '\t')) p++;
+
+        char interpArg[128];
+        uint32_t argLen = 0;
+        while (p < lineEnd && *p != '\n' && *p != '\r' && *p != '\0')
+        {
+            if (argLen < sizeof(interpArg) - 1)
+                interpArg[argLen++] = *p;
+            p++;
+        }
+        interpArg[argLen] = '\0';
+
+        // Done reading elfBuf — free it now
+        VmmFreePages(bufAddr, ELF_BUF_PAGES);
+
+        SerialPrintf("sys_execve: shebang interp='%s' arg='%s' script='%s'\n",
+                     interpPath, interpArg, lookupPath);
+
+        // Build new argv: [interp, interpArg?, script, original_argv[1:]]
+        static constexpr int MAX_SHEBANG_ARGS = 34;
+        const char* newArgv[MAX_SHEBANG_ARGS];
+        int newArgc = 0;
+        newArgv[newArgc++] = interpPath;
+        if (argLen > 0)
+            newArgv[newArgc++] = interpArg;
+        newArgv[newArgc++] = lookupPath; // the script itself
+
+        // Append original argv[1..] (skip argv[0] which was the script)
+        for (int i = 1; i < argc && newArgc < MAX_SHEBANG_ARGS - 1; i++)
+            newArgv[newArgc++] = kArgv[i];
+        newArgv[newArgc] = nullptr;
+
+        // Build pointer array and recurse
+        uint64_t newArgvPtrs[MAX_SHEBANG_ARGS];
+        for (int i = 0; i < newArgc; i++)
+            newArgvPtrs[i] = reinterpret_cast<uint64_t>(newArgv[i]);
+        newArgvPtrs[newArgc] = 0;
+
+        return sys_execve(reinterpret_cast<uint64_t>(interpPath),
+                          reinterpret_cast<uint64_t>(newArgvPtrs),
+                          envpAddr, 0, 0, 0);
+    }
 
     // --- Replace the process image ---
     uint64_t newStackPtr = 0;
