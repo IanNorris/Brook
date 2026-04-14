@@ -2161,6 +2161,83 @@ static int64_t sys_clock_nanosleep(uint64_t, uint64_t, uint64_t reqAddr,
 }
 
 // ---------------------------------------------------------------------------
+// sys_alarm (37) — deliver SIGALRM after seconds
+// ---------------------------------------------------------------------------
+
+static int64_t sys_alarm(uint64_t seconds, uint64_t, uint64_t,
+                          uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+
+    uint64_t prevRemaining = 0;
+    if (proc->alarmTick != 0)
+    {
+        // Calculate remaining seconds from previous alarm
+        uint64_t now = g_lapicTickCount;
+        if (proc->alarmTick > now)
+            prevRemaining = (proc->alarmTick - now + 999) / 1000; // round up
+    }
+
+    if (seconds == 0)
+        proc->alarmTick = 0; // Cancel alarm
+    else
+        proc->alarmTick = g_lapicTickCount + seconds * 1000;
+
+    return static_cast<int64_t>(prevRemaining);
+}
+
+// ---------------------------------------------------------------------------
+// sys_pause (34) — wait for a signal
+// ---------------------------------------------------------------------------
+
+static int64_t sys_pause(uint64_t, uint64_t, uint64_t,
+                          uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+
+    // Block until a signal is delivered
+    while (!HasPendingSignals())
+    {
+        proc->wakeupTick = g_lapicTickCount + 100; // recheck every 100ms
+        SchedulerBlock(proc);
+    }
+
+    return -EINTR; // pause always returns EINTR
+}
+
+// ---------------------------------------------------------------------------
+// sys_rt_sigsuspend (130) — temporarily replace signal mask and wait
+// ---------------------------------------------------------------------------
+
+static int64_t sys_rt_sigsuspend(uint64_t maskAddr, uint64_t sigsetsize, uint64_t,
+                                  uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    if (sigsetsize != 8) return -EINVAL;
+    if (!maskAddr) return -EFAULT;
+
+    uint64_t newMask = *reinterpret_cast<const uint64_t*>(maskAddr);
+
+    // Save current mask and replace with new one
+    proc->sigSavedMask = proc->sigMask;
+    proc->sigMask = newMask;
+
+    // Block until a signal that isn't blocked is pending
+    while (!HasPendingSignals())
+    {
+        proc->wakeupTick = g_lapicTickCount + 100;
+        SchedulerBlock(proc);
+    }
+
+    // Restore original mask (signal handler will save/restore it too)
+    proc->sigMask = proc->sigSavedMask;
+    return -EINTR;
+}
+
+// ---------------------------------------------------------------------------
 // sys_access (21)
 // ---------------------------------------------------------------------------
 
@@ -3508,13 +3585,62 @@ static int64_t sys_mkdir(uint64_t pathAddr, uint64_t, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
-// sys_sigaltstack (131) — stub
+// sys_sigaltstack (131) — alternate signal stack
 // ---------------------------------------------------------------------------
 
-static int64_t sys_sigaltstack(uint64_t, uint64_t, uint64_t,
+// Linux sigaltstack constants
+static constexpr int SS_ONSTACK  = 1;
+static constexpr int SS_DISABLE  = 2;
+
+struct linux_stack_t {
+    uint64_t ss_sp;
+    int32_t  ss_flags;
+    uint32_t _pad;
+    uint64_t ss_size;
+};
+
+static int64_t sys_sigaltstack(uint64_t ssAddr, uint64_t oldSsAddr, uint64_t,
                                 uint64_t, uint64_t, uint64_t)
 {
-    return 0; // pretend success
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+
+    // Return current state
+    if (oldSsAddr)
+    {
+        auto* oss = reinterpret_cast<linux_stack_t*>(oldSsAddr);
+        oss->ss_sp    = proc->sigAltstackSp;
+        oss->ss_size  = proc->sigAltstackSize;
+        oss->ss_flags = proc->sigAltstackFlags;
+        if (proc->inSignalHandler && proc->sigAltstackSp != 0)
+            oss->ss_flags |= SS_ONSTACK;
+    }
+
+    // Set new state
+    if (ssAddr)
+    {
+        // Cannot change altstack while executing on it
+        if (proc->inSignalHandler && proc->sigAltstackSp != 0)
+            return -EPERM;
+
+        auto* ss = reinterpret_cast<const linux_stack_t*>(ssAddr);
+        if (ss->ss_flags & SS_DISABLE)
+        {
+            proc->sigAltstackSp    = 0;
+            proc->sigAltstackSize  = 0;
+            proc->sigAltstackFlags = SS_DISABLE;
+        }
+        else
+        {
+            if (ss->ss_size < 2048) // MINSIGSTKSZ
+                return -ENOMEM;
+            proc->sigAltstackSp    = ss->ss_sp;
+            proc->sigAltstackSize  = static_cast<uint32_t>(ss->ss_size);
+            proc->sigAltstackFlags = 0;
+        }
+    }
+
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -3990,6 +4116,9 @@ void SyscallTableInit()
     g_syscallTable[SYS_GETPGID]         = sys_getpgid;
     g_syscallTable[SYS_GETSID]          = sys_getsid;
     g_syscallTable[SYS_SIGALTSTACK]     = sys_sigaltstack;
+    g_syscallTable[SYS_ALARM]           = sys_alarm;
+    g_syscallTable[SYS_PAUSE]           = sys_pause;
+    g_syscallTable[SYS_RT_SIGSUSPEND]   = sys_rt_sigsuspend;
     g_syscallTable[SYS_STATFS]          = sys_statfs;
     g_syscallTable[SYS_FSTATFS]         = sys_fstatfs;
     g_syscallTable[SYS_GETTID]          = sys_gettid;
@@ -4078,7 +4207,9 @@ static const char* SyscallName(uint64_t num)
     case 115: return "getgroups"; case 116: return "setgroups";
     case 117: return "getresuid"; case 120: return "getresgid";
     case 121: return "getpgid";   case 124: return "getsid";
-    case 131: return "sigaltstack"; case 134: return "statfs";
+    case 131: return "sigaltstack"; case 130: return "rt_sigsuspend";
+    case 134: return "statfs";
+    case 34: return "pause"; case 37: return "alarm";
     case 135: return "fstatfs";   case 157: return "prctl";
     case 158: return "arch_prctl"; case 186: return "gettid";
     case 200: return "tkill";     case 217: return "getdents64";

@@ -103,6 +103,9 @@ static constexpr uint64_t SYS_DUP3            = 292;
 static constexpr uint64_t SYS_RSEQ            = 334;
 static constexpr uint64_t SYS_PSELECT6        = 270;
 static constexpr uint64_t SYS_FACCESSAT2      = 439;
+static constexpr uint64_t SYS_ALARM           = 37;
+static constexpr uint64_t SYS_PAUSE           = 34;
+static constexpr uint64_t SYS_RT_SIGSUSPEND   = 130;
 
 // Syscall function type -- same signature as Linux: returns int64_t,
 // up to 6 arguments via rdi, rsi, rdx, r10->rcx, r8, r9.

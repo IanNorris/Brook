@@ -402,10 +402,21 @@ static void TerminalThreadFn(void* arg)
 
         if (t->dirty)
         {
-            t->child->fbDirty = 1;
+            Process* child = t->child;
+            if (child && child->state != ProcessState::Terminated)
+                child->fbDirty = 1;
             t->dirty = false;
             CompositorWake();
         }
+    }
+
+    // Terminal thread is exiting — detach from compositor.
+    // Clear child's VFB pointer so compositor won't blit stale memory.
+    Process* child = t->child;
+    if (child)
+    {
+        __atomic_store_n(&child->fbVirtual, static_cast<uint32_t*>(nullptr), __ATOMIC_RELEASE);
+        child->fbVfbWidth = 0;
     }
 
     t->active = false;
@@ -675,6 +686,34 @@ Terminal* TerminalFindByProcess(Process* proc)
         }
     }
     return nullptr;
+}
+
+void TerminalClose(Terminal* t)
+{
+    if (!t || !t->active) return;
+
+    KPrintf("TERMINAL: closing terminal (bash pid=%u)\n",
+            t->child ? t->child->pid : 0);
+
+    // Signal the terminal thread to stop
+    t->active = false;
+
+    // Kill the child process (bash) if still alive
+    if (t->child && t->child->state != ProcessState::Terminated)
+    {
+        ProcessSendSignal(t->child, 9); // SIGKILL
+    }
+
+    // Clear child's VFB pointer so compositor won't blit stale data
+    if (t->child)
+    {
+        __atomic_store_n(&t->child->fbVirtual, static_cast<uint32_t*>(nullptr), __ATOMIC_RELEASE);
+        t->child->fbVfbWidth = 0;
+    }
+
+    // Wake the terminal thread so it can exit its loop
+    if (t->thread)
+        SchedulerUnblock(t->thread);
 }
 
 } // namespace brook

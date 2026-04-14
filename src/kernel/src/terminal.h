@@ -43,4 +43,7 @@ Terminal* TerminalGetByThread(Process* proc);
 // child is an ancestor of the given process.
 Terminal* TerminalFindByProcess(Process* proc);
 
+// Shut down a terminal: kill child, stop thread, clean up.
+void TerminalClose(Terminal* t);
+
 } // namespace brook

@@ -316,6 +316,14 @@ struct Process
     uint64_t sigPending;        // Pending signals bitmask
     uint64_t sigSavedMask;      // Signal mask saved before handler (restored by sigreturn)
 
+    // Signal alternate stack
+    uint64_t sigAltstackSp;     // Alternate stack pointer (0 = disabled)
+    uint32_t sigAltstackSize;   // Alternate stack size
+    uint32_t sigAltstackFlags;  // SS_DISABLE, SS_ONSTACK, etc.
+
+    // Alarm timer (SIGALRM delivery)
+    uint64_t alarmTick;         // LAPIC tick at which to deliver SIGALRM (0 = disabled)
+
     // Signal delivery state
     bool     inSignalHandler;   // Currently executing a user signal handler
     bool     sigReturnPending;  // Set by sys_rt_sigreturn, handled by SyscallCheckSignals

@@ -534,6 +534,11 @@ static void CompositorLoopWM()
         // Handle terminated processes
         if (p->state == ProcessState::Terminated)
         {
+            // If this is a terminal window, shut down the terminal properly
+            Terminal* term = TerminalFindByProcess(p);
+            if (term)
+                TerminalClose(term);
+
             WmDestroyWindow(sorted[i]);
             CompositorUnregisterProcess(p);
             continue;
@@ -663,7 +668,12 @@ static void CompositorHandleMouseWM()
                 if (w && w->proc)
                 {
                     SerialPrintf("WM: close window %d '%s'\n", hit.windowIndex, w->title);
-                    ProcessSendSignal(w->proc, 15); // SIGTERM
+                    // For terminal windows, use TerminalClose for clean shutdown
+                    Terminal* term = TerminalFindByProcess(w->proc);
+                    if (term)
+                        TerminalClose(term);
+                    else
+                        ProcessSendSignal(w->proc, 15); // SIGTERM
                 }
                 break;
             }

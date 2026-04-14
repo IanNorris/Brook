@@ -666,6 +666,22 @@ void SchedulerTimerTick()
     if (cpu == 0)
     {
         CheckBlockedWakeups();
+
+        // Check alarm timers for all processes
+        uint64_t now = g_lapicTickCount;
+        uint64_t alf_alarm = SchedLockAcquire(g_allProcLock);
+        for (uint32_t i = 0; i < g_processCount; ++i)
+        {
+            Process* p = g_allProcesses[i];
+            if (p->alarmTick != 0 && now >= p->alarmTick &&
+                p->state != ProcessState::Terminated)
+            {
+                p->alarmTick = 0; // one-shot
+                ProcessSendSignal(p, 14); // SIGALRM
+            }
+        }
+        SchedLockRelease(g_allProcLock, alf_alarm);
+
         ReapTerminated();
         // Notify policy of time passing (for anti-starvation boosts etc.).
         uint64_t rlf_tick = SchedLockAcquire(g_readyLock);
