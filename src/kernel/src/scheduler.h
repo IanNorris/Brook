@@ -69,6 +69,24 @@ void SchedulerStop(Process* proc);
 // Reap (destroy) a terminated child process after wait4 collects its status.
 void SchedulerReapChild(Process* child);
 
+// Snapshot of a process for procfs.
+struct ProcessSnapshot {
+    uint16_t pid;
+    uint16_t parentPid;
+    uint16_t pgid;
+    uint16_t sid;
+    ProcessState state;
+    char name[32];
+    uint64_t stackBase;
+    uint64_t stackTop;
+    uint64_t programBreak;
+    int32_t runningOnCpu;
+};
+
+// Take a snapshot of all processes.  Fills `out` with up to `maxCount` entries.
+// Returns the number of entries written.
+uint32_t SchedulerSnapshotProcesses(ProcessSnapshot* out, uint32_t maxCount);
+
 // Register a scheduling policy. Called by scheduler modules during init().
 // Multiple policies can be registered; only the active one is used.
 extern "C" void SchedulerRegisterPolicy(const SchedOps* ops);

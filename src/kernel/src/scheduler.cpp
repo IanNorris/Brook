@@ -1140,6 +1140,32 @@ void SchedulerReapChild(Process* child)
     ProcessDestroy(child);
 }
 
+uint32_t SchedulerSnapshotProcesses(ProcessSnapshot* out, uint32_t maxCount)
+{
+    uint32_t count = 0;
+    uint64_t flags = SchedLockAcquire(g_allProcLock);
+    for (uint32_t i = 0; i < g_processCount && count < maxCount; ++i)
+    {
+        Process* p = g_allProcesses[i];
+        if (!p) continue;
+        ProcessSnapshot& s = out[count++];
+        s.pid = p->pid;
+        s.parentPid = p->parentPid;
+        s.pgid = p->pgid;
+        s.sid = p->sid;
+        s.state = p->state;
+        s.runningOnCpu = p->runningOnCpu;
+        s.stackBase = p->stackBase;
+        s.stackTop = p->stackTop;
+        s.programBreak = p->programBreak;
+        for (uint32_t j = 0; j < 31 && p->name[j]; ++j)
+            s.name[j] = p->name[j];
+        s.name[31] = '\0';
+    }
+    SchedLockRelease(g_allProcLock, flags);
+    return count;
+}
+
 // ---------------------------------------------------------------------------
 // Dynamic policy registration and switching
 // ---------------------------------------------------------------------------

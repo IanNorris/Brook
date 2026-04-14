@@ -25,6 +25,7 @@
 #include "syscall.h"
 #include "process.h"
 #include "scheduler.h"
+#include "procfs.h"
 #include "compositor.h"
 #include "serial_writer.h"
 #include "profiler.h"
@@ -217,6 +218,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     // ---- Device / VFS layer ----
     brook::BootLogoProgress(35, "Filesystem");
     brook::VfsInit();
+    brook::ProcFsInit();
+    brook::VfsMount("/proc", "procfs", 0);
 
     // Mount the embedded FAT16 test image as a ramdisk.
     // The image lives in .rodata (read-only pages), so we must copy it to

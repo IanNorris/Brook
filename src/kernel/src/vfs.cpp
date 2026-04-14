@@ -1,5 +1,6 @@
 #include "vfs.h"
 #include "fatfs_glue.h"
+#include "procfs.h"
 #include "memory/heap.h"
 #include "serial.h"
 #include "memory/virtual_memory.h"
@@ -23,10 +24,13 @@ static KMutex g_vfsLock;
 
 static constexpr uint32_t VFS_MAX_MOUNTS = 8;
 
+enum class FsType : uint8_t { FatFs, ProcFs };
+
 struct MountEntry {
-    char    mountPoint[64]; // e.g. "/" or "/boot"
-    FATFS*  fs;             // FatFS work area (heap-allocated at mount time)
-    uint8_t pdrv;           // FatFS physical drive number
+    char    mountPoint[64]; // e.g. "/" or "/boot" or "/proc"
+    FsType  type;           // Filesystem type
+    FATFS*  fs;             // FatFS work area (heap-allocated at mount time; null for virtual FS)
+    uint8_t pdrv;           // FatFS physical drive number (unused for virtual FS)
     bool    used;
 };
 
@@ -402,7 +406,11 @@ void VfsInit()
 bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
 {
     if (!mountPoint || !fsName) return false;
-    if (!StrEq(fsName, "fatfs"))
+
+    bool isProcFs = StrEq(fsName, "procfs");
+    bool isFatFs  = StrEq(fsName, "fatfs");
+
+    if (!isProcFs && !isFatFs)
     {
         SerialPrintf("VFS: unknown filesystem '%s'\n", fsName);
         return false;
@@ -416,6 +424,18 @@ bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
     }
     if (!slot) { SerialPuts("VFS: mount table full\n"); return false; }
 
+    if (isProcFs)
+    {
+        slot->type = FsType::ProcFs;
+        slot->fs   = nullptr;
+        slot->pdrv = 0;
+        slot->used = true;
+        StrCopy(slot->mountPoint, mountPoint, sizeof(slot->mountPoint));
+        DbgPrintf("VFS: mounted procfs at '%s'\n", mountPoint);
+        return true;
+    }
+
+    // FatFS path
     auto* fs = static_cast<FATFS*>(kmalloc(sizeof(FATFS)));
     if (!fs) { SerialPuts("VFS: kmalloc failed for FATFS\n"); return false; }
 
@@ -435,6 +455,7 @@ bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
         return false;
     }
 
+    slot->type = FsType::FatFs;
     slot->fs   = fs;
     slot->pdrv = pdrv;
     slot->used = true;
@@ -458,16 +479,20 @@ bool VfsUnmount(const char* mountPoint)
         if (!g_mounts[i].used) continue;
         if (!StrEq(g_mounts[i].mountPoint, mountPoint)) continue;
 
-        char fatPath[8];
-        fatPath[0] = static_cast<char>('0' + g_mounts[i].pdrv);
-        fatPath[1] = ':'; fatPath[2] = '\0';
+        if (g_mounts[i].type == FsType::FatFs)
+        {
+            char fatPath[8];
+            fatPath[0] = static_cast<char>('0' + g_mounts[i].pdrv);
+            fatPath[1] = ':'; fatPath[2] = '\0';
 
-        KMutexLock(&g_vfsLock);
-        f_unmount(fatPath);
-        KMutexUnlock(&g_vfsLock);
+            KMutexLock(&g_vfsLock);
+            f_unmount(fatPath);
+            KMutexUnlock(&g_vfsLock);
 
-        kfree(g_mounts[i].fs);
-        g_mounts[i].fs   = nullptr;
+            kfree(g_mounts[i].fs);
+            g_mounts[i].fs = nullptr;
+        }
+
         g_mounts[i].used = false;
         SerialPrintf("VFS: unmounted '%s'\n", mountPoint);
         return true;
@@ -485,6 +510,19 @@ Vnode* VfsOpen(const char* path, int flags)
     {
         SerialPrintf("VFS: no mount for '%s'\n", path);
         return nullptr;
+    }
+
+    // Dispatch to virtual filesystems
+    if (mount->type == FsType::ProcFs)
+    {
+        // relPath is relative to /proc, e.g. "meminfo" or "1/stat"
+        // For /proc itself (readdir), relPath will be "" or "/"
+        if (!relPath || !relPath[0] || (relPath[0] == '/' && !relPath[1]))
+            return ProcFsOpenDir(relPath);
+        // Strip leading slash
+        const char* p = relPath;
+        if (p[0] == '/') p++;
+        return ProcFsOpen(p, flags);
     }
 
     char fatPath[256];
@@ -695,6 +733,14 @@ int VfsStatPath(const char* path, VnodeStat* st)
     const char* relPath = nullptr;
     MountEntry* mount   = FindMount(path, &relPath);
     if (!mount) return -1;
+
+    // Dispatch to virtual filesystems
+    if (mount->type == FsType::ProcFs)
+    {
+        const char* p = (relPath && relPath[0] == '/') ? relPath + 1 : relPath;
+        if (!p || !p[0]) { st->size = 0; st->isDir = true; return 0; }
+        return ProcFsStatPath(p, st);
+    }
 
     char fatPath[256];
     BuildFatPath(fatPath, sizeof(fatPath), mount->pdrv, relPath);

@@ -5,6 +5,7 @@
 #include "memory/physical_memory.h"
 #include "memory/virtual_memory.h"
 #include "process.h"
+#include "procfs.h"
 
 // Scheduler stubs for KMutex — test_vfs is single-threaded so these are trivial.
 static brook::Process g_stubProcess = {};
@@ -12,6 +13,12 @@ namespace brook {
     Process* SchedulerCurrentProcess() { return &g_stubProcess; }
     void SchedulerBlock(Process*) {}
     void SchedulerUnblock(Process*) {}
+
+    // Procfs stubs — test_vfs doesn't test procfs.
+    void ProcFsInit() {}
+    Vnode* ProcFsOpen(const char*, int) { return nullptr; }
+    int ProcFsStatPath(const char*, VnodeStat*) { return -1; }
+    Vnode* ProcFsOpenDir(const char*) { return nullptr; }
 }
 
 TEST_MAIN("vfs", {

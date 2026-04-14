@@ -162,6 +162,7 @@ add_executable(kernel
     src/exception_stubs.S
     src/elf_loader.cpp
     src/vfs.cpp
+    src/procfs.cpp
     src/virtio_blk.cpp
     src/acpi.cpp
     src/apic.cpp
