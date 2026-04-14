@@ -206,6 +206,15 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
             (fde->type == FdType::Vnode && !fde->handle))
         {
             const char* buf = reinterpret_cast<const char*>(bufAddr);
+            static uint32_t s_stdoutLog = 0;
+            if (s_stdoutLog < 10 && count > 0 && count < 80)
+            {
+                s_stdoutLog++;
+                SerialPrintf("STDOUT_WRITE: pid %u fd %lu type=%d count=%lu first='%c'\n",
+                             proc ? proc->pid : 0, fd,
+                             fde ? static_cast<int>(fde->type) : -1,
+                             count, buf[0] >= ' ' ? buf[0] : '?');
+            }
             if (count > 0)
             {
                 SerialWriterEnqueue(buf, static_cast<uint32_t>(count));
@@ -249,6 +258,13 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if (fde->type == FdType::DevKeyboard)
     {
         const char* buf = reinterpret_cast<const char*>(bufAddr);
+        static uint32_t s_devkbWriteLog = 0;
+        if (s_devkbWriteLog < 10 && count > 0 && count < 80)
+        {
+            s_devkbWriteLog++;
+            SerialPrintf("DEVKB_WRITE: pid %u fd %lu count=%lu first='%c'\n",
+                         proc ? proc->pid : 0, fd, count, buf[0] >= ' ' ? buf[0] : '?');
+        }
         if (count > 0)
         {
             SerialWriterEnqueue(buf, static_cast<uint32_t>(count));
@@ -406,25 +422,28 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
 
                 buf[bytesRead++] = static_cast<uint8_t>(c);
 
-                // Always echo in non-canonical mode. Bash without readline
-                // sets echo=0 expecting readline to handle it, but since
-                // libreadline.so isn't available, nothing would echo.
-                if (c == '\n')
+                // Echo only if the process has echo enabled (canonical shells).
+                // Non-canonical programs like bash/readline handle their own
+                // echo via write() to /dev/tty.
+                if (proc->ttyEcho)
                 {
-                    SerialWriterEnqueue("\r\n", 2);
-                    TtyPutChar('\n');
-                }
-                else if (c >= ' ' && c <= '~')
-                {
-                    SerialWriterEnqueue(&c, 1);
-                    TtyPutChar(c);
-                }
-                else if (c == '\x7f' || c == '\b')
-                {
-                    SerialWriterEnqueue("\b \b", 3);
-                    TtyPutChar('\b');
-                    TtyPutChar(' ');
-                    TtyPutChar('\b');
+                    if (c == '\n')
+                    {
+                        SerialWriterEnqueue("\r\n", 2);
+                        TtyPutChar('\n');
+                    }
+                    else if (c >= ' ' && c <= '~')
+                    {
+                        SerialWriterEnqueue(&c, 1);
+                        TtyPutChar(c);
+                    }
+                    else if (c == '\x7f' || c == '\b')
+                    {
+                        SerialWriterEnqueue("\b \b", 3);
+                        TtyPutChar('\b');
+                        TtyPutChar(' ');
+                        TtyPutChar('\b');
+                    }
                 }
             }
             return static_cast<int64_t>(bytesRead);
