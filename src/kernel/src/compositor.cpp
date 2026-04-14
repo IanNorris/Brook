@@ -374,7 +374,14 @@ static void CompositorLoop()
         return;
 
     // Restore pixels under the old cursor position before blitting.
-    CursorRestore();
+    // Mark restored rows dirty so the MMIO flip erases the old cursor.
+    if (g_cursorVisible) {
+        uint32_t oldMinY = (g_cursorSaveY >= 0) ? static_cast<uint32_t>(g_cursorSaveY) : 0;
+        uint32_t oldMaxY = static_cast<uint32_t>(g_cursorSaveY) + CURSOR_H;
+        if (oldMaxY > g_physFbHeight) oldMaxY = g_physFbHeight;
+        CursorRestore();
+        MarkDirtyRows(oldMinY, oldMaxY);
+    }
 
     uint32_t compCount = __atomic_load_n(&g_compositedCount, __ATOMIC_ACQUIRE);
     if (compCount > 0)
@@ -438,22 +445,11 @@ static void CompositorLoop()
     {
         int32_t mx, my;
         MouseGetPosition(&mx, &my);
-        // Only redraw if cursor moved
-        if (mx != g_cursorSaveX || my != g_cursorSaveY || !g_cursorVisible)
-        {
-            // Dirty the old cursor region (where CursorRestore wrote).
-            if (g_cursorVisible) {
-                uint32_t oldMinY = (g_cursorSaveY >= 0) ? static_cast<uint32_t>(g_cursorSaveY) : 0;
-                uint32_t oldMaxY = static_cast<uint32_t>(g_cursorSaveY) + CURSOR_H;
-                if (oldMaxY > g_physFbHeight) oldMaxY = g_physFbHeight;
-                MarkDirtyRows(oldMinY, oldMaxY);
-            }
-            // Dirty the new cursor region.
-            uint32_t newMinY = (my >= 0) ? static_cast<uint32_t>(my) : 0;
-            uint32_t newMaxY = static_cast<uint32_t>(my) + CURSOR_H;
-            if (newMaxY > g_physFbHeight) newMaxY = g_physFbHeight;
-            MarkDirtyRows(newMinY, newMaxY);
-        }
+        // Dirty the new cursor region for the MMIO flip.
+        uint32_t newMinY = (my >= 0) ? static_cast<uint32_t>(my) : 0;
+        uint32_t newMaxY = static_cast<uint32_t>(my) + CURSOR_H;
+        if (newMaxY > g_physFbHeight) newMaxY = g_physFbHeight;
+        MarkDirtyRows(newMinY, newMaxY);
         CursorDraw(mx, my);
     }
 
