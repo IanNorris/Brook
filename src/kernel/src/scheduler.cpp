@@ -769,6 +769,11 @@ void SchedulerYield()
     if (proc->fbVfbWidth > 0)
         proc->fbExitColor = (status < 0) ? 0x00CC0000u : 0x00001A3Au;
 
+    // Null out VFB pointer BEFORE marking as Terminated to prevent the
+    // compositor from blitting freed memory (race with ReapTerminated).
+    proc->fbVirtual = nullptr;
+    proc->fbVirtualSize = 0;
+
     proc->state = ProcessState::Terminated;
     proc->exitStatus = status;
 
