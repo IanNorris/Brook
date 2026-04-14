@@ -404,9 +404,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         brook::BootLogoProgress(75, "Network");
         brook::DhcpDiscover(brook::NetGetIf());
         // Quick DNS test
-        // brook::DnsResolve("example.com");  // DISABLED for boot timing test
-        // Try to connect debug channel to host
-        // brook::DebugChannelInit();  // DISABLED for boot timing test
+        brook::DnsResolve("example.com");
     }
 
     // ---- Syscall table ----
@@ -484,6 +482,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
         // Start the compositor kernel thread (blits VFBs to physical FB).
         brook::CompositorStartThread();
+
+        // Start debug channel kernel thread (connects asynchronously).
+        brook::DebugChannelInit();
 
         // Activate APs now — BSP is about to enter the scheduler.
         brook::SmpActivateAPs();

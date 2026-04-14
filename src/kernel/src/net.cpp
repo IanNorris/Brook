@@ -1574,46 +1574,10 @@ static int UintToStr(char* buf, uint32_t val)
 
 static void DebugHandleCommand(const char* cmd, uint32_t len);
 
-// Quick TCP connect with short timeout — for local debug channel only.
-// Returns 0 on success, negative errno on failure.
-static int SockConnectFast(int sockIdx, const SockAddrIn* addr)
+// Kernel thread: attempts to connect the debug channel without blocking boot.
+// Tries once with a short timeout; if no server is listening, exits quietly.
+static void DebugChannelThreadFn(void* /*arg*/)
 {
-    Socket& s = g_sockets[sockIdx];
-    s.remoteIp = addr->sin_addr;
-    s.remotePort = addr->sin_port;
-
-    if (!s.bound) {
-        s.localPort = htons(g_tcpEphemeralPort++);
-        s.localIp = g_netIf ? g_netIf->ipAddr : 0;
-        s.bound = true;
-    }
-
-    s.tcpSndIss = static_cast<uint32_t>(g_ipId) * 12345 +
-                  ntohs(s.localPort) * 67890;
-    s.tcpSndNxt = s.tcpSndIss;
-    s.tcpSndUna = s.tcpSndIss;
-    s.tcpRcvNxt = 0;
-    s.tcpFinRecv = false;
-    s.tcpState = TcpState::SynSent;
-
-    TcpSendSegment(s, TCP_SYN, nullptr, 0);
-    s.tcpSndNxt++;
-
-    // Very short wait — SLIRP responds in <10ms if server is listening
-    for (int i = 0; i < 200000; i++) {
-        if (g_netIf && g_netIf->poll) g_netIf->poll(g_netIf);
-        if (s.tcpState == TcpState::Established) return 0;
-        if (s.tcpState == TcpState::Closed) return -111;
-        __asm__ volatile("pause");
-    }
-
-    s.tcpState = TcpState::Closed;
-    return -110; // ETIMEDOUT
-}
-
-void DebugChannelInit()
-{
-    // Connect to 10.0.2.2:9999 (QEMU host gateway)
     int idx = SockCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (idx < 0) {
         SerialPrintf("debug: failed to create socket\n");
@@ -1626,19 +1590,50 @@ void DebugChannelInit()
     addr.sin_port = htons(9999);
     addr.sin_addr = htonl(0x0A000202); // 10.0.2.2
 
-    int ret = SockConnectFast(idx, &addr);
-    if (ret < 0) {
-        SerialPrintf("debug: no debug server on 10.0.2.2:9999 (skipped)\n");
-        SockClose(idx);
-        return;
+    // Poll with yields instead of busy-spinning.
+    // Try for ~2 seconds (200 iterations × ~10ms yield each).
+    Socket& s = g_sockets[idx];
+    s.remoteIp   = addr.sin_addr;
+    s.remotePort = addr.sin_port;
+
+    if (!s.bound) {
+        s.localPort = htons(g_tcpEphemeralPort++);
+        s.localIp   = g_netIf ? g_netIf->ipAddr : 0;
+        s.bound     = true;
     }
 
-    g_debugSockIdx = idx;
-    SerialPrintf("debug: connected to host debug server\n");
+    s.tcpSndIss  = static_cast<uint32_t>(g_ipId) * 12345 + ntohs(s.localPort) * 67890;
+    s.tcpSndNxt  = s.tcpSndIss;
+    s.tcpSndUna  = s.tcpSndIss;
+    s.tcpRcvNxt  = 0;
+    s.tcpFinRecv = false;
+    s.tcpState   = TcpState::SynSent;
 
-    // Send greeting
-    const char* hello = "=== Brook Debug Channel ===\n";
-    SockSend(idx, hello, NetStrLen(hello));
+    TcpSendSegment(s, TCP_SYN, nullptr, 0);
+    s.tcpSndNxt++;
+
+    for (int i = 0; i < 200; i++) {
+        if (g_netIf && g_netIf->poll) g_netIf->poll(g_netIf);
+        if (s.tcpState == TcpState::Established) {
+            g_debugSockIdx = idx;
+            SerialPrintf("debug: connected to host debug server\n");
+            const char* hello = "=== Brook Debug Channel ===\n";
+            SockSend(idx, hello, NetStrLen(hello));
+            return;
+        }
+        if (s.tcpState == TcpState::Closed) break;
+        SchedulerYield();
+    }
+
+    SerialPrintf("debug: no debug server on 10.0.2.2:9999 (skipped)\n");
+    s.tcpState = TcpState::Closed;
+    SockClose(idx);
+}
+
+void DebugChannelInit()
+{
+    if (!g_netIf) return;
+    KernelThreadCreate("debug_ch", DebugChannelThreadFn, nullptr, 3);
 }
 
 void DebugChannelSend(const char* msg)
