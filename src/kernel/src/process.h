@@ -261,9 +261,13 @@ Process* ProcessFindByPid(uint16_t pid);
 
 // Create a new process, loading an ELF binary from a memory buffer.
 // Returns null on failure.
+// If stdFds is non-null, it points to 3 FdEntry structs used for fd 0/1/2
+// instead of the default DevKeyboard/serial setup. This allows the caller
+// to pre-wire pipe fds for terminal emulation.
 Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
                        int argc, const char* const* argv,
-                       int envc, const char* const* envp);
+                       int envc, const char* const* envp,
+                       const FdEntry* stdFds = nullptr);
 
 // Create a kernel-mode thread. Runs `fn(arg)` in ring 0 with the kernel's
 // page table. Has its own kernel stack and is scheduled like any process.

@@ -13,6 +13,8 @@
 #include "process.h"
 #include "scheduler.h"
 #include "compositor.h"
+#include "window.h"
+#include "terminal.h"
 #include "tty.h"
 #include "display.h"
 #include "font_atlas.h"
@@ -297,15 +299,36 @@ static Process* SpawnProcess(const char* path, int argc, const char* const* argv
     proc->name[ni++] = static_cast<char>('0' + g_spawnCount % 10);
     proc->name[ni] = '\0';
 
-    // Set up compositor placement (skip VFB in full-screen TTY mode)
+    // Set up compositor placement
     if (!g_ttyFull)
     {
-        int16_t destX, destY;
-        uint32_t cols, rows;
-        ComputeGridPosition(g_spawnCount, &destX, &destY, &cols, &rows);
-        CompositorSetupProcess(proc, destX, destY, g_vfbWidth, g_vfbHeight, g_scale);
-        DbgPrintf("SHELL: spawned '%s' pid=%u at (%d,%d) grid=%ux%u scale=%u\n",
-                      proc->name, proc->pid, destX, destY, cols, rows, g_scale);
+        if (WmIsActive())
+        {
+            // WM mode: create a window for this process
+            // Default window position: cascade from top-left
+            int16_t winX = static_cast<int16_t>(40 + (g_spawnCount % 8) * 30);
+            int16_t winY = static_cast<int16_t>(40 + (g_spawnCount % 8) * 30);
+            uint16_t clientW = static_cast<uint16_t>(g_vfbWidth);
+            uint16_t clientH = static_cast<uint16_t>(g_vfbHeight);
+
+            // Set up the VFB at the window's client area position
+            CompositorSetupProcess(proc, winX + WM_BORDER_WIDTH,
+                                   winY + WM_TITLE_BAR_HEIGHT + WM_BORDER_WIDTH,
+                                   clientW, clientH, 1);
+
+            WmCreateWindow(proc, winX, winY, clientW, clientH, proc->name);
+            DbgPrintf("SHELL: spawned '%s' pid=%u as WM window at (%d,%d) %ux%u\n",
+                          proc->name, proc->pid, winX, winY, clientW, clientH);
+        }
+        else
+        {
+            int16_t destX, destY;
+            uint32_t cols, rows;
+            ComputeGridPosition(g_spawnCount, &destX, &destY, &cols, &rows);
+            CompositorSetupProcess(proc, destX, destY, g_vfbWidth, g_vfbHeight, g_scale);
+            DbgPrintf("SHELL: spawned '%s' pid=%u at (%d,%d) grid=%ux%u scale=%u\n",
+                          proc->name, proc->pid, destX, destY, cols, rows, g_scale);
+        }
     }
     SchedulerAddProcess(proc);
     KPrintf("  → %s (pid %u)\n", proc->name, proc->pid);
@@ -378,6 +401,29 @@ static int ExecCommand(int argc, const char* const* argv)
         return 0;
     }
 
+    // Built-in: source <script> — execute a boot script
+    if (StrEq(cmd, "source") && argc >= 2)
+    {
+        char resolved[128];
+        // Try as-is first, then with / prefix
+        if (argv[1][0] == '/')
+        {
+            for (uint32_t i = 0; i < sizeof(resolved) - 1 && argv[1][i]; i++)
+                resolved[i] = argv[1][i];
+            resolved[sizeof(resolved) - 1] = '\0';
+        }
+        else
+        {
+            resolved[0] = '/';
+            uint32_t i = 0;
+            for (; i < sizeof(resolved) - 2 && argv[1][i]; i++)
+                resolved[i + 1] = argv[1][i];
+            resolved[i + 1] = '\0';
+        }
+        ShellExecScript(resolved);
+        return 0;
+    }
+
     // Built-in: ps
     if (StrEq(cmd, "ps"))
     {
@@ -399,9 +445,72 @@ static int ExecCommand(int argc, const char* const* argv)
         return 0;
     }
 
-    // Built-in: set <key> <value>
-    if (StrEq(cmd, "set") && argc >= 3)
+    // Built-in: set <key> [<value>]
+    if (StrEq(cmd, "set") && argc >= 2)
     {
+        // 'set wm' — enable window manager mode (no value needed)
+        if (StrEq(argv[1], "wm"))
+        {
+            WmInit();
+            WmSetActive(true);
+            g_ttyFull = false; // WM takes over the screen
+
+            // Try to load wallpaper from disk
+            using namespace brook;
+            VnodeStat st;
+            if (VfsStatPath("/WALLPAPER.RAW", &st) == 0 && st.size > 0)
+            {
+                constexpr uint32_t WP_W = 1920;
+                constexpr uint32_t WP_H = 1080;
+                uint64_t expected = (uint64_t)WP_W * WP_H * 4;
+                if (st.size == expected)
+                {
+                    auto* pixels = static_cast<uint32_t*>(kmalloc(st.size));
+                    if (pixels)
+                    {
+                        Vnode* vn = VfsOpen("/WALLPAPER.RAW", 0);
+                        if (vn)
+                        {
+                            uint64_t off = 0;
+                            uint64_t remaining = st.size;
+                            auto* dest = reinterpret_cast<uint8_t*>(pixels);
+                            while (remaining > 0)
+                            {
+                                uint64_t chunk = remaining > 65536 ? 65536 : remaining;
+                                int rd = VfsRead(vn, dest + off, chunk, &off);
+                                if (rd <= 0) break;
+                                remaining -= rd;
+                            }
+                            VfsClose(vn);
+                            if (remaining == 0)
+                            {
+                                CompositorSetWallpaper(pixels, WP_W, WP_H);
+                                KPrintf("wallpaper: loaded (%ux%u)\n", WP_W, WP_H);
+                            }
+                            else
+                            {
+                                kfree(pixels);
+                                KPrintf("wallpaper: read error\n");
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    KPrintf("wallpaper: unexpected size %llu (expected %llu)\n", st.size, expected);
+                }
+            }
+
+            KPrintf("window manager: enabled\n");
+            return 0;
+        }
+
+        if (argc < 3)
+        {
+            KPrintf("set: missing value\n");
+            return -1;
+        }
+
         if (StrEq(argv[1], "grid"))
         {
             // Parse "CxR" format
@@ -471,6 +580,47 @@ static int ExecCommand(int argc, const char* const* argv)
         else
         {
             KPrintf("set: unknown key '%s'\n", argv[1]);
+        }
+        return 0;
+    }
+
+    // Built-in: terminal — spawn a terminal window (requires WM mode)
+    if (StrEq(cmd, "terminal"))
+    {
+        if (!WmIsActive())
+        {
+            KPrintf("terminal: window manager not active (use 'set wm' first)\n");
+            return -1;
+        }
+
+        // Default terminal size: 800x600 client area
+        uint32_t clientW = 800;
+        uint32_t clientH = 600;
+
+        int termIdx = TerminalCreate(clientW, clientH);
+        if (termIdx < 0)
+        {
+            KPrintf("terminal: failed to create terminal\n");
+            return -1;
+        }
+
+        // Create a WM window for the terminal
+        Terminal* t = TerminalGet(termIdx);
+        if (t && t->child)
+        {
+            int16_t winX = static_cast<int16_t>(60 + (termIdx % 6) * 40);
+            int16_t winY = static_cast<int16_t>(60 + (termIdx % 6) * 40);
+
+            // Set up compositor placement for the child process (its VFB is the terminal VFB)
+            CompositorSetupProcess(t->child, winX + WM_BORDER_WIDTH,
+                                   winY + WM_TITLE_BAR_HEIGHT + WM_BORDER_WIDTH,
+                                   clientW, clientH, 1);
+
+            WmCreateWindow(t->child, winX, winY,
+                          static_cast<uint16_t>(clientW),
+                          static_cast<uint16_t>(clientH), "Terminal");
+
+            KPrintf("terminal: created (bash pid %u)\n", t->child->pid);
         }
         return 0;
     }

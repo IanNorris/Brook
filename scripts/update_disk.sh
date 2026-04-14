@@ -213,15 +213,22 @@ if [ -f "$init_rc" ]; then
     sync_file "$init_rc" "INIT.RC"
 fi
 
-# --- Data files (Lua scripts, etc.) ---
+# --- Data files (Lua scripts, boot configs) ---
 data_scripts="${ROOT_DIR}/data/scripts"
 if [ -d "$data_scripts" ]; then
-    for f in "$data_scripts"/*.lua; do
+    for f in "$data_scripts"/*.lua "$data_scripts"/*.rc; do
         [ -f "$f" ] || continue
         dname="$(basename "$f" | tr '[:lower:]' '[:upper:]')"
         mcopy -o -i "${DISK_IMG}" "$f" "::${dname}"
         echo "  synced data: ${dname}"
     done
+fi
+
+# --- Wallpaper ---
+wallpaper="${ROOT_DIR}/data/wallpaper.raw"
+if [ -f "$wallpaper" ]; then
+    echo "Wallpaper:"
+    sync_file "$wallpaper" "WALLPAPER.RAW"
 fi
 
 echo ""

@@ -148,6 +148,8 @@ add_executable(kernel
     src/process.cpp
     src/scheduler.cpp
     src/compositor.cpp
+    src/window.cpp
+    src/terminal.cpp
     src/display.cpp
     src/mouse.cpp
     src/clock_overlay.cpp

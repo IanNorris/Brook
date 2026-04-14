@@ -6,6 +6,9 @@
 #include "memory/virtual_memory.h"
 #include "memory/address.h"
 #include "mouse.h"
+#include "window.h"
+#include "terminal.h"
+#include "input.h"
 
 namespace brook {
 
@@ -54,6 +57,11 @@ static constexpr uint32_t COMPOSITE_INTERVAL = 16; // ~60 Hz fallback
 // so we see output even during init before DOOM signals dirty.
 static constexpr uint32_t FORCE_BLIT_INTERVAL_MS = 500;
 static uint64_t g_lastForceBlitTick = 0;
+
+// Wallpaper: raw XRGB pixel data loaded from disk, or solid color fallback.
+static uint32_t* g_wallpaper       = nullptr;
+static uint32_t  g_wallpaperWidth  = 0;
+static uint32_t  g_wallpaperHeight = 0;
 
 void CompositorInit()
 {
@@ -268,6 +276,84 @@ static void BlitProcess(Process* proc, bool forceAll)
     }
 }
 
+// Blit a process VFB at an explicit destination (for WM-managed windows).
+static void BlitProcessAt(Process* proc, int dstX0, int dstY0, bool forceAll)
+{
+    if (!proc->fbVirtual || proc->fbVfbWidth == 0) return;
+    if (!forceAll && !proc->fbDirty) return;
+    proc->fbDirty = 0;
+
+    const uint32_t* src = proc->fbVirtual;
+    const uint32_t  srcW = proc->fbVfbWidth;
+    const uint32_t  srcH = proc->fbVfbHeight;
+    const uint32_t  srcStride = proc->fbVfbStride;
+
+    uint32_t startDy = 0, startDx = 0;
+    if (dstY0 < 0) startDy = static_cast<uint32_t>(-dstY0);
+    if (dstX0 < 0) startDx = static_cast<uint32_t>(-dstX0);
+
+    uint32_t endDy = srcH;
+    uint32_t endDx = srcW;
+    if (dstY0 + static_cast<int>(endDy) > static_cast<int>(g_physFbHeight))
+        endDy = g_physFbHeight - static_cast<uint32_t>(dstY0);
+    if (dstX0 + static_cast<int>(endDx) > static_cast<int>(g_physFbWidth))
+        endDx = g_physFbWidth - static_cast<uint32_t>(dstX0);
+
+    MarkDirtyRows(static_cast<uint32_t>(dstY0) + startDy,
+                  static_cast<uint32_t>(dstY0) + endDy);
+
+    uint32_t*       dstBase   = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
+    const uint32_t  dstStride = g_backBuffer ? g_backBufStride : g_physFbStride;
+
+    uint32_t copyWidth = (endDx - startDx) * 4;
+    for (uint32_t dy = startDy; dy < endDy; ++dy)
+    {
+        const uint32_t* srcRow = src + dy * srcStride + startDx;
+        uint32_t* dstRow = dstBase +
+            static_cast<uint32_t>(dstY0 + dy) * dstStride +
+            static_cast<uint32_t>(dstX0 + startDx);
+        __builtin_memcpy(dstRow, srcRow, copyWidth);
+    }
+}
+
+// Draw wallpaper (or solid background) into backbuffer.
+static void BlitWallpaper()
+{
+    uint32_t*      dstBase   = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
+    const uint32_t dstStride = g_backBuffer ? g_backBufStride : g_physFbStride;
+
+    if (g_wallpaper && g_wallpaperWidth > 0 && g_wallpaperHeight > 0)
+    {
+        uint32_t copyH = (g_wallpaperHeight < g_physFbHeight) ? g_wallpaperHeight : g_physFbHeight;
+        uint32_t copyW = (g_wallpaperWidth < g_physFbWidth) ? g_wallpaperWidth : g_physFbWidth;
+        uint32_t offX = (g_physFbWidth > copyW) ? (g_physFbWidth - copyW) / 2 : 0;
+        uint32_t offY = (g_physFbHeight > copyH) ? (g_physFbHeight - copyH) / 2 : 0;
+
+        // Clear edges if wallpaper doesn't fill
+        if (offX > 0 || offY > 0)
+        {
+            for (uint32_t y = 0; y < g_physFbHeight; ++y)
+                for (uint32_t x = 0; x < g_physFbWidth; ++x)
+                    dstBase[y * dstStride + x] = 0x00001A3A;
+        }
+
+        for (uint32_t y = 0; y < copyH; ++y)
+        {
+            __builtin_memcpy(
+                dstBase + (offY + y) * dstStride + offX,
+                g_wallpaper + y * g_wallpaperWidth,
+                copyW * 4);
+        }
+    }
+    else
+    {
+        for (uint32_t y = 0; y < g_physFbHeight; ++y)
+            for (uint32_t x = 0; x < g_physFbWidth; ++x)
+                dstBase[y * dstStride + x] = 0x00001A3A;
+    }
+    MarkAllDirty();
+}
+
 // ---------------------------------------------------------------------------
 // Hardware cursor — simple 12×16 arrow pointer
 // ---------------------------------------------------------------------------
@@ -368,13 +454,168 @@ static volatile bool g_compositorHalted = false;
 // The compositor Process pointer — set once the thread starts.
 static Process* g_compositorProcess = nullptr;
 
+// Forward declaration
+static void CompositorHandleMouseWM();
+
+// WM-mode compositor loop: wallpaper → windows (z-ordered) → chrome → cursor.
+static void CompositorLoopWM()
+{
+    uint64_t now = g_lapicTickCount;
+    bool forceAll = (now - g_lastForceBlitTick >= FORCE_BLIT_INTERVAL_MS);
+    if (forceAll) g_lastForceBlitTick = now;
+
+    // 1. Draw wallpaper as background
+    BlitWallpaper();
+
+    // 2. Get windows in z-order (back to front) and blit their VFBs
+    int sorted[WM_MAX_WINDOWS];
+    uint32_t wcount = WmGetZOrder(sorted, WM_MAX_WINDOWS);
+
+    for (uint32_t i = 0; i < wcount; ++i)
+    {
+        Window* w = WmGetWindow(sorted[i]);
+        if (!w || !w->proc || !w->visible) continue;
+
+        Process* p = w->proc;
+
+        // Handle terminated processes
+        if (p->state == ProcessState::Terminated)
+        {
+            WmDestroyWindow(sorted[i]);
+            CompositorUnregisterProcess(p);
+            continue;
+        }
+
+        // Update process destX/destY to match window client area
+        p->fbDestX = w->clientX();
+        p->fbDestY = w->clientY();
+
+        if (p->fbVirtual && p->fbVfbWidth > 0)
+            BlitProcessAt(p, w->clientX(), w->clientY(), forceAll);
+    }
+
+    // 3. Draw window chrome (title bars, borders, buttons)
+    if (g_backBuffer)
+        WmRenderChrome(g_backBuffer, g_backBufStride, g_physFbWidth, g_physFbHeight);
+
+    // 4. Handle mouse interaction
+    CompositorHandleMouseWM();
+
+    // 5. Route keyboard input to focused window
+    InputEvent ev;
+    while (InputPollEvent(&ev))
+    {
+        if (ev.type != InputEventType::KeyPress) continue;
+        if (ev.ascii == 0) continue; // non-printable
+
+        // Find the focused window
+        Window* focused = nullptr;
+        for (uint32_t i = 0; i < WM_MAX_WINDOWS; i++)
+        {
+            Window* w = WmGetWindow(static_cast<int>(i));
+            if (w && w->proc && w->focused && w->visible)
+            {
+                focused = w;
+                break;
+            }
+        }
+        if (!focused) continue;
+
+        char ch = ev.ascii;
+
+        // Route to terminal if this window's process has one
+        for (uint32_t ti = 0; ti < MAX_TERMINALS; ti++)
+        {
+            Terminal* t = TerminalGet(static_cast<int>(ti));
+            if (t && t->child == focused->proc)
+            {
+                TerminalWriteInput(static_cast<int>(ti), &ch, 1);
+                break;
+            }
+        }
+    }
+}
+
+// Mouse state for WM interaction
+static bool    g_wmDragging      = false;
+static int     g_wmDragWindow    = -1;
+static int16_t g_wmDragOffsetX   = 0;
+static int16_t g_wmDragOffsetY   = 0;
+static bool    g_wmLastBtnDown   = false;
+
+static void CompositorHandleMouseWM()
+{
+    if (!MouseIsAvailable()) return;
+
+    int32_t mx, my;
+    MouseGetPosition(&mx, &my);
+    uint8_t buttons = MouseGetButtons();
+    bool btnDown = (buttons & 0x01) != 0; // left button
+
+    if (btnDown && !g_wmLastBtnDown)
+    {
+        // Button just pressed — do hit test
+        WmHitResult hit = WmHitTest(mx, my);
+
+        if (hit.windowIndex >= 0)
+        {
+            WmSetFocus(hit.windowIndex);
+
+            switch (hit.zone)
+            {
+            case WmHitZone::CloseButton:
+            {
+                Window* w = WmGetWindow(hit.windowIndex);
+                if (w && w->proc)
+                {
+                    // TODO: send SIGTERM; for now terminate immediately
+                    SerialPrintf("WM: close window %d '%s'\n", hit.windowIndex, w->title);
+                }
+                break;
+            }
+            case WmHitZone::MaximizeButton:
+                WmToggleMaximize(hit.windowIndex);
+                break;
+            case WmHitZone::TitleBar:
+            {
+                // Start drag
+                Window* w = WmGetWindow(hit.windowIndex);
+                if (w && w->state != WindowState::Maximized)
+                {
+                    g_wmDragging = true;
+                    g_wmDragWindow = hit.windowIndex;
+                    g_wmDragOffsetX = static_cast<int16_t>(mx - w->x);
+                    g_wmDragOffsetY = static_cast<int16_t>(my - w->y);
+                }
+                break;
+            }
+            default:
+                break;
+            }
+        }
+    }
+    else if (btnDown && g_wmDragging)
+    {
+        // Continue drag
+        WmMoveWindow(g_wmDragWindow,
+                     static_cast<int16_t>(mx - g_wmDragOffsetX),
+                     static_cast<int16_t>(my - g_wmDragOffsetY));
+    }
+    else if (!btnDown)
+    {
+        g_wmDragging = false;
+        g_wmDragWindow = -1;
+    }
+
+    g_wmLastBtnDown = btnDown;
+}
+
 static void CompositorLoop()
 {
     if (!g_physFb)
         return;
 
     // Restore pixels under the old cursor position before blitting.
-    // Mark restored rows dirty so the MMIO flip erases the old cursor.
     if (g_cursorVisible) {
         uint32_t oldMinY = (g_cursorSaveY >= 0) ? static_cast<uint32_t>(g_cursorSaveY) : 0;
         uint32_t oldMaxY = static_cast<uint32_t>(g_cursorSaveY) + CURSOR_H;
@@ -383,11 +624,17 @@ static void CompositorLoop()
         MarkDirtyRows(oldMinY, oldMaxY);
     }
 
+    // Branch: WM mode vs legacy mode
+    if (WmIsActive())
+    {
+        CompositorLoopWM();
+    }
+    else
+    {
+    // --- Legacy compositor path (non-WM) ---
     uint32_t compCount = __atomic_load_n(&g_compositedCount, __ATOMIC_ACQUIRE);
     if (compCount > 0)
     {
-        // Every FORCE_BLIT_INTERVAL_MS, blit all processes regardless of dirty
-    // flag. This ensures we see output during init (before DOOM signals dirty).
     uint64_t now = g_lapicTickCount;
     bool forceAll = (now - g_lastForceBlitTick >= FORCE_BLIT_INTERVAL_MS);
     if (forceAll) g_lastForceBlitTick = now;
@@ -397,10 +644,8 @@ static void CompositorLoop()
         Process* p = __atomic_load_n(&g_compositedProcs[i], __ATOMIC_ACQUIRE);
         if (!p) continue;
 
-        // Check termination first — once terminated, stop accessing the struct.
         if (p->state == ProcessState::Terminated)
         {
-            // Handle exit color fill if set (safe: fbExitColor is set before termination).
             uint32_t exitColor = __atomic_load_n(&p->fbExitColor, __ATOMIC_ACQUIRE);
             if (exitColor)
             {
@@ -439,13 +684,13 @@ static void CompositorLoop()
         BlitProcess(p, forceAll);
     }
     } // end if (g_compositedCount > 0)
+    } // end legacy mode
 
     // Draw mouse cursor on top of everything.
     if (MouseIsAvailable())
     {
         int32_t mx, my;
         MouseGetPosition(&mx, &my);
-        // Dirty the new cursor region for the MMIO flip.
         uint32_t newMinY = (my >= 0) ? static_cast<uint32_t>(my) : 0;
         uint32_t newMaxY = static_cast<uint32_t>(my) + CURSOR_H;
         if (newMaxY > g_physFbHeight) newMaxY = g_physFbHeight;
@@ -567,6 +812,14 @@ void CompositorRemap(uint64_t fbPhys, uint32_t w, uint32_t h, uint32_t stridePix
     MarkAllDirty();
 
     SerialPrintf("COMPOSITOR: remapped to %ux%u stride=%u\n", w, h, stridePixels);
+}
+
+void CompositorSetWallpaper(uint32_t* pixels, uint32_t w, uint32_t h)
+{
+    g_wallpaper = pixels;
+    g_wallpaperWidth = w;
+    g_wallpaperHeight = h;
+    SerialPrintf("COMPOSITOR: wallpaper set %ux%u\n", w, h);
 }
 
 } // namespace brook

@@ -47,4 +47,8 @@ void CompositorUnregisterProcess(Process* proc);
 extern "C" void CompositorRemap(uint64_t fbPhys, uint32_t w, uint32_t h,
                                 uint32_t stridePixels);
 
+// Set wallpaper pixel data. Takes ownership of the pointer (caller must not free).
+// Pixel format is XRGB (0x00RRGGBB), row-major, w pixels per row.
+void CompositorSetWallpaper(uint32_t* pixels, uint32_t w, uint32_t h);
+
 } // namespace brook
