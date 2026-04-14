@@ -1,0 +1,232 @@
+// net.h — Brook OS network stack.
+//
+// Minimal network stack: Ethernet, ARP, IPv4, ICMP, UDP.
+// No TCP yet — that's a future phase.
+
+#pragma once
+
+#include <stdint.h>
+
+namespace brook {
+
+// ---------------------------------------------------------------------------
+// Ethernet
+// ---------------------------------------------------------------------------
+
+static constexpr uint16_t ETH_TYPE_IPV4 = 0x0800;
+static constexpr uint16_t ETH_TYPE_ARP  = 0x0806;
+static constexpr uint32_t ETH_MTU       = 1500;
+static constexpr uint32_t ETH_FRAME_MAX = 1514;   // 14-byte header + 1500 payload
+
+struct __attribute__((packed)) MacAddr {
+    uint8_t b[6];
+};
+
+struct __attribute__((packed)) EthHeader {
+    MacAddr  dst;
+    MacAddr  src;
+    uint16_t etherType;   // big-endian
+};
+
+// ---------------------------------------------------------------------------
+// ARP
+// ---------------------------------------------------------------------------
+
+static constexpr uint16_t ARP_OP_REQUEST = 1;
+static constexpr uint16_t ARP_OP_REPLY   = 2;
+
+struct __attribute__((packed)) ArpPacket {
+    uint16_t htype;       // 1 = Ethernet
+    uint16_t ptype;       // 0x0800 = IPv4
+    uint8_t  hlen;        // 6
+    uint8_t  plen;        // 4
+    uint16_t oper;
+    MacAddr  sha;         // sender hardware address
+    uint32_t spa;         // sender protocol address (big-endian)
+    MacAddr  tha;         // target hardware address
+    uint32_t tpa;         // target protocol address (big-endian)
+};
+
+// ---------------------------------------------------------------------------
+// IPv4
+// ---------------------------------------------------------------------------
+
+static constexpr uint8_t IP_PROTO_ICMP = 1;
+static constexpr uint8_t IP_PROTO_TCP  = 6;
+static constexpr uint8_t IP_PROTO_UDP  = 17;
+
+struct __attribute__((packed)) Ipv4Header {
+    uint8_t  verIhl;      // version (4) | IHL (5 = 20 bytes)
+    uint8_t  tos;
+    uint16_t totalLen;    // big-endian
+    uint16_t id;
+    uint16_t flagsFrag;   // flags + fragment offset
+    uint8_t  ttl;
+    uint8_t  protocol;
+    uint16_t checksum;
+    uint32_t srcIp;       // big-endian
+    uint32_t dstIp;       // big-endian
+};
+
+// ---------------------------------------------------------------------------
+// ICMP
+// ---------------------------------------------------------------------------
+
+static constexpr uint8_t ICMP_ECHO_REPLY   = 0;
+static constexpr uint8_t ICMP_ECHO_REQUEST = 8;
+
+struct __attribute__((packed)) IcmpHeader {
+    uint8_t  type;
+    uint8_t  code;
+    uint16_t checksum;
+    uint16_t id;
+    uint16_t seq;
+};
+
+// ---------------------------------------------------------------------------
+// UDP
+// ---------------------------------------------------------------------------
+
+struct __attribute__((packed)) UdpHeader {
+    uint16_t srcPort;     // big-endian
+    uint16_t dstPort;     // big-endian
+    uint16_t length;      // big-endian (header + payload)
+    uint16_t checksum;    // big-endian (0 = no checksum)
+};
+
+// ---------------------------------------------------------------------------
+// Byte-order helpers (our kernel is little-endian x86-64)
+// ---------------------------------------------------------------------------
+
+static inline uint16_t htons(uint16_t h) { return __builtin_bswap16(h); }
+static inline uint16_t ntohs(uint16_t n) { return __builtin_bswap16(n); }
+static inline uint32_t htonl(uint32_t h) { return __builtin_bswap32(h); }
+static inline uint32_t ntohl(uint32_t n) { return __builtin_bswap32(n); }
+
+// Pack an IPv4 address from four octets (host byte order → big-endian).
+static inline uint32_t Ipv4Addr(uint8_t a, uint8_t b, uint8_t c, uint8_t d)
+{
+    return static_cast<uint32_t>(a) | (static_cast<uint32_t>(b) << 8) |
+           (static_cast<uint32_t>(c) << 16) | (static_cast<uint32_t>(d) << 24);
+}
+
+// ---------------------------------------------------------------------------
+// Network interface (NIC abstraction)
+// ---------------------------------------------------------------------------
+
+struct NetIf {
+    MacAddr  mac;
+    uint32_t ipAddr;      // our IP (big-endian), 0 = unconfigured
+    uint32_t netmask;     // big-endian
+    uint32_t gateway;     // big-endian
+    uint32_t dns;         // big-endian
+
+    // Transmit a raw Ethernet frame. Returns 0 on success.
+    int (*transmit)(NetIf* nif, const void* frame, uint32_t len);
+
+    // Poll for received packets. Calls NetReceive for each packet found.
+    void (*poll)(NetIf* nif);
+
+    void* driverPriv;     // driver-specific state
+};
+
+// ---------------------------------------------------------------------------
+// Network stack API
+// ---------------------------------------------------------------------------
+
+// Initialise network subsystem.
+void NetInit();
+
+// Register a network interface. Currently single-NIC only.
+void NetRegisterIf(NetIf* nif);
+
+// Called by the NIC driver when a frame arrives.
+void NetReceive(NetIf* nif, const void* frame, uint32_t len);
+
+// Get the primary network interface.
+NetIf* NetGetIf();
+
+// Send an IPv4 packet. Handles Ethernet framing and ARP resolution.
+// Returns 0 on success, negative on error.
+int NetSendIpv4(uint32_t dstIp, uint8_t proto,
+                const void* payload, uint32_t payloadLen);
+
+// Send a UDP datagram.
+int NetSendUdp(uint32_t dstIp, uint16_t srcPort, uint16_t dstPort,
+               const void* data, uint32_t dataLen);
+
+// ---------------------------------------------------------------------------
+// ARP
+// ---------------------------------------------------------------------------
+
+// Resolve an IP address to a MAC address. May block briefly.
+// Returns true if resolved, false on timeout.
+bool ArpResolve(uint32_t ip, MacAddr* outMac);
+
+// ---------------------------------------------------------------------------
+// DHCP (minimal)
+// ---------------------------------------------------------------------------
+
+// Perform DHCP discovery to obtain an IP address.
+// Blocks until complete or timeout. Returns true on success.
+bool DhcpDiscover(NetIf* nif);
+
+// ---------------------------------------------------------------------------
+// Socket layer (kernel-side)
+// ---------------------------------------------------------------------------
+
+static constexpr int AF_INET     = 2;
+static constexpr int SOCK_STREAM = 1;
+static constexpr int SOCK_DGRAM  = 2;
+static constexpr int SOCK_RAW    = 3;
+
+static constexpr int IPPROTO_IP   = 0;
+static constexpr int IPPROTO_ICMP = 1;
+static constexpr int IPPROTO_TCP  = 6;
+static constexpr int IPPROTO_UDP  = 17;
+
+struct __attribute__((packed)) SockAddrIn {
+    uint16_t sin_family;   // AF_INET
+    uint16_t sin_port;     // big-endian
+    uint32_t sin_addr;     // big-endian
+    uint8_t  sin_zero[8];
+};
+
+struct Socket {
+    int       domain;      // AF_INET
+    int       type;        // SOCK_DGRAM, SOCK_STREAM
+    int       protocol;
+    uint32_t  localIp;
+    uint16_t  localPort;   // big-endian
+    uint32_t  remoteIp;
+    uint16_t  remotePort;  // big-endian
+    bool      bound;
+    bool      connected;
+
+    // Receive buffer (ring buffer for incoming datagrams)
+    static constexpr uint32_t RX_BUF_SIZE = 65536;
+    uint8_t*  rxBuf;
+    uint32_t  rxHead;
+    uint32_t  rxTail;
+    uint32_t  rxCount;     // bytes available
+
+    // For recvfrom: store source address of last received packet
+    uint32_t  lastSrcIp;
+    uint16_t  lastSrcPort;
+};
+
+// Create a kernel socket. Returns socket index or negative error.
+int  SockCreate(int domain, int type, int protocol);
+int  SockBind(int sockIdx, const SockAddrIn* addr);
+int  SockSendTo(int sockIdx, const void* buf, uint32_t len,
+                const SockAddrIn* dest);
+int  SockRecvFrom(int sockIdx, void* buf, uint32_t len,
+                  SockAddrIn* src);
+void SockClose(int sockIdx);
+
+// Deliver a UDP datagram to the matching socket (called by stack).
+void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
+                    uint32_t dstIp, uint16_t dstPort,
+                    const void* data, uint32_t len);
+
+} // namespace brook

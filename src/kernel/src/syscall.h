@@ -107,6 +107,23 @@ static constexpr uint64_t SYS_ALARM           = 37;
 static constexpr uint64_t SYS_PAUSE           = 34;
 static constexpr uint64_t SYS_RT_SIGSUSPEND   = 130;
 
+// Socket syscalls
+static constexpr uint64_t SYS_SOCKET          = 41;
+static constexpr uint64_t SYS_CONNECT         = 42;
+static constexpr uint64_t SYS_ACCEPT          = 43;
+static constexpr uint64_t SYS_SENDTO          = 44;
+static constexpr uint64_t SYS_RECVFROM        = 45;
+static constexpr uint64_t SYS_SENDMSG         = 46;
+static constexpr uint64_t SYS_RECVMSG         = 47;
+static constexpr uint64_t SYS_SHUTDOWN        = 48;
+static constexpr uint64_t SYS_BIND            = 49;
+static constexpr uint64_t SYS_LISTEN          = 50;
+static constexpr uint64_t SYS_GETSOCKNAME     = 51;
+static constexpr uint64_t SYS_GETPEERNAME     = 52;
+static constexpr uint64_t SYS_SOCKETPAIR      = 53;
+static constexpr uint64_t SYS_SETSOCKOPT      = 54;
+static constexpr uint64_t SYS_GETSOCKOPT      = 55;
+
 // Syscall function type -- same signature as Linux: returns int64_t,
 // up to 6 arguments via rdi, rsi, rdx, r10->rcx, r8, r9.
 using SyscallFn = int64_t(*)(uint64_t, uint64_t, uint64_t,

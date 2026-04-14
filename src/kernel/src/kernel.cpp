@@ -26,6 +26,7 @@
 #include "process.h"
 #include "scheduler.h"
 #include "procfs.h"
+#include "net.h"
 #include "compositor.h"
 #include "serial_writer.h"
 #include "profiler.h"
@@ -219,6 +220,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::BootLogoProgress(35, "Filesystem");
     brook::VfsInit();
     brook::ProcFsInit();
+    brook::NetInit();
     brook::VfsMount("/proc", "procfs", 0);
 
     // Mount the embedded FAT16 test image as a ramdisk.
@@ -396,6 +398,12 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::SerialPuts("module: Phase 2 — loading from /boot/drivers (virtio)\n");
     brook::ModuleDiscoverAndLoad("/boot/drivers");
     brook::SerialPuts("module: Phase 2 — done\n");
+
+    // ---- Network (DHCP) ----
+    if (brook::NetGetIf()) {
+        brook::BootLogoProgress(75, "Network");
+        brook::DhcpDiscover(brook::NetGetIf());
+    }
 
     // ---- Syscall table ----
     brook::BootLogoProgress(80, "Syscalls");

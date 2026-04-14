@@ -20,6 +20,7 @@
 #include "compositor.h"
 #include "window.h"
 #include "terminal.h"
+#include "net.h"
 
 // Forward declaration
 extern "C" __attribute__((naked)) void ReturnToKernel();
@@ -180,6 +181,8 @@ static constexpr int64_t ENOSYS  = 38;
 static constexpr int64_t EAGAIN  = 11;
 static constexpr int64_t EINTR   = 4;
 static constexpr int64_t ENOTDIR = 20;
+static constexpr int64_t EIO     = 5;
+static constexpr int64_t ENOTCONN = 107;
 
 // Check if the current process has deliverable signals pending.
 // Call after SchedulerBlock() returns to decide whether to return -EINTR.
@@ -847,6 +850,12 @@ static int64_t sys_close(uint64_t fd, uint64_t, uint64_t,
         {
             kfree(pipe);
         }
+    }
+
+    if (fde->type == FdType::Socket && fde->handle)
+    {
+        int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+        SockClose(sockIdx);
     }
 
     FdFree(proc, static_cast<int>(fd));
@@ -4151,8 +4160,178 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
 }
 
 // ---------------------------------------------------------------------------
-// Syscall table
+// Socket syscalls
 // ---------------------------------------------------------------------------
+
+// Per-process socket-to-fd mapping.
+// Socket index is stored in FdEntry::handle as (void*)(uintptr_t)(sockIdx + 1).
+// +1 so that socket 0 maps to non-null handle.
+
+static int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
+                           uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ENOSYS;
+
+    int sockIdx = SockCreate(static_cast<int>(domain),
+                              static_cast<int>(type & 0xFF), // mask SOCK_NONBLOCK etc
+                              static_cast<int>(protocol));
+    if (sockIdx < 0) return -ENOMEM;
+
+    // Allocate an fd for this socket
+    int fd = FdAlloc(proc, FdType::Socket, reinterpret_cast<void*>(static_cast<uintptr_t>(sockIdx + 1)));
+    if (fd < 0) {
+        SockClose(sockIdx);
+        return -EMFILE;
+    }
+    return fd;
+}
+
+static int GetSockIdx(Process* proc, int fd)
+{
+    if (fd < 0 || fd >= static_cast<int>(MAX_FDS)) return -1;
+    FdEntry* e = &proc->fds[fd];
+    if (e->type != FdType::Socket) return -1;
+    return static_cast<int>(reinterpret_cast<uintptr_t>(e->handle)) - 1;
+}
+
+static int64_t sys_bind(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
+                         uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ENOSYS;
+
+    int fd = static_cast<int>(fdVal);
+    int sockIdx = GetSockIdx(proc, fd);
+    if (sockIdx < 0) return -EBADF;
+
+    auto* addr = reinterpret_cast<const SockAddrIn*>(addrVal);
+    if (!addr || addrLen < sizeof(SockAddrIn)) return -EINVAL;
+
+    return SockBind(sockIdx, addr);
+}
+
+static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
+                            uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ENOSYS;
+
+    int fd = static_cast<int>(fdVal);
+    int sockIdx = GetSockIdx(proc, fd);
+    if (sockIdx < 0) return -EBADF;
+
+    (void)addrLen;
+    // For UDP, "connect" just sets the default destination
+    // Actual connect for TCP would be more complex
+    return -ENOSYS; // TODO: implement
+}
+
+static int64_t sys_sendto(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
+                           uint64_t flagsVal, uint64_t destVal, uint64_t addrLenVal)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ENOSYS;
+
+    int fd = static_cast<int>(fdVal);
+    int sockIdx = GetSockIdx(proc, fd);
+    if (sockIdx < 0) return -EBADF;
+
+    (void)flagsVal;
+    auto* dest = destVal ? reinterpret_cast<const SockAddrIn*>(destVal) : nullptr;
+
+    int ret = SockSendTo(sockIdx, reinterpret_cast<const void*>(bufVal),
+                          static_cast<uint32_t>(lenVal), dest);
+    if (ret < 0) return -EIO;
+    return static_cast<int64_t>(lenVal);
+}
+
+static int64_t sys_recvfrom(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
+                             uint64_t flagsVal, uint64_t srcVal, uint64_t addrLenVal)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ENOSYS;
+
+    int fd = static_cast<int>(fdVal);
+    int sockIdx = GetSockIdx(proc, fd);
+    if (sockIdx < 0) return -EBADF;
+
+    (void)flagsVal;
+    auto* src = srcVal ? reinterpret_cast<SockAddrIn*>(srcVal) : nullptr;
+
+    int ret = SockRecvFrom(sockIdx, reinterpret_cast<void*>(bufVal),
+                            static_cast<uint32_t>(lenVal), src);
+    if (ret < 0) return -EAGAIN;
+    return static_cast<int64_t>(ret);
+}
+
+static int64_t sys_setsockopt(uint64_t, uint64_t, uint64_t,
+                               uint64_t, uint64_t, uint64_t)
+{
+    return 0; // stub — pretend success
+}
+
+static int64_t sys_getsockopt(uint64_t, uint64_t, uint64_t,
+                               uint64_t, uint64_t, uint64_t)
+{
+    return 0; // stub
+}
+
+static int64_t sys_getsockname(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
+                                uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ENOSYS;
+
+    int fd = static_cast<int>(fdVal);
+    int sockIdx = GetSockIdx(proc, fd);
+    if (sockIdx < 0) return -EBADF;
+
+    // TODO: fill in local address
+    return 0;
+}
+
+static int64_t sys_getpeername(uint64_t, uint64_t, uint64_t,
+                                uint64_t, uint64_t, uint64_t)
+{
+    return -ENOTCONN;
+}
+
+static int64_t sys_shutdown(uint64_t, uint64_t, uint64_t,
+                             uint64_t, uint64_t, uint64_t)
+{
+    return 0; // stub
+}
+
+static int64_t sys_listen(uint64_t, uint64_t, uint64_t,
+                           uint64_t, uint64_t, uint64_t)
+{
+    return -ENOSYS; // TCP not implemented yet
+}
+
+static int64_t sys_accept(uint64_t, uint64_t, uint64_t,
+                           uint64_t, uint64_t, uint64_t)
+{
+    return -ENOSYS; // TCP not implemented yet
+}
+
+static int64_t sys_socketpair(uint64_t, uint64_t, uint64_t,
+                               uint64_t, uint64_t, uint64_t)
+{
+    return -ENOSYS;
+}
+
+static int64_t sys_sendmsg(uint64_t, uint64_t, uint64_t,
+                            uint64_t, uint64_t, uint64_t)
+{
+    return -ENOSYS;
+}
+
+static int64_t sys_recvmsg(uint64_t, uint64_t, uint64_t,
+                            uint64_t, uint64_t, uint64_t)
+{
+    return -ENOSYS;
+}
 
 static SyscallFn g_syscallTable[SYSCALL_MAX];
 
@@ -4262,6 +4441,23 @@ void SyscallTableInit()
     g_syscallTable[SYS_RSEQ]            = sys_rseq;
     g_syscallTable[SYS_FACCESSAT2]      = sys_faccessat2;
 
+    // Socket syscalls
+    g_syscallTable[SYS_SOCKET]          = sys_socket;
+    g_syscallTable[SYS_CONNECT]         = sys_connect;
+    g_syscallTable[SYS_ACCEPT]          = sys_accept;
+    g_syscallTable[SYS_SENDTO]          = sys_sendto;
+    g_syscallTable[SYS_RECVFROM]        = sys_recvfrom;
+    g_syscallTable[SYS_SENDMSG]         = sys_sendmsg;
+    g_syscallTable[SYS_RECVMSG]         = sys_recvmsg;
+    g_syscallTable[SYS_SHUTDOWN]        = sys_shutdown;
+    g_syscallTable[SYS_BIND]            = sys_bind;
+    g_syscallTable[SYS_LISTEN]          = sys_listen;
+    g_syscallTable[SYS_GETSOCKNAME]     = sys_getsockname;
+    g_syscallTable[SYS_GETPEERNAME]     = sys_getpeername;
+    g_syscallTable[SYS_SOCKETPAIR]      = sys_socketpair;
+    g_syscallTable[SYS_SETSOCKOPT]      = sys_setsockopt;
+    g_syscallTable[SYS_GETSOCKOPT]      = sys_getsockopt;
+
     uint32_t count = 0;
     for (uint64_t i = 0; i < SYSCALL_MAX; ++i)
         if (g_syscallTable[i] != sys_not_implemented) ++count;
@@ -4310,7 +4506,15 @@ static const char* SyscallName(uint64_t num)
     case 23: return "select";     case 24: return "sched_yield";
     case 32: return "dup";        case 33: return "dup2";
     case 35: return "nanosleep";  case 39: return "getpid";
-    case 40: return "sendfile";   case 56: return "clone";
+    case 40: return "sendfile";   case 41: return "socket";
+    case 42: return "connect";    case 43: return "accept";
+    case 44: return "sendto";     case 45: return "recvfrom";
+    case 46: return "sendmsg";    case 47: return "recvmsg";
+    case 48: return "shutdown";   case 49: return "bind";
+    case 50: return "listen";     case 51: return "getsockname";
+    case 52: return "getpeername"; case 53: return "socketpair";
+    case 54: return "setsockopt"; case 55: return "getsockopt";
+    case 56: return "clone";
     case 57: return "fork";       case 58: return "vfork";
     case 59: return "execve";     case 60: return "exit";
     case 61: return "wait4";      case 62: return "kill";

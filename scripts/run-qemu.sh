@@ -195,6 +195,8 @@ qemu-system-x86_64 \
     -drive format=raw,file=fat:rw:"${BUILD_DIR}/esp" \
     -drive if=virtio,format=raw,file="${DISK_IMG}",file.locking=off \
     -device virtio-tablet-pci \
+    -device virtio-net-pci,netdev=net0 \
+    -netdev user,id=net0 \
     ${SERIAL_OPT} \
     ${DISPLAY_OPT} \
     -monitor unix:/tmp/qemu_monitor.sock,server,nowait \

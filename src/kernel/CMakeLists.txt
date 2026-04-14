@@ -163,6 +163,7 @@ add_executable(kernel
     src/elf_loader.cpp
     src/vfs.cpp
     src/procfs.cpp
+    src/net.cpp
     src/virtio_blk.cpp
     src/acpi.cpp
     src/apic.cpp

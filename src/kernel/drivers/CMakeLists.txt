@@ -26,3 +26,8 @@ add_driver_module(virtio_input
     "${BROOK_ROOT}/src/drivers/virtio_input/virtio_input_mod.cpp"
     EXTRA_FLAGS "-mgeneral-regs-only" "-mno-sse" "-mno-sse2" "-mfpmath="
 )
+
+add_driver_module(virtio_net
+    "${BROOK_ROOT}/src/drivers/virtio_net/virtio_net_mod.cpp"
+    EXTRA_FLAGS "-mgeneral-regs-only" "-mno-sse" "-mno-sse2" "-mfpmath="
+)

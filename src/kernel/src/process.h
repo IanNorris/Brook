@@ -180,6 +180,7 @@ enum class FdType : uint8_t
     Pipe,          // pipe() read/write end
     DevNull,       // /dev/null — discard writes, EOF on read
     SyntheticMem,  // In-memory synthetic file (e.g. /etc/passwd)
+    Socket,        // Network socket (UDP/TCP)
 };
 
 struct FdEntry

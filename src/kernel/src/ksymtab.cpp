@@ -29,6 +29,7 @@ extern "C" brook::KernelSymbol __stop_ksymtab[];
 #include "mouse.h"
 #include "idt.h"
 #include "apic.h"
+#include "net.h"
 
 // Bring all brook:: names into scope so EXPORT_SYMBOL(fn) resolves correctly.
 using namespace brook;
@@ -151,6 +152,12 @@ EXPORT_SYMBOL(KernelPanic);
 EXPORT_SYMBOL(IdtInstallHandler);
 EXPORT_SYMBOL(IoApicUnmaskIrq);
 EXPORT_SYMBOL(ApicSendEoi);
+
+// Network
+EXPORT_SYMBOL(NetRegisterIf);
+EXPORT_SYMBOL(NetReceive);
+EXPORT_SYMBOL_NAMED(NetRegisterIf, "_ZN5brook13NetRegisterIfEPNS_5NetIfE");
+EXPORT_SYMBOL_NAMED(NetReceive,    "_ZN5brook10NetReceiveEPNS_5NetIfEPKvj");
 
 namespace brook {
 
