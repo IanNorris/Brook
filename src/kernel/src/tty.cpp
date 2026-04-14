@@ -303,7 +303,7 @@ void TtyPutChar(char c)
     {
     case '\n':
         Newline();
-        if (g_ttyUsingBackbuffer) CompositorMarkDirty();
+        if (g_ttyUsingBackbuffer) { CompositorMarkDirty(); CompositorWake(); }
         return;
     case '\r':
         g_curX = 0;
@@ -339,7 +339,10 @@ void TtyPutChar(char c)
 
     RenderGlyph(code);
     if (g_ttyUsingBackbuffer)
+    {
         CompositorMarkDirty();
+        CompositorWake();
+    }
 }
 
 void TtyPuts(const char* str)
