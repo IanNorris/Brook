@@ -639,11 +639,42 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
     int32_t prevCpu = __atomic_exchange_n(&newProc->runningOnCpu, (int32_t)cpu, __ATOMIC_ACQ_REL);
     if (prevCpu != -1)
     {
-        SerialPrintf("SCHED FATAL: double-schedule! '%s' (pid %u) already on CPU%d, "
-                     "now CPU%u. oldProc='%s' pid=%u\n",
+        // Restore the original runningOnCpu — we're not taking this process.
+        __atomic_store_n(&newProc->runningOnCpu, prevCpu, __ATOMIC_RELEASE);
+
+        SerialPrintf("SCHED: double-schedule avoided: '%s' (pid %u) on CPU%d, "
+                     "CPU%u will retry. oldProc='%s' pid=%u\n",
                      newProc->name, newProc->pid, prevCpu, cpu,
                      oldProc->name, oldProc->pid);
-        for (;;) __asm__ volatile("hlt");
+
+        // If old process can still run, just continue it.
+        if (oldProc->state == ProcessState::Running ||
+            oldProc->state == ProcessState::Ready)
+        {
+            oldProc->state = ProcessState::Running;
+            __asm__ volatile("sti");
+            return;
+        }
+
+        // Old process is blocked/terminated — switch to our own idle.
+        Process* idle = g_perCpu[cpu].idleProcess;
+        if (idle && idle != newProc)
+        {
+            newProc = idle;
+            int32_t idlePrev = __atomic_exchange_n(&idle->runningOnCpu, (int32_t)cpu, __ATOMIC_ACQ_REL);
+            if (idlePrev != -1)
+            {
+                // Even our idle is busy — just hlt and wait for next tick.
+                __atomic_store_n(&idle->runningOnCpu, idlePrev, __ATOMIC_RELEASE);
+                __asm__ volatile("sti");
+                return;
+            }
+        }
+        else
+        {
+            __asm__ volatile("sti");
+            return;
+        }
     }
 
     // Mark old process as no longer running on this CPU.
