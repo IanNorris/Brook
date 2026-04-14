@@ -611,6 +611,20 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         lookupPath = resolvedPath;
     }
 
+    // Strip trailing "/." from resolved path (e.g., "/boot/." → "/boot")
+    {
+        uint32_t len = 0;
+        while (lookupPath[len]) len++;
+        if (lookupPath == resolvedPath && len >= 2 &&
+            resolvedPath[len - 1] == '.' && resolvedPath[len - 2] == '/')
+        {
+            if (len > 2)
+                resolvedPath[len - 2] = '\0'; // "/boot/." → "/boot"
+            else
+                resolvedPath[1] = '\0';        // "/." → "/"
+        }
+    }
+
     // Device paths
     if (StrEq(path, "/dev/fb0"))
     {
@@ -1726,6 +1740,30 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
         }
     }
 
+    // Busybox fallback: if not found, try running busybox with the command name
+    // as argv[0]. Busybox reads argv[0] to determine which applet to run.
+    bool busyboxFallback = false;
+    if (!found)
+    {
+        const char* cmdName = kPath;
+        for (const char* p = kPath; *p; ++p)
+            if (*p == '/') cmdName = p + 1;
+        (void)cmdName;
+
+        VnodeStat st;
+        if (VfsStatPath("/boot/BIN/BUSYBOX", &st) == 0 && !st.isDir)
+        {
+            const char* bbPath = "/boot/BIN/BUSYBOX";
+            uint32_t k = 0;
+            while (bbPath[k]) { resolvedPath[k] = bbPath[k]; k++; }
+            resolvedPath[k] = '\0';
+            lookupPath = resolvedPath;
+            found = true;
+            busyboxFallback = true;
+            DbgPrintf("sys_execve: busybox fallback for '%s'\n", cmdName);
+        }
+    }
+
     if (!found)
     {
         DbgPrintf("sys_execve: not found: %s\n", kPath);
@@ -1932,14 +1970,17 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
         __builtin_unreachable();
     }
 
-    // Update process name to reflect new binary
-    const char* baseName = lookupPath;
-    for (const char* p = lookupPath; *p; ++p)
-        if (*p == '/') baseName = p + 1;
+    // Update process name — use argv[0] for busybox applets, binary name otherwise
+    const char* nameSource = lookupPath;
+    if (busyboxFallback && argc > 0)
+        nameSource = kArgv[0];
+    const char* baseName2 = nameSource;
+    for (const char* p = nameSource; *p; ++p)
+        if (*p == '/') baseName2 = p + 1;
     uint32_t ni = 0;
-    while (baseName[ni] && ni < 30)
+    while (baseName2[ni] && ni < 30)
     {
-        proc->name[ni] = baseName[ni];
+        proc->name[ni] = baseName2[ni];
         ni++;
     }
     proc->name[ni] = '\0';
@@ -2088,6 +2129,8 @@ static int64_t sys_clock_nanosleep(uint64_t, uint64_t, uint64_t reqAddr,
 // sys_access (21)
 // ---------------------------------------------------------------------------
 
+static bool BusyboxStatFallback(const char* path, VnodeStat* vs);
+
 static int64_t sys_access(uint64_t pathAddr, uint64_t, uint64_t,
                            uint64_t, uint64_t, uint64_t)
 {
@@ -2096,7 +2139,13 @@ static int64_t sys_access(uint64_t pathAddr, uint64_t, uint64_t,
 
     // Try to open the file to check existence
     Vnode* vn = VfsOpen(path, 0);
-    if (!vn) return -ENOENT;
+    if (!vn)
+    {
+        VnodeStat vs;
+        if (!BusyboxStatFallback(path, &vs))
+            return -ENOENT;
+        return 0;
+    }
     VfsClose(vn);
     return 0;
 }
@@ -2439,7 +2488,40 @@ static void FillStat(LinuxStat* st, const VnodeStat& vs)
     if (vs.isDir)
         st->st_mode = 0040755; // S_IFDIR | rwxr-xr-x
     else
-        st->st_mode = 0100644; // S_IFREG | rw-r--r--
+        st->st_mode = 0100755; // S_IFREG | rwxr-xr-x (all files executable on FAT)
+}
+
+// Busybox-aware stat: if a file doesn't exist in /boot/BIN/ but busybox does,
+// return busybox's stat info. This lets bash's PATH search find busybox applets.
+static bool BusyboxStatFallback(const char* path, VnodeStat* vs)
+{
+    // Check if path is under a bin-like directory
+    const char* binPrefixes[] = {
+        "/boot/BIN/", "/boot/bin/", "/bin/", "/usr/bin/",
+        "/usr/local/bin/", "/sbin/", "/usr/sbin/"
+    };
+    bool isBinPath = false;
+    for (int i = 0; i < 7; ++i)
+    {
+        const char* pfx = binPrefixes[i];
+        const char* a = path;
+        const char* b = pfx;
+        while (*b && *a == *b) { a++; b++; }
+        // Check prefix matches and remainder has no slashes (is a simple filename)
+        if (!*b && *a)
+        {
+            bool hasSlash = false;
+            for (const char* c = a; *c; ++c) { if (*c == '/') { hasSlash = true; break; } }
+            if (!hasSlash)
+            {
+                isBinPath = true;
+                break;
+            }
+        }
+    }
+    if (!isBinPath) return false;
+
+    return VfsStatPath("/boot/BIN/BUSYBOX", vs) == 0;
 }
 
 static int64_t sys_stat(uint64_t pathAddr, uint64_t statAddr, uint64_t,
@@ -2448,8 +2530,43 @@ static int64_t sys_stat(uint64_t pathAddr, uint64_t statAddr, uint64_t,
     const char* path = reinterpret_cast<const char*>(pathAddr);
     auto* st = reinterpret_cast<LinuxStat*>(statAddr);
 
+    // Resolve relative paths (including ".") against CWD
+    char resolved[256];
+    const char* lookup = path;
+    if (path[0] != '/')
+    {
+        Process* proc = ProcessCurrent();
+        const char* cwd = (proc && proc->cwd[0]) ? proc->cwd : "/";
+        uint32_t ci = 0;
+        // Special case: "." means CWD itself
+        if (path[0] == '.' && (path[1] == '\0' || path[1] == '/'))
+        {
+            for (uint32_t j = 0; cwd[j] && ci < 254; ++j)
+                resolved[ci++] = cwd[j];
+            // Append anything after "."
+            if (path[1] == '/')
+                for (uint32_t j = 1; path[j] && ci < 254; ++j)
+                    resolved[ci++] = path[j];
+        }
+        else
+        {
+            for (uint32_t j = 0; cwd[j] && ci < 250; ++j)
+                resolved[ci++] = cwd[j];
+            if (ci > 0 && resolved[ci - 1] != '/')
+                resolved[ci++] = '/';
+            for (uint32_t j = 0; path[j] && ci < 254; ++j)
+                resolved[ci++] = path[j];
+        }
+        resolved[ci] = '\0';
+        lookup = resolved;
+    }
+
     VnodeStat vs; vs.size = 0; vs.isDir = false;
-    if (VfsStatPath(path, &vs) < 0) return -ENOENT;
+    if (VfsStatPath(lookup, &vs) < 0)
+    {
+        if (!BusyboxStatFallback(lookup, &vs))
+            return -ENOENT;
+    }
 
     FillStat(st, vs);
     return 0;
@@ -2764,10 +2881,13 @@ static int64_t sys_openat(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
 static int64_t sys_getcwd(uint64_t bufAddr, uint64_t size, uint64_t,
                            uint64_t, uint64_t, uint64_t)
 {
-    if (size < 2) return -ERANGE;
+    Process* proc = ProcessCurrent();
+    const char* cwd = (proc && proc->cwd[0]) ? proc->cwd : "/";
+    uint32_t len = 0;
+    while (cwd[len]) len++;
+    if (size < len + 1) return -ERANGE;
     auto* buf = reinterpret_cast<char*>(bufAddr);
-    buf[0] = '/';
-    buf[1] = '\0';
+    for (uint32_t i = 0; i <= len; i++) buf[i] = cwd[i];
     return static_cast<int64_t>(bufAddr);
 }
 
@@ -3605,7 +3725,13 @@ static int64_t sys_faccessat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
     }
 
     Vnode* vn = VfsOpen(lookup, 0);
-    if (!vn) return -ENOENT;
+    if (!vn)
+    {
+        VnodeStat vs;
+        if (!BusyboxStatFallback(lookup, &vs))
+            return -ENOENT;
+        return 0;
+    }
     VfsClose(vn);
     return 0;
 }
