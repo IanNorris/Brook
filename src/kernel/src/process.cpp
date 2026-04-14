@@ -1117,8 +1117,7 @@ int ProcessSendSignal(Process* proc, int signum)
     {
         if (proc->state == ProcessState::Stopped)
         {
-            proc->state = ProcessState::Ready;
-            SchedulerEnqueue(proc);
+            SchedulerUnblock(proc); // SchedulerUnblock now accepts Stopped state
             DbgPrintf("SIGNAL: SIGCONT -> pid %u resumed\n", proc->pid);
         }
         // Still deliver SIGCONT if a handler is registered

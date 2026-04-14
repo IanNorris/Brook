@@ -2294,7 +2294,8 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
     // TCGETS = 0x5401, TCSETS/TCSETSW/TCSETSF = 0x5402-0x5404
     // Also handle any fd that is a TTY device (e.g. fd 63 from /dev/tty dup)
     bool isTtyFd = (fd <= 2) || (fde->type == FdType::DevKeyboard) ||
-                   (fde->type == FdType::Vnode && !fde->handle);
+                   (fde->type == FdType::Vnode && !fde->handle) ||
+                   (fde->type == FdType::Pipe);
     if (isTtyFd && cmd == 0x5401)
     {
         auto* t = reinterpret_cast<uint32_t*>(arg);
@@ -2356,6 +2357,10 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
         ws->ws_ypixel = 0;
         return 0;
     }
+
+    // TIOCSWINSZ = 0x5414 — set terminal window size (accept but ignore)
+    if (isTtyFd && cmd == 0x5414)
+        return 0;
 
     SerialPrintf("sys_ioctl: unhandled fd=%lu cmd=0x%lx\n", fd, cmd);
     return -ENOSYS;
