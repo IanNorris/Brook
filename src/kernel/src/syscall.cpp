@@ -397,11 +397,22 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 if (proc->ttyEcho)
                 {
                     if (c == '\n')
+                    {
                         SerialWriterEnqueue("\r\n", 2);
+                        TtyPutChar('\n');
+                    }
                     else if (c >= ' ' && c <= '~')
+                    {
                         SerialWriterEnqueue(&c, 1);
+                        TtyPutChar(c);
+                    }
                     else if (c == '\x7f' || c == '\b')
+                    {
                         SerialWriterEnqueue("\b \b", 3);
+                        TtyPutChar('\b');
+                        TtyPutChar(' ');
+                        TtyPutChar('\b');
+                    }
                 }
             }
             return static_cast<int64_t>(bytesRead);
@@ -442,6 +453,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             {
                 // Echo ^C and return empty line
                 SerialWriterEnqueue("^C\n", 3);
+                TtyPutChar('^'); TtyPutChar('C'); TtyPutChar('\n');
                 buf[0] = '\n';
                 return 1;
             }
@@ -458,6 +470,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             if (c == '\r' || c == '\n' || ev.scanCode == 0x1C)
             {
                 SerialWriterEnqueue("\n", 1);
+                TtyPutChar('\n');
                 if (lineLen < LINE_BUF_MAX)
                     lineBuf[lineLen++] = '\n';
                 break;
@@ -470,6 +483,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 {
                     lineLen--;
                     SerialWriterEnqueue("\b \b", 3); // erase character
+                    TtyPutChar('\b'); TtyPutChar(' '); TtyPutChar('\b');
                 }
                 continue;
             }
@@ -481,6 +495,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 {
                     lineBuf[lineLen++] = '\t';
                     SerialWriterEnqueue("\t", 1);
+                    TtyPutChar('\t');
                 }
                 continue;
             }
@@ -492,6 +507,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 {
                     lineBuf[lineLen++] = c;
                     SerialWriterEnqueue(&c, 1); // echo
+                    TtyPutChar(c);
                 }
                 continue;
             }

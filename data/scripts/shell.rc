@@ -1,3 +1,4 @@
 # Brook OS boot script — interactive shell
-# (Currently the kernel enters interactive shell mode when no processes
-# are queued after script execution.)
+set tty full
+run --as SHELL /boot/BIN/BASH --norc --noprofile
+wait

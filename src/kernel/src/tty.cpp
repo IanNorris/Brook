@@ -308,6 +308,14 @@ void TtyPutChar(char c)
     case '\r':
         g_curX = 0;
         return;
+    case '\b':
+    {
+        // Move cursor back one character width
+        int spAdv = fa.glyphCount > 0 ? fa.glyphs[0].advance : 8;
+        g_curX -= spAdv;
+        if (g_curX < 0) g_curX = 0;
+        return;
+    }
     case '\t':
     {
         // Align to next multiple of 8 character widths (use space advance).
