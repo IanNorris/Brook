@@ -1,0 +1,15 @@
+# Brook OS — Window manager with 8 DOOM instances
+# Tests WM stability and performance under load
+
+set wm
+set vfb 640x400
+set scale 2
+
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
+run doom -iwad /boot/DOOM1.WAD
