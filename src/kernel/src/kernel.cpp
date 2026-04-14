@@ -30,7 +30,6 @@
 #include "compositor.h"
 #include "serial_writer.h"
 #include "profiler.h"
-#include "clock_overlay.h"
 #include "smp.h"
 #include "mouse.h"
 #include "shell.h"
@@ -465,9 +464,6 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             if (fbH > barH)
                 brook::TtySetRegion(0, fbH - barH, fbW, barH);
         }
-
-        // Start the clock overlay kernel thread (renders uptime on screen).
-        brook::ClockOverlayStart();
 
         // Start the async serial/TTY writer thread.
         brook::SerialWriterInit();

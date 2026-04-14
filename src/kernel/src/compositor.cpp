@@ -10,6 +10,7 @@
 #include "terminal.h"
 #include "input.h"
 #include "net.h"
+#include "font_atlas.h"
 
 namespace brook {
 
@@ -720,6 +721,113 @@ static void CompositorHandleMouseWM()
     g_wmLastBtnDown = btnDown;
 }
 
+// ---------------------------------------------------------------------------
+// Clock overlay — rendered directly by the compositor each frame
+// ---------------------------------------------------------------------------
+
+static char* FormatUptime(char* buf, uint64_t totalSec)
+{
+    uint32_t h = static_cast<uint32_t>(totalSec / 3600);
+    uint32_t m = static_cast<uint32_t>((totalSec % 3600) / 60);
+    uint32_t s = static_cast<uint32_t>(totalSec % 60);
+
+    buf[0] = static_cast<char>('0' + (h / 10) % 10);
+    buf[1] = static_cast<char>('0' + h % 10);
+    buf[2] = ':';
+    buf[3] = static_cast<char>('0' + m / 10);
+    buf[4] = static_cast<char>('0' + m % 10);
+    buf[5] = ':';
+    buf[6] = static_cast<char>('0' + s / 10);
+    buf[7] = static_cast<char>('0' + s % 10);
+    buf[8] = '\0';
+    return buf;
+}
+
+static uint32_t ClockMeasureText(const char* text)
+{
+    const FontAtlas& fa = g_fontAtlas;
+    uint32_t w = 0;
+    while (*text)
+    {
+        int code = static_cast<int>(static_cast<uint8_t>(*text));
+        if (code >= static_cast<int>(fa.firstChar) &&
+            code < static_cast<int>(fa.firstChar + fa.glyphCount))
+            w += static_cast<uint32_t>(fa.glyphs[code - static_cast<int>(fa.firstChar)].advance);
+        ++text;
+    }
+    return w;
+}
+
+static void ClockDrawText(uint32_t* fb, uint32_t fbStride,
+                           uint32_t fbW, uint32_t fbH,
+                           const char* text, uint32_t px, uint32_t py,
+                           uint32_t colour)
+{
+    const FontAtlas& fa = g_fontAtlas;
+    while (*text)
+    {
+        int code = static_cast<int>(static_cast<uint8_t>(*text));
+        if (code >= static_cast<int>(fa.firstChar) &&
+            code < static_cast<int>(fa.firstChar + fa.glyphCount))
+        {
+            const GlyphInfo& gi = fa.glyphs[code - static_cast<int>(fa.firstChar)];
+            int gw = gi.atlasX1 - gi.atlasX0;
+            int gh = gi.atlasY1 - gi.atlasY0;
+            int drawX = static_cast<int>(px) + gi.bearingX;
+            int drawY = static_cast<int>(py) + fa.ascent - gi.bearingY;
+
+            for (int row = 0; row < gh; ++row)
+            {
+                int absY = drawY + row;
+                if (absY < 0 || static_cast<uint32_t>(absY) >= fbH) continue;
+                for (int col = 0; col < gw; ++col)
+                {
+                    int absX = drawX + col;
+                    if (absX < 0 || static_cast<uint32_t>(absX) >= fbW) continue;
+                    uint8_t cov = fa.pixels[(gi.atlasY0 + row) *
+                        static_cast<int>(fa.atlasWidth) + (gi.atlasX0 + col)];
+                    if (cov > 0)
+                    {
+                        uint32_t r = ((colour >> 16) & 0xFF) * cov / 255;
+                        uint32_t g = ((colour >> 8) & 0xFF) * cov / 255;
+                        uint32_t b = (colour & 0xFF) * cov / 255;
+                        fb[absY * fbStride + absX] = (r << 16) | (g << 8) | b;
+                    }
+                }
+            }
+            px += static_cast<uint32_t>(gi.advance);
+        }
+        ++text;
+    }
+}
+
+// Draw the uptime clock in the top-right corner of the backbuffer.
+static void CompositorDrawClock()
+{
+    uint32_t* dst = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
+    uint32_t stride = g_backBuffer ? g_backBufStride : g_physFbStride;
+    if (!dst) return;
+
+    uint64_t uptimeSec = g_lapicTickCount / 1000;
+    char buf[16];
+    FormatUptime(buf, uptimeSec);
+
+    constexpr uint32_t padding = 4;
+    constexpr uint32_t colour = 0x00FF00; // green
+    uint32_t lineH = static_cast<uint32_t>(g_fontAtlas.lineHeight);
+    uint32_t textW = ClockMeasureText(buf);
+    uint32_t x = g_physFbWidth - textW - padding;
+    uint32_t y = padding;
+
+    // Clear background rect
+    for (uint32_t row = y; row < y + lineH + 2 && row < g_physFbHeight; ++row)
+        for (uint32_t col = x > 2 ? x - 2 : 0; col < g_physFbWidth; ++col)
+            dst[row * stride + col] = 0x000000;
+
+    ClockDrawText(dst, stride, g_physFbWidth, g_physFbHeight, buf, x, y, colour);
+    MarkDirtyRows(y, y + lineH + 2);
+}
+
 static void CompositorLoop()
 {
     if (!g_physFb)
@@ -813,6 +921,9 @@ static void CompositorLoop()
         MarkDirtyRows(newMinY, newMaxY);
         CursorDraw(mx, my);
     }
+
+    // Draw uptime clock overlay in top-right corner.
+    CompositorDrawClock();
 
     // Flip: copy only dirty scanlines from backbuffer → MMIO framebuffer.
     if (g_backBuffer && g_dirtyMinY < g_dirtyMaxY)

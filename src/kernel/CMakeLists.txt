@@ -152,7 +152,6 @@ add_executable(kernel
     src/terminal.cpp
     src/display.cpp
     src/mouse.cpp
-    src/clock_overlay.cpp
     src/shell.cpp
     src/boot_logo.cpp
     src/klog.cpp
