@@ -12,6 +12,7 @@
 #include "serial.h"
 #include "kprintf.h"
 #include "compositor.h"
+#include "window.h"
 #include "string.h"
 
 namespace brook {
@@ -675,14 +676,27 @@ void ProcessDestroy(Process* proc)
     if (!proc->isKernelThread)
         VmmDestroyUserPageTable(proc->pageTable);
 
+    // Remove from compositor BEFORE freeing pages — the compositor may be
+    // mid-blit using this process's VFB. Unregistering first ensures the
+    // compositor won't touch the VFB on its next frame.
+    CompositorUnregisterProcess(proc);
+
+    // Destroy any WM window still pointing at this process (safety net —
+    // normally the compositor loop already did this, but if we're called
+    // from wait4/SchedulerReapChild the window may still exist).
+    WmDestroyWindowForProcess(proc);
+
+    // Wait for any in-progress compositor frame to finish. Even though we
+    // removed this process from the compositor list, a blit that was already
+    // in progress (using the old fbVirtual pointer) may still be running.
+    if (proc->fbVfbWidth > 0)
+        CompositorWaitFrame();
+
     // Now free all VMM page allocations and PMM-tracked pages for this process.
     VmmKillPid(proc->pid);
 
     // Remove from scheduler tracking
     SchedulerRemoveProcess(proc);
-
-    // Remove from compositor before freeing the struct
-    CompositorUnregisterProcess(proc);
 
     kfree(proc);
 }
@@ -803,6 +817,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->state = ProcessState::Ready;
     child->runningOnCpu = -1;
     child->reapable = false;
+    child->compositorRegistered = false;
     child->schedNext = nullptr;
     child->schedPrev = nullptr;
     child->inReadyQueue = 0;
@@ -1097,8 +1112,11 @@ int ProcessSendSignal(Process* proc, int signum)
     {
         // Immediately terminate
         proc->exitStatus = 128 + SIGKILL;
+        proc->fbVirtual = nullptr;
+        proc->fbVirtualSize = 0;
         proc->state = ProcessState::Terminated;
-        proc->reapable = true;
+        if (!__atomic_load_n(&proc->compositorRegistered, __ATOMIC_ACQUIRE))
+            proc->reapable = true;
         DbgPrintf("SIGNAL: SIGKILL -> pid %u\n", proc->pid);
         return 0;
     }
@@ -1139,39 +1157,84 @@ int ProcessSendSignal(Process* proc, int signum)
     return 0;
 }
 
-bool ProcessDeliverSignal(Process* proc, uint64_t* userRip, uint64_t* userRsp,
-                          uint64_t* userRflags, uint64_t* userRax)
+} // namespace brook
+
+// ---------------------------------------------------------------------------
+// SyscallCheckSignals — called from asm syscall return path
+// ---------------------------------------------------------------------------
+// Checks for pending signals and either:
+//   1. Delivers a signal by building a SignalFrame on the user stack and
+//      redirecting the SyscallFrame to the handler entry point.
+//   2. Handles rt_sigreturn by restoring the SyscallFrame from the
+//      SignalFrame's ucontext on the user stack.
+
+using namespace brook;
+
+extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResult)
 {
-    if (!proc || proc->isKernelThread || proc->inSignalHandler) return false;
+    Process* proc = ProcessCurrent();
+    if (!proc || proc->isKernelThread) return syscallResult;
 
-    // Get deliverable signals: pending & ~blocked
-    uint64_t deliverable = proc->sigPending & ~proc->sigMask;
-    if (deliverable == 0) return false;
-
-    // Find lowest signal number
-    int signum = 0;
-    for (int i = 0; i < 64; i++)
+    // --- Handle rt_sigreturn ---
+    if (proc->sigReturnPending)
     {
-        if (deliverable & (1ULL << i))
-        {
-            signum = i + 1;
-            break;
-        }
+        proc->sigReturnPending = false;
+        proc->inSignalHandler = false;
+
+        // The user RSP at the time of the rt_sigreturn syscall points to the
+        // ucontext (pretcode was popped by handler's RET, then restorer did syscall).
+        // frame->rsp is the user RSP saved on syscall entry.
+        // The SignalFrame starts 8 bytes before the ucontext (pretcode field).
+        auto* uc = reinterpret_cast<SignalUcontext*>(frame->rsp);
+        const SignalMcontext& mc = uc->uc_mcontext;
+
+        // Restore signal mask
+        proc->sigMask = uc->uc_sigmask;
+
+        // Restore all registers from mcontext into the SyscallFrame
+        frame->rcx    = mc.rip;      // user RIP (sysret uses RCX)
+        frame->rsp    = mc.rsp;
+        frame->rflags = mc.eflags;
+        frame->rdi    = mc.rdi;
+        frame->rsi    = mc.rsi;
+        frame->rdx    = mc.rdx;
+        frame->rbp    = mc.rbp;
+        frame->rbx    = mc.rbx;
+        frame->r8     = mc.r8;
+        frame->r9     = mc.r9;
+        frame->r10    = mc.r10;
+        frame->r11    = mc.r11;
+        frame->r12    = mc.r12;
+        frame->r13    = mc.r13;
+        frame->r14    = mc.r14;
+        frame->r15    = mc.r15;
+
+        DbgPrintf("SIGRETURN: pid %u restored rip=0x%lx rsp=0x%lx\n",
+                  proc->pid, mc.rip, mc.rsp);
+
+        return static_cast<int64_t>(mc.rax); // restore original RAX
     }
-    if (signum == 0) return false;
+
+    // --- Signal delivery ---
+    if (proc->inSignalHandler) return syscallResult;
+
+    uint64_t deliverable = proc->sigPending & ~proc->sigMask;
+    if (deliverable == 0) return syscallResult;
+
+    // Find lowest pending signal
+    int signum = __builtin_ctzll(deliverable) + 1;
 
     // Clear from pending
     __atomic_and_fetch(&proc->sigPending, ~(1ULL << (signum - 1)), __ATOMIC_RELEASE);
 
     uint16_t pid = proc->pid;
-    if (pid >= MAX_PROCESSES) return false;
+    if (pid >= MAX_PROCESSES) return syscallResult;
 
     KernelSigaction& sa = g_sigHandlers[pid][signum - 1];
 
     // SIG_DFL (0) — default action
     if (sa.handler == 0)
     {
-        // Default: terminate for most signals
         switch (signum)
         {
         case 1:  // SIGHUP
@@ -1186,65 +1249,94 @@ bool ProcessDeliverSignal(Process* proc, uint64_t* userRip, uint64_t* userRsp,
             proc->fbVirtual = nullptr;
             proc->fbVirtualSize = 0;
             proc->state = ProcessState::Terminated;
-            proc->reapable = true;
+            if (!__atomic_load_n(&proc->compositorRegistered, __ATOMIC_ACQUIRE))
+                proc->reapable = true;
             DbgPrintf("SIGNAL: default terminate pid %u by signal %d\n", proc->pid, signum);
-            return false; // context not modified — process is dead
+            return syscallResult;
         case 17: // SIGCHLD — default is ignore
         case 28: // SIGWINCH — ignore
-            return false;
-        case 19: // SIGSTOP — handled in ProcessSendSignal (can't be caught)
-            return false;
+            return syscallResult;
         case 20: // SIGTSTP — default is stop
-        case 21: // SIGTTIN — default is stop
-        case 22: // SIGTTOU — default is stop
+        case 21: // SIGTTIN
+        case 22: // SIGTTOU
             proc->state = ProcessState::Stopped;
             DbgPrintf("SIGNAL: pid %u stopped by signal %d\n", proc->pid, signum);
-            return false;
-        case 18: // SIGCONT — default is resume (handled in SendSignal), ignore here
-            return false;
+            return syscallResult;
         default:
-            return false; // ignore unknown
+            return syscallResult;
         }
     }
 
     // SIG_IGN (1)
     if (sa.handler == 1)
-        return false;
+        return syscallResult;
 
-    // User handler — set up signal frame on user stack
-    DbgPrintf("SIGNAL: delivering signal %d to pid %u handler=0x%lx\n",
-              signum, proc->pid, sa.handler);
+    // --- User handler: build SignalFrame on user stack ---
+    DbgPrintf("SIGNAL: delivering signal %d to pid %u handler=0x%lx restorer=0x%lx\n",
+              signum, proc->pid, sa.handler, sa.restorer);
 
-    // Save current context
     proc->inSignalHandler = true;
-    proc->sigSavedRip = *userRip;
-    proc->sigSavedRsp = *userRsp;
-    proc->sigSavedRflags = *userRflags;
-    proc->sigSavedRax = *userRax;
 
-    // Set up the return address on the user stack
-    // Push the restorer address (sa_restorer) so the handler returns to sigreturn
-    uint64_t newRsp = *userRsp;
-    newRsp -= 128; // red zone
-    newRsp &= ~0xFULL; // 16-byte align
+    // Save current signal mask, then block signals specified by sa_mask + this signal
+    proc->sigSavedMask = proc->sigMask;
+    proc->sigMask |= sa.mask | (1ULL << (signum - 1));
+    // Never block SIGKILL or SIGSTOP
+    proc->sigMask &= ~((1ULL << 8) | (1ULL << 18));
 
-    // Push restorer return address
-    newRsp -= 8;
-    *reinterpret_cast<uint64_t*>(newRsp) = sa.restorer;
+    // Build the signal frame on the user stack
+    uint64_t userRsp = frame->rsp;
+    userRsp -= 128;                        // skip red zone
+    userRsp -= sizeof(SignalFrame);
+    userRsp &= ~0xFULL;                   // 16-byte align
 
-    // Set handler entry point
-    *userRip = sa.handler;
-    *userRsp = newRsp;
-    // Signal number in RDI (first argument)
-    // We need to communicate this — for now use the fork register save
-    // Actually, for proper x86-64 signal delivery, RDI = signum
-    // We'll set the saved context's RDI via the userRax pointer hack...
-    // Actually we need direct access to all registers. For now, just
-    // set the signal number. The caller (syscall return path) will need
-    // to set RDI.
-    *userRax = static_cast<uint64_t>(signum); // Hack: caller sets RDI from this
+    auto* sf = reinterpret_cast<SignalFrame*>(userRsp);
 
-    return true;
+    // Clear the frame
+    for (uint64_t i = 0; i < sizeof(SignalFrame) / 8; i++)
+        reinterpret_cast<uint64_t*>(sf)[i] = 0;
+
+    // Return address: sa_restorer (musl's __restore_rt which calls rt_sigreturn)
+    sf->pretcode = sa.restorer;
+
+    // Fill ucontext
+    sf->uc.uc_sigmask = proc->sigSavedMask;
+
+    // Save all registers into mcontext
+    SignalMcontext& mc = sf->uc.uc_mcontext;
+    mc.rax    = static_cast<uint64_t>(syscallResult);
+    mc.rbx    = frame->rbx;
+    mc.rcx    = frame->rcx;     // user RIP
+    mc.rdx    = frame->rdx;
+    mc.rsi    = frame->rsi;
+    mc.rdi    = frame->rdi;
+    mc.rbp    = frame->rbp;
+    mc.rsp    = frame->rsp;
+    mc.r8     = frame->r8;
+    mc.r9     = frame->r9;
+    mc.r10    = frame->r10;
+    mc.r11    = frame->r11;
+    mc.r12    = frame->r12;
+    mc.r13    = frame->r13;
+    mc.r14    = frame->r14;
+    mc.r15    = frame->r15;
+    mc.rip    = frame->rcx;     // user RIP (stored in RCX by syscall)
+    mc.eflags = frame->rflags;
+    mc.cs     = 0x23;           // user code segment
+
+    // Fill siginfo
+    sf->info.si_signo = signum;
+    sf->info.si_code  = 0;      // SI_USER
+
+    // Redirect execution to the signal handler
+    frame->rcx = sa.handler;                           // RIP = handler
+    frame->rsp = userRsp;                              // RSP = signal frame
+    frame->rdi = static_cast<uint64_t>(signum);        // arg1 = signum
+    if (sa.flags & SA_SIGINFO)
+    {
+        // SA_SIGINFO: handler(int signum, siginfo_t* info, void* ucontext)
+        frame->rsi = reinterpret_cast<uint64_t>(&sf->info);
+        frame->rdx = reinterpret_cast<uint64_t>(&sf->uc);
+    }
+
+    return syscallResult; // RAX value (handler ignores it, saved in ucontext)
 }
-
-} // namespace brook

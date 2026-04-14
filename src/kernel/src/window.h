@@ -92,6 +92,9 @@ int WmCreateWindow(Process* proc, int16_t x, int16_t y,
 // Remove a window (process exited or closed).
 void WmDestroyWindow(int idx);
 
+// Remove the window owned by a specific process (safety net for ProcessDestroy).
+void WmDestroyWindowForProcess(Process* proc);
+
 // Hit-test: given mouse coordinates, determine which window/zone is under cursor.
 WmHitResult WmHitTest(int32_t mx, int32_t my);
 

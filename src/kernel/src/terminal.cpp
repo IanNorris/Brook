@@ -569,6 +569,8 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     child->fbVfbHeight = clientH;
     child->fbVfbStride = clientW;
     child->fbDirty = 1;
+    // Mark as compositor-registered so pages aren't freed while blitting
+    __atomic_store_n(&child->compositorRegistered, true, __ATOMIC_RELEASE);
 
     // Add both to scheduler
     SchedulerAddProcess(child);

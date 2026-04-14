@@ -49,6 +49,10 @@ static constexpr uint32_t MAX_COMPOSITED = 64;
 static Process* g_compositedProcs[MAX_COMPOSITED] = {};
 static uint32_t g_compositedCount = 0;
 
+// Frame epoch — incremented at the START of each compositor frame.
+// ProcessDestroy uses this to wait until any in-progress blit has finished.
+static volatile uint64_t g_compositorEpoch = 0;
+
 // Compositor fallback interval: if no event-driven wakeup arrives within
 // this many ms, the compositor wakes anyway (for cursor updates, etc.).
 static constexpr uint32_t COMPOSITE_INTERVAL = 16; // ~60 Hz fallback
@@ -181,6 +185,7 @@ bool CompositorSetupProcess(Process* proc, int16_t destX, int16_t destY,
         __atomic_store_n(&g_compositedProcs[idx], proc, __ATOMIC_RELEASE);
         __atomic_store_n(&g_compositedCount, idx + 1, __ATOMIC_RELEASE);
     }
+    __atomic_store_n(&proc->compositorRegistered, true, __ATOMIC_RELEASE);
 
     DbgPrintf("COMPOSITOR: proc '%s' pid %u → vfb %ux%u at 0x%lx, dest=(%d,%d) scale=%u\n",
                  proc->name, proc->pid, vfbWidth, vfbHeight, vfbAddr.raw(),
@@ -192,7 +197,9 @@ bool CompositorSetupProcess(Process* proc, int16_t destX, int16_t destY,
 // If forceAll is true, blit regardless of dirty flag (periodic refresh).
 static void BlitProcess(Process* proc, bool forceAll)
 {
-    if (!proc->fbVirtual || proc->fbVfbWidth == 0) return;
+    const uint32_t* src = __atomic_load_n(&proc->fbVirtual, __ATOMIC_ACQUIRE);
+    if (!src || proc->fbVfbWidth == 0) return;
+    if (proc->state == ProcessState::Terminated) return;
     if (!forceAll && !proc->fbDirty) return;
     proc->fbDirty = 0;
 
@@ -207,7 +214,7 @@ static void BlitProcess(Process* proc, bool forceAll)
                      reinterpret_cast<uint64_t>(g_physFb));
     }
 
-    const uint32_t* src = proc->fbVirtual;
+    // Use the atomically-snapshotted src pointer (don't re-read fbVirtual)
     const uint32_t  srcW = proc->fbVfbWidth;
     const uint32_t  srcH = proc->fbVfbHeight;
     const uint32_t  srcStride = proc->fbVfbStride;
@@ -285,6 +292,7 @@ static void BlitProcessAt(Process* proc, int dstX0, int dstY0, bool forceAll,
     // (another CPU may null fbVirtual between check and use).
     const uint32_t* src = __atomic_load_n(&proc->fbVirtual, __ATOMIC_ACQUIRE);
     if (!src || proc->fbVfbWidth == 0) return;
+    if (proc->state == ProcessState::Terminated) return;
     if (!forceAll && !proc->fbDirty) return;
     proc->fbDirty = 0;
 
@@ -538,7 +546,7 @@ static void CompositorLoopWM()
         // Blit content then chrome per-window so z-order is respected.
         // (Previously chrome was drawn after ALL content, so a background
         // window's border could overwrite a foreground window's content.)
-        if (p->fbVirtual && p->fbVfbWidth > 0)
+        if (p->state != ProcessState::Terminated && p->fbVfbWidth > 0)
             BlitProcessAt(p, w->clientX(), w->clientY(), true, w->upscale);
 
         if (g_backBuffer)
@@ -694,6 +702,9 @@ static void CompositorLoop()
     if (!g_physFb)
         return;
 
+    // Bump frame epoch so ProcessDestroy can wait for in-progress blits.
+    __atomic_add_fetch(&g_compositorEpoch, 1, __ATOMIC_ACQ_REL);
+
     // Restore pixels under the old cursor position before blitting.
     if (g_cursorVisible) {
         uint32_t oldMinY = (g_cursorSaveY >= 0) ? static_cast<uint32_t>(g_cursorSaveY) : 0;
@@ -755,6 +766,9 @@ static void CompositorLoop()
                 MarkDirtyRows(minY, maxY);
             }
             __atomic_store_n(&g_compositedProcs[i], static_cast<Process*>(nullptr), __ATOMIC_RELEASE);
+            __atomic_store_n(&p->compositorRegistered, false, __ATOMIC_RELEASE);
+            if (p->state == ProcessState::Terminated)
+                __atomic_store_n(&p->reapable, true, __ATOMIC_RELEASE);
             continue;
         }
         if (!p->fbVirtual || p->fbVfbWidth == 0)
@@ -856,6 +870,40 @@ void CompositorUnregisterProcess(Process* proc)
             break;
         }
     }
+    // Clear compositor reference and allow the reaper to free pages.
+    // DrainPostSwitch skips reapable for compositor-registered processes
+    // to prevent PmmKillPid from freeing VFB pages mid-blit.
+    __atomic_store_n(&proc->compositorRegistered, false, __ATOMIC_RELEASE);
+    if (proc->state == ProcessState::Terminated)
+        __atomic_store_n(&proc->reapable, true, __ATOMIC_RELEASE);
+}
+
+void CompositorWaitFrame()
+{
+    // Wait for the compositor to complete its current frame so VFB pages
+    // are safe to free. We need the compositor to start a NEW frame
+    // (meaning any in-progress blit from before our call has finished).
+    uint64_t epoch = __atomic_load_n(&g_compositorEpoch, __ATOMIC_ACQUIRE);
+
+    // Wake the compositor in case it's sleeping between frames
+    CompositorWake();
+
+    // Yield the CPU repeatedly to let the compositor thread run.
+    // Check epoch between yields. Worst case: compositor frame is ~16ms.
+    extern volatile uint64_t g_lapicTickCount;
+    for (int attempt = 0; attempt < 50; ++attempt)
+    {
+        if (__atomic_load_n(&g_compositorEpoch, __ATOMIC_ACQUIRE) != epoch)
+            return;
+        // Yield: block ourselves for 1ms so the compositor can run
+        Process* self = ProcessCurrent();
+        if (self)
+        {
+            self->wakeupTick = g_lapicTickCount + 1;
+            SchedulerBlock(self);
+        }
+    }
+    // Timeout (~50ms) — compositor may be halted, proceed anyway
 }
 
 void CompositorRemap(uint64_t fbPhys, uint32_t w, uint32_t h, uint32_t stridePixels)

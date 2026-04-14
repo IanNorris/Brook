@@ -112,6 +112,11 @@ extern "C" __attribute__((naked, used)) void BrookSyscallDispatcher()
         "sti\n\t"
         "call SyscallDispatchC\n\t"
         "cli\n\t"
+        // Check for pending signals before returning to userspace.
+        // Pass the saved-register frame and syscall return value.
+        "mov %%rsp, %%rdi\n\t"         // RDI = pointer to SyscallFrame
+        "mov %%rax, %%rsi\n\t"         // RSI = syscall result
+        "call SyscallCheckSignals\n\t"  // returns new RAX
         "jmp .Lsyscall_return\n\t"
         ".Lsyscall_invalid:\n\t"
         "mov $-38, %%rax\n\t"
@@ -3288,6 +3293,8 @@ static int64_t sys_sigaltstack(uint64_t, uint64_t, uint64_t,
 // ---------------------------------------------------------------------------
 // sys_rt_sigreturn (15) — restore context saved by signal delivery
 // ---------------------------------------------------------------------------
+// Sets a flag so SyscallCheckSignals (called on asm return path) restores
+// the full register context from the SignalFrame ucontext on the user stack.
 
 static int64_t sys_rt_sigreturn(uint64_t, uint64_t, uint64_t,
                                  uint64_t, uint64_t, uint64_t)
@@ -3295,18 +3302,10 @@ static int64_t sys_rt_sigreturn(uint64_t, uint64_t, uint64_t,
     Process* proc = ProcessCurrent();
     if (!proc || !proc->inSignalHandler) return -EINVAL;
 
-    proc->inSignalHandler = false;
+    proc->sigReturnPending = true;
+    DbgPrintf("SIGRETURN: pid %u requesting context restore\n", proc->pid);
 
-    // The actual context restoration happens in the syscall return path
-    // after checking inSignalHandler. For now, we return -EINTR to signal
-    // that the interrupted syscall should be restarted.
-    // The saved context (sigSavedRip etc.) will be restored by the
-    // syscall dispatcher's return path.
-
-    DbgPrintf("SIGRETURN: pid %u restoring to rip=0x%lx rsp=0x%lx\n",
-              proc->pid, proc->sigSavedRip, proc->sigSavedRsp);
-
-    return proc->sigSavedRax; // Return the original syscall's return value
+    return 0; // Return value doesn't matter — SyscallCheckSignals overwrites RAX
 }
 
 // ---------------------------------------------------------------------------

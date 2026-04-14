@@ -159,7 +159,19 @@ static void DrainPostSwitch(uint32_t cpu)
     Process* retired = g_perCpu[cpu].pendingRetire;
     g_perCpu[cpu].pendingRetire = nullptr;
     if (retired)
-        __atomic_store_n(&retired->reapable, true, __ATOMIC_RELEASE);
+    {
+        // For processes with compositor-registered VFBs, don't mark reapable
+        // yet — the compositor must unregister first to avoid a race where
+        // PmmKillPid frees VFB pages while the compositor is mid-blit.
+        if (!__atomic_load_n(&retired->compositorRegistered, __ATOMIC_ACQUIRE))
+        {
+            __atomic_store_n(&retired->reapable, true, __ATOMIC_RELEASE);
+        }
+        else
+        {
+            DbgPrintf("SCHED: deferring reap for pid %u (compositorRegistered)\n", retired->pid);
+        }
+    }
 
     // Re-enqueue the process we were switched away from.
     Process* toRequeue = g_perCpu[cpu].pendingRequeue;
@@ -568,7 +580,10 @@ static void ReapTerminated()
             }
 
             SchedLockRelease(g_allProcLock, alf);
-            DbgPrintf("SCHED: reaping '%s' (pid %u)\n", p->name, p->pid);
+            DbgPrintf("SCHED: reaping '%s' (pid %u) compReg=%d reapable=%d\n",
+                       p->name, p->pid,
+                       __atomic_load_n(&p->compositorRegistered, __ATOMIC_ACQUIRE),
+                       __atomic_load_n(&p->reapable, __ATOMIC_ACQUIRE));
             ProcessDestroy(p);
             // ProcessDestroy calls SchedulerRemoveProcess
             alf = SchedLockAcquire(g_allProcLock);

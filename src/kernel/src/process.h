@@ -50,8 +50,78 @@ struct KernelSigaction {
     uint64_t mask;       // Signals blocked during handler
 };
 
+// SA_* flag constants
+static constexpr uint64_t SA_SIGINFO  = 0x00000004;
+static constexpr uint64_t SA_RESTORER = 0x04000000;
+
 // Per-process signal handlers (indexed by [pid][signal-1])
 extern KernelSigaction g_sigHandlers[MAX_PROCESSES][64];
+
+// ---------------------------------------------------------------------------
+// Signal frame structures (Linux x86_64 ABI compatible)
+// ---------------------------------------------------------------------------
+// These must match the Linux kernel's layout so musl/glibc's sigreturn works.
+
+struct SignalMcontext {
+    uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
+    uint64_t rdi, rsi, rbp, rbx, rdx, rax, rcx, rsp;
+    uint64_t rip;
+    uint64_t eflags;
+    uint16_t cs, gs, fs, __pad0;
+    uint64_t err, trapno, oldmask, cr2;
+    uint64_t fpstate;          // NULL (no FPU state saved)
+    uint64_t __reserved1[8];
+};
+
+struct SignalStack {
+    uint64_t ss_sp;
+    int32_t  ss_flags;
+    int32_t  __pad;
+    uint64_t ss_size;
+};
+
+struct SignalUcontext {
+    uint64_t        uc_flags;
+    uint64_t        uc_link;
+    SignalStack      uc_stack;
+    SignalMcontext   uc_mcontext;
+    uint64_t        uc_sigmask;
+};
+
+struct SignalInfo {
+    int32_t si_signo;
+    int32_t si_errno;
+    int32_t si_code;
+    int32_t __pad;
+    uint8_t _data[128 - 16];
+};
+
+struct SignalFrame {
+    uint64_t        pretcode;   // sa_restorer (handler returns here)
+    SignalUcontext  uc;
+    SignalInfo      info;
+};
+
+// Kernel stack frame layout matching BrookSyscallDispatcher's push order.
+// Used by SyscallCheckSignals to modify saved registers before sysret.
+struct SyscallFrame {
+    uint64_t rbx;       // [RSP+0]
+    uint64_t r15;       // [RSP+8]
+    uint64_t r14;       // [RSP+16]
+    uint64_t r13;       // [RSP+24]
+    uint64_t r12;       // [RSP+32]
+    uint64_t r11;       // [RSP+40]
+    uint64_t r10;       // [RSP+48]
+    uint64_t r9;        // [RSP+56]
+    uint64_t r8;        // [RSP+64]
+    uint64_t rdi;       // [RSP+72]
+    uint64_t rsi;       // [RSP+80]
+    uint64_t rdx;       // [RSP+88]
+    uint64_t rbp;       // [RSP+96]
+    uint64_t rflags;    // [RSP+104]  (user RFLAGS, popped into R11)
+    uint64_t rcx;       // [RSP+112]  (user RIP, restored via sysret)
+    uint64_t rsp;       // [RSP+120]  (user RSP)
+};
 
 // ---------------------------------------------------------------------------
 // Process scheduling state
@@ -165,6 +235,7 @@ struct Process
     uint8_t  schedPriority;  // Initial scheduler priority (0=RT, 1=High, 2=Normal, 3=Low)
     int32_t  runningOnCpu;   // CPU index (-1 = not running, used for double-schedule detection)
     volatile bool reapable;  // Set after context_switch completes away from this process
+    volatile bool compositorRegistered; // True while compositor holds a reference to this process's VFB
     int32_t exitStatus;      // Exit status (stored when process exits, for wait4)
 
     // Scheduler linked-list pointers (circular doubly-linked ready queue)
@@ -243,28 +314,11 @@ struct Process
     // Signal state
     uint64_t sigMask;           // Blocked signals bitmask (bit N = signal N+1)
     uint64_t sigPending;        // Pending signals bitmask
-    uint64_t sigRestorer;       // User-space signal restorer (SA_RESTORER)
+    uint64_t sigSavedMask;      // Signal mask saved before handler (restored by sigreturn)
 
-    // Saved user-mode context for signal delivery (restored by sigreturn)
-    bool     inSignalHandler;
-    uint64_t sigSavedRip;
-    uint64_t sigSavedRsp;
-    uint64_t sigSavedRflags;
-    uint64_t sigSavedRax;
-    uint64_t sigSavedRdi;
-    uint64_t sigSavedRsi;
-    uint64_t sigSavedRdx;
-    uint64_t sigSavedRcx;
-    uint64_t sigSavedR8;
-    uint64_t sigSavedR9;
-    uint64_t sigSavedR10;
-    uint64_t sigSavedR11;
-    uint64_t sigSavedRbx;
-    uint64_t sigSavedRbp;
-    uint64_t sigSavedR12;
-    uint64_t sigSavedR13;
-    uint64_t sigSavedR14;
-    uint64_t sigSavedR15;
+    // Signal delivery state
+    bool     inSignalHandler;   // Currently executing a user signal handler
+    bool     sigReturnPending;  // Set by sys_rt_sigreturn, handled by SyscallCheckSignals
 
     // Fork child state: when true, the trampoline enters user mode at
     // forkReturnRip with RAX=0 (child's fork() return value).
@@ -374,11 +428,10 @@ FdEntry*  FdGet(Process* proc, int fd);
 // Returns 0 on success, -ESRCH if not found, -EINVAL if bad signal.
 int ProcessSendSignal(Process* proc, int signum);
 
-// Check and deliver pending signals to the current process.
-// Called on return from syscall / interrupt to usermode.
-// Modifies the user-mode context to invoke the signal handler.
-// Returns true if a signal was delivered (context was modified).
-bool ProcessDeliverSignal(Process* proc, uint64_t* userRip, uint64_t* userRsp,
-                          uint64_t* userRflags, uint64_t* userRax);
-
 } // namespace brook
+
+// Called from asm syscall return path (extern "C").
+// Checks for pending signals and modifies the kernel stack frame to redirect
+// to the user signal handler. Also handles sigreturn frame restoration.
+// Returns the value that should be in RAX on return to userspace.
+extern "C" int64_t SyscallCheckSignals(brook::SyscallFrame* frame, int64_t syscallResult);

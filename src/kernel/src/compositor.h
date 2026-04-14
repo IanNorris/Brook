@@ -41,6 +41,10 @@ void CompositorMarkDirty();
 // Unregister a process from the compositor (called before the Process is freed).
 void CompositorUnregisterProcess(Process* proc);
 
+// Wait until any in-progress compositor frame completes.
+// Used by ProcessDestroy to ensure VFB pages aren't freed mid-blit.
+void CompositorWaitFrame();
+
 // Hot-swap the physical framebuffer (called by display driver on mode change).
 // Must be called AFTER TtyRemap (uses TtyGetFramebuffer to get the new mapping).
 // stridePixels is the row stride in pixels (not bytes).
