@@ -9,6 +9,7 @@
 #include "window.h"
 #include "terminal.h"
 #include "input.h"
+#include "net.h"
 
 namespace brook {
 
@@ -841,6 +842,9 @@ static void CompositorThreadFn(void* /*arg*/)
     {
         if (!g_compositorHalted)
             CompositorLoop();
+
+        // Poll debug channel for incoming commands
+        brook::DebugChannelPoll();
 
         // Block until either a process signals dirty (CompositorWake) or
         // the fallback interval elapses (ensures cursor updates even with

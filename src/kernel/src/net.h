@@ -287,4 +287,23 @@ uint32_t DnsResolve(const char* hostname);
 // Simple DNS cache lookup (no network). Returns 0 if not cached.
 uint32_t DnsCacheLookup(const char* hostname);
 
+// ---------------------------------------------------------------------------
+// Debug channel — TCP connection to host for realtime debugging
+// ---------------------------------------------------------------------------
+
+// Attempt to connect to a debug server on the QEMU host (10.0.2.2:9999).
+// Non-fatal if it fails. Call after DHCP completes.
+void DebugChannelInit();
+
+// Send a message to the debug channel (if connected). Safe to call anytime.
+void DebugChannelSend(const char* msg);
+void DebugChannelSendf(const char* fmt, ...);
+
+// Poll for incoming commands from the debug server.
+// Called periodically (e.g., from compositor or heartbeat).
+void DebugChannelPoll();
+
+// Is the debug channel connected?
+bool DebugChannelConnected();
+
 } // namespace brook

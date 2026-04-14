@@ -1158,9 +1158,10 @@ uint32_t SchedulerSnapshotProcesses(ProcessSnapshot* out, uint32_t maxCount)
         s.stackBase = p->stackBase;
         s.stackTop = p->stackTop;
         s.programBreak = p->programBreak;
-        for (uint32_t j = 0; j < 31 && p->name[j]; ++j)
+        uint32_t j = 0;
+        for (; j < 31 && p->name[j]; ++j)
             s.name[j] = p->name[j];
-        s.name[31] = '\0';
+        s.name[j] = '\0';
     }
     SchedLockRelease(g_allProcLock, flags);
     return count;

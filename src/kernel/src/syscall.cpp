@@ -2700,6 +2700,14 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
     if (isTtyFd && cmd == 0x5414)
         return 0;
 
+    // TCXONC = 0x540A — flow control (XON/XOFF), accept but ignore
+    if (cmd == 0x540A)
+        return 0;
+
+    // TCFLSH = 0x540B — flush input/output, accept but ignore
+    if (cmd == 0x540B)
+        return 0;
+
     SerialPrintf("sys_ioctl: unhandled fd=%lu cmd=0x%lx\n", fd, cmd);
     return -ENOSYS;
 }

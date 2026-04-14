@@ -7,7 +7,13 @@
 #include "serial.h"
 #include "kprintf.h"
 #include "scheduler.h"
+#include "process.h"
 #include "memory/heap.h"
+
+// External C functions used by debug channel
+extern "C" void MouseGetPosition(int32_t*, int32_t*);
+extern "C" uint8_t MouseGetButtons();
+extern "C" bool MouseIsAvailable();
 
 namespace brook {
 
@@ -1532,6 +1538,231 @@ bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite)
             return true;
     }
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// Debug channel — TCP connection to host for realtime debugging
+// ---------------------------------------------------------------------------
+
+static int g_debugSockIdx = -1;
+
+// Simple integer-to-string for debug formatting (avoids printf dependency)
+static int IntToStr(char* buf, int32_t val)
+{
+    if (val == 0) { buf[0] = '0'; return 1; }
+    bool neg = val < 0;
+    if (neg) val = -val;
+    char tmp[12];
+    int len = 0;
+    while (val > 0) { tmp[len++] = '0' + (val % 10); val /= 10; }
+    int pos = 0;
+    if (neg) buf[pos++] = '-';
+    for (int i = len - 1; i >= 0; i--) buf[pos++] = tmp[i];
+    return pos;
+}
+
+static int UintToStr(char* buf, uint32_t val)
+{
+    if (val == 0) { buf[0] = '0'; return 1; }
+    char tmp[12];
+    int len = 0;
+    while (val > 0) { tmp[len++] = '0' + (val % 10); val /= 10; }
+    int pos = 0;
+    for (int i = len - 1; i >= 0; i--) buf[pos++] = tmp[i];
+    return pos;
+}
+
+static void DebugHandleCommand(const char* cmd, uint32_t len);
+
+void DebugChannelInit()
+{
+    // Connect to 10.0.2.2:9999 (QEMU host gateway)
+    int idx = SockCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (idx < 0) {
+        SerialPrintf("debug: failed to create socket\n");
+        return;
+    }
+
+    SockAddrIn addr;
+    NetMemset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(9999);
+    addr.sin_addr = htonl(0x0A000202); // 10.0.2.2
+
+    int ret = SockConnect(idx, &addr);
+    if (ret < 0) {
+        SerialPrintf("debug: connect to 10.0.2.2:9999 failed (%d) — no debug server\n", ret);
+        SockClose(idx);
+        return;
+    }
+
+    g_debugSockIdx = idx;
+    SerialPrintf("debug: connected to host debug server\n");
+
+    // Send greeting
+    const char* hello = "=== Brook Debug Channel ===\n";
+    SockSend(idx, hello, NetStrLen(hello));
+}
+
+void DebugChannelSend(const char* msg)
+{
+    if (g_debugSockIdx < 0) return;
+    uint32_t len = 0;
+    while (msg[len]) len++;
+    SockSend(g_debugSockIdx, msg, len);
+}
+
+bool DebugChannelConnected()
+{
+    return g_debugSockIdx >= 0;
+}
+
+void DebugChannelPoll()
+{
+    if (g_debugSockIdx < 0) return;
+
+    // Check for incoming commands
+    if (!SockPollReady(g_debugSockIdx, true, false)) return;
+
+    char buf[256];
+    int n = SockRecv(g_debugSockIdx, buf, sizeof(buf) - 1);
+    if (n <= 0) {
+        if (n == 0) {
+            SerialPrintf("debug: channel closed by host\n");
+            SockClose(g_debugSockIdx);
+            g_debugSockIdx = -1;
+        }
+        return;
+    }
+    buf[n] = '\0';
+
+    // Strip trailing newline
+    if (n > 0 && buf[n-1] == '\n') buf[--n] = '\0';
+    if (n > 0 && buf[n-1] == '\r') buf[--n] = '\0';
+
+    if (n > 0)
+        DebugHandleCommand(buf, static_cast<uint32_t>(n));
+}
+
+static void DebugHandleCommand(const char* cmd, uint32_t len)
+{
+    (void)len;
+
+    if (NetStrEq(cmd, "mouse")) {
+        int32_t mx = 0, my = 0;
+        MouseGetPosition(&mx, &my);
+        uint8_t btns = MouseGetButtons();
+        bool avail = MouseIsAvailable();
+
+        char buf[128];
+        int p = 0;
+        const char* h = "mouse: avail=";
+        for (int i = 0; h[i]; i++) buf[p++] = h[i];
+        buf[p++] = avail ? '1' : '0';
+        const char* xh = " x=";
+        for (int i = 0; xh[i]; i++) buf[p++] = xh[i];
+        p += IntToStr(buf + p, mx);
+        const char* yh = " y=";
+        for (int i = 0; yh[i]; i++) buf[p++] = yh[i];
+        p += IntToStr(buf + p, my);
+        const char* bh = " btn=0x";
+        for (int i = 0; bh[i]; i++) buf[p++] = bh[i];
+        const char* hex = "0123456789abcdef";
+        buf[p++] = hex[(btns >> 4) & 0xF];
+        buf[p++] = hex[btns & 0xF];
+        buf[p++] = '\n';
+        SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
+    }
+    else if (NetStrEq(cmd, "procs")) {
+        extern uint32_t SchedulerSnapshotProcesses(ProcessSnapshot* out, uint32_t maxCount);
+
+        ProcessSnapshot snaps[MAX_PROCESSES];
+        uint32_t count = SchedulerSnapshotProcesses(snaps, MAX_PROCESSES);
+
+        char buf[128];
+        for (uint32_t i = 0; i < count; i++) {
+            int p = 0;
+            const char* ph = "  pid=";
+            for (int j = 0; ph[j]; j++) buf[p++] = ph[j];
+            p += UintToStr(buf + p, snaps[i].pid);
+            const char* sh = " state=";
+            for (int j = 0; sh[j]; j++) buf[p++] = sh[j];
+            p += UintToStr(buf + p, static_cast<uint32_t>(snaps[i].state));
+            const char* nh = " cpu=";
+            for (int j = 0; nh[j]; j++) buf[p++] = nh[j];
+            p += IntToStr(buf + p, snaps[i].runningOnCpu);
+            buf[p++] = ' ';
+            buf[p++] = '\'';
+            for (int j = 0; snaps[i].name[j] && j < 31; j++)
+                buf[p++] = snaps[i].name[j];
+            buf[p++] = '\'';
+            buf[p++] = '\n';
+            SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
+        }
+        const char* done = "---\n";
+        SockSend(g_debugSockIdx, done, 4);
+    }
+    else if (NetStrEq(cmd, "net")) {
+        if (!g_netIf) {
+            DebugChannelSend("net: no interface\n");
+            return;
+        }
+        char buf[256];
+        int p = 0;
+        const char* h = "net: ip=";
+        for (int i = 0; h[i]; i++) buf[p++] = h[i];
+        uint32_t ip = ntohl(g_netIf->ipAddr);
+        for (int oct = 3; oct >= 0; oct--) {
+            p += UintToStr(buf + p, (ip >> (oct * 8)) & 0xFF);
+            if (oct > 0) buf[p++] = '.';
+        }
+        const char* gh = " gw=";
+        for (int i = 0; gh[i]; i++) buf[p++] = gh[i];
+        uint32_t gw = ntohl(g_netIf->gateway);
+        for (int oct = 3; oct >= 0; oct--) {
+            p += UintToStr(buf + p, (gw >> (oct * 8)) & 0xFF);
+            if (oct > 0) buf[p++] = '.';
+        }
+        const char* dh = " dns=";
+        for (int i = 0; dh[i]; i++) buf[p++] = dh[i];
+        uint32_t dns = ntohl(g_netIf->dns);
+        for (int oct = 3; oct >= 0; oct--) {
+            p += UintToStr(buf + p, (dns >> (oct * 8)) & 0xFF);
+            if (oct > 0) buf[p++] = '.';
+        }
+        buf[p++] = '\n';
+        SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
+    }
+    else if (NetStrEq(cmd, "sock")) {
+        for (uint32_t i = 0; i < MAX_SOCKETS; i++) {
+            if (!g_sockUsed[i]) continue;
+            Socket& s = g_sockets[i];
+            char buf[128];
+            int p = 0;
+            const char* h = "  sock ";
+            for (int j = 0; h[j]; j++) buf[p++] = h[j];
+            p += UintToStr(buf + p, i);
+            const char* th = s.type == SOCK_STREAM ? " TCP" : " UDP";
+            for (int j = 0; th[j]; j++) buf[p++] = th[j];
+            if (s.type == SOCK_STREAM) {
+                const char* sh = " state=";
+                for (int j = 0; sh[j]; j++) buf[p++] = sh[j];
+                p += UintToStr(buf + p, static_cast<uint32_t>(s.tcpState));
+            }
+            const char* rh = " rx=";
+            for (int j = 0; rh[j]; j++) buf[p++] = rh[j];
+            p += UintToStr(buf + p, s.rxCount);
+            buf[p++] = '\n';
+            SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
+        }
+        DebugChannelSend("---\n");
+    }
+    else if (NetStrEq(cmd, "help")) {
+        DebugChannelSend("Commands: mouse, procs, net, sock, help\n");
+    }
+    else {
+        DebugChannelSend("Unknown command. Type 'help' for list.\n");
+    }
 }
 
 } // namespace brook
