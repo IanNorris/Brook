@@ -14,7 +14,8 @@ static bool g_ttyUsingBackbuffer = false;
 // TTY state
 // ---------------------------------------------------------------------------
 
-static volatile uint32_t* g_fbPixels  = nullptr; // virtual address of framebuffer
+static volatile uint32_t* g_fbPixels  = nullptr; // virtual address of framebuffer (may be backbuffer)
+static volatile uint32_t* g_fbMMIO   = nullptr; // virtual address of real MMIO framebuffer
 static uint64_t  g_fbPhysBase         = 0;        // physical base of framebuffer
 static uint32_t  g_fbWidth            = 0;
 static uint32_t  g_fbHeight           = 0;
@@ -185,6 +186,7 @@ bool TtyInit(const Framebuffer& fb)
     }
 
     g_fbPixels = reinterpret_cast<volatile uint32_t*>(fbVirt);
+    g_fbMMIO   = reinterpret_cast<volatile uint32_t*>(fbVirt);
     g_fbPhysBase = physBase;
     g_fbWidth  = fb.width;
     g_fbHeight = fb.height;
@@ -302,9 +304,23 @@ void TtyPutChar(char c)
     switch (c)
     {
     case '\n':
+    {
+        int prevY = g_curY;
         Newline();
-        if (g_ttyUsingBackbuffer) { CompositorMarkDirty(); CompositorWake(); }
+        if (g_ttyUsingBackbuffer && g_fbMMIO && g_fbMMIO != g_fbPixels) {
+            if (g_curY <= prevY) {
+                // Scroll happened — flush entire region
+                for (uint32_t row = 0; row < g_rh; row++) {
+                    uint32_t off = (g_ry + row) * g_fbStride + g_rx;
+                    for (uint32_t col = 0; col < g_rw; col++)
+                        const_cast<volatile uint32_t*>(g_fbMMIO)[off + col] =
+                            g_fbPixels[off + col];
+                }
+            }
+            CompositorMarkDirty(); CompositorWake();
+        }
         return;
+    }
     case '\r':
         g_curX = 0;
         return;
@@ -340,6 +356,30 @@ void TtyPutChar(char c)
     RenderGlyph(code);
     if (g_ttyUsingBackbuffer)
     {
+        // Copy the rendered glyph directly to MMIO for immediate visibility.
+        // Without this, chars only appear when the compositor next flushes.
+        if (g_fbMMIO && g_fbMMIO != g_fbPixels)
+        {
+            const FontAtlas& fa2 = g_fontAtlas;
+            if (code >= (int)fa2.firstChar && code < (int)(fa2.firstChar + fa2.glyphCount))
+            {
+                const GlyphInfo& gi2 = fa2.glyphs[code - (int)fa2.firstChar];
+                int lh = fa2.lineHeight;
+                // g_curX already advanced past the glyph; g_curY is the line top
+                int y0 = static_cast<int>(g_ry) + g_curY;
+                int y1 = y0 + lh;
+                if (y0 < 0) y0 = 0;
+                if (y1 > (int)(g_ry + g_rh)) y1 = static_cast<int>(g_ry + g_rh);
+                int x0 = static_cast<int>(g_rx) + g_curX - gi2.advance;
+                int x1 = static_cast<int>(g_rx) + g_curX;
+                if (x0 < 0) x0 = 0;
+                if (x1 > (int)(g_rx + g_rw)) x1 = static_cast<int>(g_rx + g_rw);
+                for (int y = y0; y < y1; y++)
+                    for (int x = x0; x < x1; x++)
+                        const_cast<volatile uint32_t*>(g_fbMMIO)[y * g_fbStride + x] =
+                            g_fbPixels[y * g_fbStride + x];
+            }
+        }
         CompositorMarkDirty();
         CompositorWake();
     }
@@ -568,6 +608,7 @@ void TtyRemap(uint64_t newPhysBase, uint32_t w, uint32_t h, uint32_t stridePixel
 
     // Update TTY state atomically (no lock needed — caller ensures serialisation).
     g_fbPixels   = reinterpret_cast<volatile uint32_t*>(fbVirt);
+    g_fbMMIO     = reinterpret_cast<volatile uint32_t*>(fbVirt);
     g_fbPhysBase = newPhysBase;
     g_fbWidth    = w;
     g_fbHeight   = h;

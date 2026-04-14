@@ -1,0 +1,7 @@
+# Brook OS boot script — DOOM fullscreen (fills 1080p display)
+
+set grid 1x1
+set scale 1
+set vfb 1920x1080
+
+run doom -iwad /boot/DOOM1.WAD
