@@ -5,5 +5,5 @@
 set wm
 set vfb 640x400
 set scale 2
-terminal
 run doom -iwad /boot/DOOM1.WAD
+terminal

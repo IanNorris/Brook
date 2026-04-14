@@ -421,11 +421,11 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     // Bottom border
     WmFillRect(buf, stride, screenW, screenH, wx, wy + oh - WM_BORDER_WIDTH, ow, WM_BORDER_WIDTH, borderCol);
 
-    // Title bar background
+    // Title bar background (fills between top border and client area)
     int titleX = wx + WM_BORDER_WIDTH;
     int titleY = wy + WM_BORDER_WIDTH;
     int titleW = ow - 2 * WM_BORDER_WIDTH;
-    int titleH = WM_TITLE_BAR_HEIGHT - WM_BORDER_WIDTH; // title sits between top border and client
+    int titleH = WM_TITLE_BAR_HEIGHT; // full height to meet client area
     WmFillRect(buf, stride, screenW, screenH, titleX, titleY, titleW, titleH, titleBg);
 
     // Title text (vertically centered in title bar)
@@ -434,24 +434,30 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
                    titleX + 6, textY, w.title,
                    WM_TITLE_FG, titleBg);
 
-    // Close button — 'X' character
+    // Close button — 'X' character, right-aligned
     int closeBtnX = wx + ow - WM_BORDER_WIDTH - WM_BUTTON_WIDTH;
     WmFillRect(buf, stride, screenW, screenH, closeBtnX, titleY,
                WM_BUTTON_WIDTH, titleH, 0x00C04040); // red tint
+    // Center 'X' glyph in button
+    int glyphW = 8; // default
+    if ('X' >= g_fontAtlas.firstChar && 'X' < g_fontAtlas.firstChar + g_fontAtlas.glyphCount)
+        glyphW = g_fontAtlas.glyphs['X' - g_fontAtlas.firstChar].advance;
+    int closeGlyphX = closeBtnX + (WM_BUTTON_WIDTH - glyphW) / 2;
+    int closeGlyphY = titleY + (titleH - g_fontAtlas.lineHeight) / 2;
     WmRenderGlyph(buf, stride, screenW, screenH,
-                  closeBtnX + 6, textY, 'X',
+                  closeGlyphX, closeGlyphY, 'X',
                   0x00FFFFFF, 0x00C04040);
 
-    // Maximize button — box character or restore indicator
+    // Maximize button — box icon, left of close button
     int maxBtnX = closeBtnX - WM_BUTTON_WIDTH;
     uint32_t maxBtnBg = titleBg;
     WmFillRect(buf, stride, screenW, screenH, maxBtnX, titleY,
                WM_BUTTON_WIDTH, titleH, maxBtnBg);
-    // Draw a small square to represent maximize
-    int sqX = maxBtnX + 6;
-    int sqY = textY + 2;
+    // Draw a centered square to represent maximize
     int sqS = 10;
-    // Top edge
+    int sqX = maxBtnX + (WM_BUTTON_WIDTH - sqS) / 2;
+    int sqY = titleY + (titleH - sqS) / 2;
+    // Top edge (thicker)
     WmFillRect(buf, stride, screenW, screenH, sqX, sqY, sqS, 2, WM_TITLE_FG);
     // Bottom edge
     WmFillRect(buf, stride, screenW, screenH, sqX, sqY + sqS - 1, sqS, 1, WM_TITLE_FG);
