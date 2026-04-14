@@ -589,21 +589,23 @@ void TerminalWriteInput(int termIdx, const char* data, uint32_t len)
 
     auto* pipe = static_cast<PipeBuffer*>(t->stdinPipe);
 
-    // Local echo: if the child process has ttyEcho set, render typed
-    // characters directly into the terminal VFB. Without this, chars
-    // only appear when bash writes them back via stdout (after Enter).
-    if (t->child && t->child->ttyEcho)
+    // Local echo: always render printable input to the terminal VFB.
+    // bash/readline turns off ECHO and handles display via stdout writes,
+    // but with TERM=dumb, readline's echo is delayed (buffered in the pipe).
+    // Immediate local echo gives responsive feedback. If readline also echoes,
+    // both render to the same cursor position — harmless overwrite.
+    for (uint32_t i = 0; i < len; i++)
     {
-        for (uint32_t i = 0; i < len; i++)
+        char ch = data[i];
+        if (ch == '\r') ch = '\n';
+        if (ch >= 32 || ch == '\n' || ch == '\b')
         {
-            char ch = data[i];
-            if (ch == '\r') ch = '\n'; // treat CR as newline for rendering
             TermRenderGlyph(t, ch);
         }
-        t->dirty = true;
-        t->child->fbDirty = 1;
-        CompositorWake();
     }
+    t->dirty = true;
+    t->child->fbDirty = 1;
+    CompositorWake();
 
     pipe->write(data, len);
 

@@ -281,11 +281,13 @@ static void BlitProcess(Process* proc, bool forceAll)
 static void BlitProcessAt(Process* proc, int dstX0, int dstY0, bool forceAll,
                            uint8_t upscale = 1)
 {
-    if (!proc->fbVirtual || proc->fbVfbWidth == 0) return;
+    // Snapshot VFB pointer atomically to avoid TOCTOU race with process exit
+    // (another CPU may null fbVirtual between check and use).
+    const uint32_t* src = __atomic_load_n(&proc->fbVirtual, __ATOMIC_ACQUIRE);
+    if (!src || proc->fbVfbWidth == 0) return;
     if (!forceAll && !proc->fbDirty) return;
     proc->fbDirty = 0;
 
-    const uint32_t* src = proc->fbVirtual;
     const uint32_t  srcW = proc->fbVfbWidth;
     const uint32_t  srcH = proc->fbVfbHeight;
     const uint32_t  srcStride = proc->fbVfbStride;
@@ -645,8 +647,8 @@ static void CompositorHandleMouseWM()
                 Window* w = WmGetWindow(hit.windowIndex);
                 if (w && w->proc)
                 {
-                    // TODO: send SIGTERM; for now terminate immediately
                     SerialPrintf("WM: close window %d '%s'\n", hit.windowIndex, w->title);
+                    ProcessSendSignal(w->proc, 15); // SIGTERM
                 }
                 break;
             }
