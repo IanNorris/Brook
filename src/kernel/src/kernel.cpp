@@ -399,10 +399,12 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::ModuleDiscoverAndLoad("/boot/drivers");
     brook::SerialPuts("module: Phase 2 — done\n");
 
-    // ---- Network (DHCP) ----
+    // ---- Network (DHCP + DNS test) ----
     if (brook::NetGetIf()) {
         brook::BootLogoProgress(75, "Network");
         brook::DhcpDiscover(brook::NetGetIf());
+        // Quick DNS test
+        brook::DnsResolve("example.com");
     }
 
     // ---- Syscall table ----

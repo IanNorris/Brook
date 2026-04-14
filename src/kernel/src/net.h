@@ -229,4 +229,15 @@ void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
                     uint32_t dstIp, uint16_t dstPort,
                     const void* data, uint32_t len);
 
+// ---------------------------------------------------------------------------
+// DNS resolver
+// ---------------------------------------------------------------------------
+
+// Resolve a hostname to an IPv4 address (big-endian).
+// Returns 0 on failure. Blocks up to ~5 seconds.
+uint32_t DnsResolve(const char* hostname);
+
+// Simple DNS cache lookup (no network). Returns 0 if not cached.
+uint32_t DnsCacheLookup(const char* hostname);
+
 } // namespace brook

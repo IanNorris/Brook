@@ -343,9 +343,10 @@ static void HandleIcmp(const Ipv4Header* ip, const uint8_t* payload, uint32_t pa
 // UDP handling
 // ---------------------------------------------------------------------------
 
-// Forward declaration — HandleUdp is replaced by HandleUdpWithDhcp below.
+// Forward declarations
 static void HandleUdpWithDhcp(const Ipv4Header* ip,
                                const uint8_t* payload, uint32_t payloadLen);
+static bool IsDnsReply(uint16_t dstPort, const void* data, uint32_t len);
 
 // ---------------------------------------------------------------------------
 // IPv4 receive
@@ -653,8 +654,10 @@ static void HandleUdpWithDhcp(const Ipv4Header* ip,
     const uint8_t* data = payload + sizeof(UdpHeader);
     uint32_t dataLen = udpLen - sizeof(UdpHeader);
 
-    // Check DHCP first
+    // Check DHCP first, then DNS
     if (IsDhcpReply(dstPort, data, dataLen))
+        return;
+    if (IsDnsReply(dstPort, data, dataLen))
         return;
 
     SockDeliverUdp(ip->srcIp, srcPort, ip->dstIp, dstPort, data, dataLen);
@@ -662,6 +665,248 @@ static void HandleUdpWithDhcp(const Ipv4Header* ip,
 
 // ---------------------------------------------------------------------------
 // Socket layer
+// ---------------------------------------------------------------------------
+
+// DNS resolver
+// ---------------------------------------------------------------------------
+
+static constexpr uint16_t DNS_PORT = 53;
+static constexpr uint16_t DNS_LOCAL_PORT = 10053;
+
+// DNS header (RFC 1035)
+struct __attribute__((packed)) DnsHeader {
+    uint16_t id;
+    uint16_t flags;
+    uint16_t qdCount;
+    uint16_t anCount;
+    uint16_t nsCount;
+    uint16_t arCount;
+};
+
+// DNS cache entry
+struct DnsCacheEntry {
+    char     name[128];
+    uint32_t ip;       // big-endian
+    uint32_t ttl;      // remaining TTL (not yet decremented)
+};
+
+static constexpr int DNS_CACHE_SIZE = 32;
+static DnsCacheEntry g_dnsCache[DNS_CACHE_SIZE];
+static int g_dnsCacheCount = 0;
+
+// Pending DNS query state
+static volatile bool g_dnsGotReply = false;
+static volatile uint32_t g_dnsResolvedIp = 0;
+static volatile uint16_t g_dnsQueryId = 0;
+
+static int NetStrLen(const char* s)
+{
+    int n = 0;
+    while (s[n]) n++;
+    return n;
+}
+
+static bool NetStrEq(const char* a, const char* b)
+{
+    while (*a && *b) {
+        if (*a != *b) return false;
+        a++; b++;
+    }
+    return *a == *b;
+}
+
+// Encode a hostname in DNS wire format: "www.example.com" → 3www7example3com0
+static int DnsEncodeName(uint8_t* buf, int maxLen, const char* name)
+{
+    int pos = 0;
+    const char* p = name;
+
+    while (*p) {
+        const char* dot = p;
+        while (*dot && *dot != '.') dot++;
+        int labelLen = dot - p;
+        if (labelLen == 0 || labelLen > 63) return -1;
+        if (pos + 1 + labelLen >= maxLen) return -1;
+
+        buf[pos++] = static_cast<uint8_t>(labelLen);
+        for (int i = 0; i < labelLen; i++)
+            buf[pos++] = static_cast<uint8_t>(p[i]);
+
+        p = *dot ? dot + 1 : dot;
+    }
+
+    if (pos >= maxLen) return -1;
+    buf[pos++] = 0; // root label
+    return pos;
+}
+
+// Skip a DNS name (handles compression pointers)
+static const uint8_t* DnsSkipName(const uint8_t* p, const uint8_t* end)
+{
+    while (p < end) {
+        uint8_t len = *p;
+        if (len == 0) return p + 1;
+        if ((len & 0xC0) == 0xC0) return p + 2; // compression pointer
+        p += 1 + len;
+    }
+    return nullptr;
+}
+
+// Parse a DNS response and extract the first A record
+static uint32_t DnsParseResponse(const uint8_t* data, uint32_t len, uint16_t expectedId)
+{
+    if (len < sizeof(DnsHeader)) return 0;
+
+    auto* hdr = reinterpret_cast<const DnsHeader*>(data);
+    if (ntohs(hdr->id) != expectedId) return 0;
+
+    uint16_t flags = ntohs(hdr->flags);
+    if (!(flags & 0x8000)) return 0; // not a response
+    if ((flags & 0x000F) != 0) return 0; // RCODE != 0 (error)
+
+    uint16_t qdCount = ntohs(hdr->qdCount);
+    uint16_t anCount = ntohs(hdr->anCount);
+
+    const uint8_t* p = data + sizeof(DnsHeader);
+    const uint8_t* end = data + len;
+
+    // Skip question section
+    for (uint16_t i = 0; i < qdCount && p < end; i++) {
+        p = DnsSkipName(p, end);
+        if (!p) return 0;
+        p += 4; // QTYPE + QCLASS
+    }
+
+    // Parse answer section — find first A record
+    for (uint16_t i = 0; i < anCount && p < end; i++) {
+        p = DnsSkipName(p, end);
+        if (!p || p + 10 > end) return 0;
+
+        uint16_t rtype  = (p[0] << 8) | p[1];
+        // uint16_t rclass = (p[2] << 8) | p[3];
+        // uint32_t ttl = (p[4] << 24) | (p[5] << 16) | (p[6] << 8) | p[7];
+        uint16_t rdlen  = (p[8] << 8) | p[9];
+        p += 10;
+
+        if (p + rdlen > end) return 0;
+
+        if (rtype == 1 && rdlen == 4) { // A record
+            uint32_t ip;
+            NetMemcpy(&ip, p, 4);
+            return ip; // big-endian
+        }
+
+        p += rdlen;
+    }
+
+    return 0;
+}
+
+// Handle incoming DNS response (called from UDP path)
+static bool IsDnsReply(uint16_t dstPort, const void* data, uint32_t len)
+{
+    if (dstPort != DNS_LOCAL_PORT || !g_dnsQueryId) return false;
+
+    uint32_t ip = DnsParseResponse(static_cast<const uint8_t*>(data), len, g_dnsQueryId);
+    if (ip) {
+        g_dnsResolvedIp = ip;
+        g_dnsGotReply = true;
+    }
+    return true;
+}
+
+uint32_t DnsCacheLookup(const char* hostname)
+{
+    for (int i = 0; i < g_dnsCacheCount; i++) {
+        if (NetStrEq(g_dnsCache[i].name, hostname))
+            return g_dnsCache[i].ip;
+    }
+    return 0;
+}
+
+static void DnsCacheInsert(const char* hostname, uint32_t ip)
+{
+    // Check if already cached
+    for (int i = 0; i < g_dnsCacheCount; i++) {
+        if (NetStrEq(g_dnsCache[i].name, hostname)) {
+            g_dnsCache[i].ip = ip;
+            return;
+        }
+    }
+
+    // Insert new entry (overwrite oldest if full)
+    int idx = g_dnsCacheCount < DNS_CACHE_SIZE ? g_dnsCacheCount++ : 0;
+    int nameLen = NetStrLen(hostname);
+    if (nameLen >= 127) nameLen = 127;
+    NetMemcpy(g_dnsCache[idx].name, hostname, nameLen);
+    g_dnsCache[idx].name[nameLen] = 0;
+    g_dnsCache[idx].ip = ip;
+}
+
+uint32_t DnsResolve(const char* hostname)
+{
+    if (!g_netIf || !g_netIf->dns) return 0;
+
+    // Check cache first
+    uint32_t cached = DnsCacheLookup(hostname);
+    if (cached) return cached;
+
+    // Check if hostname is already a dotted-decimal IP
+    // (simple check: starts with digit)
+
+    // Build DNS query
+    uint8_t pkt[512];
+    NetMemset(pkt, 0, sizeof(pkt));
+
+    static uint16_t s_dnsId = 1;
+    uint16_t qid = s_dnsId++;
+
+    auto* hdr = reinterpret_cast<DnsHeader*>(pkt);
+    hdr->id      = htons(qid);
+    hdr->flags   = htons(0x0100); // RD=1 (recursion desired)
+    hdr->qdCount = htons(1);
+
+    int nameLen = DnsEncodeName(pkt + sizeof(DnsHeader),
+                                 sizeof(pkt) - sizeof(DnsHeader) - 4,
+                                 hostname);
+    if (nameLen < 0) return 0;
+
+    uint8_t* qEnd = pkt + sizeof(DnsHeader) + nameLen;
+    // QTYPE = A (1), QCLASS = IN (1)
+    qEnd[0] = 0; qEnd[1] = 1; // A
+    qEnd[2] = 0; qEnd[3] = 1; // IN
+    uint32_t pktLen = sizeof(DnsHeader) + nameLen + 4;
+
+    g_dnsGotReply = false;
+    g_dnsResolvedIp = 0;
+    g_dnsQueryId = qid;
+
+    for (int attempt = 0; attempt < 3; attempt++) {
+        SerialPrintf("net: DNS query '%s' (attempt %d)\n", hostname, attempt + 1);
+        NetSendUdp(g_netIf->dns, DNS_LOCAL_PORT, DNS_PORT, pkt, pktLen);
+
+        // Wait up to 2 seconds, polling
+        for (int i = 0; i < 2000000; i++) {
+            if (g_netIf->poll) g_netIf->poll(g_netIf);
+            __asm__ volatile("pause");
+            if (g_dnsGotReply) {
+                uint32_t ip = g_dnsResolvedIp;
+                g_dnsQueryId = 0;
+                DnsCacheInsert(hostname, ip);
+
+                SerialPrintf("net: DNS '%s' → %d.%d.%d.%d\n", hostname,
+                             ip & 0xFF, (ip >> 8) & 0xFF,
+                             (ip >> 16) & 0xFF, (ip >> 24) & 0xFF);
+                return ip;
+            }
+        }
+    }
+
+    SerialPrintf("net: DNS failed for '%s'\n", hostname);
+    g_dnsQueryId = 0;
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 
 int SockCreate(int domain, int type, int protocol)
