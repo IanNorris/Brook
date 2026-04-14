@@ -207,13 +207,25 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
         {
             const char* buf = reinterpret_cast<const char*>(bufAddr);
             static uint32_t s_ttyLog = 0;
-            if (s_ttyLog < 40 && count > 0 && count < 200)
+            if (s_ttyLog < 80 && count > 0 && count < 200)
             {
                 s_ttyLog++;
-                char preview[17];
-                uint32_t pLen = count < 16 ? (uint32_t)count : 16;
-                for (uint32_t i = 0; i < pLen; i++)
-                    preview[i] = (buf[i] >= ' ' && buf[i] <= '~') ? buf[i] : '.';
+                // Show first few bytes with hex for non-printable
+                char preview[65];
+                uint32_t pLen = 0;
+                for (uint32_t i = 0; i < count && i < 16 && pLen < 60; i++)
+                {
+                    uint8_t ch = static_cast<uint8_t>(buf[i]);
+                    if (ch >= ' ' && ch <= '~')
+                        preview[pLen++] = static_cast<char>(ch);
+                    else
+                    {
+                        preview[pLen++] = '\\';
+                        preview[pLen++] = 'x';
+                        preview[pLen++] = "0123456789abcdef"[ch >> 4];
+                        preview[pLen++] = "0123456789abcdef"[ch & 0xF];
+                    }
+                }
                 preview[pLen] = '\0';
                 SerialPrintf("TTY_W: fd=%lu n=%lu [%s]\n", fd, count, preview);
             }
