@@ -1,85 +1,140 @@
-# Brook OS
+<p align="center">
+  <img src="docs/images/brook_logo.png" alt="Brook OS" width="600">
+</p>
 
-A hobby x86_64 operating system focused on code quality and clean architecture.
+<h3 align="center">A hobby x86-64 operating system built from scratch</h3>
 
-## Goals
+<p align="center">
+  UEFI · Clang/LLVM · SMP · Window Manager · Runs DOOM
+</p>
 
-- Minimal microkernel with drivers in userspace
-- Ring separation established early
-- Linux ABI compatibility
-- Windows ABI compatibility (clean-room, bring your own DLLs)
-- Unified Clang/LLVM toolchain throughout
+---
 
-## Architecture
+![Brook OS window manager running DOOM and a terminal](docs/images/brook_wm.png)
 
-```
-Bootloader (UEFI PE/COFF)
-  └─ Loads kernel ELF at high virtual addresses
-  └─ Passes boot protocol (memory map, framebuffer) to kernel
+## What is Brook?
 
-Kernel (ring 0, minimal)
-  └─ Memory management
-  └─ IPC / message passing
-  └─ Two-tier scheduler (kernel allocates quanta, userspace picks policy)
+Brook is a hobby operating system for x86-64, written in C++ with a unified
+Clang/LLVM toolchain. It boots via UEFI, runs on multiple cores, has a
+compositing window manager, and can run DOOM.
 
-Drivers (ring 3, userspace processes)
-  └─ Storage, filesystem, display, input
+This is my second OS project (the first being
+[Enkel](https://github.com/IanNorris/Enkel)). Where Enkel focused on getting
+things working, Brook focuses on **code quality** and **clean architecture**.
 
-Apps
-  └─ Shell, ...
-```
+## Features
+
+### Kernel
+- **UEFI bootloader** — loads ELF kernel at high virtual addresses (0xFFFFFFFF80000000)
+- **SMP** — symmetric multiprocessing with per-CPU scheduling
+- **MLFQ scheduler** — multi-level feedback queue, loaded as a kernel module
+- **Virtual memory** — 4-level page tables, per-PID ownership tracking, demand paging
+- **Kernel heap** — kmalloc/kfree with slab-style allocation
+- **Loadable kernel modules** — drivers loaded from disk at boot
+- **VFS + FAT filesystem** — virtio-blk backed storage with full read/write
+
+### Userspace
+- **Linux syscall ABI** — enough of the Linux ABI to run real ELF binaries
+- **musl libc** — standard C library for userspace programs
+- **bash** — full interactive bash shell with readline
+- **busybox** — coreutils (ls, cat, echo, etc.)
+- **TCC** — Tiny C Compiler runs natively, can compile and execute C programs
+- **DOOM** — the classic id Software game, running in a window
+- **Signals** — SIGINT, SIGQUIT, SIGKILL, SIGPIPE, SIGCHLD, with rt_sigaction
+- **Pipes** — anonymous pipes with proper blocking read/write semantics
+- **fork/exec** — full process creation with copy-on-write
+
+### Window Manager
+- **Compositing WM** — wallpaper, window chrome, title bars, z-ordering
+- **Terminal emulator** — VT100/ANSI escape sequences, connects to bash via pipes
+- **Mouse support** — cursor rendering, window focus by click
+- **Per-process framebuffers** — each window gets its own virtual framebuffer
+- **Upscaling** — configurable per-window scale factor (DOOM renders at 4×)
+
+### Drivers (loadable modules)
+- `bochs_display` — BGA/bochs VBE display driver
+- `ps2_kbd` — PS/2 keyboard with Shift, Ctrl, Alt, CapsLock
+- `ps2_mouse` — PS/2 mouse driver
+- `virtio_blk` — virtio block device for disk I/O
+- `virtio_input` — virtio input (tablet) for absolute mouse positioning
+- `sched_mlfq` — multi-level feedback queue scheduling policy
 
 ## Building
 
 ### Prerequisites
 
-- `clang` / `clang++`
-- `lld` (`lld-link` and `ld.lld`)
-- `cmake` ≥ 3.25
-- `ninja`
-- `qemu-system-x86_64` + OVMF (for running)
+- Clang/LLVM 18+, LLD, NASM
+- CMake ≥ 3.25, Ninja
+- Python 3 with `freetype-py` (for font atlas generation)
+- QEMU + OVMF (for running)
 
-On NixOS:
+On NixOS / with Nix:
 ```bash
-nix-shell -p clang lld cmake ninja qemu OVMF
+nix-shell -p clang_18 lld_18 llvm_18 cmake ninja python3 python3Packages.freetype-py nasm
 ```
 
 ### Build
 
 ```bash
-./scripts/build.sh          # Debug build (default)
+./scripts/build.sh          # Debug build
 ./scripts/build.sh Release  # Release build
 ```
 
 ### Run in QEMU
 
 ```bash
-./scripts/run-qemu.sh
+./scripts/run-qemu.sh       # Launches QEMU with OVMF firmware
 ```
+
+Boot scripts in `data/scripts/` control what runs at startup:
+- `wm.rc` — Window manager with terminal
+- `wmdoom.rc` — Window manager with DOOM + terminal
+- `doomfs.rc` — Full-screen DOOM
+- `shell.rc` — Direct serial shell (no WM)
 
 ## Project Structure
 
 ```
 src/
-  bootloader/       UEFI bootloader (PE/COFF via Clang)
-  kernel/           Kernel (bare metal ELF, high virtual addresses)
-  drivers/          Userspace driver processes
-  apps/             User applications (shell, ...)
+  bootloader/       UEFI bootloader (PE/COFF)
+  kernel/           Kernel core (memory, scheduler, VFS, syscalls, WM)
+  drivers/          Loadable kernel modules
+  apps/             Userspace programs (hello, mandelbrot, coremark, ...)
   shared/
-    boot_protocol/  Bootloader↔kernel handoff structures
+    boot_protocol/  Bootloader ↔ kernel handoff structures
     inc_km/         Kernel-mode shared headers
-    src_km/         Kernel-mode shared implementation
+    src_km/         Kernel-mode shared sources
     inc_um/         Usermode shared headers
-    src_um/         Usermode shared implementation
+    src_um/         Usermode shared sources
 cmake/
-  toolchains/       Per-target Clang toolchain files
+  toolchains/       Clang cross-compilation toolchain files
 vendor/
-  uefi-headers/     UEFI header-only library (submodule)
+  uefi-headers/     UEFI specification headers (submodule)
 scripts/
   build.sh          Build orchestration
-  run-qemu.sh       QEMU test runner
+  run-qemu.sh       QEMU launcher
+  convert_wallpaper.py   Wallpaper image converter
+  generate_font_atlas.py Font atlas generator
+data/
+  scripts/          Boot scripts (.rc files)
+  wallpaper.raw     Desktop wallpaper (raw XRGB)
+docs/
+  images/           Screenshots and logo
 ```
+
+## Acknowledgements
+
+- [DOOM Generic](https://github.com/ozkl/doomgeneric) — portable DOOM port
+- [musl libc](https://musl.libc.org/) — C standard library
+- [bash](https://www.gnu.org/software/bash/) — shell
+- [busybox](https://busybox.net/) — coreutils
+- [TCC](https://bellard.org/tcc/) — Tiny C Compiler
+- [Hack font](https://sourcefoundry.org/hack/) — terminal font
 
 ## Legal
 
-See [LEGAL.md](LEGAL.md) for notes on clean-room Windows ABI implementation.
+See [LEGAL.md](LEGAL.md) for notes on the clean-room Windows ABI compatibility layer.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
