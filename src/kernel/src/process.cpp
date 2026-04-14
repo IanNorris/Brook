@@ -1079,4 +1079,138 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     return interpEntry ? interpEntry : proc->elf.entryPoint;
 }
 
+// ---------------------------------------------------------------------------
+// Signal delivery
+// ---------------------------------------------------------------------------
+
+// Signal constants
+static constexpr int SIGKILL = 9;
+[[maybe_unused]] static constexpr int SIGSTOP = 19;
+
+int ProcessSendSignal(Process* proc, int signum)
+{
+    if (!proc) return -3; // ESRCH
+    if (signum < 1 || signum > 64) return -22; // EINVAL
+
+    // SIGKILL and SIGSTOP cannot be caught/blocked
+    if (signum == SIGKILL)
+    {
+        // Immediately terminate
+        proc->exitStatus = 128 + SIGKILL;
+        proc->state = ProcessState::Terminated;
+        proc->reapable = true;
+        DbgPrintf("SIGNAL: SIGKILL -> pid %u\n", proc->pid);
+        return 0;
+    }
+
+    uint64_t bit = 1ULL << (signum - 1);
+    __atomic_or_fetch(&proc->sigPending, bit, __ATOMIC_RELEASE);
+
+    // Wake blocked processes so they can handle the signal
+    if (proc->state == ProcessState::Blocked)
+    {
+        proc->pendingWakeup = 1;
+        SchedulerUnblock(proc);
+    }
+
+    return 0;
+}
+
+bool ProcessDeliverSignal(Process* proc, uint64_t* userRip, uint64_t* userRsp,
+                          uint64_t* userRflags, uint64_t* userRax)
+{
+    if (!proc || proc->isKernelThread || proc->inSignalHandler) return false;
+
+    // Get deliverable signals: pending & ~blocked
+    uint64_t deliverable = proc->sigPending & ~proc->sigMask;
+    if (deliverable == 0) return false;
+
+    // Find lowest signal number
+    int signum = 0;
+    for (int i = 0; i < 64; i++)
+    {
+        if (deliverable & (1ULL << i))
+        {
+            signum = i + 1;
+            break;
+        }
+    }
+    if (signum == 0) return false;
+
+    // Clear from pending
+    __atomic_and_fetch(&proc->sigPending, ~(1ULL << (signum - 1)), __ATOMIC_RELEASE);
+
+    uint16_t pid = proc->pid;
+    if (pid >= MAX_PROCESSES) return false;
+
+    KernelSigaction& sa = g_sigHandlers[pid][signum - 1];
+
+    // SIG_DFL (0) — default action
+    if (sa.handler == 0)
+    {
+        // Default: terminate for most signals
+        switch (signum)
+        {
+        case 1:  // SIGHUP
+        case 2:  // SIGINT
+        case 3:  // SIGQUIT
+        case 6:  // SIGABRT
+        case 11: // SIGSEGV
+        case 13: // SIGPIPE
+        case 14: // SIGALRM
+        case 15: // SIGTERM
+            proc->exitStatus = 128 + signum;
+            proc->state = ProcessState::Terminated;
+            proc->reapable = true;
+            DbgPrintf("SIGNAL: default terminate pid %u by signal %d\n", proc->pid, signum);
+            return false; // context not modified — process is dead
+        case 17: // SIGCHLD — default is ignore
+        case 20: // SIGTSTP — ignore for now
+        case 28: // SIGWINCH — ignore
+            return false;
+        default:
+            return false; // ignore unknown
+        }
+    }
+
+    // SIG_IGN (1)
+    if (sa.handler == 1)
+        return false;
+
+    // User handler — set up signal frame on user stack
+    DbgPrintf("SIGNAL: delivering signal %d to pid %u handler=0x%lx\n",
+              signum, proc->pid, sa.handler);
+
+    // Save current context
+    proc->inSignalHandler = true;
+    proc->sigSavedRip = *userRip;
+    proc->sigSavedRsp = *userRsp;
+    proc->sigSavedRflags = *userRflags;
+    proc->sigSavedRax = *userRax;
+
+    // Set up the return address on the user stack
+    // Push the restorer address (sa_restorer) so the handler returns to sigreturn
+    uint64_t newRsp = *userRsp;
+    newRsp -= 128; // red zone
+    newRsp &= ~0xFULL; // 16-byte align
+
+    // Push restorer return address
+    newRsp -= 8;
+    *reinterpret_cast<uint64_t*>(newRsp) = sa.restorer;
+
+    // Set handler entry point
+    *userRip = sa.handler;
+    *userRsp = newRsp;
+    // Signal number in RDI (first argument)
+    // We need to communicate this — for now use the fork register save
+    // Actually, for proper x86-64 signal delivery, RDI = signum
+    // We'll set the saved context's RDI via the userRax pointer hack...
+    // Actually we need direct access to all registers. For now, just
+    // set the signal number. The caller (syscall return path) will need
+    // to set RDI.
+    *userRax = static_cast<uint64_t>(signum); // Hack: caller sets RDI from this
+
+    return true;
+}
+
 } // namespace brook

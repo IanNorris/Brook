@@ -39,6 +39,20 @@ static constexpr uint64_t USER_MMAP_END  = 0x700000000000ULL; // well below stac
 static constexpr uint64_t USER_STACK_TOP = 0x7FFFFFFFE000ULL;
 
 // ---------------------------------------------------------------------------
+// Signal handler (Linux-compatible sigaction layout)
+// ---------------------------------------------------------------------------
+
+struct KernelSigaction {
+    uint64_t handler;    // SIG_DFL=0, SIG_IGN=1, or handler address
+    uint64_t flags;      // SA_RESTORER, SA_SIGINFO, etc.
+    uint64_t restorer;   // User-space __restore_rt trampoline
+    uint64_t mask;       // Signals blocked during handler
+};
+
+// Per-process signal handlers (indexed by [pid][signal-1])
+extern KernelSigaction g_sigHandlers[MAX_PROCESSES][64];
+
+// ---------------------------------------------------------------------------
 // Process scheduling state
 // ---------------------------------------------------------------------------
 
@@ -224,6 +238,32 @@ struct Process
     bool ttyEcho;
     bool straceEnabled;  // Per-process syscall tracing
 
+    // Signal state
+    uint64_t sigMask;           // Blocked signals bitmask (bit N = signal N+1)
+    uint64_t sigPending;        // Pending signals bitmask
+    uint64_t sigRestorer;       // User-space signal restorer (SA_RESTORER)
+
+    // Saved user-mode context for signal delivery (restored by sigreturn)
+    bool     inSignalHandler;
+    uint64_t sigSavedRip;
+    uint64_t sigSavedRsp;
+    uint64_t sigSavedRflags;
+    uint64_t sigSavedRax;
+    uint64_t sigSavedRdi;
+    uint64_t sigSavedRsi;
+    uint64_t sigSavedRdx;
+    uint64_t sigSavedRcx;
+    uint64_t sigSavedR8;
+    uint64_t sigSavedR9;
+    uint64_t sigSavedR10;
+    uint64_t sigSavedR11;
+    uint64_t sigSavedRbx;
+    uint64_t sigSavedRbp;
+    uint64_t sigSavedR12;
+    uint64_t sigSavedR13;
+    uint64_t sigSavedR14;
+    uint64_t sigSavedR15;
+
     // Fork child state: when true, the trampoline enters user mode at
     // forkReturnRip with RAX=0 (child's fork() return value).
     bool isForkChild;
@@ -300,5 +340,16 @@ FdEntry*  FdGet(Process* proc, int fd);
 // Properly handles pipe refcounting and wakes blocked readers/writers.
 void ProcessCloseAllFds(Process* proc);
 FdEntry*  FdGet(Process* proc, int fd);
+
+// Signal delivery: send a signal to a process.
+// Returns 0 on success, -ESRCH if not found, -EINVAL if bad signal.
+int ProcessSendSignal(Process* proc, int signum);
+
+// Check and deliver pending signals to the current process.
+// Called on return from syscall / interrupt to usermode.
+// Modifies the user-mode context to invoke the signal handler.
+// Returns true if a signal was delivered (context was modified).
+bool ProcessDeliverSignal(Process* proc, uint64_t* userRip, uint64_t* userRsp,
+                          uint64_t* userRflags, uint64_t* userRax);
 
 } // namespace brook

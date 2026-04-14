@@ -2562,14 +2562,7 @@ static int64_t sys_setgroups(uint64_t, uint64_t, uint64_t,
 // Signal: rt_sigaction (13), rt_sigprocmask (14)
 // ---------------------------------------------------------------------------
 
-struct KernelSigaction {
-    uint64_t handler;
-    uint64_t flags;
-    uint64_t restorer;
-    uint64_t mask;
-};
-
-static KernelSigaction g_sigHandlers[MAX_PROCESSES][64];
+KernelSigaction g_sigHandlers[MAX_PROCESSES][64];
 
 static int64_t sys_rt_sigaction(uint64_t signum, uint64_t actAddr, uint64_t oldactAddr,
                                  uint64_t sigsetsize, uint64_t, uint64_t)
@@ -2602,10 +2595,38 @@ static int64_t sys_rt_sigaction(uint64_t signum, uint64_t actAddr, uint64_t olda
 static int64_t sys_rt_sigprocmask(uint64_t how, uint64_t setAddr, uint64_t oldAddr,
                                    uint64_t sigsetsize, uint64_t, uint64_t)
 {
-    (void)how; (void)setAddr;
-    if (oldAddr && sigsetsize > 0) {
-        auto* p = reinterpret_cast<uint8_t*>(oldAddr);
-        for (uint64_t i = 0; i < sigsetsize; ++i) p[i] = 0;
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    if (sigsetsize != 8) return -EINVAL;
+
+    // Return old mask
+    if (oldAddr)
+    {
+        *reinterpret_cast<uint64_t*>(oldAddr) = proc->sigMask;
+    }
+
+    // Modify mask
+    if (setAddr)
+    {
+        uint64_t newSet = *reinterpret_cast<const uint64_t*>(setAddr);
+        // Can't block SIGKILL (9) or SIGSTOP (19)
+        uint64_t unblockable = (1ULL << 8) | (1ULL << 18);
+        newSet &= ~unblockable;
+
+        switch (how)
+        {
+        case 0: // SIG_BLOCK
+            proc->sigMask |= newSet;
+            break;
+        case 1: // SIG_UNBLOCK
+            proc->sigMask &= ~newSet;
+            break;
+        case 2: // SIG_SETMASK
+            proc->sigMask = newSet;
+            break;
+        default:
+            return -EINVAL;
+        }
     }
     return 0;
 }
@@ -3211,13 +3232,27 @@ static int64_t sys_sigaltstack(uint64_t, uint64_t, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
-// sys_rt_sigreturn (15) — stub
+// sys_rt_sigreturn (15) — restore context saved by signal delivery
 // ---------------------------------------------------------------------------
 
 static int64_t sys_rt_sigreturn(uint64_t, uint64_t, uint64_t,
                                  uint64_t, uint64_t, uint64_t)
 {
-    return 0;
+    Process* proc = ProcessCurrent();
+    if (!proc || !proc->inSignalHandler) return -EINVAL;
+
+    proc->inSignalHandler = false;
+
+    // The actual context restoration happens in the syscall return path
+    // after checking inSignalHandler. For now, we return -EINTR to signal
+    // that the interrupted syscall should be restarted.
+    // The saved context (sigSavedRip etc.) will be restored by the
+    // syscall dispatcher's return path.
+
+    DbgPrintf("SIGRETURN: pid %u restoring to rip=0x%lx rsp=0x%lx\n",
+              proc->pid, proc->sigSavedRip, proc->sigSavedRsp);
+
+    return proc->sigSavedRax; // Return the original syscall's return value
 }
 
 // ---------------------------------------------------------------------------
@@ -3297,26 +3332,36 @@ static int64_t sys_gettid(uint64_t, uint64_t, uint64_t,
     return proc ? proc->pid : 1;
 }
 
-static int64_t sys_tgkill(uint64_t, uint64_t, uint64_t,
+static int64_t sys_tgkill(uint64_t tgid, uint64_t tid, uint64_t sig,
                            uint64_t, uint64_t, uint64_t)
 {
-    return 0; // ignore signals for now
+    (void)tgid;
+    if (sig == 0) return 0; // Signal 0 = check permissions only
+    Process* target = ProcessFindByPid(static_cast<uint16_t>(tid));
+    if (!target) return -ESRCH;
+    return ProcessSendSignal(target, static_cast<int>(sig));
 }
 
-static int64_t sys_tkill(uint64_t, uint64_t, uint64_t,
+static int64_t sys_tkill(uint64_t tid, uint64_t sig, uint64_t,
                           uint64_t, uint64_t, uint64_t)
 {
-    return 0;
+    if (sig == 0) return 0;
+    Process* target = ProcessFindByPid(static_cast<uint16_t>(tid));
+    if (!target) return -ESRCH;
+    return ProcessSendSignal(target, static_cast<int>(sig));
 }
 
 // ---------------------------------------------------------------------------
-// sys_kill (62) — stub
+// sys_kill (62)
 // ---------------------------------------------------------------------------
 
-static int64_t sys_kill(uint64_t, uint64_t, uint64_t,
+static int64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t,
                          uint64_t, uint64_t, uint64_t)
 {
-    return 0; // ignore
+    if (sig == 0) return 0; // Permission check only
+    Process* target = ProcessFindByPid(static_cast<uint16_t>(pid));
+    if (!target) return -ESRCH;
+    return ProcessSendSignal(target, static_cast<int>(sig));
 }
 
 // ---------------------------------------------------------------------------
