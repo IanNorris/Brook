@@ -27,6 +27,12 @@ if [ ! -f "${DISK_IMG}" ]; then
     fi
 fi
 
+# Auto-fetch userspace binaries if missing
+if [ ! -f "${ROOT_DIR}/busybox_static" ] || [ ! -f "${ROOT_DIR}/bash_dynamic" ]; then
+    echo "Userspace binaries missing, running fetch_userspace.sh..."
+    "${SCRIPT_DIR}/fetch_userspace.sh" || echo "  (fetch_userspace.sh failed, continuing with what's available)"
+fi
+
 # mcopy -o = overwrite existing files without prompting
 # mcopy -n = no overwrite (skip existing) — we use -o for sync semantics
 
