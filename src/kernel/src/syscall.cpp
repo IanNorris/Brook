@@ -206,6 +206,17 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
             (fde->type == FdType::Vnode && !fde->handle))
         {
             const char* buf = reinterpret_cast<const char*>(bufAddr);
+            static uint32_t s_ttyLog = 0;
+            if (s_ttyLog < 40 && count > 0 && count < 200)
+            {
+                s_ttyLog++;
+                char preview[17];
+                uint32_t pLen = count < 16 ? (uint32_t)count : 16;
+                for (uint32_t i = 0; i < pLen; i++)
+                    preview[i] = (buf[i] >= ' ' && buf[i] <= '~') ? buf[i] : '.';
+                preview[pLen] = '\0';
+                SerialPrintf("TTY_W: fd=%lu n=%lu [%s]\n", fd, count, preview);
+            }
             if (count > 0)
             {
                 SerialWriterEnqueue(buf, static_cast<uint32_t>(count));
@@ -249,6 +260,17 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if (fde->type == FdType::DevKeyboard)
     {
         const char* buf = reinterpret_cast<const char*>(bufAddr);
+        static uint32_t s_kbLog = 0;
+        if (s_kbLog < 40 && count > 0 && count < 200)
+        {
+            s_kbLog++;
+            char preview[17];
+            uint32_t pLen = count < 16 ? (uint32_t)count : 16;
+            for (uint32_t i = 0; i < pLen; i++)
+                preview[i] = (buf[i] >= ' ' && buf[i] <= '~') ? buf[i] : '.';
+            preview[pLen] = '\0';
+            SerialPrintf("KB_W: fd=%lu n=%lu [%s]\n", fd, count, preview);
+        }
         if (count > 0)
         {
             SerialWriterEnqueue(buf, static_cast<uint32_t>(count));
