@@ -194,11 +194,16 @@ fi
 tcc_test_dir="${ROOT_DIR}/data/tcc_test"
 if [ -d "$tcc_test_dir" ]; then
     mmd -D s -i "${DISK_IMG}" "::SRC" 2>/dev/null || true
-    for f in "$tcc_test_dir"/*.c "$tcc_test_dir"/*.sh; do
+    for f in "$tcc_test_dir"/*.c "$tcc_test_dir"/*.sh "$tcc_test_dir"/cc; do
         [ -f "$f" ] || continue
         mcopy -o -i "${DISK_IMG}" "$f" "::SRC/$(basename "$f")"
         echo "  synced: SRC/$(basename "$f")"
     done
+    # Also put cc wrapper in BIN/ for easy access
+    if [ -f "$tcc_test_dir/cc" ]; then
+        mcopy -o -i "${DISK_IMG}" "$tcc_test_dir/cc" "::BIN/cc"
+        echo "  synced: BIN/cc"
+    fi
 fi
 
 # --- Boot script (INIT.RC) ---

@@ -245,6 +245,19 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if (fde->type == FdType::DevNull)
         return static_cast<int64_t>(count);
 
+    // Write to /dev/tty (DevKeyboard) — route to serial + TTY framebuffer
+    if (fde->type == FdType::DevKeyboard)
+    {
+        const char* buf = reinterpret_cast<const char*>(bufAddr);
+        if (count > 0)
+        {
+            SerialWriterEnqueue(buf, static_cast<uint32_t>(count));
+            for (uint64_t i = 0; i < count; i++)
+                TtyPutChar(buf[i]);
+        }
+        return static_cast<int64_t>(count);
+    }
+
     // Write to pipe — block until at least some bytes are written
     if (fde->type == FdType::Pipe && fde->handle)
     {

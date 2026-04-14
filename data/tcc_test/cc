@@ -1,0 +1,26 @@
+#!/boot/BIN/BASH
+# cc - simple C compiler wrapper for TCC on Brook
+# Usage: cc [-o output] source.c [source2.c ...]
+# If no -o given, outputs to 'a.out'
+
+TCC=/boot/BIN/tcc
+TCC_LIB=/boot/TCC/lib
+TCC_INC=/boot/TCC/include
+CRT="$TCC_LIB/crt1.o $TCC_LIB/crti.o $TCC_LIB/crtn.o $TCC_LIB/libc.a"
+
+OUTPUT="a.out"
+SOURCES=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) OUTPUT="$2"; shift 2 ;;
+        *)  SOURCES="$SOURCES $1"; shift ;;
+    esac
+done
+
+if [ -z "$SOURCES" ]; then
+    echo "Usage: cc [-o output] source.c [...]"
+    exit 1
+fi
+
+exec $TCC -B $TCC_LIB/tcc -I $TCC_INC -L $TCC_LIB -static -nostdlib -o "$OUTPUT" $SOURCES $CRT
