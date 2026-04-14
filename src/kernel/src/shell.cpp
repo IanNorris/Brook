@@ -463,46 +463,51 @@ static int ExecCommand(int argc, const char* const* argv)
             // Try to load wallpaper from disk
             using namespace brook;
             VnodeStat st;
-            if (VfsStatPath("/WALLPAPER.RAW", &st) == 0 && st.size > 0)
+            if (VfsStatPath("/boot/WALLPAPER.RAW", &st) == 0 && st.size > 8)
             {
-                constexpr uint32_t WP_W = 1920;
-                constexpr uint32_t WP_H = 1080;
-                uint64_t expected = (uint64_t)WP_W * WP_H * 4;
-                if (st.size == expected)
+                auto* pixels = static_cast<uint32_t*>(kmalloc(st.size));
+                if (pixels)
                 {
-                    auto* pixels = static_cast<uint32_t*>(kmalloc(st.size));
-                    if (pixels)
+                    Vnode* vn = VfsOpen("/boot/WALLPAPER.RAW", 0);
+                    if (vn)
                     {
-                        Vnode* vn = VfsOpen("/WALLPAPER.RAW", 0);
-                        if (vn)
+                        uint64_t off = 0;
+                        uint64_t remaining = st.size;
+                        auto* dest = reinterpret_cast<uint8_t*>(pixels);
+                        while (remaining > 0)
                         {
-                            uint64_t off = 0;
-                            uint64_t remaining = st.size;
-                            auto* dest = reinterpret_cast<uint8_t*>(pixels);
-                            while (remaining > 0)
+                            uint64_t chunk = remaining > 65536 ? 65536 : remaining;
+                            int rd = VfsRead(vn, dest + off, chunk, &off);
+                            if (rd <= 0) break;
+                            remaining -= rd;
+                        }
+                        VfsClose(vn);
+                        if (remaining == 0)
+                        {
+                            // First 8 bytes: uint32_t width, uint32_t height
+                            uint32_t wpW = pixels[0];
+                            uint32_t wpH = pixels[1];
+                            uint64_t expected = 8 + (uint64_t)wpW * wpH * 4;
+                            if (st.size == expected && wpW > 0 && wpH > 0
+                                && wpW <= 3840 && wpH <= 2160)
                             {
-                                uint64_t chunk = remaining > 65536 ? 65536 : remaining;
-                                int rd = VfsRead(vn, dest + off, chunk, &off);
-                                if (rd <= 0) break;
-                                remaining -= rd;
-                            }
-                            VfsClose(vn);
-                            if (remaining == 0)
-                            {
-                                CompositorSetWallpaper(pixels, WP_W, WP_H);
-                                KPrintf("wallpaper: loaded (%ux%u)\n", WP_W, WP_H);
+                                // Pixel data starts at offset 2 (after header)
+                                CompositorSetWallpaper(pixels + 2, wpW, wpH);
+                                KPrintf("wallpaper: loaded (%ux%u)\n", wpW, wpH);
                             }
                             else
                             {
                                 kfree(pixels);
-                                KPrintf("wallpaper: read error\n");
+                                KPrintf("wallpaper: bad header (%ux%u, size %llu)\n",
+                                        wpW, wpH, st.size);
                             }
                         }
+                        else
+                        {
+                            kfree(pixels);
+                            KPrintf("wallpaper: read error\n");
+                        }
                     }
-                }
-                else
-                {
-                    KPrintf("wallpaper: unexpected size %llu (expected %llu)\n", st.size, expected);
                 }
             }
 

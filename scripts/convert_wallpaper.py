@@ -43,11 +43,14 @@ def main():
 
     print(f"Output: {target_w}x{target_h} ({target_w * target_h * 4} bytes)")
 
-    # Write raw XRGB pixels
+    # Write raw XRGB pixels with 8-byte header (uint32_t width, uint32_t height)
+    pixels = img.tobytes()  # RGB bytes
     with open(output_path, "wb") as f:
+        f.write(struct.pack("<II", target_w, target_h))
         for y in range(target_h):
             for x in range(target_w):
-                r, g, b = img.getpixel((x, y))
+                idx = (y * target_w + x) * 3
+                r, g, b = pixels[idx], pixels[idx + 1], pixels[idx + 2]
                 f.write(struct.pack("<I", (r << 16) | (g << 8) | b))
 
     print(f"Written to {output_path}")
