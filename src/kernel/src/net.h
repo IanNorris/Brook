@@ -1,7 +1,6 @@
 // net.h — Brook OS network stack.
 //
-// Minimal network stack: Ethernet, ARP, IPv4, ICMP, UDP.
-// No TCP yet — that's a future phase.
+// Minimal network stack: Ethernet, ARP, IPv4, ICMP, UDP, TCP.
 
 #pragma once
 
@@ -92,6 +91,39 @@ struct __attribute__((packed)) UdpHeader {
     uint16_t dstPort;     // big-endian
     uint16_t length;      // big-endian (header + payload)
     uint16_t checksum;    // big-endian (0 = no checksum)
+};
+
+// ---------------------------------------------------------------------------
+// TCP
+// ---------------------------------------------------------------------------
+
+struct __attribute__((packed)) TcpHeader {
+    uint16_t srcPort;     // big-endian
+    uint16_t dstPort;     // big-endian
+    uint32_t seqNum;      // big-endian
+    uint32_t ackNum;      // big-endian
+    uint8_t  dataOff;     // upper 4 bits = header length in 32-bit words
+    uint8_t  flags;
+    uint16_t window;      // big-endian
+    uint16_t checksum;    // big-endian
+    uint16_t urgentPtr;   // big-endian
+};
+
+static constexpr uint8_t TCP_FIN = 0x01;
+static constexpr uint8_t TCP_SYN = 0x02;
+static constexpr uint8_t TCP_RST = 0x04;
+static constexpr uint8_t TCP_PSH = 0x08;
+static constexpr uint8_t TCP_ACK = 0x10;
+
+enum class TcpState : uint8_t {
+    Closed,
+    SynSent,
+    Established,
+    FinWait1,
+    FinWait2,
+    CloseWait,
+    LastAck,
+    TimeWait,
 };
 
 // ---------------------------------------------------------------------------
@@ -203,7 +235,7 @@ struct Socket {
     bool      bound;
     bool      connected;
 
-    // Receive buffer (ring buffer for incoming datagrams)
+    // Receive buffer (ring buffer for incoming data)
     static constexpr uint32_t RX_BUF_SIZE = 65536;
     uint8_t*  rxBuf;
     uint32_t  rxHead;
@@ -213,21 +245,36 @@ struct Socket {
     // For recvfrom: store source address of last received packet
     uint32_t  lastSrcIp;
     uint16_t  lastSrcPort;
+
+    // TCP state
+    TcpState  tcpState;
+    uint32_t  tcpSndNxt;   // next sequence number to send
+    uint32_t  tcpSndUna;   // oldest unacknowledged
+    uint32_t  tcpRcvNxt;   // next expected receive sequence
+    uint32_t  tcpSndIss;   // initial send sequence number
+    volatile bool tcpFinRecv; // FIN received from peer
 };
 
 // Create a kernel socket. Returns socket index or negative error.
 int  SockCreate(int domain, int type, int protocol);
 int  SockBind(int sockIdx, const SockAddrIn* addr);
+int  SockConnect(int sockIdx, const SockAddrIn* addr);
 int  SockSendTo(int sockIdx, const void* buf, uint32_t len,
                 const SockAddrIn* dest);
 int  SockRecvFrom(int sockIdx, void* buf, uint32_t len,
                   SockAddrIn* src);
+int  SockSend(int sockIdx, const void* buf, uint32_t len);
+int  SockRecv(int sockIdx, void* buf, uint32_t len);
+bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite);
 void SockClose(int sockIdx);
 
 // Deliver a UDP datagram to the matching socket (called by stack).
 void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
                     uint32_t dstIp, uint16_t dstPort,
                     const void* data, uint32_t len);
+
+// Handle an incoming TCP segment (called by IP handler).
+void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len);
 
 // ---------------------------------------------------------------------------
 // DNS resolver

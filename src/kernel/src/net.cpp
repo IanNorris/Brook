@@ -42,6 +42,14 @@ static bool   g_sockUsed[MAX_SOCKETS];
 // IPv4 identification counter
 static uint16_t g_ipId = 1;
 
+static uint16_t g_tcpEphemeralPort = 49200;
+
+// Forward declarations for TCP
+static void TcpSendSegment(Socket& s, uint8_t flags,
+                           const void* data, uint32_t dataLen);
+static uint16_t TcpChecksum(uint32_t srcIp, uint32_t dstIp,
+                            const void* tcpSeg, uint32_t tcpLen);
+
 // ---------------------------------------------------------------------------
 // Checksum helpers
 // ---------------------------------------------------------------------------
@@ -380,7 +388,7 @@ static void HandleIpv4(const uint8_t* frame, uint32_t len)
         HandleUdpWithDhcp(ip, payload, payloadLen);
         break;
     case IP_PROTO_TCP:
-        // TODO: TCP
+        HandleTcp(ip, payload, payloadLen);
         break;
     }
 }
@@ -988,13 +996,16 @@ int SockRecvFrom(int sockIdx, void* buf, uint32_t len,
 
     Socket& s = g_sockets[sockIdx];
 
-    // Simple spin-wait for data (with timeout)
-    for (int i = 0; i < 5000000; i++) {
-        if (s.rxCount > 0) break;
-        __asm__ volatile("pause");
+    // Brief poll to check for pending packets
+    if (s.rxCount == 0 && g_netIf && g_netIf->poll) {
+        for (int i = 0; i < 100000; i++) {
+            g_netIf->poll(g_netIf);
+            if (s.rxCount > 0) break;
+            __asm__ volatile("pause");
+        }
     }
 
-    if (s.rxCount == 0) return -1; // timeout
+    if (s.rxCount == 0) return -11; // EAGAIN
 
     // Read datagram length prefix (4 bytes) then data
     uint32_t dgLen = 0;
@@ -1041,8 +1052,24 @@ void SockClose(int sockIdx)
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return;
     if (!g_sockUsed[sockIdx]) return;
 
-    if (g_sockets[sockIdx].rxBuf)
-        kfree(g_sockets[sockIdx].rxBuf);
+    Socket& s = g_sockets[sockIdx];
+
+    // TCP: send FIN if connected
+    if (s.type == SOCK_STREAM && s.tcpState == TcpState::Established) {
+        TcpSendSegment(s, TCP_FIN | TCP_ACK, nullptr, 0);
+        s.tcpSndNxt++;
+        s.tcpState = TcpState::FinWait1;
+        // Brief wait for FIN-ACK (non-blocking, best-effort)
+        for (int i = 0; i < 500000; i++) {
+            if (g_netIf && g_netIf->poll) g_netIf->poll(g_netIf);
+            if (s.tcpState == TcpState::Closed || s.tcpState == TcpState::TimeWait)
+                break;
+            __asm__ volatile("pause");
+        }
+    }
+
+    if (s.rxBuf)
+        kfree(s.rxBuf);
 
     NetMemset(&g_sockets[sockIdx], 0, sizeof(Socket));
     g_sockUsed[sockIdx] = false;
@@ -1096,6 +1123,415 @@ void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
         s.rxCount += needed;
         return; // only deliver to first matching socket
     }
+}
+
+// ---------------------------------------------------------------------------
+// TCP implementation
+// ---------------------------------------------------------------------------
+
+static uint16_t TcpChecksum(uint32_t srcIp, uint32_t dstIp,
+                            const void* tcpSeg, uint32_t tcpLen)
+{
+    // Pseudo-header + TCP segment
+    uint32_t sum = 0;
+
+    // Pseudo-header: srcIp, dstIp, zero, proto, tcpLen (all in network order)
+    sum += (srcIp >> 16) & 0xFFFF;
+    sum += srcIp & 0xFFFF;
+    sum += (dstIp >> 16) & 0xFFFF;
+    sum += dstIp & 0xFFFF;
+    sum += htons(IP_PROTO_TCP);
+    sum += htons(static_cast<uint16_t>(tcpLen));
+
+    // TCP segment
+    const uint16_t* p = static_cast<const uint16_t*>(tcpSeg);
+    uint32_t remaining = tcpLen;
+    while (remaining > 1) {
+        sum += *p++;
+        remaining -= 2;
+    }
+    if (remaining == 1)
+        sum += *reinterpret_cast<const uint8_t*>(p);
+
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    return static_cast<uint16_t>(~sum);
+}
+
+static void TcpSendSegment(Socket& s, uint8_t flags,
+                           const void* data, uint32_t dataLen)
+{
+    uint32_t tcpLen = sizeof(TcpHeader) + dataLen;
+    uint8_t buf[ETH_MTU];
+    NetMemset(buf, 0, tcpLen);
+
+    auto* tcp = reinterpret_cast<TcpHeader*>(buf);
+    tcp->srcPort  = s.localPort;
+    tcp->dstPort  = s.remotePort;
+    tcp->seqNum   = htonl(s.tcpSndNxt);
+    tcp->ackNum   = htonl(s.tcpRcvNxt);
+    tcp->dataOff  = (sizeof(TcpHeader) / 4) << 4; // 20 bytes = 5 words
+    tcp->flags    = flags;
+    tcp->window   = htons(Socket::RX_BUF_SIZE < 65535
+                          ? static_cast<uint16_t>(Socket::RX_BUF_SIZE)
+                          : 65535u);
+    tcp->urgentPtr = 0;
+
+    if (data && dataLen > 0)
+        NetMemcpy(buf + sizeof(TcpHeader), data, dataLen);
+
+    // Compute TCP checksum
+    tcp->checksum = 0;
+    tcp->checksum = TcpChecksum(g_netIf->ipAddr, s.remoteIp, buf, tcpLen);
+
+    NetSendIpv4(s.remoteIp, IP_PROTO_TCP, buf, tcpLen);
+}
+
+// Append raw bytes to socket RX ring buffer (no framing, stream mode)
+static void TcpEnqueueData(Socket& s, const void* data, uint32_t len)
+{
+    uint32_t avail = Socket::RX_BUF_SIZE - s.rxCount;
+    if (len > avail) len = avail; // drop excess
+
+    const uint8_t* d = static_cast<const uint8_t*>(data);
+    for (uint32_t i = 0; i < len; i++) {
+        s.rxBuf[s.rxHead] = d[i];
+        s.rxHead = (s.rxHead + 1) % Socket::RX_BUF_SIZE;
+    }
+    __asm__ volatile("mfence" ::: "memory");
+    s.rxCount += len;
+}
+
+void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
+{
+    if (len < sizeof(TcpHeader)) return;
+
+    auto* tcp = static_cast<const TcpHeader*>(payload);
+    uint32_t dataOff = ((tcp->dataOff >> 4) & 0xF) * 4;
+    if (dataOff < 20 || dataOff > len) return;
+
+    uint16_t srcPort = tcp->srcPort;
+    uint16_t dstPort = tcp->dstPort;
+    uint32_t seq     = ntohl(tcp->seqNum);
+    uint32_t ack     = ntohl(tcp->ackNum);
+    uint8_t  flags   = tcp->flags;
+    const uint8_t* tcpData = static_cast<const uint8_t*>(payload) + dataOff;
+    uint32_t dataLen = len - dataOff;
+
+    // Find matching socket
+    for (uint32_t i = 0; i < MAX_SOCKETS; i++) {
+        if (!g_sockUsed[i]) continue;
+        Socket& s = g_sockets[i];
+        if (s.type != SOCK_STREAM) continue;
+        if (s.localPort != dstPort) continue;
+        if (s.remotePort != srcPort) continue;
+        if (s.remoteIp != ip->srcIp) continue;
+
+        switch (s.tcpState) {
+        case TcpState::SynSent:
+            // Expecting SYN-ACK
+            if ((flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK)) {
+                s.tcpRcvNxt = seq + 1;
+                s.tcpSndUna = ack;
+                s.tcpState  = TcpState::Established;
+                s.connected = true;
+                // Send ACK to complete 3-way handshake
+                TcpSendSegment(s, TCP_ACK, nullptr, 0);
+            } else if (flags & TCP_RST) {
+                s.tcpState = TcpState::Closed;
+                s.connected = false;
+            }
+            break;
+
+        case TcpState::Established:
+            // RST: abort
+            if (flags & TCP_RST) {
+                s.tcpState = TcpState::Closed;
+                s.connected = false;
+                s.tcpFinRecv = true;
+                return;
+            }
+
+            // Update send window
+            if (flags & TCP_ACK) {
+                s.tcpSndUna = ack;
+            }
+
+            // Receive data
+            if (dataLen > 0 && seq == s.tcpRcvNxt) {
+                TcpEnqueueData(s, tcpData, dataLen);
+                s.tcpRcvNxt += dataLen;
+                // Send ACK
+                TcpSendSegment(s, TCP_ACK, nullptr, 0);
+            } else if (dataLen > 0) {
+                // Out of order — ACK with expected seq to trigger retransmit
+                TcpSendSegment(s, TCP_ACK, nullptr, 0);
+            }
+
+            // FIN
+            if (flags & TCP_FIN) {
+                s.tcpRcvNxt++;
+                s.tcpFinRecv = true;
+                TcpSendSegment(s, TCP_ACK, nullptr, 0);
+                s.tcpState = TcpState::CloseWait;
+            }
+            break;
+
+        case TcpState::FinWait1:
+            if (flags & TCP_ACK) {
+                s.tcpSndUna = ack;
+                if (flags & TCP_FIN) {
+                    s.tcpRcvNxt = seq + 1;
+                    TcpSendSegment(s, TCP_ACK, nullptr, 0);
+                    s.tcpState = TcpState::TimeWait;
+                } else {
+                    s.tcpState = TcpState::FinWait2;
+                }
+            }
+            // Handle data in FIN_WAIT1
+            if (dataLen > 0 && seq == s.tcpRcvNxt) {
+                TcpEnqueueData(s, tcpData, dataLen);
+                s.tcpRcvNxt += dataLen;
+            }
+            break;
+
+        case TcpState::FinWait2:
+            if (dataLen > 0 && seq == s.tcpRcvNxt) {
+                TcpEnqueueData(s, tcpData, dataLen);
+                s.tcpRcvNxt += dataLen;
+                TcpSendSegment(s, TCP_ACK, nullptr, 0);
+            }
+            if (flags & TCP_FIN) {
+                s.tcpRcvNxt = seq + (dataLen > 0 ? dataLen : 0) + 1;
+                TcpSendSegment(s, TCP_ACK, nullptr, 0);
+                s.tcpState = TcpState::TimeWait;
+            }
+            break;
+
+        case TcpState::LastAck:
+            if (flags & TCP_ACK) {
+                s.tcpState = TcpState::Closed;
+            }
+            break;
+
+        case TcpState::CloseWait:
+            // Waiting for application to close — just ACK data
+            if (flags & TCP_ACK) s.tcpSndUna = ack;
+            break;
+
+        default:
+            break;
+        }
+        return; // handled
+    }
+
+    // No matching socket — send RST
+    if (!(flags & TCP_RST) && g_netIf) {
+        uint8_t rstBuf[sizeof(TcpHeader)];
+        NetMemset(rstBuf, 0, sizeof(TcpHeader));
+        auto* rst = reinterpret_cast<TcpHeader*>(rstBuf);
+        rst->srcPort = dstPort;
+        rst->dstPort = srcPort;
+        if (flags & TCP_ACK) {
+            rst->seqNum = tcp->ackNum;
+        } else {
+            rst->seqNum = 0;
+            rst->ackNum = htonl(seq + dataLen + ((flags & TCP_SYN) ? 1 : 0) +
+                                ((flags & TCP_FIN) ? 1 : 0));
+            rst->flags = TCP_ACK;
+        }
+        rst->flags |= TCP_RST;
+        rst->dataOff = (sizeof(TcpHeader) / 4) << 4;
+        rst->window = 0;
+        rst->checksum = 0;
+        rst->checksum = TcpChecksum(g_netIf->ipAddr, ip->srcIp,
+                                     rstBuf, sizeof(TcpHeader));
+        NetSendIpv4(ip->srcIp, IP_PROTO_TCP, rstBuf, sizeof(TcpHeader));
+    }
+}
+
+int SockConnect(int sockIdx, const SockAddrIn* addr)
+{
+    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return -1;
+    if (!g_sockUsed[sockIdx]) return -1;
+
+    Socket& s = g_sockets[sockIdx];
+
+    // UDP connect: just set default destination
+    if (s.type == SOCK_DGRAM) {
+        s.remoteIp   = addr->sin_addr;
+        s.remotePort = addr->sin_port;
+        s.connected  = true;
+        // Auto-bind if not yet bound
+        if (!s.bound) {
+            s.localPort = htons(g_tcpEphemeralPort++);
+            s.localIp = g_netIf ? g_netIf->ipAddr : 0;
+            s.bound = true;
+        }
+        return 0;
+    }
+
+    if (s.type != SOCK_STREAM) return -95; // -EOPNOTSUPP
+
+    s.remoteIp   = addr->sin_addr;
+    s.remotePort = addr->sin_port; // already big-endian
+
+    // Auto-bind local port
+    if (!s.bound) {
+        s.localPort = htons(g_tcpEphemeralPort++);
+        s.localIp = g_netIf ? g_netIf->ipAddr : 0;
+        s.bound = true;
+    }
+
+    // Initialize TCP state
+    // Use a simple ISS from the IP ID counter + port for uniqueness
+    s.tcpSndIss = static_cast<uint32_t>(g_ipId) * 12345 +
+                  ntohs(s.localPort) * 67890;
+    s.tcpSndNxt = s.tcpSndIss;
+    s.tcpSndUna = s.tcpSndIss;
+    s.tcpRcvNxt = 0;
+    s.tcpFinRecv = false;
+    s.tcpState = TcpState::SynSent;
+
+    // Send SYN
+    TcpSendSegment(s, TCP_SYN, nullptr, 0);
+    s.tcpSndNxt++; // SYN consumes one sequence number
+
+    SerialPrintf("tcp: SYN sent to %u.%u.%u.%u:%u\n",
+                 (ntohl(s.remoteIp) >> 24) & 0xFF,
+                 (ntohl(s.remoteIp) >> 16) & 0xFF,
+                 (ntohl(s.remoteIp) >> 8) & 0xFF,
+                 ntohl(s.remoteIp) & 0xFF,
+                 ntohs(s.remotePort));
+
+    // Wait for SYN-ACK (polling-based, timeout ~5 seconds)
+    for (int i = 0; i < 5000000; i++) {
+        if (g_netIf && g_netIf->poll) g_netIf->poll(g_netIf);
+        if (s.tcpState == TcpState::Established) {
+            SerialPrintf("tcp: connected!\n");
+            return 0;
+        }
+        if (s.tcpState == TcpState::Closed) {
+            SerialPrintf("tcp: connection refused (RST)\n");
+            return -111; // ECONNREFUSED
+        }
+        __asm__ volatile("pause");
+    }
+
+    // Timeout — retry once
+    s.tcpSndNxt = s.tcpSndIss;
+    TcpSendSegment(s, TCP_SYN, nullptr, 0);
+    s.tcpSndNxt++;
+    for (int i = 0; i < 5000000; i++) {
+        if (g_netIf && g_netIf->poll) g_netIf->poll(g_netIf);
+        if (s.tcpState == TcpState::Established) {
+            SerialPrintf("tcp: connected (retry)!\n");
+            return 0;
+        }
+        if (s.tcpState == TcpState::Closed) return -111;
+        __asm__ volatile("pause");
+    }
+
+    SerialPrintf("tcp: connect timeout\n");
+    s.tcpState = TcpState::Closed;
+    return -110; // ETIMEDOUT
+}
+
+int SockSend(int sockIdx, const void* buf, uint32_t len)
+{
+    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return -1;
+    if (!g_sockUsed[sockIdx]) return -1;
+
+    Socket& s = g_sockets[sockIdx];
+    if (s.type != SOCK_STREAM) return -95;
+    if (s.tcpState != TcpState::Established) return -104; // ECONNRESET
+
+    const uint8_t* data = static_cast<const uint8_t*>(buf);
+    uint32_t sent = 0;
+
+    // Send in MSS-sized chunks (max ~1460 for Ethernet)
+    static constexpr uint32_t MSS = 1460;
+
+    while (sent < len) {
+        uint32_t chunk = len - sent;
+        if (chunk > MSS) chunk = MSS;
+
+        TcpSendSegment(s, TCP_ACK | TCP_PSH, data + sent, chunk);
+        s.tcpSndNxt += chunk;
+        sent += chunk;
+
+        // Brief poll to process ACKs and avoid overwhelming the link
+        for (int i = 0; i < 50000; i++) {
+            if (g_netIf && g_netIf->poll) g_netIf->poll(g_netIf);
+            if (s.tcpSndUna >= s.tcpSndNxt) break; // all ACK'd
+            __asm__ volatile("pause");
+        }
+
+        if (s.tcpState != TcpState::Established) return -104;
+    }
+
+    return static_cast<int>(sent);
+}
+
+int SockRecv(int sockIdx, void* buf, uint32_t len)
+{
+    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return -1;
+    if (!g_sockUsed[sockIdx]) return -1;
+
+    Socket& s = g_sockets[sockIdx];
+    if (s.type != SOCK_STREAM) return -95;
+
+    // Wait for data (with timeout, ~10 seconds)
+    for (int i = 0; i < 10000000; i++) {
+        if (s.rxCount > 0) break;
+        if (s.tcpFinRecv) return 0; // EOF
+        if (s.tcpState == TcpState::Closed) return 0;
+        if (g_netIf && g_netIf->poll) g_netIf->poll(g_netIf);
+        __asm__ volatile("pause");
+    }
+
+    if (s.rxCount == 0) {
+        if (s.tcpFinRecv || s.tcpState != TcpState::Established)
+            return 0; // EOF
+        return -11; // EAGAIN
+    }
+
+    // Stream read — no framing, just read bytes from ring buffer
+    uint32_t copyLen = s.rxCount < len ? s.rxCount : len;
+    uint8_t* dst = static_cast<uint8_t*>(buf);
+    for (uint32_t i = 0; i < copyLen; i++) {
+        dst[i] = s.rxBuf[s.rxTail];
+        s.rxTail = (s.rxTail + 1) % Socket::RX_BUF_SIZE;
+    }
+    __asm__ volatile("mfence" ::: "memory");
+    s.rxCount -= copyLen;
+
+    return static_cast<int>(copyLen);
+}
+
+bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite)
+{
+    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return false;
+    if (!g_sockUsed[sockIdx]) return false;
+
+    Socket& s = g_sockets[sockIdx];
+
+    // Poll network to process any pending packets
+    if (g_netIf && g_netIf->poll) g_netIf->poll(g_netIf);
+
+    if (checkRead) {
+        if (s.rxCount > 0) return true;
+        if (s.tcpFinRecv) return true; // EOF is readable
+        if (s.type == SOCK_STREAM &&
+            s.tcpState != TcpState::Established &&
+            s.tcpState != TcpState::SynSent) return true; // closed/error
+    }
+    if (checkWrite) {
+        if (s.type == SOCK_DGRAM) return true; // UDP always writable
+        if (s.type == SOCK_STREAM && s.tcpState == TcpState::Established)
+            return true;
+    }
+    return false;
 }
 
 } // namespace brook

@@ -322,6 +322,15 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
         return static_cast<int64_t>(written);
     }
 
+    // Write to socket (TCP stream)
+    if (fde->type == FdType::Socket && fde->handle)
+    {
+        int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+        return brook::SockSend(sockIdx,
+                               reinterpret_cast<const void*>(bufAddr),
+                               static_cast<uint32_t>(count));
+    }
+
     return -EBADF;
 }
 
@@ -595,6 +604,15 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         }
     }
 
+    // Read from socket (TCP stream or UDP)
+    if (fde->type == FdType::Socket && fde->handle)
+    {
+        int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+        return brook::SockRecv(sockIdx,
+                               reinterpret_cast<void*>(bufAddr),
+                               static_cast<uint32_t>(count));
+    }
+
     return -EBADF;
 }
 
@@ -704,7 +722,8 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
             { "/etc/group",  "root:x:0:\n" },
             { "/etc/shells", "/boot/BIN/BASH\n" },
             { "/etc/hostname", "brook\n" },
-            { "/etc/nsswitch.conf", "passwd: files\ngroup: files\n" },
+            { "/etc/nsswitch.conf", "passwd: files\ngroup: files\nhosts: files dns\n" },
+            { "/etc/hosts", "127.0.0.1 localhost\n" },
             { nullptr, nullptr }
         };
 
@@ -718,6 +737,40 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
                 proc->fds[fd].seekPos = 0;
                 return fd;
             }
+        }
+
+        // Dynamic /etc/resolv.conf — generated from DHCP DNS server
+        if (StrEq(lookupPath, "/etc/resolv.conf"))
+        {
+            static char resolvBuf[128];
+            auto* nif = brook::NetGetIf();
+            if (nif && nif->dns) {
+                uint32_t ip = brook::ntohl(nif->dns);
+                // Format: "nameserver X.X.X.X\n"
+                int pos = 0;
+                const char* prefix = "nameserver ";
+                for (int i = 0; prefix[i]; i++) resolvBuf[pos++] = prefix[i];
+                // Format IP
+                for (int octet = 3; octet >= 0; octet--) {
+                    uint8_t b = static_cast<uint8_t>((ip >> (octet * 8)) & 0xFF);
+                    if (b >= 100) resolvBuf[pos++] = '0' + b / 100;
+                    if (b >= 10) resolvBuf[pos++] = '0' + (b / 10) % 10;
+                    resolvBuf[pos++] = '0' + b % 10;
+                    if (octet > 0) resolvBuf[pos++] = '.';
+                }
+                resolvBuf[pos++] = '\n';
+                resolvBuf[pos] = '\0';
+            } else {
+                // Fallback: QEMU default DNS
+                const char* fb = "nameserver 10.0.2.3\n";
+                int i = 0;
+                while (fb[i]) { resolvBuf[i] = fb[i]; i++; }
+                resolvBuf[i] = '\0';
+            }
+            int fd = FdAlloc(proc, FdType::SyntheticMem, resolvBuf);
+            if (fd < 0) return -EMFILE;
+            proc->fds[fd].seekPos = 0;
+            return fd;
         }
     }
 
@@ -3311,6 +3364,24 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
             continue;
         }
 
+        // Socket: check TCP/UDP readiness
+        if (fde->type == FdType::Socket && fde->handle)
+        {
+            int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+            if ((fds[i].events & POLLIN) &&
+                brook::SockPollReady(sockIdx, true, false))
+            {
+                fds[i].revents |= POLLIN;
+            }
+            if ((fds[i].events & POLLOUT) &&
+                brook::SockPollReady(sockIdx, false, true))
+            {
+                fds[i].revents |= POLLOUT;
+            }
+            if (fds[i].revents) ready++;
+            continue;
+        }
+
         // Default: assume ready for whatever was asked
         fds[i].revents = fds[i].events;
         ready++;
@@ -4173,6 +4244,8 @@ static int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
     Process* proc = ProcessCurrent();
     if (!proc) return -ENOSYS;
 
+    SerialPrintf("sys_socket: domain=%lu type=%lu proto=%lu\n", domain, type, protocol);
+
     int sockIdx = SockCreate(static_cast<int>(domain),
                               static_cast<int>(type & 0xFF), // mask SOCK_NONBLOCK etc
                               static_cast<int>(protocol));
@@ -4184,6 +4257,7 @@ static int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
         SockClose(sockIdx);
         return -EMFILE;
     }
+    SerialPrintf("sys_socket: fd=%d sockIdx=%d\n", fd, sockIdx);
     return fd;
 }
 
@@ -4222,9 +4296,21 @@ static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
     if (sockIdx < 0) return -EBADF;
 
     (void)addrLen;
+
+    auto* uaddr = reinterpret_cast<const brook::SockAddrIn*>(addrVal);
+    if (!uaddr) return -EFAULT;
+
+    SerialPrintf("sys_connect: fd=%d sockIdx=%d addr=%u.%u.%u.%u:%u\n",
+                 fd, sockIdx,
+                 (brook::ntohl(uaddr->sin_addr) >> 24) & 0xFF,
+                 (brook::ntohl(uaddr->sin_addr) >> 16) & 0xFF,
+                 (brook::ntohl(uaddr->sin_addr) >> 8) & 0xFF,
+                 brook::ntohl(uaddr->sin_addr) & 0xFF,
+                 brook::ntohs(uaddr->sin_port));
+
     // For UDP, "connect" just sets the default destination
-    // Actual connect for TCP would be more complex
-    return -ENOSYS; // TODO: implement
+    // For TCP, perform the 3-way handshake
+    return brook::SockConnect(sockIdx, uaddr);
 }
 
 static int64_t sys_sendto(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
@@ -4327,10 +4413,50 @@ static int64_t sys_sendmsg(uint64_t, uint64_t, uint64_t,
     return -ENOSYS;
 }
 
-static int64_t sys_recvmsg(uint64_t, uint64_t, uint64_t,
+static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
                             uint64_t, uint64_t, uint64_t)
 {
-    return -ENOSYS;
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ENOSYS;
+
+    int fd = static_cast<int>(fdVal);
+    int sockIdx = GetSockIdx(proc, fd);
+    if (sockIdx < 0) return -EBADF;
+
+    // msghdr structure (matching Linux x86-64 ABI)
+    struct MsgHdr {
+        void*    msg_name;
+        uint32_t msg_namelen;
+        uint32_t _pad0;
+        struct {
+            void*    iov_base;
+            uint64_t iov_len;
+        }*       msg_iov;
+        uint64_t msg_iovlen;
+        void*    msg_control;
+        uint64_t msg_controllen;
+        int      msg_flags;
+    };
+
+    auto* msg = reinterpret_cast<MsgHdr*>(msgVal);
+    if (!msg || msg->msg_iovlen == 0 || !msg->msg_iov) return -EINVAL;
+
+    // Use first iov entry as receive buffer
+    void* buf = msg->msg_iov[0].iov_base;
+    uint32_t len = static_cast<uint32_t>(msg->msg_iov[0].iov_len);
+    if (!buf || len == 0) return -EINVAL;
+
+    brook::SockAddrIn srcAddr;
+    int ret = brook::SockRecvFrom(sockIdx, buf, len, &srcAddr);
+
+    if (ret > 0 && msg->msg_name && msg->msg_namelen >= sizeof(brook::SockAddrIn)) {
+        auto* dst = reinterpret_cast<brook::SockAddrIn*>(msg->msg_name);
+        *dst = srcAddr;
+    }
+
+    msg->msg_flags = 0;
+    msg->msg_controllen = 0;
+    return ret;
 }
 
 static SyscallFn g_syscallTable[SYSCALL_MAX];
