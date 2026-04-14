@@ -34,9 +34,10 @@ struct Window
 {
     Process*    proc;           // owning process (nullptr = unused slot)
     int16_t     x, y;           // window position (outer top-left, including chrome)
-    uint16_t    clientW;        // client area width (= VFB width)
-    uint16_t    clientH;        // client area height (= VFB height)
+    uint16_t    clientW;        // client area width (= VFB width * upscale)
+    uint16_t    clientH;        // client area height (= VFB height * upscale)
     uint8_t     zOrder;         // higher = on top (0 = backmost)
+    uint8_t     upscale;        // integer upscale factor (1 = 1:1, 2 = 2×, 4 = 4×)
     WindowState state;
     bool        focused;
     bool        visible;
@@ -82,9 +83,11 @@ void WmInit();
 
 // Create a window for a process. Returns window index or -1 on failure.
 // The process must already have a VFB set up via CompositorSetupProcess.
+// upscale: integer scale factor (1=1:1, 2=2×, etc.). clientW/H are the
+// displayed size (VFB size × upscale).
 int WmCreateWindow(Process* proc, int16_t x, int16_t y,
                    uint16_t clientW, uint16_t clientH,
-                   const char* title);
+                   const char* title, uint8_t upscale = 1);
 
 // Remove a window (process exited or closed).
 void WmDestroyWindow(int idx);

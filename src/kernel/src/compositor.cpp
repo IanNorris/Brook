@@ -277,7 +277,9 @@ static void BlitProcess(Process* proc, bool forceAll)
 }
 
 // Blit a process VFB at an explicit destination (for WM-managed windows).
-static void BlitProcessAt(Process* proc, int dstX0, int dstY0, bool forceAll)
+// Supports integer upscaling via nearest-neighbor (for DOOM at 320×200 → 4×).
+static void BlitProcessAt(Process* proc, int dstX0, int dstY0, bool forceAll,
+                           uint8_t upscale = 1)
 {
     if (!proc->fbVirtual || proc->fbVfbWidth == 0) return;
     if (!forceAll && !proc->fbDirty) return;
@@ -288,31 +290,72 @@ static void BlitProcessAt(Process* proc, int dstX0, int dstY0, bool forceAll)
     const uint32_t  srcH = proc->fbVfbHeight;
     const uint32_t  srcStride = proc->fbVfbStride;
 
-    uint32_t startDy = 0, startDx = 0;
-    if (dstY0 < 0) startDy = static_cast<uint32_t>(-dstY0);
-    if (dstX0 < 0) startDx = static_cast<uint32_t>(-dstX0);
-
-    uint32_t endDy = srcH;
-    uint32_t endDx = srcW;
-    if (dstY0 + static_cast<int>(endDy) > static_cast<int>(g_physFbHeight))
-        endDy = g_physFbHeight - static_cast<uint32_t>(dstY0);
-    if (dstX0 + static_cast<int>(endDx) > static_cast<int>(g_physFbWidth))
-        endDx = g_physFbWidth - static_cast<uint32_t>(dstX0);
-
-    MarkDirtyRows(static_cast<uint32_t>(dstY0) + startDy,
-                  static_cast<uint32_t>(dstY0) + endDy);
-
     uint32_t*       dstBase   = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
     const uint32_t  dstStride = g_backBuffer ? g_backBufStride : g_physFbStride;
 
-    uint32_t copyWidth = (endDx - startDx) * 4;
-    for (uint32_t dy = startDy; dy < endDy; ++dy)
+    if (upscale <= 1)
     {
-        const uint32_t* srcRow = src + dy * srcStride + startDx;
-        uint32_t* dstRow = dstBase +
-            static_cast<uint32_t>(dstY0 + dy) * dstStride +
-            static_cast<uint32_t>(dstX0 + startDx);
-        __builtin_memcpy(dstRow, srcRow, copyWidth);
+        // 1:1 blit (fast path)
+        uint32_t startDy = 0, startDx = 0;
+        if (dstY0 < 0) startDy = static_cast<uint32_t>(-dstY0);
+        if (dstX0 < 0) startDx = static_cast<uint32_t>(-dstX0);
+
+        uint32_t endDy = srcH;
+        uint32_t endDx = srcW;
+        if (dstY0 + static_cast<int>(endDy) > static_cast<int>(g_physFbHeight))
+            endDy = g_physFbHeight - static_cast<uint32_t>(dstY0);
+        if (dstX0 + static_cast<int>(endDx) > static_cast<int>(g_physFbWidth))
+            endDx = g_physFbWidth - static_cast<uint32_t>(dstX0);
+
+        MarkDirtyRows(static_cast<uint32_t>(dstY0) + startDy,
+                      static_cast<uint32_t>(dstY0) + endDy);
+
+        uint32_t copyWidth = (endDx - startDx) * 4;
+        for (uint32_t dy = startDy; dy < endDy; ++dy)
+        {
+            const uint32_t* srcRow = src + dy * srcStride + startDx;
+            uint32_t* dstRow = dstBase +
+                static_cast<uint32_t>(dstY0 + dy) * dstStride +
+                static_cast<uint32_t>(dstX0 + startDx);
+            __builtin_memcpy(dstRow, srcRow, copyWidth);
+        }
+    }
+    else
+    {
+        // Nearest-neighbor upscale
+        uint32_t dispW = srcW * upscale;
+        uint32_t dispH = srcH * upscale;
+
+        uint32_t startDy = 0, startDx = 0;
+        if (dstY0 < 0) startDy = static_cast<uint32_t>(-dstY0);
+        if (dstX0 < 0) startDx = static_cast<uint32_t>(-dstX0);
+
+        uint32_t endDy = dispH;
+        uint32_t endDx = dispW;
+        if (dstY0 + static_cast<int>(endDy) > static_cast<int>(g_physFbHeight))
+            endDy = g_physFbHeight - static_cast<uint32_t>(dstY0);
+        if (dstX0 + static_cast<int>(endDx) > static_cast<int>(g_physFbWidth))
+            endDx = g_physFbWidth - static_cast<uint32_t>(dstX0);
+
+        MarkDirtyRows(static_cast<uint32_t>(dstY0) + startDy,
+                      static_cast<uint32_t>(dstY0) + endDy);
+
+        for (uint32_t dy = startDy; dy < endDy; ++dy)
+        {
+            uint32_t srcY = dy / upscale;
+            if (srcY >= srcH) break;
+            const uint32_t* srcRow = src + srcY * srcStride;
+            uint32_t* dstRow = dstBase +
+                static_cast<uint32_t>(dstY0 + dy) * dstStride +
+                static_cast<uint32_t>(dstX0);
+
+            for (uint32_t dx = startDx; dx < endDx; ++dx)
+            {
+                uint32_t srcX = dx / upscale;
+                if (srcX >= srcW) break;
+                dstRow[dx] = srcRow[srcX];
+            }
+        }
     }
 }
 
@@ -491,7 +534,7 @@ static void CompositorLoopWM()
         p->fbDestY = w->clientY();
 
         if (p->fbVirtual && p->fbVfbWidth > 0)
-            BlitProcessAt(p, w->clientX(), w->clientY(), forceAll);
+            BlitProcessAt(p, w->clientX(), w->clientY(), forceAll, w->upscale);
     }
 
     // 3. Draw window chrome (title bars, borders, buttons)

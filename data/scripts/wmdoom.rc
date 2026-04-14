@@ -1,0 +1,8 @@
+# Brook OS — Window manager with DOOM
+# DOOM at 320×200 upscaled 4× to 1280×800 in a window
+
+set wm
+set vfb 320x200
+set scale 4
+terminal
+run doom -iwad /boot/DOOM1.WAD

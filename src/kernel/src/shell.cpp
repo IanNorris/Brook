@@ -308,17 +308,22 @@ static Process* SpawnProcess(const char* path, int argc, const char* const* argv
             // Default window position: cascade from top-left
             int16_t winX = static_cast<int16_t>(40 + (g_spawnCount % 8) * 30);
             int16_t winY = static_cast<int16_t>(40 + (g_spawnCount % 8) * 30);
-            uint16_t clientW = static_cast<uint16_t>(g_vfbWidth);
-            uint16_t clientH = static_cast<uint16_t>(g_vfbHeight);
+            uint16_t vfbW = static_cast<uint16_t>(g_vfbWidth);
+            uint16_t vfbH = static_cast<uint16_t>(g_vfbHeight);
+            uint8_t upscale = g_scale;
 
-            // Set up the VFB at the window's client area position
+            // Display size = VFB × upscale
+            uint16_t displayW = static_cast<uint16_t>(vfbW * upscale);
+            uint16_t displayH = static_cast<uint16_t>(vfbH * upscale);
+
+            // Set up the VFB at native resolution
             CompositorSetupProcess(proc, winX + WM_BORDER_WIDTH,
                                    winY + WM_TITLE_BAR_HEIGHT + WM_BORDER_WIDTH,
-                                   clientW, clientH, 1);
+                                   vfbW, vfbH, 1);
 
-            WmCreateWindow(proc, winX, winY, clientW, clientH, proc->name);
-            DbgPrintf("SHELL: spawned '%s' pid=%u as WM window at (%d,%d) %ux%u\n",
-                          proc->name, proc->pid, winX, winY, clientW, clientH);
+            WmCreateWindow(proc, winX, winY, displayW, displayH, proc->name, upscale);
+            DbgPrintf("SHELL: spawned '%s' pid=%u as WM window at (%d,%d) %ux%u (vfb %ux%u scale %u)\n",
+                          proc->name, proc->pid, winX, winY, displayW, displayH, vfbW, vfbH, upscale);
         }
         else
         {

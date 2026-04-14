@@ -142,7 +142,7 @@ void WmSetActive(bool active)
 
 int WmCreateWindow(Process* proc, int16_t x, int16_t y,
                    uint16_t clientW, uint16_t clientH,
-                   const char* title)
+                   const char* title, uint8_t upscale)
 {
     // Find free slot
     int idx = -1;
@@ -163,6 +163,7 @@ int WmCreateWindow(Process* proc, int16_t x, int16_t y,
     w.clientW = clientW;
     w.clientH = clientH;
     w.zOrder = g_nextZOrder++;
+    w.upscale = (upscale >= 1) ? upscale : 1;
     w.state = WindowState::Normal;
     w.focused = false;
     w.visible = true;
@@ -172,8 +173,8 @@ int WmCreateWindow(Process* proc, int16_t x, int16_t y,
     w.savedH = clientH;
     WmStrCopy(w.title, title ? title : "Window", sizeof(w.title));
 
-    SerialPrintf("WM: created window %d '%s' at (%d,%d) %ux%u for pid %u\n",
-                 idx, w.title, x, y, clientW, clientH, proc ? proc->pid : 0);
+    SerialPrintf("WM: created window %d '%s' at (%d,%d) %ux%u scale=%u for pid %u\n",
+                 idx, w.title, x, y, clientW, clientH, upscale, proc ? proc->pid : 0);
 
     // Auto-focus new window
     WmSetFocus(idx);
