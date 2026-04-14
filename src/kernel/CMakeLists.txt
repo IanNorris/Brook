@@ -159,6 +159,7 @@ add_executable(kernel
     src/smp.cpp
     src/ap_trampoline.S
     src/context_switch.S
+    src/exception_stubs.S
     src/elf_loader.cpp
     src/vfs.cpp
     src/virtio_blk.cpp

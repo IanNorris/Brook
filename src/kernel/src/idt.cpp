@@ -9,6 +9,20 @@
 static IdtEntry      g_idt[256];
 static IdtDescriptor g_idtDesc;
 
+// ---- Full exception frame (matches exception_stubs.S push order) ----
+// Assembly stubs for vectors 13/14 push all GPRs before calling
+// HandleExceptionFull, allowing signal delivery to modify return registers.
+struct FullExceptionFrame {
+    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
+    uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
+    uint64_t errorCode;
+    uint64_t rip;
+    uint64_t cs;
+    uint64_t rflags;
+    uint64_t rsp;
+    uint64_t ss;
+};
+
 // ---- Helper to fill one IDT entry ----
 static void SetIdtEntry(uint8_t vector, void* handler, uint8_t ist = 0)
 {
@@ -143,7 +157,7 @@ static void ExcStackWalk(uint64_t rbp, int maxFrames, const char* tag)
     ExcPutsRaw(tag); ExcPutsRaw("  --- end trace ---\n");
 }
 
-static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t errorCode, bool hasErrorCode)
+static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t errorCode, bool hasErrorCode, bool swapgsDone = false)
 {
     __asm__ volatile("cli");
 
@@ -151,8 +165,9 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
     // If we entered from user mode (ring 3), GS base is the user's TLS pointer.
     // We must swap to get the kernel per-CPU pointer so that later code
     // (context_switch, etc.) leaves GS in a consistent state.
+    // Skip if the assembly stub already did SWAPGS.
     bool fromUser = (frame->cs & 3) != 0;
-    if (fromUser)
+    if (fromUser && !swapgsDone)
         __asm__ volatile("swapgs");
 
     // Per-CPU nesting guard — uses LAPIC ID to index, avoiding any lock.
@@ -385,6 +400,183 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
     for (;;) { __asm__ volatile("cli; hlt"); }
 }
 
+// ---------------------------------------------------------------------------
+// HandleExceptionFull — called from assembly stubs (exception_stubs.S)
+// for vectors 13 (#GP) and 14 (#PF).
+//
+// Has access to all GPRs via FullExceptionFrame, enabling signal delivery
+// that redirects user-mode execution to a registered signal handler.
+// ---------------------------------------------------------------------------
+
+// Map exception vectors to Linux signal numbers.
+static int ExceptionToSignal(uint8_t vector)
+{
+    switch (vector) {
+    case  0: return 8;   // #DE → SIGFPE
+    case  6: return 4;   // #UD → SIGILL
+    case 13: return 11;  // #GP → SIGSEGV
+    case 14: return 11;  // #PF → SIGSEGV
+    default: return 11;  // default to SIGSEGV
+    }
+}
+
+// SI_KERNEL code for synchronous exceptions
+static constexpr int32_t SI_KERNEL = 0x80;
+// SEGV_MAPERR / SEGV_ACCERR codes
+static constexpr int32_t SEGV_MAPERR = 1;
+static constexpr int32_t SEGV_ACCERR = 2;
+
+extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
+{
+    // The assembly stub has already done SWAPGS if needed.
+    __asm__ volatile("cli");
+
+    bool fromUser = (ef->cs & 3) != 0;
+
+    // For kernel-mode faults, delegate to the original handler for diagnostics + halt.
+    if (!fromUser)
+    {
+        InterruptFrame ifrm;
+        ifrm.ip    = ef->rip;
+        ifrm.cs    = ef->cs;
+        ifrm.flags = ef->rflags;
+        ifrm.sp    = ef->rsp;
+        ifrm.ss    = ef->ss;
+        HandleException(static_cast<uint8_t>(vector), &ifrm, ef->errorCode, true);
+        // HandleException never returns for kernel faults.
+        for (;;) __asm__ volatile("cli; hlt");
+    }
+
+    // --- User-mode fault ---
+    brook::Process* proc = brook::ProcessCurrent();
+    int signum = ExceptionToSignal(static_cast<uint8_t>(vector));
+
+    uint64_t cr2 = 0;
+    __asm__ volatile("movq %%cr2, %0" : "=r"(cr2));
+
+    // Check if the process has a handler registered for this signal.
+    bool hasHandler = false;
+    if (proc && proc->pid < brook::MAX_PROCESSES)
+    {
+        const brook::KernelSigaction& sa = brook::g_sigHandlers[proc->pid][signum - 1];
+        if (sa.handler > 1) // Not SIG_DFL (0) or SIG_IGN (1)
+            hasHandler = true;
+    }
+
+    if (hasHandler && proc && !proc->inSignalHandler)
+    {
+        const brook::KernelSigaction& sa = brook::g_sigHandlers[proc->pid][signum - 1];
+
+        ExcPutsRaw("[SIG] Delivering signal ");
+        ExcPutCharRaw(static_cast<char>('0' + signum / 10));
+        ExcPutCharRaw(static_cast<char>('0' + signum % 10));
+        ExcPutsRaw(" to pid ");
+        {
+            char pbuf[6];
+            uint16_t pid = proc->pid;
+            pbuf[0] = static_cast<char>('0' + (pid / 10000) % 10);
+            pbuf[1] = static_cast<char>('0' + (pid / 1000) % 10);
+            pbuf[2] = static_cast<char>('0' + (pid / 100) % 10);
+            pbuf[3] = static_cast<char>('0' + (pid / 10) % 10);
+            pbuf[4] = static_cast<char>('0' + pid % 10);
+            pbuf[5] = '\0';
+            const char* p = pbuf;
+            while (*p == '0' && p[1] != '\0') ++p;
+            ExcPutsRaw(p);
+        }
+        ExcPutsRaw(" (handler=0x");
+        ExcPutHex(sa.handler);
+        ExcPutsRaw(" faultAddr=0x");
+        ExcPutHex(cr2);
+        ExcPutsRaw(")\n");
+
+        // Mark that we're in a signal handler
+        proc->inSignalHandler = true;
+        proc->sigSavedMask = proc->sigMask;
+        proc->sigMask |= sa.mask | (1ULL << (signum - 1));
+        proc->sigMask &= ~((1ULL << 8) | (1ULL << 18)); // never block SIGKILL/SIGSTOP
+
+        // Build SignalFrame on the user stack
+        uint64_t userRsp = ef->rsp;
+        userRsp -= 128;                        // skip red zone
+        userRsp -= sizeof(brook::SignalFrame);
+        userRsp &= ~0xFULL;                   // 16-byte align
+
+        auto* sf = reinterpret_cast<brook::SignalFrame*>(userRsp);
+
+        // Clear the frame
+        for (uint64_t i = 0; i < sizeof(brook::SignalFrame) / 8; i++)
+            reinterpret_cast<uint64_t*>(sf)[i] = 0;
+
+        // Return address: sa_restorer (musl's __restore_rt → rt_sigreturn)
+        sf->pretcode = sa.restorer;
+
+        // Fill ucontext
+        sf->uc.uc_sigmask = proc->sigSavedMask;
+
+        // Save all registers from the fault context into mcontext
+        brook::SignalMcontext& mc = sf->uc.uc_mcontext;
+        mc.r8     = ef->r8;
+        mc.r9     = ef->r9;
+        mc.r10    = ef->r10;
+        mc.r11    = ef->r11;
+        mc.r12    = ef->r12;
+        mc.r13    = ef->r13;
+        mc.r14    = ef->r14;
+        mc.r15    = ef->r15;
+        mc.rdi    = ef->rdi;
+        mc.rsi    = ef->rsi;
+        mc.rbp    = ef->rbp;
+        mc.rbx    = ef->rbx;
+        mc.rdx    = ef->rdx;
+        mc.rax    = ef->rax;
+        mc.rcx    = ef->rcx;
+        mc.rsp    = ef->rsp;
+        mc.rip    = ef->rip;
+        mc.eflags = ef->rflags;
+        mc.cs     = 0x23;          // user code segment
+        mc.err    = ef->errorCode;
+        mc.trapno = vector;
+        mc.cr2    = cr2;
+
+        // Fill siginfo
+        sf->info.si_signo = signum;
+        sf->info.si_errno = 0;
+        if (vector == 14)
+            sf->info.si_code = (ef->errorCode & 1) ? SEGV_ACCERR : SEGV_MAPERR;
+        else
+            sf->info.si_code = SI_KERNEL;
+        // Store faulting address in si_addr (first 8 bytes of _data)
+        *reinterpret_cast<uint64_t*>(&sf->info._data[0]) = cr2;
+
+        // Redirect execution: modify the FullExceptionFrame so IRETQ returns
+        // to the signal handler with the right arguments.
+        ef->rip    = sa.handler;               // RIP → handler
+        ef->rsp    = userRsp;                  // RSP → signal frame
+        ef->rdi    = static_cast<uint64_t>(signum);        // arg1 = signum
+        if (sa.flags & brook::SA_SIGINFO)
+        {
+            ef->rsi = reinterpret_cast<uint64_t>(&sf->info);  // arg2 = siginfo
+            ef->rdx = reinterpret_cast<uint64_t>(&sf->uc);    // arg3 = ucontext
+        }
+
+        // Re-enable interrupts; the assembly stub will IRETQ back to the handler.
+        __asm__ volatile("sti");
+        return;
+    }
+
+    // No handler registered — print diagnostics and kill the process.
+    InterruptFrame ifrm;
+    ifrm.ip    = ef->rip;
+    ifrm.cs    = ef->cs;
+    ifrm.flags = ef->rflags;
+    ifrm.sp    = ef->rsp;
+    ifrm.ss    = ef->ss;
+    HandleException(static_cast<uint8_t>(vector), &ifrm, ef->errorCode, true, true /*swapgsDone*/);
+    // HandleException never returns for user-mode faults (it exits the process).
+    for (;;) __asm__ volatile("cli; hlt");
+}
+
 // ---- Exception stubs: no error code ----
 #define EXC_NOERR(N) \
     __attribute__((interrupt)) \
@@ -412,8 +604,10 @@ EXC_NOERR(9)   // Coprocessor Segment Overrun (legacy)
 EXC_ERR(10)    // #TS Invalid TSS
 EXC_ERR(11)    // #NP Segment Not Present
 EXC_ERR(12)    // #SS Stack-Segment Fault
-EXC_ERR(13)    // #GP General Protection
-EXC_ERR(14)    // #PF Page Fault
+// Vectors 13 (#GP) and 14 (#PF) use assembly stubs from exception_stubs.S
+// that provide full GPR access for signal delivery (SIGSEGV).
+extern "C" void ExceptionStub13();
+extern "C" void ExceptionStub14();
 EXC_NOERR(15)  // Reserved
 EXC_NOERR(16)  // #MF x87 FPU Exception
 EXC_ERR(17)    // #AC Alignment Check
@@ -485,8 +679,8 @@ void IdtInit(brook::Framebuffer* fb)
     // #SS, #GP, #PF use the normal kernel stack (ist=0) — it's safe now that
     // we have a dedicated 32KB stack.  Only #DF needs IST1.
     SetIdtEntry(12, reinterpret_cast<void*>(ExceptionHandler12));
-    SetIdtEntry(13, reinterpret_cast<void*>(ExceptionHandler13));
-    SetIdtEntry(14, reinterpret_cast<void*>(ExceptionHandler14));
+    SetIdtEntry(13, reinterpret_cast<void*>(ExceptionStub13));  // asm stub for SIGSEGV delivery
+    SetIdtEntry(14, reinterpret_cast<void*>(ExceptionStub14));  // asm stub for SIGSEGV delivery
     SetIdtEntry(15, reinterpret_cast<void*>(ExceptionHandler15));
     SetIdtEntry(16, reinterpret_cast<void*>(ExceptionHandler16));
     SetIdtEntry(17, reinterpret_cast<void*>(ExceptionHandler17));
