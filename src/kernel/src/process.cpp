@@ -1135,13 +1135,33 @@ int ProcessSendSignal(Process* proc, int signum)
     {
         if (proc->state == ProcessState::Stopped)
         {
-            SchedulerUnblock(proc); // SchedulerUnblock now accepts Stopped state
+            proc->stopReported = false;
+            SchedulerUnblock(proc);
             DbgPrintf("SIGNAL: SIGCONT -> pid %u resumed\n", proc->pid);
         }
         // Still deliver SIGCONT if a handler is registered
         uint64_t bit = 1ULL << (signum - 1);
         __atomic_or_fetch(&proc->sigPending, bit, __ATOMIC_RELEASE);
         return 0;
+    }
+
+    // SIGTSTP/SIGTTIN/SIGTTOU: if no user handler registered, stop immediately
+    // (like SIGSTOP). Otherwise fall through to set pending for handler delivery.
+    if (signum == 20 || signum == 21 || signum == 22)
+    {
+        KernelSigaction& sa = g_sigHandlers[proc->pid][signum - 1];
+        if (sa.handler == 0 || sa.handler == 1) // SIG_DFL or SIG_IGN
+        {
+            if (sa.handler == 1) return 0; // SIG_IGN — ignore
+            // Default action: stop
+            proc->state = ProcessState::Stopped;
+            DbgPrintf("SIGNAL: sig %d -> pid %u stopped (default)\n", signum, proc->pid);
+            // Wake parent for waitpid WUNTRACED
+            Process* parent = ProcessFindByPid(proc->parentPid);
+            if (parent)
+                ProcessSendSignal(parent, 17); // SIGCHLD
+            return 0;
+        }
     }
 
     uint64_t bit = 1ULL << (signum - 1);
@@ -1259,9 +1279,15 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
         case 20: // SIGTSTP — default is stop
         case 21: // SIGTTIN
         case 22: // SIGTTOU
-            proc->state = ProcessState::Stopped;
+        {
             DbgPrintf("SIGNAL: pid %u stopped by signal %d\n", proc->pid, signum);
+            // Set Stopped state. The scheduler timer tick will deschedule
+            // this process when it sees state != Running. We can't call
+            // SchedulerStop/Yield from SyscallCheckSignals because we're
+            // in the syscall return path with a special stack layout.
+            proc->state = ProcessState::Stopped;
             return syscallResult;
+        }
         default:
             return syscallResult;
         }

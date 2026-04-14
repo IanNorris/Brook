@@ -1635,7 +1635,9 @@ static int64_t sys_vfork(uint64_t, uint64_t, uint64_t,
 // or a specific child PID. WNOHANG (options & 1) returns 0 if no child
 // has exited yet instead of blocking.
 
-static constexpr uint64_t WNOHANG = 1;
+static constexpr uint64_t WNOHANG    = 1;
+static constexpr uint64_t WUNTRACED  = 2;
+[[maybe_unused]] static constexpr uint64_t WCONTINUED = 8;
 
 static int64_t sys_wait4(uint64_t pidArg, uint64_t statusAddr, uint64_t options,
                           uint64_t, uint64_t, uint64_t)
@@ -1649,9 +1651,28 @@ static int64_t sys_wait4(uint64_t pidArg, uint64_t statusAddr, uint64_t options,
     // pid == 0 means wait for any child in same process group — treat as -1
     if (targetPid == 0) targetPid = -1;
 
-    // Spin until a terminated child is found (or return immediately for WNOHANG)
+    // Spin until a terminated (or stopped, if WUNTRACED) child is found
     for (;;)
     {
+        // Check for stopped children if WUNTRACED
+        if (options & WUNTRACED)
+        {
+            Process* stopped = SchedulerFindStoppedChild(parent->pid, targetPid);
+            if (stopped)
+            {
+                int32_t childPid = stopped->pid;
+                if (statusAddr)
+                {
+                    // Linux wait status for stopped: (signum << 8) | 0x7F
+                    auto* wstatus = reinterpret_cast<int32_t*>(statusAddr);
+                    *wstatus = (20 << 8) | 0x7F; // SIGTSTP (20)
+                }
+                // Mark as reported so we don't report it again
+                stopped->stopReported = true;
+                return static_cast<int64_t>(childPid);
+            }
+        }
+
         Process* child = SchedulerFindTerminatedChild(parent->pid, targetPid);
         if (child)
         {
@@ -1662,7 +1683,10 @@ static int64_t sys_wait4(uint64_t pidArg, uint64_t statusAddr, uint64_t options,
             {
                 // Linux wait status encoding: (status & 0xFF) << 8 for normal exit
                 auto* wstatus = reinterpret_cast<int32_t*>(statusAddr);
-                *wstatus = (childStatus & 0xFF) << 8;
+                if (childStatus >= 128) // Killed by signal
+                    *wstatus = (childStatus - 128); // Signal number in low byte
+                else
+                    *wstatus = (childStatus & 0xFF) << 8;
             }
 
             SchedulerReapChild(child);
@@ -1672,9 +1696,6 @@ static int64_t sys_wait4(uint64_t pidArg, uint64_t statusAddr, uint64_t options,
         if (options & WNOHANG)
             return 0;
 
-        // Block until a child exits and wakes us. Use a short timed
-        // wakeup because the child may already be Terminated but not yet
-        // reapable (DrainPostSwitch hasn't run to set the flag).
         extern volatile uint64_t g_lapicTickCount;
         parent->wakeupTick = g_lapicTickCount + 5;
         SchedulerBlock(parent);

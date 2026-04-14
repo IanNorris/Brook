@@ -597,11 +597,16 @@ static void CompositorLoopWM()
                     Terminal* t = TerminalGet(static_cast<int>(ti));
                     if (t && t->child == focused->proc)
                     {
-                        // Echo ^C to terminal
-                        if (signum == 2)
+                        // Echo control character to terminal
+                        if (signum == 2) // Ctrl+C → ^C
                         {
                             char ctrlc = 0x03;
                             TerminalWriteInput(static_cast<int>(ti), &ctrlc, 1);
+                        }
+                        else if (signum == 20) // Ctrl+Z → ^Z
+                        {
+                            char ctrlz = 0x1A;
+                            TerminalWriteInput(static_cast<int>(ti), &ctrlz, 1);
                         }
                         // Send signal to foreground process group
                         ProcessSendSignalToGroup(t->foregroundPgid, signum);

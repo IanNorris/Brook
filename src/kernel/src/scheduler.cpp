@@ -461,6 +461,26 @@ void SchedulerBlock(Process* proc)
         __asm__ volatile("sti" ::: "memory");
 }
 
+void SchedulerStop(Process* proc)
+{
+    // Like SchedulerBlock but sets Stopped instead of Blocked.
+    // Used by SIGTSTP/SIGTTIN/SIGTTOU default handlers.
+    uint64_t flags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+
+    uint64_t rlf = SchedLockAcquire(g_readyLock);
+    proc->state = ProcessState::Stopped;
+    ReadyQueueRemoveLocked(proc);
+    SchedLockRelease(g_readyLock, rlf);
+
+    uint32_t cpu = ThisCpu();
+    if (proc == g_perCpu[cpu].currentProcess)
+        SchedulerYield();
+
+    if (flags & 0x200)
+        __asm__ volatile("sti" ::: "memory");
+}
+
 void SchedulerUnblock(Process* proc)
 {
     uint64_t rlf4 = SchedLockAcquire(g_readyLock);
@@ -712,6 +732,25 @@ void SchedulerTimerTick()
     // Only preempt if the process is still Running. It might have been
     // marked Blocked (by SchedulerBlock in a syscall) between the lock
     // release and the yield — the timer fired in that window.
+    // Also deschedule Stopped processes (SIGTSTP/SIGSTOP).
+    if (cur->state == ProcessState::Stopped)
+    {
+        // Stopped process — remove from ready queue and switch away
+        uint64_t rlf_stop = SchedLockAcquire(g_readyLock);
+        ReadyQueueRemoveLocked(cur);
+        Process* next = PickNextLocked();
+        SchedLockRelease(g_readyLock, rlf_stop);
+        if (next)
+            DoSwitch(cur, next, /* requeueOld */ false);
+        else
+        {
+            // No other process — switch to idle
+            Process* idle = g_perCpu[cpu].idleProcess;
+            if (idle && idle != cur)
+                DoSwitch(cur, idle, /* requeueOld */ false);
+        }
+        return;
+    }
     if (cur->state != ProcessState::Running)
         return;
 
@@ -1066,6 +1105,25 @@ Process* SchedulerFindTerminatedChild(uint16_t parentPid, int64_t pid)
         if (p->parentPid == parentPid
             && p->state == ProcessState::Terminated
             && __atomic_load_n(&p->reapable, __ATOMIC_ACQUIRE)
+            && (pid == -1 || pid == static_cast<int64_t>(p->pid)))
+        {
+            SchedLockRelease(g_allProcLock, alf);
+            return p;
+        }
+    }
+    SchedLockRelease(g_allProcLock, alf);
+    return nullptr;
+}
+
+Process* SchedulerFindStoppedChild(uint16_t parentPid, int64_t pid)
+{
+    uint64_t alf = SchedLockAcquire(g_allProcLock);
+    for (uint32_t i = 0; i < g_processCount; i++)
+    {
+        Process* p = g_allProcesses[i];
+        if (p->parentPid == parentPid
+            && p->state == ProcessState::Stopped
+            && !p->stopReported
             && (pid == -1 || pid == static_cast<int64_t>(p->pid)))
         {
             SchedLockRelease(g_allProcLock, alf);

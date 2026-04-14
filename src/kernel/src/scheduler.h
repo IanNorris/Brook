@@ -63,6 +63,8 @@ uint16_t SchedulerAllocPid();
 // Find a terminated child of parentPid. If pid == -1, any child; otherwise
 // matches a specific child PID. Returns the child Process* or nullptr.
 Process* SchedulerFindTerminatedChild(uint16_t parentPid, int64_t pid);
+Process* SchedulerFindStoppedChild(uint16_t parentPid, int64_t pid);
+void SchedulerStop(Process* proc);
 
 // Reap (destroy) a terminated child process after wait4 collects its status.
 void SchedulerReapChild(Process* child);

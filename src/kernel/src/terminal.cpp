@@ -615,7 +615,19 @@ void TerminalWriteInput(int termIdx, const char* data, uint32_t len)
             TermRenderGlyph(t, 'C');
             TermRenderGlyph(t, '\n');
             t->dirty = true;
-            t->child->fbDirty = 1;
+            if (t->child) t->child->fbDirty = 1;
+            CompositorWake();
+            continue;
+        }
+
+        // Ctrl+Z (SUB, 0x1A) → echo ^Z and newline
+        if (ch == 0x1A)
+        {
+            TermRenderGlyph(t, '^');
+            TermRenderGlyph(t, 'Z');
+            TermRenderGlyph(t, '\n');
+            t->dirty = true;
+            if (t->child) t->child->fbDirty = 1;
             CompositorWake();
             continue;
         }

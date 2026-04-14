@@ -331,6 +331,7 @@ struct Process
     // Fork child state: when true, the trampoline enters user mode at
     // forkReturnRip with RAX=0 (child's fork() return value).
     bool isForkChild;
+    bool stopReported;          // True after wait4 reported this process as stopped
     uint64_t forkReturnRip;     // User-mode RIP to resume at (instruction after syscall)
     uint64_t forkReturnRsp;     // User-mode RSP at time of fork
     uint64_t forkReturnRflags;  // User-mode RFLAGS at time of fork
