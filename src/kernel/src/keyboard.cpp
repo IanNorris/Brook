@@ -210,6 +210,8 @@ static char BufPop()
 // ---------------------------------------------------------------------------
 
 static volatile bool g_shiftHeld = false;
+static volatile bool g_ctrlHeld  = false;
+static volatile bool g_altHeld   = false;
 static volatile bool g_capsLock  = false;
 
 // ---------------------------------------------------------------------------
@@ -238,17 +240,19 @@ static void KbdIrqHandler(InterruptFrame* frame)
     // Build modifier bitmask for the input event.
     uint8_t mods = 0;
     if (g_shiftHeld) mods |= INPUT_MOD_LSHIFT;
+    if (g_ctrlHeld)  mods |= INPUT_MOD_CTRL;
+    if (g_altHeld)   mods |= INPUT_MOD_ALT;
     if (g_capsLock)  mods |= INPUT_MOD_CAPSLOCK;
 
     // Track modifier state.
-    if (key == 0x2A || key == 0x36) // L-Shift or R-Shift
-    {
+    if (key == 0x2A || key == 0x36)      // L-Shift or R-Shift
         g_shiftHeld = !release;
-    }
-    else if (key == 0x3A && !release) // Caps Lock (toggle on press)
-    {
+    else if (key == 0x1D)                // L-Ctrl (R-Ctrl is E0 1D, handled below)
+        g_ctrlHeld = !release;
+    else if (key == 0x38)                // L-Alt (R-Alt is E0 38)
+        g_altHeld = !release;
+    else if (key == 0x3A && !release)    // Caps Lock (toggle on press)
         g_capsLock = !g_capsLock;
-    }
 
     // Push raw scan code event to input subsystem (for userspace consumers like DOOM).
     // All keys (including modifiers) and both press/release are forwarded.

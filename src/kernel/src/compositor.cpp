@@ -549,7 +549,6 @@ static void CompositorLoopWM()
     while (InputPollEvent(&ev))
     {
         if (ev.type != InputEventType::KeyPress) continue;
-        if (ev.ascii == 0) continue; // non-printable
 
         // Find the focused window
         Window* focused = nullptr;
@@ -564,18 +563,50 @@ static void CompositorLoopWM()
         }
         if (!focused) continue;
 
-        char ch = ev.ascii;
+        // Check for terminal signal keys (Ctrl+C, Ctrl+Z, Ctrl+\)
+        if (ev.modifiers & INPUT_MOD_CTRL)
+        {
+            int signum = 0;
+            if (ev.scanCode == 0x2E) signum = 2;   // Ctrl+C → SIGINT
+            else if (ev.scanCode == 0x2C) signum = 20; // Ctrl+Z → SIGTSTP
+            else if (ev.scanCode == 0x2B) signum = 3;  // Ctrl+\ → SIGQUIT
+
+            if (signum)
+            {
+                // Find the terminal's child process and send signal
+                for (uint32_t ti = 0; ti < MAX_TERMINALS; ti++)
+                {
+                    Terminal* t = TerminalGet(static_cast<int>(ti));
+                    if (t && t->child == focused->proc)
+                    {
+                        ProcessSendSignal(t->child, signum);
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
 
         // Route to terminal if this window's process has one
+        bool routed = false;
         for (uint32_t ti = 0; ti < MAX_TERMINALS; ti++)
         {
             Terminal* t = TerminalGet(static_cast<int>(ti));
             if (t && t->child == focused->proc)
             {
-                TerminalWriteInput(static_cast<int>(ti), &ch, 1);
+                if (ev.ascii != 0)
+                {
+                    char ch = ev.ascii;
+                    TerminalWriteInput(static_cast<int>(ti), &ch, 1);
+                }
+                routed = true;
                 break;
             }
         }
+
+        // Non-terminal window: push raw event to per-process input queue
+        if (!routed)
+            ProcessInputPush(focused->proc, ev);
     }
 }
 

@@ -1160,6 +1160,8 @@ bool ProcessDeliverSignal(Process* proc, uint64_t* userRip, uint64_t* userRsp,
         case 14: // SIGALRM
         case 15: // SIGTERM
             proc->exitStatus = 128 + signum;
+            proc->fbVirtual = nullptr;
+            proc->fbVirtualSize = 0;
             proc->state = ProcessState::Terminated;
             proc->reapable = true;
             DbgPrintf("SIGNAL: default terminate pid %u by signal %d\n", proc->pid, signum);

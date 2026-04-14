@@ -18,6 +18,7 @@
 #include "pipe.h"
 #include "memory/heap.h"
 #include "compositor.h"
+#include "window.h"
 
 // Forward declaration
 extern "C" __attribute__((naked)) void ReturnToKernel();
@@ -357,7 +358,12 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             while (bytesRead < count)
             {
                 InputEvent ev;
-                if (!InputPollEvent(&ev)) break;
+                bool got;
+                if (WmIsActive())
+                    got = ProcessInputPop(proc, &ev);
+                else
+                    got = InputPollEvent(&ev);
+                if (!got) break;
                 uint8_t sc = ev.scanCode;
                 if (ev.type == InputEventType::KeyRelease)
                     sc |= 0x80;

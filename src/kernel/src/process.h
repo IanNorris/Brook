@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include "memory/address.h"
+#include "input.h"
 
 namespace brook {
 
@@ -284,7 +285,34 @@ struct Process
     uint64_t forkR8;
     uint64_t forkR9;
     uint64_t forkR10;
+
+    // Per-process input queue (WM mode: compositor pushes keyboard events here
+    // instead of leaving them in the global input device ring).
+    static constexpr uint32_t INPUT_QUEUE_SIZE = 64;
+    InputEvent inputQueue[INPUT_QUEUE_SIZE];
+    volatile uint32_t inputHead;  // Write index (compositor)
+    volatile uint32_t inputTail;  // Read index (process/syscall)
 };
+
+// Push an input event to a process's per-process queue (non-blocking).
+inline void ProcessInputPush(Process* proc, const InputEvent& ev)
+{
+    uint32_t next = (proc->inputHead + 1) % Process::INPUT_QUEUE_SIZE;
+    if (next == proc->inputTail) return; // full — drop
+    proc->inputQueue[proc->inputHead] = ev;
+    __atomic_store_n(&proc->inputHead, next, __ATOMIC_RELEASE);
+}
+
+// Pop an input event from a process's per-process queue (non-blocking).
+inline bool ProcessInputPop(Process* proc, InputEvent* out)
+{
+    uint32_t tail = __atomic_load_n(&proc->inputTail, __ATOMIC_ACQUIRE);
+    if (tail == __atomic_load_n(&proc->inputHead, __ATOMIC_ACQUIRE))
+        return false;
+    *out = proc->inputQueue[tail];
+    __atomic_store_n(&proc->inputTail, (tail + 1) % Process::INPUT_QUEUE_SIZE, __ATOMIC_RELEASE);
+    return true;
+}
 
 // Kernel thread entry point signature.
 using KernelThreadFn = void (*)(void* arg);
