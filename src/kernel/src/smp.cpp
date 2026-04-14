@@ -374,6 +374,8 @@ void SmpActivateAPs()
 
     KPrintf("SMP: activating %u APs for scheduling\n", g_onlineCount - 1);
 
+    // Phase 1: prepare all APs (allocate resources while no APs are running).
+    // This avoids heap/VMM lock contention between the BSP and active APs.
     for (uint32_t i = 0; i < g_cpuCount && i < MAX_CPUS; ++i)
     {
         if (g_cpus[i].isBsp || !g_cpus[i].online)
@@ -408,8 +410,13 @@ void SmpActivateAPs()
 
         KPrintf("SMP: CPU %u prepared (TSS sel=0x%x, env=%p)\n",
                 i, g_apTssSelector[i], reinterpret_cast<void*>(env));
+    }
 
-        // Wake the AP.
+    // Phase 2: activate all APs at once (no more BSP allocations needed).
+    for (uint32_t i = 0; i < g_cpuCount && i < MAX_CPUS; ++i)
+    {
+        if (g_cpus[i].isBsp || !g_cpus[i].online)
+            continue;
         __atomic_store_n(&g_apActivate[i], 1, __ATOMIC_RELEASE);
     }
 }
