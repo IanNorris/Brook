@@ -331,11 +331,14 @@ static void TerminalThreadFn(void* arg)
         t->vfb[i] = t->bgColor;
     t->dirty = true;
 
-    DbgPrintf("TERMINAL: thread started for pid %u\n", self->pid);
+    KPrintf("TERMINAL: thread started for pid %u, reading from pipe\n", self->pid);
 
     while (t->active)
     {
         char buf[256];
+
+        // Register as reader waiter so pipe writers wake us immediately
+        outPipe->readerWaiter = self;
         uint32_t n = outPipe->read(buf, sizeof(buf));
 
         if (n == 0)
@@ -343,14 +346,16 @@ static void TerminalThreadFn(void* arg)
             // Check if child still alive
             if (t->child && t->child->state == ProcessState::Terminated)
             {
-                DbgPrintf("TERMINAL: child exited, closing\n");
+                KPrintf("TERMINAL: child exited, closing\n");
                 break;
             }
-            // Sleep briefly and retry
-            self->wakeupTick = g_lapicTickCount + 5;
+            // Block until writer wakes us or timeout
+            self->wakeupTick = g_lapicTickCount + 50;
             SchedulerBlock(self);
             continue;
         }
+
+        outPipe->readerWaiter = nullptr;
 
         // Process each byte
         for (uint32_t i = 0; i < n; i++)
@@ -396,7 +401,11 @@ static void TerminalThreadFn(void* arg)
         }
 
         if (t->dirty)
+        {
+            t->child->fbDirty = 1;
+            t->dirty = false;
             CompositorWake();
+        }
     }
 
     t->active = false;
@@ -409,7 +418,8 @@ static void TerminalThreadFn(void* arg)
 
 int TerminalCreate(uint32_t clientW, uint32_t clientH)
 {
-    if (g_terminalCount >= MAX_TERMINALS) return -1;
+    KPrintf("TERMINAL: creating %ux%u, count=%u\n", clientW, clientH, g_terminalCount);
+    if (g_terminalCount >= MAX_TERMINALS) { KPrintf("TERMINAL: max terminals reached\n"); return -1; }
 
     int idx = static_cast<int>(g_terminalCount);
     Terminal* t = &g_terminals[idx];
@@ -417,7 +427,7 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     // Allocate VFB
     uint32_t vfbSize = clientW * clientH * 4;
     t->vfb = static_cast<uint32_t*>(kmalloc(vfbSize));
-    if (!t->vfb) return -1;
+    if (!t->vfb) { KPrintf("TERMINAL: vfb alloc failed (%u bytes)\n", vfbSize); return -1; }
 
     t->vfbW = clientW;
     t->vfbH = clientH;
@@ -426,7 +436,7 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     t->curX = 0;
     t->curY = 0;
     t->fgColor = 0x00CCCCCC;
-    t->bgColor = 0x00001A2A;
+    t->bgColor = 0x001A1A2E;
     t->active = true;
     t->dirty = false;
 
@@ -435,6 +445,7 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     auto* stdoutPipe = static_cast<PipeBuffer*>(kmalloc(sizeof(PipeBuffer)));
     if (!stdinPipe || !stdoutPipe)
     {
+        KPrintf("TERMINAL: pipe alloc failed\n");
         if (stdinPipe) kfree(stdinPipe);
         if (stdoutPipe) kfree(stdoutPipe);
         kfree(t->vfb);
@@ -477,10 +488,10 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
 
     // Load bash ELF
     VnodeStat st;
-    const char* bashPath = "/BIN/BASH";
+    const char* bashPath = "/boot/BIN/BASH";
     if (VfsStatPath(bashPath, &st) != 0)
     {
-        DbgPrintf("TERMINAL: bash not found at %s\n", bashPath);
+        KPrintf("TERMINAL: bash not found at %s\n", bashPath);
         kfree(stdinPipe);
         kfree(stdoutPipe);
         kfree(t->vfb);
@@ -489,10 +500,10 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     }
 
     auto* elfData = static_cast<uint8_t*>(kmalloc(st.size));
-    if (!elfData) return -1;
+    if (!elfData) { KPrintf("TERMINAL: elf alloc failed (%lu bytes)\n", st.size); return -1; }
 
     Vnode* vn = VfsOpen(bashPath, 0);
-    if (!vn) { kfree(elfData); return -1; }
+    if (!vn) { KPrintf("TERMINAL: VfsOpen failed for %s\n", bashPath); kfree(elfData); return -1; }
 
     uint64_t off = 0;
     uint64_t remaining = st.size;
@@ -507,6 +518,7 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
 
     if (remaining > 0)
     {
+        KPrintf("TERMINAL: bash ELF read incomplete (%lu remaining)\n", remaining);
         kfree(elfData);
         return -1;
     }
@@ -515,7 +527,7 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     const char* bashArgv[] = { "bash", nullptr };
     const char* bashEnvp[] = {
         "HOME=/",
-        "PATH=/BIN",
+        "PATH=/boot/BIN",
         "TERM=dumb",
         "PS1=$ ",
         nullptr
@@ -526,7 +538,7 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
 
     if (!child)
     {
-        DbgPrintf("TERMINAL: failed to spawn bash\n");
+        KPrintf("TERMINAL: failed to spawn bash\n");
         kfree(stdinPipe);
         kfree(stdoutPipe);
         kfree(t->vfb);
@@ -540,7 +552,7 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     Process* thread = KernelThreadCreate("terminal", TerminalThreadFn, t);
     if (!thread)
     {
-        DbgPrintf("TERMINAL: failed to create thread\n");
+        KPrintf("TERMINAL: failed to create thread\n");
         // child is already created, we'd need to clean up...
         return -1;
     }
@@ -563,7 +575,7 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     SchedulerAddProcess(thread);
 
     g_terminalCount++;
-    DbgPrintf("TERMINAL: created terminal %d, bash pid=%u, thread pid=%u\n",
+    KPrintf("TERMINAL: created terminal %d, bash pid=%u, thread pid=%u\n",
               idx, child->pid, thread->pid);
 
     return idx;

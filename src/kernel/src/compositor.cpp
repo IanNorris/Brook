@@ -534,7 +534,7 @@ static void CompositorLoopWM()
         p->fbDestY = w->clientY();
 
         if (p->fbVirtual && p->fbVfbWidth > 0)
-            BlitProcessAt(p, w->clientX(), w->clientY(), forceAll, w->upscale);
+            BlitProcessAt(p, w->clientX(), w->clientY(), true, w->upscale);
     }
 
     // 3. Draw window chrome (title bars, borders, buttons)

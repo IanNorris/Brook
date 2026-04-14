@@ -157,18 +157,22 @@ static bool HeapMapPages(uint64_t virtStart, uint64_t pageCount)
     return true;
 }
 
-// Expand the heap by EXPAND_PAGES. Always contiguous since we control the
-// virtual address region.
-static bool ExpandHeap()
+// Expand the heap by at least minBytes (rounded up to page granularity).
+// Always contiguous since we control the virtual address region.
+static bool ExpandHeap(uint64_t minBytes = 0)
 {
+    uint64_t expandPages = EXPAND_PAGES;
+    if (minBytes > expandPages * 4096)
+        expandPages = (minBytes + 4095) / 4096;
+
     uint64_t expandVirt = reinterpret_cast<uint64_t>(g_heapEnd);
-    if (expandVirt + EXPAND_PAGES * 4096 > HEAP_VIRT_MAX)
+    if (expandVirt + expandPages * 4096 > HEAP_VIRT_MAX)
     {
         SerialPuts("Heap: expansion would exceed max virtual region\n");
         return false;
     }
 
-    if (!HeapMapPages(expandVirt, EXPAND_PAGES))
+    if (!HeapMapPages(expandVirt, expandPages))
     {
         SerialPuts("Heap: expansion page mapping failed\n");
         return false;
@@ -184,7 +188,7 @@ static bool ExpandHeap()
         cur  = NextBlock(cur);
     }
 
-    uint32_t extra = static_cast<uint32_t>(EXPAND_PAGES * 4096);
+    uint32_t extra = static_cast<uint32_t>(expandPages * 4096);
     if (prev && prev->free)
     {
         WriteBlock(reinterpret_cast<uint8_t*>(prev), prev->size + extra, 1);
@@ -301,8 +305,8 @@ void* kmalloc(uint64_t size)
             cur = NextBlock(cur);
         }
 
-        // First pass exhausted — try to expand.
-        if (pass == 0 && !ExpandHeap()) { SpinLockRelease(&g_heapLock, lf); return nullptr; }
+        // First pass exhausted — try to expand with enough room.
+        if (pass == 0 && !ExpandHeap(needed)) { SpinLockRelease(&g_heapLock, lf); return nullptr; }
     }
 
     SpinLockRelease(&g_heapLock, lf);

@@ -617,9 +617,23 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         return fd;
     }
 
-    // /dev/tty — controlling terminal (returns keyboard for read, serial for write)
+    // /dev/tty — controlling terminal
+    // In WM terminal mode (stdin is a pipe), dup the stdin pipe so bash's
+    // /dev/tty reads go through the terminal's input pipe instead of consuming
+    // raw keyboard events from the input subsystem.
     if (StrEq(path, "/dev/tty") || StrEq(path, "/dev/console"))
     {
+        if (proc->fds[0].type == FdType::Pipe && proc->fds[0].handle)
+        {
+            // Terminal mode: dup stdin pipe for /dev/tty
+            int fd = FdAlloc(proc, FdType::Pipe, proc->fds[0].handle);
+            if (fd < 0) return -EMFILE;
+            proc->fds[fd].flags = proc->fds[0].flags;
+            proc->fds[fd].statusFlags = 2; // O_RDWR
+            auto* pipe = static_cast<PipeBuffer*>(proc->fds[0].handle);
+            __atomic_fetch_add(&pipe->readers, 1, __ATOMIC_RELEASE);
+            return fd;
+        }
         int fd = FdAlloc(proc, FdType::DevKeyboard, nullptr);
         if (fd < 0) return -EMFILE;
         DbgPrintf("sys_open: %s → fd %d (keyboard/tty)\n", path, fd);

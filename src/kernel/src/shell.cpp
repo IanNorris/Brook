@@ -616,10 +616,12 @@ static int ExecCommand(int argc, const char* const* argv)
             int16_t winX = static_cast<int16_t>(60 + (termIdx % 6) * 40);
             int16_t winY = static_cast<int16_t>(60 + (termIdx % 6) * 40);
 
-            // Set up compositor placement for the child process (its VFB is the terminal VFB)
-            CompositorSetupProcess(t->child, winX + WM_BORDER_WIDTH,
-                                   winY + WM_TITLE_BAR_HEIGHT + WM_BORDER_WIDTH,
-                                   clientW, clientH, 1);
+            // Set up compositor dest coords — terminal VFB is already set by TerminalCreate.
+            // Do NOT call CompositorSetupProcess (it would allocate a new VFB).
+            t->child->fbDestX = winX + WM_BORDER_WIDTH;
+            t->child->fbDestY = winY + WM_TITLE_BAR_HEIGHT + WM_BORDER_WIDTH;
+            t->child->fbScale = 1;
+            t->child->fbDirty = 1;
 
             WmCreateWindow(t->child, winX, winY,
                           static_cast<uint16_t>(clientW),
