@@ -331,6 +331,42 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
                                static_cast<uint32_t>(count));
     }
 
+    // Write to /dev/tty — writes to stdout pipe (rendered by terminal thread)
+    if (fde->type == FdType::DevTty && fde->handle)
+    {
+        auto* pair = static_cast<TtyDevicePair*>(fde->handle);
+        auto* pipe = static_cast<PipeBuffer*>(pair->writePipe);
+        const char* src = reinterpret_cast<const char*>(bufAddr);
+        uint64_t written = 0;
+
+        while (written < count)
+        {
+            if (__atomic_load_n(&pipe->readers, __ATOMIC_ACQUIRE) == 0)
+                return written > 0 ? static_cast<int64_t>(written) : -EPIPE;
+
+            uint32_t chunk = pipe->write(src + written,
+                static_cast<uint32_t>(count - written > 4096 ? 4096 : count - written));
+            written += chunk;
+            if (written > 0)
+            {
+                Process* reader = pipe->readerWaiter;
+                if (reader)
+                {
+                    pipe->readerWaiter = nullptr;
+                    __atomic_store_n(&reader->pendingWakeup, 1, __ATOMIC_RELEASE);
+                    SchedulerUnblock(reader);
+                }
+                break;
+            }
+            Process* self = ProcessCurrent();
+            pipe->writerWaiter = self;
+            SchedulerBlock(self);
+            if (HasPendingSignals())
+                return written > 0 ? static_cast<int64_t>(written) : -EINTR;
+        }
+        return static_cast<int64_t>(written);
+    }
+
     return -EBADF;
 }
 
@@ -613,6 +649,31 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                                static_cast<uint32_t>(count));
     }
 
+    // Read from /dev/tty — reads from stdin pipe
+    if (fde->type == FdType::DevTty && fde->handle)
+    {
+        auto* pair = static_cast<TtyDevicePair*>(fde->handle);
+        auto* pipe = static_cast<PipeBuffer*>(pair->readPipe);
+        auto* dst = reinterpret_cast<char*>(bufAddr);
+
+        for (;;)
+        {
+            uint32_t got = pipe->read(dst, static_cast<uint32_t>(
+                count > 4096 ? 4096 : count));
+            if (got > 0) return static_cast<int64_t>(got);
+
+            uint32_t wr = __atomic_load_n(&pipe->writers, __ATOMIC_ACQUIRE);
+            if (wr == 0) return 0;
+
+            Process* self = ProcessCurrent();
+            pipe->readerWaiter = self;
+            extern volatile uint64_t g_lapicTickCount;
+            self->wakeupTick = g_lapicTickCount + 10;
+            SchedulerBlock(self);
+            if (HasPendingSignals()) return -EINTR;
+        }
+    }
+
     return -EBADF;
 }
 
@@ -689,15 +750,21 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     // raw keyboard events from the input subsystem.
     if (StrEq(path, "/dev/tty") || StrEq(path, "/dev/console"))
     {
-        if (proc->fds[0].type == FdType::Pipe && proc->fds[0].handle)
+        if (proc->fds[0].type == FdType::Pipe && proc->fds[0].handle &&
+            proc->fds[1].type == FdType::Pipe && proc->fds[1].handle)
         {
-            // Terminal mode: dup stdin pipe for /dev/tty
-            int fd = FdAlloc(proc, FdType::Pipe, proc->fds[0].handle);
-            if (fd < 0) return -EMFILE;
-            proc->fds[fd].flags = proc->fds[0].flags;
+            // Terminal mode: /dev/tty reads from stdin pipe, writes to stdout pipe
+            auto* pair = static_cast<TtyDevicePair*>(kmalloc(sizeof(TtyDevicePair)));
+            if (!pair) return -ENOMEM;
+            pair->readPipe = proc->fds[0].handle;
+            pair->writePipe = proc->fds[1].handle;
+            int fd = FdAlloc(proc, FdType::DevTty, pair);
+            if (fd < 0) { kfree(pair); return -EMFILE; }
             proc->fds[fd].statusFlags = 2; // O_RDWR
-            auto* pipe = static_cast<PipeBuffer*>(proc->fds[0].handle);
-            __atomic_fetch_add(&pipe->readers, 1, __ATOMIC_RELEASE);
+            auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
+            auto* wp = static_cast<PipeBuffer*>(pair->writePipe);
+            __atomic_fetch_add(&rp->readers, 1, __ATOMIC_RELEASE);
+            __atomic_fetch_add(&wp->writers, 1, __ATOMIC_RELEASE);
             return fd;
         }
         int fd = FdAlloc(proc, FdType::DevKeyboard, nullptr);
@@ -2608,7 +2675,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
     // Also handle any fd that is a TTY device (e.g. fd 63 from /dev/tty dup)
     bool isTtyFd = (fd <= 2) || (fde->type == FdType::DevKeyboard) ||
                    (fde->type == FdType::Vnode && !fde->handle) ||
-                   (fde->type == FdType::Pipe);
+                   (fde->type == FdType::Pipe) || (fde->type == FdType::DevTty);
     if (isTtyFd && cmd == 0x5401)
     {
         auto* t = reinterpret_cast<uint32_t*>(arg);
@@ -3390,6 +3457,24 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
             continue;
         }
 
+        // /dev/tty: check read pipe for POLLIN, write pipe always ready for POLLOUT
+        if (fde->type == FdType::DevTty && fde->handle)
+        {
+            auto* pair = static_cast<TtyDevicePair*>(fde->handle);
+            if (fds[i].events & POLLIN)
+            {
+                auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
+                if (rp->count() > 0 || rp->writers == 0)
+                {
+                    fds[i].revents |= POLLIN;
+                }
+            }
+            if (fds[i].events & POLLOUT)
+                fds[i].revents |= POLLOUT;
+            if (fds[i].revents) ready++;
+            continue;
+        }
+
         // Default: assume ready for whatever was asked
         fds[i].revents = fds[i].events;
         ready++;
@@ -3417,6 +3502,12 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
             }
             if (fde->type == FdType::DevKeyboard && (fds[i].events & POLLIN))
                 InputAddWaiter(self);
+            if (fde->type == FdType::DevTty && fde->handle && (fds[i].events & POLLIN))
+            {
+                auto* pair = static_cast<TtyDevicePair*>(fde->handle);
+                auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
+                rp->readerWaiter = self;
+            }
         }
 
         // Re-check data availability after registration.

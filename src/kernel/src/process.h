@@ -181,6 +181,12 @@ enum class FdType : uint8_t
     DevNull,       // /dev/null — discard writes, EOF on read
     SyntheticMem,  // In-memory synthetic file (e.g. /etc/passwd)
     Socket,        // Network socket (UDP/TCP)
+    DevTty,        // /dev/tty — bidirectional terminal (read=stdin pipe, write=stdout pipe)
+};
+
+struct TtyDevicePair {
+    void* readPipe;   // PipeBuffer* for stdin
+    void* writePipe;  // PipeBuffer* for stdout
 };
 
 struct FdEntry
