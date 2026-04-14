@@ -1574,6 +1574,43 @@ static int UintToStr(char* buf, uint32_t val)
 
 static void DebugHandleCommand(const char* cmd, uint32_t len);
 
+// Quick TCP connect with short timeout — for local debug channel only.
+// Returns 0 on success, negative errno on failure.
+static int SockConnectFast(int sockIdx, const SockAddrIn* addr)
+{
+    Socket& s = g_sockets[sockIdx];
+    s.remoteIp = addr->sin_addr;
+    s.remotePort = addr->sin_port;
+
+    if (!s.bound) {
+        s.localPort = htons(g_tcpEphemeralPort++);
+        s.localIp = g_netIf ? g_netIf->ipAddr : 0;
+        s.bound = true;
+    }
+
+    s.tcpSndIss = static_cast<uint32_t>(g_ipId) * 12345 +
+                  ntohs(s.localPort) * 67890;
+    s.tcpSndNxt = s.tcpSndIss;
+    s.tcpSndUna = s.tcpSndIss;
+    s.tcpRcvNxt = 0;
+    s.tcpFinRecv = false;
+    s.tcpState = TcpState::SynSent;
+
+    TcpSendSegment(s, TCP_SYN, nullptr, 0);
+    s.tcpSndNxt++;
+
+    // Very short wait — SLIRP responds in <10ms if server is listening
+    for (int i = 0; i < 200000; i++) {
+        if (g_netIf && g_netIf->poll) g_netIf->poll(g_netIf);
+        if (s.tcpState == TcpState::Established) return 0;
+        if (s.tcpState == TcpState::Closed) return -111;
+        __asm__ volatile("pause");
+    }
+
+    s.tcpState = TcpState::Closed;
+    return -110; // ETIMEDOUT
+}
+
 void DebugChannelInit()
 {
     // Connect to 10.0.2.2:9999 (QEMU host gateway)
@@ -1589,9 +1626,9 @@ void DebugChannelInit()
     addr.sin_port = htons(9999);
     addr.sin_addr = htonl(0x0A000202); // 10.0.2.2
 
-    int ret = SockConnect(idx, &addr);
+    int ret = SockConnectFast(idx, &addr);
     if (ret < 0) {
-        SerialPrintf("debug: connect to 10.0.2.2:9999 failed (%d) — no debug server\n", ret);
+        SerialPrintf("debug: no debug server on 10.0.2.2:9999 (skipped)\n");
         SockClose(idx);
         return;
     }
