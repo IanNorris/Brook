@@ -609,11 +609,16 @@ void TerminalWriteInput(int termIdx, const char* data, uint32_t len)
             continue;
         }
 
-        // Local echo for printable input
-        char echo = ch;
-        if (echo == '\r') echo = '\n';
-        if (echo >= 32 || echo == '\n' || echo == '\b')
-            TermRenderGlyph(t, echo);
+        // Local echo: only when the child process has ECHO enabled.
+        // When readline/bash disables ECHO (raw mode), it handles display
+        // itself via stdout writes which the terminal thread renders.
+        if (t->child && t->child->ttyEcho)
+        {
+            char echo = ch;
+            if (echo == '\r') echo = '\n';
+            if (echo >= 32 || echo == '\n' || echo == '\b')
+                TermRenderGlyph(t, echo);
+        }
     }
     t->dirty = true;
     t->child->fbDirty = 1;
