@@ -660,7 +660,7 @@ Vnode* VfsOpen(const char* path, int flags)
     }
     kfree(dir);
 
-    SerialPrintf("VFS: cannot open '%s' (fatpath='%s')\n", path, fatPath);
+    DbgPrintf("VFS: cannot open '%s' (fatpath='%s')\n", path, fatPath);
     return nullptr;
 }
 
