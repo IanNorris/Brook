@@ -1103,6 +1103,30 @@ int ProcessSendSignal(Process* proc, int signum)
         return 0;
     }
 
+    if (signum == SIGSTOP)
+    {
+        // Immediately stop (cannot be caught/blocked)
+        proc->state = ProcessState::Stopped;
+        DbgPrintf("SIGNAL: SIGSTOP -> pid %u stopped\n", proc->pid);
+        return 0;
+    }
+
+    // SIGCONT: resume stopped process (always, even if blocked/ignored)
+    static constexpr int SIGCONT = 18;
+    if (signum == SIGCONT)
+    {
+        if (proc->state == ProcessState::Stopped)
+        {
+            proc->state = ProcessState::Ready;
+            SchedulerEnqueue(proc);
+            DbgPrintf("SIGNAL: SIGCONT -> pid %u resumed\n", proc->pid);
+        }
+        // Still deliver SIGCONT if a handler is registered
+        uint64_t bit = 1ULL << (signum - 1);
+        __atomic_or_fetch(&proc->sigPending, bit, __ATOMIC_RELEASE);
+        return 0;
+    }
+
     uint64_t bit = 1ULL << (signum - 1);
     __atomic_or_fetch(&proc->sigPending, bit, __ATOMIC_RELEASE);
 
@@ -1167,8 +1191,17 @@ bool ProcessDeliverSignal(Process* proc, uint64_t* userRip, uint64_t* userRsp,
             DbgPrintf("SIGNAL: default terminate pid %u by signal %d\n", proc->pid, signum);
             return false; // context not modified — process is dead
         case 17: // SIGCHLD — default is ignore
-        case 20: // SIGTSTP — ignore for now
         case 28: // SIGWINCH — ignore
+            return false;
+        case 19: // SIGSTOP — handled in ProcessSendSignal (can't be caught)
+            return false;
+        case 20: // SIGTSTP — default is stop
+        case 21: // SIGTTIN — default is stop
+        case 22: // SIGTTOU — default is stop
+            proc->state = ProcessState::Stopped;
+            DbgPrintf("SIGNAL: pid %u stopped by signal %d\n", proc->pid, signum);
+            return false;
+        case 18: // SIGCONT — default is resume (handled in SendSignal), ignore here
             return false;
         default:
             return false; // ignore unknown

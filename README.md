@@ -131,10 +131,6 @@ docs/
 - [TCC](https://bellard.org/tcc/) — Tiny C Compiler
 - [Hack font](https://sourcefoundry.org/hack/) — terminal font
 
-## Legal
-
-See [LEGAL.md](LEGAL.md) for notes on the clean-room Windows ABI compatibility layer.
-
 ## License
 
 MIT — see [LICENSE](LICENSE).

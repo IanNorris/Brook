@@ -62,6 +62,7 @@ enum class ProcessState : uint8_t
     Ready,          // In the run queue, eligible for scheduling
     Running,        // Currently executing on CPU
     Blocked,        // Waiting (sleep, I/O, mutex) — not in run queue
+    Stopped,        // Suspended by signal (SIGTSTP/SIGSTOP) — not in run queue
     Terminated,     // Finished, awaiting cleanup
 };
 

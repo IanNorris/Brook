@@ -452,16 +452,14 @@ void SchedulerBlock(Process* proc)
 void SchedulerUnblock(Process* proc)
 {
     uint64_t rlf4 = SchedLockAcquire(g_readyLock);
-    // The process must be fully Blocked (state=Blocked AND no longer running
-    // on any CPU). Between SchedulerBlock setting state=Blocked and DoSwitch
-    // clearing runningOnCpu, the process is in a transient state visible to
-    // other CPUs — we must not unblock it until the context switch completes.
-    if (proc->state != ProcessState::Blocked)
+    // Accept Blocked or Stopped processes for unblocking/resuming
+    if (proc->state != ProcessState::Blocked && proc->state != ProcessState::Stopped)
     {
         SchedLockRelease(g_readyLock, rlf4);
         return;
     }
-    if (__atomic_load_n(&proc->runningOnCpu, __ATOMIC_ACQUIRE) != -1)
+    if (proc->state == ProcessState::Blocked &&
+        __atomic_load_n(&proc->runningOnCpu, __ATOMIC_ACQUIRE) != -1)
     {
         // Process is Blocked but still mid-context-switch on another CPU.
         // We can't insert it into the ready queue yet.  Set pendingWakeup
@@ -720,7 +718,8 @@ void SchedulerYield()
         // Switch to the idle process so the CPU is available for other work
         // and the blocked process can be properly rescheduled when unblocked.
         if (old->state == ProcessState::Blocked ||
-            old->state == ProcessState::Terminated)
+            old->state == ProcessState::Terminated ||
+            old->state == ProcessState::Stopped)
         {
             next = g_perCpu[cpu].idleProcess;
             DoSwitch(old, next);
