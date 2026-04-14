@@ -57,15 +57,18 @@ static uint64_t g_lastForceBlitTick = 0;
 
 void CompositorInit()
 {
-    uint32_t* pixels;
+    // Get the physical framebuffer address so we can map the real MMIO,
+    // not the backbuffer that TtyGetFramebuffer() might return if a
+    // display driver (bochs) has already called CompositorRemap.
+    uint64_t fbPhysBase;
     uint32_t w, h, strideBytes;
-    if (!TtyGetFramebuffer(&pixels, &w, &h, &strideBytes))
+    if (!TtyGetFramebufferPhys(&fbPhysBase, &w, &h, &strideBytes))
     {
         SerialPuts("COMPOSITOR: no framebuffer available\n");
         return;
     }
 
-    g_physFb       = reinterpret_cast<volatile uint32_t*>(pixels);
+    g_physFb       = reinterpret_cast<volatile uint32_t*>(PhysToVirt(PhysicalAddress(fbPhysBase)).raw());
     g_physFbWidth  = w;
     g_physFbHeight = h;
     g_physFbStride = strideBytes / 4; // convert byte stride to pixel stride
