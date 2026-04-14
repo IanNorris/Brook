@@ -33,9 +33,16 @@ extern "C" brook::KernelSymbol __stop_ksymtab[];
 // Bring all brook:: names into scope so EXPORT_SYMBOL(fn) resolves correctly.
 using namespace brook;
 
+// Non-inline wrapper for PhysToVirt (inlined in header, but modules need a callable symbol).
+extern "C" uint64_t KsymPhysToVirt(uint64_t physAddr)
+{
+    return PhysToVirt(PhysicalAddress(physAddr)).raw();
+}
+
 // Memory
 EXPORT_SYMBOL(kmalloc);
 EXPORT_SYMBOL(kfree);
+EXPORT_SYMBOL(krealloc);
 
 // Formatted output
 EXPORT_SYMBOL(KPrintf);
@@ -52,6 +59,7 @@ EXPORT_SYMBOL(PmmFreePage);
 EXPORT_SYMBOL(VmmAllocPages);
 EXPORT_SYMBOL(VmmFreePages);
 EXPORT_SYMBOL(VmmVirtToPhys);
+EXPORT_SYMBOL(KsymPhysToVirt);
 // Also export with mangled names for C++ modules that include the header.
 EXPORT_SYMBOL_NAMED(VmmAllocPages, "_ZN5brook13VmmAllocPagesEmmNS_6MemTagEt");
 EXPORT_SYMBOL_NAMED(VmmVirtToPhys, "_ZN5brook13VmmVirtToPhysENS_9PageTableENS_14VirtualAddressE");
@@ -128,6 +136,13 @@ EXPORT_SYMBOL(InputWakeWaiters);
 
 // Scheduler — for dynamic policy modules
 EXPORT_SYMBOL(SchedulerRegisterPolicy);
+EXPORT_SYMBOL(SchedulerBlock);
+EXPORT_SYMBOL(SchedulerUnblock);
+
+// Process
+EXPORT_SYMBOL(ProcessCurrent);
+EXPORT_SYMBOL(ProcessFindByPid);
+EXPORT_SYMBOL(ProcessSendSignal);
 
 // Panic
 EXPORT_SYMBOL(KernelPanic);
