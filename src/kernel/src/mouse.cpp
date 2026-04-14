@@ -11,24 +11,13 @@
 #include "apic.h"
 #include "serial.h"
 #include "kprintf.h"
+#include "portio.h"
 
 namespace brook {
 
 // ---------------------------------------------------------------------------
 // Port I/O
 // ---------------------------------------------------------------------------
-
-static inline uint8_t inb(uint16_t port)
-{
-    uint8_t val;
-    __asm__ volatile("inb %1, %0" : "=a"(val) : "Nd"(port));
-    return val;
-}
-
-static inline void outb(uint16_t port, uint8_t val)
-{
-    __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
-}
 
 // Wait for the 8042 input buffer to be empty (ready to accept a command).
 static void WaitWrite()

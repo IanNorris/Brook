@@ -1,5 +1,6 @@
 #include "virtio_blk.h"
 #include "pci.h"
+#include "portio.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "memory/heap.h"
@@ -7,40 +8,6 @@
 #include "mem_tag.h"
 
 namespace brook {
-
-// ---- Port I/O ----
-
-static inline void outb(uint16_t port, uint8_t val)
-{
-    __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
-}
-
-static inline void outl(uint16_t port, uint32_t val)
-{
-    __asm__ volatile("outl %0, %1" : : "a"(val), "Nd"(port));
-}
-
-static inline uint32_t inl(uint16_t port)
-{
-    uint32_t val;
-    __asm__ volatile("inl %1, %0" : "=a"(val) : "Nd"(port));
-    return val;
-}
-
-static inline uint16_t inw(uint16_t port)
-{
-    uint16_t val;
-    __asm__ volatile("inw %1, %0" : "=a"(val) : "Nd"(port));
-    return val;
-}
-
-// inb — available for future 8-bit register reads (e.g. ISR status).
-[[maybe_unused]] static inline uint8_t inb(uint16_t port)
-{
-    uint8_t val;
-    __asm__ volatile("inb %1, %0" : "=a"(val) : "Nd"(port));
-    return val;
-}
 
 // ---- virtio-blk PCI register offsets (legacy BAR0 I/O) ----
 
