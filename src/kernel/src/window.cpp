@@ -482,4 +482,13 @@ void WmRenderChrome(uint32_t* backBuffer, uint32_t stride,
     }
 }
 
+void WmRenderChromeForWindow(uint32_t* backBuffer, uint32_t stride,
+                              uint32_t screenW, uint32_t screenH, int idx)
+{
+    if (!g_wmActive || idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
+    const Window& w = g_windows[idx];
+    if (!w.proc || !w.visible) return;
+    RenderWindowChrome(backBuffer, stride, screenW, screenH, w);
+}
+
 } // namespace brook

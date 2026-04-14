@@ -533,13 +533,16 @@ static void CompositorLoopWM()
         p->fbDestX = w->clientX();
         p->fbDestY = w->clientY();
 
+        // Blit content then chrome per-window so z-order is respected.
+        // (Previously chrome was drawn after ALL content, so a background
+        // window's border could overwrite a foreground window's content.)
         if (p->fbVirtual && p->fbVfbWidth > 0)
             BlitProcessAt(p, w->clientX(), w->clientY(), true, w->upscale);
-    }
 
-    // 3. Draw window chrome (title bars, borders, buttons)
-    if (g_backBuffer)
-        WmRenderChrome(g_backBuffer, g_backBufStride, g_physFbWidth, g_physFbHeight);
+        if (g_backBuffer)
+            WmRenderChromeForWindow(g_backBuffer, g_backBufStride,
+                                     g_physFbWidth, g_physFbHeight, sorted[i]);
+    }
 
     // 4. Handle mouse interaction
     CompositorHandleMouseWM();

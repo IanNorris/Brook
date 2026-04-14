@@ -2170,7 +2170,30 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
         if (!TtyGetFramebufferPhys(&physBase, &fbW, &fbH, &fbStride))
             return -ENODEV;
 
-        // If process has a virtual framebuffer, report its dimensions instead.
+        // Auto-create a VFB + WM window when a process without one queries
+        // the framebuffer in WM mode. This handles programs launched from
+        // bash that open /dev/fb0 (e.g. DOOM) — they need a composited VFB.
+        if (!proc->fbVirtual && WmIsActive() &&
+            (cmd == FBIOGET_VSCREENINFO || cmd == FBIOGET_FSCREENINFO))
+        {
+            static uint32_t s_autoWinCount = 0;
+            int16_t winX = static_cast<int16_t>(60 + (s_autoWinCount % 6) * 40);
+            int16_t winY = static_cast<int16_t>(60 + (s_autoWinCount % 6) * 40);
+
+            CompositorSetupProcess(proc,
+                                   winX + static_cast<int16_t>(WM_BORDER_WIDTH),
+                                   winY + static_cast<int16_t>(WM_TITLE_BAR_HEIGHT + WM_BORDER_WIDTH),
+                                   fbW, fbH, 1);
+
+            WmCreateWindow(proc, winX, winY,
+                          static_cast<uint16_t>(fbW),
+                          static_cast<uint16_t>(fbH),
+                          proc->name);
+
+            s_autoWinCount++;
+            SerialPrintf("sys_ioctl: auto-created WM window for pid %u (%ux%u)\n",
+                         proc->pid, fbW, fbH);
+        }
         uint32_t repW = (proc->fbVfbWidth  > 0) ? proc->fbVfbWidth  : fbW;
         uint32_t repH = (proc->fbVfbHeight > 0) ? proc->fbVfbHeight : fbH;
         uint32_t repStride = repW * 4; // bytes per line

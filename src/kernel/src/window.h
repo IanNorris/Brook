@@ -118,6 +118,10 @@ void WmMoveWindow(int idx, int16_t newX, int16_t newY);
 void WmRenderChrome(uint32_t* backBuffer, uint32_t stride,
                     uint32_t screenW, uint32_t screenH);
 
+// Render chrome for a single window (used when interleaving content + chrome per z-layer).
+void WmRenderChromeForWindow(uint32_t* backBuffer, uint32_t stride,
+                              uint32_t screenW, uint32_t screenH, int idx);
+
 // Check if window manager mode is active.
 bool WmIsActive();
 

@@ -588,6 +588,23 @@ void TerminalWriteInput(int termIdx, const char* data, uint32_t len)
     if (!t->active) return;
 
     auto* pipe = static_cast<PipeBuffer*>(t->stdinPipe);
+
+    // Local echo: if the child process has ttyEcho set, render typed
+    // characters directly into the terminal VFB. Without this, chars
+    // only appear when bash writes them back via stdout (after Enter).
+    if (t->child && t->child->ttyEcho)
+    {
+        for (uint32_t i = 0; i < len; i++)
+        {
+            char ch = data[i];
+            if (ch == '\r') ch = '\n'; // treat CR as newline for rendering
+            TermRenderGlyph(t, ch);
+        }
+        t->dirty = true;
+        t->child->fbDirty = 1;
+        CompositorWake();
+    }
+
     pipe->write(data, len);
 
     // Wake bash if it's blocked on stdin read
