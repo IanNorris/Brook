@@ -2592,14 +2592,29 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
             if (proc->ttyCanonical) lflag |= 0x0002; // ICANON
             if (proc->ttyEcho)      lflag |= 0x0008; // ECHO
             t[3] = lflag;
-            auto* cc = reinterpret_cast<uint8_t*>(&t[4]);
-            cc[0] = 0;
-            __builtin_memset(&cc[1], 0, 19);
-            cc[1] = 0x03;  // VINTR
-            cc[2] = 0x1C;  // VQUIT
-            cc[3] = 0x7F;  // VERASE
-            cc[4] = 0x15;  // VKILL
-            cc[5] = 0x04;  // VEOF
+            // c_line at offset 16
+            auto* raw = reinterpret_cast<uint8_t*>(&t[4]);
+            raw[0] = 0;  // c_line = N_TTY
+            // c_cc starts at offset 17 (raw[1])
+            auto* cc = &raw[1];
+            __builtin_memset(cc, 0, 19); // NCCS = 19 for old termios
+            cc[0]  = 0x03;  // VINTR  = Ctrl+C
+            cc[1]  = 0x1C;  // VQUIT  = Ctrl+backslash
+            cc[2]  = 0x7F;  // VERASE = DEL
+            cc[3]  = 0x15;  // VKILL  = Ctrl+U
+            cc[4]  = 0x04;  // VEOF   = Ctrl+D
+            cc[5]  = 0;     // VTIME  = 0
+            cc[6]  = 1;     // VMIN   = 1
+            cc[7]  = 0;     // VSWTC
+            cc[8]  = 0x11;  // VSTART = Ctrl+Q (XON)
+            cc[9]  = 0x13;  // VSTOP  = Ctrl+S (XOFF)
+            cc[10] = 0x1A;  // VSUSP  = Ctrl+Z
+            cc[11] = 0;     // VEOL
+            cc[12] = 0x12;  // VREPRINT = Ctrl+R
+            cc[13] = 0x0F;  // VDISCARD = Ctrl+O
+            cc[14] = 0x17;  // VWERASE = Ctrl+W
+            cc[15] = 0x16;  // VLNEXT  = Ctrl+V
+            cc[16] = 0;     // VEOL2
             return 0;
         }
 
@@ -2686,14 +2701,27 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
         if (proc->ttyCanonical) lflag |= 0x0002; // ICANON
         if (proc->ttyEcho)      lflag |= 0x0008; // ECHO
         t[3] = lflag;
-        auto* cc = reinterpret_cast<uint8_t*>(&t[4]);
-        cc[0] = 0;
-        __builtin_memset(&cc[1], 0, 19);
-        cc[1] = 0x03;  // VINTR = Ctrl+C
-        cc[2] = 0x1C;  // VQUIT = Ctrl+backslash
-        cc[3] = 0x7F;  // VERASE = DEL
-        cc[4] = 0x15;  // VKILL = Ctrl+U
-        cc[5] = 0x04;  // VEOF = Ctrl+D
+        auto* raw = reinterpret_cast<uint8_t*>(&t[4]);
+        raw[0] = 0;  // c_line = N_TTY
+        auto* cc = &raw[1];
+        __builtin_memset(cc, 0, 19);
+        cc[0]  = 0x03;  // VINTR  = Ctrl+C
+        cc[1]  = 0x1C;  // VQUIT  = Ctrl+backslash
+        cc[2]  = 0x7F;  // VERASE = DEL
+        cc[3]  = 0x15;  // VKILL  = Ctrl+U
+        cc[4]  = 0x04;  // VEOF   = Ctrl+D
+        cc[5]  = 0;     // VTIME  = 0
+        cc[6]  = 1;     // VMIN   = 1
+        cc[7]  = 0;     // VSWTC
+        cc[8]  = 0x11;  // VSTART = Ctrl+Q
+        cc[9]  = 0x13;  // VSTOP  = Ctrl+S
+        cc[10] = 0x1A;  // VSUSP  = Ctrl+Z
+        cc[11] = 0;     // VEOL
+        cc[12] = 0x12;  // VREPRINT = Ctrl+R
+        cc[13] = 0x0F;  // VDISCARD = Ctrl+O
+        cc[14] = 0x17;  // VWERASE = Ctrl+W
+        cc[15] = 0x16;  // VLNEXT  = Ctrl+V
+        cc[16] = 0;     // VEOL2
         return 0;
     }
     if (isTtyFd && cmd >= 0x5402 && cmd <= 0x5404)

@@ -631,6 +631,30 @@ static void CompositorLoopWM()
                     char ch = ev.ascii;
                     TerminalWriteInput(static_cast<int>(ti), &ch, 1);
                 }
+                else if (ev.type == InputEventType::KeyPress)
+                {
+                    // Convert extended scancodes to ANSI escape sequences
+                    const char* seq = nullptr;
+                    switch (ev.scanCode)
+                    {
+                    case SC_EXT_UP:     seq = "\x1b[A"; break;
+                    case SC_EXT_DOWN:   seq = "\x1b[B"; break;
+                    case SC_EXT_RIGHT:  seq = "\x1b[C"; break;
+                    case SC_EXT_LEFT:   seq = "\x1b[D"; break;
+                    case SC_EXT_HOME:   seq = "\x1b[H"; break;
+                    case SC_EXT_END:    seq = "\x1b[F"; break;
+                    case SC_EXT_INSERT: seq = "\x1b[2~"; break;
+                    case SC_EXT_DELETE: seq = "\x1b[3~"; break;
+                    case SC_EXT_PGUP:   seq = "\x1b[5~"; break;
+                    case SC_EXT_PGDN:   seq = "\x1b[6~"; break;
+                    }
+                    if (seq)
+                    {
+                        uint32_t slen = 0;
+                        while (seq[slen]) slen++;
+                        TerminalWriteInput(static_cast<int>(ti), seq, slen);
+                    }
+                }
                 routed = true;
                 break;
             }

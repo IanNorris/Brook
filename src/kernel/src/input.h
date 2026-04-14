@@ -44,6 +44,19 @@ static constexpr uint8_t INPUT_MOD_CAPSLOCK = (1 << 4);
 
 static constexpr uint8_t INPUT_MOD_SHIFT = (INPUT_MOD_LSHIFT | INPUT_MOD_RSHIFT);
 
+// Extended scan codes (E0-prefixed keys). Values >= 0x80 avoid
+// collision with base scan code set 1.
+static constexpr uint8_t SC_EXT_UP     = 0x80;
+static constexpr uint8_t SC_EXT_DOWN   = 0x81;
+static constexpr uint8_t SC_EXT_LEFT   = 0x82;
+static constexpr uint8_t SC_EXT_RIGHT  = 0x83;
+static constexpr uint8_t SC_EXT_HOME   = 0x84;
+static constexpr uint8_t SC_EXT_END    = 0x85;
+static constexpr uint8_t SC_EXT_INSERT = 0x86;
+static constexpr uint8_t SC_EXT_DELETE = 0x87;
+static constexpr uint8_t SC_EXT_PGUP   = 0x88;
+static constexpr uint8_t SC_EXT_PGDN   = 0x89;
+
 // Per-device event ring buffer size (must be power of 2).
 static constexpr uint32_t INPUT_RING_SIZE = 64;
 

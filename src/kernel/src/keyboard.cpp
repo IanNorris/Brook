@@ -213,6 +213,7 @@ static volatile bool g_shiftHeld = false;
 static volatile bool g_ctrlHeld  = false;
 static volatile bool g_altHeld   = false;
 static volatile bool g_capsLock  = false;
+static volatile bool g_e0Prefix  = false; // E0-prefixed extended key pending
 
 // ---------------------------------------------------------------------------
 // IRQ1 interrupt handler
@@ -234,8 +235,49 @@ static void KbdIrqHandler(InterruptFrame* frame)
 
     uint8_t sc = inb(0x60); // read scan code from PS/2 data port
 
+    // Handle E0 prefix (extended keys: arrows, Home, End, etc.)
+    if (sc == 0xE0)
+    {
+        g_e0Prefix = true;
+        ApicSendEoi();
+        return;
+    }
+
     bool release = (sc & 0x80) != 0;
     uint8_t key  = sc & 0x7F;
+
+    // Map E0-prefixed scancodes to synthetic extended codes
+    bool isExtended = false;
+    if (g_e0Prefix)
+    {
+        g_e0Prefix = false;
+        isExtended = true;
+        switch (key)
+        {
+        case 0x48: key = SC_EXT_UP;     break;
+        case 0x50: key = SC_EXT_DOWN;   break;
+        case 0x4B: key = SC_EXT_LEFT;   break;
+        case 0x4D: key = SC_EXT_RIGHT;  break;
+        case 0x47: key = SC_EXT_HOME;   break;
+        case 0x4F: key = SC_EXT_END;    break;
+        case 0x52: key = SC_EXT_INSERT; break;
+        case 0x53: key = SC_EXT_DELETE; break;
+        case 0x49: key = SC_EXT_PGUP;   break;
+        case 0x51: key = SC_EXT_PGDN;   break;
+        case 0x1D: // R-Ctrl
+            g_ctrlHeld = !release;
+            ApicSendEoi();
+            return;
+        case 0x38: // R-Alt
+            g_altHeld = !release;
+            ApicSendEoi();
+            return;
+        default:
+            // Unknown E0 key — ignore
+            ApicSendEoi();
+            return;
+        }
+    }
 
     // Build modifier bitmask for the input event.
     uint8_t mods = 0;
@@ -244,15 +286,18 @@ static void KbdIrqHandler(InterruptFrame* frame)
     if (g_altHeld)   mods |= INPUT_MOD_ALT;
     if (g_capsLock)  mods |= INPUT_MOD_CAPSLOCK;
 
-    // Track modifier state.
-    if (key == 0x2A || key == 0x36)      // L-Shift or R-Shift
-        g_shiftHeld = !release;
-    else if (key == 0x1D)                // L-Ctrl (R-Ctrl is E0 1D, handled below)
-        g_ctrlHeld = !release;
-    else if (key == 0x38)                // L-Alt (R-Alt is E0 38)
-        g_altHeld = !release;
-    else if (key == 0x3A && !release)    // Caps Lock (toggle on press)
-        g_capsLock = !g_capsLock;
+    // Track modifier state (non-extended keys only).
+    if (!isExtended)
+    {
+        if (key == 0x2A || key == 0x36)      // L-Shift or R-Shift
+            g_shiftHeld = !release;
+        else if (key == 0x1D)                // L-Ctrl
+            g_ctrlHeld = !release;
+        else if (key == 0x38)                // L-Alt
+            g_altHeld = !release;
+        else if (key == 0x3A && !release)    // Caps Lock (toggle on press)
+            g_capsLock = !g_capsLock;
+    }
 
     // Push raw scan code event to input subsystem (for userspace consumers like DOOM).
     // All keys (including modifiers) and both press/release are forwarded.

@@ -539,7 +539,7 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     const char* bashEnvp[] = {
         "HOME=/",
         "PATH=/boot/BIN",
-        "TERM=dumb",
+        "TERM=linux",
         "PS1=$ ",
         nullptr
     };
