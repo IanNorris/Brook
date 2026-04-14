@@ -345,15 +345,6 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     {
         auto* buf = reinterpret_cast<uint8_t*>(bufAddr);
 
-        static uint32_t s_readLogCount = 0;
-        if (s_readLogCount < 5)
-        {
-            s_readLogCount++;
-            SerialPrintf("KB_READ: pid %u fd %lu canon=%d echo=%d flags=0x%x count=%lu\n",
-                         proc->pid, fd, proc->ttyCanonical ? 1 : 0,
-                         proc->ttyEcho ? 1 : 0, fde->flags, count);
-        }
-
         // Non-blocking raw scancode mode (DOOM uses ioctl cmd=1 to enable this)
         if (fde->flags & 1)
         {
@@ -415,26 +406,25 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
 
                 buf[bytesRead++] = static_cast<uint8_t>(c);
 
-                // Echo if enabled
-                if (proc->ttyEcho)
+                // Always echo in non-canonical mode. Bash without readline
+                // sets echo=0 expecting readline to handle it, but since
+                // libreadline.so isn't available, nothing would echo.
+                if (c == '\n')
                 {
-                    if (c == '\n')
-                    {
-                        SerialWriterEnqueue("\r\n", 2);
-                        TtyPutChar('\n');
-                    }
-                    else if (c >= ' ' && c <= '~')
-                    {
-                        SerialWriterEnqueue(&c, 1);
-                        TtyPutChar(c);
-                    }
-                    else if (c == '\x7f' || c == '\b')
-                    {
-                        SerialWriterEnqueue("\b \b", 3);
-                        TtyPutChar('\b');
-                        TtyPutChar(' ');
-                        TtyPutChar('\b');
-                    }
+                    SerialWriterEnqueue("\r\n", 2);
+                    TtyPutChar('\n');
+                }
+                else if (c >= ' ' && c <= '~')
+                {
+                    SerialWriterEnqueue(&c, 1);
+                    TtyPutChar(c);
+                }
+                else if (c == '\x7f' || c == '\b')
+                {
+                    SerialWriterEnqueue("\b \b", 3);
+                    TtyPutChar('\b');
+                    TtyPutChar(' ');
+                    TtyPutChar('\b');
                 }
             }
             return static_cast<int64_t>(bytesRead);
@@ -2194,12 +2184,8 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
             if (cur)
             {
                 uint32_t lflag = t[3];
-                bool canon = (lflag & 0x0002) != 0;
-                bool echo  = (lflag & 0x0008) != 0;
-                SerialPrintf("TCSETS: pid %u fd %lu lflag=0x%x canon=%d echo=%d\n",
-                             cur->pid, fd, lflag, canon ? 1 : 0, echo ? 1 : 0);
-                cur->ttyCanonical = canon;
-                cur->ttyEcho      = echo;
+                cur->ttyCanonical = (lflag & 0x0002) != 0; // ICANON
+                cur->ttyEcho      = (lflag & 0x0008) != 0; // ECHO
             }
             return 0;
         }
@@ -2260,12 +2246,8 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
         if (cur)
         {
             uint32_t lflag = t[3];
-            bool canon = (lflag & 0x0002) != 0;
-            bool echo  = (lflag & 0x0008) != 0;
-            SerialPrintf("TCSETS(generic): pid %u fd %lu lflag=0x%x canon=%d echo=%d\n",
-                         cur->pid, fd, lflag, canon ? 1 : 0, echo ? 1 : 0);
-            cur->ttyCanonical = canon;
-            cur->ttyEcho      = echo;
+            cur->ttyCanonical = (lflag & 0x0002) != 0; // ICANON
+            cur->ttyEcho      = (lflag & 0x0008) != 0; // ECHO
         }
         return 0;
     }
