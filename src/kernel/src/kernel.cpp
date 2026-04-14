@@ -443,9 +443,11 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             brook::MouseInit();
         }
 
-        // Activate APs — they will set up per-CPU state and enter the scheduler.
-        brook::SmpActivateAPs();
-        brook::KLog("SMP: all APs activated");
+        // Prepare APs — allocate per-CPU resources while BSP has no contention.
+        // Activation is deferred until just before SchedulerStart so APs don't
+        // contend on serial/heap locks while BSP finishes boot.
+        brook::SmpPrepareAPs();
+        brook::KLog("SMP: all APs prepared");
 
         brook::BootLogoProgress(100, "Ready");
         brook::KLog("BOOT: complete, entering shell/scheduler");
@@ -482,6 +484,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
         // Start the compositor kernel thread (blits VFBs to physical FB).
         brook::CompositorStartThread();
+
+        // Activate APs now — BSP is about to enter the scheduler.
+        brook::SmpActivateAPs();
 
         // Start the scheduler on all queued processes.
         if (brook::SchedulerReadyCount() > 0)

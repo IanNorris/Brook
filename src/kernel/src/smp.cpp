@@ -367,15 +367,13 @@ uint32_t SmpInit()
 // Forward-declare the syscall table getter (defined in syscall.cpp).
 uint64_t SyscallGetTableAddress();
 
-void SmpActivateAPs()
+void SmpPrepareAPs()
 {
     if (g_onlineCount <= 1)
         return;
 
-    KPrintf("SMP: activating %u APs for scheduling\n", g_onlineCount - 1);
+    KPrintf("SMP: preparing %u APs for scheduling\n", g_onlineCount - 1);
 
-    // Phase 1: prepare all APs (allocate resources while no APs are running).
-    // This avoids heap/VMM lock contention between the BSP and active APs.
     for (uint32_t i = 0; i < g_cpuCount && i < MAX_CPUS; ++i)
     {
         if (g_cpus[i].isBsp || !g_cpus[i].online)
@@ -411,8 +409,15 @@ void SmpActivateAPs()
         KPrintf("SMP: CPU %u prepared (TSS sel=0x%x, env=%p)\n",
                 i, g_apTssSelector[i], reinterpret_cast<void*>(env));
     }
+}
 
-    // Phase 2: activate all APs at once (no more BSP allocations needed).
+void SmpActivateAPs()
+{
+    if (g_onlineCount <= 1)
+        return;
+
+    // Signal all APs to start — they will init per-CPU state and enter
+    // SchedulerStartAp which waits for g_schedulerRunning.
     for (uint32_t i = 0; i < g_cpuCount && i < MAX_CPUS; ++i)
     {
         if (g_cpus[i].isBsp || !g_cpus[i].online)
