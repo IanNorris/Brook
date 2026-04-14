@@ -963,8 +963,11 @@ parent_done:
     uint32_t cpu = ThisCpu();
 
     // Wait for BSP to set g_schedulerRunning.
+    // Use hlt (woken by LAPIC timer) instead of pause to avoid starving
+    // the BSP which still needs to finish boot before calling SchedulerStart.
+    __asm__ volatile("sti");
     while (!__atomic_load_n(&g_schedulerRunning, __ATOMIC_ACQUIRE))
-        __asm__ volatile("pause" ::: "memory");
+        __asm__ volatile("hlt" ::: "memory");
 
     // Try to pick a process from the global queue.
     uint64_t rlf12 = SchedLockAcquire(g_readyLock);
