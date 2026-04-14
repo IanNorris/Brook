@@ -101,6 +101,7 @@ static constexpr uint64_t SYS_TGKILL          = 234;
 static constexpr uint64_t SYS_FACCESSAT       = 269;
 static constexpr uint64_t SYS_DUP3            = 292;
 static constexpr uint64_t SYS_RSEQ            = 334;
+static constexpr uint64_t SYS_PSELECT6        = 270;
 static constexpr uint64_t SYS_FACCESSAT2      = 439;
 
 // Syscall function type -- same signature as Linux: returns int64_t,

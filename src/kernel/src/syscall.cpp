@@ -2204,7 +2204,10 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
 
     // tcgetattr/tcsetattr arrive as ioctl on stdin (fd 0)
     // TCGETS = 0x5401, TCSETS/TCSETSW/TCSETSF = 0x5402-0x5404
-    if (fd <= 2 && cmd == 0x5401)
+    // Also handle any fd that is a TTY device (e.g. fd 63 from /dev/tty dup)
+    bool isTtyFd = (fd <= 2) || (fde->type == FdType::DevKeyboard) ||
+                   (fde->type == FdType::Vnode && !fde->handle);
+    if (isTtyFd && cmd == 0x5401)
     {
         auto* t = reinterpret_cast<uint32_t*>(arg);
         t[0] = 0x0500;   // c_iflag: ICRNL | IXON
@@ -2224,7 +2227,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
         cc[5] = 0x04;  // VEOF = Ctrl+D
         return 0;
     }
-    if (fd <= 2 && cmd >= 0x5402 && cmd <= 0x5404)
+    if (isTtyFd && cmd >= 0x5402 && cmd <= 0x5404)
     {
         auto* t = reinterpret_cast<const uint32_t*>(arg);
         Process* cur = ProcessCurrent();
@@ -2238,7 +2241,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
     }
 
     // TIOCGPGRP = 0x540F — get foreground process group
-    if (fd <= 2 && cmd == 0x540F)
+    if (isTtyFd && cmd == 0x540F)
     {
         auto* pgrp = reinterpret_cast<int*>(arg);
         Process* cur = ProcessCurrent();
@@ -2247,15 +2250,15 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
     }
 
     // TIOCSPGRP = 0x5410 — set foreground process group
-    if (fd <= 2 && cmd == 0x5410)
+    if (isTtyFd && cmd == 0x5410)
         return 0;
 
     // TIOCSCTTY = 0x540E — set controlling terminal
-    if (fd <= 2 && cmd == 0x540E)
+    if (isTtyFd && cmd == 0x540E)
         return 0;
 
     // TIOCGWINSZ = 0x5413 — terminal window size
-    if (fd <= 2 && cmd == 0x5413)
+    if (isTtyFd && cmd == 0x5413)
     {
         struct winsize { uint16_t ws_row, ws_col, ws_xpixel, ws_ypixel; };
         auto* ws = reinterpret_cast<winsize*>(arg);
@@ -3322,6 +3325,17 @@ static int64_t sys_select(uint64_t nfds, uint64_t readfdsAddr, uint64_t writefds
 }
 
 // ---------------------------------------------------------------------------
+// sys_pselect6 (270) — pselect6, delegate to sys_select (ignore sigmask)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_pselect6(uint64_t nfds, uint64_t readfdsAddr, uint64_t writefdsAddr,
+                             uint64_t exceptfdsAddr, uint64_t timeoutAddr, uint64_t sigmaskAddr)
+{
+    (void)sigmaskAddr;
+    return sys_select(nfds, readfdsAddr, writefdsAddr, exceptfdsAddr, timeoutAddr, 0);
+}
+
+// ---------------------------------------------------------------------------
 // sys_not_implemented
 // ---------------------------------------------------------------------------
 
@@ -3564,6 +3578,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_POLL]            = sys_poll;
     g_syscallTable[SYS_RT_SIGRETURN]    = sys_rt_sigreturn;
     g_syscallTable[SYS_SELECT]          = sys_select;
+    g_syscallTable[SYS_PSELECT6]        = sys_pselect6;
     g_syscallTable[SYS_SENDFILE]        = sys_sendfile;
     g_syscallTable[SYS_KILL]            = sys_kill;
     g_syscallTable[SYS_CHDIR]           = sys_chdir;
@@ -3678,7 +3693,7 @@ static const char* SyscallName(uint64_t num)
     case 230: return "clock_nanosleep"; case 231: return "exit_group";
     case 234: return "tgkill";    case 257: return "openat";
     case 262: return "newfstatat"; case 267: return "readlinkat";
-    case 271: return "ppoll";     case 273: return "set_robust_list";
+    case 270: return "pselect6";  case 271: return "ppoll";     case 273: return "set_robust_list";
     case 289: return "prlimit64"; case 292: return "dup3";
     case 293: return "pipe2";     case 302: return "rseq";
     case 318: return "getrandom"; case 334: return "faccessat";
