@@ -201,10 +201,11 @@ bool TtyInit(const Framebuffer& fb)
         for (uint32_t x = 0; x < g_fbWidth; x++)
             g_fbPixels[y * g_fbStride + x] = g_bgColor;
 
-    SerialPrintf("TTY: %ux%u framebuffer mapped at virt 0x%p, "
+    SerialPrintf("TTY: %ux%u framebuffer mapped at virt 0x%p phys 0x%lx, "
                  "font %upx (lineHeight=%u ascent=%u)\n",
                  g_fbWidth, g_fbHeight,
                  reinterpret_cast<void*>(fbVirt),
+                 physBase,
                  static_cast<uint32_t>(g_fontAtlas.lineHeight),
                  static_cast<uint32_t>(g_fontAtlas.lineHeight),
                  static_cast<uint32_t>(g_fontAtlas.ascent));

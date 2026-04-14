@@ -537,15 +537,10 @@ void CompositorUnregisterProcess(Process* proc)
 
 void CompositorRemap(uint64_t fbPhys, uint32_t w, uint32_t h, uint32_t stridePixels)
 {
-    // The TTY has already mapped the new framebuffer. Get its virtual pointer.
-    uint32_t* pixels;
-    uint32_t tw, th, tStride;
-    if (!TtyGetFramebuffer(&pixels, &tw, &th, &tStride)) {
-        SerialPuts("COMPOSITOR: CompositorRemap — TtyGetFramebuffer failed\n");
-        return;
-    }
-
-    g_physFb       = reinterpret_cast<volatile uint32_t*>(pixels);
+    // Map the MMIO framebuffer from its physical address via the direct map.
+    // We must NOT use TtyGetFramebuffer() here because it returns the
+    // backbuffer pointer (already redirected), not the real MMIO address.
+    g_physFb       = reinterpret_cast<volatile uint32_t*>(PhysToVirt(PhysicalAddress(fbPhys)).raw());
     g_physFbWidth  = w;
     g_physFbHeight = h;
     g_physFbStride = stridePixels;
@@ -563,7 +558,7 @@ void CompositorRemap(uint64_t fbPhys, uint32_t w, uint32_t h, uint32_t stridePix
         for (uint32_t y = 0; y < h; ++y)
             __builtin_memcpy(
                 g_backBuffer + y * stridePixels,
-                const_cast<uint32_t*>(reinterpret_cast<volatile uint32_t*>(pixels) + y * stridePixels),
+                const_cast<uint32_t*>(g_physFb + y * stridePixels),
                 w * 4);
         TtyRedirectToBackbuffer(g_backBuffer);
     }

@@ -1,0 +1,3 @@
+set tty full
+run --as BASH /boot/BIN/BASH /boot/SRC/demo.sh
+wait

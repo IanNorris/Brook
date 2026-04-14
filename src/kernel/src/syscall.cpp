@@ -207,7 +207,12 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
         {
             const char* buf = reinterpret_cast<const char*>(bufAddr);
             if (count > 0)
+            {
                 SerialWriterEnqueue(buf, static_cast<uint32_t>(count));
+                // Also render to framebuffer TTY so text is visible on-screen
+                for (uint64_t i = 0; i < count; i++)
+                    TtyPutChar(buf[i]);
+            }
             return static_cast<int64_t>(count);
         }
         // Fall through to FD-table-based write below
