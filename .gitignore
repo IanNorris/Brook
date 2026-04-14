@@ -22,6 +22,15 @@ compile_commands.json
 *.o
 *.a
 *.so
+*.so.*
+
+# Prebuilt binaries (fetched at build time, not tracked)
+bash_static
+bash_dynamic
+bash_dynamic_orig
+busybox_static
+dynlibs/
+tcc_sysroot/
 
 # QEMU runtime files
 OVMF_VARS.fd
@@ -36,5 +45,7 @@ brook_disk.img
 *.swo
 *~
 .DS_Store
+
+# Game data / large assets
 *.wad
 data/wallpaper.raw
