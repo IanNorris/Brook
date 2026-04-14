@@ -404,9 +404,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         brook::BootLogoProgress(75, "Network");
         brook::DhcpDiscover(brook::NetGetIf());
         // Quick DNS test
-        brook::DnsResolve("example.com");
+        // brook::DnsResolve("example.com");  // DISABLED for boot timing test
         // Try to connect debug channel to host
-        brook::DebugChannelInit();
+        // brook::DebugChannelInit();  // DISABLED for boot timing test
     }
 
     // ---- Syscall table ----
