@@ -737,6 +737,12 @@ static bool    g_wmDragging      = false;
 static int     g_wmDragWindow    = -1;
 static int16_t g_wmDragOffsetX   = 0;
 static int16_t g_wmDragOffsetY   = 0;
+static bool    g_wmResizing      = false;
+static int     g_wmResizeWindow  = -1;
+static int16_t g_wmResizeStartMX = 0;
+static int16_t g_wmResizeStartMY = 0;
+static uint16_t g_wmResizeStartW = 0;
+static uint16_t g_wmResizeStartH = 0;
 static bool    g_wmLastBtnDown   = false;
 
 static void CompositorHandleMouseWM()
@@ -820,6 +826,21 @@ static void CompositorHandleMouseWM()
                 }
                 break;
             }
+            case WmHitZone::ResizeCorner:
+            {
+                // Start resize drag
+                Window* w = WmGetWindow(hit.windowIndex);
+                if (w && w->state != WindowState::Maximized)
+                {
+                    g_wmResizing = true;
+                    g_wmResizeWindow = hit.windowIndex;
+                    g_wmResizeStartMX = static_cast<int16_t>(mx);
+                    g_wmResizeStartMY = static_cast<int16_t>(my);
+                    g_wmResizeStartW  = w->clientW;
+                    g_wmResizeStartH  = w->clientH;
+                }
+                break;
+            }
             default:
                 break;
             }
@@ -833,10 +854,40 @@ static void CompositorHandleMouseWM()
                      static_cast<int16_t>(mx - g_wmDragOffsetX),
                      static_cast<int16_t>(my - g_wmDragOffsetY));
     }
+    else if (btnDown && g_wmResizing)
+    {
+        // During resize drag, only update window dimensions (no VFB realloc).
+        // The actual VFB reallocation happens on release.
+        int16_t dx = static_cast<int16_t>(mx) - g_wmResizeStartMX;
+        int16_t dy = static_cast<int16_t>(my) - g_wmResizeStartMY;
+        int32_t newW = static_cast<int32_t>(g_wmResizeStartW) + dx;
+        int32_t newH = static_cast<int32_t>(g_wmResizeStartH) + dy;
+        if (newW < static_cast<int32_t>(WM_MIN_WIDTH))  newW = WM_MIN_WIDTH;
+        if (newH < static_cast<int32_t>(WM_MIN_HEIGHT)) newH = WM_MIN_HEIGHT;
+
+        // Update outer dimensions only — compositor will clip blit to VFB size
+        Window* w = WmGetWindow(g_wmResizeWindow);
+        if (w)
+        {
+            w->clientW = static_cast<uint16_t>(newW);
+            w->clientH = static_cast<uint16_t>(newH);
+        }
+    }
     else if (!btnDown)
     {
+        // On release, do the actual VFB resize if we were resizing
+        if (g_wmResizing && g_wmResizeWindow >= 0)
+        {
+            Window* w = WmGetWindow(g_wmResizeWindow);
+            if (w && w->proc)
+            {
+                WmResizeWindow(g_wmResizeWindow, w->clientW, w->clientH);
+            }
+        }
         g_wmDragging = false;
         g_wmDragWindow = -1;
+        g_wmResizing = false;
+        g_wmResizeWindow = -1;
     }
 
     g_wmLastBtnDown = btnDown;

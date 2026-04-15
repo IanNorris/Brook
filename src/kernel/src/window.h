@@ -132,6 +132,10 @@ void WmRestoreWindow(int idx);
 // Move a window to a new position.
 void WmMoveWindow(int idx, int16_t newX, int16_t newY);
 
+// Resize a window's client area.  For terminal windows, reallocates the VFB
+// and sends SIGWINCH.  For non-terminal windows, updates dimensions only.
+void WmResizeWindow(int idx, uint16_t newClientW, uint16_t newClientH);
+
 // Render window chrome (title bar, border, buttons) for all windows into backbuffer.
 // Called by compositor loop after blitting client areas.
 void WmRenderChrome(uint32_t* backBuffer, uint32_t stride,

@@ -51,4 +51,8 @@ Terminal* TerminalFindByProcess(Process* proc);
 // Shut down a terminal: kill child, stop thread, clean up.
 void TerminalClose(Terminal* t);
 
+// Resize a terminal's VFB and update character dimensions.
+// Sends SIGWINCH to the child process.
+void TerminalResize(Terminal* t, uint32_t newW, uint32_t newH);
+
 } // namespace brook

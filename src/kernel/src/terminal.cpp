@@ -929,4 +929,79 @@ void TerminalClose(Terminal* t)
         SchedulerUnblock(t->thread);
 }
 
+void TerminalResize(Terminal* t, uint32_t newW, uint32_t newH)
+{
+    if (!t || !t->active || newW == 0 || newH == 0) return;
+    if (newW == t->vfbW && newH == t->vfbH) return; // no change
+
+    // Allocate new VFB
+    uint32_t newSize = newW * newH * 4;
+    auto* newVfb = static_cast<uint32_t*>(kmalloc(newSize));
+    if (!newVfb) return;
+
+    // Fill with background colour
+    for (uint32_t i = 0; i < newW * newH; i++)
+        newVfb[i] = t->bgColor;
+
+    // Copy visible content from old VFB (row by row, clamped to min dimensions)
+    uint32_t copyW = (newW < t->vfbW) ? newW : t->vfbW;
+    uint32_t copyH = (newH < t->vfbH) ? newH : t->vfbH;
+    for (uint32_t y = 0; y < copyH; y++)
+    {
+        auto* src = t->vfb + y * t->vfbW;
+        auto* dst = newVfb + y * newW;
+        for (uint32_t x = 0; x < copyW; x++)
+            dst[x] = src[x];
+    }
+
+    // Free old VFBs (including alt screen if active)
+    if (t->inAltScreen && t->altVfb)
+    {
+        kfree(t->altVfb);
+        t->altVfb = nullptr;
+        t->inAltScreen = false;
+    }
+    kfree(t->vfb);
+
+    // Install new VFB
+    t->vfb  = newVfb;
+    t->vfbW = newW;
+    t->vfbH = newH;
+
+    // Recalculate character grid
+    uint32_t oldCols = t->cols;
+    uint32_t oldRows = t->rows;
+    t->cols = newW / static_cast<uint32_t>(g_fontAtlas.glyphs[0].advance);
+    t->rows = newH / static_cast<uint32_t>(g_fontAtlas.lineHeight);
+    if (t->cols == 0) t->cols = 1;
+    if (t->rows == 0) t->rows = 1;
+
+    // Clamp cursor to new dimensions
+    if (t->curX >= t->cols) t->curX = t->cols - 1;
+    if (t->curY >= t->rows) t->curY = t->rows - 1;
+
+    // Update child process VFB pointer
+    if (t->child)
+    {
+        t->child->fbVirtual    = t->vfb;
+        t->child->fbVfbWidth   = newW;
+        t->child->fbVfbHeight  = newH;
+        t->child->fbVfbStride  = newW;
+        t->child->fbDirty      = 1;
+    }
+
+    t->dirty = true;
+
+    KPrintf("TERMINAL: resized %ux%u -> %ux%u (%ux%u chars -> %ux%u chars)\n",
+            oldCols * static_cast<uint32_t>(g_fontAtlas.glyphs[0].advance),
+            oldRows * static_cast<uint32_t>(g_fontAtlas.lineHeight),
+            newW, newH, oldCols, oldRows, t->cols, t->rows);
+
+    // Send SIGWINCH to child process group
+    if (t->child && t->child->state != ProcessState::Terminated)
+    {
+        ProcessSendSignalToGroup(t->child->pgid, 28); // SIGWINCH
+    }
+}
+
 } // namespace brook

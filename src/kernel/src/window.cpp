@@ -395,6 +395,33 @@ void WmMoveWindow(int idx, int16_t newX, int16_t newY)
     w.y = newY;
 }
 
+void WmResizeWindow(int idx, uint16_t newClientW, uint16_t newClientH)
+{
+    if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
+    Window& w = g_windows[idx];
+    if (!w.proc) return;
+
+    // Enforce minimum size
+    if (newClientW < WM_MIN_WIDTH)  newClientW = WM_MIN_WIDTH;
+    if (newClientH < WM_MIN_HEIGHT) newClientH = WM_MIN_HEIGHT;
+
+    // Update window dimensions
+    w.clientW = newClientW;
+    w.clientH = newClientH;
+
+    // Check if this is a terminal window — resize its VFB
+    Terminal* t = TerminalFindByProcess(w.proc);
+    if (t)
+    {
+        TerminalResize(t, newClientW, newClientH);
+    }
+    else
+    {
+        // Non-terminal windows: just update dimensions
+        // (process VFB stays the same size — upscale will handle it)
+    }
+}
+
 void WmMinimizeWindow(int idx)
 {
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
