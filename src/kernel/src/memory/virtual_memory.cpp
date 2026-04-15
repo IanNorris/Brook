@@ -269,9 +269,9 @@ bool VmmMapPage(PageTable pt, VirtualAddress virtAddr, PhysicalAddress physAddr,
 
     *pte = (physAddr.raw() & PHYS_MASK)
          | VMM_PRESENT
-         | (flags & ~(VMM_PRESENT | PTE_TAG_MASK | PTE_PID_MASK | VMM_NO_EXEC))
+         | (flags & ~(VMM_PRESENT | PTE_TAG_MASK | PTE_COW_BIT | PTE_PID_MASK | VMM_NO_EXEC))
          | (((uint64_t)(uint8_t)tag & 0x7) << PTE_TAG_SHIFT)
-         | (((uint64_t)pid & 0x7FF) << PTE_PID_SHIFT)
+         | (((uint64_t)pid & 0x3FF) << PTE_PID_SHIFT)
          | (flags & VMM_NO_EXEC);
     Invlpg(virtAddr);
 
@@ -544,6 +544,13 @@ PhysicalAddress VmmVirtToPhys(PageTable pt, VirtualAddress virtAddr)
     uint64_t* pte = WalkToPtr(pt, virtAddr, false);
     if (!pte || !(*pte & VMM_PRESENT)) return PhysicalAddress{};
     return PhysicalAddress((*pte & PHYS_MASK) | (virtAddr.raw() & (PAGE_SIZE - 1)));
+}
+
+uint64_t* VmmGetPte(PageTable pt, VirtualAddress virtAddr)
+{
+    uint64_t* pte = WalkToPtr(pt, virtAddr, false);
+    if (!pte || !(*pte & VMM_PRESENT)) return nullptr;
+    return pte;
 }
 
 const VmmAllocation* VmmGetAllocation(VirtualAddress virtAddr)

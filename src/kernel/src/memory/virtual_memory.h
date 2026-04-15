@@ -28,8 +28,9 @@ static constexpr uint64_t VMM_FORCE_MAP = (1ULL << 62); // bypass null guard (SM
 // PTE available-bit encoding for ownership tracking.
 static constexpr uint64_t PTE_TAG_SHIFT  = 9;
 static constexpr uint64_t PTE_TAG_MASK   = (0x7ULL   << PTE_TAG_SHIFT);
-static constexpr uint64_t PTE_PID_SHIFT  = 52;
-static constexpr uint64_t PTE_PID_MASK   = (0x7FFULL << PTE_PID_SHIFT);
+static constexpr uint64_t PTE_COW_BIT    = (1ULL << 52); // COW: page was writable, now RO-shared
+static constexpr uint64_t PTE_PID_SHIFT  = 53;
+static constexpr uint64_t PTE_PID_MASK   = (0x3FFULL << PTE_PID_SHIFT); // 10 bits = max 1024 PIDs
 
 // Base of the VMALLOC virtual address region.
 static constexpr uint64_t VMALLOC_BASE  = 0xFFFFC00000000000ULL;
@@ -75,6 +76,10 @@ void VmmUnmapPage(PageTable pt, VirtualAddress virtAddr);
 // Translate virtual → physical by walking the given page table.
 // Returns a null PhysicalAddress if unmapped.
 PhysicalAddress VmmVirtToPhys(PageTable pt, VirtualAddress virtAddr);
+
+// Return a pointer to the leaf PTE for a virtual address.
+// Returns nullptr if the page table walk fails at any level.
+uint64_t* VmmGetPte(PageTable pt, VirtualAddress virtAddr);
 
 // Extract the MemTag encoded in a mapped page's PTE available bits.
 MemTag VmmGetPageTag(PageTable pt, VirtualAddress virtAddr);

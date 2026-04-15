@@ -30,7 +30,7 @@ struct PageDescriptor
     uint32_t prev;   // prev page index in PID's list (PMM_NULL_PAGE = head)
     uint16_t pid;    // owning PID
     uint8_t  tag;    // MemTag value
-    uint8_t  _pad;
+    uint8_t  refCount; // COW reference count (0=untracked, 1=exclusive, 2+=shared)
 };
 
 // Head/tail/count for one PID's page list.
@@ -77,6 +77,14 @@ void PmmKillPid(uint16_t pid);
 // Free all physical pages owned by a PID that have the given MemTag.
 // Leaves other pages (e.g., kernel stack) untouched.
 void PmmFreeByTag(uint16_t pid, MemTag tag);
+
+// COW reference counting — increment/decrement refcount on a physical page.
+// PmmRefPage increments the refcount (call when sharing a page in fork).
+// PmmUnrefPage decrements and frees if it reaches zero.
+// PmmGetRefCount returns the current refcount (0 if untracked).
+void     PmmRefPage(PhysicalAddress physAddr);
+void     PmmUnrefPage(PhysicalAddress physAddr);
+uint8_t  PmmGetRefCount(PhysicalAddress physAddr);
 
 // Enumerate pages owned by a PID. Calls callback(physAddr, tag, ctx) for each.
 void PmmEnumeratePid(uint16_t pid,

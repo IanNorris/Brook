@@ -1869,7 +1869,16 @@ static int64_t sys_wait4(uint64_t pidArg, uint64_t statusAddr, uint64_t options,
         parent->wakeupTick = g_lapicTickCount + 5;
         SchedulerBlock(parent);
         if (HasPendingSignals())
-            return -EINTR;
+        {
+            // SIGCHLD is expected during wait — clear it and retry
+            // instead of returning EINTR. Only return EINTR for other signals.
+            uint64_t pending = parent->sigPending & ~parent->sigMask;
+            uint64_t sigchldBit = (1ULL << (17 - 1)); // SIGCHLD = 17
+            if ((pending & ~sigchldBit) != 0)
+                return -EINTR;
+            // Only SIGCHLD pending — clear it and retry the wait loop
+            parent->sigPending &= ~sigchldBit;
+        }
     }
 }
 

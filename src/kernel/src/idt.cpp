@@ -5,6 +5,8 @@
 #include "process.h"
 #include "scheduler.h"
 #include "apic.h"
+#include "memory/virtual_memory.h"
+#include "memory/physical_memory.h"
 
 using brook::SerialPrintf;
 using brook::IoApicUnmaskIrq;
@@ -438,6 +440,76 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
 
     bool fromUser = (ef->cs & 3) != 0;
 
+    // --- COW page fault handling (both kernel and user mode) ---
+    // The kernel writes to user COW pages via sys_wait4, sys_read, etc.
+    // These are kernel-mode writes (error code bit 2 = 0) to user-space
+    // addresses that have COW protection. Handle them before the kernel
+    // fault path to avoid a spurious panic.
+    if (vector == 14)
+    {
+        uint64_t cr2cow = 0;
+        __asm__ volatile("movq %%cr2, %0" : "=r"(cr2cow));
+
+        bool pfPresent = (ef->errorCode & 1) != 0;
+        bool pfWrite   = (ef->errorCode & 2) != 0;
+        // COW applies to user-mapped pages regardless of CPL
+        bool isUserAddr = (cr2cow < 0x0000800000000000ULL);
+
+        brook::Process* cowProc = brook::ProcessCurrent();
+        if (pfPresent && pfWrite && isUserAddr && cowProc)
+        {
+            using namespace brook;
+            uint64_t* pte = VmmGetPte(cowProc->pageTable,
+                                      VirtualAddress(cr2cow & ~0xFFFULL));
+            if (pte && (*pte & PTE_COW_BIT))
+            {
+                static constexpr uint64_t PTE_PHYS_MASK = 0x000FFFFFFFFFF000ULL;
+                PhysicalAddress oldPhys((*pte) & PTE_PHYS_MASK);
+                uint8_t refCount = PmmGetRefCount(oldPhys);
+
+                if (refCount > 1)
+                {
+                    // Shared COW page: allocate new page, copy, remap writable
+                    PhysicalAddress newPhys = PmmAllocPage(MemTag::User, cowProc->pid);
+                    if (newPhys)
+                    {
+                        auto* src = reinterpret_cast<const uint8_t*>(
+                            PhysToVirt(oldPhys).raw());
+                        auto* dst = reinterpret_cast<uint8_t*>(
+                            PhysToVirt(newPhys).raw());
+                        for (uint64_t b = 0; b < 4096; b += 8)
+                            *reinterpret_cast<uint64_t*>(dst + b) =
+                                *reinterpret_cast<const uint64_t*>(src + b);
+
+                        // Update PTE: new phys, writable, clear COW bit
+                        uint64_t newPte = (newPhys.raw() & PTE_PHYS_MASK)
+                                        | ((*pte) & ~(PTE_PHYS_MASK | PTE_COW_BIT))
+                                        | VMM_WRITABLE;
+                        // Update PID in PTE to this process
+                        newPte = (newPte & ~PTE_PID_MASK)
+                               | (((uint64_t)cowProc->pid & 0x3FF) << PTE_PID_SHIFT);
+                        *pte = newPte;
+
+                        PmmUnrefPage(oldPhys);
+
+                        __asm__ volatile("invlpg (%0)" :: "r"(cr2cow & ~0xFFFULL) : "memory");
+                        __asm__ volatile("sti");
+                        return;
+                    }
+                    // OOM — fall through to normal fault handling
+                }
+                else
+                {
+                    // Last reference: just make writable, clear COW
+                    *pte = ((*pte) & ~PTE_COW_BIT) | VMM_WRITABLE;
+                    __asm__ volatile("invlpg (%0)" :: "r"(cr2cow & ~0xFFFULL) : "memory");
+                    __asm__ volatile("sti");
+                    return;
+                }
+            }
+        }
+    }
+
     // For kernel-mode faults, delegate to the original handler for diagnostics + halt.
     if (!fromUser)
     {
@@ -458,6 +530,9 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
 
     uint64_t cr2 = 0;
     __asm__ volatile("movq %%cr2, %0" : "=r"(cr2));
+
+    // Note: COW page faults are handled above (before the kernel/user split)
+    // for both kernel-mode and user-mode writes to COW-protected user pages.
 
     // Check if the process has a handler registered for this signal.
     bool hasHandler = false;

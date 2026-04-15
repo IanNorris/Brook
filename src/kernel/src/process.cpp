@@ -707,12 +707,15 @@ void ProcessDestroy(Process* proc)
 // The child's trampoline returns to user mode with RAX=0 (fork return value).
 
 // Helper: walk a 4-level page table and copy all leaf pages.
-static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt, uint16_t dstPid)
+static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
+                              uint16_t srcPid, uint16_t dstPid)
 {
     static constexpr uint64_t PTE_PHYS_MASK = 0x000FFFFFFFFFF000ULL;
 
     auto* srcPml4 = reinterpret_cast<uint64_t*>(
         PhysToVirt(srcPt.pml4).raw());
+
+    uint64_t sharedCount = 0;
 
     // Only copy user-half (PML4 entries 0..255)
     for (uint64_t i4 = 0; i4 < 256; i4++)
@@ -744,45 +747,81 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt, uint16_t dstPid)
 
                     // Reconstruct the virtual address
                     uint64_t vaddr = (i4 << 39) | (i3 << 30) | (i2 << 21) | (i1 << 12);
-                    // Sign-extend if needed (not needed for user half, bits 47:0)
 
                     PhysicalAddress srcPhys(srcPt4[i1] & PTE_PHYS_MASK);
-                    uint64_t flags = srcPt4[i1] & (0xFFF | VMM_NO_EXEC); // low 12 bits + NX
+                    uint64_t pteFlags = srcPt4[i1] & ~PTE_PHYS_MASK;
+                    bool wasWritable = (pteFlags & VMM_WRITABLE) != 0;
+                    bool alreadyCow  = (pteFlags & PTE_COW_BIT) != 0;
+                    bool needsCow    = wasWritable || alreadyCow;
 
-                    // Determine page flags for the child mapping
-                    uint64_t mapFlags = 0;
-                    if (flags & (1ULL << 1)) mapFlags |= VMM_WRITABLE;
-                    if (flags & (1ULL << 2)) mapFlags |= VMM_USER;
-                    if (flags & VMM_NO_EXEC) mapFlags |= VMM_NO_EXEC;
-
-                    // Allocate a new physical page for the child
-                    PhysicalAddress dstPhys = PmmAllocPage(MemTag::User, dstPid);
-                    if (!dstPhys)
+                    if (wasWritable)
                     {
-                        SerialPrintf("FORK: OOM copying page at vaddr 0x%lx\n", vaddr);
+                        // First COW: clear writable in parent, set COW bit
+                        srcPt4[i1] = (srcPt4[i1] & ~VMM_WRITABLE) | PTE_COW_BIT;
+                    }
+
+                    // Build child PTE: same physical page, same flags
+                    // (read-only if COW, original flags if already RO)
+                    uint64_t childPte = (srcPhys.raw() & PTE_PHYS_MASK)
+                                      | VMM_PRESENT
+                                      | (pteFlags & VMM_USER)
+                                      | (pteFlags & VMM_NO_EXEC);
+                    if (needsCow)
+                        childPte |= PTE_COW_BIT; // mark as COW in child
+                    else if (pteFlags & VMM_WRITABLE)
+                        childPte |= VMM_WRITABLE; // genuinely read-write non-COW
+                    // Preserve tag bits
+                    childPte |= (pteFlags & PTE_TAG_MASK);
+                    // Set child PID
+                    childPte |= (((uint64_t)dstPid & 0x3FF) << PTE_PID_SHIFT);
+
+                    // Map into child's page table via WalkToPtr (need intermediate tables)
+                    // Use VmmMapPage to create intermediates, then override leaf PTE.
+                    uint64_t childMapFlags = VMM_USER;
+                    if (!needsCow && (pteFlags & VMM_WRITABLE))
+                        childMapFlags |= VMM_WRITABLE;
+                    if (pteFlags & VMM_NO_EXEC)
+                        childMapFlags |= VMM_NO_EXEC;
+
+                    // We need to create intermediate page table entries.
+                    // VmmMapPage will create them, then we overwrite the leaf PTE.
+                    if (!VmmMapPage(dstPt, VirtualAddress(vaddr), srcPhys,
+                                    childMapFlags, MemTag::User, dstPid))
+                    {
+                        SerialPrintf("FORK: failed to map COW page at vaddr 0x%lx\n", vaddr);
                         return false;
                     }
 
-                    // Copy page contents via direct map
-                    auto* src = reinterpret_cast<uint8_t*>(PhysToVirt(srcPhys).raw());
-                    auto* dst = reinterpret_cast<uint8_t*>(PhysToVirt(dstPhys).raw());
-                    for (uint64_t b = 0; b < 4096; b += 8)
-                        *reinterpret_cast<uint64_t*>(dst + b) =
-                            *reinterpret_cast<uint64_t*>(src + b);
-
-                    // Map into child's page table
-                    if (!VmmMapPage(dstPt, VirtualAddress(vaddr), dstPhys,
-                                    mapFlags, MemTag::User, dstPid))
+                    // Now overwrite the child's leaf PTE with our carefully constructed one
+                    // (VmmMapPage set it, but we need COW bit + read-only)
                     {
-                        SerialPrintf("FORK: failed to map page at vaddr 0x%lx\n", vaddr);
-                        PmmFreePage(dstPhys);
-                        return false;
+                        // Walk to the PTE we just created
+                        auto* dstPml4 = reinterpret_cast<uint64_t*>(
+                            PhysToVirt(dstPt.pml4).raw());
+                        auto* dstPdpt = reinterpret_cast<uint64_t*>(
+                            PhysToVirt(PhysicalAddress(dstPml4[i4] & PTE_PHYS_MASK)).raw());
+                        auto* dstPd = reinterpret_cast<uint64_t*>(
+                            PhysToVirt(PhysicalAddress(dstPdpt[i3] & PTE_PHYS_MASK)).raw());
+                        auto* dstPt4 = reinterpret_cast<uint64_t*>(
+                            PhysToVirt(PhysicalAddress(dstPd[i2] & PTE_PHYS_MASK)).raw());
+                        dstPt4[i1] = childPte;
                     }
+
+                    // Increment physical page refcount for sharing
+                    PmmRefPage(srcPhys);
+
+                    sharedCount++;
                 }
             }
         }
     }
 
+    // Flush TLB for parent (we changed its PTEs to read-only)
+    // Full TLB flush by reloading CR3
+    asm volatile("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
+
+    SerialPrintf("FORK: COW shared %lu pages (parent PID %u -> child PID %u)\n",
+                 sharedCount, static_cast<uint32_t>(srcPid), static_cast<uint32_t>(dstPid));
     return true;
 }
 
@@ -868,8 +907,9 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
         return nullptr;
     }
 
-    // Copy all user-space pages from parent to child (full copy)
-    if (!ForkCopyUserPages(parent->pageTable, child->pageTable, child->pid))
+    // COW-share all user-space pages from parent to child
+    if (!ForkCopyUserPages(parent->pageTable, child->pageTable,
+                           parent->pid, child->pid))
     {
         SerialPuts("FORK: address space copy failed\n");
         VmmDestroyUserPageTable(child->pageTable);

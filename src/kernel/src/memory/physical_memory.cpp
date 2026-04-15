@@ -96,6 +96,7 @@ static inline void TrackAlloc(uint32_t pageIdx, MemTag tag, uint16_t pid)
     // Free pages are not in any list; just append to the new owner's list.
     if (!g_pageDescs) return;
     ListAppend(pageIdx, pid, tag);
+    Desc(pageIdx).refCount = 1;  // exclusive ownership on fresh allocation
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +306,14 @@ void PmmFreePage(PhysicalAddress physAddr)
 
     if (!IsUsed(idx)) { SpinLockRelease(&g_pmmLock, flags); return; }
 
+    // If refcounted and shared, just decrement — don't free yet
+    if (g_pageDescs && Desc(static_cast<uint32_t>(idx)).refCount > 1)
+    {
+        Desc(static_cast<uint32_t>(idx)).refCount--;
+        SpinLockRelease(&g_pmmLock, flags);
+        return;
+    }
+
     SetFree(idx);
     g_freePages++;
     if (idx < g_nextHint) g_nextHint = idx;
@@ -315,6 +324,7 @@ void PmmFreePage(PhysicalAddress physAddr)
         PageDescriptor& d = Desc(static_cast<uint32_t>(idx));
         d.pid = 0;
         d.tag = static_cast<uint8_t>(MemTag::Free);
+        d.refCount = 0;
     }
 
     SpinLockRelease(&g_pmmLock, flags);
@@ -346,6 +356,62 @@ uint16_t PmmGetPid(PhysicalAddress physAddr)
     uint64_t idx = physAddr.raw() / PAGE_SIZE;
     if (idx >= g_totalPages) return KernelPid;
     return Desc(static_cast<uint32_t>(idx)).pid;
+}
+
+// ---------------------------------------------------------------------------
+// COW reference counting
+// ---------------------------------------------------------------------------
+
+void PmmRefPage(PhysicalAddress physAddr)
+{
+    if (!g_pageDescs || !physAddr) return;
+    uint64_t idx64 = physAddr.raw() / PAGE_SIZE;
+    if (idx64 >= g_totalPages) return;
+    uint32_t idx = static_cast<uint32_t>(idx64);
+
+    uint64_t flags = SpinLockAcquire(&g_pmmLock);
+    auto& d = Desc(idx);
+    if (d.refCount == 0)
+        d.refCount = 2;  // legacy page: count existing owner + new sharer
+    else if (d.refCount < 255)
+        d.refCount++;
+    SpinLockRelease(&g_pmmLock, flags);
+}
+
+void PmmUnrefPage(PhysicalAddress physAddr)
+{
+    if (!g_pageDescs || !physAddr) return;
+    uint64_t idx64 = physAddr.raw() / PAGE_SIZE;
+    if (idx64 >= g_totalPages) return;
+    uint32_t idx = static_cast<uint32_t>(idx64);
+
+    uint64_t flags = SpinLockAcquire(&g_pmmLock);
+    auto& d = Desc(idx);
+    if (d.refCount > 1)
+    {
+        d.refCount--;
+        SpinLockRelease(&g_pmmLock, flags);
+        return; // still shared, don't free
+    }
+    // refCount is 0 or 1 — this was the last (or only) reference, actually free
+    if (IsUsed(idx))
+    {
+        SetFree(idx);
+        g_freePages++;
+        if (idx < g_nextHint) g_nextHint = idx;
+    }
+    ListRemove(idx);
+    d = { PMM_NULL_PAGE, PMM_NULL_PAGE, 0,
+          static_cast<uint8_t>(MemTag::Free), 0 };
+    SpinLockRelease(&g_pmmLock, flags);
+}
+
+uint8_t PmmGetRefCount(PhysicalAddress physAddr)
+{
+    if (!g_pageDescs || !physAddr) return 0;
+    uint64_t idx64 = physAddr.raw() / PAGE_SIZE;
+    if (idx64 >= g_totalPages) return 0;
+    return Desc(static_cast<uint32_t>(idx64)).refCount;
 }
 
 void PmmEnableTracking()
@@ -387,6 +453,7 @@ void PmmEnableTracking()
         if (IsUsed(i))
         {
             ListAppend(i, KernelPid, MemTag::KernelData);
+            Desc(i).refCount = 1;  // exclusive owner
             usedCount++;
         }
         else
@@ -412,22 +479,33 @@ void PmmKillPid(uint16_t pid)
 
     uint32_t idx = g_pidLists[pid].head;
     uint32_t count = 0;
+    uint32_t shared = 0;
 
     while (idx != PMM_NULL_PAGE)
     {
         uint32_t next = Desc(idx).next;
 
-        // Clear bitmap bit and update stats.
-        if (IsUsed(idx))
+        if (Desc(idx).refCount > 1)
         {
-            SetFree(idx);
-            g_freePages++;
-            if (idx < g_nextHint) g_nextHint = idx;
+            // COW shared page — decrement refcount, don't free
+            Desc(idx).refCount--;
+            // Unlink from this PID's list only
+            Desc(idx).next = PMM_NULL_PAGE;
+            Desc(idx).prev = PMM_NULL_PAGE;
+            shared++;
         }
-
-        // Reset descriptor to free state (not in any list).
-        Desc(idx) = { PMM_NULL_PAGE, PMM_NULL_PAGE, 0,
-                      static_cast<uint8_t>(MemTag::Free), 0 };
+        else
+        {
+            // Exclusive page — actually free it
+            if (IsUsed(idx))
+            {
+                SetFree(idx);
+                g_freePages++;
+                if (idx < g_nextHint) g_nextHint = idx;
+            }
+            Desc(idx) = { PMM_NULL_PAGE, PMM_NULL_PAGE, 0,
+                          static_cast<uint8_t>(MemTag::Free), 0 };
+        }
         count++;
 
         idx = next;
@@ -437,8 +515,8 @@ void PmmKillPid(uint16_t pid)
 
     SpinLockRelease(&g_pmmLock, flags);
 
-    SerialPrintf("PMM: PmmKillPid(%u): freed %u pages\n",
-                 static_cast<uint32_t>(pid), count);
+    SerialPrintf("PMM: PmmKillPid(%u): processed %u pages (%u shared, refcount decremented)\n",
+                 static_cast<uint32_t>(pid), count, shared);
 }
 
 void PmmFreeByTag(uint16_t pid, MemTag tag)
