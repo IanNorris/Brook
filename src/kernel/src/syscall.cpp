@@ -21,6 +21,7 @@
 #include "window.h"
 #include "terminal.h"
 #include "net.h"
+#include "rtc.h"
 
 // Forward declaration
 extern "C" __attribute__((naked)) void ReturnToKernel();
@@ -2252,8 +2253,7 @@ static int64_t sys_set_tid_address(uint64_t tidptr, uint64_t, uint64_t,
 // sys_clock_gettime (228) / sys_gettimeofday (96)
 // ---------------------------------------------------------------------------
 
-// Simple monotonic counter based on LAPIC timer interrupts.
-// The LAPIC fires every 1ms, so we track a global tick count.
+// LAPIC fires every 1ms — monotonic tick counter.
 extern volatile uint64_t g_lapicTickCount; // defined in apic.cpp
 
 struct timespec {
@@ -2266,15 +2266,26 @@ struct timeval {
     int64_t tv_usec;
 };
 
+// CLOCK_REALTIME=0  CLOCK_MONOTONIC=1  CLOCK_MONOTONIC_RAW=4  CLOCK_BOOTTIME=7
 static int64_t sys_clock_gettime(uint64_t clockid, uint64_t tsAddr, uint64_t,
                                   uint64_t, uint64_t, uint64_t)
 {
     auto* ts = reinterpret_cast<timespec*>(tsAddr);
     if (!ts) return -EFAULT;
 
-    uint64_t ms = g_lapicTickCount;
-    ts->tv_sec  = static_cast<int64_t>(ms / 1000);
-    ts->tv_nsec = static_cast<int64_t>((ms % 1000) * 1000000);
+    if (clockid == 0) // CLOCK_REALTIME — wall-clock via RTC
+    {
+        uint64_t epoch = RtcNow();
+        uint64_t ms = g_lapicTickCount;
+        ts->tv_sec  = static_cast<int64_t>(epoch);
+        ts->tv_nsec = static_cast<int64_t>((ms % 1000) * 1000000);
+    }
+    else // CLOCK_MONOTONIC and variants — boot-relative
+    {
+        uint64_t ms = g_lapicTickCount;
+        ts->tv_sec  = static_cast<int64_t>(ms / 1000);
+        ts->tv_nsec = static_cast<int64_t>((ms % 1000) * 1000000);
+    }
     return 0;
 }
 
@@ -2284,8 +2295,9 @@ static int64_t sys_gettimeofday(uint64_t tvAddr, uint64_t, uint64_t,
     auto* tv = reinterpret_cast<timeval*>(tvAddr);
     if (!tv) return -EFAULT;
 
+    uint64_t epoch = RtcNow();
     uint64_t ms = g_lapicTickCount;
-    tv->tv_sec  = static_cast<int64_t>(ms / 1000);
+    tv->tv_sec  = static_cast<int64_t>(epoch);
     tv->tv_usec = static_cast<int64_t>((ms % 1000) * 1000);
     return 0;
 }
@@ -3315,20 +3327,47 @@ static int64_t sys_prlimit64(uint64_t pid, uint64_t resource, uint64_t newlimitA
 }
 
 // ---------------------------------------------------------------------------
-// sys_getrandom (318)
+// sys_getrandom (318) — RDRAND-backed random number generation
 // ---------------------------------------------------------------------------
+
+static bool RdrandU64(uint64_t* out)
+{
+    uint64_t val;
+    uint8_t ok;
+    // RDRAND sets CF=1 on success; retry up to 10 times on transient failure.
+    for (int i = 0; i < 10; i++)
+    {
+        __asm__ volatile("rdrand %0; setc %1" : "=r"(val), "=qm"(ok));
+        if (ok) { *out = val; return true; }
+    }
+    return false;
+}
 
 static int64_t sys_getrandom(uint64_t bufAddr, uint64_t count, uint64_t,
                                uint64_t, uint64_t, uint64_t)
 {
     auto* buf = reinterpret_cast<uint8_t*>(bufAddr);
-    uint64_t state = 0xB4005E4D12340001ULL;
-    for (uint64_t i = 0; i < count; ++i)
+    if (!buf) return -EFAULT;
+    if (count > 256) count = 256; // cap per-call to avoid long stalls
+
+    uint64_t filled = 0;
+    while (filled < count)
     {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        buf[i] = static_cast<uint8_t>(state);
+        uint64_t rnd;
+        if (!RdrandU64(&rnd))
+        {
+            // RDRAND unavailable — fall back to TSC-based mixing
+            uint64_t tsc;
+            __asm__ volatile("rdtsc" : "=A"(tsc));
+            rnd = tsc * 6364136223846793005ULL + 1442695040888963407ULL;
+        }
+
+        uint64_t remaining = count - filled;
+        uint64_t chunk = (remaining < 8) ? remaining : 8;
+        for (uint64_t b = 0; b < chunk; b++)
+        {
+            buf[filled++] = static_cast<uint8_t>(rnd >> (b * 8));
+        }
     }
     return static_cast<int64_t>(count);
 }

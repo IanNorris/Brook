@@ -1,0 +1,3 @@
+# Brook OS — Syscall test (getrandom + clock)
+
+run /boot/BIN/SYSCHECK2

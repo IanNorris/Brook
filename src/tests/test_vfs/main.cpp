@@ -19,6 +19,9 @@ namespace brook {
     Vnode* ProcFsOpen(const char*, int) { return nullptr; }
     int ProcFsStatPath(const char*, VnodeStat*) { return -1; }
     Vnode* ProcFsOpenDir(const char*) { return nullptr; }
+
+    // RTC stub — return fixed epoch for get_fattime()
+    uint64_t RtcNow() { return 1776556800ULL; } // 2026-04-15 approx
 }
 
 TEST_MAIN("vfs", {

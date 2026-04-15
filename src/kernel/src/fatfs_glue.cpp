@@ -8,6 +8,7 @@
 
 #include "fatfs_glue.h"
 #include "ramdisk.h"
+#include "rtc.h"
 #include "device.h"
 #include "serial.h"
 
@@ -115,10 +116,35 @@ DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void* buff)
 } // extern "C"
 
 // get_fattime() — required by FatFS when FF_FS_NORTC == 0.
-// Returns a fixed timestamp (2026-01-01) until we have an RTC.
+// Returns current RTC time in packed FAT format.
 // Format: bits 31:25=year-1980, 24:21=month, 20:16=day, 15:11=hour, 10:5=min, 4:0=sec/2
 extern "C" DWORD get_fattime(void)
 {
-    // 2026-01-01 00:00:00
-    return ((2026u - 1980u) << 25) | (1u << 21) | (1u << 16);
+    uint64_t epoch = brook::RtcNow();
+    if (epoch == 0) // RTC not yet initialized
+        return ((2026u - 1980u) << 25) | (1u << 21) | (1u << 16);
+
+    uint64_t rem = epoch;
+    uint32_t sec = rem % 60; rem /= 60;
+    uint32_t min = rem % 60; rem /= 60;
+    uint32_t hr  = rem % 24; rem /= 24;
+    uint64_t days = rem;
+    uint32_t yr = 1970;
+    while (true) {
+        uint32_t diy = ((yr % 4 == 0 && yr % 100 != 0) || yr % 400 == 0) ? 366 : 365;
+        if (days < diy) break;
+        days -= diy;
+        yr++;
+    }
+    static const uint16_t mdays[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    uint32_t mon = 1;
+    for (uint32_t m = 0; m < 12; m++) {
+        uint32_t dim = mdays[m];
+        if (m == 1 && ((yr % 4 == 0 && yr % 100 != 0) || yr % 400 == 0)) dim = 29;
+        if (days < dim) { mon = m + 1; break; }
+        days -= dim;
+    }
+    uint32_t day = static_cast<uint32_t>(days) + 1;
+    return ((yr - 1980u) << 25) | (mon << 21) | (day << 16) |
+           (hr << 11) | (min << 5) | (sec / 2);
 }
