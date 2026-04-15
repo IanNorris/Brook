@@ -33,7 +33,6 @@ MODULE_IMPORT_SYMBOL(VmmAllocPages);
 MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 MODULE_IMPORT_SYMBOL(VmmMapPage);
 MODULE_IMPORT_SYMBOL(IoApicRegisterHandler);
-MODULE_IMPORT_SYMBOL(ApicSendEoi);
 MODULE_IMPORT_SYMBOL(NetRegisterIf);
 MODULE_IMPORT_SYMBOL(NetReceive);
 
@@ -393,17 +392,14 @@ static void ProcessRxPackets()
 }
 
 // ---------------------------------------------------------------------------
-// IRQ handler
+// IRQ handler (plain function — called by kernel's shared IRQ dispatch stub)
 // ---------------------------------------------------------------------------
 
-__attribute__((interrupt))
-static void VirtioNetIrqHandler(InterruptFrame* /*frame*/)
+static void VirtioNetIrqBody()
 {
     (void)mmio_read8(g_isrCfg, 0); // acknowledge ISR
 
     ProcessRxPackets();
-
-    ApicSendEoi();
 }
 
 // ---------------------------------------------------------------------------
@@ -653,7 +649,7 @@ static int VirtioNetModuleInit()
     SerialPrintf("virtio_net: PCI interrupt line %u\n", intLine);
 
     IoApicRegisterHandler(static_cast<uint8_t>(intLine), VIRTIO_NET_IRQ_VECTOR,
-                          reinterpret_cast<void*>(VirtioNetIrqHandler));
+                          reinterpret_cast<void*>(VirtioNetIrqBody));
 
     // Mark device as ready
     mmio_write8(g_commonCfg, VIRTIO_COMMON_STATUS,

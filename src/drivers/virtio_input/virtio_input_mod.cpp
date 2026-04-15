@@ -46,7 +46,6 @@ MODULE_IMPORT_SYMBOL(VmmAllocPages);
 MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 MODULE_IMPORT_SYMBOL(VmmMapPage);
 MODULE_IMPORT_SYMBOL(IoApicRegisterHandler);
-MODULE_IMPORT_SYMBOL(ApicSendEoi);
 
 using namespace brook;
 
@@ -339,14 +338,11 @@ static void ProcessEvent(const VirtioInputEvent& ev)
 }
 
 // ---------------------------------------------------------------------------
-// IRQ handler
+// IRQ handler (plain function — called by kernel's shared IRQ dispatch stub)
 // ---------------------------------------------------------------------------
 
-__attribute__((interrupt))
-static void VirtioInputIrqHandler(InterruptFrame* frame)
+static void VirtioInputIrqBody()
 {
-    (void)frame;
-
     // Read ISR status to acknowledge.
     (void)mmio_read8(g_isrCfg, 0);
 
@@ -361,8 +357,6 @@ static void VirtioInputIrqHandler(InterruptFrame* frame)
         }
         g_usedIdxShadow++;
     }
-
-    ApicSendEoi();
 }
 
 // ---------------------------------------------------------------------------
@@ -609,7 +603,7 @@ static int VirtioInputModuleInit()
     SerialPrintf("virtio_input: PCI interrupt line %u\n", intLine);
 
     IoApicRegisterHandler(static_cast<uint8_t>(intLine), VIRTIO_INPUT_IRQ_VECTOR,
-                          reinterpret_cast<void*>(VirtioInputIrqHandler));
+                          reinterpret_cast<void*>(VirtioInputIrqBody));
 
     // Mark device as ready.
     mmio_write8(g_commonCfg, VIRTIO_COMMON_STATUS,

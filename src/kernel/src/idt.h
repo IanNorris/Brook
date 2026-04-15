@@ -33,7 +33,9 @@ void IdtInit(brook::Framebuffer* fb);
 // (__attribute__((interrupt)) or raw ISR that saves all registers).
 extern "C" void IdtInstallHandler(uint8_t vector, void* handler);
 
-// Register a handler for an IOAPIC IRQ with shared-IRQ chaining.
+// Register a plain handler for an IOAPIC IRQ with shared-IRQ chaining.
+// handler must be a plain void(*)(void) function — NOT __attribute__((interrupt)),
+// and must NOT call ApicSendEoi(). The dispatch stub handles both.
 // Returns the actual vector assigned (may differ from preferredVector if
 // the IRQ is already mapped).
 extern "C" uint8_t IoApicRegisterHandler(uint8_t irq, uint8_t preferredVector, void* handler);

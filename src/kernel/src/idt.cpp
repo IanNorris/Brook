@@ -8,6 +8,7 @@
 
 using brook::SerialPrintf;
 using brook::IoApicUnmaskIrq;
+using brook::ApicSendEoi;
 
 // ---- IDT storage ----
 static IdtEntry      g_idt[256];
@@ -660,22 +661,23 @@ IRQ_SPURIOUS(47)
 // Shared IRQ handler chain — supports multiple drivers on the same IOAPIC IRQ
 // ---------------------------------------------------------------------------
 
-using IrqHandlerFn = void (*)(InterruptFrame*);
+// Handlers registered here must be plain functions (NOT __attribute__((interrupt))).
+// They must NOT call ApicSendEoi() — the dispatch stub handles that.
+using IrqHandlerFn = void (*)();
 
 static constexpr int MAX_IRQ_CHAIN = 4;
 static constexpr int MAX_SHARED_IRQS = 24;
 
 struct SharedIrqEntry {
-    uint8_t      vector;          // IDT vector assigned to this IRQ
-    uint8_t      irq;             // IOAPIC IRQ number
-    uint8_t      count;           // number of chained handlers
+    uint8_t      vector;
+    uint8_t      irq;
+    uint8_t      count;
     IrqHandlerFn handlers[MAX_IRQ_CHAIN];
 };
 
 static SharedIrqEntry g_sharedIrqs[MAX_SHARED_IRQS];
 static int g_sharedIrqCount = 0;
 
-// Find existing chain for a given IRQ, or nullptr
 static SharedIrqEntry* FindSharedIrq(uint8_t irq)
 {
     for (int i = 0; i < g_sharedIrqCount; i++)
@@ -683,24 +685,33 @@ static SharedIrqEntry* FindSharedIrq(uint8_t irq)
     return nullptr;
 }
 
-// The shared dispatch stub — calls all handlers in the chain.
-// Each handler sends its own EOI; double-EOI on the LAPIC is harmless
-// (the second write is a no-op when no ISR bit is pending).
-__attribute__((interrupt))
-static void SharedIrqDispatch(InterruptFrame* frame)
-{
-    for (int i = 0; i < g_sharedIrqCount; i++)
-    {
-        SharedIrqEntry& e = g_sharedIrqs[i];
-        for (int j = 0; j < e.count; j++)
-            e.handlers[j](frame);
+// Per-IRQ dispatch stubs. Each is an __attribute__((interrupt)) function that
+// iterates handlers[0..count) for one SharedIrqEntry, then sends EOI.
+// We generate a small fixed set (one per MAX_SHARED_IRQS slot).
+#define SHARED_IRQ_STUB(N) \
+    __attribute__((interrupt)) \
+    static void SharedIrqStub##N(InterruptFrame* frame) { \
+        (void)frame; \
+        SharedIrqEntry& e = g_sharedIrqs[N]; \
+        for (int j = 0; j < e.count; j++) \
+            e.handlers[j](); \
+        ApicSendEoi(); \
     }
-}
 
-// Register a handler for an IOAPIC IRQ. If the IRQ already has a handler,
-// chains the new one and installs a shared dispatch stub.
-// Handles both IDT and IOAPIC programming — drivers should call this
-// instead of IdtInstallHandler + IoApicUnmaskIrq.
+SHARED_IRQ_STUB(0)
+SHARED_IRQ_STUB(1)
+SHARED_IRQ_STUB(2)
+SHARED_IRQ_STUB(3)
+
+using StubFn = void (*)(InterruptFrame*);
+static StubFn g_sharedIrqStubs[] = {
+    SharedIrqStub0, SharedIrqStub1, SharedIrqStub2, SharedIrqStub3
+};
+
+// Register a plain (non-interrupt) handler for an IOAPIC IRQ.
+// The handler must NOT be __attribute__((interrupt)) and must NOT call ApicSendEoi().
+// IoApicRegisterHandler installs a proper interrupt stub that dispatches to all
+// chained handlers and sends EOI once.
 uint8_t IoApicRegisterHandler(uint8_t irq, uint8_t preferredVector, void* handler)
 {
     SharedIrqEntry* existing = FindSharedIrq(irq);
@@ -713,10 +724,7 @@ uint8_t IoApicRegisterHandler(uint8_t irq, uint8_t preferredVector, void* handle
                 reinterpret_cast<IrqHandlerFn>(handler);
             SerialPrintf("IRQ: chained handler on IRQ %u (vector %u, %u handlers)\n",
                          irq, existing->vector, existing->count);
-
-            // Replace the IDT entry with the shared dispatch stub
-            IdtInstallHandler(existing->vector,
-                              reinterpret_cast<void*>(SharedIrqDispatch));
+            // Stub already installed on first registration — no IDT change needed
         }
         else
         {
@@ -725,8 +733,9 @@ uint8_t IoApicRegisterHandler(uint8_t irq, uint8_t preferredVector, void* handle
         return existing->vector;
     }
 
-    // New IRQ — create entry, install handler, and unmask
-    if (g_sharedIrqCount < MAX_SHARED_IRQS)
+    // New IRQ — allocate a slot, install per-slot stub, unmask
+    int slot = g_sharedIrqCount;
+    if (slot < static_cast<int>(sizeof(g_sharedIrqStubs) / sizeof(g_sharedIrqStubs[0])))
     {
         SharedIrqEntry& e = g_sharedIrqs[g_sharedIrqCount++];
         e.irq = irq;
@@ -734,7 +743,10 @@ uint8_t IoApicRegisterHandler(uint8_t irq, uint8_t preferredVector, void* handle
         e.count = 1;
         e.handlers[0] = reinterpret_cast<IrqHandlerFn>(handler);
 
-        IdtInstallHandler(preferredVector, handler);
+        // Always use the per-slot stub (even for single handler) so we
+        // can add more handlers later without swapping the IDT entry.
+        IdtInstallHandler(preferredVector,
+                          reinterpret_cast<void*>(g_sharedIrqStubs[slot]));
         IoApicUnmaskIrq(irq, preferredVector);
         return preferredVector;
     }
