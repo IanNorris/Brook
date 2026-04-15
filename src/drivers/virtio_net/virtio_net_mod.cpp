@@ -32,8 +32,7 @@ MODULE_IMPORT_SYMBOL(KPrintf);
 MODULE_IMPORT_SYMBOL(VmmAllocPages);
 MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 MODULE_IMPORT_SYMBOL(VmmMapPage);
-MODULE_IMPORT_SYMBOL(IdtInstallHandler);
-MODULE_IMPORT_SYMBOL(IoApicUnmaskIrq);
+MODULE_IMPORT_SYMBOL(IoApicRegisterHandler);
 MODULE_IMPORT_SYMBOL(ApicSendEoi);
 MODULE_IMPORT_SYMBOL(NetRegisterIf);
 MODULE_IMPORT_SYMBOL(NetReceive);
@@ -653,9 +652,8 @@ static int VirtioNetModuleInit()
     uint32_t intLine = PciConfigRead32(dev.bus, dev.dev, dev.fn, 0x3C) & 0xFF;
     SerialPrintf("virtio_net: PCI interrupt line %u\n", intLine);
 
-    IdtInstallHandler(VIRTIO_NET_IRQ_VECTOR,
-                      reinterpret_cast<void*>(VirtioNetIrqHandler));
-    IoApicUnmaskIrq(static_cast<uint8_t>(intLine), VIRTIO_NET_IRQ_VECTOR);
+    IoApicRegisterHandler(static_cast<uint8_t>(intLine), VIRTIO_NET_IRQ_VECTOR,
+                          reinterpret_cast<void*>(VirtioNetIrqHandler));
 
     // Mark device as ready
     mmio_write8(g_commonCfg, VIRTIO_COMMON_STATUS,

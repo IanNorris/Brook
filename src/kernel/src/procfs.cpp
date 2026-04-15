@@ -52,11 +52,10 @@ static char* I64ToDec(char* buf, int64_t val)
 }
 
 // Simple format: %u, %lu, %d, %ld, %s, %c — enough for /proc files.
-#include <stdarg.h>
 static uint32_t ProcFmt(char* buf, uint32_t bufSize, const char* fmt, ...)
 {
-    va_list ap;
-    va_start(ap, fmt);
+    __builtin_va_list ap;
+    __builtin_va_start(ap, fmt);
     char* p = buf;
     char* end = buf + bufSize - 1;
     while (*fmt && p < end)
@@ -68,25 +67,25 @@ static uint32_t ProcFmt(char* buf, uint32_t bufSize, const char* fmt, ...)
         switch (*fmt)
         {
         case 'u': {
-            uint64_t v = isLong ? va_arg(ap, uint64_t) : va_arg(ap, uint32_t);
+            uint64_t v = isLong ? __builtin_va_arg(ap, uint64_t) : __builtin_va_arg(ap, uint32_t);
             char tmp[20]; char* t = U64ToDec(tmp, v);
             for (char* s = tmp; s < t && p < end; ) *p++ = *s++;
             break;
         }
         case 'd': {
-            int64_t v = isLong ? va_arg(ap, int64_t) : va_arg(ap, int32_t);
+            int64_t v = isLong ? __builtin_va_arg(ap, int64_t) : __builtin_va_arg(ap, int32_t);
             char tmp[21]; char* t = I64ToDec(tmp, v);
             for (char* s = tmp; s < t && p < end; ) *p++ = *s++;
             break;
         }
         case 's': {
-            const char* s = va_arg(ap, const char*);
+            const char* s = __builtin_va_arg(ap, const char*);
             if (!s) s = "(null)";
             while (*s && p < end) *p++ = *s++;
             break;
         }
         case 'c': {
-            int c = va_arg(ap, int);
+            int c = __builtin_va_arg(ap, int);
             *p++ = static_cast<char>(c);
             break;
         }
@@ -98,7 +97,7 @@ static uint32_t ProcFmt(char* buf, uint32_t bufSize, const char* fmt, ...)
         fmt++;
     }
     *p = '\0';
-    va_end(ap);
+    __builtin_va_end(ap);
     return static_cast<uint32_t>(p - buf);
 }
 

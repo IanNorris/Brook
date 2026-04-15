@@ -45,8 +45,7 @@ MODULE_IMPORT_SYMBOL(InputWakeWaiters);
 MODULE_IMPORT_SYMBOL(VmmAllocPages);
 MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 MODULE_IMPORT_SYMBOL(VmmMapPage);
-MODULE_IMPORT_SYMBOL(IdtInstallHandler);
-MODULE_IMPORT_SYMBOL(IoApicUnmaskIrq);
+MODULE_IMPORT_SYMBOL(IoApicRegisterHandler);
 MODULE_IMPORT_SYMBOL(ApicSendEoi);
 
 using namespace brook;
@@ -609,9 +608,8 @@ static int VirtioInputModuleInit()
     uint32_t intLine = PciConfigRead32(dev.bus, dev.dev, dev.fn, 0x3C) & 0xFF;
     SerialPrintf("virtio_input: PCI interrupt line %u\n", intLine);
 
-    IdtInstallHandler(VIRTIO_INPUT_IRQ_VECTOR,
-                      reinterpret_cast<void*>(VirtioInputIrqHandler));
-    IoApicUnmaskIrq(static_cast<uint8_t>(intLine), VIRTIO_INPUT_IRQ_VECTOR);
+    IoApicRegisterHandler(static_cast<uint8_t>(intLine), VIRTIO_INPUT_IRQ_VECTOR,
+                          reinterpret_cast<void*>(VirtioInputIrqHandler));
 
     // Mark device as ready.
     mmio_write8(g_commonCfg, VIRTIO_COMMON_STATUS,

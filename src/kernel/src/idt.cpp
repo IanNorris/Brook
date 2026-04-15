@@ -4,6 +4,10 @@
 #include "panic.h"
 #include "process.h"
 #include "scheduler.h"
+#include "apic.h"
+
+using brook::SerialPrintf;
+using brook::IoApicUnmaskIrq;
 
 // ---- IDT storage ----
 static IdtEntry      g_idt[256];
@@ -651,6 +655,93 @@ IRQ_SPURIOUS(44)
 IRQ_SPURIOUS(45)
 IRQ_SPURIOUS(46)
 IRQ_SPURIOUS(47)
+
+// ---------------------------------------------------------------------------
+// Shared IRQ handler chain — supports multiple drivers on the same IOAPIC IRQ
+// ---------------------------------------------------------------------------
+
+using IrqHandlerFn = void (*)(InterruptFrame*);
+
+static constexpr int MAX_IRQ_CHAIN = 4;
+static constexpr int MAX_SHARED_IRQS = 24;
+
+struct SharedIrqEntry {
+    uint8_t      vector;          // IDT vector assigned to this IRQ
+    uint8_t      irq;             // IOAPIC IRQ number
+    uint8_t      count;           // number of chained handlers
+    IrqHandlerFn handlers[MAX_IRQ_CHAIN];
+};
+
+static SharedIrqEntry g_sharedIrqs[MAX_SHARED_IRQS];
+static int g_sharedIrqCount = 0;
+
+// Find existing chain for a given IRQ, or nullptr
+static SharedIrqEntry* FindSharedIrq(uint8_t irq)
+{
+    for (int i = 0; i < g_sharedIrqCount; i++)
+        if (g_sharedIrqs[i].irq == irq) return &g_sharedIrqs[i];
+    return nullptr;
+}
+
+// The shared dispatch stub — calls all handlers in the chain.
+// Each handler sends its own EOI; double-EOI on the LAPIC is harmless
+// (the second write is a no-op when no ISR bit is pending).
+__attribute__((interrupt))
+static void SharedIrqDispatch(InterruptFrame* frame)
+{
+    for (int i = 0; i < g_sharedIrqCount; i++)
+    {
+        SharedIrqEntry& e = g_sharedIrqs[i];
+        for (int j = 0; j < e.count; j++)
+            e.handlers[j](frame);
+    }
+}
+
+// Register a handler for an IOAPIC IRQ. If the IRQ already has a handler,
+// chains the new one and installs a shared dispatch stub.
+// Handles both IDT and IOAPIC programming — drivers should call this
+// instead of IdtInstallHandler + IoApicUnmaskIrq.
+uint8_t IoApicRegisterHandler(uint8_t irq, uint8_t preferredVector, void* handler)
+{
+    SharedIrqEntry* existing = FindSharedIrq(irq);
+    if (existing)
+    {
+        // IRQ already mapped — add to chain
+        if (existing->count < MAX_IRQ_CHAIN)
+        {
+            existing->handlers[existing->count++] =
+                reinterpret_cast<IrqHandlerFn>(handler);
+            SerialPrintf("IRQ: chained handler on IRQ %u (vector %u, %u handlers)\n",
+                         irq, existing->vector, existing->count);
+
+            // Replace the IDT entry with the shared dispatch stub
+            IdtInstallHandler(existing->vector,
+                              reinterpret_cast<void*>(SharedIrqDispatch));
+        }
+        else
+        {
+            SerialPrintf("IRQ: WARNING — chain full for IRQ %u\n", irq);
+        }
+        return existing->vector;
+    }
+
+    // New IRQ — create entry, install handler, and unmask
+    if (g_sharedIrqCount < MAX_SHARED_IRQS)
+    {
+        SharedIrqEntry& e = g_sharedIrqs[g_sharedIrqCount++];
+        e.irq = irq;
+        e.vector = preferredVector;
+        e.count = 1;
+        e.handlers[0] = reinterpret_cast<IrqHandlerFn>(handler);
+
+        IdtInstallHandler(preferredVector, handler);
+        IoApicUnmaskIrq(irq, preferredVector);
+        return preferredVector;
+    }
+
+    SerialPrintf("IRQ: WARNING — shared IRQ table full\n");
+    return preferredVector;
+}
 
 void IdtInstallHandler(uint8_t vector, void* handler)
 {

@@ -32,3 +32,8 @@ void IdtInit(brook::Framebuffer* fb);
 // handler must be a function with C linkage and standard interrupt ABI
 // (__attribute__((interrupt)) or raw ISR that saves all registers).
 extern "C" void IdtInstallHandler(uint8_t vector, void* handler);
+
+// Register a handler for an IOAPIC IRQ with shared-IRQ chaining.
+// Returns the actual vector assigned (may differ from preferredVector if
+// the IRQ is already mapped).
+extern "C" uint8_t IoApicRegisterHandler(uint8_t irq, uint8_t preferredVector, void* handler);

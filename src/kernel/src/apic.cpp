@@ -455,7 +455,7 @@ bool IoApicInit(uint64_t ioApicPhysical, uint32_t gsiBase)
 
 void IoApicUnmaskIrq(uint8_t irq, uint8_t vector)
 {
-    uint32_t entry = irq; // entry index = IRQ - gsiBase (caller adjusts if needed)
+    uint32_t entry = irq;
     uint8_t  dest  = ApicGetId();
 
     // hi: destination LAPIC ID in bits 31:24
