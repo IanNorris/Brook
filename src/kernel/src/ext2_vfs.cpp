@@ -1,8 +1,9 @@
-// ext2_vfs.cpp — Read-only ext2 filesystem driver for Brook VFS.
+// ext2_vfs.cpp — Ext2 filesystem driver for Brook VFS (read/write).
 //
 // Implements: superblock parsing, inode lookup, block mapping (direct/indirect/
 // doubly-indirect/triply-indirect), directory traversal, symlink resolution,
-// and the VfsFsOps vtable. Write support to follow in a later commit.
+// block/inode allocation from bitmaps, file write, mkdir, unlink, rename,
+// symlink creation, and the VfsFsOps vtable.
 
 #include "ext2_vfs.h"
 #include "vfs.h"
@@ -128,6 +129,9 @@ struct Ext2Mount {
     uint32_t blocksPerGroup;
     uint32_t groupCount;
     uint32_t firstDataBlock;
+    uint32_t totalInodes;    // s_inodes_count
+    uint32_t totalBlocks;    // s_blocks_count
+    uint64_t bgdtDiskOff;    // byte offset of BGDT on disk
     Ext2BlockGroupDesc* bgdt; // block group descriptor table (heap allocated)
 };
 
@@ -171,6 +175,524 @@ static bool Ext2ReadBlock(Ext2Mount* mnt, uint32_t blockNum, void* buf)
     if (blockNum == 0) return false;
     uint64_t off = static_cast<uint64_t>(blockNum) << mnt->blockShift;
     return Ext2DevRead(mnt, off, buf, mnt->blockSize);
+}
+
+// Forward declarations for functions defined later but needed by write helpers
+static bool Ext2ReadInode(Ext2Mount* mnt, uint32_t ino, Ext2Inode* out);
+static uint64_t Ext2InodeSize(const Ext2Inode* ino);
+static uint32_t Ext2BlockMap(Ext2Mount* mnt, const Ext2Inode* ino, uint32_t fileBlock);
+static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
+                             void* buf, uint64_t len, uint64_t offset);
+static uint32_t Ext2DirLookup(Ext2Mount* mnt, const Ext2Inode* dirIno, const char* name);
+static uint32_t Ext2ResolvePath(Ext2Mount* mnt, uint32_t startIno,
+                                const char* path, int symlinkDepth);
+
+// Write exactly `len` bytes to device at `byteOffset`.
+static bool Ext2DevWrite(Ext2Mount* mnt, uint64_t byteOffset, const void* buf, uint64_t len)
+{
+    int r = mnt->dev->ops->write(mnt->dev, byteOffset, buf, len);
+    return r == static_cast<int>(len);
+}
+
+// Write a single block from buf.
+static bool Ext2WriteBlock(Ext2Mount* mnt, uint32_t blockNum, const void* buf)
+{
+    if (blockNum == 0) return false;
+    uint64_t off = static_cast<uint64_t>(blockNum) << mnt->blockShift;
+    return Ext2DevWrite(mnt, off, buf, mnt->blockSize);
+}
+
+// Write an inode back to disk.
+static bool Ext2WriteInode(Ext2Mount* mnt, uint32_t ino, const Ext2Inode* data)
+{
+    if (ino == 0) return false;
+    uint32_t group = (ino - 1) / mnt->inodesPerGroup;
+    uint32_t index = (ino - 1) % mnt->inodesPerGroup;
+    if (group >= mnt->groupCount) return false;
+
+    uint64_t tableOff = static_cast<uint64_t>(mnt->bgdt[group].bg_inode_table)
+                        << mnt->blockShift;
+    uint64_t inodeOff = tableOff + static_cast<uint64_t>(index) * mnt->inodeSize;
+    return Ext2DevWrite(mnt, inodeOff, data, sizeof(Ext2Inode));
+}
+
+// Flush the BGDT back to disk.
+static bool Ext2WriteBGDT(Ext2Mount* mnt)
+{
+    uint32_t bgdtSize = mnt->groupCount * sizeof(Ext2BlockGroupDesc);
+    return Ext2DevWrite(mnt, mnt->bgdtDiskOff, mnt->bgdt, bgdtSize);
+}
+
+// ---------------------------------------------------------------------------
+// Block and inode allocation
+// ---------------------------------------------------------------------------
+
+// Allocate a free block from the bitmap. Returns block number or 0 on failure.
+static uint32_t Ext2AllocBlock(Ext2Mount* mnt)
+{
+    auto* bitmap = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+    if (!bitmap) return 0;
+
+    for (uint32_t g = 0; g < mnt->groupCount; ++g) {
+        if (mnt->bgdt[g].bg_free_blocks_count == 0) continue;
+
+        uint32_t bitmapBlock = mnt->bgdt[g].bg_block_bitmap;
+        if (!Ext2ReadBlock(mnt, bitmapBlock, bitmap)) continue;
+
+        uint32_t blocksInGroup = mnt->blocksPerGroup;
+        // Last group may have fewer blocks
+        if (g == mnt->groupCount - 1)
+            blocksInGroup = mnt->totalBlocks - g * mnt->blocksPerGroup;
+
+        for (uint32_t bit = 0; bit < blocksInGroup; ++bit) {
+            if (!(bitmap[bit / 8] & (1 << (bit % 8)))) {
+                // Found free block — mark it used
+                bitmap[bit / 8] |= (1 << (bit % 8));
+                if (!Ext2WriteBlock(mnt, bitmapBlock, bitmap)) { kfree(bitmap); return 0; }
+                mnt->bgdt[g].bg_free_blocks_count--;
+                Ext2WriteBGDT(mnt);
+                kfree(bitmap);
+                return g * mnt->blocksPerGroup + bit + mnt->firstDataBlock;
+            }
+        }
+    }
+    kfree(bitmap);
+    return 0;
+}
+
+// Free a block back to the bitmap.
+static bool Ext2FreeBlock(Ext2Mount* mnt, uint32_t blockNum)
+{
+    if (blockNum < mnt->firstDataBlock) return false;
+    uint32_t rel = blockNum - mnt->firstDataBlock;
+    uint32_t g = rel / mnt->blocksPerGroup;
+    uint32_t bit = rel % mnt->blocksPerGroup;
+    if (g >= mnt->groupCount) return false;
+
+    auto* bitmap = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+    if (!bitmap) return false;
+    if (!Ext2ReadBlock(mnt, mnt->bgdt[g].bg_block_bitmap, bitmap)) {
+        kfree(bitmap); return false;
+    }
+    bitmap[bit / 8] &= ~(1 << (bit % 8));
+    bool ok = Ext2WriteBlock(mnt, mnt->bgdt[g].bg_block_bitmap, bitmap);
+    kfree(bitmap);
+    if (ok) { mnt->bgdt[g].bg_free_blocks_count++; Ext2WriteBGDT(mnt); }
+    return ok;
+}
+
+// Allocate a free inode. Returns inode number or 0 on failure.
+// isDir: increment bg_used_dirs_count.
+static uint32_t Ext2AllocInode(Ext2Mount* mnt, bool isDir)
+{
+    auto* bitmap = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+    if (!bitmap) return 0;
+
+    for (uint32_t g = 0; g < mnt->groupCount; ++g) {
+        if (mnt->bgdt[g].bg_free_inodes_count == 0) continue;
+
+        uint32_t bitmapBlock = mnt->bgdt[g].bg_inode_bitmap;
+        if (!Ext2ReadBlock(mnt, bitmapBlock, bitmap)) continue;
+
+        for (uint32_t bit = 0; bit < mnt->inodesPerGroup; ++bit) {
+            if (!(bitmap[bit / 8] & (1 << (bit % 8)))) {
+                bitmap[bit / 8] |= (1 << (bit % 8));
+                if (!Ext2WriteBlock(mnt, bitmapBlock, bitmap)) { kfree(bitmap); return 0; }
+                mnt->bgdt[g].bg_free_inodes_count--;
+                if (isDir) mnt->bgdt[g].bg_used_dirs_count++;
+                Ext2WriteBGDT(mnt);
+                kfree(bitmap);
+                return g * mnt->inodesPerGroup + bit + 1; // inodes are 1-based
+            }
+        }
+    }
+    kfree(bitmap);
+    return 0;
+}
+
+// Free an inode back to the bitmap.
+static bool Ext2FreeInode(Ext2Mount* mnt, uint32_t ino, bool isDir)
+{
+    if (ino == 0) return false;
+    uint32_t g = (ino - 1) / mnt->inodesPerGroup;
+    uint32_t bit = (ino - 1) % mnt->inodesPerGroup;
+    if (g >= mnt->groupCount) return false;
+
+    auto* bitmap = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+    if (!bitmap) return false;
+    if (!Ext2ReadBlock(mnt, mnt->bgdt[g].bg_inode_bitmap, bitmap)) {
+        kfree(bitmap); return false;
+    }
+    bitmap[bit / 8] &= ~(1 << (bit % 8));
+    bool ok = Ext2WriteBlock(mnt, mnt->bgdt[g].bg_inode_bitmap, bitmap);
+    kfree(bitmap);
+    if (ok) {
+        mnt->bgdt[g].bg_free_inodes_count++;
+        if (isDir) mnt->bgdt[g].bg_used_dirs_count--;
+        Ext2WriteBGDT(mnt);
+    }
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Write helpers: inode data write, block assignment
+// ---------------------------------------------------------------------------
+
+// Ensure inode has a block mapped at `fileBlock`. Allocates if needed.
+// Returns disk block number or 0 on failure.
+static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
+                                uint32_t inoNum, uint32_t fileBlock)
+{
+    uint32_t ptrsPerBlock = mnt->blockSize / 4;
+
+    // Direct blocks (0..11)
+    if (fileBlock < 12) {
+        if (ino->i_block[fileBlock]) return ino->i_block[fileBlock];
+        uint32_t nb = Ext2AllocBlock(mnt);
+        if (!nb) return 0;
+        ino->i_block[fileBlock] = nb;
+        Ext2WriteInode(mnt, inoNum, ino);
+        return nb;
+    }
+    fileBlock -= 12;
+
+    // Singly indirect
+    if (fileBlock < ptrsPerBlock) {
+        if (!ino->i_block[12]) {
+            uint32_t nb = Ext2AllocBlock(mnt);
+            if (!nb) return 0;
+            // Zero out new indirect block
+            auto* zb = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+            if (!zb) return 0;
+            for (uint32_t i = 0; i < mnt->blockSize; ++i) zb[i] = 0;
+            Ext2WriteBlock(mnt, nb, zb);
+            kfree(zb);
+            ino->i_block[12] = nb;
+            Ext2WriteInode(mnt, inoNum, ino);
+        }
+        uint32_t entry = 0;
+        uint64_t off = (static_cast<uint64_t>(ino->i_block[12]) << mnt->blockShift)
+                       + fileBlock * 4;
+        Ext2DevRead(mnt, off, &entry, 4);
+        if (entry) return entry;
+        uint32_t nb = Ext2AllocBlock(mnt);
+        if (!nb) return 0;
+        Ext2DevWrite(mnt, off, &nb, 4);
+        return nb;
+    }
+    fileBlock -= ptrsPerBlock;
+
+    // Doubly indirect
+    if (fileBlock < ptrsPerBlock * ptrsPerBlock) {
+        if (!ino->i_block[13]) {
+            uint32_t nb = Ext2AllocBlock(mnt);
+            if (!nb) return 0;
+            auto* zb = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+            if (!zb) return 0;
+            for (uint32_t i = 0; i < mnt->blockSize; ++i) zb[i] = 0;
+            Ext2WriteBlock(mnt, nb, zb);
+            kfree(zb);
+            ino->i_block[13] = nb;
+            Ext2WriteInode(mnt, inoNum, ino);
+        }
+        uint32_t idx1 = fileBlock / ptrsPerBlock;
+        uint32_t idx2 = fileBlock % ptrsPerBlock;
+
+        uint64_t off1 = (static_cast<uint64_t>(ino->i_block[13]) << mnt->blockShift) + idx1 * 4;
+        uint32_t indBlock = 0;
+        Ext2DevRead(mnt, off1, &indBlock, 4);
+        if (!indBlock) {
+            indBlock = Ext2AllocBlock(mnt);
+            if (!indBlock) return 0;
+            auto* zb = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+            if (!zb) return 0;
+            for (uint32_t i = 0; i < mnt->blockSize; ++i) zb[i] = 0;
+            Ext2WriteBlock(mnt, indBlock, zb);
+            kfree(zb);
+            Ext2DevWrite(mnt, off1, &indBlock, 4);
+        }
+
+        uint64_t off2 = (static_cast<uint64_t>(indBlock) << mnt->blockShift) + idx2 * 4;
+        uint32_t entry = 0;
+        Ext2DevRead(mnt, off2, &entry, 4);
+        if (entry) return entry;
+        uint32_t nb = Ext2AllocBlock(mnt);
+        if (!nb) return 0;
+        Ext2DevWrite(mnt, off2, &nb, 4);
+        return nb;
+    }
+
+    // Triply indirect not implemented for writes yet
+    return 0;
+}
+
+// Write `len` bytes to inode data at `offset`. Returns bytes written.
+static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
+                              const void* buf, uint64_t len, uint64_t offset)
+{
+    auto* src = static_cast<const uint8_t*>(buf);
+    uint64_t bytesWritten = 0;
+
+    auto* blockBuf = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+    if (!blockBuf) return -1;
+
+    while (bytesWritten < len) {
+        uint32_t fileBlock = static_cast<uint32_t>((offset + bytesWritten) >> mnt->blockShift);
+        uint32_t blockOff  = static_cast<uint32_t>((offset + bytesWritten) & (mnt->blockSize - 1));
+        uint32_t diskBlock = Ext2EnsureBlock(mnt, ino, inoNum, fileBlock);
+        if (!diskBlock) break;
+
+        // If partial block write, read-modify-write
+        if (blockOff != 0 || (len - bytesWritten) < mnt->blockSize) {
+            Ext2ReadBlock(mnt, diskBlock, blockBuf);
+        }
+
+        uint32_t avail = mnt->blockSize - blockOff;
+        uint64_t toCopy = len - bytesWritten;
+        if (toCopy > avail) toCopy = avail;
+
+        for (uint64_t i = 0; i < toCopy; ++i)
+            blockBuf[blockOff + i] = src[bytesWritten + i];
+
+        if (!Ext2WriteBlock(mnt, diskBlock, blockBuf)) break;
+        bytesWritten += toCopy;
+    }
+
+    kfree(blockBuf);
+
+    // Update inode size if we extended the file
+    uint64_t newEnd = offset + bytesWritten;
+    if (newEnd > ino->i_size) {
+        ino->i_size = static_cast<uint32_t>(newEnd);
+        ino->i_blocks = static_cast<uint32_t>(
+            ((newEnd + mnt->blockSize - 1) >> mnt->blockShift) * (mnt->blockSize / 512));
+        Ext2WriteInode(mnt, inoNum, ino);
+    }
+
+    return static_cast<int>(bytesWritten);
+}
+
+// Free all data blocks of an inode (direct + indirect).
+static void Ext2FreeInodeBlocks(Ext2Mount* mnt, Ext2Inode* ino)
+{
+    uint32_t ptrsPerBlock = mnt->blockSize / 4;
+
+    // Direct blocks
+    for (int i = 0; i < 12; ++i) {
+        if (ino->i_block[i]) { Ext2FreeBlock(mnt, ino->i_block[i]); ino->i_block[i] = 0; }
+    }
+
+    // Singly indirect
+    if (ino->i_block[12]) {
+        auto* ind = static_cast<uint32_t*>(kmalloc(mnt->blockSize));
+        if (ind) {
+            Ext2ReadBlock(mnt, ino->i_block[12], ind);
+            for (uint32_t i = 0; i < ptrsPerBlock; ++i)
+                if (ind[i]) Ext2FreeBlock(mnt, ind[i]);
+            kfree(ind);
+        }
+        Ext2FreeBlock(mnt, ino->i_block[12]);
+        ino->i_block[12] = 0;
+    }
+
+    // Doubly indirect
+    if (ino->i_block[13]) {
+        auto* dind = static_cast<uint32_t*>(kmalloc(mnt->blockSize));
+        if (dind) {
+            Ext2ReadBlock(mnt, ino->i_block[13], dind);
+            for (uint32_t i = 0; i < ptrsPerBlock; ++i) {
+                if (dind[i]) {
+                    auto* ind = static_cast<uint32_t*>(kmalloc(mnt->blockSize));
+                    if (ind) {
+                        Ext2ReadBlock(mnt, dind[i], ind);
+                        for (uint32_t j = 0; j < ptrsPerBlock; ++j)
+                            if (ind[j]) Ext2FreeBlock(mnt, ind[j]);
+                        kfree(ind);
+                    }
+                    Ext2FreeBlock(mnt, dind[i]);
+                }
+            }
+            kfree(dind);
+        }
+        Ext2FreeBlock(mnt, ino->i_block[13]);
+        ino->i_block[13] = 0;
+    }
+
+    // Triply indirect — not freed for now (very large files rare in hobby OS)
+    ino->i_blocks = 0;
+    ino->i_size = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Directory manipulation
+// ---------------------------------------------------------------------------
+
+// Add a directory entry to a directory inode.
+static bool Ext2DirAdd(Ext2Mount* mnt, uint32_t dirIno, Ext2Inode* dirData,
+                       uint32_t childIno, const char* name, uint8_t fileType)
+{
+    uint32_t nameLen = 0;
+    for (const char* p = name; *p; ++p) ++nameLen;
+    if (nameLen == 0 || nameLen > 255) return false;
+
+    // Required size for new entry (8 bytes header + name, 4-byte aligned)
+    uint32_t neededLen = ((8 + nameLen + 3) / 4) * 4;
+
+    uint64_t dirSize = Ext2InodeSize(dirData);
+    auto* blockBuf = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+    if (!blockBuf) return false;
+
+    // Scan existing entries for space (look for slack in last entry's rec_len)
+    uint64_t off = 0;
+    while (off < dirSize) {
+        uint32_t fileBlock = static_cast<uint32_t>(off >> mnt->blockShift);
+        uint32_t diskBlock = Ext2BlockMap(mnt, dirData, fileBlock);
+        if (!diskBlock || !Ext2ReadBlock(mnt, diskBlock, blockBuf)) break;
+
+        uint32_t pos = 0;
+        while (pos < mnt->blockSize) {
+            auto* de = reinterpret_cast<Ext2DirEntry2*>(blockBuf + pos);
+            if (de->rec_len == 0) break;
+
+            // Calculate actual size of this entry
+            uint32_t actualLen = ((8 + de->name_len + 3) / 4) * 4;
+            if (de->inode == 0) actualLen = 0; // deleted entry uses no real space
+
+            uint32_t slack = de->rec_len - actualLen;
+            if (slack >= neededLen) {
+                // Split this entry
+                if (de->inode != 0) {
+                    de->rec_len = static_cast<uint16_t>(actualLen);
+                    pos += actualLen;
+                }
+                auto* newDe = reinterpret_cast<Ext2DirEntry2*>(blockBuf + pos);
+                newDe->inode = childIno;
+                newDe->rec_len = static_cast<uint16_t>(
+                    de->inode != 0 ? slack : de->rec_len);
+                newDe->name_len = static_cast<uint8_t>(nameLen);
+                newDe->file_type = fileType;
+                for (uint32_t i = 0; i < nameLen; ++i) newDe->name[i] = name[i];
+
+                Ext2WriteBlock(mnt, diskBlock, blockBuf);
+                kfree(blockBuf);
+                return true;
+            }
+
+            pos += de->rec_len;
+        }
+        off += mnt->blockSize;
+    }
+
+    // No space found — allocate a new block for the directory
+    uint32_t newBlock = Ext2EnsureBlock(mnt, dirData, dirIno,
+                                        static_cast<uint32_t>(dirSize >> mnt->blockShift));
+    if (!newBlock) { kfree(blockBuf); return false; }
+
+    // Fill the new block with our entry
+    for (uint32_t i = 0; i < mnt->blockSize; ++i) blockBuf[i] = 0;
+    auto* newDe = reinterpret_cast<Ext2DirEntry2*>(blockBuf);
+    newDe->inode = childIno;
+    newDe->rec_len = static_cast<uint16_t>(mnt->blockSize); // spans entire block
+    newDe->name_len = static_cast<uint8_t>(nameLen);
+    newDe->file_type = fileType;
+    for (uint32_t i = 0; i < nameLen; ++i) newDe->name[i] = name[i];
+
+    Ext2WriteBlock(mnt, newBlock, blockBuf);
+    kfree(blockBuf);
+
+    // Update directory size
+    dirData->i_size = static_cast<uint32_t>(dirSize + mnt->blockSize);
+    dirData->i_blocks = static_cast<uint32_t>(
+        ((dirData->i_size + mnt->blockSize - 1) >> mnt->blockShift) * (mnt->blockSize / 512));
+    Ext2WriteInode(mnt, dirIno, dirData);
+    return true;
+}
+
+// Remove a directory entry by name. Returns the removed inode number or 0.
+static uint32_t Ext2DirRemove(Ext2Mount* mnt, Ext2Inode* dirData,
+                              uint32_t dirIno, const char* name)
+{
+    uint32_t nameLen = 0;
+    for (const char* p = name; *p; ++p) ++nameLen;
+
+    uint64_t dirSize = Ext2InodeSize(dirData);
+    auto* blockBuf = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+    if (!blockBuf) return 0;
+
+    uint64_t off = 0;
+    while (off < dirSize) {
+        uint32_t fileBlock = static_cast<uint32_t>(off >> mnt->blockShift);
+        uint32_t diskBlock = Ext2BlockMap(mnt, dirData, fileBlock);
+        if (!diskBlock || !Ext2ReadBlock(mnt, diskBlock, blockBuf)) break;
+
+        uint32_t pos = 0;
+        Ext2DirEntry2* prevDe = nullptr;
+        while (pos < mnt->blockSize) {
+            auto* de = reinterpret_cast<Ext2DirEntry2*>(blockBuf + pos);
+            if (de->rec_len == 0) break;
+
+            if (de->inode != 0 && de->name_len == nameLen) {
+                bool match = true;
+                for (uint32_t i = 0; i < nameLen; ++i)
+                    if (de->name[i] != name[i]) { match = false; break; }
+                if (match) {
+                    uint32_t removedIno = de->inode;
+                    if (prevDe) {
+                        // Merge with previous entry
+                        prevDe->rec_len += de->rec_len;
+                    } else {
+                        // First entry in block — zero the inode
+                        de->inode = 0;
+                    }
+                    Ext2WriteBlock(mnt, diskBlock, blockBuf);
+                    kfree(blockBuf);
+                    return removedIno;
+                }
+            }
+            prevDe = de;
+            pos += de->rec_len;
+        }
+        off += mnt->blockSize;
+    }
+    kfree(blockBuf);
+    return 0;
+}
+
+// Resolve parent directory and extract final component from a path.
+// Returns parent inode number. Writes component name into `nameOut`.
+static uint32_t Ext2ResolveParent(Ext2Mount* mnt, const char* relPath,
+                                  char* nameOut, uint32_t nameOutSize)
+{
+    // Find last slash
+    const char* p = relPath;
+    while (*p == '/') ++p; // skip leading slashes
+    const char* lastSlash = nullptr;
+    for (const char* q = p; *q; ++q)
+        if (*q == '/') lastSlash = q;
+
+    if (!lastSlash) {
+        // No slash — parent is root, name is entire path
+        uint32_t i = 0;
+        while (p[i] && i < nameOutSize - 1) { nameOut[i] = p[i]; ++i; }
+        nameOut[i] = '\0';
+        return EXT2_ROOT_INO;
+    }
+
+    // Copy parent path
+    uint32_t parentLen = static_cast<uint32_t>(lastSlash - p);
+    char parentPath[256];
+    if (parentLen >= sizeof(parentPath)) return 0;
+    for (uint32_t i = 0; i < parentLen; ++i) parentPath[i] = p[i];
+    parentPath[parentLen] = '\0';
+
+    // Copy name (after last slash)
+    const char* name = lastSlash + 1;
+    while (*name == '/') ++name;
+    uint32_t ni = 0;
+    while (name[ni] && ni < nameOutSize - 1) { nameOut[ni] = name[ni]; ++ni; }
+    nameOut[ni] = '\0';
+
+    return Ext2ResolvePath(mnt, EXT2_ROOT_INO, parentPath, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -459,6 +981,16 @@ static int Ext2FileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
     return r;
 }
 
+static int Ext2FileWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset)
+{
+    auto* fp = static_cast<Ext2FilePriv*>(vn->priv);
+    KMutexLock(&g_ext2Lock);
+    int r = Ext2WriteInodeData(fp->mnt, &fp->inodeData, fp->inode, buf, len, *offset);
+    KMutexUnlock(&g_ext2Lock);
+    if (r > 0) *offset += r;
+    return r;
+}
+
 static void Ext2FileClose(Vnode* vn)
 {
     auto* fp = static_cast<Ext2FilePriv*>(vn->priv);
@@ -542,7 +1074,7 @@ static int Ext2DirStat(Vnode* vn, VnodeStat* st)
 static const VnodeOps g_ext2FileOps = {
     .open    = Ext2FileOpen,
     .read    = Ext2FileRead,
-    .write   = nullptr,    // read-only for now
+    .write   = Ext2FileWrite,
     .readdir = nullptr,
     .close   = Ext2FileClose,
     .stat    = Ext2FileStat,
@@ -636,6 +1168,9 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
     mnt->blocksPerGroup = sb.s_blocks_per_group;
     mnt->groupCount     = groupCount;
     mnt->firstDataBlock = sb.s_first_data_block;
+    mnt->totalInodes    = sb.s_inodes_count;
+    mnt->totalBlocks    = sb.s_blocks_count;
+    mnt->bgdtDiskOff    = bgdtOff;
     mnt->bgdt           = bgdt;
 
     *mountPriv = mnt;
@@ -656,26 +1191,60 @@ static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
 {
     (void)pdrv;
     auto* mnt = static_cast<Ext2Mount*>(mountPriv);
-    if (flags & VFS_O_WRITE) return nullptr; // read-only
 
     KMutexLock(&g_ext2Lock);
 
     // Handle root directory
     bool isRoot = (!relPath[0] || (relPath[0] == '/' && !relPath[1]));
-    uint32_t ino;
+    uint32_t ino = 0;
+    Ext2Inode inodeData;
+
     if (isRoot) {
         ino = EXT2_ROOT_INO;
     } else {
-        // Strip leading slash for resolve
         const char* p = relPath;
         while (*p == '/') ++p;
         ino = Ext2ResolvePath(mnt, EXT2_ROOT_INO, p, 0);
     }
 
+    // File not found — create if requested
+    if (!ino && (flags & VFS_O_CREATE)) {
+        char name[256];
+        uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name));
+        if (!parentIno || !name[0]) { KMutexUnlock(&g_ext2Lock); return nullptr; }
+
+        Ext2Inode parentData;
+        if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KMutexUnlock(&g_ext2Lock); return nullptr; }
+        if ((parentData.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) { KMutexUnlock(&g_ext2Lock); return nullptr; }
+
+        // Allocate new inode
+        ino = Ext2AllocInode(mnt, false);
+        if (!ino) { KMutexUnlock(&g_ext2Lock); return nullptr; }
+
+        // Initialize inode
+        for (uint32_t i = 0; i < sizeof(inodeData); ++i)
+            reinterpret_cast<uint8_t*>(&inodeData)[i] = 0;
+        inodeData.i_mode = EXT2_S_IFREG | 0644;
+        inodeData.i_links_count = 1;
+        Ext2WriteInode(mnt, ino, &inodeData);
+
+        // Add directory entry
+        if (!Ext2DirAdd(mnt, parentIno, &parentData, ino, name, 1 /*EXT2_FT_REG_FILE*/)) {
+            Ext2FreeInode(mnt, ino, false);
+            KMutexUnlock(&g_ext2Lock);
+            return nullptr;
+        }
+    }
+
     if (!ino) { KMutexUnlock(&g_ext2Lock); return nullptr; }
 
-    Ext2Inode inodeData;
     if (!Ext2ReadInode(mnt, ino, &inodeData)) { KMutexUnlock(&g_ext2Lock); return nullptr; }
+
+    // Truncate if requested
+    if ((flags & VFS_O_TRUNC) && (inodeData.i_mode & EXT2_S_IFMT) == EXT2_S_IFREG) {
+        Ext2FreeInodeBlocks(mnt, &inodeData);
+        Ext2WriteInode(mnt, ino, &inodeData);
+    }
 
     KMutexUnlock(&g_ext2Lock);
 
@@ -750,10 +1319,211 @@ static int Ext2FsStatPath(void* mountPriv, uint8_t pdrv,
     return 0;
 }
 
-// Read-only stubs
-static int Ext2FsUnlink(void*, uint8_t, const char*) { return -1; }
-static int Ext2FsMkdir(void*, uint8_t, const char*) { return -1; }
-static int Ext2FsRename(void*, uint8_t, const char*, const char*) { return -1; }
+// ---------------------------------------------------------------------------
+// VfsFsOps write operations
+// ---------------------------------------------------------------------------
+
+static int Ext2FsUnlink(void* mountPriv, uint8_t pdrv, const char* relPath)
+{
+    (void)pdrv;
+    auto* mnt = static_cast<Ext2Mount*>(mountPriv);
+
+    KMutexLock(&g_ext2Lock);
+
+    char name[256];
+    uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name));
+    if (!parentIno || !name[0]) { KMutexUnlock(&g_ext2Lock); return -1; }
+
+    Ext2Inode parentData;
+    if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KMutexUnlock(&g_ext2Lock); return -1; }
+
+    uint32_t removedIno = Ext2DirRemove(mnt, &parentData, parentIno, name);
+    if (!removedIno) { KMutexUnlock(&g_ext2Lock); return -1; }
+
+    // Decrement link count, free if zero
+    Ext2Inode removedData;
+    if (Ext2ReadInode(mnt, removedIno, &removedData)) {
+        removedData.i_links_count--;
+        if (removedData.i_links_count == 0) {
+            bool isDir = (removedData.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR;
+            Ext2FreeInodeBlocks(mnt, &removedData);
+            Ext2WriteInode(mnt, removedIno, &removedData);
+            Ext2FreeInode(mnt, removedIno, isDir);
+        } else {
+            Ext2WriteInode(mnt, removedIno, &removedData);
+        }
+    }
+
+    KMutexUnlock(&g_ext2Lock);
+    return 0;
+}
+
+static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath)
+{
+    (void)pdrv;
+    auto* mnt = static_cast<Ext2Mount*>(mountPriv);
+
+    KMutexLock(&g_ext2Lock);
+
+    char name[256];
+    uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name));
+    if (!parentIno || !name[0]) { KMutexUnlock(&g_ext2Lock); return -1; }
+
+    Ext2Inode parentData;
+    if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KMutexUnlock(&g_ext2Lock); return -1; }
+
+    // Check if already exists
+    if (Ext2DirLookup(mnt, &parentData, name)) {
+        KMutexUnlock(&g_ext2Lock);
+        return 0; // Already exists, not an error (like FAT driver)
+    }
+
+    // Allocate inode
+    uint32_t newIno = Ext2AllocInode(mnt, true);
+    if (!newIno) { KMutexUnlock(&g_ext2Lock); return -1; }
+
+    // Initialize directory inode
+    Ext2Inode newData;
+    for (uint32_t i = 0; i < sizeof(newData); ++i)
+        reinterpret_cast<uint8_t*>(&newData)[i] = 0;
+    newData.i_mode = EXT2_S_IFDIR | 0755;
+    newData.i_links_count = 2; // . and parent's entry
+
+    // Allocate first data block for . and .. entries
+    uint32_t dataBlock = Ext2AllocBlock(mnt);
+    if (!dataBlock) {
+        Ext2FreeInode(mnt, newIno, true);
+        KMutexUnlock(&g_ext2Lock);
+        return -1;
+    }
+
+    newData.i_block[0] = dataBlock;
+    newData.i_size = mnt->blockSize;
+    newData.i_blocks = mnt->blockSize / 512;
+
+    // Build . and .. entries
+    auto* blockBuf = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+    if (!blockBuf) {
+        Ext2FreeBlock(mnt, dataBlock);
+        Ext2FreeInode(mnt, newIno, true);
+        KMutexUnlock(&g_ext2Lock);
+        return -1;
+    }
+    for (uint32_t i = 0; i < mnt->blockSize; ++i) blockBuf[i] = 0;
+
+    // . entry
+    auto* dot = reinterpret_cast<Ext2DirEntry2*>(blockBuf);
+    dot->inode = newIno;
+    dot->rec_len = 12;
+    dot->name_len = 1;
+    dot->file_type = 2; // EXT2_FT_DIR
+    dot->name[0] = '.';
+
+    // .. entry (fills rest of block)
+    auto* dotdot = reinterpret_cast<Ext2DirEntry2*>(blockBuf + 12);
+    dotdot->inode = parentIno;
+    dotdot->rec_len = static_cast<uint16_t>(mnt->blockSize - 12);
+    dotdot->name_len = 2;
+    dotdot->file_type = 2;
+    dotdot->name[0] = '.';
+    dotdot->name[1] = '.';
+
+    Ext2WriteBlock(mnt, dataBlock, blockBuf);
+    kfree(blockBuf);
+
+    Ext2WriteInode(mnt, newIno, &newData);
+
+    // Add entry to parent
+    if (!Ext2DirAdd(mnt, parentIno, &parentData, newIno, name, 2 /*EXT2_FT_DIR*/)) {
+        // Rollback
+        Ext2FreeBlock(mnt, dataBlock);
+        Ext2FreeInode(mnt, newIno, true);
+        KMutexUnlock(&g_ext2Lock);
+        return -1;
+    }
+
+    // Increment parent link count (for ..)
+    parentData.i_links_count++;
+    Ext2WriteInode(mnt, parentIno, &parentData);
+
+    KMutexUnlock(&g_ext2Lock);
+    return 0;
+}
+
+static int Ext2FsRename(void* mountPriv, uint8_t pdrv,
+                        const char* oldRelPath, const char* newRelPath)
+{
+    (void)pdrv;
+    auto* mnt = static_cast<Ext2Mount*>(mountPriv);
+
+    KMutexLock(&g_ext2Lock);
+
+    // Resolve old path
+    char oldName[256];
+    uint32_t oldParentIno = Ext2ResolveParent(mnt, oldRelPath, oldName, sizeof(oldName));
+    if (!oldParentIno) { KMutexUnlock(&g_ext2Lock); return -1; }
+
+    Ext2Inode oldParentData;
+    if (!Ext2ReadInode(mnt, oldParentIno, &oldParentData)) { KMutexUnlock(&g_ext2Lock); return -1; }
+
+    // Look up the inode being moved
+    uint32_t targetIno = Ext2DirLookup(mnt, &oldParentData, oldName);
+    if (!targetIno) { KMutexUnlock(&g_ext2Lock); return -1; }
+
+    Ext2Inode targetData;
+    if (!Ext2ReadInode(mnt, targetIno, &targetData)) { KMutexUnlock(&g_ext2Lock); return -1; }
+
+    // Determine file type for new dir entry
+    uint8_t ft = 1; // EXT2_FT_REG_FILE
+    uint16_t mode = targetData.i_mode & EXT2_S_IFMT;
+    if (mode == EXT2_S_IFDIR) ft = 2;
+    else if (mode == EXT2_S_IFLNK) ft = 7;
+
+    // Resolve new path
+    char newName[256];
+    uint32_t newParentIno = Ext2ResolveParent(mnt, newRelPath, newName, sizeof(newName));
+    if (!newParentIno) { KMutexUnlock(&g_ext2Lock); return -1; }
+
+    Ext2Inode newParentData;
+    if (!Ext2ReadInode(mnt, newParentIno, &newParentData)) { KMutexUnlock(&g_ext2Lock); return -1; }
+
+    // Remove from old directory
+    Ext2DirRemove(mnt, &oldParentData, oldParentIno, oldName);
+
+    // Add to new directory
+    if (!Ext2DirAdd(mnt, newParentIno, &newParentData, targetIno, newName, ft)) {
+        // Try to re-add to old location on failure
+        Ext2DirAdd(mnt, oldParentIno, &oldParentData, targetIno, oldName, ft);
+        KMutexUnlock(&g_ext2Lock);
+        return -1;
+    }
+
+    // If moving a directory, update .. entry
+    if (mode == EXT2_S_IFDIR && oldParentIno != newParentIno) {
+        // Read first block of moved directory, update .. inode
+        auto* buf = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+        if (buf && targetData.i_block[0]) {
+            Ext2ReadBlock(mnt, targetData.i_block[0], buf);
+            // .. is the second entry (after .)
+            auto* dot = reinterpret_cast<Ext2DirEntry2*>(buf);
+            auto* dotdot = reinterpret_cast<Ext2DirEntry2*>(buf + dot->rec_len);
+            dotdot->inode = newParentIno;
+            Ext2WriteBlock(mnt, targetData.i_block[0], buf);
+            kfree(buf);
+
+            // Update link counts
+            oldParentData.i_links_count--;
+            Ext2WriteInode(mnt, oldParentIno, &oldParentData);
+            newParentData.i_links_count++;
+            Ext2WriteInode(mnt, newParentIno, &newParentData);
+        } else if (buf) {
+            kfree(buf);
+        }
+    }
+
+    KMutexUnlock(&g_ext2Lock);
+    return 0;
+}
 
 static const VfsFsOps g_ext2FsOps = {
     .mount     = Ext2FsMount,
