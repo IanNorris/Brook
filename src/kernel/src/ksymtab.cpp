@@ -76,6 +76,8 @@ EXPORT_SYMBOL(DeviceIterate);
 // VFS
 EXPORT_SYMBOL(VfsMount);
 EXPORT_SYMBOL(VfsUnmount);
+EXPORT_SYMBOL(VfsRegisterFs);
+EXPORT_SYMBOL(VfsUnregisterFs);
 EXPORT_SYMBOL(VfsOpen);
 EXPORT_SYMBOL(VfsRead);
 EXPORT_SYMBOL(VfsWrite);

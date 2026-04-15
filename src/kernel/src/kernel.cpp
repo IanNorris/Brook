@@ -26,6 +26,8 @@
 #include "process.h"
 #include "scheduler.h"
 #include "procfs.h"
+#include "fatfs_vfs.h"
+#include "procfs_vfs.h"
 #include "net.h"
 #include "compositor.h"
 #include "serial_writer.h"
@@ -224,7 +226,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     // ---- Device / VFS layer ----
     brook::BootLogoProgress(35, "Filesystem");
     brook::VfsInit();
+    brook::FatFsVfsRegister();   // register "fatfs" filesystem driver
     brook::ProcFsInit();
+    brook::ProcFsVfsRegister();  // register "procfs" filesystem driver
     brook::NetInit();
     brook::VfsMount("/proc", "procfs", 0);
 

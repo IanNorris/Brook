@@ -1,5 +1,4 @@
 #include "vfs.h"
-#include "fatfs_glue.h"
 #include "procfs.h"
 #include "memory/heap.h"
 #include "serial.h"
@@ -9,29 +8,80 @@
 // Forward-declare SchedulerYield — weak so test builds link without the scheduler.
 namespace brook { __attribute__((weak)) void SchedulerYield(); }
 
-extern "C" {
-#include "ff.h"
-}
-
 namespace brook {
 
-// Global lock protecting all FatFS operations. FatFS is NOT thread-safe —
-// concurrent f_read/f_open/f_lseek calls corrupt shared internal state.
-// Uses a sleeping mutex so blocked processes yield the CPU instead of spinning.
+// Global lock protecting VFS mount table and filesystem operations.
 static KMutex g_vfsLock;
+
+// ---- Filesystem driver registry ----
+
+static constexpr uint32_t VFS_MAX_FS_DRIVERS = 8;
+
+struct FsDriverEntry {
+    const char*      name;
+    const VfsFsOps*  ops;
+    bool             used;
+};
+
+static FsDriverEntry g_fsDrivers[VFS_MAX_FS_DRIVERS];
+
+static const VfsFsOps* FindFsDriver(const char* name)
+{
+    for (uint32_t i = 0; i < VFS_MAX_FS_DRIVERS; ++i)
+    {
+        if (!g_fsDrivers[i].used) continue;
+        const char* a = g_fsDrivers[i].name;
+        const char* b = name;
+        while (*a && *b) { if (*a != *b) goto next; ++a; ++b; }
+        if (*a == *b) return g_fsDrivers[i].ops;
+    next:;
+    }
+    return nullptr;
+}
+
+bool VfsRegisterFs(const char* name, const VfsFsOps* ops)
+{
+    if (!name || !ops) return false;
+    for (uint32_t i = 0; i < VFS_MAX_FS_DRIVERS; ++i)
+    {
+        if (!g_fsDrivers[i].used)
+        {
+            g_fsDrivers[i].name = name;
+            g_fsDrivers[i].ops  = ops;
+            g_fsDrivers[i].used = true;
+            SerialPrintf("VFS: registered filesystem '%s'\n", name);
+            return true;
+        }
+    }
+    SerialPrintf("VFS: fs driver table full, cannot register '%s'\n", name);
+    return false;
+}
+
+bool VfsUnregisterFs(const char* name)
+{
+    if (!name) return false;
+    for (uint32_t i = 0; i < VFS_MAX_FS_DRIVERS; ++i)
+    {
+        if (!g_fsDrivers[i].used) continue;
+        const char* a = g_fsDrivers[i].name;
+        const char* b = name;
+        while (*a && *b) { if (*a != *b) goto next2; ++a; ++b; }
+        if (*a == *b) { g_fsDrivers[i].used = false; return true; }
+    next2:;
+    }
+    return false;
+}
 
 // ---- Mount table ----
 
 static constexpr uint32_t VFS_MAX_MOUNTS = 8;
 
-enum class FsType : uint8_t { FatFs, ProcFs };
-
 struct MountEntry {
-    char    mountPoint[64]; // e.g. "/" or "/boot" or "/proc"
-    FsType  type;           // Filesystem type
-    FATFS*  fs;             // FatFS work area (heap-allocated at mount time; null for virtual FS)
-    uint8_t pdrv;           // FatFS physical drive number (unused for virtual FS)
-    bool    used;
+    char             mountPoint[64];
+    const VfsFsOps*  fsOps;       // filesystem driver vtable
+    void*            mountPriv;   // filesystem-private mount data
+    uint8_t          pdrv;        // physical drive (for block FS)
+    bool             used;
 };
 
 static MountEntry g_mounts[VFS_MAX_MOUNTS];
@@ -58,26 +108,6 @@ static bool StrEq(const char* a, const char* b)
     return *a == *b;
 }
 
-// Build the FatFS path: "N:rest" where N is pdrv and rest is the path
-// relative to the mount point.
-static void BuildFatPath(char* out, uint32_t maxLen,
-                         uint8_t pdrv, const char* relPath)
-{
-    if (maxLen < 4) return;
-    out[0] = static_cast<char>('0' + pdrv);
-    out[1] = ':';
-    // relPath starts with '/' already; skip leading '/' if relPath == "/"
-    uint32_t i = 2;
-    if (!relPath[0] || (relPath[0] == '/' && !relPath[1])) {
-        out[i++] = '/';
-        out[i] = '\0';
-    } else {
-        const char* p = relPath;
-        while (*p && i + 1 < maxLen) out[i++] = *p++;
-        out[i] = '\0';
-    }
-}
-
 // Find the best (longest-prefix) mount for a given absolute path.
 // Returns the mount entry and sets *relPath to the path within the mount.
 static MountEntry* FindMount(const char* absPath, const char** relPath)
@@ -89,13 +119,11 @@ static MountEntry* FindMount(const char* absPath, const char** relPath)
     {
         if (!g_mounts[i].used) continue;
         uint32_t mpLen = StrLen(g_mounts[i].mountPoint);
-        // Check that absPath starts with mountPoint.
         bool match = true;
         for (uint32_t j = 0; j < mpLen; ++j) {
             if (absPath[j] != g_mounts[i].mountPoint[j]) { match = false; break; }
         }
         if (!match) continue;
-        // Root mount "/" matches everything; for others, the next char must be '/' or '\0'.
         if (mpLen > 1 && absPath[mpLen] != '\0' && absPath[mpLen] != '/') continue;
         if (mpLen > bestLen) { bestLen = mpLen; best = &g_mounts[i]; }
     }
@@ -108,298 +136,13 @@ static MountEntry* FindMount(const char* absPath, const char** relPath)
     return best;
 }
 
-// ---- FatFS vnode ops ----
-
-// Cached file: entire file contents loaded into memory for fast random access.
-// Multiple vnodes can share the same CachedFile via refCount.
-struct CachedFile {
-    FIL*     fil;       // Original FatFS handle (closed when refCount→0)
-    uint8_t* data;      // nullptr while loading
-    uint64_t size;
-    int32_t  refCount;  // Number of vnodes sharing this cache entry
-    volatile bool loading; // True while initial load in progress
-    char     path[64];  // Canonical path for dedup (e.g. "0:/DOOM1.WAD")
-};
-
-// Global shared file cache — small fixed table for dedup across openers.
-static constexpr uint32_t FILE_CACHE_MAX = 16;
-static CachedFile* g_fileCache[FILE_CACHE_MAX] = {};
-
-// Look up an existing cache entry by FatFS path (caller must hold g_vfsLock).
-static CachedFile* FileCacheLookup(const char* fatPath)
-{
-    for (uint32_t i = 0; i < FILE_CACHE_MAX; ++i) {
-        if (g_fileCache[i] && StrEq(g_fileCache[i]->path, fatPath))
-            return g_fileCache[i];
-    }
-    return nullptr;
-}
-
-// Insert a new cache entry (caller must hold g_vfsLock). Returns false if table full.
-static bool FileCacheInsert(CachedFile* cf)
-{
-    for (uint32_t i = 0; i < FILE_CACHE_MAX; ++i) {
-        if (!g_fileCache[i]) {
-            g_fileCache[i] = cf;
-            return true;
-        }
-    }
-    return false;
-}
-
-// Remove a cache entry (caller must hold g_vfsLock).
-static void FileCacheRemove(CachedFile* cf)
-{
-    for (uint32_t i = 0; i < FILE_CACHE_MAX; ++i) {
-        if (g_fileCache[i] == cf) {
-            g_fileCache[i] = nullptr;
-            return;
-        }
-    }
-}
-
-static int FatFileOpen(Vnode* vn, int flags)
-{
-    (void)vn; (void)flags;
-    return 0; // Already open by VfsOpen()
-}
-
-// Preload file into memory. Called on first read for files > threshold.
-// CacheFile — locks internally per-chunk so other CPUs can interleave.
-// Caller must NOT hold g_vfsLock. fatPath is stored for dedup lookups.
-static CachedFile* CacheFileUnlocked(FIL* fil, const char* fatPath)
-{
-    uint64_t size = f_size(fil);
-    auto* cf = static_cast<CachedFile*>(kmalloc(sizeof(CachedFile)));
-    if (!cf) return nullptr;
-
-    cf->fil      = fil;
-    cf->size     = size;
-    cf->refCount = 1;
-    cf->loading  = false;
-    // Store path for dedup lookups
-    uint32_t pi = 0;
-    for (; fatPath[pi] && pi < sizeof(cf->path) - 1; ++pi) cf->path[pi] = fatPath[pi];
-    cf->path[pi] = '\0';
-
-    // Use VmmAllocPages for large allocations (kmalloc can't do multi-MB).
-    uint64_t numPages = (size + 4095) / 4096;
-    cf->data = static_cast<uint8_t*>(
-        reinterpret_cast<void*>(VmmAllocPages(numPages, VMM_WRITABLE, MemTag::KernelData).raw()));
-    if (!cf->data) {
-        SerialPrintf("VFS: cache alloc failed (%lu pages)\n", (unsigned long)numPages);
-        kfree(cf);
-        return nullptr;
-    }
-
-    // Read entire file — acquire VFS lock per chunk to allow interleaving.
-    // Use 64 KB chunks to match the VirtIO DMA buffer size.
-    {
-        KMutexLock(&g_vfsLock);
-        f_lseek(fil, 0);
-        KMutexUnlock(&g_vfsLock);
-    }
-    uint64_t remaining = size;
-    uint64_t off = 0;
-    while (remaining > 0) {
-        UINT chunk = (remaining > 65536) ? 65536 : static_cast<UINT>(remaining);
-        UINT br = 0;
-        KMutexLock(&g_vfsLock);
-        FRESULT res = f_read(fil, cf->data + off, chunk, &br);
-        KMutexUnlock(&g_vfsLock);
-        if (res != FR_OK || br == 0) {
-            SerialPrintf("VFS: cache read failed at off=%lu (res=%u)\n",
-                         (unsigned long)off, (unsigned)res);
-            VmmFreePages(VirtualAddress(reinterpret_cast<uint64_t>(cf->data)), numPages);
-            kfree(cf);
-            return nullptr;
-        }
-        off += br;
-        remaining -= br;
-    }
-    DbgPrintf("VFS: cached file (%lu bytes, %lu pages)\n",
-                 (unsigned long)size, (unsigned long)numPages);
-    return cf;
-}
-
-static int CachedFileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
-{
-    auto* cf = static_cast<CachedFile*>(vn->priv);
-    if (*offset >= cf->size) return 0;
-    uint64_t avail = cf->size - *offset;
-    if (len > avail) len = avail;
-    auto* dst = static_cast<uint8_t*>(buf);
-    auto* src = cf->data + *offset;
-    for (uint64_t i = 0; i < len; ++i) dst[i] = src[i];
-    *offset += len;
-    return static_cast<int>(len);
-}
-
-static void CachedFileClose(Vnode* vn)
-{
-    auto* cf = static_cast<CachedFile*>(vn->priv);
-    if (!cf) return;
-
-    // Decrement refcount under VFS lock (protects the cache table).
-    KMutexLock(&g_vfsLock);
-    int32_t refs = --cf->refCount;
-    if (refs <= 0)
-        FileCacheRemove(cf);
-    KMutexUnlock(&g_vfsLock);
-
-    if (refs <= 0) {
-        if (cf->fil) f_close(cf->fil);
-        if (cf->data) {
-            uint64_t numPages = (cf->size + 4095) / 4096;
-            VmmFreePages(VirtualAddress(reinterpret_cast<uint64_t>(cf->data)), numPages);
-        }
-        kfree(cf);
-    }
-}
-
-static int CachedFileStat(Vnode* vn, VnodeStat* st)
-{
-    auto* cf = static_cast<CachedFile*>(vn->priv);
-    st->size  = cf->size;
-    st->isDir = false;
-    return 0;
-}
-
-static const VnodeOps g_cachedFileOps = {
-    .open    = FatFileOpen,
-    .read    = CachedFileRead,
-    .write   = nullptr,
-    .readdir = nullptr,
-    .close   = CachedFileClose,
-    .stat    = CachedFileStat,
-};
-
-static int FatFileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
-{
-    FIL* fil = static_cast<FIL*>(vn->priv);
-
-    KMutexLock(&g_vfsLock);
-
-    // Seek if needed.
-    if (f_tell(fil) != *offset)
-    {
-        if (f_lseek(fil, static_cast<FSIZE_t>(*offset)) != FR_OK)
-        {
-            KMutexUnlock(&g_vfsLock);
-            return -1;
-        }
-    }
-
-    UINT br = 0;
-    FRESULT res = f_read(fil, buf, static_cast<UINT>(len), &br);
-    KMutexUnlock(&g_vfsLock);
-
-    if (res != FR_OK) return -1;
-
-    *offset += br;
-    return static_cast<int>(br);
-}
-
-static int FatFileWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset)
-{
-    FIL* fil = static_cast<FIL*>(vn->priv);
-
-    KMutexLock(&g_vfsLock);
-    if (f_tell(fil) != *offset) {
-        if (f_lseek(fil, static_cast<FSIZE_t>(*offset)) != FR_OK) {
-            KMutexUnlock(&g_vfsLock);
-            return -1;
-        }
-    }
-    UINT bw = 0;
-    FRESULT res = f_write(fil, buf, static_cast<UINT>(len), &bw);
-    KMutexUnlock(&g_vfsLock);
-
-    if (res != FR_OK) return -1;
-    *offset += bw;
-    return static_cast<int>(bw);
-}
-
-static int FatDirReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
-{
-    DIR* dir = static_cast<DIR*>(vn->priv);
-    (void)cookie; // FatFS DIR maintains its own iterator state
-
-    KMutexLock(&g_vfsLock);
-    FILINFO fno;
-    FRESULT res = f_readdir(dir, &fno);
-    KMutexUnlock(&g_vfsLock);
-
-    if (res != FR_OK) { SerialPrintf("VFS: readdir failed (res=%u)\n", static_cast<unsigned>(res)); return -1; }
-    if (fno.fname[0] == '\0') return 0; // end of directory
-
-    DbgPrintf("VFS: readdir entry: '%s' (%s, %lu bytes)\n",
-                 fno.fname, (fno.fattrib & AM_DIR) ? "dir" : "file",
-                 static_cast<unsigned long>(fno.fsize));
-    StrCopy(out->name, fno.fname, sizeof(out->name));
-    out->size  = fno.fsize;
-    out->isDir = (fno.fattrib & AM_DIR) != 0;
-    return 1;
-}
-
-static void FatFileClose(Vnode* vn)
-{
-    KMutexLock(&g_vfsLock);
-    if (vn->type == VnodeType::File)
-    {
-        FIL* fil = static_cast<FIL*>(vn->priv);
-        f_close(fil);
-        kfree(fil);
-    }
-    else
-    {
-        DIR* dir = static_cast<DIR*>(vn->priv);
-        f_closedir(dir);
-        kfree(dir);
-    }
-    KMutexUnlock(&g_vfsLock);
-}
-
-static int FatStat(Vnode* vn, VnodeStat* st)
-{
-    if (vn->type == VnodeType::File)
-    {
-        FIL* fil = static_cast<FIL*>(vn->priv);
-        st->size  = f_size(fil);
-        st->isDir = false;
-    }
-    else
-    {
-        st->size  = 0;
-        st->isDir = true;
-    }
-    return 0;
-}
-
-static const VnodeOps g_fatFileOps = {
-    .open    = FatFileOpen,
-    .read    = FatFileRead,
-    .write   = FatFileWrite,
-    .readdir = nullptr,
-    .close   = FatFileClose,
-    .stat    = FatStat,
-};
-
-static const VnodeOps g_fatDirOps = {
-    .open    = FatFileOpen,
-    .read    = nullptr,
-    .write   = nullptr,
-    .readdir = FatDirReaddir,
-    .close   = FatFileClose,
-    .stat    = FatStat,
-};
-
 // ---- Public API ----
 
 void VfsInit()
 {
     KMutexInit(&g_vfsLock);
     for (uint32_t i = 0; i < VFS_MAX_MOUNTS; ++i) g_mounts[i].used = false;
+    for (uint32_t i = 0; i < VFS_MAX_FS_DRIVERS; ++i) g_fsDrivers[i].used = false;
     SerialPuts("VFS: initialised\n");
 }
 
@@ -407,10 +150,8 @@ bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
 {
     if (!mountPoint || !fsName) return false;
 
-    bool isProcFs = StrEq(fsName, "procfs");
-    bool isFatFs  = StrEq(fsName, "fatfs");
-
-    if (!isProcFs && !isFatFs)
+    const VfsFsOps* ops = FindFsDriver(fsName);
+    if (!ops)
     {
         SerialPrintf("VFS: unknown filesystem '%s'\n", fsName);
         return false;
@@ -424,50 +165,21 @@ bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
     }
     if (!slot) { SerialPuts("VFS: mount table full\n"); return false; }
 
-    if (isProcFs)
+    // Call filesystem's mount callback
+    void* priv = nullptr;
+    if (!ops->mount(pdrv, &priv))
     {
-        slot->type = FsType::ProcFs;
-        slot->fs   = nullptr;
-        slot->pdrv = 0;
-        slot->used = true;
-        StrCopy(slot->mountPoint, mountPoint, sizeof(slot->mountPoint));
-        DbgPrintf("VFS: mounted procfs at '%s'\n", mountPoint);
-        return true;
-    }
-
-    // FatFS path
-    auto* fs = static_cast<FATFS*>(kmalloc(sizeof(FATFS)));
-    if (!fs) { SerialPuts("VFS: kmalloc failed for FATFS\n"); return false; }
-
-    char fatPath[8];
-    fatPath[0] = static_cast<char>('0' + pdrv);
-    fatPath[1] = ':'; fatPath[2] = '\0';
-
-    KMutexLock(&g_vfsLock);
-    FRESULT res = f_mount(fs, fatPath, 1);
-    KMutexUnlock(&g_vfsLock);
-
-    if (res != FR_OK)
-    {
-        SerialPrintf("VFS: f_mount failed (res=%u) for drive %u\n",
-                     static_cast<unsigned>(res), pdrv);
-        kfree(fs);
+        SerialPrintf("VFS: mount failed for '%s' at '%s'\n", fsName, mountPoint);
         return false;
     }
 
-    slot->type = FsType::FatFs;
-    slot->fs   = fs;
-    slot->pdrv = pdrv;
-    slot->used = true;
+    slot->fsOps      = ops;
+    slot->mountPriv  = priv;
+    slot->pdrv       = pdrv;
+    slot->used       = true;
     StrCopy(slot->mountPoint, mountPoint, sizeof(slot->mountPoint));
 
-    // Diagnostic: show physical page backing the FATFS.win buffer
-    uint64_t winVirt = reinterpret_cast<uint64_t>(&fs->win[0]);
-    [[maybe_unused]] uint64_t winPhys = VmmVirtToPhys(KernelPageTable, VirtualAddress(winVirt)).raw();
-    DbgPrintf("VFS: FATFS.win virt=0x%lx phys=0x%lx (sizeof FATFS=%lu)\n",
-                 winVirt, winPhys, static_cast<unsigned long>(sizeof(FATFS)));
-
-    DbgPrintf("VFS: mounted fatfs drive %u at '%s'\n", pdrv, mountPoint);
+    DbgPrintf("VFS: mounted '%s' at '%s' (pdrv=%u)\n", fsName, mountPoint, pdrv);
     return true;
 }
 
@@ -479,19 +191,8 @@ bool VfsUnmount(const char* mountPoint)
         if (!g_mounts[i].used) continue;
         if (!StrEq(g_mounts[i].mountPoint, mountPoint)) continue;
 
-        if (g_mounts[i].type == FsType::FatFs)
-        {
-            char fatPath[8];
-            fatPath[0] = static_cast<char>('0' + g_mounts[i].pdrv);
-            fatPath[1] = ':'; fatPath[2] = '\0';
-
-            KMutexLock(&g_vfsLock);
-            f_unmount(fatPath);
-            KMutexUnlock(&g_vfsLock);
-
-            kfree(g_mounts[i].fs);
-            g_mounts[i].fs = nullptr;
-        }
+        if (g_mounts[i].fsOps && g_mounts[i].fsOps->unmount)
+            g_mounts[i].fsOps->unmount(g_mounts[i].mountPriv);
 
         g_mounts[i].used = false;
         SerialPrintf("VFS: unmounted '%s'\n", mountPoint);
@@ -512,194 +213,8 @@ Vnode* VfsOpen(const char* path, int flags)
         return nullptr;
     }
 
-    // Dispatch to virtual filesystems
-    if (mount->type == FsType::ProcFs)
-    {
-        // relPath is relative to /proc, e.g. "meminfo" or "1/stat"
-        // For /proc itself (readdir), relPath will be "" or "/"
-        if (!relPath || !relPath[0] || (relPath[0] == '/' && !relPath[1]))
-            return ProcFsOpenDir(relPath);
-        // Strip leading slash
-        const char* p = relPath;
-        if (p[0] == '/') p++;
-        return ProcFsOpen(p, flags);
-    }
-
-    char fatPath[256];
-    BuildFatPath(fatPath, sizeof(fatPath), mount->pdrv, relPath);
-
-    // Try as a file first.
-    auto* fil = static_cast<FIL*>(kmalloc(sizeof(FIL)));
-    if (!fil) return nullptr;
-
-    BYTE mode = FA_READ;
-    if (flags & VFS_O_WRITE)  mode |= FA_WRITE;
-    if (flags & VFS_O_CREATE) mode |= (flags & VFS_O_TRUNC) ? FA_CREATE_ALWAYS : FA_OPEN_ALWAYS;
-    if (flags & VFS_O_TRUNC)  mode |= FA_CREATE_ALWAYS;
-    DbgPrintf("VFS: f_open('%s', mode=0x%x)\n", fatPath, mode);
-
-    // Check shared cache first (read-only opens only).
-    if (!(flags & VFS_O_WRITE)) {
-        KMutexLock(&g_vfsLock);
-        CachedFile* existing = FileCacheLookup(fatPath);
-        if (existing) {
-            existing->refCount++;
-            KMutexUnlock(&g_vfsLock);
-            kfree(fil); // Don't need FatFS handle — sharing cached data
-
-            // If another thread is still loading this file, yield until done.
-            while (__atomic_load_n(&existing->loading, __ATOMIC_ACQUIRE)) {
-                if (SchedulerYield)
-                    SchedulerYield();
-            }
-
-            if (!existing->data) {
-                // Loading failed — treat as uncached open
-                KMutexLock(&g_vfsLock);
-                existing->refCount--;
-                KMutexUnlock(&g_vfsLock);
-                return nullptr;
-            }
-
-            auto* vn = static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
-            if (!vn) {
-                KMutexLock(&g_vfsLock);
-                existing->refCount--;
-                KMutexUnlock(&g_vfsLock);
-                return nullptr;
-            }
-            vn->ops      = &g_cachedFileOps;
-            vn->type     = VnodeType::File;
-            vn->priv     = existing;
-            vn->refCount = 1;
-            DbgPrintf("VFS: sharing cached '%s' (refCount=%d)\n",
-                         fatPath, existing->refCount);
-            return vn;
-        }
-        KMutexUnlock(&g_vfsLock);
-    }
-
-    KMutexLock(&g_vfsLock);
-    FRESULT res = f_open(fil, fatPath, mode);
-    if (res != FR_OK)
-    {
-        KMutexUnlock(&g_vfsLock);
-        DbgPrintf("VFS: f_open('%s') result: %d\n", fatPath, (int)res);
-    }
-    if (res == FR_OK)
-    {
-        auto* vn = static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
-        if (!vn) { f_close(fil); KMutexUnlock(&g_vfsLock); kfree(fil); return nullptr; }
-
-        // Cache large read-only files entirely in memory for fast random access.
-        static constexpr uint64_t CACHE_THRESHOLD = 64 * 1024; // 64 KB
-        uint64_t fileSize = f_size(fil);
-        if (!(flags & VFS_O_WRITE) && fileSize >= CACHE_THRESHOLD)
-        {
-            // Insert a "loading" placeholder into the cache table immediately
-            // so other openers can wait for us instead of starting their own load.
-            auto* placeholder = static_cast<CachedFile*>(kmalloc(sizeof(CachedFile)));
-            if (placeholder) {
-                placeholder->fil      = fil;
-                placeholder->data     = nullptr;
-                placeholder->size     = fileSize;
-                placeholder->refCount = 1;
-                placeholder->loading  = true;
-                uint32_t pi = 0;
-                for (; fatPath[pi] && pi < sizeof(placeholder->path) - 1; ++pi)
-                    placeholder->path[pi] = fatPath[pi];
-                placeholder->path[pi] = '\0';
-                FileCacheInsert(placeholder);
-            }
-            KMutexUnlock(&g_vfsLock);
-
-            CachedFile* cf = CacheFileUnlocked(fil, fatPath);
-            if (cf && placeholder) {
-                // Transfer loaded data into the placeholder (which others may be waiting on).
-                placeholder->data = cf->data;
-                placeholder->size = cf->size;
-                __atomic_store_n(&placeholder->loading, false, __ATOMIC_RELEASE);
-
-                // Free the temporary CachedFile from CacheFileUnlocked (data ownership transferred).
-                cf->data = nullptr;
-                kfree(cf);
-
-                vn->ops      = &g_cachedFileOps;
-                vn->type     = VnodeType::File;
-                vn->priv     = placeholder;
-                vn->refCount = 1;
-                return vn;
-            }
-            if (placeholder) {
-                // Loading failed — mark placeholder as done (data=nullptr signals failure)
-                __atomic_store_n(&placeholder->loading, false, __ATOMIC_RELEASE);
-            }
-            if (cf) {
-                // No placeholder but cache succeeded — insert directly
-                KMutexLock(&g_vfsLock);
-                FileCacheInsert(cf);
-                KMutexUnlock(&g_vfsLock);
-                vn->ops      = &g_cachedFileOps;
-                vn->type     = VnodeType::File;
-                vn->priv     = cf;
-                vn->refCount = 1;
-                return vn;
-            }
-            // Cache failed — fall through to uncached path
-        }
-        else
-        {
-            KMutexUnlock(&g_vfsLock);
-        }
-
-        vn->ops      = &g_fatFileOps;
-        vn->type     = VnodeType::File;
-        vn->priv     = fil;
-        vn->refCount = 1;
-
-        // Seek to end for append mode.
-        if (flags & VFS_O_APPEND)
-        {
-            KMutexLock(&g_vfsLock);
-            f_lseek(fil, f_size(fil));
-            KMutexUnlock(&g_vfsLock);
-        }
-
-        return vn;
-    }
-    if (res != FR_NO_FILE && res != FR_NO_PATH)
-        DbgPrintf("VFS: f_open('%s') failed: %d\n", fatPath, (int)res);
-    kfree(fil);
-
-    // Try as a directory.
-    auto* dir = static_cast<DIR*>(kmalloc(sizeof(DIR)));
-    if (!dir) return nullptr;
-
-    KMutexLock(&g_vfsLock);
-    res = f_opendir(dir, fatPath);
-    KMutexUnlock(&g_vfsLock);
-
-    if (res == FR_OK)
-    {
-        DbgPrintf("VFS: opened dir '%s' (fatpath='%s')\n", path, fatPath);
-        auto* vn = static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
-        if (!vn) {
-            KMutexLock(&g_vfsLock);
-            f_closedir(dir);
-            KMutexUnlock(&g_vfsLock);
-            kfree(dir);
-            return nullptr;
-        }
-        vn->ops      = &g_fatDirOps;
-        vn->type     = VnodeType::Dir;
-        vn->priv     = dir;
-        vn->refCount = 1;
-        return vn;
-    }
-    kfree(dir);
-
-    DbgPrintf("VFS: cannot open '%s' (fatpath='%s')\n", path, fatPath);
-    return nullptr;
+    if (!mount->fsOps || !mount->fsOps->open) return nullptr;
+    return mount->fsOps->open(mount->mountPriv, mount->pdrv, relPath, flags);
 }
 
 int VfsRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
@@ -734,47 +249,16 @@ int VfsStatPath(const char* path, VnodeStat* st)
     MountEntry* mount   = FindMount(path, &relPath);
     if (!mount) return -1;
 
-    // Dispatch to virtual filesystems
-    if (mount->type == FsType::ProcFs)
-    {
-        const char* p = (relPath && relPath[0] == '/') ? relPath + 1 : relPath;
-        if (!p || !p[0]) { st->size = 0; st->isDir = true; return 0; }
-        return ProcFsStatPath(p, st);
-    }
-
-    char fatPath[256];
-    BuildFatPath(fatPath, sizeof(fatPath), mount->pdrv, relPath);
-
-    // Check for root directory
-    bool isRoot = (relPath[0] == '/' && relPath[1] == '\0') || relPath[0] == '\0';
-    if (isRoot) {
-        st->size  = 0;
-        st->isDir = true;
-        return 0;
-    }
-
-    FILINFO fno;
-    KMutexLock(&g_vfsLock);
-    FRESULT res = f_stat(fatPath, &fno);
-    KMutexUnlock(&g_vfsLock);
-
-    if (res != FR_OK) return -1;
-
-    st->isDir = (fno.fattrib & AM_DIR) != 0;
-    st->size  = st->isDir ? 0 : fno.fsize;
-    return 0;
+    if (!mount->fsOps || !mount->fsOps->stat_path) return -1;
+    return mount->fsOps->stat_path(mount->mountPriv, mount->pdrv, relPath, st);
 }
 
 int VfsSync(Vnode* vn)
 {
-    if (!vn || vn->type != VnodeType::File) return -1;
-    // Only works for direct FatFS files (not cached).
-    if (vn->ops != &g_fatFileOps) return 0;
-    FIL* fil = static_cast<FIL*>(vn->priv);
-    KMutexLock(&g_vfsLock);
-    FRESULT res = f_sync(fil);
-    KMutexUnlock(&g_vfsLock);
-    return (res == FR_OK) ? 0 : -1;
+    // Sync is vnode-ops based — handled by the filesystem's close/write ops.
+    // For now, no generic sync path; filesystems implement it in their vnode ops.
+    (void)vn;
+    return 0;
 }
 
 int VfsUnlink(const char* path)
@@ -782,15 +266,8 @@ int VfsUnlink(const char* path)
     if (!path || !path[0]) return -1;
     const char* relPath = nullptr;
     MountEntry* mount = FindMount(path, &relPath);
-    if (!mount) return -1;
-
-    char fatPath[256];
-    BuildFatPath(fatPath, sizeof(fatPath), mount->pdrv, relPath);
-
-    KMutexLock(&g_vfsLock);
-    FRESULT res = f_unlink(fatPath);
-    KMutexUnlock(&g_vfsLock);
-    return (res == FR_OK) ? 0 : -1;
+    if (!mount || !mount->fsOps || !mount->fsOps->unlink) return -1;
+    return mount->fsOps->unlink(mount->mountPriv, mount->pdrv, relPath);
 }
 
 int VfsMkdir(const char* path)
@@ -798,15 +275,8 @@ int VfsMkdir(const char* path)
     if (!path || !path[0]) return -1;
     const char* relPath = nullptr;
     MountEntry* mount = FindMount(path, &relPath);
-    if (!mount) return -1;
-
-    char fatPath[256];
-    BuildFatPath(fatPath, sizeof(fatPath), mount->pdrv, relPath);
-
-    KMutexLock(&g_vfsLock);
-    FRESULT res = f_mkdir(fatPath);
-    KMutexUnlock(&g_vfsLock);
-    return (res == FR_OK || res == FR_EXIST) ? 0 : -1;
+    if (!mount || !mount->fsOps || !mount->fsOps->mkdir) return -1;
+    return mount->fsOps->mkdir(mount->mountPriv, mount->pdrv, relPath);
 }
 
 int VfsRename(const char* oldPath, const char* newPath)
@@ -817,15 +287,8 @@ int VfsRename(const char* oldPath, const char* newPath)
     MountEntry* mountOld = FindMount(oldPath, &relOld);
     MountEntry* mountNew = FindMount(newPath, &relNew);
     if (!mountOld || !mountNew || mountOld != mountNew) return -1;
-
-    char fatOld[256], fatNew[256];
-    BuildFatPath(fatOld, sizeof(fatOld), mountOld->pdrv, relOld);
-    BuildFatPath(fatNew, sizeof(fatNew), mountNew->pdrv, relNew);
-
-    KMutexLock(&g_vfsLock);
-    FRESULT res = f_rename(fatOld, fatNew);
-    KMutexUnlock(&g_vfsLock);
-    return (res == FR_OK) ? 0 : -1;
+    if (!mountOld->fsOps || !mountOld->fsOps->rename) return -1;
+    return mountOld->fsOps->rename(mountOld->mountPriv, mountOld->pdrv, relOld, relNew);
 }
 
 void VfsClose(Vnode* vn)

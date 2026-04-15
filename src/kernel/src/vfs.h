@@ -61,6 +61,49 @@ static constexpr int VFS_O_CREATE = 0x02;  // Create file if it doesn't exist
 static constexpr int VFS_O_TRUNC  = 0x04;  // Truncate existing file
 static constexpr int VFS_O_APPEND = 0x08;  // Seek to end after open
 
+// ---- Filesystem driver interface ----
+//
+// A filesystem driver registers a set of callbacks.  The VFS dispatches
+// open/stat/unlink/mkdir/rename to the correct driver based on the mount table.
+// Each driver is identified by a short name (e.g. "fatfs", "procfs").
+
+struct VfsFsOps {
+    // Mount: called when VfsMount() is invoked with this FS name.
+    // pdrv is passed through for block-device filesystems (0 for virtual FS).
+    // *mountPriv is stored in the mount entry for later use by other callbacks.
+    // Return true on success.
+    bool (*mount)(uint8_t pdrv, void** mountPriv);
+
+    // Unmount: clean up mount-private state.
+    void (*unmount)(void* mountPriv);
+
+    // Open a file or directory.  relPath is relative to the mount point.
+    // Returns a Vnode* on success, nullptr on failure.
+    Vnode* (*open)(void* mountPriv, uint8_t pdrv, const char* relPath, int flags);
+
+    // Stat by relative path (no open required).  Returns 0 on success.
+    int (*stat_path)(void* mountPriv, uint8_t pdrv, const char* relPath, VnodeStat* st);
+
+    // Delete a file.  Returns 0 on success.
+    int (*unlink)(void* mountPriv, uint8_t pdrv, const char* relPath);
+
+    // Create a directory.  Returns 0 on success.
+    int (*mkdir)(void* mountPriv, uint8_t pdrv, const char* relPath);
+
+    // Rename.  Returns 0 on success.
+    int (*rename)(void* mountPriv, uint8_t pdrv,
+                  const char* oldRelPath, const char* newRelPath);
+};
+
+// Register a filesystem driver with the VFS.
+// name: short identifier (e.g. "fatfs").  Must remain valid for lifetime of driver.
+// ops: pointer to VfsFsOps vtable.  Must remain valid for lifetime of driver.
+// Returns true on success.
+extern "C" bool VfsRegisterFs(const char* name, const VfsFsOps* ops);
+
+// Unregister a filesystem driver.  Existing mounts using it are NOT affected.
+extern "C" bool VfsUnregisterFs(const char* name);
+
 // ---- VFS API ----
 
 // Initialise the VFS subsystem (call once at boot).
