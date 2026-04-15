@@ -2,7 +2,7 @@
 //
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 // Handles PT_LOAD segments, PT_TLS, program break setup.
-// Static linking only (no dynamic linker / PT_INTERP).
+// Supports dynamic linking via PT_INTERP (see LoadInterpreter in process.cpp).
 
 #include "elf.h"
 #include "process.h"

@@ -1,0 +1,3 @@
+# Brook OS — Dynamic linking test
+
+run /boot/BIN/DYNTEST
