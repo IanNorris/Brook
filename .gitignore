@@ -49,3 +49,4 @@ brook_disk.img
 # Game data / large assets
 *.wad
 data/wallpaper.raw
+brook_ext2_disk.img

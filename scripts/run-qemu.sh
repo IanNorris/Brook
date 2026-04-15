@@ -151,6 +151,14 @@ if [ ! -f "${DISK_IMG}" ]; then
     "${SCRIPT_DIR}/update_disk.sh"
 fi
 
+# Optional ext2 disk image (added as second virtio drive)
+EXT2_DISK="${BROOK_EXT2_DISK:-${ROOT_DIR}/brook_ext2_disk.img}"
+EXT2_DRIVE=""
+if [ -f "${EXT2_DISK}" ]; then
+    EXT2_DRIVE="-drive if=virtio,format=raw,file=${EXT2_DISK},file.locking=off"
+    echo "  Ext2 disk: ${EXT2_DISK}"
+fi
+
 # Select boot script: --script <name> copies data/scripts/<name>.rc to INIT.RC
 # on the disk image. Without --script, the existing INIT.RC is used.
 if [ -n "${SCRIPT_NAME}" ]; then
@@ -197,6 +205,7 @@ qemu-system-x86_64 \
     -drive if=pflash,format=raw,file="${OVMF_VARS_COPY}" \
     -drive format=raw,file=fat:rw:"${BUILD_DIR}/esp" \
     -drive if=virtio,format=raw,file="${DISK_IMG}",file.locking=off \
+    ${EXT2_DRIVE} \
     -device virtio-tablet-pci \
     -device virtio-net-pci,netdev=net0 \
     -netdev user,id=net0 \

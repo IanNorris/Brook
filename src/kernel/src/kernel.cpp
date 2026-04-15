@@ -27,6 +27,7 @@
 #include "scheduler.h"
 #include "procfs.h"
 #include "fatfs_vfs.h"
+#include "ext2_vfs.h"
 #include "procfs_vfs.h"
 #include "net.h"
 #include "compositor.h"
@@ -227,6 +228,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::BootLogoProgress(35, "Filesystem");
     brook::VfsInit();
     brook::FatFsVfsRegister();   // register "fatfs" filesystem driver
+    brook::Ext2VfsRegister();    // register "ext2" filesystem driver
     brook::ProcFsInit();
     brook::ProcFsVfsRegister();  // register "procfs" filesystem driver
     brook::NetInit();
@@ -318,7 +320,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     {
         brook::KPrintf("virtio: found %u device(s)\n", vioCount);
 
-        // Probe each virtio drive: bind to FatFS, look for BROOK.MNT.
+        // Probe each virtio drive: try FAT first, then ext2.
         // FatFS physical drives: 0 = ramdisk, 1..N = virtio0..N-1
         bool bootVolumeFound = false;
         for (uint32_t i = 0; i < vioCount && !bootVolumeFound; ++i)
@@ -331,12 +333,22 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             if (!vd) continue;
 
             uint8_t pdrv = static_cast<uint8_t>(i + 1); // pdrv 1+ for virtio
-            brook::FatFsBindDrive(pdrv, vd);
 
-            // Try mounting — FatFS will return FR_OK only if it sees a valid FAT volume.
-            if (!brook::VfsMount("/mnt/probe", "fatfs", pdrv))
+            // Try FAT first
+            brook::FatFsBindDrive(pdrv, vd);
+            bool mounted = brook::VfsMount("/mnt/probe", "fatfs", pdrv);
+            const char* fsType = "fatfs";
+
+            // If FAT failed, try ext2
+            if (!mounted) {
+                Ext2BindDevice(pdrv, vd);
+                mounted = brook::VfsMount("/mnt/probe", "ext2", pdrv);
+                fsType = "ext2";
+            }
+
+            if (!mounted)
             {
-                brook::SerialPrintf("virtio: %s — not a FAT volume or mount failed\n", name);
+                brook::SerialPrintf("virtio: %s — no recognized filesystem\n", name);
                 continue;
             }
 
@@ -371,7 +383,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
             // Remount at the target path.
             brook::VfsUnmount("/mnt/probe");
-            if (brook::VfsMount(mntPath, "fatfs", pdrv))
+            if (brook::VfsMount(mntPath, fsType, pdrv))
             {
                 brook::KPrintf("virtio: %s mounted at %s\n", name, mntPath);
                 bootVolumeFound = true;

@@ -163,6 +163,7 @@ add_executable(kernel
     src/elf_loader.cpp
     src/vfs.cpp
     src/fatfs_vfs.cpp
+    src/ext2_vfs.cpp
     src/procfs.cpp
     src/procfs_vfs.cpp
     src/net.cpp

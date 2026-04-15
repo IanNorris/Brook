@@ -16,6 +16,7 @@ extern "C" brook::KernelSymbol __stop_ksymtab[];
 #include "device.h"
 #include "vfs.h"
 #include "fatfs_glue.h"
+#include "ext2_vfs.h"
 #include "serial.h"
 #include "panic.h"
 #include "pci.h"
@@ -86,6 +87,9 @@ EXPORT_SYMBOL(VfsReaddir);
 
 // FatFS glue
 EXPORT_SYMBOL(FatFsBindDrive);
+
+// Ext2
+EXPORT_SYMBOL(Ext2BindDevice);
 
 // PCI
 EXPORT_SYMBOL(PciFindDevice);
