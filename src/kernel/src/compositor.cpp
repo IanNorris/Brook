@@ -758,7 +758,12 @@ static void CompositorHandleMouseWM()
     {
         // Check taskbar first
         int tbIdx = WmTaskbarHitTest(mx, my, g_physFbWidth, g_physFbHeight);
-        if (tbIdx >= 0)
+        if (tbIdx == -2)
+        {
+            // "+" button — spawn new terminal
+            WmSpawnTerminal();
+        }
+        else if (tbIdx >= 0)
         {
             Window* tw = WmGetWindow(tbIdx);
             if (tw && tw->proc)

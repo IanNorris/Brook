@@ -602,6 +602,7 @@ static constexpr uint32_t TASKBAR_BTN_WIDTH  = 140;
 static constexpr uint32_t TASKBAR_BTN_HEIGHT = 24;
 static constexpr uint32_t TASKBAR_PADDING    = 4;
 static constexpr uint32_t TASKBAR_SEPARATOR  = 1; // thin line between taskbar and desktop
+static constexpr uint32_t TASKBAR_NEW_BTN_W  = 28; // "+" button width
 
 void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
                      uint32_t screenW, uint32_t screenH,
@@ -625,6 +626,16 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     uint32_t btnX = TASKBAR_PADDING;
     uint32_t btnY = tbY + (WM_TASKBAR_HEIGHT - TASKBAR_BTN_HEIGHT) / 2;
     uint32_t textYOff = (TASKBAR_BTN_HEIGHT - static_cast<uint32_t>(g_fontAtlas.lineHeight)) / 2;
+
+    // "+" new terminal button
+    WmFillRect(backBuffer, stride, screenW, screenH,
+               static_cast<int>(btnX), static_cast<int>(btnY),
+               TASKBAR_NEW_BTN_W, TASKBAR_BTN_HEIGHT, 0x00334455);
+    WmRenderString(backBuffer, stride, screenW, screenH,
+                   static_cast<int>(btnX + (TASKBAR_NEW_BTN_W - 8) / 2),
+                   static_cast<int>(btnY + textYOff),
+                   "+", 0x0088CCFF, 0x00334455);
+    btnX += TASKBAR_NEW_BTN_W + TASKBAR_PADDING;
 
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
     {
@@ -694,6 +705,20 @@ int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
 
     // Walk window buttons left to right
     uint32_t btnX = TASKBAR_PADDING;
+
+    // "+" new terminal button
+    {
+        uint32_t btnY2 = tbY + (WM_TASKBAR_HEIGHT - TASKBAR_BTN_HEIGHT) / 2;
+        if (mx >= static_cast<int32_t>(btnX) &&
+            mx < static_cast<int32_t>(btnX + TASKBAR_NEW_BTN_W) &&
+            my >= static_cast<int32_t>(btnY2) &&
+            my < static_cast<int32_t>(btnY2 + TASKBAR_BTN_HEIGHT))
+        {
+            return -2; // special: new terminal button
+        }
+        btnX += TASKBAR_NEW_BTN_W + TASKBAR_PADDING;
+    }
+
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
     {
         const Window& w = g_windows[i];
