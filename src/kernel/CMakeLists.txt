@@ -150,6 +150,7 @@ add_executable(kernel
     src/compositor.cpp
     src/window.cpp
     src/terminal.cpp
+    src/rtc.cpp
     src/display.cpp
     src/mouse.cpp
     src/shell.cpp

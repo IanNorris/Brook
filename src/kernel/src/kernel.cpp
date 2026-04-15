@@ -37,6 +37,7 @@
 #include "klog.h"
 #include "fat_test_image.h"
 #include "fw_cfg.h"
+#include "rtc.h"
 
 // All kernel initialization and runtime — called by KernelMain after stack switch.
 __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootProtocol);
@@ -165,6 +166,11 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         const brook::MadtInfo& madt = brook::AcpiGetMadt();
         brook::ApicInit(madt.localApicPhysical);
         brook::IoApicInit(madt.ioApicPhysical, madt.ioApicGsiBase);
+
+        // Read CMOS RTC to get wall-clock time before LAPIC timer starts.
+        brook::RtcInit();
+        // Default timezone: UTC+0 (UK). Set to UTC+1 for BST when needed.
+        brook::RtcSetTimezoneOffset(0);
     }
     else
     {

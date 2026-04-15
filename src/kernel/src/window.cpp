@@ -9,6 +9,8 @@
 #include "compositor.h"
 #include "font_atlas.h"
 #include "serial.h"
+#include "rtc.h"
+#include "terminal.h"
 
 namespace brook {
 
@@ -574,27 +576,9 @@ static constexpr uint32_t TASKBAR_BTN_HEIGHT = 24;
 static constexpr uint32_t TASKBAR_PADDING    = 4;
 static constexpr uint32_t TASKBAR_SEPARATOR  = 1; // thin line between taskbar and desktop
 
-// Format uptime into buf as HH:MM:SS, return buf.
-static char* TaskbarFormatUptime(char* buf, uint64_t totalSec)
-{
-    uint32_t h = static_cast<uint32_t>(totalSec / 3600);
-    uint32_t m = static_cast<uint32_t>((totalSec % 3600) / 60);
-    uint32_t s = static_cast<uint32_t>(totalSec % 60);
-    buf[0] = static_cast<char>('0' + (h / 10) % 10);
-    buf[1] = static_cast<char>('0' + h % 10);
-    buf[2] = ':';
-    buf[3] = static_cast<char>('0' + m / 10);
-    buf[4] = static_cast<char>('0' + m % 10);
-    buf[5] = ':';
-    buf[6] = static_cast<char>('0' + s / 10);
-    buf[7] = static_cast<char>('0' + s % 10);
-    buf[8] = '\0';
-    return buf;
-}
-
 void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
                      uint32_t screenW, uint32_t screenH,
-                     uint64_t uptimeMs)
+                     uint64_t /*uptimeMs*/)
 {
     if (!g_wmActive || !backBuffer) return;
 
@@ -652,10 +636,10 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
         btnX += TASKBAR_BTN_WIDTH + TASKBAR_PADDING;
     }
 
-    // Clock — right-aligned in taskbar
-    uint64_t uptimeSec = uptimeMs / 1000;
-    char clockBuf[16];
-    TaskbarFormatUptime(clockBuf, uptimeSec);
+    // Real-time clock — right-aligned in taskbar
+    uint64_t now = RtcNow();
+    char clockBuf[32];
+    RtcFormatTaskbar(clockBuf, now, false); // no seconds by default
 
     // Measure clock text width
     const FontAtlas& fa = g_fontAtlas;
@@ -705,6 +689,40 @@ int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
 uint32_t WmDesktopHeight(uint32_t screenH)
 {
     return screenH > WM_TASKBAR_HEIGHT ? screenH - WM_TASKBAR_HEIGHT : screenH;
+}
+
+void WmSpawnTerminal()
+{
+    if (!g_wmActive) return;
+
+    uint32_t clientW = 800;
+    uint32_t clientH = 600;
+
+    int termIdx = TerminalCreate(clientW, clientH);
+    if (termIdx < 0)
+    {
+        SerialPuts("WM: failed to spawn new terminal\n");
+        return;
+    }
+
+    Terminal* t = TerminalGet(termIdx);
+    if (t && t->child)
+    {
+        // Stagger position based on terminal index
+        int16_t winX = static_cast<int16_t>(60 + (termIdx % 6) * 40);
+        int16_t winY = static_cast<int16_t>(60 + (termIdx % 6) * 40);
+
+        t->child->fbDestX = winX + static_cast<int16_t>(WM_BORDER_WIDTH);
+        t->child->fbDestY = winY + static_cast<int16_t>(WM_TITLE_BAR_HEIGHT + WM_BORDER_WIDTH);
+        t->child->fbScale = 1;
+        t->child->fbDirty = 1;
+
+        WmCreateWindow(t->child, winX, winY,
+                       static_cast<uint16_t>(clientW),
+                       static_cast<uint16_t>(clientH), "Terminal");
+
+        SerialPrintf("WM: spawned new terminal (bash pid %u)\n", t->child->pid);
+    }
 }
 
 } // namespace brook

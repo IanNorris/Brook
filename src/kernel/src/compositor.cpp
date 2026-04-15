@@ -624,6 +624,17 @@ static void CompositorLoopWM()
 
         DbgPrintf("KEY: scan=0x%02x ascii=0x%02x\n", ev.scanCode, ev.ascii);
 
+        // Global hotkeys (no focused window needed)
+        if (ev.modifiers & INPUT_MOD_CTRL)
+        {
+            // Ctrl+T — spawn new terminal window
+            if (ev.scanCode == 0x14) // T
+            {
+                WmSpawnTerminal();
+                continue;
+            }
+        }
+
         // Find the focused window
         Window* focused = nullptr;
         for (uint32_t i = 0; i < WM_MAX_WINDOWS; i++)
