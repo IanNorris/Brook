@@ -11,7 +11,7 @@ namespace brook {
 
 static constexpr uint64_t PAGE_SIZE  = 4096;
 // Physical address occupies bits [51:12] in a PTE.
-// Bits [11:0] are flags, bits [62:52] are used for PID, bit 63 is NX.
+// Bits [11:0] are flags, bits [62:53] are used for PID, bit 52 is COW, bit 63 is NX.
 static constexpr uint64_t PHYS_MASK = 0x000FFFFFFFFFF000ULL;
 
 // ---------------------------------------------------------------------------
@@ -649,6 +649,16 @@ static void FreeTableLevel(PhysicalAddress tablePhys, int level)
             if (!(table[i] & VMM_PRESENT)) continue;
             if (table[i] & (1ULL << 7)) continue; // huge page, skip
             FreeTableLevel(PhysicalAddress(table[i] & PHYS_MASK), level - 1);
+        }
+    }
+    else
+    {
+        // Leaf level (PT): unref data pages (handles COW shared pages)
+        for (uint64_t i = 0; i < 512; i++)
+        {
+            if (!(table[i] & VMM_PRESENT)) continue;
+            PhysicalAddress pagePhys(table[i] & PHYS_MASK);
+            PmmUnrefPage(pagePhys);
         }
     }
     PmmFreePage(tablePhys);

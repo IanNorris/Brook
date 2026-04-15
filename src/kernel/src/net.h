@@ -117,6 +117,8 @@ static constexpr uint8_t TCP_ACK = 0x10;
 
 enum class TcpState : uint8_t {
     Closed,
+    Listen,
+    SynRecv,
     SynSent,
     Established,
     FinWait1,
@@ -253,6 +255,14 @@ struct Socket {
     uint32_t  tcpRcvNxt;   // next expected receive sequence
     uint32_t  tcpSndIss;   // initial send sequence number
     volatile bool tcpFinRecv; // FIN received from peer
+
+    // Listen/accept queue (server-side)
+    static constexpr int ACCEPT_QUEUE_MAX = 16;
+    bool      listening;               // true if listen() was called
+    int       listenBacklog;           // max pending connections
+    int       acceptQueue[ACCEPT_QUEUE_MAX]; // socket indices of accepted connections
+    volatile int acceptQueueCount;     // number in queue
+    int       listenSockIdx;           // for SynRecv sockets: parent listen socket index (-1 if none)
 };
 
 // Create a kernel socket. Returns socket index or negative error.
@@ -265,6 +275,8 @@ int  SockRecvFrom(int sockIdx, void* buf, uint32_t len,
                   SockAddrIn* src);
 int  SockSend(int sockIdx, const void* buf, uint32_t len);
 int  SockRecv(int sockIdx, void* buf, uint32_t len);
+int  SockListen(int sockIdx, int backlog);
+int  SockAccept(int sockIdx, SockAddrIn* addr);
 bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite);
 void SockClose(int sockIdx);
 
