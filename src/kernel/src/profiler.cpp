@@ -327,4 +327,9 @@ void ProfilerStop()
     SerialPrintf("PROFILER: stop requested\n");
 }
 
+bool ProfilerIsRunning()
+{
+    return g_profilerEnabled;
+}
+
 } // namespace brook

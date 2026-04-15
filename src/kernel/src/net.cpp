@@ -9,6 +9,12 @@
 #include "scheduler.h"
 #include "process.h"
 #include "memory/heap.h"
+#include "memory/physical_memory.h"
+#include "klog.h"
+#include "profiler.h"
+#include "smp.h"
+#include "rtc.h"
+#include "apic.h"
 
 // External C functions used by debug channel
 extern "C" void MouseGetPosition(int32_t*, int32_t*);
@@ -1676,11 +1682,116 @@ void DebugChannelPoll()
         DebugHandleCommand(buf, static_cast<uint32_t>(n));
 }
 
+// String prefix check (no libc dependency in kernel net code)
+static bool StrStartsWith(const char* str, const char* prefix)
+{
+    while (*prefix) {
+        if (*str++ != *prefix++) return false;
+    }
+    return true;
+}
+
+// Parse unsigned decimal from string, returns number of chars consumed
+static int ParseUint(const char* s, uint32_t* out)
+{
+    uint32_t val = 0;
+    int i = 0;
+    while (s[i] >= '0' && s[i] <= '9') {
+        val = val * 10 + static_cast<uint32_t>(s[i] - '0');
+        i++;
+    }
+    *out = val;
+    return i;
+}
+
+// Match a log category name to enum (case insensitive)
+static bool MatchLogCat(const char* name, LogCat* out)
+{
+    static const struct { const char* name; LogCat cat; } kMap[] = {
+        {"general", LogCat::General}, {"sched", LogCat::Sched},
+        {"mem", LogCat::Mem}, {"vfs", LogCat::Vfs}, {"net", LogCat::Net},
+        {"input", LogCat::Input}, {"wm", LogCat::Wm}, {"term", LogCat::Term},
+        {"syscall", LogCat::Syscall}, {"driver", LogCat::Driver}, {"prof", LogCat::Prof},
+    };
+    for (auto& m : kMap) {
+        const char* a = name;
+        const char* b = m.name;
+        bool match = true;
+        while (*b) {
+            char ca = (*a >= 'A' && *a <= 'Z') ? (*a + 32) : *a;
+            if (ca != *b) { match = false; break; }
+            a++; b++;
+        }
+        if (match && (*a == '\0' || *a == ' ' || *a == '\n')) {
+            *out = m.cat;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool MatchLogLevel(const char* name, LogLevel* out)
+{
+    static const struct { const char* name; LogLevel level; } kMap[] = {
+        {"error", LogLevel::Error}, {"warn", LogLevel::Warn},
+        {"info", LogLevel::Info}, {"debug", LogLevel::Debug}, {"trace", LogLevel::Trace},
+    };
+    for (auto& m : kMap) {
+        const char* a = name;
+        const char* b = m.name;
+        bool match = true;
+        while (*b) {
+            char ca = (*a >= 'A' && *a <= 'Z') ? (*a + 32) : *a;
+            if (ca != *b) { match = false; break; }
+            a++; b++;
+        }
+        if (match && (*a == '\0' || *a == ' ' || *a == '\n')) {
+            *out = m.level;
+            return true;
+        }
+    }
+    return false;
+}
+
 static void DebugHandleCommand(const char* cmd, uint32_t len)
 {
     (void)len;
 
-    if (NetStrEq(cmd, "mouse")) {
+    // -----------------------------------------------------------------------
+    // help — list all commands
+    // -----------------------------------------------------------------------
+    if (NetStrEq(cmd, "help")) {
+        DebugChannelSend(
+            "=== Brook Debug Channel ===\n"
+            "Diagnostics:\n"
+            "  mouse           - mouse position/buttons\n"
+            "  procs           - process list\n"
+            "  net             - network interface info\n"
+            "  sock            - open sockets\n"
+            "  mem             - memory statistics\n"
+            "  uptime          - system uptime + wall clock\n"
+            "  cpus            - CPU count + SMP info\n"
+            "\n"
+            "Log control:\n"
+            "  log status      - show current log levels per category\n"
+            "  log level <cat> <level>  - set level for category\n"
+            "  log level all <level>    - set level for all categories\n"
+            "  log stream on|off        - enable/disable log streaming here\n"
+            "  (categories: general sched mem vfs net input wm term syscall driver prof)\n"
+            "  (levels: error warn info debug trace)\n"
+            "\n"
+            "Profiler:\n"
+            "  prof start [ms]  - start profiler (ms=0 or omitted: indefinite)\n"
+            "  prof stop        - stop profiler + flush\n"
+            "  prof status      - profiler status\n"
+            "\n"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // mouse — mouse position and buttons
+    // -----------------------------------------------------------------------
+    else if (NetStrEq(cmd, "mouse")) {
         int32_t mx = 0, my = 0;
         MouseGetPosition(&mx, &my);
         uint8_t btns = MouseGetButtons();
@@ -1705,6 +1816,10 @@ static void DebugHandleCommand(const char* cmd, uint32_t len)
         buf[p++] = '\n';
         SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
     }
+
+    // -----------------------------------------------------------------------
+    // procs — process list
+    // -----------------------------------------------------------------------
     else if (NetStrEq(cmd, "procs")) {
         extern uint32_t SchedulerSnapshotProcesses(ProcessSnapshot* out, uint32_t maxCount);
 
@@ -1734,6 +1849,10 @@ static void DebugHandleCommand(const char* cmd, uint32_t len)
         const char* done = "---\n";
         SockSend(g_debugSockIdx, done, 4);
     }
+
+    // -----------------------------------------------------------------------
+    // net — network interface info
+    // -----------------------------------------------------------------------
     else if (NetStrEq(cmd, "net")) {
         if (!g_netIf) {
             DebugChannelSend("net: no interface\n");
@@ -1765,6 +1884,10 @@ static void DebugHandleCommand(const char* cmd, uint32_t len)
         buf[p++] = '\n';
         SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
     }
+
+    // -----------------------------------------------------------------------
+    // sock — open sockets
+    // -----------------------------------------------------------------------
     else if (NetStrEq(cmd, "sock")) {
         for (uint32_t i = 0; i < MAX_SOCKETS; i++) {
             if (!g_sockUsed[i]) continue;
@@ -1789,9 +1912,216 @@ static void DebugHandleCommand(const char* cmd, uint32_t len)
         }
         DebugChannelSend("---\n");
     }
-    else if (NetStrEq(cmd, "help")) {
-        DebugChannelSend("Commands: mouse, procs, net, sock, help\n");
+
+    // -----------------------------------------------------------------------
+    // mem — memory statistics
+    // -----------------------------------------------------------------------
+    else if (NetStrEq(cmd, "mem")) {
+        uint64_t freePages = PmmGetFreePageCount();
+        uint64_t freeMB = (freePages * 4096) / (1024 * 1024);
+        uint64_t heapFree = HeapFreeBytes();
+
+        char buf[256];
+        int p = 0;
+        const char* h1 = "mem: pmm_free_pages=";
+        for (int i = 0; h1[i]; i++) buf[p++] = h1[i];
+        p += UintToStr(buf + p, static_cast<uint32_t>(freePages));
+        const char* h2 = " (";
+        for (int i = 0; h2[i]; i++) buf[p++] = h2[i];
+        p += UintToStr(buf + p, static_cast<uint32_t>(freeMB));
+        const char* h3 = " MB) heap_free=";
+        for (int i = 0; h3[i]; i++) buf[p++] = h3[i];
+        p += UintToStr(buf + p, static_cast<uint32_t>(heapFree / 1024));
+        const char* h4 = " KB\n";
+        for (int i = 0; h4[i]; i++) buf[p++] = h4[i];
+        SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
     }
+
+    // -----------------------------------------------------------------------
+    // uptime — system uptime and wall clock
+    // -----------------------------------------------------------------------
+    else if (NetStrEq(cmd, "uptime")) {
+        uint64_t ticks = ApicTickCount();
+        uint32_t sec = static_cast<uint32_t>(ticks / 1000);
+        uint32_t min = sec / 60;
+        uint32_t hr  = min / 60;
+
+        char buf[128];
+        int p = 0;
+        const char* h = "uptime: ";
+        for (int i = 0; h[i]; i++) buf[p++] = h[i];
+        p += UintToStr(buf + p, hr);
+        buf[p++] = 'h';
+        p += UintToStr(buf + p, min % 60);
+        buf[p++] = 'm';
+        p += UintToStr(buf + p, sec % 60);
+        buf[p++] = 's';
+
+        // Wall clock
+        const char* wh = "  wall=";
+        for (int i = 0; wh[i]; i++) buf[p++] = wh[i];
+        char timeBuf[32];
+        RtcFormatTaskbar(timeBuf, RtcNowLocal(), false);
+        for (int i = 0; timeBuf[i]; i++) buf[p++] = timeBuf[i];
+        buf[p++] = '\n';
+        SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
+    }
+
+    // -----------------------------------------------------------------------
+    // cpus — CPU count
+    // -----------------------------------------------------------------------
+    else if (NetStrEq(cmd, "cpus")) {
+        uint32_t count = SmpGetCpuCount();
+        char buf[64];
+        int p = 0;
+        const char* h = "cpus: ";
+        for (int i = 0; h[i]; i++) buf[p++] = h[i];
+        p += UintToStr(buf + p, count);
+        buf[p++] = '\n';
+        SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
+    }
+
+    // -----------------------------------------------------------------------
+    // log status — show current log levels per category
+    // -----------------------------------------------------------------------
+    else if (NetStrEq(cmd, "log status") || NetStrEq(cmd, "log")) {
+        static const char* const levelNames[] = {"ERROR", "WARN", "INFO", "DEBUG", "TRACE"};
+
+        DebugChannelSend("Log levels:\n");
+        for (int i = 0; i < static_cast<int>(LogCat::Count); i++) {
+            LogCat cat = static_cast<LogCat>(i);
+            LogLevel lvl = KLogGetLevel(cat);
+            char buf[64];
+            int p = 0;
+            const char* pad = "  ";
+            for (int j = 0; pad[j]; j++) buf[p++] = pad[j];
+            const char* cn = LogCatName(cat);
+            while (*cn) buf[p++] = *cn++;
+            // Pad to 10 chars
+            while (p < 12) buf[p++] = ' ';
+            const char* eq = " = ";
+            for (int j = 0; eq[j]; j++) buf[p++] = eq[j];
+            const char* ln = levelNames[static_cast<int>(lvl)];
+            while (*ln) buf[p++] = *ln++;
+            buf[p++] = '\n';
+            SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
+        }
+        char buf[64];
+        int p = 0;
+        const char* rs = "Remote stream: ";
+        for (int i = 0; rs[i]; i++) buf[p++] = rs[i];
+        const char* onoff = KLogRemoteStreamEnabled() ? "ON" : "OFF";
+        while (*onoff) buf[p++] = *onoff++;
+        buf[p++] = '\n';
+        SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
+    }
+
+    // -----------------------------------------------------------------------
+    // log level <cat> <level> — set log level for a category
+    // log level all <level> — set for all categories
+    // -----------------------------------------------------------------------
+    else if (StrStartsWith(cmd, "log level ")) {
+        const char* args = cmd + 10; // skip "log level "
+
+        if (StrStartsWith(args, "all ")) {
+            const char* lvlStr = args + 4;
+            LogLevel lvl;
+            if (MatchLogLevel(lvlStr, &lvl)) {
+                KLogSetGlobalLevel(lvl);
+                DebugChannelSend("OK: all categories set\n");
+            } else {
+                DebugChannelSend("ERR: unknown level (error/warn/info/debug/trace)\n");
+            }
+        } else {
+            // Find space separating cat from level
+            const char* sp = args;
+            while (*sp && *sp != ' ') sp++;
+            if (*sp == ' ') {
+                // Null-terminate category name temporarily by copying
+                char catBuf[16];
+                int ci = 0;
+                const char* c = args;
+                while (c < sp && ci < 15) catBuf[ci++] = *c++;
+                catBuf[ci] = '\0';
+
+                LogCat cat;
+                LogLevel lvl;
+                if (!MatchLogCat(catBuf, &cat)) {
+                    DebugChannelSend("ERR: unknown category\n");
+                } else if (!MatchLogLevel(sp + 1, &lvl)) {
+                    DebugChannelSend("ERR: unknown level\n");
+                } else {
+                    KLogSetLevel(cat, lvl);
+                    DebugChannelSend("OK\n");
+                }
+            } else {
+                DebugChannelSend("Usage: log level <cat> <level>\n");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // log stream on|off — enable/disable remote log streaming
+    // -----------------------------------------------------------------------
+    else if (StrStartsWith(cmd, "log stream ")) {
+        const char* val = cmd + 11;
+        if (NetStrEq(val, "on")) {
+            KLogSetRemoteStream(true);
+            DebugChannelSend("OK: log streaming enabled\n");
+        } else if (NetStrEq(val, "off")) {
+            KLogSetRemoteStream(false);
+            DebugChannelSend("OK: log streaming disabled\n");
+        } else {
+            DebugChannelSend("Usage: log stream on|off\n");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // prof start [ms] — start profiler
+    // -----------------------------------------------------------------------
+    else if (StrStartsWith(cmd, "prof start")) {
+        const char* rest = cmd + 10;
+        uint32_t durationMs = 0;
+        if (*rest == ' ') {
+            ParseUint(rest + 1, &durationMs);
+        }
+        ProfilerStart(durationMs);
+        if (durationMs > 0) {
+            char buf[64];
+            int p = 0;
+            const char* h = "OK: profiler started for ";
+            for (int i = 0; h[i]; i++) buf[p++] = h[i];
+            p += UintToStr(buf + p, durationMs);
+            const char* t = " ms\n";
+            for (int i = 0; t[i]; i++) buf[p++] = t[i];
+            SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
+        } else {
+            DebugChannelSend("OK: profiler started (indefinite)\n");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // prof stop — stop profiler
+    // -----------------------------------------------------------------------
+    else if (NetStrEq(cmd, "prof stop")) {
+        ProfilerStop();
+        DebugChannelSend("OK: profiler stopped\n");
+    }
+
+    // -----------------------------------------------------------------------
+    // prof status — profiler status
+    // -----------------------------------------------------------------------
+    else if (NetStrEq(cmd, "prof status")) {
+        if (ProfilerIsRunning()) {
+            DebugChannelSend("Profiler: RUNNING\n");
+        } else {
+            DebugChannelSend("Profiler: IDLE\n");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Unknown command
+    // -----------------------------------------------------------------------
     else {
         DebugChannelSend("Unknown command. Type 'help' for list.\n");
     }

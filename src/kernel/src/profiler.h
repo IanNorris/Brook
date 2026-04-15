@@ -25,6 +25,9 @@ void ProfilerStart(uint32_t durationMs);
 // Stop profiling early and flush remaining samples.
 void ProfilerStop();
 
+// Is the profiler currently sampling?
+bool ProfilerIsRunning();
+
 // Called from the LAPIC timer ISR on every CPU.
 // interruptedRip: the RIP from the interrupt frame.
 // interruptedCs:  the CS from the interrupt frame (to determine ring).
