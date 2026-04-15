@@ -20,6 +20,9 @@ namespace brook { extern volatile uint64_t g_lapicTickCount; }
 extern "C" void context_switch(brook::SavedContext* oldCtx, brook::SavedContext* newCtx,
                                 brook::FxsaveArea* oldFx, brook::FxsaveArea* newFx);
 
+// Futex wake — implemented in syscall.cpp, called for clear_child_tid on thread exit
+extern "C" int64_t FutexWake(uint64_t uaddr, uint32_t maxWake);
+
 // Enter user mode for the first time (existing function in syscall.cpp).
 namespace brook { void SwitchToUserMode(uint64_t userRsp, uint64_t userRip); }
 
@@ -841,38 +844,43 @@ void SchedulerYield()
 {
     uint32_t cpu = ThisCpu();
     Process* proc = g_perCpu[cpu].currentProcess;
-    SerialPrintf("SCHED: '%s' (pid %u) exited with status %d\n",
-                 proc->name, proc->pid, status);
+    SerialPrintf("SCHED: '%s' (pid %u, tgid %u) exited with status %d%s\n",
+                 proc->name, proc->pid, proc->tgid, status,
+                 proc->isThread ? " [thread]" : "");
 
-    // Close all FDs immediately so pipe readers/writers get unblocked.
-    // This must happen before marking as Terminated — the parent may be
-    // blocked on a pipe read that this process had the write end of.
-    ProcessCloseAllFds(proc);
-
-    // Reparent any children of this process to init (parentPid=0).
-    // This ensures they can be reaped even after this parent is gone.
+    // Thread exit: clear_child_tid + futex_wake for pthread_join
+    if (proc->clearChildTid)
     {
-        uint64_t alf = SchedLockAcquire(g_allProcLock);
-        for (uint32_t i = 0; i < g_processCount; i++)
-        {
-            if (g_allProcesses[i]->parentPid == proc->pid)
-                g_allProcesses[i]->parentPid = 0;
-        }
-        SchedLockRelease(g_allProcLock, alf);
+        auto* tidPtr = reinterpret_cast<volatile uint32_t*>(proc->clearChildTid);
+        __atomic_store_n(tidPtr, 0, __ATOMIC_RELEASE);
+        // Wake any thread waiting in futex(FUTEX_WAIT) on this address
+        // (pthread_join blocks on this via FUTEX_WAIT)
+        FutexWake(proc->clearChildTid, 1);
     }
 
-    // Signal the compositor to fill this process's screen region with an exit
-    // status colour on its next pass. No VFB access needed — avoids races with
-    // the reaper freeing VFB pages.
-    //   Red  for abnormal termination (negative status = signal/fault)
-    //   Blue for normal exit
-    if (proc->fbVfbWidth > 0)
-        proc->fbExitColor = (status < 0) ? 0x00CC0000u : 0x00001A3Au;
+    // Only do full process cleanup for non-thread (group leader) processes
+    if (!proc->isThread)
+    {
+        // Close all FDs immediately so pipe readers/writers get unblocked.
+        ProcessCloseAllFds(proc);
 
-    // Null out VFB pointer BEFORE marking as Terminated to prevent the
-    // compositor from blitting freed memory (race with ReapTerminated).
-    proc->fbVirtual = nullptr;
-    proc->fbVirtualSize = 0;
+        // Reparent any children of this process to init (parentPid=0).
+        {
+            uint64_t alf = SchedLockAcquire(g_allProcLock);
+            for (uint32_t i = 0; i < g_processCount; i++)
+            {
+                if (g_allProcesses[i]->parentPid == proc->pid)
+                    g_allProcesses[i]->parentPid = 0;
+            }
+            SchedLockRelease(g_allProcLock, alf);
+        }
+
+        // Signal the compositor
+        if (proc->fbVfbWidth > 0)
+            proc->fbExitColor = (status < 0) ? 0x00CC0000u : 0x00001A3Au;
+        proc->fbVirtual = nullptr;
+        proc->fbVirtualSize = 0;
+    }
 
     proc->state = ProcessState::Terminated;
     proc->exitStatus = status;

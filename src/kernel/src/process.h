@@ -239,12 +239,19 @@ struct Process
     uint16_t parentPid;          // Parent process PID (0 if no parent)
     uint16_t pgid;               // Process group ID
     uint16_t sid;                // Session ID
+    uint16_t tgid;               // Thread group ID (= leader's PID; same as PID for main thread)
     ProcessState state;
     uint8_t  schedPriority;  // Initial scheduler priority (0=RT, 1=High, 2=Normal, 3=Low)
     int32_t  runningOnCpu;   // CPU index (-1 = not running, used for double-schedule detection)
     volatile bool reapable;  // Set after context_switch completes away from this process
     volatile bool compositorRegistered; // True while compositor holds a reference to this process's VFB
     int32_t exitStatus;      // Exit status (stored when process exits, for wait4)
+
+    // Threading
+    bool     isThread;           // True if this is a thread (not the group leader)
+    Process* threadLeader;       // Points to the thread group leader (self if leader)
+    uint64_t clearChildTid;      // User address to write 0 + futex_wake on exit (set_tid_address / CLONE_CHILD_CLEARTID)
+    uint64_t parentSetTid;       // User address where parent's clone() stores child TID (CLONE_PARENT_SETTID)
 
     // Scheduler linked-list pointers (circular doubly-linked ready queue)
     Process* schedNext;
@@ -422,6 +429,13 @@ void ProcessDestroy(Process* proc);
 // Returns the child Process* on success, or null on failure.
 Process* ProcessFork(Process* parent, uint64_t userRip,
                      uint64_t userRsp, uint64_t userRflags);
+
+// Create a new thread in the same address space as parent (CLONE_VM|CLONE_THREAD).
+// Shares the page table (no copy), shares fd table, uses the provided user stack.
+// Returns the thread Process* on success, or null on failure.
+Process* ProcessCreateThread(Process* parent, uint64_t userRip,
+                             uint64_t userRsp, uint64_t userRflags,
+                             uint64_t tlsBase);
 
 // Replace the current process's address space with a new ELF binary.
 // On success, returns the new user entry point (and sets *outStackPtr).

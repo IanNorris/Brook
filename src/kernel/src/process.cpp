@@ -308,6 +308,8 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     proc->pid = SchedulerAllocPid();
     proc->pgid = proc->pid;
     proc->sid = proc->pid;
+    proc->tgid = proc->pid;         // Process is its own thread group leader
+    proc->threadLeader = proc;
     proc->state = ProcessState::Ready;
     proc->runningOnCpu = -1;
     proc->schedPriority = 2;  // SCHED_PRIORITY_NORMAL
@@ -567,6 +569,8 @@ Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
     proc->pid = SchedulerAllocPid();
     proc->pgid = proc->pid;
     proc->sid = proc->pid;
+    proc->tgid = proc->pid;
+    proc->threadLeader = proc;
     proc->state = ProcessState::Ready;
     proc->runningOnCpu = -1;
     proc->isKernelThread = true;
@@ -662,39 +666,32 @@ void ProcessDestroy(Process* proc)
 {
     if (!proc) return;
 
-    // Close any remaining FDs (most should already be closed at exit time)
-    ProcessCloseAllFds(proc);
+    bool isThread = proc->isThread;
 
-    // Free per-process kernel stack (includes guard page accounting)
+    // Threads don't own FDs — the leader does
+    if (!isThread)
+        ProcessCloseAllFds(proc);
+
+    // Free per-process kernel stack (each thread has its own)
     if (proc->kernelStackBase)
         VmmFreeKernelStack(VirtualAddress(proc->kernelStackBase), KERNEL_STACK_PAGES);
 
-    // Free per-process page table pages FIRST — must happen before PmmKillPid
-    // frees the data pages, because freed pages can be immediately reallocated
-    // by other CPUs. Walking the page table after data pages are freed is safe
-    // (FreeTableLevel only frees intermediate table pages, not leaf data pages),
-    // but freed-and-reallocated pages would have wrong descriptors.
-    if (!proc->isKernelThread)
+    // Threads share the page table with the leader — don't destroy it
+    if (!proc->isKernelThread && !isThread)
         VmmDestroyUserPageTable(proc->pageTable);
 
-    // Remove from compositor BEFORE freeing pages — the compositor may be
-    // mid-blit using this process's VFB. Unregistering first ensures the
-    // compositor won't touch the VFB on its next frame.
-    CompositorUnregisterProcess(proc);
+    // Only the leader owns compositor/window state
+    if (!isThread)
+    {
+        CompositorUnregisterProcess(proc);
+        WmDestroyWindowForProcess(proc);
+        if (proc->fbVfbWidth > 0)
+            CompositorWaitFrame();
+    }
 
-    // Destroy any WM window still pointing at this process (safety net —
-    // normally the compositor loop already did this, but if we're called
-    // from wait4/SchedulerReapChild the window may still exist).
-    WmDestroyWindowForProcess(proc);
-
-    // Wait for any in-progress compositor frame to finish. Even though we
-    // removed this process from the compositor list, a blit that was already
-    // in progress (using the old fbVirtual pointer) may still be running.
-    if (proc->fbVfbWidth > 0)
-        CompositorWaitFrame();
-
-    // Now free all VMM page allocations and PMM-tracked pages for this process.
-    VmmKillPid(proc->pid);
+    // Only free user pages for the leader process
+    if (!isThread)
+        VmmKillPid(proc->pid);
 
     // Remove from scheduler tracking
     SchedulerRemoveProcess(proc);
@@ -807,6 +804,11 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->parentPid = parent->pid;
     child->pgid = parent->pgid;      // Inherit process group from parent
     child->sid = parent->sid;         // Inherit session from parent
+    child->tgid = child->pid;         // Fork creates a new thread group
+    child->threadLeader = child;
+    child->isThread = false;
+    child->clearChildTid = 0;
+    child->parentSetTid = 0;
     if (child->pid == 0)
     {
         SerialPuts("FORK: PID allocation failed\n");
@@ -930,6 +932,122 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
                  parent->pid, child->pid, child->name, userRip, userRsp);
 
     return child;
+}
+
+// ---------------------------------------------------------------------------
+// ProcessCreateThread -- create a new thread sharing the parent's address space.
+// ---------------------------------------------------------------------------
+
+Process* ProcessCreateThread(Process* parent, uint64_t userRip,
+                             uint64_t userRsp, uint64_t userRflags,
+                             uint64_t tlsBase)
+{
+    if (!parent || parent->isKernelThread) return nullptr;
+
+    auto* thread = static_cast<Process*>(kmalloc(sizeof(Process)));
+    if (!thread) return nullptr;
+
+    // Copy parent process struct as starting point
+    auto* rawDst = reinterpret_cast<uint8_t*>(thread);
+    auto* rawSrc = reinterpret_cast<const uint8_t*>(parent);
+    for (uint64_t i = 0; i < sizeof(Process); i++) rawDst[i] = rawSrc[i];
+
+    // Allocate TID (threads get unique PIDs but share tgid)
+    thread->pid = SchedulerAllocPid();
+    if (thread->pid == 0)
+    {
+        kfree(thread);
+        return nullptr;
+    }
+
+    // Thread group: same tgid as parent, leader is parent's leader
+    Process* leader = parent->threadLeader ? parent->threadLeader : parent;
+    thread->tgid = leader->pid;
+    thread->threadLeader = leader;
+    thread->isThread = true;
+    thread->parentPid = parent->parentPid;
+    thread->pgid = parent->pgid;
+    thread->sid = parent->sid;
+
+    // Reset scheduler state
+    thread->state = ProcessState::Ready;
+    thread->runningOnCpu = -1;
+    thread->reapable = false;
+    thread->compositorRegistered = false;
+    thread->schedNext = nullptr;
+    thread->schedPrev = nullptr;
+    thread->inReadyQueue = 0;
+    thread->wakeupTick = 0;
+    thread->syncNext = nullptr;
+    thread->pendingWakeup = 0;
+
+    // Fork-child trampoline state
+    thread->isForkChild = true;
+    thread->forkReturnRip = userRip;
+    thread->forkReturnRsp = userRsp;
+    thread->forkReturnRflags = userRflags;
+
+    // Threads don't own a VFB — they share the leader's
+    thread->fbVirtual = nullptr;
+    thread->fbVirtualSize = 0;
+    thread->fbVfbWidth = 0;
+    thread->fbVfbHeight = 0;
+    thread->fbVfbStride = 0;
+    thread->fbDestX = 0;
+    thread->fbDestY = 0;
+    thread->fbScale = 0;
+    thread->fbDirty = 0;
+    thread->fbExitColor = 0;
+
+    // Initialize FPU/SSE state
+    for (uint32_t i = 0; i < 512; ++i) thread->fxsave.data[i] = 0;
+    thread->fxsave.data[0] = 0x7F;
+    thread->fxsave.data[1] = 0x03;
+    thread->fxsave.data[24] = 0x80;
+    thread->fxsave.data[25] = 0x1F;
+
+    // Allocate per-thread kernel stack
+    VirtualAddress kstackAddr = VmmAllocKernelStack(KERNEL_STACK_PAGES,
+        MemTag::KernelData, thread->pid);
+    if (!kstackAddr)
+    {
+        kfree(thread);
+        return nullptr;
+    }
+    thread->kernelStackBase = kstackAddr.raw();
+    thread->kernelStackTop  = kstackAddr.raw() + KERNEL_STACK_SIZE;
+
+    // CLONE_VM: share the same page table — no page copy
+    thread->pageTable = parent->pageTable;
+
+    // Share the same program break, mmap state
+    thread->programBreak = parent->programBreak;
+    thread->mmapNext = parent->mmapNext;
+
+    // Set TLS base for this thread (musl allocates per-thread TLS)
+    thread->fsBase = tlsBase;
+    thread->savedCtx.fsBase = tlsBase;
+
+    // Signal state: inherit mask, clear pending
+    thread->sigPending = 0;
+    thread->inSignalHandler = false;
+    thread->sigReturnPending = false;
+
+    // Set thread name
+    {
+        uint32_t nameLen = 0;
+        while (nameLen < 24 && parent->name[nameLen]) nameLen++;
+        for (uint32_t i = 0; i < nameLen; i++) thread->name[i] = parent->name[i];
+        const char* suffix = "_t";
+        for (uint32_t i = 0; suffix[i] && nameLen + i < 31; i++)
+            thread->name[nameLen + i] = suffix[i];
+        thread->name[31] = '\0';
+    }
+
+    SerialPrintf("THREAD: parent pid=%u -> thread tid=%u tgid=%u, rip=0x%lx rsp=0x%lx tls=0x%lx\n",
+                 parent->pid, thread->pid, thread->tgid, userRip, userRsp, tlsBase);
+
+    return thread;
 }
 
 // ---------------------------------------------------------------------------

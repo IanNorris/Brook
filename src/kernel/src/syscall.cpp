@@ -1611,7 +1611,9 @@ static int64_t sys_getpid(uint64_t, uint64_t, uint64_t,
                            uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
-    return proc ? proc->pid : 1;
+    if (!proc) return 1;
+    // For threads, getpid returns the thread group leader's PID (tgid)
+    return proc->tgid ? proc->tgid : proc->pid;
 }
 
 // ---------------------------------------------------------------------------
@@ -1699,13 +1701,16 @@ static int64_t sys_fork(uint64_t, uint64_t, uint64_t,
     return static_cast<int64_t>(child->pid);
 }
 
-static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t,
-                          uint64_t, uint64_t, uint64_t)
+static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAddr,
+                          uint64_t childTidAddr, uint64_t tlsAddr, uint64_t)
 {
-    // clone with a new stack: use fork but override the child's RSP.
-    // musl's __clone pushes the arg+fn onto newStack before the syscall,
-    // then the child does pop %rdi; call *%r9 using that stack.
-    (void)flags;
+    // Clone flags used by musl pthread_create:
+    //   CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
+    //   CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID
+    static constexpr uint64_t CLONE_THREAD         = 0x00010000;
+    static constexpr uint64_t CLONE_SETTLS          = 0x00080000;
+    static constexpr uint64_t CLONE_PARENT_SETTID   = 0x00100000;
+    static constexpr uint64_t CLONE_CHILD_CLEARTID  = 0x00200000;
 
     Process* parent = ProcessCurrent();
     if (!parent) return -ENOSYS;
@@ -1742,8 +1747,32 @@ static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t,
     if (newStack)
         userRsp = newStack;
 
-    Process* child = ProcessFork(parent, userRip, userRsp, userRflags);
-    if (!child) return -ENOMEM;
+    Process* child;
+
+    if (flags & CLONE_THREAD)
+    {
+        // Thread creation: share address space
+        uint64_t tls = (flags & CLONE_SETTLS) ? tlsAddr : parent->fsBase;
+        child = ProcessCreateThread(parent, userRip, userRsp, userRflags, tls);
+        if (!child) return -ENOMEM;
+
+        // CLONE_PARENT_SETTID: write child TID to parent's user space
+        if ((flags & CLONE_PARENT_SETTID) && parentTidAddr)
+        {
+            auto* tidPtr = reinterpret_cast<volatile int32_t*>(parentTidAddr);
+            *tidPtr = static_cast<int32_t>(child->pid);
+        }
+
+        // CLONE_CHILD_CLEARTID: store address for thread exit cleanup
+        if (flags & CLONE_CHILD_CLEARTID)
+            child->clearChildTid = childTidAddr;
+    }
+    else
+    {
+        // Fork: copy address space
+        child = ProcessFork(parent, userRip, userRsp, userRflags);
+        if (!child) return -ENOMEM;
+    }
 
     child->forkRbx = savedRbx;  child->forkRbp = savedRbp;
     child->forkR12 = savedR12;  child->forkR13 = savedR13;
@@ -1754,8 +1783,8 @@ static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t,
 
     SchedulerAddProcess(child);
 
-    SerialPrintf("FORK: parent pid=%u -> child pid=%u '%s', rip=0x%lx rsp=0x%lx\n",
-                 parent->pid, child->pid, child->name, userRip, userRsp);
+    SerialPrintf("CLONE: parent pid=%u -> child pid=%u flags=0x%lx rip=0x%lx rsp=0x%lx\n",
+                 parent->pid, child->pid, flags, userRip, userRsp);
     return static_cast<int64_t>(child->pid);
 }
 
@@ -2210,10 +2239,13 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
 // sys_set_tid_address (218)
 // ---------------------------------------------------------------------------
 
-static int64_t sys_set_tid_address(uint64_t, uint64_t, uint64_t,
+static int64_t sys_set_tid_address(uint64_t tidptr, uint64_t, uint64_t,
                                     uint64_t, uint64_t, uint64_t)
 {
-    return 1; // Return "tid" = 1
+    Process* proc = ProcessCurrent();
+    if (proc)
+        proc->clearChildTid = tidptr;
+    return proc ? static_cast<int64_t>(proc->pid) : 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -4666,12 +4698,90 @@ static int64_t sys_rseq(uint64_t, uint64_t, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
-// sys_futex (202) — fast userspace mutex (minimal stub)
+// sys_futex (202) — fast userspace mutex with real wait queues
 // ---------------------------------------------------------------------------
 
 static constexpr int FUTEX_WAIT         = 0;
 static constexpr int FUTEX_WAKE         = 1;
 static constexpr int FUTEX_PRIVATE_FLAG = 128;
+
+// Simple futex wait queue: hash table of blocked processes keyed by user VA.
+// Since threads share address space (same page tables), the VA is sufficient.
+static constexpr uint32_t FUTEX_HASH_SIZE = 64;
+
+struct FutexWaiter {
+    uint64_t uaddr;     // User virtual address being waited on
+    Process* proc;      // Blocked process
+    FutexWaiter* next;  // Next in hash bucket chain
+};
+
+static FutexWaiter* g_futexBuckets[FUTEX_HASH_SIZE];
+static volatile uint64_t g_futexLock = 0;  // Spinlock for the hash table
+
+// Pool of waiter nodes (avoid kmalloc from IRQ context)
+static constexpr uint32_t FUTEX_MAX_WAITERS = 128;
+static FutexWaiter g_futexWaiterPool[FUTEX_MAX_WAITERS];
+static bool        g_futexWaiterUsed[FUTEX_MAX_WAITERS];
+
+static FutexWaiter* FutexAllocWaiter()
+{
+    for (uint32_t i = 0; i < FUTEX_MAX_WAITERS; ++i) {
+        if (!g_futexWaiterUsed[i]) {
+            g_futexWaiterUsed[i] = true;
+            return &g_futexWaiterPool[i];
+        }
+    }
+    return nullptr;
+}
+
+static void FutexFreeWaiter(FutexWaiter* w)
+{
+    uint32_t idx = static_cast<uint32_t>(w - g_futexWaiterPool);
+    if (idx < FUTEX_MAX_WAITERS)
+        g_futexWaiterUsed[idx] = false;
+}
+
+static uint32_t FutexHash(uint64_t addr)
+{
+    return static_cast<uint32_t>((addr >> 2) % FUTEX_HASH_SIZE);
+}
+
+// Callable from outside syscall dispatch (e.g., scheduler thread exit)
+extern "C" int64_t FutexWake(uint64_t uaddr, uint32_t maxWake)
+{
+    uint32_t bucket = FutexHash(uaddr);
+    uint32_t woken = 0;
+
+    while (__atomic_test_and_set(&g_futexLock, __ATOMIC_ACQUIRE)) {
+        __asm__ volatile("pause");
+    }
+
+    FutexWaiter** pp = &g_futexBuckets[bucket];
+    while (*pp && woken < maxWake) {
+        FutexWaiter* w = *pp;
+        if (w->uaddr == uaddr) {
+            Process* waiter = w->proc;
+            *pp = w->next;
+            FutexFreeWaiter(w);
+            __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+
+            __atomic_store_n(&waiter->pendingWakeup, 1, __ATOMIC_RELEASE);
+            if (waiter->state == ProcessState::Blocked)
+                SchedulerUnblock(waiter);
+            woken++;
+
+            while (__atomic_test_and_set(&g_futexLock, __ATOMIC_ACQUIRE)) {
+                __asm__ volatile("pause");
+            }
+            pp = &g_futexBuckets[bucket];
+        } else {
+            pp = &(*pp)->next;
+        }
+    }
+
+    __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+    return static_cast<int64_t>(woken);
+}
 
 static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
                           uint64_t, uint64_t, uint64_t)
@@ -4679,19 +4789,49 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
     int op = static_cast<int>(opVal) & ~FUTEX_PRIVATE_FLAG;
 
     if (op == FUTEX_WAKE) {
-        // Wake up to `val` waiters — since we have no wait queue, return 0
-        (void)val;
-        return 0;
+        uint32_t maxWake = static_cast<uint32_t>(val);
+        if (maxWake == 0) return 0;
+        return FutexWake(uaddrVal, maxWake);
     }
 
     if (op == FUTEX_WAIT) {
-        // Check if *uaddr == val; if not, return EAGAIN
         auto* uaddr = reinterpret_cast<volatile uint32_t*>(uaddrVal);
-        if (__atomic_load_n(uaddr, __ATOMIC_ACQUIRE) != static_cast<uint32_t>(val))
+
+        Process* proc = ProcessCurrent();
+        if (!proc) return -ENOSYS;
+
+        // Acquire futex lock, atomically check value, and enqueue
+        while (__atomic_test_and_set(&g_futexLock, __ATOMIC_ACQUIRE)) {
+            __asm__ volatile("pause");
+        }
+
+        // Check if *uaddr == val while holding the lock
+        if (__atomic_load_n(uaddr, __ATOMIC_ACQUIRE) != static_cast<uint32_t>(val)) {
+            __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
             return -EAGAIN;
-        // For now, just yield and return — proper blocking requires a wait queue
-        SchedulerYield();
-        return -EAGAIN;
+        }
+
+        // Allocate and enqueue waiter
+        FutexWaiter* w = FutexAllocWaiter();
+        if (!w) {
+            __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+            return -ENOMEM;
+        }
+        w->uaddr = uaddrVal;
+        w->proc = proc;
+        uint32_t bucket = FutexHash(uaddrVal);
+        w->next = g_futexBuckets[bucket];
+        g_futexBuckets[bucket] = w;
+
+        // Clear pending wakeup flag before blocking
+        __atomic_store_n(&proc->pendingWakeup, 0, __ATOMIC_RELEASE);
+
+        __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+
+        // Block this process until woken by FUTEX_WAKE
+        SchedulerBlock(proc);
+
+        return 0;
     }
 
     return -ENOSYS;
