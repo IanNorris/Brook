@@ -720,6 +720,24 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
 
     // Spawn bash with piped FDs
     const char* bashArgv[] = { "bash", nullptr };
+
+    // Build COLUMNS/LINES strings dynamically from actual terminal size
+    char colsBuf[20], linesBuf[20];
+    {
+        // Simple itoa for COLUMNS=N and LINES=N
+        auto itoa = [](char* buf, const char* prefix, uint32_t val) {
+            int plen = 0;
+            while (prefix[plen]) { buf[plen] = prefix[plen]; plen++; }
+            if (val == 0) { buf[plen++] = '0'; buf[plen] = 0; return; }
+            char tmp[10]; int tlen = 0;
+            while (val > 0) { tmp[tlen++] = '0' + (val % 10); val /= 10; }
+            for (int i = tlen - 1; i >= 0; i--) buf[plen++] = tmp[i];
+            buf[plen] = 0;
+        };
+        itoa(colsBuf,  "COLUMNS=", t->cols);
+        itoa(linesBuf, "LINES=",   t->rows);
+    }
+
     const char* bashEnvp[] = {
         "HOME=/",
         "PATH=/boot/BIN",
@@ -727,8 +745,8 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
         "TERMINFO=/boot/TERMINFO",
         "TERMINFO_DIRS=/boot/TERMINFO",
         "PS1=$ ",
-        "COLUMNS=80",
-        "LINES=25",
+        colsBuf,
+        linesBuf,
         nullptr
     };
 
@@ -835,11 +853,13 @@ void TerminalWriteInput(int termIdx, const char* data, uint32_t len)
         pipe->write(&data[i], 1);
     }
 
-    // Wake bash if it's blocked on stdin read
-    if (t->child && t->child->state == ProcessState::Blocked)
+    // Wake whoever is blocked reading the stdin pipe (may be bash, vi, etc.)
+    Process* reader = pipe->readerWaiter;
+    if (reader && reader->state == ProcessState::Blocked)
     {
-        t->child->pendingWakeup = 1;
-        SchedulerUnblock(t->child);
+        pipe->readerWaiter = nullptr;
+        reader->pendingWakeup = 1;
+        SchedulerUnblock(reader);
     }
 }
 

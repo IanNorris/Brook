@@ -2676,7 +2676,11 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
         if (cmd == 0x5413)
         {
             auto* ws = reinterpret_cast<uint16_t*>(arg);
-            ws[0] = 25; ws[1] = 80; ws[2] = 0; ws[3] = 0;
+            Terminal* term = TerminalFindByProcess(proc);
+            ws[0] = term ? static_cast<uint16_t>(term->rows) : 25;
+            ws[1] = term ? static_cast<uint16_t>(term->cols) : 80;
+            ws[2] = term ? static_cast<uint16_t>(term->vfbW) : 0;
+            ws[3] = term ? static_cast<uint16_t>(term->vfbH) : 0;
             return 0;
         }
 
@@ -2782,10 +2786,11 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
     {
         struct winsize { uint16_t ws_row, ws_col, ws_xpixel, ws_ypixel; };
         auto* ws = reinterpret_cast<winsize*>(arg);
-        ws->ws_row = 25;
-        ws->ws_col = 80;
-        ws->ws_xpixel = 0;
-        ws->ws_ypixel = 0;
+        Terminal* term = TerminalFindByProcess(proc);
+        ws->ws_row = term ? static_cast<uint16_t>(term->rows) : 25;
+        ws->ws_col = term ? static_cast<uint16_t>(term->cols) : 80;
+        ws->ws_xpixel = term ? static_cast<uint16_t>(term->vfbW) : 0;
+        ws->ws_ypixel = term ? static_cast<uint16_t>(term->vfbH) : 0;
         return 0;
     }
 

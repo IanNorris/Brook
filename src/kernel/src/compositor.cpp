@@ -556,6 +556,49 @@ static void CompositorLoopWM()
         if (p->state != ProcessState::Terminated && p->fbVfbWidth > 0)
             BlitProcessAt(p, w->clientX(), w->clientY(), true, w->upscale);
 
+        // Draw text cursor for terminal windows
+        if (g_backBuffer)
+        {
+            Terminal* term = TerminalFindByProcess(p);
+            if (term && term->active)
+            {
+                // Blink: visible for 500ms, hidden for 500ms
+                bool cursorOn = ((now / 500) & 1) == 0;
+                if (cursorOn)
+                {
+                    uint32_t lineH = static_cast<uint32_t>(g_fontAtlas.lineHeight);
+                    uint32_t glyphW = g_fontAtlas.glyphCount > 0
+                                      ? static_cast<uint32_t>(g_fontAtlas.glyphs[0].advance) : 8;
+                    uint32_t cx = term->curX * glyphW;
+                    uint32_t cy = term->curY * lineH;
+                    uint8_t  sc = w->upscale;
+                    int      ox = w->clientX();
+                    int      oy = w->clientY();
+
+                    for (uint32_t dy = 0; dy < lineH; dy++)
+                    {
+                        for (uint32_t dx = 0; dx < glyphW; dx++)
+                        {
+                            for (uint8_t sy = 0; sy < sc; sy++)
+                            {
+                                for (uint8_t sx = 0; sx < sc; sx++)
+                                {
+                                    int px = ox + static_cast<int>((cx + dx) * sc + sx);
+                                    int py = oy + static_cast<int>((cy + dy) * sc + sy);
+                                    if (px >= 0 && px < static_cast<int>(g_physFbWidth) &&
+                                        py >= 0 && py < static_cast<int>(g_physFbHeight))
+                                    {
+                                        uint32_t& pixel = g_backBuffer[py * g_backBufStride + px];
+                                        pixel ^= 0x00FFFFFF; // invert RGB
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if (g_backBuffer)
             WmRenderChromeForWindow(g_backBuffer, g_backBufStride,
                                      g_physFbWidth, g_physFbHeight, sorted[i]);
