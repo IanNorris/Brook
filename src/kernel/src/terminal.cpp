@@ -7,7 +7,6 @@
 #include "font_atlas.h"
 #include "input.h"
 #include "memory/heap.h"
-#include "kprintf.h"
 #include "serial.h"
 #include "vfs.h"
 
@@ -515,7 +514,7 @@ static void TerminalThreadFn(void* arg)
         t->vfb[i] = t->bgColor;
     t->dirty = true;
 
-    KPrintf("TERMINAL: thread started for pid %u, reading from pipe\n", self->pid);
+    SerialPrintf("TERMINAL: thread started for pid %u, reading from pipe\n", self->pid);
 
     while (t->active)
     {
@@ -530,7 +529,7 @@ static void TerminalThreadFn(void* arg)
             // Check if child still alive
             if (t->child && t->child->state == ProcessState::Terminated)
             {
-                KPrintf("TERMINAL: child exited, closing\n");
+                SerialPrintf("TERMINAL: child exited, closing\n");
                 break;
             }
             // Block until writer wakes us or timeout
@@ -613,16 +612,25 @@ static void TerminalThreadFn(void* arg)
 
 int TerminalCreate(uint32_t clientW, uint32_t clientH)
 {
-    KPrintf("TERMINAL: creating %ux%u, count=%u\n", clientW, clientH, g_terminalCount);
-    if (g_terminalCount >= MAX_TERMINALS) { KPrintf("TERMINAL: max terminals reached\n"); return -1; }
+    SerialPrintf("TERMINAL: creating %ux%u\n", clientW, clientH);
 
-    int idx = static_cast<int>(g_terminalCount);
+    // Find a free slot (reuse closed terminals)
+    int idx = -1;
+    for (uint32_t i = 0; i < MAX_TERMINALS; i++)
+    {
+        if (!g_terminals[i].active && !g_terminals[i].vfb)
+        {
+            idx = static_cast<int>(i);
+            break;
+        }
+    }
+    if (idx < 0) { SerialPrintf("TERMINAL: max terminals reached\n"); return -1; }
     Terminal* t = &g_terminals[idx];
 
     // Allocate VFB
     uint32_t vfbSize = clientW * clientH * 4;
     t->vfb = static_cast<uint32_t*>(kmalloc(vfbSize));
-    if (!t->vfb) { KPrintf("TERMINAL: vfb alloc failed (%u bytes)\n", vfbSize); return -1; }
+    if (!t->vfb) { SerialPrintf("TERMINAL: vfb alloc failed (%u bytes)\n", vfbSize); return -1; }
 
     t->vfbW = clientW;
     t->vfbH = clientH;
@@ -640,7 +648,7 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     auto* stdoutPipe = static_cast<PipeBuffer*>(kmalloc(sizeof(PipeBuffer)));
     if (!stdinPipe || !stdoutPipe)
     {
-        KPrintf("TERMINAL: pipe alloc failed\n");
+        SerialPrintf("TERMINAL: pipe alloc failed\n");
         if (stdinPipe) kfree(stdinPipe);
         if (stdoutPipe) kfree(stdoutPipe);
         kfree(t->vfb);
@@ -686,7 +694,7 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     const char* bashPath = "/boot/BIN/BASH";
     if (VfsStatPath(bashPath, &st) != 0)
     {
-        KPrintf("TERMINAL: bash not found at %s\n", bashPath);
+        SerialPrintf("TERMINAL: bash not found at %s\n", bashPath);
         kfree(stdinPipe);
         kfree(stdoutPipe);
         kfree(t->vfb);
@@ -695,10 +703,10 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     }
 
     auto* elfData = static_cast<uint8_t*>(kmalloc(st.size));
-    if (!elfData) { KPrintf("TERMINAL: elf alloc failed (%lu bytes)\n", st.size); return -1; }
+    if (!elfData) { SerialPrintf("TERMINAL: elf alloc failed (%lu bytes)\n", st.size); return -1; }
 
     Vnode* vn = VfsOpen(bashPath, 0);
-    if (!vn) { KPrintf("TERMINAL: VfsOpen failed for %s\n", bashPath); kfree(elfData); return -1; }
+    if (!vn) { SerialPrintf("TERMINAL: VfsOpen failed for %s\n", bashPath); kfree(elfData); return -1; }
 
     uint64_t off = 0;
     uint64_t remaining = st.size;
@@ -713,7 +721,7 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
 
     if (remaining > 0)
     {
-        KPrintf("TERMINAL: bash ELF read incomplete (%lu remaining)\n", remaining);
+        SerialPrintf("TERMINAL: bash ELF read incomplete (%lu remaining)\n", remaining);
         kfree(elfData);
         return -1;
     }
@@ -755,7 +763,7 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
 
     if (!child)
     {
-        KPrintf("TERMINAL: failed to spawn bash\n");
+        SerialPrintf("TERMINAL: failed to spawn bash\n");
         kfree(stdinPipe);
         kfree(stdoutPipe);
         kfree(t->vfb);
@@ -770,7 +778,7 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     Process* thread = KernelThreadCreate("terminal", TerminalThreadFn, t);
     if (!thread)
     {
-        KPrintf("TERMINAL: failed to create thread\n");
+        SerialPrintf("TERMINAL: failed to create thread\n");
         // child is already created, we'd need to clean up...
         return -1;
     }
@@ -794,8 +802,9 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     SchedulerAddProcess(child);
     SchedulerAddProcess(thread);
 
-    g_terminalCount++;
-    KPrintf("TERMINAL: created terminal %d, bash pid=%u, thread pid=%u\n",
+    if (static_cast<uint32_t>(idx) >= g_terminalCount)
+        g_terminalCount = static_cast<uint32_t>(idx) + 1;
+    SerialPrintf("TERMINAL: created terminal %d, bash pid=%u, thread pid=%u\n",
               idx, child->pid, thread->pid);
 
     return idx;
@@ -905,7 +914,7 @@ void TerminalClose(Terminal* t)
 {
     if (!t || !t->active) return;
 
-    KPrintf("TERMINAL: closing terminal (bash pid=%u)\n",
+    SerialPrintf("TERMINAL: closing terminal (bash pid=%u)\n",
             t->child ? t->child->pid : 0);
 
     // Signal the terminal thread to stop
@@ -922,6 +931,18 @@ void TerminalClose(Terminal* t)
     {
         __atomic_store_n(&t->child->fbVirtual, static_cast<uint32_t*>(nullptr), __ATOMIC_RELEASE);
         t->child->fbVfbWidth = 0;
+    }
+
+    // Free VFB memory to mark slot as reusable
+    if (t->vfb)
+    {
+        kfree(t->vfb);
+        t->vfb = nullptr;
+    }
+    if (t->altVfb)
+    {
+        kfree(t->altVfb);
+        t->altVfb = nullptr;
     }
 
     // Wake the terminal thread so it can exit its loop
@@ -992,7 +1013,7 @@ void TerminalResize(Terminal* t, uint32_t newW, uint32_t newH)
 
     t->dirty = true;
 
-    KPrintf("TERMINAL: resized %ux%u -> %ux%u (%ux%u chars -> %ux%u chars)\n",
+    SerialPrintf("TERMINAL: resized %ux%u -> %ux%u (%ux%u chars -> %ux%u chars)\n",
             oldCols * static_cast<uint32_t>(g_fontAtlas.glyphs[0].advance),
             oldRows * static_cast<uint32_t>(g_fontAtlas.lineHeight),
             newW, newH, oldCols, oldRows, t->cols, t->rows);
