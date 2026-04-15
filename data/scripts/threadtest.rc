@@ -1,0 +1,4 @@
+# Brook OS — Thread test
+# Runs the pthread test binary
+
+run /boot/BIN/THREADTEST
