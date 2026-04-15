@@ -322,8 +322,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
         // Probe each virtio drive: try FAT first, then ext2.
         // FatFS physical drives: 0 = ramdisk, 1..N = virtio0..N-1
-        bool bootVolumeFound = false;
-        for (uint32_t i = 0; i < vioCount && !bootVolumeFound; ++i)
+        for (uint32_t i = 0; i < vioCount; ++i)
         {
             char name[16] = "virtio";
             // Simple uint-to-string for drive index.
@@ -386,7 +385,6 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             if (brook::VfsMount(mntPath, fsType, pdrv))
             {
                 brook::KPrintf("virtio: %s mounted at %s\n", name, mntPath);
-                bootVolumeFound = true;
 
                 // Read BROOK.CFG from the mounted volume as a sanity check.
                 char cfgPath[80] = {};
@@ -413,8 +411,6 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
                 brook::KPrintf("virtio: %s — remount at %s failed\n", name, mntPath);
             }
         }
-        if (!bootVolumeFound)
-            brook::KPuts("WARNING: no boot volume found (no BROOK.MNT on any virtio drive)\n");
     }
 
     // ---- Module loader ----

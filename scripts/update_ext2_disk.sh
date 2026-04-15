@@ -63,7 +63,7 @@ fi
 
 # BROOK.MNT
 TMPDIR=$(mktemp -d)
-echo -n "/boot" > "${TMPDIR}/BROOK.MNT"
+echo -n "/data" > "${TMPDIR}/BROOK.MNT"
 write_file "${TMPDIR}/BROOK.MNT" "BROOK.MNT"
 rm -rf "${TMPDIR}"
 
