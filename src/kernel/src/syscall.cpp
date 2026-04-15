@@ -3687,7 +3687,10 @@ static int64_t sys_readlink(uint64_t pathAddr, uint64_t bufAddr, uint64_t bufsiz
         return static_cast<int64_t>(slen);
     }
 
-    return -EINVAL; // no symlinks in our FS
+    // Try VFS readlink for real symlinks
+    int r = VfsReadlink(path, buf, bufsiz);
+    if (r >= 0) return static_cast<int64_t>(r);
+    return -EINVAL;
 }
 
 static int64_t sys_readlinkat(uint64_t dirfd, uint64_t pathAddr, uint64_t bufAddr,
@@ -3695,6 +3698,26 @@ static int64_t sys_readlinkat(uint64_t dirfd, uint64_t pathAddr, uint64_t bufAdd
 {
     (void)dirfd;
     return sys_readlink(pathAddr, bufAddr, bufsiz, 0, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// sys_symlink (88) / sys_symlinkat (266)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_symlink(uint64_t targetAddr, uint64_t linkpathAddr, uint64_t,
+                            uint64_t, uint64_t, uint64_t)
+{
+    auto* target   = reinterpret_cast<const char*>(targetAddr);
+    auto* linkpath = reinterpret_cast<const char*>(linkpathAddr);
+    int r = VfsSymlink(target, linkpath);
+    return (r == 0) ? 0 : static_cast<int64_t>(r);
+}
+
+static int64_t sys_symlinkat(uint64_t targetAddr, uint64_t newdirfd, uint64_t linkpathAddr,
+                              uint64_t, uint64_t, uint64_t)
+{
+    (void)newdirfd; // TODO: handle AT_FDCWD properly
+    return sys_symlink(targetAddr, linkpathAddr, 0, 0, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -4927,6 +4950,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_RENAME]          = sys_rename;
     g_syscallTable[SYS_MKDIR]           = sys_mkdir;
     g_syscallTable[SYS_UNLINK]          = sys_unlink;
+    g_syscallTable[SYS_SYMLINK]         = sys_symlink;
     g_syscallTable[SYS_READLINK]        = sys_readlink;
     g_syscallTable[SYS_UMASK]           = sys_umask;
     g_syscallTable[SYS_GETRLIMIT]       = sys_getrlimit;
@@ -4947,6 +4971,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_TKILL]           = sys_tkill;
     g_syscallTable[SYS_TGKILL]          = sys_tgkill;
     g_syscallTable[SYS_READLINKAT]      = sys_readlinkat;
+    g_syscallTable[SYS_SYMLINKAT]       = sys_symlinkat;
     g_syscallTable[SYS_PPOLL]           = sys_ppoll;
     g_syscallTable[SYS_PIPE2]           = sys_pipe2;
     g_syscallTable[SYS_DUP3]            = sys_dup3;
@@ -5043,7 +5068,7 @@ static const char* SyscallName(uint64_t num)
     case 79: return "getcwd";     case 80: return "chdir";
     case 81: return "fchdir";     case 82: return "rename";
     case 83: return "mkdir";      case 87: return "unlink";
-    case 89: return "readlink";   case 95: return "umask";
+    case 88: return "symlink";    case 89: return "readlink";   case 95: return "umask";
     case 96: return "gettimeofday"; case 97: return "getrlimit";
     case 98: return "getrusage";  case 99: return "sysinfo";
     case 102: return "getuid";    case 104: return "getgid";
@@ -5063,7 +5088,7 @@ static const char* SyscallName(uint64_t num)
     case 218: return "set_tid_address"; case 228: return "clock_gettime";
     case 230: return "clock_nanosleep"; case 231: return "exit_group";
     case 234: return "tgkill";    case 257: return "openat";
-    case 262: return "newfstatat"; case 267: return "readlinkat";
+    case 262: return "newfstatat"; case 266: return "symlinkat"; case 267: return "readlinkat";
     case 270: return "pselect6";  case 271: return "ppoll";     case 273: return "set_robust_list";
     case 289: return "prlimit64"; case 292: return "dup3";
     case 293: return "pipe2";     case 302: return "rseq";

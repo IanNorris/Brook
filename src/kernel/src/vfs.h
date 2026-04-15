@@ -93,6 +93,15 @@ struct VfsFsOps {
     // Rename.  Returns 0 on success.
     int (*rename)(void* mountPriv, uint8_t pdrv,
                   const char* oldRelPath, const char* newRelPath);
+
+    // Create a symbolic link.  linkRelPath → target.  Returns 0 on success.
+    int (*symlink)(void* mountPriv, uint8_t pdrv,
+                   const char* target, const char* linkRelPath);
+
+    // Read symlink target.  Writes up to bufsiz bytes into buf.
+    // Returns number of bytes written, or <0 on error.
+    int (*readlink)(void* mountPriv, uint8_t pdrv,
+                    const char* relPath, char* buf, uint64_t bufsiz);
 };
 
 // Register a filesystem driver with the VFS.
@@ -147,6 +156,12 @@ int VfsMkdir(const char* path);
 
 // Rename a file or directory.
 int VfsRename(const char* oldPath, const char* newPath);
+
+// Create a symbolic link: linkPath → target.
+int VfsSymlink(const char* target, const char* linkPath);
+
+// Read symlink target.  Returns bytes written to buf, or <0 on error.
+int VfsReadlink(const char* path, char* buf, uint64_t bufsiz);
 
 // Close and free a vnode.
 extern "C" void VfsClose(Vnode* vn);

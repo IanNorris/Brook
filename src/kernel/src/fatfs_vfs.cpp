@@ -512,6 +512,8 @@ static const VfsFsOps g_fatFsOps = {
     .unlink    = FatFsUnlink,
     .mkdir     = FatFsMkdir,
     .rename    = FatFsRename,
+    .symlink   = nullptr,
+    .readlink  = nullptr,
 };
 
 // ---- Public init ----

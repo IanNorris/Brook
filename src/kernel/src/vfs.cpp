@@ -291,6 +291,24 @@ int VfsRename(const char* oldPath, const char* newPath)
     return mountOld->fsOps->rename(mountOld->mountPriv, mountOld->pdrv, relOld, relNew);
 }
 
+int VfsSymlink(const char* target, const char* linkPath)
+{
+    if (!target || !linkPath || !target[0] || !linkPath[0]) return -1;
+    const char* relPath = nullptr;
+    MountEntry* mount = FindMount(linkPath, &relPath);
+    if (!mount || !mount->fsOps || !mount->fsOps->symlink) return -1;
+    return mount->fsOps->symlink(mount->mountPriv, mount->pdrv, target, relPath);
+}
+
+int VfsReadlink(const char* path, char* buf, uint64_t bufsiz)
+{
+    if (!path || !buf || bufsiz == 0) return -1;
+    const char* relPath = nullptr;
+    MountEntry* mount = FindMount(path, &relPath);
+    if (!mount || !mount->fsOps || !mount->fsOps->readlink) return -1;
+    return mount->fsOps->readlink(mount->mountPriv, mount->pdrv, relPath, buf, bufsiz);
+}
+
 void VfsClose(Vnode* vn)
 {
     if (!vn) return;

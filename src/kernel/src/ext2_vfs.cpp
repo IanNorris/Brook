@@ -1525,6 +1525,137 @@ static int Ext2FsRename(void* mountPriv, uint8_t pdrv,
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// symlink: create a symbolic link
+// ---------------------------------------------------------------------------
+
+static int Ext2FsSymlink(void* mountPriv, uint8_t pdrv,
+                         const char* target, const char* relPath)
+{
+    (void)pdrv;
+    auto* mnt = static_cast<Ext2Mount*>(mountPriv);
+
+    uint32_t targetLen = 0;
+    for (const char* p = target; *p; ++p) ++targetLen;
+    if (targetLen == 0 || targetLen > 4096) return -1;
+
+    KMutexLock(&g_ext2Lock);
+
+    char name[256];
+    uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name));
+    if (!parentIno || !name[0]) { KMutexUnlock(&g_ext2Lock); return -1; }
+
+    Ext2Inode parentData;
+    if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KMutexUnlock(&g_ext2Lock); return -1; }
+
+    // Check if already exists
+    if (Ext2DirLookup(mnt, &parentData, name)) {
+        KMutexUnlock(&g_ext2Lock);
+        return -17; // -EEXIST
+    }
+
+    uint32_t newIno = Ext2AllocInode(mnt, false);
+    if (!newIno) { KMutexUnlock(&g_ext2Lock); return -1; }
+
+    Ext2Inode newData;
+    for (uint32_t i = 0; i < sizeof(newData); ++i)
+        reinterpret_cast<uint8_t*>(&newData)[i] = 0;
+    newData.i_mode = EXT2_S_IFLNK | 0777;
+    newData.i_links_count = 1;
+
+    // Fast symlink: store target directly in i_block[] if it fits (≤60 bytes)
+    if (targetLen <= 60) {
+        auto* dst = reinterpret_cast<char*>(newData.i_block);
+        for (uint32_t i = 0; i < targetLen; ++i) dst[i] = target[i];
+        newData.i_size = targetLen;
+        newData.i_blocks = 0;
+    } else {
+        // Slow symlink: allocate a data block
+        uint32_t blk = Ext2AllocBlock(mnt);
+        if (!blk) {
+            Ext2FreeInode(mnt, newIno, false);
+            KMutexUnlock(&g_ext2Lock);
+            return -1;
+        }
+        auto* buf = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+        if (!buf) {
+            Ext2FreeBlock(mnt, blk);
+            Ext2FreeInode(mnt, newIno, false);
+            KMutexUnlock(&g_ext2Lock);
+            return -1;
+        }
+        for (uint32_t i = 0; i < mnt->blockSize; ++i) buf[i] = 0;
+        for (uint32_t i = 0; i < targetLen; ++i) buf[i] = static_cast<uint8_t>(target[i]);
+        Ext2WriteBlock(mnt, blk, buf);
+        kfree(buf);
+
+        newData.i_block[0] = blk;
+        newData.i_size = targetLen;
+        newData.i_blocks = mnt->blockSize / 512;
+    }
+
+    Ext2WriteInode(mnt, newIno, &newData);
+
+    // Add directory entry with type=7 (EXT2_FT_SYMLINK)
+    if (!Ext2DirAdd(mnt, parentIno, &parentData, newIno, name, 7)) {
+        Ext2FreeInodeBlocks(mnt, &newData);
+        Ext2FreeInode(mnt, newIno, false);
+        KMutexUnlock(&g_ext2Lock);
+        return -1;
+    }
+
+    KMutexUnlock(&g_ext2Lock);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// readlink: read a symbolic link target
+// ---------------------------------------------------------------------------
+
+static int Ext2FsReadlink(void* mountPriv, uint8_t pdrv,
+                          const char* relPath, char* buf, uint64_t bufsiz)
+{
+    (void)pdrv;
+    auto* mnt = static_cast<Ext2Mount*>(mountPriv);
+
+    KMutexLock(&g_ext2Lock);
+
+    // Resolve path WITHOUT following the final symlink component.
+    // We split the path into parent + name and resolve the parent,
+    // then look up the name directly in the parent directory.
+    char name[256];
+    uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name));
+    if (!parentIno || !name[0]) { KMutexUnlock(&g_ext2Lock); return -1; }
+
+    Ext2Inode parentData;
+    if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KMutexUnlock(&g_ext2Lock); return -1; }
+
+    uint32_t ino = Ext2DirLookup(mnt, &parentData, name);
+    if (!ino) { KMutexUnlock(&g_ext2Lock); return -22; } // -EINVAL
+
+    Ext2Inode inodeData;
+    if (!Ext2ReadInode(mnt, ino, &inodeData)) { KMutexUnlock(&g_ext2Lock); return -1; }
+
+    if ((inodeData.i_mode & EXT2_S_IFMT) != EXT2_S_IFLNK) {
+        KMutexUnlock(&g_ext2Lock);
+        return -22; // -EINVAL: not a symlink
+    }
+
+    char* target = Ext2ReadSymlink(mnt, &inodeData);
+    if (!target) { KMutexUnlock(&g_ext2Lock); return -1; }
+
+    uint32_t targetLen = 0;
+    for (const char* p = target; *p; ++p) ++targetLen;
+
+    uint32_t copyLen = targetLen;
+    if (copyLen > bufsiz) copyLen = static_cast<uint32_t>(bufsiz);
+    for (uint32_t i = 0; i < copyLen; ++i) buf[i] = target[i];
+
+    kfree(target);
+    KMutexUnlock(&g_ext2Lock);
+    return static_cast<int>(copyLen);
+}
+
 static const VfsFsOps g_ext2FsOps = {
     .mount     = Ext2FsMount,
     .unmount   = Ext2FsUnmount,
@@ -1533,6 +1664,8 @@ static const VfsFsOps g_ext2FsOps = {
     .unlink    = Ext2FsUnlink,
     .mkdir     = Ext2FsMkdir,
     .rename    = Ext2FsRename,
+    .symlink   = Ext2FsSymlink,
+    .readlink  = Ext2FsReadlink,
 };
 
 // ---------------------------------------------------------------------------

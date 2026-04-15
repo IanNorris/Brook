@@ -228,7 +228,7 @@ static void TestFileLookup() {
         Ext2Inode mntInode;
         CHECK(ReadInode(mntIno, &mntInode), "Read BROOK.MNT inode");
         CHECK((mntInode.i_mode & EXT2_S_IFMT) == EXT2_S_IFREG, "BROOK.MNT is regular file");
-        CHECK(mntInode.i_size == 5, "BROOK.MNT is 5 bytes (/boot)");
+        CHECK(mntInode.i_size == 5, "BROOK.MNT is 5 bytes (/data)");
 
         uint32_t db = BlockMap(&mntInode, 0);
         CHECK(db > 0, "BROOK.MNT has data block");
@@ -236,7 +236,7 @@ static void TestFileLookup() {
             char data[16] = {};
             CHECK(DiskRead((uint64_t)db << g_blockShift, data, mntInode.i_size),
                   "Read BROOK.MNT data");
-            CHECK(memcmp(data, "/boot", 5) == 0, "BROOK.MNT contains '/boot'");
+            CHECK(memcmp(data, "/data", 5) == 0, "BROOK.MNT contains '/data'");
         }
     }
 }
