@@ -59,6 +59,7 @@ QR_MAGIC_BYTE        = 0x2D
 QR_VERSION           = 0x00
 QR_HEADER_PAD        = 0xCAFEF00D
 QR_PACKET_TYPE_REGS  = 0xA3000001
+QR_PACKET_TYPE_STACK = 0xA3000002
 
 # PanicHeader: magic(1) + version(1) + page(1) + pageCount(1) + pad(4) = 8 bytes
 PANIC_HEADER_FMT = "<BBBBI"
@@ -84,7 +85,7 @@ REG_NAMES = [
 
 
 def parse_panic_packet(data: bytes) -> dict:
-    """Parse a panic packet and return a dict of register values."""
+    """Parse a panic packet and return a dict of register values + stack trace."""
     if len(data) < PANIC_HEADER_SIZE:
         raise ValueError(f"Packet too short for header: {len(data)} < {PANIC_HEADER_SIZE}")
 
@@ -99,20 +100,6 @@ def parse_panic_packet(data: bytes) -> dict:
 
     offset = PANIC_HEADER_SIZE
 
-    if len(data) < offset + PACKET_HEADER_SIZE:
-        raise ValueError("Packet too short for packet header")
-
-    pkt_type, pkt_size = struct.unpack_from(PACKET_HEADER_FMT, data, offset)
-    offset += PACKET_HEADER_SIZE
-
-    if pkt_type != QR_PACKET_TYPE_REGS:
-        raise ValueError(f"Unknown packet type: 0x{pkt_type:08x}")
-
-    if len(data) < offset + PANIC_REGS_SIZE:
-        raise ValueError(f"Packet too short for CPU regs: {len(data)} < {offset + PANIC_REGS_SIZE}")
-
-    values = struct.unpack_from(PANIC_REGS_FMT, data, offset)
-
     result = {
         "header": {
             "magic": magic,
@@ -121,15 +108,40 @@ def parse_panic_packet(data: bytes) -> dict:
             "pageCount": page_count,
             "pad": pad,
         },
-        "packet": {
-            "type": pkt_type,
-            "size": pkt_size,
-        },
-        "regs": {}
+        "regs": {},
+        "stack_trace": [],
     }
 
-    for i, name in enumerate(REG_NAMES):
-        result["regs"][name] = values[i]
+    # Parse packets until we run out of data
+    while offset + PACKET_HEADER_SIZE <= len(data):
+        pkt_type, pkt_size = struct.unpack_from(PACKET_HEADER_FMT, data, offset)
+        offset += PACKET_HEADER_SIZE
+
+        if pkt_type == QR_PACKET_TYPE_REGS:
+            if len(data) < offset + PANIC_REGS_SIZE:
+                raise ValueError(f"Packet too short for CPU regs: {len(data)} < {offset + PANIC_REGS_SIZE}")
+            values = struct.unpack_from(PANIC_REGS_FMT, data, offset)
+            for i, name in enumerate(REG_NAMES):
+                result["regs"][name] = values[i]
+            offset += PANIC_REGS_SIZE
+
+        elif pkt_type == QR_PACKET_TYPE_STACK:
+            if offset >= len(data):
+                break
+            depth = data[offset]
+            offset += 1
+            frames = []
+            for _ in range(depth):
+                if offset + 8 > len(data):
+                    break
+                rip = struct.unpack_from("<Q", data, offset)[0]
+                frames.append(rip)
+                offset += 8
+            result["stack_trace"] = frames
+
+        else:
+            # Skip unknown packet types
+            offset += pkt_size
 
     return result
 
@@ -194,6 +206,32 @@ def verify_panic_qr(image_path: str) -> bool:
     # CS should be kernel code segment (0x08)
     cs = regs["cs"]
     assert cs == 0x08, f"CS not kernel code segment: 0x{cs:04x}"
+
+    # Stack trace
+    trace = packet.get("stack_trace", [])
+    if trace:
+        print(f"\nStack trace ({len(trace)} frames):")
+        for i, addr in enumerate(trace):
+            sym = ""
+            # Try addr2line if kernel ELF is available
+            brook_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            elf_path = os.path.join(brook_root, "build", "release", "kernel", "BROOK.elf")
+            if os.path.exists(elf_path):
+                try:
+                    r = subprocess.run(
+                        ["addr2line", "-f", "-e", elf_path, f"0x{addr:x}"],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    if r.returncode == 0 and r.stdout.strip():
+                        lines = r.stdout.strip().split("\n")
+                        sym = f"  {lines[0]}"
+                        if len(lines) > 1:
+                            sym += f" at {lines[1]}"
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    pass
+            print(f"  [{i:2d}] 0x{addr:016x}{sym}")
+    else:
+        print("\nNo stack trace in packet")
 
     print(f"\n✓ All checks passed — panic QR code round-trips correctly")
     return True

@@ -94,6 +94,38 @@ static void CaptureFullRegs(brook::PanicCPURegs& r)
     r.reserved = 0;
 }
 
+// ---- Stack trace capture (RBP frame walking) --------------------------------
+static void CaptureStackTrace(brook::PanicStackTrace& trace, uint64_t rbp, uint64_t rip)
+{
+    constexpr uint64_t KERNEL_BASE = 0xffffffff80000000ULL;
+    constexpr uint64_t KERNEL_END  = 0xffffffffffffffffULL;
+
+    trace.depth = 0;
+
+    // Frame 0: the RIP at panic time
+    if (rip >= KERNEL_BASE && rip < KERNEL_END)
+        trace.rip[trace.depth++] = rip;
+
+    // Walk the RBP chain for caller frames
+    while (trace.depth < brook::PANIC_MAX_STACK_DEPTH && rbp != 0)
+    {
+        // Validate RBP is in kernel range and aligned
+        if (rbp < KERNEL_BASE || rbp >= KERNEL_END - 16 || (rbp & 7) != 0)
+            break;
+
+        const uint64_t* frame = reinterpret_cast<const uint64_t*>(rbp);
+        uint64_t retAddr = frame[1];
+        if (retAddr < KERNEL_BASE || retAddr >= KERNEL_END)
+            break;
+
+        trace.rip[trace.depth++] = retAddr;
+
+        uint64_t nextRbp = frame[0];
+        if (nextRbp <= rbp) break; // prevent loops (stack grows down)
+        rbp = nextRbp;
+    }
+}
+
 // ---- Minimal hex printer (no va_list needed) --------------------------------
 static void SerialPutHex64(uint64_t v)
 {
@@ -215,6 +247,12 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
     brook::PanicCPURegs fullRegs;
     CaptureFullRegs(fullRegs);
 
+    // Capture stack trace via RBP chain
+    brook::PanicStackTrace trace;
+    uint64_t captureRbp;
+    __asm__ volatile("movq %%rbp, %0" : "=r"(captureRbp));
+    CaptureStackTrace(trace, captureRbp, regs.rip);
+
     // Format the message into a static buffer.
     __builtin_va_list args;
     __builtin_va_start(args, fmt);
@@ -228,7 +266,31 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
     brook::SerialPuts("  RSP "); SerialPutHex64(regs.rsp);
     brook::SerialPuts("\nCR2 "); SerialPutHex64(regs.cr2);
     brook::SerialPuts("  CR3 "); SerialPutHex64(regs.cr3);
-    brook::SerialPuts("\nSystem halted.\n");
+
+    // Stack trace
+    brook::SerialPuts("\nStack trace (");
+    {
+        char depthStr[4];
+        int ds = 0;
+        if (trace.depth >= 10) depthStr[ds++] = '0' + (trace.depth / 10);
+        depthStr[ds++] = '0' + (trace.depth % 10);
+        depthStr[ds] = '\0';
+        brook::SerialPuts(depthStr);
+    }
+    brook::SerialPuts(" frames):\n");
+    for (uint8_t i = 0; i < trace.depth; i++) {
+        brook::SerialPuts("  [");
+        char idxStr[4];
+        int is = 0;
+        if (i >= 10) idxStr[is++] = '0' + (i / 10);
+        idxStr[is++] = '0' + (i % 10);
+        idxStr[is] = '\0';
+        brook::SerialPuts(idxStr);
+        brook::SerialPuts("] ");
+        SerialPutHex64(trace.rip[i]);
+        brook::SerialPuts("\n");
+    }
+    brook::SerialPuts("System halted.\n");
 
     // -- TTY output (if framebuffer is up) ------------------------------------
     if (brook::TtyReady())
@@ -241,7 +303,14 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
         brook::TtyPuts("  RSP "); TtyPutHex64(regs.rsp);
         brook::TtyPuts("\nCR2 "); TtyPutHex64(regs.cr2);
         brook::TtyPuts("  CR3 "); TtyPutHex64(regs.cr3);
-        brook::TtyPuts("\nSystem halted.\n");
+
+        brook::TtyPuts("\nBacktrace:\n");
+        for (uint8_t i = 0; i < trace.depth; i++) {
+            brook::TtyPuts("  ");
+            TtyPutHex64(trace.rip[i]);
+            brook::TtyPuts("\n");
+        }
+        brook::TtyPuts("System halted.\n");
     }
 
     // -- QR code (if framebuffer is available) ---------------------------------
@@ -249,7 +318,7 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
     uint32_t fbW = 0, fbH = 0, fbStride = 0;
     if (brook::TtyGetFramebuffer(&fbPixels, &fbW, &fbH, &fbStride))
     {
-        brook::PanicRenderQR(fbPixels, fbW, fbH, fbStride, &fullRegs);
+        brook::PanicRenderQR(fbPixels, fbW, fbH, fbStride, &fullRegs, &trace);
     }
 
     for (;;) { __asm__ volatile("hlt"); }

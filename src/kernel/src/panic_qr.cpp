@@ -12,10 +12,16 @@ extern "C" {
 
 namespace brook {
 
-// Assemble the binary panic packet: header + packet header + CPU regs
-static uint32_t BuildPanicPacket(uint8_t* buf, uint32_t bufLen, const PanicCPURegs* regs)
+// Assemble the binary panic packet: header + CPU regs packet + stack trace packet
+static uint32_t BuildPanicPacket(uint8_t* buf, uint32_t bufLen,
+                                 const PanicCPURegs* regs,
+                                 const PanicStackTrace* trace)
 {
-    uint32_t needed = sizeof(PanicHeader) + sizeof(PanicPacketHeader) + sizeof(PanicCPURegs);
+    // Calculate total size: header + (regs packet) + (stack trace packet)
+    uint32_t tracePayloadSize = 1 + trace->depth * 8; // depth byte + RIPs
+    uint32_t needed = sizeof(PanicHeader)
+                    + sizeof(PanicPacketHeader) + sizeof(PanicCPURegs)
+                    + sizeof(PanicPacketHeader) + tracePayloadSize;
     if (bufLen < needed) return 0;
 
     uint32_t off = 0;
@@ -31,7 +37,7 @@ static uint32_t BuildPanicPacket(uint8_t* buf, uint32_t bufLen, const PanicCPURe
     auto* p = reinterpret_cast<const uint8_t*>(&hdr);
     for (uint32_t i = 0; i < sizeof(hdr); ++i) buf[off++] = p[i];
 
-    // Packet header
+    // Packet 1: CPU registers
     PanicPacketHeader ph;
     ph.type = QR_PACKET_TYPE_CPU_REGS;
     ph.size = sizeof(PanicCPURegs);
@@ -39,9 +45,25 @@ static uint32_t BuildPanicPacket(uint8_t* buf, uint32_t bufLen, const PanicCPURe
     p = reinterpret_cast<const uint8_t*>(&ph);
     for (uint32_t i = 0; i < sizeof(ph); ++i) buf[off++] = p[i];
 
-    // CPU registers
     p = reinterpret_cast<const uint8_t*>(regs);
     for (uint32_t i = 0; i < sizeof(PanicCPURegs); ++i) buf[off++] = p[i];
+
+    // Packet 2: Stack trace
+    PanicPacketHeader ph2;
+    ph2.type = QR_PACKET_TYPE_STACK_TRACE;
+    ph2.size = tracePayloadSize;
+
+    p = reinterpret_cast<const uint8_t*>(&ph2);
+    for (uint32_t i = 0; i < sizeof(ph2); ++i) buf[off++] = p[i];
+
+    // depth byte
+    buf[off++] = trace->depth;
+
+    // RIP values (only the valid ones)
+    for (uint8_t d = 0; d < trace->depth; d++) {
+        p = reinterpret_cast<const uint8_t*>(&trace->rip[d]);
+        for (uint32_t i = 0; i < 8; ++i) buf[off++] = p[i];
+    }
 
     return off;
 }
@@ -82,11 +104,12 @@ static void RenderQRToFramebuffer(uint32_t* fb, uint32_t fbWidth, uint32_t fbHei
 }
 
 void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
-                   uint32_t fbStride, const PanicCPURegs* regs)
+                   uint32_t fbStride, const PanicCPURegs* regs,
+                   const PanicStackTrace* trace)
 {
-    // Step 1: Build binary panic packet
+    // Step 1: Build binary panic packet (regs + stack trace)
     uint8_t packetBuf[512];
-    uint32_t packetLen = BuildPanicPacket(packetBuf, sizeof(packetBuf), regs);
+    uint32_t packetLen = BuildPanicPacket(packetBuf, sizeof(packetBuf), regs, trace);
     if (packetLen == 0)
     {
         SerialPuts("PANIC QR: packet build failed\n");

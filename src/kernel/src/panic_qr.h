@@ -18,7 +18,8 @@ namespace brook {
 static constexpr uint8_t  QR_MAGIC_BYTE  = 0x2D;
 static constexpr uint8_t  QR_VERSION     = 0x00;
 static constexpr uint32_t QR_HEADER_PAD  = 0xCAFEF00D;
-static constexpr uint32_t QR_PACKET_TYPE_CPU_REGS = 0xA3000001;
+static constexpr uint32_t QR_PACKET_TYPE_CPU_REGS    = 0xA3000001;
+static constexpr uint32_t QR_PACKET_TYPE_STACK_TRACE = 0xA3000002;
 
 // Rendering constants (tuned on real hardware)
 static constexpr uint32_t QR_PIXELS_PER_MODULE = 3;
@@ -60,12 +61,21 @@ struct __attribute__((packed)) PanicCPURegs {
     uint16_t reserved;
 };
 
-// Render a QR code containing CPU state to the framebuffer.
+// Stack trace captured at panic time (RBP frame walking)
+static constexpr uint32_t PANIC_MAX_STACK_DEPTH = 16;
+
+struct __attribute__((packed)) PanicStackTrace {
+    uint8_t  depth;                              // number of valid frames
+    uint64_t rip[PANIC_MAX_STACK_DEPTH];         // [0]=leaf, [1..]=callers
+};
+
+// Render a QR code containing CPU state + stack trace to the framebuffer.
 // Called from KernelPanic after capturing registers.
 // fbBase: physical address of framebuffer
 // fbWidth/fbHeight: framebuffer dimensions
 // fbStride: bytes per scanline
 void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
-                   uint32_t fbStride, const PanicCPURegs* regs);
+                   uint32_t fbStride, const PanicCPURegs* regs,
+                   const PanicStackTrace* trace);
 
 } // namespace brook
