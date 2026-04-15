@@ -32,15 +32,16 @@ static int ProcFsStatPathCb(void* /*mountPriv*/, uint8_t /*pdrv*/,
 }
 
 static const VfsFsOps g_procFsOps = {
-    .mount     = ProcFsMount,
-    .unmount   = ProcFsUnmountCb,
-    .open      = ProcFsOpenCb,
-    .stat_path = ProcFsStatPathCb,
-    .unlink    = nullptr,
-    .mkdir     = nullptr,
-    .rename    = nullptr,
-    .symlink   = nullptr,
-    .readlink  = nullptr,
+    .mount      = ProcFsMount,
+    .unmount    = ProcFsUnmountCb,
+    .open       = ProcFsOpenCb,
+    .stat_path  = ProcFsStatPathCb,
+    .lstat_path = nullptr,
+    .unlink     = nullptr,
+    .mkdir      = nullptr,
+    .rename     = nullptr,
+    .symlink    = nullptr,
+    .readlink   = nullptr,
 };
 
 void ProcFsVfsRegister()

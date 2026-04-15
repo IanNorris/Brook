@@ -2852,10 +2852,12 @@ static void FillStat(LinuxStat* st, const VnodeStat& vs)
     st->st_size = static_cast<int64_t>(vs.size);
     st->st_blocks = (st->st_size + 511) / 512;
 
-    if (vs.isDir)
+    if (vs.isSymlink)
+        st->st_mode = 0120777; // S_IFLNK | rwxrwxrwx
+    else if (vs.isDir)
         st->st_mode = 0040755; // S_IFDIR | rwxr-xr-x
     else
-        st->st_mode = 0100755; // S_IFREG | rwxr-xr-x (all files executable on FAT)
+        st->st_mode = 0100755; // S_IFREG | rwxr-xr-x
 }
 
 // Busybox-aware stat: if a file doesn't exist in /boot/BIN/ but busybox does,
@@ -2928,7 +2930,7 @@ static int64_t sys_stat(uint64_t pathAddr, uint64_t statAddr, uint64_t,
         lookup = resolved;
     }
 
-    VnodeStat vs; vs.size = 0; vs.isDir = false;
+    VnodeStat vs; vs.size = 0; vs.isDir = false; vs.isSymlink = false;
     if (VfsStatPath(lookup, &vs) < 0)
     {
         if (!BusyboxStatFallback(lookup, &vs))
@@ -2942,7 +2944,47 @@ static int64_t sys_stat(uint64_t pathAddr, uint64_t statAddr, uint64_t,
 static int64_t sys_lstat(uint64_t pathAddr, uint64_t statAddr, uint64_t,
                           uint64_t, uint64_t, uint64_t)
 {
-    return sys_stat(pathAddr, statAddr, 0, 0, 0, 0);
+    const char* path = reinterpret_cast<const char*>(pathAddr);
+    auto* st = reinterpret_cast<LinuxStat*>(statAddr);
+
+    // Resolve relative paths against CWD (same logic as sys_stat)
+    char resolved[256];
+    const char* lookup = path;
+    if (path[0] != '/')
+    {
+        Process* proc = ProcessCurrent();
+        const char* cwd = (proc && proc->cwd[0]) ? proc->cwd : "/";
+        uint32_t ci = 0;
+        if (path[0] == '.' && (path[1] == '\0' || path[1] == '/'))
+        {
+            for (uint32_t j = 0; cwd[j] && ci < 254; ++j)
+                resolved[ci++] = cwd[j];
+            if (path[1] == '/')
+                for (uint32_t j = 1; path[j] && ci < 254; ++j)
+                    resolved[ci++] = path[j];
+        }
+        else
+        {
+            for (uint32_t j = 0; cwd[j] && ci < 250; ++j)
+                resolved[ci++] = cwd[j];
+            if (ci > 0 && resolved[ci - 1] != '/')
+                resolved[ci++] = '/';
+            for (uint32_t j = 0; path[j] && ci < 254; ++j)
+                resolved[ci++] = path[j];
+        }
+        resolved[ci] = '\0';
+        lookup = resolved;
+    }
+
+    VnodeStat vs; vs.size = 0; vs.isDir = false; vs.isSymlink = false;
+    if (VfsLstatPath(lookup, &vs) < 0)
+    {
+        if (!BusyboxStatFallback(lookup, &vs))
+            return -ENOENT;
+    }
+
+    FillStat(st, vs);
+    return 0;
 }
 
 static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
@@ -2966,7 +3008,7 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
 
     if (fde->type == FdType::Vnode && fde->handle) {
         auto* vn = static_cast<Vnode*>(fde->handle);
-        VnodeStat vs; vs.size = 0; vs.isDir = false;
+        VnodeStat vs; vs.size = 0; vs.isDir = false; vs.isSymlink = false;
         if (VfsStat(vn, &vs) < 0) return -EBADF;
         FillStat(st, vs);
         return 0;
@@ -3008,6 +3050,9 @@ static int64_t sys_newfstatat(uint64_t dirfd, uint64_t pathAddr, uint64_t statAd
     if (!path || path[0] == '\0')
         return sys_fstat(dirfd, statAddr, 0, 0, 0, 0);
 
+    static constexpr uint64_t AT_SYMLINK_NOFOLLOW = 0x100;
+    bool noFollow = (flags & AT_SYMLINK_NOFOLLOW) != 0;
+
     // Resolve relative path against dirfd if needed
     static constexpr int64_t AT_FDCWD = -100;
     if (path[0] != '/' && static_cast<int64_t>(dirfd) != AT_FDCWD)
@@ -3025,11 +3070,15 @@ static int64_t sys_newfstatat(uint64_t dirfd, uint64_t pathAddr, uint64_t statAd
                 for (uint32_t i = 0; path[i] && ri < 254; ++i)
                     resolved[ri++] = path[i];
                 resolved[ri] = '\0';
+                if (noFollow)
+                    return sys_lstat(reinterpret_cast<uint64_t>(resolved), statAddr, 0, 0, 0, 0);
                 return sys_stat(reinterpret_cast<uint64_t>(resolved), statAddr, 0, 0, 0, 0);
             }
         }
     }
 
+    if (noFollow)
+        return sys_lstat(pathAddr, statAddr, 0, 0, 0, 0);
     return sys_stat(pathAddr, statAddr, 0, 0, 0, 0);
 }
 
@@ -3837,7 +3886,7 @@ static int64_t sys_chdir(uint64_t pathAddr, uint64_t, uint64_t,
     }
 
     // Verify path exists and is a directory
-    VnodeStat vs; vs.size = 0; vs.isDir = false;
+    VnodeStat vs; vs.size = 0; vs.isDir = false; vs.isSymlink = false;
     if (VfsStatPath(newCwd, &vs) < 0) return -ENOENT;
     if (!vs.isDir) return -ENOTDIR;
 

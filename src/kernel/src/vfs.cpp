@@ -253,6 +253,22 @@ int VfsStatPath(const char* path, VnodeStat* st)
     return mount->fsOps->stat_path(mount->mountPriv, mount->pdrv, relPath, st);
 }
 
+int VfsLstatPath(const char* path, VnodeStat* st)
+{
+    if (!path || !st) return -1;
+
+    const char* relPath = nullptr;
+    MountEntry* mount   = FindMount(path, &relPath);
+    if (!mount || !mount->fsOps) return -1;
+
+    // Use lstat_path if available, otherwise fall back to stat_path
+    if (mount->fsOps->lstat_path)
+        return mount->fsOps->lstat_path(mount->mountPriv, mount->pdrv, relPath, st);
+    if (mount->fsOps->stat_path)
+        return mount->fsOps->stat_path(mount->mountPriv, mount->pdrv, relPath, st);
+    return -1;
+}
+
 int VfsSync(Vnode* vn)
 {
     // Sync is vnode-ops based — handled by the filesystem's close/write ops.

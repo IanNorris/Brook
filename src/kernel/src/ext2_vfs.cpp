@@ -1315,7 +1315,56 @@ static int Ext2FsStatPath(void* mountPriv, uint8_t pdrv,
 
     uint16_t mode = inodeData.i_mode & EXT2_S_IFMT;
     st->isDir = (mode == EXT2_S_IFDIR);
+    st->isSymlink = false; // stat follows symlinks, so result is never a symlink
     st->size  = st->isDir ? 0 : Ext2InodeSize(&inodeData);
+    return 0;
+}
+
+// lstat: like stat but does NOT follow the final symlink
+static int Ext2FsLstatPath(void* mountPriv, uint8_t pdrv,
+                            const char* relPath, VnodeStat* st)
+{
+    (void)pdrv;
+    auto* mnt = static_cast<Ext2Mount*>(mountPriv);
+
+    bool isRoot = (!relPath[0] || (relPath[0] == '/' && !relPath[1]));
+
+    KMutexLock(&g_ext2Lock);
+
+    if (isRoot) {
+        Ext2Inode inodeData;
+        if (!Ext2ReadInode(mnt, EXT2_ROOT_INO, &inodeData)) {
+            KMutexUnlock(&g_ext2Lock);
+            return -1;
+        }
+        KMutexUnlock(&g_ext2Lock);
+        st->isDir = true;
+        st->isSymlink = false;
+        st->size = 0;
+        return 0;
+    }
+
+    // Resolve parent directory (following symlinks in the path), then
+    // look up the final component directly without following it.
+    char name[256];
+    uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name));
+    if (!parentIno || !name[0]) { KMutexUnlock(&g_ext2Lock); return -1; }
+
+    Ext2Inode parentData;
+    if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KMutexUnlock(&g_ext2Lock); return -1; }
+
+    uint32_t ino = Ext2DirLookup(mnt, &parentData, name);
+    if (!ino) { KMutexUnlock(&g_ext2Lock); return -1; }
+
+    Ext2Inode inodeData;
+    if (!Ext2ReadInode(mnt, ino, &inodeData)) { KMutexUnlock(&g_ext2Lock); return -1; }
+
+    KMutexUnlock(&g_ext2Lock);
+
+    uint16_t mode = inodeData.i_mode & EXT2_S_IFMT;
+    st->isDir     = (mode == EXT2_S_IFDIR);
+    st->isSymlink = (mode == EXT2_S_IFLNK);
+    st->size      = Ext2InodeSize(&inodeData);
     return 0;
 }
 
@@ -1657,15 +1706,16 @@ static int Ext2FsReadlink(void* mountPriv, uint8_t pdrv,
 }
 
 static const VfsFsOps g_ext2FsOps = {
-    .mount     = Ext2FsMount,
-    .unmount   = Ext2FsUnmount,
-    .open      = Ext2FsOpen,
-    .stat_path = Ext2FsStatPath,
-    .unlink    = Ext2FsUnlink,
-    .mkdir     = Ext2FsMkdir,
-    .rename    = Ext2FsRename,
-    .symlink   = Ext2FsSymlink,
-    .readlink  = Ext2FsReadlink,
+    .mount      = Ext2FsMount,
+    .unmount    = Ext2FsUnmount,
+    .open       = Ext2FsOpen,
+    .stat_path  = Ext2FsStatPath,
+    .lstat_path = Ext2FsLstatPath,
+    .unlink     = Ext2FsUnlink,
+    .mkdir      = Ext2FsMkdir,
+    .rename     = Ext2FsRename,
+    .symlink    = Ext2FsSymlink,
+    .readlink   = Ext2FsReadlink,
 };
 
 // ---------------------------------------------------------------------------

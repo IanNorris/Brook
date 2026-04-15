@@ -52,6 +52,7 @@ struct DirEntry {
 struct VnodeStat {
     uint64_t size;
     bool     isDir;
+    bool     isSymlink;
 };
 
 // ---- VFS open flags ----
@@ -83,6 +84,10 @@ struct VfsFsOps {
 
     // Stat by relative path (no open required).  Returns 0 on success.
     int (*stat_path)(void* mountPriv, uint8_t pdrv, const char* relPath, VnodeStat* st);
+
+    // Lstat by relative path — like stat_path but does NOT follow the final symlink.
+    // If nullptr, falls back to stat_path.
+    int (*lstat_path)(void* mountPriv, uint8_t pdrv, const char* relPath, VnodeStat* st);
 
     // Delete a file.  Returns 0 on success.
     int (*unlink)(void* mountPriv, uint8_t pdrv, const char* relPath);
@@ -147,6 +152,9 @@ int VfsStat(Vnode* vn, VnodeStat* st);
 
 // Stat by path — uses directory metadata only, does NOT open the file.
 extern "C" int VfsStatPath(const char* path, VnodeStat* st);
+
+// Lstat by path — like VfsStatPath but does not follow the final symlink.
+extern "C" int VfsLstatPath(const char* path, VnodeStat* st);
 
 // Delete a file by path.
 int VfsUnlink(const char* path);

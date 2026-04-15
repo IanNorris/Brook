@@ -505,15 +505,16 @@ static int FatFsRename(void* /*mountPriv*/, uint8_t pdrv,
 }
 
 static const VfsFsOps g_fatFsOps = {
-    .mount     = FatFsMount,
-    .unmount   = FatFsUnmount,
-    .open      = FatFsOpen,
-    .stat_path = FatFsStatPath,
-    .unlink    = FatFsUnlink,
-    .mkdir     = FatFsMkdir,
-    .rename    = FatFsRename,
-    .symlink   = nullptr,
-    .readlink  = nullptr,
+    .mount      = FatFsMount,
+    .unmount    = FatFsUnmount,
+    .open       = FatFsOpen,
+    .stat_path  = FatFsStatPath,
+    .lstat_path = nullptr,
+    .unlink     = FatFsUnlink,
+    .mkdir      = FatFsMkdir,
+    .rename     = FatFsRename,
+    .symlink    = nullptr,
+    .readlink   = nullptr,
 };
 
 // ---- Public init ----
