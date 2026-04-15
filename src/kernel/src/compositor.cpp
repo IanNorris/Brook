@@ -529,7 +529,7 @@ static void CompositorLoopWM()
     for (uint32_t i = 0; i < wcount; ++i)
     {
         Window* w = WmGetWindow(sorted[i]);
-        if (!w || !w->proc || !w->visible) continue;
+        if (!w || !w->proc || !w->visible || w->minimized) continue;
 
         Process* p = w->proc;
 
@@ -602,6 +602,15 @@ static void CompositorLoopWM()
         if (g_backBuffer)
             WmRenderChromeForWindow(g_backBuffer, g_backBufStride,
                                      g_physFbWidth, g_physFbHeight, sorted[i]);
+    }
+
+    // 3. Render taskbar at bottom of screen
+    if (g_backBuffer)
+    {
+        WmRenderTaskbar(g_backBuffer, g_backBufStride,
+                        g_physFbWidth, g_physFbHeight, now);
+        uint32_t tbY = g_physFbHeight - WM_TASKBAR_HEIGHT;
+        MarkDirtyRows(tbY, g_physFbHeight);
     }
 
     // 4. Handle mouse interaction
@@ -730,6 +739,33 @@ static void CompositorHandleMouseWM()
 
     if (btnDown && !g_wmLastBtnDown)
     {
+        // Check taskbar first
+        int tbIdx = WmTaskbarHitTest(mx, my, g_physFbWidth, g_physFbHeight);
+        if (tbIdx >= 0)
+        {
+            Window* tw = WmGetWindow(tbIdx);
+            if (tw && tw->proc)
+            {
+                if (tw->minimized)
+                {
+                    WmRestoreWindow(tbIdx);
+                }
+                else if (tw->focused)
+                {
+                    WmMinimizeWindow(tbIdx);
+                }
+                else
+                {
+                    WmSetFocus(tbIdx);
+                }
+            }
+        }
+        else if (my >= static_cast<int32_t>(g_physFbHeight - WM_TASKBAR_HEIGHT))
+        {
+            // Clicked taskbar background — do nothing
+        }
+        else
+        {
         // Button just pressed — do hit test
         WmHitResult hit = WmHitTest(mx, my);
 
@@ -757,6 +793,9 @@ static void CompositorHandleMouseWM()
             case WmHitZone::MaximizeButton:
                 WmToggleMaximize(hit.windowIndex);
                 break;
+            case WmHitZone::MinimizeButton:
+                WmMinimizeWindow(hit.windowIndex);
+                break;
             case WmHitZone::TitleBar:
             {
                 // Start drag
@@ -774,6 +813,7 @@ static void CompositorHandleMouseWM()
                 break;
             }
         }
+        } // end else (desktop hit test)
     }
     else if (btnDown && g_wmDragging)
     {
@@ -992,8 +1032,9 @@ static void CompositorLoop()
         CursorDraw(mx, my);
     }
 
-    // Draw uptime clock overlay in top-right corner.
-    CompositorDrawClock();
+    // Draw uptime clock overlay (only in legacy/non-WM mode — WM uses taskbar clock).
+    if (!WmIsActive())
+        CompositorDrawClock();
 
     // Flip: copy only dirty scanlines from backbuffer → MMIO framebuffer.
     if (g_backBuffer && g_dirtyMinY < g_dirtyMaxY)

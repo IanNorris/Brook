@@ -14,6 +14,7 @@ static constexpr uint32_t WM_RESIZE_GRAB      = 8;   // corner grab zone for res
 static constexpr uint32_t WM_MIN_WIDTH        = 200;
 static constexpr uint32_t WM_MIN_HEIGHT       = 100;
 static constexpr uint32_t WM_MAX_WINDOWS      = 32;
+static constexpr uint32_t WM_TASKBAR_HEIGHT   = 32;   // bottom taskbar height
 
 // Window chrome colours
 static constexpr uint32_t WM_TITLE_BG_FOCUSED   = 0x002B4A7A; // blue-ish
@@ -23,6 +24,11 @@ static constexpr uint32_t WM_BORDER_FOCUSED     = 0x004080C0; // lighter blue
 static constexpr uint32_t WM_BORDER_UNFOCUSED   = 0x00505050; // grey
 static constexpr uint32_t WM_CLOSE_BTN_HOVER    = 0x00E04040; // red
 static constexpr uint32_t WM_MAX_BTN_HOVER      = 0x00606060; // grey
+static constexpr uint32_t WM_TASKBAR_BG         = 0x001E1E2E; // dark blue-grey
+static constexpr uint32_t WM_TASKBAR_BTN_BG     = 0x002D2D3D; // slightly lighter
+static constexpr uint32_t WM_TASKBAR_BTN_ACTIVE = 0x003B5998; // active/focused button
+static constexpr uint32_t WM_TASKBAR_BTN_FG     = 0x00D0D0D0; // button text
+static constexpr uint32_t WM_TASKBAR_CLOCK_FG   = 0x0090D0FF; // clock text (light blue)
 
 enum class WindowState : uint8_t
 {
@@ -41,6 +47,7 @@ struct Window
     WindowState state;
     bool        focused;
     bool        visible;
+    bool        minimized;      // hidden from desktop, shown in taskbar
     char        title[64];
 
     // Pre-maximise geometry (for restore)
@@ -63,9 +70,12 @@ enum class WmHitZone : uint8_t
     TitleBar,
     CloseButton,
     MaximizeButton,
+    MinimizeButton,
     ClientArea,
     ResizeCorner,   // bottom-right corner
     Border,
+    Taskbar,        // clicked on taskbar background
+    TaskbarButton,  // clicked on a taskbar window button
 };
 
 struct WmHitResult
@@ -113,6 +123,12 @@ uint32_t WmWindowCount();
 // Toggle maximise/restore for a window.
 void WmToggleMaximize(int idx);
 
+// Minimize a window (hide from desktop, show in taskbar).
+void WmMinimizeWindow(int idx);
+
+// Restore a minimized window.
+void WmRestoreWindow(int idx);
+
 // Move a window to a new position.
 void WmMoveWindow(int idx, int16_t newX, int16_t newY);
 
@@ -134,5 +150,16 @@ void WmSetActive(bool active);
 // Get all windows sorted by z-order (back to front).
 // Returns count; fills outIndices with window indices in z-order.
 uint32_t WmGetZOrder(int* outIndices, uint32_t maxOut);
+
+// Render the taskbar (bottom of screen) with window buttons and clock.
+void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
+                     uint32_t screenW, uint32_t screenH,
+                     uint64_t uptimeMs);
+
+// Hit-test the taskbar. Returns the window index if a button was clicked, -1 otherwise.
+int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH);
+
+// Get the usable desktop height (screen height minus taskbar).
+uint32_t WmDesktopHeight(uint32_t screenH);
 
 } // namespace brook

@@ -167,6 +167,7 @@ int WmCreateWindow(Process* proc, int16_t x, int16_t y,
     w.state = WindowState::Normal;
     w.focused = false;
     w.visible = true;
+    w.minimized = false;
     w.savedX = x;
     w.savedY = y;
     w.savedW = clientW;
@@ -236,7 +237,7 @@ WmHitResult WmHitTest(int32_t mx, int32_t my)
     {
         int idx = sorted[i];
         const Window& w = g_windows[idx];
-        if (!w.proc || !w.visible) continue;
+        if (!w.proc || !w.visible || w.minimized) continue;
 
         int wx = w.x;
         int wy = w.y;
@@ -268,6 +269,15 @@ WmHitResult WmHitTest(int32_t mx, int32_t my)
             relX >= maxBtnX && relX < maxBtnX + static_cast<int>(WM_BUTTON_WIDTH))
         {
             result.zone = WmHitZone::MaximizeButton;
+            return result;
+        }
+
+        // Minimize button (left of maximize)
+        int minBtnX = maxBtnX - static_cast<int>(WM_BUTTON_WIDTH);
+        if (relY < static_cast<int>(WM_TITLE_BAR_HEIGHT) &&
+            relX >= minBtnX && relX < minBtnX + static_cast<int>(WM_BUTTON_WIDTH))
+        {
+            result.zone = WmHitZone::MinimizeButton;
             return result;
         }
 
@@ -355,11 +365,12 @@ void WmToggleMaximize(int idx)
         w.savedW = w.clientW;
         w.savedH = w.clientH;
 
-        // Maximize: fill screen minus chrome
+        // Maximize: fill desktop area (screen minus taskbar) minus chrome
         w.x = 0;
         w.y = 0;
+        uint32_t desktopH = WmDesktopHeight(screenH);
         w.clientW = static_cast<uint16_t>(screenW - 2 * WM_BORDER_WIDTH);
-        w.clientH = static_cast<uint16_t>(screenH - WM_TITLE_BAR_HEIGHT - 2 * WM_BORDER_WIDTH);
+        w.clientH = static_cast<uint16_t>(desktopH - WM_TITLE_BAR_HEIGHT - 2 * WM_BORDER_WIDTH);
         w.state = WindowState::Maximized;
     }
     else
@@ -382,13 +393,53 @@ void WmMoveWindow(int idx, int16_t newX, int16_t newY)
     w.y = newY;
 }
 
+void WmMinimizeWindow(int idx)
+{
+    if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
+    Window& w = g_windows[idx];
+    if (!w.proc || w.minimized) return;
+
+    w.minimized = true;
+    SerialPrintf("WM: minimized window %d '%s'\n", idx, w.title);
+
+    // If this was focused, focus the next visible window
+    if (g_focusedIdx == idx)
+    {
+        g_focusedIdx = -1;
+        w.focused = false;
+        int bestIdx = -1;
+        uint8_t bestZ = 0;
+        for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
+        {
+            if (g_windows[i].proc && g_windows[i].visible && !g_windows[i].minimized
+                && g_windows[i].zOrder >= bestZ)
+            {
+                bestZ = g_windows[i].zOrder;
+                bestIdx = static_cast<int>(i);
+            }
+        }
+        if (bestIdx >= 0) WmSetFocus(bestIdx);
+    }
+}
+
+void WmRestoreWindow(int idx)
+{
+    if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
+    Window& w = g_windows[idx];
+    if (!w.proc || !w.minimized) return;
+
+    w.minimized = false;
+    SerialPrintf("WM: restored window %d '%s'\n", idx, w.title);
+    WmSetFocus(idx);
+}
+
 uint32_t WmGetZOrder(int* outIndices, uint32_t maxOut)
 {
-    // Collect visible windows
+    // Collect visible, non-minimized windows
     uint32_t count = 0;
     for (uint32_t i = 0; i < WM_MAX_WINDOWS && count < maxOut; ++i)
     {
-        if (g_windows[i].proc && g_windows[i].visible)
+        if (g_windows[i].proc && g_windows[i].visible && !g_windows[i].minimized)
             outIndices[count++] = static_cast<int>(i);
     }
 
@@ -478,6 +529,16 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     WmFillRect(buf, stride, screenW, screenH, sqX, sqY, 1, sqS, WM_TITLE_FG);
     // Right edge
     WmFillRect(buf, stride, screenW, screenH, sqX + sqS - 1, sqY, 1, sqS, WM_TITLE_FG);
+
+    // Minimize button — underscore icon, left of maximize button
+    int minBtnX = maxBtnX - WM_BUTTON_WIDTH;
+    WmFillRect(buf, stride, screenW, screenH, minBtnX, titleY,
+               WM_BUTTON_WIDTH, titleH, titleBg);
+    // Draw a horizontal line at the bottom of the button area
+    int lineW = 10;
+    int lineX = minBtnX + (WM_BUTTON_WIDTH - lineW) / 2;
+    int lineY = titleY + titleH - 6;
+    WmFillRect(buf, stride, screenW, screenH, lineX, lineY, lineW, 2, WM_TITLE_FG);
 }
 
 void WmRenderChrome(uint32_t* backBuffer, uint32_t stride,
@@ -502,6 +563,148 @@ void WmRenderChromeForWindow(uint32_t* backBuffer, uint32_t stride,
     const Window& w = g_windows[idx];
     if (!w.proc || !w.visible) return;
     RenderWindowChrome(backBuffer, stride, screenW, screenH, w);
+}
+
+// ---------------------------------------------------------------------------
+// Taskbar
+// ---------------------------------------------------------------------------
+
+static constexpr uint32_t TASKBAR_BTN_WIDTH  = 140;
+static constexpr uint32_t TASKBAR_BTN_HEIGHT = 24;
+static constexpr uint32_t TASKBAR_PADDING    = 4;
+static constexpr uint32_t TASKBAR_SEPARATOR  = 1; // thin line between taskbar and desktop
+
+// Format uptime into buf as HH:MM:SS, return buf.
+static char* TaskbarFormatUptime(char* buf, uint64_t totalSec)
+{
+    uint32_t h = static_cast<uint32_t>(totalSec / 3600);
+    uint32_t m = static_cast<uint32_t>((totalSec % 3600) / 60);
+    uint32_t s = static_cast<uint32_t>(totalSec % 60);
+    buf[0] = static_cast<char>('0' + (h / 10) % 10);
+    buf[1] = static_cast<char>('0' + h % 10);
+    buf[2] = ':';
+    buf[3] = static_cast<char>('0' + m / 10);
+    buf[4] = static_cast<char>('0' + m % 10);
+    buf[5] = ':';
+    buf[6] = static_cast<char>('0' + s / 10);
+    buf[7] = static_cast<char>('0' + s % 10);
+    buf[8] = '\0';
+    return buf;
+}
+
+void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
+                     uint32_t screenW, uint32_t screenH,
+                     uint64_t uptimeMs)
+{
+    if (!g_wmActive || !backBuffer) return;
+
+    uint32_t tbY = screenH - WM_TASKBAR_HEIGHT;
+
+    // Taskbar background
+    WmFillRect(backBuffer, stride, screenW, screenH,
+               0, static_cast<int>(tbY), static_cast<int>(screenW),
+               static_cast<int>(WM_TASKBAR_HEIGHT), WM_TASKBAR_BG);
+
+    // Top separator line
+    WmFillRect(backBuffer, stride, screenW, screenH,
+               0, static_cast<int>(tbY), static_cast<int>(screenW),
+               TASKBAR_SEPARATOR, 0x00404050);
+
+    // Collect all active windows (including minimized) for taskbar buttons
+    uint32_t btnX = TASKBAR_PADDING;
+    uint32_t btnY = tbY + (WM_TASKBAR_HEIGHT - TASKBAR_BTN_HEIGHT) / 2;
+    uint32_t textYOff = (TASKBAR_BTN_HEIGHT - static_cast<uint32_t>(g_fontAtlas.lineHeight)) / 2;
+
+    for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
+    {
+        const Window& w = g_windows[i];
+        if (!w.proc || !w.visible) continue;
+
+        // Button background — highlight if focused
+        uint32_t btnBg = (w.focused && !w.minimized) ? WM_TASKBAR_BTN_ACTIVE : WM_TASKBAR_BTN_BG;
+        WmFillRect(backBuffer, stride, screenW, screenH,
+                   static_cast<int>(btnX), static_cast<int>(btnY),
+                   TASKBAR_BTN_WIDTH, TASKBAR_BTN_HEIGHT, btnBg);
+
+        // If minimized, draw a subtle underline indicator
+        if (w.minimized)
+        {
+            WmFillRect(backBuffer, stride, screenW, screenH,
+                       static_cast<int>(btnX + 2),
+                       static_cast<int>(btnY + TASKBAR_BTN_HEIGHT - 2),
+                       TASKBAR_BTN_WIDTH - 4, 1, 0x00808080);
+        }
+
+        // Truncate title to fit button
+        char label[20];
+        uint32_t maxChars = (TASKBAR_BTN_WIDTH - 8) / 8; // rough estimate
+        if (maxChars > sizeof(label) - 1) maxChars = sizeof(label) - 1;
+        uint32_t ti = 0;
+        while (ti < maxChars && w.title[ti]) { label[ti] = w.title[ti]; ti++; }
+        label[ti] = '\0';
+
+        // Render title text
+        WmRenderString(backBuffer, stride, screenW, screenH,
+                       static_cast<int>(btnX + 4),
+                       static_cast<int>(btnY + textYOff),
+                       label, WM_TASKBAR_BTN_FG, btnBg);
+
+        btnX += TASKBAR_BTN_WIDTH + TASKBAR_PADDING;
+    }
+
+    // Clock — right-aligned in taskbar
+    uint64_t uptimeSec = uptimeMs / 1000;
+    char clockBuf[16];
+    TaskbarFormatUptime(clockBuf, uptimeSec);
+
+    // Measure clock text width
+    const FontAtlas& fa = g_fontAtlas;
+    uint32_t clockW = 0;
+    for (const char* p = clockBuf; *p; p++)
+    {
+        int code = static_cast<int>(static_cast<uint8_t>(*p));
+        if (code >= static_cast<int>(fa.firstChar) &&
+            code < static_cast<int>(fa.firstChar + fa.glyphCount))
+            clockW += static_cast<uint32_t>(fa.glyphs[code - static_cast<int>(fa.firstChar)].advance);
+    }
+
+    uint32_t clockX = screenW - clockW - TASKBAR_PADDING * 2;
+    WmRenderString(backBuffer, stride, screenW, screenH,
+                   static_cast<int>(clockX),
+                   static_cast<int>(btnY + textYOff),
+                   clockBuf, WM_TASKBAR_CLOCK_FG, WM_TASKBAR_BG);
+}
+
+int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
+{
+    uint32_t tbY = screenH - WM_TASKBAR_HEIGHT;
+    if (my < static_cast<int32_t>(tbY) || mx < 0 || mx >= static_cast<int32_t>(screenW))
+        return -1;
+
+    // Walk window buttons left to right
+    uint32_t btnX = TASKBAR_PADDING;
+    for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
+    {
+        const Window& w = g_windows[i];
+        if (!w.proc || !w.visible) continue;
+
+        uint32_t btnY = tbY + (WM_TASKBAR_HEIGHT - TASKBAR_BTN_HEIGHT) / 2;
+        if (mx >= static_cast<int32_t>(btnX) &&
+            mx < static_cast<int32_t>(btnX + TASKBAR_BTN_WIDTH) &&
+            my >= static_cast<int32_t>(btnY) &&
+            my < static_cast<int32_t>(btnY + TASKBAR_BTN_HEIGHT))
+        {
+            return static_cast<int>(i);
+        }
+        btnX += TASKBAR_BTN_WIDTH + TASKBAR_PADDING;
+    }
+
+    return -1; // clicked taskbar background but not a button
+}
+
+uint32_t WmDesktopHeight(uint32_t screenH)
+{
+    return screenH > WM_TASKBAR_HEIGHT ? screenH - WM_TASKBAR_HEIGHT : screenH;
 }
 
 } // namespace brook
