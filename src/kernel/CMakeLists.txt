@@ -166,6 +166,7 @@ add_executable(kernel
     src/procfs.cpp
     src/procfs_vfs.cpp
     src/net.cpp
+    src/tcp.cpp
     src/virtio_blk.cpp
     src/acpi.cpp
     src/apic.cpp

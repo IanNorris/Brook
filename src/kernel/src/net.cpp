@@ -4,6 +4,7 @@
 // Single-NIC, single-threaded receive path.
 
 #include "net.h"
+#include "tcp.h"
 #include "serial.h"
 #include "kprintf.h"
 #include "scheduler.h"
@@ -56,11 +57,9 @@ static uint16_t g_ipId = 1;
 
 static uint16_t g_tcpEphemeralPort = 49200;
 
-// Forward declarations for TCP
+// Forward declaration for TCP send (defined below)
 static void TcpSendSegment(Socket& s, uint8_t flags,
                            const void* data, uint32_t dataLen);
-static uint16_t TcpChecksum(uint32_t srcIp, uint32_t dstIp,
-                            const void* tcpSeg, uint32_t tcpLen);
 
 // ---------------------------------------------------------------------------
 // Checksum helpers
@@ -1138,37 +1137,8 @@ void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
 }
 
 // ---------------------------------------------------------------------------
-// TCP implementation
+// TCP implementation — delegates to tcp.cpp state machine
 // ---------------------------------------------------------------------------
-
-static uint16_t TcpChecksum(uint32_t srcIp, uint32_t dstIp,
-                            const void* tcpSeg, uint32_t tcpLen)
-{
-    // Pseudo-header + TCP segment
-    uint32_t sum = 0;
-
-    // Pseudo-header: srcIp, dstIp, zero, proto, tcpLen (all in network order)
-    sum += (srcIp >> 16) & 0xFFFF;
-    sum += srcIp & 0xFFFF;
-    sum += (dstIp >> 16) & 0xFFFF;
-    sum += dstIp & 0xFFFF;
-    sum += htons(IP_PROTO_TCP);
-    sum += htons(static_cast<uint16_t>(tcpLen));
-
-    // TCP segment
-    const uint16_t* p = static_cast<const uint16_t*>(tcpSeg);
-    uint32_t remaining = tcpLen;
-    while (remaining > 1) {
-        sum += *p++;
-        remaining -= 2;
-    }
-    if (remaining == 1)
-        sum += *reinterpret_cast<const uint8_t*>(p);
-
-    while (sum >> 16)
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    return static_cast<uint16_t>(~sum);
-}
 
 static void TcpSendSegment(Socket& s, uint8_t flags,
                            const void* data, uint32_t dataLen)
@@ -1182,7 +1152,7 @@ static void TcpSendSegment(Socket& s, uint8_t flags,
     tcp->dstPort  = s.remotePort;
     tcp->seqNum   = htonl(s.tcpSndNxt);
     tcp->ackNum   = htonl(s.tcpRcvNxt);
-    tcp->dataOff  = (sizeof(TcpHeader) / 4) << 4; // 20 bytes = 5 words
+    tcp->dataOff  = (sizeof(TcpHeader) / 4) << 4;
     tcp->flags    = flags;
     tcp->window   = htons(Socket::RX_BUF_SIZE < 65535
                           ? static_cast<uint16_t>(Socket::RX_BUF_SIZE)
@@ -1192,18 +1162,17 @@ static void TcpSendSegment(Socket& s, uint8_t flags,
     if (data && dataLen > 0)
         NetMemcpy(buf + sizeof(TcpHeader), data, dataLen);
 
-    // Compute TCP checksum
     tcp->checksum = 0;
     tcp->checksum = TcpChecksum(g_netIf->ipAddr, s.remoteIp, buf, tcpLen);
 
     NetSendIpv4(s.remoteIp, IP_PROTO_TCP, buf, tcpLen);
 }
 
-// Append raw bytes to socket RX ring buffer (no framing, stream mode)
+// Append raw bytes to socket RX ring buffer
 static void TcpEnqueueData(Socket& s, const void* data, uint32_t len)
 {
     uint32_t avail = Socket::RX_BUF_SIZE - s.rxCount;
-    if (len > avail) len = avail; // drop excess
+    if (len > avail) len = avail;
 
     const uint8_t* d = static_cast<const uint8_t*>(data);
     for (uint32_t i = 0; i < len; i++) {
@@ -1239,101 +1208,14 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         if (s.remotePort != srcPort) continue;
         if (s.remoteIp != ip->srcIp) continue;
 
-        switch (s.tcpState) {
-        case TcpState::SynSent:
-            // Expecting SYN-ACK
-            if ((flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK)) {
-                s.tcpRcvNxt = seq + 1;
-                s.tcpSndUna = ack;
-                s.tcpState  = TcpState::Established;
-                s.connected = true;
-                // Send ACK to complete 3-way handshake
-                TcpSendSegment(s, TCP_ACK, nullptr, 0);
-            } else if (flags & TCP_RST) {
-                s.tcpState = TcpState::Closed;
-                s.connected = false;
-            }
-            break;
+        // Delegate to testable state machine
+        TcpAction act = TcpProcessSegment(s, seq, ack, flags, tcpData, dataLen);
 
-        case TcpState::Established:
-            // RST: abort
-            if (flags & TCP_RST) {
-                s.tcpState = TcpState::Closed;
-                s.connected = false;
-                s.tcpFinRecv = true;
-                return;
-            }
+        if (act.enqueueData && act.dataPtr && act.dataLen > 0)
+            TcpEnqueueData(s, act.dataPtr, act.dataLen);
+        if (act.sendAck)
+            TcpSendSegment(s, TCP_ACK, nullptr, 0);
 
-            // Update send window
-            if (flags & TCP_ACK) {
-                s.tcpSndUna = ack;
-            }
-
-            // Receive data
-            if (dataLen > 0 && seq == s.tcpRcvNxt) {
-                TcpEnqueueData(s, tcpData, dataLen);
-                s.tcpRcvNxt += dataLen;
-                // Send ACK
-                TcpSendSegment(s, TCP_ACK, nullptr, 0);
-            } else if (dataLen > 0) {
-                // Out of order — ACK with expected seq to trigger retransmit
-                TcpSendSegment(s, TCP_ACK, nullptr, 0);
-            }
-
-            // FIN
-            if (flags & TCP_FIN) {
-                s.tcpRcvNxt++;
-                s.tcpFinRecv = true;
-                TcpSendSegment(s, TCP_ACK, nullptr, 0);
-                s.tcpState = TcpState::CloseWait;
-            }
-            break;
-
-        case TcpState::FinWait1:
-            if (flags & TCP_ACK) {
-                s.tcpSndUna = ack;
-                if (flags & TCP_FIN) {
-                    s.tcpRcvNxt = seq + 1;
-                    TcpSendSegment(s, TCP_ACK, nullptr, 0);
-                    s.tcpState = TcpState::TimeWait;
-                } else {
-                    s.tcpState = TcpState::FinWait2;
-                }
-            }
-            // Handle data in FIN_WAIT1
-            if (dataLen > 0 && seq == s.tcpRcvNxt) {
-                TcpEnqueueData(s, tcpData, dataLen);
-                s.tcpRcvNxt += dataLen;
-            }
-            break;
-
-        case TcpState::FinWait2:
-            if (dataLen > 0 && seq == s.tcpRcvNxt) {
-                TcpEnqueueData(s, tcpData, dataLen);
-                s.tcpRcvNxt += dataLen;
-                TcpSendSegment(s, TCP_ACK, nullptr, 0);
-            }
-            if (flags & TCP_FIN) {
-                s.tcpRcvNxt = seq + (dataLen > 0 ? dataLen : 0) + 1;
-                TcpSendSegment(s, TCP_ACK, nullptr, 0);
-                s.tcpState = TcpState::TimeWait;
-            }
-            break;
-
-        case TcpState::LastAck:
-            if (flags & TCP_ACK) {
-                s.tcpState = TcpState::Closed;
-            }
-            break;
-
-        case TcpState::CloseWait:
-            // Waiting for application to close — just ACK data
-            if (flags & TCP_ACK) s.tcpSndUna = ack;
-            break;
-
-        default:
-            break;
-        }
         return; // handled
     }
 

@@ -27,6 +27,14 @@ endfunction()
 
 enable_testing()
 
+add_host_test(test_tcp
+    "${BROOK_ROOT}/src/kernel/src/tcp.cpp"
+)
+target_compile_options(test_tcp PRIVATE
+    "-iquote${BROOK_ROOT}/src/kernel/src"
+    "-iquote${BROOK_ROOT}/src/shared"
+)
+
 add_host_test(test_kmutex)
 add_host_test(test_krwlock)
 add_host_test(test_ksemaphore)
