@@ -24,6 +24,11 @@ struct Terminal
     uint16_t  foregroundPgid;  // foreground process group (for Ctrl+C)
     bool      active;
     bool      dirty;           // VFB needs compositor blit
+
+    // Alternate screen buffer (DEC private mode 1049)
+    uint32_t* altVfb;         // saved main screen when in alt mode
+    uint32_t  savedCurX, savedCurY;
+    bool      inAltScreen;
 };
 
 // Create a new terminal window and spawn bash in it.

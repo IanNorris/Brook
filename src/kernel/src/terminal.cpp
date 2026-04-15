@@ -203,7 +203,39 @@ static void TermHandleCSI(Terminal* t, const char* params, int paramLen, char fi
     case 'J': // Erase in display
     {
         int mode = (argCount >= 1) ? args[0] : 0;
-        if (mode == 2 || mode == 3)
+        uint32_t lineH = static_cast<uint32_t>(g_fontAtlas.lineHeight);
+        uint32_t glyphW = static_cast<uint32_t>(g_fontAtlas.glyphs[0].advance);
+
+        if (mode == 0)
+        {
+            // Clear from cursor to end of screen
+            uint32_t pixY = t->curY * lineH;
+            uint32_t pixX = t->curX * glyphW;
+            // Clear rest of current line
+            for (uint32_t y = pixY; y < pixY + lineH && y < t->vfbH; y++)
+                for (uint32_t x = pixX; x < t->vfbW; x++)
+                    t->vfb[y * t->vfbW + x] = t->bgColor;
+            // Clear all lines below
+            uint32_t startRow = (pixY + lineH < t->vfbH) ? pixY + lineH : t->vfbH;
+            for (uint32_t i = startRow * t->vfbW; i < t->vfbW * t->vfbH; i++)
+                t->vfb[i] = t->bgColor;
+            t->dirty = true;
+        }
+        else if (mode == 1)
+        {
+            // Clear from start to cursor
+            uint32_t pixY = t->curY * lineH;
+            uint32_t pixX = t->curX * glyphW;
+            // Clear all lines above
+            for (uint32_t i = 0; i < pixY * t->vfbW; i++)
+                t->vfb[i] = t->bgColor;
+            // Clear current line up to cursor
+            for (uint32_t y = pixY; y < pixY + lineH && y < t->vfbH; y++)
+                for (uint32_t x = 0; x <= pixX && x < t->vfbW; x++)
+                    t->vfb[y * t->vfbW + x] = t->bgColor;
+            t->dirty = true;
+        }
+        else if (mode == 2 || mode == 3)
         {
             // Clear entire screen
             for (uint32_t i = 0; i < t->vfbW * t->vfbH; i++)
@@ -269,6 +301,98 @@ static void TermHandleCSI(Terminal* t, const char* params, int paramLen, char fi
         else t->curX = 0;
         break;
     }
+    case 'G': // Cursor horizontal absolute
+    {
+        int col = (argCount >= 1 && args[0] > 0) ? args[0] - 1 : 0;
+        t->curX = static_cast<uint32_t>(col);
+        if (t->curX >= t->cols) t->curX = t->cols - 1;
+        break;
+    }
+    case 'd': // Cursor vertical absolute
+    {
+        int row = (argCount >= 1 && args[0] > 0) ? args[0] - 1 : 0;
+        t->curY = static_cast<uint32_t>(row);
+        if (t->curY >= t->rows) t->curY = t->rows - 1;
+        break;
+    }
+    case 'L': // Insert lines
+    {
+        int n = (argCount >= 1 && args[0] > 0) ? args[0] : 1;
+        uint32_t lineH = static_cast<uint32_t>(g_fontAtlas.lineHeight);
+        uint32_t pixY = t->curY * lineH;
+        uint32_t shiftPx = static_cast<uint32_t>(n) * lineH;
+        // Shift lines down
+        if (pixY + shiftPx < t->vfbH)
+        {
+            for (int y = static_cast<int>(t->vfbH) - 1; y >= static_cast<int>(pixY + shiftPx); y--)
+                for (uint32_t x = 0; x < t->vfbW; x++)
+                    t->vfb[y * t->vfbW + x] = t->vfb[(y - shiftPx) * t->vfbW + x];
+        }
+        // Clear inserted lines
+        uint32_t clearEnd = pixY + shiftPx;
+        if (clearEnd > t->vfbH) clearEnd = t->vfbH;
+        for (uint32_t y = pixY; y < clearEnd; y++)
+            for (uint32_t x = 0; x < t->vfbW; x++)
+                t->vfb[y * t->vfbW + x] = t->bgColor;
+        t->dirty = true;
+        break;
+    }
+    case 'M': // Delete lines
+    {
+        int n = (argCount >= 1 && args[0] > 0) ? args[0] : 1;
+        uint32_t lineH = static_cast<uint32_t>(g_fontAtlas.lineHeight);
+        uint32_t pixY = t->curY * lineH;
+        uint32_t shiftPx = static_cast<uint32_t>(n) * lineH;
+        // Shift lines up
+        for (uint32_t y = pixY; y + shiftPx < t->vfbH; y++)
+            for (uint32_t x = 0; x < t->vfbW; x++)
+                t->vfb[y * t->vfbW + x] = t->vfb[(y + shiftPx) * t->vfbW + x];
+        // Clear vacated lines at bottom
+        uint32_t clearStart = t->vfbH > shiftPx ? t->vfbH - shiftPx : 0;
+        for (uint32_t y = clearStart; y < t->vfbH; y++)
+            for (uint32_t x = 0; x < t->vfbW; x++)
+                t->vfb[y * t->vfbW + x] = t->bgColor;
+        t->dirty = true;
+        break;
+    }
+    case 'P': // Delete characters
+    {
+        int n = (argCount >= 1 && args[0] > 0) ? args[0] : 1;
+        uint32_t lineH = static_cast<uint32_t>(g_fontAtlas.lineHeight);
+        uint32_t glyphW = static_cast<uint32_t>(g_fontAtlas.glyphs[0].advance);
+        uint32_t pixY = t->curY * lineH;
+        uint32_t pixX = t->curX * glyphW;
+        uint32_t shiftPx = static_cast<uint32_t>(n) * glyphW;
+        for (uint32_t y = pixY; y < pixY + lineH && y < t->vfbH; y++)
+        {
+            for (uint32_t x = pixX; x + shiftPx < t->vfbW; x++)
+                t->vfb[y * t->vfbW + x] = t->vfb[y * t->vfbW + x + shiftPx];
+            for (uint32_t x = (t->vfbW > shiftPx ? t->vfbW - shiftPx : 0); x < t->vfbW; x++)
+                t->vfb[y * t->vfbW + x] = t->bgColor;
+        }
+        t->dirty = true;
+        break;
+    }
+    case '@': // Insert characters
+    {
+        int n = (argCount >= 1 && args[0] > 0) ? args[0] : 1;
+        uint32_t lineH = static_cast<uint32_t>(g_fontAtlas.lineHeight);
+        uint32_t glyphW = static_cast<uint32_t>(g_fontAtlas.glyphs[0].advance);
+        uint32_t pixY = t->curY * lineH;
+        uint32_t pixX = t->curX * glyphW;
+        uint32_t shiftPx = static_cast<uint32_t>(n) * glyphW;
+        for (uint32_t y = pixY; y < pixY + lineH && y < t->vfbH; y++)
+        {
+            for (int x = static_cast<int>(t->vfbW) - 1; x >= static_cast<int>(pixX + shiftPx); x--)
+                t->vfb[y * t->vfbW + x] = t->vfb[y * t->vfbW + x - shiftPx];
+            for (uint32_t x = pixX; x < pixX + shiftPx && x < t->vfbW; x++)
+                t->vfb[y * t->vfbW + x] = t->bgColor;
+        }
+        t->dirty = true;
+        break;
+    }
+    case 'r': // Set scrolling region (DECSTBM) — accept but don't implement scroll region
+        break;
     case 'm': // SGR — Select Graphic Rendition
     {
         if (argCount == 0) { t->fgColor = 0x00CCCCCC; t->bgColor = 0x00001A2A; break; }
@@ -304,6 +428,66 @@ static void TermHandleCSI(Terminal* t, const char* params, int paramLen, char fi
                 };
                 t->fgColor = bright[code - 90];
             }
+        }
+        break;
+    }
+    case 'h': // Set mode (DEC private if params start with '?')
+    case 'l': // Reset mode
+    {
+        bool isSet = (finalChar == 'h');
+        bool isPrivate = (paramLen > 0 && params[0] == '?');
+        // Re-parse skipping leading '?'
+        int pStart = isPrivate ? 1 : 0;
+        int mode = 0;
+        for (int i = pStart; i < paramLen; i++)
+        {
+            if (params[i] >= '0' && params[i] <= '9')
+                mode = mode * 10 + (params[i] - '0');
+        }
+        if (isPrivate)
+        {
+            if (mode == 1049)
+            {
+                // Alternate screen buffer
+                if (isSet && !t->inAltScreen)
+                {
+                    // Save main screen and cursor, allocate alt buffer
+                    uint32_t sz = t->vfbW * t->vfbH;
+                    t->altVfb = static_cast<uint32_t*>(kmalloc(sz * 4));
+                    if (t->altVfb)
+                    {
+                        for (uint32_t i = 0; i < sz; i++)
+                            t->altVfb[i] = t->vfb[i];
+                        t->savedCurX = t->curX;
+                        t->savedCurY = t->curY;
+                        // Clear screen for alt buffer
+                        for (uint32_t i = 0; i < sz; i++)
+                            t->vfb[i] = t->bgColor;
+                        t->curX = 0;
+                        t->curY = 0;
+                        t->inAltScreen = true;
+                        t->dirty = true;
+                    }
+                }
+                else if (!isSet && t->inAltScreen)
+                {
+                    // Restore main screen
+                    if (t->altVfb)
+                    {
+                        uint32_t sz = t->vfbW * t->vfbH;
+                        for (uint32_t i = 0; i < sz; i++)
+                            t->vfb[i] = t->altVfb[i];
+                        kfree(t->altVfb);
+                        t->altVfb = nullptr;
+                    }
+                    t->curX = t->savedCurX;
+                    t->curY = t->savedCurY;
+                    t->inAltScreen = false;
+                    t->dirty = true;
+                }
+            }
+            // mode 25: cursor visibility — silently accept
+            // mode 7: auto-wrap — silently accept
         }
         break;
     }
