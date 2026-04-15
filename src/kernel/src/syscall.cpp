@@ -660,7 +660,8 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         {
             uint32_t got = pipe->read(dst, static_cast<uint32_t>(
                 count > 4096 ? 4096 : count));
-            if (got > 0) return static_cast<int64_t>(got);
+            if (got > 0)
+                return static_cast<int64_t>(got);
 
             uint32_t wr = __atomic_load_n(&pipe->writers, __ATOMIC_ACQUIRE);
             if (wr == 0) return 0;
@@ -887,10 +888,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     }
 
     if (!vn)
-    {
-        DbgPrintf("sys_open: not found: '%s' (flags=0x%x)\n", lookupPath, vfsFlags);
         return -ENOENT;
-    }
 
     int fd = FdAlloc(proc, FdType::Vnode, vn);
     if (fd < 0)
@@ -4133,37 +4131,302 @@ static int64_t sys_fstatfs(uint64_t, uint64_t bufAddr, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
-// sys_select (23) — minimal implementation
+// sys_select (23) — proper implementation checking pipe/device readiness
 // ---------------------------------------------------------------------------
 
 static int64_t sys_select(uint64_t nfds, uint64_t readfdsAddr, uint64_t writefdsAddr,
                            uint64_t exceptfdsAddr, uint64_t timeoutAddr, uint64_t)
 {
-    (void)exceptfdsAddr;
-    (void)timeoutAddr;
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
 
-    // For simplicity, report all FDs as ready
-    // This is sufficient for many programs that just use select as a timeout
+    auto* rfds = readfdsAddr ? reinterpret_cast<uint64_t*>(readfdsAddr) : nullptr;
+    auto* wfds = writefdsAddr ? reinterpret_cast<uint64_t*>(writefdsAddr) : nullptr;
+
+    // Parse timeout: NULL = block forever, {0,0} = poll, else timeout
+    int64_t timeout_ms = -1; // -1 = infinite
+    if (timeoutAddr)
+    {
+        // pselect6 uses struct timespec {tv_sec, tv_nsec}
+        // select uses struct timeval {tv_sec, tv_usec}
+        // Both start with tv_sec at offset 0
+        auto* ts = reinterpret_cast<const int64_t*>(timeoutAddr);
+        int64_t sec  = ts[0];
+        int64_t nsec = ts[1]; // could be nsec (pselect) or usec (select)
+        // Heuristic: if nsec > 1000000, treat as nanoseconds
+        if (nsec > 1000000)
+            timeout_ms = sec * 1000 + nsec / 1000000;
+        else
+            timeout_ms = sec * 1000 + nsec / 1000;
+        if (timeout_ms == 0) timeout_ms = 0; // poll mode
+    }
+
+    // Clear except fds
+    if (exceptfdsAddr)
+    {
+        auto* efds = reinterpret_cast<uint64_t*>(exceptfdsAddr);
+        for (uint64_t w = 0; w < (nfds + 63) / 64; w++)
+            efds[w] = 0;
+    }
+
+    // Build result fd_sets — only mark fds that are actually ready
+    uint64_t rResult[2] = {0, 0}; // supports up to 128 fds
+    uint64_t wResult[2] = {0, 0};
     int ready = 0;
-    if (readfdsAddr)
+
+    for (uint64_t fd = 0; fd < nfds && fd < 128; fd++)
     {
-        auto* rfds = reinterpret_cast<uint64_t*>(readfdsAddr);
-        for (uint64_t fd = 0; fd < nfds && fd < 64; fd++)
+        uint64_t mask = 1ULL << (fd % 64);
+        uint64_t word = fd / 64;
+
+        bool wantRead  = rfds && (rfds[word] & mask);
+        bool wantWrite = wfds && (wfds[word] & mask);
+        if (!wantRead && !wantWrite) continue;
+
+        FdEntry* fde = FdGet(proc, static_cast<int>(fd));
+        if (!fde)
         {
-            if (rfds[fd / 64] & (1ULL << (fd % 64)))
+            // Bad fd in set — EBADF per POSIX
+            continue;
+        }
+
+        // Pipe fd
+        if (fde->type == FdType::Pipe && fde->handle)
+        {
+            auto* pb = static_cast<PipeBuffer*>(fde->handle);
+            bool isWrite = (fde->flags & 1);
+            if (wantRead && !isWrite)
+            {
+                if (pb->count() > 0 || pb->writers == 0)
+                {
+                    rResult[word] |= mask;
+                    ready++;
+                }
+            }
+            if (wantWrite && isWrite)
+            {
+                if (pb->count() < PIPE_BUF_SIZE || pb->readers == 0)
+                {
+                    wResult[word] |= mask;
+                    ready++;
+                }
+            }
+            continue;
+        }
+
+        // DevTty fd (e.g. /dev/tty → fd 63)
+        if (fde->type == FdType::DevTty && fde->handle)
+        {
+            auto* pair = static_cast<TtyDevicePair*>(fde->handle);
+            if (wantRead)
+            {
+                auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
+                if (rp->count() > 0 || rp->writers == 0)
+                {
+                    rResult[word] |= mask;
+                    ready++;
+                }
+            }
+            if (wantWrite)
+            {
+                wResult[word] |= mask;
                 ready++;
+            }
+            continue;
+        }
+
+        // Keyboard device
+        if (fde->type == FdType::DevKeyboard)
+        {
+            if (wantRead && InputHasEvents())
+            {
+                rResult[word] |= mask;
+                ready++;
+            }
+            if (wantWrite)
+            {
+                wResult[word] |= mask;
+                ready++;
+            }
+            continue;
+        }
+
+        // Regular files, sockets — always ready
+        if (wantRead)  { rResult[word] |= mask; ready++; }
+        if (wantWrite) { wResult[word] |= mask; ready++; }
+    }
+
+    // If something is ready, return immediately
+    if (ready > 0)
+    {
+        if (rfds) { rfds[0] = rResult[0]; rfds[1] = rResult[1]; }
+        if (wfds) { wfds[0] = wResult[0]; wfds[1] = wResult[1]; }
+        return ready;
+    }
+
+    // Nothing ready — if timeout is 0, return 0 (poll mode)
+    if (timeout_ms == 0)
+    {
+        if (rfds) { rfds[0] = 0; rfds[1] = 0; }
+        if (wfds) { wfds[0] = 0; wfds[1] = 0; }
+        return 0;
+    }
+
+    // Block until data arrives or timeout
+    // Register as waiter on all monitored pipe fds
+    Process* self = ProcessCurrent();
+    for (uint64_t fd = 0; fd < nfds && fd < 128; fd++)
+    {
+        uint64_t mask = 1ULL << (fd % 64);
+        uint64_t word = fd / 64;
+        bool wantRead = rfds && (rfds[word] & mask);
+        if (!wantRead) continue;
+
+        FdEntry* fde = FdGet(proc, static_cast<int>(fd));
+        if (!fde) continue;
+
+        if (fde->type == FdType::Pipe && fde->handle && !(fde->flags & 1))
+        {
+            auto* pb = static_cast<PipeBuffer*>(fde->handle);
+            pb->readerWaiter = self;
+        }
+        if (fde->type == FdType::DevKeyboard)
+            InputAddWaiter(self);
+        if (fde->type == FdType::DevTty && fde->handle)
+        {
+            auto* pair = static_cast<TtyDevicePair*>(fde->handle);
+            auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
+            rp->readerWaiter = self;
         }
     }
-    if (writefdsAddr)
+
+    // Re-check after registration (close race window)
+    ready = 0;
+    rResult[0] = rResult[1] = 0;
+    wResult[0] = wResult[1] = 0;
+    for (uint64_t fd = 0; fd < nfds && fd < 128; fd++)
     {
-        auto* wfds = reinterpret_cast<uint64_t*>(writefdsAddr);
-        for (uint64_t fd = 0; fd < nfds && fd < 64; fd++)
+        uint64_t mask = 1ULL << (fd % 64);
+        uint64_t word = fd / 64;
+        bool wantRead  = rfds && (rfds[word] & mask);
+        bool wantWrite = wfds && (wfds[word] & mask);
+        if (!wantRead && !wantWrite) continue;
+
+        FdEntry* fde = FdGet(proc, static_cast<int>(fd));
+        if (!fde) continue;
+
+        if (fde->type == FdType::Pipe && fde->handle)
         {
-            if (wfds[fd / 64] & (1ULL << (fd % 64)))
+            auto* pb = static_cast<PipeBuffer*>(fde->handle);
+            bool isWrite = (fde->flags & 1);
+            if (wantRead && !isWrite && (pb->count() > 0 || pb->writers == 0))
+            {
+                rResult[word] |= mask;
                 ready++;
+            }
+            if (wantWrite && isWrite && (pb->count() < PIPE_BUF_SIZE || pb->readers == 0))
+            {
+                wResult[word] |= mask;
+                ready++;
+            }
+        }
+        else if (fde->type == FdType::DevTty && fde->handle)
+        {
+            auto* pair = static_cast<TtyDevicePair*>(fde->handle);
+            if (wantRead)
+            {
+                auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
+                if (rp->count() > 0 || rp->writers == 0)
+                {
+                    rResult[word] |= mask;
+                    ready++;
+                }
+            }
+        }
+        else if (fde->type == FdType::DevKeyboard && wantRead && InputHasEvents())
+        {
+            rResult[word] |= mask;
+            ready++;
         }
     }
-    return ready ? ready : 1; // at least 1 to avoid blocking
+
+    if (ready > 0)
+    {
+        if (rfds) { rfds[0] = rResult[0]; rfds[1] = rResult[1]; }
+        if (wfds) { wfds[0] = wResult[0]; wfds[1] = wResult[1]; }
+        return ready;
+    }
+
+    // Block
+    SchedulerBlock(self);
+
+    // After wakeup, do one final scan
+    ready = 0;
+    rResult[0] = rResult[1] = 0;
+    wResult[0] = wResult[1] = 0;
+    for (uint64_t fd = 0; fd < nfds && fd < 128; fd++)
+    {
+        uint64_t mask = 1ULL << (fd % 64);
+        uint64_t word = fd / 64;
+        bool wantRead  = rfds && (rfds[word] & mask);
+        bool wantWrite = wfds && (wfds[word] & mask);
+        if (!wantRead && !wantWrite) continue;
+
+        FdEntry* fde = FdGet(proc, static_cast<int>(fd));
+        if (!fde) continue;
+
+        if (fde->type == FdType::Pipe && fde->handle)
+        {
+            auto* pb = static_cast<PipeBuffer*>(fde->handle);
+            bool isWrite = (fde->flags & 1);
+            if (wantRead && !isWrite && (pb->count() > 0 || pb->writers == 0))
+            {
+                rResult[word] |= mask;
+                ready++;
+            }
+            if (wantWrite && isWrite && (pb->count() < PIPE_BUF_SIZE || pb->readers == 0))
+            {
+                wResult[word] |= mask;
+                ready++;
+            }
+        }
+        else if (fde->type == FdType::DevTty && fde->handle)
+        {
+            auto* pair = static_cast<TtyDevicePair*>(fde->handle);
+            if (wantRead)
+            {
+                auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
+                if (rp->count() > 0 || rp->writers == 0)
+                {
+                    rResult[word] |= mask;
+                    ready++;
+                }
+            }
+            if (wantWrite)
+            {
+                wResult[word] |= mask;
+                ready++;
+            }
+        }
+        else if (fde->type == FdType::DevKeyboard)
+        {
+            if (wantRead && InputHasEvents())
+            {
+                rResult[word] |= mask;
+                ready++;
+            }
+        }
+        else
+        {
+            // Vnode, socket etc — ready
+            if (wantRead)  { rResult[word] |= mask; ready++; }
+            if (wantWrite) { wResult[word] |= mask; ready++; }
+        }
+    }
+
+    if (rfds) { rfds[0] = rResult[0]; rfds[1] = rResult[1]; }
+    if (wfds) { wfds[0] = wResult[0]; wfds[1] = wResult[1]; }
+    return ready;
 }
 
 // ---------------------------------------------------------------------------

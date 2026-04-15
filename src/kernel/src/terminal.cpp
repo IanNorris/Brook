@@ -540,11 +540,15 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
         "HOME=/",
         "PATH=/boot/BIN",
         "TERM=linux",
+        "TERMINFO=/boot/TERMINFO",
+        "TERMINFO_DIRS=/boot/TERMINFO",
         "PS1=$ ",
+        "COLUMNS=80",
+        "LINES=25",
         nullptr
     };
 
-    Process* child = ProcessCreate(elfData, st.size, 1, bashArgv, 4, bashEnvp, stdFds);
+    Process* child = ProcessCreate(elfData, st.size, 1, bashArgv, 8, bashEnvp, stdFds);
     kfree(elfData);
 
     if (!child)

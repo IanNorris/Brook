@@ -570,6 +570,8 @@ static void CompositorLoopWM()
     {
         if (ev.type != InputEventType::KeyPress) continue;
 
+        DbgPrintf("KEY: scan=0x%02x ascii=0x%02x\n", ev.scanCode, ev.ascii);
+
         // Find the focused window
         Window* focused = nullptr;
         for (uint32_t i = 0; i < WM_MAX_WINDOWS; i++)
@@ -624,7 +626,8 @@ static void CompositorLoopWM()
         for (uint32_t ti = 0; ti < MAX_TERMINALS; ti++)
         {
             Terminal* t = TerminalGet(static_cast<int>(ti));
-            if (t && t->child == focused->proc)
+            if (!t) continue;
+            if (t->child == focused->proc)
             {
                 if (ev.ascii != 0)
                 {
