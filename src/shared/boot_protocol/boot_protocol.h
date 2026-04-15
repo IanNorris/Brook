@@ -6,7 +6,7 @@ namespace brook
 {
 
 constexpr uint32_t BootProtocolMagic   = 0xB007B007u;
-constexpr uint32_t BootProtocolVersion = 1u;
+constexpr uint32_t BootProtocolVersion = 2u;
 
 // Our own memory type enum - does NOT use UEFI types (kernel has no UEFI dependency)
 enum class MemoryType : uint32_t
@@ -22,6 +22,7 @@ enum class MemoryType : uint32_t
     BootData,         // Boot protocol struct + memory map (free after consuming)
     Framebuffer,      // Linear framebuffer
     BootloaderCode,   // Bootloader code (can be freed after jumping to kernel)
+    Initrd,           // Initial ramdisk loaded by bootloader (freeable after use)
 };
 
 struct MemoryDescriptor
@@ -76,6 +77,9 @@ struct BootProtocol
 
     uint64_t kernelPhysBase;    // Physical address of the loaded kernel image
     uint64_t kernelPhysPages;   // Size of kernel image in 4KB pages (includes BSS)
+
+    uint64_t initrdPhysBase;    // Physical address of initrd image (0 if none)
+    uint64_t initrdSize;        // Size of initrd image in bytes (0 if none)
 };
 
 } // namespace brook

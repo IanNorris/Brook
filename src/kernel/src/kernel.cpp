@@ -232,52 +232,75 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::NetInit();
     brook::VfsMount("/proc", "procfs", 0);
 
-    // Mount the embedded FAT16 test image as a ramdisk.
-    // The image lives in .rodata (read-only pages), so we must copy it to
-    // writable memory before mounting.  This lets FatFS writes (e.g. DOOM
-    // saving config) succeed without page faults.
-    uint64_t rdPages = (g_fatTestImageSize + 4095) / 4096;
-    brook::VirtualAddress rdBuf = brook::VmmAllocPages(rdPages,
-        brook::VMM_WRITABLE, brook::MemTag::KernelData, brook::KernelPid);
-    if (rdBuf)
+    // Mount initrd from bootloader (or fall back to embedded image).
+    if (bootProtocol->initrdPhysBase && bootProtocol->initrdSize > 0)
     {
-        auto* dst = reinterpret_cast<uint8_t*>(rdBuf.raw());
-        for (uint32_t i = 0; i < g_fatTestImageSize; ++i)
-            dst[i] = g_fatTestImage[i];
+        brook::KPrintf("initrd: %lu bytes at phys 0x%lx\n",
+                       (unsigned long)bootProtocol->initrdSize,
+                       (unsigned long)bootProtocol->initrdPhysBase);
 
-        brook::Device* rd = brook::RamdiskCreate(dst, g_fatTestImageSize, 512, "ramdisk0");
-        if (rd && brook::DeviceRegister(rd))
+        // Map initrd physical pages into kernel virtual address space (writable).
+        uint64_t rdPages = (bootProtocol->initrdSize + 4095) / 4096;
+        brook::VirtualAddress rdBuf = brook::VmmAllocPages(rdPages,
+            brook::VMM_WRITABLE, brook::MemTag::KernelData, brook::KernelPid);
+        if (rdBuf)
         {
-            brook::FatFsBindDrive(0, rd);
-            if (brook::VfsMount("/", "fatfs", 0))
+            // Copy from physical (identity-mapped in direct map) to writable VMM pages.
+            auto* src = reinterpret_cast<const uint8_t*>(
+                brook::PhysToVirt(brook::PhysicalAddress(bootProtocol->initrdPhysBase)).raw());
+            auto* dst = reinterpret_cast<uint8_t*>(rdBuf.raw());
+            for (uint64_t i = 0; i < bootProtocol->initrdSize; ++i)
+                dst[i] = src[i];
+
+            brook::Device* rd = brook::RamdiskCreate(dst,
+                bootProtocol->initrdSize, 512, "ramdisk0");
+            if (rd && brook::DeviceRegister(rd))
             {
-                // Smoke-test: open and read BROOK.CFG
-                brook::Vnode* cfg = brook::VfsOpen("/BROOK.CFG");
-                if (cfg)
-                {
-                    char buf[128] = {};
-                    uint64_t off = 0;
-                    int n = brook::VfsRead(cfg, buf, sizeof(buf) - 1, &off);
-                    brook::VfsClose(cfg);
-                    if (n > 0)
-                        brook::KPrintf("VFS: /BROOK.CFG (%d bytes): %s", n, buf);
-                    else
-                        brook::KPuts("VFS: /BROOK.CFG open OK but read returned 0\n");
-                }
+                brook::FatFsBindDrive(0, rd);
+                if (brook::VfsMount("/", "fatfs", 0))
+                    brook::KPuts("initrd: mounted at /\n");
                 else
-                {
-                    brook::KPuts("VFS: could not open /BROOK.CFG\n");
-                }
+                    brook::KPuts("initrd: mount failed\n");
+            }
+            else
+            {
+                brook::KPuts("initrd: ramdisk device init failed\n");
             }
         }
         else
         {
-            brook::KPuts("VFS: ramdisk init failed\n");
+            brook::KPuts("initrd: VMM allocation failed\n");
         }
     }
     else
     {
-        brook::KPuts("VFS: ramdisk buffer allocation failed\n");
+        // Fallback: mount the embedded FAT16 test image as a ramdisk.
+        brook::KPuts("initrd: not present, using embedded FAT image\n");
+        uint64_t rdPages = (g_fatTestImageSize + 4095) / 4096;
+        brook::VirtualAddress rdBuf = brook::VmmAllocPages(rdPages,
+            brook::VMM_WRITABLE, brook::MemTag::KernelData, brook::KernelPid);
+        if (rdBuf)
+        {
+            auto* dst = reinterpret_cast<uint8_t*>(rdBuf.raw());
+            for (uint32_t i = 0; i < g_fatTestImageSize; ++i)
+                dst[i] = g_fatTestImage[i];
+
+            brook::Device* rd = brook::RamdiskCreate(dst, g_fatTestImageSize, 512, "ramdisk0");
+            if (rd && brook::DeviceRegister(rd))
+            {
+                brook::FatFsBindDrive(0, rd);
+                if (!brook::VfsMount("/", "fatfs", 0))
+                    brook::KPuts("VFS: embedded ramdisk mount failed\n");
+            }
+            else
+            {
+                brook::KPuts("VFS: ramdisk init failed\n");
+            }
+        }
+        else
+        {
+            brook::KPuts("VFS: ramdisk buffer allocation failed\n");
+        }
     }
 
     // ---- QEMU fw_cfg ----

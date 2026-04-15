@@ -62,6 +62,9 @@ else
     cp "${KERNEL_ELF}" "${KERNEL_ESP_DIR}/BROOK.ELF"
 fi
 
+# Build initrd image (contains BROOK.CFG + early driver modules)
+"${SCRIPT_DIR}/make_initrd.sh" "--${BUILD_TYPE}"
+
 # Write default BROOK.CFG if not already present
 BROOK_CFG="${BUILD_DIR}/esp/BROOK.CFG"
 if [ ! -f "${BROOK_CFG}" ]; then

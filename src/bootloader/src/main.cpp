@@ -55,6 +55,19 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     FreePages(systemTable->BootServices,
         reinterpret_cast<EFI_PHYSICAL_ADDRESS>(kernelData), kernelFileSize);
 
+    // --- Load initrd (optional) ---
+    UINTN initrdFileSize = 0;
+    uint8_t* initrdData = ReadFile(imageHandle, systemTable->BootServices,
+        u"INITRD.IMG", &initrdFileSize);
+    if (initrdData != nullptr)
+    {
+        ConsolePrintLine(u"Initrd loaded");
+    }
+    else
+    {
+        ConsolePrintLine(u"No initrd found (optional)");
+    }
+
     // --- Allocate page table memory (must be before ExitBootServices) ---
     // Pass kernelPhysPages so AllocatePageTables can size the kernel PT pool.
     // It also scans the UEFI memory map internally to size the identity map.
@@ -99,6 +112,9 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     bootProtocol.memoryMapCount = memoryMapCount;
     bootProtocol.kernelPhysBase  = kernelPhysBase;
     bootProtocol.kernelPhysPages = kernelPhysPages;
+    bootProtocol.initrdPhysBase  = initrdData
+        ? reinterpret_cast<uint64_t>(initrdData) : 0;
+    bootProtocol.initrdSize      = initrdData ? initrdFileSize : 0;
 
     // --- Jump to kernel at virtual address ---
     // Use inline asm to ensure SysV calling convention:
