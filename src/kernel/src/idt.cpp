@@ -508,6 +508,32 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                 }
             }
         }
+
+        // Safety net: present + write + user page without COW bit.
+        // If the PTE belongs to this process, it likely lost its W bit
+        // due to a memory visibility race — just set it writable.
+        if (pfPresent && pfWrite && isUserAddr && cowProc)
+        {
+            using namespace brook;
+            uint64_t* pte = VmmGetPte(cowProc->pageTable,
+                                       VirtualAddress(cr2cow & ~0xFFFULL));
+            if (pte && (*pte & VMM_PRESENT) && !(*pte & PTE_COW_BIT)
+                && (*pte & VMM_USER))
+            {
+                uint16_t ptePid = static_cast<uint16_t>(
+                    (*pte >> PTE_PID_SHIFT) & 0x3FF);
+                if (ptePid == cowProc->pid)
+                {
+                    SerialPrintf("PF: recovering stale RO page at 0x%lx "
+                                 "(pid %u, PTE=0x%lx)\n",
+                                 cr2cow, cowProc->pid, *pte);
+                    *pte |= VMM_WRITABLE;
+                    __asm__ volatile("invlpg (%0)" :: "r"(cr2cow & ~0xFFFULL) : "memory");
+                    __asm__ volatile("sti");
+                    return;
+                }
+            }
+        }
     }
 
     // For kernel-mode faults, delegate to the original handler for diagnostics + halt.

@@ -233,6 +233,9 @@ bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
     DbgPrintf("ELF: loaded OK, entry=0x%lx, break=0x%lx-0x%lx\n",
                  out->entryPoint, out->programBreakLow, out->programBreakHigh);
 
+    // Memory fence: ensure all PTE writes are globally visible.
+    __asm__ volatile("mfence" ::: "memory");
+
     return true;
 }
 
@@ -321,6 +324,11 @@ uint64_t ElfLoadAt(const uint8_t* data, uint64_t size,
 
     uint64_t entry = ehdr->e_entry + slide;
     SerialPrintf("ELF interp: loaded at base=0x%lx entry=0x%lx\n", base, entry);
+
+    // Memory fence: ensure all PTE writes are visible to other CPUs before
+    // the scheduler moves this process to an AP core.
+    __asm__ volatile("mfence" ::: "memory");
+
     return entry;
 }
 
