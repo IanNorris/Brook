@@ -73,6 +73,7 @@ static const char* g_defaultEnvp[] = {
     "LOGNAME=root",
     "SSL_CERT_FILE=/nix/store/mg063aj0crwhchqayf2qbyf28k6mlrxm-nss-cacert-3.121/etc/ssl/certs/ca-bundle.crt",
     "CURL_CA_BUNDLE=/nix/store/mg063aj0crwhchqayf2qbyf28k6mlrxm-nss-cacert-3.121/etc/ssl/certs/ca-bundle.crt",
+    "NETSURFRES=/nix/apps/netsurf/res/",
     nullptr
 };
 
@@ -159,7 +160,7 @@ static uint8_t* LoadElf(const char* path, uint64_t* outSize)
     Vnode* vn = VfsOpen(path, 0);
     if (!vn) return nullptr;
 
-    constexpr uint64_t MAX_ELF_SIZE = 2 * 1024 * 1024;
+    constexpr uint64_t MAX_ELF_SIZE = 8 * 1024 * 1024;
     constexpr uint64_t ELF_BUF_PAGES = MAX_ELF_SIZE / 4096;
 
     VirtualAddress bufAddr = VmmAllocPages(ELF_BUF_PAGES,
@@ -187,7 +188,7 @@ static uint8_t* LoadElf(const char* path, uint64_t* outSize)
 
 static void FreeElfBuffer(uint8_t* buf)
 {
-    constexpr uint64_t MAX_ELF_SIZE = 2 * 1024 * 1024;
+    constexpr uint64_t MAX_ELF_SIZE = 8 * 1024 * 1024;
     constexpr uint64_t ELF_BUF_PAGES = MAX_ELF_SIZE / 4096;
     VmmFreePages(VirtualAddress(reinterpret_cast<uint64_t>(buf)), ELF_BUF_PAGES);
 }

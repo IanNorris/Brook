@@ -1,0 +1,2 @@
+set vfb 800x600
+run /nix/apps/netsurf/bin/netsurf -f brook -w 800 -h 600
