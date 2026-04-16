@@ -178,6 +178,7 @@ static constexpr uint32_t WM_LAUNCHER_MAX_ITEMS = 16;
 struct LauncherItem {
     char title[48];
     char scriptPath[128];  // e.g. "/boot/SHORTCUTS/QUAKE.RC"
+    uint32_t iconColor;    // Icon background color (0 = auto from title)
     bool valid;
 };
 

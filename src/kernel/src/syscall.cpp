@@ -499,11 +499,14 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         // Shells like ash use this for line editing.
         if (!proc->ttyCanonical)
         {
+            bool wmMode = WmIsActive();
             uint64_t bytesRead = 0;
             while (bytesRead < count)
             {
                 InputEvent ev;
-                if (!InputPollEvent(&ev))
+                bool got = wmMode ? ProcessInputPop(proc, &ev)
+                                  : InputPollEvent(&ev);
+                if (!got)
                 {
                     if (bytesRead > 0) break; // return what we have
                     // Register as waiter BEFORE re-checking, to close the
@@ -511,7 +514,9 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                     InputAddWaiter(proc);
                     // Re-check after registration — if data arrived between
                     // the first poll and AddWaiter, consume it immediately.
-                    if (InputPollEvent(&ev))
+                    got = wmMode ? ProcessInputPop(proc, &ev)
+                                : InputPollEvent(&ev);
+                    if (got)
                     {
                         InputRemoveWaiter(proc);
                         goto got_event_nc;

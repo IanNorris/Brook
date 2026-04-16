@@ -814,14 +814,69 @@ void WmSpawnTerminal()
 // ---------------------------------------------------------------------------
 
 // Launcher visual constants
-static constexpr uint32_t LAUNCHER_ITEM_HEIGHT = 32;
-static constexpr uint32_t LAUNCHER_ITEM_WIDTH  = 200;
-static constexpr uint32_t LAUNCHER_PADDING     = 6;
-static constexpr uint32_t LAUNCHER_BG          = 0x00252535;
-static constexpr uint32_t LAUNCHER_ITEM_BG     = 0x00303045;
-static constexpr uint32_t LAUNCHER_ITEM_FG     = 0x00E0E0E0;
-static constexpr uint32_t LAUNCHER_BORDER_CLR  = 0x00505060;
-static constexpr uint32_t LAUNCHER_HEADER_FG   = 0x0090D0FF;
+static constexpr uint32_t LAUNCHER_ICON_SIZE    = 20;
+static constexpr uint32_t LAUNCHER_ICON_MARGIN  = 8;
+static constexpr uint32_t LAUNCHER_ITEM_HEIGHT  = 32;
+static constexpr uint32_t LAUNCHER_ITEM_WIDTH   = 230;
+static constexpr uint32_t LAUNCHER_PADDING      = 6;
+static constexpr uint32_t LAUNCHER_BG           = 0x00252535;
+static constexpr uint32_t LAUNCHER_ITEM_BG      = 0x00303045;
+static constexpr uint32_t LAUNCHER_ITEM_FG      = 0x00E0E0E0;
+static constexpr uint32_t LAUNCHER_BORDER_CLR   = 0x00505060;
+static constexpr uint32_t LAUNCHER_HEADER_FG    = 0x0090D0FF;
+
+// Assign an icon color based on the shortcut title
+static uint32_t LauncherIconColor(const char* title)
+{
+    // Known apps get distinctive colors
+    for (const char* p = title; *p; ++p)
+    {
+        char c = (*p >= 'a' && *p <= 'z') ? (*p - 32) : *p;
+        if (c == 'D') return 0x00B03030; // DOOM — dark red
+        if (c == 'Q') return 0x00806020; // Quake — brown
+        if (c == 'N') return 0x002060A0; // NetSurf — blue
+        if (c == 'T') return 0x00307030; // Terminal — green
+        if (c >= 'A') break; // use first alpha char
+    }
+    // Fallback: hash title to a muted color
+    uint32_t h = 0x811c9dc5;
+    for (const char* p = title; *p; ++p)
+        h = (h ^ static_cast<uint8_t>(*p)) * 0x01000193;
+    return 0x00404040 | ((h & 0x7F) << 16) | (((h >> 8) & 0x7F) << 8) | ((h >> 16) & 0x7F);
+}
+
+// Draw a small colored icon with first letter
+static void LauncherDrawIcon(uint32_t* backBuffer, uint32_t stride,
+                             uint32_t screenW, uint32_t screenH,
+                             int32_t x, int32_t y, uint32_t color, char letter)
+{
+    // Filled rounded-ish rectangle (just a solid square with slightly inset corners)
+    for (uint32_t iy = 0; iy < LAUNCHER_ICON_SIZE; iy++)
+    {
+        for (uint32_t ix = 0; ix < LAUNCHER_ICON_SIZE; ix++)
+        {
+            // Skip corner pixels for rounded look
+            bool corner = (ix == 0 && iy == 0) || (ix == LAUNCHER_ICON_SIZE-1 && iy == 0) ||
+                          (ix == 0 && iy == LAUNCHER_ICON_SIZE-1) ||
+                          (ix == LAUNCHER_ICON_SIZE-1 && iy == LAUNCHER_ICON_SIZE-1);
+            if (corner) continue;
+
+            int32_t px = x + static_cast<int32_t>(ix);
+            int32_t py2 = y + static_cast<int32_t>(iy);
+            if (px >= 0 && px < static_cast<int32_t>(screenW) &&
+                py2 >= 0 && py2 < static_cast<int32_t>(screenH))
+                backBuffer[py2 * stride + px] = color;
+        }
+    }
+
+    // Render the letter centered in the icon
+    if (letter >= 'a' && letter <= 'z') letter -= 32; // uppercase
+    char str[2] = { letter, '\0' };
+    int32_t lx = x + static_cast<int32_t>(LAUNCHER_ICON_SIZE / 2) - 4;
+    int32_t ly = y + static_cast<int32_t>(LAUNCHER_ICON_SIZE / 2) -
+                 static_cast<int32_t>(g_fontAtlas.lineHeight / 2);
+    WmRenderString(backBuffer, stride, screenW, screenH, lx, ly, str, 0x00FFFFFF, color);
+}
 
 // Parse "# title: Something" from a script file's first few lines
 static bool ParseShortcutTitle(const char* path, char* titleOut, uint32_t titleMax)
@@ -907,6 +962,7 @@ void WmLauncherLoad()
         }
 
         item.valid = true;
+        item.iconColor = LauncherIconColor(item.title);
         SerialPrintf("WM: launcher[%u] = '%s' -> %s\n",
                      g_launcherCount, item.title, item.scriptPath);
         g_launcherCount++;
@@ -986,8 +1042,18 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
                    static_cast<int>(LAUNCHER_ITEM_HEIGHT),
                    LAUNCHER_ITEM_BG);
 
+        // Draw icon
+        int32_t iconX = itemX + 6;
+        int32_t iconY = itemY + static_cast<int32_t>((LAUNCHER_ITEM_HEIGHT - LAUNCHER_ICON_SIZE) / 2);
+        char firstLetter = g_launcherItems[i].title[0];
+        LauncherDrawIcon(backBuffer, stride, screenW, screenH,
+                         iconX, iconY, g_launcherItems[i].iconColor, firstLetter);
+
+        // Title text (offset to right of icon)
+        int32_t textX = iconX + static_cast<int32_t>(LAUNCHER_ICON_SIZE) +
+                        static_cast<int32_t>(LAUNCHER_ICON_MARGIN);
         WmRenderString(backBuffer, stride, screenW, screenH,
-                       itemX + 8, itemY + static_cast<int32_t>(textYOff),
+                       textX, itemY + static_cast<int32_t>(textYOff),
                        g_launcherItems[i].title,
                        LAUNCHER_ITEM_FG, LAUNCHER_ITEM_BG);
 
