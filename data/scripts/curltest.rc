@@ -1,0 +1,3 @@
+# Brook OS — curl HTTPS test
+# Fetches nix-cache-info from cache.nixos.org via HTTPS (IPv4, using IP directly)
+run --strace /nix/store/xkqd49dmldkqn4xk6dlm640f5blbv6hp-curl-8.18.0-bin/bin/curl -4 -v --resolve cache.nixos.org:443:151.101.61.91 https://cache.nixos.org/nix-cache-info

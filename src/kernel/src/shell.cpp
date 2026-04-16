@@ -63,11 +63,16 @@ static bool g_scriptMode = false;
 // Default environment for spawned processes
 static const char* g_defaultEnvp[] = {
     "HOME=/",
-    "PATH=/boot/BIN:/boot/bin:/usr/bin:/bin",
+    "PATH=/nix/store/xkqd49dmldkqn4xk6dlm640f5blbv6hp-curl-8.18.0-bin/bin:"
+          "/nix/store/g6mlwdvpg92rchq352ll7jbi0pz7h43r-xz-5.8.2-bin/bin:"
+          "/nix/store/v8sa6r6q037ihghxfbwzjj4p59v2x0pv-bash-5.3p9/bin:"
+          "/boot/BIN:/boot/bin:/usr/bin:/bin",
     "TERM=linux",
     "SHELL=/boot/BIN/BASH",
     "USER=root",
     "LOGNAME=root",
+    "SSL_CERT_FILE=/nix/store/mg063aj0crwhchqayf2qbyf28k6mlrxm-nss-cacert-3.121/etc/ssl/certs/ca-bundle.crt",
+    "CURL_CA_BUNDLE=/nix/store/mg063aj0crwhchqayf2qbyf28k6mlrxm-nss-cacert-3.121/etc/ssl/certs/ca-bundle.crt",
     nullptr
 };
 

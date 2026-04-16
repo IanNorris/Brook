@@ -278,6 +278,7 @@ int  SockRecvFrom(int sockIdx, void* buf, uint32_t len,
                   SockAddrIn* src);
 int  SockSend(int sockIdx, const void* buf, uint32_t len);
 int  SockRecv(int sockIdx, void* buf, uint32_t len);
+bool SockIsStream(int sockIdx);  // returns true for SOCK_STREAM (TCP)
 int  SockListen(int sockIdx, int backlog);
 int  SockAccept(int sockIdx, SockAddrIn* addr);
 bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite);

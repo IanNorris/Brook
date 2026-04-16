@@ -184,6 +184,7 @@ static constexpr int64_t EINTR   = 4;
 static constexpr int64_t ENOTDIR = 20;
 static constexpr int64_t EIO     = 5;
 static constexpr int64_t ENOTCONN = 107;
+static constexpr int64_t EAFNOSUPPORT = 97;
 
 // Check if the current process has deliverable signals pending.
 // Call after SchedulerBlock() returns to decide whether to return -EINTR.
@@ -263,7 +264,7 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
     }
 
     // /dev/null — discard all writes
-    if (fde->type == FdType::DevNull)
+    if (fde->type == FdType::DevNull || fde->type == FdType::DevUrandom)
         return static_cast<int64_t>(count);
 
     // Write to /dev/tty (DevKeyboard) — route to serial + TTY framebuffer
@@ -395,6 +396,29 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     // /dev/null — always EOF
     if (fde->type == FdType::DevNull)
         return 0;
+
+    // /dev/urandom — fill buffer with RDRAND random bytes
+    if (fde->type == FdType::DevUrandom)
+    {
+        auto* dst = reinterpret_cast<uint8_t*>(bufAddr);
+        uint64_t filled = 0;
+        while (filled < count) {
+            uint64_t rval;
+            int ok;
+            asm volatile("rdrand %0; setc %b1" : "=r"(rval), "=r"(ok));
+            if (!ok) {
+                // RDRAND failed, yield and retry
+                for (volatile int i = 0; i < 100; i++) {}
+                continue;
+            }
+            uint64_t remain = count - filled;
+            uint64_t chunk = (remain < 8) ? remain : 8;
+            for (uint64_t i = 0; i < chunk; i++)
+                dst[filled + i] = static_cast<uint8_t>(rval >> (i * 8));
+            filled += chunk;
+        }
+        return static_cast<int64_t>(count);
+    }
 
     // Synthetic in-memory files (/etc/passwd, /etc/group, etc.)
     if (fde->type == FdType::SyntheticMem && fde->handle)
@@ -779,6 +803,14 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     if (StrEq(path, "/dev/null"))
     {
         int fd = FdAlloc(proc, FdType::DevNull, nullptr);
+        if (fd < 0) return -EMFILE;
+        return fd;
+    }
+
+    // /dev/urandom, /dev/random — RDRAND-backed random bytes
+    if (StrEq(path, "/dev/urandom") || StrEq(path, "/dev/random"))
+    {
+        int fd = FdAlloc(proc, FdType::DevUrandom, nullptr);
         if (fd < 0) return -EMFILE;
         return fd;
     }
@@ -2354,6 +2386,21 @@ static int64_t sys_gettimeofday(uint64_t tvAddr, uint64_t, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
+// sys_time (201) — returns seconds since epoch
+// ---------------------------------------------------------------------------
+
+static int64_t sys_time(uint64_t tloc, uint64_t, uint64_t,
+                         uint64_t, uint64_t, uint64_t)
+{
+    uint64_t epoch = RtcNow();
+    if (tloc) {
+        auto* p = reinterpret_cast<int64_t*>(tloc);
+        *p = static_cast<int64_t>(epoch);
+    }
+    return static_cast<int64_t>(epoch);
+}
+
+// ---------------------------------------------------------------------------
 // sys_sched_yield (24)
 // ---------------------------------------------------------------------------
 
@@ -3118,11 +3165,12 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
         return 0;
     }
 
-    if (fde->type == FdType::DevKeyboard || fde->type == FdType::DevNull) {
+    if (fde->type == FdType::DevKeyboard || fde->type == FdType::DevNull || fde->type == FdType::DevUrandom) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
         for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
         st->st_mode = 0020666; // S_IFCHR
-        st->st_rdev = (fde->type == FdType::DevNull) ? 0x0103 : 0x0400;
+        st->st_rdev = (fde->type == FdType::DevNull) ? 0x0103 :
+                      (fde->type == FdType::DevUrandom) ? 0x0109 : 0x0400;
         st->st_blksize = 4096;
         return 0;
     }
@@ -3131,6 +3179,28 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
         auto* raw = reinterpret_cast<uint8_t*>(st);
         for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
         st->st_mode = 0010666; // S_IFIFO | rw-rw-rw-
+        st->st_blksize = 4096;
+        return 0;
+    }
+
+    if (fde->type == FdType::SyntheticMem) {
+        auto* raw = reinterpret_cast<uint8_t*>(st);
+        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        st->st_mode = 0100444; // S_IFREG | r--r--r--
+        if (fde->handle) {
+            auto* content = static_cast<const char*>(fde->handle);
+            uint64_t len = 0;
+            while (content[len]) len++;
+            st->st_size = len;
+        }
+        st->st_blksize = 4096;
+        return 0;
+    }
+
+    if (fde->type == FdType::Socket) {
+        auto* raw = reinterpret_cast<uint8_t*>(st);
+        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        st->st_mode = 0140666; // S_IFSOCK | rw-rw-rw-
         st->st_blksize = 4096;
         return 0;
     }
@@ -5262,6 +5332,9 @@ static int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
 
     SerialPrintf("sys_socket: domain=%lu type=%lu proto=%lu\n", domain, type, protocol);
 
+    // AF_UNIX (1), AF_INET6 (10) — not supported
+    if (domain != AF_INET) return -EAFNOSUPPORT;
+
     int sockIdx = SockCreate(static_cast<int>(domain),
                               static_cast<int>(type & 0xFF), // mask SOCK_NONBLOCK etc
                               static_cast<int>(protocol));
@@ -5340,8 +5413,18 @@ static int64_t sys_sendto(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
     if (sockIdx < 0) return -EBADF;
 
     (void)flagsVal;
-    auto* dest = destVal ? reinterpret_cast<const SockAddrIn*>(destVal) : nullptr;
 
+    // For connected TCP sockets, use SockSend (stream send)
+    if (brook::SockIsStream(sockIdx))
+    {
+        int ret = brook::SockSend(sockIdx,
+                                   reinterpret_cast<const void*>(bufVal),
+                                   static_cast<uint32_t>(lenVal));
+        return static_cast<int64_t>(ret);
+    }
+
+    // UDP path
+    auto* dest = destVal ? reinterpret_cast<const SockAddrIn*>(destVal) : nullptr;
     int ret = SockSendTo(sockIdx, reinterpret_cast<const void*>(bufVal),
                           static_cast<uint32_t>(lenVal), dest);
     if (ret < 0) return -EIO;
@@ -5359,8 +5442,18 @@ static int64_t sys_recvfrom(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
     if (sockIdx < 0) return -EBADF;
 
     (void)flagsVal;
-    auto* src = srcVal ? reinterpret_cast<SockAddrIn*>(srcVal) : nullptr;
 
+    // For TCP sockets, use SockRecv (stream receive)
+    if (brook::SockIsStream(sockIdx))
+    {
+        int ret = brook::SockRecv(sockIdx,
+                                   reinterpret_cast<void*>(bufVal),
+                                   static_cast<uint32_t>(lenVal));
+        return static_cast<int64_t>(ret);
+    }
+
+    // UDP path
+    auto* src = srcVal ? reinterpret_cast<SockAddrIn*>(srcVal) : nullptr;
     int ret = SockRecvFrom(sockIdx, reinterpret_cast<void*>(bufVal),
                             static_cast<uint32_t>(lenVal), src);
     if (ret < 0) return -EAGAIN;
@@ -5552,6 +5645,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_FCNTL]           = sys_fcntl;
     g_syscallTable[SYS_GETCWD]          = sys_getcwd;
     g_syscallTable[SYS_GETTIMEOFDAY]    = sys_gettimeofday;
+    g_syscallTable[SYS_TIME]             = sys_time;
     g_syscallTable[SYS_GETUID]          = sys_getuid;
     g_syscallTable[SYS_GETGID]          = sys_getgid;
     g_syscallTable[SYS_SETUID]          = sys_setuid;
@@ -5744,7 +5838,7 @@ static const char* SyscallName(uint64_t num)
     case 34: return "pause"; case 37: return "alarm";
     case 135: return "fstatfs";   case 157: return "prctl";
     case 158: return "arch_prctl"; case 186: return "gettid";
-    case 200: return "tkill";     case 217: return "getdents64";
+    case 200: return "tkill";     case 201: return "time";       case 217: return "getdents64";
     case 218: return "set_tid_address"; case 228: return "clock_gettime";
     case 230: return "clock_nanosleep"; case 231: return "exit_group";
     case 234: return "tgkill";    case 257: return "openat";

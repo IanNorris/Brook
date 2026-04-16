@@ -1536,6 +1536,13 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
     return static_cast<int>(copyLen);
 }
 
+bool SockIsStream(int sockIdx)
+{
+    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return false;
+    if (!g_sockUsed[sockIdx]) return false;
+    return g_sockets[sockIdx].type == SOCK_STREAM;
+}
+
 bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite)
 {
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return false;

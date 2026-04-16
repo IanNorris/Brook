@@ -161,6 +161,16 @@ static uint64_t SetupUserStack(Process* proc,
     // 4. Align to 16 bytes
     sp &= ~0xFULL;
 
+    // Compute total 8-byte slots to be pushed below, and pad so final RSP
+    // is 16-byte aligned (Linux ABI: RSP mod 16 == 0 at process entry).
+    //   auxv: 8 entries × 2 slots = 16
+    //   envp: (envc + 1) slots (including NULL terminator)
+    //   argv: (argc + 1) slots (including NULL terminator)
+    //   argc: 1 slot
+    int totalSlots = 16 + (envc + 1) + (argc + 1) + 1;
+    if (totalSlots & 1)
+        pushU64(0); // padding to maintain 16-byte alignment
+
     // 5. Push auxiliary vectors (in reverse order, so first entry is at lowest address)
     pushU64(0); pushU64(AT_NULL);                               // AT_NULL
     pushU64(randomAddr); pushU64(AT_RANDOM);                    // AT_RANDOM

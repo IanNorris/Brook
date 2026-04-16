@@ -179,6 +179,7 @@ enum class FdType : uint8_t
     DevKeyboard,   // /dev/keyboard
     Pipe,          // pipe() read/write end
     DevNull,       // /dev/null — discard writes, EOF on read
+    DevUrandom,    // /dev/urandom — RDRAND-backed random bytes
     SyntheticMem,  // In-memory synthetic file (e.g. /etc/passwd)
     Socket,        // Network socket (UDP/TCP)
     DevTty,        // /dev/tty — bidirectional terminal (read=stdin pipe, write=stdout pipe)

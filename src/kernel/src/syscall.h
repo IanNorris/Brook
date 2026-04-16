@@ -50,6 +50,8 @@ static constexpr uint64_t SYS_GETUID           = 102;
 static constexpr uint64_t SYS_GETGID           = 104;
 static constexpr uint64_t SYS_SETUID           = 105;
 static constexpr uint64_t SYS_SETGID           = 106;
+
+static constexpr uint64_t SYS_TIME             = 201;
 static constexpr uint64_t SYS_GETEUID          = 107;
 static constexpr uint64_t SYS_GETEGID          = 108;
 static constexpr uint64_t SYS_GETPPID          = 110;
