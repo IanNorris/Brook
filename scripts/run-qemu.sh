@@ -9,6 +9,7 @@ BUILD_TYPE="debug"
 DEBUG_FLAGS=""
 SCRIPT_NAME=""
 HEADLESS=0
+VNC_DISPLAY=""
 EXTRA_ARGS=()
 for arg in "$@"; do
     case "$arg" in
@@ -21,6 +22,9 @@ for arg in "$@"; do
         --headless)
             HEADLESS=1
             ;;
+        --vnc)
+            VNC_DISPLAY="__NEXT_VNC__"
+            ;;
         --script=*)
             SCRIPT_NAME="${arg#--script=}"
             ;;
@@ -31,6 +35,8 @@ for arg in "$@"; do
         *)
             if [ "$SCRIPT_NAME" = "__NEXT__" ]; then
                 SCRIPT_NAME="$arg"
+            elif [ "$VNC_DISPLAY" = "__NEXT_VNC__" ]; then
+                VNC_DISPLAY="$arg"
             else
                 EXTRA_ARGS+=("$arg")
             fi
@@ -191,7 +197,11 @@ fi
 
 if [ "$HEADLESS" -eq 1 ]; then
     SERIAL_OPT="-serial file:/tmp/brook_serial.log"
-    DISPLAY_OPT="-vnc none"
+    if [ -n "$VNC_DISPLAY" ] && [ "$VNC_DISPLAY" != "__NEXT_VNC__" ]; then
+        DISPLAY_OPT="-vnc ${VNC_DISPLAY}"
+    else
+        DISPLAY_OPT="-vnc none"
+    fi
 else
     SERIAL_OPT="-serial stdio"
     DISPLAY_OPT="-display gtk"
