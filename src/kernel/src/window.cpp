@@ -881,7 +881,7 @@ void WmLauncherLoad()
 
     DirEntry de;
     uint32_t cookie = 0;
-    while (VfsReaddir(dir, &de, &cookie) == 0 && g_launcherCount < WM_LAUNCHER_MAX_ITEMS)
+    while (VfsReaddir(dir, &de, &cookie) == 1 && g_launcherCount < WM_LAUNCHER_MAX_ITEMS)
     {
         if (de.isDir) continue;
 

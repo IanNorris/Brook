@@ -626,12 +626,9 @@ static void CompositorLoopWM()
         }
     }
 
-    // 4. Handle mouse interaction (position + latched clicks)
-    CompositorHandleMouseWM();
-
-    // 5. Route input events (keyboard + mouse buttons)
-    // Mouse button events are latched so CompositorHandleMouseWM picks them up
-    // even if press+release both happen between compositor frames.
+    // 4. Route input events (keyboard + mouse buttons)
+    // Must happen before mouse click handling so poll drains the virtqueue
+    // and events are latched for CompositorHandleMouseWM.
     InputEvent ev;
     while (InputPollEvent(&ev))
     {
@@ -758,6 +755,10 @@ static void CompositorLoopWM()
         if (!routed)
             ProcessInputPush(focused->proc, ev);
     }
+
+    // 5. Handle mouse interaction (position + latched clicks)
+    // Must run AFTER event poll so latch flags are populated.
+    CompositorHandleMouseWM();
 }
 
 // Mouse state for WM interaction

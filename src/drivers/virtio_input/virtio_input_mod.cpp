@@ -182,6 +182,7 @@ static int32_t  g_absXMin = 0, g_absXMax = 32767;
 static int32_t  g_absYMin = 0, g_absYMax = 32767;
 static uint32_t g_screenW = 1920, g_screenH = 1080;
 static int32_t  g_pendingX = -1, g_pendingY = -1;
+static int32_t  g_lastAbsX = 0,  g_lastAbsY = 0;
 
 static InputDevice g_inputDev;
 static void VirtioInputPoll(InputDevice* dev);
@@ -315,8 +316,10 @@ static void ProcessEvent(const VirtioInputEvent& ev)
     {
         if (g_pendingX >= 0 || g_pendingY >= 0)
         {
-            int32_t absX = (g_pendingX >= 0) ? g_pendingX : 0;
-            int32_t absY = (g_pendingY >= 0) ? g_pendingY : 0;
+            int32_t absX = (g_pendingX >= 0) ? g_pendingX : g_lastAbsX;
+            int32_t absY = (g_pendingY >= 0) ? g_pendingY : g_lastAbsY;
+            g_lastAbsX = absX;
+            g_lastAbsY = absY;
             int32_t rangeX = g_absXMax - g_absXMin;
             int32_t rangeY = g_absYMax - g_absYMin;
             if (rangeX <= 0) rangeX = 1;
