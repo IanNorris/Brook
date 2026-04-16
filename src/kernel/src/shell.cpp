@@ -52,6 +52,8 @@ static uint32_t g_gridRows  = 0;
 static uint8_t  g_scale     = 3;    // Default downscale factor
 static uint32_t g_vfbWidth  = 640;  // Default VFB dimensions
 static uint32_t g_vfbHeight = 400;
+static int32_t  g_winX     = -1;   // -1 = auto-cascade
+static int32_t  g_winY     = -1;
 static bool     g_ttyFull   = false; // When true, skip VFB for spawned processes
 
 // Track spawned process count for auto-tiling placement
@@ -311,9 +313,12 @@ static Process* SpawnProcess(const char* path, int argc, const char* const* argv
         if (WmIsActive())
         {
             // WM mode: create a window for this process
-            // Default window position: cascade from top-left
-            int16_t winX = static_cast<int16_t>(40 + (g_spawnCount % 8) * 30);
-            int16_t winY = static_cast<int16_t>(40 + (g_spawnCount % 8) * 30);
+            int16_t winX = (g_winX >= 0) ? static_cast<int16_t>(g_winX)
+                         : static_cast<int16_t>(40 + (g_spawnCount % 8) * 30);
+            int16_t winY = (g_winY >= 0) ? static_cast<int16_t>(g_winY)
+                         : static_cast<int16_t>(40 + (g_spawnCount % 8) * 30);
+            g_winX = -1;  // Reset after use
+            g_winY = -1;
             uint16_t vfbW = static_cast<uint16_t>(g_vfbWidth);
             uint16_t vfbH = static_cast<uint16_t>(g_vfbHeight);
             uint8_t upscale = g_scale;
@@ -571,6 +576,18 @@ static int ExecCommand(int argc, const char* const* argv)
                 g_vfbHeight = h;
                 KPrintf("vfb: %ux%u\n", w, h);
             }
+        }
+        else if (StrEq(argv[1], "pos"))
+        {
+            // Parse "XxY" or "X,Y" format for window position
+            const char* val = argv[2];
+            int32_t x = static_cast<int32_t>(ParseUint(val));
+            while (*val && *val != 'x' && *val != 'X' && *val != ',') ++val;
+            if (*val) ++val;
+            int32_t y = static_cast<int32_t>(ParseUint(val));
+            g_winX = x;
+            g_winY = y;
+            KPrintf("pos: %d,%d\n", x, y);
         }
         else if (StrEq(argv[1], "tty"))
         {
@@ -927,6 +944,7 @@ static void CmdHelp()
     KPrintf("  set grid <CxR>     Set process grid layout\n");
     KPrintf("  set scale <N>      Set compositor downscale\n");
     KPrintf("  set vfb <WxH>      Set VFB dimensions\n");
+    KPrintf("  set pos <X,Y>      Set next window position\n");
     KPrintf("  clear              Clear screen\n");
     KPrintf("  shutdown           Power off\n");
     KPrintf("  reboot             Reboot\n");
