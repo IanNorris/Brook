@@ -1,0 +1,2 @@
+# Brook OS — Run Nix-built hello
+run /nix/store/s8ckjjq4dcjmnjw7yra8zxmzsg25m2xc-hello-2.12.3/bin/hello

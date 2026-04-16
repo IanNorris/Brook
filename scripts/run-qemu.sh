@@ -159,6 +159,14 @@ if [ -f "${EXT2_DISK}" ]; then
     echo "  Ext2 disk: ${EXT2_DISK}"
 fi
 
+# Optional Nix store disk (third virtio drive, mounted at /nix)
+NIX_DISK="${BROOK_NIX_DISK:-${ROOT_DIR}/brook_nix_disk.img}"
+NIX_DRIVE=""
+if [ -f "${NIX_DISK}" ]; then
+    NIX_DRIVE="-drive if=virtio,format=raw,file=${NIX_DISK},file.locking=off"
+    echo "  Nix disk:  ${NIX_DISK}"
+fi
+
 # Select boot script: --script <name> copies data/scripts/<name>.rc to INIT.RC
 # on the disk image. Without --script, the existing INIT.RC is used.
 if [ -n "${SCRIPT_NAME}" ]; then
@@ -206,6 +214,7 @@ qemu-system-x86_64 \
     -drive format=raw,file=fat:rw:"${BUILD_DIR}/esp" \
     -drive if=virtio,format=raw,file="${DISK_IMG}",file.locking=off \
     ${EXT2_DRIVE} \
+    ${NIX_DRIVE} \
     -device virtio-tablet-pci \
     -device virtio-net-pci,netdev=net0 \
     -netdev user,id=net0 \
