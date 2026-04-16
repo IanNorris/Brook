@@ -1,0 +1,3 @@
+# Brook OS — Quake (shareware) test
+set scale 1
+run /nix/games/quake/quake -basedir /nix/games/quake
