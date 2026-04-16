@@ -30,6 +30,7 @@ MODULE_IMPORT_SYMBOL(PciEnableBusMaster);
 MODULE_IMPORT_SYMBOL(PciConfigRead32);
 MODULE_IMPORT_SYMBOL(PciConfigRead16);
 MODULE_IMPORT_SYMBOL(PciConfigRead8);
+MODULE_IMPORT_SYMBOL(PciConfigWrite16);
 MODULE_IMPORT_SYMBOL(SerialPrintf);
 MODULE_IMPORT_SYMBOL(SerialPuts);
 MODULE_IMPORT_SYMBOL(KPrintf);
@@ -183,7 +184,8 @@ static uint32_t g_screenW = 1920, g_screenH = 1080;
 static int32_t  g_pendingX = -1, g_pendingY = -1;
 
 static InputDevice g_inputDev;
-static const InputDeviceOps g_inputOps = { "virtio-tablet", nullptr };
+static void VirtioInputPoll(InputDevice* dev);
+static InputDeviceOps g_inputOps = { "virtio-tablet", nullptr };
 static constexpr uint8_t VIRTIO_INPUT_IRQ_VECTOR = 46;
 
 // Queue notify offset (from common config Q_NOTIFY_OFF)
@@ -219,8 +221,6 @@ static bool AllocEventQueue()
     uint8_t* base = reinterpret_cast<uint8_t*>(qAddr.raw());
     for (uint32_t i = 0; i < totalPages * 4096; ++i) base[i] = 0;
 
-    uint64_t basePhys = VmmVirtToPhys(KernelPageTable, qAddr).raw();
-
     uint8_t* descBase  = base;
     uint8_t* availBase = base + descPages * 4096;
     uint8_t* usedBase  = availBase + availPages * 4096;
@@ -233,12 +233,12 @@ static bool AllocEventQueue()
     g_usedIdx    = reinterpret_cast<volatile uint16_t*>(usedBase + 2);
     g_usedRing   = reinterpret_cast<VirtqUsedElem*>(usedBase + 4);
 
-    g_descPhys  = basePhys;
-    g_availPhys = basePhys + descPages * 4096;
-    g_usedPhys  = g_availPhys + availPages * 4096;
+    g_descPhys  = VmmVirtToPhys(KernelPageTable, VirtualAddress(reinterpret_cast<uint64_t>(descBase))).raw();
+    g_availPhys = VmmVirtToPhys(KernelPageTable, VirtualAddress(reinterpret_cast<uint64_t>(availBase))).raw();
+    g_usedPhys  = VmmVirtToPhys(KernelPageTable, VirtualAddress(reinterpret_cast<uint64_t>(usedBase))).raw();
 
     g_eventBufs     = reinterpret_cast<VirtioInputEvent*>(eventBase);
-    g_eventBufsPhys = g_usedPhys + usedPages * 4096;
+    g_eventBufsPhys = VmmVirtToPhys(KernelPageTable, VirtualAddress(reinterpret_cast<uint64_t>(eventBase))).raw();
 
     return true;
 }
@@ -343,8 +343,31 @@ static void ProcessEvent(const VirtioInputEvent& ev)
 
 static void VirtioInputIrqBody()
 {
-    // Read ISR status to acknowledge.
-    (void)mmio_read8(g_isrCfg, 0);
+    uint8_t isr = mmio_read8(g_isrCfg, 0);
+    (void)isr;
+
+    while (g_usedIdxShadow != *g_usedIdx)
+    {
+        uint16_t slot = g_usedIdxShadow & (g_queueSize - 1);
+        uint32_t descIdx = g_usedRing[slot].id;
+        if (descIdx < g_queueSize)
+        {
+            ProcessEvent(g_eventBufs[descIdx]);
+            RepostDescriptor(static_cast<uint16_t>(descIdx));
+        }
+        g_usedIdxShadow++;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Poll callback — called by InputPollEvent() each compositor frame.
+// Drains the virtqueue used ring without relying on IRQs.
+// ---------------------------------------------------------------------------
+
+static void VirtioInputPoll(InputDevice* /*dev*/)
+{
+    if (!g_usedIdx)
+        return;
 
     while (g_usedIdxShadow != *g_usedIdx)
     {
@@ -407,6 +430,29 @@ static bool FindVirtioCaps(const PciDevice& dev, VirtioPciCap caps[5])
     return found >= 4;
 }
 
+// Disable MSI-X in PCI config space so the device uses legacy INTx interrupts.
+// Without this, QEMU virtio devices may not deliver legacy interrupts.
+static void DisableMsix(const PciDevice& dev)
+{
+    uint8_t capPtr = static_cast<uint8_t>(PciConfigRead8(dev.bus, dev.dev, dev.fn, 0x34));
+    while (capPtr != 0 && capPtr != 0xFF)
+    {
+        uint8_t capId = PciConfigRead8(dev.bus, dev.dev, dev.fn, capPtr);
+        if (capId == 0x11) // MSI-X capability
+        {
+            uint16_t msgCtrl = PciConfigRead16(dev.bus, dev.dev, dev.fn, capPtr + 2);
+            if (msgCtrl & 0x8000) // MSI-X enable bit
+            {
+                SerialPrintf("virtio_input: disabling MSI-X (msgCtrl=0x%x)\n", msgCtrl);
+                PciConfigWrite16(dev.bus, dev.dev, dev.fn, capPtr + 2,
+                                 msgCtrl & ~static_cast<uint16_t>(0x8000));
+            }
+            return;
+        }
+        capPtr = PciConfigRead8(dev.bus, dev.dev, dev.fn, capPtr + 1);
+    }
+}
+
 static volatile uint8_t* MapBar(const PciDevice& dev, uint8_t barIdx, uint32_t offset, uint32_t length)
 {
     uint64_t barPhys = PciBarMemBase32(dev.bar[barIdx]);
@@ -427,7 +473,7 @@ static volatile uint8_t* MapBar(const PciDevice& dev, uint8_t barIdx, uint32_t o
         VmmMapPage(KernelPageTable,
                    VirtualAddress(vaddr.raw() + i * 4096),
                    PhysicalAddress(physBase + i * 4096),
-                   VMM_WRITABLE | VMM_NO_EXEC,
+                   VMM_WRITABLE | VMM_NO_EXEC | VMM_CACHE_DISABLE,
                    MemTag::Device, KernelPid);
     }
 
@@ -489,6 +535,7 @@ static int VirtioInputModuleInit()
 
     PciEnableMemSpace(dev);
     PciEnableBusMaster(dev);
+    DisableMsix(dev);
 
     // Parse PCI capabilities to find modern config regions.
     VirtioPciCap caps[5] = {};
@@ -547,9 +594,18 @@ static int VirtioInputModuleInit()
     CompositorGetPhysDims(&g_screenW, &g_screenH);
     SerialPrintf("virtio_input: screen %ux%u\n", g_screenW, g_screenH);
 
-    // No features to negotiate.
+    // Feature negotiation — page 0: no device-specific features needed.
+    mmio_write32(g_commonCfg, VIRTIO_COMMON_DFSELECT, 0);
+    (void)mmio_read32(g_commonCfg, VIRTIO_COMMON_DF);
     mmio_write32(g_commonCfg, VIRTIO_COMMON_GFSELECT, 0);
     mmio_write32(g_commonCfg, VIRTIO_COMMON_GF, 0);
+
+    // Page 1: VIRTIO_F_VERSION_1 (bit 32 = page 1 bit 0) — required for modern devices.
+    mmio_write32(g_commonCfg, VIRTIO_COMMON_DFSELECT, 1);
+    uint32_t devFeatures1 = mmio_read32(g_commonCfg, VIRTIO_COMMON_DF);
+    uint32_t guestFeatures1 = devFeatures1 & 0x01; // VIRTIO_F_VERSION_1
+    mmio_write32(g_commonCfg, VIRTIO_COMMON_GFSELECT, 1);
+    mmio_write32(g_commonCfg, VIRTIO_COMMON_GF, guestFeatures1);
 
     // Set FEATURES_OK.
     mmio_write8(g_commonCfg, VIRTIO_COMMON_STATUS,
@@ -564,6 +620,7 @@ static int VirtioInputModuleInit()
 
     // Select queue 0 (eventq).
     mmio_write16(g_commonCfg, VIRTIO_COMMON_Q_SELECT, 0);
+
     g_queueSize = mmio_read16(g_commonCfg, VIRTIO_COMMON_Q_SIZE);
     if (g_queueSize == 0)
     {
@@ -589,6 +646,8 @@ static int VirtioInputModuleInit()
     }
 
     // Set queue addresses (modern: 64-bit physical addresses).
+    SerialPrintf("virtio_input: desc=0x%lx avail=0x%lx used=0x%lx events=0x%lx\n",
+                 g_descPhys, g_availPhys, g_usedPhys, g_eventBufsPhys);
     mmio_write64(g_commonCfg, VIRTIO_COMMON_Q_DESC, g_descPhys);
     mmio_write64(g_commonCfg, VIRTIO_COMMON_Q_AVAIL, g_availPhys);
     mmio_write64(g_commonCfg, VIRTIO_COMMON_Q_USED, g_usedPhys);
@@ -614,6 +673,7 @@ static int VirtioInputModuleInit()
     NotifyQueue();
 
     // Register input device.
+    g_inputOps.poll = VirtioInputPoll;  // Set at runtime — static init relocations don't work in modules
     g_inputDev.ops  = &g_inputOps;
     g_inputDev.head = 0;
     g_inputDev.tail = 0;

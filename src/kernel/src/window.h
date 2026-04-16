@@ -169,4 +169,35 @@ uint32_t WmDesktopHeight(uint32_t screenH);
 // Spawn a new terminal window (Ctrl+T handler).
 void WmSpawnTerminal();
 
+// ---------------------------------------------------------------------------
+// App Launcher
+// ---------------------------------------------------------------------------
+
+static constexpr uint32_t WM_LAUNCHER_MAX_ITEMS = 16;
+
+struct LauncherItem {
+    char title[48];
+    char scriptPath[128];  // e.g. "/boot/SHORTCUTS/QUAKE.RC"
+    bool valid;
+};
+
+// Load shortcut files from /boot/SHORTCUTS/ directory.
+void WmLauncherLoad();
+
+// Toggle the launcher popup open/closed.
+void WmLauncherToggle();
+
+// Is the launcher popup currently visible?
+bool WmLauncherVisible();
+
+// Render the launcher popup over the desktop.
+void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
+                      uint32_t screenW, uint32_t screenH);
+
+// Hit-test the launcher popup. Returns item index (0..N) or -1 if miss.
+int WmLauncherHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH);
+
+// Launch the item at the given index.
+void WmLauncherExec(int itemIdx);
+
 } // namespace brook

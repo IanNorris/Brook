@@ -1,0 +1,5 @@
+# title: NetSurf (Web)
+# desc: Browse the web
+set vfb 800x600
+set scale 1
+run /nix/apps/netsurf/bin/netsurf -f brook -w 800 -h 600 http://example.com

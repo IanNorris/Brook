@@ -230,6 +230,18 @@ if [ -d "$data_scripts" ]; then
     done
 fi
 
+# --- App shortcuts ---
+shortcuts_dir="${ROOT_DIR}/data/shortcuts"
+if [ -d "$shortcuts_dir" ]; then
+    mmd -D s -i "${DISK_IMG}" "::SHORTCUTS" 2>/dev/null || true
+    for f in "$shortcuts_dir"/*.rc; do
+        [ -f "$f" ] || continue
+        dname="$(basename "$f" | tr '[:lower:]' '[:upper:]')"
+        mcopy -o -i "${DISK_IMG}" "$f" "::SHORTCUTS/${dname}"
+        echo "  synced shortcut: SHORTCUTS/${dname}"
+    done
+fi
+
 # --- Wallpaper ---
 wallpaper="${ROOT_DIR}/data/wallpaper.raw"
 if [ -f "$wallpaper" ]; then

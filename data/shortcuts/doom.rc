@@ -1,0 +1,5 @@
+# title: DOOM
+# desc: The classic
+set vfb 320x200
+set scale 2
+run doom -iwad /boot/DOOM1.WAD

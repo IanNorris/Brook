@@ -1,0 +1,11 @@
+prefix=/workspace/brook/tools/netsurf-build/inst
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: libnsfb
+Description: Provides framebuffer access for netsurf.
+Version: 0.2.2
+
+Libs: -L${libdir} -lnsfb
+Cflags: -I${includedir}

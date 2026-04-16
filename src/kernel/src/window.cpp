@@ -11,6 +11,7 @@
 #include "serial.h"
 #include "rtc.h"
 #include "terminal.h"
+#include "vfs.h"
 
 namespace brook {
 
@@ -22,6 +23,12 @@ static Window   g_windows[WM_MAX_WINDOWS] = {};
 static bool     g_wmActive = false;
 static int      g_focusedIdx = -1;
 static uint8_t  g_nextZOrder = 1;  // 0 = backmost, higher = front
+
+// App launcher state (implementation at bottom of file)
+static LauncherItem g_launcherItems[WM_LAUNCHER_MAX_ITEMS] = {};
+static uint32_t     g_launcherCount = 0;
+static bool         g_launcherOpen  = false;
+static bool         g_launcherLoaded = false;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -603,6 +610,7 @@ static constexpr uint32_t TASKBAR_BTN_HEIGHT = 24;
 static constexpr uint32_t TASKBAR_PADDING    = 4;
 static constexpr uint32_t TASKBAR_SEPARATOR  = 1; // thin line between taskbar and desktop
 static constexpr uint32_t TASKBAR_NEW_BTN_W  = 28; // "+" button width
+static constexpr uint32_t TASKBAR_APPS_BTN_W = 48; // "Apps" button width
 
 void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
                      uint32_t screenW, uint32_t screenH,
@@ -626,6 +634,17 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     uint32_t btnX = TASKBAR_PADDING;
     uint32_t btnY = tbY + (WM_TASKBAR_HEIGHT - TASKBAR_BTN_HEIGHT) / 2;
     uint32_t textYOff = (TASKBAR_BTN_HEIGHT - static_cast<uint32_t>(g_fontAtlas.lineHeight)) / 2;
+
+    // "Apps" launcher button
+    uint32_t appsBg = g_launcherOpen ? WM_TASKBAR_BTN_ACTIVE : 0x00334455;
+    WmFillRect(backBuffer, stride, screenW, screenH,
+               static_cast<int>(btnX), static_cast<int>(btnY),
+               TASKBAR_APPS_BTN_W, TASKBAR_BTN_HEIGHT, appsBg);
+    WmRenderString(backBuffer, stride, screenW, screenH,
+                   static_cast<int>(btnX + 6),
+                   static_cast<int>(btnY + textYOff),
+                   "Apps", 0x0088CCFF, appsBg);
+    btnX += TASKBAR_APPS_BTN_W + TASKBAR_PADDING;
 
     // "+" new terminal button
     WmFillRect(backBuffer, stride, screenW, screenH,
@@ -706,6 +725,19 @@ int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
     // Walk window buttons left to right
     uint32_t btnX = TASKBAR_PADDING;
 
+    // "Apps" launcher button
+    {
+        uint32_t btnY2 = tbY + (WM_TASKBAR_HEIGHT - TASKBAR_BTN_HEIGHT) / 2;
+        if (mx >= static_cast<int32_t>(btnX) &&
+            mx < static_cast<int32_t>(btnX + TASKBAR_APPS_BTN_W) &&
+            my >= static_cast<int32_t>(btnY2) &&
+            my < static_cast<int32_t>(btnY2 + TASKBAR_BTN_HEIGHT))
+        {
+            return -3; // special: apps launcher button
+        }
+        btnX += TASKBAR_APPS_BTN_W + TASKBAR_PADDING;
+    }
+
     // "+" new terminal button
     {
         uint32_t btnY2 = tbY + (WM_TASKBAR_HEIGHT - TASKBAR_BTN_HEIGHT) / 2;
@@ -775,6 +807,238 @@ void WmSpawnTerminal()
 
         SerialPrintf("WM: spawned new terminal (bash pid %u)\n", t->child->pid);
     }
+}
+
+// ---------------------------------------------------------------------------
+// App Launcher — popup panel with shortcut items
+// ---------------------------------------------------------------------------
+
+// Launcher visual constants
+static constexpr uint32_t LAUNCHER_ITEM_HEIGHT = 32;
+static constexpr uint32_t LAUNCHER_ITEM_WIDTH  = 200;
+static constexpr uint32_t LAUNCHER_PADDING     = 6;
+static constexpr uint32_t LAUNCHER_BG          = 0x00252535;
+static constexpr uint32_t LAUNCHER_ITEM_BG     = 0x00303045;
+static constexpr uint32_t LAUNCHER_ITEM_FG     = 0x00E0E0E0;
+static constexpr uint32_t LAUNCHER_BORDER_CLR  = 0x00505060;
+static constexpr uint32_t LAUNCHER_HEADER_FG   = 0x0090D0FF;
+
+// Parse "# title: Something" from a script file's first few lines
+static bool ParseShortcutTitle(const char* path, char* titleOut, uint32_t titleMax)
+{
+    Vnode* vn = VfsOpen(path, 0);
+    if (!vn) return false;
+
+    char buf[512];
+    uint64_t offset = 0;
+    int rd = VfsRead(vn, buf, sizeof(buf) - 1, &offset);
+    VfsClose(vn);
+    if (rd <= 0) return false;
+    buf[rd] = '\0';
+
+    // Search for "# title:" in the buffer
+    const char* p = buf;
+    while (*p)
+    {
+        // Skip to start of line
+        while (*p && (*p == '\n' || *p == '\r')) ++p;
+        if (*p != '#') break; // only check comment lines at the top
+
+        // Look for "# title:"
+        const char* line = p;
+        while (*p && *p != '\n') ++p;
+
+        // Check for "# title:" prefix
+        const char* t = line + 1;
+        while (*t == ' ') ++t;
+        if (t[0] == 't' && t[1] == 'i' && t[2] == 't' && t[3] == 'l' &&
+            t[4] == 'e' && t[5] == ':')
+        {
+            t += 6;
+            while (*t == ' ') ++t;
+            uint32_t i = 0;
+            while (*t && *t != '\n' && *t != '\r' && i < titleMax - 1)
+                titleOut[i++] = *t++;
+            titleOut[i] = '\0';
+            return true;
+        }
+    }
+    return false;
+}
+
+void WmLauncherLoad()
+{
+    if (g_launcherLoaded) return;
+    g_launcherLoaded = true;
+    g_launcherCount = 0;
+
+    Vnode* dir = VfsOpen("/boot/SHORTCUTS", 0);
+    if (!dir)
+    {
+        SerialPuts("WM: no /boot/SHORTCUTS directory\n");
+        return;
+    }
+
+    DirEntry de;
+    uint32_t cookie = 0;
+    while (VfsReaddir(dir, &de, &cookie) == 0 && g_launcherCount < WM_LAUNCHER_MAX_ITEMS)
+    {
+        if (de.isDir) continue;
+
+        // Build full path
+        LauncherItem& item = g_launcherItems[g_launcherCount];
+        uint32_t pi = 0;
+        const char* prefix = "/boot/SHORTCUTS/";
+        while (*prefix && pi < sizeof(item.scriptPath) - 1)
+            item.scriptPath[pi++] = *prefix++;
+        uint32_t ni = 0;
+        while (de.name[ni] && pi < sizeof(item.scriptPath) - 1)
+            item.scriptPath[pi++] = de.name[ni++];
+        item.scriptPath[pi] = '\0';
+
+        // Try to parse title from the file
+        if (!ParseShortcutTitle(item.scriptPath, item.title, sizeof(item.title)))
+        {
+            // Fallback: use filename without extension
+            uint32_t ti = 0;
+            for (uint32_t j = 0; de.name[j] && de.name[j] != '.' && ti < sizeof(item.title) - 1; ++j)
+                item.title[ti++] = de.name[j];
+            item.title[ti] = '\0';
+        }
+
+        item.valid = true;
+        SerialPrintf("WM: launcher[%u] = '%s' -> %s\n",
+                     g_launcherCount, item.title, item.scriptPath);
+        g_launcherCount++;
+    }
+
+    VfsClose(dir);
+    SerialPrintf("WM: loaded %u launcher shortcuts\n", g_launcherCount);
+}
+
+void WmLauncherToggle()
+{
+    if (!g_launcherLoaded) WmLauncherLoad();
+    g_launcherOpen = !g_launcherOpen;
+}
+
+bool WmLauncherVisible()
+{
+    return g_launcherOpen;
+}
+
+// Get the launcher panel geometry (anchored above the Apps button on the taskbar)
+static void LauncherGetRect(uint32_t screenW, uint32_t screenH,
+                            int32_t* outX, int32_t* outY,
+                            uint32_t* outW, uint32_t* outH)
+{
+    uint32_t itemCount = g_launcherCount > 0 ? g_launcherCount : 1;
+    uint32_t headerH = LAUNCHER_ITEM_HEIGHT; // "Apps" header row
+    uint32_t panelW = LAUNCHER_ITEM_WIDTH + LAUNCHER_PADDING * 2;
+    uint32_t panelH = headerH + itemCount * (LAUNCHER_ITEM_HEIGHT + 2) + LAUNCHER_PADDING * 2;
+
+    *outX = static_cast<int32_t>(TASKBAR_PADDING);
+    *outY = static_cast<int32_t>(screenH - WM_TASKBAR_HEIGHT - panelH - 2);
+    *outW = panelW;
+    *outH = panelH;
+}
+
+void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
+                      uint32_t screenW, uint32_t screenH)
+{
+    if (!g_launcherOpen || g_launcherCount == 0) return;
+
+    int32_t px, py;
+    uint32_t pw, ph;
+    LauncherGetRect(screenW, screenH, &px, &py, &pw, &ph);
+
+    // Panel background
+    WmFillRect(backBuffer, stride, screenW, screenH,
+               px, py, static_cast<int>(pw), static_cast<int>(ph), LAUNCHER_BG);
+
+    // Border
+    WmFillRect(backBuffer, stride, screenW, screenH, px, py, static_cast<int>(pw), 1, LAUNCHER_BORDER_CLR);
+    WmFillRect(backBuffer, stride, screenW, screenH, px, py + static_cast<int32_t>(ph) - 1, static_cast<int>(pw), 1, LAUNCHER_BORDER_CLR);
+    WmFillRect(backBuffer, stride, screenW, screenH, px, py, 1, static_cast<int>(ph), LAUNCHER_BORDER_CLR);
+    WmFillRect(backBuffer, stride, screenW, screenH, px + static_cast<int32_t>(pw) - 1, py, 1, static_cast<int>(ph), LAUNCHER_BORDER_CLR);
+
+    uint32_t textYOff = (LAUNCHER_ITEM_HEIGHT - static_cast<uint32_t>(g_fontAtlas.lineHeight)) / 2;
+
+    // Header: "Apps"
+    int32_t iy = py + static_cast<int32_t>(LAUNCHER_PADDING);
+    WmRenderString(backBuffer, stride, screenW, screenH,
+                   px + static_cast<int32_t>(LAUNCHER_PADDING) + 4,
+                   iy + static_cast<int32_t>(textYOff),
+                   "Applications", LAUNCHER_HEADER_FG, LAUNCHER_BG);
+    iy += LAUNCHER_ITEM_HEIGHT;
+
+    // Items
+    for (uint32_t i = 0; i < g_launcherCount; i++)
+    {
+        if (!g_launcherItems[i].valid) continue;
+
+        int32_t itemX = px + static_cast<int32_t>(LAUNCHER_PADDING);
+        int32_t itemY = iy;
+
+        WmFillRect(backBuffer, stride, screenW, screenH,
+                   itemX, itemY,
+                   static_cast<int>(LAUNCHER_ITEM_WIDTH),
+                   static_cast<int>(LAUNCHER_ITEM_HEIGHT),
+                   LAUNCHER_ITEM_BG);
+
+        WmRenderString(backBuffer, stride, screenW, screenH,
+                       itemX + 8, itemY + static_cast<int32_t>(textYOff),
+                       g_launcherItems[i].title,
+                       LAUNCHER_ITEM_FG, LAUNCHER_ITEM_BG);
+
+        iy += LAUNCHER_ITEM_HEIGHT + 2;
+    }
+}
+
+int WmLauncherHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
+{
+    if (!g_launcherOpen || g_launcherCount == 0) return -1;
+
+    int32_t px, py;
+    uint32_t pw, ph;
+    LauncherGetRect(screenW, screenH, &px, &py, &pw, &ph);
+
+    // Outside panel?
+    if (mx < px || mx >= px + static_cast<int32_t>(pw) ||
+        my < py || my >= py + static_cast<int32_t>(ph))
+        return -1;
+
+    // Skip header
+    int32_t itemStartY = py + static_cast<int32_t>(LAUNCHER_PADDING + LAUNCHER_ITEM_HEIGHT);
+    int32_t itemX = px + static_cast<int32_t>(LAUNCHER_PADDING);
+
+    for (uint32_t i = 0; i < g_launcherCount; i++)
+    {
+        int32_t iy = itemStartY + static_cast<int32_t>(i * (LAUNCHER_ITEM_HEIGHT + 2));
+        if (mx >= itemX && mx < itemX + static_cast<int32_t>(LAUNCHER_ITEM_WIDTH) &&
+            my >= iy && my < iy + static_cast<int32_t>(LAUNCHER_ITEM_HEIGHT))
+        {
+            return static_cast<int>(i);
+        }
+    }
+
+    return -1; // clicked in panel but not on an item (header or padding)
+}
+
+void WmLauncherExec(int itemIdx)
+{
+    if (itemIdx < 0 || itemIdx >= static_cast<int>(g_launcherCount)) return;
+    if (!g_launcherItems[itemIdx].valid) return;
+
+    SerialPrintf("WM: launching '%s' via %s\n",
+                 g_launcherItems[itemIdx].title,
+                 g_launcherItems[itemIdx].scriptPath);
+
+    g_launcherOpen = false;
+
+    // Execute the shortcut script (uses existing shell infrastructure)
+    extern int ShellExecScript(const char* path);
+    ShellExecScript(g_launcherItems[itemIdx].scriptPath);
 }
 
 } // namespace brook

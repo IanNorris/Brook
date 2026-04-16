@@ -1,0 +1,5 @@
+# title: NetSurf Browser
+# desc: Web browser
+set vfb 800x600
+set scale 1
+run /nix/apps/netsurf/bin/netsurf -f brook -w 800 -h 600

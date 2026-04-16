@@ -1,0 +1,5 @@
+# title: Quake
+# desc: First-person shooter
+set vfb 640x480
+set scale 1
+run /nix/games/quake/quake -basedir /nix/games/quake

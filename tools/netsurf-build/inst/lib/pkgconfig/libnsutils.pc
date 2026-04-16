@@ -1,0 +1,10 @@
+prefix=/workspace/brook/tools/netsurf-build/inst
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: libnsutils
+Description: NetSurf utilities
+Version: 0.1.1
+Libs: -L${libdir} -lnsutils
+Cflags: -I${includedir}

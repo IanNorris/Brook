@@ -512,6 +512,10 @@ static Process* g_compositorProcess = nullptr;
 // Forward declaration
 static void CompositorHandleMouseWM();
 
+// Button latch state — set by input queue event processing, consumed by mouse handler
+static volatile bool g_wmBtnLatch        = false;
+static volatile bool g_wmBtnReleaseLatch = false;
+
 // WM-mode compositor loop: wallpaper → windows (z-ordered) → chrome → cursor.
 static void CompositorLoopWM()
 {
@@ -611,15 +615,39 @@ static void CompositorLoopWM()
                         g_physFbWidth, g_physFbHeight, now);
         uint32_t tbY = g_physFbHeight - WM_TASKBAR_HEIGHT;
         MarkDirtyRows(tbY, g_physFbHeight);
+
+        // Render launcher popup over everything if open
+        if (WmLauncherVisible())
+        {
+            WmLauncherRender(g_backBuffer, g_backBufStride,
+                             g_physFbWidth, g_physFbHeight);
+            // Mark the launcher area dirty (it's above the taskbar)
+            MarkDirtyRows(0, g_physFbHeight);
+        }
     }
 
-    // 4. Handle mouse interaction
+    // 4. Handle mouse interaction (position + latched clicks)
     CompositorHandleMouseWM();
 
-    // 5. Route keyboard input to focused window
+    // 5. Route input events (keyboard + mouse buttons)
+    // Mouse button events are latched so CompositorHandleMouseWM picks them up
+    // even if press+release both happen between compositor frames.
     InputEvent ev;
     while (InputPollEvent(&ev))
     {
+        if (ev.type == InputEventType::MouseButtonDown && ev.scanCode == 0)
+        {
+            g_wmBtnLatch = true;
+            continue;
+        }
+        if (ev.type == InputEventType::MouseButtonUp && ev.scanCode == 0)
+        {
+            g_wmBtnReleaseLatch = true;
+            continue;
+        }
+        if (ev.type == InputEventType::MouseMove)
+            continue;
+
         if (ev.type != InputEventType::KeyPress) continue;
 
         DbgPrintf("KEY: scan=0x%02x ascii=0x%02x\n", ev.scanCode, ev.ascii);
@@ -751,14 +779,55 @@ static void CompositorHandleMouseWM()
 
     int32_t mx, my;
     MouseGetPosition(&mx, &my);
-    uint8_t buttons = MouseGetButtons();
-    bool btnDown = (buttons & 0x01) != 0; // left button
+
+    // Determine button state. Use latched press/release from input queue
+    // to survive fast press+release cycles between compositor frames.
+    // Also check polled state for held buttons (drag operations).
+    uint8_t polledButtons = MouseGetButtons();
+    bool btnDown = (polledButtons & 0x01) != 0;
+
+    // If a press was latched, treat as button down regardless of current state
+    if (g_wmBtnLatch)
+    {
+        btnDown = true;
+        g_wmBtnLatch = false;
+    }
 
     if (btnDown && !g_wmLastBtnDown)
     {
+        SerialPrintf("WM: click at (%d,%d)\n", mx, my);
+        // If launcher is open, check launcher panel first
+        if (WmLauncherVisible())
+        {
+            int launcherIdx = WmLauncherHitTest(mx, my, g_physFbWidth, g_physFbHeight);
+            if (launcherIdx >= 0)
+            {
+                WmLauncherExec(launcherIdx);
+                g_wmLastBtnDown = btnDown;
+                return;
+            }
+            // Check if clicking the Apps button again (toggle off)
+            int tbIdx = WmTaskbarHitTest(mx, my, g_physFbWidth, g_physFbHeight);
+            if (tbIdx == -3)
+            {
+                WmLauncherToggle();
+                g_wmLastBtnDown = btnDown;
+                return;
+            }
+            // Clicked elsewhere — close launcher
+            WmLauncherToggle();
+            g_wmLastBtnDown = btnDown;
+            return;
+        }
+
         // Check taskbar first
         int tbIdx = WmTaskbarHitTest(mx, my, g_physFbWidth, g_physFbHeight);
-        if (tbIdx == -2)
+        if (tbIdx == -3)
+        {
+            // "Apps" button — toggle launcher
+            WmLauncherToggle();
+        }
+        else if (tbIdx == -2)
         {
             // "+" button — spawn new terminal
             WmSpawnTerminal();

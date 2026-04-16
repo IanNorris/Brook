@@ -100,6 +100,7 @@ EXPORT_SYMBOL(PciEnableMemSpace);
 EXPORT_SYMBOL(PciConfigRead32);
 EXPORT_SYMBOL(PciConfigRead16);
 EXPORT_SYMBOL(PciConfigRead8);
+EXPORT_SYMBOL(PciConfigWrite16);
 
 // Display
 EXPORT_SYMBOL(DisplayRegister);
