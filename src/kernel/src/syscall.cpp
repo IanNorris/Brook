@@ -4350,6 +4350,51 @@ static int64_t sys_fallocate(uint64_t, uint64_t, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
+// sys_mincore (27) — check if pages are resident (stub: all resident)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_mincore(uint64_t addr, uint64_t length, uint64_t vecAddr,
+                            uint64_t, uint64_t, uint64_t)
+{
+    (void)addr;
+    if (!vecAddr) return -EFAULT;
+    auto* vec = reinterpret_cast<uint8_t*>(vecAddr);
+    uint64_t pages = (length + 4095) / 4096;
+    for (uint64_t i = 0; i < pages; ++i)
+        vec[i] = 1; // all pages resident
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// sys_madvise (28) — memory advice (stub: succeed)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_madvise(uint64_t, uint64_t, uint64_t,
+                            uint64_t, uint64_t, uint64_t)
+{
+    return 0; // no-op
+}
+
+// ---------------------------------------------------------------------------
+// sys_pwrite64 (18) — write at offset without changing file position
+// ---------------------------------------------------------------------------
+
+static int64_t sys_pwrite64(uint64_t fd, uint64_t bufAddr, uint64_t count,
+                             uint64_t offset, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+    FdEntry* fde = FdGet(proc, static_cast<int>(fd));
+    if (!fde) return -EBADF;
+    if (fde->type != FdType::Vnode || !fde->handle) return -EINVAL;
+
+    auto* vn = static_cast<Vnode*>(fde->handle);
+    const void* buf = reinterpret_cast<const void*>(bufAddr);
+    uint64_t off = offset;
+    return VfsWrite(vn, buf, count, &off);
+}
+
+// ---------------------------------------------------------------------------
 // sys_link (86) — create hard link
 // ---------------------------------------------------------------------------
 
@@ -5570,6 +5615,9 @@ void SyscallTableInit()
     g_syscallTable[SYS_FALLOCATE]       = sys_fallocate;
     g_syscallTable[SYS_RENAMEAT2]       = sys_renameat2;
     g_syscallTable[SYS_STATX]           = sys_statx;
+    g_syscallTable[SYS_MINCORE]         = sys_mincore;
+    g_syscallTable[SYS_MADVISE]         = sys_madvise;
+    g_syscallTable[SYS_PWRITE64]        = sys_pwrite64;
 
     // Socket syscalls
     g_syscallTable[SYS_SOCKET]          = sys_socket;
@@ -5689,6 +5737,8 @@ static const char* SyscallName(uint64_t num)
     case 265: return "linkat";    case 268: return "fchmodat";
     case 280: return "utimensat"; case 285: return "fallocate";
     case 316: return "renameat2"; case 332: return "statx";
+    case 18: return "pwrite64"; case 27: return "mincore";
+    case 28: return "madvise";
     default: return nullptr;
     }
 }
