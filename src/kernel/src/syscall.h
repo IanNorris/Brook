@@ -109,6 +109,29 @@ static constexpr uint64_t SYS_ALARM           = 37;
 static constexpr uint64_t SYS_PAUSE           = 34;
 static constexpr uint64_t SYS_RT_SIGSUSPEND   = 130;
 
+// Nix package manager syscalls
+static constexpr uint64_t SYS_FLOCK           = 73;
+static constexpr uint64_t SYS_TRUNCATE        = 76;
+static constexpr uint64_t SYS_FTRUNCATE       = 77;
+static constexpr uint64_t SYS_LINK            = 86;
+static constexpr uint64_t SYS_CHMOD           = 90;
+static constexpr uint64_t SYS_FCHMOD          = 91;
+static constexpr uint64_t SYS_CHOWN           = 92;
+static constexpr uint64_t SYS_FCHOWN          = 93;
+static constexpr uint64_t SYS_LCHOWN          = 94;
+static constexpr uint64_t SYS_SCHED_SETAFFINITY = 203;
+static constexpr uint64_t SYS_SCHED_GETAFFINITY = 204;
+static constexpr uint64_t SYS_MKDIRAT         = 258;
+static constexpr uint64_t SYS_FCHOWNAT        = 260;
+static constexpr uint64_t SYS_UNLINKAT        = 263;
+static constexpr uint64_t SYS_RENAMEAT        = 264;
+static constexpr uint64_t SYS_LINKAT          = 265;
+static constexpr uint64_t SYS_FCHMODAT        = 268;
+static constexpr uint64_t SYS_UTIMENSAT       = 280;
+static constexpr uint64_t SYS_FALLOCATE       = 285;
+static constexpr uint64_t SYS_RENAMEAT2       = 316;
+static constexpr uint64_t SYS_STATX           = 332;
+
 // Socket syscalls
 static constexpr uint64_t SYS_SOCKET          = 41;
 static constexpr uint64_t SYS_CONNECT         = 42;

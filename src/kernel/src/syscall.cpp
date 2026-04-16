@@ -4090,8 +4090,275 @@ static int64_t sys_mkdir(uint64_t pathAddr, uint64_t, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
-// sys_sigaltstack (131) — alternate signal stack
+// sys_mkdirat (258) — create a directory relative to dirfd
 // ---------------------------------------------------------------------------
+
+static int64_t sys_mkdirat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
+                            uint64_t, uint64_t, uint64_t)
+{
+    (void)dirfd; (void)mode;
+    // AT_FDCWD or absolute path: delegate to sys_mkdir
+    return sys_mkdir(pathAddr, mode, 0, 0, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// sys_unlinkat (263) — unlink file or rmdir relative to dirfd
+// ---------------------------------------------------------------------------
+
+static int64_t sys_unlinkat(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
+                             uint64_t, uint64_t, uint64_t)
+{
+    (void)dirfd;
+    // TODO: handle AT_REMOVEDIR (0x200) for rmdir
+    (void)flags;
+    return sys_unlink(pathAddr, 0, 0, 0, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// sys_renameat / sys_renameat2 (264 / 316)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_renameat(uint64_t olddirfd, uint64_t oldAddr,
+                             uint64_t newdirfd, uint64_t newAddr,
+                             uint64_t, uint64_t)
+{
+    (void)olddirfd; (void)newdirfd;
+    return sys_rename(oldAddr, newAddr, 0, 0, 0, 0);
+}
+
+static int64_t sys_renameat2(uint64_t olddirfd, uint64_t oldAddr,
+                              uint64_t newdirfd, uint64_t newAddr,
+                              uint64_t flags, uint64_t)
+{
+    (void)flags; // RENAME_NOREPLACE etc.
+    return sys_renameat(olddirfd, oldAddr, newdirfd, newAddr, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// sys_linkat (265) — create hard link
+// ---------------------------------------------------------------------------
+
+static int64_t sys_linkat(uint64_t olddirfd, uint64_t oldAddr,
+                           uint64_t newdirfd, uint64_t newAddr,
+                           uint64_t flags, uint64_t)
+{
+    (void)olddirfd; (void)newdirfd; (void)flags;
+    // Hard links not supported yet — return EPERM
+    (void)oldAddr; (void)newAddr;
+    return -EPERM;
+}
+
+// ---------------------------------------------------------------------------
+// sys_ftruncate (77) / sys_truncate (76) — change file size
+// ---------------------------------------------------------------------------
+
+static int64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t,
+                              uint64_t, uint64_t, uint64_t)
+{
+    (void)fd; (void)length;
+    // TODO: implement VfsTruncate properly
+    // For now, succeed silently — Nix uses this for DB journal files
+    return 0;
+}
+
+static int64_t sys_truncate(uint64_t pathAddr, uint64_t length, uint64_t,
+                             uint64_t, uint64_t, uint64_t)
+{
+    (void)pathAddr; (void)length;
+    return 0; // stub
+}
+
+// ---------------------------------------------------------------------------
+// sys_flock (73) — advisory file locking (stub: always succeeds)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_flock(uint64_t fd, uint64_t operation, uint64_t,
+                          uint64_t, uint64_t, uint64_t)
+{
+    (void)fd; (void)operation;
+    // Advisory locking — with a single-user OS, always succeed
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// sys_chmod (90) / sys_fchmod (91) / sys_fchmodat (268)
+// — stub: succeed silently (no permission model yet)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_chmod(uint64_t, uint64_t, uint64_t,
+                          uint64_t, uint64_t, uint64_t)
+{
+    return 0; // no-op
+}
+
+static int64_t sys_fchmod(uint64_t, uint64_t, uint64_t,
+                           uint64_t, uint64_t, uint64_t)
+{
+    return 0; // no-op
+}
+
+static int64_t sys_fchmodat(uint64_t, uint64_t, uint64_t,
+                             uint64_t, uint64_t, uint64_t)
+{
+    return 0; // no-op
+}
+
+// ---------------------------------------------------------------------------
+// sys_chown (92) / sys_fchown (93) / sys_lchown (94) / sys_fchownat (260)
+// — stub: succeed silently (no user model yet)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_chown(uint64_t, uint64_t, uint64_t,
+                          uint64_t, uint64_t, uint64_t)
+{
+    return 0; // no-op
+}
+
+static int64_t sys_fchown(uint64_t, uint64_t, uint64_t,
+                           uint64_t, uint64_t, uint64_t)
+{
+    return 0; // no-op
+}
+
+static int64_t sys_lchown(uint64_t, uint64_t, uint64_t,
+                           uint64_t, uint64_t, uint64_t)
+{
+    return 0; // no-op
+}
+
+static int64_t sys_fchownat(uint64_t, uint64_t, uint64_t,
+                             uint64_t, uint64_t, uint64_t)
+{
+    return 0; // no-op
+}
+
+// ---------------------------------------------------------------------------
+// sys_utimensat (280) — change file timestamps (stub: succeed)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_utimensat(uint64_t, uint64_t, uint64_t,
+                              uint64_t, uint64_t, uint64_t)
+{
+    return 0; // no-op — we don't track file timestamps yet
+}
+
+// ---------------------------------------------------------------------------
+// sys_sched_getaffinity (204) — get CPU affinity mask
+// ---------------------------------------------------------------------------
+
+static int64_t sys_sched_getaffinity(uint64_t pid, uint64_t cpusetsize,
+                                      uint64_t maskAddr, uint64_t, uint64_t, uint64_t)
+{
+    (void)pid;
+    if (!maskAddr) return -EFAULT;
+    if (cpusetsize < 8) return -EINVAL;
+
+    // Report all 8 CPUs available
+    auto* mask = reinterpret_cast<uint64_t*>(maskAddr);
+    *mask = 0xFF; // 8 CPUs
+    return 8; // size of mask in bytes
+}
+
+// ---------------------------------------------------------------------------
+// sys_sched_setaffinity (203) — set CPU affinity mask (stub: succeed)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_sched_setaffinity(uint64_t, uint64_t, uint64_t,
+                                      uint64_t, uint64_t, uint64_t)
+{
+    return 0; // no-op
+}
+
+// ---------------------------------------------------------------------------
+// sys_statx (332) — extended stat
+// ---------------------------------------------------------------------------
+
+struct linux_statx_timestamp {
+    int64_t  tv_sec;
+    uint32_t tv_nsec;
+    int32_t  pad;
+};
+
+struct linux_statx {
+    uint32_t stx_mask;
+    uint32_t stx_blksize;
+    uint64_t stx_attributes;
+    uint32_t stx_nlink;
+    uint32_t stx_uid;
+    uint32_t stx_gid;
+    uint16_t stx_mode;
+    uint16_t pad1;
+    uint64_t stx_ino;
+    uint64_t stx_size;
+    uint64_t stx_blocks;
+    uint64_t stx_attributes_mask;
+    linux_statx_timestamp stx_atime;
+    linux_statx_timestamp stx_btime;
+    linux_statx_timestamp stx_ctime;
+    linux_statx_timestamp stx_mtime;
+    uint32_t stx_rdev_major;
+    uint32_t stx_rdev_minor;
+    uint32_t stx_dev_major;
+    uint32_t stx_dev_minor;
+    uint64_t stx_mnt_id;
+    uint64_t pad2[13];
+};
+
+static int64_t sys_statx(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
+                          uint64_t mask, uint64_t bufAddr, uint64_t)
+{
+    (void)dirfd; (void)flags; (void)mask;
+    const char* path = reinterpret_cast<const char*>(pathAddr);
+    auto* stx = reinterpret_cast<linux_statx*>(bufAddr);
+    if (!path || !stx) return -EFAULT;
+
+    // Use VFS stat
+    Vnode* vn = VfsOpen(path);
+    if (!vn) return -ENOENT;
+
+    VnodeStat st;
+    int ret = VfsStat(vn, &st);
+    VfsClose(vn);
+    if (ret != 0) return -EIO;
+
+    // Zero-fill then populate
+    auto* raw = reinterpret_cast<uint8_t*>(stx);
+    for (uint64_t i = 0; i < sizeof(linux_statx); i++) raw[i] = 0;
+
+    stx->stx_mask = 0x7FF; // STATX_BASIC_STATS
+    stx->stx_blksize = 4096;
+    stx->stx_nlink = 1;
+    // Derive mode from stat info
+    uint16_t mode = st.isDir ? 0040755 : 0100644;
+    if (st.isSymlink) mode = 0120777;
+    stx->stx_mode = mode;
+    stx->stx_ino = 1; // placeholder
+    stx->stx_size = st.size;
+    stx->stx_blocks = (st.size + 511) / 512;
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// sys_fallocate (285) — allocate file space (stub: succeed)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_fallocate(uint64_t, uint64_t, uint64_t,
+                              uint64_t, uint64_t, uint64_t)
+{
+    return 0; // no-op for now
+}
+
+// ---------------------------------------------------------------------------
+// sys_link (86) — create hard link
+// ---------------------------------------------------------------------------
+
+static int64_t sys_link(uint64_t oldAddr, uint64_t newAddr, uint64_t,
+                         uint64_t, uint64_t, uint64_t)
+{
+    (void)oldAddr; (void)newAddr;
+    return -EPERM; // hard links not supported
+}
 
 // Linux sigaltstack constants
 static constexpr int SS_ONSTACK  = 1;
@@ -5281,6 +5548,29 @@ void SyscallTableInit()
     g_syscallTable[SYS_RSEQ]            = sys_rseq;
     g_syscallTable[SYS_FACCESSAT2]      = sys_faccessat2;
 
+    // Nix package manager syscalls
+    g_syscallTable[SYS_FLOCK]           = sys_flock;
+    g_syscallTable[SYS_TRUNCATE]        = sys_truncate;
+    g_syscallTable[SYS_FTRUNCATE]       = sys_ftruncate;
+    g_syscallTable[SYS_LINK]            = sys_link;
+    g_syscallTable[SYS_CHMOD]           = sys_chmod;
+    g_syscallTable[SYS_FCHMOD]          = sys_fchmod;
+    g_syscallTable[SYS_CHOWN]           = sys_chown;
+    g_syscallTable[SYS_FCHOWN]          = sys_fchown;
+    g_syscallTable[SYS_LCHOWN]          = sys_lchown;
+    g_syscallTable[SYS_SCHED_SETAFFINITY] = sys_sched_setaffinity;
+    g_syscallTable[SYS_SCHED_GETAFFINITY] = sys_sched_getaffinity;
+    g_syscallTable[SYS_MKDIRAT]         = sys_mkdirat;
+    g_syscallTable[SYS_FCHOWNAT]        = sys_fchownat;
+    g_syscallTable[SYS_UNLINKAT]        = sys_unlinkat;
+    g_syscallTable[SYS_RENAMEAT]        = sys_renameat;
+    g_syscallTable[SYS_LINKAT]          = sys_linkat;
+    g_syscallTable[SYS_FCHMODAT]        = sys_fchmodat;
+    g_syscallTable[SYS_UTIMENSAT]       = sys_utimensat;
+    g_syscallTable[SYS_FALLOCATE]       = sys_fallocate;
+    g_syscallTable[SYS_RENAMEAT2]       = sys_renameat2;
+    g_syscallTable[SYS_STATX]           = sys_statx;
+
     // Socket syscalls
     g_syscallTable[SYS_SOCKET]          = sys_socket;
     g_syscallTable[SYS_CONNECT]         = sys_connect;
@@ -5388,6 +5678,17 @@ static const char* SyscallName(uint64_t num)
     case 293: return "pipe2";     case 302: return "rseq";
     case 318: return "getrandom"; case 334: return "faccessat";
     case 439: return "faccessat2";
+    case 73: return "flock";      case 76: return "truncate";
+    case 77: return "ftruncate";  case 86: return "link";
+    case 90: return "chmod";      case 91: return "fchmod";
+    case 92: return "chown";      case 93: return "fchown";
+    case 94: return "lchown";
+    case 203: return "sched_setaffinity"; case 204: return "sched_getaffinity";
+    case 258: return "mkdirat";   case 260: return "fchownat";
+    case 263: return "unlinkat";  case 264: return "renameat";
+    case 265: return "linkat";    case 268: return "fchmodat";
+    case 280: return "utimensat"; case 285: return "fallocate";
+    case 316: return "renameat2"; case 332: return "statx";
     default: return nullptr;
     }
 }
