@@ -1,0 +1,2 @@
+# Brook OS — glibc hello test
+run --strace /nix/store/10s5j3mfdg22k1597x580qrhprnzcjwb-hello-2.12.3/bin/hello

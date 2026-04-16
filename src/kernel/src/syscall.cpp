@@ -1407,7 +1407,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     auto* vn = static_cast<Vnode*>(fde->handle);
     uint64_t readOff = offset;
 
-    // Read file data into a kernel-side buffer then copy through direct map
+    // Read file data page by page through the direct map.
     uint64_t bytesLeft = length;
     uint64_t dstOff = 0;
     while (bytesLeft > 0)
@@ -1415,12 +1415,40 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         uint64_t chunk = (bytesLeft > 4096) ? 4096 : bytesLeft;
         uint64_t userVA = vaddr + dstOff;
         PhysicalAddress phys = VmmVirtToPhys(proc->pageTable,
-                                             VirtualAddress(userVA));
+                                             VirtualAddress(userVA & ~0xFFFULL));
         if (!phys) break;
+        uint64_t pageOff = dstOff & 0xFFF;
         auto* kp = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
-        VfsRead(vn, kp, chunk, &readOff);
-        dstOff += chunk;
-        bytesLeft -= chunk;
+        kp = reinterpret_cast<uint8_t*>(
+            reinterpret_cast<uint64_t>(kp) & ~0xFFFULL);
+        if (chunk > 4096 - pageOff) chunk = 4096 - pageOff;
+        int got = VfsRead(vn, kp + pageOff, chunk, &readOff);
+        if (got <= 0) break;
+        dstOff += static_cast<uint64_t>(got);
+        bytesLeft -= static_cast<uint64_t>(got);
+    }
+
+    // Diagnostic: for the code segment mmap (offset=0x28000), verify data
+    // at the offset where the crash occurs (VA offset 0x179FD7 from vaddr).
+    if (offset == 0x28000 && length > 0x179FD7)
+    {
+        SerialPrintf("mmap DIAG: vaddr=0x%lx addr=0x%lx offset=0x%lx len=%lu pages=%lu flags=0x%lx\n",
+                     vaddr, addr, offset, length, pages, flags);
+        uint64_t checkVA = vaddr + 0x179FD7;
+        PhysicalAddress cp = VmmVirtToPhys(proc->pageTable,
+                                           VirtualAddress(checkVA & ~0xFFFULL));
+        if (cp) {
+            auto* ck = reinterpret_cast<uint8_t*>(PhysToVirt(cp).raw());
+            ck = reinterpret_cast<uint8_t*>(
+                reinterpret_cast<uint64_t>(ck) & ~0xFFFULL);
+            uint64_t po = checkVA & 0xFFF;
+            SerialPrintf("mmap VERIFY @VA 0x%lx (off=0x%lx): "
+                         "%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                         checkVA, offset + 0x179FD7,
+                         ck[po], ck[po+1], ck[po+2], ck[po+3],
+                         ck[po+4], ck[po+5], ck[po+6], ck[po+7]);
+            // Expected: 69 09 00 00 4d 89 cb 48
+        }
     }
 
     return static_cast<int64_t>(vaddr);
@@ -5722,9 +5750,9 @@ static const char* SyscallName(uint64_t num)
     case 234: return "tgkill";    case 257: return "openat";
     case 262: return "newfstatat"; case 266: return "symlinkat"; case 267: return "readlinkat";
     case 270: return "pselect6";  case 271: return "ppoll";     case 273: return "set_robust_list";
-    case 289: return "prlimit64"; case 292: return "dup3";
-    case 293: return "pipe2";     case 302: return "rseq";
-    case 318: return "getrandom"; case 334: return "faccessat";
+    case 292: return "dup3";
+    case 293: return "pipe2";     case 302: return "prlimit64";
+    case 318: return "getrandom"; case 334: return "rseq";
     case 439: return "faccessat2";
     case 73: return "flock";      case 76: return "truncate";
     case 77: return "ftruncate";  case 86: return "link";

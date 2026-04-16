@@ -204,6 +204,11 @@ static void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interrupted
 // (KernelCpuEnv at gs:0) is accessible throughout the handler.
 // Passes the interrupted RIP (rdi) and CS (rsi) to the inner handler for
 // profiler sampling.
+//
+// IMPORTANT: The inner handler (and anything it calls, e.g. the scheduler)
+// may clobber XMM registers.  We must save and restore the full FPU/SSE
+// state so that user-space code (especially glibc, which uses SSE heavily
+// for memset/memcpy/strcmp) is not corrupted.
 __attribute__((naked))
 static void LapicTimerHandler(void)
 {
@@ -225,20 +230,35 @@ static void LapicTimerHandler(void)
         "push %%r10\n\t"
         "push %%r11\n\t"
 
-        // Stack layout after 9 pushes (72 bytes):
-        //   RSP+72  = interrupted RIP  (CPU-pushed interrupt frame)
-        //   RSP+80  = interrupted CS
-        //   RSP+88  = interrupted RFLAGS
-        //   RSP+96  = interrupted RSP
-        //   RSP+104 = interrupted SS
-        // Load RIP→RDI (arg1), CS→RSI (arg2), RBP→RDX (arg3).
-        // RBP is callee-saved, so it still holds the interrupted value.
-        "movq 72(%%rsp), %%rdi\n\t"
-        "movq 80(%%rsp), %%rsi\n\t"
-        "movq %%rbp, %%rdx\n\t"
+        // Save FPU/SSE state (512 bytes, must be 16-byte aligned).
+        // After 9 pushes (72 bytes) + CPU frame (40 bytes for ring-3 or
+        // 24 bytes for ring-0), RSP may not be 16-byte aligned.
+        // Align down, save original RSP, then fxsave.
+        "movq %%rsp, %%rax\n\t"         // save original RSP
+        "subq $512, %%rsp\n\t"          // reserve 512 bytes for fxsave
+        "andq $-16, %%rsp\n\t"          // 16-byte align
+        "fxsave (%%rsp)\n\t"
+        "push %%rax\n\t"                // save original RSP below fxsave area
+
+        // Stack layout after 9 pushes (72 bytes) + fxsave:
+        //   RSP+0       = saved original RSP (before fxsave alloc)
+        //   RSP+8       = fxsave area (512 bytes, 16-byte aligned)
+        //   ... (GPRs)
+        //   (original RSP)+72  = interrupted RIP
+        //   (original RSP)+80  = interrupted CS
+        // Load from saved original RSP.
+        "movq (%%rsp), %%rax\n\t"       // rax = original RSP after GPR pushes
+        "movq 72(%%rax), %%rdi\n\t"     // arg1 = interrupted RIP
+        "movq 80(%%rax), %%rsi\n\t"     // arg2 = interrupted CS
+        "movq %%rbp, %%rdx\n\t"         // arg3 = interrupted RBP
 
         "cld\n\t"
         "call %P0\n\t"
+
+        // Restore FPU/SSE state
+        "pop %%rax\n\t"                 // rax = original RSP after GPR pushes
+        "fxrstor (%%rsp)\n\t"
+        "movq %%rax, %%rsp\n\t"         // restore RSP to after GPR pushes
 
         // Restore GPRs
         "pop %%r11\n\t"

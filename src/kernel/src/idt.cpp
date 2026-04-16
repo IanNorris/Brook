@@ -102,6 +102,11 @@ static inline uint8_t ExcInb(uint16_t port)
     return ret;
 }
 
+// Atomic spinlock to prevent exception output from interleaving with
+// normal serial writes from other CPUs.  Force-resets the normal serial
+// ticket lock so the exception handler can write without deadlock.
+extern "C" void ExcForceSerialLock();
+
 static void ExcPutCharRaw(char c)
 {
     if (c == '\n') {
@@ -215,6 +220,7 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
     // of va_list ABI issues or format buffer corruption.
     // Every line is prefixed with [CN] so interleaved output from multiple
     // CPUs is still parseable.
+    ExcForceSerialLock();
     ExcPutsRaw("\n"); ExcPutsRaw(cpuTag); ExcPutsRaw("=== EXCEPTION ===\n");
     ExcPutsRaw(cpuTag); ExcPutsRaw("Vector: ");
     {
@@ -264,6 +270,60 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
             ExcPutsRaw("]");
         }
         ExcPutsRaw("\n");
+    }
+
+    // For #GP in user mode, dump bytes at the faulting RIP via direct map.
+    if (vector == 13 && fromUser)
+    {
+        static constexpr uint64_t DMAP_USR = 0xFFFF800000000000ULL;
+        uint64_t cr3val;
+        __asm__ volatile("movq %%cr3, %0" : "=r"(cr3val));
+        cr3val &= 0x000FFFFFFFFFF000ULL;
+
+        uint64_t ripAddr = frame->ip;
+        // Walk page tables to get physical address of RIP page
+        uint64_t* pml4 = reinterpret_cast<uint64_t*>(DMAP_USR + cr3val);
+        uint64_t pml4e = pml4[(ripAddr >> 39) & 0x1FF];
+        if (pml4e & 1) {
+            uint64_t* pdpt = reinterpret_cast<uint64_t*>(DMAP_USR + (pml4e & 0x000FFFFFFFFFF000ULL));
+            uint64_t pdpte = pdpt[(ripAddr >> 30) & 0x1FF];
+            if (pdpte & 1) {
+                uint64_t* pd = reinterpret_cast<uint64_t*>(DMAP_USR + (pdpte & 0x000FFFFFFFFFF000ULL));
+                uint64_t pde = pd[(ripAddr >> 21) & 0x1FF];
+                if ((pde & 1) && !(pde & (1ULL << 7))) {
+                    uint64_t* pt = reinterpret_cast<uint64_t*>(DMAP_USR + (pde & 0x000FFFFFFFFFF000ULL));
+                    uint64_t pte = pt[(ripAddr >> 12) & 0x1FF];
+                    ExcPutsRaw(cpuTag); ExcPutsRaw("  RIP PTE "); ExcPutHex(pte); ExcPutsRaw("\n");
+                    if (pte & 1) {
+                        uint64_t physPage = pte & 0x000FFFFFFFFFF000ULL;
+                        uint64_t pageOff = ripAddr & 0xFFF;
+                        uint8_t* kPtr = reinterpret_cast<uint8_t*>(DMAP_USR + physPage + pageOff);
+                        // Dump 32 bytes at RIP
+                        ExcPutsRaw(cpuTag); ExcPutsRaw("  CODE@RIP: ");
+                        for (int i = 0; i < 32 && (pageOff + i) < 4096; ++i) {
+                            uint8_t b = kPtr[i];
+                            const char hex[] = "0123456789ABCDEF";
+                            ExcPutCharRaw(hex[b >> 4]);
+                            ExcPutCharRaw(hex[b & 0xF]);
+                            ExcPutCharRaw(' ');
+                        }
+                        ExcPutsRaw("\n");
+                        // Also dump 16 bytes BEFORE RIP for context
+                        if (pageOff >= 16) {
+                            ExcPutsRaw(cpuTag); ExcPutsRaw("  CODE@RIP-16: ");
+                            for (int i = -16; i < 0; ++i) {
+                                uint8_t b = kPtr[i];
+                                const char hex[] = "0123456789ABCDEF";
+                                ExcPutCharRaw(hex[b >> 4]);
+                                ExcPutCharRaw(hex[b & 0xF]);
+                                ExcPutCharRaw(' ');
+                            }
+                            ExcPutsRaw("\n");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // For page faults, walk the page table hierarchy to diagnose the mapping.
@@ -551,6 +611,123 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
     }
 
     // --- User-mode fault ---
+
+    // For #GP, dump all GPRs so we can diagnose alignment / register issues.
+    if (vector == 13)
+    {
+        ExcForceSerialLock();
+        ExcPutsRaw("\n[GP] User #GP — full register dump:\n");
+        ExcPutsRaw("  RIP "); ExcPutHex(ef->rip); ExcPutsRaw("\n");
+        ExcPutsRaw("  RSP "); ExcPutHex(ef->rsp); ExcPutsRaw("\n");
+        ExcPutsRaw("  RDI "); ExcPutHex(ef->rdi); ExcPutsRaw("\n");
+        ExcPutsRaw("  RSI "); ExcPutHex(ef->rsi); ExcPutsRaw("\n");
+        ExcPutsRaw("  RAX "); ExcPutHex(ef->rax); ExcPutsRaw("\n");
+        ExcPutsRaw("  RCX "); ExcPutHex(ef->rcx); ExcPutsRaw("\n");
+        ExcPutsRaw("  RDX "); ExcPutHex(ef->rdx); ExcPutsRaw("\n");
+        ExcPutsRaw("  RBX "); ExcPutHex(ef->rbx); ExcPutsRaw("\n");
+        ExcPutsRaw("  RBP "); ExcPutHex(ef->rbp); ExcPutsRaw("\n");
+        ExcPutsRaw("  R8  "); ExcPutHex(ef->r8);  ExcPutsRaw("\n");
+        ExcPutsRaw("  R9  "); ExcPutHex(ef->r9);  ExcPutsRaw("\n");
+        ExcPutsRaw("  R10 "); ExcPutHex(ef->r10); ExcPutsRaw("\n");
+        ExcPutsRaw("  R11 "); ExcPutHex(ef->r11); ExcPutsRaw("\n");
+        ExcPutsRaw("  R12 "); ExcPutHex(ef->r12); ExcPutsRaw("\n");
+        ExcPutsRaw("  R13 "); ExcPutHex(ef->r13); ExcPutsRaw("\n");
+        ExcPutsRaw("  R14 "); ExcPutHex(ef->r14); ExcPutsRaw("\n");
+        ExcPutsRaw("  R15 "); ExcPutHex(ef->r15); ExcPutsRaw("\n");
+        ExcPutsRaw("  ERR "); ExcPutHex(ef->errorCode); ExcPutsRaw("\n");
+
+        // Dump code bytes at RIP via direct map
+        static constexpr uint64_t DMAP_USR = 0xFFFF800000000000ULL;
+        uint64_t cr3val;
+        __asm__ volatile("movq %%cr3, %0" : "=r"(cr3val));
+        cr3val &= 0x000FFFFFFFFFF000ULL;
+        uint64_t ripAddr = ef->rip;
+        uint64_t* pml4 = reinterpret_cast<uint64_t*>(DMAP_USR + cr3val);
+        uint64_t pml4e = pml4[(ripAddr >> 39) & 0x1FF];
+        if (pml4e & 1) {
+            uint64_t* pdpt = reinterpret_cast<uint64_t*>(DMAP_USR + (pml4e & 0x000FFFFFFFFFF000ULL));
+            uint64_t pdpte = pdpt[(ripAddr >> 30) & 0x1FF];
+            if (pdpte & 1) {
+                uint64_t* pd = reinterpret_cast<uint64_t*>(DMAP_USR + (pdpte & 0x000FFFFFFFFFF000ULL));
+                uint64_t pde = pd[(ripAddr >> 21) & 0x1FF];
+                if ((pde & 1) && !(pde & (1ULL << 7))) {
+                    uint64_t* pt = reinterpret_cast<uint64_t*>(DMAP_USR + (pde & 0x000FFFFFFFFFF000ULL));
+                    uint64_t pte = pt[(ripAddr >> 12) & 0x1FF];
+                    if (pte & 1) {
+                        uint64_t physPage = pte & 0x000FFFFFFFFFF000ULL;
+                        uint64_t pageOff = ripAddr & 0xFFF;
+                        uint8_t* kPtr = reinterpret_cast<uint8_t*>(DMAP_USR + physPage + pageOff);
+                        ExcPutsRaw("  CODE@RIP: ");
+                        for (int i = -16; i < 32 && (pageOff + i) < 4096 && (pageOff + i) >= 0; ++i) {
+                            if (i == 0) ExcPutsRaw(">> ");
+                            uint8_t b = kPtr[i];
+                            const char hex[] = "0123456789ABCDEF";
+                            ExcPutCharRaw(hex[b >> 4]);
+                            ExcPutCharRaw(hex[b & 0xF]);
+                            ExcPutCharRaw(' ');
+                        }
+                        ExcPutsRaw("\n");
+                    }
+                }
+            }
+        }
+        // Dump DOOM hash table diagnostics.
+        // lumphash ptr is at user VA 0x2a96d8, lumpinfo ptr at 0x2a96d0.
+        // Read via page table walk + direct map.
+        auto readUser64 = [&](uint64_t uva) -> uint64_t {
+            uint64_t* p4 = reinterpret_cast<uint64_t*>(DMAP_USR + cr3val);
+            uint64_t e4 = p4[(uva >> 39) & 0x1FF];
+            if (!(e4 & 1)) return 0xDEAD1;
+            uint64_t* p3 = reinterpret_cast<uint64_t*>(DMAP_USR + (e4 & 0x000FFFFFFFFFF000ULL));
+            uint64_t e3 = p3[(uva >> 30) & 0x1FF];
+            if (!(e3 & 1)) return 0xDEAD2;
+            uint64_t* p2 = reinterpret_cast<uint64_t*>(DMAP_USR + (e3 & 0x000FFFFFFFFFF000ULL));
+            uint64_t e2 = p2[(uva >> 21) & 0x1FF];
+            if (!(e2 & 1)) return 0xDEAD3;
+            if (e2 & (1ULL << 7)) { // 2MB page
+                uint64_t phys = (e2 & 0x000FFFFFFFE00000ULL) | (uva & 0x1FFFFFULL);
+                return *reinterpret_cast<uint64_t*>(DMAP_USR + phys);
+            }
+            uint64_t* p1 = reinterpret_cast<uint64_t*>(DMAP_USR + (e2 & 0x000FFFFFFFFFF000ULL));
+            uint64_t e1 = p1[(uva >> 12) & 0x1FF];
+            if (!(e1 & 1)) return 0xDEAD4;
+            uint64_t phys = (e1 & 0x000FFFFFFFFFF000ULL) | (uva & 0xFFF);
+            return *reinterpret_cast<uint64_t*>(DMAP_USR + phys);
+        };
+
+        uint64_t lumphashPtr = readUser64(0x2a96d8);
+        uint64_t lumpinfoPtr = readUser64(0x2a96d0);
+        uint64_t numlumps    = readUser64(0x2a96c8) & 0xFFFFFFFF;
+        ExcPutsRaw("  lumphash="); ExcPutHex(lumphashPtr); ExcPutsRaw("\n");
+        ExcPutsRaw("  lumpinfo="); ExcPutHex(lumpinfoPtr); ExcPutsRaw("\n");
+        ExcPutsRaw("  numlumps="); ExcPutHex(numlumps);    ExcPutsRaw("\n");
+
+        // Scan hash table for the bad entry
+        if (lumphashPtr > 0x10000000ULL && lumphashPtr < 0x20000000ULL) {
+            ExcPutsRaw("  Scanning hash table for non-canonical entries...\n");
+            int found = 0;
+            for (uint64_t i = 0; i < numlumps && i < 2048 && found < 5; ++i) {
+                uint64_t entry = readUser64(lumphashPtr + i * 8);
+                if (entry != 0 && (entry >> 47) != 0 && (entry >> 47) != 0x1FFFF) {
+                    ExcPutsRaw("  BAD["); ExcPutHex(i); ExcPutsRaw("]=");
+                    ExcPutHex(entry); ExcPutsRaw(" @");
+                    ExcPutHex(lumphashPtr + i * 8); ExcPutsRaw("\n");
+                    // Dump 64 bytes around this entry
+                    ExcPutsRaw("  CONTEXT: ");
+                    uint64_t base = lumphashPtr + i * 8 - 32;
+                    for (int j = 0; j < 8; ++j) {
+                        if (j == 4) ExcPutsRaw(">> ");
+                        uint64_t val = readUser64(base + j * 8);
+                        ExcPutHex(val); ExcPutsRaw(" ");
+                    }
+                    ExcPutsRaw("\n");
+                    ++found;
+                }
+            }
+            if (found == 0) ExcPutsRaw("  (no bad entries found in first 2048)\n");
+        }
+    }
+
     brook::Process* proc = brook::ProcessCurrent();
     int signum = ExceptionToSignal(static_cast<uint8_t>(vector));
 

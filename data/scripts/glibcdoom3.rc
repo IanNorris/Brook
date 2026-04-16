@@ -1,0 +1,1 @@
+strace /nix/games/doomgeneric -iwad /nix/games/doom1.wad
