@@ -1543,6 +1543,22 @@ bool SockIsStream(int sockIdx)
     return g_sockets[sockIdx].type == SOCK_STREAM;
 }
 
+int SockGetType(int sockIdx)
+{
+    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return -1;
+    if (!g_sockUsed[sockIdx]) return -1;
+    return g_sockets[sockIdx].type;
+}
+
+void SockGetLocal(int sockIdx, uint32_t* ip, uint16_t* port)
+{
+    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return;
+    if (!g_sockUsed[sockIdx]) return;
+    Socket& s = g_sockets[sockIdx];
+    if (ip)   *ip   = s.localIp;
+    if (port) *port = s.localPort;
+}
+
 bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite)
 {
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return false;

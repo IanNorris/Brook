@@ -5316,7 +5316,10 @@ static int64_t sys_rseq(uint64_t, uint64_t, uint64_t,
 
 static constexpr int FUTEX_WAIT         = 0;
 static constexpr int FUTEX_WAKE         = 1;
-static constexpr int FUTEX_PRIVATE_FLAG = 128;
+static constexpr int FUTEX_WAIT_BITSET  = 9;
+static constexpr int FUTEX_WAKE_BITSET  = 10;
+static constexpr int FUTEX_PRIVATE_FLAG    = 128;
+static constexpr int FUTEX_CLOCK_REALTIME  = 256;
 
 // Simple futex wait queue: hash table of blocked processes keyed by user VA.
 // Since threads share address space (same page tables), the VA is sufficient.
@@ -5399,19 +5402,23 @@ extern "C" int64_t FutexWake(uint64_t uaddr, uint32_t maxWake)
 static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
                           uint64_t, uint64_t, uint64_t)
 {
-    int op = static_cast<int>(opVal) & ~FUTEX_PRIVATE_FLAG;
+    int op = static_cast<int>(opVal) & ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
 
-    if (op == FUTEX_WAKE) {
+    if (op == FUTEX_WAKE || op == FUTEX_WAKE_BITSET) {
         uint32_t maxWake = static_cast<uint32_t>(val);
         if (maxWake == 0) return 0;
-        return FutexWake(uaddrVal, maxWake);
+        int64_t r = FutexWake(uaddrVal, maxWake);
+        return r;
     }
 
-    if (op == FUTEX_WAIT) {
+    if (op == FUTEX_WAIT || op == FUTEX_WAIT_BITSET) {
         auto* uaddr = reinterpret_cast<volatile uint32_t*>(uaddrVal);
 
         Process* proc = ProcessCurrent();
-        if (!proc) return -ENOSYS;
+        if (!proc) {
+            SerialPrintf("sys_futex: WAIT no current process!\n");
+            return -ENOSYS;
+        }
 
         // Acquire futex lock, atomically check value, and enqueue
         while (__atomic_test_and_set(&g_futexLock, __ATOMIC_ACQUIRE)) {
@@ -5428,6 +5435,7 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
         FutexWaiter* w = FutexAllocWaiter();
         if (!w) {
             __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+            SerialPrintf("sys_futex: ENOMEM (pool exhausted) pid=%u\n", proc->pid);
             return -ENOMEM;
         }
         w->uaddr = uaddrVal;
@@ -5447,6 +5455,8 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
         return 0;
     }
 
+    SerialPrintf("sys_futex: unsupported op=%d (raw=0x%lx) pid=%u\n",
+                 op, opVal, ProcessCurrent() ? ProcessCurrent()->pid : 0);
     return -ENOSYS;
 }
 
@@ -5523,8 +5533,8 @@ static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
     auto* uaddr = reinterpret_cast<const brook::SockAddrIn*>(addrVal);
     if (!uaddr) return -EFAULT;
 
-    SerialPrintf("sys_connect: fd=%d sockIdx=%d addr=%u.%u.%u.%u:%u\n",
-                 fd, sockIdx,
+    SerialPrintf("sys_connect: fd=%d sockIdx=%d type=%d addr=%u.%u.%u.%u:%u\n",
+                 fd, sockIdx, brook::SockGetType(sockIdx),
                  (brook::ntohl(uaddr->sin_addr) >> 24) & 0xFF,
                  (brook::ntohl(uaddr->sin_addr) >> 16) & 0xFF,
                  (brook::ntohl(uaddr->sin_addr) >> 8) & 0xFF,
@@ -5616,7 +5626,22 @@ static int64_t sys_getsockname(uint64_t fdVal, uint64_t addrVal, uint64_t addrLe
     int sockIdx = GetSockIdx(proc, fd);
     if (sockIdx < 0) return -EBADF;
 
-    // TODO: fill in local address
+    auto* uaddr = reinterpret_cast<brook::SockAddrIn*>(addrVal);
+    auto* ulen  = reinterpret_cast<uint32_t*>(addrLenVal);
+    if (!uaddr || !ulen) return -EFAULT;
+
+    brook::SockAddrIn local{};
+    local.sin_family = AF_INET;
+    uint32_t tmpIp = 0;
+    uint16_t tmpPort = 0;
+    brook::SockGetLocal(sockIdx, &tmpIp, &tmpPort);
+    local.sin_addr = tmpIp;
+    local.sin_port = tmpPort;
+
+    uint32_t copyLen = *ulen;
+    if (copyLen > sizeof(local)) copyLen = sizeof(local);
+    __builtin_memcpy(uaddr, &local, copyLen);
+    *ulen = sizeof(local);
     return 0;
 }
 
