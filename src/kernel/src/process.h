@@ -16,7 +16,7 @@ static constexpr uint32_t MAX_PROCESSES = 64;
 static constexpr uint64_t PROGRAM_BREAK_SIZE = 64 * 1024 * 1024; // 64 MB
 
 // Default user stack size.
-static constexpr uint64_t USER_STACK_SIZE = 128 * 1024; // 128 KB
+static constexpr uint64_t USER_STACK_SIZE = 1024 * 1024; // 1 MB (Linux default)
 
 // Per-process kernel stack size (16 pages = 64 KB).
 // Must be large enough for syscalls (VFS/FatFS stack depth) and interrupts.

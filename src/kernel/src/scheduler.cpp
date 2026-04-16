@@ -887,7 +887,11 @@ void SchedulerYield()
 
     // Wake the parent process if it's blocked (likely in wait4).
     // Also send SIGCHLD to the parent.
-    if (proc->parentPid != 0)
+    // Threads (isThread=true) do NOT send SIGCHLD — only process exits do.
+    // In Linux, SIGCHLD is sent when the thread group leader exits, not
+    // individual threads. Threads only wake their leader via futex on
+    // clear_child_tid (handled above).
+    if (!proc->isThread && proc->parentPid != 0)
     {
         uint64_t alf = SchedLockAcquire(g_allProcLock);
         for (uint32_t i = 0; i < g_processCount; i++)

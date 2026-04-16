@@ -696,7 +696,15 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             self->wakeupTick = g_lapicTickCount + 10; // recheck every ~10ms
             SchedulerBlock(self);
             if (HasPendingSignals())
-                return -EINTR;
+            {
+                // SIGCHLD is harmless during pipe reads — clear it and retry.
+                // Only return EINTR for other signals.
+                uint64_t pending = self->sigPending & ~self->sigMask;
+                uint64_t sigchldBit = (1ULL << (17 - 1)); // SIGCHLD = 17
+                if ((pending & ~sigchldBit) != 0)
+                    return -EINTR;
+                self->sigPending &= ~sigchldBit;
+            }
         }
     }
 
