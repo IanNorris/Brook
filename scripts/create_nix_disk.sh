@@ -2,15 +2,29 @@
 # Create an ext2 disk image pre-populated with a Nix store closure.
 #
 # Usage:
-#   scripts/create_nix_disk.sh [size_mb]    # default: 512
+#   scripts/create_nix_disk.sh [size_mb] [nix_attr...]
+#   scripts/create_nix_disk.sh 128 pkgsMusl.hello pkgsMusl.coreutils
 #
-# The disk contains a BROOK.MNT file (mount point = /nix) and a /store
-# directory with the full closure of pkgsMusl.hello (and its dependencies).
+# Defaults: 512MB disk, pkgsMusl.hello + pkgsMusl.coreutils
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-SIZE_MB="${1:-512}"
+
+# Parse size (first numeric arg) and packages
+SIZE_MB=128
+PACKAGES=()
+for arg in "$@"; do
+    if [[ "$arg" =~ ^[0-9]+$ ]]; then
+        SIZE_MB="$arg"
+    else
+        PACKAGES+=("$arg")
+    fi
+done
+if [ ${#PACKAGES[@]} -eq 0 ]; then
+    PACKAGES=(pkgsMusl.hello pkgsMusl.coreutils)
+fi
+
 DISK_IMG="${BROOK_NIX_DISK:-${ROOT_DIR}/brook_nix_disk.img}"
 
 echo "Creating ${SIZE_MB}MB Nix store disk at ${DISK_IMG}..."
@@ -19,14 +33,18 @@ echo "Creating ${SIZE_MB}MB Nix store disk at ${DISK_IMG}..."
 dd if=/dev/zero of="${DISK_IMG}" bs=1M count="${SIZE_MB}" status=progress 2>&1
 mkfs.ext2 -q -b 4096 -L "NIXSTORE" "${DISK_IMG}"
 
-# Build the musl hello closure
-echo "Building pkgsMusl.hello closure..."
-HELLO_PATH=$(nix-build '<nixpkgs>' -A pkgsMusl.hello --no-out-link 2>/dev/null)
-echo "  hello: ${HELLO_PATH}"
+# Build all requested packages and collect closures
+echo "Building packages: ${PACKAGES[*]}..."
+ALL_PATHS=()
+for pkg in "${PACKAGES[@]}"; do
+    PKG_PATH=$(nix-build '<nixpkgs>' -A "$pkg" --no-out-link 2>/dev/null)
+    echo "  ${pkg}: ${PKG_PATH}"
+    ALL_PATHS+=("$PKG_PATH")
+done
 
-# Get the full closure (all dependencies)
-CLOSURE=$(nix-store -qR "${HELLO_PATH}")
-echo "  Closure:"
+# Get full transitive closure (deduplicated)
+CLOSURE=$(nix-store -qR "${ALL_PATHS[@]}" | sort -u)
+echo "  Closure ($(echo "$CLOSURE" | wc -l) paths):"
 for p in ${CLOSURE}; do
     SIZE=$(du -sh "$p" | cut -f1)
     echo "    ${p}  (${SIZE})"
@@ -108,4 +126,7 @@ rmdir "${MOUNT_DIR}" 2>/dev/null || true
 echo ""
 echo "Nix store disk created: ${DISK_IMG}"
 echo "  Mount point: /nix (via BROOK.MNT)"
-echo "  Test: run /nix/store/$(basename ${HELLO_PATH})/bin/hello"
+echo "  Packages: ${PACKAGES[*]}"
+for pkg_path in "${ALL_PATHS[@]}"; do
+    echo "  Test: run ${pkg_path}/bin/..."
+done

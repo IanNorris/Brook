@@ -1,0 +1,2 @@
+# Brook OS — Run Nix coreutils ls
+run /nix/store/frshg793p9xfy8qv9axdy47y9n9vh479-coreutils-9.10/bin/ls /nix/store
