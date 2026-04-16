@@ -1094,7 +1094,7 @@ static const VnodeOps g_ext2DirOps = {
 // ---------------------------------------------------------------------------
 
 // Device binding table (similar to FatFS pdrv concept)
-static constexpr uint8_t EXT2_MAX_MOUNTS = 4;
+static constexpr uint8_t EXT2_MAX_MOUNTS = 8;
 static Device* g_ext2Devices[EXT2_MAX_MOUNTS] = {};
 
 static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)

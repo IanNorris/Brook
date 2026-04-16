@@ -173,6 +173,13 @@ if [ -f "${NIX_DISK}" ]; then
     echo "  Nix disk:  ${NIX_DISK}"
 fi
 
+HOME_DISK="${BROOK_HOME_DISK:-${ROOT_DIR}/brook_home_disk.img}"
+HOME_DRIVE=""
+if [ -f "${HOME_DISK}" ]; then
+    HOME_DRIVE="-drive if=virtio,format=raw,file=${HOME_DISK},file.locking=off"
+    echo "  Home disk: ${HOME_DISK}"
+fi
+
 # Select boot script: --script <name> copies data/scripts/<name>.rc to INIT.RC
 # on the disk image. Without --script, the existing INIT.RC is used.
 if [ -n "${SCRIPT_NAME}" ]; then
@@ -225,6 +232,7 @@ qemu-system-x86_64 \
     -drive if=virtio,format=raw,file="${DISK_IMG}",file.locking=off \
     ${EXT2_DRIVE} \
     ${NIX_DRIVE} \
+    ${HOME_DRIVE} \
     -device virtio-tablet-pci \
     -device virtio-net-pci,netdev=net0 \
     -netdev user,id=net0 \
