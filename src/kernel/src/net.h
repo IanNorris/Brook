@@ -263,6 +263,9 @@ struct Socket {
     int       acceptQueue[ACCEPT_QUEUE_MAX]; // socket indices of accepted connections
     volatile int acceptQueueCount;     // number in queue
     int       listenSockIdx;           // for SynRecv sockets: parent listen socket index (-1 if none)
+
+    // Reference counting for fork/dup
+    volatile uint32_t refCount;        // number of fds pointing at this socket (1 on create)
 };
 
 // Create a kernel socket. Returns socket index or negative error.
@@ -279,6 +282,8 @@ int  SockListen(int sockIdx, int backlog);
 int  SockAccept(int sockIdx, SockAddrIn* addr);
 bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite);
 void SockClose(int sockIdx);
+void SockRef(int sockIdx);    // increment refcount (fork/dup)
+void SockUnref(int sockIdx);  // decrement refcount, destroy at 0
 
 // Deliver a UDP datagram to the matching socket (called by stack).
 void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,

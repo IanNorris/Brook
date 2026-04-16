@@ -6,6 +6,7 @@
 #include "scheduler.h"
 #include "vfs.h"
 #include "pipe.h"
+#include "net.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "memory/heap.h"
@@ -624,6 +625,14 @@ void ProcessCloseAllFds(Process* proc)
                 VfsClose(vn);
         }
 
+        // Socket cleanup: decrement refcount, close socket if last ref
+        if (fde.type == FdType::Socket && fde.handle)
+        {
+            int sockIdx = static_cast<int>(
+                reinterpret_cast<uintptr_t>(fde.handle)) - 1;
+            brook::SockUnref(sockIdx);
+        }
+
         // Pipe cleanup: decrement reader/writer counts and wake waiters
         if (fde.type == FdType::Pipe && fde.handle)
         {
@@ -943,6 +952,14 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
             {
                 auto* vn = static_cast<Vnode*>(parent->fds[i].handle);
                 __atomic_fetch_add(&vn->refCount, 1, __ATOMIC_RELEASE);
+            }
+
+            // Increment socket refcount for the child's copy
+            if (parent->fds[i].type == FdType::Socket && parent->fds[i].handle)
+            {
+                int sockIdx = static_cast<int>(
+                    reinterpret_cast<uintptr_t>(parent->fds[i].handle)) - 1;
+                brook::SockRef(sockIdx);
             }
         }
     }

@@ -974,7 +974,7 @@ static int64_t sys_close(uint64_t fd, uint64_t, uint64_t,
     if (fde->type == FdType::Socket && fde->handle)
     {
         int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
-        SockClose(sockIdx);
+        brook::SockUnref(sockIdx);
     }
 
     FdFree(proc, static_cast<int>(fd));
@@ -1061,6 +1061,13 @@ static int64_t sys_dup(uint64_t oldfd, uint64_t, uint64_t,
     if (old->type == FdType::Vnode && old->handle)
         __atomic_fetch_add(&static_cast<Vnode*>(old->handle)->refCount, 1, __ATOMIC_RELEASE);
 
+    // Bump socket refcount
+    if (old->type == FdType::Socket && old->handle)
+    {
+        int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(old->handle)) - 1;
+        brook::SockRef(sockIdx);
+    }
+
     return newfd;
 }
 
@@ -1102,6 +1109,13 @@ static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd, uint64_t,
     // Bump vnode refcount
     if (old->type == FdType::Vnode && old->handle)
         __atomic_fetch_add(&static_cast<Vnode*>(old->handle)->refCount, 1, __ATOMIC_RELEASE);
+
+    // Bump socket refcount
+    if (old->type == FdType::Socket && old->handle)
+    {
+        int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(old->handle)) - 1;
+        brook::SockRef(sockIdx);
+    }
 
     return static_cast<int64_t>(newfd);
 }
@@ -3497,6 +3511,13 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
         if (fde->type == FdType::Vnode && fde->handle)
             __atomic_fetch_add(&static_cast<Vnode*>(fde->handle)->refCount, 1, __ATOMIC_RELEASE);
 
+        // Bump socket refcount
+        if (fde->type == FdType::Socket && fde->handle)
+        {
+            int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+            brook::SockRef(sockIdx);
+        }
+
         return newfd;
     }
     case F_GETFD:
@@ -5044,16 +5065,52 @@ static int64_t sys_shutdown(uint64_t, uint64_t, uint64_t,
     return 0; // stub
 }
 
-static int64_t sys_listen(uint64_t, uint64_t, uint64_t,
+static int64_t sys_listen(uint64_t fdVal, uint64_t backlog, uint64_t,
                            uint64_t, uint64_t, uint64_t)
 {
-    return -ENOSYS; // TCP not implemented yet
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ENOSYS;
+
+    int fd = static_cast<int>(fdVal);
+    int sockIdx = GetSockIdx(proc, fd);
+    if (sockIdx < 0) return -EBADF;
+
+    int ret = brook::SockListen(sockIdx, static_cast<int>(backlog));
+    return ret < 0 ? -EINVAL : 0;
 }
 
-static int64_t sys_accept(uint64_t, uint64_t, uint64_t,
+static int64_t sys_accept(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
                            uint64_t, uint64_t, uint64_t)
 {
-    return -ENOSYS; // TCP not implemented yet
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ENOSYS;
+
+    int fd = static_cast<int>(fdVal);
+    int sockIdx = GetSockIdx(proc, fd);
+    if (sockIdx < 0) return -EBADF;
+
+    brook::SockAddrIn peerAddr = {};
+    int childIdx = brook::SockAccept(sockIdx, &peerAddr);
+    if (childIdx < 0) return childIdx; // EAGAIN or error
+
+    // Allocate a new fd for the accepted connection
+    int newFd = FdAlloc(proc, FdType::Socket,
+                        reinterpret_cast<void*>(static_cast<uintptr_t>(childIdx + 1)));
+    if (newFd < 0) {
+        brook::SockClose(childIdx);
+        return -EMFILE;
+    }
+
+    // Copy peer address to user if requested
+    if (addrVal && addrLenVal) {
+        auto* userAddr = reinterpret_cast<brook::SockAddrIn*>(addrVal);
+        auto* userLen  = reinterpret_cast<uint32_t*>(addrLenVal);
+        *userAddr = peerAddr;
+        *userLen  = sizeof(brook::SockAddrIn);
+    }
+
+    SerialPrintf("sys_accept: fd=%d -> newFd=%d childIdx=%d\n", fd, newFd, childIdx);
+    return newFd;
 }
 
 static int64_t sys_socketpair(uint64_t, uint64_t, uint64_t,

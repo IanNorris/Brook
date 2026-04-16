@@ -10,6 +10,26 @@ TcpAction TcpProcessSegment(Socket& s,
     TcpAction act = {};
 
     switch (s.tcpState) {
+    case TcpState::SynRecv:
+        // Server side: waiting for ACK to complete 3-way handshake
+        if (flags & TCP_ACK) {
+            s.tcpSndUna = ack;
+            s.tcpState  = TcpState::Established;
+            s.connected = true;
+            // If data piggy-backed on the ACK, enqueue it
+            if (dataLen > 0 && seq == s.tcpRcvNxt) {
+                act.enqueueData = true;
+                act.dataPtr     = data;
+                act.dataLen     = dataLen;
+                s.tcpRcvNxt += dataLen;
+                act.sendAck = true;
+            }
+        } else if (flags & TCP_RST) {
+            s.tcpState  = TcpState::Closed;
+            s.connected = false;
+        }
+        break;
+
     case TcpState::SynSent:
         if ((flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK)) {
             s.tcpRcvNxt = seq + 1;

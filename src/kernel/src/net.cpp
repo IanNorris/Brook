@@ -263,10 +263,44 @@ bool ArpResolve(uint32_t ip, MacAddr* outMac)
 // IPv4 send/receive
 // ---------------------------------------------------------------------------
 
+static void HandleIpv4(const uint8_t* frame, uint32_t len);
+
 int NetSendIpv4(uint32_t dstIp, uint8_t proto,
                 const void* payload, uint32_t payloadLen)
 {
     if (!g_netIf || !g_netIf->ipAddr) return -1;
+
+    // Loopback: if destination is our own IP, inject directly into HandleIpv4
+    if (dstIp == g_netIf->ipAddr)
+    {
+        uint32_t ipLen = sizeof(Ipv4Header) + payloadLen;
+        uint32_t frameLen = sizeof(EthHeader) + ipLen;
+        if (frameLen > ETH_FRAME_MAX) return -3;
+
+        uint8_t frame[ETH_FRAME_MAX];
+        NetMemset(frame, 0, frameLen);
+
+        auto* eth = reinterpret_cast<EthHeader*>(frame);
+        eth->src = g_netIf->mac;
+        eth->dst = g_netIf->mac;
+        eth->etherType = htons(ETH_TYPE_IPV4);
+
+        auto* ip = reinterpret_cast<Ipv4Header*>(frame + sizeof(EthHeader));
+        ip->verIhl   = 0x45;
+        ip->totalLen = htons(static_cast<uint16_t>(ipLen));
+        ip->id       = htons(g_ipId++);
+        ip->flagsFrag = htons(0x4000);
+        ip->ttl      = 64;
+        ip->protocol = proto;
+        ip->srcIp    = g_netIf->ipAddr;
+        ip->dstIp    = dstIp;
+        ip->checksum = 0;
+        ip->checksum = InetChecksum(ip, sizeof(Ipv4Header));
+
+        NetMemcpy(frame + sizeof(EthHeader) + sizeof(Ipv4Header), payload, payloadLen);
+        HandleIpv4(frame, frameLen);
+        return 0;
+    }
 
     // Determine next-hop: if same subnet, send direct; else use gateway
     uint32_t nextHop = dstIp;
@@ -949,6 +983,7 @@ int SockCreate(int domain, int type, int protocol)
                 return -1;
             }
 
+            g_sockets[i].refCount = 1;
             return static_cast<int>(i);
         }
     }
@@ -1065,6 +1100,27 @@ void SockClose(int sockIdx)
 
     Socket& s = g_sockets[sockIdx];
 
+    // Listening socket: close all pending connections in accept queue
+    if (s.listening)
+    {
+        for (int i = 0; i < s.acceptQueueCount; i++)
+        {
+            int childIdx = s.acceptQueue[i];
+            if (childIdx >= 0 && childIdx < static_cast<int>(MAX_SOCKETS) && g_sockUsed[childIdx])
+            {
+                Socket& child = g_sockets[childIdx];
+                if (child.tcpState == TcpState::Established ||
+                    child.tcpState == TcpState::SynRecv)
+                {
+                    TcpSendSegment(child, TCP_RST, nullptr, 0);
+                }
+                if (child.rxBuf) kfree(child.rxBuf);
+                NetMemset(&g_sockets[childIdx], 0, sizeof(Socket));
+                g_sockUsed[childIdx] = false;
+            }
+        }
+    }
+
     // TCP: send FIN if connected
     if (s.type == SOCK_STREAM && s.tcpState == TcpState::Established) {
         TcpSendSegment(s, TCP_FIN | TCP_ACK, nullptr, 0);
@@ -1084,6 +1140,22 @@ void SockClose(int sockIdx)
 
     NetMemset(&g_sockets[sockIdx], 0, sizeof(Socket));
     g_sockUsed[sockIdx] = false;
+}
+
+void SockRef(int sockIdx)
+{
+    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return;
+    if (!g_sockUsed[sockIdx]) return;
+    __atomic_fetch_add(&g_sockets[sockIdx].refCount, 1, __ATOMIC_RELEASE);
+}
+
+void SockUnref(int sockIdx)
+{
+    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return;
+    if (!g_sockUsed[sockIdx]) return;
+    uint32_t prev = __atomic_fetch_sub(&g_sockets[sockIdx].refCount, 1, __ATOMIC_ACQ_REL);
+    if (prev <= 1)
+        SockClose(sockIdx);
 }
 
 void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
@@ -1199,7 +1271,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
     const uint8_t* tcpData = static_cast<const uint8_t*>(payload) + dataOff;
     uint32_t dataLen = len - dataOff;
 
-    // Find matching socket
+    // Find matching connected socket (exact 4-tuple match)
     for (uint32_t i = 0; i < MAX_SOCKETS; i++) {
         if (!g_sockUsed[i]) continue;
         Socket& s = g_sockets[i];
@@ -1217,6 +1289,67 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             TcpSendSegment(s, TCP_ACK, nullptr, 0);
 
         return; // handled
+    }
+
+    // No connected socket — check for listening socket (incoming SYN)
+    if (flags & TCP_SYN)
+    {
+        for (uint32_t i = 0; i < MAX_SOCKETS; i++)
+        {
+            if (!g_sockUsed[i]) continue;
+            Socket& s = g_sockets[i];
+            if (s.type != SOCK_STREAM) continue;
+            if (!s.listening) continue;
+            if (s.localPort != dstPort) continue;
+
+            // Check backlog
+            if (s.acceptQueueCount >= s.listenBacklog)
+            {
+                SerialPrintf("net: TCP SYN dropped — accept queue full (port %u)\n",
+                             ntohs(dstPort));
+                break; // send RST below
+            }
+
+            // Create a new socket for this connection
+            int childIdx = SockCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (childIdx < 0)
+            {
+                SerialPrintf("net: TCP SYN dropped — no free sockets\n");
+                break;
+            }
+
+            Socket& child = g_sockets[childIdx];
+            child.localIp    = g_netIf->ipAddr;
+            child.localPort  = dstPort;
+            child.remoteIp   = ip->srcIp;
+            child.remotePort = srcPort;
+            child.bound      = true;
+            child.tcpState   = TcpState::SynRecv;
+            child.tcpRcvNxt  = seq + 1;
+            child.listenSockIdx = static_cast<int>(i);
+
+            // Generate ISS for the server side
+            child.tcpSndIss = static_cast<uint32_t>(g_ipId) * 64000 +
+                              ntohs(srcPort) + ntohs(dstPort);
+            child.tcpSndNxt = child.tcpSndIss + 1; // after SYN-ACK
+            child.tcpSndUna = child.tcpSndIss;
+
+            // Add to listen socket's accept queue
+            s.acceptQueue[s.acceptQueueCount++] = childIdx;
+
+            // Send SYN-ACK
+            // Temporarily set tcpSndNxt to ISS for the SYN-ACK segment
+            child.tcpSndNxt = child.tcpSndIss;
+            TcpSendSegment(child, TCP_SYN | TCP_ACK, nullptr, 0);
+            child.tcpSndNxt = child.tcpSndIss + 1; // SYN consumes one seq
+
+            SerialPrintf("net: TCP SYN-ACK sent for port %u -> %u.%u.%u.%u:%u (childIdx=%d)\n",
+                         ntohs(dstPort),
+                         ip->srcIp & 0xFF, (ip->srcIp >> 8) & 0xFF,
+                         (ip->srcIp >> 16) & 0xFF, (ip->srcIp >> 24) & 0xFF,
+                         ntohs(srcPort), childIdx);
+            return; // handled
+        }
     }
 
     // No matching socket — send RST
@@ -1414,11 +1547,14 @@ bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite)
     if (g_netIf && g_netIf->poll) g_netIf->poll(g_netIf);
 
     if (checkRead) {
+        // Listening socket: readable when accept queue is non-empty
+        if (s.listening && s.acceptQueueCount > 0) return true;
         if (s.rxCount > 0) return true;
         if (s.tcpFinRecv) return true; // EOF is readable
         if (s.type == SOCK_STREAM &&
             s.tcpState != TcpState::Established &&
-            s.tcpState != TcpState::SynSent) return true; // closed/error
+            s.tcpState != TcpState::SynSent &&
+            s.tcpState != TcpState::Listen) return true; // closed/error
     }
     if (checkWrite) {
         if (s.type == SOCK_DGRAM) return true; // UDP always writable
@@ -1426,6 +1562,78 @@ bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite)
             return true;
     }
     return false;
+}
+
+int SockListen(int sockIdx, int backlog)
+{
+    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return -1;
+    if (!g_sockUsed[sockIdx]) return -1;
+
+    Socket& s = g_sockets[sockIdx];
+    if (s.type != SOCK_STREAM) return -1;
+    if (!s.bound) return -1;
+
+    s.listening = true;
+    s.listenBacklog = (backlog > Socket::ACCEPT_QUEUE_MAX)
+                        ? Socket::ACCEPT_QUEUE_MAX : (backlog < 1 ? 1 : backlog);
+    s.acceptQueueCount = 0;
+    s.tcpState = TcpState::Listen;
+    s.listenSockIdx = -1;
+
+    SerialPrintf("net: listen sockIdx=%d port=%u backlog=%d\n",
+                 sockIdx, ntohs(s.localPort), s.listenBacklog);
+    return 0;
+}
+
+int SockAccept(int sockIdx, SockAddrIn* addr)
+{
+    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return -1;
+    if (!g_sockUsed[sockIdx]) return -1;
+
+    Socket& s = g_sockets[sockIdx];
+    if (!s.listening) return -1;
+
+    // Poll until we have a completed connection in the accept queue
+    for (int attempt = 0; attempt < 50000; attempt++)
+    {
+        if (g_netIf && g_netIf->poll) g_netIf->poll(g_netIf);
+
+        // Scan accept queue for Established connections
+        for (int qi = 0; qi < s.acceptQueueCount; qi++)
+        {
+            int childIdx = s.acceptQueue[qi];
+            if (childIdx < 0 || childIdx >= static_cast<int>(MAX_SOCKETS)) continue;
+            Socket& child = g_sockets[childIdx];
+
+            if (child.tcpState == TcpState::Established)
+            {
+                // Remove from accept queue (shift remaining)
+                for (int j = qi; j < s.acceptQueueCount - 1; j++)
+                    s.acceptQueue[j] = s.acceptQueue[j + 1];
+                s.acceptQueueCount--;
+
+                // Fill in peer address if requested
+                if (addr)
+                {
+                    addr->sin_family = AF_INET;
+                    addr->sin_port   = child.remotePort;
+                    addr->sin_addr   = child.remoteIp;
+                }
+
+                SerialPrintf("net: accept sockIdx=%d -> childIdx=%d remote=%u.%u.%u.%u:%u\n",
+                             sockIdx, childIdx,
+                             child.remoteIp & 0xFF, (child.remoteIp >> 8) & 0xFF,
+                             (child.remoteIp >> 16) & 0xFF, (child.remoteIp >> 24) & 0xFF,
+                             ntohs(child.remotePort));
+                return childIdx;
+            }
+        }
+
+        // Brief pause before retrying
+        for (volatile int p = 0; p < 1000; p++) {}
+    }
+
+    return -11; // EAGAIN
 }
 
 // ---------------------------------------------------------------------------
