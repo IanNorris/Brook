@@ -69,6 +69,7 @@ static constexpr uint64_t SYS_READLINKAT      = 267;
 static constexpr uint64_t SYS_SYMLINKAT       = 266;
 static constexpr uint64_t SYS_PPOLL           = 271;
 static constexpr uint64_t SYS_PIPE2           = 293;
+static constexpr uint64_t SYS_EVENTFD2        = 290;
 static constexpr uint64_t SYS_PRLIMIT64       = 302;
 static constexpr uint64_t SYS_GETRANDOM       = 318;
 

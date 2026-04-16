@@ -183,6 +183,7 @@ enum class FdType : uint8_t
     SyntheticMem,  // In-memory synthetic file (e.g. /etc/passwd)
     Socket,        // Network socket (UDP/TCP)
     DevTty,        // /dev/tty — bidirectional terminal (read=stdin pipe, write=stdout pipe)
+    EventFd,       // eventfd — uint64 counter for event notification
 };
 
 struct TtyDevicePair {

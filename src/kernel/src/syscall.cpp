@@ -195,6 +195,16 @@ static bool HasPendingSignals()
     return (proc->sigPending & ~proc->sigMask) != 0;
 }
 
+// EventFd data structure (used in read/write/poll/close)
+struct EventFdData {
+    volatile uint64_t counter;
+    uint32_t flags;
+    Process* readerWaiter;
+};
+static constexpr uint32_t EFD_SEMAPHORE = 0x01;
+[[maybe_unused]] static constexpr uint32_t EFD_CLOEXEC = 0x80000;
+static constexpr uint32_t EFD_NONBLOCK  = 0x800;
+
 // ---------------------------------------------------------------------------
 // sys_write (1)
 // ---------------------------------------------------------------------------
@@ -283,7 +293,10 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
     // Write to pipe — block until at least some bytes are written
     if (fde->type == FdType::Pipe && fde->handle)
     {
-        auto* pipe = static_cast<PipeBuffer*>(fde->handle);
+        // For bidirectional socketpair (flags==2), write goes to the write pipe
+        auto* pipe = (fde->flags == 2)
+            ? reinterpret_cast<PipeBuffer*>(fde->seekPos)
+            : static_cast<PipeBuffer*>(fde->handle);
         const char* src = reinterpret_cast<const char*>(bufAddr);
         uint64_t written = 0;
 
@@ -322,6 +335,24 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 return written > 0 ? static_cast<int64_t>(written) : -EINTR;
         }
         return static_cast<int64_t>(written);
+    }
+
+    // Write to eventfd — adds value to counter
+    if (fde->type == FdType::EventFd && fde->handle)
+    {
+        if (count < 8) return -EINVAL;
+        uint64_t val = *reinterpret_cast<const uint64_t*>(bufAddr);
+        if (val == 0xFFFFFFFFFFFFFFFFULL) return -EINVAL;
+        auto* efd = static_cast<EventFdData*>(fde->handle);
+        __atomic_fetch_add(&efd->counter, val, __ATOMIC_ACQ_REL);
+        // Wake blocked reader
+        Process* reader = efd->readerWaiter;
+        if (reader) {
+            efd->readerWaiter = nullptr;
+            __atomic_store_n(&reader->pendingWakeup, 1, __ATOMIC_RELEASE);
+            SchedulerUnblock(reader);
+        }
+        return 8;
     }
 
     // Write to socket (TCP stream)
@@ -652,6 +683,10 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             if (wr == 0)
                 return 0;
 
+            // Non-blocking: return -EAGAIN instead of blocking
+            if (fde->statusFlags & 0x800) // O_NONBLOCK
+                return -EAGAIN;
+
             // Block until writer puts data or writer closes
             Process* self = ProcessCurrent();
             pipe->readerWaiter = self;
@@ -659,6 +694,42 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             // (avoids permanent deadlock if close notification was missed)
             extern volatile uint64_t g_lapicTickCount;
             self->wakeupTick = g_lapicTickCount + 10; // recheck every ~10ms
+            SchedulerBlock(self);
+            if (HasPendingSignals())
+                return -EINTR;
+        }
+    }
+
+    // Read from eventfd — returns counter as uint64, resets to 0
+    if (fde->type == FdType::EventFd && fde->handle)
+    {
+        if (count < 8) return -EINVAL;
+        auto* efd = static_cast<EventFdData*>(fde->handle);
+
+        for (;;)
+        {
+            uint64_t val = __atomic_load_n(&efd->counter, __ATOMIC_ACQUIRE);
+            if (val > 0)
+            {
+                if (efd->flags & EFD_SEMAPHORE) {
+                    __atomic_fetch_sub(&efd->counter, 1, __ATOMIC_ACQ_REL);
+                    val = 1;
+                } else {
+                    __atomic_store_n(&efd->counter, 0ULL, __ATOMIC_RELEASE);
+                }
+                *reinterpret_cast<uint64_t*>(bufAddr) = val;
+                return 8;
+            }
+
+            // Non-blocking: return EAGAIN
+            if (fde->statusFlags & 0x800)
+                return -EAGAIN;
+
+            // Block until counter becomes non-zero
+            Process* self = ProcessCurrent();
+            efd->readerWaiter = self;
+            extern volatile uint64_t g_lapicTickCount;
+            self->wakeupTick = g_lapicTickCount + 10;
             SchedulerBlock(self);
             if (HasPendingSignals())
                 return -EINTR;
@@ -1007,6 +1078,11 @@ static int64_t sys_close(uint64_t fd, uint64_t, uint64_t,
     {
         int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
         brook::SockUnref(sockIdx);
+    }
+
+    if (fde->type == FdType::EventFd && fde->handle)
+    {
+        kfree(fde->handle);
     }
 
     FdFree(proc, static_cast<int>(fd));
@@ -3205,6 +3281,14 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
         return 0;
     }
 
+    if (fde->type == FdType::EventFd) {
+        auto* raw = reinterpret_cast<uint8_t*>(st);
+        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        st->st_mode = 0100666; // S_IFREG | rw-rw-rw-
+        st->st_blksize = 4096;
+        return 0;
+    }
+
     return -EBADF;
 }
 
@@ -3754,6 +3838,21 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
             continue;
         }
 
+        // EventFd: readable when counter > 0, always writable
+        if (fde->type == FdType::EventFd && fde->handle)
+        {
+            auto* efd = static_cast<EventFdData*>(fde->handle);
+            if ((fds[i].events & POLLIN) &&
+                __atomic_load_n(&efd->counter, __ATOMIC_ACQUIRE) > 0)
+            {
+                fds[i].revents |= POLLIN;
+            }
+            if (fds[i].events & POLLOUT)
+                fds[i].revents |= POLLOUT;
+            if (fds[i].revents) ready++;
+            continue;
+        }
+
         // Default: assume ready for whatever was asked
         fds[i].revents = fds[i].events;
         ready++;
@@ -3977,6 +4076,33 @@ static int64_t sys_pipe2(uint64_t pipefdAddr, uint64_t flags, uint64_t,
 {
     (void)flags; // O_CLOEXEC etc. — ignore for now
     return sys_pipe(pipefdAddr, 0, 0, 0, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// sys_eventfd2 (290) — event notification file descriptor
+// ---------------------------------------------------------------------------
+
+static int64_t sys_eventfd2(uint64_t initval, uint64_t flagsVal, uint64_t,
+                              uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EMFILE;
+
+    auto* efd = static_cast<EventFdData*>(kmalloc(sizeof(EventFdData)));
+    if (!efd) return -ENOMEM;
+
+    efd->counter = initval;
+    efd->flags = static_cast<uint32_t>(flagsVal);
+    efd->readerWaiter = nullptr;
+
+    int fd = FdAlloc(proc, FdType::EventFd, efd);
+    if (fd < 0) { kfree(efd); return -EMFILE; }
+
+    if (flagsVal & EFD_NONBLOCK)
+        proc->fds[fd].statusFlags = 0x800; // O_NONBLOCK
+
+    SerialPrintf("sys_eventfd2: fd=%d initval=%lu flags=0x%lx\n", fd, initval, flagsVal);
+    return fd;
 }
 
 // ---------------------------------------------------------------------------
@@ -5546,10 +5672,79 @@ static int64_t sys_accept(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
     return newFd;
 }
 
-static int64_t sys_socketpair(uint64_t, uint64_t, uint64_t,
-                               uint64_t, uint64_t, uint64_t)
+static int64_t sys_socketpair(uint64_t domain, uint64_t type, uint64_t protocol,
+                               uint64_t svAddr, uint64_t, uint64_t)
 {
-    return -ENOSYS;
+    SerialPrintf("sys_socketpair: domain=%lu type=0x%lx proto=%lu sv=0x%lx\n",
+                 domain, type, protocol, svAddr);
+    // We only support AF_UNIX (domain=1) socketpairs
+    if (domain != 1) return -EAFNOSUPPORT;
+
+    auto* sv = reinterpret_cast<int32_t*>(svAddr);
+    if (!sv) return -EFAULT;
+
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EMFILE;
+
+    // Allocate two PipeBuffers — one for each direction
+    auto* pipeAtoB = static_cast<PipeBuffer*>(kmalloc(sizeof(PipeBuffer)));
+    if (!pipeAtoB) return -ENOMEM;
+    auto* pipeBtoA = static_cast<PipeBuffer*>(kmalloc(sizeof(PipeBuffer)));
+    if (!pipeBtoA) { kfree(pipeAtoB); return -ENOMEM; }
+
+    // Zero-init both
+    for (uint64_t i = 0; i < sizeof(PipeBuffer); i++) {
+        reinterpret_cast<uint8_t*>(pipeAtoB)[i] = 0;
+        reinterpret_cast<uint8_t*>(pipeBtoA)[i] = 0;
+    }
+    pipeAtoB->readers = 1;
+    pipeAtoB->writers = 1;
+    pipeBtoA->readers = 1;
+    pipeBtoA->writers = 1;
+
+    // fd[0]: reads from pipeBtoA, writes to pipeAtoB
+    // fd[1]: reads from pipeAtoB, writes to pipeBtoA
+    // We store a small struct with both pipe pointers as the fd handle.
+    struct SocketPairEnd {
+        PipeBuffer* readPipe;
+        PipeBuffer* writePipe;
+    };
+
+    auto* endA = static_cast<SocketPairEnd*>(kmalloc(sizeof(SocketPairEnd)));
+    auto* endB = static_cast<SocketPairEnd*>(kmalloc(sizeof(SocketPairEnd)));
+    if (!endA || !endB) {
+        if (endA) kfree(endA);
+        if (endB) kfree(endB);
+        kfree(pipeAtoB);
+        kfree(pipeBtoA);
+        return -ENOMEM;
+    }
+    endA->readPipe = pipeBtoA;
+    endA->writePipe = pipeAtoB;
+    endB->readPipe = pipeAtoB;
+    endB->writePipe = pipeBtoA;
+
+    int fdA = FdAlloc(proc, FdType::Pipe, endA->readPipe);
+    if (fdA < 0) { kfree(endA); kfree(endB); kfree(pipeAtoB); kfree(pipeBtoA); return -EMFILE; }
+    // Store write pipe pointer in seekPos as a hack (we need both pipes accessible)
+    proc->fds[fdA].seekPos = reinterpret_cast<uint64_t>(endA->writePipe);
+    proc->fds[fdA].flags = 2;  // bidirectional marker
+    proc->fds[fdA].statusFlags = (type & 0x800) ? 0x800 : 0;  // O_NONBLOCK if SOCK_NONBLOCK
+
+    int fdB = FdAlloc(proc, FdType::Pipe, endB->readPipe);
+    if (fdB < 0) { FdFree(proc, fdA); kfree(endA); kfree(endB); kfree(pipeAtoB); kfree(pipeBtoA); return -EMFILE; }
+    proc->fds[fdB].seekPos = reinterpret_cast<uint64_t>(endB->writePipe);
+    proc->fds[fdB].flags = 2;  // bidirectional marker
+    proc->fds[fdB].statusFlags = (type & 0x800) ? 0x800 : 0;
+
+    kfree(endA);
+    kfree(endB);
+
+    sv[0] = fdA;
+    sv[1] = fdB;
+
+    SerialPrintf("sys_socketpair: fd[%d,%d] for pid %u\n", fdA, fdB, proc->pid);
+    return 0;
 }
 
 static int64_t sys_sendmsg(uint64_t, uint64_t, uint64_t,
@@ -5702,6 +5897,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_SYMLINKAT]       = sys_symlinkat;
     g_syscallTable[SYS_PPOLL]           = sys_ppoll;
     g_syscallTable[SYS_PIPE2]           = sys_pipe2;
+    g_syscallTable[SYS_EVENTFD2]        = sys_eventfd2;
     g_syscallTable[SYS_DUP3]            = sys_dup3;
 
     // Bash / POSIX compatibility
@@ -5845,7 +6041,7 @@ static const char* SyscallName(uint64_t num)
     case 262: return "newfstatat"; case 266: return "symlinkat"; case 267: return "readlinkat";
     case 270: return "pselect6";  case 271: return "ppoll";     case 273: return "set_robust_list";
     case 292: return "dup3";
-    case 293: return "pipe2";     case 302: return "prlimit64";
+    case 290: return "eventfd2";  case 293: return "pipe2";     case 302: return "prlimit64";
     case 318: return "getrandom"; case 334: return "rseq";
     case 439: return "faccessat2";
     case 73: return "flock";      case 76: return "truncate";
