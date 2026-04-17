@@ -236,7 +236,7 @@ qemu-system-x86_64 \
     ${HOME_DRIVE} \
     -device virtio-tablet-pci \
     -device virtio-net-pci,netdev=net0 \
-    -netdev user,id=net0 \
+    -netdev user,id=net0,hostfwd=tcp::11234-:1234 \
     ${SERIAL_OPT} \
     ${DISPLAY_OPT} \
     -monitor unix:/tmp/qemu_monitor.sock,server,nowait \

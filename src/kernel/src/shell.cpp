@@ -554,6 +554,9 @@ static int ExecCommand(int argc, const char* const* argv)
             // Spawn kernel console window (shows kernel log in a WM window).
             KernelConsoleSpawn();
 
+            // Spawn TCP debug server (streams kernel log on port 1234).
+            DebugTcpSpawn();
+
             return 0;
         }
 

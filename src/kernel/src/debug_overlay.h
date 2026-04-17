@@ -22,8 +22,16 @@ uint32_t DebugOverlayRead(char* out, uint32_t maxLines, uint32_t lineLen);
 // Get total number of lines written (may wrap).
 uint32_t DebugOverlayTotalLines();
 
+// Read pending lines using an external cursor (for independent consumers).
+// Caller manages *cursor across calls. Returns number of lines read.
+uint32_t DebugOverlayReadFrom(uint32_t* cursor, char* out, uint32_t maxLines, uint32_t lineLen);
+
 // Spawn the kernel console WM window.
 // Must be called after CompositorInit + WmInit + SchedulerInit.
 void KernelConsoleSpawn();
+
+// Spawn the TCP debug server (port 1234).
+// Must be called after NetInit + SchedulerInit.
+void DebugTcpSpawn();
 
 } // namespace brook

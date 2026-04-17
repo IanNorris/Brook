@@ -1,7 +1,8 @@
-// debug_overlay.cpp — Kernel console: ring buffer + WM window.
+// debug_overlay.cpp — Kernel console: ring buffer + WM window + TCP debug server.
 //
 // A kernel thread owns a VFB and renders the last N lines of kernel log
 // output into it. The compositor treats it as a regular window.
+// A second kernel thread streams the ring buffer over TCP on port 1234.
 
 #include "debug_overlay.h"
 #include "font_atlas.h"
@@ -11,6 +12,9 @@
 #include "compositor.h"
 #include "window.h"
 #include "serial.h"
+#include "net.h"
+#include "kprintf.h"
+#include "string.h"
 
 namespace brook {
 
@@ -108,6 +112,41 @@ uint32_t DebugOverlayRead(char* out, uint32_t maxLines, uint32_t lineLen)
 uint32_t DebugOverlayTotalLines()
 {
     return g_totalLines;
+}
+
+uint32_t DebugOverlayReadFrom(uint32_t* cursor, char* out, uint32_t maxLines, uint32_t lineLen)
+{
+    uint64_t flags = SpinLockAcquire(&g_ringLock);
+
+    uint32_t available = g_totalLines - *cursor;
+    if (available > RING_LINES) available = RING_LINES;
+
+    uint32_t count = (available < maxLines) ? available : maxLines;
+
+    uint32_t startIdx;
+    if (g_totalLines <= RING_LINES)
+        startIdx = *cursor;
+    else
+    {
+        uint32_t oldest = g_totalLines - RING_LINES;
+        if (*cursor < oldest) *cursor = oldest;
+        startIdx = *cursor;
+    }
+
+    for (uint32_t i = 0; i < count; i++)
+    {
+        uint32_t ringIdx = (startIdx + i) % RING_LINES;
+        char* dst = out + i * lineLen;
+        const char* src = g_ring[ringIdx];
+        uint32_t j = 0;
+        while (j < lineLen - 1 && src[j]) { dst[j] = src[j]; j++; }
+        dst[j] = '\0';
+    }
+
+    *cursor = startIdx + count;
+
+    SpinLockRelease(&g_ringLock, flags);
+    return count;
 }
 
 // --- Kernel console window thread ------------------------------------------
@@ -266,6 +305,111 @@ void KernelConsoleSpawn()
     }
     SchedulerAddProcess(thread);
     SerialPrintf("KCONSOLE: spawned pid=%u\n", thread->pid);
+}
+
+// --- TCP debug server thread -----------------------------------------------
+
+static constexpr uint16_t DEBUG_TCP_PORT = 1234;
+static constexpr uint32_t TCP_LINE_LEN   = 160;
+static constexpr uint32_t TCP_BATCH      = 32; // lines per send batch
+
+static void DebugTcpThread(void* /*arg*/)
+{
+    // Create listen socket
+    int listenSock = SockCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listenSock < 0)
+    {
+        SerialPuts("DEBUG_TCP: failed to create socket\n");
+        return;
+    }
+
+    SockAddrIn addr;
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(DEBUG_TCP_PORT);
+    addr.sin_addr   = 0; // INADDR_ANY
+
+    if (SockBind(listenSock, &addr) < 0)
+    {
+        SerialPuts("DEBUG_TCP: bind failed\n");
+        SockClose(listenSock);
+        return;
+    }
+
+    if (SockListen(listenSock, 2) < 0)
+    {
+        SerialPuts("DEBUG_TCP: listen failed\n");
+        SockClose(listenSock);
+        return;
+    }
+
+    SerialPrintf("DEBUG_TCP: listening on port %u\n", DEBUG_TCP_PORT);
+
+    // Accept loop — handle one client at a time
+    for (;;)
+    {
+        SockAddrIn peer;
+        int clientSock = SockAccept(listenSock, &peer);
+        if (clientSock < 0)
+        {
+            // Brief pause then retry
+            Process* self = ProcessCurrent();
+            self->wakeupTick = g_lapicTickCount + 500;
+            SchedulerBlock(self);
+            continue;
+        }
+
+        SerialPrintf("DEBUG_TCP: client connected (sock %d)\n", clientSock);
+
+        // Send banner
+        const char* banner = "=== Brook OS Debug Console ===\r\n";
+        SockSend(clientSock, banner, strlen(banner));
+
+        // Stream ring buffer content
+        uint32_t cursor = 0; // start from beginning of ring
+        char lineBuf[TCP_BATCH][TCP_LINE_LEN + 1];
+
+        for (;;)
+        {
+            uint32_t count = DebugOverlayReadFrom(&cursor,
+                reinterpret_cast<char*>(lineBuf), TCP_BATCH, TCP_LINE_LEN + 1);
+
+            for (uint32_t i = 0; i < count; i++)
+            {
+                uint32_t len = 0;
+                while (lineBuf[i][len]) len++;
+                // Append \r\n
+                lineBuf[i][len] = '\r';
+                lineBuf[i][len + 1] = '\n';
+                int ret = SockSend(clientSock, lineBuf[i], len + 2);
+                if (ret < 0)
+                    goto client_done;
+            }
+
+            if (count == 0)
+            {
+                // No new data — sleep briefly
+                Process* self = ProcessCurrent();
+                self->wakeupTick = g_lapicTickCount + 200; // ~200ms
+                SchedulerBlock(self);
+            }
+        }
+
+    client_done:
+        SerialPuts("DEBUG_TCP: client disconnected\n");
+        SockClose(clientSock);
+    }
+}
+
+void DebugTcpSpawn()
+{
+    Process* thread = KernelThreadCreate("debug_tcp", DebugTcpThread, nullptr);
+    if (!thread)
+    {
+        SerialPuts("DEBUG_TCP: failed to create thread\n");
+        return;
+    }
+    SchedulerAddProcess(thread);
+    SerialPrintf("DEBUG_TCP: spawned pid=%u\n", thread->pid);
 }
 
 } // namespace brook
