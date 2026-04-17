@@ -13,14 +13,14 @@ mkdir -p "$BUILD_DIR"
 
 # Use musl cross-compiler from nix (pkgsCross.musl64.stdenv.cc)
 CC="${MUSL_CC:-x86_64-unknown-linux-musl-gcc}"
-CFLAGS="-static -Os -fno-stack-protector -std=gnu11 -DNORMALUNIX -DBROOK -DFEATURE_SOUND -D_DEFAULT_SOURCE -Wall -Wno-unused-result"
+CFLAGS="-static -Os -fno-stack-protector -std=gnu11 -DNORMALUNIX -DBROOK -DFEATURE_SOUND -D_DEFAULT_SOURCE -Wall -Wno-unused-result -Wno-incompatible-pointer-types"
 
 # All DOOM source files (from the original Makefile, minus the Enkel platform file)
 DOOM_SRCS="
 dummy.c am_map.c doomdef.c doomstat.c dstrings.c d_event.c d_items.c d_iwad.c
 d_loop.c d_main.c d_mode.c d_net.c f_finale.c f_wipe.c g_game.c hu_lib.c
 hu_stuff.c info.c i_cdmus.c i_endoom.c i_joystick.c i_scale.c i_sound.c
-i_timer.c memio.c m_argv.c m_bbox.c m_cheat.c m_config.c
+i_timer.c memio.c mus2mid.c m_argv.c m_bbox.c m_cheat.c m_config.c
 m_controls.c m_fixed.c m_menu.c m_misc.c m_random.c p_ceilng.c p_doors.c
 p_enemy.c p_floor.c p_inter.c p_lights.c p_map.c p_maputl.c p_mobj.c
 p_plats.c p_pspr.c p_saveg.c p_setup.c p_sight.c p_spec.c p_switch.c
@@ -36,22 +36,22 @@ for src in $DOOM_SRCS; do
     obj="$BUILD_DIR/${src%.c}.o"
     if [ "$DOOM_SRC/$src" -nt "$obj" ] 2>/dev/null; then
         echo "  CC  $src"
-        $CC $CFLAGS -I"$DOOM_SRC" -c "$DOOM_SRC/$src" -o "$obj"
+        $CC $CFLAGS -I"$BROOK_SRC" -I"$DOOM_SRC" -c "$DOOM_SRC/$src" -o "$obj"
     fi
     OBJS="$OBJS $obj"
 done
 
 # Compile Brook platform file and overrides
 echo "  CC  doomgeneric_brook.c"
-$CC $CFLAGS -I"$DOOM_SRC" -c "$BROOK_SRC/doomgeneric_brook.c" -o "$BUILD_DIR/doomgeneric_brook.o"
+$CC $CFLAGS -I"$BROOK_SRC" -I"$DOOM_SRC" -c "$BROOK_SRC/doomgeneric_brook.c" -o "$BUILD_DIR/doomgeneric_brook.o"
 OBJS="$OBJS $BUILD_DIR/doomgeneric_brook.o"
 
 echo "  CC  i_system.c (Brook override)"
-$CC $CFLAGS -I"$DOOM_SRC" -c "$BROOK_SRC/i_system.c" -o "$BUILD_DIR/i_system_brook.o"
+$CC $CFLAGS -I"$BROOK_SRC" -I"$DOOM_SRC" -c "$BROOK_SRC/i_system.c" -o "$BUILD_DIR/i_system_brook.o"
 OBJS="$OBJS $BUILD_DIR/i_system_brook.o"
 
 echo "  CC  i_osssound.c (Brook OSS audio)"
-$CC $CFLAGS -I"$DOOM_SRC" -c "$BROOK_SRC/i_osssound.c" -o "$BUILD_DIR/i_osssound.o"
+$CC $CFLAGS -I"$BROOK_SRC" -I"$DOOM_SRC" -c "$BROOK_SRC/i_osssound.c" -o "$BUILD_DIR/i_osssound.o"
 OBJS="$OBJS $BUILD_DIR/i_osssound.o"
 
 # Link
