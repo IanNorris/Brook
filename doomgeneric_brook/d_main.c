@@ -404,6 +404,12 @@ boolean D_GrabMouseCallback(void)
 
 void doomgeneric_Tick()
 {
+    static int tickCount = 0;
+    if (tickCount < 3)
+        W_VerifyHashTable(tickCount == 0 ? "Tick#0 start" :
+                          tickCount == 1 ? "Tick#1 start" : "Tick#2 start");
+    tickCount++;
+
     // frame syncronous IO operations
     I_StartFrame ();
 
@@ -451,6 +457,7 @@ void D_DoomLoop (void)
     R_ExecuteSetViewSize();
 
     D_StartGameLoop();
+    W_VerifyHashTable("after D_StartGameLoop");
 
     if (testcontrols)
     {
@@ -538,9 +545,17 @@ void D_DoAdvanceDemo (void)
 	gamestate = GS_DEMOSCREEN;
 	pagename = DEH_String("TITLEPIC");
 	if ( gamemode == commercial )
+	{
+	  W_VerifyHashTable("before S_StartMusic");
 	  S_StartMusic(mus_dm2ttl);
+	  W_VerifyHashTable("after S_StartMusic");
+	}
 	else
+	{
+	  W_VerifyHashTable("before S_StartMusic");
 	  S_StartMusic (mus_intro);
+	  W_VerifyHashTable("after S_StartMusic");
+	}
 	break;
       case 1:
 	G_DeferedPlayDemo(DEH_String("demo1"));

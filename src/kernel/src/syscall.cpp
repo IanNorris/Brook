@@ -2864,9 +2864,11 @@ struct FbFixScreeninfo {
     uint16_t reserved[2];
 };
 
-static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
+static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
                           uint64_t, uint64_t, uint64_t)
 {
+    // ioctl cmd is a 32-bit value; mask off sign-extension from syscall ABI
+    uint64_t cmd = cmd_raw & 0xFFFFFFFFULL;
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
     FdEntry* fde = FdGet(proc, static_cast<int>(fd));
