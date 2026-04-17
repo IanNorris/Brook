@@ -352,6 +352,9 @@ static bool SetupCorbRirb()
     g_corbPhys = VmmVirtToPhys(KernelPageTable, page).raw();
     g_rirbPhys = g_corbPhys + 1024;
 
+    SerialPrintf("intel_hda: DMA CORB/RIRB phys=0x%lx (page 0x%lx)\n",
+                 g_corbPhys, g_corbPhys & ~0xFFFULL);
+
     // Stop CORB and RIRB
     hda_write8(CORBCTL, 0);
     hda_write8(RIRBCTL, 0);
@@ -840,6 +843,10 @@ static int IntelHdaInit()
     }
     g_audioBuf = reinterpret_cast<uint8_t*>(audioBufAddr.raw());
     g_audioBufPhys = VmmVirtToPhys(KernelPageTable, audioBufAddr).raw();
+
+    SerialPrintf("intel_hda: DMA BDL phys=0x%lx audio phys=0x%lx..0x%lx (%u pages)\n",
+                 g_bdlPhys, g_audioBufPhys,
+                 g_audioBufPhys + AUDIO_BUF_SIZE - 1, audioPages);
 
     // Enable interrupts (global + controller + stream 0)
     hda_write32(INTCTL, INTCTL_GIE | INTCTL_CIE |

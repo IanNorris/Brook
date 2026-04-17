@@ -1596,6 +1596,18 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         for (uint64_t p = 0; p < pages; ++p)
             zeroUserPage(vaddr + p * 4096);
 
+        // Log large mmap allocations with physical pages for DMA overlap debugging
+        if (pages >= 256) { // 1MB+
+            PhysicalAddress firstPhys = VmmVirtToPhys(proc->pageTable,
+                                                       VirtualAddress(vaddr));
+            PhysicalAddress lastPhys = VmmVirtToPhys(proc->pageTable,
+                                                      VirtualAddress(vaddr + (pages-1) * 4096));
+            SerialPrintf("mmap: pid=%u virt=0x%lx pages=%lu firstPhys=0x%lx lastPhys=0x%lx\n",
+                         proc->pid, vaddr, pages,
+                         firstPhys.raw() & ~0xFFFULL,
+                         lastPhys.raw() & ~0xFFFULL);
+        }
+
         return static_cast<int64_t>(vaddr);
     }
 
