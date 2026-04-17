@@ -41,6 +41,9 @@ uint32_t SmpCurrentCpuIndex();
 // Must be called from BSP only. Safe to call from panic/exception context.
 uint32_t SmpHaltAllAPs();
 
+// Check if a panic halt is active (set by SmpHaltAllAPs).
+bool SmpIsPanicActive();
+
 // Per-CPU halted state captured by NMI handler.
 struct CpuHaltedState {
     uint64_t rip;

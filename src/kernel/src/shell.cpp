@@ -398,6 +398,69 @@ static void CmdPs();
 static void CmdMem();
 static void CmdLs(int argc, const char* const* argv);
 
+// Background wallpaper loader thread — reads ~8MB WALLPAPER.RAW without
+// blocking the shell/WM init path.
+static void WallpaperLoaderThread(void* /*arg*/)
+{
+    using namespace brook;
+
+    VnodeStat st;
+    if (VfsStatPath("/boot/WALLPAPER.RAW", &st) != 0 || st.size <= 8)
+    {
+        KLog("wallpaper: file not found or too small");
+        return;
+    }
+
+    auto* pixels = static_cast<uint32_t*>(kmalloc(st.size));
+    if (!pixels)
+    {
+        KLog("wallpaper: alloc failed (%llu bytes)", st.size);
+        return;
+    }
+
+    Vnode* vn = VfsOpen("/boot/WALLPAPER.RAW", 0);
+    if (!vn)
+    {
+        kfree(pixels);
+        KLog("wallpaper: open failed");
+        return;
+    }
+
+    uint64_t off = 0;
+    uint64_t remaining = st.size;
+    auto* dest = reinterpret_cast<uint8_t*>(pixels);
+    while (remaining > 0)
+    {
+        uint64_t chunk = remaining > 65536 ? 65536 : remaining;
+        int rd = VfsRead(vn, dest + off, chunk, &off);
+        if (rd <= 0) break;
+        remaining -= rd;
+    }
+    VfsClose(vn);
+
+    if (remaining != 0)
+    {
+        kfree(pixels);
+        KLog("wallpaper: read error");
+        return;
+    }
+
+    uint32_t wpW = pixels[0];
+    uint32_t wpH = pixels[1];
+    uint64_t expected = 8 + static_cast<uint64_t>(wpW) * wpH * 4;
+    if (st.size == expected && wpW > 0 && wpH > 0
+        && wpW <= 3840 && wpH <= 2160)
+    {
+        CompositorSetWallpaper(pixels + 2, wpW, wpH);
+        KLog("wallpaper: loaded (%ux%u)", wpW, wpH);
+    }
+    else
+    {
+        kfree(pixels);
+        KLog("wallpaper: bad header (%ux%u, size %llu)", wpW, wpH, st.size);
+    }
+}
+
 static int ExecCommand(int argc, const char* const* argv)
 {
     if (argc == 0) return 0;
@@ -472,55 +535,13 @@ static int ExecCommand(int argc, const char* const* argv)
             WmSetActive(true);
             g_ttyFull = false; // WM takes over the screen
 
-            // Try to load wallpaper from disk
-            using namespace brook;
-            VnodeStat st;
-            if (VfsStatPath("/boot/WALLPAPER.RAW", &st) == 0 && st.size > 8)
+            // Load wallpaper asynchronously so WM startup isn't blocked.
             {
-                auto* pixels = static_cast<uint32_t*>(kmalloc(st.size));
-                if (pixels)
-                {
-                    Vnode* vn = VfsOpen("/boot/WALLPAPER.RAW", 0);
-                    if (vn)
-                    {
-                        uint64_t off = 0;
-                        uint64_t remaining = st.size;
-                        auto* dest = reinterpret_cast<uint8_t*>(pixels);
-                        while (remaining > 0)
-                        {
-                            uint64_t chunk = remaining > 65536 ? 65536 : remaining;
-                            int rd = VfsRead(vn, dest + off, chunk, &off);
-                            if (rd <= 0) break;
-                            remaining -= rd;
-                        }
-                        VfsClose(vn);
-                        if (remaining == 0)
-                        {
-                            // First 8 bytes: uint32_t width, uint32_t height
-                            uint32_t wpW = pixels[0];
-                            uint32_t wpH = pixels[1];
-                            uint64_t expected = 8 + (uint64_t)wpW * wpH * 4;
-                            if (st.size == expected && wpW > 0 && wpH > 0
-                                && wpW <= 3840 && wpH <= 2160)
-                            {
-                                // Pixel data starts at offset 2 (after header)
-                                CompositorSetWallpaper(pixels + 2, wpW, wpH);
-                                KPrintf("wallpaper: loaded (%ux%u)\n", wpW, wpH);
-                            }
-                            else
-                            {
-                                kfree(pixels);
-                                KPrintf("wallpaper: bad header (%ux%u, size %llu)\n",
-                                        wpW, wpH, st.size);
-                            }
-                        }
-                        else
-                        {
-                            kfree(pixels);
-                            KPrintf("wallpaper: read error\n");
-                        }
-                    }
-                }
+                using namespace brook;
+                Process* wpThread = KernelThreadCreate("wp_loader",
+                    WallpaperLoaderThread, nullptr);
+                if (wpThread)
+                    SchedulerAddProcess(wpThread);
             }
 
             KPrintf("window manager: enabled\n");

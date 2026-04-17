@@ -199,6 +199,7 @@ add_executable(kernel
     src/sched_policy.cpp
     src/exception_info.cpp
     src/debug_overlay.cpp
+    src/panic_screen.cpp
     # Default scheduler policy (statically linked fallback)
     "${BROOK_ROOT}/src/modules/sched_rr.cpp"
     # Memory subsystem
@@ -274,6 +275,7 @@ set_source_files_properties(
     src/keyboard.cpp
     src/mouse.cpp
     src/panic.cpp
+    src/panic_screen.cpp
     src/exception_info.cpp
     src/profiler.cpp
     src/smp.cpp

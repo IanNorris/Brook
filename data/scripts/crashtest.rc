@@ -1,0 +1,4 @@
+# Brook OS boot script — crash test (kernel GPF)
+set tty full
+run crash_test gpf
+wait

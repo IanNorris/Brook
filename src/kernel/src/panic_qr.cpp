@@ -68,7 +68,7 @@ static uint32_t BuildPanicPacket(uint8_t* buf, uint32_t bufLen,
     return off;
 }
 
-// Render QR code to framebuffer at a given position
+// Render QR code to framebuffer — positioned in the right portion of the screen.
 static void RenderQRToFramebuffer(uint32_t* fb, uint32_t fbWidth, uint32_t fbHeight,
                                    uint32_t fbStride, const uint8_t* qrcode)
 {
@@ -77,6 +77,15 @@ static void RenderQRToFramebuffer(uint32_t* fb, uint32_t fbWidth, uint32_t fbHei
 
     const uint32_t black = 0x00000000;
     const uint32_t white = 0xFFFFFFFF - (QR_CONTRAST * 0x11111111);
+
+    // Position the QR in the right column, vertically centred
+    uint32_t qrPixelSize = static_cast<uint32_t>(size + 2 * QR_BORDER_WIDTH) * QR_PIXELS_PER_MODULE;
+    uint32_t startX = fbWidth > qrPixelSize + 40
+                      ? fbWidth * 55 / 100 + (fbWidth * 45 / 100 - qrPixelSize) / 2
+                      : QR_START_X;
+    uint32_t startY = fbHeight > qrPixelSize + 100
+                      ? (fbHeight - qrPixelSize) / 2
+                      : QR_START_Y;
 
     for (int y = -QR_BORDER_WIDTH; y < size + QR_BORDER_WIDTH; ++y)
     {
@@ -93,8 +102,8 @@ static void RenderQRToFramebuffer(uint32_t* fb, uint32_t fbWidth, uint32_t fbHei
             {
                 for (uint32_t mx = 0; mx < QR_PIXELS_PER_MODULE; ++mx)
                 {
-                    uint32_t px = QR_START_X + posX + mx;
-                    uint32_t py = QR_START_Y + posY + my;
+                    uint32_t px = startX + posX + mx;
+                    uint32_t py = startY + posY + my;
                     if (px < fbWidth && py < fbHeight)
                         fb[py * strideQuads + px] = colour;
                 }

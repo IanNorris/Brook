@@ -241,5 +241,6 @@ qemu-system-x86_64 \
     ${DISPLAY_OPT} \
     -monitor unix:/tmp/qemu_monitor.sock,server,nowait \
     -no-reboot \
+    -no-shutdown \
     ${DEBUG_FLAGS} \
     "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"

@@ -54,9 +54,10 @@ static volatile uint32_t g_apSignal = 0;
 // ---------------------------------------------------------------------------
 // Panic halt state — NMI handler captures per-CPU state here
 // ---------------------------------------------------------------------------
-static volatile bool      g_panicHaltActive = false;
-static CpuHaltedState     g_haltedState[MAX_CPUS] = {};
-static volatile uint32_t  g_haltedCount = 0;
+// These are extern "C" so the naked asm NMI handler can reference them.
+extern "C" volatile bool      g_panicHaltActive = false;
+static CpuHaltedState         g_haltedState[MAX_CPUS] = {};
+extern "C" volatile uint32_t  g_haltedCount = 0;
 
 // Forward-declare ProcessCurrent for capturing PID
 extern Process* ProcessCurrent();
@@ -373,6 +374,9 @@ uint32_t SmpInit()
     VmmUnmapPage(VmmKernelCR3(), VirtualAddress(TEMP_STACK_PHYS));
 
     KPrintf("SMP: %u/%u CPUs online\n", g_onlineCount, g_cpuCount);
+
+    InstallPanicNmiHandler();
+
     return g_onlineCount;
 }
 
@@ -470,57 +474,64 @@ uint32_t SmpCurrentCpuIndex()
 // When g_panicHaltActive is true, the NMI handler captures the interrupted
 // RIP/RSP/RBP and the current PID, then spins forever with cli;hlt.
 // This is installed as the vector 2 handler during SmpInit.
+//
+// We use a naked asm handler to avoid any compiler-generated prologue that
+// might fault (e.g., SSE saves, red zone issues). This handler:
+//   1. Checks g_panicHaltActive — if not set, iretq (spurious NMI)
+//   2. Atomically increments g_haltedCount
+//   3. Spins forever with cli; hlt
 
-__attribute__((interrupt))
-static void PanicNmiHandler(InterruptFrame* frame)
-{
-    if (!g_panicHaltActive)
-    {
-        // Spurious NMI or not in panic — just return
-        return;
-    }
-
-    uint32_t cpuIdx = SmpCurrentCpuIndex();
-
-    g_haltedState[cpuIdx].rip = frame->ip;
-    g_haltedState[cpuIdx].rsp = frame->sp;
-
-    // Capture RBP from the interrupted context
-    uint64_t rbp;
-    __asm__ volatile("movq %%rbp, %0" : "=r"(rbp));
-    g_haltedState[cpuIdx].rbp = rbp;
-
-    // Capture current process PID
-    Process* cur = ProcessCurrent();
-    g_haltedState[cpuIdx].pid = cur ? cur->pid : 0;
-    g_haltedState[cpuIdx].halted = true;
-
-    __atomic_add_fetch(&g_haltedCount, 1, __ATOMIC_SEQ_CST);
-
-    // Spin forever — this CPU is done
-    for (;;)
-        __asm__ volatile("cli; hlt");
-}
+__asm__(
+    ".global PanicNmiHandlerAsm\n"
+    "PanicNmiHandlerAsm:\n"
+    "    cmpb $0, g_panicHaltActive(%rip)\n"
+    "    je .Lnmi_return\n"
+    "    lock incl g_haltedCount(%rip)\n"
+    ".Lnmi_spin:\n"
+    "    cli\n"
+    "    hlt\n"
+    "    jmp .Lnmi_spin\n"
+    ".Lnmi_return:\n"
+    "    iretq\n"
+);
+extern "C" void PanicNmiHandlerAsm();
 
 uint32_t SmpHaltAllAPs()
 {
-    // Mark panic halt active so NMI handler captures state
-    __atomic_store_n(&g_panicHaltActive, true, __ATOMIC_SEQ_CST);
+    SerialPuts("SmpHalt: CAS\n");
+    // Only the first caller broadcasts NMI — subsequent calls skip
+    bool expected = false;
+    if (!__atomic_compare_exchange_n(&g_panicHaltActive, &expected, true,
+                                     false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+    {
+        SerialPuts("SmpHalt: already active, skip\n");
+        // Already in panic halt — don't re-broadcast
+        return __atomic_load_n(&g_haltedCount, __ATOMIC_ACQUIRE);
+    }
+
+    SerialPuts("SmpHalt: NMI broadcast\n");
     __atomic_store_n(&g_haltedCount, 0, __ATOMIC_SEQ_CST);
 
     // Send NMI to all other CPUs
     ApicBroadcastNmi();
 
+    SerialPuts("SmpHalt: waiting\n");
     // Wait up to ~10ms for APs to halt (they should respond almost instantly)
-    uint32_t expected = g_onlineCount > 1 ? g_onlineCount - 1 : 0;
+    uint32_t expected_count = g_onlineCount > 1 ? g_onlineCount - 1 : 0;
     for (uint32_t spin = 0; spin < 10000; ++spin)
     {
-        if (__atomic_load_n(&g_haltedCount, __ATOMIC_ACQUIRE) >= expected)
+        if (__atomic_load_n(&g_haltedCount, __ATOMIC_ACQUIRE) >= expected_count)
             break;
         for (volatile int d = 0; d < 1000; d++) {}
     }
 
+    SerialPuts("SmpHalt: done\n");
     return __atomic_load_n(&g_haltedCount, __ATOMIC_ACQUIRE);
+}
+
+bool SmpIsPanicActive()
+{
+    return __atomic_load_n(&g_panicHaltActive, __ATOMIC_ACQUIRE);
 }
 
 const CpuHaltedState* SmpGetHaltedState(uint32_t cpuIndex)
@@ -532,7 +543,7 @@ const CpuHaltedState* SmpGetHaltedState(uint32_t cpuIndex)
 // Install the panic-aware NMI handler. Called during SmpInit.
 static void InstallPanicNmiHandler()
 {
-    IdtInstallHandler(2, reinterpret_cast<void*>(PanicNmiHandler));
+    IdtInstallHandler(2, reinterpret_cast<void*>(PanicNmiHandlerAsm));
 }
 
 } // namespace brook

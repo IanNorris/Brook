@@ -2,6 +2,8 @@
 #include "gdt.h"
 #include "serial.h"
 #include "panic.h"
+#include "panic_screen.h"
+#include "panic_qr.h"
 #include "process.h"
 #include "scheduler.h"
 #include "apic.h"
@@ -9,6 +11,8 @@
 #include "compositor.h"
 #include "ksym_addrs.h"
 #include "exception_info.h"
+#include "build_info.h"
+#include "tty.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 
@@ -223,9 +227,20 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
         ExcPutsRaw(" — halting ===\n");
         ExcPutsRaw("  RIP   "); ExcPutHex(frame->ip); ExcPutsRaw("\n");
         ExcPutsRaw("  RSP   "); ExcPutHex(frame->sp); ExcPutsRaw("\n");
-        for (;;) __asm__ volatile("cli; hlt");
+        for (;;) __asm__ volatile("cli; pause");
     }
     ++excDepthPerCpu[cpuSlot];
+
+    // If a panic is already active (another CPU called KernelPanic and
+    // SmpHaltAllAPs), this CPU should NOT produce any output or render
+    // a panic screen — it would garble the output. Just spin forever.
+    // The panicking CPU's SmpHaltAllAPs sets g_panicHaltActive before
+    // broadcasting NMI. If the NMI didn't reach us (or we faulted before
+    // it arrived), this guard catches us.
+    if (brook::SmpIsPanicActive())
+    {
+        for (;;) __asm__ volatile("cli; hlt");
+    }
 
     // For kernel-mode faults: halt all other CPUs and stop compositor
     // before producing any output, so nothing overwrites the crash screen.
@@ -522,7 +537,7 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
 
     // Halt here — kernel-mode exception is unrecoverable.
     // Use cli before hlt so timer interrupts don't wake us.
-    for (;;) { __asm__ volatile("cli; hlt"); }
+    for (;;) { __asm__ volatile("cli; pause"); }
 }
 
 // ---------------------------------------------------------------------------
@@ -555,6 +570,15 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
 {
     // The assembly stub has already done SWAPGS if needed.
     __asm__ volatile("cli");
+
+    // If a panic is already active, this CPU must not produce output or
+    // render a panic screen — it would garble the panicking CPU's work.
+    // This catches CPUs that enter via ExceptionStub13/14 (which bypass
+    // HandleException where the main guard lives).
+    if (brook::SmpIsPanicActive())
+    {
+        for (;;) __asm__ volatile("cli; hlt");
+    }
 
     bool fromUser = (ef->cs & 3) != 0;
 
@@ -668,6 +692,56 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         ExcPutsRaw("  R12 "); ExcPutHex(ef->r12); ExcPutsRaw("  R13 "); ExcPutHex(ef->r13); ExcPutsRaw("\n");
         ExcPutsRaw("  R14 "); ExcPutHex(ef->r14); ExcPutsRaw("  R15 "); ExcPutHex(ef->r15); ExcPutsRaw("\n");
 
+        // Render visual panic screen with full register state + QR code
+        {
+            uint32_t physStride = 0;
+            volatile uint32_t* physFb = brook::CompositorGetPhysFb(&physStride);
+            uint32_t fbW = 0, fbH = 0;
+            brook::CompositorGetPhysDims(&fbW, &fbH);
+            if (physFb && fbW && fbH)
+            {
+                uint32_t fbStride = physStride * 4; // pixel stride → byte stride
+                brook::PanicCPURegs pregs = {};
+                pregs.rax = ef->rax; pregs.rbx = ef->rbx;
+                pregs.rcx = ef->rcx; pregs.rdx = ef->rdx;
+                pregs.rsi = ef->rsi; pregs.rdi = ef->rdi;
+                pregs.r8  = ef->r8;  pregs.r9  = ef->r9;
+                pregs.r10 = ef->r10; pregs.r11 = ef->r11;
+                pregs.r12 = ef->r12; pregs.r13 = ef->r13;
+                pregs.r14 = ef->r14; pregs.r15 = ef->r15;
+                pregs.rip = ef->rip; pregs.rsp = ef->rsp;
+                pregs.rbp = ef->rbp; pregs.rflags = ef->rflags;
+                pregs.cs  = static_cast<uint16_t>(ef->cs);
+                pregs.ss  = static_cast<uint16_t>(ef->ss);
+                __asm__ volatile("movq %%cr0, %0" : "=r"(pregs.cr0));
+                __asm__ volatile("movq %%cr2, %0" : "=r"(pregs.cr2));
+                __asm__ volatile("movq %%cr3, %0" : "=r"(pregs.cr3));
+                __asm__ volatile("movq %%cr4, %0" : "=r"(pregs.cr4));
+
+                // Walk stack for trace
+                brook::PanicStackTrace ptrace = {};
+                uint64_t* rbpPtr = reinterpret_cast<uint64_t*>(ef->rbp);
+                ptrace.rip[0] = ef->rip;
+                ptrace.depth = 1;
+                for (uint8_t d = 1; d < brook::PANIC_MAX_STACK_DEPTH; d++)
+                {
+                    uint64_t addr = reinterpret_cast<uint64_t>(rbpPtr);
+                    if (addr < 0xFFFF800000000000ULL || addr == 0) break;
+                    ptrace.rip[d] = rbpPtr[1];
+                    ptrace.depth = d + 1;
+                    rbpPtr = reinterpret_cast<uint64_t*>(rbpPtr[0]);
+                }
+
+                brook::PanicScreenInfo psi = {};
+                psi.message   = "Unrecoverable kernel exception";
+                psi.regs      = &pregs;
+                psi.trace     = &ptrace;
+                psi.vector    = vector;
+                psi.errorCode = ef->errorCode;
+                brook::PanicScreenRender(const_cast<uint32_t*>(physFb), fbW, fbH, fbStride, &psi);
+            }
+        }
+
         InterruptFrame ifrm;
         ifrm.ip    = ef->rip;
         ifrm.cs    = ef->cs;
@@ -676,7 +750,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         ifrm.ss    = ef->ss;
         HandleException(static_cast<uint8_t>(vector), &ifrm, ef->errorCode, true);
         // HandleException never returns for kernel faults.
-        for (;;) __asm__ volatile("cli; hlt");
+        for (;;) __asm__ volatile("cli; pause");
     }
 
     // --- User-mode fault ---
@@ -926,7 +1000,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
     ifrm.ss    = ef->ss;
     HandleException(static_cast<uint8_t>(vector), &ifrm, ef->errorCode, true, true /*swapgsDone*/);
     // HandleException never returns for user-mode faults (it exits the process).
-    for (;;) __asm__ volatile("cli; hlt");
+    for (;;) __asm__ volatile("cli; pause");
 }
 
 // ---- Exception stubs: no error code ----
@@ -1104,7 +1178,9 @@ uint8_t IoApicRegisterHandler(uint8_t irq, uint8_t preferredVector, void* handle
 
 void IdtInstallHandler(uint8_t vector, void* handler)
 {
-    SetIdtEntry(vector, handler);
+    // Preserve the IST setting from the existing entry
+    uint8_t ist = g_idt[vector].ist;
+    SetIdtEntry(vector, handler, ist);
     __asm__ volatile("lidt %0" : : "m"(g_idtDesc));
 }
 
@@ -1115,7 +1191,7 @@ void IdtInit(brook::Framebuffer* fb)
     // Exception handlers 0-31
     SetIdtEntry( 0, reinterpret_cast<void*>(ExceptionHandler0));
     SetIdtEntry( 1, reinterpret_cast<void*>(ExceptionHandler1));
-    SetIdtEntry( 2, reinterpret_cast<void*>(ExceptionHandler2));
+    SetIdtEntry( 2, reinterpret_cast<void*>(ExceptionHandler2), IST_NMI);
     SetIdtEntry( 3, reinterpret_cast<void*>(ExceptionHandler3));
     SetIdtEntry( 4, reinterpret_cast<void*>(ExceptionHandler4));
     SetIdtEntry( 5, reinterpret_cast<void*>(ExceptionHandler5));
