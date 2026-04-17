@@ -5,6 +5,9 @@
 #include "tty.h"
 #include "panic_qr.h"
 #include "compositor.h"
+#include "smp.h"
+#include "build_info.h"
+#include "ksym_addrs.h"
 
 // ---- Register capture -------------------------------------------------------
 struct PanicRegs {
@@ -230,7 +233,10 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
 {
     __asm__ volatile("cli");
 
-    // Stop the compositor so APs don't overwrite the panic screen.
+    // Halt all other CPUs first — they must stop before we touch FB/serial
+    brook::SmpHaltAllAPs();
+
+    // Stop the compositor so nothing overwrites the panic screen.
     brook::CompositorHalt();
 
     int depth = __atomic_add_fetch(&g_panicNesting, 1, __ATOMIC_SEQ_CST);
@@ -261,13 +267,28 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
 
     // -- Serial output (always available) ------------------------------------
     brook::SerialPuts("\n*** KERNEL PANIC ***\n");
+    brook::SerialPuts("Brook OS "); brook::SerialPuts(brook::BuildDate());
+    brook::SerialPuts(" ("); brook::SerialPuts(brook::BuildGitHash());
+    brook::SerialPuts(")\n");
     brook::SerialPuts(g_panicBuf);
     brook::SerialPuts("RIP "); SerialPutHex64(regs.rip);
-    brook::SerialPuts("  RSP "); SerialPutHex64(regs.rsp);
+    // Symbolicate RIP
+    {
+        const char* symName = nullptr;
+        uint64_t symOff = 0;
+        if (brook::KsymFindByAddr(regs.rip, &symName, &symOff))
+        {
+            brook::SerialPuts("  ");
+            brook::SerialPuts(symName);
+            brook::SerialPuts("+0x");
+            SerialPutHex64(symOff);
+        }
+    }
+    brook::SerialPuts("\nRSP "); SerialPutHex64(regs.rsp);
     brook::SerialPuts("\nCR2 "); SerialPutHex64(regs.cr2);
     brook::SerialPuts("  CR3 "); SerialPutHex64(regs.cr3);
 
-    // Stack trace
+    // Stack trace with symbols
     brook::SerialPuts("\nStack trace (");
     {
         char depthStr[4];
@@ -288,6 +309,14 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
         brook::SerialPuts(idxStr);
         brook::SerialPuts("] ");
         SerialPutHex64(trace.rip[i]);
+        // Symbolicate
+        const char* symName = nullptr;
+        uint64_t symOff = 0;
+        if (brook::KsymFindByAddr(trace.rip[i], &symName, &symOff))
+        {
+            brook::SerialPuts("  ");
+            brook::SerialPuts(symName);
+        }
         brook::SerialPuts("\n");
     }
     brook::SerialPuts("System halted.\n");
@@ -298,6 +327,9 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
         brook::TtySetColors(0xFFFFFF, 0xCC0000); // white on red
         brook::TtyPuts("\n*** KERNEL PANIC ***\n");
         brook::TtySetColors(0xFFFFFF, 0x1A0000); // white on dark red
+        brook::TtyPuts("Brook OS "); brook::TtyPuts(brook::BuildDate());
+        brook::TtyPuts(" ("); brook::TtyPuts(brook::BuildGitHash());
+        brook::TtyPuts(")\n");
         brook::TtyPuts(g_panicBuf);
         brook::TtyPuts("RIP "); TtyPutHex64(regs.rip);
         brook::TtyPuts("  RSP "); TtyPutHex64(regs.rsp);
@@ -308,6 +340,13 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
         for (uint8_t i = 0; i < trace.depth; i++) {
             brook::TtyPuts("  ");
             TtyPutHex64(trace.rip[i]);
+            const char* symName = nullptr;
+            uint64_t symOff = 0;
+            if (brook::KsymFindByAddr(trace.rip[i], &symName, &symOff))
+            {
+                brook::TtyPuts("  ");
+                brook::TtyPuts(symName);
+            }
             brook::TtyPuts("\n");
         }
         brook::TtyPuts("System halted.\n");

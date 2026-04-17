@@ -391,6 +391,38 @@ uint64_t ApicGetLapicVirtBase()
 }
 
 // ---------------------------------------------------------------------------
+// NMI delivery via LAPIC ICR (for panic halt)
+// ---------------------------------------------------------------------------
+// ICR format (low 32 bits):
+//   bits  7:0  = vector (ignored for NMI delivery mode)
+//   bits 10:8  = delivery mode (100 = NMI)
+//   bit  11    = destination mode (0 = physical)
+//   bit  14    = level (1 = assert)
+//   bits 19:18 = destination shorthand (00 = use ICR_HI dest field)
+// ICR_HI bits 31:24 = destination APIC ID
+
+void ApicSendNmi(uint8_t targetApicId)
+{
+    // Wait for previous IPI to be delivered
+    while (LapicRead(LapicReg::ICR_LO) & (1u << 12))
+        __asm__ volatile("pause");
+
+    LapicWrite(LapicReg::ICR_HI, static_cast<uint32_t>(targetApicId) << 24);
+    // Delivery mode = NMI (0b100 << 8), level assert (1 << 14)
+    LapicWrite(LapicReg::ICR_LO, (0x4 << 8) | (1u << 14));
+}
+
+void ApicBroadcastNmi()
+{
+    // Wait for previous IPI to be delivered
+    while (LapicRead(LapicReg::ICR_LO) & (1u << 12))
+        __asm__ volatile("pause");
+
+    // Shorthand = 11 (all excluding self), delivery mode = NMI
+    LapicWrite(LapicReg::ICR_LO, (0x3 << 18) | (0x4 << 8) | (1u << 14));
+}
+
+// ---------------------------------------------------------------------------
 // I/O APIC
 // ---------------------------------------------------------------------------
 //

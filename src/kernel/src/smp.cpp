@@ -3,9 +3,11 @@
 #include "apic.h"
 #include "cpu.h"
 #include "gdt.h"
+#include "idt.h"
 #include "serial.h"
 #include "kprintf.h"
 #include "scheduler.h"
+#include "process.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "memory/heap.h"
@@ -48,6 +50,19 @@ static uint32_t    g_onlineCount = 0;
 
 // Volatile signal: set by AP to tell BSP it's alive.
 static volatile uint32_t g_apSignal = 0;
+
+// ---------------------------------------------------------------------------
+// Panic halt state — NMI handler captures per-CPU state here
+// ---------------------------------------------------------------------------
+static volatile bool      g_panicHaltActive = false;
+static CpuHaltedState     g_haltedState[MAX_CPUS] = {};
+static volatile uint32_t  g_haltedCount = 0;
+
+// Forward-declare ProcessCurrent for capturing PID
+extern Process* ProcessCurrent();
+
+// Forward-declare for NMI handler installation (defined below)
+static void InstallPanicNmiHandler();
 
 // Per-AP activation flag: BSP sets to 1 to tell AP to proceed.
 static volatile uint32_t g_apActivate[MAX_CPUS] = {};
@@ -253,6 +268,7 @@ uint32_t SmpInit()
         g_cpus[0].online = true;
         g_cpuCount = 1;
         g_onlineCount = 1;
+        InstallPanicNmiHandler();
         return 1;
     }
 
@@ -446,6 +462,77 @@ uint32_t SmpCurrentCpuIndex()
             return i;
     }
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// NMI handler for panic halt
+// ---------------------------------------------------------------------------
+// When g_panicHaltActive is true, the NMI handler captures the interrupted
+// RIP/RSP/RBP and the current PID, then spins forever with cli;hlt.
+// This is installed as the vector 2 handler during SmpInit.
+
+__attribute__((interrupt))
+static void PanicNmiHandler(InterruptFrame* frame)
+{
+    if (!g_panicHaltActive)
+    {
+        // Spurious NMI or not in panic — just return
+        return;
+    }
+
+    uint32_t cpuIdx = SmpCurrentCpuIndex();
+
+    g_haltedState[cpuIdx].rip = frame->ip;
+    g_haltedState[cpuIdx].rsp = frame->sp;
+
+    // Capture RBP from the interrupted context
+    uint64_t rbp;
+    __asm__ volatile("movq %%rbp, %0" : "=r"(rbp));
+    g_haltedState[cpuIdx].rbp = rbp;
+
+    // Capture current process PID
+    Process* cur = ProcessCurrent();
+    g_haltedState[cpuIdx].pid = cur ? cur->pid : 0;
+    g_haltedState[cpuIdx].halted = true;
+
+    __atomic_add_fetch(&g_haltedCount, 1, __ATOMIC_SEQ_CST);
+
+    // Spin forever — this CPU is done
+    for (;;)
+        __asm__ volatile("cli; hlt");
+}
+
+uint32_t SmpHaltAllAPs()
+{
+    // Mark panic halt active so NMI handler captures state
+    __atomic_store_n(&g_panicHaltActive, true, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_haltedCount, 0, __ATOMIC_SEQ_CST);
+
+    // Send NMI to all other CPUs
+    ApicBroadcastNmi();
+
+    // Wait up to ~10ms for APs to halt (they should respond almost instantly)
+    uint32_t expected = g_onlineCount > 1 ? g_onlineCount - 1 : 0;
+    for (uint32_t spin = 0; spin < 10000; ++spin)
+    {
+        if (__atomic_load_n(&g_haltedCount, __ATOMIC_ACQUIRE) >= expected)
+            break;
+        for (volatile int d = 0; d < 1000; d++) {}
+    }
+
+    return __atomic_load_n(&g_haltedCount, __ATOMIC_ACQUIRE);
+}
+
+const CpuHaltedState* SmpGetHaltedState(uint32_t cpuIndex)
+{
+    if (cpuIndex >= MAX_CPUS) return nullptr;
+    return &g_haltedState[cpuIndex];
+}
+
+// Install the panic-aware NMI handler. Called during SmpInit.
+static void InstallPanicNmiHandler()
+{
+    IdtInstallHandler(2, reinterpret_cast<void*>(PanicNmiHandler));
 }
 
 } // namespace brook

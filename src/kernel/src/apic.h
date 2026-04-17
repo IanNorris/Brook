@@ -85,4 +85,10 @@ void ApicInitTimerOnAp();
 // interrupt on the BSP — approximately 1 ms resolution).
 uint64_t ApicTickCount();
 
+// Send an NMI to a specific CPU by LAPIC ID.
+void ApicSendNmi(uint8_t targetApicId);
+
+// Broadcast NMI to all CPUs except self (for panic halt).
+void ApicBroadcastNmi();
+
 } // namespace brook

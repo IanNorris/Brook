@@ -122,6 +122,25 @@ file(COPY
 file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/src/ffconf.h" DESTINATION "${FATFS_BUILD_DIR}")
 
 # ---------------------------------------------------------------------------
+# Kernel symbol address table (addr → name reverse lookup for crash dumps)
+# ---------------------------------------------------------------------------
+# This is a two-pass build: the first link uses an empty stub table, then a
+# POST_BUILD step runs gen_ksym_table.py on the ELF to produce the real table.
+# Run 'cmake --build' a second time for the final symbol table to be linked in.
+
+set(KSYM_TABLE_CPP "${CMAKE_CURRENT_BINARY_DIR}/ksym_addr_table.cpp")
+
+if(NOT EXISTS "${KSYM_TABLE_CPP}")
+    file(WRITE "${KSYM_TABLE_CPP}"
+"// Stub — will be replaced by gen_ksym_table.py after first link\n\
+#include \"ksym_addrs.h\"\n\
+namespace brook {\n\
+extern const KsymAddrEntry g_ksymAddrTable[] = {{0,\"(none)\"}};\n\
+extern const uint32_t g_ksymAddrCount = 0;\n\
+}\n")
+endif()
+
+# ---------------------------------------------------------------------------
 # Kernel executable
 # ---------------------------------------------------------------------------
 
@@ -178,12 +197,15 @@ add_executable(kernel
     src/serial_writer.cpp
     src/profiler.cpp
     src/sched_policy.cpp
+    src/exception_info.cpp
     # Default scheduler policy (statically linked fallback)
     "${BROOK_ROOT}/src/modules/sched_rr.cpp"
     # Memory subsystem
     src/memory/virtual_memory.cpp
     src/memory/physical_memory.cpp
     src/memory/heap.cpp
+    src/ksym_addrs.cpp
+    "${KSYM_TABLE_CPP}"
     "${FONT_ATLAS_CPP}"
     "${FAT_IMAGE_CPP}"
     "${BROOK_ROOT}/src/shared/src_km/serial.cpp"
@@ -217,6 +239,27 @@ target_compile_options(kernel PRIVATE
     -fno-omit-frame-pointer  # enable RBP frame chain for profiler stack walking
 )
 
+# ---------------------------------------------------------------------------
+# Build info defines (git hash + timestamp) for crash dumps
+# ---------------------------------------------------------------------------
+execute_process(
+    COMMAND git rev-parse --short HEAD
+    WORKING_DIRECTORY "${BROOK_ROOT}"
+    OUTPUT_VARIABLE BROOK_GIT_HASH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if(NOT BROOK_GIT_HASH)
+    set(BROOK_GIT_HASH "unknown")
+endif()
+
+string(TIMESTAMP BROOK_BUILD_DATE "%Y-%m-%d" UTC)
+
+target_compile_definitions(kernel PRIVATE
+    BROOK_GIT_HASH="${BROOK_GIT_HASH}"
+    BROOK_BUILD_DATE="${BROOK_BUILD_DATE}"
+)
+
 # Interrupt handler files and panic must NOT use SSE/FPU registers.
 # -mgeneral-regs-only overrides the global -msse2/-mfpmath=sse for these files.
 # Combined with __attribute__((interrupt)) this guarantees no XMM state is
@@ -230,8 +273,10 @@ set_source_files_properties(
     src/keyboard.cpp
     src/mouse.cpp
     src/panic.cpp
+    src/exception_info.cpp
     src/profiler.cpp
     src/smp.cpp
+    src/ksym_addrs.cpp
     PROPERTIES COMPILE_OPTIONS "-mgeneral-regs-only;-mno-sse;-mno-sse2;-mfpmath="
 )
 
@@ -243,6 +288,13 @@ set_source_files_properties(
     "${BROOK_ROOT}/src/third_party/qrcodegen/qrcodegen.c"
     PROPERTIES COMPILE_OPTIONS
         "-Wno-unused-parameter;-Wno-unused-function;-Wno-sign-compare;-Wno-implicit-fallthrough;-Wno-unused-variable"
+)
+
+# Generated symbol table: suppress unused-const-variable (the extern refs are
+# in ksym_addrs.cpp, so clang can't see them from this TU).
+set_source_files_properties(
+    "${KSYM_TABLE_CPP}"
+    PROPERTIES COMPILE_OPTIONS "-Wno-unused-const-variable"
 )
 
 set_target_properties(kernel PROPERTIES
@@ -258,6 +310,18 @@ target_link_options(kernel PRIVATE
 )
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "" FORCE)
+
+# ---------------------------------------------------------------------------
+# POST_BUILD: generate kernel symbol address table from the linked ELF.
+# The generated .cpp replaces the stub so the NEXT build links the real table.
+# Two builds are required for a complete symbol table.
+# ---------------------------------------------------------------------------
+add_custom_command(TARGET kernel POST_BUILD
+    COMMAND ${PYTHON3} "${BROOK_ROOT}/scripts/gen_ksym_table.py"
+            "$<TARGET_FILE:kernel>" "${KSYM_TABLE_CPP}"
+    COMMENT "Generating kernel symbol address table (rebuild to link it in)"
+    VERBATIM
+)
 
 # ---------------------------------------------------------------------------
 # Driver module build system

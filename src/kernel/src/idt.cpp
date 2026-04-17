@@ -5,6 +5,10 @@
 #include "process.h"
 #include "scheduler.h"
 #include "apic.h"
+#include "smp.h"
+#include "compositor.h"
+#include "ksym_addrs.h"
+#include "exception_info.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 
@@ -161,6 +165,26 @@ static void ExcStackWalk(uint64_t rbp, int maxFrames, const char* tag)
         ExcPutCharRaw(static_cast<char>('0' + i % 10));
         ExcPutsRaw("  ");
         ExcPutHex(fp->rip);
+
+        // Symbolicate if possible
+        const char* symName = nullptr;
+        uint64_t symOff = 0;
+        if (brook::KsymFindByAddr(fp->rip, &symName, &symOff))
+        {
+            ExcPutsRaw("  ");
+            ExcPutsRaw(symName);
+            ExcPutsRaw("+0x");
+            // Print offset in hex (compact)
+            if (symOff == 0) {
+                ExcPutCharRaw('0');
+            } else {
+                char obuf[17];
+                int oi = 0;
+                uint64_t v = symOff;
+                while (v) { obuf[oi++] = "0123456789abcdef"[v & 0xf]; v >>= 4; }
+                while (oi > 0) ExcPutCharRaw(obuf[--oi]);
+            }
+        }
         ExcPutsRaw("\n");
 
         prev = fp;
@@ -202,6 +226,14 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
         for (;;) __asm__ volatile("cli; hlt");
     }
     ++excDepthPerCpu[cpuSlot];
+
+    // For kernel-mode faults: halt all other CPUs and stop compositor
+    // before producing any output, so nothing overwrites the crash screen.
+    if ((frame->cs & 3) == 0)
+    {
+        brook::SmpHaltAllAPs();
+        brook::CompositorHalt();
+    }
 
     // Build a CPU tag prefix like "[C3] " so interleaved lockless output
     // from multiple CPUs can be disambiguated.
@@ -253,7 +285,26 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
         ExcPutsRaw(" ("); ExcPutsRaw(cur->name); ExcPutsRaw(")\n");
     }
 
-    ExcPutsRaw(cpuTag); ExcPutsRaw("  RIP   "); ExcPutHex(frame->ip);    ExcPutsRaw("\n");
+    ExcPutsRaw(cpuTag); ExcPutsRaw("  RIP   "); ExcPutHex(frame->ip);
+    // Symbolicate RIP
+    {
+        const char* symName = nullptr;
+        uint64_t symOff = 0;
+        if (brook::KsymFindByAddr(frame->ip, &symName, &symOff))
+        {
+            ExcPutsRaw("  ");
+            ExcPutsRaw(symName);
+            ExcPutsRaw("+0x");
+            if (symOff == 0) { ExcPutCharRaw('0'); }
+            else {
+                char obuf[17]; int oi = 0;
+                uint64_t v = symOff;
+                while (v) { obuf[oi++] = "0123456789abcdef"[v & 0xf]; v >>= 4; }
+                while (oi > 0) ExcPutCharRaw(obuf[--oi]);
+            }
+        }
+    }
+    ExcPutsRaw("\n");
     ExcPutsRaw(cpuTag); ExcPutsRaw("  RSP   "); ExcPutHex(frame->sp);    ExcPutsRaw("\n");
     ExcPutsRaw(cpuTag); ExcPutsRaw("  CS    "); ExcPutHex(frame->cs);    ExcPutsRaw("\n");
     ExcPutsRaw(cpuTag); ExcPutsRaw("  SS    "); ExcPutHex(frame->ss);    ExcPutsRaw("\n");
@@ -270,6 +321,13 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
             ExcPutsRaw("]");
         }
         ExcPutsRaw("\n");
+    }
+
+    // Human-readable exception description
+    {
+        const char* desc = brook::ExceptionDescribe(vector, errorCode, cr2,
+                                                     frame->ip, fromUser);
+        ExcPutsRaw(cpuTag); ExcPutsRaw("  DESC  "); ExcPutsRaw(desc); ExcPutsRaw("\n");
     }
 
     // For #GP in user mode, dump bytes at the faulting RIP via direct map.
