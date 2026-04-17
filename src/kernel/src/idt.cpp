@@ -900,6 +900,38 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                 }
             }
             if (found == 0) ExcPutsRaw("  (no bad entries found in first 2048)\n");
+
+            // Print physical page backing the hash table start
+            auto readUserPhys = [&](uint64_t uva) -> uint64_t {
+                uint64_t* p4 = reinterpret_cast<uint64_t*>(DMAP_USR + cr3val);
+                uint64_t e4 = p4[(uva >> 39) & 0x1FF];
+                if (!(e4 & 1)) return 0;
+                uint64_t* p3 = reinterpret_cast<uint64_t*>(DMAP_USR + (e4 & 0x000FFFFFFFFFF000ULL));
+                uint64_t e3 = p3[(uva >> 30) & 0x1FF];
+                if (!(e3 & 1)) return 0;
+                uint64_t* p2 = reinterpret_cast<uint64_t*>(DMAP_USR + (e3 & 0x000FFFFFFFFFF000ULL));
+                uint64_t e2 = p2[(uva >> 21) & 0x1FF];
+                if (!(e2 & 1)) return 0;
+                if (e2 & (1ULL << 7))
+                    return (e2 & 0x000FFFFFFFE00000ULL) | (uva & 0x1FFFFFULL);
+                uint64_t* p1 = reinterpret_cast<uint64_t*>(DMAP_USR + (e2 & 0x000FFFFFFFFFF000ULL));
+                uint64_t e1 = p1[(uva >> 12) & 0x1FF];
+                if (!(e1 & 1)) return 0;
+                return (e1 & 0x000FFFFFFFFFF000ULL) | (uva & 0xFFF);
+            };
+
+            // Show physical pages for hash table and surrounding memory
+            ExcPutsRaw("  PHYS lumphash page: ");
+            ExcPutHex(readUserPhys(lumphashPtr) & ~0xFFFULL);
+            ExcPutsRaw("\n");
+            if (lumphashPtr + 0x1000 < lumphashPtr + numlumps * 8) {
+                ExcPutsRaw("  PHYS lumphash+4K page: ");
+                ExcPutHex(readUserPhys(lumphashPtr + 0x1000) & ~0xFFFULL);
+                ExcPutsRaw("\n");
+            }
+            ExcPutsRaw("  PHYS lumpinfo page: ");
+            ExcPutHex(readUserPhys(lumpinfoPtr) & ~0xFFFULL);
+            ExcPutsRaw("\n");
         }
     }
 
