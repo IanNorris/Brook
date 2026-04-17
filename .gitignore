@@ -61,3 +61,5 @@ tools/nar-unpack/nar-unpack
 
 # Generated package index
 tools/nix-index/packages.idx
+tools/wavplay/wavplay
+tools/wavplay/tone

@@ -115,6 +115,17 @@ for wad_path in "${ROOT_DIR}/doom1.wad" "/workspace/doom1.wad"; do
     fi
 done
 
+# --- Audio tools (wavplay, tone) ---
+audio_dir="${ROOT_DIR}/tools/wavplay"
+for tool in wavplay tone; do
+    if [ -f "$audio_dir/$tool" ]; then
+        echo "Audio tools:"
+        mmd -D s -i "${DISK_IMG}" "::BIN" 2>/dev/null || true
+        TOOL_UPPER=$(echo "$tool" | tr '[:lower:]' '[:upper:]')
+        sync_file "$audio_dir/$tool" "BIN/$TOOL_UPPER"
+    fi
+done
+
 # --- Static binaries from nix (busybox etc.) ---
 busybox_static="${ROOT_DIR}/busybox_static"
 if [ -f "$busybox_static" ]; then
