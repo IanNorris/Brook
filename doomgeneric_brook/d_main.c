@@ -487,6 +487,7 @@ void D_PageTicker (void)
 //
 void D_PageDrawer (void)
 {
+    W_VerifyHashTable("D_PageDrawer");
     V_DrawPatch (0, 0, W_CacheLumpName(pagename, PU_CACHE));
 }
 

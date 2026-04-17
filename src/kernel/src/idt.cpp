@@ -870,9 +870,9 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
             return *reinterpret_cast<uint64_t*>(DMAP_USR + phys);
         };
 
-        uint64_t lumphashPtr = readUser64(0x4b0d78);
-        uint64_t lumpinfoPtr = readUser64(0x4b0d70);
-        uint64_t numlumps    = readUser64(0x4b0d68) & 0xFFFFFFFF;
+        uint64_t lumphashPtr = readUser64(0x4b3d78);
+        uint64_t lumpinfoPtr = readUser64(0x4b3d70);
+        uint64_t numlumps    = readUser64(0x4b3d68) & 0xFFFFFFFF;
         ExcPutsRaw("  lumphash="); ExcPutHex(lumphashPtr); ExcPutsRaw("\n");
         ExcPutsRaw("  lumpinfo="); ExcPutHex(lumpinfoPtr); ExcPutsRaw("\n");
         ExcPutsRaw("  numlumps="); ExcPutHex(numlumps);    ExcPutsRaw("\n");
