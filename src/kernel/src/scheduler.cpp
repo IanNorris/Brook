@@ -1327,4 +1327,16 @@ const char* SchedulerPolicyName()
     return g_schedOps ? g_schedOps->name : "none";
 }
 
+// Panic-safe process enumeration — no locks, assumes all other CPUs halted.
+uint32_t PanicGetProcessCount()
+{
+    return g_processCount;
+}
+
+Process* PanicGetProcess(uint32_t index)
+{
+    if (index >= g_processCount) return nullptr;
+    return g_allProcesses[index];
+}
+
 } // namespace brook

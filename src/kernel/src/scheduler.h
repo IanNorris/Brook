@@ -98,4 +98,8 @@ bool SchedulerSwitchPolicy(const char* name);
 // Get the name of the currently active scheduling policy.
 const char* SchedulerPolicyName();
 
+// Panic-safe process enumeration — no locks, assumes all other CPUs halted.
+uint32_t PanicGetProcessCount();
+Process* PanicGetProcess(uint32_t index);
+
 } // namespace brook

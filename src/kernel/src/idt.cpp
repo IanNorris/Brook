@@ -737,10 +737,37 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                     rbpPtr = reinterpret_cast<uint64_t*>(rbpPtr[0]);
                 }
 
+                // Exception info
+                brook::PanicExceptionInfo excInfo = {};
+                excInfo.vector    = static_cast<uint8_t>(vector);
+                excInfo.errorCode = static_cast<uint32_t>(ef->errorCode);
+                brook::Process* curProc  = brook::ProcessCurrent();
+                excInfo.pid       = curProc ? curProc->pid : 0;
+
+                // Process list snapshot (all CPUs halted, no lock needed)
+                static brook::PanicProcessList procList;
+                procList.count = 0;
+                uint32_t nProcs = brook::PanicGetProcessCount();
+                for (uint32_t pi = 0; pi < nProcs && procList.count < brook::PANIC_MAX_PROCESSES; pi++)
+                {
+                    brook::Process* p = brook::PanicGetProcess(pi);
+                    if (!p || p->state == brook::ProcessState::Terminated) continue;
+                    auto& e = procList.entries[procList.count];
+                    e.pid   = p->pid;
+                    e.state = static_cast<uint8_t>(p->state);
+                    e.cpu   = (p->runningOnCpu >= 0) ? static_cast<uint8_t>(p->runningOnCpu) : 0xFF;
+                    e.rip   = 0;
+                    for (uint32_t j = 0; j < brook::PANIC_PROCESS_NAME_LEN; j++)
+                        e.name[j] = (p->name[j]) ? p->name[j] : '\0';
+                    procList.count++;
+                }
+
                 brook::PanicScreenInfo psi = {};
                 psi.message   = "Unrecoverable kernel exception";
                 psi.regs      = &pregs;
                 psi.trace     = &ptrace;
+                psi.excInfo   = &excInfo;
+                psi.procList  = &procList;
                 psi.vector    = vector;
                 psi.errorCode = ef->errorCode;
                 brook::PanicScreenRender(const_cast<uint32_t*>(physFb), fbW, fbH, fbStride, &psi);

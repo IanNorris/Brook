@@ -9,6 +9,8 @@
 #include "smp.h"
 #include "build_info.h"
 #include "ksym_addrs.h"
+#include "scheduler.h"
+#include "process.h"
 
 // ---- Register capture -------------------------------------------------------
 struct PanicRegs {
@@ -320,12 +322,33 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
     brook::CompositorGetPhysDims(&fbW, &fbH);
     if (physFb && fbW && fbH)
     {
+        // Snapshot running processes (all CPUs halted, no lock needed)
+        static brook::PanicProcessList procList;
+        procList.count = 0;
+        uint32_t nProcs = brook::PanicGetProcessCount();
+        for (uint32_t i = 0; i < nProcs && procList.count < brook::PANIC_MAX_PROCESSES; i++)
+        {
+            brook::Process* p = brook::PanicGetProcess(i);
+            if (!p || p->state == brook::ProcessState::Terminated) continue;
+            auto& e = procList.entries[procList.count];
+            e.pid   = p->pid;
+            e.state = static_cast<uint8_t>(p->state);
+            e.cpu   = (p->runningOnCpu >= 0) ? static_cast<uint8_t>(p->runningOnCpu) : 0xFF;
+            e.rip   = 0; // TODO: capture from saved context
+            // Copy name (truncate if needed)
+            for (uint32_t j = 0; j < brook::PANIC_PROCESS_NAME_LEN; j++)
+                e.name[j] = (p->name[j]) ? p->name[j] : '\0';
+            procList.count++;
+        }
+
         uint32_t fbStride = physStride * 4; // pixel stride → byte stride
-        brook::PanicScreenInfo psi;
+        brook::PanicScreenInfo psi = {};
         psi.message   = g_panicBuf;
         psi.regs      = &fullRegs;
         psi.trace     = &trace;
-        psi.vector    = 0;  // Not an exception — general panic
+        psi.excInfo   = nullptr;  // KernelPanic — no exception
+        psi.procList  = &procList;
+        psi.vector    = 0;
         psi.errorCode = 0;
         brook::PanicScreenRender(const_cast<uint32_t*>(physFb), fbW, fbH, fbStride, &psi);
     }

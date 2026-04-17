@@ -47,8 +47,10 @@ def base45_decode(s: str) -> bytes:
 PANIC_MAGIC = 0x2D
 PANIC_PAD   = 0xCAFEF00D
 
-PKT_CPU_REGS    = 0xA3000001
-PKT_STACK_TRACE = 0xA3000002
+PKT_CPU_REGS       = 0xA3000001
+PKT_STACK_TRACE    = 0xA3000002
+PKT_EXCEPTION_INFO = 0xA3000003
+PKT_PROCESS_LIST   = 0xA3000004
 
 GPR_NAMES = [
     "RAX", "RBX", "RCX", "RDX", "RSI", "RDI",
@@ -136,6 +138,55 @@ class StackTrace:
                 break
             self.frames.append(struct.unpack_from("<Q", data, off)[0])
             off += 8
+
+
+EXCEPTION_NAMES = {
+    0: "Divide Error", 1: "Debug", 2: "NMI", 3: "Breakpoint",
+    4: "Overflow", 5: "BOUND", 6: "#UD Invalid Opcode",
+    7: "Device Not Available", 8: "Double Fault", 10: "#TS Invalid TSS",
+    11: "#NP Segment Not Present", 12: "#SS Stack Segment",
+    13: "#GP General Protection", 14: "#PF Page Fault",
+    16: "#MF x87 FP", 17: "#AC Alignment Check",
+    18: "#MC Machine Check", 19: "#XM SIMD FP",
+}
+
+PROCESS_STATE_NAMES = {
+    0: "Ready", 1: "Running", 2: "Blocked", 3: "Stopped", 4: "Terminated",
+}
+
+
+class ExceptionInfo:
+    def __init__(self, data: bytes):
+        if len(data) < 8:
+            raise ValueError("Truncated ExceptionInfo")
+        self.vector, self.reserved, self.pid, self.error_code = \
+            struct.unpack_from("<BBHI", data, 0)
+        self.name = EXCEPTION_NAMES.get(self.vector, f"Unknown ({self.vector})")
+
+
+class ProcessEntry:
+    ENTRY_SIZE = 28  # 2+1+1+12+8 = 24... wait: 2+1+1+12+8=24
+
+    def __init__(self, data: bytes, off: int = 0):
+        self.pid, self.state, self.cpu = struct.unpack_from("<HBB", data, off)
+        self.name = data[off+4:off+16].split(b'\x00')[0].decode('ascii', errors='replace')
+        self.rip = struct.unpack_from("<Q", data, off+16)[0]
+        self.state_name = PROCESS_STATE_NAMES.get(self.state, f"?{self.state}")
+        self.cpu_str = str(self.cpu) if self.cpu != 0xFF else "-"
+
+
+class ProcessList:
+    def __init__(self, data: bytes):
+        if len(data) < 1:
+            raise ValueError("Truncated ProcessList")
+        self.count = data[0]
+        self.entries = []
+        off = 1
+        for _ in range(self.count):
+            if off + 24 > len(data):
+                break
+            self.entries.append(ProcessEntry(data, off))
+            off += 24
 
 
 # ── Symbolication ───────────────────────────────────────────────────────────
@@ -345,12 +396,19 @@ def _box_line(text: str):
 
 
 def print_report(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | None,
-                 sym: Symbolicator | None, raw_data: bytes, show_raw: bool):
+                 sym: Symbolicator | None, raw_data: bytes, show_raw: bool,
+                 exc_info: ExceptionInfo | None = None,
+                 proc_list: ProcessList | None = None):
     bar = "═" * (W + 4)
     print(f"\n  {C.RED}{C.BOLD}{bar}{C.RESET}")
     print(f"  {C.RED}{C.BOLD}{'🔴 BROOK OS CRASH DUMP':^{W + 4}}{C.RESET}")
     print(f"  {C.DIM}{'Version: 0x%02X  Page: %d/%d' % (hdr.version, hdr.page + 1, hdr.page_count):^{W + 4}}{C.RESET}")
     print(f"  {C.RED}{C.BOLD}{bar}{C.RESET}\n")
+
+    # Exception info
+    if exc_info:
+        print(f"  {C.RED}{C.BOLD}Exception:{C.RESET} {C.WHITE}#{exc_info.vector:03d} ({exc_info.name}){C.RESET}")
+        print(f"  {C.YELLOW}Error Code:{C.RESET} {C.WHITE}0x{exc_info.error_code:08X}{C.RESET}  {C.YELLOW}PID:{C.RESET} {C.WHITE}{exc_info.pid}{C.RESET}\n")
 
     if regs:
         print(f"  {C.CYAN}{C.BOLD}CPU Registers:{C.RESET}")
@@ -410,6 +468,14 @@ def print_report(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | Non
             hex_part = " ".join(f"{b:02X}" for b in chunk)
             ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
             print(f"  {C.DIM}{off:04X}{C.RESET}  {hex_part:<48s}  {C.DIM}{ascii_part}{C.RESET}")
+
+    if proc_list and proc_list.entries:
+        print(f"\n  {C.CYAN}{C.BOLD}Running Processes ({len(proc_list.entries)}):{C.RESET}")
+        print(f"  {C.DIM}{'PID':>5s}  {'STATE':<10s}  {'CPU':>3s}  {'NAME':<12s}  {'RIP'}{C.RESET}")
+        for pe in proc_list.entries:
+            rip_str = f"0x{pe.rip:016X}" if pe.rip else ""
+            state_color = C.GREEN if pe.state_name == "Running" else C.YELLOW if pe.state_name == "Ready" else C.DIM
+            print(f"  {C.WHITE}{pe.pid:5d}{C.RESET}  {state_color}{pe.state_name:<10s}{C.RESET}  {C.WHITE}{pe.cpu_str:>3s}{C.RESET}  {C.CYAN}{pe.name:<12s}{C.RESET}  {C.DIM}{rip_str}{C.RESET}")
 
     print(f"\n  {C.RED}{C.BOLD}{bar}{C.RESET}\n")
 
@@ -473,6 +539,8 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
     off = PanicHeader.SIZE
     regs = None
     trace = None
+    exc_info = None
+    proc_list = None
 
     while off + PacketHeader.SIZE <= len(data):
         pkt = PacketHeader(data, off)
@@ -491,6 +559,10 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
             regs = CPURegs(payload)
         elif pkt.type == PKT_STACK_TRACE:
             trace = StackTrace(payload)
+        elif pkt.type == PKT_EXCEPTION_INFO:
+            exc_info = ExceptionInfo(payload)
+        elif pkt.type == PKT_PROCESS_LIST:
+            proc_list = ProcessList(payload)
         else:
             print(f"[warn] Unknown packet type 0x{pkt.type:08X} ({pkt.size}B)",
                   file=sys.stderr)
@@ -500,7 +572,8 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
     if as_json:
         print(json.dumps(build_json(hdr, regs, trace, sym), indent=2))
     else:
-        print_report(hdr, regs, trace, sym, data, show_raw)
+        print_report(hdr, regs, trace, sym, data, show_raw,
+                     exc_info=exc_info, proc_list=proc_list)
 
 
 def main():

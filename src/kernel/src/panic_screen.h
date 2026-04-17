@@ -17,11 +17,13 @@
 namespace brook {
 
 struct PanicScreenInfo {
-    const char*           message;      // panic message text
-    const PanicCPURegs*   regs;         // CPU registers at crash
-    const PanicStackTrace* trace;       // stack trace
-    uint64_t              vector;       // exception vector (or 0 for KernelPanic)
-    uint64_t              errorCode;    // error code
+    const char*              message;      // panic message text
+    const PanicCPURegs*      regs;         // CPU registers at crash
+    const PanicStackTrace*   trace;        // stack trace
+    const PanicExceptionInfo* excInfo;     // exception details (nullptr for KernelPanic)
+    const PanicProcessList*  procList;     // running processes snapshot
+    uint64_t                 vector;       // exception vector (or 0 for KernelPanic)
+    uint64_t                 errorCode;    // error code
 };
 
 // Render the full panic screen to the given framebuffer.

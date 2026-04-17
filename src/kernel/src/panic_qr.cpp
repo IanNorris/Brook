@@ -12,19 +12,28 @@ extern "C" {
 
 namespace brook {
 
-// Assemble the binary panic packet: header + CPU regs packet + stack trace packet
+// Assemble the binary panic packet: header + CPU regs + stack trace + optional extras
 static uint32_t BuildPanicPacket(uint8_t* buf, uint32_t bufLen,
                                  const PanicCPURegs* regs,
-                                 const PanicStackTrace* trace)
+                                 const PanicStackTrace* trace,
+                                 const PanicExceptionInfo* excInfo,
+                                 const PanicProcessList* procList)
 {
-    // Calculate total size: header + (regs packet) + (stack trace packet)
     uint32_t tracePayloadSize = 1 + trace->depth * 8; // depth byte + RIPs
+
     uint32_t needed = sizeof(PanicHeader)
                     + sizeof(PanicPacketHeader) + sizeof(PanicCPURegs)
                     + sizeof(PanicPacketHeader) + tracePayloadSize;
+    if (excInfo) needed += sizeof(PanicPacketHeader) + sizeof(PanicExceptionInfo);
+    if (procList) needed += sizeof(PanicPacketHeader) + 1 + procList->count * sizeof(PanicProcessEntry);
+
     if (bufLen < needed) return 0;
 
     uint32_t off = 0;
+    auto appendRaw = [&](const void* data, uint32_t size) {
+        auto* p = static_cast<const uint8_t*>(data);
+        for (uint32_t i = 0; i < size; ++i) buf[off++] = p[i];
+    };
 
     // Panic header
     PanicHeader hdr;
@@ -33,36 +42,42 @@ static uint32_t BuildPanicPacket(uint8_t* buf, uint32_t bufLen,
     hdr.page      = 0;
     hdr.pageCount = 1;
     hdr.pad       = QR_HEADER_PAD;
-
-    auto* p = reinterpret_cast<const uint8_t*>(&hdr);
-    for (uint32_t i = 0; i < sizeof(hdr); ++i) buf[off++] = p[i];
+    appendRaw(&hdr, sizeof(hdr));
 
     // Packet 1: CPU registers
     PanicPacketHeader ph;
     ph.type = QR_PACKET_TYPE_CPU_REGS;
     ph.size = sizeof(PanicCPURegs);
-
-    p = reinterpret_cast<const uint8_t*>(&ph);
-    for (uint32_t i = 0; i < sizeof(ph); ++i) buf[off++] = p[i];
-
-    p = reinterpret_cast<const uint8_t*>(regs);
-    for (uint32_t i = 0; i < sizeof(PanicCPURegs); ++i) buf[off++] = p[i];
+    appendRaw(&ph, sizeof(ph));
+    appendRaw(regs, sizeof(PanicCPURegs));
 
     // Packet 2: Stack trace
-    PanicPacketHeader ph2;
-    ph2.type = QR_PACKET_TYPE_STACK_TRACE;
-    ph2.size = tracePayloadSize;
-
-    p = reinterpret_cast<const uint8_t*>(&ph2);
-    for (uint32_t i = 0; i < sizeof(ph2); ++i) buf[off++] = p[i];
-
-    // depth byte
+    ph.type = QR_PACKET_TYPE_STACK_TRACE;
+    ph.size = tracePayloadSize;
+    appendRaw(&ph, sizeof(ph));
     buf[off++] = trace->depth;
+    for (uint8_t d = 0; d < trace->depth; d++)
+        appendRaw(&trace->rip[d], 8);
 
-    // RIP values (only the valid ones)
-    for (uint8_t d = 0; d < trace->depth; d++) {
-        p = reinterpret_cast<const uint8_t*>(&trace->rip[d]);
-        for (uint32_t i = 0; i < 8; ++i) buf[off++] = p[i];
+    // Packet 3: Exception info (optional)
+    if (excInfo)
+    {
+        ph.type = QR_PACKET_TYPE_EXCEPTION_INFO;
+        ph.size = sizeof(PanicExceptionInfo);
+        appendRaw(&ph, sizeof(ph));
+        appendRaw(excInfo, sizeof(PanicExceptionInfo));
+    }
+
+    // Packet 4: Process list (optional)
+    if (procList && procList->count > 0)
+    {
+        uint32_t plSize = 1 + procList->count * sizeof(PanicProcessEntry);
+        ph.type = QR_PACKET_TYPE_PROCESS_LIST;
+        ph.size = plSize;
+        appendRaw(&ph, sizeof(ph));
+        buf[off++] = procList->count;
+        for (uint8_t i = 0; i < procList->count; i++)
+            appendRaw(&procList->entries[i], sizeof(PanicProcessEntry));
     }
 
     return off;
@@ -114,11 +129,14 @@ static void RenderQRToFramebuffer(uint32_t* fb, uint32_t fbWidth, uint32_t fbHei
 
 void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
                    uint32_t fbStride, const PanicCPURegs* regs,
-                   const PanicStackTrace* trace)
+                   const PanicStackTrace* trace,
+                   const PanicExceptionInfo* excInfo,
+                   const PanicProcessList* procList)
 {
-    // Step 1: Build binary panic packet (regs + stack trace)
-    static uint8_t packetBuf[512];
-    uint32_t packetLen = BuildPanicPacket(packetBuf, sizeof(packetBuf), regs, trace);
+    // Step 1: Build binary panic packet
+    static uint8_t packetBuf[1024];
+    uint32_t packetLen = BuildPanicPacket(packetBuf, sizeof(packetBuf),
+                                          regs, trace, excInfo, procList);
     if (packetLen == 0)
     {
         SerialPuts("PANIC QR: packet build failed\n");
