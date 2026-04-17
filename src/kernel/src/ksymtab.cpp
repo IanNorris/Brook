@@ -31,6 +31,7 @@ extern "C" brook::KernelSymbol __stop_ksymtab[];
 #include "idt.h"
 #include "apic.h"
 #include "net.h"
+#include "audio.h"
 
 // Bring all brook:: names into scope so EXPORT_SYMBOL(fn) resolves correctly.
 using namespace brook;
@@ -166,6 +167,9 @@ EXPORT_SYMBOL(NetRegisterIf);
 EXPORT_SYMBOL(NetReceive);
 EXPORT_SYMBOL_NAMED(NetRegisterIf, "_ZN5brook13NetRegisterIfEPNS_5NetIfE");
 EXPORT_SYMBOL_NAMED(NetReceive,    "_ZN5brook10NetReceiveEPNS_5NetIfEPKvj");
+
+// Audio
+EXPORT_SYMBOL(AudioRegister);
 
 namespace brook {
 
