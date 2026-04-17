@@ -492,10 +492,39 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 else
                     got = InputPollEvent(&ev);
                 if (!got) break;
+
                 uint8_t sc = ev.scanCode;
-                if (ev.type == InputEventType::KeyRelease)
-                    sc |= 0x80;
-                buf[bytesRead++] = sc;
+                bool release = (ev.type == InputEventType::KeyRelease);
+
+                // Translate synthetic extended codes back to PS/2 E0-prefixed
+                // two-byte sequences so userspace (DOOM, Quake) sees real scancodes.
+                uint8_t ps2 = 0;
+                switch (sc)
+                {
+                case SC_EXT_UP:     ps2 = 0x48; break;
+                case SC_EXT_DOWN:   ps2 = 0x50; break;
+                case SC_EXT_LEFT:   ps2 = 0x4B; break;
+                case SC_EXT_RIGHT:  ps2 = 0x4D; break;
+                case SC_EXT_HOME:   ps2 = 0x47; break;
+                case SC_EXT_END:    ps2 = 0x4F; break;
+                case SC_EXT_INSERT: ps2 = 0x52; break;
+                case SC_EXT_DELETE: ps2 = 0x53; break;
+                case SC_EXT_PGUP:   ps2 = 0x49; break;
+                case SC_EXT_PGDN:   ps2 = 0x51; break;
+                }
+
+                if (ps2)
+                {
+                    // Emit 0xE0 prefix byte, then the actual scancode
+                    if (bytesRead + 2 > count) break; // need room for both bytes
+                    buf[bytesRead++] = 0xE0;
+                    buf[bytesRead++] = release ? (ps2 | 0x80) : ps2;
+                }
+                else
+                {
+                    if (release) sc |= 0x80;
+                    buf[bytesRead++] = sc;
+                }
             }
             return static_cast<int64_t>(bytesRead);
         }
