@@ -117,7 +117,7 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
                    const PanicStackTrace* trace)
 {
     // Step 1: Build binary panic packet (regs + stack trace)
-    uint8_t packetBuf[512];
+    static uint8_t packetBuf[512];
     uint32_t packetLen = BuildPanicPacket(packetBuf, sizeof(packetBuf), regs, trace);
     if (packetLen == 0)
     {
@@ -128,7 +128,7 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
     SerialPrintf("PANIC QR: packet %u bytes\n", packetLen);
 
     // Step 2: Base45 encode (no compression for now — adds ~50% overhead)
-    char encoded[2048];
+    static char encoded[2048];
     int encLen = Base45Encode(encoded, sizeof(encoded), packetBuf, packetLen);
     if (encLen <= 0)
     {
@@ -139,14 +139,19 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
     SerialPrintf("PANIC QR: Base45 encoded %d chars\n", encLen);
 
     // Step 3: Generate QR code using Nayuki library
-    uint8_t qrBuf[qrcodegen_BUFFER_LEN_MAX];
-    uint8_t tempBuf[qrcodegen_BUFFER_LEN_MAX];
+    // Static buffers — these are ~4KB each, too large for exception stacks
+    static uint8_t qrBuf[qrcodegen_BUFFER_LEN_MAX];
+    static uint8_t tempBuf[qrcodegen_BUFFER_LEN_MAX];
+
+    SerialPuts("PANIC QR: calling qrcodegen_encodeText...\n");
 
     bool ok = qrcodegen_encodeText(encoded, tempBuf, qrBuf,
                                     qrcodegen_Ecc_LOW,
                                     qrcodegen_VERSION_MIN,
                                     qrcodegen_VERSION_MAX,
                                     qrcodegen_Mask_AUTO, true);
+
+    SerialPrintf("PANIC QR: encodeText returned %d\n", ok ? 1 : 0);
     if (!ok)
     {
         SerialPuts("PANIC QR: QR generation failed\n");

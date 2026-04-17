@@ -489,7 +489,7 @@ __asm__(
     "    lock incl g_haltedCount(%rip)\n"
     ".Lnmi_spin:\n"
     "    cli\n"
-    "    hlt\n"
+    "    pause\n"
     "    jmp .Lnmi_spin\n"
     ".Lnmi_return:\n"
     "    iretq\n"

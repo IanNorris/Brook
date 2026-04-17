@@ -276,6 +276,7 @@ set_source_files_properties(
     src/mouse.cpp
     src/panic.cpp
     src/panic_screen.cpp
+    src/panic_qr.cpp
     src/exception_info.cpp
     src/profiler.cpp
     src/smp.cpp
@@ -288,9 +289,15 @@ set_source_files_properties(
     "${FATFS_BUILD_DIR}/ff.c"
     "${FATFS_BUILD_DIR}/ffsystem.c"
     "${FATFS_BUILD_DIR}/ffunicode.c"
-    "${BROOK_ROOT}/src/third_party/qrcodegen/qrcodegen.c"
     PROPERTIES COMPILE_OPTIONS
         "-Wno-unused-parameter;-Wno-unused-function;-Wno-sign-compare;-Wno-implicit-fallthrough;-Wno-unused-variable"
+)
+
+# qrcodegen is called from panic context — needs -mgeneral-regs-only AND warning suppression.
+set_source_files_properties(
+    "${BROOK_ROOT}/src/third_party/qrcodegen/qrcodegen.c"
+    PROPERTIES COMPILE_OPTIONS
+        "-mgeneral-regs-only;-mno-sse;-mno-sse2;-mfpmath=;-Wno-unused-parameter;-Wno-unused-function;-Wno-sign-compare;-Wno-implicit-fallthrough;-Wno-unused-variable"
 )
 
 # Generated symbol table: suppress unused-const-variable (the extern refs are

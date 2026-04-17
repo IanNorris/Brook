@@ -789,6 +789,66 @@ static int ExecCommand(int argc, const char* const* argv)
         KernelPanic("SHELL: %s\n", msg);
     }
 
+    // Built-in: crashtest <mode> — trigger specific kernel crash types
+    if (StrEq(cmd, "crashtest"))
+    {
+        const char* mode = (argc >= 2) ? argv[1] : nullptr;
+        if (!mode || StrEq(mode, "help"))
+        {
+            SerialPuts("crashtest modes:\n"
+                       "  panic       — KernelPanic() with message\n"
+                       "  nullptr     — kernel NULL pointer dereference (#PF)\n"
+                       "  divzero     — kernel divide by zero (#DE)\n"
+                       "  gpf         — trigger #GP via invalid MSR write\n"
+                       "  stackoverflow — kernel stack overflow via recursion\n"
+                       "  ud          — undefined opcode (#UD)\n"
+                       "  doublefault — corrupt RSP to trigger double fault\n");
+            return 0;
+        }
+        if (StrEq(mode, "panic"))
+        {
+            KernelPanic("crashtest: deliberate kernel panic");
+        }
+        else if (StrEq(mode, "nullptr"))
+        {
+            // Write to an unmapped kernel-space address — guaranteed to fault.
+            // 0xFFFFFF0000000000 is in the higher half but well outside our mappings.
+            volatile int* p = reinterpret_cast<volatile int*>(0xFFFFFF0000000000ULL);
+            *p = 42;
+        }
+        else if (StrEq(mode, "divzero"))
+        {
+            volatile int a = 1, b = 0;
+            *(volatile int*)&a = a / b;
+        }
+        else if (StrEq(mode, "gpf"))
+        {
+            // Write to an invalid MSR — triggers #GP
+            __asm__ volatile("wrmsr" :: "c"(0xDEAD), "a"(0), "d"(0));
+        }
+        else if (StrEq(mode, "stackoverflow"))
+        {
+            // Use a simple recursive function pointer to eat stack
+            typedef void (*RecurseFn)(volatile int);
+            static RecurseFn g_recurse;
+            g_recurse = [](volatile int d) __attribute__((noinline)) {
+                volatile char buf[4096];
+                buf[0] = (char)d;
+                g_recurse(d + 1);
+            };
+            g_recurse(0);
+        }
+        else if (StrEq(mode, "ud"))
+        {
+            __asm__ volatile("ud2");
+        }
+        else
+        {
+            SerialPuts("crashtest: unknown mode\n");
+        }
+        return 0;
+    }
+
     // Built-in: log — dump kernel log
     if (StrEq(cmd, "log"))
     {

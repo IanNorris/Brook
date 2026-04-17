@@ -239,7 +239,7 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
     // it arrived), this guard catches us.
     if (brook::SmpIsPanicActive())
     {
-        for (;;) __asm__ volatile("cli; hlt");
+        for (;;) __asm__ volatile("cli; pause");
     }
 
     // For kernel-mode faults: halt all other CPUs and stop compositor
@@ -577,7 +577,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
     // HandleException where the main guard lives).
     if (brook::SmpIsPanicActive())
     {
-        for (;;) __asm__ volatile("cli; hlt");
+        for (;;) __asm__ volatile("cli; pause");
     }
 
     bool fromUser = (ef->cs & 3) != 0;
@@ -691,6 +691,11 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         ExcPutsRaw("  R10 "); ExcPutHex(ef->r10); ExcPutsRaw("  R11 "); ExcPutHex(ef->r11); ExcPutsRaw("\n");
         ExcPutsRaw("  R12 "); ExcPutHex(ef->r12); ExcPutsRaw("  R13 "); ExcPutHex(ef->r13); ExcPutsRaw("\n");
         ExcPutsRaw("  R14 "); ExcPutHex(ef->r14); ExcPutsRaw("  R15 "); ExcPutHex(ef->r15); ExcPutsRaw("\n");
+
+        // Halt all other CPUs and stop the compositor before rendering
+        // the panic screen — otherwise the compositor will overwrite it.
+        brook::SmpHaltAllAPs();
+        brook::CompositorHalt();
 
         // Render visual panic screen with full register state + QR code
         {
