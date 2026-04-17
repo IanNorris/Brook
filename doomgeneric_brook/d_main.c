@@ -406,14 +406,25 @@ void doomgeneric_Tick()
 {
     static int tickCount = 0;
     if (tickCount < 3)
+    {
         W_VerifyHashTable(tickCount == 0 ? "Tick#0 start" :
                           tickCount == 1 ? "Tick#1 start" : "Tick#2 start");
+        Z_CheckHeap();
+        fprintf(stderr, "Z_CheckHeap OK at Tick#%d\n", tickCount);
+    }
     tickCount++;
 
     // frame syncronous IO operations
     I_StartFrame ();
 
     TryRunTics (); // will run at least one tic
+
+    if (tickCount <= 3)
+    {
+        W_VerifyHashTable("after TryRunTics");
+        Z_CheckHeap();
+        fprintf(stderr, "Z_CheckHeap OK after TryRunTics (tick %d)\n", tickCount - 1);
+    }
 
     S_UpdateSounds (players[consoleplayer].mo);// move positional sounds
 
