@@ -5,7 +5,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BROOK_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-DOOM_SRC="${DOOM_SRC:-$(cd "$BROOK_ROOT/../doomgeneric_enkel/doomgeneric" 2>/dev/null && pwd)}"
+DOOM_SRC="${DOOM_SRC:-$BROOK_ROOT/doomgeneric_brook}"
 BROOK_SRC="$BROOK_ROOT/src/doom"
 BUILD_DIR="$BROOK_ROOT/build/doom"
 

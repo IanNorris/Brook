@@ -268,6 +268,20 @@ if [ -f "$wallpaper" ]; then
     sync_file "$wallpaper" "WALLPAPER.RAW"
 fi
 
+# --- User content (MP3s, etc.) ---
+user_content_dir="${ROOT_DIR}/data/user_content"
+if [ -d "$user_content_dir" ] && ls "$user_content_dir"/* &>/dev/null 2>&1; then
+    echo "User content:"
+    mmd -D s -i "${DISK_IMG}" "::MUSIC" 2>/dev/null || true
+    for f in "$user_content_dir"/*; do
+        [ -f "$f" ] || continue
+        local_name="$(basename "$f")"
+        # FAT filenames: truncate to 8.3 or use VFAT long names (mcopy handles this)
+        mcopy -o -i "${DISK_IMG}" "$f" "::MUSIC/${local_name}"
+        echo "  synced: MUSIC/${local_name} ($(stat -c%s "$f") bytes)"
+    done
+fi
+
 echo ""
 echo "Current disk contents:"
 mdir -i "${DISK_IMG}" :: 2>&1 | grep -v "^$"

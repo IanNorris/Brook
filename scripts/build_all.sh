@@ -20,6 +20,7 @@ DOOM_SRC="${DOOM_SRC:-}"
 if [ -z "$DOOM_SRC" ]; then
     # Check common locations relative to the repo
     for candidate in \
+        "${ROOT_DIR}/doomgeneric_brook" \
         "${ROOT_DIR}/../doomgeneric_enkel/doomgeneric" \
         "${ROOT_DIR}/vendor/doomgeneric_enkel/doomgeneric"; do
         if [ -d "$candidate" ]; then
