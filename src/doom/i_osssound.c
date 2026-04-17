@@ -98,6 +98,8 @@ static cached_sound_t *ExpandSound(const byte *data, int samplerate,
     return cached;
 }
 
+static int I_OSS_GetSfxLumpNum(sfxinfo_t *sfx);
+
 static boolean CacheSFX(sfxinfo_t *sfxinfo)
 {
     int lumpnum;
@@ -108,7 +110,15 @@ static boolean CacheSFX(sfxinfo_t *sfxinfo)
 
     if (sfxinfo->driver_data) return true;
 
+    // Resolve lump number if not yet set (lumpnum is -1 until first play)
     lumpnum = sfxinfo->lumpnum;
+    if (lumpnum < 0)
+    {
+        lumpnum = I_OSS_GetSfxLumpNum(sfxinfo);
+        if (lumpnum < 0) return false;
+        sfxinfo->lumpnum = lumpnum;
+    }
+
     data = W_CacheLumpNum(lumpnum, PU_STATIC);
     lumplen = W_LumpLength(lumpnum);
 

@@ -847,7 +847,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
             }
         }
         // Dump DOOM hash table diagnostics.
-        // lumphash ptr is at user VA 0x2a96d8, lumpinfo ptr at 0x2a96d0.
+        // NOTE: these addresses must match the DOOM binary (run: nm build/doom/doom | grep -E 'lumphash|lumpinfo|numlumps')
         // Read via page table walk + direct map.
         auto readUser64 = [&](uint64_t uva) -> uint64_t {
             uint64_t* p4 = reinterpret_cast<uint64_t*>(DMAP_USR + cr3val);
@@ -870,9 +870,9 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
             return *reinterpret_cast<uint64_t*>(DMAP_USR + phys);
         };
 
-        uint64_t lumphashPtr = readUser64(0x2a96d8);
-        uint64_t lumpinfoPtr = readUser64(0x2a96d0);
-        uint64_t numlumps    = readUser64(0x2a96c8) & 0xFFFFFFFF;
+        uint64_t lumphashPtr = readUser64(0x4b0d78);
+        uint64_t lumpinfoPtr = readUser64(0x4b0d70);
+        uint64_t numlumps    = readUser64(0x4b0d68) & 0xFFFFFFFF;
         ExcPutsRaw("  lumphash="); ExcPutHex(lumphashPtr); ExcPutsRaw("\n");
         ExcPutsRaw("  lumpinfo="); ExcPutHex(lumpinfoPtr); ExcPutsRaw("\n");
         ExcPutsRaw("  numlumps="); ExcPutHex(numlumps);    ExcPutsRaw("\n");
