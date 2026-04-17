@@ -6,7 +6,7 @@ set wm
 set vfb 800x600
 set scale 1
 set pos 20,20
-run /nix/apps/netsurf/bin/netsurf -f brook -w 800 -h 600
+run /nix/store/m64fp6340nd6s98fawnwvvkx4v81660k-netsurf-brook-3.11-brook/bin/netsurf -f brook -w 800 -h 600
 
 # DOOM: 320×200 upscaled 2× to 640×400 — top-right
 set vfb 320x200

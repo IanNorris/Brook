@@ -1,18 +1,23 @@
 #!/usr/bin/env bash
-# Create an ext2 disk image pre-populated with a Nix store closure.
+# Create an ext2 disk image pre-populated with Nix store closures.
 #
-# Usage:
-#   scripts/create_nix_disk.sh [size_mb] [nix_attr...]
-#   scripts/create_nix_disk.sh 128 pkgsMusl.hello pkgsMusl.coreutils
+# Supports both nixpkgs attributes and local derivations:
+#   scripts/create_nix_disk.sh [size_mb] [nix_attr_or_path...]
 #
-# Defaults: 512MB disk, pkgsMusl.hello + pkgsMusl.coreutils
+# Examples:
+#   scripts/create_nix_disk.sh 256                        # defaults
+#   scripts/create_nix_disk.sh 256 bash curl.bin          # nixpkgs attrs
+#   scripts/create_nix_disk.sh 256 ./tools/netsurf-pkg    # local derivation
+#
+# Default packages include bash, curl, xz, coreutils, nss-cacert, and
+# the Brook NetSurf package.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
 # Parse size (first numeric arg) and packages
-SIZE_MB=128
+SIZE_MB=256
 PACKAGES=()
 for arg in "$@"; do
     if [[ "$arg" =~ ^[0-9]+$ ]]; then
@@ -21,8 +26,17 @@ for arg in "$@"; do
         PACKAGES+=("$arg")
     fi
 done
+
+# Default package set for Brook OS
 if [ ${#PACKAGES[@]} -eq 0 ]; then
-    PACKAGES=(pkgsMusl.hello pkgsMusl.coreutils)
+    PACKAGES=(
+        bash
+        curl.bin
+        xz.bin
+        nss-cacert
+        coreutils
+        "${ROOT_DIR}/tools/netsurf-pkg"
+    )
 fi
 
 DISK_IMG="${BROOK_NIX_DISK:-${ROOT_DIR}/brook_nix_disk.img}"
@@ -37,7 +51,13 @@ mkfs.ext2 -q -b 4096 -L "NIXSTORE" "${DISK_IMG}"
 echo "Building packages: ${PACKAGES[*]}..."
 ALL_PATHS=()
 for pkg in "${PACKAGES[@]}"; do
-    PKG_PATH=$(nix-build '<nixpkgs>' -A "$pkg" --no-out-link 2>/dev/null)
+    if [[ "$pkg" == /* || "$pkg" == ./* || "$pkg" == ../* ]]; then
+        # Local derivation path
+        PKG_PATH=$(nix-build "$pkg" --no-out-link 2>/dev/null)
+    else
+        # Nixpkgs attribute
+        PKG_PATH=$(nix-build '<nixpkgs>' -A "$pkg" --no-out-link 2>/dev/null)
+    fi
     echo "  ${pkg}: ${PKG_PATH}"
     ALL_PATHS+=("$PKG_PATH")
 done

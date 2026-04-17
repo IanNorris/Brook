@@ -76,7 +76,7 @@ static const char* g_defaultEnvp[] = {
     "LOGNAME=root",
     "SSL_CERT_FILE=/nix/store/mg063aj0crwhchqayf2qbyf28k6mlrxm-nss-cacert-3.121/etc/ssl/certs/ca-bundle.crt",
     "CURL_CA_BUNDLE=/nix/store/mg063aj0crwhchqayf2qbyf28k6mlrxm-nss-cacert-3.121/etc/ssl/certs/ca-bundle.crt",
-    "NETSURFRES=/nix/apps/netsurf/res/",
+    "NETSURFRES=/nix/store/m64fp6340nd6s98fawnwvvkx4v81660k-netsurf-brook-3.11-brook/share/netsurf/",
     nullptr
 };
 
