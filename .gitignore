@@ -52,3 +52,12 @@ data/wallpaper.raw
 brook_ext2_disk.img
 brook_nix_disk.img
 brook_home_disk.img
+
+# Generated Nix tools (built from source)
+tools/nix-search/nix-search
+tools/nix-install/nix-install
+tools/nix-fetch/nix-fetch
+tools/nar-unpack/nar-unpack
+
+# Generated package index
+tools/nix-index/packages.idx
