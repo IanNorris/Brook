@@ -30,6 +30,7 @@
 #include "klog.h"
 #include "profiler.h"
 #include "module.h"
+#include "audio.h"
 #include "debug_overlay.h"
 
 // Strace control (defined in syscall.cpp)
@@ -933,6 +934,99 @@ static int ExecCommand(int argc, const char* const* argv)
     {
         ModuleDump();
         return 0;
+    }
+
+    // Built-in: beep [freq] [ms] — play a sine wave tone via HDA audio
+    if (StrEq(cmd, "beep"))
+    {
+        if (!AudioAvailable())
+        {
+            KPrintf("No audio driver registered\n");
+            return -1;
+        }
+
+        uint32_t freq = 440;    // A4 by default
+        uint32_t durationMs = 500;
+
+        if (argc >= 2) {
+            const char* s = argv[1]; freq = 0;
+            while (*s >= '0' && *s <= '9') freq = freq * 10 + (*s++ - '0');
+        }
+        if (argc >= 3) {
+            const char* s = argv[2]; durationMs = 0;
+            while (*s >= '0' && *s <= '9') durationMs = durationMs * 10 + (*s++ - '0');
+        }
+        if (freq < 20) freq = 20;
+        if (freq > 20000) freq = 20000;
+        if (durationMs > 10000) durationMs = 10000;
+
+        // Generate 16-bit mono PCM at 48000 Hz
+        constexpr uint32_t sampleRate = 48000;
+        uint32_t numSamples = (sampleRate * durationMs) / 1000;
+        uint32_t bufSize = numSamples * 2; // 16-bit = 2 bytes per sample
+
+        // Sine approximation lookup table (256 entries, Q15 format)
+        // sin(i * 2π / 256) * 32767
+        static const int16_t sinTable[256] = {
+                 0,    804,   1608,   2410,   3212,   4011,   4808,   5602,
+              6393,   7179,   7962,   8739,   9512,  10278,  11039,  11793,
+             12539,  13279,  14010,  14732,  15446,  16151,  16846,  17530,
+             18204,  18868,  19519,  20159,  20787,  21403,  22005,  22594,
+             23170,  23731,  24279,  24811,  25329,  25832,  26319,  26790,
+             27245,  27683,  28105,  28510,  28898,  29268,  29621,  29956,
+             30273,  30571,  30852,  31113,  31356,  31580,  31785,  31971,
+             32137,  32285,  32412,  32521,  32609,  32678,  32728,  32757,
+             32767,  32757,  32728,  32678,  32609,  32521,  32412,  32285,
+             32137,  31971,  31785,  31580,  31356,  31113,  30852,  30571,
+             30273,  29956,  29621,  29268,  28898,  28510,  28105,  27683,
+             27245,  26790,  26319,  25832,  25329,  24811,  24279,  23731,
+             23170,  22594,  22005,  21403,  20787,  20159,  19519,  18868,
+             18204,  17530,  16846,  16151,  15446,  14732,  14010,  13279,
+             12539,  11793,  11039,  10278,   9512,   8739,   7962,   7179,
+              6393,   5602,   4808,   4011,   3212,   2410,   1608,    804,
+                 0,   -804,  -1608,  -2410,  -3212,  -4011,  -4808,  -5602,
+             -6393,  -7179,  -7962,  -8739,  -9512, -10278, -11039, -11793,
+            -12539, -13279, -14010, -14732, -15446, -16151, -16846, -17530,
+            -18204, -18868, -19519, -20159, -20787, -21403, -22005, -22594,
+            -23170, -23731, -24279, -24811, -25329, -25832, -26319, -26790,
+            -27245, -27683, -28105, -28510, -28898, -29268, -29621, -29956,
+            -30273, -30571, -30852, -31113, -31356, -31580, -31785, -31971,
+            -32137, -32285, -32412, -32521, -32609, -32678, -32728, -32757,
+            -32767, -32757, -32728, -32678, -32609, -32521, -32412, -32285,
+            -32137, -31971, -31785, -31580, -31356, -31113, -30852, -30571,
+            -30273, -29956, -29621, -29268, -28898, -28510, -28105, -27683,
+            -27245, -26790, -26319, -25832, -25329, -24811, -24279, -23731,
+            -23170, -22594, -22005, -21403, -20787, -20159, -19519, -18868,
+            -18204, -17530, -16846, -16151, -15446, -14732, -14010, -13279,
+            -12539, -11793, -11039, -10278,  -9512,  -8739,  -7962,  -7179,
+             -6393,  -5602,  -4808,  -4011,  -3212,  -2410,  -1608,   -804,
+        };
+
+        // Cap buffer at 64KB (HDA buffer limit)
+        if (bufSize > 65536) bufSize = 65536;
+        numSamples = bufSize / 2;
+
+        auto* buf = static_cast<int16_t*>(kmalloc(bufSize));
+        if (!buf) { KPrintf("Out of memory\n"); return -1; }
+
+        // Generate sine wave using fixed-point phase accumulator
+        // phase is 24.8 fixed point into the 256-entry table
+        uint32_t phaseInc = (freq * 256 * 256) / sampleRate;
+        uint32_t phase = 0;
+        for (uint32_t i = 0; i < numSamples; i++)
+        {
+            uint8_t idx = (phase >> 8) & 0xFF;
+            buf[i] = sinTable[idx] / 2; // -16383..16383 (50% volume)
+            phase += phaseInc;
+        }
+
+        KPrintf("Playing %u Hz for %u ms (%u samples)\n", freq, durationMs, numSamples);
+        int ret = AudioPlay(buf, bufSize, sampleRate, 1, 16);
+        if (ret < 0)
+            KPrintf("AudioPlay failed: %d\n", ret);
+
+        kfree(buf);
+        return ret >= 0 ? 0 : -1;
     }
 
     // Built-in: sched [policy_name] — show or switch scheduler policy

@@ -173,6 +173,7 @@ add_executable(kernel
     src/display.cpp
     src/mouse.cpp
     src/shell.cpp
+    src/audio.cpp
     src/boot_logo.cpp
     src/klog.cpp
     src/smp.cpp

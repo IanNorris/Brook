@@ -13,6 +13,7 @@
 #include "pci.h"
 #include "serial.h"
 #include "kprintf.h"
+#include "audio.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "memory/address.h"
@@ -32,6 +33,7 @@ MODULE_IMPORT_SYMBOL(VmmAllocPages);
 MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 MODULE_IMPORT_SYMBOL(VmmMapPage);
 MODULE_IMPORT_SYMBOL(PmmAllocPage);
+MODULE_IMPORT_SYMBOL(AudioRegister);
 
 using namespace brook;
 
@@ -837,6 +839,16 @@ static int IntelHdaInit()
                          (1 << (g_numInputStreams)));
 
     g_initialized = true;
+
+    // Register with the audio subsystem
+    static const brook::AudioDriver hdaAudioDriver = {
+        "intel_hda",
+        HdaPlayPcm,
+        HdaStop,
+        HdaIsPlaying,
+        HdaGetPosition,
+    };
+    AudioRegister(&hdaAudioDriver);
 
     KPrintf("intel_hda: initialised — DAC=%d PIN=%d\n", g_dacNid, g_pinNid);
     return 0;
