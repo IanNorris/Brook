@@ -535,6 +535,11 @@ static int ExecCommand(int argc, const char* const* argv)
             WmSetActive(true);
             g_ttyFull = false; // WM takes over the screen
 
+            // Suppress TTY framebuffer rendering — the kernel console WM window
+            // handles log display, and TTY writes would briefly flash under the
+            // compositor each frame.
+            TtySuppressDisplay(true);
+
             // Load wallpaper asynchronously so WM startup isn't blocked.
             {
                 using namespace brook;
