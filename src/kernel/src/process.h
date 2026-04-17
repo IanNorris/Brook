@@ -185,6 +185,7 @@ enum class FdType : uint8_t
     Socket,        // Network socket (UDP/TCP)
     DevTty,        // /dev/tty — bidirectional terminal (read=stdin pipe, write=stdout pipe)
     EventFd,       // eventfd — uint64 counter for event notification
+    DevDsp,        // /dev/dsp — OSS audio output
 };
 
 struct TtyDevicePair {

@@ -22,6 +22,7 @@
 #include "terminal.h"
 #include "net.h"
 #include "rtc.h"
+#include "audio.h"
 
 // Forward declaration
 extern "C" __attribute__((naked)) void ReturnToKernel();
@@ -206,6 +207,45 @@ static constexpr uint32_t EFD_SEMAPHORE = 0x01;
 static constexpr uint32_t EFD_NONBLOCK  = 0x800;
 
 // ---------------------------------------------------------------------------
+// OSS /dev/dsp state and ioctl definitions
+// ---------------------------------------------------------------------------
+
+// OSS ioctl numbers (from <sys/soundcard.h>)
+static constexpr uint64_t SNDCTL_DSP_RESET     = 0x5000;
+static constexpr uint64_t SNDCTL_DSP_SPEED     = 0xC0045002; // _IOWR('P', 2, int)
+static constexpr uint64_t SNDCTL_DSP_SETFMT    = 0xC0045005; // _IOWR('P', 5, int)
+static constexpr uint64_t SNDCTL_DSP_CHANNELS  = 0xC0045006; // _IOWR('P', 6, int)
+static constexpr uint64_t SNDCTL_DSP_STEREO    = 0xC0045003; // _IOWR('P', 3, int)
+static constexpr uint64_t SNDCTL_DSP_GETOSPACE = 0x800C5012; // _IOR('P', 0x12, audio_buf_info)
+static constexpr uint64_t SNDCTL_DSP_GETCAPS   = 0x8004500F; // _IOR('P', 0x0F, int)
+static constexpr uint64_t SNDCTL_DSP_SETTRIGGER= 0x40045010; // _IOW('P', 0x10, int)
+static constexpr uint64_t SNDCTL_DSP_GETFMTS   = 0x8004500B; // _IOR('P', 0x0B, int)
+static constexpr uint64_t SNDCTL_DSP_SETFRAGMENT= 0xC004500A;// _IOWR('P', 0x0A, int)
+static constexpr uint64_t SNDCTL_DSP_GETBLKSIZE = 0xC0045004;// _IOWR('P', 4, int)
+
+// OSS audio formats
+static constexpr int AFMT_U8     = 0x00000008;
+static constexpr int AFMT_S16_LE = 0x00000010;
+// OSS capabilities
+static constexpr int DSP_CAP_TRIGGER = 0x00000010;
+
+// Per-fd audio device state
+struct DspState {
+    uint32_t sampleRate;
+    uint8_t  channels;
+    uint8_t  bitsPerSample;
+    uint16_t fragmentSize;   // bytes per fragment
+    uint32_t bufferOffset;   // write cursor into staging buffer
+    uint8_t* buffer;         // staging buffer (kmalloc'd)
+    uint32_t bufferSize;     // total staging buffer size
+};
+
+static constexpr uint32_t DSP_DEFAULT_RATE     = 48000;
+static constexpr uint8_t  DSP_DEFAULT_CHANNELS = 1;
+static constexpr uint8_t  DSP_DEFAULT_BITS     = 8;
+static constexpr uint32_t DSP_BUFFER_SIZE      = 65536; // 64KB staging buffer
+
+// ---------------------------------------------------------------------------
 // sys_write (1)
 // ---------------------------------------------------------------------------
 
@@ -276,6 +316,35 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
     // /dev/null — discard all writes
     if (fde->type == FdType::DevNull || fde->type == FdType::DevUrandom)
         return static_cast<int64_t>(count);
+
+    // /dev/dsp — buffer PCM data, flush to audio driver when full
+    if (fde->type == FdType::DevDsp && fde->handle)
+    {
+        auto* dsp = static_cast<DspState*>(fde->handle);
+        const uint8_t* src = reinterpret_cast<const uint8_t*>(bufAddr);
+        uint64_t written = 0;
+
+        while (written < count)
+        {
+            uint32_t space = dsp->bufferSize - dsp->bufferOffset;
+            uint32_t chunk = static_cast<uint32_t>(count - written);
+            if (chunk > space) chunk = space;
+
+            for (uint32_t i = 0; i < chunk; i++)
+                dsp->buffer[dsp->bufferOffset + i] = src[written + i];
+            dsp->bufferOffset += chunk;
+            written += chunk;
+
+            // Flush when buffer is full
+            if (dsp->bufferOffset >= dsp->bufferSize)
+            {
+                AudioPlay(dsp->buffer, dsp->bufferOffset,
+                          dsp->sampleRate, dsp->channels, dsp->bitsPerSample);
+                dsp->bufferOffset = 0;
+            }
+        }
+        return static_cast<int64_t>(written);
+    }
 
     // Write to /dev/tty (DevKeyboard) — route to serial + TTY framebuffer
     if (fde->type == FdType::DevKeyboard)
@@ -938,6 +1007,25 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         return fd;
     }
 
+    // /dev/dsp — OSS audio output
+    if (StrEq(path, "/dev/dsp"))
+    {
+        if (!AudioAvailable()) return -ENODEV;
+        auto* dsp = static_cast<DspState*>(kmalloc(sizeof(DspState)));
+        if (!dsp) return -ENOMEM;
+        dsp->sampleRate    = DSP_DEFAULT_RATE;
+        dsp->channels      = DSP_DEFAULT_CHANNELS;
+        dsp->bitsPerSample = DSP_DEFAULT_BITS;
+        dsp->fragmentSize  = 4096;
+        dsp->bufferOffset  = 0;
+        dsp->bufferSize    = DSP_BUFFER_SIZE;
+        dsp->buffer        = static_cast<uint8_t*>(kmalloc(DSP_BUFFER_SIZE));
+        if (!dsp->buffer) { kfree(dsp); return -ENOMEM; }
+        int fd = FdAlloc(proc, FdType::DevDsp, dsp);
+        if (fd < 0) { kfree(dsp->buffer); kfree(dsp); return -EMFILE; }
+        return fd;
+    }
+
     // Synthetic memory files: /etc/passwd, /etc/group, /proc/self/...
     {
         struct SyntheticFile { const char* path; const char* content; };
@@ -1135,6 +1223,19 @@ static int64_t sys_close(uint64_t fd, uint64_t, uint64_t,
     if (fde->type == FdType::EventFd && fde->handle)
     {
         kfree(fde->handle);
+    }
+
+    if (fde->type == FdType::DevDsp && fde->handle)
+    {
+        auto* dsp = static_cast<DspState*>(fde->handle);
+        // Flush any remaining buffered audio
+        if (dsp->bufferOffset > 0)
+        {
+            AudioPlay(dsp->buffer, dsp->bufferOffset,
+                      dsp->sampleRate, dsp->channels, dsp->bitsPerSample);
+        }
+        kfree(dsp->buffer);
+        kfree(dsp);
     }
 
     FdFree(proc, static_cast<int>(fd));
@@ -3076,6 +3177,117 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
     if (cmd == 0x540B)
         return 0;
 
+    // ---------------------------------------------------------------------------
+    // OSS /dev/dsp ioctls
+    // ---------------------------------------------------------------------------
+    if (fde->type == FdType::DevDsp && fde->handle)
+    {
+        auto* dsp = static_cast<DspState*>(fde->handle);
+
+        // SNDCTL_DSP_RESET — stop playback, reset buffer
+        if (cmd == SNDCTL_DSP_RESET)
+        {
+            AudioStop();
+            dsp->bufferOffset = 0;
+            return 0;
+        }
+
+        // SNDCTL_DSP_SPEED — set/get sample rate
+        if (cmd == SNDCTL_DSP_SPEED)
+        {
+            auto* rate = reinterpret_cast<int*>(arg);
+            if (*rate > 0) dsp->sampleRate = static_cast<uint32_t>(*rate);
+            *rate = static_cast<int>(dsp->sampleRate);
+            return 0;
+        }
+
+        // SNDCTL_DSP_SETFMT — set/get audio format
+        if (cmd == SNDCTL_DSP_SETFMT)
+        {
+            auto* fmt = reinterpret_cast<int*>(arg);
+            if (*fmt == AFMT_S16_LE)
+                dsp->bitsPerSample = 16;
+            else if (*fmt == AFMT_U8)
+                dsp->bitsPerSample = 8;
+            // Report back current format
+            *fmt = (dsp->bitsPerSample == 16) ? AFMT_S16_LE : AFMT_U8;
+            return 0;
+        }
+
+        // SNDCTL_DSP_CHANNELS — set/get channel count
+        if (cmd == SNDCTL_DSP_CHANNELS)
+        {
+            auto* ch = reinterpret_cast<int*>(arg);
+            if (*ch >= 1 && *ch <= 2) dsp->channels = static_cast<uint8_t>(*ch);
+            *ch = dsp->channels;
+            return 0;
+        }
+
+        // SNDCTL_DSP_STEREO — set mono(0)/stereo(1)
+        if (cmd == SNDCTL_DSP_STEREO)
+        {
+            auto* stereo = reinterpret_cast<int*>(arg);
+            dsp->channels = (*stereo) ? 2 : 1;
+            *stereo = (dsp->channels == 2) ? 1 : 0;
+            return 0;
+        }
+
+        // SNDCTL_DSP_GETOSPACE — report available buffer space
+        if (cmd == SNDCTL_DSP_GETOSPACE)
+        {
+            struct audio_buf_info { int fragments; int fragstotal; int fragsize; int bytes; };
+            auto* info = reinterpret_cast<audio_buf_info*>(arg);
+            uint32_t avail = dsp->bufferSize - dsp->bufferOffset;
+            info->fragsize   = static_cast<int>(dsp->fragmentSize);
+            info->fragstotal = static_cast<int>(dsp->bufferSize / dsp->fragmentSize);
+            info->fragments  = static_cast<int>(avail / dsp->fragmentSize);
+            info->bytes      = static_cast<int>(avail);
+            return 0;
+        }
+
+        // SNDCTL_DSP_GETCAPS — report capabilities
+        if (cmd == SNDCTL_DSP_GETCAPS)
+        {
+            auto* caps = reinterpret_cast<int*>(arg);
+            *caps = DSP_CAP_TRIGGER;
+            return 0;
+        }
+
+        // SNDCTL_DSP_GETFMTS — report supported formats
+        if (cmd == SNDCTL_DSP_GETFMTS)
+        {
+            auto* fmts = reinterpret_cast<int*>(arg);
+            *fmts = AFMT_U8 | AFMT_S16_LE;
+            return 0;
+        }
+
+        // SNDCTL_DSP_SETFRAGMENT — set fragment size (accept, clamp)
+        if (cmd == SNDCTL_DSP_SETFRAGMENT)
+        {
+            auto* val = reinterpret_cast<int*>(arg);
+            int fragExp = (*val) & 0xFFFF;
+            if (fragExp < 8) fragExp = 8;    // min 256 bytes
+            if (fragExp > 16) fragExp = 16;  // max 64KB
+            dsp->fragmentSize = static_cast<uint16_t>(1u << fragExp);
+            return 0;
+        }
+
+        // SNDCTL_DSP_GETBLKSIZE — return fragment size
+        if (cmd == SNDCTL_DSP_GETBLKSIZE)
+        {
+            auto* size = reinterpret_cast<int*>(arg);
+            *size = static_cast<int>(dsp->fragmentSize);
+            return 0;
+        }
+
+        // SNDCTL_DSP_SETTRIGGER — enable/disable output, accept but noop
+        if (cmd == SNDCTL_DSP_SETTRIGGER)
+            return 0;
+
+        SerialPrintf("sys_ioctl: dsp unknown cmd 0x%lx\n", cmd);
+        return -EINVAL;
+    }
+
     SerialPrintf("sys_ioctl: unhandled fd=%lu cmd=0x%lx\n", fd, cmd);
     return -ENOSYS;
 }
@@ -3293,12 +3505,14 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
         return 0;
     }
 
-    if (fde->type == FdType::DevKeyboard || fde->type == FdType::DevNull || fde->type == FdType::DevUrandom) {
+    if (fde->type == FdType::DevKeyboard || fde->type == FdType::DevNull ||
+        fde->type == FdType::DevUrandom || fde->type == FdType::DevDsp) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
         for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
         st->st_mode = 0020666; // S_IFCHR
         st->st_rdev = (fde->type == FdType::DevNull) ? 0x0103 :
-                      (fde->type == FdType::DevUrandom) ? 0x0109 : 0x0400;
+                      (fde->type == FdType::DevUrandom) ? 0x0109 :
+                      (fde->type == FdType::DevDsp) ? 0x0E03 : 0x0400; // 14,3 = /dev/dsp
         st->st_blksize = 4096;
         return 0;
     }
@@ -3905,6 +4119,15 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
             continue;
         }
 
+        // /dev/dsp: always writable (we buffer)
+        if (fde->type == FdType::DevDsp)
+        {
+            if (fds[i].events & POLLOUT)
+                fds[i].revents |= POLLOUT;
+            if (fds[i].revents) ready++;
+            continue;
+        }
+
         // Default: assume ready for whatever was asked
         fds[i].revents = fds[i].events;
         ready++;
@@ -4066,6 +4289,13 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
                 if ((fds[i].events & POLLIN) &&
                     __atomic_load_n(&efd->counter, __ATOMIC_ACQUIRE) > 0)
                     fds[i].revents |= POLLIN;
+                if (fds[i].events & POLLOUT)
+                    fds[i].revents |= POLLOUT;
+                if (fds[i].revents) ready++;
+                continue;
+            }
+            if (fde->type == FdType::DevDsp)
+            {
                 if (fds[i].events & POLLOUT)
                     fds[i].revents |= POLLOUT;
                 if (fds[i].revents) ready++;
