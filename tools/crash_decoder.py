@@ -4,7 +4,7 @@
 Usage:
   crash_decoder.py screenshot.png          # Decode QR from image
   crash_decoder.py --vnc localhost:5943    # Capture from VNC + decode
-  crash_decoder.py --base45 "1A2B..."      # Decode raw Base45 text
+  crash_decoder.py --hex "2d01..."         # Decode raw hex bytes
 
 Automatically finds BROOK.elf for symbolication if not specified.
 """
@@ -258,25 +258,28 @@ class Symbolicator:
 
 
 # ── QR scanning ─────────────────────────────────────────────────────────────
-def scan_qr(image_path: str) -> str:
+def scan_qr(image_path: str) -> bytes:
+    """Scan QR code from image. Returns raw bytes (binary QR mode)."""
     try:
         from pyzbar.pyzbar import decode as pyzbar_decode
         from PIL import Image
     except ImportError:
         raise RuntimeError(
-            "pyzbar/Pillow not installed. Use --base45 to supply raw text instead.\n"
+            "pyzbar/Pillow not installed. Use --hex to supply raw hex instead.\n"
             "  pip install pyzbar Pillow"
         )
     img = Image.open(image_path)
     results = pyzbar_decode(img)
     if not results:
         raise RuntimeError(f"No QR code found in {image_path}")
-    return results[0].data.decode("ascii")
+    # pyzbar interprets binary QR data as Latin-1 codepoints then UTF-8
+    # encodes them. Reverse: decode UTF-8 → Latin-1 chars → encode Latin-1.
+    return results[0].data.decode("utf-8").encode("latin-1")
 
 
 # ── VNC capture ─────────────────────────────────────────────────────────────
-def vnc_capture(host_port: str, save_path: str = "vnc_crash_capture.png") -> str:
-    """Capture a screenshot directly from VNC (no vncdotool needed)."""
+def vnc_capture(host_port: str, save_path: str = "vnc_crash_capture.png") -> bytes:
+    """Capture a screenshot directly from VNC, then scan QR and return raw bytes."""
     try:
         from PIL import Image
     except ImportError:
@@ -583,11 +586,13 @@ def main():
         epilog="""Examples:
   %(prog)s screenshot.png                 # Decode QR from image
   %(prog)s --vnc localhost:5943           # Live VNC capture + decode
-  %(prog)s --base45 "1A2B..."            # Decode raw Base45 text
+  %(prog)s --hex "2d01..."                # Decode raw hex bytes directly
+  %(prog)s --base45 "1A2B..."            # Decode legacy Base45 text
   %(prog)s screenshot.png --raw --json   # JSON output with hex dump
 """)
     ap.add_argument("image", nargs="?", help="Path to screenshot image with QR code")
-    ap.add_argument("--base45", metavar="TEXT", help="Decode raw Base45 text directly")
+    ap.add_argument("--hex", metavar="HEX", help="Decode raw hex bytes directly")
+    ap.add_argument("--base45", metavar="TEXT", help="Decode legacy Base45 text (v0x00)")
     ap.add_argument("--elf", metavar="PATH", help="Path to BROOK.elf for symbolication")
     ap.add_argument("--vnc", metavar="HOST:PORT", help="Capture from VNC server")
     ap.add_argument("--raw", action="store_true", help="Show raw hex dump")
@@ -600,23 +605,26 @@ def main():
             if not attr.startswith("_"):
                 setattr(C, attr, "")
 
-    # Obtain Base45 text
-    b45_text = None
-    if args.base45:
-        b45_text = args.base45
+    # Obtain raw crash data
+    raw = None
+    if args.hex:
+        try:
+            raw = bytes.fromhex(args.hex)
+        except ValueError as e:
+            print(f"{C.RED}[error]{C.RESET} Hex decode failed: {e}", file=sys.stderr)
+            sys.exit(1)
+    elif args.base45:
+        try:
+            raw = base45_decode(args.base45)
+        except (KeyError, ValueError) as e:
+            print(f"{C.RED}[error]{C.RESET} Base45 decode failed: {e}", file=sys.stderr)
+            sys.exit(1)
     elif args.vnc:
-        b45_text = vnc_capture(args.vnc)
+        raw = vnc_capture(args.vnc)
     elif args.image:
-        b45_text = scan_qr(args.image)
+        raw = scan_qr(args.image)
     else:
-        ap.error("Provide an image path, --base45 text, or --vnc host:port")
-
-    # Decode
-    try:
-        raw = base45_decode(b45_text)
-    except (KeyError, ValueError) as e:
-        print(f"{C.RED}[error]{C.RESET} Base45 decode failed: {e}", file=sys.stderr)
-        sys.exit(1)
+        ap.error("Provide an image path, --hex bytes, --base45 text, or --vnc host:port")
 
     # Symbolicator — auto-detect ELF if not specified
     elf_path = args.elf or find_brook_elf()

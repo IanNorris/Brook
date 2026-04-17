@@ -3,7 +3,6 @@
 // Pipeline: PanicCPURegs → binary buffer → Base45 → Nayuki QR → framebuffer
 
 #include "panic_qr.h"
-#include "base45.h"
 #include "serial.h"
 
 extern "C" {
@@ -145,31 +144,24 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
 
     SerialPrintf("PANIC QR: packet %u bytes\n", packetLen);
 
-    // Step 2: Base45 encode (no compression for now — adds ~50% overhead)
-    static char encoded[2048];
-    int encLen = Base45Encode(encoded, sizeof(encoded), packetBuf, packetLen);
-    if (encLen <= 0)
-    {
-        SerialPuts("PANIC QR: Base45 encode failed\n");
-        return;
-    }
-
-    SerialPrintf("PANIC QR: Base45 encoded %d chars\n", encLen);
-
-    // Step 3: Generate QR code using Nayuki library
-    // Static buffers — these are ~4KB each, too large for exception stacks
+    // Step 2: Generate QR code using binary mode (no Base45 overhead)
+    // encodeBinary uses dataAndTemp as both input AND scratch space,
+    // so we copy the packet data into the temp buffer first.
     static uint8_t qrBuf[qrcodegen_BUFFER_LEN_MAX];
     static uint8_t tempBuf[qrcodegen_BUFFER_LEN_MAX];
 
-    SerialPuts("PANIC QR: calling qrcodegen_encodeText...\n");
+    for (uint32_t i = 0; i < packetLen; ++i)
+        tempBuf[i] = packetBuf[i];
 
-    bool ok = qrcodegen_encodeText(encoded, tempBuf, qrBuf,
-                                    qrcodegen_Ecc_LOW,
-                                    qrcodegen_VERSION_MIN,
-                                    qrcodegen_VERSION_MAX,
-                                    qrcodegen_Mask_AUTO, true);
+    SerialPuts("PANIC QR: calling qrcodegen_encodeBinary...\n");
 
-    SerialPrintf("PANIC QR: encodeText returned %d\n", ok ? 1 : 0);
+    bool ok = qrcodegen_encodeBinary(tempBuf, packetLen, qrBuf,
+                                      qrcodegen_Ecc_LOW,
+                                      qrcodegen_VERSION_MIN,
+                                      qrcodegen_VERSION_MAX,
+                                      qrcodegen_Mask_AUTO, true);
+
+    SerialPrintf("PANIC QR: encodeBinary returned %d\n", ok ? 1 : 0);
     if (!ok)
     {
         SerialPuts("PANIC QR: QR generation failed\n");
