@@ -4000,6 +4000,13 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
                 if (!(fde->flags & 1) && pb->readerWaiter == self)
                     pb->readerWaiter = nullptr;
             }
+            if (fde->type == FdType::DevTty && fde->handle && (fds[i].events & POLLIN))
+            {
+                auto* pair = static_cast<TtyDevicePair*>(fde->handle);
+                auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
+                if (rp->readerWaiter == self)
+                    rp->readerWaiter = nullptr;
+            }
         }
 
         // Re-scan after wake — reset ready count
@@ -4029,7 +4036,42 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
             }
             if (fde->type == FdType::DevKeyboard && (fds[i].events & POLLIN) && InputHasEvents())
             { fds[i].revents |= POLLIN; ready++; continue; }
-            fds[i].revents = fds[i].events; ready++;
+            if (fde->type == FdType::DevTty && fde->handle)
+            {
+                auto* pair = static_cast<TtyDevicePair*>(fde->handle);
+                if (fds[i].events & POLLIN)
+                {
+                    auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
+                    if (rp->count() > 0 || rp->writers == 0)
+                    { fds[i].revents |= POLLIN; }
+                }
+                if (fds[i].events & POLLOUT)
+                    fds[i].revents |= POLLOUT;
+                if (fds[i].revents) ready++;
+                continue;
+            }
+            if (fde->type == FdType::Socket && fde->handle)
+            {
+                int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+                if ((fds[i].events & POLLIN) && brook::SockPollReady(sockIdx, true, false))
+                    fds[i].revents |= POLLIN;
+                if ((fds[i].events & POLLOUT) && brook::SockPollReady(sockIdx, false, true))
+                    fds[i].revents |= POLLOUT;
+                if (fds[i].revents) ready++;
+                continue;
+            }
+            if (fde->type == FdType::EventFd && fde->handle)
+            {
+                auto* efd = static_cast<EventFdData*>(fde->handle);
+                if ((fds[i].events & POLLIN) &&
+                    __atomic_load_n(&efd->counter, __ATOMIC_ACQUIRE) > 0)
+                    fds[i].revents |= POLLIN;
+                if (fds[i].events & POLLOUT)
+                    fds[i].revents |= POLLOUT;
+                if (fds[i].revents) ready++;
+                continue;
+            }
+            // Unknown fd type: don't claim readiness
         }
     }
 
