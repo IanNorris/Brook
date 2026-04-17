@@ -126,6 +126,14 @@ for tool in wavplay tone; do
     fi
 done
 
+# --- MP3 player ---
+mp3play_bin="${ROOT_DIR}/tools/mp3play/mp3play"
+if [ -f "$mp3play_bin" ]; then
+    echo "MP3 player:"
+    mmd -D s -i "${DISK_IMG}" "::BIN" 2>/dev/null || true
+    sync_file "$mp3play_bin" "BIN/MP3PLAY"
+fi
+
 # --- Static binaries from nix (busybox etc.) ---
 busybox_static="${ROOT_DIR}/busybox_static"
 if [ -f "$busybox_static" ]; then

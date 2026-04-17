@@ -13,7 +13,7 @@ mkdir -p "$BUILD_DIR"
 
 # Use musl cross-compiler from nix (pkgsCross.musl64.stdenv.cc)
 CC="${MUSL_CC:-x86_64-unknown-linux-musl-gcc}"
-CFLAGS="-static -Os -fno-stack-protector -std=gnu11 -DNORMALUNIX -DBROOK -D_DEFAULT_SOURCE -Wall -Wno-unused-result"
+CFLAGS="-static -Os -fno-stack-protector -std=gnu11 -DNORMALUNIX -DBROOK -DFEATURE_SOUND -D_DEFAULT_SOURCE -Wall -Wno-unused-result"
 
 # All DOOM source files (from the original Makefile, minus the Enkel platform file)
 DOOM_SRCS="
@@ -49,6 +49,10 @@ OBJS="$OBJS $BUILD_DIR/doomgeneric_brook.o"
 echo "  CC  i_system.c (Brook override)"
 $CC $CFLAGS -I"$DOOM_SRC" -c "$BROOK_SRC/i_system.c" -o "$BUILD_DIR/i_system_brook.o"
 OBJS="$OBJS $BUILD_DIR/i_system_brook.o"
+
+echo "  CC  i_osssound.c (Brook OSS audio)"
+$CC $CFLAGS -I"$DOOM_SRC" -c "$BROOK_SRC/i_osssound.c" -o "$BUILD_DIR/i_osssound.o"
+OBJS="$OBJS $BUILD_DIR/i_osssound.o"
 
 # Link
 echo "  LD  doom"
