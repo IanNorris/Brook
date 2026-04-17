@@ -11,6 +11,7 @@
 #include "input.h"
 #include "net.h"
 #include "font_atlas.h"
+#include "debug_overlay.h"
 
 namespace brook {
 
@@ -402,9 +403,10 @@ static void BlitWallpaper()
     }
     else
     {
-        for (uint32_t y = 0; y < g_physFbHeight; ++y)
-            for (uint32_t x = 0; x < g_physFbWidth; ++x)
-                dstBase[y * dstStride + x] = 0x00001A3A;
+        // No wallpaper loaded yet — preserve the current backbuffer content
+        // (boot logo / previous TTY output) to avoid a black flash.
+        // Once wallpaper is set via CompositorSetWallpaper, this branch
+        // will stop being taken and the wallpaper fills the screen.
     }
     MarkAllDirty();
 }

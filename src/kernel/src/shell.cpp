@@ -30,6 +30,7 @@
 #include "klog.h"
 #include "profiler.h"
 #include "module.h"
+#include "debug_overlay.h"
 
 // Strace control (defined in syscall.cpp)
 bool StraceEnablePid(uint32_t pid, bool enable);
@@ -523,6 +524,10 @@ static int ExecCommand(int argc, const char* const* argv)
             }
 
             KPrintf("window manager: enabled\n");
+
+            // Spawn kernel console window (shows kernel log in a WM window).
+            KernelConsoleSpawn();
+
             return 0;
         }
 

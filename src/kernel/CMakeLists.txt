@@ -198,6 +198,7 @@ add_executable(kernel
     src/profiler.cpp
     src/sched_policy.cpp
     src/exception_info.cpp
+    src/debug_overlay.cpp
     # Default scheduler policy (statically linked fallback)
     "${BROOK_ROOT}/src/modules/sched_rr.cpp"
     # Memory subsystem

@@ -10,6 +10,7 @@
 #include "spinlock.h"
 #include "apic.h"
 #include "net.h"
+#include "debug_overlay.h"
 
 namespace brook {
 
@@ -269,8 +270,9 @@ void KLog(const char* fmt, ...)
     g_logOffset = off;
     SpinLockRelease(&g_logLock, flags);
 
-    // Also echo to serial.
+    // Also echo to serial and debug overlay.
     SerialPuts(line);
+    DebugOverlayPuts(line);
 }
 
 void KLogCat(LogCat cat, LogLevel level, const char* fmt, ...)
