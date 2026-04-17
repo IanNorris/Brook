@@ -284,11 +284,30 @@ static int cmd_install(const char *name) {
         return 1;
     }
 
-    /* Check if already in store */
+    /* Check if already in store (verify it's not just an empty dir) */
     char store_path[512];
     snprintf(store_path, sizeof(store_path), "/nix/store/%s", pkg.store_name);
     struct stat st;
+    int in_store = 0;
     if (stat(store_path, &st) == 0) {
+        /* Verify the path has actual content (bin/, lib/, or share/) */
+        char check[512];
+        snprintf(check, sizeof(check), "%s/bin", store_path);
+        if (stat(check, &st) == 0) {
+            in_store = 1;
+        } else {
+            snprintf(check, sizeof(check), "%s/lib", store_path);
+            if (stat(check, &st) == 0) {
+                in_store = 1;
+            } else {
+                snprintf(check, sizeof(check), "%s/share", store_path);
+                if (stat(check, &st) == 0)
+                    in_store = 1;
+            }
+        }
+    }
+
+    if (in_store) {
         printf("Already in store: %s\n", pkg.store_name);
     } else {
         /* Fetch package and dependencies */
