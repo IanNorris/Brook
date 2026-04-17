@@ -64,3 +64,5 @@ tools/nix-index/packages.idx
 tools/wavplay/wavplay
 tools/wavplay/tone
 tools/mp3play/mp3play
+
+data/user_content
