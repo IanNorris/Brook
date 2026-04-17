@@ -24,7 +24,7 @@ def run(cmd, **kwargs):
 
 def parse_nm(elf_path):
     """Run llvm-nm and return [(addr, name)] for function symbols, sorted by addr."""
-    nm = shutil.which("llvm-nm") or "llvm-nm"
+    nm = shutil.which("llvm-nm") or shutil.which("nm") or "llvm-nm"
     result = run([nm, "--defined-only", "-n", elf_path])
     if result.returncode != 0:
         print(f"llvm-nm failed: {result.stderr}", file=sys.stderr)
@@ -47,7 +47,7 @@ def parse_nm(elf_path):
 
 def demangle(names):
     """Demangle a list of C++ names using llvm-cxxfilt if available."""
-    cxxfilt = shutil.which("llvm-cxxfilt")
+    cxxfilt = shutil.which("llvm-cxxfilt") or shutil.which("c++filt")
     if not cxxfilt:
         return names
 

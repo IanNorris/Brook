@@ -237,7 +237,7 @@ qemu-system-x86_64 \
     -device virtio-tablet-pci \
     -device virtio-rng-pci \
     -device virtio-net-pci,netdev=net0 \
-    -audiodev none,id=hda0 \
+    -audiodev pipewire,id=hda0 \
     -device hda-output,audiodev=hda0 \
     -netdev user,id=net0,hostfwd=tcp::11234-:1234 \
     ${SERIAL_OPT} \
