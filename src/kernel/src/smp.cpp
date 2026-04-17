@@ -498,24 +498,20 @@ extern "C" void PanicNmiHandlerAsm();
 
 uint32_t SmpHaltAllAPs()
 {
-    SerialPuts("SmpHalt: CAS\n");
     // Only the first caller broadcasts NMI — subsequent calls skip
     bool expected = false;
     if (!__atomic_compare_exchange_n(&g_panicHaltActive, &expected, true,
                                      false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
     {
-        SerialPuts("SmpHalt: already active, skip\n");
         // Already in panic halt — don't re-broadcast
         return __atomic_load_n(&g_haltedCount, __ATOMIC_ACQUIRE);
     }
 
-    SerialPuts("SmpHalt: NMI broadcast\n");
     __atomic_store_n(&g_haltedCount, 0, __ATOMIC_SEQ_CST);
 
     // Send NMI to all other CPUs
     ApicBroadcastNmi();
 
-    SerialPuts("SmpHalt: waiting\n");
     // Wait up to ~10ms for APs to halt (they should respond almost instantly)
     uint32_t expected_count = g_onlineCount > 1 ? g_onlineCount - 1 : 0;
     for (uint32_t spin = 0; spin < 10000; ++spin)
@@ -525,7 +521,6 @@ uint32_t SmpHaltAllAPs()
         for (volatile int d = 0; d < 1000; d++) {}
     }
 
-    SerialPuts("SmpHalt: done\n");
     return __atomic_load_n(&g_haltedCount, __ATOMIC_ACQUIRE);
 }
 

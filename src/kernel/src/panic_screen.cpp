@@ -137,46 +137,17 @@ void PanicScreenRender(uint32_t* fb, uint32_t fbW, uint32_t fbH,
     // fbStride comes from TtyGetFramebuffer which returns bytes — convert to pixels
     uint32_t stride = fbStride / sizeof(uint32_t);
 
-    SerialPuts("PANIC_SCREEN: fb=");
-    // Quick hex output for debugging
-    auto putHex = [](uint64_t v) {
-        char buf[19]; buf[0]='0'; buf[1]='x';
-        for (int i = 15; i >= 0; i--) {
-            int n = (v >> (i*4)) & 0xF;
-            buf[2+(15-i)] = (n<10)?('0'+n):('a'+n-10);
-        }
-        buf[18]=0; SerialPuts(buf);
-    };
-    putHex(reinterpret_cast<uint64_t>(fb));
-    SerialPuts(" W="); putHex(fbW);
-    SerialPuts(" H="); putHex(fbH);
-    SerialPuts(" byteStride="); putHex(fbStride);
-    SerialPuts(" pixStride="); putHex(stride);
-    SerialPuts("\n");
-
     const FontAtlas& fa = g_fontAtlas;
     int lineH = fa.lineHeight;
     int glyphW = (fa.glyphCount > 0) ? fa.glyphs[0].advance : 8;
 
-    SerialPuts("PANIC_SCREEN: fontAtlas glyphs=");
-    putHex(fa.glyphCount);
-    SerialPuts(" lineH="); putHex(static_cast<uint64_t>(lineH));
-    SerialPuts(" atlasW="); putHex(fa.atlasWidth);
-    SerialPuts(" pixels="); putHex(reinterpret_cast<uint64_t>(fa.pixels));
-    SerialPuts("\n");
-
     // 1. Fill entire screen with dark red background
     FillRect(fb, stride, 0, 0, fbW, fbH, BG_DARK);
-    SerialPuts("PANIC_SCREEN: FillRect done, pixel[0]=");
-    putHex(fb[0]);
-    SerialPuts("\n");
 
     // 2. Draw bright red banner at top
     uint32_t bannerH = static_cast<uint32_t>(lineH) + 16;
     FillRect(fb, stride, 0, 0, fbW, bannerH, BG_BANNER);
-    SerialPuts("PANIC_SCREEN: banner done\n");
     DrawString(fb, stride, fbW, fbH, 20, 8, "KERNEL PANIC", FG_WHITE);
-    SerialPuts("PANIC_SCREEN: title drawn\n");
 
     // Build info on banner right side
     {

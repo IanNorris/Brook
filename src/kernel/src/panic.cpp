@@ -223,17 +223,11 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
 {
     __asm__ volatile("cli");
 
-    brook::SerialPuts("\nPANIC: entered, calling SmpHaltAllAPs\n");
-
     // Halt all other CPUs first — they must stop before we touch FB/serial
     brook::SmpHaltAllAPs();
 
-    brook::SerialPuts("PANIC: SmpHaltAllAPs returned\n");
-
     // Stop the compositor so nothing overwrites the panic screen.
     brook::CompositorHalt();
-
-    brook::SerialPuts("PANIC: compositor halted\n");
 
     int depth = __atomic_add_fetch(&g_panicNesting, 1, __ATOMIC_SEQ_CST);
     if (depth > 1)
@@ -243,17 +237,11 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
         for (;;) { __asm__ volatile("hlt"); }
     }
 
-    brook::SerialPuts("PANIC: capturing regs\n");
-
     PanicRegs regs;
     CapturePanicRegs(regs);
 
-    brook::SerialPuts("PANIC: capturing full regs\n");
-
     brook::PanicCPURegs fullRegs;
     CaptureFullRegs(fullRegs);
-
-    brook::SerialPuts("PANIC: capturing stack\n");
 
     // Capture stack trace via RBP chain
     brook::PanicStackTrace trace;
@@ -261,15 +249,11 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
     __asm__ volatile("movq %%rbp, %0" : "=r"(captureRbp));
     CaptureStackTrace(trace, captureRbp, regs.rip);
 
-    brook::SerialPuts("PANIC: formatting message\n");
-
     // Format the message into a static buffer.
     __builtin_va_list args;
     __builtin_va_start(args, fmt);
     PanicFormatStr(g_panicBuf, static_cast<int>(sizeof(g_panicBuf)), fmt, args);
     __builtin_va_end(args);
-
-    brook::SerialPuts("PANIC: formatted ok, starting serial output\n");
 
     // -- Serial output (always available) ------------------------------------
     brook::SerialPuts("\n*** KERNEL PANIC ***\n");
