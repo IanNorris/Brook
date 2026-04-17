@@ -596,9 +596,20 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         }
     }
 
-    // For kernel-mode faults, delegate to the original handler for diagnostics + halt.
+    // For kernel-mode faults, dump full GPRs then delegate for diagnostics + halt.
     if (!fromUser)
     {
+        // Print all GPRs before delegating — HandleException only gets basic frame
+        ExcPutsRaw("\n=== KERNEL GPRs ===\n");
+        ExcPutsRaw("  RAX "); ExcPutHex(ef->rax); ExcPutsRaw("  RBX "); ExcPutHex(ef->rbx); ExcPutsRaw("\n");
+        ExcPutsRaw("  RCX "); ExcPutHex(ef->rcx); ExcPutsRaw("  RDX "); ExcPutHex(ef->rdx); ExcPutsRaw("\n");
+        ExcPutsRaw("  RSI "); ExcPutHex(ef->rsi); ExcPutsRaw("  RDI "); ExcPutHex(ef->rdi); ExcPutsRaw("\n");
+        ExcPutsRaw("  RBP "); ExcPutHex(ef->rbp); ExcPutsRaw("\n");
+        ExcPutsRaw("  R8  "); ExcPutHex(ef->r8);  ExcPutsRaw("  R9  "); ExcPutHex(ef->r9);  ExcPutsRaw("\n");
+        ExcPutsRaw("  R10 "); ExcPutHex(ef->r10); ExcPutsRaw("  R11 "); ExcPutHex(ef->r11); ExcPutsRaw("\n");
+        ExcPutsRaw("  R12 "); ExcPutHex(ef->r12); ExcPutsRaw("  R13 "); ExcPutHex(ef->r13); ExcPutsRaw("\n");
+        ExcPutsRaw("  R14 "); ExcPutHex(ef->r14); ExcPutsRaw("  R15 "); ExcPutHex(ef->r15); ExcPutsRaw("\n");
+
         InterruptFrame ifrm;
         ifrm.ip    = ef->rip;
         ifrm.cs    = ef->cs;

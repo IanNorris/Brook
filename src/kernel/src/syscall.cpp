@@ -431,14 +431,19 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     // /dev/urandom — fill buffer with RDRAND random bytes
     if (fde->type == FdType::DevUrandom)
     {
+        // Validate user buffer is in user address space
+        if (bufAddr == 0 || bufAddr >= 0x0000800000000000ULL)
+            return -EFAULT;
+        if (count > 0 && (bufAddr + count - 1) >= 0x0000800000000000ULL)
+            return -EFAULT;
+
         auto* dst = reinterpret_cast<uint8_t*>(bufAddr);
         uint64_t filled = 0;
         while (filled < count) {
             uint64_t rval;
-            int ok;
-            asm volatile("rdrand %0; setc %b1" : "=r"(rval), "=r"(ok));
+            unsigned char ok;
+            asm volatile("rdrand %0; setc %1" : "=r"(rval), "=qm"(ok));
             if (!ok) {
-                // RDRAND failed, yield and retry
                 for (volatile int i = 0; i < 100; i++) {}
                 continue;
             }
@@ -560,15 +565,20 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         static constexpr uint32_t LINE_BUF_MAX = 256;
         char lineBuf[LINE_BUF_MAX];
         uint32_t lineLen = 0;
+        bool wmMode = WmIsActive();
 
         for (;;)
         {
             InputEvent ev;
-            if (!InputPollEvent(&ev))
+            bool got = wmMode ? ProcessInputPop(proc, &ev)
+                              : InputPollEvent(&ev);
+            if (!got)
             {
                 // Register as waiter BEFORE re-checking to close the race.
                 InputAddWaiter(proc);
-                if (InputPollEvent(&ev))
+                got = wmMode ? ProcessInputPop(proc, &ev)
+                             : InputPollEvent(&ev);
+                if (got)
                 {
                     InputRemoveWaiter(proc);
                     goto got_event_cooked;
