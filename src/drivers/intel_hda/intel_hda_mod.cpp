@@ -764,17 +764,24 @@ static int IntelHdaInit()
         return -1;
     }
 
-    // Map MMIO pages (HDA registers span ~16KB typically)
-    uint64_t mmioAddr = bar0;
+    // Map MMIO pages into kernel virtual address space
+    uint64_t mmioPhys = bar0;
     uint32_t mmioPages = 4; // 16KB
+    auto mmioVaddr = VmmAllocPages(mmioPages, VMM_WRITABLE, MemTag::Device, KernelPid);
+    if (!mmioVaddr)
+    {
+        SerialPuts("intel_hda: MMIO alloc failed\n");
+        return -1;
+    }
     for (uint32_t p = 0; p < mmioPages; p++)
     {
         VmmMapPage(KernelPageTable,
-                   VirtualAddress(mmioAddr + p * 4096),
-                   PhysicalAddress(mmioAddr + p * 4096),
-                   VMM_WRITABLE | VMM_CACHE_DISABLE);
+                   VirtualAddress(mmioVaddr.raw() + p * 4096),
+                   PhysicalAddress(mmioPhys + p * 4096),
+                   VMM_WRITABLE | VMM_CACHE_DISABLE,
+                   MemTag::Device, KernelPid);
     }
-    g_mmioBase = reinterpret_cast<volatile uint8_t*>(mmioAddr);
+    g_mmioBase = reinterpret_cast<volatile uint8_t*>(mmioVaddr.raw());
 
     // Read capabilities
     uint16_t gcap = hda_read16(GCAP);

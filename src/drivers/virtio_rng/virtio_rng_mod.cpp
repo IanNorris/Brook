@@ -295,19 +295,22 @@ static bool FindVirtioCaps(const PciDevice& dev)
             uint32_t barAddr = PciConfigRead32(dev.bus, dev.dev, dev.fn, 0x10 + bar * 4) & ~0xFu;
             uint64_t mmioBase = barAddr + offset;
 
-            // Map the MMIO range
+            // Map the MMIO range into kernel virtual address space
             uint32_t pages = AlignUp(length, 4096) / 4096;
             if (pages == 0) pages = 1;
-            uint64_t va = mmioBase;
+            auto va = VmmAllocPages(pages, VMM_WRITABLE, MemTag::Device, KernelPid);
+            if (!va) { capPtr = PciConfigRead8(dev.bus, dev.dev, dev.fn, capPtr + 1); continue; }
+            uint64_t physBase = mmioBase & ~0xFFFULL;
             for (uint32_t p = 0; p < pages; p++)
             {
                 VmmMapPage(KernelPageTable,
-                           VirtualAddress(va + p * 4096),
-                           PhysicalAddress(va + p * 4096),
-                           VMM_WRITABLE | VMM_CACHE_DISABLE);
+                           VirtualAddress(va.raw() + p * 4096),
+                           PhysicalAddress(physBase + p * 4096),
+                           VMM_WRITABLE | VMM_CACHE_DISABLE,
+                           MemTag::Device, KernelPid);
             }
 
-            volatile uint8_t* ptr = reinterpret_cast<volatile uint8_t*>(mmioBase);
+            volatile uint8_t* ptr = reinterpret_cast<volatile uint8_t*>(va.raw() + (mmioBase & 0xFFF));
             switch (cfgType) {
                 case VIRTIO_PCI_CAP_COMMON_CFG: g_commonCfg = ptr; break;
                 case VIRTIO_PCI_CAP_NOTIFY_CFG:
