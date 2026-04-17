@@ -238,6 +238,7 @@ qemu-system-x86_64 \
     -device virtio-rng-pci \
     -device virtio-net-pci,netdev=net0 \
     -audiodev pipewire,id=hda0 \
+    -device ich9-intel-hda,bus=pcie.0,addr=0x1b \
     -device hda-output,audiodev=hda0 \
     -netdev user,id=net0,hostfwd=tcp::11234-:1234 \
     ${SERIAL_OPT} \
