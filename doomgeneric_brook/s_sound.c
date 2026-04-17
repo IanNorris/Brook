@@ -634,7 +634,22 @@ void S_ChangeMusic(int musicnum, int looping)
     if (!music->lumpnum)
     {
         M_snprintf(namebuf, sizeof(namebuf), "d_%s", DEH_String(music->name));
-        music->lumpnum = W_GetNumForName(namebuf);
+        music->lumpnum = W_CheckNumForName(namebuf);
+        if (music->lumpnum < 0)
+        {
+            // OPL variant not found — fall back to non-OPL version
+            if (musicnum == mus_introa)
+            {
+                M_snprintf(namebuf, sizeof(namebuf), "d_%s",
+                           DEH_String(S_music[mus_intro].name));
+                music->lumpnum = W_CheckNumForName(namebuf);
+            }
+            if (music->lumpnum < 0)
+            {
+                fprintf(stderr, "S_ChangeMusic: lump '%s' not found, skipping\n", namebuf);
+                return;
+            }
+        }
     }
 
     music->data = W_CacheLumpNum(music->lumpnum, PU_STATIC);
