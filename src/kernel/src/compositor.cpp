@@ -774,6 +774,8 @@ static int16_t g_wmResizeStartMX = 0;
 static int16_t g_wmResizeStartMY = 0;
 static uint16_t g_wmResizeStartW = 0;
 static uint16_t g_wmResizeStartH = 0;
+static bool    g_wmResizeX       = false; // resize horizontally
+static bool    g_wmResizeY       = false; // resize vertically
 static bool    g_wmLastBtnDown   = false;
 
 static void CompositorHandleMouseWM()
@@ -904,6 +906,8 @@ static void CompositorHandleMouseWM()
                 break;
             }
             case WmHitZone::ResizeCorner:
+            case WmHitZone::ResizeRight:
+            case WmHitZone::ResizeBottom:
             {
                 // Start resize drag
                 Window* w = WmGetWindow(hit.windowIndex);
@@ -915,6 +919,8 @@ static void CompositorHandleMouseWM()
                     g_wmResizeStartMY = static_cast<int16_t>(my);
                     g_wmResizeStartW  = w->clientW;
                     g_wmResizeStartH  = w->clientH;
+                    g_wmResizeX = (hit.zone != WmHitZone::ResizeBottom);
+                    g_wmResizeY = (hit.zone != WmHitZone::ResizeRight);
                 }
                 break;
             }
@@ -937,8 +943,8 @@ static void CompositorHandleMouseWM()
         // The actual VFB reallocation happens on release.
         int16_t dx = static_cast<int16_t>(mx) - g_wmResizeStartMX;
         int16_t dy = static_cast<int16_t>(my) - g_wmResizeStartMY;
-        int32_t newW = static_cast<int32_t>(g_wmResizeStartW) + dx;
-        int32_t newH = static_cast<int32_t>(g_wmResizeStartH) + dy;
+        int32_t newW = static_cast<int32_t>(g_wmResizeStartW) + (g_wmResizeX ? dx : 0);
+        int32_t newH = static_cast<int32_t>(g_wmResizeStartH) + (g_wmResizeY ? dy : 0);
         if (newW < static_cast<int32_t>(WM_MIN_WIDTH))  newW = WM_MIN_WIDTH;
         if (newH < static_cast<int32_t>(WM_MIN_HEIGHT)) newH = WM_MIN_HEIGHT;
 

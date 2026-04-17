@@ -253,9 +253,26 @@ WmHitResult WmHitTest(int32_t mx, int32_t my)
         int ww = w.outerWidth();
         int wh = w.outerHeight();
 
-        // Check if mouse is within outer bounds
-        if (mx < wx || my < wy || mx >= wx + ww || my >= wy + wh)
+        // Check if mouse is within outer bounds (extended by grab zone for resize)
+        int grab = static_cast<int>(WM_RESIZE_EDGE);
+        if (mx < wx - grab || my < wy || mx >= wx + ww + grab || my >= wy + wh + grab)
             continue;
+
+        // If click is outside the visual window but inside grab zone,
+        // treat as edge resize
+        bool outsideRight  = (mx >= wx + ww);
+        bool outsideBottom = (my >= wy + wh);
+        if (outsideRight || outsideBottom)
+        {
+            result.windowIndex = idx;
+            if (outsideRight && outsideBottom)
+                result.zone = WmHitZone::ResizeCorner;
+            else if (outsideRight)
+                result.zone = WmHitZone::ResizeRight;
+            else
+                result.zone = WmHitZone::ResizeBottom;
+            return result;
+        }
 
         // We hit this window
         result.windowIndex = idx;
@@ -302,6 +319,18 @@ WmHitResult WmHitTest(int32_t mx, int32_t my)
             relY >= wh - static_cast<int>(WM_RESIZE_GRAB))
         {
             result.zone = WmHitZone::ResizeCorner;
+            return result;
+        }
+
+        // Resize edges (bottom and right, wider than visual border)
+        if (relY >= wh - static_cast<int>(WM_RESIZE_EDGE))
+        {
+            result.zone = WmHitZone::ResizeBottom;
+            return result;
+        }
+        if (relX >= ww - static_cast<int>(WM_RESIZE_EDGE))
+        {
+            result.zone = WmHitZone::ResizeRight;
             return result;
         }
 

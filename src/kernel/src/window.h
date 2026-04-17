@@ -10,7 +10,8 @@ struct Process;
 static constexpr uint32_t WM_TITLE_BAR_HEIGHT = 24;
 static constexpr uint32_t WM_BORDER_WIDTH     = 2;
 static constexpr uint32_t WM_BUTTON_WIDTH     = 24;
-static constexpr uint32_t WM_RESIZE_GRAB      = 8;   // corner grab zone for resize
+static constexpr uint32_t WM_RESIZE_GRAB      = 16;  // corner/edge grab zone for resize
+static constexpr uint32_t WM_RESIZE_EDGE      = 6;   // edge-only grab zone (bottom/right)
 static constexpr uint32_t WM_MIN_WIDTH        = 200;
 static constexpr uint32_t WM_MIN_HEIGHT       = 100;
 static constexpr uint32_t WM_MAX_WINDOWS      = 32;
@@ -73,6 +74,8 @@ enum class WmHitZone : uint8_t
     MinimizeButton,
     ClientArea,
     ResizeCorner,   // bottom-right corner
+    ResizeRight,    // right edge
+    ResizeBottom,   // bottom edge
     Border,
     Taskbar,        // clicked on taskbar background
     TaskbarButton,  // clicked on a taskbar window button
