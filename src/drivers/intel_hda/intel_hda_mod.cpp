@@ -617,7 +617,8 @@ static void StopOutputStream()
 // ---------------------------------------------------------------------------
 
 // Play PCM samples through the HDA output.
-// Non-blocking: stops any in-flight playback immediately and starts the new buffer.
+// Waits briefly for the previous buffer to finish (for gapless playback),
+// but caps the wait so callers like DOOM don't freeze.
 extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
                            uint32_t sampleRate, uint8_t channels,
                            uint8_t bitsPerSample)
@@ -633,16 +634,29 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
                      channels != g_curChannels ||
                      bitsPerSample != g_curBits;
 
-    // Copy audio data to DMA buffer
+    // Wait for previous buffer to finish (~50ms cap).
+    // DOOM: 2048 bytes @ 11025Hz stereo 16-bit = ~46ms
+    // mp3play: ~4608 bytes @ 44100Hz stereo 16-bit = ~26ms
+    if (hda_read32(sdBase + SD_CTL) & SD_CTL_RUN)
+    {
+        for (int i = 0; i < 1000000; i++)
+        {
+            if (hda_read8(sdBase + SD_STS) & SD_STS_BCIS) break;
+            if (!(hda_read32(sdBase + SD_CTL) & SD_CTL_RUN)) break;
+            __asm__ volatile("pause");
+        }
+    }
+
+    // Stop DMA before touching the buffer — avoids corruption
+    StopOutputStream();
+    hda_write8(sdBase + SD_STS, SD_STS_BCIS | SD_STS_FIFOE | SD_STS_DESE);
+
+    // Now safe to copy audio data
     const uint8_t* src = static_cast<const uint8_t*>(samples);
     for (uint32_t i = 0; i < byteCount; i++)
         g_audioBuf[i] = src[i];
     for (uint32_t i = byteCount; i < AUDIO_BUF_SIZE; i++)
         g_audioBuf[i] = 0;
-
-    // Stop current playback, reset position, and restart with new data
-    StopOutputStream();
-    hda_write8(sdBase + SD_STS, SD_STS_BCIS | SD_STS_FIFOE | SD_STS_DESE);
 
     if (needSetup)
         SetupOutputStream(sampleRate, channels, bitsPerSample);

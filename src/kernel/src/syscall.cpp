@@ -317,33 +317,18 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if (fde->type == FdType::DevNull || fde->type == FdType::DevUrandom)
         return static_cast<int64_t>(count);
 
-    // /dev/dsp — buffer PCM data, flush to audio driver at fragment boundary
+    // /dev/dsp — pass each write directly to the audio driver.
+    // No staging buffer — each write() call becomes one HdaPlayPcm call.
+    // This keeps latency low (DOOM writes 2048 bytes = ~46ms at 11025Hz stereo).
     if (fde->type == FdType::DevDsp && fde->handle)
     {
         auto* dsp = static_cast<DspState*>(fde->handle);
         const uint8_t* src = reinterpret_cast<const uint8_t*>(bufAddr);
-        uint64_t written = 0;
 
-        while (written < count)
-        {
-            uint32_t space = dsp->bufferSize - dsp->bufferOffset;
-            uint32_t chunk = static_cast<uint32_t>(count - written);
-            if (chunk > space) chunk = space;
+        AudioPlay(src, static_cast<uint32_t>(count),
+                  dsp->sampleRate, dsp->channels, dsp->bitsPerSample);
 
-            for (uint32_t i = 0; i < chunk; i++)
-                dsp->buffer[dsp->bufferOffset + i] = src[written + i];
-            dsp->bufferOffset += chunk;
-            written += chunk;
-
-            // Flush when we've accumulated a fragment's worth of data
-            if (dsp->bufferOffset >= dsp->fragmentSize)
-            {
-                AudioPlay(dsp->buffer, dsp->bufferOffset,
-                          dsp->sampleRate, dsp->channels, dsp->bitsPerSample);
-                dsp->bufferOffset = 0;
-            }
-        }
-        return static_cast<int64_t>(written);
+        return static_cast<int64_t>(count);
     }
 
     // Write to /dev/tty (DevKeyboard) — route to serial + TTY framebuffer
