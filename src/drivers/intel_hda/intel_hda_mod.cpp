@@ -209,9 +209,9 @@ static BdlEntry* g_bdl = nullptr;
 static uint64_t  g_bdlPhys = 0;
 
 // Audio buffer — split into N fragments for ring-buffered DMA
-static constexpr uint32_t AUDIO_BUF_SIZE  = 64 * 1024; // 64KB total
-static constexpr uint32_t NUM_FRAGMENTS   = 16;         // BDL entries
-static constexpr uint32_t FRAG_SIZE       = AUDIO_BUF_SIZE / NUM_FRAGMENTS; // 4KB each
+static constexpr uint32_t NUM_FRAGMENTS   = 4;           // BDL entries
+static constexpr uint32_t FRAG_SIZE       = 4096;        // 4KB each (= 1 page)
+static constexpr uint32_t AUDIO_BUF_SIZE  = NUM_FRAGMENTS * FRAG_SIZE; // 16KB total
 static uint8_t*  g_audioBuf = nullptr;
 static uint64_t  g_audioBufPhys = 0;
 static uint64_t  g_fragPhys[NUM_FRAGMENTS]; // per-fragment physical addresses

@@ -822,10 +822,18 @@ static void MixAndWrite(void)
             if (a > maxAbs) maxAbs = a;
         }
 
-        if ((mix_count % 100) == 1) {
-            fprintf(stderr, "MixAndWrite #%d: %d bytes, peak=%d, midi=%d\n",
-                    mix_count, (int)sizeof(outbuf), maxAbs,
-                    midi_state.playing ? 1 : 0);
+        // Count active SFX and FM voices
+        int sfxActive = 0, fmActive = 0;
+        for (int c = 0; c < NUM_CHANNELS; c++)
+            if (channels[c].data) sfxActive++;
+        for (int v = 0; v < FM_MAX_VOICES; v++)
+            if (fm_voices[v].active) fmActive++;
+
+        if ((mix_count % 200) == 1) {
+            fprintf(stderr, "Mix #%d: peak=%d midi=%d sfx=%d fm=%d pos=%zu/%zu\n",
+                    mix_count, maxAbs, midi_state.playing ? 1 : 0,
+                    sfxActive, fmActive,
+                    midi_state.pos, midi_state.track_end);
         }
         write(dsp_fd, outbuf, sizeof(outbuf));
     }
@@ -861,8 +869,9 @@ static int I_OSS_StartSound(sfxinfo_t *sfxinfo, int channel, int vol, int sep)
     int left_frac  = 254 - sep;
     int right_frac = sep;
 
-    channels[channel].vol_left  = (vol * left_frac) / (127 * 127);
-    channels[channel].vol_right = (vol * right_frac) / (127 * 127);
+    // vol is 0-127, sep is 0-254 (center=127). Match SDL_mixer panning.
+    channels[channel].vol_left  = (vol * left_frac) / 127;
+    channels[channel].vol_right = (vol * right_frac) / 127;
 
     if (channels[channel].vol_left > 255)  channels[channel].vol_left = 255;
     if (channels[channel].vol_right > 255) channels[channel].vol_right = 255;
@@ -899,8 +908,8 @@ static void I_OSS_UpdateSoundParams(int handle, int vol, int sep)
     int left_frac  = 254 - sep;
     int right_frac = sep;
 
-    channels[handle].vol_left  = (vol * left_frac) / (127 * 127);
-    channels[handle].vol_right = (vol * right_frac) / (127 * 127);
+    channels[handle].vol_left  = (vol * left_frac) / 127;
+    channels[handle].vol_right = (vol * right_frac) / 127;
 
     if (channels[handle].vol_left > 255)  channels[handle].vol_left = 255;
     if (channels[handle].vol_right > 255) channels[handle].vol_right = 255;
