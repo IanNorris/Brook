@@ -225,11 +225,22 @@ static Vnode* GenStat()
     auto* buf = static_cast<char*>(kmalloc(1024));
     if (!buf) return nullptr;
 
+    // Sum actual CPU time from all processes
+    ProcessSnapshot snaps[MAX_PROCESSES];
+    uint32_t count = SchedulerSnapshotProcesses(snaps, MAX_PROCESSES);
+    uint64_t totalUser = 0, totalSys = 0;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        totalUser += snaps[i].userTicks;
+        totalSys  += snaps[i].sysTicks;
+    }
+
     uint64_t ticks = g_lapicTickCount;
-    // Approximate: 1 tick ≈ 1ms, report as jiffies (centiseconds)
-    uint64_t user = ticks / 20;    // rough approximation
-    uint64_t sys  = ticks / 20;
-    uint64_t idle = ticks / 10;
+    // Convert ms ticks to centiseconds (HZ=100)
+    uint64_t user = totalUser / 10;
+    uint64_t sys  = totalSys / 10;
+    uint64_t idle = (ticks - totalUser - totalSys) / 10;
+    if (idle > ticks / 10) idle = 0; // underflow guard
 
     uint32_t n = ProcFmt(buf, 1024,
         "cpu  %lu %lu %lu %lu 0 0 0 0 0 0\n"
@@ -243,7 +254,7 @@ static Vnode* GenStat()
         user, 0UL, sys, idle,
         user, 0UL, sys, idle,
         0UL,  // btime
-        ticks / 1000);  // rough process count
+        (uint64_t)count);
 
     return MakeProcVnode(buf, n);
 }
@@ -321,13 +332,18 @@ static Vnode* GenPidStat(const ProcessSnapshot& proc)
     uint64_t vsize = proc.programBreak > 0 ? proc.programBreak : 0;
     uint64_t rss = (proc.stackTop - proc.stackBase) / 4096;  // rough RSS in pages
 
+    // Convert LAPIC ticks (~1ms each) to Linux clock ticks (HZ=100, 10ms each)
+    uint64_t utime = proc.userTicks / 10;
+    uint64_t stime = proc.sysTicks / 10;
+
     uint32_t n = ProcFmt(buf, 512,
         "%u (%s) %c %u %u %u 0 -1 0 "
-        "0 0 0 0 0 0 0 0 "
+        "0 0 0 0 %lu %lu 0 0 "
         "20 0 1 0 0 %lu %lu "
         "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
         (uint32_t)proc.pid, proc.name, StateChar(proc.state),
         (uint32_t)proc.parentPid, (uint32_t)proc.pgid, (uint32_t)proc.sid,
+        utime, stime,
         vsize, rss);
 
     return MakeProcVnode(buf, n);

@@ -747,6 +747,10 @@ void SchedulerTimerTick()
     if (!cur)
         return;
 
+    // CPU time accounting: charge one tick to the running process.
+    if (cur != g_perCpu[cpu].idleProcess)
+        cur->userTicks++;
+
     // Idle — if something became ready, switch to it.
     if (cur == g_perCpu[cpu].idleProcess)
     {
@@ -1204,6 +1208,8 @@ uint32_t SchedulerSnapshotProcesses(ProcessSnapshot* out, uint32_t maxCount)
         s.stackBase = p->stackBase;
         s.stackTop = p->stackTop;
         s.programBreak = p->programBreak;
+        s.userTicks = p->userTicks;
+        s.sysTicks = p->sysTicks;
         uint32_t j = 0;
         for (; j < 31 && p->name[j]; ++j)
             s.name[j] = p->name[j];

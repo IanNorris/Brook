@@ -251,6 +251,10 @@ struct Process
     volatile bool compositorRegistered; // True while compositor holds a reference to this process's VFB
     int32_t exitStatus;      // Exit status (stored when process exits, for wait4)
 
+    // CPU time accounting (in LAPIC ticks, ~1ms each)
+    volatile uint64_t userTicks;     // Ticks spent in user mode
+    volatile uint64_t sysTicks;      // Ticks spent in kernel mode
+
     // Threading
     bool     isThread;           // True if this is a thread (not the group leader)
     Process* threadLeader;       // Points to the thread group leader (self if leader)

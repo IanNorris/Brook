@@ -81,6 +81,8 @@ struct ProcessSnapshot {
     uint64_t stackTop;
     uint64_t programBreak;
     int32_t runningOnCpu;
+    uint64_t userTicks;
+    uint64_t sysTicks;
 };
 
 // Take a snapshot of all processes.  Fills `out` with up to `maxCount` entries.
