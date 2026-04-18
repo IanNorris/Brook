@@ -627,6 +627,12 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
 
     uint32_t sdBase = g_outStreamBase;
 
+    // Full stream setup only on first call or format change
+    bool needSetup = !g_streamConfigured ||
+                     sampleRate != g_curRate ||
+                     channels != g_curChannels ||
+                     bitsPerSample != g_curBits;
+
     // Wait for any in-flight playback to complete
     if (hda_read32(sdBase + SD_CTL) & SD_CTL_RUN)
     {
@@ -639,29 +645,23 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
             if (!(hda_read32(sdBase + SD_CTL) & SD_CTL_RUN)) break;
             __asm__ volatile("pause");
         }
-        StopOutputStream();
     }
 
-    // Clear completion status
-    hda_write8(sdBase + SD_STS, SD_STS_BCIS | SD_STS_FIFOE | SD_STS_DESE);
-
-    // Full stream setup only on first call or format change
-    bool needSetup = !g_streamConfigured ||
-                     sampleRate != g_curRate ||
-                     channels != g_curChannels ||
-                     bitsPerSample != g_curBits;
-
-    if (needSetup)
-        SetupOutputStream(sampleRate, channels, bitsPerSample);
-
-    // Copy audio data to DMA buffer
+    // Copy new audio data BEFORE stopping — minimizes the silent gap.
+    // The old buffer is looping but BCIS means it completed at least once,
+    // so DMA position is near/at the end. Overwriting is safe.
     const uint8_t* src = static_cast<const uint8_t*>(samples);
     for (uint32_t i = 0; i < byteCount; i++)
         g_audioBuf[i] = src[i];
-
-    // Zero remaining buffer
     for (uint32_t i = byteCount; i < AUDIO_BUF_SIZE; i++)
         g_audioBuf[i] = 0;
+
+    // Now stop, update, restart — this window is as short as possible
+    StopOutputStream();
+    hda_write8(sdBase + SD_STS, SD_STS_BCIS | SD_STS_FIFOE | SD_STS_DESE);
+
+    if (needSetup)
+        SetupOutputStream(sampleRate, channels, bitsPerSample);
 
     // Update BDL entry and cyclic buffer length
     g_bdl[0].addr   = g_audioBufPhys;
