@@ -30,9 +30,9 @@ mkdir drivers
 mkdir bin
 EOF
 
-# Write BROOK.MNT (tells kernel to mount at /boot)
+# Write BROOK.MNT (tells kernel to mount at /data)
 TMPDIR=$(mktemp -d)
-echo -n "/boot" > "${TMPDIR}/BROOK.MNT"
+echo -n "/data" > "${TMPDIR}/BROOK.MNT"
 debugfs -w "${DISK_IMG}" -R "write ${TMPDIR}/BROOK.MNT BROOK.MNT" 2>/dev/null
 rm -rf "${TMPDIR}"
 
