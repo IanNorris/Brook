@@ -50,7 +50,11 @@ echo "  CC  i_system.c (Brook override)"
 $CC $CFLAGS -I"$BROOK_SRC" -I"$DOOM_SRC" -c "$BROOK_SRC/i_system.c" -o "$BUILD_DIR/i_system_brook.o"
 OBJS="$OBJS $BUILD_DIR/i_system_brook.o"
 
-echo "  CC  i_osssound.c (Brook OSS audio)"
+echo "  CC  opl3.c (Nuked OPL3 emulator)"
+$CC $CFLAGS -Wno-unused-variable -I"$BROOK_SRC" -I"$DOOM_SRC" -c "$BROOK_SRC/opl3.c" -o "$BUILD_DIR/opl3.o"
+OBJS="$OBJS $BUILD_DIR/opl3.o"
+
+echo "  CC  i_osssound.c (Brook OSS audio + OPL3 music)"
 $CC $CFLAGS -I"$BROOK_SRC" -I"$DOOM_SRC" -c "$BROOK_SRC/i_osssound.c" -o "$BUILD_DIR/i_osssound.o"
 OBJS="$OBJS $BUILD_DIR/i_osssound.o"
 

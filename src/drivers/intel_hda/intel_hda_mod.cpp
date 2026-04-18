@@ -653,17 +653,6 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
 
     uint32_t sdBase = g_outStreamBase;
 
-    static int hda_call_count = 0;
-    hda_call_count++;
-    if ((hda_call_count % 50) == 1) {
-        uint32_t lpib = hda_read32(sdBase + SD_LPIB);
-        uint32_t ctl = hda_read32(sdBase + SD_CTL);
-        uint32_t sts = hda_read8(sdBase + SD_STS);
-        SerialPrintf("HdaPlayPcm #%d: %u bytes rate=%u wFrag=%u wOff=%u LPIB=%u CTL=0x%x STS=0x%x running=%d\n",
-                     hda_call_count, byteCount, sampleRate, g_writeFrag, g_writeOffset,
-                     lpib, ctl, sts, g_streamRunning ? 1 : 0);
-    }
-
     // Full stream setup on first call or format change
     bool needSetup = !g_streamConfigured ||
                      sampleRate != g_curRate ||
