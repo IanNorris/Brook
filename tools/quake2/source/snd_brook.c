@@ -31,7 +31,7 @@ static unsigned char dma_buffer[SND_BUF_SAMPLES * 2 * 2]; /* 16-bit stereo */
 
 qboolean SNDDMA_Init(void)
 {
-    audio_fd = open("/dev/dsp", O_WRONLY);
+    audio_fd = open("/dev/dsp", O_WRONLY | O_NONBLOCK);
     if (audio_fd < 0)
     {
         Com_Printf("SNDDMA_Init: can't open /dev/dsp\n");

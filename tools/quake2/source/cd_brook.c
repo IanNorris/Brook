@@ -122,7 +122,7 @@ static qboolean cd_open_track(int track)
 
 int CDAudio_Init(void)
 {
-    cd_fd = open("/dev/dsp", O_WRONLY);
+    cd_fd = open("/dev/dsp", O_WRONLY | O_NONBLOCK);
     if (cd_fd < 0)
     {
         Com_Printf("CDAudio_Init: can't open /dev/dsp for music\n");

@@ -649,7 +649,7 @@ static void StopOutputStream()
 // so we don't overwrite data DMA is still playing.
 extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
                            uint32_t sampleRate, uint8_t channels,
-                           uint8_t bitsPerSample)
+                           uint8_t bitsPerSample, bool nonblock)
 {
     if (!g_initialized || !g_dacNid) return -1;
 
@@ -720,13 +720,10 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
             }
 
             // Wait for DMA to advance so we don't overwrite data being played.
-            // One 4KB fragment at 44100 Hz stereo 16-bit takes ~23ms.
-            // We use BusyWait to ensure real time passes (SchedulerYield alone
-            // returns instantly if no other threads are runnable), then yield
-            // to let other threads use the CPU while we wait.
             {
                 bool ready = false;
-                for (int attempt = 0; attempt < 100; attempt++)
+                int maxAttempts = nonblock ? 1 : 100;
+                for (int attempt = 0; attempt < maxAttempts; attempt++)
                 {
                     uint32_t lpib = hda_read32(sdBase + SD_LPIB);
                     uint32_t playFrag = lpib / FRAG_SIZE;

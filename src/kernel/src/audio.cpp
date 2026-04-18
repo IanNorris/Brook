@@ -92,7 +92,7 @@ void AudioMixerFlush()
     }
 
     uint32_t byteCount = g_mixFrames * MIXER_FRAME_BYTES;
-    g_audioDriver->play(outBuf, byteCount, MIXER_HW_RATE, MIXER_HW_CHANNELS, MIXER_HW_BITS);
+    g_audioDriver->play(outBuf, byteCount, MIXER_HW_RATE, MIXER_HW_CHANNELS, MIXER_HW_BITS, false);
 
     // Clear the flushed region and reset stream positions
     uint32_t flushedFrames = g_mixFrames;
@@ -131,10 +131,11 @@ bool AudioAvailable()
 }
 
 int AudioPlay(const void* samples, uint32_t byteCount,
-              uint32_t sampleRate, uint8_t channels, uint8_t bitsPerSample)
+              uint32_t sampleRate, uint8_t channels, uint8_t bitsPerSample,
+              bool nonblock)
 {
     if (!g_audioDriver || !g_audioDriver->play) return -1;
-    return g_audioDriver->play(samples, byteCount, sampleRate, channels, bitsPerSample);
+    return g_audioDriver->play(samples, byteCount, sampleRate, channels, bitsPerSample, nonblock);
 }
 
 void AudioStop()

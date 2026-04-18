@@ -403,9 +403,9 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
 
         if (mixSrc && mixFrames > 0)
         {
-            // Send directly to HDA (bypass mixer — flush-per-write never mixes)
+            bool nonblock = (fde->statusFlags & 0x800) != 0; // O_NONBLOCK
             AudioPlay(mixSrc, mixFrames * MIXER_FRAME_BYTES,
-                      MIXER_HW_RATE, MIXER_HW_CHANNELS, MIXER_HW_BITS);
+                      MIXER_HW_RATE, MIXER_HW_CHANNELS, MIXER_HW_BITS, nonblock);
         }
 
         return static_cast<int64_t>(count);

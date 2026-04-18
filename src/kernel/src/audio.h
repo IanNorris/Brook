@@ -18,8 +18,10 @@ struct AudioDriver {
     const char* name;
 
     // Play PCM data.  Returns bytes queued, or negative on error.
+    // If nonblock is true, return immediately if buffer is full (don't wait).
     int  (*play)(const void* samples, uint32_t byteCount,
-                 uint32_t sampleRate, uint8_t channels, uint8_t bitsPerSample);
+                 uint32_t sampleRate, uint8_t channels, uint8_t bitsPerSample,
+                 bool nonblock);
 
     // Stop playback.
     void (*stop)();
@@ -36,7 +38,8 @@ extern "C" bool AudioRegister(const AudioDriver* drv);
 
 // Kernel-side convenience wrappers (direct to hardware — prefer mixer API).
 int      AudioPlay(const void* samples, uint32_t byteCount,
-                   uint32_t sampleRate, uint8_t channels, uint8_t bitsPerSample);
+                   uint32_t sampleRate, uint8_t channels, uint8_t bitsPerSample,
+                   bool nonblock = false);
 void     AudioStop();
 bool     AudioIsPlaying();
 uint32_t AudioGetPosition();
