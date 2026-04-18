@@ -21,6 +21,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "quakedef.h"
 #include "errno.h"
+#include <time.h>
 
 qboolean isDedicated;
 
@@ -182,11 +183,9 @@ void Sys_Quit (void)
 
 double Sys_FloatTime (void)
 {
-	static double t;
-	
-	t += 0.1;
-	
-	return t;
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
 char *Sys_ConsoleInput (void)
