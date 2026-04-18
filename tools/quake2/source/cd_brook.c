@@ -40,10 +40,8 @@ static qboolean       cd_looping = false;
 static qboolean       cd_playing = false;
 static int            cd_track   = 0;
 
-/* Decode buffer: ~1 game-frame of audio per CDAudio_Update call.
- * At 44100 Hz and ~30fps, that's ~1470 frames.  Larger values cause
- * the write() to block (ring buffer fills), stalling the game loop. */
-#define CD_FRAMES_PER_CHUNK  1470
+/* Max decode buffer: 2 seconds of audio at 44100 Hz stereo (safety cap) */
+#define CD_FRAMES_PER_CHUNK  4096
 static short cd_pcm[CD_FRAMES_PER_CHUNK * 2]; /* stereo interleaved */
 
 /* ---- helpers ---- */
@@ -175,19 +173,25 @@ void CDAudio_Update(void)
     if (!cd_playing || !cd_vorbis || cd_fd < 0)
         return;
 
-    /* Decode and write one chunk of PCM per frame */
+    /* Decode exactly as many frames as elapsed real time warrants.
+     * cls.frametime is seconds since last frame; at 44100 Hz this gives
+     * the exact number of output frames the hardware will consume this frame.
+     * Clamped to [1, CD_FRAMES_PER_CHUNK] to handle large/tiny frametimes. */
+    int want = (int)(44100.0f * cls.frametime);
+    if (want < 1)   want = 1;
+    if (want > CD_FRAMES_PER_CHUNK) want = CD_FRAMES_PER_CHUNK;
+
     int frames = stb_vorbis_get_samples_short_interleaved(
-                     cd_vorbis, 2, cd_pcm, CD_FRAMES_PER_CHUNK * 2);
+                     cd_vorbis, 2, cd_pcm, want * 2);
 
     if (frames <= 0)
     {
         /* End of track */
         if (cd_looping)
         {
-            /* Rewind and try again */
             stb_vorbis_seek_start(cd_vorbis);
             frames = stb_vorbis_get_samples_short_interleaved(
-                         cd_vorbis, 2, cd_pcm, CD_FRAMES_PER_CHUNK * 2);
+                         cd_vorbis, 2, cd_pcm, want * 2);
             if (frames <= 0) { cd_close_track(); return; }
         }
         else
@@ -198,5 +202,5 @@ void CDAudio_Update(void)
     }
 
     int bytes = frames * 2 * sizeof(short); /* stereo 16-bit */
-    write(cd_fd, cd_pcm, bytes);  /* single write; don't loop/block */
+    write(cd_fd, cd_pcm, bytes);  /* O_NONBLOCK — don't stall game loop */
 }
