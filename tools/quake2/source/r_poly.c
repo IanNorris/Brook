@@ -790,7 +790,7 @@ void R_PolygonScanLeftEdge (void)
 			for (v=itop ; v<ibottom ; v++)
 			{
 				if (pspan >= s_polygon_spans_end)
-					break;
+					return;
 				pspan->u = u >> 16;
 				pspan->v = v;
 				u += u_step;
@@ -871,8 +871,10 @@ void R_PolygonScanRightEdge (void)
 
 			for (v=itop ; v<ibottom ; v++)
 			{
-				if (pspan >= s_polygon_spans_end)
-					break;
+				if (pspan >= s_polygon_spans_end) {
+					pspan->count = DS_SPAN_LIST_END;
+					return;
+				}
 				pspan->count = (u >> 16) - pspan->u;
 				u += u_step;
 				pspan++;
