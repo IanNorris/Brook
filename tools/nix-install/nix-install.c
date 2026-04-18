@@ -19,6 +19,7 @@
 #include <ctype.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <dirent.h>
 #include <errno.h>
 
@@ -316,7 +317,8 @@ static int cmd_install(const char *name) {
         snprintf(cmd, sizeof(cmd), "/nix/bin/nix-fetch --deps %s", hash);
         int ret = system(cmd);
         if (ret != 0) {
-            fprintf(stderr, "Error: nix-fetch failed (exit %d)\n", ret);
+            int code = WIFEXITED(ret) ? WEXITSTATUS(ret) : ret;
+            fprintf(stderr, "Error: nix-fetch failed (exit %d)\n", code);
             return 1;
         }
     }

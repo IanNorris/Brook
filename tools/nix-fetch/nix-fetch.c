@@ -92,7 +92,13 @@ static int curl_fetch(const char *url, char *buf, size_t bufsz) {
 
     int status;
     waitpid(pid, &status, 0);
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return -1;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        fprintf(stderr, "nix-fetch: curl exited with status %d (url: %s)\n", code, url);
+        if (total > 0)
+            fprintf(stderr, "nix-fetch: curl output (%zu bytes): %.512s\n", total, buf);
+        return -1;
+    }
     return (int)total;
 }
 
@@ -382,5 +388,6 @@ int main(int argc, char **argv) {
     printf("nix-fetch: nar-unpack=%s\n", g_unpack_path);
     printf("nix-fetch: store=%s\n", g_store_dir);
 
-    return fetch_package(hash_buf);
+    int rc = fetch_package(hash_buf);
+    return rc == 0 ? 0 : 1;
 }
