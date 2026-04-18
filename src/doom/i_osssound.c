@@ -520,6 +520,7 @@ typedef struct {
     unsigned int samples_per_tick_q16; // samples per MIDI tick in Q16
     int playing;
     int looping;
+    unsigned int generation;   // incremented on each new song
 } midi_state_t;
 
 static midi_state_t midi_state;
@@ -553,7 +554,9 @@ static void MidiRecalcTempo(midi_state_t *m)
 
 static boolean MidiParseSong(midi_state_t *m, unsigned char *data, size_t len)
 {
+    static unsigned int s_gen = 0;
     memset(m, 0, sizeof(*m));
+    m->generation = ++s_gen;
     m->data = data;
     m->length = len;
     m->tempo = 500000;  // 120 BPM default
@@ -595,9 +598,20 @@ static void MidiAdvance(midi_state_t *m, unsigned int samples)
     // Convert samples to ticks (Q16)
     m->tick_accum += ((uint64_t)samples << 16) / (m->samples_per_tick_q16 > 0 ? m->samples_per_tick_q16 : 1);
 
+    // These are stored in the midi_state via a generation counter to
+    // detect song changes and re-read the initial delay.
     static unsigned char running_status = 0;
     static unsigned int next_delay = 0;
     static int delay_initialized = 0;
+    static unsigned int song_generation = 0;
+
+    if (m->generation != song_generation) {
+        // New song — reset sequencer state
+        song_generation = m->generation;
+        delay_initialized = 0;
+        running_status = 0;
+        next_delay = 0;
+    }
 
     // Read initial delay if needed
     if (!delay_initialized) {
@@ -800,14 +814,20 @@ static void MixAndWrite(void)
     if (dsp_fd >= 0) {
         static int mix_count = 0;
         mix_count++;
+
+        // Check if buffer has any non-zero samples
+        int maxAbs = 0;
+        for (int i = 0; i < MIX_BUFFER * 2; i++) {
+            int a = outbuf[i] < 0 ? -outbuf[i] : outbuf[i];
+            if (a > maxAbs) maxAbs = a;
+        }
+
         if ((mix_count % 100) == 1) {
-            fprintf(stderr, "MixAndWrite #%d: %d bytes, fd=%d\n",
-                    mix_count, (int)sizeof(outbuf), dsp_fd);
+            fprintf(stderr, "MixAndWrite #%d: %d bytes, peak=%d, midi=%d\n",
+                    mix_count, (int)sizeof(outbuf), maxAbs,
+                    midi_state.playing ? 1 : 0);
         }
-        ssize_t ret = write(dsp_fd, outbuf, sizeof(outbuf));
-        if (ret < 0 && (mix_count % 100) == 2) {
-            fprintf(stderr, "MixAndWrite: write failed ret=%d\n", (int)ret);
-        }
+        write(dsp_fd, outbuf, sizeof(outbuf));
     }
 }
 
