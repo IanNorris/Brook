@@ -224,6 +224,12 @@ static uint8_t g_dacNid = 0;       // DAC widget NID
 static uint8_t g_pinNid = 0;       // Output pin widget NID
 static bool    g_initialized = false;
 
+// Track current stream format to avoid redundant reconfiguration
+static uint32_t g_curRate = 0;
+static uint8_t  g_curChannels = 0;
+static uint8_t  g_curBits = 0;
+static bool     g_streamConfigured = false;
+
 // ---------------------------------------------------------------------------
 // Busy-wait helper
 // ---------------------------------------------------------------------------
@@ -541,25 +547,19 @@ static uint16_t EncodeStreamFormat(uint32_t sampleRate, uint8_t channels, uint8_
 
 static bool SetupOutputStream(uint32_t sampleRate, uint8_t channels, uint8_t bits)
 {
-    // Output stream 0 is at SD_BASE + numInputStreams * 0x20
     uint32_t sdBase = g_outStreamBase;
-    uint8_t streamTag = 1; // Stream tag 1 (0 is reserved)
+    uint8_t streamTag = 1;
 
     // Reset stream
     hda_write32(sdBase + SD_CTL, SD_CTL_SRST);
     BusyWait(10000);
-
-    // Wait for reset
     for (int i = 0; i < 100; i++)
     {
         if (hda_read32(sdBase + SD_CTL) & SD_CTL_SRST) break;
         BusyWait(1000);
     }
-
-    // Clear reset
     hda_write32(sdBase + SD_CTL, 0);
     BusyWait(10000);
-
     for (int i = 0; i < 100; i++)
     {
         if (!(hda_read32(sdBase + SD_CTL) & SD_CTL_SRST)) break;
@@ -574,33 +574,33 @@ static bool SetupOutputStream(uint32_t sampleRate, uint8_t channels, uint8_t bit
     hda_write16(sdBase + SD_FMT, fmt);
 
     // Configure DAC: set stream tag and channel
-    // Verb: Set Converter Stream, Channel (bits 7:4 = stream, bits 3:0 = channel)
     HdaCommandNoResp(HdaVerb(g_codecAddr, g_dacNid, VERB_SET_CONV_STREAM,
                               (streamTag << 4) | 0));
-
-    // Set DAC format to match stream
     HdaCommandNoResp(HdaVerb4(g_codecAddr, g_dacNid, VERB_SET_CONV_FMT, fmt));
-
-    // Set up BDL — single entry pointing to audio buffer
-    g_bdl[0].addr   = g_audioBufPhys;
-    g_bdl[0].length = AUDIO_BUF_SIZE;
-    g_bdl[0].ioc    = 1;
 
     // Set BDL address
     hda_write32(sdBase + SD_BDLPL, static_cast<uint32_t>(g_bdlPhys));
     hda_write32(sdBase + SD_BDLPU, static_cast<uint32_t>(g_bdlPhys >> 32));
 
-    // Set cyclic buffer length
-    hda_write32(sdBase + SD_CBL, AUDIO_BUF_SIZE);
-
     // Set last valid index (0 = 1 entry)
     hda_write16(sdBase + SD_LVI, 0);
 
-    // Set stream control: stream tag in bits 23:20, run, IOC enable
-    uint32_t ctl = (static_cast<uint32_t>(streamTag) << 20) | SD_CTL_IOCE | SD_CTL_RUN;
-    hda_write32(sdBase + SD_CTL, ctl);
+    // Record current format
+    g_curRate = sampleRate;
+    g_curChannels = channels;
+    g_curBits = bits;
+    g_streamConfigured = true;
 
     return true;
+}
+
+// Start the stream (after setup or buffer update)
+static void StartOutputStream()
+{
+    uint32_t sdBase = g_outStreamBase;
+    uint8_t streamTag = 1;
+    uint32_t ctl = (static_cast<uint32_t>(streamTag) << 20) | SD_CTL_IOCE | SD_CTL_RUN;
+    hda_write32(sdBase + SD_CTL, ctl);
 }
 
 static void StopOutputStream()
@@ -609,7 +609,7 @@ static void StopOutputStream()
     uint32_t ctl = hda_read32(sdBase + SD_CTL);
     ctl &= ~SD_CTL_RUN;
     hda_write32(sdBase + SD_CTL, ctl);
-    BusyWait(10000);
+    BusyWait(1000);
 }
 
 // ---------------------------------------------------------------------------
@@ -617,11 +617,7 @@ static void StopOutputStream()
 // ---------------------------------------------------------------------------
 
 // Play PCM samples through the HDA output.
-// samples: pointer to PCM data (signed 16-bit interleaved)
-// byteCount: total bytes of PCM data
-// sampleRate: e.g. 44100, 48000
-// channels: 1=mono, 2=stereo
-// bitsPerSample: 8, 16, 24, 32
+// Blocks until any previous buffer finishes, then starts the new one.
 extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
                            uint32_t sampleRate, uint8_t channels,
                            uint8_t bitsPerSample)
@@ -629,24 +625,31 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
     if (!g_initialized || !g_dacNid) return -1;
     if (byteCount > AUDIO_BUF_SIZE) byteCount = AUDIO_BUF_SIZE;
 
-    // Wait for any in-flight playback to complete before overwriting buffer
     uint32_t sdBase = g_outStreamBase;
+
+    // Wait for any in-flight playback to complete
     if (hda_read32(sdBase + SD_CTL) & SD_CTL_RUN)
     {
-        // Poll for BCIS (Buffer Completion Interrupt Status) — set when
-        // the IOC BDL entry finishes. This is reliable because BCIS
-        // latches even though LPIB wraps in a cyclic buffer.
-        for (int i = 0; i < 2000000; i++)
+        for (int i = 0; i < 5000000; i++)
         {
             if (hda_read8(sdBase + SD_STS) & SD_STS_BCIS) break;
             if (!(hda_read32(sdBase + SD_CTL) & SD_CTL_RUN)) break;
             __asm__ volatile("pause");
         }
-        // Stop the stream before reconfiguring
         StopOutputStream();
-        // Clear completion status
-        hda_write8(sdBase + SD_STS, SD_STS_BCIS);
     }
+
+    // Clear completion status
+    hda_write8(sdBase + SD_STS, SD_STS_BCIS | SD_STS_FIFOE | SD_STS_DESE);
+
+    // Full stream setup only on first call or format change
+    bool needSetup = !g_streamConfigured ||
+                     sampleRate != g_curRate ||
+                     channels != g_curChannels ||
+                     bitsPerSample != g_curBits;
+
+    if (needSetup)
+        SetupOutputStream(sampleRate, channels, bitsPerSample);
 
     // Copy audio data to DMA buffer
     const uint8_t* src = static_cast<const uint8_t*>(samples);
@@ -657,12 +660,14 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
     for (uint32_t i = byteCount; i < AUDIO_BUF_SIZE; i++)
         g_audioBuf[i] = 0;
 
-    // Update BDL entry length
+    // Update BDL entry and cyclic buffer length
+    g_bdl[0].addr   = g_audioBufPhys;
     g_bdl[0].length = byteCount;
-    hda_write32(g_outStreamBase + SD_CBL, byteCount);
+    g_bdl[0].ioc    = 1;
+    hda_write32(sdBase + SD_CBL, byteCount);
 
-    // Configure and start stream
-    SetupOutputStream(sampleRate, channels, bitsPerSample);
+    // Start stream
+    StartOutputStream();
 
     return static_cast<int>(byteCount);
 }
