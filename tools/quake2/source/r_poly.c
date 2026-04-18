@@ -39,6 +39,7 @@ spanletvars_t s_spanletvars;
 static int r_polyblendcolor;
 
 static espan_t	*s_polygon_spans;
+static espan_t	*s_polygon_spans_end;  // bounds limit
 
 polydesc_t	r_polydesc;
 
@@ -788,6 +789,8 @@ void R_PolygonScanLeftEdge (void)
 
 			for (v=itop ; v<ibottom ; v++)
 			{
+				if (pspan >= s_polygon_spans_end)
+					break;
 				pspan->u = u >> 16;
 				pspan->v = v;
 				u += u_step;
@@ -868,6 +871,8 @@ void R_PolygonScanRightEdge (void)
 
 			for (v=itop ; v<ibottom ; v++)
 			{
+				if (pspan >= s_polygon_spans_end)
+					break;
 				pspan->count = (u >> 16) - pspan->u;
 				u += u_step;
 				pspan++;
@@ -1131,6 +1136,7 @@ static void R_DrawPoly( qboolean iswater )
 	espan_t	spans[MAXHEIGHT+1];
 
 	s_polygon_spans = spans;
+	s_polygon_spans_end = spans + MAXHEIGHT;
 
 // find the top and bottom vertices, and make sure there's at least one scan to
 // draw
