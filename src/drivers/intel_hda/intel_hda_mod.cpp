@@ -617,7 +617,7 @@ static void StopOutputStream()
 // ---------------------------------------------------------------------------
 
 // Play PCM samples through the HDA output.
-// Blocks until any previous buffer finishes, then starts the new one.
+// Non-blocking: stops any in-flight playback immediately and starts the new buffer.
 extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
                            uint32_t sampleRate, uint8_t channels,
                            uint8_t bitsPerSample)
@@ -627,32 +627,20 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
 
     uint32_t sdBase = g_outStreamBase;
 
-    // Wait for any in-flight playback to complete
-    if (hda_read32(sdBase + SD_CTL) & SD_CTL_RUN)
-    {
-        for (int i = 0; i < 5000000; i++)
-        {
-            if (hda_read8(sdBase + SD_STS) & SD_STS_BCIS) break;
-            if (!(hda_read32(sdBase + SD_CTL) & SD_CTL_RUN)) break;
-            __asm__ volatile("pause");
-        }
-    }
-
     // Full stream setup only on first call or format change
     bool needSetup = !g_streamConfigured ||
                      sampleRate != g_curRate ||
                      channels != g_curChannels ||
                      bitsPerSample != g_curBits;
 
-    // Copy audio data to DMA buffer while stream may still be looping
-    // (the old buffer data is fine — we overwrite completely)
+    // Copy audio data to DMA buffer
     const uint8_t* src = static_cast<const uint8_t*>(samples);
     for (uint32_t i = 0; i < byteCount; i++)
         g_audioBuf[i] = src[i];
     for (uint32_t i = byteCount; i < AUDIO_BUF_SIZE; i++)
         g_audioBuf[i] = 0;
 
-    // Now stop, update CBL, and restart — minimize the silent gap
+    // Stop current playback, reset position, and restart with new data
     StopOutputStream();
     hda_write8(sdBase + SD_STS, SD_STS_BCIS | SD_STS_FIFOE | SD_STS_DESE);
 

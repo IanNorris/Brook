@@ -317,7 +317,7 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if (fde->type == FdType::DevNull || fde->type == FdType::DevUrandom)
         return static_cast<int64_t>(count);
 
-    // /dev/dsp — buffer PCM data, flush to audio driver when full
+    // /dev/dsp — buffer PCM data, flush to audio driver at fragment boundary
     if (fde->type == FdType::DevDsp && fde->handle)
     {
         auto* dsp = static_cast<DspState*>(fde->handle);
@@ -335,8 +335,8 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
             dsp->bufferOffset += chunk;
             written += chunk;
 
-            // Flush when buffer is full
-            if (dsp->bufferOffset >= dsp->bufferSize)
+            // Flush when we've accumulated a fragment's worth of data
+            if (dsp->bufferOffset >= dsp->fragmentSize)
             {
                 AudioPlay(dsp->buffer, dsp->bufferOffset,
                           dsp->sampleRate, dsp->channels, dsp->bitsPerSample);
