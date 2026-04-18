@@ -649,8 +649,23 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
         }
     }
 
-    // Stop DMA before touching the buffer — avoids corruption
+    // Stop DMA and reset stream position before touching the buffer
     StopOutputStream();
+
+    // Stream reset — resets LPIB to 0 so DMA starts from the beginning
+    hda_write32(sdBase + SD_CTL, SD_CTL_SRST);
+    for (int i = 0; i < 100000; i++)
+    {
+        if (hda_read32(sdBase + SD_CTL) & SD_CTL_SRST) break;
+        __asm__ volatile("pause");
+    }
+    hda_write32(sdBase + SD_CTL, 0);
+    for (int i = 0; i < 100000; i++)
+    {
+        if (!(hda_read32(sdBase + SD_CTL) & SD_CTL_SRST)) break;
+        __asm__ volatile("pause");
+    }
+
     hda_write8(sdBase + SD_STS, SD_STS_BCIS | SD_STS_FIFOE | SD_STS_DESE);
 
     // Now safe to copy audio data
@@ -662,6 +677,15 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
 
     if (needSetup)
         SetupOutputStream(sampleRate, channels, bitsPerSample);
+    else
+    {
+        // Stream reset cleared all registers — must restore format and BDL
+        uint16_t fmt = EncodeStreamFormat(sampleRate, channels, bitsPerSample);
+        hda_write16(sdBase + SD_FMT, fmt);
+        hda_write32(sdBase + SD_BDLPL, static_cast<uint32_t>(g_bdlPhys));
+        hda_write32(sdBase + SD_BDLPU, static_cast<uint32_t>(g_bdlPhys >> 32));
+        hda_write16(sdBase + SD_LVI, 0);
+    }
 
     g_bdl[0].addr   = g_audioBufPhys;
     g_bdl[0].length = byteCount;
