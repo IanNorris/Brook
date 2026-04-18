@@ -618,8 +618,7 @@ static void StopOutputStream()
 // ---------------------------------------------------------------------------
 
 // Play PCM samples through the HDA output.
-// Waits briefly for the previous buffer to finish (for gapless playback),
-// but caps the wait so callers like DOOM don't freeze.
+// Blocks until the previous buffer finishes, then starts the new one.
 extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
                            uint32_t sampleRate, uint8_t channels,
                            uint8_t bitsPerSample)
@@ -635,11 +634,13 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
                      channels != g_curChannels ||
                      bitsPerSample != g_curBits;
 
-    // Wait for previous buffer to complete (blocks up to buffer duration).
-    // DOOM: 2048 bytes @ 11025Hz stereo 16-bit = ~46ms
-    // mp3play: ~4608 bytes @ 44100Hz stereo 16-bit = ~26ms
+    // Wait for previous buffer to complete.
+    // CRITICAL: clear BCIS first so we wait for the CURRENT buffer,
+    // not see a stale completion from the previous one.
     if (hda_read32(sdBase + SD_CTL) & SD_CTL_RUN)
     {
+        hda_write8(sdBase + SD_STS, SD_STS_BCIS);  // clear stale BCIS (W1C)
+
         for (int i = 0; i < 50000000; i++)
         {
             if (g_stopping) return -1;
@@ -649,43 +650,20 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
         }
     }
 
-    // Stop DMA and reset stream position before touching the buffer
-    StopOutputStream();
-
-    // Stream reset — resets LPIB to 0 so DMA starts from the beginning
-    hda_write32(sdBase + SD_CTL, SD_CTL_SRST);
-    for (int i = 0; i < 100000; i++)
-    {
-        if (hda_read32(sdBase + SD_CTL) & SD_CTL_SRST) break;
-        __asm__ volatile("pause");
-    }
-    hda_write32(sdBase + SD_CTL, 0);
-    for (int i = 0; i < 100000; i++)
-    {
-        if (!(hda_read32(sdBase + SD_CTL) & SD_CTL_SRST)) break;
-        __asm__ volatile("pause");
-    }
-
-    hda_write8(sdBase + SD_STS, SD_STS_BCIS | SD_STS_FIFOE | SD_STS_DESE);
-
-    // Now safe to copy audio data
+    // Copy audio data while DMA may still be looping on old buffer
+    // (cyclic mode — the old data is fine, we overwrite completely)
     const uint8_t* src = static_cast<const uint8_t*>(samples);
     for (uint32_t i = 0; i < byteCount; i++)
         g_audioBuf[i] = src[i];
     for (uint32_t i = byteCount; i < AUDIO_BUF_SIZE; i++)
         g_audioBuf[i] = 0;
 
+    // Stop stream, clear status, update buffer, restart
+    StopOutputStream();
+    hda_write8(sdBase + SD_STS, SD_STS_BCIS | SD_STS_FIFOE | SD_STS_DESE);
+
     if (needSetup)
         SetupOutputStream(sampleRate, channels, bitsPerSample);
-    else
-    {
-        // Stream reset cleared all registers — must restore format and BDL
-        uint16_t fmt = EncodeStreamFormat(sampleRate, channels, bitsPerSample);
-        hda_write16(sdBase + SD_FMT, fmt);
-        hda_write32(sdBase + SD_BDLPL, static_cast<uint32_t>(g_bdlPhys));
-        hda_write32(sdBase + SD_BDLPU, static_cast<uint32_t>(g_bdlPhys >> 32));
-        hda_write16(sdBase + SD_LVI, 0);
-    }
 
     g_bdl[0].addr   = g_audioBufPhys;
     g_bdl[0].length = byteCount;
