@@ -717,34 +717,21 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
                 continue;
             }
 
-            // Wait if writer is about to overrun the DMA read position.
-            // dist=0 means we'd write the fragment DMA is reading (collision).
-            // dist=NUM_FRAGMENTS-1 means we've almost lapped the reader.
-            // Safe when 1 <= dist <= NUM_FRAGMENTS-2.
+            // Check if writer is about to overrun the DMA read position.
+            // If the next fragment isn't safe to write yet, just stop —
+            // the caller will come back next frame with more data.
+            // This avoids blocking the game loop on audio.
             {
-                bool ready = false;
-                for (int i = 0; i < 50000; i++)
-                {
-                    uint32_t lpib = hda_read32(sdBase + SD_LPIB);
-                    uint32_t playFrag = lpib / FRAG_SIZE;
-                    if (playFrag >= NUM_FRAGMENTS) playFrag = NUM_FRAGMENTS - 1;
+                uint32_t lpib = hda_read32(sdBase + SD_LPIB);
+                uint32_t playFrag = lpib / FRAG_SIZE;
+                if (playFrag >= NUM_FRAGMENTS) playFrag = NUM_FRAGMENTS - 1;
 
-                    // Distance from reader to writer in the ring
-                    uint32_t dist = (nextFrag >= playFrag)
-                        ? (nextFrag - playFrag)
-                        : (NUM_FRAGMENTS - playFrag + nextFrag);
+                uint32_t dist = (nextFrag >= playFrag)
+                    ? (nextFrag - playFrag)
+                    : (NUM_FRAGMENTS - playFrag + nextFrag);
 
-                    if (dist >= 1 && dist < NUM_FRAGMENTS - 1) { ready = true; break; }
-                    __asm__ volatile("pause");
-                }
-                if (!ready) {
-                    static int s_dropCount = 0;
-                    if (s_dropCount++ < 5)
-                    {
-                        uint32_t lpib = hda_read32(sdBase + SD_LPIB);
-                        SerialPrintf("HDA: drop! nextFrag=%u playFrag=%u lpib=%u\n",
-                                     nextFrag, lpib / FRAG_SIZE, lpib);
-                    }
+                if (dist < 1 || dist >= NUM_FRAGMENTS - 1) {
+                    // Would overrun DMA — stop writing, return what we have
                     break;
                 }
             }
