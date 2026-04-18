@@ -134,6 +134,14 @@ if [ -f "$mp3play_bin" ]; then
     sync_file "$mp3play_bin" "BIN/MP3PLAY"
 fi
 
+# --- nix-install tool ---
+nix_install_bin="${ROOT_DIR}/tools/nix-install/nix-install"
+if [ -f "$nix_install_bin" ]; then
+    echo "nix-install:"
+    mmd -D s -i "${DISK_IMG}" "::BIN" 2>/dev/null || true
+    sync_file "$nix_install_bin" "BIN/NIX-INSTALL"
+fi
+
 # --- Static binaries from nix (busybox etc.) ---
 busybox_static="${ROOT_DIR}/busybox_static"
 if [ -f "$busybox_static" ]; then
