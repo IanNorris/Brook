@@ -728,8 +728,6 @@ static void CompositorLoopWM()
             if (!t) continue;
             if (t->child == focused->proc)
             {
-                SerialPrintf("INPUT: key sc=0x%02x routed to TERMINAL (pid %u '%s')\n",
-                             ev.scanCode, focused->proc->pid, focused->proc->name);
                 if (ev.ascii != 0)
                 {
                     char ch = ev.ascii;
@@ -766,11 +764,7 @@ static void CompositorLoopWM()
 
         // Non-terminal window: push raw event to per-process input queue
         if (!routed)
-        {
-            SerialPrintf("INPUT: key sc=0x%02x -> pid %u '%s'\n",
-                         ev.scanCode, focused->proc->pid, focused->proc->name);
             ProcessInputPush(focused->proc, ev);
-        }
     }
 
     // 5. Handle mouse interaction (position + latched clicks)

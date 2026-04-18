@@ -162,10 +162,6 @@ void DG_Init()
 
         fprintf(stderr, "Brook DOOM: framebuffer %ux%u, render at (%u,%u)\n",
                s_ScreenWidth, s_ScreenHeight, s_PositionX, s_PositionY);
-        fprintf(stderr, "Brook DOOM: FrameBuffer=%p (end=%p), screensize=%lu\n",
-               (void*)FrameBuffer,
-               (void*)((char*)FrameBuffer + screensize),
-               (unsigned long)screensize);
     }
     else
     {

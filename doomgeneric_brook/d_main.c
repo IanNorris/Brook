@@ -404,27 +404,10 @@ boolean D_GrabMouseCallback(void)
 
 void doomgeneric_Tick()
 {
-    static int tickCount = 0;
-    if (tickCount < 3)
-    {
-        W_VerifyHashTable(tickCount == 0 ? "Tick#0 start" :
-                          tickCount == 1 ? "Tick#1 start" : "Tick#2 start");
-        Z_CheckHeap();
-        fprintf(stderr, "Z_CheckHeap OK at Tick#%d\n", tickCount);
-    }
-    tickCount++;
-
     // frame syncronous IO operations
     I_StartFrame ();
 
     TryRunTics (); // will run at least one tic
-
-    if (tickCount <= 3)
-    {
-        W_VerifyHashTable("after TryRunTics");
-        Z_CheckHeap();
-        fprintf(stderr, "Z_CheckHeap OK after TryRunTics (tick %d)\n", tickCount - 1);
-    }
 
     S_UpdateSounds (players[consoleplayer].mo);// move positional sounds
 
@@ -459,16 +442,13 @@ void D_DoomLoop (void)
     I_SetWindowTitle(gamedescription);
     I_GraphicsCheckCommandLine();
     I_SetGrabMouseCallback(D_GrabMouseCallback);
-    W_VerifyHashTable("before I_InitGraphics");
     I_InitGraphics();
-    W_VerifyHashTable("after I_InitGraphics");
     I_EnableLoadingDisk();
 
     V_RestoreBuffer();
     R_ExecuteSetViewSize();
 
     D_StartGameLoop();
-    W_VerifyHashTable("after D_StartGameLoop");
 
     if (testcontrols)
     {
@@ -505,7 +485,6 @@ void D_PageTicker (void)
 //
 void D_PageDrawer (void)
 {
-    W_VerifyHashTable("D_PageDrawer");
     V_DrawPatch (0, 0, W_CacheLumpName(pagename, PU_CACHE));
 }
 
@@ -557,15 +536,11 @@ void D_DoAdvanceDemo (void)
 	pagename = DEH_String("TITLEPIC");
 	if ( gamemode == commercial )
 	{
-	  W_VerifyHashTable("before S_StartMusic");
 	  S_StartMusic(mus_dm2ttl);
-	  W_VerifyHashTable("after S_StartMusic");
 	}
 	else
 	{
-	  W_VerifyHashTable("before S_StartMusic");
 	  S_StartMusic (mus_intro);
-	  W_VerifyHashTable("after S_StartMusic");
 	}
 	break;
       case 1:
@@ -1640,11 +1615,8 @@ void D_DoomMain (void)
     I_CheckIsScreensaver();
     I_InitTimer();
     I_InitJoystick();
-    W_VerifyHashTable("before I_InitSound");
     I_InitSound(true);
-    W_VerifyHashTable("after I_InitSound");
     I_InitMusic();
-    W_VerifyHashTable("after I_InitMusic");
 
 #ifdef FEATURE_MULTIPLAYER
     printf ("NET_Init: Init network subsystem.\n");
@@ -1800,7 +1772,6 @@ void D_DoomMain (void)
 
     DEH_printf("S_Init: Setting up sound.\n");
     S_Init (sfxVolume * 8, musicVolume * 8);
-    W_VerifyHashTable("after S_Init");
 
     DEH_printf("D_CheckNetGame: Checking network game status.\n");
     D_CheckNetGame ();
@@ -1812,7 +1783,6 @@ void D_DoomMain (void)
 
     DEH_printf("ST_Init: Init status bar.\n");
     ST_Init ();
-    W_VerifyHashTable("after ST_Init");
 
     // If Doom II without a MAP01 lump, this is a store demo.
     // Moved this here so that MAP01 isn't constantly looked up

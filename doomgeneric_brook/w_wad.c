@@ -570,17 +570,7 @@ void W_GenerateHashTable(void)
     if (numlumps > 0)
     {
         lumphash = Z_Malloc(sizeof(lumpinfo_t *) * numlumps, PU_STATIC, NULL);
-        fprintf(stderr, "HASH_DIAG: Z_Malloc returned %p (size=%lu)\n",
-                (void*)lumphash, (unsigned long)(sizeof(lumpinfo_t*) * numlumps));
         memset(lumphash, 0, sizeof(lumpinfo_t *) * numlumps);
-
-        // CHECKPOINT 1: verify memset actually zeroed the table
-        {
-            unsigned int nonzero = 0;
-            for (i = 0; i < numlumps; ++i)
-                if (lumphash[i] != NULL) nonzero++;
-            fprintf(stderr, "HASH_DIAG: after memset: nonzero=%u/%u\n", nonzero, numlumps);
-        }
 
         for (i=0; i<numlumps; ++i)
         {
@@ -592,43 +582,6 @@ void W_GenerateHashTable(void)
 
             lumpinfo[i].next = lumphash[hash];
             lumphash[hash] = &lumpinfo[i];
-        }
-
-        // CHECKPOINT 2: validate hash table immediately after fill loop
-        {
-            unsigned int bad = 0;
-            for (i = 0; i < numlumps; ++i)
-            {
-                uintptr_t val = (uintptr_t)lumphash[i];
-                uint32_t lo = (uint32_t)(val);
-                uint32_t hi = (uint32_t)(val >> 32);
-                if (val != 0 && lo == hi)
-                {
-                    if (bad < 5)
-                        fprintf(stderr, "HASH_VERIFY[%u]: DUPED 0x%016lx\n", i, (unsigned long)val);
-                    bad++;
-                }
-            }
-            fprintf(stderr, "HASH_VERIFY: lumphash=%p lumpinfo=%p numlumps=%u duped=%u\n",
-                    (void*)lumphash, (void*)lumpinfo, numlumps, bad);
-            for (i = 0; i < 8 && i < numlumps; ++i)
-            {
-                uintptr_t val = (uintptr_t)lumphash[i];
-                uint32_t lo = (uint32_t)(val);
-                uint32_t hi = (uint32_t)(val >> 32);
-                fprintf(stderr, "HASH[%u]: 0x%016lx (lo=0x%08x hi=0x%08x %s)\n",
-                        i, (unsigned long)val, lo, hi,
-                        (lo == hi && val != 0) ? "DUPED!" : "ok");
-            }
-            if (bad > 0) {
-                fprintf(stderr, "HASH_VERIFY: CORRUPTION DETECTED AT GENERATION TIME!\n");
-                fprintf(stderr, "  sizeof(lumpinfo_t*)=%lu sizeof(lumpinfo_t)=%lu\n",
-                        (unsigned long)sizeof(lumpinfo_t*),
-                        (unsigned long)sizeof(lumpinfo_t));
-                // Print what a valid pointer looks like
-                fprintf(stderr, "  &lumpinfo[0]=%p &lumpinfo[1]=%p\n",
-                        (void*)&lumpinfo[0], (void*)&lumpinfo[1]);
-            }
         }
     }
 
