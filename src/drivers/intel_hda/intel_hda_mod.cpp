@@ -1,7 +1,7 @@
 // intel_hda_mod.cpp — Intel High Definition Audio driver for ICH9 (QEMU q35)
 //
 // Implements:
-//   - Controller reset and CORB/RIRB command buffers
+//   - Controller reset and Immediate Command Interface (ICI) for codec verbs
 //   - Codec discovery (STATESTS) and basic widget enumeration
 //   - Output stream 0 with Buffer Descriptor List (BDL) for PCM playback
 //   - Simple kernel API: HdaPlayPcm(samples, count, rate, channels, bits)
@@ -63,8 +63,8 @@ enum HdaReg : uint32_t {
     CORBWP      = 0x48,  // CORB write pointer (16-bit)
     CORBRP      = 0x4A,  // CORB read pointer (16-bit)
     CORBCTL     = 0x4C,  // CORB control (8-bit)
-    CORBSTS     = 0x4E,  // CORB status (8-bit)
-    CORBSIZE    = 0x4F,  // CORB size (8-bit)
+    CORBSTS     = 0x4D,  // CORB status (8-bit)
+    CORBSIZE    = 0x4E,  // CORB size (8-bit)
 
     // RIRB registers
     RIRBLBASE   = 0x50,  // RIRB lower base address (32-bit)
@@ -79,6 +79,11 @@ enum HdaReg : uint32_t {
     // SD0 starts at 0x80 (input stream 0)
     // Output streams start after input streams
     SD_BASE     = 0x80,
+
+    // Immediate Command Interface (ICI) registers
+    ICW         = 0x60,  // Immediate Command Write (32-bit)
+    IRR         = 0x64,  // Immediate Response Result (32-bit)
+    ICS         = 0x68,  // Immediate Command Status (16-bit)
 };
 
 // Stream descriptor offsets (within each 0x20-byte block)
@@ -107,15 +112,13 @@ static constexpr uint8_t SD_STS_DESE  = (1 << 4);  // Descriptor error
 // GCTL bits
 static constexpr uint32_t GCTL_CRST = (1 << 0);  // Controller reset
 
-// CORBCTL bits
-static constexpr uint8_t CORBCTL_RUN  = (1 << 1);
-
-// RIRBCTL bits
-static constexpr uint8_t RIRBCTL_RUN  = (1 << 1);
-
 // INTCTL bits
 static constexpr uint32_t INTCTL_GIE = (1u << 31);  // Global interrupt enable
 static constexpr uint32_t INTCTL_CIE = (1u << 30);  // Controller interrupt enable
+
+// ICS (Immediate Command Status) bits
+static constexpr uint16_t ICS_ICB = (1 << 0);  // Immediate Command Busy
+static constexpr uint16_t ICS_IRV = (1 << 1);  // Immediate Response Valid
 
 // ---------------------------------------------------------------------------
 // HDA codec verb helpers
@@ -193,25 +196,6 @@ static inline uint32_t hda_read32(uint32_t off)
 { return *reinterpret_cast<volatile uint32_t*>(g_mmioBase + off); }
 
 // ---------------------------------------------------------------------------
-// CORB/RIRB (command/response ring buffers)
-// ---------------------------------------------------------------------------
-
-static constexpr uint32_t CORB_ENTRIES = 256;
-static constexpr uint32_t RIRB_ENTRIES = 256;
-
-static uint32_t* g_corb = nullptr;      // CORB: 256 × 4 bytes = 1KB
-static uint64_t  g_corbPhys = 0;
-
-struct RirbEntry {
-    uint32_t response;
-    uint32_t responseEx; // codec addr in bits 3:0, unsolicited in bit 4
-};
-
-static RirbEntry* g_rirb = nullptr;     // RIRB: 256 × 8 bytes = 2KB
-static uint64_t   g_rirbPhys = 0;
-static uint16_t   g_rirbReadIdx = 0;
-
-// ---------------------------------------------------------------------------
 // Buffer Descriptor List for output stream
 // ---------------------------------------------------------------------------
 
@@ -251,43 +235,49 @@ static void BusyWait(uint32_t iters)
 }
 
 // ---------------------------------------------------------------------------
-// CORB/RIRB command interface
+// Immediate Command Interface (ICI) — MMIO-based, no DMA needed
 // ---------------------------------------------------------------------------
-
-static bool CorbSendVerb(uint32_t verb)
-{
-    uint16_t wp = hda_read16(CORBWP) & 0xFF;
-    wp = (wp + 1) % CORB_ENTRIES;
-    g_corb[wp] = verb;
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    hda_write16(CORBWP, wp);
-    return true;
-}
-
-static bool RirbRecvResponse(uint32_t& response, uint32_t timeoutIters = 100000)
-{
-    for (uint32_t i = 0; i < timeoutIters; i++)
-    {
-        uint16_t wp = hda_read16(RIRBWP) & 0xFF;
-        if (wp != g_rirbReadIdx)
-        {
-            g_rirbReadIdx = (g_rirbReadIdx + 1) % RIRB_ENTRIES;
-            __atomic_thread_fence(__ATOMIC_ACQUIRE);
-            response = g_rirb[g_rirbReadIdx].response;
-
-            // Clear RIRB interrupt status
-            hda_write8(RIRBSTS, 0x05);
-            return true;
-        }
-        __asm__ volatile("pause");
-    }
-    return false;
-}
 
 static bool HdaCommand(uint32_t verb, uint32_t& response)
 {
-    CorbSendVerb(verb);
-    return RirbRecvResponse(response);
+    // Wait for any previous command to complete
+    for (int i = 0; i < 10000; i++)
+    {
+        if (!(hda_read16(ICS) & ICS_ICB)) goto ready;
+        __asm__ volatile("pause");
+    }
+    SerialPrintf("intel_hda: ICI busy timeout (verb=0x%08x)\n", verb);
+    return false;
+
+ready:
+    // Clear IRV by writing 1
+    hda_write16(ICS, ICS_IRV);
+
+    // Write verb
+    hda_write32(ICW, verb);
+
+    // Set ICB to start command
+    hda_write16(ICS, ICS_ICB);
+
+    // Wait for completion (ICB clears when done)
+    for (int i = 0; i < 100000; i++)
+    {
+        uint16_t sts = hda_read16(ICS);
+        if (!(sts & ICS_ICB))
+        {
+            if (sts & ICS_IRV)
+            {
+                response = hda_read32(IRR);
+                return true;
+            }
+            // ICB cleared but no response — error
+            return false;
+        }
+        __asm__ volatile("pause");
+    }
+
+    SerialPrintf("intel_hda: ICI timeout (verb=0x%08x)\n", verb);
+    return false;
 }
 
 // Convenience: send verb, ignore response
@@ -333,80 +323,6 @@ static bool HdaControllerReset()
 
     // Wait for codecs to enumerate (give them time after reset)
     BusyWait(100000);
-
-    return true;
-}
-
-static bool SetupCorbRirb()
-{
-    // Allocate CORB (1 page for both CORB + RIRB: 1KB + 2KB = 3KB < 4KB)
-    auto page = VmmAllocPages(1, VMM_WRITABLE | VMM_CACHE_DISABLE, MemTag::Device, KernelPid);
-    if (!page) return false;
-
-    uint8_t* base = reinterpret_cast<uint8_t*>(page.raw());
-    for (int i = 0; i < 4096; i++) base[i] = 0;
-
-    g_corb = reinterpret_cast<uint32_t*>(base);
-    g_rirb = reinterpret_cast<RirbEntry*>(base + 1024);
-
-    g_corbPhys = VmmVirtToPhys(KernelPageTable, page).raw();
-    g_rirbPhys = g_corbPhys + 1024;
-
-    SerialPrintf("intel_hda: DMA CORB/RIRB phys=0x%lx (page 0x%lx)\n",
-                 g_corbPhys, g_corbPhys & ~0xFFFULL);
-
-    // Stop CORB and RIRB
-    hda_write8(CORBCTL, 0);
-    hda_write8(RIRBCTL, 0);
-    BusyWait(10000);
-
-    // Set CORB base address
-    hda_write32(CORBLBASE, static_cast<uint32_t>(g_corbPhys));
-    hda_write32(CORBUBASE, static_cast<uint32_t>(g_corbPhys >> 32));
-
-    // Set CORB size to 256 entries
-    hda_write8(CORBSIZE, 0x02); // 256 entries
-
-    // Reset CORB read pointer (spec says poll for acknowledgement)
-    hda_write16(CORBRP, 0x8000); // Set reset bit
-    for (int i = 0; i < 1000; i++)
-    {
-        if (hda_read16(CORBRP) & 0x8000) break;
-        BusyWait(100);
-    }
-    hda_write16(CORBRP, 0x0000); // Clear reset bit
-    for (int i = 0; i < 1000; i++)
-    {
-        if (!(hda_read16(CORBRP) & 0x8000)) break;
-        BusyWait(100);
-    }
-
-    // Reset CORB write pointer
-    hda_write16(CORBWP, 0);
-
-    // Set RIRB base address
-    hda_write32(RIRBLBASE, static_cast<uint32_t>(g_rirbPhys));
-    hda_write32(RIRBUBASE, static_cast<uint32_t>(g_rirbPhys >> 32));
-
-    // Set RIRB size to 256 entries
-    hda_write8(RIRBSIZE, 0x02);
-
-    // Reset RIRB write pointer
-    hda_write16(RIRBWP, 0x8000); // Reset
-    BusyWait(1000);
-
-    g_rirbReadIdx = 0;
-
-    // Start CORB and RIRB DMA
-    hda_write8(CORBCTL, CORBCTL_RUN);
-    hda_write8(RIRBCTL, RIRBCTL_RUN);
-    BusyWait(10000);
-
-    // Verify DMA is running
-    uint8_t corbctl = hda_read8(CORBCTL);
-    uint8_t rirbctl = hda_read8(RIRBCTL);
-    SerialPrintf("intel_hda: CORBCTL=0x%02x RIRBCTL=0x%02x (expect 0x02)\n",
-                 corbctl, rirbctl);
 
     return true;
 }
@@ -517,9 +433,9 @@ static bool EnumerateWidgets()
         }
         else if (wtype == WT_PIN_COMPLEX && g_pinNid == 0)
         {
-            // Check if this is an output pin (default config)
+            // Get default pin configuration (verb 0xF1C)
             uint32_t pinCfg;
-            if (HdaCommand(HdaVerb(g_codecAddr, nid, VERB_GET_PARAM, 0x1C), pinCfg))
+            if (HdaCommand(HdaVerb(g_codecAddr, nid, 0xF1C, 0x00), pinCfg))
             {
                 // Default association in bits 7:4, sequence in bits 3:0
                 // Check default device type in bits 23:20
@@ -713,6 +629,24 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
     if (!g_initialized || !g_dacNid) return -1;
     if (byteCount > AUDIO_BUF_SIZE) byteCount = AUDIO_BUF_SIZE;
 
+    // Wait for any in-flight playback to complete before overwriting buffer
+    uint32_t sdBase = g_outStreamBase;
+    if (hda_read32(sdBase + SD_CTL) & SD_CTL_RUN)
+    {
+        // Poll until stream finishes (LPIB reaches CBL) or timeout
+        uint32_t cbl = hda_read32(sdBase + SD_CBL);
+        for (int i = 0; i < 500000; i++)
+        {
+            uint32_t pos = hda_read32(sdBase + SD_LPIB);
+            if (pos >= cbl) break;
+            // Also check if stream stopped
+            if (!(hda_read32(sdBase + SD_CTL) & SD_CTL_RUN)) break;
+            __asm__ volatile("pause");
+        }
+        // Stop the stream before reconfiguring
+        StopOutputStream();
+    }
+
     // Copy audio data to DMA buffer
     const uint8_t* src = static_cast<const uint8_t*>(samples);
     for (uint32_t i = 0; i < byteCount; i++)
@@ -789,7 +723,8 @@ static int IntelHdaInit()
     // Map MMIO pages into kernel virtual address space
     uint64_t mmioPhys = bar0;
     uint32_t mmioPages = 4; // 16KB
-    auto mmioVaddr = VmmAllocPages(mmioPages, VMM_WRITABLE, MemTag::Device, KernelPid);
+    auto mmioVaddr = VmmAllocPages(mmioPages, VMM_WRITABLE | VMM_CACHE_DISABLE,
+                                    MemTag::Device, KernelPid);
     if (!mmioVaddr)
     {
         SerialPuts("intel_hda: MMIO alloc failed\n");
@@ -822,25 +757,21 @@ static int IntelHdaInit()
     if (!HdaControllerReset())
         return -1;
 
-    // Setup CORB/RIRB
-    if (!SetupCorbRirb())
-        return -1;
-
     // Discover codecs
     if (!DiscoverCodec())
         return -1;
 
-    // Enumerate widgets
+    // Enumerate widgets (uses ICI — no DMA needed)
     if (!EnumerateWidgets())
     {
-        SerialPuts("intel_hda: widget enumeration failed (non-fatal)\n");
-        // Continue — we may still work with minimal config
+        SerialPuts("intel_hda: widget enumeration failed\n");
+        return -1;
     }
 
     // Configure output path
     ConfigureOutputPath();
 
-    // Allocate BDL
+    // Allocate BDL (uncacheable for DMA)
     auto bdlPage = VmmAllocPages(1, VMM_WRITABLE | VMM_CACHE_DISABLE, MemTag::Device, KernelPid);
     if (!bdlPage)
     {
@@ -852,9 +783,10 @@ static int IntelHdaInit()
     for (int i = 0; i < 4096 / 4; i++)
         reinterpret_cast<uint32_t*>(g_bdl)[i] = 0;
 
-    // Allocate audio buffer (16 pages = 64KB)
+    // Allocate audio buffer (16 pages = 64KB, uncacheable for DMA)
     uint32_t audioPages = AUDIO_BUF_SIZE / 4096;
-    auto audioBufAddr = VmmAllocPages(audioPages, VMM_WRITABLE, MemTag::Device, KernelPid);
+    auto audioBufAddr = VmmAllocPages(audioPages, VMM_WRITABLE | VMM_CACHE_DISABLE,
+                                       MemTag::Device, KernelPid);
     if (!audioBufAddr)
     {
         SerialPuts("intel_hda: audio buffer alloc failed\n");
@@ -867,7 +799,7 @@ static int IntelHdaInit()
                  g_bdlPhys, g_audioBufPhys,
                  g_audioBufPhys + AUDIO_BUF_SIZE - 1, audioPages);
 
-    // Enable interrupts (global + controller + stream 0)
+    // Enable interrupts (global + controller + output stream 0)
     hda_write32(INTCTL, INTCTL_GIE | INTCTL_CIE |
                          (1 << (g_numInputStreams)));
 
@@ -894,9 +826,6 @@ static void IntelHdaExit()
         StopOutputStream();
         // Disable interrupts
         hda_write32(INTCTL, 0);
-        // Stop CORB/RIRB
-        hda_write8(CORBCTL, 0);
-        hda_write8(RIRBCTL, 0);
     }
     g_initialized = false;
     SerialPuts("intel_hda: unloaded\n");
