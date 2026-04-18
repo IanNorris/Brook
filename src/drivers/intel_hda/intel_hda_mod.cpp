@@ -264,7 +264,7 @@ static bool CorbSendVerb(uint32_t verb)
     return true;
 }
 
-static bool RirbRecvResponse(uint32_t& response, uint32_t timeoutIters = 500000)
+static bool RirbRecvResponse(uint32_t& response, uint32_t timeoutIters = 100000)
 {
     for (uint32_t i = 0; i < timeoutIters; i++)
     {
@@ -367,11 +367,19 @@ static bool SetupCorbRirb()
     // Set CORB size to 256 entries
     hda_write8(CORBSIZE, 0x02); // 256 entries
 
-    // Reset CORB read pointer
+    // Reset CORB read pointer (spec says poll for acknowledgement)
     hda_write16(CORBRP, 0x8000); // Set reset bit
-    BusyWait(10000);
+    for (int i = 0; i < 1000; i++)
+    {
+        if (hda_read16(CORBRP) & 0x8000) break;
+        BusyWait(100);
+    }
     hda_write16(CORBRP, 0x0000); // Clear reset bit
-    BusyWait(10000);
+    for (int i = 0; i < 1000; i++)
+    {
+        if (!(hda_read16(CORBRP) & 0x8000)) break;
+        BusyWait(100);
+    }
 
     // Reset CORB write pointer
     hda_write16(CORBWP, 0);
@@ -393,6 +401,12 @@ static bool SetupCorbRirb()
     hda_write8(CORBCTL, CORBCTL_RUN);
     hda_write8(RIRBCTL, RIRBCTL_RUN);
     BusyWait(10000);
+
+    // Verify DMA is running
+    uint8_t corbctl = hda_read8(CORBCTL);
+    uint8_t rirbctl = hda_read8(RIRBCTL);
+    SerialPrintf("intel_hda: CORBCTL=0x%02x RIRBCTL=0x%02x (expect 0x02)\n",
+                 corbctl, rirbctl);
 
     return true;
 }
@@ -429,6 +443,11 @@ static bool DiscoverCodec()
     {
         KPrintf("intel_hda: codec %d vendor=%04x device=%04x\n",
                 g_codecAddr, vendorId >> 16, vendorId & 0xFFFF);
+    }
+    else
+    {
+        SerialPrintf("intel_hda: codec %d — vendor ID query failed (CORB/RIRB timeout)\n",
+                     g_codecAddr);
     }
 
     return true;

@@ -584,9 +584,8 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
 
                 if (ps2)
                 {
-                    // Emit 0xE0 prefix byte, then the actual scancode
-                    if (bytesRead + 2 > count) break; // need room for both bytes
-                    buf[bytesRead++] = 0xE0;
+                    // Emit single-byte scancode (no E0 prefix) for compatibility
+                    // with apps that read 1 byte at a time (DOOM, etc.)
                     buf[bytesRead++] = release ? (ps2 | 0x80) : ps2;
                 }
                 else

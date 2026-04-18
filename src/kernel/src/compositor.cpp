@@ -647,8 +647,29 @@ static void CompositorLoopWM()
         if (ev.type == InputEventType::MouseMove)
             continue;
 
-        if (ev.type != InputEventType::KeyPress) continue;
+        if (ev.type != InputEventType::KeyPress && ev.type != InputEventType::KeyRelease)
+            continue;
 
+        // Find the focused window (needed for both press and release)
+        Window* focused = nullptr;
+        for (uint32_t i = 0; i < WM_MAX_WINDOWS; i++)
+        {
+            Window* w = WmGetWindow(static_cast<int>(i));
+            if (w && w->proc && w->focused && w->visible)
+            {
+                focused = w;
+                break;
+            }
+        }
+        if (!focused) continue;
+
+        // Key release events skip hotkey/signal processing — just route to window
+        if (ev.type == InputEventType::KeyRelease)
+        {
+            // Route release to terminal or per-process queue (same logic as press)
+        }
+        else
+        {
         DbgPrintf("KEY: scan=0x%02x ascii=0x%02x\n", ev.scanCode, ev.ascii);
 
         // Global hotkeys (no focused window needed)
@@ -661,19 +682,6 @@ static void CompositorLoopWM()
                 continue;
             }
         }
-
-        // Find the focused window
-        Window* focused = nullptr;
-        for (uint32_t i = 0; i < WM_MAX_WINDOWS; i++)
-        {
-            Window* w = WmGetWindow(static_cast<int>(i));
-            if (w && w->proc && w->focused && w->visible)
-            {
-                focused = w;
-                break;
-            }
-        }
-        if (!focused) continue;
 
         // Check for terminal signal keys (Ctrl+C, Ctrl+Z, Ctrl+\)
         if (ev.modifiers & INPUT_MOD_CTRL)
@@ -710,6 +718,7 @@ static void CompositorLoopWM()
                 continue;
             }
         }
+        } // end KeyPress-only block
 
         // Route to terminal if this window's process has one
         bool routed = false;
@@ -719,6 +728,8 @@ static void CompositorLoopWM()
             if (!t) continue;
             if (t->child == focused->proc)
             {
+                SerialPrintf("INPUT: key sc=0x%02x routed to TERMINAL (pid %u '%s')\n",
+                             ev.scanCode, focused->proc->pid, focused->proc->name);
                 if (ev.ascii != 0)
                 {
                     char ch = ev.ascii;
@@ -755,7 +766,11 @@ static void CompositorLoopWM()
 
         // Non-terminal window: push raw event to per-process input queue
         if (!routed)
+        {
+            SerialPrintf("INPUT: key sc=0x%02x -> pid %u '%s'\n",
+                         ev.scanCode, focused->proc->pid, focused->proc->name);
             ProcessInputPush(focused->proc, ev);
+        }
     }
 
     // 5. Handle mouse interaction (position + latched clicks)
