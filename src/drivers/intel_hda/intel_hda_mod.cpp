@@ -720,12 +720,13 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
             }
 
             // Wait for DMA to advance so we don't overwrite data being played.
-            // Yield the CPU instead of busy-spinning — this lets other threads
-            // run while we wait, and properly paces apps like mp3play that
-            // rely on blocking writes for timing.
+            // One 4KB fragment at 44100 Hz stereo 16-bit takes ~23ms.
+            // We use BusyWait to ensure real time passes (SchedulerYield alone
+            // returns instantly if no other threads are runnable), then yield
+            // to let other threads use the CPU while we wait.
             {
                 bool ready = false;
-                for (int attempt = 0; attempt < 200; attempt++)
+                for (int attempt = 0; attempt < 100; attempt++)
                 {
                     uint32_t lpib = hda_read32(sdBase + SD_LPIB);
                     uint32_t playFrag = lpib / FRAG_SIZE;
@@ -737,12 +738,9 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
 
                     if (dist >= 2 && dist < NUM_FRAGMENTS - 2) { ready = true; break; }
 
-                    // First few attempts: brief pause (for cases where DMA
-                    // is about to cross a fragment boundary imminently)
-                    if (attempt < 4)
-                        __asm__ volatile("pause");
-                    else
-                        SchedulerYield();  // give up CPU slice, come back later
+                    // ~1ms busy-wait then yield CPU to other threads
+                    BusyWait(25000);
+                    SchedulerYield();
                 }
                 if (!ready)
                     break;
