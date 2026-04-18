@@ -209,7 +209,7 @@ static bool Ext2DevWrite(Ext2Mount* mnt, uint64_t byteOffset, const void* buf, u
 static bool Ext2WriteBlock(Ext2Mount* mnt, uint32_t blockNum, const void* buf)
 {
     if (blockNum == 0) return false;
-    SerialPrintf("ext2: WriteBlock %u\n", blockNum);
+    // SerialPrintf("ext2: WriteBlock %u\n", blockNum);
     uint64_t off = static_cast<uint64_t>(blockNum) << mnt->blockShift;
     return Ext2DevWrite(mnt, off, buf, mnt->blockSize);
 }
@@ -547,7 +547,7 @@ static bool Ext2DirAdd(Ext2Mount* mnt, uint32_t dirIno, Ext2Inode* dirData,
     for (const char* p = name; *p; ++p) ++nameLen;
     if (nameLen == 0 || nameLen > 255) return false;
 
-    SerialPrintf("ext2: DirAdd '%s' (ino %u) into dir ino %u\n", name, childIno, dirIno);
+    // SerialPrintf("ext2: DirAdd '%s' (ino %u) into dir ino %u\n", name, childIno, dirIno);
 
     // Required size for new entry (8 bytes header + name, 4-byte aligned)
     uint32_t neededLen = ((8 + nameLen + 3) / 4) * 4;
@@ -954,7 +954,7 @@ static uint32_t Ext2ResolvePathInternal(Ext2Mount* mnt, uint32_t startIno,
 
     uint32_t childIno = Ext2DirLookup(mnt, &dirIno, component);
     if (!childIno) {
-        SerialPrintf("ext2: DirLookup '%s' in ino %u → MISS\n", component, curIno);
+        // SerialPrintf("ext2: DirLookup '%s' in ino %u → MISS\n", component, curIno);
         return 0;
     }
 
