@@ -229,7 +229,6 @@ static uint32_t g_curRate = 0;
 static uint8_t  g_curChannels = 0;
 static uint8_t  g_curBits = 0;
 static bool     g_streamConfigured = false;
-static volatile bool g_stopping = false;   // set by HdaStop to break wait loops
 
 // ---------------------------------------------------------------------------
 // Busy-wait helper
@@ -618,7 +617,7 @@ static void StopOutputStream()
 // ---------------------------------------------------------------------------
 
 // Play PCM samples through the HDA output.
-// Blocks until the previous buffer finishes, then starts the new one.
+// Blocks until any previous buffer finishes, then starts the new one.
 extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
                            uint32_t sampleRate, uint8_t channels,
                            uint8_t bitsPerSample)
@@ -628,48 +627,49 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
 
     uint32_t sdBase = g_outStreamBase;
 
+    // Wait for any in-flight playback to complete
+    if (hda_read32(sdBase + SD_CTL) & SD_CTL_RUN)
+    {
+        // Clear stale BCIS before waiting so we detect the CURRENT buffer's completion
+        hda_write8(sdBase + SD_STS, SD_STS_BCIS);
+
+        for (int i = 0; i < 5000000; i++)
+        {
+            if (hda_read8(sdBase + SD_STS) & SD_STS_BCIS) break;
+            if (!(hda_read32(sdBase + SD_CTL) & SD_CTL_RUN)) break;
+            __asm__ volatile("pause");
+        }
+        StopOutputStream();
+    }
+
+    // Clear completion status
+    hda_write8(sdBase + SD_STS, SD_STS_BCIS | SD_STS_FIFOE | SD_STS_DESE);
+
     // Full stream setup only on first call or format change
     bool needSetup = !g_streamConfigured ||
                      sampleRate != g_curRate ||
                      channels != g_curChannels ||
                      bitsPerSample != g_curBits;
 
-    // Wait for previous buffer to complete.
-    // CRITICAL: clear BCIS first so we wait for the CURRENT buffer,
-    // not see a stale completion from the previous one.
-    if (hda_read32(sdBase + SD_CTL) & SD_CTL_RUN)
-    {
-        hda_write8(sdBase + SD_STS, SD_STS_BCIS);  // clear stale BCIS (W1C)
-
-        for (int i = 0; i < 50000000; i++)
-        {
-            if (g_stopping) return -1;
-            if (hda_read8(sdBase + SD_STS) & SD_STS_BCIS) break;
-            if (!(hda_read32(sdBase + SD_CTL) & SD_CTL_RUN)) break;
-            __asm__ volatile("pause");
-        }
-    }
-
-    // Copy audio data while DMA may still be looping on old buffer
-    // (cyclic mode — the old data is fine, we overwrite completely)
-    const uint8_t* src = static_cast<const uint8_t*>(samples);
-    for (uint32_t i = 0; i < byteCount; i++)
-        g_audioBuf[i] = src[i];
-    for (uint32_t i = byteCount; i < AUDIO_BUF_SIZE; i++)
-        g_audioBuf[i] = 0;
-
-    // Stop stream, clear status, update buffer, restart
-    StopOutputStream();
-    hda_write8(sdBase + SD_STS, SD_STS_BCIS | SD_STS_FIFOE | SD_STS_DESE);
-
     if (needSetup)
         SetupOutputStream(sampleRate, channels, bitsPerSample);
 
+    // Copy audio data to DMA buffer
+    const uint8_t* src = static_cast<const uint8_t*>(samples);
+    for (uint32_t i = 0; i < byteCount; i++)
+        g_audioBuf[i] = src[i];
+
+    // Zero remaining buffer
+    for (uint32_t i = byteCount; i < AUDIO_BUF_SIZE; i++)
+        g_audioBuf[i] = 0;
+
+    // Update BDL entry and cyclic buffer length
     g_bdl[0].addr   = g_audioBufPhys;
     g_bdl[0].length = byteCount;
     g_bdl[0].ioc    = 1;
     hda_write32(sdBase + SD_CBL, byteCount);
 
+    // Start stream
     StartOutputStream();
 
     return static_cast<int>(byteCount);
@@ -679,9 +679,7 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
 extern "C" void HdaStop()
 {
     if (!g_initialized) return;
-    g_stopping = true;          // break any active HdaPlayPcm wait loop
     StopOutputStream();
-    g_stopping = false;
 }
 
 // Check if audio is currently playing
