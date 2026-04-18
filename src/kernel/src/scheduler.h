@@ -36,7 +36,7 @@ void SchedulerUnblock(Process* proc);
 void SchedulerTimerTick();
 
 // Yield the current timeslice voluntarily.
-void SchedulerYield();
+extern "C" void SchedulerYield();
 
 // Trampoline for kernel threads — drains requeue, enables interrupts,
 // reads fn/arg from the kernel stack, and calls fn(arg).

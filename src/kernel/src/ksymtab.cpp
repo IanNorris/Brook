@@ -147,6 +147,7 @@ EXPORT_SYMBOL(InputWakeWaiters);
 EXPORT_SYMBOL(SchedulerRegisterPolicy);
 EXPORT_SYMBOL(SchedulerBlock);
 EXPORT_SYMBOL(SchedulerUnblock);
+EXPORT_SYMBOL(SchedulerYield);
 
 // Process
 EXPORT_SYMBOL(ProcessCurrent);
