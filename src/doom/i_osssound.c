@@ -627,8 +627,14 @@ static void MidiAdvance(midi_state_t *m, unsigned int samples)
                 next_delay, m->pos, m->track_end, m->samples_per_tick_q16);
     }
 
+    int events_processed = 0;
     while (m->tick_accum >= ((uint32_t)next_delay << 16)) {
         m->tick_accum -= ((uint32_t)next_delay << 16);
+
+        if (++events_processed > 200) {
+            // Safety: don't process too many events in one block
+            break;
+        }
 
         if (m->pos >= m->track_end) {
             if (m->looping) {
