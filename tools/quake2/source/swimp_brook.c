@@ -129,6 +129,19 @@ void SWimp_EndFrame(void)
                             fb_width / vid.width : fb_height / vid.height));
     }
 
+    // Periodic diagnostic: check if sw_framebuffer has non-zero content
+    static int diag_count = 0;
+    if (++diag_count <= 5 || (diag_count % 100) == 0) {
+        int nonzero_src = 0, nonzero_pal = 0;
+        for (int i = 0; i < vid.width * vid.height && nonzero_src < 10; i++)
+            if (sw_framebuffer[i] != 0) nonzero_src++;
+        for (int i = 0; i < 256; i++)
+            if (palette_rgba[i] != 0 && palette_rgba[i] != 0xFF000000u) nonzero_pal++;
+        ri.Con_Printf(PRINT_ALL, "SWimp_EndFrame #%d: nonzero_src=%d nonzero_pal=%d pal[0]=0x%08x pal[1]=0x%08x fb_pixels=%p\n",
+                      diag_count, nonzero_src, nonzero_pal,
+                      palette_rgba[0], palette_rgba[1], (void*)fb_pixels);
+    }
+
     // Blit 8-bit paletted frame to 32-bit framebuffer with scaling
     int sw = vid.width;
     int sh = vid.height;
