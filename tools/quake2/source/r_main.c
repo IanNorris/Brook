@@ -1009,6 +1009,20 @@ void R_RenderFrame (refdef_t *fd)
 
 	R_EdgeDrawing ();
 
+	// Diagnostic: check if edge drawing produced non-zero pixels
+	{
+		static int rf_diag = 0;
+		if (++rf_diag <= 5 || (rf_diag % 200) == 0) {
+			int nz = 0;
+			if (d_viewbuffer) {
+				for (int i = 0; i < r_refdef.vrect.width * r_refdef.vrect.height && nz < 10; i++)
+					if (((byte*)d_viewbuffer)[i] != 0) nz++;
+			}
+			ri.Con_Printf(PRINT_ALL, "R_RenderFrame #%d: after EdgeDraw nz=%d vrect=%dx%d d_viewbuf=%p\n",
+				rf_diag, nz, r_refdef.vrect.width, r_refdef.vrect.height, d_viewbuffer);
+		}
+	}
+
 	if (r_dspeeds->value)
 	{
 		se_time2 = Sys_Milliseconds ();

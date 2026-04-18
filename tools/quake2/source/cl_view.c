@@ -444,10 +444,20 @@ void V_RenderView( float stereo_separation )
 	extern int entitycmpfnc( const entity_t *, const entity_t * );
 
 	if (cls.state != ca_active)
+	{
+		static int v_dbg1 = 0;
+		if (++v_dbg1 <= 3)
+			Com_Printf("V_RenderView: skip (state=%d not active)\n", cls.state);
 		return;
+	}
 
 	if (!cl.refresh_prepped)
+	{
+		static int v_dbg2 = 0;
+		if (++v_dbg2 <= 3)
+			Com_Printf("V_RenderView: skip (refresh not prepped)\n");
 		return;			// still loading
+	}
 
 	if (cl_timedemo->value)
 	{

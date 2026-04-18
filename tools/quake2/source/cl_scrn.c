@@ -1274,6 +1274,9 @@ void SCR_UpdateScreen (void)
 	// do nothing at all
 	if (cls.disable_screen)
 	{
+		static int ds_dbg = 0;
+		if (++ds_dbg <= 3)
+			Com_Printf("SCR_UpdateScreen: disabled (disable_screen=%f)\n", cls.disable_screen);
 		if (Sys_Milliseconds() - cls.disable_screen > 120000)
 		{
 			cls.disable_screen = 0;
