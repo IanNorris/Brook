@@ -1009,24 +1009,16 @@ void R_RenderFrame (refdef_t *fd)
 
 	R_EdgeDrawing ();
 
-	// Diagnostic: check rendering output
+	// Diagnostic: check rendering output (first 3 frames only)
 	{
 		static int rf_diag = 0;
 		rf_diag++;
-		if (rf_diag <= 3 || (rf_diag % 100) == 0) {
-			int nz = 0;
-			byte *buf = (byte*)d_viewbuffer;
-			int stride = r_screenwidth;
-			int w = r_refdef.vrect.width;
-			int h = r_refdef.vrect.height;
-			for (int y = 0; y < h && nz < 20; y++)
-				for (int x = 0; x < w && nz < 20; x++)
-					if (buf[y * stride + x] != 0) nz++;
+		if (rf_diag <= 3) {
 			ri.Con_Printf(PRINT_ALL,
-				"R_Render #%d: polys=%d oob_edges=%d nz=%d vrect=%d,%d+%dx%d d_viewbuf=%p vid.buf=%p\n",
-				rf_diag, r_drawnpolycount, r_outofedges, nz,
-				r_refdef.vrect.x, r_refdef.vrect.y, w, h,
-				d_viewbuffer, vid.buffer);
+				"R_Render #%d: polys=%d vrect=%d,%d+%dx%d\n",
+				rf_diag, r_drawnpolycount,
+				r_refdef.vrect.x, r_refdef.vrect.y,
+				r_refdef.vrect.width, r_refdef.vrect.height);
 		}
 	}
 

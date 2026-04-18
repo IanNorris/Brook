@@ -91,6 +91,9 @@ rserr_t SWimp_SetMode(int *pwidth, int *pheight, int mode, qboolean fullscreen)
     *pwidth = width;
     *pheight = height;
 
+    // Notify client of the new window size (sets viddef.width/height)
+    ri.Vid_NewWindow(width, height);
+
     return rserr_ok;
 }
 
