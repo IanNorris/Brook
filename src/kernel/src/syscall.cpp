@@ -335,8 +335,9 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
             dsp->bufferOffset += chunk;
             written += chunk;
 
-            // Flush when buffer is full
-            if (dsp->bufferOffset >= dsp->bufferSize)
+            // Flush at fragment boundary (4096 bytes).
+            // Must not exceed HALF_BUF_SIZE (32KB) in the double-buffered driver.
+            if (dsp->bufferOffset >= dsp->fragmentSize)
             {
                 AudioPlay(dsp->buffer, dsp->bufferOffset,
                           dsp->sampleRate, dsp->channels, dsp->bitsPerSample);
