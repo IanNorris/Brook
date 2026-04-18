@@ -608,6 +608,11 @@ void R_PolygonDrawSpans(espan_t *pspan, qboolean iswater )
 
 	do
 	{
+		// Bounds check: skip spans with out-of-range coordinates
+		if (pspan->v < 0 || pspan->v >= vid.height ||
+		    pspan->u < 0 || pspan->u >= vid.width)
+			goto NextSpan;
+
 		s_spanletvars.pdest   = (byte *)d_viewbuffer + ( d_scantable[pspan->v] /*r_screenwidth * pspan->v*/) + pspan->u;
 		s_spanletvars.pz      = d_pzbuffer + (d_zwidth * pspan->v) + pspan->u;
 		s_spanletvars.u       = pspan->u;

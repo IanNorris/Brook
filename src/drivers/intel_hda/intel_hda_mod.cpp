@@ -209,9 +209,9 @@ static BdlEntry* g_bdl = nullptr;
 static uint64_t  g_bdlPhys = 0;
 
 // Audio buffer — split into N fragments for ring-buffered DMA
-static constexpr uint32_t NUM_FRAGMENTS   = 32;          // BDL entries (max 256)
+static constexpr uint32_t NUM_FRAGMENTS   = 64;           // BDL entries (max 256)
 static constexpr uint32_t FRAG_SIZE       = 4096;        // 4KB each (= 1 page)
-static constexpr uint32_t AUDIO_BUF_SIZE  = NUM_FRAGMENTS * FRAG_SIZE; // 128KB total
+static constexpr uint32_t AUDIO_BUF_SIZE  = NUM_FRAGMENTS * FRAG_SIZE; // 256KB total
 static uint8_t*  g_audioBuf = nullptr;
 static uint64_t  g_audioBufPhys = 0;
 static uint64_t  g_fragPhys[NUM_FRAGMENTS]; // per-fragment physical addresses
@@ -718,22 +718,26 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
             }
 
             // Check if writer is about to overrun the DMA read position.
-            // If the next fragment isn't safe to write yet, just stop —
-            // the caller will come back next frame with more data.
-            // This avoids blocking the game loop on audio.
+            // Brief spin (up to 500 iterations) to wait for DMA to advance,
+            // then drop if still not safe. Avoids blocking the game loop
+            // while reducing audio clicks from premature drops.
             {
-                uint32_t lpib = hda_read32(sdBase + SD_LPIB);
-                uint32_t playFrag = lpib / FRAG_SIZE;
-                if (playFrag >= NUM_FRAGMENTS) playFrag = NUM_FRAGMENTS - 1;
+                bool ready = false;
+                for (int i = 0; i < 500; i++)
+                {
+                    uint32_t lpib = hda_read32(sdBase + SD_LPIB);
+                    uint32_t playFrag = lpib / FRAG_SIZE;
+                    if (playFrag >= NUM_FRAGMENTS) playFrag = NUM_FRAGMENTS - 1;
 
-                uint32_t dist = (nextFrag >= playFrag)
-                    ? (nextFrag - playFrag)
-                    : (NUM_FRAGMENTS - playFrag + nextFrag);
+                    uint32_t dist = (nextFrag >= playFrag)
+                        ? (nextFrag - playFrag)
+                        : (NUM_FRAGMENTS - playFrag + nextFrag);
 
-                if (dist < 1 || dist >= NUM_FRAGMENTS - 1) {
-                    // Would overrun DMA — stop writing, return what we have
-                    break;
+                    if (dist >= 1 && dist < NUM_FRAGMENTS - 1) { ready = true; break; }
+                    __asm__ volatile("pause");
                 }
+                if (!ready)
+                    break;
             }
 
             g_writeFrag = nextFrag;
@@ -868,7 +872,7 @@ static int IntelHdaInit()
     for (int i = 0; i < 4096 / 4; i++)
         reinterpret_cast<uint32_t*>(g_bdl)[i] = 0;
 
-    // Allocate audio buffer (32 pages = 128KB, uncacheable for DMA)
+    // Allocate audio buffer (64 pages = 256KB, uncacheable for DMA)
     uint32_t audioPages = AUDIO_BUF_SIZE / 4096;
     auto audioBufAddr = VmmAllocPages(audioPages, VMM_WRITABLE | VMM_CACHE_DISABLE,
                                        MemTag::Device, KernelPid);
