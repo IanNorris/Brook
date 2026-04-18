@@ -153,4 +153,37 @@ bool KMutexTryLock(KMutex* m)
     return false;
 }
 
+void KMutexForceUnlock(KMutex* m, uint32_t pid)
+{
+    uint64_t flags = GuardAcquire(m);
+
+    if (!m->locked || m->ownerPid != pid)
+    {
+        GuardRelease(m, flags);
+        return;
+    }
+
+    // The dying process holds this mutex. Release it.
+    Process* waiter = m->waitHead;
+    if (waiter)
+    {
+        m->waitHead = waiter->syncNext;
+        if (!m->waitHead)
+            m->waitTail = nullptr;
+        waiter->syncNext = nullptr;
+        m->ownerPid = waiter->pid;
+        __atomic_store_n(&waiter->pendingWakeup, 1, __ATOMIC_RELEASE);
+        GuardRelease(m, flags);
+        SchedulerUnblock(waiter);
+    }
+    else
+    {
+        m->locked   = 0;
+        m->ownerPid = 0;
+        GuardRelease(m, flags);
+    }
+
+    SerialPrintf("KMutex: force-unlocked for dying pid %u\n", pid);
+}
+
 } // namespace brook

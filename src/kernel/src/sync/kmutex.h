@@ -52,4 +52,8 @@ void KMutexUnlock(KMutex* m);
 // Returns true if acquired, false if already held.
 bool KMutexTryLock(KMutex* m);
 
+// Force-release a mutex if held by the given PID.
+// Called during process teardown to prevent deadlock.
+void KMutexForceUnlock(KMutex* m, uint32_t pid);
+
 } // namespace brook

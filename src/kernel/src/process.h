@@ -7,7 +7,7 @@
 namespace brook {
 
 // Maximum number of open file descriptors per process.
-static constexpr uint32_t MAX_FDS = 64;
+static constexpr uint32_t MAX_FDS = 256;
 
 // Maximum concurrent processes.
 static constexpr uint32_t MAX_PROCESSES = 64;

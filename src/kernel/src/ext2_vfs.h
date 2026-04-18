@@ -11,6 +11,9 @@ struct Device;
 // Register "ext2" filesystem driver with the VFS.
 void Ext2VfsRegister();
 
+// Force-release the ext2 lock if held by a dying process.
+void Ext2ForceUnlockForPid(uint32_t pid);
+
 } // namespace brook
 
 // Bind a block device to an ext2 physical-drive slot (0-based).

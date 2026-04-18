@@ -104,7 +104,7 @@ void SWimp_SetPalette(const unsigned char *palette)
         unsigned char r = palette[i * 4 + 0];
         unsigned char g = palette[i * 4 + 1];
         unsigned char b = palette[i * 4 + 2];
-        // BGRA format for typical framebuffers (red at offset 16)
+        // BGRA format: blue at offset 0, green at 8, red at 16, alpha at 24
         palette_rgba[i] = (0xFF << 24) | (r << 16) | (g << 8) | b;
     }
 }
@@ -118,6 +118,16 @@ void SWimp_EndFrame(void)
 {
     if (!fb_pixels || !sw_framebuffer)
         return;
+
+    // One-time diagnostic
+    static int diag_once = 0;
+    if (!diag_once) {
+        diag_once = 1;
+        ri.Con_Printf(PRINT_ALL, "SWimp_EndFrame: vid=%dx%d rowbytes=%d fb=%ux%u scale=%d\n",
+                      vid.width, vid.height, vid.rowbytes, fb_width, fb_height,
+                      (int)(fb_width / vid.width < fb_height / vid.height ?
+                            fb_width / vid.width : fb_height / vid.height));
+    }
 
     // Blit 8-bit paletted frame to 32-bit framebuffer with scaling
     int sw = vid.width;

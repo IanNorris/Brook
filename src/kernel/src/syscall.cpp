@@ -238,6 +238,7 @@ struct DspState {
     uint32_t bufferOffset;   // write cursor into staging buffer
     uint8_t* buffer;         // staging buffer (kmalloc'd)
     uint32_t bufferSize;     // total staging buffer size
+    uint32_t mixerStreamId;  // mixer stream slot (0-7)
 };
 
 static constexpr uint32_t DSP_DEFAULT_RATE     = 48000;
@@ -318,48 +319,93 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if (fde->type == FdType::DevNull || fde->type == FdType::DevUrandom)
         return static_cast<int64_t>(count);
 
-    // /dev/dsp — pass PCM data directly to audio driver.
-    // If the app's sample rate differs from the HW rate, resample by
-    // nearest-neighbour duplication (upsample) or decimation (downsample).
+    // /dev/dsp — pass PCM data through the audio mixer.
+    // All streams are resampled to 44100 Hz stereo 16-bit, then submitted
+    // to the mixer which accumulates and flushes to hardware.
     if (fde->type == FdType::DevDsp && fde->handle)
     {
         auto* dsp = static_cast<DspState*>(fde->handle);
         const uint8_t* src = reinterpret_cast<const uint8_t*>(bufAddr);
         uint32_t appRate = dsp->sampleRate;
+        uint32_t bytesPerFrame = (dsp->bitsPerSample / 8) * dsp->channels;
+        if (bytesPerFrame == 0) bytesPerFrame = 1;
+
+        const int16_t* mixSrc = nullptr;
+        uint32_t mixFrames = 0;
 
         if (appRate == DSP_HW_RATE || appRate == 0)
         {
-            // No resampling needed
-            AudioPlay(src, static_cast<uint32_t>(count),
-                      DSP_HW_RATE, dsp->channels, dsp->bitsPerSample);
+            // Already at hardware rate — can submit directly
+            if (dsp->channels == 2 && dsp->bitsPerSample == 16)
+            {
+                mixSrc = reinterpret_cast<const int16_t*>(src);
+                mixFrames = static_cast<uint32_t>(count) / 4;
+            }
+            else
+            {
+                // Mono→stereo or 8→16 bit conversion needed
+                uint32_t inFrames = static_cast<uint32_t>(count) / bytesPerFrame;
+                uint32_t outBytes = inFrames * 4; // stereo 16-bit
+                if (outBytes > dsp->bufferSize) outBytes = dsp->bufferSize;
+                uint32_t outFrames = outBytes / 4;
+                int16_t* out = reinterpret_cast<int16_t*>(dsp->buffer);
+
+                for (uint32_t i = 0; i < outFrames; i++)
+                {
+                    int16_t sample;
+                    if (dsp->bitsPerSample == 8)
+                        sample = (static_cast<int16_t>(src[i * (dsp->channels == 2 ? 2 : 1)]) - 128) << 8;
+                    else
+                        sample = reinterpret_cast<const int16_t*>(src)[i * (dsp->channels == 2 ? 2 : 1)];
+                    out[i * 2 + 0] = sample; // L
+                    out[i * 2 + 1] = (dsp->channels == 2)
+                        ? (dsp->bitsPerSample == 8
+                            ? (static_cast<int16_t>(src[i * 2 + 1]) - 128) << 8
+                            : reinterpret_cast<const int16_t*>(src)[i * 2 + 1])
+                        : sample; // R = L for mono
+                }
+                mixSrc = out;
+                mixFrames = outFrames;
+            }
         }
         else
         {
-            // Resample: compute output size
-            uint32_t bytesPerSample = (dsp->bitsPerSample / 8) * dsp->channels;
-            if (bytesPerSample == 0) bytesPerSample = 1;
-            uint32_t inFrames  = static_cast<uint32_t>(count) / bytesPerSample;
+            // Resample to 44100 Hz stereo 16-bit
+            uint32_t inFrames  = static_cast<uint32_t>(count) / bytesPerFrame;
             uint32_t outFrames = (inFrames * DSP_HW_RATE + appRate - 1) / appRate;
-            uint32_t outBytes  = outFrames * bytesPerSample;
+            uint32_t outBytes  = outFrames * 4; // stereo 16-bit
+            if (outBytes > dsp->bufferSize) outBytes = dsp->bufferSize;
+            outFrames = outBytes / 4;
 
-            // Use the DSP staging buffer for resampled output
-            if (outBytes > dsp->bufferSize)
-                outBytes = dsp->bufferSize;
-            outFrames = outBytes / bytesPerSample;
+            int16_t* out = reinterpret_cast<int16_t*>(dsp->buffer);
 
-            uint8_t* out = dsp->buffer;
-
-            // Nearest-neighbour resample
             for (uint32_t i = 0; i < outFrames; i++)
             {
                 uint32_t srcFrame = (uint64_t)i * appRate / DSP_HW_RATE;
                 if (srcFrame >= inFrames) srcFrame = inFrames - 1;
-                __builtin_memcpy(out + i * bytesPerSample,
-                                 src + srcFrame * bytesPerSample,
-                                 bytesPerSample);
-            }
 
-            AudioPlay(out, outBytes, DSP_HW_RATE, dsp->channels, dsp->bitsPerSample);
+                int16_t sample;
+                if (dsp->bitsPerSample == 8)
+                    sample = (static_cast<int16_t>(src[srcFrame * (dsp->channels == 2 ? 2 : 1)]) - 128) << 8;
+                else
+                    sample = reinterpret_cast<const int16_t*>(src)[srcFrame * (dsp->channels == 2 ? 2 : 1)];
+
+                out[i * 2 + 0] = sample; // L
+                out[i * 2 + 1] = (dsp->channels == 2)
+                    ? (dsp->bitsPerSample == 8
+                        ? (static_cast<int16_t>(src[srcFrame * 2 + 1]) - 128) << 8
+                        : reinterpret_cast<const int16_t*>(src)[srcFrame * 2 + 1])
+                    : sample; // R = L for mono
+            }
+            mixSrc = out;
+            mixFrames = outFrames;
+        }
+
+        if (mixSrc && mixFrames > 0)
+        {
+            // Send directly to HDA (bypass mixer — flush-per-write never mixes)
+            AudioPlay(mixSrc, mixFrames * MIXER_FRAME_BYTES,
+                      MIXER_HW_RATE, MIXER_HW_CHANNELS, MIXER_HW_BITS);
         }
 
         return static_cast<int64_t>(count);
@@ -928,7 +974,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
                          uint64_t, uint64_t, uint64_t)
 {
     const char* path = reinterpret_cast<const char*>(pathAddr);
-    if (!path) return -EFAULT;
+    if (!path || pathAddr < 0x1000) return -EFAULT;
 
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
@@ -1029,8 +1075,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     if (StrEq(path, "/dev/dsp"))
     {
         if (!AudioAvailable()) return -ENODEV;
-        // Flush any stale audio left in the HDA DMA buffer by a previous app
-        AudioStop();
+        static uint32_t s_nextMixerStream = 0;
         auto* dsp = static_cast<DspState*>(kmalloc(sizeof(DspState)));
         if (!dsp) return -ENOMEM;
         dsp->sampleRate    = DSP_DEFAULT_RATE;
@@ -1039,6 +1084,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         dsp->fragmentSize  = 4096;
         dsp->bufferOffset  = 0;
         dsp->bufferSize    = DSP_BUFFER_SIZE;
+        dsp->mixerStreamId = s_nextMixerStream++ % 8;
         dsp->buffer        = static_cast<uint8_t*>(kmalloc(DSP_BUFFER_SIZE));
         if (!dsp->buffer) { kfree(dsp); return -ENOMEM; }
         int fd = FdAlloc(proc, FdType::DevDsp, dsp);
@@ -1152,7 +1198,21 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     }
 
     if (!vn)
+    {
+        // Diagnostic: log pak open failures
+        bool isPak = false;
+        for (const char* p = lookupPath; *p; ++p)
+            if (p[0] == 'p' && p[1] == 'a' && p[2] == 'k') { isPak = true; break; }
+        if (isPak)
+        {
+            uint32_t usedFds = 0;
+            for (uint32_t fi = 0; fi < MAX_FDS; fi++)
+                if (proc->fds[fi].type != FdType::None) usedFds++;
+            SerialPrintf("sys_open FAIL: '%s' (resolved '%s') fds=%u/%u\n",
+                         path, lookupPath, usedFds, MAX_FDS);
+        }
         return -ENOENT;
+    }
 
     int fd = FdAlloc(proc, FdType::Vnode, vn);
     if (fd < 0)
@@ -2900,7 +2960,9 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
 
         // Auto-create a VFB + WM window when a process without one queries
         // the framebuffer in WM mode. This handles programs launched from
-        // bash that open /dev/fb0 (e.g. DOOM) — they need a composited VFB.
+        // bash that open /dev/fb0 (e.g. DOOM, Quake 2) — they need a composited VFB.
+        // Use a default window size of 640×480 rather than the full physical FB,
+        // so the window fits on screen with WM decorations.
         if (!proc->fbVirtual && WmIsActive() &&
             (cmd == FBIOGET_VSCREENINFO || cmd == FBIOGET_FSCREENINFO))
         {
@@ -2908,19 +2970,24 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
             int16_t winX = static_cast<int16_t>(60 + (s_autoWinCount % 6) * 40);
             int16_t winY = static_cast<int16_t>(60 + (s_autoWinCount % 6) * 40);
 
+            uint32_t autoW = 640;
+            uint32_t autoH = 480;
+            if (autoW > fbW) autoW = fbW;
+            if (autoH > fbH) autoH = fbH;
+
             CompositorSetupProcess(proc,
                                    winX + static_cast<int16_t>(WM_BORDER_WIDTH),
                                    winY + static_cast<int16_t>(WM_TITLE_BAR_HEIGHT + WM_BORDER_WIDTH),
-                                   fbW, fbH, 1);
+                                   autoW, autoH, 1);
 
             WmCreateWindow(proc, winX, winY,
-                          static_cast<uint16_t>(fbW),
-                          static_cast<uint16_t>(fbH),
+                          static_cast<uint16_t>(autoW),
+                          static_cast<uint16_t>(autoH),
                           proc->name);
 
             s_autoWinCount++;
             SerialPrintf("sys_ioctl: auto-created WM window for pid %u (%ux%u)\n",
-                         proc->pid, fbW, fbH);
+                         proc->pid, autoW, autoH);
         }
         uint32_t repW = (proc->fbVfbWidth  > 0) ? proc->fbVfbWidth  : fbW;
         uint32_t repH = (proc->fbVfbHeight > 0) ? proc->fbVfbHeight : fbH;

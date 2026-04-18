@@ -38,6 +38,7 @@
 #include "shell.h"
 #include "boot_logo.h"
 #include "klog.h"
+#include "audio.h"
 #include "fat_test_image.h"
 #include "fw_cfg.h"
 #include "rtc.h"
@@ -424,6 +425,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
     // Initialise input subsystem before modules so keyboard module can register.
     brook::InputInit();
+
+    // Initialise the audio mixer before modules so HDA can register.
+    brook::AudioMixerInit();
 
     // Phase 1: load early modules from embedded ramdisk (mounted at "/").
     //   These run before virtio, so they can't access /boot yet.

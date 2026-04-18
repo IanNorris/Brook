@@ -20,6 +20,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 // r_rast.c
 
 #include <assert.h>
+#include <math.h>
 
 #include "r_local.h"
 
@@ -250,6 +251,8 @@ void R_EmitEdge (mvertex_t *pv0, mvertex_t *pv1)
 	// FIXME: build x/yscale into transform?
 		scale = xscale * lzi0;
 		u0 = (xcenter + scale*transformed[0]);
+		if (!isfinite(u0))
+			u0 = r_refdef.fvrectx_adj;
 		if (u0 < r_refdef.fvrectx_adj)
 			u0 = r_refdef.fvrectx_adj;
 		if (u0 > r_refdef.fvrectright_adj)
@@ -257,6 +260,8 @@ void R_EmitEdge (mvertex_t *pv0, mvertex_t *pv1)
 	
 		scale = yscale * lzi0;
 		v0 = (ycenter - scale*transformed[1]);
+		if (!isfinite(v0))
+			v0 = r_refdef.fvrecty_adj;
 		if (v0 < r_refdef.fvrecty_adj)
 			v0 = r_refdef.fvrecty_adj;
 		if (v0 > r_refdef.fvrectbottom_adj)
@@ -278,6 +283,8 @@ void R_EmitEdge (mvertex_t *pv0, mvertex_t *pv1)
 
 	scale = xscale * r_lzi1;
 	r_u1 = (xcenter + scale*transformed[0]);
+	if (!isfinite(r_u1))
+		r_u1 = r_refdef.fvrectx_adj;
 	if (r_u1 < r_refdef.fvrectx_adj)
 		r_u1 = r_refdef.fvrectx_adj;
 	if (r_u1 > r_refdef.fvrectright_adj)
@@ -285,6 +292,8 @@ void R_EmitEdge (mvertex_t *pv0, mvertex_t *pv1)
 
 	scale = yscale * r_lzi1;
 	r_v1 = (ycenter - scale*transformed[1]);
+	if (!isfinite(r_v1))
+		r_v1 = r_refdef.fvrecty_adj;
 	if (r_v1 < r_refdef.fvrecty_adj)
 		r_v1 = r_refdef.fvrecty_adj;
 	if (r_v1 > r_refdef.fvrectbottom_adj)
@@ -370,6 +379,10 @@ void R_EmitEdge (mvertex_t *pv0, mvertex_t *pv1)
 	u_check = edge->u;
 	if (edge->surfs[0])
 		u_check++;	// sort trailers after leaders
+
+	// Bounds-check v and v2 to prevent array overflow
+	if (v < 0 || v >= MAXHEIGHT || v2 < 0 || v2 >= MAXHEIGHT)
+		return;
 
 	if (!newedges[v] || newedges[v]->u >= u_check)
 	{

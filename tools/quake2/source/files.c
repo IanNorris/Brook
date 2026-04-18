@@ -19,9 +19,11 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 */
 
 #include "qcommon.h"
+#include <unistd.h>
+#include <stdio.h>
 
 // define this to dissalow any data but the demo pak file
-//#define	NO_ADDONS
+#define	NO_ADDONS
 
 // if a packfile directory differs from this, it is assumed to be hacked
 // Full version
@@ -247,7 +249,7 @@ int FS_FOpenFile (char *filename, FILE **file)
 				// open a new file on the pakfile
 					*file = fopen (pak->filename, "rb");
 					if (!*file)
-						Com_Error (ERR_FATAL, "Couldn't reopen %s", pak->filename);	
+						Com_Error (ERR_FATAL, "Couldn't reopen %s", pak->filename);
 					fseek (*file, pak->files[i].filepos, SEEK_SET);
 					return pak->files[i].filelen;
 				}
@@ -320,8 +322,10 @@ int FS_FOpenFile (char *filename, FILE **file)
 		// open a new file on the pakfile
 			*file = fopen (pak->filename, "rb");
 			if (!*file)
-				Com_Error (ERR_FATAL, "Couldn't reopen %s", pak->filename);	
-			fseek (*file, pak->files[i].filepos, SEEK_SET);
+				Com_Error (ERR_FATAL, "Couldn't reopen %s", pak->filename);
+			{
+				fseek (*file, pak->files[i].filepos, SEEK_SET);
+			}
 			return pak->files[i].filelen;
 		}
 	
@@ -480,8 +484,10 @@ pack_t *FS_LoadPackFile (char *packfile)
 	checksum = Com_BlockChecksum ((void *)info, header.dirlen);
 
 #ifdef NO_ADDONS
-	if (checksum != PAK0_CHECKSUM)
-		return NULL;
+	if (checksum != PAK0_CHECKSUM) {
+		Com_Printf("pak checksum 0x%x (expected 0x%x) — accepting anyway\n",
+			checksum, PAK0_CHECKSUM);
+	}
 #endif
 // parse the directory
 	for (i=0 ; i<numpackfiles ; i++)

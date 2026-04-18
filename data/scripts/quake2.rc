@@ -1,0 +1,4 @@
+# Boot directly into Quake 2
+set vfb 640x480
+set scale 1
+run /data/games/quake2/quake2 +set basedir /data/games/quake2

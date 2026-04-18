@@ -11,7 +11,7 @@ BUILD_DIR="$BROOK_ROOT/build/quake2"
 mkdir -p "$BUILD_DIR"
 
 CC="${MUSL_CC:-x86_64-unknown-linux-musl-gcc}"
-CFLAGS="-static -O2 -fno-stack-protector -std=gnu99 -DLINUX -Did386=0 -DREF_HARD_LINKED -DGAME_HARD_LINKED -D_DEFAULT_SOURCE -w -Wno-error -Wno-incompatible-pointer-types -Wno-implicit-int -Wno-implicit-function-declaration -Wno-int-conversion"
+CFLAGS="-static -O2 -g -fno-stack-protector -std=gnu99 -DLINUX -Did386=0 -DREF_HARD_LINKED -DGAME_HARD_LINKED -D_DEFAULT_SOURCE -w -Wno-error -Wno-incompatible-pointer-types -Wno-implicit-int -Wno-implicit-function-declaration -Wno-int-conversion"
 
 # Client/engine sources
 CLIENT_SRCS="

@@ -209,9 +209,9 @@ static BdlEntry* g_bdl = nullptr;
 static uint64_t  g_bdlPhys = 0;
 
 // Audio buffer — split into N fragments for ring-buffered DMA
-static constexpr uint32_t NUM_FRAGMENTS   = 4;           // BDL entries
+static constexpr uint32_t NUM_FRAGMENTS   = 32;          // BDL entries (max 256)
 static constexpr uint32_t FRAG_SIZE       = 4096;        // 4KB each (= 1 page)
-static constexpr uint32_t AUDIO_BUF_SIZE  = NUM_FRAGMENTS * FRAG_SIZE; // 16KB total
+static constexpr uint32_t AUDIO_BUF_SIZE  = NUM_FRAGMENTS * FRAG_SIZE; // 128KB total
 static uint8_t*  g_audioBuf = nullptr;
 static uint64_t  g_audioBufPhys = 0;
 static uint64_t  g_fragPhys[NUM_FRAGMENTS]; // per-fragment physical addresses
@@ -653,6 +653,19 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
 
     uint32_t sdBase = g_outStreamBase;
 
+    // Periodic diagnostic: every 50th call
+    static uint32_t s_callCount = 0;
+    static uint64_t s_totalBytes = 0;
+    s_callCount++;
+    s_totalBytes += byteCount;
+    if (s_callCount <= 5 || (s_callCount % 50) == 0)
+    {
+        uint32_t lpib = g_streamRunning ? hda_read32(sdBase + SD_LPIB) : 0;
+        SerialPrintf("HDA: call#%u bytes=%u total=%luKB wfrag=%u lpib=%u run=%u\n",
+                     s_callCount, byteCount, s_totalBytes/1024,
+                     g_writeFrag, lpib, g_streamRunning ? 1 : 0);
+    }
+
     // Full stream setup on first call or format change
     bool needSetup = !g_streamConfigured ||
                      sampleRate != g_curRate ||
@@ -692,11 +705,11 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
 
             if (!g_streamRunning)
             {
-                // Pre-fill at least 2 fragments before starting DMA
+                // Pre-fill 16 fragments before starting DMA for smooth playback
                 g_writeFrag = nextFrag;
                 g_writeOffset = 0;
 
-                if (nextFrag >= 2)
+                if (nextFrag >= 16)
                 {
                     StartOutputStream();
                     g_streamRunning = true;
@@ -704,16 +717,36 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
                 continue;
             }
 
-            // Wait for DMA to move past the fragment we're about to write.
-            // Each BCIS means one fragment completed. Wait until DMA is
-            // not in our target fragment.
-            for (int i = 0; i < 50000000; i++)
+            // Wait if writer is about to overrun the DMA read position.
+            // dist=0 means we'd write the fragment DMA is reading (collision).
+            // dist=NUM_FRAGMENTS-1 means we've almost lapped the reader.
+            // Safe when 1 <= dist <= NUM_FRAGMENTS-2.
             {
-                uint32_t lpib = hda_read32(sdBase + SD_LPIB);
-                uint32_t playFrag = lpib / FRAG_SIZE;
-                if (playFrag >= NUM_FRAGMENTS) playFrag = NUM_FRAGMENTS - 1;
-                if (playFrag != nextFrag) break;
-                __asm__ volatile("pause");
+                bool ready = false;
+                for (int i = 0; i < 50000; i++)
+                {
+                    uint32_t lpib = hda_read32(sdBase + SD_LPIB);
+                    uint32_t playFrag = lpib / FRAG_SIZE;
+                    if (playFrag >= NUM_FRAGMENTS) playFrag = NUM_FRAGMENTS - 1;
+
+                    // Distance from reader to writer in the ring
+                    uint32_t dist = (nextFrag >= playFrag)
+                        ? (nextFrag - playFrag)
+                        : (NUM_FRAGMENTS - playFrag + nextFrag);
+
+                    if (dist >= 1 && dist < NUM_FRAGMENTS - 1) { ready = true; break; }
+                    __asm__ volatile("pause");
+                }
+                if (!ready) {
+                    static int s_dropCount = 0;
+                    if (s_dropCount++ < 5)
+                    {
+                        uint32_t lpib = hda_read32(sdBase + SD_LPIB);
+                        SerialPrintf("HDA: drop! nextFrag=%u playFrag=%u lpib=%u\n",
+                                     nextFrag, lpib / FRAG_SIZE, lpib);
+                    }
+                    break;
+                }
             }
 
             g_writeFrag = nextFrag;
@@ -848,7 +881,7 @@ static int IntelHdaInit()
     for (int i = 0; i < 4096 / 4; i++)
         reinterpret_cast<uint32_t*>(g_bdl)[i] = 0;
 
-    // Allocate audio buffer (16 pages = 64KB, uncacheable for DMA)
+    // Allocate audio buffer (32 pages = 128KB, uncacheable for DMA)
     uint32_t audioPages = AUDIO_BUF_SIZE / 4096;
     auto audioBufAddr = VmmAllocPages(audioPages, VMM_WRITABLE | VMM_CACHE_DISABLE,
                                        MemTag::Device, KernelPid);

@@ -14,6 +14,7 @@
 #include "kprintf.h"
 #include "compositor.h"
 #include "window.h"
+#include "ext2_vfs.h"
 #include "string.h"
 
 namespace brook {
@@ -40,6 +41,7 @@ int FdAlloc(Process* proc, FdType type, void* handle)
             return static_cast<int>(i);
         }
     }
+    SerialPrintf("FD: pid %u exhausted %u fds\n", proc->pid, MAX_FDS);
     return -24; // EMFILE
 }
 
@@ -686,6 +688,9 @@ void ProcessDestroy(Process* proc)
     if (!proc) return;
 
     bool isThread = proc->isThread;
+
+    // Release any kernel mutexes held by this process (prevents deadlock)
+    Ext2ForceUnlockForPid(proc->pid);
 
     // Threads don't own FDs — the leader does
     if (!isThread)

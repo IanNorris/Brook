@@ -40,7 +40,18 @@ else
     echo ""
 fi
 
-# 3. Userspace test apps (requires musl cross-compiler)
+# 3. Quake 2 (if source is available)
+Q2_SRC="${ROOT_DIR}/tools/quake2/source"
+if [ -d "$Q2_SRC" ] && command -v x86_64-unknown-linux-musl-gcc &>/dev/null; then
+    echo "--- Quake 2 ---"
+    MUSL_CC=x86_64-unknown-linux-musl-gcc "${SCRIPT_DIR}/build_quake2.sh"
+    echo ""
+else
+    echo "--- Quake 2 (skipped — source or musl-gcc not found) ---"
+    echo ""
+fi
+
+# 4. Userspace test apps (requires musl cross-compiler)
 if command -v x86_64-unknown-linux-musl-gcc &>/dev/null; then
     echo "--- Apps ---"
     "${SCRIPT_DIR}/build_apps.sh"
@@ -50,12 +61,17 @@ else
     echo ""
 fi
 
-# 4. Update disk image
+# 5. Update disk image (FAT boot disk)
 echo "--- Disk Image ---"
 "${SCRIPT_DIR}/update_disk.sh" --create
 echo ""
 
-# 4. Run host tests
+# 6. Update ext2 disk image
+echo "--- Ext2 Disk Image ---"
+"${SCRIPT_DIR}/update_ext2_disk.sh" --create
+echo ""
+
+# 7. Run host tests
 BUILD_TYPE_LOWER="$(echo "${BUILD_TYPE}" | tr '[:upper:]' '[:lower:]')"
 HOST_TEST_DIR="${ROOT_DIR}/build/${BUILD_TYPE_LOWER}/host_tests"
 if [ -d "${HOST_TEST_DIR}" ]; then

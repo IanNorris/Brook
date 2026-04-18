@@ -307,6 +307,13 @@ static int VirtioBlkWrite(Device* dev, uint64_t offset, const void* buf, uint64_
     uint64_t startSector = offset / SECTOR_SIZE;
     uint64_t endSector   = (offset + len + SECTOR_SIZE - 1) / SECTOR_SIZE;
 
+    // Detect partial first/last sectors that need read-modify-write.
+    bool partialFirst = (offset % SECTOR_SIZE) != 0;
+    bool partialLast  = ((offset + len) % SECTOR_SIZE) != 0 && endSector > startSector;
+    // Single-sector write that is partial on both ends:
+    if (endSector - startSector == 1 && ((offset % SECTOR_SIZE) != 0 || (offset + len) % SECTOR_SIZE != 0))
+        partialFirst = true;
+
     const uint8_t* srcBytes = static_cast<const uint8_t*>(buf);
     uint64_t bytesWritten = 0;
     auto* dmaBuf = s->dmaBuf;
@@ -318,8 +325,16 @@ static int VirtioBlkWrite(Device* dev, uint64_t offset, const void* buf, uint64_
         if (batch > SECTORS_PER_DMA) batch = SECTORS_PER_DMA;
         uint32_t dmaLen = batch * SECTOR_SIZE;
 
-        // Zero-fill entire batch region, then copy in relevant bytes.
-        for (uint32_t i = 0; i < dmaLen; ++i) dmaBuf[i] = 0;
+        // Read-modify-write: pre-read sectors that will be partially overwritten
+        // so we don't zero out data we're not writing.
+        bool needPreRead = (partialFirst && sec == startSector) ||
+                           (partialLast && sec + batch == endSector);
+        if (needPreRead) {
+            if (!SubmitRequest(*s, VIRTIO_BLK_T_IN, sec, s->dmaBufPhys, dmaLen))
+                return -1;
+        } else {
+            for (uint32_t i = 0; i < dmaLen; ++i) dmaBuf[i] = 0;
+        }
 
         for (uint32_t i = 0; i < batch && bytesWritten < len; ++i)
         {

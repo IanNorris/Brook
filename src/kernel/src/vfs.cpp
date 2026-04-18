@@ -220,7 +220,8 @@ Vnode* VfsOpen(const char* path, int flags)
 int VfsRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
 {
     if (!vn || !vn->ops->read) return -1;
-    return vn->ops->read(vn, buf, len, offset);
+    int r = vn->ops->read(vn, buf, len, offset);
+    return r;
 }
 
 int VfsWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset)

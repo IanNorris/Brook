@@ -158,6 +158,12 @@ static void EnsureLock()
     if (!g_ext2LockInit) { KMutexInit(&g_ext2Lock); g_ext2LockInit = true; }
 }
 
+void Ext2ForceUnlockForPid(uint32_t pid)
+{
+    if (g_ext2LockInit)
+        KMutexForceUnlock(&g_ext2Lock, pid);
+}
+
 // ---------------------------------------------------------------------------
 // Device I/O helpers
 // ---------------------------------------------------------------------------
@@ -166,7 +172,12 @@ static void EnsureLock()
 static bool Ext2DevRead(Ext2Mount* mnt, uint64_t byteOffset, void* buf, uint64_t len)
 {
     int r = mnt->dev->ops->read(mnt->dev, byteOffset, buf, len);
-    return r == static_cast<int>(len);
+    if (r != static_cast<int>(len))
+    {
+        SerialPrintf("ext2: DevRead FAIL off=%llu len=%llu got=%d\n", byteOffset, len, r);
+        return false;
+    }
+    return true;
 }
 
 // Read a single block into buf.
@@ -198,6 +209,7 @@ static bool Ext2DevWrite(Ext2Mount* mnt, uint64_t byteOffset, const void* buf, u
 static bool Ext2WriteBlock(Ext2Mount* mnt, uint32_t blockNum, const void* buf)
 {
     if (blockNum == 0) return false;
+    SerialPrintf("ext2: WriteBlock %u\n", blockNum);
     uint64_t off = static_cast<uint64_t>(blockNum) << mnt->blockShift;
     return Ext2DevWrite(mnt, off, buf, mnt->blockSize);
 }
@@ -535,6 +547,8 @@ static bool Ext2DirAdd(Ext2Mount* mnt, uint32_t dirIno, Ext2Inode* dirData,
     for (const char* p = name; *p; ++p) ++nameLen;
     if (nameLen == 0 || nameLen > 255) return false;
 
+    SerialPrintf("ext2: DirAdd '%s' (ino %u) into dir ino %u\n", name, childIno, dirIno);
+
     // Required size for new entry (8 bytes header + name, 4-byte aligned)
     uint32_t neededLen = ((8 + nameLen + 3) / 4) * 4;
 
@@ -744,15 +758,27 @@ static uint32_t Ext2BlockMap(Ext2Mount* mnt, const Ext2Inode* ino, uint32_t file
     // Doubly indirect (block 13)
     if (fileBlock < ptrsPerBlock * ptrsPerBlock) {
         uint32_t dindBlock = ino->i_block[13];
-        if (!dindBlock) return 0;
+        if (!dindBlock) {
+            SerialPrintf("ext2: dind i_block[13]=0 for fileBlock=%u\n", fileBlock + 12 + ptrsPerBlock);
+            return 0;
+        }
         uint32_t idx1 = fileBlock / ptrsPerBlock;
         uint32_t idx2 = fileBlock % ptrsPerBlock;
         uint32_t indBlock = 0;
         uint64_t off1 = (static_cast<uint64_t>(dindBlock) << mnt->blockShift) + idx1 * 4;
-        if (!Ext2DevRead(mnt, off1, &indBlock, 4) || !indBlock) return 0;
+        if (!Ext2DevRead(mnt, off1, &indBlock, 4) || !indBlock) {
+            SerialPrintf("ext2: dind L1 fail idx1=%u indBlock=%u dindBlock=%u\n", idx1, indBlock, dindBlock);
+            return 0;
+        }
         uint32_t entry = 0;
         uint64_t off2 = (static_cast<uint64_t>(indBlock) << mnt->blockShift) + idx2 * 4;
-        if (!Ext2DevRead(mnt, off2, &entry, 4)) return 0;
+        if (!Ext2DevRead(mnt, off2, &entry, 4)) {
+            SerialPrintf("ext2: dind L2 fail idx2=%u indBlock=%u\n", idx2, indBlock);
+            return 0;
+        }
+        if (!entry) {
+            // sparse hole — block not allocated
+        }
         return entry;
     }
     fileBlock -= ptrsPerBlock * ptrsPerBlock;
@@ -781,7 +807,9 @@ static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
                              void* buf, uint64_t len, uint64_t offset)
 {
     uint64_t fileSize = Ext2InodeSize(ino);
-    if (offset >= fileSize) return 0;
+    if (offset >= fileSize) {
+        return 0;
+    }
     if (offset + len > fileSize) len = fileSize - offset;
     if (len == 0) return 0;
 
@@ -796,9 +824,15 @@ static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
         uint32_t fileBlock = static_cast<uint32_t>((offset + bytesRead) >> mnt->blockShift);
         uint32_t blockOff  = static_cast<uint32_t>((offset + bytesRead) & (mnt->blockSize - 1));
         uint32_t diskBlock = Ext2BlockMap(mnt, ino, fileBlock);
-        if (!diskBlock) break; // sparse hole or error
+        if (!diskBlock) {
+            break; // sparse hole or error
+        }
 
-        if (!Ext2ReadBlock(mnt, diskBlock, blockBuf)) break;
+        if (!Ext2ReadBlock(mnt, diskBlock, blockBuf)) {
+            SerialPrintf("ext2: ReadBlock failed for diskBlock=%u (fileBlock=%u)\n",
+                diskBlock, fileBlock);
+            break;
+        }
 
         uint32_t avail = mnt->blockSize - blockOff;
         uint64_t toCopy = len - bytesRead;
@@ -908,11 +942,21 @@ static uint32_t Ext2ResolvePathInternal(Ext2Mount* mnt, uint32_t startIno,
 
     // Look up component in current directory
     Ext2Inode dirIno;
-    if (!Ext2ReadInode(mnt, curIno, &dirIno)) return 0;
-    if ((dirIno.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) return 0;
+    if (!Ext2ReadInode(mnt, curIno, &dirIno)) {
+        SerialPrintf("ext2: ReadInode %u FAILED for component '%s'\n", curIno, component);
+        return 0;
+    }
+    if ((dirIno.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) {
+        SerialPrintf("ext2: ino %u not a dir (mode 0x%x) for component '%s'\n",
+                     curIno, dirIno.i_mode, component);
+        return 0;
+    }
 
     uint32_t childIno = Ext2DirLookup(mnt, &dirIno, component);
-    if (!childIno) return 0;
+    if (!childIno) {
+        SerialPrintf("ext2: DirLookup '%s' in ino %u → MISS\n", component, curIno);
+        return 0;
+    }
 
     // Check if child is a symlink — follow it
     Ext2Inode childData;
@@ -1209,6 +1253,7 @@ static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
 
     // File not found — create if requested
     if (!ino && (flags & VFS_O_CREATE)) {
+        SerialPrintf("ext2: CREATE file '%s'\n", relPath);
         char name[256];
         uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name));
         if (!parentIno || !name[0]) { KMutexUnlock(&g_ext2Lock); return nullptr; }
@@ -1236,7 +1281,11 @@ static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
         }
     }
 
-    if (!ino) { KMutexUnlock(&g_ext2Lock); return nullptr; }
+    if (!ino) {
+        SerialPrintf("ext2: open '%s' → not found\n", relPath);
+        KMutexUnlock(&g_ext2Lock);
+        return nullptr;
+    }
 
     if (!Ext2ReadInode(mnt, ino, &inodeData)) { KMutexUnlock(&g_ext2Lock); return nullptr; }
 
@@ -1306,10 +1355,18 @@ static int Ext2FsStatPath(void* mountPriv, uint8_t pdrv,
         ino = Ext2ResolvePath(mnt, EXT2_ROOT_INO, p, 0);
     }
 
-    if (!ino) { KMutexUnlock(&g_ext2Lock); return -1; }
+    if (!ino) {
+        SerialPrintf("ext2: stat '%s' → not found\n", relPath);
+        KMutexUnlock(&g_ext2Lock);
+        return -1;
+    }
 
     Ext2Inode inodeData;
-    if (!Ext2ReadInode(mnt, ino, &inodeData)) { KMutexUnlock(&g_ext2Lock); return -1; }
+    if (!Ext2ReadInode(mnt, ino, &inodeData)) {
+        SerialPrintf("ext2: stat '%s' ino=%u → read failed\n", relPath, ino);
+        KMutexUnlock(&g_ext2Lock);
+        return -1;
+    }
 
     KMutexUnlock(&g_ext2Lock);
 
@@ -1411,6 +1468,8 @@ static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath)
 {
     (void)pdrv;
     auto* mnt = static_cast<Ext2Mount*>(mountPriv);
+
+    SerialPrintf("ext2: MKDIR '%s'\n", relPath);
 
     KMutexLock(&g_ext2Lock);
 
