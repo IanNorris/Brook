@@ -1029,6 +1029,8 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     if (StrEq(path, "/dev/dsp"))
     {
         if (!AudioAvailable()) return -ENODEV;
+        // Flush any stale audio left in the HDA DMA buffer by a previous app
+        AudioStop();
         auto* dsp = static_cast<DspState*>(kmalloc(sizeof(DspState)));
         if (!dsp) return -ENOMEM;
         dsp->sampleRate    = DSP_DEFAULT_RATE;
