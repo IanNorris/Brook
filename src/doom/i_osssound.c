@@ -595,8 +595,11 @@ static void MidiAdvance(midi_state_t *m, unsigned int samples)
 {
     if (!m->playing) return;
 
-    // Convert samples to ticks (Q16)
-    m->tick_accum += ((uint64_t)samples << 16) / (m->samples_per_tick_q16 > 0 ? m->samples_per_tick_q16 : 1);
+    // Convert samples to ticks (Q16 fixed point).
+    // samples_per_tick_q16 = actual_samples_per_tick * 65536
+    // We want tick_accum in Q16 ticks: tick_accum += (samples / actual_spt) * 65536
+    //   = samples * 65536 * 65536 / samples_per_tick_q16
+    m->tick_accum += ((uint64_t)samples << 32) / (m->samples_per_tick_q16 > 0 ? m->samples_per_tick_q16 : 1);
 
     // These are stored in the midi_state via a generation counter to
     // detect song changes and re-read the initial delay.
@@ -617,6 +620,8 @@ static void MidiAdvance(midi_state_t *m, unsigned int samples)
     if (!delay_initialized) {
         next_delay = MidiReadVarLen(m);
         delay_initialized = 1;
+        fprintf(stderr, "MidiAdvance: init delay=%u pos=%zu/%zu spt=%u\n",
+                next_delay, m->pos, m->track_end, m->samples_per_tick_q16);
     }
 
     while (m->tick_accum >= ((uint32_t)next_delay << 16)) {
@@ -830,10 +835,11 @@ static void MixAndWrite(void)
             if (fm_voices[v].active) fmActive++;
 
         if ((mix_count % 200) == 1) {
-            fprintf(stderr, "Mix #%d: peak=%d midi=%d sfx=%d fm=%d pos=%zu/%zu\n",
+            fprintf(stderr, "Mix #%d: peak=%d midi=%d sfx=%d fm=%d pos=%zu/%zu accum=%u spt=%u\n",
                     mix_count, maxAbs, midi_state.playing ? 1 : 0,
                     sfxActive, fmActive,
-                    midi_state.pos, midi_state.track_end);
+                    midi_state.pos, midi_state.track_end,
+                    midi_state.tick_accum, midi_state.samples_per_tick_q16);
         }
         write(dsp_fd, outbuf, sizeof(outbuf));
     }
