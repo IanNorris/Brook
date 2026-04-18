@@ -735,12 +735,18 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
     return static_cast<int>(totalWritten);
 }
 
-// Stop audio playback
+// Stop audio playback and clear buffers
 extern "C" void HdaStop()
 {
     if (!g_initialized) return;
     StopOutputStream();
     g_streamRunning = false;
+    g_streamConfigured = false;
+    g_writeFrag = 0;
+    g_writeOffset = 0;
+    // Zero buffer so next open doesn't replay stale data
+    for (uint32_t i = 0; i < AUDIO_BUF_SIZE; i++)
+        g_audioBuf[i] = 0;
 }
 
 // Check if audio is currently playing
