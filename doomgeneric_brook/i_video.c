@@ -190,8 +190,12 @@ void I_InitGraphics (void)
     int i;
 
 	memset(&s_Fb, 0, sizeof(struct FB_ScreenInfo));
-	s_Fb.xres = DOOMGENERIC_RESX;
-	s_Fb.yres = DOOMGENERIC_RESY;
+
+	// Use actual VFB dimensions from DG_Init, not DOOMGENERIC_RESX/RESY.
+	// The WM handles scaling — we write at native VFB resolution.
+	extern unsigned int DG_FbWidth, DG_FbHeight;
+	s_Fb.xres = (DG_FbWidth > 0) ? DG_FbWidth : DOOMGENERIC_RESX;
+	s_Fb.yres = (DG_FbHeight > 0) ? DG_FbHeight : DOOMGENERIC_RESY;
 	s_Fb.xres_virtual = s_Fb.xres;
 	s_Fb.yres_virtual = s_Fb.yres;
 	s_Fb.bits_per_pixel = 32;

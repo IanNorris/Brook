@@ -1596,8 +1596,8 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         for (uint64_t p = 0; p < pages; ++p)
             zeroUserPage(vaddr + p * 4096);
 
-        // Log large mmap allocations with physical pages for DMA overlap debugging
-        if (pages >= 256) { // 1MB+
+        // Log large mmap allocations for debugging
+        if (pages >= 32) {
             PhysicalAddress firstPhys = VmmVirtToPhys(proc->pageTable,
                                                        VirtualAddress(vaddr));
             PhysicalAddress lastPhys = VmmVirtToPhys(proc->pageTable,
@@ -1658,8 +1658,9 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             }
         }
 
-        DbgPrintf("sys_mmap: fb mapped %lu pages at virt 0x%lx (%s, vfb=%ux%u)\n",
-                     pages, vaddr,
+        SerialPrintf("sys_mmap: fb mapped %lu pages at virt 0x%lx..0x%lx pid=%u (%s, vfb=%ux%u)\n",
+                     pages, vaddr, vaddr + pages * 4096 - 1,
+                     proc->pid,
                      useVirtFb ? "virtual" : "physical",
                      proc->fbVfbWidth, proc->fbVfbHeight);
         return static_cast<int64_t>(vaddr);
