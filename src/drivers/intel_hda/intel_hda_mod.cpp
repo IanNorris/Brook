@@ -639,15 +639,17 @@ static void StopOutputStream()
 // Public API: play PCM audio
 // ---------------------------------------------------------------------------
 
+// Double-buffer write cursor: offset within the current write half
+static uint32_t  g_writeOffset = 0;
+
 // Play PCM samples through the HDA output using double-buffered DMA.
-// The stream runs continuously with two BDL entries (A and B).
-// We fill whichever half isn't currently playing, then wait if needed.
+// Accumulates data into the inactive half-buffer. When a half is full,
+// switches to the other half (waiting for DMA to vacate it first).
 extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
                            uint32_t sampleRate, uint8_t channels,
                            uint8_t bitsPerSample)
 {
     if (!g_initialized || !g_dacNid) return -1;
-    if (byteCount > HALF_BUF_SIZE) byteCount = HALF_BUF_SIZE;
 
     uint32_t sdBase = g_outStreamBase;
 
@@ -662,44 +664,59 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
         if (g_streamRunning) StopOutputStream();
         g_streamRunning = false;
         SetupOutputStream(sampleRate, channels, bitsPerSample);
+        g_writeOffset = 0;
     }
 
-    // Determine which half to write to
-    uint32_t writeIdx = g_writeHalf;
-    uint8_t* dst = g_audioBuf + (writeIdx * HALF_BUF_SIZE);
+    const uint8_t* src = static_cast<const uint8_t*>(samples);
+    uint32_t totalWritten = 0;
 
-    // If stream is running, wait until DMA moves out of our write half.
-    // LPIB < HALF_BUF_SIZE means DMA is in half 0, >= means half 1.
-    if (g_streamRunning)
+    while (totalWritten < byteCount)
     {
-        for (int i = 0; i < 50000000; i++)
+        uint32_t writeIdx = g_writeHalf;
+        uint8_t* dst = g_audioBuf + (writeIdx * HALF_BUF_SIZE);
+
+        // If stream is running, make sure DMA isn't playing our write half
+        if (g_streamRunning)
         {
-            uint32_t lpib = hda_read32(sdBase + SD_LPIB);
-            uint32_t playHalf = (lpib >= HALF_BUF_SIZE) ? 1 : 0;
-            if (playHalf != writeIdx) break;
-            __asm__ volatile("pause");
+            for (int i = 0; i < 50000000; i++)
+            {
+                uint32_t lpib = hda_read32(sdBase + SD_LPIB);
+                uint32_t playHalf = (lpib >= HALF_BUF_SIZE) ? 1 : 0;
+                if (playHalf != writeIdx) break;
+                __asm__ volatile("pause");
+            }
+        }
+
+        // Fill remainder of current half
+        uint32_t space = HALF_BUF_SIZE - g_writeOffset;
+        uint32_t chunk = byteCount - totalWritten;
+        if (chunk > space) chunk = space;
+
+        for (uint32_t i = 0; i < chunk; i++)
+            dst[g_writeOffset + i] = src[totalWritten + i];
+        g_writeOffset += chunk;
+        totalWritten += chunk;
+
+        // If half is full, zero-pad (shouldn't need it) and switch
+        if (g_writeOffset >= HALF_BUF_SIZE)
+        {
+            g_writeHalf = 1 - writeIdx;
+            g_writeOffset = 0;
+
+            // Start stream after first half is filled
+            if (!g_streamRunning)
+            {
+                // Zero the other half so it plays silence until filled
+                uint8_t* other = g_audioBuf + ((1 - writeIdx) * HALF_BUF_SIZE);
+                for (uint32_t i = 0; i < HALF_BUF_SIZE; i++)
+                    other[i] = 0;
+                StartOutputStream();
+                g_streamRunning = true;
+            }
         }
     }
 
-    // Copy data into our half
-    const uint8_t* src = static_cast<const uint8_t*>(samples);
-    for (uint32_t i = 0; i < byteCount; i++)
-        dst[i] = src[i];
-    // Zero-pad the rest of the half so we don't replay stale data
-    for (uint32_t i = byteCount; i < HALF_BUF_SIZE; i++)
-        dst[i] = 0;
-
-    g_halfFilled[writeIdx] = byteCount;
-    g_writeHalf = 1 - writeIdx; // alternate for next call
-
-    // Start stream on first buffer (fill half 0, start, next call fills half 1)
-    if (!g_streamRunning)
-    {
-        StartOutputStream();
-        g_streamRunning = true;
-    }
-
-    return static_cast<int>(byteCount);
+    return static_cast<int>(totalWritten);
 }
 
 // Stop audio playback
