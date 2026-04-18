@@ -8,7 +8,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 DISK_IMG="${BROOK_EXT2_DISK:-${ROOT_DIR}/brook_ext2_disk.img}"
-SIZE_MB="${1:-256}"
+SIZE_MB="${1:-2048}"
 
 if [ -f "${DISK_IMG}" ]; then
     echo "Disk image already exists at ${DISK_IMG}"
