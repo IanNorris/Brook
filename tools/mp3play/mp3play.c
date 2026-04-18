@@ -11,8 +11,17 @@
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+
+static volatile int g_quit = 0;
+
+static void sighandler(int sig)
+{
+    (void)sig;
+    g_quit = 1;
+}
 
 #define MINIMP3_IMPLEMENTATION
 #include "minimp3.h"
@@ -36,6 +45,9 @@ int main(int argc, char **argv)
     }
 
     const char *path = argv[1];
+
+    signal(SIGINT, sighandler);
+    signal(SIGTERM, sighandler);
 
     // Read entire MP3 file into memory
     int fd = open(path, O_RDONLY);
@@ -117,14 +129,15 @@ int main(int argc, char **argv)
 
     // Write the first decoded frame
     if (samples > 0) {
-        write(dsp_fd, pcm, (size_t)(samples * channels * sizeof(short)));
+        ssize_t w = write(dsp_fd, pcm, (size_t)(samples * channels * sizeof(short)));
+        if (w < 0) { close(dsp_fd); free(mp3_data); return 1; }
     }
 
     // Decode and play remaining frames
     size_t offset = (size_t)info.frame_bytes;
     unsigned long total_samples = (unsigned long)samples;
 
-    while (offset < total_read) {
+    while (offset < total_read && !g_quit) {
         samples = mp3dec_decode_frame(&mp3d, mp3_data + offset,
                                        (int)(total_read - offset),
                                        pcm, &info);
@@ -136,7 +149,8 @@ int main(int argc, char **argv)
 
         if (samples > 0) {
             size_t bytes = (size_t)(samples * channels * sizeof(short));
-            write(dsp_fd, pcm, bytes);
+            ssize_t w = write(dsp_fd, pcm, bytes);
+            if (w < 0) break;
             total_samples += (unsigned long)samples;
         }
     }

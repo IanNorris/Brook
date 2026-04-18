@@ -6447,6 +6447,37 @@ static int64_t SyscallDispatchTraced(uint64_t num, uint64_t a0, uint64_t a1,
     Process* proc = ProcessCurrent();
     const char* name = SyscallName(num);
 
+    // Rate-limit: suppress repeated identical error syscalls to prevent
+    // stack/serial flood (e.g. writes to a closed fd in a tight loop).
+    static uint64_t s_lastNum   = ~0ULL;
+    static uint64_t s_lastA0    = 0;
+    static int64_t  s_lastRet   = 0;
+    static uint32_t s_suppressed = 0;
+    static constexpr uint32_t SUPPRESS_THRESHOLD = 3;
+
+    int64_t ret = g_syscallTable[num](a0, a1, a2, a3, a4, a5);
+
+    bool isError = (ret < 0 && ret > -4096);
+    bool isRepeat = (num == s_lastNum && a0 == s_lastA0 && ret == s_lastRet && isError);
+
+    if (isRepeat) {
+        s_suppressed++;
+        if (s_suppressed == SUPPRESS_THRESHOLD)
+            SerialPrintf("[strace:%u] ... suppressing repeated %s(%lu) = -%lu\n",
+                         proc->pid, name ? name : "?", a0, -ret);
+        if (s_suppressed >= SUPPRESS_THRESHOLD)
+            return ret;
+    } else {
+        if (s_suppressed > SUPPRESS_THRESHOLD)
+            SerialPrintf("[strace:%u] ... (%u identical errors suppressed)\n",
+                         proc->pid, s_suppressed - SUPPRESS_THRESHOLD);
+        s_suppressed = 0;
+    }
+
+    s_lastNum = num;
+    s_lastA0  = a0;
+    s_lastRet = ret;
+
     // Log entry — format depends on syscall type for readability
     if (num == SYS_OPEN || num == SYS_OPENAT) {
         const char* path = (num == SYS_OPENAT)
@@ -6483,8 +6514,6 @@ static int64_t SyscallDispatchTraced(uint64_t num, uint64_t a0, uint64_t a1,
         SerialPrintf("[strace:%u] syscall_%lu(0x%lx, 0x%lx, 0x%lx)",
                      proc->pid, num, a0, a1, a2);
     }
-
-    int64_t ret = g_syscallTable[num](a0, a1, a2, a3, a4, a5);
 
     // Log return value
     if (ret < 0 && ret > -4096)
