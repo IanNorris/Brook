@@ -99,15 +99,25 @@ fi
 # Quake 2
 Q2_BIN="${ROOT_DIR}/build/quake2/quake2"
 Q2_PAK="/workspace/q2demo/Install/Data/baseq2/pak0.pak"
+Q2_MUSIC="/workspace/q2ost"
 if [ -f "${Q2_BIN}" ]; then
-    write_file "${Q2_BIN}" "bin/quake2"
     debugfs -w "${DISK_IMG}" <<'MKDIRS' 2>/dev/null
 mkdir games
 mkdir games/quake2
 mkdir games/quake2/baseq2
+mkdir games/quake2/baseq2/music
 MKDIRS
+    write_file "${Q2_BIN}" "games/quake2/quake2"
     if [ -f "${Q2_PAK}" ]; then
         write_file "${Q2_PAK}" "games/quake2/baseq2/pak0.pak"
+    fi
+    # OGG music tracks
+    if [ -d "${Q2_MUSIC}" ]; then
+        for ogg in "${Q2_MUSIC}"/*.ogg; do
+            [ -f "$ogg" ] || continue
+            name=$(basename "$ogg")
+            write_file "$ogg" "games/quake2/baseq2/music/${name}"
+        done
     fi
 fi
 

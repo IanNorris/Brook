@@ -55,7 +55,7 @@ r_polyse.c r_rast.c r_scan.c r_sprite.c r_surf.c
 # Brook platform layer
 BROOK_SRCS="
 sys_brook.c vid_brook.c swimp_brook.c in_brook.c snd_brook.c
-net_brook.c q_shbrook.c cd_null.c glob.c
+net_brook.c q_shbrook.c cd_brook.c stb_vorbis_impl.c glob.c
 "
 
 ALL_SRCS="$CLIENT_SRCS $COMMON_SRCS $SERVER_SRCS $GAME_SRCS $REFSOFT_SRCS $BROOK_SRCS"
