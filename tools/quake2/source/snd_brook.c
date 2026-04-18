@@ -94,31 +94,14 @@ void SNDDMA_BeginPainting(void)
 
 void SNDDMA_Submit(void)
 {
-    if (!snd_inited || audio_fd < 0)
+    // SFX temporarily disabled — testing CD music path only
+    if (!snd_inited)
         return;
 
+    // Advance submit_pos so Quake's mixer doesn't stall thinking
+    // the buffer is full, but don't actually write anything.
     extern int paintedtime;
     int new_samples = (paintedtime - (submit_pos / dma.channels)) * dma.channels;
-    if (new_samples <= 0)
-        return;
-
-    int sample_bytes = dma.samplebits / 8;
-    int buf_len = dma.samples * sample_bytes;
-    int pos = (submit_pos * sample_bytes) & (buf_len - 1);
-    int total_bytes = new_samples * sample_bytes;
-
-    while (total_bytes > 0)
-    {
-        int chunk = buf_len - pos;
-        if (chunk > total_bytes)
-            chunk = total_bytes;
-
-        ssize_t w = write(audio_fd, dma_buffer + pos, chunk);
-        if (w < 0)
-            break;
-
-        pos = (pos + w) & (buf_len - 1);
-        total_bytes -= w;
-        submit_pos += w / sample_bytes;
-    }
+    if (new_samples > 0)
+        submit_pos += new_samples;
 }
