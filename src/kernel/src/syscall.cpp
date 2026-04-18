@@ -1227,12 +1227,8 @@ static int64_t sys_close(uint64_t fd, uint64_t, uint64_t,
     if (fde->type == FdType::DevDsp && fde->handle)
     {
         auto* dsp = static_cast<DspState*>(fde->handle);
-        // Flush any remaining buffered audio
-        if (dsp->bufferOffset > 0)
-        {
-            AudioPlay(dsp->buffer, dsp->bufferOffset,
-                      dsp->sampleRate, dsp->channels, dsp->bitsPerSample);
-        }
+        // Stop any in-flight playback — don't block on flush during teardown
+        AudioStop();
         kfree(dsp->buffer);
         kfree(dsp);
     }

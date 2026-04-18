@@ -636,11 +636,7 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
             if (!(hda_read32(sdBase + SD_CTL) & SD_CTL_RUN)) break;
             __asm__ volatile("pause");
         }
-        StopOutputStream();
     }
-
-    // Clear completion status
-    hda_write8(sdBase + SD_STS, SD_STS_BCIS | SD_STS_FIFOE | SD_STS_DESE);
 
     // Full stream setup only on first call or format change
     bool needSetup = !g_streamConfigured ||
@@ -648,25 +644,26 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
                      channels != g_curChannels ||
                      bitsPerSample != g_curBits;
 
-    if (needSetup)
-        SetupOutputStream(sampleRate, channels, bitsPerSample);
-
-    // Copy audio data to DMA buffer
+    // Copy audio data to DMA buffer while stream may still be looping
+    // (the old buffer data is fine — we overwrite completely)
     const uint8_t* src = static_cast<const uint8_t*>(samples);
     for (uint32_t i = 0; i < byteCount; i++)
         g_audioBuf[i] = src[i];
-
-    // Zero remaining buffer
     for (uint32_t i = byteCount; i < AUDIO_BUF_SIZE; i++)
         g_audioBuf[i] = 0;
 
-    // Update BDL entry and cyclic buffer length
+    // Now stop, update CBL, and restart — minimize the silent gap
+    StopOutputStream();
+    hda_write8(sdBase + SD_STS, SD_STS_BCIS | SD_STS_FIFOE | SD_STS_DESE);
+
+    if (needSetup)
+        SetupOutputStream(sampleRate, channels, bitsPerSample);
+
     g_bdl[0].addr   = g_audioBufPhys;
     g_bdl[0].length = byteCount;
     g_bdl[0].ioc    = 1;
     hda_write32(sdBase + SD_CBL, byteCount);
 
-    // Start stream
     StartOutputStream();
 
     return static_cast<int>(byteCount);
