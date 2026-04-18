@@ -40,8 +40,10 @@ static qboolean       cd_looping = false;
 static qboolean       cd_playing = false;
 static int            cd_track   = 0;
 
-/* Decode buffer: ~4096 stereo frames per chunk */
-#define CD_FRAMES_PER_CHUNK  4096
+/* Decode buffer: ~1 game-frame of audio per CDAudio_Update call.
+ * At 44100 Hz and ~30fps, that's ~1470 frames.  Larger values cause
+ * the write() to block (ring buffer fills), stalling the game loop. */
+#define CD_FRAMES_PER_CHUNK  1470
 static short cd_pcm[CD_FRAMES_PER_CHUNK * 2]; /* stereo interleaved */
 
 /* ---- helpers ---- */
@@ -196,11 +198,5 @@ void CDAudio_Update(void)
     }
 
     int bytes = frames * 2 * sizeof(short); /* stereo 16-bit */
-    int written = 0;
-    while (written < bytes)
-    {
-        ssize_t w = write(cd_fd, (char *)cd_pcm + written, bytes - written);
-        if (w <= 0) break;
-        written += (int)w;
-    }
+    write(cd_fd, cd_pcm, bytes);  /* single write; don't loop/block */
 }
