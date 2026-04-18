@@ -229,6 +229,7 @@ static uint32_t g_curRate = 0;
 static uint8_t  g_curChannels = 0;
 static uint8_t  g_curBits = 0;
 static bool     g_streamConfigured = false;
+static volatile bool g_stopping = false;   // set by HdaStop to break wait loops
 
 // ---------------------------------------------------------------------------
 // Busy-wait helper
@@ -634,13 +635,14 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
                      channels != g_curChannels ||
                      bitsPerSample != g_curBits;
 
-    // Wait for previous buffer to finish (~50ms cap).
+    // Wait for previous buffer to complete (blocks up to buffer duration).
     // DOOM: 2048 bytes @ 11025Hz stereo 16-bit = ~46ms
     // mp3play: ~4608 bytes @ 44100Hz stereo 16-bit = ~26ms
     if (hda_read32(sdBase + SD_CTL) & SD_CTL_RUN)
     {
-        for (int i = 0; i < 1000000; i++)
+        for (int i = 0; i < 50000000; i++)
         {
+            if (g_stopping) return -1;
             if (hda_read8(sdBase + SD_STS) & SD_STS_BCIS) break;
             if (!(hda_read32(sdBase + SD_CTL) & SD_CTL_RUN)) break;
             __asm__ volatile("pause");
@@ -675,7 +677,9 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
 extern "C" void HdaStop()
 {
     if (!g_initialized) return;
+    g_stopping = true;          // break any active HdaPlayPcm wait loop
     StopOutputStream();
+    g_stopping = false;
 }
 
 // Check if audio is currently playing
