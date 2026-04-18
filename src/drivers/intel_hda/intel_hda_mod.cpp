@@ -214,6 +214,7 @@ static constexpr uint32_t NUM_FRAGMENTS   = 16;         // BDL entries
 static constexpr uint32_t FRAG_SIZE       = AUDIO_BUF_SIZE / NUM_FRAGMENTS; // 4KB each
 static uint8_t*  g_audioBuf = nullptr;
 static uint64_t  g_audioBufPhys = 0;
+static uint64_t  g_fragPhys[NUM_FRAGMENTS]; // per-fragment physical addresses
 
 // Ring buffer state
 static uint32_t  g_writeFrag = 0;      // which fragment to write next
@@ -592,7 +593,7 @@ static bool SetupOutputStream(uint32_t sampleRate, uint8_t channels, uint8_t bit
     // Set up ring buffer: NUM_FRAGMENTS BDL entries, each FRAG_SIZE bytes
     for (uint32_t i = 0; i < NUM_FRAGMENTS; i++)
     {
-        g_bdl[i].addr   = g_audioBufPhys + (i * FRAG_SIZE);
+        g_bdl[i].addr   = g_fragPhys[i];
         g_bdl[i].length = FRAG_SIZE;
         g_bdl[i].ioc    = 1;  // interrupt on every fragment completion
     }
@@ -651,6 +652,17 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
     if (!g_initialized || !g_dacNid) return -1;
 
     uint32_t sdBase = g_outStreamBase;
+
+    static int hda_call_count = 0;
+    hda_call_count++;
+    if ((hda_call_count % 50) == 1) {
+        uint32_t lpib = hda_read32(sdBase + SD_LPIB);
+        uint32_t ctl = hda_read32(sdBase + SD_CTL);
+        uint32_t sts = hda_read8(sdBase + SD_STS);
+        SerialPrintf("HdaPlayPcm #%d: %u bytes rate=%u wFrag=%u wOff=%u LPIB=%u CTL=0x%x STS=0x%x running=%d\n",
+                     hda_call_count, byteCount, sampleRate, g_writeFrag, g_writeOffset,
+                     lpib, ctl, sts, g_streamRunning ? 1 : 0);
+    }
 
     // Full stream setup on first call or format change
     bool needSetup = !g_streamConfigured ||
@@ -853,9 +865,15 @@ static int IntelHdaInit()
     g_audioBuf = reinterpret_cast<uint8_t*>(audioBufAddr.raw());
     g_audioBufPhys = VmmVirtToPhys(KernelPageTable, audioBufAddr).raw();
 
-    SerialPrintf("intel_hda: DMA BDL phys=0x%lx audio phys=0x%lx..0x%lx (%u pages)\n",
-                 g_bdlPhys, g_audioBufPhys,
-                 g_audioBufPhys + AUDIO_BUF_SIZE - 1, audioPages);
+    // Resolve per-fragment physical addresses (pages may not be contiguous)
+    for (uint32_t i = 0; i < NUM_FRAGMENTS; i++)
+    {
+        VirtualAddress fragVa(audioBufAddr.raw() + i * FRAG_SIZE);
+        g_fragPhys[i] = VmmVirtToPhys(KernelPageTable, fragVa).raw();
+    }
+
+    SerialPrintf("intel_hda: DMA BDL phys=0x%lx audio frag0=0x%lx frag1=0x%lx (%u pages)\n",
+                 g_bdlPhys, g_fragPhys[0], g_fragPhys[1], audioPages);
 
     // Enable interrupts (global + controller + output stream 0)
     hda_write32(INTCTL, INTCTL_GIE | INTCTL_CIE |

@@ -134,6 +134,14 @@ if [ -f "$mp3play_bin" ]; then
     sync_file "$mp3play_bin" "BIN/MP3PLAY"
 fi
 
+# --- sinetest tool ---
+sinetest_bin="${ROOT_DIR}/tools/sinetest/sinetest"
+if [ -f "$sinetest_bin" ]; then
+    echo "Sine test:"
+    mmd -D s -i "${DISK_IMG}" "::BIN" 2>/dev/null || true
+    sync_file "$sinetest_bin" "BIN/SINETEST"
+fi
+
 # --- nix-install tool ---
 nix_install_bin="${ROOT_DIR}/tools/nix-install/nix-install"
 if [ -f "$nix_install_bin" ]; then

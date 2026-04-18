@@ -798,7 +798,16 @@ static void MixAndWrite(void)
     }
 
     if (dsp_fd >= 0) {
-        write(dsp_fd, outbuf, sizeof(outbuf));
+        static int mix_count = 0;
+        mix_count++;
+        if ((mix_count % 100) == 1) {
+            fprintf(stderr, "MixAndWrite #%d: %d bytes, fd=%d\n",
+                    mix_count, (int)sizeof(outbuf), dsp_fd);
+        }
+        ssize_t ret = write(dsp_fd, outbuf, sizeof(outbuf));
+        if (ret < 0 && (mix_count % 100) == 2) {
+            fprintf(stderr, "MixAndWrite: write failed ret=%d\n", (int)ret);
+        }
     }
 }
 
