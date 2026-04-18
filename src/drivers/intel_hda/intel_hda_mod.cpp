@@ -208,15 +208,16 @@ struct __attribute__((packed)) BdlEntry {
 static BdlEntry* g_bdl = nullptr;
 static uint64_t  g_bdlPhys = 0;
 
-// Audio buffer — split into two halves for double-buffering
-static constexpr uint32_t AUDIO_BUF_SIZE = 64 * 1024; // 64KB total
-static constexpr uint32_t HALF_BUF_SIZE  = AUDIO_BUF_SIZE / 2; // 32KB per half
+// Audio buffer — split into N fragments for ring-buffered DMA
+static constexpr uint32_t AUDIO_BUF_SIZE  = 64 * 1024; // 64KB total
+static constexpr uint32_t NUM_FRAGMENTS   = 16;         // BDL entries
+static constexpr uint32_t FRAG_SIZE       = AUDIO_BUF_SIZE / NUM_FRAGMENTS; // 4KB each
 static uint8_t*  g_audioBuf = nullptr;
 static uint64_t  g_audioBufPhys = 0;
 
-// Double-buffer state
-static uint32_t  g_writeHalf = 0;      // which half (0 or 1) to write next
-static uint32_t  g_halfFilled[2] = {}; // bytes of real data in each half
+// Ring buffer state
+static uint32_t  g_writeFrag = 0;      // which fragment to write next
+static uint32_t  g_writeOffset = 0;    // offset within current fragment
 static bool      g_streamRunning = false;
 
 // Output stream descriptor offset (depends on GCAP)
@@ -588,24 +589,23 @@ static bool SetupOutputStream(uint32_t sampleRate, uint8_t channels, uint8_t bit
     hda_write32(sdBase + SD_BDLPL, static_cast<uint32_t>(g_bdlPhys));
     hda_write32(sdBase + SD_BDLPU, static_cast<uint32_t>(g_bdlPhys >> 32));
 
-    // Two BDL entries: half A and half B, both with IOC
-    g_bdl[0].addr   = g_audioBufPhys;
-    g_bdl[0].length = HALF_BUF_SIZE;
-    g_bdl[0].ioc    = 1;
-    g_bdl[1].addr   = g_audioBufPhys + HALF_BUF_SIZE;
-    g_bdl[1].length = HALF_BUF_SIZE;
-    g_bdl[1].ioc    = 1;
+    // Set up ring buffer: NUM_FRAGMENTS BDL entries, each FRAG_SIZE bytes
+    for (uint32_t i = 0; i < NUM_FRAGMENTS; i++)
+    {
+        g_bdl[i].addr   = g_audioBufPhys + (i * FRAG_SIZE);
+        g_bdl[i].length = FRAG_SIZE;
+        g_bdl[i].ioc    = 1;  // interrupt on every fragment completion
+    }
 
-    // LVI = 1 (two entries: 0 and 1), CBL = total size
-    hda_write16(sdBase + SD_LVI, 1);
+    // LVI = last valid index, CBL = total ring size
+    hda_write16(sdBase + SD_LVI, NUM_FRAGMENTS - 1);
     hda_write32(sdBase + SD_CBL, AUDIO_BUF_SIZE);
 
-    // Zero both halves
+    // Zero entire buffer
     for (uint32_t i = 0; i < AUDIO_BUF_SIZE; i++)
         g_audioBuf[i] = 0;
-    g_halfFilled[0] = 0;
-    g_halfFilled[1] = 0;
-    g_writeHalf = 0;
+    g_writeFrag = 0;
+    g_writeOffset = 0;
 
     // Record current format
     g_curRate = sampleRate;
@@ -639,12 +639,11 @@ static void StopOutputStream()
 // Public API: play PCM audio
 // ---------------------------------------------------------------------------
 
-// Double-buffer write cursor: offset within the current write half
-static uint32_t  g_writeOffset = 0;
-
-// Play PCM samples through the HDA output using double-buffered DMA.
-// Two BDL entries with IOC — DMA plays A→B→A→B automatically.
-// BCIS fires when each entry completes, signaling us to refill it.
+// Play PCM samples through the HDA output using ring-buffered DMA.
+// 16 BDL entries of 4KB each, all with IOC. DMA cycles through them.
+// We accumulate writes into the current fragment and advance when full.
+// BCIS fires on each fragment completion — we use it to pace writes
+// so we don't overwrite data DMA is still playing.
 extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
                            uint32_t sampleRate, uint8_t channels,
                            uint8_t bitsPerSample)
@@ -665,7 +664,7 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
         g_streamRunning = false;
         SetupOutputStream(sampleRate, channels, bitsPerSample);
         g_writeOffset = 0;
-        g_writeHalf = 0;
+        g_writeFrag = 0;
     }
 
     const uint8_t* src = static_cast<const uint8_t*>(samples);
@@ -673,10 +672,10 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
 
     while (totalWritten < byteCount)
     {
-        uint8_t* dst = g_audioBuf + (g_writeHalf * HALF_BUF_SIZE);
+        uint8_t* dst = g_audioBuf + (g_writeFrag * FRAG_SIZE);
 
-        // Fill remainder of current half
-        uint32_t space = HALF_BUF_SIZE - g_writeOffset;
+        // Fill remainder of current fragment
+        uint32_t space = FRAG_SIZE - g_writeOffset;
         uint32_t chunk = byteCount - totalWritten;
         if (chunk > space) chunk = space;
 
@@ -685,31 +684,38 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
         g_writeOffset += chunk;
         totalWritten += chunk;
 
-        // Half is full — switch to the other half
-        if (g_writeOffset >= HALF_BUF_SIZE)
+        // Fragment is full — advance to next
+        if (g_writeOffset >= FRAG_SIZE)
         {
+            uint32_t nextFrag = (g_writeFrag + 1) % NUM_FRAGMENTS;
+
             if (!g_streamRunning)
             {
-                // First half filled — zero the other half and start DMA
-                uint8_t* other = g_audioBuf + ((1 - g_writeHalf) * HALF_BUF_SIZE);
-                for (uint32_t i = 0; i < HALF_BUF_SIZE; i++)
-                    other[i] = 0;
-                StartOutputStream();
-                g_streamRunning = true;
-            }
-            else
-            {
-                // Wait for DMA to finish the half we're about to write.
-                // Clear BCIS, then wait for it — means one BDL entry completed.
-                hda_write8(sdBase + SD_STS, SD_STS_BCIS);
-                for (int i = 0; i < 50000000; i++)
+                // Pre-fill at least 2 fragments before starting DMA
+                g_writeFrag = nextFrag;
+                g_writeOffset = 0;
+
+                if (nextFrag >= 2)
                 {
-                    if (hda_read8(sdBase + SD_STS) & SD_STS_BCIS) break;
-                    __asm__ volatile("pause");
+                    StartOutputStream();
+                    g_streamRunning = true;
                 }
+                continue;
             }
 
-            g_writeHalf = 1 - g_writeHalf;
+            // Wait for DMA to move past the fragment we're about to write.
+            // Each BCIS means one fragment completed. Wait until DMA is
+            // not in our target fragment.
+            for (int i = 0; i < 50000000; i++)
+            {
+                uint32_t lpib = hda_read32(sdBase + SD_LPIB);
+                uint32_t playFrag = lpib / FRAG_SIZE;
+                if (playFrag >= NUM_FRAGMENTS) playFrag = NUM_FRAGMENTS - 1;
+                if (playFrag != nextFrag) break;
+                __asm__ volatile("pause");
+            }
+
+            g_writeFrag = nextFrag;
             g_writeOffset = 0;
         }
     }
