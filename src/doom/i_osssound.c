@@ -34,6 +34,7 @@
 #include "opl3.h"
 
 // OSS ioctl definitions (Linux)
+#define SNDCTL_DSP_RESET      0x5000
 #define SNDCTL_DSP_SPEED      0xC0045002
 #define SNDCTL_DSP_SETFMT     0xC0045005
 #define SNDCTL_DSP_CHANNELS   0xC0045006
@@ -1338,17 +1339,29 @@ static void I_OSS_PlaySong(void *handle, boolean looping)
     // Stop any current playback
     midi_state.playing = 0;
 
-    // Release all OPL voices
-    for (int ch = 0; ch < 16; ch++)
-        OplAllNotesOff(ch);
+    // Flush the HDA ring buffer so old audio doesn't bleed through
+    if (dsp_fd >= 0)
+        ioctl(dsp_fd, SNDCTL_DSP_RESET, NULL);
 
-    // Re-initialize OPL registers for a clean start
+    // Full OPL3 chip reset (clears all internal state: envelopes, phases, etc.)
+    OPL3_Reset(&opl_chip, MIX_FREQ);
     OplInitRegisters();
     OplInitVoices();
 
     // Reset channel state
     for (int i = 0; i < 16; i++)
         OplInitChannel(&opl_channels[i]);
+
+    // Re-configure DSP after reset
+    if (dsp_fd >= 0) {
+        int val;
+        val = AFMT_S16_LE;
+        ioctl(dsp_fd, SNDCTL_DSP_SETFMT, &val);
+        val = 2;
+        ioctl(dsp_fd, SNDCTL_DSP_CHANNELS, &val);
+        val = MIX_FREQ;
+        ioctl(dsp_fd, SNDCTL_DSP_SPEED, &val);
+    }
 
     if (!MidiParseSong(&midi_state, song->midi_data, song->midi_len)) {
         fprintf(stderr, "I_OSS_PlaySong: failed to parse MIDI\n");
