@@ -177,19 +177,6 @@ static void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interrupted
     {
         g_lapicTickCount++;
 
-        // Heartbeat: every 5000ms, print a one-line status to serial.
-        // Bypasses the serial lock to avoid deadlock (we're in an ISR).
-        // This is the primary livelock detector.
-        if ((g_lapicTickCount & 0xFFF) == 0)  // every ~4096ms
-        {
-            // Quick, lockless diagnostic — just output a few chars directly.
-            // Acceptable to race with other serial output.
-            const char* msg = "HEARTBEAT\r\n";
-            while (*msg) {
-                while ((inb(0x3FD) & 0x20) == 0) {}
-                outb(0x3F8, static_cast<uint8_t>(*msg++));
-            }
-        }
     }
 
     // Record a profiler sample (fast no-op when profiling is disabled).
