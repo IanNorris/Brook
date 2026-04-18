@@ -633,18 +633,19 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
     uint32_t sdBase = g_outStreamBase;
     if (hda_read32(sdBase + SD_CTL) & SD_CTL_RUN)
     {
-        // Poll until stream finishes (LPIB reaches CBL) or timeout
-        uint32_t cbl = hda_read32(sdBase + SD_CBL);
-        for (int i = 0; i < 500000; i++)
+        // Poll for BCIS (Buffer Completion Interrupt Status) — set when
+        // the IOC BDL entry finishes. This is reliable because BCIS
+        // latches even though LPIB wraps in a cyclic buffer.
+        for (int i = 0; i < 2000000; i++)
         {
-            uint32_t pos = hda_read32(sdBase + SD_LPIB);
-            if (pos >= cbl) break;
-            // Also check if stream stopped
+            if (hda_read8(sdBase + SD_STS) & SD_STS_BCIS) break;
             if (!(hda_read32(sdBase + SD_CTL) & SD_CTL_RUN)) break;
             __asm__ volatile("pause");
         }
         // Stop the stream before reconfiguring
         StopOutputStream();
+        // Clear completion status
+        hda_write8(sdBase + SD_STS, SD_STS_BCIS);
     }
 
     // Copy audio data to DMA buffer
