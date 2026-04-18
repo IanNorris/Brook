@@ -11,6 +11,7 @@
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
 
 static int kb_fd = -1;
 static int mouse_fd = -1;
@@ -81,12 +82,16 @@ static int scancode_to_q2key(unsigned char sc)
 
 void IN_Init(void)
 {
-    kb_fd = open("/dev/keyboard", O_RDONLY | O_NONBLOCK);
-    if (kb_fd < 0)
+    kb_fd = open("/dev/keyboard", O_RDONLY);
+    if (kb_fd >= 0)
+        ioctl(kb_fd, 1, (void *)1); /* non-blocking raw scancode mode */
+    else
         Com_Printf("IN_Init: can't open /dev/keyboard\n");
 
-    mouse_fd = open("/dev/mouse", O_RDONLY | O_NONBLOCK);
-    if (mouse_fd < 0)
+    mouse_fd = open("/dev/mouse", O_RDONLY);
+    if (mouse_fd >= 0)
+        ioctl(mouse_fd, 1, (void *)1); /* non-blocking mode */
+    else
         Com_Printf("IN_Init: can't open /dev/mouse\n");
 
     mouse_active = 1;
