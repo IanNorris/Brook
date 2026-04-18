@@ -213,6 +213,15 @@ void QG_Init(void)
 
 void QG_Quit(void)
 {
+    if (fb_pixels && fb_pixels != (void *)-1)
+    {
+        unsigned long screensize = screen_w * screen_h * 4;
+        munmap(fb_pixels, screensize);
+        fb_pixels = NULL;
+    }
+    if (fb_fd >= 0) { close(fb_fd); fb_fd = -1; }
+    if (kb_fd >= 0) { close(kb_fd); kb_fd = -1; }
+    if (mouse_fd >= 0) { close(mouse_fd); mouse_fd = -1; }
 }
 
 void QG_SetPalette(unsigned char palette[768])
