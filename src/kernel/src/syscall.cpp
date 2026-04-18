@@ -243,6 +243,7 @@ struct DspState {
 static constexpr uint32_t DSP_DEFAULT_RATE     = 48000;
 static constexpr uint8_t  DSP_DEFAULT_CHANNELS = 1;
 static constexpr uint8_t  DSP_DEFAULT_BITS     = 8;
+static constexpr uint32_t DSP_HW_RATE          = 44100; // hardware playback rate
 static constexpr uint32_t DSP_BUFFER_SIZE      = 65536; // 64KB staging buffer
 
 // ---------------------------------------------------------------------------
@@ -318,15 +319,48 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
         return static_cast<int64_t>(count);
 
     // /dev/dsp — pass PCM data directly to audio driver.
-    // The HDA driver accumulates into its double-buffered DMA internally,
-    // so no kernel-side staging buffer is needed.
+    // If the app's sample rate differs from the HW rate, resample by
+    // nearest-neighbour duplication (upsample) or decimation (downsample).
     if (fde->type == FdType::DevDsp && fde->handle)
     {
         auto* dsp = static_cast<DspState*>(fde->handle);
         const uint8_t* src = reinterpret_cast<const uint8_t*>(bufAddr);
+        uint32_t appRate = dsp->sampleRate;
 
-        AudioPlay(src, static_cast<uint32_t>(count),
-                  dsp->sampleRate, dsp->channels, dsp->bitsPerSample);
+        if (appRate == DSP_HW_RATE || appRate == 0)
+        {
+            // No resampling needed
+            AudioPlay(src, static_cast<uint32_t>(count),
+                      DSP_HW_RATE, dsp->channels, dsp->bitsPerSample);
+        }
+        else
+        {
+            // Resample: compute output size
+            uint32_t bytesPerSample = (dsp->bitsPerSample / 8) * dsp->channels;
+            if (bytesPerSample == 0) bytesPerSample = 1;
+            uint32_t inFrames  = static_cast<uint32_t>(count) / bytesPerSample;
+            uint32_t outFrames = (inFrames * DSP_HW_RATE + appRate - 1) / appRate;
+            uint32_t outBytes  = outFrames * bytesPerSample;
+
+            // Use the DSP staging buffer for resampled output
+            if (outBytes > dsp->bufferSize)
+                outBytes = dsp->bufferSize;
+            outFrames = outBytes / bytesPerSample;
+
+            uint8_t* out = dsp->buffer;
+
+            // Nearest-neighbour resample
+            for (uint32_t i = 0; i < outFrames; i++)
+            {
+                uint32_t srcFrame = (uint64_t)i * appRate / DSP_HW_RATE;
+                if (srcFrame >= inFrames) srcFrame = inFrames - 1;
+                __builtin_memcpy(out + i * bytesPerSample,
+                                 src + srcFrame * bytesPerSample,
+                                 bytesPerSample);
+            }
+
+            AudioPlay(out, outBytes, DSP_HW_RATE, dsp->channels, dsp->bitsPerSample);
+        }
 
         return static_cast<int64_t>(count);
     }
