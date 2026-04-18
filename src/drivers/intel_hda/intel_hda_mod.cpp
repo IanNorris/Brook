@@ -643,8 +643,8 @@ static void StopOutputStream()
 static uint32_t  g_writeOffset = 0;
 
 // Play PCM samples through the HDA output using double-buffered DMA.
-// Accumulates data into the inactive half-buffer. When a half is full,
-// switches to the other half (waiting for DMA to vacate it first).
+// Two BDL entries with IOC — DMA plays A→B→A→B automatically.
+// BCIS fires when each entry completes, signaling us to refill it.
 extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
                            uint32_t sampleRate, uint8_t channels,
                            uint8_t bitsPerSample)
@@ -665,6 +665,7 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
         g_streamRunning = false;
         SetupOutputStream(sampleRate, channels, bitsPerSample);
         g_writeOffset = 0;
+        g_writeHalf = 0;
     }
 
     const uint8_t* src = static_cast<const uint8_t*>(samples);
@@ -672,20 +673,7 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
 
     while (totalWritten < byteCount)
     {
-        uint32_t writeIdx = g_writeHalf;
-        uint8_t* dst = g_audioBuf + (writeIdx * HALF_BUF_SIZE);
-
-        // If stream is running, make sure DMA isn't playing our write half
-        if (g_streamRunning)
-        {
-            for (int i = 0; i < 50000000; i++)
-            {
-                uint32_t lpib = hda_read32(sdBase + SD_LPIB);
-                uint32_t playHalf = (lpib >= HALF_BUF_SIZE) ? 1 : 0;
-                if (playHalf != writeIdx) break;
-                __asm__ volatile("pause");
-            }
-        }
+        uint8_t* dst = g_audioBuf + (g_writeHalf * HALF_BUF_SIZE);
 
         // Fill remainder of current half
         uint32_t space = HALF_BUF_SIZE - g_writeOffset;
@@ -697,22 +685,32 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
         g_writeOffset += chunk;
         totalWritten += chunk;
 
-        // If half is full, zero-pad (shouldn't need it) and switch
+        // Half is full — switch to the other half
         if (g_writeOffset >= HALF_BUF_SIZE)
         {
-            g_writeHalf = 1 - writeIdx;
-            g_writeOffset = 0;
-
-            // Start stream after first half is filled
             if (!g_streamRunning)
             {
-                // Zero the other half so it plays silence until filled
-                uint8_t* other = g_audioBuf + ((1 - writeIdx) * HALF_BUF_SIZE);
+                // First half filled — zero the other half and start DMA
+                uint8_t* other = g_audioBuf + ((1 - g_writeHalf) * HALF_BUF_SIZE);
                 for (uint32_t i = 0; i < HALF_BUF_SIZE; i++)
                     other[i] = 0;
                 StartOutputStream();
                 g_streamRunning = true;
             }
+            else
+            {
+                // Wait for DMA to finish the half we're about to write.
+                // Clear BCIS, then wait for it — means one BDL entry completed.
+                hda_write8(sdBase + SD_STS, SD_STS_BCIS);
+                for (int i = 0; i < 50000000; i++)
+                {
+                    if (hda_read8(sdBase + SD_STS) & SD_STS_BCIS) break;
+                    __asm__ volatile("pause");
+                }
+            }
+
+            g_writeHalf = 1 - g_writeHalf;
+            g_writeOffset = 0;
         }
     }
 
