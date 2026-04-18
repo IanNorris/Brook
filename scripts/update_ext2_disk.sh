@@ -96,6 +96,21 @@ fi
 # Wallpaper
 [ -f "${ROOT_DIR}/wallpaper/wallpaper.raw" ] && write_file "${ROOT_DIR}/wallpaper/wallpaper.raw" "wallpaper.raw"
 
+# Quake 2
+Q2_BIN="${ROOT_DIR}/build/quake2/quake2"
+Q2_PAK="/workspace/q2demo/Install/Data/baseq2/pak0.pak"
+if [ -f "${Q2_BIN}" ]; then
+    write_file "${Q2_BIN}" "bin/quake2"
+    debugfs -w "${DISK_IMG}" <<'MKDIRS' 2>/dev/null
+mkdir games
+mkdir games/quake2
+mkdir games/quake2/baseq2
+MKDIRS
+    if [ -f "${Q2_PAK}" ]; then
+        write_file "${Q2_PAK}" "games/quake2/baseq2/pak0.pak"
+    fi
+fi
+
 # TCC
 [ -f "${ROOT_DIR}/tcc_build/tcc" ] && write_file "${ROOT_DIR}/tcc_build/tcc" "bin/tcc"
 

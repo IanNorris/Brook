@@ -1,0 +1,5 @@
+# title: Quake II
+# desc: id Software shooter
+set vfb 640x480
+set scale 1
+run /data/bin/quake2 +set basedir /data/games/quake2
