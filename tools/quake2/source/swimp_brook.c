@@ -156,6 +156,10 @@ void SWimp_EndFrame(void)
             }
         }
     }
+
+    // Signal compositor that a new frame is ready
+    if (fb_fd >= 0)
+        write(fb_fd, "", 1);
 }
 
 void SWimp_Shutdown(void)
