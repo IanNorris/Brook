@@ -14,6 +14,7 @@
 #include "serial.h"
 #include "kprintf.h"
 #include "audio.h"
+#include "scheduler.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "memory/address.h"
@@ -34,6 +35,7 @@ MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 MODULE_IMPORT_SYMBOL(VmmMapPage);
 MODULE_IMPORT_SYMBOL(PmmAllocPage);
 MODULE_IMPORT_SYMBOL(AudioRegister);
+MODULE_IMPORT_SYMBOL(SchedulerYield);
 
 using namespace brook;
 
@@ -717,13 +719,13 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
                 continue;
             }
 
-            // Check if writer is about to overrun the DMA read position.
-            // Brief spin (up to 500 iterations) to wait for DMA to advance,
-            // then drop if still not safe. Avoids blocking the game loop
-            // while reducing audio clicks from premature drops.
+            // Wait for DMA to advance so we don't overwrite data being played.
+            // Yield the CPU instead of busy-spinning — this lets other threads
+            // run while we wait, and properly paces apps like mp3play that
+            // rely on blocking writes for timing.
             {
                 bool ready = false;
-                for (int i = 0; i < 500; i++)
+                for (int attempt = 0; attempt < 200; attempt++)
                 {
                     uint32_t lpib = hda_read32(sdBase + SD_LPIB);
                     uint32_t playFrag = lpib / FRAG_SIZE;
@@ -733,8 +735,14 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
                         ? (nextFrag - playFrag)
                         : (NUM_FRAGMENTS - playFrag + nextFrag);
 
-                    if (dist >= 1 && dist < NUM_FRAGMENTS - 1) { ready = true; break; }
-                    __asm__ volatile("pause");
+                    if (dist >= 2 && dist < NUM_FRAGMENTS - 2) { ready = true; break; }
+
+                    // First few attempts: brief pause (for cases where DMA
+                    // is about to cross a fragment boundary imminently)
+                    if (attempt < 4)
+                        __asm__ volatile("pause");
+                    else
+                        SchedulerYield();  // give up CPU slice, come back later
                 }
                 if (!ready)
                     break;
