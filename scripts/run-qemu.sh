@@ -9,8 +9,6 @@ BUILD_TYPE="debug"
 DEBUG_FLAGS=""
 SCRIPT_NAME=""
 HEADLESS=0
-LOG_TO_FILE=0
-LOG_FILE="/tmp/brook_serial.log"
 VNC_DISPLAY=""
 EXTRA_ARGS=()
 for arg in "$@"; do
@@ -24,15 +22,6 @@ for arg in "$@"; do
         --headless)
             HEADLESS=1
             ;;
-        --logtofile=*)
-            LOG_TO_FILE=1
-            LOG_FILE="${arg#--logtofile=}"
-            ;;
-        --logtofile)
-            LOG_TO_FILE=1
-            # Next arg (if any) will be consumed as the path
-            LOG_FILE="__NEXT_LOG__"
-            ;;
         --vnc)
             VNC_DISPLAY="__NEXT_VNC__"
             ;;
@@ -40,7 +29,6 @@ for arg in "$@"; do
             SCRIPT_NAME="${arg#--script=}"
             ;;
         --script)
-            # Next arg will be consumed below
             SCRIPT_NAME="__NEXT__"
             ;;
         *)
@@ -48,18 +36,12 @@ for arg in "$@"; do
                 SCRIPT_NAME="$arg"
             elif [ "$VNC_DISPLAY" = "__NEXT_VNC__" ]; then
                 VNC_DISPLAY="$arg"
-            elif [ "$LOG_FILE" = "__NEXT_LOG__" ]; then
-                LOG_FILE="$arg"
             else
                 EXTRA_ARGS+=("$arg")
             fi
             ;;
     esac
 done
-# --logtofile with no path argument: use default
-if [ "$LOG_FILE" = "__NEXT_LOG__" ]; then
-    LOG_FILE="/tmp/brook_serial.log"
-fi
 
 BUILD_DIR="${ROOT_DIR}/build/${BUILD_TYPE}"
 ESP_DIR="${BUILD_DIR}/esp/EFI/BOOT"
@@ -220,24 +202,14 @@ if [ -n "${SCRIPT_NAME}" ]; then
     mcopy -o -i "${DISK_IMG}" "${SCRIPT_FILE}" "::INIT.RC"
 fi
 
-SERIAL_LOG="/tmp/brook_serial.log"
 if [ "$HEADLESS" -eq 1 ]; then
-    # Headless: serial to regular file (non-blocking write — no backpressure).
-    SERIAL_OPT="-serial file:${LOG_FILE}"
+    SERIAL_OPT="-serial stdio"
     BROOK_AUDIODEV="${BROOK_AUDIODEV:-none}"
     if [ -n "$VNC_DISPLAY" ] && [ "$VNC_DISPLAY" != "__NEXT_VNC__" ]; then
         DISPLAY_OPT="-vnc ${VNC_DISPLAY}"
     else
         DISPLAY_OPT="-vnc none"
     fi
-elif [ "$LOG_TO_FILE" -eq 1 ]; then
-    # Interactive + log: COM1 → regular file (non-blocking, no FIFO backpressure).
-    # QEMU's write to a regular file never blocks, so SerialPutChar never stalls.
-    # Live view: tail -f ${LOG_FILE} in another terminal, or just check after the run.
-    rm -f "${LOG_FILE}"
-    SERIAL_OPT="-serial file:${LOG_FILE}"
-    DISPLAY_OPT="-display gtk"
-    echo "  Serial log: ${LOG_FILE}  (tail -f ${LOG_FILE} to watch live)"
 else
     SERIAL_OPT="-serial stdio"
     DISPLAY_OPT="-display gtk"
@@ -276,3 +248,11 @@ qemu-system-x86_64 \
     -no-shutdown \
     ${DEBUG_FLAGS} \
     "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+
+# If a profile was written to the boot disk, offer to extract it.
+if mcopy -i "${DISK_IMG}" ::profile.txt /dev/null 2>/dev/null; then
+    echo ""
+    echo "  Profile found on boot disk. To extract and convert:"
+    echo "    mcopy -i ${DISK_IMG} ::profile.txt ./profile.txt"
+    echo "    python3 ${SCRIPT_DIR}/profiler_to_speedscope.py profile.txt"
+fi

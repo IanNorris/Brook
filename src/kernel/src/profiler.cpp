@@ -20,6 +20,8 @@
 #include "smp.h"
 #include "serial.h"
 #include "serial_writer.h"
+#include "vfs.h"
+#include "memory/heap.h"
 
 // LAPIC tick counter (defined in apic.cpp).
 namespace brook { extern volatile uint64_t g_lapicTickCount; }
@@ -281,30 +283,105 @@ static uint32_t FormatEvent(const ProfileSample& s, char* buf)
     return p;
 }
 
-static uint32_t DrainToSerial()
+static uint32_t AppendStr(char* buf, uint32_t pos, const char* str)
 {
-    // Format each event into a stack buffer and hand it off to serial_writer
-    // via the lockless MPSC queue.  No serial lock, no UART busy-wait here.
-    char lineBuf[300]; // P event with 8 × 17 hex chars + overhead < 300
+    while (*str) buf[pos++] = *str++;
+    return pos;
+}
 
-    uint32_t totalSamples = 0;
+// Write all buffered samples to /boot/profile.txt on the FAT boot partition.
+// Uses a 16 KB heap buffer to coalesce small writes.  After the run, extract
+// the file with:
+//   mcopy -i build/release/brook_disk.img ::profile.txt ./profile.txt
+// then process with:
+//   python3 scripts/profiler_to_speedscope.py profile.txt
+static uint32_t WriteProfileToDisk()
+{
+    constexpr const char* kPath = "/boot/profile.txt";
+    Vnode* f = VfsOpen(kPath, VFS_O_WRITE | VFS_O_CREATE | VFS_O_TRUNC);
+    if (!f) {
+        SerialPrintf("PROFILER: failed to create %s\n", kPath);
+        return 0;
+    }
+
+    constexpr uint32_t kBufSize = 16384;
+    char* wbuf = static_cast<char*>(kmalloc(kBufSize));
+    if (!wbuf) {
+        SerialPrintf("PROFILER: kmalloc failed for write buffer\n");
+        VfsClose(f);
+        return 0;
+    }
+
+    uint64_t off    = 0;
+    uint32_t wpos   = 0;
     uint32_t cpuCount = SmpGetCpuCount();
+
+    // Flush write buffer to disk.
+    auto flush = [&]() {
+        if (wpos > 0) {
+            VfsWrite(f, wbuf, wpos, &off);
+            wpos = 0;
+        }
+    };
+
+    // Append raw bytes to the write buffer, flushing as needed.
+    auto append = [&](const char* src, uint32_t len) {
+        while (len > 0) {
+            uint32_t avail = kBufSize - wpos;
+            if (avail == 0) { flush(); avail = kBufSize; }
+            uint32_t n = (len < avail) ? len : avail;
+            __builtin_memcpy(wbuf + wpos, src, n);
+            wpos += n;
+            src  += n;
+            len  -= n;
+        }
+    };
+
+    // PROF_BEGIN <cpuCount> <startTick>
+    {
+        char hdr[80]; uint32_t p = 0;
+        p = AppendStr(hdr, p, "PROF_BEGIN ");
+        p = AppendDec(hdr, p, cpuCount);
+        hdr[p++] = ' ';
+        p = AppendDec(hdr, p, static_cast<uint32_t>(g_profilerStartTick));
+        hdr[p++] = '\n';
+        append(hdr, p);
+    }
+
+    uint32_t totalWritten = 0;
+    char lineBuf[300];
 
     for (uint32_t c = 0; c < cpuCount; c++) {
         PerCpuBuffer& buf = g_cpuBuf[c];
-
         uint32_t ri = buf.readIdx;
         uint32_t wi = __atomic_load_n(&buf.writeIdx, __ATOMIC_ACQUIRE);
-
         while (ri != wi) {
             uint32_t len = FormatEvent(buf.samples[ri], lineBuf);
-            SerialWriterEnqueue(lineBuf, len);
+            append(lineBuf, len);
             ri = (ri + 1) % SAMPLES_PER_CPU;
-            totalSamples++;
+            totalWritten++;
         }
         buf.readIdx = ri;
     }
-    return totalSamples;
+
+    // PROF_END <samples> <dropped>
+    {
+        uint32_t dropped = 0;
+        for (uint32_t c = 0; c < cpuCount; c++) dropped += g_cpuBuf[c].dropped;
+
+        char ftr[80]; uint32_t p = 0;
+        p = AppendStr(ftr, p, "PROF_END ");
+        p = AppendDec(ftr, p, totalWritten);
+        ftr[p++] = ' ';
+        p = AppendDec(ftr, p, dropped);
+        ftr[p++] = '\n';
+        append(ftr, p);
+    }
+
+    flush();
+    kfree(wbuf);
+    VfsClose(f);
+    return totalWritten;
 }
 
 // ---------------------------------------------------------------------------
@@ -326,14 +403,10 @@ static void ProfilerThreadFn(void* /*arg*/)
         }
 
         if (g_profilerEnabled) {
-            // Collect into ring buffers silently. DrainToSerial now enqueues
-            // via the lockless MPSC queue (no serial lock, no UART busy-wait),
-            // so draining during recording is now safe in principle — but we
-            // still drain only at the end to keep things simple. Ring-buffer
-            // overflow drops early events; the most-recent SAMPLES_PER_CPU
-            // events per CPU are always preserved.
+            // Collect into ring buffers silently while profiling runs.
+            // No serial output during the recording window so kernel debug
+            // messages (sys_socket, tcp:, etc.) can flow through freely.
             uint32_t cpuCount = SmpGetCpuCount();
-            SerialPrintf("PROF_BEGIN %u %lu\n", cpuCount, g_profilerStartTick);
 
             uint32_t elapsed = 0;
             while (g_profilerEnabled) {
@@ -347,14 +420,16 @@ static void ProfilerThreadFn(void* /*arg*/)
                     SerialPrintf("PROFILER: recording (%u s)\n", elapsed);
             }
 
-            // Profiling ended — drain everything to serial now.
-            uint32_t totalWritten = DrainToSerial();
+            // Profiling ended — write everything to disk (fast, no baud-rate
+            // limit).  Extract after QEMU exits with:
+            //   mcopy -i build/release/brook_disk.img ::profile.txt ./profile.txt
+            SerialPrintf("PROFILER: writing to /boot/profile.txt...\n");
+            uint32_t totalWritten = WriteProfileToDisk();
 
             uint32_t totalDropped = 0;
             for (uint32_t c = 0; c < cpuCount; c++)
                 totalDropped += g_cpuBuf[c].dropped;
 
-            SerialPrintf("PROF_END %u %u\n", totalWritten, totalDropped);
             SerialPrintf("PROFILER: done — %u samples, %u dropped\n", totalWritten, totalDropped);
 
             g_profilerFlushReq = false;

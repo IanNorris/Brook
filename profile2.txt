@@ -1,0 +1,426 @@
+[2J[001;001H[=3h[2J[001;001H[2J[001;001H[8;042;160t[2J[001;001H[2J[001;001H[8;056;240t[2J[001;001HBdsDxe: failed to load Boot0002 "UEFI Non-Block Boot Device" from PciRoot(0x0)/Pci(0x5,0x0): Not Found
+BdsDxe: failed to load Boot0003 "UEFI Misc Device" from PciRoot(0x0)/Pci(0x6,0x0): Not Found
+BdsDxe: failed to load Boot0004 "UEFI Misc Device 2" from PciRoot(0x0)/Pci(0x7,0x0): Not Found
+BdsDxe: failed to load Boot0005 "UEFI Misc Device 3" from PciRoot(0x0)/Pci(0x8,0x0): Not Found
+BdsDxe: loading Boot0006 "UEFI QEMU HARDDISK QM00001 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x0,0xFFFF,0x0)
+BdsDxe: starting Boot0006 "UEFI QEMU HARDDISK QM00001 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x0,0xFFFF,0x0)
+[2J[001;001HBrook bootloader starting...
+Framebuffer initialized
+ACPI located
+Kernel file read
+Kernel size: 11013712 bytes
+Warning: preferred kernel address unavailable, using any
+Kernel physical base: 0x000000007D3C6000
+Kernel virtual entry: 0xFFFFFFFF80000000
+Kernel loaded
+Initrd loaded
+Page table memory allocated
+Memory map built
+Brook kernel starting...
+CPU: FPU/SSE enabled (CR0=0x80010033 CR4=0x668)
+CPU: SSE3=yes SSSE3=yes SSE4.1=yes SSE4.2=yes
+CPU: SYSCALL/SYSRET enabled (STAR=0x0018000800000000 LSTAR=0xffffffff8000fec0)
+GDT+FPU+SYSCALL loaded
+IDT loaded
+PMM: 4035 MB free of 6144 MB total physical
+PMM ready: 1033094 free pages (4035 MB)
+VMM: direct physical map active at 0xFFFF800000000000
+VMM: initialized
+Heap: 1024 KB initial region at 0x0xffffc08000000000
+PMM: tracking enabled — 1572864 pages (544653 used, 1028211 free), descriptors: 18432 KB
+CPU: kernel GS env at 0xffffc08000000010, syscall stack top 0xffffc00001219ff0
+ACPI: XSDT @ 0x0x000000007fb7d0e8
+ACPI: MADT — 8 processor(s), LAPIC @ 0x0x00000000fee00000, IOAPIC @ 0x0x00000000fec00000
+APIC: 8259 PIC disabled
+APIC: LAPIC mapped phys 0x0x00000000fee00000 → virt 0x0xffffc0000121a000
+APIC: LAPIC timer calibrated — 62561 ticks/ms (625619 ticks in 10 ms)
+APIC: LAPIC ID=0, version=0x14, timer running at 1ms intervals
+IOAPIC: mapped phys 0x0x00000000fec00000 → virt 0x0xffffc0000121b000, 24 entries, GSI base 0
+RTC: 2026-04-19 21:59:16 UTC
+RTC: timezone set to UTC0:00
+TTY: 1920x1080 framebuffer mapped at virt 0x0xffffc0000121c000 phys 0x80000000, font 19px (lineHeight=19 ascent=15)
+BOOT LOGO: 152x200 at (884,293), bar at (846,513) w=228
+BOOT: 5% -- Memory
+Brook OS
+--------
+Framebuffer  1920x1080
+PMM          4016 MB free / 6144 MB total
+LAPIC        @ 0x0x00000000fee00000  (8 processor(s))
+Timer        62561 ticks/ms
+
+Kernel running.
+BOOT: 20% -- ACPI
+SMP: BSP LAPIC ID=0, 8 processor(s) in MADT
+SMP: trampoline 324 bytes, data block at offset 280
+SMP: booting AP 1 (LAPIC ID 1)...
+SMP: AP 1 online
+SMP: AP 1 (LAPIC ID 1) online ✓
+SMP: booting AP 2 (LAPIC ID 2)...
+SMP: AP 2 online
+SMP: AP 2 (LAPIC ID 2) online ✓
+SMP: booting AP 3 (LAPIC ID 3)...
+SMP: AP 3 online
+SMP: AP 3 (LAPIC ID 3) online ✓
+SMP: booting AP 4 (LAPIC ID 4)...
+SMP: AP 4 online
+SMP: AP 4 (LAPIC ID 4) online ✓
+SMP: booting AP 5 (LAPIC ID 5)...
+SMP: AP 5 online
+SMP: AP 5 (LAPIC ID 5) online ✓
+SMP: booting AP 6 (LAPIC ID 6)...
+SMP: AP 6 online
+SMP: AP 6 (LAPIC ID 6) online ✓
+SMP: booting AP 7 (LAPIC ID 7)...
+SMP: AP 7 online
+SMP: AP 7 (LAPIC ID 7) online ✓
+SMP: 8/8 CPUs online
+SMP          8 CPU(s) online
+BOOT: 30% -- SMP
+BOOT: 35% -- Filesystem
+VFS: initialised
+VFS: registered filesystem 'fatfs'
+VFS: registered filesystem 'ext2'
+procfs: initialised
+VFS: registered filesystem 'procfs'
+net: initialised
+initrd: 737280 bytes at phys 0x7deb1000
+DEV: registered 'ramdisk0' (type 0)
+FatFS: drive 0 → 'ramdisk0'
+initrd: mounted at /
+FW_CFG: available (id=0x3000000, no DMA)
+BOOT: 50% -- Storage
+PCI scan:
+  00:00.0  8086:29c0  class 06:00
+  00:01.0  1234:1111  class 03:00
+  00:02.0  1af4:1052  class 09:80
+  00:03.0  1af4:1005  class 00:ff
+  00:04.0  1af4:1000  class 02:00
+  00:05.0  1af4:1001  class 01:00
+  00:06.0  1af4:1001  class 01:00
+  00:07.0  1af4:1001  class 01:00
+  00:08.0  1af4:1001  class 01:00
+  00:1b.0  8086:293e  class 04:03
+  00:1f.0  8086:2918  class 06:01
+  00:1f.2  8086:2922  class 01:06
+  00:1f.3  8086:2930  class 0c:05
+virtio-blk: found 00:05.0 as virtio0, I/O base 0x6180
+virtio-blk: queue size=256 (device advertised, capped to max=256)
+virtio: alloc queue: N=256 descSz=4096 availSz=518 usedOff=8192 usedSz=2054 totalPg=4
+virtio: queue virt=0xffffc00001ad5000 pages=4 usedIdx_virt=0xffffc00001ad7002
+virtio: queuePhys=0x2477000 reqBufPhys=0x247a000
+virtio-blk: virtio0 — 262144 sectors (128 MB)
+DEV: registered 'virtio0' (type 0)
+virtio-blk: found 00:06.0 as virtio1, I/O base 0x6100
+virtio-blk: queue size=256 (device advertised, capped to max=256)
+virtio: alloc queue: N=256 descSz=4096 availSz=518 usedOff=8192 usedSz=2054 totalPg=4
+virtio: queue virt=0xffffc00001ad9000 pages=4 usedIdx_virt=0xffffc00001adb002
+virtio: queuePhys=0x248b000 reqBufPhys=0x248e000
+virtio-blk: virtio1 — 4194304 sectors (2048 MB)
+DEV: registered 'virtio1' (type 0)
+virtio-blk: found 00:07.0 as virtio2, I/O base 0x6080
+virtio-blk: queue size=256 (device advertised, capped to max=256)
+virtio: alloc queue: N=256 descSz=4096 availSz=518 usedOff=8192 usedSz=2054 totalPg=4
+virtio: queue virt=0xffffc00001add000 pages=4 usedIdx_virt=0xffffc00001adf002
+virtio: queuePhys=0x249f000 reqBufPhys=0x24a2000
+virtio-blk: virtio2 — 524288 sectors (256 MB)
+DEV: registered 'virtio2' (type 0)
+virtio-blk: found 00:08.0 as virtio3, I/O base 0x6000
+virtio-blk: queue size=256 (device advertised, capped to max=256)
+virtio: alloc queue: N=256 descSz=4096 availSz=518 usedOff=8192 usedSz=2054 totalPg=4
+virtio: queue virt=0xffffc00001ae1000 pages=4 usedIdx_virt=0xffffc00001ae3002
+virtio: queuePhys=0x24b3000 reqBufPhys=0x24b6000
+virtio-blk: virtio3 — 131072 sectors (64 MB)
+DEV: registered 'virtio3' (type 0)
+virtio: found 4 device(s)
+FatFS: drive 1 → 'virtio0'
+VFS: unmounted '/mnt/probe'
+virtio: virtio0 mounted at /boot
+FatFS: drive 2 → 'virtio1'
+FATFS_VFS: f_mount failed (res=13) for drive 2
+VFS: mount failed for 'fatfs' at '/mnt/probe'
+ext2: drive 2 → 'virtio1'
+ext2: virtio1 — 524288 blocks, 131072 inodes, 4096 block size, 16 groups
+VFS: unmounted '/mnt/probe'
+ext2: virtio1 — 524288 blocks, 131072 inodes, 4096 block size, 16 groups
+virtio: virtio1 mounted at /data
+virtio: /data/BROOK.CFG (97 bytes): # Brook OS boot configuration
+TARGET=KERNEL\BROOK.ELF
+DEBUG_TEXT=0
+LOG_MEMORY=0
+LOG_INTERRUPTS=0
+FatFS: drive 3 → 'virtio2'
+FATFS_VFS: f_mount failed (res=13) for drive 3
+VFS: mount failed for 'fatfs' at '/mnt/probe'
+ext2: drive 3 → 'virtio2'
+ext2: virtio2 — 65536 blocks, 65536 inodes, 4096 block size, 2 groups
+VFS: unmounted '/mnt/probe'
+ext2: virtio2 — 65536 blocks, 65536 inodes, 4096 block size, 2 groups
+virtio: virtio2 mounted at /nix
+ext2: open '/BROOK.CFG' → not found
+FATFS_VFS: f_mount failed (res=3) for drive 4
+VFS: mount failed for 'fatfs' at '/mnt/probe'
+ext2: drive 4 → 'virtio3'
+ext2: virtio3 — 65536 blocks, 16384 inodes, 1024 block size, 8 groups
+VFS: unmounted '/mnt/probe'
+ext2: virtio3 — 65536 blocks, 16384 inodes, 1024 block size, 8 groups
+virtio: virtio3 mounted at /home
+ext2: open '/BROOK.CFG' → not found
+BOOT: 65% -- Modules
+KLOG: logging to /boot/BROOK.LOG
+[0] PMM: 4015 MB free of 6144 MB total
+INPUT: subsystem initialised
+ksymtab: 85 exported symbols
+  kmalloc                           0xffffffff80059e50
+  kfree                             0xffffffff8005a470
+  krealloc                          0xffffffff8005a620
+  KPrintf                           0xffffffff80009f10
+  KPuts                             0xffffffff80009eb0
+  SerialPrintf                      0xffffffff8005b9e0
+  SerialPuts                        0xffffffff8005ac10
+  PmmAllocPage                      0xffffffff80058cb0
+  PmmAllocPages                     0xffffffff80058e50
+  PmmFreePage                       0xffffffff800590c0
+  VmmAllocPages                     0xffffffff800573e0
+  VmmFreePages                      0xffffffff80057c70
+  VmmVirtToPhys                     0xffffffff80058270
+  KsymPhysToVirt                    0xffffffff8000a700
+  _ZN5brook13VmmAllocPagesEmmNS_6MemTagEt  0xffffffff800573e0
+  _ZN5brook13VmmVirtToPhysENS_9PageTableENS_14VirtualAddressE  0xffffffff80058270
+  _ZN5brook12VmmFreePagesENS_14VirtualAddressEm  0xffffffff80057c70
+  _ZN5brook10VmmMapPageENS_9PageTableENS_14VirtualAddressENS_15PhysicalAddressEmNS_6MemTagEt  0xffffffff80056910
+  DeviceRegister                    0xffffffff80000e00
+  DeviceUnregister                  0xffffffff80000f00
+  DeviceFind                        0xffffffff800010a0
+  DeviceIterate                     0xffffffff80001130
+  VfsMount                          0xffffffff80039540
+  VfsUnmount                        0xffffffff800399c0
+  VfsRegisterFs                     0xffffffff800390c0
+  VfsUnregisterFs                   0xffffffff800391d0
+  VfsOpen                           0xffffffff80039d10
+  VfsRead                           0xffffffff8003a160
+  VfsWrite                          0xffffffff8003a180
+  VfsClose                          0xffffffff8003a540
+  VfsReaddir                        0xffffffff8003a1a0
+  FatFsBindDrive                    0xffffffff800011b0
+  Ext2BindDevice                    0xffffffff8003b9d0
+  PciFindDevice                     0xffffffff8000df70
+  PciFindNextDevice                 0xffffffff8000e240
+  PciEnumerate                      0xffffffff8000e270
+  PciEnableBusMaster                0xffffffff8000e330
+  PciEnableMemSpace                 0xffffffff8000e3c0
+  PciConfigRead32                   0xffffffff8000de10
+  PciConfigRead16                   0xffffffff8000de40
+  PciConfigRead8                    0xffffffff8000de80
+  PciConfigWrite16                  0xffffffff8000df00
+  DisplayRegister                   0xffffffff80031280
+  TtyGetFramebuffer                 0xffffffff80051bd0
+  TtyGetFramebufferPhys             0xffffffff80051c10
+  TtyRemap                          0xffffffff80051c50
+  CompositorRemap                   0xffffffff80027180
+  CompositorGetPhysDims             0xffffffff800243c0
+  CompositorWake                    0xffffffff80027070
+  MouseInit                         0xffffffff800316f0
+  MouseIsAvailable                  0xffffffff80031d40
+  MouseGetPosition                  0xffffffff80031d50
+  MouseSetBounds                    0xffffffff80031d70
+  MouseGetButtons                   0xffffffff80031dc0
+  MouseSetPosition                  0xffffffff80031dd0
+  MouseSetButtons                   0xffffffff80031e30
+  MouseSetAvailable                 0xffffffff80031e40
+  VirtioBlkInitAll                  0xffffffff8004eab0
+  KbdInit                           0xffffffff80009d80
+  KbdGetChar                        0xffffffff80009e40
+  KbdPeekChar                       0xffffffff80009df0
+  KbdIsAvailable                    0xffffffff80009de0
+  InputInit                         0xffffffff800097f0
+  InputRegister                     0xffffffff80009810
+  InputPollEvent                    0xffffffff800098a0
+  InputWaitEvent                    0xffffffff80009930
+  InputHasEvents                    0xffffffff800099c0
+  InputWakeWaiters                  0xffffffff80009720
+  SchedulerRegisterPolicy           0xffffffff80021bd0
+  SchedulerBlock                    0xffffffff80022620
+  SchedulerUnblock                  0xffffffff800228b0
+  SchedulerYield                    0xffffffff80022710
+  ProcessCurrent                    0xffffffff80023610
+  ProcessFindByPid                  0xffffffff80023630
+  ProcessSendSignal                 0xffffffff800213f0
+  KernelPanic                       0xffffffff8000b940
+  IdtInstallHandler                 0xffffffff80008a20
+  IoApicUnmaskIrq                   0xffffffff80050050
+  IoApicRegisterHandler             0xffffffff800088f0
+  ApicSendEoi                       0xffffffff8004fdf0
+  NetRegisterIf                     0xffffffff80045850
+  NetReceive                        0xffffffff80045350
+  _ZN5brook13NetRegisterIfEPNS_5NetIfE  0xffffffff80045850
+  _ZN5brook10NetReceiveEPNS_5NetIfEPKvj  0xffffffff80045350
+  AudioRegister                     0xffffffff80034bd0
+module: Phase 1 — loading from /drivers (ramdisk)
+module: loading '/drivers/BOCHS_DISPLAY.MOD' (17928 bytes)
+bochs_display: init
+bochs_display: found at 00:01.0
+bochs_display: BAR0 at phys 0x80000000
+bochs_display: VBE Dispi ID 0xb0c5
+bochs_display: 1920x1080 @ 32bpp, FB phys 0x80000000
+DISPLAY: registering 'bochs-vga' (replacing 'gop')
+TTY: remapped to 1920x1080 at phys 0x80000000, virt 0xffffc00001ae5000
+TTY: redirected to backbuffer 0xffffc000022ce000
+COMPOSITOR: remapped to 1920x1080 stride=1920
+module: 'bochs_display' v1.0.0 loaded OK at 0xffffffff90000000 (1 pages)
+module: loading '/drivers/INTEL_HDA.MOD' (51032 bytes)
+intel_hda: found at PCI 00:1b.0
+intel_hda: HDA v1.0, ISS=4 OSS=4
+intel_hda: codec 0 vendor=1af4 device=0012
+intel_hda: root node: start=1 count=1
+intel_hda: audio function group at NID 1
+intel_hda: AFG widgets: start=2 count=2
+intel_hda: DAC at NID 2
+intel_hda: output pin at NID 3 (type=0)
+intel_hda: DMA BDL phys=0x2cc5000 audio frag0=0x2cc6000 frag1=0x2cc7000 (16 pages)
+audio: registered driver 'intel_hda'
+intel_hda: initialised — DAC=2 PIN=3
+module: 'intel_hda' v1.0.0 loaded OK at 0xffffffff90001000 (3 pages)
+module: loading '/drivers/PS2_KBD.MOD' (6344 bytes)
+ps2_kbd module: init
+INPUT: registered 'ps2_kbd' (1 total)
+KBD: PS/2 keyboard ready (IRQ1 → vector 33)
+ps2_kbd module: PS/2 keyboard initialized
+module: 'ps2_kbd' v1.0.0 loaded OK at 0xffffffff90004000 (1 pages)
+module: loading '/drivers/PS2_MOUSE.MOD' (5856 bytes)
+MOUSE: initialising PS/2 auxiliary device
+MOUSE: 8042 config byte = 0x47
+MOUSE: reset response: self-test=0xaa id=0x0
+MOUSE: 8042 config after init = 0x47
+INPUT: registered 'ps2_mouse' (2 total)
+MOUSE: PS/2 mouse ready (IRQ12 → vector 44)
+module: 'ps2_mouse' v1.0.0 loaded OK at 0xffffffff90005000 (1 pages)
+module: loading '/drivers/SCHED_MLFQ.MOD' (20416 bytes)
+sched_mlfq module: init
+SCHED: registered policy 'mlfq' (state=560 bytes)
+sched_mlfq: registered 'mlfq' policy
+module: 'sched_mlfq' v1.0.0 loaded OK at 0xffffffff90006000 (1 pages)
+module: loading '/drivers/VIRTIO_BLK.MOD' (10664 bytes)
+virtio_blk module: init
+virtio_blk module: 4 virtio device(s) registered by kernel
+  virtio0: 262144 sectors (128 MB)
+  virtio1: 4194304 sectors (2048 MB)
+  virtio2: 524288 sectors (256 MB)
+  virtio3: 131072 sectors (64 MB)
+module: 'virtio_blk' v1.0.0 loaded OK at 0xffffffff90007000 (1 pages)
+module: loading '/drivers/VIRTIO_INPUT.MOD' (54480 bytes)
+virtio_input: init
+virtio_input: found at 00:02.0
+virtio_input: cap type 2 bar 4 off 0x3000 len 0x1000
+virtio_input: cap type 4 bar 4 off 0x2000 len 0x1000
+virtio_input: cap type 3 bar 4 off 0x1000 len 0x1000
+virtio_input: cap type 1 bar 4 off 0x0 len 0x1000
+virtio_input: device name: 'QEMU Virtio Tablet'
+virtio_input: screen 1920x1080
+virtio_input: eventq size 64
+virtio_input: desc=0x2ce0000 avail=0x2ce1000 used=0x2ce2000 events=0x2ce3000
+virtio_input: PCI interrupt line 11
+INPUT: registered 'virtio-tablet' (3 total)
+virtio_input: tablet ready (1920x1080)
+module: 'virtio_input' v1.0.0 loaded OK at 0xffffffff90008000 (2 pages)
+module: loading '/drivers/VIRTIO_NET.MOD' (47816 bytes)
+virtio_net: init
+virtio_net: found at 00:04.0 (device 0x1000)
+virtio_net: cap type 2 bar 4 off 0x3000 len 0x1000
+virtio_net: cap type 4 bar 4 off 0x2000 len 0x1000
+virtio_net: cap type 3 bar 4 off 0x1000 len 0x1000
+virtio_net: cap type 1 bar 4 off 0x0 len 0x1000
+virtio_net: device features[0] = 0x30bf8024
+virtio_net: device features[1] = 0x00000101
+virtio_net: MAC=52:54:00:12:34:56
+virtio_net: queue 0 size 256
+virtio_net: q0 desc=0x2cea000 avail=0x2ceb000 used=0x2cec000
+virtio_net: queue 1 size 256
+virtio_net: q1 desc=0x2ced000 avail=0x2cee000 used=0x2cef000
+virtio_net: PCI interrupt line 10
+net: interface registered, MAC=52:54:00:12:34:56
+virtio_net: ready, MAC=52:54:00:12:34:56
+module: 'virtio_net' v1.0.0 loaded OK at 0xffffffff9000a000 (2 pages)
+module: loading '/drivers/VIRTIO_RNG.MOD' (34328 bytes)
+virtio_rng: found at PCI 00:03.0
+virtio_rng: initialised, 0 bytes in entropy pool
+module: 'virtio_rng' v1.0.0 loaded OK at 0xffffffff9000c000 (3 pages)
+module: discover '/drivers': 9 loaded, 0 failed
+module: Phase 2 — loading from /boot/drivers (virtio)
+module: loading '/boot/drivers/BOCHS_DISPLAY.MOD' (17928 bytes)
+module: 'bochs_display' already loaded — skipping '/boot/drivers/BOCHS_DISPLAY.MOD'
+module: loading '/boot/drivers/PS2_KBD.MOD' (6344 bytes)
+module: 'ps2_kbd' already loaded — skipping '/boot/drivers/PS2_KBD.MOD'
+module: loading '/boot/drivers/PS2_MOUSE.MOD' (5856 bytes)
+module: 'ps2_mouse' already loaded — skipping '/boot/drivers/PS2_MOUSE.MOD'
+module: loading '/boot/drivers/SCHED_MLFQ.MOD' (20416 bytes)
+module: 'sched_mlfq' already loaded — skipping '/boot/drivers/SCHED_MLFQ.MOD'
+module: loading '/boot/drivers/VIRTIO_BLK.MOD' (10664 bytes)
+module: 'virtio_blk' already loaded — skipping '/boot/drivers/VIRTIO_BLK.MOD'
+module: loading '/boot/drivers/VIRTIO_INPUT.MOD' (54480 bytes)
+module: 'virtio_input' already loaded — skipping '/boot/drivers/VIRTIO_INPUT.MOD'
+module: loading '/boot/drivers/VIRTIO_NET.MOD' (47816 bytes)
+module: 'virtio_net' already loaded — skipping '/boot/drivers/VIRTIO_NET.MOD'
+module: loading '/boot/drivers/INTEL_HDA.MOD' (51032 bytes)
+module: 'intel_hda' already loaded — skipping '/boot/drivers/INTEL_HDA.MOD'
+module: loading '/boot/drivers/VIRTIO_RNG.MOD' (34328 bytes)
+module: 'virtio_rng' already loaded — skipping '/boot/drivers/VIRTIO_RNG.MOD'
+module: discover '/boot/drivers': 9 loaded, 0 failed
+module: Phase 2 — done
+BOOT: 75% -- Network
+net: DHCP discover (attempt 1)
+virtio_net: TX 594 bytes [pkt#1]
+net: DHCP offer: 10.0.2.15
+virtio_net: TX 594 bytes [pkt#2]
+net: DHCP ACK — IP 10.0.2.15 mask 255.255.255.0 gw 10.0.2.2
+net: IP 10.0.2.15 (DHCP)
+net: DNS query 'example.com' (attempt 1)
+virtio_net: TX 42 bytes [pkt#3]
+net: DNS 'example.com' → 104.20.23.154
+BOOT: 80% -- Syscalls
+SYSCALL: table initialised (512 entries, 149 implemented)
+[0] SYSCALL: table initialised
+BOOT: 90% -- Scheduler
+SCHED: registered policy 'rr' (state=392 bytes)
+SCHED: loaded policy 'rr'
+SCHED: scheduler initialised
+COMPOSITOR: backbuffer 8100 KB at 0xffffc00002b8a000
+TTY: redirected to backbuffer 0xffffc00002b8a000
+COMPOSITOR: initialised, 1920x1080 stride=1920
+SMP: preparing 7 APs for scheduling
+SMP: CPU 1 prepared (TSS sel=0x40, env=0xffffc080000244f0)
+SMP: CPU 2 prepared (TSS sel=0x50, env=0xffffc0800002ac10)
+SMP: CPU 3 prepared (TSS sel=0x60, env=0xffffc08000031330)
+SMP: CPU 4 prepared (TSS sel=0x70, env=0xffffc08000037a50)
+SMP: CPU 5 prepared (TSS sel=0x80, env=0xffffc0800003e170)
+SMP: CPU 6 prepared (TSS sel=0x90, env=0xffffc08000044890)
+SMP: CPU 7 prepared (TSS sel=0xa0, env=0xffffc0800004afb0)
+[0] SMP: all APs prepared
+BOOT: 100% -- Ready
+[0] BOOT: complete, entering shell/scheduler
+SERIAL_WRITER: thread created pid=2
+PROFILER: thread created pid=3
+Executing /boot/INIT.RC
+SHELL: executing script '/boot/INIT.RC'
+PROFILER: recording started (60000 ms, 8 CPUs)
+  → nix-install_0 (pid 4)
+SHELL: script '/boot/INIT.RC' finished
+COMPOSITOR: thread created pid=5
+SHELL: 4 processes queued, starting scheduler
+CPU: SYSCALL/SYSRET enabled (STAR=0x0018000800000000 LSTAR=0xffffffff8000fec0)
+CPU: SYSCALL/SYSRET enabled (STAR=0x0018000800000000 LSTAR=0xffffffff8000fec0)
+CPU: SYSCALL/SYSRET enabled (STAR=0x0018000800000000 LSTAR=0xffffffff8000fec0)
+CPU: SYSCALL/SYSRET enabled (STAR=0x0018000800000000 LSTAR=0xffffffff8000fec0)
+CPU: SYSCALL/SYSRET enabled (STAR=0x0018000800000000 LSTAR=0xffffffff8000fec0)
+CPU: SYSCALL/SYSRET enabled (STAR=0x0018000800000000 LSTAR=0xffffffff8000fec0)
+CPU: SYSCALL/SYSRET enabled (STAR=0x0018000800000000 LSTAR=0xffffffff8000fec0)
+SCHED: starting scheduler, 4 processes ready
+SMP: AP 5 (CPU 5) activated, entering scheduler
+SMP: AP 1 (CPU 1) activated, entering scheduler
+SMP: AP 6 (CPU 6) activated, entering scheduler
+SMP: AP 7 (CPU 7) activated, entering scheduler
+SMP: AP 2 (CPU 2) activated, entering scheduler
+SMP: AP 3 (CPU 3) activated, entering scheduler
+SMP: AP 4 (CPU 4) activated, entering scheduler
+PROFILER: thread started
+COMPOSITOR: thread started (1920x1080, 1 processes)
+SCHED: CPU6 entering idle

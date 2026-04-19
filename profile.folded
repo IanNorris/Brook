@@ -1,0 +1,32 @@
+brook::SchedulerStartAp()+0x131 45759
+brook::IdleLoop()+0x12 23878
+brook::SerialUnlock()+0x2a 443
+brook::SubmitRequest(brook::VirtioBlkState&, unsigned int, unsigned long, unsigned long, unsigned int)+0xbf 89
+kmalloc+0x3f6 25
+SerialPrintf+0xb2 14
+kfree+0x1a9 10
+brook::sys_mmap(unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long)+0x260 8
+SerialPrintf+0x10a 7
+brook::sys_mmap(unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long)+0x3b0 6
+brook::ProcessExec(brook::Process*, unsigned char const*, unsigned long, int, char const* const*, int, char const* const*, unsigned long*)+0x190 5
+memcpy+0x34 4
+brook::SerialLock()+0x32 4
+brook::WalkToPtr(brook::PageTable, brook::VirtualAddress, bool, unsigned long)+0x510 3
+brook::SubmitRequest(brook::VirtioBlkState&, unsigned int, unsigned long, unsigned long, unsigned int)+0xa8 2
+brook::SubmitRequest(brook::VirtioBlkState&, unsigned int, unsigned long, unsigned long, unsigned int)+0xbd 2
+brook::SchedulerStartAp()+0x1a 1
+memcpy+0x42 1
+0x000000000040519f 1
+brook::SubmitRequest(brook::VirtioBlkState&, unsigned int, unsigned long, unsigned long, unsigned int)+0xb7 1
+0x0000000000409edc 1
+brook::Newline()+0x104 1
+brook::VmmMapPage(brook::PageTable, brook::VirtualAddress, brook::PhysicalAddress, unsigned long, brook::MemTag, unsigned short)+0x14a 1
+brook::VirtioBlkRead(brook::Device*, unsigned long, void*, unsigned long)+0x1e5 1
+brook::SerialLock()+0x38 1
+brook::PmmAllocPage(brook::MemTag, unsigned short)+0x192 1
+brook::sys_mmap(unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long)+0x3d7 1
+SerialPrintf+0xb8 1
+brook::TtyPutChar(char)+0x535 1
+brook::WalkToPtr(brook::PageTable, brook::VirtualAddress, bool, unsigned long)+0x4ab 1
+brook::VmmUnmapPage(brook::PageTable, brook::VirtualAddress)+0xbd 1
+brook::CompositorThreadFn(void*)+0x22d2 1
