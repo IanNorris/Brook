@@ -1,11 +1,19 @@
-// serial_writer.cpp — Async serial/TTY output via kernel thread + ring buffer.
+// serial_writer.cpp — Async serial/TTY output via lockless MPSC queue.
 //
-// Userspace sys_write(fd 1/2) enqueues into g_serialBuf.  A dedicated kernel
-// thread drains the buffer to the serial port (and optionally TTY), decoupling
-// userspace from the 115200 baud bottleneck.
+// All userspace writes (sys_write fd 1/2) and profiler drain output enqueue
+// into g_serialQueue.  A dedicated kernel thread (serial_wr) is the sole
+// consumer: it is the only code that ever calls SerialPutChar after the
+// scheduler starts, so the serial lock is no longer needed in the writer
+// thread's hot path.
+//
+// The queue is a lockless MPSC slot ring (see mpscqueue.h).  Producers claim
+// slots atomically and return immediately after memcpy; no lock, no busy-wait
+// on the UART.  Only serial_wr busy-waits on COM1_LSR, and it holds the
+// serial lock for ≤ one slot (≤ 512 bytes ≈ 44 ms) at a time, allowing
+// direct SerialPrintf callers (kernel init, KernelPanic) to still interleave.
 
 #include "serial_writer.h"
-#include "kringbuf.h"
+#include "mpscqueue.h"
 #include "serial.h"
 #include "tty.h"
 #include "process.h"
@@ -16,45 +24,48 @@ namespace brook { extern volatile uint64_t g_lapicTickCount; }
 
 namespace brook {
 
-// 64 KB ring buffer — enough for bursty printf output from 32 processes.
-static KRingBuffer<65536> g_serialBuf;
+// 2048 slots × 512 bytes = ~1 MB of queue memory.
+// With 2048 slots, 8 producers and a ~11 KB/s UART backend, the queue absorbs
+// ~90 seconds of flat-out burst before producers start spinning (in practice
+// much longer since most messages are short).
+static MpscQueue<2048, 512> g_serialQueue;
 
-// The writer thread process (so we can unblock it).
+// The writer thread process (kept for unblocking on wakeup).
 static Process* g_writerProc = nullptr;
 
 // ---------------------------------------------------------------------------
-// Writer kernel thread
+// Writer kernel thread — single consumer, sole UART writer post-scheduler.
 // ---------------------------------------------------------------------------
 
 static void SerialWriterThreadFn(void* /*arg*/)
 {
-    // Line-buffered drain: read up to one line at a time so each serial
-    // lock acquisition outputs a coherent line.  Falls back to a full
-    // batch if no newline is found (binary output / very long lines).
-    char batch[256];
+    char slot[512];
 
     for (;;) {
-        uint32_t n = g_serialBuf.readUntilNewline(batch, sizeof(batch));
+        uint32_t n = g_serialQueue.dequeue(slot, sizeof(slot));
 
         if (n > 0) {
+            // serial_wr is the only post-boot UART writer, so the lock hold
+            // is just for safety against early-boot SerialPrintf calls and
+            // KernelPanic.  One slot (≤ 512 B) takes at most ~44 ms at
+            // 115200 baud — acceptable since those callers are rare.
             SerialLock();
             for (uint32_t i = 0; i < n; ++i)
-                SerialPutChar(batch[i]);
+                SerialPutChar(slot[i]);
             SerialUnlock();
 
-            // Also echo to TTY (framebuffer console) if available.
+            // Echo to TTY (framebuffer console) if available.
             if (TtyReady()) {
                 for (uint32_t i = 0; i < n; ++i)
-                    TtyPutChar(batch[i]);
+                    TtyPutChar(slot[i]);
             }
-        }
-
-        // Sleep briefly then check again. Keeps serial responsive
-        // without starving user processes.
-        Process* self = ProcessCurrent();
-        if (self) {
-            self->wakeupTick = g_lapicTickCount + (g_serialBuf.empty() ? 10 : 1);
-            SchedulerBlock(self);
+        } else {
+            // Queue empty — sleep briefly.
+            Process* self = ProcessCurrent();
+            if (self) {
+                self->wakeupTick = g_lapicTickCount + 5;
+                SchedulerBlock(self);
+            }
         }
     }
 }
@@ -66,7 +77,7 @@ static void SerialWriterThreadFn(void* /*arg*/)
 void SerialWriterInit()
 {
     g_writerProc = KernelThreadCreate("serial_wr", SerialWriterThreadFn, nullptr,
-                                       2 /* NORMAL priority — don't starve user processes */);
+                                       2 /* NORMAL priority */);
     if (g_writerProc) {
         SchedulerAddProcess(g_writerProc);
         SerialPrintf("SERIAL_WRITER: thread created pid=%u\n", g_writerProc->pid);
@@ -75,7 +86,15 @@ void SerialWriterInit()
 
 void SerialWriterEnqueue(const char* buf, uint32_t len)
 {
-    g_serialBuf.write(buf, len);
+    // Split writes that exceed one slot so no message is silently truncated.
+    constexpr uint32_t kSlotBytes = 512;
+    while (len > 0) {
+        uint32_t chunk = (len > kSlotBytes) ? kSlotBytes : len;
+        g_serialQueue.enqueue(buf, chunk);
+        buf += chunk;
+        len -= chunk;
+    }
 }
 
 } // namespace brook
+

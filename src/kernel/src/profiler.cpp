@@ -19,6 +19,7 @@
 #include "scheduler.h"
 #include "smp.h"
 #include "serial.h"
+#include "serial_writer.h"
 
 // LAPIC tick counter (defined in apic.cpp).
 namespace brook { extern volatile uint64_t g_lapicTickCount; }
@@ -205,23 +206,87 @@ void ProfilerContextSwitch(uint16_t oldPid, uint16_t newPid)
 //   P <tick_dec> <pid_hex> <cpu> <flags> <rip0_hex>;<rip1_hex>;...
 // Delimited by PROF_BEGIN / PROF_END markers.
 
-static void SerialPutHex16(uint64_t v)
+// ---------------------------------------------------------------------------
+// Drain samples — format each event to a stack buffer, enqueue via
+// SerialWriterEnqueue.  No serial lock held, no UART busy-wait here.
+// ---------------------------------------------------------------------------
+
+// Format helpers that write into a caller-supplied char buffer.
+static uint32_t AppendHexDigit(char* buf, uint32_t pos, uint8_t v)
 {
-    for (int i = 15; i >= 0; --i)
-        SerialPutChar(kHexDigits[(v >> (i * 4)) & 0xF]);
+    buf[pos] = kHexDigits[v & 0xF];
+    return pos + 1;
 }
 
-static void SerialPutDec(uint32_t v)
+static uint32_t AppendHex4(char* buf, uint32_t pos, uint16_t v)
 {
-    char tb[11]; int ti = 10; tb[ti] = '\0';
-    if (v == 0) { tb[--ti] = '0'; }
-    else { while (v > 0) { tb[--ti] = '0' + (v % 10); v /= 10; } }
-    const char* p = &tb[ti];
-    while (*p) SerialPutChar(*p++);
+    pos = AppendHexDigit(buf, pos, (v >> 12) & 0xF);
+    pos = AppendHexDigit(buf, pos, (v >>  8) & 0xF);
+    pos = AppendHexDigit(buf, pos, (v >>  4) & 0xF);
+    pos = AppendHexDigit(buf, pos, (v >>  0) & 0xF);
+    return pos;
+}
+
+static uint32_t AppendHex16(char* buf, uint32_t pos, uint64_t v)
+{
+    for (int i = 15; i >= 0; --i)
+        pos = AppendHexDigit(buf, pos, (v >> (i * 4)) & 0xF);
+    return pos;
+}
+
+static uint32_t AppendDec(char* buf, uint32_t pos, uint32_t v)
+{
+    char tmp[11]; int ti = 10; tmp[ti] = '\0';
+    if (v == 0) { tmp[--ti] = '0'; }
+    else { while (v > 0) { tmp[--ti] = '0' + (v % 10); v /= 10; } }
+    for (const char* p = &tmp[ti]; *p; ++p)
+        buf[pos++] = *p;
+    return pos;
+}
+
+// Format one ProfileSample into `buf` (must be ≥ 300 bytes).
+// Returns number of characters written (no NUL terminator).
+static uint32_t FormatEvent(const ProfileSample& s, char* buf)
+{
+    uint32_t p = 0;
+
+    if (s.type == ProfileEventType::ContextSwitch) {
+        // CS <tick> <cpu> <old_pid_hex> <new_pid_hex>
+        buf[p++] = 'C'; buf[p++] = 'S'; buf[p++] = ' ';
+        p = AppendDec(buf, p, s.tick);
+        buf[p++] = ' ';
+        buf[p++] = '0' + s.cpu;
+        buf[p++] = ' ';
+        p = AppendHex4(buf, p, s.pid);
+        buf[p++] = ' ';
+        p = AppendHex4(buf, p, s.newPid);
+        buf[p++] = '\n';
+    } else {
+        // P <tick> <pid_hex> <cpu> <flags> <rip0>;...;<ripN>
+        buf[p++] = 'P'; buf[p++] = ' ';
+        p = AppendDec(buf, p, s.tick);
+        buf[p++] = ' ';
+        p = AppendHex4(buf, p, s.pid);
+        buf[p++] = ' ';
+        buf[p++] = '0' + s.cpu;
+        buf[p++] = ' ';
+        buf[p++] = '0' + s.flags;
+        buf[p++] = ' ';
+        for (uint8_t d = 0; d < s.depth; ++d) {
+            if (d > 0) buf[p++] = ';';
+            p = AppendHex16(buf, p, s.rip[d]);
+        }
+        buf[p++] = '\n';
+    }
+    return p;
 }
 
 static uint32_t DrainToSerial()
 {
+    // Format each event into a stack buffer and hand it off to serial_writer
+    // via the lockless MPSC queue.  No serial lock, no UART busy-wait here.
+    char lineBuf[300]; // P event with 8 × 17 hex chars + overhead < 300
+
     uint32_t totalSamples = 0;
     uint32_t cpuCount = SmpGetCpuCount();
 
@@ -230,56 +295,13 @@ static uint32_t DrainToSerial()
 
         uint32_t ri = buf.readIdx;
         uint32_t wi = __atomic_load_n(&buf.writeIdx, __ATOMIC_ACQUIRE);
-        if (ri == wi) continue;
 
-        SerialLock();
         while (ri != wi) {
-            const ProfileSample& s = buf.samples[ri];
-
-            if (s.type == ProfileEventType::ContextSwitch) {
-                // CS <tick> <cpu> <old_pid_hex> <new_pid_hex>
-                SerialPutChar('C'); SerialPutChar('S'); SerialPutChar(' ');
-                SerialPutDec(s.tick);
-                SerialPutChar(' ');
-                SerialPutChar('0' + s.cpu);
-                SerialPutChar(' ');
-                SerialPutChar(kHexDigits[(s.pid >> 12) & 0xF]);
-                SerialPutChar(kHexDigits[(s.pid >> 8) & 0xF]);
-                SerialPutChar(kHexDigits[(s.pid >> 4) & 0xF]);
-                SerialPutChar(kHexDigits[s.pid & 0xF]);
-                SerialPutChar(' ');
-                SerialPutChar(kHexDigits[(s.newPid >> 12) & 0xF]);
-                SerialPutChar(kHexDigits[(s.newPid >> 8) & 0xF]);
-                SerialPutChar(kHexDigits[(s.newPid >> 4) & 0xF]);
-                SerialPutChar(kHexDigits[s.newPid & 0xF]);
-                SerialPutChar('\n');
-            } else {
-                // P <tick> <pid_hex> <cpu> <flags> <rip0_hex>;<rip1_hex>;...
-                SerialPutChar('P');
-                SerialPutChar(' ');
-                SerialPutDec(s.tick);
-                SerialPutChar(' ');
-                SerialPutChar(kHexDigits[(s.pid >> 12) & 0xF]);
-                SerialPutChar(kHexDigits[(s.pid >> 8) & 0xF]);
-                SerialPutChar(kHexDigits[(s.pid >> 4) & 0xF]);
-                SerialPutChar(kHexDigits[s.pid & 0xF]);
-                SerialPutChar(' ');
-                SerialPutChar('0' + s.cpu);
-                SerialPutChar(' ');
-                SerialPutChar('0' + s.flags);
-                SerialPutChar(' ');
-                // Stack frames: rip0;rip1;rip2;...
-                for (uint8_t d = 0; d < s.depth; d++) {
-                    if (d > 0) SerialPutChar(';');
-                    SerialPutHex16(s.rip[d]);
-                }
-                SerialPutChar('\n');
-            }
-
+            uint32_t len = FormatEvent(buf.samples[ri], lineBuf);
+            SerialWriterEnqueue(lineBuf, len);
             ri = (ri + 1) % SAMPLES_PER_CPU;
             totalSamples++;
         }
-        SerialUnlock();
         buf.readIdx = ri;
     }
     return totalSamples;
@@ -304,13 +326,12 @@ static void ProfilerThreadFn(void* /*arg*/)
         }
 
         if (g_profilerEnabled) {
-            // Profiling is active.  Do NOT drain to serial during recording.
-            // Draining continuously holds the serial lock while busy-waiting
-            // on the UART TX FIFO, which starves all other serial output for
-            // ~98% of the profiling window.  We collect into the ring buffer
-            // and drain once when profiling ends.  Ring-buffer overflow drops
-            // early events; the most-recent SAMPLES_PER_CPU events per CPU
-            // are always preserved.
+            // Collect into ring buffers silently. DrainToSerial now enqueues
+            // via the lockless MPSC queue (no serial lock, no UART busy-wait),
+            // so draining during recording is now safe in principle — but we
+            // still drain only at the end to keep things simple. Ring-buffer
+            // overflow drops early events; the most-recent SAMPLES_PER_CPU
+            // events per CPU are always preserved.
             uint32_t cpuCount = SmpGetCpuCount();
             SerialPrintf("PROF_BEGIN %u %lu\n", cpuCount, g_profilerStartTick);
 
