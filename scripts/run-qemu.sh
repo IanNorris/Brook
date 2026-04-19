@@ -220,9 +220,14 @@ if [ -n "${SCRIPT_NAME}" ]; then
     mcopy -o -i "${DISK_IMG}" "${SCRIPT_FILE}" "::INIT.RC"
 fi
 
+SERIAL_FIFO="/tmp/brook_serial_fifo"
 if [ "$HEADLESS" -eq 1 ]; then
-    # Headless: serial goes only to log file
-    SERIAL_OPT="-chardev file,id=ser0,path=${LOG_FILE} -serial chardev:ser0"
+    # Headless: serial to file via FIFO (unbuffered — no QEMU write buffering)
+    rm -f "${SERIAL_FIFO}"
+    mkfifo "${SERIAL_FIFO}"
+    tee "${LOG_FILE}" < "${SERIAL_FIFO}" &
+    TEE_PID=$!
+    SERIAL_OPT="-serial file:${SERIAL_FIFO}"
     BROOK_AUDIODEV="${BROOK_AUDIODEV:-none}"
     if [ -n "$VNC_DISPLAY" ] && [ "$VNC_DISPLAY" != "__NEXT_VNC__" ]; then
         DISPLAY_OPT="-vnc ${VNC_DISPLAY}"
@@ -230,10 +235,12 @@ if [ "$HEADLESS" -eq 1 ]; then
         DISPLAY_OPT="-vnc none"
     fi
 elif [ "$LOG_TO_FILE" -eq 1 ]; then
-    # Interactive + log: COM1 goes to a file, COM2 (added below) goes to stdio for live view.
-    # The kernel only initialises COM1 so all serial output lands in the log.
-    # A second -serial stdio gives the QEMU monitor / user a live terminal.
-    SERIAL_OPT="-chardev file,id=ser0,path=${LOG_FILE} -serial chardev:ser0 -serial stdio"
+    # Interactive + log: serial to file via FIFO (unbuffered), tee to terminal live
+    rm -f "${SERIAL_FIFO}"
+    mkfifo "${SERIAL_FIFO}"
+    tee "${LOG_FILE}" < "${SERIAL_FIFO}" &
+    TEE_PID=$!
+    SERIAL_OPT="-serial file:${SERIAL_FIFO}"
     DISPLAY_OPT="-display gtk"
     echo "  Serial log: ${LOG_FILE}"
 else
@@ -274,3 +281,9 @@ qemu-system-x86_64 \
     -no-shutdown \
     ${DEBUG_FLAGS} \
     "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+
+# Clean up FIFO and tee process if used
+if [ "$HEADLESS" -eq 1 ] || [ "$LOG_TO_FILE" -eq 1 ]; then
+    wait "${TEE_PID}" 2>/dev/null || true
+    rm -f "${SERIAL_FIFO}"
+fi
