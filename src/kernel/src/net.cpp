@@ -1158,6 +1158,13 @@ void SockUnref(int sockIdx)
         SockClose(sockIdx);
 }
 
+void SockSetPollWaiter(int sockIdx, Process* waiter)
+{
+    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return;
+    if (!g_sockUsed[sockIdx]) return;
+    g_sockets[sockIdx].pollWaiter = waiter;
+}
+
 void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
                     uint32_t dstIp, uint16_t dstPort,
                     const void* data, uint32_t len)
@@ -1174,8 +1181,12 @@ void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
         // Match — enqueue datagram
         // Format: [len:4][srcIp:4][srcPort:2][data:len]
         uint32_t needed = 10 + len;
+
+        uint64_t irqFlags = SpinLockAcquire(&s.lock);
+
         uint32_t avail = Socket::RX_BUF_SIZE - s.rxCount;
         if (needed > avail) {
+            SpinLockRelease(&s.lock, irqFlags);
             SerialPrintf("net: socket %u rx buffer full, dropping\n", i);
             return;
         }
@@ -1204,6 +1215,16 @@ void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
 
         __asm__ volatile("mfence" ::: "memory");
         s.rxCount += needed;
+
+        Process* waiter = s.pollWaiter;
+        if (waiter) s.pollWaiter = nullptr;
+
+        SpinLockRelease(&s.lock, irqFlags);
+
+        // Wake poll waiter after releasing the lock
+        if (waiter)
+            SchedulerUnblock(waiter);
+
         return; // only deliver to first matching socket
     }
 }
@@ -1240,7 +1261,8 @@ static void TcpSendSegment(Socket& s, uint8_t flags,
     NetSendIpv4(s.remoteIp, IP_PROTO_TCP, buf, tcpLen);
 }
 
-// Append raw bytes to socket RX ring buffer
+// Append raw bytes to socket RX ring buffer.
+// Caller MUST hold s.lock.
 static void TcpEnqueueData(Socket& s, const void* data, uint32_t len)
 {
     uint32_t avail = Socket::RX_BUF_SIZE - s.rxCount;
@@ -1253,6 +1275,7 @@ static void TcpEnqueueData(Socket& s, const void* data, uint32_t len)
     }
     __asm__ volatile("mfence" ::: "memory");
     s.rxCount += len;
+    // Caller (HandleTcp) wakes pollWaiter after releasing the lock.
 }
 
 void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
@@ -1268,6 +1291,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
     uint32_t seq     = ntohl(tcp->seqNum);
     uint32_t ack     = ntohl(tcp->ackNum);
     uint8_t  flags   = tcp->flags;
+    uint16_t window  = ntohs(tcp->window);
     const uint8_t* tcpData = static_cast<const uint8_t*>(payload) + dataOff;
     uint32_t dataLen = len - dataOff;
 
@@ -1280,13 +1304,37 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         if (s.remotePort != srcPort) continue;
         if (s.remoteIp != ip->srcIp) continue;
 
+        uint64_t irqFlags = SpinLockAcquire(&s.lock);
+
+        // Update peer's advertised window
+        s.tcpSndWnd = window;
+
+        // Diagnostic: log all segments in Established state
+        if (s.tcpState == TcpState::Established || s.tcpState == TcpState::SynSent) {
+            SerialPrintf("tcp: RX flags=0x%02x seq=%u ack=%u datalen=%u rcvNxt=%u\n",
+                         flags, seq, ack, dataLen, s.tcpRcvNxt);
+        }
+
         // Delegate to testable state machine
         TcpAction act = TcpProcessSegment(s, seq, ack, flags, tcpData, dataLen);
 
         if (act.enqueueData && act.dataPtr && act.dataLen > 0)
             TcpEnqueueData(s, act.dataPtr, act.dataLen);
+
+        SpinLockRelease(&s.lock, irqFlags);
+
         if (act.sendAck)
             TcpSendSegment(s, TCP_ACK, nullptr, 0);
+
+        // Wake poll waiter on any state change that could make the socket ready
+        // (connection established, data received, FIN/RST received, error)
+        if (s.pollWaiter && (s.rxCount > 0 || s.connected || s.tcpFinRecv ||
+            s.tcpRstRecv ||
+            (s.tcpState != TcpState::SynSent && s.tcpState != TcpState::SynRecv)))
+        {
+            SchedulerUnblock(s.pollWaiter);
+            s.pollWaiter = nullptr;
+        }
 
         return; // handled
     }
@@ -1418,6 +1466,8 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
     s.tcpSndUna = s.tcpSndIss;
     s.tcpRcvNxt = 0;
     s.tcpFinRecv = false;
+    s.tcpRstRecv = false;
+    s.tcpSndWnd  = 65535; // assume full window until server tells us otherwise
     s.tcpState = TcpState::SynSent;
 
     // Send SYN
@@ -1438,7 +1488,7 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
             SerialPrintf("tcp: connected!\n");
             return 0;
         }
-        if (s.tcpState == TcpState::Closed) {
+        if (s.tcpState == TcpState::Closed || s.tcpRstRecv) {
             SerialPrintf("tcp: connection refused (RST)\n");
             return -111; // ECONNREFUSED
         }
@@ -1455,7 +1505,7 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
             SerialPrintf("tcp: connected (retry)!\n");
             return 0;
         }
-        if (s.tcpState == TcpState::Closed) return -111;
+        if (s.tcpState == TcpState::Closed || s.tcpRstRecv) return -111;
         __asm__ volatile("pause");
     }
 
@@ -1511,6 +1561,10 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
     // Wait for data (with timeout, ~10 seconds)
     for (int i = 0; i < 10000000; i++) {
         if (s.rxCount > 0) break;
+        if (s.tcpRstRecv) {
+            SerialPrintf("tcp: SockRecv ECONNRESET (RST)\n");
+            return -104; // ECONNRESET
+        }
         if (s.tcpFinRecv) return 0; // EOF
         if (s.tcpState == TcpState::Closed) return 0;
         if (g_netIf && g_netIf->poll) g_netIf->poll(g_netIf);
@@ -1518,12 +1572,14 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
     }
 
     if (s.rxCount == 0) {
+        if (s.tcpRstRecv) return -104; // ECONNRESET
         if (s.tcpFinRecv || s.tcpState != TcpState::Established)
             return 0; // EOF
         return -11; // EAGAIN
     }
 
     // Stream read — no framing, just read bytes from ring buffer
+    uint64_t irqFlags = SpinLockAcquire(&s.lock);
     uint32_t copyLen = s.rxCount < len ? s.rxCount : len;
     uint8_t* dst = static_cast<uint8_t*>(buf);
     for (uint32_t i = 0; i < copyLen; i++) {
@@ -1532,6 +1588,7 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
     }
     __asm__ volatile("mfence" ::: "memory");
     s.rxCount -= copyLen;
+    SpinLockRelease(&s.lock, irqFlags);
 
     return static_cast<int>(copyLen);
 }
@@ -1574,6 +1631,7 @@ bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite)
         if (s.listening && s.acceptQueueCount > 0) return true;
         if (s.rxCount > 0) return true;
         if (s.tcpFinRecv) return true; // EOF is readable
+        if (s.tcpRstRecv) return true; // RST is readable (returns ECONNRESET)
         if (s.type == SOCK_STREAM &&
             s.tcpState != TcpState::Established &&
             s.tcpState != TcpState::SynSent &&
@@ -1726,6 +1784,8 @@ static void DebugChannelThreadFn(void* /*arg*/)
     s.tcpSndUna  = s.tcpSndIss;
     s.tcpRcvNxt  = 0;
     s.tcpFinRecv = false;
+    s.tcpRstRecv = false;
+    s.tcpSndWnd  = 65535;
     s.tcpState   = TcpState::SynSent;
 
     TcpSendSegment(s, TCP_SYN, nullptr, 0);

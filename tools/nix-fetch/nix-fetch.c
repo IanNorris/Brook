@@ -31,9 +31,20 @@
 static const char *g_cache_url  = "https://cache.nixos.org";
 static const char *g_store_dir  = "/nix/store";
 static const char *g_curl_path  = NULL;
+static const char *g_cacert_path = NULL;
 static const char *g_xz_path    = NULL;
 static const char *g_unpack_path = NULL;
 static int g_fetch_deps = 0;
+
+/* exec curl with optional --cacert; never returns on success */
+static void exec_curl(const char *url) {
+    if (g_cacert_path)
+        execlp(g_curl_path, "curl", "-4", "-sL", "--cacert", g_cacert_path, url, (char*)NULL);
+    else
+        execlp(g_curl_path, "curl", "-4", "-sL", url, (char*)NULL);
+    perror("execl curl");
+    _exit(127);
+}
 
 /* Find a binary, checking env var first, then common Nix store paths */
 static const char *find_binary(const char *env_var, const char *name,
@@ -76,9 +87,7 @@ static int curl_fetch(const char *url, char *buf, size_t bufsz) {
         close(pfd[0]);
         dup2(pfd[1], STDOUT_FILENO);
         close(pfd[1]);
-        execl(g_curl_path, "curl", "-4", "-sL", url, NULL);
-        perror("execl curl");
-        _exit(127);
+        exec_curl(url);
     }
 
     close(pfd[1]);
@@ -149,8 +158,7 @@ static int download_and_extract(const char *nar_url, const char *compression,
             close(pipe1[0]); close(pipe2[0]); close(pipe2[1]);
             dup2(pipe1[1], STDOUT_FILENO);
             close(pipe1[1]);
-            execl(g_curl_path, "curl", "-4", "-sL", full_url, NULL);
-            _exit(127);
+            exec_curl(full_url);
         }
 
         /* xz -d */
@@ -212,8 +220,7 @@ static int download_and_extract(const char *nar_url, const char *compression,
             close(pfd[0]);
             dup2(pfd[1], STDOUT_FILENO);
             close(pfd[1]);
-            execl(g_curl_path, "curl", "-4", "-sL", full_url, NULL);
-            _exit(127);
+            exec_curl(full_url);
         }
 
         pid_t pid_unpack = fork();
@@ -362,8 +369,13 @@ int main(int argc, char **argv) {
 
     const char *curl_paths[] = {
         "/nix/store/xkqd49dmldkqn4xk6dlm640f5blbv6hp-curl-8.18.0-bin/bin/curl",
-        "/nix/bin/curl",
+        "/nix/bin/curl",   // static mini-curl fallback
         "/usr/bin/curl",
+    };
+    const char *cacert_paths[] = {
+        "/nix/store/mg063aj0crwhchqayf2qbyf28k6mlrxm-nss-cacert-3.121/etc/ssl/certs/ca-bundle.crt",
+        "/etc/ssl/certs/ca-bundle.crt",
+        "/etc/ssl/certs/ca-certificates.crt",
     };
     const char *xz_paths[] = {
         "/nix/store/g6mlwdvpg92rchq352ll7jbi0pz7h43r-xz-5.8.2-bin/bin/xz",
@@ -379,11 +391,22 @@ int main(int argc, char **argv) {
     g_xz_path = find_binary("XZ_PATH", "xz", xz_paths, 3);
     g_unpack_path = find_binary("NAR_UNPACK_PATH", "nar-unpack", unpack_paths, 2);
 
+    /* Find CA certificate bundle */
+    const char *cacert_env = getenv("CURL_CA_BUNDLE");
+    if (cacert_env && access(cacert_env, R_OK) == 0) {
+        g_cacert_path = cacert_env;
+    } else {
+        for (int i = 0; i < 3; i++) {
+            if (access(cacert_paths[i], R_OK) == 0) { g_cacert_path = cacert_paths[i]; break; }
+        }
+    }
+
     if (!g_curl_path)   { fprintf(stderr, "nix-fetch: curl not found\n"); return 1; }
     if (!g_xz_path)     { fprintf(stderr, "nix-fetch: xz not found\n"); return 1; }
     if (!g_unpack_path) { fprintf(stderr, "nix-fetch: nar-unpack not found\n"); return 1; }
 
     printf("nix-fetch: curl=%s\n", g_curl_path);
+    printf("nix-fetch: cacert=%s\n", g_cacert_path ? g_cacert_path : "(none)");
     printf("nix-fetch: xz=%s\n", g_xz_path);
     printf("nix-fetch: nar-unpack=%s\n", g_unpack_path);
     printf("nix-fetch: store=%s\n", g_store_dir);

@@ -60,6 +60,14 @@ bool CpuHasSse2()
     return (edx >> 26) & 1;
 }
 
+bool CpuHasRdrand()
+{
+    // CPUID leaf 1, ECX bit 30 = RDRAND support.
+    uint32_t ecx;
+    __asm__ volatile("cpuid" : "=c"(ecx) : "a"(1) : "ebx", "edx");
+    return (ecx >> 30) & 1;
+}
+
 // ---------------------------------------------------------------------------
 // SYSCALL / SYSRET MSR setup
 // ---------------------------------------------------------------------------

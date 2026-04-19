@@ -38,8 +38,9 @@ TcpAction TcpProcessSegment(Socket& s,
             s.connected = true;
             act.sendAck = true;
         } else if (flags & TCP_RST) {
-            s.tcpState  = TcpState::Closed;
-            s.connected = false;
+            s.tcpState   = TcpState::Closed;
+            s.connected  = false;
+            s.tcpRstRecv = true;
         }
         break;
 
@@ -47,7 +48,7 @@ TcpAction TcpProcessSegment(Socket& s,
         if (flags & TCP_RST) {
             s.tcpState   = TcpState::Closed;
             s.connected  = false;
-            s.tcpFinRecv = true;
+            s.tcpRstRecv = true; // RST ≠ FIN: report as ECONNRESET, not EOF
             return act;
         }
 

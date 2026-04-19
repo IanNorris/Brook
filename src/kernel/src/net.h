@@ -3,10 +3,13 @@
 // Minimal network stack: Ethernet, ARP, IPv4, ICMP, UDP, TCP.
 
 #pragma once
+#include "spinlock.h"
 
 #include <stdint.h>
 
 namespace brook {
+
+struct Process;  // forward declaration for poll waiter
 
 // ---------------------------------------------------------------------------
 // Ethernet
@@ -236,7 +239,6 @@ struct Socket {
     uint16_t  remotePort;  // big-endian
     bool      bound;
     bool      connected;
-
     // Receive buffer (ring buffer for incoming data)
     static constexpr uint32_t RX_BUF_SIZE = 65536;
     uint8_t*  rxBuf;
@@ -254,7 +256,9 @@ struct Socket {
     uint32_t  tcpSndUna;   // oldest unacknowledged
     uint32_t  tcpRcvNxt;   // next expected receive sequence
     uint32_t  tcpSndIss;   // initial send sequence number
+    uint16_t  tcpSndWnd;   // peer's advertised receive window (host-endian)
     volatile bool tcpFinRecv; // FIN received from peer
+    volatile bool tcpRstRecv; // RST received from peer (→ ECONNRESET)
 
     // Listen/accept queue (server-side)
     static constexpr int ACCEPT_QUEUE_MAX = 16;
@@ -266,6 +270,13 @@ struct Socket {
 
     // Reference counting for fork/dup
     volatile uint32_t refCount;        // number of fds pointing at this socket (1 on create)
+
+    // Poll waiter — process to wake when data arrives
+    Process* pollWaiter;
+
+    // Spinlock protecting rxBuf/rxHead/rxTail/rxCount and TCP state fields.
+    // Acquired by both the IRQ handler (HandleTcp) and userspace syscall paths.
+    SpinLock lock;
 };
 
 // Create a kernel socket. Returns socket index or negative error.
@@ -284,6 +295,7 @@ void SockGetLocal(int sockIdx, uint32_t* ip, uint16_t* port);
 int  SockListen(int sockIdx, int backlog);
 int  SockAccept(int sockIdx, SockAddrIn* addr);
 bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite);
+void SockSetPollWaiter(int sockIdx, Process* waiter);
 void SockClose(int sockIdx);
 void SockRef(int sockIdx);    // increment refcount (fork/dup)
 void SockUnref(int sockIdx);  // decrement refcount, destroy at 0
