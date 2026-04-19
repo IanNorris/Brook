@@ -204,17 +204,9 @@ static void HandleArp(const uint8_t* frame, uint32_t len)
     if (op == ARP_OP_REQUEST) {
         // Is this for us?
         if (g_netIf && arp->tpa == g_netIf->ipAddr) {
-            SerialPrintf("net: ARP request for our IP, sending reply\n");
             ArpSendReply(arp->sha, arp->spa);
         }
     } else if (op == ARP_OP_REPLY) {
-        static uint32_t s_arpReplyCount = 0;
-        s_arpReplyCount++;
-        if (s_arpReplyCount <= 3 || (s_arpReplyCount % 1000) == 0)
-            SerialPrintf("net: ARP reply from %d.%d.%d.%d [#%u]\n",
-                         arp->spa & 0xFF, (arp->spa >> 8) & 0xFF,
-                         (arp->spa >> 16) & 0xFF, (arp->spa >> 24) & 0xFF,
-                         s_arpReplyCount);
 
         // Wake up anyone waiting for this ARP reply
         if (arp->spa == g_arpReplyIp) {
