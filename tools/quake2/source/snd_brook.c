@@ -24,16 +24,10 @@
 
 static int audio_fd = -1;
 static int snd_inited = 0;
-static int submit_pos = 0;  /* mono samples written so far */
+static int snd_start_ms = 0;
 
 #define SND_BUF_SAMPLES  16384  /* total mono samples in ring buffer */
 static unsigned char dma_buffer[SND_BUF_SAMPLES * 2 * 2]; /* 16-bit stereo */
-
-/* Pending SFX buffer: filled by SNDDMA_Submit, consumed by SFX_MixInto.
- * Holds at most one frame of 11025 Hz stereo int16 audio (~460 frames = 1840 bytes). */
-#define SFX_PENDING_BYTES  4096
-static unsigned char g_sfx_pending[SFX_PENDING_BYTES];
-int g_sfx_pending_bytes = 0;
 
 qboolean SNDDMA_Init(void)
 {
@@ -68,7 +62,7 @@ qboolean SNDDMA_Init(void)
     dma.buffer = dma_buffer;
 
     memset(dma_buffer, 0, sizeof(dma_buffer));
-    submit_pos = 0;
+    snd_start_ms = Sys_Milliseconds();
     snd_inited = 1;
 
     Com_Printf("SNDDMA_Init: /dev/dsp opened, %d Hz, 16-bit stereo\n", dma.speed);
@@ -80,7 +74,12 @@ int SNDDMA_GetDMAPos(void)
     if (!snd_inited)
         return 0;
 
-    dma.samplepos = submit_pos & (dma.samples - 1);
+    /* Return a position that advances at exactly dma.speed * dma.channels int16
+     * values per second in real time.  GetSoundtime() divides by dma.channels,
+     * so soundtime advances at dma.speed pairs/sec — correct for 11025 Hz. */
+    int elapsed_ms = Sys_Milliseconds() - snd_start_ms;
+    int total = (int)((long long)elapsed_ms * dma.speed * dma.channels / 1000);
+    dma.samplepos = total & (dma.samples - 1);
     return dma.samplepos;
 }
 
@@ -98,67 +97,51 @@ void SNDDMA_BeginPainting(void)
 {
 }
 
+/* SNDDMA_Submit is a no-op: SFX audio is read directly from dma_buffer by
+ * SFX_MixInto using paintedtime.  Q2 calls this after each mix cycle but
+ * we don't need to do anything here. */
 void SNDDMA_Submit(void)
 {
-    if (!snd_inited)
-        return;
-
-    extern int paintedtime;
-    int new_samples = (paintedtime - (submit_pos / dma.channels)) * dma.channels;
-    if (new_samples <= 0)
-    {
-        g_sfx_pending_bytes = 0;
-        return;
-    }
-
-    /* Cap at one frame's worth at 11025 Hz to avoid getting too far ahead */
-    int max_samples = (11025 / 25 + 16) * dma.channels;
-    if (new_samples > max_samples)
-        new_samples = max_samples;
-
-    int sample_bytes = dma.samplebits / 8;
-    int buf_len = dma.samples * sample_bytes;
-    int pos = (submit_pos * sample_bytes) & (buf_len - 1);
-    int total_bytes = new_samples * sample_bytes;
-    if (total_bytes > SFX_PENDING_BYTES)
-        total_bytes = SFX_PENDING_BYTES;
-
-    /* Copy from ring buffer (handling wrap) into pending buffer for cd_brook.c */
-    int chunk1 = buf_len - pos;
-    if (chunk1 > total_bytes) chunk1 = total_bytes;
-    memcpy(g_sfx_pending, dma_buffer + pos, chunk1);
-    if (chunk1 < total_bytes)
-        memcpy(g_sfx_pending + chunk1, dma_buffer, total_bytes - chunk1);
-
-    g_sfx_pending_bytes = total_bytes;
-    submit_pos += new_samples;
 }
 
 /*
- * SFX_MixInto — called by cd_brook.c to blend pending SFX into the CD audio
- * buffer before writing to /dev/dsp.  Resamples from 11025 Hz to 44100 Hz
- * (nearest-neighbour, 4× upsample) and adds with int16 clamping.
- * Clears the pending buffer on return.
+ * SFX_MixInto — blend this frame's SFX into dst (44100 Hz stereo int16).
+ *
+ * Reads exactly dst_frames * dma.speed / 44100 frames directly from
+ * dma_buffer ending at paintedtime — always correct pitch regardless of
+ * framerate.  Uses nearest-neighbour upsample (dma.speed → 44100 Hz).
  */
 int SFX_MixInto(short* dst, int dst_frames)
 {
-    if (g_sfx_pending_bytes <= 0)
+    if (!snd_inited || !dma.buffer || dst_frames <= 0)
         return 0;
 
-    int src_frames = g_sfx_pending_bytes / 4; /* 4 bytes = 1 stereo int16 frame */
-    short* src = (short*)g_sfx_pending;
+    extern int paintedtime;
+
+    /* Compute how many dma.speed-Hz stereo frames correspond to dst_frames
+     * at 44100 Hz.  dma.speed/44100 = 11025/44100 = 1/4. */
+    int src_frames = dst_frames * dma.speed / 44100;
+    if (src_frames <= 0)
+        return 0;
+
+    /* dma_buffer is a ring of (dma.samples / dma.channels) stereo frames.
+     * paintedtime is the mix cursor in stereo frames.
+     * The most recently mixed audio is in [paintedtime - src_frames, paintedtime). */
+    int stereo_ring = dma.samples >> 1;              /* 8192 stereo frames */
+    int bytes_per_frame = (dma.samplebits / 8) * dma.channels; /* 4 */
+    int start = paintedtime - src_frames;
 
     for (int i = 0; i < dst_frames; i++)
     {
         int si = (int)((long long)i * src_frames / dst_frames);
-        if (si >= src_frames) si = src_frames - 1;
+        int frame = (start + si) & (stereo_ring - 1);
+        short* src = (short*)(dma_buffer + frame * bytes_per_frame);
 
-        int l = (int)dst[i*2]   + (int)src[si*2];
-        int r = (int)dst[i*2+1] + (int)src[si*2+1];
+        int l = (int)dst[i*2]   + (int)src[0];
+        int r = (int)dst[i*2+1] + (int)src[1];
         dst[i*2]   = l >  32767 ?  32767 : l < -32768 ? -32768 : (short)l;
         dst[i*2+1] = r >  32767 ?  32767 : r < -32768 ? -32768 : (short)r;
     }
 
-    g_sfx_pending_bytes = 0;
     return dst_frames;
 }

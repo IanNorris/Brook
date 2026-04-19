@@ -240,7 +240,7 @@ qemu-system-x86_64 \
     -audiodev ${BROOK_AUDIODEV:-pipewire},id=hda0,out.buffer-length=200000,timer-period=5000 \
     -device ich9-intel-hda,bus=pcie.0,addr=0x1b \
     -device hda-output,audiodev=hda0 \
-    -netdev user,id=net0,hostfwd=tcp::11235-:1234 \
+    -netdev user,id=net0,hostfwd=tcp::11236-:1234 \
     ${SERIAL_OPT} \
     ${DISPLAY_OPT} \
     -monitor unix:/tmp/qemu_monitor.sock,server,nowait \
