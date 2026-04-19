@@ -1423,6 +1423,63 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     if (StrEq(lookupPath, "/proc/self/exe"))
         return -ENOENT;
 
+    // /dev/shm/<name> — POSIX shared memory via memfd
+    // glibc shm_open() calls open("/dev/shm/<name>", flags, mode)
+    if (lookupPath[0] == '/' &&
+        lookupPath[1] == 'd' && lookupPath[2] == 'e' && lookupPath[3] == 'v' &&
+        lookupPath[4] == '/' && lookupPath[5] == 's' && lookupPath[6] == 'h' &&
+        lookupPath[7] == 'm' && lookupPath[8] == '/')
+    {
+        static constexpr int SHM_MAX = 32;
+        struct ShmEntry { char name[64]; MemFdData* mfd; bool used; };
+        static ShmEntry s_shm[SHM_MAX];
+
+        const char* shmName = lookupPath + 9; // skip "/dev/shm/"
+        static constexpr uint64_t LINUX_O_CREAT_SHM  = 0x40;
+        static constexpr uint64_t LINUX_O_TRUNC_SHM  = 0x200;
+        bool create = (flags & LINUX_O_CREAT_SHM) != 0;
+        bool trunc  = (flags & LINUX_O_TRUNC_SHM) != 0;
+
+        // Find existing entry
+        ShmEntry* entry = nullptr;
+        for (int i = 0; i < SHM_MAX; i++) {
+            if (!s_shm[i].used) continue;
+            const char* a = s_shm[i].name; const char* b = shmName;
+            bool match = true;
+            while (*a || *b) { if (*a++ != *b++) { match = false; break; } }
+            if (match) { entry = &s_shm[i]; break; }
+        }
+
+        if (!entry && !create) return -ENOENT;
+
+        if (!entry) {
+            // Allocate new shm entry
+            for (int i = 0; i < SHM_MAX; i++) {
+                if (!s_shm[i].used) { entry = &s_shm[i]; break; }
+            }
+            if (!entry) return -ENOMEM;
+            for (int i = 0; i < 63 && shmName[i]; i++) entry->name[i] = shmName[i];
+            entry->name[63] = 0;
+            entry->mfd = static_cast<MemFdData*>(kmalloc(sizeof(MemFdData)));
+            if (!entry->mfd) return -ENOMEM;
+            entry->mfd->buf = nullptr;
+            entry->mfd->size = 0;
+            entry->mfd->capacity = 0;
+            entry->used = true;
+        }
+
+        if (trunc) {
+            if (entry->mfd->buf) { kfree(entry->mfd->buf); entry->mfd->buf = nullptr; }
+            entry->mfd->size = 0;
+            entry->mfd->capacity = 0;
+        }
+
+        int fd = FdAlloc(proc, FdType::MemFd, entry->mfd);
+        if (fd < 0) return -EMFILE;
+        SerialPrintf("shm_open: '%s' fd=%d size=%llu\n", shmName, fd, entry->mfd->size);
+        return fd;
+    }
+
     // Translate Linux open flags to VFS flags
     uint32_t vfsFlags = VFS_O_READ;
     static constexpr uint64_t LINUX_O_WRONLY = 1;
@@ -5538,6 +5595,15 @@ static int64_t sys_unlink(uint64_t pathAddr, uint64_t, uint64_t,
 {
     const char* path = reinterpret_cast<const char*>(pathAddr);
     if (!path) return -EFAULT;
+
+    // /dev/shm/<name> — shm_unlink: mark entry as free
+    if (path[0]=='/' && path[1]=='d' && path[2]=='e' && path[3]=='v' &&
+        path[4]=='/' && path[5]=='s' && path[6]=='h' && path[7]=='m' && path[8]=='/') {
+        // Leave the MemFdData alive (other fds may still reference it)
+        // Just make it invisible to future shm_open calls
+        SerialPrintf("shm_unlink: '%s' (ignored — fds stay valid)\n", path + 9);
+        return 0;
+    }
 
     // Try as-is first, then with /boot prefix
     if (VfsUnlink(path) == 0) return 0;
