@@ -49,7 +49,11 @@ static MacAddr  g_arpReplyMac;
 static Process* g_arpWaiter = nullptr;
 
 // Socket table
-static constexpr uint32_t MAX_SOCKETS = 64;
+// TODO: Replace with per-process dynamic socket pool to support high socket
+// counts. The current global fixed table limits the whole system to
+// MAX_SOCKETS simultaneous sockets. Each socket heap-allocates 64KB for its
+// RX ring, so the practical limit is bounded by physical RAM anyway.
+static constexpr uint32_t MAX_SOCKETS = 1024;
 static Socket g_sockets[MAX_SOCKETS];
 static bool   g_sockUsed[MAX_SOCKETS];
 
@@ -1033,6 +1037,7 @@ int SockCreate(int domain, int type, int protocol)
             return static_cast<int>(i);
         }
     }
+    SerialPrintf("net: socket table full (MAX_SOCKETS=%u) — all slots in use\n", MAX_SOCKETS);
     return -1; // no free sockets
 }
 

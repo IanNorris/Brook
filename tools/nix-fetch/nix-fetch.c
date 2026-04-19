@@ -36,12 +36,30 @@ static const char *g_xz_path    = NULL;
 static const char *g_unpack_path = NULL;
 static int g_fetch_deps = 0;
 
+/* Set of hashes already fetched or in-progress — prevents redundant downloads
+ * when a package lists itself in its own References, or when the same dep
+ * appears in multiple dependency chains. */
+#define MAX_SEEN 256
+static char g_seen_hashes[MAX_SEEN][33];
+static int  g_seen_count = 0;
+
+static int hash_is_seen(const char *hash) {
+    for (int i = 0; i < g_seen_count; i++)
+        if (memcmp(g_seen_hashes[i], hash, 32) == 0) return 1;
+    return 0;
+}
+
+static void hash_mark_seen(const char *hash) {
+    if (g_seen_count < MAX_SEEN)
+        memcpy(g_seen_hashes[g_seen_count++], hash, 33);
+}
+
 /* exec curl with optional --cacert; never returns on success */
 static void exec_curl(const char *url) {
     if (g_cacert_path)
-        execlp(g_curl_path, "curl", "-4", "-sL", "--cacert", g_cacert_path, url, (char*)NULL);
+        execlp(g_curl_path, "curl", "-4", "-SL", "--cacert", g_cacert_path, url, (char*)NULL);
     else
-        execlp(g_curl_path, "curl", "-4", "-sL", url, (char*)NULL);
+        execlp(g_curl_path, "curl", "-4", "-SL", url, (char*)NULL);
     perror("execl curl");
     _exit(127);
 }
@@ -262,19 +280,33 @@ static void fetch_dependencies(const char *refs_str) {
             memcpy(ref_hash, tok, 32);
             ref_hash[32] = '\0';
 
-            /* Check if already present */
+            /* Skip if already fetched or in-progress (prevents self-referential
+             * packages and duplicate work across shared dependency chains) */
+            if (hash_is_seen(ref_hash)) {
+                tok = strtok(NULL, " \t");
+                continue;
+            }
+
+            /* Also skip if the store path already exists on disk */
             char path[MAX_PATH];
             snprintf(path, sizeof(path), "%s/%s", g_store_dir, tok);
-            if (access(path, F_OK) != 0) {
-                printf("  Fetching dependency: %s\n", tok);
-                fetch_package(ref_hash);
+            if (access(path, F_OK) == 0) {
+                tok = strtok(NULL, " \t");
+                continue;
             }
+
+            printf("  Fetching dependency: %s\n", tok);
+            fetch_package(ref_hash);
         }
         tok = strtok(NULL, " \t");
     }
 }
 
 static int fetch_package(const char *hash) {
+    /* Guard against self-referential packages and shared deps in parallel chains */
+    if (hash_is_seen(hash)) return 0;
+    hash_mark_seen(hash);
+
     char url[MAX_PATH];
     snprintf(url, sizeof(url), "%s/%s.narinfo", g_cache_url, hash);
 
