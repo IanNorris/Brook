@@ -155,6 +155,18 @@ static constexpr uint64_t SYS_SOCKETPAIR      = 53;
 static constexpr uint64_t SYS_SETSOCKOPT      = 54;
 static constexpr uint64_t SYS_GETSOCKOPT      = 55;
 
+// Wayland/epoll syscalls
+static constexpr uint64_t SYS_EPOLL_CREATE    = 213;
+static constexpr uint64_t SYS_EPOLL_WAIT      = 232;
+static constexpr uint64_t SYS_EPOLL_CTL       = 233;
+static constexpr uint64_t SYS_EPOLL_PWAIT     = 281;
+static constexpr uint64_t SYS_TIMERFD_CREATE  = 283;
+static constexpr uint64_t SYS_TIMERFD_SETTIME = 286;
+static constexpr uint64_t SYS_TIMERFD_GETTIME = 287;
+static constexpr uint64_t SYS_EPOLL_CREATE1   = 291;
+static constexpr uint64_t SYS_MEMFD_CREATE    = 319;
+static constexpr uint64_t SYS_MEMFD_SECRET    = 447;
+
 // Syscall function type -- same signature as Linux: returns int64_t,
 // up to 6 arguments via rdi, rsi, rdx, r10->rcx, r8, r9.
 using SyscallFn = int64_t(*)(uint64_t, uint64_t, uint64_t,

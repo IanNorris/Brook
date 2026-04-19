@@ -186,6 +186,10 @@ enum class FdType : uint8_t
     DevTty,        // /dev/tty — bidirectional terminal (read=stdin pipe, write=stdout pipe)
     EventFd,       // eventfd — uint64 counter for event notification
     DevDsp,        // /dev/dsp — OSS audio output
+    EpollFd,       // epoll instance
+    TimerFd,       // timerfd — timer-based event notification
+    MemFd,         // memfd_create — anonymous in-memory file
+    UnixSocket,    // AF_UNIX domain socket
 };
 
 struct TtyDevicePair {

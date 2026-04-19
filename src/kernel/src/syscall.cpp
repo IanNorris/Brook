@@ -235,6 +235,31 @@ static constexpr uint32_t EFD_SEMAPHORE = 0x01;
 [[maybe_unused]] static constexpr uint32_t EFD_CLOEXEC = 0x80000;
 static constexpr uint32_t EFD_NONBLOCK  = 0x800;
 
+// timerfd constants and data — defined here so sys_read/sys_poll can use them
+static constexpr int TFD_NONBLOCK     = 0x800;
+static constexpr int TFD_CLOEXEC      = 0x80000;
+static constexpr int TFD_TIMER_ABSTIME = 1;
+static constexpr uint64_t LAPIC_TICKS_PER_MS = 1; // LAPIC ticks ≈ 1ms each
+
+struct TimerFdData {
+    volatile uint64_t expiryCount; // number of expirations since last read
+    uint64_t  intervalNs;          // interval in nanoseconds (0 = one-shot)
+    uint64_t  nextExpiry;          // absolute LAPIC tick of next expiry
+    int       clockId;
+    bool      armed;
+    Process*  waiter;              // process blocked in read() or epoll
+};
+
+// memfd constants and data — defined here so sys_read/sys_write/fstat can use them
+static constexpr uint32_t MFD_CLOEXEC       = 0x0001u;
+[[maybe_unused]] static constexpr uint32_t MFD_ALLOW_SEALING = 0x0002u;
+
+struct MemFdData {
+    uint8_t*  buf;
+    uint64_t  size;
+    uint64_t  capacity;
+};
+
 // ---------------------------------------------------------------------------
 // OSS /dev/dsp state and ioctl definitions
 // ---------------------------------------------------------------------------
@@ -561,6 +586,33 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 return written > 0 ? static_cast<int64_t>(written) : -EINTR;
         }
         return static_cast<int64_t>(written);
+    }
+
+    // Write to memfd — grows buffer as needed
+    if (fde->type == FdType::MemFd && fde->handle)
+    {
+        auto* mfd = static_cast<MemFdData*>(fde->handle);
+        uint64_t pos = fde->seekPos;
+        uint64_t end = pos + count;
+
+        // Grow buffer if needed
+        if (end > mfd->capacity) {
+            uint64_t newCap = end + 4096;
+            auto* newBuf = static_cast<uint8_t*>(kmalloc(static_cast<uint32_t>(newCap)));
+            if (!newBuf) return -ENOMEM;
+            if (mfd->buf) {
+                for (uint64_t i = 0; i < mfd->size; i++) newBuf[i] = mfd->buf[i];
+                kfree(mfd->buf);
+            }
+            mfd->buf = newBuf;
+            mfd->capacity = newCap;
+        }
+
+        if (bufAddr < 0x1000) return -EFAULT;
+        __builtin_memcpy(mfd->buf + pos, reinterpret_cast<const void*>(bufAddr), count);
+        fde->seekPos += count;
+        if (fde->seekPos > mfd->size) mfd->size = fde->seekPos;
+        return static_cast<int64_t>(count);
     }
 
     return -EBADF;
@@ -955,6 +1007,69 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                                static_cast<uint32_t>(count));
     }
 
+    // Read from timerfd — returns uint64 expiry count, blocks until armed+expired
+    if (fde->type == FdType::TimerFd && fde->handle)
+    {
+        if (count < 8) return -EINVAL;
+        auto* tfd = static_cast<TimerFdData*>(fde->handle);
+        bool nonblock = (fde->statusFlags & 0x800) != 0;
+
+        // Poll for expiry
+        for (;;) {
+            extern volatile uint64_t g_lapicTickCount;
+            uint64_t now = g_lapicTickCount;
+
+            // Check if timer has fired
+            if (tfd->armed && now >= tfd->nextExpiry) {
+                // Count how many intervals have elapsed
+                uint64_t elapsed = 1;
+                if (tfd->intervalNs > 0) {
+                    uint64_t intervalMs = tfd->intervalNs / 1000000ULL;
+                    if (intervalMs == 0) intervalMs = 1;
+                    uint64_t over = now - tfd->nextExpiry;
+                    elapsed = 1 + over / (intervalMs * LAPIC_TICKS_PER_MS);
+                    tfd->nextExpiry += elapsed * intervalMs * LAPIC_TICKS_PER_MS;
+                } else {
+                    tfd->armed = false; // one-shot
+                }
+
+                uint64_t total = __atomic_exchange_n(&tfd->expiryCount, 0, __ATOMIC_ACQ_REL) + elapsed;
+                __builtin_memcpy(reinterpret_cast<void*>(bufAddr), &total, 8);
+                return 8;
+            }
+
+            uint64_t pending = __atomic_exchange_n(&tfd->expiryCount, 0, __ATOMIC_ACQ_REL);
+            if (pending > 0) {
+                __builtin_memcpy(reinterpret_cast<void*>(bufAddr), &pending, 8);
+                return 8;
+            }
+
+            if (nonblock) return -EAGAIN;
+            if (!tfd->armed) return -EAGAIN;
+
+            // Block until next expiry
+            Process* self = ProcessCurrent();
+            tfd->waiter = self;
+            self->wakeupTick = tfd->nextExpiry;
+            SchedulerBlock(self);
+            tfd->waiter = nullptr;
+            if (HasPendingSignals()) return -EINTR;
+        }
+    }
+
+    // Read from memfd — sequential read from heap buffer
+    if (fde->type == FdType::MemFd && fde->handle)
+    {
+        auto* mfd = static_cast<MemFdData*>(fde->handle);
+        uint64_t pos = fde->seekPos;
+        if (pos >= mfd->size) return 0; // EOF
+        uint64_t avail = mfd->size - pos;
+        uint64_t copyLen = (count < avail) ? count : avail;
+        __builtin_memcpy(reinterpret_cast<void*>(bufAddr), mfd->buf + pos, copyLen);
+        fde->seekPos += copyLen;
+        return static_cast<int64_t>(copyLen);
+    }
+
     // Read from /dev/tty — reads from stdin pipe
     if (fde->type == FdType::DevTty && fde->handle)
     {
@@ -1330,6 +1445,23 @@ static int64_t sys_close(uint64_t fd, uint64_t, uint64_t,
         kfree(fde->handle);
     }
 
+    if (fde->type == FdType::EpollFd && fde->handle)
+    {
+        kfree(fde->handle);
+    }
+
+    if (fde->type == FdType::TimerFd && fde->handle)
+    {
+        kfree(fde->handle);
+    }
+
+    if (fde->type == FdType::MemFd && fde->handle)
+    {
+        auto* mfd = static_cast<MemFdData*>(fde->handle);
+        if (mfd->buf) kfree(mfd->buf);
+        kfree(mfd);
+    }
+
     if (fde->type == FdType::DevDsp && fde->handle)
     {
         auto* dsp = static_cast<DspState*>(fde->handle);
@@ -1525,6 +1657,13 @@ static int64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
         break;
     case SEEK_END:
     {
+        if (fde->type == FdType::MemFd && fde->handle) {
+            auto* mfd = static_cast<MemFdData*>(fde->handle);
+            int64_t newPos = static_cast<int64_t>(mfd->size) + soff;
+            if (newPos < 0) return -EINVAL;
+            fde->seekPos = static_cast<uint64_t>(newPos);
+            break;
+        }
         if (fde->type != FdType::Vnode || !fde->handle) return -EINVAL;
         auto* vn = static_cast<Vnode*>(fde->handle);
         VnodeStat st{};
@@ -3695,6 +3834,33 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
         return 0;
     }
 
+    if (fde->type == FdType::EpollFd) {
+        auto* raw = reinterpret_cast<uint8_t*>(st);
+        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        st->st_mode = 0100666;
+        st->st_blksize = 4096;
+        return 0;
+    }
+
+    if (fde->type == FdType::TimerFd) {
+        auto* raw = reinterpret_cast<uint8_t*>(st);
+        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        st->st_mode = 0100666;
+        st->st_blksize = 4096;
+        return 0;
+    }
+
+    if (fde->type == FdType::MemFd && fde->handle) {
+        auto* mfd = static_cast<MemFdData*>(fde->handle);
+        auto* raw = reinterpret_cast<uint8_t*>(st);
+        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        st->st_mode = 0100666; // S_IFREG | rw-rw-rw-
+        st->st_size = static_cast<int64_t>(mfd->size);
+        st->st_blksize = 4096;
+        st->st_blocks  = static_cast<int64_t>((mfd->size + 511) / 512);
+        return 0;
+    }
+
     return -EBADF;
 }
 
@@ -4241,6 +4407,28 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
             continue;
         }
 
+        if (fde->type == FdType::TimerFd && fde->handle)
+        {
+            auto* tfd = static_cast<TimerFdData*>(fde->handle);
+            if (fds[i].events & POLLIN)
+            {
+                extern volatile uint64_t g_lapicTickCount;
+                bool fired = (tfd->expiryCount > 0) ||
+                             (tfd->armed && g_lapicTickCount >= tfd->nextExpiry);
+                if (fired) fds[i].revents |= POLLIN;
+            }
+            if (fds[i].revents) ready++;
+            continue;
+        }
+
+        if (fde->type == FdType::MemFd)
+        {
+            if (fds[i].events & (POLLIN | POLLOUT))
+                fds[i].revents |= (fds[i].events & (POLLIN | POLLOUT));
+            if (fds[i].revents) ready++;
+            continue;
+        }
+
         // /dev/dsp: always writable (we buffer)
         if (fde->type == FdType::DevDsp)
         {
@@ -4570,6 +4758,486 @@ static int64_t sys_eventfd2(uint64_t initval, uint64_t flagsVal, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
+// epoll — Linux epoll_create / epoll_ctl / epoll_wait
+// ---------------------------------------------------------------------------
+//
+// Wayland compositors (weston, etc.) use epoll as their primary event loop.
+// We implement a simple but correct epoll supporting EPOLLIN/EPOLLOUT on
+// pipes, sockets, eventfds, timerfds, and other fd types.
+//
+// Data structures:
+//   EpollInstance  — the epoll fd's state (interest list + ready list)
+//   EpollEntry     — one registered fd (interest list entry)
+
+static constexpr uint32_t EPOLLIN      = 0x001;
+static constexpr uint32_t EPOLLOUT     = 0x004;
+[[maybe_unused]] static constexpr uint32_t EPOLLRDHUP   = 0x2000;
+[[maybe_unused]] static constexpr uint32_t EPOLLPRI     = 0x002;
+static constexpr uint32_t EPOLLERR     = 0x008;
+static constexpr uint32_t EPOLLHUP     = 0x010;
+[[maybe_unused]] static constexpr uint32_t EPOLLET      = (1u << 31);  // edge-triggered (ignored, always LT)
+[[maybe_unused]] static constexpr uint32_t EPOLLONESHOT = (1u << 30);
+
+[[maybe_unused]] static constexpr int EPOLL_CTL_ADD = 1;
+static constexpr int EPOLL_CTL_DEL = 2;
+static constexpr int EPOLL_CTL_MOD = 3;
+
+struct EpollEvent {
+    uint32_t events;
+    union {
+        int      fd;
+        uint64_t u64;
+        uint32_t u32;
+        void*    ptr;
+    } data;
+};
+
+static constexpr int EPOLL_MAX_FDS = 64;
+
+struct EpollEntry {
+    int      fd;      // watched fd (-1 = free)
+    uint32_t events;  // requested events
+    uint64_t data;    // user data (uint64)
+};
+
+struct EpollInstance {
+    EpollEntry entries[EPOLL_MAX_FDS];
+    int        count;
+    Process*   waiter; // process blocked in epoll_wait
+};
+
+// Check if a single fd is ready given the requested events mask.
+// Returns the set of events that are actually ready.
+static uint32_t EpollFdReady(Process* proc, int fd, uint32_t events)
+{
+    FdEntry* fde = FdGet(proc, fd);
+    if (!fde) return EPOLLERR | EPOLLHUP;
+
+    uint32_t ready = 0;
+
+    if (events & EPOLLIN) {
+        bool readable = false;
+        if (fde->type == FdType::Pipe && fde->handle) {
+            auto* pb = static_cast<PipeBuffer*>(fde->handle);
+            readable = (pb->count() > 0 || pb->writers == 0);
+        } else if (fde->type == FdType::EventFd && fde->handle) {
+            auto* efd = static_cast<EventFdData*>(fde->handle);
+            readable = (efd->counter > 0);
+        } else if (fde->type == FdType::Socket && fde->handle) {
+            int si = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+            readable = brook::SockPollReady(si, true, false);
+        } else if (fde->type == FdType::TimerFd && fde->handle) {
+            // TimerFd is readable when its expiry count > 0 or timer has fired
+            auto* tfd = static_cast<TimerFdData*>(fde->handle);
+            extern volatile uint64_t g_lapicTickCount;
+            readable = (tfd->expiryCount > 0) ||
+                       (tfd->armed && g_lapicTickCount >= tfd->nextExpiry);
+        } else if (fde->type == FdType::Vnode) {
+            readable = true; // files always readable
+        } else if (fde->type == FdType::DevTty && fde->handle) {
+            auto* pair = static_cast<TtyDevicePair*>(fde->handle);
+            auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
+            readable = (rp->count() > 0 || rp->writers == 0);
+        } else if (fde->type == FdType::UnixSocket) {
+            // Placeholder: check unix socket rx — see UnixSocket impl
+            readable = false;
+        }
+        if (readable) ready |= EPOLLIN;
+    }
+
+    if (events & EPOLLOUT) {
+        bool writable = false;
+        if (fde->type == FdType::Pipe && fde->handle) {
+            // writable if write end and there's space
+            if (fde->flags & 1) { // write end
+                auto* pb = static_cast<PipeBuffer*>(fde->handle);
+                writable = (pb->space() > 0);
+            }
+        } else if (fde->type == FdType::Socket && fde->handle) {
+            int si = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+            writable = brook::SockPollReady(si, false, true);
+        } else if (fde->type == FdType::EventFd) {
+            writable = true;
+        } else if (fde->type == FdType::Vnode) {
+            writable = true;
+        } else if (fde->type == FdType::DevTty) {
+            writable = true;
+        } else if (fde->type == FdType::MemFd) {
+            writable = true;
+        }
+        if (writable) ready |= EPOLLOUT;
+    }
+
+    return ready;
+}
+
+// Scan interest list and fill events[]. Returns count of ready fds.
+static int EpollScanReady(Process* proc, EpollInstance* ep,
+                           EpollEvent* events, int maxevents)
+{
+    int n = 0;
+    for (int i = 0; i < ep->count && n < maxevents; i++) {
+        EpollEntry& e = ep->entries[i];
+        if (e.fd < 0) continue;
+        uint32_t ready = EpollFdReady(proc, e.fd, e.events);
+        if (ready) {
+            events[n].events = ready;
+            events[n].data.u64 = e.data;
+            n++;
+        }
+    }
+    return n;
+}
+
+static int64_t epoll_create_impl(uint64_t flagsVal)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EMFILE;
+
+    auto* ep = static_cast<EpollInstance*>(kmalloc(sizeof(EpollInstance)));
+    if (!ep) return -ENOMEM;
+    for (int i = 0; i < EPOLL_MAX_FDS; i++) ep->entries[i].fd = -1;
+    ep->count = 0;
+    ep->waiter = nullptr;
+
+    int fd = FdAlloc(proc, FdType::EpollFd, ep);
+    if (fd < 0) { kfree(ep); return -EMFILE; }
+
+    if (flagsVal & 0x80000) // EPOLL_CLOEXEC
+        proc->fds[fd].fdFlags |= 1;
+
+    SerialPrintf("sys_epoll_create: fd=%d\n", fd);
+    return fd;
+}
+
+static int64_t sys_epoll_create(uint64_t size, uint64_t, uint64_t,
+                                  uint64_t, uint64_t, uint64_t)
+{
+    (void)size; // size hint ignored since Linux 2.6.8
+    return epoll_create_impl(0);
+}
+
+static int64_t sys_epoll_create1(uint64_t flags, uint64_t, uint64_t,
+                                   uint64_t, uint64_t, uint64_t)
+{
+    return epoll_create_impl(flags);
+}
+
+static int64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t watchfd,
+                               uint64_t eventAddr, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+
+    FdEntry* epfde = FdGet(proc, static_cast<int>(epfd));
+    if (!epfde || epfde->type != FdType::EpollFd || !epfde->handle) return -EBADF;
+    auto* ep = static_cast<EpollInstance*>(epfde->handle);
+
+    int wfd = static_cast<int>(watchfd);
+
+    if (op == EPOLL_CTL_DEL) {
+        for (int i = 0; i < ep->count; i++) {
+            if (ep->entries[i].fd == wfd) {
+                ep->entries[i].fd = -1;
+                SerialPrintf("sys_epoll_ctl: DEL fd=%d from epoll=%lu\n", wfd, epfd);
+                return 0;
+            }
+        }
+        return -ENOENT;
+    }
+
+    // ADD or MOD — read the epoll_event from userspace
+    EpollEvent ev = {};
+    if (eventAddr < 0x1000) return -EFAULT;
+    __builtin_memcpy(&ev, reinterpret_cast<const void*>(eventAddr), sizeof(ev));
+
+    if (op == EPOLL_CTL_MOD) {
+        for (int i = 0; i < ep->count; i++) {
+            if (ep->entries[i].fd == wfd) {
+                ep->entries[i].events = ev.events;
+                ep->entries[i].data   = ev.data.u64;
+                SerialPrintf("sys_epoll_ctl: MOD fd=%d events=0x%x\n", wfd, ev.events);
+                return 0;
+            }
+        }
+        return -ENOENT;
+    }
+
+    // EPOLL_CTL_ADD
+    if (ep->count >= EPOLL_MAX_FDS) return -ENOMEM;
+
+    // Find free slot (may have gaps from DEL)
+    for (int i = 0; i < EPOLL_MAX_FDS; i++) {
+        if (ep->entries[i].fd < 0) {
+            ep->entries[i].fd     = wfd;
+            ep->entries[i].events = ev.events;
+            ep->entries[i].data   = ev.data.u64;
+            if (i >= ep->count) ep->count = i + 1;
+            SerialPrintf("sys_epoll_ctl: ADD fd=%d events=0x%x epoll=%lu\n",
+                         wfd, ev.events, epfd);
+            return 0;
+        }
+    }
+    return -ENOMEM;
+}
+
+static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
+                                EpollEvent* kEvents, int maxevents,
+                                int timeout_ms)
+{
+    // Immediate scan
+    int n = EpollScanReady(proc, ep, kEvents, maxevents);
+    if (n > 0 || timeout_ms == 0) return n;
+
+    // Block until something is ready (or timeout)
+    extern volatile uint64_t g_lapicTickCount;
+    uint64_t startTick = g_lapicTickCount;
+    uint64_t timeoutTicks = (timeout_ms < 0)
+        ? (~(uint64_t)0)  // UINT64_MAX
+        : startTick + (uint64_t)timeout_ms;
+
+    ep->waiter = proc;
+    proc->wakeupTick = timeoutTicks;
+
+    while (true) {
+        SchedulerBlock(proc);
+        if (HasPendingSignals()) {
+            ep->waiter = nullptr;
+            return -EINTR;
+        }
+
+        n = EpollScanReady(proc, ep, kEvents, maxevents);
+        if (n > 0) { ep->waiter = nullptr; return n; }
+
+        uint64_t now = g_lapicTickCount;
+        if (timeout_ms >= 0 && now >= timeoutTicks) {
+            ep->waiter = nullptr;
+            return 0; // timeout
+        }
+
+        // Re-arm for another wait cycle
+        proc->wakeupTick = timeoutTicks;
+        ep->waiter = proc;
+    }
+}
+
+static int64_t sys_epoll_wait(uint64_t epfd, uint64_t eventsAddr,
+                               uint64_t maxevents, uint64_t timeout_ms,
+                               uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+
+    FdEntry* epfde = FdGet(proc, static_cast<int>(epfd));
+    if (!epfde || epfde->type != FdType::EpollFd || !epfde->handle) return -EBADF;
+    auto* ep = static_cast<EpollInstance*>(epfde->handle);
+
+    if (maxevents <= 0 || maxevents > 1024) return -EINVAL;
+
+    // Allocate kernel-side event buffer
+    auto* kEvents = static_cast<EpollEvent*>(
+        kmalloc(sizeof(EpollEvent) * static_cast<uint32_t>(maxevents)));
+    if (!kEvents) return -ENOMEM;
+
+    int n = epoll_wait_impl(proc, ep, kEvents,
+                             static_cast<int>(maxevents),
+                             static_cast<int>(static_cast<int64_t>(timeout_ms)));
+
+    if (n > 0) {
+        if (eventsAddr < 0x1000) { kfree(kEvents); return -EFAULT; }
+        __builtin_memcpy(reinterpret_cast<void*>(eventsAddr), kEvents,
+                        sizeof(EpollEvent) * static_cast<uint32_t>(n));
+    }
+
+    kfree(kEvents);
+    return n;
+}
+
+static int64_t sys_epoll_pwait(uint64_t epfd, uint64_t eventsAddr,
+                                uint64_t maxevents, uint64_t timeout_ms,
+                                uint64_t sigmaskAddr, uint64_t)
+{
+    (void)sigmaskAddr; // signal mask ignored — we have no RT signals
+    return sys_epoll_wait(epfd, eventsAddr, maxevents, timeout_ms, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// timerfd — timerfd_create / timerfd_settime / timerfd_gettime
+// ---------------------------------------------------------------------------
+//
+// Used by Wayland clients for frame pacing and animation timers.
+// We implement a simple periodic/one-shot timer using LAPIC tick count.
+
+static constexpr int CLOCK_REALTIME  = 0;
+static constexpr int CLOCK_MONOTONIC = 1;
+
+struct ITimerSpec {
+    struct {
+        int64_t tv_sec;
+        int64_t tv_nsec;
+    } it_interval; // period (0 = one-shot)
+    struct {
+        int64_t tv_sec;
+        int64_t tv_nsec;
+    } it_value;    // initial expiry (0 = disarmed)
+};
+
+static int64_t sys_timerfd_create(uint64_t clockid, uint64_t flags,
+                                   uint64_t, uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EMFILE;
+
+    if (clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC)
+        return -EINVAL;
+
+    auto* tfd = static_cast<TimerFdData*>(kmalloc(sizeof(TimerFdData)));
+    if (!tfd) return -ENOMEM;
+    tfd->expiryCount = 0;
+    tfd->intervalNs  = 0;
+    tfd->nextExpiry  = 0;
+    tfd->clockId     = static_cast<int>(clockid);
+    tfd->armed       = false;
+    tfd->waiter      = nullptr;
+
+    int fd = FdAlloc(proc, FdType::TimerFd, tfd);
+    if (fd < 0) { kfree(tfd); return -EMFILE; }
+
+    if (flags & TFD_NONBLOCK)
+        proc->fds[fd].statusFlags = 0x800;
+    if (flags & TFD_CLOEXEC)
+        proc->fds[fd].fdFlags |= 1;
+
+    SerialPrintf("sys_timerfd_create: fd=%d clock=%lu\n", fd, clockid);
+    return fd;
+}
+
+static int64_t sys_timerfd_settime(uint64_t fd, uint64_t flagsVal,
+                                    uint64_t newValAddr, uint64_t oldValAddr,
+                                    uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+
+    FdEntry* fde = FdGet(proc, static_cast<int>(fd));
+    if (!fde || fde->type != FdType::TimerFd || !fde->handle) return -EBADF;
+    auto* tfd = static_cast<TimerFdData*>(fde->handle);
+
+    ITimerSpec newVal = {};
+    if (newValAddr < 0x1000) return -EFAULT;
+    __builtin_memcpy(&newVal, reinterpret_cast<const void*>(newValAddr), sizeof(newVal));
+
+    // Save old value if requested
+    if (oldValAddr) {
+        ITimerSpec oldVal = {};
+        if (tfd->armed) {
+            extern volatile uint64_t g_lapicTickCount;
+            uint64_t remaining = (tfd->nextExpiry > g_lapicTickCount)
+                ? (tfd->nextExpiry - g_lapicTickCount) : 0;
+            oldVal.it_value.tv_sec  = static_cast<int64_t>(remaining / 1000);
+            oldVal.it_value.tv_nsec = static_cast<int64_t>((remaining % 1000) * 1000000);
+            oldVal.it_interval.tv_sec  = static_cast<int64_t>(tfd->intervalNs / 1000000000ULL);
+            oldVal.it_interval.tv_nsec = static_cast<int64_t>(tfd->intervalNs % 1000000000ULL);
+        }
+        if (oldValAddr >= 0x1000)
+            __builtin_memcpy(reinterpret_cast<void*>(oldValAddr), &oldVal, sizeof(oldVal));
+    }
+
+    // Disarm if both it_value fields are zero
+    int64_t valueSec  = newVal.it_value.tv_sec;
+    int64_t valueNsec = newVal.it_value.tv_nsec;
+    if (valueSec == 0 && valueNsec == 0) {
+        tfd->armed = false;
+        tfd->expiryCount = 0;
+        return 0;
+    }
+
+    extern volatile uint64_t g_lapicTickCount;
+    uint64_t nowTick = g_lapicTickCount;
+    uint64_t valueMs = static_cast<uint64_t>(valueSec) * 1000ULL
+                       + static_cast<uint64_t>(valueNsec) / 1000000ULL;
+
+    if (flagsVal & TFD_TIMER_ABSTIME) {
+        // Convert absolute time to tick (rough: treat as ms from epoch offset)
+        tfd->nextExpiry = valueMs; // absolute - not great but acceptable for now
+    } else {
+        tfd->nextExpiry = nowTick + valueMs * LAPIC_TICKS_PER_MS;
+    }
+
+    uint64_t intervalSec  = static_cast<uint64_t>(newVal.it_interval.tv_sec);
+    uint64_t intervalNsec = static_cast<uint64_t>(newVal.it_interval.tv_nsec);
+    tfd->intervalNs = intervalSec * 1000000000ULL + intervalNsec;
+    tfd->armed = true;
+    tfd->expiryCount = 0;
+
+    SerialPrintf("sys_timerfd_settime: fd=%lu nextExpiry=%llu intervalNs=%llu\n",
+                 fd, tfd->nextExpiry, tfd->intervalNs);
+    return 0;
+}
+
+static int64_t sys_timerfd_gettime(uint64_t fd, uint64_t currValAddr,
+                                    uint64_t, uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+
+    FdEntry* fde = FdGet(proc, static_cast<int>(fd));
+    if (!fde || fde->type != FdType::TimerFd || !fde->handle) return -EBADF;
+    auto* tfd = static_cast<TimerFdData*>(fde->handle);
+
+    ITimerSpec curr = {};
+    if (tfd->armed) {
+        extern volatile uint64_t g_lapicTickCount;
+        uint64_t remaining = (tfd->nextExpiry > g_lapicTickCount)
+            ? (tfd->nextExpiry - g_lapicTickCount) : 0;
+        curr.it_value.tv_sec  = static_cast<int64_t>(remaining / 1000);
+        curr.it_value.tv_nsec = static_cast<int64_t>((remaining % 1000) * 1000000LL);
+        curr.it_interval.tv_sec  = static_cast<int64_t>(tfd->intervalNs / 1000000000ULL);
+        curr.it_interval.tv_nsec = static_cast<int64_t>(tfd->intervalNs % 1000000000ULL);
+    }
+
+    if (currValAddr < 0x1000) return -EFAULT;
+    __builtin_memcpy(reinterpret_cast<void*>(currValAddr), &curr, sizeof(curr));
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// sys_memfd_create (319) — anonymous in-memory file
+// ---------------------------------------------------------------------------
+//
+// Wayland uses memfd for shared memory buffers (wl_shm).
+// We implement it as a SyntheticMem fd backed by a heap allocation.
+
+static int64_t sys_memfd_create(uint64_t nameAddr, uint64_t flags,
+                                  uint64_t, uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EMFILE;
+
+    // Name is just for debugging; we don't enforce it
+    char name[64] = "<memfd>";
+    if (nameAddr >= 0x1000) {
+        const char* src = reinterpret_cast<const char*>(nameAddr);
+        for (int i = 0; i < (int)(sizeof(name) - 1) && src[i]; i++) name[i] = src[i], name[i+1] = 0;
+    }
+
+    auto* mfd = static_cast<MemFdData*>(kmalloc(sizeof(MemFdData)));
+    if (!mfd) return -ENOMEM;
+    mfd->buf      = nullptr;
+    mfd->size     = 0;
+    mfd->capacity = 0;
+
+    int fd = FdAlloc(proc, FdType::MemFd, mfd);
+    if (fd < 0) { kfree(mfd); return -EMFILE; }
+
+    if (flags & MFD_CLOEXEC)
+        proc->fds[fd].fdFlags |= 1;
+
+    SerialPrintf("sys_memfd_create: fd=%d name='%s' flags=0x%lx\n", fd, name, flags);
+    return fd;
+}
+
+// ---------------------------------------------------------------------------
 // sys_sendfile (40) — stub: copies between fds in kernel
 // ---------------------------------------------------------------------------
 
@@ -4843,9 +5511,30 @@ static int64_t sys_linkat(uint64_t olddirfd, uint64_t oldAddr,
 static int64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t,
                               uint64_t, uint64_t, uint64_t)
 {
-    (void)fd; (void)length;
-    // TODO: implement VfsTruncate properly
-    // For now, succeed silently — Nix uses this for DB journal files
+    Process* proc = ProcessCurrent();
+    if (proc) {
+        FdEntry* fde = FdGet(proc, static_cast<int>(fd));
+        if (fde && fde->type == FdType::MemFd && fde->handle) {
+            auto* mfd = static_cast<MemFdData*>(fde->handle);
+            if (length > mfd->capacity) {
+                auto* newBuf = static_cast<uint8_t*>(kmalloc(static_cast<uint32_t>(length + 4096)));
+                if (!newBuf) return -ENOMEM;
+                if (mfd->buf) {
+                    for (uint64_t i = 0; i < mfd->size; i++) newBuf[i] = mfd->buf[i];
+                    kfree(mfd->buf);
+                }
+                mfd->buf = newBuf;
+                mfd->capacity = length + 4096;
+            }
+            if (length > mfd->size) {
+                // Zero-fill the extension
+                for (uint64_t i = mfd->size; i < length; i++) mfd->buf[i] = 0;
+            }
+            mfd->size = length;
+            return 0;
+        }
+    }
+    // For Vnode files and stubs, succeed silently (Nix uses this for DB journal files)
     return 0;
 }
 
@@ -6442,6 +7131,17 @@ void SyscallTableInit()
     g_syscallTable[SYS_SOCKETPAIR]      = sys_socketpair;
     g_syscallTable[SYS_SETSOCKOPT]      = sys_setsockopt;
     g_syscallTable[SYS_GETSOCKOPT]      = sys_getsockopt;
+
+    // Wayland prerequisites
+    g_syscallTable[SYS_EPOLL_CREATE]    = sys_epoll_create;
+    g_syscallTable[SYS_EPOLL_CREATE1]   = sys_epoll_create1;
+    g_syscallTable[SYS_EPOLL_CTL]       = sys_epoll_ctl;
+    g_syscallTable[SYS_EPOLL_WAIT]      = sys_epoll_wait;
+    g_syscallTable[SYS_EPOLL_PWAIT]     = sys_epoll_pwait;
+    g_syscallTable[SYS_TIMERFD_CREATE]  = sys_timerfd_create;
+    g_syscallTable[SYS_TIMERFD_SETTIME] = sys_timerfd_settime;
+    g_syscallTable[SYS_TIMERFD_GETTIME] = sys_timerfd_gettime;
+    g_syscallTable[SYS_MEMFD_CREATE]    = sys_memfd_create;
 
     uint32_t count = 0;
     for (uint64_t i = 0; i < SYSCALL_MAX; ++i)
