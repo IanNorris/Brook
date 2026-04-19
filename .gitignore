@@ -68,3 +68,4 @@ tools/mp3play/mp3play
 data/user_content
 doomgeneric_brook/doomgeneric
 doomgeneric_brook/doomgeneric.map
+profile*.txt\nprofile*.json\nprofile*.folded
