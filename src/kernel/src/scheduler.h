@@ -50,6 +50,7 @@ void KernelThreadTrampoline();
 
 // Terminate the current process and reschedule. Never returns.
 [[noreturn]] void SchedulerExitCurrentProcess(int status);
+void SchedulerKillThreadGroup(uint16_t tgid, Process* caller);
 
 // Get the current process running on this CPU (nullptr if none).
 Process* SchedulerCurrentProcess();

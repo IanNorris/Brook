@@ -1456,14 +1456,14 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
         case 13: // SIGPIPE
         case 14: // SIGALRM
         case 15: // SIGTERM
-            proc->exitStatus = 128 + signum;
-            proc->fbVirtual = nullptr;
-            proc->fbVirtualSize = 0;
-            proc->state = ProcessState::Terminated;
-            if (!__atomic_load_n(&proc->compositorRegistered, __ATOMIC_ACQUIRE))
-                proc->reapable = true;
             DbgPrintf("SIGNAL: default terminate pid %u by signal %d\n", proc->pid, signum);
-            return syscallResult;
+            // Use SchedulerExitCurrentProcess instead of setting state+returning.
+            // The old approach returned to user space with state=Terminated; the
+            // compositor could then mark the process reapable and call ProcessDestroy
+            // (freeing the kernel stack) while the process was still live and about
+            // to re-enter the syscall dispatcher — causing a use-after-free of the
+            // kernel stack and a double fault.
+            SchedulerExitCurrentProcess(128 + signum);
         case 17: // SIGCHLD — default is ignore
         case 28: // SIGWINCH — ignore
             return syscallResult;

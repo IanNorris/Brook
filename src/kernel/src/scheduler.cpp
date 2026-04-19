@@ -1146,6 +1146,44 @@ uint16_t SchedulerAllocPid()
     return g_nextPid++;
 }
 
+// Mark all threads in a thread group (same tgid) as terminated so they are
+// reaped without running.  Called by sys_exit_group before the calling thread
+// calls SchedulerExitCurrentProcess.  Threads that are currently running on
+// another CPU will be caught by the scheduler at the next timer tick.
+void SchedulerKillThreadGroup(uint16_t tgid, Process* caller)
+{
+    Process* targets[MAX_PROCESSES];
+    uint32_t count = 0;
+
+    uint64_t alf = SchedLockAcquire(g_allProcLock);
+    for (uint32_t i = 0; i < g_processCount; ++i)
+    {
+        Process* p = g_allProcesses[i];
+        if (p && p != caller && p->tgid == tgid
+            && p->state != ProcessState::Terminated)
+        {
+            if (count < MAX_PROCESSES) targets[count++] = p;
+        }
+    }
+    SchedLockRelease(g_allProcLock, alf);
+
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        Process* p = targets[i];
+        p->state     = ProcessState::Terminated;
+        p->exitStatus = 128 + 9; // SIGKILL
+        // Threads that are not yet reapable will be reaped by the scheduler
+        // once they stop running.  Set reapable only if they are not
+        // currently executing on a CPU.
+        if (__atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) < 0)
+            __atomic_store_n(&p->reapable, true, __ATOMIC_RELEASE);
+        SerialPrintf("SCHED: exit_group killing thread pid=%u tgid=%u\n",
+                     p->pid, p->tgid);
+    }
+}
+
+
+
 Process* SchedulerFindTerminatedChild(uint16_t parentPid, int64_t pid)
 {
     uint64_t alf = SchedLockAcquire(g_allProcLock);

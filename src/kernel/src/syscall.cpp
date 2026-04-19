@@ -1921,6 +1921,23 @@ static int64_t sys_exit(uint64_t status, uint64_t, uint64_t,
     return 0;
 }
 
+static int64_t sys_exit_group(uint64_t status, uint64_t, uint64_t,
+                               uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    SerialPrintf("sys_exit_group: tgid %u exiting with status %lu\n",
+                 proc ? proc->tgid : 0, status);
+
+    // Kill all other threads in this thread group so they don't linger
+    // and cause use-after-free on shared resources after the leader exits.
+    if (proc)
+        SchedulerKillThreadGroup(proc->tgid, proc);
+
+    SchedulerExitCurrentProcess(static_cast<int>(status));
+    // never reached
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // sys_readv (19)
 // ---------------------------------------------------------------------------
@@ -6302,7 +6319,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_SET_TID_ADDRESS] = sys_set_tid_address;
     g_syscallTable[SYS_CLOCK_GETTIME]   = sys_clock_gettime;
     g_syscallTable[SYS_CLOCK_NANOSLEEP] = sys_clock_nanosleep;
-    g_syscallTable[SYS_EXIT_GROUP]      = sys_exit;
+    g_syscallTable[SYS_EXIT_GROUP]      = sys_exit_group;
     g_syscallTable[SYS_OPENAT]          = sys_openat;
     g_syscallTable[SYS_NEWFSTATAT]      = sys_newfstatat;
     g_syscallTable[SYS_PRLIMIT64]       = sys_prlimit64;
