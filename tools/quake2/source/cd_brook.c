@@ -174,7 +174,7 @@ void CDAudio_Activate(qboolean active)
 
 void CDAudio_Update(void)
 {
-    if (!cd_playing || !cd_vorbis || cd_fd < 0)
+    if (cd_fd < 0)
         return;
 
     /* Decode exactly as many frames as elapsed real time warrants.
@@ -185,31 +185,41 @@ void CDAudio_Update(void)
     if (want < 1)   want = 1;
     if (want > CD_FRAMES_PER_CHUNK) want = CD_FRAMES_PER_CHUNK;
 
-    int frames = stb_vorbis_get_samples_short_interleaved(
+    int frames = 0;
+    if (cd_playing && cd_vorbis)
+    {
+        frames = stb_vorbis_get_samples_short_interleaved(
                      cd_vorbis, 2, cd_pcm, want * 2);
 
-    if (frames <= 0)
-    {
-        /* End of track */
-        if (cd_looping)
+        if (frames <= 0)
         {
-            stb_vorbis_seek_start(cd_vorbis);
-            frames = stb_vorbis_get_samples_short_interleaved(
-                         cd_vorbis, 2, cd_pcm, want * 2);
-            if (frames <= 0) { cd_close_track(); return; }
-        }
-        else
-        {
-            cd_close_track();
-            return;
+            /* End of track */
+            if (cd_looping)
+            {
+                stb_vorbis_seek_start(cd_vorbis);
+                frames = stb_vorbis_get_samples_short_interleaved(
+                             cd_vorbis, 2, cd_pcm, want * 2);
+                if (frames <= 0) cd_close_track();
+            }
+            else
+            {
+                cd_close_track();
+            }
         }
     }
 
-    int bytes = frames * 2 * sizeof(short); /* stereo 16-bit */
+    /* When no CD music is playing, write silence so SFX still gets output.
+     * This ensures SFX is audible even when there is no active music track. */
+    if (frames <= 0)
+    {
+        memset(cd_pcm, 0, want * 2 * sizeof(short));
+        frames = want;
+    }
 
     /* Mix in SFX (11025 Hz → 44100 Hz upsample, additive) before writing.
      * This keeps total HDA writes at exactly 1× hardware rate. */
     SFX_MixInto(cd_pcm, frames);
 
+    int bytes = frames * 2 * sizeof(short); /* stereo 16-bit */
     write(cd_fd, cd_pcm, bytes);  /* O_NONBLOCK — don't stall game loop */
 }
