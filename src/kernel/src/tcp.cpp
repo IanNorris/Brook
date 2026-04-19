@@ -75,6 +75,11 @@ TcpAction TcpProcessSegment(Socket& s,
         break;
 
     case TcpState::FinWait1:
+        if (flags & TCP_RST) {
+            s.tcpState = TcpState::Closed;
+            s.tcpRstRecv = true;
+            return act;
+        }
         if (flags & TCP_ACK) {
             s.tcpSndUna = ack;
             if (flags & TCP_FIN) {
@@ -94,6 +99,10 @@ TcpAction TcpProcessSegment(Socket& s,
         break;
 
     case TcpState::FinWait2:
+        if (flags & TCP_RST) {
+            s.tcpState = TcpState::Closed;
+            return act;
+        }
         if (dataLen > 0 && seq == s.tcpRcvNxt) {
             act.enqueueData = true;
             act.dataPtr     = data;

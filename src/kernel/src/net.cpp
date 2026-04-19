@@ -60,7 +60,7 @@ static bool   g_sockUsed[MAX_SOCKETS];
 // IPv4 identification counter
 static uint16_t g_ipId = 1;
 
-static uint16_t g_tcpEphemeralPort = 49200;
+static uint32_t g_tcpEphemeralPort = 49200; // accessed via atomic fetch-add
 
 // Forward declaration for TCP send (defined below)
 static void TcpSendSegment(Socket& s, uint8_t flags,
@@ -501,17 +501,22 @@ void NetRegisterIf(NetIf* nif)
     // This is needed because SockRecv/Connect now block via SchedulerBlock
     // rather than busy-polling, so without this thread no one would ever call
     // nif->poll() and incoming packets would never be delivered.
+    //
+    // Priority 1 (above normal user processes at 2) ensures the poller runs
+    // promptly after data arrives, minimising per-packet scheduler latency.
     KernelThreadCreate("net_poll", [](void* /*arg*/) {
         extern volatile uint64_t g_lapicTickCount;
         while (true) {
-            if (g_netIf && g_netIf->poll)
-                g_netIf->poll(g_netIf);
-            // Yield after each poll burst to avoid starving user processes.
-            // SchedulerYield() is sufficient — we don't want a long sleep
-            // since we need low receive latency for TCP throughput.
+            if (g_netIf && g_netIf->poll) {
+                // Drain in a short burst so a backlog of packets doesn't
+                // require multiple scheduler round-trips to clear.
+                for (int i = 0; i < 8; i++)
+                    g_netIf->poll(g_netIf);
+            }
+            // Yield after each burst to avoid starving user processes.
             SchedulerYield();
         }
-    }, nullptr, 2 /* NORMAL priority */);
+    }, nullptr, 1 /* above NORMAL, below REALTIME */);
 }
 
 NetIf* NetGetIf()
@@ -1076,8 +1081,9 @@ int SockSendTo(int sockIdx, const void* buf, uint32_t len,
 
     // Auto-bind if not yet bound
     if (!s.bound) {
-        static uint16_t ephemeralPort = 49152;
-        s.localPort = htons(ephemeralPort++);
+        uint32_t port = __atomic_fetch_add(&g_tcpEphemeralPort, 1, __ATOMIC_RELAXED);
+        if (port >= 65535) __atomic_store_n(&g_tcpEphemeralPort, 49200, __ATOMIC_RELAXED);
+        s.localPort = htons(static_cast<uint16_t>(port));
         s.localIp = g_netIf ? g_netIf->ipAddr : 0;
         s.bound = true;
     }
@@ -1502,7 +1508,9 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
         s.connected  = true;
         // Auto-bind if not yet bound
         if (!s.bound) {
-            s.localPort = htons(g_tcpEphemeralPort++);
+            uint32_t port = __atomic_fetch_add(&g_tcpEphemeralPort, 1, __ATOMIC_RELAXED);
+            if (port >= 65535) __atomic_store_n(&g_tcpEphemeralPort, 49200, __ATOMIC_RELAXED);
+            s.localPort = htons(static_cast<uint16_t>(port));
             s.localIp = g_netIf ? g_netIf->ipAddr : 0;
             s.bound = true;
         }
@@ -1516,7 +1524,9 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
 
     // Auto-bind local port
     if (!s.bound) {
-        s.localPort = htons(g_tcpEphemeralPort++);
+        uint32_t port = __atomic_fetch_add(&g_tcpEphemeralPort, 1, __ATOMIC_RELAXED);
+        if (port >= 65535) __atomic_store_n(&g_tcpEphemeralPort, 49200, __ATOMIC_RELAXED);
+        s.localPort = htons(static_cast<uint16_t>(port));
         s.localIp = g_netIf ? g_netIf->ipAddr : 0;
         s.bound = true;
     }
@@ -1858,7 +1868,9 @@ static void DebugChannelThreadFn(void* /*arg*/)
     s.remotePort = addr.sin_port;
 
     if (!s.bound) {
-        s.localPort = htons(g_tcpEphemeralPort++);
+        uint32_t port = __atomic_fetch_add(&g_tcpEphemeralPort, 1, __ATOMIC_RELAXED);
+        if (port >= 65535) __atomic_store_n(&g_tcpEphemeralPort, 49200, __ATOMIC_RELAXED);
+        s.localPort = htons(static_cast<uint16_t>(port));
         s.localIp   = g_netIf ? g_netIf->ipAddr : 0;
         s.bound     = true;
     }

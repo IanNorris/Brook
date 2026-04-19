@@ -490,6 +490,15 @@ void SchedulerUnblock(Process* proc)
     // Accept Blocked or Stopped processes for unblocking/resuming
     if (proc->state != ProcessState::Blocked && proc->state != ProcessState::Stopped)
     {
+        // If the process is still Running, it's in the window between setting
+        // pollWaiter (inside the socket spinlock) and calling SchedulerBlock.
+        // Set pendingWakeup so the imminent SchedulerBlock returns immediately
+        // instead of sleeping.  This closes the SockRecv/SockConnect race:
+        //   CPU0: release sock.lock, set pollWaiter, [HERE] → SchedulerBlock
+        //   CPU1: HandleTcp → SchedulerUnblock → (was Running, no pendingWakeup set)
+        //   CPU0: SchedulerBlock → pendingWakeup==0 → blocks for 10s timeout
+        if (proc->state == ProcessState::Running)
+            __atomic_store_n(&proc->pendingWakeup, 1, __ATOMIC_RELEASE);
         SchedLockRelease(g_readyLock, rlf4);
         return;
     }
