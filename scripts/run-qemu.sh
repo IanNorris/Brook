@@ -220,14 +220,10 @@ if [ -n "${SCRIPT_NAME}" ]; then
     mcopy -o -i "${DISK_IMG}" "${SCRIPT_FILE}" "::INIT.RC"
 fi
 
-SERIAL_FIFO="/tmp/brook_serial_fifo"
+SERIAL_LOG="/tmp/brook_serial.log"
 if [ "$HEADLESS" -eq 1 ]; then
-    # Headless: serial to file via FIFO (unbuffered — no QEMU write buffering)
-    rm -f "${SERIAL_FIFO}"
-    mkfifo "${SERIAL_FIFO}"
-    tee "${LOG_FILE}" < "${SERIAL_FIFO}" &
-    TEE_PID=$!
-    SERIAL_OPT="-serial file:${SERIAL_FIFO}"
+    # Headless: serial to regular file (non-blocking write — no backpressure).
+    SERIAL_OPT="-serial file:${LOG_FILE}"
     BROOK_AUDIODEV="${BROOK_AUDIODEV:-none}"
     if [ -n "$VNC_DISPLAY" ] && [ "$VNC_DISPLAY" != "__NEXT_VNC__" ]; then
         DISPLAY_OPT="-vnc ${VNC_DISPLAY}"
@@ -235,14 +231,13 @@ if [ "$HEADLESS" -eq 1 ]; then
         DISPLAY_OPT="-vnc none"
     fi
 elif [ "$LOG_TO_FILE" -eq 1 ]; then
-    # Interactive + log: serial to file via FIFO (unbuffered), tee to terminal live
-    rm -f "${SERIAL_FIFO}"
-    mkfifo "${SERIAL_FIFO}"
-    tee "${LOG_FILE}" < "${SERIAL_FIFO}" &
-    TEE_PID=$!
-    SERIAL_OPT="-serial file:${SERIAL_FIFO}"
+    # Interactive + log: COM1 → regular file (non-blocking, no FIFO backpressure).
+    # QEMU's write to a regular file never blocks, so SerialPutChar never stalls.
+    # Live view: tail -f ${LOG_FILE} in another terminal, or just check after the run.
+    rm -f "${LOG_FILE}"
+    SERIAL_OPT="-serial file:${LOG_FILE}"
     DISPLAY_OPT="-display gtk"
-    echo "  Serial log: ${LOG_FILE}"
+    echo "  Serial log: ${LOG_FILE}  (tail -f ${LOG_FILE} to watch live)"
 else
     SERIAL_OPT="-serial stdio"
     DISPLAY_OPT="-display gtk"
@@ -281,9 +276,3 @@ qemu-system-x86_64 \
     -no-shutdown \
     ${DEBUG_FLAGS} \
     "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
-
-# Clean up FIFO and tee process if used
-if [ "$HEADLESS" -eq 1 ] || [ "$LOG_TO_FILE" -eq 1 ]; then
-    wait "${TEE_PID}" 2>/dev/null || true
-    rm -f "${SERIAL_FIFO}"
-fi
