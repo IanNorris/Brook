@@ -2,7 +2,12 @@
 """Convert Brook OS profiler serial output to Speedscope JSON format.
 
 Usage:
-    python3 profiler_to_speedscope.py serial.log [output.json] [--symmap symbols.txt]
+    python3 profiler_to_speedscope.py serial.log [output] [--elf kernel.elf] [--symmap symbols.txt] [--folded]
+
+    --elf <path>      Resolve symbols from kernel ELF (auto-detected from build/ if omitted)
+    --symmap <path>   Use pre-generated symbol map (addr name, one per line)
+    --folded          Output folded stacks format instead of speedscope JSON
+                      (compatible with flamegraph.pl and speedscope's import)
 
 The serial log contains lines like:
     PROF_BEGIN <cpuCount> <startTick>
@@ -132,28 +137,95 @@ def pid_label(pid):
     return f"PID {pid}" if pid != 0xFFFF else "idle"
 
 
+def _symmap_from_elf(elf_path):
+    """Extract demangled symbols from ELF via nm+llvm-cxxfilt, return temp file path."""
+    import subprocess, tempfile
+    try:
+        nm = subprocess.run(['nm', '-n', elf_path], capture_output=True, text=True)
+        if nm.returncode != 0:
+            print(f"  nm failed: {nm.stderr.strip()}")
+            return None
+        # Filter text symbols and demangle
+        lines = []
+        for line in nm.stdout.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) == 3 and parts[1] in ('T', 't'):
+                lines.append(f"{parts[0]} {parts[2]}\n")
+        demangled = subprocess.run(['llvm-cxxfilt'], input=''.join(lines),
+                                   capture_output=True, text=True)
+        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.symmap', delete=False)
+        tmp.write(demangled.stdout if demangled.returncode == 0 else ''.join(lines))
+        tmp.close()
+        count = len(lines)
+        print(f"  Generated symmap: {count} symbols from {os.path.basename(elf_path)}")
+        return tmp.name
+    except FileNotFoundError as e:
+        print(f"  Symbol extraction unavailable ({e}); addresses will be raw hex")
+        return None
+
+
+def write_folded(outpath, samples, syms, sorted_addrs):
+    """Write folded stacks format: 'frame\\tcount' per unique frame."""
+    from collections import Counter
+    counts = Counter()
+    for _tick, _pid, _cpu, ring, stack in samples:
+        if stack:
+            frame = resolve_rip(stack[0], syms, sorted_addrs)
+            counts[frame] += 1
+    with open(outpath, 'w') as f:
+        for frame, count in counts.most_common():
+            f.write(f"{frame} {count}\n")
+    print(f"Wrote {outpath} ({len(counts)} unique frames, {sum(counts.values())} samples)")
+
+
 def main():
     if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} serial.log [output.json] [--symmap symbols.txt]")
+        print(f"Usage: {sys.argv[0]} serial.log [output] [--symmap symbols.txt] [--elf kernel.elf] [--folded]")
         sys.exit(1)
 
     inpath = sys.argv[1]
     outpath = None
     symmap_path = None
+    elf_path = None
+    folded = False
 
     i = 2
     while i < len(sys.argv):
         if sys.argv[i] == '--symmap' and i + 1 < len(sys.argv):
             symmap_path = sys.argv[i + 1]
             i += 2
-        elif outpath is None:
+        elif sys.argv[i] == '--elf' and i + 1 < len(sys.argv):
+            elf_path = sys.argv[i + 1]
+            i += 2
+        elif sys.argv[i] == '--folded':
+            folded = True
+            i += 1
+        elif outpath is None and not sys.argv[i].startswith('--'):
             outpath = sys.argv[i]
             i += 1
         else:
             i += 1
 
+    # Auto-detect ELF if not given
+    if elf_path is None and symmap_path is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        root = os.path.dirname(script_dir)
+        for candidate in [
+            os.path.join(root, 'build', 'release', 'kernel', 'BROOK.elf'),
+            os.path.join(root, 'build', 'debug', 'kernel', 'BROOK.elf'),
+        ]:
+            if os.path.exists(candidate):
+                elf_path = candidate
+                print(f"Auto-detected ELF: {elf_path}")
+                break
+
+    # Generate symmap from ELF using nm + llvm-cxxfilt
+    if elf_path and not symmap_path:
+        symmap_path = _symmap_from_elf(elf_path)
+
     if outpath is None:
-        outpath = inpath.rsplit('.', 1)[0] + '.speedscope.json'
+        stem = inpath.rsplit('.', 1)[0]
+        outpath = stem + '.folded' if folded else stem + '.speedscope.json'
 
     syms = load_symmap(symmap_path)
     sorted_addrs = sorted(syms.keys()) if syms else []
@@ -166,6 +238,10 @@ def main():
 
     print(f"Parsed: {cpuCount} CPUs, {len(samples)} samples, "
           f"{len(context_switches)} context switches, {dropped} dropped")
+
+    if folded:
+        write_folded(outpath, samples, syms, sorted_addrs)
+        return
 
     # Build frame table (unique RIP → index)
     frame_map = {}
