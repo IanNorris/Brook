@@ -156,7 +156,7 @@ if [ ! -f "${DISK_IMG}" ]; then
     "${SCRIPT_DIR}/create_disk.sh"
 fi
 # Always sync latest files to disk
-"${SCRIPT_DIR}/update_disk.sh"
+"${SCRIPT_DIR}/update_disk.sh" "--${BUILD_TYPE}"
 
 # Optional ext2 disk image (added as second virtio drive)
 EXT2_DISK="${BROOK_EXT2_DISK:-${ROOT_DIR}/brook_ext2_disk.img}"
