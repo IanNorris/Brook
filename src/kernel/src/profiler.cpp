@@ -49,9 +49,15 @@ struct ProfileSample {
 // Per-CPU lock-free ring buffer (single-producer ISR, single-consumer thread)
 // ---------------------------------------------------------------------------
 // Each sample is ~80 bytes with 8 stack frames.
-// 512 samples per CPU, drained every 100ms by the profiler thread.
+// 4096 samples per CPU (~2.5 MB total), drained once at end of profiling.
+// Why not continuous drain: DrainToSerial holds the serial lock while
+// busy-waiting on the UART TX FIFO (115200 baud = ~87 µs/byte).  With CS
+// events filling up at hundreds/second the drain takes ~8 s per cycle,
+// starving serial_writer and all direct SerialPrintf callers for ~98% of the
+// profiling window.  Accept ring-buffer overflow instead; the last
+// SAMPLES_PER_CPU events per CPU are always preserved.
 
-static constexpr uint32_t SAMPLES_PER_CPU = 512;
+static constexpr uint32_t SAMPLES_PER_CPU = 4096;
 
 struct PerCpuBuffer {
     ProfileSample samples[SAMPLES_PER_CPU];
@@ -298,26 +304,30 @@ static void ProfilerThreadFn(void* /*arg*/)
         }
 
         if (g_profilerEnabled) {
-            // Profiling is active — emit header and start continuous drain
+            // Profiling is active.  Do NOT drain to serial during recording.
+            // Draining continuously holds the serial lock while busy-waiting
+            // on the UART TX FIFO, which starves all other serial output for
+            // ~98% of the profiling window.  We collect into the ring buffer
+            // and drain once when profiling ends.  Ring-buffer overflow drops
+            // early events; the most-recent SAMPLES_PER_CPU events per CPU
+            // are always preserved.
             uint32_t cpuCount = SmpGetCpuCount();
             SerialPrintf("PROF_BEGIN %u %lu\n", cpuCount, g_profilerStartTick);
 
-            uint32_t totalWritten = 0;
-
-            // Continuously drain while profiling is active
+            uint32_t elapsed = 0;
             while (g_profilerEnabled) {
-                totalWritten += DrainToSerial();
-
                 Process* self = ProcessCurrent();
                 if (self) {
-                    // Drain every 100ms — fast enough to keep up with 100Hz per CPU
-                    self->wakeupTick = g_lapicTickCount + 100;
+                    self->wakeupTick = g_lapicTickCount + 1000; // 1 s
                     SchedulerBlock(self);
                 }
+                elapsed++;
+                if (elapsed % 10 == 0)
+                    SerialPrintf("PROFILER: recording (%u s)\n", elapsed);
             }
 
-            // Final drain after profiling stopped
-            totalWritten += DrainToSerial();
+            // Profiling ended — drain everything to serial now.
+            uint32_t totalWritten = DrainToSerial();
 
             uint32_t totalDropped = 0;
             for (uint32_t c = 0; c < cpuCount; c++)
