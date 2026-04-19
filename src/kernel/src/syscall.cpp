@@ -28,6 +28,35 @@
 extern "C" __attribute__((naked)) void ReturnToKernel();
 
 // ---------------------------------------------------------------------------
+// Random helpers: RDRAND with TSC fallback
+// ---------------------------------------------------------------------------
+
+// Software PRNG fallback using TSC + LCG mixing (used when rdrand unavailable).
+static uint64_t SoftRandU64()
+{
+    uint64_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    uint64_t tsc = (hi << 32) | lo;
+    tsc ^= tsc << 13;
+    tsc ^= tsc >> 7;
+    tsc ^= tsc << 17;
+    return tsc * 6364136223846793005ULL + 1442695040888963407ULL;
+}
+
+static bool RdrandU64(uint64_t* out)
+{
+    if (!CpuHasRdrand()) return false;
+    uint64_t val;
+    uint8_t ok;
+    for (int i = 0; i < 10; i++)
+    {
+        __asm__ volatile("rdrand %0; setc %1" : "=r"(val), "=qm"(ok));
+        if (ok) { *out = val; return true; }
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // C dispatch wrapper — reads syscall number from GS:120, applies strace.
 // Must be extern "C" for the assembly call instruction.
 // ---------------------------------------------------------------------------
@@ -575,12 +604,8 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         uint64_t filled = 0;
         while (filled < count) {
             uint64_t rval;
-            unsigned char ok;
-            asm volatile("rdrand %0; setc %1" : "=r"(rval), "=qm"(ok));
-            if (!ok) {
-                for (volatile int i = 0; i < 100; i++) {}
-                continue;
-            }
+            if (!RdrandU64(&rval))
+                rval = SoftRandU64();
             uint64_t remain = count - filled;
             uint64_t chunk = (remain < 8) ? remain : 8;
             for (uint64_t i = 0; i < chunk; i++)
@@ -3916,19 +3941,6 @@ static int64_t sys_prlimit64(uint64_t pid, uint64_t resource, uint64_t newlimitA
 // sys_getrandom (318) — RDRAND-backed random number generation
 // ---------------------------------------------------------------------------
 
-static bool RdrandU64(uint64_t* out)
-{
-    uint64_t val;
-    uint8_t ok;
-    // RDRAND sets CF=1 on success; retry up to 10 times on transient failure.
-    for (int i = 0; i < 10; i++)
-    {
-        __asm__ volatile("rdrand %0; setc %1" : "=r"(val), "=qm"(ok));
-        if (ok) { *out = val; return true; }
-    }
-    return false;
-}
-
 static int64_t sys_getrandom(uint64_t bufAddr, uint64_t count, uint64_t,
                                uint64_t, uint64_t, uint64_t)
 {
@@ -3941,12 +3953,7 @@ static int64_t sys_getrandom(uint64_t bufAddr, uint64_t count, uint64_t,
     {
         uint64_t rnd;
         if (!RdrandU64(&rnd))
-        {
-            // RDRAND unavailable — fall back to TSC-based mixing
-            uint64_t tsc;
-            __asm__ volatile("rdtsc" : "=A"(tsc));
-            rnd = tsc * 6364136223846793005ULL + 1442695040888963407ULL;
-        }
+            rnd = SoftRandU64();
 
         uint64_t remaining = count - filled;
         uint64_t chunk = (remaining < 8) ? remaining : 8;
@@ -4276,6 +4283,11 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
                 auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
                 rp->readerWaiter = self;
             }
+            if (fde->type == FdType::Socket && fde->handle)
+            {
+                int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+                brook::SockSetPollWaiter(sockIdx, self);
+            }
         }
 
         // Re-check data availability after registration.
@@ -4292,6 +4304,13 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
             {
                 auto* pb = static_cast<PipeBuffer*>(fde->handle);
                 if (!(fde->flags & 1) && (pb->count() > 0 || pb->writers == 0))
+                { ready++; break; }
+            }
+            if (fde->type == FdType::Socket && fde->handle)
+            {
+                int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+                if (brook::SockPollReady(sockIdx, (fds[i].events & POLLIN) != 0,
+                                                  (fds[i].events & POLLOUT) != 0))
                 { ready++; break; }
             }
         }
@@ -4320,6 +4339,11 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
                         if (!(fde2->flags & 1) && pb2->readerWaiter == self)
                             pb2->readerWaiter = nullptr;
                     }
+                    if (fde2->type == FdType::Socket && fde2->handle)
+                    {
+                        int si = static_cast<int>(reinterpret_cast<uintptr_t>(fde2->handle)) - 1;
+                        brook::SockSetPollWaiter(si, nullptr);
+                    }
                 }
                 return -EINTR;
             }
@@ -4345,6 +4369,7 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
                 if (rp->readerWaiter == self)
                     rp->readerWaiter = nullptr;
             }
+            // Socket waiter is already cleared by SockDeliverUdp/TcpEnqueueData on wake
         }
 
         // Re-scan after wake — reset ready count
