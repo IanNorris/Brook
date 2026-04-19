@@ -215,6 +215,8 @@ static constexpr int64_t ENOTDIR = 20;
 static constexpr int64_t EIO     = 5;
 static constexpr int64_t ENOTCONN = 107;
 static constexpr int64_t EAFNOSUPPORT = 97;
+static constexpr int64_t ECONNREFUSED = 111;
+static constexpr int64_t ETIMEDOUT    = 110;
 
 // Check if the current process has deliverable signals pending.
 // Call after SchedulerBlock() returns to decide whether to return -EINTR.
@@ -259,6 +261,72 @@ struct MemFdData {
     uint64_t  size;
     uint64_t  capacity;
 };
+
+// ---------------------------------------------------------------------------
+// AF_UNIX path sockets — structs and helpers defined here so
+// sys_read/sys_write/sys_close can use them
+// ---------------------------------------------------------------------------
+
+static constexpr int AF_UNIX           = 1;
+static constexpr int UNIX_SOCK_NONBLOCK = 0x800;
+static constexpr int UNIX_SOCK_CLOEXEC  = 0x80000;
+static constexpr int UNIX_MAX_SERVERS   = 16;
+static constexpr int UNIX_ACCEPT_QUEUE  = 8;
+
+struct UnixPendingConn {
+    PipeBuffer* serverRx;     // server reads this (client→server data)
+    PipeBuffer* serverTx;     // server writes this (server→client data)
+    Process*    clientWaiter; // client blocked until accept() completes
+    bool        accepted;
+    bool        used;
+};
+
+struct UnixSocketData {
+    enum class State : uint8_t { Unbound, Listening, Connected };
+    State   state;
+    bool    nonblock;
+    char    path[108];
+    UnixPendingConn pending[UNIX_ACCEPT_QUEUE];
+    int             pendingCount;
+    Process*        acceptWaiter;
+    PipeBuffer* rxPipe;
+    PipeBuffer* txPipe;
+};
+
+struct SockAddrUn {
+    uint16_t sun_family; // AF_UNIX = 1
+    char     sun_path[108];
+};
+
+static UnixSocketData* g_unixServers[UNIX_MAX_SERVERS];
+
+static UnixSocketData* UnixFindServer(const char* path)
+{
+    for (int i = 0; i < UNIX_MAX_SERVERS; i++) {
+        if (!g_unixServers[i]) continue;
+        if (g_unixServers[i]->state != UnixSocketData::State::Listening) continue;
+        const char* a = g_unixServers[i]->path;
+        const char* b = path;
+        bool match = true;
+        while (*a || *b) { if (*a++ != *b++) { match = false; break; } }
+        if (match) return g_unixServers[i];
+    }
+    return nullptr;
+}
+
+static void UnixRegisterServer(UnixSocketData* usd)
+{
+    for (int i = 0; i < UNIX_MAX_SERVERS; i++) {
+        if (!g_unixServers[i]) { g_unixServers[i] = usd; return; }
+    }
+}
+
+static void UnixUnregisterServer(UnixSocketData* usd)
+{
+    for (int i = 0; i < UNIX_MAX_SERVERS; i++) {
+        if (g_unixServers[i] == usd) { g_unixServers[i] = nullptr; return; }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // OSS /dev/dsp state and ioctl definitions
@@ -613,6 +681,41 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
         fde->seekPos += count;
         if (fde->seekPos > mfd->size) mfd->size = fde->seekPos;
         return static_cast<int64_t>(count);
+    }
+
+    // Write to AF_UNIX connected socket
+    if (fde->type == FdType::UnixSocket && fde->handle)
+    {
+        auto* usd = static_cast<UnixSocketData*>(fde->handle);
+        if (usd->state != UnixSocketData::State::Connected || !usd->txPipe)
+            return -ENOTCONN;
+        auto* pipe = usd->txPipe;
+        const char* src = reinterpret_cast<const char*>(bufAddr);
+        bool nonblock = usd->nonblock || (fde->statusFlags & 0x800);
+        uint64_t written = 0;
+
+        while (written < count) {
+            if (__atomic_load_n(&pipe->readers, __ATOMIC_ACQUIRE) == 0)
+                return written > 0 ? static_cast<int64_t>(written) : -EPIPE;
+            uint32_t chunk = pipe->write(src + written,
+                static_cast<uint32_t>(count - written > 4096 ? 4096 : count - written));
+            written += chunk;
+            if (written > 0) {
+                Process* reader = pipe->readerWaiter;
+                if (reader) {
+                    pipe->readerWaiter = nullptr;
+                    __atomic_store_n(&reader->pendingWakeup, 1, __ATOMIC_RELEASE);
+                    SchedulerUnblock(reader);
+                }
+                break;
+            }
+            if (nonblock) return -EAGAIN;
+            Process* self = ProcessCurrent();
+            pipe->writerWaiter = self;
+            SchedulerBlock(self);
+            if (HasPendingSignals()) return written > 0 ? static_cast<int64_t>(written) : -EINTR;
+        }
+        return static_cast<int64_t>(written);
     }
 
     return -EBADF;
@@ -1096,6 +1199,30 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         }
     }
 
+    // Read from AF_UNIX connected socket
+    if (fde->type == FdType::UnixSocket && fde->handle)
+    {
+        auto* usd = static_cast<UnixSocketData*>(fde->handle);
+        if (usd->state != UnixSocketData::State::Connected || !usd->rxPipe)
+            return -ENOTCONN;
+        auto* pipe = usd->rxPipe;
+        auto* dst  = reinterpret_cast<char*>(bufAddr);
+        bool nonblock = usd->nonblock || (fde->statusFlags & 0x800);
+
+        for (;;) {
+            uint32_t got = pipe->read(dst, static_cast<uint32_t>(count > 4096 ? 4096 : count));
+            if (got > 0) return static_cast<int64_t>(got);
+            if (__atomic_load_n(&pipe->writers, __ATOMIC_ACQUIRE) == 0) return 0; // EOF
+            if (nonblock) return -EAGAIN;
+            Process* self = ProcessCurrent();
+            pipe->readerWaiter = self;
+            extern volatile uint64_t g_lapicTickCount;
+            self->wakeupTick = g_lapicTickCount + 10;
+            SchedulerBlock(self);
+            if (HasPendingSignals()) return -EINTR;
+        }
+    }
+
     return -EBADF;
 }
 
@@ -1460,6 +1587,17 @@ static int64_t sys_close(uint64_t fd, uint64_t, uint64_t,
         auto* mfd = static_cast<MemFdData*>(fde->handle);
         if (mfd->buf) kfree(mfd->buf);
         kfree(mfd);
+    }
+
+    if (fde->type == FdType::UnixSocket && fde->handle)
+    {
+        auto* usd = static_cast<UnixSocketData*>(fde->handle);
+        if (usd->state == UnixSocketData::State::Listening)
+            UnixUnregisterServer(usd);
+        // Decrement refcounts on connected pipes so the other end sees EOF
+        if (usd->rxPipe) __atomic_fetch_sub(&usd->rxPipe->readers, 1, __ATOMIC_RELEASE);
+        if (usd->txPipe) __atomic_fetch_sub(&usd->txPipe->writers, 1, __ATOMIC_RELEASE);
+        kfree(usd);
     }
 
     if (fde->type == FdType::DevDsp && fde->handle)
@@ -3861,6 +3999,14 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
         return 0;
     }
 
+    if (fde->type == FdType::UnixSocket) {
+        auto* raw = reinterpret_cast<uint8_t*>(st);
+        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        st->st_mode = 0140666; // S_IFSOCK | rw-rw-rw-
+        st->st_blksize = 4096;
+        return 0;
+    }
+
     return -EBADF;
 }
 
@@ -4838,9 +4984,14 @@ static uint32_t EpollFdReady(Process* proc, int fd, uint32_t events)
             auto* pair = static_cast<TtyDevicePair*>(fde->handle);
             auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
             readable = (rp->count() > 0 || rp->writers == 0);
-        } else if (fde->type == FdType::UnixSocket) {
-            // Placeholder: check unix socket rx — see UnixSocket impl
-            readable = false;
+        } else if (fde->type == FdType::UnixSocket && fde->handle) {
+            auto* usd = static_cast<UnixSocketData*>(fde->handle);
+            if (usd->state == UnixSocketData::State::Listening) {
+                readable = (usd->pendingCount > 0);
+            } else if (usd->state == UnixSocketData::State::Connected && usd->rxPipe) {
+                readable = (usd->rxPipe->count() > 0 ||
+                            __atomic_load_n(&usd->rxPipe->writers, __ATOMIC_ACQUIRE) == 0);
+            }
         }
         if (readable) ready |= EPOLLIN;
     }
@@ -4864,6 +5015,11 @@ static uint32_t EpollFdReady(Process* proc, int fd, uint32_t events)
             writable = true;
         } else if (fde->type == FdType::MemFd) {
             writable = true;
+        } else if (fde->type == FdType::UnixSocket && fde->handle) {
+            auto* usd = static_cast<UnixSocketData*>(fde->handle);
+            if (usd->state == UnixSocketData::State::Connected && usd->txPipe)
+                writable = (__atomic_load_n(&usd->txPipe->readers, __ATOMIC_ACQUIRE) > 0 &&
+                            usd->txPipe->space() > 0);
         }
         if (writable) ready |= EPOLLOUT;
     }
@@ -6609,6 +6765,8 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
 // Socket syscalls
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Per-process socket-to-fd mapping.
 // Socket index is stored in FdEntry::handle as (void*)(uintptr_t)(sockIdx + 1).
 // +1 so that socket 0 maps to non-null handle.
@@ -6621,7 +6779,22 @@ static int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
 
     SerialPrintf("sys_socket: domain=%lu type=%lu proto=%lu\n", domain, type, protocol);
 
-    // AF_UNIX (1), AF_INET6 (10) — not supported
+    if (domain == AF_UNIX) {
+        auto* usd = static_cast<UnixSocketData*>(kmalloc(sizeof(UnixSocketData)));
+        if (!usd) return -ENOMEM;
+        for (uint64_t i = 0; i < sizeof(UnixSocketData); i++)
+            reinterpret_cast<uint8_t*>(usd)[i] = 0;
+        usd->state    = UnixSocketData::State::Unbound;
+        usd->nonblock = (type & UNIX_SOCK_NONBLOCK) != 0;
+
+        int fd = FdAlloc(proc, FdType::UnixSocket, usd);
+        if (fd < 0) { kfree(usd); return -EMFILE; }
+        if (type & UNIX_SOCK_CLOEXEC) proc->fds[fd].fdFlags |= 1;
+        SerialPrintf("sys_socket: AF_UNIX fd=%d\n", fd);
+        return fd;
+    }
+
+    // AF_INET6 (10) — not supported
     if (domain != AF_INET) return -EAFNOSUPPORT;
 
     int sockIdx = SockCreate(static_cast<int>(domain),
@@ -6654,6 +6827,22 @@ static int64_t sys_bind(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
     if (!proc) return -ENOSYS;
 
     int fd = static_cast<int>(fdVal);
+
+    // Check for AF_UNIX socket first
+    FdEntry* fde = FdGet(proc, fd);
+    if (fde && fde->type == FdType::UnixSocket && fde->handle) {
+        auto* usd = static_cast<UnixSocketData*>(fde->handle);
+        if (addrVal < 0x1000) return -EFAULT;
+        auto* ua = reinterpret_cast<const SockAddrUn*>(addrVal);
+        if (ua->sun_family != AF_UNIX) return -EINVAL;
+        // Copy path
+        const char* src = ua->sun_path;
+        char* dst = usd->path;
+        for (int i = 0; i < 107 && src[i]; i++) dst[i] = src[i], dst[i+1] = 0;
+        SerialPrintf("sys_bind: AF_UNIX fd=%d path='%s'\n", fd, usd->path);
+        return 0;
+    }
+
     int sockIdx = GetSockIdx(proc, fd);
     if (sockIdx < 0) return -EBADF;
 
@@ -6670,6 +6859,84 @@ static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
     if (!proc) return -ENOSYS;
 
     int fd = static_cast<int>(fdVal);
+
+    // AF_UNIX connect: find server, create pipe pair, enqueue, block until accepted
+    FdEntry* fde = FdGet(proc, fd);
+    if (fde && fde->type == FdType::UnixSocket && fde->handle) {
+        auto* usd = static_cast<UnixSocketData*>(fde->handle);
+        if (addrVal < 0x1000) return -EFAULT;
+        auto* ua = reinterpret_cast<const SockAddrUn*>(addrVal);
+        if (ua->sun_family != AF_UNIX) return -EINVAL;
+
+        // Copy destination path
+        char path[108] = {};
+        for (int i = 0; i < 107 && ua->sun_path[i]; i++) path[i] = ua->sun_path[i];
+
+        SerialPrintf("sys_connect: AF_UNIX fd=%d path='%s'\n", fd, path);
+
+        // Find the listening server
+        UnixSocketData* server = UnixFindServer(path);
+        if (!server) return -ECONNREFUSED;
+        if (server->pendingCount >= UNIX_ACCEPT_QUEUE) return -EAGAIN;
+
+        // Create bidirectional pipe pair
+        auto* pipeCS = static_cast<PipeBuffer*>(kmalloc(sizeof(PipeBuffer))); // client→server
+        auto* pipeSC = static_cast<PipeBuffer*>(kmalloc(sizeof(PipeBuffer))); // server→client
+        if (!pipeCS || !pipeSC) {
+            if (pipeCS) kfree(pipeCS);
+            if (pipeSC) kfree(pipeSC);
+            return -ENOMEM;
+        }
+        for (uint64_t i = 0; i < sizeof(PipeBuffer); i++) {
+            reinterpret_cast<uint8_t*>(pipeCS)[i] = 0;
+            reinterpret_cast<uint8_t*>(pipeSC)[i] = 0;
+        }
+        pipeCS->readers = 1; pipeCS->writers = 1;
+        pipeSC->readers = 1; pipeSC->writers = 1;
+
+        // Set up client side
+        usd->state   = UnixSocketData::State::Connected;
+        usd->rxPipe  = pipeSC; // client reads server→client pipe
+        usd->txPipe  = pipeCS; // client writes client→server pipe
+        for (int i = 0; i < 107 && path[i]; i++) usd->path[i] = path[i];
+
+        // Enqueue pending connection on server
+        int slot = -1;
+        for (int i = 0; i < UNIX_ACCEPT_QUEUE; i++) {
+            if (!server->pending[i].used) { slot = i; break; }
+        }
+        if (slot < 0) { kfree(pipeCS); kfree(pipeSC); return -EAGAIN; }
+
+        server->pending[slot].serverRx     = pipeCS; // server reads what client wrote
+        server->pending[slot].serverTx     = pipeSC; // server writes what client reads
+        server->pending[slot].clientWaiter = proc;
+        server->pending[slot].accepted     = false;
+        server->pending[slot].used         = true;
+        server->pendingCount++;
+
+        // Wake server if it's blocked in accept
+        if (server->acceptWaiter) {
+            Process* w = server->acceptWaiter;
+            server->acceptWaiter = nullptr;
+            __atomic_store_n(&w->pendingWakeup, 1, __ATOMIC_RELEASE);
+            SchedulerUnblock(w);
+        }
+
+        // Block until accepted (or nonblock)
+        if (!usd->nonblock) {
+            for (int iter = 0; iter < 100000 && !server->pending[slot].accepted; iter++) {
+                Process* self = ProcessCurrent();
+                self->wakeupTick = g_lapicTickCount + 10;
+                SchedulerBlock(self);
+                if (HasPendingSignals()) return -EINTR;
+            }
+            if (!server->pending[slot].accepted) return -ETIMEDOUT;
+        }
+
+        (void)addrLen;
+        return 0;
+    }
+
     int sockIdx = GetSockIdx(proc, fd);
     if (sockIdx < 0) return -EBADF;
 
@@ -6809,6 +7076,18 @@ static int64_t sys_listen(uint64_t fdVal, uint64_t backlog, uint64_t,
     if (!proc) return -ENOSYS;
 
     int fd = static_cast<int>(fdVal);
+
+    // AF_UNIX: mark socket as listening and register in global table
+    FdEntry* fde = FdGet(proc, fd);
+    if (fde && fde->type == FdType::UnixSocket && fde->handle) {
+        auto* usd = static_cast<UnixSocketData*>(fde->handle);
+        usd->state = UnixSocketData::State::Listening;
+        UnixRegisterServer(usd);
+        SerialPrintf("sys_listen: AF_UNIX fd=%d path='%s'\n", fd, usd->path);
+        return 0;
+    }
+
+    (void)backlog;
     int sockIdx = GetSockIdx(proc, fd);
     if (sockIdx < 0) return -EBADF;
 
@@ -6823,6 +7102,68 @@ static int64_t sys_accept(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
     if (!proc) return -ENOSYS;
 
     int fd = static_cast<int>(fdVal);
+
+    // AF_UNIX accept: dequeue a pending connection
+    FdEntry* fde = FdGet(proc, fd);
+    if (fde && fde->type == FdType::UnixSocket && fde->handle) {
+        auto* usd = static_cast<UnixSocketData*>(fde->handle);
+        if (usd->state != UnixSocketData::State::Listening) return -EINVAL;
+
+        // Wait for a pending connection
+        for (;;) {
+            // Find a pending (not yet accepted) slot
+            int slot = -1;
+            for (int i = 0; i < UNIX_ACCEPT_QUEUE; i++) {
+                if (usd->pending[i].used && !usd->pending[i].accepted) {
+                    slot = i; break;
+                }
+            }
+
+            if (slot >= 0) {
+                // Create a connected server-side socket
+                auto* serverSock = static_cast<UnixSocketData*>(kmalloc(sizeof(UnixSocketData)));
+                if (!serverSock) return -ENOMEM;
+                for (uint64_t i = 0; i < sizeof(UnixSocketData); i++)
+                    reinterpret_cast<uint8_t*>(serverSock)[i] = 0;
+                serverSock->state  = UnixSocketData::State::Connected;
+                serverSock->rxPipe = usd->pending[slot].serverRx;
+                serverSock->txPipe = usd->pending[slot].serverTx;
+
+                int newFd = FdAlloc(proc, FdType::UnixSocket, serverSock);
+                if (newFd < 0) { kfree(serverSock); return -EMFILE; }
+
+                // Mark accepted and wake the client
+                usd->pending[slot].accepted = true;
+                usd->pendingCount--;
+                Process* client = usd->pending[slot].clientWaiter;
+                usd->pending[slot].used = false;
+
+                if (client) {
+                    __atomic_store_n(&client->pendingWakeup, 1, __ATOMIC_RELEASE);
+                    SchedulerUnblock(client);
+                }
+
+                // Zero out peer addr if requested (AF_UNIX has no meaningful peer addr)
+                if (addrVal >= 0x1000 && addrLenVal >= 0x1000) {
+                    auto* lenPtr = reinterpret_cast<uint32_t*>(addrLenVal);
+                    *lenPtr = 0;
+                }
+
+                SerialPrintf("sys_accept: AF_UNIX fd=%d -> newFd=%d\n", fd, newFd);
+                return newFd;
+            }
+
+            if (usd->nonblock) return -EAGAIN;
+
+            // Block until a connection arrives
+            usd->acceptWaiter = proc;
+            proc->wakeupTick = g_lapicTickCount + 100;
+            SchedulerBlock(proc);
+            usd->acceptWaiter = nullptr;
+            if (HasPendingSignals()) return -EINTR;
+        }
+    }
+
     int sockIdx = GetSockIdx(proc, fd);
     if (sockIdx < 0) return -EBADF;
 
@@ -6848,6 +7189,22 @@ static int64_t sys_accept(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
 
     SerialPrintf("sys_accept: fd=%d -> newFd=%d childIdx=%d\n", fd, newFd, childIdx);
     return newFd;
+}
+
+// accept4 = accept with flags (SOCK_NONBLOCK, SOCK_CLOEXEC)
+static int64_t sys_accept4(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
+                            uint64_t flags, uint64_t, uint64_t)
+{
+    int64_t ret = sys_accept(fdVal, addrVal, addrLenVal, 0, 0, 0);
+    if (ret < 0) return ret;
+
+    Process* proc = ProcessCurrent();
+    if (proc) {
+        int newFd = static_cast<int>(ret);
+        if (flags & UNIX_SOCK_NONBLOCK) proc->fds[newFd].statusFlags |= 0x800;
+        if (flags & UNIX_SOCK_CLOEXEC)  proc->fds[newFd].fdFlags |= 1;
+    }
+    return ret;
 }
 
 static int64_t sys_socketpair(uint64_t domain, uint64_t type, uint64_t protocol,
@@ -6925,31 +7282,63 @@ static int64_t sys_socketpair(uint64_t domain, uint64_t type, uint64_t protocol,
     return 0;
 }
 
-static int64_t sys_sendmsg(uint64_t, uint64_t, uint64_t,
+static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
                             uint64_t, uint64_t, uint64_t)
 {
+    (void)flagsVal;
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ENOSYS;
+
+    int fd = static_cast<int>(fdVal);
+    if (msgVal < 0x1000) return -EFAULT;
+
+    struct MsgHdr {
+        void*    msg_name;
+        uint32_t msg_namelen;
+        uint32_t _pad0;
+        struct { void* iov_base; uint64_t iov_len; }* msg_iov;
+        uint64_t msg_iovlen;
+        void*    msg_control;
+        uint64_t msg_controllen;
+        int      msg_flags;
+    };
+    auto* msg = reinterpret_cast<MsgHdr*>(msgVal);
+    if (!msg || msg->msg_iovlen == 0 || !msg->msg_iov) return -EINVAL;
+
+    // AF_UNIX: route through sys_write for each iov
+    FdEntry* fde = FdGet(proc, fd);
+    if (fde && fde->type == FdType::UnixSocket) {
+        int64_t total = 0;
+        for (uint64_t i = 0; i < msg->msg_iovlen; i++) {
+            void* base = msg->msg_iov[i].iov_base;
+            uint64_t len = msg->msg_iov[i].iov_len;
+            if (!base || len == 0) continue;
+            int64_t ret = sys_write(fd, reinterpret_cast<uint64_t>(base), len, 0, 0, 0);
+            if (ret < 0) return (total > 0) ? total : ret;
+            total += ret;
+        }
+        return total;
+    }
+
     return -ENOSYS;
 }
 
 static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
                             uint64_t, uint64_t, uint64_t)
 {
+    (void)flagsVal;
     Process* proc = ProcessCurrent();
     if (!proc) return -ENOSYS;
 
     int fd = static_cast<int>(fdVal);
-    int sockIdx = GetSockIdx(proc, fd);
-    if (sockIdx < 0) return -EBADF;
+    if (msgVal < 0x1000) return -EFAULT;
 
     // msghdr structure (matching Linux x86-64 ABI)
     struct MsgHdr {
         void*    msg_name;
         uint32_t msg_namelen;
         uint32_t _pad0;
-        struct {
-            void*    iov_base;
-            uint64_t iov_len;
-        }*       msg_iov;
+        struct { void* iov_base; uint64_t iov_len; }* msg_iov;
         uint64_t msg_iovlen;
         void*    msg_control;
         uint64_t msg_controllen;
@@ -6958,6 +7347,27 @@ static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
 
     auto* msg = reinterpret_cast<MsgHdr*>(msgVal);
     if (!msg || msg->msg_iovlen == 0 || !msg->msg_iov) return -EINVAL;
+
+    // AF_UNIX: receive through sys_read for each iov
+    FdEntry* fde = FdGet(proc, fd);
+    if (fde && fde->type == FdType::UnixSocket) {
+        int64_t total = 0;
+        for (uint64_t i = 0; i < msg->msg_iovlen; i++) {
+            void* base = msg->msg_iov[i].iov_base;
+            uint64_t len = msg->msg_iov[i].iov_len;
+            if (!base || len == 0) continue;
+            int64_t ret = sys_read(fd, reinterpret_cast<uint64_t>(base), len, 0, 0, 0);
+            if (ret < 0) return (total > 0) ? total : ret;
+            if (ret == 0) break; // EOF
+            total += ret;
+        }
+        msg->msg_flags = 0;
+        msg->msg_controllen = 0;
+        return total;
+    }
+
+    int sockIdx = GetSockIdx(proc, fd);
+    if (sockIdx < 0) return -EBADF;
 
     // Use first iov entry as receive buffer
     void* buf = msg->msg_iov[0].iov_base;
@@ -7119,6 +7529,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_SOCKET]          = sys_socket;
     g_syscallTable[SYS_CONNECT]         = sys_connect;
     g_syscallTable[SYS_ACCEPT]          = sys_accept;
+    g_syscallTable[SYS_ACCEPT4]         = sys_accept4;
     g_syscallTable[SYS_SENDTO]          = sys_sendto;
     g_syscallTable[SYS_RECVFROM]        = sys_recvfrom;
     g_syscallTable[SYS_SENDMSG]         = sys_sendmsg;

@@ -163,6 +163,7 @@ static constexpr uint64_t SYS_EPOLL_PWAIT     = 281;
 static constexpr uint64_t SYS_TIMERFD_CREATE  = 283;
 static constexpr uint64_t SYS_TIMERFD_SETTIME = 286;
 static constexpr uint64_t SYS_TIMERFD_GETTIME = 287;
+static constexpr uint64_t SYS_ACCEPT4         = 288;
 static constexpr uint64_t SYS_EPOLL_CREATE1   = 291;
 static constexpr uint64_t SYS_MEMFD_CREATE    = 319;
 static constexpr uint64_t SYS_MEMFD_SECRET    = 447;
