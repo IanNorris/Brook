@@ -230,14 +230,12 @@ if [ "$HEADLESS" -eq 1 ]; then
         DISPLAY_OPT="-vnc none"
     fi
 elif [ "$LOG_TO_FILE" -eq 1 ]; then
-    # Interactive + log: keep -serial stdio unchanged (stdin stays as TTY for raw mode),
-    # but redirect QEMU's stdout through tee so output goes to screen AND log file.
-    # Brook OS never reads from serial, so stdin-as-TTY is all that matters for QEMU.
-    SERIAL_OPT="-serial stdio"
+    # Interactive + log: COM1 goes to a file, COM2 (added below) goes to stdio for live view.
+    # The kernel only initialises COM1 so all serial output lands in the log.
+    # A second -serial stdio gives the QEMU monitor / user a live terminal.
+    SERIAL_OPT="-chardev file,id=ser0,path=${LOG_FILE} -serial chardev:ser0 -serial stdio"
     DISPLAY_OPT="-display gtk"
     echo "  Serial log: ${LOG_FILE}"
-    # Redirect stdout through tee immediately — all echo output above is already done
-    exec 1> >(tee "${LOG_FILE}")
 else
     SERIAL_OPT="-serial stdio"
     DISPLAY_OPT="-display gtk"
@@ -276,8 +274,3 @@ qemu-system-x86_64 \
     -no-shutdown \
     ${DEBUG_FLAGS} \
     "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
-
-# If --logtofile was used, wait for the tee subprocess to flush before exiting
-if [ "$LOG_TO_FILE" -eq 1 ] && [ "$HEADLESS" -eq 0 ]; then
-    wait
-fi
