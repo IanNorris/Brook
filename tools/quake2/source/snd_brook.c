@@ -29,6 +29,12 @@ static int submit_pos = 0;  /* mono samples written so far */
 #define SND_BUF_SAMPLES  16384  /* total mono samples in ring buffer */
 static unsigned char dma_buffer[SND_BUF_SAMPLES * 2 * 2]; /* 16-bit stereo */
 
+/* Pending SFX buffer: filled by SNDDMA_Submit, consumed by SFX_MixInto.
+ * Holds at most one frame of 11025 Hz stereo int16 audio (~460 frames = 1840 bytes). */
+#define SFX_PENDING_BYTES  4096
+static unsigned char g_sfx_pending[SFX_PENDING_BYTES];
+int g_sfx_pending_bytes = 0;
+
 qboolean SNDDMA_Init(void)
 {
     audio_fd = open("/dev/dsp", O_WRONLY | O_NONBLOCK);
@@ -94,18 +100,19 @@ void SNDDMA_BeginPainting(void)
 
 void SNDDMA_Submit(void)
 {
-    if (!snd_inited || audio_fd < 0)
+    if (!snd_inited)
         return;
 
     extern int paintedtime;
     int new_samples = (paintedtime - (submit_pos / dma.channels)) * dma.channels;
     if (new_samples <= 0)
+    {
+        g_sfx_pending_bytes = 0;
         return;
+    }
 
-    /* Cap at half a frame's worth of audio (11025 Hz, half-frame at 30fps ≈ 184
-     * mono samples = 735 stereo int16 bytes).  CD music gets the other half.
-     * After 4× kernel resampling both together stay at ≤ hardware rate. */
-    int max_samples = (11025 / 30);   /* ~367 mono samples per full frame */
+    /* Cap at one frame's worth at 11025 Hz to avoid getting too far ahead */
+    int max_samples = (11025 / 25 + 16) * dma.channels;
     if (new_samples > max_samples)
         new_samples = max_samples;
 
@@ -113,19 +120,45 @@ void SNDDMA_Submit(void)
     int buf_len = dma.samples * sample_bytes;
     int pos = (submit_pos * sample_bytes) & (buf_len - 1);
     int total_bytes = new_samples * sample_bytes;
+    if (total_bytes > SFX_PENDING_BYTES)
+        total_bytes = SFX_PENDING_BYTES;
 
-    while (total_bytes > 0)
+    /* Copy from ring buffer (handling wrap) into pending buffer for cd_brook.c */
+    int chunk1 = buf_len - pos;
+    if (chunk1 > total_bytes) chunk1 = total_bytes;
+    memcpy(g_sfx_pending, dma_buffer + pos, chunk1);
+    if (chunk1 < total_bytes)
+        memcpy(g_sfx_pending + chunk1, dma_buffer, total_bytes - chunk1);
+
+    g_sfx_pending_bytes = total_bytes;
+    submit_pos += new_samples;
+}
+
+/*
+ * SFX_MixInto — called by cd_brook.c to blend pending SFX into the CD audio
+ * buffer before writing to /dev/dsp.  Resamples from 11025 Hz to 44100 Hz
+ * (nearest-neighbour, 4× upsample) and adds with int16 clamping.
+ * Clears the pending buffer on return.
+ */
+int SFX_MixInto(short* dst, int dst_frames)
+{
+    if (g_sfx_pending_bytes <= 0)
+        return 0;
+
+    int src_frames = g_sfx_pending_bytes / 4; /* 4 bytes = 1 stereo int16 frame */
+    short* src = (short*)g_sfx_pending;
+
+    for (int i = 0; i < dst_frames; i++)
     {
-        int chunk = buf_len - pos;
-        if (chunk > total_bytes)
-            chunk = total_bytes;
+        int si = (int)((long long)i * src_frames / dst_frames);
+        if (si >= src_frames) si = src_frames - 1;
 
-        ssize_t w = write(audio_fd, dma_buffer + pos, chunk);
-        if (w <= 0)
-            break;
-
-        pos = (pos + w) & (buf_len - 1);
-        total_bytes -= w;
-        submit_pos += w / sample_bytes;
+        int l = (int)dst[i*2]   + (int)src[si*2];
+        int r = (int)dst[i*2+1] + (int)src[si*2+1];
+        dst[i*2]   = l >  32767 ?  32767 : l < -32768 ? -32768 : (short)l;
+        dst[i*2+1] = r >  32767 ?  32767 : r < -32768 ? -32768 : (short)r;
     }
+
+    g_sfx_pending_bytes = 0;
+    return dst_frames;
 }

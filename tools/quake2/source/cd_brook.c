@@ -3,10 +3,11 @@
  *
  * Replaces the null CD driver.  When the engine calls CDAudio_Play(track),
  * we open baseq2/music/TrackNN.ogg, decode with stb_vorbis, and stream
- * 16-bit stereo 44100 Hz PCM to a second /dev/dsp file descriptor.
+ * 16-bit stereo 44100 Hz PCM to /dev/dsp.
  *
- * The kernel mixes all /dev/dsp writers together, so this coexists with
- * the SFX output in snd_brook.c.
+ * SFX audio (from snd_brook.c) is mixed directly into the CD buffer here
+ * before writing, so there is only ever one /dev/dsp write per frame.
+ * This keeps the HDA ring buffer at exactly 1× hardware rate.
  */
 
 #include "client.h"
@@ -43,6 +44,9 @@ static int            cd_track   = 0;
 /* Max decode buffer: 2 seconds of audio at 44100 Hz stereo (safety cap) */
 #define CD_FRAMES_PER_CHUNK  4096
 static short cd_pcm[CD_FRAMES_PER_CHUNK * 2]; /* stereo interleaved */
+
+/* SFX pending buffer filled by snd_brook.c SNDDMA_Submit each frame */
+extern int SFX_MixInto(short* dst, int dst_frames);
 
 /* ---- helpers ---- */
 
@@ -202,5 +206,10 @@ void CDAudio_Update(void)
     }
 
     int bytes = frames * 2 * sizeof(short); /* stereo 16-bit */
+
+    /* Mix in SFX (11025 Hz → 44100 Hz upsample, additive) before writing.
+     * This keeps total HDA writes at exactly 1× hardware rate. */
+    SFX_MixInto(cd_pcm, frames);
+
     write(cd_fd, cd_pcm, bytes);  /* O_NONBLOCK — don't stall game loop */
 }

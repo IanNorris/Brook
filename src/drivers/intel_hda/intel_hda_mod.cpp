@@ -211,9 +211,9 @@ static BdlEntry* g_bdl = nullptr;
 static uint64_t  g_bdlPhys = 0;
 
 // Audio buffer — split into N fragments for ring-buffered DMA
-static constexpr uint32_t NUM_FRAGMENTS   = 64;           // BDL entries (max 256)
+static constexpr uint32_t NUM_FRAGMENTS   = 16;           // BDL entries (max 256)
 static constexpr uint32_t FRAG_SIZE       = 4096;        // 4KB each (= 1 page)
-static constexpr uint32_t AUDIO_BUF_SIZE  = NUM_FRAGMENTS * FRAG_SIZE; // 256KB total
+static constexpr uint32_t AUDIO_BUF_SIZE  = NUM_FRAGMENTS * FRAG_SIZE; // 64KB total
 static uint8_t*  g_audioBuf = nullptr;
 static uint64_t  g_audioBufPhys = 0;
 static uint64_t  g_fragPhys[NUM_FRAGMENTS]; // per-fragment physical addresses
@@ -707,11 +707,11 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
 
             if (!g_streamRunning)
             {
-                // Pre-fill 16 fragments before starting DMA for smooth playback
+                // Pre-fill 4 fragments before starting DMA
                 g_writeFrag = nextFrag;
                 g_writeOffset = 0;
 
-                if (nextFrag >= 16)
+                if (nextFrag >= 4)
                 {
                     StartOutputStream();
                     g_streamRunning = true;
