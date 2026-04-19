@@ -3,11 +3,12 @@
 // See profiler.h for overview.  The hot path (ProfilerSample) runs in ISR
 // context on every CPU and must be lock-free and SSE-free.
 //
-// Design: per-CPU ring buffers accumulate samples during profiling.
-// When profiling stops, the drain thread dumps ALL samples to the serial
+// Design: per-CPU ring buffers accumulate events during profiling.
+// When profiling stops, the drain thread dumps ALL events to the serial
 // port in a parseable text format:
 //   PROF_BEGIN <cpuCount> <startTick>
-//   P <tick> <pid_hex> <cpu> <flags> <rip_hex>
+//   P  <tick> <pid_hex> <cpu> <flags> <rip_hex>   (sample)
+//   CS <tick> <cpu> <old_pid_hex> <new_pid_hex>   (context switch)
 //   ...
 //   PROF_END <totalSamples> <dropped>
 // A host-side script (profiler_to_speedscope.py) extracts these lines from
@@ -25,18 +26,23 @@ namespace brook { extern volatile uint64_t g_lapicTickCount; }
 namespace brook {
 
 // ---------------------------------------------------------------------------
-// Sample record — variable-length stack trace
+// Event record — either a sample (P) or context-switch (CS)
 // ---------------------------------------------------------------------------
+
+enum class ProfileEventType : uint8_t { Sample = 0, ContextSwitch = 1 };
 
 static constexpr uint32_t MAX_STACK_DEPTH = 8;
 
 struct ProfileSample {
+    ProfileEventType type;
     uint32_t tick;                     // relative to profiler start
     uint16_t pid;
     uint8_t  cpu;
     uint8_t  flags;                    // bit 0: ring (0=kernel, 1=user)
     uint64_t rip[MAX_STACK_DEPTH];     // [0] = leaf, [1..] = callers via RBP chain
     uint8_t  depth;                    // number of valid frames
+    // Used only for ContextSwitch events:
+    uint16_t newPid;
 };
 
 // ---------------------------------------------------------------------------
@@ -108,6 +114,7 @@ void ProfilerSample(uint64_t interruptedRip, uint64_t interruptedCs, uint64_t in
     bool userMode = (interruptedCs & 3) != 0;
 
     ProfileSample& s = buf.samples[wi];
+    s.type  = ProfileEventType::Sample;
     s.tick  = static_cast<uint32_t>(now - g_profilerStartTick);
     s.pid   = pid;
     s.cpu   = static_cast<uint8_t>(cpu);
@@ -152,6 +159,40 @@ void ProfilerSample(uint64_t interruptedRip, uint64_t interruptedCs, uint64_t in
 static const char kHexDigits[] = "0123456789abcdef";
 
 // ---------------------------------------------------------------------------
+// Context-switch hook — emits a CS event into the calling CPU's ring buffer
+// ---------------------------------------------------------------------------
+
+void ProfilerContextSwitch(uint16_t oldPid, uint16_t newPid)
+{
+    if (!g_profilerEnabled) return;
+    if (oldPid == newPid) return; // no actual switch (e.g. same idle process)
+
+    uint32_t cpu = SmpCurrentCpuIndex();
+    if (cpu >= MAX_PROFILER_CPUS) return;
+
+    PerCpuBuffer& buf = g_cpuBuf[cpu];
+
+    uint32_t wi = buf.writeIdx;
+    uint32_t nextWi = (wi + 1) % SAMPLES_PER_CPU;
+    if (nextWi == buf.readIdx) {
+        buf.dropped++;
+        return;
+    }
+
+    uint64_t now = g_lapicTickCount;
+
+    ProfileSample& s = buf.samples[wi];
+    s.type   = ProfileEventType::ContextSwitch;
+    s.tick   = static_cast<uint32_t>(now - g_profilerStartTick);
+    s.cpu    = static_cast<uint8_t>(cpu);
+    s.pid    = oldPid;
+    s.newPid = newPid;
+    s.depth  = 0;
+
+    __atomic_store_n(&buf.writeIdx, nextWi, __ATOMIC_RELEASE);
+}
+
+// ---------------------------------------------------------------------------
 // Drain samples to serial in parseable text format
 // ---------------------------------------------------------------------------
 // Output format (one line per sample, stack frames separated by semicolons):
@@ -189,25 +230,45 @@ static uint32_t DrainToSerial()
         while (ri != wi) {
             const ProfileSample& s = buf.samples[ri];
 
-            SerialPutChar('P');
-            SerialPutChar(' ');
-            SerialPutDec(s.tick);
-            SerialPutChar(' ');
-            SerialPutChar(kHexDigits[(s.pid >> 12) & 0xF]);
-            SerialPutChar(kHexDigits[(s.pid >> 8) & 0xF]);
-            SerialPutChar(kHexDigits[(s.pid >> 4) & 0xF]);
-            SerialPutChar(kHexDigits[s.pid & 0xF]);
-            SerialPutChar(' ');
-            SerialPutChar('0' + s.cpu);
-            SerialPutChar(' ');
-            SerialPutChar('0' + s.flags);
-            SerialPutChar(' ');
-            // Stack frames: rip0;rip1;rip2;...
-            for (uint8_t d = 0; d < s.depth; d++) {
-                if (d > 0) SerialPutChar(';');
-                SerialPutHex16(s.rip[d]);
+            if (s.type == ProfileEventType::ContextSwitch) {
+                // CS <tick> <cpu> <old_pid_hex> <new_pid_hex>
+                SerialPutChar('C'); SerialPutChar('S'); SerialPutChar(' ');
+                SerialPutDec(s.tick);
+                SerialPutChar(' ');
+                SerialPutChar('0' + s.cpu);
+                SerialPutChar(' ');
+                SerialPutChar(kHexDigits[(s.pid >> 12) & 0xF]);
+                SerialPutChar(kHexDigits[(s.pid >> 8) & 0xF]);
+                SerialPutChar(kHexDigits[(s.pid >> 4) & 0xF]);
+                SerialPutChar(kHexDigits[s.pid & 0xF]);
+                SerialPutChar(' ');
+                SerialPutChar(kHexDigits[(s.newPid >> 12) & 0xF]);
+                SerialPutChar(kHexDigits[(s.newPid >> 8) & 0xF]);
+                SerialPutChar(kHexDigits[(s.newPid >> 4) & 0xF]);
+                SerialPutChar(kHexDigits[s.newPid & 0xF]);
+                SerialPutChar('\n');
+            } else {
+                // P <tick> <pid_hex> <cpu> <flags> <rip0_hex>;<rip1_hex>;...
+                SerialPutChar('P');
+                SerialPutChar(' ');
+                SerialPutDec(s.tick);
+                SerialPutChar(' ');
+                SerialPutChar(kHexDigits[(s.pid >> 12) & 0xF]);
+                SerialPutChar(kHexDigits[(s.pid >> 8) & 0xF]);
+                SerialPutChar(kHexDigits[(s.pid >> 4) & 0xF]);
+                SerialPutChar(kHexDigits[s.pid & 0xF]);
+                SerialPutChar(' ');
+                SerialPutChar('0' + s.cpu);
+                SerialPutChar(' ');
+                SerialPutChar('0' + s.flags);
+                SerialPutChar(' ');
+                // Stack frames: rip0;rip1;rip2;...
+                for (uint8_t d = 0; d < s.depth; d++) {
+                    if (d > 0) SerialPutChar(';');
+                    SerialPutHex16(s.rip[d]);
+                }
+                SerialPutChar('\n');
             }
-            SerialPutChar('\n');
 
             ri = (ri + 1) % SAMPLES_PER_CPU;
             totalSamples++;

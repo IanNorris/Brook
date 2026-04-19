@@ -221,6 +221,7 @@ static void HandleArp(const uint8_t* frame, uint32_t len)
             Process* waiter = g_arpWaiter;
             if (waiter) {
                 g_arpWaiter = nullptr;
+                __atomic_store_n(&waiter->pendingWakeup, 1, __ATOMIC_RELEASE);
                 SchedulerUnblock(waiter);
             }
         }
@@ -906,6 +907,7 @@ static bool IsDnsReply(uint16_t dstPort, const void* data, uint32_t len)
         Process* waiter = g_dnsWaiter;
         if (waiter) {
             g_dnsWaiter = nullptr;
+            __atomic_store_n(&waiter->pendingWakeup, 1, __ATOMIC_RELEASE);
             SchedulerUnblock(waiter);
         }
     }
@@ -1278,8 +1280,10 @@ void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
         SpinLockRelease(&s.lock, irqFlags);
 
         // Wake poll waiter after releasing the lock
-        if (waiter)
+        if (waiter) {
+            __atomic_store_n(&waiter->pendingWakeup, 1, __ATOMIC_RELEASE);
             SchedulerUnblock(waiter);
+        }
 
         return; // only deliver to first matching socket
     }
@@ -1401,8 +1405,10 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             s.tcpRstRecv ||
             (s.tcpState != TcpState::SynSent && s.tcpState != TcpState::SynRecv)))
         {
-            SchedulerUnblock(s.pollWaiter);
+            Process* w = s.pollWaiter;
             s.pollWaiter = nullptr;
+            __atomic_store_n(&w->pendingWakeup, 1, __ATOMIC_RELEASE);
+            SchedulerUnblock(w);
         }
 
         return; // handled

@@ -10,6 +10,7 @@
 #include "serial.h"
 #include "spinlock.h"
 #include "sched_ops.h"
+#include "profiler.h"
 
 #include <stdint.h>
 
@@ -490,14 +491,20 @@ void SchedulerUnblock(Process* proc)
     // Accept Blocked or Stopped processes for unblocking/resuming
     if (proc->state != ProcessState::Blocked && proc->state != ProcessState::Stopped)
     {
-        // If the process is still Running, it's in the window between setting
-        // pollWaiter (inside the socket spinlock) and calling SchedulerBlock.
-        // Set pendingWakeup so the imminent SchedulerBlock returns immediately
-        // instead of sleeping.  This closes the SockRecv/SockConnect race:
-        //   CPU0: release sock.lock, set pollWaiter, [HERE] → SchedulerBlock
-        //   CPU1: HandleTcp → SchedulerUnblock → (was Running, no pendingWakeup set)
-        //   CPU0: SchedulerBlock → pendingWakeup==0 → blocks for 10s timeout
-        if (proc->state == ProcessState::Running)
+        // If the process is still Running or Ready, it's in the window between
+        // setting pollWaiter (inside the socket spinlock) and calling
+        // SchedulerBlock.  Set pendingWakeup so the imminent SchedulerBlock
+        // returns immediately instead of sleeping.
+        //
+        // Running: process on another CPU, about to call SchedulerBlock.
+        // Ready:   process was preempted after releasing the socket spinlock
+        //          but before reaching SchedulerBlock; when it next runs it
+        //          will call SchedulerBlock and must not block.
+        //
+        // This mirrors the KMutexUnlock pattern which sets pendingWakeup
+        // directly before calling SchedulerUnblock.
+        if (proc->state == ProcessState::Running ||
+            proc->state == ProcessState::Ready)
             __atomic_store_n(&proc->pendingWakeup, 1, __ATOMIC_RELEASE);
         SchedLockRelease(g_readyLock, rlf4);
         return;
@@ -712,6 +719,7 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
         for (;;) __asm__ volatile("hlt");
     }
 
+    ProfilerContextSwitch(oldProc->pid, newProc->pid);
     context_switch(&oldProc->savedCtx, &newProc->savedCtx,
                    &oldProc->fxsave, &newProc->fxsave);
 
@@ -951,6 +959,7 @@ parent_done:
     // and this kernel stack is no longer in use.
     g_perCpu[cpu].pendingRetire = proc;
 
+    ProfilerContextSwitch(proc->pid, next->pid);
     context_switch(&proc->savedCtx, &next->savedCtx,
                    &proc->fxsave, &next->fxsave);
 
