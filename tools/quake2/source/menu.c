@@ -1080,29 +1080,29 @@ static void ControlsSetMenuItemValues( void )
 	s_options_sfxvolume_slider.curvalue		= Cvar_VariableValue( "s_volume" ) * 10;
 	s_options_cdvolume_box.curvalue 		= !Cvar_VariableValue("cd_nocd");
 	s_options_quality_list.curvalue			= !Cvar_VariableValue( "s_loadas8bit" );
-	s_options_sensitivity_slider.curvalue	= ( sensitivity->value ) * 2;
+	s_options_sensitivity_slider.curvalue	= sensitivity ? ( sensitivity->value ) * 2 : 3.0f;
 
-	Cvar_SetValue( "cl_run", ClampCvar( 0, 1, cl_run->value ) );
-	s_options_alwaysrun_box.curvalue		= cl_run->value;
+	Cvar_SetValue( "cl_run", ClampCvar( 0, 1, cl_run ? cl_run->value : 0 ) );
+	s_options_alwaysrun_box.curvalue		= cl_run ? cl_run->value : 0;
 
-	s_options_invertmouse_box.curvalue		= m_pitch->value < 0;
+	s_options_invertmouse_box.curvalue		= m_pitch ? m_pitch->value < 0 : 0;
 
-	Cvar_SetValue( "lookspring", ClampCvar( 0, 1, lookspring->value ) );
-	s_options_lookspring_box.curvalue		= lookspring->value;
+	Cvar_SetValue( "lookspring", ClampCvar( 0, 1, lookspring ? lookspring->value : 0 ) );
+	s_options_lookspring_box.curvalue		= lookspring ? lookspring->value : 0;
 
-	Cvar_SetValue( "lookstrafe", ClampCvar( 0, 1, lookstrafe->value ) );
-	s_options_lookstrafe_box.curvalue		= lookstrafe->value;
+	Cvar_SetValue( "lookstrafe", ClampCvar( 0, 1, lookstrafe ? lookstrafe->value : 0 ) );
+	s_options_lookstrafe_box.curvalue		= lookstrafe ? lookstrafe->value : 0;
 
-	Cvar_SetValue( "freelook", ClampCvar( 0, 1, freelook->value ) );
-	s_options_freelook_box.curvalue			= freelook->value;
+	Cvar_SetValue( "freelook", ClampCvar( 0, 1, freelook ? freelook->value : 0 ) );
+	s_options_freelook_box.curvalue			= freelook ? freelook->value : 0;
 
-	Cvar_SetValue( "crosshair", ClampCvar( 0, 3, crosshair->value ) );
-	s_options_crosshair_box.curvalue		= crosshair->value;
+	Cvar_SetValue( "crosshair", ClampCvar( 0, 3, crosshair ? crosshair->value : 0 ) );
+	s_options_crosshair_box.curvalue		= crosshair ? crosshair->value : 0;
 
-	Cvar_SetValue( "in_joystick", ClampCvar( 0, 1, in_joystick->value ) );
-	s_options_joystick_box.curvalue		= in_joystick->value;
+	Cvar_SetValue( "in_joystick", ClampCvar( 0, 1, in_joystick ? in_joystick->value : 0 ) );
+	s_options_joystick_box.curvalue		= in_joystick ? in_joystick->value : 0;
 
-	s_options_noalttab_box.curvalue			= win_noalttab->value;
+	s_options_noalttab_box.curvalue			= win_noalttab ? win_noalttab->value : 0;
 }
 
 static void ControlsResetDefaultsFunc( void *unused )

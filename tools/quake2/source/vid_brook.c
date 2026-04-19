@@ -106,6 +106,9 @@ void VID_Init(void)
     ri.Vid_MenuInit = VID_MenuInit;
     ri.Vid_NewWindow = VID_NewWindow;
 
+    /* Initialize cvars owned by the video/input subsystem */
+    in_joystick = Cvar_Get("in_joystick", "0", CVAR_ARCHIVE);
+
     re = GetRefAPI(ri);
 
     if (re.api_version != API_VERSION)
