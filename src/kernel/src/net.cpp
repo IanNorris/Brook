@@ -208,9 +208,13 @@ static void HandleArp(const uint8_t* frame, uint32_t len)
             ArpSendReply(arp->sha, arp->spa);
         }
     } else if (op == ARP_OP_REPLY) {
-        SerialPrintf("net: ARP reply from %d.%d.%d.%d\n",
-                     arp->spa & 0xFF, (arp->spa >> 8) & 0xFF,
-                     (arp->spa >> 16) & 0xFF, (arp->spa >> 24) & 0xFF);
+        static uint32_t s_arpReplyCount = 0;
+        s_arpReplyCount++;
+        if (s_arpReplyCount <= 3 || (s_arpReplyCount % 1000) == 0)
+            SerialPrintf("net: ARP reply from %d.%d.%d.%d [#%u]\n",
+                         arp->spa & 0xFF, (arp->spa >> 8) & 0xFF,
+                         (arp->spa >> 16) & 0xFF, (arp->spa >> 24) & 0xFF,
+                         s_arpReplyCount);
 
         // Wake up anyone waiting for this ARP reply
         if (arp->spa == g_arpReplyIp) {
@@ -1309,10 +1313,13 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         // Update peer's advertised window
         s.tcpSndWnd = window;
 
-        // Diagnostic: log all segments in Established state
+        // Log TCP segments with rate-limiting (first 3, then every 1000th)
         if (s.tcpState == TcpState::Established || s.tcpState == TcpState::SynSent) {
-            SerialPrintf("tcp: RX flags=0x%02x seq=%u ack=%u datalen=%u rcvNxt=%u\n",
-                         flags, seq, ack, dataLen, s.tcpRcvNxt);
+            static uint32_t s_tcpRxCount = 0;
+            s_tcpRxCount++;
+            if (s_tcpRxCount <= 3 || (s_tcpRxCount % 1000) == 0)
+                SerialPrintf("tcp: RX flags=0x%02x seq=%u ack=%u datalen=%u rcvNxt=%u [pkt#%u]\n",
+                             flags, seq, ack, dataLen, s.tcpRcvNxt, s_tcpRxCount);
         }
 
         // Delegate to testable state machine
@@ -1643,6 +1650,13 @@ bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite)
             return true;
     }
     return false;
+}
+
+uint32_t SockRxCount(int sockIdx)
+{
+    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return 0;
+    if (!g_sockUsed[sockIdx]) return 0;
+    return g_sockets[sockIdx].rxCount;
 }
 
 int SockListen(int sockIdx, int backlog)

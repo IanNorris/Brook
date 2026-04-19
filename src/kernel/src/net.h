@@ -295,6 +295,7 @@ void SockGetLocal(int sockIdx, uint32_t* ip, uint16_t* port);
 int  SockListen(int sockIdx, int backlog);
 int  SockAccept(int sockIdx, SockAddrIn* addr);
 bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite);
+uint32_t SockRxCount(int sockIdx);
 void SockSetPollWaiter(int sockIdx, Process* waiter);
 void SockClose(int sockIdx);
 void SockRef(int sockIdx);    // increment refcount (fork/dup)

@@ -307,7 +307,10 @@ static int VirtioNetTransmit(NetIf* nif, const void* frame, uint32_t len)
 {
     if (len + VIRTIO_NET_HDR_SIZE > RX_BUF_SIZE) return -1;
 
-    SerialPrintf("virtio_net: TX %u bytes\n", len);
+    static uint32_t s_txCount = 0;
+    s_txCount++;
+    if (s_txCount <= 3 || (s_txCount % 1000) == 0)
+        SerialPrintf("virtio_net: TX %u bytes [pkt#%u]\n", len, s_txCount);
 
     // Prepare virtio-net header + frame in TX buffer
     auto* hdr = reinterpret_cast<VirtioNetHdr*>(g_txBuf);
