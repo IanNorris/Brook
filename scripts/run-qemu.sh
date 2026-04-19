@@ -203,8 +203,10 @@ if [ -n "${SCRIPT_NAME}" ]; then
     mcopy -o -i "${DISK_IMG}" "${SCRIPT_FILE}" "::INIT.RC"
 fi
 
+SERIAL_LOG="/tmp/brook_serial.log"
 if [ "$HEADLESS" -eq 1 ]; then
-    SERIAL_OPT="-serial file:/tmp/brook_serial.log"
+    # Headless: serial goes only to log file
+    SERIAL_OPT="-chardev file,id=ser0,path=${SERIAL_LOG} -serial chardev:ser0"
     BROOK_AUDIODEV="${BROOK_AUDIODEV:-none}"
     if [ -n "$VNC_DISPLAY" ] && [ "$VNC_DISPLAY" != "__NEXT_VNC__" ]; then
         DISPLAY_OPT="-vnc ${VNC_DISPLAY}"
@@ -212,9 +214,11 @@ if [ "$HEADLESS" -eq 1 ]; then
         DISPLAY_OPT="-vnc none"
     fi
 else
-    SERIAL_OPT="-serial stdio"
+    # Interactive: serial goes to stdio AND is mirrored to log file for post-processing
+    SERIAL_OPT="-chardev stdio,id=ser0,signal=off,logfile=${SERIAL_LOG} -serial chardev:ser0"
     DISPLAY_OPT="-display gtk"
 fi
+echo "  Serial log: ${SERIAL_LOG}"
 
 KVM_FLAGS=""
 if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] && [ "${NO_KVM:-}" != "1" ]; then
