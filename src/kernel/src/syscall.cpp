@@ -2101,6 +2101,59 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         return static_cast<int64_t>(vaddr);
     }
 
+    // MemFd-backed mmap (MAP_SHARED or MAP_PRIVATE) — used by wl_shm
+    // The buffer is heap-allocated, so we copy data into freshly-allocated
+    // user pages and track the mapping for write-back on munmap.
+    // For Wayland's use case (shared pixel buffers), the compositor and client
+    // both mmap the same fd: we give them both mappings into the same MemFdData
+    // buffer by mapping the kernel heap pages directly.
+    if (fde->type == FdType::MemFd && fde->handle)
+    {
+        auto* mfd = static_cast<MemFdData*>(fde->handle);
+
+        // Grow the MemFd to cover [offset, offset+length) if needed
+        uint64_t needed = offset + length;
+        if (needed > mfd->capacity) {
+            auto* newBuf = static_cast<uint8_t*>(kmalloc(static_cast<uint32_t>(needed + 4096)));
+            if (!newBuf) return -ENOMEM;
+            if (mfd->buf) {
+                for (uint64_t i = 0; i < mfd->size; i++) newBuf[i] = mfd->buf[i];
+                for (uint64_t i = mfd->size; i < needed + 4096; i++) newBuf[i] = 0;
+                kfree(mfd->buf);
+            } else {
+                for (uint64_t i = 0; i < needed + 4096; i++) newBuf[i] = 0;
+            }
+            mfd->buf = newBuf;
+            mfd->capacity = needed + 4096;
+        }
+        if (needed > mfd->size) mfd->size = needed;
+
+        uint64_t vaddr = pickAddr();
+        if (!vaddr) return -ENOMEM;
+
+        // Map each page of the MemFd buffer directly into user space.
+        // We find the physical address of each kernel heap page and share it.
+        for (uint64_t i = 0; i < pages; i++) {
+            uint64_t bufVA = reinterpret_cast<uint64_t>(mfd->buf) + offset + i * 4096;
+            // Align to page boundary
+            uint64_t bufVAAligned = bufVA & ~0xFFFULL;
+            PhysicalAddress phys = VmmVirtToPhys(KernelPageTable, VirtualAddress(bufVAAligned));
+            if (!phys) {
+                SerialPrintf("mmap: MemFd page %lu not mapped in kernel!\n", i);
+                return -ENOMEM;
+            }
+            if (!VmmMapPage(proc->pageTable, VirtualAddress(vaddr + i * 4096),
+                            phys, vmmFlags | VMM_WRITABLE, MemTag::User, proc->pid)) {
+                SerialPrintf("mmap: MemFd VmmMapPage failed at page %lu\n", i);
+                return -ENOMEM;
+            }
+        }
+
+        SerialPrintf("mmap: MemFd fd=%lu offset=0x%lx len=%lu -> vaddr=0x%lx\n",
+                     fd, offset, length, vaddr);
+        return static_cast<int64_t>(vaddr);
+    }
+
     // File-backed mmap
     if (fde->type != FdType::Vnode || !fde->handle)
         return -EBADF;
