@@ -411,7 +411,12 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
             }
             return static_cast<int64_t>(count);
         }
-        // Fall through to FD-table-based write below
+        // Fall through to FD-table-based write below, but mirror to serial
+        // so piped stdout/stderr is visible in the debug log.
+        if (count > 0) {
+            const char* buf = reinterpret_cast<const char*>(bufAddr);
+            SerialWriterEnqueue(buf, static_cast<uint32_t>(count));
+        }
     }
 
     // File descriptor write
