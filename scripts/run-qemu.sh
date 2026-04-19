@@ -10,6 +10,7 @@ DEBUG_FLAGS=""
 SCRIPT_NAME=""
 HEADLESS=0
 LOG_TO_FILE=0
+LOG_FILE="/tmp/brook_serial.log"
 VNC_DISPLAY=""
 EXTRA_ARGS=()
 for arg in "$@"; do
@@ -23,8 +24,14 @@ for arg in "$@"; do
         --headless)
             HEADLESS=1
             ;;
+        --logtofile=*)
+            LOG_TO_FILE=1
+            LOG_FILE="${arg#--logtofile=}"
+            ;;
         --logtofile)
             LOG_TO_FILE=1
+            # Next arg (if any) will be consumed as the path
+            LOG_FILE="__NEXT_LOG__"
             ;;
         --vnc)
             VNC_DISPLAY="__NEXT_VNC__"
@@ -41,12 +48,18 @@ for arg in "$@"; do
                 SCRIPT_NAME="$arg"
             elif [ "$VNC_DISPLAY" = "__NEXT_VNC__" ]; then
                 VNC_DISPLAY="$arg"
+            elif [ "$LOG_FILE" = "__NEXT_LOG__" ]; then
+                LOG_FILE="$arg"
             else
                 EXTRA_ARGS+=("$arg")
             fi
             ;;
     esac
 done
+# --logtofile with no path argument: use default
+if [ "$LOG_FILE" = "__NEXT_LOG__" ]; then
+    LOG_FILE="/tmp/brook_serial.log"
+fi
 
 BUILD_DIR="${ROOT_DIR}/build/${BUILD_TYPE}"
 ESP_DIR="${BUILD_DIR}/esp/EFI/BOOT"
@@ -207,10 +220,9 @@ if [ -n "${SCRIPT_NAME}" ]; then
     mcopy -o -i "${DISK_IMG}" "${SCRIPT_FILE}" "::INIT.RC"
 fi
 
-SERIAL_LOG="/tmp/brook_serial.log"
 if [ "$HEADLESS" -eq 1 ]; then
     # Headless: serial goes only to log file
-    SERIAL_OPT="-chardev file,id=ser0,path=${SERIAL_LOG} -serial chardev:ser0"
+    SERIAL_OPT="-chardev file,id=ser0,path=${LOG_FILE} -serial chardev:ser0"
     BROOK_AUDIODEV="${BROOK_AUDIODEV:-none}"
     if [ -n "$VNC_DISPLAY" ] && [ "$VNC_DISPLAY" != "__NEXT_VNC__" ]; then
         DISPLAY_OPT="-vnc ${VNC_DISPLAY}"
@@ -223,9 +235,9 @@ elif [ "$LOG_TO_FILE" -eq 1 ]; then
     # Brook OS never reads from serial, so stdin-as-TTY is all that matters for QEMU.
     SERIAL_OPT="-serial stdio"
     DISPLAY_OPT="-display gtk"
-    echo "  Serial log: ${SERIAL_LOG}"
+    echo "  Serial log: ${LOG_FILE}"
     # Redirect stdout through tee immediately — all echo output above is already done
-    exec 1> >(tee "${SERIAL_LOG}")
+    exec 1> >(tee "${LOG_FILE}")
 else
     SERIAL_OPT="-serial stdio"
     DISPLAY_OPT="-display gtk"
@@ -266,6 +278,6 @@ qemu-system-x86_64 \
     "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
 
 # If --logtofile was used, wait for the tee subprocess to flush before exiting
-if [ "$LOG_TO_FILE" -eq 1 ]; then
+if [ "$LOG_TO_FILE" -eq 1 ] && [ "$HEADLESS" -eq 0 ]; then
     wait
 fi
