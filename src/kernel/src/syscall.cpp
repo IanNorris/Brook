@@ -4558,6 +4558,7 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
         if (fds[i].fd < 0) continue;
 
         FdEntry* fde = FdGet(proc, fds[i].fd);
+
         if (!fde || fde->type == FdType::None)
         {
             fds[i].revents = POLLNVAL;
@@ -4616,16 +4617,11 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
         if (fde->type == FdType::Socket && fde->handle)
         {
             int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
-            if ((fds[i].events & POLLIN) &&
-                brook::SockPollReady(sockIdx, true, false))
-            {
-                fds[i].revents |= POLLIN;
-            }
-            if ((fds[i].events & POLLOUT) &&
-                brook::SockPollReady(sockIdx, false, true))
-            {
-                fds[i].revents |= POLLOUT;
-            }
+            bool rdReady = (fds[i].events & POLLIN) && brook::SockPollReady(sockIdx, true, false);
+            bool wrReady = (fds[i].events & POLLOUT) && brook::SockPollReady(sockIdx, false, true);
+
+            if (rdReady) fds[i].revents |= POLLIN;
+            if (wrReady) fds[i].revents |= POLLOUT;
             if (fds[i].revents) ready++;
             continue;
         }
@@ -4766,6 +4762,7 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
             {
                 extern volatile uint64_t g_lapicTickCount;
                 self->wakeupTick = g_lapicTickCount + timeout_ms;
+
             }
             SchedulerBlock(self);
             if (HasPendingSignals())
@@ -5172,7 +5169,7 @@ static int64_t epoll_create_impl(uint64_t flagsVal)
     if (flagsVal & 0x80000) // EPOLL_CLOEXEC
         proc->fds[fd].fdFlags |= 1;
 
-    SerialPrintf("sys_epoll_create: fd=%d\n", fd);
+
     return fd;
 }
 
@@ -5205,7 +5202,7 @@ static int64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t watchfd,
         for (int i = 0; i < ep->count; i++) {
             if (ep->entries[i].fd == wfd) {
                 ep->entries[i].fd = -1;
-                SerialPrintf("sys_epoll_ctl: DEL fd=%d from epoll=%lu\n", wfd, epfd);
+
                 return 0;
             }
         }
@@ -5222,7 +5219,7 @@ static int64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t watchfd,
             if (ep->entries[i].fd == wfd) {
                 ep->entries[i].events = ev.events;
                 ep->entries[i].data   = ev.data.u64;
-                SerialPrintf("sys_epoll_ctl: MOD fd=%d events=0x%x\n", wfd, ev.events);
+
                 return 0;
             }
         }
@@ -5239,8 +5236,7 @@ static int64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t watchfd,
             ep->entries[i].events = ev.events;
             ep->entries[i].data   = ev.data.u64;
             if (i >= ep->count) ep->count = i + 1;
-            SerialPrintf("sys_epoll_ctl: ADD fd=%d events=0x%x epoll=%lu\n",
-                         wfd, ev.events, epfd);
+
             return 0;
         }
     }
