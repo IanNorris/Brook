@@ -492,6 +492,22 @@ void NetRegisterIf(NetIf* nif)
     SerialPrintf("net: interface registered, MAC=%02x:%02x:%02x:%02x:%02x:%02x\n",
                  nif->mac.b[0], nif->mac.b[1], nif->mac.b[2],
                  nif->mac.b[3], nif->mac.b[4], nif->mac.b[5]);
+
+    // Spawn a background thread to continuously drain the NIC receive ring.
+    // This is needed because SockRecv/Connect now block via SchedulerBlock
+    // rather than busy-polling, so without this thread no one would ever call
+    // nif->poll() and incoming packets would never be delivered.
+    KernelThreadCreate("net_poll", [](void* /*arg*/) {
+        extern volatile uint64_t g_lapicTickCount;
+        while (true) {
+            if (g_netIf && g_netIf->poll)
+                g_netIf->poll(g_netIf);
+            // Yield after each poll burst to avoid starving user processes.
+            // SchedulerYield() is sufficient — we don't want a long sleep
+            // since we need low receive latency for TCP throughput.
+            SchedulerYield();
+        }
+    }, nullptr, 2 /* NORMAL priority */);
 }
 
 NetIf* NetGetIf()
