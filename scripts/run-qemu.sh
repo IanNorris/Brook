@@ -9,6 +9,7 @@ BUILD_TYPE="debug"
 DEBUG_FLAGS=""
 SCRIPT_NAME=""
 HEADLESS=0
+LOG_TO_FILE=0
 VNC_DISPLAY=""
 EXTRA_ARGS=()
 for arg in "$@"; do
@@ -21,6 +22,9 @@ for arg in "$@"; do
             ;;
         --headless)
             HEADLESS=1
+            ;;
+        --logtofile)
+            LOG_TO_FILE=1
             ;;
         --vnc)
             VNC_DISPLAY="__NEXT_VNC__"
@@ -213,12 +217,15 @@ if [ "$HEADLESS" -eq 1 ]; then
     else
         DISPLAY_OPT="-vnc none"
     fi
-else
-    # Interactive: serial goes to stdio AND is mirrored to log file for post-processing
+elif [ "$LOG_TO_FILE" -eq 1 ]; then
+    # Interactive + log: serial appears on screen AND is mirrored to log file
     SERIAL_OPT="-chardev stdio,id=ser0,signal=off,logfile=${SERIAL_LOG} -serial chardev:ser0"
     DISPLAY_OPT="-display gtk"
+    echo "  Serial log: ${SERIAL_LOG}"
+else
+    SERIAL_OPT="-serial stdio"
+    DISPLAY_OPT="-display gtk"
 fi
-echo "  Serial log: ${SERIAL_LOG}"
 
 KVM_FLAGS=""
 if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] && [ "${NO_KVM:-}" != "1" ]; then
