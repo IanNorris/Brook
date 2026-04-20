@@ -1,0 +1,23 @@
+# Brook OS — Network diagnostics: TLS handshake + TCP throughput
+# Tests the TCP/TLS stack step-by-step to isolate failures.
+#
+# Run with: scripts/run-qemu.sh --script nixnetdiag
+#
+# What it does:
+#   1. nix-install openssl  → tests narinfo fetch (small HTTPS download)
+#   2. openssl s_client     → manual TLS handshake to cache.nixos.org:443
+#   3. nix-install iperf3   → tests larger NAR download
+#   4. nix-install netcat-openbsd  → ditto
+
+# Step 1: install openssl (narinfo fetch only — small)
+run /nix/bin/nix-install openssl
+
+# Step 2: TLS handshake to cache.nixos.org — if this stalls we have a
+# TCP-layer problem; if it prints the cert we have a data-delivery issue
+run /nix/profile/bin/openssl s_client -connect cache.nixos.org:443 -brief -no_ign_eof
+
+# Step 3: install iperf3 (medium NAR — ~300KB) to stress sequential connections
+run /nix/bin/nix-install iperf3
+
+# Step 4: install netcat-openbsd (small)
+run /nix/bin/nix-install netcat-openbsd

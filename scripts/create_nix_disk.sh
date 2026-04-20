@@ -35,6 +35,9 @@ if [ ${#PACKAGES[@]} -eq 0 ]; then
         xz.bin
         nss-cacert
         coreutils
+        openssl         # openssl s_client for TLS handshake diagnosis
+        iperf3          # TCP throughput + sequential connection stress testing
+        netcat-openbsd  # raw TCP without TLS overhead (nc host port)
         "${ROOT_DIR}/tools/netsurf-pkg"
     )
 fi
