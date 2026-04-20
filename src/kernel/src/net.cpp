@@ -203,6 +203,15 @@ static void HandleArp(const uint8_t* frame, uint32_t len)
     auto* arp = reinterpret_cast<const ArpPacket*>(frame + sizeof(EthHeader));
     uint16_t op = ntohs(arp->oper);
 
+    SerialPrintf("arp: RX op=%u spa=%d.%d.%d.%d sha=%02x:%02x:%02x:%02x:%02x:%02x tpa=%d.%d.%d.%d\n",
+                 op,
+                 arp->spa & 0xFF, (arp->spa >> 8) & 0xFF,
+                 (arp->spa >> 16) & 0xFF, (arp->spa >> 24) & 0xFF,
+                 arp->sha.b[0], arp->sha.b[1], arp->sha.b[2],
+                 arp->sha.b[3], arp->sha.b[4], arp->sha.b[5],
+                 arp->tpa & 0xFF, (arp->tpa >> 8) & 0xFF,
+                 (arp->tpa >> 16) & 0xFF, (arp->tpa >> 24) & 0xFF);
+
     // Always learn from any ARP packet
     ArpCacheInsert(arp->spa, arp->sha);
 
@@ -695,6 +704,18 @@ static void HandleDhcpReply(const uint8_t* data, uint32_t len)
 
         g_dhcpState = 3;
         g_dhcpDone = true;
+
+        // Pre-populate the gateway MAC as broadcast. QEMU slirp has no real L2
+        // presence and ignores destination MAC on incoming frames, so broadcast
+        // works fine. On real hardware this entry will be replaced by the first
+        // genuine ARP reply from the gateway.
+        if (router) {
+            MacAddr bcastMac = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
+            ArpCacheInsert(router, bcastMac);
+            SerialPrintf("net: pre-seeded gateway %d.%d.%d.%d with broadcast MAC\n",
+                         router & 0xFF, (router >> 8) & 0xFF,
+                         (router >> 16) & 0xFF, (router >> 24) & 0xFF);
+        }
     }
 }
 
@@ -1321,7 +1342,10 @@ static void TcpSendSegment(Socket& s, uint8_t flags,
     tcp->checksum = 0;
     tcp->checksum = TcpChecksum(g_netIf->ipAddr, s.remoteIp, buf, tcpLen);
 
-    NetSendIpv4(s.remoteIp, IP_PROTO_TCP, buf, tcpLen);
+    int sendResult = NetSendIpv4(s.remoteIp, IP_PROTO_TCP, buf, tcpLen);
+    if (sendResult != 0) {
+        SerialPrintf("tcp: send failed flags=0x%02x err=%d\n", flags, sendResult);
+    }
 }
 
 // Append raw bytes to socket RX ring buffer.
@@ -1553,7 +1577,7 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
     TcpSendSegment(s, TCP_SYN, nullptr, 0);
     s.tcpSndNxt++; // SYN consumes one sequence number
 
-    SerialPrintf("tcp: SYN sent to %u.%u.%u.%u:%u\n",
+    SerialPrintf("tcp: SYN queued to %u.%u.%u.%u:%u\n",
                  (ntohl(s.remoteIp) >> 24) & 0xFF,
                  (ntohl(s.remoteIp) >> 16) & 0xFF,
                  (ntohl(s.remoteIp) >> 8) & 0xFF,
