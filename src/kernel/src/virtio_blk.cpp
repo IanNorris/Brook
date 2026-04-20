@@ -6,6 +6,7 @@
 #include "memory/heap.h"
 #include "serial.h"
 #include "mem_tag.h"
+#include "spinlock.h"
 
 namespace brook {
 
@@ -100,6 +101,12 @@ struct VirtioBlkState {
     static constexpr uint32_t DMA_BUF_PAGES = 16;
     uint8_t*      dmaBuf;
     uint64_t      dmaBufPhys;
+
+    // Serialises concurrent requests from multiple processes.
+    // The virtio queue uses hardcoded descriptor slots 0-2, so only one
+    // request can be in-flight at a time.  SpinLockAcquire disables
+    // interrupts; disk I/O in KVM completes in ~10 μs so latency is fine.
+    SpinLock      requestLock;
 };
 
 // ---- Register helpers ----
@@ -263,6 +270,10 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
     uint8_t* dstBytes = static_cast<uint8_t*>(buf);
     uint64_t bytesRead = 0;
 
+    // Serialise against concurrent reads/writes: virtio queue has fixed
+    // descriptor slots 0-2, so only one request can be in-flight at a time.
+    uint64_t irqFlags = SpinLockAcquire(&s->requestLock);
+
     uint64_t sec = startSector;
     while (sec < endSector && bytesRead < len)
     {
@@ -274,6 +285,7 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
         {
             brook::SerialPrintf("virtio-blk: read failed at sector %lu\n",
                                 static_cast<unsigned long>(sec));
+            SpinLockRelease(&s->requestLock, irqFlags);
             return -1;
         }
 
@@ -292,6 +304,7 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
         }
     }
 
+    SpinLockRelease(&s->requestLock, irqFlags);
     return static_cast<int>(bytesRead);
 }
 
@@ -318,6 +331,8 @@ static int VirtioBlkWrite(Device* dev, uint64_t offset, const void* buf, uint64_
     uint64_t bytesWritten = 0;
     auto* dmaBuf = s->dmaBuf;
 
+    uint64_t irqFlags = SpinLockAcquire(&s->requestLock);
+
     uint64_t sec = startSector;
     while (sec < endSector && bytesWritten < len)
     {
@@ -330,8 +345,10 @@ static int VirtioBlkWrite(Device* dev, uint64_t offset, const void* buf, uint64_
         bool needPreRead = (partialFirst && sec == startSector) ||
                            (partialLast && sec + batch == endSector);
         if (needPreRead) {
-            if (!SubmitRequest(*s, VIRTIO_BLK_T_IN, sec, s->dmaBufPhys, dmaLen))
+            if (!SubmitRequest(*s, VIRTIO_BLK_T_IN, sec, s->dmaBufPhys, dmaLen)) {
+                SpinLockRelease(&s->requestLock, irqFlags);
                 return -1;
+            }
         } else {
             for (uint32_t i = 0; i < dmaLen; ++i) dmaBuf[i] = 0;
         }
@@ -349,12 +366,15 @@ static int VirtioBlkWrite(Device* dev, uint64_t offset, const void* buf, uint64_
                 dstSector[j] = srcBytes[bytesWritten++];
         }
 
-        if (!SubmitRequest(*s, VIRTIO_BLK_T_OUT, sec, s->dmaBufPhys, dmaLen))
+        if (!SubmitRequest(*s, VIRTIO_BLK_T_OUT, sec, s->dmaBufPhys, dmaLen)) {
+            SpinLockRelease(&s->requestLock, irqFlags);
             return -1;
+        }
 
         sec += batch;
     }
 
+    SpinLockRelease(&s->requestLock, irqFlags);
     return static_cast<int>(bytesWritten);
 }
 

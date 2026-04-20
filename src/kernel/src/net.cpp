@@ -1435,6 +1435,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         // buffer causes TcpEnqueueData to silently drop bytes while we've
         // already ACKed them, permanently desynchronising sequence numbers.
         uint32_t freeSpace = Socket::RX_BUF_SIZE - s.rxCount;
+        bool bufferWasFull = (dataLen > 0 && freeSpace == 0);
         if (dataLen > freeSpace) dataLen = freeSpace;
 
         // Delegate to testable state machine
@@ -1445,7 +1446,12 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
 
         SpinLockRelease(&s.lock, irqFlags);
 
-        if (act.sendAck)
+        // If the buffer was full we must send a zero-window ACK immediately —
+        // without it the server waits for its RTO (seconds) before retransmitting,
+        // and after enough retransmits will RST the connection (error 35).
+        // A zero-window ACK tells the server to stop instantly; we send a
+        // window-update ACK from SockRecv once we've drained enough data.
+        if (act.sendAck || bufferWasFull)
             TcpSendSegment(s, TCP_ACK, nullptr, 0);
 
         // Wake poll waiter on any state change that could make the socket ready

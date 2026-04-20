@@ -245,8 +245,13 @@ struct Socket {
     uint16_t  remotePort;  // big-endian
     bool      bound;
     bool      connected;
-    // Receive buffer (ring buffer for incoming data)
-    static constexpr uint32_t RX_BUF_SIZE = 65536;
+    // Receive buffer (ring buffer for incoming data).
+    // 512 KB gives enough headroom for multi-MB NAR downloads: curl does TLS
+    // crypto + pipes to xz while the server sends at line rate, so the kernel
+    // buffer needs to absorb a burst without triggering zero-window flow-control
+    // on every other segment (which would require many round-trips and risks
+    // the server's RTO firing and RST'ing the connection).
+    static constexpr uint32_t RX_BUF_SIZE = 524288; // 512 KB
     uint8_t*  rxBuf;
     uint32_t  rxHead;
     uint32_t  rxTail;
