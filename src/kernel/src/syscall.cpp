@@ -2632,6 +2632,46 @@ static int64_t sys_vfork(uint64_t, uint64_t, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
+// sys_clone3 (435)
+// ---------------------------------------------------------------------------
+// Extended clone with struct clone_args. We extract fields and delegate
+// to sys_clone so all thread/fork logic stays in one place.
+// glibc and musl try clone3 first and fall back to clone on ENOSYS;
+// implementing it avoids that fallback and silences the UNIMPL noise.
+
+struct CloneArgs {
+    uint64_t flags;
+    uint64_t pidfd;
+    uint64_t child_tid;
+    uint64_t parent_tid;
+    uint64_t exit_signal;
+    uint64_t stack;
+    uint64_t stack_size;
+    uint64_t tls;
+    uint64_t set_tid;
+    uint64_t set_tid_size;
+    uint64_t cgroup;
+};
+
+static int64_t sys_clone3(uint64_t argsPtr, uint64_t size, uint64_t,
+                           uint64_t, uint64_t, uint64_t)
+{
+    if (!argsPtr || size < offsetof(CloneArgs, tls) + sizeof(uint64_t))
+        return -EINVAL;
+
+    const CloneArgs* ca = reinterpret_cast<const CloneArgs*>(argsPtr);
+
+    // Stack: clone3 passes base+size; clone expects the top (stack grows down)
+    uint64_t stackTop = ca->stack;
+    if (stackTop && ca->stack_size)
+        stackTop = ca->stack + ca->stack_size;
+
+    // Delegate to sys_clone with the same argument layout:
+    //   flags, newStack, parentTidAddr, childTidAddr, tlsAddr
+    return sys_clone(ca->flags, stackTop, ca->parent_tid, ca->child_tid, ca->tls, 0);
+}
+
+// ---------------------------------------------------------------------------
 // sys_wait4 (61)
 // ---------------------------------------------------------------------------
 // Wait for a child process to terminate. Supports pid=-1 (any child)
@@ -7549,6 +7589,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_CLONE]           = sys_clone;
     g_syscallTable[SYS_FORK]            = sys_fork;
     g_syscallTable[SYS_VFORK]           = sys_vfork;
+    g_syscallTable[435]                 = sys_clone3;
     g_syscallTable[SYS_EXECVE]          = sys_execve;
     g_syscallTable[SYS_EXIT]            = sys_exit;
     g_syscallTable[SYS_WAIT4]           = sys_wait4;
@@ -7783,6 +7824,7 @@ static const char* SyscallName(uint64_t num)
     case 265: return "linkat";    case 268: return "fchmodat";
     case 280: return "utimensat"; case 285: return "fallocate";
     case 316: return "renameat2"; case 332: return "statx";
+    case 435: return "clone3";
     case 18: return "pwrite64"; case 27: return "mincore";
     case 28: return "madvise";
     default: return nullptr;
