@@ -200,6 +200,9 @@ int NetSendUdp(uint32_t dstIp, uint16_t srcPort, uint16_t dstPort,
 // Returns true if resolved, false on timeout.
 bool ArpResolve(uint32_t ip, MacAddr* outMac);
 
+// Insert a known mapping into the ARP cache.
+void ArpCacheInsert(uint32_t ip, const MacAddr& mac);
+
 // ---------------------------------------------------------------------------
 // DHCP (minimal)
 // ---------------------------------------------------------------------------
@@ -207,6 +210,9 @@ bool ArpResolve(uint32_t ip, MacAddr* outMac);
 // Perform DHCP discovery to obtain an IP address.
 // Blocks until complete or timeout. Returns true on success.
 bool DhcpDiscover(NetIf* nif);
+
+// Start the net_poll background thread. Must be called AFTER SchedulerInit().
+void NetStartPollThread();
 
 // ---------------------------------------------------------------------------
 // Socket layer (kernel-side)

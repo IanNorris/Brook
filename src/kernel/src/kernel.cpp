@@ -446,7 +446,23 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     // ---- Network (DHCP + DNS test) ----
     if (brook::NetGetIf()) {
         brook::BootLogoProgress(75, "Network");
-        brook::DhcpDiscover(brook::NetGetIf());
+        if (brook::DhcpDiscover(brook::NetGetIf())) {
+            // Immediately resolve the gateway MAC while still in polling mode
+            // (no scheduler yet — ArpResolve falls back to nif->poll).
+            // This avoids a race later when curl runs post-scheduler and must
+            // ARP for the gateway under real-time constraints.
+            brook::NetIf* nif = brook::NetGetIf();
+            if (nif && nif->gateway) {
+                brook::MacAddr gwMac;
+                if (!brook::ArpResolve(nif->gateway, &gwMac)) {
+                    // Fallback: broadcast works with QEMU/slirp because slirp
+                    // ignores the destination MAC on ingress packets.
+                    gwMac = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
+                    brook::ArpCacheInsert(nif->gateway, gwMac);
+                    brook::SerialPrintf("net: gateway ARP timed out — using broadcast MAC\n");
+                }
+            }
+        }
         // Quick DNS test
         brook::DnsResolve("example.com");
     }
@@ -470,6 +486,10 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         brook::BootLogoProgress(90, "Scheduler");
         brook::SchedulerInit();
         brook::CompositorInit();
+
+        // Start the NIC polling thread now that the scheduler is initialised.
+        if (brook::NetGetIf())
+            brook::NetStartPollThread();
 
         // If keyboard module wasn't loaded, fall back to direct init.
         if (acpiOk && !brook::KbdIsAvailable())

@@ -110,7 +110,7 @@ static void* NetMemcpy(void* dst, const void* src, uint64_t n)
 // ARP cache
 // ---------------------------------------------------------------------------
 
-static void ArpCacheInsert(uint32_t ip, const MacAddr& mac)
+void ArpCacheInsert(uint32_t ip, const MacAddr& mac)
 {
     // Update existing entry
     for (uint32_t i = 0; i < g_arpCount; i++) {
@@ -506,16 +506,23 @@ void NetRegisterIf(NetIf* nif)
     SerialPrintf("net: interface registered, MAC=%02x:%02x:%02x:%02x:%02x:%02x\n",
                  nif->mac.b[0], nif->mac.b[1], nif->mac.b[2],
                  nif->mac.b[3], nif->mac.b[4], nif->mac.b[5]);
+}
+
+void NetStartPollThread()
+{
+    if (!g_netIf) return;
 
     // Spawn a background thread to continuously drain the NIC receive ring.
-    // This is needed because SockRecv/Connect now block via SchedulerBlock
-    // rather than busy-polling, so without this thread no one would ever call
-    // nif->poll() and incoming packets would never be delivered.
+    // This is needed because SockRecv/Connect block via SchedulerBlock rather
+    // than busy-polling; without this thread no one would call nif->poll() and
+    // incoming packets would never be delivered post-scheduler-init.
     //
     // Priority 1 (above normal user processes at 2) ensures the poller runs
     // promptly after data arrives, minimising per-packet scheduler latency.
-    KernelThreadCreate("net_poll", [](void* /*arg*/) {
-        extern volatile uint64_t g_lapicTickCount;
+    //
+    // IMPORTANT: must be called AFTER SchedulerInit(), not from NetRegisterIf,
+    // because SchedulerAddProcess requires the MLFQ to be initialised.
+    Process* pollThread = KernelThreadCreate("net_poll", [](void* /*arg*/) {
         while (true) {
             if (g_netIf && g_netIf->poll) {
                 // Drain in a short burst so a backlog of packets doesn't
@@ -527,6 +534,10 @@ void NetRegisterIf(NetIf* nif)
             SchedulerYield();
         }
     }, nullptr, 1 /* above NORMAL, below REALTIME */);
+    if (pollThread) {
+        SchedulerAddProcess(pollThread);
+        SerialPrintf("net: net_poll thread started (pid=%u)\n", pollThread->pid);
+    }
 }
 
 NetIf* NetGetIf()
@@ -704,18 +715,6 @@ static void HandleDhcpReply(const uint8_t* data, uint32_t len)
 
         g_dhcpState = 3;
         g_dhcpDone = true;
-
-        // Pre-populate the gateway MAC as broadcast. QEMU slirp has no real L2
-        // presence and ignores destination MAC on incoming frames, so broadcast
-        // works fine. On real hardware this entry will be replaced by the first
-        // genuine ARP reply from the gateway.
-        if (router) {
-            MacAddr bcastMac = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
-            ArpCacheInsert(router, bcastMac);
-            SerialPrintf("net: pre-seeded gateway %d.%d.%d.%d with broadcast MAC\n",
-                         router & 0xFF, (router >> 8) & 0xFF,
-                         (router >> 16) & 0xFF, (router >> 24) & 0xFF);
-        }
     }
 }
 
