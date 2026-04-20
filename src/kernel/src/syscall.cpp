@@ -14,7 +14,6 @@
 #include "vfs.h"
 #include "tty.h"
 #include "input.h"
-#include "serial_writer.h"
 #include "pipe.h"
 #include "memory/heap.h"
 #include "compositor.h"
@@ -405,7 +404,10 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
             const char* buf = reinterpret_cast<const char*>(bufAddr);
             if (count > 0)
             {
-                SerialWriterEnqueue(buf, static_cast<uint32_t>(count));
+                brook::SerialLock();
+                for (uint64_t i = 0; i < count; i++)
+                    brook::SerialPutChar(buf[i]);
+                brook::SerialUnlock();
                 for (uint64_t i = 0; i < count; i++)
                     TtyPutChar(buf[i]);
             }
@@ -415,7 +417,10 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
         // so piped stdout/stderr is visible in the debug log.
         if (count > 0) {
             const char* buf = reinterpret_cast<const char*>(bufAddr);
-            SerialWriterEnqueue(buf, static_cast<uint32_t>(count));
+            brook::SerialLock();
+            for (uint64_t i = 0; i < count; i++)
+                brook::SerialPutChar(buf[i]);
+            brook::SerialUnlock();
         }
     }
 
@@ -544,7 +549,10 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
         const char* buf = reinterpret_cast<const char*>(bufAddr);
         if (count > 0)
         {
-            SerialWriterEnqueue(buf, static_cast<uint32_t>(count));
+            brook::SerialLock();
+            for (uint64_t i = 0; i < count; i++)
+                brook::SerialPutChar(buf[i]);
+            brook::SerialUnlock();
             for (uint64_t i = 0; i < count; i++)
                 TtyPutChar(buf[i]);
         }
@@ -947,7 +955,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             if ((ev.modifiers & INPUT_MOD_CTRL) && (ev.scanCode == 0x2E)) // 'C'
             {
                 // Echo ^C and return empty line
-                SerialWriterEnqueue("^C\n", 3);
+                brook::SerialLock(); brook::SerialPutChar('^'); brook::SerialPutChar('C'); brook::SerialPutChar('\n'); brook::SerialUnlock();
                 TtyPutChar('^'); TtyPutChar('C'); TtyPutChar('\n');
                 buf[0] = '\n';
                 return 1;
@@ -964,7 +972,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             // Enter/Return
             if (c == '\r' || c == '\n' || ev.scanCode == 0x1C)
             {
-                SerialWriterEnqueue("\n", 1);
+                brook::SerialLock(); brook::SerialPutChar('\n'); brook::SerialUnlock();
                 TtyPutChar('\n');
                 if (lineLen < LINE_BUF_MAX)
                     lineBuf[lineLen++] = '\n';
@@ -977,7 +985,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 if (lineLen > 0)
                 {
                     lineLen--;
-                    SerialWriterEnqueue("\b \b", 3); // erase character
+                    brook::SerialLock(); brook::SerialPutChar('\b'); brook::SerialPutChar(' '); brook::SerialPutChar('\b'); brook::SerialUnlock();
                     TtyPutChar('\b'); TtyPutChar(' '); TtyPutChar('\b');
                 }
                 continue;
@@ -989,7 +997,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 if (lineLen < LINE_BUF_MAX - 1)
                 {
                     lineBuf[lineLen++] = '\t';
-                    SerialWriterEnqueue("\t", 1);
+                    brook::SerialLock(); brook::SerialPutChar('\t'); brook::SerialUnlock();
                     TtyPutChar('\t');
                 }
                 continue;
@@ -1001,7 +1009,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 if (lineLen < LINE_BUF_MAX - 1)
                 {
                     lineBuf[lineLen++] = c;
-                    SerialWriterEnqueue(&c, 1); // echo
+                    brook::SerialLock(); brook::SerialPutChar(c); brook::SerialUnlock();
                     TtyPutChar(c);
                 }
                 continue;

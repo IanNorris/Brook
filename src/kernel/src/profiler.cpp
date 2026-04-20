@@ -19,7 +19,6 @@
 #include "scheduler.h"
 #include "smp.h"
 #include "serial.h"
-#include "serial_writer.h"
 #include "vfs.h"
 #include "memory/heap.h"
 
