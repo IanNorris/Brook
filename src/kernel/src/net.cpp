@@ -517,23 +517,35 @@ void NetStartPollThread()
     // than busy-polling; without this thread no one would call nif->poll() and
     // incoming packets would never be delivered post-scheduler-init.
     //
-    // Priority 1 (above normal user processes at 2) ensures the poller runs
-    // promptly after data arrives, minimising per-packet scheduler latency.
+    // Priority 2 (NORMAL) so it doesn't preempt user processes. The 1ms sleep
+    // between drain bursts is enough for good TCP throughput while keeping the
+    // scheduler lock free for timer/IRQ handlers (mouse, profiler wakeups etc.).
+    //
+    // DO NOT use SchedulerYield() here — it spins at high frequency, contends
+    // g_readyLock constantly, and delays LAPIC timer handlers that need the
+    // lock to check wakeupTick. Use SchedulerBlock with a short timeout instead.
     //
     // IMPORTANT: must be called AFTER SchedulerInit(), not from NetRegisterIf,
     // because SchedulerAddProcess requires the MLFQ to be initialised.
     Process* pollThread = KernelThreadCreate("net_poll", [](void* /*arg*/) {
+        extern volatile uint64_t g_lapicTickCount;
         while (true) {
             if (g_netIf && g_netIf->poll) {
-                // Drain in a short burst so a backlog of packets doesn't
-                // require multiple scheduler round-trips to clear.
+                // Drain in a burst to clear any backlog without needing
+                // multiple wakeup cycles.
                 for (int i = 0; i < 8; i++)
                     g_netIf->poll(g_netIf);
             }
-            // Yield after each burst to avoid starving user processes.
-            SchedulerYield();
+            // Sleep 1ms between polls. This releases the CPU entirely,
+            // allows LAPIC/IRQ handlers to run unobstructed, and keeps
+            // TCP latency well under 2ms for interactive workloads.
+            Process* self = ProcessCurrent();
+            if (self) {
+                self->wakeupTick = g_lapicTickCount + 1;
+                SchedulerBlock(self);
+            }
         }
-    }, nullptr, 1 /* above NORMAL, below REALTIME */);
+    }, nullptr, 2 /* NORMAL priority — same as user processes */);
     if (pollThread) {
         SchedulerAddProcess(pollThread);
         SerialPrintf("net: net_poll thread started (pid=%u)\n", pollThread->pid);

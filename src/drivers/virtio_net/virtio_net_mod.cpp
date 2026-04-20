@@ -367,6 +367,7 @@ static int VirtioNetTransmit(NetIf* nif, const void* frame, uint32_t len)
 
 static void ProcessRxPackets()
 {
+    bool didWork = false;
     while (g_rxq.usedIdxShadow != *g_rxq.usedIdx) {
         uint16_t slot = g_rxq.usedIdxShadow & (g_rxq.size - 1);
         uint32_t descIdx = g_rxq.usedRing[slot].id;
@@ -389,9 +390,14 @@ static void ProcessRxPackets()
         *g_rxq.availIdx = g_rxq.availIdxShadow;
 
         g_rxq.usedIdxShadow++;
+        didWork = true;
     }
 
-    NotifyQueue(0, g_rxq);
+    // Only notify QEMU when we've actually reposted buffers. Kicking with no
+    // new available descriptors is wasteful (MMIO write = VM exit) and in
+    // some virtio implementations triggers a spurious used-ring interrupt.
+    if (didWork)
+        NotifyQueue(0, g_rxq);
 }
 
 // ---------------------------------------------------------------------------
