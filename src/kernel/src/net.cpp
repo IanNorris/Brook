@@ -1448,33 +1448,35 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         if (act.enqueueData && act.dataPtr && act.dataLen > 0)
             TcpEnqueueData(s, act.dataPtr, act.dataLen);
 
+        // CRITICAL: compute shouldWake and capture pollWaiter while still
+        // holding the lock.  If we release first, SockRecv can drain the
+        // rx buffer on another core before we read s.rxCount here — the
+        // delta (s.rxCount > prevRxCount) becomes false and the wakeup is
+        // suppressed.  The sleeping SockRecv then waits the full 10-second
+        // SchedulerBlock timeout instead of being woken immediately (the
+        // 60-second stall = 6 missed wakeups × 10-second timeout).
+        bool shouldWake = (s.rxCount > prevRxCount) || s.tcpRstRecv
+                          || s.tcpFinRecv || act.justConnected;
+        Process* waiter = nullptr;
+        if (s.pollWaiter && shouldWake)
+        {
+            waiter = s.pollWaiter;
+            s.pollWaiter = nullptr;
+        }
+
         SpinLockRelease(&s.lock, irqFlags);
 
-        // If the buffer was full we must send a zero-window ACK immediately —
-        // without it the server waits for its RTO (seconds) before retransmitting,
-        // and after enough retransmits will RST the connection (error 35).
-        // A zero-window ACK tells the server to stop instantly; we send a
-        // window-update ACK from SockRecv once we've drained enough data.
+        // Send ACK outside the lock — TcpSendSegment is not re-entrant under
+        // s.lock and may acquire other locks (e.g. TX queue).
         if (act.sendAck || bufferWasFull)
             TcpSendSegment(s, TCP_ACK, nullptr, 0);
 
-        // Only wake the poll waiter when there is actually something new for it:
-        //   - new data just enqueued (rxCount increased)
-        //   - RST or FIN received (need to return ECONNRESET/EOF to reader)
-        //   - SYN-ACK received (justConnected: wake SockConnect waiter)
-        //
-        // Waking on EVERY packet (the old condition used s.connected which is
-        // always true) caused a race: the waiter would wake, see no data, clear
-        // pollWaiter, and then real data would arrive with pollWaiter==null —
-        // no wakeup possible until the 10-second SchedulerBlock timeout fired.
-        bool shouldWake = (s.rxCount > prevRxCount) || s.tcpRstRecv
-                          || s.tcpFinRecv || act.justConnected;
-        if (s.pollWaiter && shouldWake)
+        // Wake the waiter outside the lock — SchedulerUnblock may need the
+        // scheduler lock which must not be acquired while holding s.lock.
+        if (waiter)
         {
-            Process* w = s.pollWaiter;
-            s.pollWaiter = nullptr;
-            __atomic_store_n(&w->pendingWakeup, 1, __ATOMIC_RELEASE);
-            SchedulerUnblock(w);
+            __atomic_store_n(&waiter->pendingWakeup, 1, __ATOMIC_RELEASE);
+            SchedulerUnblock(waiter);
         }
 
         return; // handled
@@ -1711,24 +1713,32 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
     Socket& s = g_sockets[sockIdx];
     if (s.type != SOCK_STREAM) return -95;
 
-    // Block until data arrives, connection closes, or 10-second timeout.
+    // Block until data arrives or the connection closes.
     //
     // IMPORTANT: the "is there data?" check must happen while holding the socket
     // lock.  Without the lock, a packet can arrive between the check and setting
     // pollWaiter — HandleTcp sees pollWaiter==null, skips the wakeup, and we
     // sleep for the full 10-second timeout with data sitting in the buffer.
+    //
+    // We use a 10-second wakeupTick as a heartbeat so we re-check state
+    // periodically even without a data wakeup (e.g., after a missed timer).
+    // We do NOT return EAGAIN on a per-heartbeat timeout — blocking sockets
+    // must never surface EAGAIN, because callers (OpenSSL/curl) would retry
+    // immediately and each retry would stall another 10 seconds, giving the
+    // 6 × 10s = 60s failure pattern.  Instead we loop until data arrives,
+    // the connection closes, or a 120-second hard timeout fires.
     if (s.rxCount == 0 && !s.tcpRstRecv && !s.tcpFinRecv &&
         s.tcpState != TcpState::Closed) {
 
         extern volatile uint64_t g_lapicTickCount;
         Process* self = SchedulerCurrentProcess();
-        uint64_t deadline = g_lapicTickCount + 10000;
+        uint64_t hardDeadline = g_lapicTickCount + 120000; // 120-second hard limit
 
         while (true) {
             uint64_t irqFlags = SpinLockAcquire(&s.lock);
             bool ready = s.rxCount > 0 || s.tcpRstRecv || s.tcpFinRecv
                          || s.tcpState == TcpState::Closed
-                         || g_lapicTickCount >= deadline;
+                         || g_lapicTickCount >= hardDeadline;
             if (ready) {
                 SpinLockRelease(&s.lock, irqFlags);
                 break;
@@ -1736,9 +1746,11 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
             // Set pollWaiter while holding the lock so HandleTcp can never
             // enqueue data and miss the wakeup in a race window.
             s.pollWaiter = self;
-            self->wakeupTick = g_lapicTickCount + 10000;
+            self->wakeupTick = g_lapicTickCount + 10000; // heartbeat every 10s
             SpinLockRelease(&s.lock, irqFlags);
             SchedulerBlock(self);
+            // Woken by data (HandleTcp), heartbeat tick, or spurious —
+            // loop back to re-check under the lock.
         }
     }
 
@@ -1749,12 +1761,11 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
         }
         if (s.tcpFinRecv || s.tcpState != TcpState::Established)
             return 0; // EOF
-        // 10-second timeout — state is Established but no data arrived.
-        // This typically means a wakeup notification was missed or the
-        // server went silent.
-        SerialPrintf("tcp: SockRecv timeout fd=%d rxPkts=%u state=%d\n",
+        // 120-second hard timeout — connection is established but no data
+        // arrived at all.  Server likely gone without sending RST/FIN.
+        SerialPrintf("tcp: SockRecv hard timeout fd=%d rxPkts=%u state=%d\n",
                      sockIdx, s.rxPktCount, (int)s.tcpState);
-        return -11; // EAGAIN
+        return -110; // ETIMEDOUT (not EAGAIN — blocking socket must not return EAGAIN)
     }
 
     // Stream read — no framing, just read bytes from ring buffer

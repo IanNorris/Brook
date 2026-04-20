@@ -620,6 +620,76 @@ Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
     return proc;
 }
 
+// Close a single FD's underlying resource and free the slot.
+// Shared between ProcessCloseAllFds and ProcessCloseCloexecFds.
+static void CloseFdEntry(Process* proc, uint32_t i)
+{
+    FdEntry& fde = proc->fds[i];
+
+    if (fde.type == FdType::Vnode && fde.handle)
+    {
+        auto* vn = static_cast<Vnode*>(fde.handle);
+        uint32_t prev = __atomic_fetch_sub(&vn->refCount, 1, __ATOMIC_ACQ_REL);
+        if (prev <= 1)
+            VfsClose(vn);
+    }
+
+    if (fde.type == FdType::Socket && fde.handle)
+    {
+        int sockIdx = static_cast<int>(
+            reinterpret_cast<uintptr_t>(fde.handle)) - 1;
+        brook::SockUnref(sockIdx);
+    }
+
+    if (fde.type == FdType::Pipe && fde.handle)
+    {
+        auto* pipe = static_cast<PipeBuffer*>(fde.handle);
+        if (fde.flags & 1) // write end
+        {
+            __atomic_fetch_sub(&pipe->writers, 1, __ATOMIC_RELEASE);
+            Process* reader = pipe->readerWaiter;
+            if (reader)
+            {
+                pipe->readerWaiter = nullptr;
+                __atomic_store_n(&reader->pendingWakeup, 1, __ATOMIC_RELEASE);
+                SchedulerUnblock(reader);
+            }
+        }
+        else // read end
+        {
+            __atomic_fetch_sub(&pipe->readers, 1, __ATOMIC_RELEASE);
+            Process* writer = pipe->writerWaiter;
+            if (writer)
+            {
+                pipe->writerWaiter = nullptr;
+                __atomic_store_n(&writer->pendingWakeup, 1, __ATOMIC_RELEASE);
+                SchedulerUnblock(writer);
+            }
+        }
+
+        if (__atomic_load_n(&pipe->readers, __ATOMIC_ACQUIRE) == 0 &&
+            __atomic_load_n(&pipe->writers, __ATOMIC_ACQUIRE) == 0)
+        {
+            kfree(pipe);
+        }
+    }
+
+    FdFree(proc, static_cast<int>(i));
+}
+
+// Close all FDs with FD_CLOEXEC set — called by ProcessExec (execve semantics).
+void ProcessCloseCloexecFds(Process* proc)
+{
+    if (!proc) return;
+    for (uint32_t i = 0; i < MAX_FDS; ++i)
+    {
+        FdEntry& fde = proc->fds[i];
+        if (fde.type == FdType::None) continue;
+        if (!(fde.fdFlags & 1)) continue; // not FD_CLOEXEC
+        CloseFdEntry(proc, i);
+    }
+}
+
 void ProcessCloseAllFds(Process* proc)
 {
     if (!proc) return;
@@ -628,58 +698,7 @@ void ProcessCloseAllFds(Process* proc)
     {
         FdEntry& fde = proc->fds[i];
         if (fde.type == FdType::None) continue;
-
-        if (fde.type == FdType::Vnode && fde.handle)
-        {
-            auto* vn = static_cast<Vnode*>(fde.handle);
-            uint32_t prev = __atomic_fetch_sub(&vn->refCount, 1, __ATOMIC_ACQ_REL);
-            if (prev <= 1)
-                VfsClose(vn);
-        }
-
-        // Socket cleanup: decrement refcount, close socket if last ref
-        if (fde.type == FdType::Socket && fde.handle)
-        {
-            int sockIdx = static_cast<int>(
-                reinterpret_cast<uintptr_t>(fde.handle)) - 1;
-            brook::SockUnref(sockIdx);
-        }
-
-        // Pipe cleanup: decrement reader/writer counts and wake waiters
-        if (fde.type == FdType::Pipe && fde.handle)
-        {
-            auto* pipe = static_cast<PipeBuffer*>(fde.handle);
-            if (fde.flags & 1) // write end
-            {
-                __atomic_fetch_sub(&pipe->writers, 1, __ATOMIC_RELEASE);
-                Process* reader = pipe->readerWaiter;
-                if (reader)
-                {
-                    pipe->readerWaiter = nullptr;
-                    __atomic_store_n(&reader->pendingWakeup, 1, __ATOMIC_RELEASE);
-                    SchedulerUnblock(reader);
-                }
-            }
-            else // read end
-            {
-                __atomic_fetch_sub(&pipe->readers, 1, __ATOMIC_RELEASE);
-                Process* writer = pipe->writerWaiter;
-                if (writer)
-                {
-                    pipe->writerWaiter = nullptr;
-                    __atomic_store_n(&writer->pendingWakeup, 1, __ATOMIC_RELEASE);
-                    SchedulerUnblock(writer);
-                }
-            }
-
-            if (__atomic_load_n(&pipe->readers, __ATOMIC_ACQUIRE) == 0 &&
-                __atomic_load_n(&pipe->writers, __ATOMIC_ACQUIRE) == 0)
-            {
-                kfree(pipe);
-            }
-        }
-
-        FdFree(proc, static_cast<int>(i));
+        CloseFdEntry(proc, i);
     }
 }
 
@@ -1276,8 +1295,11 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     proc->fbDirty = 0;
     proc->fbExitColor = 0;
 
-    // 8. Close O_CLOEXEC fds (we don't track this flag yet, so keep all open)
-    // For now, FDs 0/1/2 are preserved (stdin/stdout/stderr).
+    // 8. Close FD_CLOEXEC file descriptors — POSIX execve semantics require
+    //    that any fd opened with O_CLOEXEC / FD_CLOEXEC is closed when the
+    //    process image is replaced.  Skipping this leaks inherited sockets and
+    //    pipes into the new program's address space.
+    ProcessCloseCloexecFds(proc);
 
     *outStackPtr = userSP;
     // If dynamically linked, start at the interpreter's entry point;

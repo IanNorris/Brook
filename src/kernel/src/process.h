@@ -465,6 +465,7 @@ FdEntry*  FdGet(Process* proc, int fd);
 // Close all file descriptors for a process (called at exit time).
 // Properly handles pipe refcounting and wakes blocked readers/writers.
 void ProcessCloseAllFds(Process* proc);
+void ProcessCloseCloexecFds(Process* proc); // close FD_CLOEXEC fds on execve
 FdEntry*  FdGet(Process* proc, int fd);
 
 // Signal delivery: send a signal to a process.
