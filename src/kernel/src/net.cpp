@@ -203,17 +203,21 @@ static void HandleArp(const uint8_t* frame, uint32_t len)
     auto* arp = reinterpret_cast<const ArpPacket*>(frame + sizeof(EthHeader));
     uint16_t op = ntohs(arp->oper);
 
-    SerialPrintf("arp: RX op=%u spa=%d.%d.%d.%d sha=%02x:%02x:%02x:%02x:%02x:%02x tpa=%d.%d.%d.%d\n",
-                 op,
-                 arp->spa & 0xFF, (arp->spa >> 8) & 0xFF,
-                 (arp->spa >> 16) & 0xFF, (arp->spa >> 24) & 0xFF,
-                 arp->sha.b[0], arp->sha.b[1], arp->sha.b[2],
-                 arp->sha.b[3], arp->sha.b[4], arp->sha.b[5],
-                 arp->tpa & 0xFF, (arp->tpa >> 8) & 0xFF,
-                 (arp->tpa >> 16) & 0xFF, (arp->tpa >> 24) & 0xFF);
-
-    // Always learn from any ARP packet
+    // Always learn from any ARP packet; only log when the cache entry is new
+    // to avoid spamming the serial log with repeated gratuitous ARPs from the
+    // gateway (QEMU sends one every few seconds for each host).
+    MacAddr existing;
+    bool isNew = !ArpCacheLookup(arp->spa, &existing);
     ArpCacheInsert(arp->spa, arp->sha);
+    if (isNew)
+        SerialPrintf("arp: RX op=%u spa=%d.%d.%d.%d sha=%02x:%02x:%02x:%02x:%02x:%02x tpa=%d.%d.%d.%d\n",
+                     op,
+                     arp->spa & 0xFF, (arp->spa >> 8) & 0xFF,
+                     (arp->spa >> 16) & 0xFF, (arp->spa >> 24) & 0xFF,
+                     arp->sha.b[0], arp->sha.b[1], arp->sha.b[2],
+                     arp->sha.b[3], arp->sha.b[4], arp->sha.b[5],
+                     arp->tpa & 0xFF, (arp->tpa >> 8) & 0xFF,
+                     (arp->tpa >> 16) & 0xFF, (arp->tpa >> 24) & 0xFF);
 
     if (op == ARP_OP_REQUEST) {
         // Is this for us?
