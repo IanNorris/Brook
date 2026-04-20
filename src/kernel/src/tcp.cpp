@@ -1,4 +1,5 @@
 #include "tcp.h"
+#include "serial.h"
 
 namespace brook {
 
@@ -38,6 +39,8 @@ TcpAction TcpProcessSegment(Socket& s,
             s.connected = true;
             act.sendAck = true;
         } else if (flags & TCP_RST) {
+            SerialPrintf("tcp: RST received in SynSent (lport=%u rport=%u) — connection refused\n",
+                         ntohs(s.localPort), ntohs(s.remotePort));
             s.tcpState   = TcpState::Closed;
             s.connected  = false;
             s.tcpRstRecv = true;
@@ -46,6 +49,8 @@ TcpAction TcpProcessSegment(Socket& s,
 
     case TcpState::Established:
         if (flags & TCP_RST) {
+            SerialPrintf("tcp: RST received in Established (lport=%u rport=%u seq=%u rcvNxt=%u)\n",
+                         ntohs(s.localPort), ntohs(s.remotePort), seq, s.tcpRcvNxt);
             s.tcpState   = TcpState::Closed;
             s.connected  = false;
             s.tcpRstRecv = true; // RST ≠ FIN: report as ECONNRESET, not EOF

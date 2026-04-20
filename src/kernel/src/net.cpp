@@ -1217,11 +1217,25 @@ void SockClose(int sockIdx)
         TcpSendSegment(s, TCP_FIN | TCP_ACK, nullptr, 0);
         s.tcpSndNxt++;
         s.tcpState = TcpState::FinWait1;
-        // Brief best-effort wait for FIN-ACK — yield a few times then move on
-        for (int i = 0; i < 10; i++) {
-            if (s.tcpState == TcpState::Closed || s.tcpState == TcpState::TimeWait)
-                break;
-            SchedulerYield();
+
+        // Wait up to 500ms for the FIN-ACK from the peer.
+        // We must use SchedulerBlock (not SchedulerYield) because SchedulerYield
+        // returns immediately when no other thread is ready, so the FIN-ACK can
+        // arrive via IRQ but we've already zeroed the socket. SchedulerBlock
+        // suspends us and lets the IRQ handler wake us when the FIN-ACK arrives.
+        extern volatile uint64_t g_lapicTickCount;
+        Process* self = ProcessCurrent();
+        if (self) {
+            uint64_t deadline = g_lapicTickCount + 500;
+            while (s.tcpState == TcpState::FinWait1 ||
+                   s.tcpState == TcpState::FinWait2) {
+                if (g_lapicTickCount >= deadline) break;
+                uint64_t lf = SpinLockAcquire(&s.lock);
+                s.pollWaiter = self;
+                self->wakeupTick = g_lapicTickCount + 50; // check every 50ms
+                SpinLockRelease(&s.lock, lf);
+                SchedulerBlock(self);
+            }
         }
     }
 
@@ -1512,6 +1526,10 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
 
     // No matching socket — send RST
     if (!(flags & TCP_RST) && g_netIf) {
+        SerialPrintf("tcp: no socket for %u.%u.%u.%u:%u→%u (flags=0x%02x) — sending RST\n",
+                     (ntohl(ip->srcIp) >> 24) & 0xFF, (ntohl(ip->srcIp) >> 16) & 0xFF,
+                     (ntohl(ip->srcIp) >> 8) & 0xFF, ntohl(ip->srcIp) & 0xFF,
+                     ntohs(srcPort), ntohs(dstPort), flags);
         uint8_t rstBuf[sizeof(TcpHeader)];
         NetMemset(rstBuf, 0, sizeof(TcpHeader));
         auto* rst = reinterpret_cast<TcpHeader*>(rstBuf);
