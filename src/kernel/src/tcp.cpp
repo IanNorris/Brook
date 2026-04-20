@@ -37,6 +37,7 @@ TcpAction TcpProcessSegment(Socket& s,
             s.tcpSndUna = ack;
             s.tcpState  = TcpState::Established;
             s.connected = true;
+            act.justConnected = true;
             act.sendAck = true;
         } else if (flags & TCP_RST) {
             SerialPrintf("tcp: RST received in SynSent (lport=%u rport=%u) — connection refused\n",

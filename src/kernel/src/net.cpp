@@ -1443,6 +1443,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         if (dataLen > freeSpace) dataLen = freeSpace;
 
         // Delegate to testable state machine
+        uint32_t prevRxCount = s.rxCount;
         TcpAction act = TcpProcessSegment(s, seq, ack, flags, tcpData, dataLen);
 
         if (act.enqueueData && act.dataPtr && act.dataLen > 0)
@@ -1458,11 +1459,18 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         if (act.sendAck || bufferWasFull)
             TcpSendSegment(s, TCP_ACK, nullptr, 0);
 
-        // Wake poll waiter on any state change that could make the socket ready
-        // (connection established, data received, FIN/RST received, error)
-        if (s.pollWaiter && (s.rxCount > 0 || s.connected || s.tcpFinRecv ||
-            s.tcpRstRecv ||
-            (s.tcpState != TcpState::SynSent && s.tcpState != TcpState::SynRecv)))
+        // Only wake the poll waiter when there is actually something new for it:
+        //   - new data just enqueued (rxCount increased)
+        //   - RST or FIN received (need to return ECONNRESET/EOF to reader)
+        //   - SYN-ACK received (justConnected: wake SockConnect waiter)
+        //
+        // Waking on EVERY packet (the old condition used s.connected which is
+        // always true) caused a race: the waiter would wake, see no data, clear
+        // pollWaiter, and then real data would arrive with pollWaiter==null —
+        // no wakeup possible until the 10-second SchedulerBlock timeout fired.
+        bool shouldWake = (s.rxCount > prevRxCount) || s.tcpRstRecv
+                          || s.tcpFinRecv || act.justConnected;
+        if (s.pollWaiter && shouldWake)
         {
             Process* w = s.pollWaiter;
             s.pollWaiter = nullptr;
@@ -1700,7 +1708,12 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
     Socket& s = g_sockets[sockIdx];
     if (s.type != SOCK_STREAM) return -95;
 
-    // Block until data arrives, connection closes, or 10-second timeout
+    // Block until data arrives, connection closes, or 10-second timeout.
+    //
+    // IMPORTANT: the "is there data?" check must happen while holding the socket
+    // lock.  Without the lock, a packet can arrive between the check and setting
+    // pollWaiter — HandleTcp sees pollWaiter==null, skips the wakeup, and we
+    // sleep for the full 10-second timeout with data sitting in the buffer.
     if (s.rxCount == 0 && !s.tcpRstRecv && !s.tcpFinRecv &&
         s.tcpState != TcpState::Closed) {
 
@@ -1708,10 +1721,17 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
         Process* self = SchedulerCurrentProcess();
         uint64_t deadline = g_lapicTickCount + 10000;
 
-        while (s.rxCount == 0 && !s.tcpRstRecv && !s.tcpFinRecv &&
-               s.tcpState != TcpState::Closed &&
-               g_lapicTickCount < deadline) {
+        while (true) {
             uint64_t irqFlags = SpinLockAcquire(&s.lock);
+            bool ready = s.rxCount > 0 || s.tcpRstRecv || s.tcpFinRecv
+                         || s.tcpState == TcpState::Closed
+                         || g_lapicTickCount >= deadline;
+            if (ready) {
+                SpinLockRelease(&s.lock, irqFlags);
+                break;
+            }
+            // Set pollWaiter while holding the lock so HandleTcp can never
+            // enqueue data and miss the wakeup in a race window.
             s.pollWaiter = self;
             self->wakeupTick = g_lapicTickCount + 10000;
             SpinLockRelease(&s.lock, irqFlags);
