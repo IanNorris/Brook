@@ -1425,14 +1425,13 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         // Update peer's advertised window
         s.tcpSndWnd = window;
 
-        // Log TCP segments with rate-limiting (first 3, then every 1000th)
-        if (s.tcpState == TcpState::Established || s.tcpState == TcpState::SynSent) {
-            static uint32_t s_tcpRxCount = 0;
-            s_tcpRxCount++;
-            if (s_tcpRxCount <= 3 || (s_tcpRxCount % 1000) == 0)
-                SerialPrintf("tcp: RX flags=0x%02x seq=%u ack=%u datalen=%u rcvNxt=%u [pkt#%u]\n",
-                             flags, seq, ack, dataLen, s.tcpRcvNxt, s_tcpRxCount);
-        }
+        // Log TCP segments — per-socket counter so each new connection gets
+        // fresh verbose logging (the old global static went silent after 3
+        // packets from the first connection).
+        s.rxPktCount++;
+        if (s.rxPktCount <= 5 || (s.rxPktCount % 500) == 0)
+            SerialPrintf("tcp: RX flags=0x%02x seq=%u ack=%u datalen=%u rcvNxt=%u [pkt#%u]\n",
+                         flags, seq, ack, dataLen, s.tcpRcvNxt, s.rxPktCount);
 
         // Clamp incoming data to our actual free space so tcpRcvNxt stays
         // in sync with what we actually accept.  Without this, a full RX
@@ -1674,7 +1673,11 @@ int SockSend(int sockIdx, const void* buf, uint32_t len)
 
     Socket& s = g_sockets[sockIdx];
     if (s.type != SOCK_STREAM) return -95;
-    if (s.tcpState != TcpState::Established) return -104; // ECONNRESET
+    if (s.tcpState != TcpState::Established) {
+        SerialPrintf("tcp: SockSend refused: state=%d (not Established) fd=%d\n",
+                     (int)s.tcpState, sockIdx);
+        return -104; // ECONNRESET
+    }
 
     const uint8_t* data = static_cast<const uint8_t*>(buf);
     uint32_t sent = 0;
@@ -1741,12 +1744,17 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
 
     if (s.rxCount == 0) {
         if (s.tcpRstRecv) {
-            SerialPrintf("tcp: SockRecv ECONNRESET (RST)\n");
+            SerialPrintf("tcp: SockRecv ECONNRESET (RST) fd=%d\n", sockIdx);
             return -104; // ECONNRESET
         }
         if (s.tcpFinRecv || s.tcpState != TcpState::Established)
             return 0; // EOF
-        return -11; // EAGAIN (timeout)
+        // 10-second timeout — state is Established but no data arrived.
+        // This typically means a wakeup notification was missed or the
+        // server went silent.
+        SerialPrintf("tcp: SockRecv timeout fd=%d rxPkts=%u state=%d\n",
+                     sockIdx, s.rxPktCount, (int)s.tcpState);
+        return -11; // EAGAIN
     }
 
     // Stream read — no framing, just read bytes from ring buffer

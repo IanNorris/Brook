@@ -282,6 +282,9 @@ struct Socket {
     // Reference counting for fork/dup
     volatile uint32_t refCount;        // number of fds pointing at this socket (1 on create)
 
+    // Diagnostic counters (not reset on reuse — per-socket lifetime)
+    uint32_t rxPktCount;   // total TCP segments received on this socket
+
     // Poll waiter — process to wake when data arrives
     Process* pollWaiter;
 
