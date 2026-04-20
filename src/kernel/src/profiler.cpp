@@ -288,99 +288,130 @@ static uint32_t AppendStr(char* buf, uint32_t pos, const char* str)
     return pos;
 }
 
-// Write all buffered samples to /boot/profile.txt on the FAT boot partition.
-// Uses a 16 KB heap buffer to coalesce small writes.  After the run, extract
-// the file with:
+// ---------------------------------------------------------------------------
+// Incremental profile file writer
+//
+// Usage:
+//   ProfileWriter pw;
+//   if (ProfileWriterOpen(&pw)) {
+//       while (recording) { ProfileWriterDrain(&pw); sleep(1s); }
+//       ProfileWriterClose(&pw);
+//   }
+//
+// Extract after QEMU exits:
 //   mcopy -i build/release/brook_disk.img ::profile.txt ./profile.txt
-// then process with:
+// then:
 //   python3 scripts/profiler_to_speedscope.py profile.txt
-static uint32_t WriteProfileToDisk()
+// ---------------------------------------------------------------------------
+
+static constexpr uint32_t kProfBufSize = 16384;
+static constexpr const char* kProfPath = "/boot/profile.txt";
+
+struct ProfileWriter {
+    Vnode*   file;
+    char*    buf;
+    uint64_t fileOff;
+    uint32_t bufPos;
+    uint32_t written;   // total sample lines written so far
+};
+
+static void ProfileWriterFlush(ProfileWriter& pw)
 {
-    constexpr const char* kPath = "/boot/profile.txt";
-    Vnode* f = VfsOpen(kPath, VFS_O_WRITE | VFS_O_CREATE | VFS_O_TRUNC);
-    if (!f) {
-        SerialPrintf("PROFILER: failed to create %s\n", kPath);
-        return 0;
+    if (pw.bufPos > 0) {
+        VfsWrite(pw.file, pw.buf, pw.bufPos, &pw.fileOff);
+        pw.bufPos = 0;
+    }
+}
+
+static void ProfileWriterAppend(ProfileWriter& pw, const char* src, uint32_t len)
+{
+    while (len > 0) {
+        uint32_t avail = kProfBufSize - pw.bufPos;
+        if (avail == 0) { ProfileWriterFlush(pw); avail = kProfBufSize; }
+        uint32_t n = len < avail ? len : avail;
+        __builtin_memcpy(pw.buf + pw.bufPos, src, n);
+        pw.bufPos += n;
+        src += n;
+        len -= n;
+    }
+}
+
+// Open the profile file and write the PROF_BEGIN header.
+static bool ProfileWriterOpen(ProfileWriter& pw)
+{
+    pw.file     = VfsOpen(kProfPath, VFS_O_WRITE | VFS_O_CREATE | VFS_O_TRUNC);
+    pw.buf      = nullptr;
+    pw.fileOff  = 0;
+    pw.bufPos   = 0;
+    pw.written  = 0;
+
+    if (!pw.file) {
+        SerialPrintf("PROFILER: failed to create %s\n", kProfPath);
+        return false;
     }
 
-    constexpr uint32_t kBufSize = 16384;
-    char* wbuf = static_cast<char*>(kmalloc(kBufSize));
-    if (!wbuf) {
+    pw.buf = static_cast<char*>(kmalloc(kProfBufSize));
+    if (!pw.buf) {
         SerialPrintf("PROFILER: kmalloc failed for write buffer\n");
-        VfsClose(f);
-        return 0;
+        VfsClose(pw.file);
+        pw.file = nullptr;
+        return false;
     }
 
-    uint64_t off    = 0;
-    uint32_t wpos   = 0;
     uint32_t cpuCount = SmpGetCpuCount();
+    char hdr[80]; uint32_t p = 0;
+    p = AppendStr(hdr, p, "PROF_BEGIN ");
+    p = AppendDec(hdr, p, cpuCount);
+    hdr[p++] = ' ';
+    p = AppendDec(hdr, p, static_cast<uint32_t>(g_profilerStartTick));
+    hdr[p++] = '\n';
+    ProfileWriterAppend(pw, hdr, p);
+    return true;
+}
 
-    // Flush write buffer to disk.
-    auto flush = [&]() {
-        if (wpos > 0) {
-            VfsWrite(f, wbuf, wpos, &off);
-            wpos = 0;
-        }
-    };
-
-    // Append raw bytes to the write buffer, flushing as needed.
-    auto append = [&](const char* src, uint32_t len) {
-        while (len > 0) {
-            uint32_t avail = kBufSize - wpos;
-            if (avail == 0) { flush(); avail = kBufSize; }
-            uint32_t n = (len < avail) ? len : avail;
-            __builtin_memcpy(wbuf + wpos, src, n);
-            wpos += n;
-            src  += n;
-            len  -= n;
-        }
-    };
-
-    // PROF_BEGIN <cpuCount> <startTick>
-    {
-        char hdr[80]; uint32_t p = 0;
-        p = AppendStr(hdr, p, "PROF_BEGIN ");
-        p = AppendDec(hdr, p, cpuCount);
-        hdr[p++] = ' ';
-        p = AppendDec(hdr, p, static_cast<uint32_t>(g_profilerStartTick));
-        hdr[p++] = '\n';
-        append(hdr, p);
-    }
-
-    uint32_t totalWritten = 0;
+// Drain all CPU ring buffers into the open file. Safe to call repeatedly.
+static void ProfileWriterDrain(ProfileWriter& pw)
+{
+    if (!pw.file) return;
+    uint32_t cpuCount = SmpGetCpuCount();
     char lineBuf[300];
-
     for (uint32_t c = 0; c < cpuCount; c++) {
         PerCpuBuffer& buf = g_cpuBuf[c];
         uint32_t ri = buf.readIdx;
         uint32_t wi = __atomic_load_n(&buf.writeIdx, __ATOMIC_ACQUIRE);
         while (ri != wi) {
             uint32_t len = FormatEvent(buf.samples[ri], lineBuf);
-            append(lineBuf, len);
+            ProfileWriterAppend(pw, lineBuf, len);
             ri = (ri + 1) % SAMPLES_PER_CPU;
-            totalWritten++;
+            pw.written++;
         }
         buf.readIdx = ri;
     }
+    ProfileWriterFlush(pw);
+}
 
-    // PROF_END <samples> <dropped>
-    {
-        uint32_t dropped = 0;
-        for (uint32_t c = 0; c < cpuCount; c++) dropped += g_cpuBuf[c].dropped;
+// Write PROF_END, flush and close the file.
+static void ProfileWriterClose(ProfileWriter& pw)
+{
+    if (!pw.file) return;
 
-        char ftr[80]; uint32_t p = 0;
-        p = AppendStr(ftr, p, "PROF_END ");
-        p = AppendDec(ftr, p, totalWritten);
-        ftr[p++] = ' ';
-        p = AppendDec(ftr, p, dropped);
-        ftr[p++] = '\n';
-        append(ftr, p);
-    }
+    uint32_t dropped = 0;
+    uint32_t cpuCount = SmpGetCpuCount();
+    for (uint32_t c = 0; c < cpuCount; c++) dropped += g_cpuBuf[c].dropped;
 
-    flush();
-    kfree(wbuf);
-    VfsClose(f);
-    return totalWritten;
+    char ftr[80]; uint32_t p = 0;
+    p = AppendStr(ftr, p, "PROF_END ");
+    p = AppendDec(ftr, p, pw.written);
+    ftr[p++] = ' ';
+    p = AppendDec(ftr, p, dropped);
+    ftr[p++] = '\n';
+    ProfileWriterAppend(pw, ftr, p);
+
+    ProfileWriterFlush(pw);
+    kfree(pw.buf);
+    VfsClose(pw.file);
+    pw.file = nullptr;
+    pw.buf  = nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -402,11 +433,13 @@ static void ProfilerThreadFn(void* /*arg*/)
         }
 
         if (g_profilerEnabled) {
-            // Collect into ring buffers silently while profiling runs.
-            // No serial output during the recording window so kernel debug
-            // messages (sys_socket, tcp:, etc.) can flow through freely.
-            uint32_t cpuCount = SmpGetCpuCount();
+            // Open the profile file immediately so we can drain into it each
+            // second.  This prevents the 4096-slot per-CPU ring buffers from
+            // overflowing during long recordings.
+            ProfileWriter pw;
+            bool fileOk = ProfileWriterOpen(pw);
 
+            uint32_t cpuCount = SmpGetCpuCount();
             uint32_t elapsed = 0;
             while (g_profilerEnabled) {
                 Process* self = ProcessCurrent();
@@ -417,19 +450,30 @@ static void ProfilerThreadFn(void* /*arg*/)
                 elapsed++;
                 if (elapsed % 10 == 0)
                     SerialPrintf("PROFILER: recording (%u s)\n", elapsed);
+
+                // Drain ring buffers into the file every second so they
+                // don't overflow during long recordings.
+                if (fileOk)
+                    ProfileWriterDrain(pw);
             }
 
-            // Profiling ended — write everything to disk (fast, no baud-rate
-            // limit).  Extract after QEMU exits with:
-            //   mcopy -i build/release/brook_disk.img ::profile.txt ./profile.txt
-            SerialPrintf("PROFILER: writing to /boot/profile.txt...\n");
-            uint32_t totalWritten = WriteProfileToDisk();
+            // Final drain to catch any events that arrived after the last
+            // 1 s tick.
+            if (fileOk)
+                ProfileWriterDrain(pw);
 
             uint32_t totalDropped = 0;
             for (uint32_t c = 0; c < cpuCount; c++)
                 totalDropped += g_cpuBuf[c].dropped;
 
-            SerialPrintf("PROFILER: done — %u samples, %u dropped\n", totalWritten, totalDropped);
+            if (fileOk) {
+                ProfileWriterClose(pw);
+                SerialPrintf("PROFILER: done — %u samples, %u dropped\n",
+                             pw.written, totalDropped);
+            } else {
+                SerialPrintf("PROFILER: done — file open failed, %u dropped\n",
+                             totalDropped);
+            }
 
             g_profilerFlushReq = false;
 
