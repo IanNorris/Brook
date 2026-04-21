@@ -186,7 +186,7 @@ if [ "${FUSE}" -eq 1 ]; then
     for p in ${CLOSURE}; do
         BASENAME=$(basename "$p")
         echo "  Copying ${BASENAME}..."
-        cp -a "$p" "${MOUNT_DIR}/store/${BASENAME}"
+        cp -a --no-preserve=links "$p" "${MOUNT_DIR}/store/${BASENAME}"
     done
 
     # Create /nix/bin with tools
