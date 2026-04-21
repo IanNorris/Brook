@@ -400,18 +400,16 @@ int main(int argc, char **argv) {
     if (store) g_store_dir = store;
 
     const char *curl_paths[] = {
-        "/nix/store/xkqd49dmldkqn4xk6dlm640f5blbv6hp-curl-8.18.0-bin/bin/curl",
-        "/nix/bin/curl",   // static mini-curl fallback
+        "/nix/bin/curl",   // symlink created by create_nix_disk.sh
         "/usr/bin/curl",
     };
     const char *cacert_paths[] = {
-        "/nix/store/mg063aj0crwhchqayf2qbyf28k6mlrxm-nss-cacert-3.121/etc/ssl/certs/ca-bundle.crt",
+        "/nix/etc/ssl/certs/ca-bundle.crt",  // symlink created by create_nix_disk.sh
         "/etc/ssl/certs/ca-bundle.crt",
         "/etc/ssl/certs/ca-certificates.crt",
     };
     const char *xz_paths[] = {
-        "/nix/store/g6mlwdvpg92rchq352ll7jbi0pz7h43r-xz-5.8.2-bin/bin/xz",
-        "/nix/bin/xz",
+        "/nix/bin/xz",     // symlink created by create_nix_disk.sh
         "/usr/bin/xz",
     };
     const char *unpack_paths[] = {
@@ -419,8 +417,8 @@ int main(int argc, char **argv) {
         "/usr/bin/nar-unpack",
     };
 
-    g_curl_path = find_binary("CURL_PATH", "curl", curl_paths, 3);
-    g_xz_path = find_binary("XZ_PATH", "xz", xz_paths, 3);
+    g_curl_path = find_binary("CURL_PATH", "curl", curl_paths, 2);
+    g_xz_path = find_binary("XZ_PATH", "xz", xz_paths, 2);
     g_unpack_path = find_binary("NAR_UNPACK_PATH", "nar-unpack", unpack_paths, 2);
 
     /* Find CA certificate bundle */
@@ -428,7 +426,7 @@ int main(int argc, char **argv) {
     if (cacert_env && access(cacert_env, R_OK) == 0) {
         g_cacert_path = cacert_env;
     } else {
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < (int)(sizeof(cacert_paths)/sizeof(cacert_paths[0])); i++) {
             if (access(cacert_paths[i], R_OK) == 0) { g_cacert_path = cacert_paths[i]; break; }
         }
     }
