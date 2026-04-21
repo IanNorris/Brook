@@ -57,9 +57,13 @@ static void hash_mark_seen(const char *hash) {
 /* exec curl with optional --cacert; never returns on success */
 static void exec_curl(const char *url) {
     if (g_cacert_path)
-        execlp(g_curl_path, "curl", "-4", "-sSL", "--cacert", g_cacert_path, url, (char*)NULL);
+        execlp(g_curl_path, "curl", "-4", "-sSL",
+               "-H", "Connection: close",
+               "--cacert", g_cacert_path, url, (char*)NULL);
     else
-        execlp(g_curl_path, "curl", "-4", "-sSL", url, (char*)NULL);
+        execlp(g_curl_path, "curl", "-4", "-sSL",
+               "-H", "Connection: close",
+               url, (char*)NULL);
     perror("execl curl");
     _exit(127);
 }
