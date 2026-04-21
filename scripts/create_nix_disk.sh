@@ -33,7 +33,7 @@ if [ ${#PACKAGES[@]} -eq 0 ]; then
         bash
         curl.bin
         xz.bin
-        nss-cacert
+        cacert
         coreutils
         openssl         # openssl s_client for TLS handshake diagnosis
         iperf3          # TCP throughput + sequential connection stress testing
