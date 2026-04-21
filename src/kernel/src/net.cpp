@@ -1216,13 +1216,31 @@ void SockClose(int sockIdx)
         }
     }
 
-    // TCP: send FIN if connected
-    if (s.type == SOCK_STREAM && s.tcpState == TcpState::Established) {
+    // TCP: graceful close — send FIN and wait for the peer to acknowledge.
+    //
+    // We handle two states:
+    //   Established: we initiate close (active close, FIN_WAIT1 path)
+    //   CloseWait:   peer already sent FIN; we must send our own FIN to
+    //                complete the 4-way handshake (passive close, LAST_ACK path).
+    //
+    // If we skip sending FIN in CloseWait, the peer stays in FIN_WAIT2 forever.
+    // When the same local port is reused for a new connection to the same peer,
+    // the peer sees a new SYN on a 4-tuple it thinks is still open and responds
+    // with FIN/RST — killing the new connection immediately.
+    if (s.type == SOCK_STREAM &&
+        (s.tcpState == TcpState::Established ||
+         s.tcpState == TcpState::CloseWait))
+    {
         TcpSendSegment(s, TCP_FIN | TCP_ACK, nullptr, 0);
         s.tcpSndNxt++;
-        s.tcpState = TcpState::FinWait1;
 
-        // Wait up to 500ms for the FIN-ACK from the peer.
+        // Active close (Established): wait for FIN-ACK (FinWait1 → FinWait2 → done)
+        // Passive close (CloseWait):  wait for ACK of our FIN (LastAck → Closed)
+        s.tcpState = (s.tcpState == TcpState::Established)
+                         ? TcpState::FinWait1
+                         : TcpState::LastAck;
+
+        // Wait up to 500ms for the peer to acknowledge our FIN.
         // We must use SchedulerBlock (not SchedulerYield) because SchedulerYield
         // returns immediately when no other thread is ready, so the FIN-ACK can
         // arrive via IRQ but we've already zeroed the socket. SchedulerBlock
@@ -1232,7 +1250,8 @@ void SockClose(int sockIdx)
         if (self) {
             uint64_t deadline = g_lapicTickCount + 500;
             while (s.tcpState == TcpState::FinWait1 ||
-                   s.tcpState == TcpState::FinWait2) {
+                   s.tcpState == TcpState::FinWait2 ||
+                   s.tcpState == TcpState::LastAck) {
                 if (g_lapicTickCount >= deadline) break;
                 uint64_t lf = SpinLockAcquire(&s.lock);
                 s.pollWaiter = self;
@@ -1346,7 +1365,14 @@ void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
 static void TcpSendSegment(Socket& s, uint8_t flags,
                            const void* data, uint32_t dataLen)
 {
-    uint32_t tcpLen = sizeof(TcpHeader) + dataLen;
+    // SYN packets include MSS option (4 bytes): kind=2, len=2, mss=1460
+    // This makes us look like a real Linux client and avoids CDNs defaulting
+    // to MSS=536 (which some servers use as a signal to reject the connection).
+    static constexpr uint16_t TCP_OPT_MSS = 1460;
+    bool addMss = (flags & TCP_SYN) && !(flags & TCP_ACK); // SYN only, not SYN-ACK
+
+    uint32_t optLen  = addMss ? 4 : 0;   // MSS option is 4 bytes
+    uint32_t tcpLen  = sizeof(TcpHeader) + optLen + dataLen;
     uint8_t buf[ETH_MTU];
     NetMemset(buf, 0, tcpLen);
 
@@ -1355,7 +1381,7 @@ static void TcpSendSegment(Socket& s, uint8_t flags,
     tcp->dstPort  = s.remotePort;
     tcp->seqNum   = htonl(s.tcpSndNxt);
     tcp->ackNum   = htonl(s.tcpRcvNxt);
-    tcp->dataOff  = (sizeof(TcpHeader) / 4) << 4;
+    tcp->dataOff  = ((sizeof(TcpHeader) + optLen) / 4) << 4;
     tcp->flags    = flags;
     // Advertise actual free space to prevent the sender from overflowing our buffer
     {
@@ -1365,8 +1391,17 @@ static void TcpSendSegment(Socket& s, uint8_t flags,
     }
     tcp->urgentPtr = 0;
 
+    // Write MSS option immediately after the TCP header (SYN only)
+    if (addMss) {
+        uint8_t* opts = buf + sizeof(TcpHeader);
+        opts[0] = 2;                                          // kind: MSS
+        opts[1] = 4;                                          // length: 4 bytes
+        opts[2] = static_cast<uint8_t>(TCP_OPT_MSS >> 8);    // MSS high byte
+        opts[3] = static_cast<uint8_t>(TCP_OPT_MSS & 0xFF);  // MSS low byte
+    }
+
     if (data && dataLen > 0)
-        NetMemcpy(buf + sizeof(TcpHeader), data, dataLen);
+        NetMemcpy(buf + sizeof(TcpHeader) + optLen, data, dataLen);
 
     tcp->checksum = 0;
     tcp->checksum = TcpChecksum(g_netIf->ipAddr, s.remoteIp, buf, tcpLen);
