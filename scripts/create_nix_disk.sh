@@ -46,6 +46,22 @@ DISK_IMG="${BROOK_NIX_DISK:-${ROOT_DIR}/brook_nix_disk.img}"
 
 echo "Creating ${SIZE_MB}MB Nix store disk at ${DISK_IMG}..."
 
+# Unmount any stale fuse2fs mounts of this image (from previous failed runs)
+if command -v fuser &>/dev/null && fuser -s "${DISK_IMG}" 2>/dev/null; then
+    echo "  Unmounting stale mount on ${DISK_IMG}..."
+    fuser -k "${DISK_IMG}" 2>/dev/null || true
+    sleep 1
+fi
+# Also try fusermount on any known mount point
+for mp in /tmp/tmp.*/; do
+    if mountpoint -q "$mp" 2>/dev/null && mount | grep -q "${DISK_IMG}.*${mp}"; then
+        fusermount -u "$mp" 2>/dev/null || fusermount -uz "$mp" 2>/dev/null || true
+    fi
+done
+
+# Remove old image if it exists (we're recreating from scratch)
+rm -f "${DISK_IMG}"
+
 # Create and format
 dd if=/dev/zero of="${DISK_IMG}" bs=1M count="${SIZE_MB}" status=progress 2>&1
 mkfs.ext2 -q -b 4096 -L "NIXSTORE" "${DISK_IMG}"
