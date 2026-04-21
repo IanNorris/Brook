@@ -1768,13 +1768,13 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
     // must never surface EAGAIN, because callers (OpenSSL/curl) would retry
     // immediately and each retry would stall another 10 seconds, giving the
     // 6 × 10s = 60s failure pattern.  Instead we loop until data arrives,
-    // the connection closes, or a 120-second hard timeout fires.
+    // the connection closes, or a 30-second hard timeout fires.
     if (s.rxCount == 0 && !s.tcpRstRecv && !s.tcpFinRecv &&
         s.tcpState != TcpState::Closed) {
 
         extern volatile uint64_t g_lapicTickCount;
         Process* self = SchedulerCurrentProcess();
-        uint64_t hardDeadline = g_lapicTickCount + 120000; // 120-second hard limit
+        uint64_t hardDeadline = g_lapicTickCount + 30000; // 30-second hard limit
 
         while (true) {
             uint64_t irqFlags = SpinLockAcquire(&s.lock);
@@ -1806,7 +1806,7 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
                          sockIdx, (int)s.tcpFinRecv, (int)s.tcpState);
             return 0; // EOF
         }
-        // 120-second hard timeout — connection is established but no data
+        // 30-second hard timeout — connection is established but no data
         // arrived at all.  Server likely gone without sending RST/FIN.
         SerialPrintf("tcp: SockRecv hard timeout fd=%d rxPkts=%u state=%d\n",
                      sockIdx, s.rxPktCount, (int)s.tcpState);
