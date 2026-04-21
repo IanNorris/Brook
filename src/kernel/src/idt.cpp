@@ -526,6 +526,19 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
     // Kernel-mode faults are unrecoverable — halt.
     if ((frame->cs & 3) == 3)
     {
+        // Print ELF bounds to disambiguate which binary the process was actually running.
+        // Useful when the process name may be stale (e.g. after exec before name update).
+        brook::Process* diagProc = brook::ProcessCurrent();
+        if (diagProc)
+        {
+            ExcPutsRaw(cpuTag); ExcPutsRaw("  ELF base=");
+            ExcPutHex(diagProc->elf.baseAddress);
+            ExcPutsRaw(" breakLow=");
+            ExcPutHex(diagProc->elf.programBreakLow);
+            ExcPutsRaw(" entry=");
+            ExcPutHex(diagProc->elf.entryPoint);
+            ExcPutsRaw("\n");
+        }
         ExcPutsRaw(cpuTag); ExcPutsRaw("=== KILLING PROCESS ===\n");
         --excDepthPerCpu[cpuSlot];
         __asm__ volatile("sti");

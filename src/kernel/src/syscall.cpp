@@ -1118,6 +1118,9 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if (fde->type == FdType::Socket && fde->handle)
     {
         int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+        bool nonblock = (fde->statusFlags & 0x800) != 0;
+        if (nonblock && brook::SockRxCount(sockIdx) == 0 && !brook::SockPollReady(sockIdx, true, false))
+            return -EAGAIN;
         return brook::SockRecv(sockIdx,
                                reinterpret_cast<void*>(bufAddr),
                                static_cast<uint32_t>(count));
@@ -7170,6 +7173,10 @@ static int64_t sys_recvfrom(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
     // For TCP sockets, use SockRecv (stream receive)
     if (brook::SockIsStream(sockIdx))
     {
+        auto* fde = FdGet(proc, fd);
+        bool nonblock = fde && (fde->statusFlags & 0x800) != 0;
+        if (nonblock && brook::SockRxCount(sockIdx) == 0 && !brook::SockPollReady(sockIdx, true, false))
+            return -EAGAIN;
         int ret = brook::SockRecv(sockIdx,
                                    reinterpret_cast<void*>(bufVal),
                                    static_cast<uint32_t>(lenVal));

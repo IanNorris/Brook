@@ -1,5 +1,14 @@
 #include "tcp.h"
+#ifndef BROOK_HOST_TEST
 #include "serial.h"
+#else
+// Host-test stub — tcp.cpp is compiled standalone without the kernel.
+#include <cstdio>
+#include <cstdarg>
+static void SerialPrintf(const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap);
+}
+#endif
 
 namespace brook {
 
@@ -72,7 +81,15 @@ TcpAction TcpProcessSegment(Socket& s,
             act.sendAck = true;
         }
 
-        if (flags & TCP_FIN) {
+        // Only accept FIN if it's at the expected sequence number.
+        // An OOO FIN must be ignored — accepting it would prematurely
+        // signal EOF to the application while data is still in flight.
+        //
+        // For a data+FIN segment: after processing the in-order data above,
+        // s.tcpRcvNxt == seq+dataLen.  The FIN sits right after the data, so
+        // we check seq+dataLen == s.tcpRcvNxt (works for FIN-only too, since
+        // dataLen is 0 in that case and rcvNxt was never advanced here).
+        if ((flags & TCP_FIN) && (seq + dataLen) == s.tcpRcvNxt) {
             s.tcpRcvNxt++;
             s.tcpFinRecv = true;
             act.sendAck = true;
@@ -86,21 +103,22 @@ TcpAction TcpProcessSegment(Socket& s,
             s.tcpRstRecv = true;
             return act;
         }
-        if (flags & TCP_ACK) {
-            s.tcpSndUna = ack;
-            if (flags & TCP_FIN) {
-                s.tcpRcvNxt = seq + 1;
-                act.sendAck = true;
-                s.tcpState = TcpState::TimeWait;
-            } else {
-                s.tcpState = TcpState::FinWait2;
-            }
-        }
         if (dataLen > 0 && seq == s.tcpRcvNxt) {
             act.enqueueData = true;
             act.dataPtr     = data;
             act.dataLen     = dataLen;
             s.tcpRcvNxt += dataLen;
+            act.sendAck = true;
+        }
+        if (flags & TCP_ACK) {
+            s.tcpSndUna = ack;
+            if ((flags & TCP_FIN) && (seq + dataLen) == s.tcpRcvNxt) {
+                s.tcpRcvNxt++;
+                act.sendAck = true;
+                s.tcpState = TcpState::TimeWait;
+            } else {
+                s.tcpState = TcpState::FinWait2;
+            }
         }
         break;
 
@@ -116,8 +134,9 @@ TcpAction TcpProcessSegment(Socket& s,
             s.tcpRcvNxt += dataLen;
             act.sendAck = true;
         }
-        if (flags & TCP_FIN) {
-            s.tcpRcvNxt = seq + (dataLen > 0 ? dataLen : 0) + 1;
+        // Same combined data+FIN check as Established
+        if ((flags & TCP_FIN) && (seq + dataLen) == s.tcpRcvNxt) {
+            s.tcpRcvNxt++;
             act.sendAck = true;
             s.tcpState = TcpState::TimeWait;
         }

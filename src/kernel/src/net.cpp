@@ -1409,6 +1409,10 @@ static void TcpSendSegment(Socket& s, uint8_t flags,
     int sendResult = NetSendIpv4(s.remoteIp, IP_PROTO_TCP, buf, tcpLen);
     if (sendResult != 0) {
         SerialPrintf("tcp: send failed flags=0x%02x err=%d\n", flags, sendResult);
+    } else {
+        extern volatile uint64_t g_lapicTickCount;
+        SerialPrintf("tcp: TX t=%lums flags=0x%02x seq=%u ack=%u datalen=%u\n",
+                     g_lapicTickCount, flags, s.tcpSndNxt, s.tcpRcvNxt, dataLen);
     }
 }
 
@@ -1464,9 +1468,12 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         // fresh verbose logging (the old global static went silent after 3
         // packets from the first connection).
         s.rxPktCount++;
-        if (s.rxPktCount <= 5 || (s.rxPktCount % 500) == 0)
-            SerialPrintf("tcp: RX flags=0x%02x seq=%u ack=%u datalen=%u rcvNxt=%u [pkt#%u]\n",
-                         flags, seq, ack, dataLen, s.tcpRcvNxt, s.rxPktCount);
+        if (s.rxPktCount <= 10 || (s.rxPktCount % 500) == 0)
+        {
+            extern volatile uint64_t g_lapicTickCount;
+            SerialPrintf("tcp: RX t=%lums flags=0x%02x seq=%u ack=%u datalen=%u rcvNxt=%u [pkt#%u]\n",
+                         g_lapicTickCount, flags, seq, ack, dataLen, s.tcpRcvNxt, s.rxPktCount);
+        }
 
         // Clamp incoming data to our actual free space so tcpRcvNxt stays
         // in sync with what we actually accept.  Without this, a full RX
@@ -1794,8 +1801,11 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
             SerialPrintf("tcp: SockRecv ECONNRESET (RST) fd=%d\n", sockIdx);
             return -104; // ECONNRESET
         }
-        if (s.tcpFinRecv || s.tcpState != TcpState::Established)
+        if (s.tcpFinRecv || s.tcpState != TcpState::Established) {
+            SerialPrintf("tcp: SockRecv EOF fd=%d finRecv=%d state=%d\n",
+                         sockIdx, (int)s.tcpFinRecv, (int)s.tcpState);
             return 0; // EOF
+        }
         // 120-second hard timeout — connection is established but no data
         // arrived at all.  Server likely gone without sending RST/FIN.
         SerialPrintf("tcp: SockRecv hard timeout fd=%d rxPkts=%u state=%d\n",
@@ -1806,6 +1816,8 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
     // Stream read — no framing, just read bytes from ring buffer
     uint64_t irqFlags = SpinLockAcquire(&s.lock);
     uint32_t copyLen = s.rxCount < len ? s.rxCount : len;
+    // Capture free space BEFORE consuming, to decide whether window was constrained.
+    uint32_t freeBefore = Socket::RX_BUF_SIZE - s.rxCount;
     uint8_t* dst = static_cast<uint8_t*>(buf);
     for (uint32_t i = 0; i < copyLen; i++) {
         dst[i] = s.rxBuf[s.rxTail];
@@ -1813,11 +1825,20 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
     }
     __asm__ volatile("mfence" ::: "memory");
     s.rxCount -= copyLen;
+    uint32_t freeAfter = Socket::RX_BUF_SIZE - s.rxCount;
+    TcpState stateSnap = s.tcpState;
     SpinLockRelease(&s.lock, irqFlags);
 
-    // Send a window update so the server can resume if it was blocked by
-    // a zero-window advertisement (which we now send accurately).
-    if (copyLen > 0 && s.tcpState == TcpState::Established)
+    // Send a window update ACK only when:
+    //   1. The receive window was constrained (< 2 MSS of free space), AND
+    //   2. It has now opened up enough for the server to send another segment.
+    // During normal flow where the buffer is not near-full, no ACK is needed —
+    // HandleTcp already ACKed each incoming segment as it arrived.
+    // This prevents ACK storms when the application reads in MSS-sized chunks.
+    static constexpr uint32_t MSS = 1460;
+    bool wasConstrained = freeBefore < 2 * MSS;
+    bool nowOpen        = freeAfter  >= MSS;
+    if (wasConstrained && nowOpen && stateSnap == TcpState::Established)
         TcpSendSegment(s, TCP_ACK, nullptr, 0);
 
     return static_cast<int>(copyLen);

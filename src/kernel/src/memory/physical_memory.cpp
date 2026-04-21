@@ -487,11 +487,9 @@ void PmmKillPid(uint16_t pid)
 
         if (Desc(idx).refCount > 1)
         {
-            // COW shared page — decrement refcount, don't free
+            // COW shared page — decrement refcount, remove from this PID's list
             Desc(idx).refCount--;
-            // Unlink from this PID's list only
-            Desc(idx).next = PMM_NULL_PAGE;
-            Desc(idx).prev = PMM_NULL_PAGE;
+            ListRemove(idx);  // update neighbours so list stays consistent
             shared++;
         }
         else

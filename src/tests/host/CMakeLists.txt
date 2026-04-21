@@ -33,6 +33,8 @@ add_host_test(test_tcp
 target_compile_options(test_tcp PRIVATE
     "-iquote${BROOK_ROOT}/src/kernel/src"
     "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km"
+    -DBROOK_HOST_TEST
 )
 
 add_host_test(test_kmutex)
