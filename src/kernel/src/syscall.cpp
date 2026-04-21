@@ -2736,6 +2736,16 @@ static int64_t sys_wait4(uint64_t pidArg, uint64_t statusAddr, uint64_t options,
             }
 
             SchedulerReapChild(child);
+            // Diagnostic: log the user-mode RIP we'll return to — catches
+            // cases where a stray corruption lands control flow off in the weeds.
+            {
+                uint64_t retRip = 0, retRsp = 0;
+                __asm__ volatile("movq %%gs:48, %0\n\t"
+                                 "movq %%gs:56, %1"
+                                 : "=r"(retRip), "=r"(retRsp));
+                DbgPrintf("WAIT4: pid=%u reaped child=%u status=0x%x -> user RIP=0x%lx RSP=0x%lx\n",
+                          parent->pid, childPid, childStatus, retRip, retRsp);
+            }
             return static_cast<int64_t>(childPid);
         }
 
@@ -6177,7 +6187,9 @@ static int64_t sys_rt_sigreturn(uint64_t, uint64_t, uint64_t,
     if (!proc || !proc->inSignalHandler) return -EINVAL;
 
     proc->sigReturnPending = true;
-    DbgPrintf("SIGRETURN: pid %u requesting context restore\n", proc->pid);
+    DbgPrintf("SIGRETURN: pid %u requesting context restore (cur user RIP=0x%lx)\n",
+              proc->pid,
+              []{ uint64_t r; __asm__ volatile("movq %%gs:48, %0" : "=r"(r)); return r; }());
 
     return 0; // Return value doesn't matter — SyscallCheckSignals overwrites RAX
 }

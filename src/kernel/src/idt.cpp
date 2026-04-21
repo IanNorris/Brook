@@ -1069,6 +1069,31 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
     }
 
     // No handler registered — print diagnostics and kill the process.
+    // For user-mode #PF, dump all GPRs first — critical for diagnosing
+    // stray RIPs / corrupted control flow after syscalls or signal returns.
+    if (vector == 14 && fromUser)
+    {
+        ExcForceSerialLock();
+        ExcPutsRaw("\n[PF] User #PF — full register dump:\n");
+        ExcPutsRaw("  RIP "); ExcPutHex(ef->rip);     ExcPutsRaw("\n");
+        ExcPutsRaw("  RSP "); ExcPutHex(ef->rsp);     ExcPutsRaw("\n");
+        ExcPutsRaw("  RAX "); ExcPutHex(ef->rax);     ExcPutsRaw("\n");
+        ExcPutsRaw("  RBX "); ExcPutHex(ef->rbx);     ExcPutsRaw("\n");
+        ExcPutsRaw("  RCX "); ExcPutHex(ef->rcx);     ExcPutsRaw("\n");
+        ExcPutsRaw("  RDX "); ExcPutHex(ef->rdx);     ExcPutsRaw("\n");
+        ExcPutsRaw("  RDI "); ExcPutHex(ef->rdi);     ExcPutsRaw("\n");
+        ExcPutsRaw("  RSI "); ExcPutHex(ef->rsi);     ExcPutsRaw("\n");
+        ExcPutsRaw("  RBP "); ExcPutHex(ef->rbp);     ExcPutsRaw("\n");
+        ExcPutsRaw("  R8  "); ExcPutHex(ef->r8);      ExcPutsRaw("\n");
+        ExcPutsRaw("  R9  "); ExcPutHex(ef->r9);      ExcPutsRaw("\n");
+        ExcPutsRaw("  R10 "); ExcPutHex(ef->r10);     ExcPutsRaw("\n");
+        ExcPutsRaw("  R11 "); ExcPutHex(ef->r11);     ExcPutsRaw("\n");
+        ExcPutsRaw("  R12 "); ExcPutHex(ef->r12);     ExcPutsRaw("\n");
+        ExcPutsRaw("  R13 "); ExcPutHex(ef->r13);     ExcPutsRaw("\n");
+        ExcPutsRaw("  R14 "); ExcPutHex(ef->r14);     ExcPutsRaw("\n");
+        ExcPutsRaw("  R15 "); ExcPutHex(ef->r15);     ExcPutsRaw("\n");
+    }
+
     InterruptFrame ifrm;
     ifrm.ip    = ef->rip;
     ifrm.cs    = ef->cs;
