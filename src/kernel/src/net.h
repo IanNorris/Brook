@@ -285,6 +285,9 @@ struct Socket {
     // Diagnostic counters (not reset on reuse — per-socket lifetime)
     uint32_t rxPktCount;   // total TCP segments received on this socket
 
+    // Owner PID (tgid) — set when socket is created via sys_socket. Diagnostic only.
+    uint32_t ownerPid;
+
     // Poll waiter — process to wake when data arrives
     Process* pollWaiter;
 

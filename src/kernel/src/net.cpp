@@ -1078,6 +1078,10 @@ int SockCreate(int domain, int type, int protocol)
             }
 
             g_sockets[i].refCount = 1;
+            {
+                Process* self = ProcessCurrent();
+                g_sockets[i].ownerPid = self ? self->tgid : 0;
+            }
             return static_cast<int>(i);
         }
     }
@@ -1413,8 +1417,10 @@ static void TcpSendSegment(Socket& s, uint8_t flags,
         SerialPrintf("tcp: send failed flags=0x%02x err=%d\n", flags, sendResult);
     } else {
         extern volatile uint64_t g_lapicTickCount;
-        SerialPrintf("tcp: TX t=%lums flags=0x%02x seq=%u ack=%u datalen=%u why=%s\n",
-                     g_lapicTickCount, flags, s.tcpSndNxt, s.tcpRcvNxt, dataLen, why);
+        int sockIdx = static_cast<int>(&s - g_sockets);
+        SerialPrintf("tcp: TX pid=%u sock=%d t=%lums flags=0x%02x seq=%u ack=%u datalen=%u why=%s\n",
+                     s.ownerPid, sockIdx, g_lapicTickCount, flags,
+                     s.tcpSndNxt, s.tcpRcvNxt, dataLen, why);
     }
 }
 
@@ -1470,11 +1476,12 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         // fresh verbose logging (the old global static went silent after 3
         // packets from the first connection).
         s.rxPktCount++;
-        if (s.rxPktCount <= 10 || (s.rxPktCount % 500) == 0)
+        if (s.rxPktCount <= 50 || (s.rxPktCount % 100) == 0)
         {
             extern volatile uint64_t g_lapicTickCount;
-            SerialPrintf("tcp: RX t=%lums flags=0x%02x seq=%u ack=%u datalen=%u rcvNxt=%u [pkt#%u]\n",
-                         g_lapicTickCount, flags, seq, ack, dataLen, s.tcpRcvNxt, s.rxPktCount);
+            int sockIdx = static_cast<int>(&s - g_sockets);
+            SerialPrintf("tcp: RX pid=%u sock=%d t=%lums flags=0x%02x seq=%u ack=%u datalen=%u rcvNxt=%u [pkt#%u]\n",
+                         s.ownerPid, sockIdx, g_lapicTickCount, flags, seq, ack, dataLen, s.tcpRcvNxt, s.rxPktCount);
         }
 
         // Clamp incoming data to our actual free space so tcpRcvNxt stays
@@ -1777,7 +1784,10 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
 
         extern volatile uint64_t g_lapicTickCount;
         Process* self = SchedulerCurrentProcess();
-        uint64_t hardDeadline = g_lapicTickCount + 30000; // 30-second hard limit
+        // 3-minute hard deadline — enough for slow TLS handshakes / server
+        // cache misses, but still bounded so a truly dead peer releases the
+        // caller rather than hanging forever.
+        uint64_t hardDeadline = g_lapicTickCount + 180000;
 
         while (true) {
             uint64_t irqFlags = SpinLockAcquire(&s.lock);
