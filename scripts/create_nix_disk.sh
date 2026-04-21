@@ -199,22 +199,23 @@ if [ "${FUSE}" -eq 1 ]; then
     # "nix" is a symlink to nix-install (which supports subcommands)
     ln -sf nix-install "${MOUNT_DIR}/bin/nix"
 
-    # Create symlinks for curl, xz, and CA certs so nix-fetch can find them
-    # at /nix/bin/{curl,xz} and /nix/etc/ssl/certs/ca-bundle.crt without
-    # needing hardcoded store hashes.
+    # Copy curl, xz binaries and CA certs into /nix/bin and /nix/etc so
+    # nix-fetch can find them at stable paths without hardcoded store hashes.
+    # We copy rather than symlink because Brook's VFS may not resolve
+    # cross-mount symlinks reliably.
     for p in ${CLOSURE}; do
         base=$(basename "$p")
         case "$base" in
             *-curl-*-bin)
-                [ -x "$p/bin/curl" ] && ln -sf "/nix/store/${base}/bin/curl" "${MOUNT_DIR}/bin/curl"
+                [ -x "$p/bin/curl" ] && cp "$p/bin/curl" "${MOUNT_DIR}/bin/curl"
                 ;;
             *-xz-*-bin)
-                [ -x "$p/bin/xz" ] && ln -sf "/nix/store/${base}/bin/xz" "${MOUNT_DIR}/bin/xz"
+                [ -x "$p/bin/xz" ] && cp "$p/bin/xz" "${MOUNT_DIR}/bin/xz"
                 ;;
             *-nss-cacert-*|*-cacert-*)
                 if [ -f "$p/etc/ssl/certs/ca-bundle.crt" ]; then
                     mkdir -p "${MOUNT_DIR}/etc/ssl/certs"
-                    ln -sf "/nix/store/${base}/etc/ssl/certs/ca-bundle.crt" "${MOUNT_DIR}/etc/ssl/certs/ca-bundle.crt"
+                    cp "$p/etc/ssl/certs/ca-bundle.crt" "${MOUNT_DIR}/etc/ssl/certs/ca-bundle.crt"
                 fi
                 ;;
         esac
