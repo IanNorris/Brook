@@ -97,9 +97,17 @@ done
 MOUNT_DIR=$(mktemp -d)
 echo "Mounting at ${MOUNT_DIR}..."
 
+# Cleanup trap: unmount on any exit (success or failure)
+cleanup_mount() {
+    sync 2>/dev/null || true
+    fusermount -u "${MOUNT_DIR}" 2>/dev/null || fusermount -uz "${MOUNT_DIR}" 2>/dev/null || true
+    rmdir "${MOUNT_DIR}" 2>/dev/null || true
+}
+trap cleanup_mount EXIT
+
 # Use fuse2fs if available (no root needed), otherwise debugfs
 if command -v fuse2fs &>/dev/null; then
-    fuse2fs -o rw "${DISK_IMG}" "${MOUNT_DIR}"
+    fuse2fs -o rw,fakeroot "${DISK_IMG}" "${MOUNT_DIR}"
     FUSE=1
 else
     echo "Warning: fuse2fs not available, using debugfs (slower)"
@@ -197,10 +205,6 @@ if [ "${FUSE}" -eq 1 ]; then
 
     # Create /nix/profile directory
     mkdir -p "${MOUNT_DIR}/profile/bin"
-
-    # Sync and unmount
-    sync
-    fusermount -u "${MOUNT_DIR}"
 else
     # debugfs approach
     TMPFILE=$(mktemp)
@@ -234,8 +238,6 @@ else
     mkdir_on_disk "${DISK_IMG}" "profile"
     mkdir_on_disk "${DISK_IMG}" "profile/bin"
 fi
-
-rmdir "${MOUNT_DIR}" 2>/dev/null || true
 
 echo ""
 echo "Nix store disk created: ${DISK_IMG}"
