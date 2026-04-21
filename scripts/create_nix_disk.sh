@@ -56,10 +56,14 @@ ALL_PATHS=()
 for pkg in "${PACKAGES[@]}"; do
     if [[ "$pkg" == /* || "$pkg" == ./* || "$pkg" == ../* ]]; then
         # Local derivation path
-        PKG_PATH=$(nix-build "$pkg" --no-out-link 2>/dev/null)
+        PKG_PATH=$(nix-build "$pkg" --no-out-link)
     else
         # Nixpkgs attribute
-        PKG_PATH=$(nix-build '<nixpkgs>' -A "$pkg" --no-out-link 2>/dev/null)
+        PKG_PATH=$(nix-build '<nixpkgs>' -A "$pkg" --no-out-link)
+    fi
+    if [ -z "$PKG_PATH" ]; then
+        echo "  ERROR: nix-build returned empty path for '${pkg}'" >&2
+        exit 1
     fi
     echo "  ${pkg}: ${PKG_PATH}"
     ALL_PATHS+=("$PKG_PATH")
