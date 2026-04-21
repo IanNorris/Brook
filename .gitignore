@@ -60,7 +60,6 @@ tools/nix-fetch/nix-fetch
 tools/nar-unpack/nar-unpack
 
 # Generated package index
-tools/nix-index/packages.idx
 tools/wavplay/wavplay
 tools/wavplay/tone
 tools/mp3play/mp3play
