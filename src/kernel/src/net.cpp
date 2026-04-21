@@ -64,7 +64,8 @@ static uint32_t g_tcpEphemeralPort = 49200; // accessed via atomic fetch-add
 
 // Forward declaration for TCP send (defined below)
 static void TcpSendSegment(Socket& s, uint8_t flags,
-                           const void* data, uint32_t dataLen);
+                           const void* data, uint32_t dataLen,
+                           const char* why = "?");
 
 // ---------------------------------------------------------------------------
 // Checksum helpers
@@ -1207,7 +1208,7 @@ void SockClose(int sockIdx)
                 if (child.tcpState == TcpState::Established ||
                     child.tcpState == TcpState::SynRecv)
                 {
-                    TcpSendSegment(child, TCP_RST, nullptr, 0);
+                    TcpSendSegment(child, TCP_RST, nullptr, 0, "rst-listener");
                 }
                 if (child.rxBuf) kfree(child.rxBuf);
                 NetMemset(&g_sockets[childIdx], 0, sizeof(Socket));
@@ -1231,7 +1232,7 @@ void SockClose(int sockIdx)
         (s.tcpState == TcpState::Established ||
          s.tcpState == TcpState::CloseWait))
     {
-        TcpSendSegment(s, TCP_FIN | TCP_ACK, nullptr, 0);
+        TcpSendSegment(s, TCP_FIN | TCP_ACK, nullptr, 0, "close");
         s.tcpSndNxt++;
 
         // Active close (Established): wait for FIN-ACK (FinWait1 → FinWait2 → done)
@@ -1363,7 +1364,8 @@ void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
 // ---------------------------------------------------------------------------
 
 static void TcpSendSegment(Socket& s, uint8_t flags,
-                           const void* data, uint32_t dataLen)
+                           const void* data, uint32_t dataLen,
+                           const char* why)
 {
     // SYN packets include MSS option (4 bytes): kind=2, len=2, mss=1460
     // This makes us look like a real Linux client and avoids CDNs defaulting
@@ -1411,8 +1413,8 @@ static void TcpSendSegment(Socket& s, uint8_t flags,
         SerialPrintf("tcp: send failed flags=0x%02x err=%d\n", flags, sendResult);
     } else {
         extern volatile uint64_t g_lapicTickCount;
-        SerialPrintf("tcp: TX t=%lums flags=0x%02x seq=%u ack=%u datalen=%u\n",
-                     g_lapicTickCount, flags, s.tcpSndNxt, s.tcpRcvNxt, dataLen);
+        SerialPrintf("tcp: TX t=%lums flags=0x%02x seq=%u ack=%u datalen=%u why=%s\n",
+                     g_lapicTickCount, flags, s.tcpSndNxt, s.tcpRcvNxt, dataLen, why);
     }
 }
 
@@ -1511,7 +1513,8 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         // Send ACK outside the lock — TcpSendSegment is not re-entrant under
         // s.lock and may acquire other locks (e.g. TX queue).
         if (act.sendAck || bufferWasFull)
-            TcpSendSegment(s, TCP_ACK, nullptr, 0);
+            TcpSendSegment(s, TCP_ACK, nullptr, 0,
+                           bufferWasFull ? "rx-bufferfull" : "rx-action");
 
         // Wake the waiter outside the lock — SchedulerUnblock may need the
         // scheduler lock which must not be acquired while holding s.lock.
@@ -1573,7 +1576,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             // Send SYN-ACK
             // Temporarily set tcpSndNxt to ISS for the SYN-ACK segment
             child.tcpSndNxt = child.tcpSndIss;
-            TcpSendSegment(child, TCP_SYN | TCP_ACK, nullptr, 0);
+            TcpSendSegment(child, TCP_SYN | TCP_ACK, nullptr, 0, "synack");
             child.tcpSndNxt = child.tcpSndIss + 1; // SYN consumes one seq
 
             SerialPrintf("net: TCP SYN-ACK sent for port %u -> %u.%u.%u.%u:%u (childIdx=%d)\n",
@@ -1664,7 +1667,7 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
     s.tcpState = TcpState::SynSent;
 
     // Send SYN
-    TcpSendSegment(s, TCP_SYN, nullptr, 0);
+    TcpSendSegment(s, TCP_SYN, nullptr, 0, "connect");
     s.tcpSndNxt++; // SYN consumes one sequence number
 
     SerialPrintf("tcp: SYN queued to %u.%u.%u.%u:%u\n",
@@ -1682,7 +1685,7 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
         if (attempt == 1) {
             // Retry SYN
             s.tcpSndNxt = s.tcpSndIss;
-            TcpSendSegment(s, TCP_SYN, nullptr, 0);
+            TcpSendSegment(s, TCP_SYN, nullptr, 0, "connect-retry");
             s.tcpSndNxt++;
         }
 
@@ -1733,7 +1736,7 @@ int SockSend(int sockIdx, const void* buf, uint32_t len)
         uint32_t chunk = len - sent;
         if (chunk > MSS) chunk = MSS;
 
-        TcpSendSegment(s, TCP_ACK | TCP_PSH, data + sent, chunk);
+        TcpSendSegment(s, TCP_ACK | TCP_PSH, data + sent, chunk, "data");
         s.tcpSndNxt += chunk;
         sent += chunk;
 
@@ -1839,7 +1842,7 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
     bool wasConstrained = freeBefore < 2 * MSS;
     bool nowOpen        = freeAfter  >= MSS;
     if (wasConstrained && nowOpen && stateSnap == TcpState::Established)
-        TcpSendSegment(s, TCP_ACK, nullptr, 0);
+        TcpSendSegment(s, TCP_ACK, nullptr, 0, "wnd-update");
 
     return static_cast<int>(copyLen);
 }
@@ -2048,7 +2051,7 @@ static void DebugChannelThreadFn(void* /*arg*/)
     s.tcpSndWnd  = 65535;
     s.tcpState   = TcpState::SynSent;
 
-    TcpSendSegment(s, TCP_SYN, nullptr, 0);
+    TcpSendSegment(s, TCP_SYN, nullptr, 0, "connect-poll");
     s.tcpSndNxt++;
 
     for (int i = 0; i < 200; i++) {
