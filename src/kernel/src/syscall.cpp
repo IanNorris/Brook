@@ -3952,6 +3952,40 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         return -EINVAL;
     }
 
+    // TCGETS2 = 0x802c542a — termios2 (like TCGETS plus ispeed/ospeed uint32s)
+    if (isTtyFd && cmd == 0x802c542aUL)
+    {
+        auto* t = reinterpret_cast<uint32_t*>(arg);
+        t[0] = 0x0500;
+        t[1] = 0x0005;
+        t[2] = 0x00BF;
+        uint32_t lflag = 0x8A31;
+        if (proc->ttyCanonical) lflag |= 0x0002;
+        if (proc->ttyEcho)      lflag |= 0x0008;
+        t[3] = lflag;
+        auto* raw = reinterpret_cast<uint8_t*>(&t[4]);
+        raw[0] = 0;
+        auto* cc = &raw[1];
+        __builtin_memset(cc, 0, 19);
+        cc[0]=0x03; cc[1]=0x1C; cc[2]=0x7F; cc[3]=0x15; cc[4]=0x04;
+        cc[5]=0;    cc[6]=1;    cc[7]=0;    cc[8]=0x11; cc[9]=0x13;
+        cc[10]=0x1A;cc[11]=0;   cc[12]=0x12;cc[13]=0x0F;cc[14]=0x17;
+        cc[15]=0x16;cc[16]=0;
+        // termios2 appends c_ispeed, c_ospeed (uint32 each) at offset 20 in cc-block
+        uint32_t* speeds = reinterpret_cast<uint32_t*>(&raw[20]);
+        speeds[0] = 38400;
+        speeds[1] = 38400;
+        return 0;
+    }
+
+    // Any unhandled 'T'-type ioctl (termios family) on a non-tty or for
+    // commands we don't implement -> ENOTTY is the correct POSIX reply.
+    // Go runtime uses this to detect isatty; returning ENOSYS makes it loop.
+    if (((cmd >> 8) & 0xFF) == 'T')
+    {
+        return -25; // ENOTTY
+    }
+
     SerialPrintf("sys_ioctl: unhandled fd=%lu cmd=0x%lx\n", fd, cmd);
     return -ENOSYS;
 }

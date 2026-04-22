@@ -94,9 +94,12 @@ static constexpr uint16_t VIRTQ_DESC_F_WRITE = 2;
 
 static constexpr uint16_t EV_SYN = 0x00;
 static constexpr uint16_t EV_KEY = 0x01;
+static constexpr uint16_t EV_REL = 0x02;
 static constexpr uint16_t EV_ABS = 0x03;
-static constexpr uint16_t ABS_X  = 0x00;
-static constexpr uint16_t ABS_Y  = 0x01;
+static constexpr uint16_t ABS_X       = 0x00;
+static constexpr uint16_t ABS_Y       = 0x01;
+static constexpr uint16_t REL_HWHEEL  = 0x06;
+static constexpr uint16_t REL_WHEEL   = 0x08;
 static constexpr uint16_t BTN_LEFT   = 0x110;
 static constexpr uint16_t BTN_RIGHT  = 0x111;
 static constexpr uint16_t BTN_MIDDLE = 0x112;
@@ -290,6 +293,21 @@ static void ProcessEvent(const VirtioInputEvent& ev)
     }
     else if (ev.type == EV_KEY)
     {
+        // Some QEMU backends emit wheel events as EV_KEY with QEMU's
+        // InputButton enum values (7=WHEEL_LEFT, 8=WHEEL_RIGHT) instead
+        // of proper EV_REL. Translate those to scroll events on key-down.
+        if ((ev.code == 7 || ev.code == 8) && ev.value)
+        {
+            InputEvent ie;
+            ie.type = InputEventType::MouseScroll;
+            ie.scanCode = 0;
+            ie.ascii    = static_cast<uint8_t>(ev.code == 8 ? 1 : -1);
+            ie.modifiers = MouseGetButtons();
+            InputDevicePush(&g_inputDev, ie);
+            InputWakeWaiters();
+            return;
+        }
+
         uint8_t btn = 0;
         if (ev.code == BTN_LEFT)   btn = MOUSE_BTN_LEFT;
         else if (ev.code == BTN_RIGHT)  btn = MOUSE_BTN_RIGHT;
@@ -311,6 +329,21 @@ static void ProcessEvent(const VirtioInputEvent& ev)
             InputDevicePush(&g_inputDev, ie);
             InputWakeWaiters();
         }
+    }
+    else if (ev.type == EV_REL)
+    {
+        int8_t dy = 0, dx = 0;
+        if (ev.code == REL_WHEEL)       dy = static_cast<int8_t>(static_cast<int32_t>(ev.value));
+        else if (ev.code == REL_HWHEEL) dx = static_cast<int8_t>(static_cast<int32_t>(ev.value));
+        else return;
+
+        InputEvent ie;
+        ie.type = InputEventType::MouseScroll;
+        ie.scanCode = static_cast<uint8_t>(dy);
+        ie.ascii    = static_cast<uint8_t>(dx);
+        ie.modifiers = MouseGetButtons();
+        InputDevicePush(&g_inputDev, ie);
+        InputWakeWaiters();
     }
     else if (ev.type == EV_SYN)
     {
