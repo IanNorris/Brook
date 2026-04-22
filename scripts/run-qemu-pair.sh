@@ -85,16 +85,23 @@ echo "VM0 static IP: 10.42.0.10   VM1 static IP: 10.42.0.11"
 #    (so Ctrl-C from the terminal reaches the second window cleanly).
 echo ""
 echo "Launching VM0 (MAC 52:54:00:42:00:10, IP 10.42.0.10)..."
+echo "  (output → /tmp/brook-vm0.log)"
 ESP_OVERRIDE="${VM0_ESP}" \
 "${SCRIPT_DIR}/run-qemu.sh" ${BUILD_TYPE_ARG} \
     --vde="${VDE_SOCK}" \
     --mac=52:54:00:42:00:10 \
     --instance=0 \
     --no-audio \
-    "${EXTRA[@]+"${EXTRA[@]}"}" &
+    "${EXTRA[@]+"${EXTRA[@]}"}" </dev/null >/tmp/brook-vm0.log 2>&1 &
 VM0_PID=$!
 
-sleep 2
+sleep 3
+
+if ! kill -0 "${VM0_PID}" 2>/dev/null; then
+    echo "ERROR: VM0 exited early. Last 30 lines of /tmp/brook-vm0.log:"
+    tail -30 /tmp/brook-vm0.log
+    exit 1
+fi
 
 echo "Launching VM1 (MAC 52:54:00:42:00:11, IP 10.42.0.11)..."
 BROOK_DISK_IMG="${VM1_DIR}/brook_disk.img" \
