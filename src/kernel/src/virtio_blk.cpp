@@ -1,6 +1,7 @@
 #include "virtio_blk.h"
 #include "pci.h"
 #include "portio.h"
+#include "string.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "memory/heap.h"
@@ -299,8 +300,9 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
             if (copyEnd - copyStart > remaining) copyEnd = copyStart + remaining;
 
             uint8_t* srcSector = s->dmaBuf + (i * SECTOR_SIZE);
-            for (uint64_t j = copyStart; j < copyEnd; ++j)
-                dstBytes[bytesRead++] = srcSector[j];
+            uint64_t n = copyEnd - copyStart;
+            memcpy(dstBytes + bytesRead, srcSector + copyStart, n);
+            bytesRead += n;
         }
     }
 
@@ -350,7 +352,7 @@ static int VirtioBlkWrite(Device* dev, uint64_t offset, const void* buf, uint64_
                 return -1;
             }
         } else {
-            for (uint32_t i = 0; i < dmaLen; ++i) dmaBuf[i] = 0;
+            memset(dmaBuf, 0, dmaLen);
         }
 
         for (uint32_t i = 0; i < batch && bytesWritten < len; ++i)
@@ -362,8 +364,9 @@ static int VirtioBlkWrite(Device* dev, uint64_t offset, const void* buf, uint64_
             if (copyEnd - copyStart > remaining) copyEnd = copyStart + remaining;
 
             uint8_t* dstSector = dmaBuf + (i * SECTOR_SIZE);
-            for (uint64_t j = copyStart; j < copyEnd; ++j)
-                dstSector[j] = srcBytes[bytesWritten++];
+            uint64_t n = copyEnd - copyStart;
+            memcpy(dstSector + copyStart, srcBytes + bytesWritten, n);
+            bytesWritten += n;
         }
 
         if (!SubmitRequest(*s, VIRTIO_BLK_T_OUT, sec, s->dmaBufPhys, dmaLen)) {

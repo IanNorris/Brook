@@ -10,6 +10,7 @@
 #include "device.h"
 #include "memory/heap.h"
 #include "serial.h"
+#include "string.h"
 #include "sync/kmutex.h"
 
 namespace brook {
@@ -522,19 +523,20 @@ static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
         uint32_t diskBlock = Ext2EnsureBlock(mnt, ino, inoNum, fileBlock);
         if (!diskBlock) break;
 
-        // If partial block write, read-modify-write
-        if (blockOff != 0 || (len - bytesWritten) < mnt->blockSize) {
-            Ext2ReadBlock(mnt, diskBlock, blockBuf);
-        }
-
         uint32_t avail = mnt->blockSize - blockOff;
         uint64_t toCopy = len - bytesWritten;
         if (toCopy > avail) toCopy = avail;
 
-        for (uint64_t i = 0; i < toCopy; ++i)
-            blockBuf[blockOff + i] = src[bytesWritten + i];
-
-        if (!Ext2WriteBlock(mnt, diskBlock, blockBuf)) break;
+        // Fast path: full-block write — skip the bounce buffer entirely
+        // and pass the caller's data straight through to the block device.
+        if (blockOff == 0 && toCopy == mnt->blockSize) {
+            if (!Ext2WriteBlock(mnt, diskBlock, src + bytesWritten)) break;
+        } else {
+            // Partial block: read-modify-write via bounce buffer.
+            Ext2ReadBlock(mnt, diskBlock, blockBuf);
+            memcpy(blockBuf + blockOff, src + bytesWritten, toCopy);
+            if (!Ext2WriteBlock(mnt, diskBlock, blockBuf)) break;
+        }
         bytesWritten += toCopy;
     }
 
