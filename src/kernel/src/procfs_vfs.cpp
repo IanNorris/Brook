@@ -42,6 +42,7 @@ static const VfsFsOps g_procFsOps = {
     .rename     = nullptr,
     .symlink    = nullptr,
     .readlink   = nullptr,
+    .sync       = nullptr,
 };
 
 void ProcFsVfsRegister()

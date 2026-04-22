@@ -272,9 +272,15 @@ int VfsLstatPath(const char* path, VnodeStat* st)
 
 int VfsSync(Vnode* vn)
 {
-    // Sync is vnode-ops based — handled by the filesystem's close/write ops.
-    // For now, no generic sync path; filesystems implement it in their vnode ops.
+    // Best-effort flush: call each filesystem's sync hook so buffered
+    // metadata (e.g. ext2 bitmap/BGDT cache) reaches disk.  Per-vnode
+    // granularity is not tracked yet, so we sync everything.
     (void)vn;
+    for (uint32_t i = 0; i < VFS_MAX_MOUNTS; ++i) {
+        if (!g_mounts[i].used) continue;
+        if (g_mounts[i].fsOps && g_mounts[i].fsOps->sync)
+            g_mounts[i].fsOps->sync(g_mounts[i].mountPriv);
+    }
     return 0;
 }
 

@@ -133,7 +133,23 @@ struct Ext2Mount {
     uint32_t totalBlocks;    // s_blocks_count
     uint64_t bgdtDiskOff;    // byte offset of BGDT on disk
     Ext2BlockGroupDesc* bgdt; // block group descriptor table (heap allocated)
+
+    // --- Metadata write-back cache ---
+    // Without this, every file create performs ~4–6 sector writes for
+    // bitmap and BGDT updates even though they're all rewrites of the
+    // same blocks.  Cache dirty-tracks the BGDT and per-group bitmaps
+    // and defers writes until Ext2Sync (called on unmount, periodic
+    // safety flush, or sys_sync).  Crash window is bounded by
+    // Ext2FsSync being called every OPS_PER_AUTO_SYNC metadata ops.
+    bool      bgdtDirty;
+    uint8_t** blockBitmapCache;   // [groupCount] — lazy-alloced
+    bool*     blockBitmapDirty;   // [groupCount]
+    uint8_t** inodeBitmapCache;   // [groupCount]
+    bool*     inodeBitmapDirty;   // [groupCount]
+    uint32_t  pendingMetaOps;     // ops since last auto-sync
 };
+
+static constexpr uint32_t EXT2_OPS_PER_AUTO_SYNC = 64;
 
 // Per-open-file state
 struct Ext2FilePriv {
@@ -232,7 +248,76 @@ static bool Ext2WriteInode(Ext2Mount* mnt, uint32_t ino, const Ext2Inode* data)
 static bool Ext2WriteBGDT(Ext2Mount* mnt)
 {
     uint32_t bgdtSize = mnt->groupCount * sizeof(Ext2BlockGroupDesc);
-    return Ext2DevWrite(mnt, mnt->bgdtDiskOff, mnt->bgdt, bgdtSize);
+    bool ok = Ext2DevWrite(mnt, mnt->bgdtDiskOff, mnt->bgdt, bgdtSize);
+    if (ok) mnt->bgdtDirty = false;
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Metadata write-back cache helpers
+// ---------------------------------------------------------------------------
+
+// Return a pointer to this group's cached block bitmap, loading from disk
+// the first time it's accessed.  Returns nullptr on I/O failure.
+static uint8_t* Ext2GetBlockBitmap(Ext2Mount* mnt, uint32_t group)
+{
+    if (group >= mnt->groupCount) return nullptr;
+    if (mnt->blockBitmapCache[group]) return mnt->blockBitmapCache[group];
+
+    auto* bm = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+    if (!bm) return nullptr;
+    if (!Ext2ReadBlock(mnt, mnt->bgdt[group].bg_block_bitmap, bm)) {
+        kfree(bm); return nullptr;
+    }
+    mnt->blockBitmapCache[group] = bm;
+    mnt->blockBitmapDirty[group] = false;
+    return bm;
+}
+
+static uint8_t* Ext2GetInodeBitmap(Ext2Mount* mnt, uint32_t group)
+{
+    if (group >= mnt->groupCount) return nullptr;
+    if (mnt->inodeBitmapCache[group]) return mnt->inodeBitmapCache[group];
+
+    auto* bm = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+    if (!bm) return nullptr;
+    if (!Ext2ReadBlock(mnt, mnt->bgdt[group].bg_inode_bitmap, bm)) {
+        kfree(bm); return nullptr;
+    }
+    mnt->inodeBitmapCache[group] = bm;
+    mnt->inodeBitmapDirty[group] = false;
+    return bm;
+}
+
+// Flush every dirty cached bitmap + the BGDT to disk.  Called from the
+// VFS sync hook, on unmount, and after every EXT2_OPS_PER_AUTO_SYNC
+// metadata mutations as a safety net so the crash window is bounded.
+static void Ext2Sync(Ext2Mount* mnt)
+{
+    if (!mnt) return;
+    for (uint32_t g = 0; g < mnt->groupCount; ++g) {
+        if (mnt->blockBitmapCache[g] && mnt->blockBitmapDirty[g]) {
+            if (Ext2WriteBlock(mnt, mnt->bgdt[g].bg_block_bitmap,
+                               mnt->blockBitmapCache[g])) {
+                mnt->blockBitmapDirty[g] = false;
+            }
+        }
+        if (mnt->inodeBitmapCache[g] && mnt->inodeBitmapDirty[g]) {
+            if (Ext2WriteBlock(mnt, mnt->bgdt[g].bg_inode_bitmap,
+                               mnt->inodeBitmapCache[g])) {
+                mnt->inodeBitmapDirty[g] = false;
+            }
+        }
+    }
+    if (mnt->bgdtDirty) Ext2WriteBGDT(mnt);
+    mnt->pendingMetaOps = 0;
+}
+
+// Called from each mutating op to bump the counter + trigger periodic flush.
+static inline void Ext2BumpMetaOps(Ext2Mount* mnt)
+{
+    if (++mnt->pendingMetaOps >= EXT2_OPS_PER_AUTO_SYNC)
+        Ext2Sync(mnt);
 }
 
 // ---------------------------------------------------------------------------
@@ -242,33 +327,27 @@ static bool Ext2WriteBGDT(Ext2Mount* mnt)
 // Allocate a free block from the bitmap. Returns block number or 0 on failure.
 static uint32_t Ext2AllocBlock(Ext2Mount* mnt)
 {
-    auto* bitmap = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
-    if (!bitmap) return 0;
-
     for (uint32_t g = 0; g < mnt->groupCount; ++g) {
         if (mnt->bgdt[g].bg_free_blocks_count == 0) continue;
 
-        uint32_t bitmapBlock = mnt->bgdt[g].bg_block_bitmap;
-        if (!Ext2ReadBlock(mnt, bitmapBlock, bitmap)) continue;
+        uint8_t* bitmap = Ext2GetBlockBitmap(mnt, g);
+        if (!bitmap) continue;
 
         uint32_t blocksInGroup = mnt->blocksPerGroup;
-        // Last group may have fewer blocks
         if (g == mnt->groupCount - 1)
             blocksInGroup = mnt->totalBlocks - g * mnt->blocksPerGroup;
 
         for (uint32_t bit = 0; bit < blocksInGroup; ++bit) {
             if (!(bitmap[bit / 8] & (1 << (bit % 8)))) {
-                // Found free block — mark it used
                 bitmap[bit / 8] |= (1 << (bit % 8));
-                if (!Ext2WriteBlock(mnt, bitmapBlock, bitmap)) { kfree(bitmap); return 0; }
+                mnt->blockBitmapDirty[g] = true;
                 mnt->bgdt[g].bg_free_blocks_count--;
-                Ext2WriteBGDT(mnt);
-                kfree(bitmap);
+                mnt->bgdtDirty = true;
+                Ext2BumpMetaOps(mnt);
                 return g * mnt->blocksPerGroup + bit + mnt->firstDataBlock;
             }
         }
     }
-    kfree(bitmap);
     return 0;
 }
 
@@ -281,44 +360,38 @@ static bool Ext2FreeBlock(Ext2Mount* mnt, uint32_t blockNum)
     uint32_t bit = rel % mnt->blocksPerGroup;
     if (g >= mnt->groupCount) return false;
 
-    auto* bitmap = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+    uint8_t* bitmap = Ext2GetBlockBitmap(mnt, g);
     if (!bitmap) return false;
-    if (!Ext2ReadBlock(mnt, mnt->bgdt[g].bg_block_bitmap, bitmap)) {
-        kfree(bitmap); return false;
-    }
     bitmap[bit / 8] &= ~(1 << (bit % 8));
-    bool ok = Ext2WriteBlock(mnt, mnt->bgdt[g].bg_block_bitmap, bitmap);
-    kfree(bitmap);
-    if (ok) { mnt->bgdt[g].bg_free_blocks_count++; Ext2WriteBGDT(mnt); }
-    return ok;
+    mnt->blockBitmapDirty[g] = true;
+    mnt->bgdt[g].bg_free_blocks_count++;
+    mnt->bgdtDirty = true;
+    Ext2BumpMetaOps(mnt);
+    return true;
 }
 
 // Allocate a free inode. Returns inode number or 0 on failure.
 // isDir: increment bg_used_dirs_count.
 static uint32_t Ext2AllocInode(Ext2Mount* mnt, bool isDir)
 {
-    auto* bitmap = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
-    if (!bitmap) return 0;
-
     for (uint32_t g = 0; g < mnt->groupCount; ++g) {
         if (mnt->bgdt[g].bg_free_inodes_count == 0) continue;
 
-        uint32_t bitmapBlock = mnt->bgdt[g].bg_inode_bitmap;
-        if (!Ext2ReadBlock(mnt, bitmapBlock, bitmap)) continue;
+        uint8_t* bitmap = Ext2GetInodeBitmap(mnt, g);
+        if (!bitmap) continue;
 
         for (uint32_t bit = 0; bit < mnt->inodesPerGroup; ++bit) {
             if (!(bitmap[bit / 8] & (1 << (bit % 8)))) {
                 bitmap[bit / 8] |= (1 << (bit % 8));
-                if (!Ext2WriteBlock(mnt, bitmapBlock, bitmap)) { kfree(bitmap); return 0; }
+                mnt->inodeBitmapDirty[g] = true;
                 mnt->bgdt[g].bg_free_inodes_count--;
                 if (isDir) mnt->bgdt[g].bg_used_dirs_count++;
-                Ext2WriteBGDT(mnt);
-                kfree(bitmap);
-                return g * mnt->inodesPerGroup + bit + 1; // inodes are 1-based
+                mnt->bgdtDirty = true;
+                Ext2BumpMetaOps(mnt);
+                return g * mnt->inodesPerGroup + bit + 1;
             }
         }
     }
-    kfree(bitmap);
     return 0;
 }
 
@@ -330,20 +403,15 @@ static bool Ext2FreeInode(Ext2Mount* mnt, uint32_t ino, bool isDir)
     uint32_t bit = (ino - 1) % mnt->inodesPerGroup;
     if (g >= mnt->groupCount) return false;
 
-    auto* bitmap = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+    uint8_t* bitmap = Ext2GetInodeBitmap(mnt, g);
     if (!bitmap) return false;
-    if (!Ext2ReadBlock(mnt, mnt->bgdt[g].bg_inode_bitmap, bitmap)) {
-        kfree(bitmap); return false;
-    }
     bitmap[bit / 8] &= ~(1 << (bit % 8));
-    bool ok = Ext2WriteBlock(mnt, mnt->bgdt[g].bg_inode_bitmap, bitmap);
-    kfree(bitmap);
-    if (ok) {
-        mnt->bgdt[g].bg_free_inodes_count++;
-        if (isDir) mnt->bgdt[g].bg_used_dirs_count--;
-        Ext2WriteBGDT(mnt);
-    }
-    return ok;
+    mnt->inodeBitmapDirty[g] = true;
+    mnt->bgdt[g].bg_free_inodes_count++;
+    if (isDir) mnt->bgdt[g].bg_used_dirs_count--;
+    mnt->bgdtDirty = true;
+    Ext2BumpMetaOps(mnt);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1217,6 +1285,29 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
     mnt->bgdtDiskOff    = bgdtOff;
     mnt->bgdt           = bgdt;
 
+    // Metadata cache arrays — lazy-populated on first use.
+    mnt->bgdtDirty         = false;
+    mnt->pendingMetaOps    = 0;
+    mnt->blockBitmapCache  = static_cast<uint8_t**>(kmalloc(groupCount * sizeof(uint8_t*)));
+    mnt->blockBitmapDirty  = static_cast<bool*>(kmalloc(groupCount * sizeof(bool)));
+    mnt->inodeBitmapCache  = static_cast<uint8_t**>(kmalloc(groupCount * sizeof(uint8_t*)));
+    mnt->inodeBitmapDirty  = static_cast<bool*>(kmalloc(groupCount * sizeof(bool)));
+    if (!mnt->blockBitmapCache || !mnt->blockBitmapDirty ||
+        !mnt->inodeBitmapCache || !mnt->inodeBitmapDirty) {
+        if (mnt->blockBitmapCache) kfree(mnt->blockBitmapCache);
+        if (mnt->blockBitmapDirty) kfree(mnt->blockBitmapDirty);
+        if (mnt->inodeBitmapCache) kfree(mnt->inodeBitmapCache);
+        if (mnt->inodeBitmapDirty) kfree(mnt->inodeBitmapDirty);
+        kfree(bgdt); kfree(mnt);
+        return false;
+    }
+    for (uint32_t i = 0; i < groupCount; ++i) {
+        mnt->blockBitmapCache[i] = nullptr;
+        mnt->blockBitmapDirty[i] = false;
+        mnt->inodeBitmapCache[i] = nullptr;
+        mnt->inodeBitmapDirty[i] = false;
+    }
+
     *mountPriv = mnt;
     DbgPrintf("ext2: mounted successfully\n");
     return true;
@@ -1226,8 +1317,32 @@ static void Ext2FsUnmount(void* mountPriv)
 {
     auto* mnt = static_cast<Ext2Mount*>(mountPriv);
     if (!mnt) return;
+    // Flush any dirty metadata before releasing cache buffers.
+    Ext2Sync(mnt);
+    if (mnt->blockBitmapCache) {
+        for (uint32_t g = 0; g < mnt->groupCount; ++g)
+            if (mnt->blockBitmapCache[g]) kfree(mnt->blockBitmapCache[g]);
+        kfree(mnt->blockBitmapCache);
+    }
+    if (mnt->inodeBitmapCache) {
+        for (uint32_t g = 0; g < mnt->groupCount; ++g)
+            if (mnt->inodeBitmapCache[g]) kfree(mnt->inodeBitmapCache[g]);
+        kfree(mnt->inodeBitmapCache);
+    }
+    if (mnt->blockBitmapDirty) kfree(mnt->blockBitmapDirty);
+    if (mnt->inodeBitmapDirty) kfree(mnt->inodeBitmapDirty);
     if (mnt->bgdt) kfree(mnt->bgdt);
     kfree(mnt);
+}
+
+// VFS sync hook — flush all dirty metadata to disk.
+static void Ext2FsSync(void* mountPriv)
+{
+    auto* mnt = static_cast<Ext2Mount*>(mountPriv);
+    if (!mnt) return;
+    KMutexLock(&g_ext2Lock);
+    Ext2Sync(mnt);
+    KMutexUnlock(&g_ext2Lock);
 }
 
 static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
@@ -1780,6 +1895,7 @@ static const VfsFsOps g_ext2FsOps = {
     .rename     = Ext2FsRename,
     .symlink    = Ext2FsSymlink,
     .readlink   = Ext2FsReadlink,
+    .sync       = Ext2FsSync,
 };
 
 // ---------------------------------------------------------------------------
