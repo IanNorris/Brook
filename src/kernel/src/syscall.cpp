@@ -9,6 +9,7 @@
 #include "panic.h"
 #include "process.h"
 #include "scheduler.h"
+#include "spinlock.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "vfs.h"
@@ -1977,11 +1978,25 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     uint64_t pages = (length + 4095) / 4096;
     uint64_t vmmFlags = ProtToVmmFlags(prot);
 
-    // Determine virtual address.
+    // Threads in the same thread-group share the page table but each
+    // Process struct has its own mmapNext.  Route all address-space
+    // bookkeeping through the thread-group leader so parallel mmaps from
+    // multiple threads don't hand out overlapping regions.  This is the
+    // minimum we need for Go's multi-threaded runtime to work correctly.
+    Process* leader = (proc->tgid && proc->tgid != proc->pid)
+                    ? ProcessFindByPid(proc->tgid)
+                    : nullptr;
+    if (!leader) leader = proc;
+    static SpinLock s_mmapLock;
+
+    // Determine virtual address.  The critical section covers the
+    // read-modify-write of leader->mmapNext AND any unmap-in-place
+    // operation for MAP_FIXED, so two threads can't race on the same range.
     auto pickAddr = [&]() -> uint64_t {
+        uint64_t lf = SpinLockAcquire(&s_mmapLock);
+        uint64_t result = 0;
         if (flags & MAP_FIXED) {
-            if (addr == 0) return 0; // Fail
-            // Unmap any existing pages in the range.
+            if (addr == 0) { SpinLockRelease(&s_mmapLock, lf); return 0; }
             for (uint64_t i = 0; i < pages; i++) {
                 VirtualAddress va(addr + i * 4096);
                 PhysicalAddress existing = VmmVirtToPhys(proc->pageTable, va);
@@ -1990,22 +2005,26 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                     PmmFreePage(existing);
                 }
             }
-            return addr;
+            result = addr;
+        } else {
+            uint64_t base = leader->mmapNext;
+            if (addr >= USER_MMAP_BASE && addr + pages * 4096 <= USER_MMAP_END) {
+                bool free = true;
+                for (uint64_t i = 0; i < pages && free; i++)
+                    if (VmmVirtToPhys(proc->pageTable, VirtualAddress(addr + i * 4096)))
+                        free = false;
+                if (free) base = addr;
+            }
+            if (base + pages * 4096 > USER_MMAP_END) {
+                SpinLockRelease(&s_mmapLock, lf);
+                return 0;
+            }
+            if (base >= leader->mmapNext)
+                leader->mmapNext = base + pages * 4096;
+            result = base;
         }
-        // Non-fixed: use addr as hint if valid, otherwise allocate.
-        uint64_t base = proc->mmapNext;
-        if (addr >= USER_MMAP_BASE && addr + pages * 4096 <= USER_MMAP_END) {
-            // Check if hint range is free.
-            bool free = true;
-            for (uint64_t i = 0; i < pages && free; i++)
-                if (VmmVirtToPhys(proc->pageTable, VirtualAddress(addr + i * 4096)))
-                    free = false;
-            if (free) base = addr;
-        }
-        if (base + pages * 4096 > USER_MMAP_END) return 0;
-        if (base >= proc->mmapNext)
-            proc->mmapNext = base + pages * 4096;
-        return base;
+        SpinLockRelease(&s_mmapLock, lf);
+        return result;
     };
 
     // Helper: allocate pages at a specific address.
@@ -2039,6 +2058,16 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     {
         uint64_t vaddr = pickAddr();
         if (!vaddr) return -ENOMEM;
+
+        // PROT_NONE anonymous mappings are pure reservations: do NOT back
+        // them with physical pages.  Go's runtime reserves multi-GB arenas
+        // up front with PROT_NONE and then mprotects sub-ranges to commit.
+        // Allocating backing pages eagerly would immediately OOM, AND would
+        // defeat the PROT_NONE guard-page contract (reads should fault).
+        // sys_mprotect lazily backs pages when prot upgrades to non-zero.
+        if (prot == 0)
+            return static_cast<int64_t>(vaddr);
+
         if (!allocAt(vaddr, MemTag::User)) return -ENOMEM;
 
         // Zero via direct map (safe even for PROT_NONE / read-only pages).
@@ -2250,9 +2279,36 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
     {
         VirtualAddress va(addr + i * 4096);
         PhysicalAddress phys = VmmVirtToPhys(proc->pageTable, va);
-        if (!phys) continue; // Page not mapped — skip (Linux does this)
 
-        // Remap the page with the new flags.
+        if (!phys)
+        {
+            // Page not mapped.  If the caller is upgrading to a real
+            // protection (non-PROT_NONE), this is a lazy-backing request
+            // — allocate and zero a fresh page.  This is the pattern Go's
+            // runtime uses: reserve a large region with PROT_NONE, then
+            // mprotect sub-ranges to commit.
+            if (prot == 0)
+                continue;
+
+            PhysicalAddress newPhys = PmmAllocPage(MemTag::User, proc->pid);
+            if (!newPhys) return -ENOMEM;
+
+            if (!VmmMapPage(proc->pageTable, va, newPhys, newFlags,
+                            MemTag::User, proc->pid))
+            {
+                PmmFreePage(newPhys);
+                return -ENOMEM;
+            }
+
+            // Zero via kernel direct map (safe even for RO/NX pages).
+            auto* kp = reinterpret_cast<uint8_t*>(PhysToVirt(newPhys).raw());
+            kp = reinterpret_cast<uint8_t*>(
+                reinterpret_cast<uint64_t>(kp) & ~0xFFFULL);
+            for (uint64_t b = 0; b < 4096; ++b) kp[b] = 0;
+            continue;
+        }
+
+        // Remap the existing page with the new flags.
         VmmUnmapPage(proc->pageTable, va);
         VmmMapPage(proc->pageTable, va, phys, newFlags, MemTag::User, proc->pid);
     }
