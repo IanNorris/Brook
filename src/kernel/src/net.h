@@ -174,14 +174,25 @@ struct NetIf {
 // Initialise network subsystem.
 void NetInit();
 
-// Register a network interface. Currently single-NIC only.
+// Register a network interface. Up to NET_MAX_IFS (4) may be registered.
 void NetRegisterIf(NetIf* nif);
 
 // Called by the NIC driver when a frame arrives.
 void NetReceive(NetIf* nif, const void* frame, uint32_t len);
 
-// Get the primary network interface.
+// Get the primary (first-registered) network interface.
 NetIf* NetGetIf();
+
+// Total registered interface count and accessor.
+uint32_t NetIfCount();
+NetIf* NetIfAt(uint32_t idx);
+
+// Pick the interface that should source packets destined for dstIp. Chooses
+// a configured interface whose subnet matches dstIp; falls back to the
+// primary (default-route) interface when no subnet matches.
+NetIf* NetIfForDst(uint32_t dstIp);
+
+static constexpr uint32_t NET_MAX_IFS = 4;
 
 // Send an IPv4 packet. Handles Ethernet framing and ARP resolution.
 // Returns 0 on success, negative on error.

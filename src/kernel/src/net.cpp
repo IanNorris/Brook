@@ -28,6 +28,10 @@ namespace brook {
 // Global state
 // ---------------------------------------------------------------------------
 
+static NetIf* g_netIfs[NET_MAX_IFS] = {};
+static uint32_t g_netIfCount = 0;
+// Back-compat alias used by legacy single-NIC code paths below. Points at
+// g_netIfs[0] (the primary / default-route interface).
 static NetIf* g_netIf = nullptr;
 
 // ARP cache — small fixed table
@@ -147,14 +151,15 @@ static bool ArpCacheLookup(uint32_t ip, MacAddr* out)
 
 static void ArpSendRequest(uint32_t targetIp)
 {
-    if (!g_netIf) return;
+    NetIf* nif = NetIfForDst(targetIp);
+    if (!nif) return;
 
     uint8_t frame[42]; // 14 eth + 28 arp
     NetMemset(frame, 0, sizeof(frame));
 
     auto* eth = reinterpret_cast<EthHeader*>(frame);
     NetMemset(eth->dst.b, 0xFF, 6); // broadcast
-    eth->src = g_netIf->mac;
+    eth->src = nif->mac;
     eth->etherType = htons(ETH_TYPE_ARP);
 
     auto* arp = reinterpret_cast<ArpPacket*>(frame + sizeof(EthHeader));
@@ -163,24 +168,24 @@ static void ArpSendRequest(uint32_t targetIp)
     arp->hlen  = 6;
     arp->plen  = 4;
     arp->oper  = htons(ARP_OP_REQUEST);
-    arp->sha   = g_netIf->mac;
-    arp->spa   = g_netIf->ipAddr;
+    arp->sha   = nif->mac;
+    arp->spa   = nif->ipAddr;
     NetMemset(arp->tha.b, 0, 6);
     arp->tpa   = targetIp;
 
-    g_netIf->transmit(g_netIf, frame, 42);
+    nif->transmit(nif, frame, 42);
 }
 
-static void ArpSendReply(const MacAddr& dstMac, uint32_t dstIp)
+static void ArpSendReply(NetIf* nif, const MacAddr& dstMac, uint32_t dstIp)
 {
-    if (!g_netIf) return;
+    if (!nif) return;
 
     uint8_t frame[42];
     NetMemset(frame, 0, sizeof(frame));
 
     auto* eth = reinterpret_cast<EthHeader*>(frame);
     eth->dst = dstMac;
-    eth->src = g_netIf->mac;
+    eth->src = nif->mac;
     eth->etherType = htons(ETH_TYPE_ARP);
 
     auto* arp = reinterpret_cast<ArpPacket*>(frame + sizeof(EthHeader));
@@ -189,15 +194,15 @@ static void ArpSendReply(const MacAddr& dstMac, uint32_t dstIp)
     arp->hlen  = 6;
     arp->plen  = 4;
     arp->oper  = htons(ARP_OP_REPLY);
-    arp->sha   = g_netIf->mac;
-    arp->spa   = g_netIf->ipAddr;
+    arp->sha   = nif->mac;
+    arp->spa   = nif->ipAddr;
     arp->tha   = dstMac;
     arp->tpa   = dstIp;
 
-    g_netIf->transmit(g_netIf, frame, 42);
+    nif->transmit(nif, frame, 42);
 }
 
-static void HandleArp(const uint8_t* frame, uint32_t len)
+static void HandleArp(NetIf* nif, const uint8_t* frame, uint32_t len)
 {
     if (len < sizeof(EthHeader) + sizeof(ArpPacket)) return;
 
@@ -221,9 +226,9 @@ static void HandleArp(const uint8_t* frame, uint32_t len)
                      (arp->tpa >> 16) & 0xFF, (arp->tpa >> 24) & 0xFF);
 
     if (op == ARP_OP_REQUEST) {
-        // Is this for us?
-        if (g_netIf && arp->tpa == g_netIf->ipAddr) {
-            ArpSendReply(arp->sha, arp->spa);
+        // Is this for us? Check against the receiving interface's IP.
+        if (nif && arp->tpa == nif->ipAddr) {
+            ArpSendReply(nif, arp->sha, arp->spa);
         }
     } else if (op == ARP_OP_REPLY) {
 
@@ -300,10 +305,11 @@ static void HandleIpv4(const uint8_t* frame, uint32_t len);
 int NetSendIpv4(uint32_t dstIp, uint8_t proto,
                 const void* payload, uint32_t payloadLen)
 {
-    if (!g_netIf || !g_netIf->ipAddr) return -1;
+    NetIf* nif = NetIfForDst(dstIp);
+    if (!nif || !nif->ipAddr) return -1;
 
-    // Loopback: if destination is our own IP, inject directly into HandleIpv4
-    if (dstIp == g_netIf->ipAddr)
+    // Loopback: if destination is our own IP on this iface, inject locally
+    if (dstIp == nif->ipAddr)
     {
         uint32_t ipLen = sizeof(Ipv4Header) + payloadLen;
         uint32_t frameLen = sizeof(EthHeader) + ipLen;
@@ -313,8 +319,8 @@ int NetSendIpv4(uint32_t dstIp, uint8_t proto,
         NetMemset(frame, 0, frameLen);
 
         auto* eth = reinterpret_cast<EthHeader*>(frame);
-        eth->src = g_netIf->mac;
-        eth->dst = g_netIf->mac;
+        eth->src = nif->mac;
+        eth->dst = nif->mac;
         eth->etherType = htons(ETH_TYPE_IPV4);
 
         auto* ip = reinterpret_cast<Ipv4Header*>(frame + sizeof(EthHeader));
@@ -324,7 +330,7 @@ int NetSendIpv4(uint32_t dstIp, uint8_t proto,
         ip->flagsFrag = htons(0x4000);
         ip->ttl      = 64;
         ip->protocol = proto;
-        ip->srcIp    = g_netIf->ipAddr;
+        ip->srcIp    = nif->ipAddr;
         ip->dstIp    = dstIp;
         ip->checksum = 0;
         ip->checksum = InetChecksum(ip, sizeof(Ipv4Header));
@@ -336,8 +342,8 @@ int NetSendIpv4(uint32_t dstIp, uint8_t proto,
 
     // Determine next-hop: if same subnet, send direct; else use gateway
     uint32_t nextHop = dstIp;
-    if ((dstIp & g_netIf->netmask) != (g_netIf->ipAddr & g_netIf->netmask)) {
-        nextHop = g_netIf->gateway;
+    if ((dstIp & nif->netmask) != (nif->ipAddr & nif->netmask)) {
+        nextHop = nif->gateway;
         if (!nextHop) return -1; // no gateway configured
     }
 
@@ -356,25 +362,25 @@ int NetSendIpv4(uint32_t dstIp, uint8_t proto,
 
     auto* eth = reinterpret_cast<EthHeader*>(frame);
     eth->dst = dstMac;
-    eth->src = g_netIf->mac;
+    eth->src = nif->mac;
     eth->etherType = htons(ETH_TYPE_IPV4);
 
     auto* ip = reinterpret_cast<Ipv4Header*>(frame + sizeof(EthHeader));
-    ip->verIhl   = 0x45; // IPv4, 20-byte header
+    ip->verIhl   = 0x45;
     ip->tos      = 0;
     ip->totalLen = htons(static_cast<uint16_t>(ipLen));
     ip->id       = htons(g_ipId++);
-    ip->flagsFrag = htons(0x4000); // Don't Fragment
+    ip->flagsFrag = htons(0x4000);
     ip->ttl      = 64;
     ip->protocol = proto;
-    ip->srcIp    = g_netIf->ipAddr;
+    ip->srcIp    = nif->ipAddr;
     ip->dstIp    = dstIp;
     ip->checksum = 0;
     ip->checksum = InetChecksum(ip, sizeof(Ipv4Header));
 
     NetMemcpy(frame + sizeof(EthHeader) + sizeof(Ipv4Header), payload, payloadLen);
 
-    return g_netIf->transmit(g_netIf, frame, frameLen);
+    return nif->transmit(nif, frame, frameLen);
 }
 
 int NetSendUdp(uint32_t dstIp, uint16_t srcPort, uint16_t dstPort,
@@ -448,11 +454,22 @@ static void HandleIpv4(const uint8_t* frame, uint32_t len)
     if (totalLen < ihl) return;
     if (sizeof(EthHeader) + totalLen > len) return;
 
-    // Check destination: us, broadcast, or multicast
-    if (g_netIf && ip->dstIp != g_netIf->ipAddr &&
-        ip->dstIp != 0xFFFFFFFF &&
-        (ip->dstIp & g_netIf->netmask) != (0xFFFFFFFF & g_netIf->netmask))
-        return;
+    // Check destination: accept if it targets any of our interface IPs,
+    // the global broadcast, or any of our subnet-directed broadcasts.
+    bool forUs = (ip->dstIp == 0xFFFFFFFF);
+    if (!forUs) {
+        for (uint32_t i = 0; i < g_netIfCount; i++) {
+            NetIf* n = g_netIfs[i];
+            if (!n) continue;
+            if (ip->dstIp == n->ipAddr) { forUs = true; break; }
+            if (n->netmask &&
+                (ip->dstIp | n->netmask) == 0xFFFFFFFF &&
+                (ip->dstIp & n->netmask) == (n->ipAddr & n->netmask)) {
+                forUs = true; break;
+            }
+        }
+    }
+    if (!forUs) return;
 
     const uint8_t* payload = frame + sizeof(EthHeader) + ihl;
     uint32_t payloadLen = totalLen - ihl;
@@ -483,7 +500,7 @@ void NetReceive(NetIf* nif, const void* frame, uint32_t len)
 
     switch (etherType) {
     case ETH_TYPE_ARP:
-        HandleArp(static_cast<const uint8_t*>(frame), len);
+        HandleArp(nif, static_cast<const uint8_t*>(frame), len);
         break;
     case ETH_TYPE_IPV4:
         HandleIpv4(static_cast<const uint8_t*>(frame), len);
@@ -502,15 +519,40 @@ void NetInit()
     NetMemset(g_sockets, 0, sizeof(g_sockets));
     NetMemset(g_sockUsed, 0, sizeof(g_sockUsed));
     g_netIf = nullptr;
+    for (uint32_t i = 0; i < NET_MAX_IFS; i++) g_netIfs[i] = nullptr;
+    g_netIfCount = 0;
     SerialPuts("net: initialised\n");
 }
 
 void NetRegisterIf(NetIf* nif)
 {
-    g_netIf = nif;
-    SerialPrintf("net: interface registered, MAC=%02x:%02x:%02x:%02x:%02x:%02x\n",
+    if (g_netIfCount >= NET_MAX_IFS) {
+        SerialPrintf("net: too many interfaces (max %u), ignoring\n", NET_MAX_IFS);
+        return;
+    }
+    uint32_t idx = g_netIfCount++;
+    g_netIfs[idx] = nif;
+    if (idx == 0) g_netIf = nif;
+    SerialPrintf("net: interface %u registered, MAC=%02x:%02x:%02x:%02x:%02x:%02x\n",
+                 idx,
                  nif->mac.b[0], nif->mac.b[1], nif->mac.b[2],
                  nif->mac.b[3], nif->mac.b[4], nif->mac.b[5]);
+}
+
+uint32_t NetIfCount() { return g_netIfCount; }
+NetIf* NetIfAt(uint32_t idx) { return (idx < g_netIfCount) ? g_netIfs[idx] : nullptr; }
+
+// Pick the interface that should source packets destined for dstIp.
+// Prefers subnet match; falls back to NIC 0 (default route).
+NetIf* NetIfForDst(uint32_t dstIp)
+{
+    for (uint32_t i = 0; i < g_netIfCount; i++) {
+        NetIf* nif = g_netIfs[i];
+        if (!nif || !nif->ipAddr || !nif->netmask) continue;
+        if ((dstIp & nif->netmask) == (nif->ipAddr & nif->netmask))
+            return nif;
+    }
+    return g_netIf;
 }
 
 void NetStartPollThread()
@@ -535,15 +577,13 @@ void NetStartPollThread()
     Process* pollThread = KernelThreadCreate("net_poll", [](void* /*arg*/) {
         extern volatile uint64_t g_lapicTickCount;
         while (true) {
-            if (g_netIf && g_netIf->poll) {
-                // Drain in a burst to clear any backlog without needing
-                // multiple wakeup cycles.
-                for (int i = 0; i < 8; i++)
-                    g_netIf->poll(g_netIf);
+            uint32_t n = NetIfCount();
+            for (int burst = 0; burst < 8; burst++) {
+                for (uint32_t i = 0; i < n; i++) {
+                    NetIf* nif = NetIfAt(i);
+                    if (nif && nif->poll) nif->poll(nif);
+                }
             }
-            // Sleep 1ms between polls. This releases the CPU entirely,
-            // allows LAPIC/IRQ handlers to run unobstructed, and keeps
-            // TCP latency well under 2ms for interactive workloads.
             Process* self = ProcessCurrent();
             if (self) {
                 self->wakeupTick = g_lapicTickCount + 1;
