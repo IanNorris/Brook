@@ -316,10 +316,10 @@ int VfsRename(const char* oldPath, const char* newPath)
 
 int VfsSymlink(const char* target, const char* linkPath)
 {
-    if (!target || !linkPath || !target[0] || !linkPath[0]) return -1;
+    if (!target || !linkPath || !target[0] || !linkPath[0]) return -22; // -EINVAL
     const char* relPath = nullptr;
     MountEntry* mount = FindMount(linkPath, &relPath);
-    if (!mount || !mount->fsOps || !mount->fsOps->symlink) return -1;
+    if (!mount || !mount->fsOps || !mount->fsOps->symlink) return -1; // -EPERM
     return mount->fsOps->symlink(mount->mountPriv, mount->pdrv, target, relPath);
 }
 

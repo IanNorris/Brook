@@ -1767,16 +1767,16 @@ static int Ext2FsSymlink(void* mountPriv, uint8_t pdrv,
 
     uint32_t targetLen = 0;
     for (const char* p = target; *p; ++p) ++targetLen;
-    if (targetLen == 0 || targetLen > 4096) return -1;
+    if (targetLen == 0 || targetLen > 4096) return -22; // -EINVAL
 
     KMutexLock(&g_ext2Lock);
 
     char name[256];
     uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name));
-    if (!parentIno || !name[0]) { KMutexUnlock(&g_ext2Lock); return -1; }
+    if (!parentIno || !name[0]) { KMutexUnlock(&g_ext2Lock); return -2; } // -ENOENT
 
     Ext2Inode parentData;
-    if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KMutexUnlock(&g_ext2Lock); return -1; }
+    if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KMutexUnlock(&g_ext2Lock); return -5; } // -EIO
 
     // Check if already exists
     if (Ext2DirLookup(mnt, &parentData, name)) {

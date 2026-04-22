@@ -4291,6 +4291,9 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
     return -EBADF;
 }
 
+// Forward decl for *at path resolution (defined after sys_openat).
+static bool ResolveAtPath(int dirfd, const char* path, char* out, uint32_t outSize);
+
 static int64_t sys_newfstatat(uint64_t dirfd, uint64_t pathAddr, uint64_t statAddr,
                                uint64_t flags, uint64_t, uint64_t)
 {
@@ -4301,33 +4304,14 @@ static int64_t sys_newfstatat(uint64_t dirfd, uint64_t pathAddr, uint64_t statAd
     static constexpr uint64_t AT_SYMLINK_NOFOLLOW = 0x100;
     bool noFollow = (flags & AT_SYMLINK_NOFOLLOW) != 0;
 
-    // Resolve relative path against dirfd if needed
-    static constexpr int64_t AT_FDCWD = -100;
-    if (path[0] != '/' && static_cast<int64_t>(dirfd) != AT_FDCWD)
-    {
-        Process* proc = ProcessCurrent();
-        if (proc)
-        {
-            FdEntry* fde = FdGet(proc, static_cast<int>(dirfd));
-            if (fde && fde->dirPath[0])
-            {
-                char resolved[256];
-                uint32_t ri = 0;
-                for (uint32_t i = 0; fde->dirPath[i] && ri < 250; ++i)
-                    resolved[ri++] = fde->dirPath[i];
-                for (uint32_t i = 0; path[i] && ri < 254; ++i)
-                    resolved[ri++] = path[i];
-                resolved[ri] = '\0';
-                if (noFollow)
-                    return sys_lstat(reinterpret_cast<uint64_t>(resolved), statAddr, 0, 0, 0, 0);
-                return sys_stat(reinterpret_cast<uint64_t>(resolved), statAddr, 0, 0, 0, 0);
-            }
-        }
-    }
+    char resolved[256];
+    uint64_t arg = pathAddr;
+    if (ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
+        arg = reinterpret_cast<uint64_t>(resolved);
 
     if (noFollow)
-        return sys_lstat(pathAddr, statAddr, 0, 0, 0, 0);
-    return sys_stat(pathAddr, statAddr, 0, 0, 0, 0);
+        return sys_lstat(arg, statAddr, 0, 0, 0, 0);
+    return sys_stat(arg, statAddr, 0, 0, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -4585,11 +4569,41 @@ static int64_t sys_openat(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
     uint32_t ri = 0;
     for (uint32_t i = 0; fde->dirPath[i] && ri < 250; ++i)
         resolved[ri++] = fde->dirPath[i];
+    if (ri > 0 && resolved[ri - 1] != '/' && ri < 254)
+        resolved[ri++] = '/';
     for (uint32_t i = 0; path[i] && ri < 254; ++i)
         resolved[ri++] = path[i];
     resolved[ri] = '\0';
 
     return sys_open(reinterpret_cast<uint64_t>(resolved), flags, mode, 0, 0, 0);
+}
+
+// Shared helper for *at syscalls: resolves a path relative to dirfd into an
+// absolute path in 'out'. Returns true on success. If path is already absolute
+// or dirfd is AT_FDCWD, copies path verbatim.
+static bool ResolveAtPath(int dirfd, const char* path, char* out, uint32_t outSize)
+{
+    static constexpr int AT_FDCWD = -100;
+    if (!path || !out || outSize < 2) return false;
+    if (path[0] == '/' || dirfd == AT_FDCWD) {
+        uint32_t i = 0;
+        while (path[i] && i < outSize - 1) { out[i] = path[i]; ++i; }
+        out[i] = '\0';
+        return true;
+    }
+    Process* proc = ProcessCurrent();
+    if (!proc) return false;
+    FdEntry* fde = FdGet(proc, dirfd);
+    if (!fde || fde->dirPath[0] == '\0') return false;
+    uint32_t ri = 0;
+    for (uint32_t i = 0; fde->dirPath[i] && ri < outSize - 2; ++i)
+        out[ri++] = fde->dirPath[i];
+    if (ri > 0 && out[ri - 1] != '/' && ri < outSize - 2)
+        out[ri++] = '/';
+    for (uint32_t i = 0; path[i] && ri < outSize - 1; ++i)
+        out[ri++] = path[i];
+    out[ri] = '\0';
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -5119,8 +5133,11 @@ static int64_t sys_readlink(uint64_t pathAddr, uint64_t bufAddr, uint64_t bufsiz
 static int64_t sys_readlinkat(uint64_t dirfd, uint64_t pathAddr, uint64_t bufAddr,
                                uint64_t bufsiz, uint64_t, uint64_t)
 {
-    (void)dirfd;
-    return sys_readlink(pathAddr, bufAddr, bufsiz, 0, 0, 0);
+    const char* path = reinterpret_cast<const char*>(pathAddr);
+    char resolved[256];
+    if (!ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
+        return sys_readlink(pathAddr, bufAddr, bufsiz, 0, 0, 0);
+    return sys_readlink(reinterpret_cast<uint64_t>(resolved), bufAddr, bufsiz, 0, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -5139,8 +5156,11 @@ static int64_t sys_symlink(uint64_t targetAddr, uint64_t linkpathAddr, uint64_t,
 static int64_t sys_symlinkat(uint64_t targetAddr, uint64_t newdirfd, uint64_t linkpathAddr,
                               uint64_t, uint64_t, uint64_t)
 {
-    (void)newdirfd; // TODO: handle AT_FDCWD properly
-    return sys_symlink(targetAddr, linkpathAddr, 0, 0, 0, 0);
+    const char* linkpath = reinterpret_cast<const char*>(linkpathAddr);
+    char resolved[256];
+    if (!ResolveAtPath(static_cast<int>(newdirfd), linkpath, resolved, sizeof(resolved)))
+        return sys_symlink(targetAddr, linkpathAddr, 0, 0, 0, 0);
+    return sys_symlink(targetAddr, reinterpret_cast<uint64_t>(resolved), 0, 0, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -5894,9 +5914,11 @@ static int64_t sys_mkdir(uint64_t pathAddr, uint64_t, uint64_t,
 static int64_t sys_mkdirat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
                             uint64_t, uint64_t, uint64_t)
 {
-    (void)dirfd; (void)mode;
-    // AT_FDCWD or absolute path: delegate to sys_mkdir
-    return sys_mkdir(pathAddr, mode, 0, 0, 0, 0);
+    const char* path = reinterpret_cast<const char*>(pathAddr);
+    char resolved[256];
+    if (!ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
+        return sys_mkdir(pathAddr, mode, 0, 0, 0, 0);
+    return sys_mkdir(reinterpret_cast<uint64_t>(resolved), mode, 0, 0, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -5906,10 +5928,12 @@ static int64_t sys_mkdirat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
 static int64_t sys_unlinkat(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
                              uint64_t, uint64_t, uint64_t)
 {
-    (void)dirfd;
-    // TODO: handle AT_REMOVEDIR (0x200) for rmdir
-    (void)flags;
-    return sys_unlink(pathAddr, 0, 0, 0, 0, 0);
+    (void)flags; // TODO: handle AT_REMOVEDIR (0x200) for rmdir
+    const char* path = reinterpret_cast<const char*>(pathAddr);
+    char resolved[256];
+    if (!ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
+        return sys_unlink(pathAddr, 0, 0, 0, 0, 0);
+    return sys_unlink(reinterpret_cast<uint64_t>(resolved), 0, 0, 0, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -5920,8 +5944,15 @@ static int64_t sys_renameat(uint64_t olddirfd, uint64_t oldAddr,
                              uint64_t newdirfd, uint64_t newAddr,
                              uint64_t, uint64_t)
 {
-    (void)olddirfd; (void)newdirfd;
-    return sys_rename(oldAddr, newAddr, 0, 0, 0, 0);
+    const char* oldP = reinterpret_cast<const char*>(oldAddr);
+    const char* newP = reinterpret_cast<const char*>(newAddr);
+    char oldR[256], newR[256];
+    uint64_t oArg = oldAddr, nArg = newAddr;
+    if (ResolveAtPath(static_cast<int>(olddirfd), oldP, oldR, sizeof(oldR)))
+        oArg = reinterpret_cast<uint64_t>(oldR);
+    if (ResolveAtPath(static_cast<int>(newdirfd), newP, newR, sizeof(newR)))
+        nArg = reinterpret_cast<uint64_t>(newR);
+    return sys_rename(oArg, nArg, 0, 0, 0, 0);
 }
 
 static int64_t sys_renameat2(uint64_t olddirfd, uint64_t oldAddr,
