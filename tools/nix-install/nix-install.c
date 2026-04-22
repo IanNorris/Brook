@@ -188,11 +188,15 @@ static int remove_from_manifest(const char *name) {
 }
 
 /* Create symlinks from profile/bin/ to the package's bin/ directory.
- * Use RELATIVE targets (../store/<name>/bin/<file>) so that path
- * resolution works across mount boundaries: absolute targets like
- * /nix/store/... get resolved from the ext2 root, which is already
- * /nix — i.e. the 'nix' prefix would need stripping. Relative
- * targets avoid the whole problem and are what upstream Nix uses. */
+ * Use RELATIVE targets so that path resolution works across mount
+ * boundaries. The symlink lives at /nix/profile/bin/<name> and must
+ * reach /nix/store/<pkg>/bin/<name>, so we need to go up TWO levels
+ * (profile/bin -> profile -> /nix) before descending into store:
+ *   ../../store/<pkg>/bin/<name>
+ * A one-level-up target (../store/...) was wrong — it resolved to
+ * /nix/profile/store/... and the kernel's VFS correctly reported the
+ * path as non-existent, which caused execve to fall back to busybox
+ * and every installed binary to exit 127. */
 static int link_package_bins(const char *store_name) {
     char bin_dir[512];
     snprintf(bin_dir, sizeof(bin_dir), "/nix/store/%s/bin", store_name);
@@ -208,8 +212,9 @@ static int link_package_bins(const char *store_name) {
         if (ent->d_name[0] == '.') continue;
 
         char rel_target[1024], dst[1024], src_abs[1024];
-        /* Relative target: /nix/profile/bin/foo -> ../store/<name>/bin/foo */
-        snprintf(rel_target, sizeof(rel_target), "../store/%s/bin/%s",
+        /* Relative target: /nix/profile/bin/foo -> ../../store/<name>/bin/foo
+         * (two levels up: bin/ -> profile/ -> nix/, then down into store/) */
+        snprintf(rel_target, sizeof(rel_target), "../../store/%s/bin/%s",
                  store_name, ent->d_name);
         snprintf(src_abs, sizeof(src_abs), "%s/%s", bin_dir, ent->d_name);
         snprintf(dst, sizeof(dst), "%s/%s", PROFILE_BIN, ent->d_name);
