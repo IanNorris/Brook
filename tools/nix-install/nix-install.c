@@ -187,7 +187,12 @@ static int remove_from_manifest(const char *name) {
     return 0;
 }
 
-/* Create symlinks from profile/bin/ to the package's bin/ directory */
+/* Create symlinks from profile/bin/ to the package's bin/ directory.
+ * Use RELATIVE targets (../store/<name>/bin/<file>) so that path
+ * resolution works across mount boundaries: absolute targets like
+ * /nix/store/... get resolved from the ext2 root, which is already
+ * /nix — i.e. the 'nix' prefix would need stripping. Relative
+ * targets avoid the whole problem and are what upstream Nix uses. */
 static int link_package_bins(const char *store_name) {
     char bin_dir[512];
     snprintf(bin_dir, sizeof(bin_dir), "/nix/store/%s/bin", store_name);
@@ -202,15 +207,18 @@ static int link_package_bins(const char *store_name) {
     while ((ent = readdir(d)) != NULL) {
         if (ent->d_name[0] == '.') continue;
 
-        char src[1024], dst[1024];
-        snprintf(src, sizeof(src), "%s/%s", bin_dir, ent->d_name);
+        char rel_target[1024], dst[1024], src_abs[1024];
+        /* Relative target: /nix/profile/bin/foo -> ../store/<name>/bin/foo */
+        snprintf(rel_target, sizeof(rel_target), "../store/%s/bin/%s",
+                 store_name, ent->d_name);
+        snprintf(src_abs, sizeof(src_abs), "%s/%s", bin_dir, ent->d_name);
         snprintf(dst, sizeof(dst), "%s/%s", PROFILE_BIN, ent->d_name);
 
-        /* Check if it's a regular file or symlink */
+        /* Check if it's a regular file or symlink (stat the real path) */
         struct stat st;
-        if (stat(src, &st) == 0 && (S_ISREG(st.st_mode) || S_ISLNK(st.st_mode))) {
+        if (stat(src_abs, &st) == 0 && (S_ISREG(st.st_mode) || S_ISLNK(st.st_mode))) {
             unlink(dst); /* Remove existing link if any */
-            if (symlink(src, dst) == 0) {
+            if (symlink(rel_target, dst) == 0) {
                 linked++;
             }
         }
