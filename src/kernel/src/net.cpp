@@ -1416,11 +1416,20 @@ static void TcpSendSegment(Socket& s, uint8_t flags,
     if (sendResult != 0) {
         SerialPrintf("tcp: send failed flags=0x%02x err=%d\n", flags, sendResult);
     } else {
-        extern volatile uint64_t g_lapicTickCount;
-        int sockIdx = static_cast<int>(&s - g_sockets);
-        SerialPrintf("tcp: TX pid=%u sock=%d t=%lums flags=0x%02x seq=%u ack=%u datalen=%u why=%s\n",
-                     s.ownerPid, sockIdx, g_lapicTickCount, flags,
-                     s.tcpSndNxt, s.tcpRcvNxt, dataLen, why);
+        s.txPktCount++;
+        // Always log control segments (SYN/FIN/RST/PSH) and anything carrying
+        // payload. Throttle pure ACKs (flags == ACK only, datalen == 0) the
+        // same way we throttle RX: first 50, then every 100. During a bulk
+        // download we emit thousands of pure ACKs and they drown the log.
+        bool isPureAck = (flags == 0x10) && (dataLen == 0);
+        bool log = !isPureAck || s.txPktCount <= 50 || (s.txPktCount % 100) == 0;
+        if (log) {
+            extern volatile uint64_t g_lapicTickCount;
+            int sockIdx = static_cast<int>(&s - g_sockets);
+            SerialPrintf("tcp: TX pid=%u sock=%d t=%lums flags=0x%02x seq=%u ack=%u datalen=%u why=%s [pkt#%u]\n",
+                         s.ownerPid, sockIdx, g_lapicTickCount, flags,
+                         s.tcpSndNxt, s.tcpRcvNxt, dataLen, why, s.txPktCount);
+        }
     }
 }
 

@@ -1253,7 +1253,12 @@ static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
 
     // File not found — create if requested
     if (!ino && (flags & VFS_O_CREATE)) {
-        SerialPrintf("ext2: CREATE file '%s'\n", relPath);
+        // Throttled: first 20 then every 100. NAR unpack creates thousands of
+        // files; logging every one is pure noise.
+        static uint32_t s_createCount = 0;
+        s_createCount++;
+        if (s_createCount <= 20 || (s_createCount % 100) == 0)
+            SerialPrintf("ext2: CREATE file '%s' [#%u]\n", relPath, s_createCount);
         char name[256];
         uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name));
         if (!parentIno || !name[0]) { KMutexUnlock(&g_ext2Lock); return nullptr; }

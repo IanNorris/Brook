@@ -284,6 +284,7 @@ struct Socket {
 
     // Diagnostic counters (not reset on reuse — per-socket lifetime)
     uint32_t rxPktCount;   // total TCP segments received on this socket
+    uint32_t txPktCount;   // total TCP segments transmitted on this socket
     uint32_t oooDropCount; // TCP segments dropped for being out-of-order
     uint64_t lastStaleAckTick; // last tick we dup-ACKed a stale/duplicate segment
 
