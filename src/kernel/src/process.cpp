@@ -739,6 +739,16 @@ void ProcessDestroy(Process* proc)
     // Remove from scheduler tracking
     SchedulerRemoveProcess(proc);
 
+    // Clear signal handler slot so the PID can be safely reused without
+    // the next process inheriting our handler pointers (which would
+    // reference user memory no longer mapped and cause a #PF on signal).
+    for (int s = 0; s < 64; ++s) {
+        g_sigHandlers[proc->pid][s].handler = 0;
+        g_sigHandlers[proc->pid][s].flags = 0;
+        g_sigHandlers[proc->pid][s].restorer = 0;
+        g_sigHandlers[proc->pid][s].mask = 0;
+    }
+
     kfree(proc);
 }
 
@@ -1008,6 +1018,14 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->ttyEcho = parent->ttyEcho;
     child->straceEnabled = parent->straceEnabled;
 
+    // Inherit parent's signal handlers (POSIX fork semantics). The
+    // g_sigHandlers table is indexed by pid, so we must explicitly copy;
+    // otherwise the child's slot contains stale handler pointers from
+    // whatever previous process had the same pid — a deterministic #PF
+    // waiting for the first signal delivery (e.g. SIGCHLD on waitpid).
+    for (int s = 0; s < 64; ++s)
+        g_sigHandlers[child->pid][s] = g_sigHandlers[parent->pid][s];
+
     // Set child's name
     {
         const char* suffix = "_child";
@@ -1123,6 +1141,13 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     thread->sigPending = 0;
     thread->inSignalHandler = false;
     thread->sigReturnPending = false;
+
+    // Threads get a unique pid (TID) but share the process group's signal
+    // handlers. The g_sigHandlers table is per-pid, so copy the parent's
+    // slot into the thread's slot. Without this the thread's slot contains
+    // whatever stale data was left by a previous process with the same pid.
+    for (int s = 0; s < 64; ++s)
+        g_sigHandlers[thread->pid][s] = g_sigHandlers[parent->pid][s];
 
     // Set thread name
     {
@@ -1300,6 +1325,24 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     //    process image is replaced.  Skipping this leaks inherited sockets and
     //    pipes into the new program's address space.
     ProcessCloseCloexecFds(proc);
+
+    // 9. Reset signal handlers per POSIX execve semantics: handlers set to
+    //    a user function must be reset to SIG_DFL (0) because the new image
+    //    has no such function at that address. SIG_IGN (1) is preserved.
+    //    Without this, inherited handler pointers (from the pre-exec image,
+    //    or worse — stale pointers from a previous process that had the
+    //    same PID if we never cleared on destroy) would redirect signal
+    //    delivery to unmapped memory, causing a #PF in the new program on
+    //    its first signal (e.g. SIGCHLD from a child exiting).
+    for (int s = 0; s < 64; ++s) {
+        auto& sa = g_sigHandlers[proc->pid][s];
+        if (sa.handler != 1 /* SIG_IGN */) {
+            sa.handler = 0;
+            sa.flags = 0;
+            sa.restorer = 0;
+            sa.mask = 0;
+        }
+    }
 
     *outStackPtr = userSP;
     // If dynamically linked, start at the interpreter's entry point;
