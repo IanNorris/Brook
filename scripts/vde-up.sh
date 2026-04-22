@@ -15,12 +15,12 @@ SWITCH_PID=/tmp/vde-brook.switch.pid
 
 case "${1:-up}" in
     up)
-        if [ -S "${CTL}" ] && [ -f "${SWITCH_PID}" ] \
+        if [ -e "${CTL}" ] && [ -f "${SWITCH_PID}" ] \
                && kill -0 "$(cat "${SWITCH_PID}")" 2>/dev/null; then
             echo "VDE switch already running (pid $(cat ${SWITCH_PID}))"
             exit 0
         fi
-        rm -f "${CTL}" "${MGMT}" "${SWITCH_PID}"
+        rm -rf "${CTL}" "${MGMT}" "${SWITCH_PID}"
         echo "Starting vde_switch at ${CTL}..."
         vde_switch -sock "${CTL}" -mgmt "${MGMT}" -mgmtmode 0600 \
                    -daemon -pidfile "${SWITCH_PID}"
@@ -35,7 +35,7 @@ case "${1:-up}" in
             fi
             rm -f "${SWITCH_PID}"
         fi
-        rm -f "${CTL}" "${MGMT}"
+        rm -rf "${CTL}" "${MGMT}"
         echo "VDE down."
         ;;
     status)
