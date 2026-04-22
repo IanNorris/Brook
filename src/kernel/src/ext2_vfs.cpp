@@ -1361,7 +1361,7 @@ static int Ext2FsStatPath(void* mountPriv, uint8_t pdrv,
     }
 
     if (!ino) {
-        SerialPrintf("ext2: stat '%s' → not found\n", relPath);
+        DbgPrintf("ext2: stat '%s' → not found\n", relPath);
         KMutexUnlock(&g_ext2Lock);
         return -1;
     }
@@ -1474,7 +1474,7 @@ static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath)
     (void)pdrv;
     auto* mnt = static_cast<Ext2Mount*>(mountPriv);
 
-    SerialPrintf("ext2: MKDIR '%s'\n", relPath);
+    DbgPrintf("ext2: MKDIR '%s'\n", relPath);
 
     KMutexLock(&g_ext2Lock);
 

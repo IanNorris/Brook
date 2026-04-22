@@ -221,7 +221,7 @@ static uint64_t LoadInterpreter(Process* proc)
 {
     if (proc->elf.interpPath[0] == '\0') return 0;
 
-    SerialPrintf("INTERP: loading '%s' for pid %u\n",
+    DbgPrintf("INTERP: loading '%s' for pid %u\n",
                  proc->elf.interpPath, proc->pid);
 
     // Try the exact path first.
@@ -758,7 +758,7 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
     auto* srcPml4 = reinterpret_cast<uint64_t*>(
         PhysToVirt(srcPt.pml4).raw());
 
-    uint64_t sharedCount = 0;
+    [[maybe_unused]] uint64_t sharedCount = 0;
 
     // Only copy user-half (PML4 entries 0..255)
     for (uint64_t i4 = 0; i4 < 256; i4++)
@@ -863,7 +863,7 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
     // Full TLB flush by reloading CR3
     asm volatile("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
 
-    SerialPrintf("FORK: COW shared %lu pages (parent PID %u -> child PID %u)\n",
+    DbgPrintf("FORK: COW shared %lu pages (parent PID %u -> child PID %u)\n",
                  sharedCount, static_cast<uint32_t>(srcPid), static_cast<uint32_t>(dstPid));
     return true;
 }
@@ -1019,7 +1019,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
         child->name[31] = '\0';
     }
 
-    SerialPrintf("FORK: parent pid=%u -> child pid=%u '%s', rip=0x%lx rsp=0x%lx\n",
+    DbgPrintf("FORK: parent pid=%u -> child pid=%u '%s', rip=0x%lx rsp=0x%lx\n",
                  parent->pid, child->pid, child->name, userRip, userRsp);
 
     return child;
@@ -1135,7 +1135,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
         thread->name[31] = '\0';
     }
 
-    SerialPrintf("THREAD: parent pid=%u -> thread tid=%u tgid=%u, rip=0x%lx rsp=0x%lx tls=0x%lx\n",
+    DbgPrintf("THREAD: parent pid=%u -> thread tid=%u tgid=%u, rip=0x%lx rsp=0x%lx tls=0x%lx\n",
                  parent->pid, thread->pid, thread->tgid, userRip, userRsp, tlsBase);
 
     return thread;

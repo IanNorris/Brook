@@ -865,9 +865,15 @@ void SchedulerYield()
 {
     uint32_t cpu = ThisCpu();
     Process* proc = g_perCpu[cpu].currentProcess;
-    SerialPrintf("SCHED: '%s' (pid %u, tgid %u) exited with status %d%s\n",
-                 proc->name, proc->pid, proc->tgid, status,
-                 proc->isThread ? " [thread]" : "");
+    if (status != 0) {
+        SerialPrintf("SCHED: '%s' (pid %u, tgid %u) exited with status %d%s\n",
+                     proc->name, proc->pid, proc->tgid, status,
+                     proc->isThread ? " [thread]" : "");
+    } else {
+        DbgPrintf("SCHED: '%s' (pid %u, tgid %u) exited with status %d%s\n",
+                  proc->name, proc->pid, proc->tgid, status,
+                  proc->isThread ? " [thread]" : "");
+    }
 
     // Thread exit: clear_child_tid + futex_wake for pthread_join
     if (proc->clearChildTid)

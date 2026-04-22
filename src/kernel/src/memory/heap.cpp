@@ -200,7 +200,7 @@ static bool ExpandHeap(uint64_t minBytes = 0)
     g_heapEnd   += extra;
     g_freeBytes += extra;
 
-    SerialPrintf("Heap: expanded by %u KB (total %lu KB)\n",
+    DbgPrintf("Heap: expanded by %u KB (total %lu KB)\n",
                  extra / 1024,
                  (unsigned long)(g_heapEnd - g_heapStart) / 1024);
     return true;

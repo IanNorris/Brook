@@ -809,7 +809,7 @@ static void CompositorHandleMouseWM()
 
     if (btnDown && !g_wmLastBtnDown)
     {
-        SerialPrintf("WM: click at (%d,%d)\n", mx, my);
+        DbgPrintf("WM: click at (%d,%d)\n", mx, my);
         // If launcher is open, check launcher panel first
         if (WmLauncherVisible())
         {

@@ -2046,11 +2046,11 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 
         // Log large mmap allocations for debugging
         if (pages >= 32) {
-            PhysicalAddress firstPhys = VmmVirtToPhys(proc->pageTable,
+            [[maybe_unused]] PhysicalAddress firstPhys = VmmVirtToPhys(proc->pageTable,
                                                        VirtualAddress(vaddr));
-            PhysicalAddress lastPhys = VmmVirtToPhys(proc->pageTable,
+            [[maybe_unused]] PhysicalAddress lastPhys = VmmVirtToPhys(proc->pageTable,
                                                       VirtualAddress(vaddr + (pages-1) * 4096));
-            SerialPrintf("mmap: pid=%u virt=0x%lx pages=%lu firstPhys=0x%lx lastPhys=0x%lx\n",
+            DbgPrintf("mmap: pid=%u virt=0x%lx pages=%lu firstPhys=0x%lx lastPhys=0x%lx\n",
                          proc->pid, vaddr, pages,
                          firstPhys.raw() & ~0xFFFULL,
                          lastPhys.raw() & ~0xFFFULL);
@@ -2350,8 +2350,13 @@ static int64_t sys_exit_group(uint64_t status, uint64_t, uint64_t,
                                uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
-    SerialPrintf("sys_exit_group: tgid %u exiting with status %lu\n",
-                 proc ? proc->tgid : 0, status);
+    if (status != 0) {
+        SerialPrintf("sys_exit_group: tgid %u exiting with status %lu\n",
+                     proc ? proc->tgid : 0, status);
+    } else {
+        DbgPrintf("sys_exit_group: tgid %u exiting with status %lu\n",
+                  proc ? proc->tgid : 0, status);
+    }
 
     // Kill all other threads in this thread group so they don't linger
     // and cause use-after-free on shared resources after the leader exits.
@@ -2618,7 +2623,7 @@ static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAd
 
     SchedulerAddProcess(child);
 
-    SerialPrintf("CLONE: parent pid=%u -> child pid=%u flags=0x%lx rip=0x%lx rsp=0x%lx\n",
+    DbgPrintf("CLONE: parent pid=%u -> child pid=%u flags=0x%lx rip=0x%lx rsp=0x%lx\n",
                  parent->pid, child->pid, flags, userRip, userRsp);
     return static_cast<int64_t>(child->pid);
 }
@@ -2986,7 +2991,7 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
         return -ENOEXEC;
     }
 
-    SerialPrintf("sys_execve: loaded '%s' (%lu bytes) for pid %u\n",
+    DbgPrintf("sys_execve: loaded '%s' (%lu bytes) for pid %u\n",
               lookupPath, elfSize, proc->pid);
 
     // --- Shebang (#!) support ---
@@ -5076,7 +5081,7 @@ static int64_t sys_eventfd2(uint64_t initval, uint64_t flagsVal, uint64_t,
     if (flagsVal & EFD_NONBLOCK)
         proc->fds[fd].statusFlags = 0x800; // O_NONBLOCK
 
-    SerialPrintf("sys_eventfd2: fd=%d initval=%lu flags=0x%lx\n", fd, initval, flagsVal);
+    DbgPrintf("sys_eventfd2: fd=%d initval=%lu flags=0x%lx\n", fd, initval, flagsVal);
     return fd;
 }
 
@@ -6964,7 +6969,7 @@ static int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
     Process* proc = ProcessCurrent();
     if (!proc) return -ENOSYS;
 
-    SerialPrintf("sys_socket: domain=%lu type=%lu proto=%lu\n", domain, type, protocol);
+    DbgPrintf("sys_socket: domain=%lu type=%lu proto=%lu\n", domain, type, protocol);
 
     if (domain == AF_UNIX) {
         auto* usd = static_cast<UnixSocketData*>(kmalloc(sizeof(UnixSocketData)));
@@ -6977,7 +6982,7 @@ static int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
         int fd = FdAlloc(proc, FdType::UnixSocket, usd);
         if (fd < 0) { kfree(usd); return -EMFILE; }
         if (type & UNIX_SOCK_CLOEXEC) proc->fds[fd].fdFlags |= 1;
-        SerialPrintf("sys_socket: AF_UNIX fd=%d\n", fd);
+        DbgPrintf("sys_socket: AF_UNIX fd=%d\n", fd);
         return fd;
     }
 
@@ -6995,7 +7000,7 @@ static int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
         SockClose(sockIdx);
         return -EMFILE;
     }
-    SerialPrintf("sys_socket: fd=%d sockIdx=%d\n", fd, sockIdx);
+    DbgPrintf("sys_socket: fd=%d sockIdx=%d\n", fd, sockIdx);
     return fd;
 }
 
@@ -7059,7 +7064,7 @@ static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
         char path[108] = {};
         for (int i = 0; i < 107 && ua->sun_path[i]; i++) path[i] = ua->sun_path[i];
 
-        SerialPrintf("sys_connect: AF_UNIX fd=%d path='%s'\n", fd, path);
+        DbgPrintf("sys_connect: AF_UNIX fd=%d path='%s'\n", fd, path);
 
         // Find the listening server
         UnixSocketData* server = UnixFindServer(path);
@@ -7132,7 +7137,7 @@ static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
     auto* uaddr = reinterpret_cast<const brook::SockAddrIn*>(addrVal);
     if (!uaddr) return -EFAULT;
 
-    SerialPrintf("sys_connect: fd=%d sockIdx=%d type=%d addr=%u.%u.%u.%u:%u\n",
+    DbgPrintf("sys_connect: fd=%d sockIdx=%d type=%d addr=%u.%u.%u.%u:%u\n",
                  fd, sockIdx, brook::SockGetType(sockIdx),
                  (brook::ntohl(uaddr->sin_addr) >> 24) & 0xFF,
                  (brook::ntohl(uaddr->sin_addr) >> 16) & 0xFF,

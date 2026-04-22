@@ -196,7 +196,7 @@ bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
                 while (pathLen > 0 && out->interpPath[pathLen - 1] == '\0')
                     --pathLen;
 
-                SerialPrintf("ELF:   PT_INTERP '%s'\n", out->interpPath);
+                DbgPrintf("ELF:   PT_INTERP '%s'\n", out->interpPath);
             }
         }
     }
@@ -317,13 +317,13 @@ uint64_t ElfLoadAt(const uint8_t* data, uint64_t size,
             *dst = src[b];
         }
 
-        SerialPrintf("ELF interp:   PT_LOAD 0x%lx-0x%lx (%lu bytes)\n",
+        DbgPrintf("ELF interp:   PT_LOAD 0x%lx-0x%lx (%lu bytes)\n",
                      phdr.p_vaddr + slide, phdr.p_vaddr + slide + phdr.p_memsz,
                      phdr.p_filesz);
     }
 
     uint64_t entry = ehdr->e_entry + slide;
-    SerialPrintf("ELF interp: loaded at base=0x%lx entry=0x%lx\n", base, entry);
+    DbgPrintf("ELF interp: loaded at base=0x%lx entry=0x%lx\n", base, entry);
 
     // Memory fence: ensure all PTE writes are visible to other CPUs before
     // the scheduler moves this process to an AP core.
