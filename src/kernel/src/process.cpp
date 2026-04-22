@@ -1381,7 +1381,7 @@ int ProcessSendSignal(Process* proc, int signum)
     {
         // Immediately stop (cannot be caught/blocked)
         proc->state = ProcessState::Stopped;
-        DbgPrintf("SIGNAL: SIGSTOP -> pid %u stopped\n", proc->pid);
+        DbgPrintf("SIGNAL: SIGSTOP -> pid %u stopped (default)\n", proc->pid);
         return 0;
     }
 
@@ -1416,6 +1416,25 @@ int ProcessSendSignal(Process* proc, int signum)
             Process* parent = ProcessFindByPid(proc->parentPid);
             if (parent)
                 ProcessSendSignal(parent, 17); // SIGCHLD
+            return 0;
+        }
+    }
+
+    // Drop signals whose current disposition is "ignore".  Without this the
+    // bit sits in sigPending forever and HasPendingSignals() returns true,
+    // causing every blocking syscall to return -EINTR — which for line-reads
+    // in the shell looks like EOF and silently kills bash on e.g. SIGWINCH.
+    //
+    // Signals that are ignored:
+    //   - explicit SIG_IGN
+    //   - SIG_DFL where the POSIX default is "ignore": SIGCHLD (17),
+    //     SIGURG (23), SIGWINCH (28)
+    {
+        KernelSigaction& sa = g_sigHandlers[proc->pid][signum - 1];
+        bool defaultIsIgnore = (signum == 17 || signum == 23 || signum == 28);
+        if (sa.handler == 1 ||
+            (sa.handler == 0 && defaultIsIgnore))
+        {
             return 0;
         }
     }
