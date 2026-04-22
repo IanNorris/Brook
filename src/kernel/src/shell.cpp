@@ -258,6 +258,54 @@ static bool ResolveBinaryPath(const char* name, char* outPath, uint32_t maxLen)
 }
 
 // ---------------------------------------------------------------------------
+// Shebang resolution — peek first bytes of a file; if "#!interp [arg]\n",
+// copy interpreter and optional argument into caller buffers. Returns true
+// if a shebang was present and parsed.
+// ---------------------------------------------------------------------------
+
+static bool PeekShebang(const char* path, char* outInterp, uint32_t interpSize,
+                        char* outArg, uint32_t argSize)
+{
+    Vnode* vn = VfsOpen(path, 0);
+    if (!vn) return false;
+
+    char header[256] = {};
+    uint64_t offset = 0;
+    int n = VfsRead(vn, reinterpret_cast<uint8_t*>(header), sizeof(header) - 1, &offset);
+    VfsClose(vn);
+    if (n < 4 || header[0] != '#' || header[1] != '!') return false;
+
+    // Skip leading whitespace after "#!"
+    int i = 2;
+    while (i < n && (header[i] == ' ' || header[i] == '\t')) ++i;
+
+    // Interpreter path runs until whitespace or newline
+    uint32_t j = 0;
+    while (i < n && header[i] != ' ' && header[i] != '\t'
+           && header[i] != '\n' && header[i] != '\r'
+           && j + 1 < interpSize)
+    {
+        outInterp[j++] = header[i++];
+    }
+    outInterp[j] = '\0';
+    if (j == 0) return false;
+
+    // Optional single argument — everything up to newline (preserving spaces).
+    // Traditional Unix: only ONE argument allowed; remaining text is one string.
+    outArg[0] = '\0';
+    while (i < n && (header[i] == ' ' || header[i] == '\t')) ++i;
+    uint32_t k = 0;
+    while (i < n && header[i] != '\n' && header[i] != '\r' && k + 1 < argSize)
+    {
+        outArg[k++] = header[i++];
+    }
+    // Strip trailing whitespace
+    while (k > 0 && (outArg[k-1] == ' ' || outArg[k-1] == '\t')) --k;
+    outArg[k] = '\0';
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Spawn a process from a binary path with arguments
 // ---------------------------------------------------------------------------
 
@@ -730,19 +778,63 @@ static int ExecCommand(int argc, const char* const* argv)
             return -1;
         }
 
+        // Build the effective argv starting from the user's args.
+        const char* effArgv[32];
+        int effArgc = argc - pathIdx;
+        if (effArgc > 32) effArgc = 32;
+        for (int i = 0; i < effArgc; ++i) effArgv[i] = argv[pathIdx + i];
+        effArgv[0] = resolved;
+
+        // Shebang unwinding: up to 4 levels of script-invoking-script.
+        static char shebangPath[128];
+        static char interpStore[4][128];
+        static char interpArgStore[4][128];
+        StrCopy(shebangPath, resolved, sizeof(shebangPath));
+
+        for (int depth = 0; depth < 4; ++depth)
+        {
+            char interp[128];
+            char interpArg[128];
+            if (!PeekShebang(shebangPath, interp, sizeof(interp),
+                             interpArg, sizeof(interpArg)))
+                break;
+
+            if (!ResolveBinaryPath(interp, interpStore[depth],
+                                   sizeof(interpStore[depth])))
+            {
+                KPrintf("shell: interpreter '%s' not found (for %s)\n",
+                        interp, shebangPath);
+                return -1;
+            }
+            StrCopy(interpArgStore[depth], interpArg,
+                    sizeof(interpArgStore[depth]));
+
+            const char* nArgv[32];
+            int nArgc = 0;
+            nArgv[nArgc++] = interpStore[depth];
+            if (interpArgStore[depth][0] && nArgc < 31)
+                nArgv[nArgc++] = interpArgStore[depth];
+            if (nArgc < 31) nArgv[nArgc++] = shebangPath;
+            for (int i = 1; i < effArgc && nArgc < 31; ++i)
+                nArgv[nArgc++] = effArgv[i];
+
+            for (int i = 0; i < nArgc; ++i) effArgv[i] = nArgv[i];
+            effArgc = nArgc;
+            StrCopy(shebangPath, interpStore[depth], sizeof(shebangPath));
+        }
+
         Process* proc = nullptr;
         if (argv0Override)
         {
-            const int newArgc = argc - pathIdx;
             const char* newArgv[32];
             newArgv[0] = argv0Override;
-            for (int i = 1; i < newArgc && i < 31; ++i)
-                newArgv[i] = argv[pathIdx + i];
-            proc = SpawnProcess(resolved, newArgc, newArgv);
+            for (int i = 1; i < effArgc && i < 31; ++i)
+                newArgv[i] = effArgv[i];
+            proc = SpawnProcess(shebangPath, effArgc, newArgv);
         }
         else
         {
-            proc = SpawnProcess(resolved, argc - pathIdx, argv + pathIdx);
+            proc = SpawnProcess(shebangPath, effArgc, effArgv);
         }
 
         if (proc && strace) {
