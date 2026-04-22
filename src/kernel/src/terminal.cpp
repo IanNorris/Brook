@@ -33,12 +33,165 @@ enum class AnsiState : uint8_t
 };
 
 // ---------------------------------------------------------------------------
+// Cell grid helpers (scrollback + logical state)
+// ---------------------------------------------------------------------------
+
+static void CellFillBlank(Terminal* t, TermCell* row, uint32_t count)
+{
+    for (uint32_t i = 0; i < count; i++)
+    {
+        row[i].ch   = 0;
+        row[i].attr = 0;
+        row[i].pad  = 0;
+        row[i].fg   = t->fgColor;
+        row[i].bg   = t->bgColor;
+    }
+}
+
+// Push the current top cell row into the scrollback ring and shift
+// the remaining rows up by one.  Clears the new bottom row.
+static void CellShiftUp(Terminal* t)
+{
+    if (!t->cells || t->rows == 0 || t->cols == 0) return;
+
+    // Only archive to scrollback when on the main screen.  Alt-screen
+    // applications (vi, less, htop) own the viewport; we shouldn't
+    // capture their redraws as scrollback noise.
+    if (t->scrollback && !t->inAltScreen && t->scrollbackRows > 0)
+    {
+        TermCell* dst = t->scrollback + (t->scrollbackHead * t->cols);
+        for (uint32_t i = 0; i < t->cols; i++) dst[i] = t->cells[i];
+        t->scrollbackHead = (t->scrollbackHead + 1) % t->scrollbackRows;
+        if (t->scrollbackUsed < t->scrollbackRows) t->scrollbackUsed++;
+    }
+
+    for (uint32_t y = 0; y + 1 < t->rows; y++)
+    {
+        for (uint32_t x = 0; x < t->cols; x++)
+            t->cells[y * t->cols + x] = t->cells[(y + 1) * t->cols + x];
+    }
+    CellFillBlank(t, t->cells + (t->rows - 1) * t->cols, t->cols);
+}
+
+// Record a printable character into the live cell grid at the cursor.
+static void CellPut(Terminal* t, char ch)
+{
+    if (!t->cells || t->curX >= t->cols || t->curY >= t->rows) return;
+    TermCell& c = t->cells[t->curY * t->cols + t->curX];
+    c.ch   = ch;
+    c.attr = 0;
+    c.fg   = t->fgColor;
+    c.bg   = t->bgColor;
+}
+
+// Blit a single cell (char + fg/bg) at logical row/col into the VFB.
+// Used only by scrollback redraw — live rendering still goes through
+// the existing TermRenderGlyph fast path.
+static void CellRender(Terminal* t, uint32_t row, uint32_t col,
+                       const TermCell& c)
+{
+    if (!t->vfb || !g_fontAtlas.pixels) return;
+    const auto advance = g_fontAtlas.glyphs[0].advance;
+    int pixX = static_cast<int>(col) * advance;
+    int pixY = static_cast<int>(row) * g_fontAtlas.lineHeight;
+
+    // Fill cell background.
+    for (int cy = 0; cy < g_fontAtlas.lineHeight; cy++)
+    {
+        int dy = pixY + cy;
+        if (dy < 0 || dy >= static_cast<int>(t->vfbH)) continue;
+        for (int cx = 0; cx < advance; cx++)
+        {
+            int dx = pixX + cx;
+            if (dx < 0 || dx >= static_cast<int>(t->vfbW)) continue;
+            t->vfb[dy * t->vfbW + dx] = c.bg;
+        }
+    }
+
+    if (c.ch < 32 || c.ch > 126) return;
+
+    const auto& gi = g_fontAtlas.glyphs[c.ch - 32];
+    int glyphW = gi.atlasX1 - gi.atlasX0;
+    int glyphH = gi.atlasY1 - gi.atlasY0;
+    int baseY  = pixY + g_fontAtlas.ascent;
+    int drawX  = pixX + gi.bearingX;
+    int drawY  = baseY - gi.bearingY;
+
+    for (int gy = 0; gy < glyphH; gy++)
+    {
+        int dy = drawY + gy;
+        if (dy < 0 || dy >= static_cast<int>(t->vfbH)) continue;
+        for (int gx = 0; gx < glyphW; gx++)
+        {
+            int dx = drawX + gx;
+            if (dx < 0 || dx >= static_cast<int>(t->vfbW)) continue;
+            uint8_t alpha = g_fontAtlas.pixels[
+                (gi.atlasY0 + gy) * g_fontAtlas.atlasWidth + gi.atlasX0 + gx];
+            if (alpha == 0) continue;
+            uint32_t fg = c.fg;
+            if (alpha == 255)
+                t->vfb[dy * t->vfbW + dx] = fg;
+            else
+            {
+                uint32_t bg = t->vfb[dy * t->vfbW + dx];
+                uint32_t rr = ((fg >> 16) & 0xFF) * alpha + ((bg >> 16) & 0xFF) * (255 - alpha);
+                uint32_t gg = ((fg >>  8) & 0xFF) * alpha + ((bg >>  8) & 0xFF) * (255 - alpha);
+                uint32_t bb = ((fg      ) & 0xFF) * alpha + ((bg      ) & 0xFF) * (255 - alpha);
+                t->vfb[dy * t->vfbW + dx] = ((rr / 255) << 16) | ((gg / 255) << 8) | (bb / 255);
+            }
+        }
+    }
+}
+
+// Redraw the entire VFB from the cell grid + scrollback according to
+// the current viewOffset.  Called after wheel events and when returning
+// to the live viewport after having scrolled back.
+static void CellRedrawAll(Terminal* t)
+{
+    if (!t->vfb || !t->cells) return;
+
+    // Clear VFB to background.
+    for (uint32_t i = 0; i < t->vfbW * t->vfbH; i++)
+        t->vfb[i] = t->bgColor;
+
+    uint32_t off = t->viewOffset;
+    if (off > t->scrollbackUsed) off = t->scrollbackUsed;
+
+    for (uint32_t r = 0; r < t->rows; r++)
+    {
+        if (r < off)
+        {
+            // Scrollback rows fill the top.  The on-screen row r shows the
+            // scrollback row at index (scrollbackUsed - off + r).
+            uint32_t sbIdx = t->scrollbackUsed - off + r;
+            uint32_t ringIdx = (t->scrollbackHead + t->scrollbackRows
+                              - t->scrollbackUsed + sbIdx) % t->scrollbackRows;
+            const TermCell* sbRow = t->scrollback + ringIdx * t->cols;
+            for (uint32_t c = 0; c < t->cols; c++)
+                CellRender(t, r, c, sbRow[c]);
+        }
+        else
+        {
+            uint32_t liveRow = r - off;
+            const TermCell* row = t->cells + liveRow * t->cols;
+            for (uint32_t c = 0; c < t->cols; c++)
+                CellRender(t, r, c, row[c]);
+        }
+    }
+    t->dirty = true;
+}
+
+// ---------------------------------------------------------------------------
 // Glyph rendering into the terminal VFB
 // ---------------------------------------------------------------------------
 
 static void TermRenderGlyph(Terminal* t, char ch)
 {
     if (!t->vfb || !g_fontAtlas.pixels) return;
+    // While the user is viewing scrollback, we mustn't clobber the VFB
+    // with live output — but we must still update the logical cell grid
+    // so that snapping back to live shows the new content.
+    const bool frozen = (t->viewOffset != 0);
 
     // Handle control characters
     if (ch == '\n')
@@ -47,17 +200,19 @@ static void TermRenderGlyph(Terminal* t, char ch)
         t->curY++;
         if (t->curY >= t->rows)
         {
-            // Scroll up one line
-            uint32_t lineH = static_cast<uint32_t>(g_fontAtlas.lineHeight);
-            uint32_t scrollBytes = t->vfbW * (t->vfbH - lineH);
-            auto* dst = reinterpret_cast<uint8_t*>(t->vfb);
-            auto* src = dst + t->vfbW * lineH * 4;
-            for (uint32_t i = 0; i < scrollBytes * 4; i++)
-                dst[i] = src[i];
-            // Clear last line
-            uint32_t clearStart = t->vfbW * (t->vfbH - lineH);
-            for (uint32_t i = clearStart; i < t->vfbW * t->vfbH; i++)
-                t->vfb[i] = t->bgColor;
+            CellShiftUp(t);
+            if (!frozen)
+            {
+                uint32_t lineH = static_cast<uint32_t>(g_fontAtlas.lineHeight);
+                uint32_t scrollBytes = t->vfbW * (t->vfbH - lineH);
+                auto* dst = reinterpret_cast<uint8_t*>(t->vfb);
+                auto* src = dst + t->vfbW * lineH * 4;
+                for (uint32_t i = 0; i < scrollBytes * 4; i++)
+                    dst[i] = src[i];
+                uint32_t clearStart = t->vfbW * (t->vfbH - lineH);
+                for (uint32_t i = clearStart; i < t->vfbW * t->vfbH; i++)
+                    t->vfb[i] = t->bgColor;
+            }
             t->curY = t->rows - 1;
         }
         t->dirty = true;
@@ -83,6 +238,11 @@ static void TermRenderGlyph(Terminal* t, char ch)
     // Printable character — render glyph
     if (ch < 32 || ch > 126) return;
 
+    // Update logical cell grid (authoritative for scrollback redraw).
+    CellPut(t, ch);
+
+    if (!frozen)
+    {
     const auto& gi = g_fontAtlas.glyphs[ch - 32];
     int glyphW = gi.atlasX1 - gi.atlasX0;
     int glyphH = gi.atlasY1 - gi.atlasY0;
@@ -136,6 +296,7 @@ static void TermRenderGlyph(Terminal* t, char ch)
             }
         }
     }
+    } // end !frozen
 
     t->curX++;
     if (t->curX >= t->cols)
@@ -144,16 +305,19 @@ static void TermRenderGlyph(Terminal* t, char ch)
         t->curY++;
         if (t->curY >= t->rows)
         {
-            // Scroll (same as \n)
-            uint32_t lineH = static_cast<uint32_t>(g_fontAtlas.lineHeight);
-            uint32_t scrollBytes = t->vfbW * (t->vfbH - lineH);
-            auto* dst = reinterpret_cast<uint8_t*>(t->vfb);
-            auto* src = dst + t->vfbW * lineH * 4;
-            for (uint32_t i = 0; i < scrollBytes * 4; i++)
-                dst[i] = src[i];
-            uint32_t clearStart = t->vfbW * (t->vfbH - lineH);
-            for (uint32_t i = clearStart; i < t->vfbW * t->vfbH; i++)
-                t->vfb[i] = t->bgColor;
+            CellShiftUp(t);
+            if (!frozen)
+            {
+                uint32_t lineH = static_cast<uint32_t>(g_fontAtlas.lineHeight);
+                uint32_t scrollBytes = t->vfbW * (t->vfbH - lineH);
+                auto* dst = reinterpret_cast<uint8_t*>(t->vfb);
+                auto* src = dst + t->vfbW * lineH * 4;
+                for (uint32_t i = 0; i < scrollBytes * 4; i++)
+                    dst[i] = src[i];
+                uint32_t clearStart = t->vfbW * (t->vfbH - lineH);
+                for (uint32_t i = clearStart; i < t->vfbW * t->vfbH; i++)
+                    t->vfb[i] = t->bgColor;
+            }
             t->curY = t->rows - 1;
         }
     }
@@ -218,6 +382,14 @@ static void TermHandleCSI(Terminal* t, const char* params, int paramLen, char fi
             uint32_t startRow = (pixY + lineH < t->vfbH) ? pixY + lineH : t->vfbH;
             for (uint32_t i = startRow * t->vfbW; i < t->vfbW * t->vfbH; i++)
                 t->vfb[i] = t->bgColor;
+            // Mirror to cells.
+            if (t->cells)
+            {
+                for (uint32_t x = t->curX; x < t->cols; x++)
+                    CellFillBlank(t, &t->cells[t->curY * t->cols + x], 1);
+                for (uint32_t y = t->curY + 1; y < t->rows; y++)
+                    CellFillBlank(t, &t->cells[y * t->cols], t->cols);
+            }
             t->dirty = true;
         }
         else if (mode == 1)
@@ -232,6 +404,13 @@ static void TermHandleCSI(Terminal* t, const char* params, int paramLen, char fi
             for (uint32_t y = pixY; y < pixY + lineH && y < t->vfbH; y++)
                 for (uint32_t x = 0; x <= pixX && x < t->vfbW; x++)
                     t->vfb[y * t->vfbW + x] = t->bgColor;
+            if (t->cells)
+            {
+                for (uint32_t y = 0; y < t->curY; y++)
+                    CellFillBlank(t, &t->cells[y * t->cols], t->cols);
+                for (uint32_t x = 0; x <= t->curX && x < t->cols; x++)
+                    CellFillBlank(t, &t->cells[t->curY * t->cols + x], 1);
+            }
             t->dirty = true;
         }
         else if (mode == 2 || mode == 3)
@@ -239,6 +418,8 @@ static void TermHandleCSI(Terminal* t, const char* params, int paramLen, char fi
             // Clear entire screen
             for (uint32_t i = 0; i < t->vfbW * t->vfbH; i++)
                 t->vfb[i] = t->bgColor;
+            if (t->cells)
+                CellFillBlank(t, t->cells, t->cols * t->rows);
             t->curX = 0;
             t->curY = 0;
             t->dirty = true;
@@ -256,18 +437,26 @@ static void TermHandleCSI(Terminal* t, const char* params, int paramLen, char fi
             for (uint32_t y = pixY; y < pixY + lineH && y < t->vfbH; y++)
                 for (uint32_t x = pixX; x < t->vfbW; x++)
                     t->vfb[y * t->vfbW + x] = t->bgColor;
+            if (t->cells)
+                for (uint32_t x = t->curX; x < t->cols; x++)
+                    CellFillBlank(t, &t->cells[t->curY * t->cols + x], 1);
         }
         else if (mode == 1) // clear from start to cursor
         {
             for (uint32_t y = pixY; y < pixY + lineH && y < t->vfbH; y++)
                 for (uint32_t x = 0; x <= pixX && x < t->vfbW; x++)
                     t->vfb[y * t->vfbW + x] = t->bgColor;
+            if (t->cells)
+                for (uint32_t x = 0; x <= t->curX && x < t->cols; x++)
+                    CellFillBlank(t, &t->cells[t->curY * t->cols + x], 1);
         }
         else if (mode == 2) // clear entire line
         {
             for (uint32_t y = pixY; y < pixY + lineH && y < t->vfbH; y++)
                 for (uint32_t x = 0; x < t->vfbW; x++)
                     t->vfb[y * t->vfbW + x] = t->bgColor;
+            if (t->cells)
+                CellFillBlank(t, &t->cells[t->curY * t->cols], t->cols);
         }
         t->dirty = true;
         break;
@@ -643,6 +832,28 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     t->active = true;
     t->dirty = false;
 
+    // Allocate cell grid + scrollback ring.
+    t->cells = nullptr;
+    t->scrollback = nullptr;
+    t->scrollbackRows = 0;
+    t->scrollbackHead = 0;
+    t->scrollbackUsed = 0;
+    t->viewOffset = 0;
+    if (t->cols > 0 && t->rows > 0)
+    {
+        t->cells = static_cast<TermCell*>(
+            kmalloc(t->cols * t->rows * sizeof(TermCell)));
+        if (t->cells) CellFillBlank(t, t->cells, t->cols * t->rows);
+
+        t->scrollbackRows = TERM_SCROLLBACK_ROWS;
+        t->scrollback = static_cast<TermCell*>(
+            kmalloc(t->scrollbackRows * t->cols * sizeof(TermCell)));
+        if (!t->scrollback)
+        {
+            t->scrollbackRows = 0;
+        }
+    }
+
     // Create pipes
     auto* stdinPipe = static_cast<PipeBuffer*>(kmalloc(sizeof(PipeBuffer)));
     auto* stdoutPipe = static_cast<PipeBuffer*>(kmalloc(sizeof(PipeBuffer)));
@@ -818,6 +1029,16 @@ void TerminalWriteInput(int termIdx, const char* data, uint32_t len)
     Terminal* t = &g_terminals[termIdx];
     if (!t->active) return;
 
+    // User typing snaps the view back to live, matching the behaviour of
+    // xterm / gnome-terminal / putty.
+    if (t->viewOffset != 0 && len > 0)
+    {
+        t->viewOffset = 0;
+        CellRedrawAll(t);
+        if (t->child) t->child->fbDirty = 1;
+        CompositorWake();
+    }
+
     auto* pipe = static_cast<PipeBuffer*>(t->stdinPipe);
 
     for (uint32_t i = 0; i < len; i++)
@@ -946,6 +1167,20 @@ void TerminalClose(Terminal* t)
         kfree(t->altVfb);
         t->altVfb = nullptr;
     }
+    if (t->cells)
+    {
+        kfree(t->cells);
+        t->cells = nullptr;
+    }
+    if (t->scrollback)
+    {
+        kfree(t->scrollback);
+        t->scrollback = nullptr;
+    }
+    t->scrollbackRows = 0;
+    t->scrollbackHead = 0;
+    t->scrollbackUsed = 0;
+    t->viewOffset = 0;
 
     // Wake the terminal thread so it can exit its loop
     if (t->thread)
@@ -1003,6 +1238,48 @@ void TerminalResize(Terminal* t, uint32_t newW, uint32_t newH)
     if (t->curX >= t->cols) t->curX = t->cols - 1;
     if (t->curY >= t->rows) t->curY = t->rows - 1;
 
+    // Reallocate the cell grid for the new dimensions.  Content is
+    // copied anchored to the bottom-left so the visible output stays
+    // where the user expects when shrinking.
+    if (t->cells)
+    {
+        TermCell* newCells = static_cast<TermCell*>(
+            kmalloc(t->cols * t->rows * sizeof(TermCell)));
+        if (newCells)
+        {
+            CellFillBlank(t, newCells, t->cols * t->rows);
+            uint32_t copyCols = (t->cols < oldCols) ? t->cols : oldCols;
+            uint32_t copyRows = (t->rows < oldRows) ? t->rows : oldRows;
+            // Bottom-align rows.
+            uint32_t srcRowStart = oldRows - copyRows;
+            uint32_t dstRowStart = t->rows - copyRows;
+            for (uint32_t y = 0; y < copyRows; y++)
+            {
+                TermCell* src = t->cells + (srcRowStart + y) * oldCols;
+                TermCell* dst = newCells + (dstRowStart + y) * t->cols;
+                for (uint32_t x = 0; x < copyCols; x++) dst[x] = src[x];
+            }
+            kfree(t->cells);
+            t->cells = newCells;
+        }
+    }
+
+    // Resize the scrollback ring if the column count changed (simplest
+    // correct behaviour: drop existing scrollback rather than reflow).
+    if (t->cols != oldCols && t->scrollback)
+    {
+        kfree(t->scrollback);
+        t->scrollback = static_cast<TermCell*>(
+            kmalloc(t->scrollbackRows * t->cols * sizeof(TermCell)));
+        if (!t->scrollback) t->scrollbackRows = 0;
+        t->scrollbackHead = 0;
+        t->scrollbackUsed = 0;
+    }
+
+    // A resize snaps the viewport back to live — the old offset no
+    // longer makes sense against the new geometry.
+    t->viewOffset = 0;
+
     // Update child process VFB pointer
     if (t->child)
     {
@@ -1029,11 +1306,22 @@ void TerminalResize(Terminal* t, uint32_t newW, uint32_t newH)
 
 void TerminalScroll(Terminal* t, int32_t dy)
 {
-    if (!t || dy == 0) return;
-    // Placeholder until scrollback storage lands.  Logged to serial so we
-    // can verify wheel events route through the compositor correctly.
-    SerialPrintf("TERM: scroll dy=%d (child pid=%u)\n",
-                 dy, t->child ? t->child->pid : 0u);
+    if (!t || !t->active || dy == 0) return;
+    if (!t->cells) return;
+
+    // Positive dy = scroll UP (show older content, increase offset).
+    // Negative dy = scroll DOWN (newer content, decrease offset).
+    int64_t newOff = static_cast<int64_t>(t->viewOffset) + dy;
+    if (newOff < 0) newOff = 0;
+    if (newOff > static_cast<int64_t>(t->scrollbackUsed))
+        newOff = static_cast<int64_t>(t->scrollbackUsed);
+    uint32_t newOffU = static_cast<uint32_t>(newOff);
+    if (newOffU == t->viewOffset) return;
+
+    t->viewOffset = newOffU;
+    CellRedrawAll(t);
+    if (t->child) t->child->fbDirty = 1;
+    CompositorWake();
 }
 
 } // namespace brook
