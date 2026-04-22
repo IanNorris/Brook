@@ -399,6 +399,147 @@ static int cmd_remove(const char *name) {
     return 0;
 }
 
+/* Fetch a package's closure into the store (no manifest / profile mutation).
+ * Returns 0 on success, sets *out_store_name to the package store dir name. */
+static int fetch_package_to_store(const char *name, char *out_store_name, size_t cap) {
+    struct pkg_info pkg;
+    if (lookup_package(name, &pkg) != 0) {
+        fprintf(stderr, "Package '%s' not found in index.\n", name);
+        fprintf(stderr, "Try: nix search %s\n", name);
+        return -1;
+    }
+
+    char hash[64] = {0};
+    const char *dash = strchr(pkg.store_name, '-');
+    if (dash) {
+        size_t hlen = dash - pkg.store_name;
+        if (hlen < sizeof(hash)) {
+            memcpy(hash, pkg.store_name, hlen);
+            hash[hlen] = '\0';
+        }
+    }
+    if (!hash[0]) {
+        fprintf(stderr, "Error: invalid store name '%s'\n", pkg.store_name);
+        return -1;
+    }
+
+    /* Check whether the store path already has real content */
+    char store_path[512];
+    snprintf(store_path, sizeof(store_path), "/nix/store/%s", pkg.store_name);
+    int in_store = 0;
+    struct stat st;
+    const char *probes[] = { "bin", "lib", "share" };
+    for (int i = 0; i < 3 && !in_store; ++i) {
+        char check[640];
+        snprintf(check, sizeof(check), "%s/%s", store_path, probes[i]);
+        if (stat(check, &st) == 0) in_store = 1;
+    }
+
+    if (!in_store) {
+        printf("Fetching %s %s...\n", pkg.name, pkg.version);
+        char cmd[1024];
+        snprintf(cmd, sizeof(cmd), "/nix/bin/nix-fetch --deps %s", hash);
+        int ret = system(cmd);
+        if (ret != 0) {
+            int code = WIFEXITED(ret) ? WEXITSTATUS(ret) : ret;
+            fprintf(stderr, "Error: nix-fetch failed (exit %d)\n", code);
+            return -1;
+        }
+    }
+
+    strncpy(out_store_name, pkg.store_name, cap - 1);
+    out_store_name[cap - 1] = '\0';
+    return 0;
+}
+
+/* nix shell <pkg...> — start an interactive shell with each pkg's bin dir
+ * prepended to PATH.  The store files are fetched (via nix-fetch) if absent
+ * but the user's profile/manifest is NOT modified — the shell is ephemeral.
+ * Packages remain in /nix/store afterwards (no GC implemented yet). */
+static int cmd_shell(int npkgs, char *const *pkgs) {
+    if (npkgs < 1) {
+        fprintf(stderr, "Usage: nix shell <package> [<package>...]\n");
+        return 1;
+    }
+
+    /* Build up new PATH: join each pkg's bin dir, then prepend to existing PATH. */
+    size_t path_cap = 8192;
+    char *new_path = malloc(path_cap);
+    if (!new_path) return 1;
+    new_path[0] = '\0';
+    size_t used = 0;
+
+    for (int i = 0; i < npkgs; ++i) {
+        char store_name[512];
+        if (fetch_package_to_store(pkgs[i], store_name, sizeof(store_name)) != 0) {
+            free(new_path);
+            return 1;
+        }
+        char bin[640];
+        snprintf(bin, sizeof(bin), "/nix/store/%s/bin", store_name);
+        /* Only add to PATH if the dir actually exists (libraries may not
+         * have one — skip silently). */
+        struct stat st;
+        if (stat(bin, &st) != 0) continue;
+
+        size_t need = used + strlen(bin) + 2;
+        if (need > path_cap) {
+            path_cap = need * 2;
+            char *grown = realloc(new_path, path_cap);
+            if (!grown) { free(new_path); return 1; }
+            new_path = grown;
+        }
+        if (used > 0) new_path[used++] = ':';
+        strcpy(new_path + used, bin);
+        used += strlen(bin);
+    }
+
+    const char *old_path = getenv("PATH");
+    if (!old_path) old_path = "/nix/profile/bin:/boot/BIN";
+
+    size_t total = used + 1 + strlen(old_path) + 1;
+    if (total > path_cap) {
+        char *grown = realloc(new_path, total);
+        if (!grown) { free(new_path); return 1; }
+        new_path = grown;
+    }
+    if (used > 0) { new_path[used++] = ':'; }
+    strcpy(new_path + used, old_path);
+
+    if (setenv("PATH", new_path, 1) != 0) {
+        fprintf(stderr, "Error: setenv PATH failed: %s\n", strerror(errno));
+        free(new_path);
+        return 1;
+    }
+
+    /* Mark the shell so it's clear we're in a nix shell. */
+    char ps1_prefix[256];
+    snprintf(ps1_prefix, sizeof(ps1_prefix), "[nix-shell:%s", pkgs[0]);
+    for (int i = 1; i < npkgs && strlen(ps1_prefix) + strlen(pkgs[i]) + 3 < sizeof(ps1_prefix); ++i) {
+        strcat(ps1_prefix, ",");
+        strcat(ps1_prefix, pkgs[i]);
+    }
+    strncat(ps1_prefix, "] \\w \\$ ", sizeof(ps1_prefix) - strlen(ps1_prefix) - 1);
+    setenv("PS1", ps1_prefix, 1);
+    setenv("IN_NIX_SHELL", "impure", 1);
+
+    printf("\033[36mEntering nix shell with %d package(s). Exit to return.\033[0m\n",
+           npkgs);
+    printf("  PATH=%s\n", new_path);
+    free(new_path);
+
+    /* exec bash — prefer /nix/profile/bin/bash, fall back to /boot/BIN/BASH. */
+    const char *shells[] = { "/nix/profile/bin/bash", "/boot/BIN/BASH", "/bin/bash", NULL };
+    for (int i = 0; shells[i]; ++i) {
+        struct stat st;
+        if (stat(shells[i], &st) != 0) continue;
+        execl(shells[i], shells[i], NULL);
+    }
+
+    fprintf(stderr, "Error: no usable shell found (tried /nix/profile/bin/bash, /boot/BIN/BASH)\n");
+    return 1;
+}
+
 static int cmd_list(void) {
     FILE *f = fopen(MANIFEST_PATH, "r");
     if (!f) {
@@ -442,6 +583,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  %s remove <package>    Remove a package\n", prog);
     fprintf(stderr, "  %s list                List installed packages\n", prog);
     fprintf(stderr, "  %s search <query>      Search for packages\n", prog);
+    fprintf(stderr, "  %s shell <pkg...>      Start a temporary shell with the packages on PATH\n", prog);
 }
 
 int main(int argc, char *argv[]) {
@@ -471,6 +613,12 @@ int main(int argc, char *argv[]) {
             return cmd_remove(argv[2]);
         } else if (strcmp(cmd, "list") == 0 || strcmp(cmd, "ls") == 0) {
             return cmd_list();
+        } else if (strcmp(cmd, "shell") == 0) {
+            if (argc < 3) {
+                fprintf(stderr, "Usage: %s shell <package> [<package>...]\n", prog);
+                return 1;
+            }
+            return cmd_shell(argc - 2, argv + 2);
         } else if (strcmp(cmd, "search") == 0 || strcmp(cmd, "s") == 0) {
             /* Delegate to nix-search */
             if (argc < 3) {
