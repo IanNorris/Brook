@@ -75,9 +75,12 @@ static void exec_curl(const char *url) {
     _exit(127);
 }
 
-/* Find a binary, checking env var first, then common Nix store paths */
+/* Find a binary, checking env var first, then common Nix store paths.
+ * Caller supplies the scratch buffer so sequential calls don't alias each
+ * other's PATH-search result. */
 static const char *find_binary(const char *env_var, const char *name,
-                                const char *fallback_paths[], int n_fallbacks) {
+                                const char *fallback_paths[], int n_fallbacks,
+                                char *scratch, size_t scratch_sz) {
     const char *p = getenv(env_var);
     if (p && access(p, X_OK) == 0) return p;
 
@@ -85,8 +88,7 @@ static const char *find_binary(const char *env_var, const char *name,
         if (access(fallback_paths[i], X_OK) == 0) return fallback_paths[i];
     }
 
-    /* Try PATH-based search using /usr/bin/which or just direct access */
-    static char buf[MAX_PATH];
+    /* Try PATH-based search */
     const char *path = getenv("PATH");
     if (path) {
         char pathcopy[4096];
@@ -96,8 +98,8 @@ static const char *find_binary(const char *env_var, const char *name,
         while (dir) {
             char *next = strchr(dir, ':');
             if (next) *next++ = '\0';
-            snprintf(buf, sizeof(buf), "%s/%s", dir, name);
-            if (access(buf, X_OK) == 0) return buf;
+            snprintf(scratch, scratch_sz, "%s/%s", dir, name);
+            if (access(scratch, X_OK) == 0) return scratch;
             dir = next;
         }
     }
@@ -275,13 +277,20 @@ static int download_and_extract(const char *nar_url, const char *compression,
 
 static int fetch_package(const char *hash);
 
-/* Parse references from narinfo and fetch missing ones */
+/* Parse references from narinfo and fetch missing ones.
+ *
+ * IMPORTANT: uses strtok_r, not strtok. fetch_package() recurses back into
+ * fetch_dependencies(), and strtok's global state does NOT survive recursion —
+ * the inner call overwrites the outer's state, and on return the outer's
+ * saved pointer references a popped stack frame. That produced wild jumps
+ * (crash at RIP=0x4738ab well outside the text segment). */
 static void fetch_dependencies(const char *refs_str) {
     char buf[4096];
     strncpy(buf, refs_str, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
 
-    char *tok = strtok(buf, " \t");
+    char *saveptr = NULL;
+    char *tok = strtok_r(buf, " \t", &saveptr);
     while (tok) {
         /* Extract hash (first 32 chars before the dash) */
         char ref_hash[33];
@@ -294,7 +303,7 @@ static void fetch_dependencies(const char *refs_str) {
             /* Skip if already fetched or in-progress (prevents self-referential
              * packages and duplicate work across shared dependency chains) */
             if (hash_is_seen(ref_hash)) {
-                tok = strtok(NULL, " \t");
+                tok = strtok_r(NULL, " \t", &saveptr);
                 continue;
             }
 
@@ -302,14 +311,14 @@ static void fetch_dependencies(const char *refs_str) {
             char path[MAX_PATH];
             snprintf(path, sizeof(path), "%s/%s", g_store_dir, tok);
             if (access(path, F_OK) == 0) {
-                tok = strtok(NULL, " \t");
+                tok = strtok_r(NULL, " \t", &saveptr);
                 continue;
             }
 
             printf("  Fetching dependency: %s\n", tok);
             fetch_package(ref_hash);
         }
-        tok = strtok(NULL, " \t");
+        tok = strtok_r(NULL, " \t", &saveptr);
     }
 }
 
@@ -428,9 +437,15 @@ int main(int argc, char **argv) {
         "/usr/bin/nar-unpack",
     };
 
-    g_curl_path = find_binary("CURL_PATH", "curl", curl_paths, 2);
-    g_xz_path = find_binary("XZ_PATH", "xz", xz_paths, 2);
-    g_unpack_path = find_binary("NAR_UNPACK_PATH", "nar-unpack", unpack_paths, 2);
+    static char curl_scratch[MAX_PATH];
+    static char xz_scratch[MAX_PATH];
+    static char unpack_scratch[MAX_PATH];
+    g_curl_path   = find_binary("CURL_PATH", "curl", curl_paths, 2,
+                                curl_scratch, sizeof(curl_scratch));
+    g_xz_path     = find_binary("XZ_PATH", "xz", xz_paths, 2,
+                                xz_scratch, sizeof(xz_scratch));
+    g_unpack_path = find_binary("NAR_UNPACK_PATH", "nar-unpack", unpack_paths, 2,
+                                unpack_scratch, sizeof(unpack_scratch));
 
     /* Find CA certificate bundle */
     const char *cacert_env = getenv("CURL_CA_BUNDLE");
