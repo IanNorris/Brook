@@ -62,9 +62,11 @@ static volatile uint32_t g_maxY     = 1080;
 static volatile uint8_t  g_buttons  = 0;
 static volatile uint8_t  g_prevButtons = 0;
 static bool              g_mouseInit = false;
+static uint8_t           g_mouseId   = 0;   // 0=3-byte legacy, 3=IntelliMouse wheel, 4=Explorer (5 btn + H wheel)
+static uint8_t           g_packetLen = 3;
 
-// 3-byte packet assembly
-static uint8_t  g_packetBuf[3];
+// 4-byte packet assembly for IntelliMouse modes.
+static uint8_t  g_packetBuf[4];
 static uint8_t  g_packetIdx = 0;
 
 // Input device for the input subsystem
@@ -116,13 +118,13 @@ static void MouseIrqHandler(InterruptFrame* frame)
 
     g_packetBuf[g_packetIdx++] = data;
 
-    if (g_packetIdx < 3)
+    if (g_packetIdx < g_packetLen)
     {
         ApicSendEoi();
         return;
     }
 
-    // Full 3-byte packet received
+    // Full packet received
     g_packetIdx = 0;
 
     uint8_t stat = g_packetBuf[0];
@@ -140,6 +142,36 @@ static void MouseIrqHandler(InterruptFrame* frame)
         return;
     }
 
+    // Decode wheel bytes for IntelliMouse / Explorer modes.
+    int8_t wheelY = 0;  // vertical scroll ticks (up positive)
+    int8_t wheelX = 0;  // horizontal scroll ticks (right positive)
+    uint8_t extraButtons = 0; // bits 0=btn4, 1=btn5
+    if (g_packetLen == 4)
+    {
+        uint8_t z = g_packetBuf[3];
+        if (g_mouseId == 3)
+        {
+            // Plain IntelliMouse: byte 3 is a signed int8 vertical Z delta.
+            // IntelliMouse convention: positive = scroll DOWN.  Flip so our
+            // event type uses "up positive".
+            wheelY = static_cast<int8_t>(-static_cast<int8_t>(z));
+        }
+        else if (g_mouseId == 4)
+        {
+            // IntelliMouse Explorer: low nibble is signed 4-bit Z (vertical),
+            // bits 6/7 carry buttons 4/5.  Some firmwares repurpose bits 4/5
+            // for horizontal scroll; handle it when present.
+            int8_t zlo = static_cast<int8_t>(z & 0x0F);
+            if (zlo & 0x08) zlo |= static_cast<int8_t>(0xF0); // sign-extend
+            // Flip: PS/2 convention is +ve = down, we want up positive.
+            wheelY = static_cast<int8_t>(-zlo);
+            extraButtons = (z >> 6) & 0x03;
+            // Horizontal scroll: some mice set bit 5 for right, bit 4 for left.
+            if (z & 0x20) wheelX = 1;
+            if (z & 0x10) wheelX = -1;
+        }
+    }
+
     // Update cursor position (Y is inverted in PS/2 protocol)
     int32_t newX = g_mouseX + dx;
     int32_t newY = g_mouseY - dy;
@@ -153,9 +185,9 @@ static void MouseIrqHandler(InterruptFrame* frame)
     g_mouseX = newX;
     g_mouseY = newY;
 
-    // Update button state
+    // Update button state (core 3 in stat, extras from wheel byte)
     g_prevButtons = g_buttons;
-    g_buttons = stat & 0x07;
+    g_buttons = static_cast<uint8_t>((stat & 0x07) | ((extraButtons & 0x03) << 3));
 
     // Push move event to input subsystem
     if (dx != 0 || dy != 0)
@@ -170,9 +202,20 @@ static void MouseIrqHandler(InterruptFrame* frame)
         InputDevicePush(&g_mouseInputDev, ev);
     }
 
+    // Push scroll event
+    if (wheelY != 0 || wheelX != 0)
+    {
+        InputEvent ev;
+        ev.type     = InputEventType::MouseScroll;
+        ev.scanCode = static_cast<uint8_t>(wheelY); // int8 dy (up positive)
+        ev.ascii    = static_cast<char>(wheelX);    // int8 dx (right positive)
+        ev.modifiers = g_buttons;
+        InputDevicePush(&g_mouseInputDev, ev);
+    }
+
     // Push button change events
     uint8_t changed = g_buttons ^ g_prevButtons;
-    for (uint8_t bit = 0; bit < 3; bit++)
+    for (uint8_t bit = 0; bit < 5; bit++)
     {
         if (changed & (1 << bit))
         {
@@ -252,6 +295,44 @@ void MouseInit()
 
     // Use default settings
     MouseCmd(0xF6);
+
+    // IntelliMouse Explorer knock sequence.  The magic sample-rate
+    // sequence enables extended PS/2 protocols:
+    //   200, 100, 80  → device ID 3 (IntelliMouse: +1 byte vertical wheel)
+    //   200, 200, 80  → device ID 4 (Explorer: +1 byte wheel + 2 buttons,
+    //                                 some firmwares encode horizontal
+    //                                 scroll in upper bits of the Z byte)
+    // We only move to the next knock if the previous one succeeded.
+    auto tryKnock = [](const uint8_t* rates) {
+        for (int i = 0; i < 3; i++) {
+            MouseCmd(0xF3);   // Set sample rate
+            MouseCmd(rates[i]);
+        }
+    };
+    auto readId = []() -> uint8_t {
+        MouseCmd(0xF2);       // Get device ID (ACK consumed)
+        WaitRead();
+        return inb(0x60);
+    };
+
+    static const uint8_t KNOCK_WHEEL[3]   = { 200, 100, 80 };
+    static const uint8_t KNOCK_EXPLORER[3] = { 200, 200, 80 };
+
+    tryKnock(KNOCK_WHEEL);
+    uint8_t id = readId();
+    if (id == 3)
+    {
+        g_mouseId = 3;
+        g_packetLen = 4;
+        tryKnock(KNOCK_EXPLORER);
+        uint8_t id2 = readId();
+        if (id2 == 4)
+        {
+            g_mouseId = 4;
+        }
+    }
+    SerialPrintf("MOUSE: negotiated protocol id=%u (%u-byte packets)\n",
+                 g_mouseId, g_packetLen);
 
     // Set sample rate to 100 samples/sec
     MouseCmd(0xF3);

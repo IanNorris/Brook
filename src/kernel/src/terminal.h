@@ -55,4 +55,10 @@ void TerminalClose(Terminal* t);
 // Sends SIGWINCH to the child process.
 void TerminalResize(Terminal* t, uint32_t newW, uint32_t newH);
 
+// Scroll the terminal viewport by dy lines.  Positive dy scrolls UP
+// (older content into view), negative scrolls down toward live output.
+// Currently a no-op placeholder that logs — scrollback storage lands
+// in a follow-up.
+void TerminalScroll(Terminal* t, int32_t dy);
+
 } // namespace brook

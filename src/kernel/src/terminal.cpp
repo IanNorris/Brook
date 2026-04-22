@@ -1027,4 +1027,13 @@ void TerminalResize(Terminal* t, uint32_t newW, uint32_t newH)
     }
 }
 
+void TerminalScroll(Terminal* t, int32_t dy)
+{
+    if (!t || dy == 0) return;
+    // Placeholder until scrollback storage lands.  Logged to serial so we
+    // can verify wheel events route through the compositor correctly.
+    SerialPrintf("TERM: scroll dy=%d (child pid=%u)\n",
+                 dy, t->child ? t->child->pid : 0u);
+}
+
 } // namespace brook

@@ -647,6 +647,34 @@ static void CompositorLoopWM()
         if (ev.type == InputEventType::MouseMove)
             continue;
 
+        // Scroll wheel: route to the window under the cursor (not the focused
+        // one — standard UX is "scroll the thing you're pointing at").
+        if (ev.type == InputEventType::MouseScroll)
+        {
+            int32_t mx = 0, my = 0;
+            MouseGetPosition(&mx, &my);
+            WmHitResult hit = WmHitTest(mx, my);
+            if (hit.windowIndex >= 0)
+            {
+                Window* target = WmGetWindow(hit.windowIndex);
+                if (target && target->proc)
+                {
+                    int8_t dy = static_cast<int8_t>(ev.scanCode);
+                    int8_t dx = static_cast<int8_t>(ev.ascii);
+                    // If the target is a terminal, consume the scroll as
+                    // scrollback navigation.  Otherwise drop for now — we
+                    // don't have a per-window scroll event channel yet.
+                    Terminal* term = TerminalFindByProcess(target->proc);
+                    if (term)
+                    {
+                        TerminalScroll(term, dy);
+                        (void)dx;
+                    }
+                }
+            }
+            continue;
+        }
+
         if (ev.type != InputEventType::KeyPress && ev.type != InputEventType::KeyRelease)
             continue;
 
