@@ -15,6 +15,7 @@
 #include "idt.h"
 #include "apic.h"
 #include "net.h"
+#include "spinlock.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "memory/address.h"
@@ -362,35 +363,61 @@ static int VirtioNetTransmit(NetIf* nif, const void* frame, uint32_t len)
 }
 
 // ---------------------------------------------------------------------------
-// RX processing (called from IRQ handler)
+// RX processing (called from IRQ handler AND from poll path)
+//
+// Critical bug fix: this function used to call NetReceive() (long-running TCP
+// processing) BEFORE advancing usedIdxShadow. If a virtio-net IRQ fired while
+// NetReceive was in progress — which is common, because TCP sends ACKs, which
+// can drive RX interrupts — the nested ProcessRxPackets would see the same
+// usedIdxShadow and replay every unprocessed used-ring slot from scratch.
+// That manifested as the device apparently "retransmitting" old SYN|ACK and
+// data packets thousands of times per second. It was entirely self-inflicted:
+// we were re-reading our own used ring.
+//
+// Fix: take a ticket spinlock (which also disables local IRQs) around the
+// short critical section that reads a slot and advances usedIdxShadow, then
+// release before calling NetReceive. A re-entrant IRQ on the same CPU cannot
+// preempt us while the lock is held; concurrent IRQs on other CPUs spin
+// briefly. The actual packet processing (NetReceive) runs lock-free.
 // ---------------------------------------------------------------------------
+
+static SpinLock g_rxLock;
 
 static void ProcessRxPackets()
 {
     bool didWork = false;
-    while (g_rxq.usedIdxShadow != *g_rxq.usedIdx) {
-        uint16_t slot = g_rxq.usedIdxShadow & (g_rxq.size - 1);
+
+    for (;;) {
+        uint64_t flags = SpinLockAcquire(&g_rxLock);
+        if (g_rxq.usedIdxShadow == *g_rxq.usedIdx) {
+            SpinLockRelease(&g_rxLock, flags);
+            break;
+        }
+        uint16_t slot    = g_rxq.usedIdxShadow & (g_rxq.size - 1);
         uint32_t descIdx = g_rxq.usedRing[slot].id;
         uint32_t totalLen = g_rxq.usedRing[slot].len;
+        g_rxq.usedIdxShadow++;
+        SpinLockRelease(&g_rxLock, flags);
 
         if (descIdx < g_rxq.size && totalLen > VIRTIO_NET_HDR_SIZE) {
             uint8_t* pkt = g_rxBufs + descIdx * RX_BUF_SIZE;
             uint32_t frameLen = totalLen - VIRTIO_NET_HDR_SIZE;
             uint8_t* frame = pkt + VIRTIO_NET_HDR_SIZE;
 
-            // Deliver to network stack
+            // Deliver to network stack (may be long-running — no lock held)
             NetReceive(&g_netIf, frame, frameLen);
         }
 
-        // Repost buffer to available ring
+        // Repost buffer to available ring. availIdxShadow is shared with
+        // other invocations so must be advanced under the lock too.
+        flags = SpinLockAcquire(&g_rxLock);
         uint16_t availSlot = g_rxq.availIdxShadow & (g_rxq.size - 1);
         g_rxq.availRing[availSlot] = static_cast<uint16_t>(descIdx);
         g_rxq.availIdxShadow++;
         __asm__ volatile("sfence" ::: "memory");
         *g_rxq.availIdx = g_rxq.availIdxShadow;
-
-        g_rxq.usedIdxShadow++;
         didWork = true;
+        SpinLockRelease(&g_rxLock, flags);
     }
 
     // Only notify QEMU when we've actually reposted buffers. Kicking with no
