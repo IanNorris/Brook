@@ -3650,14 +3650,15 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
 
     // tcgetattr/tcsetattr arrive as ioctl on stdin (fd 0)
     // TCGETS = 0x5401, TCSETS/TCSETSW/TCSETSF = 0x5402-0x5404
-    // Also handle any fd that is a TTY device (e.g. fd 63 from /dev/tty dup).
-    // IMPORTANT: pipes are NOT ttys — if we answer TCGETS for pipe fds,
-    // isatty() returns true and programs like xz refuse to read their stdin
-    // ("Compressed data cannot be read from a terminal"). Let pipe ioctls
-    // fall through to the ENOSYS path so libc translates to ENOTTY.
+    // A pipe is a TTY only if its FdEntry has flags bit 0x04 set (marked by
+    // the terminal when setting up bash stdio). That way the terminal's
+    // shell sees its stdio as a TTY (for readline, job control, etc.) but
+    // anonymous pipes created by pipe() — e.g. the curl | xz | nar-unpack
+    // pipeline — are not TTYs and isatty() returns false on them.
     bool isTtyFd = (fde->type == FdType::DevKeyboard) ||
                    (fde->type == FdType::Vnode && !fde->handle) ||
                    (fde->type == FdType::DevTty) ||
+                   (fde->type == FdType::Pipe && (fde->flags & 0x04)) ||
                    ((fd <= 2) && fde->type != FdType::Pipe &&
                                  fde->type != FdType::Socket);
     if (isTtyFd && cmd == 0x5401)

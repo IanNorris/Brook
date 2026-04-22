@@ -671,20 +671,22 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     t->stdoutPipe = stdoutPipe;
 
     // Set up FdEntry array for bash: fd0=stdin read, fd1=stdout write, fd2=stdout write
+    // flags bit 2 (0x04) marks these pipes as the controlling TTY so isatty()
+    // returns true for them, even though the fd type is Pipe.
     FdEntry stdFds[3] = {};
     stdFds[0].type = FdType::Pipe;
-    stdFds[0].flags = 0;       // read end
+    stdFds[0].flags = 0x04;    // read end, TTY-pipe
     stdFds[0].handle = stdinPipe;
     stdFds[0].refCount = 1;
 
     stdFds[1].type = FdType::Pipe;
-    stdFds[1].flags = 1;       // write end
+    stdFds[1].flags = 0x01 | 0x04; // write end, TTY-pipe
     stdFds[1].statusFlags = 1; // O_WRONLY
     stdFds[1].handle = stdoutPipe;
     stdFds[1].refCount = 1;
 
     stdFds[2].type = FdType::Pipe;
-    stdFds[2].flags = 1;       // write end
+    stdFds[2].flags = 0x01 | 0x04; // write end, TTY-pipe
     stdFds[2].statusFlags = 1; // O_WRONLY
     stdFds[2].handle = stdoutPipe;
     stdFds[2].refCount = 1;
