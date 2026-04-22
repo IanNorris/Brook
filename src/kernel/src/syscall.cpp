@@ -2870,6 +2870,8 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
             found = true;
             busyboxFallback = true;
             DbgPrintf("sys_execve: busybox fallback for '%s'\n", cmdName);
+            SerialPrintf("sys_execve: busybox fallback — original='%s' resolved='%s'\n",
+                         kPath, lookupPath);
         }
     }
 
