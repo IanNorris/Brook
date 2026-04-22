@@ -750,7 +750,7 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
 
     const char* bashEnvp[] = {
         "HOME=/",
-        "PATH=/boot/BIN",
+        "PATH=/nix/profile/bin:/boot/BIN",
         "TERM=linux",
         "TERMINFO=/boot/TERMINFO",
         "TERMINFO_DIRS=/boot/TERMINFO",
