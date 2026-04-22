@@ -56,12 +56,19 @@ static void hash_mark_seen(const char *hash) {
 
 /* exec curl with optional --cacert; never returns on success */
 static void exec_curl(const char *url) {
+    /* --http1.1 forces HTTP/1.1 via ALPN. With the default HTTP/2
+     * negotiation the server (Fastly) ignores "Connection: close" because
+     * HTTP/2 uses a single multiplexed TCP connection for many streams —
+     * the stream ends but the TCP connection stays open for reuse. That
+     * leaves curl blocked in recv() waiting for a FIN that never comes
+     * until our SockRecv hard-timeout fires 180s later. Forcing HTTP/1.1
+     * makes "Connection: close" meaningful and the server FINs promptly. */
     if (g_cacert_path)
-        execlp(g_curl_path, "curl", "-4", "-sSL",
+        execlp(g_curl_path, "curl", "-4", "-sSL", "--http1.1",
                "-H", "Connection: close",
                "--cacert", g_cacert_path, url, (char*)NULL);
     else
-        execlp(g_curl_path, "curl", "-4", "-sSL",
+        execlp(g_curl_path, "curl", "-4", "-sSL", "--http1.1",
                "-H", "Connection: close",
                url, (char*)NULL);
     perror("execl curl");
