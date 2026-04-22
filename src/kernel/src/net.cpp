@@ -1954,8 +1954,13 @@ int SockAccept(int sockIdx, SockAddrIn* addr)
     Socket& s = g_sockets[sockIdx];
     if (!s.listening) return -1;
 
-    // Poll until we have a completed connection in the accept queue
-    for (int attempt = 0; attempt < 50000; attempt++)
+    // Drive the network stack a handful of times with proper yields so we
+    // don't monopolise the CPU if no client is pending.  Real wakeup on
+    // SYN arrival would be ideal, but this is good enough until we wire
+    // per-socket wait queues.  The old 50000-iteration busy loop with a
+    // 1000-iter volatile spin burned ~30–50 ms per call and showed up as
+    // 17% of non-idle kernel time during a nix install.
+    for (int attempt = 0; attempt < 16; attempt++)
     {
         if (g_netIf && g_netIf->poll) g_netIf->poll(g_netIf);
 
@@ -1990,8 +1995,8 @@ int SockAccept(int sockIdx, SockAddrIn* addr)
             }
         }
 
-        // Brief pause before retrying
-        for (volatile int p = 0; p < 1000; p++) {}
+        // Yield so other work can run while we wait for a SYN to land.
+        SchedulerYield();
     }
 
     return -11; // EAGAIN
