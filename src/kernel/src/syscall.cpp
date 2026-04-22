@@ -2965,7 +2965,10 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
         return -ENOENT;
     }
 
-    constexpr uint64_t MAX_ELF_SIZE = 2 * 1024 * 1024;
+    // 32 MB accommodates most real binaries, including statically-linked
+    // Go executables which routinely run 10-20 MB.  The buffer is freed
+    // immediately after ELF loading, so it's only a transient cost.
+    constexpr uint64_t MAX_ELF_SIZE = 32 * 1024 * 1024;
     constexpr uint64_t ELF_BUF_PAGES = MAX_ELF_SIZE / 4096;
 
     VirtualAddress bufAddr = VmmAllocPages(ELF_BUF_PAGES,

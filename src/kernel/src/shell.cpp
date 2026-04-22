@@ -165,7 +165,7 @@ static uint8_t* LoadElf(const char* path, uint64_t* outSize)
     Vnode* vn = VfsOpen(path, 0);
     if (!vn) return nullptr;
 
-    constexpr uint64_t MAX_ELF_SIZE = 8 * 1024 * 1024;
+    constexpr uint64_t MAX_ELF_SIZE = 32 * 1024 * 1024;
     constexpr uint64_t ELF_BUF_PAGES = MAX_ELF_SIZE / 4096;
 
     VirtualAddress bufAddr = VmmAllocPages(ELF_BUF_PAGES,
@@ -193,7 +193,7 @@ static uint8_t* LoadElf(const char* path, uint64_t* outSize)
 
 static void FreeElfBuffer(uint8_t* buf)
 {
-    constexpr uint64_t MAX_ELF_SIZE = 8 * 1024 * 1024;
+    constexpr uint64_t MAX_ELF_SIZE = 32 * 1024 * 1024;
     constexpr uint64_t ELF_BUF_PAGES = MAX_ELF_SIZE / 4096;
     VmmFreePages(VirtualAddress(reinterpret_cast<uint64_t>(buf)), ELF_BUF_PAGES);
 }
