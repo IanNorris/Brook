@@ -22,6 +22,7 @@
 #include "net.h"
 #include "rtc.h"
 #include "audio.h"
+#include "profiler.h"
 
 // Forward declaration
 extern "C" __attribute__((naked)) void ReturnToKernel();
@@ -6658,6 +6659,24 @@ static int64_t sys_pselect6(uint64_t nfds, uint64_t readfdsAddr, uint64_t writef
 }
 
 // ---------------------------------------------------------------------------
+// sys_brook_profile (500) — Brook-specific: start/stop the sampling profiler
+// ---------------------------------------------------------------------------
+// arg0: op — 0 = start (arg1 = durationMs, 0 = indefinite), 1 = stop,
+//            2 = isRunning (returns 1/0)
+// Returns 0 on success, -EINVAL on bad op.
+
+static int64_t sys_brook_profile(uint64_t op, uint64_t a1, uint64_t, uint64_t,
+                                   uint64_t, uint64_t)
+{
+    switch (op) {
+    case 0: brook::ProfilerStart(static_cast<uint32_t>(a1)); return 0;
+    case 1: brook::ProfilerStop(); return 0;
+    case 2: return brook::ProfilerIsRunning() ? 1 : 0;
+    default: return -EINVAL;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // sys_not_implemented
 // ---------------------------------------------------------------------------
 
@@ -7752,6 +7771,9 @@ void SyscallTableInit()
     g_syscallTable[SYS_TIMERFD_SETTIME] = sys_timerfd_settime;
     g_syscallTable[SYS_TIMERFD_GETTIME] = sys_timerfd_gettime;
     g_syscallTable[SYS_MEMFD_CREATE]    = sys_memfd_create;
+
+    // Brook-specific syscalls (500+). 500 = profiler control.
+    g_syscallTable[500]                  = sys_brook_profile;
 
     uint32_t count = 0;
     for (uint64_t i = 0; i < SYSCALL_MAX; ++i)

@@ -150,6 +150,14 @@ if [ -f "$nix_install_bin" ]; then
     sync_file "$nix_install_bin" "BIN/NIX-INSTALL"
 fi
 
+# --- profile tool (profiler control wrapper) ---
+profile_bin="${ROOT_DIR}/tools/profile/profile"
+if [ -f "$profile_bin" ]; then
+    echo "profile:"
+    mmd -D s -i "${DISK_IMG}" "::BIN" 2>/dev/null || true
+    sync_file "$profile_bin" "BIN/PROFILE"
+fi
+
 # --- Static binaries from nix (busybox etc.) ---
 busybox_static="${ROOT_DIR}/busybox_static"
 if [ -f "$busybox_static" ]; then
