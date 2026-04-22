@@ -1250,7 +1250,6 @@ void TerminalResize(Terminal* t, uint32_t newW, uint32_t newH)
             CellFillBlank(t, newCells, t->cols * t->rows);
             uint32_t copyCols = (t->cols < oldCols) ? t->cols : oldCols;
             uint32_t copyRows = (t->rows < oldRows) ? t->rows : oldRows;
-            // Bottom-align rows.
             uint32_t srcRowStart = oldRows - copyRows;
             uint32_t dstRowStart = t->rows - copyRows;
             for (uint32_t y = 0; y < copyRows; y++)
@@ -1264,16 +1263,41 @@ void TerminalResize(Terminal* t, uint32_t newW, uint32_t newH)
         }
     }
 
-    // Resize the scrollback ring if the column count changed (simplest
-    // correct behaviour: drop existing scrollback rather than reflow).
-    if (t->cols != oldCols && t->scrollback)
+    // Reflow the scrollback ring if cols changed: copy each row clipped
+    // or zero-padded to the new column count instead of dropping history.
+    // Without this, wheel-up after a horizontal resize would appear to
+    // do nothing.
+    if (t->cols != oldCols && t->scrollback && t->scrollbackRows > 0)
     {
-        kfree(t->scrollback);
-        t->scrollback = static_cast<TermCell*>(
+        TermCell* oldRing = t->scrollback;
+        uint32_t  oldHead = t->scrollbackHead;
+        uint32_t  oldUsed = t->scrollbackUsed;
+
+        TermCell* newRing = static_cast<TermCell*>(
             kmalloc(t->scrollbackRows * t->cols * sizeof(TermCell)));
-        if (!t->scrollback) t->scrollbackRows = 0;
-        t->scrollbackHead = 0;
-        t->scrollbackUsed = 0;
+        if (newRing)
+        {
+            CellFillBlank(t, newRing, t->scrollbackRows * t->cols);
+            uint32_t copyC = (t->cols < oldCols) ? t->cols : oldCols;
+            for (uint32_t i = 0; i < oldUsed; i++)
+            {
+                uint32_t srcIdx = (oldHead + t->scrollbackRows - oldUsed + i)
+                                  % t->scrollbackRows;
+                TermCell* src = oldRing + srcIdx * oldCols;
+                TermCell* dst = newRing + i * t->cols;
+                for (uint32_t x = 0; x < copyC; x++) dst[x] = src[x];
+            }
+            kfree(oldRing);
+            t->scrollback = newRing;
+            t->scrollbackUsed = oldUsed;
+            t->scrollbackHead = oldUsed % t->scrollbackRows;
+        }
+        else
+        {
+            t->scrollback = nullptr;
+            t->scrollbackHead = 0;
+            t->scrollbackUsed = 0;
+        }
     }
 
     // A resize snaps the viewport back to live — the old offset no
