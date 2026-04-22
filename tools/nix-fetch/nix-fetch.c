@@ -311,6 +311,7 @@ static void fetch_dependencies(const char *refs_str) {
             char path[MAX_PATH];
             snprintf(path, sizeof(path), "%s/%s", g_store_dir, tok);
             if (access(path, F_OK) == 0) {
+                printf("  Already on disk: %s\n", tok);
                 tok = strtok_r(NULL, " \t", &saveptr);
                 continue;
             }
