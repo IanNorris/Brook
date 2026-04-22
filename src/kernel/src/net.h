@@ -222,6 +222,12 @@ void ArpCacheInsert(uint32_t ip, const MacAddr& mac);
 // Blocks until complete or timeout. Returns true on success.
 bool DhcpDiscover(NetIf* nif);
 
+// Read /boot/BROOK.CFG and, if NET0_MODE=static, configure the interface's
+// ipAddr/netmask/gateway/dns from NET0_IP / NET0_NETMASK / NET0_GATEWAY /
+// NET0_DNS. Returns true if a static config was applied (caller should skip
+// DHCP); false otherwise.
+bool NetApplyStaticConfig(NetIf* nif);
+
 // Start the net_poll background thread. Must be called AFTER SchedulerInit().
 void NetStartPollThread();
 

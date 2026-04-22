@@ -10,6 +10,10 @@ DEBUG_FLAGS=""
 SCRIPT_NAME=""
 HEADLESS=0
 VNC_DISPLAY=""
+VDE_SOCK=""
+NIC_MAC=""
+INSTANCE=""
+NO_AUDIO=0
 EXTRA_ARGS=()
 for arg in "$@"; do
     case "$arg" in
@@ -24,6 +28,18 @@ for arg in "$@"; do
             ;;
         --vnc)
             VNC_DISPLAY="__NEXT_VNC__"
+            ;;
+        --vde=*)
+            VDE_SOCK="${arg#--vde=}"
+            ;;
+        --mac=*)
+            NIC_MAC="${arg#--mac=}"
+            ;;
+        --instance=*)
+            INSTANCE="${arg#--instance=}"
+            ;;
+        --no-audio)
+            NO_AUDIO=1
             ;;
         --script=*)
             SCRIPT_NAME="${arg#--script=}"
@@ -215,6 +231,37 @@ else
     DISPLAY_OPT="-display gtk"
 fi
 
+# Network device selection: default is user-mode slirp with tcp host-forward.
+# --vde=SOCK switches to a VDE switch peer link (for VM<->VM traffic).
+NIC_MAC_ARG=""
+if [ -n "${NIC_MAC}" ]; then
+    NIC_MAC_ARG=",mac=${NIC_MAC}"
+fi
+if [ -n "${VDE_SOCK}" ]; then
+    NETDEV_OPT="-netdev vde,id=net0,sock=${VDE_SOCK}"
+    echo "  Net:  VDE switch at ${VDE_SOCK}"
+else
+    # Hostfwd base port: 11237 + instance offset (to avoid collision when running pairs)
+    HOSTFWD_BASE=11237
+    if [ -n "${INSTANCE}" ]; then
+        HOSTFWD_BASE=$((11237 + INSTANCE * 100))
+    fi
+    NETDEV_OPT="-netdev user,id=net0,hostfwd=tcp::${HOSTFWD_BASE}-:1234"
+fi
+
+# Per-instance QEMU monitor socket and audio disable
+MONITOR_SOCK="/tmp/qemu_monitor.sock"
+if [ -n "${INSTANCE}" ]; then
+    MONITOR_SOCK="/tmp/qemu_monitor_${INSTANCE}.sock"
+fi
+
+AUDIO_OPTS="-audiodev ${BROOK_AUDIODEV:-pipewire},id=hda0,out.buffer-length=200000,timer-period=5000 \
+    -device ich9-intel-hda,bus=pcie.0,addr=0x1b \
+    -device hda-output,audiodev=hda0"
+if [ "${NO_AUDIO}" -eq 1 ]; then
+    AUDIO_OPTS="-audiodev none,id=hda0"
+fi
+
 KVM_FLAGS=""
 if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] && [ "${NO_KVM:-}" != "1" ]; then
     KVM_FLAGS="-enable-kvm -cpu host"
@@ -229,21 +276,19 @@ qemu-system-x86_64 \
     -m 4G \
     -drive if=pflash,format=raw,readonly=on,file="${OVMF_CODE}" \
     -drive if=pflash,format=raw,file="${OVMF_VARS_COPY}" \
-    -drive format=raw,file=fat:rw:"${BUILD_DIR}/esp" \
+    -drive format=raw,file=fat:rw:"${ESP_OVERRIDE:-${BUILD_DIR}/esp}" \
     -drive if=virtio,format=raw,file="${DISK_IMG}",file.locking=off \
     ${EXT2_DRIVE} \
     ${NIX_DRIVE} \
     ${HOME_DRIVE} \
     -device virtio-tablet-pci \
     -device virtio-rng-pci \
-    -device virtio-net-pci,netdev=net0 \
-    -audiodev ${BROOK_AUDIODEV:-pipewire},id=hda0,out.buffer-length=200000,timer-period=5000 \
-    -device ich9-intel-hda,bus=pcie.0,addr=0x1b \
-    -device hda-output,audiodev=hda0 \
-    -netdev user,id=net0,hostfwd=tcp::11237-:1234 \
+    -device virtio-net-pci,netdev=net0${NIC_MAC_ARG} \
+    ${AUDIO_OPTS} \
+    ${NETDEV_OPT} \
     ${SERIAL_OPT} \
     ${DISPLAY_OPT} \
-    -monitor unix:/tmp/qemu_monitor.sock,server,nowait \
+    -monitor unix:${MONITOR_SOCK},server,nowait \
     -no-reboot \
     -no-shutdown \
     ${DEBUG_FLAGS} \

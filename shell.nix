@@ -40,6 +40,7 @@ pkgs.mkShellNoCC {
     # Runtime / testing
     pkgs.qemu
     pkgs.OVMF
+    pkgs.vde2            # vde_switch + slirpvde for VM<->VM networking
 
     # Dev tools
     llvm.clang-tools      # clangd, clang-tidy, clang-format

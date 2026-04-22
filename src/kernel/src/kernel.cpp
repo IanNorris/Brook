@@ -443,15 +443,19 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::ModuleDiscoverAndLoad("/boot/drivers");
     brook::SerialPuts("module: Phase 2 — done\n");
 
-    // ---- Network (DHCP + DNS test) ----
+    // ---- Network (static config from BROOK.CFG, or DHCP) ----
     if (brook::NetGetIf()) {
         brook::BootLogoProgress(75, "Network");
-        if (brook::DhcpDiscover(brook::NetGetIf())) {
+        brook::NetIf* nif = brook::NetGetIf();
+        bool configured = brook::NetApplyStaticConfig(nif);
+        if (!configured) {
+            configured = brook::DhcpDiscover(nif);
+        }
+        if (configured) {
             // Immediately resolve the gateway MAC while still in polling mode
             // (no scheduler yet — ArpResolve falls back to nif->poll).
             // This avoids a race later when curl runs post-scheduler and must
             // ARP for the gateway under real-time constraints.
-            brook::NetIf* nif = brook::NetGetIf();
             if (nif && nif->gateway) {
                 brook::MacAddr gwMac;
                 if (!brook::ArpResolve(nif->gateway, &gwMac)) {
@@ -463,8 +467,10 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
                 }
             }
         }
-        // Quick DNS test
-        brook::DnsResolve("example.com");
+        // Quick DNS test (only if we have a DNS server)
+        if (nif && nif->dns) {
+            brook::DnsResolve("example.com");
+        }
     }
 
     // ---- Syscall table ----

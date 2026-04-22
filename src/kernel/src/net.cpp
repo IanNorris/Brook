@@ -16,6 +16,7 @@
 #include "smp.h"
 #include "rtc.h"
 #include "apic.h"
+#include "vfs.h"
 
 // External C functions used by debug channel
 extern "C" void MouseGetPosition(int32_t*, int32_t*);
@@ -773,6 +774,132 @@ static void HandleDhcpReply(const uint8_t* data, uint32_t len)
         g_dhcpState = 3;
         g_dhcpDone = true;
     }
+}
+
+// ---- Static interface config via /boot/BROOK.CFG -------------------------
+//
+// Keys parsed (ASCII, one "KEY=value" per line, '#' comments):
+//   NET0_MODE    — "static" or "dhcp" (default dhcp)
+//   NET0_IP      — dotted-quad
+//   NET0_NETMASK — dotted-quad (default 255.255.255.0)
+//   NET0_GATEWAY — dotted-quad (optional)
+//   NET0_DNS     — dotted-quad (optional)
+
+static bool ParseDottedQuad(const char* s, uint32_t len, uint32_t* out)
+{
+    uint32_t ip = 0;
+    uint32_t octet = 0;
+    uint32_t octetCount = 0;
+    bool haveDigit = false;
+    for (uint32_t i = 0; i <= len; i++) {
+        char c = (i < len) ? s[i] : '.';
+        if (c >= '0' && c <= '9') {
+            octet = octet * 10 + (uint32_t)(c - '0');
+            if (octet > 255) return false;
+            haveDigit = true;
+        } else if (c == '.') {
+            if (!haveDigit) return false;
+            ip |= (octet & 0xFF) << (8 * octetCount);
+            octetCount++;
+            octet = 0;
+            haveDigit = false;
+            if (octetCount == 4) {
+                if (i != len) return false;
+                *out = ip;
+                return true;
+            }
+        } else {
+            return false;
+        }
+    }
+    return false;
+}
+
+static bool LineKeyIs(const char* line, uint32_t keyLen,
+                      const char* key, uint32_t wantLen)
+{
+    if (keyLen != wantLen) return false;
+    for (uint32_t i = 0; i < wantLen; i++) {
+        if (line[i] != key[i]) return false;
+    }
+    return true;
+}
+
+bool NetApplyStaticConfig(NetIf* nif)
+{
+    if (!nif) return false;
+
+    Vnode* cfg = VfsOpen("/boot/BROOK.CFG");
+    if (!cfg) return false;
+
+    char buf[1024] = {};
+    uint64_t off = 0;
+    int n = VfsRead(cfg, buf, sizeof(buf) - 1, &off);
+    VfsClose(cfg);
+    if (n <= 0) return false;
+
+    bool isStatic = false;
+    uint32_t ip = 0, mask = 0x00FFFFFF, gw = 0, dns = 0;  // mask default /24
+    bool haveIp = false;
+
+    uint32_t pos = 0;
+    while (pos < (uint32_t)n) {
+        uint32_t lineStart = pos;
+        while (pos < (uint32_t)n && buf[pos] != '\n' && buf[pos] != '\r') pos++;
+        uint32_t lineEnd = pos;
+        while (pos < (uint32_t)n && (buf[pos] == '\n' || buf[pos] == '\r')) pos++;
+
+        while (lineStart < lineEnd && (buf[lineStart] == ' ' || buf[lineStart] == '\t'))
+            lineStart++;
+        if (lineStart >= lineEnd) continue;
+        if (buf[lineStart] == '#') continue;
+
+        uint32_t eq = lineStart;
+        while (eq < lineEnd && buf[eq] != '=') eq++;
+        if (eq >= lineEnd) continue;
+
+        const char* key = &buf[lineStart];
+        uint32_t keyLen = eq - lineStart;
+        const char* val = &buf[eq + 1];
+        uint32_t valLen = lineEnd - (eq + 1);
+
+        while (valLen > 0 && (val[0] == ' ' || val[0] == '\t')) { val++; valLen--; }
+        while (valLen > 0 && (val[valLen - 1] == ' ' || val[valLen - 1] == '\t'
+                              || val[valLen - 1] == '\r')) { valLen--; }
+
+        if (LineKeyIs(key, keyLen, "NET0_MODE", 9)) {
+            if (valLen == 6 && val[0] == 's' && val[1] == 't' && val[2] == 'a'
+                            && val[3] == 't' && val[4] == 'i' && val[5] == 'c') {
+                isStatic = true;
+            }
+        } else if (LineKeyIs(key, keyLen, "NET0_IP", 7)) {
+            uint32_t v;
+            if (ParseDottedQuad(val, valLen, &v)) { ip = v; haveIp = true; }
+        } else if (LineKeyIs(key, keyLen, "NET0_NETMASK", 12)) {
+            uint32_t v;
+            if (ParseDottedQuad(val, valLen, &v)) mask = v;
+        } else if (LineKeyIs(key, keyLen, "NET0_GATEWAY", 12)) {
+            uint32_t v;
+            if (ParseDottedQuad(val, valLen, &v)) gw = v;
+        } else if (LineKeyIs(key, keyLen, "NET0_DNS", 8)) {
+            uint32_t v;
+            if (ParseDottedQuad(val, valLen, &v)) dns = v;
+        }
+    }
+
+    if (!isStatic || !haveIp) return false;
+
+    nif->ipAddr  = ip;
+    nif->netmask = mask;
+    nif->gateway = gw;
+    nif->dns     = dns;
+
+    SerialPrintf("net: static config %u.%u.%u.%u/%u.%u.%u.%u gw=%u.%u.%u.%u dns=%u.%u.%u.%u\n",
+        ip & 0xFF, (ip >> 8) & 0xFF, (ip >> 16) & 0xFF, (ip >> 24) & 0xFF,
+        mask & 0xFF, (mask >> 8) & 0xFF, (mask >> 16) & 0xFF, (mask >> 24) & 0xFF,
+        gw & 0xFF, (gw >> 8) & 0xFF, (gw >> 16) & 0xFF, (gw >> 24) & 0xFF,
+        dns & 0xFF, (dns >> 8) & 0xFF, (dns >> 16) & 0xFF, (dns >> 24) & 0xFF);
+    return true;
 }
 
 bool DhcpDiscover(NetIf* nif)
