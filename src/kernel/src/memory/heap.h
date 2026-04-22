@@ -45,4 +45,20 @@ void HeapSetPoison(bool enable);
 // Dump heap statistics to serial: total blocks, free/used counts, sizes.
 void HeapDumpStats();
 
+// Snapshot of heap state, filled by HeapGetStats.  Takes the heap lock
+// internally; safe to call from any thread.  Used by diagnostic channels.
+struct HeapStats {
+    uint64_t regionStart;
+    uint64_t regionEnd;
+    uint64_t heapSizeBytes;
+    uint32_t totalBlocks;
+    uint32_t usedBlocks;
+    uint32_t freeBlocks;
+    uint64_t usedBytes;
+    uint64_t freeBytes;
+    uint32_t largestFreeBlock;
+    bool     poisonEnabled;
+};
+void HeapGetStats(HeapStats* out);
+
 } // namespace brook

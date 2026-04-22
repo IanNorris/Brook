@@ -438,9 +438,11 @@ void HeapSetPoison(bool enable)
     g_heapPoisonEnabled = enable;
 }
 
-void HeapDumpStats()
+void HeapGetStats(HeapStats* out)
 {
-    if (!g_heapStart) { SerialPuts("Heap: not initialised\n"); return; }
+    if (!out) return;
+    *out = {};
+    if (!g_heapStart) return;
 
     uint64_t lf = SpinLockAcquire(&g_heapLock);
 
@@ -466,21 +468,37 @@ void HeapDumpStats()
         cur = NextBlock(cur);
     }
 
-    uint64_t heapSize = static_cast<uint64_t>(g_heapEnd - g_heapStart);
-
     SpinLockRelease(&g_heapLock, lf);
+
+    out->regionStart      = reinterpret_cast<uint64_t>(g_heapStart);
+    out->regionEnd        = reinterpret_cast<uint64_t>(g_heapEnd);
+    out->heapSizeBytes    = static_cast<uint64_t>(g_heapEnd - g_heapStart);
+    out->totalBlocks      = totalBlocks;
+    out->usedBlocks       = usedBlocks;
+    out->freeBlocks       = freeBlocks;
+    out->usedBytes        = usedBytes;
+    out->freeBytes        = freeBytes;
+    out->largestFreeBlock = largestFree;
+    out->poisonEnabled    = g_heapPoisonEnabled;
+}
+
+void HeapDumpStats()
+{
+    if (!g_heapStart) { SerialPuts("Heap: not initialised\n"); return; }
+
+    HeapStats s;
+    HeapGetStats(&s);
 
     SerialPrintf("=== HEAP STATS ===\n");
     SerialPrintf("  Region: 0x%lx - 0x%lx (%lu KB)\n",
-                 reinterpret_cast<uint64_t>(g_heapStart),
-                 reinterpret_cast<uint64_t>(g_heapEnd),
-                 (unsigned long)(heapSize / 1024));
+                 s.regionStart, s.regionEnd,
+                 (unsigned long)(s.heapSizeBytes / 1024));
     SerialPrintf("  Blocks: %u total (%u used, %u free)\n",
-                 totalBlocks, usedBlocks, freeBlocks);
-    SerialPrintf("  Used:   %lu bytes\n", (unsigned long)usedBytes);
+                 s.totalBlocks, s.usedBlocks, s.freeBlocks);
+    SerialPrintf("  Used:   %lu bytes\n", (unsigned long)s.usedBytes);
     SerialPrintf("  Free:   %lu bytes (largest block: %u)\n",
-                 (unsigned long)freeBytes, largestFree);
-    SerialPrintf("  Poison: %s\n", g_heapPoisonEnabled ? "enabled" : "disabled");
+                 (unsigned long)s.freeBytes, s.largestFreeBlock);
+    SerialPrintf("  Poison: %s\n", s.poisonEnabled ? "enabled" : "disabled");
     SerialPrintf("==================\n");
 }
 

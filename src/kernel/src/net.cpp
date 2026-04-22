@@ -2228,7 +2228,9 @@ static void DebugHandleCommand(const char* cmd, uint32_t len)
             "  procs           - process list\n"
             "  net             - network interface info\n"
             "  sock            - open sockets\n"
-            "  mem             - memory statistics\n"
+            "  mem             - memory statistics (PMM + heap summary)\n"
+            "  mem heap        - detailed heap block breakdown\n"
+            "  mem pids        - per-PID PMM page counts (to serial)\n"
             "  uptime          - system uptime + wall clock\n"
             "  cpus            - CPU count + SMP info\n"
             "\n"
@@ -2395,6 +2397,51 @@ static void DebugHandleCommand(const char* cmd, uint32_t len)
         const char* h4 = " KB\n";
         for (int i = 0; h4[i]; i++) buf[p++] = h4[i];
         SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
+    }
+
+    // -----------------------------------------------------------------------
+    // mem heap — detailed heap block stats
+    // -----------------------------------------------------------------------
+    else if (NetStrEq(cmd, "mem heap") || NetStrEq(cmd, "heap")) {
+        HeapStats s;
+        HeapGetStats(&s);
+        char buf[320];
+        int p = 0;
+        const char* h1 = "heap: size=";
+        for (int i = 0; h1[i]; i++) buf[p++] = h1[i];
+        p += UintToStr(buf + p, static_cast<uint32_t>(s.heapSizeBytes / 1024));
+        const char* h2 = " KB blocks=";
+        for (int i = 0; h2[i]; i++) buf[p++] = h2[i];
+        p += UintToStr(buf + p, s.totalBlocks);
+        const char* h3 = " used=";
+        for (int i = 0; h3[i]; i++) buf[p++] = h3[i];
+        p += UintToStr(buf + p, s.usedBlocks);
+        const char* h4 = " free=";
+        for (int i = 0; h4[i]; i++) buf[p++] = h4[i];
+        p += UintToStr(buf + p, s.freeBlocks);
+        const char* h5 = "\n      used_bytes=";
+        for (int i = 0; h5[i]; i++) buf[p++] = h5[i];
+        p += UintToStr(buf + p, static_cast<uint32_t>(s.usedBytes));
+        const char* h6 = " free_bytes=";
+        for (int i = 0; h6[i]; i++) buf[p++] = h6[i];
+        p += UintToStr(buf + p, static_cast<uint32_t>(s.freeBytes));
+        const char* h7 = " largest_free=";
+        for (int i = 0; h7[i]; i++) buf[p++] = h7[i];
+        p += UintToStr(buf + p, s.largestFreeBlock);
+        const char* h8 = " poison=";
+        for (int i = 0; h8[i]; i++) buf[p++] = h8[i];
+        const char* pn = s.poisonEnabled ? "on" : "off";
+        for (int i = 0; pn[i]; i++) buf[p++] = pn[i];
+        buf[p++] = '\n';
+        SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
+    }
+
+    // -----------------------------------------------------------------------
+    // mem pids — per-PID page counts (PMM)
+    // -----------------------------------------------------------------------
+    else if (NetStrEq(cmd, "mem pids")) {
+        PmmDumpPidStats();
+        DebugChannelSend("mem pids: written to serial (see kernel log)\n");
     }
 
     // -----------------------------------------------------------------------
