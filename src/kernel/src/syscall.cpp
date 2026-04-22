@@ -413,15 +413,12 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
             }
             return static_cast<int64_t>(count);
         }
-        // Fall through to FD-table-based write below, but mirror to serial
-        // so piped stdout/stderr is visible in the debug log.
-        if (count > 0) {
-            const char* buf = reinterpret_cast<const char*>(bufAddr);
-            brook::SerialLock();
-            for (uint64_t i = 0; i < count; i++)
-                brook::SerialPutChar(buf[i]);
-            brook::SerialUnlock();
-        }
+        // Fall through to FD-table-based write below. (Historically we
+        // mirrored redirected stdout/stderr to the serial log here, but
+        // that corrupts binary pipelines — e.g. curl | xz | nar-unpack
+        // dumps the compressed NAR stream onto the serial console — and
+        // makes debug output confusing. If you need pipe content in logs,
+        // explicitly tee to fd 3.)
     }
 
     // File descriptor write
@@ -3653,10 +3650,16 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
 
     // tcgetattr/tcsetattr arrive as ioctl on stdin (fd 0)
     // TCGETS = 0x5401, TCSETS/TCSETSW/TCSETSF = 0x5402-0x5404
-    // Also handle any fd that is a TTY device (e.g. fd 63 from /dev/tty dup)
-    bool isTtyFd = (fd <= 2) || (fde->type == FdType::DevKeyboard) ||
+    // Also handle any fd that is a TTY device (e.g. fd 63 from /dev/tty dup).
+    // IMPORTANT: pipes are NOT ttys — if we answer TCGETS for pipe fds,
+    // isatty() returns true and programs like xz refuse to read their stdin
+    // ("Compressed data cannot be read from a terminal"). Let pipe ioctls
+    // fall through to the ENOSYS path so libc translates to ENOTTY.
+    bool isTtyFd = (fde->type == FdType::DevKeyboard) ||
                    (fde->type == FdType::Vnode && !fde->handle) ||
-                   (fde->type == FdType::Pipe) || (fde->type == FdType::DevTty);
+                   (fde->type == FdType::DevTty) ||
+                   ((fd <= 2) && fde->type != FdType::Pipe &&
+                                 fde->type != FdType::Socket);
     if (isTtyFd && cmd == 0x5401)
     {
         auto* t = reinterpret_cast<uint32_t*>(arg);
