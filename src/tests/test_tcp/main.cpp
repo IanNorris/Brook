@@ -12,6 +12,10 @@
 
 using namespace brook;
 
+namespace brook {
+    volatile uint64_t g_lapicTickCount = 0;
+}
+
 static int g_pass = 0;
 static int g_fail = 0;
 

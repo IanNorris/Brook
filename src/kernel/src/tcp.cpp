@@ -77,18 +77,30 @@ TcpAction TcpProcessSegment(Socket& s,
             s.tcpRcvNxt += dataLen;
             act.sendAck = true;
         } else if (dataLen > 0) {
-            // Out of order — ACK with expected seq (dup-ack drives fast retransmit).
-            // We currently have no reassembly queue, so the data is DROPPED.
-            // Log first few + every 10th occurrence per socket so we can see
-            // when TLS corruption is caused by our own OOO drops versus the
-            // wire losing packets.
+            // Out of order — either stale (seq < rcvNxt, duplicate after our
+            // ACK was lost) or future (seq > rcvNxt, a gap).  We have no
+            // reassembly queue, so future data is DROPPED.  Stale data is
+            // harmless but means the peer didn't see our ACK.
+            int32_t gap = (int32_t)(seq - s.tcpRcvNxt);
+            bool stale = gap < 0;
             s.oooDropCount++;
-            if (s.oooDropCount <= 5 || (s.oooDropCount % 10) == 0) {
-                int32_t gap = (int32_t)(seq - s.tcpRcvNxt);
-                SerialPrintf("tcp: OOO DROP pid=%u seq=%u rcvNxt=%u gap=%d len=%u count=%u\n",
+            if (s.oooDropCount <= 5 || (s.oooDropCount % 50) == 0) {
+                SerialPrintf("tcp: OOO %s pid=%u seq=%u rcvNxt=%u gap=%d len=%u count=%u\n",
+                             stale ? "STALE" : "FUTURE",
                              s.ownerPid, seq, s.tcpRcvNxt, gap, dataLen, s.oooDropCount);
             }
-            act.sendAck = true;
+            // Rate-limit ACKs to stale segments — one immediate dup-ACK per
+            // retransmit is counter-productive (triggers more fast retransmit).
+            // Only ACK once per 100ms of stale repeats.
+            extern volatile uint64_t g_lapicTickCount;
+            if (stale) {
+                if (g_lapicTickCount - s.lastStaleAckTick > 100) {
+                    act.sendAck = true;
+                    s.lastStaleAckTick = g_lapicTickCount;
+                }
+            } else {
+                act.sendAck = true; // future gap — send dup-ACK to drive fast retransmit
+            }
         }
 
         // Only accept FIN if it's at the expected sequence number.
