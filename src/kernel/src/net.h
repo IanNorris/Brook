@@ -284,6 +284,7 @@ struct Socket {
 
     // Diagnostic counters (not reset on reuse — per-socket lifetime)
     uint32_t rxPktCount;   // total TCP segments received on this socket
+    uint32_t oooDropCount; // TCP segments dropped for being out-of-order
 
     // Owner PID (tgid) — set when socket is created via sys_socket. Diagnostic only.
     uint32_t ownerPid;

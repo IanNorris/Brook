@@ -77,7 +77,17 @@ TcpAction TcpProcessSegment(Socket& s,
             s.tcpRcvNxt += dataLen;
             act.sendAck = true;
         } else if (dataLen > 0) {
-            // Out of order — ACK with expected seq
+            // Out of order — ACK with expected seq (dup-ack drives fast retransmit).
+            // We currently have no reassembly queue, so the data is DROPPED.
+            // Log first few + every 10th occurrence per socket so we can see
+            // when TLS corruption is caused by our own OOO drops versus the
+            // wire losing packets.
+            s.oooDropCount++;
+            if (s.oooDropCount <= 5 || (s.oooDropCount % 10) == 0) {
+                int32_t gap = (int32_t)(seq - s.tcpRcvNxt);
+                SerialPrintf("tcp: OOO DROP pid=%u seq=%u rcvNxt=%u gap=%d len=%u count=%u\n",
+                             s.ownerPid, seq, s.tcpRcvNxt, gap, dataLen, s.oooDropCount);
+            }
             act.sendAck = true;
         }
 
