@@ -210,7 +210,8 @@ uint64_t ElfLoadAt(const uint8_t* data, uint64_t size,
                    uint64_t base, PageTable pt, uint16_t pid);
 
 // Base address where the dynamic linker / interpreter is loaded.
-static constexpr uint64_t INTERP_LOAD_BASE = 0x40000000ULL; // 1 GB
+// Placed above USER_MMAP_END so it can never collide with sys_mmap allocations.
+static constexpr uint64_t INTERP_LOAD_BASE = 0x7F0000000000ULL; // ~127 TB
 
 // ---------------------------------------------------------------------------
 // LoadInterpreter -- Read and load the ELF interpreter specified in

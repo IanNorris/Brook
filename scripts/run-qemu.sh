@@ -203,7 +203,7 @@ if [ -n "${SCRIPT_NAME}" ]; then
 fi
 
 if [ "$HEADLESS" -eq 1 ]; then
-    SERIAL_OPT="-serial stdio"
+    SERIAL_OPT="${SERIAL_OPT:--serial stdio}"
     BROOK_AUDIODEV="${BROOK_AUDIODEV:-none}"
     if [ -n "$VNC_DISPLAY" ] && [ "$VNC_DISPLAY" != "__NEXT_VNC__" ]; then
         DISPLAY_OPT="-vnc ${VNC_DISPLAY}"
