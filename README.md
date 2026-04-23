@@ -16,6 +16,12 @@
 
 <p align="center"><em>Brook's compositing window manager running DOOM alongside an interactive bash terminal</em></p>
 
+<p align="center">
+  <img src="docs/images/brook_quake2_lan.png" alt="Two Brook VMs playing Quake 2 LAN deathmatch over a VDE virtual switch" width="800">
+</p>
+
+<p align="center"><em>Two Brook VMs playing Quake 2 LAN deathmatch over a VDE virtual switch — real UDP sockets, static-IP config, multi-NIC kernel routing</em></p>
+
 ## What is Brook?
 
 Brook is a hobby operating system for x86-64, written from scratch in C++ with
