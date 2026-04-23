@@ -42,6 +42,7 @@
 #include "fat_test_image.h"
 #include "fw_cfg.h"
 #include "rtc.h"
+#include "kvmclock.h"
 
 // All kernel initialization and runtime — called by KernelMain after stack switch.
 __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootProtocol);
@@ -175,6 +176,10 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         brook::RtcInit();
         // Default timezone: UTC+0 (UK). Set to UTC+1 for BST when needed.
         brook::RtcSetTimezoneOffset(0);
+
+        // KVM paravirt clock — high-precision monotonic time when running
+        // under KVM.  Falls back silently on bare metal / non-KVM hosts.
+        brook::KvmClockInit();
     }
     else
     {
