@@ -7740,6 +7740,101 @@ static int64_t sys_socketpair(uint64_t domain, uint64_t type, uint64_t protocol,
     return 0;
 }
 
+// Linux x86-64 ABI constants (match <sys/socket.h>).
+static constexpr int SOL_SOCKET  = 1;
+static constexpr int SCM_RIGHTS  = 1;
+
+struct CmsgHdr {
+    uint64_t cmsg_len;   // socklen_t in struct, but aligned to 8 bytes
+    int      cmsg_level;
+    int      cmsg_type;
+    // followed by data, padded to 8
+};
+
+// CMSG alignment rounds to sizeof(size_t) = 8 on x86-64.
+static inline uint64_t CmsgAlign(uint64_t n) { return (n + 7) & ~uint64_t{7}; }
+
+// Take an FdEntry snapshot suitable for passing over AF_UNIX. Bumps the
+// underlying handle's refcount so the sender can close their fd without
+// freeing the kernel object out from under the receiver.
+static bool UnixFdSnapFrom(const FdEntry* src, UnixFdSnap* out)
+{
+    if (!src || src->type == FdType::None) return false;
+    switch (src->type) {
+        case FdType::MemFd:
+            if (src->handle) MemFdRef(static_cast<MemFdData*>(src->handle));
+            break;
+        case FdType::Vnode:
+            if (src->handle)
+                __atomic_fetch_add(&static_cast<Vnode*>(src->handle)->refCount,
+                                    1, __ATOMIC_RELEASE);
+            break;
+        case FdType::Socket:
+            if (src->handle) {
+                int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(src->handle)) - 1;
+                brook::SockRef(sockIdx);
+            }
+            break;
+        default:
+            // Other fd types (Pipe, UnixSocket, EventFd, EpollFd, TimerFd,
+            // DevDsp, etc.) don't have a portable snapshot refcount today.
+            // Wayland only needs MemFd (for wl_shm), so refuse quietly.
+            return false;
+    }
+    out->type        = src->type;
+    out->flags       = src->flags;
+    out->fdFlags     = src->fdFlags;
+    out->statusFlags = src->statusFlags;
+    out->handle      = src->handle;
+    return true;
+}
+
+// Install a snapshot into the receiver's fd table. On success the snap's
+// refcount becomes the new FdEntry's ref; on failure the caller must
+// release it (drainSnap) so we don't leak.
+static int UnixFdSnapInstall(Process* dst, const UnixFdSnap* snap)
+{
+    int fd = FdAlloc(dst, snap->type, snap->handle);
+    if (fd < 0) return -EMFILE;
+    dst->fds[fd].flags       = snap->flags;
+    dst->fds[fd].fdFlags     = snap->fdFlags;
+    dst->fds[fd].statusFlags = snap->statusFlags;
+    return fd;
+}
+
+static void UnixFdSnapRelease(const UnixFdSnap* snap)
+{
+    if (!snap || !snap->handle) return;
+    switch (snap->type) {
+        case FdType::MemFd:
+            MemFdUnref(static_cast<MemFdData*>(snap->handle));
+            break;
+        case FdType::Vnode: {
+            auto* vn = static_cast<Vnode*>(snap->handle);
+            uint32_t prev = __atomic_fetch_sub(&vn->refCount, 1, __ATOMIC_ACQ_REL);
+            if (prev <= 1) VfsClose(vn);
+            break;
+        }
+        case FdType::Socket: {
+            int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(snap->handle)) - 1;
+            brook::SockUnref(sockIdx);
+            break;
+        }
+        default: break;
+    }
+}
+
+struct LinuxMsgHdr {
+    void*    msg_name;
+    uint32_t msg_namelen;
+    uint32_t _pad0;
+    struct { void* iov_base; uint64_t iov_len; }* msg_iov;
+    uint64_t msg_iovlen;
+    void*    msg_control;
+    uint64_t msg_controllen;
+    int      msg_flags;
+};
+
 static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
                             uint64_t, uint64_t, uint64_t)
 {
@@ -7750,35 +7845,100 @@ static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
     int fd = static_cast<int>(fdVal);
     if (msgVal < 0x1000) return -EFAULT;
 
-    struct MsgHdr {
-        void*    msg_name;
-        uint32_t msg_namelen;
-        uint32_t _pad0;
-        struct { void* iov_base; uint64_t iov_len; }* msg_iov;
-        uint64_t msg_iovlen;
-        void*    msg_control;
-        uint64_t msg_controllen;
-        int      msg_flags;
-    };
-    auto* msg = reinterpret_cast<MsgHdr*>(msgVal);
+    auto* msg = reinterpret_cast<LinuxMsgHdr*>(msgVal);
     if (!msg || msg->msg_iovlen == 0 || !msg->msg_iov) return -EINVAL;
 
-    // AF_UNIX: route through sys_write for each iov
     FdEntry* fde = FdGet(proc, fd);
-    if (fde && fde->type == FdType::UnixSocket) {
-        int64_t total = 0;
-        for (uint64_t i = 0; i < msg->msg_iovlen; i++) {
-            void* base = msg->msg_iov[i].iov_base;
-            uint64_t len = msg->msg_iov[i].iov_len;
-            if (!base || len == 0) continue;
-            int64_t ret = sys_write(fd, reinterpret_cast<uint64_t>(base), len, 0, 0, 0);
-            if (ret < 0) return (total > 0) ? total : ret;
-            total += ret;
+    if (!fde || fde->type != FdType::UnixSocket) return -ENOSYS;
+
+    auto* usd = static_cast<UnixSocketData*>(fde->handle);
+
+    // Parse SCM_RIGHTS cmsg (if any) BEFORE writing payload. If cmsg parsing
+    // fails (bad pointer, wrong type, fd full) we refuse the whole sendmsg
+    // rather than send orphaned payload — matches Linux kernel behaviour.
+    UnixFdSnap pendingSnaps[UNIX_FD_QUEUE_CAP];
+    int pendingCount = 0;
+
+    if (msg->msg_control && msg->msg_controllen >= sizeof(CmsgHdr)) {
+        uint64_t ctlAddr = reinterpret_cast<uint64_t>(msg->msg_control);
+        if (ctlAddr < 0x1000) return -EFAULT;
+
+        uint64_t off = 0;
+        while (off + sizeof(CmsgHdr) <= msg->msg_controllen) {
+            auto* cm = reinterpret_cast<CmsgHdr*>(ctlAddr + off);
+            if (cm->cmsg_len < sizeof(CmsgHdr) || cm->cmsg_len > msg->msg_controllen - off)
+                break;
+
+            if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS) {
+                uint64_t dataLen = cm->cmsg_len - sizeof(CmsgHdr);
+                uint64_t nFds    = dataLen / sizeof(int);
+                auto* fds = reinterpret_cast<int*>(
+                    reinterpret_cast<uint64_t>(cm) + sizeof(CmsgHdr));
+
+                for (uint64_t i = 0; i < nFds; i++) {
+                    if (pendingCount >= UNIX_FD_QUEUE_CAP) {
+                        for (int j = 0; j < pendingCount; j++)
+                            UnixFdSnapRelease(&pendingSnaps[j]);
+                        return -EAGAIN;
+                    }
+                    FdEntry* srcFde = FdGet(proc, fds[i]);
+                    if (!srcFde || !UnixFdSnapFrom(srcFde, &pendingSnaps[pendingCount])) {
+                        for (int j = 0; j < pendingCount; j++)
+                            UnixFdSnapRelease(&pendingSnaps[j]);
+                        return -EBADF;
+                    }
+                    pendingCount++;
+                }
+            }
+
+            uint64_t step = CmsgAlign(cm->cmsg_len);
+            if (step == 0) break;
+            off += step;
         }
-        return total;
     }
 
-    return -ENOSYS;
+    // Now enqueue the snapshots on the peer's incoming queue. If the queue
+    // is full, fail — don't partial-send cmsg.
+    if (pendingCount > 0) {
+        UnixFdQueue* q = usd->peerIncomingFds;
+        if (!q) {
+            for (int j = 0; j < pendingCount; j++) UnixFdSnapRelease(&pendingSnaps[j]);
+            return -ENOTCONN;
+        }
+        if (UnixFdQueueCount(q) + pendingCount >= UNIX_FD_QUEUE_CAP) {
+            for (int j = 0; j < pendingCount; j++) UnixFdSnapRelease(&pendingSnaps[j]);
+            return -EAGAIN;
+        }
+        for (int j = 0; j < pendingCount; j++) {
+            q->msgs[q->head] = pendingSnaps[j];
+            q->head = (q->head + 1) % UNIX_FD_QUEUE_CAP;
+        }
+    }
+
+    // Write the iov payload. If we enqueued fds but the payload write fails,
+    // drain the snaps back out so we don't leak/strand them. Linux actually
+    // delivers cmsg with the first data byte; we approximate by requiring at
+    // least one payload byte alongside any fds — Wayland always sends both.
+    int64_t total = 0;
+    for (uint64_t i = 0; i < msg->msg_iovlen; i++) {
+        void* base = msg->msg_iov[i].iov_base;
+        uint64_t len = msg->msg_iov[i].iov_len;
+        if (!base || len == 0) continue;
+        int64_t ret = sys_write(fd, reinterpret_cast<uint64_t>(base), len, 0, 0, 0);
+        if (ret < 0) {
+            // If nothing was sent at all and we'd pushed fds, back them out.
+            if (total == 0 && pendingCount > 0) {
+                UnixFdQueue* q = usd->peerIncomingFds;
+                for (int j = 0; j < pendingCount; j++) {
+                    q->head = (q->head - 1 + UNIX_FD_QUEUE_CAP) % UNIX_FD_QUEUE_CAP;
+                    UnixFdSnapRelease(&q->msgs[q->head]);
+                }
+            }
+            return (total > 0) ? total : ret;
+        }
+        total += ret;
+    }
+    return total;
 }
 
 static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
@@ -7791,24 +7951,13 @@ static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
     int fd = static_cast<int>(fdVal);
     if (msgVal < 0x1000) return -EFAULT;
 
-    // msghdr structure (matching Linux x86-64 ABI)
-    struct MsgHdr {
-        void*    msg_name;
-        uint32_t msg_namelen;
-        uint32_t _pad0;
-        struct { void* iov_base; uint64_t iov_len; }* msg_iov;
-        uint64_t msg_iovlen;
-        void*    msg_control;
-        uint64_t msg_controllen;
-        int      msg_flags;
-    };
-
-    auto* msg = reinterpret_cast<MsgHdr*>(msgVal);
+    auto* msg = reinterpret_cast<LinuxMsgHdr*>(msgVal);
     if (!msg || msg->msg_iovlen == 0 || !msg->msg_iov) return -EINVAL;
 
-    // AF_UNIX: receive through sys_read for each iov
     FdEntry* fde = FdGet(proc, fd);
     if (fde && fde->type == FdType::UnixSocket) {
+        auto* usd = static_cast<UnixSocketData*>(fde->handle);
+
         int64_t total = 0;
         for (uint64_t i = 0; i < msg->msg_iovlen; i++) {
             void* base = msg->msg_iov[i].iov_base;
@@ -7816,18 +7965,74 @@ static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
             if (!base || len == 0) continue;
             int64_t ret = sys_read(fd, reinterpret_cast<uint64_t>(base), len, 0, 0, 0);
             if (ret < 0) return (total > 0) ? total : ret;
-            if (ret == 0) break; // EOF
+            if (ret == 0) break;
             total += ret;
         }
+
+        // Drain any pending SCM_RIGHTS fds from our incoming queue into the
+        // caller's cmsg buffer. We only deliver fds when we also delivered
+        // at least one data byte — Wayland's preferred semantics and what
+        // libc callers expect.
         msg->msg_flags = 0;
-        msg->msg_controllen = 0;
+        uint64_t wroteCtl = 0;
+
+        if (total > 0 && usd->incomingFds &&
+            msg->msg_control && msg->msg_controllen >= sizeof(CmsgHdr))
+        {
+            uint64_t ctlAddr = reinterpret_cast<uint64_t>(msg->msg_control);
+            if (ctlAddr >= 0x1000) {
+                UnixFdQueue* q = usd->incomingFds;
+                uint64_t cap   = msg->msg_controllen;
+                uint64_t off   = 0;
+
+                int n = UnixFdQueueCount(q);
+                if (n > 0) {
+                    // One SCM_RIGHTS cmsg can hold multiple fds back-to-back.
+                    uint64_t fdsMax = (cap - sizeof(CmsgHdr)) / sizeof(int);
+                    int installed = 0;
+                    int wantFds   = n;
+                    if ((uint64_t)wantFds > fdsMax) {
+                        wantFds = static_cast<int>(fdsMax);
+                        msg->msg_flags |= 0x8; // MSG_CTRUNC
+                    }
+                    if (wantFds > 0) {
+                        auto* cm = reinterpret_cast<CmsgHdr*>(ctlAddr + off);
+                        auto* fdSlot = reinterpret_cast<int*>(
+                            reinterpret_cast<uint64_t>(cm) + sizeof(CmsgHdr));
+
+                        for (int j = 0; j < wantFds; j++) {
+                            UnixFdSnap snap = q->msgs[q->tail];
+                            q->tail = (q->tail + 1) % UNIX_FD_QUEUE_CAP;
+
+                            int newFd = UnixFdSnapInstall(proc, &snap);
+                            if (newFd < 0) {
+                                // Out of fds — put it back at the tail head-side
+                                // (we already advanced tail; rewind one slot).
+                                q->tail = (q->tail - 1 + UNIX_FD_QUEUE_CAP) % UNIX_FD_QUEUE_CAP;
+                                q->msgs[q->tail] = snap;
+                                break;
+                            }
+                            fdSlot[installed++] = newFd;
+                        }
+
+                        if (installed > 0) {
+                            cm->cmsg_len   = sizeof(CmsgHdr) + installed * sizeof(int);
+                            cm->cmsg_level = SOL_SOCKET;
+                            cm->cmsg_type  = SCM_RIGHTS;
+                            wroteCtl = CmsgAlign(cm->cmsg_len);
+                        }
+                    }
+                }
+            }
+        }
+
+        msg->msg_controllen = wroteCtl;
         return total;
     }
 
     int sockIdx = GetSockIdx(proc, fd);
     if (sockIdx < 0) return -EBADF;
 
-    // Use first iov entry as receive buffer
     void* buf = msg->msg_iov[0].iov_base;
     uint32_t len = static_cast<uint32_t>(msg->msg_iov[0].iov_len);
     if (!buf || len == 0) return -EINVAL;
