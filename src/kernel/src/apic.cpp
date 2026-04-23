@@ -354,6 +354,48 @@ bool ApicInit(uint64_t localApicPhysical)
     SerialPrintf("APIC: LAPIC ID=%u, version=0x%x, timer running at 1ms intervals\n",
                  ApicGetId(),
                  LapicRead(LapicReg::VERSION) & 0xFF);
+
+    // Sanity-check: verify LAPIC-tick-counted ms advance at the same rate as
+    // an independent PIT-gated wall-clock window.  PIT channel 2 is 16-bit,
+    // so a single one-shot tops out at ~54ms (65535/1193182).  For longer
+    // windows we chain multiple 50ms one-shots.  Expected: dMs ~= windowMs.
+    {
+        __asm__ volatile("sti");
+
+        auto measure = [](uint32_t windowMs) {
+            constexpr uint32_t CHUNK_MS = 50;
+            constexpr uint32_t PIT_CHUNK = (PIT_FREQUENCY * CHUNK_MS) / 1000;
+
+            uint64_t tStart = g_lapicTickCount;
+            uint32_t chunks = windowMs / CHUNK_MS;
+            uint8_t  prev61 = inb(0x61);
+            for (uint32_t i = 0; i < chunks; i++)
+            {
+                outb(0x61, prev61 & ~0x03);
+                outb(0x43, 0xB0);
+                outb(0x42, static_cast<uint8_t>(PIT_CHUNK & 0xFF));
+                outb(0x42, static_cast<uint8_t>(PIT_CHUNK >> 8));
+                outb(0x61, (prev61 & ~0x02) | 0x01);
+                while (!(inb(0x61) & 0x20)) {}
+            }
+            outb(0x61, prev61);
+            uint64_t tEnd = g_lapicTickCount;
+
+            uint64_t dMs   = tEnd - tStart;
+            uint32_t realMs = chunks * CHUNK_MS;
+            int32_t  skew  = static_cast<int32_t>(dMs) -
+                             static_cast<int32_t>(realMs);
+            SerialPrintf("APIC: self-test — %u ms real, %lu ms kernel "
+                         "(skew %d ms, %d%%)\n",
+                         realMs, dMs, skew,
+                         (skew * 100) / static_cast<int32_t>(realMs));
+        };
+
+        measure(50);
+        measure(200);
+        measure(500);
+    }
+
     return true;
 }
 
