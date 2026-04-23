@@ -47,38 +47,55 @@ clone_if_exists "${ROOT_DIR}/brook_ext2_disk.img"  "${VM1_DIR}/brook_ext2_disk.i
 clone_if_exists "${ROOT_DIR}/brook_nix_disk.img"   "${VM1_DIR}/brook_nix_disk.img"
 clone_if_exists "${ROOT_DIR}/brook_home_disk.img"  "${VM1_DIR}/brook_home_disk.img"
 
-# Per-instance ESP directories (copies of build/{type}/esp) so the two
-# QEMUs don't fight over fat:rw: on the same directory, and so we can
-# stamp per-instance BROOK.CFG with distinct static IPs.
+# Per-instance ESP directories.  We build them from scratch (bootloader +
+# kernel + BROOK.CFG + initrd) rather than from build/{type}/esp so the
+# pair script works even on a fresh checkout where run-qemu.sh hasn't
+# populated that directory yet.
 BUILD_TYPE="${BUILD_TYPE_ARG#--}"
 BUILD_TYPE="${BUILD_TYPE:-debug}"
-SRC_ESP="${ROOT_DIR}/build/${BUILD_TYPE}/esp"
+BUILD_DIR="${ROOT_DIR}/build/${BUILD_TYPE}"
+BOOTLOADER="${BUILD_DIR}/bootloader/BOOTX64.efi"
+KERNEL_ELF="${BUILD_DIR}/kernel/BROOK.elf"
+
+if [ ! -f "${BOOTLOADER}" ] || [ ! -f "${KERNEL_ELF}" ]; then
+    echo "ERROR: bootloader or kernel missing in ${BUILD_DIR}."
+    echo "Build first:  scripts/build.sh ${BUILD_TYPE^}"
+    exit 1
+fi
+
+# Make sure initrd exists (run-qemu.sh normally regenerates it).
+"${SCRIPT_DIR}/make_initrd.sh" "--${BUILD_TYPE}" >/dev/null
+
 VM0_DIR=/tmp/brook-vm0
 VM0_ESP="${VM0_DIR}/esp"
 VM1_ESP="${VM1_DIR}/esp"
 mkdir -p "${VM0_DIR}"
 rm -rf "${VM0_ESP}" "${VM1_ESP}"
-cp -r "${SRC_ESP}" "${VM0_ESP}"
-cp -r "${SRC_ESP}" "${VM1_ESP}"
 
-# Strip any existing NET0_* lines, then append per-instance static config.
-stamp_brook_cfg() {
-    local cfg="$1"
+build_esp() {
+    local dst="$1"
     local ip="$2"
-    if [ -f "${cfg}" ]; then
-        grep -v '^NET0_' "${cfg}" > "${cfg}.tmp" || true
-        mv "${cfg}.tmp" "${cfg}"
-    else
-        touch "${cfg}"
+    mkdir -p "${dst}/EFI/BOOT" "${dst}/KERNEL"
+    cp "${BOOTLOADER}" "${dst}/EFI/BOOT/BOOTX64.EFI"
+    cp "${KERNEL_ELF}" "${dst}/KERNEL/BROOK.ELF"
+    # Initrd (contains early drivers + any config)
+    if [ -f "${BUILD_DIR}/initrd.img" ]; then
+        cp "${BUILD_DIR}/initrd.img" "${dst}/INITRD.IMG"
     fi
-    cat >> "${cfg}" <<EOF
+    cat > "${dst}/BROOK.CFG" <<EOF
+# Brook OS boot configuration (pair instance)
+TARGET=KERNEL\\BROOK.ELF
+DEBUG_TEXT=0
+LOG_MEMORY=0
+LOG_INTERRUPTS=0
 NET0_MODE=static
 NET0_IP=${ip}
 NET0_NETMASK=255.255.255.0
 EOF
 }
-stamp_brook_cfg "${VM0_ESP}/BROOK.CFG" 10.42.0.10
-stamp_brook_cfg "${VM1_ESP}/BROOK.CFG" 10.42.0.11
+
+build_esp "${VM0_ESP}" 10.42.0.10
+build_esp "${VM1_ESP}" 10.42.0.11
 echo "VM0 static IP: 10.42.0.10   VM1 static IP: 10.42.0.11"
 
 # 3) Launch both VMs. Instance 0 in the background, instance 1 in foreground
