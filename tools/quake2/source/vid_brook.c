@@ -6,6 +6,7 @@
  */
 
 #include "client.h"
+#include "qmenu.h"
 
 #include <stdio.h>
 #include <stdarg.h>
@@ -141,14 +142,89 @@ void VID_CheckChanges(void)
 
 void VID_MenuInit(void)
 {
-    // Simplified — no video mode menu
+    static const char *resolutions[VID_NUM_MODES + 1];
+    static char        resbufs[VID_NUM_MODES][16];
+    static menuframework_s s_video_menu;
+    static menulist_s      s_mode_list;
+    static menuaction_s    s_apply_action;
+
+    // Build the resolution-names array once (pointers stay valid for menu lifetime).
+    for (int i = 0; i < (int)VID_NUM_MODES; i++)
+    {
+        snprintf(resbufs[i], sizeof(resbufs[i]), "%dx%d",
+                 vid_modes[i].width, vid_modes[i].height);
+        resolutions[i] = resbufs[i];
+    }
+    resolutions[VID_NUM_MODES] = NULL;
+
+    // Find current mode (closest match to viddef.width/height, else 0).
+    int curMode = 0;
+    for (int i = 0; i < (int)VID_NUM_MODES; i++)
+    {
+        if (vid_modes[i].width == (int)viddef.width &&
+            vid_modes[i].height == (int)viddef.height)
+        {
+            curMode = i;
+            break;
+        }
+    }
+
+    fprintf(stderr,
+            "VID_MenuInit: cur=%dx%d mapped to mode %d; %u modes available\n",
+            (int)viddef.width, (int)viddef.height, curMode, (unsigned)VID_NUM_MODES);
+
+    s_video_menu.x      = viddef.width / 2;
+    s_video_menu.y      = viddef.height / 2 - 58;
+    s_video_menu.nitems = 0;
+
+    s_mode_list.generic.type         = MTYPE_LIST;
+    s_mode_list.generic.name         = "video mode";
+    s_mode_list.generic.x            = 0;
+    s_mode_list.generic.y            = 0;
+    s_mode_list.itemnames            = resolutions;
+    s_mode_list.curvalue             = curMode;
+
+    s_apply_action.generic.type      = MTYPE_ACTION;
+    s_apply_action.generic.name      = "apply (not supported yet)";
+    s_apply_action.generic.x         = 0;
+    s_apply_action.generic.y         = 30;
+    s_apply_action.generic.flags     = QMF_GRAYED;
+    s_apply_action.generic.callback  = NULL;
+
+    Menu_AddItem(&s_video_menu, &s_mode_list);
+    Menu_AddItem(&s_video_menu, &s_apply_action);
+
+    Menu_Center(&s_video_menu);
+    s_video_menu.x -= 8;
+
+    // Stash for Draw/Key callbacks.
+    extern menuframework_s *g_vid_menu;
+    g_vid_menu = &s_video_menu;
 }
+
+menuframework_s *g_vid_menu = NULL;
 
 void VID_MenuDraw(void)
 {
+    if (!g_vid_menu)
+    {
+        fprintf(stderr, "VID_MenuDraw: g_vid_menu NULL — VID_MenuInit never ran?\n");
+        return;
+    }
+
+    // Center banner (fall back gracefully if the pic is missing).
+    int w = 0, h = 0;
+    re.DrawGetPicSize(&w, &h, "m_banner_video");
+    if (w > 0 && h > 0)
+        re.DrawPic(viddef.width / 2 - w / 2, viddef.height / 2 - 110, "m_banner_video");
+
+    Menu_AdjustCursor(g_vid_menu, 1);
+    Menu_Draw(g_vid_menu);
 }
 
 const char *VID_MenuKey(int key)
 {
-    return NULL;
+    extern const char *Default_MenuKey(menuframework_s *m, int key);
+    if (!g_vid_menu) return NULL;
+    return Default_MenuKey(g_vid_menu, key);
 }
