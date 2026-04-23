@@ -50,15 +50,21 @@ echo "Building host tests..."
 HOST_TEST_DIR="${BUILD_DIR}/host_tests"
 mkdir -p "${HOST_TEST_DIR}"
 HOST_COMPILER="${HOST_CXX:-${CXX:-c++}}"
-cmake \
+if cmake \
     -S "${ROOT_DIR}/src/tests/host" \
     -B "${HOST_TEST_DIR}" \
     -DCMAKE_CXX_COMPILER="${HOST_COMPILER}" \
     -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
     -DBROOK_ROOT="${ROOT_DIR}" \
-    -G Ninja 2>/dev/null
-cmake --build "${HOST_TEST_DIR}" 2>/dev/null && \
-    echo "Host tests built." || \
-    echo "Host tests skipped (no host C++ toolchain)."
+    -G Ninja >/dev/null 2>&1
+then
+    if cmake --build "${HOST_TEST_DIR}" >/dev/null 2>&1; then
+        echo "Host tests built."
+    else
+        echo "Host tests skipped (build failed — rerun with verbose to debug)."
+    fi
+else
+    echo "Host tests skipped (configure failed — likely stale CMake cache; rm -rf ${HOST_TEST_DIR} to fix)."
+fi
 
 echo "Done. Artifacts in ${BUILD_DIR}/"
