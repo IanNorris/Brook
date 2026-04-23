@@ -162,6 +162,9 @@ void SchedulerTimerTick();
 // Forward-declare profiler sample (defined in profiler.cpp).
 void ProfilerSample(uint64_t interruptedRip, uint64_t interruptedCs, uint64_t interruptedRbp);
 
+// Forward-declare RTC recalibration (defined in rtc.cpp).
+void RtcRecalibrateLapic();
+
 // C handler called from the naked ISR wrapper below.
 // interruptedRip/interruptedCs/interruptedRbp are passed from the naked
 // handler (extracted from the CPU interrupt frame on the stack).
@@ -177,6 +180,12 @@ static void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interrupted
     {
         g_lapicTickCount++;
 
+        // Re-check CMOS every ~1024 ticks (~1 second) to correct for
+        // LAPIC calibration drift under host turbo / KVM dilation.
+        if ((g_lapicTickCount & 0x3FF) == 0)
+        {
+            RtcRecalibrateLapic();
+        }
     }
 
     // Record a profiler sample (fast no-op when profiling is disabled).

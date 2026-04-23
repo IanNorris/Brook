@@ -8,6 +8,10 @@ namespace brook {
 // Must be called early in boot (before LAPIC timer starts).
 void RtcInit();
 
+// Re-align g_lapicTickCount against the CMOS RTC.  Called once per second
+// from the BSP's LAPIC timer ISR to correct for timer calibration drift.
+void RtcRecalibrateLapic();
+
 // Get current wall-clock time as Unix timestamp (UTC).
 uint64_t RtcNow();
 

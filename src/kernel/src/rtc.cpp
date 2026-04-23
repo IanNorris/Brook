@@ -20,6 +20,11 @@ static uint64_t g_bootTick = 0;
 // Timezone offset in seconds east of UTC.
 static int32_t g_tzOffsetSec = 0;
 
+// Last RTC epoch sampled by RtcRecalibrateLapic, and the g_lapicTickCount
+// reading that accompanied it.  Used to detect RTC jumps and throttle work.
+static uint64_t g_lastRtcSec = 0;
+static uint64_t g_lastRtcTick = 0;
+
 // ---------------------------------------------------------------------------
 // CMOS RTC access
 // ---------------------------------------------------------------------------
@@ -152,12 +157,101 @@ void RtcInit()
 
     g_bootEpochSec = DateToEpoch(fullYear, mon, day, hr, min, sec);
     g_bootTick = g_lapicTickCount;
+    g_lastRtcSec = g_bootEpochSec;
+    g_lastRtcTick = g_bootTick;
 
     // Default timezone: UTC+0 (configurable via RtcSetTimezoneOffset)
     g_tzOffsetSec = 0;
 
     SerialPrintf("RTC: %04u-%02u-%02u %02u:%02u:%02u UTC\n",
                  fullYear, mon, day, hr, min, sec);
+}
+
+// Non-blocking CMOS snapshot: returns 0 if the RTC is mid-update or the
+// two consecutive reads disagreed (meaning we caught an update).  Safe to
+// call from a LAPIC ISR: only issues ~14 port reads, never spins.
+static uint64_t TryReadCmosEpoch()
+{
+    if (CmosUpdateInProgress()) return 0;
+
+    uint8_t sec1 = CmosRead(0x00);
+    uint8_t min1 = CmosRead(0x02);
+    uint8_t hr1  = CmosRead(0x04);
+    uint8_t day1 = CmosRead(0x07);
+    uint8_t mon1 = CmosRead(0x08);
+    uint8_t yr1  = CmosRead(0x09);
+    if (CmosUpdateInProgress()) return 0;
+    uint8_t sec2 = CmosRead(0x00);
+    if (sec1 != sec2) return 0;
+
+    uint8_t regB = CmosRead(0x0B);
+    bool bcd = !(regB & 0x04);
+    bool h24 = (regB & 0x02) != 0;
+
+    uint32_t sec = bcd ? BcdToBin(sec1) : sec1;
+    uint32_t min = bcd ? BcdToBin(min1) : min1;
+    uint32_t hr  = bcd ? BcdToBin(hr1 & 0x7F) : (hr1 & 0x7F);
+    uint32_t day = bcd ? BcdToBin(day1) : day1;
+    uint32_t mon = bcd ? BcdToBin(mon1) : mon1;
+    uint32_t yr  = bcd ? BcdToBin(yr1)  : yr1;
+
+    if (!h24 && (hr1 & 0x80))
+        hr = (hr == 12) ? 12 : hr + 12;
+    else if (!h24 && hr == 12)
+        hr = 0;
+
+    uint32_t fullYear = (yr < 70) ? 2000 + yr : 1900 + yr;
+    return DateToEpoch(fullYear, mon, day, hr, min, sec);
+}
+
+// Re-align g_lapicTickCount against the CMOS RTC.  Called periodically from
+// the BSP's LAPIC timer ISR.  The LAPIC timer is calibrated once at boot
+// against the PIT; under real hardware turbo-boost (or KVM timer drift)
+// it can skew by 10-20% from wall-clock.  Since every Brook time source
+// (clock_gettime, gettimeofday, nanosleep scheduling) is based on this
+// counter, letting it skew makes user-space time sources diverge from
+// reality.  We rebase by reading CMOS (1-second resolution) once a second
+// and nudging g_lapicTickCount so it matches wall time.
+//
+// The counter is never decremented — only paused (when LAPIC is running
+// fast) or jumped forward (when running slow).
+void RtcRecalibrateLapic()
+{
+    uint64_t tickNow = g_lapicTickCount;
+    uint64_t rtcSec = TryReadCmosEpoch();
+    if (rtcSec == 0) return;  // RTC busy, try again next pass
+
+    // Only act when RTC has actually advanced — otherwise our drift
+    // estimate is sub-second and unreliable.
+    if (rtcSec == g_lastRtcSec) return;
+    if (rtcSec < g_lastRtcSec) {
+        // Clock went backwards (user changed RTC?) — resync baseline.
+        g_lastRtcSec = rtcSec;
+        g_lastRtcTick = tickNow;
+        g_bootEpochSec = rtcSec - (tickNow - g_bootTick) / 1000;
+        return;
+    }
+
+    uint64_t expectedMsSinceBoot = (rtcSec - g_bootEpochSec) * 1000;
+    uint64_t actualMsSinceBoot = tickNow - g_bootTick;
+
+    // Aim to land halfway through the current RTC second (add 500ms).
+    uint64_t targetMs = expectedMsSinceBoot + 500;
+
+    if (actualMsSinceBoot > targetMs + 1000) {
+        // LAPIC is running fast by more than 1 second — pause increments
+        // by nudging the apparent count backward.  This is the only time
+        // we touch the counter from outside the ISR increment path; both
+        // writes happen on the BSP from within the ISR so the store is
+        // safe.
+        g_lapicTickCount = g_bootTick + targetMs;
+    } else if (actualMsSinceBoot + 1000 < targetMs) {
+        // LAPIC is running slow — jump forward.
+        g_lapicTickCount = g_bootTick + targetMs;
+    }
+
+    g_lastRtcSec = rtcSec;
+    g_lastRtcTick = g_lapicTickCount;
 }
 
 uint64_t RtcNow()
