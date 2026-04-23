@@ -110,6 +110,7 @@ fi
 Q2_BIN="${ROOT_DIR}/build/quake2/quake2"
 Q2_PAK="${BROOK_Q2_PAK:-${ROOT_DIR}/../q2demo/Install/Data/baseq2/pak0.pak}"
 Q2_MUSIC="${BROOK_Q2_MUSIC:-${ROOT_DIR}/../q2ost}"
+Q2_PLAYERS="${BROOK_Q2_PLAYERS:-${ROOT_DIR}/../q2demo/Install/Data/baseq2/players}"
 if [ -f "${Q2_BIN}" ]; then
     mkdir -p "${MNTDIR}/games/quake2/baseq2/music" 2>/dev/null || true
     write_file "${Q2_BIN}" "games/quake2/quake2"
@@ -124,6 +125,14 @@ if [ -f "${Q2_BIN}" ]; then
             [ -f "$ogg" ] || continue
             write_file "$ogg" "games/quake2/baseq2/music/$(basename "$ogg")"
         done
+    fi
+    # Player models (live outside pak0.pak in the Q2 demo distribution)
+    if [ -d "${Q2_PLAYERS}" ]; then
+        echo "  Q2 player models from ${Q2_PLAYERS}"
+        mkdir -p "${MNTDIR}/games/quake2/baseq2/players"
+        cp -r "${Q2_PLAYERS}/." "${MNTDIR}/games/quake2/baseq2/players/"
+    else
+        echo "  (Q2 players dir not found at ${Q2_PLAYERS} — set BROOK_Q2_PLAYERS to override)"
     fi
 fi
 
