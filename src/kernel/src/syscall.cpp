@@ -261,7 +261,27 @@ struct MemFdData {
     uint8_t*  buf;
     uint64_t  size;
     uint64_t  capacity;
+    volatile uint32_t refCount; // +1 per fd holding this MemFdData
 };
+
+static inline void MemFdRef(MemFdData* mfd)
+{
+    if (mfd) __atomic_fetch_add(&mfd->refCount, 1, __ATOMIC_RELEASE);
+}
+
+static inline void MemFdUnref(MemFdData* mfd)
+{
+    if (!mfd) return;
+    uint32_t prev = __atomic_fetch_sub(&mfd->refCount, 1, __ATOMIC_ACQ_REL);
+    if (prev <= 1) {
+        if (mfd->buf) kfree(mfd->buf);
+        kfree(mfd);
+    }
+}
+
+// External wrappers for fork() in process.cpp, which doesn't see MemFdData.
+void MemFdHandleRef(void* handle) { MemFdRef(static_cast<MemFdData*>(handle)); }
+void MemFdHandleUnref(void* handle) { MemFdUnref(static_cast<MemFdData*>(handle)); }
 
 // ---------------------------------------------------------------------------
 // AF_UNIX path sockets — structs and helpers defined here so
@@ -273,10 +293,43 @@ static constexpr int UNIX_SOCK_NONBLOCK = 0x800;
 static constexpr int UNIX_SOCK_CLOEXEC  = 0x80000;
 static constexpr int UNIX_MAX_SERVERS   = 16;
 static constexpr int UNIX_ACCEPT_QUEUE  = 8;
+static constexpr int UNIX_FD_QUEUE_CAP  = 64;
+
+// Snapshot of an FdEntry passed across an AF_UNIX connection via SCM_RIGHTS.
+// The handle refcount is bumped on send (via the type-specific Ref helper),
+// transferred to the receiver on recv (no net refcount change), or dropped
+// on socket close (matching refcount decrement).
+struct UnixFdSnap {
+    FdType   type;
+    uint8_t  flags;
+    uint8_t  fdFlags;
+    uint32_t statusFlags;
+    void*    handle;
+};
+
+// FIFO of in-flight fds for one direction of a connected AF_UNIX pair.
+// Shared between sender (enqueue) and receiver (dequeue).
+struct UnixFdQueue {
+    UnixFdSnap   msgs[UNIX_FD_QUEUE_CAP];
+    volatile int head;
+    volatile int tail;
+    volatile uint32_t refCount; // one ref per UnixSocketData pointing at us
+};
+
+static inline int UnixFdQueueCount(const UnixFdQueue* q)
+{
+    return (q->head - q->tail + UNIX_FD_QUEUE_CAP) % UNIX_FD_QUEUE_CAP;
+}
+[[maybe_unused]] static inline bool UnixFdQueueFull(const UnixFdQueue* q)
+{
+    return UnixFdQueueCount(q) >= UNIX_FD_QUEUE_CAP - 1;
+}
 
 struct UnixPendingConn {
     PipeBuffer* serverRx;     // server reads this (client→server data)
     PipeBuffer* serverTx;     // server writes this (server→client data)
+    UnixFdQueue* serverRxFds; // server reads these fds (client→server)
+    UnixFdQueue* serverTxFds; // server writes these fds (server→client)
     Process*    clientWaiter; // client blocked until accept() completes
     bool        accepted;
     bool        used;
@@ -292,6 +345,8 @@ struct UnixSocketData {
     Process*        acceptWaiter;
     PipeBuffer* rxPipe;
     PipeBuffer* txPipe;
+    UnixFdQueue* incomingFds; // fds arriving on rxPipe
+    UnixFdQueue* peerIncomingFds; // fds we post to, drained by peer's recvmsg
 };
 
 struct SockAddrUn {
@@ -1480,6 +1535,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
             entry->mfd->buf = nullptr;
             entry->mfd->size = 0;
             entry->mfd->capacity = 0;
+            entry->mfd->refCount = 0;
             entry->used = true;
         }
 
@@ -1491,6 +1547,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
 
         int fd = FdAlloc(proc, FdType::MemFd, entry->mfd);
         if (fd < 0) return -EMFILE;
+        MemFdRef(entry->mfd);
         SerialPrintf("shm_open: '%s' fd=%d size=%llu\n", shmName, fd, entry->mfd->size);
         return fd;
     }
@@ -1657,8 +1714,7 @@ static int64_t sys_close(uint64_t fd, uint64_t, uint64_t,
     if (fde->type == FdType::MemFd && fde->handle)
     {
         auto* mfd = static_cast<MemFdData*>(fde->handle);
-        if (mfd->buf) kfree(mfd->buf);
-        kfree(mfd);
+        MemFdUnref(mfd);
     }
 
     if (fde->type == FdType::UnixSocket && fde->handle)
@@ -1669,6 +1725,37 @@ static int64_t sys_close(uint64_t fd, uint64_t, uint64_t,
         // Decrement refcounts on connected pipes so the other end sees EOF
         if (usd->rxPipe) __atomic_fetch_sub(&usd->rxPipe->readers, 1, __ATOMIC_RELEASE);
         if (usd->txPipe) __atomic_fetch_sub(&usd->txPipe->writers, 1, __ATOMIC_RELEASE);
+
+        // Drop our refs on the per-direction fd queues; if this was the last
+        // holder, drain any undelivered fds so we don't leak kernel objects.
+        auto drainQueue = [](UnixFdQueue* q) {
+            if (!q) return;
+            uint32_t prev = __atomic_fetch_sub(&q->refCount, 1, __ATOMIC_ACQ_REL);
+            if (prev > 1) return;
+            while (q->head != q->tail) {
+                UnixFdSnap& m = q->msgs[q->tail];
+                q->tail = (q->tail + 1) % UNIX_FD_QUEUE_CAP;
+                // Release the ref we took at send time
+                if (m.type == FdType::MemFd && m.handle)
+                    MemFdUnref(static_cast<MemFdData*>(m.handle));
+                else if (m.type == FdType::Vnode && m.handle) {
+                    auto* vn = static_cast<Vnode*>(m.handle);
+                    uint32_t prev2 = __atomic_fetch_sub(&vn->refCount, 1, __ATOMIC_ACQ_REL);
+                    if (prev2 <= 1) VfsClose(vn);
+                }
+                else if (m.type == FdType::Socket && m.handle) {
+                    int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(m.handle)) - 1;
+                    brook::SockUnref(sockIdx);
+                }
+                // Other types (Pipe, UnixSocket, EventFd, etc.) aren't currently
+                // ref-counted via snap-level ops; passing them isn't implemented
+                // either so draining is a no-op.
+            }
+            kfree(q);
+        };
+        drainQueue(usd->incomingFds);
+        drainQueue(usd->peerIncomingFds);
+
         kfree(usd);
     }
 
@@ -1772,6 +1859,10 @@ static int64_t sys_dup(uint64_t oldfd, uint64_t, uint64_t,
         brook::SockRef(sockIdx);
     }
 
+    // Bump memfd refcount
+    if (old->type == FdType::MemFd && old->handle)
+        MemFdRef(static_cast<MemFdData*>(old->handle));
+
     return newfd;
 }
 
@@ -1820,6 +1911,10 @@ static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd, uint64_t,
         int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(old->handle)) - 1;
         brook::SockRef(sockIdx);
     }
+
+    // Bump memfd refcount
+    if (old->type == FdType::MemFd && old->handle)
+        MemFdRef(static_cast<MemFdData*>(old->handle));
 
     return static_cast<int64_t>(newfd);
 }
@@ -5679,9 +5774,11 @@ static int64_t sys_memfd_create(uint64_t nameAddr, uint64_t flags,
     mfd->buf      = nullptr;
     mfd->size     = 0;
     mfd->capacity = 0;
+    mfd->refCount = 0; // bumped by FdAlloc below
 
     int fd = FdAlloc(proc, FdType::MemFd, mfd);
     if (fd < 0) { kfree(mfd); return -EMFILE; }
+    MemFdRef(mfd);
 
     if (flags & MFD_CLOEXEC)
         proc->fds[fd].fdFlags |= 1;
@@ -7219,22 +7316,34 @@ static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
         // Create bidirectional pipe pair
         auto* pipeCS = static_cast<PipeBuffer*>(kmalloc(sizeof(PipeBuffer))); // client→server
         auto* pipeSC = static_cast<PipeBuffer*>(kmalloc(sizeof(PipeBuffer))); // server→client
-        if (!pipeCS || !pipeSC) {
+        auto* fdqCS  = static_cast<UnixFdQueue*>(kmalloc(sizeof(UnixFdQueue))); // fds client→server
+        auto* fdqSC  = static_cast<UnixFdQueue*>(kmalloc(sizeof(UnixFdQueue))); // fds server→client
+        if (!pipeCS || !pipeSC || !fdqCS || !fdqSC) {
             if (pipeCS) kfree(pipeCS);
             if (pipeSC) kfree(pipeSC);
+            if (fdqCS)  kfree(fdqCS);
+            if (fdqSC)  kfree(fdqSC);
             return -ENOMEM;
         }
         for (uint64_t i = 0; i < sizeof(PipeBuffer); i++) {
             reinterpret_cast<uint8_t*>(pipeCS)[i] = 0;
             reinterpret_cast<uint8_t*>(pipeSC)[i] = 0;
         }
+        for (uint64_t i = 0; i < sizeof(UnixFdQueue); i++) {
+            reinterpret_cast<uint8_t*>(fdqCS)[i] = 0;
+            reinterpret_cast<uint8_t*>(fdqSC)[i] = 0;
+        }
         pipeCS->readers = 1; pipeCS->writers = 1;
         pipeSC->readers = 1; pipeSC->writers = 1;
+        fdqCS->refCount = 1; // client side will point at it as peerIncomingFds; server gets a ref in accept
+        fdqSC->refCount = 1; // server points at it as peerIncomingFds; client uses it as incomingFds
 
         // Set up client side
         usd->state   = UnixSocketData::State::Connected;
         usd->rxPipe  = pipeSC; // client reads server→client pipe
         usd->txPipe  = pipeCS; // client writes client→server pipe
+        usd->incomingFds     = fdqSC; // client reads fds from server→client queue
+        usd->peerIncomingFds = fdqCS; // client sends fds into client→server queue
         for (int i = 0; i < 107 && path[i]; i++) usd->path[i] = path[i];
 
         // Enqueue pending connection on server
@@ -7242,10 +7351,12 @@ static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
         for (int i = 0; i < UNIX_ACCEPT_QUEUE; i++) {
             if (!server->pending[i].used) { slot = i; break; }
         }
-        if (slot < 0) { kfree(pipeCS); kfree(pipeSC); return -EAGAIN; }
+        if (slot < 0) { kfree(pipeCS); kfree(pipeSC); kfree(fdqCS); kfree(fdqSC); return -EAGAIN; }
 
         server->pending[slot].serverRx     = pipeCS; // server reads what client wrote
         server->pending[slot].serverTx     = pipeSC; // server writes what client reads
+        server->pending[slot].serverRxFds  = fdqCS;  // server drains client-sent fds
+        server->pending[slot].serverTxFds  = fdqSC;  // server posts fds for client
         server->pending[slot].clientWaiter = proc;
         server->pending[slot].accepted     = false;
         server->pending[slot].used         = true;
@@ -7469,6 +7580,12 @@ static int64_t sys_accept(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
                 serverSock->state  = UnixSocketData::State::Connected;
                 serverSock->rxPipe = usd->pending[slot].serverRx;
                 serverSock->txPipe = usd->pending[slot].serverTx;
+                serverSock->incomingFds     = usd->pending[slot].serverRxFds; // fds client→server
+                serverSock->peerIncomingFds = usd->pending[slot].serverTxFds; // fds server→client
+                if (serverSock->incomingFds)
+                    __atomic_fetch_add(&serverSock->incomingFds->refCount, 1, __ATOMIC_RELEASE);
+                if (serverSock->peerIncomingFds)
+                    __atomic_fetch_add(&serverSock->peerIncomingFds->refCount, 1, __ATOMIC_RELEASE);
 
                 int newFd = FdAlloc(proc, FdType::UnixSocket, serverSock);
                 if (newFd < 0) { kfree(serverSock); return -EMFILE; }

@@ -4,6 +4,7 @@
 
 #include "process.h"
 #include "scheduler.h"
+#include "syscall.h"
 #include "vfs.h"
 #include "pipe.h"
 #include "net.h"
@@ -1006,6 +1007,10 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
                     reinterpret_cast<uintptr_t>(parent->fds[i].handle)) - 1;
                 brook::SockRef(sockIdx);
             }
+
+            // Increment memfd refcount for the child's copy (shared buffer).
+            if (parent->fds[i].type == FdType::MemFd && parent->fds[i].handle)
+                brook::MemFdHandleRef(parent->fds[i].handle);
         }
     }
 

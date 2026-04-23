@@ -185,6 +185,13 @@ SyscallFn* SyscallGetTable();
 // Get the syscall table address as uint64_t (for per-CPU env setup).
 uint64_t SyscallGetTableAddress();
 
+// MemFd (memfd_create / shm_open) handle refcount helpers.
+// The handle is a `MemFdData*` stored as `FdEntry::handle` on FdType::MemFd fds.
+// process.cpp's fork path uses these to correctly inherit MemFd fds into the
+// child without double-freeing the underlying buffer on close.
+void MemFdHandleRef(void* handle);
+void MemFdHandleUnref(void* handle);
+
 // Switch to user mode.
 // Saves kernel state, builds IRETQ frame, SWAPGS, jumps to ring 3.
 // When the user process calls sys_exit, control returns here.
