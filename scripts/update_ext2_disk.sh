@@ -128,9 +128,10 @@ if [ -f "${Q2_BIN}" ]; then
     fi
     # Player models (live outside pak0.pak in the Q2 demo distribution)
     if [ -d "${Q2_PLAYERS}" ]; then
-        echo "  Q2 player models from ${Q2_PLAYERS}"
-        mkdir -p "${MNTDIR}/games/quake2/baseq2/players"
-        cp -r "${Q2_PLAYERS}/." "${MNTDIR}/games/quake2/baseq2/players/"
+        while IFS= read -r -d '' f; do
+            rel="${f#${Q2_PLAYERS}/}"
+            write_file "$f" "games/quake2/baseq2/players/${rel}"
+        done < <(find "${Q2_PLAYERS}" -type f -print0)
     else
         echo "  (Q2 players dir not found at ${Q2_PLAYERS} — set BROOK_Q2_PLAYERS to override)"
     fi
