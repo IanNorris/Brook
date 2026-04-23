@@ -54,24 +54,47 @@ These run as unmodified Linux ELF binaries on Brook, linked against musl libc:
 - **UEFI bootloader** — custom bootloader loads ELF kernel at high virtual addresses
 - **SMP** — symmetric multiprocessing with per-CPU run queues and load balancing
 - **MLFQ scheduler** — multi-level feedback queue loaded as a kernel module, with configurable policy
-- **Virtual memory** — 4-level paging, per-PID ownership tracking, guard pages
-- **Kernel heap** — kmalloc/kfree with slab-style allocation
-- **Loadable kernel modules** — drivers compiled separately and loaded from disk at boot
-- **VFS + FAT filesystem** — virtio-blk backed storage with full read/write support
+- **Virtual memory** — 4-level paging, per-PID ownership tracking, guard pages, lazy mmap w/ PROT_NONE + on-demand mprotect (needed for Go binaries)
+- **Kernel heap** — kmalloc/kfree with slab-style allocation; kmutex, krwlock, ksemaphore
+- **Loadable kernel modules** — drivers compiled separately and loaded from disk at boot (Phase 1 from initrd, Phase 2 from /boot/drivers)
+- **VFS with FAT and ext2** — virtio-blk backed storage with full read/write support, metadata cache, mount points
+- **Panic decoder** — kernel panics render a scannable QR code with a stack-trace payload that Brook's companion `EnkelCrashDecoder` can read
+
+### Networking
+- **Multi-interface stack** — up to 4 NICs, per-IF ARP, routing, broadcast handling
+- **virtio-net driver** — init/TX/RX with feature negotiation
+- **DHCP + static IP** — `NET0_MODE=static` / `NET0_IP` / `NET0_NETMASK` / `NET0_GATEWAY` / `NET0_DNS` in `/boot/BROOK.CFG`
+- **TCP/UDP** — BSD sockets (socket, bind, connect, listen, accept, send/recv, setsockopt) with loopback and refcounted close
+- **DNS** — resolver wired through the UDP stack
+- **VDE pair demo** — two Brook VMs on a virtual switch playing Quake 2 LAN deathmatch
+
+### Audio
+- **Intel HDA driver** — codec enumeration, DAC/pin discovery, cyclic DMA output (44.1 kHz / 16-bit stereo)
+- **OGG Vorbis decoder** — stb_vorbis-based music playback (Q2 OST streams off disk)
+
+### Package Manager (Nix userspace)
+- **Nix store** — `/store` laid out as on a real NixOS system, consumed by the Brook dynamic linker
+- **`nix-install` helper** — fetches cached closures from a remote binary cache (HTTPS + HTTP) and unpacks NARs
+- **Real Nix binaries** — cowsay, coreutils, curl, bash, etc. run unmodified
 
 ### Linux Compatibility
-- **~80 syscalls** — open, read, write, mmap, fork, execve, pipe, dup2, ioctl, poll, and more
+- **~90 syscalls** — open, read, write, mmap (lazy), fork, execve, pipe, dup2, ioctl, poll, epoll, socket/bind/connect, sendto/recvfrom, futex, clock_gettime, rt_sigaction, signalfd, TCGETS2, dirfd, symlinkat and more
 - **ELF loader** — loads standard Linux ELF binaries with dynamic linking (musl ld.so)
-- **Signals** — SIGINT, SIGQUIT, SIGTSTP, SIGCONT, SIGKILL, SIGPIPE, SIGCHLD with rt_sigaction
-- **Pipes** — anonymous pipes with blocking read/write and proper EOF semantics
-- **fork/exec** — full process creation with address space cloning
+- **Signals** — full rt_sigaction lifecycle, SIGINT/QUIT/TSTP/CONT/KILL/PIPE/CHLD, signal-safe TTY handling
+- **Pipes / fork / exec** — anonymous pipes, full address-space cloning
+- **Go runtime** — Go binaries run (lazy PROT_NONE heap, mprotect on demand)
 
 ### Window Manager
-- **Compositing WM** — desktop wallpaper, window chrome with title bars, z-ordered rendering
-- **Terminal emulator** — VT100/ANSI escape sequences, connects to bash via pipe pair
-- **Mouse + keyboard** — cursor rendering, click-to-focus, Ctrl+C/Z/\ signal keys
-- **Per-process framebuffers** — each window renders to its own virtual framebuffer
+- **Compositing WM** — desktop wallpaper, window chrome with title bars, z-ordered rendering, drag + resize
+- **Terminal emulator** — VT100/ANSI escape sequences (16-colour palette), cell-grid scrollback, wheel-scroll, connected to bash via a pipe pair
+- **Mouse + keyboard** — cursor rendering, click-to-focus, wheel events, Ctrl+C/Z/\ signal keys
+- **Per-process framebuffers** — each window renders to its own VFB
 - **Upscaling** — configurable per-window scale factor (DOOM renders at 4× to fill the screen)
+
+### Userspace / bundled apps
+- DOOM (`doomgeneric`), **Quake 2** (SP + LAN multiplayer)
+- bash, busybox, TCC, NetSurf (experimental)
+- Graphical: mandelbrot, clock, wavplay, sinetest, 2048
 
 ### Drivers (loadable modules)
 | Module | Description |
@@ -81,20 +104,27 @@ These run as unmodified Linux ELF binaries on Brook, linked against musl libc:
 | `ps2_mouse` | PS/2 mouse driver |
 | `virtio_blk` | Virtio block device for disk I/O |
 | `virtio_input` | Virtio input tablet for absolute mouse positioning |
+| `virtio_net` | Virtio-net — TX/RX, multi-queue ready |
+| `virtio_rng` | Virtio entropy source |
+| `intel_hda` | Intel HDA audio controller (DAC + pin output) |
 | `sched_mlfq` | Multi-level feedback queue scheduling policy |
 
 ## Building
 
 ### Prerequisites
 
-- Clang/LLVM 18+, LLD, NASM
-- CMake ≥ 3.25, Ninja
-- Python 3 with `freetype-py` (for font atlas generation)
-- QEMU + OVMF (for running)
+Everything runs inside the pinned Nix shell — no system-level toolchain
+is required.  You only need:
 
-On NixOS / with Nix:
+- A recent Linux host with `nix` installed (multi-user or single-user)
+- QEMU with OVMF (provided via `shell.nix`)
+
+Everything else — clang/lld, NASM, CMake, Ninja, Python + freetype-py,
+mtools, e2fsprogs-fuse2fs, vde2, musl cross-compilers, OVMF — is pinned
+in `shell.nix`.
+
 ```bash
-nix-shell -p clang_18 lld_18 llvm_18 cmake ninja python3 python3Packages.freetype-py nasm
+nix-shell
 ```
 
 ### Build
@@ -102,12 +132,15 @@ nix-shell -p clang_18 lld_18 llvm_18 cmake ninja python3 python3Packages.freetyp
 ```bash
 ./scripts/build.sh          # Debug build
 ./scripts/build.sh Release  # Release build
+./scripts/build_all.sh Release  # Kernel + bootloader + Quake 2 + disk images
 ```
 
 ### Run in QEMU
 
 ```bash
-./scripts/run-qemu.sh       # Launches QEMU with OVMF firmware
+./scripts/run-qemu.sh --release               # Single VM
+./scripts/vde-up.sh up && \
+./scripts/run-qemu-pair.sh --release --script wm   # Two VMs on a VDE switch
 ```
 
 Boot scripts in `data/scripts/` control what runs at startup:

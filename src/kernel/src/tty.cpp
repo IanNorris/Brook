@@ -25,7 +25,7 @@ static int        g_curX              = 0;        // current pen X (pixels)
 static int        g_curY              = 0;        // current line top Y (pixels)
 
 static uint32_t   g_fgColor           = 0x00E0E0E0; // light grey
-static uint32_t   g_bgColor           = 0x00001A3A; // dark blue (matches kernel bg)
+static uint32_t   g_bgColor           = 0x001E2736; // Solarized-ish dark bg
 
 static bool       g_displaySuppressed = false;      // when true, skip FB writes
 
@@ -225,15 +225,17 @@ static int g_ansiParamCount = 0;
 // Map ANSI SGR color code (30-37, 90-97) to 0xRRGGBB
 static uint32_t AnsiToRgb(int code)
 {
-    // Standard colors (30-37)
+    // Tango-inspired palette — picked to stay readable on our dark-navy
+    // default background (see g_bgColor reset below).  In particular,
+    // standard-blue and bright-blue are lightened so blue-on-navy text
+    // (typical ls output for dirs) is legible.
     static const uint32_t colors[] = {
-        0x000000, 0xAA0000, 0x00AA00, 0xAA5500,
-        0x5555FF, 0xAA00AA, 0x00AAAA, 0xAAAAAA,
+        0x2E3436, 0xCC0000, 0x4E9A06, 0xC4A000,
+        0x3465A4, 0x75507B, 0x06989A, 0xD3D7CF,
     };
-    // Bright colors (90-97)
     static const uint32_t bright[] = {
-        0x555555, 0xFF5555, 0x55FF55, 0xFFFF55,
-        0x5555FF, 0xFF55FF, 0x55FFFF, 0xFFFFFF,
+        0x555753, 0xEF2929, 0x8AE234, 0xFCE94F,
+        0x729FCF, 0xAD7FA8, 0x34E2E2, 0xEEEEEC,
     };
     if (code >= 30 && code <= 37) return colors[code - 30];
     if (code >= 90 && code <= 97) return bright[code - 90];
@@ -245,12 +247,12 @@ static void AnsiApplySgr()
     for (int i = 0; i < g_ansiParamCount; ++i)
     {
         int p = g_ansiParams[i];
-        if (p == 0) { g_fgColor = 0x00E0E0E0; g_bgColor = 0x00001A3A; } // reset
+        if (p == 0) { g_fgColor = 0x00E0E0E0; g_bgColor = 0x001E2736; } // reset
         else if (p == 1) { /* bold — brighten fg */ }
         else if (p >= 30 && p <= 37) g_fgColor = AnsiToRgb(p);
         else if (p == 39) g_fgColor = 0x00E0E0E0; // default fg
         else if (p >= 40 && p <= 47) g_bgColor = AnsiToRgb(p - 10);
-        else if (p == 49) g_bgColor = 0x00001A3A; // default bg
+        else if (p == 49) g_bgColor = 0x001E2736; // default bg
         else if (p >= 90 && p <= 97) g_fgColor = AnsiToRgb(p);
     }
 }
