@@ -5524,7 +5524,14 @@ static int64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t watchfd,
     if (!proc) return -EBADF;
 
     FdEntry* epfde = FdGet(proc, static_cast<int>(epfd));
-    if (!epfde || epfde->type != FdType::EpollFd || !epfde->handle) return -EBADF;
+    if (!epfde || epfde->type != FdType::EpollFd || !epfde->handle) {
+        SerialPrintf("sys_epoll_ctl: EBADF epfd=%lu pid=%u op=%lu "
+                     "fde=%p type=%d handle=%p\n",
+                     epfd, proc->pid, op, epfde,
+                     epfde ? static_cast<int>(epfde->type) : -1,
+                     epfde ? epfde->handle : nullptr);
+        return -EBADF;
+    }
     auto* ep = static_cast<EpollInstance*>(epfde->handle);
 
     int wfd = static_cast<int>(watchfd);
@@ -5622,7 +5629,14 @@ static int64_t sys_epoll_wait(uint64_t epfd, uint64_t eventsAddr,
     if (!proc) return -EBADF;
 
     FdEntry* epfde = FdGet(proc, static_cast<int>(epfd));
-    if (!epfde || epfde->type != FdType::EpollFd || !epfde->handle) return -EBADF;
+    if (!epfde || epfde->type != FdType::EpollFd || !epfde->handle) {
+        SerialPrintf("sys_epoll_wait: EBADF epfd=%lu pid=%u "
+                     "fde=%p type=%d handle=%p\n",
+                     epfd, proc->pid, epfde,
+                     epfde ? static_cast<int>(epfde->type) : -1,
+                     epfde ? epfde->handle : nullptr);
+        return -EBADF;
+    }
     auto* ep = static_cast<EpollInstance*>(epfde->handle);
 
     if (maxevents <= 0 || maxevents > 1024) return -EINVAL;
