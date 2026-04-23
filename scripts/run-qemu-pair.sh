@@ -35,9 +35,9 @@ mkdir -p "${VM1_DIR}"
 clone_if_exists() {
     local src="$1"
     local dst="$2"
-    if [ -f "${src}" ] && [ ! -f "${dst}" ]; then
+    if [ -f "${src}" ] && { [ ! -f "${dst}" ] || [ "${src}" -nt "${dst}" ]; }; then
         echo "  cloning $(basename "${src}") -> ${dst}"
-        cp --reflink=auto "${src}" "${dst}"
+        cp --reflink=auto -f "${src}" "${dst}"
     fi
 }
 
