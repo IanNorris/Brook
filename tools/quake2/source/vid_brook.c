@@ -140,91 +140,182 @@ void VID_CheckChanges(void)
     // No dynamic renderer switching in Brook
 }
 
-void VID_MenuInit(void)
+void VID_MenuInit(void);
+void VID_MenuDraw(void);
+const char *VID_MenuKey(int key);
+
+// ---- Direct port of id Software's linux/vid_menu.c (GPL-2, matches Brook
+// license). Stripped to the software-only branch: Brook has no OpenGL, no X11,
+// no fullscreen toggle. All remaining items are cvars that ref_soft honours
+// immediately or on next renderer restart.
+// ------------------------------------------------------------------------
+
+extern cvar_t *vid_gamma;
+extern cvar_t *scr_viewsize;
+
+static cvar_t *sw_mode;
+static cvar_t *sw_stipplealpha;
+
+extern void M_ForceMenuOff(void);
+
+static menuframework_s  s_software_menu;
+static menulist_s       s_mode_list;
+static menuslider_s     s_screensize_slider;
+static menuslider_s     s_brightness_slider;
+static menulist_s       s_stipple_box;
+static menuaction_s     s_apply_action;
+static menuaction_s     s_defaults_action;
+
+static void ScreenSizeCallback(void *s)
 {
-    static const char *resolutions[VID_NUM_MODES + 1];
-    static char        resbufs[VID_NUM_MODES][16];
-    static menuframework_s s_video_menu;
-    static menulist_s      s_mode_list;
-    static menuaction_s    s_apply_action;
-
-    // Build the resolution-names array once (pointers stay valid for menu lifetime).
-    for (int i = 0; i < (int)VID_NUM_MODES; i++)
-    {
-        snprintf(resbufs[i], sizeof(resbufs[i]), "%dx%d",
-                 vid_modes[i].width, vid_modes[i].height);
-        resolutions[i] = resbufs[i];
-    }
-    resolutions[VID_NUM_MODES] = NULL;
-
-    // Find current mode (closest match to viddef.width/height, else 0).
-    int curMode = 0;
-    for (int i = 0; i < (int)VID_NUM_MODES; i++)
-    {
-        if (vid_modes[i].width == (int)viddef.width &&
-            vid_modes[i].height == (int)viddef.height)
-        {
-            curMode = i;
-            break;
-        }
-    }
-
-    fprintf(stderr,
-            "VID_MenuInit: cur=%dx%d mapped to mode %d; %u modes available\n",
-            (int)viddef.width, (int)viddef.height, curMode, (unsigned)VID_NUM_MODES);
-
-    s_video_menu.x      = viddef.width / 2;
-    s_video_menu.y      = viddef.height / 2 - 58;
-    s_video_menu.nitems = 0;
-
-    s_mode_list.generic.type         = MTYPE_LIST;
-    s_mode_list.generic.name         = "video mode";
-    s_mode_list.generic.x            = 0;
-    s_mode_list.generic.y            = 0;
-    s_mode_list.itemnames            = resolutions;
-    s_mode_list.curvalue             = curMode;
-
-    s_apply_action.generic.type      = MTYPE_ACTION;
-    s_apply_action.generic.name      = "apply (not supported yet)";
-    s_apply_action.generic.x         = 0;
-    s_apply_action.generic.y         = 30;
-    s_apply_action.generic.flags     = QMF_GRAYED;
-    s_apply_action.generic.callback  = NULL;
-
-    Menu_AddItem(&s_video_menu, &s_mode_list);
-    Menu_AddItem(&s_video_menu, &s_apply_action);
-
-    Menu_Center(&s_video_menu);
-    s_video_menu.x -= 8;
-
-    // Stash for Draw/Key callbacks.
-    extern menuframework_s *g_vid_menu;
-    g_vid_menu = &s_video_menu;
+    menuslider_s *slider = (menuslider_s *)s;
+    Cvar_SetValue("viewsize", slider->curvalue * 10);
 }
 
-menuframework_s *g_vid_menu = NULL;
+static void BrightnessCallback(void *s)
+{
+    menuslider_s *slider = (menuslider_s *)s;
+    float gamma = (0.8 - (slider->curvalue / 10.0 - 0.5)) + 0.5;
+    Cvar_SetValue("vid_gamma", gamma);
+}
+
+static void ResetDefaults(void *unused)
+{
+    (void)unused;
+    VID_MenuInit();
+}
+
+static void ApplyChanges(void *unused)
+{
+    (void)unused;
+    float gamma = (0.8 - (s_brightness_slider.curvalue / 10.0 - 0.5)) + 0.5;
+    Cvar_SetValue("vid_gamma", gamma);
+    Cvar_SetValue("sw_stipplealpha", s_stipple_box.curvalue);
+    Cvar_SetValue("sw_mode", s_mode_list.curvalue);
+    Cvar_Set("vid_ref", "soft");
+    M_ForceMenuOff();
+}
+
+void VID_MenuInit(void)
+{
+    static const char *resolutions[] = {
+        "[320 240  ]", "[400 300  ]", "[512 384  ]", "[640 480  ]",
+        "[800 600  ]", "[960 720  ]", "[1024 768 ]", "[1152 864 ]",
+        "[1280 960 ]", "[1600 1200]", 0
+    };
+    static const char *yesno_names[] = { "no", "yes", 0 };
+
+    if (!sw_mode)
+        sw_mode = Cvar_Get("sw_mode", "0", 0);
+    if (!sw_stipplealpha)
+        sw_stipplealpha = Cvar_Get("sw_stipplealpha", "0", CVAR_ARCHIVE);
+    if (!scr_viewsize)
+        scr_viewsize = Cvar_Get("viewsize", "100", CVAR_ARCHIVE);
+
+    s_mode_list.curvalue          = sw_mode->value;
+    s_screensize_slider.curvalue  = scr_viewsize->value / 10;
+    s_brightness_slider.curvalue  = (1.3 - vid_gamma->value + 0.5) * 10;
+
+    fprintf(stderr,
+            "VID_MenuInit: cur=%dx%d sw_mode=%d vid_gamma=%.2f viewsize=%.0f\n",
+            (int)viddef.width, (int)viddef.height,
+            (int)sw_mode->value, vid_gamma->value, scr_viewsize->value);
+
+    s_software_menu.x      = viddef.width * 0.50;
+    s_software_menu.nitems = 0;
+
+    s_mode_list.generic.type            = MTYPE_SPINCONTROL;
+    s_mode_list.generic.name            = "video mode";
+    s_mode_list.generic.x               = 0;
+    s_mode_list.generic.y               = 10;
+    s_mode_list.itemnames               = resolutions;
+
+    s_screensize_slider.generic.type    = MTYPE_SLIDER;
+    s_screensize_slider.generic.x       = 0;
+    s_screensize_slider.generic.y       = 20;
+    s_screensize_slider.generic.name    = "screen size";
+    s_screensize_slider.minvalue        = 3;
+    s_screensize_slider.maxvalue        = 12;
+    s_screensize_slider.generic.callback = ScreenSizeCallback;
+
+    s_brightness_slider.generic.type    = MTYPE_SLIDER;
+    s_brightness_slider.generic.x       = 0;
+    s_brightness_slider.generic.y       = 30;
+    s_brightness_slider.generic.name    = "brightness";
+    s_brightness_slider.generic.callback = BrightnessCallback;
+    s_brightness_slider.minvalue        = 5;
+    s_brightness_slider.maxvalue        = 13;
+
+    s_stipple_box.generic.type          = MTYPE_SPINCONTROL;
+    s_stipple_box.generic.x             = 0;
+    s_stipple_box.generic.y             = 60;
+    s_stipple_box.generic.name          = "stipple alpha";
+    s_stipple_box.itemnames             = yesno_names;
+    s_stipple_box.curvalue              = sw_stipplealpha->value;
+
+    s_defaults_action.generic.type      = MTYPE_ACTION;
+    s_defaults_action.generic.name      = "reset to default";
+    s_defaults_action.generic.x         = 0;
+    s_defaults_action.generic.y         = 90;
+    s_defaults_action.generic.callback  = ResetDefaults;
+
+    s_apply_action.generic.type         = MTYPE_ACTION;
+    s_apply_action.generic.name         = "apply";
+    s_apply_action.generic.x            = 0;
+    s_apply_action.generic.y            = 100;
+    s_apply_action.generic.callback     = ApplyChanges;
+
+    Menu_AddItem(&s_software_menu, &s_mode_list);
+    Menu_AddItem(&s_software_menu, &s_screensize_slider);
+    Menu_AddItem(&s_software_menu, &s_brightness_slider);
+    Menu_AddItem(&s_software_menu, &s_stipple_box);
+    Menu_AddItem(&s_software_menu, &s_defaults_action);
+    Menu_AddItem(&s_software_menu, &s_apply_action);
+
+    Menu_Center(&s_software_menu);
+    s_software_menu.x -= 8;
+}
 
 void VID_MenuDraw(void)
 {
-    if (!g_vid_menu)
-    {
-        fprintf(stderr, "VID_MenuDraw: g_vid_menu NULL — VID_MenuInit never ran?\n");
-        return;
-    }
-
-    // Center banner (fall back gracefully if the pic is missing).
     int w = 0, h = 0;
     re.DrawGetPicSize(&w, &h, "m_banner_video");
     if (w > 0 && h > 0)
         re.DrawPic(viddef.width / 2 - w / 2, viddef.height / 2 - 110, "m_banner_video");
 
-    Menu_AdjustCursor(g_vid_menu, 1);
-    Menu_Draw(g_vid_menu);
+    Menu_AdjustCursor(&s_software_menu, 1);
+    Menu_Draw(&s_software_menu);
 }
 
 const char *VID_MenuKey(int key)
 {
-    extern const char *Default_MenuKey(menuframework_s *m, int key);
-    if (!g_vid_menu) return NULL;
-    return Default_MenuKey(g_vid_menu, key);
+    extern void M_PopMenu(void);
+    menuframework_s *m = &s_software_menu;
+    static const char *sound = "misc/menu1.wav";
+
+    switch (key)
+    {
+    case K_ESCAPE:
+        M_PopMenu();
+        return NULL;
+    case K_UPARROW:
+        m->cursor--;
+        Menu_AdjustCursor(m, -1);
+        break;
+    case K_DOWNARROW:
+        m->cursor++;
+        Menu_AdjustCursor(m, 1);
+        break;
+    case K_LEFTARROW:
+        Menu_SlideItem(m, -1);
+        break;
+    case K_RIGHTARROW:
+        Menu_SlideItem(m, 1);
+        break;
+    case K_ENTER:
+        Menu_SelectItem(m);
+        break;
+    }
+
+    return sound;
 }
