@@ -43,10 +43,13 @@ These run as unmodified Linux ELF binaries on Brook, linked against musl libc:
 |----------|---------|--------|-------|
 | [bash](https://www.gnu.org/software/bash/) | 5.2 | ✅ Working | Interactive shell with readline, job control, scripting |
 | [DOOM](https://github.com/ozkl/doomgeneric) | 1.9 | ✅ Working | Runs in a WM window or full-screen, with keyboard input |
+| [Quake 2](https://github.com/id-Software/Quake-2) | 3.21 | ✅ Working | Single-player + LAN deathmatch between two Brook VMs, software renderer, HDA audio, OGG music |
 | [busybox](https://busybox.net/) | 1.36 | ✅ Working | ls, cat, echo, wc, head, tail, grep, and many more |
 | [TCC](https://bellard.org/tcc/) | 0.9.27 | ✅ Working | Compiles and runs C programs natively on Brook |
 | [CoreMark](https://www.eembc.org/coremark/) | 1.0 | ✅ Working | CPU benchmark, runs to completion |
 | [musl libc](https://musl.libc.org/) | 1.2 | ✅ Working | Standard C library, dynamically linked |
+| [Go](https://go.dev/) runtime | 1.22 | ✅ Working | Static Go binaries (lazy PROT_NONE heap + on-demand mprotect) |
+| Nix binaries | — | ✅ Working | Stock NixOS closures fetched via `nix-install` (cowsay, coreutils, curl, …) |
 
 ## Features
 
@@ -59,6 +62,8 @@ These run as unmodified Linux ELF binaries on Brook, linked against musl libc:
 - **Loadable kernel modules** — drivers compiled separately and loaded from disk at boot (Phase 1 from initrd, Phase 2 from /boot/drivers)
 - **VFS with FAT and ext2** — virtio-blk backed storage with full read/write support, metadata cache, mount points
 - **Panic decoder** — kernel panics render a scannable QR code with a stack-trace payload that Brook's companion `EnkelCrashDecoder` can read
+- **Boot self-test** — cross-checks LAPIC tick rate against a PIT-gated wall-clock window at boot to catch calibration drift
+- **Debug socket** — runtime heap + per-PID PMM dumps over a unix-domain socket, for post-hoc inspection without a debugger
 
 ### Networking
 - **Multi-interface stack** — up to 4 NICs, per-IF ARP, routing, broadcast handling
@@ -78,23 +83,24 @@ These run as unmodified Linux ELF binaries on Brook, linked against musl libc:
 - **Real Nix binaries** — cowsay, coreutils, curl, bash, etc. run unmodified
 
 ### Linux Compatibility
-- **~90 syscalls** — open, read, write, mmap (lazy), fork, execve, pipe, dup2, ioctl, poll, epoll, socket/bind/connect, sendto/recvfrom, futex, clock_gettime, rt_sigaction, signalfd, TCGETS2, dirfd, symlinkat and more
-- **ELF loader** — loads standard Linux ELF binaries with dynamic linking (musl ld.so)
-- **Signals** — full rt_sigaction lifecycle, SIGINT/QUIT/TSTP/CONT/KILL/PIPE/CHLD, signal-safe TTY handling
-- **Pipes / fork / exec** — anonymous pipes, full address-space cloning
-- **Go runtime** — Go binaries run (lazy PROT_NONE heap, mprotect on demand)
+- **~150 syscalls** — open, read, write, mmap (lazy/PROT_NONE), mprotect, fork, execve, clone, pipe, dup/dup2/dup3, ioctl, poll, select, epoll (create/ctl/wait), socket family (bind, connect, listen, accept, send/recv, setsockopt, sendmsg/recvmsg with **SCM_RIGHTS** fd passing), futex, clock_gettime, nanosleep, rt_sigaction/rt_sigprocmask, signalfd, eventfd, timerfd, **memfd_create**, dirfd-aware *at syscalls, symlinkat/readlinkat, TCGETS2/TCSETS, and more
+- **ELF loader** — standard Linux ELF64 with dynamic linking (musl ld.so, glibc closures from Nix)
+- **Signals** — full rt_sigaction lifecycle, SIGINT/QUIT/TSTP/CONT/KILL/PIPE/CHLD with signal-safe TTY + AF_UNIX read (SIGCHLD doesn't spuriously EINTR)
+- **IPC** — anonymous pipes, **AF_UNIX stream sockets with SCM_RIGHTS**, memfd-backed shared memory (backs `wl_shm`), full address-space cloning on fork
+- **Go runtime** — Go binaries run (lazy PROT_NONE reservations, mprotect on demand, thread-shared mmap cursor)
 
 ### Window Manager
-- **Compositing WM** — desktop wallpaper, window chrome with title bars, z-ordered rendering, drag + resize
-- **Terminal emulator** — VT100/ANSI escape sequences (16-colour palette), cell-grid scrollback, wheel-scroll, connected to bash via a pipe pair
-- **Mouse + keyboard** — cursor rendering, click-to-focus, wheel events, Ctrl+C/Z/\ signal keys
+- **Compositing WM** — desktop wallpaper, window chrome with title bars, z-ordered rendering, drag + resize + maximize (VFB resizes with window)
+- **Terminal emulator** — VT100/ANSI escape sequences (16-colour palette), cell-grid scrollback preserved across resize, mouse-wheel viewport scroll, connected to bash via a pipe pair
+- **Mouse + keyboard** — cursor rendering, click-to-focus, virtio-input absolute positioning, PS/2 IntelliMouse wheel, Ctrl+C/Z/\ signal keys
 - **Per-process framebuffers** — each window renders to its own VFB
 - **Upscaling** — configurable per-window scale factor (DOOM renders at 4× to fill the screen)
 
 ### Userspace / bundled apps
-- DOOM (`doomgeneric`), **Quake 2** (SP + LAN multiplayer)
-- bash, busybox, TCC, NetSurf (experimental)
-- Graphical: mandelbrot, clock, wavplay, sinetest, 2048
+- **Games** — DOOM (`doomgeneric`), **Quake 2** (single-player + LAN multiplayer over VDE), 2048
+- **Shells / tools** — bash, busybox, TCC, NetSurf (experimental)
+- **Graphical** — mandelbrot, clock, wavplay, sinetest
+- **Smoke tests** — fork/exec, pipe, signals, SCM_RIGHTS fd passing, symlink, epoll, TCP, Wayland client stub
 
 ### Drivers (loadable modules)
 | Module | Description |
