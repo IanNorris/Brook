@@ -261,10 +261,25 @@ int main(int argc, char **argv)
         newtime = Sys_Milliseconds();
         time = newtime - oldtime;
 
-        if (time > 0)
-            Qcommon_Frame(time);
+        /* Cap the per-frame delta so a long pause (disk load, scheduler
+         * starvation) can't push the simulation forward by seconds in one
+         * step.  100ms matches Q2's reference Windows/Linux backends. */
+        if (time > 100)
+            time = 100;
 
-        oldtime = newtime;
+        if (time > 0)
+        {
+            Qcommon_Frame(time);
+            oldtime = newtime;
+        }
+        else
+        {
+            /* No simulation work yet; yield a ms so we don't spin the CPU
+             * (and starve the mixer / network threads) while waiting for
+             * the next millisecond to tick over. */
+            struct timespec ts = { 0, 1000000 };  /* 1 ms */
+            nanosleep(&ts, NULL);
+        }
     }
 
     return 0;

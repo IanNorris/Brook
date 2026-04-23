@@ -395,6 +395,8 @@ void WmToggleMaximize(int idx)
     uint32_t screenW, screenH;
     CompositorGetPhysDims(&screenW, &screenH);
 
+    uint16_t newW, newH;
+
     if (w.state == WindowState::Normal)
     {
         // Save current geometry
@@ -407,8 +409,8 @@ void WmToggleMaximize(int idx)
         w.x = 0;
         w.y = 0;
         uint32_t desktopH = WmDesktopHeight(screenH);
-        w.clientW = static_cast<uint16_t>(screenW - 2 * WM_BORDER_WIDTH);
-        w.clientH = static_cast<uint16_t>(desktopH - WM_TITLE_BAR_HEIGHT - 2 * WM_BORDER_WIDTH);
+        newW = static_cast<uint16_t>(screenW - 2 * WM_BORDER_WIDTH);
+        newH = static_cast<uint16_t>(desktopH - WM_TITLE_BAR_HEIGHT - 2 * WM_BORDER_WIDTH);
         w.state = WindowState::Maximized;
     }
     else
@@ -416,10 +418,14 @@ void WmToggleMaximize(int idx)
         // Restore
         w.x = w.savedX;
         w.y = w.savedY;
-        w.clientW = w.savedW;
-        w.clientH = w.savedH;
+        newW = w.savedW;
+        newH = w.savedH;
         w.state = WindowState::Normal;
     }
+
+    // Route through WmResizeWindow so terminal VFBs / SIGWINCH paths fire.
+    // Without this, chrome grows but the inner VFB stays the old size.
+    WmResizeWindow(idx, newW, newH);
 }
 
 void WmMoveWindow(int idx, int16_t newX, int16_t newY)
