@@ -41,6 +41,14 @@ clone_if_exists() {
     fi
 }
 
+echo "Preparing VM0 disk images in ${VM0_DIR}..."
+VM0_DIR=/tmp/brook-vm0
+mkdir -p "${VM0_DIR}"
+clone_if_exists "${ROOT_DIR}/brook_disk.img"       "${VM0_DIR}/brook_disk.img"
+clone_if_exists "${ROOT_DIR}/brook_ext2_disk.img"  "${VM0_DIR}/brook_ext2_disk.img"
+clone_if_exists "${ROOT_DIR}/brook_nix_disk.img"   "${VM0_DIR}/brook_nix_disk.img"
+clone_if_exists "${ROOT_DIR}/brook_home_disk.img"  "${VM0_DIR}/brook_home_disk.img"
+
 echo "Preparing VM1 disk images in ${VM1_DIR}..."
 clone_if_exists "${ROOT_DIR}/brook_disk.img"       "${VM1_DIR}/brook_disk.img"
 clone_if_exists "${ROOT_DIR}/brook_ext2_disk.img"  "${VM1_DIR}/brook_ext2_disk.img"
@@ -67,10 +75,8 @@ fi
 mkdir -p "${BUILD_DIR}/esp"
 "${SCRIPT_DIR}/make_initrd.sh" "--${BUILD_TYPE}" >/dev/null
 
-VM0_DIR=/tmp/brook-vm0
 VM0_ESP="${VM0_DIR}/esp"
 VM1_ESP="${VM1_DIR}/esp"
-mkdir -p "${VM0_DIR}"
 rm -rf "${VM0_ESP}" "${VM1_ESP}"
 
 build_esp() {
@@ -99,12 +105,41 @@ build_esp "${VM0_ESP}" 10.42.0.10
 build_esp "${VM1_ESP}" 10.42.0.11
 echo "VM0 static IP: 10.42.0.10   VM1 static IP: 10.42.0.11"
 
+# The kernel reads BROOK.CFG from the mounted virtio-blk disk (/boot),
+# not from the ESP.  mcopy a per-instance BROOK.CFG into each disk
+# image's root so NetApplyStaticConfig finds NET0_* keys.
+stamp_disk_cfg() {
+    local img="$1"
+    local ip="$2"
+    if [ ! -f "${img}" ]; then
+        echo "  (skip ${img} — not present)"
+        return
+    fi
+    local tmp
+    tmp="$(mktemp /tmp/brook-cfg-XXXXXX.cfg)"
+    cat > "${tmp}" <<EOF
+# Brook OS kernel config (pair instance)
+NET0_MODE=static
+NET0_IP=${ip}
+NET0_NETMASK=255.255.255.0
+EOF
+    # mcopy -o: overwrite if present
+    mcopy -o -i "${img}" "${tmp}" ::BROOK.CFG
+    rm -f "${tmp}"
+}
+stamp_disk_cfg "${VM0_DIR}/brook_disk.img"       10.42.0.10
+stamp_disk_cfg "${VM1_DIR}/brook_disk.img"       10.42.0.11
+
 # 3) Launch both VMs. Instance 0 in the background, instance 1 in foreground
 #    (so Ctrl-C from the terminal reaches the second window cleanly).
 echo ""
 echo "Launching VM0 (MAC 52:54:00:42:00:10, IP 10.42.0.10)..."
 echo "  (output → /tmp/brook-vm0.log)"
 ESP_OVERRIDE="${VM0_ESP}" \
+BROOK_DISK_IMG="${VM0_DIR}/brook_disk.img" \
+BROOK_EXT2_DISK="${VM0_DIR}/brook_ext2_disk.img" \
+BROOK_NIX_DISK="${VM0_DIR}/brook_nix_disk.img" \
+BROOK_HOME_DISK="${VM0_DIR}/brook_home_disk.img" \
 "${SCRIPT_DIR}/run-qemu.sh" ${BUILD_TYPE_ARG} \
     --vde="${VDE_SOCK}" \
     --mac=52:54:00:42:00:10 \
