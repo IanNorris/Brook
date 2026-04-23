@@ -297,6 +297,13 @@ struct Process
     uint64_t programBreak;      // Current brk() position
     uint64_t mmapNext;          // Next free user-space mmap virtual address
 
+    // MemFd mmap ranges — recorded so sys_munmap can unmap without freeing
+    // the underlying kernel heap pages (the MemFd buffer). Without this,
+    // client munmap() of a shared memfd corrupts the kernel heap.
+    static constexpr uint32_t MAX_MEMFD_MAPS = 16;
+    struct MemFdMap { uint64_t vaddr; uint64_t length; };
+    MemFdMap memfdMaps[MAX_MEMFD_MAPS];
+
     // User stack
     uint64_t stackBase;         // Bottom of stack allocation (lowest address)
     uint64_t stackTop;          // Top of stack (highest usable address)

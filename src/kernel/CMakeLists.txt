@@ -257,6 +257,19 @@ if(NOT BROOK_GIT_HASH)
 endif()
 
 string(TIMESTAMP BROOK_BUILD_DATE "%Y-%m-%d" UTC)
+# In Nix's hermetic build sandbox, SOURCE_DATE_EPOCH forces the above
+# to "1980-01-01" for reproducibility. Use the git commit date instead:
+# it's more informative and doesn't depend on the build clock.
+execute_process(
+    COMMAND git log -1 --format=%cs
+    WORKING_DIRECTORY "${BROOK_ROOT}"
+    OUTPUT_VARIABLE BROOK_GIT_DATE
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if(BROOK_GIT_DATE)
+    set(BROOK_BUILD_DATE "${BROOK_GIT_DATE}")
+endif()
 
 target_compile_definitions(kernel PRIVATE
     BROOK_GIT_HASH="${BROOK_GIT_HASH}"

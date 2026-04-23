@@ -723,7 +723,20 @@ void ProcessDestroy(Process* proc)
 
     // Threads share the page table with the leader — don't destroy it
     if (!proc->isKernelThread && !isThread)
+    {
+        // Unmap MemFd mmap ranges first — their physical pages belong to
+        // kernel heap buffers, not to this process. VmmDestroyUserPageTable
+        // would otherwise PmmUnrefPage them and potentially free live heap.
+        for (uint32_t i = 0; i < Process::MAX_MEMFD_MAPS; i++) {
+            auto& m = proc->memfdMaps[i];
+            if (m.length == 0) continue;
+            uint64_t pages = (m.length + 4095) / 4096;
+            for (uint64_t p = 0; p < pages; p++)
+                VmmUnmapPage(proc->pageTable, VirtualAddress(m.vaddr + p * 4096));
+            m.vaddr = 0; m.length = 0;
+        }
         VmmDestroyUserPageTable(proc->pageTable);
+    }
 
     // Only the leader owns compositor/window state
     if (!isThread)
