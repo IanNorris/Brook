@@ -170,7 +170,6 @@ add_executable(kernel
     src/window.cpp
     src/terminal.cpp
     src/rtc.cpp
-    src/kvmclock.cpp
     src/display.cpp
     src/mouse.cpp
     src/shell.cpp
