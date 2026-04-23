@@ -172,6 +172,8 @@ static void EnsureUdp(void)
     /* Server binds PORT_SERVER so peers can find it; client gets ephemeral. */
     udp_sockets[NS_SERVER] = OpenUdp(PORT_SERVER);
     udp_sockets[NS_CLIENT] = OpenUdp(0);
+    Com_Printf("net: sockets SERVER=%d(port %d) CLIENT=%d(ephemeral)\n",
+               udp_sockets[NS_SERVER], PORT_SERVER, udp_sockets[NS_CLIENT]);
 }
 
 void NET_Config(qboolean multiplayer)
@@ -200,6 +202,10 @@ qboolean NET_GetPacket(netsrc_t sock, netadr_t *net_from, sizebuf_t *net_message
 
     net_message->cursize = n;
     SockaddrToNetadr(&from, net_from);
+    Com_Printf("net: RX %d bytes on %s from %d.%d.%d.%d:%d\n",
+               n, sock == NS_CLIENT ? "CLIENT" : "SERVER",
+               net_from->ip[0], net_from->ip[1], net_from->ip[2], net_from->ip[3],
+               ntohs(net_from->port));
     return true;
 }
 
@@ -219,7 +225,12 @@ void NET_SendPacket(netsrc_t sock, int length, void *data, netadr_t to)
 
     struct sockaddr_in dst;
     NetadrToSockaddr(&to, &dst);
-    sendto(fd, data, length, 0, (struct sockaddr *)&dst, sizeof(dst));
+    int r = sendto(fd, data, length, 0, (struct sockaddr *)&dst, sizeof(dst));
+    Com_Printf("net: TX %d bytes on %s to %s%d.%d.%d.%d:%d -> %d\n",
+               length, sock == NS_CLIENT ? "CLIENT" : "SERVER",
+               to.type == NA_BROADCAST ? "BCAST " : "",
+               to.ip[0], to.ip[1], to.ip[2], to.ip[3],
+               ntohs(to.port), r);
 }
 
 qboolean NET_CompareAdr(netadr_t a, netadr_t b)

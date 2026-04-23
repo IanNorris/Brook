@@ -122,33 +122,6 @@ void SWimp_EndFrame(void)
     if (!fb_pixels || !sw_framebuffer)
         return;
 
-    // One-time diagnostic
-    static int diag_once = 0;
-    if (!diag_once) {
-        diag_once = 1;
-        ri.Con_Printf(PRINT_ALL, "SWimp_EndFrame: vid=%dx%d rowbytes=%d fb=%ux%u scale=%d\n",
-                      vid.width, vid.height, vid.rowbytes, fb_width, fb_height,
-                      (int)(fb_width / vid.width < fb_height / vid.height ?
-                            fb_width / vid.width : fb_height / vid.height));
-    }
-
-    // Periodic diagnostic: check if sw_framebuffer has non-zero content
-    static int diag_count = 0;
-    if (++diag_count <= 5 || (diag_count % 100) == 0) {
-        int nonzero_src = 0, nonzero_vid = 0, nonzero_pal = 0;
-        for (int i = 0; i < vid.width * vid.height && nonzero_src < 10; i++)
-            if (sw_framebuffer[i] != 0) nonzero_src++;
-        if (vid.buffer && vid.buffer != sw_framebuffer) {
-            for (int i = 0; i < vid.width * vid.height && nonzero_vid < 10; i++)
-                if (vid.buffer[i] != 0) nonzero_vid++;
-        }
-        for (int i = 0; i < 256; i++)
-            if (palette_rgba[i] != 0 && palette_rgba[i] != 0xFF000000u) nonzero_pal++;
-        ri.Con_Printf(PRINT_ALL, "SWimp_EndFrame #%d: sw_fb=%p vid.buf=%p match=%d nonzero_src=%d nonzero_vid=%d pal=%d\n",
-                      diag_count, (void*)sw_framebuffer, (void*)vid.buffer,
-                      (vid.buffer == sw_framebuffer), nonzero_src, nonzero_vid, nonzero_pal);
-    }
-
     // Blit 8-bit paletted frame to 32-bit framebuffer with scaling
     int sw = vid.width;
     int sh = vid.height;
