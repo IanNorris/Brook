@@ -1265,7 +1265,15 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             extern volatile uint64_t g_lapicTickCount;
             self->wakeupTick = g_lapicTickCount + 10;
             SchedulerBlock(self);
-            if (HasPendingSignals()) return -EINTR;
+            // SIGCHLD alone shouldn't interrupt a blocking read — it's
+            // default-ignored. Retry and re-poll the pipe instead.
+            if (HasPendingSignals()) {
+                Process* p = ProcessCurrent();
+                uint64_t pending = p->sigPending & ~p->sigMask;
+                uint64_t sigchld = (1ULL << (17 - 1));
+                if ((pending & ~sigchld) != 0) return -EINTR;
+                p->sigPending &= ~sigchld;
+            }
         }
     }
 
@@ -1289,7 +1297,17 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             extern volatile uint64_t g_lapicTickCount;
             self->wakeupTick = g_lapicTickCount + 10;
             SchedulerBlock(self);
-            if (HasPendingSignals()) return -EINTR;
+            if (HasPendingSignals()) {
+                // SIGCHLD alone (default-ignored) shouldn't interrupt a
+                // blocking AF_UNIX read; this is the classic case that
+                // broke scm_rights_test when the client exits right after
+                // sending.
+                Process* p = ProcessCurrent();
+                uint64_t pending = p->sigPending & ~p->sigMask;
+                uint64_t sigchld = (1ULL << (17 - 1));
+                if ((pending & ~sigchld) != 0) return -EINTR;
+                p->sigPending &= ~sigchld;
+            }
         }
     }
 
