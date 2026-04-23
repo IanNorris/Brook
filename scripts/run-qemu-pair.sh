@@ -41,9 +41,9 @@ clone_if_exists() {
     fi
 }
 
-echo "Preparing VM0 disk images in ${VM0_DIR}..."
 VM0_DIR=/tmp/brook-vm0
 mkdir -p "${VM0_DIR}"
+echo "Preparing VM0 disk images in ${VM0_DIR}..."
 clone_if_exists "${ROOT_DIR}/brook_disk.img"       "${VM0_DIR}/brook_disk.img"
 clone_if_exists "${ROOT_DIR}/brook_ext2_disk.img"  "${VM0_DIR}/brook_ext2_disk.img"
 clone_if_exists "${ROOT_DIR}/brook_nix_disk.img"   "${VM0_DIR}/brook_nix_disk.img"
