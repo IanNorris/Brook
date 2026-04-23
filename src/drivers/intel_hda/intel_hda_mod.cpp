@@ -39,6 +39,15 @@ MODULE_IMPORT_SYMBOL(SchedulerYield);
 
 using namespace brook;
 
+// Flip to 1 to re-enable verbose codec-enumeration / DMA-setup logs.
+#define HDA_VERBOSE 0
+#if HDA_VERBOSE
+#define HDA_VPRINTF(...)  SerialPrintf(__VA_ARGS__)
+#else
+#define HDA_VPRINTF(...)  ((void)0)
+#endif
+
+
 // ---------------------------------------------------------------------------
 // HDA controller registers (BAR0 MMIO, Intel spec §3)
 // ---------------------------------------------------------------------------
@@ -395,7 +404,7 @@ static bool EnumerateWidgets()
     uint8_t startNid = (response >> 16) & 0xFF;
     uint8_t count    = response & 0xFF;
 
-    SerialPrintf("intel_hda: root node: start=%d count=%d\n", startNid, count);
+    HDA_VPRINTF("intel_hda: root node: start=%d count=%d\n", startNid, count);
 
     // Find audio function group (type 1)
     uint8_t afg = 0;
@@ -409,7 +418,7 @@ static bool EnumerateWidgets()
         if (groupType == 1)
         {
             afg = nid;
-            SerialPrintf("intel_hda: audio function group at NID %d\n", afg);
+            HDA_VPRINTF("intel_hda: audio function group at NID %d\n", afg);
             break;
         }
     }
@@ -431,7 +440,7 @@ static bool EnumerateWidgets()
     startNid = (response >> 16) & 0xFF;
     count    = response & 0xFF;
 
-    SerialPrintf("intel_hda: AFG widgets: start=%d count=%d\n", startNid, count);
+    HDA_VPRINTF("intel_hda: AFG widgets: start=%d count=%d\n", startNid, count);
 
     // Scan widgets for DAC and output pin
     for (uint8_t i = 0; i < count; i++)
@@ -445,7 +454,7 @@ static bool EnumerateWidgets()
         if (wtype == WT_AUDIO_OUTPUT && g_dacNid == 0)
         {
             g_dacNid = nid;
-            SerialPrintf("intel_hda: DAC at NID %d\n", nid);
+            HDA_VPRINTF("intel_hda: DAC at NID %d\n", nid);
         }
         else if (wtype == WT_PIN_COMPLEX && g_pinNid == 0)
         {
@@ -460,7 +469,7 @@ static bool EnumerateWidgets()
                 if (defaultDevice <= 2)
                 {
                     g_pinNid = nid;
-                    SerialPrintf("intel_hda: output pin at NID %d (type=%d)\n",
+                    HDA_VPRINTF("intel_hda: output pin at NID %d (type=%d)\n",
                                 nid, defaultDevice);
                 }
             }
@@ -654,19 +663,6 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
     if (!g_initialized || !g_dacNid) return -1;
 
     uint32_t sdBase = g_outStreamBase;
-
-    // Periodic diagnostic: every 50th call
-    static uint32_t s_callCount = 0;
-    static uint64_t s_totalBytes = 0;
-    s_callCount++;
-    s_totalBytes += byteCount;
-    if (s_callCount <= 5 || (s_callCount % 50) == 0)
-    {
-        uint32_t lpib = g_streamRunning ? hda_read32(sdBase + SD_LPIB) : 0;
-        SerialPrintf("HDA: call#%u bytes=%u total=%luKB wfrag=%u lpib=%u run=%u\n",
-                     s_callCount, byteCount, s_totalBytes/1024,
-                     g_writeFrag, lpib, g_streamRunning ? 1 : 0);
-    }
 
     // Full stream setup on first call or format change
     bool needSetup = !g_streamConfigured ||
@@ -894,7 +890,7 @@ static int IntelHdaInit()
         g_fragPhys[i] = VmmVirtToPhys(KernelPageTable, fragVa).raw();
     }
 
-    SerialPrintf("intel_hda: DMA BDL phys=0x%lx audio frag0=0x%lx frag1=0x%lx (%u pages)\n",
+    HDA_VPRINTF("intel_hda: DMA BDL phys=0x%lx audio frag0=0x%lx frag1=0x%lx (%u pages)\n",
                  g_bdlPhys, g_fragPhys[0], g_fragPhys[1], audioPages);
 
     // Enable interrupts (global + controller + output stream 0)

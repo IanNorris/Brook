@@ -661,10 +661,19 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
         // Restore the original runningOnCpu — we're not taking this process.
         __atomic_store_n(&newProc->runningOnCpu, prevCpu, __ATOMIC_RELEASE);
 
-        SerialPrintf("SCHED: double-schedule avoided: '%s' (pid %u) on CPU%d, "
-                     "CPU%u will retry. oldProc='%s' pid=%u\n",
-                     newProc->name, newProc->pid, prevCpu, cpu,
-                     oldProc->name, oldProc->pid);
+        // Rate-limit: this path fires repeatedly when a hot process is
+        // contended between CPUs (e.g. a long-running nar-unpack).  It's a
+        // benign avoided-race, not a bug; log once per second per CPU.
+        static uint64_t lastLogMs[SCHED_MAX_CPUS] = {};
+        uint64_t nowMs = g_lapicTickCount;
+        if (nowMs - lastLogMs[cpu] >= 1000)
+        {
+            lastLogMs[cpu] = nowMs;
+            SerialPrintf("SCHED: double-schedule avoided: '%s' (pid %u) on CPU%d, "
+                         "CPU%u will retry. oldProc='%s' pid=%u\n",
+                         newProc->name, newProc->pid, prevCpu, cpu,
+                         oldProc->name, oldProc->pid);
+        }
 
         // If old process can still run, just continue it.
         if (oldProc->state == ProcessState::Running ||
