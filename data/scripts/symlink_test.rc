@@ -1,0 +1,2 @@
+# Brook boot script — run symlink_test to diagnose ext2 EPERM
+run /boot/BIN/SYMLINK_TEST
