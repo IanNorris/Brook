@@ -17,6 +17,8 @@
 #include <sys/mman.h>
 #include <linux/fb.h>
 
+extern qboolean VID_GetModeInfo(int *width, int *height, int mode);
+
 static int fb_fd = -1;
 static uint32_t *fb_pixels = NULL;
 static unsigned int fb_width = 0;
@@ -68,10 +70,21 @@ int SWimp_Init(void *hInstance, void *wndProc)
 
 rserr_t SWimp_SetMode(int *pwidth, int *pheight, int mode, qboolean fullscreen)
 {
-    // Use fixed resolution matching framebuffer or a standard Q2 mode
-    // Default Q2 software mode is 320x240
     int width = 320;
     int height = 240;
+
+    // Look up the requested mode from vid_modes[] (defined in vid_brook.c).
+    // Fall back to 320x240 if the mode number is out of range.
+    if (!VID_GetModeInfo(&width, &height, mode))
+    {
+        ri.Con_Printf(PRINT_ALL, "SWimp_SetMode: invalid mode %d, using 320x240\n", mode);
+        width = 320;
+        height = 240;
+    }
+
+    // Clamp to framebuffer so we don't overrun the blit.
+    if (fb_width && width > (int)fb_width) width = fb_width;
+    if (fb_height && height > (int)fb_height) height = fb_height;
 
     ri.Con_Printf(PRINT_ALL, "SWimp_SetMode: %dx%d (mode %d)\n", width, height, mode);
 
