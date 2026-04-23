@@ -84,7 +84,8 @@ def main():
         # BIN/ — copy any user-mode test binaries
         bin_names = ["hello_test", "hello_musl", "hello", "cowsay", "busybox",
                      "syscheck", "stresstest", "echotest", "demo",
-                     "wavplay", "tone", "mp3play", "wayland_test", "scm_rights_test"]
+                     "wavplay", "tone", "mp3play", "wayland_test", "scm_rights_test",
+                     "symlink_test"]
         # Search both <build_dir>/ and <build_dir>/user/ and <build_dir>/apps/ for binaries.
         bin_search_dirs = [build_dir, os.path.join(build_dir, "user"),
                            os.path.join(build_dir, "apps"),

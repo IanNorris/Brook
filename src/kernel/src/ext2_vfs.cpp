@@ -1773,10 +1773,18 @@ static int Ext2FsSymlink(void* mountPriv, uint8_t pdrv,
 
     char name[256];
     uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name));
-    if (!parentIno || !name[0]) { KMutexUnlock(&g_ext2Lock); return -2; } // -ENOENT
+    if (!parentIno || !name[0]) {
+        SerialPrintf("ext2 symlink: ResolveParent FAILED for '%s' (target='%s')\n",
+                     relPath, target);
+        KMutexUnlock(&g_ext2Lock); return -2; // -ENOENT
+    }
 
     Ext2Inode parentData;
-    if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KMutexUnlock(&g_ext2Lock); return -5; } // -EIO
+    if (!Ext2ReadInode(mnt, parentIno, &parentData)) {
+        SerialPrintf("ext2 symlink: ReadInode parent %u FAILED for '%s'\n",
+                     parentIno, relPath);
+        KMutexUnlock(&g_ext2Lock); return -5; // -EIO
+    }
 
     // Check if already exists
     if (Ext2DirLookup(mnt, &parentData, name)) {
@@ -1785,7 +1793,11 @@ static int Ext2FsSymlink(void* mountPriv, uint8_t pdrv,
     }
 
     uint32_t newIno = Ext2AllocInode(mnt, false);
-    if (!newIno) { KMutexUnlock(&g_ext2Lock); return -1; }
+    if (!newIno) {
+        SerialPrintf("ext2 symlink: AllocInode FAILED (likely out of inodes) for '%s'\n",
+                     relPath);
+        KMutexUnlock(&g_ext2Lock); return -28; // -ENOSPC
+    }
 
     Ext2Inode newData;
     for (uint32_t i = 0; i < sizeof(newData); ++i)
@@ -1803,16 +1815,20 @@ static int Ext2FsSymlink(void* mountPriv, uint8_t pdrv,
         // Slow symlink: allocate a data block
         uint32_t blk = Ext2AllocBlock(mnt);
         if (!blk) {
+            SerialPrintf("ext2 symlink: AllocBlock FAILED (disk full?) for '%s' target len=%u\n",
+                         relPath, targetLen);
             Ext2FreeInode(mnt, newIno, false);
             KMutexUnlock(&g_ext2Lock);
-            return -1;
+            return -28; // -ENOSPC
         }
         auto* buf = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
         if (!buf) {
+            SerialPrintf("ext2 symlink: kmalloc(%u) FAILED for '%s'\n",
+                         mnt->blockSize, relPath);
             Ext2FreeBlock(mnt, blk);
             Ext2FreeInode(mnt, newIno, false);
             KMutexUnlock(&g_ext2Lock);
-            return -1;
+            return -12; // -ENOMEM
         }
         for (uint32_t i = 0; i < mnt->blockSize; ++i) buf[i] = 0;
         for (uint32_t i = 0; i < targetLen; ++i) buf[i] = static_cast<uint8_t>(target[i]);
@@ -1828,10 +1844,12 @@ static int Ext2FsSymlink(void* mountPriv, uint8_t pdrv,
 
     // Add directory entry with type=7 (EXT2_FT_SYMLINK)
     if (!Ext2DirAdd(mnt, parentIno, &parentData, newIno, name, 7)) {
+        SerialPrintf("ext2 symlink: DirAdd FAILED parent=%u name='%s' for '%s'\n",
+                     parentIno, name, relPath);
         Ext2FreeInodeBlocks(mnt, &newData);
         Ext2FreeInode(mnt, newIno, false);
         KMutexUnlock(&g_ext2Lock);
-        return -1;
+        return -28; // -ENOSPC (probably couldn't extend dir)
     }
 
     KMutexUnlock(&g_ext2Lock);
