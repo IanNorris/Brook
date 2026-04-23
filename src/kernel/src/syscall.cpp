@@ -22,6 +22,7 @@
 #include "terminal.h"
 #include "net.h"
 #include "rtc.h"
+#include "kvmclock.h"
 #include "audio.h"
 #include "profiler.h"
 
@@ -3373,6 +3374,27 @@ static int64_t sys_clock_gettime(uint64_t clockid, uint64_t tsAddr, uint64_t,
     auto* ts = reinterpret_cast<timespec*>(tsAddr);
     if (!ts) return -EFAULT;
 
+    // Under KVM, the pvclock source gives us nanosecond precision directly.
+    // LAPIC-derived ms is only ms-accurate and drifts between RTC
+    // re-anchors, so prefer pvclock whenever it's live.
+    if (KvmClockAvailable())
+    {
+        uint64_t ns = KvmClockReadNs();
+        if (clockid == 0) // CLOCK_REALTIME
+        {
+            // Wall-clock: RtcNow() gives the epoch base, pvclock the sub-sec.
+            uint64_t epoch = RtcNow();
+            ts->tv_sec  = static_cast<int64_t>(epoch);
+            ts->tv_nsec = static_cast<int64_t>(ns % 1000000000ULL);
+        }
+        else
+        {
+            ts->tv_sec  = static_cast<int64_t>(ns / 1000000000ULL);
+            ts->tv_nsec = static_cast<int64_t>(ns % 1000000000ULL);
+        }
+        return 0;
+    }
+
     if (clockid == 0) // CLOCK_REALTIME — wall-clock via RTC
     {
         uint64_t epoch = RtcNow();
@@ -3396,9 +3418,18 @@ static int64_t sys_gettimeofday(uint64_t tvAddr, uint64_t, uint64_t,
     if (!tv) return -EFAULT;
 
     uint64_t epoch = RtcNow();
-    uint64_t ms = g_lapicTickCount;
-    tv->tv_sec  = static_cast<int64_t>(epoch);
-    tv->tv_usec = static_cast<int64_t>((ms % 1000) * 1000);
+    if (KvmClockAvailable())
+    {
+        uint64_t ns = KvmClockReadNs();
+        tv->tv_sec  = static_cast<int64_t>(epoch);
+        tv->tv_usec = static_cast<int64_t>((ns / 1000) % 1000000ULL);
+    }
+    else
+    {
+        uint64_t ms = g_lapicTickCount;
+        tv->tv_sec  = static_cast<int64_t>(epoch);
+        tv->tv_usec = static_cast<int64_t>((ms % 1000) * 1000);
+    }
     return 0;
 }
 
