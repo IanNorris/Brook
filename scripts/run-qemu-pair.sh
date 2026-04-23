@@ -64,6 +64,7 @@ if [ ! -f "${BOOTLOADER}" ] || [ ! -f "${KERNEL_ELF}" ]; then
 fi
 
 # Make sure initrd exists (run-qemu.sh normally regenerates it).
+mkdir -p "${BUILD_DIR}/esp"
 "${SCRIPT_DIR}/make_initrd.sh" "--${BUILD_TYPE}" >/dev/null
 
 VM0_DIR=/tmp/brook-vm0
@@ -78,9 +79,9 @@ build_esp() {
     mkdir -p "${dst}/EFI/BOOT" "${dst}/KERNEL"
     cp "${BOOTLOADER}" "${dst}/EFI/BOOT/BOOTX64.EFI"
     cp "${KERNEL_ELF}" "${dst}/KERNEL/BROOK.ELF"
-    # Initrd (contains early drivers + any config)
-    if [ -f "${BUILD_DIR}/initrd.img" ]; then
-        cp "${BUILD_DIR}/initrd.img" "${dst}/INITRD.IMG"
+    # Initrd (make_initrd.sh writes it to build/<type>/esp/INITRD.IMG)
+    if [ -f "${BUILD_DIR}/esp/INITRD.IMG" ]; then
+        cp "${BUILD_DIR}/esp/INITRD.IMG" "${dst}/INITRD.IMG"
     fi
     cat > "${dst}/BROOK.CFG" <<EOF
 # Brook OS boot configuration (pair instance)
