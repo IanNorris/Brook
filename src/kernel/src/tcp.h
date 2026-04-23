@@ -16,6 +16,7 @@ struct TcpAction {
     bool     sendAck;        // send an ACK segment
     bool     sendRst;        // send a RST segment
     bool     enqueueData;    // data should be enqueued to RX buffer
+    bool     justConnected;  // SynSent → Established transition this segment
     const uint8_t* dataPtr;  // pointer to data to enqueue (within input payload)
     uint32_t dataLen;        // bytes to enqueue
 };

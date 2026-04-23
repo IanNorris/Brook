@@ -1,0 +1,2 @@
+# Brook OS — Comprehensive Nix package test
+run /nix/store/d9mmsda01n5ir4xsm1f033662q7fdwha-bash-interactive-5.3p9/bin/bash /boot/BIN/NIXTEST.SH

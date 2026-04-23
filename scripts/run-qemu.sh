@@ -9,6 +9,11 @@ BUILD_TYPE="debug"
 DEBUG_FLAGS=""
 SCRIPT_NAME=""
 HEADLESS=0
+VNC_DISPLAY=""
+VDE_SOCK=""
+NIC_MAC=""
+INSTANCE=""
+NO_AUDIO=0
 EXTRA_ARGS=()
 for arg in "$@"; do
     case "$arg" in
@@ -21,16 +26,32 @@ for arg in "$@"; do
         --headless)
             HEADLESS=1
             ;;
+        --vnc)
+            VNC_DISPLAY="__NEXT_VNC__"
+            ;;
+        --vde=*)
+            VDE_SOCK="${arg#--vde=}"
+            ;;
+        --mac=*)
+            NIC_MAC="${arg#--mac=}"
+            ;;
+        --instance=*)
+            INSTANCE="${arg#--instance=}"
+            ;;
+        --no-audio)
+            NO_AUDIO=1
+            ;;
         --script=*)
             SCRIPT_NAME="${arg#--script=}"
             ;;
         --script)
-            # Next arg will be consumed below
             SCRIPT_NAME="__NEXT__"
             ;;
         *)
             if [ "$SCRIPT_NAME" = "__NEXT__" ]; then
                 SCRIPT_NAME="$arg"
+            elif [ "$VNC_DISPLAY" = "__NEXT_VNC__" ]; then
+                VNC_DISPLAY="$arg"
             else
                 EXTRA_ARGS+=("$arg")
             fi
@@ -148,8 +169,9 @@ DISK_IMG="${BROOK_DISK_IMG:-${ROOT_DIR}/brook_disk.img}"
 if [ ! -f "${DISK_IMG}" ]; then
     echo "Creating persistent disk image..."
     "${SCRIPT_DIR}/create_disk.sh"
-    "${SCRIPT_DIR}/update_disk.sh"
 fi
+# Always sync latest files to disk
+"${SCRIPT_DIR}/update_disk.sh" "--${BUILD_TYPE}"
 
 # Optional ext2 disk image (added as second virtio drive)
 EXT2_DISK="${BROOK_EXT2_DISK:-${ROOT_DIR}/brook_ext2_disk.img}"
@@ -165,6 +187,13 @@ NIX_DRIVE=""
 if [ -f "${NIX_DISK}" ]; then
     NIX_DRIVE="-drive if=virtio,format=raw,file=${NIX_DISK},file.locking=off"
     echo "  Nix disk:  ${NIX_DISK}"
+fi
+
+HOME_DISK="${BROOK_HOME_DISK:-${ROOT_DIR}/brook_home_disk.img}"
+HOME_DRIVE=""
+if [ -f "${HOME_DISK}" ]; then
+    HOME_DRIVE="-drive if=virtio,format=raw,file=${HOME_DISK},file.locking=off"
+    echo "  Home disk: ${HOME_DISK}"
 fi
 
 # Select boot script: --script <name> copies data/scripts/<name>.rc to INIT.RC
@@ -190,11 +219,47 @@ if [ -n "${SCRIPT_NAME}" ]; then
 fi
 
 if [ "$HEADLESS" -eq 1 ]; then
-    SERIAL_OPT="-serial file:/tmp/brook_serial.log"
-    DISPLAY_OPT="-vnc none"
+    SERIAL_OPT="${SERIAL_OPT:--serial stdio}"
+    BROOK_AUDIODEV="${BROOK_AUDIODEV:-none}"
+    if [ -n "$VNC_DISPLAY" ] && [ "$VNC_DISPLAY" != "__NEXT_VNC__" ]; then
+        DISPLAY_OPT="-vnc ${VNC_DISPLAY}"
+    else
+        DISPLAY_OPT="-vnc none"
+    fi
 else
     SERIAL_OPT="-serial stdio"
     DISPLAY_OPT="-display gtk"
+fi
+
+# Network device selection: default is user-mode slirp with tcp host-forward.
+# --vde=SOCK switches to a VDE switch peer link (for VM<->VM traffic).
+NIC_MAC_ARG=""
+if [ -n "${NIC_MAC}" ]; then
+    NIC_MAC_ARG=",mac=${NIC_MAC}"
+fi
+if [ -n "${VDE_SOCK}" ]; then
+    NETDEV_OPT="-netdev vde,id=net0,sock=${VDE_SOCK}"
+    echo "  Net:  VDE switch at ${VDE_SOCK}"
+else
+    # Hostfwd base port: 11237 + instance offset (to avoid collision when running pairs)
+    HOSTFWD_BASE=11237
+    if [ -n "${INSTANCE}" ]; then
+        HOSTFWD_BASE=$((11237 + INSTANCE * 100))
+    fi
+    NETDEV_OPT="-netdev user,id=net0,hostfwd=tcp::${HOSTFWD_BASE}-:1234"
+fi
+
+# Per-instance QEMU monitor socket and audio disable
+MONITOR_SOCK="/tmp/qemu_monitor.sock"
+if [ -n "${INSTANCE}" ]; then
+    MONITOR_SOCK="/tmp/qemu_monitor_${INSTANCE}.sock"
+fi
+
+AUDIO_OPTS="-audiodev ${BROOK_AUDIODEV:-pipewire},id=hda0,out.buffer-length=200000,timer-period=5000 \
+    -device ich9-intel-hda,bus=pcie.0,addr=0x1b \
+    -device hda-output,audiodev=hda0"
+if [ "${NO_AUDIO}" -eq 1 ]; then
+    AUDIO_OPTS="-audiodev none,id=hda0"
 fi
 
 KVM_FLAGS=""
@@ -211,16 +276,28 @@ qemu-system-x86_64 \
     -m 4G \
     -drive if=pflash,format=raw,readonly=on,file="${OVMF_CODE}" \
     -drive if=pflash,format=raw,file="${OVMF_VARS_COPY}" \
-    -drive format=raw,file=fat:rw:"${BUILD_DIR}/esp" \
+    -drive format=raw,file=fat:rw:"${ESP_OVERRIDE:-${BUILD_DIR}/esp}" \
     -drive if=virtio,format=raw,file="${DISK_IMG}",file.locking=off \
     ${EXT2_DRIVE} \
     ${NIX_DRIVE} \
+    ${HOME_DRIVE} \
     -device virtio-tablet-pci \
-    -device virtio-net-pci,netdev=net0 \
-    -netdev user,id=net0 \
+    -device virtio-rng-pci \
+    -device virtio-net-pci,netdev=net0${NIC_MAC_ARG} \
+    ${AUDIO_OPTS} \
+    ${NETDEV_OPT} \
     ${SERIAL_OPT} \
     ${DISPLAY_OPT} \
-    -monitor unix:/tmp/qemu_monitor.sock,server,nowait \
+    -monitor unix:${MONITOR_SOCK},server,nowait \
     -no-reboot \
+    -no-shutdown \
     ${DEBUG_FLAGS} \
     "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+
+# If a profile was written to the boot disk, offer to extract it.
+if mcopy -i "${DISK_IMG}" ::profile.txt /dev/null 2>/dev/null; then
+    echo ""
+    echo "  Profile found on boot disk. To extract and convert:"
+    echo "    mcopy -i ${DISK_IMG} ::profile.txt ./profile.txt"
+    echo "    python3 ${SCRIPT_DIR}/profiler_to_speedscope.py profile.txt"
+fi

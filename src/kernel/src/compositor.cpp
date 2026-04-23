@@ -11,6 +11,7 @@
 #include "input.h"
 #include "net.h"
 #include "font_atlas.h"
+#include "debug_overlay.h"
 
 namespace brook {
 
@@ -402,9 +403,10 @@ static void BlitWallpaper()
     }
     else
     {
-        for (uint32_t y = 0; y < g_physFbHeight; ++y)
-            for (uint32_t x = 0; x < g_physFbWidth; ++x)
-                dstBase[y * dstStride + x] = 0x00001A3A;
+        // No wallpaper loaded yet — preserve the current backbuffer content
+        // (boot logo / previous TTY output) to avoid a black flash.
+        // Once wallpaper is set via CompositorSetWallpaper, this branch
+        // will stop being taken and the wallpaper fills the screen.
     }
     MarkAllDirty();
 }
@@ -512,6 +514,10 @@ static Process* g_compositorProcess = nullptr;
 // Forward declaration
 static void CompositorHandleMouseWM();
 
+// Button latch state — set by input queue event processing, consumed by mouse handler
+static volatile bool g_wmBtnLatch        = false;
+static volatile bool g_wmBtnReleaseLatch = false;
+
 // WM-mode compositor loop: wallpaper → windows (z-ordered) → chrome → cursor.
 static void CompositorLoopWM()
 {
@@ -611,17 +617,87 @@ static void CompositorLoopWM()
                         g_physFbWidth, g_physFbHeight, now);
         uint32_t tbY = g_physFbHeight - WM_TASKBAR_HEIGHT;
         MarkDirtyRows(tbY, g_physFbHeight);
+
+        // Render launcher popup over everything if open
+        if (WmLauncherVisible())
+        {
+            WmLauncherRender(g_backBuffer, g_backBufStride,
+                             g_physFbWidth, g_physFbHeight);
+            // Mark the launcher area dirty (it's above the taskbar)
+            MarkDirtyRows(0, g_physFbHeight);
+        }
     }
 
-    // 4. Handle mouse interaction
-    CompositorHandleMouseWM();
-
-    // 5. Route keyboard input to focused window
+    // 4. Route input events (keyboard + mouse buttons)
+    // Must happen before mouse click handling so poll drains the virtqueue
+    // and events are latched for CompositorHandleMouseWM.
     InputEvent ev;
     while (InputPollEvent(&ev))
     {
-        if (ev.type != InputEventType::KeyPress) continue;
+        if (ev.type == InputEventType::MouseButtonDown && ev.scanCode == 0)
+        {
+            g_wmBtnLatch = true;
+            continue;
+        }
+        if (ev.type == InputEventType::MouseButtonUp && ev.scanCode == 0)
+        {
+            g_wmBtnReleaseLatch = true;
+            continue;
+        }
+        if (ev.type == InputEventType::MouseMove)
+            continue;
 
+        // Scroll wheel: route to the window under the cursor (not the focused
+        // one — standard UX is "scroll the thing you're pointing at").
+        if (ev.type == InputEventType::MouseScroll)
+        {
+            int32_t mx = 0, my = 0;
+            MouseGetPosition(&mx, &my);
+            WmHitResult hit = WmHitTest(mx, my);
+            if (hit.windowIndex >= 0)
+            {
+                Window* target = WmGetWindow(hit.windowIndex);
+                if (target && target->proc)
+                {
+                    int8_t dy = static_cast<int8_t>(ev.scanCode);
+                    int8_t dx = static_cast<int8_t>(ev.ascii);
+                    // If the target is a terminal, consume the scroll as
+                    // scrollback navigation.  Otherwise drop for now — we
+                    // don't have a per-window scroll event channel yet.
+                    Terminal* term = TerminalFindByProcess(target->proc);
+                    if (term)
+                    {
+                        TerminalScroll(term, dy);
+                        (void)dx;
+                    }
+                }
+            }
+            continue;
+        }
+
+        if (ev.type != InputEventType::KeyPress && ev.type != InputEventType::KeyRelease)
+            continue;
+
+        // Find the focused window (needed for both press and release)
+        Window* focused = nullptr;
+        for (uint32_t i = 0; i < WM_MAX_WINDOWS; i++)
+        {
+            Window* w = WmGetWindow(static_cast<int>(i));
+            if (w && w->proc && w->focused && w->visible)
+            {
+                focused = w;
+                break;
+            }
+        }
+        if (!focused) continue;
+
+        // Key release events skip hotkey/signal processing — just route to window
+        if (ev.type == InputEventType::KeyRelease)
+        {
+            // Route release to terminal or per-process queue (same logic as press)
+        }
+        else
+        {
         DbgPrintf("KEY: scan=0x%02x ascii=0x%02x\n", ev.scanCode, ev.ascii);
 
         // Global hotkeys (no focused window needed)
@@ -634,19 +710,6 @@ static void CompositorLoopWM()
                 continue;
             }
         }
-
-        // Find the focused window
-        Window* focused = nullptr;
-        for (uint32_t i = 0; i < WM_MAX_WINDOWS; i++)
-        {
-            Window* w = WmGetWindow(static_cast<int>(i));
-            if (w && w->proc && w->focused && w->visible)
-            {
-                focused = w;
-                break;
-            }
-        }
-        if (!focused) continue;
 
         // Check for terminal signal keys (Ctrl+C, Ctrl+Z, Ctrl+\)
         if (ev.modifiers & INPUT_MOD_CTRL)
@@ -683,6 +746,7 @@ static void CompositorLoopWM()
                 continue;
             }
         }
+        } // end KeyPress-only block
 
         // Route to terminal if this window's process has one
         bool routed = false;
@@ -730,6 +794,10 @@ static void CompositorLoopWM()
         if (!routed)
             ProcessInputPush(focused->proc, ev);
     }
+
+    // 5. Handle mouse interaction (position + latched clicks)
+    // Must run AFTER event poll so latch flags are populated.
+    CompositorHandleMouseWM();
 }
 
 // Mouse state for WM interaction
@@ -743,6 +811,8 @@ static int16_t g_wmResizeStartMX = 0;
 static int16_t g_wmResizeStartMY = 0;
 static uint16_t g_wmResizeStartW = 0;
 static uint16_t g_wmResizeStartH = 0;
+static bool    g_wmResizeX       = false; // resize horizontally
+static bool    g_wmResizeY       = false; // resize vertically
 static bool    g_wmLastBtnDown   = false;
 
 static void CompositorHandleMouseWM()
@@ -751,14 +821,55 @@ static void CompositorHandleMouseWM()
 
     int32_t mx, my;
     MouseGetPosition(&mx, &my);
-    uint8_t buttons = MouseGetButtons();
-    bool btnDown = (buttons & 0x01) != 0; // left button
+
+    // Determine button state. Use latched press/release from input queue
+    // to survive fast press+release cycles between compositor frames.
+    // Also check polled state for held buttons (drag operations).
+    uint8_t polledButtons = MouseGetButtons();
+    bool btnDown = (polledButtons & 0x01) != 0;
+
+    // If a press was latched, treat as button down regardless of current state
+    if (g_wmBtnLatch)
+    {
+        btnDown = true;
+        g_wmBtnLatch = false;
+    }
 
     if (btnDown && !g_wmLastBtnDown)
     {
+        DbgPrintf("WM: click at (%d,%d)\n", mx, my);
+        // If launcher is open, check launcher panel first
+        if (WmLauncherVisible())
+        {
+            int launcherIdx = WmLauncherHitTest(mx, my, g_physFbWidth, g_physFbHeight);
+            if (launcherIdx >= 0)
+            {
+                WmLauncherExec(launcherIdx);
+                g_wmLastBtnDown = btnDown;
+                return;
+            }
+            // Check if clicking the Apps button again (toggle off)
+            int tbIdx = WmTaskbarHitTest(mx, my, g_physFbWidth, g_physFbHeight);
+            if (tbIdx == -3)
+            {
+                WmLauncherToggle();
+                g_wmLastBtnDown = btnDown;
+                return;
+            }
+            // Clicked elsewhere — close launcher
+            WmLauncherToggle();
+            g_wmLastBtnDown = btnDown;
+            return;
+        }
+
         // Check taskbar first
         int tbIdx = WmTaskbarHitTest(mx, my, g_physFbWidth, g_physFbHeight);
-        if (tbIdx == -2)
+        if (tbIdx == -3)
+        {
+            // "Apps" button — toggle launcher
+            WmLauncherToggle();
+        }
+        else if (tbIdx == -2)
         {
             // "+" button — spawn new terminal
             WmSpawnTerminal();
@@ -832,6 +943,8 @@ static void CompositorHandleMouseWM()
                 break;
             }
             case WmHitZone::ResizeCorner:
+            case WmHitZone::ResizeRight:
+            case WmHitZone::ResizeBottom:
             {
                 // Start resize drag
                 Window* w = WmGetWindow(hit.windowIndex);
@@ -843,6 +956,8 @@ static void CompositorHandleMouseWM()
                     g_wmResizeStartMY = static_cast<int16_t>(my);
                     g_wmResizeStartW  = w->clientW;
                     g_wmResizeStartH  = w->clientH;
+                    g_wmResizeX = (hit.zone != WmHitZone::ResizeBottom);
+                    g_wmResizeY = (hit.zone != WmHitZone::ResizeRight);
                 }
                 break;
             }
@@ -865,8 +980,8 @@ static void CompositorHandleMouseWM()
         // The actual VFB reallocation happens on release.
         int16_t dx = static_cast<int16_t>(mx) - g_wmResizeStartMX;
         int16_t dy = static_cast<int16_t>(my) - g_wmResizeStartMY;
-        int32_t newW = static_cast<int32_t>(g_wmResizeStartW) + dx;
-        int32_t newH = static_cast<int32_t>(g_wmResizeStartH) + dy;
+        int32_t newW = static_cast<int32_t>(g_wmResizeStartW) + (g_wmResizeX ? dx : 0);
+        int32_t newH = static_cast<int32_t>(g_wmResizeStartH) + (g_wmResizeY ? dy : 0);
         if (newW < static_cast<int32_t>(WM_MIN_WIDTH))  newW = WM_MIN_WIDTH;
         if (newH < static_cast<int32_t>(WM_MIN_HEIGHT)) newH = WM_MIN_HEIGHT;
 

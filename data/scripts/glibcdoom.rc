@@ -1,0 +1,2 @@
+# Brook OS — glibc DOOM test
+run --strace /nix/games/doomgeneric -iwad /nix/games/doom1.wad

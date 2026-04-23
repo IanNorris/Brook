@@ -25,6 +25,7 @@ enum class InputEventType : uint8_t {
     MouseMove       = 2,
     MouseButtonDown = 3,
     MouseButtonUp   = 4,
+    MouseScroll     = 5,   // scanCode=int8 dy (up positive), ascii=int8 dx (right positive)
 };
 
 // A single input event.

@@ -1,0 +1,3 @@
+# Brook OS crash test — nullptr
+set tty full
+crashtest nullptr

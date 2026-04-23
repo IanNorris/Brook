@@ -14,6 +14,7 @@
 #include "kprintf.h"
 #include "compositor.h"
 #include "window.h"
+#include "ext2_vfs.h"
 #include "string.h"
 
 namespace brook {
@@ -40,6 +41,7 @@ int FdAlloc(Process* proc, FdType type, void* handle)
             return static_cast<int>(i);
         }
     }
+    SerialPrintf("FD: pid %u exhausted %u fds\n", proc->pid, MAX_FDS);
     return -24; // EMFILE
 }
 
@@ -161,6 +163,16 @@ static uint64_t SetupUserStack(Process* proc,
     // 4. Align to 16 bytes
     sp &= ~0xFULL;
 
+    // Compute total 8-byte slots to be pushed below, and pad so final RSP
+    // is 16-byte aligned (Linux ABI: RSP mod 16 == 0 at process entry).
+    //   auxv: 8 entries × 2 slots = 16
+    //   envp: (envc + 1) slots (including NULL terminator)
+    //   argv: (argc + 1) slots (including NULL terminator)
+    //   argc: 1 slot
+    int totalSlots = 16 + (envc + 1) + (argc + 1) + 1;
+    if (totalSlots & 1)
+        pushU64(0); // padding to maintain 16-byte alignment
+
     // 5. Push auxiliary vectors (in reverse order, so first entry is at lowest address)
     pushU64(0); pushU64(AT_NULL);                               // AT_NULL
     pushU64(randomAddr); pushU64(AT_RANDOM);                    // AT_RANDOM
@@ -198,7 +210,8 @@ uint64_t ElfLoadAt(const uint8_t* data, uint64_t size,
                    uint64_t base, PageTable pt, uint16_t pid);
 
 // Base address where the dynamic linker / interpreter is loaded.
-static constexpr uint64_t INTERP_LOAD_BASE = 0x40000000ULL; // 1 GB
+// Placed above USER_MMAP_END so it can never collide with sys_mmap allocations.
+static constexpr uint64_t INTERP_LOAD_BASE = 0x7F0000000000ULL; // ~127 TB
 
 // ---------------------------------------------------------------------------
 // LoadInterpreter -- Read and load the ELF interpreter specified in
@@ -209,7 +222,7 @@ static uint64_t LoadInterpreter(Process* proc)
 {
     if (proc->elf.interpPath[0] == '\0') return 0;
 
-    SerialPrintf("INTERP: loading '%s' for pid %u\n",
+    DbgPrintf("INTERP: loading '%s' for pid %u\n",
                  proc->elf.interpPath, proc->pid);
 
     // Try the exact path first.
@@ -608,6 +621,76 @@ Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
     return proc;
 }
 
+// Close a single FD's underlying resource and free the slot.
+// Shared between ProcessCloseAllFds and ProcessCloseCloexecFds.
+static void CloseFdEntry(Process* proc, uint32_t i)
+{
+    FdEntry& fde = proc->fds[i];
+
+    if (fde.type == FdType::Vnode && fde.handle)
+    {
+        auto* vn = static_cast<Vnode*>(fde.handle);
+        uint32_t prev = __atomic_fetch_sub(&vn->refCount, 1, __ATOMIC_ACQ_REL);
+        if (prev <= 1)
+            VfsClose(vn);
+    }
+
+    if (fde.type == FdType::Socket && fde.handle)
+    {
+        int sockIdx = static_cast<int>(
+            reinterpret_cast<uintptr_t>(fde.handle)) - 1;
+        brook::SockUnref(sockIdx);
+    }
+
+    if (fde.type == FdType::Pipe && fde.handle)
+    {
+        auto* pipe = static_cast<PipeBuffer*>(fde.handle);
+        if (fde.flags & 1) // write end
+        {
+            __atomic_fetch_sub(&pipe->writers, 1, __ATOMIC_RELEASE);
+            Process* reader = pipe->readerWaiter;
+            if (reader)
+            {
+                pipe->readerWaiter = nullptr;
+                __atomic_store_n(&reader->pendingWakeup, 1, __ATOMIC_RELEASE);
+                SchedulerUnblock(reader);
+            }
+        }
+        else // read end
+        {
+            __atomic_fetch_sub(&pipe->readers, 1, __ATOMIC_RELEASE);
+            Process* writer = pipe->writerWaiter;
+            if (writer)
+            {
+                pipe->writerWaiter = nullptr;
+                __atomic_store_n(&writer->pendingWakeup, 1, __ATOMIC_RELEASE);
+                SchedulerUnblock(writer);
+            }
+        }
+
+        if (__atomic_load_n(&pipe->readers, __ATOMIC_ACQUIRE) == 0 &&
+            __atomic_load_n(&pipe->writers, __ATOMIC_ACQUIRE) == 0)
+        {
+            kfree(pipe);
+        }
+    }
+
+    FdFree(proc, static_cast<int>(i));
+}
+
+// Close all FDs with FD_CLOEXEC set — called by ProcessExec (execve semantics).
+void ProcessCloseCloexecFds(Process* proc)
+{
+    if (!proc) return;
+    for (uint32_t i = 0; i < MAX_FDS; ++i)
+    {
+        FdEntry& fde = proc->fds[i];
+        if (fde.type == FdType::None) continue;
+        if (!(fde.fdFlags & 1)) continue; // not FD_CLOEXEC
+        CloseFdEntry(proc, i);
+    }
+}
+
 void ProcessCloseAllFds(Process* proc)
 {
     if (!proc) return;
@@ -616,58 +699,7 @@ void ProcessCloseAllFds(Process* proc)
     {
         FdEntry& fde = proc->fds[i];
         if (fde.type == FdType::None) continue;
-
-        if (fde.type == FdType::Vnode && fde.handle)
-        {
-            auto* vn = static_cast<Vnode*>(fde.handle);
-            uint32_t prev = __atomic_fetch_sub(&vn->refCount, 1, __ATOMIC_ACQ_REL);
-            if (prev <= 1)
-                VfsClose(vn);
-        }
-
-        // Socket cleanup: decrement refcount, close socket if last ref
-        if (fde.type == FdType::Socket && fde.handle)
-        {
-            int sockIdx = static_cast<int>(
-                reinterpret_cast<uintptr_t>(fde.handle)) - 1;
-            brook::SockUnref(sockIdx);
-        }
-
-        // Pipe cleanup: decrement reader/writer counts and wake waiters
-        if (fde.type == FdType::Pipe && fde.handle)
-        {
-            auto* pipe = static_cast<PipeBuffer*>(fde.handle);
-            if (fde.flags & 1) // write end
-            {
-                __atomic_fetch_sub(&pipe->writers, 1, __ATOMIC_RELEASE);
-                Process* reader = pipe->readerWaiter;
-                if (reader)
-                {
-                    pipe->readerWaiter = nullptr;
-                    __atomic_store_n(&reader->pendingWakeup, 1, __ATOMIC_RELEASE);
-                    SchedulerUnblock(reader);
-                }
-            }
-            else // read end
-            {
-                __atomic_fetch_sub(&pipe->readers, 1, __ATOMIC_RELEASE);
-                Process* writer = pipe->writerWaiter;
-                if (writer)
-                {
-                    pipe->writerWaiter = nullptr;
-                    __atomic_store_n(&writer->pendingWakeup, 1, __ATOMIC_RELEASE);
-                    SchedulerUnblock(writer);
-                }
-            }
-
-            if (__atomic_load_n(&pipe->readers, __ATOMIC_ACQUIRE) == 0 &&
-                __atomic_load_n(&pipe->writers, __ATOMIC_ACQUIRE) == 0)
-            {
-                kfree(pipe);
-            }
-        }
-
-        FdFree(proc, static_cast<int>(i));
+        CloseFdEntry(proc, i);
     }
 }
 
@@ -676,6 +708,9 @@ void ProcessDestroy(Process* proc)
     if (!proc) return;
 
     bool isThread = proc->isThread;
+
+    // Release any kernel mutexes held by this process (prevents deadlock)
+    Ext2ForceUnlockForPid(proc->pid);
 
     // Threads don't own FDs — the leader does
     if (!isThread)
@@ -705,6 +740,16 @@ void ProcessDestroy(Process* proc)
     // Remove from scheduler tracking
     SchedulerRemoveProcess(proc);
 
+    // Clear signal handler slot so the PID can be safely reused without
+    // the next process inheriting our handler pointers (which would
+    // reference user memory no longer mapped and cause a #PF on signal).
+    for (int s = 0; s < 64; ++s) {
+        g_sigHandlers[proc->pid][s].handler = 0;
+        g_sigHandlers[proc->pid][s].flags = 0;
+        g_sigHandlers[proc->pid][s].restorer = 0;
+        g_sigHandlers[proc->pid][s].mask = 0;
+    }
+
     kfree(proc);
 }
 
@@ -724,7 +769,7 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
     auto* srcPml4 = reinterpret_cast<uint64_t*>(
         PhysToVirt(srcPt.pml4).raw());
 
-    uint64_t sharedCount = 0;
+    [[maybe_unused]] uint64_t sharedCount = 0;
 
     // Only copy user-half (PML4 entries 0..255)
     for (uint64_t i4 = 0; i4 < 256; i4++)
@@ -829,7 +874,7 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
     // Full TLB flush by reloading CR3
     asm volatile("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
 
-    SerialPrintf("FORK: COW shared %lu pages (parent PID %u -> child PID %u)\n",
+    DbgPrintf("FORK: COW shared %lu pages (parent PID %u -> child PID %u)\n",
                  sharedCount, static_cast<uint32_t>(srcPid), static_cast<uint32_t>(dstPid));
     return true;
 }
@@ -974,6 +1019,14 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->ttyEcho = parent->ttyEcho;
     child->straceEnabled = parent->straceEnabled;
 
+    // Inherit parent's signal handlers (POSIX fork semantics). The
+    // g_sigHandlers table is indexed by pid, so we must explicitly copy;
+    // otherwise the child's slot contains stale handler pointers from
+    // whatever previous process had the same pid — a deterministic #PF
+    // waiting for the first signal delivery (e.g. SIGCHLD on waitpid).
+    for (int s = 0; s < 64; ++s)
+        g_sigHandlers[child->pid][s] = g_sigHandlers[parent->pid][s];
+
     // Set child's name
     {
         const char* suffix = "_child";
@@ -985,7 +1038,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
         child->name[31] = '\0';
     }
 
-    SerialPrintf("FORK: parent pid=%u -> child pid=%u '%s', rip=0x%lx rsp=0x%lx\n",
+    DbgPrintf("FORK: parent pid=%u -> child pid=%u '%s', rip=0x%lx rsp=0x%lx\n",
                  parent->pid, child->pid, child->name, userRip, userRsp);
 
     return child;
@@ -1090,6 +1143,13 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     thread->inSignalHandler = false;
     thread->sigReturnPending = false;
 
+    // Threads get a unique pid (TID) but share the process group's signal
+    // handlers. The g_sigHandlers table is per-pid, so copy the parent's
+    // slot into the thread's slot. Without this the thread's slot contains
+    // whatever stale data was left by a previous process with the same pid.
+    for (int s = 0; s < 64; ++s)
+        g_sigHandlers[thread->pid][s] = g_sigHandlers[parent->pid][s];
+
     // Set thread name
     {
         uint32_t nameLen = 0;
@@ -1101,7 +1161,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
         thread->name[31] = '\0';
     }
 
-    SerialPrintf("THREAD: parent pid=%u -> thread tid=%u tgid=%u, rip=0x%lx rsp=0x%lx tls=0x%lx\n",
+    DbgPrintf("THREAD: parent pid=%u -> thread tid=%u tgid=%u, rip=0x%lx rsp=0x%lx tls=0x%lx\n",
                  parent->pid, thread->pid, thread->tgid, userRip, userRsp, tlsBase);
 
     return thread;
@@ -1261,8 +1321,29 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     proc->fbDirty = 0;
     proc->fbExitColor = 0;
 
-    // 8. Close O_CLOEXEC fds (we don't track this flag yet, so keep all open)
-    // For now, FDs 0/1/2 are preserved (stdin/stdout/stderr).
+    // 8. Close FD_CLOEXEC file descriptors — POSIX execve semantics require
+    //    that any fd opened with O_CLOEXEC / FD_CLOEXEC is closed when the
+    //    process image is replaced.  Skipping this leaks inherited sockets and
+    //    pipes into the new program's address space.
+    ProcessCloseCloexecFds(proc);
+
+    // 9. Reset signal handlers per POSIX execve semantics: handlers set to
+    //    a user function must be reset to SIG_DFL (0) because the new image
+    //    has no such function at that address. SIG_IGN (1) is preserved.
+    //    Without this, inherited handler pointers (from the pre-exec image,
+    //    or worse — stale pointers from a previous process that had the
+    //    same PID if we never cleared on destroy) would redirect signal
+    //    delivery to unmapped memory, causing a #PF in the new program on
+    //    its first signal (e.g. SIGCHLD from a child exiting).
+    for (int s = 0; s < 64; ++s) {
+        auto& sa = g_sigHandlers[proc->pid][s];
+        if (sa.handler != 1 /* SIG_IGN */) {
+            sa.handler = 0;
+            sa.flags = 0;
+            sa.restorer = 0;
+            sa.mask = 0;
+        }
+    }
 
     *outStackPtr = userSP;
     // If dynamically linked, start at the interpreter's entry point;
@@ -1301,7 +1382,7 @@ int ProcessSendSignal(Process* proc, int signum)
     {
         // Immediately stop (cannot be caught/blocked)
         proc->state = ProcessState::Stopped;
-        DbgPrintf("SIGNAL: SIGSTOP -> pid %u stopped\n", proc->pid);
+        DbgPrintf("SIGNAL: SIGSTOP -> pid %u stopped (default)\n", proc->pid);
         return 0;
     }
 
@@ -1336,6 +1417,25 @@ int ProcessSendSignal(Process* proc, int signum)
             Process* parent = ProcessFindByPid(proc->parentPid);
             if (parent)
                 ProcessSendSignal(parent, 17); // SIGCHLD
+            return 0;
+        }
+    }
+
+    // Drop signals whose current disposition is "ignore".  Without this the
+    // bit sits in sigPending forever and HasPendingSignals() returns true,
+    // causing every blocking syscall to return -EINTR — which for line-reads
+    // in the shell looks like EOF and silently kills bash on e.g. SIGWINCH.
+    //
+    // Signals that are ignored:
+    //   - explicit SIG_IGN
+    //   - SIG_DFL where the POSIX default is "ignore": SIGCHLD (17),
+    //     SIGURG (23), SIGWINCH (28)
+    {
+        KernelSigaction& sa = g_sigHandlers[proc->pid][signum - 1];
+        bool defaultIsIgnore = (signum == 17 || signum == 23 || signum == 28);
+        if (sa.handler == 1 ||
+            (sa.handler == 0 && defaultIsIgnore))
+        {
             return 0;
         }
     }
@@ -1441,14 +1541,14 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
         case 13: // SIGPIPE
         case 14: // SIGALRM
         case 15: // SIGTERM
-            proc->exitStatus = 128 + signum;
-            proc->fbVirtual = nullptr;
-            proc->fbVirtualSize = 0;
-            proc->state = ProcessState::Terminated;
-            if (!__atomic_load_n(&proc->compositorRegistered, __ATOMIC_ACQUIRE))
-                proc->reapable = true;
             DbgPrintf("SIGNAL: default terminate pid %u by signal %d\n", proc->pid, signum);
-            return syscallResult;
+            // Use SchedulerExitCurrentProcess instead of setting state+returning.
+            // The old approach returned to user space with state=Terminated; the
+            // compositor could then mark the process reapable and call ProcessDestroy
+            // (freeing the kernel stack) while the process was still live and about
+            // to re-enter the syscall dispatcher — causing a use-after-free of the
+            // kernel stack and a double fault.
+            SchedulerExitCurrentProcess(128 + signum);
         case 17: // SIGCHLD — default is ignore
         case 28: // SIGWINCH — ignore
             return syscallResult;

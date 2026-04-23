@@ -24,10 +24,13 @@ static constexpr uint64_t SYS_IOCTL           = 16;
 static constexpr uint64_t SYS_RT_SIGACTION    = 13;
 static constexpr uint64_t SYS_RT_SIGPROCMASK = 14;
 static constexpr uint64_t SYS_PREAD64         = 17;
+static constexpr uint64_t SYS_PWRITE64        = 18;
 static constexpr uint64_t SYS_READV           = 19;
 static constexpr uint64_t SYS_WRITEV          = 20;
 static constexpr uint64_t SYS_ACCESS          = 21;
 static constexpr uint64_t SYS_SCHED_YIELD     = 24;
+static constexpr uint64_t SYS_MINCORE         = 27;
+static constexpr uint64_t SYS_MADVISE         = 28;
 static constexpr uint64_t SYS_NANOSLEEP       = 35;
 static constexpr uint64_t SYS_GETPID          = 39;
 static constexpr uint64_t SYS_PIPE            = 22;
@@ -47,6 +50,8 @@ static constexpr uint64_t SYS_GETUID           = 102;
 static constexpr uint64_t SYS_GETGID           = 104;
 static constexpr uint64_t SYS_SETUID           = 105;
 static constexpr uint64_t SYS_SETGID           = 106;
+
+static constexpr uint64_t SYS_TIME             = 201;
 static constexpr uint64_t SYS_GETEUID          = 107;
 static constexpr uint64_t SYS_GETEGID          = 108;
 static constexpr uint64_t SYS_GETPPID          = 110;
@@ -64,6 +69,7 @@ static constexpr uint64_t SYS_READLINKAT      = 267;
 static constexpr uint64_t SYS_SYMLINKAT       = 266;
 static constexpr uint64_t SYS_PPOLL           = 271;
 static constexpr uint64_t SYS_PIPE2           = 293;
+static constexpr uint64_t SYS_EVENTFD2        = 290;
 static constexpr uint64_t SYS_PRLIMIT64       = 302;
 static constexpr uint64_t SYS_GETRANDOM       = 318;
 
@@ -109,6 +115,29 @@ static constexpr uint64_t SYS_ALARM           = 37;
 static constexpr uint64_t SYS_PAUSE           = 34;
 static constexpr uint64_t SYS_RT_SIGSUSPEND   = 130;
 
+// Nix package manager syscalls
+static constexpr uint64_t SYS_FLOCK           = 73;
+static constexpr uint64_t SYS_TRUNCATE        = 76;
+static constexpr uint64_t SYS_FTRUNCATE       = 77;
+static constexpr uint64_t SYS_LINK            = 86;
+static constexpr uint64_t SYS_CHMOD           = 90;
+static constexpr uint64_t SYS_FCHMOD          = 91;
+static constexpr uint64_t SYS_CHOWN           = 92;
+static constexpr uint64_t SYS_FCHOWN          = 93;
+static constexpr uint64_t SYS_LCHOWN          = 94;
+static constexpr uint64_t SYS_SCHED_SETAFFINITY = 203;
+static constexpr uint64_t SYS_SCHED_GETAFFINITY = 204;
+static constexpr uint64_t SYS_MKDIRAT         = 258;
+static constexpr uint64_t SYS_FCHOWNAT        = 260;
+static constexpr uint64_t SYS_UNLINKAT        = 263;
+static constexpr uint64_t SYS_RENAMEAT        = 264;
+static constexpr uint64_t SYS_LINKAT          = 265;
+static constexpr uint64_t SYS_FCHMODAT        = 268;
+static constexpr uint64_t SYS_UTIMENSAT       = 280;
+static constexpr uint64_t SYS_FALLOCATE       = 285;
+static constexpr uint64_t SYS_RENAMEAT2       = 316;
+static constexpr uint64_t SYS_STATX           = 332;
+
 // Socket syscalls
 static constexpr uint64_t SYS_SOCKET          = 41;
 static constexpr uint64_t SYS_CONNECT         = 42;
@@ -125,6 +154,19 @@ static constexpr uint64_t SYS_GETPEERNAME     = 52;
 static constexpr uint64_t SYS_SOCKETPAIR      = 53;
 static constexpr uint64_t SYS_SETSOCKOPT      = 54;
 static constexpr uint64_t SYS_GETSOCKOPT      = 55;
+
+// Wayland/epoll syscalls
+static constexpr uint64_t SYS_EPOLL_CREATE    = 213;
+static constexpr uint64_t SYS_EPOLL_WAIT      = 232;
+static constexpr uint64_t SYS_EPOLL_CTL       = 233;
+static constexpr uint64_t SYS_EPOLL_PWAIT     = 281;
+static constexpr uint64_t SYS_TIMERFD_CREATE  = 283;
+static constexpr uint64_t SYS_TIMERFD_SETTIME = 286;
+static constexpr uint64_t SYS_TIMERFD_GETTIME = 287;
+static constexpr uint64_t SYS_ACCEPT4         = 288;
+static constexpr uint64_t SYS_EPOLL_CREATE1   = 291;
+static constexpr uint64_t SYS_MEMFD_CREATE    = 319;
+static constexpr uint64_t SYS_MEMFD_SECRET    = 447;
 
 // Syscall function type -- same signature as Linux: returns int64_t,
 // up to 6 arguments via rdi, rsi, rdx, r10->rcx, r8, r9.

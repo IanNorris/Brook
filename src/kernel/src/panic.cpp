@@ -4,7 +4,13 @@
 #include "serial.h"
 #include "tty.h"
 #include "panic_qr.h"
+#include "panic_screen.h"
 #include "compositor.h"
+#include "smp.h"
+#include "build_info.h"
+#include "ksym_addrs.h"
+#include "scheduler.h"
+#include "process.h"
 
 // ---- Register capture -------------------------------------------------------
 struct PanicRegs {
@@ -137,17 +143,6 @@ static void SerialPutHex64(uint64_t v)
     }
 }
 
-static void TtyPutHex64(uint64_t v)
-{
-    if (!brook::TtyReady()) return;
-    brook::TtyPuts("0x");
-    for (int shift = 60; shift >= 0; shift -= 4)
-    {
-        int nib = static_cast<int>((v >> shift) & 0xF);
-        brook::TtyPutChar(static_cast<char>(nib < 10 ? '0' + nib : 'a' + nib - 10));
-    }
-}
-
 // ---- Minimal printf fan-out (no va_copy — serial first, TTY second) ---------
 // We use a simple char-buffer approach to avoid needing va_copy from
 // -mgeneral-regs-only context (where the ABI for va_list is tricky).
@@ -230,7 +225,10 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
 {
     __asm__ volatile("cli");
 
-    // Stop the compositor so APs don't overwrite the panic screen.
+    // Halt all other CPUs first — they must stop before we touch FB/serial
+    brook::SmpHaltAllAPs();
+
+    // Stop the compositor so nothing overwrites the panic screen.
     brook::CompositorHalt();
 
     int depth = __atomic_add_fetch(&g_panicNesting, 1, __ATOMIC_SEQ_CST);
@@ -261,13 +259,28 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
 
     // -- Serial output (always available) ------------------------------------
     brook::SerialPuts("\n*** KERNEL PANIC ***\n");
+    brook::SerialPuts("Brook OS "); brook::SerialPuts(brook::BuildDate());
+    brook::SerialPuts(" ("); brook::SerialPuts(brook::BuildGitHash());
+    brook::SerialPuts(")\n");
     brook::SerialPuts(g_panicBuf);
     brook::SerialPuts("RIP "); SerialPutHex64(regs.rip);
-    brook::SerialPuts("  RSP "); SerialPutHex64(regs.rsp);
+    // Symbolicate RIP
+    {
+        const char* symName = nullptr;
+        uint64_t symOff = 0;
+        if (brook::KsymFindByAddr(regs.rip, &symName, &symOff))
+        {
+            brook::SerialPuts("  ");
+            brook::SerialPuts(symName);
+            brook::SerialPuts("+0x");
+            SerialPutHex64(symOff);
+        }
+    }
+    brook::SerialPuts("\nRSP "); SerialPutHex64(regs.rsp);
     brook::SerialPuts("\nCR2 "); SerialPutHex64(regs.cr2);
     brook::SerialPuts("  CR3 "); SerialPutHex64(regs.cr3);
 
-    // Stack trace
+    // Stack trace with symbols
     brook::SerialPuts("\nStack trace (");
     {
         char depthStr[4];
@@ -288,38 +301,58 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
         brook::SerialPuts(idxStr);
         brook::SerialPuts("] ");
         SerialPutHex64(trace.rip[i]);
+        // Symbolicate
+        const char* symName = nullptr;
+        uint64_t symOff = 0;
+        if (brook::KsymFindByAddr(trace.rip[i], &symName, &symOff))
+        {
+            brook::SerialPuts("  ");
+            brook::SerialPuts(symName);
+        }
         brook::SerialPuts("\n");
     }
     brook::SerialPuts("System halted.\n");
 
-    // -- TTY output (if framebuffer is up) ------------------------------------
-    if (brook::TtyReady())
+    // -- Visual panic screen (if framebuffer is up) ----------------------------
+    // Use the physical framebuffer directly — the compositor's backbuffer
+    // won't be flushed since the compositor is halted.
+    uint32_t physStride = 0;
+    volatile uint32_t* physFb = brook::CompositorGetPhysFb(&physStride);
+    uint32_t fbW = 0, fbH = 0;
+    brook::CompositorGetPhysDims(&fbW, &fbH);
+    if (physFb && fbW && fbH)
     {
-        brook::TtySetColors(0xFFFFFF, 0xCC0000); // white on red
-        brook::TtyPuts("\n*** KERNEL PANIC ***\n");
-        brook::TtySetColors(0xFFFFFF, 0x1A0000); // white on dark red
-        brook::TtyPuts(g_panicBuf);
-        brook::TtyPuts("RIP "); TtyPutHex64(regs.rip);
-        brook::TtyPuts("  RSP "); TtyPutHex64(regs.rsp);
-        brook::TtyPuts("\nCR2 "); TtyPutHex64(regs.cr2);
-        brook::TtyPuts("  CR3 "); TtyPutHex64(regs.cr3);
-
-        brook::TtyPuts("\nBacktrace:\n");
-        for (uint8_t i = 0; i < trace.depth; i++) {
-            brook::TtyPuts("  ");
-            TtyPutHex64(trace.rip[i]);
-            brook::TtyPuts("\n");
+        // Snapshot running processes (all CPUs halted, no lock needed)
+        static brook::PanicProcessList procList;
+        procList.count = 0;
+        uint32_t nProcs = brook::PanicGetProcessCount();
+        for (uint32_t i = 0; i < nProcs && procList.count < brook::PANIC_MAX_PROCESSES; i++)
+        {
+            brook::Process* p = brook::PanicGetProcess(i);
+            if (!p || p->state == brook::ProcessState::Terminated) continue;
+            auto& e = procList.entries[procList.count];
+            e.pid   = p->pid;
+            e.state = static_cast<uint8_t>(p->state);
+            e.cpu   = (p->runningOnCpu >= 0) ? static_cast<uint8_t>(p->runningOnCpu) : 0xFF;
+            e.rip   = 0; // TODO: capture from saved context
+            // Copy name (truncate if needed)
+            for (uint32_t j = 0; j < brook::PANIC_PROCESS_NAME_LEN; j++)
+                e.name[j] = (p->name[j]) ? p->name[j] : '\0';
+            procList.count++;
         }
-        brook::TtyPuts("System halted.\n");
+
+        uint32_t fbStride = physStride * 4; // pixel stride → byte stride
+        brook::PanicScreenInfo psi = {};
+        psi.message   = g_panicBuf;
+        psi.regs      = &fullRegs;
+        psi.trace     = &trace;
+        psi.excInfo   = nullptr;  // KernelPanic — no exception
+        psi.procList  = &procList;
+        psi.vector    = 0;
+        psi.errorCode = 0;
+        brook::PanicScreenRender(const_cast<uint32_t*>(physFb), fbW, fbH, fbStride, &psi);
     }
 
-    // -- QR code (if framebuffer is available) ---------------------------------
-    uint32_t* fbPixels = nullptr;
-    uint32_t fbW = 0, fbH = 0, fbStride = 0;
-    if (brook::TtyGetFramebuffer(&fbPixels, &fbW, &fbH, &fbStride))
-    {
-        brook::PanicRenderQR(fbPixels, fbW, fbH, fbStride, &fullRegs, &trace);
-    }
-
-    for (;;) { __asm__ volatile("hlt"); }
+    // Spin forever (don't use hlt — it causes QEMU to exit when all CPUs halt)
+    for (;;) { __asm__ volatile("pause"); }
 }

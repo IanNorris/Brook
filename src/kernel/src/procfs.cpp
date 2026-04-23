@@ -7,6 +7,7 @@
 #include "vfs.h"
 #include "process.h"
 #include "scheduler.h"
+#include "smp.h"
 #include "memory/physical_memory.h"
 #include "memory/heap.h"
 #include "serial.h"
@@ -222,28 +223,56 @@ static char StateChar(ProcessState s)
 // /proc/stat — CPU time statistics
 static Vnode* GenStat()
 {
-    auto* buf = static_cast<char*>(kmalloc(1024));
+    uint32_t cpuCount = SmpGetCpuCount();
+    if (cpuCount == 0) cpuCount = 1;
+
+    // Allocate enough for summary + per-CPU lines
+    uint32_t bufSize = 512 + cpuCount * 80;
+    auto* buf = static_cast<char*>(kmalloc(bufSize));
     if (!buf) return nullptr;
 
-    uint64_t ticks = g_lapicTickCount;
-    // Approximate: 1 tick ≈ 1ms, report as jiffies (centiseconds)
-    uint64_t user = ticks / 20;    // rough approximation
-    uint64_t sys  = ticks / 20;
-    uint64_t idle = ticks / 10;
+    // Sum actual CPU time from all processes
+    ProcessSnapshot snaps[MAX_PROCESSES];
+    uint32_t count = SchedulerSnapshotProcesses(snaps, MAX_PROCESSES);
+    uint64_t totalUser = 0, totalSys = 0;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        totalUser += snaps[i].userTicks;
+        totalSys  += snaps[i].sysTicks;
+    }
 
-    uint32_t n = ProcFmt(buf, 1024,
-        "cpu  %lu %lu %lu %lu 0 0 0 0 0 0\n"
-        "cpu0 %lu %lu %lu %lu 0 0 0 0 0 0\n"
+    uint64_t ticks = g_lapicTickCount;
+    // Convert ms ticks to centiseconds (HZ=100)
+    uint64_t user = totalUser / 10;
+    uint64_t sys  = totalSys / 10;
+    uint64_t idle = (ticks - totalUser - totalSys) / 10;
+    if (idle > ticks / 10) idle = 0; // underflow guard
+
+    // Summary line (aggregate across all CPUs)
+    uint32_t n = ProcFmt(buf, bufSize,
+        "cpu  %lu %lu %lu %lu 0 0 0 0 0 0\n",
+        user, 0UL, sys, idle);
+
+    // Per-CPU lines (split evenly for now — we don't track per-CPU time yet)
+    for (uint32_t c = 0; c < cpuCount; ++c)
+    {
+        uint64_t perUser = user / cpuCount;
+        uint64_t perSys  = sys / cpuCount;
+        uint64_t perIdle = idle / cpuCount;
+        n += ProcFmt(buf + n, bufSize - n,
+            "cpu%u %lu %lu %lu %lu 0 0 0 0 0 0\n",
+            c, perUser, 0UL, perSys, perIdle);
+    }
+
+    n += ProcFmt(buf + n, bufSize - n,
         "intr 0\n"
         "ctxt 0\n"
         "btime %lu\n"
         "processes %lu\n"
         "procs_running 1\n"
         "procs_blocked 0\n",
-        user, 0UL, sys, idle,
-        user, 0UL, sys, idle,
         0UL,  // btime
-        ticks / 1000);  // rough process count
+        (uint64_t)count);
 
     return MakeProcVnode(buf, n);
 }
@@ -321,13 +350,19 @@ static Vnode* GenPidStat(const ProcessSnapshot& proc)
     uint64_t vsize = proc.programBreak > 0 ? proc.programBreak : 0;
     uint64_t rss = (proc.stackTop - proc.stackBase) / 4096;  // rough RSS in pages
 
+    // Convert LAPIC ticks (~1ms each) to Linux clock ticks (HZ=100, 10ms each)
+    uint64_t utime = proc.userTicks / 10;
+    uint64_t stime = proc.sysTicks / 10;
+
     uint32_t n = ProcFmt(buf, 512,
         "%u (%s) %c %u %u %u 0 -1 0 "
-        "0 0 0 0 0 0 0 0 "
+        "0 0 0 0 %lu %lu 0 0 "
         "20 0 1 0 0 %lu %lu "
-        "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 "
+        "0 0 0 0 0 0 0 0 0 0\n",
         (uint32_t)proc.pid, proc.name, StateChar(proc.state),
         (uint32_t)proc.parentPid, (uint32_t)proc.pgid, (uint32_t)proc.sid,
+        utime, stime,
         vsize, rss);
 
     return MakeProcVnode(buf, n);
@@ -369,6 +404,22 @@ static Vnode* GenPidCmdline(const ProcessSnapshot& proc)
     if (!buf) return nullptr;
     ProcStrCopy(buf, proc.name, len + 1);
     return MakeProcVnode(buf, len + 1);  // include NUL terminator
+}
+
+// /proc/[pid]/statm — memory usage in pages
+// Format: size resident shared text lib data dt
+static Vnode* GenPidStatm(const ProcessSnapshot& proc)
+{
+    auto* buf = static_cast<char*>(kmalloc(128));
+    if (!buf) return nullptr;
+
+    uint64_t size = proc.programBreak > 0 ? proc.programBreak / 4096 : 0;
+    uint64_t resident = (proc.stackTop - proc.stackBase) / 4096;
+
+    uint32_t n = ProcFmt(buf, 128, "%lu %lu 0 0 0 %lu 0\n",
+        size, resident, resident);
+
+    return MakeProcVnode(buf, n);
 }
 
 // ---- Path parsing helpers ----
@@ -430,6 +481,7 @@ struct ProcPidEntry {
 
 static ProcPidEntry g_pidEntries[] = {
     { "stat",    GenPidStat },
+    { "statm",   GenPidStatm },
     { "status",  GenPidStatus },
     { "cmdline", GenPidCmdline },
 };

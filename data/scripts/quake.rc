@@ -1,0 +1,4 @@
+# Brook OS — Quake (shareware) test
+set scale 1
+set vfb 640x480
+run /nix/games/quake/quake -basedir /nix/games/quake

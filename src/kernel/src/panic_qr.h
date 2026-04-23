@@ -16,10 +16,12 @@ namespace brook {
 
 // Panic QR protocol constants
 static constexpr uint8_t  QR_MAGIC_BYTE  = 0x2D;
-static constexpr uint8_t  QR_VERSION     = 0x00;
+static constexpr uint8_t  QR_VERSION     = 0x01;
 static constexpr uint32_t QR_HEADER_PAD  = 0xCAFEF00D;
-static constexpr uint32_t QR_PACKET_TYPE_CPU_REGS    = 0xA3000001;
-static constexpr uint32_t QR_PACKET_TYPE_STACK_TRACE = 0xA3000002;
+static constexpr uint32_t QR_PACKET_TYPE_CPU_REGS       = 0xA3000001;
+static constexpr uint32_t QR_PACKET_TYPE_STACK_TRACE    = 0xA3000002;
+static constexpr uint32_t QR_PACKET_TYPE_EXCEPTION_INFO = 0xA3000003;
+static constexpr uint32_t QR_PACKET_TYPE_PROCESS_LIST   = 0xA3000004;
 
 // Rendering constants (tuned on real hardware)
 static constexpr uint32_t QR_PIXELS_PER_MODULE = 3;
@@ -69,6 +71,31 @@ struct __attribute__((packed)) PanicStackTrace {
     uint64_t rip[PANIC_MAX_STACK_DEPTH];         // [0]=leaf, [1..]=callers
 };
 
+// Exception info captured at panic time
+struct __attribute__((packed)) PanicExceptionInfo {
+    uint8_t  vector;       // Exception vector number (0-31)
+    uint8_t  reserved;
+    uint16_t pid;          // PID of faulting process
+    uint32_t errorCode;    // CPU error code
+};
+
+// Per-process summary for crash dump (compact: 20 bytes each)
+static constexpr uint32_t PANIC_MAX_PROCESSES = 16;
+static constexpr uint32_t PANIC_PROCESS_NAME_LEN = 12;
+
+struct __attribute__((packed)) PanicProcessEntry {
+    uint16_t pid;
+    uint8_t  state;        // ProcessState enum
+    uint8_t  cpu;          // runningOnCpu (0xFF = not running)
+    char     name[PANIC_PROCESS_NAME_LEN];
+    uint64_t rip;          // Last known RIP (0 if unavailable)
+};
+
+struct __attribute__((packed)) PanicProcessList {
+    uint8_t count;
+    PanicProcessEntry entries[PANIC_MAX_PROCESSES];
+};
+
 // Render a QR code containing CPU state + stack trace to the framebuffer.
 // Called from KernelPanic after capturing registers.
 // fbBase: physical address of framebuffer
@@ -76,6 +103,8 @@ struct __attribute__((packed)) PanicStackTrace {
 // fbStride: bytes per scanline
 void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
                    uint32_t fbStride, const PanicCPURegs* regs,
-                   const PanicStackTrace* trace);
+                   const PanicStackTrace* trace,
+                   const PanicExceptionInfo* excInfo = nullptr,
+                   const PanicProcessList* procList = nullptr);
 
 } // namespace brook

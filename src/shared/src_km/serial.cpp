@@ -118,6 +118,20 @@ static void SerialPutsRaw(const char* str)
 void SerialLock()  { SerialLockAcquire(); }
 void SerialUnlock() { SerialLockRelease(); }
 
+} // namespace brook
+
+// Force-acquire serial lock for exception handler (breaks ticket ordering
+// but safe since we're about to kill the process / halt).
+extern "C" void ExcForceSerialLock()
+{
+    // Reset the ticket lock so no other CPU can acquire it.
+    // Set serving = next = 0 atomically enough for our purposes.
+    __atomic_store_n(&brook::g_serialLock.serving, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&brook::g_serialLock.next, 1, __ATOMIC_RELEASE);
+}
+
+namespace brook {
+
 // ---- Internal helper for SerialPrintf ----
 
 static void PrintPtr(unsigned long val)

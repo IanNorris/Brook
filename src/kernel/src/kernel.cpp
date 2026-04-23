@@ -38,6 +38,7 @@
 #include "shell.h"
 #include "boot_logo.h"
 #include "klog.h"
+#include "audio.h"
 #include "fat_test_image.h"
 #include "fw_cfg.h"
 #include "rtc.h"
@@ -425,6 +426,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     // Initialise input subsystem before modules so keyboard module can register.
     brook::InputInit();
 
+    // Initialise the audio mixer before modules so HDA can register.
+    brook::AudioMixerInit();
+
     // Phase 1: load early modules from embedded ramdisk (mounted at "/").
     //   These run before virtio, so they can't access /boot yet.
     //   Keyboard is NOT here — it needs APIC which is already set up, but
@@ -439,12 +443,34 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::ModuleDiscoverAndLoad("/boot/drivers");
     brook::SerialPuts("module: Phase 2 — done\n");
 
-    // ---- Network (DHCP + DNS test) ----
+    // ---- Network (static config from BROOK.CFG, or DHCP) ----
     if (brook::NetGetIf()) {
         brook::BootLogoProgress(75, "Network");
-        brook::DhcpDiscover(brook::NetGetIf());
-        // Quick DNS test
-        brook::DnsResolve("example.com");
+        brook::NetIf* nif = brook::NetGetIf();
+        bool configured = brook::NetApplyStaticConfig(nif);
+        if (!configured) {
+            configured = brook::DhcpDiscover(nif);
+        }
+        if (configured) {
+            // Immediately resolve the gateway MAC while still in polling mode
+            // (no scheduler yet — ArpResolve falls back to nif->poll).
+            // This avoids a race later when curl runs post-scheduler and must
+            // ARP for the gateway under real-time constraints.
+            if (nif && nif->gateway) {
+                brook::MacAddr gwMac;
+                if (!brook::ArpResolve(nif->gateway, &gwMac)) {
+                    // Fallback: broadcast works with QEMU/slirp because slirp
+                    // ignores the destination MAC on ingress packets.
+                    gwMac = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
+                    brook::ArpCacheInsert(nif->gateway, gwMac);
+                    brook::SerialPrintf("net: gateway ARP timed out — using broadcast MAC\n");
+                }
+            }
+        }
+        // Quick DNS test (only if we have a DNS server)
+        if (nif && nif->dns) {
+            brook::DnsResolve("example.com");
+        }
     }
 
     // ---- Syscall table ----
@@ -466,6 +492,10 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         brook::BootLogoProgress(90, "Scheduler");
         brook::SchedulerInit();
         brook::CompositorInit();
+
+        // Start the NIC polling thread now that the scheduler is initialised.
+        if (brook::NetGetIf())
+            brook::NetStartPollThread();
 
         // If keyboard module wasn't loaded, fall back to direct init.
         if (acpiOk && !brook::KbdIsAvailable())

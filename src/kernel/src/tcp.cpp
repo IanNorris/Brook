@@ -1,4 +1,14 @@
 #include "tcp.h"
+#ifndef BROOK_HOST_TEST
+#include "serial.h"
+#else
+// Host-test stub — tcp.cpp is compiled standalone without the kernel.
+#include <cstdio>
+#include <cstdarg>
+static void SerialPrintf(const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap);
+}
+#endif
 
 namespace brook {
 
@@ -36,18 +46,24 @@ TcpAction TcpProcessSegment(Socket& s,
             s.tcpSndUna = ack;
             s.tcpState  = TcpState::Established;
             s.connected = true;
+            act.justConnected = true;
             act.sendAck = true;
         } else if (flags & TCP_RST) {
-            s.tcpState  = TcpState::Closed;
-            s.connected = false;
+            SerialPrintf("tcp: RST received in SynSent (lport=%u rport=%u) — connection refused\n",
+                         ntohs(s.localPort), ntohs(s.remotePort));
+            s.tcpState   = TcpState::Closed;
+            s.connected  = false;
+            s.tcpRstRecv = true;
         }
         break;
 
     case TcpState::Established:
         if (flags & TCP_RST) {
+            SerialPrintf("tcp: RST received in Established (lport=%u rport=%u seq=%u rcvNxt=%u)\n",
+                         ntohs(s.localPort), ntohs(s.remotePort), seq, s.tcpRcvNxt);
             s.tcpState   = TcpState::Closed;
             s.connected  = false;
-            s.tcpFinRecv = true;
+            s.tcpRstRecv = true; // RST ≠ FIN: report as ECONNRESET, not EOF
             return act;
         }
 
@@ -61,11 +77,41 @@ TcpAction TcpProcessSegment(Socket& s,
             s.tcpRcvNxt += dataLen;
             act.sendAck = true;
         } else if (dataLen > 0) {
-            // Out of order — ACK with expected seq
-            act.sendAck = true;
+            // Out of order — either stale (seq < rcvNxt, duplicate after our
+            // ACK was lost) or future (seq > rcvNxt, a gap).  We have no
+            // reassembly queue, so future data is DROPPED.  Stale data is
+            // harmless but means the peer didn't see our ACK.
+            int32_t gap = (int32_t)(seq - s.tcpRcvNxt);
+            bool stale = gap < 0;
+            s.oooDropCount++;
+            if (s.oooDropCount <= 5 || (s.oooDropCount % 50) == 0) {
+                SerialPrintf("tcp: OOO %s pid=%u seq=%u rcvNxt=%u gap=%d len=%u count=%u\n",
+                             stale ? "STALE" : "FUTURE",
+                             s.ownerPid, seq, s.tcpRcvNxt, gap, dataLen, s.oooDropCount);
+            }
+            // Rate-limit ACKs to stale segments — one immediate dup-ACK per
+            // retransmit is counter-productive (triggers more fast retransmit).
+            // Only ACK once per 100ms of stale repeats.
+            extern volatile uint64_t g_lapicTickCount;
+            if (stale) {
+                if (g_lapicTickCount - s.lastStaleAckTick > 100) {
+                    act.sendAck = true;
+                    s.lastStaleAckTick = g_lapicTickCount;
+                }
+            } else {
+                act.sendAck = true; // future gap — send dup-ACK to drive fast retransmit
+            }
         }
 
-        if (flags & TCP_FIN) {
+        // Only accept FIN if it's at the expected sequence number.
+        // An OOO FIN must be ignored — accepting it would prematurely
+        // signal EOF to the application while data is still in flight.
+        //
+        // For a data+FIN segment: after processing the in-order data above,
+        // s.tcpRcvNxt == seq+dataLen.  The FIN sits right after the data, so
+        // we check seq+dataLen == s.tcpRcvNxt (works for FIN-only too, since
+        // dataLen is 0 in that case and rcvNxt was never advanced here).
+        if ((flags & TCP_FIN) && (seq + dataLen) == s.tcpRcvNxt) {
             s.tcpRcvNxt++;
             s.tcpFinRecv = true;
             act.sendAck = true;
@@ -74,25 +120,11 @@ TcpAction TcpProcessSegment(Socket& s,
         break;
 
     case TcpState::FinWait1:
-        if (flags & TCP_ACK) {
-            s.tcpSndUna = ack;
-            if (flags & TCP_FIN) {
-                s.tcpRcvNxt = seq + 1;
-                act.sendAck = true;
-                s.tcpState = TcpState::TimeWait;
-            } else {
-                s.tcpState = TcpState::FinWait2;
-            }
+        if (flags & TCP_RST) {
+            s.tcpState = TcpState::Closed;
+            s.tcpRstRecv = true;
+            return act;
         }
-        if (dataLen > 0 && seq == s.tcpRcvNxt) {
-            act.enqueueData = true;
-            act.dataPtr     = data;
-            act.dataLen     = dataLen;
-            s.tcpRcvNxt += dataLen;
-        }
-        break;
-
-    case TcpState::FinWait2:
         if (dataLen > 0 && seq == s.tcpRcvNxt) {
             act.enqueueData = true;
             act.dataPtr     = data;
@@ -100,8 +132,33 @@ TcpAction TcpProcessSegment(Socket& s,
             s.tcpRcvNxt += dataLen;
             act.sendAck = true;
         }
-        if (flags & TCP_FIN) {
-            s.tcpRcvNxt = seq + (dataLen > 0 ? dataLen : 0) + 1;
+        if (flags & TCP_ACK) {
+            s.tcpSndUna = ack;
+            if ((flags & TCP_FIN) && (seq + dataLen) == s.tcpRcvNxt) {
+                s.tcpRcvNxt++;
+                act.sendAck = true;
+                s.tcpState = TcpState::TimeWait;
+            } else {
+                s.tcpState = TcpState::FinWait2;
+            }
+        }
+        break;
+
+    case TcpState::FinWait2:
+        if (flags & TCP_RST) {
+            s.tcpState = TcpState::Closed;
+            return act;
+        }
+        if (dataLen > 0 && seq == s.tcpRcvNxt) {
+            act.enqueueData = true;
+            act.dataPtr     = data;
+            act.dataLen     = dataLen;
+            s.tcpRcvNxt += dataLen;
+            act.sendAck = true;
+        }
+        // Same combined data+FIN check as Established
+        if ((flags & TCP_FIN) && (seq + dataLen) == s.tcpRcvNxt) {
+            s.tcpRcvNxt++;
             act.sendAck = true;
             s.tcpState = TcpState::TimeWait;
         }

@@ -12,6 +12,10 @@
 
 using namespace brook;
 
+namespace brook {
+    volatile uint64_t g_lapicTickCount = 0;
+}
+
 static int g_pass = 0;
 static int g_fail = 0;
 
@@ -162,7 +166,8 @@ static void TestEstablishedRst()
 
     ASSERT_EQ(s.tcpState, TcpState::Closed);
     ASSERT_TRUE(!s.connected);
-    ASSERT_TRUE(s.tcpFinRecv);
+    ASSERT_TRUE(s.tcpRstRecv);      // RST, distinct from FIN (ECONNRESET vs EOF)
+    ASSERT_TRUE(!s.tcpFinRecv);
     ASSERT_TRUE(!act.sendAck);
     printf("  TestEstablishedRst: OK\n");
 }

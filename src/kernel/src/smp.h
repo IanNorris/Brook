@@ -35,4 +35,25 @@ const CpuInfo* SmpGetCpu(uint32_t index);
 // Get the current CPU's index (based on LAPIC ID).
 uint32_t SmpCurrentCpuIndex();
 
+// Halt all application processors via NMI broadcast.
+// Each AP's state (RIP, RSP, RBP) is captured in the NMI handler.
+// Returns the number of APs successfully halted.
+// Must be called from BSP only. Safe to call from panic/exception context.
+uint32_t SmpHaltAllAPs();
+
+// Check if a panic halt is active (set by SmpHaltAllAPs).
+bool SmpIsPanicActive();
+
+// Per-CPU halted state captured by NMI handler.
+struct CpuHaltedState {
+    uint64_t rip;
+    uint64_t rsp;
+    uint64_t rbp;
+    uint16_t pid;       // PID of process running on that CPU (0 if none)
+    bool     halted;    // true if this CPU has been halted
+};
+
+// Get the halted state for a CPU (valid only after SmpHaltAllAPs).
+const CpuHaltedState* SmpGetHaltedState(uint32_t cpuIndex);
+
 } // namespace brook

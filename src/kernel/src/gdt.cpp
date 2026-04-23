@@ -32,6 +32,9 @@ static Tss64 g_tssArray[GDT_MAX_CPUS];
 // Per-CPU double-fault stacks (4KB each).
 static uint8_t g_dfStacks[GDT_MAX_CPUS][4096] __attribute__((aligned(16)));
 
+// Per-CPU NMI stacks (4KB each).
+static uint8_t g_nmiStacks[GDT_MAX_CPUS][4096] __attribute__((aligned(16)));
+
 // Track how many CPUs have been initialized.
 static uint32_t g_cpuTssCount = 0;
 
@@ -72,9 +75,11 @@ void GdtInit()
     SetGdtEntry(g_gdtRaw[4], 0, 0xFFFF, 0xF2, 0x00);     // 0x20: Ring 3 data
     SetGdtEntry(g_gdtRaw[5], 0, 0xFFFF, 0xFA, 0x20);     // 0x28: Ring 3 64-bit code
 
-    // Populate BSP TSS (CPU 0): IST1 = double-fault stack.
+    // Populate BSP TSS (CPU 0): IST1 = double-fault stack, IST2 = NMI stack.
     void* dfTop = static_cast<void*>(g_dfStacks[0] + sizeof(g_dfStacks[0]) - 16);
     g_tssArray[0].ist[0]         = reinterpret_cast<uint64_t>(dfTop);
+    void* nmiTop = static_cast<void*>(g_nmiStacks[0] + sizeof(g_nmiStacks[0]) - 16);
+    g_tssArray[0].ist[1]         = reinterpret_cast<uint64_t>(nmiTop);
     g_tssArray[0].ioBitmapOffset = static_cast<uint16_t>(sizeof(Tss64));
 
     // TSS descriptor for CPU 0 starts at GDT slot 6 (byte offset 0x30).
@@ -122,6 +127,8 @@ uint16_t GdtInitAp(uint32_t cpuIndex)
 
     void* dfTop = static_cast<void*>(g_dfStacks[cpuIndex] + sizeof(g_dfStacks[cpuIndex]) - 16);
     tss->ist[0]         = reinterpret_cast<uint64_t>(dfTop);
+    void* nmiTop = static_cast<void*>(g_nmiStacks[cpuIndex] + sizeof(g_nmiStacks[cpuIndex]) - 16);
+    tss->ist[1]         = reinterpret_cast<uint64_t>(nmiTop);
     tss->ioBitmapOffset = static_cast<uint16_t>(sizeof(Tss64));
 
     // TSS descriptor: CPU N uses GDT slots (6 + N*2) and (6 + N*2 + 1).

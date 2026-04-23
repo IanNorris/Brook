@@ -51,3 +51,20 @@ brook_disk.img
 data/wallpaper.raw
 brook_ext2_disk.img
 brook_nix_disk.img
+brook_home_disk.img
+
+# Generated Nix tools (built from source)
+tools/nix-search/nix-search
+tools/nix-install/nix-install
+tools/nix-fetch/nix-fetch
+tools/nar-unpack/nar-unpack
+
+# Generated package index
+tools/wavplay/wavplay
+tools/wavplay/tone
+tools/mp3play/mp3play
+
+data/user_content
+doomgeneric_brook/doomgeneric
+doomgeneric_brook/doomgeneric.map
+profile*.txt\nprofile*.json\nprofile*.folded

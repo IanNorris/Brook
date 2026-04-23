@@ -1,0 +1,21 @@
+# Brook OS — Showcase: DOOM + Quake + NetSurf in window manager
+# Screen: 1920×1080 with ~25px taskbar
+set wm
+
+# NetSurf: 800×600 — left side
+set vfb 800x600
+set scale 1
+set pos 20,20
+run /nix/store/m64fp6340nd6s98fawnwvvkx4v81660k-netsurf-brook-3.11-brook/bin/netsurf -f brook -w 800 -h 600
+
+# DOOM: 320×200 upscaled 2× to 640×400 — top-right
+set vfb 320x200
+set scale 2
+set pos 850,20
+run doom -iwad /boot/DOOM1.WAD
+
+# Quake: 640×480 — bottom-right
+set vfb 640x480
+set scale 1
+set pos 850,480
+run /nix/games/quake/quake -basedir /nix/games/quake

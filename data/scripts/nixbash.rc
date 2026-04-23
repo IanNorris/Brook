@@ -1,0 +1,2 @@
+# Brook OS — Run Nix-built bash
+run --strace /nix/store/d9mmsda01n5ir4xsm1f033662q7fdwha-bash-interactive-5.3p9/bin/bash -c "echo Brook says hello from bash"

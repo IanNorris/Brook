@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Create the persistent Brook OS disk image (FAT32, 128MB).
+# Create the persistent Brook OS disk image (FAT32, 256MB).
 #
 # This is a one-time setup script. The image lives at /workspace/brook_disk.img
 # (outside the repo) and persists across builds. Use update_disk.sh to sync
 # build artifacts into it.
 #
 # Usage:
-#   scripts/create_disk.sh [size_mb]    # default: 128
+#   scripts/create_disk.sh [size_mb]    # default: 256
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 DISK_IMG="${BROOK_DISK_IMG:-${ROOT_DIR}/brook_disk.img}"
-SIZE_MB="${1:-128}"
+SIZE_MB="${1:-256}"
 
 if [ -f "${DISK_IMG}" ]; then
     echo "Disk image already exists at ${DISK_IMG}"
@@ -31,6 +31,7 @@ mkfs.fat -F 32 -n "BROOKDISK" "${DISK_IMG}"
 # Create directory structure
 mmd -i "${DISK_IMG}" ::DRIVERS
 mmd -i "${DISK_IMG}" ::BIN
+mmd -i "${DISK_IMG}" ::MUSIC
 
 # Write BROOK.MNT — tells the kernel to mount this volume at /boot
 echo -n "/boot" | mcopy -i "${DISK_IMG}" - "::BROOK.MNT"

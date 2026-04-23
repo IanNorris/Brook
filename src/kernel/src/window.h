@@ -10,7 +10,8 @@ struct Process;
 static constexpr uint32_t WM_TITLE_BAR_HEIGHT = 24;
 static constexpr uint32_t WM_BORDER_WIDTH     = 2;
 static constexpr uint32_t WM_BUTTON_WIDTH     = 24;
-static constexpr uint32_t WM_RESIZE_GRAB      = 8;   // corner grab zone for resize
+static constexpr uint32_t WM_RESIZE_GRAB      = 16;  // corner/edge grab zone for resize
+static constexpr uint32_t WM_RESIZE_EDGE      = 6;   // edge-only grab zone (bottom/right)
 static constexpr uint32_t WM_MIN_WIDTH        = 200;
 static constexpr uint32_t WM_MIN_HEIGHT       = 100;
 static constexpr uint32_t WM_MAX_WINDOWS      = 32;
@@ -73,6 +74,8 @@ enum class WmHitZone : uint8_t
     MinimizeButton,
     ClientArea,
     ResizeCorner,   // bottom-right corner
+    ResizeRight,    // right edge
+    ResizeBottom,   // bottom edge
     Border,
     Taskbar,        // clicked on taskbar background
     TaskbarButton,  // clicked on a taskbar window button
@@ -168,5 +171,37 @@ uint32_t WmDesktopHeight(uint32_t screenH);
 
 // Spawn a new terminal window (Ctrl+T handler).
 void WmSpawnTerminal();
+
+// ---------------------------------------------------------------------------
+// App Launcher
+// ---------------------------------------------------------------------------
+
+static constexpr uint32_t WM_LAUNCHER_MAX_ITEMS = 16;
+
+struct LauncherItem {
+    char title[48];
+    char scriptPath[128];  // e.g. "/boot/SHORTCUTS/QUAKE.RC"
+    uint32_t iconColor;    // Icon background color (0 = auto from title)
+    bool valid;
+};
+
+// Load shortcut files from /boot/SHORTCUTS/ directory.
+void WmLauncherLoad();
+
+// Toggle the launcher popup open/closed.
+void WmLauncherToggle();
+
+// Is the launcher popup currently visible?
+bool WmLauncherVisible();
+
+// Render the launcher popup over the desktop.
+void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
+                      uint32_t screenW, uint32_t screenH);
+
+// Hit-test the launcher popup. Returns item index (0..N) or -1 if miss.
+int WmLauncherHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH);
+
+// Launch the item at the given index.
+void WmLauncherExec(int itemIdx);
 
 } // namespace brook

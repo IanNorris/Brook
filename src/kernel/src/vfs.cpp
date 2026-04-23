@@ -220,7 +220,8 @@ Vnode* VfsOpen(const char* path, int flags)
 int VfsRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
 {
     if (!vn || !vn->ops->read) return -1;
-    return vn->ops->read(vn, buf, len, offset);
+    int r = vn->ops->read(vn, buf, len, offset);
+    return r;
 }
 
 int VfsWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset)
@@ -271,9 +272,15 @@ int VfsLstatPath(const char* path, VnodeStat* st)
 
 int VfsSync(Vnode* vn)
 {
-    // Sync is vnode-ops based — handled by the filesystem's close/write ops.
-    // For now, no generic sync path; filesystems implement it in their vnode ops.
+    // Best-effort flush: call each filesystem's sync hook so buffered
+    // metadata (e.g. ext2 bitmap/BGDT cache) reaches disk.  Per-vnode
+    // granularity is not tracked yet, so we sync everything.
     (void)vn;
+    for (uint32_t i = 0; i < VFS_MAX_MOUNTS; ++i) {
+        if (!g_mounts[i].used) continue;
+        if (g_mounts[i].fsOps && g_mounts[i].fsOps->sync)
+            g_mounts[i].fsOps->sync(g_mounts[i].mountPriv);
+    }
     return 0;
 }
 
@@ -309,10 +316,10 @@ int VfsRename(const char* oldPath, const char* newPath)
 
 int VfsSymlink(const char* target, const char* linkPath)
 {
-    if (!target || !linkPath || !target[0] || !linkPath[0]) return -1;
+    if (!target || !linkPath || !target[0] || !linkPath[0]) return -22; // -EINVAL
     const char* relPath = nullptr;
     MountEntry* mount = FindMount(linkPath, &relPath);
-    if (!mount || !mount->fsOps || !mount->fsOps->symlink) return -1;
+    if (!mount || !mount->fsOps || !mount->fsOps->symlink) return -1; // -EPERM
     return mount->fsOps->symlink(mount->mountPriv, mount->pdrv, target, relPath);
 }
 

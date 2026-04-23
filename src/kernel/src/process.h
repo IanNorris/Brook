@@ -7,7 +7,7 @@
 namespace brook {
 
 // Maximum number of open file descriptors per process.
-static constexpr uint32_t MAX_FDS = 64;
+static constexpr uint32_t MAX_FDS = 256;
 
 // Maximum concurrent processes.
 static constexpr uint32_t MAX_PROCESSES = 64;
@@ -16,13 +16,14 @@ static constexpr uint32_t MAX_PROCESSES = 64;
 static constexpr uint64_t PROGRAM_BREAK_SIZE = 64 * 1024 * 1024; // 64 MB
 
 // Default user stack size.
-static constexpr uint64_t USER_STACK_SIZE = 128 * 1024; // 128 KB
+static constexpr uint64_t USER_STACK_SIZE = 8 * 1024 * 1024; // 8 MB (Linux default)
 
-// Per-process kernel stack size (16 pages = 64 KB).
-// Must be large enough for syscalls (VFS/FatFS stack depth) and interrupts.
+// Per-process kernel stack size (32 pages = 128 KB).
+// Must be large enough for syscalls (VFS/FatFS stack depth), interrupts,
+// and signal delivery frames (~560 bytes each).
 // Each process's kernel stack is also used as its syscall stack (gs:8).
 // The allocation includes unmapped guard pages at both ends for overflow detection.
-static constexpr uint64_t KERNEL_STACK_SIZE = 64 * 1024;
+static constexpr uint64_t KERNEL_STACK_SIZE = 128 * 1024;
 static constexpr uint64_t KERNEL_STACK_PAGES = KERNEL_STACK_SIZE / 4096;
 
 // Scheduler time slice in milliseconds (~10ms).
@@ -179,9 +180,16 @@ enum class FdType : uint8_t
     DevKeyboard,   // /dev/keyboard
     Pipe,          // pipe() read/write end
     DevNull,       // /dev/null — discard writes, EOF on read
+    DevUrandom,    // /dev/urandom — RDRAND-backed random bytes
     SyntheticMem,  // In-memory synthetic file (e.g. /etc/passwd)
     Socket,        // Network socket (UDP/TCP)
     DevTty,        // /dev/tty — bidirectional terminal (read=stdin pipe, write=stdout pipe)
+    EventFd,       // eventfd — uint64 counter for event notification
+    DevDsp,        // /dev/dsp — OSS audio output
+    EpollFd,       // epoll instance
+    TimerFd,       // timerfd — timer-based event notification
+    MemFd,         // memfd_create — anonymous in-memory file
+    UnixSocket,    // AF_UNIX domain socket
 };
 
 struct TtyDevicePair {
@@ -246,6 +254,10 @@ struct Process
     volatile bool reapable;  // Set after context_switch completes away from this process
     volatile bool compositorRegistered; // True while compositor holds a reference to this process's VFB
     int32_t exitStatus;      // Exit status (stored when process exits, for wait4)
+
+    // CPU time accounting (in LAPIC ticks, ~1ms each)
+    volatile uint64_t userTicks;     // Ticks spent in user mode
+    volatile uint64_t sysTicks;      // Ticks spent in kernel mode
 
     // Threading
     bool     isThread;           // True if this is a thread (not the group leader)
@@ -453,6 +465,7 @@ FdEntry*  FdGet(Process* proc, int fd);
 // Close all file descriptors for a process (called at exit time).
 // Properly handles pipe refcounting and wakes blocked readers/writers.
 void ProcessCloseAllFds(Process* proc);
+void ProcessCloseCloexecFds(Process* proc); // close FD_CLOEXEC fds on execve
 FdEntry*  FdGet(Process* proc, int fd);
 
 // Signal delivery: send a signal to a process.

@@ -484,6 +484,22 @@ ModuleHandle* ModuleLoad(const char* path)
     }
     kfree(buf);
 
+    // Skip if a module with the same name is already loaded.
+    if (pr.info && pr.info->name)
+    {
+        for (uint32_t i = 0; i < MODULE_MAX; ++i)
+        {
+            if (g_modules[i].active && g_modules[i].info &&
+                ModStrEq(g_modules[i].info->name, pr.info->name))
+            {
+                SerialPrintf("module: '%s' already loaded — skipping '%s'\n",
+                             pr.info->name, path);
+                VmmFreePages(VirtualAddress(pr.baseVirt), pr.pageCount);
+                return &g_modules[i]; // return existing handle
+            }
+        }
+    }
+
     // Call module init.
     if (pr.info->init)
     {

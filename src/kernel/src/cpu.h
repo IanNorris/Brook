@@ -21,6 +21,7 @@ void CpuInitFpu();
 
 // Returns true if CPUID reports SSE2 support (always true on x86-64).
 bool CpuHasSse2();
+bool CpuHasRdrand();
 
 // ---- MSR helpers ----
 

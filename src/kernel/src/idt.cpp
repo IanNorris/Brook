@@ -2,9 +2,17 @@
 #include "gdt.h"
 #include "serial.h"
 #include "panic.h"
+#include "panic_screen.h"
+#include "panic_qr.h"
 #include "process.h"
 #include "scheduler.h"
 #include "apic.h"
+#include "smp.h"
+#include "compositor.h"
+#include "ksym_addrs.h"
+#include "exception_info.h"
+#include "build_info.h"
+#include "tty.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 
@@ -102,6 +110,11 @@ static inline uint8_t ExcInb(uint16_t port)
     return ret;
 }
 
+// Atomic spinlock to prevent exception output from interleaving with
+// normal serial writes from other CPUs.  Force-resets the normal serial
+// ticket lock so the exception handler can write without deadlock.
+extern "C" void ExcForceSerialLock();
+
 static void ExcPutCharRaw(char c)
 {
     if (c == '\n') {
@@ -156,6 +169,26 @@ static void ExcStackWalk(uint64_t rbp, int maxFrames, const char* tag)
         ExcPutCharRaw(static_cast<char>('0' + i % 10));
         ExcPutsRaw("  ");
         ExcPutHex(fp->rip);
+
+        // Symbolicate if possible
+        const char* symName = nullptr;
+        uint64_t symOff = 0;
+        if (brook::KsymFindByAddr(fp->rip, &symName, &symOff))
+        {
+            ExcPutsRaw("  ");
+            ExcPutsRaw(symName);
+            ExcPutsRaw("+0x");
+            // Print offset in hex (compact)
+            if (symOff == 0) {
+                ExcPutCharRaw('0');
+            } else {
+                char obuf[17];
+                int oi = 0;
+                uint64_t v = symOff;
+                while (v) { obuf[oi++] = "0123456789abcdef"[v & 0xf]; v >>= 4; }
+                while (oi > 0) ExcPutCharRaw(obuf[--oi]);
+            }
+        }
         ExcPutsRaw("\n");
 
         prev = fp;
@@ -194,9 +227,28 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
         ExcPutsRaw(" — halting ===\n");
         ExcPutsRaw("  RIP   "); ExcPutHex(frame->ip); ExcPutsRaw("\n");
         ExcPutsRaw("  RSP   "); ExcPutHex(frame->sp); ExcPutsRaw("\n");
-        for (;;) __asm__ volatile("cli; hlt");
+        for (;;) __asm__ volatile("cli; pause");
     }
     ++excDepthPerCpu[cpuSlot];
+
+    // If a panic is already active (another CPU called KernelPanic and
+    // SmpHaltAllAPs), this CPU should NOT produce any output or render
+    // a panic screen — it would garble the output. Just spin forever.
+    // The panicking CPU's SmpHaltAllAPs sets g_panicHaltActive before
+    // broadcasting NMI. If the NMI didn't reach us (or we faulted before
+    // it arrived), this guard catches us.
+    if (brook::SmpIsPanicActive())
+    {
+        for (;;) __asm__ volatile("cli; pause");
+    }
+
+    // For kernel-mode faults: halt all other CPUs and stop compositor
+    // before producing any output, so nothing overwrites the crash screen.
+    if ((frame->cs & 3) == 0)
+    {
+        brook::SmpHaltAllAPs();
+        brook::CompositorHalt();
+    }
 
     // Build a CPU tag prefix like "[C3] " so interleaved lockless output
     // from multiple CPUs can be disambiguated.
@@ -215,6 +267,7 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
     // of va_list ABI issues or format buffer corruption.
     // Every line is prefixed with [CN] so interleaved output from multiple
     // CPUs is still parseable.
+    ExcForceSerialLock();
     ExcPutsRaw("\n"); ExcPutsRaw(cpuTag); ExcPutsRaw("=== EXCEPTION ===\n");
     ExcPutsRaw(cpuTag); ExcPutsRaw("Vector: ");
     {
@@ -247,7 +300,26 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
         ExcPutsRaw(" ("); ExcPutsRaw(cur->name); ExcPutsRaw(")\n");
     }
 
-    ExcPutsRaw(cpuTag); ExcPutsRaw("  RIP   "); ExcPutHex(frame->ip);    ExcPutsRaw("\n");
+    ExcPutsRaw(cpuTag); ExcPutsRaw("  RIP   "); ExcPutHex(frame->ip);
+    // Symbolicate RIP
+    {
+        const char* symName = nullptr;
+        uint64_t symOff = 0;
+        if (brook::KsymFindByAddr(frame->ip, &symName, &symOff))
+        {
+            ExcPutsRaw("  ");
+            ExcPutsRaw(symName);
+            ExcPutsRaw("+0x");
+            if (symOff == 0) { ExcPutCharRaw('0'); }
+            else {
+                char obuf[17]; int oi = 0;
+                uint64_t v = symOff;
+                while (v) { obuf[oi++] = "0123456789abcdef"[v & 0xf]; v >>= 4; }
+                while (oi > 0) ExcPutCharRaw(obuf[--oi]);
+            }
+        }
+    }
+    ExcPutsRaw("\n");
     ExcPutsRaw(cpuTag); ExcPutsRaw("  RSP   "); ExcPutHex(frame->sp);    ExcPutsRaw("\n");
     ExcPutsRaw(cpuTag); ExcPutsRaw("  CS    "); ExcPutHex(frame->cs);    ExcPutsRaw("\n");
     ExcPutsRaw(cpuTag); ExcPutsRaw("  SS    "); ExcPutHex(frame->ss);    ExcPutsRaw("\n");
@@ -264,6 +336,67 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
             ExcPutsRaw("]");
         }
         ExcPutsRaw("\n");
+    }
+
+    // Human-readable exception description
+    {
+        const char* desc = brook::ExceptionDescribe(vector, errorCode, cr2,
+                                                     frame->ip, fromUser);
+        ExcPutsRaw(cpuTag); ExcPutsRaw("  DESC  "); ExcPutsRaw(desc); ExcPutsRaw("\n");
+    }
+
+    // For #GP in user mode, dump bytes at the faulting RIP via direct map.
+    if (vector == 13 && fromUser)
+    {
+        static constexpr uint64_t DMAP_USR = 0xFFFF800000000000ULL;
+        uint64_t cr3val;
+        __asm__ volatile("movq %%cr3, %0" : "=r"(cr3val));
+        cr3val &= 0x000FFFFFFFFFF000ULL;
+
+        uint64_t ripAddr = frame->ip;
+        // Walk page tables to get physical address of RIP page
+        uint64_t* pml4 = reinterpret_cast<uint64_t*>(DMAP_USR + cr3val);
+        uint64_t pml4e = pml4[(ripAddr >> 39) & 0x1FF];
+        if (pml4e & 1) {
+            uint64_t* pdpt = reinterpret_cast<uint64_t*>(DMAP_USR + (pml4e & 0x000FFFFFFFFFF000ULL));
+            uint64_t pdpte = pdpt[(ripAddr >> 30) & 0x1FF];
+            if (pdpte & 1) {
+                uint64_t* pd = reinterpret_cast<uint64_t*>(DMAP_USR + (pdpte & 0x000FFFFFFFFFF000ULL));
+                uint64_t pde = pd[(ripAddr >> 21) & 0x1FF];
+                if ((pde & 1) && !(pde & (1ULL << 7))) {
+                    uint64_t* pt = reinterpret_cast<uint64_t*>(DMAP_USR + (pde & 0x000FFFFFFFFFF000ULL));
+                    uint64_t pte = pt[(ripAddr >> 12) & 0x1FF];
+                    ExcPutsRaw(cpuTag); ExcPutsRaw("  RIP PTE "); ExcPutHex(pte); ExcPutsRaw("\n");
+                    if (pte & 1) {
+                        uint64_t physPage = pte & 0x000FFFFFFFFFF000ULL;
+                        uint64_t pageOff = ripAddr & 0xFFF;
+                        uint8_t* kPtr = reinterpret_cast<uint8_t*>(DMAP_USR + physPage + pageOff);
+                        // Dump 32 bytes at RIP
+                        ExcPutsRaw(cpuTag); ExcPutsRaw("  CODE@RIP: ");
+                        for (int i = 0; i < 32 && (pageOff + i) < 4096; ++i) {
+                            uint8_t b = kPtr[i];
+                            const char hex[] = "0123456789ABCDEF";
+                            ExcPutCharRaw(hex[b >> 4]);
+                            ExcPutCharRaw(hex[b & 0xF]);
+                            ExcPutCharRaw(' ');
+                        }
+                        ExcPutsRaw("\n");
+                        // Also dump 16 bytes BEFORE RIP for context
+                        if (pageOff >= 16) {
+                            ExcPutsRaw(cpuTag); ExcPutsRaw("  CODE@RIP-16: ");
+                            for (int i = -16; i < 0; ++i) {
+                                uint8_t b = kPtr[i];
+                                const char hex[] = "0123456789ABCDEF";
+                                ExcPutCharRaw(hex[b >> 4]);
+                                ExcPutCharRaw(hex[b & 0xF]);
+                                ExcPutCharRaw(' ');
+                            }
+                            ExcPutsRaw("\n");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // For page faults, walk the page table hierarchy to diagnose the mapping.
@@ -393,6 +526,19 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
     // Kernel-mode faults are unrecoverable — halt.
     if ((frame->cs & 3) == 3)
     {
+        // Print ELF bounds to disambiguate which binary the process was actually running.
+        // Useful when the process name may be stale (e.g. after exec before name update).
+        brook::Process* diagProc = brook::ProcessCurrent();
+        if (diagProc)
+        {
+            ExcPutsRaw(cpuTag); ExcPutsRaw("  ELF base=");
+            ExcPutHex(diagProc->elf.baseAddress);
+            ExcPutsRaw(" breakLow=");
+            ExcPutHex(diagProc->elf.programBreakLow);
+            ExcPutsRaw(" entry=");
+            ExcPutHex(diagProc->elf.entryPoint);
+            ExcPutsRaw("\n");
+        }
         ExcPutsRaw(cpuTag); ExcPutsRaw("=== KILLING PROCESS ===\n");
         --excDepthPerCpu[cpuSlot];
         __asm__ volatile("sti");
@@ -404,7 +550,7 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
 
     // Halt here — kernel-mode exception is unrecoverable.
     // Use cli before hlt so timer interrupts don't wake us.
-    for (;;) { __asm__ volatile("cli; hlt"); }
+    for (;;) { __asm__ volatile("cli; pause"); }
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +583,15 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
 {
     // The assembly stub has already done SWAPGS if needed.
     __asm__ volatile("cli");
+
+    // If a panic is already active, this CPU must not produce output or
+    // render a panic screen — it would garble the panicking CPU's work.
+    // This catches CPUs that enter via ExceptionStub13/14 (which bypass
+    // HandleException where the main guard lives).
+    if (brook::SmpIsPanicActive())
+    {
+        for (;;) __asm__ volatile("cli; pause");
+    }
 
     bool fromUser = (ef->cs & 3) != 0;
 
@@ -508,11 +663,130 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                 }
             }
         }
+
+        // Safety net: present + write + user page without COW bit.
+        // If the PTE belongs to this process, it likely lost its W bit
+        // due to a memory visibility race — just set it writable.
+        if (pfPresent && pfWrite && isUserAddr && cowProc)
+        {
+            using namespace brook;
+            uint64_t* pte = VmmGetPte(cowProc->pageTable,
+                                       VirtualAddress(cr2cow & ~0xFFFULL));
+            if (pte && (*pte & VMM_PRESENT) && !(*pte & PTE_COW_BIT)
+                && (*pte & VMM_USER))
+            {
+                uint16_t ptePid = static_cast<uint16_t>(
+                    (*pte >> PTE_PID_SHIFT) & 0x3FF);
+                if (ptePid == cowProc->pid)
+                {
+                    SerialPrintf("PF: recovering stale RO page at 0x%lx "
+                                 "(pid %u, PTE=0x%lx)\n",
+                                 cr2cow, cowProc->pid, *pte);
+                    *pte |= VMM_WRITABLE;
+                    __asm__ volatile("invlpg (%0)" :: "r"(cr2cow & ~0xFFFULL) : "memory");
+                    __asm__ volatile("sti");
+                    return;
+                }
+            }
+        }
     }
 
-    // For kernel-mode faults, delegate to the original handler for diagnostics + halt.
+    // For kernel-mode faults, dump full GPRs then delegate for diagnostics + halt.
     if (!fromUser)
     {
+        // Print all GPRs before delegating — HandleException only gets basic frame
+        ExcPutsRaw("\n=== KERNEL GPRs ===\n");
+        ExcPutsRaw("  RAX "); ExcPutHex(ef->rax); ExcPutsRaw("  RBX "); ExcPutHex(ef->rbx); ExcPutsRaw("\n");
+        ExcPutsRaw("  RCX "); ExcPutHex(ef->rcx); ExcPutsRaw("  RDX "); ExcPutHex(ef->rdx); ExcPutsRaw("\n");
+        ExcPutsRaw("  RSI "); ExcPutHex(ef->rsi); ExcPutsRaw("  RDI "); ExcPutHex(ef->rdi); ExcPutsRaw("\n");
+        ExcPutsRaw("  RBP "); ExcPutHex(ef->rbp); ExcPutsRaw("\n");
+        ExcPutsRaw("  R8  "); ExcPutHex(ef->r8);  ExcPutsRaw("  R9  "); ExcPutHex(ef->r9);  ExcPutsRaw("\n");
+        ExcPutsRaw("  R10 "); ExcPutHex(ef->r10); ExcPutsRaw("  R11 "); ExcPutHex(ef->r11); ExcPutsRaw("\n");
+        ExcPutsRaw("  R12 "); ExcPutHex(ef->r12); ExcPutsRaw("  R13 "); ExcPutHex(ef->r13); ExcPutsRaw("\n");
+        ExcPutsRaw("  R14 "); ExcPutHex(ef->r14); ExcPutsRaw("  R15 "); ExcPutHex(ef->r15); ExcPutsRaw("\n");
+
+        // Halt all other CPUs and stop the compositor before rendering
+        // the panic screen — otherwise the compositor will overwrite it.
+        brook::SmpHaltAllAPs();
+        brook::CompositorHalt();
+
+        // Render visual panic screen with full register state + QR code
+        {
+            uint32_t physStride = 0;
+            volatile uint32_t* physFb = brook::CompositorGetPhysFb(&physStride);
+            uint32_t fbW = 0, fbH = 0;
+            brook::CompositorGetPhysDims(&fbW, &fbH);
+            if (physFb && fbW && fbH)
+            {
+                uint32_t fbStride = physStride * 4; // pixel stride → byte stride
+                brook::PanicCPURegs pregs = {};
+                pregs.rax = ef->rax; pregs.rbx = ef->rbx;
+                pregs.rcx = ef->rcx; pregs.rdx = ef->rdx;
+                pregs.rsi = ef->rsi; pregs.rdi = ef->rdi;
+                pregs.r8  = ef->r8;  pregs.r9  = ef->r9;
+                pregs.r10 = ef->r10; pregs.r11 = ef->r11;
+                pregs.r12 = ef->r12; pregs.r13 = ef->r13;
+                pregs.r14 = ef->r14; pregs.r15 = ef->r15;
+                pregs.rip = ef->rip; pregs.rsp = ef->rsp;
+                pregs.rbp = ef->rbp; pregs.rflags = ef->rflags;
+                pregs.cs  = static_cast<uint16_t>(ef->cs);
+                pregs.ss  = static_cast<uint16_t>(ef->ss);
+                __asm__ volatile("movq %%cr0, %0" : "=r"(pregs.cr0));
+                __asm__ volatile("movq %%cr2, %0" : "=r"(pregs.cr2));
+                __asm__ volatile("movq %%cr3, %0" : "=r"(pregs.cr3));
+                __asm__ volatile("movq %%cr4, %0" : "=r"(pregs.cr4));
+
+                // Walk stack for trace
+                brook::PanicStackTrace ptrace = {};
+                uint64_t* rbpPtr = reinterpret_cast<uint64_t*>(ef->rbp);
+                ptrace.rip[0] = ef->rip;
+                ptrace.depth = 1;
+                for (uint8_t d = 1; d < brook::PANIC_MAX_STACK_DEPTH; d++)
+                {
+                    uint64_t addr = reinterpret_cast<uint64_t>(rbpPtr);
+                    if (addr < 0xFFFF800000000000ULL || addr == 0) break;
+                    ptrace.rip[d] = rbpPtr[1];
+                    ptrace.depth = d + 1;
+                    rbpPtr = reinterpret_cast<uint64_t*>(rbpPtr[0]);
+                }
+
+                // Exception info
+                brook::PanicExceptionInfo excInfo = {};
+                excInfo.vector    = static_cast<uint8_t>(vector);
+                excInfo.errorCode = static_cast<uint32_t>(ef->errorCode);
+                brook::Process* curProc  = brook::ProcessCurrent();
+                excInfo.pid       = curProc ? curProc->pid : 0;
+
+                // Process list snapshot (all CPUs halted, no lock needed)
+                static brook::PanicProcessList procList;
+                procList.count = 0;
+                uint32_t nProcs = brook::PanicGetProcessCount();
+                for (uint32_t pi = 0; pi < nProcs && procList.count < brook::PANIC_MAX_PROCESSES; pi++)
+                {
+                    brook::Process* p = brook::PanicGetProcess(pi);
+                    if (!p || p->state == brook::ProcessState::Terminated) continue;
+                    auto& e = procList.entries[procList.count];
+                    e.pid   = p->pid;
+                    e.state = static_cast<uint8_t>(p->state);
+                    e.cpu   = (p->runningOnCpu >= 0) ? static_cast<uint8_t>(p->runningOnCpu) : 0xFF;
+                    e.rip   = 0;
+                    for (uint32_t j = 0; j < brook::PANIC_PROCESS_NAME_LEN; j++)
+                        e.name[j] = (p->name[j]) ? p->name[j] : '\0';
+                    procList.count++;
+                }
+
+                brook::PanicScreenInfo psi = {};
+                psi.message   = "Unrecoverable kernel exception";
+                psi.regs      = &pregs;
+                psi.trace     = &ptrace;
+                psi.excInfo   = &excInfo;
+                psi.procList  = &procList;
+                psi.vector    = vector;
+                psi.errorCode = ef->errorCode;
+                brook::PanicScreenRender(const_cast<uint32_t*>(physFb), fbW, fbH, fbStride, &psi);
+            }
+        }
+
         InterruptFrame ifrm;
         ifrm.ip    = ef->rip;
         ifrm.cs    = ef->cs;
@@ -521,10 +795,159 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         ifrm.ss    = ef->ss;
         HandleException(static_cast<uint8_t>(vector), &ifrm, ef->errorCode, true);
         // HandleException never returns for kernel faults.
-        for (;;) __asm__ volatile("cli; hlt");
+        for (;;) __asm__ volatile("cli; pause");
     }
 
     // --- User-mode fault ---
+
+    // For #GP, dump all GPRs so we can diagnose alignment / register issues.
+    if (vector == 13)
+    {
+        ExcForceSerialLock();
+        ExcPutsRaw("\n[GP] User #GP — full register dump:\n");
+        ExcPutsRaw("  RIP "); ExcPutHex(ef->rip); ExcPutsRaw("\n");
+        ExcPutsRaw("  RSP "); ExcPutHex(ef->rsp); ExcPutsRaw("\n");
+        ExcPutsRaw("  RDI "); ExcPutHex(ef->rdi); ExcPutsRaw("\n");
+        ExcPutsRaw("  RSI "); ExcPutHex(ef->rsi); ExcPutsRaw("\n");
+        ExcPutsRaw("  RAX "); ExcPutHex(ef->rax); ExcPutsRaw("\n");
+        ExcPutsRaw("  RCX "); ExcPutHex(ef->rcx); ExcPutsRaw("\n");
+        ExcPutsRaw("  RDX "); ExcPutHex(ef->rdx); ExcPutsRaw("\n");
+        ExcPutsRaw("  RBX "); ExcPutHex(ef->rbx); ExcPutsRaw("\n");
+        ExcPutsRaw("  RBP "); ExcPutHex(ef->rbp); ExcPutsRaw("\n");
+        ExcPutsRaw("  R8  "); ExcPutHex(ef->r8);  ExcPutsRaw("\n");
+        ExcPutsRaw("  R9  "); ExcPutHex(ef->r9);  ExcPutsRaw("\n");
+        ExcPutsRaw("  R10 "); ExcPutHex(ef->r10); ExcPutsRaw("\n");
+        ExcPutsRaw("  R11 "); ExcPutHex(ef->r11); ExcPutsRaw("\n");
+        ExcPutsRaw("  R12 "); ExcPutHex(ef->r12); ExcPutsRaw("\n");
+        ExcPutsRaw("  R13 "); ExcPutHex(ef->r13); ExcPutsRaw("\n");
+        ExcPutsRaw("  R14 "); ExcPutHex(ef->r14); ExcPutsRaw("\n");
+        ExcPutsRaw("  R15 "); ExcPutHex(ef->r15); ExcPutsRaw("\n");
+        ExcPutsRaw("  ERR "); ExcPutHex(ef->errorCode); ExcPutsRaw("\n");
+
+        // Dump code bytes at RIP via direct map
+        static constexpr uint64_t DMAP_USR = 0xFFFF800000000000ULL;
+        uint64_t cr3val;
+        __asm__ volatile("movq %%cr3, %0" : "=r"(cr3val));
+        cr3val &= 0x000FFFFFFFFFF000ULL;
+        uint64_t ripAddr = ef->rip;
+        uint64_t* pml4 = reinterpret_cast<uint64_t*>(DMAP_USR + cr3val);
+        uint64_t pml4e = pml4[(ripAddr >> 39) & 0x1FF];
+        if (pml4e & 1) {
+            uint64_t* pdpt = reinterpret_cast<uint64_t*>(DMAP_USR + (pml4e & 0x000FFFFFFFFFF000ULL));
+            uint64_t pdpte = pdpt[(ripAddr >> 30) & 0x1FF];
+            if (pdpte & 1) {
+                uint64_t* pd = reinterpret_cast<uint64_t*>(DMAP_USR + (pdpte & 0x000FFFFFFFFFF000ULL));
+                uint64_t pde = pd[(ripAddr >> 21) & 0x1FF];
+                if ((pde & 1) && !(pde & (1ULL << 7))) {
+                    uint64_t* pt = reinterpret_cast<uint64_t*>(DMAP_USR + (pde & 0x000FFFFFFFFFF000ULL));
+                    uint64_t pte = pt[(ripAddr >> 12) & 0x1FF];
+                    if (pte & 1) {
+                        uint64_t physPage = pte & 0x000FFFFFFFFFF000ULL;
+                        uint64_t pageOff = ripAddr & 0xFFF;
+                        uint8_t* kPtr = reinterpret_cast<uint8_t*>(DMAP_USR + physPage + pageOff);
+                        ExcPutsRaw("  CODE@RIP: ");
+                        for (int i = -16; i < 32 && (pageOff + i) < 4096 && (pageOff + i) >= 0; ++i) {
+                            if (i == 0) ExcPutsRaw(">> ");
+                            uint8_t b = kPtr[i];
+                            const char hex[] = "0123456789ABCDEF";
+                            ExcPutCharRaw(hex[b >> 4]);
+                            ExcPutCharRaw(hex[b & 0xF]);
+                            ExcPutCharRaw(' ');
+                        }
+                        ExcPutsRaw("\n");
+                    }
+                }
+            }
+        }
+        // Dump DOOM hash table diagnostics.
+        // NOTE: these addresses must match the DOOM binary (run: nm build/doom/doom | grep -E 'lumphash|lumpinfo|numlumps')
+        // Read via page table walk + direct map.
+        auto readUser64 = [&](uint64_t uva) -> uint64_t {
+            uint64_t* p4 = reinterpret_cast<uint64_t*>(DMAP_USR + cr3val);
+            uint64_t e4 = p4[(uva >> 39) & 0x1FF];
+            if (!(e4 & 1)) return 0xDEAD1;
+            uint64_t* p3 = reinterpret_cast<uint64_t*>(DMAP_USR + (e4 & 0x000FFFFFFFFFF000ULL));
+            uint64_t e3 = p3[(uva >> 30) & 0x1FF];
+            if (!(e3 & 1)) return 0xDEAD2;
+            uint64_t* p2 = reinterpret_cast<uint64_t*>(DMAP_USR + (e3 & 0x000FFFFFFFFFF000ULL));
+            uint64_t e2 = p2[(uva >> 21) & 0x1FF];
+            if (!(e2 & 1)) return 0xDEAD3;
+            if (e2 & (1ULL << 7)) { // 2MB page
+                uint64_t phys = (e2 & 0x000FFFFFFFE00000ULL) | (uva & 0x1FFFFFULL);
+                return *reinterpret_cast<uint64_t*>(DMAP_USR + phys);
+            }
+            uint64_t* p1 = reinterpret_cast<uint64_t*>(DMAP_USR + (e2 & 0x000FFFFFFFFFF000ULL));
+            uint64_t e1 = p1[(uva >> 12) & 0x1FF];
+            if (!(e1 & 1)) return 0xDEAD4;
+            uint64_t phys = (e1 & 0x000FFFFFFFFFF000ULL) | (uva & 0xFFF);
+            return *reinterpret_cast<uint64_t*>(DMAP_USR + phys);
+        };
+
+        uint64_t lumphashPtr = readUser64(0x4b3d78);
+        uint64_t lumpinfoPtr = readUser64(0x4b3d70);
+        uint64_t numlumps    = readUser64(0x4b3d68) & 0xFFFFFFFF;
+        ExcPutsRaw("  lumphash="); ExcPutHex(lumphashPtr); ExcPutsRaw("\n");
+        ExcPutsRaw("  lumpinfo="); ExcPutHex(lumpinfoPtr); ExcPutsRaw("\n");
+        ExcPutsRaw("  numlumps="); ExcPutHex(numlumps);    ExcPutsRaw("\n");
+
+        // Scan hash table for the bad entry
+        if (lumphashPtr > 0x10000000ULL && lumphashPtr < 0x20000000ULL) {
+            ExcPutsRaw("  Scanning hash table for non-canonical entries...\n");
+            int found = 0;
+            for (uint64_t i = 0; i < numlumps && i < 2048 && found < 5; ++i) {
+                uint64_t entry = readUser64(lumphashPtr + i * 8);
+                if (entry != 0 && (entry >> 47) != 0 && (entry >> 47) != 0x1FFFF) {
+                    ExcPutsRaw("  BAD["); ExcPutHex(i); ExcPutsRaw("]=");
+                    ExcPutHex(entry); ExcPutsRaw(" @");
+                    ExcPutHex(lumphashPtr + i * 8); ExcPutsRaw("\n");
+                    // Dump 64 bytes around this entry
+                    ExcPutsRaw("  CONTEXT: ");
+                    uint64_t base = lumphashPtr + i * 8 - 32;
+                    for (int j = 0; j < 8; ++j) {
+                        if (j == 4) ExcPutsRaw(">> ");
+                        uint64_t val = readUser64(base + j * 8);
+                        ExcPutHex(val); ExcPutsRaw(" ");
+                    }
+                    ExcPutsRaw("\n");
+                    ++found;
+                }
+            }
+            if (found == 0) ExcPutsRaw("  (no bad entries found in first 2048)\n");
+
+            // Print physical page backing the hash table start
+            auto readUserPhys = [&](uint64_t uva) -> uint64_t {
+                uint64_t* p4 = reinterpret_cast<uint64_t*>(DMAP_USR + cr3val);
+                uint64_t e4 = p4[(uva >> 39) & 0x1FF];
+                if (!(e4 & 1)) return 0;
+                uint64_t* p3 = reinterpret_cast<uint64_t*>(DMAP_USR + (e4 & 0x000FFFFFFFFFF000ULL));
+                uint64_t e3 = p3[(uva >> 30) & 0x1FF];
+                if (!(e3 & 1)) return 0;
+                uint64_t* p2 = reinterpret_cast<uint64_t*>(DMAP_USR + (e3 & 0x000FFFFFFFFFF000ULL));
+                uint64_t e2 = p2[(uva >> 21) & 0x1FF];
+                if (!(e2 & 1)) return 0;
+                if (e2 & (1ULL << 7))
+                    return (e2 & 0x000FFFFFFFE00000ULL) | (uva & 0x1FFFFFULL);
+                uint64_t* p1 = reinterpret_cast<uint64_t*>(DMAP_USR + (e2 & 0x000FFFFFFFFFF000ULL));
+                uint64_t e1 = p1[(uva >> 12) & 0x1FF];
+                if (!(e1 & 1)) return 0;
+                return (e1 & 0x000FFFFFFFFFF000ULL) | (uva & 0xFFF);
+            };
+
+            // Show physical pages for hash table and surrounding memory
+            ExcPutsRaw("  PHYS lumphash page: ");
+            ExcPutHex(readUserPhys(lumphashPtr) & ~0xFFFULL);
+            ExcPutsRaw("\n");
+            if (lumphashPtr + 0x1000 < lumphashPtr + numlumps * 8) {
+                ExcPutsRaw("  PHYS lumphash+4K page: ");
+                ExcPutHex(readUserPhys(lumphashPtr + 0x1000) & ~0xFFFULL);
+                ExcPutsRaw("\n");
+            }
+            ExcPutsRaw("  PHYS lumpinfo page: ");
+            ExcPutHex(readUserPhys(lumpinfoPtr) & ~0xFFFULL);
+            ExcPutsRaw("\n");
+        }
+    }
+
     brook::Process* proc = brook::ProcessCurrent();
     int signum = ExceptionToSignal(static_cast<uint8_t>(vector));
 
@@ -646,6 +1069,31 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
     }
 
     // No handler registered — print diagnostics and kill the process.
+    // For user-mode #PF, dump all GPRs first — critical for diagnosing
+    // stray RIPs / corrupted control flow after syscalls or signal returns.
+    if (vector == 14 && fromUser)
+    {
+        ExcForceSerialLock();
+        ExcPutsRaw("\n[PF] User #PF — full register dump:\n");
+        ExcPutsRaw("  RIP "); ExcPutHex(ef->rip);     ExcPutsRaw("\n");
+        ExcPutsRaw("  RSP "); ExcPutHex(ef->rsp);     ExcPutsRaw("\n");
+        ExcPutsRaw("  RAX "); ExcPutHex(ef->rax);     ExcPutsRaw("\n");
+        ExcPutsRaw("  RBX "); ExcPutHex(ef->rbx);     ExcPutsRaw("\n");
+        ExcPutsRaw("  RCX "); ExcPutHex(ef->rcx);     ExcPutsRaw("\n");
+        ExcPutsRaw("  RDX "); ExcPutHex(ef->rdx);     ExcPutsRaw("\n");
+        ExcPutsRaw("  RDI "); ExcPutHex(ef->rdi);     ExcPutsRaw("\n");
+        ExcPutsRaw("  RSI "); ExcPutHex(ef->rsi);     ExcPutsRaw("\n");
+        ExcPutsRaw("  RBP "); ExcPutHex(ef->rbp);     ExcPutsRaw("\n");
+        ExcPutsRaw("  R8  "); ExcPutHex(ef->r8);      ExcPutsRaw("\n");
+        ExcPutsRaw("  R9  "); ExcPutHex(ef->r9);      ExcPutsRaw("\n");
+        ExcPutsRaw("  R10 "); ExcPutHex(ef->r10);     ExcPutsRaw("\n");
+        ExcPutsRaw("  R11 "); ExcPutHex(ef->r11);     ExcPutsRaw("\n");
+        ExcPutsRaw("  R12 "); ExcPutHex(ef->r12);     ExcPutsRaw("\n");
+        ExcPutsRaw("  R13 "); ExcPutHex(ef->r13);     ExcPutsRaw("\n");
+        ExcPutsRaw("  R14 "); ExcPutHex(ef->r14);     ExcPutsRaw("\n");
+        ExcPutsRaw("  R15 "); ExcPutHex(ef->r15);     ExcPutsRaw("\n");
+    }
+
     InterruptFrame ifrm;
     ifrm.ip    = ef->rip;
     ifrm.cs    = ef->cs;
@@ -654,7 +1102,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
     ifrm.ss    = ef->ss;
     HandleException(static_cast<uint8_t>(vector), &ifrm, ef->errorCode, true, true /*swapgsDone*/);
     // HandleException never returns for user-mode faults (it exits the process).
-    for (;;) __asm__ volatile("cli; hlt");
+    for (;;) __asm__ volatile("cli; pause");
 }
 
 // ---- Exception stubs: no error code ----
@@ -832,7 +1280,9 @@ uint8_t IoApicRegisterHandler(uint8_t irq, uint8_t preferredVector, void* handle
 
 void IdtInstallHandler(uint8_t vector, void* handler)
 {
-    SetIdtEntry(vector, handler);
+    // Preserve the IST setting from the existing entry
+    uint8_t ist = g_idt[vector].ist;
+    SetIdtEntry(vector, handler, ist);
     __asm__ volatile("lidt %0" : : "m"(g_idtDesc));
 }
 
@@ -843,7 +1293,7 @@ void IdtInit(brook::Framebuffer* fb)
     // Exception handlers 0-31
     SetIdtEntry( 0, reinterpret_cast<void*>(ExceptionHandler0));
     SetIdtEntry( 1, reinterpret_cast<void*>(ExceptionHandler1));
-    SetIdtEntry( 2, reinterpret_cast<void*>(ExceptionHandler2));
+    SetIdtEntry( 2, reinterpret_cast<void*>(ExceptionHandler2), IST_NMI);
     SetIdtEntry( 3, reinterpret_cast<void*>(ExceptionHandler3));
     SetIdtEntry( 4, reinterpret_cast<void*>(ExceptionHandler4));
     SetIdtEntry( 5, reinterpret_cast<void*>(ExceptionHandler5));

@@ -34,6 +34,7 @@ def main():
         sys.exit(1)
 
     build_dir = sys.argv[1]
+    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.makedirs(build_dir, exist_ok=True)
     img_path = os.path.join(build_dir, "brook_disk.img")
 
@@ -82,10 +83,14 @@ def main():
 
         # BIN/ — copy any user-mode test binaries
         bin_names = ["hello_test", "hello_musl", "hello", "cowsay", "busybox",
-                     "syscheck", "stresstest", "echotest", "demo"]
+                     "syscheck", "stresstest", "echotest", "demo",
+                     "wavplay", "tone", "mp3play", "wayland_test"]
         # Search both <build_dir>/ and <build_dir>/user/ and <build_dir>/apps/ for binaries.
         bin_search_dirs = [build_dir, os.path.join(build_dir, "user"),
-                           os.path.join(build_dir, "apps")]
+                           os.path.join(build_dir, "apps"),
+                           os.path.join(root_dir, "tools", "wavplay"),
+                           os.path.join(root_dir, "tools", "mp3play"),
+                           os.path.join(root_dir, "tools")]
         def find_bin(name):
             for d in bin_search_dirs:
                 p = os.path.join(d, name)

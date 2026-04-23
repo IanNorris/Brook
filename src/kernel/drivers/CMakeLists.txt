@@ -31,3 +31,11 @@ add_driver_module(virtio_net
     "${BROOK_ROOT}/src/drivers/virtio_net/virtio_net_mod.cpp"
     EXTRA_FLAGS "-mgeneral-regs-only" "-mno-sse" "-mno-sse2" "-mfpmath="
 )
+
+add_driver_module(virtio_rng
+    "${BROOK_ROOT}/src/drivers/virtio_rng/virtio_rng_mod.cpp"
+)
+
+add_driver_module(intel_hda
+    "${BROOK_ROOT}/src/drivers/intel_hda/intel_hda_mod.cpp"
+)

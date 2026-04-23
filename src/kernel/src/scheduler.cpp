@@ -10,6 +10,7 @@
 #include "serial.h"
 #include "spinlock.h"
 #include "sched_ops.h"
+#include "profiler.h"
 
 #include <stdint.h>
 
@@ -490,6 +491,21 @@ void SchedulerUnblock(Process* proc)
     // Accept Blocked or Stopped processes for unblocking/resuming
     if (proc->state != ProcessState::Blocked && proc->state != ProcessState::Stopped)
     {
+        // If the process is still Running or Ready, it's in the window between
+        // setting pollWaiter (inside the socket spinlock) and calling
+        // SchedulerBlock.  Set pendingWakeup so the imminent SchedulerBlock
+        // returns immediately instead of sleeping.
+        //
+        // Running: process on another CPU, about to call SchedulerBlock.
+        // Ready:   process was preempted after releasing the socket spinlock
+        //          but before reaching SchedulerBlock; when it next runs it
+        //          will call SchedulerBlock and must not block.
+        //
+        // This mirrors the KMutexUnlock pattern which sets pendingWakeup
+        // directly before calling SchedulerUnblock.
+        if (proc->state == ProcessState::Running ||
+            proc->state == ProcessState::Ready)
+            __atomic_store_n(&proc->pendingWakeup, 1, __ATOMIC_RELEASE);
         SchedLockRelease(g_readyLock, rlf4);
         return;
     }
@@ -703,6 +719,7 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
         for (;;) __asm__ volatile("hlt");
     }
 
+    ProfilerContextSwitch(oldProc->pid, newProc->pid);
     context_switch(&oldProc->savedCtx, &newProc->savedCtx,
                    &oldProc->fxsave, &newProc->fxsave);
 
@@ -746,6 +763,10 @@ void SchedulerTimerTick()
     Process* cur = g_perCpu[cpu].currentProcess;
     if (!cur)
         return;
+
+    // CPU time accounting: charge one tick to the running process.
+    if (cur != g_perCpu[cpu].idleProcess)
+        cur->userTicks++;
 
     // Idle — if something became ready, switch to it.
     if (cur == g_perCpu[cpu].idleProcess)
@@ -844,9 +865,15 @@ void SchedulerYield()
 {
     uint32_t cpu = ThisCpu();
     Process* proc = g_perCpu[cpu].currentProcess;
-    SerialPrintf("SCHED: '%s' (pid %u, tgid %u) exited with status %d%s\n",
-                 proc->name, proc->pid, proc->tgid, status,
-                 proc->isThread ? " [thread]" : "");
+    if (status != 0) {
+        SerialPrintf("SCHED: '%s' (pid %u, tgid %u) exited with status %d%s\n",
+                     proc->name, proc->pid, proc->tgid, status,
+                     proc->isThread ? " [thread]" : "");
+    } else {
+        DbgPrintf("SCHED: '%s' (pid %u, tgid %u) exited with status %d%s\n",
+                  proc->name, proc->pid, proc->tgid, status,
+                  proc->isThread ? " [thread]" : "");
+    }
 
     // Thread exit: clear_child_tid + futex_wake for pthread_join
     if (proc->clearChildTid)
@@ -887,7 +914,11 @@ void SchedulerYield()
 
     // Wake the parent process if it's blocked (likely in wait4).
     // Also send SIGCHLD to the parent.
-    if (proc->parentPid != 0)
+    // Threads (isThread=true) do NOT send SIGCHLD — only process exits do.
+    // In Linux, SIGCHLD is sent when the thread group leader exits, not
+    // individual threads. Threads only wake their leader via futex on
+    // clear_child_tid (handled above).
+    if (!proc->isThread && proc->parentPid != 0)
     {
         uint64_t alf = SchedLockAcquire(g_allProcLock);
         for (uint32_t i = 0; i < g_processCount; i++)
@@ -934,6 +965,7 @@ parent_done:
     // and this kernel stack is no longer in use.
     g_perCpu[cpu].pendingRetire = proc;
 
+    ProfilerContextSwitch(proc->pid, next->pid);
     context_switch(&proc->savedCtx, &next->savedCtx,
                    &proc->fxsave, &next->fxsave);
 
@@ -1138,6 +1170,44 @@ uint16_t SchedulerAllocPid()
     return g_nextPid++;
 }
 
+// Mark all threads in a thread group (same tgid) as terminated so they are
+// reaped without running.  Called by sys_exit_group before the calling thread
+// calls SchedulerExitCurrentProcess.  Threads that are currently running on
+// another CPU will be caught by the scheduler at the next timer tick.
+void SchedulerKillThreadGroup(uint16_t tgid, Process* caller)
+{
+    Process* targets[MAX_PROCESSES];
+    uint32_t count = 0;
+
+    uint64_t alf = SchedLockAcquire(g_allProcLock);
+    for (uint32_t i = 0; i < g_processCount; ++i)
+    {
+        Process* p = g_allProcesses[i];
+        if (p && p != caller && p->tgid == tgid
+            && p->state != ProcessState::Terminated)
+        {
+            if (count < MAX_PROCESSES) targets[count++] = p;
+        }
+    }
+    SchedLockRelease(g_allProcLock, alf);
+
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        Process* p = targets[i];
+        p->state     = ProcessState::Terminated;
+        p->exitStatus = 128 + 9; // SIGKILL
+        // Threads that are not yet reapable will be reaped by the scheduler
+        // once they stop running.  Set reapable only if they are not
+        // currently executing on a CPU.
+        if (__atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) < 0)
+            __atomic_store_n(&p->reapable, true, __ATOMIC_RELEASE);
+        SerialPrintf("SCHED: exit_group killing thread pid=%u tgid=%u\n",
+                     p->pid, p->tgid);
+    }
+}
+
+
+
 Process* SchedulerFindTerminatedChild(uint16_t parentPid, int64_t pid)
 {
     uint64_t alf = SchedLockAcquire(g_allProcLock);
@@ -1200,6 +1270,8 @@ uint32_t SchedulerSnapshotProcesses(ProcessSnapshot* out, uint32_t maxCount)
         s.stackBase = p->stackBase;
         s.stackTop = p->stackTop;
         s.programBreak = p->programBreak;
+        s.userTicks = p->userTicks;
+        s.sysTicks = p->sysTicks;
         uint32_t j = 0;
         for (; j < 31 && p->name[j]; ++j)
             s.name[j] = p->name[j];
@@ -1321,6 +1393,18 @@ bool SchedulerSwitchPolicy(const char* name)
 const char* SchedulerPolicyName()
 {
     return g_schedOps ? g_schedOps->name : "none";
+}
+
+// Panic-safe process enumeration — no locks, assumes all other CPUs halted.
+uint32_t PanicGetProcessCount()
+{
+    return g_processCount;
+}
+
+Process* PanicGetProcess(uint32_t index)
+{
+    if (index >= g_processCount) return nullptr;
+    return g_allProcesses[index];
 }
 
 } // namespace brook

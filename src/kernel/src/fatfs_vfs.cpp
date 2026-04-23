@@ -515,6 +515,7 @@ static const VfsFsOps g_fatFsOps = {
     .rename     = FatFsRename,
     .symlink    = nullptr,
     .readlink   = nullptr,
+    .sync       = nullptr,
 };
 
 // ---- Public init ----

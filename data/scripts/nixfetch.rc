@@ -1,0 +1,3 @@
+# Brook OS — Nix package download test
+# Downloads 'which' from cache.nixos.org, extracts, and runs it
+run --strace /nix/bin/nix-fetch qnnigprif5vrj9c0bkpj6w0nd46fm3mm

@@ -31,6 +31,7 @@ extern "C" brook::KernelSymbol __stop_ksymtab[];
 #include "idt.h"
 #include "apic.h"
 #include "net.h"
+#include "audio.h"
 
 // Bring all brook:: names into scope so EXPORT_SYMBOL(fn) resolves correctly.
 using namespace brook;
@@ -100,6 +101,7 @@ EXPORT_SYMBOL(PciEnableMemSpace);
 EXPORT_SYMBOL(PciConfigRead32);
 EXPORT_SYMBOL(PciConfigRead16);
 EXPORT_SYMBOL(PciConfigRead8);
+EXPORT_SYMBOL(PciConfigWrite16);
 
 // Display
 EXPORT_SYMBOL(DisplayRegister);
@@ -145,6 +147,7 @@ EXPORT_SYMBOL(InputWakeWaiters);
 EXPORT_SYMBOL(SchedulerRegisterPolicy);
 EXPORT_SYMBOL(SchedulerBlock);
 EXPORT_SYMBOL(SchedulerUnblock);
+EXPORT_SYMBOL(SchedulerYield);
 
 // Process
 EXPORT_SYMBOL(ProcessCurrent);
@@ -165,6 +168,9 @@ EXPORT_SYMBOL(NetRegisterIf);
 EXPORT_SYMBOL(NetReceive);
 EXPORT_SYMBOL_NAMED(NetRegisterIf, "_ZN5brook13NetRegisterIfEPNS_5NetIfE");
 EXPORT_SYMBOL_NAMED(NetReceive,    "_ZN5brook10NetReceiveEPNS_5NetIfEPKvj");
+
+// Audio
+EXPORT_SYMBOL(AudioRegister);
 
 namespace brook {
 

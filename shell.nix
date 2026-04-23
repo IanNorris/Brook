@@ -40,6 +40,7 @@ pkgs.mkShellNoCC {
     # Runtime / testing
     pkgs.qemu
     pkgs.OVMF
+    pkgs.vde2            # vde_switch + slirpvde for VM<->VM networking
 
     # Dev tools
     llvm.clang-tools      # clangd, clang-tidy, clang-format
@@ -51,6 +52,9 @@ pkgs.mkShellNoCC {
     # Storage image creation (build-time FAT32 ramdisk image for VFS tests)
     pkgs.mtools
     pkgs.dosfstools
+    pkgs.e2fsprogs        # debugfs for ext2 disk images
+    pkgs.e2fsprogs.fuse2fs # fuse2fs for mounting ext2 images without sudo
+    pkgs.fuse             # fusermount for fuse2fs
   ];
 
   shellHook = ''

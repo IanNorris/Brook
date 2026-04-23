@@ -36,7 +36,7 @@ void SchedulerUnblock(Process* proc);
 void SchedulerTimerTick();
 
 // Yield the current timeslice voluntarily.
-void SchedulerYield();
+extern "C" void SchedulerYield();
 
 // Trampoline for kernel threads — drains requeue, enables interrupts,
 // reads fn/arg from the kernel stack, and calls fn(arg).
@@ -50,6 +50,7 @@ void KernelThreadTrampoline();
 
 // Terminate the current process and reschedule. Never returns.
 [[noreturn]] void SchedulerExitCurrentProcess(int status);
+void SchedulerKillThreadGroup(uint16_t tgid, Process* caller);
 
 // Get the current process running on this CPU (nullptr if none).
 Process* SchedulerCurrentProcess();
@@ -81,6 +82,8 @@ struct ProcessSnapshot {
     uint64_t stackTop;
     uint64_t programBreak;
     int32_t runningOnCpu;
+    uint64_t userTicks;
+    uint64_t sysTicks;
 };
 
 // Take a snapshot of all processes.  Fills `out` with up to `maxCount` entries.
@@ -97,5 +100,9 @@ bool SchedulerSwitchPolicy(const char* name);
 
 // Get the name of the currently active scheduling policy.
 const char* SchedulerPolicyName();
+
+// Panic-safe process enumeration — no locks, assumes all other CPUs halted.
+uint32_t PanicGetProcessCount();
+Process* PanicGetProcess(uint32_t index);
 
 } // namespace brook

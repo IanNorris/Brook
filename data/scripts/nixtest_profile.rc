@@ -1,0 +1,7 @@
+# Brook OS — nix-install cowsay with sampling profiler active
+# Run with: scripts/run-qemu.sh --release --script nixtest_profile
+# Serial output (including profiler data) is saved to /tmp/brook_serial.log
+# Post-process with: python3 scripts/profiler_to_speedscope.py /tmp/brook_serial.log > profile.json
+# Then open profile.json at https://speedscope.app
+profile 60000
+run /nix/bin/nix-install cowsay

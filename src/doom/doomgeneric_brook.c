@@ -39,6 +39,10 @@ static unsigned int s_PositionY = 0;
 static unsigned int s_ScreenWidth = 0;
 static unsigned int s_ScreenHeight = 0;
 
+// Expose actual VFB dimensions for I_InitGraphics to use
+unsigned int DG_FbWidth = 0;
+unsigned int DG_FbHeight = 0;
+
 static unsigned char convertToDoomKey(unsigned char scancode)
 {
     unsigned char key = 0;
@@ -138,6 +142,8 @@ void DG_Init()
 
         s_ScreenWidth = vinfo.xres;
         s_ScreenHeight = vinfo.yres;
+        DG_FbWidth = vinfo.xres;
+        DG_FbHeight = vinfo.yres;
 
         // Center DOOM's 640x400 output on the screen
         if (s_ScreenWidth > DOOMGENERIC_RESX)
@@ -209,11 +215,15 @@ void DG_DrawFrame()
 {
     if (FrameBuffer)
     {
-        for (int i = 0; i < DOOMGENERIC_RESY; ++i)
+        // Use actual VFB dimensions, not DOOMGENERIC_RESX/RESY
+        unsigned int copyW = (DG_FbWidth > 0) ? DG_FbWidth : DOOMGENERIC_RESX;
+        unsigned int copyH = (DG_FbHeight > 0) ? DG_FbHeight : DOOMGENERIC_RESY;
+
+        for (unsigned int i = 0; i < copyH; ++i)
         {
             memcpy(FrameBuffer + s_PositionX + (i + s_PositionY) * s_ScreenWidth,
-                   DG_ScreenBuffer + i * DOOMGENERIC_RESX,
-                   DOOMGENERIC_RESX * 4);
+                   DG_ScreenBuffer + i * copyW,
+                   copyW * 4);
         }
 
         // Signal compositor that this framebuffer has new content.

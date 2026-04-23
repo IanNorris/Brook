@@ -30,6 +30,8 @@
 #include "klog.h"
 #include "profiler.h"
 #include "module.h"
+#include "audio.h"
+#include "debug_overlay.h"
 
 // Strace control (defined in syscall.cpp)
 bool StraceEnablePid(uint32_t pid, bool enable);
@@ -52,6 +54,8 @@ static uint32_t g_gridRows  = 0;
 static uint8_t  g_scale     = 3;    // Default downscale factor
 static uint32_t g_vfbWidth  = 640;  // Default VFB dimensions
 static uint32_t g_vfbHeight = 400;
+static int32_t  g_winX     = -1;   // -1 = auto-cascade
+static int32_t  g_winY     = -1;
 static bool     g_ttyFull   = false; // When true, skip VFB for spawned processes
 
 // Track spawned process count for auto-tiling placement
@@ -63,11 +67,18 @@ static bool g_scriptMode = false;
 // Default environment for spawned processes
 static const char* g_defaultEnvp[] = {
     "HOME=/",
-    "PATH=/boot/BIN:/boot/bin:/usr/bin:/bin",
+    "PATH=/nix/profile/bin:/nix/bin:"
+          "/nix/store/xkqd49dmldkqn4xk6dlm640f5blbv6hp-curl-8.18.0-bin/bin:"
+          "/nix/store/g6mlwdvpg92rchq352ll7jbi0pz7h43r-xz-5.8.2-bin/bin:"
+          "/nix/store/v8sa6r6q037ihghxfbwzjj4p59v2x0pv-bash-5.3p9/bin:"
+          "/boot/BIN:/boot/bin:/usr/bin:/bin",
     "TERM=linux",
     "SHELL=/boot/BIN/BASH",
     "USER=root",
     "LOGNAME=root",
+    "SSL_CERT_FILE=/nix/store/mg063aj0crwhchqayf2qbyf28k6mlrxm-nss-cacert-3.121/etc/ssl/certs/ca-bundle.crt",
+    "CURL_CA_BUNDLE=/nix/store/mg063aj0crwhchqayf2qbyf28k6mlrxm-nss-cacert-3.121/etc/ssl/certs/ca-bundle.crt",
+    "NETSURFRES=/nix/store/m64fp6340nd6s98fawnwvvkx4v81660k-netsurf-brook-3.11-brook/share/netsurf/",
     nullptr
 };
 
@@ -154,7 +165,7 @@ static uint8_t* LoadElf(const char* path, uint64_t* outSize)
     Vnode* vn = VfsOpen(path, 0);
     if (!vn) return nullptr;
 
-    constexpr uint64_t MAX_ELF_SIZE = 2 * 1024 * 1024;
+    constexpr uint64_t MAX_ELF_SIZE = 32 * 1024 * 1024;
     constexpr uint64_t ELF_BUF_PAGES = MAX_ELF_SIZE / 4096;
 
     VirtualAddress bufAddr = VmmAllocPages(ELF_BUF_PAGES,
@@ -182,7 +193,7 @@ static uint8_t* LoadElf(const char* path, uint64_t* outSize)
 
 static void FreeElfBuffer(uint8_t* buf)
 {
-    constexpr uint64_t MAX_ELF_SIZE = 2 * 1024 * 1024;
+    constexpr uint64_t MAX_ELF_SIZE = 32 * 1024 * 1024;
     constexpr uint64_t ELF_BUF_PAGES = MAX_ELF_SIZE / 4096;
     VmmFreePages(VirtualAddress(reinterpret_cast<uint64_t>(buf)), ELF_BUF_PAGES);
 }
@@ -247,6 +258,54 @@ static bool ResolveBinaryPath(const char* name, char* outPath, uint32_t maxLen)
 }
 
 // ---------------------------------------------------------------------------
+// Shebang resolution — peek first bytes of a file; if "#!interp [arg]\n",
+// copy interpreter and optional argument into caller buffers. Returns true
+// if a shebang was present and parsed.
+// ---------------------------------------------------------------------------
+
+static bool PeekShebang(const char* path, char* outInterp, uint32_t interpSize,
+                        char* outArg, uint32_t argSize)
+{
+    Vnode* vn = VfsOpen(path, 0);
+    if (!vn) return false;
+
+    char header[256] = {};
+    uint64_t offset = 0;
+    int n = VfsRead(vn, reinterpret_cast<uint8_t*>(header), sizeof(header) - 1, &offset);
+    VfsClose(vn);
+    if (n < 4 || header[0] != '#' || header[1] != '!') return false;
+
+    // Skip leading whitespace after "#!"
+    int i = 2;
+    while (i < n && (header[i] == ' ' || header[i] == '\t')) ++i;
+
+    // Interpreter path runs until whitespace or newline
+    uint32_t j = 0;
+    while (i < n && header[i] != ' ' && header[i] != '\t'
+           && header[i] != '\n' && header[i] != '\r'
+           && j + 1 < interpSize)
+    {
+        outInterp[j++] = header[i++];
+    }
+    outInterp[j] = '\0';
+    if (j == 0) return false;
+
+    // Optional single argument — everything up to newline (preserving spaces).
+    // Traditional Unix: only ONE argument allowed; remaining text is one string.
+    outArg[0] = '\0';
+    while (i < n && (header[i] == ' ' || header[i] == '\t')) ++i;
+    uint32_t k = 0;
+    while (i < n && header[i] != '\n' && header[i] != '\r' && k + 1 < argSize)
+    {
+        outArg[k++] = header[i++];
+    }
+    // Strip trailing whitespace
+    while (k > 0 && (outArg[k-1] == ' ' || outArg[k-1] == '\t')) --k;
+    outArg[k] = '\0';
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Spawn a process from a binary path with arguments
 // ---------------------------------------------------------------------------
 
@@ -305,9 +364,12 @@ static Process* SpawnProcess(const char* path, int argc, const char* const* argv
         if (WmIsActive())
         {
             // WM mode: create a window for this process
-            // Default window position: cascade from top-left
-            int16_t winX = static_cast<int16_t>(40 + (g_spawnCount % 8) * 30);
-            int16_t winY = static_cast<int16_t>(40 + (g_spawnCount % 8) * 30);
+            int16_t winX = (g_winX >= 0) ? static_cast<int16_t>(g_winX)
+                         : static_cast<int16_t>(40 + (g_spawnCount % 8) * 30);
+            int16_t winY = (g_winY >= 0) ? static_cast<int16_t>(g_winY)
+                         : static_cast<int16_t>(40 + (g_spawnCount % 8) * 30);
+            g_winX = -1;  // Reset after use
+            g_winY = -1;
             uint16_t vfbW = static_cast<uint16_t>(g_vfbWidth);
             uint16_t vfbH = static_cast<uint16_t>(g_vfbHeight);
             uint8_t upscale = g_scale;
@@ -386,6 +448,69 @@ static void CmdPs();
 static void CmdMem();
 static void CmdLs(int argc, const char* const* argv);
 
+// Background wallpaper loader thread — reads ~8MB WALLPAPER.RAW without
+// blocking the shell/WM init path.
+static void WallpaperLoaderThread(void* /*arg*/)
+{
+    using namespace brook;
+
+    VnodeStat st;
+    if (VfsStatPath("/boot/WALLPAPER.RAW", &st) != 0 || st.size <= 8)
+    {
+        KLog("wallpaper: file not found or too small");
+        return;
+    }
+
+    auto* pixels = static_cast<uint32_t*>(kmalloc(st.size));
+    if (!pixels)
+    {
+        KLog("wallpaper: alloc failed (%llu bytes)", st.size);
+        return;
+    }
+
+    Vnode* vn = VfsOpen("/boot/WALLPAPER.RAW", 0);
+    if (!vn)
+    {
+        kfree(pixels);
+        KLog("wallpaper: open failed");
+        return;
+    }
+
+    uint64_t off = 0;
+    uint64_t remaining = st.size;
+    auto* dest = reinterpret_cast<uint8_t*>(pixels);
+    while (remaining > 0)
+    {
+        uint64_t chunk = remaining > 65536 ? 65536 : remaining;
+        int rd = VfsRead(vn, dest + off, chunk, &off);
+        if (rd <= 0) break;
+        remaining -= rd;
+    }
+    VfsClose(vn);
+
+    if (remaining != 0)
+    {
+        kfree(pixels);
+        KLog("wallpaper: read error");
+        return;
+    }
+
+    uint32_t wpW = pixels[0];
+    uint32_t wpH = pixels[1];
+    uint64_t expected = 8 + static_cast<uint64_t>(wpW) * wpH * 4;
+    if (st.size == expected && wpW > 0 && wpH > 0
+        && wpW <= 3840 && wpH <= 2160)
+    {
+        CompositorSetWallpaper(pixels + 2, wpW, wpH);
+        KLog("wallpaper: loaded (%ux%u)", wpW, wpH);
+    }
+    else
+    {
+        kfree(pixels);
+        KLog("wallpaper: bad header (%ux%u, size %llu)", wpW, wpH, st.size);
+    }
+}
+
 static int ExecCommand(int argc, const char* const* argv)
 {
     if (argc == 0) return 0;
@@ -460,58 +585,28 @@ static int ExecCommand(int argc, const char* const* argv)
             WmSetActive(true);
             g_ttyFull = false; // WM takes over the screen
 
-            // Try to load wallpaper from disk
-            using namespace brook;
-            VnodeStat st;
-            if (VfsStatPath("/boot/WALLPAPER.RAW", &st) == 0 && st.size > 8)
+            // Suppress TTY framebuffer rendering — the kernel console WM window
+            // handles log display, and TTY writes would briefly flash under the
+            // compositor each frame.
+            TtySuppressDisplay(true);
+
+            // Load wallpaper asynchronously so WM startup isn't blocked.
             {
-                auto* pixels = static_cast<uint32_t*>(kmalloc(st.size));
-                if (pixels)
-                {
-                    Vnode* vn = VfsOpen("/boot/WALLPAPER.RAW", 0);
-                    if (vn)
-                    {
-                        uint64_t off = 0;
-                        uint64_t remaining = st.size;
-                        auto* dest = reinterpret_cast<uint8_t*>(pixels);
-                        while (remaining > 0)
-                        {
-                            uint64_t chunk = remaining > 65536 ? 65536 : remaining;
-                            int rd = VfsRead(vn, dest + off, chunk, &off);
-                            if (rd <= 0) break;
-                            remaining -= rd;
-                        }
-                        VfsClose(vn);
-                        if (remaining == 0)
-                        {
-                            // First 8 bytes: uint32_t width, uint32_t height
-                            uint32_t wpW = pixels[0];
-                            uint32_t wpH = pixels[1];
-                            uint64_t expected = 8 + (uint64_t)wpW * wpH * 4;
-                            if (st.size == expected && wpW > 0 && wpH > 0
-                                && wpW <= 3840 && wpH <= 2160)
-                            {
-                                // Pixel data starts at offset 2 (after header)
-                                CompositorSetWallpaper(pixels + 2, wpW, wpH);
-                                KPrintf("wallpaper: loaded (%ux%u)\n", wpW, wpH);
-                            }
-                            else
-                            {
-                                kfree(pixels);
-                                KPrintf("wallpaper: bad header (%ux%u, size %llu)\n",
-                                        wpW, wpH, st.size);
-                            }
-                        }
-                        else
-                        {
-                            kfree(pixels);
-                            KPrintf("wallpaper: read error\n");
-                        }
-                    }
-                }
+                using namespace brook;
+                Process* wpThread = KernelThreadCreate("wp_loader",
+                    WallpaperLoaderThread, nullptr);
+                if (wpThread)
+                    SchedulerAddProcess(wpThread);
             }
 
             KPrintf("window manager: enabled\n");
+
+            // Spawn kernel console window (shows kernel log in a WM window).
+            KernelConsoleSpawn();
+
+            // Spawn TCP debug server (streams kernel log on port 1234).
+            DebugTcpSpawn();
+
             return 0;
         }
 
@@ -565,6 +660,18 @@ static int ExecCommand(int argc, const char* const* argv)
                 g_vfbHeight = h;
                 KPrintf("vfb: %ux%u\n", w, h);
             }
+        }
+        else if (StrEq(argv[1], "pos"))
+        {
+            // Parse "XxY" or "X,Y" format for window position
+            const char* val = argv[2];
+            int32_t x = static_cast<int32_t>(ParseUint(val));
+            while (*val && *val != 'x' && *val != 'X' && *val != ',') ++val;
+            if (*val) ++val;
+            int32_t y = static_cast<int32_t>(ParseUint(val));
+            g_winX = x;
+            g_winY = y;
+            KPrintf("pos: %d,%d\n", x, y);
         }
         else if (StrEq(argv[1], "tty"))
         {
@@ -671,19 +778,63 @@ static int ExecCommand(int argc, const char* const* argv)
             return -1;
         }
 
+        // Build the effective argv starting from the user's args.
+        const char* effArgv[32];
+        int effArgc = argc - pathIdx;
+        if (effArgc > 32) effArgc = 32;
+        for (int i = 0; i < effArgc; ++i) effArgv[i] = argv[pathIdx + i];
+        effArgv[0] = resolved;
+
+        // Shebang unwinding: up to 4 levels of script-invoking-script.
+        static char shebangPath[128];
+        static char interpStore[4][128];
+        static char interpArgStore[4][128];
+        StrCopy(shebangPath, resolved, sizeof(shebangPath));
+
+        for (int depth = 0; depth < 4; ++depth)
+        {
+            char interp[128];
+            char interpArg[128];
+            if (!PeekShebang(shebangPath, interp, sizeof(interp),
+                             interpArg, sizeof(interpArg)))
+                break;
+
+            if (!ResolveBinaryPath(interp, interpStore[depth],
+                                   sizeof(interpStore[depth])))
+            {
+                KPrintf("shell: interpreter '%s' not found (for %s)\n",
+                        interp, shebangPath);
+                return -1;
+            }
+            StrCopy(interpArgStore[depth], interpArg,
+                    sizeof(interpArgStore[depth]));
+
+            const char* nArgv[32];
+            int nArgc = 0;
+            nArgv[nArgc++] = interpStore[depth];
+            if (interpArgStore[depth][0] && nArgc < 31)
+                nArgv[nArgc++] = interpArgStore[depth];
+            if (nArgc < 31) nArgv[nArgc++] = shebangPath;
+            for (int i = 1; i < effArgc && nArgc < 31; ++i)
+                nArgv[nArgc++] = effArgv[i];
+
+            for (int i = 0; i < nArgc; ++i) effArgv[i] = nArgv[i];
+            effArgc = nArgc;
+            StrCopy(shebangPath, interpStore[depth], sizeof(shebangPath));
+        }
+
         Process* proc = nullptr;
         if (argv0Override)
         {
-            const int newArgc = argc - pathIdx;
             const char* newArgv[32];
             newArgv[0] = argv0Override;
-            for (int i = 1; i < newArgc && i < 31; ++i)
-                newArgv[i] = argv[pathIdx + i];
-            proc = SpawnProcess(resolved, newArgc, newArgv);
+            for (int i = 1; i < effArgc && i < 31; ++i)
+                newArgv[i] = effArgv[i];
+            proc = SpawnProcess(shebangPath, effArgc, newArgv);
         }
         else
         {
-            proc = SpawnProcess(resolved, argc - pathIdx, argv + pathIdx);
+            proc = SpawnProcess(shebangPath, effArgc, effArgv);
         }
 
         if (proc && strace) {
@@ -738,6 +889,66 @@ static int ExecCommand(int argc, const char* const* argv)
     {
         const char* msg = (argc >= 2) ? argv[1] : "deliberate test panic";
         KernelPanic("SHELL: %s\n", msg);
+    }
+
+    // Built-in: crashtest <mode> — trigger specific kernel crash types
+    if (StrEq(cmd, "crashtest"))
+    {
+        const char* mode = (argc >= 2) ? argv[1] : nullptr;
+        if (!mode || StrEq(mode, "help"))
+        {
+            SerialPuts("crashtest modes:\n"
+                       "  panic       — KernelPanic() with message\n"
+                       "  nullptr     — kernel NULL pointer dereference (#PF)\n"
+                       "  divzero     — kernel divide by zero (#DE)\n"
+                       "  gpf         — trigger #GP via invalid MSR write\n"
+                       "  stackoverflow — kernel stack overflow via recursion\n"
+                       "  ud          — undefined opcode (#UD)\n"
+                       "  doublefault — corrupt RSP to trigger double fault\n");
+            return 0;
+        }
+        if (StrEq(mode, "panic"))
+        {
+            KernelPanic("crashtest: deliberate kernel panic");
+        }
+        else if (StrEq(mode, "nullptr"))
+        {
+            // Write to an unmapped kernel-space address — guaranteed to fault.
+            // 0xFFFFFF0000000000 is in the higher half but well outside our mappings.
+            volatile int* p = reinterpret_cast<volatile int*>(0xFFFFFF0000000000ULL);
+            *p = 42;
+        }
+        else if (StrEq(mode, "divzero"))
+        {
+            volatile int a = 1, b = 0;
+            *(volatile int*)&a = a / b;
+        }
+        else if (StrEq(mode, "gpf"))
+        {
+            // Write to an invalid MSR — triggers #GP
+            __asm__ volatile("wrmsr" :: "c"(0xDEAD), "a"(0), "d"(0));
+        }
+        else if (StrEq(mode, "stackoverflow"))
+        {
+            // Use a simple recursive function pointer to eat stack
+            typedef void (*RecurseFn)(volatile int);
+            static RecurseFn g_recurse;
+            g_recurse = [](volatile int d) __attribute__((noinline)) {
+                volatile char buf[4096];
+                buf[0] = (char)d;
+                g_recurse(d + 1);
+            };
+            g_recurse(0);
+        }
+        else if (StrEq(mode, "ud"))
+        {
+            __asm__ volatile("ud2");
+        }
+        else
+        {
+            SerialPuts("crashtest: unknown mode\n");
+        }
+        return 0;
     }
 
     // Built-in: log — dump kernel log
@@ -815,6 +1026,99 @@ static int ExecCommand(int argc, const char* const* argv)
     {
         ModuleDump();
         return 0;
+    }
+
+    // Built-in: beep [freq] [ms] — play a sine wave tone via HDA audio
+    if (StrEq(cmd, "beep"))
+    {
+        if (!AudioAvailable())
+        {
+            KPrintf("No audio driver registered\n");
+            return -1;
+        }
+
+        uint32_t freq = 440;    // A4 by default
+        uint32_t durationMs = 500;
+
+        if (argc >= 2) {
+            const char* s = argv[1]; freq = 0;
+            while (*s >= '0' && *s <= '9') freq = freq * 10 + (*s++ - '0');
+        }
+        if (argc >= 3) {
+            const char* s = argv[2]; durationMs = 0;
+            while (*s >= '0' && *s <= '9') durationMs = durationMs * 10 + (*s++ - '0');
+        }
+        if (freq < 20) freq = 20;
+        if (freq > 20000) freq = 20000;
+        if (durationMs > 10000) durationMs = 10000;
+
+        // Generate 16-bit mono PCM at 48000 Hz
+        constexpr uint32_t sampleRate = 48000;
+        uint32_t numSamples = (sampleRate * durationMs) / 1000;
+        uint32_t bufSize = numSamples * 2; // 16-bit = 2 bytes per sample
+
+        // Sine approximation lookup table (256 entries, Q15 format)
+        // sin(i * 2π / 256) * 32767
+        static const int16_t sinTable[256] = {
+                 0,    804,   1608,   2410,   3212,   4011,   4808,   5602,
+              6393,   7179,   7962,   8739,   9512,  10278,  11039,  11793,
+             12539,  13279,  14010,  14732,  15446,  16151,  16846,  17530,
+             18204,  18868,  19519,  20159,  20787,  21403,  22005,  22594,
+             23170,  23731,  24279,  24811,  25329,  25832,  26319,  26790,
+             27245,  27683,  28105,  28510,  28898,  29268,  29621,  29956,
+             30273,  30571,  30852,  31113,  31356,  31580,  31785,  31971,
+             32137,  32285,  32412,  32521,  32609,  32678,  32728,  32757,
+             32767,  32757,  32728,  32678,  32609,  32521,  32412,  32285,
+             32137,  31971,  31785,  31580,  31356,  31113,  30852,  30571,
+             30273,  29956,  29621,  29268,  28898,  28510,  28105,  27683,
+             27245,  26790,  26319,  25832,  25329,  24811,  24279,  23731,
+             23170,  22594,  22005,  21403,  20787,  20159,  19519,  18868,
+             18204,  17530,  16846,  16151,  15446,  14732,  14010,  13279,
+             12539,  11793,  11039,  10278,   9512,   8739,   7962,   7179,
+              6393,   5602,   4808,   4011,   3212,   2410,   1608,    804,
+                 0,   -804,  -1608,  -2410,  -3212,  -4011,  -4808,  -5602,
+             -6393,  -7179,  -7962,  -8739,  -9512, -10278, -11039, -11793,
+            -12539, -13279, -14010, -14732, -15446, -16151, -16846, -17530,
+            -18204, -18868, -19519, -20159, -20787, -21403, -22005, -22594,
+            -23170, -23731, -24279, -24811, -25329, -25832, -26319, -26790,
+            -27245, -27683, -28105, -28510, -28898, -29268, -29621, -29956,
+            -30273, -30571, -30852, -31113, -31356, -31580, -31785, -31971,
+            -32137, -32285, -32412, -32521, -32609, -32678, -32728, -32757,
+            -32767, -32757, -32728, -32678, -32609, -32521, -32412, -32285,
+            -32137, -31971, -31785, -31580, -31356, -31113, -30852, -30571,
+            -30273, -29956, -29621, -29268, -28898, -28510, -28105, -27683,
+            -27245, -26790, -26319, -25832, -25329, -24811, -24279, -23731,
+            -23170, -22594, -22005, -21403, -20787, -20159, -19519, -18868,
+            -18204, -17530, -16846, -16151, -15446, -14732, -14010, -13279,
+            -12539, -11793, -11039, -10278,  -9512,  -8739,  -7962,  -7179,
+             -6393,  -5602,  -4808,  -4011,  -3212,  -2410,  -1608,   -804,
+        };
+
+        // Cap buffer at 64KB (HDA buffer limit)
+        if (bufSize > 65536) bufSize = 65536;
+        numSamples = bufSize / 2;
+
+        auto* buf = static_cast<int16_t*>(kmalloc(bufSize));
+        if (!buf) { KPrintf("Out of memory\n"); return -1; }
+
+        // Generate sine wave using fixed-point phase accumulator
+        // phase is 24.8 fixed point into the 256-entry table
+        uint32_t phaseInc = (freq * 256 * 256) / sampleRate;
+        uint32_t phase = 0;
+        for (uint32_t i = 0; i < numSamples; i++)
+        {
+            uint8_t idx = (phase >> 8) & 0xFF;
+            buf[i] = sinTable[idx] / 2; // -16383..16383 (50% volume)
+            phase += phaseInc;
+        }
+
+        KPrintf("Playing %u Hz for %u ms (%u samples)\n", freq, durationMs, numSamples);
+        int ret = AudioPlay(buf, bufSize, sampleRate, 1, 16);
+        if (ret < 0)
+            KPrintf("AudioPlay failed: %d\n", ret);
+
+        kfree(buf);
+        return ret >= 0 ? 0 : -1;
     }
 
     // Built-in: sched [policy_name] — show or switch scheduler policy
@@ -921,6 +1225,7 @@ static void CmdHelp()
     KPrintf("  set grid <CxR>     Set process grid layout\n");
     KPrintf("  set scale <N>      Set compositor downscale\n");
     KPrintf("  set vfb <WxH>      Set VFB dimensions\n");
+    KPrintf("  set pos <X,Y>      Set next window position\n");
     KPrintf("  clear              Clear screen\n");
     KPrintf("  shutdown           Power off\n");
     KPrintf("  reboot             Reboot\n");

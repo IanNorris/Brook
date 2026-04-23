@@ -16,6 +16,7 @@
 #include "smp.h"
 #include "rtc.h"
 #include "apic.h"
+#include "vfs.h"
 
 // External C functions used by debug channel
 extern "C" void MouseGetPosition(int32_t*, int32_t*);
@@ -28,6 +29,10 @@ namespace brook {
 // Global state
 // ---------------------------------------------------------------------------
 
+static NetIf* g_netIfs[NET_MAX_IFS] = {};
+static uint32_t g_netIfCount = 0;
+// Back-compat alias used by legacy single-NIC code paths below. Points at
+// g_netIfs[0] (the primary / default-route interface).
 static NetIf* g_netIf = nullptr;
 
 // ARP cache — small fixed table
@@ -46,20 +51,26 @@ static uint32_t g_arpCount = 0;
 static volatile bool g_arpReplyPending = false;
 static uint32_t g_arpReplyIp = 0;
 static MacAddr  g_arpReplyMac;
+static Process* g_arpWaiter = nullptr;
 
 // Socket table
-static constexpr uint32_t MAX_SOCKETS = 64;
+// TODO: Replace with per-process dynamic socket pool to support high socket
+// counts. The current global fixed table limits the whole system to
+// MAX_SOCKETS simultaneous sockets. Each socket heap-allocates 64KB for its
+// RX ring, so the practical limit is bounded by physical RAM anyway.
+static constexpr uint32_t MAX_SOCKETS = 1024;
 static Socket g_sockets[MAX_SOCKETS];
 static bool   g_sockUsed[MAX_SOCKETS];
 
 // IPv4 identification counter
 static uint16_t g_ipId = 1;
 
-static uint16_t g_tcpEphemeralPort = 49200;
+static uint32_t g_tcpEphemeralPort = 49200; // accessed via atomic fetch-add
 
 // Forward declaration for TCP send (defined below)
 static void TcpSendSegment(Socket& s, uint8_t flags,
-                           const void* data, uint32_t dataLen);
+                           const void* data, uint32_t dataLen,
+                           const char* why = "?");
 
 // ---------------------------------------------------------------------------
 // Checksum helpers
@@ -105,7 +116,7 @@ static void* NetMemcpy(void* dst, const void* src, uint64_t n)
 // ARP cache
 // ---------------------------------------------------------------------------
 
-static void ArpCacheInsert(uint32_t ip, const MacAddr& mac)
+void ArpCacheInsert(uint32_t ip, const MacAddr& mac)
 {
     // Update existing entry
     for (uint32_t i = 0; i < g_arpCount; i++) {
@@ -141,14 +152,15 @@ static bool ArpCacheLookup(uint32_t ip, MacAddr* out)
 
 static void ArpSendRequest(uint32_t targetIp)
 {
-    if (!g_netIf) return;
+    NetIf* nif = NetIfForDst(targetIp);
+    if (!nif) return;
 
     uint8_t frame[42]; // 14 eth + 28 arp
     NetMemset(frame, 0, sizeof(frame));
 
     auto* eth = reinterpret_cast<EthHeader*>(frame);
     NetMemset(eth->dst.b, 0xFF, 6); // broadcast
-    eth->src = g_netIf->mac;
+    eth->src = nif->mac;
     eth->etherType = htons(ETH_TYPE_ARP);
 
     auto* arp = reinterpret_cast<ArpPacket*>(frame + sizeof(EthHeader));
@@ -157,24 +169,24 @@ static void ArpSendRequest(uint32_t targetIp)
     arp->hlen  = 6;
     arp->plen  = 4;
     arp->oper  = htons(ARP_OP_REQUEST);
-    arp->sha   = g_netIf->mac;
-    arp->spa   = g_netIf->ipAddr;
+    arp->sha   = nif->mac;
+    arp->spa   = nif->ipAddr;
     NetMemset(arp->tha.b, 0, 6);
     arp->tpa   = targetIp;
 
-    g_netIf->transmit(g_netIf, frame, 42);
+    nif->transmit(nif, frame, 42);
 }
 
-static void ArpSendReply(const MacAddr& dstMac, uint32_t dstIp)
+static void ArpSendReply(NetIf* nif, const MacAddr& dstMac, uint32_t dstIp)
 {
-    if (!g_netIf) return;
+    if (!nif) return;
 
     uint8_t frame[42];
     NetMemset(frame, 0, sizeof(frame));
 
     auto* eth = reinterpret_cast<EthHeader*>(frame);
     eth->dst = dstMac;
-    eth->src = g_netIf->mac;
+    eth->src = nif->mac;
     eth->etherType = htons(ETH_TYPE_ARP);
 
     auto* arp = reinterpret_cast<ArpPacket*>(frame + sizeof(EthHeader));
@@ -183,40 +195,55 @@ static void ArpSendReply(const MacAddr& dstMac, uint32_t dstIp)
     arp->hlen  = 6;
     arp->plen  = 4;
     arp->oper  = htons(ARP_OP_REPLY);
-    arp->sha   = g_netIf->mac;
-    arp->spa   = g_netIf->ipAddr;
+    arp->sha   = nif->mac;
+    arp->spa   = nif->ipAddr;
     arp->tha   = dstMac;
     arp->tpa   = dstIp;
 
-    g_netIf->transmit(g_netIf, frame, 42);
+    nif->transmit(nif, frame, 42);
 }
 
-static void HandleArp(const uint8_t* frame, uint32_t len)
+static void HandleArp(NetIf* nif, const uint8_t* frame, uint32_t len)
 {
     if (len < sizeof(EthHeader) + sizeof(ArpPacket)) return;
 
     auto* arp = reinterpret_cast<const ArpPacket*>(frame + sizeof(EthHeader));
     uint16_t op = ntohs(arp->oper);
 
-    // Always learn from any ARP packet
+    // Always learn from any ARP packet; only log when the cache entry is new
+    // to avoid spamming the serial log with repeated gratuitous ARPs from the
+    // gateway (QEMU sends one every few seconds for each host).
+    MacAddr existing;
+    bool isNew = !ArpCacheLookup(arp->spa, &existing);
     ArpCacheInsert(arp->spa, arp->sha);
+    if (isNew)
+        SerialPrintf("arp: RX op=%u spa=%d.%d.%d.%d sha=%02x:%02x:%02x:%02x:%02x:%02x tpa=%d.%d.%d.%d\n",
+                     op,
+                     arp->spa & 0xFF, (arp->spa >> 8) & 0xFF,
+                     (arp->spa >> 16) & 0xFF, (arp->spa >> 24) & 0xFF,
+                     arp->sha.b[0], arp->sha.b[1], arp->sha.b[2],
+                     arp->sha.b[3], arp->sha.b[4], arp->sha.b[5],
+                     arp->tpa & 0xFF, (arp->tpa >> 8) & 0xFF,
+                     (arp->tpa >> 16) & 0xFF, (arp->tpa >> 24) & 0xFF);
 
     if (op == ARP_OP_REQUEST) {
-        // Is this for us?
-        if (g_netIf && arp->tpa == g_netIf->ipAddr) {
-            SerialPrintf("net: ARP request for our IP, sending reply\n");
-            ArpSendReply(arp->sha, arp->spa);
+        // Is this for us? Check against the receiving interface's IP.
+        if (nif && arp->tpa == nif->ipAddr) {
+            ArpSendReply(nif, arp->sha, arp->spa);
         }
     } else if (op == ARP_OP_REPLY) {
-        SerialPrintf("net: ARP reply from %d.%d.%d.%d\n",
-                     arp->spa & 0xFF, (arp->spa >> 8) & 0xFF,
-                     (arp->spa >> 16) & 0xFF, (arp->spa >> 24) & 0xFF);
 
         // Wake up anyone waiting for this ARP reply
         if (arp->spa == g_arpReplyIp) {
             g_arpReplyMac = arp->sha;
             __asm__ volatile("mfence" ::: "memory");
             g_arpReplyPending = true;
+            Process* waiter = g_arpWaiter;
+            if (waiter) {
+                g_arpWaiter = nullptr;
+                __atomic_store_n(&waiter->pendingWakeup, 1, __ATOMIC_RELEASE);
+                SchedulerUnblock(waiter);
+            }
         }
     }
 }
@@ -238,18 +265,29 @@ bool ArpResolve(uint32_t ip, MacAddr* outMac)
     g_arpReplyIp = ip;
     __asm__ volatile("mfence" ::: "memory");
 
+    extern volatile uint64_t g_lapicTickCount;
+    Process* self = SchedulerCurrentProcess();
+
     for (int attempt = 0; attempt < 3; attempt++) {
         ArpSendRequest(ip);
 
-        // Wait up to ~500ms per attempt
-        for (int i = 0; i < 500000; i++) {
-            if (g_netIf && g_netIf->poll) g_netIf->poll(g_netIf);
-            __asm__ volatile("pause");
-            if (g_arpReplyPending) {
-                *outMac = g_arpReplyMac;
-                ArpCacheInsert(ip, *outMac);
-                return true;
+        // Block until ARP reply arrives (500ms timeout per attempt)
+        uint64_t deadline = g_lapicTickCount + 500;
+        while (!g_arpReplyPending && g_lapicTickCount < deadline) {
+            if (self) {
+                g_arpWaiter = self;
+                self->wakeupTick = g_lapicTickCount + 500;
+                SchedulerBlock(self);
+            } else if (g_netIf && g_netIf->poll) {
+                // Early-boot: no scheduler yet, fall back to polling
+                g_netIf->poll(g_netIf);
             }
+        }
+
+        if (g_arpReplyPending) {
+            *outMac = g_arpReplyMac;
+            ArpCacheInsert(ip, *outMac);
+            return true;
         }
     }
 
@@ -268,10 +306,11 @@ static void HandleIpv4(const uint8_t* frame, uint32_t len);
 int NetSendIpv4(uint32_t dstIp, uint8_t proto,
                 const void* payload, uint32_t payloadLen)
 {
-    if (!g_netIf || !g_netIf->ipAddr) return -1;
+    NetIf* nif = NetIfForDst(dstIp);
+    if (!nif || !nif->ipAddr) return -1;
 
-    // Loopback: if destination is our own IP, inject directly into HandleIpv4
-    if (dstIp == g_netIf->ipAddr)
+    // Loopback: if destination is our own IP on this iface, inject locally
+    if (dstIp == nif->ipAddr)
     {
         uint32_t ipLen = sizeof(Ipv4Header) + payloadLen;
         uint32_t frameLen = sizeof(EthHeader) + ipLen;
@@ -281,8 +320,8 @@ int NetSendIpv4(uint32_t dstIp, uint8_t proto,
         NetMemset(frame, 0, frameLen);
 
         auto* eth = reinterpret_cast<EthHeader*>(frame);
-        eth->src = g_netIf->mac;
-        eth->dst = g_netIf->mac;
+        eth->src = nif->mac;
+        eth->dst = nif->mac;
         eth->etherType = htons(ETH_TYPE_IPV4);
 
         auto* ip = reinterpret_cast<Ipv4Header*>(frame + sizeof(EthHeader));
@@ -292,7 +331,7 @@ int NetSendIpv4(uint32_t dstIp, uint8_t proto,
         ip->flagsFrag = htons(0x4000);
         ip->ttl      = 64;
         ip->protocol = proto;
-        ip->srcIp    = g_netIf->ipAddr;
+        ip->srcIp    = nif->ipAddr;
         ip->dstIp    = dstIp;
         ip->checksum = 0;
         ip->checksum = InetChecksum(ip, sizeof(Ipv4Header));
@@ -304,8 +343,8 @@ int NetSendIpv4(uint32_t dstIp, uint8_t proto,
 
     // Determine next-hop: if same subnet, send direct; else use gateway
     uint32_t nextHop = dstIp;
-    if ((dstIp & g_netIf->netmask) != (g_netIf->ipAddr & g_netIf->netmask)) {
-        nextHop = g_netIf->gateway;
+    if ((dstIp & nif->netmask) != (nif->ipAddr & nif->netmask)) {
+        nextHop = nif->gateway;
         if (!nextHop) return -1; // no gateway configured
     }
 
@@ -324,25 +363,25 @@ int NetSendIpv4(uint32_t dstIp, uint8_t proto,
 
     auto* eth = reinterpret_cast<EthHeader*>(frame);
     eth->dst = dstMac;
-    eth->src = g_netIf->mac;
+    eth->src = nif->mac;
     eth->etherType = htons(ETH_TYPE_IPV4);
 
     auto* ip = reinterpret_cast<Ipv4Header*>(frame + sizeof(EthHeader));
-    ip->verIhl   = 0x45; // IPv4, 20-byte header
+    ip->verIhl   = 0x45;
     ip->tos      = 0;
     ip->totalLen = htons(static_cast<uint16_t>(ipLen));
     ip->id       = htons(g_ipId++);
-    ip->flagsFrag = htons(0x4000); // Don't Fragment
+    ip->flagsFrag = htons(0x4000);
     ip->ttl      = 64;
     ip->protocol = proto;
-    ip->srcIp    = g_netIf->ipAddr;
+    ip->srcIp    = nif->ipAddr;
     ip->dstIp    = dstIp;
     ip->checksum = 0;
     ip->checksum = InetChecksum(ip, sizeof(Ipv4Header));
 
     NetMemcpy(frame + sizeof(EthHeader) + sizeof(Ipv4Header), payload, payloadLen);
 
-    return g_netIf->transmit(g_netIf, frame, frameLen);
+    return nif->transmit(nif, frame, frameLen);
 }
 
 int NetSendUdp(uint32_t dstIp, uint16_t srcPort, uint16_t dstPort,
@@ -416,11 +455,22 @@ static void HandleIpv4(const uint8_t* frame, uint32_t len)
     if (totalLen < ihl) return;
     if (sizeof(EthHeader) + totalLen > len) return;
 
-    // Check destination: us, broadcast, or multicast
-    if (g_netIf && ip->dstIp != g_netIf->ipAddr &&
-        ip->dstIp != 0xFFFFFFFF &&
-        (ip->dstIp & g_netIf->netmask) != (0xFFFFFFFF & g_netIf->netmask))
-        return;
+    // Check destination: accept if it targets any of our interface IPs,
+    // the global broadcast, or any of our subnet-directed broadcasts.
+    bool forUs = (ip->dstIp == 0xFFFFFFFF);
+    if (!forUs) {
+        for (uint32_t i = 0; i < g_netIfCount; i++) {
+            NetIf* n = g_netIfs[i];
+            if (!n) continue;
+            if (ip->dstIp == n->ipAddr) { forUs = true; break; }
+            if (n->netmask &&
+                (ip->dstIp | n->netmask) == 0xFFFFFFFF &&
+                (ip->dstIp & n->netmask) == (n->ipAddr & n->netmask)) {
+                forUs = true; break;
+            }
+        }
+    }
+    if (!forUs) return;
 
     const uint8_t* payload = frame + sizeof(EthHeader) + ihl;
     uint32_t payloadLen = totalLen - ihl;
@@ -451,7 +501,7 @@ void NetReceive(NetIf* nif, const void* frame, uint32_t len)
 
     switch (etherType) {
     case ETH_TYPE_ARP:
-        HandleArp(static_cast<const uint8_t*>(frame), len);
+        HandleArp(nif, static_cast<const uint8_t*>(frame), len);
         break;
     case ETH_TYPE_IPV4:
         HandleIpv4(static_cast<const uint8_t*>(frame), len);
@@ -470,15 +520,82 @@ void NetInit()
     NetMemset(g_sockets, 0, sizeof(g_sockets));
     NetMemset(g_sockUsed, 0, sizeof(g_sockUsed));
     g_netIf = nullptr;
+    for (uint32_t i = 0; i < NET_MAX_IFS; i++) g_netIfs[i] = nullptr;
+    g_netIfCount = 0;
     SerialPuts("net: initialised\n");
 }
 
 void NetRegisterIf(NetIf* nif)
 {
-    g_netIf = nif;
-    SerialPrintf("net: interface registered, MAC=%02x:%02x:%02x:%02x:%02x:%02x\n",
+    if (g_netIfCount >= NET_MAX_IFS) {
+        SerialPrintf("net: too many interfaces (max %u), ignoring\n", NET_MAX_IFS);
+        return;
+    }
+    uint32_t idx = g_netIfCount++;
+    g_netIfs[idx] = nif;
+    if (idx == 0) g_netIf = nif;
+    SerialPrintf("net: interface %u registered, MAC=%02x:%02x:%02x:%02x:%02x:%02x\n",
+                 idx,
                  nif->mac.b[0], nif->mac.b[1], nif->mac.b[2],
                  nif->mac.b[3], nif->mac.b[4], nif->mac.b[5]);
+}
+
+uint32_t NetIfCount() { return g_netIfCount; }
+NetIf* NetIfAt(uint32_t idx) { return (idx < g_netIfCount) ? g_netIfs[idx] : nullptr; }
+
+// Pick the interface that should source packets destined for dstIp.
+// Prefers subnet match; falls back to NIC 0 (default route).
+NetIf* NetIfForDst(uint32_t dstIp)
+{
+    for (uint32_t i = 0; i < g_netIfCount; i++) {
+        NetIf* nif = g_netIfs[i];
+        if (!nif || !nif->ipAddr || !nif->netmask) continue;
+        if ((dstIp & nif->netmask) == (nif->ipAddr & nif->netmask))
+            return nif;
+    }
+    return g_netIf;
+}
+
+void NetStartPollThread()
+{
+    if (!g_netIf) return;
+
+    // Spawn a background thread to continuously drain the NIC receive ring.
+    // This is needed because SockRecv/Connect block via SchedulerBlock rather
+    // than busy-polling; without this thread no one would call nif->poll() and
+    // incoming packets would never be delivered post-scheduler-init.
+    //
+    // Priority 2 (NORMAL) so it doesn't preempt user processes. The 1ms sleep
+    // between drain bursts is enough for good TCP throughput while keeping the
+    // scheduler lock free for timer/IRQ handlers (mouse, profiler wakeups etc.).
+    //
+    // DO NOT use SchedulerYield() here — it spins at high frequency, contends
+    // g_readyLock constantly, and delays LAPIC timer handlers that need the
+    // lock to check wakeupTick. Use SchedulerBlock with a short timeout instead.
+    //
+    // IMPORTANT: must be called AFTER SchedulerInit(), not from NetRegisterIf,
+    // because SchedulerAddProcess requires the MLFQ to be initialised.
+    Process* pollThread = KernelThreadCreate("net_poll", [](void* /*arg*/) {
+        extern volatile uint64_t g_lapicTickCount;
+        while (true) {
+            uint32_t n = NetIfCount();
+            for (int burst = 0; burst < 8; burst++) {
+                for (uint32_t i = 0; i < n; i++) {
+                    NetIf* nif = NetIfAt(i);
+                    if (nif && nif->poll) nif->poll(nif);
+                }
+            }
+            Process* self = ProcessCurrent();
+            if (self) {
+                self->wakeupTick = g_lapicTickCount + 1;
+                SchedulerBlock(self);
+            }
+        }
+    }, nullptr, 2 /* NORMAL priority — same as user processes */);
+    if (pollThread) {
+        SchedulerAddProcess(pollThread);
+        SerialPrintf("net: net_poll thread started (pid=%u)\n", pollThread->pid);
+    }
 }
 
 NetIf* NetGetIf()
@@ -659,6 +776,132 @@ static void HandleDhcpReply(const uint8_t* data, uint32_t len)
     }
 }
 
+// ---- Static interface config via /boot/BROOK.CFG -------------------------
+//
+// Keys parsed (ASCII, one "KEY=value" per line, '#' comments):
+//   NET0_MODE    — "static" or "dhcp" (default dhcp)
+//   NET0_IP      — dotted-quad
+//   NET0_NETMASK — dotted-quad (default 255.255.255.0)
+//   NET0_GATEWAY — dotted-quad (optional)
+//   NET0_DNS     — dotted-quad (optional)
+
+static bool ParseDottedQuad(const char* s, uint32_t len, uint32_t* out)
+{
+    uint32_t ip = 0;
+    uint32_t octet = 0;
+    uint32_t octetCount = 0;
+    bool haveDigit = false;
+    for (uint32_t i = 0; i <= len; i++) {
+        char c = (i < len) ? s[i] : '.';
+        if (c >= '0' && c <= '9') {
+            octet = octet * 10 + (uint32_t)(c - '0');
+            if (octet > 255) return false;
+            haveDigit = true;
+        } else if (c == '.') {
+            if (!haveDigit) return false;
+            ip |= (octet & 0xFF) << (8 * octetCount);
+            octetCount++;
+            octet = 0;
+            haveDigit = false;
+            if (octetCount == 4) {
+                if (i != len) return false;
+                *out = ip;
+                return true;
+            }
+        } else {
+            return false;
+        }
+    }
+    return false;
+}
+
+static bool LineKeyIs(const char* line, uint32_t keyLen,
+                      const char* key, uint32_t wantLen)
+{
+    if (keyLen != wantLen) return false;
+    for (uint32_t i = 0; i < wantLen; i++) {
+        if (line[i] != key[i]) return false;
+    }
+    return true;
+}
+
+bool NetApplyStaticConfig(NetIf* nif)
+{
+    if (!nif) return false;
+
+    Vnode* cfg = VfsOpen("/boot/BROOK.CFG");
+    if (!cfg) return false;
+
+    char buf[1024] = {};
+    uint64_t off = 0;
+    int n = VfsRead(cfg, buf, sizeof(buf) - 1, &off);
+    VfsClose(cfg);
+    if (n <= 0) return false;
+
+    bool isStatic = false;
+    uint32_t ip = 0, mask = 0x00FFFFFF, gw = 0, dns = 0;  // mask default /24
+    bool haveIp = false;
+
+    uint32_t pos = 0;
+    while (pos < (uint32_t)n) {
+        uint32_t lineStart = pos;
+        while (pos < (uint32_t)n && buf[pos] != '\n' && buf[pos] != '\r') pos++;
+        uint32_t lineEnd = pos;
+        while (pos < (uint32_t)n && (buf[pos] == '\n' || buf[pos] == '\r')) pos++;
+
+        while (lineStart < lineEnd && (buf[lineStart] == ' ' || buf[lineStart] == '\t'))
+            lineStart++;
+        if (lineStart >= lineEnd) continue;
+        if (buf[lineStart] == '#') continue;
+
+        uint32_t eq = lineStart;
+        while (eq < lineEnd && buf[eq] != '=') eq++;
+        if (eq >= lineEnd) continue;
+
+        const char* key = &buf[lineStart];
+        uint32_t keyLen = eq - lineStart;
+        const char* val = &buf[eq + 1];
+        uint32_t valLen = lineEnd - (eq + 1);
+
+        while (valLen > 0 && (val[0] == ' ' || val[0] == '\t')) { val++; valLen--; }
+        while (valLen > 0 && (val[valLen - 1] == ' ' || val[valLen - 1] == '\t'
+                              || val[valLen - 1] == '\r')) { valLen--; }
+
+        if (LineKeyIs(key, keyLen, "NET0_MODE", 9)) {
+            if (valLen == 6 && val[0] == 's' && val[1] == 't' && val[2] == 'a'
+                            && val[3] == 't' && val[4] == 'i' && val[5] == 'c') {
+                isStatic = true;
+            }
+        } else if (LineKeyIs(key, keyLen, "NET0_IP", 7)) {
+            uint32_t v;
+            if (ParseDottedQuad(val, valLen, &v)) { ip = v; haveIp = true; }
+        } else if (LineKeyIs(key, keyLen, "NET0_NETMASK", 12)) {
+            uint32_t v;
+            if (ParseDottedQuad(val, valLen, &v)) mask = v;
+        } else if (LineKeyIs(key, keyLen, "NET0_GATEWAY", 12)) {
+            uint32_t v;
+            if (ParseDottedQuad(val, valLen, &v)) gw = v;
+        } else if (LineKeyIs(key, keyLen, "NET0_DNS", 8)) {
+            uint32_t v;
+            if (ParseDottedQuad(val, valLen, &v)) dns = v;
+        }
+    }
+
+    if (!isStatic || !haveIp) return false;
+
+    nif->ipAddr  = ip;
+    nif->netmask = mask;
+    nif->gateway = gw;
+    nif->dns     = dns;
+
+    SerialPrintf("net: static config %u.%u.%u.%u/%u.%u.%u.%u gw=%u.%u.%u.%u dns=%u.%u.%u.%u\n",
+        ip & 0xFF, (ip >> 8) & 0xFF, (ip >> 16) & 0xFF, (ip >> 24) & 0xFF,
+        mask & 0xFF, (mask >> 8) & 0xFF, (mask >> 16) & 0xFF, (mask >> 24) & 0xFF,
+        gw & 0xFF, (gw >> 8) & 0xFF, (gw >> 16) & 0xFF, (gw >> 24) & 0xFF,
+        dns & 0xFF, (dns >> 8) & 0xFF, (dns >> 16) & 0xFF, (dns >> 24) & 0xFF);
+    return true;
+}
+
 bool DhcpDiscover(NetIf* nif)
 {
     g_dhcpState = 1;
@@ -751,6 +994,7 @@ static int g_dnsCacheCount = 0;
 static volatile bool g_dnsGotReply = false;
 static volatile uint32_t g_dnsResolvedIp = 0;
 static volatile uint16_t g_dnsQueryId = 0;
+static Process* g_dnsWaiter = nullptr;
 
 static int NetStrLen(const char* s)
 {
@@ -864,6 +1108,12 @@ static bool IsDnsReply(uint16_t dstPort, const void* data, uint32_t len)
     if (ip) {
         g_dnsResolvedIp = ip;
         g_dnsGotReply = true;
+        Process* waiter = g_dnsWaiter;
+        if (waiter) {
+            g_dnsWaiter = nullptr;
+            __atomic_store_n(&waiter->pendingWakeup, 1, __ATOMIC_RELEASE);
+            SchedulerUnblock(waiter);
+        }
     }
     return true;
 }
@@ -934,24 +1184,35 @@ uint32_t DnsResolve(const char* hostname)
     g_dnsResolvedIp = 0;
     g_dnsQueryId = qid;
 
+    extern volatile uint64_t g_lapicTickCount;
+    Process* self = SchedulerCurrentProcess();
+
     for (int attempt = 0; attempt < 3; attempt++) {
         SerialPrintf("net: DNS query '%s' (attempt %d)\n", hostname, attempt + 1);
         NetSendUdp(g_netIf->dns, DNS_LOCAL_PORT, DNS_PORT, pkt, pktLen);
 
-        // Wait up to 2 seconds, polling
-        for (int i = 0; i < 2000000; i++) {
-            if (g_netIf->poll) g_netIf->poll(g_netIf);
-            __asm__ volatile("pause");
-            if (g_dnsGotReply) {
-                uint32_t ip = g_dnsResolvedIp;
-                g_dnsQueryId = 0;
-                DnsCacheInsert(hostname, ip);
-
-                SerialPrintf("net: DNS '%s' → %d.%d.%d.%d\n", hostname,
-                             ip & 0xFF, (ip >> 8) & 0xFF,
-                             (ip >> 16) & 0xFF, (ip >> 24) & 0xFF);
-                return ip;
+        // Block until DNS reply arrives (2 second timeout per attempt)
+        uint64_t deadline = g_lapicTickCount + 2000;
+        while (!g_dnsGotReply && g_lapicTickCount < deadline) {
+            if (self) {
+                g_dnsWaiter = self;
+                self->wakeupTick = g_lapicTickCount + 2000;
+                SchedulerBlock(self);
+            } else if (g_netIf->poll) {
+                // Early-boot: no scheduler yet, fall back to polling
+                g_netIf->poll(g_netIf);
             }
+        }
+
+        if (g_dnsGotReply) {
+            uint32_t ip = g_dnsResolvedIp;
+            g_dnsQueryId = 0;
+            DnsCacheInsert(hostname, ip);
+
+            SerialPrintf("net: DNS '%s' → %d.%d.%d.%d\n", hostname,
+                         ip & 0xFF, (ip >> 8) & 0xFF,
+                         (ip >> 16) & 0xFF, (ip >> 24) & 0xFF);
+            return ip;
         }
     }
 
@@ -984,9 +1245,14 @@ int SockCreate(int domain, int type, int protocol)
             }
 
             g_sockets[i].refCount = 1;
+            {
+                Process* self = ProcessCurrent();
+                g_sockets[i].ownerPid = self ? self->tgid : 0;
+            }
             return static_cast<int>(i);
         }
     }
+    SerialPrintf("net: socket table full (MAX_SOCKETS=%u) — all slots in use\n", MAX_SOCKETS);
     return -1; // no free sockets
 }
 
@@ -1025,8 +1291,9 @@ int SockSendTo(int sockIdx, const void* buf, uint32_t len,
 
     // Auto-bind if not yet bound
     if (!s.bound) {
-        static uint16_t ephemeralPort = 49152;
-        s.localPort = htons(ephemeralPort++);
+        uint32_t port = __atomic_fetch_add(&g_tcpEphemeralPort, 1, __ATOMIC_RELAXED);
+        if (port >= 65535) __atomic_store_n(&g_tcpEphemeralPort, 49200, __ATOMIC_RELAXED);
+        s.localPort = htons(static_cast<uint16_t>(port));
         s.localIp = g_netIf ? g_netIf->ipAddr : 0;
         s.bound = true;
     }
@@ -1112,7 +1379,7 @@ void SockClose(int sockIdx)
                 if (child.tcpState == TcpState::Established ||
                     child.tcpState == TcpState::SynRecv)
                 {
-                    TcpSendSegment(child, TCP_RST, nullptr, 0);
+                    TcpSendSegment(child, TCP_RST, nullptr, 0, "rst-listener");
                 }
                 if (child.rxBuf) kfree(child.rxBuf);
                 NetMemset(&g_sockets[childIdx], 0, sizeof(Socket));
@@ -1121,17 +1388,49 @@ void SockClose(int sockIdx)
         }
     }
 
-    // TCP: send FIN if connected
-    if (s.type == SOCK_STREAM && s.tcpState == TcpState::Established) {
-        TcpSendSegment(s, TCP_FIN | TCP_ACK, nullptr, 0);
+    // TCP: graceful close — send FIN and wait for the peer to acknowledge.
+    //
+    // We handle two states:
+    //   Established: we initiate close (active close, FIN_WAIT1 path)
+    //   CloseWait:   peer already sent FIN; we must send our own FIN to
+    //                complete the 4-way handshake (passive close, LAST_ACK path).
+    //
+    // If we skip sending FIN in CloseWait, the peer stays in FIN_WAIT2 forever.
+    // When the same local port is reused for a new connection to the same peer,
+    // the peer sees a new SYN on a 4-tuple it thinks is still open and responds
+    // with FIN/RST — killing the new connection immediately.
+    if (s.type == SOCK_STREAM &&
+        (s.tcpState == TcpState::Established ||
+         s.tcpState == TcpState::CloseWait))
+    {
+        TcpSendSegment(s, TCP_FIN | TCP_ACK, nullptr, 0, "close");
         s.tcpSndNxt++;
-        s.tcpState = TcpState::FinWait1;
-        // Brief wait for FIN-ACK (non-blocking, best-effort)
-        for (int i = 0; i < 500000; i++) {
-            if (g_netIf && g_netIf->poll) g_netIf->poll(g_netIf);
-            if (s.tcpState == TcpState::Closed || s.tcpState == TcpState::TimeWait)
-                break;
-            __asm__ volatile("pause");
+
+        // Active close (Established): wait for FIN-ACK (FinWait1 → FinWait2 → done)
+        // Passive close (CloseWait):  wait for ACK of our FIN (LastAck → Closed)
+        s.tcpState = (s.tcpState == TcpState::Established)
+                         ? TcpState::FinWait1
+                         : TcpState::LastAck;
+
+        // Wait up to 500ms for the peer to acknowledge our FIN.
+        // We must use SchedulerBlock (not SchedulerYield) because SchedulerYield
+        // returns immediately when no other thread is ready, so the FIN-ACK can
+        // arrive via IRQ but we've already zeroed the socket. SchedulerBlock
+        // suspends us and lets the IRQ handler wake us when the FIN-ACK arrives.
+        extern volatile uint64_t g_lapicTickCount;
+        Process* self = ProcessCurrent();
+        if (self) {
+            uint64_t deadline = g_lapicTickCount + 500;
+            while (s.tcpState == TcpState::FinWait1 ||
+                   s.tcpState == TcpState::FinWait2 ||
+                   s.tcpState == TcpState::LastAck) {
+                if (g_lapicTickCount >= deadline) break;
+                uint64_t lf = SpinLockAcquire(&s.lock);
+                s.pollWaiter = self;
+                self->wakeupTick = g_lapicTickCount + 50; // check every 50ms
+                SpinLockRelease(&s.lock, lf);
+                SchedulerBlock(self);
+            }
         }
     }
 
@@ -1158,6 +1457,13 @@ void SockUnref(int sockIdx)
         SockClose(sockIdx);
 }
 
+void SockSetPollWaiter(int sockIdx, Process* waiter)
+{
+    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return;
+    if (!g_sockUsed[sockIdx]) return;
+    g_sockets[sockIdx].pollWaiter = waiter;
+}
+
 void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
                     uint32_t dstIp, uint16_t dstPort,
                     const void* data, uint32_t len)
@@ -1174,8 +1480,12 @@ void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
         // Match — enqueue datagram
         // Format: [len:4][srcIp:4][srcPort:2][data:len]
         uint32_t needed = 10 + len;
+
+        uint64_t irqFlags = SpinLockAcquire(&s.lock);
+
         uint32_t avail = Socket::RX_BUF_SIZE - s.rxCount;
         if (needed > avail) {
+            SpinLockRelease(&s.lock, irqFlags);
             SerialPrintf("net: socket %u rx buffer full, dropping\n", i);
             return;
         }
@@ -1204,6 +1514,18 @@ void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
 
         __asm__ volatile("mfence" ::: "memory");
         s.rxCount += needed;
+
+        Process* waiter = s.pollWaiter;
+        if (waiter) s.pollWaiter = nullptr;
+
+        SpinLockRelease(&s.lock, irqFlags);
+
+        // Wake poll waiter after releasing the lock
+        if (waiter) {
+            __atomic_store_n(&waiter->pendingWakeup, 1, __ATOMIC_RELEASE);
+            SchedulerUnblock(waiter);
+        }
+
         return; // only deliver to first matching socket
     }
 }
@@ -1213,9 +1535,17 @@ void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
 // ---------------------------------------------------------------------------
 
 static void TcpSendSegment(Socket& s, uint8_t flags,
-                           const void* data, uint32_t dataLen)
+                           const void* data, uint32_t dataLen,
+                           const char* why)
 {
-    uint32_t tcpLen = sizeof(TcpHeader) + dataLen;
+    // SYN packets include MSS option (4 bytes): kind=2, len=2, mss=1460
+    // This makes us look like a real Linux client and avoids CDNs defaulting
+    // to MSS=536 (which some servers use as a signal to reject the connection).
+    static constexpr uint16_t TCP_OPT_MSS = 1460;
+    bool addMss = (flags & TCP_SYN) && !(flags & TCP_ACK); // SYN only, not SYN-ACK
+
+    uint32_t optLen  = addMss ? 4 : 0;   // MSS option is 4 bytes
+    uint32_t tcpLen  = sizeof(TcpHeader) + optLen + dataLen;
     uint8_t buf[ETH_MTU];
     NetMemset(buf, 0, tcpLen);
 
@@ -1224,23 +1554,54 @@ static void TcpSendSegment(Socket& s, uint8_t flags,
     tcp->dstPort  = s.remotePort;
     tcp->seqNum   = htonl(s.tcpSndNxt);
     tcp->ackNum   = htonl(s.tcpRcvNxt);
-    tcp->dataOff  = (sizeof(TcpHeader) / 4) << 4;
+    tcp->dataOff  = ((sizeof(TcpHeader) + optLen) / 4) << 4;
     tcp->flags    = flags;
-    tcp->window   = htons(Socket::RX_BUF_SIZE < 65535
-                          ? static_cast<uint16_t>(Socket::RX_BUF_SIZE)
-                          : 65535u);
+    // Advertise actual free space to prevent the sender from overflowing our buffer
+    {
+        uint32_t freeSpace = Socket::RX_BUF_SIZE - s.rxCount;
+        uint16_t wnd = freeSpace > 65535u ? 65535u : static_cast<uint16_t>(freeSpace);
+        tcp->window = htons(wnd);
+    }
     tcp->urgentPtr = 0;
 
+    // Write MSS option immediately after the TCP header (SYN only)
+    if (addMss) {
+        uint8_t* opts = buf + sizeof(TcpHeader);
+        opts[0] = 2;                                          // kind: MSS
+        opts[1] = 4;                                          // length: 4 bytes
+        opts[2] = static_cast<uint8_t>(TCP_OPT_MSS >> 8);    // MSS high byte
+        opts[3] = static_cast<uint8_t>(TCP_OPT_MSS & 0xFF);  // MSS low byte
+    }
+
     if (data && dataLen > 0)
-        NetMemcpy(buf + sizeof(TcpHeader), data, dataLen);
+        NetMemcpy(buf + sizeof(TcpHeader) + optLen, data, dataLen);
 
     tcp->checksum = 0;
     tcp->checksum = TcpChecksum(g_netIf->ipAddr, s.remoteIp, buf, tcpLen);
 
-    NetSendIpv4(s.remoteIp, IP_PROTO_TCP, buf, tcpLen);
+    int sendResult = NetSendIpv4(s.remoteIp, IP_PROTO_TCP, buf, tcpLen);
+    if (sendResult != 0) {
+        SerialPrintf("tcp: send failed flags=0x%02x err=%d\n", flags, sendResult);
+    } else {
+        s.txPktCount++;
+        // Always log control segments (SYN/FIN/RST/PSH) and anything carrying
+        // payload. Throttle pure ACKs (flags == ACK only, datalen == 0) the
+        // same way we throttle RX: first 50, then every 100. During a bulk
+        // download we emit thousands of pure ACKs and they drown the log.
+        bool isPureAck = (flags == 0x10) && (dataLen == 0);
+        bool log = !isPureAck || s.txPktCount <= 50 || (s.txPktCount % 100) == 0;
+        if (log) {
+            extern volatile uint64_t g_lapicTickCount;
+            int sockIdx = static_cast<int>(&s - g_sockets);
+            SerialPrintf("tcp: TX pid=%u sock=%d t=%lums flags=0x%02x seq=%u ack=%u datalen=%u why=%s [pkt#%u]\n",
+                         s.ownerPid, sockIdx, g_lapicTickCount, flags,
+                         s.tcpSndNxt, s.tcpRcvNxt, dataLen, why, s.txPktCount);
+        }
+    }
 }
 
-// Append raw bytes to socket RX ring buffer
+// Append raw bytes to socket RX ring buffer.
+// Caller MUST hold s.lock.
 static void TcpEnqueueData(Socket& s, const void* data, uint32_t len)
 {
     uint32_t avail = Socket::RX_BUF_SIZE - s.rxCount;
@@ -1253,6 +1614,7 @@ static void TcpEnqueueData(Socket& s, const void* data, uint32_t len)
     }
     __asm__ volatile("mfence" ::: "memory");
     s.rxCount += len;
+    // Caller (HandleTcp) wakes pollWaiter after releasing the lock.
 }
 
 void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
@@ -1268,6 +1630,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
     uint32_t seq     = ntohl(tcp->seqNum);
     uint32_t ack     = ntohl(tcp->ackNum);
     uint8_t  flags   = tcp->flags;
+    uint16_t window  = ntohs(tcp->window);
     const uint8_t* tcpData = static_cast<const uint8_t*>(payload) + dataOff;
     uint32_t dataLen = len - dataOff;
 
@@ -1280,13 +1643,69 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         if (s.remotePort != srcPort) continue;
         if (s.remoteIp != ip->srcIp) continue;
 
+        uint64_t irqFlags = SpinLockAcquire(&s.lock);
+
+        // Update peer's advertised window
+        s.tcpSndWnd = window;
+
+        // Log TCP segments — per-socket counter so each new connection gets
+        // fresh verbose logging (the old global static went silent after 3
+        // packets from the first connection).
+        s.rxPktCount++;
+        if (s.rxPktCount <= 50 || (s.rxPktCount % 100) == 0)
+        {
+            extern volatile uint64_t g_lapicTickCount;
+            int sockIdx = static_cast<int>(&s - g_sockets);
+            SerialPrintf("tcp: RX pid=%u sock=%d t=%lums flags=0x%02x seq=%u ack=%u datalen=%u rcvNxt=%u [pkt#%u]\n",
+                         s.ownerPid, sockIdx, g_lapicTickCount, flags, seq, ack, dataLen, s.tcpRcvNxt, s.rxPktCount);
+        }
+
+        // Clamp incoming data to our actual free space so tcpRcvNxt stays
+        // in sync with what we actually accept.  Without this, a full RX
+        // buffer causes TcpEnqueueData to silently drop bytes while we've
+        // already ACKed them, permanently desynchronising sequence numbers.
+        uint32_t freeSpace = Socket::RX_BUF_SIZE - s.rxCount;
+        bool bufferWasFull = (dataLen > 0 && freeSpace == 0);
+        if (dataLen > freeSpace) dataLen = freeSpace;
+
         // Delegate to testable state machine
+        uint32_t prevRxCount = s.rxCount;
         TcpAction act = TcpProcessSegment(s, seq, ack, flags, tcpData, dataLen);
 
         if (act.enqueueData && act.dataPtr && act.dataLen > 0)
             TcpEnqueueData(s, act.dataPtr, act.dataLen);
-        if (act.sendAck)
-            TcpSendSegment(s, TCP_ACK, nullptr, 0);
+
+        // CRITICAL: compute shouldWake and capture pollWaiter while still
+        // holding the lock.  If we release first, SockRecv can drain the
+        // rx buffer on another core before we read s.rxCount here — the
+        // delta (s.rxCount > prevRxCount) becomes false and the wakeup is
+        // suppressed.  The sleeping SockRecv then waits the full 10-second
+        // SchedulerBlock timeout instead of being woken immediately (the
+        // 60-second stall = 6 missed wakeups × 10-second timeout).
+        bool shouldWake = (s.rxCount > prevRxCount) || s.tcpRstRecv
+                          || s.tcpFinRecv || act.justConnected;
+        Process* waiter = nullptr;
+        if (s.pollWaiter && shouldWake)
+        {
+            waiter = s.pollWaiter;
+            s.pollWaiter = nullptr;
+        }
+
+        SpinLockRelease(&s.lock, irqFlags);
+
+        // Send ACK outside the lock — TcpSendSegment is not re-entrant under
+        // s.lock and may acquire other locks (e.g. TX queue).
+        if (act.sendAck || bufferWasFull)
+            TcpSendSegment(s, TCP_ACK, nullptr, 0,
+                           bufferWasFull ? "rx-bufferfull" : "rx-action");
+
+        // Wake the waiter outside the lock — SchedulerUnblock may need the
+        // scheduler lock which must not be acquired while holding s.lock.
+        if (waiter)
+        {
+            __atomic_store_n(&waiter->pendingWakeup, 1, __ATOMIC_RELEASE);
+            SchedulerUnblock(waiter);
+        }
 
         return; // handled
     }
@@ -1340,7 +1759,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             // Send SYN-ACK
             // Temporarily set tcpSndNxt to ISS for the SYN-ACK segment
             child.tcpSndNxt = child.tcpSndIss;
-            TcpSendSegment(child, TCP_SYN | TCP_ACK, nullptr, 0);
+            TcpSendSegment(child, TCP_SYN | TCP_ACK, nullptr, 0, "synack");
             child.tcpSndNxt = child.tcpSndIss + 1; // SYN consumes one seq
 
             SerialPrintf("net: TCP SYN-ACK sent for port %u -> %u.%u.%u.%u:%u (childIdx=%d)\n",
@@ -1354,6 +1773,10 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
 
     // No matching socket — send RST
     if (!(flags & TCP_RST) && g_netIf) {
+        SerialPrintf("tcp: no socket for %u.%u.%u.%u:%u→%u (flags=0x%02x) — sending RST\n",
+                     (ntohl(ip->srcIp) >> 24) & 0xFF, (ntohl(ip->srcIp) >> 16) & 0xFF,
+                     (ntohl(ip->srcIp) >> 8) & 0xFF, ntohl(ip->srcIp) & 0xFF,
+                     ntohs(srcPort), ntohs(dstPort), flags);
         uint8_t rstBuf[sizeof(TcpHeader)];
         NetMemset(rstBuf, 0, sizeof(TcpHeader));
         auto* rst = reinterpret_cast<TcpHeader*>(rstBuf);
@@ -1391,7 +1814,9 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
         s.connected  = true;
         // Auto-bind if not yet bound
         if (!s.bound) {
-            s.localPort = htons(g_tcpEphemeralPort++);
+            uint32_t port = __atomic_fetch_add(&g_tcpEphemeralPort, 1, __ATOMIC_RELAXED);
+            if (port >= 65535) __atomic_store_n(&g_tcpEphemeralPort, 49200, __ATOMIC_RELAXED);
+            s.localPort = htons(static_cast<uint16_t>(port));
             s.localIp = g_netIf ? g_netIf->ipAddr : 0;
             s.bound = true;
         }
@@ -1405,7 +1830,9 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
 
     // Auto-bind local port
     if (!s.bound) {
-        s.localPort = htons(g_tcpEphemeralPort++);
+        uint32_t port = __atomic_fetch_add(&g_tcpEphemeralPort, 1, __ATOMIC_RELAXED);
+        if (port >= 65535) __atomic_store_n(&g_tcpEphemeralPort, 49200, __ATOMIC_RELAXED);
+        s.localPort = htons(static_cast<uint16_t>(port));
         s.localIp = g_netIf ? g_netIf->ipAddr : 0;
         s.bound = true;
     }
@@ -1418,45 +1845,50 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
     s.tcpSndUna = s.tcpSndIss;
     s.tcpRcvNxt = 0;
     s.tcpFinRecv = false;
+    s.tcpRstRecv = false;
+    s.tcpSndWnd  = 65535; // assume full window until server tells us otherwise
     s.tcpState = TcpState::SynSent;
 
     // Send SYN
-    TcpSendSegment(s, TCP_SYN, nullptr, 0);
+    TcpSendSegment(s, TCP_SYN, nullptr, 0, "connect");
     s.tcpSndNxt++; // SYN consumes one sequence number
 
-    SerialPrintf("tcp: SYN sent to %u.%u.%u.%u:%u\n",
+    SerialPrintf("tcp: SYN queued to %u.%u.%u.%u:%u\n",
                  (ntohl(s.remoteIp) >> 24) & 0xFF,
                  (ntohl(s.remoteIp) >> 16) & 0xFF,
                  (ntohl(s.remoteIp) >> 8) & 0xFF,
                  ntohl(s.remoteIp) & 0xFF,
                  ntohs(s.remotePort));
 
-    // Wait for SYN-ACK (polling-based, timeout ~5 seconds)
-    for (int i = 0; i < 5000000; i++) {
-        if (g_netIf && g_netIf->poll) g_netIf->poll(g_netIf);
+    extern volatile uint64_t g_lapicTickCount;
+    Process* self = SchedulerCurrentProcess();
+
+    // Block until SYN-ACK arrives or timeout (5 second per attempt, 2 attempts)
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (attempt == 1) {
+            // Retry SYN
+            s.tcpSndNxt = s.tcpSndIss;
+            TcpSendSegment(s, TCP_SYN, nullptr, 0, "connect-retry");
+            s.tcpSndNxt++;
+        }
+
+        uint64_t deadline = g_lapicTickCount + 5000;
+        while (s.tcpState == TcpState::SynSent && g_lapicTickCount < deadline) {
+            uint64_t irqFlags = SpinLockAcquire(&s.lock);
+            s.pollWaiter = self;
+            self->wakeupTick = g_lapicTickCount + 5000;
+            SpinLockRelease(&s.lock, irqFlags);
+            SchedulerBlock(self);
+        }
+
         if (s.tcpState == TcpState::Established) {
-            SerialPrintf("tcp: connected!\n");
+            SerialPrintf("tcp: connected%s!\n", attempt ? " (retry)" : "");
             return 0;
         }
-        if (s.tcpState == TcpState::Closed) {
+        if (s.tcpState == TcpState::Closed || s.tcpRstRecv) {
             SerialPrintf("tcp: connection refused (RST)\n");
             return -111; // ECONNREFUSED
         }
-        __asm__ volatile("pause");
-    }
-
-    // Timeout — retry once
-    s.tcpSndNxt = s.tcpSndIss;
-    TcpSendSegment(s, TCP_SYN, nullptr, 0);
-    s.tcpSndNxt++;
-    for (int i = 0; i < 5000000; i++) {
-        if (g_netIf && g_netIf->poll) g_netIf->poll(g_netIf);
-        if (s.tcpState == TcpState::Established) {
-            SerialPrintf("tcp: connected (retry)!\n");
-            return 0;
-        }
-        if (s.tcpState == TcpState::Closed) return -111;
-        __asm__ volatile("pause");
     }
 
     SerialPrintf("tcp: connect timeout\n");
@@ -1471,7 +1903,11 @@ int SockSend(int sockIdx, const void* buf, uint32_t len)
 
     Socket& s = g_sockets[sockIdx];
     if (s.type != SOCK_STREAM) return -95;
-    if (s.tcpState != TcpState::Established) return -104; // ECONNRESET
+    if (s.tcpState != TcpState::Established) {
+        SerialPrintf("tcp: SockSend refused: state=%d (not Established) fd=%d\n",
+                     (int)s.tcpState, sockIdx);
+        return -104; // ECONNRESET
+    }
 
     const uint8_t* data = static_cast<const uint8_t*>(buf);
     uint32_t sent = 0;
@@ -1483,16 +1919,13 @@ int SockSend(int sockIdx, const void* buf, uint32_t len)
         uint32_t chunk = len - sent;
         if (chunk > MSS) chunk = MSS;
 
-        TcpSendSegment(s, TCP_ACK | TCP_PSH, data + sent, chunk);
+        TcpSendSegment(s, TCP_ACK | TCP_PSH, data + sent, chunk, "data");
         s.tcpSndNxt += chunk;
         sent += chunk;
 
-        // Brief poll to process ACKs and avoid overwhelming the link
-        for (int i = 0; i < 50000; i++) {
-            if (g_netIf && g_netIf->poll) g_netIf->poll(g_netIf);
-            if (s.tcpSndUna >= s.tcpSndNxt) break; // all ACK'd
-            __asm__ volatile("pause");
-        }
+        // Yield after each segment to let the receive path process ACKs
+        // without spinning. The send window check prevents overwhelming the peer.
+        SchedulerYield();
 
         if (s.tcpState != TcpState::Established) return -104;
     }
@@ -1508,23 +1941,72 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
     Socket& s = g_sockets[sockIdx];
     if (s.type != SOCK_STREAM) return -95;
 
-    // Wait for data (with timeout, ~10 seconds)
-    for (int i = 0; i < 10000000; i++) {
-        if (s.rxCount > 0) break;
-        if (s.tcpFinRecv) return 0; // EOF
-        if (s.tcpState == TcpState::Closed) return 0;
-        if (g_netIf && g_netIf->poll) g_netIf->poll(g_netIf);
-        __asm__ volatile("pause");
+    // Block until data arrives or the connection closes.
+    //
+    // IMPORTANT: the "is there data?" check must happen while holding the socket
+    // lock.  Without the lock, a packet can arrive between the check and setting
+    // pollWaiter — HandleTcp sees pollWaiter==null, skips the wakeup, and we
+    // sleep for the full 10-second timeout with data sitting in the buffer.
+    //
+    // We use a 10-second wakeupTick as a heartbeat so we re-check state
+    // periodically even without a data wakeup (e.g., after a missed timer).
+    // We do NOT return EAGAIN on a per-heartbeat timeout — blocking sockets
+    // must never surface EAGAIN, because callers (OpenSSL/curl) would retry
+    // immediately and each retry would stall another 10 seconds, giving the
+    // 6 × 10s = 60s failure pattern.  Instead we loop until data arrives,
+    // the connection closes, or a 30-second hard timeout fires.
+    if (s.rxCount == 0 && !s.tcpRstRecv && !s.tcpFinRecv &&
+        s.tcpState != TcpState::Closed) {
+
+        extern volatile uint64_t g_lapicTickCount;
+        Process* self = SchedulerCurrentProcess();
+        // 3-minute hard deadline — enough for slow TLS handshakes / server
+        // cache misses, but still bounded so a truly dead peer releases the
+        // caller rather than hanging forever.
+        uint64_t hardDeadline = g_lapicTickCount + 180000;
+
+        while (true) {
+            uint64_t irqFlags = SpinLockAcquire(&s.lock);
+            bool ready = s.rxCount > 0 || s.tcpRstRecv || s.tcpFinRecv
+                         || s.tcpState == TcpState::Closed
+                         || g_lapicTickCount >= hardDeadline;
+            if (ready) {
+                SpinLockRelease(&s.lock, irqFlags);
+                break;
+            }
+            // Set pollWaiter while holding the lock so HandleTcp can never
+            // enqueue data and miss the wakeup in a race window.
+            s.pollWaiter = self;
+            self->wakeupTick = g_lapicTickCount + 10000; // heartbeat every 10s
+            SpinLockRelease(&s.lock, irqFlags);
+            SchedulerBlock(self);
+            // Woken by data (HandleTcp), heartbeat tick, or spurious —
+            // loop back to re-check under the lock.
+        }
     }
 
     if (s.rxCount == 0) {
-        if (s.tcpFinRecv || s.tcpState != TcpState::Established)
+        if (s.tcpRstRecv) {
+            SerialPrintf("tcp: SockRecv ECONNRESET (RST) fd=%d\n", sockIdx);
+            return -104; // ECONNRESET
+        }
+        if (s.tcpFinRecv || s.tcpState != TcpState::Established) {
+            SerialPrintf("tcp: SockRecv EOF fd=%d finRecv=%d state=%d\n",
+                         sockIdx, (int)s.tcpFinRecv, (int)s.tcpState);
             return 0; // EOF
-        return -11; // EAGAIN
+        }
+        // 30-second hard timeout — connection is established but no data
+        // arrived at all.  Server likely gone without sending RST/FIN.
+        SerialPrintf("tcp: SockRecv hard timeout fd=%d rxPkts=%u state=%d\n",
+                     sockIdx, s.rxPktCount, (int)s.tcpState);
+        return -110; // ETIMEDOUT (not EAGAIN — blocking socket must not return EAGAIN)
     }
 
     // Stream read — no framing, just read bytes from ring buffer
+    uint64_t irqFlags = SpinLockAcquire(&s.lock);
     uint32_t copyLen = s.rxCount < len ? s.rxCount : len;
+    // Capture free space BEFORE consuming, to decide whether window was constrained.
+    uint32_t freeBefore = Socket::RX_BUF_SIZE - s.rxCount;
     uint8_t* dst = static_cast<uint8_t*>(buf);
     for (uint32_t i = 0; i < copyLen; i++) {
         dst[i] = s.rxBuf[s.rxTail];
@@ -1532,8 +2014,46 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
     }
     __asm__ volatile("mfence" ::: "memory");
     s.rxCount -= copyLen;
+    uint32_t freeAfter = Socket::RX_BUF_SIZE - s.rxCount;
+    TcpState stateSnap = s.tcpState;
+    SpinLockRelease(&s.lock, irqFlags);
+
+    // Send a window update ACK only when:
+    //   1. The receive window was constrained (< 2 MSS of free space), AND
+    //   2. It has now opened up enough for the server to send another segment.
+    // During normal flow where the buffer is not near-full, no ACK is needed —
+    // HandleTcp already ACKed each incoming segment as it arrived.
+    // This prevents ACK storms when the application reads in MSS-sized chunks.
+    static constexpr uint32_t MSS = 1460;
+    bool wasConstrained = freeBefore < 2 * MSS;
+    bool nowOpen        = freeAfter  >= MSS;
+    if (wasConstrained && nowOpen && stateSnap == TcpState::Established)
+        TcpSendSegment(s, TCP_ACK, nullptr, 0, "wnd-update");
 
     return static_cast<int>(copyLen);
+}
+
+bool SockIsStream(int sockIdx)
+{
+    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return false;
+    if (!g_sockUsed[sockIdx]) return false;
+    return g_sockets[sockIdx].type == SOCK_STREAM;
+}
+
+int SockGetType(int sockIdx)
+{
+    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return -1;
+    if (!g_sockUsed[sockIdx]) return -1;
+    return g_sockets[sockIdx].type;
+}
+
+void SockGetLocal(int sockIdx, uint32_t* ip, uint16_t* port)
+{
+    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return;
+    if (!g_sockUsed[sockIdx]) return;
+    Socket& s = g_sockets[sockIdx];
+    if (ip)   *ip   = s.localIp;
+    if (port) *port = s.localPort;
 }
 
 bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite)
@@ -1551,6 +2071,7 @@ bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite)
         if (s.listening && s.acceptQueueCount > 0) return true;
         if (s.rxCount > 0) return true;
         if (s.tcpFinRecv) return true; // EOF is readable
+        if (s.tcpRstRecv) return true; // RST is readable (returns ECONNRESET)
         if (s.type == SOCK_STREAM &&
             s.tcpState != TcpState::Established &&
             s.tcpState != TcpState::SynSent &&
@@ -1562,6 +2083,13 @@ bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite)
             return true;
     }
     return false;
+}
+
+uint32_t SockRxCount(int sockIdx)
+{
+    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return 0;
+    if (!g_sockUsed[sockIdx]) return 0;
+    return g_sockets[sockIdx].rxCount;
 }
 
 int SockListen(int sockIdx, int backlog)
@@ -1593,8 +2121,13 @@ int SockAccept(int sockIdx, SockAddrIn* addr)
     Socket& s = g_sockets[sockIdx];
     if (!s.listening) return -1;
 
-    // Poll until we have a completed connection in the accept queue
-    for (int attempt = 0; attempt < 50000; attempt++)
+    // Drive the network stack a handful of times with proper yields so we
+    // don't monopolise the CPU if no client is pending.  Real wakeup on
+    // SYN arrival would be ideal, but this is good enough until we wire
+    // per-socket wait queues.  The old 50000-iteration busy loop with a
+    // 1000-iter volatile spin burned ~30–50 ms per call and showed up as
+    // 17% of non-idle kernel time during a nix install.
+    for (int attempt = 0; attempt < 16; attempt++)
     {
         if (g_netIf && g_netIf->poll) g_netIf->poll(g_netIf);
 
@@ -1629,8 +2162,8 @@ int SockAccept(int sockIdx, SockAddrIn* addr)
             }
         }
 
-        // Brief pause before retrying
-        for (volatile int p = 0; p < 1000; p++) {}
+        // Yield so other work can run while we wait for a SYN to land.
+        SchedulerYield();
     }
 
     return -11; // EAGAIN
@@ -1693,7 +2226,9 @@ static void DebugChannelThreadFn(void* /*arg*/)
     s.remotePort = addr.sin_port;
 
     if (!s.bound) {
-        s.localPort = htons(g_tcpEphemeralPort++);
+        uint32_t port = __atomic_fetch_add(&g_tcpEphemeralPort, 1, __ATOMIC_RELAXED);
+        if (port >= 65535) __atomic_store_n(&g_tcpEphemeralPort, 49200, __ATOMIC_RELAXED);
+        s.localPort = htons(static_cast<uint16_t>(port));
         s.localIp   = g_netIf ? g_netIf->ipAddr : 0;
         s.bound     = true;
     }
@@ -1703,9 +2238,11 @@ static void DebugChannelThreadFn(void* /*arg*/)
     s.tcpSndUna  = s.tcpSndIss;
     s.tcpRcvNxt  = 0;
     s.tcpFinRecv = false;
+    s.tcpRstRecv = false;
+    s.tcpSndWnd  = 65535;
     s.tcpState   = TcpState::SynSent;
 
-    TcpSendSegment(s, TCP_SYN, nullptr, 0);
+    TcpSendSegment(s, TCP_SYN, nullptr, 0, "connect-poll");
     s.tcpSndNxt++;
 
     for (int i = 0; i < 200; i++) {
@@ -1858,7 +2395,9 @@ static void DebugHandleCommand(const char* cmd, uint32_t len)
             "  procs           - process list\n"
             "  net             - network interface info\n"
             "  sock            - open sockets\n"
-            "  mem             - memory statistics\n"
+            "  mem             - memory statistics (PMM + heap summary)\n"
+            "  mem heap        - detailed heap block breakdown\n"
+            "  mem pids        - per-PID PMM page counts (to serial)\n"
             "  uptime          - system uptime + wall clock\n"
             "  cpus            - CPU count + SMP info\n"
             "\n"
@@ -2025,6 +2564,51 @@ static void DebugHandleCommand(const char* cmd, uint32_t len)
         const char* h4 = " KB\n";
         for (int i = 0; h4[i]; i++) buf[p++] = h4[i];
         SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
+    }
+
+    // -----------------------------------------------------------------------
+    // mem heap — detailed heap block stats
+    // -----------------------------------------------------------------------
+    else if (NetStrEq(cmd, "mem heap") || NetStrEq(cmd, "heap")) {
+        HeapStats s;
+        HeapGetStats(&s);
+        char buf[320];
+        int p = 0;
+        const char* h1 = "heap: size=";
+        for (int i = 0; h1[i]; i++) buf[p++] = h1[i];
+        p += UintToStr(buf + p, static_cast<uint32_t>(s.heapSizeBytes / 1024));
+        const char* h2 = " KB blocks=";
+        for (int i = 0; h2[i]; i++) buf[p++] = h2[i];
+        p += UintToStr(buf + p, s.totalBlocks);
+        const char* h3 = " used=";
+        for (int i = 0; h3[i]; i++) buf[p++] = h3[i];
+        p += UintToStr(buf + p, s.usedBlocks);
+        const char* h4 = " free=";
+        for (int i = 0; h4[i]; i++) buf[p++] = h4[i];
+        p += UintToStr(buf + p, s.freeBlocks);
+        const char* h5 = "\n      used_bytes=";
+        for (int i = 0; h5[i]; i++) buf[p++] = h5[i];
+        p += UintToStr(buf + p, static_cast<uint32_t>(s.usedBytes));
+        const char* h6 = " free_bytes=";
+        for (int i = 0; h6[i]; i++) buf[p++] = h6[i];
+        p += UintToStr(buf + p, static_cast<uint32_t>(s.freeBytes));
+        const char* h7 = " largest_free=";
+        for (int i = 0; h7[i]; i++) buf[p++] = h7[i];
+        p += UintToStr(buf + p, s.largestFreeBlock);
+        const char* h8 = " poison=";
+        for (int i = 0; h8[i]; i++) buf[p++] = h8[i];
+        const char* pn = s.poisonEnabled ? "on" : "off";
+        for (int i = 0; pn[i]; i++) buf[p++] = pn[i];
+        buf[p++] = '\n';
+        SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
+    }
+
+    // -----------------------------------------------------------------------
+    // mem pids — per-PID page counts (PMM)
+    // -----------------------------------------------------------------------
+    else if (NetStrEq(cmd, "mem pids")) {
+        PmmDumpPidStats();
+        DebugChannelSend("mem pids: written to serial (see kernel log)\n");
     }
 
     // -----------------------------------------------------------------------

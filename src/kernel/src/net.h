@@ -3,10 +3,13 @@
 // Minimal network stack: Ethernet, ARP, IPv4, ICMP, UDP, TCP.
 
 #pragma once
+#include "spinlock.h"
 
 #include <stdint.h>
 
 namespace brook {
+
+struct Process;  // forward declaration for poll waiter
 
 // ---------------------------------------------------------------------------
 // Ethernet
@@ -171,14 +174,25 @@ struct NetIf {
 // Initialise network subsystem.
 void NetInit();
 
-// Register a network interface. Currently single-NIC only.
+// Register a network interface. Up to NET_MAX_IFS (4) may be registered.
 void NetRegisterIf(NetIf* nif);
 
 // Called by the NIC driver when a frame arrives.
 void NetReceive(NetIf* nif, const void* frame, uint32_t len);
 
-// Get the primary network interface.
+// Get the primary (first-registered) network interface.
 NetIf* NetGetIf();
+
+// Total registered interface count and accessor.
+uint32_t NetIfCount();
+NetIf* NetIfAt(uint32_t idx);
+
+// Pick the interface that should source packets destined for dstIp. Chooses
+// a configured interface whose subnet matches dstIp; falls back to the
+// primary (default-route) interface when no subnet matches.
+NetIf* NetIfForDst(uint32_t dstIp);
+
+static constexpr uint32_t NET_MAX_IFS = 4;
 
 // Send an IPv4 packet. Handles Ethernet framing and ARP resolution.
 // Returns 0 on success, negative on error.
@@ -197,6 +211,9 @@ int NetSendUdp(uint32_t dstIp, uint16_t srcPort, uint16_t dstPort,
 // Returns true if resolved, false on timeout.
 bool ArpResolve(uint32_t ip, MacAddr* outMac);
 
+// Insert a known mapping into the ARP cache.
+void ArpCacheInsert(uint32_t ip, const MacAddr& mac);
+
 // ---------------------------------------------------------------------------
 // DHCP (minimal)
 // ---------------------------------------------------------------------------
@@ -204,6 +221,15 @@ bool ArpResolve(uint32_t ip, MacAddr* outMac);
 // Perform DHCP discovery to obtain an IP address.
 // Blocks until complete or timeout. Returns true on success.
 bool DhcpDiscover(NetIf* nif);
+
+// Read /boot/BROOK.CFG and, if NET0_MODE=static, configure the interface's
+// ipAddr/netmask/gateway/dns from NET0_IP / NET0_NETMASK / NET0_GATEWAY /
+// NET0_DNS. Returns true if a static config was applied (caller should skip
+// DHCP); false otherwise.
+bool NetApplyStaticConfig(NetIf* nif);
+
+// Start the net_poll background thread. Must be called AFTER SchedulerInit().
+void NetStartPollThread();
 
 // ---------------------------------------------------------------------------
 // Socket layer (kernel-side)
@@ -236,9 +262,13 @@ struct Socket {
     uint16_t  remotePort;  // big-endian
     bool      bound;
     bool      connected;
-
-    // Receive buffer (ring buffer for incoming data)
-    static constexpr uint32_t RX_BUF_SIZE = 65536;
+    // Receive buffer (ring buffer for incoming data).
+    // 512 KB gives enough headroom for multi-MB NAR downloads: curl does TLS
+    // crypto + pipes to xz while the server sends at line rate, so the kernel
+    // buffer needs to absorb a burst without triggering zero-window flow-control
+    // on every other segment (which would require many round-trips and risks
+    // the server's RTO firing and RST'ing the connection).
+    static constexpr uint32_t RX_BUF_SIZE = 524288; // 512 KB
     uint8_t*  rxBuf;
     uint32_t  rxHead;
     uint32_t  rxTail;
@@ -254,7 +284,9 @@ struct Socket {
     uint32_t  tcpSndUna;   // oldest unacknowledged
     uint32_t  tcpRcvNxt;   // next expected receive sequence
     uint32_t  tcpSndIss;   // initial send sequence number
+    uint16_t  tcpSndWnd;   // peer's advertised receive window (host-endian)
     volatile bool tcpFinRecv; // FIN received from peer
+    volatile bool tcpRstRecv; // RST received from peer (→ ECONNRESET)
 
     // Listen/accept queue (server-side)
     static constexpr int ACCEPT_QUEUE_MAX = 16;
@@ -266,6 +298,22 @@ struct Socket {
 
     // Reference counting for fork/dup
     volatile uint32_t refCount;        // number of fds pointing at this socket (1 on create)
+
+    // Diagnostic counters (not reset on reuse — per-socket lifetime)
+    uint32_t rxPktCount;   // total TCP segments received on this socket
+    uint32_t txPktCount;   // total TCP segments transmitted on this socket
+    uint32_t oooDropCount; // TCP segments dropped for being out-of-order
+    uint64_t lastStaleAckTick; // last tick we dup-ACKed a stale/duplicate segment
+
+    // Owner PID (tgid) — set when socket is created via sys_socket. Diagnostic only.
+    uint32_t ownerPid;
+
+    // Poll waiter — process to wake when data arrives
+    Process* pollWaiter;
+
+    // Spinlock protecting rxBuf/rxHead/rxTail/rxCount and TCP state fields.
+    // Acquired by both the IRQ handler (HandleTcp) and userspace syscall paths.
+    SpinLock lock;
 };
 
 // Create a kernel socket. Returns socket index or negative error.
@@ -278,9 +326,14 @@ int  SockRecvFrom(int sockIdx, void* buf, uint32_t len,
                   SockAddrIn* src);
 int  SockSend(int sockIdx, const void* buf, uint32_t len);
 int  SockRecv(int sockIdx, void* buf, uint32_t len);
+bool SockIsStream(int sockIdx);  // returns true for SOCK_STREAM (TCP)
+int  SockGetType(int sockIdx);  // returns SOCK_STREAM(1) or SOCK_DGRAM(2)
+void SockGetLocal(int sockIdx, uint32_t* ip, uint16_t* port);
 int  SockListen(int sockIdx, int backlog);
 int  SockAccept(int sockIdx, SockAddrIn* addr);
 bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite);
+uint32_t SockRxCount(int sockIdx);
+void SockSetPollWaiter(int sockIdx, Process* waiter);
 void SockClose(int sockIdx);
 void SockRef(int sockIdx);    // increment refcount (fork/dup)
 void SockUnref(int sockIdx);  // decrement refcount, destroy at 0

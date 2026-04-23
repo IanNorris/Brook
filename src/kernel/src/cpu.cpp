@@ -40,6 +40,15 @@ void CpuInitFpu()
 
     brook::SerialPrintf("CPU: FPU/SSE enabled (CR0=0x%lx CR4=0x%lx)\n",
                         ReadCr0(), ReadCr4());
+
+    // Report SSE4.2 — glibc ifunc resolvers use it to pick optimised paths.
+    uint32_t ecx_val;
+    __asm__ volatile("cpuid" : "=c"(ecx_val) : "a"(1) : "ebx", "edx");
+    brook::SerialPrintf("CPU: SSE3=%s SSSE3=%s SSE4.1=%s SSE4.2=%s\n",
+                        (ecx_val & (1U << 0)) ? "yes" : "no",
+                        (ecx_val & (1U << 9)) ? "yes" : "no",
+                        (ecx_val & (1U << 19)) ? "yes" : "no",
+                        (ecx_val & (1U << 20)) ? "yes" : "no");
 }
 
 bool CpuHasSse2()
@@ -49,6 +58,14 @@ bool CpuHasSse2()
     uint32_t edx;
     __asm__ volatile("cpuid" : "=d"(edx) : "a"(1) : "ebx", "ecx");
     return (edx >> 26) & 1;
+}
+
+bool CpuHasRdrand()
+{
+    // CPUID leaf 1, ECX bit 30 = RDRAND support.
+    uint32_t ecx;
+    __asm__ volatile("cpuid" : "=c"(ecx) : "a"(1) : "ebx", "edx");
+    return (ecx >> 30) & 1;
 }
 
 // ---------------------------------------------------------------------------

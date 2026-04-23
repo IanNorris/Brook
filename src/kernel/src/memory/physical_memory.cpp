@@ -478,8 +478,8 @@ void PmmKillPid(uint16_t pid)
     uint64_t flags = SpinLockAcquire(&g_pmmLock);
 
     uint32_t idx = g_pidLists[pid].head;
-    uint32_t count = 0;
-    uint32_t shared = 0;
+    [[maybe_unused]] uint32_t count = 0;
+    [[maybe_unused]] uint32_t shared = 0;
 
     while (idx != PMM_NULL_PAGE)
     {
@@ -487,11 +487,9 @@ void PmmKillPid(uint16_t pid)
 
         if (Desc(idx).refCount > 1)
         {
-            // COW shared page — decrement refcount, don't free
+            // COW shared page — decrement refcount, remove from this PID's list
             Desc(idx).refCount--;
-            // Unlink from this PID's list only
-            Desc(idx).next = PMM_NULL_PAGE;
-            Desc(idx).prev = PMM_NULL_PAGE;
+            ListRemove(idx);  // update neighbours so list stays consistent
             shared++;
         }
         else
@@ -515,7 +513,7 @@ void PmmKillPid(uint16_t pid)
 
     SpinLockRelease(&g_pmmLock, flags);
 
-    SerialPrintf("PMM: PmmKillPid(%u): processed %u pages (%u shared, refcount decremented)\n",
+    DbgPrintf("PMM: PmmKillPid(%u): processed %u pages (%u shared, refcount decremented)\n",
                  static_cast<uint32_t>(pid), count, shared);
 }
 

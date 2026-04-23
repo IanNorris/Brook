@@ -19,6 +19,7 @@ static constexpr uint16_t GDT_STAR_USER   = 0x18;  // STAR[63:48]
 
 // IST slots in the TSS (1-indexed; 0 = no IST).
 static constexpr uint8_t IST_DOUBLE_FAULT = 1;  // IST1 → dedicated double-fault stack
+static constexpr uint8_t IST_NMI         = 2;  // IST2 → dedicated NMI stack
 
 struct GdtEntry {
     uint16_t limitLow;

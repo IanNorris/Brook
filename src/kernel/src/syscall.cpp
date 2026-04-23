@@ -9,12 +9,12 @@
 #include "panic.h"
 #include "process.h"
 #include "scheduler.h"
+#include "spinlock.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "vfs.h"
 #include "tty.h"
 #include "input.h"
-#include "serial_writer.h"
 #include "pipe.h"
 #include "memory/heap.h"
 #include "compositor.h"
@@ -22,9 +22,40 @@
 #include "terminal.h"
 #include "net.h"
 #include "rtc.h"
+#include "audio.h"
+#include "profiler.h"
 
 // Forward declaration
 extern "C" __attribute__((naked)) void ReturnToKernel();
+
+// ---------------------------------------------------------------------------
+// Random helpers: RDRAND with TSC fallback
+// ---------------------------------------------------------------------------
+
+// Software PRNG fallback using TSC + LCG mixing (used when rdrand unavailable).
+static uint64_t SoftRandU64()
+{
+    uint64_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    uint64_t tsc = (hi << 32) | lo;
+    tsc ^= tsc << 13;
+    tsc ^= tsc >> 7;
+    tsc ^= tsc << 17;
+    return tsc * 6364136223846793005ULL + 1442695040888963407ULL;
+}
+
+static bool RdrandU64(uint64_t* out)
+{
+    if (!CpuHasRdrand()) return false;
+    uint64_t val;
+    uint8_t ok;
+    for (int i = 0; i < 10; i++)
+    {
+        __asm__ volatile("rdrand %0; setc %1" : "=r"(val), "=qm"(ok));
+        if (ok) { *out = val; return true; }
+    }
+    return false;
+}
 
 // ---------------------------------------------------------------------------
 // C dispatch wrapper — reads syscall number from GS:120, applies strace.
@@ -184,6 +215,9 @@ static constexpr int64_t EINTR   = 4;
 static constexpr int64_t ENOTDIR = 20;
 static constexpr int64_t EIO     = 5;
 static constexpr int64_t ENOTCONN = 107;
+static constexpr int64_t EAFNOSUPPORT = 97;
+static constexpr int64_t ECONNREFUSED = 111;
+static constexpr int64_t ETIMEDOUT    = 110;
 
 // Check if the current process has deliverable signals pending.
 // Call after SchedulerBlock() returns to decide whether to return -EINTR.
@@ -193,6 +227,148 @@ static bool HasPendingSignals()
     if (!proc) return false;
     return (proc->sigPending & ~proc->sigMask) != 0;
 }
+
+// EventFd data structure (used in read/write/poll/close)
+struct EventFdData {
+    volatile uint64_t counter;
+    uint32_t flags;
+    Process* readerWaiter;
+};
+static constexpr uint32_t EFD_SEMAPHORE = 0x01;
+[[maybe_unused]] static constexpr uint32_t EFD_CLOEXEC = 0x80000;
+static constexpr uint32_t EFD_NONBLOCK  = 0x800;
+
+// timerfd constants and data — defined here so sys_read/sys_poll can use them
+static constexpr int TFD_NONBLOCK     = 0x800;
+static constexpr int TFD_CLOEXEC      = 0x80000;
+static constexpr int TFD_TIMER_ABSTIME = 1;
+static constexpr uint64_t LAPIC_TICKS_PER_MS = 1; // LAPIC ticks ≈ 1ms each
+
+struct TimerFdData {
+    volatile uint64_t expiryCount; // number of expirations since last read
+    uint64_t  intervalNs;          // interval in nanoseconds (0 = one-shot)
+    uint64_t  nextExpiry;          // absolute LAPIC tick of next expiry
+    int       clockId;
+    bool      armed;
+    Process*  waiter;              // process blocked in read() or epoll
+};
+
+// memfd constants and data — defined here so sys_read/sys_write/fstat can use them
+static constexpr uint32_t MFD_CLOEXEC       = 0x0001u;
+[[maybe_unused]] static constexpr uint32_t MFD_ALLOW_SEALING = 0x0002u;
+
+struct MemFdData {
+    uint8_t*  buf;
+    uint64_t  size;
+    uint64_t  capacity;
+};
+
+// ---------------------------------------------------------------------------
+// AF_UNIX path sockets — structs and helpers defined here so
+// sys_read/sys_write/sys_close can use them
+// ---------------------------------------------------------------------------
+
+static constexpr int AF_UNIX           = 1;
+static constexpr int UNIX_SOCK_NONBLOCK = 0x800;
+static constexpr int UNIX_SOCK_CLOEXEC  = 0x80000;
+static constexpr int UNIX_MAX_SERVERS   = 16;
+static constexpr int UNIX_ACCEPT_QUEUE  = 8;
+
+struct UnixPendingConn {
+    PipeBuffer* serverRx;     // server reads this (client→server data)
+    PipeBuffer* serverTx;     // server writes this (server→client data)
+    Process*    clientWaiter; // client blocked until accept() completes
+    bool        accepted;
+    bool        used;
+};
+
+struct UnixSocketData {
+    enum class State : uint8_t { Unbound, Listening, Connected };
+    State   state;
+    bool    nonblock;
+    char    path[108];
+    UnixPendingConn pending[UNIX_ACCEPT_QUEUE];
+    int             pendingCount;
+    Process*        acceptWaiter;
+    PipeBuffer* rxPipe;
+    PipeBuffer* txPipe;
+};
+
+struct SockAddrUn {
+    uint16_t sun_family; // AF_UNIX = 1
+    char     sun_path[108];
+};
+
+static UnixSocketData* g_unixServers[UNIX_MAX_SERVERS];
+
+static UnixSocketData* UnixFindServer(const char* path)
+{
+    for (int i = 0; i < UNIX_MAX_SERVERS; i++) {
+        if (!g_unixServers[i]) continue;
+        if (g_unixServers[i]->state != UnixSocketData::State::Listening) continue;
+        const char* a = g_unixServers[i]->path;
+        const char* b = path;
+        bool match = true;
+        while (*a || *b) { if (*a++ != *b++) { match = false; break; } }
+        if (match) return g_unixServers[i];
+    }
+    return nullptr;
+}
+
+static void UnixRegisterServer(UnixSocketData* usd)
+{
+    for (int i = 0; i < UNIX_MAX_SERVERS; i++) {
+        if (!g_unixServers[i]) { g_unixServers[i] = usd; return; }
+    }
+}
+
+static void UnixUnregisterServer(UnixSocketData* usd)
+{
+    for (int i = 0; i < UNIX_MAX_SERVERS; i++) {
+        if (g_unixServers[i] == usd) { g_unixServers[i] = nullptr; return; }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OSS /dev/dsp state and ioctl definitions
+// ---------------------------------------------------------------------------
+
+// OSS ioctl numbers (from <sys/soundcard.h>)
+static constexpr uint64_t SNDCTL_DSP_RESET     = 0x5000;
+static constexpr uint64_t SNDCTL_DSP_SPEED     = 0xC0045002; // _IOWR('P', 2, int)
+static constexpr uint64_t SNDCTL_DSP_SETFMT    = 0xC0045005; // _IOWR('P', 5, int)
+static constexpr uint64_t SNDCTL_DSP_CHANNELS  = 0xC0045006; // _IOWR('P', 6, int)
+static constexpr uint64_t SNDCTL_DSP_STEREO    = 0xC0045003; // _IOWR('P', 3, int)
+static constexpr uint64_t SNDCTL_DSP_GETOSPACE = 0x800C5012; // _IOR('P', 0x12, audio_buf_info)
+static constexpr uint64_t SNDCTL_DSP_GETCAPS   = 0x8004500F; // _IOR('P', 0x0F, int)
+static constexpr uint64_t SNDCTL_DSP_SETTRIGGER= 0x40045010; // _IOW('P', 0x10, int)
+static constexpr uint64_t SNDCTL_DSP_GETFMTS   = 0x8004500B; // _IOR('P', 0x0B, int)
+static constexpr uint64_t SNDCTL_DSP_SETFRAGMENT= 0xC004500A;// _IOWR('P', 0x0A, int)
+static constexpr uint64_t SNDCTL_DSP_GETBLKSIZE = 0xC0045004;// _IOWR('P', 4, int)
+
+// OSS audio formats
+static constexpr int AFMT_U8     = 0x00000008;
+static constexpr int AFMT_S16_LE = 0x00000010;
+// OSS capabilities
+static constexpr int DSP_CAP_TRIGGER = 0x00000010;
+
+// Per-fd audio device state
+struct DspState {
+    uint32_t sampleRate;
+    uint8_t  channels;
+    uint8_t  bitsPerSample;
+    uint16_t fragmentSize;   // bytes per fragment
+    uint32_t bufferOffset;   // write cursor into staging buffer
+    uint8_t* buffer;         // staging buffer (kmalloc'd)
+    uint32_t bufferSize;     // total staging buffer size
+    uint32_t mixerStreamId;  // mixer stream slot (0-7)
+};
+
+static constexpr uint32_t DSP_DEFAULT_RATE     = 48000;
+static constexpr uint8_t  DSP_DEFAULT_CHANNELS = 1;
+static constexpr uint8_t  DSP_DEFAULT_BITS     = 8;
+static constexpr uint32_t DSP_HW_RATE          = 44100; // hardware playback rate
+static constexpr uint32_t DSP_BUFFER_SIZE      = 65536; // 64KB staging buffer
 
 // ---------------------------------------------------------------------------
 // sys_write (1)
@@ -230,13 +406,21 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
             const char* buf = reinterpret_cast<const char*>(bufAddr);
             if (count > 0)
             {
-                SerialWriterEnqueue(buf, static_cast<uint32_t>(count));
+                brook::SerialLock();
+                for (uint64_t i = 0; i < count; i++)
+                    brook::SerialPutChar(buf[i]);
+                brook::SerialUnlock();
                 for (uint64_t i = 0; i < count; i++)
                     TtyPutChar(buf[i]);
             }
             return static_cast<int64_t>(count);
         }
-        // Fall through to FD-table-based write below
+        // Fall through to FD-table-based write below. (Historically we
+        // mirrored redirected stdout/stderr to the serial log here, but
+        // that corrupts binary pipelines — e.g. curl | xz | nar-unpack
+        // dumps the compressed NAR stream onto the serial console — and
+        // makes debug output confusing. If you need pipe content in logs,
+        // explicitly tee to fd 3.)
     }
 
     // File descriptor write
@@ -263,8 +447,100 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
     }
 
     // /dev/null — discard all writes
-    if (fde->type == FdType::DevNull)
+    if (fde->type == FdType::DevNull || fde->type == FdType::DevUrandom)
         return static_cast<int64_t>(count);
+
+    // /dev/dsp — pass PCM data through the audio mixer.
+    // All streams are resampled to 44100 Hz stereo 16-bit, then submitted
+    // to the mixer which accumulates and flushes to hardware.
+    if (fde->type == FdType::DevDsp && fde->handle)
+    {
+        auto* dsp = static_cast<DspState*>(fde->handle);
+        const uint8_t* src = reinterpret_cast<const uint8_t*>(bufAddr);
+        uint32_t appRate = dsp->sampleRate;
+        uint32_t bytesPerFrame = (dsp->bitsPerSample / 8) * dsp->channels;
+        if (bytesPerFrame == 0) bytesPerFrame = 1;
+
+        const int16_t* mixSrc = nullptr;
+        uint32_t mixFrames = 0;
+
+        if (appRate == DSP_HW_RATE || appRate == 0)
+        {
+            // Already at hardware rate — can submit directly
+            if (dsp->channels == 2 && dsp->bitsPerSample == 16)
+            {
+                mixSrc = reinterpret_cast<const int16_t*>(src);
+                mixFrames = static_cast<uint32_t>(count) / 4;
+            }
+            else
+            {
+                // Mono→stereo or 8→16 bit conversion needed
+                uint32_t inFrames = static_cast<uint32_t>(count) / bytesPerFrame;
+                uint32_t outBytes = inFrames * 4; // stereo 16-bit
+                if (outBytes > dsp->bufferSize) outBytes = dsp->bufferSize;
+                uint32_t outFrames = outBytes / 4;
+                int16_t* out = reinterpret_cast<int16_t*>(dsp->buffer);
+
+                for (uint32_t i = 0; i < outFrames; i++)
+                {
+                    int16_t sample;
+                    if (dsp->bitsPerSample == 8)
+                        sample = (static_cast<int16_t>(src[i * (dsp->channels == 2 ? 2 : 1)]) - 128) << 8;
+                    else
+                        sample = reinterpret_cast<const int16_t*>(src)[i * (dsp->channels == 2 ? 2 : 1)];
+                    out[i * 2 + 0] = sample; // L
+                    out[i * 2 + 1] = (dsp->channels == 2)
+                        ? (dsp->bitsPerSample == 8
+                            ? (static_cast<int16_t>(src[i * 2 + 1]) - 128) << 8
+                            : reinterpret_cast<const int16_t*>(src)[i * 2 + 1])
+                        : sample; // R = L for mono
+                }
+                mixSrc = out;
+                mixFrames = outFrames;
+            }
+        }
+        else
+        {
+            // Resample to 44100 Hz stereo 16-bit
+            uint32_t inFrames  = static_cast<uint32_t>(count) / bytesPerFrame;
+            uint32_t outFrames = (inFrames * DSP_HW_RATE + appRate - 1) / appRate;
+            uint32_t outBytes  = outFrames * 4; // stereo 16-bit
+            if (outBytes > dsp->bufferSize) outBytes = dsp->bufferSize;
+            outFrames = outBytes / 4;
+
+            int16_t* out = reinterpret_cast<int16_t*>(dsp->buffer);
+
+            for (uint32_t i = 0; i < outFrames; i++)
+            {
+                uint32_t srcFrame = (uint64_t)i * appRate / DSP_HW_RATE;
+                if (srcFrame >= inFrames) srcFrame = inFrames - 1;
+
+                int16_t sample;
+                if (dsp->bitsPerSample == 8)
+                    sample = (static_cast<int16_t>(src[srcFrame * (dsp->channels == 2 ? 2 : 1)]) - 128) << 8;
+                else
+                    sample = reinterpret_cast<const int16_t*>(src)[srcFrame * (dsp->channels == 2 ? 2 : 1)];
+
+                out[i * 2 + 0] = sample; // L
+                out[i * 2 + 1] = (dsp->channels == 2)
+                    ? (dsp->bitsPerSample == 8
+                        ? (static_cast<int16_t>(src[srcFrame * 2 + 1]) - 128) << 8
+                        : reinterpret_cast<const int16_t*>(src)[srcFrame * 2 + 1])
+                    : sample; // R = L for mono
+            }
+            mixSrc = out;
+            mixFrames = outFrames;
+        }
+
+        if (mixSrc && mixFrames > 0)
+        {
+            bool nonblock = (fde->statusFlags & 0x800) != 0; // O_NONBLOCK
+            AudioPlay(mixSrc, mixFrames * MIXER_FRAME_BYTES,
+                      MIXER_HW_RATE, MIXER_HW_CHANNELS, MIXER_HW_BITS, nonblock);
+        }
+
+        return static_cast<int64_t>(count);
+    }
 
     // Write to /dev/tty (DevKeyboard) — route to serial + TTY framebuffer
     if (fde->type == FdType::DevKeyboard)
@@ -272,7 +548,10 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
         const char* buf = reinterpret_cast<const char*>(bufAddr);
         if (count > 0)
         {
-            SerialWriterEnqueue(buf, static_cast<uint32_t>(count));
+            brook::SerialLock();
+            for (uint64_t i = 0; i < count; i++)
+                brook::SerialPutChar(buf[i]);
+            brook::SerialUnlock();
             for (uint64_t i = 0; i < count; i++)
                 TtyPutChar(buf[i]);
         }
@@ -282,7 +561,10 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
     // Write to pipe — block until at least some bytes are written
     if (fde->type == FdType::Pipe && fde->handle)
     {
-        auto* pipe = static_cast<PipeBuffer*>(fde->handle);
+        // For bidirectional socketpair (flags==2), write goes to the write pipe
+        auto* pipe = (fde->flags == 2)
+            ? reinterpret_cast<PipeBuffer*>(fde->seekPos)
+            : static_cast<PipeBuffer*>(fde->handle);
         const char* src = reinterpret_cast<const char*>(bufAddr);
         uint64_t written = 0;
 
@@ -321,6 +603,24 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 return written > 0 ? static_cast<int64_t>(written) : -EINTR;
         }
         return static_cast<int64_t>(written);
+    }
+
+    // Write to eventfd — adds value to counter
+    if (fde->type == FdType::EventFd && fde->handle)
+    {
+        if (count < 8) return -EINVAL;
+        uint64_t val = *reinterpret_cast<const uint64_t*>(bufAddr);
+        if (val == 0xFFFFFFFFFFFFFFFFULL) return -EINVAL;
+        auto* efd = static_cast<EventFdData*>(fde->handle);
+        __atomic_fetch_add(&efd->counter, val, __ATOMIC_ACQ_REL);
+        // Wake blocked reader
+        Process* reader = efd->readerWaiter;
+        if (reader) {
+            efd->readerWaiter = nullptr;
+            __atomic_store_n(&reader->pendingWakeup, 1, __ATOMIC_RELEASE);
+            SchedulerUnblock(reader);
+        }
+        return 8;
     }
 
     // Write to socket (TCP stream)
@@ -368,6 +668,68 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
         return static_cast<int64_t>(written);
     }
 
+    // Write to memfd — grows buffer as needed
+    if (fde->type == FdType::MemFd && fde->handle)
+    {
+        auto* mfd = static_cast<MemFdData*>(fde->handle);
+        uint64_t pos = fde->seekPos;
+        uint64_t end = pos + count;
+
+        // Grow buffer if needed
+        if (end > mfd->capacity) {
+            uint64_t newCap = end + 4096;
+            auto* newBuf = static_cast<uint8_t*>(kmalloc(static_cast<uint32_t>(newCap)));
+            if (!newBuf) return -ENOMEM;
+            if (mfd->buf) {
+                for (uint64_t i = 0; i < mfd->size; i++) newBuf[i] = mfd->buf[i];
+                kfree(mfd->buf);
+            }
+            mfd->buf = newBuf;
+            mfd->capacity = newCap;
+        }
+
+        if (bufAddr < 0x1000) return -EFAULT;
+        __builtin_memcpy(mfd->buf + pos, reinterpret_cast<const void*>(bufAddr), count);
+        fde->seekPos += count;
+        if (fde->seekPos > mfd->size) mfd->size = fde->seekPos;
+        return static_cast<int64_t>(count);
+    }
+
+    // Write to AF_UNIX connected socket
+    if (fde->type == FdType::UnixSocket && fde->handle)
+    {
+        auto* usd = static_cast<UnixSocketData*>(fde->handle);
+        if (usd->state != UnixSocketData::State::Connected || !usd->txPipe)
+            return -ENOTCONN;
+        auto* pipe = usd->txPipe;
+        const char* src = reinterpret_cast<const char*>(bufAddr);
+        bool nonblock = usd->nonblock || (fde->statusFlags & 0x800);
+        uint64_t written = 0;
+
+        while (written < count) {
+            if (__atomic_load_n(&pipe->readers, __ATOMIC_ACQUIRE) == 0)
+                return written > 0 ? static_cast<int64_t>(written) : -EPIPE;
+            uint32_t chunk = pipe->write(src + written,
+                static_cast<uint32_t>(count - written > 4096 ? 4096 : count - written));
+            written += chunk;
+            if (written > 0) {
+                Process* reader = pipe->readerWaiter;
+                if (reader) {
+                    pipe->readerWaiter = nullptr;
+                    __atomic_store_n(&reader->pendingWakeup, 1, __ATOMIC_RELEASE);
+                    SchedulerUnblock(reader);
+                }
+                break;
+            }
+            if (nonblock) return -EAGAIN;
+            Process* self = ProcessCurrent();
+            pipe->writerWaiter = self;
+            SchedulerBlock(self);
+            if (HasPendingSignals()) return written > 0 ? static_cast<int64_t>(written) : -EINTR;
+        }
+        return static_cast<int64_t>(written);
+    }
+
     return -EBADF;
 }
 
@@ -395,6 +757,30 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     // /dev/null — always EOF
     if (fde->type == FdType::DevNull)
         return 0;
+
+    // /dev/urandom — fill buffer with RDRAND random bytes
+    if (fde->type == FdType::DevUrandom)
+    {
+        // Validate user buffer is in user address space
+        if (bufAddr == 0 || bufAddr >= 0x0000800000000000ULL)
+            return -EFAULT;
+        if (count > 0 && (bufAddr + count - 1) >= 0x0000800000000000ULL)
+            return -EFAULT;
+
+        auto* dst = reinterpret_cast<uint8_t*>(bufAddr);
+        uint64_t filled = 0;
+        while (filled < count) {
+            uint64_t rval;
+            if (!RdrandU64(&rval))
+                rval = SoftRandU64();
+            uint64_t remain = count - filled;
+            uint64_t chunk = (remain < 8) ? remain : 8;
+            for (uint64_t i = 0; i < chunk; i++)
+                dst[filled + i] = static_cast<uint8_t>(rval >> (i * 8));
+            filled += chunk;
+        }
+        return static_cast<int64_t>(count);
+    }
 
     // Synthetic in-memory files (/etc/passwd, /etc/group, etc.)
     if (fde->type == FdType::SyntheticMem && fde->handle)
@@ -432,10 +818,38 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 else
                     got = InputPollEvent(&ev);
                 if (!got) break;
+
                 uint8_t sc = ev.scanCode;
-                if (ev.type == InputEventType::KeyRelease)
-                    sc |= 0x80;
-                buf[bytesRead++] = sc;
+                bool release = (ev.type == InputEventType::KeyRelease);
+
+                // Translate synthetic extended codes back to PS/2 E0-prefixed
+                // two-byte sequences so userspace (DOOM, Quake) sees real scancodes.
+                uint8_t ps2 = 0;
+                switch (sc)
+                {
+                case SC_EXT_UP:     ps2 = 0x48; break;
+                case SC_EXT_DOWN:   ps2 = 0x50; break;
+                case SC_EXT_LEFT:   ps2 = 0x4B; break;
+                case SC_EXT_RIGHT:  ps2 = 0x4D; break;
+                case SC_EXT_HOME:   ps2 = 0x47; break;
+                case SC_EXT_END:    ps2 = 0x4F; break;
+                case SC_EXT_INSERT: ps2 = 0x52; break;
+                case SC_EXT_DELETE: ps2 = 0x53; break;
+                case SC_EXT_PGUP:   ps2 = 0x49; break;
+                case SC_EXT_PGDN:   ps2 = 0x51; break;
+                }
+
+                if (ps2)
+                {
+                    // Emit single-byte scancode (no E0 prefix) for compatibility
+                    // with apps that read 1 byte at a time (DOOM, etc.)
+                    buf[bytesRead++] = release ? (ps2 | 0x80) : ps2;
+                }
+                else
+                {
+                    if (release) sc |= 0x80;
+                    buf[bytesRead++] = sc;
+                }
             }
             return static_cast<int64_t>(bytesRead);
         }
@@ -444,11 +858,14 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         // Shells like ash use this for line editing.
         if (!proc->ttyCanonical)
         {
+            bool wmMode = WmIsActive();
             uint64_t bytesRead = 0;
             while (bytesRead < count)
             {
                 InputEvent ev;
-                if (!InputPollEvent(&ev))
+                bool got = wmMode ? ProcessInputPop(proc, &ev)
+                                  : InputPollEvent(&ev);
+                if (!got)
                 {
                     if (bytesRead > 0) break; // return what we have
                     // Register as waiter BEFORE re-checking, to close the
@@ -456,7 +873,9 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                     InputAddWaiter(proc);
                     // Re-check after registration — if data arrived between
                     // the first poll and AddWaiter, consume it immediately.
-                    if (InputPollEvent(&ev))
+                    got = wmMode ? ProcessInputPop(proc, &ev)
+                                : InputPollEvent(&ev);
+                    if (got)
                     {
                         InputRemoveWaiter(proc);
                         goto got_event_nc;
@@ -500,15 +919,20 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         static constexpr uint32_t LINE_BUF_MAX = 256;
         char lineBuf[LINE_BUF_MAX];
         uint32_t lineLen = 0;
+        bool wmMode = WmIsActive();
 
         for (;;)
         {
             InputEvent ev;
-            if (!InputPollEvent(&ev))
+            bool got = wmMode ? ProcessInputPop(proc, &ev)
+                              : InputPollEvent(&ev);
+            if (!got)
             {
                 // Register as waiter BEFORE re-checking to close the race.
                 InputAddWaiter(proc);
-                if (InputPollEvent(&ev))
+                got = wmMode ? ProcessInputPop(proc, &ev)
+                             : InputPollEvent(&ev);
+                if (got)
                 {
                     InputRemoveWaiter(proc);
                     goto got_event_cooked;
@@ -530,7 +954,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             if ((ev.modifiers & INPUT_MOD_CTRL) && (ev.scanCode == 0x2E)) // 'C'
             {
                 // Echo ^C and return empty line
-                SerialWriterEnqueue("^C\n", 3);
+                brook::SerialLock(); brook::SerialPutChar('^'); brook::SerialPutChar('C'); brook::SerialPutChar('\n'); brook::SerialUnlock();
                 TtyPutChar('^'); TtyPutChar('C'); TtyPutChar('\n');
                 buf[0] = '\n';
                 return 1;
@@ -547,7 +971,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             // Enter/Return
             if (c == '\r' || c == '\n' || ev.scanCode == 0x1C)
             {
-                SerialWriterEnqueue("\n", 1);
+                brook::SerialLock(); brook::SerialPutChar('\n'); brook::SerialUnlock();
                 TtyPutChar('\n');
                 if (lineLen < LINE_BUF_MAX)
                     lineBuf[lineLen++] = '\n';
@@ -560,7 +984,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 if (lineLen > 0)
                 {
                     lineLen--;
-                    SerialWriterEnqueue("\b \b", 3); // erase character
+                    brook::SerialLock(); brook::SerialPutChar('\b'); brook::SerialPutChar(' '); brook::SerialPutChar('\b'); brook::SerialUnlock();
                     TtyPutChar('\b'); TtyPutChar(' '); TtyPutChar('\b');
                 }
                 continue;
@@ -572,7 +996,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 if (lineLen < LINE_BUF_MAX - 1)
                 {
                     lineBuf[lineLen++] = '\t';
-                    SerialWriterEnqueue("\t", 1);
+                    brook::SerialLock(); brook::SerialPutChar('\t'); brook::SerialUnlock();
                     TtyPutChar('\t');
                 }
                 continue;
@@ -584,7 +1008,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 if (lineLen < LINE_BUF_MAX - 1)
                 {
                     lineBuf[lineLen++] = c;
-                    SerialWriterEnqueue(&c, 1); // echo
+                    brook::SerialLock(); brook::SerialPutChar(c); brook::SerialUnlock();
                     TtyPutChar(c);
                 }
                 continue;
@@ -628,6 +1052,10 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             if (wr == 0)
                 return 0;
 
+            // Non-blocking: return -EAGAIN instead of blocking
+            if (fde->statusFlags & 0x800) // O_NONBLOCK
+                return -EAGAIN;
+
             // Block until writer puts data or writer closes
             Process* self = ProcessCurrent();
             pipe->readerWaiter = self;
@@ -635,6 +1063,50 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             // (avoids permanent deadlock if close notification was missed)
             extern volatile uint64_t g_lapicTickCount;
             self->wakeupTick = g_lapicTickCount + 10; // recheck every ~10ms
+            SchedulerBlock(self);
+            if (HasPendingSignals())
+            {
+                // SIGCHLD is harmless during pipe reads — clear it and retry.
+                // Only return EINTR for other signals.
+                uint64_t pending = self->sigPending & ~self->sigMask;
+                uint64_t sigchldBit = (1ULL << (17 - 1)); // SIGCHLD = 17
+                if ((pending & ~sigchldBit) != 0)
+                    return -EINTR;
+                self->sigPending &= ~sigchldBit;
+            }
+        }
+    }
+
+    // Read from eventfd — returns counter as uint64, resets to 0
+    if (fde->type == FdType::EventFd && fde->handle)
+    {
+        if (count < 8) return -EINVAL;
+        auto* efd = static_cast<EventFdData*>(fde->handle);
+
+        for (;;)
+        {
+            uint64_t val = __atomic_load_n(&efd->counter, __ATOMIC_ACQUIRE);
+            if (val > 0)
+            {
+                if (efd->flags & EFD_SEMAPHORE) {
+                    __atomic_fetch_sub(&efd->counter, 1, __ATOMIC_ACQ_REL);
+                    val = 1;
+                } else {
+                    __atomic_store_n(&efd->counter, 0ULL, __ATOMIC_RELEASE);
+                }
+                *reinterpret_cast<uint64_t*>(bufAddr) = val;
+                return 8;
+            }
+
+            // Non-blocking: return EAGAIN
+            if (fde->statusFlags & 0x800)
+                return -EAGAIN;
+
+            // Block until counter becomes non-zero
+            Process* self = ProcessCurrent();
+            efd->readerWaiter = self;
+            extern volatile uint64_t g_lapicTickCount;
+            self->wakeupTick = g_lapicTickCount + 10;
             SchedulerBlock(self);
             if (HasPendingSignals())
                 return -EINTR;
@@ -645,9 +1117,75 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if (fde->type == FdType::Socket && fde->handle)
     {
         int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+        bool nonblock = (fde->statusFlags & 0x800) != 0;
+        if (nonblock && brook::SockRxCount(sockIdx) == 0 && !brook::SockPollReady(sockIdx, true, false))
+            return -EAGAIN;
         return brook::SockRecv(sockIdx,
                                reinterpret_cast<void*>(bufAddr),
                                static_cast<uint32_t>(count));
+    }
+
+    // Read from timerfd — returns uint64 expiry count, blocks until armed+expired
+    if (fde->type == FdType::TimerFd && fde->handle)
+    {
+        if (count < 8) return -EINVAL;
+        auto* tfd = static_cast<TimerFdData*>(fde->handle);
+        bool nonblock = (fde->statusFlags & 0x800) != 0;
+
+        // Poll for expiry
+        for (;;) {
+            extern volatile uint64_t g_lapicTickCount;
+            uint64_t now = g_lapicTickCount;
+
+            // Check if timer has fired
+            if (tfd->armed && now >= tfd->nextExpiry) {
+                // Count how many intervals have elapsed
+                uint64_t elapsed = 1;
+                if (tfd->intervalNs > 0) {
+                    uint64_t intervalMs = tfd->intervalNs / 1000000ULL;
+                    if (intervalMs == 0) intervalMs = 1;
+                    uint64_t over = now - tfd->nextExpiry;
+                    elapsed = 1 + over / (intervalMs * LAPIC_TICKS_PER_MS);
+                    tfd->nextExpiry += elapsed * intervalMs * LAPIC_TICKS_PER_MS;
+                } else {
+                    tfd->armed = false; // one-shot
+                }
+
+                uint64_t total = __atomic_exchange_n(&tfd->expiryCount, 0, __ATOMIC_ACQ_REL) + elapsed;
+                __builtin_memcpy(reinterpret_cast<void*>(bufAddr), &total, 8);
+                return 8;
+            }
+
+            uint64_t pending = __atomic_exchange_n(&tfd->expiryCount, 0, __ATOMIC_ACQ_REL);
+            if (pending > 0) {
+                __builtin_memcpy(reinterpret_cast<void*>(bufAddr), &pending, 8);
+                return 8;
+            }
+
+            if (nonblock) return -EAGAIN;
+            if (!tfd->armed) return -EAGAIN;
+
+            // Block until next expiry
+            Process* self = ProcessCurrent();
+            tfd->waiter = self;
+            self->wakeupTick = tfd->nextExpiry;
+            SchedulerBlock(self);
+            tfd->waiter = nullptr;
+            if (HasPendingSignals()) return -EINTR;
+        }
+    }
+
+    // Read from memfd — sequential read from heap buffer
+    if (fde->type == FdType::MemFd && fde->handle)
+    {
+        auto* mfd = static_cast<MemFdData*>(fde->handle);
+        uint64_t pos = fde->seekPos;
+        if (pos >= mfd->size) return 0; // EOF
+        uint64_t avail = mfd->size - pos;
+        uint64_t copyLen = (count < avail) ? count : avail;
+        __builtin_memcpy(reinterpret_cast<void*>(bufAddr), mfd->buf + pos, copyLen);
+        fde->seekPos += copyLen;
+        return static_cast<int64_t>(copyLen);
     }
 
     // Read from /dev/tty — reads from stdin pipe
@@ -676,6 +1214,30 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         }
     }
 
+    // Read from AF_UNIX connected socket
+    if (fde->type == FdType::UnixSocket && fde->handle)
+    {
+        auto* usd = static_cast<UnixSocketData*>(fde->handle);
+        if (usd->state != UnixSocketData::State::Connected || !usd->rxPipe)
+            return -ENOTCONN;
+        auto* pipe = usd->rxPipe;
+        auto* dst  = reinterpret_cast<char*>(bufAddr);
+        bool nonblock = usd->nonblock || (fde->statusFlags & 0x800);
+
+        for (;;) {
+            uint32_t got = pipe->read(dst, static_cast<uint32_t>(count > 4096 ? 4096 : count));
+            if (got > 0) return static_cast<int64_t>(got);
+            if (__atomic_load_n(&pipe->writers, __ATOMIC_ACQUIRE) == 0) return 0; // EOF
+            if (nonblock) return -EAGAIN;
+            Process* self = ProcessCurrent();
+            pipe->readerWaiter = self;
+            extern volatile uint64_t g_lapicTickCount;
+            self->wakeupTick = g_lapicTickCount + 10;
+            SchedulerBlock(self);
+            if (HasPendingSignals()) return -EINTR;
+        }
+    }
+
     return -EBADF;
 }
 
@@ -694,7 +1256,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
                          uint64_t, uint64_t, uint64_t)
 {
     const char* path = reinterpret_cast<const char*>(pathAddr);
-    if (!path) return -EFAULT;
+    if (!path || pathAddr < 0x1000) return -EFAULT;
 
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
@@ -783,6 +1345,35 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         return fd;
     }
 
+    // /dev/urandom, /dev/random — RDRAND-backed random bytes
+    if (StrEq(path, "/dev/urandom") || StrEq(path, "/dev/random"))
+    {
+        int fd = FdAlloc(proc, FdType::DevUrandom, nullptr);
+        if (fd < 0) return -EMFILE;
+        return fd;
+    }
+
+    // /dev/dsp — OSS audio output
+    if (StrEq(path, "/dev/dsp"))
+    {
+        if (!AudioAvailable()) return -ENODEV;
+        static uint32_t s_nextMixerStream = 0;
+        auto* dsp = static_cast<DspState*>(kmalloc(sizeof(DspState)));
+        if (!dsp) return -ENOMEM;
+        dsp->sampleRate    = DSP_DEFAULT_RATE;
+        dsp->channels      = DSP_DEFAULT_CHANNELS;
+        dsp->bitsPerSample = DSP_DEFAULT_BITS;
+        dsp->fragmentSize  = 4096;
+        dsp->bufferOffset  = 0;
+        dsp->bufferSize    = DSP_BUFFER_SIZE;
+        dsp->mixerStreamId = s_nextMixerStream++ % 8;
+        dsp->buffer        = static_cast<uint8_t*>(kmalloc(DSP_BUFFER_SIZE));
+        if (!dsp->buffer) { kfree(dsp); return -ENOMEM; }
+        int fd = FdAlloc(proc, FdType::DevDsp, dsp);
+        if (fd < 0) { kfree(dsp->buffer); kfree(dsp); return -EMFILE; }
+        return fd;
+    }
+
     // Synthetic memory files: /etc/passwd, /etc/group, /proc/self/...
     {
         struct SyntheticFile { const char* path; const char* content; };
@@ -847,6 +1438,63 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     if (StrEq(lookupPath, "/proc/self/exe"))
         return -ENOENT;
 
+    // /dev/shm/<name> — POSIX shared memory via memfd
+    // glibc shm_open() calls open("/dev/shm/<name>", flags, mode)
+    if (lookupPath[0] == '/' &&
+        lookupPath[1] == 'd' && lookupPath[2] == 'e' && lookupPath[3] == 'v' &&
+        lookupPath[4] == '/' && lookupPath[5] == 's' && lookupPath[6] == 'h' &&
+        lookupPath[7] == 'm' && lookupPath[8] == '/')
+    {
+        static constexpr int SHM_MAX = 32;
+        struct ShmEntry { char name[64]; MemFdData* mfd; bool used; };
+        static ShmEntry s_shm[SHM_MAX];
+
+        const char* shmName = lookupPath + 9; // skip "/dev/shm/"
+        static constexpr uint64_t LINUX_O_CREAT_SHM  = 0x40;
+        static constexpr uint64_t LINUX_O_TRUNC_SHM  = 0x200;
+        bool create = (flags & LINUX_O_CREAT_SHM) != 0;
+        bool trunc  = (flags & LINUX_O_TRUNC_SHM) != 0;
+
+        // Find existing entry
+        ShmEntry* entry = nullptr;
+        for (int i = 0; i < SHM_MAX; i++) {
+            if (!s_shm[i].used) continue;
+            const char* a = s_shm[i].name; const char* b = shmName;
+            bool match = true;
+            while (*a || *b) { if (*a++ != *b++) { match = false; break; } }
+            if (match) { entry = &s_shm[i]; break; }
+        }
+
+        if (!entry && !create) return -ENOENT;
+
+        if (!entry) {
+            // Allocate new shm entry
+            for (int i = 0; i < SHM_MAX; i++) {
+                if (!s_shm[i].used) { entry = &s_shm[i]; break; }
+            }
+            if (!entry) return -ENOMEM;
+            for (int i = 0; i < 63 && shmName[i]; i++) entry->name[i] = shmName[i];
+            entry->name[63] = 0;
+            entry->mfd = static_cast<MemFdData*>(kmalloc(sizeof(MemFdData)));
+            if (!entry->mfd) return -ENOMEM;
+            entry->mfd->buf = nullptr;
+            entry->mfd->size = 0;
+            entry->mfd->capacity = 0;
+            entry->used = true;
+        }
+
+        if (trunc) {
+            if (entry->mfd->buf) { kfree(entry->mfd->buf); entry->mfd->buf = nullptr; }
+            entry->mfd->size = 0;
+            entry->mfd->capacity = 0;
+        }
+
+        int fd = FdAlloc(proc, FdType::MemFd, entry->mfd);
+        if (fd < 0) return -EMFILE;
+        SerialPrintf("shm_open: '%s' fd=%d size=%llu\n", shmName, fd, entry->mfd->size);
+        return fd;
+    }
+
     // Translate Linux open flags to VFS flags
     uint32_t vfsFlags = VFS_O_READ;
     static constexpr uint64_t LINUX_O_WRONLY = 1;
@@ -889,7 +1537,21 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     }
 
     if (!vn)
+    {
+        // Diagnostic: log pak open failures
+        bool isPak = false;
+        for (const char* p = lookupPath; *p; ++p)
+            if (p[0] == 'p' && p[1] == 'a' && p[2] == 'k') { isPak = true; break; }
+        if (isPak)
+        {
+            uint32_t usedFds = 0;
+            for (uint32_t fi = 0; fi < MAX_FDS; fi++)
+                if (proc->fds[fi].type != FdType::None) usedFds++;
+            SerialPrintf("sys_open FAIL: '%s' (resolved '%s') fds=%u/%u\n",
+                         path, lookupPath, usedFds, MAX_FDS);
+        }
         return -ENOENT;
+    }
 
     int fd = FdAlloc(proc, FdType::Vnode, vn);
     if (fd < 0)
@@ -975,6 +1637,48 @@ static int64_t sys_close(uint64_t fd, uint64_t, uint64_t,
     {
         int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
         brook::SockUnref(sockIdx);
+    }
+
+    if (fde->type == FdType::EventFd && fde->handle)
+    {
+        kfree(fde->handle);
+    }
+
+    if (fde->type == FdType::EpollFd && fde->handle)
+    {
+        kfree(fde->handle);
+    }
+
+    if (fde->type == FdType::TimerFd && fde->handle)
+    {
+        kfree(fde->handle);
+    }
+
+    if (fde->type == FdType::MemFd && fde->handle)
+    {
+        auto* mfd = static_cast<MemFdData*>(fde->handle);
+        if (mfd->buf) kfree(mfd->buf);
+        kfree(mfd);
+    }
+
+    if (fde->type == FdType::UnixSocket && fde->handle)
+    {
+        auto* usd = static_cast<UnixSocketData*>(fde->handle);
+        if (usd->state == UnixSocketData::State::Listening)
+            UnixUnregisterServer(usd);
+        // Decrement refcounts on connected pipes so the other end sees EOF
+        if (usd->rxPipe) __atomic_fetch_sub(&usd->rxPipe->readers, 1, __ATOMIC_RELEASE);
+        if (usd->txPipe) __atomic_fetch_sub(&usd->txPipe->writers, 1, __ATOMIC_RELEASE);
+        kfree(usd);
+    }
+
+    if (fde->type == FdType::DevDsp && fde->handle)
+    {
+        auto* dsp = static_cast<DspState*>(fde->handle);
+        // Stop any in-flight playback — don't block on flush during teardown
+        AudioStop();
+        kfree(dsp->buffer);
+        kfree(dsp);
     }
 
     FdFree(proc, static_cast<int>(fd));
@@ -1163,6 +1867,13 @@ static int64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
         break;
     case SEEK_END:
     {
+        if (fde->type == FdType::MemFd && fde->handle) {
+            auto* mfd = static_cast<MemFdData*>(fde->handle);
+            int64_t newPos = static_cast<int64_t>(mfd->size) + soff;
+            if (newPos < 0) return -EINVAL;
+            fde->seekPos = static_cast<uint64_t>(newPos);
+            break;
+        }
         if (fde->type != FdType::Vnode || !fde->handle) return -EINVAL;
         auto* vn = static_cast<Vnode*>(fde->handle);
         VnodeStat st{};
@@ -1267,11 +1978,25 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     uint64_t pages = (length + 4095) / 4096;
     uint64_t vmmFlags = ProtToVmmFlags(prot);
 
-    // Determine virtual address.
+    // Threads in the same thread-group share the page table but each
+    // Process struct has its own mmapNext.  Route all address-space
+    // bookkeeping through the thread-group leader so parallel mmaps from
+    // multiple threads don't hand out overlapping regions.  This is the
+    // minimum we need for Go's multi-threaded runtime to work correctly.
+    Process* leader = (proc->tgid && proc->tgid != proc->pid)
+                    ? ProcessFindByPid(proc->tgid)
+                    : nullptr;
+    if (!leader) leader = proc;
+    static SpinLock s_mmapLock;
+
+    // Determine virtual address.  The critical section covers the
+    // read-modify-write of leader->mmapNext AND any unmap-in-place
+    // operation for MAP_FIXED, so two threads can't race on the same range.
     auto pickAddr = [&]() -> uint64_t {
+        uint64_t lf = SpinLockAcquire(&s_mmapLock);
+        uint64_t result = 0;
         if (flags & MAP_FIXED) {
-            if (addr == 0) return 0; // Fail
-            // Unmap any existing pages in the range.
+            if (addr == 0) { SpinLockRelease(&s_mmapLock, lf); return 0; }
             for (uint64_t i = 0; i < pages; i++) {
                 VirtualAddress va(addr + i * 4096);
                 PhysicalAddress existing = VmmVirtToPhys(proc->pageTable, va);
@@ -1280,22 +2005,26 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                     PmmFreePage(existing);
                 }
             }
-            return addr;
+            result = addr;
+        } else {
+            uint64_t base = leader->mmapNext;
+            if (addr >= USER_MMAP_BASE && addr + pages * 4096 <= USER_MMAP_END) {
+                bool free = true;
+                for (uint64_t i = 0; i < pages && free; i++)
+                    if (VmmVirtToPhys(proc->pageTable, VirtualAddress(addr + i * 4096)))
+                        free = false;
+                if (free) base = addr;
+            }
+            if (base + pages * 4096 > USER_MMAP_END) {
+                SpinLockRelease(&s_mmapLock, lf);
+                return 0;
+            }
+            if (base >= leader->mmapNext)
+                leader->mmapNext = base + pages * 4096;
+            result = base;
         }
-        // Non-fixed: use addr as hint if valid, otherwise allocate.
-        uint64_t base = proc->mmapNext;
-        if (addr >= USER_MMAP_BASE && addr + pages * 4096 <= USER_MMAP_END) {
-            // Check if hint range is free.
-            bool free = true;
-            for (uint64_t i = 0; i < pages && free; i++)
-                if (VmmVirtToPhys(proc->pageTable, VirtualAddress(addr + i * 4096)))
-                    free = false;
-            if (free) base = addr;
-        }
-        if (base + pages * 4096 > USER_MMAP_END) return 0;
-        if (base >= proc->mmapNext)
-            proc->mmapNext = base + pages * 4096;
-        return base;
+        SpinLockRelease(&s_mmapLock, lf);
+        return result;
     };
 
     // Helper: allocate pages at a specific address.
@@ -1329,11 +2058,33 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     {
         uint64_t vaddr = pickAddr();
         if (!vaddr) return -ENOMEM;
+
+        // PROT_NONE anonymous mappings are pure reservations: do NOT back
+        // them with physical pages.  Go's runtime reserves multi-GB arenas
+        // up front with PROT_NONE and then mprotects sub-ranges to commit.
+        // Allocating backing pages eagerly would immediately OOM, AND would
+        // defeat the PROT_NONE guard-page contract (reads should fault).
+        // sys_mprotect lazily backs pages when prot upgrades to non-zero.
+        if (prot == 0)
+            return static_cast<int64_t>(vaddr);
+
         if (!allocAt(vaddr, MemTag::User)) return -ENOMEM;
 
         // Zero via direct map (safe even for PROT_NONE / read-only pages).
         for (uint64_t p = 0; p < pages; ++p)
             zeroUserPage(vaddr + p * 4096);
+
+        // Log large mmap allocations for debugging
+        if (pages >= 32) {
+            [[maybe_unused]] PhysicalAddress firstPhys = VmmVirtToPhys(proc->pageTable,
+                                                       VirtualAddress(vaddr));
+            [[maybe_unused]] PhysicalAddress lastPhys = VmmVirtToPhys(proc->pageTable,
+                                                      VirtualAddress(vaddr + (pages-1) * 4096));
+            DbgPrintf("mmap: pid=%u virt=0x%lx pages=%lu firstPhys=0x%lx lastPhys=0x%lx\n",
+                         proc->pid, vaddr, pages,
+                         firstPhys.raw() & ~0xFFFULL,
+                         lastPhys.raw() & ~0xFFFULL);
+        }
 
         return static_cast<int64_t>(vaddr);
     }
@@ -1385,10 +2136,64 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             }
         }
 
-        DbgPrintf("sys_mmap: fb mapped %lu pages at virt 0x%lx (%s, vfb=%ux%u)\n",
-                     pages, vaddr,
+        SerialPrintf("sys_mmap: fb mapped %lu pages at virt 0x%lx..0x%lx pid=%u (%s, vfb=%ux%u)\n",
+                     pages, vaddr, vaddr + pages * 4096 - 1,
+                     proc->pid,
                      useVirtFb ? "virtual" : "physical",
                      proc->fbVfbWidth, proc->fbVfbHeight);
+        return static_cast<int64_t>(vaddr);
+    }
+
+    // MemFd-backed mmap (MAP_SHARED or MAP_PRIVATE) — used by wl_shm
+    // The buffer is heap-allocated, so we copy data into freshly-allocated
+    // user pages and track the mapping for write-back on munmap.
+    // For Wayland's use case (shared pixel buffers), the compositor and client
+    // both mmap the same fd: we give them both mappings into the same MemFdData
+    // buffer by mapping the kernel heap pages directly.
+    if (fde->type == FdType::MemFd && fde->handle)
+    {
+        auto* mfd = static_cast<MemFdData*>(fde->handle);
+
+        // Grow the MemFd to cover [offset, offset+length) if needed
+        uint64_t needed = offset + length;
+        if (needed > mfd->capacity) {
+            auto* newBuf = static_cast<uint8_t*>(kmalloc(static_cast<uint32_t>(needed + 4096)));
+            if (!newBuf) return -ENOMEM;
+            if (mfd->buf) {
+                for (uint64_t i = 0; i < mfd->size; i++) newBuf[i] = mfd->buf[i];
+                for (uint64_t i = mfd->size; i < needed + 4096; i++) newBuf[i] = 0;
+                kfree(mfd->buf);
+            } else {
+                for (uint64_t i = 0; i < needed + 4096; i++) newBuf[i] = 0;
+            }
+            mfd->buf = newBuf;
+            mfd->capacity = needed + 4096;
+        }
+        if (needed > mfd->size) mfd->size = needed;
+
+        uint64_t vaddr = pickAddr();
+        if (!vaddr) return -ENOMEM;
+
+        // Map each page of the MemFd buffer directly into user space.
+        // We find the physical address of each kernel heap page and share it.
+        for (uint64_t i = 0; i < pages; i++) {
+            uint64_t bufVA = reinterpret_cast<uint64_t>(mfd->buf) + offset + i * 4096;
+            // Align to page boundary
+            uint64_t bufVAAligned = bufVA & ~0xFFFULL;
+            PhysicalAddress phys = VmmVirtToPhys(KernelPageTable, VirtualAddress(bufVAAligned));
+            if (!phys) {
+                SerialPrintf("mmap: MemFd page %lu not mapped in kernel!\n", i);
+                return -ENOMEM;
+            }
+            if (!VmmMapPage(proc->pageTable, VirtualAddress(vaddr + i * 4096),
+                            phys, vmmFlags | VMM_WRITABLE, MemTag::User, proc->pid)) {
+                SerialPrintf("mmap: MemFd VmmMapPage failed at page %lu\n", i);
+                return -ENOMEM;
+            }
+        }
+
+        SerialPrintf("mmap: MemFd fd=%lu offset=0x%lx len=%lu -> vaddr=0x%lx\n",
+                     fd, offset, length, vaddr);
         return static_cast<int64_t>(vaddr);
     }
 
@@ -1407,7 +2212,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     auto* vn = static_cast<Vnode*>(fde->handle);
     uint64_t readOff = offset;
 
-    // Read file data into a kernel-side buffer then copy through direct map
+    // Read file data page by page through the direct map.
     uint64_t bytesLeft = length;
     uint64_t dstOff = 0;
     while (bytesLeft > 0)
@@ -1415,12 +2220,40 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         uint64_t chunk = (bytesLeft > 4096) ? 4096 : bytesLeft;
         uint64_t userVA = vaddr + dstOff;
         PhysicalAddress phys = VmmVirtToPhys(proc->pageTable,
-                                             VirtualAddress(userVA));
+                                             VirtualAddress(userVA & ~0xFFFULL));
         if (!phys) break;
+        uint64_t pageOff = dstOff & 0xFFF;
         auto* kp = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
-        VfsRead(vn, kp, chunk, &readOff);
-        dstOff += chunk;
-        bytesLeft -= chunk;
+        kp = reinterpret_cast<uint8_t*>(
+            reinterpret_cast<uint64_t>(kp) & ~0xFFFULL);
+        if (chunk > 4096 - pageOff) chunk = 4096 - pageOff;
+        int got = VfsRead(vn, kp + pageOff, chunk, &readOff);
+        if (got <= 0) break;
+        dstOff += static_cast<uint64_t>(got);
+        bytesLeft -= static_cast<uint64_t>(got);
+    }
+
+    // Diagnostic: for the code segment mmap (offset=0x28000), verify data
+    // at the offset where the crash occurs (VA offset 0x179FD7 from vaddr).
+    if (offset == 0x28000 && length > 0x179FD7)
+    {
+        SerialPrintf("mmap DIAG: vaddr=0x%lx addr=0x%lx offset=0x%lx len=%lu pages=%lu flags=0x%lx\n",
+                     vaddr, addr, offset, length, pages, flags);
+        uint64_t checkVA = vaddr + 0x179FD7;
+        PhysicalAddress cp = VmmVirtToPhys(proc->pageTable,
+                                           VirtualAddress(checkVA & ~0xFFFULL));
+        if (cp) {
+            auto* ck = reinterpret_cast<uint8_t*>(PhysToVirt(cp).raw());
+            ck = reinterpret_cast<uint8_t*>(
+                reinterpret_cast<uint64_t>(ck) & ~0xFFFULL);
+            uint64_t po = checkVA & 0xFFF;
+            SerialPrintf("mmap VERIFY @VA 0x%lx (off=0x%lx): "
+                         "%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                         checkVA, offset + 0x179FD7,
+                         ck[po], ck[po+1], ck[po+2], ck[po+3],
+                         ck[po+4], ck[po+5], ck[po+6], ck[po+7]);
+            // Expected: 69 09 00 00 4d 89 cb 48
+        }
     }
 
     return static_cast<int64_t>(vaddr);
@@ -1446,9 +2279,36 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
     {
         VirtualAddress va(addr + i * 4096);
         PhysicalAddress phys = VmmVirtToPhys(proc->pageTable, va);
-        if (!phys) continue; // Page not mapped — skip (Linux does this)
 
-        // Remap the page with the new flags.
+        if (!phys)
+        {
+            // Page not mapped.  If the caller is upgrading to a real
+            // protection (non-PROT_NONE), this is a lazy-backing request
+            // — allocate and zero a fresh page.  This is the pattern Go's
+            // runtime uses: reserve a large region with PROT_NONE, then
+            // mprotect sub-ranges to commit.
+            if (prot == 0)
+                continue;
+
+            PhysicalAddress newPhys = PmmAllocPage(MemTag::User, proc->pid);
+            if (!newPhys) return -ENOMEM;
+
+            if (!VmmMapPage(proc->pageTable, va, newPhys, newFlags,
+                            MemTag::User, proc->pid))
+            {
+                PmmFreePage(newPhys);
+                return -ENOMEM;
+            }
+
+            // Zero via kernel direct map (safe even for RO/NX pages).
+            auto* kp = reinterpret_cast<uint8_t*>(PhysToVirt(newPhys).raw());
+            kp = reinterpret_cast<uint8_t*>(
+                reinterpret_cast<uint64_t>(kp) & ~0xFFFULL);
+            for (uint64_t b = 0; b < 4096; ++b) kp[b] = 0;
+            continue;
+        }
+
+        // Remap the existing page with the new flags.
         VmmUnmapPage(proc->pageTable, va);
         VmmMapPage(proc->pageTable, va, phys, newFlags, MemTag::User, proc->pid);
     }
@@ -1538,6 +2398,28 @@ static int64_t sys_exit(uint64_t status, uint64_t, uint64_t,
                          uint64_t, uint64_t, uint64_t)
 {
     SerialPrintf("sys_exit: process exited with status %lu\n", status);
+    SchedulerExitCurrentProcess(static_cast<int>(status));
+    // never reached
+    return 0;
+}
+
+static int64_t sys_exit_group(uint64_t status, uint64_t, uint64_t,
+                               uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (status != 0) {
+        SerialPrintf("sys_exit_group: tgid %u exiting with status %lu\n",
+                     proc ? proc->tgid : 0, status);
+    } else {
+        DbgPrintf("sys_exit_group: tgid %u exiting with status %lu\n",
+                  proc ? proc->tgid : 0, status);
+    }
+
+    // Kill all other threads in this thread group so they don't linger
+    // and cause use-after-free on shared resources after the leader exits.
+    if (proc)
+        SchedulerKillThreadGroup(proc->tgid, proc);
+
     SchedulerExitCurrentProcess(static_cast<int>(status));
     // never reached
     return 0;
@@ -1798,7 +2680,7 @@ static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAd
 
     SchedulerAddProcess(child);
 
-    SerialPrintf("CLONE: parent pid=%u -> child pid=%u flags=0x%lx rip=0x%lx rsp=0x%lx\n",
+    DbgPrintf("CLONE: parent pid=%u -> child pid=%u flags=0x%lx rip=0x%lx rsp=0x%lx\n",
                  parent->pid, child->pid, flags, userRip, userRsp);
     return static_cast<int64_t>(child->pid);
 }
@@ -1809,6 +2691,46 @@ static int64_t sys_vfork(uint64_t, uint64_t, uint64_t,
     // vfork is like fork but parent blocks until child exec/exit.
     // For now, implement as plain fork (parent doesn't block).
     return sys_fork(0, 0, 0, 0, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// sys_clone3 (435)
+// ---------------------------------------------------------------------------
+// Extended clone with struct clone_args. We extract fields and delegate
+// to sys_clone so all thread/fork logic stays in one place.
+// glibc and musl try clone3 first and fall back to clone on ENOSYS;
+// implementing it avoids that fallback and silences the UNIMPL noise.
+
+struct CloneArgs {
+    uint64_t flags;
+    uint64_t pidfd;
+    uint64_t child_tid;
+    uint64_t parent_tid;
+    uint64_t exit_signal;
+    uint64_t stack;
+    uint64_t stack_size;
+    uint64_t tls;
+    uint64_t set_tid;
+    uint64_t set_tid_size;
+    uint64_t cgroup;
+};
+
+static int64_t sys_clone3(uint64_t argsPtr, uint64_t size, uint64_t,
+                           uint64_t, uint64_t, uint64_t)
+{
+    if (!argsPtr || size < offsetof(CloneArgs, tls) + sizeof(uint64_t))
+        return -EINVAL;
+
+    const CloneArgs* ca = reinterpret_cast<const CloneArgs*>(argsPtr);
+
+    // Stack: clone3 passes base+size; clone expects the top (stack grows down)
+    uint64_t stackTop = ca->stack;
+    if (stackTop && ca->stack_size)
+        stackTop = ca->stack + ca->stack_size;
+
+    // Delegate to sys_clone with the same argument layout:
+    //   flags, newStack, parentTidAddr, childTidAddr, tlsAddr
+    return sys_clone(ca->flags, stackTop, ca->parent_tid, ca->child_tid, ca->tls, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1873,6 +2795,16 @@ static int64_t sys_wait4(uint64_t pidArg, uint64_t statusAddr, uint64_t options,
             }
 
             SchedulerReapChild(child);
+            // Diagnostic: log the user-mode RIP we'll return to — catches
+            // cases where a stray corruption lands control flow off in the weeds.
+            {
+                uint64_t retRip = 0, retRsp = 0;
+                __asm__ volatile("movq %%gs:48, %0\n\t"
+                                 "movq %%gs:56, %1"
+                                 : "=r"(retRip), "=r"(retRsp));
+                DbgPrintf("WAIT4: pid=%u reaped child=%u status=0x%x -> user RIP=0x%lx RSP=0x%lx\n",
+                          parent->pid, childPid, childStatus, retRip, retRsp);
+            }
             return static_cast<int64_t>(childPid);
         }
 
@@ -1995,6 +2927,8 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
             found = true;
             busyboxFallback = true;
             DbgPrintf("sys_execve: busybox fallback for '%s'\n", cmdName);
+            SerialPrintf("sys_execve: busybox fallback — original='%s' resolved='%s'\n",
+                         kPath, lookupPath);
         }
     }
 
@@ -2087,7 +3021,10 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
         return -ENOENT;
     }
 
-    constexpr uint64_t MAX_ELF_SIZE = 2 * 1024 * 1024;
+    // 32 MB accommodates most real binaries, including statically-linked
+    // Go executables which routinely run 10-20 MB.  The buffer is freed
+    // immediately after ELF loading, so it's only a transient cost.
+    constexpr uint64_t MAX_ELF_SIZE = 32 * 1024 * 1024;
     constexpr uint64_t ELF_BUF_PAGES = MAX_ELF_SIZE / 4096;
 
     VirtualAddress bufAddr = VmmAllocPages(ELF_BUF_PAGES,
@@ -2116,7 +3053,7 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
         return -ENOEXEC;
     }
 
-    SerialPrintf("sys_execve: loaded '%s' (%lu bytes) for pid %u\n",
+    DbgPrintf("sys_execve: loaded '%s' (%lu bytes) for pid %u\n",
               lookupPath, elfSize, proc->pid);
 
     // --- Shebang (#!) support ---
@@ -2323,6 +3260,21 @@ static int64_t sys_gettimeofday(uint64_t tvAddr, uint64_t, uint64_t,
     tv->tv_sec  = static_cast<int64_t>(epoch);
     tv->tv_usec = static_cast<int64_t>((ms % 1000) * 1000);
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// sys_time (201) — returns seconds since epoch
+// ---------------------------------------------------------------------------
+
+static int64_t sys_time(uint64_t tloc, uint64_t, uint64_t,
+                         uint64_t, uint64_t, uint64_t)
+{
+    uint64_t epoch = RtcNow();
+    if (tloc) {
+        auto* p = reinterpret_cast<int64_t*>(tloc);
+        *p = static_cast<int64_t>(epoch);
+    }
+    return static_cast<int64_t>(epoch);
 }
 
 // ---------------------------------------------------------------------------
@@ -2548,9 +3500,11 @@ struct FbFixScreeninfo {
     uint16_t reserved[2];
 };
 
-static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
+static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
                           uint64_t, uint64_t, uint64_t)
 {
+    // ioctl cmd is a 32-bit value; mask off sign-extension from syscall ABI
+    uint64_t cmd = cmd_raw & 0xFFFFFFFFULL;
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
     FdEntry* fde = FdGet(proc, static_cast<int>(fd));
@@ -2565,7 +3519,9 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
 
         // Auto-create a VFB + WM window when a process without one queries
         // the framebuffer in WM mode. This handles programs launched from
-        // bash that open /dev/fb0 (e.g. DOOM) — they need a composited VFB.
+        // bash that open /dev/fb0 (e.g. DOOM, Quake 2) — they need a composited VFB.
+        // Use a default window size of 640×480 rather than the full physical FB,
+        // so the window fits on screen with WM decorations.
         if (!proc->fbVirtual && WmIsActive() &&
             (cmd == FBIOGET_VSCREENINFO || cmd == FBIOGET_FSCREENINFO))
         {
@@ -2573,19 +3529,24 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
             int16_t winX = static_cast<int16_t>(60 + (s_autoWinCount % 6) * 40);
             int16_t winY = static_cast<int16_t>(60 + (s_autoWinCount % 6) * 40);
 
+            uint32_t autoW = 640;
+            uint32_t autoH = 480;
+            if (autoW > fbW) autoW = fbW;
+            if (autoH > fbH) autoH = fbH;
+
             CompositorSetupProcess(proc,
                                    winX + static_cast<int16_t>(WM_BORDER_WIDTH),
                                    winY + static_cast<int16_t>(WM_TITLE_BAR_HEIGHT + WM_BORDER_WIDTH),
-                                   fbW, fbH, 1);
+                                   autoW, autoH, 1);
 
             WmCreateWindow(proc, winX, winY,
-                          static_cast<uint16_t>(fbW),
-                          static_cast<uint16_t>(fbH),
+                          static_cast<uint16_t>(autoW),
+                          static_cast<uint16_t>(autoH),
                           proc->name);
 
             s_autoWinCount++;
             SerialPrintf("sys_ioctl: auto-created WM window for pid %u (%ux%u)\n",
-                         proc->pid, fbW, fbH);
+                         proc->pid, autoW, autoH);
         }
         uint32_t repW = (proc->fbVfbWidth  > 0) ? proc->fbVfbWidth  : fbW;
         uint32_t repH = (proc->fbVfbHeight > 0) ? proc->fbVfbHeight : fbH;
@@ -2756,10 +3717,17 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
 
     // tcgetattr/tcsetattr arrive as ioctl on stdin (fd 0)
     // TCGETS = 0x5401, TCSETS/TCSETSW/TCSETSF = 0x5402-0x5404
-    // Also handle any fd that is a TTY device (e.g. fd 63 from /dev/tty dup)
-    bool isTtyFd = (fd <= 2) || (fde->type == FdType::DevKeyboard) ||
+    // A pipe is a TTY only if its FdEntry has flags bit 0x04 set (marked by
+    // the terminal when setting up bash stdio). That way the terminal's
+    // shell sees its stdio as a TTY (for readline, job control, etc.) but
+    // anonymous pipes created by pipe() — e.g. the curl | xz | nar-unpack
+    // pipeline — are not TTYs and isatty() returns false on them.
+    bool isTtyFd = (fde->type == FdType::DevKeyboard) ||
                    (fde->type == FdType::Vnode && !fde->handle) ||
-                   (fde->type == FdType::Pipe) || (fde->type == FdType::DevTty);
+                   (fde->type == FdType::DevTty) ||
+                   (fde->type == FdType::Pipe && (fde->flags & 0x04)) ||
+                   ((fd <= 2) && fde->type != FdType::Pipe &&
+                                 fde->type != FdType::Socket);
     if (isTtyFd && cmd == 0x5401)
     {
         auto* t = reinterpret_cast<uint32_t*>(arg);
@@ -2872,6 +3840,151 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg,
     // TCFLSH = 0x540B — flush input/output, accept but ignore
     if (cmd == 0x540B)
         return 0;
+
+    // ---------------------------------------------------------------------------
+    // OSS /dev/dsp ioctls
+    // ---------------------------------------------------------------------------
+    if (fde->type == FdType::DevDsp && fde->handle)
+    {
+        auto* dsp = static_cast<DspState*>(fde->handle);
+
+        // SNDCTL_DSP_RESET — stop playback, reset buffer
+        if (cmd == SNDCTL_DSP_RESET)
+        {
+            AudioStop();
+            dsp->bufferOffset = 0;
+            return 0;
+        }
+
+        // SNDCTL_DSP_SPEED — set/get sample rate
+        if (cmd == SNDCTL_DSP_SPEED)
+        {
+            auto* rate = reinterpret_cast<int*>(arg);
+            if (*rate > 0) dsp->sampleRate = static_cast<uint32_t>(*rate);
+            *rate = static_cast<int>(dsp->sampleRate);
+            return 0;
+        }
+
+        // SNDCTL_DSP_SETFMT — set/get audio format
+        if (cmd == SNDCTL_DSP_SETFMT)
+        {
+            auto* fmt = reinterpret_cast<int*>(arg);
+            if (*fmt == AFMT_S16_LE)
+                dsp->bitsPerSample = 16;
+            else if (*fmt == AFMT_U8)
+                dsp->bitsPerSample = 8;
+            // Report back current format
+            *fmt = (dsp->bitsPerSample == 16) ? AFMT_S16_LE : AFMT_U8;
+            return 0;
+        }
+
+        // SNDCTL_DSP_CHANNELS — set/get channel count
+        if (cmd == SNDCTL_DSP_CHANNELS)
+        {
+            auto* ch = reinterpret_cast<int*>(arg);
+            if (*ch >= 1 && *ch <= 2) dsp->channels = static_cast<uint8_t>(*ch);
+            *ch = dsp->channels;
+            return 0;
+        }
+
+        // SNDCTL_DSP_STEREO — set mono(0)/stereo(1)
+        if (cmd == SNDCTL_DSP_STEREO)
+        {
+            auto* stereo = reinterpret_cast<int*>(arg);
+            dsp->channels = (*stereo) ? 2 : 1;
+            *stereo = (dsp->channels == 2) ? 1 : 0;
+            return 0;
+        }
+
+        // SNDCTL_DSP_GETOSPACE — report available buffer space
+        if (cmd == SNDCTL_DSP_GETOSPACE)
+        {
+            struct audio_buf_info { int fragments; int fragstotal; int fragsize; int bytes; };
+            auto* info = reinterpret_cast<audio_buf_info*>(arg);
+            uint32_t avail = dsp->bufferSize - dsp->bufferOffset;
+            info->fragsize   = static_cast<int>(dsp->fragmentSize);
+            info->fragstotal = static_cast<int>(dsp->bufferSize / dsp->fragmentSize);
+            info->fragments  = static_cast<int>(avail / dsp->fragmentSize);
+            info->bytes      = static_cast<int>(avail);
+            return 0;
+        }
+
+        // SNDCTL_DSP_GETCAPS — report capabilities
+        if (cmd == SNDCTL_DSP_GETCAPS)
+        {
+            auto* caps = reinterpret_cast<int*>(arg);
+            *caps = DSP_CAP_TRIGGER;
+            return 0;
+        }
+
+        // SNDCTL_DSP_GETFMTS — report supported formats
+        if (cmd == SNDCTL_DSP_GETFMTS)
+        {
+            auto* fmts = reinterpret_cast<int*>(arg);
+            *fmts = AFMT_U8 | AFMT_S16_LE;
+            return 0;
+        }
+
+        // SNDCTL_DSP_SETFRAGMENT — set fragment size (accept, clamp)
+        if (cmd == SNDCTL_DSP_SETFRAGMENT)
+        {
+            auto* val = reinterpret_cast<int*>(arg);
+            int fragExp = (*val) & 0xFFFF;
+            if (fragExp < 8) fragExp = 8;    // min 256 bytes
+            if (fragExp > 16) fragExp = 16;  // max 64KB
+            dsp->fragmentSize = static_cast<uint16_t>(1u << fragExp);
+            return 0;
+        }
+
+        // SNDCTL_DSP_GETBLKSIZE — return fragment size
+        if (cmd == SNDCTL_DSP_GETBLKSIZE)
+        {
+            auto* size = reinterpret_cast<int*>(arg);
+            *size = static_cast<int>(dsp->fragmentSize);
+            return 0;
+        }
+
+        // SNDCTL_DSP_SETTRIGGER — enable/disable output, accept but noop
+        if (cmd == SNDCTL_DSP_SETTRIGGER)
+            return 0;
+
+        SerialPrintf("sys_ioctl: dsp unknown cmd 0x%lx\n", cmd);
+        return -EINVAL;
+    }
+
+    // TCGETS2 = 0x802c542a — termios2 (like TCGETS plus ispeed/ospeed uint32s)
+    if (isTtyFd && cmd == 0x802c542aUL)
+    {
+        auto* t = reinterpret_cast<uint32_t*>(arg);
+        t[0] = 0x0500;
+        t[1] = 0x0005;
+        t[2] = 0x00BF;
+        uint32_t lflag = 0x8A31;
+        if (proc->ttyCanonical) lflag |= 0x0002;
+        if (proc->ttyEcho)      lflag |= 0x0008;
+        t[3] = lflag;
+        auto* raw = reinterpret_cast<uint8_t*>(&t[4]);
+        raw[0] = 0;
+        auto* cc = &raw[1];
+        __builtin_memset(cc, 0, 19);
+        cc[0]=0x03; cc[1]=0x1C; cc[2]=0x7F; cc[3]=0x15; cc[4]=0x04;
+        cc[5]=0;    cc[6]=1;    cc[7]=0;    cc[8]=0x11; cc[9]=0x13;
+        cc[10]=0x1A;cc[11]=0;   cc[12]=0x12;cc[13]=0x0F;cc[14]=0x17;
+        cc[15]=0x16;cc[16]=0;
+        // termios2 appends c_ispeed, c_ospeed (uint32 each) at offset 20 in cc-block
+        uint32_t* speeds = reinterpret_cast<uint32_t*>(&raw[20]);
+        speeds[0] = 38400;
+        speeds[1] = 38400;
+        return 0;
+    }
+
+    // Any unhandled 'T'-type ioctl (termios family) on a non-tty or for
+    // commands we don't implement -> ENOTTY is the correct POSIX reply.
+    // Go runtime uses this to detect isatty; returning ENOSYS makes it loop.
+    if (((cmd >> 8) & 0xFF) == 'T')
+    {
+        return -25; // ENOTTY
+    }
 
     SerialPrintf("sys_ioctl: unhandled fd=%lu cmd=0x%lx\n", fd, cmd);
     return -ENOSYS;
@@ -3090,11 +4203,14 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
         return 0;
     }
 
-    if (fde->type == FdType::DevKeyboard || fde->type == FdType::DevNull) {
+    if (fde->type == FdType::DevKeyboard || fde->type == FdType::DevNull ||
+        fde->type == FdType::DevUrandom || fde->type == FdType::DevDsp) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
         for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
         st->st_mode = 0020666; // S_IFCHR
-        st->st_rdev = (fde->type == FdType::DevNull) ? 0x0103 : 0x0400;
+        st->st_rdev = (fde->type == FdType::DevNull) ? 0x0103 :
+                      (fde->type == FdType::DevUrandom) ? 0x0109 :
+                      (fde->type == FdType::DevDsp) ? 0x0E03 : 0x0400; // 14,3 = /dev/dsp
         st->st_blksize = 4096;
         return 0;
     }
@@ -3107,8 +4223,76 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
         return 0;
     }
 
+    if (fde->type == FdType::SyntheticMem) {
+        auto* raw = reinterpret_cast<uint8_t*>(st);
+        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        st->st_mode = 0100444; // S_IFREG | r--r--r--
+        if (fde->handle) {
+            auto* content = static_cast<const char*>(fde->handle);
+            uint64_t len = 0;
+            while (content[len]) len++;
+            st->st_size = len;
+        }
+        st->st_blksize = 4096;
+        return 0;
+    }
+
+    if (fde->type == FdType::Socket) {
+        auto* raw = reinterpret_cast<uint8_t*>(st);
+        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        st->st_mode = 0140666; // S_IFSOCK | rw-rw-rw-
+        st->st_blksize = 4096;
+        return 0;
+    }
+
+    if (fde->type == FdType::EventFd) {
+        auto* raw = reinterpret_cast<uint8_t*>(st);
+        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        st->st_mode = 0100666; // S_IFREG | rw-rw-rw-
+        st->st_blksize = 4096;
+        return 0;
+    }
+
+    if (fde->type == FdType::EpollFd) {
+        auto* raw = reinterpret_cast<uint8_t*>(st);
+        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        st->st_mode = 0100666;
+        st->st_blksize = 4096;
+        return 0;
+    }
+
+    if (fde->type == FdType::TimerFd) {
+        auto* raw = reinterpret_cast<uint8_t*>(st);
+        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        st->st_mode = 0100666;
+        st->st_blksize = 4096;
+        return 0;
+    }
+
+    if (fde->type == FdType::MemFd && fde->handle) {
+        auto* mfd = static_cast<MemFdData*>(fde->handle);
+        auto* raw = reinterpret_cast<uint8_t*>(st);
+        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        st->st_mode = 0100666; // S_IFREG | rw-rw-rw-
+        st->st_size = static_cast<int64_t>(mfd->size);
+        st->st_blksize = 4096;
+        st->st_blocks  = static_cast<int64_t>((mfd->size + 511) / 512);
+        return 0;
+    }
+
+    if (fde->type == FdType::UnixSocket) {
+        auto* raw = reinterpret_cast<uint8_t*>(st);
+        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        st->st_mode = 0140666; // S_IFSOCK | rw-rw-rw-
+        st->st_blksize = 4096;
+        return 0;
+    }
+
     return -EBADF;
 }
+
+// Forward decl for *at path resolution (defined after sys_openat).
+static bool ResolveAtPath(int dirfd, const char* path, char* out, uint32_t outSize);
 
 static int64_t sys_newfstatat(uint64_t dirfd, uint64_t pathAddr, uint64_t statAddr,
                                uint64_t flags, uint64_t, uint64_t)
@@ -3120,33 +4304,14 @@ static int64_t sys_newfstatat(uint64_t dirfd, uint64_t pathAddr, uint64_t statAd
     static constexpr uint64_t AT_SYMLINK_NOFOLLOW = 0x100;
     bool noFollow = (flags & AT_SYMLINK_NOFOLLOW) != 0;
 
-    // Resolve relative path against dirfd if needed
-    static constexpr int64_t AT_FDCWD = -100;
-    if (path[0] != '/' && static_cast<int64_t>(dirfd) != AT_FDCWD)
-    {
-        Process* proc = ProcessCurrent();
-        if (proc)
-        {
-            FdEntry* fde = FdGet(proc, static_cast<int>(dirfd));
-            if (fde && fde->dirPath[0])
-            {
-                char resolved[256];
-                uint32_t ri = 0;
-                for (uint32_t i = 0; fde->dirPath[i] && ri < 250; ++i)
-                    resolved[ri++] = fde->dirPath[i];
-                for (uint32_t i = 0; path[i] && ri < 254; ++i)
-                    resolved[ri++] = path[i];
-                resolved[ri] = '\0';
-                if (noFollow)
-                    return sys_lstat(reinterpret_cast<uint64_t>(resolved), statAddr, 0, 0, 0, 0);
-                return sys_stat(reinterpret_cast<uint64_t>(resolved), statAddr, 0, 0, 0, 0);
-            }
-        }
-    }
+    char resolved[256];
+    uint64_t arg = pathAddr;
+    if (ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
+        arg = reinterpret_cast<uint64_t>(resolved);
 
     if (noFollow)
-        return sys_lstat(pathAddr, statAddr, 0, 0, 0, 0);
-    return sys_stat(pathAddr, statAddr, 0, 0, 0, 0);
+        return sys_lstat(arg, statAddr, 0, 0, 0, 0);
+    return sys_stat(arg, statAddr, 0, 0, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -3353,19 +4518,6 @@ static int64_t sys_prlimit64(uint64_t pid, uint64_t resource, uint64_t newlimitA
 // sys_getrandom (318) — RDRAND-backed random number generation
 // ---------------------------------------------------------------------------
 
-static bool RdrandU64(uint64_t* out)
-{
-    uint64_t val;
-    uint8_t ok;
-    // RDRAND sets CF=1 on success; retry up to 10 times on transient failure.
-    for (int i = 0; i < 10; i++)
-    {
-        __asm__ volatile("rdrand %0; setc %1" : "=r"(val), "=qm"(ok));
-        if (ok) { *out = val; return true; }
-    }
-    return false;
-}
-
 static int64_t sys_getrandom(uint64_t bufAddr, uint64_t count, uint64_t,
                                uint64_t, uint64_t, uint64_t)
 {
@@ -3378,12 +4530,7 @@ static int64_t sys_getrandom(uint64_t bufAddr, uint64_t count, uint64_t,
     {
         uint64_t rnd;
         if (!RdrandU64(&rnd))
-        {
-            // RDRAND unavailable — fall back to TSC-based mixing
-            uint64_t tsc;
-            __asm__ volatile("rdtsc" : "=A"(tsc));
-            rnd = tsc * 6364136223846793005ULL + 1442695040888963407ULL;
-        }
+            rnd = SoftRandU64();
 
         uint64_t remaining = count - filled;
         uint64_t chunk = (remaining < 8) ? remaining : 8;
@@ -3422,11 +4569,41 @@ static int64_t sys_openat(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
     uint32_t ri = 0;
     for (uint32_t i = 0; fde->dirPath[i] && ri < 250; ++i)
         resolved[ri++] = fde->dirPath[i];
+    if (ri > 0 && resolved[ri - 1] != '/' && ri < 254)
+        resolved[ri++] = '/';
     for (uint32_t i = 0; path[i] && ri < 254; ++i)
         resolved[ri++] = path[i];
     resolved[ri] = '\0';
 
     return sys_open(reinterpret_cast<uint64_t>(resolved), flags, mode, 0, 0, 0);
+}
+
+// Shared helper for *at syscalls: resolves a path relative to dirfd into an
+// absolute path in 'out'. Returns true on success. If path is already absolute
+// or dirfd is AT_FDCWD, copies path verbatim.
+static bool ResolveAtPath(int dirfd, const char* path, char* out, uint32_t outSize)
+{
+    static constexpr int AT_FDCWD = -100;
+    if (!path || !out || outSize < 2) return false;
+    if (path[0] == '/' || dirfd == AT_FDCWD) {
+        uint32_t i = 0;
+        while (path[i] && i < outSize - 1) { out[i] = path[i]; ++i; }
+        out[i] = '\0';
+        return true;
+    }
+    Process* proc = ProcessCurrent();
+    if (!proc) return false;
+    FdEntry* fde = FdGet(proc, dirfd);
+    if (!fde || fde->dirPath[0] == '\0') return false;
+    uint32_t ri = 0;
+    for (uint32_t i = 0; fde->dirPath[i] && ri < outSize - 2; ++i)
+        out[ri++] = fde->dirPath[i];
+    if (ri > 0 && out[ri - 1] != '/' && ri < outSize - 2)
+        out[ri++] = '/';
+    for (uint32_t i = 0; path[i] && ri < outSize - 1; ++i)
+        out[ri++] = path[i];
+    out[ri] = '\0';
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -3566,6 +4743,7 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
         if (fds[i].fd < 0) continue;
 
         FdEntry* fde = FdGet(proc, fds[i].fd);
+
         if (!fde || fde->type == FdType::None)
         {
             fds[i].revents = POLLNVAL;
@@ -3624,16 +4802,11 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
         if (fde->type == FdType::Socket && fde->handle)
         {
             int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
-            if ((fds[i].events & POLLIN) &&
-                brook::SockPollReady(sockIdx, true, false))
-            {
-                fds[i].revents |= POLLIN;
-            }
-            if ((fds[i].events & POLLOUT) &&
-                brook::SockPollReady(sockIdx, false, true))
-            {
-                fds[i].revents |= POLLOUT;
-            }
+            bool rdReady = (fds[i].events & POLLIN) && brook::SockPollReady(sockIdx, true, false);
+            bool wrReady = (fds[i].events & POLLOUT) && brook::SockPollReady(sockIdx, false, true);
+
+            if (rdReady) fds[i].revents |= POLLIN;
+            if (wrReady) fds[i].revents |= POLLOUT;
             if (fds[i].revents) ready++;
             continue;
         }
@@ -3650,6 +4823,52 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
                     fds[i].revents |= POLLIN;
                 }
             }
+            if (fds[i].events & POLLOUT)
+                fds[i].revents |= POLLOUT;
+            if (fds[i].revents) ready++;
+            continue;
+        }
+
+        // EventFd: readable when counter > 0, always writable
+        if (fde->type == FdType::EventFd && fde->handle)
+        {
+            auto* efd = static_cast<EventFdData*>(fde->handle);
+            if ((fds[i].events & POLLIN) &&
+                __atomic_load_n(&efd->counter, __ATOMIC_ACQUIRE) > 0)
+            {
+                fds[i].revents |= POLLIN;
+            }
+            if (fds[i].events & POLLOUT)
+                fds[i].revents |= POLLOUT;
+            if (fds[i].revents) ready++;
+            continue;
+        }
+
+        if (fde->type == FdType::TimerFd && fde->handle)
+        {
+            auto* tfd = static_cast<TimerFdData*>(fde->handle);
+            if (fds[i].events & POLLIN)
+            {
+                extern volatile uint64_t g_lapicTickCount;
+                bool fired = (tfd->expiryCount > 0) ||
+                             (tfd->armed && g_lapicTickCount >= tfd->nextExpiry);
+                if (fired) fds[i].revents |= POLLIN;
+            }
+            if (fds[i].revents) ready++;
+            continue;
+        }
+
+        if (fde->type == FdType::MemFd)
+        {
+            if (fds[i].events & (POLLIN | POLLOUT))
+                fds[i].revents |= (fds[i].events & (POLLIN | POLLOUT));
+            if (fds[i].revents) ready++;
+            continue;
+        }
+
+        // /dev/dsp: always writable (we buffer)
+        if (fde->type == FdType::DevDsp)
+        {
             if (fds[i].events & POLLOUT)
                 fds[i].revents |= POLLOUT;
             if (fds[i].revents) ready++;
@@ -3689,6 +4908,11 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
                 auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
                 rp->readerWaiter = self;
             }
+            if (fde->type == FdType::Socket && fde->handle)
+            {
+                int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+                brook::SockSetPollWaiter(sockIdx, self);
+            }
         }
 
         // Re-check data availability after registration.
@@ -3707,6 +4931,13 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
                 if (!(fde->flags & 1) && (pb->count() > 0 || pb->writers == 0))
                 { ready++; break; }
             }
+            if (fde->type == FdType::Socket && fde->handle)
+            {
+                int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+                if (brook::SockPollReady(sockIdx, (fds[i].events & POLLIN) != 0,
+                                                  (fds[i].events & POLLOUT) != 0))
+                { ready++; break; }
+            }
         }
 
         if (ready == 0)
@@ -3716,6 +4947,7 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
             {
                 extern volatile uint64_t g_lapicTickCount;
                 self->wakeupTick = g_lapicTickCount + timeout_ms;
+
             }
             SchedulerBlock(self);
             if (HasPendingSignals())
@@ -3732,6 +4964,11 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
                         auto* pb2 = static_cast<PipeBuffer*>(fde2->handle);
                         if (!(fde2->flags & 1) && pb2->readerWaiter == self)
                             pb2->readerWaiter = nullptr;
+                    }
+                    if (fde2->type == FdType::Socket && fde2->handle)
+                    {
+                        int si = static_cast<int>(reinterpret_cast<uintptr_t>(fde2->handle)) - 1;
+                        brook::SockSetPollWaiter(si, nullptr);
                     }
                 }
                 return -EINTR;
@@ -3751,6 +4988,14 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
                 if (!(fde->flags & 1) && pb->readerWaiter == self)
                     pb->readerWaiter = nullptr;
             }
+            if (fde->type == FdType::DevTty && fde->handle && (fds[i].events & POLLIN))
+            {
+                auto* pair = static_cast<TtyDevicePair*>(fde->handle);
+                auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
+                if (rp->readerWaiter == self)
+                    rp->readerWaiter = nullptr;
+            }
+            // Socket waiter is already cleared by SockDeliverUdp/TcpEnqueueData on wake
         }
 
         // Re-scan after wake — reset ready count
@@ -3780,7 +5025,49 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
             }
             if (fde->type == FdType::DevKeyboard && (fds[i].events & POLLIN) && InputHasEvents())
             { fds[i].revents |= POLLIN; ready++; continue; }
-            fds[i].revents = fds[i].events; ready++;
+            if (fde->type == FdType::DevTty && fde->handle)
+            {
+                auto* pair = static_cast<TtyDevicePair*>(fde->handle);
+                if (fds[i].events & POLLIN)
+                {
+                    auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
+                    if (rp->count() > 0 || rp->writers == 0)
+                    { fds[i].revents |= POLLIN; }
+                }
+                if (fds[i].events & POLLOUT)
+                    fds[i].revents |= POLLOUT;
+                if (fds[i].revents) ready++;
+                continue;
+            }
+            if (fde->type == FdType::Socket && fde->handle)
+            {
+                int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+                if ((fds[i].events & POLLIN) && brook::SockPollReady(sockIdx, true, false))
+                    fds[i].revents |= POLLIN;
+                if ((fds[i].events & POLLOUT) && brook::SockPollReady(sockIdx, false, true))
+                    fds[i].revents |= POLLOUT;
+                if (fds[i].revents) ready++;
+                continue;
+            }
+            if (fde->type == FdType::EventFd && fde->handle)
+            {
+                auto* efd = static_cast<EventFdData*>(fde->handle);
+                if ((fds[i].events & POLLIN) &&
+                    __atomic_load_n(&efd->counter, __ATOMIC_ACQUIRE) > 0)
+                    fds[i].revents |= POLLIN;
+                if (fds[i].events & POLLOUT)
+                    fds[i].revents |= POLLOUT;
+                if (fds[i].revents) ready++;
+                continue;
+            }
+            if (fde->type == FdType::DevDsp)
+            {
+                if (fds[i].events & POLLOUT)
+                    fds[i].revents |= POLLOUT;
+                if (fds[i].revents) ready++;
+                continue;
+            }
+            // Unknown fd type: don't claim readiness
         }
     }
 
@@ -3846,8 +5133,11 @@ static int64_t sys_readlink(uint64_t pathAddr, uint64_t bufAddr, uint64_t bufsiz
 static int64_t sys_readlinkat(uint64_t dirfd, uint64_t pathAddr, uint64_t bufAddr,
                                uint64_t bufsiz, uint64_t, uint64_t)
 {
-    (void)dirfd;
-    return sys_readlink(pathAddr, bufAddr, bufsiz, 0, 0, 0);
+    const char* path = reinterpret_cast<const char*>(pathAddr);
+    char resolved[256];
+    if (!ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
+        return sys_readlink(pathAddr, bufAddr, bufsiz, 0, 0, 0);
+    return sys_readlink(reinterpret_cast<uint64_t>(resolved), bufAddr, bufsiz, 0, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -3866,8 +5156,11 @@ static int64_t sys_symlink(uint64_t targetAddr, uint64_t linkpathAddr, uint64_t,
 static int64_t sys_symlinkat(uint64_t targetAddr, uint64_t newdirfd, uint64_t linkpathAddr,
                               uint64_t, uint64_t, uint64_t)
 {
-    (void)newdirfd; // TODO: handle AT_FDCWD properly
-    return sys_symlink(targetAddr, linkpathAddr, 0, 0, 0, 0);
+    const char* linkpath = reinterpret_cast<const char*>(linkpathAddr);
+    char resolved[256];
+    if (!ResolveAtPath(static_cast<int>(newdirfd), linkpath, resolved, sizeof(resolved)))
+        return sys_symlink(targetAddr, linkpathAddr, 0, 0, 0, 0);
+    return sys_symlink(targetAddr, reinterpret_cast<uint64_t>(resolved), 0, 0, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -3879,6 +5172,522 @@ static int64_t sys_pipe2(uint64_t pipefdAddr, uint64_t flags, uint64_t,
 {
     (void)flags; // O_CLOEXEC etc. — ignore for now
     return sys_pipe(pipefdAddr, 0, 0, 0, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// sys_eventfd2 (290) — event notification file descriptor
+// ---------------------------------------------------------------------------
+
+static int64_t sys_eventfd2(uint64_t initval, uint64_t flagsVal, uint64_t,
+                              uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EMFILE;
+
+    auto* efd = static_cast<EventFdData*>(kmalloc(sizeof(EventFdData)));
+    if (!efd) return -ENOMEM;
+
+    efd->counter = initval;
+    efd->flags = static_cast<uint32_t>(flagsVal);
+    efd->readerWaiter = nullptr;
+
+    int fd = FdAlloc(proc, FdType::EventFd, efd);
+    if (fd < 0) { kfree(efd); return -EMFILE; }
+
+    if (flagsVal & EFD_NONBLOCK)
+        proc->fds[fd].statusFlags = 0x800; // O_NONBLOCK
+
+    DbgPrintf("sys_eventfd2: fd=%d initval=%lu flags=0x%lx\n", fd, initval, flagsVal);
+    return fd;
+}
+
+// ---------------------------------------------------------------------------
+// epoll — Linux epoll_create / epoll_ctl / epoll_wait
+// ---------------------------------------------------------------------------
+//
+// Wayland compositors (weston, etc.) use epoll as their primary event loop.
+// We implement a simple but correct epoll supporting EPOLLIN/EPOLLOUT on
+// pipes, sockets, eventfds, timerfds, and other fd types.
+//
+// Data structures:
+//   EpollInstance  — the epoll fd's state (interest list + ready list)
+//   EpollEntry     — one registered fd (interest list entry)
+
+static constexpr uint32_t EPOLLIN      = 0x001;
+static constexpr uint32_t EPOLLOUT     = 0x004;
+[[maybe_unused]] static constexpr uint32_t EPOLLRDHUP   = 0x2000;
+[[maybe_unused]] static constexpr uint32_t EPOLLPRI     = 0x002;
+static constexpr uint32_t EPOLLERR     = 0x008;
+static constexpr uint32_t EPOLLHUP     = 0x010;
+[[maybe_unused]] static constexpr uint32_t EPOLLET      = (1u << 31);  // edge-triggered (ignored, always LT)
+[[maybe_unused]] static constexpr uint32_t EPOLLONESHOT = (1u << 30);
+
+[[maybe_unused]] static constexpr int EPOLL_CTL_ADD = 1;
+static constexpr int EPOLL_CTL_DEL = 2;
+static constexpr int EPOLL_CTL_MOD = 3;
+
+struct EpollEvent {
+    uint32_t events;
+    union {
+        int      fd;
+        uint64_t u64;
+        uint32_t u32;
+        void*    ptr;
+    } data;
+};
+
+static constexpr int EPOLL_MAX_FDS = 64;
+
+struct EpollEntry {
+    int      fd;      // watched fd (-1 = free)
+    uint32_t events;  // requested events
+    uint64_t data;    // user data (uint64)
+};
+
+struct EpollInstance {
+    EpollEntry entries[EPOLL_MAX_FDS];
+    int        count;
+    Process*   waiter; // process blocked in epoll_wait
+};
+
+// Check if a single fd is ready given the requested events mask.
+// Returns the set of events that are actually ready.
+static uint32_t EpollFdReady(Process* proc, int fd, uint32_t events)
+{
+    FdEntry* fde = FdGet(proc, fd);
+    if (!fde) return EPOLLERR | EPOLLHUP;
+
+    uint32_t ready = 0;
+
+    if (events & EPOLLIN) {
+        bool readable = false;
+        if (fde->type == FdType::Pipe && fde->handle) {
+            auto* pb = static_cast<PipeBuffer*>(fde->handle);
+            readable = (pb->count() > 0 || pb->writers == 0);
+        } else if (fde->type == FdType::EventFd && fde->handle) {
+            auto* efd = static_cast<EventFdData*>(fde->handle);
+            readable = (efd->counter > 0);
+        } else if (fde->type == FdType::Socket && fde->handle) {
+            int si = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+            readable = brook::SockPollReady(si, true, false);
+        } else if (fde->type == FdType::TimerFd && fde->handle) {
+            // TimerFd is readable when its expiry count > 0 or timer has fired
+            auto* tfd = static_cast<TimerFdData*>(fde->handle);
+            extern volatile uint64_t g_lapicTickCount;
+            readable = (tfd->expiryCount > 0) ||
+                       (tfd->armed && g_lapicTickCount >= tfd->nextExpiry);
+        } else if (fde->type == FdType::Vnode) {
+            readable = true; // files always readable
+        } else if (fde->type == FdType::DevTty && fde->handle) {
+            auto* pair = static_cast<TtyDevicePair*>(fde->handle);
+            auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
+            readable = (rp->count() > 0 || rp->writers == 0);
+        } else if (fde->type == FdType::UnixSocket && fde->handle) {
+            auto* usd = static_cast<UnixSocketData*>(fde->handle);
+            if (usd->state == UnixSocketData::State::Listening) {
+                readable = (usd->pendingCount > 0);
+            } else if (usd->state == UnixSocketData::State::Connected && usd->rxPipe) {
+                readable = (usd->rxPipe->count() > 0 ||
+                            __atomic_load_n(&usd->rxPipe->writers, __ATOMIC_ACQUIRE) == 0);
+            }
+        }
+        if (readable) ready |= EPOLLIN;
+    }
+
+    if (events & EPOLLOUT) {
+        bool writable = false;
+        if (fde->type == FdType::Pipe && fde->handle) {
+            // writable if write end and there's space
+            if (fde->flags & 1) { // write end
+                auto* pb = static_cast<PipeBuffer*>(fde->handle);
+                writable = (pb->space() > 0);
+            }
+        } else if (fde->type == FdType::Socket && fde->handle) {
+            int si = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+            writable = brook::SockPollReady(si, false, true);
+        } else if (fde->type == FdType::EventFd) {
+            writable = true;
+        } else if (fde->type == FdType::Vnode) {
+            writable = true;
+        } else if (fde->type == FdType::DevTty) {
+            writable = true;
+        } else if (fde->type == FdType::MemFd) {
+            writable = true;
+        } else if (fde->type == FdType::UnixSocket && fde->handle) {
+            auto* usd = static_cast<UnixSocketData*>(fde->handle);
+            if (usd->state == UnixSocketData::State::Connected && usd->txPipe)
+                writable = (__atomic_load_n(&usd->txPipe->readers, __ATOMIC_ACQUIRE) > 0 &&
+                            usd->txPipe->space() > 0);
+        }
+        if (writable) ready |= EPOLLOUT;
+    }
+
+    return ready;
+}
+
+// Scan interest list and fill events[]. Returns count of ready fds.
+static int EpollScanReady(Process* proc, EpollInstance* ep,
+                           EpollEvent* events, int maxevents)
+{
+    int n = 0;
+    for (int i = 0; i < ep->count && n < maxevents; i++) {
+        EpollEntry& e = ep->entries[i];
+        if (e.fd < 0) continue;
+        uint32_t ready = EpollFdReady(proc, e.fd, e.events);
+        if (ready) {
+            events[n].events = ready;
+            events[n].data.u64 = e.data;
+            n++;
+        }
+    }
+    return n;
+}
+
+static int64_t epoll_create_impl(uint64_t flagsVal)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EMFILE;
+
+    auto* ep = static_cast<EpollInstance*>(kmalloc(sizeof(EpollInstance)));
+    if (!ep) return -ENOMEM;
+    for (int i = 0; i < EPOLL_MAX_FDS; i++) ep->entries[i].fd = -1;
+    ep->count = 0;
+    ep->waiter = nullptr;
+
+    int fd = FdAlloc(proc, FdType::EpollFd, ep);
+    if (fd < 0) { kfree(ep); return -EMFILE; }
+
+    if (flagsVal & 0x80000) // EPOLL_CLOEXEC
+        proc->fds[fd].fdFlags |= 1;
+
+
+    return fd;
+}
+
+static int64_t sys_epoll_create(uint64_t size, uint64_t, uint64_t,
+                                  uint64_t, uint64_t, uint64_t)
+{
+    (void)size; // size hint ignored since Linux 2.6.8
+    return epoll_create_impl(0);
+}
+
+static int64_t sys_epoll_create1(uint64_t flags, uint64_t, uint64_t,
+                                   uint64_t, uint64_t, uint64_t)
+{
+    return epoll_create_impl(flags);
+}
+
+static int64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t watchfd,
+                               uint64_t eventAddr, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+
+    FdEntry* epfde = FdGet(proc, static_cast<int>(epfd));
+    if (!epfde || epfde->type != FdType::EpollFd || !epfde->handle) return -EBADF;
+    auto* ep = static_cast<EpollInstance*>(epfde->handle);
+
+    int wfd = static_cast<int>(watchfd);
+
+    if (op == EPOLL_CTL_DEL) {
+        for (int i = 0; i < ep->count; i++) {
+            if (ep->entries[i].fd == wfd) {
+                ep->entries[i].fd = -1;
+
+                return 0;
+            }
+        }
+        return -ENOENT;
+    }
+
+    // ADD or MOD — read the epoll_event from userspace
+    EpollEvent ev = {};
+    if (eventAddr < 0x1000) return -EFAULT;
+    __builtin_memcpy(&ev, reinterpret_cast<const void*>(eventAddr), sizeof(ev));
+
+    if (op == EPOLL_CTL_MOD) {
+        for (int i = 0; i < ep->count; i++) {
+            if (ep->entries[i].fd == wfd) {
+                ep->entries[i].events = ev.events;
+                ep->entries[i].data   = ev.data.u64;
+
+                return 0;
+            }
+        }
+        return -ENOENT;
+    }
+
+    // EPOLL_CTL_ADD
+    if (ep->count >= EPOLL_MAX_FDS) return -ENOMEM;
+
+    // Find free slot (may have gaps from DEL)
+    for (int i = 0; i < EPOLL_MAX_FDS; i++) {
+        if (ep->entries[i].fd < 0) {
+            ep->entries[i].fd     = wfd;
+            ep->entries[i].events = ev.events;
+            ep->entries[i].data   = ev.data.u64;
+            if (i >= ep->count) ep->count = i + 1;
+
+            return 0;
+        }
+    }
+    return -ENOMEM;
+}
+
+static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
+                                EpollEvent* kEvents, int maxevents,
+                                int timeout_ms)
+{
+    // Immediate scan
+    int n = EpollScanReady(proc, ep, kEvents, maxevents);
+    if (n > 0 || timeout_ms == 0) return n;
+
+    // Block until something is ready (or timeout)
+    extern volatile uint64_t g_lapicTickCount;
+    uint64_t startTick = g_lapicTickCount;
+    uint64_t timeoutTicks = (timeout_ms < 0)
+        ? (~(uint64_t)0)  // UINT64_MAX
+        : startTick + (uint64_t)timeout_ms;
+
+    ep->waiter = proc;
+    proc->wakeupTick = timeoutTicks;
+
+    while (true) {
+        SchedulerBlock(proc);
+        if (HasPendingSignals()) {
+            ep->waiter = nullptr;
+            return -EINTR;
+        }
+
+        n = EpollScanReady(proc, ep, kEvents, maxevents);
+        if (n > 0) { ep->waiter = nullptr; return n; }
+
+        uint64_t now = g_lapicTickCount;
+        if (timeout_ms >= 0 && now >= timeoutTicks) {
+            ep->waiter = nullptr;
+            return 0; // timeout
+        }
+
+        // Re-arm for another wait cycle
+        proc->wakeupTick = timeoutTicks;
+        ep->waiter = proc;
+    }
+}
+
+static int64_t sys_epoll_wait(uint64_t epfd, uint64_t eventsAddr,
+                               uint64_t maxevents, uint64_t timeout_ms,
+                               uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+
+    FdEntry* epfde = FdGet(proc, static_cast<int>(epfd));
+    if (!epfde || epfde->type != FdType::EpollFd || !epfde->handle) return -EBADF;
+    auto* ep = static_cast<EpollInstance*>(epfde->handle);
+
+    if (maxevents <= 0 || maxevents > 1024) return -EINVAL;
+
+    // Allocate kernel-side event buffer
+    auto* kEvents = static_cast<EpollEvent*>(
+        kmalloc(sizeof(EpollEvent) * static_cast<uint32_t>(maxevents)));
+    if (!kEvents) return -ENOMEM;
+
+    int n = epoll_wait_impl(proc, ep, kEvents,
+                             static_cast<int>(maxevents),
+                             static_cast<int>(static_cast<int64_t>(timeout_ms)));
+
+    if (n > 0) {
+        if (eventsAddr < 0x1000) { kfree(kEvents); return -EFAULT; }
+        __builtin_memcpy(reinterpret_cast<void*>(eventsAddr), kEvents,
+                        sizeof(EpollEvent) * static_cast<uint32_t>(n));
+    }
+
+    kfree(kEvents);
+    return n;
+}
+
+static int64_t sys_epoll_pwait(uint64_t epfd, uint64_t eventsAddr,
+                                uint64_t maxevents, uint64_t timeout_ms,
+                                uint64_t sigmaskAddr, uint64_t)
+{
+    (void)sigmaskAddr; // signal mask ignored — we have no RT signals
+    return sys_epoll_wait(epfd, eventsAddr, maxevents, timeout_ms, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// timerfd — timerfd_create / timerfd_settime / timerfd_gettime
+// ---------------------------------------------------------------------------
+//
+// Used by Wayland clients for frame pacing and animation timers.
+// We implement a simple periodic/one-shot timer using LAPIC tick count.
+
+static constexpr int CLOCK_REALTIME  = 0;
+static constexpr int CLOCK_MONOTONIC = 1;
+
+struct ITimerSpec {
+    struct {
+        int64_t tv_sec;
+        int64_t tv_nsec;
+    } it_interval; // period (0 = one-shot)
+    struct {
+        int64_t tv_sec;
+        int64_t tv_nsec;
+    } it_value;    // initial expiry (0 = disarmed)
+};
+
+static int64_t sys_timerfd_create(uint64_t clockid, uint64_t flags,
+                                   uint64_t, uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EMFILE;
+
+    if (clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC)
+        return -EINVAL;
+
+    auto* tfd = static_cast<TimerFdData*>(kmalloc(sizeof(TimerFdData)));
+    if (!tfd) return -ENOMEM;
+    tfd->expiryCount = 0;
+    tfd->intervalNs  = 0;
+    tfd->nextExpiry  = 0;
+    tfd->clockId     = static_cast<int>(clockid);
+    tfd->armed       = false;
+    tfd->waiter      = nullptr;
+
+    int fd = FdAlloc(proc, FdType::TimerFd, tfd);
+    if (fd < 0) { kfree(tfd); return -EMFILE; }
+
+    if (flags & TFD_NONBLOCK)
+        proc->fds[fd].statusFlags = 0x800;
+    if (flags & TFD_CLOEXEC)
+        proc->fds[fd].fdFlags |= 1;
+
+    SerialPrintf("sys_timerfd_create: fd=%d clock=%lu\n", fd, clockid);
+    return fd;
+}
+
+static int64_t sys_timerfd_settime(uint64_t fd, uint64_t flagsVal,
+                                    uint64_t newValAddr, uint64_t oldValAddr,
+                                    uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+
+    FdEntry* fde = FdGet(proc, static_cast<int>(fd));
+    if (!fde || fde->type != FdType::TimerFd || !fde->handle) return -EBADF;
+    auto* tfd = static_cast<TimerFdData*>(fde->handle);
+
+    ITimerSpec newVal = {};
+    if (newValAddr < 0x1000) return -EFAULT;
+    __builtin_memcpy(&newVal, reinterpret_cast<const void*>(newValAddr), sizeof(newVal));
+
+    // Save old value if requested
+    if (oldValAddr) {
+        ITimerSpec oldVal = {};
+        if (tfd->armed) {
+            extern volatile uint64_t g_lapicTickCount;
+            uint64_t remaining = (tfd->nextExpiry > g_lapicTickCount)
+                ? (tfd->nextExpiry - g_lapicTickCount) : 0;
+            oldVal.it_value.tv_sec  = static_cast<int64_t>(remaining / 1000);
+            oldVal.it_value.tv_nsec = static_cast<int64_t>((remaining % 1000) * 1000000);
+            oldVal.it_interval.tv_sec  = static_cast<int64_t>(tfd->intervalNs / 1000000000ULL);
+            oldVal.it_interval.tv_nsec = static_cast<int64_t>(tfd->intervalNs % 1000000000ULL);
+        }
+        if (oldValAddr >= 0x1000)
+            __builtin_memcpy(reinterpret_cast<void*>(oldValAddr), &oldVal, sizeof(oldVal));
+    }
+
+    // Disarm if both it_value fields are zero
+    int64_t valueSec  = newVal.it_value.tv_sec;
+    int64_t valueNsec = newVal.it_value.tv_nsec;
+    if (valueSec == 0 && valueNsec == 0) {
+        tfd->armed = false;
+        tfd->expiryCount = 0;
+        return 0;
+    }
+
+    extern volatile uint64_t g_lapicTickCount;
+    uint64_t nowTick = g_lapicTickCount;
+    uint64_t valueMs = static_cast<uint64_t>(valueSec) * 1000ULL
+                       + static_cast<uint64_t>(valueNsec) / 1000000ULL;
+
+    if (flagsVal & TFD_TIMER_ABSTIME) {
+        // Convert absolute time to tick (rough: treat as ms from epoch offset)
+        tfd->nextExpiry = valueMs; // absolute - not great but acceptable for now
+    } else {
+        tfd->nextExpiry = nowTick + valueMs * LAPIC_TICKS_PER_MS;
+    }
+
+    uint64_t intervalSec  = static_cast<uint64_t>(newVal.it_interval.tv_sec);
+    uint64_t intervalNsec = static_cast<uint64_t>(newVal.it_interval.tv_nsec);
+    tfd->intervalNs = intervalSec * 1000000000ULL + intervalNsec;
+    tfd->armed = true;
+    tfd->expiryCount = 0;
+
+    SerialPrintf("sys_timerfd_settime: fd=%lu nextExpiry=%llu intervalNs=%llu\n",
+                 fd, tfd->nextExpiry, tfd->intervalNs);
+    return 0;
+}
+
+static int64_t sys_timerfd_gettime(uint64_t fd, uint64_t currValAddr,
+                                    uint64_t, uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+
+    FdEntry* fde = FdGet(proc, static_cast<int>(fd));
+    if (!fde || fde->type != FdType::TimerFd || !fde->handle) return -EBADF;
+    auto* tfd = static_cast<TimerFdData*>(fde->handle);
+
+    ITimerSpec curr = {};
+    if (tfd->armed) {
+        extern volatile uint64_t g_lapicTickCount;
+        uint64_t remaining = (tfd->nextExpiry > g_lapicTickCount)
+            ? (tfd->nextExpiry - g_lapicTickCount) : 0;
+        curr.it_value.tv_sec  = static_cast<int64_t>(remaining / 1000);
+        curr.it_value.tv_nsec = static_cast<int64_t>((remaining % 1000) * 1000000LL);
+        curr.it_interval.tv_sec  = static_cast<int64_t>(tfd->intervalNs / 1000000000ULL);
+        curr.it_interval.tv_nsec = static_cast<int64_t>(tfd->intervalNs % 1000000000ULL);
+    }
+
+    if (currValAddr < 0x1000) return -EFAULT;
+    __builtin_memcpy(reinterpret_cast<void*>(currValAddr), &curr, sizeof(curr));
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// sys_memfd_create (319) — anonymous in-memory file
+// ---------------------------------------------------------------------------
+//
+// Wayland uses memfd for shared memory buffers (wl_shm).
+// We implement it as a SyntheticMem fd backed by a heap allocation.
+
+static int64_t sys_memfd_create(uint64_t nameAddr, uint64_t flags,
+                                  uint64_t, uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EMFILE;
+
+    // Name is just for debugging; we don't enforce it
+    char name[64] = "<memfd>";
+    if (nameAddr >= 0x1000) {
+        const char* src = reinterpret_cast<const char*>(nameAddr);
+        for (int i = 0; i < (int)(sizeof(name) - 1) && src[i]; i++) name[i] = src[i], name[i+1] = 0;
+    }
+
+    auto* mfd = static_cast<MemFdData*>(kmalloc(sizeof(MemFdData)));
+    if (!mfd) return -ENOMEM;
+    mfd->buf      = nullptr;
+    mfd->size     = 0;
+    mfd->capacity = 0;
+
+    int fd = FdAlloc(proc, FdType::MemFd, mfd);
+    if (fd < 0) { kfree(mfd); return -EMFILE; }
+
+    if (flags & MFD_CLOEXEC)
+        proc->fds[fd].fdFlags |= 1;
+
+    SerialPrintf("sys_memfd_create: fd=%d name='%s' flags=0x%lx\n", fd, name, flags);
+    return fd;
 }
 
 // ---------------------------------------------------------------------------
@@ -4027,6 +5836,15 @@ static int64_t sys_unlink(uint64_t pathAddr, uint64_t, uint64_t,
     const char* path = reinterpret_cast<const char*>(pathAddr);
     if (!path) return -EFAULT;
 
+    // /dev/shm/<name> — shm_unlink: mark entry as free
+    if (path[0]=='/' && path[1]=='d' && path[2]=='e' && path[3]=='v' &&
+        path[4]=='/' && path[5]=='s' && path[6]=='h' && path[7]=='m' && path[8]=='/') {
+        // Leave the MemFdData alive (other fds may still reference it)
+        // Just make it invisible to future shm_open calls
+        SerialPrintf("shm_unlink: '%s' (ignored — fds stay valid)\n", path + 9);
+        return 0;
+    }
+
     // Try as-is first, then with /boot prefix
     if (VfsUnlink(path) == 0) return 0;
 
@@ -4090,8 +5908,352 @@ static int64_t sys_mkdir(uint64_t pathAddr, uint64_t, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
-// sys_sigaltstack (131) — alternate signal stack
+// sys_mkdirat (258) — create a directory relative to dirfd
 // ---------------------------------------------------------------------------
+
+static int64_t sys_mkdirat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
+                            uint64_t, uint64_t, uint64_t)
+{
+    const char* path = reinterpret_cast<const char*>(pathAddr);
+    char resolved[256];
+    if (!ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
+        return sys_mkdir(pathAddr, mode, 0, 0, 0, 0);
+    return sys_mkdir(reinterpret_cast<uint64_t>(resolved), mode, 0, 0, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// sys_unlinkat (263) — unlink file or rmdir relative to dirfd
+// ---------------------------------------------------------------------------
+
+static int64_t sys_unlinkat(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
+                             uint64_t, uint64_t, uint64_t)
+{
+    (void)flags; // TODO: handle AT_REMOVEDIR (0x200) for rmdir
+    const char* path = reinterpret_cast<const char*>(pathAddr);
+    char resolved[256];
+    if (!ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
+        return sys_unlink(pathAddr, 0, 0, 0, 0, 0);
+    return sys_unlink(reinterpret_cast<uint64_t>(resolved), 0, 0, 0, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// sys_renameat / sys_renameat2 (264 / 316)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_renameat(uint64_t olddirfd, uint64_t oldAddr,
+                             uint64_t newdirfd, uint64_t newAddr,
+                             uint64_t, uint64_t)
+{
+    const char* oldP = reinterpret_cast<const char*>(oldAddr);
+    const char* newP = reinterpret_cast<const char*>(newAddr);
+    char oldR[256], newR[256];
+    uint64_t oArg = oldAddr, nArg = newAddr;
+    if (ResolveAtPath(static_cast<int>(olddirfd), oldP, oldR, sizeof(oldR)))
+        oArg = reinterpret_cast<uint64_t>(oldR);
+    if (ResolveAtPath(static_cast<int>(newdirfd), newP, newR, sizeof(newR)))
+        nArg = reinterpret_cast<uint64_t>(newR);
+    return sys_rename(oArg, nArg, 0, 0, 0, 0);
+}
+
+static int64_t sys_renameat2(uint64_t olddirfd, uint64_t oldAddr,
+                              uint64_t newdirfd, uint64_t newAddr,
+                              uint64_t flags, uint64_t)
+{
+    (void)flags; // RENAME_NOREPLACE etc.
+    return sys_renameat(olddirfd, oldAddr, newdirfd, newAddr, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// sys_linkat (265) — create hard link
+// ---------------------------------------------------------------------------
+
+static int64_t sys_linkat(uint64_t olddirfd, uint64_t oldAddr,
+                           uint64_t newdirfd, uint64_t newAddr,
+                           uint64_t flags, uint64_t)
+{
+    (void)olddirfd; (void)newdirfd; (void)flags;
+    // Hard links not supported yet — return EPERM
+    (void)oldAddr; (void)newAddr;
+    return -EPERM;
+}
+
+// ---------------------------------------------------------------------------
+// sys_ftruncate (77) / sys_truncate (76) — change file size
+// ---------------------------------------------------------------------------
+
+static int64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t,
+                              uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (proc) {
+        FdEntry* fde = FdGet(proc, static_cast<int>(fd));
+        if (fde && fde->type == FdType::MemFd && fde->handle) {
+            auto* mfd = static_cast<MemFdData*>(fde->handle);
+            if (length > mfd->capacity) {
+                auto* newBuf = static_cast<uint8_t*>(kmalloc(static_cast<uint32_t>(length + 4096)));
+                if (!newBuf) return -ENOMEM;
+                if (mfd->buf) {
+                    for (uint64_t i = 0; i < mfd->size; i++) newBuf[i] = mfd->buf[i];
+                    kfree(mfd->buf);
+                }
+                mfd->buf = newBuf;
+                mfd->capacity = length + 4096;
+            }
+            if (length > mfd->size) {
+                // Zero-fill the extension
+                for (uint64_t i = mfd->size; i < length; i++) mfd->buf[i] = 0;
+            }
+            mfd->size = length;
+            return 0;
+        }
+    }
+    // For Vnode files and stubs, succeed silently (Nix uses this for DB journal files)
+    return 0;
+}
+
+static int64_t sys_truncate(uint64_t pathAddr, uint64_t length, uint64_t,
+                             uint64_t, uint64_t, uint64_t)
+{
+    (void)pathAddr; (void)length;
+    return 0; // stub
+}
+
+// ---------------------------------------------------------------------------
+// sys_flock (73) — advisory file locking (stub: always succeeds)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_flock(uint64_t fd, uint64_t operation, uint64_t,
+                          uint64_t, uint64_t, uint64_t)
+{
+    (void)fd; (void)operation;
+    // Advisory locking — with a single-user OS, always succeed
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// sys_chmod (90) / sys_fchmod (91) / sys_fchmodat (268)
+// — stub: succeed silently (no permission model yet)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_chmod(uint64_t, uint64_t, uint64_t,
+                          uint64_t, uint64_t, uint64_t)
+{
+    return 0; // no-op
+}
+
+static int64_t sys_fchmod(uint64_t, uint64_t, uint64_t,
+                           uint64_t, uint64_t, uint64_t)
+{
+    return 0; // no-op
+}
+
+static int64_t sys_fchmodat(uint64_t, uint64_t, uint64_t,
+                             uint64_t, uint64_t, uint64_t)
+{
+    return 0; // no-op
+}
+
+// ---------------------------------------------------------------------------
+// sys_chown (92) / sys_fchown (93) / sys_lchown (94) / sys_fchownat (260)
+// — stub: succeed silently (no user model yet)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_chown(uint64_t, uint64_t, uint64_t,
+                          uint64_t, uint64_t, uint64_t)
+{
+    return 0; // no-op
+}
+
+static int64_t sys_fchown(uint64_t, uint64_t, uint64_t,
+                           uint64_t, uint64_t, uint64_t)
+{
+    return 0; // no-op
+}
+
+static int64_t sys_lchown(uint64_t, uint64_t, uint64_t,
+                           uint64_t, uint64_t, uint64_t)
+{
+    return 0; // no-op
+}
+
+static int64_t sys_fchownat(uint64_t, uint64_t, uint64_t,
+                             uint64_t, uint64_t, uint64_t)
+{
+    return 0; // no-op
+}
+
+// ---------------------------------------------------------------------------
+// sys_utimensat (280) — change file timestamps (stub: succeed)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_utimensat(uint64_t, uint64_t, uint64_t,
+                              uint64_t, uint64_t, uint64_t)
+{
+    return 0; // no-op — we don't track file timestamps yet
+}
+
+// ---------------------------------------------------------------------------
+// sys_sched_getaffinity (204) — get CPU affinity mask
+// ---------------------------------------------------------------------------
+
+static int64_t sys_sched_getaffinity(uint64_t pid, uint64_t cpusetsize,
+                                      uint64_t maskAddr, uint64_t, uint64_t, uint64_t)
+{
+    (void)pid;
+    if (!maskAddr) return -EFAULT;
+    if (cpusetsize < 8) return -EINVAL;
+
+    // Report all 8 CPUs available
+    auto* mask = reinterpret_cast<uint64_t*>(maskAddr);
+    *mask = 0xFF; // 8 CPUs
+    return 8; // size of mask in bytes
+}
+
+// ---------------------------------------------------------------------------
+// sys_sched_setaffinity (203) — set CPU affinity mask (stub: succeed)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_sched_setaffinity(uint64_t, uint64_t, uint64_t,
+                                      uint64_t, uint64_t, uint64_t)
+{
+    return 0; // no-op
+}
+
+// ---------------------------------------------------------------------------
+// sys_statx (332) — extended stat
+// ---------------------------------------------------------------------------
+
+struct linux_statx_timestamp {
+    int64_t  tv_sec;
+    uint32_t tv_nsec;
+    int32_t  pad;
+};
+
+struct linux_statx {
+    uint32_t stx_mask;
+    uint32_t stx_blksize;
+    uint64_t stx_attributes;
+    uint32_t stx_nlink;
+    uint32_t stx_uid;
+    uint32_t stx_gid;
+    uint16_t stx_mode;
+    uint16_t pad1;
+    uint64_t stx_ino;
+    uint64_t stx_size;
+    uint64_t stx_blocks;
+    uint64_t stx_attributes_mask;
+    linux_statx_timestamp stx_atime;
+    linux_statx_timestamp stx_btime;
+    linux_statx_timestamp stx_ctime;
+    linux_statx_timestamp stx_mtime;
+    uint32_t stx_rdev_major;
+    uint32_t stx_rdev_minor;
+    uint32_t stx_dev_major;
+    uint32_t stx_dev_minor;
+    uint64_t stx_mnt_id;
+    uint64_t pad2[13];
+};
+
+static int64_t sys_statx(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
+                          uint64_t mask, uint64_t bufAddr, uint64_t)
+{
+    (void)dirfd; (void)flags; (void)mask;
+    const char* path = reinterpret_cast<const char*>(pathAddr);
+    auto* stx = reinterpret_cast<linux_statx*>(bufAddr);
+    if (!path || !stx) return -EFAULT;
+
+    // Use VFS stat
+    Vnode* vn = VfsOpen(path);
+    if (!vn) return -ENOENT;
+
+    VnodeStat st;
+    int ret = VfsStat(vn, &st);
+    VfsClose(vn);
+    if (ret != 0) return -EIO;
+
+    // Zero-fill then populate
+    auto* raw = reinterpret_cast<uint8_t*>(stx);
+    for (uint64_t i = 0; i < sizeof(linux_statx); i++) raw[i] = 0;
+
+    stx->stx_mask = 0x7FF; // STATX_BASIC_STATS
+    stx->stx_blksize = 4096;
+    stx->stx_nlink = 1;
+    // Derive mode from stat info
+    uint16_t mode = st.isDir ? 0040755 : 0100644;
+    if (st.isSymlink) mode = 0120777;
+    stx->stx_mode = mode;
+    stx->stx_ino = 1; // placeholder
+    stx->stx_size = st.size;
+    stx->stx_blocks = (st.size + 511) / 512;
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// sys_fallocate (285) — allocate file space (stub: succeed)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_fallocate(uint64_t, uint64_t, uint64_t,
+                              uint64_t, uint64_t, uint64_t)
+{
+    return 0; // no-op for now
+}
+
+// ---------------------------------------------------------------------------
+// sys_mincore (27) — check if pages are resident (stub: all resident)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_mincore(uint64_t addr, uint64_t length, uint64_t vecAddr,
+                            uint64_t, uint64_t, uint64_t)
+{
+    (void)addr;
+    if (!vecAddr) return -EFAULT;
+    auto* vec = reinterpret_cast<uint8_t*>(vecAddr);
+    uint64_t pages = (length + 4095) / 4096;
+    for (uint64_t i = 0; i < pages; ++i)
+        vec[i] = 1; // all pages resident
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// sys_madvise (28) — memory advice (stub: succeed)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_madvise(uint64_t, uint64_t, uint64_t,
+                            uint64_t, uint64_t, uint64_t)
+{
+    return 0; // no-op
+}
+
+// ---------------------------------------------------------------------------
+// sys_pwrite64 (18) — write at offset without changing file position
+// ---------------------------------------------------------------------------
+
+static int64_t sys_pwrite64(uint64_t fd, uint64_t bufAddr, uint64_t count,
+                             uint64_t offset, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+    FdEntry* fde = FdGet(proc, static_cast<int>(fd));
+    if (!fde) return -EBADF;
+    if (fde->type != FdType::Vnode || !fde->handle) return -EINVAL;
+
+    auto* vn = static_cast<Vnode*>(fde->handle);
+    const void* buf = reinterpret_cast<const void*>(bufAddr);
+    uint64_t off = offset;
+    return VfsWrite(vn, buf, count, &off);
+}
+
+// ---------------------------------------------------------------------------
+// sys_link (86) — create hard link
+// ---------------------------------------------------------------------------
+
+static int64_t sys_link(uint64_t oldAddr, uint64_t newAddr, uint64_t,
+                         uint64_t, uint64_t, uint64_t)
+{
+    (void)oldAddr; (void)newAddr;
+    return -EPERM; // hard links not supported
+}
 
 // Linux sigaltstack constants
 static constexpr int SS_ONSTACK  = 1;
@@ -4161,7 +6323,9 @@ static int64_t sys_rt_sigreturn(uint64_t, uint64_t, uint64_t,
     if (!proc || !proc->inSignalHandler) return -EINVAL;
 
     proc->sigReturnPending = true;
-    DbgPrintf("SIGRETURN: pid %u requesting context restore\n", proc->pid);
+    DbgPrintf("SIGRETURN: pid %u requesting context restore (cur user RIP=0x%lx)\n",
+              proc->pid,
+              []{ uint64_t r; __asm__ volatile("movq %%gs:48, %0" : "=r"(r)); return r; }());
 
     return 0; // Return value doesn't matter — SyscallCheckSignals overwrites RAX
 }
@@ -4619,6 +6783,24 @@ static int64_t sys_pselect6(uint64_t nfds, uint64_t readfdsAddr, uint64_t writef
 }
 
 // ---------------------------------------------------------------------------
+// sys_brook_profile (500) — Brook-specific: start/stop the sampling profiler
+// ---------------------------------------------------------------------------
+// arg0: op — 0 = start (arg1 = durationMs, 0 = indefinite), 1 = stop,
+//            2 = isRunning (returns 1/0)
+// Returns 0 on success, -EINVAL on bad op.
+
+static int64_t sys_brook_profile(uint64_t op, uint64_t a1, uint64_t, uint64_t,
+                                   uint64_t, uint64_t)
+{
+    switch (op) {
+    case 0: brook::ProfilerStart(static_cast<uint32_t>(a1)); return 0;
+    case 1: brook::ProfilerStop(); return 0;
+    case 2: return brook::ProfilerIsRunning() ? 1 : 0;
+    default: return -EINVAL;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // sys_not_implemented
 // ---------------------------------------------------------------------------
 
@@ -4772,7 +6954,10 @@ static int64_t sys_rseq(uint64_t, uint64_t, uint64_t,
 
 static constexpr int FUTEX_WAIT         = 0;
 static constexpr int FUTEX_WAKE         = 1;
-static constexpr int FUTEX_PRIVATE_FLAG = 128;
+static constexpr int FUTEX_WAIT_BITSET  = 9;
+static constexpr int FUTEX_WAKE_BITSET  = 10;
+static constexpr int FUTEX_PRIVATE_FLAG    = 128;
+static constexpr int FUTEX_CLOCK_REALTIME  = 256;
 
 // Simple futex wait queue: hash table of blocked processes keyed by user VA.
 // Since threads share address space (same page tables), the VA is sufficient.
@@ -4855,19 +7040,23 @@ extern "C" int64_t FutexWake(uint64_t uaddr, uint32_t maxWake)
 static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
                           uint64_t, uint64_t, uint64_t)
 {
-    int op = static_cast<int>(opVal) & ~FUTEX_PRIVATE_FLAG;
+    int op = static_cast<int>(opVal) & ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
 
-    if (op == FUTEX_WAKE) {
+    if (op == FUTEX_WAKE || op == FUTEX_WAKE_BITSET) {
         uint32_t maxWake = static_cast<uint32_t>(val);
         if (maxWake == 0) return 0;
-        return FutexWake(uaddrVal, maxWake);
+        int64_t r = FutexWake(uaddrVal, maxWake);
+        return r;
     }
 
-    if (op == FUTEX_WAIT) {
+    if (op == FUTEX_WAIT || op == FUTEX_WAIT_BITSET) {
         auto* uaddr = reinterpret_cast<volatile uint32_t*>(uaddrVal);
 
         Process* proc = ProcessCurrent();
-        if (!proc) return -ENOSYS;
+        if (!proc) {
+            SerialPrintf("sys_futex: WAIT no current process!\n");
+            return -ENOSYS;
+        }
 
         // Acquire futex lock, atomically check value, and enqueue
         while (__atomic_test_and_set(&g_futexLock, __ATOMIC_ACQUIRE)) {
@@ -4884,6 +7073,7 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
         FutexWaiter* w = FutexAllocWaiter();
         if (!w) {
             __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+            SerialPrintf("sys_futex: ENOMEM (pool exhausted) pid=%u\n", proc->pid);
             return -ENOMEM;
         }
         w->uaddr = uaddrVal;
@@ -4903,6 +7093,8 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
         return 0;
     }
 
+    SerialPrintf("sys_futex: unsupported op=%d (raw=0x%lx) pid=%u\n",
+                 op, opVal, ProcessCurrent() ? ProcessCurrent()->pid : 0);
     return -ENOSYS;
 }
 
@@ -4910,6 +7102,8 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
 // Socket syscalls
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Per-process socket-to-fd mapping.
 // Socket index is stored in FdEntry::handle as (void*)(uintptr_t)(sockIdx + 1).
 // +1 so that socket 0 maps to non-null handle.
@@ -4920,7 +7114,25 @@ static int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
     Process* proc = ProcessCurrent();
     if (!proc) return -ENOSYS;
 
-    SerialPrintf("sys_socket: domain=%lu type=%lu proto=%lu\n", domain, type, protocol);
+    DbgPrintf("sys_socket: domain=%lu type=%lu proto=%lu\n", domain, type, protocol);
+
+    if (domain == AF_UNIX) {
+        auto* usd = static_cast<UnixSocketData*>(kmalloc(sizeof(UnixSocketData)));
+        if (!usd) return -ENOMEM;
+        for (uint64_t i = 0; i < sizeof(UnixSocketData); i++)
+            reinterpret_cast<uint8_t*>(usd)[i] = 0;
+        usd->state    = UnixSocketData::State::Unbound;
+        usd->nonblock = (type & UNIX_SOCK_NONBLOCK) != 0;
+
+        int fd = FdAlloc(proc, FdType::UnixSocket, usd);
+        if (fd < 0) { kfree(usd); return -EMFILE; }
+        if (type & UNIX_SOCK_CLOEXEC) proc->fds[fd].fdFlags |= 1;
+        DbgPrintf("sys_socket: AF_UNIX fd=%d\n", fd);
+        return fd;
+    }
+
+    // AF_INET6 (10) — not supported
+    if (domain != AF_INET) return -EAFNOSUPPORT;
 
     int sockIdx = SockCreate(static_cast<int>(domain),
                               static_cast<int>(type & 0xFF), // mask SOCK_NONBLOCK etc
@@ -4933,7 +7145,7 @@ static int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
         SockClose(sockIdx);
         return -EMFILE;
     }
-    SerialPrintf("sys_socket: fd=%d sockIdx=%d\n", fd, sockIdx);
+    DbgPrintf("sys_socket: fd=%d sockIdx=%d\n", fd, sockIdx);
     return fd;
 }
 
@@ -4952,6 +7164,22 @@ static int64_t sys_bind(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
     if (!proc) return -ENOSYS;
 
     int fd = static_cast<int>(fdVal);
+
+    // Check for AF_UNIX socket first
+    FdEntry* fde = FdGet(proc, fd);
+    if (fde && fde->type == FdType::UnixSocket && fde->handle) {
+        auto* usd = static_cast<UnixSocketData*>(fde->handle);
+        if (addrVal < 0x1000) return -EFAULT;
+        auto* ua = reinterpret_cast<const SockAddrUn*>(addrVal);
+        if (ua->sun_family != AF_UNIX) return -EINVAL;
+        // Copy path
+        const char* src = ua->sun_path;
+        char* dst = usd->path;
+        for (int i = 0; i < 107 && src[i]; i++) dst[i] = src[i], dst[i+1] = 0;
+        SerialPrintf("sys_bind: AF_UNIX fd=%d path='%s'\n", fd, usd->path);
+        return 0;
+    }
+
     int sockIdx = GetSockIdx(proc, fd);
     if (sockIdx < 0) return -EBADF;
 
@@ -4968,6 +7196,84 @@ static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
     if (!proc) return -ENOSYS;
 
     int fd = static_cast<int>(fdVal);
+
+    // AF_UNIX connect: find server, create pipe pair, enqueue, block until accepted
+    FdEntry* fde = FdGet(proc, fd);
+    if (fde && fde->type == FdType::UnixSocket && fde->handle) {
+        auto* usd = static_cast<UnixSocketData*>(fde->handle);
+        if (addrVal < 0x1000) return -EFAULT;
+        auto* ua = reinterpret_cast<const SockAddrUn*>(addrVal);
+        if (ua->sun_family != AF_UNIX) return -EINVAL;
+
+        // Copy destination path
+        char path[108] = {};
+        for (int i = 0; i < 107 && ua->sun_path[i]; i++) path[i] = ua->sun_path[i];
+
+        DbgPrintf("sys_connect: AF_UNIX fd=%d path='%s'\n", fd, path);
+
+        // Find the listening server
+        UnixSocketData* server = UnixFindServer(path);
+        if (!server) return -ECONNREFUSED;
+        if (server->pendingCount >= UNIX_ACCEPT_QUEUE) return -EAGAIN;
+
+        // Create bidirectional pipe pair
+        auto* pipeCS = static_cast<PipeBuffer*>(kmalloc(sizeof(PipeBuffer))); // client→server
+        auto* pipeSC = static_cast<PipeBuffer*>(kmalloc(sizeof(PipeBuffer))); // server→client
+        if (!pipeCS || !pipeSC) {
+            if (pipeCS) kfree(pipeCS);
+            if (pipeSC) kfree(pipeSC);
+            return -ENOMEM;
+        }
+        for (uint64_t i = 0; i < sizeof(PipeBuffer); i++) {
+            reinterpret_cast<uint8_t*>(pipeCS)[i] = 0;
+            reinterpret_cast<uint8_t*>(pipeSC)[i] = 0;
+        }
+        pipeCS->readers = 1; pipeCS->writers = 1;
+        pipeSC->readers = 1; pipeSC->writers = 1;
+
+        // Set up client side
+        usd->state   = UnixSocketData::State::Connected;
+        usd->rxPipe  = pipeSC; // client reads server→client pipe
+        usd->txPipe  = pipeCS; // client writes client→server pipe
+        for (int i = 0; i < 107 && path[i]; i++) usd->path[i] = path[i];
+
+        // Enqueue pending connection on server
+        int slot = -1;
+        for (int i = 0; i < UNIX_ACCEPT_QUEUE; i++) {
+            if (!server->pending[i].used) { slot = i; break; }
+        }
+        if (slot < 0) { kfree(pipeCS); kfree(pipeSC); return -EAGAIN; }
+
+        server->pending[slot].serverRx     = pipeCS; // server reads what client wrote
+        server->pending[slot].serverTx     = pipeSC; // server writes what client reads
+        server->pending[slot].clientWaiter = proc;
+        server->pending[slot].accepted     = false;
+        server->pending[slot].used         = true;
+        server->pendingCount++;
+
+        // Wake server if it's blocked in accept
+        if (server->acceptWaiter) {
+            Process* w = server->acceptWaiter;
+            server->acceptWaiter = nullptr;
+            __atomic_store_n(&w->pendingWakeup, 1, __ATOMIC_RELEASE);
+            SchedulerUnblock(w);
+        }
+
+        // Block until accepted (or nonblock)
+        if (!usd->nonblock) {
+            for (int iter = 0; iter < 100000 && !server->pending[slot].accepted; iter++) {
+                Process* self = ProcessCurrent();
+                self->wakeupTick = g_lapicTickCount + 10;
+                SchedulerBlock(self);
+                if (HasPendingSignals()) return -EINTR;
+            }
+            if (!server->pending[slot].accepted) return -ETIMEDOUT;
+        }
+
+        (void)addrLen;
+        return 0;
+    }
+
     int sockIdx = GetSockIdx(proc, fd);
     if (sockIdx < 0) return -EBADF;
 
@@ -4976,8 +7282,8 @@ static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
     auto* uaddr = reinterpret_cast<const brook::SockAddrIn*>(addrVal);
     if (!uaddr) return -EFAULT;
 
-    SerialPrintf("sys_connect: fd=%d sockIdx=%d addr=%u.%u.%u.%u:%u\n",
-                 fd, sockIdx,
+    DbgPrintf("sys_connect: fd=%d sockIdx=%d type=%d addr=%u.%u.%u.%u:%u\n",
+                 fd, sockIdx, brook::SockGetType(sockIdx),
                  (brook::ntohl(uaddr->sin_addr) >> 24) & 0xFF,
                  (brook::ntohl(uaddr->sin_addr) >> 16) & 0xFF,
                  (brook::ntohl(uaddr->sin_addr) >> 8) & 0xFF,
@@ -5000,8 +7306,18 @@ static int64_t sys_sendto(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
     if (sockIdx < 0) return -EBADF;
 
     (void)flagsVal;
-    auto* dest = destVal ? reinterpret_cast<const SockAddrIn*>(destVal) : nullptr;
 
+    // For connected TCP sockets, use SockSend (stream send)
+    if (brook::SockIsStream(sockIdx))
+    {
+        int ret = brook::SockSend(sockIdx,
+                                   reinterpret_cast<const void*>(bufVal),
+                                   static_cast<uint32_t>(lenVal));
+        return static_cast<int64_t>(ret);
+    }
+
+    // UDP path
+    auto* dest = destVal ? reinterpret_cast<const SockAddrIn*>(destVal) : nullptr;
     int ret = SockSendTo(sockIdx, reinterpret_cast<const void*>(bufVal),
                           static_cast<uint32_t>(lenVal), dest);
     if (ret < 0) return -EIO;
@@ -5019,8 +7335,22 @@ static int64_t sys_recvfrom(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
     if (sockIdx < 0) return -EBADF;
 
     (void)flagsVal;
-    auto* src = srcVal ? reinterpret_cast<SockAddrIn*>(srcVal) : nullptr;
 
+    // For TCP sockets, use SockRecv (stream receive)
+    if (brook::SockIsStream(sockIdx))
+    {
+        auto* fde = FdGet(proc, fd);
+        bool nonblock = fde && (fde->statusFlags & 0x800) != 0;
+        if (nonblock && brook::SockRxCount(sockIdx) == 0 && !brook::SockPollReady(sockIdx, true, false))
+            return -EAGAIN;
+        int ret = brook::SockRecv(sockIdx,
+                                   reinterpret_cast<void*>(bufVal),
+                                   static_cast<uint32_t>(lenVal));
+        return static_cast<int64_t>(ret);
+    }
+
+    // UDP path
+    auto* src = srcVal ? reinterpret_cast<SockAddrIn*>(srcVal) : nullptr;
     int ret = SockRecvFrom(sockIdx, reinterpret_cast<void*>(bufVal),
                             static_cast<uint32_t>(lenVal), src);
     if (ret < 0) return -EAGAIN;
@@ -5049,7 +7379,22 @@ static int64_t sys_getsockname(uint64_t fdVal, uint64_t addrVal, uint64_t addrLe
     int sockIdx = GetSockIdx(proc, fd);
     if (sockIdx < 0) return -EBADF;
 
-    // TODO: fill in local address
+    auto* uaddr = reinterpret_cast<brook::SockAddrIn*>(addrVal);
+    auto* ulen  = reinterpret_cast<uint32_t*>(addrLenVal);
+    if (!uaddr || !ulen) return -EFAULT;
+
+    brook::SockAddrIn local{};
+    local.sin_family = AF_INET;
+    uint32_t tmpIp = 0;
+    uint16_t tmpPort = 0;
+    brook::SockGetLocal(sockIdx, &tmpIp, &tmpPort);
+    local.sin_addr = tmpIp;
+    local.sin_port = tmpPort;
+
+    uint32_t copyLen = *ulen;
+    if (copyLen > sizeof(local)) copyLen = sizeof(local);
+    __builtin_memcpy(uaddr, &local, copyLen);
+    *ulen = sizeof(local);
     return 0;
 }
 
@@ -5072,6 +7417,18 @@ static int64_t sys_listen(uint64_t fdVal, uint64_t backlog, uint64_t,
     if (!proc) return -ENOSYS;
 
     int fd = static_cast<int>(fdVal);
+
+    // AF_UNIX: mark socket as listening and register in global table
+    FdEntry* fde = FdGet(proc, fd);
+    if (fde && fde->type == FdType::UnixSocket && fde->handle) {
+        auto* usd = static_cast<UnixSocketData*>(fde->handle);
+        usd->state = UnixSocketData::State::Listening;
+        UnixRegisterServer(usd);
+        SerialPrintf("sys_listen: AF_UNIX fd=%d path='%s'\n", fd, usd->path);
+        return 0;
+    }
+
+    (void)backlog;
     int sockIdx = GetSockIdx(proc, fd);
     if (sockIdx < 0) return -EBADF;
 
@@ -5086,6 +7443,68 @@ static int64_t sys_accept(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
     if (!proc) return -ENOSYS;
 
     int fd = static_cast<int>(fdVal);
+
+    // AF_UNIX accept: dequeue a pending connection
+    FdEntry* fde = FdGet(proc, fd);
+    if (fde && fde->type == FdType::UnixSocket && fde->handle) {
+        auto* usd = static_cast<UnixSocketData*>(fde->handle);
+        if (usd->state != UnixSocketData::State::Listening) return -EINVAL;
+
+        // Wait for a pending connection
+        for (;;) {
+            // Find a pending (not yet accepted) slot
+            int slot = -1;
+            for (int i = 0; i < UNIX_ACCEPT_QUEUE; i++) {
+                if (usd->pending[i].used && !usd->pending[i].accepted) {
+                    slot = i; break;
+                }
+            }
+
+            if (slot >= 0) {
+                // Create a connected server-side socket
+                auto* serverSock = static_cast<UnixSocketData*>(kmalloc(sizeof(UnixSocketData)));
+                if (!serverSock) return -ENOMEM;
+                for (uint64_t i = 0; i < sizeof(UnixSocketData); i++)
+                    reinterpret_cast<uint8_t*>(serverSock)[i] = 0;
+                serverSock->state  = UnixSocketData::State::Connected;
+                serverSock->rxPipe = usd->pending[slot].serverRx;
+                serverSock->txPipe = usd->pending[slot].serverTx;
+
+                int newFd = FdAlloc(proc, FdType::UnixSocket, serverSock);
+                if (newFd < 0) { kfree(serverSock); return -EMFILE; }
+
+                // Mark accepted and wake the client
+                usd->pending[slot].accepted = true;
+                usd->pendingCount--;
+                Process* client = usd->pending[slot].clientWaiter;
+                usd->pending[slot].used = false;
+
+                if (client) {
+                    __atomic_store_n(&client->pendingWakeup, 1, __ATOMIC_RELEASE);
+                    SchedulerUnblock(client);
+                }
+
+                // Zero out peer addr if requested (AF_UNIX has no meaningful peer addr)
+                if (addrVal >= 0x1000 && addrLenVal >= 0x1000) {
+                    auto* lenPtr = reinterpret_cast<uint32_t*>(addrLenVal);
+                    *lenPtr = 0;
+                }
+
+                SerialPrintf("sys_accept: AF_UNIX fd=%d -> newFd=%d\n", fd, newFd);
+                return newFd;
+            }
+
+            if (usd->nonblock) return -EAGAIN;
+
+            // Block until a connection arrives
+            usd->acceptWaiter = proc;
+            proc->wakeupTick = g_lapicTickCount + 100;
+            SchedulerBlock(proc);
+            usd->acceptWaiter = nullptr;
+            if (HasPendingSignals()) return -EINTR;
+        }
+    }
+
     int sockIdx = GetSockIdx(proc, fd);
     if (sockIdx < 0) return -EBADF;
 
@@ -5113,37 +7532,154 @@ static int64_t sys_accept(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
     return newFd;
 }
 
-static int64_t sys_socketpair(uint64_t, uint64_t, uint64_t,
-                               uint64_t, uint64_t, uint64_t)
+// accept4 = accept with flags (SOCK_NONBLOCK, SOCK_CLOEXEC)
+static int64_t sys_accept4(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
+                            uint64_t flags, uint64_t, uint64_t)
 {
-    return -ENOSYS;
+    int64_t ret = sys_accept(fdVal, addrVal, addrLenVal, 0, 0, 0);
+    if (ret < 0) return ret;
+
+    Process* proc = ProcessCurrent();
+    if (proc) {
+        int newFd = static_cast<int>(ret);
+        if (flags & UNIX_SOCK_NONBLOCK) proc->fds[newFd].statusFlags |= 0x800;
+        if (flags & UNIX_SOCK_CLOEXEC)  proc->fds[newFd].fdFlags |= 1;
+    }
+    return ret;
 }
 
-static int64_t sys_sendmsg(uint64_t, uint64_t, uint64_t,
+static int64_t sys_socketpair(uint64_t domain, uint64_t type, uint64_t protocol,
+                               uint64_t svAddr, uint64_t, uint64_t)
+{
+    SerialPrintf("sys_socketpair: domain=%lu type=0x%lx proto=%lu sv=0x%lx\n",
+                 domain, type, protocol, svAddr);
+    // We only support AF_UNIX (domain=1) socketpairs
+    if (domain != 1) return -EAFNOSUPPORT;
+
+    auto* sv = reinterpret_cast<int32_t*>(svAddr);
+    if (!sv) return -EFAULT;
+
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EMFILE;
+
+    // Allocate two PipeBuffers — one for each direction
+    auto* pipeAtoB = static_cast<PipeBuffer*>(kmalloc(sizeof(PipeBuffer)));
+    if (!pipeAtoB) return -ENOMEM;
+    auto* pipeBtoA = static_cast<PipeBuffer*>(kmalloc(sizeof(PipeBuffer)));
+    if (!pipeBtoA) { kfree(pipeAtoB); return -ENOMEM; }
+
+    // Zero-init both
+    for (uint64_t i = 0; i < sizeof(PipeBuffer); i++) {
+        reinterpret_cast<uint8_t*>(pipeAtoB)[i] = 0;
+        reinterpret_cast<uint8_t*>(pipeBtoA)[i] = 0;
+    }
+    pipeAtoB->readers = 1;
+    pipeAtoB->writers = 1;
+    pipeBtoA->readers = 1;
+    pipeBtoA->writers = 1;
+
+    // fd[0]: reads from pipeBtoA, writes to pipeAtoB
+    // fd[1]: reads from pipeAtoB, writes to pipeBtoA
+    // We store a small struct with both pipe pointers as the fd handle.
+    struct SocketPairEnd {
+        PipeBuffer* readPipe;
+        PipeBuffer* writePipe;
+    };
+
+    auto* endA = static_cast<SocketPairEnd*>(kmalloc(sizeof(SocketPairEnd)));
+    auto* endB = static_cast<SocketPairEnd*>(kmalloc(sizeof(SocketPairEnd)));
+    if (!endA || !endB) {
+        if (endA) kfree(endA);
+        if (endB) kfree(endB);
+        kfree(pipeAtoB);
+        kfree(pipeBtoA);
+        return -ENOMEM;
+    }
+    endA->readPipe = pipeBtoA;
+    endA->writePipe = pipeAtoB;
+    endB->readPipe = pipeAtoB;
+    endB->writePipe = pipeBtoA;
+
+    int fdA = FdAlloc(proc, FdType::Pipe, endA->readPipe);
+    if (fdA < 0) { kfree(endA); kfree(endB); kfree(pipeAtoB); kfree(pipeBtoA); return -EMFILE; }
+    // Store write pipe pointer in seekPos as a hack (we need both pipes accessible)
+    proc->fds[fdA].seekPos = reinterpret_cast<uint64_t>(endA->writePipe);
+    proc->fds[fdA].flags = 2;  // bidirectional marker
+    proc->fds[fdA].statusFlags = (type & 0x800) ? 0x800 : 0;  // O_NONBLOCK if SOCK_NONBLOCK
+
+    int fdB = FdAlloc(proc, FdType::Pipe, endB->readPipe);
+    if (fdB < 0) { FdFree(proc, fdA); kfree(endA); kfree(endB); kfree(pipeAtoB); kfree(pipeBtoA); return -EMFILE; }
+    proc->fds[fdB].seekPos = reinterpret_cast<uint64_t>(endB->writePipe);
+    proc->fds[fdB].flags = 2;  // bidirectional marker
+    proc->fds[fdB].statusFlags = (type & 0x800) ? 0x800 : 0;
+
+    kfree(endA);
+    kfree(endB);
+
+    sv[0] = fdA;
+    sv[1] = fdB;
+
+    SerialPrintf("sys_socketpair: fd[%d,%d] for pid %u\n", fdA, fdB, proc->pid);
+    return 0;
+}
+
+static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
                             uint64_t, uint64_t, uint64_t)
 {
+    (void)flagsVal;
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ENOSYS;
+
+    int fd = static_cast<int>(fdVal);
+    if (msgVal < 0x1000) return -EFAULT;
+
+    struct MsgHdr {
+        void*    msg_name;
+        uint32_t msg_namelen;
+        uint32_t _pad0;
+        struct { void* iov_base; uint64_t iov_len; }* msg_iov;
+        uint64_t msg_iovlen;
+        void*    msg_control;
+        uint64_t msg_controllen;
+        int      msg_flags;
+    };
+    auto* msg = reinterpret_cast<MsgHdr*>(msgVal);
+    if (!msg || msg->msg_iovlen == 0 || !msg->msg_iov) return -EINVAL;
+
+    // AF_UNIX: route through sys_write for each iov
+    FdEntry* fde = FdGet(proc, fd);
+    if (fde && fde->type == FdType::UnixSocket) {
+        int64_t total = 0;
+        for (uint64_t i = 0; i < msg->msg_iovlen; i++) {
+            void* base = msg->msg_iov[i].iov_base;
+            uint64_t len = msg->msg_iov[i].iov_len;
+            if (!base || len == 0) continue;
+            int64_t ret = sys_write(fd, reinterpret_cast<uint64_t>(base), len, 0, 0, 0);
+            if (ret < 0) return (total > 0) ? total : ret;
+            total += ret;
+        }
+        return total;
+    }
+
     return -ENOSYS;
 }
 
 static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
                             uint64_t, uint64_t, uint64_t)
 {
+    (void)flagsVal;
     Process* proc = ProcessCurrent();
     if (!proc) return -ENOSYS;
 
     int fd = static_cast<int>(fdVal);
-    int sockIdx = GetSockIdx(proc, fd);
-    if (sockIdx < 0) return -EBADF;
+    if (msgVal < 0x1000) return -EFAULT;
 
     // msghdr structure (matching Linux x86-64 ABI)
     struct MsgHdr {
         void*    msg_name;
         uint32_t msg_namelen;
         uint32_t _pad0;
-        struct {
-            void*    iov_base;
-            uint64_t iov_len;
-        }*       msg_iov;
+        struct { void* iov_base; uint64_t iov_len; }* msg_iov;
         uint64_t msg_iovlen;
         void*    msg_control;
         uint64_t msg_controllen;
@@ -5152,6 +7688,27 @@ static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
 
     auto* msg = reinterpret_cast<MsgHdr*>(msgVal);
     if (!msg || msg->msg_iovlen == 0 || !msg->msg_iov) return -EINVAL;
+
+    // AF_UNIX: receive through sys_read for each iov
+    FdEntry* fde = FdGet(proc, fd);
+    if (fde && fde->type == FdType::UnixSocket) {
+        int64_t total = 0;
+        for (uint64_t i = 0; i < msg->msg_iovlen; i++) {
+            void* base = msg->msg_iov[i].iov_base;
+            uint64_t len = msg->msg_iov[i].iov_len;
+            if (!base || len == 0) continue;
+            int64_t ret = sys_read(fd, reinterpret_cast<uint64_t>(base), len, 0, 0, 0);
+            if (ret < 0) return (total > 0) ? total : ret;
+            if (ret == 0) break; // EOF
+            total += ret;
+        }
+        msg->msg_flags = 0;
+        msg->msg_controllen = 0;
+        return total;
+    }
+
+    int sockIdx = GetSockIdx(proc, fd);
+    if (sockIdx < 0) return -EBADF;
 
     // Use first iov entry as receive buffer
     void* buf = msg->msg_iov[0].iov_base;
@@ -5205,6 +7762,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_CLONE]           = sys_clone;
     g_syscallTable[SYS_FORK]            = sys_fork;
     g_syscallTable[SYS_VFORK]           = sys_vfork;
+    g_syscallTable[435]                 = sys_clone3;
     g_syscallTable[SYS_EXECVE]          = sys_execve;
     g_syscallTable[SYS_EXIT]            = sys_exit;
     g_syscallTable[SYS_WAIT4]           = sys_wait4;
@@ -5212,6 +7770,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_FCNTL]           = sys_fcntl;
     g_syscallTable[SYS_GETCWD]          = sys_getcwd;
     g_syscallTable[SYS_GETTIMEOFDAY]    = sys_gettimeofday;
+    g_syscallTable[SYS_TIME]             = sys_time;
     g_syscallTable[SYS_GETUID]          = sys_getuid;
     g_syscallTable[SYS_GETGID]          = sys_getgid;
     g_syscallTable[SYS_SETUID]          = sys_setuid;
@@ -5226,7 +7785,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_SET_TID_ADDRESS] = sys_set_tid_address;
     g_syscallTable[SYS_CLOCK_GETTIME]   = sys_clock_gettime;
     g_syscallTable[SYS_CLOCK_NANOSLEEP] = sys_clock_nanosleep;
-    g_syscallTable[SYS_EXIT_GROUP]      = sys_exit;
+    g_syscallTable[SYS_EXIT_GROUP]      = sys_exit_group;
     g_syscallTable[SYS_OPENAT]          = sys_openat;
     g_syscallTable[SYS_NEWFSTATAT]      = sys_newfstatat;
     g_syscallTable[SYS_PRLIMIT64]       = sys_prlimit64;
@@ -5268,6 +7827,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_SYMLINKAT]       = sys_symlinkat;
     g_syscallTable[SYS_PPOLL]           = sys_ppoll;
     g_syscallTable[SYS_PIPE2]           = sys_pipe2;
+    g_syscallTable[SYS_EVENTFD2]        = sys_eventfd2;
     g_syscallTable[SYS_DUP3]            = sys_dup3;
 
     // Bash / POSIX compatibility
@@ -5281,10 +7841,37 @@ void SyscallTableInit()
     g_syscallTable[SYS_RSEQ]            = sys_rseq;
     g_syscallTable[SYS_FACCESSAT2]      = sys_faccessat2;
 
+    // Nix package manager syscalls
+    g_syscallTable[SYS_FLOCK]           = sys_flock;
+    g_syscallTable[SYS_TRUNCATE]        = sys_truncate;
+    g_syscallTable[SYS_FTRUNCATE]       = sys_ftruncate;
+    g_syscallTable[SYS_LINK]            = sys_link;
+    g_syscallTable[SYS_CHMOD]           = sys_chmod;
+    g_syscallTable[SYS_FCHMOD]          = sys_fchmod;
+    g_syscallTable[SYS_CHOWN]           = sys_chown;
+    g_syscallTable[SYS_FCHOWN]          = sys_fchown;
+    g_syscallTable[SYS_LCHOWN]          = sys_lchown;
+    g_syscallTable[SYS_SCHED_SETAFFINITY] = sys_sched_setaffinity;
+    g_syscallTable[SYS_SCHED_GETAFFINITY] = sys_sched_getaffinity;
+    g_syscallTable[SYS_MKDIRAT]         = sys_mkdirat;
+    g_syscallTable[SYS_FCHOWNAT]        = sys_fchownat;
+    g_syscallTable[SYS_UNLINKAT]        = sys_unlinkat;
+    g_syscallTable[SYS_RENAMEAT]        = sys_renameat;
+    g_syscallTable[SYS_LINKAT]          = sys_linkat;
+    g_syscallTable[SYS_FCHMODAT]        = sys_fchmodat;
+    g_syscallTable[SYS_UTIMENSAT]       = sys_utimensat;
+    g_syscallTable[SYS_FALLOCATE]       = sys_fallocate;
+    g_syscallTable[SYS_RENAMEAT2]       = sys_renameat2;
+    g_syscallTable[SYS_STATX]           = sys_statx;
+    g_syscallTable[SYS_MINCORE]         = sys_mincore;
+    g_syscallTable[SYS_MADVISE]         = sys_madvise;
+    g_syscallTable[SYS_PWRITE64]        = sys_pwrite64;
+
     // Socket syscalls
     g_syscallTable[SYS_SOCKET]          = sys_socket;
     g_syscallTable[SYS_CONNECT]         = sys_connect;
     g_syscallTable[SYS_ACCEPT]          = sys_accept;
+    g_syscallTable[SYS_ACCEPT4]         = sys_accept4;
     g_syscallTable[SYS_SENDTO]          = sys_sendto;
     g_syscallTable[SYS_RECVFROM]        = sys_recvfrom;
     g_syscallTable[SYS_SENDMSG]         = sys_sendmsg;
@@ -5297,6 +7884,20 @@ void SyscallTableInit()
     g_syscallTable[SYS_SOCKETPAIR]      = sys_socketpair;
     g_syscallTable[SYS_SETSOCKOPT]      = sys_setsockopt;
     g_syscallTable[SYS_GETSOCKOPT]      = sys_getsockopt;
+
+    // Wayland prerequisites
+    g_syscallTable[SYS_EPOLL_CREATE]    = sys_epoll_create;
+    g_syscallTable[SYS_EPOLL_CREATE1]   = sys_epoll_create1;
+    g_syscallTable[SYS_EPOLL_CTL]       = sys_epoll_ctl;
+    g_syscallTable[SYS_EPOLL_WAIT]      = sys_epoll_wait;
+    g_syscallTable[SYS_EPOLL_PWAIT]     = sys_epoll_pwait;
+    g_syscallTable[SYS_TIMERFD_CREATE]  = sys_timerfd_create;
+    g_syscallTable[SYS_TIMERFD_SETTIME] = sys_timerfd_settime;
+    g_syscallTable[SYS_TIMERFD_GETTIME] = sys_timerfd_gettime;
+    g_syscallTable[SYS_MEMFD_CREATE]    = sys_memfd_create;
+
+    // Brook-specific syscalls (500+). 500 = profiler control.
+    g_syscallTable[500]                  = sys_brook_profile;
 
     uint32_t count = 0;
     for (uint64_t i = 0; i < SYSCALL_MAX; ++i)
@@ -5378,16 +7979,30 @@ static const char* SyscallName(uint64_t num)
     case 34: return "pause"; case 37: return "alarm";
     case 135: return "fstatfs";   case 157: return "prctl";
     case 158: return "arch_prctl"; case 186: return "gettid";
-    case 200: return "tkill";     case 217: return "getdents64";
+    case 200: return "tkill";     case 201: return "time";       case 217: return "getdents64";
     case 218: return "set_tid_address"; case 228: return "clock_gettime";
     case 230: return "clock_nanosleep"; case 231: return "exit_group";
     case 234: return "tgkill";    case 257: return "openat";
     case 262: return "newfstatat"; case 266: return "symlinkat"; case 267: return "readlinkat";
     case 270: return "pselect6";  case 271: return "ppoll";     case 273: return "set_robust_list";
-    case 289: return "prlimit64"; case 292: return "dup3";
-    case 293: return "pipe2";     case 302: return "rseq";
-    case 318: return "getrandom"; case 334: return "faccessat";
+    case 292: return "dup3";
+    case 290: return "eventfd2";  case 293: return "pipe2";     case 302: return "prlimit64";
+    case 318: return "getrandom"; case 334: return "rseq";
     case 439: return "faccessat2";
+    case 73: return "flock";      case 76: return "truncate";
+    case 77: return "ftruncate";  case 86: return "link";
+    case 90: return "chmod";      case 91: return "fchmod";
+    case 92: return "chown";      case 93: return "fchown";
+    case 94: return "lchown";
+    case 203: return "sched_setaffinity"; case 204: return "sched_getaffinity";
+    case 258: return "mkdirat";   case 260: return "fchownat";
+    case 263: return "unlinkat";  case 264: return "renameat";
+    case 265: return "linkat";    case 268: return "fchmodat";
+    case 280: return "utimensat"; case 285: return "fallocate";
+    case 316: return "renameat2"; case 332: return "statx";
+    case 435: return "clone3";
+    case 18: return "pwrite64"; case 27: return "mincore";
+    case 28: return "madvise";
     default: return nullptr;
     }
 }
@@ -5397,6 +8012,37 @@ static int64_t SyscallDispatchTraced(uint64_t num, uint64_t a0, uint64_t a1,
 {
     Process* proc = ProcessCurrent();
     const char* name = SyscallName(num);
+
+    // Rate-limit: suppress repeated identical error syscalls to prevent
+    // stack/serial flood (e.g. writes to a closed fd in a tight loop).
+    static uint64_t s_lastNum   = ~0ULL;
+    static uint64_t s_lastA0    = 0;
+    static int64_t  s_lastRet   = 0;
+    static uint32_t s_suppressed = 0;
+    static constexpr uint32_t SUPPRESS_THRESHOLD = 3;
+
+    int64_t ret = g_syscallTable[num](a0, a1, a2, a3, a4, a5);
+
+    bool isError = (ret < 0 && ret > -4096);
+    bool isRepeat = (num == s_lastNum && a0 == s_lastA0 && ret == s_lastRet && isError);
+
+    if (isRepeat) {
+        s_suppressed++;
+        if (s_suppressed == SUPPRESS_THRESHOLD)
+            SerialPrintf("[strace:%u] ... suppressing repeated %s(%lu) = -%lu\n",
+                         proc->pid, name ? name : "?", a0, -ret);
+        if (s_suppressed >= SUPPRESS_THRESHOLD)
+            return ret;
+    } else {
+        if (s_suppressed > SUPPRESS_THRESHOLD)
+            SerialPrintf("[strace:%u] ... (%u identical errors suppressed)\n",
+                         proc->pid, s_suppressed - SUPPRESS_THRESHOLD);
+        s_suppressed = 0;
+    }
+
+    s_lastNum = num;
+    s_lastA0  = a0;
+    s_lastRet = ret;
 
     // Log entry — format depends on syscall type for readability
     if (num == SYS_OPEN || num == SYS_OPENAT) {
@@ -5434,8 +8080,6 @@ static int64_t SyscallDispatchTraced(uint64_t num, uint64_t a0, uint64_t a1,
         SerialPrintf("[strace:%u] syscall_%lu(0x%lx, 0x%lx, 0x%lx)",
                      proc->pid, num, a0, a1, a2);
     }
-
-    int64_t ret = g_syscallTable[num](a0, a1, a2, a3, a4, a5);
 
     // Log return value
     if (ret < 0 && ret > -4096)

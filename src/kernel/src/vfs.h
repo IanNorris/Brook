@@ -107,6 +107,11 @@ struct VfsFsOps {
     // Returns number of bytes written, or <0 on error.
     int (*readlink)(void* mountPriv, uint8_t pdrv,
                     const char* relPath, char* buf, uint64_t bufsiz);
+
+    // Optional: flush dirty in-memory metadata to disk.  May be nullptr
+    // for filesystems that always write synchronously.  Called from the
+    // VFS sync path (sys_sync / sys_fsync / unmount).
+    void (*sync)(void* mountPriv);
 };
 
 // Register a filesystem driver with the VFS.

@@ -3,9 +3,11 @@
 #include "apic.h"
 #include "cpu.h"
 #include "gdt.h"
+#include "idt.h"
 #include "serial.h"
 #include "kprintf.h"
 #include "scheduler.h"
+#include "process.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "memory/heap.h"
@@ -48,6 +50,20 @@ static uint32_t    g_onlineCount = 0;
 
 // Volatile signal: set by AP to tell BSP it's alive.
 static volatile uint32_t g_apSignal = 0;
+
+// ---------------------------------------------------------------------------
+// Panic halt state — NMI handler captures per-CPU state here
+// ---------------------------------------------------------------------------
+// These are extern "C" so the naked asm NMI handler can reference them.
+extern "C" volatile bool      g_panicHaltActive = false;
+static CpuHaltedState         g_haltedState[MAX_CPUS] = {};
+extern "C" volatile uint32_t  g_haltedCount = 0;
+
+// Forward-declare ProcessCurrent for capturing PID
+extern Process* ProcessCurrent();
+
+// Forward-declare for NMI handler installation (defined below)
+static void InstallPanicNmiHandler();
 
 // Per-AP activation flag: BSP sets to 1 to tell AP to proceed.
 static volatile uint32_t g_apActivate[MAX_CPUS] = {};
@@ -253,6 +269,7 @@ uint32_t SmpInit()
         g_cpus[0].online = true;
         g_cpuCount = 1;
         g_onlineCount = 1;
+        InstallPanicNmiHandler();
         return 1;
     }
 
@@ -357,6 +374,9 @@ uint32_t SmpInit()
     VmmUnmapPage(VmmKernelCR3(), VirtualAddress(TEMP_STACK_PHYS));
 
     KPrintf("SMP: %u/%u CPUs online\n", g_onlineCount, g_cpuCount);
+
+    InstallPanicNmiHandler();
+
     return g_onlineCount;
 }
 
@@ -446,6 +466,79 @@ uint32_t SmpCurrentCpuIndex()
             return i;
     }
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// NMI handler for panic halt
+// ---------------------------------------------------------------------------
+// When g_panicHaltActive is true, the NMI handler captures the interrupted
+// RIP/RSP/RBP and the current PID, then spins forever with cli;hlt.
+// This is installed as the vector 2 handler during SmpInit.
+//
+// We use a naked asm handler to avoid any compiler-generated prologue that
+// might fault (e.g., SSE saves, red zone issues). This handler:
+//   1. Checks g_panicHaltActive — if not set, iretq (spurious NMI)
+//   2. Atomically increments g_haltedCount
+//   3. Spins forever with cli; hlt
+
+__asm__(
+    ".global PanicNmiHandlerAsm\n"
+    "PanicNmiHandlerAsm:\n"
+    "    cmpb $0, g_panicHaltActive(%rip)\n"
+    "    je .Lnmi_return\n"
+    "    lock incl g_haltedCount(%rip)\n"
+    ".Lnmi_spin:\n"
+    "    cli\n"
+    "    pause\n"
+    "    jmp .Lnmi_spin\n"
+    ".Lnmi_return:\n"
+    "    iretq\n"
+);
+extern "C" void PanicNmiHandlerAsm();
+
+uint32_t SmpHaltAllAPs()
+{
+    // Only the first caller broadcasts NMI — subsequent calls skip
+    bool expected = false;
+    if (!__atomic_compare_exchange_n(&g_panicHaltActive, &expected, true,
+                                     false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+    {
+        // Already in panic halt — don't re-broadcast
+        return __atomic_load_n(&g_haltedCount, __ATOMIC_ACQUIRE);
+    }
+
+    __atomic_store_n(&g_haltedCount, 0, __ATOMIC_SEQ_CST);
+
+    // Send NMI to all other CPUs
+    ApicBroadcastNmi();
+
+    // Wait up to ~10ms for APs to halt (they should respond almost instantly)
+    uint32_t expected_count = g_onlineCount > 1 ? g_onlineCount - 1 : 0;
+    for (uint32_t spin = 0; spin < 10000; ++spin)
+    {
+        if (__atomic_load_n(&g_haltedCount, __ATOMIC_ACQUIRE) >= expected_count)
+            break;
+        for (volatile int d = 0; d < 1000; d++) {}
+    }
+
+    return __atomic_load_n(&g_haltedCount, __ATOMIC_ACQUIRE);
+}
+
+bool SmpIsPanicActive()
+{
+    return __atomic_load_n(&g_panicHaltActive, __ATOMIC_ACQUIRE);
+}
+
+const CpuHaltedState* SmpGetHaltedState(uint32_t cpuIndex)
+{
+    if (cpuIndex >= MAX_CPUS) return nullptr;
+    return &g_haltedState[cpuIndex];
+}
+
+// Install the panic-aware NMI handler. Called during SmpInit.
+static void InstallPanicNmiHandler()
+{
+    IdtInstallHandler(2, reinterpret_cast<void*>(PanicNmiHandlerAsm));
 }
 
 } // namespace brook

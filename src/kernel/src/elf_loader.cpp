@@ -66,6 +66,16 @@ bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
         return false;
     }
 
+    // Bounds-check the program header table against the loaded buffer.
+    uint64_t phdrBytes = static_cast<uint64_t>(ehdr->e_phnum) * sizeof(Elf64_Phdr);
+    if (ehdr->e_phoff > size || phdrBytes > size - ehdr->e_phoff)
+    {
+        SerialPrintf("ELF: phdr table out of range "
+                     "(phoff=%lu phnum=%u size=%lu)\n",
+                     ehdr->e_phoff, ehdr->e_phnum, size);
+        return false;
+    }
+
     // Parse program headers
     auto* phdrs = reinterpret_cast<const Elf64_Phdr*>(data + ehdr->e_phoff);
 
@@ -157,6 +167,19 @@ bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
 
         if (phdr.p_type == PT_LOAD)
         {
+            // Bounds-check against the in-memory ELF buffer.  Returning
+            // false here is better than faulting the kernel when the file
+            // is truncated or the caller passed a buffer smaller than the
+            // on-disk image (e.g. a Go binary exceeding MAX_ELF_SIZE).
+            if (phdr.p_offset > size ||
+                phdr.p_filesz > size - phdr.p_offset)
+            {
+                SerialPrintf("ELF: PT_LOAD %u out of range "
+                             "(offset=%lu filesz=%lu size=%lu)\n",
+                             i, phdr.p_offset, phdr.p_filesz, size);
+                return false;
+            }
+
             // Copy file data via direct map (apply slide for PIE)
             const auto* src = data + phdr.p_offset;
             for (uint64_t b = 0; b < phdr.p_filesz; ++b)
@@ -173,6 +196,12 @@ bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
         }
         else if (phdr.p_type == PT_TLS)
         {
+            if (phdr.p_offset > size ||
+                phdr.p_filesz > size - phdr.p_offset)
+            {
+                SerialPrintf("ELF: PT_TLS out of range\n");
+                return false;
+            }
             // TLS template: record user vaddr and sizes (with slide).
             out->tlsInitData  = reinterpret_cast<uint8_t*>(phdr.p_vaddr + slide);
             out->tlsInitSize  = phdr.p_filesz;
@@ -184,6 +213,13 @@ bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
         }
         else if (phdr.p_type == PT_INTERP)
         {
+            if (phdr.p_offset > size ||
+                phdr.p_filesz > size - phdr.p_offset)
+            {
+                SerialPuts("ELF: PT_INTERP out of range\n");
+                return false;
+            }
+
             // Extract interpreter path from the ELF.
             uint64_t pathLen = phdr.p_filesz;
             if (pathLen > 0 && pathLen < sizeof(out->interpPath))
@@ -196,7 +232,7 @@ bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
                 while (pathLen > 0 && out->interpPath[pathLen - 1] == '\0')
                     --pathLen;
 
-                SerialPrintf("ELF:   PT_INTERP '%s'\n", out->interpPath);
+                DbgPrintf("ELF:   PT_INTERP '%s'\n", out->interpPath);
             }
         }
     }
@@ -232,6 +268,9 @@ bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
 
     DbgPrintf("ELF: loaded OK, entry=0x%lx, break=0x%lx-0x%lx\n",
                  out->entryPoint, out->programBreakLow, out->programBreakHigh);
+
+    // Memory fence: ensure all PTE writes are globally visible.
+    __asm__ volatile("mfence" ::: "memory");
 
     return true;
 }
@@ -314,13 +353,18 @@ uint64_t ElfLoadAt(const uint8_t* data, uint64_t size,
             *dst = src[b];
         }
 
-        SerialPrintf("ELF interp:   PT_LOAD 0x%lx-0x%lx (%lu bytes)\n",
+        DbgPrintf("ELF interp:   PT_LOAD 0x%lx-0x%lx (%lu bytes)\n",
                      phdr.p_vaddr + slide, phdr.p_vaddr + slide + phdr.p_memsz,
                      phdr.p_filesz);
     }
 
     uint64_t entry = ehdr->e_entry + slide;
-    SerialPrintf("ELF interp: loaded at base=0x%lx entry=0x%lx\n", base, entry);
+    DbgPrintf("ELF interp: loaded at base=0x%lx entry=0x%lx\n", base, entry);
+
+    // Memory fence: ensure all PTE writes are visible to other CPUs before
+    // the scheduler moves this process to an AP core.
+    __asm__ volatile("mfence" ::: "memory");
+
     return entry;
 }
 

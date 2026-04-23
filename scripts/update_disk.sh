@@ -115,6 +115,49 @@ for wad_path in "${ROOT_DIR}/doom1.wad" "/workspace/doom1.wad"; do
     fi
 done
 
+# --- Audio tools (wavplay, tone) ---
+audio_dir="${ROOT_DIR}/tools/wavplay"
+for tool in wavplay tone; do
+    if [ -f "$audio_dir/$tool" ]; then
+        echo "Audio tools:"
+        mmd -D s -i "${DISK_IMG}" "::BIN" 2>/dev/null || true
+        TOOL_UPPER=$(echo "$tool" | tr '[:lower:]' '[:upper:]')
+        sync_file "$audio_dir/$tool" "BIN/$TOOL_UPPER"
+    fi
+done
+
+# --- MP3 player ---
+mp3play_bin="${ROOT_DIR}/tools/mp3play/mp3play"
+if [ -f "$mp3play_bin" ]; then
+    echo "MP3 player:"
+    mmd -D s -i "${DISK_IMG}" "::BIN" 2>/dev/null || true
+    sync_file "$mp3play_bin" "BIN/MP3PLAY"
+fi
+
+# --- sinetest tool ---
+sinetest_bin="${ROOT_DIR}/tools/sinetest/sinetest"
+if [ -f "$sinetest_bin" ]; then
+    echo "Sine test:"
+    mmd -D s -i "${DISK_IMG}" "::BIN" 2>/dev/null || true
+    sync_file "$sinetest_bin" "BIN/SINETEST"
+fi
+
+# --- nix-install tool ---
+nix_install_bin="${ROOT_DIR}/tools/nix-install/nix-install"
+if [ -f "$nix_install_bin" ]; then
+    echo "nix-install:"
+    mmd -D s -i "${DISK_IMG}" "::BIN" 2>/dev/null || true
+    sync_file "$nix_install_bin" "BIN/NIX-INSTALL"
+fi
+
+# --- profile tool (profiler control wrapper) ---
+profile_bin="${ROOT_DIR}/tools/profile/profile"
+if [ -f "$profile_bin" ]; then
+    echo "profile:"
+    mmd -D s -i "${DISK_IMG}" "::BIN" 2>/dev/null || true
+    sync_file "$profile_bin" "BIN/PROFILE"
+fi
+
 # --- Static binaries from nix (busybox etc.) ---
 busybox_static="${ROOT_DIR}/busybox_static"
 if [ -f "$busybox_static" ]; then
@@ -230,11 +273,37 @@ if [ -d "$data_scripts" ]; then
     done
 fi
 
+# --- App shortcuts ---
+shortcuts_dir="${ROOT_DIR}/data/shortcuts"
+if [ -d "$shortcuts_dir" ]; then
+    mmd -D s -i "${DISK_IMG}" "::SHORTCUTS" 2>/dev/null || true
+    for f in "$shortcuts_dir"/*.rc; do
+        [ -f "$f" ] || continue
+        dname="$(basename "$f" | tr '[:lower:]' '[:upper:]')"
+        mcopy -o -i "${DISK_IMG}" "$f" "::SHORTCUTS/${dname}"
+        echo "  synced shortcut: SHORTCUTS/${dname}"
+    done
+fi
+
 # --- Wallpaper ---
 wallpaper="${ROOT_DIR}/data/wallpaper.raw"
 if [ -f "$wallpaper" ]; then
     echo "Wallpaper:"
     sync_file "$wallpaper" "WALLPAPER.RAW"
+fi
+
+# --- User content (MP3s, etc.) ---
+user_content_dir="${ROOT_DIR}/data/user_content"
+if [ -d "$user_content_dir" ] && ls "$user_content_dir"/* &>/dev/null 2>&1; then
+    echo "User content:"
+    mmd -D s -i "${DISK_IMG}" "::MUSIC" 2>/dev/null || true
+    for f in "$user_content_dir"/*; do
+        [ -f "$f" ] || continue
+        local_name="$(basename "$f")"
+        # FAT filenames: truncate to 8.3 or use VFAT long names (mcopy handles this)
+        mcopy -o -i "${DISK_IMG}" "$f" "::MUSIC/${local_name}"
+        echo "  synced: MUSIC/${local_name} ($(stat -c%s "$f") bytes)"
+    done
 fi
 
 echo ""

@@ -8,7 +8,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 DISK_IMG="${BROOK_EXT2_DISK:-${ROOT_DIR}/brook_ext2_disk.img}"
-SIZE_MB="${1:-128}"
+SIZE_MB="${1:-2048}"
 
 if [ -f "${DISK_IMG}" ]; then
     echo "Disk image already exists at ${DISK_IMG}"
@@ -30,9 +30,9 @@ mkdir drivers
 mkdir bin
 EOF
 
-# Write BROOK.MNT (tells kernel to mount at /boot)
+# Write BROOK.MNT (tells kernel to mount at /data)
 TMPDIR=$(mktemp -d)
-echo -n "/boot" > "${TMPDIR}/BROOK.MNT"
+echo -n "/data" > "${TMPDIR}/BROOK.MNT"
 debugfs -w "${DISK_IMG}" -R "write ${TMPDIR}/BROOK.MNT BROOK.MNT" 2>/dev/null
 rm -rf "${TMPDIR}"
 
