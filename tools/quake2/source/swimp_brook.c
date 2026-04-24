@@ -33,7 +33,7 @@ static byte *sw_framebuffer = NULL;
 
 // --- Frame diagnostics -----------------------------------------------------
 
-#define FPS_HIST 64
+#define FPS_HIST 256
 static uint16_t frame_time_us[FPS_HIST];  // frame times in units of 100us (0-6553ms)
 static int      fps_head = 0;
 static uint64_t fps_last_ns = 0;
@@ -145,15 +145,19 @@ static void fps_record_and_draw(void)
 
     if (!fb_pixels || fb_width == 0 || fb_height == 0) return;
 
-    const int scale = 2;
+    // Scale overlay with resolution. At 1024×768 use scale 4 (2x previous),
+    // bar width 2, graph height 40. At low res fall back to the old small size.
+    int scale   = (fb_width >= 800) ? 4 : 2;
+    int barW    = (fb_width >= 800) ? 2 : 1;
+    int graphH  = (fb_width >= 800) ? 40 : 20;
     const int gh = 5 * scale;
-    const int pad = 4;
+    const int pad = 4 * (scale / 2);
     const uint32_t white = 0x00FFFFFF;
     const uint32_t bg    = 0x00000000;
 
-    // Panel size: text line (~80px) above graph (FPS_HIST px wide, 20px tall).
-    const int panelW = FPS_HIST + pad * 2;
-    const int panelH = gh + 2 + 20 + pad * 2;
+    int graphW  = FPS_HIST * barW;
+    const int panelW = graphW + pad * 2;
+    const int panelH = gh + 2 + graphH + pad * 2;
     if ((int)fb_width < panelW + pad || (int)fb_height < panelH + pad) return;
     int px = (int)fb_width - panelW - pad;
     int py = pad;
@@ -165,7 +169,7 @@ static void fps_record_and_draw(void)
         for (int xx = px; xx < px + panelW; ++xx) row[xx] = bg;
     }
 
-    // "FPS NNN" + "MM.M"
+    // "FPS NNN MM.MMS"
     char buf[24];
     int fps = fps_value;
     if (fps < 0) fps = 0;
@@ -177,28 +181,29 @@ static void fps_record_and_draw(void)
     draw_text(fb_pixels, fb_width, fb_width, fb_height, buf,
               px + pad, py + pad, scale, white);
 
-    // Bar graph: 20px tall, full-scale = 33ms.
+    // Bar graph — full-scale 33ms (= 30 Hz).
     int gx = px + pad;
     int gy = py + pad + gh + 2;
-    const int graphH = 20;
     for (int i = 0; i < FPS_HIST; ++i)
     {
         int idx = (fps_head + i) % FPS_HIST;
         uint32_t u100 = frame_time_us[idx];
-        // Height: 330 units (33ms) = full
         int bar = (u100 * graphH) / 330;
         if (bar > graphH) bar = graphH;
         uint32_t col =
             (u100 > 330) ? 0x00FF3030 :
             (u100 > 200) ? 0x00FFC040 :
             0x0040C0FF;
-        int cx = gx + i;
-        if (cx >= (int)fb_width) break;
-        for (int r = 0; r < graphH; ++r)
+        for (int bw = 0; bw < barW; ++bw)
         {
-            int pyy = gy + graphH - 1 - r;
-            if (pyy < 0 || pyy >= (int)fb_height) continue;
-            fb_pixels[pyy * fb_width + cx] = (r < bar) ? col : 0x00202020;
+            int cx = gx + i * barW + bw;
+            if (cx >= (int)fb_width) break;
+            for (int r = 0; r < graphH; ++r)
+            {
+                int pyy = gy + graphH - 1 - r;
+                if (pyy < 0 || pyy >= (int)fb_height) continue;
+                fb_pixels[pyy * fb_width + cx] = (r < bar) ? col : 0x00202020;
+            }
         }
     }
 }
