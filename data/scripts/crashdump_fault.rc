@@ -1,0 +1,4 @@
+# crashdump_fault.rc — Drive the fault-path crash-dump redirect with a
+# deliberate user-mode NULL deref.  Verifies the kernel's HandleExceptionFull
+# path spawns the libcrashdump writer and produces /data/crashes/*.txt.
+run /boot/BIN/CRASH_TEST null

@@ -6,6 +6,7 @@
 #include "panic_qr.h"
 #include "process.h"
 #include "scheduler.h"
+#include "../../shared/inc_um/crash_dump.h"
 #include "apic.h"
 #include "smp.h"
 #include "compositor.h"
@@ -1092,6 +1093,72 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         ExcPutsRaw("  R13 "); ExcPutHex(ef->r13);     ExcPutsRaw("\n");
         ExcPutsRaw("  R14 "); ExcPutHex(ef->r14);     ExcPutsRaw("\n");
         ExcPutsRaw("  R15 "); ExcPutHex(ef->r15);     ExcPutsRaw("\n");
+    }
+
+    // ---- User-mode crash-dump redirect -----------------------------------
+    // If the process has registered a user-mode crash-dump writer (syscall
+    // 502) and we're not already dumping, inject a new thread in this
+    // process that runs the writer with a CrashCtx built from the fault
+    // frame.  Writer does its work in user mode — kernel stays out of
+    // the filesystem.  See files/crash-dump-plan.md.
+    if (fromUser && proc) {
+        brook::Process* leader =
+            proc->threadLeader ? proc->threadLeader : proc;
+
+        if (leader->crashEntry && !leader->crashInProgress) {
+            leader->crashInProgress = true;
+
+            BrookCrashCtx ctx = {};
+            ctx.magic     = BROOK_CRASH_CTX_MAGIC;
+            ctx.version   = BROOK_CRASH_CTX_VER;
+            ctx.signum    = static_cast<uint32_t>(signum);
+            ctx.vector    = static_cast<uint32_t>(vector);
+            ctx.errorCode = ef->errorCode;
+            ctx.faultAddr = (vector == 14) ? cr2 : 0;
+            ctx.rip = ef->rip; ctx.rflags = ef->rflags;
+            ctx.cs  = ef->cs;  ctx.ss     = ef->ss;
+            ctx.rax = ef->rax; ctx.rbx = ef->rbx;
+            ctx.rcx = ef->rcx; ctx.rdx = ef->rdx;
+            ctx.rsi = ef->rsi; ctx.rdi = ef->rdi;
+            ctx.rbp = ef->rbp; ctx.rsp = ef->rsp;
+            ctx.r8  = ef->r8;  ctx.r9  = ef->r9;
+            ctx.r10 = ef->r10; ctx.r11 = ef->r11;
+            ctx.r12 = ef->r12; ctx.r13 = ef->r13;
+            ctx.r14 = ef->r14; ctx.r15 = ef->r15;
+            ctx.tid = proc->pid;
+            for (uint32_t i = 0; i < sizeof(ctx.commName) - 1; ++i) {
+                char ch = leader->name[i];
+                ctx.commName[i] = ch;
+                if (!ch) break;
+            }
+            ctx.commName[sizeof(ctx.commName) - 1] = 0;
+
+            uint16_t wtid = brook::CreateRemoteThread(
+                leader, leader->crashEntry, 128 * 1024,
+                &ctx, sizeof(ctx));
+
+            if (wtid) {
+                SerialPrintf("CRASHDUMP: spawned writer tid=%u for pid=%u "
+                             "('%s') sig=%d vec=%lu addr=0x%lx\n",
+                             wtid, leader->pid, leader->name,
+                             signum, vector, ctx.faultAddr);
+
+                // Faulting thread can't return to user mode.  Park it in
+                // Stopped state so its Process struct stays alive (the
+                // writer holds a threadLeader pointer to it).  When the
+                // writer calls sys_brook_crash_complete, it tears down
+                // the whole group including this parked thread.
+                __asm__ volatile("sti");
+                brook::SchedulerStop(proc);
+                // SchedulerStop yields; if we ever come back here the
+                // process is being torn down — don't return to user.
+                for (;;) __asm__ volatile("cli; pause");
+            }
+
+            leader->crashInProgress = false;
+            SerialPrintf("CRASHDUMP: CreateRemoteThread failed for pid=%u — "
+                         "falling back to hard kill\n", leader->pid);
+        }
     }
 
     InterruptFrame ifrm;
