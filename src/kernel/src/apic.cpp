@@ -41,6 +41,7 @@ static inline void WriteMsr(uint32_t msr, uint64_t val)
 
 static uint64_t g_lapicVirt = 0;
 static uint32_t g_timerTicksPerMs = 0;
+static uint32_t g_timerTicksOrigCalibration = 0;  // snapshot of initial calibration for clamp
 
 static inline uint32_t LapicRead(uint32_t offset)
 {
@@ -362,6 +363,7 @@ bool ApicInit(uint64_t localApicPhysical)
                       reinterpret_cast<void*>(LapicTimerHandler));
 
     g_timerTicksPerMs = CalibrateLapicTimer();
+    g_timerTicksOrigCalibration = g_timerTicksPerMs;
 
     // Program the LAPIC timer: periodic, ~1ms interval.
     LapicWrite(LapicReg::TIMER_DIVIDE, 0x3);  // divide by 16
@@ -430,6 +432,44 @@ uint8_t ApicGetId()
 uint32_t ApicGetTimerTicksPerMs()
 {
     return g_timerTicksPerMs;
+}
+
+// Adjust the LAPIC periodic timer rate based on observed drift vs RTC.
+// `observedTicksPerSec` is how many ISR-increments actually occurred in the
+// last real wall-clock second (measured from CMOS).  If the LAPIC is firing
+// too fast, observed > 1000 and we increase INIT_COUNT so the next interval
+// is longer (fewer ticks/sec).  Proportional control with 50% damping and a
+// 2% deadband to avoid oscillation.  Clamped to [0.25×, 4×] the original
+// boot-time calibration so we can never brick the scheduler tick.
+void ApicAdjustTimerRate(uint32_t observedTicksPerSec)
+{
+    if (g_timerTicksPerMs == 0 || g_timerTicksOrigCalibration == 0) return;
+
+    // Deadband: ignore errors < 10%.  CMOS 1s resolution + integer sampling
+    // windows adds a few % phase noise even at 10s windows; we'd rather
+    // accept 10% wall-clock drift than oscillate.
+    int32_t errorTicks = static_cast<int32_t>(observedTicksPerSec) - 1000;
+    if (errorTicks > -100 && errorTicks < 100) return;
+
+    // Observed rate too high → LAPIC fires too often → increase INIT_COUNT.
+    // 25% proportional, 75% carry-over (heavy damping for stability).
+    uint64_t cur = g_timerTicksPerMs;
+    uint64_t proposed = (cur * observedTicksPerSec + 500) / 1000;
+    uint64_t damped = (cur * 3 + proposed) / 4;
+
+    uint64_t lo = g_timerTicksOrigCalibration / 4;
+    uint64_t hi = static_cast<uint64_t>(g_timerTicksOrigCalibration) * 4;
+    if (damped < lo) damped = lo;
+    if (damped > hi) damped = hi;
+
+    if (damped == cur) return;
+
+    g_timerTicksPerMs = static_cast<uint32_t>(damped);
+    LapicWrite(LapicReg::TIMER_INIT_CNT, g_timerTicksPerMs);
+
+    SerialPrintf("apic: rate adjust obs=%u/s old=%u new=%u\n",
+                 observedTicksPerSec, static_cast<uint32_t>(cur),
+                 g_timerTicksPerMs);
 }
 
 uint64_t ApicGetLapicVirtBase()

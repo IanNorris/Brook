@@ -6,6 +6,7 @@
 #include "rtc.h"
 #include "portio.h"
 #include "serial.h"
+#include "apic.h"
 
 namespace brook {
 
@@ -24,6 +25,13 @@ static int32_t g_tzOffsetSec = 0;
 // reading that accompanied it.  Used to detect RTC jumps and throttle work.
 static uint64_t g_lastRtcSec = 0;
 static uint64_t g_lastRtcTick = 0;
+
+// Separate longer-window state for LAPIC rate correction: CMOS resolution is
+// 1 second, so to get a drift signal below our 5% deadband we need ≥3 real
+// seconds of observation.  These are advanced only after we actually take
+// a rate sample.
+static uint64_t g_lastRateSec  = 0;
+static uint64_t g_lastRateTick = 0;
 
 // ---------------------------------------------------------------------------
 // CMOS RTC access
@@ -230,6 +238,24 @@ void RtcRecalibrateLapic()
         g_lastRtcTick = tickNow;
         g_bootEpochSec = rtcSec - (tickNow - g_bootTick) / 1000;
         return;
+    }
+
+    // Require ≥3 elapsed RTC seconds so phase noise (±1s at each endpoint
+    // of a CMOS-resolution measurement) is damped below our 5% deadband.
+    // Uses separate state (g_lastRate*) because the nudge code below always
+    // updates g_lastRtc* every 1s.
+    if (g_lastRateSec == 0) {
+        g_lastRateSec  = rtcSec;
+        g_lastRateTick = tickNow;
+    } else {
+        uint64_t elapsedRtcSec = rtcSec - g_lastRateSec;
+        uint64_t elapsedTicks  = tickNow - g_lastRateTick;
+        if (elapsedRtcSec >= 10 && elapsedRtcSec <= 60) {
+            uint32_t observedPerSec = static_cast<uint32_t>(elapsedTicks / elapsedRtcSec);
+            ApicAdjustTimerRate(observedPerSec);
+            g_lastRateSec  = rtcSec;
+            g_lastRateTick = tickNow;
+        }
     }
 
     uint64_t expectedMsSinceBoot = (rtcSec - g_bootEpochSec) * 1000;

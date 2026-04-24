@@ -58,6 +58,11 @@ uint8_t ApicGetId();
 // Valid only after ApicInit().
 uint32_t ApicGetTimerTicksPerMs();
 
+// Adjust LAPIC periodic timer rate. `observedTicksPerSec` is ISR increments
+// observed in the last real wall-clock second (measured against CMOS RTC).
+// Expected is 1000. Called from RTC recalibration path.
+void ApicAdjustTimerRate(uint32_t observedTicksPerSec);
+
 // Return the virtual base address used to access LAPIC registers.
 uint64_t ApicGetLapicVirtBase();
 
