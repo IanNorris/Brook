@@ -122,8 +122,12 @@ static qboolean cd_open_track(int track)
 
 /* ---- public API ---- */
 
+static cvar_t *cd_nocd = NULL;
+
 int CDAudio_Init(void)
 {
+    cd_nocd = Cvar_Get("cd_nocd", "0", CVAR_ARCHIVE);
+
     cd_fd = open("/dev/dsp", O_WRONLY | O_NONBLOCK);
     if (cd_fd < 0)
     {
@@ -149,6 +153,13 @@ void CDAudio_Shutdown(void)
 void CDAudio_Play(int track, qboolean looping)
 {
     if (cd_fd < 0) return;
+
+    /* Honor menu toggle — cd_nocd=1 means "CD music disabled" */
+    if (cd_nocd && cd_nocd->value)
+    {
+        CDAudio_Stop();
+        return;
+    }
 
     /* Track 0/1 = no music */
     if (track <= 1)
@@ -176,6 +187,10 @@ void CDAudio_Update(void)
 {
     if (cd_fd < 0)
         return;
+
+    /* Runtime honor of cd_nocd: stop music immediately if disabled. */
+    if (cd_nocd && cd_nocd->value && cd_playing)
+        cd_close_track();
 
     /* Decode exactly as many frames as elapsed real time warrants.
      * cls.frametime is seconds since last frame; at 44100 Hz this gives
