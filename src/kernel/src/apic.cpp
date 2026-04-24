@@ -43,6 +43,11 @@ static uint64_t g_lapicVirt = 0;
 static uint32_t g_timerTicksPerMs = 0;
 static uint32_t g_timerTicksOrigCalibration = 0;  // snapshot of initial calibration for clamp
 
+// Raw ISR invocation counter, only ever incremented by the BSP LAPIC timer
+// ISR. Never adjusted by RTC nudge/slew code, so it reflects actual LAPIC
+// firing rate and can be used as drift signal for rate correction.
+volatile uint64_t g_lapicRawTickCount = 0;
+
 // Epoch incremented whenever the rate changes. Each CPU's LAPIC timer ISR
 // compares against its cached last-seen epoch and reprograms its local
 // TIMER_INIT_CNT from g_timerTicksPerMs when stale. Avoids needing IPIs.
@@ -187,6 +192,7 @@ static void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interrupted
     if (cpuId == 0)
     {
         g_lapicTickCount++;
+        g_lapicRawTickCount++;
 
         // Re-check CMOS every ~1024 ticks (~1 second) to correct for
         // LAPIC calibration drift under host turbo / KVM dilation.

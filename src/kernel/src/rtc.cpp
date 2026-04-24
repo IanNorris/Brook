@@ -11,6 +11,7 @@
 namespace brook {
 
 extern volatile uint64_t g_lapicTickCount;
+extern volatile uint64_t g_lapicRawTickCount;  // never touched outside ISR
 
 // Boot-time Unix epoch (seconds since 1970-01-01 00:00:00 UTC).
 static uint64_t g_bootEpochSec = 0;
@@ -226,6 +227,7 @@ static uint64_t TryReadCmosEpoch()
 void RtcRecalibrateLapic()
 {
     uint64_t tickNow = g_lapicTickCount;
+    uint64_t rawNow  = g_lapicRawTickCount;
     uint64_t rtcSec = TryReadCmosEpoch();
     if (rtcSec == 0) return;  // RTC busy, try again next pass
 
@@ -243,18 +245,20 @@ void RtcRecalibrateLapic()
     // Require ≥3 elapsed RTC seconds so phase noise (±1s at each endpoint
     // of a CMOS-resolution measurement) is damped below our 5% deadband.
     // Uses separate state (g_lastRate*) because the nudge code below always
-    // updates g_lastRtc* every 1s.
+    // updates g_lastRtc* every 1s.  IMPORTANT: measure against the RAW
+    // tick counter (pure ISR increments) — not g_lapicTickCount, which is
+    // paused/jumped by the nudge code below and would mask the true rate.
     if (g_lastRateSec == 0) {
         g_lastRateSec  = rtcSec;
-        g_lastRateTick = tickNow;
+        g_lastRateTick = rawNow;
     } else {
         uint64_t elapsedRtcSec = rtcSec - g_lastRateSec;
-        uint64_t elapsedTicks  = tickNow - g_lastRateTick;
+        uint64_t elapsedTicks  = rawNow - g_lastRateTick;
         if (elapsedRtcSec >= 10 && elapsedRtcSec <= 60) {
             uint32_t observedPerSec = static_cast<uint32_t>(elapsedTicks / elapsedRtcSec);
             ApicAdjustTimerRate(observedPerSec);
             g_lastRateSec  = rtcSec;
-            g_lastRateTick = tickNow;
+            g_lastRateTick = rawNow;
         }
     }
 
