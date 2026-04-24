@@ -25,6 +25,11 @@ struct PipeBuffer
     Process* volatile readerWaiter = nullptr;
     Process* volatile writerWaiter = nullptr;
 
+    // Process currently blocked inside epoll_wait watching this pipe for
+    // readability. Set by epoll_wait_impl before it blocks, cleared on wake.
+    // Writers check this after appending data and SchedulerUnblock() it.
+    Process* volatile epollWaiter = nullptr;
+
     uint32_t count() const
     {
         return (head - tail + PIPE_BUF_SIZE) % PIPE_BUF_SIZE;

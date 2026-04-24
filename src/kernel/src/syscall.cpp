@@ -345,6 +345,9 @@ struct UnixSocketData {
     UnixPendingConn pending[UNIX_ACCEPT_QUEUE];
     int             pendingCount;
     Process*        acceptWaiter;
+    // Process inside epoll_wait watching this listening socket for readable
+    // (= new pending connection). Cleared + SchedulerUnblock'd on connect.
+    Process* volatile epollWaiter;
     PipeBuffer* rxPipe;
     PipeBuffer* txPipe;
     UnixFdQueue* incomingFds; // fds arriving on rxPipe
@@ -391,6 +394,33 @@ void UnixSocketHandleRef(void* handle)
     if (!handle) return;
     auto* usd = static_cast<UnixSocketData*>(handle);
     __atomic_fetch_add(&usd->refCount, 1, __ATOMIC_RELEASE);
+}
+
+// Wake any process blocked inside epoll_wait on this pipe. Called from
+// sys_write / sys_sendmsg / sys_close after mutating pipe state in a way
+// that could transition a watched fd to ready.
+static inline void PipeWakeEpoll(PipeBuffer* pipe)
+{
+    if (!pipe) return;
+    Process* ew = pipe->epollWaiter;
+    if (ew) {
+        pipe->epollWaiter = nullptr;
+        __atomic_store_n(&ew->pendingWakeup, 1, __ATOMIC_RELEASE);
+        SchedulerUnblock(ew);
+    }
+}
+
+// Same for a listening AF_UNIX socket: wake epoll waiter when a new
+// connection is posted to the pending queue.
+static inline void UnixListenWakeEpoll(UnixSocketData* usd)
+{
+    if (!usd) return;
+    Process* ew = usd->epollWaiter;
+    if (ew) {
+        usd->epollWaiter = nullptr;
+        __atomic_store_n(&ew->pendingWakeup, 1, __ATOMIC_RELEASE);
+        SchedulerUnblock(ew);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -657,6 +687,7 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
                     __atomic_store_n(&reader->pendingWakeup, 1, __ATOMIC_RELEASE);
                     SchedulerUnblock(reader);
                 }
+                PipeWakeEpoll(pipe);
                 break;  // Return partial writes immediately
             }
             // Buffer full — block until reader drains some
@@ -684,6 +715,9 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
             __atomic_store_n(&reader->pendingWakeup, 1, __ATOMIC_RELEASE);
             SchedulerUnblock(reader);
         }
+        // Note: eventfd readability may also be observed through epoll, but
+        // EventFdData has no epollWaiter slot yet — covered by the 5ms
+        // safety poll in epoll_wait_impl.
         return 8;
     }
 
@@ -721,6 +755,7 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
                     __atomic_store_n(&reader->pendingWakeup, 1, __ATOMIC_RELEASE);
                     SchedulerUnblock(reader);
                 }
+                PipeWakeEpoll(pipe);
                 break;
             }
             Process* self = ProcessCurrent();
@@ -783,6 +818,7 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
                     __atomic_store_n(&reader->pendingWakeup, 1, __ATOMIC_RELEASE);
                     SchedulerUnblock(reader);
                 }
+                PipeWakeEpoll(pipe);
                 break;
             }
             if (nonblock) return -EAGAIN;
@@ -1695,6 +1731,8 @@ static int64_t sys_close(uint64_t fd, uint64_t, uint64_t,
                 __atomic_store_n(&reader->pendingWakeup, 1, __ATOMIC_RELEASE);
                 SchedulerUnblock(reader);
             }
+            // EOF is also readable for epoll (EPOLLHUP/EPOLLIN).
+            PipeWakeEpoll(pipe);
         }
         else
         {
@@ -5689,17 +5727,60 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
     ep->waiter = proc;
     proc->wakeupTick = timeoutTicks;
 
+    // Register proc as the epoll waiter on every watched pipe / listen
+    // socket so writers can SchedulerUnblock us directly. For resources
+    // that don't yet have epoll-waiter slots (EventFd, Socket, TimerFd,
+    // Vnode) we fall back to the 50ms safety poll below.
+    auto registerWaiters = [&]() {
+        for (int i = 0; i < ep->count; i++) {
+            int wfd = ep->entries[i].fd;
+            if (wfd < 0) continue;
+            FdEntry* fde = FdGet(proc, wfd);
+            if (!fde || !fde->handle) continue;
+            if (fde->type == FdType::Pipe) {
+                static_cast<PipeBuffer*>(fde->handle)->epollWaiter = proc;
+            } else if (fde->type == FdType::UnixSocket) {
+                auto* usd = static_cast<UnixSocketData*>(fde->handle);
+                if (usd->state == UnixSocketData::State::Listening) {
+                    usd->epollWaiter = proc;
+                } else if (usd->state == UnixSocketData::State::Connected && usd->rxPipe) {
+                    usd->rxPipe->epollWaiter = proc;
+                }
+            }
+        }
+    };
+    auto unregisterWaiters = [&]() {
+        for (int i = 0; i < ep->count; i++) {
+            int wfd = ep->entries[i].fd;
+            if (wfd < 0) continue;
+            FdEntry* fde = FdGet(proc, wfd);
+            if (!fde || !fde->handle) continue;
+            if (fde->type == FdType::Pipe) {
+                auto* pb = static_cast<PipeBuffer*>(fde->handle);
+                if (pb->epollWaiter == proc) pb->epollWaiter = nullptr;
+            } else if (fde->type == FdType::UnixSocket) {
+                auto* usd = static_cast<UnixSocketData*>(fde->handle);
+                if (usd->epollWaiter == proc) usd->epollWaiter = nullptr;
+                if (usd->rxPipe && usd->rxPipe->epollWaiter == proc)
+                    usd->rxPipe->epollWaiter = nullptr;
+            }
+        }
+    };
+
     while (true) {
-        // Short poll interval — without per-fd waiter wiring, we re-scan
-        // every ~5ms so that data arriving on a watched pipe/socket is
-        // noticed even if the writer doesn't know to wake epoll waiters.
-        uint64_t pollDeadline = g_lapicTickCount + 5;
+        registerWaiters();
+
+        // Safety poll: 50ms for resources without epoll-waiter wiring.
+        // Much longer than the original 5ms stopgap because writers on
+        // Pipe/UnixSocket now wake us directly.
+        uint64_t pollDeadline = g_lapicTickCount + 50;
         if (pollDeadline < timeoutTicks)
             proc->wakeupTick = pollDeadline;
         else
             proc->wakeupTick = timeoutTicks;
 
         SchedulerBlock(proc);
+        unregisterWaiters();
         if (HasPendingSignals()) {
             ep->waiter = nullptr;
             return -EINTR;
@@ -7585,6 +7666,8 @@ static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
             __atomic_store_n(&w->pendingWakeup, 1, __ATOMIC_RELEASE);
             SchedulerUnblock(w);
         }
+        // Also wake server if it's blocked in epoll_wait on this listen fd.
+        UnixListenWakeEpoll(server);
 
         // Block until accepted (or nonblock)
         if (!usd->nonblock) {
