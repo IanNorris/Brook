@@ -1075,6 +1075,10 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
             // Increment memfd refcount for the child's copy (shared buffer).
             if (parent->fds[i].type == FdType::MemFd && parent->fds[i].handle)
                 brook::MemFdHandleRef(parent->fds[i].handle);
+
+            // Increment unix socket refcount for the child's copy
+            if (parent->fds[i].type == FdType::UnixSocket && parent->fds[i].handle)
+                UnixSocketHandleRef(parent->fds[i].handle);
         }
     }
 

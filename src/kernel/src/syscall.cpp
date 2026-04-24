@@ -339,6 +339,7 @@ struct UnixSocketData {
     enum class State : uint8_t { Unbound, Listening, Connected };
     State   state;
     bool    nonblock;
+    volatile uint32_t refCount; // +1 per fd pointing at this struct
     char    path[108];
     UnixPendingConn pending[UNIX_ACCEPT_QUEUE];
     int             pendingCount;
@@ -382,6 +383,13 @@ static void UnixUnregisterServer(UnixSocketData* usd)
     for (int i = 0; i < UNIX_MAX_SERVERS; i++) {
         if (g_unixServers[i] == usd) { g_unixServers[i] = nullptr; return; }
     }
+}
+
+void UnixSocketHandleRef(void* handle)
+{
+    if (!handle) return;
+    auto* usd = static_cast<UnixSocketData*>(handle);
+    __atomic_fetch_add(&usd->refCount, 1, __ATOMIC_RELEASE);
 }
 
 // ---------------------------------------------------------------------------
@@ -1738,6 +1746,8 @@ static int64_t sys_close(uint64_t fd, uint64_t, uint64_t,
     if (fde->type == FdType::UnixSocket && fde->handle)
     {
         auto* usd = static_cast<UnixSocketData*>(fde->handle);
+        uint32_t prev = __atomic_fetch_sub(&usd->refCount, 1, __ATOMIC_ACQ_REL);
+        if (prev == 1) {
         if (usd->state == UnixSocketData::State::Listening)
             UnixUnregisterServer(usd);
         // Decrement refcounts on connected pipes so the other end sees EOF
@@ -1775,6 +1785,7 @@ static int64_t sys_close(uint64_t fd, uint64_t, uint64_t,
         drainQueue(usd->peerIncomingFds);
 
         kfree(usd);
+        }
     }
 
     if (fde->type == FdType::DevDsp && fde->handle)
@@ -1881,6 +1892,13 @@ static int64_t sys_dup(uint64_t oldfd, uint64_t, uint64_t,
     if (old->type == FdType::MemFd && old->handle)
         MemFdRef(static_cast<MemFdData*>(old->handle));
 
+    // Bump unix socket refcount
+    if (old->type == FdType::UnixSocket && old->handle)
+    {
+        auto* usd = static_cast<UnixSocketData*>(old->handle);
+        __atomic_fetch_add(&usd->refCount, 1, __ATOMIC_RELEASE);
+    }
+
     return newfd;
 }
 
@@ -1933,6 +1951,13 @@ static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd, uint64_t,
     // Bump memfd refcount
     if (old->type == FdType::MemFd && old->handle)
         MemFdRef(static_cast<MemFdData*>(old->handle));
+
+    // Bump unix socket refcount
+    if (old->type == FdType::UnixSocket && old->handle)
+    {
+        auto* usd = static_cast<UnixSocketData*>(old->handle);
+        __atomic_fetch_add(&usd->refCount, 1, __ATOMIC_RELEASE);
+    }
 
     return static_cast<int64_t>(newfd);
 }
@@ -4862,6 +4887,13 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
             brook::SockRef(sockIdx);
         }
 
+        // Bump unix socket refcount
+        if (fde->type == FdType::UnixSocket && fde->handle)
+        {
+            auto* usd = static_cast<UnixSocketData*>(fde->handle);
+            __atomic_fetch_add(&usd->refCount, 1, __ATOMIC_RELEASE);
+        }
+
         return newfd;
     }
     case F_GETFD:
@@ -7364,6 +7396,7 @@ static int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
             reinterpret_cast<uint8_t*>(usd)[i] = 0;
         usd->state    = UnixSocketData::State::Unbound;
         usd->nonblock = (type & UNIX_SOCK_NONBLOCK) != 0;
+        usd->refCount = 1;
 
         int fd = FdAlloc(proc, FdType::UnixSocket, usd);
         if (fd < 0) { kfree(usd); return -EMFILE; }
@@ -7722,6 +7755,7 @@ static int64_t sys_accept(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
                 for (uint64_t i = 0; i < sizeof(UnixSocketData); i++)
                     reinterpret_cast<uint8_t*>(serverSock)[i] = 0;
                 serverSock->state  = UnixSocketData::State::Connected;
+                serverSock->refCount = 1;
                 serverSock->rxPipe = usd->pending[slot].serverRx;
                 serverSock->txPipe = usd->pending[slot].serverTx;
                 serverSock->incomingFds     = usd->pending[slot].serverRxFds; // fds client→server

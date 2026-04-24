@@ -191,6 +191,7 @@ uint64_t SyscallGetTableAddress();
 // child without double-freeing the underlying buffer on close.
 void MemFdHandleRef(void* handle);
 void MemFdHandleUnref(void* handle);
+void UnixSocketHandleRef(void* handle);
 
 // Switch to user mode.
 // Saves kernel state, builds IRETQ frame, SWAPGS, jumps to ring 3.
