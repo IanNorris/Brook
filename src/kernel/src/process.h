@@ -311,8 +311,12 @@ struct Process
     // TLS
     uint64_t fsBase;            // FS segment base (TLS)
 
-    // File descriptors
-    FdEntry  fds[MAX_FDS];
+    // File descriptors. Points to a heap-allocated FdEntry[MAX_FDS]. Shared
+    // across CLONE_FILES threads of the same thread group (all threads' fds
+    // pointer points at the leader's table). fork() allocates a new table
+    // and copies entries. The leader (or fork root) frees the table when
+    // the process is destroyed.
+    FdEntry* fds;
 
     // Per-process virtual framebuffer (for compositor)
     // When non-null, fb mmap maps this buffer instead of the physical FB.

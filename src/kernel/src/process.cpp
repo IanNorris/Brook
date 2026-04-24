@@ -26,8 +26,20 @@ namespace brook {
 // File descriptor operations
 // ---------------------------------------------------------------------------
 
+// Allocate a fresh fd table. Returns nullptr on OOM. Each entry is zeroed
+// so type==FdType::None and handle==nullptr.
+static FdEntry* AllocFdTable()
+{
+    auto* table = static_cast<FdEntry*>(kmalloc(sizeof(FdEntry) * MAX_FDS));
+    if (!table) return nullptr;
+    auto* raw = reinterpret_cast<uint8_t*>(table);
+    for (uint64_t i = 0; i < sizeof(FdEntry) * MAX_FDS; ++i) raw[i] = 0;
+    return table;
+}
+
 int FdAlloc(Process* proc, FdType type, void* handle)
 {
+    if (!proc || !proc->fds) return -24; // EMFILE
     // fd 0-2 are reserved (stdin/stdout/stderr), start searching from 3
     for (uint32_t i = 0; i < MAX_FDS; ++i)
     {
@@ -48,6 +60,7 @@ int FdAlloc(Process* proc, FdType type, void* handle)
 
 void FdFree(Process* proc, int fd)
 {
+    if (!proc || !proc->fds) return;
     if (fd < 0 || fd >= static_cast<int>(MAX_FDS)) return;
     proc->fds[fd].type     = FdType::None;
     proc->fds[fd].handle   = nullptr;
@@ -57,6 +70,7 @@ void FdFree(Process* proc, int fd)
 
 FdEntry* FdGet(Process* proc, int fd)
 {
+    if (!proc || !proc->fds) return nullptr;
     if (fd < 0 || fd >= static_cast<int>(MAX_FDS)) return nullptr;
     if (proc->fds[fd].type == FdType::None) return nullptr;
     return &proc->fds[fd];
@@ -328,6 +342,15 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     proc->state = ProcessState::Ready;
     proc->runningOnCpu = -1;
     proc->schedPriority = 2;  // SCHED_PRIORITY_NORMAL
+
+    // Allocate shared fd table (shared across CLONE_FILES threads).
+    proc->fds = AllocFdTable();
+    if (!proc->fds)
+    {
+        SerialPuts("PROC: fd table allocation failed\n");
+        kfree(proc);
+        return nullptr;
+    }
 
     // Default working directory
     proc->cwd[0] = '/'; proc->cwd[1] = 'b'; proc->cwd[2] = 'o';
@@ -717,6 +740,19 @@ void ProcessDestroy(Process* proc)
     if (!isThread)
         ProcessCloseAllFds(proc);
 
+    // Free the shared fd table once the leader (or fork root) is destroyed.
+    // Threads get their fds pointer cleared so the leader still sees the
+    // live table until its own ProcessDestroy runs.
+    if (!isThread && proc->fds)
+    {
+        kfree(proc->fds);
+        proc->fds = nullptr;
+    }
+    else if (isThread)
+    {
+        proc->fds = nullptr;
+    }
+
     // Free per-process kernel stack (each thread has its own)
     if (proc->kernelStackBase)
         VmmFreeKernelStack(VirtualAddress(proc->kernelStackBase), KERNEL_STACK_PAGES);
@@ -923,6 +959,16 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
         return nullptr;
     }
 
+    // Fork gets its own fd table (copied from parent below). The memcpy
+    // above left child->fds pointing at parent's table — replace it.
+    child->fds = AllocFdTable();
+    if (!child->fds)
+    {
+        SerialPuts("FORK: fd table allocation failed\n");
+        kfree(child);
+        return nullptr;
+    }
+
     // Reset scheduler state
     child->state = ProcessState::Ready;
     child->runningOnCpu = -1;
@@ -1093,6 +1139,13 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     thread->tgid = leader->pid;
     thread->threadLeader = leader;
     thread->isThread = true;
+
+    // Share the leader's fd table (CLONE_FILES semantics). The memcpy above
+    // already copied the pointer from parent->fds, but that pointer could be
+    // parent's leader-chained fds; make this explicit so Go/pthread-style
+    // thread groups correctly share one fd namespace. Opening a socket /
+    // epoll in any thread must be visible in every sibling.
+    thread->fds = leader->fds;
     thread->parentPid = parent->parentPid;
     thread->pgid = parent->pgid;
     thread->sid = parent->sid;
