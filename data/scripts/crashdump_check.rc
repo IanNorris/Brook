@@ -1,0 +1,2 @@
+# crashdump_check.rc — Exercise libcrashdump writer via injected remote thread
+run /boot/BIN/CRASHDUMP_CHECK

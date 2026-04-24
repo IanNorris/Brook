@@ -953,7 +953,9 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->isThread = false;
     child->clearChildTid = 0;
     child->parentSetTid = 0;
-    child->crashEntry = 0;
+    // Crash entry is inherited from the parent: fork keeps the same VAS
+    // contents, so __brook_crash_entry is at the same VA in the child.
+    // (exec() does clear it — see ProcessExec.)
     child->crashInProgress = false;
     if (child->pid == 0)
     {

@@ -1197,7 +1197,7 @@ uint16_t SchedulerAllocPid()
 // reaped without running.  Called by sys_exit_group before the calling thread
 // calls SchedulerExitCurrentProcess.  Threads that are currently running on
 // another CPU will be caught by the scheduler at the next timer tick.
-void SchedulerKillThreadGroup(uint16_t tgid, Process* caller)
+void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus)
 {
     Process* targets[MAX_PROCESSES];
     uint32_t count = 0;
@@ -1218,7 +1218,7 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller)
     {
         Process* p = targets[i];
         p->state     = ProcessState::Terminated;
-        p->exitStatus = 128 + 9; // SIGKILL
+        p->exitStatus = exitStatus;
         // Threads that are not yet reapable will be reaped by the scheduler
         // once they stop running.  Set reapable only if they are not
         // currently executing on a CPU.

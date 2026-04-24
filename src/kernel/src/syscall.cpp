@@ -7076,11 +7076,11 @@ static int64_t sys_brook_crash_complete(uint64_t exitCode,
     SerialPrintf("crash_complete: tgid %u exiting with code %lu\n",
                  leader->tgid, exitCode);
 
-    // Mirror sys_exit_group: reap sibling threads, then exit self.
-    SchedulerKillThreadGroup(leader->tgid, caller);
+    // Kill sibling threads (and the leader) with the crash exit code so
+    // wait4 in the parent sees "exited with 128+signum" rather than
+    // "killed by SIGKILL".
+    SchedulerKillThreadGroup(leader->tgid, caller, static_cast<int>(exitCode));
 
-    // Clear the in-progress flag — if anything later inspects the leader
-    // before full teardown, it should see a clean state.
     leader->crashInProgress = false;
 
     SchedulerExitCurrentProcess(static_cast<int>(exitCode));
