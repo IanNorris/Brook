@@ -40,6 +40,7 @@ if [ ${#PACKAGES[@]} -eq 0 ]; then
         netcat-openbsd  # raw TCP without TLS overhead (nc host port)
         wayland         # libwayland-client/server for compositor work
         "${ROOT_DIR}/tools/netsurf-pkg"
+        "${ROOT_DIR}/tools/waylandd-pkg"  # Brook first-light Wayland server
     )
 fi
 
