@@ -65,6 +65,57 @@ static constexpr uint32_t COMPOSITE_INTERVAL = 16; // ~60 Hz fallback
 static constexpr uint32_t FORCE_BLIT_INTERVAL_MS = 500;
 static uint64_t g_lastForceBlitTick = 0;
 
+// Present-timing telemetry: ring buffer of recent frame periods (ms) and
+// per-frame loop durations (ms).  Emitted on serial every 5s.  Additive;
+// no rendering effect.  Useful for diagnosing invisible hitches that an
+// app-level overlay (e.g. Q2's) wouldn't catch because they happen in the
+// compositor itself or in scheduling between wakeups.
+static constexpr uint32_t PRESENT_STATS_WINDOW = 256; // ~4s @ 60Hz
+static uint32_t g_presentPeriodMs[PRESENT_STATS_WINDOW] = {};
+static uint32_t g_presentLoopMs  [PRESENT_STATS_WINDOW] = {};
+static uint32_t g_presentStatsIdx      = 0;
+static uint32_t g_presentStatsFilled   = 0;
+static uint64_t g_presentLastLoopTick  = 0;
+static uint64_t g_presentLastReportTick= 0;
+
+static void PresentStatsReport()
+{
+    uint64_t now = g_lapicTickCount;
+    if (g_presentLastReportTick == 0) g_presentLastReportTick = now;
+    if (now - g_presentLastReportTick < 5000) return;
+    g_presentLastReportTick = now;
+
+    uint32_t n = g_presentStatsFilled;
+    if (n < 8) return; // need a real sample
+
+    // Period: min, mean, p99, max.  Simple insertion-based threshold
+    // counts (we don't sort the whole array to keep this cheap).
+    uint64_t sumP = 0, sumL = 0;
+    uint32_t minP = 0xFFFFFFFFu, maxP = 0, minL = 0xFFFFFFFFu, maxL = 0;
+    // p99 estimate: count frames exceeding 33ms (missed 30Hz) and 50ms.
+    uint32_t over33 = 0, over50 = 0, over100 = 0;
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        uint32_t p = g_presentPeriodMs[i];
+        uint32_t l = g_presentLoopMs[i];
+        sumP += p; sumL += l;
+        if (p < minP) minP = p; if (p > maxP) maxP = p;
+        if (l < minL) minL = l; if (l > maxL) maxL = l;
+        if (p >= 33)  ++over33;
+        if (p >= 50)  ++over50;
+        if (p >= 100) ++over100;
+    }
+    uint32_t meanP = static_cast<uint32_t>(sumP / n);
+    uint32_t meanL = static_cast<uint32_t>(sumL / n);
+    uint32_t fps   = meanP ? (1000u / meanP) : 0;
+
+    SerialPrintf("COMPOSITOR stats[%u]: period min=%u mean=%u max=%u ms "
+                 "(%u fps); loop min=%u mean=%u max=%u ms; "
+                 "frames>33ms=%u >50ms=%u >100ms=%u\n",
+                 n, minP, meanP, maxP, fps, minL, meanL, maxL,
+                 over33, over50, over100);
+}
+
 // Wallpaper: raw XRGB pixel data loaded from disk, or solid color fallback.
 static uint32_t* g_wallpaper       = nullptr;
 static uint32_t  g_wallpaperWidth  = 0;
@@ -1171,6 +1222,12 @@ static void CompositorLoop()
     if (!g_physFb)
         return;
 
+    // Present-timing: sample period (wakeup-to-wakeup) and mark loop start.
+    uint64_t loopStartTick = g_lapicTickCount;
+    uint64_t periodMs = g_presentLastLoopTick
+        ? (loopStartTick - g_presentLastLoopTick) : 0;
+    g_presentLastLoopTick = loopStartTick;
+
     // Bump frame epoch so ProcessDestroy can wait for in-progress blits.
     __atomic_add_fetch(&g_compositorEpoch, 1, __ATOMIC_ACQ_REL);
 
@@ -1280,6 +1337,22 @@ static void CompositorLoop()
                 g_physFbWidth * 4);
         }
     }
+
+    // Present-timing: record this frame's period + loop time and
+    // periodically emit a summary on serial.  Additive diagnostics.
+    uint64_t loopEndTick = g_lapicTickCount;
+    uint64_t loopMs = loopEndTick - loopStartTick;
+    if (periodMs > 0)
+    {
+        uint32_t idx = g_presentStatsIdx % PRESENT_STATS_WINDOW;
+        g_presentPeriodMs[idx] = static_cast<uint32_t>(
+            periodMs > 0xFFFFFFFFull ? 0xFFFFFFFFu : periodMs);
+        g_presentLoopMs[idx]   = static_cast<uint32_t>(
+            loopMs > 0xFFFFFFFFull ? 0xFFFFFFFFu : loopMs);
+        ++g_presentStatsIdx;
+        if (g_presentStatsFilled < PRESENT_STATS_WINDOW) ++g_presentStatsFilled;
+    }
+    PresentStatsReport();
 }
 
 static void CompositorThreadFn(void* /*arg*/)
