@@ -42,6 +42,7 @@ if [ ${#PACKAGES[@]} -eq 0 ]; then
         "${ROOT_DIR}/tools/netsurf-pkg"
         "${ROOT_DIR}/tools/waylandd-pkg"  # Brook first-light Wayland server
         "${ROOT_DIR}/tools/wayland-smoke-pkg"  # Wayland client smoke test
+        "${ROOT_DIR}/tools/wayland-shm-smoke-pkg"  # Wayland shm round-trip smoke test
     )
 fi
 
