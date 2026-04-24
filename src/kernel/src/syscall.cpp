@@ -8161,9 +8161,11 @@ static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
 static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
                             uint64_t, uint64_t, uint64_t)
 {
-    (void)flagsVal;
     Process* proc = ProcessCurrent();
     if (!proc) return -ENOSYS;
+
+    constexpr uint64_t MSG_DONTWAIT = 0x40;
+    bool dontwait = (flagsVal & MSG_DONTWAIT) != 0;
 
     int fd = static_cast<int>(fdVal);
     if (msgVal < 0x1000) return -EFAULT;
@@ -8175,16 +8177,44 @@ static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
     if (fde && fde->type == FdType::UnixSocket) {
         auto* usd = static_cast<UnixSocketData*>(fde->handle);
 
+        // Honor MSG_DONTWAIT: if no data is ready and no cmsg fds queued,
+        // return EAGAIN immediately instead of blocking in sys_read.
+        if (dontwait && usd->state == UnixSocketData::State::Connected && usd->rxPipe) {
+            uint32_t avail = usd->rxPipe->count();
+            int ctlN = usd->incomingFds ? UnixFdQueueCount(usd->incomingFds) : 0;
+            bool writersGone = (__atomic_load_n(&usd->rxPipe->writers, __ATOMIC_ACQUIRE) == 0);
+            if (avail == 0 && ctlN == 0 && !writersGone) {
+                msg->msg_controllen = 0;
+                msg->msg_flags = 0;
+                return -EAGAIN;
+            }
+        }
+
+        // Temporarily enable nonblock for the per-iov reads so even if the
+        // first iov drains the pipe, a second iov doesn't block waiting for
+        // bytes the peer hasn't sent yet (Wayland sends full messages at once).
+        bool savedNonblock = usd->nonblock;
+        if (dontwait) usd->nonblock = true;
+
         int64_t total = 0;
         for (uint64_t i = 0; i < msg->msg_iovlen; i++) {
             void* base = msg->msg_iov[i].iov_base;
             uint64_t len = msg->msg_iov[i].iov_len;
             if (!base || len == 0) continue;
             int64_t ret = sys_read(fd, reinterpret_cast<uint64_t>(base), len, 0, 0, 0);
-            if (ret < 0) return (total > 0) ? total : ret;
+            if (ret < 0) {
+                if (dontwait) usd->nonblock = savedNonblock;
+                if (ret == -EAGAIN && total > 0) return total;
+                return (total > 0) ? total : ret;
+            }
             if (ret == 0) break;
             total += ret;
+            // Partial read on an iov means pipe is now drained; don't spin
+            // into the next iov expecting more.
+            if ((uint64_t)ret < len) break;
         }
+
+        if (dontwait) usd->nonblock = savedNonblock;
 
         // Drain any pending SCM_RIGHTS fds from our incoming queue into the
         // caller's cmsg buffer. We only deliver fds when we also delivered
