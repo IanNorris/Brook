@@ -1309,13 +1309,12 @@ int SockRecvFrom(int sockIdx, void* buf, uint32_t len,
 
     Socket& s = g_sockets[sockIdx];
 
-    // Brief poll to check for pending packets
+    // One-shot poll: give the NIC a chance to deliver any already-DMA'd
+    // packets, but don't spin. Caller uses non-blocking semantics (returns
+    // -EAGAIN below); the prior 100k-iteration pause-spin was burning ~6ms
+    // per empty call and caused per-frame stalls (Q2 loopback polling).
     if (s.rxCount == 0 && g_netIf && g_netIf->poll) {
-        for (int i = 0; i < 100000; i++) {
-            g_netIf->poll(g_netIf);
-            if (s.rxCount > 0) break;
-            __asm__ volatile("pause");
-        }
+        g_netIf->poll(g_netIf);
     }
 
     if (s.rxCount == 0) return -11; // EAGAIN
