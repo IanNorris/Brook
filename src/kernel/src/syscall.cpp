@@ -259,11 +259,39 @@ static constexpr uint32_t MFD_CLOEXEC       = 0x0001u;
 [[maybe_unused]] static constexpr uint32_t MFD_ALLOW_SEALING = 0x0002u;
 
 struct MemFdData {
-    uint8_t*  buf;
+    uint8_t*  buf;        // page-aligned view (what mmap maps)
+    uint8_t*  rawBuf;     // actual kmalloc allocation (may be unaligned)
     uint64_t  size;
     uint64_t  capacity;
     volatile uint32_t refCount; // +1 per fd holding this MemFdData
 };
+
+// Allocate/grow a MemFdData buffer so that `buf` is always 4 KiB aligned.
+// Wayland's wl_shm path mmaps the fd in two processes and expects both
+// mappings to alias the same bytes at offset 0 — that requires the
+// backing buffer to start on a page boundary. Without this, the user's
+// mmap view is page-aligned DOWN from `buf`, exposing allocator padding
+// bytes before the real payload.
+static bool MemFdGrow(MemFdData* mfd, uint64_t needed)
+{
+    if (needed <= mfd->capacity) return true;
+    uint64_t newCap = needed + 4096;
+    // Over-allocate by one page so we can align up inside the allocation.
+    uint8_t* raw = static_cast<uint8_t*>(kmalloc(static_cast<uint32_t>(newCap + 4096)));
+    if (!raw) return false;
+    uintptr_t aligned = (reinterpret_cast<uintptr_t>(raw) + 0xFFF) & ~uintptr_t{0xFFF};
+    uint8_t* newBuf = reinterpret_cast<uint8_t*>(aligned);
+    if (mfd->buf) {
+        for (uint64_t i = 0; i < mfd->size; i++) newBuf[i] = mfd->buf[i];
+    }
+    // Zero the rest of capacity — mmap'd clients expect read-as-zero past size.
+    for (uint64_t i = mfd->size; i < newCap; i++) newBuf[i] = 0;
+    if (mfd->rawBuf) kfree(mfd->rawBuf);
+    mfd->rawBuf   = raw;
+    mfd->buf      = newBuf;
+    mfd->capacity = newCap;
+    return true;
+}
 
 static inline void MemFdRef(MemFdData* mfd)
 {
@@ -275,7 +303,7 @@ static inline void MemFdUnref(MemFdData* mfd)
     if (!mfd) return;
     uint32_t prev = __atomic_fetch_sub(&mfd->refCount, 1, __ATOMIC_ACQ_REL);
     if (prev <= 1) {
-        if (mfd->buf) kfree(mfd->buf);
+        if (mfd->rawBuf) kfree(mfd->rawBuf);
         kfree(mfd);
     }
 }
@@ -776,15 +804,7 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
 
         // Grow buffer if needed
         if (end > mfd->capacity) {
-            uint64_t newCap = end + 4096;
-            auto* newBuf = static_cast<uint8_t*>(kmalloc(static_cast<uint32_t>(newCap)));
-            if (!newBuf) return -ENOMEM;
-            if (mfd->buf) {
-                for (uint64_t i = 0; i < mfd->size; i++) newBuf[i] = mfd->buf[i];
-                kfree(mfd->buf);
-            }
-            mfd->buf = newBuf;
-            mfd->capacity = newCap;
+            if (!MemFdGrow(mfd, end)) return -ENOMEM;
         }
 
         if (bufAddr < 0x1000) return -EFAULT;
@@ -1596,6 +1616,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
             entry->mfd = static_cast<MemFdData*>(kmalloc(sizeof(MemFdData)));
             if (!entry->mfd) return -ENOMEM;
             entry->mfd->buf = nullptr;
+            entry->mfd->rawBuf = nullptr;
             entry->mfd->size = 0;
             entry->mfd->capacity = 0;
             entry->mfd->refCount = 0;
@@ -1603,7 +1624,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         }
 
         if (trunc) {
-            if (entry->mfd->buf) { kfree(entry->mfd->buf); entry->mfd->buf = nullptr; }
+            if (entry->mfd->rawBuf) { kfree(entry->mfd->rawBuf); entry->mfd->rawBuf = nullptr; entry->mfd->buf = nullptr; }
             entry->mfd->size = 0;
             entry->mfd->capacity = 0;
         }
@@ -2334,17 +2355,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         // Grow the MemFd to cover [offset, offset+length) if needed
         uint64_t needed = offset + length;
         if (needed > mfd->capacity) {
-            auto* newBuf = static_cast<uint8_t*>(kmalloc(static_cast<uint32_t>(needed + 4096)));
-            if (!newBuf) return -ENOMEM;
-            if (mfd->buf) {
-                for (uint64_t i = 0; i < mfd->size; i++) newBuf[i] = mfd->buf[i];
-                for (uint64_t i = mfd->size; i < needed + 4096; i++) newBuf[i] = 0;
-                kfree(mfd->buf);
-            } else {
-                for (uint64_t i = 0; i < needed + 4096; i++) newBuf[i] = 0;
-            }
-            mfd->buf = newBuf;
-            mfd->capacity = needed + 4096;
+            if (!MemFdGrow(mfd, needed)) return -ENOMEM;
         }
         if (needed > mfd->size) mfd->size = needed;
 
@@ -2352,12 +2363,11 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         if (!vaddr) return -ENOMEM;
 
         // Map each page of the MemFd buffer directly into user space.
-        // We find the physical address of each kernel heap page and share it.
+        // `mfd->buf` is guaranteed page-aligned by MemFdGrow, so offset+i*4096
+        // lands on page boundaries within the backing allocation.
         for (uint64_t i = 0; i < pages; i++) {
             uint64_t bufVA = reinterpret_cast<uint64_t>(mfd->buf) + offset + i * 4096;
-            // Align to page boundary
-            uint64_t bufVAAligned = bufVA & ~0xFFFULL;
-            PhysicalAddress phys = VmmVirtToPhys(KernelPageTable, VirtualAddress(bufVAAligned));
+            PhysicalAddress phys = VmmVirtToPhys(KernelPageTable, VirtualAddress(bufVA));
             if (!phys) {
                 SerialPrintf("mmap: MemFd page %lu not mapped in kernel!\n", i);
                 return -ENOMEM;
@@ -6010,6 +6020,7 @@ static int64_t sys_memfd_create(uint64_t nameAddr, uint64_t flags,
     auto* mfd = static_cast<MemFdData*>(kmalloc(sizeof(MemFdData)));
     if (!mfd) return -ENOMEM;
     mfd->buf      = nullptr;
+    mfd->rawBuf   = nullptr;
     mfd->size     = 0;
     mfd->capacity = 0;
     mfd->refCount = 0; // bumped by FdAlloc below
@@ -6325,14 +6336,7 @@ static int64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t,
         if (fde && fde->type == FdType::MemFd && fde->handle) {
             auto* mfd = static_cast<MemFdData*>(fde->handle);
             if (length > mfd->capacity) {
-                auto* newBuf = static_cast<uint8_t*>(kmalloc(static_cast<uint32_t>(length + 4096)));
-                if (!newBuf) return -ENOMEM;
-                if (mfd->buf) {
-                    for (uint64_t i = 0; i < mfd->size; i++) newBuf[i] = mfd->buf[i];
-                    kfree(mfd->buf);
-                }
-                mfd->buf = newBuf;
-                mfd->capacity = length + 4096;
+                if (!MemFdGrow(mfd, length)) return -ENOMEM;
             }
             if (length > mfd->size) {
                 // Zero-fill the extension

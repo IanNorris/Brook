@@ -160,7 +160,7 @@ static void compositor_create_surface(struct wl_client *client,
                                       uint32_t id)
 {
     (void)res;
-    fprintf(stderr, "[waylandd] create_surface entry id=%u\n", id); fflush(stderr);
+    fprintf(stderr, "[waylandd] create_surface entry id=%u\n", id);
     struct brook_surface *s = calloc(1, sizeof(*s));
     if (!s) { wl_client_post_no_memory(client); return; }
     struct wl_resource *sr = wl_resource_create(client, &wl_surface_interface,
