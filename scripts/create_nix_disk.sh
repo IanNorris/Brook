@@ -41,6 +41,7 @@ if [ ${#PACKAGES[@]} -eq 0 ]; then
         wayland         # libwayland-client/server for compositor work
         "${ROOT_DIR}/tools/netsurf-pkg"
         "${ROOT_DIR}/tools/waylandd-pkg"  # Brook first-light Wayland server
+        "${ROOT_DIR}/tools/wayland-smoke-pkg"  # Wayland client smoke test
     )
 fi
 

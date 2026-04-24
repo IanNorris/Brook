@@ -5433,7 +5433,7 @@ struct EpollEvent {
         uint32_t u32;
         void*    ptr;
     } data;
-};
+} __attribute__((packed)); // Linux x86_64 ABI: packed to 12 bytes
 
 static constexpr int EPOLL_MAX_FDS = 64;
 
@@ -5659,6 +5659,15 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
     proc->wakeupTick = timeoutTicks;
 
     while (true) {
+        // Short poll interval — without per-fd waiter wiring, we re-scan
+        // every ~5ms so that data arriving on a watched pipe/socket is
+        // noticed even if the writer doesn't know to wake epoll waiters.
+        uint64_t pollDeadline = g_lapicTickCount + 5;
+        if (pollDeadline < timeoutTicks)
+            proc->wakeupTick = pollDeadline;
+        else
+            proc->wakeupTick = timeoutTicks;
+
         SchedulerBlock(proc);
         if (HasPendingSignals()) {
             ep->waiter = nullptr;
@@ -5675,7 +5684,6 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
         }
 
         // Re-arm for another wait cycle
-        proc->wakeupTick = timeoutTicks;
         ep->waiter = proc;
     }
 }
