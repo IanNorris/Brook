@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -181,8 +182,9 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
 
     fprintf(stderr,
             "[waylandd] commit #%d: %dx%d stride=%d fmt=0x%x "
-            "digest=0x%08x first=0x%08x last=0x%08x\n",
-            ++g_commit_count, w, h, stride, fmt, digest, first_pix, last_pix);
+            "digest=0x%08x first=0x%08x last=0x%08x px=%p\n",
+            ++g_commit_count, w, h, stride, fmt, digest, first_pix, last_pix,
+            (void*)px);
 
     /* Release the buffer so the client can reuse it. */
     wl_buffer_send_release(s->pending_buffer);

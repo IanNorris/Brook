@@ -139,8 +139,8 @@ int main(void)
                      ((uint32_t)g << 8) | b;
         }
     }
-    fprintf(stderr, "[shm-smoke] drew pattern (gradient) first=0x%08x last=0x%08x\n",
-            ((uint32_t*)px)[0], ((uint32_t*)px)[W*H - 1]);
+    fprintf(stderr, "[shm-smoke] drew pattern (gradient) first=0x%08x last=0x%08x px=%p\n",
+            ((uint32_t*)px)[0], ((uint32_t*)px)[W*H - 1], (void*)px);
 
     /* Create surface, attach, damage, commit. */
     struct wl_surface *surf = wl_compositor_create_surface(g_comp);

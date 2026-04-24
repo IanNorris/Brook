@@ -286,10 +286,11 @@ static bool MemFdGrow(MemFdData* mfd, uint64_t needed)
     }
     // Zero the rest of capacity — mmap'd clients expect read-as-zero past size.
     for (uint64_t i = mfd->size; i < newCap; i++) newBuf[i] = 0;
-    if (mfd->rawBuf) kfree(mfd->rawBuf);
+    uint8_t* oldRaw = mfd->rawBuf;
     mfd->rawBuf   = raw;
     mfd->buf      = newBuf;
     mfd->capacity = newCap;
+    if (oldRaw) kfree(oldRaw);
     return true;
 }
 
@@ -2368,27 +2369,25 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         for (uint64_t i = 0; i < pages; i++) {
             uint64_t bufVA = reinterpret_cast<uint64_t>(mfd->buf) + offset + i * 4096;
             PhysicalAddress phys = VmmVirtToPhys(KernelPageTable, VirtualAddress(bufVA));
-            if (!phys) {
-                SerialPrintf("mmap: MemFd page %lu not mapped in kernel!\n", i);
-                return -ENOMEM;
-            }
+            if (!phys) return -ENOMEM;
             if (!VmmMapPage(proc->pageTable, VirtualAddress(vaddr + i * 4096),
                             phys, vmmFlags | VMM_WRITABLE, MemTag::User, proc->pid)) {
-                SerialPrintf("mmap: MemFd VmmMapPage failed at page %lu\n", i);
                 return -ENOMEM;
             }
         }
 
-        SerialPrintf("mmap: MemFd fd=%lu offset=0x%lx len=%lu -> vaddr=0x%lx\n",
-                     fd, offset, length, vaddr);
-
         // Record the mapping so sys_munmap can skip PmmFreePage on these
         // pages — they belong to the MemFd's kernel heap buffer, not to
         // the user process. Without this, client munmap corrupts the heap.
+        // Take a VMA-lifetime ref on the MemFdData so POSIX close(fd) on
+        // the mapping owner does not free the underlying buffer while the
+        // mapping is still live (matches Linux mmap semantics).
         for (uint32_t i = 0; i < Process::MAX_MEMFD_MAPS; i++) {
             if (proc->memfdMaps[i].length == 0) {
                 proc->memfdMaps[i].vaddr  = vaddr;
                 proc->memfdMaps[i].length = pages * 4096;
+                proc->memfdMaps[i].mfd    = mfd;
+                MemFdRef(mfd);
                 break;
             }
         }
@@ -2532,6 +2531,7 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t,
     // Is this range a MemFd mmap? If so, unmap only — the physical pages
     // are kernel heap pages owned by the MemFd, not by the process.
     bool isMemFd = false;
+    MemFdData* unmappedMfd = nullptr;
     for (uint32_t i = 0; i < Process::MAX_MEMFD_MAPS; i++) {
         auto& m = proc->memfdMaps[i];
         if (m.length == 0) continue;
@@ -2539,7 +2539,8 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t,
             isMemFd = true;
             // Clear the slot if we're unmapping the whole range.
             if (addr == m.vaddr && length == m.length) {
-                m.vaddr = 0; m.length = 0;
+                unmappedMfd = static_cast<MemFdData*>(m.mfd);
+                m.vaddr = 0; m.length = 0; m.mfd = nullptr;
             }
             break;
         }
@@ -2555,6 +2556,8 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t,
             if (!isMemFd) PmmFreePage(phys);
         }
     }
+
+    if (unmappedMfd) MemFdUnref(unmappedMfd);
 
     return 0;
 }

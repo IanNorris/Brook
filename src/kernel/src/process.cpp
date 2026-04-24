@@ -770,7 +770,8 @@ void ProcessDestroy(Process* proc)
             uint64_t pages = (m.length + 4095) / 4096;
             for (uint64_t p = 0; p < pages; p++)
                 VmmUnmapPage(proc->pageTable, VirtualAddress(m.vaddr + p * 4096));
-            m.vaddr = 0; m.length = 0;
+            if (m.mfd) brook::MemFdHandleUnref(m.mfd);
+            m.vaddr = 0; m.length = 0; m.mfd = nullptr;
         }
         VmmDestroyUserPageTable(proc->pageTable);
     }
