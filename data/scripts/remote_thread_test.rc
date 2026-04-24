@@ -1,0 +1,2 @@
+# remote_thread_test.rc — Boot script for CreateRemoteThread primitive test
+run /boot/BIN/REMOTE_THREAD_TEST

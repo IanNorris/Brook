@@ -17,6 +17,7 @@
 #include "window.h"
 #include "ext2_vfs.h"
 #include "string.h"
+#include "spinlock.h"
 
 namespace brook {
 
@@ -1236,6 +1237,179 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
                  parent->pid, thread->pid, thread->tgid, userRip, userRsp, tlsBase);
 
     return thread;
+}
+
+// ---------------------------------------------------------------------------
+// CreateRemoteThread -- inject a new user-mode thread into a target process.
+// ---------------------------------------------------------------------------
+//
+// Design: allocate user stack in target's VAS, copy argBytes to top of stack,
+// create a CLONE_VM|CLONE_FILES thread whose ForkChildTrampoline restores
+// entry at RIP, stack top at RSP, argBytes address in RDI, and all other
+// GPRs zero.  The thread inherits target's signal mask + fs base (no TLS
+// of its own — entry code must be TLS-free or set up %fs explicitly).
+
+uint16_t CreateRemoteThread(Process* target, uint64_t entry,
+                            uint32_t stackSize,
+                            const void* argBytes, uint32_t argLen)
+{
+    if (!target || target->isKernelThread) return 0;
+    if (!entry) return 0;
+    if (stackSize < 4096) stackSize = 4096;
+    // Round up to 4K and clamp to 1 MiB (defensive)
+    stackSize = (stackSize + 4095) & ~uint32_t(4095);
+    if (stackSize > (1u << 20)) stackSize = 1u << 20;
+
+    // argBytes must fit in top of stack, leaving room for alignment + a
+    // small amount of spare so the entry function doesn't immediately
+    // clobber its own argument when it pushes stack frames.
+    if (argLen > stackSize / 2) return 0;
+
+    // Locate the thread-group leader — all user address-space bookkeeping
+    // (mmapNext) lives there, just like sys_mmap does.
+    Process* leader = target->threadLeader ? target->threadLeader : target;
+
+    // Reserve a VA range in the leader's mmap area.  Use a dedicated lock
+    // to avoid clashing with sys_mmap — overlap would be catastrophic.
+    // We intentionally don't share the sys_mmap spinlock (different TU).
+    static SpinLock s_remoteStackLock;
+    uint64_t stackBase = 0;
+    uint32_t pages = stackSize / 4096;
+    {
+        uint64_t lf = SpinLockAcquire(&s_remoteStackLock);
+        stackBase = leader->mmapNext;
+        if (stackBase + stackSize > USER_MMAP_END) {
+            SpinLockRelease(&s_remoteStackLock, lf);
+            SerialPrintf("CRT: out of user VA (pid %u)\n", target->pid);
+            return 0;
+        }
+        leader->mmapNext = stackBase + stackSize;
+        SpinLockRelease(&s_remoteStackLock, lf);
+    }
+
+    // Allocate + map pages as User/RW.  NX is set via the architecture
+    // default for non-executable; user stack must not be executable.
+    uint64_t vmmFlags = VMM_WRITABLE | VMM_USER;
+    uint32_t mapped = 0;
+    for (uint32_t i = 0; i < pages; ++i) {
+        PhysicalAddress phys = PmmAllocPage(MemTag::User, leader->pid);
+        if (!phys) break;
+        if (!VmmMapPage(target->pageTable,
+                        VirtualAddress(stackBase + i * 4096),
+                        phys, vmmFlags, MemTag::User, leader->pid)) {
+            PmmFreePage(phys);
+            break;
+        }
+        // Zero the page via the direct physmap (stack hygiene).
+        auto* kp = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
+        for (uint32_t b = 0; b < 4096; ++b) kp[b] = 0;
+        ++mapped;
+    }
+    if (mapped < pages) {
+        // Partial mapping — roll back what we did and fail.
+        for (uint32_t i = 0; i < mapped; ++i) {
+            VirtualAddress va(stackBase + i * 4096);
+            PhysicalAddress p = VmmVirtToPhys(target->pageTable, va);
+            VmmUnmapPage(target->pageTable, va);
+            if (p) PmmFreePage(p);
+        }
+        SerialPrintf("CRT: stack alloc failed (%u/%u pages) for pid %u\n",
+                     mapped, pages, target->pid);
+        return 0;
+    }
+
+    uint64_t stackTop = stackBase + stackSize;
+
+    // Place argBytes at the very top of the stack.  Align the arg buffer
+    // to 16 bytes so the entry function gets an aligned RSP.
+    uint64_t argVA = 0;
+    if (argBytes && argLen > 0) {
+        uint64_t argStart = (stackTop - argLen) & ~uint64_t(0xF);
+        argVA = argStart;
+
+        // Copy via the direct physmap.  The buffer may cross page
+        // boundaries, so walk page-by-page.
+        const auto* src = static_cast<const uint8_t*>(argBytes);
+        uint32_t remaining = argLen;
+        uint64_t cursor = argStart;
+        while (remaining > 0) {
+            uint64_t pageVA = cursor & ~uint64_t(0xFFF);
+            uint64_t pageOff = cursor & 0xFFF;
+            uint32_t thisPage = 4096u - static_cast<uint32_t>(pageOff);
+            if (thisPage > remaining) thisPage = remaining;
+            PhysicalAddress phys = VmmVirtToPhys(target->pageTable,
+                                                  VirtualAddress(pageVA));
+            if (!phys) {
+                SerialPrintf("CRT: arg copy hit unmapped page 0x%lx pid %u\n",
+                             pageVA, target->pid);
+                return 0;
+            }
+            auto* dst = reinterpret_cast<uint8_t*>(
+                PhysToVirt(phys).raw() + pageOff);
+            for (uint32_t b = 0; b < thisPage; ++b) dst[b] = src[b];
+            src += thisPage;
+            cursor += thisPage;
+            remaining -= thisPage;
+        }
+    }
+
+    // Pick the user RSP.  Leave 16 bytes of headroom below the arg area
+    // for alignment + a sentinel return address (function prologue will
+    // push RBP onto this).  Linux ABI: at function entry RSP % 16 == 8.
+    uint64_t userRsp = argVA ? (argVA - 16) : (stackTop - 16);
+    userRsp &= ~uint64_t(0xF);
+    userRsp -= 8;   // so that (rsp + 8) is 16-aligned = ABI pre-call state
+
+    // Create the thread using the existing CLONE_VM|CLONE_FILES machinery.
+    // Pass target's fs base as the TLS — the entry code must tolerate
+    // whatever fs is pointing at (or re-initialise it explicitly).
+    Process* thread = ProcessCreateThread(target, entry, userRsp, 0x202,
+                                          target->fsBase);
+    if (!thread) {
+        // Roll back the stack mapping.
+        for (uint32_t i = 0; i < pages; ++i) {
+            VirtualAddress va(stackBase + i * 4096);
+            PhysicalAddress p = VmmVirtToPhys(target->pageTable, va);
+            VmmUnmapPage(target->pageTable, va);
+            if (p) PmmFreePage(p);
+        }
+        return 0;
+    }
+
+    // Override caller-saved registers: entry gets only RDI = argVA, all
+    // others cleared.  Callee-saved (RBX, RBP, R12-R15) also cleared so
+    // the frame walker stops cleanly at the entry frame.
+    thread->forkRdi = argVA;
+    thread->forkRsi = 0;
+    thread->forkRdx = 0;
+    thread->forkR8  = 0;
+    thread->forkR9  = 0;
+    thread->forkR10 = 0;
+    thread->forkRbx = 0;
+    thread->forkRbp = 0;
+    thread->forkR12 = 0;
+    thread->forkR13 = 0;
+    thread->forkR14 = 0;
+    thread->forkR15 = 0;
+
+    // Rename for log hygiene.
+    {
+        const char* suffix = "_crt";
+        uint32_t nameLen = 0;
+        while (nameLen < 24 && target->name[nameLen]) nameLen++;
+        for (uint32_t i = 0; i < nameLen; i++) thread->name[i] = target->name[i];
+        for (uint32_t i = 0; suffix[i] && nameLen + i < 31; i++)
+            thread->name[nameLen + i] = suffix[i];
+        thread->name[31] = '\0';
+    }
+
+    SerialPrintf("CRT: injected tid=%u into tgid=%u entry=0x%lx rsp=0x%lx "
+                 "arg=0x%lx (%u B) stack=0x%lx..0x%lx\n",
+                 thread->pid, target->tgid, entry, userRsp, argVA, argLen,
+                 stackBase, stackBase + stackSize);
+
+    SchedulerAddProcess(thread);
+    return thread->pid;
 }
 
 // ---------------------------------------------------------------------------

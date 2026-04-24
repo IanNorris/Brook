@@ -460,6 +460,21 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
                              uint64_t userRsp, uint64_t userRflags,
                              uint64_t tlsBase);
 
+// Create a new user-mode thread inside `target`'s address space, running at
+// `entry` with a freshly-allocated user stack.  `argBytes` (length `argLen`)
+// is copied onto the top of the new stack; the entry point receives its
+// address in RDI.  The new thread shares target's page table, fd table,
+// tgid, and signal handlers — effectively a synchronous CLONE_VM|CLONE_FILES
+// initiated by the kernel.  Used for crash-dump writers and similar
+// in-process injection tasks; reusable primitive (future: debugger attach,
+// profiler inject, hot-patching).
+//
+// Returns the new thread's tid on success, or 0 on failure.  The caller
+// must not hold any per-process locks on `target`.
+uint16_t CreateRemoteThread(Process* target, uint64_t entry,
+                            uint32_t stackSize,
+                            const void* argBytes, uint32_t argLen);
+
 // Replace the current process's address space with a new ELF binary.
 // On success, returns the new user entry point (and sets *outStackPtr).
 // On failure, returns 0 (the process is left in a broken state and should exit).

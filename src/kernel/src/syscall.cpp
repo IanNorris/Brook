@@ -6984,6 +6984,51 @@ static int64_t sys_brook_profile(uint64_t op, uint64_t a1, uint64_t, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
+// sys_brook_remote_thread_debug (501) — TEMPORARY, for CreateRemoteThread
+// shakedown.  Will be removed after the crash-dump path is verified.
+// ---------------------------------------------------------------------------
+// arg0: target_pid (0 = caller's tgid — "inject into self")
+// arg1: entry      (user VA of function in target)
+// arg2: argBytes   (user VA of arg buffer)
+// arg3: argLen     (bytes)
+// Returns new tid on success, negative errno on failure.
+
+static int64_t sys_brook_remote_thread_debug(uint64_t target_pid,
+                                              uint64_t entry,
+                                              uint64_t argBytes,
+                                              uint64_t argLen,
+                                              uint64_t, uint64_t)
+{
+    brook::Process* caller = brook::ProcessCurrent();
+    if (!caller) return -ESRCH;
+
+    brook::Process* target = nullptr;
+    if (target_pid == 0) {
+        target = caller->threadLeader ? caller->threadLeader : caller;
+    } else {
+        target = brook::ProcessFindByPid(static_cast<uint16_t>(target_pid));
+    }
+    if (!target) return -ESRCH;
+
+    // Copy argBytes into a kernel-side staging buffer so CreateRemoteThread
+    // doesn't have to walk user memory itself (and so target != caller
+    // address spaces work).  Cap at 4 KiB.
+    if (argLen > 4096) return -EINVAL;
+    uint8_t staging[4096];
+    if (argLen > 0) {
+        const auto* src = reinterpret_cast<const uint8_t*>(argBytes);
+        for (uint64_t i = 0; i < argLen; ++i) staging[i] = src[i];
+    }
+
+    uint16_t tid = brook::CreateRemoteThread(target, entry,
+                                              64 * 1024,
+                                              argLen ? staging : nullptr,
+                                              static_cast<uint32_t>(argLen));
+    if (!tid) return -ENOMEM;
+    return static_cast<int64_t>(tid);
+}
+
+// ---------------------------------------------------------------------------
 // sys_not_implemented
 // ---------------------------------------------------------------------------
 
@@ -8306,6 +8351,7 @@ void SyscallTableInit()
 
     // Brook-specific syscalls (500+). 500 = profiler control.
     g_syscallTable[500]                  = sys_brook_profile;
+    g_syscallTable[501]                  = sys_brook_remote_thread_debug;
 
     uint32_t count = 0;
     for (uint64_t i = 0; i < SYSCALL_MAX; ++i)
