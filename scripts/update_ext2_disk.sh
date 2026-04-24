@@ -145,6 +145,9 @@ for app in ansi_test snake game2048; do
     [ -f "${ROOT_DIR}/tcc_build/${app}" ] && write_file "${ROOT_DIR}/tcc_build/${app}" "bin/${app}"
 done
 
+# Profile tool (wraps syscall 500 for sampling profiler control)
+[ -f "${ROOT_DIR}/tools/profile/profile" ] && write_file "${ROOT_DIR}/tools/profile/profile" "bin/profile"
+
 # Symlinks
 if [ ! -L "${MNTDIR}/sh" ]; then
     ln -s bin/busybox "${MNTDIR}/sh" 2>/dev/null && echo "  → sh -> bin/busybox (symlink)" || true
