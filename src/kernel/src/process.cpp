@@ -1207,6 +1207,11 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     VmmDestroyUserPageTable(oldPt);
     PmmFreeByTag(proc->pid, MemTag::User);
 
+    // Any user-space pointers the kernel held into the old address space are
+    // now stale. If we fail later in ProcessExec, SchedulerExitCurrentProcess
+    // must not dereference them. Linux does the same in flush_old_exec().
+    proc->clearChildTid = 0;
+
     // 2. Create fresh page table
     proc->pageTable = VmmCreateUserPageTable();
     if (!proc->pageTable)

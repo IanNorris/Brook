@@ -887,11 +887,25 @@ void SchedulerYield()
     // Thread exit: clear_child_tid + futex_wake for pthread_join
     if (proc->clearChildTid)
     {
-        auto* tidPtr = reinterpret_cast<volatile uint32_t*>(proc->clearChildTid);
-        __atomic_store_n(tidPtr, 0, __ATOMIC_RELEASE);
-        // Wake any thread waiting in futex(FUTEX_WAIT) on this address
-        // (pthread_join blocks on this via FUTEX_WAIT)
-        FutexWake(proc->clearChildTid, 1);
+        // Verify the address is still mapped. After execve the old address
+        // space is gone; if clearChildTid wasn't cleared by the exec path we'd
+        // fault here. Treat an unmapped tidPtr as "nothing to do" rather than
+        // panicking the kernel.
+        PhysicalAddress tidPhys = VmmVirtToPhys(proc->pageTable,
+            VirtualAddress(proc->clearChildTid));
+        if (tidPhys)
+        {
+            auto* tidPtr = reinterpret_cast<volatile uint32_t*>(proc->clearChildTid);
+            __atomic_store_n(tidPtr, 0, __ATOMIC_RELEASE);
+            // Wake any thread waiting in futex(FUTEX_WAIT) on this address
+            // (pthread_join blocks on this via FUTEX_WAIT)
+            FutexWake(proc->clearChildTid, 1);
+        }
+        else
+        {
+            SerialPrintf("SCHED: skip clearChildTid=0x%lx (unmapped) pid=%u\n",
+                         proc->clearChildTid, proc->pid);
+        }
     }
 
     // Only do full process cleanup for non-thread (group leader) processes
