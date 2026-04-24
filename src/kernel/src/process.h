@@ -265,6 +265,12 @@ struct Process
     uint64_t clearChildTid;      // User address to write 0 + futex_wake on exit (set_tid_address / CLONE_CHILD_CLEARTID)
     uint64_t parentSetTid;       // User address where parent's clone() stores child TID (CLONE_PARENT_SETTID)
 
+    // Crash-dump hook: when set, an unhandled synchronous fault in this
+    // process is redirected to a user-mode writer thread entered at this VA.
+    // Leader-owned; threads inherit via threadLeader. See files/crash-dump-plan.md.
+    uint64_t crashEntry;         // 0 = not registered
+    bool     crashInProgress;    // Set on fault; prevents recursive dumps
+
     // Scheduler linked-list pointers (circular doubly-linked ready queue)
     Process* schedNext;
     Process* schedPrev;

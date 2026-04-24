@@ -7029,6 +7029,65 @@ static int64_t sys_brook_remote_thread_debug(uint64_t target_pid,
 }
 
 // ---------------------------------------------------------------------------
+// sys_brook_set_crash_entry (502) — register the user-mode crash-dump writer
+// entry point. One-shot: cannot be re-registered on the same leader.  The
+// fault handler (commit d) will CreateRemoteThread(proc, crashEntry, ...)
+// with a CrashCtx snapshot when a synchronous fatal exception hits this
+// process.  See files/crash-dump-plan.md.
+// ---------------------------------------------------------------------------
+// arg0: entry (user VA of __brook_crash_entry)
+// Returns 0 on success, -errno otherwise.
+
+static int64_t sys_brook_set_crash_entry(uint64_t entry,
+                                          uint64_t, uint64_t, uint64_t,
+                                          uint64_t, uint64_t)
+{
+    if (!entry) return -EINVAL;
+
+    brook::Process* caller = brook::ProcessCurrent();
+    if (!caller) return -ESRCH;
+
+    brook::Process* leader = caller->threadLeader ? caller->threadLeader : caller;
+
+    if (leader->crashEntry != 0) return -EINVAL; // already registered
+    leader->crashEntry = entry;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// sys_brook_crash_complete (503) — called by the user-mode writer once the
+// dump file has been flushed.  Terminates the whole thread group with the
+// supplied exit code (conventionally 128 + signum).  This is the "don't
+// come back" path — if the writer couldn't finish, the fault handler's
+// hardKill fallback would have been taken instead.
+// ---------------------------------------------------------------------------
+// arg0: exitCode (int, stored in lower 8 bits of wait-status)
+// Does not return on success.
+
+static int64_t sys_brook_crash_complete(uint64_t exitCode,
+                                         uint64_t, uint64_t, uint64_t,
+                                         uint64_t, uint64_t)
+{
+    brook::Process* caller = brook::ProcessCurrent();
+    if (!caller) return -ESRCH;
+
+    brook::Process* leader = caller->threadLeader ? caller->threadLeader : caller;
+
+    SerialPrintf("crash_complete: tgid %u exiting with code %lu\n",
+                 leader->tgid, exitCode);
+
+    // Mirror sys_exit_group: reap sibling threads, then exit self.
+    SchedulerKillThreadGroup(leader->tgid, caller);
+
+    // Clear the in-progress flag — if anything later inspects the leader
+    // before full teardown, it should see a clean state.
+    leader->crashInProgress = false;
+
+    SchedulerExitCurrentProcess(static_cast<int>(exitCode));
+    return 0; // unreachable
+}
+
+// ---------------------------------------------------------------------------
 // sys_not_implemented
 // ---------------------------------------------------------------------------
 
@@ -8352,6 +8411,8 @@ void SyscallTableInit()
     // Brook-specific syscalls (500+). 500 = profiler control.
     g_syscallTable[500]                  = sys_brook_profile;
     g_syscallTable[501]                  = sys_brook_remote_thread_debug;
+    g_syscallTable[502]                  = sys_brook_set_crash_entry;
+    g_syscallTable[503]                  = sys_brook_crash_complete;
 
     uint32_t count = 0;
     for (uint64_t i = 0; i < SYSCALL_MAX; ++i)

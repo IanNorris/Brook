@@ -953,6 +953,8 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->isThread = false;
     child->clearChildTid = 0;
     child->parentSetTid = 0;
+    child->crashEntry = 0;
+    child->crashInProgress = false;
     if (child->pid == 0)
     {
         SerialPuts("FORK: PID allocation failed\n");
@@ -1438,6 +1440,10 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     // now stale. If we fail later in ProcessExec, SchedulerExitCurrentProcess
     // must not dereference them. Linux does the same in flush_old_exec().
     proc->clearChildTid = 0;
+    // exec() replaces the program image; a previously-registered crash
+    // entry point is no longer valid (it pointed into the old VAS).
+    proc->crashEntry = 0;
+    proc->crashInProgress = false;
 
     // 2. Create fresh page table
     proc->pageTable = VmmCreateUserPageTable();
