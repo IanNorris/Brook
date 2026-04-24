@@ -3731,7 +3731,34 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         }
 
         if (cmd == FBIOPUT_VSCREENINFO)
-            return 0; // pretend success
+        {
+            // Honor requested xres/yres: resize the process VFB and its
+            // associated WM window so the renderer blits 1:1.
+            const auto* info = reinterpret_cast<const FbVarScreeninfo*>(arg);
+            uint32_t newW = info->xres;
+            uint32_t newH = info->yres;
+            if (newW == 0 || newH == 0) return -EINVAL;
+            if (!proc->fbVirtual) return 0; // no VFB yet — nothing to resize
+
+            if (newW > fbW) newW = fbW;
+            if (newH > fbH) newH = fbH;
+
+            if (!CompositorResizeVfb(proc, newW, newH))
+                return -ENOMEM;
+
+            if (WmIsActive())
+            {
+                int widx = WmFindWindowForProcess(proc);
+                if (widx >= 0)
+                    WmResizeWindow(widx,
+                                   static_cast<uint16_t>(newW),
+                                   static_cast<uint16_t>(newH));
+            }
+
+            SerialPrintf("sys_ioctl: FBIOPUT_VSCREENINFO pid %u → %ux%u\n",
+                         proc->pid, newW, newH);
+            return 0;
+        }
 
         SerialPrintf("sys_ioctl: fb unknown cmd 0x%lx\n", cmd);
         return -EINVAL;

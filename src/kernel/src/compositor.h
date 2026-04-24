@@ -24,6 +24,14 @@ volatile uint32_t* CompositorGetPhysFb(uint32_t* stride);
 bool CompositorSetupProcess(Process* proc, int16_t destX, int16_t destY,
                              uint32_t vfbWidth, uint32_t vfbHeight, uint8_t scale = 1);
 
+// Resize an existing process VFB to newWidth x newHeight.
+// Allocates a new buffer, waits for the compositor to finish the current
+// frame, swaps the pointer atomically, then leaks the old VFB pages
+// (acceptable for rare resize events — PmmKillPid will reclaim on exit).
+// The associated WM window is left untouched; caller should also call
+// WmResizeWindow() to update on-screen dimensions.
+bool CompositorResizeVfb(Process* proc, uint32_t newWidth, uint32_t newHeight);
+
 // Start the compositor kernel thread. Must be called after CompositorInit()
 // and after all processes have been spawned (or at least after SchedulerInit).
 void CompositorStartThread();

@@ -196,6 +196,52 @@ bool CompositorSetupProcess(Process* proc, int16_t destX, int16_t destY,
     return true;
 }
 
+bool CompositorResizeVfb(Process* proc, uint32_t newWidth, uint32_t newHeight)
+{
+    if (!proc || !g_physFb) return false;
+    if (newWidth == 0 || newHeight == 0) return false;
+
+    // Clamp to physical FB so we can't allocate something that wouldn't fit.
+    if (newWidth  > g_physFbWidth)  newWidth  = g_physFbWidth;
+    if (newHeight > g_physFbHeight) newHeight = g_physFbHeight;
+
+    if (proc->fbVfbWidth == newWidth && proc->fbVfbHeight == newHeight)
+        return true;
+
+    uint32_t stride = newWidth;
+    uint64_t fbSizeBytes = static_cast<uint64_t>(stride) * newHeight * 4;
+    uint64_t fbPages     = (fbSizeBytes + 4095) / 4096;
+
+    VirtualAddress vfbAddr = VmmAllocPages(fbPages, VMM_WRITABLE, MemTag::Device, proc->pid);
+    if (!vfbAddr)
+    {
+        SerialPrintf("COMPOSITOR: resize failed to alloc %lu pages for vfb %ux%u\n",
+                     fbPages, newWidth, newHeight);
+        return false;
+    }
+
+    auto* newVfb = reinterpret_cast<uint32_t*>(vfbAddr.raw());
+    for (uint64_t i = 0; i < (fbSizeBytes / 4); ++i)
+        newVfb[i] = 0;
+
+    // Wait for any in-progress blit using the old VFB pointer to retire.
+    CompositorWaitFrame();
+
+    // Swap in the new VFB atomically; blits fetch fbVirtual atomically.
+    __atomic_store_n(&proc->fbVirtual, newVfb, __ATOMIC_RELEASE);
+    proc->fbVirtualSize = static_cast<uint32_t>(fbSizeBytes);
+    proc->fbVfbWidth    = newWidth;
+    proc->fbVfbHeight   = newHeight;
+    proc->fbVfbStride   = stride;
+    proc->fbDirty       = 1;
+
+    // Old VFB pages are leaked until process exit (PmmKillPid reclaims them
+    // via the pid-tagged page owner).  Acceptable for rare resize events.
+    SerialPrintf("COMPOSITOR: proc '%s' pid %u vfb resized to %ux%u at 0x%lx\n",
+                 proc->name, proc->pid, newWidth, newHeight, vfbAddr.raw());
+    return true;
+}
+
 // Blit a process's VFB onto the physical FB with optional downscaling.
 // If forceAll is true, blit regardless of dirty flag (periodic refresh).
 static void BlitProcess(Process* proc, bool forceAll)

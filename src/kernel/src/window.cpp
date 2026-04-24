@@ -233,6 +233,17 @@ void WmDestroyWindowForProcess(Process* proc)
     }
 }
 
+int WmFindWindowForProcess(Process* proc)
+{
+    if (!proc) return -1;
+    for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
+    {
+        if (g_windows[i].proc == proc)
+            return static_cast<int>(i);
+    }
+    return -1;
+}
+
 WmHitResult WmHitTest(int32_t mx, int32_t my)
 {
     WmHitResult result = { -1, WmHitZone::None };

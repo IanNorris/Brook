@@ -82,11 +82,51 @@ rserr_t SWimp_SetMode(int *pwidth, int *pheight, int mode, qboolean fullscreen)
         height = 240;
     }
 
+    // Ask the kernel to resize our VFB so we render 1:1 (no up/down scale).
+    if (fb_fd >= 0)
+    {
+        struct fb_var_screeninfo vinfo;
+        memset(&vinfo, 0, sizeof(vinfo));
+        if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &vinfo) == 0)
+        {
+            vinfo.xres = width;
+            vinfo.yres = height;
+            vinfo.xres_virtual = width;
+            vinfo.yres_virtual = height;
+            if (ioctl(fb_fd, FBIOPUT_VSCREENINFO, &vinfo) == 0)
+            {
+                // Re-query the accepted size (kernel clamps to physical FB).
+                if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &vinfo) == 0)
+                {
+                    // Drop old mmap and re-map at the new size.
+                    if (fb_pixels && fb_pixels != MAP_FAILED)
+                    {
+                        munmap(fb_pixels, fb_width * fb_height * 4);
+                        fb_pixels = NULL;
+                    }
+
+                    fb_width  = vinfo.xres;
+                    fb_height = vinfo.yres;
+
+                    size_t fb_size = (size_t)fb_width * fb_height * (vinfo.bits_per_pixel / 8);
+                    fb_pixels = (uint32_t *)mmap(NULL, fb_size, PROT_READ | PROT_WRITE,
+                                                  MAP_SHARED, fb_fd, 0);
+                    if (fb_pixels == MAP_FAILED)
+                    {
+                        ri.Con_Printf(PRINT_ALL, "SWimp_SetMode: re-mmap failed\n");
+                        fb_pixels = NULL;
+                    }
+                }
+            }
+        }
+    }
+
     // Clamp to framebuffer so we don't overrun the blit.
     if (fb_width && width > (int)fb_width) width = fb_width;
     if (fb_height && height > (int)fb_height) height = fb_height;
 
-    ri.Con_Printf(PRINT_ALL, "SWimp_SetMode: %dx%d (mode %d)\n", width, height, mode);
+    ri.Con_Printf(PRINT_ALL, "SWimp_SetMode: %dx%d (mode %d) fb=%ux%u\n",
+                  width, height, mode, fb_width, fb_height);
 
     // Allocate the 8-bit software framebuffer
     if (sw_framebuffer)
