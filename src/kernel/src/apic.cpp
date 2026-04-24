@@ -43,6 +43,13 @@ static uint64_t g_lapicVirt = 0;
 static uint32_t g_timerTicksPerMs = 0;
 static uint32_t g_timerTicksOrigCalibration = 0;  // snapshot of initial calibration for clamp
 
+// Epoch incremented whenever the rate changes. Each CPU's LAPIC timer ISR
+// compares against its cached last-seen epoch and reprograms its local
+// TIMER_INIT_CNT from g_timerTicksPerMs when stale. Avoids needing IPIs.
+static volatile uint32_t g_timerRateEpoch = 0;
+static constexpr uint32_t MAX_CPUS_FOR_RATE_CACHE = 32;
+static volatile uint32_t g_lastSeenRateEpoch[MAX_CPUS_FOR_RATE_CACHE] = {};
+
 static inline uint32_t LapicRead(uint32_t offset)
 {
     return *reinterpret_cast<volatile uint32_t*>(g_lapicVirt + offset);
@@ -186,6 +193,20 @@ static void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interrupted
         if ((g_lapicTickCount & 0x3FF) == 0)
         {
             RtcRecalibrateLapic();
+        }
+    }
+
+    // Propagate rate changes to every CPU: when BSP adjusts the timer rate,
+    // it bumps g_timerRateEpoch. Each CPU checks here and reprograms its
+    // local LAPIC TIMER_INIT_CNT when stale. Writing TIMER_INIT_CNT during
+    // a running periodic timer is safe — it restarts the countdown.
+    if (cpuId < MAX_CPUS_FOR_RATE_CACHE)
+    {
+        uint32_t curEpoch = g_timerRateEpoch;
+        if (g_lastSeenRateEpoch[cpuId] != curEpoch)
+        {
+            LapicWrite(LapicReg::TIMER_INIT_CNT, g_timerTicksPerMs);
+            g_lastSeenRateEpoch[cpuId] = curEpoch;
         }
     }
 
@@ -466,6 +487,8 @@ void ApicAdjustTimerRate(uint32_t observedTicksPerSec)
 
     g_timerTicksPerMs = static_cast<uint32_t>(damped);
     LapicWrite(LapicReg::TIMER_INIT_CNT, g_timerTicksPerMs);
+    // Bump epoch so APs pick up the new rate in their next LAPIC timer ISR.
+    __atomic_add_fetch(&g_timerRateEpoch, 1, __ATOMIC_RELEASE);
 
     SerialPrintf("apic: rate adjust obs=%u/s old=%u new=%u\n",
                  observedTicksPerSec, static_cast<uint32_t>(cur),
