@@ -288,45 +288,54 @@ static void LapicTimerHandler(void)
 // ---------------------------------------------------------------------------
 
 static constexpr uint32_t PIT_FREQUENCY      = 1193182;   // Hz
-static constexpr uint32_t CALIBRATION_MS     = 10;
-static constexpr uint32_t PIT_TICKS_10MS     = (PIT_FREQUENCY * CALIBRATION_MS) / 1000;
-// ~11931 ticks for 10ms
 
-static uint32_t CalibrateLapicTimer()
+static uint32_t CalibrateLapicTimerOnce(uint32_t windowMs)
 {
-    // Set LAPIC timer divide by 16.
     LapicWrite(LapicReg::TIMER_DIVIDE, 0x3);
 
-    // Configure PIT channel 2 for one-shot mode.
-    // Port 0x61: bit 0 = gate, bit 1 = speaker enable (keep 0)
+    uint32_t pitTicks = (PIT_FREQUENCY * windowMs) / 1000;
+
     uint8_t prev61 = inb(0x61);
-    outb(0x61, (prev61 & ~0x02) | 0x01);  // gate on, speaker off
+    outb(0x61, (prev61 & ~0x02) | 0x01);
 
-    // Select channel 2, lo/hi byte, mode 0 (interrupt on terminal count).
     outb(0x43, 0xB0);
-    outb(0x42, static_cast<uint8_t>(PIT_TICKS_10MS & 0xFF));
-    outb(0x42, static_cast<uint8_t>(PIT_TICKS_10MS >> 8));
+    outb(0x42, static_cast<uint8_t>(pitTicks & 0xFF));
+    outb(0x42, static_cast<uint8_t>(pitTicks >> 8));
 
-    // Start LAPIC timer counting down from max.
     LapicWrite(LapicReg::TIMER_INIT_CNT, 0xFFFFFFFF);
 
-    // Wait for PIT to complete (bit 5 of port 0x61 goes high when done).
     while (!(inb(0x61) & 0x20)) {}
 
-    // Read remaining LAPIC count and compute elapsed ticks.
     uint32_t remaining = LapicRead(LapicReg::TIMER_CUR_CNT);
-    LapicWrite(LapicReg::TIMER_INIT_CNT, 0);  // stop timer
+    LapicWrite(LapicReg::TIMER_INIT_CNT, 0);
 
-    // Restore port 0x61.
     outb(0x61, prev61);
 
     uint32_t elapsed = 0xFFFFFFFF - remaining;
-    uint32_t ticksPerMs = elapsed / CALIBRATION_MS;
+    return elapsed / windowMs;
+}
 
-    SerialPrintf("APIC: LAPIC timer calibrated — %u ticks/ms "
-                 "(%u ticks in %u ms)\n",
-                 ticksPerMs, elapsed, CALIBRATION_MS);
-    return ticksPerMs;
+static uint32_t CalibrateLapicTimer()
+{
+    // Take the max of several samples. CPU steal (host load, turbo transitions)
+    // only makes a sample read LOW — the LAPIC still advances at a fixed
+    // hardware rate, but we observe fewer cycles per PIT window. So the
+    // maximum of several samples is the closest to the true rate.
+    //
+    // Also use a longer per-sample window (25ms) to reduce the relative
+    // impact of any single stall.
+    uint32_t best = 0;
+    uint32_t samples[5] = {};
+    for (int i = 0; i < 5; ++i)
+    {
+        uint32_t s = CalibrateLapicTimerOnce(25);
+        samples[i] = s;
+        if (s > best) best = s;
+    }
+
+    SerialPrintf("APIC: LAPIC calibrated %u ticks/ms (samples %u %u %u %u %u)\n",
+                 best, samples[0], samples[1], samples[2], samples[3], samples[4]);
+    return best;
 }
 
 // ---------------------------------------------------------------------------

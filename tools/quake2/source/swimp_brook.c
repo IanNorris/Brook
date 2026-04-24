@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
@@ -29,6 +30,178 @@ static uint32_t palette_rgba[256];
 
 // 8-bit rendered frame (ref_soft renders into this)
 static byte *sw_framebuffer = NULL;
+
+// --- Frame diagnostics -----------------------------------------------------
+
+#define FPS_HIST 64
+static uint16_t frame_time_us[FPS_HIST];  // frame times in units of 100us (0-6553ms)
+static int      fps_head = 0;
+static uint64_t fps_last_ns = 0;
+static uint64_t fps_window_start_ns = 0;
+static int      fps_window_frames = 0;
+static int      fps_value = 0;
+static float    fps_mean_ms = 0.0f;
+
+static uint64_t mono_ns(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+// Minimal 3x5 digit + small-letter font, packed MSB-first per row.
+// Each glyph is 5 rows of 3 bits. Supports: 0-9, space, '.', 'F','P','S','m','s'.
+static const uint8_t glyph_digit[10][5] = {
+    {0b111,0b101,0b101,0b101,0b111}, // 0
+    {0b010,0b110,0b010,0b010,0b111}, // 1
+    {0b111,0b001,0b111,0b100,0b111}, // 2
+    {0b111,0b001,0b111,0b001,0b111}, // 3
+    {0b101,0b101,0b111,0b001,0b001}, // 4
+    {0b111,0b100,0b111,0b001,0b111}, // 5
+    {0b111,0b100,0b111,0b101,0b111}, // 6
+    {0b111,0b001,0b010,0b010,0b010}, // 7
+    {0b111,0b101,0b111,0b101,0b111}, // 8
+    {0b111,0b101,0b111,0b001,0b111}, // 9
+};
+static const uint8_t glyph_F[5]   = {0b111,0b100,0b111,0b100,0b100};
+static const uint8_t glyph_P[5]   = {0b111,0b101,0b111,0b100,0b100};
+static const uint8_t glyph_S[5]   = {0b111,0b100,0b111,0b001,0b111};
+static const uint8_t glyph_M[5]   = {0b101,0b111,0b111,0b101,0b101};
+static const uint8_t glyph_dot[5] = {0b000,0b000,0b000,0b000,0b010};
+
+static void draw_glyph(uint32_t *fb, int fbstride, int fbw, int fbh,
+                       const uint8_t rows[5], int x, int y, int scale,
+                       uint32_t fg)
+{
+    for (int r = 0; r < 5; ++r)
+    {
+        for (int c = 0; c < 3; ++c)
+        {
+            if (!((rows[r] >> (2 - c)) & 1)) continue;
+            for (int sy = 0; sy < scale; ++sy)
+                for (int sx = 0; sx < scale; ++sx)
+                {
+                    int px = x + c * scale + sx;
+                    int py = y + r * scale + sy;
+                    if (px < 0 || py < 0 || px >= fbw || py >= fbh) continue;
+                    fb[py * fbstride + px] = fg;
+                }
+        }
+    }
+}
+
+static void draw_text(uint32_t *fb, int fbstride, int fbw, int fbh,
+                      const char *s, int x, int y, int scale, uint32_t fg)
+{
+    int adv = 4 * scale; // 3px glyph + 1px gap
+    for (; *s; ++s)
+    {
+        const uint8_t *g = NULL;
+        if (*s >= '0' && *s <= '9') g = glyph_digit[*s - '0'];
+        else if (*s == 'F') g = glyph_F;
+        else if (*s == 'P') g = glyph_P;
+        else if (*s == 'S') g = glyph_S;
+        else if (*s == 'M') g = glyph_M;
+        else if (*s == '.') g = glyph_dot;
+        if (g) draw_glyph(fb, fbstride, fbw, fbh, g, x, y, scale, fg);
+        if (*s != ' ' || true) x += adv;
+    }
+}
+
+static void fps_record_and_draw(void)
+{
+    uint64_t now = mono_ns();
+    if (fps_last_ns != 0)
+    {
+        uint64_t dt_ns = now - fps_last_ns;
+        uint32_t u100 = (uint32_t)(dt_ns / 100000ULL); // 100us units
+        if (u100 > 0xFFFF) u100 = 0xFFFF;
+        frame_time_us[fps_head] = (uint16_t)u100;
+        fps_head = (fps_head + 1) % FPS_HIST;
+    }
+    fps_last_ns = now;
+
+    if (fps_window_start_ns == 0) fps_window_start_ns = now;
+    ++fps_window_frames;
+    uint64_t windowNs = now - fps_window_start_ns;
+    if (windowNs >= 500000000ULL)
+    {
+        fps_value = (int)((uint64_t)fps_window_frames * 1000000000ULL / windowNs);
+        // Mean frame time ms over history
+        uint64_t sum = 0;
+        int n = 0;
+        for (int i = 0; i < FPS_HIST; ++i)
+        {
+            if (frame_time_us[i])
+            {
+                sum += frame_time_us[i];
+                ++n;
+            }
+        }
+        fps_mean_ms = (n > 0) ? ((float)sum / (float)n) / 10.0f : 0.0f;
+        fps_window_frames = 0;
+        fps_window_start_ns = now;
+    }
+
+    if (!fb_pixels || fb_width == 0 || fb_height == 0) return;
+
+    const int scale = 2;
+    const int gh = 5 * scale;
+    const int pad = 4;
+    const uint32_t white = 0x00FFFFFF;
+    const uint32_t bg    = 0x00000000;
+
+    // Panel size: text line (~80px) above graph (FPS_HIST px wide, 20px tall).
+    const int panelW = FPS_HIST + pad * 2;
+    const int panelH = gh + 2 + 20 + pad * 2;
+    if ((int)fb_width < panelW + pad || (int)fb_height < panelH + pad) return;
+    int px = (int)fb_width - panelW - pad;
+    int py = pad;
+
+    // Clear panel
+    for (int yy = py; yy < py + panelH; ++yy)
+    {
+        uint32_t *row = fb_pixels + yy * fb_width;
+        for (int xx = px; xx < px + panelW; ++xx) row[xx] = bg;
+    }
+
+    // "FPS NNN" + "MM.M"
+    char buf[24];
+    int fps = fps_value;
+    if (fps < 0) fps = 0;
+    if (fps > 999) fps = 999;
+    int ms_int = (int)fps_mean_ms;
+    int ms_dec = (int)((fps_mean_ms - (float)ms_int) * 10.0f);
+    if (ms_dec < 0) ms_dec = 0; if (ms_dec > 9) ms_dec = 9;
+    snprintf(buf, sizeof(buf), "FPS %d %d.%dMS", fps, ms_int, ms_dec);
+    draw_text(fb_pixels, fb_width, fb_width, fb_height, buf,
+              px + pad, py + pad, scale, white);
+
+    // Bar graph: 20px tall, full-scale = 33ms.
+    int gx = px + pad;
+    int gy = py + pad + gh + 2;
+    const int graphH = 20;
+    for (int i = 0; i < FPS_HIST; ++i)
+    {
+        int idx = (fps_head + i) % FPS_HIST;
+        uint32_t u100 = frame_time_us[idx];
+        // Height: 330 units (33ms) = full
+        int bar = (u100 * graphH) / 330;
+        if (bar > graphH) bar = graphH;
+        uint32_t col =
+            (u100 > 330) ? 0x00FF3030 :
+            (u100 > 200) ? 0x00FFC040 :
+            0x0040C0FF;
+        int cx = gx + i;
+        if (cx >= (int)fb_width) break;
+        for (int r = 0; r < graphH; ++r)
+        {
+            int pyy = gy + graphH - 1 - r;
+            if (pyy < 0 || pyy >= (int)fb_height) continue;
+            fb_pixels[pyy * fb_width + cx] = (r < bar) ? col : 0x00202020;
+        }
+    }
+}
 
 int SWimp_Init(void *hInstance, void *wndProc)
 {
@@ -206,6 +379,10 @@ void SWimp_EndFrame(void)
     // Signal compositor that a new frame is ready
     if (fb_fd >= 0)
         write(fb_fd, "", 1);
+
+    // Frame diagnostics overlay (drawn after the scaled blit, so it's always
+    // on top of the Q2 image).
+    fps_record_and_draw();
 }
 
 void SWimp_Shutdown(void)
