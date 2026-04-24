@@ -20,11 +20,15 @@
 #include <string.h>
 #include <stdint.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <errno.h>
 
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <linux/fb.h>
 
 #include <wayland-server.h>
 #include <wayland-server-protocol.h>
@@ -32,6 +36,68 @@
 static struct wl_display *g_display = NULL;
 static volatile sig_atomic_t g_shutdown = 0;
 static int g_commit_count = 0;
+
+/* Waylandd's own virtual framebuffer — blit committed client buffers here
+ * so the kernel compositor can show them on screen. */
+static uint32_t *g_vfb       = NULL;
+static uint32_t  g_vfb_w     = 0;
+static uint32_t  g_vfb_h     = 0;
+static uint32_t  g_vfb_bytes = 0;
+
+static int open_vfb(void)
+{
+    int fd = open("/dev/fb0", O_RDWR);
+    if (fd < 0) {
+        fprintf(stderr, "[waylandd] /dev/fb0 open failed: %s\n", strerror(errno));
+        return -1;
+    }
+    struct fb_var_screeninfo vi;
+    if (ioctl(fd, FBIOGET_VSCREENINFO, &vi) < 0) {
+        fprintf(stderr, "[waylandd] FBIOGET_VSCREENINFO failed: %s\n", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    g_vfb_w = vi.xres;
+    g_vfb_h = vi.yres;
+    g_vfb_bytes = g_vfb_w * g_vfb_h * 4;
+
+    void *p = mmap(NULL, g_vfb_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED) {
+        fprintf(stderr, "[waylandd] VFB mmap failed: %s\n", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    g_vfb = (uint32_t*)p;
+    /* fd can be closed now — kernel retains the mapping. */
+    close(fd);
+
+    /* Paint a distinct background so it's obvious what's ours vs empty. */
+    uint32_t bg = 0xff101830; /* deep navy */
+    for (uint32_t i = 0; i < g_vfb_w * g_vfb_h; i++) g_vfb[i] = bg;
+
+    fprintf(stderr, "[waylandd] vfb %ux%u mapped at %p (%u bytes)\n",
+            g_vfb_w, g_vfb_h, (void*)g_vfb, g_vfb_bytes);
+    return 0;
+}
+
+static void blit_into_vfb(const uint8_t *src, int sw, int sh, int sstride)
+{
+    if (!g_vfb || sw <= 0 || sh <= 0) return;
+    /* Centre the client surface in our VFB. */
+    int dx = ((int)g_vfb_w - sw) / 2; if (dx < 0) dx = 0;
+    int dy = ((int)g_vfb_h - sh) / 2; if (dy < 0) dy = 0;
+    int cw = sw; if (dx + cw > (int)g_vfb_w) cw = (int)g_vfb_w - dx;
+    int ch = sh; if (dy + ch > (int)g_vfb_h) ch = (int)g_vfb_h - dy;
+
+    for (int y = 0; y < ch; y++) {
+        const uint32_t *srow = (const uint32_t*)(src + (size_t)y * sstride);
+        uint32_t *drow = g_vfb + (size_t)(dy + y) * g_vfb_w + dx;
+        for (int x = 0; x < cw; x++) {
+            /* XRGB8888 -> ARGB8888 with opaque alpha. */
+            drow[x] = 0xff000000u | (srow[x] & 0x00ffffffu);
+        }
+    }
+}
 
 static void on_sigint(int sig) { (void)sig; g_shutdown = 1; }
 
@@ -108,6 +174,8 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
         }
         first_pix = *(const uint32_t*)px;
         last_pix  = *(const uint32_t*)(px + total - 4);
+        /* Actually show the pixels on screen. */
+        blit_into_vfb(px, w, h, stride);
     }
     wl_shm_buffer_end_access(shm);
 
@@ -228,6 +296,9 @@ int main(int argc, char **argv)
     }
 
     fprintf(stderr, "[waylandd] starting (first-light, %ds)\n", run_seconds);
+
+    /* Best-effort: map our VFB so we can actually show committed buffers. */
+    (void)open_vfb();
 
     g_display = wl_display_create();
     if (!g_display) {
