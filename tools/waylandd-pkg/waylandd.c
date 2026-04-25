@@ -33,6 +33,7 @@
 
 #include <wayland-server.h>
 #include <wayland-server-protocol.h>
+#include "xdg-shell-server-protocol.h"
 
 static struct wl_display *g_display = NULL;
 static volatile sig_atomic_t g_shutdown = 0;
@@ -108,6 +109,16 @@ struct brook_surface {
     struct wl_resource *resource;
     struct wl_resource *pending_buffer; /* set by attach, consumed by commit */
     int pending_w, pending_h;
+
+    /* xdg-shell role state. role==NULL until get_xdg_surface; once we
+     * have an xdg_toplevel we treat the surface as "windowed" — we send
+     * an initial configure on the first commit, and only blit committed
+     * frames after the client has acked at least one configure. */
+    struct wl_resource *xdg_surface;   /* xdg_surface resource, if any */
+    struct wl_resource *xdg_toplevel;  /* xdg_toplevel resource, if any */
+    int  xdg_initial_commit_done;      /* did we send the first configure? */
+    int  xdg_acked;                    /* did client ack a configure? */
+    uint32_t next_configure_serial;
 };
 
 static void surface_destroy(struct wl_client *c, struct wl_resource *r) {
@@ -145,6 +156,23 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
     (void)c;
     fprintf(stderr, "[waylandd] surface_commit entry\n"); fflush(stderr);
     struct brook_surface *s = wl_resource_get_user_data(r);
+
+    /* xdg-shell role: the very first commit must have NO buffer; we
+     * respond with a configure. The client acks, then commits with a
+     * buffer for real. */
+    if (s->xdg_toplevel && !s->xdg_initial_commit_done) {
+        s->xdg_initial_commit_done = 1;
+        struct wl_array states;
+        wl_array_init(&states);
+        /* No states for first configure — client picks its own size. */
+        xdg_toplevel_send_configure(s->xdg_toplevel, 0, 0, &states);
+        wl_array_release(&states);
+        uint32_t serial = ++s->next_configure_serial;
+        xdg_surface_send_configure(s->xdg_surface, serial);
+        fprintf(stderr, "[waylandd] xdg initial configure sent serial=%u\n", serial);
+        return;
+    }
+
     if (!s->pending_buffer) {
         fprintf(stderr, "[waylandd] commit with no attached buffer\n");
         return;
@@ -175,15 +203,19 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
         }
         first_pix = *(const uint32_t*)px;
         last_pix  = *(const uint32_t*)(px + total - 4);
-        /* Actually show the pixels on screen. */
-        blit_into_vfb(px, w, h, stride);
+        /* Only blit toplevels that have completed the configure handshake.
+         * Bare-shm clients (no xdg role) still get blitted as before for
+         * the wl_shm round-trip diagnostic. */
+        int may_blit = (!s->xdg_toplevel) || s->xdg_acked;
+        if (may_blit) blit_into_vfb(px, w, h, stride);
     }
     wl_shm_buffer_end_access(shm);
 
+    const char *kind = s->xdg_toplevel ? "xdg-toplevel" : "bare";
     fprintf(stderr,
-            "[waylandd] commit #%d: %dx%d stride=%d fmt=0x%x "
+            "[waylandd] commit #%d (%s): %dx%d stride=%d fmt=0x%x "
             "digest=0x%08x first=0x%08x last=0x%08x px=%p\n",
-            ++g_commit_count, w, h, stride, fmt, digest, first_pix, last_pix,
+            ++g_commit_count, kind, w, h, stride, fmt, digest, first_pix, last_pix,
             (void*)px);
 
     /* Release the buffer so the client can reuse it. */
@@ -254,6 +286,239 @@ static const struct wl_compositor_interface compositor_impl = {
     .create_surface = compositor_create_surface,
     .create_region  = compositor_create_region,
 };
+
+/* ---------------- xdg-shell ---------------- */
+
+/* xdg_toplevel: most requests are stash-or-stub for now. We only need
+ * configure/ack and destroy to get a real client to commit a frame. */
+
+static void xdg_toplevel_destroy_req(struct wl_client *c, struct wl_resource *r) {
+    (void)c; wl_resource_destroy(r);
+}
+static void xdg_toplevel_set_parent(struct wl_client *c, struct wl_resource *r,
+                                     struct wl_resource *parent) {
+    (void)c; (void)r; (void)parent;
+}
+static void xdg_toplevel_set_title(struct wl_client *c, struct wl_resource *r,
+                                    const char *title) {
+    (void)c; (void)r;
+    fprintf(stderr, "[waylandd] xdg_toplevel.set_title: %s\n", title ? title : "(null)");
+}
+static void xdg_toplevel_set_app_id(struct wl_client *c, struct wl_resource *r,
+                                     const char *app_id) {
+    (void)c; (void)r;
+    fprintf(stderr, "[waylandd] xdg_toplevel.set_app_id: %s\n", app_id ? app_id : "(null)");
+}
+static void xdg_toplevel_show_window_menu(struct wl_client *c, struct wl_resource *r,
+                                            struct wl_resource *seat, uint32_t serial,
+                                            int32_t x, int32_t y) {
+    (void)c; (void)r; (void)seat; (void)serial; (void)x; (void)y;
+}
+static void xdg_toplevel_move(struct wl_client *c, struct wl_resource *r,
+                               struct wl_resource *seat, uint32_t serial) {
+    (void)c; (void)r; (void)seat; (void)serial;
+}
+static void xdg_toplevel_resize(struct wl_client *c, struct wl_resource *r,
+                                 struct wl_resource *seat, uint32_t serial,
+                                 uint32_t edges) {
+    (void)c; (void)r; (void)seat; (void)serial; (void)edges;
+}
+static void xdg_toplevel_set_max_size(struct wl_client *c, struct wl_resource *r,
+                                       int32_t w, int32_t h) {
+    (void)c; (void)r; (void)w; (void)h;
+}
+static void xdg_toplevel_set_min_size(struct wl_client *c, struct wl_resource *r,
+                                       int32_t w, int32_t h) {
+    (void)c; (void)r; (void)w; (void)h;
+}
+static void xdg_toplevel_set_maximized(struct wl_client *c, struct wl_resource *r) {
+    (void)c; (void)r;
+}
+static void xdg_toplevel_unset_maximized(struct wl_client *c, struct wl_resource *r) {
+    (void)c; (void)r;
+}
+static void xdg_toplevel_set_fullscreen(struct wl_client *c, struct wl_resource *r,
+                                         struct wl_resource *output) {
+    (void)c; (void)r; (void)output;
+}
+static void xdg_toplevel_unset_fullscreen(struct wl_client *c, struct wl_resource *r) {
+    (void)c; (void)r;
+}
+static void xdg_toplevel_set_minimized(struct wl_client *c, struct wl_resource *r) {
+    (void)c; (void)r;
+}
+
+static const struct xdg_toplevel_interface xdg_toplevel_impl = {
+    .destroy           = xdg_toplevel_destroy_req,
+    .set_parent        = xdg_toplevel_set_parent,
+    .set_title         = xdg_toplevel_set_title,
+    .set_app_id        = xdg_toplevel_set_app_id,
+    .show_window_menu  = xdg_toplevel_show_window_menu,
+    .move              = xdg_toplevel_move,
+    .resize            = xdg_toplevel_resize,
+    .set_max_size      = xdg_toplevel_set_max_size,
+    .set_min_size      = xdg_toplevel_set_min_size,
+    .set_maximized     = xdg_toplevel_set_maximized,
+    .unset_maximized   = xdg_toplevel_unset_maximized,
+    .set_fullscreen    = xdg_toplevel_set_fullscreen,
+    .unset_fullscreen  = xdg_toplevel_unset_fullscreen,
+    .set_minimized     = xdg_toplevel_set_minimized,
+};
+
+static void xdg_toplevel_resource_destroy(struct wl_resource *r) {
+    struct brook_surface *s = wl_resource_get_user_data(r);
+    if (s) s->xdg_toplevel = NULL;
+}
+
+/* xdg_surface */
+
+static void xdg_surface_destroy_req(struct wl_client *c, struct wl_resource *r) {
+    (void)c; wl_resource_destroy(r);
+}
+static void xdg_surface_get_toplevel(struct wl_client *c, struct wl_resource *r,
+                                       uint32_t id) {
+    struct brook_surface *s = wl_resource_get_user_data(r);
+    struct wl_resource *tr = wl_resource_create(c, &xdg_toplevel_interface,
+                                                 wl_resource_get_version(r), id);
+    if (!tr) { wl_client_post_no_memory(c); return; }
+    wl_resource_set_implementation(tr, &xdg_toplevel_impl, s, xdg_toplevel_resource_destroy);
+    s->xdg_toplevel = tr;
+    fprintf(stderr, "[waylandd] xdg_surface.get_toplevel id=%u\n", id);
+}
+static void xdg_surface_get_popup(struct wl_client *c, struct wl_resource *r,
+                                    uint32_t id, struct wl_resource *parent,
+                                    struct wl_resource *positioner) {
+    (void)id; (void)parent; (void)positioner;
+    wl_resource_post_error(r, XDG_WM_BASE_ERROR_INVALID_POPUP_PARENT,
+                            "popups not implemented");
+    (void)c;
+}
+static void xdg_surface_set_window_geometry(struct wl_client *c, struct wl_resource *r,
+                                              int32_t x, int32_t y,
+                                              int32_t w, int32_t h) {
+    (void)c; (void)r; (void)x; (void)y; (void)w; (void)h;
+}
+static void xdg_surface_ack_configure(struct wl_client *c, struct wl_resource *r,
+                                        uint32_t serial) {
+    (void)c;
+    struct brook_surface *s = wl_resource_get_user_data(r);
+    s->xdg_acked = 1;
+    fprintf(stderr, "[waylandd] xdg_surface.ack_configure serial=%u\n", serial);
+}
+
+static const struct xdg_surface_interface xdg_surface_impl = {
+    .destroy             = xdg_surface_destroy_req,
+    .get_toplevel        = xdg_surface_get_toplevel,
+    .get_popup           = xdg_surface_get_popup,
+    .set_window_geometry = xdg_surface_set_window_geometry,
+    .ack_configure       = xdg_surface_ack_configure,
+};
+
+static void xdg_surface_resource_destroy(struct wl_resource *r) {
+    struct brook_surface *s = wl_resource_get_user_data(r);
+    if (s) s->xdg_surface = NULL;
+}
+
+/* xdg_positioner — minimal stub (we never use the values). */
+
+static void positioner_destroy(struct wl_client *c, struct wl_resource *r) {
+    (void)c; wl_resource_destroy(r);
+}
+static void positioner_set_size(struct wl_client *c, struct wl_resource *r,
+                                  int32_t w, int32_t h) {
+    (void)c; (void)r; (void)w; (void)h;
+}
+static void positioner_set_anchor_rect(struct wl_client *c, struct wl_resource *r,
+                                         int32_t x, int32_t y, int32_t w, int32_t h) {
+    (void)c; (void)r; (void)x; (void)y; (void)w; (void)h;
+}
+static void positioner_set_anchor(struct wl_client *c, struct wl_resource *r,
+                                    uint32_t a) { (void)c; (void)r; (void)a; }
+static void positioner_set_gravity(struct wl_client *c, struct wl_resource *r,
+                                     uint32_t g) { (void)c; (void)r; (void)g; }
+static void positioner_set_constraint_adjustment(struct wl_client *c, struct wl_resource *r,
+                                                    uint32_t v) { (void)c; (void)r; (void)v; }
+static void positioner_set_offset(struct wl_client *c, struct wl_resource *r,
+                                    int32_t x, int32_t y) {
+    (void)c; (void)r; (void)x; (void)y;
+}
+static void positioner_set_reactive(struct wl_client *c, struct wl_resource *r) {
+    (void)c; (void)r;
+}
+static void positioner_set_parent_size(struct wl_client *c, struct wl_resource *r,
+                                         int32_t w, int32_t h) {
+    (void)c; (void)r; (void)w; (void)h;
+}
+static void positioner_set_parent_configure(struct wl_client *c, struct wl_resource *r,
+                                               uint32_t serial) {
+    (void)c; (void)r; (void)serial;
+}
+
+static const struct xdg_positioner_interface positioner_impl = {
+    .destroy                   = positioner_destroy,
+    .set_size                  = positioner_set_size,
+    .set_anchor_rect           = positioner_set_anchor_rect,
+    .set_anchor                = positioner_set_anchor,
+    .set_gravity               = positioner_set_gravity,
+    .set_constraint_adjustment = positioner_set_constraint_adjustment,
+    .set_offset                = positioner_set_offset,
+    .set_reactive              = positioner_set_reactive,
+    .set_parent_size           = positioner_set_parent_size,
+    .set_parent_configure      = positioner_set_parent_configure,
+};
+
+/* xdg_wm_base */
+
+static void wm_base_destroy(struct wl_client *c, struct wl_resource *r) {
+    (void)c; wl_resource_destroy(r);
+}
+static void wm_base_create_positioner(struct wl_client *c, struct wl_resource *r,
+                                        uint32_t id) {
+    struct wl_resource *pr = wl_resource_create(c, &xdg_positioner_interface,
+                                                 wl_resource_get_version(r), id);
+    if (!pr) { wl_client_post_no_memory(c); return; }
+    wl_resource_set_implementation(pr, &positioner_impl, NULL, NULL);
+}
+static void wm_base_get_xdg_surface(struct wl_client *c, struct wl_resource *r,
+                                      uint32_t id, struct wl_resource *surface) {
+    struct brook_surface *s = wl_resource_get_user_data(surface);
+    if (!s) {
+        wl_resource_post_error(r, XDG_WM_BASE_ERROR_INVALID_SURFACE_STATE,
+                                "no surface state");
+        return;
+    }
+    if (s->xdg_surface) {
+        wl_resource_post_error(r, XDG_WM_BASE_ERROR_ROLE,
+                                "wl_surface already has xdg_surface");
+        return;
+    }
+    struct wl_resource *xs = wl_resource_create(c, &xdg_surface_interface,
+                                                 wl_resource_get_version(r), id);
+    if (!xs) { wl_client_post_no_memory(c); return; }
+    wl_resource_set_implementation(xs, &xdg_surface_impl, s, xdg_surface_resource_destroy);
+    s->xdg_surface = xs;
+    fprintf(stderr, "[waylandd] xdg_wm_base.get_xdg_surface id=%u\n", id);
+}
+static void wm_base_pong(struct wl_client *c, struct wl_resource *r, uint32_t serial) {
+    (void)c; (void)r; (void)serial;
+}
+
+static const struct xdg_wm_base_interface wm_base_impl = {
+    .destroy           = wm_base_destroy,
+    .create_positioner = wm_base_create_positioner,
+    .get_xdg_surface   = wm_base_get_xdg_surface,
+    .pong              = wm_base_pong,
+};
+
+static void wm_base_bind(struct wl_client *client, void *data,
+                           uint32_t version, uint32_t id) {
+    (void)data;
+    fprintf(stderr, "[waylandd] xdg_wm_base bind v=%u id=%u\n", version, id);
+    struct wl_resource *r = wl_resource_create(client, &xdg_wm_base_interface,
+                                                (int)version, id);
+    if (!r) { wl_client_post_no_memory(client); return; }
+    wl_resource_set_implementation(r, &wm_base_impl, NULL, NULL);
+}
 
 static void brook_wl_log(const char *fmt, va_list ap) {
     fprintf(stderr, "[waylandd][libwayland] ");
@@ -364,6 +629,14 @@ int main(int argc, char **argv)
         return 1;
     }
     fprintf(stderr, "[waylandd] wl_compositor global advertised (v4)\n");
+
+    struct wl_global *xdg = wl_global_create(g_display, &xdg_wm_base_interface,
+                                              3, NULL, wm_base_bind);
+    if (!xdg) {
+        fprintf(stderr, "[waylandd] FAIL: wl_global_create(xdg_wm_base)\n");
+        return 1;
+    }
+    fprintf(stderr, "[waylandd] xdg_wm_base global advertised (v3)\n");
 
     signal(SIGINT,  on_sigint);
     signal(SIGTERM, on_sigint);

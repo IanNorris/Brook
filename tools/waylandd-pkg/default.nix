@@ -1,11 +1,14 @@
 { stdenv ? (import <nixpkgs> {}).stdenv
 , wayland ? (import <nixpkgs> {}).wayland
+, wayland-scanner ? (import <nixpkgs> {}).wayland-scanner
+, wayland-protocols ? (import <nixpkgs> {}).wayland-protocols
 , patchelf ? (import <nixpkgs> {}).patchelf
 }:
 
-# Package the Brook "first-light" Wayland server.
+# Package the Brook Wayland server.
 # Builds waylandd.c against libwayland-server from the Nix closure,
-# then patchelf's the result so the dynamic linker on Brook resolves
+# generates xdg-shell server bindings via wayland-scanner, then
+# patchelf's the result so the dynamic linker on Brook resolves
 # wayland + libc out of the Nix disk image.
 
 stdenv.mkDerivation {
@@ -14,13 +17,17 @@ stdenv.mkDerivation {
 
   src = ./.;
 
-  nativeBuildInputs = [ patchelf ];
+  nativeBuildInputs = [ patchelf wayland-scanner ];
   buildInputs = [ wayland ];
 
   buildPhase = ''
+    XDG_XML=${wayland-protocols}/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml
+    wayland-scanner server-header  $XDG_XML xdg-shell-server-protocol.h
+    wayland-scanner private-code   $XDG_XML xdg-shell-protocol.c
+
     $CC -O2 -Wall -Wextra \
-        -I${wayland.dev}/include \
-        waylandd.c \
+        -I${wayland.dev}/include -I. \
+        waylandd.c xdg-shell-protocol.c \
         -L${wayland}/lib -lwayland-server \
         -Wl,-rpath,${wayland}/lib:${stdenv.cc.libc}/lib \
         -o waylandd
