@@ -955,6 +955,15 @@ static void pump_input_once(void) {
         int sy_i = vy - g_active_surface_vfb_y;
 
         for (struct brook_seat_client *bsc = g_seat_clients; bsc; bsc = bsc->next) {
+            /* Pointer events are surface-scoped: a wl_surface resource
+             * belongs to exactly one client.  Sending pointer.enter on
+             * another client's surface to this client would mean its
+             * libwayland looks up a non-existent surface ID, returns
+             * NULL user_data, and toytoolkit derefs NULL+0x110 in
+             * pointer_handle_enter.  Only deliver to the surface owner. */
+            if (g_active_surface &&
+                wl_resource_get_client(g_active_surface->resource) != bsc->client)
+                continue;
             switch (type) {
             case 2: /* MouseMove */ {
                 if (!bsc->pointer) break;
