@@ -33,6 +33,10 @@ static MpscQueue<2048, 512> g_serialQueue;
 // The writer thread process (kept for unblocking on wakeup).
 static Process* g_writerProc = nullptr;
 
+// Set to 1 when writer is about to block (or is blocked) on an empty queue.
+// Producers check this and call SchedulerUnblock to wake the consumer.
+static volatile uint32_t g_writerSleeping = 0;
+
 // ---------------------------------------------------------------------------
 // Writer kernel thread — single consumer, sole UART writer post-scheduler.
 // ---------------------------------------------------------------------------
@@ -60,11 +64,23 @@ static void SerialWriterThreadFn(void* /*arg*/)
                     TtyPutChar(slot[i]);
             }
         } else {
-            // Queue empty — sleep briefly.
+            // Queue empty — block indefinitely until SerialWriterEnqueue wakes us.
+            // The previous "wakeupTick = lapicTick + 5" pattern caused a high-rate
+            // self-poll cycle that exercised SchedulerBlock/Unblock every 5ms even
+            // when nothing needed printing; this was implicated in an SMP scheduler
+            // wakeup race where userspace processes failed to dispatch.
             Process* self = ProcessCurrent();
             if (self) {
-                self->wakeupTick = g_lapicTickCount + 5;
-                SchedulerBlock(self);
+                __atomic_store_n(&g_writerSleeping, 1, __ATOMIC_RELEASE);
+                // Re-check queue under the sleeping flag to close the wake race.
+                // If a producer enqueued between our dequeue and setting the flag,
+                // it will have set g_writerSleeping=0 + called SchedulerUnblock
+                // (which sets pendingWakeup if we're not yet Blocked).
+                if (g_serialQueue.empty()) {
+                    self->wakeupTick = 0;
+                    SchedulerBlock(self);
+                }
+                __atomic_store_n(&g_writerSleeping, 0, __ATOMIC_RELEASE);
             }
         }
     }
@@ -93,6 +109,19 @@ void SerialWriterEnqueue(const char* buf, uint32_t len)
         g_serialQueue.enqueue(buf, chunk);
         buf += chunk;
         len -= chunk;
+    }
+
+    // Wake the consumer if it's sleeping.  The CAS ensures we only call
+    // SchedulerUnblock once per sleep cycle (cheap when not sleeping).
+    if (__atomic_load_n(&g_writerSleeping, __ATOMIC_ACQUIRE) != 0) {
+        uint32_t expected = 1;
+        if (__atomic_compare_exchange_n(&g_writerSleeping, &expected, 0,
+                                         false, __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE)) {
+            if (g_writerProc) {
+                SchedulerUnblock(g_writerProc);
+            }
+        }
     }
 }
 
