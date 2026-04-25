@@ -82,6 +82,9 @@ static const char* g_defaultEnvp[] = {
     "WAYLAND_DISPLAY=wayland-0",
     "XDG_RUNTIME_DIR=/tmp",
     "TMPDIR=/tmp",
+    "XCURSOR_PATH=/nix/store/aaipci08wnfa7d64lmd5vyn9l2bkihg5-brook-cursor-theme-0.1/share/icons",
+    "XCURSOR_THEME=default",
+    "XCURSOR_SIZE=24",
     nullptr
 };
 
