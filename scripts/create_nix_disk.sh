@@ -47,6 +47,8 @@ if [ ${#PACKAGES[@]} -eq 0 ]; then
         "${ROOT_DIR}/tools/wayland-calc-pkg"  # Brook-native xdg-shell calculator demo
         "${ROOT_DIR}/tools/weston-flower-pkg"  # weston-flower demo bundle (RPATH-locked)
         "${ROOT_DIR}/tools/weston-presentation-shm-pkg"  # libtoytoolkit-free SHM client (no cursor → no crash)
+        "${ROOT_DIR}/tools/weston-eventdemo-pkg"  # weston-eventdemo (toytoolkit pointer/keyboard event display)
+        "${ROOT_DIR}/tools/weston-clickdot-pkg"  # weston-clickdot (click to draw a dot)
         "${ROOT_DIR}/tools/brook-cursor-theme"  # XCursor theme (so libwayland-cursor doesn't return NULL)
     )
 fi
