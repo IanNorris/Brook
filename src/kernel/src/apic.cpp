@@ -643,6 +643,16 @@ void IoApicMaskIrq(uint8_t irq)
 
 void ApicInitTimerOnAp()
 {
+    // Software-enable the LAPIC on this AP and zero the Task Priority
+    // Register so it accepts all interrupt classes. Without SVR bit 8
+    // set the LAPIC silently drops the timer IRQs we're about to ask
+    // it to deliver, which leaves the AP stuck in its startup hlt loop
+    // forever (manifests as ~30% of boots hanging at "COMPOSITOR: thread
+    // started" once everything else has gone idle).
+    LapicWrite(LapicReg::SVR,
+               LAPIC_SVR_ENABLE | LAPIC_SPURIOUS_VECTOR);
+    LapicWrite(LapicReg::TPR, 0);
+
     // Start the LAPIC timer on this AP using the BSP's calibrated ticks/ms.
     // The LAPIC is already enabled and MMIO-mapped (shared virtual address).
     LapicWrite(LapicReg::TIMER_DIVIDE, 0x3);  // divide by 16
