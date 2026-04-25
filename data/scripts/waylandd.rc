@@ -1,1 +1,1 @@
-run /nix/store/9dscy3h6wvr0hghwrcdymklgj06pcg2p-waylandd-brook-0.1-brook/bin/waylandd --seconds 5
+run /nix/store/cxr77hmdfnpyqg2nmknldy0i189k29lj-waylandd-brook-0.1-brook/bin/waylandd --seconds 5
