@@ -871,10 +871,20 @@ static void deliver_pointer_leave(struct brook_seat_client *sc) {
 
 /* Drain the kernel's per-process input queue and translate to wl events. */
 static void pump_input_once(void) {
-    if (!g_active_surface) return;
     uint8_t buf[16 * 32];
     long n = syscall(BROOK_SYS_INPUT_POP, (long)buf, 32L);
     if (n <= 0) return;
+    /* Diagnostic: prove kernel→waylandd input plumbing even if no client
+     * has bound wl_pointer / wl_keyboard yet. */
+    static long s_total_events = 0;
+    static long s_last_logged = -1;
+    s_total_events += n;
+    if (s_last_logged < 0 || s_total_events - s_last_logged >= 8) {
+        fprintf(stderr, "[waylandd] input_pop: drained %ld (total=%ld)\n",
+                n, s_total_events);
+        s_last_logged = s_total_events;
+    }
+    if (!g_active_surface) return;
     for (long i = 0; i < n; ++i) {
         const uint8_t *e = buf + (i * BROOK_INPUT_REC_SIZE);
         uint8_t  type = e[0];
