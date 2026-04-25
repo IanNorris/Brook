@@ -236,6 +236,14 @@ if [ -d "$dynlibs_dir" ] && ls "$dynlibs_dir"/*.so* &>/dev/null 2>&1; then
         local_name="$(basename "$f")"
         mcopy_safe -o -i "${DISK_IMG}" "$f" "::LIB/${local_name}"
         echo "  synced: LIB/${local_name} ($(stat -c%s "$f") bytes)"
+        # musl unifies libc and the dynamic linker — ld-musl-x86_64.so.1
+        # is normally a symlink to libc.so.  FAT has no symlinks, so
+        # publish a second copy under the canonical PT_INTERP name so
+        # dynamic ELFs (bash etc.) can find their interpreter.
+        if [ "$local_name" = "libc.so" ]; then
+            mcopy_safe -o -i "${DISK_IMG}" "$f" "::LIB/ld-musl-x86_64.so.1"
+            echo "  synced: LIB/ld-musl-x86_64.so.1 (alias of libc.so)"
+        fi
     done
 fi
 
