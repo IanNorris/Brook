@@ -651,6 +651,27 @@ static int ExecCommand(int argc, const char* const* argv)
         }
         else if (StrEq(argv[1], "vfb"))
         {
+            // 'set vfb auto' / 'set vfb full' — use physical FB size at scale 1
+            // (i.e. fullscreen 1:1).  Convenient for wayland_flower.rc and
+            // similar single-app shells where you want the client to occupy
+            // the whole screen.
+            if (StrEq(argv[2], "auto") || StrEq(argv[2], "full"))
+            {
+                uint32_t physW = 0, physH = 0;
+                CompositorGetPhysDims(&physW, &physH);
+                if (physW > 0 && physH > 0)
+                {
+                    g_vfbWidth  = physW;
+                    g_vfbHeight = physH;
+                    g_scale     = 1;
+                    KPrintf("vfb: %ux%u (physical, 1:1)\n", physW, physH);
+                }
+                else
+                {
+                    KPrintf("vfb: physical dims unavailable\n");
+                }
+                return 0;
+            }
             // Parse "WxH" format
             const char* val = argv[2];
             uint32_t w = ParseUint(val);
@@ -1227,7 +1248,7 @@ static void CmdHelp()
     KPrintf("  ls [path]          List directory contents\n");
     KPrintf("  set grid <CxR>     Set process grid layout\n");
     KPrintf("  set scale <N>      Set compositor downscale\n");
-    KPrintf("  set vfb <WxH>      Set VFB dimensions\n");
+    KPrintf("  set vfb <WxH>      Set VFB dimensions (or 'auto'/'full')\n");
     KPrintf("  set pos <X,Y>      Set next window position\n");
     KPrintf("  clear              Clear screen\n");
     KPrintf("  shutdown           Power off\n");

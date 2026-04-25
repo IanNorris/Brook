@@ -215,6 +215,19 @@ static void MouseIrqHandler(InterruptFrame* frame)
 
     // Push button change events
     uint8_t changed = g_buttons ^ g_prevButtons;
+    if (changed)
+    {
+        // First-N trace per button-state change so we can debug missing
+        // middle-button events on real hardware.  Capped to keep serial quiet.
+        static uint32_t s_btnTraces = 0;
+        if (s_btnTraces++ < 32)
+        {
+            SerialPrintf("MOUSE: stat=0x%02x extras=0x%02x buttons=0x%02x "
+                         "prev=0x%02x changed=0x%02x packetLen=%u id=%u\r\n",
+                         stat, extraButtons, g_buttons, g_prevButtons,
+                         changed, g_packetLen, g_mouseId);
+        }
+    }
     for (uint8_t bit = 0; bit < 5; bit++)
     {
         if (changed & (1 << bit))

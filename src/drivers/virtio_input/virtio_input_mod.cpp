@@ -309,9 +309,10 @@ static void ProcessEvent(const VirtioInputEvent& ev)
         }
 
         uint8_t btn = 0;
-        if (ev.code == BTN_LEFT)   btn = MOUSE_BTN_LEFT;
-        else if (ev.code == BTN_RIGHT)  btn = MOUSE_BTN_RIGHT;
-        else if (ev.code == BTN_MIDDLE) btn = MOUSE_BTN_MIDDLE;
+        uint8_t bit = 0;
+        if      (ev.code == BTN_LEFT)   { btn = MOUSE_BTN_LEFT;   bit = 0; }
+        else if (ev.code == BTN_RIGHT)  { btn = MOUSE_BTN_RIGHT;  bit = 1; }
+        else if (ev.code == BTN_MIDDLE) { btn = MOUSE_BTN_MIDDLE; bit = 2; }
 
         if (btn)
         {
@@ -323,7 +324,7 @@ static void ProcessEvent(const VirtioInputEvent& ev)
             InputEvent ie;
             ie.type = ev.value ? InputEventType::MouseButtonDown
                                : InputEventType::MouseButtonUp;
-            ie.scanCode = btn;
+            ie.scanCode = bit; // bit index (0=L, 1=R, 2=M) — matches PS/2 path
             ie.ascii = 0;
             ie.modifiers = cur;
             InputDevicePush(&g_inputDev, ie);
