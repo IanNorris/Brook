@@ -423,11 +423,17 @@ static void ProfilerThreadFn(void* /*arg*/)
     SerialPrintf("PROFILER: thread started\n");
 
     for (;;) {
-        // Sleep until profiling starts
+        // Sleep indefinitely until profiling starts.  Previously this used a
+        // 100-tick timed self-sleep to poll g_profilerEnabled, which exercised
+        // CheckBlockedWakeups → SchedulerUnblock churn from boot onward.  That
+        // pattern was implicated in an SMP wakeup hang where userspace
+        // processes failed to dispatch (~36% of boots).  Now ProfilerStart()
+        // explicitly unblocks us via SchedulerUnblock; ProfilerStop sets
+        // pendingWakeup the same way.
         while (!g_profilerEnabled && !g_profilerFlushReq) {
             Process* self = ProcessCurrent();
             if (self) {
-                self->wakeupTick = g_lapicTickCount + 100;
+                self->wakeupTick = 0; // no timed wake — wait for explicit unblock
                 SchedulerBlock(self);
             }
         }
@@ -525,6 +531,10 @@ void ProfilerStart(uint32_t durationMs)
     // Enable sampling (ISRs will start recording on next tick)
     __atomic_store_n(&g_profilerEnabled, true, __ATOMIC_RELEASE);
 
+    // Wake the profiler thread (it sleeps indefinitely on the disabled flag)
+    if (g_profilerThread)
+        SchedulerUnblock(g_profilerThread);
+
     SerialPrintf("PROFILER: recording started (%u ms, %u CPUs)\n",
                  durationMs, SmpGetCpuCount());
 }
@@ -534,6 +544,8 @@ void ProfilerStop()
     if (!g_profilerEnabled) return;
     g_profilerEnabled  = false;
     g_profilerFlushReq = true;
+    if (g_profilerThread)
+        SchedulerUnblock(g_profilerThread);
     SerialPrintf("PROFILER: stop requested\n");
 }
 
