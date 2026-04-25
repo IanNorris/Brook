@@ -24,27 +24,21 @@ static inline uint32_t SerialThisCpu()
 
 static inline void SerialLockAcquire()
 {
-    // Save flags and disable interrupts to prevent ISR on this CPU from
-    // taking a ticket (which would cause an inversion deadlock — the ISR's
-    // ticket would be after ours but the ISR blocks us from running).
+    // Save flags and disable interrupts.  IF stays disabled across the
+    // entire acquire+critical+release sequence so that no ISR on this
+    // CPU can re-enter SerialPrintf and take a *second* ticket.  If
+    // re-entry were possible, the inner call would advance `serving`
+    // past the outer call's ticket and the outer's "serving == ticket"
+    // wait would never succeed — a self-induced ticket-skip deadlock.
+    // SerialPrintf is short (~tens of microseconds at 115200 baud), so
+    // spinning with interrupts disabled is acceptable.
     uint64_t flags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
 
     uint32_t ticket = __atomic_fetch_add(&g_serialLock.next, 1, __ATOMIC_RELAXED);
 
-    // Spin with interrupts RE-ENABLED so waiting CPUs still service the
-    // timer ISR (heartbeat, scheduler).  This prevents the livelock where
-    // all 8 CPUs spin with cli and starve every interrupt.
-    // Safe because: (a) cli before ticket prevents ISR taking a second
-    // ticket on this CPU, and (b) we re-cli before entering the critical
-    // section so the lock holder is never preempted.
-    if (__atomic_load_n(&g_serialLock.serving, __ATOMIC_ACQUIRE) != ticket)
-    {
-        __asm__ volatile("sti" ::: "memory");
-        while (__atomic_load_n(&g_serialLock.serving, __ATOMIC_ACQUIRE) != ticket)
-            __asm__ volatile("pause" ::: "memory");
-        __asm__ volatile("cli" ::: "memory");
-    }
+    while (__atomic_load_n(&g_serialLock.serving, __ATOMIC_ACQUIRE) != ticket)
+        __asm__ volatile("pause" ::: "memory");
 
     g_serialSavedFlags[SerialThisCpu()] = flags;
 }
