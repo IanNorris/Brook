@@ -86,8 +86,10 @@ fi
 # trivial issues (orphan clusters, dirty bit) which mcopy's own writes
 # leave behind when it's interrupted; only hard corruption fails the run.
 if command -v fsck.fat >/dev/null 2>&1; then
-    fsck.fat -a "${DISK_IMG}" >/tmp/brook_fsck.$$ 2>&1
-    fsck_rc=$?
+    # NB: fsck.fat returns 1 on "errors corrected" — that's a success for us
+    # but `set -e` would kill the script before we could inspect $?.
+    fsck_rc=0
+    fsck.fat -a "${DISK_IMG}" >/tmp/brook_fsck.$$ 2>&1 || fsck_rc=$?
     # fsck.fat exit codes: 0=clean, 1=errors corrected, 2=errors not corrected
     if [ $fsck_rc -ge 2 ]; then
         echo "FAT filesystem corrupted in ${DISK_IMG} (unfixable):"
@@ -112,8 +114,8 @@ fi
 # children).  Hard-cap each invocation; if any single file takes > 30s
 # something is wrong.
 mcopy_safe() {
-    timeout --signal=KILL 30 mcopy "$@"
-    local rc=$?
+    local rc=0
+    timeout --signal=KILL 30 mcopy "$@" || rc=$?
     if [ $rc -eq 137 ] || [ $rc -eq 124 ]; then
         echo "ERROR: mcopy timed out (>30s) — disk image likely corrupt." >&2
         echo "  Args: $*" >&2
