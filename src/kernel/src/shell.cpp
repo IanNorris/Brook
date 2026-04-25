@@ -664,7 +664,11 @@ static int ExecCommand(int argc, const char* const* argv)
                     g_vfbWidth  = physW;
                     g_vfbHeight = physH;
                     g_scale     = 1;
-                    KPrintf("vfb: %ux%u (physical, 1:1)\n", physW, physH);
+                    // Fullscreen client takes over the screen — silence the
+                    // TTY framebuffer writer so kernel log lines don't draw
+                    // over the client's surface.
+                    TtySuppressDisplay(true);
+                    KPrintf("vfb: %ux%u (physical, 1:1, tty suppressed)\n", physW, physH);
                 }
                 else
                 {

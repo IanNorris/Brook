@@ -46,6 +46,7 @@ if [ ${#PACKAGES[@]} -eq 0 ]; then
         "${ROOT_DIR}/tools/wayland-xdg-smoke-pkg"  # Wayland xdg-shell smoke test
         "${ROOT_DIR}/tools/wayland-calc-pkg"  # Brook-native xdg-shell calculator demo
         "${ROOT_DIR}/tools/weston-flower-pkg"  # weston-flower demo bundle (RPATH-locked)
+        "${ROOT_DIR}/tools/weston-presentation-shm-pkg"  # libtoytoolkit-free SHM client (no cursor → no crash)
     )
 fi
 
