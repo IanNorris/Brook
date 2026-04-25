@@ -7288,6 +7288,70 @@ static int64_t sys_brook_crash_complete(uint64_t exitCode,
 }
 
 // ---------------------------------------------------------------------------
+// sys_brook_input_pop (504) — drain the calling process's per-process input
+// queue. WM-mode delivery is already in place: the compositor pushes events
+// for the focused window into proc->inputQueue.  This syscall lets a
+// userspace display server (waylandd) drain the queue without going via the
+// /dev/keyboard fd path (which is scancode-only and lossy for mouse).
+//
+// Each event is delivered as 16 bytes:
+//   [0]  type (uint8)   — InputEventType
+//   [1]  scanCode (uint8)
+//   [2]  ascii (int8)
+//   [3]  modifiers (uint8)
+//   [4..7] reserved
+//   [8..11] mouse_x (int32) — only valid for MouseMove; absolute screen X
+//   [12..15] mouse_y (int32) — only valid for MouseMove; absolute screen Y
+// arg0: user buffer pointer
+// arg1: max event count
+// Returns: number of events copied, or -EFAULT on bad pointer.
+// ---------------------------------------------------------------------------
+
+extern "C" void MouseGetPosition(int32_t*, int32_t*);
+
+static int64_t sys_brook_input_pop(uint64_t bufAddr, uint64_t maxCount,
+                                     uint64_t, uint64_t, uint64_t, uint64_t)
+{
+    if (!bufAddr) return -EFAULT;
+    if (maxCount == 0) return 0;
+    if (maxCount > 256) maxCount = 256;
+
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+
+    auto* out = reinterpret_cast<uint8_t*>(bufAddr);
+    uint64_t n = 0;
+    while (n < maxCount) {
+        InputEvent ev;
+        if (!ProcessInputPop(proc, &ev)) break;
+        uint8_t* slot = out + (n * 16);
+        slot[0] = static_cast<uint8_t>(ev.type);
+        slot[1] = ev.scanCode;
+        slot[2] = static_cast<uint8_t>(ev.ascii);
+        slot[3] = ev.modifiers;
+        slot[4] = slot[5] = slot[6] = slot[7] = 0;
+        int32_t mx = 0, my = 0;
+        if (ev.type == InputEventType::MouseMove ||
+            ev.type == InputEventType::MouseButtonDown ||
+            ev.type == InputEventType::MouseButtonUp ||
+            ev.type == InputEventType::MouseScroll) {
+            int32_t sx = 0, sy = 0;
+            MouseGetPosition(&sx, &sy);
+            // Translate screen coords to caller's VFB coords. The compositor
+            // blits the VFB to (fbDestX, fbDestY) at fbScale×; the inverse is
+            // (sx - fbDestX) / fbScale.  Userspace then converts VFB→surface.
+            uint8_t scale = proc->fbScale ? proc->fbScale : 1;
+            mx = (sx - proc->fbDestX) / scale;
+            my = (sy - proc->fbDestY) / scale;
+        }
+        *reinterpret_cast<int32_t*>(slot + 8)  = mx;
+        *reinterpret_cast<int32_t*>(slot + 12) = my;
+        ++n;
+    }
+    return static_cast<int64_t>(n);
+}
+
+// ---------------------------------------------------------------------------
 // sys_not_implemented
 // ---------------------------------------------------------------------------
 
@@ -8647,6 +8711,7 @@ void SyscallTableInit()
     g_syscallTable[500]                  = sys_brook_profile;
     g_syscallTable[502]                  = sys_brook_set_crash_entry;
     g_syscallTable[503]                  = sys_brook_crash_complete;
+    g_syscallTable[504]                  = sys_brook_input_pop;
 
     uint32_t count = 0;
     for (uint64_t i = 0; i < SYSCALL_MAX; ++i)

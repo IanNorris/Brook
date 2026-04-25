@@ -734,15 +734,65 @@ static void CompositorLoopWM()
         if (ev.type == InputEventType::MouseButtonDown && ev.scanCode == 0)
         {
             g_wmBtnLatch = true;
+            // Also route LMB to the window under the cursor so Wayland
+            // apps can see it.  WM drag/resize uses the latch above; this
+            // forwards to the app's input queue if the click lands inside
+            // a client area.
+            int32_t mx = 0, my = 0;
+            MouseGetPosition(&mx, &my);
+            WmHitResult hit = WmHitTest(mx, my);
+            if (hit.windowIndex >= 0 && hit.zone == WmHitZone::ClientArea)
+            {
+                Window* target = WmGetWindow(hit.windowIndex);
+                if (target && target->proc)
+                    ProcessInputPush(target->proc, ev);
+            }
             continue;
         }
         if (ev.type == InputEventType::MouseButtonUp && ev.scanCode == 0)
         {
             g_wmBtnReleaseLatch = true;
+            int32_t mx = 0, my = 0;
+            MouseGetPosition(&mx, &my);
+            WmHitResult hit = WmHitTest(mx, my);
+            if (hit.windowIndex >= 0 && hit.zone == WmHitZone::ClientArea)
+            {
+                Window* target = WmGetWindow(hit.windowIndex);
+                if (target && target->proc)
+                    ProcessInputPush(target->proc, ev);
+            }
+            continue;
+        }
+        // Non-LMB mouse buttons (middle, right, side): route to window under cursor
+        if (ev.type == InputEventType::MouseButtonDown ||
+            ev.type == InputEventType::MouseButtonUp)
+        {
+            int32_t mx = 0, my = 0;
+            MouseGetPosition(&mx, &my);
+            WmHitResult hit = WmHitTest(mx, my);
+            if (hit.windowIndex >= 0 && hit.zone == WmHitZone::ClientArea)
+            {
+                Window* target = WmGetWindow(hit.windowIndex);
+                if (target && target->proc)
+                    ProcessInputPush(target->proc, ev);
+            }
             continue;
         }
         if (ev.type == InputEventType::MouseMove)
+        {
+            // Route motion to the window under the cursor (no latching needed
+            // since the WM uses MouseGetPosition directly for drag/resize).
+            int32_t mx = 0, my = 0;
+            MouseGetPosition(&mx, &my);
+            WmHitResult hit = WmHitTest(mx, my);
+            if (hit.windowIndex >= 0 && hit.zone == WmHitZone::ClientArea)
+            {
+                Window* target = WmGetWindow(hit.windowIndex);
+                if (target && target->proc)
+                    ProcessInputPush(target->proc, ev);
+            }
             continue;
+        }
 
         // Scroll wheel: route to the window under the cursor (not the focused
         // one — standard UX is "scroll the thing you're pointing at").

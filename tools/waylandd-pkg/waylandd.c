@@ -46,6 +46,15 @@ static struct wl_display *g_display = NULL;
 static volatile sig_atomic_t g_shutdown = 0;
 static int g_commit_count = 0;
 
+/* Forward decls — defined in the wl_seat section below. */
+struct brook_surface;
+static struct brook_surface *g_active_surface = NULL;
+static int g_active_surface_w = 0;
+static int g_active_surface_h = 0;
+static int g_active_surface_vfb_x = 0;
+static int g_active_surface_vfb_y = 0;
+static void pump_input_once(void);
+
 /* Waylandd's own virtual framebuffer — blit committed client buffers here
  * so the kernel compositor can show them on screen. */
 static uint32_t *g_vfb       = NULL;
@@ -225,7 +234,17 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
          * Bare-shm clients (no xdg role) still get blitted as before for
          * the wl_shm round-trip diagnostic. */
         int may_blit = (!s->xdg_toplevel) || s->xdg_acked;
-        if (may_blit) blit_into_vfb(px, w, h, stride);
+        if (may_blit) {
+            blit_into_vfb(px, w, h, stride);
+            /* Track this as the focusable surface for input dispatch. */
+            g_active_surface = s;
+            g_active_surface_w = w;
+            g_active_surface_h = h;
+            int dx = ((int)g_vfb_w - w) / 2; if (dx < 0) dx = 0;
+            int dy = ((int)g_vfb_h - h) / 2; if (dy < 0) dy = 0;
+            g_active_surface_vfb_x = dx;
+            g_active_surface_vfb_y = dy;
+        }
     }
     wl_shm_buffer_end_access(shm);
 
@@ -603,7 +622,340 @@ static void compositor_bind(struct wl_client *client, void *data,
     wl_resource_set_implementation(r, &compositor_impl, NULL, NULL);
 }
 
-/* ---------------- main ---------------- */
+/* ---------------- wl_seat / wl_pointer / wl_keyboard ---------------- */
+
+/* Brook input syscall: returns up to N events as 16-byte records.
+ *   [0]   type    (uint8)  — InputEventType: 0=KeyPress 1=KeyRelease
+ *                            2=MouseMove 3=MouseButtonDown 4=MouseButtonUp
+ *                            5=MouseScroll
+ *   [1]   scanCode
+ *   [2]   ascii
+ *   [3]   modifiers
+ *   [4..7] reserved
+ *   [8..11]  vfb-local mouse_x (int32)
+ *   [12..15] vfb-local mouse_y (int32)
+ */
+#define BROOK_SYS_INPUT_POP 504
+#define BROOK_INPUT_REC_SIZE 16
+
+struct brook_seat_client {
+    struct wl_resource *seat;
+    struct wl_resource *pointer;
+    struct wl_resource *keyboard;
+    struct wl_client   *client;
+    struct brook_surface *entered_surface; /* surface we last sent enter on */
+    struct brook_seat_client *next;
+};
+
+static struct brook_seat_client *g_seat_clients = NULL;
+
+/* Track previous pointer state so we only fire on changes. */
+static int g_last_ptr_x = -100000, g_last_ptr_y = -100000;
+static uint32_t g_serial = 1;
+static uint32_t next_serial(void) { return g_serial++; }
+
+static void seat_remove_client(struct brook_seat_client *sc) {
+    struct brook_seat_client **pp = &g_seat_clients;
+    while (*pp) {
+        if (*pp == sc) { *pp = sc->next; free(sc); return; }
+        pp = &(*pp)->next;
+    }
+}
+
+static struct brook_seat_client *seat_for_resource(struct wl_resource *r) {
+    for (struct brook_seat_client *sc = g_seat_clients; sc; sc = sc->next) {
+        if (sc->seat == r || sc->pointer == r || sc->keyboard == r) return sc;
+    }
+    return NULL;
+}
+
+static void pointer_set_cursor(struct wl_client *c, struct wl_resource *r,
+                                uint32_t serial, struct wl_resource *surface,
+                                int32_t hx, int32_t hy) {
+    (void)c; (void)r; (void)serial; (void)surface; (void)hx; (void)hy;
+}
+static void pointer_release(struct wl_client *c, struct wl_resource *r) {
+    (void)c; wl_resource_destroy(r);
+}
+static const struct wl_pointer_interface pointer_impl = {
+    .set_cursor = pointer_set_cursor,
+    .release    = pointer_release,
+};
+static void pointer_resource_destroy(struct wl_resource *r) {
+    struct brook_seat_client *sc = seat_for_resource(r);
+    if (sc && sc->pointer == r) sc->pointer = NULL;
+}
+
+static void keyboard_release(struct wl_client *c, struct wl_resource *r) {
+    (void)c; wl_resource_destroy(r);
+}
+static const struct wl_keyboard_interface keyboard_impl = {
+    .release = keyboard_release,
+};
+static void keyboard_resource_destroy(struct wl_resource *r) {
+    struct brook_seat_client *sc = seat_for_resource(r);
+    if (sc && sc->keyboard == r) sc->keyboard = NULL;
+}
+
+static int make_keymap_fd(size_t *out_size) {
+    /* Self-contained xkb_v1 keymap with no includes — keep tiny: just
+     * letters a-z, return, space, escape, modifier keys.  Real toolkits
+     * will compile this string with libxkbcommon. */
+    static const char keymap[] =
+        "xkb_keymap {\n"
+        "xkb_keycodes \"brook\" {\n"
+        " minimum = 8; maximum = 255;\n"
+        " <ESC> = 9; <SPCE> = 65; <RTRN> = 36;\n"
+        " <LFSH> = 50; <RTSH> = 62; <LCTL> = 37; <RCTL> = 105;\n"
+        " <LALT> = 64; <RALT> = 108; <CAPS> = 66;\n"
+        " <AC01> = 38; <AC02> = 39; <AC03> = 40; <AC04> = 41;\n"
+        " <AC05> = 42; <AC06> = 43; <AC07> = 44; <AC08> = 45;\n"
+        " <AC09> = 46; <AC10> = 47; <AC11> = 48;\n"
+        " <AB01> = 52; <AB02> = 53; <AB03> = 54; <AB04> = 55;\n"
+        " <AB05> = 56; <AB06> = 57; <AB07> = 58; <AB08> = 59;\n"
+        " <AB09> = 60; <AB10> = 61;\n"
+        " <AD01> = 24; <AD02> = 25; <AD03> = 26; <AD04> = 27;\n"
+        " <AD05> = 28; <AD06> = 29; <AD07> = 30; <AD08> = 31;\n"
+        " <AD09> = 32; <AD10> = 33;\n"
+        "};\n"
+        "xkb_types \"brook\" {\n"
+        " virtual_modifiers NumLock,Alt,LevelThree,LAlt,RAlt,RControl,LControl,ScrollLock,LevelFive,AltGr,Meta,Super,Hyper;\n"
+        " type \"ONE_LEVEL\" { modifiers = none; level_name[Level1] = \"Any\"; };\n"
+        " type \"TWO_LEVEL\" { modifiers = Shift; map[Shift] = Level2; level_name[Level1] = \"Base\"; level_name[Level2] = \"Shift\"; };\n"
+        "};\n"
+        "xkb_compatibility \"brook\" {\n"
+        " virtual_modifiers NumLock,Alt,LevelThree,LAlt,RAlt,RControl,LControl,ScrollLock,LevelFive,AltGr,Meta,Super,Hyper;\n"
+        " interpret Any+AnyOf(all) { action = SetMods(modifiers=modMapMods,clearLocks); };\n"
+        "};\n"
+        "xkb_symbols \"brook\" {\n"
+        " name[Group1] = \"Brook US\";\n"
+        " key <ESC>  { [Escape] };\n"
+        " key <SPCE> { [space] };\n"
+        " key <RTRN> { [Return] };\n"
+        " key <LFSH> { [Shift_L] }; key <RTSH> { [Shift_R] };\n"
+        " key <LCTL> { [Control_L] }; key <RCTL> { [Control_R] };\n"
+        " key <LALT> { [Alt_L] }; key <RALT> { [Alt_R] };\n"
+        " key <CAPS> { [Caps_Lock] };\n"
+        " key <AC01> { type=\"TWO_LEVEL\", [a, A] };\n"
+        " key <AC02> { type=\"TWO_LEVEL\", [s, S] };\n"
+        " key <AC03> { type=\"TWO_LEVEL\", [d, D] };\n"
+        " key <AC04> { type=\"TWO_LEVEL\", [f, F] };\n"
+        " key <AC05> { type=\"TWO_LEVEL\", [g, G] };\n"
+        " key <AC06> { type=\"TWO_LEVEL\", [h, H] };\n"
+        " key <AC07> { type=\"TWO_LEVEL\", [j, J] };\n"
+        " key <AC08> { type=\"TWO_LEVEL\", [k, K] };\n"
+        " key <AC09> { type=\"TWO_LEVEL\", [l, L] };\n"
+        " modifier_map Shift   { Shift_L, Shift_R };\n"
+        " modifier_map Control { Control_L, Control_R };\n"
+        " modifier_map Mod1    { Alt_L, Alt_R };\n"
+        " modifier_map Lock    { Caps_Lock };\n"
+        "};\n"
+        "};\n";
+    size_t len = sizeof(keymap); /* includes trailing NUL — clients expect it */
+    int fd = syscall(SYS_memfd_create, "brook-keymap", 0u);
+    if (fd < 0) return -1;
+    if (ftruncate(fd, (off_t)len) < 0) { close(fd); return -1; }
+    void *p = mmap(NULL, len, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED) { close(fd); return -1; }
+    memcpy(p, keymap, len);
+    munmap(p, len);
+    *out_size = len;
+    return fd;
+}
+
+static void seat_get_pointer(struct wl_client *c, struct wl_resource *r, uint32_t id) {
+    struct brook_seat_client *sc = seat_for_resource(r);
+    struct wl_resource *p = wl_resource_create(c, &wl_pointer_interface,
+                                                wl_resource_get_version(r), id);
+    if (!p) { wl_client_post_no_memory(c); return; }
+    wl_resource_set_implementation(p, &pointer_impl, sc, pointer_resource_destroy);
+    if (sc) sc->pointer = p;
+    fprintf(stderr, "[waylandd] wl_seat.get_pointer id=%u\n", id);
+}
+
+static void seat_get_keyboard(struct wl_client *c, struct wl_resource *r, uint32_t id) {
+    struct brook_seat_client *sc = seat_for_resource(r);
+    struct wl_resource *k = wl_resource_create(c, &wl_keyboard_interface,
+                                                wl_resource_get_version(r), id);
+    if (!k) { wl_client_post_no_memory(c); return; }
+    wl_resource_set_implementation(k, &keyboard_impl, sc, keyboard_resource_destroy);
+    if (sc) sc->keyboard = k;
+
+    size_t kmsize = 0;
+    int kfd = make_keymap_fd(&kmsize);
+    if (kfd >= 0) {
+        wl_keyboard_send_keymap(k, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1,
+                                kfd, (uint32_t)kmsize);
+        close(kfd);
+    } else {
+        /* Best effort: tell client we have no keymap. */
+        wl_keyboard_send_keymap(k, WL_KEYBOARD_KEYMAP_FORMAT_NO_KEYMAP, -1, 0);
+    }
+    if (wl_resource_get_version(k) >= 4)
+        wl_keyboard_send_repeat_info(k, 25, 600);
+    fprintf(stderr, "[waylandd] wl_seat.get_keyboard id=%u keymap_size=%zu\n", id, kmsize);
+}
+
+static void seat_get_touch(struct wl_client *c, struct wl_resource *r, uint32_t id) {
+    (void)r;
+    /* No touch — return a stub resource so the protocol doesn't error. */
+    struct wl_resource *t = wl_resource_create(c, &wl_touch_interface,
+                                                wl_resource_get_version(r), id);
+    if (!t) { wl_client_post_no_memory(c); return; }
+    wl_resource_set_implementation(t, NULL, NULL, NULL);
+}
+
+static void seat_release(struct wl_client *c, struct wl_resource *r) {
+    (void)c; wl_resource_destroy(r);
+}
+
+static const struct wl_seat_interface seat_impl = {
+    .get_pointer  = seat_get_pointer,
+    .get_keyboard = seat_get_keyboard,
+    .get_touch    = seat_get_touch,
+    .release      = seat_release,
+};
+
+static void seat_resource_destroy(struct wl_resource *r) {
+    struct brook_seat_client *sc = seat_for_resource(r);
+    if (sc && sc->seat == r) {
+        sc->seat = NULL;
+        if (!sc->pointer && !sc->keyboard) seat_remove_client(sc);
+    }
+}
+
+static void seat_bind(struct wl_client *client, void *data,
+                      uint32_t version, uint32_t id) {
+    (void)data;
+    struct wl_resource *r = wl_resource_create(client, &wl_seat_interface,
+                                                (int)version, id);
+    if (!r) { wl_client_post_no_memory(client); return; }
+    struct brook_seat_client *sc = calloc(1, sizeof(*sc));
+    if (!sc) { wl_resource_destroy(r); wl_client_post_no_memory(client); return; }
+    sc->seat = r;
+    sc->client = client;
+    sc->next = g_seat_clients;
+    g_seat_clients = sc;
+    wl_resource_set_implementation(r, &seat_impl, sc, seat_resource_destroy);
+    wl_seat_send_capabilities(r,
+        WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);
+    if (version >= 2)
+        wl_seat_send_name(r, "brook-seat");
+    fprintf(stderr, "[waylandd] wl_seat bind v=%u id=%u\n", version, id);
+}
+
+/* PS/2 scancode set 1 → XKB keycode (keycode = scancode + 8 in the
+ * traditional Linux/X11 mapping for set 1). Good enough for our tiny
+ * keymap which uses XKB <NAME> = scancode+8 conventions. */
+static uint32_t scancode_to_xkb(uint8_t sc) {
+    return (uint32_t)sc + 8u;
+}
+
+static void deliver_pointer_enter(struct brook_seat_client *sc,
+                                   struct brook_surface *s,
+                                   wl_fixed_t sx, wl_fixed_t sy) {
+    if (!sc->pointer || !s) return;
+    wl_pointer_send_enter(sc->pointer, next_serial(), s->resource, sx, sy);
+    if (wl_resource_get_version(sc->pointer) >= 5)
+        wl_pointer_send_frame(sc->pointer);
+    sc->entered_surface = s;
+}
+static void deliver_pointer_leave(struct brook_seat_client *sc) {
+    if (!sc->pointer || !sc->entered_surface) return;
+    wl_pointer_send_leave(sc->pointer, next_serial(),
+                          sc->entered_surface->resource);
+    if (wl_resource_get_version(sc->pointer) >= 5)
+        wl_pointer_send_frame(sc->pointer);
+    sc->entered_surface = NULL;
+}
+
+/* Drain the kernel's per-process input queue and translate to wl events. */
+static void pump_input_once(void) {
+    if (!g_active_surface) return;
+    uint8_t buf[16 * 32];
+    long n = syscall(BROOK_SYS_INPUT_POP, (long)buf, 32L);
+    if (n <= 0) return;
+    for (long i = 0; i < n; ++i) {
+        const uint8_t *e = buf + (i * BROOK_INPUT_REC_SIZE);
+        uint8_t  type = e[0];
+        uint8_t  sc   = e[1];
+        int32_t vx = *(const int32_t*)(e + 8);
+        int32_t vy = *(const int32_t*)(e + 12);
+        /* VFB → surface-local: subtract centre offset. */
+        int sx_i = vx - g_active_surface_vfb_x;
+        int sy_i = vy - g_active_surface_vfb_y;
+
+        for (struct brook_seat_client *bsc = g_seat_clients; bsc; bsc = bsc->next) {
+            switch (type) {
+            case 2: /* MouseMove */ {
+                if (!bsc->pointer) break;
+                int inside = (sx_i >= 0 && sy_i >= 0 &&
+                              sx_i < g_active_surface_w &&
+                              sy_i < g_active_surface_h);
+                wl_fixed_t fx = wl_fixed_from_int(sx_i);
+                wl_fixed_t fy = wl_fixed_from_int(sy_i);
+                if (inside && bsc->entered_surface != g_active_surface)
+                    deliver_pointer_enter(bsc, g_active_surface, fx, fy);
+                if (inside) {
+                    wl_pointer_send_motion(bsc->pointer, g_now_ms(), fx, fy);
+                    if (wl_resource_get_version(bsc->pointer) >= 5)
+                        wl_pointer_send_frame(bsc->pointer);
+                } else if (bsc->entered_surface) {
+                    deliver_pointer_leave(bsc);
+                }
+                break;
+            }
+            case 3: /* MouseButtonDown */
+            case 4: /* MouseButtonUp */ {
+                if (!bsc->pointer) break;
+                /* Button mapping: 0=L 1=R 2=M (Brook) → BTN_LEFT/RIGHT/MIDDLE. */
+                static const uint32_t btnmap[3] = { 0x110, 0x111, 0x112 };
+                if (sc > 2) break;
+                uint32_t btn = btnmap[sc];
+                uint32_t state = (type == 3)
+                    ? WL_POINTER_BUTTON_STATE_PRESSED
+                    : WL_POINTER_BUTTON_STATE_RELEASED;
+                if (bsc->entered_surface != g_active_surface) {
+                    /* fire enter at current pos so client can correlate */
+                    deliver_pointer_enter(bsc, g_active_surface,
+                                          wl_fixed_from_int(sx_i),
+                                          wl_fixed_from_int(sy_i));
+                }
+                wl_pointer_send_button(bsc->pointer, next_serial(),
+                                       g_now_ms(), btn, state);
+                if (wl_resource_get_version(bsc->pointer) >= 5)
+                    wl_pointer_send_frame(bsc->pointer);
+                fprintf(stderr, "[waylandd] pointer button=%u state=%u\n", btn, state);
+                break;
+            }
+            case 0: /* KeyPress */
+            case 1: /* KeyRelease */ {
+                if (!bsc->keyboard) break;
+                if (bsc->entered_surface != g_active_surface) {
+                    /* Send keyboard.enter once so clients accept keys. */
+                    struct wl_array keys; wl_array_init(&keys);
+                    wl_keyboard_send_enter(bsc->keyboard, next_serial(),
+                                           g_active_surface->resource, &keys);
+                    wl_array_release(&keys);
+                }
+                uint32_t key = scancode_to_xkb(sc);
+                uint32_t state = (type == 0)
+                    ? WL_KEYBOARD_KEY_STATE_PRESSED
+                    : WL_KEYBOARD_KEY_STATE_RELEASED;
+                wl_keyboard_send_key(bsc->keyboard, next_serial(),
+                                     g_now_ms(), key - 8u /* evdev keycode */,
+                                     state);
+                break;
+            }
+            default: break;
+            }
+        }
+        (void)vx; (void)vy;
+        g_last_ptr_x = vx; g_last_ptr_y = vy;
+    }
+}
+
+
 
 int main(int argc, char **argv)
 {
@@ -689,6 +1041,14 @@ int main(int argc, char **argv)
     }
     fprintf(stderr, "[waylandd] xdg_wm_base global advertised (v3)\n");
 
+    struct wl_global *seat = wl_global_create(g_display, &wl_seat_interface,
+                                               5, NULL, seat_bind);
+    if (!seat) {
+        fprintf(stderr, "[waylandd] FAIL: wl_global_create(wl_seat)\n");
+        return 1;
+    }
+    fprintf(stderr, "[waylandd] wl_seat global advertised (v5)\n");
+
     signal(SIGINT,  on_sigint);
     signal(SIGTERM, on_sigint);
 
@@ -700,12 +1060,19 @@ int main(int argc, char **argv)
 
     for (int i = 0; i < run_seconds && !g_shutdown; ++i) {
         wl_display_flush_clients(g_display);
-        int n = wl_event_loop_dispatch(loop, 1000);
-        if (n < 0) {
-            fprintf(stderr, "[waylandd] event loop error: %s\n", strerror(errno));
-            break;
+        /* Poll input every 16ms (~60Hz) by using a short dispatch timeout
+         * and pumping in between.  This keeps pointer cadence smooth. */
+        for (int sub = 0; sub < 60 && !g_shutdown; ++sub) {
+            pump_input_once();
+            int n = wl_event_loop_dispatch(loop, 16);
+            if (n < 0) {
+                fprintf(stderr, "[waylandd] event loop error: %s\n", strerror(errno));
+                goto done;
+            }
+            wl_display_flush_clients(g_display);
         }
     }
+done:
 
     fprintf(stderr, "[waylandd] shutting down (commits=%d)\n", g_commit_count);
     wl_display_destroy(g_display);
