@@ -225,6 +225,7 @@ void SchedulerInit()
     // Create idle process for BSP (CPU 0).
     auto* idle = static_cast<Process*>(kmalloc(sizeof(Process)));
     __builtin_memset(idle, 0, sizeof(Process));
+    idle->magic = PROCESS_MAGIC;
     // Safe FPU/SSE defaults for fxrstor
     idle->fxsave.data[0] = 0x7F; idle->fxsave.data[1] = 0x03;   // FCW = 0x037F
     idle->fxsave.data[24] = 0x80; idle->fxsave.data[25] = 0x1F; // MXCSR = 0x1F80
@@ -1167,6 +1168,7 @@ void SchedulerInitApIdle(uint32_t cpuIndex)
 {
     auto* idle = static_cast<Process*>(kmalloc(sizeof(Process)));
     __builtin_memset(idle, 0, sizeof(Process));
+    idle->magic = PROCESS_MAGIC;
     // Safe FPU/SSE defaults for fxrstor
     idle->fxsave.data[0] = 0x7F; idle->fxsave.data[1] = 0x03;   // FCW = 0x037F
     idle->fxsave.data[24] = 0x80; idle->fxsave.data[25] = 0x1F; // MXCSR = 0x1F80
