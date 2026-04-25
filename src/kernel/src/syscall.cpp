@@ -2563,6 +2563,93 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
+// sys_mremap (25) -- resize an existing mapping.  Minimal implementation:
+//   - shrink: unmap the tail pages in place, return old_addr
+//   - same:   return old_addr
+//   - grow:   if MREMAP_MAYMOVE, allocate a new region, copy the old contents
+//             page-by-page, unmap the old range, return new address.  Otherwise
+//             return -ENOMEM (we don't try to extend in place — the next pages
+//             are usually already taken by mmapNext bumping).
+// Flags values from <sys/mman.h>: MREMAP_MAYMOVE=1, MREMAP_FIXED=2.
+// We don't honour MREMAP_FIXED; if userspace passes new_addr we ignore it.
+// ---------------------------------------------------------------------------
+
+static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size,
+                           uint64_t flags, uint64_t /*new_addr*/, uint64_t)
+{
+    constexpr uint64_t MREMAP_MAYMOVE = 1;
+
+    if (old_addr & 0xFFF) return -EINVAL;
+    if (old_size == 0 || new_size == 0) return -EINVAL;
+
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+
+    uint64_t oldPages = (old_size + 4095) / 4096;
+    uint64_t newPages = (new_size + 4095) / 4096;
+
+    if (newPages == oldPages) return static_cast<int64_t>(old_addr);
+
+    // Shrink: unmap the tail.
+    if (newPages < oldPages)
+    {
+        for (uint64_t i = newPages; i < oldPages; ++i)
+        {
+            VirtualAddress va(old_addr + i * 4096);
+            PhysicalAddress phys = VmmVirtToPhys(proc->pageTable, va);
+            if (phys)
+            {
+                VmmUnmapPage(proc->pageTable, va);
+                PmmFreePage(phys);
+            }
+        }
+        return static_cast<int64_t>(old_addr);
+    }
+
+    // Grow.  Refuse if caller can't tolerate the move.
+    if (!(flags & MREMAP_MAYMOVE)) return -ENOMEM;
+
+    // Allocate a fresh anonymous region of newPages.  We reuse sys_mmap to
+    // avoid duplicating the address-picking + page-allocation logic.
+    int64_t mmRet = sys_mmap(0, newPages * 4096,
+                             3 /*PROT_READ|PROT_WRITE*/,
+                             0x22 /*MAP_PRIVATE|MAP_ANONYMOUS*/,
+                             static_cast<uint64_t>(-1), 0);
+    if (mmRet < 0) return mmRet;
+    uint64_t newAddr = static_cast<uint64_t>(mmRet);
+
+    // Copy old contents into the new region.
+    for (uint64_t i = 0; i < oldPages; ++i)
+    {
+        VirtualAddress src(old_addr + i * 4096);
+        VirtualAddress dst(newAddr + i * 4096);
+        PhysicalAddress sp = VmmVirtToPhys(proc->pageTable, src);
+        PhysicalAddress dp = VmmVirtToPhys(proc->pageTable, dst);
+        if (!sp || !dp) continue;
+        // Both pages are mapped in the current page table (current process).
+        // We can copy directly via the user virtual addresses.
+        __builtin_memcpy(reinterpret_cast<void*>(newAddr + i * 4096),
+                         reinterpret_cast<void*>(old_addr + i * 4096), 4096);
+    }
+
+    // Unmap the old range and free its pages.
+    for (uint64_t i = 0; i < oldPages; ++i)
+    {
+        VirtualAddress va(old_addr + i * 4096);
+        PhysicalAddress phys = VmmVirtToPhys(proc->pageTable, va);
+        if (phys)
+        {
+            VmmUnmapPage(proc->pageTable, va);
+            PmmFreePage(phys);
+        }
+    }
+
+    DbgPrintf("sys_mremap: 0x%lx (%lu) -> 0x%lx (%lu)\n",
+              old_addr, oldPages, newAddr, newPages);
+    return static_cast<int64_t>(newAddr);
+}
+
+// ---------------------------------------------------------------------------
 // sys_arch_prctl (158) -- TLS setup
 // ---------------------------------------------------------------------------
 
@@ -8405,6 +8492,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_MMAP]            = sys_mmap;
     g_syscallTable[SYS_MPROTECT]        = sys_mprotect;
     g_syscallTable[SYS_MUNMAP]          = sys_munmap;
+    g_syscallTable[SYS_MREMAP]          = sys_mremap;
     g_syscallTable[SYS_BRK]             = sys_brk;
     g_syscallTable[SYS_RT_SIGACTION]    = sys_rt_sigaction;
     g_syscallTable[SYS_RT_SIGPROCMASK]  = sys_rt_sigprocmask;
@@ -8606,6 +8694,7 @@ static const char* SyscallName(uint64_t num)
     case 19: return "readv";      case 20: return "writev";
     case 21: return "access";     case 22: return "pipe";
     case 23: return "select";     case 24: return "sched_yield";
+    case 25: return "mremap";
     case 32: return "dup";        case 33: return "dup2";
     case 35: return "nanosleep";  case 39: return "getpid";
     case 40: return "sendfile";   case 41: return "socket";

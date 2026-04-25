@@ -24,6 +24,13 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <errno.h>
+#include <time.h>
+
+static uint32_t g_now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint32_t)((uint64_t)ts.tv_sec * 1000ull + (uint32_t)(ts.tv_nsec / 1000000));
+}
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -119,6 +126,13 @@ struct brook_surface {
     int  xdg_initial_commit_done;      /* did we send the first configure? */
     int  xdg_acked;                    /* did client ack a configure? */
     uint32_t next_configure_serial;
+
+    /* Pending frame callbacks queued by wl_surface.frame() since the
+     * last commit. Fired with a millisecond timestamp at commit time so
+     * the client redraws on a real cadence. Kept as a tiny ring; weston
+     * demos only ever queue one. */
+    struct wl_resource *pending_frame_cbs[8];
+    int pending_frame_cb_count;
 };
 
 static void surface_destroy(struct wl_client *c, struct wl_resource *r) {
@@ -135,14 +149,18 @@ static void surface_damage(struct wl_client *c, struct wl_resource *r,
     (void)c; (void)r; (void)x; (void)y; (void)w; (void)h;
 }
 static void surface_frame(struct wl_client *c, struct wl_resource *r, uint32_t cb) {
-    /* Create and immediately fire the callback — static client gets one
-     * ack per commit, done at commit time from our side. */
+    /* Queue the callback; we'll fire it at commit time with a real
+     * timestamp so the client redraws on a steady cadence. */
+    struct brook_surface *s = wl_resource_get_user_data(r);
     struct wl_resource *cb_r = wl_resource_create(c, &wl_callback_interface, 1, cb);
-    if (cb_r) {
-        wl_callback_send_done(cb_r, 0);
+    if (!cb_r) return;
+    if (s->pending_frame_cb_count < (int)(sizeof(s->pending_frame_cbs)/sizeof(s->pending_frame_cbs[0]))) {
+        s->pending_frame_cbs[s->pending_frame_cb_count++] = cb_r;
+    } else {
+        /* Overflow: just fire it now to avoid leaking. */
+        wl_callback_send_done(cb_r, g_now_ms());
         wl_resource_destroy(cb_r);
     }
-    (void)r;
 }
 static void surface_set_opaque_region(struct wl_client *c, struct wl_resource *r,
                                        struct wl_resource *reg) {
@@ -221,6 +239,18 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
     /* Release the buffer so the client can reuse it. */
     wl_buffer_send_release(s->pending_buffer);
     s->pending_buffer = NULL;
+
+    /* Fire any frame callbacks queued via wl_surface.frame() — tells the
+     * client this commit has been "presented" and it's a good time to
+     * draw the next frame. Without this, animated demos (weston-flower)
+     * stall after the first commit. */
+    uint32_t now = g_now_ms();
+    for (int i = 0; i < s->pending_frame_cb_count; i++) {
+        wl_callback_send_done(s->pending_frame_cbs[i], now);
+        wl_resource_destroy(s->pending_frame_cbs[i]);
+        s->pending_frame_cbs[i] = NULL;
+    }
+    s->pending_frame_cb_count = 0;
 }
 static void surface_set_buffer_transform(struct wl_client *c, struct wl_resource *r, int32_t t) {
     (void)c; (void)r; (void)t;
@@ -273,13 +303,34 @@ static void compositor_create_surface(struct wl_client *client,
     fprintf(stderr, "[waylandd] wl_surface created id=%u\n", id); fflush(stderr);
 }
 
+static void region_destroy(struct wl_client *c, struct wl_resource *r) {
+    (void)c; wl_resource_destroy(r);
+}
+static void region_add(struct wl_client *c, struct wl_resource *r,
+                       int32_t x, int32_t y, int32_t w, int32_t h) {
+    (void)c; (void)r; (void)x; (void)y; (void)w; (void)h;
+}
+static void region_subtract(struct wl_client *c, struct wl_resource *r,
+                            int32_t x, int32_t y, int32_t w, int32_t h) {
+    (void)c; (void)r; (void)x; (void)y; (void)w; (void)h;
+}
+static const struct wl_region_interface region_impl = {
+    .destroy  = region_destroy,
+    .add      = region_add,
+    .subtract = region_subtract,
+};
+
 static void compositor_create_region(struct wl_client *client,
                                      struct wl_resource *res,
                                      uint32_t id)
 {
-    (void)client; (void)res; (void)id;
-    /* Regions are only used by set_opaque_region / set_input_region, which
-     * we ignore; no need to back this with real state for first pixels. */
+    /* Regions are stubbed (we ignore opaque/input regions) but we MUST
+     * register the resource so subsequent set_opaque_region(id) doesn't
+     * fail with "unknown object". */
+    struct wl_resource *rr = wl_resource_create(client, &wl_region_interface,
+                                                 wl_resource_get_version(res), id);
+    if (!rr) { wl_client_post_no_memory(client); return; }
+    wl_resource_set_implementation(rr, &region_impl, NULL, NULL);
 }
 
 static const struct wl_compositor_interface compositor_impl = {
