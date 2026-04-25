@@ -40,7 +40,7 @@ sync_file() {
     local src="$1"
     local dest="$2"
     if [ -f "$src" ]; then
-        mcopy -o -i "${DISK_IMG}" "$src" "::${dest}"
+        mcopy_safe -o -i "${DISK_IMG}" "$src" "::${dest}"
         echo "  synced: ${dest} ($(stat -c%s "$src") bytes)"
     fi
 }
@@ -61,12 +61,67 @@ sync_dir_contents() {
         [ -f "$f" ] || continue
         local name
         name="$(basename "$f" | tr '[:lower:]' '[:upper:]')"
-        mcopy -o -i "${DISK_IMG}" "$f" "::${dest_dir}/${name}"
+        mcopy_safe -o -i "${DISK_IMG}" "$f" "::${dest_dir}/${name}"
         echo "  synced: ${dest_dir}/${name} ($(stat -c%s "$f") bytes)"
     done
 }
 
 echo "Updating disk image: ${DISK_IMG}"
+
+# --- Concurrency guard: serialize update_disk runs against this image ---
+# Without this, two concurrent invocations (or one that was killed mid-run
+# leaving stale fcntl state) can corrupt the FAT, after which subsequent
+# mcopy invocations spin forever traversing a broken cluster chain.
+LOCKFILE="${DISK_IMG}.lock"
+exec 9>"${LOCKFILE}"
+if ! flock -n 9; then
+    echo "Another update_disk.sh is running for ${DISK_IMG} (lock held)."
+    echo "Wait for it to finish, or remove ${LOCKFILE} if stale."
+    exit 1
+fi
+
+# --- Filesystem health precheck ---
+# Catch corruption early, before we kick off ~50 mcopy invocations that
+# would otherwise loop forever on a broken FAT.  fsck.fat -a auto-repairs
+# trivial issues (orphan clusters, dirty bit) which mcopy's own writes
+# leave behind when it's interrupted; only hard corruption fails the run.
+if command -v fsck.fat >/dev/null 2>&1; then
+    fsck.fat -a "${DISK_IMG}" >/tmp/brook_fsck.$$ 2>&1
+    fsck_rc=$?
+    # fsck.fat exit codes: 0=clean, 1=errors corrected, 2=errors not corrected
+    if [ $fsck_rc -ge 2 ]; then
+        echo "FAT filesystem corrupted in ${DISK_IMG} (unfixable):"
+        sed 's/^/  /' /tmp/brook_fsck.$$
+        rm -f /tmp/brook_fsck.$$
+        echo ""
+        echo "To recover:"
+        echo "  rm ${DISK_IMG}"
+        echo "  scripts/create_disk.sh"
+        echo "  scripts/update_disk.sh"
+        exit 1
+    fi
+    if [ $fsck_rc -eq 1 ]; then
+        echo "  fsck.fat: auto-repaired residual issues from a prior killed run"
+    fi
+    rm -f /tmp/brook_fsck.$$
+fi
+
+# --- Per-mcopy timeout wrapper ---
+# A pathological FAT can make a single mcopy spin forever consuming
+# unbounded memory (we've observed runaway parents with 30+ stuck mcopy
+# children).  Hard-cap each invocation; if any single file takes > 30s
+# something is wrong.
+mcopy_safe() {
+    timeout --signal=KILL 30 mcopy "$@"
+    local rc=$?
+    if [ $rc -eq 137 ] || [ $rc -eq 124 ]; then
+        echo "ERROR: mcopy timed out (>30s) — disk image likely corrupt." >&2
+        echo "  Args: $*" >&2
+        echo "  Recover with: rm ${DISK_IMG} && scripts/create_disk.sh && scripts/update_disk.sh" >&2
+        exit 1
+    fi
+    return $rc
+}
 
 # --- Driver modules (from most recent build) ---
 # Check release first, then debug
@@ -165,7 +220,7 @@ if [ -f "$busybox_static" ]; then
     mmd -D s -i "${DISK_IMG}" "::BIN" 2>/dev/null || true
     # Delete any existing uppercase BUSYBOX to avoid conflicts
     mdel -i "${DISK_IMG}" "::BIN/BUSYBOX" 2>/dev/null || true
-    mcopy -o -i "${DISK_IMG}" "$busybox_static" "::BIN/busybox"
+    mcopy_safe -o -i "${DISK_IMG}" "$busybox_static" "::BIN/busybox"
     echo "  synced: BIN/busybox ($(stat -c%s "$busybox_static") bytes)"
 fi
 
@@ -177,7 +232,7 @@ if [ -d "$dynlibs_dir" ] && ls "$dynlibs_dir"/*.so* &>/dev/null 2>&1; then
     for f in "$dynlibs_dir"/*.so*; do
         [ -f "$f" ] || continue
         local_name="$(basename "$f")"
-        mcopy -o -i "${DISK_IMG}" "$f" "::LIB/${local_name}"
+        mcopy_safe -o -i "${DISK_IMG}" "$f" "::LIB/${local_name}"
         echo "  synced: LIB/${local_name} ($(stat -c%s "$f") bytes)"
     done
 fi
@@ -195,7 +250,7 @@ tcc_sysroot="${ROOT_DIR}/tcc_sysroot"
 if [ -d "$tcc_sysroot" ] && [ -f "$tcc_sysroot/tcc" ]; then
     echo "TCC compiler:"
     mmd -D s -i "${DISK_IMG}" "::BIN" 2>/dev/null || true
-    mcopy -o -i "${DISK_IMG}" "$tcc_sysroot/tcc" "::BIN/tcc"
+    mcopy_safe -o -i "${DISK_IMG}" "$tcc_sysroot/tcc" "::BIN/tcc"
     echo "  synced: BIN/tcc ($(stat -c%s "$tcc_sysroot/tcc") bytes)"
 
     # TCC library dir (libtcc1.a + tcc includes)
@@ -203,11 +258,11 @@ if [ -d "$tcc_sysroot" ] && [ -f "$tcc_sysroot/tcc" ]; then
     mmd -D s -i "${DISK_IMG}" "::TCC/lib" 2>/dev/null || true
     mmd -D s -i "${DISK_IMG}" "::TCC/lib/tcc" 2>/dev/null || true
     mmd -D s -i "${DISK_IMG}" "::TCC/lib/tcc/include" 2>/dev/null || true
-    mcopy -o -i "${DISK_IMG}" "$tcc_sysroot/lib/tcc/libtcc1.a" "::TCC/lib/tcc/libtcc1.a"
+    mcopy_safe -o -i "${DISK_IMG}" "$tcc_sysroot/lib/tcc/libtcc1.a" "::TCC/lib/tcc/libtcc1.a"
     echo "  synced: TCC/lib/tcc/libtcc1.a"
     for f in "$tcc_sysroot"/lib/tcc/include/*.h; do
         [ -f "$f" ] || continue
-        mcopy -o -i "${DISK_IMG}" "$f" "::TCC/lib/tcc/include/$(basename "$f")"
+        mcopy_safe -o -i "${DISK_IMG}" "$f" "::TCC/lib/tcc/include/$(basename "$f")"
     done
     echo "  synced: TCC/lib/tcc/include/*.h"
 
@@ -216,7 +271,7 @@ if [ -d "$tcc_sysroot" ] && [ -f "$tcc_sysroot/tcc" ]; then
     # Top-level headers
     for f in "$tcc_sysroot"/include/*.h; do
         [ -f "$f" ] || continue
-        mcopy -o -i "${DISK_IMG}" "$f" "::TCC/include/$(basename "$f")"
+        mcopy_safe -o -i "${DISK_IMG}" "$f" "::TCC/include/$(basename "$f")"
     done
     # Subdirectories (sys/, bits/, arpa/, net/, netinet/, etc.)
     for subdir in "$tcc_sysroot"/include/*/; do
@@ -225,7 +280,7 @@ if [ -d "$tcc_sysroot" ] && [ -f "$tcc_sysroot/tcc" ]; then
         mmd -D s -i "${DISK_IMG}" "::TCC/include/${dname}" 2>/dev/null || true
         for f in "$subdir"*; do
             [ -f "$f" ] || continue
-            mcopy -o -i "${DISK_IMG}" "$f" "::TCC/include/${dname}/$(basename "$f")"
+            mcopy_safe -o -i "${DISK_IMG}" "$f" "::TCC/include/${dname}/$(basename "$f")"
         done
     done
     echo "  synced: TCC/include/ (musl headers)"
@@ -233,7 +288,7 @@ if [ -d "$tcc_sysroot" ] && [ -f "$tcc_sysroot/tcc" ]; then
     # Musl CRT and libc.a
     for f in crt1.o crti.o crtn.o libc.a; do
         if [ -f "$tcc_sysroot/lib/$f" ]; then
-            mcopy -o -i "${DISK_IMG}" "$tcc_sysroot/lib/$f" "::TCC/lib/$f"
+            mcopy_safe -o -i "${DISK_IMG}" "$tcc_sysroot/lib/$f" "::TCC/lib/$f"
             echo "  synced: TCC/lib/$f"
         fi
     done
@@ -245,12 +300,12 @@ if [ -d "$tcc_test_dir" ]; then
     mmd -D s -i "${DISK_IMG}" "::SRC" 2>/dev/null || true
     for f in "$tcc_test_dir"/*.c "$tcc_test_dir"/*.sh "$tcc_test_dir"/cc; do
         [ -f "$f" ] || continue
-        mcopy -o -i "${DISK_IMG}" "$f" "::SRC/$(basename "$f")"
+        mcopy_safe -o -i "${DISK_IMG}" "$f" "::SRC/$(basename "$f")"
         echo "  synced: SRC/$(basename "$f")"
     done
     # Also put cc wrapper in BIN/ for easy access
     if [ -f "$tcc_test_dir/cc" ]; then
-        mcopy -o -i "${DISK_IMG}" "$tcc_test_dir/cc" "::BIN/cc"
+        mcopy_safe -o -i "${DISK_IMG}" "$tcc_test_dir/cc" "::BIN/cc"
         echo "  synced: BIN/cc"
     fi
 fi
@@ -268,7 +323,7 @@ if [ -d "$data_scripts" ]; then
     for f in "$data_scripts"/*.lua "$data_scripts"/*.rc; do
         [ -f "$f" ] || continue
         dname="$(basename "$f" | tr '[:lower:]' '[:upper:]')"
-        mcopy -o -i "${DISK_IMG}" "$f" "::${dname}"
+        mcopy_safe -o -i "${DISK_IMG}" "$f" "::${dname}"
         echo "  synced data: ${dname}"
     done
 fi
@@ -280,7 +335,7 @@ if [ -d "$shortcuts_dir" ]; then
     for f in "$shortcuts_dir"/*.rc; do
         [ -f "$f" ] || continue
         dname="$(basename "$f" | tr '[:lower:]' '[:upper:]')"
-        mcopy -o -i "${DISK_IMG}" "$f" "::SHORTCUTS/${dname}"
+        mcopy_safe -o -i "${DISK_IMG}" "$f" "::SHORTCUTS/${dname}"
         echo "  synced shortcut: SHORTCUTS/${dname}"
     done
 fi
@@ -301,7 +356,7 @@ if [ -d "$user_content_dir" ] && ls "$user_content_dir"/* &>/dev/null 2>&1; then
         [ -f "$f" ] || continue
         local_name="$(basename "$f")"
         # FAT filenames: truncate to 8.3 or use VFAT long names (mcopy handles this)
-        mcopy -o -i "${DISK_IMG}" "$f" "::MUSIC/${local_name}"
+        mcopy_safe -o -i "${DISK_IMG}" "$f" "::MUSIC/${local_name}"
         echo "  synced: MUSIC/${local_name} ($(stat -c%s "$f") bytes)"
     done
 fi
