@@ -168,8 +168,8 @@ static uint64_t SetupUserStack(Process* proc,
     uint64_t randomAddr = pushU64(randSeed);
 
     // 2. Push environment strings and record pointers
-    uint64_t envAddrs[16] = {};
-    for (int i = 0; i < envc && i < 16; ++i)
+    uint64_t envAddrs[32] = {};
+    for (int i = 0; i < envc && i < 32; ++i)
     {
         uint64_t len = 0;
         while (envp[i][len]) ++len;
@@ -177,8 +177,8 @@ static uint64_t SetupUserStack(Process* proc,
     }
 
     // 3. Push argument strings and record pointers
-    uint64_t argAddrs[16] = {};
-    for (int i = 0; i < argc && i < 16; ++i)
+    uint64_t argAddrs[32] = {};
+    for (int i = 0; i < argc && i < 32; ++i)
     {
         uint64_t len = 0;
         while (argv[i][len]) ++len;

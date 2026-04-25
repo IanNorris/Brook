@@ -93,6 +93,9 @@ static const char* g_defaultEnvp[] = {
     "XCURSOR_PATH=/nix/store/aaipci08wnfa7d64lmd5vyn9l2bkihg5-brook-cursor-theme-0.1/share/icons",
     "XCURSOR_THEME=default",
     "XCURSOR_SIZE=24",
+    "FONTCONFIG_FILE=/nix/store/vb4pfax5bzq9hxi2jb8s40axvv7hz5ls-brook-fonts-0.1/etc/fonts/fonts.conf",
+    "FONTCONFIG_PATH=/nix/store/vb4pfax5bzq9hxi2jb8s40axvv7hz5ls-brook-fonts-0.1/etc/fonts",
+    "WESTON_DATA_DIR=/nix/store/ls7lby8cwwvbdrwvlswjgxky7lrwjy97-brook-weston-data-0.1/share/weston",
     nullptr
 };
 
