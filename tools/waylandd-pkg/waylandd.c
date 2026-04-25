@@ -61,6 +61,7 @@ static uint32_t *g_vfb       = NULL;
 static uint32_t  g_vfb_w     = 0;
 static uint32_t  g_vfb_h     = 0;
 static uint32_t  g_vfb_bytes = 0;
+static int       g_vfb_fd    = -1;
 
 static int open_vfb(void)
 {
@@ -86,8 +87,14 @@ static int open_vfb(void)
         return -1;
     }
     g_vfb = (uint32_t*)p;
-    /* fd can be closed now — kernel retains the mapping. */
-    close(fd);
+    /* Keep fd open: kernel sets proc->fbDirty + CompositorWake() on every
+     * write() to /dev/fb0 (syscall.cpp DevFramebuf branch).  Stores via
+     * the mmap alone do NOT set fbDirty, which is why animated demos
+     * looked stuck at the compositor's 500ms force-blit cadence rather
+     * than running at the wl_surface frame-callback rate.  We do a 1-byte
+     * write after every commit (vfb_signal_dirty()) to drive the
+     * compositor at client commit rate. */
+    g_vfb_fd = fd;
 
     /* Paint a distinct background so it's obvious what's ours vs empty. */
     uint32_t bg = 0xff101830; /* deep navy */
@@ -96,6 +103,18 @@ static int open_vfb(void)
     fprintf(stderr, "[waylandd] vfb %ux%u mapped at %p (%u bytes)\n",
             g_vfb_w, g_vfb_h, (void*)g_vfb, g_vfb_bytes);
     return 0;
+}
+
+/* Tell the kernel a fresh frame is ready: a 1-byte write to /dev/fb0 sets
+ * proc->fbDirty and wakes the compositor (see kernel syscall.cpp).  The
+ * byte itself is discarded (DevFramebuf write returns count without
+ * touching memory).  Without this, mmap stores from blit_into_vfb only
+ * become visible at the compositor's 500ms force-blit cadence. */
+static void vfb_signal_dirty(void)
+{
+    if (g_vfb_fd < 0) return;
+    char zero = 0;
+    (void)write(g_vfb_fd, &zero, 1);
 }
 
 static void blit_into_vfb(const uint8_t *src, int sw, int sh, int sstride)
@@ -236,6 +255,7 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
         int may_blit = (!s->xdg_toplevel) || s->xdg_acked;
         if (may_blit) {
             blit_into_vfb(px, w, h, stride);
+            vfb_signal_dirty();
             /* Track this as the focusable surface for input dispatch. */
             g_active_surface = s;
             g_active_surface_w = w;
