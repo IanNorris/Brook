@@ -17,7 +17,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
 # Parse size (first numeric arg) and packages
-SIZE_MB=256
+SIZE_MB=384
 PACKAGES=()
 for arg in "$@"; do
     if [[ "$arg" =~ ^[0-9]+$ ]]; then
@@ -45,6 +45,7 @@ if [ ${#PACKAGES[@]} -eq 0 ]; then
         "${ROOT_DIR}/tools/wayland-shm-smoke-pkg"  # Wayland shm round-trip smoke test
         "${ROOT_DIR}/tools/wayland-xdg-smoke-pkg"  # Wayland xdg-shell smoke test
         "${ROOT_DIR}/tools/wayland-calc-pkg"  # Brook-native xdg-shell calculator demo
+        "${ROOT_DIR}/tools/weston-flower-pkg"  # weston-flower demo bundle (RPATH-locked)
     )
 fi
 
@@ -91,8 +92,24 @@ for pkg in "${PACKAGES[@]}"; do
     ALL_PATHS+=("$PKG_PATH")
 done
 
-# Get full transitive closure (deduplicated)
-CLOSURE=$(nix-store -qR "${ALL_PATHS[@]}" | sort -u)
+# Get full transitive closure (deduplicated), but treat "-bundle"
+# derivations as self-contained: include only the bundle path itself,
+# not its references. (RPATH-locked bundles copy everything into $out.)
+BUNDLE_PATHS=()
+NORMAL_PATHS=()
+for p in "${ALL_PATHS[@]}"; do
+    if [[ "$(basename "$p")" == *-bundle ]]; then
+        BUNDLE_PATHS+=("$p")
+    else
+        NORMAL_PATHS+=("$p")
+    fi
+done
+if [ ${#NORMAL_PATHS[@]} -gt 0 ]; then
+    NORMAL_CLOSURE=$(nix-store -qR "${NORMAL_PATHS[@]}" | sort -u)
+else
+    NORMAL_CLOSURE=""
+fi
+CLOSURE=$(printf '%s\n' $NORMAL_CLOSURE "${BUNDLE_PATHS[@]}" | sort -u)
 echo "  Closure ($(echo "$CLOSURE" | wc -l) paths):"
 for p in ${CLOSURE}; do
     SIZE=$(du -sh "$p" | cut -f1)

@@ -1,5 +1,5 @@
 # Brook running stock weston-flower (Linux-native binary, unmodified).
 # Bundle is just weston-flower + its required .so libs from upstream weston/cairo/pango/...
 # The binary's RPATH points only into the bundle's lib/.
-run /nix/store/9n2x8fdalcpc012ca2jbdf37y8skd3wq-waylandd-brook-0.1-brook/bin/waylandd --seconds 30
-run /nix/store/3i4wxsqgyqk69380ica1cvlbizdk1fc4-weston-flower-bundle-15.0.0-bundle/bin/weston-flower
+run /nix/store/3qnaiyl4kij64jqw5jr1d51yrlzmrhjl-waylandd-brook-0.1-brook/bin/waylandd
+run /nix/store/9lpb4j6syssckpmrcfs9r1awwf3dcyq4-weston-flower-bundle-15.0.0-bundle/bin/weston-flower

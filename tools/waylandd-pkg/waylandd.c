@@ -959,13 +959,19 @@ static void pump_input_once(void) {
 
 int main(int argc, char **argv)
 {
-    int run_seconds = 10;
+    /* run_seconds == 0 means "run indefinitely" (the normal desktop case).
+     * A positive value runs for roughly that many seconds, intended for
+     * smoke tests and CI runs that need a hard exit. */
+    int run_seconds = 0;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--seconds") == 0 && i + 1 < argc)
             run_seconds = atoi(argv[++i]);
     }
 
-    fprintf(stderr, "[waylandd] starting (first-light, %ds)\n", run_seconds);
+    if (run_seconds > 0)
+        fprintf(stderr, "[waylandd] starting (first-light, %ds)\n", run_seconds);
+    else
+        fprintf(stderr, "[waylandd] starting (persistent, no time limit)\n");
 
     /* Best-effort: map our VFB so we can actually show committed buffers. */
     (void)open_vfb();
@@ -1058,7 +1064,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    for (int i = 0; i < run_seconds && !g_shutdown; ++i) {
+    for (;;) {
+        if (g_shutdown) break;
         wl_display_flush_clients(g_display);
         /* Poll input every 16ms (~60Hz) by using a short dispatch timeout
          * and pumping in between.  This keeps pointer cadence smooth. */
@@ -1071,6 +1078,8 @@ int main(int argc, char **argv)
             }
             wl_display_flush_clients(g_display);
         }
+        if (run_seconds > 0 && --run_seconds == 0)
+            break;
     }
 done:
 
