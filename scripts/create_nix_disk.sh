@@ -44,6 +44,7 @@ if [ ${#PACKAGES[@]} -eq 0 ]; then
         "${ROOT_DIR}/tools/wayland-smoke-pkg"  # Wayland client smoke test
         "${ROOT_DIR}/tools/wayland-shm-smoke-pkg"  # Wayland shm round-trip smoke test
         "${ROOT_DIR}/tools/wayland-xdg-smoke-pkg"  # Wayland xdg-shell smoke test
+        "${ROOT_DIR}/tools/wayland-calc-pkg"  # Brook-native xdg-shell calculator demo
     )
 fi
 
