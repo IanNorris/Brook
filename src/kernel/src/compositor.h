@@ -63,4 +63,15 @@ extern "C" void CompositorRemap(uint64_t fbPhys, uint32_t w, uint32_t h,
 // Pixel format is XRGB (0x00RRGGBB), row-major, w pixels per row.
 void CompositorSetWallpaper(uint32_t* pixels, uint32_t w, uint32_t h);
 
+// Input "grabber" — a userspace display server (e.g. waylandd) registers
+// itself as the global input sink so it sees every keyboard/mouse event,
+// regardless of which window the kernel WM thinks owns the click.  This
+// is what lets a Wayland compositor route input to its own clients via
+// wl_pointer / wl_keyboard.  enable=1 sets ProcessCurrent() as grabber;
+// enable=0 clears it (only succeeds if caller is the current grabber).
+// Returns true on success.
+bool CompositorSetInputGrabber(Process* proc, bool enable);
+// Cleared automatically when the grabber process exits.
+void CompositorClearInputGrabberIfMatches(Process* proc);
+
 } // namespace brook

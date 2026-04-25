@@ -1055,6 +1055,20 @@ int main(int argc, char **argv)
     }
     fprintf(stderr, "[waylandd] wl_seat global advertised (v5)\n");
 
+    /* Become the global input grabber so the kernel WM forwards every
+     * mouse/keyboard event into our per-PID input queue.  Without this
+     * sys_brook_input_pop in pump_input_once() always returns 0 in raw
+     * (non-WM) compositor mode and we lose all input.  Best-effort: if
+     * the syscall isn't compiled in we just keep going. */
+    {
+        long rc = syscall(505 /* sys_brook_input_grab */, 1L);
+        if (rc == 0)
+            fprintf(stderr, "[waylandd] input grab acquired\n");
+        else
+            fprintf(stderr, "[waylandd] WARN: input grab failed rc=%ld errno=%d\n",
+                    rc, errno);
+    }
+
     signal(SIGINT,  on_sigint);
     signal(SIGTERM, on_sigint);
 

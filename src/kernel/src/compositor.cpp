@@ -56,6 +56,44 @@ static uint32_t g_compositedCount = 0;
 // ProcessDestroy uses this to wait until any in-progress blit has finished.
 static volatile uint64_t g_compositorEpoch = 0;
 
+// Global input "grabber" — set by waylandd via sys_brook_input_grab so it
+// receives every keyboard/mouse event in addition to (or instead of) the
+// kernel WM's per-window routing. NULL means no grabber registered.
+static Process* g_inputGrabber = nullptr;
+
+bool CompositorSetInputGrabber(Process* proc, bool enable)
+{
+    if (!proc) return false;
+    if (enable) {
+        __atomic_store_n(&g_inputGrabber, proc, __ATOMIC_RELEASE);
+        SerialPrintf("COMPOSITOR: input grabber set pid=%u '%s'\n",
+                     proc->pid, proc->name);
+        return true;
+    }
+    Process* cur = __atomic_load_n(&g_inputGrabber, __ATOMIC_ACQUIRE);
+    if (cur != proc) return false;
+    __atomic_store_n(&g_inputGrabber, static_cast<Process*>(nullptr), __ATOMIC_RELEASE);
+    SerialPrintf("COMPOSITOR: input grabber cleared (was pid=%u)\n", proc->pid);
+    return true;
+}
+
+void CompositorClearInputGrabberIfMatches(Process* proc)
+{
+    if (!proc) return;
+    Process* cur = __atomic_load_n(&g_inputGrabber, __ATOMIC_ACQUIRE);
+    if (cur == proc) {
+        __atomic_store_n(&g_inputGrabber, static_cast<Process*>(nullptr), __ATOMIC_RELEASE);
+        SerialPrintf("COMPOSITOR: input grabber pid=%u exited, cleared\n", proc->pid);
+    }
+}
+
+static inline void RouteToGrabber(const InputEvent& ev)
+{
+    Process* g = __atomic_load_n(&g_inputGrabber, __ATOMIC_ACQUIRE);
+    if (g && g->state != ProcessState::Terminated)
+        ProcessInputPush(g, ev);
+}
+
 // Compositor fallback interval: if no event-driven wakeup arrives within
 // this many ms, the compositor wakes anyway (for cursor updates, etc.).
 static constexpr uint32_t COMPOSITE_INTERVAL = 16; // ~60 Hz fallback
@@ -731,6 +769,11 @@ static void CompositorLoopWM()
     InputEvent ev;
     while (InputPollEvent(&ev))
     {
+        // Always copy the event to the global grabber (e.g. waylandd) so
+        // userspace display servers see every input regardless of WM
+        // hit-test result.
+        RouteToGrabber(ev);
+
         if (ev.type == InputEventType::MouseButtonDown && ev.scanCode == 0)
         {
             g_wmBtnLatch = true;
@@ -1353,6 +1396,14 @@ static void CompositorLoop()
         BlitProcess(p, forceAll);
     }
     } // end if (g_compositedCount > 0)
+    // Even with no composited windows, drain input events so the grabber
+    // (waylandd) can still see them. In WM mode this drain happens inside
+    // CompositorLoopWM; in legacy mode we need our own.
+    {
+        InputEvent ev;
+        while (InputPollEvent(&ev))
+            RouteToGrabber(ev);
+    }
     } // end legacy mode
 
     // Draw mouse cursor on top of everything.
@@ -1460,6 +1511,9 @@ void CompositorMarkDirty()
 void CompositorUnregisterProcess(Process* proc)
 {
     if (!proc) return;
+    // If this process was the global input grabber, drop the reference so
+    // we don't post-mortem push events into freed memory.
+    CompositorClearInputGrabberIfMatches(proc);
     uint32_t count = __atomic_load_n(&g_compositedCount, __ATOMIC_ACQUIRE);
     for (uint32_t i = 0; i < count; ++i)
     {

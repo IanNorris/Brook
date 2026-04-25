@@ -7352,6 +7352,24 @@ static int64_t sys_brook_input_pop(uint64_t bufAddr, uint64_t maxCount,
 }
 
 // ---------------------------------------------------------------------------
+// sys_brook_input_grab (505) — register / unregister the calling process as
+// the global input grabber.  When set, the compositor copies every keyboard
+// and mouse event into the grabber's per-PID input queue (in addition to the
+// kernel WM's per-window routing), so a userspace Wayland compositor can
+// fan input out to its own clients via wl_pointer / wl_keyboard.
+//   arg0 = enable (1 to grab, 0 to release)
+//   returns 0 on success, -EPERM if releasing while not the current grabber.
+// ---------------------------------------------------------------------------
+static int64_t sys_brook_input_grab(uint64_t enable, uint64_t, uint64_t,
+                                     uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    bool ok = brook::CompositorSetInputGrabber(proc, enable != 0);
+    return ok ? 0 : -EPERM;
+}
+
+// ---------------------------------------------------------------------------
 // sys_not_implemented
 // ---------------------------------------------------------------------------
 
@@ -8712,6 +8730,7 @@ void SyscallTableInit()
     g_syscallTable[502]                  = sys_brook_set_crash_entry;
     g_syscallTable[503]                  = sys_brook_crash_complete;
     g_syscallTable[504]                  = sys_brook_input_pop;
+    g_syscallTable[505]                  = sys_brook_input_grab;
 
     uint32_t count = 0;
     for (uint64_t i = 0; i < SYSCALL_MAX; ++i)
