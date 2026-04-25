@@ -241,8 +241,20 @@ struct ElfBinary
 // Process
 // ---------------------------------------------------------------------------
 
+// Sentinel written to Process::magic at allocation; zeroed at kfree.  Any
+// scheduler hot-path that derefs a Process* asserts this value to catch
+// use-after-free promptly instead of triggering a non-canonical #PF on a
+// truncated/poisoned pointer field.  Value chosen to be obviously non-zero,
+// non-canonical-as-an-address, and ASCII-distinctive in serial dumps.
+static constexpr uint64_t PROCESS_MAGIC = 0xB0000B5042524F4FULL; // "B   BROO"
+
 struct Process
 {
+    // Magic word — used by DoSwitch and SchedulerBlock to catch use-after-free
+    // when a Process struct has been freed and its pages reused.  Set on
+    // allocation, zeroed on free.  See PROCESS_MAGIC below.
+    uint64_t magic;
+
     uint16_t pid;
     uint16_t parentPid;          // Parent process PID (0 if no parent)
     uint16_t pgid;               // Process group ID

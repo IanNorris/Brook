@@ -23,6 +23,15 @@ namespace brook {
 
 // ProcessCurrent() is now in scheduler.cpp (g_currentProcess lives there).
 
+// Helper: free a Process* and clear its magic so any stale pointer to this
+// page that survives in the scheduler / wakeup lists fails its magic-check
+// at next deref instead of corrupting the run.
+static inline void FreeProcessStruct(Process* p)
+{
+    if (p) p->magic = 0;
+    kfree(p);
+}
+
 // ---------------------------------------------------------------------------
 // File descriptor operations
 // ---------------------------------------------------------------------------
@@ -325,6 +334,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     // Zero-initialize
     auto* raw = reinterpret_cast<uint8_t*>(proc);
     for (uint64_t i = 0; i < sizeof(Process); ++i) raw[i] = 0;
+    proc->magic = PROCESS_MAGIC;
 
     // Initialize FPU/SSE state with safe defaults so fxrstor works correctly
     // on the first context switch to this process.
@@ -349,7 +359,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     if (!proc->fds)
     {
         SerialPuts("PROC: fd table allocation failed\n");
-        kfree(proc);
+        FreeProcessStruct(proc);
         return nullptr;
     }
 
@@ -363,7 +373,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     if (!kstackAddr)
     {
         SerialPuts("PROC: kernel stack allocation failed\n");
-        kfree(proc);
+        FreeProcessStruct(proc);
         return nullptr;
     }
     proc->kernelStackBase = kstackAddr.raw();
@@ -374,7 +384,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     if (!proc->pageTable)
     {
         SerialPuts("PROC: page table allocation failed\n");
-        kfree(proc);
+        FreeProcessStruct(proc);
         return nullptr;
     }
 
@@ -384,7 +394,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     {
         SerialPuts("PROC: ELF load failed\n");
         VmmDestroyUserPageTable(proc->pageTable);
-        kfree(proc);
+        FreeProcessStruct(proc);
         return nullptr;
     }
 
@@ -435,7 +445,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
                          proc->elf.interpPath);
             PmmKillPid(proc->pid);
             VmmDestroyUserPageTable(proc->pageTable);
-            kfree(proc);
+            FreeProcessStruct(proc);
             return nullptr;
         }
         interpBase = INTERP_LOAD_BASE;
@@ -470,7 +480,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
         SerialPuts("PROC: stack allocation failed\n");
         PmmKillPid(proc->pid);
         VmmDestroyUserPageTable(proc->pageTable);
-        kfree(proc);
+        FreeProcessStruct(proc);
         return nullptr;
     }
     // Guard page (first page) is left unmapped — faults on stack overflow.
@@ -598,6 +608,7 @@ Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
     // Zero-initialize
     auto* raw = reinterpret_cast<uint8_t*>(proc);
     for (uint64_t i = 0; i < sizeof(Process); ++i) raw[i] = 0;
+    proc->magic = PROCESS_MAGIC;
 
     // Initialize FPU/SSE state
     proc->fxsave.data[0] = 0x7F;
@@ -624,7 +635,7 @@ Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
     if (!kstackAddr)
     {
         SerialPuts("KTHREAD: kernel stack allocation failed\n");
-        kfree(proc);
+        FreeProcessStruct(proc);
         return nullptr;
     }
     proc->kernelStackBase = kstackAddr.raw();
@@ -802,7 +813,7 @@ void ProcessDestroy(Process* proc)
         g_sigHandlers[proc->pid][s].mask = 0;
     }
 
-    kfree(proc);
+    FreeProcessStruct(proc);
 }
 
 // ---------------------------------------------------------------------------
@@ -943,6 +954,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     auto* rawDst = reinterpret_cast<uint8_t*>(child);
     auto* rawSrc = reinterpret_cast<const uint8_t*>(parent);
     for (uint64_t i = 0; i < sizeof(Process); i++) rawDst[i] = rawSrc[i];
+    child->magic = PROCESS_MAGIC;
 
     // Allocate new PID
     child->pid = SchedulerAllocPid();
@@ -961,7 +973,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     if (child->pid == 0)
     {
         SerialPuts("FORK: PID allocation failed\n");
-        kfree(child);
+        FreeProcessStruct(child);
         return nullptr;
     }
 
@@ -971,7 +983,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     if (!child->fds)
     {
         SerialPuts("FORK: fd table allocation failed\n");
-        kfree(child);
+        FreeProcessStruct(child);
         return nullptr;
     }
 
@@ -1011,7 +1023,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     if (!kstackAddr)
     {
         SerialPuts("FORK: kernel stack allocation failed\n");
-        kfree(child);
+        FreeProcessStruct(child);
         return nullptr;
     }
     child->kernelStackBase = kstackAddr.raw();
@@ -1023,7 +1035,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     {
         SerialPuts("FORK: page table allocation failed\n");
         VmmFreeKernelStack(kstackAddr, KERNEL_STACK_PAGES);
-        kfree(child);
+        FreeProcessStruct(child);
         return nullptr;
     }
 
@@ -1034,7 +1046,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
         SerialPuts("FORK: address space copy failed\n");
         VmmDestroyUserPageTable(child->pageTable);
         VmmFreeKernelStack(kstackAddr, KERNEL_STACK_PAGES);
-        kfree(child);
+        FreeProcessStruct(child);
         return nullptr;
     }
 
@@ -1135,12 +1147,13 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     auto* rawDst = reinterpret_cast<uint8_t*>(thread);
     auto* rawSrc = reinterpret_cast<const uint8_t*>(parent);
     for (uint64_t i = 0; i < sizeof(Process); i++) rawDst[i] = rawSrc[i];
+    thread->magic = PROCESS_MAGIC;
 
     // Allocate TID (threads get unique PIDs but share tgid)
     thread->pid = SchedulerAllocPid();
     if (thread->pid == 0)
     {
-        kfree(thread);
+        FreeProcessStruct(thread);
         return nullptr;
     }
 
@@ -1202,7 +1215,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
         MemTag::KernelData, thread->pid);
     if (!kstackAddr)
     {
-        kfree(thread);
+        FreeProcessStruct(thread);
         return nullptr;
     }
     thread->kernelStackBase = kstackAddr.raw();

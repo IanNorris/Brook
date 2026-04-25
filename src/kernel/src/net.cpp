@@ -587,7 +587,12 @@ void NetStartPollThread()
             }
             Process* self = ProcessCurrent();
             if (self) {
-                self->wakeupTick = g_lapicTickCount + 1;
+                // Wake every ~50ms instead of every tick.  A 1-tick wake
+                // rate generates ~60k context switches per minute, which
+                // multiplies the chance of any latent UAF in the scheduler
+                // queues turning into a panic.  Real network traffic
+                // doesn't need millisecond polling for our use cases.
+                self->wakeupTick = g_lapicTickCount + 50;
                 SchedulerBlock(self);
             }
         }

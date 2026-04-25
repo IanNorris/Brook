@@ -1,5 +1,6 @@
 #include "scheduler.h"
 #include "process.h"
+#include "panic.h"
 #include "cpu.h"
 #include "smp.h"
 #include "memory/virtual_memory.h"
@@ -429,6 +430,20 @@ void SchedulerRemoveProcess(Process* proc)
 
 void SchedulerBlock(Process* proc)
 {
+    // UAF guard — same rationale as in DoSwitch.
+    {
+        uint64_t v = (uint64_t)proc;
+        if (v == 0 || (v >> 47) != 0x1FFFFULL)
+        {
+            KernelPanic("SCHED: SchedulerBlock proc %p not canonical kernel-half\n", proc);
+        }
+        if (proc->magic != PROCESS_MAGIC)
+        {
+            KernelPanic("SCHED: SchedulerBlock proc %p has bad magic 0x%lx — UAF?\n",
+                        proc, proc->magic);
+        }
+    }
+
     // Disable interrupts across the entire block+yield sequence to prevent
     // SchedulerTimerTick from firing between setting Blocked and yielding,
     // which would overwrite the Blocked state with Ready.
@@ -651,6 +666,34 @@ static void ReapTerminated()
 static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false)
 {
     __asm__ volatile("cli");
+
+    // Use-after-free / corruption guard.  Both pointers must be canonical
+    // kernel-half addresses pointing at a live Process struct.  If a stale
+    // pointer made it onto the run queue or wakeup list, deref'ing fields
+    // here would otherwise produce a non-canonical fault deep inside the
+    // dispatch path; the magic check turns that into a clear, attributable
+    // panic naming the offending pointer.
+    auto validate = [](Process* p, const char* who) {
+        uint64_t v = (uint64_t)p;
+        if (v == 0 || (v >> 47) != 0x1FFFFULL)
+        {
+            KernelPanic("SCHED: %s pointer %p not canonical kernel-half\n", who, p);
+        }
+        if (p->magic != PROCESS_MAGIC)
+        {
+            KernelPanic("SCHED: %s=%p has bad magic 0x%lx (expected 0x%lx) — UAF?\n",
+                        who, p, p->magic, PROCESS_MAGIC);
+        }
+        // State must be a valid enum value (0..4 in our enum).
+        uint32_t s = (uint32_t)p->state;
+        if (s > 4)
+        {
+            KernelPanic("SCHED: %s=%p (pid=%u) has corrupt state=%u\n",
+                        who, p, p->pid, s);
+        }
+    };
+    validate(oldProc, "oldProc");
+    validate(newProc, "newProc");
 
     uint32_t cpu = ThisCpu();
 
