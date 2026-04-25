@@ -844,6 +844,45 @@ static void seat_resource_destroy(struct wl_resource *r) {
     }
 }
 
+/* wl_output: advertise a single output covering the whole vfb so that
+ * toytoolkit clients (window_frame_create, etc.) can bind to it during
+ * window initialization.  Without this, window_create succeeds but
+ * window_frame_create returns NULL and clients like weston-clickdot
+ * crash dereferencing the result. */
+static void output_release(struct wl_client *c, struct wl_resource *r) {
+    (void)c; wl_resource_destroy(r);
+}
+static const struct wl_output_interface output_impl = {
+    .release = output_release,
+};
+static void output_bind(struct wl_client *client, void *data,
+                        uint32_t version, uint32_t id) {
+    (void)data;
+    struct wl_resource *r = wl_resource_create(client, &wl_output_interface,
+                                                (int)version, id);
+    if (!r) { wl_client_post_no_memory(client); return; }
+    wl_resource_set_implementation(r, &output_impl, NULL, NULL);
+
+    int w = (int)(g_vfb_w ? g_vfb_w : 1920);
+    int h = (int)(g_vfb_h ? g_vfb_h : 1080);
+    wl_output_send_geometry(r,
+        0, 0,                                  /* x, y */
+        (int)((w * 254 + 480) / 960),          /* phys_w mm @96dpi (approx) */
+        (int)((h * 254 + 480) / 960),          /* phys_h mm */
+        WL_OUTPUT_SUBPIXEL_UNKNOWN,
+        "Brook", "vfb-0",
+        WL_OUTPUT_TRANSFORM_NORMAL);
+    wl_output_send_mode(r,
+        WL_OUTPUT_MODE_CURRENT | WL_OUTPUT_MODE_PREFERRED,
+        w, h, 60000);
+    if (version >= 2) {
+        wl_output_send_scale(r, 1);
+        wl_output_send_done(r);
+    }
+    fprintf(stderr, "[waylandd] wl_output bind v=%u id=%u (%dx%d)\n",
+            version, id, w, h);
+}
+
 static void seat_bind(struct wl_client *client, void *data,
                       uint32_t version, uint32_t id) {
     (void)data;
@@ -1084,6 +1123,14 @@ int main(int argc, char **argv)
         return 1;
     }
     fprintf(stderr, "[waylandd] wl_seat global advertised (v5)\n");
+
+    struct wl_global *output = wl_global_create(g_display, &wl_output_interface,
+                                                 3, NULL, output_bind);
+    if (!output) {
+        fprintf(stderr, "[waylandd] FAIL: wl_global_create(wl_output)\n");
+        return 1;
+    }
+    fprintf(stderr, "[waylandd] wl_output global advertised (v3)\n");
 
     /* Become the global input grabber so the kernel WM forwards every
      * mouse/keyboard event into our per-PID input queue.  Without this
