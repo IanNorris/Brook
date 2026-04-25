@@ -130,6 +130,26 @@ extern "C" void ExcForceSerialLock()
     __atomic_store_n(&brook::g_serialLock.next, 1, __ATOMIC_RELEASE);
 }
 
+// Global panic-print mutex.  Distinct from the serial ticket lock because
+// ExcForceSerialLock above intentionally *resets* the ticket lock (so a
+// dying CPU can't be blocked by a held ticket).  The cost is that two CPUs
+// faulting at the same instant can both reset and produce interleaved
+// output.  This dedicated panic lock serialises kernel-fault dumps:
+// first CPU in writes a full report; later CPUs spin or skip after a
+// timeout (so a single broken CPU can't deadlock the rest).
+static volatile uint32_t g_panicPrintOwner = 0xFFFFFFFFu;
+extern "C" bool ExcPanicLockTry(uint32_t cpuId)
+{
+    uint32_t expected = 0xFFFFFFFFu;
+    return __atomic_compare_exchange_n(&g_panicPrintOwner, &expected, cpuId,
+                                       false, __ATOMIC_ACQ_REL,
+                                       __ATOMIC_ACQUIRE);
+}
+extern "C" bool ExcPanicLockHeldBy(uint32_t cpuId)
+{
+    return __atomic_load_n(&g_panicPrintOwner, __ATOMIC_ACQUIRE) == cpuId;
+}
+
 namespace brook {
 
 // ---- Internal helper for SerialPrintf ----

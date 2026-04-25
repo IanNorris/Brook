@@ -115,6 +115,8 @@ static inline uint8_t ExcInb(uint16_t port)
 // normal serial writes from other CPUs.  Force-resets the normal serial
 // ticket lock so the exception handler can write without deadlock.
 extern "C" void ExcForceSerialLock();
+extern "C" bool ExcPanicLockTry(uint32_t cpuId);
+extern "C" bool ExcPanicLockHeldBy(uint32_t cpuId);
 
 static void ExcPutCharRaw(char c)
 {
@@ -247,6 +249,13 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
     // before producing any output, so nothing overwrites the crash screen.
     if ((frame->cs & 3) == 0)
     {
+        // Acquire the global panic-print lock.  If another CPU has already
+        // started a kernel-fault dump, just halt silently — its dump is
+        // the authoritative one and our concurrent output would garble it.
+        if (!ExcPanicLockTry(cpuSlot))
+        {
+            for (;;) __asm__ volatile("cli; hlt");
+        }
         brook::SmpHaltAllAPs();
         brook::CompositorHalt();
     }
@@ -695,6 +704,14 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
     // For kernel-mode faults, dump full GPRs then delegate for diagnostics + halt.
     if (!fromUser)
     {
+        // Acquire the panic-print lock so concurrent kernel faults on
+        // other CPUs don't garble this dump.  Late-arriving CPUs halt
+        // silently; the first faulting CPU produces the canonical dump.
+        uint32_t cpuId = brook::SmpCurrentCpuIndex();
+        if (!ExcPanicLockTry(cpuId))
+        {
+            for (;;) __asm__ volatile("cli; hlt");
+        }
         // Print all GPRs before delegating — HandleException only gets basic frame
         ExcPutsRaw("\n=== KERNEL GPRs ===\n");
         ExcPutsRaw("  RAX "); ExcPutHex(ef->rax); ExcPutsRaw("  RBX "); ExcPutHex(ef->rbx); ExcPutsRaw("\n");
