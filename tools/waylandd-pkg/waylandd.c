@@ -136,6 +136,8 @@ static void blit_into_vfb(const uint8_t *src, int sw, int sh, int sstride)
     }
 }
 
+/* Forward decl: tiler redraw, defined below brook_surface. */
+static void redraw_workspace(void);
 static void on_sigint(int sig) { (void)sig; g_shutdown = 1; }
 
 /* ---------------- wl_surface ---------------- */
@@ -161,7 +163,101 @@ struct brook_surface {
      * demos only ever queue one. */
     struct wl_resource *pending_frame_cbs[8];
     int pending_frame_cb_count;
+
+    /* Tiler state: cached pixel buffer of last commit (RGBA, tightly
+     * packed at committed_w stride) so redraw_workspace can repaint
+     * every tile in the workspace each time any surface commits. */
+    uint32_t *committed_px;
+    int committed_w, committed_h;
+    int committed_cap;          /* allocated pixel count */
+
+    /* Assigned tile rect within the workspace. */
+    int tile_x, tile_y, tile_w, tile_h;
+    /* Where the surface itself is placed within its tile (for input). */
+    int placed_x, placed_y;
+    int is_tiled;               /* 1 == in g_tiled[] */
 };
+
+/* Tiler state: list of mapped xdg_toplevel surfaces, laid out as a
+ * simple horizontal split.  This is the smallest thing that lets two
+ * Wayland clients be visible side-by-side without requiring a full
+ * window manager.  More than ~8 simultaneous windows isn't a goal. */
+#define MAX_TILED 8
+static struct brook_surface *g_tiled[MAX_TILED];
+static int g_tiled_count = 0;
+
+static void tile_layout(void) {
+    if (g_tiled_count <= 0) return;
+    int col_w = (int)g_vfb_w / g_tiled_count;
+    if (col_w <= 0) col_w = (int)g_vfb_w;
+    for (int i = 0; i < g_tiled_count; i++) {
+        struct brook_surface *s = g_tiled[i];
+        s->tile_x = i * col_w;
+        s->tile_y = 0;
+        s->tile_w = (i == g_tiled_count - 1) ? ((int)g_vfb_w - s->tile_x) : col_w;
+        s->tile_h = (int)g_vfb_h;
+    }
+}
+
+static void tile_add(struct brook_surface *s) {
+    if (s->is_tiled) return;
+    if (g_tiled_count >= MAX_TILED) return;
+    g_tiled[g_tiled_count++] = s;
+    s->is_tiled = 1;
+    tile_layout();
+}
+
+static void tile_remove(struct brook_surface *s) {
+    if (!s->is_tiled) return;
+    for (int i = 0; i < g_tiled_count; i++) {
+        if (g_tiled[i] == s) {
+            for (int j = i; j < g_tiled_count - 1; j++)
+                g_tiled[j] = g_tiled[j + 1];
+            g_tiled[--g_tiled_count] = NULL;
+            break;
+        }
+    }
+    s->is_tiled = 0;
+    tile_layout();
+}
+
+static void blit_at(const uint32_t *src, int sw, int sh,
+                    int dx, int dy, int *out_x, int *out_y) {
+    if (!g_vfb || !src || sw <= 0 || sh <= 0) return;
+    if (dx < 0) dx = 0;
+    if (dy < 0) dy = 0;
+    int cw = sw; if (dx + cw > (int)g_vfb_w) cw = (int)g_vfb_w - dx;
+    int ch = sh; if (dy + ch > (int)g_vfb_h) ch = (int)g_vfb_h - dy;
+    if (cw <= 0 || ch <= 0) return;
+    for (int y = 0; y < ch; y++) {
+        const uint32_t *srow = src + (size_t)y * sw;
+        uint32_t *drow = g_vfb + (size_t)(dy + y) * g_vfb_w + dx;
+        for (int x = 0; x < cw; x++) {
+            drow[x] = 0xff000000u | (srow[x] & 0x00ffffffu);
+        }
+    }
+    if (out_x) *out_x = dx;
+    if (out_y) *out_y = dy;
+}
+
+static void redraw_workspace(void) {
+    if (!g_vfb) return;
+    /* Background colour for unoccupied workspace area. */
+    uint32_t bg = 0xff202428u;
+    for (uint32_t i = 0; i < g_vfb_w * g_vfb_h; i++) g_vfb[i] = bg;
+    for (int i = 0; i < g_tiled_count; i++) {
+        struct brook_surface *s = g_tiled[i];
+        if (!s->committed_px) continue;
+        int sw = s->committed_w, sh = s->committed_h;
+        /* Centre surface within its tile rect. */
+        int dx = s->tile_x + (s->tile_w - sw) / 2;
+        int dy = s->tile_y + (s->tile_h - sh) / 2;
+        if (dx < s->tile_x) dx = s->tile_x;
+        if (dy < s->tile_y) dy = s->tile_y;
+        blit_at(s->committed_px, sw, sh, dx, dy, &s->placed_x, &s->placed_y);
+    }
+    vfb_signal_dirty();
+}
 
 static void surface_destroy(struct wl_client *c, struct wl_resource *r) {
     (void)c; wl_resource_destroy(r);
@@ -254,16 +350,48 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
          * the wl_shm round-trip diagnostic. */
         int may_blit = (!s->xdg_toplevel) || s->xdg_acked;
         if (may_blit) {
-            blit_into_vfb(px, w, h, stride);
-            vfb_signal_dirty();
-            /* Track this as the focusable surface for input dispatch. */
-            g_active_surface = s;
-            g_active_surface_w = w;
-            g_active_surface_h = h;
-            int dx = ((int)g_vfb_w - w) / 2; if (dx < 0) dx = 0;
-            int dy = ((int)g_vfb_h - h) / 2; if (dy < 0) dy = 0;
-            g_active_surface_vfb_x = dx;
-            g_active_surface_vfb_y = dy;
+            /* Cache the committed pixels in a per-surface buffer so the
+             * tiler can repaint without needing to access the wl_buffer
+             * later (we release it back to the client below). */
+            int need = w * h;
+            if (need > s->committed_cap) {
+                free(s->committed_px);
+                s->committed_px = (uint32_t*)malloc((size_t)need * 4);
+                s->committed_cap = s->committed_px ? need : 0;
+            }
+            if (s->committed_px) {
+                for (int yy = 0; yy < h; yy++) {
+                    const uint32_t *srow =
+                        (const uint32_t*)(px + (size_t)yy * stride);
+                    uint32_t *drow = s->committed_px + (size_t)yy * w;
+                    for (int xx = 0; xx < w; xx++) drow[xx] = srow[xx];
+                }
+                s->committed_w = w;
+                s->committed_h = h;
+            }
+            /* Bare wl_shm clients without an xdg role aren't tiled — they
+             * stay on the legacy single-surface path (kept so the shm
+             * round-trip diagnostic still works). */
+            if (s->xdg_toplevel) {
+                if (!s->is_tiled) tile_add(s);
+                redraw_workspace();
+                /* Track focusable surface for input dispatch. */
+                g_active_surface = s;
+                g_active_surface_w = w;
+                g_active_surface_h = h;
+                g_active_surface_vfb_x = s->placed_x;
+                g_active_surface_vfb_y = s->placed_y;
+            } else {
+                blit_into_vfb(px, w, h, stride);
+                vfb_signal_dirty();
+                g_active_surface = s;
+                g_active_surface_w = w;
+                g_active_surface_h = h;
+                int dx = ((int)g_vfb_w - w) / 2; if (dx < 0) dx = 0;
+                int dy = ((int)g_vfb_h - h) / 2; if (dy < 0) dy = 0;
+                g_active_surface_vfb_x = dx;
+                g_active_surface_vfb_y = dy;
+            }
         }
     }
     wl_shm_buffer_end_access(shm);
@@ -321,6 +449,11 @@ static const struct wl_surface_interface surface_impl = {
 
 static void surface_destroy_userdata(struct wl_resource *r) {
     struct brook_surface *s = wl_resource_get_user_data(r);
+    if (s) {
+        tile_remove(s);
+        free(s->committed_px);
+        if (g_active_surface == s) g_active_surface = NULL;
+    }
     free(s);
 }
 
@@ -950,7 +1083,28 @@ static void pump_input_once(void) {
         uint8_t  sc   = e[1];
         int32_t vx = *(const int32_t*)(e + 8);
         int32_t vy = *(const int32_t*)(e + 12);
-        /* VFB → surface-local: subtract centre offset. */
+
+        /* Sloppy focus: pick whichever tile the cursor is currently over.
+         * Falls back to g_active_surface when no tile is hit (so bare-shm
+         * single-surface clients keep working). */
+        struct brook_surface *focus = NULL;
+        for (int ti = 0; ti < g_tiled_count; ti++) {
+            struct brook_surface *t = g_tiled[ti];
+            if (!t->committed_px) continue;
+            int x0 = t->placed_x, y0 = t->placed_y;
+            int x1 = x0 + t->committed_w, y1 = y0 + t->committed_h;
+            if (vx >= x0 && vy >= y0 && vx < x1 && vy < y1) {
+                focus = t; break;
+            }
+        }
+        if (focus) {
+            g_active_surface = focus;
+            g_active_surface_w = focus->committed_w;
+            g_active_surface_h = focus->committed_h;
+            g_active_surface_vfb_x = focus->placed_x;
+            g_active_surface_vfb_y = focus->placed_y;
+        }
+        /* VFB → surface-local: subtract surface origin within the VFB. */
         int sx_i = vx - g_active_surface_vfb_x;
         int sy_i = vy - g_active_surface_vfb_y;
 
@@ -960,10 +1114,17 @@ static void pump_input_once(void) {
              * another client's surface to this client would mean its
              * libwayland looks up a non-existent surface ID, returns
              * NULL user_data, and toytoolkit derefs NULL+0x110 in
-             * pointer_handle_enter.  Only deliver to the surface owner. */
-            if (g_active_surface &&
-                wl_resource_get_client(g_active_surface->resource) != bsc->client)
+             * pointer_handle_enter.  We deliver pointer/keyboard events
+             * to the owner of the *currently focused* surface; other
+             * clients receive a leave (if previously entered) so their
+             * cursor handling stops referring to a surface no longer
+             * theirs. */
+            int is_owner = (g_active_surface &&
+                wl_resource_get_client(g_active_surface->resource) == bsc->client);
+            if (!is_owner) {
+                if (bsc->entered_surface) deliver_pointer_leave(bsc);
                 continue;
+            }
             switch (type) {
             case 2: /* MouseMove */ {
                 if (!bsc->pointer) break;

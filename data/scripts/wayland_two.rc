@@ -1,6 +1,6 @@
 # Brook running stock weston-eventdemo + weston-clickdot side-by-side.
 # Two unmodified Linux Wayland clients connecting to the same waylandd.
 set vfb auto
-run /nix/store/jdvxpmaybcnv2s7xc2a62mr4ghc1c9ra-waylandd-brook-0.1-brook/bin/waylandd
+run /nix/store/pfjakajwyd4n33468rzaqs6f8yp1bm5y-waylandd-brook-0.1-brook/bin/waylandd
 run /nix/store/a1im3kc7f4xdmvkglwcmlbi9970srcp9-weston-weston-eventdemo-bundle-15.0.0-bundle/bin/weston-eventdemo
 run /nix/store/rhisg5gpfbrmqy721xdfj2g6a36rgfnn-weston-weston-clickdot-bundle-15.0.0-bundle/bin/weston-clickdot
