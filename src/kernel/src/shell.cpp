@@ -57,6 +57,14 @@ static uint32_t g_vfbHeight = 400;
 static int32_t  g_winX     = -1;   // -1 = auto-cascade
 static int32_t  g_winY     = -1;
 static bool     g_ttyFull   = false; // When true, skip VFB for spawned processes
+// 'set vfb auto/full' fullscreen mode: only the first subsequent spawn (the
+// rendering server, e.g. waylandd) gets a VFB.  Subsequent processes
+// (Wayland clients) talk to that server over the wayland socket and must
+// NOT have their own VFB — otherwise the compositor blits their black
+// 1920x1080 backbuffer over the server's, producing a flicker-then-black
+// effect that's been mistaken for "client only renders one frame".
+static bool     g_vfbFullscreenMode = false;
+static bool     g_vfbFullscreenConsumed = false;
 
 // Track spawned process count for auto-tiling placement
 static uint32_t g_spawnCount = 0;
@@ -365,7 +373,21 @@ static Process* SpawnProcess(const char* path, int argc, const char* const* argv
     proc->name[ni] = '\0';
 
     // Set up compositor placement
-    if (!g_ttyFull)
+    bool skipVfb = g_ttyFull;
+    if (g_vfbFullscreenMode)
+    {
+        if (g_vfbFullscreenConsumed)
+        {
+            // Subsequent processes in fullscreen mode are wayland clients —
+            // they don't own a VFB, the renderer (first process) does.
+            skipVfb = true;
+        }
+        else
+        {
+            g_vfbFullscreenConsumed = true;
+        }
+    }
+    if (!skipVfb)
     {
         if (WmIsActive())
         {
@@ -667,11 +689,13 @@ static int ExecCommand(int argc, const char* const* argv)
                     g_vfbWidth  = physW;
                     g_vfbHeight = physH;
                     g_scale     = 1;
+                    g_vfbFullscreenMode = true;
+                    g_vfbFullscreenConsumed = false;
                     // Fullscreen client takes over the screen — silence the
                     // TTY framebuffer writer so kernel log lines don't draw
                     // over the client's surface.
                     TtySuppressDisplay(true);
-                    KPrintf("vfb: %ux%u (physical, 1:1, tty suppressed)\n", physW, physH);
+                    KPrintf("vfb: %ux%u (physical, 1:1, tty suppressed, fullscreen)\n", physW, physH);
                 }
                 else
                 {
