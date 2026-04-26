@@ -781,8 +781,10 @@ void ProcessDestroy(Process* proc)
     // Release any kernel mutexes held by this process (prevents deadlock)
     Ext2ForceUnlockForPid(proc->pid);
 
-    // Threads don't own FDs — the leader does
-    if (!isThread)
+    // Threads don't own FDs — the leader does. Kernel threads never had
+    // an fd table allocated (proc->fds is NULL), so skip the close loop
+    // for them as well; otherwise ProcessCloseAllFds would deref NULL.
+    if (!isThread && !proc->isKernelThread && proc->fds)
         ProcessCloseAllFds(proc);
 
     // Free the shared fd table once the leader (or fork root) is destroyed.
