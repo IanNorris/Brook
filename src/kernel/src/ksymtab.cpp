@@ -148,6 +148,7 @@ EXPORT_SYMBOL(SchedulerRegisterPolicy);
 EXPORT_SYMBOL(SchedulerBlock);
 EXPORT_SYMBOL(SchedulerUnblock);
 EXPORT_SYMBOL(SchedulerYield);
+EXPORT_SYMBOL(SchedulerSleepMs);
 
 // Process
 EXPORT_SYMBOL(ProcessCurrent);

@@ -885,7 +885,6 @@ void SchedulerYield()
     Process* old = g_perCpu[cpu].currentProcess;
     if (!old)
         return;
-
     uint64_t rlf9 = SchedLockAcquire(g_readyLock);
     Process* next = PickNextLocked();
     SchedLockRelease(g_readyLock, rlf9);
@@ -912,6 +911,24 @@ void SchedulerYield()
     if (requeue)
         old->state = ProcessState::Ready;
     DoSwitch(old, next, requeue);
+}
+
+extern "C" void SchedulerSleepMs(uint32_t ms)
+{
+    if (ms == 0) { SchedulerYield(); return; }
+
+    Process* proc = ProcessCurrent();
+    // Pre-scheduler / kernel-context with no current process: best-effort
+    // busy spin so we don't deadlock early boot callers.
+    if (!proc)
+    {
+        for (volatile uint32_t i = 0; i < ms * 25000; i++)
+            __asm__ volatile("pause");
+        return;
+    }
+
+    proc->wakeupTick = g_lapicTickCount + ms;
+    SchedulerBlock(proc);
 }
 
 [[noreturn]] void SchedulerExitCurrentProcess(int status)

@@ -38,6 +38,12 @@ void SchedulerTimerTick();
 // Yield the current timeslice voluntarily.
 extern "C" void SchedulerYield();
 
+// Block the current process for approximately `ms` milliseconds.  Uses the
+// same wakeup-tick path as sys_nanosleep so other CPUs / processes can run
+// while we wait.  Safe to call from kernel/driver context that has a
+// current Process; no-op in early boot before the scheduler is ready.
+extern "C" void SchedulerSleepMs(uint32_t ms);
+
 // Trampoline for kernel threads — drains requeue, enables interrupts,
 // reads fn/arg from the kernel stack, and calls fn(arg).
 void KernelThreadTrampoline();

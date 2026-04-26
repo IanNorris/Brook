@@ -36,6 +36,7 @@ MODULE_IMPORT_SYMBOL(VmmMapPage);
 MODULE_IMPORT_SYMBOL(PmmAllocPage);
 MODULE_IMPORT_SYMBOL(AudioRegister);
 MODULE_IMPORT_SYMBOL(SchedulerYield);
+MODULE_IMPORT_SYMBOL(SchedulerSleepMs);
 
 using namespace brook;
 
@@ -718,7 +719,7 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
             // Wait for DMA to advance so we don't overwrite data being played.
             {
                 bool ready = false;
-                int maxAttempts = nonblock ? 1 : 100;
+                int maxAttempts = nonblock ? 1 : 50;
                 for (int attempt = 0; attempt < maxAttempts; attempt++)
                 {
                     uint32_t lpib = hda_read32(sdBase + SD_LPIB);
@@ -731,9 +732,14 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
 
                     if (dist >= 2 && dist < NUM_FRAGMENTS - 2) { ready = true; break; }
 
-                    // ~1ms busy-wait then yield CPU to other threads
-                    BusyWait(25000);
-                    SchedulerYield();
+                    // Sleep ~2ms to let DMA drain a chunk of the ring.
+                    // Previously this was BusyWait(25000)+SchedulerYield,
+                    // which spent ~1ms of CPU busy-spinning per attempt
+                    // and dominated Q2's frame budget (~60% of CPU on a
+                    // ~12 fps run was inside this loop).  A real sleep
+                    // releases the CPU and gives the audio time to drain
+                    // before we re-check LPIB.
+                    SchedulerSleepMs(2);
                 }
                 if (!ready)
                     break;
