@@ -2,5 +2,5 @@
 # Bundle is just weston-flower + its required .so libs from upstream weston/cairo/pango/...
 # The binary's RPATH points only into the bundle's lib/.
 set vfb auto
-run /nix/store/wxnsvbfdkzpk3vxaxvmfzlxrsx8ina55-waylandd-brook-0.1-brook/bin/waylandd
+run /nix/store/kwdjchp139bbhn2x2jqnc1wci4bvw7jg-waylandd-brook-0.1-brook/bin/waylandd
 run /nix/store/9lpb4j6syssckpmrcfs9r1awwf3dcyq4-weston-flower-bundle-15.0.0-bundle/bin/weston-flower

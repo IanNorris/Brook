@@ -212,6 +212,7 @@ static void blit_into_vfb(const uint8_t *src, int sw, int sh, int sstride)
 
 /* Forward decl: tiler redraw, defined below brook_surface. */
 static void redraw_workspace(void);
+#define PANEL_H 28
 static void on_sigint(int sig) { (void)sig; g_shutdown = 1; }
 
 /* ---------------- wl_surface ---------------- */
@@ -264,12 +265,14 @@ static void tile_layout(void) {
     if (g_tiled_count <= 0) return;
     int col_w = (int)g_vfb_w / g_tiled_count;
     if (col_w <= 0) col_w = (int)g_vfb_w;
+    int avail_h = (int)g_vfb_h - PANEL_H;
+    if (avail_h < 1) avail_h = (int)g_vfb_h;
     for (int i = 0; i < g_tiled_count; i++) {
         struct brook_surface *s = g_tiled[i];
         s->tile_x = i * col_w;
-        s->tile_y = 0;
+        s->tile_y = PANEL_H;
         s->tile_w = (i == g_tiled_count - 1) ? ((int)g_vfb_w - s->tile_x) : col_w;
-        s->tile_h = (int)g_vfb_h;
+        s->tile_h = avail_h;
     }
 }
 
@@ -314,6 +317,104 @@ static void blit_at(const uint32_t *src, int sw, int sh,
     if (out_y) *out_y = dy;
 }
 
+/* Panel: 28px strip at top of workspace, drawn after background and
+ * tiles.  Tiles get tile_y = PANEL_H so windows never overlap the
+ * panel.  Renders a tiny 5x7 hand-coded font for clock digits + window
+ * "chips" for each open xdg_toplevel. */
+
+/* 5x7 bitmap: digits, ':', and ' '.  Each row is a uint8_t whose low
+ * 5 bits encode the row pixels with bit 0 = leftmost. */
+static const uint8_t s_panel_glyphs[12][7] = {
+    /* '0' */ {0x0E,0x11,0x19,0x15,0x13,0x11,0x0E},
+    /* '1' */ {0x02,0x03,0x02,0x02,0x02,0x02,0x07},
+    /* '2' */ {0x0E,0x11,0x10,0x08,0x04,0x02,0x1F},
+    /* '3' */ {0x0E,0x11,0x10,0x0C,0x10,0x11,0x0E},
+    /* '4' */ {0x08,0x0C,0x0A,0x09,0x1F,0x08,0x08},
+    /* '5' */ {0x1F,0x01,0x0F,0x10,0x10,0x11,0x0E},
+    /* '6' */ {0x0C,0x02,0x01,0x0F,0x11,0x11,0x0E},
+    /* '7' */ {0x1F,0x10,0x08,0x04,0x02,0x02,0x02},
+    /* '8' */ {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E},
+    /* '9' */ {0x0E,0x11,0x11,0x1E,0x10,0x08,0x06},
+    /* ':' */ {0x00,0x00,0x04,0x00,0x04,0x00,0x00},
+    /* ' ' */ {0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+};
+
+static int panel_glyph_index(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c == ':') return 10;
+    return 11;
+}
+
+static void put_pixel(int x, int y, uint32_t col) {
+    if (x < 0 || y < 0 || (uint32_t)x >= g_vfb_w || (uint32_t)y >= g_vfb_h)
+        return;
+    g_vfb[(size_t)y * g_vfb_w + x] = col;
+}
+
+static void draw_glyph(int gx, int gy, int gi, uint32_t col) {
+    const uint8_t *bits = s_panel_glyphs[gi];
+    for (int y = 0; y < 7; y++) {
+        uint8_t row = bits[y];
+        for (int x = 0; x < 5; x++)
+            if (row & (1u << x))
+                put_pixel(gx + x, gy + y, col);
+    }
+}
+
+static void draw_text(int x, int y, const char *s, uint32_t col) {
+    while (*s) {
+        draw_glyph(x, y, panel_glyph_index(*s), col);
+        x += 6;
+        s++;
+    }
+}
+
+static void fill_rect(int x, int y, int w, int h, uint32_t col) {
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > (int)g_vfb_w) w = (int)g_vfb_w - x;
+    if (y + h > (int)g_vfb_h) h = (int)g_vfb_h - y;
+    if (w <= 0 || h <= 0) return;
+    for (int j = 0; j < h; j++) {
+        uint32_t *row = g_vfb + (size_t)(y + j) * g_vfb_w + x;
+        for (int i = 0; i < w; i++) row[i] = col;
+    }
+}
+
+static void draw_panel(void) {
+    if (!g_vfb || g_vfb_h <= PANEL_H) return;
+    /* Strip background + bottom separator line. */
+    fill_rect(0, 0, (int)g_vfb_w, PANEL_H, 0xff1a1d20u);
+    fill_rect(0, PANEL_H - 1, (int)g_vfb_w, 1, 0xff3a3e44u);
+
+    /* Window "chips" — one rectangle per open tile, brighter for the
+     * focused (active) one. */
+    int cx = 8, cy = 6;
+    for (int i = 0; i < g_tiled_count; i++) {
+        int focused = (g_tiled[i] == g_active_surface);
+        uint32_t fill = focused ? 0xfff0c060u : 0xff5a5e64u;
+        uint32_t edge = focused ? 0xffffd870u : 0xff80868cu;
+        fill_rect(cx, cy, 80, 16, fill);
+        fill_rect(cx, cy, 80, 1, edge);
+        fill_rect(cx, cy + 15, 80, 1, edge);
+        fill_rect(cx, cy, 1, 16, edge);
+        fill_rect(cx + 79, cy, 1, 16, edge);
+        cx += 84;
+    }
+
+    /* Clock at top right.  UTC for now — Brook has no tz database. */
+    char buf[16];
+    time_t t = time(NULL);
+    struct tm tm;
+    gmtime_r(&t, &tm);
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d",
+             tm.tm_hour, tm.tm_min, tm.tm_sec);
+    int text_w = (int)strlen(buf) * 6;
+    int tx = (int)g_vfb_w - text_w - 8;
+    int ty = (PANEL_H - 7) / 2;
+    draw_text(tx, ty, buf, 0xffd8dde0u);
+}
+
 static void redraw_workspace(void) {
     if (!g_vfb) return;
     fill_background();
@@ -328,6 +429,7 @@ static void redraw_workspace(void) {
         if (dy < s->tile_y) dy = s->tile_y;
         blit_at(s->committed_px, sw, sh, dx, dy, &s->placed_x, &s->placed_y);
     }
+    draw_panel();
     vfb_signal_dirty();
 }
 
@@ -1287,9 +1389,9 @@ int main(int argc, char **argv)
     /* Best-effort: map our VFB so we can actually show committed buffers. */
     (void)open_vfb();
     load_wallpaper();
-    /* Paint the wallpaper immediately so the desktop is visible even
-     * before any Wayland client connects. */
-    if (g_vfb) { fill_background(); vfb_signal_dirty(); }
+    /* Paint the wallpaper + panel immediately so the desktop is visible
+     * even before any Wayland client connects. */
+    if (g_vfb) redraw_workspace();
 
     g_display = wl_display_create();
     if (!g_display) {
@@ -1415,6 +1517,9 @@ int main(int argc, char **argv)
             }
             wl_display_flush_clients(g_display);
         }
+        /* ~1Hz panel refresh so the clock ticks even when no client
+         * commits. */
+        redraw_workspace();
         if (run_seconds > 0 && --run_seconds == 0)
             break;
     }
