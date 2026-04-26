@@ -1,17 +1,23 @@
 /*
- * waylandd.c — Brook OS Wayland server.
+ * waylandd.c — Brook OS Wayland server (Phase D rewrite).
  *
- * Beyond first-light: now handles wl_compositor.create_surface and
- * wl_surface.attach/damage/commit. On commit, the server maps the
- * attached wl_shm buffer, reads pixel data, and prints a digest so we
- * can verify end-to-end shm round-trip without a real display sink.
+ * Each wayland xdg_toplevel now becomes a kernel-managed Window
+ * (WM_CREATE_WINDOW syscall) with its own VFB allocated and mapped by
+ * the kernel.  Layout, chrome, panel, drag, focus hit-testing all live
+ * in the kernel WM (window.cpp + compositor.cpp).  Our job here is
+ * just the wayland protocol relay:
  *
- * What this does NOT do yet (intentionally):
- *   - blit into the Brook kernel compositor (next step)
- *   - implement xdg-shell (no window role, no real weston clients yet)
- *   - anything fancy: no damage tracking, no frame callbacks
+ *   surface_commit   →  copy wl_shm pixels into the per-window VFB,
+ *                       WM_SIGNAL_DIRTY, fire frame callbacks.
+ *   set_title        →  WM_SET_TITLE.
+ *   surface destroy  →  WM_DESTROY_WINDOW.
+ *   per-frame pump   →  WM_POP_INPUT(wm_id) → wl_pointer/wl_keyboard
+ *                       events, plus WM-synthetic events
+ *                       (CLOSE_REQUESTED → xdg_toplevel.send_close,
+ *                        FOCUS_GAINED/LOST → wl_keyboard.enter/leave).
  *
- * Build via tools/waylandd-pkg/default.nix.
+ * No tiling, no SSD, no panel, no global VFB — that all lived in the
+ * old waylandd and is now the kernel WM's responsibility.
  */
 
 #include <stdio.h>
@@ -20,11 +26,57 @@
 #include <string.h>
 #include <stdint.h>
 #include <sys/syscall.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <errno.h>
 #include <time.h>
+
+#include <wayland-server.h>
+#include <wayland-server-protocol.h>
+#include "xdg-shell-server-protocol.h"
+
+#define BROOK_SYS_WM_CREATE_WINDOW   506
+#define BROOK_SYS_WM_DESTROY_WINDOW  507
+#define BROOK_SYS_WM_SIGNAL_DIRTY    508
+#define BROOK_SYS_WM_SET_TITLE       509
+#define BROOK_SYS_WM_POP_INPUT       510
+
+/* Match the kernel's BrookWmCreateOut struct. */
+struct brook_wm_create_out {
+    uint32_t wm_id;
+    uint32_t vfb_stride;   /* in pixels */
+    uint64_t vfb_user;
+};
+
+/* Match window.h Window::WmInputEvent layout (12 bytes). */
+struct brook_wm_event {
+    uint8_t  type;
+    uint8_t  scan;
+    uint8_t  ascii;
+    uint8_t  mods;
+    int16_t  x;
+    int16_t  y;
+    uint32_t reserved;
+};
+
+#define EVT_KEY_PRESS        0
+#define EVT_KEY_RELEASE      1
+#define EVT_MOUSE_MOVE       2
+#define EVT_MOUSE_BTN_DOWN   3
+#define EVT_MOUSE_BTN_UP     4
+#define EVT_MOUSE_SCROLL     5
+#define WM_EVT_CLOSE_REQUESTED 0x80
+#define WM_EVT_FOCUS_GAINED    0x81
+#define WM_EVT_FOCUS_LOST      0x82
+#define WM_EVT_RESIZED         0x83
+
+static struct wl_display *g_display = NULL;
+static volatile sig_atomic_t g_shutdown = 0;
+static int g_commit_count = 0;
 
 static uint32_t g_now_ms(void) {
     struct timespec ts;
@@ -32,546 +84,70 @@ static uint32_t g_now_ms(void) {
     return (uint32_t)((uint64_t)ts.tv_sec * 1000ull + (uint32_t)(ts.tv_nsec / 1000000));
 }
 
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <sys/mman.h>
-#include <sys/ioctl.h>
-#include <linux/fb.h>
-
-#include <wayland-server.h>
-#include <wayland-server-protocol.h>
-#include "xdg-shell-server-protocol.h"
-
-static struct wl_display *g_display = NULL;
-static volatile sig_atomic_t g_shutdown = 0;
-static int g_commit_count = 0;
-
-/* Forward decls — defined in the wl_seat section below. */
-struct brook_surface;
-static struct brook_surface *g_active_surface = NULL;     /* pointer focus */
-static struct brook_surface *g_focused_surface = NULL;    /* keyboard focus */
-static int g_active_surface_w = 0;
-static int g_active_surface_h = 0;
-static int g_active_surface_vfb_x = 0;
-static int g_active_surface_vfb_y = 0;
-static void pump_input_once(void);
-/* Z-order / focus stack: front (index 0) = most-recently focused.
- * Used for click-to-focus latching and (later) Alt+Tab cycling. */
-#define FOCUS_STACK_MAX 16
-static struct brook_surface *g_focus_stack[FOCUS_STACK_MAX];
-static int g_focus_stack_count = 0;
-static void focus_stack_remove(struct brook_surface *s);
-static void focus_stack_raise(struct brook_surface *s);
-static void set_keyboard_focus(struct brook_surface *s);
-
-/* Waylandd's own virtual framebuffer — blit committed client buffers here
- * so the kernel compositor can show them on screen. */
-static uint32_t *g_vfb       = NULL;
-/* Backbuffer: redraw_workspace paints into g_back, then memcpy's to
- * g_vfb in a single pass so the kernel compositor never observes a
- * mid-paint frame (would flash black during drag). */
-static uint32_t *g_back      = NULL;
-static uint32_t  g_vfb_w     = 0;
-static uint32_t  g_vfb_h     = 0;
-static uint32_t  g_vfb_bytes = 0;
-static int       g_vfb_fd    = -1;
-
-/* Wallpaper — loaded once at startup from /boot/WALLPAPER.RAW (8-byte
- * header = u32 width + u32 height, then RGBA pixels).  Owned, freed
- * never (live for process lifetime). NULL ⇒ fallback to solid grey. */
-static uint32_t *g_wallpaper   = NULL;
-static int       g_wallpaper_w = 0;
-static int       g_wallpaper_h = 0;
-
-static void load_wallpaper(void) {
-    int fd = open("/boot/WALLPAPER.RAW", O_RDONLY);
-    if (fd < 0) {
-        fprintf(stderr, "[waylandd] wallpaper: open failed: %s\n",
-                strerror(errno));
-        return;
-    }
-    uint32_t hdr[2];
-    if (read(fd, hdr, 8) != 8) {
-        fprintf(stderr, "[waylandd] wallpaper: header read failed\n");
-        close(fd); return;
-    }
-    int w = (int)hdr[0], h = (int)hdr[1];
-    if (w <= 0 || h <= 0 || w > 3840 || h > 2160) {
-        fprintf(stderr, "[waylandd] wallpaper: bad dims %dx%d\n", w, h);
-        close(fd); return;
-    }
-    size_t bytes = (size_t)w * (size_t)h * 4u;
-    uint32_t *px = (uint32_t*)malloc(bytes);
-    if (!px) { close(fd); return; }
-    size_t got = 0;
-    while (got < bytes) {
-        ssize_t r = read(fd, (uint8_t*)px + got, bytes - got);
-        if (r <= 0) break;
-        got += (size_t)r;
-    }
-    close(fd);
-    if (got != bytes) {
-        fprintf(stderr, "[waylandd] wallpaper: short read %zu/%zu\n",
-                got, bytes);
-        free(px); return;
-    }
-    g_wallpaper = px;
-    g_wallpaper_w = w;
-    g_wallpaper_h = h;
-    fprintf(stderr, "[waylandd] wallpaper loaded %dx%d\n", w, h);
+static long wm_create_window(uint32_t w, uint32_t h, const char* title,
+                             struct brook_wm_create_out* out) {
+    return syscall(BROOK_SYS_WM_CREATE_WINDOW, (long)w, (long)h, (long)title, (long)out);
+}
+static long wm_destroy_window(uint32_t id) {
+    return syscall(BROOK_SYS_WM_DESTROY_WINDOW, (long)id);
+}
+static long wm_signal_dirty(uint32_t id) {
+    return syscall(BROOK_SYS_WM_SIGNAL_DIRTY, (long)id);
+}
+static long wm_set_title(uint32_t id, const char* title) {
+    size_t n = title ? strlen(title) : 0;
+    return syscall(BROOK_SYS_WM_SET_TITLE, (long)id, (long)title, (long)n);
+}
+static long wm_pop_input(uint32_t id, struct brook_wm_event* buf, long max) {
+    return syscall(BROOK_SYS_WM_POP_INPUT, (long)id, (long)buf, max);
 }
 
-/* Fill the entire VFB with the workspace background (wallpaper if loaded,
- * solid grey otherwise).  Wallpaper is centred & cropped — no scaling. */
-static void fill_background(void) {
-    if (!g_vfb) return;
-    if (!g_wallpaper) {
-        uint32_t bg = 0xff202428u;
-        for (uint32_t i = 0; i < g_vfb_w * g_vfb_h; i++) g_vfb[i] = bg;
-        return;
-    }
-    int wpw = g_wallpaper_w, wph = g_wallpaper_h;
-    int ox = ((int)g_vfb_w - wpw) / 2;
-    int oy = ((int)g_vfb_h - wph) / 2;
-    for (uint32_t y = 0; y < g_vfb_h; y++) {
-        int sy = (int)y - oy;
-        uint32_t *drow = g_vfb + (size_t)y * g_vfb_w;
-        if (sy < 0 || sy >= wph) {
-            uint32_t bg = 0xff181818u;
-            for (uint32_t x = 0; x < g_vfb_w; x++) drow[x] = bg;
-            continue;
-        }
-        const uint32_t *srow = g_wallpaper + (size_t)sy * wpw;
-        for (uint32_t x = 0; x < g_vfb_w; x++) {
-            int sx = (int)x - ox;
-            if (sx < 0 || sx >= wpw) drow[x] = 0xff181818u;
-            else drow[x] = 0xff000000u | (srow[sx] & 0x00ffffffu);
-        }
-    }
-}
+/* ---------------- per-surface state ---------------- */
 
-static int open_vfb(void)
-{
-    int fd = open("/dev/fb0", O_RDWR);
-    if (fd < 0) {
-        fprintf(stderr, "[waylandd] /dev/fb0 open failed: %s\n", strerror(errno));
-        return -1;
-    }
-    struct fb_var_screeninfo vi;
-    if (ioctl(fd, FBIOGET_VSCREENINFO, &vi) < 0) {
-        fprintf(stderr, "[waylandd] FBIOGET_VSCREENINFO failed: %s\n", strerror(errno));
-        close(fd);
-        return -1;
-    }
-    g_vfb_w = vi.xres;
-    g_vfb_h = vi.yres;
-    g_vfb_bytes = g_vfb_w * g_vfb_h * 4;
-
-    void *p = mmap(NULL, g_vfb_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (p == MAP_FAILED) {
-        fprintf(stderr, "[waylandd] VFB mmap failed: %s\n", strerror(errno));
-        close(fd);
-        return -1;
-    }
-    g_vfb = (uint32_t*)p;
-    /* Keep fd open: kernel sets proc->fbDirty + CompositorWake() on every
-     * write() to /dev/fb0 (syscall.cpp DevFramebuf branch).  Stores via
-     * the mmap alone do NOT set fbDirty, which is why animated demos
-     * looked stuck at the compositor's 500ms force-blit cadence rather
-     * than running at the wl_surface frame-callback rate.  We do a 1-byte
-     * write after every commit (vfb_signal_dirty()) to drive the
-     * compositor at client commit rate. */
-    g_vfb_fd = fd;
-
-    /* Paint a distinct background so it's obvious what's ours vs empty. */
-    uint32_t bg = 0xff101830; /* deep navy */
-    for (uint32_t i = 0; i < g_vfb_w * g_vfb_h; i++) g_vfb[i] = bg;
-
-    fprintf(stderr, "[waylandd] vfb %ux%u mapped at %p (%u bytes)\n",
-            g_vfb_w, g_vfb_h, (void*)g_vfb, g_vfb_bytes);
-    return 0;
-}
-
-/* Tell the kernel a fresh frame is ready: a 1-byte write to /dev/fb0 sets
- * proc->fbDirty and wakes the compositor (see kernel syscall.cpp).  The
- * byte itself is discarded (DevFramebuf write returns count without
- * touching memory).  Without this, mmap stores from blit_into_vfb only
- * become visible at the compositor's 500ms force-blit cadence. */
-static void vfb_signal_dirty(void)
-{
-    if (g_vfb_fd < 0) return;
-    char zero = 0;
-    (void)write(g_vfb_fd, &zero, 1);
-}
-
-static void blit_into_vfb(const uint8_t *src, int sw, int sh, int sstride)
-{
-    if (!g_vfb || sw <= 0 || sh <= 0) return;
-    /* Centre the client surface in our VFB. */
-    int dx = ((int)g_vfb_w - sw) / 2; if (dx < 0) dx = 0;
-    int dy = ((int)g_vfb_h - sh) / 2; if (dy < 0) dy = 0;
-    int cw = sw; if (dx + cw > (int)g_vfb_w) cw = (int)g_vfb_w - dx;
-    int ch = sh; if (dy + ch > (int)g_vfb_h) ch = (int)g_vfb_h - dy;
-
-    for (int y = 0; y < ch; y++) {
-        const uint32_t *srow = (const uint32_t*)(src + (size_t)y * sstride);
-        uint32_t *drow = g_vfb + (size_t)(dy + y) * g_vfb_w + dx;
-        for (int x = 0; x < cw; x++) {
-            /* XRGB8888 -> ARGB8888 with opaque alpha. */
-            drow[x] = 0xff000000u | (srow[x] & 0x00ffffffu);
-        }
-    }
-}
-
-/* Forward decl: tiler redraw, defined below brook_surface. */
-static void redraw_workspace(void);
-#define PANEL_H 28
-static void on_sigint(int sig) { (void)sig; g_shutdown = 1; }
-
-/* ---------------- wl_surface ---------------- */
+struct brook_seat_client;
 
 struct brook_surface {
     struct wl_resource *resource;
-    struct wl_resource *pending_buffer; /* set by attach, consumed by commit */
-    int pending_w, pending_h;
+    struct wl_resource *pending_buffer;
 
-    /* xdg-shell role state. role==NULL until get_xdg_surface; once we
-     * have an xdg_toplevel we treat the surface as "windowed" — we send
-     * an initial configure on the first commit, and only blit committed
-     * frames after the client has acked at least one configure. */
-    struct wl_resource *xdg_surface;   /* xdg_surface resource, if any */
-    struct wl_resource *xdg_toplevel;  /* xdg_toplevel resource, if any */
-    int  xdg_initial_commit_done;      /* did we send the first configure? */
-    int  xdg_acked;                    /* did client ack a configure? */
+    /* xdg-shell role state. */
+    struct wl_resource *xdg_surface;
+    struct wl_resource *xdg_toplevel;
+    int  xdg_initial_commit_done;
+    int  xdg_acked;
     uint32_t next_configure_serial;
 
     /* Pending frame callbacks queued by wl_surface.frame() since the
-     * last commit. Fired with a millisecond timestamp at commit time so
-     * the client redraws on a real cadence. Kept as a tiny ring; weston
-     * demos only ever queue one. */
+     * last commit. Fired with a millisecond timestamp at commit time. */
     struct wl_resource *pending_frame_cbs[8];
     int pending_frame_cb_count;
 
-    /* Tiler state: cached pixel buffer of last commit (RGBA, tightly
-     * packed at committed_w stride) so redraw_workspace can repaint
-     * every tile in the workspace each time any surface commits. */
-    uint32_t *committed_px;
-    int committed_w, committed_h;
-    int committed_cap;          /* allocated pixel count */
+    /* Latest set_title — copied so it survives the wayland string. */
+    char title[64];
 
-    /* Assigned tile rect within the workspace. */
-    int tile_x, tile_y, tile_w, tile_h;
-    /* Where the surface itself is placed within its tile (for input). */
-    int placed_x, placed_y;
-    int is_tiled;               /* 1 == in g_tiled[] */
+    /* Kernel Window backing this xdg_toplevel.  Created lazily on the
+     * first real (post-ack) commit when we know the buffer size. */
+    uint32_t wm_id;
+    uint32_t *vfb;          /* mapped into our address space by the kernel */
+    uint32_t  vfb_stride;   /* in pixels */
+    uint32_t  vfb_w, vfb_h; /* the size we created the Window at */
 
-    /* Floating-window state (Phase 5).  When is_floating is set the
-     * surface lives in g_floating[] instead of g_tiled[] and is drawn
-     * with its chrome top-left at (float_x, float_y) regardless of any
-     * tile layout.  Mutually exclusive with is_tiled. */
-    int is_floating;
-    int float_x, float_y;       /* chrome (title-bar) top-left in VFB */
+    /* Linked list of all surfaces — used by the input pump. */
+    struct brook_surface *next;
 };
 
-/* Tiler state: list of mapped xdg_toplevel surfaces, laid out as a
- * simple horizontal split.  This is the smallest thing that lets two
- * Wayland clients be visible side-by-side without requiring a full
- * window manager.  More than ~8 simultaneous windows isn't a goal. */
-#define MAX_TILED 8
+static struct brook_surface *g_surfaces = NULL;
 
-/* Server-side decoration ("chrome"): a 24px title bar drawn directly
- * above each xdg_toplevel surface, with a close button at the right.
- * Click on close → xdg_toplevel.send_close → graceful shutdown. */
-#define CHROME_H     24
-#define CLOSE_BTN_W  20
-#define CLOSE_BTN_H  CHROME_H
-static struct brook_surface *g_tiled[MAX_TILED];
-static int g_tiled_count = 0;
-
-/* Floating layer: drawn on top of tiled layer, in array order so that
- * the last entry is the top-most floater.  raise_floating(s) moves s
- * to the end of this list. */
-#define MAX_FLOATING 8
-static struct brook_surface *g_floating[MAX_FLOATING];
-static int g_floating_count = 0;
-
-/* Active drag (window-move via title-bar).  When non-NULL, MouseMove
- * events update the target's float_{x,y} until MouseButtonUp. */
-static struct brook_surface *g_drag_target = NULL;
-static int g_drag_offset_x = 0;
-static int g_drag_offset_y = 0;
-
-static void tile_layout(void) {
-    if (g_tiled_count <= 0) return;
-    int col_w = (int)g_vfb_w / g_tiled_count;
-    if (col_w <= 0) col_w = (int)g_vfb_w;
-    int avail_h = (int)g_vfb_h - PANEL_H;
-    if (avail_h < 1) avail_h = (int)g_vfb_h;
-    for (int i = 0; i < g_tiled_count; i++) {
-        struct brook_surface *s = g_tiled[i];
-        s->tile_x = i * col_w;
-        s->tile_y = PANEL_H;
-        s->tile_w = (i == g_tiled_count - 1) ? ((int)g_vfb_w - s->tile_x) : col_w;
-        s->tile_h = avail_h;
-    }
+static struct brook_surface *find_surface_by_wm_id(uint32_t id) {
+    if (!id) return NULL;
+    for (struct brook_surface *s = g_surfaces; s; s = s->next)
+        if (s->wm_id == id) return s;
+    return NULL;
 }
 
-static void tile_add(struct brook_surface *s) {
-    if (s->is_tiled) return;
-    if (g_tiled_count >= MAX_TILED) return;
-    g_tiled[g_tiled_count++] = s;
-    s->is_tiled = 1;
-    tile_layout();
-}
+static void on_sigint(int sig) { (void)sig; g_shutdown = 1; }
 
-static void tile_remove(struct brook_surface *s) {
-    if (!s->is_tiled) return;
-    for (int i = 0; i < g_tiled_count; i++) {
-        if (g_tiled[i] == s) {
-            for (int j = i; j < g_tiled_count - 1; j++)
-                g_tiled[j] = g_tiled[j + 1];
-            g_tiled[--g_tiled_count] = NULL;
-            break;
-        }
-    }
-    s->is_tiled = 0;
-    tile_layout();
-}
-
-static void floating_remove(struct brook_surface *s) {
-    if (!s->is_floating) return;
-    for (int i = 0; i < g_floating_count; i++) {
-        if (g_floating[i] == s) {
-            for (int j = i; j < g_floating_count - 1; j++)
-                g_floating[j] = g_floating[j + 1];
-            g_floating[--g_floating_count] = NULL;
-            break;
-        }
-    }
-    s->is_floating = 0;
-}
-
-static void floating_raise(struct brook_surface *s) {
-    if (!s->is_floating) return;
-    floating_remove(s);
-    if (g_floating_count < MAX_FLOATING) {
-        g_floating[g_floating_count++] = s;
-        s->is_floating = 1;
-    }
-}
-
-/* Pop s out of the tiled layout and into the floating layer at the
- * given chrome top-left.  No-op if already floating.  Used when the
- * user starts dragging a tiled window's title bar. */
-static void float_from_tile(struct brook_surface *s, int fx, int fy) {
-    if (s->is_floating) return;
-    if (s->is_tiled) tile_remove(s);
-    if (g_floating_count >= MAX_FLOATING) return;
-    s->float_x = fx;
-    s->float_y = fy;
-    g_floating[g_floating_count++] = s;
-    s->is_floating = 1;
-}
-
-static void blit_at(const uint32_t *src, int sw, int sh,
-                    int dx, int dy, int *out_x, int *out_y) {
-    if (!g_vfb || !src || sw <= 0 || sh <= 0) return;
-    if (dx < 0) dx = 0;
-    if (dy < 0) dy = 0;
-    int cw = sw; if (dx + cw > (int)g_vfb_w) cw = (int)g_vfb_w - dx;
-    int ch = sh; if (dy + ch > (int)g_vfb_h) ch = (int)g_vfb_h - dy;
-    if (cw <= 0 || ch <= 0) return;
-    for (int y = 0; y < ch; y++) {
-        const uint32_t *srow = src + (size_t)y * sw;
-        uint32_t *drow = g_vfb + (size_t)(dy + y) * g_vfb_w + dx;
-        for (int x = 0; x < cw; x++) {
-            drow[x] = 0xff000000u | (srow[x] & 0x00ffffffu);
-        }
-    }
-    if (out_x) *out_x = dx;
-    if (out_y) *out_y = dy;
-}
-
-/* Panel: 28px strip at top of workspace, drawn after background and
- * tiles.  Tiles get tile_y = PANEL_H so windows never overlap the
- * panel.  Renders a tiny 5x7 hand-coded font for clock digits + window
- * "chips" for each open xdg_toplevel. */
-
-/* 5x7 bitmap: digits, ':', and ' '.  Each row is a uint8_t whose low
- * 5 bits encode the row pixels with bit 0 = leftmost. */
-static const uint8_t s_panel_glyphs[12][7] = {
-    /* '0' */ {0x0E,0x11,0x19,0x15,0x13,0x11,0x0E},
-    /* '1' */ {0x02,0x03,0x02,0x02,0x02,0x02,0x07},
-    /* '2' */ {0x0E,0x11,0x10,0x08,0x04,0x02,0x1F},
-    /* '3' */ {0x0E,0x11,0x10,0x0C,0x10,0x11,0x0E},
-    /* '4' */ {0x08,0x0C,0x0A,0x09,0x1F,0x08,0x08},
-    /* '5' */ {0x1F,0x01,0x0F,0x10,0x10,0x11,0x0E},
-    /* '6' */ {0x0C,0x02,0x01,0x0F,0x11,0x11,0x0E},
-    /* '7' */ {0x1F,0x10,0x08,0x04,0x02,0x02,0x02},
-    /* '8' */ {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E},
-    /* '9' */ {0x0E,0x11,0x11,0x1E,0x10,0x08,0x06},
-    /* ':' */ {0x00,0x00,0x04,0x00,0x04,0x00,0x00},
-    /* ' ' */ {0x00,0x00,0x00,0x00,0x00,0x00,0x00},
-};
-
-static int panel_glyph_index(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c == ':') return 10;
-    return 11;
-}
-
-static void put_pixel(int x, int y, uint32_t col) {
-    if (x < 0 || y < 0 || (uint32_t)x >= g_vfb_w || (uint32_t)y >= g_vfb_h)
-        return;
-    g_vfb[(size_t)y * g_vfb_w + x] = col;
-}
-
-static void draw_glyph(int gx, int gy, int gi, uint32_t col) {
-    const uint8_t *bits = s_panel_glyphs[gi];
-    for (int y = 0; y < 7; y++) {
-        uint8_t row = bits[y];
-        for (int x = 0; x < 5; x++)
-            if (row & (1u << x))
-                put_pixel(gx + x, gy + y, col);
-    }
-}
-
-static void draw_text(int x, int y, const char *s, uint32_t col) {
-    while (*s) {
-        draw_glyph(x, y, panel_glyph_index(*s), col);
-        x += 6;
-        s++;
-    }
-}
-
-static void fill_rect(int x, int y, int w, int h, uint32_t col) {
-    if (x < 0) { w += x; x = 0; }
-    if (y < 0) { h += y; y = 0; }
-    if (x + w > (int)g_vfb_w) w = (int)g_vfb_w - x;
-    if (y + h > (int)g_vfb_h) h = (int)g_vfb_h - y;
-    if (w <= 0 || h <= 0) return;
-    for (int j = 0; j < h; j++) {
-        uint32_t *row = g_vfb + (size_t)(y + j) * g_vfb_w + x;
-        for (int i = 0; i < w; i++) row[i] = col;
-    }
-}
-
-static void draw_panel(void) {
-    if (!g_vfb || g_vfb_h <= PANEL_H) return;
-    /* Strip background + bottom separator line. */
-    fill_rect(0, 0, (int)g_vfb_w, PANEL_H, 0xff1a1d20u);
-    fill_rect(0, PANEL_H - 1, (int)g_vfb_w, 1, 0xff3a3e44u);
-
-    /* Window "chips" — one rectangle per open window (tiled then
-     * floating), brighter for the focused (active) one. */
-    int cx = 8, cy = 6;
-    struct brook_surface *chip_list[MAX_TILED + MAX_FLOATING];
-    int chip_n = 0;
-    for (int i = 0; i < g_tiled_count; i++)    chip_list[chip_n++] = g_tiled[i];
-    for (int i = 0; i < g_floating_count; i++) chip_list[chip_n++] = g_floating[i];
-    for (int i = 0; i < chip_n; i++) {
-        int focused = (chip_list[i] == g_focused_surface);
-        uint32_t fill = focused ? 0xfff0c060u : 0xff5a5e64u;
-        uint32_t edge = focused ? 0xffffd870u : 0xff80868cu;
-        fill_rect(cx, cy, 80, 16, fill);
-        fill_rect(cx, cy, 80, 1, edge);
-        fill_rect(cx, cy + 15, 80, 1, edge);
-        fill_rect(cx, cy, 1, 16, edge);
-        fill_rect(cx + 79, cy, 1, 16, edge);
-        cx += 84;
-    }
-
-    /* Clock at top right.  UTC for now — Brook has no tz database. */
-    char buf[16];
-    time_t t = time(NULL);
-    struct tm tm;
-    gmtime_r(&t, &tm);
-    snprintf(buf, sizeof(buf), "%02d:%02d:%02d",
-             tm.tm_hour, tm.tm_min, tm.tm_sec);
-    int text_w = (int)strlen(buf) * 6;
-    int tx = (int)g_vfb_w - text_w - 8;
-    int ty = (PANEL_H - 7) / 2;
-    draw_text(tx, ty, buf, 0xffd8dde0u);
-}
-
-static void draw_close_x(int cx, int cy, uint32_t col) {
-    /* 9x9 X centred in the close button */
-    int ox = cx + (CLOSE_BTN_W - 9) / 2;
-    int oy = cy + (CHROME_H - 9) / 2;
-    for (int i = 0; i < 9; i++) {
-        put_pixel(ox + i,         oy + i,         col);
-        put_pixel(ox + i,         oy + (8 - i),   col);
-        /* thicken */
-        put_pixel(ox + i + 1,     oy + i,         col);
-        put_pixel(ox + i,         oy + (8 - i) + 1, col);
-    }
-}
-
-static void draw_chrome(struct brook_surface *s) {
-    int sw = s->committed_w;
-    if (sw <= 0) return;
-    int focused = (s == g_focused_surface);
-    uint32_t bg   = focused ? 0xff3a4148u : 0xff24272au;
-    uint32_t edge = focused ? 0xffffd870u : 0xff444a50u;
-    int cx = s->placed_x;
-    int cy = s->placed_y - CHROME_H;
-    fill_rect(cx, cy, sw, CHROME_H, bg);
-    fill_rect(cx, cy + CHROME_H - 1, sw, 1, edge);
-    /* Close button on the right. */
-    int bx = cx + sw - CLOSE_BTN_W;
-    fill_rect(bx, cy, 1, CHROME_H, edge);  /* divider */
-    uint32_t xcol = focused ? 0xffffe6a0u : 0xff9aa0a4u;
-    draw_close_x(bx, cy, xcol);
-}
-
-static void redraw_workspace(void) {
-    if (!g_vfb) return;
-    /* Paint into the backbuffer to avoid the kernel compositor observing
-     * a half-filled frame.  All draw helpers reference g_vfb, so we swap
-     * the pointer for the duration of the paint, then memcpy out. */
-    if (!g_back) {
-        g_back = (uint32_t*)malloc((size_t)g_vfb_bytes);
-        if (!g_back) {
-            fprintf(stderr, "[waylandd] backbuffer alloc failed; "
-                    "falling back to direct VFB paint\n");
-        }
-    }
-    uint32_t *real_vfb = g_vfb;
-    if (g_back) g_vfb = g_back;
-
-    fill_background();
-    for (int i = 0; i < g_tiled_count; i++) {
-        struct brook_surface *s = g_tiled[i];
-        if (!s->committed_px) continue;
-        int sw = s->committed_w, sh = s->committed_h;
-        /* Reserve CHROME_H above the surface within its tile.  Centre
-         * the (chrome + surface) bundle in the tile vertically. */
-        int total_h = sh + CHROME_H;
-        int dx = s->tile_x + (s->tile_w - sw) / 2;
-        int dy = s->tile_y + (s->tile_h - total_h) / 2 + CHROME_H;
-        if (dx < s->tile_x) dx = s->tile_x;
-        if (dy < s->tile_y + CHROME_H) dy = s->tile_y + CHROME_H;
-        blit_at(s->committed_px, sw, sh, dx, dy, &s->placed_x, &s->placed_y);
-        draw_chrome(s);
-    }
-    /* Floating layer on top, in array order — last entry is top-most. */
-    for (int i = 0; i < g_floating_count; i++) {
-        struct brook_surface *s = g_floating[i];
-        if (!s->committed_px) continue;
-        int sw = s->committed_w, sh = s->committed_h;
-        int dx = s->float_x;
-        int dy = s->float_y + CHROME_H;
-        blit_at(s->committed_px, sw, sh, dx, dy, &s->placed_x, &s->placed_y);
-        draw_chrome(s);
-    }
-    draw_panel();
-
-    if (g_back) {
-        g_vfb = real_vfb;
-        memcpy(g_vfb, g_back, g_vfb_bytes);
-    }
-    vfb_signal_dirty();
-}
+/* ---------------- wl_surface ---------------- */
 
 static void surface_destroy(struct wl_client *c, struct wl_resource *r) {
     (void)c; wl_resource_destroy(r);
@@ -587,15 +163,13 @@ static void surface_damage(struct wl_client *c, struct wl_resource *r,
     (void)c; (void)r; (void)x; (void)y; (void)w; (void)h;
 }
 static void surface_frame(struct wl_client *c, struct wl_resource *r, uint32_t cb) {
-    /* Queue the callback; we'll fire it at commit time with a real
-     * timestamp so the client redraws on a steady cadence. */
     struct brook_surface *s = wl_resource_get_user_data(r);
     struct wl_resource *cb_r = wl_resource_create(c, &wl_callback_interface, 1, cb);
     if (!cb_r) return;
-    if (s->pending_frame_cb_count < (int)(sizeof(s->pending_frame_cbs)/sizeof(s->pending_frame_cbs[0]))) {
+    int cap = (int)(sizeof(s->pending_frame_cbs)/sizeof(s->pending_frame_cbs[0]));
+    if (s->pending_frame_cb_count < cap) {
         s->pending_frame_cbs[s->pending_frame_cb_count++] = cb_r;
     } else {
-        /* Overflow: just fire it now to avoid leaking. */
         wl_callback_send_done(cb_r, g_now_ms());
         wl_resource_destroy(cb_r);
     }
@@ -608,9 +182,26 @@ static void surface_set_input_region(struct wl_client *c, struct wl_resource *r,
                                       struct wl_resource *reg) {
     (void)c; (void)r; (void)reg;
 }
+
+/* Copy wl_shm buffer pixels into the per-window VFB.  Convert XRGB8888
+ * → ARGB8888 (force opaque alpha) so the kernel compositor's straight
+ * blit produces the correct result. */
+static void blit_to_window(struct brook_surface *s,
+                           const uint8_t *src, int sw, int sh, int sstride) {
+    if (!s->vfb || sw <= 0 || sh <= 0) return;
+    int cw = sw < (int)s->vfb_w ? sw : (int)s->vfb_w;
+    int ch = sh < (int)s->vfb_h ? sh : (int)s->vfb_h;
+    for (int y = 0; y < ch; y++) {
+        const uint32_t *srow = (const uint32_t*)(src + (size_t)y * sstride);
+        uint32_t *drow = s->vfb + (size_t)y * s->vfb_stride;
+        for (int x = 0; x < cw; x++) {
+            drow[x] = 0xff000000u | (srow[x] & 0x00ffffffu);
+        }
+    }
+}
+
 static void surface_commit(struct wl_client *c, struct wl_resource *r) {
     (void)c;
-    fprintf(stderr, "[waylandd] surface_commit entry\n"); fflush(stderr);
     struct brook_surface *s = wl_resource_get_user_data(r);
 
     /* xdg-shell role: the very first commit must have NO buffer; we
@@ -620,7 +211,6 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
         s->xdg_initial_commit_done = 1;
         struct wl_array states;
         wl_array_init(&states);
-        /* No states for first configure — client picks its own size. */
         xdg_toplevel_send_configure(s->xdg_toplevel, 0, 0, &states);
         wl_array_release(&states);
         uint32_t serial = ++s->next_configure_serial;
@@ -629,10 +219,8 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
         return;
     }
 
-    if (!s->pending_buffer) {
-        fprintf(stderr, "[waylandd] commit with no attached buffer\n");
-        return;
-    }
+    if (!s->pending_buffer) return;
+
     struct wl_shm_buffer *shm = wl_shm_buffer_get(s->pending_buffer);
     if (!shm) {
         fprintf(stderr, "[waylandd] commit: buffer is not wl_shm\n");
@@ -644,87 +232,43 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
     int32_t w      = wl_shm_buffer_get_width(shm);
     int32_t h      = wl_shm_buffer_get_height(shm);
     int32_t stride = wl_shm_buffer_get_stride(shm);
-    uint32_t fmt   = wl_shm_buffer_get_format(shm);
 
-    wl_shm_buffer_begin_access(shm);
-    const uint8_t *px = wl_shm_buffer_get_data(shm);
-    uint32_t digest = 0;
-    uint32_t first_pix = 0, last_pix = 0;
-    if (px && w > 0 && h > 0) {
-        /* FNV-1a over the whole buffer — proves bytes transited correctly. */
-        digest = 2166136261u;
-        uint64_t total = (uint64_t)stride * (uint64_t)h;
-        for (uint64_t i = 0; i < total; i++) {
-            digest = (digest ^ px[i]) * 16777619u;
-        }
-        first_pix = *(const uint32_t*)px;
-        last_pix  = *(const uint32_t*)(px + total - 4);
-        /* Only blit toplevels that have completed the configure handshake.
-         * Bare-shm clients (no xdg role) still get blitted as before for
-         * the wl_shm round-trip diagnostic. */
-        int may_blit = (!s->xdg_toplevel) || s->xdg_acked;
-        if (may_blit) {
-            /* Cache the committed pixels in a per-surface buffer so the
-             * tiler can repaint without needing to access the wl_buffer
-             * later (we release it back to the client below). */
-            int need = w * h;
-            if (need > s->committed_cap) {
-                free(s->committed_px);
-                s->committed_px = (uint32_t*)malloc((size_t)need * 4);
-                s->committed_cap = s->committed_px ? need : 0;
-            }
-            if (s->committed_px) {
-                for (int yy = 0; yy < h; yy++) {
-                    const uint32_t *srow =
-                        (const uint32_t*)(px + (size_t)yy * stride);
-                    uint32_t *drow = s->committed_px + (size_t)yy * w;
-                    for (int xx = 0; xx < w; xx++) drow[xx] = srow[xx];
-                }
-                s->committed_w = w;
-                s->committed_h = h;
-            }
-            /* Bare wl_shm clients without an xdg role aren't tiled — they
-             * stay on the legacy single-surface path (kept so the shm
-             * round-trip diagnostic still works). */
-            if (s->xdg_toplevel) {
-                if (!s->is_tiled && !s->is_floating) tile_add(s);
-                redraw_workspace();
-                /* Track focusable surface for input dispatch. */
-                g_active_surface = s;
-                g_active_surface_w = w;
-                g_active_surface_h = h;
-                g_active_surface_vfb_x = s->placed_x;
-                g_active_surface_vfb_y = s->placed_y;
+    int may_blit = (!s->xdg_toplevel) || s->xdg_acked;
+    if (may_blit && w > 0 && h > 0 && s->xdg_toplevel) {
+        /* Lazy create the kernel Window now that we know the size. */
+        if (s->wm_id == 0) {
+            struct brook_wm_create_out out = {0};
+            long rc = wm_create_window((uint32_t)w, (uint32_t)h,
+                                       s->title[0] ? s->title : NULL, &out);
+            if (rc == 0 && out.wm_id) {
+                s->wm_id      = out.wm_id;
+                s->vfb        = (uint32_t*)(uintptr_t)out.vfb_user;
+                s->vfb_stride = out.vfb_stride;
+                s->vfb_w      = (uint32_t)w;
+                s->vfb_h      = (uint32_t)h;
+                fprintf(stderr,
+                        "[waylandd] WM_CREATE_WINDOW id=%u %dx%d stride=%u vfb=%p\n",
+                        s->wm_id, w, h, s->vfb_stride, (void*)s->vfb);
             } else {
-                blit_into_vfb(px, w, h, stride);
-                vfb_signal_dirty();
-                g_active_surface = s;
-                g_active_surface_w = w;
-                g_active_surface_h = h;
-                int dx = ((int)g_vfb_w - w) / 2; if (dx < 0) dx = 0;
-                int dy = ((int)g_vfb_h - h) / 2; if (dy < 0) dy = 0;
-                g_active_surface_vfb_x = dx;
-                g_active_surface_vfb_y = dy;
+                fprintf(stderr, "[waylandd] WM_CREATE_WINDOW failed rc=%ld\n", rc);
             }
+        }
+
+        if (s->wm_id && s->vfb) {
+            wl_shm_buffer_begin_access(shm);
+            const uint8_t *px = wl_shm_buffer_get_data(shm);
+            if (px) blit_to_window(s, px, w, h, stride);
+            wl_shm_buffer_end_access(shm);
+            wm_signal_dirty(s->wm_id);
         }
     }
-    wl_shm_buffer_end_access(shm);
 
-    const char *kind = s->xdg_toplevel ? "xdg-toplevel" : "bare";
-    fprintf(stderr,
-            "[waylandd] commit #%d (%s): %dx%d stride=%d fmt=0x%x "
-            "digest=0x%08x first=0x%08x last=0x%08x px=%p\n",
-            ++g_commit_count, kind, w, h, stride, fmt, digest, first_pix, last_pix,
-            (void*)px);
+    ++g_commit_count;
 
-    /* Release the buffer so the client can reuse it. */
     wl_buffer_send_release(s->pending_buffer);
     s->pending_buffer = NULL;
 
-    /* Fire any frame callbacks queued via wl_surface.frame() — tells the
-     * client this commit has been "presented" and it's a good time to
-     * draw the next frame. Without this, animated demos (weston-flower)
-     * stall after the first commit. */
+    /* Fire any frame callbacks queued via wl_surface.frame(). */
     uint32_t now = g_now_ms();
     for (int i = 0; i < s->pending_frame_cb_count; i++) {
         wl_callback_send_done(s->pending_frame_cbs[i], now);
@@ -733,14 +277,15 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
     }
     s->pending_frame_cb_count = 0;
 }
+
 static void surface_set_buffer_transform(struct wl_client *c, struct wl_resource *r, int32_t t) {
     (void)c; (void)r; (void)t;
 }
-static void surface_set_buffer_scale(struct wl_client *c, struct wl_resource *r, int32_t s) {
-    (void)c; (void)r; (void)s;
+static void surface_set_buffer_scale(struct wl_client *c, struct wl_resource *r, int32_t sc) {
+    (void)c; (void)r; (void)sc;
 }
 static void surface_damage_buffer(struct wl_client *c, struct wl_resource *r,
-                                   int32_t x, int32_t y, int32_t w, int32_t h) {
+                                  int32_t x, int32_t y, int32_t w, int32_t h) {
     (void)c; (void)r; (void)x; (void)y; (void)w; (void)h;
 }
 static void surface_offset(struct wl_client *c, struct wl_resource *r, int32_t x, int32_t y) {
@@ -763,29 +308,14 @@ static const struct wl_surface_interface surface_impl = {
 
 static void surface_destroy_userdata(struct wl_resource *r) {
     struct brook_surface *s = wl_resource_get_user_data(r);
-    if (s) {
-        int was_visible = (s->is_tiled || s->is_floating);
-        tile_remove(s);
-        floating_remove(s);
-        if (g_drag_target == s) g_drag_target = NULL;
-        focus_stack_remove(s);
-        free(s->committed_px);
-        if (g_active_surface == s) g_active_surface = NULL;
-        if (g_focused_surface == s) {
-            g_focused_surface = NULL;
-            /* Latch focus to the next stack entry, if any. */
-            struct brook_surface *next = (g_focus_stack_count > 0)
-                ? g_focus_stack[0] : NULL;
-            if (next) set_keyboard_focus(next);
-        }
-        free(s);
-        /* Removing a tile re-flows the layout; remaining windows have
-         * stale placed_x/y until something repaints, and the destroyed
-         * surface's pixels linger in the VFB.  Repaint now so the second
-         * window picks up its new tile slot and the close button works. */
-        if (was_visible) redraw_workspace();
-        return;
+    if (!s) return;
+    /* unlink */
+    struct brook_surface **pp = &g_surfaces;
+    while (*pp) {
+        if (*pp == s) { *pp = s->next; break; }
+        pp = &(*pp)->next;
     }
+    if (s->wm_id) wm_destroy_window(s->wm_id);
     free(s);
 }
 
@@ -793,18 +323,17 @@ static void surface_destroy_userdata(struct wl_resource *r) {
 
 static void compositor_create_surface(struct wl_client *client,
                                       struct wl_resource *res,
-                                      uint32_t id)
-{
-    (void)res;
-    fprintf(stderr, "[waylandd] create_surface entry id=%u\n", id);
+                                      uint32_t id) {
     struct brook_surface *s = calloc(1, sizeof(*s));
     if (!s) { wl_client_post_no_memory(client); return; }
     struct wl_resource *sr = wl_resource_create(client, &wl_surface_interface,
-                                                 wl_resource_get_version(res), id);
+                                                wl_resource_get_version(res), id);
     if (!sr) { free(s); wl_client_post_no_memory(client); return; }
     s->resource = sr;
+    s->next = g_surfaces;
+    g_surfaces = s;
     wl_resource_set_implementation(sr, &surface_impl, s, surface_destroy_userdata);
-    fprintf(stderr, "[waylandd] wl_surface created id=%u\n", id); fflush(stderr);
+    fprintf(stderr, "[waylandd] wl_surface created id=%u\n", id);
 }
 
 static void region_destroy(struct wl_client *c, struct wl_resource *r) {
@@ -826,11 +355,7 @@ static const struct wl_region_interface region_impl = {
 
 static void compositor_create_region(struct wl_client *client,
                                      struct wl_resource *res,
-                                     uint32_t id)
-{
-    /* Regions are stubbed (we ignore opaque/input regions) but we MUST
-     * register the resource so subsequent set_opaque_region(id) doesn't
-     * fail with "unknown object". */
+                                     uint32_t id) {
     struct wl_resource *rr = wl_resource_create(client, &wl_region_interface,
                                                  wl_resource_get_version(res), id);
     if (!rr) { wl_client_post_no_memory(client); return; }
@@ -842,10 +367,16 @@ static const struct wl_compositor_interface compositor_impl = {
     .create_region  = compositor_create_region,
 };
 
-/* ---------------- xdg-shell ---------------- */
+static void compositor_bind(struct wl_client *client, void *data,
+                            uint32_t version, uint32_t id) {
+    (void)data;
+    struct wl_resource *r = wl_resource_create(client, &wl_compositor_interface,
+                                               (int)version, id);
+    if (!r) { wl_client_post_no_memory(client); return; }
+    wl_resource_set_implementation(r, &compositor_impl, NULL, NULL);
+}
 
-/* xdg_toplevel: most requests are stash-or-stub for now. We only need
- * configure/ack and destroy to get a real client to commit a frame. */
+/* ---------------- xdg-shell ---------------- */
 
 static void xdg_toplevel_destroy_req(struct wl_client *c, struct wl_resource *r) {
     (void)c; wl_resource_destroy(r);
@@ -856,13 +387,16 @@ static void xdg_toplevel_set_parent(struct wl_client *c, struct wl_resource *r,
 }
 static void xdg_toplevel_set_title(struct wl_client *c, struct wl_resource *r,
                                     const char *title) {
-    (void)c; (void)r;
-    fprintf(stderr, "[waylandd] xdg_toplevel.set_title: %s\n", title ? title : "(null)");
+    (void)c;
+    struct brook_surface *s = wl_resource_get_user_data(r);
+    if (!s || !title) return;
+    snprintf(s->title, sizeof(s->title), "%s", title);
+    if (s->wm_id) wm_set_title(s->wm_id, s->title);
+    fprintf(stderr, "[waylandd] xdg_toplevel.set_title: %s\n", s->title);
 }
 static void xdg_toplevel_set_app_id(struct wl_client *c, struct wl_resource *r,
                                      const char *app_id) {
-    (void)c; (void)r;
-    fprintf(stderr, "[waylandd] xdg_toplevel.set_app_id: %s\n", app_id ? app_id : "(null)");
+    (void)c; (void)r; (void)app_id;
 }
 static void xdg_toplevel_show_window_menu(struct wl_client *c, struct wl_resource *r,
                                             struct wl_resource *seat, uint32_t serial,
@@ -925,8 +459,6 @@ static void xdg_toplevel_resource_destroy(struct wl_resource *r) {
     if (s) s->xdg_toplevel = NULL;
 }
 
-/* xdg_surface */
-
 static void xdg_surface_destroy_req(struct wl_client *c, struct wl_resource *r) {
     (void)c; wl_resource_destroy(r);
 }
@@ -943,10 +475,9 @@ static void xdg_surface_get_toplevel(struct wl_client *c, struct wl_resource *r,
 static void xdg_surface_get_popup(struct wl_client *c, struct wl_resource *r,
                                     uint32_t id, struct wl_resource *parent,
                                     struct wl_resource *positioner) {
-    (void)id; (void)parent; (void)positioner;
+    (void)id; (void)parent; (void)positioner; (void)c;
     wl_resource_post_error(r, XDG_WM_BASE_ERROR_INVALID_POPUP_PARENT,
                             "popups not implemented");
-    (void)c;
 }
 static void xdg_surface_set_window_geometry(struct wl_client *c, struct wl_resource *r,
                                               int32_t x, int32_t y,
@@ -955,10 +486,9 @@ static void xdg_surface_set_window_geometry(struct wl_client *c, struct wl_resou
 }
 static void xdg_surface_ack_configure(struct wl_client *c, struct wl_resource *r,
                                         uint32_t serial) {
-    (void)c;
+    (void)c; (void)serial;
     struct brook_surface *s = wl_resource_get_user_data(r);
     s->xdg_acked = 1;
-    fprintf(stderr, "[waylandd] xdg_surface.ack_configure serial=%u\n", serial);
 }
 
 static const struct xdg_surface_interface xdg_surface_impl = {
@@ -974,8 +504,7 @@ static void xdg_surface_resource_destroy(struct wl_resource *r) {
     if (s) s->xdg_surface = NULL;
 }
 
-/* xdg_positioner — minimal stub (we never use the values). */
-
+/* xdg_positioner — minimal stub. */
 static void positioner_destroy(struct wl_client *c, struct wl_resource *r) {
     (void)c; wl_resource_destroy(r);
 }
@@ -1052,7 +581,6 @@ static void wm_base_get_xdg_surface(struct wl_client *c, struct wl_resource *r,
     if (!xs) { wl_client_post_no_memory(c); return; }
     wl_resource_set_implementation(xs, &xdg_surface_impl, s, xdg_surface_resource_destroy);
     s->xdg_surface = xs;
-    fprintf(stderr, "[waylandd] xdg_wm_base.get_xdg_surface id=%u\n", id);
 }
 static void wm_base_pong(struct wl_client *c, struct wl_resource *r, uint32_t serial) {
     (void)c; (void)r; (void)serial;
@@ -1068,7 +596,6 @@ static const struct xdg_wm_base_interface wm_base_impl = {
 static void wm_base_bind(struct wl_client *client, void *data,
                            uint32_t version, uint32_t id) {
     (void)data;
-    fprintf(stderr, "[waylandd] xdg_wm_base bind v=%u id=%u\n", version, id);
     struct wl_resource *r = wl_resource_create(client, &xdg_wm_base_interface,
                                                 (int)version, id);
     if (!r) { wl_client_post_no_memory(client); return; }
@@ -1083,18 +610,11 @@ static void brook_wl_log(const char *fmt, va_list ap) {
 
 static void client_destroyed(struct wl_listener *l, void *data) {
     fprintf(stderr, "[waylandd] client %p destroyed\n", data); fflush(stderr);
-    /* Listener was heap-allocated per-client (see client_created). */
     free(l);
 }
-
 static void client_created(struct wl_listener *l, void *data) {
     (void)l;
     struct wl_client *c = data;
-    fprintf(stderr, "[waylandd] client %p created\n", (void*)c); fflush(stderr);
-    /* wl_listener nodes live in a single signal's list; we MUST allocate
-     * one per client or the wl_list link gets corrupted across clients
-     * (manifests as duplicate destroy notifications and a stale "ghost"
-     * window after closing the first of two clients). */
     struct wl_listener *dl = calloc(1, sizeof(*dl));
     if (!dl) return;
     dl->notify = client_destroyed;
@@ -1102,47 +622,19 @@ static void client_created(struct wl_listener *l, void *data) {
 }
 static struct wl_listener g_client_create_listener = { .notify = client_created };
 
-static void compositor_bind(struct wl_client *client, void *data,
-                            uint32_t version, uint32_t id)
-{
-    (void)data;
-    fprintf(stderr, "[waylandd] compositor_bind client=%p v=%u id=%u\n",
-            (void*)client, version, id);
-    struct wl_resource *r = wl_resource_create(client, &wl_compositor_interface,
-                                               (int)version, id);
-    if (!r) { wl_client_post_no_memory(client); return; }
-    wl_resource_set_implementation(r, &compositor_impl, NULL, NULL);
-}
-
 /* ---------------- wl_seat / wl_pointer / wl_keyboard ---------------- */
-
-/* Brook input syscall: returns up to N events as 16-byte records.
- *   [0]   type    (uint8)  — InputEventType: 0=KeyPress 1=KeyRelease
- *                            2=MouseMove 3=MouseButtonDown 4=MouseButtonUp
- *                            5=MouseScroll
- *   [1]   scanCode
- *   [2]   ascii
- *   [3]   modifiers
- *   [4..7] reserved
- *   [8..11]  vfb-local mouse_x (int32)
- *   [12..15] vfb-local mouse_y (int32)
- */
-#define BROOK_SYS_INPUT_POP 504
-#define BROOK_INPUT_REC_SIZE 16
 
 struct brook_seat_client {
     struct wl_resource *seat;
     struct wl_resource *pointer;
     struct wl_resource *keyboard;
     struct wl_client   *client;
-    struct brook_surface *entered_surface; /* surface we last sent enter on */
+    struct brook_surface *entered_surface;  /* pointer enter target */
+    struct brook_surface *kb_focus;         /* keyboard focus target */
     struct brook_seat_client *next;
 };
 
 static struct brook_seat_client *g_seat_clients = NULL;
-
-/* Track previous pointer state so we only fire on changes. */
-static int g_last_ptr_x = -100000, g_last_ptr_y = -100000;
 static uint32_t g_serial = 1;
 static uint32_t next_serial(void) { return g_serial++; }
 
@@ -1153,7 +645,6 @@ static void seat_remove_client(struct brook_seat_client *sc) {
         pp = &(*pp)->next;
     }
 }
-
 static struct brook_seat_client *seat_for_resource(struct wl_resource *r) {
     for (struct brook_seat_client *sc = g_seat_clients; sc; sc = sc->next) {
         if (sc->seat == r || sc->pointer == r || sc->keyboard == r) return sc;
@@ -1177,7 +668,6 @@ static void pointer_resource_destroy(struct wl_resource *r) {
     struct brook_seat_client *sc = seat_for_resource(r);
     if (sc && sc->pointer == r) sc->pointer = NULL;
 }
-
 static void keyboard_release(struct wl_client *c, struct wl_resource *r) {
     (void)c; wl_resource_destroy(r);
 }
@@ -1190,9 +680,6 @@ static void keyboard_resource_destroy(struct wl_resource *r) {
 }
 
 static int make_keymap_fd(size_t *out_size) {
-    /* Self-contained xkb_v1 keymap with no includes — keep tiny: just
-     * letters a-z, return, space, escape, modifier keys.  Real toolkits
-     * will compile this string with libxkbcommon. */
     static const char keymap[] =
         "xkb_keymap {\n"
         "xkb_keycodes \"brook\" {\n"
@@ -1243,7 +730,7 @@ static int make_keymap_fd(size_t *out_size) {
         " modifier_map Lock    { Caps_Lock };\n"
         "};\n"
         "};\n";
-    size_t len = sizeof(keymap); /* includes trailing NUL — clients expect it */
+    size_t len = sizeof(keymap);
     int fd = syscall(SYS_memfd_create, "brook-keymap", 0u);
     if (fd < 0) return -1;
     if (ftruncate(fd, (off_t)len) < 0) { close(fd); return -1; }
@@ -1262,9 +749,7 @@ static void seat_get_pointer(struct wl_client *c, struct wl_resource *r, uint32_
     if (!p) { wl_client_post_no_memory(c); return; }
     wl_resource_set_implementation(p, &pointer_impl, sc, pointer_resource_destroy);
     if (sc) sc->pointer = p;
-    fprintf(stderr, "[waylandd] wl_seat.get_pointer id=%u\n", id);
 }
-
 static void seat_get_keyboard(struct wl_client *c, struct wl_resource *r, uint32_t id) {
     struct brook_seat_client *sc = seat_for_resource(r);
     struct wl_resource *k = wl_resource_create(c, &wl_keyboard_interface,
@@ -1280,79 +765,32 @@ static void seat_get_keyboard(struct wl_client *c, struct wl_resource *r, uint32
                                 kfd, (uint32_t)kmsize);
         close(kfd);
     } else {
-        /* Best effort: tell client we have no keymap. */
         wl_keyboard_send_keymap(k, WL_KEYBOARD_KEYMAP_FORMAT_NO_KEYMAP, -1, 0);
     }
     if (wl_resource_get_version(k) >= 4)
         wl_keyboard_send_repeat_info(k, 25, 600);
-    fprintf(stderr, "[waylandd] wl_seat.get_keyboard id=%u keymap_size=%zu\n", id, kmsize);
 }
-
 static void seat_get_touch(struct wl_client *c, struct wl_resource *r, uint32_t id) {
-    (void)r;
-    /* No touch — return a stub resource so the protocol doesn't error. */
     struct wl_resource *t = wl_resource_create(c, &wl_touch_interface,
                                                 wl_resource_get_version(r), id);
     if (!t) { wl_client_post_no_memory(c); return; }
     wl_resource_set_implementation(t, NULL, NULL, NULL);
 }
-
 static void seat_release(struct wl_client *c, struct wl_resource *r) {
     (void)c; wl_resource_destroy(r);
 }
-
 static const struct wl_seat_interface seat_impl = {
     .get_pointer  = seat_get_pointer,
     .get_keyboard = seat_get_keyboard,
     .get_touch    = seat_get_touch,
     .release      = seat_release,
 };
-
 static void seat_resource_destroy(struct wl_resource *r) {
     struct brook_seat_client *sc = seat_for_resource(r);
     if (sc && sc->seat == r) {
         sc->seat = NULL;
         if (!sc->pointer && !sc->keyboard) seat_remove_client(sc);
     }
-}
-
-/* wl_output: advertise a single output covering the whole vfb so that
- * toytoolkit clients (window_frame_create, etc.) can bind to it during
- * window initialization.  Without this, window_create succeeds but
- * window_frame_create returns NULL and clients like weston-clickdot
- * crash dereferencing the result. */
-static void output_release(struct wl_client *c, struct wl_resource *r) {
-    (void)c; wl_resource_destroy(r);
-}
-static const struct wl_output_interface output_impl = {
-    .release = output_release,
-};
-static void output_bind(struct wl_client *client, void *data,
-                        uint32_t version, uint32_t id) {
-    (void)data;
-    struct wl_resource *r = wl_resource_create(client, &wl_output_interface,
-                                                (int)version, id);
-    if (!r) { wl_client_post_no_memory(client); return; }
-    wl_resource_set_implementation(r, &output_impl, NULL, NULL);
-
-    int w = (int)(g_vfb_w ? g_vfb_w : 1920);
-    int h = (int)(g_vfb_h ? g_vfb_h : 1080);
-    wl_output_send_geometry(r,
-        0, 0,                                  /* x, y */
-        (int)((w * 254 + 480) / 960),          /* phys_w mm @96dpi (approx) */
-        (int)((h * 254 + 480) / 960),          /* phys_h mm */
-        WL_OUTPUT_SUBPIXEL_UNKNOWN,
-        "Brook", "vfb-0",
-        WL_OUTPUT_TRANSFORM_NORMAL);
-    wl_output_send_mode(r,
-        WL_OUTPUT_MODE_CURRENT | WL_OUTPUT_MODE_PREFERRED,
-        w, h, 60000);
-    if (version >= 2) {
-        wl_output_send_scale(r, 1);
-        wl_output_send_done(r);
-    }
-    fprintf(stderr, "[waylandd] wl_output bind v=%u id=%u (%dx%d)\n",
-            version, id, w, h);
 }
 
 static void seat_bind(struct wl_client *client, void *data,
@@ -1372,345 +810,182 @@ static void seat_bind(struct wl_client *client, void *data,
         WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);
     if (version >= 2)
         wl_seat_send_name(r, "brook-seat");
-    fprintf(stderr, "[waylandd] wl_seat bind v=%u id=%u\n", version, id);
 }
 
-/* PS/2 scancode set 1 → XKB keycode (keycode = scancode + 8 in the
- * traditional Linux/X11 mapping for set 1). Good enough for our tiny
- * keymap which uses XKB <NAME> = scancode+8 conventions. */
-static uint32_t scancode_to_xkb(uint8_t sc) {
-    return (uint32_t)sc + 8u;
+/* wl_output: single output. */
+static void output_release(struct wl_client *c, struct wl_resource *r) {
+    (void)c; wl_resource_destroy(r);
+}
+static const struct wl_output_interface output_impl = {
+    .release = output_release,
+};
+static void output_bind(struct wl_client *client, void *data,
+                        uint32_t version, uint32_t id) {
+    (void)data;
+    struct wl_resource *r = wl_resource_create(client, &wl_output_interface,
+                                                (int)version, id);
+    if (!r) { wl_client_post_no_memory(client); return; }
+    wl_resource_set_implementation(r, &output_impl, NULL, NULL);
+    int w = 1920, h = 1080;
+    wl_output_send_geometry(r, 0, 0,
+        (int)((w * 254 + 480) / 960), (int)((h * 254 + 480) / 960),
+        WL_OUTPUT_SUBPIXEL_UNKNOWN, "Brook", "vfb-0",
+        WL_OUTPUT_TRANSFORM_NORMAL);
+    wl_output_send_mode(r, WL_OUTPUT_MODE_CURRENT | WL_OUTPUT_MODE_PREFERRED,
+                        w, h, 60000);
+    if (version >= 2) {
+        wl_output_send_scale(r, 1);
+        wl_output_send_done(r);
+    }
 }
 
-static void deliver_pointer_enter(struct brook_seat_client *sc,
-                                   struct brook_surface *s,
-                                   wl_fixed_t sx, wl_fixed_t sy) {
-    if (!sc->pointer || !s) return;
-    wl_pointer_send_enter(sc->pointer, next_serial(), s->resource, sx, sy);
-    if (wl_resource_get_version(sc->pointer) >= 5)
-        wl_pointer_send_frame(sc->pointer);
+/* PS/2 scancode set 1 → XKB keycode (keycode = scancode + 8). */
+static uint32_t scancode_to_xkb(uint8_t sc) { return (uint32_t)sc + 8u; }
+
+/* ---------------- input pump ---------------- */
+
+/* Find the seat client owned by the same wl_client that owns `surf`. */
+static struct brook_seat_client *seat_for_surface(struct brook_surface *surf) {
+    if (!surf || !surf->resource) return NULL;
+    struct wl_client *owner = wl_resource_get_client(surf->resource);
+    for (struct brook_seat_client *sc = g_seat_clients; sc; sc = sc->next)
+        if (sc->client == owner) return sc;
+    return NULL;
+}
+
+static void pointer_enter_if_needed(struct brook_seat_client *sc,
+                                     struct brook_surface *s,
+                                     int lx, int ly) {
+    if (!sc || !sc->pointer) return;
+    if (sc->entered_surface == s) return;
+    if (sc->entered_surface && sc->entered_surface != s) {
+        wl_pointer_send_leave(sc->pointer, next_serial(),
+                              sc->entered_surface->resource);
+        if (wl_resource_get_version(sc->pointer) >= 5)
+            wl_pointer_send_frame(sc->pointer);
+    }
+    if (s) {
+        wl_pointer_send_enter(sc->pointer, next_serial(), s->resource,
+                              wl_fixed_from_int(lx), wl_fixed_from_int(ly));
+        if (wl_resource_get_version(sc->pointer) >= 5)
+            wl_pointer_send_frame(sc->pointer);
+    }
     sc->entered_surface = s;
 }
-static void deliver_pointer_leave(struct brook_seat_client *sc) {
-    if (!sc->pointer || !sc->entered_surface) return;
-    wl_pointer_send_leave(sc->pointer, next_serial(),
-                          sc->entered_surface->resource);
-    if (wl_resource_get_version(sc->pointer) >= 5)
-        wl_pointer_send_frame(sc->pointer);
-    sc->entered_surface = NULL;
-}
 
-/* Drain the kernel's per-process input queue and translate to wl events. */
-/* ---- Z-order / keyboard focus helpers (Phase 4) ---- */
-static void focus_stack_remove(struct brook_surface *s) {
-    for (int i = 0; i < g_focus_stack_count; i++) {
-        if (g_focus_stack[i] == s) {
-            for (int j = i; j < g_focus_stack_count - 1; j++)
-                g_focus_stack[j] = g_focus_stack[j+1];
-            g_focus_stack_count--;
-            return;
+static void pump_input_for_surface(struct brook_surface *s) {
+    if (!s->wm_id) return;
+    struct brook_wm_event evs[16];
+    long n = wm_pop_input(s->wm_id, evs, 16);
+    if (n <= 0) return;
+
+    struct brook_seat_client *sc = seat_for_surface(s);
+    uint32_t now = g_now_ms();
+
+    for (long i = 0; i < n; ++i) {
+        struct brook_wm_event *e = &evs[i];
+        switch (e->type) {
+        case EVT_MOUSE_MOVE: {
+            if (!sc || !sc->pointer) break;
+            pointer_enter_if_needed(sc, s, e->x, e->y);
+            wl_pointer_send_motion(sc->pointer, now,
+                                   wl_fixed_from_int(e->x),
+                                   wl_fixed_from_int(e->y));
+            if (wl_resource_get_version(sc->pointer) >= 5)
+                wl_pointer_send_frame(sc->pointer);
+            break;
         }
-    }
-}
-static void focus_stack_raise(struct brook_surface *s) {
-    if (!s) return;
-    focus_stack_remove(s);
-    if (g_focus_stack_count >= FOCUS_STACK_MAX)
-        g_focus_stack_count = FOCUS_STACK_MAX - 1;
-    for (int i = g_focus_stack_count; i > 0; i--)
-        g_focus_stack[i] = g_focus_stack[i-1];
-    g_focus_stack[0] = s;
-    g_focus_stack_count++;
-}
-static void set_keyboard_focus(struct brook_surface *s) {
-    if (g_focused_surface == s) {
-        if (s) focus_stack_raise(s);
-        return;
-    }
-    /* Send wl_keyboard.leave to the previous focus's owner. */
-    if (g_focused_surface) {
-        struct wl_client *prev_owner =
-            wl_resource_get_client(g_focused_surface->resource);
-        for (struct brook_seat_client *bsc = g_seat_clients; bsc; bsc = bsc->next) {
-            if (!bsc->keyboard) continue;
-            if (bsc->client != prev_owner) continue;
-            wl_keyboard_send_leave(bsc->keyboard, next_serial(),
-                                   g_focused_surface->resource);
+        case EVT_MOUSE_BTN_DOWN:
+        case EVT_MOUSE_BTN_UP: {
+            if (!sc || !sc->pointer) break;
+            pointer_enter_if_needed(sc, s, e->x, e->y);
+            /* scan: 0=left, 1=right, 2=middle  →  BTN_LEFT 0x110, etc. */
+            uint32_t btn = 0x110 + (e->scan & 0x3);
+            uint32_t st  = (e->type == EVT_MOUSE_BTN_DOWN)
+                             ? WL_POINTER_BUTTON_STATE_PRESSED
+                             : WL_POINTER_BUTTON_STATE_RELEASED;
+            wl_pointer_send_button(sc->pointer, next_serial(), now, btn, st);
+            if (wl_resource_get_version(sc->pointer) >= 5)
+                wl_pointer_send_frame(sc->pointer);
+            break;
         }
-    }
-    g_focused_surface = s;
-    if (s) {
-        focus_stack_raise(s);
-        struct wl_client *new_owner = wl_resource_get_client(s->resource);
-        for (struct brook_seat_client *bsc = g_seat_clients; bsc; bsc = bsc->next) {
-            if (!bsc->keyboard) continue;
-            if (bsc->client != new_owner) continue;
-            struct wl_array keys; wl_array_init(&keys);
-            wl_keyboard_send_enter(bsc->keyboard, next_serial(),
-                                   s->resource, &keys);
-            wl_array_release(&keys);
+        case EVT_MOUSE_SCROLL: {
+            if (!sc || !sc->pointer) break;
+            int32_t dy = (int8_t)e->scan;
+            wl_pointer_send_axis(sc->pointer, now,
+                                 WL_POINTER_AXIS_VERTICAL_SCROLL,
+                                 wl_fixed_from_int(dy * 10));
+            if (wl_resource_get_version(sc->pointer) >= 5)
+                wl_pointer_send_frame(sc->pointer);
+            break;
         }
-        fprintf(stderr, "[waylandd] kb focus → surface=%p\n", (void*)s);
-    } else {
-        fprintf(stderr, "[waylandd] kb focus → NULL\n");
+        case EVT_KEY_PRESS:
+        case EVT_KEY_RELEASE: {
+            if (!sc || !sc->keyboard) break;
+            uint32_t st = (e->type == EVT_KEY_PRESS)
+                            ? WL_KEYBOARD_KEY_STATE_PRESSED
+                            : WL_KEYBOARD_KEY_STATE_RELEASED;
+            wl_keyboard_send_key(sc->keyboard, next_serial(), now,
+                                 scancode_to_xkb(e->scan), st);
+            break;
+        }
+        case WM_EVT_CLOSE_REQUESTED: {
+            if (s->xdg_toplevel) {
+                fprintf(stderr, "[waylandd] CLOSE_REQUESTED → xdg_toplevel.send_close (wm=%u)\n",
+                        s->wm_id);
+                xdg_toplevel_send_close(s->xdg_toplevel);
+            }
+            break;
+        }
+        case WM_EVT_FOCUS_GAINED: {
+            if (sc && sc->keyboard && sc->kb_focus != s) {
+                struct wl_array keys; wl_array_init(&keys);
+                wl_keyboard_send_enter(sc->keyboard, next_serial(),
+                                       s->resource, &keys);
+                wl_array_release(&keys);
+                sc->kb_focus = s;
+                fprintf(stderr, "[waylandd] FOCUS_GAINED wm=%u\n", s->wm_id);
+            }
+            break;
+        }
+        case WM_EVT_FOCUS_LOST: {
+            if (sc && sc->keyboard && sc->kb_focus == s) {
+                wl_keyboard_send_leave(sc->keyboard, next_serial(), s->resource);
+                sc->kb_focus = NULL;
+                fprintf(stderr, "[waylandd] FOCUS_LOST wm=%u\n", s->wm_id);
+            }
+            break;
+        }
+        case WM_EVT_RESIZED:
+            /* TODO Phase E: send xdg_toplevel.configure with new size. */
+            break;
+        default: break;
+        }
     }
 }
 
 static void pump_input_once(void) {
-    uint8_t buf[16 * 32];
-    long n = syscall(BROOK_SYS_INPUT_POP, (long)buf, 32L);
-    if (n <= 0) return;
-    /* Diagnostic: prove kernel→waylandd input plumbing even if no client
-     * has bound wl_pointer / wl_keyboard yet. */
-    static long s_total_events = 0;
-    static long s_last_logged = -1;
-    s_total_events += n;
-    if (s_last_logged < 0 || s_total_events - s_last_logged >= 8) {
-        fprintf(stderr, "[waylandd] input_pop: drained %ld (total=%ld)\n",
-                n, s_total_events);
-        s_last_logged = s_total_events;
-    }
-    if (!g_active_surface && g_floating_count == 0) return;
-    for (long i = 0; i < n; ++i) {
-        const uint8_t *e = buf + (i * BROOK_INPUT_REC_SIZE);
-        uint8_t  type = e[0];
-        uint8_t  sc   = e[1];
-        int32_t vx = *(const int32_t*)(e + 8);
-        int32_t vy = *(const int32_t*)(e + 12);
-
-        /* Active drag (window-move): consume MouseMove to update the
-         * floating window's position; MouseButtonUp ends the drag.
-         * All other events fall through. */
-        if (g_drag_target) {
-            if (type == 2 /* MouseMove */) {
-                int nx = vx - g_drag_offset_x;
-                int ny = vy - g_drag_offset_y;
-                if (ny < PANEL_H) ny = PANEL_H;
-                if (nx < -((int)g_drag_target->committed_w - 32))
-                    nx = -((int)g_drag_target->committed_w - 32);
-                if (nx > (int)g_vfb_w - 32) nx = (int)g_vfb_w - 32;
-                if (ny > (int)g_vfb_h - CHROME_H) ny = (int)g_vfb_h - CHROME_H;
-                g_drag_target->float_x = nx;
-                g_drag_target->float_y = ny;
-                redraw_workspace();
-                g_last_ptr_x = vx; g_last_ptr_y = vy;
-                continue;
-            }
-            if (type == 4 /* MouseButtonUp */ && sc == 0) {
-                fprintf(stderr, "[waylandd] drag end @ (%d,%d)\n",
-                        g_drag_target->float_x, g_drag_target->float_y);
-                g_drag_target = NULL;
-                continue;
-            }
-            /* Other events while dragging: ignore to avoid mid-drag
-             * focus changes or button delivery to the client. */
-            continue;
-        }
-
-        /* Sloppy focus: pick whichever window the cursor is over.
-         * Test floating layer first (top-most last → iterate in
-         * reverse), then tiled.  Hit area includes the chrome strip
-         * above the surface body. */
-        struct brook_surface *focus = NULL;
-        int in_chrome = 0;        /* cursor lands on chrome (not body) */
-        int in_close  = 0;        /* cursor lands on close button */
-        for (int fi = g_floating_count - 1; fi >= 0 && !focus; fi--) {
-            struct brook_surface *t = g_floating[fi];
-            if (!t->committed_px) continue;
-            int x0 = t->placed_x, y0 = t->placed_y;
-            int x1 = x0 + t->committed_w, y1 = y0 + t->committed_h;
-            int chrome_y0 = y0 - CHROME_H;
-            int close_x0  = x1 - CLOSE_BTN_W;
-            if (vx >= x0 && vy >= chrome_y0 && vx < x1 && vy < y1) {
-                focus = t;
-                if (vy < y0) {
-                    in_chrome = 1;
-                    if (vx >= close_x0) in_close = 1;
-                }
-            }
-        }
-        for (int ti = 0; ti < g_tiled_count && !focus; ti++) {
-            struct brook_surface *t = g_tiled[ti];
-            if (!t->committed_px) continue;
-            int x0 = t->placed_x, y0 = t->placed_y;
-            int x1 = x0 + t->committed_w, y1 = y0 + t->committed_h;
-            int chrome_y0 = y0 - CHROME_H;
-            int close_x0  = x1 - CLOSE_BTN_W;
-            if (vx >= x0 && vy >= chrome_y0 && vx < x1 && vy < y1) {
-                focus = t;
-                if (vy < y0) {
-                    in_chrome = 1;
-                    if (vx >= close_x0) in_close = 1;
-                }
-                break;
-            }
-        }
-        if (focus) {
-            g_active_surface = focus;
-            g_active_surface_w = focus->committed_w;
-            g_active_surface_h = focus->committed_h;
-            g_active_surface_vfb_x = focus->placed_x;
-            g_active_surface_vfb_y = focus->placed_y;
-        }
-        /* Click-to-focus: any left-button press inside a window (chrome
-         * or body) latches keyboard focus to that surface and raises
-         * it in the Z-order list (and floating layer if applicable). */
-        if (focus && type == 3 /* MouseButtonDown */ && sc == 0) {
-            set_keyboard_focus(focus);
-            if (focus->is_floating) floating_raise(focus);
-        }
-        /* Close-button click: handle locally, do not forward to client. */
-        if (in_close && focus && type == 3 /* MouseButtonDown */ && sc == 0) {
-            if (focus->xdg_toplevel) {
-                fprintf(stderr, "[waylandd] close click → "
-                        "xdg_toplevel.close\n");
-                xdg_toplevel_send_close(focus->xdg_toplevel);
-            }
-            continue;  /* swallow */
-        }
-        /* Chrome (non-close) press: start a window-move drag.  If the
-         * window was tiled, kick it into the floating layer at its
-         * current screen position (so it doesn't snap on first move). */
-        if (in_chrome && !in_close && focus &&
-            type == 3 /* MouseButtonDown */ && sc == 0) {
-            int fx, fy;
-            if (focus->is_floating) {
-                fx = focus->float_x;
-                fy = focus->float_y;
-            } else {
-                fx = focus->placed_x;
-                fy = focus->placed_y - CHROME_H;
-                float_from_tile(focus, fx, fy);
-            }
-            g_drag_target = focus;
-            g_drag_offset_x = vx - fx;
-            g_drag_offset_y = vy - fy;
-            fprintf(stderr, "[waylandd] drag begin @ (%d,%d) off=(%d,%d)\n",
-                    fx, fy, g_drag_offset_x, g_drag_offset_y);
-            continue;
-        }
-        /* Chrome (non-close) click: focus only, swallow event. */
-        if (in_chrome) {
-            continue;
-        }
-        /* VFB → surface-local: subtract surface origin within the VFB. */
-        int sx_i = vx - g_active_surface_vfb_x;
-        int sy_i = vy - g_active_surface_vfb_y;
-
-        /* ---- Keyboard events: route to g_focused_surface's owner ---- */
-        if (type == 0 || type == 1) {
-            if (!g_focused_surface) {
-                g_last_ptr_x = vx; g_last_ptr_y = vy;
-                continue;
-            }
-            struct wl_client *kb_owner =
-                wl_resource_get_client(g_focused_surface->resource);
-            uint32_t key = scancode_to_xkb(sc);
-            uint32_t state = (type == 0)
-                ? WL_KEYBOARD_KEY_STATE_PRESSED
-                : WL_KEYBOARD_KEY_STATE_RELEASED;
-            for (struct brook_seat_client *bsc = g_seat_clients; bsc; bsc = bsc->next) {
-                if (!bsc->keyboard) continue;
-                if (bsc->client != kb_owner) continue;
-                wl_keyboard_send_key(bsc->keyboard, next_serial(),
-                                     g_now_ms(), key - 8u, state);
-            }
-            g_last_ptr_x = vx; g_last_ptr_y = vy;
-            continue;
-        }
-
-        /* ---- Pointer events: route to g_active_surface's owner ---- */
-        for (struct brook_seat_client *bsc = g_seat_clients; bsc; bsc = bsc->next) {
-            int is_owner = (g_active_surface &&
-                wl_resource_get_client(g_active_surface->resource) == bsc->client);
-            if (!is_owner) {
-                if (bsc->entered_surface) deliver_pointer_leave(bsc);
-                continue;
-            }
-            switch (type) {
-            case 2: /* MouseMove */ {
-                if (!bsc->pointer) break;
-                int inside = (sx_i >= 0 && sy_i >= 0 &&
-                              sx_i < g_active_surface_w &&
-                              sy_i < g_active_surface_h);
-                wl_fixed_t fx = wl_fixed_from_int(sx_i);
-                wl_fixed_t fy = wl_fixed_from_int(sy_i);
-                if (inside && bsc->entered_surface != g_active_surface)
-                    deliver_pointer_enter(bsc, g_active_surface, fx, fy);
-                if (inside) {
-                    wl_pointer_send_motion(bsc->pointer, g_now_ms(), fx, fy);
-                    if (wl_resource_get_version(bsc->pointer) >= 5)
-                        wl_pointer_send_frame(bsc->pointer);
-                } else if (bsc->entered_surface) {
-                    deliver_pointer_leave(bsc);
-                }
-                break;
-            }
-            case 3: /* MouseButtonDown */
-            case 4: /* MouseButtonUp */ {
-                if (!bsc->pointer) break;
-                /* Button mapping: 0=L 1=R 2=M (Brook) → BTN_LEFT/RIGHT/MIDDLE. */
-                static const uint32_t btnmap[3] = { 0x110, 0x111, 0x112 };
-                if (sc > 2) break;
-                uint32_t btn = btnmap[sc];
-                uint32_t state = (type == 3)
-                    ? WL_POINTER_BUTTON_STATE_PRESSED
-                    : WL_POINTER_BUTTON_STATE_RELEASED;
-                if (bsc->entered_surface != g_active_surface) {
-                    /* fire enter at current pos so client can correlate */
-                    deliver_pointer_enter(bsc, g_active_surface,
-                                          wl_fixed_from_int(sx_i),
-                                          wl_fixed_from_int(sy_i));
-                }
-                wl_pointer_send_button(bsc->pointer, next_serial(),
-                                       g_now_ms(), btn, state);
-                if (wl_resource_get_version(bsc->pointer) >= 5)
-                    wl_pointer_send_frame(bsc->pointer);
-                fprintf(stderr, "[waylandd] pointer button=%u state=%u\n", btn, state);
-                break;
-            }
-            case 0: /* KeyPress (handled above) */
-            case 1: /* KeyRelease (handled above) */
-                break;
-            default: break;
-            }
-        }
-        (void)vx; (void)vy;
-        g_last_ptr_x = vx; g_last_ptr_y = vy;
-    }
+    for (struct brook_surface *s = g_surfaces; s; s = s->next)
+        pump_input_for_surface(s);
 }
 
-
+/* ---------------- main ---------------- */
 
 int main(int argc, char **argv)
 {
-    /* run_seconds == 0 means "run indefinitely" (the normal desktop case).
-     * A positive value runs for roughly that many seconds, intended for
-     * smoke tests and CI runs that need a hard exit. */
+    fprintf(stderr, "[waylandd] starting (Phase D — kernel-WM unified)\n");
     int run_seconds = 0;
     for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--seconds") == 0 && i + 1 < argc)
+        if ((!strcmp(argv[i], "--for") || !strcmp(argv[i], "--seconds"))
+            && i + 1 < argc)
             run_seconds = atoi(argv[++i]);
     }
-
-    if (run_seconds > 0)
-        fprintf(stderr, "[waylandd] starting (first-light, %ds)\n", run_seconds);
-    else
-        fprintf(stderr, "[waylandd] starting (persistent, no time limit)\n");
-
-    /* Best-effort: map our VFB so we can actually show committed buffers. */
-    (void)open_vfb();
-    load_wallpaper();
-    /* Paint the wallpaper + panel immediately so the desktop is visible
-     * even before any Wayland client connects. */
-    if (g_vfb) redraw_workspace();
 
     g_display = wl_display_create();
     if (!g_display) {
         fprintf(stderr, "[waylandd] FAIL: wl_display_create returned NULL\n");
         return 1;
     }
-    fprintf(stderr, "[waylandd] wl_display_create OK\n");
 
     wl_log_set_handler_server(brook_wl_log);
     wl_display_add_client_created_listener(g_display, &g_client_create_listener);
@@ -1719,13 +994,10 @@ int main(int argc, char **argv)
     if (!sock_name) sock_name = "wayland-0";
 
     const char *sock = NULL;
-    if (getenv("XDG_RUNTIME_DIR"))
-    {
-        if (wl_display_add_socket(g_display, sock_name) == 0)
-            sock = sock_name;
+    if (getenv("XDG_RUNTIME_DIR")) {
+        if (wl_display_add_socket(g_display, sock_name) == 0) sock = sock_name;
     }
-    if (!sock)
-    {
+    if (!sock) {
         int lfd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
         if (lfd < 0) {
             fprintf(stderr, "[waylandd] FAIL: socket: %s\n", strerror(errno));
@@ -1737,8 +1009,7 @@ int main(int argc, char **argv)
         snprintf(a.sun_path, sizeof(a.sun_path), "/tmp/%s", sock_name);
         unlink(a.sun_path);
         if (bind(lfd, (struct sockaddr*)&a, sizeof(a)) < 0) {
-            fprintf(stderr, "[waylandd] FAIL: bind %s: %s\n",
-                    a.sun_path, strerror(errno));
+            fprintf(stderr, "[waylandd] FAIL: bind %s: %s\n", a.sun_path, strerror(errno));
             return 1;
         }
         if (listen(lfd, 16) < 0) {
@@ -1749,77 +1020,30 @@ int main(int argc, char **argv)
             fprintf(stderr, "[waylandd] FAIL: add_socket_fd\n");
             return 1;
         }
-        fprintf(stderr, "[waylandd] bound explicit socket at %s (fd=%d)\n",
-                a.sun_path, lfd);
+        fprintf(stderr, "[waylandd] bound explicit socket at %s\n", a.sun_path);
         sock = sock_name;
     }
     fprintf(stderr, "[waylandd] listening on WAYLAND_DISPLAY=%s\n", sock);
 
     if (wl_display_init_shm(g_display) < 0)
         fprintf(stderr, "[waylandd] WARN: wl_display_init_shm failed\n");
-    else
-        fprintf(stderr, "[waylandd] wl_shm initialised\n");
 
-    struct wl_global *comp = wl_global_create(g_display, &wl_compositor_interface,
-                                              4, NULL, compositor_bind);
-    if (!comp) {
-        fprintf(stderr, "[waylandd] FAIL: wl_global_create(wl_compositor)\n");
-        return 1;
-    }
-    fprintf(stderr, "[waylandd] wl_compositor global advertised (v4)\n");
-
-    struct wl_global *xdg = wl_global_create(g_display, &xdg_wm_base_interface,
-                                              3, NULL, wm_base_bind);
-    if (!xdg) {
-        fprintf(stderr, "[waylandd] FAIL: wl_global_create(xdg_wm_base)\n");
-        return 1;
-    }
-    fprintf(stderr, "[waylandd] xdg_wm_base global advertised (v3)\n");
-
-    struct wl_global *seat = wl_global_create(g_display, &wl_seat_interface,
-                                               5, NULL, seat_bind);
-    if (!seat) {
-        fprintf(stderr, "[waylandd] FAIL: wl_global_create(wl_seat)\n");
-        return 1;
-    }
-    fprintf(stderr, "[waylandd] wl_seat global advertised (v5)\n");
-
-    struct wl_global *output = wl_global_create(g_display, &wl_output_interface,
-                                                 3, NULL, output_bind);
-    if (!output) {
-        fprintf(stderr, "[waylandd] FAIL: wl_global_create(wl_output)\n");
-        return 1;
-    }
-    fprintf(stderr, "[waylandd] wl_output global advertised (v3)\n");
-
-    /* Become the global input grabber so the kernel WM forwards every
-     * mouse/keyboard event into our per-PID input queue.  Without this
-     * sys_brook_input_pop in pump_input_once() always returns 0 in raw
-     * (non-WM) compositor mode and we lose all input.  Best-effort: if
-     * the syscall isn't compiled in we just keep going. */
-    {
-        long rc = syscall(505 /* sys_brook_input_grab */, 1L);
-        if (rc == 0)
-            fprintf(stderr, "[waylandd] input grab acquired\n");
-        else
-            fprintf(stderr, "[waylandd] WARN: input grab failed rc=%ld errno=%d\n",
-                    rc, errno);
-    }
+    if (!wl_global_create(g_display, &wl_compositor_interface, 4, NULL, compositor_bind)) return 1;
+    if (!wl_global_create(g_display, &xdg_wm_base_interface, 3, NULL, wm_base_bind)) return 1;
+    if (!wl_global_create(g_display, &wl_seat_interface, 5, NULL, seat_bind)) return 1;
+    if (!wl_global_create(g_display, &wl_output_interface, 3, NULL, output_bind)) return 1;
+    fprintf(stderr, "[waylandd] globals advertised\n");
 
     signal(SIGINT,  on_sigint);
     signal(SIGTERM, on_sigint);
 
     struct wl_event_loop *loop = wl_display_get_event_loop(g_display);
-    if (!loop) {
-        fprintf(stderr, "[waylandd] FAIL: get_event_loop\n");
-        return 1;
-    }
+    if (!loop) return 1;
 
+    uint32_t loop_start = g_now_ms();
     for (;;) {
         if (g_shutdown) break;
         wl_display_flush_clients(g_display);
-        /* Poll input every 16ms (~60Hz) by using a short dispatch timeout
-         * and pumping in between.  This keeps pointer cadence smooth. */
         for (int sub = 0; sub < 60 && !g_shutdown; ++sub) {
             pump_input_once();
             int n = wl_event_loop_dispatch(loop, 16);
@@ -1829,14 +1053,10 @@ int main(int argc, char **argv)
             }
             wl_display_flush_clients(g_display);
         }
-        /* ~1Hz panel refresh so the clock ticks even when no client
-         * commits. */
-        redraw_workspace();
-        if (run_seconds > 0 && --run_seconds == 0)
+        if (run_seconds > 0 && (int)((g_now_ms() - loop_start) / 1000) >= run_seconds)
             break;
     }
 done:
-
     fprintf(stderr, "[waylandd] shutting down (commits=%d)\n", g_commit_count);
     wl_display_destroy(g_display);
     fprintf(stderr, "[waylandd] PASS\n");

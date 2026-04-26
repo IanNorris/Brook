@@ -1,3 +1,5 @@
 # Brook Wayland xdg-shell round-trip smoke test
+set wm
+set vfb none
 run /nix/store/zpxxdjy9w210lpqm9mp7vgra9a4qx8vr-waylandd-brook-0.1-brook/bin/waylandd --seconds 12
 run /nix/store/fnzi2sarrqvh6vfr0wngmvv07q3zrw0r-wayland-xdg-smoke-brook-0.1-brook/bin/wayland-xdg-smoke

@@ -64,6 +64,8 @@ static bool     g_ttyFull   = false; // When true, skip VFB for spawned processe
 // 1920x1080 backbuffer over the server's, producing a flicker-then-black
 // effect that's been mistaken for "client only renders one frame".
 static bool     g_vfbFullscreenMode = false;
+static bool     g_vfbNone = false; // 'set vfb none' — skip auto-Window for all spawns
+                                   // (used by wayland scripts; clients call WM_CREATE_WINDOW themselves)
 static bool     g_vfbFullscreenConsumed = false;
 
 // Track spawned process count for auto-tiling placement
@@ -376,7 +378,7 @@ static Process* SpawnProcess(const char* path, int argc, const char* const* argv
     proc->name[ni] = '\0';
 
     // Set up compositor placement
-    bool skipVfb = g_ttyFull;
+    bool skipVfb = g_ttyFull || g_vfbNone;
     if (g_vfbFullscreenMode)
     {
         if (g_vfbFullscreenConsumed)
@@ -683,6 +685,12 @@ static int ExecCommand(int argc, const char* const* argv)
             // (i.e. fullscreen 1:1).  Convenient for wayland_flower.rc and
             // similar single-app shells where you want the client to occupy
             // the whole screen.
+            if (StrEq(argv[2], "none"))
+            {
+                g_vfbNone = true;
+                KPrintf("vfb: none (auto-window suppressed for spawned procs)\n");
+                return 0;
+            }
             if (StrEq(argv[2], "auto") || StrEq(argv[2], "full"))
             {
                 uint32_t physW = 0, physH = 0;
