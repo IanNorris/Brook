@@ -40,13 +40,15 @@ struct FullExceptionFrame {
 };
 
 // ---- Helper to fill one IDT entry ----
-static void SetIdtEntry(uint8_t vector, void* handler, uint8_t ist = 0)
+static void SetIdtEntry(uint8_t vector, void* handler, uint8_t ist = 0,
+                        uint8_t dpl = 0)
 {
     uintptr_t addr = reinterpret_cast<uintptr_t>(handler);
     g_idt[vector].offsetLow  = static_cast<uint16_t>(addr & 0xFFFF);
     g_idt[vector].selector   = GDT_KERNEL_CODE;
     g_idt[vector].ist        = ist;
-    g_idt[vector].typeAttr   = 0x8E;
+    // P=1 | DPL | 0 | type=1110 (interrupt gate)
+    g_idt[vector].typeAttr   = 0x8E | static_cast<uint8_t>((dpl & 0x3) << 5);
     g_idt[vector].offsetMid  = static_cast<uint16_t>((addr >> 16) & 0xFFFF);
     g_idt[vector].offsetHigh = static_cast<uint32_t>((addr >> 32) & 0xFFFFFFFF);
     g_idt[vector]._reserved  = 0;
@@ -1378,8 +1380,8 @@ void IdtInit(brook::Framebuffer* fb)
     SetIdtEntry( 0, reinterpret_cast<void*>(ExceptionHandler0));
     SetIdtEntry( 1, reinterpret_cast<void*>(ExceptionHandler1));
     SetIdtEntry( 2, reinterpret_cast<void*>(ExceptionHandler2), IST_NMI);
-    SetIdtEntry( 3, reinterpret_cast<void*>(ExceptionHandler3));
-    SetIdtEntry( 4, reinterpret_cast<void*>(ExceptionHandler4));
+    SetIdtEntry( 3, reinterpret_cast<void*>(ExceptionHandler3), 0, /*dpl=*/3);
+    SetIdtEntry( 4, reinterpret_cast<void*>(ExceptionHandler4), 0, /*dpl=*/3);
     SetIdtEntry( 5, reinterpret_cast<void*>(ExceptionHandler5));
     SetIdtEntry( 6, reinterpret_cast<void*>(ExceptionHandler6));
     SetIdtEntry( 7, reinterpret_cast<void*>(ExceptionHandler7));
