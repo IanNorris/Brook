@@ -96,8 +96,19 @@ static constexpr uint64_t AT_PHENT    = 4;
 static constexpr uint64_t AT_PHNUM    = 5;
 static constexpr uint64_t AT_PAGESZ   = 6;
 static constexpr uint64_t AT_BASE     = 7;
+static constexpr uint64_t AT_FLAGS    = 8;
 static constexpr uint64_t AT_ENTRY    = 9;
+static constexpr uint64_t AT_UID      = 11;
+static constexpr uint64_t AT_EUID     = 12;
+static constexpr uint64_t AT_GID      = 13;
+static constexpr uint64_t AT_EGID     = 14;
+static constexpr uint64_t AT_PLATFORM = 15;
+static constexpr uint64_t AT_HWCAP    = 16;
+static constexpr uint64_t AT_CLKTCK   = 17;
+static constexpr uint64_t AT_SECURE   = 23;
 static constexpr uint64_t AT_RANDOM   = 25;
+static constexpr uint64_t AT_HWCAP2   = 26;
+static constexpr uint64_t AT_EXECFN   = 31;
 
 // Simple PRNG for AT_RANDOM (stack canary seed).
 static uint64_t SimpleRand(uint64_t seed)
@@ -167,6 +178,17 @@ static uint64_t SetupUserStack(Process* proc,
     randSeed = SimpleRand(randSeed);
     uint64_t randomAddr = pushU64(randSeed);
 
+    // 1b. Push AT_PLATFORM string + AT_EXECFN string
+    static const char k_plat[] = "x86_64";
+    uint64_t platformAddr = pushBytes(k_plat, sizeof(k_plat));
+    uint64_t execfnAddr = (argc > 0 && argv && argv[0])
+                          ? pushBytes(argv[0], 0) // populated below; kept 0 if no arg
+                          : 0;
+    if (argc > 0 && argv && argv[0]) {
+        uint64_t len = 0; while (argv[0][len]) ++len;
+        execfnAddr = pushBytes(argv[0], len + 1);
+    }
+
     // 2. Push environment strings and record pointers
     uint64_t envAddrs[32] = {};
     for (int i = 0; i < envc && i < 32; ++i)
@@ -190,18 +212,29 @@ static uint64_t SetupUserStack(Process* proc,
 
     // Compute total 8-byte slots to be pushed below, and pad so final RSP
     // is 16-byte aligned (Linux ABI: RSP mod 16 == 0 at process entry).
-    //   auxv: 8 entries × 2 slots = 16
+    //   auxv: 17 entries × 2 slots = 34
     //   envp: (envc + 1) slots (including NULL terminator)
     //   argv: (argc + 1) slots (including NULL terminator)
     //   argc: 1 slot
-    int totalSlots = 16 + (envc + 1) + (argc + 1) + 1;
+    int totalSlots = 34 + (envc + 1) + (argc + 1) + 1;
     if (totalSlots & 1)
         pushU64(0); // padding to maintain 16-byte alignment
 
     // 5. Push auxiliary vectors (in reverse order, so first entry is at lowest address)
     pushU64(0); pushU64(AT_NULL);                               // AT_NULL
+    pushU64(execfnAddr); pushU64(AT_EXECFN);                    // AT_EXECFN
+    pushU64(0); pushU64(AT_HWCAP2);                             // AT_HWCAP2 = 0
     pushU64(randomAddr); pushU64(AT_RANDOM);                    // AT_RANDOM
+    pushU64(0); pushU64(AT_SECURE);                             // AT_SECURE = 0 (not setuid)
+    pushU64(100); pushU64(AT_CLKTCK);                           // AT_CLKTCK = 100
+    pushU64(0); pushU64(AT_HWCAP);                              // AT_HWCAP = 0 (no SIMD assumptions)
+    pushU64(platformAddr); pushU64(AT_PLATFORM);                // AT_PLATFORM = "x86_64"
+    pushU64(0); pushU64(AT_EGID);                               // AT_EGID = 0 (root)
+    pushU64(0); pushU64(AT_GID);                                // AT_GID = 0
+    pushU64(0); pushU64(AT_EUID);                               // AT_EUID = 0
+    pushU64(0); pushU64(AT_UID);                                // AT_UID = 0
     pushU64(proc->elf.entryPoint); pushU64(AT_ENTRY);           // AT_ENTRY
+    pushU64(0); pushU64(AT_FLAGS);                              // AT_FLAGS = 0
     pushU64(interpBase); pushU64(AT_BASE);                       // AT_BASE (interpreter load addr, 0 if static)
     pushU64(4096); pushU64(AT_PAGESZ);                          // AT_PAGESZ
     pushU64(proc->elf.phdrNum); pushU64(AT_PHNUM);              // AT_PHNUM
