@@ -322,6 +322,16 @@ struct Process
     struct MemFdMap { uint64_t vaddr; uint64_t length; void* mfd; };
     MemFdMap memfdMaps[MAX_MEMFD_MAPS];
 
+    // /dev/fb0 mmap ranges — recorded so sys_munmap can unmap without
+    // freeing the underlying physical pages, which are owned by
+    // proc->fbVirtual (the kernel-side compositor VFB).  Without this,
+    // a process that munmap()s its fb mapping (e.g. Q2's SWimp_SetMode
+    // when changing sw_mode) frees pages still referenced by the
+    // compositor; subsequent re-mmap returns stale/garbage pages.
+    static constexpr uint32_t MAX_FB_MAPS = 4;
+    struct FbMap { uint64_t vaddr; uint64_t length; };
+    FbMap fbMaps[MAX_FB_MAPS];
+
     // User stack
     uint64_t stackBase;         // Bottom of stack allocation (lowest address)
     uint64_t stackTop;          // Top of stack (highest usable address)

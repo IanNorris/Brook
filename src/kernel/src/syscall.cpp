@@ -2340,6 +2340,17 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                      proc->pid,
                      useVirtFb ? "virtual" : "physical",
                      proc->fbVfbWidth, proc->fbVfbHeight);
+
+        // Record the fb mmap so sys_munmap leaves the physical pages
+        // alone (they're owned by proc->fbVirtual when useVirtFb=true,
+        // and by the firmware framebuffer when not).
+        for (uint32_t i = 0; i < Process::MAX_FB_MAPS; ++i) {
+            if (proc->fbMaps[i].length == 0) {
+                proc->fbMaps[i].vaddr  = vaddr;
+                proc->fbMaps[i].length = pages * 4096;
+                break;
+            }
+        }
         return static_cast<int64_t>(vaddr);
     }
 
@@ -2546,6 +2557,23 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t,
         }
     }
 
+    // Is this range a /dev/fb0 mmap?  If so, unmap only — the physical
+    // pages are owned by proc->fbVirtual (or the firmware FB) and
+    // freeing them here would corrupt the compositor's view of the VFB
+    // and leave dangling references in fbVirtual's PT entries.
+    bool isFbMap = false;
+    for (uint32_t i = 0; i < Process::MAX_FB_MAPS; i++) {
+        auto& m = proc->fbMaps[i];
+        if (m.length == 0) continue;
+        if (addr >= m.vaddr && addr + length <= m.vaddr + m.length) {
+            isFbMap = true;
+            if (addr == m.vaddr && length == m.length) {
+                m.vaddr = 0; m.length = 0;
+            }
+            break;
+        }
+    }
+
     for (uint64_t i = 0; i < pages; ++i)
     {
         VirtualAddress va(addr + i * 4096);
@@ -2553,7 +2581,7 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t,
         if (phys)
         {
             VmmUnmapPage(proc->pageTable, va);
-            if (!isMemFd) PmmFreePage(phys);
+            if (!isMemFd && !isFbMap) PmmFreePage(phys);
         }
     }
 
