@@ -735,13 +735,14 @@ static void CompositorLoopWM()
         if (w->vfb)
         {
             // Per-window VFB (Phase A): kernel-resident buffer owned by
-            // the Window itself.  Lets one process own multiple windows.
-            if (w->vfbDirty || forceAll)
-            {
-                BlitWindowVfb(w->vfb, w->clientW, w->clientH, w->vfbStride,
-                              w->clientX(), w->clientY());
-                w->vfbDirty = 0;
-            }
+            // the Window itself.  We always blit (the backbuffer is
+            // wiped to wallpaper each frame, so skipping based on dirty
+            // makes the content flicker out).  vfbDirty is consumed only
+            // to clear the damage-bit; later phases can use it to skip
+            // recomposition when nothing has changed *anywhere*.
+            BlitWindowVfb(w->vfb, w->clientW, w->clientH, w->vfbStride,
+                          w->clientX(), w->clientY());
+            w->vfbDirty = 0;
         }
         else if (p->state != ProcessState::Terminated && p->fbVfbWidth > 0)
         {
