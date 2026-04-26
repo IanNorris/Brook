@@ -894,8 +894,20 @@ static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
         uint32_t fileBlock = static_cast<uint32_t>((offset + bytesRead) >> mnt->blockShift);
         uint32_t blockOff  = static_cast<uint32_t>((offset + bytesRead) & (mnt->blockSize - 1));
         uint32_t diskBlock = Ext2BlockMap(mnt, ino, fileBlock);
+
+        uint32_t avail = mnt->blockSize - blockOff;
+        uint64_t toCopy = len - bytesRead;
+        if (toCopy > avail) toCopy = avail;
+
         if (!diskBlock) {
-            break; // sparse hole or error
+            // Sparse hole: read returns zeros (POSIX semantics for sparse
+            // files). Zero-filling and continuing is essential for ELF
+            // shared libraries where cp -a / fuse2fs preserve zero
+            // alignment padding as sparse blocks on disk.
+            for (uint64_t i = 0; i < toCopy; ++i)
+                dst[bytesRead + i] = 0;
+            bytesRead += toCopy;
+            continue;
         }
 
         if (!Ext2ReadBlock(mnt, diskBlock, blockBuf)) {
@@ -903,10 +915,6 @@ static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
                 diskBlock, fileBlock);
             break;
         }
-
-        uint32_t avail = mnt->blockSize - blockOff;
-        uint64_t toCopy = len - bytesRead;
-        if (toCopy > avail) toCopy = avail;
 
         for (uint64_t i = 0; i < toCopy; ++i)
             dst[bytesRead + i] = blockBuf[blockOff + i];
