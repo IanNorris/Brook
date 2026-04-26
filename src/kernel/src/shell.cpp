@@ -745,6 +745,13 @@ static int ExecCommand(int argc, const char* const* argv)
             {
                 g_vfbWidth = w;
                 g_vfbHeight = h;
+                // Asking for a concrete WxH means the next spawn does want
+                // an auto-window — clear the sticky 'none'/'fullscreen' flags
+                // so a Q2 launch after a Wayland-app launch (which sets
+                // g_vfbNone=true) still gets its compositor VFB.
+                g_vfbNone = false;
+                g_vfbFullscreenMode = false;
+                g_vfbFullscreenConsumed = false;
                 KPrintf("vfb: %ux%u\n", w, h);
             }
         }
