@@ -1,3 +1,3 @@
 # Brook Wayland shm round-trip smoke test
-run /nix/store/xlysf7y1mfiws8815pxi8azcrgi23wq6-waylandd-brook-0.1-brook/bin/waylandd --seconds 10
+run /nix/store/d4hpfzdx8pymcpmml2pai11dl0aggdsb-waylandd-brook-0.1-brook/bin/waylandd --seconds 10
 run /nix/store/gmb5h2zra9bfjw70spqc5lvw4mgy258p-wayland-shm-smoke-brook-0.1-brook/bin/wayland-shm-smoke

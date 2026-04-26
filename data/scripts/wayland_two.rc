@@ -2,6 +2,6 @@
 # Two unmodified Linux Wayland clients connecting to the same waylandd.
 set wm
 set vfb none
-run /nix/store/xlysf7y1mfiws8815pxi8azcrgi23wq6-waylandd-brook-0.1-brook/bin/waylandd
+run /nix/store/d4hpfzdx8pymcpmml2pai11dl0aggdsb-waylandd-brook-0.1-brook/bin/waylandd
 run /nix/store/a1im3kc7f4xdmvkglwcmlbi9970srcp9-weston-weston-eventdemo-bundle-15.0.0-bundle/bin/weston-eventdemo
 run /nix/store/rhisg5gpfbrmqy721xdfj2g6a36rgfnn-weston-weston-clickdot-bundle-15.0.0-bundle/bin/weston-clickdot

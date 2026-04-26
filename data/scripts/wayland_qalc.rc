@@ -1,5 +1,5 @@
 # Brook + qalculate-gtk (GTK3) — first real-toolkit smoke.
 set wm
 set vfb none
-run /nix/store/xlysf7y1mfiws8815pxi8azcrgi23wq6-waylandd-brook-0.1-brook/bin/waylandd
+run /nix/store/d4hpfzdx8pymcpmml2pai11dl0aggdsb-waylandd-brook-0.1-brook/bin/waylandd
 run /nix/store/k4zn496hh9gcfn36dmq92hdlm8xm1jaq-qalculate-gtk-5.10.0/bin/qalculate-gtk
