@@ -12,6 +12,10 @@
 #include "rtc.h"
 #include "terminal.h"
 #include "vfs.h"
+#include "memory/virtual_memory.h"
+#include "memory/physical_memory.h"
+#include "memory/address.h"
+#include "mem_tag.h"
 
 namespace brook {
 
@@ -181,6 +185,12 @@ int WmCreateWindow(Process* proc, int16_t x, int16_t y,
     w.savedY = y;
     w.savedW = clientW;
     w.savedH = clientH;
+    w.vfb       = nullptr;
+    w.vfbStride = 0;
+    w.vfbBytes  = 0;
+    w.vfbUser   = nullptr;
+    w.vfbDirty  = 0;
+    w.wmId      = static_cast<uint16_t>(idx + 1);
     WmStrCopy(w.title, title ? title : "Window", sizeof(w.title));
 
     SerialPrintf("WM: created window %d '%s' at (%d,%d) %ux%u scale=%u for pid %u\n",
@@ -199,6 +209,28 @@ void WmDestroyWindow(int idx)
     if (!w.proc) return;
 
     SerialPrintf("WM: destroyed window %d '%s'\n", idx, w.title);
+
+    // Free the per-window VFB (if any).  We unmap from the owner's user
+    // address space first, then free the kernel-virtual pages.
+    if (w.vfb)
+    {
+        uint64_t pageCount = (w.vfbBytes + 4095) / 4096;
+        Process* p = w.proc;
+        if (p && p->pageTable && w.vfbUser)
+        {
+            uint64_t userBase = reinterpret_cast<uint64_t>(w.vfbUser);
+            for (uint64_t i = 0; i < pageCount; ++i)
+                VmmUnmapPage(p->pageTable, VirtualAddress(userBase + i * 4096));
+        }
+        VmmFreePages(VirtualAddress(reinterpret_cast<uint64_t>(w.vfb)),
+                     pageCount);
+        w.vfb       = nullptr;
+        w.vfbStride = 0;
+        w.vfbBytes  = 0;
+        w.vfbUser   = nullptr;
+        w.vfbDirty  = 0;
+    }
+    w.wmId = 0;
     w.proc = nullptr;
     w.visible = false;
 
@@ -228,7 +260,8 @@ void WmDestroyWindowForProcess(Process* proc)
         if (g_windows[i].proc == proc)
         {
             WmDestroyWindow(static_cast<int>(i));
-            return;
+            // Don't return — a single process may own multiple windows
+            // (e.g. waylandd hosting several xdg_toplevels).
         }
     }
 }
@@ -1151,6 +1184,137 @@ void WmLauncherExec(int itemIdx)
     // Execute the shortcut script (uses existing shell infrastructure)
     extern int ShellExecScript(const char* path);
     ShellExecScript(g_launcherItems[itemIdx].scriptPath);
+}
+
+// ---------------------------------------------------------------------------
+// Per-window VFB API (Phase A of wayland↔WM unification).
+// ---------------------------------------------------------------------------
+
+Window* WmFindWindowById(Process* proc, uint32_t wmId)
+{
+    if (!proc || wmId == 0) return nullptr;
+    int idx = static_cast<int>(wmId) - 1;
+    if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return nullptr;
+    Window& w = g_windows[idx];
+    if (w.proc != proc || w.wmId != wmId) return nullptr;
+    return &w;
+}
+
+WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
+                                              uint16_t clientW,
+                                              uint16_t clientH,
+                                              const char* title)
+{
+    WmCreateWindowResult res = {};
+
+    if (!proc || clientW == 0 || clientH == 0) return res;
+    if (clientW < WM_MIN_WIDTH)  clientW = WM_MIN_WIDTH;
+    if (clientH < WM_MIN_HEIGHT) clientH = WM_MIN_HEIGHT;
+
+    // Cascade placement: each new window offset 30px from the prior count.
+    static int s_cascade = 0;
+    int16_t winX = static_cast<int16_t>(40 + (s_cascade % 8) * 30);
+    int16_t winY = static_cast<int16_t>(40 + (s_cascade % 8) * 30);
+    s_cascade++;
+
+    int idx = WmCreateWindow(proc, winX, winY, clientW, clientH, title, 1);
+    if (idx < 0) return res;
+
+    Window& w = g_windows[idx];
+
+    // Allocate the VFB pages kernel-side.
+    uint32_t stride = clientW;
+    uint64_t bytes  = static_cast<uint64_t>(stride) * clientH * 4;
+    uint64_t pages  = (bytes + 4095) / 4096;
+
+    VirtualAddress kAddr = VmmAllocPages(pages, VMM_WRITABLE,
+                                          MemTag::Device, proc->pid);
+    if (!kAddr)
+    {
+        SerialPrintf("WM: VFB alloc failed for window '%s' (%ux%u)\n",
+                     w.title, clientW, clientH);
+        WmDestroyWindow(idx);
+        return res;
+    }
+    auto* kVfb = reinterpret_cast<uint32_t*>(kAddr.raw());
+    for (uint64_t i = 0; i < bytes / 4; ++i) kVfb[i] = 0;
+
+    // Map the same physical pages into the calling process's address
+    // space, user-readable.  Reuse the user-mmap window allocator
+    // (mmapNext) — pick a contiguous free range.
+    uint64_t userBase = proc->mmapNext;
+    if (userBase + pages * 4096 > USER_MMAP_END)
+    {
+        SerialPrintf("WM: user mmap window exhausted for VFB\n");
+        VmmFreePages(kAddr, pages);
+        WmDestroyWindow(idx);
+        return res;
+    }
+    proc->mmapNext = userBase + pages * 4096;
+
+    bool mapOk = true;
+    for (uint64_t i = 0; i < pages; ++i)
+    {
+        VirtualAddress kPage(kAddr.raw() + i * 4096);
+        PhysicalAddress phys = VmmVirtToPhys(KernelPageTable, kPage);
+        if (!phys) { mapOk = false; break; }
+        if (!VmmMapPage(proc->pageTable, VirtualAddress(userBase + i * 4096),
+                        phys,
+                        VMM_PRESENT | VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
+                        MemTag::Device, proc->pid))
+        {
+            mapOk = false;
+            break;
+        }
+    }
+    if (!mapOk)
+    {
+        SerialPrintf("WM: failed to map VFB into user space\n");
+        // Best-effort unmap of any partial pages.
+        for (uint64_t i = 0; i < pages; ++i)
+            VmmUnmapPage(proc->pageTable, VirtualAddress(userBase + i * 4096));
+        VmmFreePages(kAddr, pages);
+        WmDestroyWindow(idx);
+        return res;
+    }
+
+    w.vfb       = kVfb;
+    w.vfbStride = stride;
+    w.vfbBytes  = pages * 4096;
+    w.vfbUser   = reinterpret_cast<void*>(userBase);
+    w.vfbDirty  = 1;  // first frame
+
+    SerialPrintf("WM: window %d '%s' VFB %ux%u kvfb=0x%lx user=0x%lx pid=%u\n",
+                 idx, w.title, clientW, clientH,
+                 reinterpret_cast<uint64_t>(kVfb), userBase, proc->pid);
+
+    res.wmId      = w.wmId;
+    res.vfbUser   = w.vfbUser;
+    res.vfbStride = w.vfbStride;
+    return res;
+}
+
+void WmDestroyWindowById(Process* proc, uint32_t wmId)
+{
+    Window* w = WmFindWindowById(proc, wmId);
+    if (!w) return;
+    int idx = static_cast<int>(wmId) - 1;
+    WmDestroyWindow(idx);
+}
+
+void WmSignalDirtyById(Process* proc, uint32_t wmId)
+{
+    Window* w = WmFindWindowById(proc, wmId);
+    if (!w) return;
+    w->vfbDirty = 1;
+    CompositorWake();
+}
+
+void WmSetTitleById(Process* proc, uint32_t wmId, const char* title)
+{
+    Window* w = WmFindWindowById(proc, wmId);
+    if (!w || !title) return;
+    WmStrCopy(w->title, title, sizeof(w->title));
 }
 
 } // namespace brook

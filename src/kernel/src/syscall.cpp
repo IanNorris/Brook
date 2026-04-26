@@ -7289,7 +7289,6 @@ static int64_t sys_brook_crash_complete(uint64_t exitCode,
 
 // ---------------------------------------------------------------------------
 // sys_brook_input_pop (504) — drain the calling process's per-process input
-// queue. WM-mode delivery is already in place: the compositor pushes events
 // for the focused window into proc->inputQueue.  This syscall lets a
 // userspace display server (waylandd) drain the queue without going via the
 // /dev/keyboard fd path (which is scancode-only and lossy for mouse).
@@ -7367,6 +7366,100 @@ static int64_t sys_brook_input_grab(uint64_t enable, uint64_t, uint64_t,
     if (!proc) return -ESRCH;
     bool ok = brook::CompositorSetInputGrabber(proc, enable != 0);
     return ok ? 0 : -EPERM;
+}
+
+// ---------------------------------------------------------------------------
+// Brook WM syscalls 506-509 — multi-window-per-process WM API.
+// Phase A of the wayland↔WM unification.  Lets one process (e.g. waylandd)
+// own multiple top-level windows, each backed by its own kernel-allocated
+// VFB mapped read/write into the caller's address space.
+// ---------------------------------------------------------------------------
+
+// 506: WM_CREATE_WINDOW
+//   arg0 = clientW (uint16)
+//   arg1 = clientH (uint16)
+//   arg2 = title pointer (user, 0-terminated)
+//   arg3 = out struct pointer (user) — receives:
+//          uint32_t wmId, uint32_t vfbStride, uint64_t vfbUser
+// Returns 0 on success, -errno on failure.
+struct BrookWmCreateOut {
+    uint32_t wmId;
+    uint32_t vfbStride;
+    uint64_t vfbUser;
+};
+
+static int64_t sys_brook_wm_create_window(uint64_t cW, uint64_t cH,
+                                           uint64_t titlePtr, uint64_t outPtr,
+                                           uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    if (cW == 0 || cH == 0 || cW > 0xFFFF || cH > 0xFFFF) return -EINVAL;
+    if (!outPtr) return -EFAULT;
+
+    char titleBuf[64] = {};
+    if (titlePtr) {
+        const char* utp = reinterpret_cast<const char*>(titlePtr);
+        for (uint32_t i = 0; i < sizeof(titleBuf) - 1; ++i) {
+            char c = utp[i];
+            titleBuf[i] = c;
+            if (!c) break;
+        }
+        titleBuf[sizeof(titleBuf) - 1] = '\0';
+    }
+
+    auto res = brook::WmCreateWindowForProcess(proc,
+                                                static_cast<uint16_t>(cW),
+                                                static_cast<uint16_t>(cH),
+                                                titlePtr ? titleBuf : nullptr);
+    if (res.wmId == 0) return -ENOMEM;
+
+    auto* uo = reinterpret_cast<BrookWmCreateOut*>(outPtr);
+    uo->wmId      = res.wmId;
+    uo->vfbStride = res.vfbStride;
+    uo->vfbUser   = reinterpret_cast<uint64_t>(res.vfbUser);
+    return 0;
+}
+
+// 507: WM_DESTROY_WINDOW(wmId)
+static int64_t sys_brook_wm_destroy_window(uint64_t wmId, uint64_t, uint64_t,
+                                            uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    if (wmId == 0 || wmId > 0xFFFFFFFFu) return -EINVAL;
+    brook::WmDestroyWindowById(proc, static_cast<uint32_t>(wmId));
+    return 0;
+}
+
+// 508: WM_SIGNAL_DIRTY(wmId) — caller has finished writing to the VFB.
+static int64_t sys_brook_wm_signal_dirty(uint64_t wmId, uint64_t, uint64_t,
+                                          uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    if (wmId == 0) return -EINVAL;
+    brook::WmSignalDirtyById(proc, static_cast<uint32_t>(wmId));
+    return 0;
+}
+
+// 509: WM_SET_TITLE(wmId, title*)
+static int64_t sys_brook_wm_set_title(uint64_t wmId, uint64_t titlePtr,
+                                       uint64_t, uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    if (wmId == 0 || !titlePtr) return -EINVAL;
+    char buf[64] = {};
+    const char* utp = reinterpret_cast<const char*>(titlePtr);
+    for (uint32_t i = 0; i < sizeof(buf) - 1; ++i) {
+        char c = utp[i];
+        buf[i] = c;
+        if (!c) break;
+    }
+    buf[sizeof(buf) - 1] = '\0';
+    brook::WmSetTitleById(proc, static_cast<uint32_t>(wmId), buf);
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -8731,6 +8824,10 @@ void SyscallTableInit()
     g_syscallTable[503]                  = sys_brook_crash_complete;
     g_syscallTable[504]                  = sys_brook_input_pop;
     g_syscallTable[505]                  = sys_brook_input_grab;
+    g_syscallTable[506]                  = sys_brook_wm_create_window;
+    g_syscallTable[507]                  = sys_brook_wm_destroy_window;
+    g_syscallTable[508]                  = sys_brook_wm_signal_dirty;
+    g_syscallTable[509]                  = sys_brook_wm_set_title;
 
     uint32_t count = 0;
     for (uint64_t i = 0; i < SYSCALL_MAX; ++i)

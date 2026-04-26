@@ -51,6 +51,17 @@ struct Window
     bool        minimized;      // hidden from desktop, shown in taskbar
     char        title[64];
 
+    // Per-window VFB (Phase A of wayland↔WM unification).  When non-null
+    // the compositor blits from this buffer instead of `proc->fbVirtual`,
+    // permitting multiple windows per process.  Allocated kernel-side and
+    // mapped user-readable into `proc`'s address space at `vfbUser`.
+    uint32_t*   vfb;            // kernel-virtual pointer (for blit reads)
+    uint32_t    vfbStride;      // pixels per row (== clientW today)
+    uint64_t    vfbBytes;       // total allocation size (page-aligned)
+    void*       vfbUser;        // user-space address in proc->pageTable
+    uint8_t     vfbDirty;       // set by syscall on each commit; cleared after blit
+    uint16_t    wmId;           // (idx + 1); 0 reserved for "invalid"
+
     // Pre-maximise geometry (for restore)
     int16_t     savedX, savedY;
     uint16_t    savedW, savedH;
@@ -174,6 +185,35 @@ uint32_t WmDesktopHeight(uint32_t screenH);
 
 // Spawn a new terminal window (Ctrl+T handler).
 void WmSpawnTerminal();
+
+// ---------------------------------------------------------------------------
+// Per-window VFB API (Phase A of wayland↔WM unification).
+//
+// Lets a single process (e.g. waylandd) own multiple top-level windows,
+// each backed by its own VFB.  The kernel allocates the VFB pages, maps
+// them user-readable into `proc`, and registers the window with the WM.
+// On destroy the pages are unmapped + freed.
+//
+// Returned wmId is `windowIndex + 1` so 0 can mean "invalid".
+// ---------------------------------------------------------------------------
+
+struct WmCreateWindowResult {
+    uint32_t wmId;     // 0 on failure
+    void*    vfbUser;  // user-virtual VFB pointer
+    uint32_t vfbStride;
+};
+
+WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
+                                              uint16_t clientW,
+                                              uint16_t clientH,
+                                              const char* title);
+
+void WmDestroyWindowById(Process* proc, uint32_t wmId);
+void WmSignalDirtyById(Process* proc, uint32_t wmId);
+void WmSetTitleById(Process* proc, uint32_t wmId, const char* title);
+
+// Look up a Window* given (proc, wmId).  Returns nullptr if mismatch.
+Window* WmFindWindowById(Process* proc, uint32_t wmId);
 
 // ---------------------------------------------------------------------------
 // App Launcher

@@ -507,6 +507,44 @@ static void BlitProcessAt(Process* proc, int dstX0, int dstY0, bool forceAll,
     }
 }
 
+// Blit a kernel-resident VFB at an explicit destination.  Used for
+// per-window VFBs (Window::vfb) — separate from the per-process
+// `BlitProcessAt` so we don't need to fake a Process struct.
+static void BlitWindowVfb(const uint32_t* src,
+                           uint32_t srcW, uint32_t srcH, uint32_t srcStride,
+                           int dstX0, int dstY0)
+{
+    if (!src || srcW == 0) return;
+    uint32_t* dstBase = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
+    const uint32_t dstStride = g_backBuffer ? g_backBufStride : g_physFbStride;
+
+    uint32_t startDy = 0, startDx = 0;
+    if (dstY0 < 0) startDy = static_cast<uint32_t>(-dstY0);
+    if (dstX0 < 0) startDx = static_cast<uint32_t>(-dstX0);
+
+    uint32_t endDy = srcH;
+    uint32_t endDx = srcW;
+    if (dstY0 + static_cast<int>(endDy) > static_cast<int>(g_physFbHeight))
+        endDy = g_physFbHeight - static_cast<uint32_t>(dstY0);
+    if (dstX0 + static_cast<int>(endDx) > static_cast<int>(g_physFbWidth))
+        endDx = g_physFbWidth - static_cast<uint32_t>(dstX0);
+
+    if (endDy <= startDy || endDx <= startDx) return;
+
+    MarkDirtyRows(static_cast<uint32_t>(dstY0) + startDy,
+                  static_cast<uint32_t>(dstY0) + endDy);
+
+    uint32_t copyWidth = (endDx - startDx) * 4;
+    for (uint32_t dy = startDy; dy < endDy; ++dy)
+    {
+        const uint32_t* srcRow = src + dy * srcStride + startDx;
+        uint32_t* dstRow = dstBase +
+            static_cast<uint32_t>(dstY0 + dy) * dstStride +
+            static_cast<uint32_t>(dstX0 + startDx);
+        __builtin_memcpy(dstRow, srcRow, copyWidth);
+    }
+}
+
 // Draw wallpaper (or solid background) into backbuffer.
 static void BlitWallpaper()
 {
@@ -694,8 +732,21 @@ static void CompositorLoopWM()
         // Blit content then chrome per-window so z-order is respected.
         // (Previously chrome was drawn after ALL content, so a background
         // window's border could overwrite a foreground window's content.)
-        if (p->state != ProcessState::Terminated && p->fbVfbWidth > 0)
+        if (w->vfb)
+        {
+            // Per-window VFB (Phase A): kernel-resident buffer owned by
+            // the Window itself.  Lets one process own multiple windows.
+            if (w->vfbDirty || forceAll)
+            {
+                BlitWindowVfb(w->vfb, w->clientW, w->clientH, w->vfbStride,
+                              w->clientX(), w->clientY());
+                w->vfbDirty = 0;
+            }
+        }
+        else if (p->state != ProcessState::Terminated && p->fbVfbWidth > 0)
+        {
             BlitProcessAt(p, w->clientX(), w->clientY(), true, w->upscale);
+        }
 
         // Draw text cursor for terminal windows
         if (g_backBuffer)
