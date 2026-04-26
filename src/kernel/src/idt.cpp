@@ -701,6 +701,18 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                 }
             }
         }
+
+        // --- MemFd lazy-page-in (user faults only) ---
+        // wl_shm and gdk-wayland MAP_SHARED a memfd; the mapping is recorded
+        // in proc->memfdMaps but no PTEs are installed until first access.
+        // Allocate the backing page via the mfd's index and install the PTE.
+        if (fromUser && !pfPresent && isUserAddr && cowProc) {
+            extern bool MemFdHandleUserFault(uint64_t, uint64_t);
+            if (MemFdHandleUserFault(cr2cow, ef->errorCode)) {
+                __asm__ volatile("sti");
+                return;
+            }
+        }
     }
 
     // For kernel-mode faults, dump full GPRs then delegate for diagnostics + halt.

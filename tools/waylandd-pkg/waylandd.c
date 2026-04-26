@@ -156,7 +156,8 @@ struct brook_surface {
 
 static struct brook_surface *g_surfaces = NULL;
 
-static struct brook_surface *find_surface_by_wm_id(uint32_t id) {
+struct brook_surface *find_surface_by_wm_id(uint32_t id);
+struct brook_surface *find_surface_by_wm_id(uint32_t id) {
     if (!id) return NULL;
     for (struct brook_surface *s = g_surfaces; s; s = s->next)
         if (s->wm_id == id) return s;
@@ -233,11 +234,15 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
         s->xdg_initial_commit_done = 1;
         struct wl_array states;
         wl_array_init(&states);
-        xdg_toplevel_send_configure(s->xdg_toplevel, 0, 0, &states);
+        /* Suggest a sane default size. Sending 0,0 lets the client pick
+         * its own natural size; for some GTK layouts that produces a
+         * pathological measurement (>65535 px). Bounding it here lets
+         * the SHM pool allocation stay sane. */
+        xdg_toplevel_send_configure(s->xdg_toplevel, 800, 600, &states);
         wl_array_release(&states);
         uint32_t serial = ++s->next_configure_serial;
         xdg_surface_send_configure(s->xdg_surface, serial);
-        fprintf(stderr, "[waylandd] xdg initial configure sent serial=%u\n", serial);
+        fprintf(stderr, "[waylandd] xdg initial configure sent serial=%u (800x600)\n", serial);
         return;
     }
     if (s->xdg_popup && !s->xdg_initial_commit_done) {
@@ -518,6 +523,8 @@ static void xdg_toplevel_resource_destroy(struct wl_resource *r) {
 static void xdg_surface_destroy_req(struct wl_client *c, struct wl_resource *r) {
     (void)c; wl_resource_destroy(r);
 }
+void waylandd_send_enter_for_surface(struct wl_resource *surface_resource);
+
 static void xdg_surface_get_toplevel(struct wl_client *c, struct wl_resource *r,
                                        uint32_t id) {
     struct brook_surface *s = wl_resource_get_user_data(r);
@@ -527,6 +534,10 @@ static void xdg_surface_get_toplevel(struct wl_client *c, struct wl_resource *r,
     wl_resource_set_implementation(tr, &xdg_toplevel_impl, s, xdg_toplevel_resource_destroy);
     s->xdg_toplevel = tr;
     fprintf(stderr, "[waylandd] xdg_surface.get_toplevel id=%u\n", id);
+    /* Tell the client this surface is on our output so GDK's
+     * window_update_scale finds a monitor and doesn't fall back to a
+     * runaway natural-size pass that would clamp at 65535 px. */
+    waylandd_send_enter_for_surface(s->resource);
 }
 /* xdg_popup — minimal: respond to grab/destroy, no nested popups. */
 static void xdg_popup_destroy_req(struct wl_client *c, struct wl_resource *r) {
@@ -922,7 +933,41 @@ static void seat_bind(struct wl_client *client, void *data,
         wl_seat_send_name(r, "brook-seat");
 }
 
-/* wl_output: single output. */
+/* wl_output: single output. We track every bound output resource so that
+ * we can send wl_surface.enter to associate surfaces with their output —
+ * GDK/GTK refuse to compute a sane natural size for a toplevel that
+ * isn't on any monitor, and end up clamping at 65535 px. */
+struct brook_output {
+    struct wl_resource *resource;
+    struct wl_listener  destroy;
+    struct brook_output *next;
+};
+static struct brook_output *g_outputs = NULL;
+
+static void output_resource_destroyed(struct wl_listener *l, void *data) {
+    (void)data;
+    struct brook_output *o = wl_container_of(l, o, destroy);
+    struct brook_output **pp = &g_outputs;
+    while (*pp) {
+        if (*pp == o) { *pp = o->next; break; }
+        pp = &(*pp)->next;
+    }
+    free(o);
+}
+
+void waylandd_send_enter_for_surface(struct wl_resource *surface_resource);
+void waylandd_send_enter_for_surface(struct wl_resource *surface_resource) {
+    if (!surface_resource) return;
+    struct wl_client *sc = wl_resource_get_client(surface_resource);
+    for (struct brook_output *o = g_outputs; o; o = o->next) {
+        if (wl_resource_get_client(o->resource) == sc) {
+            wl_surface_send_enter(surface_resource, o->resource);
+            fprintf(stderr, "[waylandd] wl_surface.enter sent (output res=%p)\n",
+                    (void*)o->resource);
+        }
+    }
+}
+
 static void output_release(struct wl_client *c, struct wl_resource *r) {
     (void)c; wl_resource_destroy(r);
 }
@@ -936,6 +981,16 @@ static void output_bind(struct wl_client *client, void *data,
                                                 (int)version, id);
     if (!r) { wl_client_post_no_memory(client); return; }
     wl_resource_set_implementation(r, &output_impl, NULL, NULL);
+    fprintf(stderr, "[waylandd] wl_output bind v=%u id=%u client=%p\n",
+            version, id, (void*)client);
+    struct brook_output *o = calloc(1, sizeof(*o));
+    if (o) {
+        o->resource = r;
+        o->destroy.notify = output_resource_destroyed;
+        wl_resource_add_destroy_listener(r, &o->destroy);
+        o->next = g_outputs;
+        g_outputs = o;
+    }
     int w = 1920, h = 1080;
     wl_output_send_geometry(r, 0, 0,
         (int)((w * 254 + 480) / 960), (int)((h * 254 + 480) / 960),

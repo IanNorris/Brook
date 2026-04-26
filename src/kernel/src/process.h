@@ -319,7 +319,7 @@ struct Process
     // the underlying kernel heap pages (the MemFd buffer). Without this,
     // client munmap() of a shared memfd corrupts the kernel heap.
     static constexpr uint32_t MAX_MEMFD_MAPS = 16;
-    struct MemFdMap { uint64_t vaddr; uint64_t length; void* mfd; };
+    struct MemFdMap { uint64_t vaddr; uint64_t length; uint64_t offset; void* mfd; };
     MemFdMap memfdMaps[MAX_MEMFD_MAPS];
 
     // /dev/fb0 mmap ranges — recorded so sys_munmap can unmap without

@@ -258,46 +258,93 @@ struct TimerFdData {
 static constexpr uint32_t MFD_CLOEXEC       = 0x0001u;
 [[maybe_unused]] static constexpr uint32_t MFD_ALLOW_SEALING = 0x0002u;
 
+// Sparse / lazy memfd backing.
+//
+// GTK's gdk-wayland speculatively ftruncates ~700 MiB for an SHM cache and
+// then mmap()s the whole region, but only ever touches a tiny slice. Eagerly
+// allocating the full backing would OOM the guest. Instead we keep a per-fd
+// page-index array: pageMap[i] is either 0 (unbacked, reads-as-zero) or the
+// physical address of a 4 KiB page. Pages are allocated on first access —
+// either via kernel sys_read/sys_write to the fd, or via a user #PF on a
+// MAP_SHARED mapping (handled in idt.cpp). Multiple processes sharing the
+// fd share the same physical pages, which is the wl_shm contract.
 struct MemFdData {
-    uint8_t*  buf;        // page-aligned view (what mmap maps)
-    uint8_t*  rawBuf;     // actual kmalloc allocation (may be unaligned)
-    uint64_t  size;
-    uint64_t  capacity;
-    volatile uint32_t refCount; // +1 per fd holding this MemFdData
+    uint64_t* pageMap;          // [pageMapCount] entries; raw PhysicalAddress.value, 0 = unbacked
+    uint64_t  pageMapCount;     // number of slots; covers `capacity` bytes
+    uint64_t  size;             // logical size set by ftruncate / extended on write
+    uint64_t  capacity;         // pageMapCount * 4096
+    volatile uint32_t lock;     // spinlock protecting pageMap allocations + grow
+    volatile uint32_t refCount; // +1 per fd, +1 per live mmap VMA
 };
 
-// Allocate/grow a MemFdData buffer so that `buf` is always 4 KiB aligned.
-// Wayland's wl_shm path mmaps the fd in two processes and expects both
-// mappings to alias the same bytes at offset 0 — that requires the
-// backing buffer to start on a page boundary. Without this, the user's
-// mmap view is page-aligned DOWN from `buf`, exposing allocator padding
-// bytes before the real payload.
-static bool MemFdGrow(MemFdData* mfd, uint64_t needed)
+static inline void MfdLock(MemFdData* mfd)
+{
+    while (__atomic_exchange_n(&mfd->lock, 1, __ATOMIC_ACQUIRE)) {
+        __asm__ volatile("pause");
+    }
+}
+static inline void MfdUnlock(MemFdData* mfd)
+{
+    __atomic_store_n(&mfd->lock, 0, __ATOMIC_RELEASE);
+}
+
+// Grow pageMap to cover at least `needed` bytes. Does NOT allocate any
+// physical pages — those are demand-paged. Caller must hold mfd->lock.
+static bool MemFdGrowLocked(MemFdData* mfd, uint64_t needed)
 {
     if (needed <= mfd->capacity) return true;
-    // Cap memfd size at 128 MiB. GTK's gdk-wayland speculatively
-    // ftruncates a giant pool (~700 MiB) for the SHM cache; allowing
-    // that would either OOM kmalloc or wrap our uint32 cast below.
-    // Returning ENOMEM lets it back off to a per-buffer pool.
-    static constexpr uint64_t MEMFD_MAX = 128ULL * 1024 * 1024;
-    if (needed > MEMFD_MAX) return false;
-    uint64_t newCap = needed + 4096;
-    // Over-allocate by one page so we can align up inside the allocation.
-    uint8_t* raw = static_cast<uint8_t*>(kmalloc(static_cast<uint32_t>(newCap + 4096)));
-    if (!raw) return false;
-    uintptr_t aligned = (reinterpret_cast<uintptr_t>(raw) + 0xFFF) & ~uintptr_t{0xFFF};
-    uint8_t* newBuf = reinterpret_cast<uint8_t*>(aligned);
-    if (mfd->buf) {
-        for (uint64_t i = 0; i < mfd->size; i++) newBuf[i] = mfd->buf[i];
+    // Cap at 16 GiB of address space so the index array itself stays small
+    // (16 GiB / 4 KiB * 8 = 32 MiB index). Past this is almost certainly an
+    // app pathology and -ENOMEM is the right answer.
+    static constexpr uint64_t MEMFD_MAX = 16ULL * 1024 * 1024 * 1024;
+    if (needed > MEMFD_MAX) {
+        SerialPrintf("MemFdGrow: needed=%lu > MEMFD_MAX (%lu), returning ENOMEM\n",
+                     needed, MEMFD_MAX);
+        return false;
     }
-    // Zero the rest of capacity — mmap'd clients expect read-as-zero past size.
-    for (uint64_t i = mfd->size; i < newCap; i++) newBuf[i] = 0;
-    uint8_t* oldRaw = mfd->rawBuf;
-    mfd->rawBuf   = raw;
-    mfd->buf      = newBuf;
-    mfd->capacity = newCap;
-    if (oldRaw) kfree(oldRaw);
+
+    uint64_t newCount = (needed + 4095) / 4096;
+    uint64_t bytes = newCount * sizeof(uint64_t);
+    auto* newMap = static_cast<uint64_t*>(kmalloc(static_cast<uint32_t>(bytes)));
+    if (!newMap) {
+        SerialPrintf("MemFdGrow: kmalloc(%lu) FAILED for index of %lu pages\n",
+                     bytes, newCount);
+        return false;
+    }
+    for (uint64_t i = 0; i < mfd->pageMapCount; i++) newMap[i] = mfd->pageMap[i];
+    for (uint64_t i = mfd->pageMapCount; i < newCount; i++) newMap[i] = 0;
+    if (mfd->pageMap) kfree(mfd->pageMap);
+    mfd->pageMap = newMap;
+    mfd->pageMapCount = newCount;
+    mfd->capacity = newCount * 4096;
     return true;
+}
+
+static bool MemFdGrow(MemFdData* mfd, uint64_t needed)
+{
+    MfdLock(mfd);
+    bool ok = MemFdGrowLocked(mfd, needed);
+    MfdUnlock(mfd);
+    return ok;
+}
+
+// Get-or-allocate the physical page backing page index `pageIdx`. Returns
+// PhysicalAddress(0) on OOM or out-of-range. New pages are zero-filled.
+static PhysicalAddress MemFdGetOrAllocPage(MemFdData* mfd, uint64_t pageIdx, uint16_t pid)
+{
+    MfdLock(mfd);
+    if (pageIdx >= mfd->pageMapCount) { MfdUnlock(mfd); return PhysicalAddress(0); }
+    uint64_t raw = mfd->pageMap[pageIdx];
+    if (raw == 0) {
+        PhysicalAddress phys = PmmAllocPage(MemTag::User, pid);
+        if (!phys) { MfdUnlock(mfd); return PhysicalAddress(0); }
+        auto* va = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
+        for (uint32_t i = 0; i < 4096; i++) va[i] = 0;
+        raw = phys.raw();
+        mfd->pageMap[pageIdx] = raw;
+    }
+    MfdUnlock(mfd);
+    return PhysicalAddress(raw);
 }
 
 static inline void MemFdRef(MemFdData* mfd)
@@ -310,14 +357,64 @@ static inline void MemFdUnref(MemFdData* mfd)
     if (!mfd) return;
     uint32_t prev = __atomic_fetch_sub(&mfd->refCount, 1, __ATOMIC_ACQ_REL);
     if (prev <= 1) {
-        if (mfd->rawBuf) kfree(mfd->rawBuf);
+        if (mfd->pageMap) {
+            for (uint64_t i = 0; i < mfd->pageMapCount; i++) {
+                if (mfd->pageMap[i]) PmmFreePage(PhysicalAddress(mfd->pageMap[i]));
+            }
+            kfree(mfd->pageMap);
+        }
         kfree(mfd);
     }
 }
 
+// User #PF demand-paging hook for memfd MAP_SHARED mappings. Returns true
+// if the fault was a memfd-backed page that we just paged in; false if
+// this fault is unrelated (caller should fall through to the kill path).
+extern "C" bool MemFdHandleUserFault(uint64_t cr2, uint64_t errCode);
+
 // External wrappers for fork() in process.cpp, which doesn't see MemFdData.
 void MemFdHandleRef(void* handle) { MemFdRef(static_cast<MemFdData*>(handle)); }
 void MemFdHandleUnref(void* handle) { MemFdUnref(static_cast<MemFdData*>(handle)); }
+
+// Demand-page a memfd-backed user mapping. Called from the user #PF path
+// in idt.cpp before the kill flow. Returns true if the fault was on a
+// memfd VMA and was successfully resolved (PTE installed).
+extern "C" bool MemFdHandleUserFault(uint64_t cr2, uint64_t errCode)
+{
+    (void)errCode;
+    Process* proc = ProcessCurrent();
+    if (!proc) return false;
+    uint64_t pageVA = cr2 & ~uint64_t{0xFFF};
+
+    for (uint32_t i = 0; i < Process::MAX_MEMFD_MAPS; i++) {
+        auto& m = proc->memfdMaps[i];
+        if (m.length == 0 || !m.mfd) continue;
+        if (pageVA < m.vaddr || pageVA >= m.vaddr + m.length) continue;
+
+        auto* mfd = static_cast<MemFdData*>(m.mfd);
+        uint64_t offsetInVma = pageVA - m.vaddr;
+        uint64_t mfdOffset = m.offset + offsetInVma;
+        uint64_t pageIdx = mfdOffset / 4096;
+
+        PhysicalAddress phys = MemFdGetOrAllocPage(mfd, pageIdx, proc->pid);
+        if (!phys) return false;
+
+        // Install a writable user PTE. We don't tag with PTE_TAG/PTE_PID
+        // ownership bits because the page is owned by the mfd's pageMap,
+        // not by this process's page table — VmmDestroyUserPageTable must
+        // not free it. process.cpp::ProcessDestroy explicitly VmmUnmapPage's
+        // every memfd VMA before destroying the page table, which clears
+        // these PTEs and prevents the unref-on-destroy walk from touching
+        // mfd-owned pages.
+        if (!VmmMapPage(proc->pageTable, VirtualAddress(pageVA), phys,
+                        VMM_PRESENT | VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
+                        MemTag::User, proc->pid)) {
+            return false;
+        }
+        return true;
+    }
+    return false;
+}
 
 // ---------------------------------------------------------------------------
 // AF_UNIX path sockets — structs and helpers defined here so
@@ -802,22 +899,33 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
         return static_cast<int64_t>(written);
     }
 
-    // Write to memfd — grows buffer as needed
+    // Write to memfd — grows backing as needed, allocates pages on demand.
     if (fde->type == FdType::MemFd && fde->handle)
     {
         auto* mfd = static_cast<MemFdData*>(fde->handle);
+        if (bufAddr < 0x1000) return -EFAULT;
         uint64_t pos = fde->seekPos;
         uint64_t end = pos + count;
 
-        // Grow buffer if needed
         if (end > mfd->capacity) {
             if (!MemFdGrow(mfd, end)) return -ENOMEM;
         }
 
-        if (bufAddr < 0x1000) return -EFAULT;
-        __builtin_memcpy(mfd->buf + pos, reinterpret_cast<const void*>(bufAddr), count);
-        fde->seekPos += count;
-        if (fde->seekPos > mfd->size) mfd->size = fde->seekPos;
+        const uint8_t* src = reinterpret_cast<const uint8_t*>(bufAddr);
+        uint64_t remaining = count;
+        while (remaining) {
+            uint64_t pageIdx = pos / 4096;
+            uint64_t pageOff = pos & 0xFFF;
+            uint64_t chunk = 4096 - pageOff;
+            if (chunk > remaining) chunk = remaining;
+            PhysicalAddress phys = MemFdGetOrAllocPage(mfd, pageIdx, proc->pid);
+            if (!phys) return -ENOMEM;
+            auto* dst = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw()) + pageOff;
+            __builtin_memcpy(dst, src, chunk);
+            src += chunk; pos += chunk; remaining -= chunk;
+        }
+        fde->seekPos = pos;
+        if (pos > mfd->size) mfd->size = pos;
         return static_cast<int64_t>(count);
     }
 
@@ -1302,7 +1410,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         }
     }
 
-    // Read from memfd — sequential read from heap buffer
+    // Read from memfd — sequential read; unbacked pages read as zero.
     if (fde->type == FdType::MemFd && fde->handle)
     {
         auto* mfd = static_cast<MemFdData*>(fde->handle);
@@ -1310,8 +1418,24 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         if (pos >= mfd->size) return 0; // EOF
         uint64_t avail = mfd->size - pos;
         uint64_t copyLen = (count < avail) ? count : avail;
-        __builtin_memcpy(reinterpret_cast<void*>(bufAddr), mfd->buf + pos, copyLen);
-        fde->seekPos += copyLen;
+
+        auto* dst = reinterpret_cast<uint8_t*>(bufAddr);
+        uint64_t remaining = copyLen;
+        while (remaining) {
+            uint64_t pageIdx = pos / 4096;
+            uint64_t pageOff = pos & 0xFFF;
+            uint64_t chunk = 4096 - pageOff;
+            if (chunk > remaining) chunk = remaining;
+            uint64_t raw = (pageIdx < mfd->pageMapCount) ? mfd->pageMap[pageIdx] : 0;
+            if (raw == 0) {
+                __builtin_memset(dst, 0, chunk);
+            } else {
+                auto* src = reinterpret_cast<const uint8_t*>(PhysToVirt(PhysicalAddress(raw)).raw()) + pageOff;
+                __builtin_memcpy(dst, src, chunk);
+            }
+            dst += chunk; pos += chunk; remaining -= chunk;
+        }
+        fde->seekPos = pos;
         return static_cast<int64_t>(copyLen);
     }
 
@@ -1622,18 +1746,28 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
             entry->name[63] = 0;
             entry->mfd = static_cast<MemFdData*>(kmalloc(sizeof(MemFdData)));
             if (!entry->mfd) return -ENOMEM;
-            entry->mfd->buf = nullptr;
-            entry->mfd->rawBuf = nullptr;
+            entry->mfd->pageMap = nullptr;
+            entry->mfd->pageMapCount = 0;
             entry->mfd->size = 0;
             entry->mfd->capacity = 0;
+            entry->mfd->lock = 0;
             entry->mfd->refCount = 0;
             entry->used = true;
         }
 
         if (trunc) {
-            if (entry->mfd->rawBuf) { kfree(entry->mfd->rawBuf); entry->mfd->rawBuf = nullptr; entry->mfd->buf = nullptr; }
+            MfdLock(entry->mfd);
+            if (entry->mfd->pageMap) {
+                for (uint64_t i = 0; i < entry->mfd->pageMapCount; i++) {
+                    if (entry->mfd->pageMap[i]) PmmFreePage(PhysicalAddress(entry->mfd->pageMap[i]));
+                }
+                kfree(entry->mfd->pageMap);
+                entry->mfd->pageMap = nullptr;
+            }
+            entry->mfd->pageMapCount = 0;
             entry->mfd->size = 0;
             entry->mfd->capacity = 0;
+            MfdUnlock(entry->mfd);
         }
 
         int fd = FdAlloc(proc, FdType::MemFd, entry->mfd);
@@ -2360,17 +2494,20 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         return static_cast<int64_t>(vaddr);
     }
 
-    // MemFd-backed mmap (MAP_SHARED or MAP_PRIVATE) — used by wl_shm
-    // The buffer is heap-allocated, so we copy data into freshly-allocated
-    // user pages and track the mapping for write-back on munmap.
-    // For Wayland's use case (shared pixel buffers), the compositor and client
-    // both mmap the same fd: we give them both mappings into the same MemFdData
-    // buffer by mapping the kernel heap pages directly.
+    // MemFd-backed mmap (MAP_SHARED) — used by wl_shm.
+    //
+    // We DO NOT install PTEs eagerly. The user's virtual range is left
+    // unmapped; the first access on each page traps to MemFdHandleUserFault
+    // (idt.cpp), which calls MemFdGetOrAllocPage and installs the PTE. This
+    // is the lazy/sparse semantics gdk-wayland depends on: ftruncate(700MB)
+    // and mmap(700MB) consume only the index array (≈1.4 MB) until pages
+    // are actually touched.
     if (fde->type == FdType::MemFd && fde->handle)
     {
         auto* mfd = static_cast<MemFdData*>(fde->handle);
 
-        // Grow the MemFd to cover [offset, offset+length) if needed
+        // Grow the page index array to cover [offset, offset+length). Pages
+        // remain unbacked until first access.
         uint64_t needed = offset + length;
         if (needed > mfd->capacity) {
             if (!MemFdGrow(mfd, needed)) return -ENOMEM;
@@ -2380,34 +2517,23 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         uint64_t vaddr = pickAddr();
         if (!vaddr) return -ENOMEM;
 
-        // Map each page of the MemFd buffer directly into user space.
-        // `mfd->buf` is guaranteed page-aligned by MemFdGrow, so offset+i*4096
-        // lands on page boundaries within the backing allocation.
-        for (uint64_t i = 0; i < pages; i++) {
-            uint64_t bufVA = reinterpret_cast<uint64_t>(mfd->buf) + offset + i * 4096;
-            PhysicalAddress phys = VmmVirtToPhys(KernelPageTable, VirtualAddress(bufVA));
-            if (!phys) return -ENOMEM;
-            if (!VmmMapPage(proc->pageTable, VirtualAddress(vaddr + i * 4096),
-                            phys, vmmFlags | VMM_WRITABLE, MemTag::User, proc->pid)) {
-                return -ENOMEM;
-            }
-        }
-
-        // Record the mapping so sys_munmap can skip PmmFreePage on these
-        // pages — they belong to the MemFd's kernel heap buffer, not to
-        // the user process. Without this, client munmap corrupts the heap.
-        // Take a VMA-lifetime ref on the MemFdData so POSIX close(fd) on
-        // the mapping owner does not free the underlying buffer while the
-        // mapping is still live (matches Linux mmap semantics).
+        // Record the mapping (with page-aligned mfd offset) so the PF handler
+        // can resolve faults, and so munmap can tear it down without freeing
+        // the mfd-owned phys pages. Take a VMA-lifetime ref on the MemFdData
+        // so close(fd) doesn't drop the backing while the mapping is live.
+        bool tracked = false;
         for (uint32_t i = 0; i < Process::MAX_MEMFD_MAPS; i++) {
             if (proc->memfdMaps[i].length == 0) {
                 proc->memfdMaps[i].vaddr  = vaddr;
                 proc->memfdMaps[i].length = pages * 4096;
+                proc->memfdMaps[i].offset = offset;
                 proc->memfdMaps[i].mfd    = mfd;
                 MemFdRef(mfd);
+                tracked = true;
                 break;
             }
         }
+        if (!tracked) return -ENOMEM;
         return static_cast<int64_t>(vaddr);
     }
 
@@ -6220,11 +6346,12 @@ static int64_t sys_memfd_create(uint64_t nameAddr, uint64_t flags,
 
     auto* mfd = static_cast<MemFdData*>(kmalloc(sizeof(MemFdData)));
     if (!mfd) return -ENOMEM;
-    mfd->buf      = nullptr;
-    mfd->rawBuf   = nullptr;
-    mfd->size     = 0;
-    mfd->capacity = 0;
-    mfd->refCount = 0; // bumped by FdAlloc below
+    mfd->pageMap      = nullptr;
+    mfd->pageMapCount = 0;
+    mfd->size         = 0;
+    mfd->capacity     = 0;
+    mfd->lock         = 0;
+    mfd->refCount     = 0; // bumped by FdAlloc below
 
     int fd = FdAlloc(proc, FdType::MemFd, mfd);
     if (fd < 0) { kfree(mfd); return -EMFILE; }
@@ -6539,9 +6666,18 @@ static int64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t,
             if (length > mfd->capacity) {
                 if (!MemFdGrow(mfd, length)) return -ENOMEM;
             }
-            if (length > mfd->size) {
-                // Zero-fill the extension
-                for (uint64_t i = mfd->size; i < length; i++) mfd->buf[i] = 0;
+            // Shrinking ftruncate: free pages past the new tail. (Growth is
+            // free — pages are unbacked / read-as-zero until first access.)
+            if (length < mfd->size) {
+                MfdLock(mfd);
+                uint64_t firstFreeIdx = (length + 4095) / 4096;
+                for (uint64_t i = firstFreeIdx; i < mfd->pageMapCount; i++) {
+                    if (mfd->pageMap[i]) {
+                        PmmFreePage(PhysicalAddress(mfd->pageMap[i]));
+                        mfd->pageMap[i] = 0;
+                    }
+                }
+                MfdUnlock(mfd);
             }
             mfd->size = length;
             return 0;
