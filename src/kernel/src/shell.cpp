@@ -98,6 +98,16 @@ static const char* g_defaultEnvp[] = {
     "FONTCONFIG_FILE=/nix/store/vb4pfax5bzq9hxi2jb8s40axvv7hz5ls-brook-fonts-0.1/etc/fonts/fonts.conf",
     "FONTCONFIG_PATH=/nix/store/vb4pfax5bzq9hxi2jb8s40axvv7hz5ls-brook-fonts-0.1/etc/fonts",
     "WESTON_DATA_DIR=/nix/store/ls7lby8cwwvbdrwvlswjgxky7lrwjy97-brook-weston-data-0.1/share/weston",
+    // GTK / dbus / portal — keep GTK from hanging on session-bus probe.
+    "GTK_USE_PORTAL=0",
+    "GDK_BACKEND=wayland",
+    "GSETTINGS_BACKEND=memory",
+    "GIO_USE_VFS=local",
+    "NO_AT_BRIDGE=1",
+    "XDG_CACHE_HOME=/tmp/cache",
+    "XDG_CONFIG_HOME=/tmp/config",
+    "XDG_DATA_HOME=/tmp/share",
+    "XDG_DATA_DIRS=/nix/store/vb4pfax5bzq9hxi2jb8s40axvv7hz5ls-brook-fonts-0.1/share:/usr/share",
     nullptr
 };
 

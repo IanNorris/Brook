@@ -227,7 +227,7 @@ static uint64_t SetupUserStack(Process* proc,
     pushU64(randomAddr); pushU64(AT_RANDOM);                    // AT_RANDOM
     pushU64(0); pushU64(AT_SECURE);                             // AT_SECURE = 0 (not setuid)
     pushU64(100); pushU64(AT_CLKTCK);                           // AT_CLKTCK = 100
-    pushU64(0); pushU64(AT_HWCAP);                              // AT_HWCAP = 0 (no SIMD assumptions)
+    pushU64(0); pushU64(AT_HWCAP);                              // AT_HWCAP = 0 (conservative; some IFUNC libs may need real bits)
     pushU64(platformAddr); pushU64(AT_PLATFORM);                // AT_PLATFORM = "x86_64"
     pushU64(0); pushU64(AT_EGID);                               // AT_EGID = 0 (root)
     pushU64(0); pushU64(AT_GID);                                // AT_GID = 0

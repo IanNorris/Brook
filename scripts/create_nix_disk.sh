@@ -17,7 +17,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
 # Parse size (first numeric arg) and packages
-SIZE_MB=384
+SIZE_MB=3072
 PACKAGES=()
 for arg in "$@"; do
     if [[ "$arg" =~ ^[0-9]+$ ]]; then
@@ -52,6 +52,10 @@ if [ ${#PACKAGES[@]} -eq 0 ]; then
         "${ROOT_DIR}/tools/brook-cursor-theme"  # XCursor theme (so libwayland-cursor doesn't return NULL)
         "${ROOT_DIR}/tools/brook-fonts-pkg"  # DejaVu fonts + fontconfig (window_frame_create needs cairo+pango)
         "${ROOT_DIR}/tools/brook-weston-data-pkg"  # weston share/weston PNG icons (frame_create needs sign_close.png etc)
+        qalculate-gtk      # default calculator (GTK3, ~390MB closure — smallest GTK calc)
+        mousepad           # default text editor (Xfce GTK3, ~430MB closure)
+        foot               # terminal — needs pty; carried for staged bring-up
+        gimp               # Tier-2 photo editor; pulled but launched only when ready (~1.2GB)
     )
 fi
 
@@ -185,6 +189,18 @@ symlink_on_disk() {
 
 copy_tree_to_disk() {
     local img="$1" src="$2" dst="$3"
+
+    # Some nix store entries are single files (e.g. shell scripts), not directories.
+    if [ -f "$src" ] && [ ! -d "$src" ]; then
+        write_to_disk "$img" "$src" "$dst"
+        return
+    fi
+    if [ -L "$src" ] && [ ! -d "$src" ]; then
+        local t; t=$(readlink "$src")
+        symlink_on_disk "$img" "$dst" "$t"
+        return
+    fi
+
     mkdir_on_disk "$img" "$dst"
 
     (cd "$src" && find . -type d) | while read -r dir; do
