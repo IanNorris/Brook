@@ -1,0 +1,3 @@
+# title: Flower Demo
+# desc: Weston animated flower (Wayland)
+source /boot/SCRIPTS/wayland_flower.rc

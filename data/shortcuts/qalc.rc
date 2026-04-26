@@ -1,0 +1,3 @@
+# title: Qalculate
+# desc: GTK calculator (qalculate-gtk)
+source /boot/SCRIPTS/wayland_qalc.rc

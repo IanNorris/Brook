@@ -1,0 +1,3 @@
+# title: Mousepad
+# desc: GTK text editor
+source /boot/SCRIPTS/wayland_mousepad.rc

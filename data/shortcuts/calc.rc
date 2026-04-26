@@ -1,0 +1,3 @@
+# title: Calculator
+# desc: Brook native calculator demo
+source /boot/SCRIPTS/wayland_calc.rc
