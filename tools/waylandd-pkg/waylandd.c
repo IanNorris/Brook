@@ -67,6 +67,10 @@ static void set_keyboard_focus(struct brook_surface *s);
 /* Waylandd's own virtual framebuffer — blit committed client buffers here
  * so the kernel compositor can show them on screen. */
 static uint32_t *g_vfb       = NULL;
+/* Backbuffer: redraw_workspace paints into g_back, then memcpy's to
+ * g_vfb in a single pass so the kernel compositor never observes a
+ * mid-paint frame (would flash black during drag). */
+static uint32_t *g_back      = NULL;
 static uint32_t  g_vfb_w     = 0;
 static uint32_t  g_vfb_h     = 0;
 static uint32_t  g_vfb_bytes = 0;
@@ -522,6 +526,19 @@ static void draw_chrome(struct brook_surface *s) {
 
 static void redraw_workspace(void) {
     if (!g_vfb) return;
+    /* Paint into the backbuffer to avoid the kernel compositor observing
+     * a half-filled frame.  All draw helpers reference g_vfb, so we swap
+     * the pointer for the duration of the paint, then memcpy out. */
+    if (!g_back) {
+        g_back = (uint32_t*)malloc((size_t)g_vfb_bytes);
+        if (!g_back) {
+            fprintf(stderr, "[waylandd] backbuffer alloc failed; "
+                    "falling back to direct VFB paint\n");
+        }
+    }
+    uint32_t *real_vfb = g_vfb;
+    if (g_back) g_vfb = g_back;
+
     fill_background();
     for (int i = 0; i < g_tiled_count; i++) {
         struct brook_surface *s = g_tiled[i];
@@ -548,6 +565,11 @@ static void redraw_workspace(void) {
         draw_chrome(s);
     }
     draw_panel();
+
+    if (g_back) {
+        g_vfb = real_vfb;
+        memcpy(g_vfb, g_back, g_vfb_bytes);
+    }
     vfb_signal_dirty();
 }
 
@@ -742,6 +764,7 @@ static const struct wl_surface_interface surface_impl = {
 static void surface_destroy_userdata(struct wl_resource *r) {
     struct brook_surface *s = wl_resource_get_user_data(r);
     if (s) {
+        int was_visible = (s->is_tiled || s->is_floating);
         tile_remove(s);
         floating_remove(s);
         if (g_drag_target == s) g_drag_target = NULL;
@@ -755,6 +778,13 @@ static void surface_destroy_userdata(struct wl_resource *r) {
                 ? g_focus_stack[0] : NULL;
             if (next) set_keyboard_focus(next);
         }
+        free(s);
+        /* Removing a tile re-flows the layout; remaining windows have
+         * stale placed_x/y until something repaints, and the destroyed
+         * surface's pixels linger in the VFB.  Repaint now so the second
+         * window picks up its new tile slot and the close button works. */
+        if (was_visible) redraw_workspace();
+        return;
     }
     free(s);
 }
@@ -1052,16 +1082,23 @@ static void brook_wl_log(const char *fmt, va_list ap) {
 }
 
 static void client_destroyed(struct wl_listener *l, void *data) {
-    (void)l;
     fprintf(stderr, "[waylandd] client %p destroyed\n", data); fflush(stderr);
+    /* Listener was heap-allocated per-client (see client_created). */
+    free(l);
 }
-static struct wl_listener g_client_destroy_listener = { .notify = client_destroyed };
 
 static void client_created(struct wl_listener *l, void *data) {
     (void)l;
     struct wl_client *c = data;
     fprintf(stderr, "[waylandd] client %p created\n", (void*)c); fflush(stderr);
-    wl_client_add_destroy_listener(c, &g_client_destroy_listener);
+    /* wl_listener nodes live in a single signal's list; we MUST allocate
+     * one per client or the wl_list link gets corrupted across clients
+     * (manifests as duplicate destroy notifications and a stale "ghost"
+     * window after closing the first of two clients). */
+    struct wl_listener *dl = calloc(1, sizeof(*dl));
+    if (!dl) return;
+    dl->notify = client_destroyed;
+    wl_client_add_destroy_listener(c, dl);
 }
 static struct wl_listener g_client_create_listener = { .notify = client_created };
 
