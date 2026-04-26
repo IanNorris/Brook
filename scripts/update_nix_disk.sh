@@ -72,6 +72,33 @@ if [ "${UPDATE_TOOLS}" -eq 1 ]; then
     fi
     # Ensure nix -> nix-install symlink exists
     ln -sf nix-install "${MNTDIR}/bin/nix"
+
+    # Bundle curl, xz binaries and CA certs from the on-disk store so
+    # nix-fetch finds them at stable paths (/nix/bin/curl, /nix/bin/xz,
+    # /nix/etc/ssl/certs/ca-bundle.crt). Without these, `nix install`
+    # fails immediately with "curl not found".
+    if [ -d "${MNTDIR}/store" ]; then
+        for d in "${MNTDIR}"/store/*-curl-*-bin; do
+            [ -x "$d/bin/curl" ] || continue
+            cp "$d/bin/curl" "${MNTDIR}/bin/curl"
+            echo "  curl -> /nix/bin/curl"
+            break
+        done
+        for d in "${MNTDIR}"/store/*-xz-*-bin; do
+            [ -x "$d/bin/xz" ] || continue
+            cp "$d/bin/xz" "${MNTDIR}/bin/xz"
+            echo "  xz -> /nix/bin/xz"
+            break
+        done
+        for d in "${MNTDIR}"/store/*-nss-cacert-* "${MNTDIR}"/store/*-cacert-*; do
+            [ -f "$d/etc/ssl/certs/ca-bundle.crt" ] || continue
+            mkdir -p "${MNTDIR}/etc/ssl/certs"
+            cp "$d/etc/ssl/certs/ca-bundle.crt" \
+                "${MNTDIR}/etc/ssl/certs/ca-bundle.crt"
+            echo "  ca-bundle.crt -> /nix/etc/ssl/certs/ca-bundle.crt"
+            break
+        done
+    fi
 fi
 
 if [ "${UPDATE_INDEX}" -eq 1 ]; then
