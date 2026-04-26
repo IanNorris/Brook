@@ -63,6 +63,80 @@ static uint32_t  g_vfb_h     = 0;
 static uint32_t  g_vfb_bytes = 0;
 static int       g_vfb_fd    = -1;
 
+/* Wallpaper — loaded once at startup from /boot/WALLPAPER.RAW (8-byte
+ * header = u32 width + u32 height, then RGBA pixels).  Owned, freed
+ * never (live for process lifetime). NULL ⇒ fallback to solid grey. */
+static uint32_t *g_wallpaper   = NULL;
+static int       g_wallpaper_w = 0;
+static int       g_wallpaper_h = 0;
+
+static void load_wallpaper(void) {
+    int fd = open("/boot/WALLPAPER.RAW", O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "[waylandd] wallpaper: open failed: %s\n",
+                strerror(errno));
+        return;
+    }
+    uint32_t hdr[2];
+    if (read(fd, hdr, 8) != 8) {
+        fprintf(stderr, "[waylandd] wallpaper: header read failed\n");
+        close(fd); return;
+    }
+    int w = (int)hdr[0], h = (int)hdr[1];
+    if (w <= 0 || h <= 0 || w > 3840 || h > 2160) {
+        fprintf(stderr, "[waylandd] wallpaper: bad dims %dx%d\n", w, h);
+        close(fd); return;
+    }
+    size_t bytes = (size_t)w * (size_t)h * 4u;
+    uint32_t *px = (uint32_t*)malloc(bytes);
+    if (!px) { close(fd); return; }
+    size_t got = 0;
+    while (got < bytes) {
+        ssize_t r = read(fd, (uint8_t*)px + got, bytes - got);
+        if (r <= 0) break;
+        got += (size_t)r;
+    }
+    close(fd);
+    if (got != bytes) {
+        fprintf(stderr, "[waylandd] wallpaper: short read %zu/%zu\n",
+                got, bytes);
+        free(px); return;
+    }
+    g_wallpaper = px;
+    g_wallpaper_w = w;
+    g_wallpaper_h = h;
+    fprintf(stderr, "[waylandd] wallpaper loaded %dx%d\n", w, h);
+}
+
+/* Fill the entire VFB with the workspace background (wallpaper if loaded,
+ * solid grey otherwise).  Wallpaper is centred & cropped — no scaling. */
+static void fill_background(void) {
+    if (!g_vfb) return;
+    if (!g_wallpaper) {
+        uint32_t bg = 0xff202428u;
+        for (uint32_t i = 0; i < g_vfb_w * g_vfb_h; i++) g_vfb[i] = bg;
+        return;
+    }
+    int wpw = g_wallpaper_w, wph = g_wallpaper_h;
+    int ox = ((int)g_vfb_w - wpw) / 2;
+    int oy = ((int)g_vfb_h - wph) / 2;
+    for (uint32_t y = 0; y < g_vfb_h; y++) {
+        int sy = (int)y - oy;
+        uint32_t *drow = g_vfb + (size_t)y * g_vfb_w;
+        if (sy < 0 || sy >= wph) {
+            uint32_t bg = 0xff181818u;
+            for (uint32_t x = 0; x < g_vfb_w; x++) drow[x] = bg;
+            continue;
+        }
+        const uint32_t *srow = g_wallpaper + (size_t)sy * wpw;
+        for (uint32_t x = 0; x < g_vfb_w; x++) {
+            int sx = (int)x - ox;
+            if (sx < 0 || sx >= wpw) drow[x] = 0xff181818u;
+            else drow[x] = 0xff000000u | (srow[sx] & 0x00ffffffu);
+        }
+    }
+}
+
 static int open_vfb(void)
 {
     int fd = open("/dev/fb0", O_RDWR);
@@ -242,9 +316,7 @@ static void blit_at(const uint32_t *src, int sw, int sh,
 
 static void redraw_workspace(void) {
     if (!g_vfb) return;
-    /* Background colour for unoccupied workspace area. */
-    uint32_t bg = 0xff202428u;
-    for (uint32_t i = 0; i < g_vfb_w * g_vfb_h; i++) g_vfb[i] = bg;
+    fill_background();
     for (int i = 0; i < g_tiled_count; i++) {
         struct brook_surface *s = g_tiled[i];
         if (!s->committed_px) continue;
@@ -1214,6 +1286,10 @@ int main(int argc, char **argv)
 
     /* Best-effort: map our VFB so we can actually show committed buffers. */
     (void)open_vfb();
+    load_wallpaper();
+    /* Paint the wallpaper immediately so the desktop is visible even
+     * before any Wayland client connects. */
+    if (g_vfb) { fill_background(); vfb_signal_dirty(); }
 
     g_display = wl_display_create();
     if (!g_display) {
