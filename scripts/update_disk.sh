@@ -330,11 +330,15 @@ fi
 # --- Data files (Lua scripts, boot configs) ---
 data_scripts="${ROOT_DIR}/data/scripts"
 if [ -d "$data_scripts" ]; then
+    mmd -D s -i "${DISK_IMG}" "::SCRIPTS" 2>/dev/null || true
     for f in "$data_scripts"/*.lua "$data_scripts"/*.rc; do
         [ -f "$f" ] || continue
         dname="$(basename "$f" | tr '[:lower:]' '[:upper:]')"
+        # Top-level copy preserved for legacy callers (INIT.RC, etc).
         mcopy_safe -o -i "${DISK_IMG}" "$f" "::${dname}"
-        echo "  synced data: ${dname}"
+        # Also place under /SCRIPTS/ so shortcuts can `source /boot/SCRIPTS/<name>`.
+        mcopy_safe -o -i "${DISK_IMG}" "$f" "::SCRIPTS/${dname}"
+        echo "  synced data: ${dname} (root + SCRIPTS/)"
     done
 fi
 

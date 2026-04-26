@@ -581,9 +581,10 @@ static int ExecCommand(int argc, const char* const* argv)
         // Try as-is first, then with / prefix
         if (argv[1][0] == '/')
         {
-            for (uint32_t i = 0; i < sizeof(resolved) - 1 && argv[1][i]; i++)
+            uint32_t i = 0;
+            for (; i < sizeof(resolved) - 1 && argv[1][i]; i++)
                 resolved[i] = argv[1][i];
-            resolved[sizeof(resolved) - 1] = '\0';
+            resolved[i] = '\0';
         }
         else
         {
