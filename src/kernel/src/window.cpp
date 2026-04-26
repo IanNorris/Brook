@@ -8,6 +8,7 @@
 #include "process.h"
 #include "compositor.h"
 #include "font_atlas.h"
+#include "input.h"
 #include "serial.h"
 #include "rtc.h"
 #include "terminal.h"
@@ -191,6 +192,8 @@ int WmCreateWindow(Process* proc, int16_t x, int16_t y,
     w.vfbUser   = nullptr;
     w.vfbDirty  = 0;
     w.wmId      = static_cast<uint16_t>(idx + 1);
+    w.inputHead = 0;
+    w.inputTail = 0;
     WmStrCopy(w.title, title ? title : "Window", sizeof(w.title));
 
     SerialPrintf("WM: created window %d '%s' at (%d,%d) %ux%u scale=%u for pid %u\n",
@@ -1315,6 +1318,41 @@ void WmSetTitleById(Process* proc, uint32_t wmId, const char* title)
     Window* w = WmFindWindowById(proc, wmId);
     if (!w || !title) return;
     WmStrCopy(w->title, title, sizeof(w->title));
+}
+
+void WmInputPush(Window* win, const InputEvent& ev, int16_t localX, int16_t localY)
+{
+    if (!win) return;
+    uint32_t head = __atomic_load_n(&win->inputHead, __ATOMIC_ACQUIRE);
+    uint32_t tail = __atomic_load_n(&win->inputTail, __ATOMIC_ACQUIRE);
+    uint32_t next = (head + 1) % Window::WM_INPUT_QUEUE;
+    if (next == tail) return;  // full — drop
+    Window::WmInputEvent& slot = win->inputQueue[head];
+    slot.type      = static_cast<uint8_t>(ev.type);
+    slot.scanCode  = ev.scanCode;
+    slot.ascii     = static_cast<uint8_t>(ev.ascii);
+    slot.modifiers = ev.modifiers;
+    slot.x         = localX;
+    slot.y         = localY;
+    slot.reserved  = 0;
+    __atomic_store_n(&win->inputHead, next, __ATOMIC_RELEASE);
+}
+
+uint32_t WmInputPop(Window* win, Window::WmInputEvent* out, uint32_t max)
+{
+    if (!win || !out || !max) return 0;
+    uint32_t produced = 0;
+    while (produced < max)
+    {
+        uint32_t tail = __atomic_load_n(&win->inputTail, __ATOMIC_ACQUIRE);
+        uint32_t head = __atomic_load_n(&win->inputHead, __ATOMIC_ACQUIRE);
+        if (tail == head) break;
+        out[produced++] = win->inputQueue[tail];
+        __atomic_store_n(&win->inputTail,
+                         (tail + 1) % Window::WM_INPUT_QUEUE,
+                         __ATOMIC_RELEASE);
+    }
+    return produced;
 }
 
 } // namespace brook

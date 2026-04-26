@@ -840,7 +840,12 @@ static void CompositorLoopWM()
             {
                 Window* target = WmGetWindow(hit.windowIndex);
                 if (target && target->proc)
+                {
                     ProcessInputPush(target->proc, ev);
+                    WmInputPush(target, ev,
+                                static_cast<int16_t>(mx - target->clientX()),
+                                static_cast<int16_t>(my - target->clientY()));
+                }
             }
             continue;
         }
@@ -854,7 +859,12 @@ static void CompositorLoopWM()
             {
                 Window* target = WmGetWindow(hit.windowIndex);
                 if (target && target->proc)
+                {
                     ProcessInputPush(target->proc, ev);
+                    WmInputPush(target, ev,
+                                static_cast<int16_t>(mx - target->clientX()),
+                                static_cast<int16_t>(my - target->clientY()));
+                }
             }
             continue;
         }
@@ -869,7 +879,12 @@ static void CompositorLoopWM()
             {
                 Window* target = WmGetWindow(hit.windowIndex);
                 if (target && target->proc)
+                {
                     ProcessInputPush(target->proc, ev);
+                    WmInputPush(target, ev,
+                                static_cast<int16_t>(mx - target->clientX()),
+                                static_cast<int16_t>(my - target->clientY()));
+                }
             }
             continue;
         }
@@ -884,7 +899,12 @@ static void CompositorLoopWM()
             {
                 Window* target = WmGetWindow(hit.windowIndex);
                 if (target && target->proc)
+                {
                     ProcessInputPush(target->proc, ev);
+                    WmInputPush(target, ev,
+                                static_cast<int16_t>(mx - target->clientX()),
+                                static_cast<int16_t>(my - target->clientY()));
+                }
             }
             continue;
         }
@@ -1035,6 +1055,10 @@ static void CompositorLoopWM()
         // Non-terminal window: push raw event to per-process input queue
         if (!routed)
             ProcessInputPush(focused->proc, ev);
+
+        // Always also push to the per-window queue (key events, x/y zero).
+        // Wayland clients rely on this for keyboard delivery.
+        WmInputPush(focused, ev, 0, 0);
     }
 
     // 5. Handle mouse interaction (position + latched clicks)

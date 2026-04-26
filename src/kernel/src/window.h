@@ -5,6 +5,7 @@
 namespace brook {
 
 struct Process;
+struct InputEvent;
 
 // Window manager constants
 static constexpr uint32_t WM_TITLE_BAR_HEIGHT = 24;
@@ -61,6 +62,25 @@ struct Window
     void*       vfbUser;        // user-space address in proc->pageTable
     uint8_t     vfbDirty;       // set by syscall on each commit; cleared after blit
     uint16_t    wmId;           // (idx + 1); 0 reserved for "invalid"
+
+    // Per-window input ring (Phase B).  When the WM routes an event
+    // to this window (mouse over client area, or keyboard while focused),
+    // the event is pushed here in addition to the legacy per-process queue.
+    // Userspace drains via syscall WM_POP_INPUT.  Mouse coords are
+    // *client-local* (0,0 = top-left of the window's client area).
+    static constexpr uint32_t WM_INPUT_QUEUE = 64;
+    struct WmInputEvent {
+        uint8_t  type;       // InputEventType
+        uint8_t  scanCode;
+        uint8_t  ascii;
+        uint8_t  modifiers;
+        int16_t  x;          // client-local pixel (mouse events)
+        int16_t  y;
+        uint32_t reserved;
+    };
+    WmInputEvent inputQueue[WM_INPUT_QUEUE];
+    volatile uint32_t inputHead;
+    volatile uint32_t inputTail;
 
     // Pre-maximise geometry (for restore)
     int16_t     savedX, savedY;
@@ -214,6 +234,14 @@ void WmSetTitleById(Process* proc, uint32_t wmId, const char* title);
 
 // Look up a Window* given (proc, wmId).  Returns nullptr if mismatch.
 Window* WmFindWindowById(Process* proc, uint32_t wmId);
+
+// Push an input event into a window's per-window queue.  Coords should be
+// client-local for mouse events.  Drops on overflow.
+void WmInputPush(Window* win, const InputEvent& ev, int16_t localX, int16_t localY);
+
+// Drain up to `max` events from the window's queue into `out`.  Returns
+// number of events actually written.  Non-blocking.
+uint32_t WmInputPop(Window* win, Window::WmInputEvent* out, uint32_t max);
 
 // ---------------------------------------------------------------------------
 // App Launcher

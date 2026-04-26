@@ -7462,6 +7462,23 @@ static int64_t sys_brook_wm_set_title(uint64_t wmId, uint64_t titlePtr,
     return 0;
 }
 
+// 510: WM_POP_INPUT(wmId, buf*, max) — drain per-window input queue.
+// Each event written is a brook::Window::WmInputEvent (12 bytes).
+// Returns number of events written, or -errno.
+static int64_t sys_brook_wm_pop_input(uint64_t wmId, uint64_t bufPtr,
+                                       uint64_t max, uint64_t,
+                                       uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    if (wmId == 0 || !bufPtr || !max) return -EINVAL;
+    if (max > 256) max = 256;
+    brook::Window* w = brook::WmFindWindowById(proc, static_cast<uint32_t>(wmId));
+    if (!w) return -ENOENT;
+    auto* uo = reinterpret_cast<brook::Window::WmInputEvent*>(bufPtr);
+    return static_cast<int64_t>(brook::WmInputPop(w, uo, static_cast<uint32_t>(max)));
+}
+
 // ---------------------------------------------------------------------------
 // sys_not_implemented
 // ---------------------------------------------------------------------------
@@ -8828,6 +8845,7 @@ void SyscallTableInit()
     g_syscallTable[507]                  = sys_brook_wm_destroy_window;
     g_syscallTable[508]                  = sys_brook_wm_signal_dirty;
     g_syscallTable[509]                  = sys_brook_wm_set_title;
+    g_syscallTable[510]                  = sys_brook_wm_pop_input;
 
     uint32_t count = 0;
     for (uint64_t i = 0; i < SYSCALL_MAX; ++i)
