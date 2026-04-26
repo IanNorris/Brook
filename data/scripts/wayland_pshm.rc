@@ -5,5 +5,5 @@
 # Crucially, it does NOT call wl_cursor_theme_load, so it does not hit the
 # pending no-XCURSOR-theme crash that takes down weston-flower/eventdemo.
 set vfb auto
-run /nix/store/63q27arsdn7s7b7yx4b43hcf540kggsk-waylandd-brook-0.1-brook/bin/waylandd
+run /nix/store/14cbcc5dhlykk5rwfhd21yrhl44a1wxy-waylandd-brook-0.1-brook/bin/waylandd
 run /nix/store/ad9dmdrrhqpz4ygqpkhr9bfcjisrlgjk-weston-weston-presentation-shm-bundle-15.0.0-bundle/bin/weston-presentation-shm

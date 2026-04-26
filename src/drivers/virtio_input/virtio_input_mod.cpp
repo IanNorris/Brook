@@ -366,6 +366,25 @@ static void ProcessEvent(const VirtioInputEvent& ev)
                 static_cast<int64_t>(absY - g_absYMin) *
                 static_cast<int64_t>(g_screenH - 1) / rangeY);
 
+            // Push a MouseMove event so userspace consumers (waylandd)
+            // observe motion via the input ring, not just the cursor
+            // global.  PS/2 mouse path does the same.  Only emit if the
+            // mapped screen position actually changed, to avoid flooding
+            // the ring on duplicate EV_SYN frames.
+            static int32_t s_lastScreenX = -1, s_lastScreenY = -1;
+            if (screenX != s_lastScreenX || screenY != s_lastScreenY)
+            {
+                InputEvent ie;
+                ie.type      = InputEventType::MouseMove;
+                ie.scanCode  = MouseGetButtons();
+                ie.ascii     = 0;
+                ie.modifiers = 0;
+                InputDevicePush(&g_inputDev, ie);
+                InputWakeWaiters();
+                s_lastScreenX = screenX;
+                s_lastScreenY = screenY;
+            }
+
             MouseSetPosition(screenX, screenY);
             CompositorWake();
             g_pendingX = -1;

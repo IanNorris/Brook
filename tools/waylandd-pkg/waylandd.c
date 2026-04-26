@@ -260,6 +260,13 @@ struct brook_surface {
     /* Where the surface itself is placed within its tile (for input). */
     int placed_x, placed_y;
     int is_tiled;               /* 1 == in g_tiled[] */
+
+    /* Floating-window state (Phase 5).  When is_floating is set the
+     * surface lives in g_floating[] instead of g_tiled[] and is drawn
+     * with its chrome top-left at (float_x, float_y) regardless of any
+     * tile layout.  Mutually exclusive with is_tiled. */
+    int is_floating;
+    int float_x, float_y;       /* chrome (title-bar) top-left in VFB */
 };
 
 /* Tiler state: list of mapped xdg_toplevel surfaces, laid out as a
@@ -276,6 +283,19 @@ struct brook_surface {
 #define CLOSE_BTN_H  CHROME_H
 static struct brook_surface *g_tiled[MAX_TILED];
 static int g_tiled_count = 0;
+
+/* Floating layer: drawn on top of tiled layer, in array order so that
+ * the last entry is the top-most floater.  raise_floating(s) moves s
+ * to the end of this list. */
+#define MAX_FLOATING 8
+static struct brook_surface *g_floating[MAX_FLOATING];
+static int g_floating_count = 0;
+
+/* Active drag (window-move via title-bar).  When non-NULL, MouseMove
+ * events update the target's float_{x,y} until MouseButtonUp. */
+static struct brook_surface *g_drag_target = NULL;
+static int g_drag_offset_x = 0;
+static int g_drag_offset_y = 0;
 
 static void tile_layout(void) {
     if (g_tiled_count <= 0) return;
@@ -312,6 +332,41 @@ static void tile_remove(struct brook_surface *s) {
     }
     s->is_tiled = 0;
     tile_layout();
+}
+
+static void floating_remove(struct brook_surface *s) {
+    if (!s->is_floating) return;
+    for (int i = 0; i < g_floating_count; i++) {
+        if (g_floating[i] == s) {
+            for (int j = i; j < g_floating_count - 1; j++)
+                g_floating[j] = g_floating[j + 1];
+            g_floating[--g_floating_count] = NULL;
+            break;
+        }
+    }
+    s->is_floating = 0;
+}
+
+static void floating_raise(struct brook_surface *s) {
+    if (!s->is_floating) return;
+    floating_remove(s);
+    if (g_floating_count < MAX_FLOATING) {
+        g_floating[g_floating_count++] = s;
+        s->is_floating = 1;
+    }
+}
+
+/* Pop s out of the tiled layout and into the floating layer at the
+ * given chrome top-left.  No-op if already floating.  Used when the
+ * user starts dragging a tiled window's title bar. */
+static void float_from_tile(struct brook_surface *s, int fx, int fy) {
+    if (s->is_floating) return;
+    if (s->is_tiled) tile_remove(s);
+    if (g_floating_count >= MAX_FLOATING) return;
+    s->float_x = fx;
+    s->float_y = fy;
+    g_floating[g_floating_count++] = s;
+    s->is_floating = 1;
 }
 
 static void blit_at(const uint32_t *src, int sw, int sh,
@@ -403,11 +458,15 @@ static void draw_panel(void) {
     fill_rect(0, 0, (int)g_vfb_w, PANEL_H, 0xff1a1d20u);
     fill_rect(0, PANEL_H - 1, (int)g_vfb_w, 1, 0xff3a3e44u);
 
-    /* Window "chips" — one rectangle per open tile, brighter for the
-     * focused (active) one. */
+    /* Window "chips" — one rectangle per open window (tiled then
+     * floating), brighter for the focused (active) one. */
     int cx = 8, cy = 6;
-    for (int i = 0; i < g_tiled_count; i++) {
-        int focused = (g_tiled[i] == g_focused_surface);
+    struct brook_surface *chip_list[MAX_TILED + MAX_FLOATING];
+    int chip_n = 0;
+    for (int i = 0; i < g_tiled_count; i++)    chip_list[chip_n++] = g_tiled[i];
+    for (int i = 0; i < g_floating_count; i++) chip_list[chip_n++] = g_floating[i];
+    for (int i = 0; i < chip_n; i++) {
+        int focused = (chip_list[i] == g_focused_surface);
         uint32_t fill = focused ? 0xfff0c060u : 0xff5a5e64u;
         uint32_t edge = focused ? 0xffffd870u : 0xff80868cu;
         fill_rect(cx, cy, 80, 16, fill);
@@ -475,6 +534,16 @@ static void redraw_workspace(void) {
         int dy = s->tile_y + (s->tile_h - total_h) / 2 + CHROME_H;
         if (dx < s->tile_x) dx = s->tile_x;
         if (dy < s->tile_y + CHROME_H) dy = s->tile_y + CHROME_H;
+        blit_at(s->committed_px, sw, sh, dx, dy, &s->placed_x, &s->placed_y);
+        draw_chrome(s);
+    }
+    /* Floating layer on top, in array order — last entry is top-most. */
+    for (int i = 0; i < g_floating_count; i++) {
+        struct brook_surface *s = g_floating[i];
+        if (!s->committed_px) continue;
+        int sw = s->committed_w, sh = s->committed_h;
+        int dx = s->float_x;
+        int dy = s->float_y + CHROME_H;
         blit_at(s->committed_px, sw, sh, dx, dy, &s->placed_x, &s->placed_y);
         draw_chrome(s);
     }
@@ -596,7 +665,7 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
              * stay on the legacy single-surface path (kept so the shm
              * round-trip diagnostic still works). */
             if (s->xdg_toplevel) {
-                if (!s->is_tiled) tile_add(s);
+                if (!s->is_tiled && !s->is_floating) tile_add(s);
                 redraw_workspace();
                 /* Track focusable surface for input dispatch. */
                 g_active_surface = s;
@@ -674,6 +743,8 @@ static void surface_destroy_userdata(struct wl_resource *r) {
     struct brook_surface *s = wl_resource_get_user_data(r);
     if (s) {
         tile_remove(s);
+        floating_remove(s);
+        if (g_drag_target == s) g_drag_target = NULL;
         focus_stack_remove(s);
         free(s->committed_px);
         if (g_active_surface == s) g_active_surface = NULL;
@@ -1362,7 +1433,7 @@ static void pump_input_once(void) {
                 n, s_total_events);
         s_last_logged = s_total_events;
     }
-    if (!g_active_surface) return;
+    if (!g_active_surface && g_floating_count == 0) return;
     for (long i = 0; i < n; ++i) {
         const uint8_t *e = buf + (i * BROOK_INPUT_REC_SIZE);
         uint8_t  type = e[0];
@@ -1370,14 +1441,58 @@ static void pump_input_once(void) {
         int32_t vx = *(const int32_t*)(e + 8);
         int32_t vy = *(const int32_t*)(e + 12);
 
-        /* Sloppy focus: pick whichever tile the cursor is over.  Hit
-         * test includes the chrome strip directly above the surface so
-         * clicks on the title bar still focus the window.  Falls back
-         * to g_active_surface when no tile is hit (legacy bare-shm). */
+        /* Active drag (window-move): consume MouseMove to update the
+         * floating window's position; MouseButtonUp ends the drag.
+         * All other events fall through. */
+        if (g_drag_target) {
+            if (type == 2 /* MouseMove */) {
+                int nx = vx - g_drag_offset_x;
+                int ny = vy - g_drag_offset_y;
+                if (ny < PANEL_H) ny = PANEL_H;
+                if (nx < -((int)g_drag_target->committed_w - 32))
+                    nx = -((int)g_drag_target->committed_w - 32);
+                if (nx > (int)g_vfb_w - 32) nx = (int)g_vfb_w - 32;
+                if (ny > (int)g_vfb_h - CHROME_H) ny = (int)g_vfb_h - CHROME_H;
+                g_drag_target->float_x = nx;
+                g_drag_target->float_y = ny;
+                redraw_workspace();
+                g_last_ptr_x = vx; g_last_ptr_y = vy;
+                continue;
+            }
+            if (type == 4 /* MouseButtonUp */ && sc == 0) {
+                fprintf(stderr, "[waylandd] drag end @ (%d,%d)\n",
+                        g_drag_target->float_x, g_drag_target->float_y);
+                g_drag_target = NULL;
+                continue;
+            }
+            /* Other events while dragging: ignore to avoid mid-drag
+             * focus changes or button delivery to the client. */
+            continue;
+        }
+
+        /* Sloppy focus: pick whichever window the cursor is over.
+         * Test floating layer first (top-most last → iterate in
+         * reverse), then tiled.  Hit area includes the chrome strip
+         * above the surface body. */
         struct brook_surface *focus = NULL;
         int in_chrome = 0;        /* cursor lands on chrome (not body) */
         int in_close  = 0;        /* cursor lands on close button */
-        for (int ti = 0; ti < g_tiled_count; ti++) {
+        for (int fi = g_floating_count - 1; fi >= 0 && !focus; fi--) {
+            struct brook_surface *t = g_floating[fi];
+            if (!t->committed_px) continue;
+            int x0 = t->placed_x, y0 = t->placed_y;
+            int x1 = x0 + t->committed_w, y1 = y0 + t->committed_h;
+            int chrome_y0 = y0 - CHROME_H;
+            int close_x0  = x1 - CLOSE_BTN_W;
+            if (vx >= x0 && vy >= chrome_y0 && vx < x1 && vy < y1) {
+                focus = t;
+                if (vy < y0) {
+                    in_chrome = 1;
+                    if (vx >= close_x0) in_close = 1;
+                }
+            }
+        }
+        for (int ti = 0; ti < g_tiled_count && !focus; ti++) {
             struct brook_surface *t = g_tiled[ti];
             if (!t->committed_px) continue;
             int x0 = t->placed_x, y0 = t->placed_y;
@@ -1400,11 +1515,12 @@ static void pump_input_once(void) {
             g_active_surface_vfb_x = focus->placed_x;
             g_active_surface_vfb_y = focus->placed_y;
         }
-        /* Click-to-focus: any left-button press inside a tile (chrome
+        /* Click-to-focus: any left-button press inside a window (chrome
          * or body) latches keyboard focus to that surface and raises
-         * it in the Z-order list. */
+         * it in the Z-order list (and floating layer if applicable). */
         if (focus && type == 3 /* MouseButtonDown */ && sc == 0) {
             set_keyboard_focus(focus);
+            if (focus->is_floating) floating_raise(focus);
         }
         /* Close-button click: handle locally, do not forward to client. */
         if (in_close && focus && type == 3 /* MouseButtonDown */ && sc == 0) {
@@ -1414,6 +1530,27 @@ static void pump_input_once(void) {
                 xdg_toplevel_send_close(focus->xdg_toplevel);
             }
             continue;  /* swallow */
+        }
+        /* Chrome (non-close) press: start a window-move drag.  If the
+         * window was tiled, kick it into the floating layer at its
+         * current screen position (so it doesn't snap on first move). */
+        if (in_chrome && !in_close && focus &&
+            type == 3 /* MouseButtonDown */ && sc == 0) {
+            int fx, fy;
+            if (focus->is_floating) {
+                fx = focus->float_x;
+                fy = focus->float_y;
+            } else {
+                fx = focus->placed_x;
+                fy = focus->placed_y - CHROME_H;
+                float_from_tile(focus, fx, fy);
+            }
+            g_drag_target = focus;
+            g_drag_offset_x = vx - fx;
+            g_drag_offset_y = vy - fy;
+            fprintf(stderr, "[waylandd] drag begin @ (%d,%d) off=(%d,%d)\n",
+                    fx, fy, g_drag_offset_x, g_drag_offset_y);
+            continue;
         }
         /* Chrome (non-close) click: focus only, swallow event. */
         if (in_chrome) {
