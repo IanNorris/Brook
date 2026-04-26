@@ -48,12 +48,21 @@ static int g_commit_count = 0;
 
 /* Forward decls — defined in the wl_seat section below. */
 struct brook_surface;
-static struct brook_surface *g_active_surface = NULL;
+static struct brook_surface *g_active_surface = NULL;     /* pointer focus */
+static struct brook_surface *g_focused_surface = NULL;    /* keyboard focus */
 static int g_active_surface_w = 0;
 static int g_active_surface_h = 0;
 static int g_active_surface_vfb_x = 0;
 static int g_active_surface_vfb_y = 0;
 static void pump_input_once(void);
+/* Z-order / focus stack: front (index 0) = most-recently focused.
+ * Used for click-to-focus latching and (later) Alt+Tab cycling. */
+#define FOCUS_STACK_MAX 16
+static struct brook_surface *g_focus_stack[FOCUS_STACK_MAX];
+static int g_focus_stack_count = 0;
+static void focus_stack_remove(struct brook_surface *s);
+static void focus_stack_raise(struct brook_surface *s);
+static void set_keyboard_focus(struct brook_surface *s);
 
 /* Waylandd's own virtual framebuffer — blit committed client buffers here
  * so the kernel compositor can show them on screen. */
@@ -398,7 +407,7 @@ static void draw_panel(void) {
      * focused (active) one. */
     int cx = 8, cy = 6;
     for (int i = 0; i < g_tiled_count; i++) {
-        int focused = (g_tiled[i] == g_active_surface);
+        int focused = (g_tiled[i] == g_focused_surface);
         uint32_t fill = focused ? 0xfff0c060u : 0xff5a5e64u;
         uint32_t edge = focused ? 0xffffd870u : 0xff80868cu;
         fill_rect(cx, cy, 80, 16, fill);
@@ -438,7 +447,7 @@ static void draw_close_x(int cx, int cy, uint32_t col) {
 static void draw_chrome(struct brook_surface *s) {
     int sw = s->committed_w;
     if (sw <= 0) return;
-    int focused = (s == g_active_surface);
+    int focused = (s == g_focused_surface);
     uint32_t bg   = focused ? 0xff3a4148u : 0xff24272au;
     uint32_t edge = focused ? 0xffffd870u : 0xff444a50u;
     int cx = s->placed_x;
@@ -665,8 +674,16 @@ static void surface_destroy_userdata(struct wl_resource *r) {
     struct brook_surface *s = wl_resource_get_user_data(r);
     if (s) {
         tile_remove(s);
+        focus_stack_remove(s);
         free(s->committed_px);
         if (g_active_surface == s) g_active_surface = NULL;
+        if (g_focused_surface == s) {
+            g_focused_surface = NULL;
+            /* Latch focus to the next stack entry, if any. */
+            struct brook_surface *next = (g_focus_stack_count > 0)
+                ? g_focus_stack[0] : NULL;
+            if (next) set_keyboard_focus(next);
+        }
     }
     free(s);
 }
@@ -1276,6 +1293,61 @@ static void deliver_pointer_leave(struct brook_seat_client *sc) {
 }
 
 /* Drain the kernel's per-process input queue and translate to wl events. */
+/* ---- Z-order / keyboard focus helpers (Phase 4) ---- */
+static void focus_stack_remove(struct brook_surface *s) {
+    for (int i = 0; i < g_focus_stack_count; i++) {
+        if (g_focus_stack[i] == s) {
+            for (int j = i; j < g_focus_stack_count - 1; j++)
+                g_focus_stack[j] = g_focus_stack[j+1];
+            g_focus_stack_count--;
+            return;
+        }
+    }
+}
+static void focus_stack_raise(struct brook_surface *s) {
+    if (!s) return;
+    focus_stack_remove(s);
+    if (g_focus_stack_count >= FOCUS_STACK_MAX)
+        g_focus_stack_count = FOCUS_STACK_MAX - 1;
+    for (int i = g_focus_stack_count; i > 0; i--)
+        g_focus_stack[i] = g_focus_stack[i-1];
+    g_focus_stack[0] = s;
+    g_focus_stack_count++;
+}
+static void set_keyboard_focus(struct brook_surface *s) {
+    if (g_focused_surface == s) {
+        if (s) focus_stack_raise(s);
+        return;
+    }
+    /* Send wl_keyboard.leave to the previous focus's owner. */
+    if (g_focused_surface) {
+        struct wl_client *prev_owner =
+            wl_resource_get_client(g_focused_surface->resource);
+        for (struct brook_seat_client *bsc = g_seat_clients; bsc; bsc = bsc->next) {
+            if (!bsc->keyboard) continue;
+            if (bsc->client != prev_owner) continue;
+            wl_keyboard_send_leave(bsc->keyboard, next_serial(),
+                                   g_focused_surface->resource);
+        }
+    }
+    g_focused_surface = s;
+    if (s) {
+        focus_stack_raise(s);
+        struct wl_client *new_owner = wl_resource_get_client(s->resource);
+        for (struct brook_seat_client *bsc = g_seat_clients; bsc; bsc = bsc->next) {
+            if (!bsc->keyboard) continue;
+            if (bsc->client != new_owner) continue;
+            struct wl_array keys; wl_array_init(&keys);
+            wl_keyboard_send_enter(bsc->keyboard, next_serial(),
+                                   s->resource, &keys);
+            wl_array_release(&keys);
+        }
+        fprintf(stderr, "[waylandd] kb focus → surface=%p\n", (void*)s);
+    } else {
+        fprintf(stderr, "[waylandd] kb focus → NULL\n");
+    }
+}
+
 static void pump_input_once(void) {
     uint8_t buf[16 * 32];
     long n = syscall(BROOK_SYS_INPUT_POP, (long)buf, 32L);
@@ -1328,6 +1400,12 @@ static void pump_input_once(void) {
             g_active_surface_vfb_x = focus->placed_x;
             g_active_surface_vfb_y = focus->placed_y;
         }
+        /* Click-to-focus: any left-button press inside a tile (chrome
+         * or body) latches keyboard focus to that surface and raises
+         * it in the Z-order list. */
+        if (focus && type == 3 /* MouseButtonDown */ && sc == 0) {
+            set_keyboard_focus(focus);
+        }
         /* Close-button click: handle locally, do not forward to client. */
         if (in_close && focus && type == 3 /* MouseButtonDown */ && sc == 0) {
             if (focus->xdg_toplevel) {
@@ -1345,17 +1423,30 @@ static void pump_input_once(void) {
         int sx_i = vx - g_active_surface_vfb_x;
         int sy_i = vy - g_active_surface_vfb_y;
 
+        /* ---- Keyboard events: route to g_focused_surface's owner ---- */
+        if (type == 0 || type == 1) {
+            if (!g_focused_surface) {
+                g_last_ptr_x = vx; g_last_ptr_y = vy;
+                continue;
+            }
+            struct wl_client *kb_owner =
+                wl_resource_get_client(g_focused_surface->resource);
+            uint32_t key = scancode_to_xkb(sc);
+            uint32_t state = (type == 0)
+                ? WL_KEYBOARD_KEY_STATE_PRESSED
+                : WL_KEYBOARD_KEY_STATE_RELEASED;
+            for (struct brook_seat_client *bsc = g_seat_clients; bsc; bsc = bsc->next) {
+                if (!bsc->keyboard) continue;
+                if (bsc->client != kb_owner) continue;
+                wl_keyboard_send_key(bsc->keyboard, next_serial(),
+                                     g_now_ms(), key - 8u, state);
+            }
+            g_last_ptr_x = vx; g_last_ptr_y = vy;
+            continue;
+        }
+
+        /* ---- Pointer events: route to g_active_surface's owner ---- */
         for (struct brook_seat_client *bsc = g_seat_clients; bsc; bsc = bsc->next) {
-            /* Pointer events are surface-scoped: a wl_surface resource
-             * belongs to exactly one client.  Sending pointer.enter on
-             * another client's surface to this client would mean its
-             * libwayland looks up a non-existent surface ID, returns
-             * NULL user_data, and toytoolkit derefs NULL+0x110 in
-             * pointer_handle_enter.  We deliver pointer/keyboard events
-             * to the owner of the *currently focused* surface; other
-             * clients receive a leave (if previously entered) so their
-             * cursor handling stops referring to a surface no longer
-             * theirs. */
             int is_owner = (g_active_surface &&
                 wl_resource_get_client(g_active_surface->resource) == bsc->client);
             if (!is_owner) {
@@ -1404,25 +1495,9 @@ static void pump_input_once(void) {
                 fprintf(stderr, "[waylandd] pointer button=%u state=%u\n", btn, state);
                 break;
             }
-            case 0: /* KeyPress */
-            case 1: /* KeyRelease */ {
-                if (!bsc->keyboard) break;
-                if (bsc->entered_surface != g_active_surface) {
-                    /* Send keyboard.enter once so clients accept keys. */
-                    struct wl_array keys; wl_array_init(&keys);
-                    wl_keyboard_send_enter(bsc->keyboard, next_serial(),
-                                           g_active_surface->resource, &keys);
-                    wl_array_release(&keys);
-                }
-                uint32_t key = scancode_to_xkb(sc);
-                uint32_t state = (type == 0)
-                    ? WL_KEYBOARD_KEY_STATE_PRESSED
-                    : WL_KEYBOARD_KEY_STATE_RELEASED;
-                wl_keyboard_send_key(bsc->keyboard, next_serial(),
-                                     g_now_ms(), key - 8u /* evdev keycode */,
-                                     state);
+            case 0: /* KeyPress (handled above) */
+            case 1: /* KeyRelease (handled above) */
                 break;
-            }
             default: break;
             }
         }
