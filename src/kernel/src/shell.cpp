@@ -625,6 +625,7 @@ static int ExecCommand(int argc, const char* const* argv)
         // 'set wm' — enable window manager mode (no value needed)
         if (StrEq(argv[1], "wm"))
         {
+            const bool wasActive = WmIsActive();
             WmInit();
             WmSetActive(true);
             g_ttyFull = false; // WM takes over the screen
@@ -633,6 +634,15 @@ static int ExecCommand(int argc, const char* const* argv)
             // handles log display, and TTY writes would briefly flash under the
             // compositor each frame.
             TtySuppressDisplay(true);
+
+            if (wasActive)
+            {
+                // Already running: launcher shortcuts re-source `set wm` for
+                // first-run-from-cold scripts. Don't re-spawn the kernel
+                // console / wallpaper / debug-TCP threads, that would orphan
+                // every prior app's window and leak helper processes.
+                return 0;
+            }
 
             // Load wallpaper asynchronously so WM startup isn't blocked.
             {
@@ -828,6 +838,7 @@ static int ExecCommand(int argc, const char* const* argv)
         int pathIdx = 1;
         const char* argv0Override = nullptr;
         bool strace = false;
+        bool runOnce = false;
 
         // Parse flags before the path
         while (pathIdx < argc) {
@@ -837,6 +848,13 @@ static int ExecCommand(int argc, const char* const* argv)
             } else if (StrEq(argv[pathIdx], "--strace")) {
                 strace = true;
                 pathIdx++;
+            } else if (StrEq(argv[pathIdx], "--once")) {
+                // Idempotent spawn: skip if a process with the same basename
+                // is already running. Used by re-sourceable launcher scripts
+                // (`set wm; run --once waylandd; run app`) so re-clicking
+                // the launcher doesn't double-spawn the rendering server.
+                runOnce = true;
+                pathIdx++;
             } else {
                 break;
             }
@@ -844,7 +862,7 @@ static int ExecCommand(int argc, const char* const* argv)
 
         if (pathIdx >= argc)
         {
-            KPrintf("usage: run [--as <name>] [--strace] <path> [args...]\n");
+            KPrintf("usage: run [--as <name>] [--strace] [--once] <path> [args...]\n");
             return -1;
         }
 
@@ -853,6 +871,19 @@ static int ExecCommand(int argc, const char* const* argv)
         {
             KPrintf("shell: '%s' not found\n", argv[pathIdx]);
             return -1;
+        }
+
+        if (runOnce)
+        {
+            // Extract basename from resolved path for the live-process lookup.
+            const char* base = resolved;
+            for (const char* q = resolved; *q; ++q)
+                if (*q == '/') base = q + 1;
+            if (SchedulerFindProcessByBaseName(base))
+            {
+                KPrintf("shell: '%s' already running, skipping\n", base);
+                return 0;
+            }
         }
 
         // Build the effective argv starting from the user's args.

@@ -67,6 +67,13 @@ Process* SchedulerFindTerminatedChild(uint16_t parentPid, int64_t pid);
 Process* SchedulerFindStoppedChild(uint16_t parentPid, int64_t pid);
 void SchedulerStop(Process* proc);
 
+// Find a non-terminated process whose name (basename, possibly suffixed
+// by SpawnProcess with `_NN`) matches the given basename.  Used by the
+// shell to make `run-once` idempotent — re-sourced launcher scripts
+// must not double-spawn long-running helpers like waylandd.  Returns
+// nullptr if no live match is found.
+Process* SchedulerFindProcessByBaseName(const char* basename);
+
 // Reap (destroy) a terminated child process after wait4 collects its status.
 void SchedulerReapChild(Process* child);
 

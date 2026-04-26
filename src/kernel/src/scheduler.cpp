@@ -1314,6 +1314,29 @@ Process* SchedulerFindStoppedChild(uint16_t parentPid, int64_t pid)
     return nullptr;
 }
 
+Process* SchedulerFindProcessByBaseName(const char* basename)
+{
+    if (!basename || !*basename) return nullptr;
+    uint64_t alf = SchedLockAcquire(g_allProcLock);
+    for (uint32_t i = 0; i < g_processCount; ++i)
+    {
+        Process* p = g_allProcesses[i];
+        if (!p || p->state == ProcessState::Terminated) continue;
+        // proc->name is the binary basename optionally followed by "_NN".
+        // Match the prefix up to and excluding the spawn-index suffix.
+        const char* a = p->name;
+        const char* b = basename;
+        while (*a && *b && *a == *b) { ++a; ++b; }
+        if (*b == '\0' && (*a == '\0' || *a == '_'))
+        {
+            SchedLockRelease(g_allProcLock, alf);
+            return p;
+        }
+    }
+    SchedLockRelease(g_allProcLock, alf);
+    return nullptr;
+}
+
 void SchedulerReapChild(Process* child)
 {
     DbgPrintf("SCHED: reaping child '%s' (pid %u)\n", child->name, child->pid);

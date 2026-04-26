@@ -135,6 +135,16 @@ static void WmRenderString(uint32_t* buf, uint32_t stride,
 
 void WmInit()
 {
+    if (g_wmActive)
+    {
+        // Idempotent: launcher shortcuts that include `set wm` for first-run
+        // boot scripts must not nuke the existing window table when invoked
+        // a second time. Without this guard, every subsequent app launch
+        // would wipe every existing window's `proc` pointer (leaving the
+        // owning processes orphaned with no chrome and never reaped).
+        SerialPuts("WM: WmInit() called again — already initialised, skipping\n");
+        return;
+    }
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
         g_windows[i].proc = nullptr;
     g_focusedIdx = -1;
@@ -512,10 +522,22 @@ void WmResizeWindow(int idx, uint16_t newClientW, uint16_t newClientH)
     {
         TerminalResize(t, newClientW, newClientH);
     }
+    else if (w.vfb)
+    {
+        // WM-API window (waylandd-hosted toplevel etc): notify the client
+        // so it can reallocate a buffer at the new size and re-commit.
+        // The compositor blit clamps to the existing VFB until the new
+        // buffer arrives, so the visible chrome grows immediately and
+        // content "fills in" once the client acknowledges the configure.
+        WmPushWmEvent(&w,
+                      WM_EVT_RESIZED,
+                      static_cast<int16_t>(newClientW),
+                      static_cast<int16_t>(newClientH));
+    }
     else
     {
-        // Non-terminal windows: just update dimensions
-        // (process VFB stays the same size — upscale will handle it)
+        // Legacy per-process VFB (not WM-API): stays the same size,
+        // upscale handles it.
     }
 }
 

@@ -1038,9 +1038,32 @@ static void pump_input_for_surface(struct brook_surface *s) {
             }
             break;
         }
-        case WM_EVT_RESIZED:
-            /* TODO Phase E: send xdg_toplevel.configure with new size. */
+        case WM_EVT_RESIZED: {
+            /* The kernel WM has resized this window's chrome (drag-resize
+             * release). Tell the client via xdg_toplevel.configure with
+             * the new size — the client will allocate a fresh buffer at
+             * those dimensions, ack_configure, and commit. */
+            if (s->xdg_toplevel && s->xdg_surface) {
+                int32_t neww = e->x;
+                int32_t newh = e->y;
+                struct wl_array states; wl_array_init(&states);
+                /* Tell the client this is an active toplevel; resize is a
+                 * normal configure, not a fullscreen/maximize. */
+                if (wl_resource_get_version(s->xdg_toplevel) >= 2) {
+                    uint32_t *st = wl_array_add(&states, sizeof(uint32_t));
+                    if (st) *st = XDG_TOPLEVEL_STATE_ACTIVATED;
+                }
+                xdg_toplevel_send_configure(s->xdg_toplevel, neww, newh, &states);
+                wl_array_release(&states);
+                uint32_t serial = next_serial();
+                s->next_configure_serial = serial;
+                s->xdg_acked = 0;
+                xdg_surface_send_configure(s->xdg_surface, serial);
+                fprintf(stderr, "[waylandd] WM_EVT_RESIZED wm=%u → configure %dx%d serial=%u\n",
+                        s->wm_id, neww, newh, serial);
+            }
             break;
+        }
         default: break;
         }
     }
