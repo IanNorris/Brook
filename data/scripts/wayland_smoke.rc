@@ -1,3 +1,3 @@
 # Brook Wayland: server + client smoke test
-run /nix/store/kwdjchp139bbhn2x2jqnc1wci4bvw7jg-waylandd-brook-0.1-brook/bin/waylandd --seconds 10
+run /nix/store/g5c0jccsa5ws6kzf58mmwknyvzryzz2n-waylandd-brook-0.1-brook/bin/waylandd --seconds 10
 run /nix/store/4qkhgbl8hvj0p9sx3vkjammqc8b7xm5d-wayland-smoke-brook-0.1-brook/bin/wayland-smoke

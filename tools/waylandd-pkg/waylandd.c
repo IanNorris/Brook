@@ -258,6 +258,13 @@ struct brook_surface {
  * Wayland clients be visible side-by-side without requiring a full
  * window manager.  More than ~8 simultaneous windows isn't a goal. */
 #define MAX_TILED 8
+
+/* Server-side decoration ("chrome"): a 24px title bar drawn directly
+ * above each xdg_toplevel surface, with a close button at the right.
+ * Click on close → xdg_toplevel.send_close → graceful shutdown. */
+#define CHROME_H     24
+#define CLOSE_BTN_W  20
+#define CLOSE_BTN_H  CHROME_H
 static struct brook_surface *g_tiled[MAX_TILED];
 static int g_tiled_count = 0;
 
@@ -415,6 +422,36 @@ static void draw_panel(void) {
     draw_text(tx, ty, buf, 0xffd8dde0u);
 }
 
+static void draw_close_x(int cx, int cy, uint32_t col) {
+    /* 9x9 X centred in the close button */
+    int ox = cx + (CLOSE_BTN_W - 9) / 2;
+    int oy = cy + (CHROME_H - 9) / 2;
+    for (int i = 0; i < 9; i++) {
+        put_pixel(ox + i,         oy + i,         col);
+        put_pixel(ox + i,         oy + (8 - i),   col);
+        /* thicken */
+        put_pixel(ox + i + 1,     oy + i,         col);
+        put_pixel(ox + i,         oy + (8 - i) + 1, col);
+    }
+}
+
+static void draw_chrome(struct brook_surface *s) {
+    int sw = s->committed_w;
+    if (sw <= 0) return;
+    int focused = (s == g_active_surface);
+    uint32_t bg   = focused ? 0xff3a4148u : 0xff24272au;
+    uint32_t edge = focused ? 0xffffd870u : 0xff444a50u;
+    int cx = s->placed_x;
+    int cy = s->placed_y - CHROME_H;
+    fill_rect(cx, cy, sw, CHROME_H, bg);
+    fill_rect(cx, cy + CHROME_H - 1, sw, 1, edge);
+    /* Close button on the right. */
+    int bx = cx + sw - CLOSE_BTN_W;
+    fill_rect(bx, cy, 1, CHROME_H, edge);  /* divider */
+    uint32_t xcol = focused ? 0xffffe6a0u : 0xff9aa0a4u;
+    draw_close_x(bx, cy, xcol);
+}
+
 static void redraw_workspace(void) {
     if (!g_vfb) return;
     fill_background();
@@ -422,12 +459,15 @@ static void redraw_workspace(void) {
         struct brook_surface *s = g_tiled[i];
         if (!s->committed_px) continue;
         int sw = s->committed_w, sh = s->committed_h;
-        /* Centre surface within its tile rect. */
+        /* Reserve CHROME_H above the surface within its tile.  Centre
+         * the (chrome + surface) bundle in the tile vertically. */
+        int total_h = sh + CHROME_H;
         int dx = s->tile_x + (s->tile_w - sw) / 2;
-        int dy = s->tile_y + (s->tile_h - sh) / 2;
+        int dy = s->tile_y + (s->tile_h - total_h) / 2 + CHROME_H;
         if (dx < s->tile_x) dx = s->tile_x;
-        if (dy < s->tile_y) dy = s->tile_y;
+        if (dy < s->tile_y + CHROME_H) dy = s->tile_y + CHROME_H;
         blit_at(s->committed_px, sw, sh, dx, dy, &s->placed_x, &s->placed_y);
+        draw_chrome(s);
     }
     draw_panel();
     vfb_signal_dirty();
@@ -1258,17 +1298,27 @@ static void pump_input_once(void) {
         int32_t vx = *(const int32_t*)(e + 8);
         int32_t vy = *(const int32_t*)(e + 12);
 
-        /* Sloppy focus: pick whichever tile the cursor is currently over.
-         * Falls back to g_active_surface when no tile is hit (so bare-shm
-         * single-surface clients keep working). */
+        /* Sloppy focus: pick whichever tile the cursor is over.  Hit
+         * test includes the chrome strip directly above the surface so
+         * clicks on the title bar still focus the window.  Falls back
+         * to g_active_surface when no tile is hit (legacy bare-shm). */
         struct brook_surface *focus = NULL;
+        int in_chrome = 0;        /* cursor lands on chrome (not body) */
+        int in_close  = 0;        /* cursor lands on close button */
         for (int ti = 0; ti < g_tiled_count; ti++) {
             struct brook_surface *t = g_tiled[ti];
             if (!t->committed_px) continue;
             int x0 = t->placed_x, y0 = t->placed_y;
             int x1 = x0 + t->committed_w, y1 = y0 + t->committed_h;
-            if (vx >= x0 && vy >= y0 && vx < x1 && vy < y1) {
-                focus = t; break;
+            int chrome_y0 = y0 - CHROME_H;
+            int close_x0  = x1 - CLOSE_BTN_W;
+            if (vx >= x0 && vy >= chrome_y0 && vx < x1 && vy < y1) {
+                focus = t;
+                if (vy < y0) {
+                    in_chrome = 1;
+                    if (vx >= close_x0) in_close = 1;
+                }
+                break;
             }
         }
         if (focus) {
@@ -1277,6 +1327,19 @@ static void pump_input_once(void) {
             g_active_surface_h = focus->committed_h;
             g_active_surface_vfb_x = focus->placed_x;
             g_active_surface_vfb_y = focus->placed_y;
+        }
+        /* Close-button click: handle locally, do not forward to client. */
+        if (in_close && focus && type == 3 /* MouseButtonDown */ && sc == 0) {
+            if (focus->xdg_toplevel) {
+                fprintf(stderr, "[waylandd] close click → "
+                        "xdg_toplevel.close\n");
+                xdg_toplevel_send_close(focus->xdg_toplevel);
+            }
+            continue;  /* swallow */
+        }
+        /* Chrome (non-close) click: focus only, swallow event. */
+        if (in_chrome) {
+            continue;
         }
         /* VFB → surface-local: subtract surface origin within the VFB. */
         int sx_i = vx - g_active_surface_vfb_x;
