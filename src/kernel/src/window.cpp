@@ -529,6 +529,10 @@ void WmResizeWindow(int idx, uint16_t newClientW, uint16_t newClientH)
         // The compositor blit clamps to the existing VFB until the new
         // buffer arrives, so the visible chrome grows immediately and
         // content "fills in" once the client acknowledges the configure.
+        SerialPrintf("WM: resize wm_id=%u '%s' -> %ux%u (vfb %ux%u stride=%u)"
+                     " — pushing WM_EVT_RESIZED\n",
+                     w.wmId, w.title, newClientW, newClientH,
+                     w.clientW, w.clientH, w.vfbStride);
         WmPushWmEvent(&w,
                       WM_EVT_RESIZED,
                       static_cast<int16_t>(newClientW),
@@ -1333,6 +1337,115 @@ void WmDestroyWindowById(Process* proc, uint32_t wmId)
     if (!w) return;
     int idx = static_cast<int>(wmId) - 1;
     WmDestroyWindow(idx);
+}
+
+int WmResizeVfbForProcess(Process* proc, uint32_t wmId,
+                          uint16_t newW, uint16_t newH,
+                          WmCreateWindowResult* outResult)
+{
+    if (!proc || !outResult) return -22; // -EINVAL
+    if (newW < WM_MIN_WIDTH)  newW = WM_MIN_WIDTH;
+    if (newH < WM_MIN_HEIGHT) newH = WM_MIN_HEIGHT;
+
+    Window* w = WmFindWindowById(proc, wmId);
+    if (!w) return -2; // -ENOENT
+    if (!w->vfb) return -22; // -EINVAL — only for WM-API windows
+
+    // Compute new size; bail if identical to current to avoid churn.
+    uint32_t newStride = newW;
+    uint64_t newBytes  = static_cast<uint64_t>(newStride) * newH * 4;
+    uint64_t newPages  = (newBytes + 4095) / 4096;
+    uint64_t roundedBytes = newPages * 4096;
+
+    // Allocate new kernel-side VFB pages.
+    VirtualAddress newKAddr = VmmAllocPages(newPages, VMM_WRITABLE,
+                                             MemTag::Device, proc->pid);
+    if (!newKAddr)
+    {
+        SerialPrintf("WM: resize_vfb wm=%u alloc %lu pages failed\n", wmId, newPages);
+        return -12; // -ENOMEM
+    }
+    auto* newKVfb = reinterpret_cast<uint32_t*>(newKAddr.raw());
+    for (uint64_t i = 0; i < roundedBytes / 4; ++i) newKVfb[i] = 0;
+
+    // Carve a fresh user-VA range for the new mapping (we don't try to
+    // reuse the old userBase to avoid TLB races; we unmap the old one
+    // afterwards).
+    uint64_t newUserBase = proc->mmapNext;
+    if (newUserBase + newPages * 4096 > USER_MMAP_END)
+    {
+        SerialPrintf("WM: resize_vfb wm=%u user mmap exhausted\n", wmId);
+        VmmFreePages(newKAddr, newPages);
+        return -12;
+    }
+    proc->mmapNext = newUserBase + newPages * 4096;
+
+    bool mapOk = true;
+    for (uint64_t i = 0; i < newPages; ++i)
+    {
+        VirtualAddress kPage(newKAddr.raw() + i * 4096);
+        PhysicalAddress phys = VmmVirtToPhys(KernelPageTable, kPage);
+        if (!phys) { mapOk = false; break; }
+        if (!VmmMapPage(proc->pageTable, VirtualAddress(newUserBase + i * 4096),
+                        phys,
+                        VMM_PRESENT | VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
+                        MemTag::Device, proc->pid))
+        {
+            mapOk = false;
+            break;
+        }
+    }
+    if (!mapOk)
+    {
+        SerialPrintf("WM: resize_vfb wm=%u map failed\n", wmId);
+        for (uint64_t i = 0; i < newPages; ++i)
+            VmmUnmapPage(proc->pageTable, VirtualAddress(newUserBase + i * 4096));
+        VmmFreePages(newKAddr, newPages);
+        return -12;
+    }
+
+    // Snapshot old mapping so the compositor can finish any in-flight
+    // blit using w->vfb before we tear it down.
+    uint32_t* oldKVfb       = w->vfb;
+    uint64_t  oldVfbBytes   = w->vfbBytes;
+    void*     oldVfbUser    = w->vfbUser;
+    uint64_t  oldPages      = (oldVfbBytes + 4095) / 4096;
+
+    // Atomically swap the kernel VFB pointer + sizes so the compositor
+    // sees a consistent view from this point on.  Mark dirty so the
+    // first blit at the new size happens before any client commit.
+    w->vfb       = newKVfb;
+    w->vfbStride = newStride;
+    w->vfbBytes  = roundedBytes;
+    w->vfbUser   = reinterpret_cast<void*>(newUserBase);
+    w->clientW   = newW;
+    w->clientH   = newH;
+    w->vfbDirty  = 1;
+
+    // Wait for any in-flight compositor blit using the old VFB to retire
+    // before we unmap the old user pages and free the old kernel pages.
+    CompositorWaitFrame();
+
+    if (oldVfbUser && oldVfbBytes)
+    {
+        uint64_t oldUserBase = reinterpret_cast<uint64_t>(oldVfbUser);
+        for (uint64_t i = 0; i < oldPages; ++i)
+            VmmUnmapPage(proc->pageTable, VirtualAddress(oldUserBase + i * 4096));
+    }
+    if (oldKVfb && oldPages)
+    {
+        VmmFreePages(VirtualAddress(reinterpret_cast<uint64_t>(oldKVfb)),
+                     oldPages);
+    }
+
+    SerialPrintf("WM: resize_vfb wm=%u -> %ux%u stride=%u kvfb=0x%lx user=0x%lx\n",
+                 wmId, newW, newH, newStride,
+                 reinterpret_cast<uint64_t>(newKVfb), newUserBase);
+
+    outResult->wmId      = wmId;
+    outResult->vfbUser   = w->vfbUser;
+    outResult->vfbStride = w->vfbStride;
+    return 0;
 }
 
 void WmSignalDirtyById(Process* proc, uint32_t wmId)

@@ -232,6 +232,18 @@ void WmDestroyWindowById(Process* proc, uint32_t wmId);
 void WmSignalDirtyById(Process* proc, uint32_t wmId);
 void WmSetTitleById(Process* proc, uint32_t wmId, const char* title);
 
+// Resize an existing WM-API window's VFB to (newW × newH).  Allocates fresh
+// kernel pages, zeros them, unmaps the old user-side mapping, and maps the
+// new pages at the same userBase if it fits, else at a fresh user range.
+// Used by waylandd after sending xdg_toplevel.configure and the client
+// commits a buffer at the new size.  Returns 0 on success, -errno on
+// failure; on success populates *outResult with the new vfbUser pointer
+// and stride (which may differ from the old stride).  The kernel-side
+// w.clientW/H are also updated to the new dimensions.
+int WmResizeVfbForProcess(Process* proc, uint32_t wmId,
+                          uint16_t newW, uint16_t newH,
+                          WmCreateWindowResult* outResult);
+
 // Look up a Window* given (proc, wmId).  Returns nullptr if mismatch.
 Window* WmFindWindowById(Process* proc, uint32_t wmId);
 

@@ -45,6 +45,7 @@
 #define BROOK_SYS_WM_SIGNAL_DIRTY    508
 #define BROOK_SYS_WM_SET_TITLE       509
 #define BROOK_SYS_WM_POP_INPUT       510
+#define BROOK_SYS_WM_RESIZE_VFB      511
 
 /* Match the kernel's BrookWmCreateOut struct. */
 struct brook_wm_create_out {
@@ -101,6 +102,10 @@ static long wm_set_title(uint32_t id, const char* title) {
 }
 static long wm_pop_input(uint32_t id, struct brook_wm_event* buf, long max) {
     return syscall(BROOK_SYS_WM_POP_INPUT, (long)id, (long)buf, max);
+}
+static long wm_resize_vfb(uint32_t id, uint32_t w, uint32_t h,
+                          struct brook_wm_create_out* out) {
+    return syscall(BROOK_SYS_WM_RESIZE_VFB, (long)id, (long)w, (long)h, (long)out);
 }
 
 /* ---------------- per-surface state ---------------- */
@@ -283,6 +288,29 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
         }
 
         if (s->wm_id && s->vfb) {
+            /* If the client committed a buffer at a size different from
+             * our current VFB (typical after we sent a configure with new
+             * dimensions and the client allocated a fresh buffer), grow
+             * the kernel VFB to match before blitting.  We only resize
+             * when *both* dimensions changed or the new buffer is bigger
+             * than current VFB so we don't churn on transient mismatches. */
+            if ((uint32_t)w != s->vfb_w || (uint32_t)h != s->vfb_h) {
+                struct brook_wm_create_out out = {0};
+                long rc = wm_resize_vfb(s->wm_id, (uint32_t)w, (uint32_t)h, &out);
+                if (rc == 0 && out.vfb_user) {
+                    s->vfb        = (uint32_t*)(uintptr_t)out.vfb_user;
+                    s->vfb_stride = out.vfb_stride;
+                    s->vfb_w      = (uint32_t)w;
+                    s->vfb_h      = (uint32_t)h;
+                    fprintf(stderr,
+                            "[waylandd] WM_RESIZE_VFB id=%u %dx%d stride=%u vfb=%p\n",
+                            s->wm_id, w, h, s->vfb_stride, (void*)s->vfb);
+                } else {
+                    fprintf(stderr,
+                            "[waylandd] WM_RESIZE_VFB id=%u %dx%d FAILED rc=%ld — clamping blit\n",
+                            s->wm_id, w, h, rc);
+                }
+            }
             wl_shm_buffer_begin_access(shm);
             const uint8_t *px = wl_shm_buffer_get_data(shm);
             if (px) blit_to_window(s, px, w, h, stride);

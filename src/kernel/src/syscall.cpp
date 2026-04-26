@@ -7479,6 +7479,36 @@ static int64_t sys_brook_wm_pop_input(uint64_t wmId, uint64_t bufPtr,
     return static_cast<int64_t>(brook::WmInputPop(w, uo, static_cast<uint32_t>(max)));
 }
 
+// 511: WM_RESIZE_VFB(wmId, newW, newH, outPtr)
+//   Reallocates the kernel VFB for an existing waylandd-hosted toplevel
+//   to (newW × newH).  Old user mapping is unmapped and a fresh user
+//   mapping is returned via outPtr (BrookWmCreateOut layout).  Should be
+//   called by waylandd after the client commits a buffer at the size we
+//   asked for via xdg_toplevel.configure.
+static int64_t sys_brook_wm_resize_vfb(uint64_t wmId, uint64_t newW,
+                                        uint64_t newH, uint64_t outPtr,
+                                        uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    if (wmId == 0 || wmId > 0xFFFFFFFFu) return -EINVAL;
+    if (newW == 0 || newH == 0 || newW > 0xFFFF || newH > 0xFFFF) return -EINVAL;
+    if (!outPtr) return -EFAULT;
+
+    brook::WmCreateWindowResult res = {};
+    int rc = brook::WmResizeVfbForProcess(proc, static_cast<uint32_t>(wmId),
+                                           static_cast<uint16_t>(newW),
+                                           static_cast<uint16_t>(newH),
+                                           &res);
+    if (rc != 0) return rc;
+
+    auto* uo = reinterpret_cast<BrookWmCreateOut*>(outPtr);
+    uo->wmId      = res.wmId;
+    uo->vfbStride = res.vfbStride;
+    uo->vfbUser   = reinterpret_cast<uint64_t>(res.vfbUser);
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // sys_not_implemented
 // ---------------------------------------------------------------------------
@@ -8846,6 +8876,7 @@ void SyscallTableInit()
     g_syscallTable[508]                  = sys_brook_wm_signal_dirty;
     g_syscallTable[509]                  = sys_brook_wm_set_title;
     g_syscallTable[510]                  = sys_brook_wm_pop_input;
+    g_syscallTable[511]                  = sys_brook_wm_resize_vfb;
 
     uint32_t count = 0;
     for (uint64_t i = 0; i < SYSCALL_MAX; ++i)
