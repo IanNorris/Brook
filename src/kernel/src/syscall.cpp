@@ -275,6 +275,12 @@ struct MemFdData {
 static bool MemFdGrow(MemFdData* mfd, uint64_t needed)
 {
     if (needed <= mfd->capacity) return true;
+    // Cap memfd size at 128 MiB. GTK's gdk-wayland speculatively
+    // ftruncates a giant pool (~700 MiB) for the SHM cache; allowing
+    // that would either OOM kmalloc or wrap our uint32 cast below.
+    // Returning ENOMEM lets it back off to a per-buffer pool.
+    static constexpr uint64_t MEMFD_MAX = 128ULL * 1024 * 1024;
+    if (needed > MEMFD_MAX) return false;
     uint64_t newCap = needed + 4096;
     // Over-allocate by one page so we can align up inside the allocation.
     uint8_t* raw = static_cast<uint8_t*>(kmalloc(static_cast<uint32_t>(newCap + 4096)));

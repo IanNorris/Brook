@@ -275,7 +275,7 @@ qemu-system-x86_64 \
     -machine q35 \
     ${KVM_FLAGS} \
     -smp 8 \
-    -m 4G \
+    -m 8G \
     -drive if=pflash,format=raw,readonly=on,file="${OVMF_CODE}" \
     -drive if=pflash,format=raw,file="${OVMF_VARS_COPY}" \
     -drive format=raw,file=fat:rw:"${ESP_OVERRIDE:-${BUILD_DIR}/esp}" \
