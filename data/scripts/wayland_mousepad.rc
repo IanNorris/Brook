@@ -1,5 +1,5 @@
 # Brook + mousepad (Xfce GTK3 text editor).
 set wm
 set vfb none
-run /nix/store/3y5hdmm5cfc5q4wldivcjh4xahmi93s2-waylandd-brook-0.1-brook/bin/waylandd
+run /nix/store/fgx145an3idhczckjd26r526m0ykzafz-waylandd-brook-0.1-brook/bin/waylandd
 run /nix/store/n7gxslgrhr7kmwgxigsys49davanf2c6-mousepad-0.7.0/bin/mousepad

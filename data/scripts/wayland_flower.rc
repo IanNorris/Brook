@@ -3,5 +3,5 @@
 # The binary's RPATH points only into the bundle's lib/.
 set wm
 set vfb none
-run /nix/store/3y5hdmm5cfc5q4wldivcjh4xahmi93s2-waylandd-brook-0.1-brook/bin/waylandd
+run /nix/store/fgx145an3idhczckjd26r526m0ykzafz-waylandd-brook-0.1-brook/bin/waylandd
 run /nix/store/9lpb4j6syssckpmrcfs9r1awwf3dcyq4-weston-flower-bundle-15.0.0-bundle/bin/weston-flower
