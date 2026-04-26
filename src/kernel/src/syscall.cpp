@@ -5207,6 +5207,32 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
             continue;
         }
 
+        // Unix domain socket
+        if (fde->type == FdType::UnixSocket && fde->handle)
+        {
+            auto* usd = static_cast<UnixSocketData*>(fde->handle);
+            if (fds[i].events & POLLIN)
+            {
+                bool readable = false;
+                if (usd->state == UnixSocketData::State::Listening)
+                    readable = (usd->pendingCount > 0);
+                else if (usd->state == UnixSocketData::State::Connected && usd->rxPipe)
+                    readable = (usd->rxPipe->count() > 0 ||
+                                __atomic_load_n(&usd->rxPipe->writers, __ATOMIC_ACQUIRE) == 0);
+                if (readable) fds[i].revents |= POLLIN;
+            }
+            if (fds[i].events & POLLOUT)
+            {
+                bool writable = false;
+                if (usd->state == UnixSocketData::State::Connected && usd->txPipe)
+                    writable = (usd->txPipe->space() > 0 ||
+                                __atomic_load_n(&usd->txPipe->readers, __ATOMIC_ACQUIRE) == 0);
+                if (writable) fds[i].revents |= POLLOUT;
+            }
+            if (fds[i].revents) ready++;
+            continue;
+        }
+
         // /dev/tty: check read pipe for POLLIN, write pipe always ready for POLLOUT
         if (fde->type == FdType::DevTty && fde->handle)
         {
@@ -5309,6 +5335,14 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
                 int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
                 brook::SockSetPollWaiter(sockIdx, self);
             }
+            if (fde->type == FdType::UnixSocket && fde->handle && (fds[i].events & POLLIN))
+            {
+                auto* usd = static_cast<UnixSocketData*>(fde->handle);
+                if (usd->state == UnixSocketData::State::Connected && usd->rxPipe)
+                    usd->rxPipe->readerWaiter = self;
+                else if (usd->state == UnixSocketData::State::Listening)
+                    usd->epollWaiter = self;
+            }
         }
 
         // Re-check data availability after registration.
@@ -5333,6 +5367,17 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
                 if (brook::SockPollReady(sockIdx, (fds[i].events & POLLIN) != 0,
                                                   (fds[i].events & POLLOUT) != 0))
                 { ready++; break; }
+            }
+            if (fde->type == FdType::UnixSocket && fde->handle && (fds[i].events & POLLIN))
+            {
+                auto* usd = static_cast<UnixSocketData*>(fde->handle);
+                if (usd->state == UnixSocketData::State::Listening) {
+                    if (usd->pendingCount > 0) { ready++; break; }
+                } else if (usd->state == UnixSocketData::State::Connected && usd->rxPipe) {
+                    if (usd->rxPipe->count() > 0 ||
+                        __atomic_load_n(&usd->rxPipe->writers, __ATOMIC_ACQUIRE) == 0)
+                    { ready++; break; }
+                }
             }
         }
 
@@ -5390,6 +5435,16 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
                 auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
                 if (rp->readerWaiter == self)
                     rp->readerWaiter = nullptr;
+            }
+            if (fde->type == FdType::UnixSocket && fde->handle && (fds[i].events & POLLIN))
+            {
+                auto* usd = static_cast<UnixSocketData*>(fde->handle);
+                if (usd->state == UnixSocketData::State::Connected && usd->rxPipe &&
+                    usd->rxPipe->readerWaiter == self)
+                    usd->rxPipe->readerWaiter = nullptr;
+                if (usd->state == UnixSocketData::State::Listening &&
+                    usd->epollWaiter == self)
+                    usd->epollWaiter = nullptr;
             }
             // Socket waiter is already cleared by SockDeliverUdp/TcpEnqueueData on wake
         }
@@ -5460,6 +5515,29 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
             {
                 if (fds[i].events & POLLOUT)
                     fds[i].revents |= POLLOUT;
+                if (fds[i].revents) ready++;
+                continue;
+            }
+            if (fde->type == FdType::UnixSocket && fde->handle)
+            {
+                auto* usd = static_cast<UnixSocketData*>(fde->handle);
+                if (fds[i].events & POLLIN)
+                {
+                    bool readable = false;
+                    if (usd->state == UnixSocketData::State::Listening)
+                        readable = (usd->pendingCount > 0);
+                    else if (usd->state == UnixSocketData::State::Connected && usd->rxPipe)
+                        readable = (usd->rxPipe->count() > 0 ||
+                                    __atomic_load_n(&usd->rxPipe->writers, __ATOMIC_ACQUIRE) == 0);
+                    if (readable) fds[i].revents |= POLLIN;
+                }
+                if (fds[i].events & POLLOUT)
+                {
+                    if (usd->state == UnixSocketData::State::Connected && usd->txPipe &&
+                        (usd->txPipe->space() > 0 ||
+                         __atomic_load_n(&usd->txPipe->readers, __ATOMIC_ACQUIRE) == 0))
+                        fds[i].revents |= POLLOUT;
+                }
                 if (fds[i].revents) ready++;
                 continue;
             }
