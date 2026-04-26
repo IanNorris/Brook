@@ -125,6 +125,10 @@ void ApEntryFunction()
            (1ULL << 10);    // OSXMMEXCPT
     __asm__ volatile("mov %0, %%cr4" :: "r"(cr4));
 
+    // Match BSP: enable OSXSAVE + XCR0=x87|SSE|AVX so AVX-using user code
+    // doesn't #UD on this AP.  Helper handles CPUID gating internally.
+    CpuEnableXsaveAvx();
+
     uint8_t myId = static_cast<uint8_t>(LapicRead(LapicReg::ID) >> 24);
     SerialPrintf("SMP: AP %u online\n", myId);
 

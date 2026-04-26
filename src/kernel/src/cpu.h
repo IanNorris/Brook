@@ -19,6 +19,11 @@
 
 void CpuInitFpu();
 
+// Enable XSAVE-managed CPU state (CR4.OSXSAVE + XCR0 = x87|SSE|AVX) so
+// AVX/AVX2 instructions don't #UD in user space.  Called from CpuInitFpu
+// for the BSP and from ApEntryFunction for each AP.
+void CpuEnableXsaveAvx();
+
 // Returns true if CPUID reports SSE2 support (always true on x86-64).
 bool CpuHasSse2();
 bool CpuHasRdrand();

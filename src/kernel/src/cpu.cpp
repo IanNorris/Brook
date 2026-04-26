@@ -14,6 +14,7 @@ static constexpr uint64_t CR0_NE = (1ULL << 5);  // Numeric Error (native FPU er
 // CR4
 static constexpr uint64_t CR4_OSFXSR    = (1ULL << 9);   // OS supports FXSAVE/FXRSTOR
 static constexpr uint64_t CR4_OSXMMEXCPT = (1ULL << 10); // OS handles SIMD FP exceptions
+static constexpr uint64_t CR4_OSXSAVE    = (1ULL << 18); // OS uses XSAVE/XRSTOR & enables AVX
 
 static inline uint64_t ReadCr0() { uint64_t v; __asm__ volatile("mov %%cr0,%0":"=r"(v)); return v; }
 static inline void     WriteCr0(uint64_t v) { __asm__ volatile("mov %0,%%cr0"::"r"(v)); }
@@ -49,6 +50,70 @@ void CpuInitFpu()
                         (ecx_val & (1U << 9)) ? "yes" : "no",
                         (ecx_val & (1U << 19)) ? "yes" : "no",
                         (ecx_val & (1U << 20)) ? "yes" : "no");
+
+    CpuEnableXsaveAvx();
+}
+
+// Enable XSAVE-managed CPU state so AVX/AVX2 instructions don't #UD in user
+// space.  Sets CR4.OSXSAVE and writes XCR0 = 0x7 (x87 | SSE | AVX).
+//
+// CAVEAT: We currently keep using fxsave/fxrstor in the scheduler context
+// switch and in the APIC profiler IRQ stub.  fxsave only saves x87 + SSE
+// (XMM0-15 lower 128 bits) — the YMM upper halves are NOT saved across
+// context switches.  This means YMM bits 128-255 of process A can leak
+// into process B if the scheduler interleaves them.  For Brook (hobby OS,
+// no security boundary, mostly single-threaded GUI apps) this is an
+// accepted compromise to unblock AVX-using clients (GIMP etc).  Proper
+// fix is to grow FxsaveArea to 1088B alignas(64) and switch the asm to
+// xsave64/xrstor64 with state mask 0x7 — tracked separately.
+void CpuEnableXsaveAvx()
+{
+    // CPUID.1.ECX[26] = XSAVE supported by hardware.  qemu64 model lacks
+    // it; -cpu host (KVM) and -cpu Skylake-Client and friends have it.
+    uint32_t cpuid1_ecx = 0, cpuid1_edx = 0, cpuid1_ebx = 0;
+    __asm__ volatile("cpuid"
+                     : "=b"(cpuid1_ebx), "=c"(cpuid1_ecx), "=d"(cpuid1_edx)
+                     : "a"(1));
+    if (!(cpuid1_ecx & (1U << 26)))
+    {
+        brook::SerialPrintf("CPU: XSAVE not supported by HW; AVX disabled\n");
+        return;
+    }
+
+    // Set CR4.OSXSAVE — required before XGETBV/XSETBV and before CPUID
+    // reports OSXSAVE=1 to user-space (which glibc ifunc resolvers gate on).
+    uint64_t cr4 = ReadCr4();
+    cr4 |= CR4_OSXSAVE;
+    WriteCr4(cr4);
+
+    // Read current XCR0 (just for logging).
+    uint32_t xcr0_lo = 0, xcr0_hi = 0;
+    __asm__ volatile("xgetbv"
+                     : "=a"(xcr0_lo), "=d"(xcr0_hi)
+                     : "c"(0));
+
+    // Always enable x87 (bit 0) + SSE (bit 1).  Add AVX (bit 2) iff
+    // CPUID.1.ECX[28] is set — required by Intel SDM (don't enable a
+    // state component the CPU doesn't advertise).
+    uint32_t newXcr0 = xcr0_lo | 0x3;
+    bool hasAvx = (cpuid1_ecx & (1U << 28)) != 0;
+    if (hasAvx) newXcr0 |= 0x4;
+
+    __asm__ volatile("xsetbv"
+                     :
+                     : "a"(newXcr0), "d"(0u), "c"(0u));
+
+    // Also read AVX2 from CPUID.7.0.EBX[5] for diagnostic logging.
+    uint32_t leaf7_ebx = 0;
+    __asm__ volatile("cpuid"
+                     : "=b"(leaf7_ebx)
+                     : "a"(7u), "c"(0u)
+                     : "edx");
+
+    brook::SerialPrintf("CPU: XSAVE enabled (CR4.OSXSAVE=1, XCR0=0x%x, AVX=%s, AVX2=%s)\n",
+                        newXcr0,
+                        hasAvx ? "yes" : "no",
+                        (leaf7_ebx & (1U << 5)) ? "yes" : "no");
 }
 
 bool CpuHasSse2()
