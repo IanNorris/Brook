@@ -107,6 +107,7 @@ static constexpr uint64_t SYS_FUTEX           = 202;
 static constexpr uint64_t SYS_TKILL           = 200;
 static constexpr uint64_t SYS_SET_ROBUST_LIST = 273;
 static constexpr uint64_t SYS_TGKILL          = 234;
+static constexpr uint64_t SYS_MBIND           = 237;
 static constexpr uint64_t SYS_FACCESSAT       = 269;
 static constexpr uint64_t SYS_DUP3            = 292;
 static constexpr uint64_t SYS_RSEQ            = 334;

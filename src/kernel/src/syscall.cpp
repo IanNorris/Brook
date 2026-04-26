@@ -5756,7 +5756,6 @@ static int64_t epoll_create_impl(uint64_t flagsVal)
     if (flagsVal & 0x80000) // EPOLL_CLOEXEC
         proc->fds[fd].fdFlags |= 1;
 
-
     return fd;
 }
 
@@ -6680,6 +6679,17 @@ static int64_t sys_madvise(uint64_t, uint64_t, uint64_t,
                             uint64_t, uint64_t, uint64_t)
 {
     return 0; // no-op
+}
+
+// ---------------------------------------------------------------------------
+// sys_mbind (237) — NUMA memory binding. We are single-node, so this is
+// always a successful no-op. GIMP via libmetis calls this.
+// ---------------------------------------------------------------------------
+
+static int64_t sys_mbind(uint64_t, uint64_t, uint64_t,
+                          uint64_t, uint64_t, uint64_t)
+{
+    return 0; // single-node — nothing to bind
 }
 
 // ---------------------------------------------------------------------------
@@ -8862,6 +8872,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_STATX]           = sys_statx;
     g_syscallTable[SYS_MINCORE]         = sys_mincore;
     g_syscallTable[SYS_MADVISE]         = sys_madvise;
+    g_syscallTable[SYS_MBIND]           = sys_mbind;
     g_syscallTable[SYS_PWRITE64]        = sys_pwrite64;
 
     // Socket syscalls
