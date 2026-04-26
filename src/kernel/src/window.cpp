@@ -402,15 +402,23 @@ void WmSetFocus(int idx)
 {
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
     if (!g_windows[idx].proc) return;
+    if (g_focusedIdx == idx) return;
 
     // Unfocus old
     if (g_focusedIdx >= 0 && g_focusedIdx < static_cast<int>(WM_MAX_WINDOWS))
-        g_windows[g_focusedIdx].focused = false;
+    {
+        Window& old = g_windows[g_focusedIdx];
+        old.focused = false;
+        if (old.proc && old.vfb)
+            WmPushWmEvent(&old, WM_EVT_FOCUS_LOST, 0, 0);
+    }
 
     // Focus and raise new
     g_windows[idx].focused = true;
     g_windows[idx].zOrder = g_nextZOrder++;
     g_focusedIdx = idx;
+    if (g_windows[idx].vfb)
+        WmPushWmEvent(&g_windows[idx], WM_EVT_FOCUS_GAINED, 0, 0);
 }
 
 int WmGetFocusedWindow()
@@ -1353,6 +1361,24 @@ uint32_t WmInputPop(Window* win, Window::WmInputEvent* out, uint32_t max)
                          __ATOMIC_RELEASE);
     }
     return produced;
+}
+
+void WmPushWmEvent(Window* win, uint8_t type, int16_t x, int16_t y)
+{
+    if (!win) return;
+    uint32_t head = __atomic_load_n(&win->inputHead, __ATOMIC_ACQUIRE);
+    uint32_t tail = __atomic_load_n(&win->inputTail, __ATOMIC_ACQUIRE);
+    uint32_t next = (head + 1) % Window::WM_INPUT_QUEUE;
+    if (next == tail) return;
+    Window::WmInputEvent& slot = win->inputQueue[head];
+    slot.type      = type;
+    slot.scanCode  = 0;
+    slot.ascii     = 0;
+    slot.modifiers = 0;
+    slot.x         = x;
+    slot.y         = y;
+    slot.reserved  = 0;
+    __atomic_store_n(&win->inputHead, next, __ATOMIC_RELEASE);
 }
 
 } // namespace brook

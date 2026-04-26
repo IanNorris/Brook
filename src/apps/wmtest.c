@@ -15,6 +15,10 @@
 #define BROOK_WM_SET_TITLE       509
 #define BROOK_WM_POP_INPUT       510
 
+#define WM_EVT_CLOSE_REQUESTED   0x80
+#define WM_EVT_FOCUS_GAINED      0x81
+#define WM_EVT_FOCUS_LOST        0x82
+
 struct wm_create_out {
     uint32_t wm_id;
     uint32_t vfb_stride;
@@ -43,6 +47,10 @@ static long wm_signal_dirty(uint32_t id) {
 
 static long wm_pop(uint32_t id, struct wm_input_evt* buf, long max) {
     return syscall(BROOK_WM_POP_INPUT, (long)id, (long)buf, max);
+}
+
+static long wm_destroy(uint32_t id) {
+    return syscall(BROOK_WM_DESTROY_WINDOW, (long)id);
 }
 
 static void fill(uint32_t* fb, uint32_t stride, uint16_t w, uint16_t h,
@@ -103,29 +111,61 @@ int main(void) {
     redraw(&B);
 
     struct wm_input_evt buf[16];
-    for (int frame = 0; frame < 2400; ++frame) {  // ~120s @ 50ms
+    int focused_a = 0, focused_b = 0;
+    int alive_a = 1, alive_b = 1;
+    for (int frame = 0; frame < 12000 && (alive_a || alive_b); ++frame) {
         int dirty_a = 0, dirty_b = 0;
-        long n = wm_pop(A.info.wm_id, buf, 16);
-        for (long i = 0; i < n; ++i) {
-            if (buf[i].type == 2 || buf[i].type == 3 || buf[i].type == 4) {
-                A.mx = buf[i].x; A.my = buf[i].y;
-            } else if (buf[i].type == 0) {
-                A.keys++;
+        if (alive_a) {
+            long n = wm_pop(A.info.wm_id, buf, 16);
+            for (long i = 0; i < n; ++i) {
+                uint8_t t = buf[i].type;
+                if (t == 2 || t == 3 || t == 4) {
+                    A.mx = buf[i].x; A.my = buf[i].y;
+                    dirty_a = 1;
+                } else if (t == 0) {
+                    A.keys++;
+                    dirty_a = 1;
+                } else if (t == WM_EVT_CLOSE_REQUESTED) {
+                    printf("wmtest: A close requested\n");
+                    wm_destroy(A.info.wm_id);
+                    alive_a = 0;
+                    break;
+                } else if (t == WM_EVT_FOCUS_GAINED) {
+                    focused_a = 1; dirty_a = 1;
+                } else if (t == WM_EVT_FOCUS_LOST) {
+                    focused_a = 0; dirty_a = 1;
+                }
             }
-            dirty_a = 1;
         }
-        n = wm_pop(B.info.wm_id, buf, 16);
-        for (long i = 0; i < n; ++i) {
-            if (buf[i].type == 2 || buf[i].type == 3 || buf[i].type == 4) {
-                B.mx = buf[i].x; B.my = buf[i].y;
-            } else if (buf[i].type == 0) {
-                B.keys++;
+        if (alive_b) {
+            long n = wm_pop(B.info.wm_id, buf, 16);
+            for (long i = 0; i < n; ++i) {
+                uint8_t t = buf[i].type;
+                if (t == 2 || t == 3 || t == 4) {
+                    B.mx = buf[i].x; B.my = buf[i].y;
+                    dirty_b = 1;
+                } else if (t == 0) {
+                    B.keys++;
+                    dirty_b = 1;
+                } else if (t == WM_EVT_CLOSE_REQUESTED) {
+                    printf("wmtest: B close requested\n");
+                    wm_destroy(B.info.wm_id);
+                    alive_b = 0;
+                    break;
+                } else if (t == WM_EVT_FOCUS_GAINED) {
+                    focused_b = 1; dirty_b = 1;
+                } else if (t == WM_EVT_FOCUS_LOST) {
+                    focused_b = 0; dirty_b = 1;
+                }
             }
-            dirty_b = 1;
         }
-        if (dirty_a) redraw(&A);
-        if (dirty_b) redraw(&B);
+        // Tint background slightly when focused.
+        A.bg = focused_a ? 0xFFE04040 : 0xFFCC3030;
+        B.bg = focused_b ? 0xFF50A0FF : 0xFF3060CC;
+        if (alive_a && dirty_a) redraw(&A);
+        if (alive_b && dirty_b) redraw(&B);
         usleep(50 * 1000);
     }
+    printf("wmtest: exit\n");
     return 0;
 }

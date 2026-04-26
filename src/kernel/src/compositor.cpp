@@ -720,7 +720,12 @@ static void CompositorLoopWM()
             if (term)
                 TerminalClose(term);
 
-            WmDestroyWindow(sorted[i]);
+            // Destroy every window owned by this process in one go,
+            // *before* unregistering / marking reapable.  Otherwise the
+            // next loop iteration that dereferences w->proc on a sibling
+            // window of the same proc may hit a freed Process struct
+            // (the reaper can race us between iterations).
+            WmDestroyWindowForProcess(p);
             CompositorUnregisterProcess(p);
             continue;
         }
@@ -1180,12 +1185,22 @@ static void CompositorHandleMouseWM()
                 if (w && w->proc)
                 {
                     SerialPrintf("WM: close window %d '%s'\n", hit.windowIndex, w->title);
-                    // For terminal windows, use TerminalClose for clean shutdown
-                    Terminal* term = TerminalFindByProcess(w->proc);
-                    if (term)
-                        TerminalClose(term);
+                    if (w->vfb)
+                    {
+                        // WM-API window: push CloseRequested so the client
+                        // can do its own teardown (close wl_clients, free
+                        // resources, then call WM_DESTROY_WINDOW).
+                        WmPushWmEvent(w, WM_EVT_CLOSE_REQUESTED, 0, 0);
+                    }
                     else
-                        ProcessSendSignal(w->proc, 15); // SIGTERM
+                    {
+                        // Native/legacy window: previous behaviour.
+                        Terminal* term = TerminalFindByProcess(w->proc);
+                        if (term)
+                            TerminalClose(term);
+                        else
+                            ProcessSendSignal(w->proc, 15); // SIGTERM
+                    }
                 }
                 break;
             }

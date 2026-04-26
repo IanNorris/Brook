@@ -243,6 +243,17 @@ void WmInputPush(Window* win, const InputEvent& ev, int16_t localX, int16_t loca
 // number of events actually written.  Non-blocking.
 uint32_t WmInputPop(Window* win, Window::WmInputEvent* out, uint32_t max);
 
+// Phase C — synthetic "WM event" types.  These share the same ring as
+// input events; clients distinguish via the `type` byte.  Values >= 0x80
+// are reserved for WM events to avoid colliding with InputEventType.
+static constexpr uint8_t WM_EVT_CLOSE_REQUESTED = 0x80;
+static constexpr uint8_t WM_EVT_FOCUS_GAINED    = 0x81;
+static constexpr uint8_t WM_EVT_FOCUS_LOST      = 0x82;
+static constexpr uint8_t WM_EVT_RESIZED         = 0x83; // x=newW, y=newH
+
+// Push a synthetic WM event into the per-window queue.  Drops on overflow.
+void WmPushWmEvent(Window* win, uint8_t type, int16_t x = 0, int16_t y = 0);
+
 // ---------------------------------------------------------------------------
 // App Launcher
 // ---------------------------------------------------------------------------
