@@ -745,8 +745,20 @@ static void CompositorLoopWM()
             // makes the content flicker out).  vfbDirty is consumed only
             // to clear the damage-bit; later phases can use it to skip
             // recomposition when nothing has changed *anywhere*.
-            BlitWindowVfb(w->vfb, w->clientW, w->clientH, w->vfbStride,
-                          w->clientX(), w->clientY());
+            //
+            // Clamp blit to the buffer that was actually allocated — the
+            // user can drag-resize the window larger than the VFB before
+            // the client provides a fresh buffer, and reading past
+            // w->vfb causes a kernel #PF.
+            uint32_t vfbW = w->vfbStride;
+            uint32_t vfbH = (w->vfbStride && w->vfbBytes)
+                          ? static_cast<uint32_t>(w->vfbBytes / (uint64_t)w->vfbStride / 4)
+                          : 0;
+            uint32_t blitW = w->clientW < vfbW ? w->clientW : vfbW;
+            uint32_t blitH = w->clientH < vfbH ? w->clientH : vfbH;
+            if (blitW && blitH)
+                BlitWindowVfb(w->vfb, blitW, blitH, w->vfbStride,
+                              w->clientX(), w->clientY());
             w->vfbDirty = 0;
         }
         else if (p->state != ProcessState::Terminated && p->fbVfbWidth > 0)
