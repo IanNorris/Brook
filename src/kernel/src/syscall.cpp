@@ -7795,6 +7795,25 @@ static int64_t sys_brook_wm_resize_vfb(uint64_t wmId, uint64_t newW,
     return 0;
 }
 
+// 512: WM_SET_DECORATION_MODE(wmId, csdEnabled)
+//   Toggle CSD (client-side decoration) mode for a waylandd-hosted window.
+//   Used to honour zxdg_toplevel_decoration_v1.set_mode.  When enabled,
+//   the kernel WM stops drawing chrome and the whole outer area is client.
+static int64_t sys_brook_wm_set_decoration_mode(uint64_t wmId, uint64_t csd,
+                                                 uint64_t, uint64_t,
+                                                 uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    if (wmId == 0 || wmId > 0xFFFFu) return -EINVAL;
+
+    int idx = static_cast<int>(wmId) - 1;
+    brook::Window* w = brook::WmGetWindow(idx);
+    if (!w || w->proc != proc) return -EINVAL;
+    brook::WmSetClientSideDecoration(idx, csd != 0);
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // sys_not_implemented
 // ---------------------------------------------------------------------------
@@ -9188,6 +9207,7 @@ void SyscallTableInit()
     g_syscallTable[509]                  = sys_brook_wm_set_title;
     g_syscallTable[510]                  = sys_brook_wm_pop_input;
     g_syscallTable[511]                  = sys_brook_wm_resize_vfb;
+    g_syscallTable[512]                  = sys_brook_wm_set_decoration_mode;
 
     uint32_t count = 0;
     for (uint64_t i = 0; i < SYSCALL_MAX; ++i)

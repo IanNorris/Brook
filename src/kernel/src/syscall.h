@@ -5,7 +5,7 @@
 namespace brook {
 
 // Maximum number of syscalls. Must match the dispatcher bounds check.
-static constexpr uint64_t SYSCALL_MAX = 512;
+static constexpr uint64_t SYSCALL_MAX = 600;
 
 // Syscall numbers (Linux x86-64 ABI)
 static constexpr uint64_t SYS_READ            = 0;

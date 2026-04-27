@@ -46,6 +46,7 @@
 #define BROOK_SYS_WM_SET_TITLE       509
 #define BROOK_SYS_WM_POP_INPUT       510
 #define BROOK_SYS_WM_RESIZE_VFB      511
+#define BROOK_SYS_WM_SET_DECORATION_MODE 512
 
 /* Match the kernel's BrookWmCreateOut struct. */
 struct brook_wm_create_out {
@@ -107,6 +108,9 @@ static long wm_resize_vfb(uint32_t id, uint32_t w, uint32_t h,
                           struct brook_wm_create_out* out) {
     return syscall(BROOK_SYS_WM_RESIZE_VFB, (long)id, (long)w, (long)h, (long)out);
 }
+static long wm_set_decoration_mode(uint32_t id, int csd) {
+    return syscall(BROOK_SYS_WM_SET_DECORATION_MODE, (long)id, (long)csd);
+}
 
 /* ---------------- per-surface state ---------------- */
 
@@ -149,6 +153,13 @@ struct brook_surface {
     uint32_t *vfb;          /* mapped into our address space by the kernel */
     uint32_t  vfb_stride;   /* in pixels */
     uint32_t  vfb_w, vfb_h; /* the size we created the Window at */
+
+    /* Decoration mode requested by client.  Initialised to CSD when the
+     * client binds zxdg_decoration_manager_v1 (signalling it knows how to
+     * draw its own chrome) and updated by zxdg_toplevel_decoration_v1.set_mode.
+     * Applied to the kernel WM when wm_id is known. */
+    int  deco_csd;          /* 1 = client-side, 0 = server-side */
+    int  deco_pending;      /* mode change requested but wm_id not yet known */
 
     /* Linked list of all surfaces — used by the input pump. */
     struct brook_surface *next;
@@ -287,6 +298,12 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
                 fprintf(stderr,
                         "[waylandd] WM_CREATE_WINDOW id=%u %dx%d stride=%u vfb=%p\n",
                         s->wm_id, w, h, s->vfb_stride, (void*)s->vfb);
+                /* Apply any decoration mode the client requested before
+                 * the kernel Window existed. */
+                if (s->deco_pending) {
+                    wm_set_decoration_mode(s->wm_id, s->deco_csd);
+                    s->deco_pending = 0;
+                }
             } else {
                 fprintf(stderr, "[waylandd] WM_CREATE_WINDOW failed rc=%ld\n", rc);
             }
@@ -1175,18 +1192,45 @@ static void pump_input_once(void) {
  * from the client) and always respond with configure(server_side).
  */
 
+/* zxdg_toplevel_decoration_v1 — server-managed decoration negotiation.
+ *
+ * Brook follows the GNOME/Mutter convention: when a client binds the
+ * decoration manager at all, it has signalled it knows how to draw its
+ * own chrome (CSD).  The initial configure is therefore CLIENT_SIDE.
+ * The client may override with set_mode(SERVER_SIDE) -- we comply and
+ * have the kernel WM draw chrome.  Either way we drive the kernel
+ * WM's noChrome flag via syscall 512 so the rendering matches.
+ *
+ * Clients that never bind the decoration manager (most legacy GTK3)
+ * keep the default SSD chrome.
+ */
+
 static void deco_destroy(struct wl_client *c, struct wl_resource *r) {
     (void)c; wl_resource_destroy(r);
 }
-static void deco_set_mode(struct wl_client *c, struct wl_resource *r, uint32_t mode) {
-    (void)c; (void)mode;
+static void deco_apply_mode(struct wl_resource *r, int csd) {
+    struct brook_surface *s = wl_resource_get_user_data(r);
+    if (!s) return;
+    s->deco_csd = csd;
+    if (s->wm_id) {
+        wm_set_decoration_mode(s->wm_id, csd);
+        s->deco_pending = 0;
+    } else {
+        s->deco_pending = 1;
+    }
     zxdg_toplevel_decoration_v1_send_configure(r,
-        ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+        csd ? ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE
+            : ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+}
+static void deco_set_mode(struct wl_client *c, struct wl_resource *r, uint32_t mode) {
+    (void)c;
+    deco_apply_mode(r, mode == ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE ? 1 : 0);
 }
 static void deco_unset_mode(struct wl_client *c, struct wl_resource *r) {
     (void)c;
-    zxdg_toplevel_decoration_v1_send_configure(r,
-        ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+    /* Spec: "client requests to use the surface's current mode without
+     * a preference".  We default to CSD per the policy above. */
+    deco_apply_mode(r, 1);
 }
 static const struct zxdg_toplevel_decoration_v1_interface deco_impl = {
     .destroy    = deco_destroy,
@@ -1201,17 +1245,15 @@ static void deco_mgr_get_toplevel_decoration(struct wl_client *c,
                                               struct wl_resource *r,
                                               uint32_t id,
                                               struct wl_resource *toplevel) {
-    (void)r; (void)toplevel;
+    (void)r;
+    struct brook_surface *s = toplevel ? wl_resource_get_user_data(toplevel) : NULL;
     struct wl_resource *d = wl_resource_create(c,
         &zxdg_toplevel_decoration_v1_interface,
         wl_resource_get_version(r), id);
     if (!d) { wl_client_post_no_memory(c); return; }
-    wl_resource_set_implementation(d, &deco_impl, NULL, NULL);
-    /* Send the initial configure immediately so clients that wait for
-     * it before drawing don't stall.  Server-side: we will draw the
-     * decoration. */
-    zxdg_toplevel_decoration_v1_send_configure(d,
-        ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+    wl_resource_set_implementation(d, &deco_impl, s, NULL);
+    /* Default to CSD: the client opted in by binding the manager. */
+    deco_apply_mode(d, 1);
 }
 static const struct zxdg_decoration_manager_v1_interface deco_mgr_impl = {
     .destroy                = deco_mgr_destroy,

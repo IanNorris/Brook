@@ -192,6 +192,7 @@ int WmCreateWindow(Process* proc, int16_t x, int16_t y,
     w.focused = false;
     w.visible = true;
     w.minimized = false;
+    w.noChrome = false;
     w.savedX = x;
     w.savedY = y;
     w.savedW = clientW;
@@ -310,10 +311,20 @@ WmHitResult WmHitTest(int32_t mx, int32_t my)
         int ww = w.outerWidth();
         int wh = w.outerHeight();
 
-        // Check if mouse is within outer bounds (extended by grab zone for resize)
-        int grab = static_cast<int>(WM_RESIZE_EDGE);
+        // Check if mouse is within outer bounds (extended by grab zone for resize).
+        // CSD windows have no kernel-managed chrome or resize zone; treat them
+        // strictly by their outer (== client) bounds.
+        int grab = w.noChrome ? 0 : static_cast<int>(WM_RESIZE_EDGE);
         if (mx < wx - grab || my < wy || mx >= wx + ww + grab || my >= wy + wh + grab)
             continue;
+
+        // CSD: no chrome zones, no edge resize.  The whole window is client.
+        if (w.noChrome)
+        {
+            result.windowIndex = idx;
+            result.zone = WmHitZone::ClientArea;
+            return result;
+        }
 
         // If click is outside the visual window but inside grab zone,
         // treat as edge resize
@@ -443,6 +454,19 @@ Window* WmGetWindow(int idx)
     return &g_windows[idx];
 }
 
+void WmSetClientSideDecoration(int idx, bool enable)
+{
+    if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
+    Window& w = g_windows[idx];
+    if (!w.proc) return;
+    if (w.noChrome == enable) return;
+    w.noChrome = enable;
+    // Mark compositor dirty so the chrome region repaints/clears next frame.
+    extern void CompositorMarkDirty();
+    CompositorMarkDirty();
+    SerialPrintf("WM: window %d CSD=%d\n", idx, (int)enable);
+}
+
 uint32_t WmWindowCount()
 {
     uint32_t n = 0;
@@ -470,12 +494,18 @@ void WmToggleMaximize(int idx)
         w.savedW = w.clientW;
         w.savedH = w.clientH;
 
-        // Maximize: fill desktop area (screen minus taskbar) minus chrome
+        // Maximize: fill desktop area (screen minus taskbar) minus chrome.
+        // CSD windows have no chrome, so the client area takes the full space.
         w.x = 0;
         w.y = 0;
         uint32_t desktopH = WmDesktopHeight(screenH);
-        newW = static_cast<uint16_t>(screenW - 2 * WM_BORDER_WIDTH);
-        newH = static_cast<uint16_t>(desktopH - WM_TITLE_BAR_HEIGHT - 2 * WM_BORDER_WIDTH);
+        if (w.noChrome) {
+            newW = static_cast<uint16_t>(screenW);
+            newH = static_cast<uint16_t>(desktopH);
+        } else {
+            newW = static_cast<uint16_t>(screenW - 2 * WM_BORDER_WIDTH);
+            newH = static_cast<uint16_t>(desktopH - WM_TITLE_BAR_HEIGHT - 2 * WM_BORDER_WIDTH);
+        }
         w.state = WindowState::Maximized;
     }
     else
@@ -620,6 +650,7 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
                                 uint32_t screenW, uint32_t screenH,
                                 const Window& w)
 {
+    if (w.noChrome) return;  // CSD: client draws its own chrome
     int wx = w.x;
     int wy = w.y;
     int ow = w.outerWidth();

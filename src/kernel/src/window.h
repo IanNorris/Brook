@@ -50,6 +50,7 @@ struct Window
     bool        focused;
     bool        visible;
     bool        minimized;      // hidden from desktop, shown in taskbar
+    bool        noChrome;       // CSD: client draws own chrome; WM skips title/border
     char        title[64];
 
     // Per-window VFB (Phase A of wayland↔WM unification).  When non-null
@@ -86,13 +87,14 @@ struct Window
     int16_t     savedX, savedY;
     uint16_t    savedW, savedH;
 
-    // Outer dimensions including chrome
-    uint16_t outerWidth()  const { return clientW + 2 * WM_BORDER_WIDTH; }
-    uint16_t outerHeight() const { return clientH + WM_TITLE_BAR_HEIGHT + 2 * WM_BORDER_WIDTH; }
+    // Outer dimensions including chrome.  CSD (noChrome) windows have
+    // no kernel chrome, so outer == client.
+    uint16_t outerWidth()  const { return noChrome ? clientW : (clientW + 2 * WM_BORDER_WIDTH); }
+    uint16_t outerHeight() const { return noChrome ? clientH : (clientH + WM_TITLE_BAR_HEIGHT + 2 * WM_BORDER_WIDTH); }
 
     // Client area origin relative to outer top-left
-    int16_t clientX() const { return x + static_cast<int16_t>(WM_BORDER_WIDTH); }
-    int16_t clientY() const { return y + static_cast<int16_t>(WM_TITLE_BAR_HEIGHT + WM_BORDER_WIDTH); }
+    int16_t clientX() const { return noChrome ? x : (x + static_cast<int16_t>(WM_BORDER_WIDTH)); }
+    int16_t clientY() const { return noChrome ? y : (y + static_cast<int16_t>(WM_TITLE_BAR_HEIGHT + WM_BORDER_WIDTH)); }
 };
 
 // Hit-test result for mouse clicks
@@ -162,6 +164,11 @@ void WmMinimizeWindow(int idx);
 
 // Restore a minimized window.
 void WmRestoreWindow(int idx);
+
+// Toggle CSD (client-side decoration) mode for a window.  When enabled the
+// kernel WM stops drawing chrome and treats the whole outer area as client.
+// Used by waylandd to honour zxdg_toplevel_decoration_v1.set_mode.
+void WmSetClientSideDecoration(int idx, bool enable);
 
 // Move a window to a new position.
 void WmMoveWindow(int idx, int16_t newX, int16_t newY);
