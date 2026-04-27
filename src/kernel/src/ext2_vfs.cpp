@@ -873,6 +873,13 @@ static uint32_t Ext2BlockMap(Ext2Mount* mnt, const Ext2Inode* ino, uint32_t file
 }
 
 // Read `len` bytes from inode data at `offset`. Returns bytes read.
+//
+// Performance: coalesces runs of contiguous full file-blocks into a
+// single Ext2DevRead, reading directly into the caller's buffer
+// (skipping the bounce buffer). For typical large files (libgtk-4.so
+// etc.) the underlying ext2 allocator places blocks contiguously, so
+// the run usually spans the whole request — collapsing dozens of
+// per-block virtio round-trips into a single 64KB transfer.
 static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
                              void* buf, uint64_t len, uint64_t offset)
 {
@@ -886,42 +893,77 @@ static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
     auto* dst = static_cast<uint8_t*>(buf);
     uint64_t bytesRead = 0;
 
-    // Temporary block buffer
-    auto* blockBuf = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
-    if (!blockBuf) return -1;
+    // Cap run-coalesce length at the underlying device's preferred
+    // burst (matches virtio-blk's persistent 64KB DMA buffer).
+    static constexpr uint64_t MAX_RUN_BYTES = 64 * 1024;
+
+    // Bounce buffer used only for unaligned head/tail partial blocks.
+    uint8_t* blockBuf = nullptr;
+    auto getBounce = [&]() -> uint8_t* {
+        if (!blockBuf) blockBuf = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+        return blockBuf;
+    };
 
     while (bytesRead < len) {
         uint32_t fileBlock = static_cast<uint32_t>((offset + bytesRead) >> mnt->blockShift);
         uint32_t blockOff  = static_cast<uint32_t>((offset + bytesRead) & (mnt->blockSize - 1));
         uint32_t diskBlock = Ext2BlockMap(mnt, ino, fileBlock);
 
-        uint32_t avail = mnt->blockSize - blockOff;
-        uint64_t toCopy = len - bytesRead;
-        if (toCopy > avail) toCopy = avail;
+        uint64_t avail = mnt->blockSize - blockOff;
+        uint64_t remaining = len - bytesRead;
 
+        // Sparse hole: read returns zeros (POSIX semantics; essential
+        // for ELF shared libraries where fuse2fs preserves zero
+        // alignment padding as sparse blocks on disk).
         if (!diskBlock) {
-            // Sparse hole: read returns zeros (POSIX semantics for sparse
-            // files). Zero-filling and continuing is essential for ELF
-            // shared libraries where cp -a / fuse2fs preserve zero
-            // alignment padding as sparse blocks on disk.
-            for (uint64_t i = 0; i < toCopy; ++i)
-                dst[bytesRead + i] = 0;
+            uint64_t toCopy = avail < remaining ? avail : remaining;
+            for (uint64_t i = 0; i < toCopy; ++i) dst[bytesRead + i] = 0;
             bytesRead += toCopy;
             continue;
         }
 
-        if (!Ext2ReadBlock(mnt, diskBlock, blockBuf)) {
-            SerialPrintf("ext2: ReadBlock failed for diskBlock=%u (fileBlock=%u)\n",
-                diskBlock, fileBlock);
-            break;
+        // Unaligned head OR final partial block: use bounce buffer for
+        // one block, copy the slice we need.
+        if (blockOff != 0 || remaining < mnt->blockSize) {
+            uint8_t* bb = getBounce();
+            if (!bb) break;
+            if (!Ext2ReadBlock(mnt, diskBlock, bb)) {
+                SerialPrintf("ext2: ReadBlock failed for diskBlock=%u (fileBlock=%u)\n",
+                             diskBlock, fileBlock);
+                break;
+            }
+            uint64_t toCopy = avail < remaining ? avail : remaining;
+            for (uint64_t i = 0; i < toCopy; ++i)
+                dst[bytesRead + i] = bb[blockOff + i];
+            bytesRead += toCopy;
+            continue;
         }
 
-        for (uint64_t i = 0; i < toCopy; ++i)
-            dst[bytesRead + i] = blockBuf[blockOff + i];
-        bytesRead += toCopy;
+        // Aligned to a block boundary AND caller wants at least one
+        // full block. Find the longest run of contiguous file-blocks
+        // mapping to contiguous disk-blocks (capped at MAX_RUN_BYTES
+        // and at the data still requested).
+        uint32_t runBlocks = 1;
+        uint32_t maxRun = static_cast<uint32_t>(remaining >> mnt->blockShift);
+        if (maxRun > (MAX_RUN_BYTES >> mnt->blockShift))
+            maxRun = MAX_RUN_BYTES >> mnt->blockShift;
+        while (runBlocks < maxRun) {
+            uint32_t nextDb = Ext2BlockMap(mnt, ino, fileBlock + runBlocks);
+            if (nextDb != diskBlock + runBlocks) break; // sparse hole or non-contiguous
+            ++runBlocks;
+        }
+
+        uint64_t runBytes = static_cast<uint64_t>(runBlocks) << mnt->blockShift;
+        uint64_t runOff   = static_cast<uint64_t>(diskBlock) << mnt->blockShift;
+        if (!Ext2DevRead(mnt, runOff, dst + bytesRead, runBytes)) {
+            SerialPrintf("ext2: coalesced read failed off=%lu len=%lu\n",
+                         runOff, runBytes);
+            break;
+        }
+        bytesRead += runBytes;
     }
 
-    kfree(blockBuf);
+    if (blockBuf) kfree(blockBuf);
     return static_cast<int>(bytesRead);
 }
 
