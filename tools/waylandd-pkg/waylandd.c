@@ -115,6 +115,8 @@ static long wm_set_decoration_mode(uint32_t id, int csd) {
 /* ---------------- per-surface state ---------------- */
 
 struct brook_seat_client;
+struct brook_surface;
+static void seat_clients_scrub_surface(struct brook_surface *s);
 
 /* xdg_positioner state — captured here so xdg_surface.get_popup can
  * read its size/anchor without a forward declaration dance. */
@@ -392,10 +394,7 @@ static void surface_destroy_userdata(struct wl_resource *r) {
      * memory and (more visibly) call wl_pointer.send_leave with a surface
      * resource owned by another client, which libwayland aborts as a
      * compositor bug. */
-    for (struct brook_seat_client *sc = g_seat_clients; sc; sc = sc->next) {
-        if (sc->entered_surface == s) sc->entered_surface = NULL;
-        if (sc->kb_focus == s)        sc->kb_focus = NULL;
-    }
+    seat_clients_scrub_surface(s);
     /* unlink */
     struct brook_surface **pp = &g_surfaces;
     while (*pp) {
@@ -778,12 +777,21 @@ struct brook_seat_client {
     struct wl_client   *client;
     struct brook_surface *entered_surface;  /* pointer enter target */
     struct brook_surface *kb_focus;         /* keyboard focus target */
+    uint32_t kb_mods_depressed;
+    uint32_t kb_mods_locked;
     struct brook_seat_client *next;
 };
 
 static struct brook_seat_client *g_seat_clients = NULL;
 static uint32_t g_serial = 1;
 static uint32_t next_serial(void) { return g_serial++; }
+
+static void seat_clients_scrub_surface(struct brook_surface *s) {
+    for (struct brook_seat_client *sc = g_seat_clients; sc; sc = sc->next) {
+        if (sc->entered_surface == s) sc->entered_surface = NULL;
+        if (sc->kb_focus == s)        sc->kb_focus = NULL;
+    }
+}
 
 static void seat_remove_client(struct brook_seat_client *sc) {
     struct brook_seat_client **pp = &g_seat_clients;
@@ -827,54 +835,173 @@ static void keyboard_resource_destroy(struct wl_resource *r) {
 }
 
 static int make_keymap_fd(size_t *out_size) {
+    /* Full US-101 xkb keymap.  evdev keycodes (= scancode + 8).
+     * The previous version only declared a-l on the home row -- every
+     * other letter, number, and punctuation key reached the client as
+     * an unmapped keycode, which xkbcommon translates to NoSymbol and
+     * apps like mousepad drop.  Cover the standard typing block. */
     static const char keymap[] =
         "xkb_keymap {\n"
         "xkb_keycodes \"brook\" {\n"
         " minimum = 8; maximum = 255;\n"
-        " <ESC> = 9; <SPCE> = 65; <RTRN> = 36;\n"
-        " <LFSH> = 50; <RTSH> = 62; <LCTL> = 37; <RCTL> = 105;\n"
-        " <LALT> = 64; <RALT> = 108; <CAPS> = 66;\n"
-        " <AC01> = 38; <AC02> = 39; <AC03> = 40; <AC04> = 41;\n"
-        " <AC05> = 42; <AC06> = 43; <AC07> = 44; <AC08> = 45;\n"
-        " <AC09> = 46; <AC10> = 47; <AC11> = 48;\n"
-        " <AB01> = 52; <AB02> = 53; <AB03> = 54; <AB04> = 55;\n"
-        " <AB05> = 56; <AB06> = 57; <AB07> = 58; <AB08> = 59;\n"
-        " <AB09> = 60; <AB10> = 61;\n"
-        " <AD01> = 24; <AD02> = 25; <AD03> = 26; <AD04> = 27;\n"
-        " <AD05> = 28; <AD06> = 29; <AD07> = 30; <AD08> = 31;\n"
-        " <AD09> = 32; <AD10> = 33;\n"
+        " <ESC>  =  9;\n"
+        " <AE01> = 10; <AE02> = 11; <AE03> = 12; <AE04> = 13; <AE05> = 14;\n"
+        " <AE06> = 15; <AE07> = 16; <AE08> = 17; <AE09> = 18; <AE10> = 19;\n"
+        " <AE11> = 20; <AE12> = 21; <BKSP> = 22;\n"
+        " <TAB>  = 23;\n"
+        " <AD01> = 24; <AD02> = 25; <AD03> = 26; <AD04> = 27; <AD05> = 28;\n"
+        " <AD06> = 29; <AD07> = 30; <AD08> = 31; <AD09> = 32; <AD10> = 33;\n"
+        " <AD11> = 34; <AD12> = 35; <RTRN> = 36;\n"
+        " <LCTL> = 37;\n"
+        " <AC01> = 38; <AC02> = 39; <AC03> = 40; <AC04> = 41; <AC05> = 42;\n"
+        " <AC06> = 43; <AC07> = 44; <AC08> = 45; <AC09> = 46; <AC10> = 47;\n"
+        " <AC11> = 48; <TLDE> = 49;\n"
+        " <LFSH> = 50; <BKSL> = 51;\n"
+        " <AB01> = 52; <AB02> = 53; <AB03> = 54; <AB04> = 55; <AB05> = 56;\n"
+        " <AB06> = 57; <AB07> = 58; <AB08> = 59; <AB09> = 60; <AB10> = 61;\n"
+        " <RTSH> = 62; <KPMU> = 63;\n"
+        " <LALT> = 64; <SPCE> = 65; <CAPS> = 66;\n"
+        " <FK01> = 67; <FK02> = 68; <FK03> = 69; <FK04> = 70; <FK05> = 71;\n"
+        " <FK06> = 72; <FK07> = 73; <FK08> = 74; <FK09> = 75; <FK10> = 76;\n"
+        " <NMLK> = 77; <SCLK> = 78;\n"
+        " <KP7>  = 79; <KP8>  = 80; <KP9>  = 81; <KPSU> = 82;\n"
+        " <KP4>  = 83; <KP5>  = 84; <KP6>  = 85; <KPAD> = 86;\n"
+        " <KP1>  = 87; <KP2>  = 88; <KP3>  = 89; <KP0>  = 90; <KPDL> = 91;\n"
+        " <FK11> = 95; <FK12> = 96;\n"
+        " <KPEN> = 104; <RCTL> = 105; <KPDV> = 106;\n"
+        " <PRSC> = 107; <RALT> = 108;\n"
+        " <HOME> = 110; <UP>   = 111; <PGUP> = 112;\n"
+        " <LEFT> = 113; <RGHT> = 114;\n"
+        " <END>  = 115; <DOWN> = 116; <PGDN> = 117;\n"
+        " <INS>  = 118; <DELE> = 119;\n"
+        " <PAUS> = 127;\n"
+        " <LWIN> = 133; <RWIN> = 134; <MENU> = 135;\n"
         "};\n"
         "xkb_types \"brook\" {\n"
         " virtual_modifiers NumLock,Alt,LevelThree,LAlt,RAlt,RControl,LControl,ScrollLock,LevelFive,AltGr,Meta,Super,Hyper;\n"
         " type \"ONE_LEVEL\" { modifiers = none; level_name[Level1] = \"Any\"; };\n"
-        " type \"TWO_LEVEL\" { modifiers = Shift; map[Shift] = Level2; level_name[Level1] = \"Base\"; level_name[Level2] = \"Shift\"; };\n"
+        " type \"TWO_LEVEL\" {\n"
+        "   modifiers = Shift;\n"
+        "   map[Shift] = Level2;\n"
+        "   level_name[Level1] = \"Base\"; level_name[Level2] = \"Shift\";\n"
+        " };\n"
+        " type \"ALPHABETIC\" {\n"
+        "   modifiers = Shift+Lock;\n"
+        "   map[Shift] = Level2; map[Lock] = Level2;\n"
+        "   level_name[Level1] = \"Base\"; level_name[Level2] = \"Caps\";\n"
+        " };\n"
+        " type \"KEYPAD\" {\n"
+        "   modifiers = NumLock+Shift;\n"
+        "   map[Shift] = Level2; map[NumLock] = Level2;\n"
+        "   level_name[Level1] = \"Base\"; level_name[Level2] = \"Number\";\n"
+        " };\n"
         "};\n"
         "xkb_compatibility \"brook\" {\n"
         " virtual_modifiers NumLock,Alt,LevelThree,LAlt,RAlt,RControl,LControl,ScrollLock,LevelFive,AltGr,Meta,Super,Hyper;\n"
         " interpret Any+AnyOf(all) { action = SetMods(modifiers=modMapMods,clearLocks); };\n"
+        " interpret Caps_Lock+AnyOf(all) { action= LockMods(modifiers=Lock); };\n"
+        " interpret Num_Lock+AnyOf(all) { action= LockMods(modifiers=NumLock); };\n"
         "};\n"
         "xkb_symbols \"brook\" {\n"
         " name[Group1] = \"Brook US\";\n"
-        " key <ESC>  { [Escape] };\n"
-        " key <SPCE> { [space] };\n"
-        " key <RTRN> { [Return] };\n"
-        " key <LFSH> { [Shift_L] }; key <RTSH> { [Shift_R] };\n"
-        " key <LCTL> { [Control_L] }; key <RCTL> { [Control_R] };\n"
-        " key <LALT> { [Alt_L] }; key <RALT> { [Alt_R] };\n"
-        " key <CAPS> { [Caps_Lock] };\n"
-        " key <AC01> { type=\"TWO_LEVEL\", [a, A] };\n"
-        " key <AC02> { type=\"TWO_LEVEL\", [s, S] };\n"
-        " key <AC03> { type=\"TWO_LEVEL\", [d, D] };\n"
-        " key <AC04> { type=\"TWO_LEVEL\", [f, F] };\n"
-        " key <AC05> { type=\"TWO_LEVEL\", [g, G] };\n"
-        " key <AC06> { type=\"TWO_LEVEL\", [h, H] };\n"
-        " key <AC07> { type=\"TWO_LEVEL\", [j, J] };\n"
-        " key <AC08> { type=\"TWO_LEVEL\", [k, K] };\n"
-        " key <AC09> { type=\"TWO_LEVEL\", [l, L] };\n"
+        " key <ESC>  { [ Escape ] };\n"
+        " key <AE01> { type=\"TWO_LEVEL\", [ 1, exclam       ] };\n"
+        " key <AE02> { type=\"TWO_LEVEL\", [ 2, at           ] };\n"
+        " key <AE03> { type=\"TWO_LEVEL\", [ 3, numbersign   ] };\n"
+        " key <AE04> { type=\"TWO_LEVEL\", [ 4, dollar       ] };\n"
+        " key <AE05> { type=\"TWO_LEVEL\", [ 5, percent      ] };\n"
+        " key <AE06> { type=\"TWO_LEVEL\", [ 6, asciicircum  ] };\n"
+        " key <AE07> { type=\"TWO_LEVEL\", [ 7, ampersand    ] };\n"
+        " key <AE08> { type=\"TWO_LEVEL\", [ 8, asterisk     ] };\n"
+        " key <AE09> { type=\"TWO_LEVEL\", [ 9, parenleft    ] };\n"
+        " key <AE10> { type=\"TWO_LEVEL\", [ 0, parenright   ] };\n"
+        " key <AE11> { type=\"TWO_LEVEL\", [ minus, underscore ] };\n"
+        " key <AE12> { type=\"TWO_LEVEL\", [ equal, plus     ] };\n"
+        " key <BKSP> { [ BackSpace ] };\n"
+        " key <TAB>  { [ Tab, ISO_Left_Tab ] };\n"
+        " key <AD01> { type=\"ALPHABETIC\", [ q, Q ] };\n"
+        " key <AD02> { type=\"ALPHABETIC\", [ w, W ] };\n"
+        " key <AD03> { type=\"ALPHABETIC\", [ e, E ] };\n"
+        " key <AD04> { type=\"ALPHABETIC\", [ r, R ] };\n"
+        " key <AD05> { type=\"ALPHABETIC\", [ t, T ] };\n"
+        " key <AD06> { type=\"ALPHABETIC\", [ y, Y ] };\n"
+        " key <AD07> { type=\"ALPHABETIC\", [ u, U ] };\n"
+        " key <AD08> { type=\"ALPHABETIC\", [ i, I ] };\n"
+        " key <AD09> { type=\"ALPHABETIC\", [ o, O ] };\n"
+        " key <AD10> { type=\"ALPHABETIC\", [ p, P ] };\n"
+        " key <AD11> { type=\"TWO_LEVEL\", [ bracketleft, braceleft   ] };\n"
+        " key <AD12> { type=\"TWO_LEVEL\", [ bracketright, braceright ] };\n"
+        " key <RTRN> { [ Return ] };\n"
+        " key <LCTL> { [ Control_L ] };\n"
+        " key <AC01> { type=\"ALPHABETIC\", [ a, A ] };\n"
+        " key <AC02> { type=\"ALPHABETIC\", [ s, S ] };\n"
+        " key <AC03> { type=\"ALPHABETIC\", [ d, D ] };\n"
+        " key <AC04> { type=\"ALPHABETIC\", [ f, F ] };\n"
+        " key <AC05> { type=\"ALPHABETIC\", [ g, G ] };\n"
+        " key <AC06> { type=\"ALPHABETIC\", [ h, H ] };\n"
+        " key <AC07> { type=\"ALPHABETIC\", [ j, J ] };\n"
+        " key <AC08> { type=\"ALPHABETIC\", [ k, K ] };\n"
+        " key <AC09> { type=\"ALPHABETIC\", [ l, L ] };\n"
+        " key <AC10> { type=\"TWO_LEVEL\", [ semicolon, colon  ] };\n"
+        " key <AC11> { type=\"TWO_LEVEL\", [ apostrophe, quotedbl ] };\n"
+        " key <TLDE> { type=\"TWO_LEVEL\", [ grave, asciitilde ] };\n"
+        " key <LFSH> { [ Shift_L ] };\n"
+        " key <BKSL> { type=\"TWO_LEVEL\", [ backslash, bar ] };\n"
+        " key <AB01> { type=\"ALPHABETIC\", [ z, Z ] };\n"
+        " key <AB02> { type=\"ALPHABETIC\", [ x, X ] };\n"
+        " key <AB03> { type=\"ALPHABETIC\", [ c, C ] };\n"
+        " key <AB04> { type=\"ALPHABETIC\", [ v, V ] };\n"
+        " key <AB05> { type=\"ALPHABETIC\", [ b, B ] };\n"
+        " key <AB06> { type=\"ALPHABETIC\", [ n, N ] };\n"
+        " key <AB07> { type=\"ALPHABETIC\", [ m, M ] };\n"
+        " key <AB08> { type=\"TWO_LEVEL\", [ comma, less    ] };\n"
+        " key <AB09> { type=\"TWO_LEVEL\", [ period, greater ] };\n"
+        " key <AB10> { type=\"TWO_LEVEL\", [ slash, question ] };\n"
+        " key <RTSH> { [ Shift_R ] };\n"
+        " key <KPMU> { [ KP_Multiply ] };\n"
+        " key <LALT> { [ Alt_L ] };\n"
+        " key <SPCE> { [ space ] };\n"
+        " key <CAPS> { [ Caps_Lock ] };\n"
+        " key <FK01> { [ F1 ] }; key <FK02> { [ F2 ] };\n"
+        " key <FK03> { [ F3 ] }; key <FK04> { [ F4 ] };\n"
+        " key <FK05> { [ F5 ] }; key <FK06> { [ F6 ] };\n"
+        " key <FK07> { [ F7 ] }; key <FK08> { [ F8 ] };\n"
+        " key <FK09> { [ F9 ] }; key <FK10> { [ F10 ] };\n"
+        " key <FK11> { [ F11 ] }; key <FK12> { [ F12 ] };\n"
+        " key <NMLK> { [ Num_Lock ] };\n"
+        " key <SCLK> { [ Scroll_Lock ] };\n"
+        " key <KP0>  { type=\"KEYPAD\", [ KP_Insert,    KP_0 ] };\n"
+        " key <KP1>  { type=\"KEYPAD\", [ KP_End,       KP_1 ] };\n"
+        " key <KP2>  { type=\"KEYPAD\", [ KP_Down,      KP_2 ] };\n"
+        " key <KP3>  { type=\"KEYPAD\", [ KP_Next,      KP_3 ] };\n"
+        " key <KP4>  { type=\"KEYPAD\", [ KP_Left,      KP_4 ] };\n"
+        " key <KP5>  { type=\"KEYPAD\", [ KP_Begin,     KP_5 ] };\n"
+        " key <KP6>  { type=\"KEYPAD\", [ KP_Right,     KP_6 ] };\n"
+        " key <KP7>  { type=\"KEYPAD\", [ KP_Home,      KP_7 ] };\n"
+        " key <KP8>  { type=\"KEYPAD\", [ KP_Up,        KP_8 ] };\n"
+        " key <KP9>  { type=\"KEYPAD\", [ KP_Prior,     KP_9 ] };\n"
+        " key <KPDL> { type=\"KEYPAD\", [ KP_Delete, KP_Decimal ] };\n"
+        " key <KPSU> { [ KP_Subtract ] };\n"
+        " key <KPAD> { [ KP_Add ] };\n"
+        " key <KPDV> { [ KP_Divide ] };\n"
+        " key <KPEN> { [ KP_Enter ] };\n"
+        " key <RCTL> { [ Control_R ] };\n"
+        " key <RALT> { [ Alt_R ] };\n"
+        " key <PRSC> { [ Print ] };\n"
+        " key <PAUS> { [ Pause ] };\n"
+        " key <HOME> { [ Home ] }; key <END>  { [ End  ] };\n"
+        " key <PGUP> { [ Prior ] }; key <PGDN> { [ Next ] };\n"
+        " key <INS>  { [ Insert ] }; key <DELE> { [ Delete ] };\n"
+        " key <UP>   { [ Up    ] }; key <DOWN> { [ Down  ] };\n"
+        " key <LEFT> { [ Left  ] }; key <RGHT> { [ Right ] };\n"
+        " key <LWIN> { [ Super_L ] }; key <RWIN> { [ Super_R ] };\n"
+        " key <MENU> { [ Menu ] };\n"
         " modifier_map Shift   { Shift_L, Shift_R };\n"
         " modifier_map Control { Control_L, Control_R };\n"
         " modifier_map Mod1    { Alt_L, Alt_R };\n"
+        " modifier_map Mod4    { Super_L, Super_R };\n"
         " modifier_map Lock    { Caps_Lock };\n"
+        " modifier_map Mod2    { Num_Lock };\n"
         "};\n"
         "};\n";
     size_t len = sizeof(keymap);
@@ -1031,7 +1158,26 @@ static void output_bind(struct wl_client *client, void *data,
 }
 
 /* PS/2 scancode set 1 → XKB keycode (keycode = scancode + 8). */
-static uint32_t scancode_to_xkb(uint8_t sc) { return (uint32_t)sc + 8u; }
+/* Translate Brook kernel scan-code byte into an evdev keycode + 8 (= xkb
+ * keycode).  Scan-codes 0x00-0x7F are PS/2 set-1, which happens to align
+ * 1:1 with Linux evdev keycodes for the typing block.  0x80-0x89 are
+ * Brook's synthetic E0-extended codes (see input.h: SC_EXT_*); map them
+ * explicitly to evdev navigation/edit keys. */
+static uint32_t scancode_to_xkb(uint8_t sc) {
+    switch (sc) {
+    case 0x80: return 103 + 8; /* SC_EXT_UP    -> KEY_UP */
+    case 0x81: return 108 + 8; /* SC_EXT_DOWN  -> KEY_DOWN */
+    case 0x82: return 105 + 8; /* SC_EXT_LEFT  -> KEY_LEFT */
+    case 0x83: return 106 + 8; /* SC_EXT_RIGHT -> KEY_RIGHT */
+    case 0x84: return 102 + 8; /* SC_EXT_HOME  -> KEY_HOME */
+    case 0x85: return 107 + 8; /* SC_EXT_END   -> KEY_END */
+    case 0x86: return 110 + 8; /* SC_EXT_INSERT-> KEY_INSERT */
+    case 0x87: return 111 + 8; /* SC_EXT_DELETE-> KEY_DELETE */
+    case 0x88: return 104 + 8; /* SC_EXT_PGUP  -> KEY_PAGEUP */
+    case 0x89: return 109 + 8; /* SC_EXT_PGDN  -> KEY_PAGEDOWN */
+    default:   return (uint32_t)sc + 8u;
+    }
+}
 
 /* ---------------- input pump ---------------- */
 
@@ -1116,6 +1262,24 @@ static void pump_input_for_surface(struct brook_surface *s) {
             uint32_t st = (e->type == EVT_KEY_PRESS)
                             ? WL_KEYBOARD_KEY_STATE_PRESSED
                             : WL_KEYBOARD_KEY_STATE_RELEASED;
+            /* Translate kernel's modifier bitmask to xkb modifier indices.
+             * Order matches our keymap's modifier_map: Shift=0, Lock=1,
+             * Control=2, Mod1(Alt)=3.  Without this, clients (e.g. GTK
+             * via xkbcommon) never see Shift held and silently drop
+             * shifted keys. */
+            uint32_t depressed = 0;
+            uint32_t locked    = 0;
+            if (e->mods & 0x03) depressed |= (1u << 0); /* Shift */
+            if (e->mods & 0x04) depressed |= (1u << 2); /* Control */
+            if (e->mods & 0x08) depressed |= (1u << 3); /* Mod1/Alt */
+            if (e->mods & 0x10) locked    |= (1u << 1); /* Lock/Caps */
+            if (depressed != sc->kb_mods_depressed ||
+                locked    != sc->kb_mods_locked) {
+                wl_keyboard_send_modifiers(sc->keyboard, next_serial(),
+                                           depressed, 0u, locked, 0u);
+                sc->kb_mods_depressed = depressed;
+                sc->kb_mods_locked    = locked;
+            }
             wl_keyboard_send_key(sc->keyboard, next_serial(), now,
                                  scancode_to_xkb(e->scan), st);
             break;

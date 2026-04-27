@@ -1,5 +1,5 @@
 # Brook + GIMP (GTK3) — heavy tier-2 target. Will likely require subsurface.
 set wm
 set vfb none
-run --once /nix/store/fgx145an3idhczckjd26r526m0ykzafz-waylandd-brook-0.1-brook/bin/waylandd
+run --once /nix/store/qsfca4f83xgppsj6g11c1rv1vn3iq2fa-waylandd-brook-0.1-brook/bin/waylandd
 run /nix/store/lgri4bb2jq2klh9nvspyi7b09flc4l1z-gimp-3.0.8/bin/gimp
