@@ -440,6 +440,9 @@ static bool Ext2FreeInode(Ext2Mount* mnt, uint32_t ino, bool isDir)
 
 // Ensure inode has a block mapped at `fileBlock`. Allocates if needed.
 // Returns disk block number or 0 on failure.
+// Forward declaration: defined further down with the read path.
+static uint32_t Ext2ReadIndPointer(Ext2Mount* mnt, uint32_t indBlock, uint32_t idx);
+
 static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
                                 uint32_t inoNum, uint32_t fileBlock)
 {
@@ -469,13 +472,24 @@ static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
             kfree(zb);
             ino->i_block[12] = nb;
         }
-        uint32_t entry = 0;
-        uint64_t off = (static_cast<uint64_t>(ino->i_block[12]) << mnt->blockShift)
-                       + fileBlock * 4;
-        Ext2DevRead(mnt, off, &entry, 4);
+        // Use the indirect-block read cache (fed by Ext2ReadIndPointer)
+        // to avoid hitting the disk every time we extend a file in
+        // indirect-block range.
+        uint32_t entry = Ext2ReadIndPointer(mnt, ino->i_block[12], fileBlock);
         if (entry) return entry;
         uint32_t nb = Ext2AllocBlock(mnt);
         if (!nb) return 0;
+        uint64_t off = (static_cast<uint64_t>(ino->i_block[12]) << mnt->blockShift)
+                       + fileBlock * 4;
+        // Invalidate cache before mutating the indirect block on disk.
+        if (mnt->indCacheBlockNum == ino->i_block[12]) {
+            uint64_t lf = SpinLockAcquire(&mnt->indCacheLock);
+            if (mnt->indCacheBlockNum == ino->i_block[12]) {
+                if (mnt->indCacheData)
+                    *reinterpret_cast<uint32_t*>(mnt->indCacheData + fileBlock * 4) = nb;
+            }
+            SpinLockRelease(&mnt->indCacheLock, lf);
+        }
         Ext2DevWrite(mnt, off, &nb, 4);
         return nb;
     }
