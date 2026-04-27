@@ -451,7 +451,7 @@ static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
         uint32_t nb = Ext2AllocBlock(mnt);
         if (!nb) return 0;
         ino->i_block[fileBlock] = nb;
-        Ext2WriteInode(mnt, inoNum, ino);
+        // Caller must write the inode back when its overall update is done.
         return nb;
     }
     fileBlock -= 12;
@@ -468,7 +468,6 @@ static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
             Ext2WriteBlock(mnt, nb, zb);
             kfree(zb);
             ino->i_block[12] = nb;
-            Ext2WriteInode(mnt, inoNum, ino);
         }
         uint32_t entry = 0;
         uint64_t off = (static_cast<uint64_t>(ino->i_block[12]) << mnt->blockShift)
@@ -493,7 +492,6 @@ static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
             Ext2WriteBlock(mnt, nb, zb);
             kfree(zb);
             ino->i_block[13] = nb;
-            Ext2WriteInode(mnt, inoNum, ino);
         }
         uint32_t idx1 = fileBlock / ptrsPerBlock;
         uint32_t idx2 = fileBlock % ptrsPerBlock;
@@ -561,14 +559,17 @@ static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
 
     kfree(blockBuf);
 
-    // Update inode size if we extended the file
+    // Update inode size if we extended the file, and unconditionally
+    // write the inode back so any newly-allocated i_block[] entries
+    // assigned by Ext2EnsureBlock are persisted (it no longer flushes
+    // the inode itself per allocation).
     uint64_t newEnd = offset + bytesWritten;
     if (newEnd > ino->i_size) {
         ino->i_size = static_cast<uint32_t>(newEnd);
         ino->i_blocks = static_cast<uint32_t>(
             ((newEnd + mnt->blockSize - 1) >> mnt->blockShift) * (mnt->blockSize / 512));
-        Ext2WriteInode(mnt, inoNum, ino);
     }
+    Ext2WriteInode(mnt, inoNum, ino);
 
     return static_cast<int>(bytesWritten);
 }

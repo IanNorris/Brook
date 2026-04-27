@@ -370,6 +370,15 @@ static const struct wl_surface_interface surface_impl = {
 static void surface_destroy_userdata(struct wl_resource *r) {
     struct brook_surface *s = wl_resource_get_user_data(r);
     if (!s) return;
+    /* Scrub references to this surface from all seat clients before we free
+     * it.  Without this, a subsequent input event would dereference freed
+     * memory and (more visibly) call wl_pointer.send_leave with a surface
+     * resource owned by another client, which libwayland aborts as a
+     * compositor bug. */
+    for (struct brook_seat_client *sc = g_seat_clients; sc; sc = sc->next) {
+        if (sc->entered_surface == s) sc->entered_surface = NULL;
+        if (sc->kb_focus == s)        sc->kb_focus = NULL;
+    }
     /* unlink */
     struct brook_surface **pp = &g_surfaces;
     while (*pp) {
