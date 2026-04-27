@@ -161,6 +161,16 @@ struct Ext2Mount {
     SpinLock indCacheLock;
     uint32_t indCacheBlockNum;    // 0 = empty
     uint8_t* indCacheData;        // blockSize bytes; lazy-alloced
+
+    // --- Bitmap allocation hints ---
+    // Without these, Ext2AllocBlock/Ext2AllocInode rescan each bitmap from
+    // bit 0 every call.  Writing a 1MB file (256 blocks) on a partially
+    // filled FS becomes O(N * blocksUsedSoFar).  Hints track "first bit
+    // we haven't seen used yet" per group, are reset to <= freed_bit on
+    // Ext2FreeBlock/FreeInode, and clamped on every miss so they remain
+    // valid even if disk state lies.
+    uint32_t* nextFreeBlockHint;  // [groupCount], lazy-init to 0
+    uint32_t* nextFreeInodeHint;  // [groupCount], lazy-init to 0
 };
 
 static constexpr uint32_t EXT2_OPS_PER_AUTO_SYNC = 64;
@@ -357,16 +367,33 @@ static uint32_t Ext2AllocBlock(Ext2Mount* mnt)
         if (g == mnt->groupCount - 1)
             blocksInGroup = mnt->totalBlocks - g * mnt->blocksPerGroup;
 
-        for (uint32_t bit = 0; bit < blocksInGroup; ++bit) {
-            if (!(bitmap[bit / 8] & (1 << (bit % 8)))) {
-                bitmap[bit / 8] |= (1 << (bit % 8));
-                mnt->blockBitmapDirty[g] = true;
-                mnt->bgdt[g].bg_free_blocks_count--;
-                mnt->bgdtDirty = true;
-                Ext2BumpMetaOps(mnt);
-                return g * mnt->blocksPerGroup + bit + mnt->firstDataBlock;
+        uint32_t start = mnt->nextFreeBlockHint ? mnt->nextFreeBlockHint[g] : 0;
+        if (start >= blocksInGroup) start = 0;
+        for (uint32_t pass = 0; pass < 2; ++pass) {
+            uint32_t end = (pass == 0) ? blocksInGroup : start;
+            uint32_t bit = (pass == 0) ? start : 0;
+            // Word-at-a-time scan: skip 8 bits at once when fully-set.
+            while (bit < end) {
+                uint32_t byteIdx = bit / 8;
+                uint8_t  byte    = bitmap[byteIdx];
+                if (byte == 0xFF) { bit = (byteIdx + 1) * 8; continue; }
+                uint32_t bitInByte = bit & 7;
+                if (!(byte & (1u << bitInByte))) {
+                    bitmap[byteIdx] = byte | (uint8_t)(1u << bitInByte);
+                    mnt->blockBitmapDirty[g] = true;
+                    mnt->bgdt[g].bg_free_blocks_count--;
+                    mnt->bgdtDirty = true;
+                    Ext2BumpMetaOps(mnt);
+                    if (mnt->nextFreeBlockHint) mnt->nextFreeBlockHint[g] = bit + 1;
+                    return g * mnt->blocksPerGroup + bit + mnt->firstDataBlock;
+                }
+                ++bit;
             }
+            if (start == 0) break; // pass-0 covered everything
         }
+        // Group claims free blocks but bitmap shows none — clear hint
+        // and trust the next group.
+        if (mnt->nextFreeBlockHint) mnt->nextFreeBlockHint[g] = blocksInGroup;
     }
     return 0;
 }
@@ -387,6 +414,8 @@ static bool Ext2FreeBlock(Ext2Mount* mnt, uint32_t blockNum)
     mnt->bgdt[g].bg_free_blocks_count++;
     mnt->bgdtDirty = true;
     Ext2BumpMetaOps(mnt);
+    if (mnt->nextFreeBlockHint && bit < mnt->nextFreeBlockHint[g])
+        mnt->nextFreeBlockHint[g] = bit;
     return true;
 }
 
@@ -400,17 +429,31 @@ static uint32_t Ext2AllocInode(Ext2Mount* mnt, bool isDir)
         uint8_t* bitmap = Ext2GetInodeBitmap(mnt, g);
         if (!bitmap) continue;
 
-        for (uint32_t bit = 0; bit < mnt->inodesPerGroup; ++bit) {
-            if (!(bitmap[bit / 8] & (1 << (bit % 8)))) {
-                bitmap[bit / 8] |= (1 << (bit % 8));
-                mnt->inodeBitmapDirty[g] = true;
-                mnt->bgdt[g].bg_free_inodes_count--;
-                if (isDir) mnt->bgdt[g].bg_used_dirs_count++;
-                mnt->bgdtDirty = true;
-                Ext2BumpMetaOps(mnt);
-                return g * mnt->inodesPerGroup + bit + 1;
+        uint32_t start = mnt->nextFreeInodeHint ? mnt->nextFreeInodeHint[g] : 0;
+        if (start >= mnt->inodesPerGroup) start = 0;
+        for (uint32_t pass = 0; pass < 2; ++pass) {
+            uint32_t end = (pass == 0) ? mnt->inodesPerGroup : start;
+            uint32_t bit = (pass == 0) ? start : 0;
+            while (bit < end) {
+                uint32_t byteIdx = bit / 8;
+                uint8_t  byte    = bitmap[byteIdx];
+                if (byte == 0xFF) { bit = (byteIdx + 1) * 8; continue; }
+                uint32_t bitInByte = bit & 7;
+                if (!(byte & (1u << bitInByte))) {
+                    bitmap[byteIdx] = byte | (uint8_t)(1u << bitInByte);
+                    mnt->inodeBitmapDirty[g] = true;
+                    mnt->bgdt[g].bg_free_inodes_count--;
+                    if (isDir) mnt->bgdt[g].bg_used_dirs_count++;
+                    mnt->bgdtDirty = true;
+                    Ext2BumpMetaOps(mnt);
+                    if (mnt->nextFreeInodeHint) mnt->nextFreeInodeHint[g] = bit + 1;
+                    return g * mnt->inodesPerGroup + bit + 1;
+                }
+                ++bit;
             }
+            if (start == 0) break;
         }
+        if (mnt->nextFreeInodeHint) mnt->nextFreeInodeHint[g] = mnt->inodesPerGroup;
     }
     return 0;
 }
@@ -431,6 +474,8 @@ static bool Ext2FreeInode(Ext2Mount* mnt, uint32_t ino, bool isDir)
     if (isDir) mnt->bgdt[g].bg_used_dirs_count--;
     mnt->bgdtDirty = true;
     Ext2BumpMetaOps(mnt);
+    if (mnt->nextFreeInodeHint && bit < mnt->nextFreeInodeHint[g])
+        mnt->nextFreeInodeHint[g] = bit;
     return true;
 }
 
@@ -1410,12 +1455,17 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
     mnt->blockBitmapDirty  = static_cast<bool*>(kmalloc(groupCount * sizeof(bool)));
     mnt->inodeBitmapCache  = static_cast<uint8_t**>(kmalloc(groupCount * sizeof(uint8_t*)));
     mnt->inodeBitmapDirty  = static_cast<bool*>(kmalloc(groupCount * sizeof(bool)));
+    mnt->nextFreeBlockHint = static_cast<uint32_t*>(kmalloc(groupCount * sizeof(uint32_t)));
+    mnt->nextFreeInodeHint = static_cast<uint32_t*>(kmalloc(groupCount * sizeof(uint32_t)));
     if (!mnt->blockBitmapCache || !mnt->blockBitmapDirty ||
-        !mnt->inodeBitmapCache || !mnt->inodeBitmapDirty) {
+        !mnt->inodeBitmapCache || !mnt->inodeBitmapDirty ||
+        !mnt->nextFreeBlockHint || !mnt->nextFreeInodeHint) {
         if (mnt->blockBitmapCache) kfree(mnt->blockBitmapCache);
         if (mnt->blockBitmapDirty) kfree(mnt->blockBitmapDirty);
         if (mnt->inodeBitmapCache) kfree(mnt->inodeBitmapCache);
         if (mnt->inodeBitmapDirty) kfree(mnt->inodeBitmapDirty);
+        if (mnt->nextFreeBlockHint) kfree(mnt->nextFreeBlockHint);
+        if (mnt->nextFreeInodeHint) kfree(mnt->nextFreeInodeHint);
         kfree(bgdt); kfree(mnt);
         return false;
     }
@@ -1424,6 +1474,8 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
         mnt->blockBitmapDirty[i] = false;
         mnt->inodeBitmapCache[i] = nullptr;
         mnt->inodeBitmapDirty[i] = false;
+        mnt->nextFreeBlockHint[i] = 0;
+        mnt->nextFreeInodeHint[i] = 0;
     }
 
     *mountPriv = mnt;
@@ -1449,6 +1501,8 @@ static void Ext2FsUnmount(void* mountPriv)
     }
     if (mnt->blockBitmapDirty) kfree(mnt->blockBitmapDirty);
     if (mnt->inodeBitmapDirty) kfree(mnt->inodeBitmapDirty);
+    if (mnt->nextFreeBlockHint) kfree(mnt->nextFreeBlockHint);
+    if (mnt->nextFreeInodeHint) kfree(mnt->nextFreeInodeHint);
     if (mnt->bgdt) kfree(mnt->bgdt);
     kfree(mnt);
 }
