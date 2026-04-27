@@ -24,6 +24,16 @@ SECTIONS
         *(.data .data.*)
     }
 
+    /* Syscall dispatch table — its own page so we can mark it
+       read-only after SyscallTableInit. Bounded by start/stop
+       symbols so the runtime knows the exact page range. */
+    .syscall_table : ALIGN(4096) {
+        __syscall_table_start = .;
+        *(.syscall_table)
+        . = ALIGN(4096);
+        __syscall_table_end = .;
+    }
+
     .bss : ALIGN(4096) {
         __bss_start = .;
         *(.bss .bss.*)

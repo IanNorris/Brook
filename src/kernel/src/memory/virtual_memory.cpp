@@ -623,6 +623,36 @@ PageTable VmmKernelCR3()
     return PageTable(g_kernelCR3);
 }
 
+bool VmmKernelMarkReadOnly(VirtualAddress virtAddr, uint64_t size)
+{
+    uint64_t va = virtAddr.raw();
+    if ((va & (PAGE_SIZE - 1)) || (size & (PAGE_SIZE - 1)) || size == 0)
+    {
+        SerialPrintf("VMM: VmmKernelMarkReadOnly: unaligned va=0x%lx size=0x%lx\n",
+                     va, size);
+        return false;
+    }
+
+    uint64_t lf = SpinLockAcquire(&g_kernelPtLock);
+    bool ok = true;
+    for (uint64_t off = 0; off < size; off += PAGE_SIZE)
+    {
+        VirtualAddress page(va + off);
+        uint64_t* pte = WalkToPtr(KernelPageTable, page, /*create=*/false);
+        if (!pte || !(*pte & VMM_PRESENT))
+        {
+            SerialPrintf("VMM: VmmKernelMarkReadOnly: page 0x%lx not present\n",
+                         page.raw());
+            ok = false;
+            continue;
+        }
+        *pte &= ~VMM_WRITABLE;
+        Invlpg(page);
+    }
+    SpinLockRelease(&g_kernelPtLock, lf);
+    return ok;
+}
+
 void VmmSwitchPageTable(PageTable pt)
 {
     __asm__ volatile("mov %0, %%cr3" : : "r"(pt.pml4.raw()) : "memory");

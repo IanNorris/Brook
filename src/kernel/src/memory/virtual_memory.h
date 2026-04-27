@@ -144,6 +144,14 @@ void VmmDestroyUserPageTable(PageTable pt);
 // Get the kernel's page table.
 PageTable VmmKernelCR3();
 
+// Mark a contiguous range of kernel virtual addresses (mapped via 4KB
+// pages by the bootloader / VMM) as read-only by clearing VMM_WRITABLE
+// in each PTE and invalidating the TLB. virtAddr/size must be page-
+// aligned. Returns false if any page in the range is not present or
+// is mapped via a 2MB hugepage (caller should split first). Intended
+// for hardening static dispatch tables after one-shot init.
+bool VmmKernelMarkReadOnly(VirtualAddress virtAddr, uint64_t size);
+
 // Switch the active page table.  Writes CR3 and flushes the TLB.
 void VmmSwitchPageTable(PageTable pt);
 

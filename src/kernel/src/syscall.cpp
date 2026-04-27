@@ -8990,7 +8990,13 @@ static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
     return ret;
 }
 
-static SyscallFn g_syscallTable[SYSCALL_MAX];
+// Lives in its own page (.syscall_table) so we can mark it read-only
+// after init. See VmmKernelMarkReadOnly + linker.ld.
+static SyscallFn g_syscallTable[SYSCALL_MAX]
+    __attribute__((section(".syscall_table"), aligned(4096)));
+
+extern "C" uint8_t __syscall_table_start[];
+extern "C" uint8_t __syscall_table_end[];
 
 void SyscallTableInit()
 {
@@ -9188,6 +9194,20 @@ void SyscallTableInit()
 
     SerialPrintf("SYSCALL: table initialised (%u entries, %u implemented)\n",
                  static_cast<unsigned>(SYSCALL_MAX), count);
+
+    // Lock the dispatch table read-only. Any subsequent write attempt
+    // (corruption, stray pointer) will #PF immediately on the offending
+    // RIP rather than silently leaving a null entry to be discovered
+    // later by an indirect call. The table fills exactly one 4KB page
+    // (512 entries × 8 bytes) and lives in its own .syscall_table
+    // section, so this is a single-page protect.
+    uint64_t lockStart = reinterpret_cast<uint64_t>(__syscall_table_start);
+    uint64_t lockEnd   = reinterpret_cast<uint64_t>(__syscall_table_end);
+    if (VmmKernelMarkReadOnly(VirtualAddress(lockStart), lockEnd - lockStart))
+        SerialPrintf("SYSCALL: dispatch table locked RO at 0x%lx (%lu bytes)\n",
+                     lockStart, lockEnd - lockStart);
+    else
+        SerialPrintf("SYSCALL: WARNING failed to lock table RO\n");
 }
 
 SyscallFn* SyscallGetTable()
