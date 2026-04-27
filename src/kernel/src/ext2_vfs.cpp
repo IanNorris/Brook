@@ -171,6 +171,22 @@ struct Ext2Mount {
     // valid even if disk state lies.
     uint32_t* nextFreeBlockHint;  // [groupCount], lazy-init to 0
     uint32_t* nextFreeInodeHint;  // [groupCount], lazy-init to 0
+
+    // --- Inode read cache ---
+    // Direct-mapped (1024 slots).  Without this, every Ext2ReadInode
+    // hits the disk for 256 bytes -- and path resolution does one
+    // ReadInode per component, so opening "/store/<hash>/lib/foo.so"
+    // is 5+ disk reads even on cache-warm code.  nix-install opens
+    // hundreds of files per invocation, almost all repeat lookups
+    // through the same /store/<hash>/... prefixes.  Slot is keyed on
+    // ino number (not hash) so collisions just mean replacement.
+    // Entry.ino==0 means empty.  Lock-free: protected by g_ext2Lock.
+    void* inodeCache;             // Ext2InodeCacheEntry[1024]; lazy-alloced
+};
+static constexpr uint32_t EXT2_INODE_CACHE_SIZE = 1024;
+struct Ext2InodeCacheEntry {
+    uint32_t ino;
+    Ext2Inode data;
 };
 
 static constexpr uint32_t EXT2_OPS_PER_AUTO_SYNC = 64;
@@ -245,6 +261,33 @@ static bool Ext2DevWrite(Ext2Mount* mnt, uint64_t byteOffset, const void* buf, u
     return r == static_cast<int>(len);
 }
 
+// --- Inode read cache helpers ---
+static inline Ext2InodeCacheEntry* Ext2InodeCacheSlot(Ext2Mount* mnt, uint32_t ino)
+{
+    if (!mnt->inodeCache) return nullptr;
+    auto* table = static_cast<Ext2InodeCacheEntry*>(mnt->inodeCache);
+    return &table[(ino - 1) & (EXT2_INODE_CACHE_SIZE - 1)];
+}
+static bool Ext2InodeCacheLookup(Ext2Mount* mnt, uint32_t ino, Ext2Inode* out)
+{
+    auto* slot = Ext2InodeCacheSlot(mnt, ino);
+    if (!slot || slot->ino != ino) return false;
+    *out = slot->data;
+    return true;
+}
+static void Ext2InodeCachePut(Ext2Mount* mnt, uint32_t ino, const Ext2Inode* data)
+{
+    auto* slot = Ext2InodeCacheSlot(mnt, ino);
+    if (!slot) return;
+    slot->ino = ino;
+    slot->data = *data;
+}
+static void Ext2InodeCacheInvalidate(Ext2Mount* mnt, uint32_t ino)
+{
+    auto* slot = Ext2InodeCacheSlot(mnt, ino);
+    if (slot && slot->ino == ino) slot->ino = 0;
+}
+
 // Write a single block from buf.
 static bool Ext2WriteBlock(Ext2Mount* mnt, uint32_t blockNum, const void* buf)
 {
@@ -271,7 +314,9 @@ static bool Ext2WriteInode(Ext2Mount* mnt, uint32_t ino, const Ext2Inode* data)
     uint64_t tableOff = static_cast<uint64_t>(mnt->bgdt[group].bg_inode_table)
                         << mnt->blockShift;
     uint64_t inodeOff = tableOff + static_cast<uint64_t>(index) * mnt->inodeSize;
-    return Ext2DevWrite(mnt, inodeOff, data, sizeof(Ext2Inode));
+    bool ok = Ext2DevWrite(mnt, inodeOff, data, sizeof(Ext2Inode));
+    if (ok) Ext2InodeCachePut(mnt, ino, data);
+    return ok;
 }
 
 // Flush the BGDT back to disk.
@@ -476,6 +521,7 @@ static bool Ext2FreeInode(Ext2Mount* mnt, uint32_t ino, bool isDir)
     Ext2BumpMetaOps(mnt);
     if (mnt->nextFreeInodeHint && bit < mnt->nextFreeInodeHint[g])
         mnt->nextFreeInodeHint[g] = bit;
+    Ext2InodeCacheInvalidate(mnt, ino);
     return true;
 }
 
@@ -865,6 +911,7 @@ static uint32_t Ext2ResolveParent(Ext2Mount* mnt, const char* relPath,
 static bool Ext2ReadInode(Ext2Mount* mnt, uint32_t ino, Ext2Inode* out)
 {
     if (ino == 0) return false;
+    if (Ext2InodeCacheLookup(mnt, ino, out)) return true;
     uint32_t group = (ino - 1) / mnt->inodesPerGroup;
     uint32_t index = (ino - 1) % mnt->inodesPerGroup;
     if (group >= mnt->groupCount) return false;
@@ -872,7 +919,9 @@ static bool Ext2ReadInode(Ext2Mount* mnt, uint32_t ino, Ext2Inode* out)
     uint64_t tableOff = static_cast<uint64_t>(mnt->bgdt[group].bg_inode_table)
                         << mnt->blockShift;
     uint64_t inodeOff = tableOff + static_cast<uint64_t>(index) * mnt->inodeSize;
-    return Ext2DevRead(mnt, inodeOff, out, sizeof(Ext2Inode));
+    if (!Ext2DevRead(mnt, inodeOff, out, sizeof(Ext2Inode))) return false;
+    Ext2InodeCachePut(mnt, ino, out);
+    return true;
 }
 
 static uint64_t Ext2InodeSize(const Ext2Inode* ino)
@@ -1478,6 +1527,12 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
         mnt->nextFreeInodeHint[i] = 0;
     }
 
+    // Inode read cache: 1024 direct-mapped slots. ~256 KB per mount.
+    mnt->inodeCache = kmalloc(EXT2_INODE_CACHE_SIZE * sizeof(Ext2InodeCacheEntry));
+    if (mnt->inodeCache) {
+        memset(mnt->inodeCache, 0, EXT2_INODE_CACHE_SIZE * sizeof(Ext2InodeCacheEntry));
+    }
+
     *mountPriv = mnt;
     DbgPrintf("ext2: mounted successfully\n");
     return true;
@@ -1503,6 +1558,7 @@ static void Ext2FsUnmount(void* mountPriv)
     if (mnt->inodeBitmapDirty) kfree(mnt->inodeBitmapDirty);
     if (mnt->nextFreeBlockHint) kfree(mnt->nextFreeBlockHint);
     if (mnt->nextFreeInodeHint) kfree(mnt->nextFreeInodeHint);
+    if (mnt->inodeCache) kfree(mnt->inodeCache);
     if (mnt->bgdt) kfree(mnt->bgdt);
     kfree(mnt);
 }
