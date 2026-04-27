@@ -12,6 +12,7 @@
 #include "serial.h"
 #include "string.h"
 #include "sync/kmutex.h"
+#include "spinlock.h"
 
 namespace brook {
 
@@ -148,6 +149,18 @@ struct Ext2Mount {
     uint8_t** inodeBitmapCache;   // [groupCount]
     bool*     inodeBitmapDirty;   // [groupCount]
     uint32_t  pendingMetaOps;     // ops since last auto-sync
+
+    // --- Indirect-block read cache ---
+    // BlockMap() is called once per file-block during sequential reads,
+    // and for every fileBlock past the first 12 it has to read a
+    // singly-indirect block from disk to find the disk-block number.
+    // Without caching, a 1MB sequential read does ~256 4-byte virtio
+    // reads of the same indirect block.  One slot is enough because
+    // sequential reads stream through 1024 file-blocks (4MB) of one
+    // indirect block before crossing.
+    SpinLock indCacheLock;
+    uint32_t indCacheBlockNum;    // 0 = empty
+    uint8_t* indCacheData;        // blockSize bytes; lazy-alloced
 };
 
 static constexpr uint32_t EXT2_OPS_PER_AUTO_SYNC = 64;
@@ -228,6 +241,12 @@ static bool Ext2WriteBlock(Ext2Mount* mnt, uint32_t blockNum, const void* buf)
     if (blockNum == 0) return false;
     // SerialPrintf("ext2: WriteBlock %u\n", blockNum);
     uint64_t off = static_cast<uint64_t>(blockNum) << mnt->blockShift;
+    // Invalidate the indirect-block read cache if we're overwriting it.
+    if (mnt->indCacheBlockNum == blockNum) {
+        uint64_t lf = SpinLockAcquire(&mnt->indCacheLock);
+        if (mnt->indCacheBlockNum == blockNum) mnt->indCacheBlockNum = 0;
+        SpinLockRelease(&mnt->indCacheLock, lf);
+    }
     return Ext2DevWrite(mnt, off, buf, mnt->blockSize);
 }
 
@@ -801,6 +820,41 @@ static uint64_t Ext2InodeSize(const Ext2Inode* ino)
     return ino->i_size; // For files >4GB we'd use i_dir_acl, but read-only ext2 is fine with 32-bit
 }
 
+// Read a 4-byte block-pointer from an indirect block, using a per-mount
+// one-slot cache to avoid re-reading the same indirect block during
+// sequential file scans (BlockMap is called per file-block).
+static uint32_t Ext2ReadIndPointer(Ext2Mount* mnt, uint32_t indBlock, uint32_t idx)
+{
+    if (!indBlock) return 0;
+    uint32_t entry = 0;
+    uint64_t lf = SpinLockAcquire(&mnt->indCacheLock);
+    if (mnt->indCacheBlockNum == indBlock && mnt->indCacheData) {
+        entry = *reinterpret_cast<uint32_t*>(mnt->indCacheData + idx * 4);
+        SpinLockRelease(&mnt->indCacheLock, lf);
+        return entry;
+    }
+    if (!mnt->indCacheData) {
+        mnt->indCacheData = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+        if (!mnt->indCacheData) {
+            SpinLockRelease(&mnt->indCacheLock, lf);
+            // Fall back to direct read.
+            uint64_t off = (static_cast<uint64_t>(indBlock) << mnt->blockShift) + idx * 4;
+            if (!Ext2DevRead(mnt, off, &entry, 4)) return 0;
+            return entry;
+        }
+    }
+    uint64_t blockOff = static_cast<uint64_t>(indBlock) << mnt->blockShift;
+    if (!Ext2DevRead(mnt, blockOff, mnt->indCacheData, mnt->blockSize)) {
+        mnt->indCacheBlockNum = 0; // mark cache empty on failure
+        SpinLockRelease(&mnt->indCacheLock, lf);
+        return 0;
+    }
+    mnt->indCacheBlockNum = indBlock;
+    entry = *reinterpret_cast<uint32_t*>(mnt->indCacheData + idx * 4);
+    SpinLockRelease(&mnt->indCacheLock, lf);
+    return entry;
+}
+
 // Resolve a file-relative block index to a disk block number.
 // Handles direct, indirect, doubly-indirect, and triply-indirect blocks.
 static uint32_t Ext2BlockMap(Ext2Mount* mnt, const Ext2Inode* ino, uint32_t fileBlock)
@@ -815,13 +869,7 @@ static uint32_t Ext2BlockMap(Ext2Mount* mnt, const Ext2Inode* ino, uint32_t file
 
     // Singly indirect (block 12)
     if (fileBlock < ptrsPerBlock) {
-        uint32_t indBlock = ino->i_block[12];
-        if (!indBlock) return 0;
-        uint32_t entry = 0;
-        uint64_t off = (static_cast<uint64_t>(indBlock) << mnt->blockShift)
-                       + fileBlock * 4;
-        if (!Ext2DevRead(mnt, off, &entry, 4)) return 0;
-        return entry;
+        return Ext2ReadIndPointer(mnt, ino->i_block[12], fileBlock);
     }
     fileBlock -= ptrsPerBlock;
 
@@ -1340,6 +1388,9 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
     // Metadata cache arrays — lazy-populated on first use.
     mnt->bgdtDirty         = false;
     mnt->pendingMetaOps    = 0;
+    mnt->indCacheLock      = SpinLock{};
+    mnt->indCacheBlockNum  = 0;
+    mnt->indCacheData      = nullptr;
     mnt->blockBitmapCache  = static_cast<uint8_t**>(kmalloc(groupCount * sizeof(uint8_t*)));
     mnt->blockBitmapDirty  = static_cast<bool*>(kmalloc(groupCount * sizeof(bool)));
     mnt->inodeBitmapCache  = static_cast<uint8_t**>(kmalloc(groupCount * sizeof(uint8_t*)));
