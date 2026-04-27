@@ -182,11 +182,27 @@ struct Ext2Mount {
     // ino number (not hash) so collisions just mean replacement.
     // Entry.ino==0 means empty.  Lock-free: protected by g_ext2Lock.
     void* inodeCache;             // Ext2InodeCacheEntry[1024]; lazy-alloced
+
+    // --- Directory entry name cache ---
+    // Path resolution does Ext2DirLookup once per component, which
+    // reads the dir's data block(s) and linear-scans entries.  /store
+    // can have thousands of entries, so this dominates lookup cost.
+    // Direct-mapped 1024-slot cache of (parentIno, name) -> childIno.
+    // Names longer than EXT2_DIRENT_CACHE_NAMELEN are not cached.
+    void* direntCache;            // Ext2DirentCacheEntry[1024]; lazy-alloced
 };
 static constexpr uint32_t EXT2_INODE_CACHE_SIZE = 1024;
+static constexpr uint32_t EXT2_DIRENT_CACHE_SIZE = 1024;
+static constexpr uint32_t EXT2_DIRENT_CACHE_NAMELEN = 95;
 struct Ext2InodeCacheEntry {
     uint32_t ino;
     Ext2Inode data;
+};
+struct Ext2DirentCacheEntry {
+    uint32_t parentIno;   // 0 = empty
+    uint32_t childIno;
+    uint8_t  nameLen;
+    char     name[EXT2_DIRENT_CACHE_NAMELEN];
 };
 
 static constexpr uint32_t EXT2_OPS_PER_AUTO_SYNC = 64;
@@ -250,7 +266,7 @@ static uint64_t Ext2InodeSize(const Ext2Inode* ino);
 static uint32_t Ext2BlockMap(Ext2Mount* mnt, const Ext2Inode* ino, uint32_t fileBlock);
 static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
                              void* buf, uint64_t len, uint64_t offset);
-static uint32_t Ext2DirLookup(Ext2Mount* mnt, const Ext2Inode* dirIno, const char* name);
+static uint32_t Ext2DirLookup(Ext2Mount* mnt, uint32_t parentIno, const Ext2Inode* dirIno, const char* name);
 static uint32_t Ext2ResolvePath(Ext2Mount* mnt, uint32_t startIno,
                                 const char* path, int symlinkDepth);
 
@@ -286,6 +302,46 @@ static void Ext2InodeCacheInvalidate(Ext2Mount* mnt, uint32_t ino)
 {
     auto* slot = Ext2InodeCacheSlot(mnt, ino);
     if (slot && slot->ino == ino) slot->ino = 0;
+}
+
+// --- Dirent cache helpers ---
+static inline uint32_t Ext2DirentCacheHash(uint32_t parentIno, const char* name, uint32_t len)
+{
+    uint32_t h = parentIno * 2654435761u;
+    for (uint32_t i = 0; i < len; ++i) h = h * 31u + static_cast<uint8_t>(name[i]);
+    return h & (EXT2_DIRENT_CACHE_SIZE - 1);
+}
+static bool Ext2DirentCacheLookup(Ext2Mount* mnt, uint32_t parentIno,
+                                  const char* name, uint32_t nameLen,
+                                  uint32_t* outChild)
+{
+    if (!mnt->direntCache || nameLen == 0 || nameLen > EXT2_DIRENT_CACHE_NAMELEN) return false;
+    auto* table = static_cast<Ext2DirentCacheEntry*>(mnt->direntCache);
+    auto& slot = table[Ext2DirentCacheHash(parentIno, name, nameLen)];
+    if (slot.parentIno != parentIno || slot.nameLen != nameLen) return false;
+    for (uint32_t i = 0; i < nameLen; ++i)
+        if (slot.name[i] != name[i]) return false;
+    *outChild = slot.childIno;
+    return true;
+}
+static void Ext2DirentCachePut(Ext2Mount* mnt, uint32_t parentIno,
+                               const char* name, uint32_t nameLen, uint32_t childIno)
+{
+    if (!mnt->direntCache || nameLen == 0 || nameLen > EXT2_DIRENT_CACHE_NAMELEN) return;
+    auto* table = static_cast<Ext2DirentCacheEntry*>(mnt->direntCache);
+    auto& slot = table[Ext2DirentCacheHash(parentIno, name, nameLen)];
+    slot.parentIno = parentIno;
+    slot.childIno  = childIno;
+    slot.nameLen   = static_cast<uint8_t>(nameLen);
+    for (uint32_t i = 0; i < nameLen; ++i) slot.name[i] = name[i];
+}
+// Invalidate every cache entry referencing parentIno.  Called after add/remove.
+static void Ext2DirentCacheInvalidateParent(Ext2Mount* mnt, uint32_t parentIno)
+{
+    if (!mnt->direntCache) return;
+    auto* table = static_cast<Ext2DirentCacheEntry*>(mnt->direntCache);
+    for (uint32_t i = 0; i < EXT2_DIRENT_CACHE_SIZE; ++i)
+        if (table[i].parentIno == parentIno) table[i].parentIno = 0;
 }
 
 // Write a single block from buf.
@@ -784,6 +840,7 @@ static bool Ext2DirAdd(Ext2Mount* mnt, uint32_t dirIno, Ext2Inode* dirData,
 
                 Ext2WriteBlock(mnt, diskBlock, blockBuf);
                 kfree(blockBuf);
+                Ext2DirentCacheInvalidateParent(mnt, dirIno);
                 return true;
             }
 
@@ -814,6 +871,7 @@ static bool Ext2DirAdd(Ext2Mount* mnt, uint32_t dirIno, Ext2Inode* dirData,
     dirData->i_blocks = static_cast<uint32_t>(
         ((dirData->i_size + mnt->blockSize - 1) >> mnt->blockShift) * (mnt->blockSize / 512));
     Ext2WriteInode(mnt, dirIno, dirData);
+    Ext2DirentCacheInvalidateParent(mnt, dirIno);
     return true;
 }
 
@@ -855,6 +913,7 @@ static uint32_t Ext2DirRemove(Ext2Mount* mnt, Ext2Inode* dirData,
                     }
                     Ext2WriteBlock(mnt, diskBlock, blockBuf);
                     kfree(blockBuf);
+                    Ext2DirentCacheInvalidateParent(mnt, dirIno);
                     return removedIno;
                 }
             }
@@ -1129,13 +1188,17 @@ static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
 // ---------------------------------------------------------------------------
 
 // Look up a name in a directory inode. Returns the inode number or 0 on failure.
-static uint32_t Ext2DirLookup(Ext2Mount* mnt, const Ext2Inode* dirIno, const char* name)
+static uint32_t Ext2DirLookup(Ext2Mount* mnt, uint32_t parentIno, const Ext2Inode* dirIno, const char* name)
 {
     uint64_t dirSize = Ext2InodeSize(dirIno);
     if (dirSize == 0) return 0;
 
     uint32_t nameLen = 0;
     for (const char* p = name; *p; ++p) ++nameLen;
+
+    uint32_t cached = 0;
+    if (parentIno && Ext2DirentCacheLookup(mnt, parentIno, name, nameLen, &cached))
+        return cached;
 
     auto* buf = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
     if (!buf) return 0;
@@ -1158,6 +1221,7 @@ static uint32_t Ext2DirLookup(Ext2Mount* mnt, const Ext2Inode* dirIno, const cha
                 if (match) {
                     uint32_t result = de->inode;
                     kfree(buf);
+                    if (parentIno) Ext2DirentCachePut(mnt, parentIno, name, nameLen, result);
                     return result;
                 }
             }
@@ -1229,7 +1293,7 @@ static uint32_t Ext2ResolvePathInternal(Ext2Mount* mnt, uint32_t startIno,
         return 0;
     }
 
-    uint32_t childIno = Ext2DirLookup(mnt, &dirIno, component);
+    uint32_t childIno = Ext2DirLookup(mnt, curIno, &dirIno, component);
     if (!childIno) {
         // SerialPrintf("ext2: DirLookup '%s' in ino %u → MISS\n", component, curIno);
         return 0;
@@ -1533,6 +1597,12 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
         memset(mnt->inodeCache, 0, EXT2_INODE_CACHE_SIZE * sizeof(Ext2InodeCacheEntry));
     }
 
+    // Dirent name cache: 1024 direct-mapped slots. ~108 KB per mount.
+    mnt->direntCache = kmalloc(EXT2_DIRENT_CACHE_SIZE * sizeof(Ext2DirentCacheEntry));
+    if (mnt->direntCache) {
+        memset(mnt->direntCache, 0, EXT2_DIRENT_CACHE_SIZE * sizeof(Ext2DirentCacheEntry));
+    }
+
     *mountPriv = mnt;
     DbgPrintf("ext2: mounted successfully\n");
     return true;
@@ -1559,6 +1629,7 @@ static void Ext2FsUnmount(void* mountPriv)
     if (mnt->nextFreeBlockHint) kfree(mnt->nextFreeBlockHint);
     if (mnt->nextFreeInodeHint) kfree(mnt->nextFreeInodeHint);
     if (mnt->inodeCache) kfree(mnt->inodeCache);
+    if (mnt->direntCache) kfree(mnt->direntCache);
     if (mnt->bgdt) kfree(mnt->bgdt);
     kfree(mnt);
 }
@@ -1758,7 +1829,7 @@ static int Ext2FsLstatPath(void* mountPriv, uint8_t pdrv,
     Ext2Inode parentData;
     if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KMutexUnlock(&g_ext2Lock); return -1; }
 
-    uint32_t ino = Ext2DirLookup(mnt, &parentData, name);
+    uint32_t ino = Ext2DirLookup(mnt, parentIno, &parentData, name);
     if (!ino) { KMutexUnlock(&g_ext2Lock); return -1; }
 
     Ext2Inode inodeData;
@@ -1829,7 +1900,7 @@ static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath)
     if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KMutexUnlock(&g_ext2Lock); return -1; }
 
     // Check if already exists
-    if (Ext2DirLookup(mnt, &parentData, name)) {
+    if (Ext2DirLookup(mnt, parentIno, &parentData, name)) {
         KMutexUnlock(&g_ext2Lock);
         return 0; // Already exists, not an error (like FAT driver)
     }
@@ -1923,7 +1994,7 @@ static int Ext2FsRename(void* mountPriv, uint8_t pdrv,
     if (!Ext2ReadInode(mnt, oldParentIno, &oldParentData)) { KMutexUnlock(&g_ext2Lock); return -1; }
 
     // Look up the inode being moved
-    uint32_t targetIno = Ext2DirLookup(mnt, &oldParentData, oldName);
+    uint32_t targetIno = Ext2DirLookup(mnt, oldParentIno, &oldParentData, oldName);
     if (!targetIno) { KMutexUnlock(&g_ext2Lock); return -1; }
 
     Ext2Inode targetData;
@@ -2013,7 +2084,7 @@ static int Ext2FsSymlink(void* mountPriv, uint8_t pdrv,
     }
 
     // Check if already exists
-    if (Ext2DirLookup(mnt, &parentData, name)) {
+    if (Ext2DirLookup(mnt, parentIno, &parentData, name)) {
         KMutexUnlock(&g_ext2Lock);
         return -17; // -EEXIST
     }
@@ -2104,7 +2175,7 @@ static int Ext2FsReadlink(void* mountPriv, uint8_t pdrv,
     Ext2Inode parentData;
     if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KMutexUnlock(&g_ext2Lock); return -1; }
 
-    uint32_t ino = Ext2DirLookup(mnt, &parentData, name);
+    uint32_t ino = Ext2DirLookup(mnt, parentIno, &parentData, name);
     if (!ino) { KMutexUnlock(&g_ext2Lock); return -22; } // -EINVAL
 
     Ext2Inode inodeData;
