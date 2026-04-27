@@ -101,6 +101,8 @@ static const char* g_defaultEnvp[] = {
     // GTK / dbus / portal — keep GTK from hanging on session-bus probe.
     "GTK_USE_PORTAL=0",
     "GDK_BACKEND=wayland",
+    "GDK_SCALE=1",
+    "GDK_DPI_SCALE=1",
     "GSETTINGS_BACKEND=memory",
     "GIO_USE_VFS=local",
     "NO_AT_BRIDGE=1",
