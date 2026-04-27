@@ -7816,6 +7816,15 @@ static int64_t sys_not_implemented(uint64_t, uint64_t, uint64_t,
     return -ENOSYS;
 }
 
+// Silent ENOSYS: for syscalls we deliberately don't implement but where
+// the userland-side fallback is well-trodden (e.g. inotify -> polling).
+// Avoids noisy UNIMPL spam during normal operation.
+static int64_t sys_enosys_quiet(uint64_t, uint64_t, uint64_t,
+                                 uint64_t, uint64_t, uint64_t)
+{
+    return -ENOSYS;
+}
+
 // ---------------------------------------------------------------------------
 // sys_getresuid (118) / sys_getresgid (120)
 // ---------------------------------------------------------------------------
@@ -9031,6 +9040,13 @@ void SyscallTableInit()
     g_syscallTable[SYS_SETGID]          = sys_setgid;
     g_syscallTable[SYS_CAPGET]          = sys_capget;
     g_syscallTable[SYS_CAPSET]          = sys_capset;
+    // inotify: deliberately unimplemented. Glibc/GLib fall back to
+    // polling/manual checks when inotify_init fails. Returning ENOSYS
+    // quietly avoids UNIMPL serial spam from GIMP / file pickers.
+    g_syscallTable[253]                  = sys_enosys_quiet; // inotify_init
+    g_syscallTable[254]                  = sys_enosys_quiet; // inotify_add_watch
+    g_syscallTable[255]                  = sys_enosys_quiet; // inotify_rm_watch
+    g_syscallTable[294]                  = sys_enosys_quiet; // inotify_init1
     g_syscallTable[SYS_GETEUID]         = sys_geteuid;
     g_syscallTable[SYS_GETEGID]         = sys_getegid;
     g_syscallTable[SYS_GETPPID]         = sys_getppid;
