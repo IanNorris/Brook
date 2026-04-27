@@ -9260,7 +9260,15 @@ static int64_t SyscallDispatchTraced(uint64_t num, uint64_t a0, uint64_t a1,
     static uint32_t s_suppressed = 0;
     static constexpr uint32_t SUPPRESS_THRESHOLD = 3;
 
-    int64_t ret = g_syscallTable[num](a0, a1, a2, a3, a4, a5);
+    SyscallFn fn = (num < SYSCALL_MAX) ? g_syscallTable[num] : nullptr;
+    if (!fn) {
+        SerialPrintf("[syscall] FATAL-AVOIDED: pid=%u (%s) num=%lu has null/oob entry "
+                     "(a0=%lx a1=%lx a2=%lx a3=%lx a4=%lx a5=%lx) -> -ENOSYS\n",
+                     proc ? proc->pid : 0, proc ? proc->name : "?",
+                     num, a0, a1, a2, a3, a4, a5);
+        return -38; // -ENOSYS
+    }
+    int64_t ret = fn(a0, a1, a2, a3, a4, a5);
 
     bool isError = (ret < 0 && ret > -4096);
     bool isRepeat = (num == s_lastNum && a0 == s_lastA0 && ret == s_lastRet && isError);
@@ -9337,7 +9345,15 @@ int64_t SyscallDispatchInternal(uint64_t num, uint64_t a0, uint64_t a1,
     Process* proc = ProcessCurrent();
     if (proc && proc->straceEnabled)
         return SyscallDispatchTraced(num, a0, a1, a2, a3, a4, a5);
-    return g_syscallTable[num](a0, a1, a2, a3, a4, a5);
+    SyscallFn fn = (num < SYSCALL_MAX) ? g_syscallTable[num] : nullptr;
+    if (!fn) {
+        SerialPrintf("[syscall] FATAL-AVOIDED: pid=%u (%s) num=%lu has null/oob entry "
+                     "(a0=%lx a1=%lx a2=%lx a3=%lx a4=%lx a5=%lx) -> -ENOSYS\n",
+                     proc ? proc->pid : 0, proc ? proc->name : "?",
+                     num, a0, a1, a2, a3, a4, a5);
+        return -38; // -ENOSYS
+    }
+    return fn(a0, a1, a2, a3, a4, a5);
 }
 
 // ---------------------------------------------------------------------------
