@@ -17,12 +17,14 @@
 # can find a sans-serif face.
 
 let
-  fontsConf = writeText "fonts.conf" ''
+  fontsConf = ''
     <?xml version="1.0"?>
     <!DOCTYPE fontconfig SYSTEM "fonts.dtd">
     <fontconfig>
-      <dir prefix="default">../../share/fonts/dejavu</dir>
-      <cachedir prefix="default">../../var/cache/fontconfig</cachedir>
+      <!-- Absolute paths so fontconfig finds the fonts regardless of how
+           it computes prefixes; @OUT@ is substituted at install time. -->
+      <dir>@OUT@/share/fonts/dejavu</dir>
+      <cachedir>@OUT@/var/cache/fontconfig</cachedir>
       <cachedir>/tmp/fontconfig</cachedir>
 
       <alias><family>sans-serif</family><prefer><family>DejaVu Sans</family></prefer></alias>
@@ -51,15 +53,27 @@ stdenv.mkDerivation {
       cp ${dejavu_fonts}/share/fonts/truetype/$f $out/share/fonts/dejavu/
     done
 
-    cp ${fontsConf} $out/etc/fonts/fonts.conf
+    cat > $out/etc/fonts/fonts.conf <<EOF
+${fontsConf}
+EOF
+    sed -i "s|@OUT@|$out|g" $out/etc/fonts/fonts.conf
 
-    # Pre-build the cache so clients don't have to. fc-cache uses
-    # FONTCONFIG_FILE if set, otherwise reads system fontconfig dirs.
+    # Pre-build the cache so clients don't have to.
+    # fc-cache writes caches into the <cachedir> declared in fonts.conf.
+    # (--cache-dir is NOT a valid fc-cache flag; older code passed it and
+    # then masked the error with `|| true`, leaving the cache empty and
+    # forcing every client to do a full font scan at startup, which on
+    # Brook silently produces missing-glyph fallbacks → tofu rendering →
+    # huge GTK label widths → ftruncate overflow crashes.)
     FONTCONFIG_FILE=$out/etc/fonts/fonts.conf \
     FONTCONFIG_PATH=$out/etc/fonts \
-      ${fontconfig.bin}/bin/fc-cache -v -s -y $out/share/fonts/dejavu \
-        --cache-dir=$out/var/cache/fontconfig || true
+      ${fontconfig.bin}/bin/fc-cache -v -f -s $out/share/fonts/dejavu
 
     echo "brook-fonts: $(ls $out/share/fonts/dejavu | wc -l) fonts, cache=$(ls $out/var/cache/fontconfig 2>/dev/null | wc -l) entries"
+    # Sanity: fail the build if the cache wasn't actually written.
+    if [ "$(ls $out/var/cache/fontconfig 2>/dev/null | wc -l)" = "0" ]; then
+      echo "ERROR: fontconfig cache is empty after fc-cache" >&2
+      exit 1
+    fi
   '';
 }

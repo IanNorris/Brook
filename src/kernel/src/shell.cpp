@@ -95,8 +95,8 @@ static const char* g_defaultEnvp[] = {
     "XCURSOR_PATH=/nix/store/aaipci08wnfa7d64lmd5vyn9l2bkihg5-brook-cursor-theme-0.1/share/icons",
     "XCURSOR_THEME=default",
     "XCURSOR_SIZE=24",
-    "FONTCONFIG_FILE=/nix/store/vb4pfax5bzq9hxi2jb8s40axvv7hz5ls-brook-fonts-0.1/etc/fonts/fonts.conf",
-    "FONTCONFIG_PATH=/nix/store/vb4pfax5bzq9hxi2jb8s40axvv7hz5ls-brook-fonts-0.1/etc/fonts",
+    "FONTCONFIG_FILE=/nix/store/5xrdnxfmz6fs3w5q4iyq1xd6gr6imgzf-brook-fonts-0.1/etc/fonts/fonts.conf",
+    "FONTCONFIG_PATH=/nix/store/5xrdnxfmz6fs3w5q4iyq1xd6gr6imgzf-brook-fonts-0.1/etc/fonts",
     "WESTON_DATA_DIR=/nix/store/ls7lby8cwwvbdrwvlswjgxky7lrwjy97-brook-weston-data-0.1/share/weston",
     // GTK / dbus / portal — keep GTK from hanging on session-bus probe.
     "GTK_USE_PORTAL=0",
@@ -109,7 +109,7 @@ static const char* g_defaultEnvp[] = {
     "XDG_CACHE_HOME=/tmp/cache",
     "XDG_CONFIG_HOME=/tmp/config",
     "XDG_DATA_HOME=/tmp/share",
-    "XDG_DATA_DIRS=/nix/store/vb4pfax5bzq9hxi2jb8s40axvv7hz5ls-brook-fonts-0.1/share:/usr/share",
+    "XDG_DATA_DIRS=/nix/store/5xrdnxfmz6fs3w5q4iyq1xd6gr6imgzf-brook-fonts-0.1/share:/usr/share",
     nullptr
 };
 
