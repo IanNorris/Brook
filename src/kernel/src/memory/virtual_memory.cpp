@@ -211,9 +211,13 @@ void VmmInit()
     if (!pdptPhys) { SerialPuts("VMM: FATAL cannot alloc dmap PDPT\n"); return; }
     ZeroPageIdentity(pdptPhys.raw());
 
-    // We map up to 4GB of physical RAM (4 PDPT entries × 1GB each).
+    // We map up to 16GB of physical RAM (16 PDPT entries × 1GB each).
     // Each PDPT entry points to a PD with 512 × 2MB page entries.
-    static constexpr uint64_t DMAP_GB = 4;
+    // NOTE: this MUST be >= the configured QEMU -m size, otherwise PMM can
+    // hand out page-table pages above the direct map and any subsequent
+    // WalkToPtr will fault writing to an unmapped kernel address.
+    // (GIMP triggered this with the previous 4GB cap on an 8GB VM.)
+    static constexpr uint64_t DMAP_GB = 16;
     static constexpr uint64_t PAGE_2MB = 0x80ULL; // PS bit
 
     uint64_t* pdptPtr = reinterpret_cast<uint64_t*>(pdptPhys.raw()); // identity-mapped
