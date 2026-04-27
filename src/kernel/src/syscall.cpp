@@ -4907,6 +4907,33 @@ static int64_t sys_setuid(uint64_t, uint64_t, uint64_t,
 static int64_t sys_setgid(uint64_t, uint64_t, uint64_t,
                            uint64_t, uint64_t, uint64_t) { return 0; }
 
+// capget(125): probe / fetch process capabilities. We have no capability
+// model — pretend the caller has nothing set. glibc/libcap calls this to
+// detect kernel version support; on non-NULL datap we must write the
+// effective/permitted/inheritable triple (zeroed) so userland doesn't
+// read uninitialised stack.
+static int64_t sys_capget(uint64_t hdrAddr, uint64_t dataAddr,
+                           uint64_t, uint64_t, uint64_t, uint64_t)
+{
+    if (hdrAddr) {
+        // header is { __u32 version; int pid; }. Echo back the version
+        // userland gave us; that's what Linux does on a successful probe.
+        // Leave version unchanged; nothing else to do.
+        (void)hdrAddr;
+    }
+    if (dataAddr) {
+        // V3 layout: two `struct __user_cap_data_struct` (12 bytes each).
+        // Zero 24 bytes covering both halves; harmless if caller used V1/V2.
+        auto* p = reinterpret_cast<uint32_t*>(dataAddr);
+        for (int i = 0; i < 6; ++i) p[i] = 0;
+    }
+    return 0;
+}
+
+// capset(126): silently succeed. We don't track caps.
+static int64_t sys_capset(uint64_t, uint64_t,
+                           uint64_t, uint64_t, uint64_t, uint64_t) { return 0; }
+
 // getgroups(115): return supplementary group list
 static int64_t sys_getgroups(uint64_t size, uint64_t listAddr, uint64_t,
                               uint64_t, uint64_t, uint64_t)
@@ -9002,6 +9029,8 @@ void SyscallTableInit()
     g_syscallTable[SYS_GETGID]          = sys_getgid;
     g_syscallTable[SYS_SETUID]          = sys_setuid;
     g_syscallTable[SYS_SETGID]          = sys_setgid;
+    g_syscallTable[SYS_CAPGET]          = sys_capget;
+    g_syscallTable[SYS_CAPSET]          = sys_capset;
     g_syscallTable[SYS_GETEUID]         = sys_geteuid;
     g_syscallTable[SYS_GETEGID]         = sys_getegid;
     g_syscallTable[SYS_GETPPID]         = sys_getppid;
