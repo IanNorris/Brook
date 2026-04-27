@@ -10,6 +10,7 @@
 #include "process.h"
 #include "scheduler.h"
 #include "spinlock.h"
+#include "string.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "vfs.h"
@@ -339,7 +340,7 @@ static PhysicalAddress MemFdGetOrAllocPage(MemFdData* mfd, uint64_t pageIdx, uin
         PhysicalAddress phys = PmmAllocPage(MemTag::User, pid);
         if (!phys) { MfdUnlock(mfd); return PhysicalAddress(0); }
         auto* va = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
-        for (uint32_t i = 0; i < 4096; i++) va[i] = 0;
+        memset(va, 0, 4096);
         raw = phys.raw();
         mfd->pageMap[pageIdx] = raw;
     }

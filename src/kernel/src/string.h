@@ -19,17 +19,27 @@ extern "C" {
 
 static inline void* memset(void* s, int c, size_t n)
 {
-    unsigned char* p = (unsigned char*)s;
-    while (n--) *p++ = (unsigned char)c;
-    return s;
+    // Use ERMS/FSRM-friendly rep stosb.  Modern x86-64 (Ivy Bridge+,
+    // and crucially the QEMU TCG/KVM host CPUs we run on) microcodes
+    // this into a wide-store loop that beats hand-rolled byte copies
+    // by 10–30×.  Old byte loop dominated profiles whenever a path
+    // zeroed a freshly allocated page (memfd, kmalloc, etc).
+    void* ret = s;
+    asm volatile("rep stosb"
+                 : "+D"(s), "+c"(n)
+                 : "a"((unsigned char)c)
+                 : "memory");
+    return ret;
 }
 
 static inline void* memcpy(void* __restrict__ dst, const void* __restrict__ src, size_t n)
 {
-    unsigned char* d = (unsigned char*)dst;
-    const unsigned char* s = (const unsigned char*)src;
-    while (n--) *d++ = *s++;
-    return dst;
+    void* ret = dst;
+    asm volatile("rep movsb"
+                 : "+D"(dst), "+S"(src), "+c"(n)
+                 :
+                 : "memory");
+    return ret;
 }
 
 static inline void* memmove(void* dst, const void* src, size_t n)
@@ -37,8 +47,12 @@ static inline void* memmove(void* dst, const void* src, size_t n)
     unsigned char* d = (unsigned char*)dst;
     const unsigned char* s = (const unsigned char*)src;
     if (d < s) {
-        while (n--) *d++ = *s++;
-    } else {
+        // Non-overlapping or forward-safe: use the fast path.
+        asm volatile("rep movsb"
+                     : "+D"(d), "+S"(s), "+c"(n)
+                     :
+                     : "memory");
+    } else if (d > s) {
         d += n; s += n;
         while (n--) *--d = *--s;
     }
