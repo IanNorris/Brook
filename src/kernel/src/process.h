@@ -318,7 +318,15 @@ struct Process
     // MemFd mmap ranges — recorded so sys_munmap can unmap without freeing
     // the underlying kernel heap pages (the MemFd buffer). Without this,
     // client munmap() of a shared memfd corrupts the kernel heap.
-    static constexpr uint32_t MAX_MEMFD_MAPS = 16;
+    /* GTK/qalc-style apps that open many short-lived popup surfaces
+     * allocate a fresh wl_shm pool (i.e. a fresh memfd mmap) per
+     * submenu/popup.  16 was too small -- one Qalculate session
+     * exhausted the slots and the next mmap returned ENOMEM, which
+     * gdk-wayland reports as "mmap'ping shared memory file failed:
+     * Cannot allocate memory" before NULL-derefing the pool pointer.
+     * 256 covers realistic GTK app sessions; cost is 256*32B = 8 KB
+     * per process, which is negligible. */
+    static constexpr uint32_t MAX_MEMFD_MAPS = 256;
     struct MemFdMap { uint64_t vaddr; uint64_t length; uint64_t offset; void* mfd; };
     MemFdMap memfdMaps[MAX_MEMFD_MAPS];
 
