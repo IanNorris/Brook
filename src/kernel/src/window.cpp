@@ -430,16 +430,20 @@ void WmSetFocus(int idx)
     {
         Window& old = g_windows[g_focusedIdx];
         old.focused = false;
-        if (old.proc && old.vfb)
+        if (old.proc)
             WmPushWmEvent(&old, WM_EVT_FOCUS_LOST, 0, 0);
     }
 
-    // Focus and raise new
+    // Focus and raise new.  Push FOCUS_GAINED unconditionally, even if
+    // the VFB isn't attached yet -- a freshly-created Wayland window
+    // attaches its buffer some time after WM_CREATE_WINDOW returns, and
+    // waylandd needs the focus event to drive wl_keyboard.enter so the
+    // client believes it has the keyboard.  Without this, no keystroke
+    // ever reaches a newly-opened window.
     g_windows[idx].focused = true;
     g_windows[idx].zOrder = g_nextZOrder++;
     g_focusedIdx = idx;
-    if (g_windows[idx].vfb)
-        WmPushWmEvent(&g_windows[idx], WM_EVT_FOCUS_GAINED, 0, 0);
+    WmPushWmEvent(&g_windows[idx], WM_EVT_FOCUS_GAINED, 0, 0);
 }
 
 int WmGetFocusedWindow()
