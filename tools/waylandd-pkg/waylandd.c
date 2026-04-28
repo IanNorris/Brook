@@ -1158,24 +1158,28 @@ static void output_bind(struct wl_client *client, void *data,
 }
 
 /* PS/2 scancode set 1 → XKB keycode (keycode = scancode + 8). */
-/* Translate Brook kernel scan-code byte into an evdev keycode + 8 (= xkb
- * keycode).  Scan-codes 0x00-0x7F are PS/2 set-1, which happens to align
- * 1:1 with Linux evdev keycodes for the typing block.  0x80-0x89 are
- * Brook's synthetic E0-extended codes (see input.h: SC_EXT_*); map them
- * explicitly to evdev navigation/edit keys. */
+/* Wayland convention: wl_keyboard.key carries an evdev keycode.  Clients
+ * then add 8 to look up the xkb keymap (which uses xkb keycodes =
+ * evdev + 8).  Our keymap declares AD01=24, AD02=25, ... = evdev + 8,
+ * so we must hand the client a *bare* evdev keycode here and let it
+ * do the +8 itself.  PS/2 set-1 scan codes 0x00-0x35 happen to match
+ * Linux evdev keycodes for the typing block 1:1 (KEY_ESC=1, KEY_Q=16,
+ * etc.), so the typing block needs no translation.  0x80-0x89 are
+ * Brook's synthetic E0-extended codes (see input.h: SC_EXT_*); map
+ * those to their proper evdev keycodes. */
 static uint32_t scancode_to_xkb(uint8_t sc) {
     switch (sc) {
-    case 0x80: return 103 + 8; /* SC_EXT_UP    -> KEY_UP */
-    case 0x81: return 108 + 8; /* SC_EXT_DOWN  -> KEY_DOWN */
-    case 0x82: return 105 + 8; /* SC_EXT_LEFT  -> KEY_LEFT */
-    case 0x83: return 106 + 8; /* SC_EXT_RIGHT -> KEY_RIGHT */
-    case 0x84: return 102 + 8; /* SC_EXT_HOME  -> KEY_HOME */
-    case 0x85: return 107 + 8; /* SC_EXT_END   -> KEY_END */
-    case 0x86: return 110 + 8; /* SC_EXT_INSERT-> KEY_INSERT */
-    case 0x87: return 111 + 8; /* SC_EXT_DELETE-> KEY_DELETE */
-    case 0x88: return 104 + 8; /* SC_EXT_PGUP  -> KEY_PAGEUP */
-    case 0x89: return 109 + 8; /* SC_EXT_PGDN  -> KEY_PAGEDOWN */
-    default:   return (uint32_t)sc + 8u;
+    case 0x80: return 103; /* SC_EXT_UP    -> KEY_UP */
+    case 0x81: return 108; /* SC_EXT_DOWN  -> KEY_DOWN */
+    case 0x82: return 105; /* SC_EXT_LEFT  -> KEY_LEFT */
+    case 0x83: return 106; /* SC_EXT_RIGHT -> KEY_RIGHT */
+    case 0x84: return 102; /* SC_EXT_HOME  -> KEY_HOME */
+    case 0x85: return 107; /* SC_EXT_END   -> KEY_END */
+    case 0x86: return 110; /* SC_EXT_INSERT-> KEY_INSERT */
+    case 0x87: return 111; /* SC_EXT_DELETE-> KEY_DELETE */
+    case 0x88: return 104; /* SC_EXT_PGUP  -> KEY_PAGEUP */
+    case 0x89: return 109; /* SC_EXT_PGDN  -> KEY_PAGEDOWN */
+    default:   return (uint32_t)sc;
     }
 }
 
