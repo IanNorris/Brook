@@ -100,6 +100,14 @@ static const char* g_defaultEnvp[] = {
     "WESTON_DATA_DIR=/nix/store/ls7lby8cwwvbdrwvlswjgxky7lrwjy97-brook-weston-data-0.1/share/weston",
     // GTK / dbus / portal — keep GTK from hanging on session-bus probe.
     "GTK_USE_PORTAL=0",
+    // Brook policy: kernel WM draws all chrome (titlebar, border, close
+    // button).  Tell GTK not to draw its own client-side decoration on
+    // top of ours.  Without this, mousepad/qalc/gimp render a duplicate
+    // GTK headerbar inside their content area, producing a visible
+    // double-frame.  Toolkits that bind zxdg-decoration-v1 still get
+    // server-side mode via that protocol; this covers every other GTK3
+    // toolkit that doesn't speak the decoration protocol.
+    "GTK_CSD=0",
     "GDK_BACKEND=wayland",
     "GDK_SCALE=1",
     "GDK_DPI_SCALE=1",
