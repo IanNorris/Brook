@@ -159,6 +159,27 @@ static Process* PickNextLocked()
 // ProcessTrampoline, KernelThreadTrampoline).
 static void DrainPostSwitch(uint32_t cpu)
 {
+    // Defensive: a corrupt-stack panic was observed where this function was
+    // entered with cpu = 0x80040f0c — the low 32 bits of context_switch's
+    // .Lresume label.  Root cause: after .Lresume executes `ret`, the saved
+    // kernel stack of the resuming thread had a return address that pointed
+    // five bytes past `call SmpCurrentCpuIndex` in the post-context_switch
+    // continuation, skipping the call.  EAX retained the value left by
+    // context_switch's `mov 0x38(%rsi), %rax` (= the saved RIP, .Lresume),
+    // and `mov %eax, %edi` propagated that into the cpu argument here.
+    //
+    // The underlying stack corruption is rare and not reliably reproducible.
+    // Re-derive cpu from the APIC and log loudly so a recurrence is visible
+    // rather than a fatal #PF on g_perCpu[cpu].pendingRetire.
+    if (cpu >= SCHED_MAX_CPUS)
+    {
+        uint32_t recovered = SmpCurrentCpuIndex();
+        SerialPrintf("SCHED: DrainPostSwitch entered with bogus cpu=0x%x — "
+                     "recovering via APIC -> %u (kernel stack corruption?)\n",
+                     cpu, recovered);
+        cpu = (recovered < SCHED_MAX_CPUS) ? recovered : 0;
+    }
+
     // Mark any terminated process as safe to reap — by this point the CPU's
     // RSP is on the NEW process's kernel stack, so the old stack is unused.
     Process* retired = g_perCpu[cpu].pendingRetire;
