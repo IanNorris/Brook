@@ -190,8 +190,9 @@ static uint64_t SetupUserStack(Process* proc,
     }
 
     // 2. Push environment strings and record pointers
-    uint64_t envAddrs[32] = {};
-    for (int i = 0; i < envc && i < 32; ++i)
+    static constexpr int MAX_ENV = 64;
+    uint64_t envAddrs[MAX_ENV] = {};
+    for (int i = 0; i < envc && i < MAX_ENV; ++i)
     {
         uint64_t len = 0;
         while (envp[i][len]) ++len;
@@ -216,7 +217,8 @@ static uint64_t SetupUserStack(Process* proc,
     //   envp: (envc + 1) slots (including NULL terminator)
     //   argv: (argc + 1) slots (including NULL terminator)
     //   argc: 1 slot
-    int totalSlots = 34 + (envc + 1) + (argc + 1) + 1;
+    int envcClamped = (envc > MAX_ENV) ? MAX_ENV : envc;
+    int totalSlots = 34 + (envcClamped + 1) + (argc + 1) + 1;
     if (totalSlots & 1)
         pushU64(0); // padding to maintain 16-byte alignment
 
@@ -241,9 +243,9 @@ static uint64_t SetupUserStack(Process* proc,
     pushU64(proc->elf.phdrEntSize); pushU64(AT_PHENT);          // AT_PHENT
     pushU64(proc->elf.phdrVaddr); pushU64(AT_PHDR);             // AT_PHDR
 
-    // 6. Push envp array (null-terminated)
+    // 6. Push envp array (null-terminated). envcClamped already capped to MAX_ENV.
     pushU64(0); // envp[envc] = NULL
-    for (int i = envc - 1; i >= 0; --i)
+    for (int i = envcClamped - 1; i >= 0; --i)
         pushU64(envAddrs[i]);
 
     // 7. Push argv array (null-terminated)

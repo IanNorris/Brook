@@ -1005,7 +1005,8 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     bashEnvp[envIdx++] = linesBuf;
     bashEnvp[envIdx]   = nullptr;
 
-    Process* child = ProcessCreate(elfData, st.size, 1, bashArgv, 8, bashEnvp, stdFds);
+    Process* child = ProcessCreate(elfData, st.size, 1, bashArgv,
+                                   static_cast<int>(envIdx), bashEnvp, stdFds);
     kfree(elfData);
     kfree(bashEnvp);
 
