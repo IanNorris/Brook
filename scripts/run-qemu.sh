@@ -189,6 +189,19 @@ NIX_DRIVE=""
 if [ -f "${NIX_DISK}" ]; then
     NIX_DRIVE="-drive if=virtio,format=raw,file=${NIX_DISK},file.locking=off"
     echo "  Nix disk:  ${NIX_DISK}"
+
+    # Make sure /nix/bin/curl etc. are present.  Disks created before
+    # commit 5d53fb5 don't bundle them, and `nix install` then fails with
+    # "curl not found".  Probe with debugfs (read-only, no mount) and
+    # auto-run update_nix_disk.sh --tools when missing.  Skipped when
+    # BROOK_SKIP_UPDATE_DISK=1.
+    if [ "${BROOK_SKIP_UPDATE_DISK:-0}" != "1" ] && command -v debugfs >/dev/null 2>&1; then
+        if ! debugfs -R 'stat /bin/curl' "${NIX_DISK}" 2>/dev/null | grep -q 'Inode:'; then
+            echo "  Nix disk missing /nix/bin/curl — refreshing bundled tools..."
+            "${SCRIPT_DIR}/update_nix_disk.sh" --tools || \
+                echo "  WARNING: update_nix_disk.sh failed; nix install may not work"
+        fi
+    fi
 fi
 
 HOME_DISK="${BROOK_HOME_DISK:-${ROOT_DIR}/brook_home_disk.img}"
