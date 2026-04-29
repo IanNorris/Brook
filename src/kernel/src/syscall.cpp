@@ -6203,9 +6203,9 @@ static int64_t sys_epoll_wait(uint64_t epfd, uint64_t eventsAddr,
 
     FdEntry* epfde = FdGet(proc, static_cast<int>(epfd));
     if (!epfde || epfde->type != FdType::EpollFd || !epfde->handle) {
-        SerialPrintf("sys_epoll_wait: EBADF epfd=%lu pid=%u "
+        SerialPrintf("sys_epoll_wait: EBADF epfd=%lu pid=%u tgid=%u "
                      "fde=%p type=%d handle=%p\n",
-                     epfd, proc->pid, epfde,
+                     epfd, proc->pid, proc->tgid, epfde,
                      epfde ? static_cast<int>(epfde->type) : -1,
                      epfde ? epfde->handle : nullptr);
         return -EBADF;
