@@ -53,6 +53,7 @@ struct KernelSigaction {
 
 // SA_* flag constants
 static constexpr uint64_t SA_SIGINFO  = 0x00000004;
+static constexpr uint64_t SA_ONSTACK  = 0x08000000;
 static constexpr uint64_t SA_RESTORER = 0x04000000;
 
 // Per-process signal handlers (indexed by [pid][signal-1])
@@ -400,6 +401,7 @@ struct Process
 
     // Signal delivery state
     bool     inSignalHandler;   // Currently executing a user signal handler
+    bool     inSignalHandlerOnAltStack; // Current handler entered on sigaltstack
     bool     sigReturnPending;  // Set by sys_rt_sigreturn, handled by SyscallCheckSignals
 
     // Fork child state: when true, the trampoline enters user mode at

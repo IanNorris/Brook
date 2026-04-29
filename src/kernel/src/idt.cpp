@@ -993,14 +993,14 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
     bool hasHandler = false;
     if (proc && proc->pid < brook::MAX_PROCESSES)
     {
-        const brook::KernelSigaction& sa = brook::g_sigHandlers[proc->pid][signum - 1];
+        const brook::KernelSigaction& sa = brook::g_sigHandlers[proc->tgid][signum - 1];
         if (sa.handler > 1) // Not SIG_DFL (0) or SIG_IGN (1)
             hasHandler = true;
     }
 
     if (hasHandler && proc && !proc->inSignalHandler)
     {
-        const brook::KernelSigaction& sa = brook::g_sigHandlers[proc->pid][signum - 1];
+        const brook::KernelSigaction& sa = brook::g_sigHandlers[proc->tgid][signum - 1];
 
         ExcPutsRaw("[SIG] Delivering signal ");
         ExcPutCharRaw(static_cast<char>('0' + signum / 10));
@@ -1031,9 +1031,21 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         proc->sigMask |= sa.mask | (1ULL << (signum - 1));
         proc->sigMask &= ~((1ULL << 8) | (1ULL << 18)); // never block SIGKILL/SIGSTOP
 
-        // Build SignalFrame on the user stack
-        uint64_t userRsp = ef->rsp;
-        userRsp -= 128;                        // skip red zone
+        // Build SignalFrame — on alt stack if SA_ONSTACK & configured
+        uint64_t userRsp;
+        bool useAlt = (sa.flags & brook::SA_ONSTACK) && proc->sigAltstackSp != 0
+                      && !(proc->sigAltstackFlags & 2)
+                      && !proc->inSignalHandlerOnAltStack;
+        if (useAlt)
+        {
+            userRsp = proc->sigAltstackSp + proc->sigAltstackSize;
+            proc->inSignalHandlerOnAltStack = true;
+        }
+        else
+        {
+            userRsp = ef->rsp;
+            userRsp -= 128;                    // skip red zone
+        }
         userRsp -= sizeof(brook::SignalFrame);
         userRsp &= ~0xFULL;                   // 16-byte align
 
@@ -1048,6 +1060,10 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
 
         // Fill ucontext
         sf->uc.uc_sigmask = proc->sigSavedMask;
+        sf->uc.uc_stack.ss_sp    = proc->sigAltstackSp;
+        sf->uc.uc_stack.ss_size  = proc->sigAltstackSize;
+        sf->uc.uc_stack.ss_flags = useAlt ? 1
+                                          : (proc->sigAltstackSp ? 0 : 2);
 
         // Save all registers from the fault context into mcontext
         brook::SignalMcontext& mc = sf->uc.uc_mcontext;

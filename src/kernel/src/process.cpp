@@ -842,10 +842,10 @@ void ProcessDestroy(Process* proc)
     // the next process inheriting our handler pointers (which would
     // reference user memory no longer mapped and cause a #PF on signal).
     for (int s = 0; s < 64; ++s) {
-        g_sigHandlers[proc->pid][s].handler = 0;
-        g_sigHandlers[proc->pid][s].flags = 0;
-        g_sigHandlers[proc->pid][s].restorer = 0;
-        g_sigHandlers[proc->pid][s].mask = 0;
+        g_sigHandlers[proc->tgid][s].handler = 0;
+        g_sigHandlers[proc->tgid][s].flags = 0;
+        g_sigHandlers[proc->tgid][s].restorer = 0;
+        g_sigHandlers[proc->tgid][s].mask = 0;
     }
 
     FreeProcessStruct(proc);
@@ -1146,7 +1146,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     // whatever previous process had the same pid — a deterministic #PF
     // waiting for the first signal delivery (e.g. SIGCHLD on waitpid).
     for (int s = 0; s < 64; ++s)
-        g_sigHandlers[child->pid][s] = g_sigHandlers[parent->pid][s];
+        g_sigHandlers[child->tgid][s] = g_sigHandlers[parent->tgid][s];
 
     // Set child's name
     {
@@ -1270,6 +1270,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     // Signal state: inherit mask, clear pending
     thread->sigPending = 0;
     thread->inSignalHandler = false;
+    thread->inSignalHandlerOnAltStack = false;
     thread->sigReturnPending = false;
 
     // Threads get a unique pid (TID) but share the process group's signal
@@ -1277,7 +1278,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     // slot into the thread's slot. Without this the thread's slot contains
     // whatever stale data was left by a previous process with the same pid.
     for (int s = 0; s < 64; ++s)
-        g_sigHandlers[thread->pid][s] = g_sigHandlers[parent->pid][s];
+        g_sigHandlers[thread->tgid][s] = g_sigHandlers[parent->tgid][s];
 
     // Set thread name
     {
@@ -1647,7 +1648,7 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     //    delivery to unmapped memory, causing a #PF in the new program on
     //    its first signal (e.g. SIGCHLD from a child exiting).
     for (int s = 0; s < 64; ++s) {
-        auto& sa = g_sigHandlers[proc->pid][s];
+        auto& sa = g_sigHandlers[proc->tgid][s];
         if (sa.handler != 1 /* SIG_IGN */) {
             sa.handler = 0;
             sa.flags = 0;
@@ -1717,7 +1718,7 @@ int ProcessSendSignal(Process* proc, int signum)
     // (like SIGSTOP). Otherwise fall through to set pending for handler delivery.
     if (signum == 20 || signum == 21 || signum == 22)
     {
-        KernelSigaction& sa = g_sigHandlers[proc->pid][signum - 1];
+        KernelSigaction& sa = g_sigHandlers[proc->tgid][signum - 1];
         if (sa.handler == 0 || sa.handler == 1) // SIG_DFL or SIG_IGN
         {
             if (sa.handler == 1) return 0; // SIG_IGN — ignore
@@ -1742,7 +1743,7 @@ int ProcessSendSignal(Process* proc, int signum)
     //   - SIG_DFL where the POSIX default is "ignore": SIGCHLD (17),
     //     SIGURG (23), SIGWINCH (28)
     {
-        KernelSigaction& sa = g_sigHandlers[proc->pid][signum - 1];
+        KernelSigaction& sa = g_sigHandlers[proc->tgid][signum - 1];
         bool defaultIsIgnore = (signum == 17 || signum == 23 || signum == 28);
         if (sa.handler == 1 ||
             (sa.handler == 0 && defaultIsIgnore))
@@ -1787,6 +1788,7 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     {
         proc->sigReturnPending = false;
         proc->inSignalHandler = false;
+        proc->inSignalHandlerOnAltStack = false;
 
         // The user RSP at the time of the rt_sigreturn syscall points to the
         // ucontext (pretcode was popped by handler's RET, then restorer did syscall).
@@ -1834,7 +1836,7 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     // Clear from pending
     __atomic_and_fetch(&proc->sigPending, ~(1ULL << (signum - 1)), __ATOMIC_RELEASE);
 
-    uint16_t pid = proc->pid;
+    uint16_t pid = proc->tgid;
     if (pid >= MAX_PROCESSES) return syscallResult;
 
     KernelSigaction& sa = g_sigHandlers[pid][signum - 1];
@@ -1896,9 +1898,22 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     // Never block SIGKILL or SIGSTOP
     proc->sigMask &= ~((1ULL << 8) | (1ULL << 18));
 
-    // Build the signal frame on the user stack
-    uint64_t userRsp = frame->rsp;
-    userRsp -= 128;                        // skip red zone
+    // Build the signal frame — on alt stack if SA_ONSTACK and one is configured,
+    // otherwise on the current user stack (skip red zone).
+    uint64_t userRsp;
+    bool useAlt = (sa.flags & SA_ONSTACK) && proc->sigAltstackSp != 0
+                  && !(proc->sigAltstackFlags & 2 /*SS_DISABLE*/)
+                  && !proc->inSignalHandlerOnAltStack;
+    if (useAlt)
+    {
+        userRsp = proc->sigAltstackSp + proc->sigAltstackSize;
+        proc->inSignalHandlerOnAltStack = true;
+    }
+    else
+    {
+        userRsp = frame->rsp;
+        userRsp -= 128;                    // skip red zone
+    }
     userRsp -= sizeof(SignalFrame);
     userRsp &= ~0xFULL;                   // 16-byte align
 
@@ -1913,6 +1928,10 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
 
     // Fill ucontext
     sf->uc.uc_sigmask = proc->sigSavedMask;
+    sf->uc.uc_stack.ss_sp    = proc->sigAltstackSp;
+    sf->uc.uc_stack.ss_size  = proc->sigAltstackSize;
+    sf->uc.uc_stack.ss_flags = useAlt ? 1 /*SS_ONSTACK*/
+                                      : (proc->sigAltstackSp ? 0 : 2 /*SS_DISABLE*/);
 
     // Save all registers into mcontext
     SignalMcontext& mc = sf->uc.uc_mcontext;

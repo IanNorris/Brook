@@ -1,0 +1,5 @@
+# Brook OS — nix-install vlc with sampling profiler active
+# Run with: scripts/run-qemu.sh --release --script nixvlc_profile
+# Serial output is saved to /tmp/brook_serial.log
+profile 240000
+run /nix/bin/nix-install vlc

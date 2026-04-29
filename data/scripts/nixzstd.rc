@@ -1,0 +1,2 @@
+# Brook OS — install just zstd to test if hang is package-specific
+run /nix/bin/nix-install zstd

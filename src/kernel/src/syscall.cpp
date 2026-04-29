@@ -854,13 +854,24 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
         return 8;
     }
 
-    // Write to socket (TCP stream)
+    // Write to socket (TCP stream or connected UDP datagram).
     if (fde->type == FdType::Socket && fde->handle)
     {
         int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
-        return brook::SockSend(sockIdx,
-                               reinterpret_cast<const void*>(bufAddr),
-                               static_cast<uint32_t>(count));
+        if (brook::SockIsStream(sockIdx))
+        {
+            return brook::SockSend(sockIdx,
+                                   reinterpret_cast<const void*>(bufAddr),
+                                   static_cast<uint32_t>(count));
+        }
+        // UDP: write() requires a prior connect() so the kernel knows the peer.
+        // SockSendTo with dest=nullptr falls back to the cached connect address.
+        int ret = SockSendTo(sockIdx,
+                             reinterpret_cast<const void*>(bufAddr),
+                             static_cast<uint32_t>(count),
+                             nullptr);
+        if (ret < 0) return -ENOTCONN;
+        return static_cast<int64_t>(count);
     }
 
     // Write to /dev/tty — writes to stdout pipe (rendered by terminal thread)
@@ -1349,16 +1360,34 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         }
     }
 
-    // Read from socket (TCP stream or UDP)
+    // Read from socket (TCP stream or connected UDP)
     if (fde->type == FdType::Socket && fde->handle)
     {
         int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
         bool nonblock = (fde->statusFlags & 0x800) != 0;
-        if (nonblock && brook::SockRxCount(sockIdx) == 0 && !brook::SockPollReady(sockIdx, true, false))
-            return -EAGAIN;
-        return brook::SockRecv(sockIdx,
-                               reinterpret_cast<void*>(bufAddr),
-                               static_cast<uint32_t>(count));
+        if (brook::SockIsStream(sockIdx))
+        {
+            if (nonblock && brook::SockRxCount(sockIdx) == 0 && !brook::SockPollReady(sockIdx, true, false))
+                return -EAGAIN;
+            return brook::SockRecv(sockIdx,
+                                   reinterpret_cast<void*>(bufAddr),
+                                   static_cast<uint32_t>(count));
+        }
+        // UDP: read() pulls one datagram from the rx queue.  SockRecvFrom
+        // returns -EAGAIN when empty; non-blocking sockets propagate that,
+        // blocking sockets spin-poll briefly (matches existing TCP behaviour).
+        SockAddrIn unused = {};
+        for (;;) {
+            int ret = SockRecvFrom(sockIdx,
+                                    reinterpret_cast<void*>(bufAddr),
+                                    static_cast<uint32_t>(count),
+                                    &unused);
+            if (ret >= 0) return ret;
+            if (nonblock) return -EAGAIN;
+            if (HasPendingSignals()) return -EINTR;
+            // Yield briefly so the NIC ISR / poll path can deliver packets.
+            __asm__ volatile("pause");
+        }
     }
 
     // Read from timerfd — returns uint64 expiry count, blocks until armed+expired
@@ -4969,7 +4998,7 @@ static int64_t sys_rt_sigaction(uint64_t signum, uint64_t actAddr, uint64_t olda
     if (!proc) return -ESRCH;
 
     uint32_t idx = static_cast<uint32_t>(signum) - 1;
-    uint16_t pid = proc->pid;
+    uint16_t pid = proc->tgid;
     if (pid >= MAX_PROCESSES) return -EINVAL;
 
     if (oldactAddr)
@@ -7129,6 +7158,19 @@ static int64_t sys_tgkill(uint64_t tgid, uint64_t tid, uint64_t sig,
     if (sig == 0) return 0; // Signal 0 = check permissions only
     Process* target = ProcessFindByPid(static_cast<uint16_t>(tid));
     if (!target) return -ESRCH;
+    // If the handler asks for SA_ONSTACK but the target thread hasn't
+    // configured a signal alt stack, dropping the signal is safer than
+    // delivering on the regular stack — Go's runtime panics with
+    // "non-Go code set up signal handler without SA_ONSTACK flag" if
+    // SP isn't on the gsignal stack at delivery time. This bites SIGURG
+    // (used for goroutine preemption) on threads that haven't reached
+    // minit() yet.
+    if (sig >= 1 && sig <= 64 && target->tgid < MAX_PROCESSES)
+    {
+        const KernelSigaction& sa = g_sigHandlers[target->tgid][sig - 1];
+        if ((sa.flags & SA_ONSTACK) && target->sigAltstackSp == 0)
+            return 0;
+    }
     return ProcessSendSignal(target, static_cast<int>(sig));
 }
 

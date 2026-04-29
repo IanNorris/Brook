@@ -638,10 +638,15 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* Called as nix-install directly */
+    /* Called as nix-install directly. Accepts one or more packages. */
     if (argc < 2) {
-        fprintf(stderr, "Usage: nix-install <package>\n");
+        fprintf(stderr, "Usage: nix-install <package> [<package>...]\n");
         return 1;
     }
-    return cmd_install(argv[1]);
+    int rc = 0;
+    for (int i = 1; i < argc; i++) {
+        int r = cmd_install(argv[i]);
+        if (r != 0) rc = r;
+    }
+    return rc;
 }

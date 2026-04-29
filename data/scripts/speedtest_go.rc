@@ -1,0 +1,2 @@
+# Brook OS — speedtest-go (binary already in store; bypass profile symlink)
+run /nix/store/g4h87kyr7gn0s09ygk22hwqqr7gm83cw-speedtest-go-1.7.10/bin/speedtest-go
