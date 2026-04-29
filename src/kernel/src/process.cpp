@@ -1914,6 +1914,11 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     // --- User handler: build SignalFrame on user stack ---
     DbgPrintf("SIGNAL: delivering signal %d to pid %u handler=0x%lx restorer=0x%lx\n",
               signum, proc->pid, sa.handler, sa.restorer);
+    // Promote SIGWINCH delivery debug to SerialPrintf in release until the
+    // resize-kills-terminal bug is closed.
+    if (signum == 28)
+        brook::SerialPrintf("SIGNAL: deliver SIGWINCH pid=%u tgid=%u handler=0x%lx restorer=0x%lx flags=0x%lx\n",
+                            proc->pid, proc->tgid, sa.handler, sa.restorer, sa.flags);
 
     proc->inSignalHandler = true;
 
