@@ -316,7 +316,7 @@ int NetSendIpv4(uint32_t dstIp, uint8_t proto,
         uint32_t frameLen = sizeof(EthHeader) + ipLen;
         if (frameLen > ETH_FRAME_MAX) return -3;
 
-        uint8_t frame[ETH_FRAME_MAX];
+        alignas(16) uint8_t frame[ETH_FRAME_MAX];
         NetMemset(frame, 0, frameLen);
 
         auto* eth = reinterpret_cast<EthHeader*>(frame);
@@ -358,7 +358,7 @@ int NetSendIpv4(uint32_t dstIp, uint8_t proto,
     uint32_t frameLen = sizeof(EthHeader) + ipLen;
     if (frameLen > ETH_FRAME_MAX) return -3;
 
-    uint8_t frame[ETH_FRAME_MAX];
+    alignas(16) uint8_t frame[ETH_FRAME_MAX];
     NetMemset(frame, 0, frameLen);
 
     auto* eth = reinterpret_cast<EthHeader*>(frame);
@@ -390,7 +390,7 @@ int NetSendUdp(uint32_t dstIp, uint16_t srcPort, uint16_t dstPort,
     uint32_t udpLen = sizeof(UdpHeader) + dataLen;
     if (udpLen > ETH_MTU - sizeof(Ipv4Header)) return -1;
 
-    uint8_t buf[ETH_MTU];
+    alignas(16) uint8_t buf[ETH_MTU];
     auto* udp = reinterpret_cast<UdpHeader*>(buf);
     udp->srcPort  = htons(srcPort);
     udp->dstPort  = htons(dstPort);
@@ -648,7 +648,7 @@ static void DhcpSend(uint8_t msgType, uint32_t serverIp, uint32_t requestedIp)
     if (!g_netIf) return;
 
     // Build DHCP over UDP over IP over Ethernet
-    uint8_t frame[ETH_FRAME_MAX];
+    alignas(16) uint8_t frame[ETH_FRAME_MAX];
     NetMemset(frame, 0, sizeof(frame));
 
     auto* eth = reinterpret_cast<EthHeader*>(frame);
@@ -1550,7 +1550,7 @@ static void TcpSendSegment(Socket& s, uint8_t flags,
 
     uint32_t optLen  = addMss ? 4 : 0;   // MSS option is 4 bytes
     uint32_t tcpLen  = sizeof(TcpHeader) + optLen + dataLen;
-    uint8_t buf[ETH_MTU];
+    alignas(16) uint8_t buf[ETH_MTU];
     NetMemset(buf, 0, tcpLen);
 
     auto* tcp = reinterpret_cast<TcpHeader*>(buf);

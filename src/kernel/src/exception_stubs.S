@@ -67,10 +67,18 @@ ExceptionStub\vector:
     // RSI = vector number
     movq $\vector, %rsi
 
-    // Align stack to 16 bytes for C calling convention
+    // Align stack to 16 bytes for C calling convention.
+    // We need RSP at the moment of `call` to be 0-mod-16 so the callee
+    // sees the SysV-mandated 8-mod-16. After `and $-16, %rsp` RSP is
+    // 0-mod-16; `push %rbp` would leave it at 8-mod-16, and the call's
+    // own 8-byte push would give the callee 0-mod-16 — every downstream
+    // function then gets a misaligned stack and any movaps to a local
+    // ends in #GP. Add an 8-byte pad so the saved-rsp push lands on
+    // 0-mod-16.
     movq %rsp, %rbp
     andq $-16, %rsp
-    push %rbp          // save original RSP
+    subq $8, %rsp      // pad so RSP is 0-mod-16 at the `call`
+    push %rbp          // save original RSP (popped on return)
 
     call HandleExceptionFull
 
