@@ -7,6 +7,7 @@
 #include "font_atlas.h"
 #include "input.h"
 #include "memory/heap.h"
+#include "memory/virtual_memory.h"
 #include "serial.h"
 #include "vfs.h"
 
@@ -1219,6 +1220,49 @@ void TerminalResize(Terminal* t, uint32_t newW, uint32_t newH)
         t->altVfb = nullptr;
         t->inAltScreen = false;
     }
+
+    // If the child has user-space mappings of the OLD vfb pages, those
+    // PTEs still point at the kernel pages we're about to free.  After
+    // kfree(t->vfb) those pages may be reused for unrelated allocations,
+    // and the next user write through the stale mapping silently
+    // corrupts kernel state — Ian observed btop crashing the WM on
+    // resize because of this.  Re-point each user PTE at the matching
+    // page of newVfb (up to min(oldPages, newPages, mapPages)) before
+    // freeing.  Pages beyond the new vfb are unmapped so a stray write
+    // takes a clean #PF instead of a UAF.
+    if (t->child)
+    {
+        uint64_t newKernVa = reinterpret_cast<uint64_t>(newVfb);
+        uint64_t newPages = (newSize + 4095) / 4096;
+        for (uint32_t mi = 0; mi < Process::MAX_FB_MAPS; ++mi)
+        {
+            auto& m = t->child->fbMaps[mi];
+            if (m.length == 0) continue;
+            uint64_t mapPages = m.length / 4096;
+            for (uint64_t i = 0; i < mapPages; ++i)
+            {
+                VirtualAddress uva(m.vaddr + i * 4096);
+                if (i < newPages)
+                {
+                    VirtualAddress newKva(newKernVa + i * 4096);
+                    PhysicalAddress np = VmmVirtToPhys(KernelPageTable, newKva);
+                    if (!np) continue;
+                    VmmUnmapPage(t->child->pageTable, uva);
+                    VmmMapPage(t->child->pageTable, uva, np,
+                               VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
+                               MemTag::Device, t->child->pid);
+                }
+                else
+                {
+                    VmmUnmapPage(t->child->pageTable, uva);
+                }
+            }
+            // Truncate the recorded mapping so munmap doesn't try to
+            // unmap pages beyond the new VFB.
+            if (mapPages > newPages) m.length = newPages * 4096;
+        }
+    }
+
     kfree(t->vfb);
 
     // Install new VFB
@@ -1308,6 +1352,7 @@ void TerminalResize(Terminal* t, uint32_t newW, uint32_t newH)
     if (t->child)
     {
         t->child->fbVirtual    = t->vfb;
+        t->child->fbVirtualSize = newSize;
         t->child->fbVfbWidth   = newW;
         t->child->fbVfbHeight  = newH;
         t->child->fbVfbStride  = newW;
