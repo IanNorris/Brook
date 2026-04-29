@@ -107,7 +107,9 @@ static int mkdir_p(const char *path) {
     return mkdir(tmp, 0755);
 }
 
-static int is_installed(const char *name) {
+/* Look up an installed package by name. If found, copy its store_name
+ * into out_store (size out_sz) and return 1. Returns 0 if not installed. */
+static int find_installed(const char *name, char *out_store, size_t out_sz) {
     FILE *f = fopen(MANIFEST_PATH, "r");
     if (!f) return 0;
 
@@ -116,16 +118,29 @@ static int is_installed(const char *name) {
         size_t len = strlen(line);
         if (len > 0 && line[len - 1] == '\n') line[--len] = '\0';
 
-        char *tab = strchr(line, '\t');
-        if (tab) *tab = '\0';
+        char *p_name = line;
+        char *p_ver = strchr(p_name, '\t');
+        if (!p_ver) continue;
+        *p_ver++ = '\0';
+        char *p_store = strchr(p_ver, '\t');
+        if (!p_store) continue;
+        *p_store++ = '\0';
 
-        if (strcasecmp(line, name) == 0) {
+        if (strcasecmp(p_name, name) == 0) {
+            if (out_store && out_sz) {
+                strncpy(out_store, p_store, out_sz - 1);
+                out_store[out_sz - 1] = '\0';
+            }
             fclose(f);
             return 1;
         }
     }
     fclose(f);
     return 0;
+}
+
+static int is_installed(const char *name) {
+    return find_installed(name, NULL, 0);
 }
 
 static int add_to_manifest(const struct pkg_info *pkg) {
@@ -266,8 +281,15 @@ static int unlink_package_bins(const char *store_name) {
 static int cmd_install(const char *name) {
     printf("Looking up '%s'...\n", name);
 
-    if (is_installed(name)) {
+    char existing_store[512] = {0};
+    if (find_installed(name, existing_store, sizeof(existing_store))) {
+        /* Already in manifest. Re-link bins in case the profile/bin
+         * symlinks are missing (e.g. wiped, or earlier link step never
+         * ran). This is idempotent — link_package_bins unlinks first. */
+        int linked = link_package_bins(existing_store);
         printf("'%s' is already installed.\n", name);
+        if (linked > 0)
+            printf("  re-linked %d binary(ies) in %s\n", linked, PROFILE_BIN);
         return 0;
     }
 
