@@ -698,6 +698,18 @@ static void CloseFdEntry(Process* proc, uint32_t i)
 {
     FdEntry& fde = proc->fds[i];
 
+    // Trace low-numbered fd closures so we can spot accidental closures
+    // of Go runtime fds (epoll, eventfd, network sockets typically land at
+    // fd 3..7). BRO-003 debug.
+    if (i <= 15 && fde.type != FdType::None)
+    {
+        SerialPrintf("CLOSE: fd=%u pid=%u tgid=%u type=%d handle=0x%lx flags=0x%x\n",
+                     i, proc->pid, proc->tgid,
+                     static_cast<int>(fde.type),
+                     reinterpret_cast<uint64_t>(fde.handle),
+                     static_cast<unsigned>(fde.flags));
+    }
+
     if (fde.type == FdType::Vnode && fde.handle)
     {
         auto* vn = static_cast<Vnode*>(fde.handle);

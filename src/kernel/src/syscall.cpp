@@ -6040,6 +6040,9 @@ static int64_t epoll_create_impl(uint64_t flagsVal)
     if (flagsVal & 0x80000) // EPOLL_CLOEXEC
         proc->fds[fd].fdFlags |= 1;
 
+    SerialPrintf("EPOLL: create fd=%d pid=%u tgid=%u flags=0x%lx ep=0x%lx\n",
+                 fd, proc->pid, proc->tgid, flagsVal,
+                 reinterpret_cast<uint64_t>(ep));
     return fd;
 }
 
