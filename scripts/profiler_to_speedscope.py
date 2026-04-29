@@ -74,8 +74,9 @@ def resolve_rip(rip, syms, sorted_addrs):
 
 # Regex for sample lines: P <tick> <pid_hex> <cpu> <flags> <rip0;rip1;...>
 SAMPLE_RE = re.compile(r'^P (\d+) ([0-9a-fA-F]{1,4}) (\d+) (\d) (.+)$')
-# Regex for context-switch lines: CS <tick> <cpu> <old_pid_hex> <new_pid_hex>
-CS_RE = re.compile(r'^CS (\d+) (\d+) ([0-9a-fA-F]{1,4}) ([0-9a-fA-F]{1,4})$')
+# Regex for context-switch lines: CS <tick> <cpu> <old_pid_hex> <new_pid_hex> [<rip0;rip1;...>]
+# The trailing stack is the OUTGOING process's kernel callstack at yield.
+CS_RE = re.compile(r'^CS (\d+) (\d+) ([0-9a-fA-F]{1,4}) ([0-9a-fA-F]{1,4})(?: (.+))?$')
 
 
 def parse_serial_log(path):
@@ -128,7 +129,9 @@ def parse_serial_log(path):
                     cpu      = int(m.group(2))
                     old_pid  = int(m.group(3), 16)
                     new_pid  = int(m.group(4), 16)
-                    context_switches.append((tick, cpu, old_pid, new_pid))
+                    rip_str  = m.group(5)
+                    cs_stack = [int(r, 16) for r in rip_str.split(';') if r] if rip_str else []
+                    context_switches.append((tick, cpu, old_pid, new_pid, cs_stack))
 
     return cpuCount, startTick, samples, context_switches, dropped
 
@@ -326,8 +329,8 @@ def main():
     # was running at each point.  Each CS event ends the previous PID's slice
     # and starts the new one.  Weight = duration of the slice in ticks (≈ ms).
     by_cs_cpu = defaultdict(list)
-    for tick, cpu, old_pid, new_pid in sorted(context_switches):
-        by_cs_cpu[cpu].append((tick, old_pid, new_pid))
+    for tick, cpu, old_pid, new_pid, cs_stack in sorted(context_switches):
+        by_cs_cpu[cpu].append((tick, old_pid, new_pid, cs_stack))
 
     for cpu in sorted(by_cs_cpu.keys()):
         events = by_cs_cpu[cpu]
@@ -336,7 +339,7 @@ def main():
         ss = []
         weights = []
         prev_tick = events[0][0]
-        for i, (tick, old_pid, new_pid) in enumerate(events):
+        for i, (tick, old_pid, new_pid, cs_stack) in enumerate(events):
             # Slice weight = ticks since last switch
             w = max(tick - prev_tick, 1)
             ss.append([[get_cs_frame(old_pid)]])
@@ -362,7 +365,8 @@ def main():
     # Summary: per-PID time spent running (from CS events)
     pid_run_ms = defaultdict(int)
     for cpu_events in by_cs_cpu.values():
-        for i, (tick, old_pid, new_pid) in enumerate(cpu_events):
+        for i, ev in enumerate(cpu_events):
+            tick = ev[0]
             if i > 0:
                 prev = cpu_events[i-1]
                 pid_run_ms[prev[2]] += tick - prev[0]
@@ -370,6 +374,26 @@ def main():
         print("\nPID run time from context switches (ticks ≈ ms):")
         for pid, ms in sorted(pid_run_ms.items(), key=lambda x: -x[1]):
             print(f"  {pid_label(pid):12s} {ms:6d} ms")
+
+    # Per-PID yield-stack histogram: when a PID context-switches OUT, what
+    # kernel call site did it yield from? Top entries point at the blocking
+    # primitive each PID is parked on (KMutex, futex, VirtioBlk poll, etc.).
+    yield_stacks = defaultdict(lambda: defaultdict(int))
+    for cpu_events in by_cs_cpu.values():
+        for tick, old_pid, new_pid, cs_stack in cpu_events:
+            if cs_stack:
+                # Use leaf RIP as the bucketing key.
+                yield_stacks[old_pid][cs_stack[0]] += 1
+    if yield_stacks:
+        print("\nTop yield sites per PID (where each pid kept context-switching out):")
+        for pid in sorted(yield_stacks.keys(),
+                          key=lambda p: -sum(yield_stacks[p].values()))[:20]:
+            sites = sorted(yield_stacks[pid].items(), key=lambda x: -x[1])
+            total = sum(c for _, c in sites)
+            top3 = sites[:3]
+            print(f"  {pid_label(pid):12s} ({total} CS):")
+            for rip, count in top3:
+                print(f"      0x{rip:016x}  x{count}")
 
     speedscope = {
         "$schema": "https://www.speedscope.app/file-format-schema.json",

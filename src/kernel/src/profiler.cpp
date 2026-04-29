@@ -195,7 +195,32 @@ void ProfilerContextSwitch(uint16_t oldPid, uint16_t newPid)
     s.cpu    = static_cast<uint8_t>(cpu);
     s.pid    = oldPid;
     s.newPid = newPid;
-    s.depth  = 0;
+
+    // Capture the outgoing process's kernel stack at the CS point. This is
+    // the most useful piece of data when investigating why a PID is stuck:
+    // the call chain shows which blocking primitive (KMutex, FutexWait,
+    // SchedulerBlock, VirtioBlk poll, etc.) the process is yielding into.
+    // Walks the same RBP frame chain as ProfilerSample's kernel path.
+    uint64_t rbp = reinterpret_cast<uint64_t>(__builtin_frame_address(0));
+    uint64_t leafRip = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+    s.rip[0] = leafRip;
+    uint8_t depth = 1;
+
+    constexpr uint64_t KERNEL_BASE = 0xffffffff80000000ULL;
+    constexpr uint64_t KERNEL_END  = 0xffffffffffffffffULL;
+    while (depth < MAX_STACK_DEPTH) {
+        if (rbp < KERNEL_BASE || rbp >= KERNEL_END - 16 || (rbp & 7) != 0)
+            break;
+        const uint64_t* frame = reinterpret_cast<const uint64_t*>(rbp);
+        uint64_t retAddr = frame[1];
+        if (retAddr < KERNEL_BASE || retAddr >= KERNEL_END)
+            break;
+        s.rip[depth++] = retAddr;
+        uint64_t nextRbp = frame[0];
+        if (nextRbp <= rbp) break;
+        rbp = nextRbp;
+    }
+    s.depth = depth;
 
     __atomic_store_n(&buf.writeIdx, nextWi, __ATOMIC_RELEASE);
 }
@@ -252,7 +277,10 @@ static uint32_t FormatEvent(const ProfileSample& s, char* buf)
     uint32_t p = 0;
 
     if (s.type == ProfileEventType::ContextSwitch) {
-        // CS <tick> <cpu> <old_pid_hex> <new_pid_hex>
+        // CS <tick> <cpu> <old_pid_hex> <new_pid_hex> [<rip0>;<rip1>;...]
+        // Stack frames are the OUTGOING process's kernel callstack at the
+        // point where it yielded — invaluable for diagnosing softlocks
+        // (shows which blocking primitive each process is parked on).
         buf[p++] = 'C'; buf[p++] = 'S'; buf[p++] = ' ';
         p = AppendDec(buf, p, s.tick);
         buf[p++] = ' ';
@@ -261,6 +289,13 @@ static uint32_t FormatEvent(const ProfileSample& s, char* buf)
         p = AppendHex4(buf, p, s.pid);
         buf[p++] = ' ';
         p = AppendHex4(buf, p, s.newPid);
+        if (s.depth > 0) {
+            buf[p++] = ' ';
+            for (uint8_t d = 0; d < s.depth; ++d) {
+                if (d > 0) buf[p++] = ';';
+                p = AppendHex16(buf, p, s.rip[d]);
+            }
+        }
         buf[p++] = '\n';
     } else {
         // P <tick> <pid_hex> <cpu> <flags> <rip0>;...;<ripN>

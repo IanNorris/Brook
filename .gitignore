@@ -69,3 +69,4 @@ doomgeneric_brook/doomgeneric
 doomgeneric_brook/doomgeneric.map
 profile*.txt\nprofile*.json\nprofile*.folded
 brook_disk.img.lock
+result
