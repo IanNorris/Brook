@@ -1199,9 +1199,25 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
         return nullptr;
     }
 
-    // Thread group: same tgid as parent, leader is parent's leader
+    // Thread group: inherit parent's tgid directly. We must NOT dereference
+    // parent->threadLeader to read leader->pid here — if the original group
+    // leader exited via plain sys_exit while threads were still running, that
+    // Process struct is freed and reading from it returns heap-poison
+    // (0xDFDF), corrupting tgid and panicking later in the signal-handler
+    // copy. parent->tgid is cached on every thread at creation, so it is
+    // always valid as long as parent itself is alive (which it must be — it
+    // is gCurrentProcess).
+    thread->tgid = parent->tgid;
     Process* leader = parent->threadLeader ? parent->threadLeader : parent;
-    thread->tgid = leader->pid;
+    // Defensive: validate the leader pointer with a magic check before
+    // storing it. If the leader was freed, fall back to parent so we don't
+    // propagate a dangling pointer to the new thread.
+    if (!leader || leader->magic != PROCESS_MAGIC)
+    {
+        SerialPrintf("THREAD: parent pid=%u has dangling leader, using parent\n",
+                     parent->pid);
+        leader = parent;
+    }
     thread->threadLeader = leader;
     thread->isThread = true;
 

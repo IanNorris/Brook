@@ -2892,6 +2892,23 @@ static int64_t sys_exit(uint64_t status, uint64_t, uint64_t,
                          uint64_t, uint64_t, uint64_t)
 {
     SerialPrintf("sys_exit: process exited with status %lu\n", status);
+
+    // If the thread group leader calls plain sys_exit while sibling threads
+    // are still alive, treat it as exit_group. Otherwise the leader's user
+    // page table is destroyed under live threads and other threads' cached
+    // threadLeader pointers become dangling references to freed memory
+    // (later reads return heap free-poison 0xDFDF). Linux zombifies the
+    // leader instead — for our hobby OS, killing the whole group is a
+    // simpler invariant that keeps shared resources consistent.
+    Process* proc = ProcessCurrent();
+    if (proc && proc->pid == proc->tgid && !proc->isThread)
+    {
+        // SchedulerKillThreadGroup is a no-op if no siblings exist, so we
+        // can call it unconditionally for the leader.
+        SchedulerKillThreadGroup(proc->tgid, proc,
+                                 static_cast<int>(status));
+    }
+
     SchedulerExitCurrentProcess(static_cast<int>(status));
     // never reached
     return 0;
