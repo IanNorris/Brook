@@ -3105,7 +3105,8 @@ static int64_t sys_fork(uint64_t, uint64_t, uint64_t,
 
     SchedulerAddProcess(child);
 
-    DbgPrintf("FORK: pid=%u forked child pid=%u\n", parent->pid, child->pid);
+    SerialPrintf("FORK: parent pid=%u tgid=%u -> child pid=%u tgid=%u\n",
+                 parent->pid, parent->tgid, child->pid, child->tgid);
     return static_cast<int64_t>(child->pid);
 }
 
@@ -3191,8 +3192,9 @@ static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAd
 
     SchedulerAddProcess(child);
 
-    DbgPrintf("CLONE: parent pid=%u -> child pid=%u flags=0x%lx rip=0x%lx rsp=0x%lx\n",
-                 parent->pid, child->pid, flags, userRip, userRsp);
+    SerialPrintf("CLONE: parent pid=%u tgid=%u -> child pid=%u tgid=%u flags=0x%lx %s rip=0x%lx rsp=0x%lx\n",
+                 parent->pid, parent->tgid, child->pid, child->tgid, flags,
+                 (flags & CLONE_THREAD) ? "THREAD" : "FORK", userRip, userRsp);
     return static_cast<int64_t>(child->pid);
 }
 
