@@ -116,6 +116,14 @@ static SchedLock g_allProcLock;
 // Next PID to allocate.
 static uint16_t g_nextPid = 1;
 
+// PID recycling: stack of freed pids in the [1, MAX_PROCESSES) range.
+// Without recycling g_nextPid grows unboundedly past MAX_PROCESSES, which
+// breaks any g_sigHandlers[tgid] / g_pidToProcess[tgid] indexing. We keep
+// PIDs bounded so signal-handler tables never overflow.
+static uint16_t g_pidFreeStack[MAX_PROCESSES];
+static uint32_t g_pidFreeCount = 0;
+static SchedLock g_pidLock;
+
 // Guard: timer ticks are ignored until SchedulerStart sets this.
 static volatile bool g_schedulerRunning = false;
 
@@ -425,6 +433,13 @@ void SchedulerAddProcess(Process* proc)
     uint64_t alf1 = SchedLockAcquire(g_allProcLock);
     if (g_processCount < MAX_PROCESSES)
         g_allProcesses[g_processCount++] = proc;
+    else
+    {
+        SchedLockRelease(g_allProcLock, alf1);
+        KernelPanic("SCHED: g_allProcesses full (MAX_PROCESSES=%u). "
+                    "Process '%s' pid=%u not registered.\n",
+                    MAX_PROCESSES, proc->name, proc->pid);
+    }
     SchedLockRelease(g_allProcLock, alf1);
 
     DbgPrintf("SCHED: added '%s' (pid %u) to ready queue\n",
@@ -448,6 +463,10 @@ void SchedulerRemoveProcess(Process* proc)
         }
     }
     SchedLockRelease(g_allProcLock, alf2);
+
+    if (proc->pid > 0 && proc->pid < SCHED_MAX_PIDS)
+        g_pidToProcess[proc->pid] = nullptr;
+    SchedulerFreePid(proc->pid);
 }
 
 void SchedulerBlock(Process* proc)
@@ -1273,7 +1292,33 @@ int ProcessSendSignalToGroup(uint16_t pgid, int signum)
 
 uint16_t SchedulerAllocPid()
 {
-    return g_nextPid++;
+    uint64_t f = SchedLockAcquire(g_pidLock);
+    uint16_t pid;
+    if (g_pidFreeCount > 0)
+    {
+        pid = g_pidFreeStack[--g_pidFreeCount];
+    }
+    else
+    {
+        pid = g_nextPid++;
+        if (pid >= MAX_PROCESSES)
+        {
+            SchedLockRelease(g_pidLock, f);
+            KernelPanic("SCHED: pid %u exceeds MAX_PROCESSES=%u and no "
+                        "freed pids available\n", pid, MAX_PROCESSES);
+        }
+    }
+    SchedLockRelease(g_pidLock, f);
+    return pid;
+}
+
+void SchedulerFreePid(uint16_t pid)
+{
+    if (pid == 0 || pid >= MAX_PROCESSES) return;
+    uint64_t f = SchedLockAcquire(g_pidLock);
+    if (g_pidFreeCount < MAX_PROCESSES)
+        g_pidFreeStack[g_pidFreeCount++] = pid;
+    SchedLockRelease(g_pidLock, f);
 }
 
 // Mark all threads in a thread group (same tgid) as terminated so they are

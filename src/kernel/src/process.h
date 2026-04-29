@@ -10,7 +10,7 @@ namespace brook {
 static constexpr uint32_t MAX_FDS = 256;
 
 // Maximum concurrent processes.
-static constexpr uint32_t MAX_PROCESSES = 64;
+static constexpr uint32_t MAX_PROCESSES = 256;
 
 // Program break limit (max heap size per process).
 static constexpr uint64_t PROGRAM_BREAK_SIZE = 64 * 1024 * 1024; // 64 MB

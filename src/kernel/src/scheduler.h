@@ -66,6 +66,7 @@ uint32_t SchedulerReadyCount();
 
 // Allocate a unique PID.
 uint16_t SchedulerAllocPid();
+void SchedulerFreePid(uint16_t pid);
 
 // Find a terminated child of parentPid. If pid == -1, any child; otherwise
 // matches a specific child PID. Returns the child Process* or nullptr.

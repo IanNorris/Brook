@@ -841,11 +841,18 @@ void ProcessDestroy(Process* proc)
     // Clear signal handler slot so the PID can be safely reused without
     // the next process inheriting our handler pointers (which would
     // reference user memory no longer mapped and cause a #PF on signal).
-    for (int s = 0; s < 64; ++s) {
-        g_sigHandlers[proc->tgid][s].handler = 0;
-        g_sigHandlers[proc->tgid][s].flags = 0;
-        g_sigHandlers[proc->tgid][s].restorer = 0;
-        g_sigHandlers[proc->tgid][s].mask = 0;
+    //
+    // Signal handlers are shared across all threads in a thread group
+    // (CLONE_SIGHAND semantics) and indexed by tgid. Only clear when
+    // the leader (pid == tgid) is destroyed, otherwise a thread exiting
+    // before the leader would wipe the still-live process's handlers.
+    if (proc->pid == proc->tgid) {
+        for (int s = 0; s < 64; ++s) {
+            g_sigHandlers[proc->tgid][s].handler = 0;
+            g_sigHandlers[proc->tgid][s].flags = 0;
+            g_sigHandlers[proc->tgid][s].restorer = 0;
+            g_sigHandlers[proc->tgid][s].mask = 0;
+        }
     }
 
     FreeProcessStruct(proc);

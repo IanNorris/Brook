@@ -236,11 +236,16 @@ static bool SubmitRequest(VirtioBlkState& s,
     VioWrite16(s.ioBase, VIRTIO_PCI_QUEUE_NOTIFY, 0);
 
     // Poll used ring until device consumes the request.
+    // Spin limit: 100M `pause` iterations. Under KVM each pause is ~10ns,
+    // so this is roughly 1 second of wall time. Heavy host load (e.g.
+    // multi-GB nix install streaming through gzip+xz+nar-unpack) can
+    // delay vcpu scheduling enough that 10M was too tight and we got
+    // spurious "timeout" failures mid-install.
     uint32_t spins = 0;
     while (*s.usedIdx == s.usedIdxShadow)
     {
         __asm__ volatile("pause");
-        if (++spins > 10000000u)
+        if (++spins > 100000000u)
         {
             SerialPuts("virtio-blk: timeout waiting for response\n");
             return false;
