@@ -1200,10 +1200,17 @@ static void pointer_enter_if_needed(struct brook_seat_client *sc,
     if (!sc || !sc->pointer) return;
     if (sc->entered_surface == s) return;
     if (sc->entered_surface && sc->entered_surface != s) {
-        wl_pointer_send_leave(sc->pointer, next_serial(),
-                              sc->entered_surface->resource);
-        if (wl_resource_get_version(sc->pointer) >= 5)
-            wl_pointer_send_frame(sc->pointer);
+        /* Defensive: only send leave if entered_surface still belongs to
+         * this seat's client.  If a previous surface was orphaned (client
+         * destroyed without scrubbing in time, or cross-client
+         * mis-tracking), libwayland aborts on a leave with an object from
+         * a different client.  Drop silently in that case. */
+        struct wl_resource *prev = sc->entered_surface->resource;
+        if (prev && wl_resource_get_client(prev) == sc->client) {
+            wl_pointer_send_leave(sc->pointer, next_serial(), prev);
+            if (wl_resource_get_version(sc->pointer) >= 5)
+                wl_pointer_send_frame(sc->pointer);
+        }
     }
     if (s) {
         wl_pointer_send_enter(sc->pointer, next_serial(), s->resource,
