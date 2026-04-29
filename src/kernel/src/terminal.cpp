@@ -1,6 +1,7 @@
 #include "terminal.h"
 #include "pipe.h"
 #include "process.h"
+#include "shell.h"
 #include "scheduler.h"
 #include "compositor.h"
 #include "window.h"
@@ -960,20 +961,53 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
         itoa(linesBuf, "LINES=",   t->rows);
     }
 
-    const char* bashEnvp[] = {
-        "HOME=/",
-        "PATH=/nix/profile/bin:/boot/BIN",
-        "TERM=linux",
-        "TERMINFO=/boot/TERMINFO",
-        "TERMINFO_DIRS=/boot/TERMINFO",
-        "PS1=$ ",
-        colsBuf,
-        linesBuf,
-        nullptr
-    };
+    // Build bash's environment by extending the kernel-shell defaults
+    // (SSL_CERT_FILE, WAYLAND_DISPLAY, GTK_*, FONTCONFIG_*, XDG_*, ...).
+    // Without this, bash and every program it spawns inherits a stripped
+    // env and TLS / fontconfig / wayland / GTK silently break.
+    //
+    // Per-terminal additions: COLUMNS, LINES, PS1, TERMINFO_DIRS, override
+    // PATH so /boot/BIN is searched.
+    const char* const* baseEnv  = ShellGetDefaultEnvp();
+    uint32_t            baseN   = ShellGetDefaultEnvpCount();
+
+    static constexpr uint32_t kExtra = 6;  // PS1, COLUMNS, LINES, TERMINFO_DIRS, TERMINFO override, PATH override
+    const char** bashEnvp = static_cast<const char**>(
+        kmalloc((baseN + kExtra + 1) * sizeof(const char*)));
+    if (!bashEnvp) {
+        kfree(elfData);
+        kfree(stdinPipe);
+        kfree(stdoutPipe);
+        kfree(t->vfb);
+        t->vfb = nullptr;
+        return -1;
+    }
+
+    uint32_t envIdx = 0;
+    // Copy base env, but skip entries we override (PATH, TERMINFO).
+    for (uint32_t i = 0; i < baseN; ++i) {
+        const char* e = baseEnv[i];
+        // Skip PATH= so we can put /boot/BIN first.
+        if (e[0]=='P'&&e[1]=='A'&&e[2]=='T'&&e[3]=='H'&&e[4]=='=') continue;
+        if (e[0]=='T'&&e[1]=='E'&&e[2]=='R'&&e[3]=='M'&&e[4]=='I'&&e[5]=='N'&&e[6]=='F'&&e[7]=='O'&&(e[8]=='='||e[8]=='_')) continue;
+        bashEnvp[envIdx++] = e;
+    }
+    // Terminal-specific additions
+    bashEnvp[envIdx++] = "PATH=/nix/profile/bin:"
+                      "/nix/store/xkqd49dmldkqn4xk6dlm640f5blbv6hp-curl-8.18.0-bin/bin:"
+                      "/nix/store/g6mlwdvpg92rchq352ll7jbi0pz7h43r-xz-5.8.2-bin/bin:"
+                      "/nix/store/v8sa6r6q037ihghxfbwzjj4p59v2x0pv-bash-5.3p9/bin:"
+                      "/boot/BIN:/boot/bin:/usr/bin:/bin";
+    bashEnvp[envIdx++] = "TERMINFO=/boot/TERMINFO";
+    bashEnvp[envIdx++] = "TERMINFO_DIRS=/boot/TERMINFO";
+    bashEnvp[envIdx++] = "PS1=$ ";
+    bashEnvp[envIdx++] = colsBuf;
+    bashEnvp[envIdx++] = linesBuf;
+    bashEnvp[envIdx]   = nullptr;
 
     Process* child = ProcessCreate(elfData, st.size, 1, bashArgv, 8, bashEnvp, stdFds);
     kfree(elfData);
+    kfree(bashEnvp);
 
     if (!child)
     {

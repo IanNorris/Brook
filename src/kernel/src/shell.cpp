@@ -75,7 +75,15 @@ static uint32_t g_spawnCount = 0;
 static bool g_scriptMode = false;
 
 // Default environment for spawned processes
-static const char* g_defaultEnvp[] = {
+//
+// Exposed via ShellGetDefaultEnvp() so other in-kernel spawners (e.g.
+// terminal.cpp -> bash) can extend rather than duplicate this list. Each
+// entry that matters for graphical apps (SSL_CERT_FILE, WAYLAND_DISPLAY,
+// XDG_*, GTK_*, FONTCONFIG_*) MUST come from a single source of truth; if
+// terminal.cpp inlined its own minimal envp, bash and its children would
+// run with a stripped-down environment and TLS / fontconfig / wayland
+// would silently break.
+const char* const g_defaultEnvp[] = {
     "HOME=/",
     "PATH=/nix/profile/bin:/nix/bin:"
           "/nix/store/xkqd49dmldkqn4xk6dlm640f5blbv6hp-curl-8.18.0-bin/bin:"
@@ -120,6 +128,15 @@ static const char* g_defaultEnvp[] = {
     "XDG_DATA_DIRS=/nix/store/5xrdnxfmz6fs3w5q4iyq1xd6gr6imgzf-brook-fonts-0.1/share:/usr/share",
     nullptr
 };
+
+const char* const* ShellGetDefaultEnvp() { return g_defaultEnvp; }
+
+uint32_t ShellGetDefaultEnvpCount()
+{
+    uint32_t n = 0;
+    while (g_defaultEnvp[n]) ++n;
+    return n;
+}
 
 // ---------------------------------------------------------------------------
 // String helpers (kernel has no libc)

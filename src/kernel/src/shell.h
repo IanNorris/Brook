@@ -33,4 +33,17 @@ int ShellExecScript(const char* path);
 // Never returns (runs until shutdown/reboot).
 [[noreturn]] void ShellInteractive();
 
+// Default environment block passed to every user-mode process spawned by
+// the shell.  Other in-kernel spawners (e.g. terminal.cpp launching bash)
+// MUST extend this rather than build their own — otherwise SSL_CERT_FILE,
+// WAYLAND_DISPLAY, XDG_*, GTK_*, FONTCONFIG_*, etc. silently disappear
+// from descendant processes' environments.
+//
+// Returns a NULL-terminated array of "KEY=VALUE" strings.
+const char* const* ShellGetDefaultEnvp();
+
+// Number of entries (excluding the terminating nullptr) in
+// ShellGetDefaultEnvp().
+uint32_t ShellGetDefaultEnvpCount();
+
 } // namespace brook
