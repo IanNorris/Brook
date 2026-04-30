@@ -292,8 +292,21 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
     ExcPutsRaw(" ("); ExcPutsRaw(name); ExcPutsRaw(")\n");
 
     // Print current process info if available.
+    // Defensive: cur could be a stale pointer if the panic is itself
+    // related to process-table corruption (BRO-005-style migration races,
+    // freed Process*, etc).  Validate it's a plausible kernel direct-map
+    // pointer and cap name printing to the field length, stopping at
+    // any non-printable byte.  Without this, a wild pointer floods the
+    // serial log with thousands of bytes of garbage and obscures the
+    // real diagnostics.
     brook::Process* cur = brook::ProcessCurrent();
-    if (cur) {
+    auto plausibleKernelPtr = [](const void* p) -> bool {
+        uint64_t v = reinterpret_cast<uint64_t>(p);
+        if (v < 0xffff800000000000ULL) return false;     // not high-half
+        if ((v & 0x7) != 0) return false;                // misaligned
+        return true;
+    };
+    if (cur && plausibleKernelPtr(cur)) {
         ExcPutsRaw(cpuTag); ExcPutsRaw("  PID   ");
         {
             char pbuf[6];
@@ -309,7 +322,18 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
             while (*p == '0' && p[1] != '\0') ++p;
             ExcPutsRaw(p);
         }
-        ExcPutsRaw(" ("); ExcPutsRaw(cur->name); ExcPutsRaw(")\n");
+        ExcPutsRaw(" (");
+        for (int i = 0; i < 32; i++) {
+            char ch = cur->name[i];
+            if (ch == '\0') break;
+            if (ch < 0x20 || ch > 0x7e) { ExcPutsRaw("?"); break; }
+            ExcPutCharRaw(ch);
+        }
+        ExcPutsRaw(")\n");
+    } else if (cur) {
+        ExcPutsRaw(cpuTag); ExcPutsRaw("  PID   <bogus Process* ");
+        ExcPutHex(reinterpret_cast<uint64_t>(cur));
+        ExcPutsRaw(">\n");
     }
 
     ExcPutsRaw(cpuTag); ExcPutsRaw("  RIP   "); ExcPutHex(frame->ip);
