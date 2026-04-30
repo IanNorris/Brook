@@ -2428,6 +2428,12 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         uint64_t vaddr = pickAddr();
         if (!vaddr) return -ENOMEM;
 
+        // Trace mmaps in Go's arena range so we can correlate with later faults.
+        if (vaddr >= 0x2d7700000000ULL && vaddr < 0x2d8000000000ULL) {
+            SerialPrintf("MMAP: pid=%u vaddr=0x%lx pages=%lu prot=0x%lx flags=0x%lx (anon)\n",
+                         proc->pid, vaddr, pages, prot, flags);
+        }
+
         // PROT_NONE anonymous mappings are pure reservations: do NOT back
         // them with physical pages.  Go's runtime reserves multi-GB arenas
         // up front with PROT_NONE and then mprotects sub-ranges to commit.
@@ -2645,6 +2651,11 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
     uint64_t pages = (len + 4095) / 4096;
     uint64_t newFlags = ProtToVmmFlags(prot);
 
+    if (addr >= 0x2d7700000000ULL && addr < 0x2d8000000000ULL) {
+        SerialPrintf("MPROTECT: pid=%u addr=0x%lx pages=%lu prot=0x%lx\n",
+                     proc->pid, addr, pages, prot);
+    }
+
     for (uint64_t i = 0; i < pages; ++i)
     {
         VirtualAddress va(addr + i * 4096);
@@ -2700,6 +2711,10 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t,
     if (!proc) return -ESRCH;
 
     uint64_t pages = (length + 4095) / 4096;
+
+    if (addr >= 0x2d7700000000ULL && addr < 0x2d8000000000ULL) {
+        SerialPrintf("MUNMAP: pid=%u addr=0x%lx pages=%lu\n", proc->pid, addr, pages);
+    }
 
     // Is this range a MemFd mmap? If so, unmap only — the physical pages
     // are kernel heap pages owned by the MemFd, not by the process.
