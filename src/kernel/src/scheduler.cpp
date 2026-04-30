@@ -793,6 +793,7 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
     __atomic_store_n(&oldProc->runningOnCpu, (int32_t)-1, __ATOMIC_RELEASE);
 
     g_perCpu[cpu].currentProcess = newProc;
+    if (g_perCpu[cpu].cpuEnv) g_perCpu[cpu].cpuEnv->currentPid = newProc->pid;
     newProc->state = ProcessState::Running;
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
 
@@ -1078,6 +1079,7 @@ parent_done:
     __atomic_store_n(&proc->runningOnCpu, (int32_t)-1, __ATOMIC_RELEASE);
 
     g_perCpu[cpu].currentProcess = next;
+    if (g_perCpu[cpu].cpuEnv) g_perCpu[cpu].cpuEnv->currentPid = next->pid;
     next->state = ProcessState::Running;
     __atomic_store_n(&next->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
@@ -1110,6 +1112,7 @@ parent_done:
     if (!first) first = g_perCpu[cpu].idleProcess;
 
     g_perCpu[cpu].currentProcess = first;
+    if (g_perCpu[cpu].cpuEnv) g_perCpu[cpu].cpuEnv->currentPid = first->pid;
     first->state = ProcessState::Running;
     __atomic_store_n(&first->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
@@ -1172,6 +1175,7 @@ parent_done:
     if (!first) first = g_perCpu[cpu].idleProcess;
 
     g_perCpu[cpu].currentProcess = first;
+    if (g_perCpu[cpu].cpuEnv) g_perCpu[cpu].cpuEnv->currentPid = first->pid;
     first->state = ProcessState::Running;
     __atomic_store_n(&first->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;

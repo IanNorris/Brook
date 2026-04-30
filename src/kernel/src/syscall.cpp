@@ -26,6 +26,7 @@
 #include "kvmclock.h"
 #include "audio.h"
 #include "profiler.h"
+#include "smp.h"
 
 // Forward declaration
 extern "C" __attribute__((naked)) void ReturnToKernel();
@@ -6274,11 +6275,22 @@ static int64_t sys_epoll_wait(uint64_t epfd, uint64_t eventsAddr,
 
     FdEntry* epfde = FdGet(proc, static_cast<int>(epfd));
     if (!epfde || epfde->type != FdType::EpollFd || !epfde->handle) {
+        // BRO-005 diagnostic: cross-check ProcessCurrent() against the pid
+        // the scheduler stamped into cpuEnv->currentPid (gs:40) at the most
+        // recent context switch. If these disagree, ProcessCurrent() is
+        // returning a stale per-CPU pointer and the bug is in the scheduler,
+        // not the fd table.
+        uint32_t curPidGs = 0;
+        __asm__ volatile("movl %%gs:40, %0" : "=r"(curPidGs));
+        Process* proc2 = ProcessCurrent();
         SerialPrintf("sys_epoll_wait: EBADF epfd=%lu pid=%u tgid=%u "
-                     "fde=%p type=%d handle=%p\n",
+                     "fde=%p type=%d handle=%p | cpu=%u gs:currentPid=%u "
+                     "proc=%p proc2=%p proc2pid=%u\n",
                      epfd, proc->pid, proc->tgid, epfde,
                      epfde ? static_cast<int>(epfde->type) : -1,
-                     epfde ? epfde->handle : nullptr);
+                     epfde ? epfde->handle : nullptr,
+                     SmpCurrentCpuIndex(), curPidGs,
+                     proc, proc2, proc2 ? proc2->pid : 0);
         return -EBADF;
     }
     auto* ep = static_cast<EpollInstance*>(epfde->handle);
