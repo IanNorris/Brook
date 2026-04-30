@@ -31,6 +31,35 @@
 extern "C" __attribute__((naked)) void ReturnToKernel();
 
 // ---------------------------------------------------------------------------
+// UserBufferReadable — verify [addr, addr+len) is fully mapped in the
+// current process's address space. Returns false if any page is unmapped
+// or if the range is in kernel space. Used to validate user-supplied
+// pointers before kernel reads, so a malicious/buggy user program can't
+// fault the kernel.
+// ---------------------------------------------------------------------------
+static bool UserBufferReadable(uint64_t addr, uint64_t len)
+{
+    if (len == 0) return true;
+    // Reject kernel addresses outright.
+    if (addr >= 0x0000800000000000ULL) return false;
+    uint64_t end;
+    if (__builtin_add_overflow(addr, len, &end)) return false;
+    if (end > 0x0000800000000000ULL) return false;
+
+    brook::Process* proc = brook::ProcessCurrent();
+    if (!proc) return false;
+
+    uint64_t first = addr & ~0xFFFULL;
+    uint64_t last  = (end - 1) & ~0xFFFULL;
+    for (uint64_t pg = first; pg <= last; pg += 4096)
+    {
+        if (!brook::VmmVirtToPhys(proc->pageTable, brook::VirtualAddress(pg)))
+            return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Random helpers: RDRAND with TSC fallback
 // ---------------------------------------------------------------------------
 
@@ -604,6 +633,11 @@ static constexpr uint32_t DSP_BUFFER_SIZE      = 65536; // 64KB staging buffer
 static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
                           uint64_t, uint64_t, uint64_t)
 {
+    // Validate the user buffer once, up front. EFAULT if any page in the
+    // range is unmapped — without this, a bad user pointer faults the kernel.
+    if (count > 0 && !UserBufferReadable(bufAddr, count))
+        return -EFAULT;
+
     // fd 3 = debug serial — writes directly, bypassing the async ring buffer.
     // Hold the serial lock across the entire write so multi-CPU output
     // doesn't interleave character-by-character.
