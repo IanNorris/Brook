@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <time.h>
 
 #define MAX_STR  (16 * 1024 * 1024)  /* 16MB max string/file-contents chunk */
 #define PATH_MAX_NAR 4096
@@ -242,14 +243,23 @@ int main(int argc, char **argv) {
 
     const char *dest = argv[1];
 
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
     /* Read and verify magic */
     expect("nix-archive-1");
 
     /* Parse root node */
     parse_node(dest);
 
-    fprintf(stderr, "nar-unpack: extracted to %s (%llu bytes read)\n",
-            dest, (unsigned long long)total_bytes);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long ms = (t1.tv_sec - t0.tv_sec) * 1000L
+            + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
+
+    fprintf(stderr, "nar-unpack: extracted to %s (%llu bytes, %ldms, %lluKB/s)\n",
+            dest, (unsigned long long)total_bytes, ms,
+            ms > 0 ? (unsigned long long)total_bytes / (unsigned long long)ms
+                   : 0ULL);
 
     return 0;
 }

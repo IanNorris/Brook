@@ -358,6 +358,11 @@ static char *narinfo_field(char *narinfo, const char *field, char *out, size_t o
 
 /* Run the download+decompress+unpack pipeline:
  *   curl <nar_url> | xz -d | nar-unpack <dest>
+ *
+ * Logs which stage finished first / last to identify the bottleneck.
+ * In a steady-state pipeline, all three run concurrently; the slowest
+ * is whichever exits last (children blocked on read upstream finish
+ * sooner; the slowest stage drains its pipe last).
  */
 static int download_and_extract(const char *nar_url, const char *compression,
                                  const char *dest) {
@@ -365,6 +370,7 @@ static int download_and_extract(const char *nar_url, const char *compression,
     snprintf(full_url, sizeof(full_url), "%s/%s", g_cache_url, nar_url);
 
     int use_xz = (strcmp(compression, "xz") == 0);
+    long t_start = now_ms();
 
     if (use_xz) {
         /* Three-stage pipeline: curl | xz -d | nar-unpack */
@@ -408,27 +414,23 @@ static int download_and_extract(const char *nar_url, const char *compression,
         close(pipe1[0]); close(pipe1[1]);
         close(pipe2[0]); close(pipe2[1]);
 
-        int status;
-        waitpid(pid_curl, &status, 0);
-        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-            fprintf(stderr, "nix-fetch: curl failed\n");
-            waitpid(pid_xz, &status, 0);
-            waitpid(pid_unpack, &status, 0);
-            return -1;
-        }
-
-        waitpid(pid_xz, &status, 0);
-        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-            fprintf(stderr, "nix-fetch: xz decompression failed\n");
-            waitpid(pid_unpack, &status, 0);
-            return -1;
-        }
-
-        waitpid(pid_unpack, &status, 0);
-        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-            fprintf(stderr, "nix-fetch: nar-unpack failed\n");
-            return -1;
-        }
+        /* Wait in pid order — wait() (any child) was unreliable here:
+         * one of three reaps would consistently miss, leaving nar-unpack
+         * still running when we returned (✓ Installed printed BEFORE
+         * the unpack actually finished — partial-state hazard). */
+        int curl_st = 0, xz_st = 0, unpack_st = 0;
+        waitpid(pid_curl,   &curl_st,   0); long t_curl   = now_ms() - t_start;
+        waitpid(pid_xz,     &xz_st,     0); long t_xz     = now_ms() - t_start;
+        waitpid(pid_unpack, &unpack_st, 0); long t_unpack = now_ms() - t_start;
+        int curl_rc   = WIFEXITED(curl_st)   ? WEXITSTATUS(curl_st)   : -1;
+        int xz_rc     = WIFEXITED(xz_st)     ? WEXITSTATUS(xz_st)     : -1;
+        int unpack_rc = WIFEXITED(unpack_st) ? WEXITSTATUS(unpack_st) : -1;
+        long t_total = now_ms() - t_start;
+        fprintf(stderr, "nix-fetch: timing pkg=%s total=%ldms curl=%ldms(rc=%d) xz=%ldms(rc=%d) unpack=%ldms(rc=%d)\n",
+                dest, t_total, t_curl, curl_rc, t_xz, xz_rc, t_unpack, unpack_rc);
+        if (curl_rc != 0)   { fprintf(stderr, "nix-fetch: curl failed\n");   return -1; }
+        if (xz_rc != 0)     { fprintf(stderr, "nix-fetch: xz failed\n");     return -1; }
+        if (unpack_rc != 0) { fprintf(stderr, "nix-fetch: nar-unpack failed\n"); return -1; }
 
     } else {
         /* Two-stage: curl | nar-unpack */
@@ -456,10 +458,16 @@ static int download_and_extract(const char *nar_url, const char *compression,
 
         close(pfd[0]); close(pfd[1]);
 
-        int status;
-        waitpid(pid_curl, &status, 0);
-        waitpid(pid_unpack, &status, 0);
-        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return -1;
+        long t_curl = -1, t_unpack = -1;
+        int curl_st = 0, unpack_st = 0;
+        waitpid(pid_curl,   &curl_st,   0); t_curl   = now_ms() - t_start;
+        waitpid(pid_unpack, &unpack_st, 0); t_unpack = now_ms() - t_start;
+        int curl_rc   = WIFEXITED(curl_st)   ? WEXITSTATUS(curl_st)   : -1;
+        int unpack_rc = WIFEXITED(unpack_st) ? WEXITSTATUS(unpack_st) : -1;
+        long t_total = now_ms() - t_start;
+        fprintf(stderr, "nix-fetch: timing pkg=%s total=%ldms curl=%ldms(rc=%d) unpack=%ldms(rc=%d)\n",
+                dest, t_total, t_curl, curl_rc, t_unpack, unpack_rc);
+        if (curl_rc != 0 || unpack_rc != 0) return -1;
     }
 
     return 0;
