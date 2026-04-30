@@ -8125,7 +8125,7 @@ extern "C" int64_t FutexWake(uint64_t uaddr, uint32_t maxWake)
 }
 
 static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
-                          uint64_t, uint64_t, uint64_t)
+                          uint64_t arg4, uint64_t arg5, uint64_t arg6)
 {
     int op = static_cast<int>(opVal) & ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
 
@@ -8180,8 +8180,16 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
         return 0;
     }
 
-    SerialPrintf("sys_futex: unsupported op=%d (raw=0x%lx) pid=%u\n",
-                 op, opVal, ProcessCurrent() ? ProcessCurrent()->pid : 0);
+    {
+        uint64_t userRip = 0, userRax = 0;
+        __asm__ volatile("movq %%gs:48, %0" : "=r"(userRip));
+        __asm__ volatile("movq %%gs:120, %0" : "=r"(userRax));
+        SerialPrintf("sys_futex: unsupported op=%d (raw=0x%lx) pid=%u rax=%lu rip=0x%lx "
+                     "uaddr=0x%lx val=0x%lx a4=0x%lx a5=0x%lx a6=0x%lx\n",
+                     op, opVal,
+                     ProcessCurrent() ? ProcessCurrent()->pid : 0,
+                     userRax, userRip, uaddrVal, val, arg4, arg5, arg6);
+    }
     return -ENOSYS;
 }
 
