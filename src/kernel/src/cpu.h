@@ -84,6 +84,20 @@ struct KernelCpuEnv {
     uint64_t syscallUserR8;    // [gs:152]
     uint64_t syscallUserR9;    // [gs:160]
     uint64_t syscallUserR10;   // [gs:168]
+
+    // Per-CPU "what cpu am I" — written once at SMP init.  Reading this
+    // through %gs (which is per-CPU thanks to SWAPGS) is atomic and
+    // immune to the migration race that plagues SmpCurrentCpuIndex():
+    // ApicGetId returns whichever CPU we're on at the *moment* it reads
+    // the LAPIC, but if a timer interrupt migrates us before the linear
+    // search completes, the cached myId points at the wrong CPU and we
+    // return a stale index.  gs:176 sidesteps that entirely.
+    uint64_t cpuIndex;         // [gs:176]
+    // Pointer to the Process currently scheduled on this CPU.  Mirrors
+    // g_perCpu[cpu].currentProcess, but reachable in one instruction
+    // (mov %gs:184, %rax) without going through ThisCpu().  Updated in
+    // every context-switch site alongside currentPid.
+    uint64_t currentProcess;   // [gs:184]
 };
 
 // Initialise SYSCALL/SYSRET MSRs.  Call after GdtInit().

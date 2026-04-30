@@ -149,9 +149,14 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             env->kernelRbp    = 0;
             env->kernelRsp    = 0;
             env->currentPid   = 0;  // kernel
+            env->cpuIndex     = 0;  // BSP is always CPU 0
+            env->currentProcess = 0;
 
             CpuSetKernelGsBase(env);
             g_kernelEnv = env;
+            // gs:176 now contains a valid cpuIndex (0 for BSP); enable
+            // the fast migration-safe SmpCurrentCpuIndex path.
+            brook::SmpEnableFastCpuIndex();
 
             // Set TSS.RSP0 so ring 3 → ring 0 exception transitions
             // use the syscall stack (SYSCALL itself uses LSTAR, not TSS).

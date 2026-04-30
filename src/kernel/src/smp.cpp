@@ -47,6 +47,7 @@ struct APDataBlock {
 static CpuInfo     g_cpus[MAX_CPUS];
 static uint32_t    g_cpuCount    = 0;
 static uint32_t    g_onlineCount = 0;
+static bool        g_smpReady    = false;
 
 // Volatile signal: set by AP to tell BSP it's alive.
 static volatile uint32_t g_apSignal = 0;
@@ -426,6 +427,7 @@ void SmpPrepareAPs()
         }
         env->syscallTable = SyscallGetTableAddress();
         env->selfPtr = reinterpret_cast<uint64_t>(env);
+        env->cpuIndex = i;
 
         g_apEnv[i] = env;
         SchedulerSetCpuEnv(i, env);
@@ -463,13 +465,38 @@ const CpuInfo* SmpGetCpu(uint32_t index)
 
 uint32_t SmpCurrentCpuIndex()
 {
-    uint8_t myId = ApicGetId();
-    for (uint32_t i = 0; i < g_cpuCount; ++i)
+    // gives each CPU its own gs base).  Previously we did:
+    //
+    //     uint8_t myId = ApicGetId();
+    //     for (i = 0; i < g_cpuCount; ++i)
+    //         if (g_cpus[i].apicId == myId) return i;
+    //
+    // ApicGetId is correct at the *moment* it reads the LAPIC, but if a
+    // timer interrupt migrates this thread between the read and the loop
+    // (or anywhere inside the loop) the cached myId points at the wrong
+    // CPU and we return a stale index — exactly the BRO-005 race that
+    // produced ProcessCurrent() returning a Process for a different CPU's
+    // thread.  Reading via gs is one instruction and immune to migration.
+    //
+    // Boot path: g_cpus[]/g_apEnv[] aren't populated until SmpInit runs.
+    // Until then, only the BSP is online and gs may not yet be set up,
+    // so the boot-time fast-path falls back to ApicGetId; SmpInit sets
+    // env->cpuIndex during AP prepare and the BSP is always CPU 0.
+    if (!g_smpReady)
     {
-        if (g_cpus[i].apicId == myId)
-            return i;
+        uint8_t myId = ApicGetId();
+        for (uint32_t i = 0; i < g_cpuCount; ++i)
+            if (g_cpus[i].apicId == myId) return i;
+        return 0;
     }
-    return 0;
+    uint64_t idx;
+    __asm__ volatile("movq %%gs:176, %0" : "=r"(idx));
+    return static_cast<uint32_t>(idx);
+}
+
+void SmpEnableFastCpuIndex()
+{
+    g_smpReady = true;
 }
 
 // ---------------------------------------------------------------------------

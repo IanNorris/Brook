@@ -793,7 +793,10 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
     __atomic_store_n(&oldProc->runningOnCpu, (int32_t)-1, __ATOMIC_RELEASE);
 
     g_perCpu[cpu].currentProcess = newProc;
-    if (g_perCpu[cpu].cpuEnv) g_perCpu[cpu].cpuEnv->currentPid = newProc->pid;
+    if (g_perCpu[cpu].cpuEnv) {
+        g_perCpu[cpu].cpuEnv->currentPid = newProc->pid;
+        g_perCpu[cpu].cpuEnv->currentProcess = reinterpret_cast<uint64_t>(newProc);
+    }
     newProc->state = ProcessState::Running;
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
 
@@ -1079,7 +1082,10 @@ parent_done:
     __atomic_store_n(&proc->runningOnCpu, (int32_t)-1, __ATOMIC_RELEASE);
 
     g_perCpu[cpu].currentProcess = next;
-    if (g_perCpu[cpu].cpuEnv) g_perCpu[cpu].cpuEnv->currentPid = next->pid;
+    if (g_perCpu[cpu].cpuEnv) {
+        g_perCpu[cpu].cpuEnv->currentPid = next->pid;
+        g_perCpu[cpu].cpuEnv->currentProcess = reinterpret_cast<uint64_t>(next);
+    }
     next->state = ProcessState::Running;
     __atomic_store_n(&next->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
@@ -1112,7 +1118,7 @@ parent_done:
     if (!first) first = g_perCpu[cpu].idleProcess;
 
     g_perCpu[cpu].currentProcess = first;
-    if (g_perCpu[cpu].cpuEnv) g_perCpu[cpu].cpuEnv->currentPid = first->pid;
+    if (g_perCpu[cpu].cpuEnv) { g_perCpu[cpu].cpuEnv->currentPid = first->pid; g_perCpu[cpu].cpuEnv->currentProcess = reinterpret_cast<uint64_t>(first); }
     first->state = ProcessState::Running;
     __atomic_store_n(&first->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
@@ -1175,7 +1181,7 @@ parent_done:
     if (!first) first = g_perCpu[cpu].idleProcess;
 
     g_perCpu[cpu].currentProcess = first;
-    if (g_perCpu[cpu].cpuEnv) g_perCpu[cpu].cpuEnv->currentPid = first->pid;
+    if (g_perCpu[cpu].cpuEnv) { g_perCpu[cpu].cpuEnv->currentPid = first->pid; g_perCpu[cpu].cpuEnv->currentProcess = reinterpret_cast<uint64_t>(first); }
     first->state = ProcessState::Running;
     __atomic_store_n(&first->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
@@ -1251,6 +1257,24 @@ void SchedulerInitApIdle(uint32_t cpuIndex)
 
 Process* ProcessCurrent()
 {
+    // Fast migration-safe path: gs:184 holds the Process* of whichever
+    // thread the *current* CPU is running.  Each CPU has its own gs base
+    // (set by SWAPGS at kernel entry), so this single instruction always
+    // returns *our* process — even if a timer interrupt migrates us
+    // between two unrelated reads of `cpu`.  Falling back through
+    // ThisCpu() + g_perCpu[] was the BRO-005 root cause: ApicGetId could
+    // be cached just before a migration, the loop would return a stale
+    // index, and we'd hand back a pointer to whoever was now running on
+    // the *previous* CPU.
+    //
+    // Boot path: gs base may not be set up yet, and currentProcess will
+    // read 0 — fall through to the array path so very-early callers
+    // (kernel init code that uses ProcessCurrent before scheduler is
+    // running) still work.
+    uint64_t cur;
+    __asm__ volatile("movq %%gs:184, %0" : "=r"(cur));
+    if (cur)
+        return reinterpret_cast<Process*>(cur);
     return g_perCpu[ThisCpu()].currentProcess;
 }
 

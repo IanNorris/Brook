@@ -35,6 +35,13 @@ const CpuInfo* SmpGetCpu(uint32_t index);
 // Get the current CPU's index (based on LAPIC ID).
 uint32_t SmpCurrentCpuIndex();
 
+// Enable fast (gs-based) CPU index lookup.  Call this *after* the BSP's
+// KernelCpuEnv is allocated, env->cpuIndex = 0 is written, and
+// CpuSetKernelGsBase has been called — i.e. once gs:176 is meaningful.
+// Before this is called, SmpCurrentCpuIndex falls back to the slower
+// (and migration-racy) ApicGetId-based lookup.
+void SmpEnableFastCpuIndex();
+
 // Halt all application processors via NMI broadcast.
 // Each AP's state (RIP, RSP, RBP) is captured in the NMI handler.
 // Returns the number of APs successfully halted.
