@@ -10,6 +10,7 @@
 #include "memory/heap.h"
 #include "memory/virtual_memory.h"
 #include "serial.h"
+#include "serial_writer.h"
 #include "vfs.h"
 
 namespace brook {
@@ -730,6 +731,12 @@ static void TerminalThreadFn(void* arg)
         }
 
         outPipe->readerWaiter = nullptr;
+
+        // Mirror raw terminal output (bash stdout/stderr) to the serial log
+        // so post-mortem debugging can see what the user saw on screen,
+        // including ANSI escape sequences. The async writer is non-blocking
+        // and drops excess if the ring fills, which is fine for a mirror.
+        brook::SerialWriterEnqueue(buf, n);
 
         // Process each byte
         for (uint32_t i = 0; i < n; i++)

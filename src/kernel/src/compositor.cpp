@@ -120,7 +120,7 @@ static void PresentStatsReport()
 {
     uint64_t now = g_lapicTickCount;
     if (g_presentLastReportTick == 0) g_presentLastReportTick = now;
-    if (now - g_presentLastReportTick < 5000) return;
+    if (now - g_presentLastReportTick < 50000) return;
     g_presentLastReportTick = now;
 
     uint32_t n = g_presentStatsFilled;

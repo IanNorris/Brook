@@ -1538,6 +1538,54 @@ void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
 // TCP implementation — delegates to tcp.cpp state machine
 // ---------------------------------------------------------------------------
 
+// TCP TX/RX rollup: aggregate per-segment counters and flush a one-line
+// summary every 5s. Per-packet logs were drowning the serial log during
+// bulk transfers (e.g. speedtest-go).
+namespace {
+    struct TcpStats {
+        uint32_t txPkts;
+        uint32_t rxPkts;
+        uint64_t txBytes;
+        uint64_t rxBytes;
+        uint32_t txAcks;
+        uint32_t rxAcks;
+    };
+    TcpStats g_tcpStats = {};
+    uint64_t g_tcpStatsLastTick = 0;
+}
+
+static void TcpStatsRecord(bool tx, uint8_t flags, uint32_t dataLen)
+{
+    bool isPureAck = (flags & ~TCP_ACK) == 0 && dataLen == 0;
+    if (tx) {
+        g_tcpStats.txPkts++;
+        g_tcpStats.txBytes += dataLen;
+        if (isPureAck) g_tcpStats.txAcks++;
+    } else {
+        g_tcpStats.rxPkts++;
+        g_tcpStats.rxBytes += dataLen;
+        if (isPureAck) g_tcpStats.rxAcks++;
+    }
+}
+
+static void TcpStatsMaybeFlush()
+{
+    extern volatile uint64_t g_lapicTickCount;
+    uint64_t now = g_lapicTickCount;
+    if (g_tcpStatsLastTick == 0) g_tcpStatsLastTick = now;
+    if (now - g_tcpStatsLastTick < 5000) return;
+    if (g_tcpStats.txPkts == 0 && g_tcpStats.rxPkts == 0) {
+        g_tcpStatsLastTick = now;
+        return;
+    }
+    SerialPrintf("tcp: stats t=%lums TX %u pkts (%u acks) %lu B  RX %u pkts (%u acks) %lu B\n",
+                 now, g_tcpStats.txPkts, g_tcpStats.txAcks,
+                 g_tcpStats.txBytes, g_tcpStats.rxPkts,
+                 g_tcpStats.rxAcks, g_tcpStats.rxBytes);
+    g_tcpStats = {};
+    g_tcpStatsLastTick = now;
+}
+
 static void TcpSendSegment(Socket& s, uint8_t flags,
                            const void* data, uint32_t dataLen,
                            const char* why)
@@ -1588,13 +1636,12 @@ static void TcpSendSegment(Socket& s, uint8_t flags,
         SerialPrintf("tcp: send failed flags=0x%02x err=%d\n", flags, sendResult);
     } else {
         s.txPktCount++;
-        // Always log control segments (SYN/FIN/RST/PSH) and anything carrying
-        // payload. Throttle pure ACKs (flags == ACK only, datalen == 0) the
-        // same way we throttle RX: first 50, then every 100. During a bulk
-        // download we emit thousands of pure ACKs and they drown the log.
-        bool isPureAck = (flags == 0x10) && (dataLen == 0);
-        bool log = !isPureAck || s.txPktCount <= 50 || (s.txPktCount % 100) == 0;
-        if (log) {
+        TcpStatsRecord(/*tx=*/true, flags, dataLen);
+        // Control segments (SYN/FIN/RST) are still logged inline because they
+        // mark connection state transitions worth seeing in real time. Pure
+        // ACKs and data segments roll up into the 5s summary instead.
+        bool isControl = (flags & (TCP_SYN | TCP_FIN | TCP_RST)) != 0;
+        if (isControl) {
             extern volatile uint64_t g_lapicTickCount;
             int sockIdx = static_cast<int>(&s - g_sockets);
             SerialPrintf("tcp: TX pid=%u sock=%d t=%lums flags=0x%02x seq=%u ack=%u datalen=%u why=%s [pkt#%u]\n",
@@ -1602,6 +1649,7 @@ static void TcpSendSegment(Socket& s, uint8_t flags,
                          s.tcpSndNxt, s.tcpRcvNxt, dataLen, why, s.txPktCount);
         }
     }
+    TcpStatsMaybeFlush();
 }
 
 // Append raw bytes to socket RX ring buffer.
@@ -1656,13 +1704,16 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         // fresh verbose logging (the old global static went silent after 3
         // packets from the first connection).
         s.rxPktCount++;
-        if (s.rxPktCount <= 50 || (s.rxPktCount % 100) == 0)
+        TcpStatsRecord(/*tx=*/false, flags, dataLen);
+        bool isControl = (flags & (TCP_SYN | TCP_FIN | TCP_RST)) != 0;
+        if (isControl)
         {
             extern volatile uint64_t g_lapicTickCount;
             int sockIdx = static_cast<int>(&s - g_sockets);
             SerialPrintf("tcp: RX pid=%u sock=%d t=%lums flags=0x%02x seq=%u ack=%u datalen=%u rcvNxt=%u [pkt#%u]\n",
                          s.ownerPid, sockIdx, g_lapicTickCount, flags, seq, ack, dataLen, s.tcpRcvNxt, s.rxPktCount);
         }
+        TcpStatsMaybeFlush();
 
         // Clamp incoming data to our actual free space so tcpRcvNxt stays
         // in sync with what we actually accept.  Without this, a full RX
