@@ -1005,6 +1005,45 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         SerialPrintf("[SIG] Delivering signal %u to pid %u (handler=0x%lx faultAddr=0x%lx)\n",
                      signum, proc->pid, sa.handler, cr2);
 
+        if (vector == 14 && cr2) {
+            static constexpr uint64_t DMAP_USR_PT = 0xFFFF800000000000ULL;
+            uint64_t cr3val = 0;
+            __asm__ volatile("movq %%cr3, %0" : "=r"(cr3val));
+            cr3val &= ~0xFFFULL;
+            uint64_t* p4 = reinterpret_cast<uint64_t*>(DMAP_USR_PT + cr3val);
+            uint64_t i4 = (cr2 >> 39) & 0x1FF, i3 = (cr2 >> 30) & 0x1FF;
+            uint64_t i2 = (cr2 >> 21) & 0x1FF, i1 = (cr2 >> 12) & 0x1FF;
+            uint64_t e4 = p4[i4], e3 = 0, e2 = 0, e1 = 0;
+            const char* missing = nullptr;
+            if (!(e4 & 1)) missing = "PML4";
+            else {
+                uint64_t* p3 = reinterpret_cast<uint64_t*>(DMAP_USR_PT + (e4 & 0x000FFFFFFFFFF000ULL));
+                e3 = p3[i3];
+                if (!(e3 & 1)) missing = "PDPT";
+                else if (e3 & (1ULL << 7)) {
+                    SerialPrintf("[SIG] PT walk cr2=0x%lx cr3=0x%lx PML4=0x%lx PDPT=0x%lx (1G page)\n",
+                                 cr2, cr3val, e4, e3);
+                } else {
+                    uint64_t* p2 = reinterpret_cast<uint64_t*>(DMAP_USR_PT + (e3 & 0x000FFFFFFFFFF000ULL));
+                    e2 = p2[i2];
+                    if (!(e2 & 1)) missing = "PD";
+                    else if (e2 & (1ULL << 7)) {
+                        SerialPrintf("[SIG] PT walk cr2=0x%lx cr3=0x%lx PML4=0x%lx PDPT=0x%lx PD=0x%lx (2M page)\n",
+                                     cr2, cr3val, e4, e3, e2);
+                    } else {
+                        uint64_t* p1 = reinterpret_cast<uint64_t*>(DMAP_USR_PT + (e2 & 0x000FFFFFFFFFF000ULL));
+                        e1 = p1[i1];
+                        if (!(e1 & 1)) missing = "PT";
+                        else SerialPrintf("[SIG] PT walk cr2=0x%lx cr3=0x%lx PML4=0x%lx PDPT=0x%lx PD=0x%lx PT=0x%lx (mapped)\n",
+                                          cr2, cr3val, e4, e3, e2, e1);
+                    }
+                }
+            }
+            if (missing)
+                SerialPrintf("[SIG] PT walk cr2=0x%lx cr3=0x%lx UNMAPPED at level %s (PML4=0x%lx PDPT=0x%lx PD=0x%lx PT=0x%lx)\n",
+                             cr2, cr3val, missing, e4, e3, e2, e1);
+        }
+
         // Mark that we're in a signal handler
         proc->inSignalHandler = true;
         proc->sigSavedMask = proc->sigMask;
