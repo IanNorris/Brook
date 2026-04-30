@@ -3887,8 +3887,8 @@ static int64_t sys_sched_yield(uint64_t, uint64_t, uint64_t,
 static int64_t sys_nanosleep(uint64_t reqAddr, uint64_t remAddr, uint64_t,
                               uint64_t, uint64_t, uint64_t)
 {
+    if (!UserBufferReadable(reqAddr, sizeof(timespec))) return -EFAULT;
     auto* req = reinterpret_cast<const timespec*>(reqAddr);
-    if (!req) return -EFAULT;
 
     uint64_t sleepMs = static_cast<uint64_t>(req->tv_sec) * 1000 +
                        static_cast<uint64_t>(req->tv_nsec) / 1000000;
@@ -3903,7 +3903,7 @@ static int64_t sys_nanosleep(uint64_t reqAddr, uint64_t remAddr, uint64_t,
         if (HasPendingSignals())
         {
             // Fill remainder if caller wants it
-            if (remAddr)
+            if (remAddr && UserBufferReadable(remAddr, sizeof(timespec)))
             {
                 auto* rem = reinterpret_cast<timespec*>(remAddr);
                 // Approximate remaining time (may be 0 if wakeup was near end)
@@ -3916,7 +3916,7 @@ static int64_t sys_nanosleep(uint64_t reqAddr, uint64_t remAddr, uint64_t,
         }
     }
 
-    if (remAddr)
+    if (remAddr && UserBufferReadable(remAddr, sizeof(timespec)))
     {
         auto* rem = reinterpret_cast<timespec*>(remAddr);
         rem->tv_sec = 0;
