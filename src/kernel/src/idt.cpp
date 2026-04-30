@@ -1002,28 +1002,8 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
     {
         const brook::KernelSigaction& sa = brook::g_sigHandlers[proc->tgid][signum - 1];
 
-        ExcPutsRaw("[SIG] Delivering signal ");
-        ExcPutCharRaw(static_cast<char>('0' + signum / 10));
-        ExcPutCharRaw(static_cast<char>('0' + signum % 10));
-        ExcPutsRaw(" to pid ");
-        {
-            char pbuf[6];
-            uint16_t pid = proc->pid;
-            pbuf[0] = static_cast<char>('0' + (pid / 10000) % 10);
-            pbuf[1] = static_cast<char>('0' + (pid / 1000) % 10);
-            pbuf[2] = static_cast<char>('0' + (pid / 100) % 10);
-            pbuf[3] = static_cast<char>('0' + (pid / 10) % 10);
-            pbuf[4] = static_cast<char>('0' + pid % 10);
-            pbuf[5] = '\0';
-            const char* p = pbuf;
-            while (*p == '0' && p[1] != '\0') ++p;
-            ExcPutsRaw(p);
-        }
-        ExcPutsRaw(" (handler=0x");
-        ExcPutHex(sa.handler);
-        ExcPutsRaw(" faultAddr=0x");
-        ExcPutHex(cr2);
-        ExcPutsRaw(")\n");
+        SerialPrintf("[SIG] Delivering signal %u to pid %u (handler=0x%lx faultAddr=0x%lx)\n",
+                     signum, proc->pid, sa.handler, cr2);
 
         // Mark that we're in a signal handler
         proc->inSignalHandler = true;
