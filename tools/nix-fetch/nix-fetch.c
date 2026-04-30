@@ -20,6 +20,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -146,6 +147,98 @@ static void narinfo_cache_save(const char *hash, const char *data, size_t len) {
     if (rename(tmp, path) < 0) unlink(tmp);
 }
 
+/* Monotonic milliseconds for ad-hoc timing instrumentation. */
+static long now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0) return 0;
+    return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+/* Batch-prefetch a set of narinfos in a single curl invocation.
+ *
+ * Each curl invocation pays ~1.2s for fork + DNS + TCP + TLS + HTTP +
+ * teardown.  Most of that is the TLS handshake.  By passing many URLs
+ * to a single curl, we amortise the handshake across all of them:
+ * curl reuses the HTTP/1.1 connection for every subsequent URL.
+ *
+ * We use curl's -K config-file syntax so each URL gets its own output
+ * file written directly into the narinfo cache.  Skips hashes that
+ * already exist on disk (no point re-fetching).  Failures here are
+ * non-fatal — the recursive walk will fall back to per-hash fetch if
+ * a cache lookup misses.
+ *
+ * Note: we deliberately do NOT pass "Connection: close" here (unlike
+ * single fetches) because we *want* connection reuse across URLs.
+ * curl will close cleanly at end of input.
+ */
+static void batch_prefetch_narinfos(char hashes[][33], int n) {
+    if (n <= 0 || g_cache_disabled) return;
+    narinfo_cache_init();
+    if (g_cache_disabled) return;
+
+    /* Build curl config file in /tmp.  Each entry: url= ... \n output= ... */
+    char cfg_path[MAX_PATH];
+    snprintf(cfg_path, sizeof(cfg_path), "/tmp/nix-fetch-batch-%d.cfg", (int)getpid());
+
+    FILE *f = fopen(cfg_path, "w");
+    if (!f) return;
+
+    int written = 0;
+    long t_build0 = now_ms();
+    for (int i = 0; i < n; i++) {
+        /* Skip if cache file already exists */
+        char cache_path[MAX_PATH];
+        narinfo_cache_path(hashes[i], cache_path, sizeof(cache_path));
+        if (access(cache_path, F_OK) == 0) continue;
+        fprintf(f, "url = \"%s/%s.narinfo\"\n", g_cache_url, hashes[i]);
+        fprintf(f, "output = \"%s\"\n", cache_path);
+        written++;
+    }
+    fclose(f);
+
+    if (written == 0) { unlink(cfg_path); return; }
+
+    fprintf(stderr, "nix-fetch: prefetching %d narinfo(s) in one curl...\n", written);
+    long t0 = now_ms();
+    pid_t pid = fork();
+    if (pid < 0) { unlink(cfg_path); return; }
+    if (pid == 0) {
+        /* No stdout capture — outputs go to per-URL files via config.
+         * -Z runs transfers in parallel (default cap 50, we limit via
+         * --parallel-max).  Each transfer is independent, with its own
+         * connection — we keep "Connection: close" so the server FINs
+         * promptly (the alternative, single connection reused
+         * sequentially, sits in recv() waiting for FINs that never
+         * come and burns the SockRecv hard-timeout repeatedly — measured
+         * 9s/narinfo vs the 1.2s baseline).
+         *
+         * Parallelism cap of 4 keeps load on cache.nixos.org modest
+         * while collapsing the wall-clock by ~4x in the typical case. */
+        if (g_cacert_path)
+            execlp(g_curl_path, "curl", "-4", "-sS", "--http1.1",
+                   "-Z", "--parallel-max", "4",
+                   "-H", "Connection: close",
+                   "--cacert", g_cacert_path, "-K", cfg_path, (char*)NULL);
+        else
+            execlp(g_curl_path, "curl", "-4", "-sS", "--http1.1",
+                   "-Z", "--parallel-max", "4",
+                   "-H", "Connection: close",
+                   "-K", cfg_path, (char*)NULL);
+        _exit(127);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    long t_done = now_ms();
+    int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    fprintf(stderr, "nix-fetch: batch prefetch %d narinfos: %ldms (build=%ldms curl exit=%d)\n",
+            written, t_done - t0, t0 - t_build0, code);
+    unlink(cfg_path);
+    /* Even on partial failure, individual file contents are intact:
+     * curl writes each output file as it streams; failed URLs leave
+     * either no file (404) or a partial file (network).  The
+     * subsequent fetch_package call will re-validate on cache hit. */
+}
+
 /* exec curl with optional --cacert; never returns on success */
 static void exec_curl(const char *url) {
     /* --http1.1 forces HTTP/1.1 via ALPN. With the default HTTP/2
@@ -201,6 +294,7 @@ static const char *find_binary(const char *env_var, const char *name,
 /* Run: curl -4 -sL <url> and capture output to buffer */
 static int curl_fetch(const char *url, char *buf, size_t bufsz) {
     int pfd[2];
+    long t0 = now_ms();
     if (pipe(pfd) < 0) { perror("pipe"); return -1; }
     pid_t pid = fork();
     if (pid < 0) { perror("fork"); return -1; }
@@ -213,16 +307,21 @@ static int curl_fetch(const char *url, char *buf, size_t bufsz) {
     }
 
     close(pfd[1]);
+    long t_fork = now_ms();
     size_t total = 0;
     ssize_t n;
     while (total < bufsz - 1 && (n = read(pfd[0], buf + total, bufsz - 1 - total)) > 0) {
         total += n;
     }
+    long t_read = now_ms();
     buf[total] = '\0';
     close(pfd[0]);
 
     int status;
     waitpid(pid, &status, 0);
+    long t_done = now_ms();
+    fprintf(stderr, "nix-fetch: timing url=%.40s fork=%ldms read=%ldms wait=%ldms total=%ldms bytes=%zu\n",
+            url, t_fork - t0, t_read - t_fork, t_done - t_read, t_done - t0, total);
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
         fprintf(stderr, "nix-fetch: curl exited with status %d (url: %s)\n", code, url);
@@ -379,6 +478,38 @@ static void fetch_dependencies(const char *refs_str) {
     char buf[4096];
     strncpy(buf, refs_str, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
+
+    /* First pass: collect every ref hash that isn't already on disk and
+     * isn't already in our cache, then issue a single batched curl to
+     * pull all of those narinfos at once.  Without this, the recursive
+     * walk pays one TLS handshake per dep (~1.2s).  With it, the whole
+     * closure shares a single connection — a large fraction of the
+     * narinfo phase collapses.  Recursive fetch_package calls below
+     * then hit the warm cache and avoid spawning curl entirely. */
+    {
+        char prefetch_hashes[64][33];
+        int prefetch_n = 0;
+        char scan_buf[4096];
+        memcpy(scan_buf, buf, sizeof(scan_buf));
+        char *sp = NULL;
+        char *t = strtok_r(scan_buf, " \t", &sp);
+        while (t && prefetch_n < 64) {
+            char *dash = strchr(t, '-');
+            size_t hlen = dash ? (size_t)(dash - t) : strlen(t);
+            if (hlen == 32) {
+                char h[33]; memcpy(h, t, 32); h[32] = '\0';
+                if (!hash_is_seen(h)) {
+                    char p[MAX_PATH];
+                    snprintf(p, sizeof(p), "%s/%s", g_store_dir, t);
+                    if (access(p, F_OK) != 0) {
+                        memcpy(prefetch_hashes[prefetch_n++], h, 33);
+                    }
+                }
+            }
+            t = strtok_r(NULL, " \t", &sp);
+        }
+        if (prefetch_n > 1) batch_prefetch_narinfos(prefetch_hashes, prefetch_n);
+    }
 
     char *saveptr = NULL;
     char *tok = strtok_r(buf, " \t", &saveptr);
