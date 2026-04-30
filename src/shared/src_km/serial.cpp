@@ -94,9 +94,17 @@ void SerialPutChar(char c)
     outb(COM1_DATA, static_cast<uint8_t>(c));
 }
 
+// Set by the panic path before printing the kernel exception dump.  When
+// non-zero, any normal SerialPuts call drops its output immediately.  This
+// prevents other CPUs that haven't yet been halted by SmpHaltAllAPs from
+// interleaving their SCHED/CLOSE/etc. messages into the panic register
+// dump and rendering it unreadable on the serial log.
+static volatile uint32_t g_panicInProgress = 0;
+
 void SerialPuts(const char* str)
 {
     if (!str) return;
+    if (__atomic_load_n(&g_panicInProgress, __ATOMIC_ACQUIRE)) return;
     SerialLockAcquire();
     while (*str) SerialPutChar(*str++);
     SerialLockRelease();
@@ -118,6 +126,11 @@ void SerialUnlock() { SerialLockRelease(); }
 // but safe since we're about to kill the process / halt).
 extern "C" void ExcForceSerialLock()
 {
+    // Mark panic in progress — silences SerialPuts/SerialPrintf on every
+    // other CPU so they can't garble the panic register dump while we
+    // wait for SmpHaltAllAPs to land.
+    __atomic_store_n(&brook::g_panicInProgress, 1, __ATOMIC_RELEASE);
+
     // Reset the ticket lock so no other CPU can acquire it.
     // Set serving = next = 0 atomically enough for our purposes.
     __atomic_store_n(&brook::g_serialLock.serving, 0, __ATOMIC_RELEASE);
@@ -277,6 +290,7 @@ void SerialVPrintf(const char* fmt, __builtin_va_list args)
 
 void SerialPrintf(const char* fmt, ...)
 {
+    if (__atomic_load_n(&g_panicInProgress, __ATOMIC_ACQUIRE)) return;
     __builtin_va_list args;
     __builtin_va_start(args, fmt);
     SerialLockAcquire();

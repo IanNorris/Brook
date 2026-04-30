@@ -726,6 +726,9 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         {
             for (;;) __asm__ volatile("cli; hlt");
         }
+        // Silence SerialPuts/SerialPrintf on other CPUs so concurrent
+        // SCHED/CLOSE/etc. messages don't interleave with this dump.
+        ExcForceSerialLock();
         // Print all GPRs before delegating — HandleException only gets basic frame
         ExcPutsRaw("\n=== KERNEL GPRs ===\n");
         ExcPutsRaw("  RAX "); ExcPutHex(ef->rax); ExcPutsRaw("  RBX "); ExcPutHex(ef->rbx); ExcPutsRaw("\n");
