@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -30,11 +31,18 @@
 
 static const char *g_cache_url  = "https://cache.nixos.org";
 static const char *g_store_dir  = "/nix/store";
+/* Persistent on-disk narinfo cache. cache.nixos.org narinfos are
+ * effectively immutable (they describe the contents of a fixed store
+ * path keyed by hash), so caching them on disk avoids one TLS handshake
+ * + curl fork/exec per closure walk. Each install of a package whose
+ * deps were already resolved becomes ~free. */
+static const char *g_narinfo_cache_dir = "/nix/var/cache/narinfo";
 static const char *g_curl_path  = NULL;
 static const char *g_cacert_path = NULL;
 static const char *g_xz_path    = NULL;
 static const char *g_unpack_path = NULL;
 static int g_fetch_deps = 0;
+static int g_cache_disabled = 0;  /* set to 1 if cache dir creation fails */
 
 /* Set of hashes already fetched or in-progress — prevents redundant downloads
  * when a package lists itself in its own References, or when the same dep
@@ -52,6 +60,90 @@ static int hash_is_seen(const char *hash) {
 static void hash_mark_seen(const char *hash) {
     if (g_seen_count < MAX_SEEN)
         memcpy(g_seen_hashes[g_seen_count++], hash, 33);
+}
+
+/* mkdir -p equivalent.  Returns 0 on success or if it already exists,
+ * -1 on real failure.  Walks each path component creating directories.
+ * Skips empty components and treats EEXIST as success. */
+static int mkdir_p(const char *path) {
+    char buf[MAX_PATH];
+    size_t len = strlen(path);
+    if (len == 0 || len >= sizeof(buf)) return -1;
+    memcpy(buf, path, len + 1);
+
+    for (size_t i = 1; i < len; i++) {
+        if (buf[i] == '/') {
+            buf[i] = '\0';
+            if (mkdir(buf, 0755) < 0 && errno != EEXIST) return -1;
+            buf[i] = '/';
+        }
+    }
+    if (mkdir(buf, 0755) < 0 && errno != EEXIST) return -1;
+    return 0;
+}
+
+/* Build the on-disk narinfo cache path for a hash.  Flat layout —
+ * fewer than ~hundreds of entries expected on a typical user's disk,
+ * sharding adds complexity for no measurable benefit. */
+static void narinfo_cache_path(const char *hash, char *out, size_t outsz) {
+    snprintf(out, outsz, "%s/%s.narinfo", g_narinfo_cache_dir, hash);
+}
+
+/* Lazily create the cache directory on first use.  If creation fails
+ * (read-only fs, no perms, etc.) flip g_cache_disabled so subsequent
+ * calls short-circuit. */
+static void narinfo_cache_init(void) {
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    if (mkdir_p(g_narinfo_cache_dir) < 0) {
+        fprintf(stderr, "nix-fetch: warning: cannot create cache dir %s: %s\n",
+                g_narinfo_cache_dir, strerror(errno));
+        g_cache_disabled = 1;
+    }
+}
+
+/* Read a cached narinfo from disk into buf.  Returns bytes read, 0
+ * if not cached, -1 on error.  We keep it simple: if the file exists
+ * and is parseable later, it's a hit. */
+static int narinfo_cache_load(const char *hash, char *buf, size_t bufsz) {
+    char path[MAX_PATH];
+    narinfo_cache_path(hash, path, sizeof(path));
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+
+    size_t total = 0;
+    ssize_t r;
+    while (total < bufsz - 1 &&
+           (r = read(fd, buf + total, bufsz - 1 - total)) > 0) {
+        total += (size_t)r;
+    }
+    close(fd);
+    if (total == 0) return 0;
+    buf[total] = '\0';
+    return (int)total;
+}
+
+/* Atomically write a narinfo to the cache.  Write to <path>.tmp then
+ * rename to avoid leaving partial files if we get killed mid-write. */
+static void narinfo_cache_save(const char *hash, const char *data, size_t len) {
+    narinfo_cache_init();
+    if (g_cache_disabled) return;
+
+    char path[MAX_PATH], tmp[MAX_PATH];
+    narinfo_cache_path(hash, path, sizeof(path));
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    size_t written = 0;
+    while (written < len) {
+        ssize_t w = write(fd, data + written, len - written);
+        if (w <= 0) { close(fd); unlink(tmp); return; }
+        written += (size_t)w;
+    }
+    close(fd);
+    if (rename(tmp, path) < 0) unlink(tmp);
 }
 
 /* exec curl with optional --cacert; never returns on success */
@@ -110,7 +202,6 @@ static const char *find_binary(const char *env_var, const char *name,
 static int curl_fetch(const char *url, char *buf, size_t bufsz) {
     int pfd[2];
     if (pipe(pfd) < 0) { perror("pipe"); return -1; }
-
     pid_t pid = fork();
     if (pid < 0) { perror("fork"); return -1; }
 
@@ -331,14 +422,33 @@ static int fetch_package(const char *hash) {
     char url[MAX_PATH];
     snprintf(url, sizeof(url), "%s/%s.narinfo", g_cache_url, hash);
 
-    printf("Fetching narinfo for %s...\n", hash);
-
     char narinfo[MAX_NARINFO];
-    int n = curl_fetch(url, narinfo, sizeof(narinfo));
-    if (n <= 0) {
-        fprintf(stderr, "nix-fetch: failed to fetch narinfo for %s\n", hash);
-        return -1;
+    int n = -1;
+    int from_cache = 0;
+
+    /* Try the on-disk cache first.  cache.nixos.org narinfos are
+     * immutable for a given hash, so a cache hit lets us skip the
+     * fork+exec curl + TLS handshake entirely — the major per-package
+     * cost when the closure walk hits a dep we've seen before in a
+     * previous run. */
+    if (!g_cache_disabled) {
+        n = narinfo_cache_load(hash, narinfo, sizeof(narinfo));
+        if (n > 0) from_cache = 1;
     }
+
+    if (n <= 0) {
+        printf("Fetching narinfo for %s...\n", hash);
+        n = curl_fetch(url, narinfo, sizeof(narinfo));
+        if (n <= 0) {
+            fprintf(stderr, "nix-fetch: failed to fetch narinfo for %s\n", hash);
+            return -1;
+        }
+        if (!g_cache_disabled)
+            narinfo_cache_save(hash, narinfo, (size_t)n);
+    } else {
+        printf("Cached narinfo for %s\n", hash);
+    }
+    (void)from_cache;
 
     char store_path[MAX_PATH], nar_url[MAX_PATH];
     char compression[64], references[4096];
