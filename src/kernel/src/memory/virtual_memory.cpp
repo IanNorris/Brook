@@ -27,6 +27,14 @@ static SpinLock g_vmmLock;
 // concurrent GetOrAllocEntry races on shared intermediate levels.
 static SpinLock g_kernelPtLock;
 
+// SMP lock protecting USER page table walks/modifications. Threads in the
+// same thread group share a page table; concurrent mmap's that fall in the
+// same 2 MB region can race on leaf PT page allocation, causing one
+// thread's PTE write to be silently lost. A single global lock here is
+// sub-optimal for SMP scaling but is correct; per-tgid locking is a
+// future optimisation. (BRO-003 root cause.)
+static SpinLock g_userPtLock;
+
 // The kernel's PML4 physical address, captured at init time.
 static PhysicalAddress g_kernelCR3{};
 
@@ -258,16 +266,17 @@ bool VmmMapPage(PageTable pt, VirtualAddress virtAddr, PhysicalAddress physAddr,
     // Strip the force flag before writing the PTE
     flags &= ~VMM_FORCE_MAP;
 
-    // Protect kernel page table walks from concurrent modification.
+    // Protect page table walks from concurrent modification. Both kernel
+    // and user paths can race when create=true allocates intermediate
+    // levels (PML4 → PDPT → PD → PT pages).
     bool isKernel = !pt;
-    uint64_t lf = 0;
-    if (isKernel)
-        lf = SpinLockAcquire(&g_kernelPtLock);
+    SpinLock& ptLock = isKernel ? g_kernelPtLock : g_userPtLock;
+    uint64_t lf = SpinLockAcquire(&ptLock);
 
     uint64_t* pte = WalkToPtr(pt, virtAddr, /*create=*/true, flags);
     if (!pte)
     {
-        if (isKernel) SpinLockRelease(&g_kernelPtLock, lf);
+        SpinLockRelease(&ptLock, lf);
         return false;
     }
 
@@ -279,16 +288,15 @@ bool VmmMapPage(PageTable pt, VirtualAddress virtAddr, PhysicalAddress physAddr,
          | (flags & VMM_NO_EXEC);
     Invlpg(virtAddr);
 
-    if (isKernel) SpinLockRelease(&g_kernelPtLock, lf);
+    SpinLockRelease(&ptLock, lf);
     return true;
 }
 
 void VmmUnmapPage(PageTable pt, VirtualAddress virtAddr)
 {
     bool isKernel = !pt;
-    uint64_t lf = 0;
-    if (isKernel)
-        lf = SpinLockAcquire(&g_kernelPtLock);
+    SpinLock& ptLock = isKernel ? g_kernelPtLock : g_userPtLock;
+    uint64_t lf = SpinLockAcquire(&ptLock);
 
     uint64_t* pte = WalkToPtr(pt, virtAddr, /*create=*/false);
     if (pte && (*pte & VMM_PRESENT))
@@ -297,7 +305,7 @@ void VmmUnmapPage(PageTable pt, VirtualAddress virtAddr)
         Invlpg(virtAddr);
     }
 
-    if (isKernel) SpinLockRelease(&g_kernelPtLock, lf);
+    SpinLockRelease(&ptLock, lf);
 }
 
 VirtualAddress VmmAllocPages(uint64_t pageCount, uint64_t flags, MemTag tag, uint16_t pid)
