@@ -16,6 +16,12 @@
 
 namespace brook {
 
+// Verbose tracing (per-file kernel debug prints).  Default off because each
+// SerialPrintf busy-waits the UART; in nix-install vlc, the not-found print
+// alone costs ~35s of UART time while holding g_ext2Lock.  Set true at
+// runtime to re-enable.
+bool g_kdebugTrace = false;
+
 // ---------------------------------------------------------------------------
 // On-disk structures (Linux ext2 format)
 // ---------------------------------------------------------------------------
@@ -1701,8 +1707,15 @@ static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
     }
 
     if (!ino) {
-        SerialPrintf("ext2: open '%s' → not found\n", relPath);
+        // Note: not-found is the common case for dynamic-linker probes
+        // (glibc-hwcaps + every entry on RPATH).  Logging each one was
+        // costing ~35s of UART busy-wait per nix-install while holding
+        // g_ext2Lock — visible as 96% idle, 3% disk, 0% userspace in
+        // a 240s nix-install vlc profile.  Gate behind g_kdebugTrace so
+        // callers that need it can re-enable at runtime.
         KMutexUnlock(&g_ext2Lock);
+        if (g_kdebugTrace)
+            SerialPrintf("ext2: open '%s' → not found\n", relPath);
         return nullptr;
     }
 
