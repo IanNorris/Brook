@@ -1027,6 +1027,14 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     FdEntry* fde = FdGet(proc, static_cast<int>(fd));
     if (!fde) return -EBADF;
 
+    // Validate user buffer up-front — every read path below ultimately
+    // writes to bufAddr. If the user munmapped or never mapped the range,
+    // a kernel #PF would be unrecoverable. UserBufferReadable confirms
+    // every page in [bufAddr, bufAddr+count) is mapped; user pages are
+    // always writable in our model so checking presence is sufficient.
+    if (count > 0 && !UserBufferReadable(bufAddr, count))
+        return -EFAULT;
+
     if (fde->type == FdType::Vnode && fde->handle)
     {
         auto* vn = static_cast<Vnode*>(fde->handle);
