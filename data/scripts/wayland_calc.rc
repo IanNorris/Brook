@@ -1,5 +1,5 @@
 # Brook Wayland calculator demo — render a static calculator UI.
 set wm
 set vfb none
-run /nix/store/qdcm0cay0hichmsb3f0wx4abrrkk2254-waylandd-brook-0.1-brook/bin/waylandd --seconds 30
+run /nix/bin/waylandd --seconds 30
 run /nix/store/qb338djrlcqq6748kksr0d4hgm2lyzfc-wayland-calc-brook-0.1-brook/bin/wayland-calc 20

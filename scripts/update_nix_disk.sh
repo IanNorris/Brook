@@ -90,6 +90,12 @@ if [ "${UPDATE_TOOLS}" -eq 1 ]; then
             echo "  xz -> /nix/bin/xz"
             break
         done
+        for d in "${MNTDIR}"/store/*-waylandd-brook-*; do
+            [ -x "$d/bin/waylandd" ] || continue
+            cp "$d/bin/waylandd" "${MNTDIR}/bin/waylandd"
+            echo "  waylandd -> /nix/bin/waylandd"
+            break
+        done
         for d in "${MNTDIR}"/store/*-nss-cacert-* "${MNTDIR}"/store/*-cacert-*; do
             [ -f "$d/etc/ssl/certs/ca-bundle.crt" ] || continue
             mkdir -p "${MNTDIR}/etc/ssl/certs"

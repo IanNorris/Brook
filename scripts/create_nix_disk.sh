@@ -257,6 +257,9 @@ if [ "${FUSE}" -eq 1 ]; then
             *-xz-*-bin)
                 [ -x "$p/bin/xz" ] && cp "$p/bin/xz" "${MOUNT_DIR}/bin/xz"
                 ;;
+            *-waylandd-brook-*)
+                [ -x "$p/bin/waylandd" ] && cp "$p/bin/waylandd" "${MOUNT_DIR}/bin/waylandd"
+                ;;
             *-nss-cacert-*|*-cacert-*)
                 if [ -f "$p/etc/ssl/certs/ca-bundle.crt" ]; then
                     mkdir -p "${MOUNT_DIR}/etc/ssl/certs"
@@ -297,6 +300,15 @@ else
     [ -f "${NAR_UNPACK}" ] && write_to_disk "${DISK_IMG}" "${NAR_UNPACK}" "bin/nar-unpack"
     symlink_on_disk "${DISK_IMG}" "bin/nix" "nix-install"
 
+    for p in ${CLOSURE}; do
+        base=$(basename "$p")
+        case "$base" in
+            *-waylandd-brook-*)
+                [ -x "$p/bin/waylandd" ] && write_to_disk "${DISK_IMG}" "$p/bin/waylandd" "bin/waylandd"
+                ;;
+        esac
+    done
+
     # Create /nix/index with package index
     mkdir_on_disk "${DISK_IMG}" "index"
     write_to_disk "${DISK_IMG}" "${INDEX_FILE}" "index/packages.idx"
@@ -310,7 +322,7 @@ echo ""
 echo "Nix store disk created: ${DISK_IMG}"
 echo "  Mount point: /nix (via BROOK.MNT)"
 echo "  Packages: ${PACKAGES[*]}"
-echo "  Tools: nix, nix-search, nix-install, nix-fetch, nar-unpack"
+echo "  Tools: nix, nix-search, nix-install, nix-fetch, nar-unpack, waylandd"
 echo "  Index: $(wc -l < "${INDEX_FILE}") packages"
 for pkg_path in "${ALL_PATHS[@]}"; do
     echo "  Test: run ${pkg_path}/bin/..."
