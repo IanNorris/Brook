@@ -23,7 +23,8 @@ extern "C" void context_switch(brook::SavedContext* oldCtx, brook::SavedContext*
                                 brook::FxsaveArea* oldFx, brook::FxsaveArea* newFx);
 
 // Futex wake — implemented in syscall.cpp, called for clear_child_tid on thread exit
-extern "C" int64_t FutexWake(uint64_t uaddr, uint32_t maxWake);
+extern "C" int64_t FutexWake(uint64_t uaddr, uint32_t maxWake,
+                              uint32_t wake_bitset = 0xFFFFFFFFu);
 
 // Enter user mode for the first time (existing function in syscall.cpp).
 namespace brook { void SwitchToUserMode(uint64_t userRsp, uint64_t userRip); }
@@ -86,6 +87,24 @@ static inline void SetSyscallStack(uint32_t cpuIdx, uint64_t stackTop)
 {
     if (g_perCpu[cpuIdx].cpuEnv)
         g_perCpu[cpuIdx].cpuEnv->syscallStack = stackTop;
+}
+
+static void CopyProcessNameForLog(const Process* proc, char out[33])
+{
+    if (!proc)
+    {
+        out[0] = '?';
+        out[1] = '\0';
+        return;
+    }
+
+    uint32_t i = 0;
+    for (; i < 32 && proc->name[i]; ++i)
+    {
+        char ch = proc->name[i];
+        out[i] = (ch >= 32 && ch <= 126) ? ch : '?';
+    }
+    out[i] = '\0';
 }
 
 // ---------------------------------------------------------------------------
@@ -255,7 +274,7 @@ void SchedulerInit()
     auto* idle = static_cast<Process*>(kmalloc(sizeof(Process)));
     __builtin_memset(idle, 0, sizeof(Process));
     idle->magic = PROCESS_MAGIC;
-    // Safe FPU/SSE defaults for fxrstor
+    // Safe x87/SSE defaults for xrstor
     idle->fxsave.data[0] = 0x7F; idle->fxsave.data[1] = 0x03;   // FCW = 0x037F
     idle->fxsave.data[24] = 0x80; idle->fxsave.data[25] = 0x1F; // MXCSR = 0x1F80
 
@@ -543,6 +562,12 @@ void SchedulerStop(Process* proc)
 
 void SchedulerUnblock(Process* proc)
 {
+    uint64_t procAddr = reinterpret_cast<uint64_t>(proc);
+    if (!proc || (procAddr >> 47) != 0x1FFFFULL)
+        return;
+    if (proc->magic != PROCESS_MAGIC)
+        return;
+
     uint64_t rlf4 = SchedLockAcquire(g_readyLock);
     // Accept Blocked or Stopped processes for unblocking/resuming
     if (proc->state != ProcessState::Blocked && proc->state != ProcessState::Stopped)
@@ -634,6 +659,19 @@ static void CheckBlockedWakeups()
 // Reap terminated processes.
 static volatile uint32_t g_reapInProgress = 0;
 
+static bool ThreadGroupHasLivePeerLocked(Process* proc)
+{
+    if (!proc) return false;
+    for (uint32_t i = 0; i < g_processCount; ++i)
+    {
+        Process* p = g_allProcesses[i];
+        if (p && p != proc && p->tgid == proc->tgid
+            && p->state != ProcessState::Terminated)
+            return true;
+    }
+    return false;
+}
+
 static void ReapTerminated()
 {
     // Guard against re-entry: if PmmKillPid→SerialPrintf→serial-lock-sti
@@ -650,6 +688,12 @@ static void ReapTerminated()
             && __atomic_load_n(&p->reapable, __ATOMIC_ACQUIRE)
             && p != g_perCpu[cpu].currentProcess)
         {
+            if (!p->isThread && ThreadGroupHasLivePeerLocked(p))
+            {
+                ++i;
+                continue;
+            }
+
             // If parentPid != 0, check if the parent still exists.
             // If the parent is gone, reparent to 0 so we can reap.
             if (p->parentPid != 0)
@@ -806,12 +850,12 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
     GdtSetTssRsp0ForCpu(cpu, newProc->kernelStackTop);
     SetSyscallStack(cpu, newProc->kernelStackTop);
 
-    // Validate FxsaveArea alignment.
+    // Validate XSAVE area alignment.
     auto oldFxAddr = reinterpret_cast<uintptr_t>(&oldProc->fxsave);
     auto newFxAddr = reinterpret_cast<uintptr_t>(&newProc->fxsave);
-    if ((oldFxAddr & 0xF) || (newFxAddr & 0xF))
+    if ((oldFxAddr & 0x3F) || (newFxAddr & 0x3F))
     {
-        SerialPrintf("SCHED FATAL: FxsaveArea misaligned! old=%p new=%p\n",
+        SerialPrintf("SCHED FATAL: XSAVE area misaligned! old=%p new=%p\n",
                      (void*)oldFxAddr, (void*)newFxAddr);
         for (;;) __asm__ volatile("hlt");
     }
@@ -824,7 +868,7 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
     DrainPostSwitch(ThisCpu());
 }
 
-void SchedulerTimerTick()
+void SchedulerTimerTick(bool allowPreempt)
 {
     if (!g_schedulerRunning)
         return;
@@ -875,6 +919,13 @@ void SchedulerTimerTick()
             DoSwitch(cur, next);
         return;
     }
+
+    // Brook currently treats kernel code as non-preemptible. Timer ticks still
+    // sample, account, wake sleepers, and dispatch away from idle, but a tick
+    // that interrupted a syscall/driver path must not deschedule the process
+    // while it owns filesystem, VFS, or device-driver locks.
+    if (!allowPreempt)
+        return;
 
     // Check timeslice (per-process, from policy module).
     uint64_t timeslice = g_schedOps->Timeslice(g_schedState, cur->pid);
@@ -979,13 +1030,15 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
 {
     uint32_t cpu = ThisCpu();
     Process* proc = g_perCpu[cpu].currentProcess;
+    char procName[33];
+    CopyProcessNameForLog(proc, procName);
     if (status != 0) {
         SerialPrintf("SCHED: '%s' (pid %u, tgid %u) exited with status %d%s\n",
-                     proc->name, proc->pid, proc->tgid, status,
+                     procName, proc->pid, proc->tgid, status,
                      proc->isThread ? " [thread]" : "");
     } else {
         DbgPrintf("SCHED: '%s' (pid %u, tgid %u) exited with status %d%s\n",
-                  proc->name, proc->pid, proc->tgid, status,
+                  procName, proc->pid, proc->tgid, status,
                   proc->isThread ? " [thread]" : "");
     }
 
@@ -1013,11 +1066,25 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
         }
     }
 
-    // Only do full process cleanup for non-thread (group leader) processes
+    bool hasLiveThreadPeer = false;
     if (!proc->isThread)
     {
-        // Close all FDs immediately so pipe readers/writers get unblocked.
-        ProcessCloseAllFds(proc);
+        uint64_t alf = SchedLockAcquire(g_allProcLock);
+        hasLiveThreadPeer = ThreadGroupHasLivePeerLocked(proc);
+        SchedLockRelease(g_allProcLock, alf);
+    }
+
+    // Only do full process cleanup for non-thread (group leader) processes
+    // after all sibling threads are gone. A plain sys_exit from the leader does
+    // not terminate the thread group, and shared fds/address-space state must
+    // remain valid for still-running pthreads.
+    if (!proc->isThread)
+    {
+        if (!hasLiveThreadPeer)
+        {
+            // Close all FDs immediately so pipe readers/writers get unblocked.
+            ProcessCloseAllFds(proc);
+        }
 
         // Reparent any children of this process to init (parentPid=0).
         {
