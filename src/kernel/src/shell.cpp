@@ -96,6 +96,8 @@ const char* const g_defaultEnvp[] = {
     "LOGNAME=root",
     "SSL_CERT_FILE=/nix/etc/ssl/certs/ca-bundle.crt",
     "CURL_CA_BUNDLE=/nix/etc/ssl/certs/ca-bundle.crt",
+    "ALSA_CONFIG_PATH=/nix/etc/asound.conf",
+    "TZ=UTC0",
     "NETSURFRES=/nix/store/m64fp6340nd6s98fawnwvvkx4v81660k-netsurf-brook-3.11-brook/share/netsurf/",
     "WAYLAND_DISPLAY=wayland-0",
     "XDG_RUNTIME_DIR=/tmp",
@@ -122,6 +124,7 @@ const char* const g_defaultEnvp[] = {
     "GSETTINGS_BACKEND=memory",
     "GIO_USE_VFS=local",
     "NO_AT_BRIDGE=1",
+    "GIMP3_PLUGINDIR=/nix/share/gimp-lite",
     "XDG_CACHE_HOME=/tmp/cache",
     "XDG_CONFIG_HOME=/tmp/config",
     "XDG_DATA_HOME=/tmp/share",
@@ -365,7 +368,8 @@ static bool PeekShebang(const char* path, char* outInterp, uint32_t interpSize,
 // Spawn a process from a binary path with arguments
 // ---------------------------------------------------------------------------
 
-static Process* SpawnProcess(const char* path, int argc, const char* const* argv)
+static Process* SpawnProcess(const char* path, int argc, const char* const* argv,
+                             int32_t uidOverride = -1)
 {
     uint64_t elfSize = 0;
     uint8_t* elfBuf = LoadElf(path, &elfSize);
@@ -395,6 +399,23 @@ static Process* SpawnProcess(const char* path, int argc, const char* const* argv
     {
         KPrintf("shell: failed to create process from '%s'\n", path);
         return nullptr;
+    }
+
+    uint32_t ei = 0;
+    while (path[ei] && ei + 1 < sizeof(proc->exePath))
+    {
+        proc->exePath[ei] = path[ei];
+        ++ei;
+    }
+    proc->exePath[ei] = '\0';
+
+    if (uidOverride >= 0)
+    {
+        uint32_t uid = static_cast<uint32_t>(uidOverride);
+        proc->uid = uid;
+        proc->euid = uid;
+        proc->gid = uid;
+        proc->egid = uid;
     }
 
     // Name the process after the binary
@@ -865,12 +886,13 @@ static int ExecCommand(int argc, const char* const* argv)
         return 0;
     }
 
-    // Built-in: run [--as <name>] <path> [args...] — explicit run command
+    // Built-in: run [--as <name>] [--uid <uid>] <path> [args...] — explicit run command
     // --as overrides argv[0] for the spawned process (useful for busybox applets)
     if (StrEq(cmd, "run") && argc >= 2)
     {
         int pathIdx = 1;
         const char* argv0Override = nullptr;
+        int32_t uidOverride = -1;
         bool strace = false;
         bool runOnce = false;
 
@@ -878,6 +900,9 @@ static int ExecCommand(int argc, const char* const* argv)
         while (pathIdx < argc) {
             if (StrEq(argv[pathIdx], "--as") && pathIdx + 1 < argc) {
                 argv0Override = argv[pathIdx + 1];
+                pathIdx += 2;
+            } else if (StrEq(argv[pathIdx], "--uid") && pathIdx + 1 < argc) {
+                uidOverride = static_cast<int32_t>(ParseUint(argv[pathIdx + 1]));
                 pathIdx += 2;
             } else if (StrEq(argv[pathIdx], "--strace")) {
                 strace = true;
@@ -896,7 +921,7 @@ static int ExecCommand(int argc, const char* const* argv)
 
         if (pathIdx >= argc)
         {
-            KPrintf("usage: run [--as <name>] [--strace] [--once] <path> [args...]\n");
+            KPrintf("usage: run [--as <name>] [--uid <uid>] [--strace] [--once] <path> [args...]\n");
             return -1;
         }
 
@@ -972,11 +997,11 @@ static int ExecCommand(int argc, const char* const* argv)
             newArgv[0] = argv0Override;
             for (int i = 1; i < effArgc && i < 31; ++i)
                 newArgv[i] = effArgv[i];
-            proc = SpawnProcess(shebangPath, effArgc, newArgv);
+            proc = SpawnProcess(shebangPath, effArgc, newArgv, uidOverride);
         }
         else
         {
-            proc = SpawnProcess(shebangPath, effArgc, effArgv);
+            proc = SpawnProcess(shebangPath, effArgc, effArgv, uidOverride);
         }
 
         if (proc && strace) {

@@ -20,12 +20,59 @@ extern "C" {
 
 namespace brook {
 
-static constexpr uint8_t FATFS_MAX_DRIVES = 4;
+static constexpr uint8_t FATFS_MAX_DRIVES = FF_VOLUMES;
 static Device* g_fatfsDrives[FATFS_MAX_DRIVES] = {};
+
+static bool KernelPtrLooksCanonical(const void* ptr)
+{
+    uint64_t v = reinterpret_cast<uint64_t>(ptr);
+    return v != 0 && (v >> 47) == 0x1FFFFULL;
+}
+
+static bool FatFsDeviceReady(uint8_t pdrv, Device** out)
+{
+    if (out) *out = nullptr;
+    if (pdrv >= FATFS_MAX_DRIVES) return false;
+
+    Device* dev = g_fatfsDrives[pdrv];
+    bool registered = DeviceIsRegistered(dev);
+    const BlockDeviceOps* ops = (registered && KernelPtrLooksCanonical(dev->ops))
+        ? reinterpret_cast<const BlockDeviceOps*>(dev->ops)
+        : nullptr;
+    if (!registered || dev->type != DeviceType::Block || !ops ||
+        !ops->read || !ops->write || !ops->block_count || !ops->block_size)
+    {
+        static volatile uint32_t warnCount = 0;
+        uint32_t n = __atomic_fetch_add(&warnCount, 1, __ATOMIC_RELAXED);
+        if (n < 8 || (n & 0xFF) == 0)
+        {
+            SerialPrintf("FatFS: drive %u invalid dev=%p registered=%u ops=%p read=%p write=%p [#%u]\n",
+                         pdrv, dev, registered ? 1u : 0u,
+                         (registered && dev) ? dev->ops : nullptr,
+                         ops ? ops->read : nullptr,
+                         ops ? ops->write : nullptr,
+                         n);
+        }
+        return false;
+    }
+
+    if (out) *out = dev;
+    return true;
+}
 
 bool FatFsBindDrive(uint8_t pdrv, Device* dev)
 {
-    if (pdrv >= FATFS_MAX_DRIVES || !dev) return false;
+    bool registered = DeviceIsRegistered(dev);
+    const BlockDeviceOps* ops = (registered && KernelPtrLooksCanonical(dev->ops))
+        ? reinterpret_cast<const BlockDeviceOps*>(dev->ops)
+        : nullptr;
+    if (pdrv >= FATFS_MAX_DRIVES || !registered ||
+        dev->type != DeviceType::Block || !ops || !ops->read ||
+        !ops->write || !ops->block_count || !ops->block_size)
+    {
+        SerialPrintf("FatFS: refusing invalid drive %u dev=%p\n", pdrv, dev);
+        return false;
+    }
     g_fatfsDrives[pdrv] = dev;
     SerialPrintf("FatFS: drive %u → '%s'\n", pdrv, dev->name);
     return true;
@@ -41,23 +88,22 @@ extern "C" {
 
 DSTATUS disk_status(BYTE pdrv)
 {
-    if (pdrv >= brook::FATFS_MAX_DRIVES || !brook::g_fatfsDrives[pdrv])
+    if (!brook::FatFsDeviceReady(pdrv, nullptr))
         return STA_NOINIT | STA_NODISK;
     return 0; // drive present and initialised
 }
 
 DSTATUS disk_initialize(BYTE pdrv)
 {
-    if (pdrv >= brook::FATFS_MAX_DRIVES || !brook::g_fatfsDrives[pdrv])
+    if (!brook::FatFsDeviceReady(pdrv, nullptr))
         return STA_NOINIT;
     return 0;
 }
 
 DRESULT disk_read(BYTE pdrv, BYTE* buff, LBA_t sector, UINT count)
 {
-    if (pdrv >= brook::FATFS_MAX_DRIVES) return RES_PARERR;
-    brook::Device* dev = brook::g_fatfsDrives[pdrv];
-    if (!dev) return RES_NOTRDY;
+    brook::Device* dev = nullptr;
+    if (!brook::FatFsDeviceReady(pdrv, &dev)) return RES_NOTRDY;
 
     // FF_MIN_SS == FF_MAX_SS == 512, so block size is always 512.
     static constexpr uint32_t SECTOR_SIZE = 512;
@@ -70,9 +116,8 @@ DRESULT disk_read(BYTE pdrv, BYTE* buff, LBA_t sector, UINT count)
 
 DRESULT disk_write(BYTE pdrv, const BYTE* buff, LBA_t sector, UINT count)
 {
-    if (pdrv >= brook::FATFS_MAX_DRIVES) return RES_PARERR;
-    brook::Device* dev = brook::g_fatfsDrives[pdrv];
-    if (!dev) return RES_NOTRDY;
+    brook::Device* dev = nullptr;
+    if (!brook::FatFsDeviceReady(pdrv, &dev)) return RES_NOTRDY;
 
     static constexpr uint32_t SECTOR_SIZE = 512;
     uint64_t offset = static_cast<uint64_t>(sector) * SECTOR_SIZE;
@@ -84,9 +129,8 @@ DRESULT disk_write(BYTE pdrv, const BYTE* buff, LBA_t sector, UINT count)
 
 DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void* buff)
 {
-    if (pdrv >= brook::FATFS_MAX_DRIVES) return RES_PARERR;
-    brook::Device* dev = brook::g_fatfsDrives[pdrv];
-    if (!dev) return RES_NOTRDY;
+    brook::Device* dev = nullptr;
+    if (!brook::FatFsDeviceReady(pdrv, &dev)) return RES_NOTRDY;
 
     switch (cmd)
     {

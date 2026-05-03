@@ -139,6 +139,12 @@ extern "C" bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdr
 // f_unmount is called.  Returns true if a matching mount was found.
 extern "C" bool VfsUnmount(const char* mountPoint);
 
+// Enumerate root-level mount points (e.g. "boot" for /boot) so directory
+// listings of "/" can expose mounted filesystems even when the backing root
+// filesystem does not contain physical mount directories.
+uint32_t VfsRootMountCount();
+bool VfsRootMountNameAt(uint32_t index, char* out, uint32_t outSize);
+
 // Open a file or directory.  Caller owns the returned Vnode*; call VfsClose().
 // Returns nullptr on error.
 extern "C" Vnode* VfsOpen(const char* path, int flags = 0);

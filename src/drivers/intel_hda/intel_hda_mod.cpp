@@ -224,6 +224,8 @@ static uint64_t  g_bdlPhys = 0;
 static constexpr uint32_t NUM_FRAGMENTS   = 16;           // BDL entries (max 256)
 static constexpr uint32_t FRAG_SIZE       = 4096;        // 4KB each (= 1 page)
 static constexpr uint32_t AUDIO_BUF_SIZE  = NUM_FRAGMENTS * FRAG_SIZE; // 64KB total
+static constexpr uint32_t START_QUEUE_BYTES  = 8192;     // ~46ms at 44.1k stereo s16
+static constexpr uint32_t TARGET_QUEUE_BYTES = 24576;    // ~139ms; keeps latency bounded
 static uint8_t*  g_audioBuf = nullptr;
 static uint64_t  g_audioBufPhys = 0;
 static uint64_t  g_fragPhys[NUM_FRAGMENTS]; // per-fragment physical addresses
@@ -231,7 +233,11 @@ static uint64_t  g_fragPhys[NUM_FRAGMENTS]; // per-fragment physical addresses
 // Ring buffer state
 static uint32_t  g_writeFrag = 0;      // which fragment to write next
 static uint32_t  g_writeOffset = 0;    // offset within current fragment
+static uint64_t  g_submittedBytes = 0; // monotonically increasing write position
+static uint64_t  g_playedBytes = 0;    // monotonically increasing DMA position
+static uint32_t  g_lastLpib = 0;       // previous cyclic DMA position
 static bool      g_streamRunning = false;
+static volatile uint32_t g_playLock = 0;
 
 // Output stream descriptor offset (depends on GCAP)
 static uint32_t g_outStreamBase = 0;
@@ -258,6 +264,17 @@ static void BusyWait(uint32_t iters)
 {
     for (volatile uint32_t i = 0; i < iters; i++)
         __asm__ volatile("pause");
+}
+
+static void PlayLock()
+{
+    while (__atomic_exchange_n(&g_playLock, 1u, __ATOMIC_ACQUIRE))
+        SchedulerSleepMs(1);
+}
+
+static void PlayUnlock()
+{
+    __atomic_store_n(&g_playLock, 0u, __ATOMIC_RELEASE);
 }
 
 // ---------------------------------------------------------------------------
@@ -619,6 +636,9 @@ static bool SetupOutputStream(uint32_t sampleRate, uint8_t channels, uint8_t bit
         g_audioBuf[i] = 0;
     g_writeFrag = 0;
     g_writeOffset = 0;
+    g_submittedBytes = 0;
+    g_playedBytes = 0;
+    g_lastLpib = 0;
 
     // Record current format
     g_curRate = sampleRate;
@@ -635,6 +655,7 @@ static void StartOutputStream()
 {
     uint32_t sdBase = g_outStreamBase;
     uint8_t streamTag = 1;
+    g_lastLpib = hda_read32(sdBase + SD_LPIB) % AUDIO_BUF_SIZE;
     uint32_t ctl = (static_cast<uint32_t>(streamTag) << 20) | SD_CTL_IOCE | SD_CTL_RUN;
     hda_write32(sdBase + SD_CTL, ctl);
 }
@@ -646,6 +667,50 @@ static void StopOutputStream()
     ctl &= ~SD_CTL_RUN;
     hda_write32(sdBase + SD_CTL, ctl);
     BusyWait(1000);
+}
+
+static void UpdatePlayedBytesLocked()
+{
+    if (!g_streamRunning)
+        return;
+    uint32_t lpib = hda_read32(g_outStreamBase + SD_LPIB) % AUDIO_BUF_SIZE;
+    uint32_t delta = (lpib >= g_lastLpib)
+        ? (lpib - g_lastLpib)
+        : (AUDIO_BUF_SIZE - g_lastLpib + lpib);
+    g_lastLpib = lpib;
+    g_playedBytes += delta;
+    if (g_playedBytes > g_submittedBytes)
+        g_playedBytes = g_submittedBytes;
+}
+
+static uint32_t QueuedBytesLocked()
+{
+    UpdatePlayedBytesLocked();
+    uint64_t queued = g_submittedBytes - g_playedBytes;
+    if (queued > AUDIO_BUF_SIZE)
+        queued = AUDIO_BUF_SIZE;
+    return static_cast<uint32_t>(queued);
+}
+
+static void ResetPlaybackQueueLocked(bool reconfigure)
+{
+    if (g_streamRunning)
+        StopOutputStream();
+    g_streamRunning = false;
+    if (reconfigure)
+        SetupOutputStream(g_curRate ? g_curRate : 44100,
+                          g_curChannels ? g_curChannels : 2,
+                          g_curBits ? g_curBits : 16);
+    else
+    {
+        for (uint32_t i = 0; i < AUDIO_BUF_SIZE; i++)
+            g_audioBuf[i] = 0;
+        g_writeFrag = 0;
+        g_writeOffset = 0;
+        g_submittedBytes = 0;
+        g_playedBytes = 0;
+        g_lastLpib = 0;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -662,8 +727,14 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
                            uint8_t bitsPerSample, bool nonblock)
 {
     if (!g_initialized || !g_dacNid) return -1;
+    if (!samples || byteCount == 0) return 0;
+    uint32_t bytesPerSample = bitsPerSample / 8;
+    uint32_t frameBytes = bytesPerSample * channels;
+    if (bytesPerSample == 0 || channels == 0) return -1;
+    byteCount -= byteCount % frameBytes;
+    if (byteCount == 0) return 0;
 
-    uint32_t sdBase = g_outStreamBase;
+    PlayLock();
 
     // Full stream setup on first call or format change
     bool needSetup = !g_streamConfigured ||
@@ -676,8 +747,6 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
         if (g_streamRunning) StopOutputStream();
         g_streamRunning = false;
         SetupOutputStream(sampleRate, channels, bitsPerSample);
-        g_writeOffset = 0;
-        g_writeFrag = 0;
     }
 
     const uint8_t* src = static_cast<const uint8_t*>(samples);
@@ -685,71 +754,58 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
 
     while (totalWritten < byteCount)
     {
-        uint8_t* dst = g_audioBuf + (g_writeFrag * FRAG_SIZE);
+        uint32_t queued = QueuedBytesLocked();
+        if (g_streamRunning && queued == 0)
+        {
+            ResetPlaybackQueueLocked(true);
+            queued = 0;
+        }
 
-        // Fill remainder of current fragment
-        uint32_t space = FRAG_SIZE - g_writeOffset;
+        uint32_t capacity = TARGET_QUEUE_BYTES > queued ? TARGET_QUEUE_BYTES - queued : 0;
+        capacity -= capacity % frameBytes;
+        if (capacity == 0)
+        {
+            if (nonblock || totalWritten > 0)
+                break;
+            PlayUnlock();
+            SchedulerSleepMs(1);
+            PlayLock();
+            continue;
+        }
+
+        uint32_t ringPos = static_cast<uint32_t>(g_submittedBytes % AUDIO_BUF_SIZE);
         uint32_t chunk = byteCount - totalWritten;
-        if (chunk > space) chunk = space;
+        if (chunk > capacity) chunk = capacity;
+        uint32_t contiguous = AUDIO_BUF_SIZE - ringPos;
+        if (chunk > contiguous) chunk = contiguous;
+        chunk -= chunk % frameBytes;
+        if (chunk == 0)
+        {
+            if (nonblock || totalWritten > 0)
+                break;
+            PlayUnlock();
+            SchedulerSleepMs(1);
+            PlayLock();
+            continue;
+        }
 
         for (uint32_t i = 0; i < chunk; i++)
-            dst[g_writeOffset + i] = src[totalWritten + i];
-        g_writeOffset += chunk;
+            g_audioBuf[ringPos + i] = src[totalWritten + i];
+        g_submittedBytes += chunk;
         totalWritten += chunk;
 
-        // Fragment is full — advance to next
-        if (g_writeOffset >= FRAG_SIZE)
+        queued = QueuedBytesLocked();
+        g_writeFrag = static_cast<uint32_t>((g_submittedBytes % AUDIO_BUF_SIZE) / FRAG_SIZE);
+        g_writeOffset = static_cast<uint32_t>(g_submittedBytes % FRAG_SIZE);
+
+        if (!g_streamRunning && queued >= START_QUEUE_BYTES)
         {
-            uint32_t nextFrag = (g_writeFrag + 1) % NUM_FRAGMENTS;
-
-            if (!g_streamRunning)
-            {
-                // Pre-fill 4 fragments before starting DMA
-                g_writeFrag = nextFrag;
-                g_writeOffset = 0;
-
-                if (nextFrag >= 4)
-                {
-                    StartOutputStream();
-                    g_streamRunning = true;
-                }
-                continue;
-            }
-
-            // Wait for DMA to advance so we don't overwrite data being played.
-            {
-                bool ready = false;
-                int maxAttempts = nonblock ? 1 : 50;
-                for (int attempt = 0; attempt < maxAttempts; attempt++)
-                {
-                    uint32_t lpib = hda_read32(sdBase + SD_LPIB);
-                    uint32_t playFrag = lpib / FRAG_SIZE;
-                    if (playFrag >= NUM_FRAGMENTS) playFrag = NUM_FRAGMENTS - 1;
-
-                    uint32_t dist = (nextFrag >= playFrag)
-                        ? (nextFrag - playFrag)
-                        : (NUM_FRAGMENTS - playFrag + nextFrag);
-
-                    if (dist >= 2 && dist < NUM_FRAGMENTS - 2) { ready = true; break; }
-
-                    // Sleep ~2ms to let DMA drain a chunk of the ring.
-                    // Previously this was BusyWait(25000)+SchedulerYield,
-                    // which spent ~1ms of CPU busy-spinning per attempt
-                    // and dominated Q2's frame budget (~60% of CPU on a
-                    // ~12 fps run was inside this loop).  A real sleep
-                    // releases the CPU and gives the audio time to drain
-                    // before we re-check LPIB.
-                    SchedulerSleepMs(2);
-                }
-                if (!ready)
-                    break;
-            }
-
-            g_writeFrag = nextFrag;
-            g_writeOffset = 0;
+            StartOutputStream();
+            g_streamRunning = true;
         }
     }
 
+    PlayUnlock();
     return static_cast<int>(totalWritten);
 }
 
@@ -757,14 +813,19 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
 extern "C" void HdaStop()
 {
     if (!g_initialized) return;
+    PlayLock();
     StopOutputStream();
     g_streamRunning = false;
     g_streamConfigured = false;
     g_writeFrag = 0;
     g_writeOffset = 0;
+    g_submittedBytes = 0;
+    g_playedBytes = 0;
+    g_lastLpib = 0;
     // Zero buffer so next open doesn't replay stale data
     for (uint32_t i = 0; i < AUDIO_BUF_SIZE; i++)
         g_audioBuf[i] = 0;
+    PlayUnlock();
 }
 
 // Check if audio is currently playing
@@ -779,7 +840,10 @@ extern "C" bool HdaIsPlaying()
 extern "C" uint32_t HdaGetPosition()
 {
     if (!g_initialized) return 0;
-    return hda_read32(g_outStreamBase + SD_LPIB);
+    PlayLock();
+    uint32_t queued = QueuedBytesLocked();
+    PlayUnlock();
+    return queued;
 }
 
 // ---------------------------------------------------------------------------

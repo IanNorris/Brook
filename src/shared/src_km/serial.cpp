@@ -161,6 +161,8 @@ namespace brook {
 
 // ---- Internal helper for SerialPrintf ----
 
+static constexpr int SERIAL_PRINTF_MAX_STRING = 1024;
+
 static void PrintPtr(unsigned long val)
 {
     SerialPutsRaw("0x");
@@ -211,12 +213,13 @@ void SerialVPrintf(const char* fmt, __builtin_va_list args)
             case 's': {
                 const char* s = __builtin_va_arg(args, const char*);
                 if (!s) s = "(null)";
-                // Count length
+                // Serial output must never walk arbitrarily far through kernel
+                // memory just because a diagnostic string lost its terminator.
                 const char* p = s;
-                while (*p) { ++p; ++len; }
+                while (*p && len < SERIAL_PRINTF_MAX_STRING) { ++p; ++len; }
                 // Pad right (left-align: print string then spaces)
                 if (!leftAlign) { for (int i = len; i < width; ++i) SerialPutChar(' '); }
-                SerialPutsRaw(s);
+                for (int i = 0; i < len; ++i) SerialPutChar(s[i]);
                 if (leftAlign) { for (int i = len; i < width; ++i) SerialPutChar(' '); }
                 break;
             }

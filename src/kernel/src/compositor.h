@@ -46,12 +46,24 @@ extern "C" void CompositorWake();
 // Called by the TTY after rendering text into the backbuffer.
 void CompositorMarkDirty();
 
+// Begin a WM drag operation for a window at the current mouse position.
+// Used by Wayland clients via xdg_toplevel.move when they draw their own chrome.
+bool CompositorBeginWindowMove(int windowIdx);
+
+// Begin an interactive WM resize using the current pointer position.
+bool CompositorBeginWindowResize(int windowIdx, bool left, bool right,
+                                 bool top, bool bottom);
+
 // Unregister a process from the compositor (called before the Process is freed).
 void CompositorUnregisterProcess(Process* proc);
 
 // Wait until any in-progress compositor frame completes.
 // Used by ProcessDestroy to ensure VFB pages aren't freed mid-blit.
 void CompositorWaitFrame();
+
+// Defer freeing compositor-read kernel pages until any in-flight frame that may
+// have snapshotted the pointer has retired.
+void CompositorDeferFreePages(uint64_t virtAddr, uint64_t pageCount);
 
 // Hot-swap the physical framebuffer (called by display driver on mode change).
 // Must be called AFTER TtyRemap (uses TtyGetFramebuffer to get the new mapping).
@@ -73,5 +85,9 @@ void CompositorSetWallpaper(uint32_t* pixels, uint32_t w, uint32_t h);
 bool CompositorSetInputGrabber(Process* proc, bool enable);
 // Cleared automatically when the grabber process exits.
 void CompositorClearInputGrabberIfMatches(Process* proc);
+
+// Hide/show the compositor-owned default mouse cursor. This is intentionally
+// only visibility state; Wayland cursor surface pixels are a separate concern.
+bool CompositorSetCursorVisible(Process* proc, bool visible);
 
 } // namespace brook

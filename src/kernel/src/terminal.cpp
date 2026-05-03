@@ -718,15 +718,19 @@ static void TerminalThreadFn(void* arg)
 
         if (n == 0)
         {
-            // Check if child still alive
-            if (t->child && t->child->state == ProcessState::Terminated)
-            {
-                SerialPrintf("TERMINAL: child exited, closing\n");
-                break;
-            }
-            // Block until writer wakes us or timeout
+            // Check if child still alive — use a brief delay to avoid
+            // racing with transient pipe-empty conditions (e.g. child
+            // forked a subprocess that just closed its write end).
             self->wakeupTick = g_lapicTickCount + 50;
             SchedulerBlock(self);
+
+            // Re-check after waking — only close if bash is truly gone
+            if (t->child && t->child->state == ProcessState::Terminated)
+            {
+                SerialPrintf("TERMINAL: child exited (pid=%u status=%d), closing\n",
+                             t->child->pid, t->child->exitStatus);
+                break;
+            }
             continue;
         }
 
@@ -864,23 +868,16 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     }
 
     // Create pipes
-    auto* stdinPipe = static_cast<PipeBuffer*>(kmalloc(sizeof(PipeBuffer)));
-    auto* stdoutPipe = static_cast<PipeBuffer*>(kmalloc(sizeof(PipeBuffer)));
+    auto* stdinPipe = PipeBufferCreate(PIPE_BUF_DEFAULT_SIZE);
+    auto* stdoutPipe = PipeBufferCreate(PIPE_BUF_DEFAULT_SIZE);
     if (!stdinPipe || !stdoutPipe)
     {
         SerialPrintf("TERMINAL: pipe alloc failed\n");
-        if (stdinPipe) kfree(stdinPipe);
-        if (stdoutPipe) kfree(stdoutPipe);
+        if (stdinPipe) PipeBufferDestroy(stdinPipe);
+        if (stdoutPipe) PipeBufferDestroy(stdoutPipe);
         kfree(t->vfb);
         t->vfb = nullptr;
         return -1;
-    }
-
-    // Zero-init pipes
-    for (uint64_t i = 0; i < sizeof(PipeBuffer); i++)
-    {
-        reinterpret_cast<uint8_t*>(stdinPipe)[i] = 0;
-        reinterpret_cast<uint8_t*>(stdoutPipe)[i] = 0;
     }
     stdinPipe->readers = 1;
     stdinPipe->writers = 1;
@@ -917,8 +914,8 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     if (VfsStatPath(bashPath, &st) != 0)
     {
         SerialPrintf("TERMINAL: bash not found at %s\n", bashPath);
-        kfree(stdinPipe);
-        kfree(stdoutPipe);
+        PipeBufferDestroy(stdinPipe);
+        PipeBufferDestroy(stdoutPipe);
         kfree(t->vfb);
         t->vfb = nullptr;
         return -1;
@@ -983,8 +980,8 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
         kmalloc((baseN + kExtra + 1) * sizeof(const char*)));
     if (!bashEnvp) {
         kfree(elfData);
-        kfree(stdinPipe);
-        kfree(stdoutPipe);
+        PipeBufferDestroy(stdinPipe);
+        PipeBufferDestroy(stdoutPipe);
         kfree(t->vfb);
         t->vfb = nullptr;
         return -1;
@@ -1020,8 +1017,8 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     if (!child)
     {
         SerialPrintf("TERMINAL: failed to spawn bash\n");
-        kfree(stdinPipe);
-        kfree(stdoutPipe);
+        PipeBufferDestroy(stdinPipe);
+        PipeBufferDestroy(stdoutPipe);
         kfree(t->vfb);
         t->vfb = nullptr;
         return -1;

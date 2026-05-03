@@ -12,6 +12,16 @@ static void SerialPrintf(const char* fmt, ...) {
 
 namespace brook {
 
+static bool TcpSeqBefore(uint32_t a, uint32_t b)
+{
+    return static_cast<int32_t>(a - b) < 0;
+}
+
+static bool TcpSeqAfter(uint32_t a, uint32_t b)
+{
+    return static_cast<int32_t>(a - b) > 0;
+}
+
 TcpAction TcpProcessSegment(Socket& s,
                             uint32_t seq, uint32_t ack,
                             uint8_t flags,
@@ -70,36 +80,46 @@ TcpAction TcpProcessSegment(Socket& s,
         if (flags & TCP_ACK)
             s.tcpSndUna = ack;
 
-        if (dataLen > 0 && seq == s.tcpRcvNxt) {
-            act.enqueueData = true;
-            act.dataPtr     = data;
-            act.dataLen     = dataLen;
-            s.tcpRcvNxt += dataLen;
-            act.sendAck = true;
-        } else if (dataLen > 0) {
-            // Out of order — either stale (seq < rcvNxt, duplicate after our
-            // ACK was lost) or future (seq > rcvNxt, a gap).  We have no
-            // reassembly queue, so future data is DROPPED.  Stale data is
-            // harmless but means the peer didn't see our ACK.
-            int32_t gap = (int32_t)(seq - s.tcpRcvNxt);
-            bool stale = gap < 0;
-            s.oooDropCount++;
-            if (s.oooDropCount <= 5 || (s.oooDropCount % 50) == 0) {
-                SerialPrintf("tcp: OOO %s pid=%u seq=%u rcvNxt=%u gap=%d len=%u count=%u\n",
-                             stale ? "STALE" : "FUTURE",
-                             s.ownerPid, seq, s.tcpRcvNxt, gap, dataLen, s.oooDropCount);
-            }
-            // Rate-limit ACKs to stale segments — one immediate dup-ACK per
-            // retransmit is counter-productive (triggers more fast retransmit).
-            // Only ACK once per 100ms of stale repeats.
-            extern volatile uint64_t g_lapicTickCount;
-            if (stale) {
-                if (g_lapicTickCount - s.lastStaleAckTick > 100) {
-                    act.sendAck = true;
-                    s.lastStaleAckTick = g_lapicTickCount;
+        if (dataLen > 0) {
+            const uint8_t* dataPtr = data;
+            uint32_t dataSeq = seq;
+            uint32_t len = dataLen;
+            uint32_t segEnd = dataSeq + len;
+
+            if (TcpSeqBefore(dataSeq, s.tcpRcvNxt)) {
+                if (!TcpSeqAfter(segEnd, s.tcpRcvNxt)) {
+                    int32_t gap = static_cast<int32_t>(dataSeq - s.tcpRcvNxt);
+                    s.oooDropCount++;
+                    if (s.oooDropCount <= 5 || (s.oooDropCount % 50) == 0) {
+                        SerialPrintf("tcp: OOO STALE pid=%u seq=%u rcvNxt=%u gap=%d len=%u count=%u\n",
+                                     s.ownerPid, dataSeq, s.tcpRcvNxt, gap, len, s.oooDropCount);
+                    }
+                    extern volatile uint64_t g_lapicTickCount;
+                    if (g_lapicTickCount - s.lastStaleAckTick > 100) {
+                        act.sendAck = true;
+                        s.lastStaleAckTick = g_lapicTickCount;
+                    }
+                    return act;
                 }
+
+                uint32_t staleBytes = s.tcpRcvNxt - dataSeq;
+                dataPtr += staleBytes;
+                len -= staleBytes;
+                dataSeq = s.tcpRcvNxt;
+            }
+
+            if (dataSeq == s.tcpRcvNxt) {
+                act.enqueueData = true;
+                act.dataPtr     = dataPtr;
+                act.dataLen     = len;
+                s.tcpRcvNxt += len;
+                act.sendAck = true;
             } else {
-                act.sendAck = true; // future gap — send dup-ACK to drive fast retransmit
+                act.holdOooData = true;
+                act.oooDataPtr  = dataPtr;
+                act.oooDataLen  = len;
+                act.oooSeq      = dataSeq;
+                act.sendAck = true; // future gap — dup-ACK to drive fast retransmit
             }
         }
 

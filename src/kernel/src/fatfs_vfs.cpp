@@ -19,6 +19,11 @@ namespace brook {
 static KMutex g_fatLock;
 static bool   g_fatLockInit = false;
 
+struct FatFsMountData {
+    FATFS fs;
+    uint8_t pdrv;
+};
+
 static void EnsureLock()
 {
     if (!g_fatLockInit) { KMutexInit(&g_fatLock); g_fatLockInit = true; }
@@ -225,6 +230,7 @@ static int FatStat(Vnode* vn, VnodeStat* st)
         st->size  = 0;
         st->isDir = true;
     }
+    st->isSymlink = false;
     return 0;
 }
 
@@ -264,6 +270,7 @@ static int CachedFileStat(Vnode* vn, VnodeStat* st)
     auto* cf = static_cast<CachedFile*>(vn->priv);
     st->size  = cf->size;
     st->isDir = false;
+    st->isSymlink = false;
     return 0;
 }
 
@@ -287,36 +294,47 @@ static const VnodeOps g_fatDirOps = {
 static bool FatFsMount(uint8_t pdrv, void** mountPriv)
 {
     EnsureLock();
-    auto* fs = static_cast<FATFS*>(kmalloc(sizeof(FATFS)));
-    if (!fs) { SerialPuts("FATFS_VFS: kmalloc failed for FATFS\n"); return false; }
+    auto* data = static_cast<FatFsMountData*>(kmalloc(sizeof(FatFsMountData)));
+    if (!data) { SerialPuts("FATFS_VFS: kmalloc failed for FATFS\n"); return false; }
+    __builtin_memset(data, 0, sizeof(FatFsMountData));
+    data->pdrv = pdrv;
 
     char fatPath[8];
     fatPath[0] = static_cast<char>('0' + pdrv);
     fatPath[1] = ':'; fatPath[2] = '\0';
 
     KMutexLock(&g_fatLock);
-    FRESULT res = f_mount(fs, fatPath, 1);
+    FRESULT res = f_mount(&data->fs, fatPath, 1);
+    if (res != FR_OK)
+        f_mount(nullptr, fatPath, 0);
     KMutexUnlock(&g_fatLock);
 
     if (res != FR_OK) {
         SerialPrintf("FATFS_VFS: f_mount failed (res=%u) for drive %u\n",
                      static_cast<unsigned>(res), pdrv);
-        kfree(fs);
+        kfree(data);
         return false;
     }
 
-    *mountPriv = fs;
+    *mountPriv = data;
     DbgPrintf("FATFS_VFS: mounted drive %u\n", pdrv);
     return true;
 }
 
 static void FatFsUnmount(void* mountPriv)
 {
-    auto* fs = static_cast<FATFS*>(mountPriv);
-    if (!fs) return;
-    // We don't know which drive number, but f_unmount uses the FATFS*
-    // registered in the FatFS internal table. Just free our copy.
-    kfree(fs);
+    auto* data = static_cast<FatFsMountData*>(mountPriv);
+    if (!data) return;
+
+    char fatPath[8];
+    fatPath[0] = static_cast<char>('0' + data->pdrv);
+    fatPath[1] = ':'; fatPath[2] = '\0';
+
+    KMutexLock(&g_fatLock);
+    f_mount(nullptr, fatPath, 0);
+    KMutexUnlock(&g_fatLock);
+
+    kfree(data);
 }
 
 static Vnode* FatFsOpen(void* /*mountPriv*/, uint8_t pdrv,
@@ -456,7 +474,7 @@ static int FatFsStatPath(void* /*mountPriv*/, uint8_t pdrv,
                          const char* relPath, VnodeStat* st)
 {
     bool isRoot = (relPath[0] == '/' && relPath[1] == '\0') || relPath[0] == '\0';
-    if (isRoot) { st->size = 0; st->isDir = true; return 0; }
+    if (isRoot) { st->size = 0; st->isDir = true; st->isSymlink = false; return 0; }
 
     char fatPath[256];
     BuildFatPath(fatPath, sizeof(fatPath), pdrv, relPath);
@@ -469,6 +487,7 @@ static int FatFsStatPath(void* /*mountPriv*/, uint8_t pdrv,
 
     st->isDir = (fno.fattrib & AM_DIR) != 0;
     st->size  = st->isDir ? 0 : fno.fsize;
+    st->isSymlink = false;
     return 0;
 }
 

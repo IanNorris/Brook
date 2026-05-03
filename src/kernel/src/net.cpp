@@ -71,6 +71,7 @@ static uint32_t g_tcpEphemeralPort = 49200; // accessed via atomic fetch-add
 static void TcpSendSegment(Socket& s, uint8_t flags,
                            const void* data, uint32_t dataLen,
                            const char* why = "?");
+static void TcpEnqueueData(Socket& s, const void* data, uint32_t len);
 
 // ---------------------------------------------------------------------------
 // Checksum helpers
@@ -1248,6 +1249,15 @@ int SockCreate(int domain, int type, int protocol)
                 g_sockUsed[i] = false;
                 return -1;
             }
+            if (type == SOCK_STREAM) {
+                g_sockets[i].tcpOooBuf = static_cast<uint8_t*>(
+                    kmalloc(Socket::TCP_OOO_SLOT_COUNT * Socket::TCP_OOO_SLOT_SIZE));
+                if (!g_sockets[i].tcpOooBuf) {
+                    kfree(g_sockets[i].rxBuf);
+                    g_sockUsed[i] = false;
+                    return -1;
+                }
+            }
 
             g_sockets[i].refCount = 1;
             {
@@ -1385,6 +1395,7 @@ void SockClose(int sockIdx)
                 {
                     TcpSendSegment(child, TCP_RST, nullptr, 0, "rst-listener");
                 }
+                if (child.tcpOooBuf) kfree(child.tcpOooBuf);
                 if (child.rxBuf) kfree(child.rxBuf);
                 NetMemset(&g_sockets[childIdx], 0, sizeof(Socket));
                 g_sockUsed[childIdx] = false;
@@ -1438,6 +1449,8 @@ void SockClose(int sockIdx)
         }
     }
 
+    if (s.tcpOooBuf)
+        kfree(s.tcpOooBuf);
     if (s.rxBuf)
         kfree(s.rxBuf);
 
@@ -1473,7 +1486,6 @@ void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
                     const void* data, uint32_t len)
 {
     uint16_t dstPortBE = htons(dstPort);
-
     for (uint32_t i = 0; i < MAX_SOCKETS; i++) {
         if (!g_sockUsed[i]) continue;
         Socket& s = g_sockets[i];
@@ -1586,9 +1598,162 @@ static void TcpStatsMaybeFlush()
     g_tcpStatsLastTick = now;
 }
 
-static void TcpSendSegment(Socket& s, uint8_t flags,
-                           const void* data, uint32_t dataLen,
-                           const char* why)
+static bool TcpSeqAcked(uint32_t sndUna, uint32_t seqEnd)
+{
+    return static_cast<int32_t>(sndUna - seqEnd) >= 0;
+}
+
+static bool TcpSeqBefore(uint32_t a, uint32_t b)
+{
+    return static_cast<int32_t>(a - b) < 0;
+}
+
+static bool TcpSeqAfter(uint32_t a, uint32_t b)
+{
+    return static_cast<int32_t>(a - b) > 0;
+}
+
+static uint32_t TcpReceiveFree(const Socket& s)
+{
+    uint32_t used = s.rxCount + s.tcpOooBytes;
+    return used >= Socket::RX_BUF_SIZE ? 0 : Socket::RX_BUF_SIZE - used;
+}
+
+static void TcpReapOoo(Socket& s, uint64_t now)
+{
+    static constexpr uint64_t TCP_OOO_REAP_MS = 30000;
+    for (uint32_t i = 0; i < Socket::TCP_OOO_SLOT_COUNT; ++i) {
+        auto& slot = s.tcpOooSlots[i];
+        if (!slot.used || now - slot.tick < TCP_OOO_REAP_MS)
+            continue;
+
+        if (s.tcpOooBytes >= slot.len)
+            s.tcpOooBytes -= slot.len;
+        else
+            s.tcpOooBytes = 0;
+        slot.used = false;
+        slot.len = 0;
+    }
+}
+
+static bool TcpStoreOoo(Socket& s, uint32_t seq, const uint8_t* data,
+                        uint32_t len, uint64_t now)
+{
+    if (!s.tcpOooBuf || !data || len == 0)
+        return false;
+
+    uint32_t end = seq + len;
+    if (!TcpSeqAfter(end, s.tcpRcvNxt))
+        return false;
+
+    if (TcpSeqBefore(seq, s.tcpRcvNxt)) {
+        uint32_t trim = s.tcpRcvNxt - seq;
+        data += trim;
+        len -= trim;
+        seq = s.tcpRcvNxt;
+        end = seq + len;
+    }
+    if (len == 0)
+        return false;
+    if (len > Socket::TCP_OOO_SLOT_SIZE) {
+        s.oooDropCount++;
+        if (s.oooDropCount <= 5 || (s.oooDropCount % 50) == 0)
+            SerialPrintf("tcp: OOO TOOLARGE pid=%u seq=%u len=%u drop=%u\n",
+                         s.ownerPid, seq, len, s.oooDropCount);
+        return false;
+    }
+
+    for (uint32_t i = 0; i < Socket::TCP_OOO_SLOT_COUNT; ++i) {
+        const auto& slot = s.tcpOooSlots[i];
+        if (!slot.used)
+            continue;
+        uint32_t slotEnd = slot.seq + slot.len;
+        bool disjoint = !TcpSeqBefore(seq, slotEnd) || !TcpSeqBefore(slot.seq, end);
+        if (!disjoint) {
+            s.oooDropCount++;
+            if (s.oooDropCount <= 5 || (s.oooDropCount % 50) == 0)
+                SerialPrintf("tcp: OOO OVERLAP pid=%u seq=%u len=%u slotSeq=%u slotLen=%u drop=%u\n",
+                             s.ownerPid, seq, len, slot.seq, slot.len, s.oooDropCount);
+            return false;
+        }
+    }
+
+    if (len > TcpReceiveFree(s)) {
+        s.oooDropCount++;
+        if (s.oooDropCount <= 5 || (s.oooDropCount % 50) == 0)
+            SerialPrintf("tcp: OOO CAPACITY pid=%u seq=%u len=%u free=%u drop=%u bytes=%u\n",
+                         s.ownerPid, seq, len, TcpReceiveFree(s),
+                         s.oooDropCount, s.tcpOooBytes);
+        return false;
+    }
+
+    for (uint32_t i = 0; i < Socket::TCP_OOO_SLOT_COUNT; ++i) {
+        auto& slot = s.tcpOooSlots[i];
+        if (slot.used)
+            continue;
+
+        NetMemcpy(s.tcpOooBuf + i * Socket::TCP_OOO_SLOT_SIZE, data, len);
+        slot.seq = seq;
+        slot.len = static_cast<uint16_t>(len);
+        slot.tick = now;
+        slot.used = true;
+        s.tcpOooBytes += len;
+        s.oooHeldCount++;
+        if (s.oooHeldCount <= 5 || (s.oooHeldCount % 50) == 0) {
+            int32_t gap = static_cast<int32_t>(seq - s.tcpRcvNxt);
+            SerialPrintf("tcp: OOO HELD pid=%u seq=%u rcvNxt=%u gap=%d len=%u held=%u bytes=%u\n",
+                         s.ownerPid, seq, s.tcpRcvNxt, gap, len,
+                         s.oooHeldCount, s.tcpOooBytes);
+        }
+        return true;
+    }
+
+    s.oooDropCount++;
+    if (s.oooDropCount <= 5 || (s.oooDropCount % 50) == 0)
+        SerialPrintf("tcp: OOO FULL pid=%u seq=%u rcvNxt=%u len=%u drop=%u bytes=%u\n",
+                     s.ownerPid, seq, s.tcpRcvNxt, len, s.oooDropCount, s.tcpOooBytes);
+    return false;
+}
+
+static bool TcpDrainOoo(Socket& s)
+{
+    bool drained = false;
+    bool progress = true;
+    while (progress) {
+        progress = false;
+        for (uint32_t i = 0; i < Socket::TCP_OOO_SLOT_COUNT; ++i) {
+            auto& slot = s.tcpOooSlots[i];
+            if (!slot.used)
+                continue;
+
+            uint32_t end = slot.seq + slot.len;
+            if (TcpSeqAfter(slot.seq, s.tcpRcvNxt) || !TcpSeqAfter(end, s.tcpRcvNxt))
+                continue;
+
+            uint32_t offset = s.tcpRcvNxt - slot.seq;
+            uint32_t len = slot.len - offset;
+            const uint8_t* data = s.tcpOooBuf + i * Socket::TCP_OOO_SLOT_SIZE + offset;
+            if (s.tcpOooBytes >= slot.len)
+                s.tcpOooBytes -= slot.len;
+            else
+                s.tcpOooBytes = 0;
+            slot.used = false;
+            slot.len = 0;
+
+            TcpEnqueueData(s, data, len);
+            s.tcpRcvNxt += len;
+            s.oooDrainCount++;
+            drained = true;
+            progress = true;
+            break;
+        }
+    }
+    return drained;
+}
+
+static void TcpSendSegmentAtSeq(Socket& s, uint32_t seq, uint8_t flags,
+                                const void* data, uint32_t dataLen,
+                                const char* why)
 {
     // SYN packets include MSS option (4 bytes): kind=2, len=2, mss=1460
     // This makes us look like a real Linux client and avoids CDNs defaulting
@@ -1604,13 +1769,13 @@ static void TcpSendSegment(Socket& s, uint8_t flags,
     auto* tcp = reinterpret_cast<TcpHeader*>(buf);
     tcp->srcPort  = s.localPort;
     tcp->dstPort  = s.remotePort;
-    tcp->seqNum   = htonl(s.tcpSndNxt);
+    tcp->seqNum   = htonl(seq);
     tcp->ackNum   = htonl(s.tcpRcvNxt);
     tcp->dataOff  = ((sizeof(TcpHeader) + optLen) / 4) << 4;
     tcp->flags    = flags;
     // Advertise actual free space to prevent the sender from overflowing our buffer
     {
-        uint32_t freeSpace = Socket::RX_BUF_SIZE - s.rxCount;
+        uint32_t freeSpace = TcpReceiveFree(s);
         uint16_t wnd = freeSpace > 65535u ? 65535u : static_cast<uint16_t>(freeSpace);
         tcp->window = htons(wnd);
     }
@@ -1645,11 +1810,18 @@ static void TcpSendSegment(Socket& s, uint8_t flags,
             extern volatile uint64_t g_lapicTickCount;
             int sockIdx = static_cast<int>(&s - g_sockets);
             SerialPrintf("tcp: TX pid=%u sock=%d t=%lums flags=0x%02x seq=%u ack=%u datalen=%u why=%s [pkt#%u]\n",
-                         s.ownerPid, sockIdx, g_lapicTickCount, flags,
-                         s.tcpSndNxt, s.tcpRcvNxt, dataLen, why, s.txPktCount);
+                          s.ownerPid, sockIdx, g_lapicTickCount, flags,
+                          seq, s.tcpRcvNxt, dataLen, why, s.txPktCount);
         }
     }
     TcpStatsMaybeFlush();
+}
+
+static void TcpSendSegment(Socket& s, uint8_t flags,
+                           const void* data, uint32_t dataLen,
+                           const char* why)
+{
+    TcpSendSegmentAtSeq(s, s.tcpSndNxt, flags, data, dataLen, why);
 }
 
 // Append raw bytes to socket RX ring buffer.
@@ -1715,20 +1887,27 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         }
         TcpStatsMaybeFlush();
 
-        // Clamp incoming data to our actual free space so tcpRcvNxt stays
-        // in sync with what we actually accept.  Without this, a full RX
-        // buffer causes TcpEnqueueData to silently drop bytes while we've
-        // already ACKed them, permanently desynchronising sequence numbers.
-        uint32_t freeSpace = Socket::RX_BUF_SIZE - s.rxCount;
+        // Clamp incoming data to bytes we can either expose to recv() now or
+        // hold for later reassembly.  Without this, tcpRcvNxt could advance
+        // past bytes the kernel cannot eventually deliver.
+        extern volatile uint64_t g_lapicTickCount;
+        TcpReapOoo(s, g_lapicTickCount);
+        uint32_t freeSpace = TcpReceiveFree(s);
         bool bufferWasFull = (dataLen > 0 && freeSpace == 0);
         if (dataLen > freeSpace) dataLen = freeSpace;
 
         // Delegate to testable state machine
         uint32_t prevRxCount = s.rxCount;
+        uint32_t prevSndUna = s.tcpSndUna;
         TcpAction act = TcpProcessSegment(s, seq, ack, flags, tcpData, dataLen);
 
         if (act.enqueueData && act.dataPtr && act.dataLen > 0)
             TcpEnqueueData(s, act.dataPtr, act.dataLen);
+        if (act.holdOooData && act.oooDataPtr && act.oooDataLen > 0)
+            TcpStoreOoo(s, act.oooSeq, act.oooDataPtr,
+                        act.oooDataLen, g_lapicTickCount);
+        if (TcpDrainOoo(s))
+            act.sendAck = true;
 
         // CRITICAL: compute shouldWake and capture pollWaiter while still
         // holding the lock.  If we release first, SockRecv can drain the
@@ -1737,8 +1916,10 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         // suppressed.  The sleeping SockRecv then waits the full 10-second
         // SchedulerBlock timeout instead of being woken immediately (the
         // 60-second stall = 6 missed wakeups × 10-second timeout).
-        bool shouldWake = (s.rxCount > prevRxCount) || s.tcpRstRecv
-                          || s.tcpFinRecv || act.justConnected;
+        bool shouldWake = (s.rxCount > prevRxCount)
+                           || (s.tcpSndUna != prevSndUna)
+                           || s.tcpRstRecv
+                           || s.tcpFinRecv || act.justConnected;
         Process* waiter = nullptr;
         if (s.pollWaiter && shouldWake)
         {
@@ -1951,6 +2132,56 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
     return -110; // ETIMEDOUT
 }
 
+static int TcpWaitForDataAck(Socket& s, int sockIdx,
+                             uint32_t seq, const uint8_t* data, uint32_t len)
+{
+    extern volatile uint64_t g_lapicTickCount;
+
+    Process* self = SchedulerCurrentProcess();
+    uint32_t seqEnd = seq + len;
+    uint64_t deadline = g_lapicTickCount + 30000;
+    uint64_t nextRetransmit = g_lapicTickCount + 1000;
+    uint32_t retransmits = 0;
+
+    while (true) {
+        uint64_t now = g_lapicTickCount;
+
+        uint64_t irqFlags = SpinLockAcquire(&s.lock);
+        bool acked = TcpSeqAcked(s.tcpSndUna, seqEnd);
+        bool closed = s.tcpRstRecv || s.tcpFinRecv ||
+                      s.tcpState != TcpState::Established;
+        if (acked || closed || now >= deadline) {
+            SpinLockRelease(&s.lock, irqFlags);
+            if (acked) return 0;
+            if (closed) return -104; // ECONNRESET
+            SerialPrintf("tcp: data ACK timeout fd=%d seq=%u end=%u una=%u retx=%u\n",
+                         sockIdx, seq, seqEnd, s.tcpSndUna, retransmits);
+            return -110; // ETIMEDOUT
+        }
+
+        if (self) {
+            s.pollWaiter = self;
+            self->wakeupTick = nextRetransmit < deadline
+                                   ? nextRetransmit
+                                   : deadline;
+        }
+        SpinLockRelease(&s.lock, irqFlags);
+
+        if (now >= nextRetransmit) {
+            retransmits++;
+            TcpSendSegmentAtSeq(s, seq, TCP_ACK | TCP_PSH, data, len,
+                                "data-retry");
+            uint64_t backoff = 1000ULL << (retransmits < 4 ? retransmits : 4);
+            nextRetransmit = now + backoff;
+            continue;
+        }
+
+        if (!self)
+            return 0;
+        SchedulerBlock(self);
+    }
+}
+
 int SockSend(int sockIdx, const void* buf, uint32_t len)
 {
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return -1;
@@ -1974,12 +2205,17 @@ int SockSend(int sockIdx, const void* buf, uint32_t len)
         uint32_t chunk = len - sent;
         if (chunk > MSS) chunk = MSS;
 
+        uint32_t seq = s.tcpSndNxt;
         TcpSendSegment(s, TCP_ACK | TCP_PSH, data + sent, chunk, "data");
         s.tcpSndNxt += chunk;
+
+        int ackStatus = TcpWaitForDataAck(s, sockIdx, seq, data + sent, chunk);
+        if (ackStatus != 0)
+            return ackStatus;
+
         sent += chunk;
 
-        // Yield after each segment to let the receive path process ACKs
-        // without spinning. The send window check prevents overwhelming the peer.
+        // Yield after each ACKed segment to let peer responses run without spinning.
         SchedulerYield();
 
         if (s.tcpState != TcpState::Established) return -104;
@@ -2138,6 +2374,23 @@ bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite)
             return true;
     }
     return false;
+}
+
+bool SockPollHangup(int sockIdx)
+{
+    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return true;
+    if (!g_sockUsed[sockIdx]) return true;
+
+    Socket& s = g_sockets[sockIdx];
+    if (s.type != SOCK_STREAM) return false;
+
+    uint64_t irqFlags = SpinLockAcquire(&s.lock);
+    bool hungUp = s.tcpFinRecv || s.tcpRstRecv ||
+                  (s.tcpState != TcpState::Established &&
+                   s.tcpState != TcpState::SynSent &&
+                   s.tcpState != TcpState::Listen);
+    SpinLockRelease(&s.lock, irqFlags);
+    return hungUp;
 }
 
 uint32_t SockRxCount(int sockIdx)

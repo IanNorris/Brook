@@ -108,6 +108,15 @@ static bool StrEq(const char* a, const char* b)
     return *a == *b;
 }
 
+static void StrAppend(char* dst, const char* src, uint32_t maxLen)
+{
+    uint32_t di = StrLen(dst);
+    uint32_t si = 0;
+    while (di + 1 < maxLen && src[si])
+        dst[di++] = src[si++];
+    dst[di] = '\0';
+}
+
 // Find the best (longest-prefix) mount for a given absolute path.
 // Returns the mount entry and sets *relPath to the path within the mount.
 static MountEntry* FindMount(const char* absPath, const char** relPath)
@@ -134,6 +143,162 @@ static MountEntry* FindMount(const char* absPath, const char** relPath)
         *relPath = (rem[0] == '\0') ? "/" : rem;
     }
     return best;
+}
+
+static int VfsLstatPathRaw(const char* path, VnodeStat* st)
+{
+    if (!path || !st) return -1;
+
+    const char* relPath = nullptr;
+    MountEntry* mount   = FindMount(path, &relPath);
+    if (!mount || !mount->fsOps) return -1;
+
+    if (mount->fsOps->lstat_path)
+        return mount->fsOps->lstat_path(mount->mountPriv, mount->pdrv, relPath, st);
+    if (mount->fsOps->stat_path)
+        return mount->fsOps->stat_path(mount->mountPriv, mount->pdrv, relPath, st);
+    return -1;
+}
+
+static int VfsReadlinkRaw(const char* path, char* buf, uint64_t bufsiz)
+{
+    if (!path || !buf || bufsiz == 0) return -1;
+    const char* relPath = nullptr;
+    MountEntry* mount = FindMount(path, &relPath);
+    if (!mount || !mount->fsOps || !mount->fsOps->readlink) return -1;
+    return mount->fsOps->readlink(mount->mountPriv, mount->pdrv, relPath, buf, bufsiz);
+}
+
+static bool NormalizePath(const char* in, char* out, uint32_t outSize)
+{
+    if (!in || !out || outSize < 2) return false;
+
+    out[0] = '/';
+    out[1] = '\0';
+
+    const char* p = in;
+    while (*p)
+    {
+        while (*p == '/') ++p;
+        if (!*p) break;
+
+        char comp[256];
+        uint32_t ci = 0;
+        while (*p && *p != '/' && ci + 1 < sizeof(comp))
+            comp[ci++] = *p++;
+        comp[ci] = '\0';
+        while (*p && *p != '/') ++p;
+
+        if (StrEq(comp, "."))
+            continue;
+
+        if (StrEq(comp, ".."))
+        {
+            uint32_t len = StrLen(out);
+            if (len > 1)
+            {
+                if (out[len - 1] == '/') out[--len] = '\0';
+                while (len > 1 && out[len - 1] != '/') --len;
+                out[len == 1 ? 1 : len] = '\0';
+            }
+            continue;
+        }
+
+        if (!StrEq(out, "/")) StrAppend(out, "/", outSize);
+        StrAppend(out, comp, outSize);
+    }
+
+    return true;
+}
+
+static bool BuildSymlinkPath(const char* linkPath, const char* target,
+                             const char* remaining, char* out, uint32_t outSize)
+{
+    char combined[512];
+    combined[0] = '\0';
+
+    if (target[0] == '/')
+    {
+        StrCopy(combined, target, sizeof(combined));
+    }
+    else
+    {
+        StrCopy(combined, linkPath, sizeof(combined));
+        uint32_t len = StrLen(combined);
+        while (len > 1 && combined[len - 1] != '/') --len;
+        combined[len] = '\0';
+        if (!StrEq(combined, "/")) StrAppend(combined, "/", sizeof(combined));
+        StrAppend(combined, target, sizeof(combined));
+    }
+
+    if (remaining && remaining[0])
+    {
+        if (!StrEq(combined, "/")) StrAppend(combined, "/", sizeof(combined));
+        StrAppend(combined, remaining, sizeof(combined));
+    }
+
+    return NormalizePath(combined, out, outSize);
+}
+
+static bool VfsResolveSymlinks(const char* path, char* out, uint32_t outSize,
+                               bool followFinal)
+{
+    if (!path || !path[0] || !out || outSize < 2) return false;
+
+    char work[512];
+    if (!NormalizePath(path, work, sizeof(work))) return false;
+
+    for (int depth = 0; depth < 8; ++depth)
+    {
+        char cur[512];
+        cur[0] = '/';
+        cur[1] = '\0';
+        const char* p = work;
+        while (*p == '/') ++p;
+
+        while (*p)
+        {
+            char comp[256];
+            uint32_t ci = 0;
+            while (*p && *p != '/' && ci + 1 < sizeof(comp))
+                comp[ci++] = *p++;
+            comp[ci] = '\0';
+            while (*p == '/') ++p;
+
+            if (!StrEq(cur, "/")) StrAppend(cur, "/", sizeof(cur));
+            StrAppend(cur, comp, sizeof(cur));
+
+            bool final = (*p == '\0');
+            if (!final || followFinal)
+            {
+                VnodeStat st;
+                st.size = 0;
+                st.isDir = false;
+                st.isSymlink = false;
+                if (VfsLstatPathRaw(cur, &st) == 0 && st.isSymlink)
+                {
+                    char target[512];
+                    int n = VfsReadlinkRaw(cur, target, sizeof(target) - 1);
+                    if (n < 0) return false;
+                    target[n] = '\0';
+
+                    char next[512];
+                    if (!BuildSymlinkPath(cur, target, p, next, sizeof(next)))
+                        return false;
+                    StrCopy(work, next, sizeof(work));
+                    goto restart;
+                }
+            }
+        }
+
+        StrCopy(out, cur, outSize);
+        return true;
+
+    restart:
+        continue;
+    }
+
+    return false;
 }
 
 // ---- Public API ----
@@ -201,15 +366,70 @@ bool VfsUnmount(const char* mountPoint)
     return false;
 }
 
+uint32_t VfsRootMountCount()
+{
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < VFS_MAX_MOUNTS; ++i)
+    {
+        if (!g_mounts[i].used) continue;
+        const char* mp = g_mounts[i].mountPoint;
+        if (mp[0] != '/' || mp[1] == '\0') continue;
+
+        bool nested = false;
+        for (uint32_t j = 1; mp[j]; ++j)
+        {
+            if (mp[j] == '/') { nested = true; break; }
+        }
+        if (!nested) ++count;
+    }
+    return count;
+}
+
+bool VfsRootMountNameAt(uint32_t index, char* out, uint32_t outSize)
+{
+    if (!out || outSize == 0) return false;
+
+    uint32_t seen = 0;
+    for (uint32_t i = 0; i < VFS_MAX_MOUNTS; ++i)
+    {
+        if (!g_mounts[i].used) continue;
+        const char* mp = g_mounts[i].mountPoint;
+        if (mp[0] != '/' || mp[1] == '\0') continue;
+
+        bool nested = false;
+        uint32_t nameLen = 0;
+        for (uint32_t j = 1; mp[j]; ++j)
+        {
+            if (mp[j] == '/') { nested = true; break; }
+            ++nameLen;
+        }
+        if (nested || nameLen == 0) continue;
+
+        if (seen++ != index) continue;
+
+        uint32_t copyLen = (nameLen < outSize - 1) ? nameLen : outSize - 1;
+        for (uint32_t j = 0; j < copyLen; ++j)
+            out[j] = mp[j + 1];
+        out[copyLen] = '\0';
+        return true;
+    }
+    return false;
+}
+
 Vnode* VfsOpen(const char* path, int flags)
 {
     if (!path || !path[0]) return nullptr;
 
+    char resolved[512];
+    const char* lookup = path;
+    if (VfsResolveSymlinks(path, resolved, sizeof(resolved), true))
+        lookup = resolved;
+
     const char* relPath = nullptr;
-    MountEntry* mount   = FindMount(path, &relPath);
+    MountEntry* mount   = FindMount(lookup, &relPath);
     if (!mount)
     {
-        SerialPrintf("VFS: no mount for '%s'\n", path);
+        SerialPrintf("VFS: no mount for '%s'\n", lookup);
         return nullptr;
     }
 
@@ -246,8 +466,13 @@ int VfsStatPath(const char* path, VnodeStat* st)
 {
     if (!path || !path[0] || !st) return -1;
 
+    char resolved[512];
+    const char* lookup = path;
+    if (VfsResolveSymlinks(path, resolved, sizeof(resolved), true))
+        lookup = resolved;
+
     const char* relPath = nullptr;
-    MountEntry* mount   = FindMount(path, &relPath);
+    MountEntry* mount   = FindMount(lookup, &relPath);
     if (!mount) return -1;
 
     if (!mount->fsOps || !mount->fsOps->stat_path) return -1;
@@ -258,8 +483,13 @@ int VfsLstatPath(const char* path, VnodeStat* st)
 {
     if (!path || !st) return -1;
 
+    char resolved[512];
+    const char* lookup = path;
+    if (VfsResolveSymlinks(path, resolved, sizeof(resolved), false))
+        lookup = resolved;
+
     const char* relPath = nullptr;
-    MountEntry* mount   = FindMount(path, &relPath);
+    MountEntry* mount   = FindMount(lookup, &relPath);
     if (!mount || !mount->fsOps) return -1;
 
     // Use lstat_path if available, otherwise fall back to stat_path
@@ -326,10 +556,13 @@ int VfsSymlink(const char* target, const char* linkPath)
 int VfsReadlink(const char* path, char* buf, uint64_t bufsiz)
 {
     if (!path || !buf || bufsiz == 0) return -1;
-    const char* relPath = nullptr;
-    MountEntry* mount = FindMount(path, &relPath);
-    if (!mount || !mount->fsOps || !mount->fsOps->readlink) return -1;
-    return mount->fsOps->readlink(mount->mountPriv, mount->pdrv, relPath, buf, bufsiz);
+
+    char resolved[512];
+    const char* lookup = path;
+    if (VfsResolveSymlinks(path, resolved, sizeof(resolved), false))
+        lookup = resolved;
+
+    return VfsReadlinkRaw(lookup, buf, bufsiz);
 }
 
 void VfsClose(Vnode* vn)

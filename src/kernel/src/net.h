@@ -274,6 +274,18 @@ struct Socket {
     uint32_t  rxTail;
     uint32_t  rxCount;     // bytes available
 
+    static constexpr uint32_t TCP_OOO_SLOT_COUNT = 16;
+    static constexpr uint32_t TCP_OOO_SLOT_SIZE = ETH_MTU;
+    struct TcpOooSlot {
+        uint32_t seq;
+        uint16_t len;
+        uint64_t tick;
+        bool     used;
+    };
+    uint8_t*   tcpOooBuf;
+    TcpOooSlot tcpOooSlots[TCP_OOO_SLOT_COUNT];
+    uint32_t   tcpOooBytes; // future bytes held, not yet visible to recv()
+
     // For recvfrom: store source address of last received packet
     uint32_t  lastSrcIp;
     uint16_t  lastSrcPort;
@@ -303,6 +315,8 @@ struct Socket {
     uint32_t rxPktCount;   // total TCP segments received on this socket
     uint32_t txPktCount;   // total TCP segments transmitted on this socket
     uint32_t oooDropCount; // TCP segments dropped for being out-of-order
+    uint32_t oooHeldCount; // TCP future segments retained for reassembly
+    uint32_t oooDrainCount; // TCP retained segments/partials drained to rxBuf
     uint64_t lastStaleAckTick; // last tick we dup-ACKed a stale/duplicate segment
 
     // Owner PID (tgid) — set when socket is created via sys_socket. Diagnostic only.
@@ -332,6 +346,7 @@ void SockGetLocal(int sockIdx, uint32_t* ip, uint16_t* port);
 int  SockListen(int sockIdx, int backlog);
 int  SockAccept(int sockIdx, SockAddrIn* addr);
 bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite);
+bool SockPollHangup(int sockIdx);
 uint32_t SockRxCount(int sockIdx);
 void SockSetPollWaiter(int sockIdx, Process* waiter);
 void SockClose(int sockIdx);

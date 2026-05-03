@@ -16,9 +16,13 @@ struct TcpAction {
     bool     sendAck;        // send an ACK segment
     bool     sendRst;        // send a RST segment
     bool     enqueueData;    // data should be enqueued to RX buffer
+    bool     holdOooData;    // future data should be retained for reassembly
     bool     justConnected;  // SynSent → Established transition this segment
     const uint8_t* dataPtr;  // pointer to data to enqueue (within input payload)
     uint32_t dataLen;        // bytes to enqueue
+    const uint8_t* oooDataPtr; // pointer to future data (within input payload)
+    uint32_t oooDataLen;       // bytes of future data to retain
+    uint32_t oooSeq;           // sequence number for oooDataPtr
 };
 
 // Process an incoming TCP segment for a socket.

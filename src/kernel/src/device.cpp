@@ -83,6 +83,17 @@ Device* DeviceFind(const char* name)
     return nullptr;
 }
 
+bool DeviceIsRegistered(Device* dev)
+{
+    if (!dev) return false;
+    for (uint32_t i = 0; i < g_deviceCount; ++i)
+    {
+        if (g_devices[i] == dev)
+            return true;
+    }
+    return false;
+}
+
 void DeviceIterate(DeviceType type, bool (*cb)(Device* dev, void* ctx), void* ctx)
 {
     if (!cb) return;

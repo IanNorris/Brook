@@ -166,7 +166,8 @@ void WmSetActive(bool active)
 
 int WmCreateWindow(Process* proc, int16_t x, int16_t y,
                    uint16_t clientW, uint16_t clientH,
-                   const char* title, uint8_t upscale)
+                   const char* title, uint8_t upscale,
+                   bool focusable)
 {
     // Find free slot
     int idx = -1;
@@ -193,6 +194,7 @@ int WmCreateWindow(Process* proc, int16_t x, int16_t y,
     w.visible = true;
     w.minimized = false;
     w.noChrome = false;
+    w.focusable = focusable;
     w.savedX = x;
     w.savedY = y;
     w.savedW = clientW;
@@ -210,8 +212,10 @@ int WmCreateWindow(Process* proc, int16_t x, int16_t y,
     SerialPrintf("WM: created window %d '%s' at (%d,%d) %ux%u scale=%u for pid %u\n",
                  idx, w.title, x, y, clientW, clientH, upscale, proc ? proc->pid : 0);
 
-    // Auto-focus new window
-    WmSetFocus(idx);
+    // Auto-focus normal windows. Popup/tooltips are raised by z-order but keep
+    // keyboard focus on the invoking toplevel.
+    if (w.focusable)
+        WmSetFocus(idx);
 
     return idx;
 }
@@ -224,10 +228,12 @@ void WmDestroyWindow(int idx)
 
     SerialPrintf("WM: destroyed window %d '%s'\n", idx, w.title);
 
-    // Free the per-window VFB (if any).  We unmap from the owner's user
-    // address space first, then free the kernel-virtual pages.
+    // Detach the per-window VFB (if any).  The compositor may already have
+    // snapshotted w.vfb for the current frame, so kernel pages are freed only
+    // after a later compositor epoch.
     if (w.vfb)
     {
+        uint32_t* oldVfb = w.vfb;
         uint64_t pageCount = (w.vfbBytes + 4095) / 4096;
         Process* p = w.proc;
         if (p && p->pageTable && w.vfbUser)
@@ -236,13 +242,12 @@ void WmDestroyWindow(int idx)
             for (uint64_t i = 0; i < pageCount; ++i)
                 VmmUnmapPage(p->pageTable, VirtualAddress(userBase + i * 4096));
         }
-        VmmFreePages(VirtualAddress(reinterpret_cast<uint64_t>(w.vfb)),
-                     pageCount);
         w.vfb       = nullptr;
         w.vfbStride = 0;
         w.vfbBytes  = 0;
         w.vfbUser   = nullptr;
         w.vfbDirty  = 0;
+        CompositorDeferFreePages(reinterpret_cast<uint64_t>(oldVfb), pageCount);
     }
     w.wmId = 0;
     w.proc = nullptr;
@@ -256,7 +261,8 @@ void WmDestroyWindow(int idx)
         uint8_t bestZ = 0;
         for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
         {
-            if (g_windows[i].proc && g_windows[i].visible && g_windows[i].zOrder >= bestZ)
+            if (g_windows[i].proc && g_windows[i].visible && g_windows[i].focusable
+                && g_windows[i].zOrder >= bestZ)
             {
                 bestZ = g_windows[i].zOrder;
                 bestIdx = static_cast<int>(i);
@@ -423,6 +429,7 @@ void WmSetFocus(int idx)
 {
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
     if (!g_windows[idx].proc) return;
+    if (!g_windows[idx].focusable) return;
     if (g_focusedIdx == idx) return;
 
     // Unfocus old
@@ -479,11 +486,12 @@ uint32_t WmWindowCount()
     return n;
 }
 
-void WmToggleMaximize(int idx)
+void WmSetMaximized(int idx, bool enable)
 {
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
     Window& w = g_windows[idx];
     if (!w.proc) return;
+    if ((w.state == WindowState::Maximized) == enable) return;
 
     uint32_t screenW, screenH;
     CompositorGetPhysDims(&screenW, &screenH);
@@ -527,6 +535,14 @@ void WmToggleMaximize(int idx)
     WmResizeWindow(idx, newW, newH);
 }
 
+void WmToggleMaximize(int idx)
+{
+    if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
+    Window& w = g_windows[idx];
+    if (!w.proc) return;
+    WmSetMaximized(idx, w.state != WindowState::Maximized);
+}
+
 void WmMoveWindow(int idx, int16_t newX, int16_t newY)
 {
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
@@ -534,6 +550,29 @@ void WmMoveWindow(int idx, int16_t newX, int16_t newY)
     if (!w.proc) return;
     w.x = newX;
     w.y = newY;
+}
+
+bool WmMoveWindowRelativeToParent(Process* proc, uint32_t wmId,
+                                  uint32_t parentWmId,
+                                  int32_t relX, int32_t relY)
+{
+    Window* child = WmFindWindowById(proc, wmId);
+    Window* parent = WmFindWindowById(proc, parentWmId);
+    if (!child || !parent) return false;
+
+    int32_t clientX = parent->x + (parent->noChrome ? 0 : static_cast<int32_t>(WM_BORDER_WIDTH));
+    int32_t clientY = parent->y + (parent->noChrome ? 0 : static_cast<int32_t>(WM_TITLE_BAR_HEIGHT + WM_BORDER_WIDTH));
+    int32_t x = clientX + relX;
+    int32_t y = clientY + relY;
+    static constexpr int32_t kMinI16 = -32768;
+    static constexpr int32_t kMaxI16 = 32767;
+    if (x < kMinI16) x = kMinI16;
+    if (x > kMaxI16) x = kMaxI16;
+    if (y < kMinI16) y = kMinI16;
+    if (y > kMaxI16) y = kMaxI16;
+
+    WmMoveWindow(static_cast<int>(wmId) - 1, static_cast<int16_t>(x), static_cast<int16_t>(y));
+    return true;
 }
 
 void WmResizeWindow(int idx, uint16_t newClientW, uint16_t newClientH)
@@ -598,6 +637,7 @@ void WmMinimizeWindow(int idx)
         for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
         {
             if (g_windows[i].proc && g_windows[i].visible && !g_windows[i].minimized
+                && g_windows[i].focusable
                 && g_windows[i].zOrder >= bestZ)
             {
                 bestZ = g_windows[i].zOrder;
@@ -1273,9 +1313,10 @@ Window* WmFindWindowById(Process* proc, uint32_t wmId)
 }
 
 WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
-                                              uint16_t clientW,
-                                              uint16_t clientH,
-                                              const char* title)
+                                               uint16_t clientW,
+                                               uint16_t clientH,
+                                               const char* title,
+                                               bool focusable)
 {
     WmCreateWindowResult res = {};
 
@@ -1289,7 +1330,8 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
     int16_t winY = static_cast<int16_t>(40 + (s_cascade % 8) * 30);
     s_cascade++;
 
-    int idx = WmCreateWindow(proc, winX, winY, clientW, clientH, title, 1);
+    int idx = WmCreateWindow(proc, winX, winY, clientW, clientH, title, 1,
+                             focusable);
     if (idx < 0) return res;
 
     Window& w = g_windows[idx];

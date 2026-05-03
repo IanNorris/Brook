@@ -46,6 +46,29 @@ static char* U64ToDec(char* buf, uint64_t val)
     return buf;
 }
 
+static char HexDigit(uint8_t n)
+{
+    return static_cast<char>(n < 10 ? '0' + n : 'a' + (n - 10));
+}
+
+static char* U64ToHex(char* buf, uint64_t val)
+{
+    bool started = false;
+    for (int shift = 60; shift >= 0; shift -= 4) {
+        uint8_t n = static_cast<uint8_t>((val >> shift) & 0xF);
+        if (!started && n == 0 && shift > 0) continue;
+        started = true;
+        *buf++ = HexDigit(n);
+    }
+    return buf;
+}
+
+static char* AppendStr(char* p, const char* s)
+{
+    while (*s) *p++ = *s++;
+    return p;
+}
+
 static char* I64ToDec(char* buf, int64_t val)
 {
     if (val < 0) { *buf++ = '-'; val = -val; }
@@ -422,6 +445,22 @@ static Vnode* GenPidStatm(const ProcessSnapshot& proc)
     return MakeProcVnode(buf, n);
 }
 
+// /proc/[pid]/maps — minimal Linux-style VM map.
+// glibc's pthread_getattr_np() consults this for the initial thread's stack.
+static Vnode* GenPidMaps(const ProcessSnapshot& proc)
+{
+    auto* buf = static_cast<char*>(kmalloc(256));
+    if (!buf) return nullptr;
+
+    char* p = buf;
+    p = U64ToHex(p, proc.stackBase);
+    *p++ = '-';
+    p = U64ToHex(p, USER_STACK_TOP);
+    p = AppendStr(p, " rw-p 00000000 00:00 0                          [stack]\n");
+    *p = '\0';
+    return MakeProcVnode(buf, static_cast<uint32_t>(p - buf));
+}
+
 // ---- Path parsing helpers ----
 
 static bool IsDigit(char c) { return c >= '0' && c <= '9'; }
@@ -484,6 +523,7 @@ static ProcPidEntry g_pidEntries[] = {
     { "statm",   GenPidStatm },
     { "status",  GenPidStatus },
     { "cmdline", GenPidCmdline },
+    { "maps",    GenPidMaps },
 };
 static constexpr uint32_t NUM_PID_ENTRIES = sizeof(g_pidEntries) / sizeof(g_pidEntries[0]);
 

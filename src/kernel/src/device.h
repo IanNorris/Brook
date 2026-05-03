@@ -74,6 +74,11 @@ extern "C" bool DeviceUnregister(Device* dev);
 // Find a device by exact name.  Returns nullptr if not found.
 extern "C" Device* DeviceFind(const char* name);
 
+// True if dev is currently present in the registry.  Does not dereference dev,
+// so it is safe to use before validating a pointer recovered from another
+// subsystem's cached state.
+extern "C" bool DeviceIsRegistered(Device* dev);
+
 // Iterate over all devices of a given type.
 // Calls cb(dev, ctx) for each match.  Stops if cb returns false.
 extern "C" void DeviceIterate(DeviceType type, bool (*cb)(Device* dev, void* ctx), void* ctx);

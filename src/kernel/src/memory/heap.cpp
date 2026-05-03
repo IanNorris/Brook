@@ -13,7 +13,7 @@ namespace brook {
 
 static constexpr uint32_t HEADER_MAGIC  = 0xB10CBEEF;
 static constexpr uint32_t FOOTER_MAGIC  = 0xB10CBEE2;
-static constexpr uint64_t ALIGN         = 16;
+static constexpr uint64_t ALIGN         = 64;
 static constexpr uint64_t INITIAL_PAGES = 256;         // 1MB initial heap
 static constexpr uint64_t EXPAND_PAGES  = 256;         // expand by 1MB at a time
 
@@ -31,7 +31,7 @@ static volatile bool g_heapPoisonEnabled = true;
 // ---------------------------------------------------------------------------
 // Block layout
 //
-//  ┌─────────────────────┐  ← BlockHeader (24 bytes)
+//  ┌─────────────────────┐  ← BlockHeader (64 bytes)
 //  │ magic               │
 //  │ size (whole block)  │
 //  │ free                │
@@ -51,13 +51,14 @@ struct BlockHeader
     uint32_t size;   // total block size including header + footer
     uint32_t free;   // 1 = free, 0 = allocated
     uint32_t _pad;
+    uint8_t  _alignPad[48];
 };
 
 struct BlockFooter
 {
     uint32_t size;
     uint32_t magic;
-    uint64_t _pad;  // pad to 16 bytes so OVERHEAD = 32 (multiple of ALIGN)
+    uint8_t  _alignPad[56];
 };
 
 static constexpr uint64_t HEADER_SIZE   = sizeof(BlockHeader);

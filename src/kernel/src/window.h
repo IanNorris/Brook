@@ -51,6 +51,7 @@ struct Window
     bool        visible;
     bool        minimized;      // hidden from desktop, shown in taskbar
     bool        noChrome;       // CSD: client draws own chrome; WM skips title/border
+    bool        focusable;      // popups/tooltips stay above but don't take keyboard focus
     char        title[64];
 
     // Per-window VFB (Phase A of wayland↔WM unification).  When non-null
@@ -133,7 +134,8 @@ void WmInit();
 // displayed size (VFB size × upscale).
 int WmCreateWindow(Process* proc, int16_t x, int16_t y,
                    uint16_t clientW, uint16_t clientH,
-                   const char* title, uint8_t upscale = 1);
+                   const char* title, uint8_t upscale = 1,
+                   bool focusable = true);
 
 // Remove a window (process exited or closed).
 void WmDestroyWindow(int idx);
@@ -159,6 +161,9 @@ uint32_t WmWindowCount();
 // Toggle maximise/restore for a window.
 void WmToggleMaximize(int idx);
 
+// Set maximise state idempotently.
+void WmSetMaximized(int idx, bool enable);
+
 // Minimize a window (hide from desktop, show in taskbar).
 void WmMinimizeWindow(int idx);
 
@@ -172,6 +177,13 @@ void WmSetClientSideDecoration(int idx, bool enable);
 
 // Move a window to a new position.
 void WmMoveWindow(int idx, int16_t newX, int16_t newY);
+
+// Move one WM-API window relative to another window's client-area origin.
+// Used by waylandd for xdg_popup placement, where popup coordinates are
+// relative to the parent xdg surface rather than screen coordinates.
+bool WmMoveWindowRelativeToParent(Process* proc, uint32_t wmId,
+                                  uint32_t parentWmId,
+                                  int32_t relX, int32_t relY);
 
 // Resize a window's client area.  For terminal windows, reallocates the VFB
 // and sends SIGWINCH.  For non-terminal windows, updates dimensions only.
@@ -231,9 +243,10 @@ struct WmCreateWindowResult {
 };
 
 WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
-                                              uint16_t clientW,
-                                              uint16_t clientH,
-                                              const char* title);
+                                               uint16_t clientW,
+                                               uint16_t clientH,
+                                               const char* title,
+                                               bool focusable = true);
 
 void WmDestroyWindowById(Process* proc, uint32_t wmId);
 void WmSignalDirtyById(Process* proc, uint32_t wmId);

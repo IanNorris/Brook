@@ -12,13 +12,13 @@ namespace brook {
 // Header and footer store the block size, allowing O(1) coalescing in both
 // directions. Magic values detect common corruption patterns.
 //
-// Alignment: all allocations are 16-byte aligned.
+// Alignment: all allocations are 64-byte aligned.
 // Expansion: the heap grows by calling VmmAllocPages() when exhausted.
 
 // Initialise the heap. Must be called after VmmInit().
 extern "C" void HeapInit();
 
-// Allocate at least 'size' bytes. Returns a 16-byte-aligned pointer, or
+// Allocate at least 'size' bytes. Returns a 64-byte-aligned pointer, or
 // nullptr on failure. Requesting 0 bytes returns nullptr.
 extern "C" void* kmalloc(uint64_t size);
 

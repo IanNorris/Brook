@@ -56,10 +56,94 @@ static uint32_t g_compositedCount = 0;
 // ProcessDestroy uses this to wait until any in-progress blit has finished.
 static volatile uint64_t g_compositorEpoch = 0;
 
+struct DeferredPageFree {
+    uint64_t virtAddr;
+    uint64_t pageCount;
+    uint64_t readyEpoch;
+};
+
+static constexpr uint32_t MAX_DEFERRED_PAGE_FREES = 128;
+static DeferredPageFree g_deferredPageFrees[MAX_DEFERRED_PAGE_FREES] = {};
+static volatile uint32_t g_deferredFreeLock = 0;
+
+static uint64_t DeferredFreeLockAcquire()
+{
+    uint64_t flags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+    while (__atomic_exchange_n(&g_deferredFreeLock, 1u, __ATOMIC_ACQUIRE))
+        __asm__ volatile("pause" ::: "memory");
+    return flags;
+}
+
+static void DeferredFreeLockRelease(uint64_t flags)
+{
+    __atomic_store_n(&g_deferredFreeLock, 0u, __ATOMIC_RELEASE);
+    if (flags & 0x200)
+        __asm__ volatile("sti" ::: "memory");
+}
+
+static void DrainDeferredPageFrees(uint64_t epoch)
+{
+    uint64_t freeVirt[MAX_DEFERRED_PAGE_FREES];
+    uint64_t freePages[MAX_DEFERRED_PAGE_FREES];
+    uint32_t freeCount = 0;
+
+    uint64_t flags = DeferredFreeLockAcquire();
+    for (uint32_t i = 0; i < MAX_DEFERRED_PAGE_FREES; ++i)
+    {
+        DeferredPageFree& item = g_deferredPageFrees[i];
+        uint64_t virt = item.virtAddr;
+        if (!virt || epoch < item.readyEpoch)
+            continue;
+
+        uint64_t pages = item.pageCount;
+        item.pageCount = 0;
+        item.readyEpoch = 0;
+        item.virtAddr = 0;
+        if (pages)
+        {
+            freeVirt[freeCount] = virt;
+            freePages[freeCount] = pages;
+            ++freeCount;
+        }
+    }
+    DeferredFreeLockRelease(flags);
+
+    for (uint32_t i = 0; i < freeCount; ++i)
+        VmmFreePages(VirtualAddress(freeVirt[i]), freePages[i]);
+}
+
+void CompositorDeferFreePages(uint64_t virtAddr, uint64_t pageCount)
+{
+    if (!virtAddr || pageCount == 0)
+        return;
+
+    uint64_t readyEpoch = __atomic_load_n(&g_compositorEpoch, __ATOMIC_ACQUIRE) + 2;
+    uint64_t flags = DeferredFreeLockAcquire();
+    for (uint32_t i = 0; i < MAX_DEFERRED_PAGE_FREES; ++i)
+    {
+        if (g_deferredPageFrees[i].virtAddr == 0)
+        {
+            g_deferredPageFrees[i].pageCount = pageCount;
+            g_deferredPageFrees[i].readyEpoch = readyEpoch;
+            g_deferredPageFrees[i].virtAddr = virtAddr;
+            DeferredFreeLockRelease(flags);
+            CompositorWake();
+            return;
+        }
+    }
+    DeferredFreeLockRelease(flags);
+
+    SerialPrintf("COMPOSITOR: deferred page-free queue full; leaking 0x%lx (%lu pages)\n",
+                 virtAddr, pageCount);
+}
+
 // Global input "grabber" — set by waylandd via sys_brook_input_grab so it
 // receives every keyboard/mouse event in addition to (or instead of) the
 // kernel WM's per-window routing. NULL means no grabber registered.
 static Process* g_inputGrabber = nullptr;
+static Process* g_cursorVisibilityOwner = nullptr;
+static uint32_t g_defaultCursorVisible = 1;
 
 bool CompositorSetInputGrabber(Process* proc, bool enable)
 {
@@ -85,6 +169,24 @@ void CompositorClearInputGrabberIfMatches(Process* proc)
         __atomic_store_n(&g_inputGrabber, static_cast<Process*>(nullptr), __ATOMIC_RELEASE);
         SerialPrintf("COMPOSITOR: input grabber pid=%u exited, cleared\n", proc->pid);
     }
+    Process* cursorOwner = __atomic_load_n(&g_cursorVisibilityOwner, __ATOMIC_ACQUIRE);
+    if (cursorOwner == proc) {
+        __atomic_store_n(&g_cursorVisibilityOwner, static_cast<Process*>(nullptr),
+                         __ATOMIC_RELEASE);
+        __atomic_store_n(&g_defaultCursorVisible, 1u, __ATOMIC_RELEASE);
+        SerialPrintf("COMPOSITOR: cursor visibility owner pid=%u exited, reset visible\n",
+                     proc->pid);
+        CompositorWake();
+    }
+}
+
+bool CompositorSetCursorVisible(Process* proc, bool visible)
+{
+    if (!proc) return false;
+    __atomic_store_n(&g_cursorVisibilityOwner, proc, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_defaultCursorVisible, visible ? 1u : 0u, __ATOMIC_RELEASE);
+    CompositorWake();
+    return true;
 }
 
 static inline void RouteToGrabber(const InputEvent& ev)
@@ -534,14 +636,37 @@ static void BlitWindowVfb(const uint32_t* src,
     MarkDirtyRows(static_cast<uint32_t>(dstY0) + startDy,
                   static_cast<uint32_t>(dstY0) + endDy);
 
-    uint32_t copyWidth = (endDx - startDx) * 4;
     for (uint32_t dy = startDy; dy < endDy; ++dy)
     {
         const uint32_t* srcRow = src + dy * srcStride + startDx;
         uint32_t* dstRow = dstBase +
             static_cast<uint32_t>(dstY0 + dy) * dstStride +
             static_cast<uint32_t>(dstX0 + startDx);
-        __builtin_memcpy(dstRow, srcRow, copyWidth);
+        for (uint32_t dx = startDx; dx < endDx; ++dx)
+        {
+            uint32_t sp = srcRow[dx - startDx];
+            uint32_t a = sp >> 24;
+            if (a == 0)
+                continue;
+            if (a == 255)
+            {
+                dstRow[dx - startDx] = sp;
+                continue;
+            }
+
+            uint32_t dp = dstRow[dx - startDx];
+            uint32_t inv = 255 - a;
+            uint32_t sr = (sp >> 16) & 0xff;
+            uint32_t sg = (sp >> 8) & 0xff;
+            uint32_t sb = sp & 0xff;
+            uint32_t dr = (dp >> 16) & 0xff;
+            uint32_t dg = (dp >> 8) & 0xff;
+            uint32_t db = dp & 0xff;
+            uint32_t r = (sr * a + dr * inv + 127) / 255;
+            uint32_t g = (sg * a + dg * inv + 127) / 255;
+            uint32_t b = (sb * a + db * inv + 127) / 255;
+            dstRow[dx - startDx] = 0xff000000u | (r << 16) | (g << 8) | b;
+        }
     }
 }
 
@@ -1092,11 +1217,60 @@ static bool    g_wmResizing      = false;
 static int     g_wmResizeWindow  = -1;
 static int16_t g_wmResizeStartMX = 0;
 static int16_t g_wmResizeStartMY = 0;
+static int16_t g_wmResizeStartX  = 0;
+static int16_t g_wmResizeStartY  = 0;
 static uint16_t g_wmResizeStartW = 0;
 static uint16_t g_wmResizeStartH = 0;
-static bool    g_wmResizeX       = false; // resize horizontally
-static bool    g_wmResizeY       = false; // resize vertically
+static bool    g_wmResizeLeft    = false;
+static bool    g_wmResizeRight   = false;
+static bool    g_wmResizeTop     = false;
+static bool    g_wmResizeBottom  = false;
 static bool    g_wmLastBtnDown   = false;
+static bool    g_wmPrimaryDown   = false;
+
+bool CompositorBeginWindowMove(int windowIdx)
+{
+    if (!MouseIsAvailable()) return false;
+    Window* w = WmGetWindow(windowIdx);
+    if (!w || !w->proc || w->state == WindowState::Maximized) return false;
+
+    int32_t mx = 0, my = 0;
+    MouseGetPosition(&mx, &my);
+    g_wmDragging = true;
+    g_wmDragWindow = windowIdx;
+    g_wmDragOffsetX = static_cast<int16_t>(mx - w->x);
+    g_wmDragOffsetY = static_cast<int16_t>(my - w->y);
+    g_wmLastBtnDown = true;
+    WmSetFocus(windowIdx);
+    return true;
+}
+
+bool CompositorBeginWindowResize(int windowIdx, bool left, bool right,
+                                 bool top, bool bottom)
+{
+    if (!MouseIsAvailable()) return false;
+    if (!left && !right && !top && !bottom) return false;
+    Window* w = WmGetWindow(windowIdx);
+    if (!w || !w->proc || w->state == WindowState::Maximized) return false;
+
+    int32_t mx = 0, my = 0;
+    MouseGetPosition(&mx, &my);
+    g_wmResizing = true;
+    g_wmResizeWindow = windowIdx;
+    g_wmResizeStartMX = static_cast<int16_t>(mx);
+    g_wmResizeStartMY = static_cast<int16_t>(my);
+    g_wmResizeStartX = w->x;
+    g_wmResizeStartY = w->y;
+    g_wmResizeStartW = w->clientW;
+    g_wmResizeStartH = w->clientH;
+    g_wmResizeLeft = left;
+    g_wmResizeRight = right;
+    g_wmResizeTop = top;
+    g_wmResizeBottom = bottom;
+    g_wmLastBtnDown = true;
+    WmSetFocus(windowIdx);
+    return true;
+}
 
 static void CompositorHandleMouseWM()
 {
@@ -1107,15 +1281,24 @@ static void CompositorHandleMouseWM()
 
     // Determine button state. Use latched press/release from input queue
     // to survive fast press+release cycles between compositor frames.
-    // Also check polled state for held buttons (drag operations).
+    // Also check polled state for held buttons (drag operations).  Some
+    // pointer backends report transitions without a reliable polled hold
+    // state, so keep an internal primary-button state from the latches.
     uint8_t polledButtons = MouseGetButtons();
-    bool btnDown = (polledButtons & 0x01) != 0;
+    bool polledDown = (polledButtons & 0x01) != 0;
+    bool releaseLatched = g_wmBtnReleaseLatch;
+    bool btnDown = g_wmPrimaryDown || polledDown;
 
     // If a press was latched, treat as button down regardless of current state
     if (g_wmBtnLatch)
     {
+        g_wmPrimaryDown = true;
         btnDown = true;
         g_wmBtnLatch = false;
+    }
+    if (releaseLatched)
+    {
+        g_wmBtnReleaseLatch = false;
     }
 
     if (btnDown && !g_wmLastBtnDown)
@@ -1188,6 +1371,23 @@ static void CompositorHandleMouseWM()
         if (hit.windowIndex >= 0)
         {
             WmSetFocus(hit.windowIndex);
+            Window* hitWindow = WmGetWindow(hit.windowIndex);
+            if (hitWindow && hitWindow->noChrome)
+            {
+                int32_t localX = mx - hitWindow->x;
+                int32_t localY = my - hitWindow->y;
+                int32_t reservedControls =
+                    static_cast<int32_t>(WM_BUTTON_WIDTH * 4);
+                if (localY >= 0 &&
+                    localY < static_cast<int32_t>(WM_TITLE_BAR_HEIGHT) &&
+                    localX >= 0 &&
+                    localX < static_cast<int32_t>(hitWindow->clientW) - reservedControls)
+                {
+                    CompositorBeginWindowMove(hit.windowIndex);
+                    g_wmLastBtnDown = btnDown;
+                    return;
+                }
+            }
 
             switch (hit.zone)
             {
@@ -1225,14 +1425,7 @@ static void CompositorHandleMouseWM()
             case WmHitZone::TitleBar:
             {
                 // Start drag
-                Window* w = WmGetWindow(hit.windowIndex);
-                if (w && w->state != WindowState::Maximized)
-                {
-                    g_wmDragging = true;
-                    g_wmDragWindow = hit.windowIndex;
-                    g_wmDragOffsetX = static_cast<int16_t>(mx - w->x);
-                    g_wmDragOffsetY = static_cast<int16_t>(my - w->y);
-                }
+                CompositorBeginWindowMove(hit.windowIndex);
                 break;
             }
             case WmHitZone::ResizeCorner:
@@ -1243,14 +1436,9 @@ static void CompositorHandleMouseWM()
                 Window* w = WmGetWindow(hit.windowIndex);
                 if (w && w->state != WindowState::Maximized)
                 {
-                    g_wmResizing = true;
-                    g_wmResizeWindow = hit.windowIndex;
-                    g_wmResizeStartMX = static_cast<int16_t>(mx);
-                    g_wmResizeStartMY = static_cast<int16_t>(my);
-                    g_wmResizeStartW  = w->clientW;
-                    g_wmResizeStartH  = w->clientH;
-                    g_wmResizeX = (hit.zone != WmHitZone::ResizeBottom);
-                    g_wmResizeY = (hit.zone != WmHitZone::ResizeRight);
+                    bool resizeX = (hit.zone != WmHitZone::ResizeBottom);
+                    bool resizeY = (hit.zone != WmHitZone::ResizeRight);
+                    CompositorBeginWindowResize(hit.windowIndex, false, resizeX, false, resizeY);
                 }
                 break;
             }
@@ -1273,20 +1461,53 @@ static void CompositorHandleMouseWM()
         // The actual VFB reallocation happens on release.
         int16_t dx = static_cast<int16_t>(mx) - g_wmResizeStartMX;
         int16_t dy = static_cast<int16_t>(my) - g_wmResizeStartMY;
-        int32_t newW = static_cast<int32_t>(g_wmResizeStartW) + (g_wmResizeX ? dx : 0);
-        int32_t newH = static_cast<int32_t>(g_wmResizeStartH) + (g_wmResizeY ? dy : 0);
-        if (newW < static_cast<int32_t>(WM_MIN_WIDTH))  newW = WM_MIN_WIDTH;
-        if (newH < static_cast<int32_t>(WM_MIN_HEIGHT)) newH = WM_MIN_HEIGHT;
+        int32_t newX = g_wmResizeStartX;
+        int32_t newY = g_wmResizeStartY;
+        int32_t newW = g_wmResizeStartW;
+        int32_t newH = g_wmResizeStartH;
+
+        if (g_wmResizeRight)
+            newW = static_cast<int32_t>(g_wmResizeStartW) + dx;
+        if (g_wmResizeBottom)
+            newH = static_cast<int32_t>(g_wmResizeStartH) + dy;
+        if (g_wmResizeLeft)
+        {
+            newW = static_cast<int32_t>(g_wmResizeStartW) - dx;
+            newX = static_cast<int32_t>(g_wmResizeStartX) + dx;
+        }
+        if (g_wmResizeTop)
+        {
+            newH = static_cast<int32_t>(g_wmResizeStartH) - dy;
+            newY = static_cast<int32_t>(g_wmResizeStartY) + dy;
+        }
+        if (newW < static_cast<int32_t>(WM_MIN_WIDTH))
+        {
+            if (g_wmResizeLeft)
+                newX = static_cast<int32_t>(g_wmResizeStartX) +
+                       static_cast<int32_t>(g_wmResizeStartW) -
+                       static_cast<int32_t>(WM_MIN_WIDTH);
+            newW = WM_MIN_WIDTH;
+        }
+        if (newH < static_cast<int32_t>(WM_MIN_HEIGHT))
+        {
+            if (g_wmResizeTop)
+                newY = static_cast<int32_t>(g_wmResizeStartY) +
+                       static_cast<int32_t>(g_wmResizeStartH) -
+                       static_cast<int32_t>(WM_MIN_HEIGHT);
+            newH = WM_MIN_HEIGHT;
+        }
 
         // Update outer dimensions only — compositor will clip blit to VFB size
         Window* w = WmGetWindow(g_wmResizeWindow);
         if (w)
         {
+            w->x = static_cast<int16_t>(newX);
+            w->y = static_cast<int16_t>(newY);
             w->clientW = static_cast<uint16_t>(newW);
             w->clientH = static_cast<uint16_t>(newH);
         }
     }
-    else if (!btnDown)
+    else if (!btnDown && !releaseLatched)
     {
         // On release, do the actual VFB resize if we were resizing
         if (g_wmResizing && g_wmResizeWindow >= 0)
@@ -1301,6 +1522,32 @@ static void CompositorHandleMouseWM()
         g_wmDragWindow = -1;
         g_wmResizing = false;
         g_wmResizeWindow = -1;
+        g_wmResizeLeft = false;
+        g_wmResizeRight = false;
+        g_wmResizeTop = false;
+        g_wmResizeBottom = false;
+    }
+
+    if (releaseLatched && !polledDown)
+    {
+        if (g_wmResizing && g_wmResizeWindow >= 0)
+        {
+            Window* w = WmGetWindow(g_wmResizeWindow);
+            if (w && w->proc)
+            {
+                WmResizeWindow(g_wmResizeWindow, w->clientW, w->clientH);
+            }
+        }
+        g_wmPrimaryDown = false;
+        g_wmDragging = false;
+        g_wmDragWindow = -1;
+        g_wmResizing = false;
+        g_wmResizeWindow = -1;
+        g_wmResizeLeft = false;
+        g_wmResizeRight = false;
+        g_wmResizeTop = false;
+        g_wmResizeBottom = false;
+        btnDown = false;
     }
 
     g_wmLastBtnDown = btnDown;
@@ -1417,6 +1664,8 @@ static void CompositorLoop()
 {
     if (!g_physFb)
         return;
+    const bool cursorVisibleThisFrame =
+        __atomic_load_n(&g_defaultCursorVisible, __ATOMIC_ACQUIRE) != 0;
 
     // Present-timing: sample period (wakeup-to-wakeup) and mark loop start.
     uint64_t loopStartTick = g_lapicTickCount;
@@ -1424,8 +1673,10 @@ static void CompositorLoop()
         ? (loopStartTick - g_presentLastLoopTick) : 0;
     g_presentLastLoopTick = loopStartTick;
 
-    // Bump frame epoch so ProcessDestroy can wait for in-progress blits.
-    __atomic_add_fetch(&g_compositorEpoch, 1, __ATOMIC_ACQ_REL);
+    // Bump frame epoch so ProcessDestroy/deferred frees can wait for
+    // in-progress blits.
+    uint64_t epoch = __atomic_add_fetch(&g_compositorEpoch, 1, __ATOMIC_ACQ_REL);
+    DrainDeferredPageFrees(epoch);
 
     // Restore pixels under the old cursor position before blitting.
     if (g_cursorVisible) {
@@ -1510,7 +1761,7 @@ static void CompositorLoop()
     } // end legacy mode
 
     // Draw mouse cursor on top of everything.
-    if (MouseIsAvailable())
+    if (MouseIsAvailable() && cursorVisibleThisFrame)
     {
         int32_t mx, my;
         MouseGetPosition(&mx, &my);

@@ -1,19 +1,22 @@
 #pragma once
 
 #include <stdint.h>
+#include "memory/heap.h"
 #include "spinlock.h"
 
 namespace brook {
 
 struct Process;  // forward declaration for waiter
 
-// Kernel pipe buffer — fixed-size ring buffer with reader/writer reference counts.
+// Kernel pipe buffer — ring buffer with reader/writer reference counts.
 // Blocking read/write via SchedulerBlock() when buffer is empty/full.
-static constexpr uint32_t PIPE_BUF_SIZE = 4096;
+static constexpr uint32_t PIPE_BUF_DEFAULT_SIZE = 4096;
+static constexpr uint32_t PIPE_BUF_UNIX_SIZE    = 65536;
 
 struct PipeBuffer
 {
-    char     data[PIPE_BUF_SIZE];
+    char*    data = nullptr;
+    uint32_t capacity = 0;
     volatile uint32_t head = 0;
     volatile uint32_t tail = 0;
     SpinLock lock = {};
@@ -32,12 +35,14 @@ struct PipeBuffer
 
     uint32_t count() const
     {
-        return (head - tail + PIPE_BUF_SIZE) % PIPE_BUF_SIZE;
+        if (capacity == 0) return 0;
+        return (head - tail + capacity) % capacity;
     }
 
     uint32_t space() const
     {
-        return PIPE_BUF_SIZE - 1 - count();
+        if (capacity == 0) return 0;
+        return capacity - 1 - count();
     }
 
     bool empty() const { return head == tail; }
@@ -47,13 +52,19 @@ struct PipeBuffer
     {
         uint64_t flags = SpinLockAcquire(&lock);
 
-        uint32_t avail = PIPE_BUF_SIZE - 1 - ((head - tail + PIPE_BUF_SIZE) % PIPE_BUF_SIZE);
+        if (!data || capacity == 0)
+        {
+            SpinLockRelease(&lock, flags);
+            return 0;
+        }
+
+        uint32_t avail = capacity - 1 - ((head - tail + capacity) % capacity);
         if (len > avail) len = avail;
 
         for (uint32_t i = 0; i < len; ++i)
         {
             data[head] = src[i];
-            head = (head + 1) % PIPE_BUF_SIZE;
+            head = (head + 1) % capacity;
         }
 
         SpinLockRelease(&lock, flags);
@@ -65,18 +76,54 @@ struct PipeBuffer
     {
         uint64_t flags = SpinLockAcquire(&lock);
 
-        uint32_t avail = (head - tail + PIPE_BUF_SIZE) % PIPE_BUF_SIZE;
+        if (!data || capacity == 0)
+        {
+            SpinLockRelease(&lock, flags);
+            return 0;
+        }
+
+        uint32_t avail = (head - tail + capacity) % capacity;
         if (len > avail) len = avail;
 
         for (uint32_t i = 0; i < len; ++i)
         {
             dst[i] = data[tail];
-            tail = (tail + 1) % PIPE_BUF_SIZE;
+            tail = (tail + 1) % capacity;
         }
 
         SpinLockRelease(&lock, flags);
         return len;
     }
 };
+
+static inline PipeBuffer* PipeBufferCreate(uint32_t capacity)
+{
+    if (capacity < 2) return nullptr;
+
+    auto* pipe = static_cast<PipeBuffer*>(kmalloc(sizeof(PipeBuffer)));
+    if (!pipe) return nullptr;
+    for (uint64_t i = 0; i < sizeof(PipeBuffer); i++)
+        reinterpret_cast<uint8_t*>(pipe)[i] = 0;
+
+    pipe->data = static_cast<char*>(kmalloc(capacity));
+    if (!pipe->data)
+    {
+        kfree(pipe);
+        return nullptr;
+    }
+    for (uint32_t i = 0; i < capacity; i++)
+        pipe->data[i] = 0;
+
+    pipe->capacity = capacity;
+    return pipe;
+}
+
+static inline void PipeBufferDestroy(PipeBuffer* pipe)
+{
+    if (!pipe) return;
+    if (pipe->data)
+        kfree(pipe->data);
+    kfree(pipe);
+}
 
 } // namespace brook
