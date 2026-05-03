@@ -1,9 +1,10 @@
 // exception_stubs.S — Assembly ISR stubs for exceptions that need full GPR access.
 //
-// Vectors 13 (#GP) and 14 (#PF) push an error code. The stubs save all
-// general-purpose registers into a FullExceptionFrame struct, call the C
-// handler HandleExceptionFull(), then restore GPRs (which the handler may
-// have modified for signal delivery) and IRETQ.
+// Full-register exception stubs save all general-purpose registers into a
+// FullExceptionFrame struct, call the C handler HandleExceptionFull(), then
+// restore GPRs (which the handler may have modified for signal delivery) and
+// IRETQ. Vectors without a CPU error code push a synthetic zero error code so
+// the C-side frame layout stays identical.
 //
 // FullExceptionFrame layout (must match idt.cpp):
 //   [RSP+0x00] r15
@@ -29,6 +30,78 @@
 //   [RSP+0xA0] ss          (pushed by CPU, only for ring 3→0 transition)
 
 .text
+
+// Macro for an exception without a CPU-pushed error code.
+.macro EXCEPTION_STUB_NOERR vector
+.global ExceptionStub\vector
+.type ExceptionStub\vector, @function
+ExceptionStub\vector:
+    // Synthesize an error_code slot so FullExceptionFrame matches the error
+    // code exceptions: errorCode, rip, cs, rflags, rsp, ss.
+    pushq $0
+
+    // Push all GPRs to form FullExceptionFrame
+    push %rax
+    push %rbx
+    push %rcx
+    push %rdx
+    push %rsi
+    push %rdi
+    push %rbp
+    push %r8
+    push %r9
+    push %r10
+    push %r11
+    push %r12
+    push %r13
+    push %r14
+    push %r15
+
+    // SWAPGS if coming from user mode (check CS on the interrupt frame)
+    testq $3, 0x88(%rsp)
+    jz 1f
+    swapgs
+1:
+
+    movq %rsp, %rdi
+    movq $\vector, %rsi
+
+    movq %rsp, %rbp
+    andq $-16, %rsp
+    subq $8, %rsp
+    push %rbp
+
+    call HandleExceptionFull
+
+    pop %rsp
+
+    // SWAPGS back if returning to user mode
+    testq $3, 0x88(%rsp)
+    jz 2f
+    swapgs
+2:
+
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %r11
+    pop %r10
+    pop %r9
+    pop %r8
+    pop %rbp
+    pop %rdi
+    pop %rsi
+    pop %rdx
+    pop %rcx
+    pop %rbx
+    pop %rax
+
+    // Remove synthetic error code
+    addq $8, %rsp
+
+    iretq
+.endm
 
 // Macro for an exception with error code.
 // The CPU pushes: [SS, RSP, RFLAGS, CS, RIP, ErrorCode]
@@ -113,6 +186,7 @@ ExceptionStub\vector:
     iretq
 .endm
 
-// Generate stubs for #GP (13) and #PF (14)
+// Generate stubs for exceptions that need full register capture / QR panic.
+EXCEPTION_STUB_NOERR 6
 EXCEPTION_STUB_ERR 13
 EXCEPTION_STUB_ERR 14

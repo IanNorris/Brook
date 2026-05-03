@@ -6,24 +6,28 @@
 
 namespace brook {
 
+struct Vnode;
+
 // Maximum number of open file descriptors per process.
 static constexpr uint32_t MAX_FDS = 256;
 
 // Maximum concurrent processes.
 static constexpr uint32_t MAX_PROCESSES = 256;
 
-// Program break limit (max heap size per process).
-static constexpr uint64_t PROGRAM_BREAK_SIZE = 64 * 1024 * 1024; // 64 MB
+// Program break limit (max brk heap size per process). Browser/WebContent
+// workloads can exceed 64 MB through many small allocator requests before
+// falling back to mmap.
+static constexpr uint64_t PROGRAM_BREAK_SIZE = 128 * 1024 * 1024; // 128 MB
 
 // Default user stack size.
 static constexpr uint64_t USER_STACK_SIZE = 8 * 1024 * 1024; // 8 MB (Linux default)
 
-// Per-process kernel stack size (32 pages = 128 KB).
+// Per-process kernel stack size (64 pages = 256 KB).
 // Must be large enough for syscalls (VFS/FatFS stack depth), interrupts,
 // and signal delivery frames (~560 bytes each).
 // Each process's kernel stack is also used as its syscall stack (gs:8).
 // The allocation includes unmapped guard pages at both ends for overflow detection.
-static constexpr uint64_t KERNEL_STACK_SIZE = 128 * 1024;
+static constexpr uint64_t KERNEL_STACK_SIZE = 256 * 1024;
 static constexpr uint64_t KERNEL_STACK_PAGES = KERNEL_STACK_SIZE / 4096;
 
 // Scheduler time slice in milliseconds (~10ms).
@@ -55,6 +59,7 @@ struct KernelSigaction {
 static constexpr uint64_t SA_SIGINFO  = 0x00000004;
 static constexpr uint64_t SA_ONSTACK  = 0x08000000;
 static constexpr uint64_t SA_RESTORER = 0x04000000;
+static constexpr uint64_t SA_RESTART  = 0x10000000;
 
 // Per-process signal handlers (indexed by [pid][signal-1])
 extern KernelSigaction g_sigHandlers[MAX_PROCESSES][64];
@@ -163,10 +168,13 @@ struct SavedContext
     uint64_t fsBase;    // FS segment base (TLS)
 };
 
-// FXSAVE area must be 16-byte aligned, 512 bytes.
-struct alignas(16) FxsaveArea
+// XSAVE area for x87 + SSE + AVX state.  Brook enables CR4.OSXSAVE and
+// XCR0[2] for AVX-capable userland, so fxsave/fxrstor is not sufficient:
+// it omits the upper halves of YMM registers and corrupts AVX-optimised code
+// across context switches.
+struct alignas(64) FxsaveArea
 {
-    uint8_t data[512];
+    uint8_t data[1088];
 };
 
 // ---------------------------------------------------------------------------
@@ -261,9 +269,14 @@ struct Process
     uint16_t pgid;               // Process group ID
     uint16_t sid;                // Session ID
     uint16_t tgid;               // Thread group ID (= leader's PID; same as PID for main thread)
+    uint32_t uid;                // Real user ID
+    uint32_t euid;               // Effective user ID
+    uint32_t gid;                // Real group ID
+    uint32_t egid;               // Effective group ID
     ProcessState state;
     uint8_t  schedPriority;  // Initial scheduler priority (0=RT, 1=High, 2=Normal, 3=Low)
     int32_t  runningOnCpu;   // CPU index (-1 = not running, used for double-schedule detection)
+    int32_t  cpuAffinity;    // User address spaces are pinned until SMP TLB shootdown exists (-1 = unset)
     volatile bool reapable;  // Set after context_switch completes away from this process
     volatile bool compositorRegistered; // True while compositor holds a reference to this process's VFB
     int32_t exitStatus;      // Exit status (stored when process exits, for wait4)
@@ -328,8 +341,17 @@ struct Process
      * 256 covers realistic GTK app sessions; cost is 256*32B = 8 KB
      * per process, which is negligible. */
     static constexpr uint32_t MAX_MEMFD_MAPS = 256;
-    struct MemFdMap { uint64_t vaddr; uint64_t length; uint64_t offset; void* mfd; };
+    struct MemFdMap { uint64_t vaddr; uint64_t length; uint64_t offset; uint64_t vmmFlags; void* mfd; };
     MemFdMap memfdMaps[MAX_MEMFD_MAPS];
+
+    // File-backed mmap ranges.  These are demand-paged by the user #PF path:
+    // each entry owns a Vnode reference independent of the fd table so close(fd)
+    // after mmap() keeps the backing object alive.
+    // VLC's no-cache plugin scan maps hundreds of shared objects during one
+    // startup, so this needs to cover more than the dynamic loader's base set.
+    static constexpr uint32_t MAX_FILE_MAPS = 4096;
+    struct FileMap { uint64_t vaddr; uint64_t length; uint64_t offset; uint64_t vmmFlags; Vnode* vnode; };
+    FileMap fileMaps[MAX_FILE_MAPS];
 
     // /dev/fb0 mmap ranges — recorded so sys_munmap can unmap without
     // freeing the underlying physical pages, which are owned by
@@ -375,6 +397,9 @@ struct Process
     // Process name (for debug output)
     char name[32];
 
+    // Absolute path of the current executable for /proc/self/exe.
+    char exePath[256];
+
     // Working directory (for relative path resolution)
     char cwd[64];
 
@@ -408,6 +433,24 @@ struct Process
     // forkReturnRip with RAX=0 (child's fork() return value).
     bool isForkChild;
     bool stopReported;          // True after wait4 reported this process as stopped
+    // Stable copy of the user register snapshot taken at syscall entry. The
+    // syscall path copies per-CPU %gs fields here before re-enabling interrupts
+    // so fork/clone are not racing another syscall on the same CPU.
+    uint64_t syscallUserRip;
+    uint64_t syscallUserRsp;
+    uint64_t syscallUserRflags;
+    uint64_t syscallUserRbx;
+    uint64_t syscallUserRbp;
+    uint64_t syscallUserR12;
+    uint64_t syscallUserR13;
+    uint64_t syscallUserR14;
+    uint64_t syscallUserR15;
+    uint64_t syscallUserRdi;
+    uint64_t syscallUserRsi;
+    uint64_t syscallUserRdx;
+    uint64_t syscallUserR8;
+    uint64_t syscallUserR9;
+    uint64_t syscallUserR10;
     uint64_t forkReturnRip;     // User-mode RIP to resume at (instruction after syscall)
     uint64_t forkReturnRsp;     // User-mode RSP at time of fork
     uint64_t forkReturnRflags;  // User-mode RFLAGS at time of fork
@@ -437,9 +480,14 @@ struct Process
 // Push an input event to a process's per-process queue (non-blocking).
 inline void ProcessInputPush(Process* proc, const InputEvent& ev)
 {
-    uint32_t next = (proc->inputHead + 1) % Process::INPUT_QUEUE_SIZE;
-    if (next == proc->inputTail) return; // full — drop
-    proc->inputQueue[proc->inputHead] = ev;
+    if (!proc || proc->magic != PROCESS_MAGIC ||
+        proc->state == ProcessState::Terminated)
+        return;
+    uint32_t head = __atomic_load_n(&proc->inputHead, __ATOMIC_ACQUIRE);
+    uint32_t tail = __atomic_load_n(&proc->inputTail, __ATOMIC_ACQUIRE);
+    uint32_t next = (head + 1) % Process::INPUT_QUEUE_SIZE;
+    if (next == tail) return; // full — drop
+    proc->inputQueue[head] = ev;
     __atomic_store_n(&proc->inputHead, next, __ATOMIC_RELEASE);
 }
 

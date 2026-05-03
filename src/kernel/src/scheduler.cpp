@@ -20,10 +20,11 @@ namespace brook { extern volatile uint64_t g_lapicTickCount; }
 
 // Context switch — implemented in context_switch.S
 extern "C" void context_switch(brook::SavedContext* oldCtx, brook::SavedContext* newCtx,
-                                brook::FxsaveArea* oldFx, brook::FxsaveArea* newFx);
+                                brook::FxsaveArea* oldFx, brook::FxsaveArea* newFx,
+                                volatile int32_t* oldRunningOnCpu);
 
 // Futex wake — implemented in syscall.cpp, called for clear_child_tid on thread exit
-extern "C" int64_t FutexWake(uint64_t uaddr, uint32_t maxWake,
+extern "C" int64_t FutexWake(uint64_t owner, uint64_t uaddr, uint32_t maxWake,
                               uint32_t wake_bitset = 0xFFFFFFFFu);
 
 // Enter user mode for the first time (existing function in syscall.cpp).
@@ -174,11 +175,52 @@ static void ReadyQueueRemoveLocked(Process* proc)
     g_schedOps->Remove(g_schedState, proc->pid);
 }
 
-static Process* PickNextLocked()
+static bool ProcessCanRunOnCpu(Process* proc, uint32_t cpu)
 {
-    uint16_t pid = g_schedOps->PickNext(g_schedState);
-    if (pid == SCHED_PID_NONE) return nullptr;
-    return g_pidToProcess[pid];
+    if (!proc || proc->pid == 0 || proc->isKernelThread)
+        return true;
+    int32_t affinity = __atomic_load_n(&proc->cpuAffinity, __ATOMIC_ACQUIRE);
+    return affinity < 0 || affinity == static_cast<int32_t>(cpu);
+}
+
+static void PinUserAddressSpaceToCpu(Process* proc, uint32_t cpu)
+{
+    if (!proc || proc->pid == 0 || proc->isKernelThread)
+        return;
+
+    int32_t expected = -1;
+    __atomic_compare_exchange_n(&proc->cpuAffinity, &expected,
+                                static_cast<int32_t>(cpu),
+                                false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
+static Process* PickNextLocked(uint32_t cpu)
+{
+    Process* skipped[SCHED_MAX_PIDS];
+    uint32_t skippedCount = 0;
+    uint32_t tries = g_schedOps->ReadyCount(g_schedState);
+
+    for (uint32_t i = 0; i < tries; ++i)
+    {
+        uint16_t pid = g_schedOps->PickNext(g_schedState);
+        if (pid == SCHED_PID_NONE)
+            break;
+
+        Process* proc = g_pidToProcess[pid];
+        if (proc && ProcessCanRunOnCpu(proc, cpu))
+        {
+            for (uint32_t j = 0; j < skippedCount; ++j)
+                ReadyQueueInsertLocked(skipped[j]);
+            return proc;
+        }
+
+        if (proc && skippedCount < SCHED_MAX_PIDS)
+            skipped[skippedCount++] = proc;
+    }
+
+    for (uint32_t j = 0; j < skippedCount; ++j)
+        ReadyQueueInsertLocked(skipped[j]);
+    return nullptr;
 }
 
 // Drain per-CPU bookkeeping that was set before a context_switch.
@@ -345,8 +387,6 @@ static void ForkChildTrampoline()
     uint64_t userR10 = proc->forkR10;
     proc->isForkChild = false;
 
-    __asm__ volatile("sti");
-
     // Enter user mode via IRETQ with ALL registers restored.
     // Linux preserves every register across fork except RAX (0 for child).
     // We use IRETQ instead of SYSRET because SYSRET faults are delivered in
@@ -362,6 +402,8 @@ static void ForkChildTrampoline()
     } regs = { userRip, userRflags, userRsp, userRbx, userRbp,
                userR12, userR13, userR14, userR15,
                userRdi, userRsi, userRdx, userR8, userR9, userR10 };
+
+    __asm__ volatile("cli" ::: "memory");
 
     __asm__ volatile(
         "mov %[base], %%rax\n\t"
@@ -833,14 +875,12 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
         }
     }
 
-    // Mark old process as no longer running on this CPU.
-    __atomic_store_n(&oldProc->runningOnCpu, (int32_t)-1, __ATOMIC_RELEASE);
-
     g_perCpu[cpu].currentProcess = newProc;
     if (g_perCpu[cpu].cpuEnv) {
         g_perCpu[cpu].cpuEnv->currentPid = newProc->pid;
         g_perCpu[cpu].cpuEnv->currentProcess = reinterpret_cast<uint64_t>(newProc);
     }
+    PinUserAddressSpaceToCpu(newProc, cpu);
     newProc->state = ProcessState::Running;
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
 
@@ -862,7 +902,8 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
 
     ProfilerContextSwitch(oldProc->pid, newProc->pid);
     context_switch(&oldProc->savedCtx, &newProc->savedCtx,
-                   &oldProc->fxsave, &newProc->fxsave);
+                   &oldProc->fxsave, &newProc->fxsave,
+                   &oldProc->runningOnCpu);
 
     // --- We return here when another CPU (or this one) switches back to us ---
     DrainPostSwitch(ThisCpu());
@@ -913,7 +954,7 @@ void SchedulerTimerTick(bool allowPreempt)
     if (cur == g_perCpu[cpu].idleProcess)
     {
         uint64_t rlf7 = SchedLockAcquire(g_readyLock);
-        Process* next = PickNextLocked();
+        Process* next = PickNextLocked(cpu);
         SchedLockRelease(g_readyLock, rlf7);
         if (next)
             DoSwitch(cur, next);
@@ -941,7 +982,7 @@ void SchedulerTimerTick(bool allowPreempt)
         // Stopped process — remove from ready queue and switch away
         uint64_t rlf_stop = SchedLockAcquire(g_readyLock);
         ReadyQueueRemoveLocked(cur);
-        Process* next = PickNextLocked();
+        Process* next = PickNextLocked(cpu);
         SchedLockRelease(g_readyLock, rlf_stop);
         if (next)
             DoSwitch(cur, next, /* requeueOld */ false);
@@ -960,7 +1001,7 @@ void SchedulerTimerTick(bool allowPreempt)
     // Timeslice expired — notify policy, pick next, and switch.
     uint64_t rlf8 = SchedLockAcquire(g_readyLock);
     g_schedOps->TimesliceExpired(g_schedState, cur->pid);
-    Process* next = PickNextLocked();
+    Process* next = PickNextLocked(cpu);
     SchedLockRelease(g_readyLock, rlf8);
 
     if (!next)
@@ -981,7 +1022,7 @@ void SchedulerYield()
     if (!old)
         return;
     uint64_t rlf9 = SchedLockAcquire(g_readyLock);
-    Process* next = PickNextLocked();
+    Process* next = PickNextLocked(cpu);
     SchedLockRelease(g_readyLock, rlf9);
 
     if (!next)
@@ -1057,7 +1098,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
             __atomic_store_n(tidPtr, 0, __ATOMIC_RELEASE);
             // Wake any thread waiting in futex(FUTEX_WAIT) on this address
             // (pthread_join blocks on this via FUTEX_WAIT)
-            FutexWake(proc->clearChildTid, 1);
+            FutexWake(proc->tgid, proc->clearChildTid, 1);
         }
         else
         {
@@ -1141,7 +1182,7 @@ parent_done:
 
     uint64_t rlf10 = SchedLockAcquire(g_readyLock);
     ReadyQueueRemoveLocked(proc);
-    Process* next = PickNextLocked();
+    Process* next = PickNextLocked(cpu);
     SchedLockRelease(g_readyLock, rlf10);
 
     if (!next) next = g_perCpu[cpu].idleProcess;
@@ -1153,6 +1194,7 @@ parent_done:
         g_perCpu[cpu].cpuEnv->currentPid = next->pid;
         g_perCpu[cpu].cpuEnv->currentProcess = reinterpret_cast<uint64_t>(next);
     }
+    PinUserAddressSpaceToCpu(next, cpu);
     next->state = ProcessState::Running;
     __atomic_store_n(&next->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
@@ -1166,7 +1208,8 @@ parent_done:
 
     ProfilerContextSwitch(proc->pid, next->pid);
     context_switch(&proc->savedCtx, &next->savedCtx,
-                   &proc->fxsave, &next->fxsave);
+                   &proc->fxsave, &next->fxsave,
+                   &proc->runningOnCpu);
 
     __builtin_unreachable();
 }
@@ -1179,13 +1222,14 @@ parent_done:
     uint32_t cpu = ThisCpu();
 
     uint64_t rlf11 = SchedLockAcquire(g_readyLock);
-    Process* first = PickNextLocked();
+    Process* first = PickNextLocked(cpu);
     SchedLockRelease(g_readyLock, rlf11);
 
     if (!first) first = g_perCpu[cpu].idleProcess;
 
     g_perCpu[cpu].currentProcess = first;
     if (g_perCpu[cpu].cpuEnv) { g_perCpu[cpu].cpuEnv->currentPid = first->pid; g_perCpu[cpu].cpuEnv->currentProcess = reinterpret_cast<uint64_t>(first); }
+    PinUserAddressSpaceToCpu(first, cpu);
     first->state = ProcessState::Running;
     __atomic_store_n(&first->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
@@ -1242,13 +1286,14 @@ parent_done:
 
     // Try to pick a process from the global queue.
     uint64_t rlf12 = SchedLockAcquire(g_readyLock);
-    Process* first = PickNextLocked();
+    Process* first = PickNextLocked(cpu);
     SchedLockRelease(g_readyLock, rlf12);
 
     if (!first) first = g_perCpu[cpu].idleProcess;
 
     g_perCpu[cpu].currentProcess = first;
     if (g_perCpu[cpu].cpuEnv) { g_perCpu[cpu].cpuEnv->currentPid = first->pid; g_perCpu[cpu].cpuEnv->currentProcess = reinterpret_cast<uint64_t>(first); }
+    PinUserAddressSpaceToCpu(first, cpu);
     first->state = ProcessState::Running;
     __atomic_store_n(&first->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;

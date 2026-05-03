@@ -589,9 +589,89 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
     for (;;) { __asm__ volatile("cli; pause"); }
 }
 
+static void HandleDoubleFault(InterruptFrame* frame, uint64_t errorCode)
+{
+    __asm__ volatile("cli");
+
+    uint32_t lapicId;
+    __asm__ volatile("mov $1, %%eax; cpuid; shr $24, %%ebx; mov %%ebx, %0"
+                     : "=r"(lapicId) : : "eax","ebx","ecx","edx");
+    uint32_t cpuSlot = (lapicId < 64) ? lapicId : 0;
+
+    char cpuTag[6] = {'[','C','0',']',' ','\0'};
+    cpuTag[2] = static_cast<char>('0' + cpuSlot % 10);
+
+    uint64_t cr2 = 0;
+    uint64_t cr3 = 0;
+    uint64_t rbp = 0;
+    uint64_t currentProcRaw = 0;
+    __asm__ volatile("movq %%cr2, %0" : "=r"(cr2));
+    __asm__ volatile("movq %%cr3, %0" : "=r"(cr3));
+    __asm__ volatile("movq %%rbp, %0" : "=r"(rbp));
+    __asm__ volatile("movq %%gs:184, %0" : "=r"(currentProcRaw));
+
+    // Keep #DF diagnostics independent of scheduler/process/compositor state.
+    // A double fault can be caused by a bad kernel stack or wrong GS base, and
+    // the generic handler's ProcessCurrent() path can fault before printing RIP.
+    ExcForceSerialLock();
+    ExcPutsRaw("\n"); ExcPutsRaw(cpuTag); ExcPutsRaw("=== EXCEPTION ===\n");
+    ExcPutsRaw(cpuTag); ExcPutsRaw("Vector: 008 (#DF Double Fault)\n");
+    ExcPutsRaw(cpuTag); ExcPutsRaw("  RIP   "); ExcPutHex(frame->ip);    ExcPutsRaw("\n");
+    ExcPutsRaw(cpuTag); ExcPutsRaw("  RSP   "); ExcPutHex(frame->sp);    ExcPutsRaw("\n");
+    ExcPutsRaw(cpuTag); ExcPutsRaw("  CS    "); ExcPutHex(frame->cs);    ExcPutsRaw("\n");
+    ExcPutsRaw(cpuTag); ExcPutsRaw("  SS    "); ExcPutHex(frame->ss);    ExcPutsRaw("\n");
+    ExcPutsRaw(cpuTag); ExcPutsRaw("  FLAGS "); ExcPutHex(frame->flags); ExcPutsRaw("\n");
+    ExcPutsRaw(cpuTag); ExcPutsRaw("  ERR   "); ExcPutHex(errorCode);    ExcPutsRaw("\n");
+    ExcPutsRaw(cpuTag); ExcPutsRaw("  CR2   "); ExcPutHex(cr2);          ExcPutsRaw("\n");
+    ExcPutsRaw(cpuTag); ExcPutsRaw("  CR3   "); ExcPutHex(cr3);          ExcPutsRaw("\n");
+    ExcPutsRaw(cpuTag); ExcPutsRaw("  RBP   "); ExcPutHex(rbp);          ExcPutsRaw("\n");
+    ExcPutsRaw(cpuTag); ExcPutsRaw("  CURPROC_RAW "); ExcPutHex(currentProcRaw); ExcPutsRaw("\n");
+    if (currentProcRaw >= 0xFFFF800000000000ULL && (currentProcRaw & 0x7) == 0)
+    {
+        auto* cur = reinterpret_cast<brook::Process*>(currentProcRaw);
+        ExcPutsRaw(cpuTag); ExcPutsRaw("  CUR_PID "); ExcPutHex(cur->pid);
+        ExcPutsRaw("  KSTACK_BASE "); ExcPutHex(cur->kernelStackBase);
+        ExcPutsRaw("  KSTACK_TOP "); ExcPutHex(cur->kernelStackTop);
+        ExcPutsRaw("\n");
+    }
+    ExcPutsRaw(cpuTag); ExcPutsRaw("  DESC  A second exception occurred while handling the first.\n");
+    ExcPutsRaw(cpuTag); ExcPutsRaw("  NOTE  Minimal #DF dump: skipped ProcessCurrent(), stack walk, compositor halt.\n");
+
+    if (frame->sp >= 0xFFFF800000000000ULL)
+    {
+        auto* sp = reinterpret_cast<uint64_t*>(frame->sp);
+        uint64_t handlerRet = sp[5];
+        uint64_t savedFramePtr = sp[6];
+        ExcPutsRaw(cpuTag); ExcPutsRaw("  HANDLER_RET "); ExcPutHex(handlerRet); ExcPutsRaw("\n");
+        ExcPutsRaw(cpuTag); ExcPutsRaw("  FULL_FRAME  "); ExcPutHex(savedFramePtr); ExcPutsRaw("\n");
+
+        if (savedFramePtr >= frame->sp && savedFramePtr < frame->sp + 4096)
+        {
+            auto* ef = reinterpret_cast<FullExceptionFrame*>(savedFramePtr);
+            ExcPutsRaw(cpuTag); ExcPutsRaw("  FIRST_RIP   "); ExcPutHex(ef->rip);       ExcPutsRaw("\n");
+            ExcPutsRaw(cpuTag); ExcPutsRaw("  FIRST_RSP   "); ExcPutHex(ef->rsp);       ExcPutsRaw("\n");
+            ExcPutsRaw(cpuTag); ExcPutsRaw("  FIRST_CS    "); ExcPutHex(ef->cs);        ExcPutsRaw("\n");
+            ExcPutsRaw(cpuTag); ExcPutsRaw("  FIRST_FLAGS "); ExcPutHex(ef->rflags);    ExcPutsRaw("\n");
+            ExcPutsRaw(cpuTag); ExcPutsRaw("  FIRST_ERR   "); ExcPutHex(ef->errorCode); ExcPutsRaw("\n");
+            ExcPutsRaw(cpuTag); ExcPutsRaw("  FIRST_RAX   "); ExcPutHex(ef->rax);       ExcPutsRaw("  FIRST_RBX "); ExcPutHex(ef->rbx); ExcPutsRaw("\n");
+            ExcPutsRaw(cpuTag); ExcPutsRaw("  FIRST_RDI   "); ExcPutHex(ef->rdi);       ExcPutsRaw("  FIRST_RSI "); ExcPutHex(ef->rsi); ExcPutsRaw("\n");
+            ExcPutsRaw(cpuTag); ExcPutsRaw("  FIRST_RBP   "); ExcPutHex(ef->rbp);       ExcPutsRaw("\n");
+        }
+    }
+
+    if (cr2 >= frame->sp - 4096 && cr2 < frame->sp)
+    {
+        ExcPutsRaw(cpuTag);
+        ExcPutsRaw("  HINT  CR2 is just below RSP; likely stack overflow/guard-page push fault.\n");
+    }
+
+    ExcPutsRaw(cpuTag); ExcPutsRaw("=== HALTED ===\n");
+    for (;;) { __asm__ volatile("cli; pause"); }
+}
+
 // ---------------------------------------------------------------------------
 // HandleExceptionFull — called from assembly stubs (exception_stubs.S)
-// for vectors 13 (#GP) and 14 (#PF).
+// for exceptions that need full GPR capture (#UD/#GP/#PF).
 //
 // Has access to all GPRs via FullExceptionFrame, enabling signal delivery
 // that redirects user-mode execution to a registered signal handler.
@@ -736,6 +816,28 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                 __asm__ volatile("sti");
                 return;
             }
+            extern bool FileMapHandleUserFault(uint64_t, uint64_t);
+            if (FileMapHandleUserFault(cr2cow, ef->errorCode)) {
+                __asm__ volatile("sti");
+                return;
+            }
+        }
+
+        // Kernel syscalls still copy some user buffers directly.  Until the
+        // full BRO-004 uaccess sweep lands, let those kernel-mode reads fault
+        // in lazy user VMAs and retry the instruction instead of panicking on
+        // a valid-but-not-present user page.
+        if (!fromUser && !pfPresent && isUserAddr && cowProc) {
+            extern bool MemFdHandleUserFault(uint64_t, uint64_t);
+            if (MemFdHandleUserFault(cr2cow, ef->errorCode)) {
+                __asm__ volatile("sti");
+                return;
+            }
+            extern bool FileMapHandleUserFault(uint64_t, uint64_t);
+            if (FileMapHandleUserFault(cr2cow, ef->errorCode)) {
+                __asm__ volatile("sti");
+                return;
+            }
         }
     }
 
@@ -755,6 +857,8 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         ExcForceSerialLock();
         // Print all GPRs before delegating — HandleException only gets basic frame
         ExcPutsRaw("\n=== KERNEL GPRs ===\n");
+        ExcPutsRaw("  RIP "); ExcPutHex(ef->rip); ExcPutsRaw("  RSP "); ExcPutHex(ef->rsp); ExcPutsRaw("\n");
+        ExcPutsRaw("  ERR "); ExcPutHex(ef->errorCode); ExcPutsRaw("  RFLAGS "); ExcPutHex(ef->rflags); ExcPutsRaw("\n");
         ExcPutsRaw("  RAX "); ExcPutHex(ef->rax); ExcPutsRaw("  RBX "); ExcPutHex(ef->rbx); ExcPutsRaw("\n");
         ExcPutsRaw("  RCX "); ExcPutHex(ef->rcx); ExcPutsRaw("  RDX "); ExcPutHex(ef->rdx); ExcPutsRaw("\n");
         ExcPutsRaw("  RSI "); ExcPutHex(ef->rsi); ExcPutsRaw("  RDI "); ExcPutHex(ef->rdi); ExcPutsRaw("\n");
@@ -763,6 +867,18 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         ExcPutsRaw("  R10 "); ExcPutHex(ef->r10); ExcPutsRaw("  R11 "); ExcPutHex(ef->r11); ExcPutsRaw("\n");
         ExcPutsRaw("  R12 "); ExcPutHex(ef->r12); ExcPutsRaw("  R13 "); ExcPutHex(ef->r13); ExcPutsRaw("\n");
         ExcPutsRaw("  R14 "); ExcPutHex(ef->r14); ExcPutsRaw("  R15 "); ExcPutHex(ef->r15); ExcPutsRaw("\n");
+
+        brook::Process* faultProc = brook::ProcessCurrent();
+        if (faultProc && faultProc->kernelStackBase &&
+            ef->rip >= faultProc->kernelStackBase &&
+            ef->rip < faultProc->kernelStackTop)
+        {
+            ExcPutsRaw("  DIAG RIP is inside current process kernel stack [");
+            ExcPutHex(faultProc->kernelStackBase);
+            ExcPutsRaw(", ");
+            ExcPutHex(faultProc->kernelStackTop);
+            ExcPutsRaw(") - likely corrupted return/indirect branch target\n");
+        }
 
         // Halt all other CPUs and stop the compositor before rendering
         // the panic screen — otherwise the compositor will overwrite it.
@@ -942,6 +1058,28 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
             return *reinterpret_cast<uint64_t*>(DMAP_USR + phys);
         };
 
+        ExcPutsRaw("  USER_RSP: ");
+        for (int i = 0; i < 8; ++i) {
+            ExcPutHex(readUser64(ef->rsp + static_cast<uint64_t>(i) * 8));
+            ExcPutCharRaw(' ');
+        }
+        ExcPutsRaw("\n");
+        ExcPutsRaw("  USER_RBP_CHAIN:\n");
+        uint64_t rbp = ef->rbp;
+        for (int i = 0; i < 8 && rbp >= 0x1000 && rbp < 0x800000000000ULL; ++i) {
+            uint64_t next = readUser64(rbp);
+            uint64_t ret  = readUser64(rbp + 8);
+            ExcPutsRaw("    ");
+            ExcPutHex(rbp);
+            ExcPutsRaw(" -> ");
+            ExcPutHex(next);
+            ExcPutsRaw(" ret=");
+            ExcPutHex(ret);
+            ExcPutsRaw("\n");
+            if (next <= rbp || next >= 0x800000000000ULL) break;
+            rbp = next;
+        }
+
         uint64_t lumphashPtr = readUser64(0x4b3d78);
         uint64_t lumpinfoPtr = readUser64(0x4b3d70);
         uint64_t numlumps    = readUser64(0x4b3d68) & 0xFFFFFFFF;
@@ -1093,7 +1231,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
             userRsp -= 128;                    // skip red zone
         }
         userRsp -= sizeof(brook::SignalFrame);
-        userRsp &= ~0xFULL;                   // 16-byte align
+        userRsp = (userRsp & ~0xFULL) - 8;    // function-entry ABI: RSP % 16 == 8
 
         auto* sf = reinterpret_cast<brook::SignalFrame*>(userRsp);
 
@@ -1186,6 +1324,51 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         ExcPutsRaw("  R13 "); ExcPutHex(ef->r13);     ExcPutsRaw("\n");
         ExcPutsRaw("  R14 "); ExcPutHex(ef->r14);     ExcPutsRaw("\n");
         ExcPutsRaw("  R15 "); ExcPutHex(ef->r15);     ExcPutsRaw("\n");
+
+        static constexpr uint64_t DMAP_USR = 0xFFFF800000000000ULL;
+        uint64_t cr3val;
+        __asm__ volatile("movq %%cr3, %0" : "=r"(cr3val));
+        cr3val &= 0x000FFFFFFFFFF000ULL;
+        auto readUser64 = [&](uint64_t uva) -> uint64_t {
+            uint64_t* p4 = reinterpret_cast<uint64_t*>(DMAP_USR + cr3val);
+            uint64_t e4 = p4[(uva >> 39) & 0x1FF];
+            if (!(e4 & 1)) return 0xDEAD1;
+            uint64_t* p3 = reinterpret_cast<uint64_t*>(DMAP_USR + (e4 & 0x000FFFFFFFFFF000ULL));
+            uint64_t e3 = p3[(uva >> 30) & 0x1FF];
+            if (!(e3 & 1)) return 0xDEAD2;
+            uint64_t* p2 = reinterpret_cast<uint64_t*>(DMAP_USR + (e3 & 0x000FFFFFFFFFF000ULL));
+            uint64_t e2 = p2[(uva >> 21) & 0x1FF];
+            if (!(e2 & 1)) return 0xDEAD3;
+            if (e2 & (1ULL << 7)) {
+                uint64_t phys = (e2 & 0x000FFFFFFFE00000ULL) | (uva & 0x1FFFFFULL);
+                return *reinterpret_cast<uint64_t*>(DMAP_USR + phys);
+            }
+            uint64_t* p1 = reinterpret_cast<uint64_t*>(DMAP_USR + (e2 & 0x000FFFFFFFFFF000ULL));
+            uint64_t e1 = p1[(uva >> 12) & 0x1FF];
+            if (!(e1 & 1)) return 0xDEAD4;
+            uint64_t phys = (e1 & 0x000FFFFFFFFFF000ULL) | (uva & 0xFFF);
+            return *reinterpret_cast<uint64_t*>(DMAP_USR + phys);
+        };
+        ExcPutsRaw("  CODE@RIP_QWORDS: ");
+        for (int i = -2; i < 4; ++i) {
+            ExcPutHex(readUser64(ef->rip + static_cast<int64_t>(i) * 8));
+            ExcPutCharRaw(' ');
+        }
+        ExcPutsRaw("\n  USER_RBP_CHAIN:\n");
+        uint64_t rbp = ef->rbp;
+        for (int i = 0; i < 8 && rbp >= 0x1000 && rbp < 0x800000000000ULL; ++i) {
+            uint64_t next = readUser64(rbp);
+            uint64_t ret  = readUser64(rbp + 8);
+            ExcPutsRaw("    ");
+            ExcPutHex(rbp);
+            ExcPutsRaw(" -> ");
+            ExcPutHex(next);
+            ExcPutsRaw(" ret=");
+            ExcPutHex(ret);
+            ExcPutsRaw("\n");
+            if (next <= rbp || next >= 0x800000000000ULL) break;
+            rbp = next;
+        }
     }
 
     // ---- User-mode crash-dump redirect -----------------------------------
@@ -1287,13 +1470,19 @@ EXC_NOERR(4)   // #OF Overflow
 EXC_NOERR(5)   // #BR Bound Range
 EXC_NOERR(6)   // #UD Invalid Opcode
 EXC_NOERR(7)   // #NM Device Not Available
-EXC_ERR(8)     // #DF Double Fault (error code always 0)
+__attribute__((interrupt))
+static void ExceptionHandler8(InterruptFrame* frame, uintptr_t err)
+{
+    HandleDoubleFault(frame, static_cast<uint64_t>(err));
+}
 EXC_NOERR(9)   // Coprocessor Segment Overrun (legacy)
 EXC_ERR(10)    // #TS Invalid TSS
 EXC_ERR(11)    // #NP Segment Not Present
 EXC_ERR(12)    // #SS Stack-Segment Fault
-// Vectors 13 (#GP) and 14 (#PF) use assembly stubs from exception_stubs.S
-// that provide full GPR access for signal delivery (SIGSEGV).
+// Vectors 6 (#UD), 13 (#GP), and 14 (#PF) use assembly stubs from
+// exception_stubs.S that provide full GPR access for signal delivery and
+// kernel panic QR rendering.
+extern "C" void ExceptionStub6();
 extern "C" void ExceptionStub13();
 extern "C" void ExceptionStub14();
 EXC_NOERR(15)  // Reserved
@@ -1457,7 +1646,7 @@ void IdtInit(brook::Framebuffer* fb)
     SetIdtEntry( 3, reinterpret_cast<void*>(ExceptionHandler3), 0, /*dpl=*/3);
     SetIdtEntry( 4, reinterpret_cast<void*>(ExceptionHandler4), 0, /*dpl=*/3);
     SetIdtEntry( 5, reinterpret_cast<void*>(ExceptionHandler5));
-    SetIdtEntry( 6, reinterpret_cast<void*>(ExceptionHandler6));
+    SetIdtEntry( 6, reinterpret_cast<void*>(ExceptionStub6));   // full-GPR stub for SIGILL + QR panic
     SetIdtEntry( 7, reinterpret_cast<void*>(ExceptionHandler7));
     // #DF double-fault MUST use IST1 so it fires even if the kernel stack is corrupt.
     SetIdtEntry( 8, reinterpret_cast<void*>(ExceptionHandler8),  IST_DOUBLE_FAULT);

@@ -261,7 +261,14 @@ bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
     out->allocatedSize   = loadSize;
     out->entryPoint      = ehdr->e_entry + slide;
     out->programBreakLow = loadEnd;
-    out->programBreakHigh = loadEnd + PROGRAM_BREAK_SIZE;
+    uint64_t breakHigh = loadEnd + PROGRAM_BREAK_SIZE;
+    static constexpr uint64_t USER_BRK_MMAP_GUARD = 16 * 1024 * 1024;
+    uint64_t breakLimit = USER_MMAP_BASE - USER_BRK_MMAP_GUARD;
+    if (breakHigh > breakLimit && loadEnd < breakLimit)
+        breakHigh = breakLimit;
+    if (breakHigh < loadEnd)
+        breakHigh = loadEnd;
+    out->programBreakHigh = breakHigh;
     out->phdrVaddr       = phdrInMemory;
     out->phdrNum         = ehdr->e_phnum;
     out->phdrEntSize     = ehdr->e_phentsize;

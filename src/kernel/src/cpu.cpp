@@ -57,15 +57,8 @@ void CpuInitFpu()
 // Enable XSAVE-managed CPU state so AVX/AVX2 instructions don't #UD in user
 // space.  Sets CR4.OSXSAVE and writes XCR0 = 0x7 (x87 | SSE | AVX).
 //
-// CAVEAT: We currently keep using fxsave/fxrstor in the scheduler context
-// switch and in the APIC profiler IRQ stub.  fxsave only saves x87 + SSE
-// (XMM0-15 lower 128 bits) — the YMM upper halves are NOT saved across
-// context switches.  This means YMM bits 128-255 of process A can leak
-// into process B if the scheduler interleaves them.  For Brook (hobby OS,
-// no security boundary, mostly single-threaded GUI apps) this is an
-// accepted compromise to unblock AVX-using clients (GIMP etc).  Proper
-// fix is to grow FxsaveArea to 1088B alignas(64) and switch the asm to
-// xsave64/xrstor64 with state mask 0x7 — tracked separately.
+    // The scheduler and profiler save/restore the full x87 + SSE + AVX state
+    // with XSAVE/XRSTOR once this is enabled.
 void CpuEnableXsaveAvx()
 {
     // CPUID.1.ECX[26] = XSAVE supported by hardware.  qemu64 model lacks

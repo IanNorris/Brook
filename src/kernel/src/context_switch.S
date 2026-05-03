@@ -1,9 +1,10 @@
 // context_switch.S — Low-level context switch for Brook OS scheduler.
 //
 // void context_switch(SavedContext* old, SavedContext* new,
-//                     FxsaveArea* oldFx, FxsaveArea* newFx);
+//                     FxsaveArea* oldFx, FxsaveArea* newFx,
+//                     volatile int32_t* oldRunningOnCpu);
 //
-// Saves callee-saved registers + SSE state into old/oldFx,
+// Saves callee-saved registers + x87/SSE/AVX state into old/oldFx,
 // restores from new/newFx.
 // If old->cr3 != new->cr3, writes CR3 to switch page tables.
 // Sets IA32_FS_BASE MSR from new->fsBase for TLS.
@@ -28,9 +29,13 @@
 context_switch:
     // RDI = old SavedContext*, RSI = new SavedContext*
     // RDX = old FxsaveArea*,  RCX = new FxsaveArea*
+    // R8  = &oldProc->runningOnCpu; published as -1 only after old context is saved
 
-    // --- Save SSE/FPU state first (before any XMM clobber) ---
-    fxsave (%rdx)
+    // --- Save x87/SSE/AVX state first (before any vector clobber) ---
+    movq %rdx, %r9
+    movl $0x7, %eax              // XCR0 mask: x87 | SSE | AVX
+    xorl %edx, %edx
+    xsave64 (%r9)
 
     // --- Save callee-saved GPRs ---
     movq %r15,  0(%rdi)
@@ -57,14 +62,20 @@ context_switch:
     movq %rax, 72(%rdi)
 
     // Save FS base (IA32_FS_BASE = 0xC0000100) — must happen before
-    // we clobber RCX/RDX for the new FxsaveArea* stash.
-    movq %rcx, %r8              // stash new FxsaveArea* in R8 early
+    // we clobber RCX/RDX. Keep newFx in R10; R8 still points at
+    // oldProc->runningOnCpu.
+    movq %rcx, %r10             // stash new FxsaveArea*
     movl $0xC0000100, %ecx
     rdmsr
     movl %eax, %ecx
     shlq $32, %rdx
     orq  %rcx, %rdx
     movq %rdx, 80(%rdi)         // old->fsBase
+
+    // The old process is no longer running only after its register context is
+    // fully saved. Publishing this earlier lets another CPU schedule it from a
+    // stale SavedContext while this CPU is still inside context_switch.
+    movl $-1, (%r8)
 
     // --- Restore new context ---
 
@@ -106,8 +117,10 @@ context_switch:
     // Restore stack pointer
     movq 48(%rsi), %rsp
 
-    // Restore SSE/FPU state (R8 = new FxsaveArea*)
-    fxrstor (%r8)
+    // Restore x87/SSE/AVX state (R10 = new FxsaveArea*)
+    movl $0x7, %eax              // XCR0 mask: x87 | SSE | AVX
+    xorl %edx, %edx
+    xrstor64 (%r10)
 
     // Validate saved RIP is a canonical kernel address before jumping.
     movq 56(%rsi), %rax

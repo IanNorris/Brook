@@ -29,8 +29,9 @@ static GdtDescriptor g_gdtDesc;
 // Per-CPU TSS instances.
 static Tss64 g_tssArray[GDT_MAX_CPUS];
 
-// Per-CPU double-fault stacks (4KB each).
-static uint8_t g_dfStacks[GDT_MAX_CPUS][4096] __attribute__((aligned(16)));
+// Per-CPU double-fault stacks.  #DF often means the interrupted kernel stack is
+// already unusable, so keep enough IST headroom for a minimal serial dump.
+static uint8_t g_dfStacks[GDT_MAX_CPUS][32768] __attribute__((aligned(16)));
 
 // Per-CPU NMI stacks (4KB each).
 static uint8_t g_nmiStacks[GDT_MAX_CPUS][4096] __attribute__((aligned(16)));

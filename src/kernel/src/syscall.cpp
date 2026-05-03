@@ -2112,8 +2112,12 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     const char* path = nullptr;
     if (pathAddr < 0x0000800000000000ULL)
     {
-        if (pathAddr < 0x1000 || !CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf)))
+        if (pathAddr < 0x1000 || !CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) {
+            Process* p = ProcessCurrent();
+            SerialPrintf("sys_open: EFAULT pathAddr=0x%lx pid=%u (%s)\n",
+                         pathAddr, p ? p->pid : 0, p ? p->name : "?");
             return -EFAULT;
+        }
         path = pathBuf;
     }
     else if ((pathAddr >> 47) == 0x1FFFFULL)
@@ -6048,7 +6052,26 @@ static int64_t sys_openat(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
                            uint64_t mode, uint64_t, uint64_t)
 {
     char pathBuf[256];
-    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
+    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) {
+        // Diagnostic: identify exactly where the path copy failed.
+        Process* p = ProcessCurrent();
+        uint32_t validBytes = 0;
+        for (uint32_t i = 0; i < 256; ++i) {
+            if (!UserBufferReadable(pathAddr + i, 1)) break;
+            validBytes = i + 1;
+        }
+        SerialPrintf("openat: EFAULT pathAddr=0x%lx validBytes=%u pid=%u (%s)\n",
+                     pathAddr, validBytes, p ? p->pid : 0, p ? p->name : "?");
+        if (validBytes > 0) {
+            char partial[64];
+            uint32_t show = validBytes < 63 ? validBytes : 63;
+            for (uint32_t i = 0; i < show; ++i)
+                partial[i] = *reinterpret_cast<const char*>(pathAddr + i);
+            partial[show] = '\0';
+            SerialPrintf("openat: partial path='%s'\n", partial);
+        }
+        return -EFAULT;
+    }
     const char* path = pathBuf;
 
     // If path is absolute or dirfd is AT_FDCWD, delegate to sys_open

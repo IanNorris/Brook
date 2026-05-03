@@ -4,6 +4,8 @@
 
 namespace brook {
 
+struct Process;
+
 // Maximum number of syscalls. Must match the dispatcher bounds check.
 static constexpr uint64_t SYSCALL_MAX = 600;
 
@@ -32,6 +34,7 @@ static constexpr uint64_t SYS_SCHED_YIELD     = 24;
 static constexpr uint64_t SYS_MREMAP          = 25;
 static constexpr uint64_t SYS_MINCORE         = 27;
 static constexpr uint64_t SYS_MADVISE         = 28;
+static constexpr uint64_t SYS_SHMGET          = 29;
 static constexpr uint64_t SYS_NANOSLEEP       = 35;
 static constexpr uint64_t SYS_GETPID          = 39;
 static constexpr uint64_t SYS_PIPE            = 22;
@@ -45,6 +48,8 @@ static constexpr uint64_t SYS_EXIT            = 60;
 static constexpr uint64_t SYS_WAIT4           = 61;
 static constexpr uint64_t SYS_UNAME           = 63;
 static constexpr uint64_t SYS_FCNTL           = 72;
+static constexpr uint64_t SYS_FSYNC           = 74;
+static constexpr uint64_t SYS_FDATASYNC       = 75;
 static constexpr uint64_t SYS_GETCWD          = 79;
 static constexpr uint64_t SYS_GETTIMEOFDAY    = 96;
 static constexpr uint64_t SYS_GETUID           = 102;
@@ -62,6 +67,7 @@ static constexpr uint64_t SYS_ARCH_PRCTL      = 158;
 static constexpr uint64_t SYS_GETDENTS64      = 217;
 static constexpr uint64_t SYS_SET_TID_ADDRESS = 218;
 static constexpr uint64_t SYS_CLOCK_GETTIME   = 228;
+static constexpr uint64_t SYS_CLOCK_GETRES    = 229;
 static constexpr uint64_t SYS_CLOCK_NANOSLEEP = 230;
 static constexpr uint64_t SYS_EXIT_GROUP      = 231;
 static constexpr uint64_t SYS_OPENAT          = 257;
@@ -100,9 +106,12 @@ static constexpr uint64_t SYS_GETPGID         = 121;
 static constexpr uint64_t SYS_GETSID          = 124;
 static constexpr uint64_t SYS_CAPGET           = 125;
 static constexpr uint64_t SYS_CAPSET           = 126;
+static constexpr uint64_t SYS_RT_SIGTIMEDWAIT  = 128;
 static constexpr uint64_t SYS_SIGALTSTACK     = 131;
 static constexpr uint64_t SYS_STATFS          = 137;
 static constexpr uint64_t SYS_FSTATFS         = 138;
+static constexpr uint64_t SYS_GETPRIORITY     = 140;
+static constexpr uint64_t SYS_SETPRIORITY     = 141;
 static constexpr uint64_t SYS_PRCTL           = 157;
 static constexpr uint64_t SYS_GETTID          = 186;
 static constexpr uint64_t SYS_FUTEX           = 202;
@@ -110,9 +119,12 @@ static constexpr uint64_t SYS_TKILL           = 200;
 static constexpr uint64_t SYS_SET_ROBUST_LIST = 273;
 static constexpr uint64_t SYS_TGKILL          = 234;
 static constexpr uint64_t SYS_MBIND           = 237;
+static constexpr uint64_t SYS_SET_MEMPOLICY   = 238;
+static constexpr uint64_t SYS_GET_MEMPOLICY   = 239;
 static constexpr uint64_t SYS_FACCESSAT       = 269;
 static constexpr uint64_t SYS_DUP3            = 292;
 static constexpr uint64_t SYS_RSEQ            = 334;
+static constexpr uint64_t SYS_CLOSE_RANGE     = 436;
 static constexpr uint64_t SYS_PSELECT6        = 270;
 static constexpr uint64_t SYS_FACCESSAT2      = 439;
 static constexpr uint64_t SYS_ALARM           = 37;
@@ -131,6 +143,7 @@ static constexpr uint64_t SYS_FCHOWN          = 93;
 static constexpr uint64_t SYS_LCHOWN          = 94;
 static constexpr uint64_t SYS_SCHED_SETAFFINITY = 203;
 static constexpr uint64_t SYS_SCHED_GETAFFINITY = 204;
+static constexpr uint64_t SYS_FADVISE64       = 221;
 static constexpr uint64_t SYS_MKDIRAT         = 258;
 static constexpr uint64_t SYS_FCHOWNAT        = 260;
 static constexpr uint64_t SYS_UNLINKAT        = 263;
@@ -150,6 +163,7 @@ static constexpr uint64_t SYS_SENDTO          = 44;
 static constexpr uint64_t SYS_RECVFROM        = 45;
 static constexpr uint64_t SYS_SENDMSG         = 46;
 static constexpr uint64_t SYS_RECVMSG         = 47;
+static constexpr uint64_t SYS_SENDMMSG        = 307;
 static constexpr uint64_t SYS_SHUTDOWN        = 48;
 static constexpr uint64_t SYS_BIND            = 49;
 static constexpr uint64_t SYS_LISTEN          = 50;
@@ -170,6 +184,7 @@ static constexpr uint64_t SYS_TIMERFD_GETTIME = 287;
 static constexpr uint64_t SYS_ACCEPT4         = 288;
 static constexpr uint64_t SYS_EPOLL_CREATE1   = 291;
 static constexpr uint64_t SYS_MEMFD_CREATE    = 319;
+static constexpr uint64_t SYS_PIDFD_OPEN      = 434;
 static constexpr uint64_t SYS_MEMFD_SECRET    = 447;
 
 // Syscall function type -- same signature as Linux: returns int64_t,
@@ -195,7 +210,11 @@ uint64_t SyscallGetTableAddress();
 // child without double-freeing the underlying buffer on close.
 void MemFdHandleRef(void* handle);
 void MemFdHandleUnref(void* handle);
+void EventFdHandleRef(void* handle);
+void EpollFdHandleRef(void* handle);
+void TimerFdHandleRef(void* handle);
 void UnixSocketHandleRef(void* handle);
+int64_t CloseProcessFd(Process* proc, int fd);
 
 // Switch to user mode.
 // Saves kernel state, builds IRETQ frame, SWAPGS, jumps to ring 3.

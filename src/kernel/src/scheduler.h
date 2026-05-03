@@ -32,8 +32,10 @@ void SchedulerBlock(Process* proc);
 // Unblock a process — move it from Blocked back to Ready queue.
 void SchedulerUnblock(Process* proc);
 
-// Called from the LAPIC timer ISR on each CPU.
-void SchedulerTimerTick();
+// Called from the LAPIC timer ISR on each CPU. `allowPreempt` should be true
+// only when the interrupted context was preemptible user mode; wakeups and idle
+// dispatch still run when false.
+void SchedulerTimerTick(bool allowPreempt);
 
 // Yield the current timeslice voluntarily.
 extern "C" void SchedulerYield();
