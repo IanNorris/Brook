@@ -64,8 +64,7 @@ PhysicalAddress PmmAllocPages(uint64_t count,
 // Free a previously allocated page frame. No-op if null.
 void PmmFreePage(PhysicalAddress physAddr);
 
-// Ownership: set/get tag and PID for a page.
-void     PmmSetOwner(PhysicalAddress physAddr, MemTag tag, uint16_t pid = KernelPid);
+// Ownership: get tag and PID for a page.
 MemTag   PmmGetTag(PhysicalAddress physAddr);
 uint16_t PmmGetPid(PhysicalAddress physAddr);
 

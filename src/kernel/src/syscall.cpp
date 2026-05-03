@@ -6463,7 +6463,8 @@ retry_poll:
         Process* self = ProcessCurrent();
 
         // For pipe FDs, register as waiter on the pipe
-        for (uint64_t i = 0; i < nfds && i < 16; i++)
+        uint64_t waiterCap = nfds < 64 ? nfds : 64;
+        for (uint64_t i = 0; i < waiterCap; i++)
         {
             if (fds[i].fd < 0) continue;
             FdEntry* fde = FdGet(proc, fds[i].fd);
@@ -6575,7 +6576,7 @@ retry_poll:
             {
                 // Clean up waiters before returning
                 InputRemoveWaiter(self);
-                for (uint64_t i = 0; i < nfds && i < 16; i++)
+                for (uint64_t i = 0; i < waiterCap; i++)
                 {
                     if (fds[i].fd < 0) continue;
                     FdEntry* fde2 = FdGet(proc, fds[i].fd);
@@ -6614,7 +6615,7 @@ retry_poll:
 
         // Clean up waiters
         InputRemoveWaiter(self);
-        for (uint64_t i = 0; i < nfds && i < 16; i++)
+        for (uint64_t i = 0; i < waiterCap; i++)
         {
             if (fds[i].fd < 0) continue;
             FdEntry* fde = FdGet(proc, fds[i].fd);

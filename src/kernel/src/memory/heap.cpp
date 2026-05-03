@@ -277,6 +277,8 @@ void* kmalloc(uint64_t size)
                 }
 
                 uint32_t allocSize = cur->size; // consume entire free block
+                // Remove the old free block's usable-byte contribution.
+                g_freeBytes -= (cur->size - OVERHEAD);
                 if (cur->size >= needed + static_cast<uint32_t>(MIN_BLOCK))
                 {
                     // Split: remainder is large enough to be its own block
@@ -287,7 +289,6 @@ void* kmalloc(uint64_t size)
                 }
 
                 WriteBlock(reinterpret_cast<uint8_t*>(cur), allocSize, 0);
-                g_freeBytes -= allocSize;
                 void* result = UserPtr(cur);
 
                 // Poison freshly allocated memory to catch use-of-uninitialized.
@@ -324,7 +325,7 @@ void kfree(void* ptr)
     if (!IsValidHeader(h)) { SpinLockRelease(&g_heapLock, lf); return; }
     if (h->free) { SpinLockRelease(&g_heapLock, lf); return; }
 
-    g_freeBytes += h->size;
+    g_freeBytes += h->size - OVERHEAD;
 
     // Coalesce with next block if free.
     BlockHeader* next = NextBlock(h);
@@ -396,6 +397,8 @@ bool HeapCheckIntegrity()
 {
     if (!g_heapStart) return true;
 
+    uint64_t lf = SpinLockAcquire(&g_heapLock);
+
     uint32_t blockCount = 0;
     BlockHeader* cur = reinterpret_cast<BlockHeader*>(g_heapStart);
 
@@ -406,6 +409,7 @@ bool HeapCheckIntegrity()
             uint64_t off = reinterpret_cast<uint8_t*>(cur) - g_heapStart;
             SerialPrintf("HeapCheck: corrupt header at block #%u offset 0x%lx "
                          "(magic=0x%x)\n", blockCount, (unsigned long)off, cur->magic);
+            SpinLockRelease(&g_heapLock, lf);
             return false;
         }
 
@@ -414,6 +418,7 @@ bool HeapCheckIntegrity()
             uint64_t off = reinterpret_cast<uint8_t*>(cur) - g_heapStart;
             SerialPrintf("HeapCheck: invalid size %u at block #%u offset 0x%lx\n",
                          cur->size, blockCount, (unsigned long)off);
+            SpinLockRelease(&g_heapLock, lf);
             return false;
         }
 
@@ -424,6 +429,7 @@ bool HeapCheckIntegrity()
             SerialPrintf("HeapCheck: footer mismatch at block #%u offset 0x%lx "
                          "(ftr_magic=0x%x ftr_size=%u hdr_size=%u)\n",
                          blockCount, (unsigned long)off, f->magic, f->size, cur->size);
+            SpinLockRelease(&g_heapLock, lf);
             return false;
         }
 
@@ -431,6 +437,7 @@ bool HeapCheckIntegrity()
         cur = NextBlock(cur);
     }
 
+    SpinLockRelease(&g_heapLock, lf);
     return true;
 }
 

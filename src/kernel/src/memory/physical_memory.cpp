@@ -330,18 +330,6 @@ void PmmFreePage(PhysicalAddress physAddr)
     SpinLockRelease(&g_pmmLock, flags);
 }
 
-void PmmSetOwner(PhysicalAddress physAddr, MemTag tag, uint16_t pid)
-{
-    if ((physAddr.raw() & (PAGE_SIZE - 1)) != 0) return;
-    if (!g_pageDescs) return;
-    uint64_t idx64 = physAddr.raw() / PAGE_SIZE;
-    if (idx64 >= g_totalPages) return;
-    uint32_t idx = static_cast<uint32_t>(idx64);
-    if (Desc(idx).pid != 0 || Desc(idx).tag != static_cast<uint8_t>(MemTag::Free))
-        ListRemove(idx);
-    ListAppend(idx, pid, tag);
-}
-
 MemTag PmmGetTag(PhysicalAddress physAddr)
 {
     if (!g_pageDescs) return MemTag::KernelData;
