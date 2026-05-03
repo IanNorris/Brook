@@ -12,6 +12,15 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <grp.h>
+#include <sys/syscall.h>
+
+struct brook_linux_dirent64 {
+    unsigned long long d_ino;
+    long long          d_off;
+    unsigned short     d_reclen;
+    unsigned char      d_type;
+    char               d_name[];
+};
 
 static int g_pass = 0, g_fail = 0;
 
@@ -61,7 +70,8 @@ int main(void)
     {
         char cwd[256];
         CHECK("getcwd", getcwd(cwd, sizeof(cwd)) != NULL);
-        CHECK("cwd='/'", cwd[0] == '/' && cwd[1] == '\0');
+        CHECK("cwd='/boot'", strcmp(cwd, "/boot") == 0);
+        CHECK("raw getcwd len", syscall(SYS_getcwd, cwd, sizeof(cwd)) == (long)strlen(cwd) + 1);
         CHECK("chdir", chdir("/") == 0);
     }
     printf("\n");
@@ -215,10 +225,26 @@ int main(void)
     // --- Directory listing ---
     printf("[Directory]\n");
     {
-        // getdents64 via opendir/readdir requires dirent.h
-        // Just test that we can open a directory path
         struct stat dst;
         CHECK("stat(/boot)", stat("/boot", &dst) == 0);
+
+        int dfd = open("/", O_RDONLY | O_DIRECTORY);
+        CHECK("open(/)", dfd >= 0);
+        if (dfd >= 0) {
+            char dirbuf[2048];
+            int n = syscall(SYS_getdents64, dfd, dirbuf, sizeof(dirbuf));
+            int saw_boot = 0;
+            for (int pos = 0; n > 0 && pos < n; ) {
+                struct brook_linux_dirent64* de =
+                    (struct brook_linux_dirent64*)(dirbuf + pos);
+                if (strcmp(de->d_name, "boot") == 0)
+                    saw_boot = 1;
+                if (de->d_reclen == 0) break;
+                pos += de->d_reclen;
+            }
+            CHECK("getdents64(/) includes boot", n > 0 && saw_boot);
+            close(dfd);
+        }
     }
     printf("\n");
 

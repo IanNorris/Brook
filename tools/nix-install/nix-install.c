@@ -22,11 +22,15 @@
 #include <sys/wait.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <elf.h>
 
 #define INDEX_PATH      "/nix/index/packages.idx"
 #define PROFILE_DIR     "/nix/profile"
 #define MANIFEST_PATH   "/nix/profile/manifest.tsv"
 #define PROFILE_BIN     "/nix/profile/bin"
+#define PROFILE_LIB     "/nix/profile/lib"
 #define MAX_LINE        4096
 #define MAX_PACKAGES    256
 
@@ -105,6 +109,170 @@ static int mkdir_p(const char *path) {
         }
     }
     return mkdir(tmp, 0755);
+}
+
+static int run_program(char *const argv[]) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "Error: fork failed for %s: %s\n", argv[0], strerror(errno));
+        return -1;
+    }
+    if (pid == 0) {
+        execv(argv[0], argv);
+        fprintf(stderr, "Error: exec failed for %s: %s\n", argv[0], strerror(errno));
+        _exit(127);
+    }
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        fprintf(stderr, "Error: waitpid failed for %s: %s\n", argv[0], strerror(errno));
+        return -1;
+    }
+
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+    return -1;
+}
+
+static int run_nix_fetch_deps(const char *hash, int force) {
+    char *const argv[] = {
+        (char*)"/nix/bin/nix-fetch",
+        (char*)"--deps",
+        force ? (char*)"--force" : (char*)hash,
+        force ? (char*)hash : NULL,
+        NULL,
+    };
+    return run_program(argv);
+}
+
+static int read_full_at(int fd, void *buf, size_t len, off_t off) {
+    if (lseek(fd, off, SEEK_SET) < 0) return -1;
+    size_t done = 0;
+    while (done < len) {
+        ssize_t r = read(fd, (char*)buf + done, len - done);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (r == 0) return -1;
+        done += (size_t)r;
+    }
+    return 0;
+}
+
+static int elf_file_healthy(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 1;
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        return 0;
+    }
+
+    Elf64_Ehdr eh;
+    if (read_full_at(fd, &eh, sizeof(eh), 0) != 0) {
+        close(fd);
+        return 0;
+    }
+
+    if (memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0) {
+        close(fd);
+        return 1;
+    }
+
+    int healthy = 1;
+    if (eh.e_ident[EI_CLASS] != ELFCLASS64 ||
+        eh.e_ident[EI_DATA] != ELFDATA2LSB ||
+        eh.e_phentsize != sizeof(Elf64_Phdr) ||
+        eh.e_phoff > (uint64_t)st.st_size ||
+        (uint64_t)eh.e_phnum * sizeof(Elf64_Phdr) > (uint64_t)st.st_size - eh.e_phoff) {
+        healthy = 0;
+        goto out;
+    }
+
+    if (eh.e_shoff != 0 && eh.e_shnum != 0) {
+        if (eh.e_shentsize == 0 ||
+            eh.e_shoff > (uint64_t)st.st_size ||
+            (uint64_t)eh.e_shnum * eh.e_shentsize > (uint64_t)st.st_size - eh.e_shoff) {
+            healthy = 0;
+            goto out;
+        }
+    }
+
+    for (uint16_t i = 0; i < eh.e_phnum; ++i) {
+        Elf64_Phdr ph;
+        if (read_full_at(fd, &ph, sizeof(ph),
+                         (off_t)(eh.e_phoff + (uint64_t)i * sizeof(ph))) != 0) {
+            healthy = 0;
+            goto out;
+        }
+        if (ph.p_type != PT_DYNAMIC) continue;
+
+        if (ph.p_offset > (uint64_t)st.st_size ||
+            ph.p_filesz > (uint64_t)st.st_size - ph.p_offset) {
+            healthy = 0;
+            goto out;
+        }
+
+        uint64_t count = ph.p_filesz / sizeof(Elf64_Dyn);
+        int saw_non_null = 0;
+        for (uint64_t j = 0; j < count; ++j) {
+            Elf64_Dyn dyn;
+            if (read_full_at(fd, &dyn, sizeof(dyn),
+                             (off_t)(ph.p_offset + j * sizeof(dyn))) != 0) {
+                healthy = 0;
+                goto out;
+            }
+            if (dyn.d_tag == DT_NULL) break;
+            saw_non_null = 1;
+        }
+        if (!saw_non_null) {
+            healthy = 0;
+            goto out;
+        }
+    }
+
+out:
+    close(fd);
+    return healthy;
+}
+
+static int store_path_healthy(const char *store_name) {
+    char store_path[512];
+    snprintf(store_path, sizeof(store_path), "/nix/store/%s", store_name);
+
+    struct stat st;
+    if (stat(store_path, &st) != 0 || !S_ISDIR(st.st_mode))
+        return 0;
+
+    char bin_dir[512];
+    snprintf(bin_dir, sizeof(bin_dir), "%s/bin", store_path);
+    DIR *d = opendir(bin_dir);
+    if (!d)
+        return 1;
+
+    int healthy = 1;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s", bin_dir, ent->d_name);
+        if (stat(path, &st) != 0)
+            continue;
+        if (!S_ISREG(st.st_mode))
+            continue;
+
+        if (!elf_file_healthy(path)) {
+            fprintf(stderr, "nix-install: corrupt ELF detected: %s\n", path);
+            healthy = 0;
+            break;
+        }
+    }
+    closedir(d);
+    return healthy;
 }
 
 /* Look up an installed package by name. If found, copy its store_name
@@ -247,6 +415,139 @@ static int link_package_bins(const char *store_name) {
     return linked;
 }
 
+static int link_package_libs_to_dir(const char *store_name, const char *dst_dir,
+                                    const char *rel_prefix, int replace_regular) {
+    char lib_dir[512];
+    snprintf(lib_dir, sizeof(lib_dir), "/nix/store/%s/lib", store_name);
+
+    DIR *d = opendir(lib_dir);
+    if (!d) return 0; /* No lib dir is OK (e.g., tools) */
+
+    mkdir_p(dst_dir);
+
+    struct dirent *ent;
+    int linked = 0;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+
+        char rel_target[1024], dst[1024], src_abs[1024];
+        snprintf(rel_target, sizeof(rel_target), "%s%s/lib/%s",
+                 rel_prefix, store_name, ent->d_name);
+        snprintf(src_abs, sizeof(src_abs), "%s/%s", lib_dir, ent->d_name);
+        snprintf(dst, sizeof(dst), "%s/%s", dst_dir, ent->d_name);
+
+        struct stat st;
+        if (stat(src_abs, &st) == 0 && (S_ISREG(st.st_mode) || S_ISLNK(st.st_mode))) {
+            struct stat dst_st;
+            if (lstat(dst, &dst_st) == 0) {
+                if (!S_ISLNK(dst_st.st_mode) && !replace_regular)
+                    continue;
+                /* Skip if existing symlink already points to the same target —
+                 * re-linking would briefly invalidate mmap'd libraries used by
+                 * running processes (e.g. bash using glibc from this path). */
+                if (S_ISLNK(dst_st.st_mode)) {
+                    char existing[1024];
+                    ssize_t rl = readlink(dst, existing, sizeof(existing) - 1);
+                    if (rl > 0) {
+                        existing[rl] = '\0';
+                        if (strcmp(existing, rel_target) == 0)
+                            continue; /* already correct */
+                    }
+                }
+                unlink(dst);
+            }
+            if (symlink(rel_target, dst) == 0)
+                linked++;
+        }
+    }
+    closedir(d);
+    return linked;
+}
+
+static int link_package_libs(const char *store_name) {
+    return link_package_libs_to_dir(store_name, PROFILE_LIB, "../../store/", 1);
+}
+
+static void store_hash_from_name(const char *store_name, char out[33]) {
+    out[0] = '\0';
+    const char *dash = strchr(store_name, '-');
+    size_t hlen = dash ? (size_t)(dash - store_name) : strlen(store_name);
+    if (hlen == 32) {
+        memcpy(out, store_name, 32);
+        out[32] = '\0';
+    }
+}
+
+static int link_closure_libs_from_narinfo(const char *store_name) {
+    char hash[33];
+    store_hash_from_name(store_name, hash);
+    if (!hash[0]) return 0;
+
+    char narinfo_path[512];
+    snprintf(narinfo_path, sizeof(narinfo_path),
+             "/nix/var/cache/narinfo/%s.narinfo", hash);
+
+    FILE *f = fopen(narinfo_path, "r");
+    if (!f) return 0;
+
+    int linked = 0;
+    char line[MAX_LINE];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "References:", 11) != 0) continue;
+
+        char *p = line + 11;
+        while (*p && isspace((unsigned char)*p)) p++;
+
+        char *saveptr = NULL;
+        char *tok = strtok_r(p, " \t\r\n", &saveptr);
+        while (tok) {
+            linked += link_package_libs(tok);
+            tok = strtok_r(NULL, " \t\r\n", &saveptr);
+        }
+        break;
+    }
+
+    fclose(f);
+    return linked;
+}
+
+static int link_closure_libs_into_package(const char *store_name) {
+    char package_lib_dir[512];
+    snprintf(package_lib_dir, sizeof(package_lib_dir), "/nix/store/%s/lib", store_name);
+
+    char hash[33];
+    store_hash_from_name(store_name, hash);
+    if (!hash[0]) return 0;
+
+    char narinfo_path[512];
+    snprintf(narinfo_path, sizeof(narinfo_path),
+             "/nix/var/cache/narinfo/%s.narinfo", hash);
+
+    FILE *f = fopen(narinfo_path, "r");
+    if (!f) return 0;
+
+    int linked = 0;
+    char line[MAX_LINE];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "References:", 11) != 0) continue;
+
+        char *p = line + 11;
+        while (*p && isspace((unsigned char)*p)) p++;
+
+        char *saveptr = NULL;
+        char *tok = strtok_r(p, " \t\r\n", &saveptr);
+        while (tok) {
+            if (strcmp(tok, store_name) != 0)
+                linked += link_package_libs_to_dir(tok, package_lib_dir, "../../", 0);
+            tok = strtok_r(NULL, " \t\r\n", &saveptr);
+        }
+        break;
+    }
+
+    fclose(f);
+    return linked;
+}
+
 /* Remove symlinks that point into a package's store path */
 static int unlink_package_bins(const char *store_name) {
     DIR *d = opendir(PROFILE_BIN);
@@ -278,18 +579,78 @@ static int unlink_package_bins(const char *store_name) {
     return removed;
 }
 
+static int unlink_package_libs(const char *store_name) {
+    DIR *d = opendir(PROFILE_LIB);
+    if (!d) return 0;
+
+    char prefix[512];
+    snprintf(prefix, sizeof(prefix), "../../store/%s/lib/", store_name);
+    size_t prefix_len = strlen(prefix);
+
+    struct dirent *ent;
+    int removed = 0;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s", PROFILE_LIB, ent->d_name);
+
+        char target[1024];
+        ssize_t n = readlink(path, target, sizeof(target) - 1);
+        if (n > 0) {
+            target[n] = '\0';
+            if (strncmp(target, prefix, prefix_len) == 0) {
+                unlink(path);
+                removed++;
+            }
+        }
+    }
+    closedir(d);
+    return removed;
+}
+
 static int cmd_install(const char *name) {
     printf("Looking up '%s'...\n", name);
 
     char existing_store[512] = {0};
     if (find_installed(name, existing_store, sizeof(existing_store))) {
+        if (!store_path_healthy(existing_store)) {
+            char hash[64] = {0};
+            const char *dash = strchr(existing_store, '-');
+            if (dash) {
+                size_t hlen = dash - existing_store;
+                if (hlen < sizeof(hash)) {
+                    memcpy(hash, existing_store, hlen);
+                    hash[hlen] = '\0';
+                }
+            }
+            if (!hash[0]) {
+                fprintf(stderr, "Error: invalid store name '%s'\n", existing_store);
+                return 1;
+            }
+
+            printf("'%s' is already installed but its store path is incomplete; repairing...\n", name);
+            int code = run_nix_fetch_deps(hash, 1);
+            if (code != 0) {
+                fprintf(stderr, "Error: nix-fetch repair failed (exit %d)\n", code);
+                return 1;
+            }
+        }
+
         /* Already in manifest. Re-link bins in case the profile/bin
          * symlinks are missing (e.g. wiped, or earlier link step never
          * ran). This is idempotent — link_package_bins unlinks first. */
         int linked = link_package_bins(existing_store);
+        int lib_linked = link_package_libs(existing_store);
+        lib_linked += link_closure_libs_from_narinfo(existing_store);
+        int rpath_linked = link_closure_libs_into_package(existing_store);
         printf("'%s' is already installed.\n", name);
         if (linked > 0)
             printf("  re-linked %d binary(ies) in %s\n", linked, PROFILE_BIN);
+        if (lib_linked > 0)
+            printf("  re-linked %d library file(s) in %s\n", lib_linked, PROFILE_LIB);
+        if (rpath_linked > 0)
+            printf("  re-linked %d runtime library file(s) beside package binaries\n", rpath_linked);
         return 0;
     }
 
@@ -343,16 +704,20 @@ static int cmd_install(const char *name) {
         }
     }
 
-    if (in_store) {
+    if (in_store && !store_path_healthy(pkg.store_name)) {
+        printf("Store path exists but appears incomplete; repairing %s...\n", pkg.store_name);
+        int code = run_nix_fetch_deps(hash, 1);
+        if (code != 0) {
+            fprintf(stderr, "Error: nix-fetch repair failed (exit %d)\n", code);
+            return 1;
+        }
+    } else if (in_store) {
         printf("Already in store: %s\n", pkg.store_name);
     } else {
         /* Fetch package and dependencies */
         printf("Fetching %s and dependencies...\n", hash);
-        char cmd[1024];
-        snprintf(cmd, sizeof(cmd), "/nix/bin/nix-fetch --deps %s", hash);
-        int ret = system(cmd);
-        if (ret != 0) {
-            int code = WIFEXITED(ret) ? WEXITSTATUS(ret) : ret;
+        int code = run_nix_fetch_deps(hash, 0);
+        if (code != 0) {
             fprintf(stderr, "Error: nix-fetch failed (exit %d)\n", code);
             return 1;
         }
@@ -369,10 +734,17 @@ static int cmd_install(const char *name) {
 
     /* Link binaries */
     int linked = link_package_bins(pkg.store_name);
+    int lib_linked = link_package_libs(pkg.store_name);
+    lib_linked += link_closure_libs_from_narinfo(pkg.store_name);
+    int rpath_linked = link_closure_libs_into_package(pkg.store_name);
 
     printf("\n\033[32m✓ Installed %s %s\033[0m\n", pkg.name, pkg.version);
     if (linked > 0)
         printf("  %d binary(ies) added to %s\n", linked, PROFILE_BIN);
+    if (lib_linked > 0)
+        printf("  %d library file(s) added to %s\n", lib_linked, PROFILE_LIB);
+    if (rpath_linked > 0)
+        printf("  %d runtime library file(s) linked beside package binaries\n", rpath_linked);
 
     return 0;
 }
@@ -409,6 +781,7 @@ static int cmd_remove(const char *name) {
     /* Remove symlinks */
     if (store_name[0]) {
         unlink_package_bins(store_name);
+        unlink_package_libs(store_name);
     }
 
     /* Remove from manifest */
@@ -459,12 +832,16 @@ static int fetch_package_to_store(const char *name, char *out_store_name, size_t
 
     if (!in_store) {
         printf("Fetching %s %s...\n", pkg.name, pkg.version);
-        char cmd[1024];
-        snprintf(cmd, sizeof(cmd), "/nix/bin/nix-fetch --deps %s", hash);
-        int ret = system(cmd);
-        if (ret != 0) {
-            int code = WIFEXITED(ret) ? WEXITSTATUS(ret) : ret;
+        int code = run_nix_fetch_deps(hash, 0);
+        if (code != 0) {
             fprintf(stderr, "Error: nix-fetch failed (exit %d)\n", code);
+            return -1;
+        }
+    } else if (!store_path_healthy(pkg.store_name)) {
+        printf("Store path exists but appears incomplete; repairing %s...\n", pkg.store_name);
+        int code = run_nix_fetch_deps(hash, 1);
+        if (code != 0) {
+            fprintf(stderr, "Error: nix-fetch repair failed (exit %d)\n", code);
             return -1;
         }
     }
@@ -647,9 +1024,12 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "Usage: %s search <query>\n", prog);
                 return 1;
             }
-            char cmd_buf[1024];
-            snprintf(cmd_buf, sizeof(cmd_buf), "/nix/bin/nix-search %s", argv[2]);
-            return system(cmd_buf);
+            char *const search_argv[] = {
+                (char*)"/nix/bin/nix-search",
+                argv[2],
+                NULL,
+            };
+            return run_program(search_argv);
         } else if (strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0) {
             usage(prog);
             return 0;

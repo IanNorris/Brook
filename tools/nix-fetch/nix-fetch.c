@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <time.h>
+#include <dirent.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -43,6 +44,7 @@ static const char *g_cacert_path = NULL;
 static const char *g_xz_path    = NULL;
 static const char *g_unpack_path = NULL;
 static int g_fetch_deps = 0;
+static int g_force_root = 0;
 static int g_cache_disabled = 0;  /* set to 1 if cache dir creation fails */
 
 /* Set of hashes already fetched or in-progress — prevents redundant downloads
@@ -81,6 +83,37 @@ static int mkdir_p(const char *path) {
     }
     if (mkdir(buf, 0755) < 0 && errno != EEXIST) return -1;
     return 0;
+}
+
+static int remove_tree(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) < 0) {
+        return errno == ENOENT ? 0 : -1;
+    }
+
+    if (!S_ISDIR(st.st_mode)) {
+        return unlink(path);
+    }
+
+    DIR *d = opendir(path);
+    if (!d) return -1;
+
+    struct dirent *ent;
+    int rc = 0;
+    while ((ent = readdir(d)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+            continue;
+
+        char child[MAX_PATH];
+        snprintf(child, sizeof(child), "%s/%s", path, ent->d_name);
+        if (remove_tree(child) != 0)
+            rc = -1;
+    }
+    closedir(d);
+
+    if (rmdir(path) != 0)
+        rc = -1;
+    return rc;
 }
 
 /* Build the on-disk narinfo cache path for a hash.  Flat layout —
@@ -473,7 +506,7 @@ static int download_and_extract(const char *nar_url, const char *compression,
     return 0;
 }
 
-static int fetch_package(const char *hash);
+static int fetch_package(const char *hash, int force);
 
 /* Parse references from narinfo and fetch missing ones.
  *
@@ -547,13 +580,13 @@ static void fetch_dependencies(const char *refs_str) {
             }
 
             printf("  Fetching dependency: %s\n", tok);
-            fetch_package(ref_hash);
+            fetch_package(ref_hash, 0);
         }
         tok = strtok_r(NULL, " \t", &saveptr);
     }
 }
 
-static int fetch_package(const char *hash) {
+static int fetch_package(const char *hash, int force) {
     /* Guard against self-referential packages and shared deps in parallel chains */
     if (hash_is_seen(hash)) return 0;
     hash_mark_seen(hash);
@@ -611,10 +644,15 @@ static int fetch_package(const char *hash) {
     char dest[MAX_PATH];
     snprintf(dest, sizeof(dest), "%s/%s", g_store_dir, basename);
 
-    /* Skip if already installed */
+    /* Skip if already installed.  Non-forced fetches preserve the immutable
+     * store fast path; forced fetches repair a path that exists but was left
+     * partial by an interrupted previous extraction. */
     if (access(dest, F_OK) == 0) {
-        printf("  Already installed: %s\n", basename);
-        return 0;
+        if (!force) {
+            printf("  Already installed: %s\n", basename);
+            return 0;
+        }
+        printf("  Repairing existing store path: %s\n", basename);
     }
 
     printf("  Package:     %s\n", basename);
@@ -627,26 +665,67 @@ static int fetch_package(const char *hash) {
         }
     }
 
+    char tmp_dest[MAX_PATH];
+    char old_dest[MAX_PATH];
+    snprintf(tmp_dest, sizeof(tmp_dest), "%s/.%s.tmp.%d",
+             g_store_dir, basename, (int)getpid());
+    snprintf(old_dest, sizeof(old_dest), "%s/.%s.old.%d",
+             g_store_dir, basename, (int)getpid());
+
+    remove_tree(tmp_dest);
+    remove_tree(old_dest);
+
     printf("  Downloading NAR...\n");
-    int rc = download_and_extract(nar_url, compression, dest);
+    int rc = download_and_extract(nar_url, compression, tmp_dest);
     if (rc == 0) {
+        int had_old = (access(dest, F_OK) == 0);
+        if (had_old) {
+            if (rename(dest, old_dest) != 0) {
+                fprintf(stderr, "nix-fetch: cannot move old store path %s: %s\n",
+                        dest, strerror(errno));
+                remove_tree(tmp_dest);
+                return -1;
+            }
+        }
+
+        if (rename(tmp_dest, dest) != 0) {
+            fprintf(stderr, "nix-fetch: cannot publish store path %s: %s\n",
+                    dest, strerror(errno));
+            if (had_old) rename(old_dest, dest);
+            remove_tree(tmp_dest);
+            return -1;
+        }
+
+        if (had_old)
+            remove_tree(old_dest);
         printf("  Installed: %s\n", basename);
     } else {
+        remove_tree(tmp_dest);
         fprintf(stderr, "  FAILED: %s\n", basename);
     }
     return rc;
 }
 
 int main(int argc, char **argv) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
     int argi = 1;
 
-    if (argi < argc && strcmp(argv[argi], "--deps") == 0) {
-        g_fetch_deps = 1;
+    while (argi < argc && strncmp(argv[argi], "--", 2) == 0) {
+        if (strcmp(argv[argi], "--deps") == 0) {
+            g_fetch_deps = 1;
+        } else if (strcmp(argv[argi], "--force") == 0) {
+            g_force_root = 1;
+        } else {
+            fprintf(stderr, "Usage: nix-fetch [--deps] [--force] <store-path-hash>\n");
+            return 1;
+        }
         argi++;
     }
 
     if (argi >= argc) {
-        fprintf(stderr, "Usage: nix-fetch [--deps] <store-path-hash>\n");
+        fprintf(stderr, "Usage: nix-fetch [--deps] [--force] <store-path-hash>\n");
         return 1;
     }
 
@@ -717,6 +796,6 @@ int main(int argc, char **argv) {
     printf("nix-fetch: nar-unpack=%s\n", g_unpack_path);
     printf("nix-fetch: store=%s\n", g_store_dir);
 
-    int rc = fetch_package(hash_buf);
-    return rc == 0 ? 0 : 1;
+    int rc = fetch_package(hash_buf, g_force_root);
+    _exit(rc == 0 ? 0 : 1);
 }

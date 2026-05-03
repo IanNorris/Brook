@@ -47,6 +47,19 @@
 #define BROOK_SYS_WM_POP_INPUT       510
 #define BROOK_SYS_WM_RESIZE_VFB      511
 #define BROOK_SYS_WM_SET_DECORATION_MODE 512
+#define BROOK_SYS_WM_BEGIN_MOVE      513
+#define BROOK_SYS_WM_MOVE_RELATIVE   514
+#define BROOK_SYS_WM_SET_MAXIMIZED   515
+#define BROOK_SYS_WM_SET_MINIMIZED   516
+#define BROOK_SYS_WM_BEGIN_RESIZE    517
+#define BROOK_SYS_WM_SET_CURSOR_VISIBLE 518
+#define BROOK_WM_CREATE_FLAG_CSD     1u
+#define BROOK_WM_CREATE_FLAG_NO_FOCUS 2u
+
+#define BROOK_WM_EDGE_TOP     1u
+#define BROOK_WM_EDGE_BOTTOM  2u
+#define BROOK_WM_EDGE_LEFT    4u
+#define BROOK_WM_EDGE_RIGHT   8u
 
 /* Match the kernel's BrookWmCreateOut struct. */
 struct brook_wm_create_out {
@@ -88,8 +101,9 @@ static uint32_t g_now_ms(void) {
 }
 
 static long wm_create_window(uint32_t w, uint32_t h, const char* title,
-                             struct brook_wm_create_out* out) {
-    return syscall(BROOK_SYS_WM_CREATE_WINDOW, (long)w, (long)h, (long)title, (long)out);
+                             uint32_t flags, struct brook_wm_create_out* out) {
+    return syscall(BROOK_SYS_WM_CREATE_WINDOW, (long)w, (long)h,
+                   (long)title, (long)out, (long)flags);
 }
 static long wm_destroy_window(uint32_t id) {
     return syscall(BROOK_SYS_WM_DESTROY_WINDOW, (long)id);
@@ -111,6 +125,25 @@ static long wm_resize_vfb(uint32_t id, uint32_t w, uint32_t h,
 static long wm_set_decoration_mode(uint32_t id, int csd) {
     return syscall(BROOK_SYS_WM_SET_DECORATION_MODE, (long)id, (long)csd);
 }
+static long wm_begin_move(uint32_t id) {
+    return syscall(BROOK_SYS_WM_BEGIN_MOVE, (long)id);
+}
+static long wm_move_relative(uint32_t id, uint32_t parent_id, int32_t x, int32_t y) {
+    return syscall(BROOK_SYS_WM_MOVE_RELATIVE, (long)id, (long)parent_id,
+                   (long)x, (long)y);
+}
+static long wm_set_maximized(uint32_t id, int enable) {
+    return syscall(BROOK_SYS_WM_SET_MAXIMIZED, (long)id, (long)enable);
+}
+static long wm_set_minimized(uint32_t id) {
+    return syscall(BROOK_SYS_WM_SET_MINIMIZED, (long)id);
+}
+static long wm_begin_resize(uint32_t id, uint32_t edges) {
+    return syscall(BROOK_SYS_WM_BEGIN_RESIZE, (long)id, (long)edges);
+}
+static long wm_set_cursor_visible(int visible) {
+    return syscall(BROOK_SYS_WM_SET_CURSOR_VISIBLE, (long)(visible != 0));
+}
 
 /* ---------------- per-surface state ---------------- */
 
@@ -123,6 +156,7 @@ static void seat_clients_scrub_surface(struct brook_surface *s);
 struct brook_positioner {
     int32_t w, h;
     int32_t ax, ay, aw, ah;
+    uint32_t anchor, gravity, constraint;
     int32_t ox, oy;
 };
 
@@ -140,6 +174,7 @@ struct brook_surface {
     /* Popup geometry derived from positioner at get_popup time. */
     int32_t popup_w, popup_h;
     int32_t popup_x, popup_y;
+    struct brook_surface *popup_parent;
 
     /* Pending frame callbacks queued by wl_surface.frame() since the
      * last commit. Fired with a millisecond timestamp at commit time. */
@@ -156,10 +191,8 @@ struct brook_surface {
     uint32_t  vfb_stride;   /* in pixels */
     uint32_t  vfb_w, vfb_h; /* the size we created the Window at */
 
-    /* Decoration mode requested by client.  Initialised to CSD when the
-     * client binds zxdg_decoration_manager_v1 (signalling it knows how to
-     * draw its own chrome) and updated by zxdg_toplevel_decoration_v1.set_mode.
-     * Applied to the kernel WM when wm_id is known. */
+    /* Decoration mode requested by client.  Brook's policy is server-side
+     * chrome for normal toplevels; popups are forced CSD/no-chrome. */
     int  deco_csd;          /* 1 = client-side, 0 = server-side */
     int  deco_pending;      /* mode change requested but wm_id not yet known */
 
@@ -177,6 +210,92 @@ struct brook_surface *find_surface_by_wm_id(uint32_t id) {
     return NULL;
 }
 
+static void positioner_compute_geometry(const struct brook_positioner *p,
+                                        int32_t *out_x, int32_t *out_y,
+                                        int32_t *out_w, int32_t *out_h) {
+    int32_t pw = (p && p->w > 0) ? p->w : 200;
+    int32_t ph = (p && p->h > 0) ? p->h : 100;
+    int32_t x = p ? p->ax : 0;
+    int32_t y = p ? p->ay : 0;
+
+    if (p) {
+        switch (p->anchor) {
+            case XDG_POSITIONER_ANCHOR_TOP:
+            case XDG_POSITIONER_ANCHOR_BOTTOM:
+                x += p->aw / 2;
+                break;
+            case XDG_POSITIONER_ANCHOR_RIGHT:
+            case XDG_POSITIONER_ANCHOR_TOP_RIGHT:
+            case XDG_POSITIONER_ANCHOR_BOTTOM_RIGHT:
+                x += p->aw;
+                break;
+            default:
+                break;
+        }
+        switch (p->anchor) {
+            case XDG_POSITIONER_ANCHOR_LEFT:
+            case XDG_POSITIONER_ANCHOR_RIGHT:
+                y += p->ah / 2;
+                break;
+            case XDG_POSITIONER_ANCHOR_BOTTOM:
+            case XDG_POSITIONER_ANCHOR_BOTTOM_LEFT:
+            case XDG_POSITIONER_ANCHOR_BOTTOM_RIGHT:
+                y += p->ah;
+                break;
+            default:
+                break;
+        }
+
+        switch (p->gravity) {
+            case XDG_POSITIONER_GRAVITY_TOP:
+            case XDG_POSITIONER_GRAVITY_BOTTOM:
+                x -= pw / 2;
+                break;
+            case XDG_POSITIONER_GRAVITY_LEFT:
+            case XDG_POSITIONER_GRAVITY_TOP_LEFT:
+            case XDG_POSITIONER_GRAVITY_BOTTOM_LEFT:
+                x -= pw;
+                break;
+            default:
+                break;
+        }
+        switch (p->gravity) {
+            case XDG_POSITIONER_GRAVITY_LEFT:
+            case XDG_POSITIONER_GRAVITY_RIGHT:
+                y -= ph / 2;
+                break;
+            case XDG_POSITIONER_GRAVITY_TOP:
+            case XDG_POSITIONER_GRAVITY_TOP_LEFT:
+            case XDG_POSITIONER_GRAVITY_TOP_RIGHT:
+                y -= ph;
+                break;
+            default:
+                break;
+        }
+
+        x += p->ox;
+        y += p->oy;
+    }
+
+    *out_x = x;
+    *out_y = y;
+    *out_w = pw;
+    *out_h = ph;
+}
+
+static void popup_apply_position(struct brook_surface *s) {
+    if (!s || !s->xdg_popup || !s->wm_id || !s->popup_parent || !s->popup_parent->wm_id)
+        return;
+    long rc = wm_move_relative(s->wm_id, s->popup_parent->wm_id, s->popup_x, s->popup_y);
+    if (rc != 0) {
+        fprintf(stderr, "[waylandd] WM_MOVE_RELATIVE popup=%u parent=%u at (%d,%d) failed rc=%ld errno=%d\n",
+                s->wm_id, s->popup_parent->wm_id, s->popup_x, s->popup_y, rc, errno);
+    } else {
+        fprintf(stderr, "[waylandd] WM_MOVE_RELATIVE popup=%u parent=%u at (%d,%d)\n",
+                s->wm_id, s->popup_parent->wm_id, s->popup_x, s->popup_y);
+    }
+}
+
 static void on_sigint(int sig) { (void)sig; g_shutdown = 1; }
 
 /* ---------------- wl_surface ---------------- */
@@ -189,7 +308,6 @@ static void surface_attach(struct wl_client *c, struct wl_resource *r,
     (void)c; (void)x; (void)y;
     struct brook_surface *s = wl_resource_get_user_data(r);
     s->pending_buffer = buffer;
-    fprintf(stderr, "[waylandd] surface.attach buffer=%p\n", (void*)buffer);
 }
 static void surface_damage(struct wl_client *c, struct wl_resource *r,
                            int32_t x, int32_t y, int32_t w, int32_t h) {
@@ -197,7 +315,6 @@ static void surface_damage(struct wl_client *c, struct wl_resource *r,
 }
 static void surface_frame(struct wl_client *c, struct wl_resource *r, uint32_t cb) {
     struct brook_surface *s = wl_resource_get_user_data(r);
-    fprintf(stderr, "[waylandd] surface.frame cb=%u\n", cb);
     struct wl_resource *cb_r = wl_resource_create(c, &wl_callback_interface, 1, cb);
     if (!cb_r) return;
     int cap = (int)(sizeof(s->pending_frame_cbs)/sizeof(s->pending_frame_cbs[0]));
@@ -217,19 +334,20 @@ static void surface_set_input_region(struct wl_client *c, struct wl_resource *r,
     (void)c; (void)r; (void)reg;
 }
 
-/* Copy wl_shm buffer pixels into the per-window VFB.  Convert XRGB8888
- * → ARGB8888 (force opaque alpha) so the kernel compositor's straight
- * blit produces the correct result. */
+/* Copy wl_shm buffer pixels into the per-window VFB.  Preserve ARGB alpha so
+ * GTK/Qt CSD shadows stay transparent; force XRGB buffers opaque. */
 static void blit_to_window(struct brook_surface *s,
-                           const uint8_t *src, int sw, int sh, int sstride) {
+                           const uint8_t *src, int sw, int sh, int sstride,
+                           uint32_t format) {
     if (!s->vfb || sw <= 0 || sh <= 0) return;
     int cw = sw < (int)s->vfb_w ? sw : (int)s->vfb_w;
     int ch = sh < (int)s->vfb_h ? sh : (int)s->vfb_h;
+    int has_alpha = (format == WL_SHM_FORMAT_ARGB8888);
     for (int y = 0; y < ch; y++) {
         const uint32_t *srow = (const uint32_t*)(src + (size_t)y * sstride);
         uint32_t *drow = s->vfb + (size_t)y * s->vfb_stride;
         for (int x = 0; x < cw; x++) {
-            drow[x] = 0xff000000u | (srow[x] & 0x00ffffffu);
+            drow[x] = has_alpha ? srow[x] : (0xff000000u | (srow[x] & 0x00ffffffu));
         }
     }
 }
@@ -238,8 +356,6 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
     (void)c;
     struct brook_surface *s = wl_resource_get_user_data(r);
 
-    fprintf(stderr, "[waylandd] surface.commit pending=%p initial_done=%d acked=%d\n",
-            (void*)s->pending_buffer, s->xdg_initial_commit_done, s->xdg_acked);
     /* xdg-shell role: the very first commit must have NO buffer; we
      * respond with a configure. The client acks, then commits with a
      * buffer for real. */
@@ -289,8 +405,15 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
         /* Lazy create the kernel Window now that we know the size. */
         if (s->wm_id == 0) {
             struct brook_wm_create_out out = {0};
+            uint32_t create_flags = 0;
+            if (s->xdg_popup || s->deco_csd)
+                create_flags |= BROOK_WM_CREATE_FLAG_CSD;
+            if (s->xdg_popup)
+                create_flags |= BROOK_WM_CREATE_FLAG_NO_FOCUS;
             long rc = wm_create_window((uint32_t)w, (uint32_t)h,
-                                       s->title[0] ? s->title : NULL, &out);
+                                       s->title[0] ? s->title : NULL,
+                                       create_flags,
+                                       &out);
             if (rc == 0 && out.wm_id) {
                 s->wm_id      = out.wm_id;
                 s->vfb        = (uint32_t*)(uintptr_t)out.vfb_user;
@@ -298,14 +421,15 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
                 s->vfb_w      = (uint32_t)w;
                 s->vfb_h      = (uint32_t)h;
                 fprintf(stderr,
-                        "[waylandd] WM_CREATE_WINDOW id=%u %dx%d stride=%u vfb=%p\n",
-                        s->wm_id, w, h, s->vfb_stride, (void*)s->vfb);
-                /* Apply any decoration mode the client requested before
-                 * the kernel Window existed. */
+                        "[waylandd] WM_CREATE_WINDOW id=%u %dx%d stride=%u vfb=%p deco=%s\n",
+                        s->wm_id, w, h, s->vfb_stride, (void*)s->vfb,
+                        s->deco_csd ? "client_side" : "server_side");
+                /* The initial decoration mode is applied atomically by
+                 * WM_CREATE_WINDOW; later mode changes use syscall 512. */
                 if (s->deco_pending) {
-                    wm_set_decoration_mode(s->wm_id, s->deco_csd);
                     s->deco_pending = 0;
                 }
+                popup_apply_position(s);
             } else {
                 fprintf(stderr, "[waylandd] WM_CREATE_WINDOW failed rc=%ld\n", rc);
             }
@@ -337,7 +461,7 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
             }
             wl_shm_buffer_begin_access(shm);
             const uint8_t *px = wl_shm_buffer_get_data(shm);
-            if (px) blit_to_window(s, px, w, h, stride);
+            if (px) blit_to_window(s, px, w, h, stride, wl_shm_buffer_get_format(shm));
             wl_shm_buffer_end_access(shm);
             wm_signal_dirty(s->wm_id);
         }
@@ -401,6 +525,9 @@ static void surface_destroy_userdata(struct wl_resource *r) {
         if (*pp == s) { *pp = s->next; break; }
         pp = &(*pp)->next;
     }
+    for (struct brook_surface *it = g_surfaces; it; it = it->next) {
+        if (it->popup_parent == s) it->popup_parent = NULL;
+    }
     if (s->wm_id) wm_destroy_window(s->wm_id);
     free(s);
 }
@@ -419,7 +546,6 @@ static void compositor_create_surface(struct wl_client *client,
     s->next = g_surfaces;
     g_surfaces = s;
     wl_resource_set_implementation(sr, &surface_impl, s, surface_destroy_userdata);
-    fprintf(stderr, "[waylandd] wl_surface created id=%u\n", id);
 }
 
 static void region_destroy(struct wl_client *c, struct wl_resource *r) {
@@ -491,12 +617,34 @@ static void xdg_toplevel_show_window_menu(struct wl_client *c, struct wl_resourc
 }
 static void xdg_toplevel_move(struct wl_client *c, struct wl_resource *r,
                                struct wl_resource *seat, uint32_t serial) {
-    (void)c; (void)r; (void)seat; (void)serial;
+    (void)c; (void)seat; (void)serial;
+    struct brook_surface *s = wl_resource_get_user_data(r);
+    if (!s || !s->wm_id) return;
+    long rc = wm_begin_move(s->wm_id);
+    fprintf(stderr, "[waylandd] xdg_toplevel.move wm=%u rc=%ld\n",
+            s->wm_id, rc);
 }
 static void xdg_toplevel_resize(struct wl_client *c, struct wl_resource *r,
                                  struct wl_resource *seat, uint32_t serial,
                                  uint32_t edges) {
-    (void)c; (void)r; (void)seat; (void)serial; (void)edges;
+    (void)c; (void)seat; (void)serial;
+    struct brook_surface *s = wl_resource_get_user_data(r);
+    if (!s || !s->wm_id) return;
+    uint32_t brook_edges = 0;
+    switch (edges) {
+    case 1:  brook_edges = BROOK_WM_EDGE_TOP; break;
+    case 2:  brook_edges = BROOK_WM_EDGE_BOTTOM; break;
+    case 4:  brook_edges = BROOK_WM_EDGE_LEFT; break;
+    case 5:  brook_edges = BROOK_WM_EDGE_TOP | BROOK_WM_EDGE_LEFT; break;
+    case 6:  brook_edges = BROOK_WM_EDGE_BOTTOM | BROOK_WM_EDGE_LEFT; break;
+    case 8:  brook_edges = BROOK_WM_EDGE_RIGHT; break;
+    case 9:  brook_edges = BROOK_WM_EDGE_TOP | BROOK_WM_EDGE_RIGHT; break;
+    case 10: brook_edges = BROOK_WM_EDGE_BOTTOM | BROOK_WM_EDGE_RIGHT; break;
+    default: return;
+    }
+    long rc = wm_begin_resize(s->wm_id, brook_edges);
+    fprintf(stderr, "[waylandd] xdg_toplevel.resize wm=%u edges=%u rc=%ld\n",
+            s->wm_id, edges, rc);
 }
 static void xdg_toplevel_set_max_size(struct wl_client *c, struct wl_resource *r,
                                        int32_t w, int32_t h) {
@@ -507,10 +655,20 @@ static void xdg_toplevel_set_min_size(struct wl_client *c, struct wl_resource *r
     (void)c; (void)r; (void)w; (void)h;
 }
 static void xdg_toplevel_set_maximized(struct wl_client *c, struct wl_resource *r) {
-    (void)c; (void)r;
+    (void)c;
+    struct brook_surface *s = wl_resource_get_user_data(r);
+    if (!s || !s->wm_id) return;
+    long rc = wm_set_maximized(s->wm_id, 1);
+    fprintf(stderr, "[waylandd] xdg_toplevel.set_maximized wm=%u rc=%ld\n",
+            s->wm_id, rc);
 }
 static void xdg_toplevel_unset_maximized(struct wl_client *c, struct wl_resource *r) {
-    (void)c; (void)r;
+    (void)c;
+    struct brook_surface *s = wl_resource_get_user_data(r);
+    if (!s || !s->wm_id) return;
+    long rc = wm_set_maximized(s->wm_id, 0);
+    fprintf(stderr, "[waylandd] xdg_toplevel.unset_maximized wm=%u rc=%ld\n",
+            s->wm_id, rc);
 }
 static void xdg_toplevel_set_fullscreen(struct wl_client *c, struct wl_resource *r,
                                          struct wl_resource *output) {
@@ -520,7 +678,12 @@ static void xdg_toplevel_unset_fullscreen(struct wl_client *c, struct wl_resourc
     (void)c; (void)r;
 }
 static void xdg_toplevel_set_minimized(struct wl_client *c, struct wl_resource *r) {
-    (void)c; (void)r;
+    (void)c;
+    struct brook_surface *s = wl_resource_get_user_data(r);
+    if (!s || !s->wm_id) return;
+    long rc = wm_set_minimized(s->wm_id);
+    fprintf(stderr, "[waylandd] xdg_toplevel.set_minimized wm=%u rc=%ld\n",
+            s->wm_id, rc);
 }
 
 static const struct xdg_toplevel_interface xdg_toplevel_impl = {
@@ -558,6 +721,8 @@ static void xdg_surface_get_toplevel(struct wl_client *c, struct wl_resource *r,
     if (!tr) { wl_client_post_no_memory(c); return; }
     wl_resource_set_implementation(tr, &xdg_toplevel_impl, s, xdg_toplevel_resource_destroy);
     s->xdg_toplevel = tr;
+    s->deco_csd = 0;
+    s->deco_pending = 1;
     fprintf(stderr, "[waylandd] xdg_surface.get_toplevel id=%u\n", id);
     /* Tell the client this surface is on our output so GDK's
      * window_update_scale finds a monitor and doesn't fall back to a
@@ -573,10 +738,23 @@ static void xdg_popup_grab(struct wl_client *c, struct wl_resource *r,
     (void)c; (void)r; (void)seat; (void)serial;
 }
 static void xdg_popup_reposition(struct wl_client *c, struct wl_resource *r,
-                                   struct wl_resource *positioner,
-                                   uint32_t token) {
-    (void)c; (void)positioner;
-    /* Echo a repositioned event so clients waiting for it don't stall. */
+                                    struct wl_resource *positioner,
+                                    uint32_t token) {
+    (void)c;
+    struct brook_surface *s = wl_resource_get_user_data(r);
+    struct brook_positioner *p = positioner ?
+        wl_resource_get_user_data(positioner) : NULL;
+    if (s) {
+        positioner_compute_geometry(p, &s->popup_x, &s->popup_y,
+                                    &s->popup_w, &s->popup_h);
+        xdg_popup_send_configure(r, s->popup_x, s->popup_y,
+                                 s->popup_w, s->popup_h);
+        if (s->xdg_surface) {
+            uint32_t serial = ++s->next_configure_serial;
+            xdg_surface_send_configure(s->xdg_surface, serial);
+        }
+        popup_apply_position(s);
+    }
     xdg_popup_send_repositioned(r, token);
 }
 static const struct xdg_popup_interface xdg_popup_impl = {
@@ -598,21 +776,20 @@ static void xdg_surface_get_popup(struct wl_client *c, struct wl_resource *r,
     /* Capture popup geometry from the positioner. */
     struct brook_positioner *p = positioner ?
         wl_resource_get_user_data(positioner) : NULL;
-    int32_t pw = (p && p->w  > 0) ? p->w  : 200;
-    int32_t ph = (p && p->h  > 0) ? p->h  : 100;
-    s->popup_w = pw;
-    s->popup_h = ph;
-    s->popup_x = (p ? p->ax + p->ox : 0);
-    s->popup_y = (p ? p->ay + p->oy : 0);
+    positioner_compute_geometry(p, &s->popup_x, &s->popup_y,
+                                &s->popup_w, &s->popup_h);
+    s->popup_parent = parent ? wl_resource_get_user_data(parent) : NULL;
+    s->deco_csd = 1;
+    s->deco_pending = 1;
 
     struct wl_resource *pr = wl_resource_create(c, &xdg_popup_interface,
                                                  wl_resource_get_version(r), id);
     if (!pr) { wl_client_post_no_memory(c); return; }
     wl_resource_set_implementation(pr, &xdg_popup_impl, s, xdg_popup_resource_destroy);
     s->xdg_popup = pr;
-    (void)parent;
-    fprintf(stderr, "[waylandd] xdg_surface.get_popup id=%u size=%dx%d at (%d,%d)\n",
-            id, pw, ph, s->popup_x, s->popup_y);
+    fprintf(stderr, "[waylandd] xdg_surface.get_popup id=%u parent_wm=%u size=%dx%d at (%d,%d)\n",
+            id, s->popup_parent ? s->popup_parent->wm_id : 0,
+            s->popup_w, s->popup_h, s->popup_x, s->popup_y);
 }
 static void xdg_surface_set_window_geometry(struct wl_client *c, struct wl_resource *r,
                                               int32_t x, int32_t y,
@@ -659,11 +836,23 @@ static void positioner_set_anchor_rect(struct wl_client *c, struct wl_resource *
     if (p) { p->ax = x; p->ay = y; p->aw = w; p->ah = h; }
 }
 static void positioner_set_anchor(struct wl_client *c, struct wl_resource *r,
-                                    uint32_t a) { (void)c; (void)r; (void)a; }
+                                    uint32_t a) {
+    (void)c;
+    struct brook_positioner *p = wl_resource_get_user_data(r);
+    if (p) p->anchor = a;
+}
 static void positioner_set_gravity(struct wl_client *c, struct wl_resource *r,
-                                     uint32_t g) { (void)c; (void)r; (void)g; }
+                                     uint32_t g) {
+    (void)c;
+    struct brook_positioner *p = wl_resource_get_user_data(r);
+    if (p) p->gravity = g;
+}
 static void positioner_set_constraint_adjustment(struct wl_client *c, struct wl_resource *r,
-                                                    uint32_t v) { (void)c; (void)r; (void)v; }
+                                                    uint32_t v) {
+    (void)c;
+    struct brook_positioner *p = wl_resource_get_user_data(r);
+    if (p) p->constraint = v;
+}
 static void positioner_set_offset(struct wl_client *c, struct wl_resource *r,
                                     int32_t x, int32_t y) {
     (void)c;
@@ -777,6 +966,7 @@ struct brook_seat_client {
     struct wl_client   *client;
     struct brook_surface *entered_surface;  /* pointer enter target */
     struct brook_surface *kb_focus;         /* keyboard focus target */
+    int cursor_visible;                     /* policy; kernel is mechanism */
     uint32_t kb_mods_depressed;
     uint32_t kb_mods_locked;
     struct brook_seat_client *next;
@@ -788,12 +978,18 @@ static uint32_t next_serial(void) { return g_serial++; }
 
 static void seat_clients_scrub_surface(struct brook_surface *s) {
     for (struct brook_seat_client *sc = g_seat_clients; sc; sc = sc->next) {
-        if (sc->entered_surface == s) sc->entered_surface = NULL;
+        if (sc->entered_surface == s) {
+            if (!sc->cursor_visible)
+                wm_set_cursor_visible(1);
+            sc->entered_surface = NULL;
+        }
         if (sc->kb_focus == s)        sc->kb_focus = NULL;
     }
 }
 
 static void seat_remove_client(struct brook_seat_client *sc) {
+    if (sc && sc->entered_surface && !sc->cursor_visible)
+        wm_set_cursor_visible(1);
     struct brook_seat_client **pp = &g_seat_clients;
     while (*pp) {
         if (*pp == sc) { *pp = sc->next; free(sc); return; }
@@ -807,10 +1003,25 @@ static struct brook_seat_client *seat_for_resource(struct wl_resource *r) {
     return NULL;
 }
 
+static void seat_apply_cursor_visibility(struct brook_seat_client *sc) {
+    if (!sc || !sc->entered_surface) return;
+    long rc = wm_set_cursor_visible(sc->cursor_visible);
+    if (rc != 0) {
+        fprintf(stderr, "[waylandd] WM_SET_CURSOR_VISIBLE visible=%d failed rc=%ld\n",
+                sc->cursor_visible, rc);
+    }
+}
+
 static void pointer_set_cursor(struct wl_client *c, struct wl_resource *r,
                                 uint32_t serial, struct wl_resource *surface,
                                 int32_t hx, int32_t hy) {
-    (void)c; (void)r; (void)serial; (void)surface; (void)hx; (void)hy;
+    (void)c; (void)serial; (void)hx; (void)hy;
+    struct brook_seat_client *sc = seat_for_resource(r);
+    if (!sc) return;
+    sc->cursor_visible = surface != NULL;
+    seat_apply_cursor_visibility(sc);
+    fprintf(stderr, "[waylandd] wl_pointer.set_cursor visible=%d\n",
+            sc->cursor_visible);
 }
 static void pointer_release(struct wl_client *c, struct wl_resource *r) {
     (void)c; wl_resource_destroy(r);
@@ -1077,6 +1288,7 @@ static void seat_bind(struct wl_client *client, void *data,
     if (!sc) { wl_resource_destroy(r); wl_client_post_no_memory(client); return; }
     sc->seat = r;
     sc->client = client;
+    sc->cursor_visible = 1;
     sc->next = g_seat_clients;
     g_seat_clients = sc;
     wl_resource_set_implementation(r, &seat_impl, sc, seat_resource_destroy);
@@ -1219,6 +1431,7 @@ static void pointer_enter_if_needed(struct brook_seat_client *sc,
             wl_pointer_send_frame(sc->pointer);
     }
     sc->entered_surface = s;
+    seat_apply_cursor_visibility(sc);
 }
 
 static void pump_input_for_surface(struct brook_surface *s) {
@@ -1360,24 +1573,11 @@ static void pump_input_once(void) {
 
 /* ---------------- xdg-decoration-unstable-v1 ----------------
  *
- * We always tell the client to use server-side decorations.  In Brook
- * the kernel WM draws SSDs (titlebar/border/close buttons), so client
- * chrome would be redundant or actively conflict.  Spec compliance:
- * we accept set_mode / unset_mode requests (they're optional hints
- * from the client) and always respond with configure(server_side).
- */
-
-/* zxdg_toplevel_decoration_v1 — server-managed decoration negotiation.
+ * zxdg_toplevel_decoration_v1 — server-managed decoration negotiation.
  *
- * Brook follows the GNOME/Mutter convention: when a client binds the
- * decoration manager at all, it has signalled it knows how to draw its
- * own chrome (CSD).  The initial configure is therefore CLIENT_SIDE.
- * The client may override with set_mode(SERVER_SIDE) -- we comply and
- * have the kernel WM draw chrome.  Either way we drive the kernel
- * WM's noChrome flag via syscall 512 so the rendering matches.
- *
- * Clients that never bind the decoration manager (most legacy GTK3)
- * keep the default SSD chrome.
+ * Brook defaults normal toplevels to server-side decoration so clients
+ * that do not draw reliable CSD still get kernel chrome.  Clients may
+ * explicitly request client-side decoration; popups are always no-chrome.
  */
 
 static void deco_destroy(struct wl_client *c, struct wl_resource *r) {
@@ -1388,9 +1588,13 @@ static void deco_apply_mode(struct wl_resource *r, int csd) {
     if (!s) return;
     s->deco_csd = csd;
     if (s->wm_id) {
-        wm_set_decoration_mode(s->wm_id, csd);
+        long rc = wm_set_decoration_mode(s->wm_id, csd);
+        fprintf(stderr, "[waylandd] decoration wm=%u mode=%s rc=%ld\n",
+                s->wm_id, csd ? "client_side" : "server_side", rc);
         s->deco_pending = 0;
     } else {
+        fprintf(stderr, "[waylandd] decoration pending mode=%s\n",
+                csd ? "client_side" : "server_side");
         s->deco_pending = 1;
     }
     zxdg_toplevel_decoration_v1_send_configure(r,
@@ -1399,13 +1603,14 @@ static void deco_apply_mode(struct wl_resource *r, int csd) {
 }
 static void deco_set_mode(struct wl_client *c, struct wl_resource *r, uint32_t mode) {
     (void)c;
+    fprintf(stderr, "[waylandd] decoration set_mode=%u\n", mode);
     deco_apply_mode(r, mode == ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE ? 1 : 0);
 }
 static void deco_unset_mode(struct wl_client *c, struct wl_resource *r) {
     (void)c;
     /* Spec: "client requests to use the surface's current mode without
-     * a preference".  We default to CSD per the policy above. */
-    deco_apply_mode(r, 1);
+     * a preference".  Keep Brook's server-side default. */
+    deco_apply_mode(r, 0);
 }
 static const struct zxdg_toplevel_decoration_v1_interface deco_impl = {
     .destroy    = deco_destroy,
@@ -1427,6 +1632,8 @@ static void deco_mgr_get_toplevel_decoration(struct wl_client *c,
         wl_resource_get_version(r), id);
     if (!d) { wl_client_post_no_memory(c); return; }
     wl_resource_set_implementation(d, &deco_impl, s, NULL);
+    fprintf(stderr, "[waylandd] decoration get_toplevel_decoration surface=%p\n",
+            (void*)s);
     /* Default to CSD: the client opted in by binding the manager. */
     deco_apply_mode(d, 1);
 }
@@ -1442,6 +1649,8 @@ static void deco_mgr_bind(struct wl_client *client, void *data,
         &zxdg_decoration_manager_v1_interface, (int)version, id);
     if (!r) { wl_client_post_no_memory(client); return; }
     wl_resource_set_implementation(r, &deco_mgr_impl, NULL, NULL);
+    fprintf(stderr, "[waylandd] decoration manager bind v=%u id=%u\n",
+            version, id);
 }
 
 /* ---------------- wl_subcompositor (stub) ---------------- */
