@@ -7,6 +7,7 @@
 #include "memory/heap.h"
 #include "serial.h"
 #include "mem_tag.h"
+#include "process.h"
 #include "scheduler.h"
 
 namespace brook {
@@ -327,19 +328,21 @@ static bool SubmitRequest(VirtioBlkState& s,
         __asm__ volatile("pause" ::: "memory");
     }
 
-    // Phase 2: yield (stay runnable) and re-check. Unlike SchedulerBlock,
-    // SchedulerYield keeps us in the run queue — we'll be re-scheduled
-    // immediately if no other process needs the CPU.
+    // Phase 2: yield (stay runnable) and re-check.
     {
+        bool canYield = (ProcessCurrent() != nullptr);
         uint32_t yieldCount = 0;
         while (*s.usedIdx == s.usedIdxShadow)
         {
-            if (++yieldCount > 50000) // safety timeout
+            if (++yieldCount > 50000)
             {
                 SerialPuts("virtio-blk: timeout waiting for response\n");
                 return false;
             }
-            SchedulerYield();
+            if (canYield)
+                SchedulerYield();
+            else
+                __asm__ volatile("pause" ::: "memory");
         }
     }
 
@@ -353,13 +356,15 @@ done:
 static void AcquireRequestLock(VirtioBlkState& s)
 {
     uint32_t ticket = __atomic_fetch_add(&s.requestGuardNext, 1, __ATOMIC_RELAXED);
+    bool canYield = (ProcessCurrent() != nullptr);
     uint32_t spins = 0;
     while (__atomic_load_n(&s.requestGuardServing, __ATOMIC_ACQUIRE) != ticket)
     {
         __asm__ volatile("pause" ::: "memory");
         if (++spins > 10000)
         {
-            SchedulerYield();
+            if (canYield)
+                SchedulerYield();
             spins = 0;
         }
     }
