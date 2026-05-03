@@ -318,17 +318,19 @@ static bool SubmitRequest(VirtioBlkState& s,
     // Notify device that queue 0 has work.
     VioWrite16(s.ioBase, VIRTIO_PCI_QUEUE_NOTIFY, 0);
 
-    // Hybrid wait: brief spin for fast completions, then yield CPU.
-    // Phase 1: poll ~200 iterations (~2-5µs on modern CPUs). Catches
-    // most QEMU completions without a context switch.
-    for (uint32_t i = 0; i < 200; ++i)
+    // Hybrid wait: spin for completion then yield if needed.
+    // Under KVM, virtio-blk typically completes within a few thousand
+    // pause iterations after the notify port write. We spin up to ~50µs
+    // (10K pauses) which covers the vast majority of cases without a
+    // context switch, then fall back to yield for real hardware latency.
+    for (uint32_t i = 0; i < 10000; ++i)
     {
         if (*s.usedIdx != s.usedIdxShadow)
             goto done;
         __asm__ volatile("pause" ::: "memory");
     }
 
-    // Phase 2: yield and re-check each timer tick (~1ms).
+    // Phase 2: yield and re-check each timer tick.
     {
         Process* self = ProcessCurrent();
         uint32_t yieldCount = 0;
@@ -346,7 +348,6 @@ static bool SubmitRequest(VirtioBlkState& s,
             }
             else
             {
-                // Early boot / no process context — fall back to pause
                 for (uint32_t j = 0; j < 10000; ++j)
                     __asm__ volatile("pause" ::: "memory");
             }
@@ -363,8 +364,23 @@ done:
 static void AcquireRequestLock(VirtioBlkState& s)
 {
     uint32_t ticket = __atomic_fetch_add(&s.requestGuardNext, 1, __ATOMIC_RELAXED);
+    uint32_t spins = 0;
     while (__atomic_load_n(&s.requestGuardServing, __ATOMIC_ACQUIRE) != ticket)
+    {
         __asm__ volatile("pause" ::: "memory");
+        if (++spins > 10000)
+        {
+            // Yield to avoid burning CPU while another thread is sleeping
+            // inside SubmitRequest's completion wait.
+            Process* self = ProcessCurrent();
+            if (self)
+            {
+                self->wakeupTick = g_lapicTickCount + 1;
+                SchedulerBlock(self);
+            }
+            spins = 0;
+        }
+    }
 }
 
 static void ReleaseRequestLock(VirtioBlkState& s)
