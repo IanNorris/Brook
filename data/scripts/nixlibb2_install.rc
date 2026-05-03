@@ -1,0 +1,3 @@
+# Brook OS — install Ladybird's missing BLAKE2 runtime library.
+run /nix/bin/nix-install libb2
+

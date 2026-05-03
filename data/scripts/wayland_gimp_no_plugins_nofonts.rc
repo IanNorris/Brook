@@ -1,0 +1,6 @@
+# GIMP startup boundary test: no data, no plug-ins, and no font loading.
+set wm
+set vfb none
+run --once /nix/bin/waylandd
+run /nix/bin/gimp --verbose --console-messages --stack-trace-mode=never --no-data --no-shm --no-cpu-accel --no-fonts --session=brook-clean --gimprc /boot/SCRIPTS/GIMP_EMPTY_PLUGINS.RC
+

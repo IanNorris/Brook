@@ -1,0 +1,3 @@
+# Brook OS — fetch libwebp only; run nix-install separately to relink profile.
+run /nix/bin/nix-fetch nbqvcbgh1cgxiydas83mlv30f3gx9yhx
+

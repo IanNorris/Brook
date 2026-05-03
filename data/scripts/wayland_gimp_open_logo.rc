@@ -1,0 +1,6 @@
+# Open a PNG in GIMP using the lite plug-in set.
+set wm
+set vfb none
+run --once /nix/bin/waylandd
+run /nix/bin/gimp --no-fonts --gimprc /nix/share/gimp-lite/gimprc /boot/BROOK.PNG
+

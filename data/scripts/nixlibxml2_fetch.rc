@@ -1,0 +1,3 @@
+# Refetch Ladybird's corrupted libxml2 runtime dependency.
+run /nix/bin/nix-fetch v5k7aj5qfr8spbak4xnjhb9g5g3dzsar
+

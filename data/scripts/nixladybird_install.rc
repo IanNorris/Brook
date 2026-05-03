@@ -1,0 +1,2 @@
+# Brook OS — install Ladybird from the Nix package index.
+run /nix/bin/nix-install ladybird

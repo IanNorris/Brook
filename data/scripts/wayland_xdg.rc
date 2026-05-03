@@ -2,4 +2,4 @@
 set wm
 set vfb none
 run /nix/bin/waylandd --seconds 12
-run /nix/store/fnzi2sarrqvh6vfr0wngmvv07q3zrw0r-wayland-xdg-smoke-brook-0.1-brook/bin/wayland-xdg-smoke
+run /nix/store/j25zdmgvz1k8q35hzfszsnifxrg63rvd-wayland-xdg-smoke-brook-0.1-brook/bin/wayland-xdg-smoke

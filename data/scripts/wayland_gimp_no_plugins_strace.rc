@@ -1,0 +1,5 @@
+# Strace the no-plug-in GIMP startup boundary.
+set wm
+set vfb none
+run --once /nix/bin/waylandd
+run --strace /nix/bin/gimp --verbose --console-messages --stack-trace-mode=never --no-data --no-shm --no-cpu-accel --session=brook-clean --gimprc /boot/SCRIPTS/GIMP_EMPTY_PLUGINS.RC

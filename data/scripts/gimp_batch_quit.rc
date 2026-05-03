@@ -1,0 +1,2 @@
+# Smoke-test GIMP batch mode with Script-Fu enabled.
+run /nix/bin/gimp --no-fonts --gimprc /nix/share/gimp-batch/gimprc -i -b "(gimp-quit 0)"

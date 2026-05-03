@@ -1,0 +1,3 @@
+# title: VLC
+# desc: VLC media player
+source /boot/SCRIPTS/wayland_vlc.rc

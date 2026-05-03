@@ -242,12 +242,16 @@ if [ "${FUSE}" -eq 1 ]; then
     done
     [ -f "${NAR_UNPACK}" ] && cp "${NAR_UNPACK}" "${MOUNT_DIR}/bin/nar-unpack"
     # "nix" is a symlink to nix-install (which supports subcommands)
-    ln -sf nix-install "${MOUNT_DIR}/bin/nix"
+    rm -rf "${MOUNT_DIR}/bin/nix"
+    ln -sfnT nix-install "${MOUNT_DIR}/bin/nix"
 
     # Copy curl, xz binaries and CA certs into /nix/bin and /nix/etc so
     # nix-fetch can find them at stable paths without hardcoded store hashes.
     # We copy rather than symlink because Brook's VFS may not resolve
     # cross-mount symlinks reliably.
+    mkdir -p "${MOUNT_DIR}/etc"
+    cp "${ROOT_DIR}/data/asound.conf" "${MOUNT_DIR}/etc/asound.conf"
+
     for p in ${CLOSURE}; do
         base=$(basename "$p")
         case "$base" in
@@ -259,6 +263,49 @@ if [ "${FUSE}" -eq 1 ]; then
                 ;;
             *-waylandd-brook-*)
                 [ -x "$p/bin/waylandd" ] && cp "$p/bin/waylandd" "${MOUNT_DIR}/bin/waylandd"
+                ;;
+            *-gimp-*)
+                if [ -x "$p/bin/gimp" ]; then
+                    ln -sf "../store/$(basename "$p")/bin/gimp" "${MOUNT_DIR}/bin/gimp"
+                    lite_dir="${MOUNT_DIR}/share/gimp-lite"
+                    rm -rf "${lite_dir}"
+                    mkdir -p "${lite_dir}/plug-ins"
+                    for plugin in file-png file-jpeg file-bmp file-tiff file-webp; do
+                        if [ -d "$p/lib/gimp/3.0/plug-ins/${plugin}" ]; then
+                            cp -a "$p/lib/gimp/3.0/plug-ins/${plugin}" \
+                                "${lite_dir}/plug-ins/${plugin}"
+                        fi
+                    done
+                    cat > "${lite_dir}/gimprc" <<'EOF'
+(plug-in-path "/nix/share/gimp-lite/plug-ins")
+(pluginrc-path "/home/gimp-lite-pluginrc")
+(module-path "")
+(interpreter-path "")
+(environ-path "")
+(save-document-history no)
+(save-session-info no)
+(num-processors 1)
+EOF
+                    batch_dir="${MOUNT_DIR}/share/gimp-batch"
+                    rm -rf "${batch_dir}"
+                    mkdir -p "${batch_dir}/plug-ins"
+                    for plugin in file-png file-jpeg file-bmp file-tiff file-webp script-fu; do
+                        if [ -d "$p/lib/gimp/3.0/plug-ins/${plugin}" ]; then
+                            cp -a "$p/lib/gimp/3.0/plug-ins/${plugin}" \
+                                "${batch_dir}/plug-ins/${plugin}"
+                        fi
+                    done
+                    cat > "${batch_dir}/gimprc" <<'EOF'
+(plug-in-path "/nix/share/gimp-batch/plug-ins")
+(pluginrc-path "/home/gimp-batch-pluginrc")
+(module-path "")
+(interpreter-path "")
+(environ-path "")
+(save-document-history no)
+(save-session-info no)
+(num-processors 1)
+EOF
+                fi
                 ;;
             *-nss-cacert-*|*-cacert-*)
                 if [ -f "$p/etc/ssl/certs/ca-bundle.crt" ]; then
@@ -300,11 +347,19 @@ else
     [ -f "${NAR_UNPACK}" ] && write_to_disk "${DISK_IMG}" "${NAR_UNPACK}" "bin/nar-unpack"
     symlink_on_disk "${DISK_IMG}" "bin/nix" "nix-install"
 
+    mkdir_on_disk "${DISK_IMG}" "etc"
+    write_to_disk "${DISK_IMG}" "${ROOT_DIR}/data/asound.conf" "etc/asound.conf"
+
     for p in ${CLOSURE}; do
         base=$(basename "$p")
         case "$base" in
             *-waylandd-brook-*)
                 [ -x "$p/bin/waylandd" ] && write_to_disk "${DISK_IMG}" "$p/bin/waylandd" "bin/waylandd"
+                ;;
+            *-gimp-*)
+                if [ -x "$p/bin/gimp" ]; then
+                    symlink_on_disk "${DISK_IMG}" "bin/gimp" "../store/$(basename "$p")/bin/gimp"
+                fi
                 ;;
         esac
     done

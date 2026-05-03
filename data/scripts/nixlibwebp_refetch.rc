@@ -1,0 +1,4 @@
+# Brook OS — repair/refetch libwebp after detecting a partial store path.
+run /nix/bin/nix-fetch nbqvcbgh1cgxiydas83mlv30f3gx9yhx
+run /nix/bin/nix-install libwebp
+

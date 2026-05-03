@@ -71,6 +71,13 @@ fi
 mmd -i "${INITRD_IMG}.tmp" "::TEST" 2>/dev/null || true
 echo "Hello from initrd!" | mcopy -i "${INITRD_IMG}.tmp" - "::TEST/HELLO.TXT"
 
+# GLib/GIO and DBus require a valid machine-id even for session-bus
+# autolaunch. A deterministic ID is sufficient for Brook's single-VM
+# development images and avoids toolkit startup stalls.
+mmd -i "${INITRD_IMG}.tmp" "::ETC" 2>/dev/null || true
+echo "0123456789abcdef0123456789abcdef" | \
+    mcopy -i "${INITRD_IMG}.tmp" - "::ETC/MACHINE-ID"
+
 # Move into place
 mv "${INITRD_IMG}.tmp" "${INITRD_IMG}"
 

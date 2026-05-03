@@ -1,0 +1,2 @@
+# Brook OS — install Ladybird's OpenLDAP/libldap runtime dependency.
+run /nix/bin/nix-install openldap

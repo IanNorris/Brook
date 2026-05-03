@@ -1,0 +1,8 @@
+(plug-in-path "")
+(pluginrc-path "/tmp/gimp-empty-pluginrc")
+(module-path "")
+(interpreter-path "")
+(environ-path "")
+(save-document-history no)
+(save-session-info no)
+(num-processors 1)

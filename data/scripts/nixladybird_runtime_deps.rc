@@ -1,0 +1,2 @@
+# Brook OS — link Ladybird runtime libraries that are not in its ELF RPATH.
+run /nix/bin/nix-install libb2 libwebp openldap

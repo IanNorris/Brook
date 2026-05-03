@@ -1,0 +1,3 @@
+# title: Ladybird
+# desc: Ladybird browser
+source /boot/SCRIPTS/wayland_ladybird_example.rc

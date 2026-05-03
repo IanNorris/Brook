@@ -55,7 +55,22 @@ echo "Mounted ${DISK_IMG} at ${MNTDIR}"
 
 if [ "${UPDATE_TOOLS}" -eq 1 ]; then
     echo "Updating tools..."
+    echo -n "/nix" > "${MNTDIR}/BROOK.MNT"
     mkdir -p "${MNTDIR}/bin"
+    WAYLANDD_OUT=""
+    if command -v nix-build &>/dev/null && command -v nix-store &>/dev/null; then
+        WAYLANDD_OUT=$(nix-build "${ROOT_DIR}/tools/waylandd-pkg" --no-out-link)
+        mkdir -p "${MNTDIR}/store"
+        while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            base=$(basename "$p")
+            dst="${MNTDIR}/store/${base}"
+            if [ ! -e "$dst" ]; then
+                cp -a --no-preserve=links "$p" "$dst"
+                echo "  store/${base}"
+            fi
+        done < <(nix-store -qR "$WAYLANDD_OUT")
+    fi
     for tool in nix-fetch nix-search nix-install; do
         src="${TOOLS_BIN}/${tool}/${tool}"
         if [ -f "$src" ]; then
@@ -70,13 +85,19 @@ if [ "${UPDATE_TOOLS}" -eq 1 ]; then
         cp "$nar" "${MNTDIR}/bin/nar-unpack"
         echo "  nar-unpack -> /nix/bin/nar-unpack"
     fi
-    # Ensure nix -> nix-install symlink exists
-    ln -sf nix-install "${MNTDIR}/bin/nix"
+    # Ensure nix -> nix-install symlink exists. Older images may have a
+    # stale /nix/bin/nix directory, which ln -sf will not replace.
+    rm -rf "${MNTDIR}/bin/nix"
+    ln -sfnT nix-install "${MNTDIR}/bin/nix"
 
     # Bundle curl, xz binaries and CA certs from the on-disk store so
     # nix-fetch finds them at stable paths (/nix/bin/curl, /nix/bin/xz,
     # /nix/etc/ssl/certs/ca-bundle.crt). Without these, `nix install`
     # fails immediately with "curl not found".
+    mkdir -p "${MNTDIR}/etc"
+    cp "${ROOT_DIR}/data/asound.conf" "${MNTDIR}/etc/asound.conf"
+    echo "  asound.conf -> /nix/etc/asound.conf"
+
     if [ -d "${MNTDIR}/store" ]; then
         for d in "${MNTDIR}"/store/*-curl-*-bin; do
             [ -x "$d/bin/curl" ] || continue
@@ -90,10 +111,62 @@ if [ "${UPDATE_TOOLS}" -eq 1 ]; then
             echo "  xz -> /nix/bin/xz"
             break
         done
-        for d in "${MNTDIR}"/store/*-waylandd-brook-*; do
-            [ -x "$d/bin/waylandd" ] || continue
-            cp "$d/bin/waylandd" "${MNTDIR}/bin/waylandd"
+        if [ -n "$WAYLANDD_OUT" ] && [ -x "${MNTDIR}/store/$(basename "$WAYLANDD_OUT")/bin/waylandd" ]; then
+            cp "${MNTDIR}/store/$(basename "$WAYLANDD_OUT")/bin/waylandd" "${MNTDIR}/bin/waylandd"
             echo "  waylandd -> /nix/bin/waylandd"
+        else
+            for d in "${MNTDIR}"/store/*-waylandd-brook-*; do
+                [ -x "$d/bin/waylandd" ] || continue
+                cp "$d/bin/waylandd" "${MNTDIR}/bin/waylandd"
+                echo "  waylandd -> /nix/bin/waylandd"
+                break
+            done
+        fi
+        for d in "${MNTDIR}"/store/*-gimp-*; do
+            [ -x "$d/bin/gimp" ] || continue
+            ln -sf "../store/$(basename "$d")/bin/gimp" "${MNTDIR}/bin/gimp"
+
+            lite_dir="${MNTDIR}/share/gimp-lite"
+            rm -rf "${lite_dir}"
+            mkdir -p "${lite_dir}/plug-ins"
+            for plugin in file-png file-jpeg file-bmp file-tiff file-webp; do
+                if [ -d "$d/lib/gimp/3.0/plug-ins/${plugin}" ]; then
+                    cp -a "$d/lib/gimp/3.0/plug-ins/${plugin}" \
+                        "${lite_dir}/plug-ins/${plugin}"
+                fi
+            done
+            cat > "${lite_dir}/gimprc" <<'EOF'
+(plug-in-path "/nix/share/gimp-lite/plug-ins")
+(pluginrc-path "/home/gimp-lite-pluginrc")
+(module-path "")
+(interpreter-path "")
+(environ-path "")
+(save-document-history no)
+(save-session-info no)
+(num-processors 1)
+EOF
+            batch_dir="${MNTDIR}/share/gimp-batch"
+            rm -rf "${batch_dir}"
+            mkdir -p "${batch_dir}/plug-ins"
+            for plugin in file-png file-jpeg file-bmp file-tiff file-webp script-fu; do
+                if [ -d "$d/lib/gimp/3.0/plug-ins/${plugin}" ]; then
+                    cp -a "$d/lib/gimp/3.0/plug-ins/${plugin}" \
+                        "${batch_dir}/plug-ins/${plugin}"
+                fi
+            done
+            cat > "${batch_dir}/gimprc" <<'EOF'
+(plug-in-path "/nix/share/gimp-batch/plug-ins")
+(pluginrc-path "/home/gimp-batch-pluginrc")
+(module-path "")
+(interpreter-path "")
+(environ-path "")
+(save-document-history no)
+(save-session-info no)
+(num-processors 1)
+EOF
+            echo "  gimp -> /nix/bin/gimp"
+            echo "  gimp-lite gimprc + file plug-ins -> /nix/share/gimp-lite"
+            echo "  gimp-batch gimprc + script-fu -> /nix/share/gimp-batch"
             break
         done
         for d in "${MNTDIR}"/store/*-nss-cacert-* "${MNTDIR}"/store/*-cacert-*; do

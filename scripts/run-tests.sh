@@ -3,7 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-BUILD_TYPE="${1:-debug}"
+BUILD_TYPE_INPUT="${1:-debug}"
+BUILD_TYPE="$(echo "${BUILD_TYPE_INPUT}" | tr '[:upper:]' '[:lower:]')"
 BUILD_DIR="${ROOT_DIR}/build/${BUILD_TYPE}"
 
 # Locate OVMF firmware (same logic as run-qemu.sh)

@@ -1,0 +1,4 @@
+#!/boot/BIN/BASH
+exec /nix/bin/gimp --no-fonts --gimprc /nix/share/gimp-batch/gimprc -i \
+  -b '(let* ((loaded (gimp-file-load RUN-NONINTERACTIVE "/boot/BROOK.PNG" "/boot/BROOK.PNG")) (image (if (pair? loaded) (car loaded) loaded))) (gimp-image-flip image ORIENTATION-HORIZONTAL) (gimp-file-save RUN-NONINTERACTIVE image "/boot/BROOK-OUT.PNG" "/boot/BROOK-OUT.PNG") (gimp-image-delete image))' \
+  -b '(gimp-quit 0)'

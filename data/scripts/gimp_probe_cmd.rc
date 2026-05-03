@@ -1,0 +1,5 @@
+#!/boot/BIN/BASH
+exec /nix/bin/gimp --no-fonts --gimprc /nix/share/gimp-batch/gimprc -i \
+  -b '(let* ((loaded (gimp-file-load RUN-NONINTERACTIVE "/boot/BROOK.PNG" "/boot/BROOK.PNG")) (image (if (pair? loaded) (car loaded) loaded)) (selected (gimp-image-get-selected-layers image))) (gimp-message (string-append "loaded pair=" (if (pair? loaded) "yes" "no") " vector=" (if (vector? loaded) "yes" "no"))) (gimp-message (string-append "selected pair=" (if (pair? selected) "yes" "no") " vector=" (if (vector? selected) "yes" "no"))))' \
+  -b '(gimp-quit 0)'
+

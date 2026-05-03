@@ -1,0 +1,2 @@
+# Load, edit, and export a PNG through GIMP's batch path.
+run /boot/BIN/BASH --norc --noprofile /boot/SCRIPTS/GIMP_EXPORT_CMD.RC

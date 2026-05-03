@@ -89,7 +89,17 @@ if command -v fsck.fat >/dev/null 2>&1; then
     # NB: fsck.fat returns 1 on "errors corrected" — that's a success for us
     # but `set -e` would kill the script before we could inspect $?.
     fsck_rc=0
-    fsck.fat -a "${DISK_IMG}" >/tmp/brook_fsck.$$ 2>&1 || fsck_rc=$?
+    timeout --signal=KILL 60 fsck.fat -a "${DISK_IMG}" </dev/null >/tmp/brook_fsck.$$ 2>&1 || fsck_rc=$?
+    if [ $fsck_rc -eq 124 ] || [ $fsck_rc -eq 137 ]; then
+        echo "FAT filesystem check timed out for ${DISK_IMG}:"
+        sed 's/^/  /' /tmp/brook_fsck.$$
+        rm -f /tmp/brook_fsck.$$
+        echo ""
+        echo "To recover:"
+        echo "  cp ${DISK_IMG} ${DISK_IMG}.backup"
+        echo "  fsck.fat -a ${DISK_IMG} < /dev/null"
+        exit 1
+    fi
     # fsck.fat exit codes: 0=clean, 1=errors corrected, 2=errors not corrected
     if [ $fsck_rc -ge 2 ]; then
         echo "FAT filesystem corrupted in ${DISK_IMG} (unfixable):"
@@ -105,6 +115,10 @@ if command -v fsck.fat >/dev/null 2>&1; then
     if [ $fsck_rc -eq 1 ]; then
         echo "  fsck.fat: auto-repaired residual issues from a prior killed run"
     fi
+    # Lost clusters recovered by fsck.fat are not source-of-truth content
+    # for this generated boot disk; leaving hundreds of FSCK*.REC files in
+    # the root slows future directory scans and wastes image space.
+    mdel -i "${DISK_IMG}" "::/FSCK*.REC" 2>/dev/null || true
     rm -f /tmp/brook_fsck.$$
 fi
 

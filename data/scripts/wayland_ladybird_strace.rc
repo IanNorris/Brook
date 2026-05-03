@@ -1,0 +1,5 @@
+# Brook + Ladybird Wayland launch with syscall tracing on the browser process.
+set wm
+set vfb none
+run --once /nix/bin/waylandd
+run --strace /nix/profile/bin/Ladybird --force-cpu-painting --disable-sql-database --disable-http-disk-cache about:blank

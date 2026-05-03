@@ -1,0 +1,5 @@
+# GIMP with normal font loading enabled, using the lite plug-in directory.
+set wm
+set vfb none
+run --once /nix/bin/waylandd
+run /nix/bin/gimp --gimprc /nix/share/gimp-lite/gimprc

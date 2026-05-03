@@ -1,0 +1,3 @@
+# Probe GIMP 3 Script-Fu return shapes for batch export.
+run /boot/BIN/BASH --norc --noprofile /boot/SCRIPTS/GIMP_PROBE_CMD.RC
+
