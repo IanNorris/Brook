@@ -7,12 +7,9 @@
 #include "memory/heap.h"
 #include "serial.h"
 #include "mem_tag.h"
-#include "process.h"
 #include "scheduler.h"
 
 namespace brook {
-
-extern volatile uint64_t g_lapicTickCount;
 
 // ---- virtio-blk PCI register offsets (legacy BAR0 I/O) ----
 
@@ -330,27 +327,19 @@ static bool SubmitRequest(VirtioBlkState& s,
         __asm__ volatile("pause" ::: "memory");
     }
 
-    // Phase 2: yield and re-check each timer tick.
+    // Phase 2: yield (stay runnable) and re-check. Unlike SchedulerBlock,
+    // SchedulerYield keeps us in the run queue — we'll be re-scheduled
+    // immediately if no other process needs the CPU.
     {
-        Process* self = ProcessCurrent();
         uint32_t yieldCount = 0;
         while (*s.usedIdx == s.usedIdxShadow)
         {
-            if (++yieldCount > 5000) // ~5s timeout
+            if (++yieldCount > 50000) // safety timeout
             {
                 SerialPuts("virtio-blk: timeout waiting for response\n");
                 return false;
             }
-            if (self)
-            {
-                self->wakeupTick = g_lapicTickCount + 1;
-                SchedulerBlock(self);
-            }
-            else
-            {
-                for (uint32_t j = 0; j < 10000; ++j)
-                    __asm__ volatile("pause" ::: "memory");
-            }
+            SchedulerYield();
         }
     }
 
@@ -370,14 +359,7 @@ static void AcquireRequestLock(VirtioBlkState& s)
         __asm__ volatile("pause" ::: "memory");
         if (++spins > 10000)
         {
-            // Yield to avoid burning CPU while another thread is sleeping
-            // inside SubmitRequest's completion wait.
-            Process* self = ProcessCurrent();
-            if (self)
-            {
-                self->wakeupTick = g_lapicTickCount + 1;
-                SchedulerBlock(self);
-            }
+            SchedulerYield();
             spins = 0;
         }
     }
