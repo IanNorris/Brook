@@ -32,6 +32,36 @@ static inline void FreeProcessStruct(Process* p)
     kfree(p);
 }
 
+static inline void VnodeHandleUnref(Vnode* vn)
+{
+    if (!vn) return;
+    uint32_t prev = __atomic_fetch_sub(&vn->refCount, 1, __ATOMIC_ACQ_REL);
+    if (prev <= 1)
+        VfsClose(vn);
+}
+
+static void ProcessClearLazyMappings(Process* proc)
+{
+    if (!proc) return;
+
+    for (uint32_t i = 0; i < Process::MAX_MEMFD_MAPS; i++) {
+        auto& m = proc->memfdMaps[i];
+        if (m.length == 0) continue;
+        uint64_t pages = (m.length + 4095) / 4096;
+        for (uint64_t p = 0; p < pages; p++)
+            VmmUnmapPage(proc->pageTable, VirtualAddress(m.vaddr + p * 4096));
+        if (m.mfd) brook::MemFdHandleUnref(m.mfd);
+        m.vaddr = 0; m.length = 0; m.offset = 0; m.vmmFlags = 0; m.mfd = nullptr;
+    }
+
+    for (uint32_t i = 0; i < Process::MAX_FILE_MAPS; i++) {
+        auto& m = proc->fileMaps[i];
+        if (m.length == 0) continue;
+        if (m.vnode) VnodeHandleUnref(m.vnode);
+        m.vaddr = 0; m.length = 0; m.offset = 0; m.vmmFlags = 0; m.vnode = nullptr;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // File descriptor operations
 // ---------------------------------------------------------------------------
@@ -57,7 +87,9 @@ int FdAlloc(Process* proc, FdType type, void* handle)
         {
             proc->fds[i].type     = type;
             proc->fds[i].flags    = 0;
+            proc->fds[i].fdFlags  = 0;
             proc->fds[i].refCount = 1;
+            proc->fds[i].statusFlags = 0;
             proc->fds[i].handle   = handle;
             proc->fds[i].seekPos  = 0;
             proc->fds[i].dirPath[0] = '\0';
@@ -73,9 +105,13 @@ void FdFree(Process* proc, int fd)
     if (!proc || !proc->fds) return;
     if (fd < 0 || fd >= static_cast<int>(MAX_FDS)) return;
     proc->fds[fd].type     = FdType::None;
+    proc->fds[fd].flags    = 0;
+    proc->fds[fd].fdFlags  = 0;
+    proc->fds[fd].statusFlags = 0;
     proc->fds[fd].handle   = nullptr;
     proc->fds[fd].refCount = 0;
     proc->fds[fd].seekPos  = 0;
+    proc->fds[fd].dirPath[0] = '\0';
 }
 
 FdEntry* FdGet(Process* proc, int fd)
@@ -387,6 +423,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     proc->threadLeader = proc;
     proc->state = ProcessState::Ready;
     proc->runningOnCpu = -1;
+    proc->cpuAffinity = -1;
     proc->schedPriority = 2;  // SCHED_PRIORITY_NORMAL
 
     // Allocate shared fd table (shared across CLONE_FILES threads).
@@ -658,6 +695,7 @@ Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
     proc->threadLeader = proc;
     proc->state = ProcessState::Ready;
     proc->runningOnCpu = -1;
+    proc->cpuAffinity = -1;
     proc->isKernelThread = true;
     proc->schedPriority = priority;
 
@@ -696,69 +734,7 @@ Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
 // Shared between ProcessCloseAllFds and ProcessCloseCloexecFds.
 static void CloseFdEntry(Process* proc, uint32_t i)
 {
-    FdEntry& fde = proc->fds[i];
-
-    // Trace low-numbered fd closures so we can spot accidental closures
-    // of Go runtime fds (epoll, eventfd, network sockets typically land at
-    // fd 3..7). BRO-003 debug.
-    if (i <= 15 && fde.type != FdType::None)
-    {
-        SerialPrintf("CLOSE: fd=%u pid=%u tgid=%u type=%d handle=0x%lx flags=0x%x\n",
-                     i, proc->pid, proc->tgid,
-                     static_cast<int>(fde.type),
-                     reinterpret_cast<uint64_t>(fde.handle),
-                     static_cast<unsigned>(fde.flags));
-    }
-
-    if (fde.type == FdType::Vnode && fde.handle)
-    {
-        auto* vn = static_cast<Vnode*>(fde.handle);
-        uint32_t prev = __atomic_fetch_sub(&vn->refCount, 1, __ATOMIC_ACQ_REL);
-        if (prev <= 1)
-            VfsClose(vn);
-    }
-
-    if (fde.type == FdType::Socket && fde.handle)
-    {
-        int sockIdx = static_cast<int>(
-            reinterpret_cast<uintptr_t>(fde.handle)) - 1;
-        brook::SockUnref(sockIdx);
-    }
-
-    if (fde.type == FdType::Pipe && fde.handle)
-    {
-        auto* pipe = static_cast<PipeBuffer*>(fde.handle);
-        if (fde.flags & 1) // write end
-        {
-            __atomic_fetch_sub(&pipe->writers, 1, __ATOMIC_RELEASE);
-            Process* reader = pipe->readerWaiter;
-            if (reader)
-            {
-                pipe->readerWaiter = nullptr;
-                __atomic_store_n(&reader->pendingWakeup, 1, __ATOMIC_RELEASE);
-                SchedulerUnblock(reader);
-            }
-        }
-        else // read end
-        {
-            __atomic_fetch_sub(&pipe->readers, 1, __ATOMIC_RELEASE);
-            Process* writer = pipe->writerWaiter;
-            if (writer)
-            {
-                pipe->writerWaiter = nullptr;
-                __atomic_store_n(&writer->pendingWakeup, 1, __ATOMIC_RELEASE);
-                SchedulerUnblock(writer);
-            }
-        }
-
-        if (__atomic_load_n(&pipe->readers, __ATOMIC_ACQUIRE) == 0 &&
-            __atomic_load_n(&pipe->writers, __ATOMIC_ACQUIRE) == 0)
-        {
-            kfree(pipe);
-        }
-    }
-
-    FdFree(proc, static_cast<int>(i));
+    CloseProcessFd(proc, static_cast<int>(i));
 }
 
 // Close all FDs with FD_CLOEXEC set — called by ProcessExec (execve semantics).
@@ -814,40 +790,34 @@ void ProcessDestroy(Process* proc)
         proc->fds = nullptr;
     }
 
-    // Free per-process kernel stack (each thread has its own)
-    if (proc->kernelStackBase)
-        VmmFreeKernelStack(VirtualAddress(proc->kernelStackBase), KERNEL_STACK_PAGES);
-
-    // Threads share the page table with the leader — don't destroy it
-    if (!proc->isKernelThread && !isThread)
-    {
-        // Unmap MemFd mmap ranges first — their physical pages belong to
-        // kernel heap buffers, not to this process. VmmDestroyUserPageTable
-        // would otherwise PmmUnrefPage them and potentially free live heap.
-        for (uint32_t i = 0; i < Process::MAX_MEMFD_MAPS; i++) {
-            auto& m = proc->memfdMaps[i];
-            if (m.length == 0) continue;
-            uint64_t pages = (m.length + 4095) / 4096;
-            for (uint64_t p = 0; p < pages; p++)
-                VmmUnmapPage(proc->pageTable, VirtualAddress(m.vaddr + p * 4096));
-            if (m.mfd) brook::MemFdHandleUnref(m.mfd);
-            m.vaddr = 0; m.length = 0; m.mfd = nullptr;
-        }
-        VmmDestroyUserPageTable(proc->pageTable);
-    }
-
-    // Only the leader owns compositor/window state
+    // Only the leader owns compositor/window state.  Do this before tearing
+    // down the user page table because per-window VFB mappings are unmapped
+    // through proc->pageTable.  The scheduler reaper can run from the LAPIC
+    // timer path, so this path must not block waiting for a compositor frame.
     if (!isThread)
     {
         CompositorUnregisterProcess(proc);
         WmDestroyWindowForProcess(proc);
-        if (proc->fbVfbWidth > 0)
-            CompositorWaitFrame();
+    }
+
+    // Threads share the page table with the leader — don't destroy it
+    if (!proc->isKernelThread && !isThread)
+    {
+        // Clear lazy VMAs before page-table destruction. MemFd PTEs point at
+        // memfd-owned pages, and file VMAs hold vnode references independent of
+        // the fd table.
+        ProcessClearLazyMappings(proc);
+        VmmDestroyUserPageTable(proc->pageTable);
     }
 
     // Only free user pages for the leader process
     if (!isThread)
         VmmKillPid(proc->pid);
+
+    // Free per-process kernel stack (each thread has its own).  This must be
+    // after teardown work that may still need helper calls using this proc.
+    if (proc->kernelStackBase)
+        VmmFreeKernelStack(VirtualAddress(proc->kernelStackBase), KERNEL_STACK_PAGES);
 
     // Remove from scheduler tracking
     SchedulerRemoveProcess(proc);
@@ -925,24 +895,67 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                     uint64_t pteFlags = srcPt4[i1] & ~PTE_PHYS_MASK;
                     bool wasWritable = (pteFlags & VMM_WRITABLE) != 0;
                     bool alreadyCow  = (pteFlags & PTE_COW_BIT) != 0;
-                    bool needsCow    = wasWritable || alreadyCow;
+                    bool privateWritable = wasWritable || alreadyCow;
 
-                    if (wasWritable)
+                    // Brook does not yet have SMP TLB shootdown. Downgrading
+                    // a parent's writable PTE to COW is unsafe if that address
+                    // space has stale writable translations on another CPU.
+                    // Eager-copy writable pages for now; keep sharing only
+                    // pages that are already read-only.
+                    if (privateWritable)
                     {
-                        // First COW: clear writable in parent, set COW bit
-                        srcPt4[i1] = (srcPt4[i1] & ~VMM_WRITABLE) | PTE_COW_BIT;
+                        PhysicalAddress childPhys = PmmAllocPage(MemTag::User, dstPid);
+                        if (!childPhys)
+                        {
+                            SerialPrintf("FORK: failed to copy writable page at vaddr 0x%lx\n", vaddr);
+                            return false;
+                        }
+
+                        auto* src = reinterpret_cast<const uint8_t*>(
+                            PhysToVirt(srcPhys).raw());
+                        auto* dst = reinterpret_cast<uint8_t*>(
+                            PhysToVirt(childPhys).raw());
+                        for (uint64_t b = 0; b < 4096; b += 8)
+                            *reinterpret_cast<uint64_t*>(dst + b) =
+                                *reinterpret_cast<const uint64_t*>(src + b);
+
+                        uint64_t childPte = (childPhys.raw() & PTE_PHYS_MASK)
+                                          | VMM_PRESENT
+                                          | (pteFlags & VMM_USER)
+                                          | (pteFlags & VMM_NO_EXEC)
+                                          | VMM_WRITABLE
+                                          | (pteFlags & PTE_TAG_MASK)
+                                          | (((uint64_t)dstPid & 0x3FF) << PTE_PID_SHIFT);
+
+                        uint64_t childMapFlags = VMM_USER | VMM_WRITABLE;
+                        if (pteFlags & VMM_NO_EXEC)
+                            childMapFlags |= VMM_NO_EXEC;
+
+                        if (!VmmMapPage(dstPt, VirtualAddress(vaddr), childPhys,
+                                        childMapFlags, MemTag::User, dstPid))
+                        {
+                            SerialPrintf("FORK: failed to map copied page at vaddr 0x%lx\n", vaddr);
+                            PmmFreePage(childPhys);
+                            return false;
+                        }
+
+                        auto* dstPml4 = reinterpret_cast<uint64_t*>(
+                            PhysToVirt(dstPt.pml4).raw());
+                        auto* dstPdpt = reinterpret_cast<uint64_t*>(
+                            PhysToVirt(PhysicalAddress(dstPml4[i4] & PTE_PHYS_MASK)).raw());
+                        auto* dstPd = reinterpret_cast<uint64_t*>(
+                            PhysToVirt(PhysicalAddress(dstPdpt[i3] & PTE_PHYS_MASK)).raw());
+                        auto* dstPt4 = reinterpret_cast<uint64_t*>(
+                            PhysToVirt(PhysicalAddress(dstPd[i2] & PTE_PHYS_MASK)).raw());
+                        dstPt4[i1] = childPte;
+                        continue;
                     }
 
-                    // Build child PTE: same physical page, same flags
-                    // (read-only if COW, original flags if already RO)
+                    // Build child PTE: same physical page and read-only flags.
                     uint64_t childPte = (srcPhys.raw() & PTE_PHYS_MASK)
                                       | VMM_PRESENT
                                       | (pteFlags & VMM_USER)
                                       | (pteFlags & VMM_NO_EXEC);
-                    if (needsCow)
-                        childPte |= PTE_COW_BIT; // mark as COW in child
-                    else if (pteFlags & VMM_WRITABLE)
-                        childPte |= VMM_WRITABLE; // genuinely read-write non-COW
                     // Preserve tag bits
                     childPte |= (pteFlags & PTE_TAG_MASK);
                     // Set child PID
@@ -951,8 +964,6 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                     // Map into child's page table via WalkToPtr (need intermediate tables)
                     // Use VmmMapPage to create intermediates, then override leaf PTE.
                     uint64_t childMapFlags = VMM_USER;
-                    if (!needsCow && (pteFlags & VMM_WRITABLE))
-                        childMapFlags |= VMM_WRITABLE;
                     if (pteFlags & VMM_NO_EXEC)
                         childMapFlags |= VMM_NO_EXEC;
 
@@ -961,12 +972,12 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                     if (!VmmMapPage(dstPt, VirtualAddress(vaddr), srcPhys,
                                     childMapFlags, MemTag::User, dstPid))
                     {
-                        SerialPrintf("FORK: failed to map COW page at vaddr 0x%lx\n", vaddr);
+                        SerialPrintf("FORK: failed to map shared page at vaddr 0x%lx\n", vaddr);
                         return false;
                     }
 
-                    // Now overwrite the child's leaf PTE with our carefully constructed one
-                    // (VmmMapPage set it, but we need COW bit + read-only)
+                    // Now overwrite the child's leaf PTE with our carefully
+                    // constructed one preserving Brook's metadata bits.
                     {
                         // Walk to the PTE we just created
                         auto* dstPml4 = reinterpret_cast<uint64_t*>(
@@ -980,7 +991,7 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                         dstPt4[i1] = childPte;
                     }
 
-                    // Increment physical page refcount for sharing
+                    // Increment physical page refcount for read-only sharing.
                     PmmRefPage(srcPhys);
 
                     sharedCount++;
@@ -989,11 +1000,7 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
         }
     }
 
-    // Flush TLB for parent (we changed its PTEs to read-only)
-    // Full TLB flush by reloading CR3
-    asm volatile("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
-
-    DbgPrintf("FORK: COW shared %lu pages (parent PID %u -> child PID %u)\n",
+    DbgPrintf("FORK: shared %lu read-only pages (parent PID %u -> child PID %u)\n",
                  sharedCount, static_cast<uint32_t>(srcPid), static_cast<uint32_t>(dstPid));
     return true;
 }
@@ -1046,6 +1053,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     // Reset scheduler state
     child->state = ProcessState::Ready;
     child->runningOnCpu = -1;
+    child->cpuAffinity = -1;
     child->reapable = false;
     child->compositorRegistered = false;
     child->schedNext = nullptr;
@@ -1095,7 +1103,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
         return nullptr;
     }
 
-    // COW-share all user-space pages from parent to child
+    // Copy writable user pages and share read-only mappings.
     if (!ForkCopyUserPages(parent->pageTable, child->pageTable,
                            parent->pid, child->pid))
     {
@@ -1145,10 +1153,28 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
             if (parent->fds[i].type == FdType::MemFd && parent->fds[i].handle)
                 brook::MemFdHandleRef(parent->fds[i].handle);
 
+            if (parent->fds[i].type == FdType::EventFd && parent->fds[i].handle)
+                brook::EventFdHandleRef(parent->fds[i].handle);
+            if (parent->fds[i].type == FdType::EpollFd && parent->fds[i].handle)
+                brook::EpollFdHandleRef(parent->fds[i].handle);
+            if (parent->fds[i].type == FdType::TimerFd && parent->fds[i].handle)
+                brook::TimerFdHandleRef(parent->fds[i].handle);
+
             // Increment unix socket refcount for the child's copy
             if (parent->fds[i].type == FdType::UnixSocket && parent->fds[i].handle)
                 UnixSocketHandleRef(parent->fds[i].handle);
         }
+    }
+
+    for (uint32_t i = 0; i < Process::MAX_MEMFD_MAPS; i++)
+    {
+        if (child->memfdMaps[i].length != 0 && child->memfdMaps[i].mfd)
+            brook::MemFdHandleRef(child->memfdMaps[i].mfd);
+    }
+    for (uint32_t i = 0; i < Process::MAX_FILE_MAPS; i++)
+    {
+        if (child->fileMaps[i].length != 0 && child->fileMaps[i].vnode)
+            __atomic_fetch_add(&child->fileMaps[i].vnode->refCount, 1, __ATOMIC_RELEASE);
     }
 
     // Update child's TLS fsBase to point to the new address space's TLS
@@ -1248,6 +1274,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     // Reset scheduler state
     thread->state = ProcessState::Ready;
     thread->runningOnCpu = -1;
+    thread->cpuAffinity = leader->cpuAffinity;
     thread->reapable = false;
     thread->compositorRegistered = false;
     thread->schedNext = nullptr;
@@ -1526,6 +1553,7 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     __asm__ volatile("mov %0, %%cr3" : : "r"(kernelPt.pml4.raw()) : "memory");
 
     // 1. Free all user-space pages and destroy old page table.
+    ProcessClearLazyMappings(proc);
     VmmDestroyUserPageTable(oldPt);
     PmmFreeByTag(proc->pid, MemTag::User);
 
@@ -1831,6 +1859,14 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
         // ucontext (pretcode was popped by handler's RET, then restorer did syscall).
         // frame->rsp is the user RSP saved on syscall entry.
         // The SignalFrame starts 8 bytes before the ucontext (pretcode field).
+        {
+            uint64_t ucEnd = frame->rsp + sizeof(SignalUcontext);
+            if (frame->rsp >= 0x0000800000000000ULL || ucEnd > 0x0000800000000000ULL ||
+                ucEnd < frame->rsp) {
+                brook::SerialPrintf("SIGRETURN: bad user stack 0x%lx pid %u\n", frame->rsp, proc->pid);
+                return syscallResult;
+            }
+        }
         auto* uc = reinterpret_cast<SignalUcontext*>(frame->rsp);
         const SignalMcontext& mc = uc->uc_mcontext;
 
@@ -1892,12 +1928,10 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
         case 14: // SIGALRM
         case 15: // SIGTERM
             DbgPrintf("SIGNAL: default terminate pid %u by signal %d\n", proc->pid, signum);
-            // Use SchedulerExitCurrentProcess instead of setting state+returning.
-            // The old approach returned to user space with state=Terminated; the
-            // compositor could then mark the process reapable and call ProcessDestroy
-            // (freeing the kernel stack) while the process was still live and about
-            // to re-enter the syscall dispatcher — causing a use-after-free of the
-            // kernel stack and a double fault.
+            // A fatal default signal terminates the whole thread group on
+            // Linux. Killing only this thread lets sibling threads run after
+            // process-wide teardown has started.
+            SchedulerKillThreadGroup(proc->tgid, proc, 128 + signum);
             SchedulerExitCurrentProcess(128 + signum);
         case 17: // SIGCHLD — default is ignore
         case 28: // SIGWINCH — ignore
@@ -1957,8 +1991,19 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
         userRsp -= 128;                    // skip red zone
     }
     userRsp -= sizeof(SignalFrame);
-    userRsp &= ~0xFULL;                   // 16-byte align
+    userRsp = (userRsp & ~0xFULL) - 8;    // function-entry ABI: RSP % 16 == 8
 
+    {
+        uint64_t sfEnd = userRsp + sizeof(SignalFrame);
+        if (userRsp >= 0x0000800000000000ULL || sfEnd > 0x0000800000000000ULL ||
+            sfEnd < userRsp) {
+            brook::SerialPrintf("SIGNAL: bad user stack 0x%lx for pid %u signal %d\n",
+                                userRsp, proc->pid, signum);
+            proc->inSignalHandler = false;
+            proc->sigMask = proc->sigSavedMask;
+            return syscallResult;
+        }
+    }
     auto* sf = reinterpret_cast<SignalFrame*>(userRsp);
 
     // Clear the frame
@@ -1996,6 +2041,19 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     mc.rip    = frame->rcx;     // user RIP (stored in RCX by syscall)
     mc.eflags = frame->rflags;
     mc.cs     = 0x23;           // user code segment
+
+    // Linux restarts selected interrupted syscalls after a signal handler
+    // returns when the handler was installed with SA_RESTART. Bash relies on
+    // this for SIGWINCH while blocked in terminal read(); otherwise resize
+    // converts the read into EINTR and the interactive shell can exit.
+    uint64_t syscallNum = 0;
+    __asm__ volatile("movq %%gs:120, %0" : "=r"(syscallNum));
+    if (syscallResult == -4 /* -EINTR */ && (sa.flags & SA_RESTART) &&
+        syscallNum == 0 /* read */ && mc.rip >= 2)
+    {
+        mc.rax = syscallNum;
+        mc.rip -= 2; // x86_64 syscall instruction length
+    }
 
     // Fill siginfo
     sf->info.si_signo = signum;

@@ -56,6 +56,7 @@ void KSemaphoreWait(KSemaphore* sem)
 
     // Block — enqueue on wait list.
     self->syncNext = nullptr;
+    __atomic_store_n(&self->pendingWakeup, 0, __ATOMIC_RELEASE);
     if (sem->waitTail)
         sem->waitTail->syncNext = self;
     else
@@ -79,6 +80,7 @@ void KSemaphoreSignal(KSemaphore* sem)
             sem->waitTail = nullptr;
         waiter->syncNext = nullptr;
 
+        __atomic_store_n(&waiter->pendingWakeup, 1, __ATOMIC_RELEASE);
         SemGuardRelease(sem, flags);
         SchedulerUnblock(waiter);
     }

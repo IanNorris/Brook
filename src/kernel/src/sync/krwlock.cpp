@@ -73,8 +73,8 @@ void KRwLockReadLock(KRwLock* rw)
 
     uint64_t flags = RwGuardAcquire(rw);
 
-    // Grant immediately if no writer is active.
-    if (!rw->writerActive)
+    // Grant immediately if no writer is active and none waiting.
+    if (!rw->writerActive && rw->writersWaiting == 0)
     {
         rw->readerCount++;
         RwGuardRelease(rw, flags);
@@ -82,6 +82,7 @@ void KRwLockReadLock(KRwLock* rw)
     }
 
     // Block — enqueue on reader wait list.
+    __atomic_store_n(&self->pendingWakeup, 0, __ATOMIC_RELEASE);
     Enqueue(rw->readWaitHead, rw->readWaitTail, self);
     RwGuardRelease(rw, flags);
     SchedulerBlock(self);
@@ -98,6 +99,7 @@ void KRwLockReadUnlock(KRwLock* rw)
         Process* writer = Dequeue(rw->writeWaitHead, rw->writeWaitTail);
         rw->writerActive = 1;
         rw->writersWaiting--;
+        __atomic_store_n(&writer->pendingWakeup, 1, __ATOMIC_RELEASE);
         RwGuardRelease(rw, flags);
         SchedulerUnblock(writer);
         return;
@@ -123,6 +125,7 @@ void KRwLockWriteLock(KRwLock* rw)
 
     // Block — enqueue on writer wait list.
     rw->writersWaiting++;
+    __atomic_store_n(&self->pendingWakeup, 0, __ATOMIC_RELEASE);
     Enqueue(rw->writeWaitHead, rw->writeWaitTail, self);
     RwGuardRelease(rw, flags);
     SchedulerBlock(self);
@@ -142,7 +145,9 @@ void KRwLockWriteUnlock(KRwLock* rw)
         uint32_t count = 0;
         while (rw->readWaitHead && count < 128)
         {
-            readers[count++] = Dequeue(rw->readWaitHead, rw->readWaitTail);
+            readers[count] = Dequeue(rw->readWaitHead, rw->readWaitTail);
+            __atomic_store_n(&readers[count]->pendingWakeup, 1, __ATOMIC_RELEASE);
+            count++;
             rw->readerCount++;
         }
         RwGuardRelease(rw, flags);
@@ -159,6 +164,7 @@ void KRwLockWriteUnlock(KRwLock* rw)
         Process* writer = Dequeue(rw->writeWaitHead, rw->writeWaitTail);
         rw->writerActive = 1;
         rw->writersWaiting--;
+        __atomic_store_n(&writer->pendingWakeup, 1, __ATOMIC_RELEASE);
         RwGuardRelease(rw, flags);
         SchedulerUnblock(writer);
         return;
