@@ -456,6 +456,8 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     if (!proc->pageTable)
     {
         SerialPuts("PROC: page table allocation failed\n");
+        VmmFreeKernelStack(kstackAddr, KERNEL_STACK_PAGES);
+        kfree(proc->fds);
         FreeProcessStruct(proc);
         return nullptr;
     }
@@ -466,6 +468,8 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     {
         SerialPuts("PROC: ELF load failed\n");
         VmmDestroyUserPageTable(proc->pageTable);
+        VmmFreeKernelStack(kstackAddr, KERNEL_STACK_PAGES);
+        kfree(proc->fds);
         FreeProcessStruct(proc);
         return nullptr;
     }
@@ -1099,6 +1103,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     {
         SerialPuts("FORK: page table allocation failed\n");
         VmmFreeKernelStack(kstackAddr, KERNEL_STACK_PAGES);
+        kfree(child->fds);
         FreeProcessStruct(child);
         return nullptr;
     }
@@ -1110,6 +1115,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
         SerialPuts("FORK: address space copy failed\n");
         VmmDestroyUserPageTable(child->pageTable);
         VmmFreeKernelStack(kstackAddr, KERNEL_STACK_PAGES);
+        kfree(child->fds);
         FreeProcessStruct(child);
         return nullptr;
     }
