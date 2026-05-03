@@ -7,8 +7,6 @@
 #include "memory/heap.h"
 #include "serial.h"
 #include "mem_tag.h"
-#include "process.h"
-#include "scheduler.h"
 
 namespace brook {
 
@@ -316,35 +314,17 @@ static bool SubmitRequest(VirtioBlkState& s,
     // Notify device that queue 0 has work.
     VioWrite16(s.ioBase, VIRTIO_PCI_QUEUE_NOTIFY, 0);
 
-    // Hybrid wait: spin for completion then yield if needed.
-    // Under KVM, virtio-blk typically completes within a few thousand
-    // pause iterations after the notify port write. We spin up to ~50µs
-    // (10K pauses) which covers the vast majority of cases without a
-    // context switch, then fall back to yield for real hardware latency.
-    for (uint32_t i = 0; i < 10000; ++i)
+    // Poll for completion. Under KVM/QEMU, virtio-blk typically completes
+    // within microseconds but may take longer under host load or when the
+    // QEMU I/O thread is descheduled.
+    for (uint32_t i = 0; i < 100000000u; ++i)
     {
         if (*s.usedIdx != s.usedIdxShadow)
             goto done;
         __asm__ volatile("pause" ::: "memory");
     }
-
-    // Phase 2: yield (stay runnable) and re-check.
-    {
-        bool canYield = (ProcessCurrent() != nullptr);
-        uint32_t yieldCount = 0;
-        while (*s.usedIdx == s.usedIdxShadow)
-        {
-            if (++yieldCount > 50000)
-            {
-                SerialPuts("virtio-blk: timeout waiting for response\n");
-                return false;
-            }
-            if (canYield)
-                SchedulerYield();
-            else
-                __asm__ volatile("pause" ::: "memory");
-        }
-    }
+    SerialPuts("virtio-blk: timeout waiting for response\n");
+    return false;
 
 done:
     __asm__ volatile("mfence" ::: "memory");
@@ -356,18 +336,8 @@ done:
 static void AcquireRequestLock(VirtioBlkState& s)
 {
     uint32_t ticket = __atomic_fetch_add(&s.requestGuardNext, 1, __ATOMIC_RELAXED);
-    bool canYield = (ProcessCurrent() != nullptr);
-    uint32_t spins = 0;
     while (__atomic_load_n(&s.requestGuardServing, __ATOMIC_ACQUIRE) != ticket)
-    {
         __asm__ volatile("pause" ::: "memory");
-        if (++spins > 10000)
-        {
-            if (canYield)
-                SchedulerYield();
-            spins = 0;
-        }
-    }
 }
 
 static void ReleaseRequestLock(VirtioBlkState& s)
