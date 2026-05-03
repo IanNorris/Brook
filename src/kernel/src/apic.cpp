@@ -170,7 +170,7 @@ static void SoftEnableLapic()
 volatile uint64_t g_lapicTickCount = 0;
 
 // Forward-declare scheduler tick (defined in scheduler.cpp).
-void SchedulerTimerTick();
+void SchedulerTimerTick(bool allowPreempt);
 
 // Forward-declare profiler sample (defined in profiler.cpp).
 void ProfilerSample(uint64_t interruptedRip, uint64_t interruptedCs, uint64_t interruptedRbp);
@@ -219,8 +219,11 @@ static void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interrupted
     // Record a profiler sample (fast no-op when profiling is disabled).
     ProfilerSample(interruptedRip, interruptedCs, interruptedRbp);
 
-    // Drive the scheduler on every CPU.
-    SchedulerTimerTick();
+    // Drive scheduler wakeups/accounting on every CPU. Only preempt arbitrary
+    // non-idle work when the interrupted context was user mode; Brook kernel
+    // code is not generally safe to timeslice while holding internal locks.
+    bool userMode = (interruptedCs & 3) != 0;
+    SchedulerTimerTick(userMode);
 }
 
 // Naked ISR entry for LAPIC timer (vector 32).
@@ -229,10 +232,10 @@ static void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interrupted
 // Passes the interrupted RIP (rdi) and CS (rsi) to the inner handler for
 // profiler sampling.
 //
-// IMPORTANT: The inner handler (and anything it calls, e.g. the scheduler)
-// may clobber XMM registers.  We must save and restore the full FPU/SSE
-// state so that user-space code (especially glibc, which uses SSE heavily
-// for memset/memcpy/strcmp) is not corrupted.
+// IMPORTANT: apic.cpp/scheduler.cpp/profiler.cpp are compiled with
+// -mgeneral-regs-only, so this interrupt path must not touch vector state.
+// The scheduler saves/restores user x87/SSE/AVX state only at actual context
+// switches.
 __attribute__((naked))
 static void LapicTimerHandler(void)
 {
@@ -243,56 +246,52 @@ static void LapicTimerHandler(void)
         "swapgs\n\t"
         "1:\n\t"
 
-        // Save all caller-saved GPRs (callee-saved are preserved by C ABI).
+        // Save all GPRs. This ISR can preempt kernel C code and then context
+        // switch before returning; callee-saved registers live in the
+        // interrupted frame must survive that whole path.
         "push %%rax\n\t"
+        "push %%rbx\n\t"
         "push %%rcx\n\t"
         "push %%rdx\n\t"
         "push %%rsi\n\t"
         "push %%rdi\n\t"
+        "push %%rbp\n\t"
         "push %%r8\n\t"
         "push %%r9\n\t"
         "push %%r10\n\t"
         "push %%r11\n\t"
+        "push %%r12\n\t"
+        "push %%r13\n\t"
+        "push %%r14\n\t"
+        "push %%r15\n\t"
 
-        // Save FPU/SSE state (512 bytes, must be 16-byte aligned).
-        // After 9 pushes (72 bytes) + CPU frame (40 bytes for ring-3 or
-        // 24 bytes for ring-0), RSP may not be 16-byte aligned.
-        // Align down, save original RSP, then fxsave.
-        "movq %%rsp, %%rax\n\t"         // save original RSP
-        "subq $512, %%rsp\n\t"          // reserve 512 bytes for fxsave
-        "andq $-16, %%rsp\n\t"          // 16-byte align
-        "fxsave (%%rsp)\n\t"
-        "push %%rax\n\t"                // save original RSP below fxsave area
-
-        // Stack layout after 9 pushes (72 bytes) + fxsave:
-        //   RSP+0       = saved original RSP (before fxsave alloc)
-        //   RSP+8       = fxsave area (512 bytes, 16-byte aligned)
-        //   ... (GPRs)
-        //   (original RSP)+72  = interrupted RIP
-        //   (original RSP)+80  = interrupted CS
-        // Load from saved original RSP.
-        "movq (%%rsp), %%rax\n\t"       // rax = original RSP after GPR pushes
-        "movq 72(%%rax), %%rdi\n\t"     // arg1 = interrupted RIP
-        "movq 80(%%rax), %%rsi\n\t"     // arg2 = interrupted CS
-        "movq %%rbp, %%rdx\n\t"         // arg3 = interrupted RBP
+        // Stack layout after 15 pushes:
+        //   RSP+64  = interrupted RBP
+        //   RSP+120 = interrupted RIP
+        //   RSP+128 = interrupted CS
+        "movq %%rsp, %%rax\n\t"
+        "movq 120(%%rax), %%rdi\n\t"    // arg1 = interrupted RIP
+        "movq 128(%%rax), %%rsi\n\t"    // arg2 = interrupted CS
+        "movq 64(%%rax), %%rdx\n\t"     // arg3 = interrupted RBP
 
         "cld\n\t"
         "call %P0\n\t"
 
-        // Restore FPU/SSE state
-        "pop %%rax\n\t"                 // rax = original RSP after GPR pushes
-        "fxrstor (%%rsp)\n\t"
-        "movq %%rax, %%rsp\n\t"         // restore RSP to after GPR pushes
-
         // Restore GPRs
+        "pop %%r15\n\t"
+        "pop %%r14\n\t"
+        "pop %%r13\n\t"
+        "pop %%r12\n\t"
         "pop %%r11\n\t"
         "pop %%r10\n\t"
         "pop %%r9\n\t"
         "pop %%r8\n\t"
+        "pop %%rbp\n\t"
         "pop %%rdi\n\t"
         "pop %%rsi\n\t"
         "pop %%rdx\n\t"
         "pop %%rcx\n\t"
+        "pop %%rbx\n\t"
         "pop %%rax\n\t"
 
         // If returning to ring 3, swap gs back.
@@ -472,6 +471,10 @@ void ApicAdjustTimerRate(uint32_t observedTicksPerSec)
 {
     if (g_timerTicksPerMs == 0 || g_timerTicksOrigCalibration == 0) return;
 
+    // Reject wildly implausible observations — likely a missed RTC second
+    // boundary or CPU halt during the measurement window.
+    if (observedTicksPerSec < 200 || observedTicksPerSec > 5000) return;
+
     // Deadband: ignore errors < 10%.  CMOS 1s resolution + integer sampling
     // windows adds a few % phase noise even at 10s windows; we'd rather
     // accept 10% wall-clock drift than oscillate.
@@ -484,8 +487,8 @@ void ApicAdjustTimerRate(uint32_t observedTicksPerSec)
     uint64_t proposed = (cur * observedTicksPerSec + 500) / 1000;
     uint64_t damped = (cur * 3 + proposed) / 4;
 
-    uint64_t lo = g_timerTicksOrigCalibration / 4;
-    uint64_t hi = static_cast<uint64_t>(g_timerTicksOrigCalibration) * 4;
+    uint64_t lo = g_timerTicksOrigCalibration / 2;
+    uint64_t hi = static_cast<uint64_t>(g_timerTicksOrigCalibration) * 2;
     if (damped < lo) damped = lo;
     if (damped > hi) damped = hi;
 

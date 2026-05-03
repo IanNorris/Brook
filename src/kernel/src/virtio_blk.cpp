@@ -7,9 +7,12 @@
 #include "memory/heap.h"
 #include "serial.h"
 #include "mem_tag.h"
-#include "spinlock.h"
+#include "process.h"
+#include "scheduler.h"
 
 namespace brook {
+
+extern volatile uint64_t g_lapicTickCount;
 
 // ---- virtio-blk PCI register offsets (legacy BAR0 I/O) ----
 
@@ -20,7 +23,6 @@ static constexpr uint8_t VIRTIO_PCI_QUEUE_SIZE     = 0x0C;
 static constexpr uint8_t VIRTIO_PCI_QUEUE_SEL      = 0x0E;
 static constexpr uint8_t VIRTIO_PCI_QUEUE_NOTIFY   = 0x10;
 static constexpr uint8_t VIRTIO_PCI_STATUS         = 0x12;
-// VIRTIO_PCI_ISR not used in polling mode (interrupt-free).
 
 // Device config space starts at 0x14 for legacy; blk config has capacity first.
 static constexpr uint8_t VIRTIO_PCI_BLK_CAPACITY   = 0x14; // 64-bit sector count
@@ -40,6 +42,12 @@ static constexpr uint32_t VIRTIO_BLK_T_IN  = 0; // read
 static constexpr uint32_t VIRTIO_BLK_T_OUT = 1; // write
 
 static constexpr uint8_t VIRTIO_BLK_S_OK = 0;
+
+static constexpr uint32_t VIRTIO_MAX_DEVS = 8;
+static constexpr uint32_t VIRTIO_CACHE_BLOCK_SECTORS = 8;     // 4 KiB
+static constexpr uint32_t VIRTIO_CACHE_BLOCK_SIZE    = 4096;
+static constexpr uint32_t VIRTIO_CACHE_ENTRIES       = 4096;  // 16 MiB
+static constexpr uint64_t VIRTIO_SMALL_READ_LIMIT    = 16 * 1024;
 
 // ---- Virtqueue structures (packed for DMA) ----
 
@@ -64,6 +72,11 @@ struct __attribute__((packed)) VirtioBlkReq {
     uint32_t type;
     uint32_t reserved;
     uint64_t sector;
+};
+
+struct VirtioBlkCacheEntry {
+    uint64_t blockNumber; // 4 KiB block number, not 512-byte sector number
+    bool     valid;
 };
 
 // ---- Driver state ----
@@ -103,18 +116,20 @@ struct VirtioBlkState {
     uint8_t*      dmaBuf;
     uint64_t      dmaBufPhys;
 
-    // Serialises concurrent requests from multiple processes.
-    // The virtio queue uses hardcoded descriptor slots 0-2, so only one
-    // request can be in-flight at a time.  SpinLockAcquire disables
-    // interrupts; disk I/O in KVM completes in ~10 μs so latency is fine.
-    SpinLock      requestLock;
+    VirtioBlkCacheEntry* cacheEntries;
+    uint8_t*             cacheData;
+
+    // Serialises concurrent requests from multiple processes.  The current
+    // driver still uses hardcoded descriptor slots 0-2 and one shared DMA
+    // buffer, so only one request can be in-flight at a time.
+    volatile uint32_t requestGuardNext;
+    volatile uint32_t requestGuardServing;
 };
 
 // ---- Register helpers ----
 
 static inline uint32_t VioRead32(uint16_t base, uint8_t reg)  { return inl(base + reg); }
 static inline uint16_t VioRead16(uint16_t base, uint8_t reg)  { return inw(base + reg); }
-// VioRead8 reserved for future use (e.g. ISR register reads).
 static inline void VioWrite32(uint16_t base, uint8_t reg, uint32_t v) { outl(base + reg, v); }
 static inline void VioWrite16(uint16_t base, uint8_t reg, uint16_t v)
 {
@@ -122,6 +137,74 @@ static inline void VioWrite16(uint16_t base, uint8_t reg, uint16_t v)
     __asm__ volatile("outw %0, %1" : : "a"(v), "Nd"(static_cast<uint16_t>(base + reg)));
 }
 static inline void VioWrite8 (uint16_t base, uint8_t reg, uint8_t v)  { outb(base + reg, v); }
+
+static inline uint32_t CacheIndex(uint64_t blockNumber)
+{
+    return static_cast<uint32_t>(blockNumber % VIRTIO_CACHE_ENTRIES);
+}
+
+static inline uint8_t* CacheDataFor(VirtioBlkState& s, uint32_t index)
+{
+    return s.cacheData + (static_cast<uint64_t>(index) * VIRTIO_CACHE_BLOCK_SIZE);
+}
+
+static bool CacheLookup(VirtioBlkState& s, uint64_t blockNumber, uint8_t** data)
+{
+    if (!s.cacheEntries || !s.cacheData)
+        return false;
+
+    uint32_t idx = CacheIndex(blockNumber);
+    VirtioBlkCacheEntry& e = s.cacheEntries[idx];
+    if (!e.valid || e.blockNumber != blockNumber)
+        return false;
+
+    *data = CacheDataFor(s, idx);
+    return true;
+}
+
+static void CacheStore(VirtioBlkState& s, uint64_t blockNumber, const uint8_t* src)
+{
+    if (!s.cacheEntries || !s.cacheData)
+        return;
+
+    uint32_t idx = CacheIndex(blockNumber);
+    memcpy(CacheDataFor(s, idx), src, VIRTIO_CACHE_BLOCK_SIZE);
+    s.cacheEntries[idx].blockNumber = blockNumber;
+    s.cacheEntries[idx].valid = true;
+}
+
+static void CacheInvalidateRange(VirtioBlkState& s, uint64_t startSector, uint64_t endSector)
+{
+    if (!s.cacheEntries || !s.cacheData || endSector <= startSector)
+        return;
+
+    uint64_t firstBlock = startSector / VIRTIO_CACHE_BLOCK_SECTORS;
+    uint64_t lastBlock = (endSector - 1) / VIRTIO_CACHE_BLOCK_SECTORS;
+    for (uint64_t block = firstBlock; block <= lastBlock; ++block)
+    {
+        uint32_t idx = CacheIndex(block);
+        VirtioBlkCacheEntry& e = s.cacheEntries[idx];
+        if (e.valid && e.blockNumber == block)
+            e.valid = false;
+    }
+}
+
+static void CacheStoreFullBlocks(VirtioBlkState& s, uint64_t firstSector,
+                                 uint32_t sectorCount, const uint8_t* src)
+{
+    if (!s.cacheEntries || !s.cacheData)
+        return;
+
+    uint64_t endSector = firstSector + sectorCount;
+    uint64_t block = (firstSector + VIRTIO_CACHE_BLOCK_SECTORS - 1) /
+                     VIRTIO_CACHE_BLOCK_SECTORS;
+    while ((block + 1) * VIRTIO_CACHE_BLOCK_SECTORS <= endSector)
+    {
+        uint64_t sectorOffset = block * VIRTIO_CACHE_BLOCK_SECTORS - firstSector;
+        CacheStore(s, block, src + sectorOffset * 512);
+        ++block;
+    }
+}
 
 // ---- Virtqueue DMA allocation ----
 // Virtio 1.0 legacy layout for a queue of size N:
@@ -191,11 +274,11 @@ static bool AllocVirtqueue(VirtioBlkState& s)
     return true;
 }
 
-// ---- Synchronous request (polling, no interrupts) ----
+// ---- Synchronous request (polling, interrupts left enabled) ----
 
 static bool SubmitRequest(VirtioBlkState& s,
-                          uint32_t type, uint64_t sector,
-                          uint64_t dataBufPhys, uint32_t dataLen)
+                           uint32_t type, uint64_t sector,
+                           uint64_t dataBufPhys, uint32_t dataLen)
 {
     // Descriptor 0: request header (device-readable)
     s.reqBuf->type     = type;
@@ -235,26 +318,58 @@ static bool SubmitRequest(VirtioBlkState& s,
     // Notify device that queue 0 has work.
     VioWrite16(s.ioBase, VIRTIO_PCI_QUEUE_NOTIFY, 0);
 
-    // Poll used ring until device consumes the request.
-    // Spin limit: 100M `pause` iterations. Under KVM each pause is ~10ns,
-    // so this is roughly 1 second of wall time. Heavy host load (e.g.
-    // multi-GB nix install streaming through gzip+xz+nar-unpack) can
-    // delay vcpu scheduling enough that 10M was too tight and we got
-    // spurious "timeout" failures mid-install.
-    uint32_t spins = 0;
-    while (*s.usedIdx == s.usedIdxShadow)
+    // Hybrid wait: brief spin for fast completions, then yield CPU.
+    // Phase 1: poll ~200 iterations (~2-5µs on modern CPUs). Catches
+    // most QEMU completions without a context switch.
+    for (uint32_t i = 0; i < 200; ++i)
     {
-        __asm__ volatile("pause");
-        if (++spins > 100000000u)
+        if (*s.usedIdx != s.usedIdxShadow)
+            goto done;
+        __asm__ volatile("pause" ::: "memory");
+    }
+
+    // Phase 2: yield and re-check each timer tick (~1ms).
+    {
+        Process* self = ProcessCurrent();
+        uint32_t yieldCount = 0;
+        while (*s.usedIdx == s.usedIdxShadow)
         {
-            SerialPuts("virtio-blk: timeout waiting for response\n");
-            return false;
+            if (++yieldCount > 5000) // ~5s timeout
+            {
+                SerialPuts("virtio-blk: timeout waiting for response\n");
+                return false;
+            }
+            if (self)
+            {
+                self->wakeupTick = g_lapicTickCount + 1;
+                SchedulerBlock(self);
+            }
+            else
+            {
+                // Early boot / no process context — fall back to pause
+                for (uint32_t j = 0; j < 10000; ++j)
+                    __asm__ volatile("pause" ::: "memory");
+            }
         }
     }
+
+done:
     __asm__ volatile("mfence" ::: "memory");
     ++s.usedIdxShadow;
 
     return (*s.statusBuf == VIRTIO_BLK_S_OK);
+}
+
+static void AcquireRequestLock(VirtioBlkState& s)
+{
+    uint32_t ticket = __atomic_fetch_add(&s.requestGuardNext, 1, __ATOMIC_RELAXED);
+    while (__atomic_load_n(&s.requestGuardServing, __ATOMIC_ACQUIRE) != ticket)
+        __asm__ volatile("pause" ::: "memory");
+}
+
+static void ReleaseRequestLock(VirtioBlkState& s)
+{
+    __atomic_fetch_add(&s.requestGuardServing, 1, __ATOMIC_RELEASE);
 }
 
 // ---- DeviceOps ----
@@ -276,13 +391,60 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
     uint8_t* dstBytes = static_cast<uint8_t*>(buf);
     uint64_t bytesRead = 0;
 
-    // Serialise against concurrent reads/writes: virtio queue has fixed
-    // descriptor slots 0-2, so only one request can be in-flight at a time.
-    uint64_t irqFlags = SpinLockAcquire(&s->requestLock);
+    // Serialise against concurrent reads/writes without masking timer IRQs
+    // across device latency.
+    AcquireRequestLock(*s);
+
+    uint64_t roundedEndSector = endSector;
+    bool cacheableSmallRead =
+        len <= VIRTIO_SMALL_READ_LIMIT &&
+        s->cacheEntries && s->cacheData &&
+        roundedEndSector <= s->sectorCount &&
+        ((((roundedEndSector - 1) / VIRTIO_CACHE_BLOCK_SECTORS) + 1) *
+             VIRTIO_CACHE_BLOCK_SECTORS) <= s->sectorCount;
+
+    if (cacheableSmallRead)
+    {
+        while (bytesRead < len)
+        {
+            uint64_t absolute = offset + bytesRead;
+            uint64_t blockNumber = absolute / VIRTIO_CACHE_BLOCK_SIZE;
+            uint64_t blockOffset = absolute % VIRTIO_CACHE_BLOCK_SIZE;
+            uint8_t* cacheBlock = nullptr;
+
+            if (!CacheLookup(*s, blockNumber, &cacheBlock))
+            {
+                uint64_t blockSector = blockNumber * VIRTIO_CACHE_BLOCK_SECTORS;
+                if (!SubmitRequest(*s, VIRTIO_BLK_T_IN, blockSector,
+                                   s->dmaBufPhys, VIRTIO_CACHE_BLOCK_SIZE))
+                {
+                    brook::SerialPrintf("virtio-blk: cached read failed at sector %lu\n",
+                                        static_cast<unsigned long>(blockSector));
+                    ReleaseRequestLock(*s);
+                    return -1;
+                }
+                CacheStore(*s, blockNumber, s->dmaBuf);
+                if (!CacheLookup(*s, blockNumber, &cacheBlock))
+                {
+                    ReleaseRequestLock(*s);
+                    return -1;
+                }
+            }
+
+            uint64_t n = VIRTIO_CACHE_BLOCK_SIZE - blockOffset;
+            if (n > len - bytesRead) n = len - bytesRead;
+            memcpy(dstBytes + bytesRead, cacheBlock + blockOffset, n);
+            bytesRead += n;
+        }
+
+        ReleaseRequestLock(*s);
+        return static_cast<int>(bytesRead);
+    }
 
     uint64_t sec = startSector;
     while (sec < endSector && bytesRead < len)
     {
+        uint64_t batchStart = sec;
         uint32_t batch = static_cast<uint32_t>(endSector - sec);
         if (batch > SECTORS_PER_DMA) batch = SECTORS_PER_DMA;
         uint32_t dmaLen = batch * SECTOR_SIZE;
@@ -291,9 +453,11 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
         {
             brook::SerialPrintf("virtio-blk: read failed at sector %lu\n",
                                 static_cast<unsigned long>(sec));
-            SpinLockRelease(&s->requestLock, irqFlags);
+            ReleaseRequestLock(*s);
             return -1;
         }
+
+        CacheStoreFullBlocks(*s, batchStart, batch, s->dmaBuf);
 
         // Copy relevant bytes from the DMA buffer into the output.
         for (uint32_t i = 0; i < batch && bytesRead < len; ++i, ++sec)
@@ -311,7 +475,7 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
         }
     }
 
-    SpinLockRelease(&s->requestLock, irqFlags);
+    ReleaseRequestLock(*s);
     return static_cast<int>(bytesRead);
 }
 
@@ -338,7 +502,7 @@ static int VirtioBlkWrite(Device* dev, uint64_t offset, const void* buf, uint64_
     uint64_t bytesWritten = 0;
     auto* dmaBuf = s->dmaBuf;
 
-    uint64_t irqFlags = SpinLockAcquire(&s->requestLock);
+    AcquireRequestLock(*s);
 
     uint64_t sec = startSector;
     while (sec < endSector && bytesWritten < len)
@@ -353,7 +517,7 @@ static int VirtioBlkWrite(Device* dev, uint64_t offset, const void* buf, uint64_
                            (partialLast && sec + batch == endSector);
         if (needPreRead) {
             if (!SubmitRequest(*s, VIRTIO_BLK_T_IN, sec, s->dmaBufPhys, dmaLen)) {
-                SpinLockRelease(&s->requestLock, irqFlags);
+                ReleaseRequestLock(*s);
                 return -1;
             }
         } else {
@@ -375,14 +539,15 @@ static int VirtioBlkWrite(Device* dev, uint64_t offset, const void* buf, uint64_
         }
 
         if (!SubmitRequest(*s, VIRTIO_BLK_T_OUT, sec, s->dmaBufPhys, dmaLen)) {
-            SpinLockRelease(&s->requestLock, irqFlags);
+            ReleaseRequestLock(*s);
             return -1;
         }
 
+        CacheInvalidateRange(*s, sec, sec + batch);
         sec += batch;
     }
 
-    SpinLockRelease(&s->requestLock, irqFlags);
+    ReleaseRequestLock(*s);
     return static_cast<int>(bytesWritten);
 }
 
@@ -421,7 +586,6 @@ static const char* const g_virtioNames[] = {
     "virtio0", "virtio1", "virtio2", "virtio3",
     "virtio4", "virtio5", "virtio6", "virtio7",
 };
-static constexpr uint32_t VIRTIO_MAX_DEVS = 8;
 
 static Device* InitOnePciDevice(const PciDevice& pci, uint32_t slot)
 {
@@ -488,6 +652,27 @@ static Device* InitOnePciDevice(const PciDevice& pci, uint32_t slot)
         return nullptr;
     }
     state->dmaBuf = reinterpret_cast<uint8_t*>(PhysToVirt(PhysicalAddress(state->dmaBufPhys)).raw());
+
+    state->cacheEntries = static_cast<VirtioBlkCacheEntry*>(
+        kmalloc(sizeof(VirtioBlkCacheEntry) * VIRTIO_CACHE_ENTRIES));
+    if (state->cacheEntries)
+    {
+        memset(state->cacheEntries, 0,
+               sizeof(VirtioBlkCacheEntry) * VIRTIO_CACHE_ENTRIES);
+        state->cacheData = reinterpret_cast<uint8_t*>(
+            VmmAllocPages(VIRTIO_CACHE_ENTRIES, VMM_WRITABLE,
+                          MemTag::KernelData, KernelPid).raw());
+        if (!state->cacheData)
+        {
+            kfree(state->cacheEntries);
+            state->cacheEntries = nullptr;
+        }
+        else
+        {
+            SerialPrintf("virtio-blk: read cache enabled (%u KiB)\n",
+                         (VIRTIO_CACHE_ENTRIES * VIRTIO_CACHE_BLOCK_SIZE) / 1024);
+        }
+    }
 
     // Write queue PFN.
     uint32_t pfn = static_cast<uint32_t>(state->queuePhys >> 12);
