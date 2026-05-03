@@ -284,10 +284,17 @@ else
     KVM_FLAGS="-cpu qemu64"
 fi
 
+# Prevent GNOME fractional scaling from affecting QEMU's display output.
+# Force native Wayland rendering at 1x scale regardless of system setting.
+export GDK_SCALE=1
+export GDK_DPI_SCALE=1
+export QT_SCALE_FACTOR=1
+export GDK_BACKEND=x11
+
 qemu-system-x86_64 \
     -machine q35 \
     ${KVM_FLAGS} \
-    -smp 8 \
+    -smp "${BROOK_SMP:-8}" \
     -m 8G \
     -drive if=pflash,format=raw,readonly=on,file="${OVMF_CODE}" \
     -drive if=pflash,format=raw,file="${OVMF_VARS_COPY}" \
