@@ -2,4 +2,4 @@
 set wm
 set vfb none
 run --once /nix/bin/waylandd
-run --uid 1000 /nix/profile/bin/vlc --no-plugins-cache --aout=alsa /boot/VIDEOS/sample-5s.mp4
+run --uid 1000 /nix/profile/bin/vlc --no-plugins-cache --aout=alsa --vout=wl_shm --verbose=2 /boot/VIDEOS/sample-5s.mp4

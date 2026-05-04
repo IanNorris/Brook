@@ -765,9 +765,13 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
             }
             else
             {
-                // Blocking caller (streaming): keep stream running.
-                // DMA is cycling through silence (buffer was zeroed on last
-                // underrun or startup). Just write new data ahead of DMA.
+                // Blocking caller (streaming): keep stream running but zero
+                // the buffer so DMA plays silence instead of stale data.
+                // Without this, DMA advances through old audio and LPIB
+                // races ahead of g_submittedBytes on every call, causing
+                // perpetual underrun (no backpressure → plays too fast).
+                for (uint32_t i = 0; i < AUDIO_BUF_SIZE; i++)
+                    g_audioBuf[i] = 0;
                 uint32_t lpib = hda_read32(g_outStreamBase + SD_LPIB) % AUDIO_BUF_SIZE;
                 g_submittedBytes = lpib;
                 g_playedBytes = lpib;
