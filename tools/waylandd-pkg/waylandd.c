@@ -39,6 +39,7 @@
 #include <wayland-server-protocol.h>
 #include "xdg-shell-server-protocol.h"
 #include "xdg-decoration-server-protocol.h"
+#include "viewporter-server-protocol.h"
 
 #define BROOK_SYS_WM_CREATE_WINDOW   506
 #define BROOK_SYS_WM_DESTROY_WINDOW  507
@@ -1661,6 +1662,50 @@ static void deco_mgr_bind(struct wl_client *client, void *data,
             version, id);
 }
 
+/* ---------------- wp_viewporter (stub for SDL3) ---------------- */
+static void viewport_destroy(struct wl_client *c, struct wl_resource *r) {
+    (void)c; wl_resource_destroy(r);
+}
+static void viewport_set_source(struct wl_client *c, struct wl_resource *r,
+                                wl_fixed_t x, wl_fixed_t y,
+                                wl_fixed_t w, wl_fixed_t h) {
+    (void)c; (void)r; (void)x; (void)y; (void)w; (void)h;
+}
+static void viewport_set_destination(struct wl_client *c, struct wl_resource *r,
+                                     int32_t w, int32_t h) {
+    (void)c; (void)r; (void)w; (void)h;
+}
+static const struct wp_viewport_interface viewport_impl = {
+    .destroy         = viewport_destroy,
+    .set_source      = viewport_set_source,
+    .set_destination = viewport_set_destination,
+};
+
+static void viewporter_destroy(struct wl_client *c, struct wl_resource *r) {
+    (void)c; wl_resource_destroy(r);
+}
+static void viewporter_get_viewport(struct wl_client *c, struct wl_resource *r,
+                                     uint32_t id, struct wl_resource *surface) {
+    (void)surface;
+    struct wl_resource *vp = wl_resource_create(c, &wp_viewport_interface,
+                                                 wl_resource_get_version(r), id);
+    if (!vp) { wl_client_post_no_memory(c); return; }
+    wl_resource_set_implementation(vp, &viewport_impl, NULL, NULL);
+}
+static const struct wp_viewporter_interface viewporter_impl = {
+    .destroy      = viewporter_destroy,
+    .get_viewport = viewporter_get_viewport,
+};
+static void viewporter_bind(struct wl_client *client, void *data,
+                            uint32_t version, uint32_t id) {
+    (void)data;
+    struct wl_resource *r = wl_resource_create(client,
+        &wp_viewporter_interface, (int)version, id);
+    if (!r) { wl_client_post_no_memory(client); return; }
+    wl_resource_set_implementation(r, &viewporter_impl, NULL, NULL);
+    fprintf(stderr, "[waylandd] wp_viewporter bind v=%u id=%u\n", version, id);
+}
+
 /* ---------------- wl_subcompositor (stub) ---------------- */
 static void subsurface_destroy(struct wl_client *c, struct wl_resource *r) {
     (void)c; wl_resource_destroy(r);
@@ -1873,6 +1918,7 @@ int main(int argc, char **argv)
     if (!wl_global_create(g_display, &wl_seat_interface, 5, NULL, seat_bind)) return 1;
     if (!wl_global_create(g_display, &wl_output_interface, 3, NULL, output_bind)) return 1;
     if (!wl_global_create(g_display, &zxdg_decoration_manager_v1_interface, 1, NULL, deco_mgr_bind)) return 1;
+    if (!wl_global_create(g_display, &wp_viewporter_interface, 1, NULL, viewporter_bind)) return 1;
     if (!wl_global_create(g_display, &wl_subcompositor_interface, 1, NULL, subcomp_bind)) return 1;
     if (!wl_global_create(g_display, &wl_data_device_manager_interface, 3, NULL, ddm_bind)) return 1;
     fprintf(stderr, "[waylandd] globals advertised\n");
