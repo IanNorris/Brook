@@ -1,7 +1,9 @@
 # Brook + VLC (temporary non-root UID override).
-# HW accel plugins blacklisted — Brook has no GPU, so vaapi/vdpau produce
-# opaque formats (VAOP/VDV0) that can't be converted to RV32 for wl_shm.
+# HW accel disabled — Brook has no GPU, so vaapi/vdpau produce opaque formats
+# (VAOP/VDV0) that can't be converted to RV32 for wl_shm.
+# LIBVA_DRIVERS_PATH=/nonexistent is set globally in shell.cpp to prevent
+# vaapi_filters from finding a VA driver at runtime.
 set wm
 set vfb none
 run --once /nix/bin/waylandd
-run --uid 1000 /nix/profile/bin/vlc --no-plugins-cache --vout=wl_shm --aout=alsa --avcodec-hw=none --no-avcodec-dr --codec=avcodec,none --no-vaapi_filters --verbose=2 /boot/VIDEOS/sample-5s.mp4
+run --uid 1000 /nix/profile/bin/vlc --no-plugins-cache --vout=wl_shm --aout=alsa --avcodec-hw=none --no-avcodec-dr --codec=avcodec,none --verbose=2 /boot/VIDEOS/sample-5s.mp4
