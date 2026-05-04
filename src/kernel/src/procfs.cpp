@@ -361,6 +361,110 @@ static Vnode* GenLoadavg()
     return MakeProcVnode(buf, n);
 }
 
+// /proc/cpuinfo — per-CPU information including feature flags.
+// Many apps (VLC, FFmpeg, glibc ifunc) read this for CPU capabilities.
+static Vnode* GenCpuinfo()
+{
+    uint32_t cpuCount = SmpGetCpuCount();
+    if (cpuCount == 0) cpuCount = 1;
+
+    // Query CPUID for feature flags
+    uint32_t eax, ebx, ecx, edx;
+
+    // Leaf 0: vendor string
+    char vendor[13] = {};
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0));
+    __builtin_memcpy(vendor + 0, &ebx, 4);
+    __builtin_memcpy(vendor + 4, &edx, 4);
+    __builtin_memcpy(vendor + 8, &ecx, 4);
+
+    // Leaf 1: feature bits
+    uint32_t feat_ecx = 0, feat_edx = 0;
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1));
+    feat_ecx = ecx;
+    feat_edx = edx;
+    uint32_t family = ((eax >> 8) & 0xF) + ((eax >> 20) & 0xFF);
+    uint32_t model  = ((eax >> 4) & 0xF) | (((eax >> 16) & 0xF) << 4);
+    uint32_t stepping = eax & 0xF;
+
+    // Leaf 7: extended features (AVX2, BMI, etc.)
+    uint32_t leaf7_ebx = 0;
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(7), "c"(0));
+    leaf7_ebx = ebx;
+
+    // Build flags string
+    char flags[512];
+    char* fp = flags;
+    auto addFlag = [&](bool cond, const char* name) {
+        if (!cond) return;
+        if (fp > flags) *fp++ = ' ';
+        while (*name) *fp++ = *name++;
+    };
+    // EDX flags
+    addFlag(feat_edx & (1U << 0),  "fpu");
+    addFlag(feat_edx & (1U << 4),  "tsc");
+    addFlag(feat_edx & (1U << 5),  "msr");
+    addFlag(feat_edx & (1U << 8),  "cx8");
+    addFlag(feat_edx & (1U << 15), "cmov");
+    addFlag(feat_edx & (1U << 19), "clflush");
+    addFlag(feat_edx & (1U << 23), "mmx");
+    addFlag(feat_edx & (1U << 24), "fxsr");
+    addFlag(feat_edx & (1U << 25), "sse");
+    addFlag(feat_edx & (1U << 26), "sse2");
+    addFlag(feat_edx & (1U << 28), "ht");
+    // ECX flags
+    addFlag(feat_ecx & (1U << 0),  "sse3");
+    addFlag(feat_ecx & (1U << 1),  "pclmulqdq");
+    addFlag(feat_ecx & (1U << 9),  "ssse3");
+    addFlag(feat_ecx & (1U << 12), "fma");
+    addFlag(feat_ecx & (1U << 13), "cx16");
+    addFlag(feat_ecx & (1U << 19), "sse4_1");
+    addFlag(feat_ecx & (1U << 20), "sse4_2");
+    addFlag(feat_ecx & (1U << 22), "movbe");
+    addFlag(feat_ecx & (1U << 23), "popcnt");
+    addFlag(feat_ecx & (1U << 25), "aes");
+    addFlag(feat_ecx & (1U << 26), "xsave");
+    addFlag(feat_ecx & (1U << 28), "avx");
+    addFlag(feat_ecx & (1U << 29), "f16c");
+    addFlag(feat_ecx & (1U << 30), "rdrand");
+    // Leaf 7 EBX
+    addFlag(leaf7_ebx & (1U << 3),  "bmi1");
+    addFlag(leaf7_ebx & (1U << 5),  "avx2");
+    addFlag(leaf7_ebx & (1U << 8),  "bmi2");
+    *fp = '\0';
+
+    // Allocate output: ~350 bytes per CPU entry
+    uint32_t perCpu = 512;
+    uint32_t bufSize = cpuCount * perCpu;
+    auto* buf = static_cast<char*>(kmalloc(bufSize));
+    if (!buf) return nullptr;
+
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < cpuCount && n < bufSize - perCpu; i++) {
+        n += ProcFmt(buf + n, bufSize - n,
+            "processor\t: %lu\n"
+            "vendor_id\t: %s\n"
+            "cpu family\t: %lu\n"
+            "model\t\t: %lu\n"
+            "stepping\t: %lu\n"
+            "cpu MHz\t\t: 3000.000\n"
+            "physical id\t: 0\n"
+            "siblings\t: %lu\n"
+            "core id\t\t: %lu\n"
+            "cpu cores\t: %lu\n"
+            "flags\t\t: %s\n"
+            "bogomips\t: 6000.00\n"
+            "clflush size\t: 64\n"
+            "cache_alignment\t: 64\n"
+            "address sizes\t: 48 bits physical, 48 bits virtual\n\n",
+            (uint64_t)i, vendor, (uint64_t)family, (uint64_t)model,
+            (uint64_t)stepping, (uint64_t)cpuCount, (uint64_t)i,
+            (uint64_t)cpuCount, flags);
+    }
+
+    return MakeProcVnode(buf, n);
+}
+
 // /proc/[pid]/stat — single-line process stat
 static Vnode* GenPidStat(const ProcessSnapshot& proc)
 {
@@ -509,6 +613,7 @@ static ProcGlobalEntry g_globalEntries[] = {
     { "uptime",  GenUptime },
     { "version", GenVersion },
     { "loadavg", GenLoadavg },
+    { "cpuinfo", GenCpuinfo },
 };
 static constexpr uint32_t NUM_GLOBAL = sizeof(g_globalEntries) / sizeof(g_globalEntries[0]);
 
