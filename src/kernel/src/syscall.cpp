@@ -7980,9 +7980,25 @@ static int64_t sys_sched_setaffinity(uint64_t, uint64_t, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
+// sys_sched_setparam (142) / sys_sched_getparam (143)
 // sys_sched_setscheduler (144) / sys_sched_getscheduler (145)
 // sys_sched_get_priority_max (146) / sys_sched_get_priority_min (147)
 // ---------------------------------------------------------------------------
+
+static int64_t sys_sched_setparam(uint64_t, uint64_t, uint64_t,
+                                   uint64_t, uint64_t, uint64_t)
+{
+    return 0; // pretend success
+}
+
+static int64_t sys_sched_getparam(uint64_t, uint64_t paramAddr, uint64_t,
+                                   uint64_t, uint64_t, uint64_t)
+{
+    // Return sched_priority = 0 (default for SCHED_OTHER)
+    if (paramAddr && UserBufferReadable(paramAddr, 4))
+        *reinterpret_cast<int32_t*>(paramAddr) = 0;
+    return 0;
+}
 
 static int64_t sys_sched_setscheduler(uint64_t, uint64_t, uint64_t,
                                        uint64_t, uint64_t, uint64_t)
@@ -10817,6 +10833,8 @@ void SyscallTableInit()
     g_syscallTable[SYS_CHOWN]           = sys_chown;
     g_syscallTable[SYS_FCHOWN]          = sys_fchown;
     g_syscallTable[SYS_LCHOWN]          = sys_lchown;
+    g_syscallTable[SYS_SCHED_SETPARAM]  = sys_sched_setparam;
+    g_syscallTable[SYS_SCHED_GETPARAM]  = sys_sched_getparam;
     g_syscallTable[SYS_SCHED_SETAFFINITY] = sys_sched_setaffinity;
     g_syscallTable[SYS_SCHED_GETAFFINITY] = sys_sched_getaffinity;
     g_syscallTable[SYS_SCHED_SETSCHEDULER] = sys_sched_setscheduler;
@@ -11006,6 +11024,7 @@ static const char* SyscallName(uint64_t num)
     case 90: return "chmod";      case 91: return "fchmod";
     case 92: return "chown";      case 93: return "fchown";
     case 94: return "lchown";
+    case 142: return "sched_setparam"; case 143: return "sched_getparam";
     case 144: return "sched_setscheduler"; case 145: return "sched_getscheduler";
     case 146: return "sched_get_priority_max"; case 147: return "sched_get_priority_min";
     case 203: return "sched_setaffinity"; case 204: return "sched_getaffinity";
