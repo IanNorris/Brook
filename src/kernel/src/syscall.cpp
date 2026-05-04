@@ -5699,6 +5699,24 @@ static int64_t sys_newfstatat(uint64_t dirfd, uint64_t pathAddr, uint64_t statAd
     {
         // Empty path or copy failure — try fstat on dirfd
         if (!pathAddr) return sys_fstat(dirfd, statAddr, 0, 0, 0, 0);
+
+        // Detailed EFAULT diagnostic: walk the page table manually
+        Process* p = ProcessCurrent();
+        uint64_t pg = pathAddr & ~0xFFFULL;
+        PhysicalAddress phys = VmmVirtToPhys(p->pageTable, VirtualAddress(pg));
+        uint64_t cr3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+        SerialPrintf("newfstatat EFAULT: addr=0x%lx page=0x%lx phys=0x%lx "
+                     "pt.pml4=0x%lx cr3=0x%lx brk=0x%lx pid=%u\n",
+                     pathAddr, pg, phys.raw(),
+                     p->pageTable.pml4.raw(), cr3,
+                     p->programBreak, p->pid);
+        if (phys) {
+            // Page IS in page table but CopyUserCString still failed?!
+            char testByte = *reinterpret_cast<volatile const char*>(pathAddr);
+            SerialPrintf("newfstatat EFAULT: page mapped but CopyUserCString failed! "
+                         "byte=0x%x\n", (unsigned)(unsigned char)testByte);
+        }
         return -EFAULT;
     }
     const char* path = pathBuf;
