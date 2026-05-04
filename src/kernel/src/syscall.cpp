@@ -6745,14 +6745,25 @@ retry_poll:
             if (fde->type == FdType::UnixSocket && fde->handle)
             {
                 auto* usd = static_cast<UnixSocketData*>(fde->handle);
+                // POLLHUP is always reported (not gated by events mask) when
+                // the peer side of the socket has closed.
+                bool peerGone = false;
+                if (usd->state == UnixSocketData::State::Connected) {
+                    if (usd->rxPipe &&
+                        __atomic_load_n(&usd->rxPipe->writers, __ATOMIC_ACQUIRE) == 0)
+                        peerGone = true;
+                    if (usd->txPipe &&
+                        __atomic_load_n(&usd->txPipe->readers, __ATOMIC_ACQUIRE) == 0)
+                        peerGone = true;
+                }
+                if (peerGone) fds[i].revents |= POLLHUP;
                 if (fds[i].events & POLLIN)
                 {
                     bool readable = false;
                     if (usd->state == UnixSocketData::State::Listening)
                         readable = (usd->pendingCount > 0);
                     else if (usd->state == UnixSocketData::State::Connected && usd->rxPipe)
-                        readable = (usd->rxPipe->count() > 0 ||
-                                    __atomic_load_n(&usd->rxPipe->writers, __ATOMIC_ACQUIRE) == 0);
+                        readable = (usd->rxPipe->count() > 0 || peerGone);
                     if (readable) fds[i].revents |= POLLIN;
                 }
                 if (fds[i].events & POLLOUT)
@@ -6985,6 +6996,21 @@ static uint32_t EpollFdReady(Process* proc, int fd, uint32_t events)
         if (brook::SockPollHangup(si))
             ready |= EPOLLHUP | EPOLLRDHUP;
     }
+    // Unix sockets: detect peer closure for EPOLLHUP.
+    bool unixPeerGone = false;
+    if (fde->type == FdType::UnixSocket && fde->handle) {
+        auto* usd = static_cast<UnixSocketData*>(fde->handle);
+        if (usd->state == UnixSocketData::State::Connected) {
+            if (usd->rxPipe &&
+                __atomic_load_n(&usd->rxPipe->writers, __ATOMIC_ACQUIRE) == 0)
+                unixPeerGone = true;
+            if (usd->txPipe &&
+                __atomic_load_n(&usd->txPipe->readers, __ATOMIC_ACQUIRE) == 0)
+                unixPeerGone = true;
+        }
+        if (unixPeerGone)
+            ready |= EPOLLHUP;
+    }
 
     if (events & EPOLLIN) {
         bool readable = false;
@@ -7014,8 +7040,7 @@ static uint32_t EpollFdReady(Process* proc, int fd, uint32_t events)
             if (usd->state == UnixSocketData::State::Listening) {
                 readable = (usd->pendingCount > 0);
             } else if (usd->state == UnixSocketData::State::Connected && usd->rxPipe) {
-                readable = (usd->rxPipe->count() > 0 ||
-                            __atomic_load_n(&usd->rxPipe->writers, __ATOMIC_ACQUIRE) == 0);
+                readable = (usd->rxPipe->count() > 0 || unixPeerGone);
             }
         }
         if (readable) ready |= EPOLLIN;
