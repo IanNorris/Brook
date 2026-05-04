@@ -1458,7 +1458,11 @@ static void pump_input_for_surface(struct brook_surface *s) {
         }
         case EVT_MOUSE_BTN_DOWN:
         case EVT_MOUSE_BTN_UP: {
-            if (!sc || !sc->pointer) break;
+            if (!sc || !sc->pointer) {
+                fprintf(stderr, "[waylandd] btn wm=%u DROPPED (no seat/pointer)\n",
+                        s->wm_id);
+                break;
+            }
             pointer_enter_if_needed(sc, s, e->x, e->y);
             /* scan: 0=left, 1=right, 2=middle  →  BTN_LEFT 0x110, etc. */
             uint32_t btn = 0x110 + (e->scan & 0x3);
@@ -1468,6 +1472,10 @@ static void pump_input_for_surface(struct brook_surface *s) {
             wl_pointer_send_button(sc->pointer, next_serial(), now, btn, st);
             if (wl_resource_get_version(sc->pointer) >= 5)
                 wl_pointer_send_frame(sc->pointer);
+            fprintf(stderr, "[waylandd] btn wm=%u 0x%x %s at (%d,%d)\n",
+                    s->wm_id, btn,
+                    st == WL_POINTER_BUTTON_STATE_PRESSED ? "down" : "up",
+                    e->x, e->y);
             break;
         }
         case EVT_MOUSE_SCROLL: {
