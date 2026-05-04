@@ -1,7 +1,8 @@
 # Brook + ffplay video playback via Wayland SHM.
-# Uses software decode only (-hwaccel none) since Brook has no GPU.
 # SDL3's Wayland backend provides the display surface.
+# Note: don't pass -hwaccel none — it triggers ffplay's vulkan renderer
+# requirement. Without it, ffplay falls back to software decode naturally.
 set wm
 set vfb none
 run --once /nix/bin/waylandd
-run --uid 1000 /nix/bin/ffplay -hwaccel none -autoexit -fs /boot/VIDEOS/sample-5s.mp4
+run --uid 1000 /nix/bin/ffplay -autoexit -fs /boot/VIDEOS/sample-5s.mp4
