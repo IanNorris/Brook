@@ -4,4 +4,4 @@
 set wm
 set vfb none
 run --once /nix/bin/waylandd
-run --uid 1000 /nix/profile/bin/vlc --no-plugins-cache --vout=wl_shm --aout=alsa --avcodec-hw=none --no-avcodec-dr --codec=avcodec,none --no-vaapi --no-vdpau --no-vaapi_filters --verbose=2 /boot/VIDEOS/sample-5s.mp4
+run --uid 1000 /nix/profile/bin/vlc --no-plugins-cache --vout=wl_shm --aout=alsa --avcodec-hw=none --no-avcodec-dr --codec=avcodec,none --no-vaapi_filters --verbose=2 /boot/VIDEOS/sample-5s.mp4
