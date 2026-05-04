@@ -10399,12 +10399,17 @@ static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
         }
         if (UnixFdQueueCount(q) + pendingCount >= UNIX_FD_QUEUE_CAP) {
             for (int j = 0; j < pendingCount; j++) UnixFdSnapRelease(&pendingSnaps[j]);
+            DbgPrintf("sendmsg SCM_RIGHTS: queue FULL (%d + %d >= %d) pid=%d\n",
+                      UnixFdQueueCount(q), pendingCount, UNIX_FD_QUEUE_CAP, proc->pid);
             return -EAGAIN;
         }
         for (int j = 0; j < pendingCount; j++) {
             q->msgs[q->head] = pendingSnaps[j];
             q->head = (q->head + 1) % UNIX_FD_QUEUE_CAP;
         }
+        DbgPrintf("sendmsg SCM_RIGHTS: pushed %d fd(s) type=%d to queue (depth now %d) pid=%d fd#=%d\n",
+                  pendingCount, (int)pendingSnaps[0].type, UnixFdQueueCount(q), proc->pid,
+                  pendingCount > 0 ? static_cast<int>(reinterpret_cast<uintptr_t>(pendingSnaps[0].handle) & 0xffff) : -1);
     }
 
     // Write the iov payload. If we enqueued fds but the payload write fails,
@@ -10538,6 +10543,20 @@ static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
         msg->msg_flags = 0;
         uint64_t wroteCtl = 0;
 
+        // Debug: check if fds are pending but conditions prevent delivery
+        if (usd->incomingFds && UnixFdQueueCount(usd->incomingFds) > 0) {
+            if (total <= 0)
+                DbgPrintf("recvmsg: %d fd(s) pending but total=%ld (no data) pid=%d\n",
+                          UnixFdQueueCount(usd->incomingFds), (long)total, proc->pid);
+            else if (!msg->msg_control)
+                DbgPrintf("recvmsg: %d fd(s) pending but msg_control=NULL pid=%d\n",
+                          UnixFdQueueCount(usd->incomingFds), proc->pid);
+            else if (msg->msg_controllen < sizeof(CmsgHdr))
+                DbgPrintf("recvmsg: %d fd(s) pending but controllen=%lu < %lu pid=%d\n",
+                          UnixFdQueueCount(usd->incomingFds),
+                          msg->msg_controllen, sizeof(CmsgHdr), proc->pid);
+        }
+
         if (total > 0 && usd->incomingFds &&
             msg->msg_control && msg->msg_controllen >= sizeof(CmsgHdr))
         {
@@ -10549,6 +10568,8 @@ static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
 
                 int n = UnixFdQueueCount(q);
                 if (n > 0) {
+                    DbgPrintf("recvmsg SCM_RIGHTS: %d fd(s) queued, delivering to pid=%d\n",
+                              n, proc->pid);
                     // One SCM_RIGHTS cmsg can hold multiple fds back-to-back.
                     uint64_t fdsMax = (cap - sizeof(CmsgHdr)) / sizeof(int);
                     int installed = 0;
@@ -10582,6 +10603,8 @@ static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
                             cm->cmsg_level = SOL_SOCKET;
                             cm->cmsg_type  = SCM_RIGHTS;
                             wroteCtl = CmsgAlign(cm->cmsg_len);
+                            DbgPrintf("recvmsg SCM_RIGHTS: installed %d fd(s), cmsg_len=%lu pid=%d\n",
+                                      installed, cm->cmsg_len, proc->pid);
                         }
                     }
                 }
