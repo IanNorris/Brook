@@ -70,6 +70,23 @@ if [ "${UPDATE_TOOLS}" -eq 1 ]; then
                 echo "  store/${base}"
             fi
         done < <(nix-store -qR "$WAYLANDD_OUT")
+
+        # Copy ffplay (ffmpeg-bin) closure for video playback
+        FFPLAY_STORE="/nix/store/nih4c7knfj2mgjz6jp5l0fqn86xdwmhc-ffmpeg-8.0.1-bin"
+        if [ -x "${FFPLAY_STORE}/bin/ffplay" ]; then
+            ADDED=0
+            while IFS= read -r p; do
+                [ -n "$p" ] || continue
+                base=$(basename "$p")
+                dst="${MNTDIR}/store/${base}"
+                if [ ! -e "$dst" ]; then
+                    cp -a --no-preserve=links "$p" "$dst"
+                    ADDED=$((ADDED + 1))
+                fi
+            done < <(nix-store -qR "$FFPLAY_STORE")
+            cp "${FFPLAY_STORE}/bin/ffplay" "${MNTDIR}/bin/ffplay"
+            echo "  ffplay -> /nix/bin/ffplay ($ADDED new store paths)"
+        fi
     fi
     for tool in nix-fetch nix-search nix-install; do
         src="${TOOLS_BIN}/${tool}/${tool}"

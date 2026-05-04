@@ -1,0 +1,3 @@
+# title: FFplay
+# desc: FFmpeg video player
+source /boot/SCRIPTS/wayland_ffplay.rc
