@@ -5464,13 +5464,11 @@ static bool BusyboxStatFallback(const char* path, VnodeStat* vs)
     return VfsStatPath("/boot/BIN/BUSYBOX", vs) == 0;
 }
 
-static int64_t sys_stat(uint64_t pathAddr, uint64_t statAddr, uint64_t,
-                         uint64_t, uint64_t, uint64_t)
+// Internal stat helper — takes a kernel-space path directly (no user copy).
+// statAddr is the user-space address of the stat buffer.
+static int64_t do_stat_internal(const char* path, uint64_t statAddr)
 {
-    char pathBuf[256];
-    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
     if (!UserBufferWritable(statAddr, sizeof(LinuxStat))) return -EFAULT;
-    const char* path = pathBuf;
     auto* st = reinterpret_cast<LinuxStat*>(statAddr);
 
     // Resolve relative paths (including ".") against CWD
@@ -5481,12 +5479,10 @@ static int64_t sys_stat(uint64_t pathAddr, uint64_t statAddr, uint64_t,
         Process* proc = ProcessCurrent();
         const char* cwd = (proc && proc->cwd[0]) ? proc->cwd : "/";
         uint32_t ci = 0;
-        // Special case: "." means CWD itself
         if (path[0] == '.' && (path[1] == '\0' || path[1] == '/'))
         {
             for (uint32_t j = 0; cwd[j] && ci < 254; ++j)
                 resolved[ci++] = cwd[j];
-            // Append anything after "."
             if (path[1] == '/')
                 for (uint32_t j = 1; path[j] && ci < 254; ++j)
                     resolved[ci++] = path[j];
@@ -5515,16 +5511,12 @@ static int64_t sys_stat(uint64_t pathAddr, uint64_t statAddr, uint64_t,
     return 0;
 }
 
-static int64_t sys_lstat(uint64_t pathAddr, uint64_t statAddr, uint64_t,
-                          uint64_t, uint64_t, uint64_t)
+// Internal lstat helper — takes a kernel-space path directly.
+static int64_t do_lstat_internal(const char* path, uint64_t statAddr)
 {
-    char pathBuf[256];
-    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
     if (!UserBufferWritable(statAddr, sizeof(LinuxStat))) return -EFAULT;
-    const char* path = pathBuf;
     auto* st = reinterpret_cast<LinuxStat*>(statAddr);
 
-    // Resolve relative paths against CWD (same logic as sys_stat)
     char resolved[256];
     const char* lookup = path;
     if (path[0] != '/')
@@ -5562,6 +5554,22 @@ static int64_t sys_lstat(uint64_t pathAddr, uint64_t statAddr, uint64_t,
 
     FillStat(st, vs);
     return 0;
+}
+
+static int64_t sys_stat(uint64_t pathAddr, uint64_t statAddr, uint64_t,
+                         uint64_t, uint64_t, uint64_t)
+{
+    char pathBuf[256];
+    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
+    return do_stat_internal(pathBuf, statAddr);
+}
+
+static int64_t sys_lstat(uint64_t pathAddr, uint64_t statAddr, uint64_t,
+                          uint64_t, uint64_t, uint64_t)
+{
+    char pathBuf[256];
+    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
+    return do_lstat_internal(pathBuf, statAddr);
 }
 
 static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
@@ -5699,24 +5707,6 @@ static int64_t sys_newfstatat(uint64_t dirfd, uint64_t pathAddr, uint64_t statAd
     {
         // Empty path or copy failure — try fstat on dirfd
         if (!pathAddr) return sys_fstat(dirfd, statAddr, 0, 0, 0, 0);
-
-        // Detailed EFAULT diagnostic: walk the page table manually
-        Process* p = ProcessCurrent();
-        uint64_t pg = pathAddr & ~0xFFFULL;
-        PhysicalAddress phys = VmmVirtToPhys(p->pageTable, VirtualAddress(pg));
-        uint64_t cr3;
-        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
-        SerialPrintf("newfstatat EFAULT: addr=0x%lx page=0x%lx phys=0x%lx "
-                     "pt.pml4=0x%lx cr3=0x%lx brk=0x%lx pid=%u\n",
-                     pathAddr, pg, phys.raw(),
-                     p->pageTable.pml4.raw(), cr3,
-                     p->programBreak, p->pid);
-        if (phys) {
-            // Page IS in page table but CopyUserCString still failed?!
-            char testByte = *reinterpret_cast<volatile const char*>(pathAddr);
-            SerialPrintf("newfstatat EFAULT: page mapped but CopyUserCString failed! "
-                         "byte=0x%x\n", (unsigned)(unsigned char)testByte);
-        }
         return -EFAULT;
     }
     const char* path = pathBuf;
@@ -5726,14 +5716,15 @@ static int64_t sys_newfstatat(uint64_t dirfd, uint64_t pathAddr, uint64_t statAd
     static constexpr uint64_t AT_SYMLINK_NOFOLLOW = 0x100;
     bool noFollow = (flags & AT_SYMLINK_NOFOLLOW) != 0;
 
+    // Resolve relative path against dirfd
     char resolved[256];
-    uint64_t arg = reinterpret_cast<uint64_t>(path);
+    const char* finalPath = path;
     if (ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
-        arg = reinterpret_cast<uint64_t>(resolved);
+        finalPath = resolved;
 
     if (noFollow)
-        return sys_lstat(arg, statAddr, 0, 0, 0, 0);
-    return sys_stat(arg, statAddr, 0, 0, 0, 0);
+        return do_lstat_internal(finalPath, statAddr);
+    return do_stat_internal(finalPath, statAddr);
 }
 
 // ---------------------------------------------------------------------------
@@ -11038,24 +11029,7 @@ int64_t SyscallDispatchInternal(uint64_t num, uint64_t a0, uint64_t a1,
                      num, a0, a1, a2, a3, a4, a5);
         return -38; // -ENOSYS
     }
-    int64_t ret = fn(a0, a1, a2, a3, a4, a5);
-    // Temporary diagnostic: log EFAULT returns for library-loading syscalls
-    if (ret == -14 && proc) {
-        const char* nm = "?";
-        switch (num) {
-            case 2: nm = "open"; break;
-            case 4: nm = "stat"; break;
-            case 5: nm = "fstat"; break;
-            case 6: nm = "lstat"; break;
-            case 9: nm = "mmap"; break;
-            case 21: nm = "access"; break;
-            case 257: nm = "openat"; break;
-            case 262: nm = "newfstatat"; break;
-        }
-        SerialPrintf("EFAULT: pid=%u (%s) syscall=%lu(%s) a0=0x%lx a1=0x%lx a2=0x%lx\n",
-                     proc->pid, proc->name, num, nm, a0, a1, a2);
-    }
-    return ret;
+    return fn(a0, a1, a2, a3, a4, a5);
 }
 
 // ---------------------------------------------------------------------------

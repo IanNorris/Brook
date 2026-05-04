@@ -243,7 +243,7 @@ if [ "$HEADLESS" -eq 1 ]; then
     fi
 else
     SERIAL_OPT="-serial stdio"
-    DISPLAY_OPT="-display gtk"
+    DISPLAY_OPT="-display sdl"
 fi
 
 # Network device selection: default is user-mode slirp with tcp host-forward.

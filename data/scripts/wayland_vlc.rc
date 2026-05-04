@@ -2,4 +2,4 @@
 set wm
 set vfb none
 run --once /nix/bin/waylandd
-run --strace --uid 1000 /nix/profile/bin/vlc --no-plugins-cache --aout=none --verbose=2
+run --uid 1000 /nix/profile/bin/vlc --no-plugins-cache --aout=none --verbose=2
