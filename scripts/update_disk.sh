@@ -389,6 +389,19 @@ if [ -d "$user_content_dir" ] && ls "$user_content_dir"/* &>/dev/null 2>&1; then
     done
 fi
 
+# --- Video files ---
+video_dir="${ROOT_DIR}/data/videos"
+if [ -d "$video_dir" ] && ls "$video_dir"/* &>/dev/null 2>&1; then
+    echo "Videos:"
+    mmd -D s -i "${DISK_IMG}" "::VIDEOS" 2>/dev/null || true
+    for f in "$video_dir"/*; do
+        [ -f "$f" ] || continue
+        local_name="$(basename "$f")"
+        mcopy_safe -o -i "${DISK_IMG}" "$f" "::VIDEOS/${local_name}"
+        echo "  synced: VIDEOS/${local_name} ($(stat -c%s "$f") bytes)"
+    done
+fi
+
 echo ""
 echo "Current disk contents:"
 mdir -i "${DISK_IMG}" :: 2>&1 | grep -v "^$"
