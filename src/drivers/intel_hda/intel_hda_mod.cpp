@@ -692,6 +692,7 @@ static uint32_t QueuedBytesLocked()
     return static_cast<uint32_t>(queued);
 }
 
+__attribute__((unused))
 static void ResetPlaybackQueueLocked(bool reconfigure)
 {
     if (g_streamRunning)
@@ -757,15 +758,19 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
         uint32_t queued = QueuedBytesLocked();
         if (g_streamRunning && queued == 0)
         {
-            ResetPlaybackQueueLocked(true);
-            queued = 0;
+            // Underrun: DMA played past all submitted data.
+            // Re-sync counters so next write lands just ahead of DMA.
+            uint32_t lpib = hda_read32(g_outStreamBase + SD_LPIB) % AUDIO_BUF_SIZE;
+            g_submittedBytes = lpib;
+            g_playedBytes = lpib;
+            g_lastLpib = lpib;
         }
 
         uint32_t capacity = TARGET_QUEUE_BYTES > queued ? TARGET_QUEUE_BYTES - queued : 0;
         capacity -= capacity % frameBytes;
         if (capacity == 0)
         {
-            if (nonblock || totalWritten > 0)
+            if (nonblock)
                 break;
             PlayUnlock();
             SchedulerSleepMs(1);
@@ -781,7 +786,7 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
         chunk -= chunk % frameBytes;
         if (chunk == 0)
         {
-            if (nonblock || totalWritten > 0)
+            if (nonblock)
                 break;
             PlayUnlock();
             SchedulerSleepMs(1);
