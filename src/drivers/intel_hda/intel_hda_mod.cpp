@@ -757,9 +757,22 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
         uint32_t queued = QueuedBytesLocked();
         if (g_streamRunning && queued == 0)
         {
-            // Underrun: DMA consumed all data. Full reset to avoid stale playback.
-            ResetPlaybackQueueLocked(true);
-            queued = 0;
+            if (nonblock)
+            {
+                // Non-blocking caller (games): full reset to avoid stale data.
+                ResetPlaybackQueueLocked(true);
+                queued = 0;
+            }
+            else
+            {
+                // Blocking caller (streaming): keep stream running.
+                // DMA is cycling through silence (buffer was zeroed on last
+                // underrun or startup). Just write new data ahead of DMA.
+                uint32_t lpib = hda_read32(g_outStreamBase + SD_LPIB) % AUDIO_BUF_SIZE;
+                g_submittedBytes = lpib;
+                g_playedBytes = lpib;
+                g_lastLpib = lpib;
+            }
         }
 
         uint32_t capacity = TARGET_QUEUE_BYTES > queued ? TARGET_QUEUE_BYTES - queued : 0;
