@@ -225,7 +225,7 @@ static constexpr uint32_t NUM_FRAGMENTS   = 16;           // BDL entries (max 25
 static constexpr uint32_t FRAG_SIZE       = 4096;        // 4KB each (= 1 page)
 static constexpr uint32_t AUDIO_BUF_SIZE  = NUM_FRAGMENTS * FRAG_SIZE; // 64KB total
 static constexpr uint32_t START_QUEUE_BYTES  = 8192;     // ~46ms at 44.1k stereo s16
-static constexpr uint32_t TARGET_QUEUE_BYTES = 24576;    // ~139ms; keeps latency bounded
+static constexpr uint32_t TARGET_QUEUE_BYTES = 49152;    // ~278ms; enough to absorb scheduling jitter
 static uint8_t*  g_audioBuf = nullptr;
 static uint64_t  g_audioBufPhys = 0;
 static uint64_t  g_fragPhys[NUM_FRAGMENTS]; // per-fragment physical addresses
