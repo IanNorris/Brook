@@ -7508,7 +7508,6 @@ static int64_t sys_memfd_create(uint64_t nameAddr, uint64_t flags,
     if (flags & MFD_CLOEXEC)
         proc->fds[fd].fdFlags |= 1;
 
-    brook::SerialPrintf("sys_memfd_create: fd=%d name='%s' flags=0x%lx\n", fd, name, flags);
     return fd;
 }
 
@@ -10399,17 +10398,12 @@ static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
         }
         if (UnixFdQueueCount(q) + pendingCount >= UNIX_FD_QUEUE_CAP) {
             for (int j = 0; j < pendingCount; j++) UnixFdSnapRelease(&pendingSnaps[j]);
-            brook::SerialPrintf("sendmsg SCM_RIGHTS: queue FULL (%d + %d >= %d) pid=%d\n",
-                      UnixFdQueueCount(q), pendingCount, UNIX_FD_QUEUE_CAP, proc->pid);
             return -EAGAIN;
         }
         for (int j = 0; j < pendingCount; j++) {
             q->msgs[q->head] = pendingSnaps[j];
             q->head = (q->head + 1) % UNIX_FD_QUEUE_CAP;
         }
-        brook::SerialPrintf("sendmsg SCM_RIGHTS: pushed %d fd(s) type=%d to queue (depth now %d) pid=%d fd#=%d\n",
-                  pendingCount, (int)pendingSnaps[0].type, UnixFdQueueCount(q), proc->pid,
-                  pendingCount > 0 ? static_cast<int>(reinterpret_cast<uintptr_t>(pendingSnaps[0].handle) & 0xffff) : -1);
     }
 
     // Write the iov payload. If we enqueued fds but the payload write fails,
@@ -10568,8 +10562,6 @@ static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
 
                 int n = UnixFdQueueCount(q);
                 if (n > 0) {
-                    brook::SerialPrintf("recvmsg SCM_RIGHTS: %d fd(s) queued, delivering to pid=%d\n",
-                              n, proc->pid);
                     // One SCM_RIGHTS cmsg can hold multiple fds back-to-back.
                     uint64_t fdsMax = (cap - sizeof(CmsgHdr)) / sizeof(int);
                     int installed = 0;
@@ -10603,8 +10595,6 @@ static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
                             cm->cmsg_level = SOL_SOCKET;
                             cm->cmsg_type  = SCM_RIGHTS;
                             wroteCtl = CmsgAlign(cm->cmsg_len);
-                            brook::SerialPrintf("recvmsg SCM_RIGHTS: installed %d fd(s), cmsg_len=%lu pid=%d\n",
-                                      installed, cm->cmsg_len, proc->pid);
                         }
                     }
                 }
