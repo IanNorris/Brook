@@ -11020,7 +11020,24 @@ int64_t SyscallDispatchInternal(uint64_t num, uint64_t a0, uint64_t a1,
                      num, a0, a1, a2, a3, a4, a5);
         return -38; // -ENOSYS
     }
-    return fn(a0, a1, a2, a3, a4, a5);
+    int64_t ret = fn(a0, a1, a2, a3, a4, a5);
+    // Temporary diagnostic: log EFAULT returns for library-loading syscalls
+    if (ret == -14 && proc) {
+        const char* nm = "?";
+        switch (num) {
+            case 2: nm = "open"; break;
+            case 4: nm = "stat"; break;
+            case 5: nm = "fstat"; break;
+            case 6: nm = "lstat"; break;
+            case 9: nm = "mmap"; break;
+            case 21: nm = "access"; break;
+            case 257: nm = "openat"; break;
+            case 262: nm = "newfstatat"; break;
+        }
+        SerialPrintf("EFAULT: pid=%u (%s) syscall=%lu(%s) a0=0x%lx a1=0x%lx a2=0x%lx\n",
+                     proc->pid, proc->name, num, nm, a0, a1, a2);
+    }
+    return ret;
 }
 
 // ---------------------------------------------------------------------------
