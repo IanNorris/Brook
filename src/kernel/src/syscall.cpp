@@ -7956,6 +7956,38 @@ static int64_t sys_sched_setaffinity(uint64_t, uint64_t, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
+// sys_sched_setscheduler (144) / sys_sched_getscheduler (145)
+// sys_sched_get_priority_max (146) / sys_sched_get_priority_min (147)
+// ---------------------------------------------------------------------------
+
+static int64_t sys_sched_setscheduler(uint64_t, uint64_t, uint64_t,
+                                       uint64_t, uint64_t, uint64_t)
+{
+    return 0; // pretend success
+}
+
+static int64_t sys_sched_getscheduler(uint64_t, uint64_t, uint64_t,
+                                       uint64_t, uint64_t, uint64_t)
+{
+    return 0; // SCHED_OTHER
+}
+
+static int64_t sys_sched_get_priority_max(uint64_t policy, uint64_t, uint64_t,
+                                            uint64_t, uint64_t, uint64_t)
+{
+    // Linux returns: SCHED_OTHER=0, SCHED_FIFO/RR=99
+    if (policy == 1 || policy == 2) return 99; // SCHED_FIFO / SCHED_RR
+    return 0; // SCHED_OTHER / SCHED_BATCH / SCHED_IDLE
+}
+
+static int64_t sys_sched_get_priority_min(uint64_t policy, uint64_t, uint64_t,
+                                            uint64_t, uint64_t, uint64_t)
+{
+    if (policy == 1 || policy == 2) return 1; // SCHED_FIFO / SCHED_RR
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // sys_statx (332) — extended stat
 // ---------------------------------------------------------------------------
 
@@ -10726,6 +10758,10 @@ void SyscallTableInit()
     g_syscallTable[SYS_LCHOWN]          = sys_lchown;
     g_syscallTable[SYS_SCHED_SETAFFINITY] = sys_sched_setaffinity;
     g_syscallTable[SYS_SCHED_GETAFFINITY] = sys_sched_getaffinity;
+    g_syscallTable[SYS_SCHED_SETSCHEDULER] = sys_sched_setscheduler;
+    g_syscallTable[SYS_SCHED_GETSCHEDULER] = sys_sched_getscheduler;
+    g_syscallTable[SYS_SCHED_GET_PRIORITY_MAX] = sys_sched_get_priority_max;
+    g_syscallTable[SYS_SCHED_GET_PRIORITY_MIN] = sys_sched_get_priority_min;
     g_syscallTable[SYS_MKDIRAT]         = sys_mkdirat;
     g_syscallTable[SYS_FCHOWNAT]        = sys_fchownat;
     g_syscallTable[SYS_UNLINKAT]        = sys_unlinkat;
@@ -10909,6 +10945,8 @@ static const char* SyscallName(uint64_t num)
     case 90: return "chmod";      case 91: return "fchmod";
     case 92: return "chown";      case 93: return "fchown";
     case 94: return "lchown";
+    case 144: return "sched_setscheduler"; case 145: return "sched_getscheduler";
+    case 146: return "sched_get_priority_max"; case 147: return "sched_get_priority_min";
     case 203: return "sched_setaffinity"; case 204: return "sched_getaffinity";
     case 258: return "mkdirat";   case 260: return "fchownat";
     case 263: return "unlinkat";  case 264: return "renameat";
