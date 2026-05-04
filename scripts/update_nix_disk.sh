@@ -177,6 +177,13 @@ EOF
             echo "  ca-bundle.crt -> /nix/etc/ssl/certs/ca-bundle.crt"
             break
         done
+        # Remove vaapi_filters plugin from VLC — Brook has no GPU and this
+        # module causes VAOP format negotiation that fails after window resize.
+        for f in "${MNTDIR}"/store/*-vlc-*/lib/vlc/plugins/vaapi/libvaapi_filters_plugin.so; do
+            [ -f "$f" ] || continue
+            rm -f "$f"
+            echo "  removed libvaapi_filters_plugin.so (no GPU)"
+        done
     fi
 fi
 
