@@ -1,0 +1,6 @@
+# Brook + brook-player video playback via direct Wayland wl_shm.
+# Uses ffmpeg libav* for decoding, bypasses SDL entirely.
+set wm
+set vfb none
+run --once /nix/bin/waylandd
+run --uid 1000 /nix/bin/brook-player -fs /boot/VIDEOS/sample-5s.mp4

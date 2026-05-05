@@ -1,3 +1,3 @@
-# title: FFplay
-# desc: FFmpeg video player
-source /boot/SCRIPTS/wayland_ffplay.rc
+# title: Video Player
+# desc: Brook video player (wl_shm)
+source /boot/SCRIPTS/wayland_brookplayer.rc

@@ -87,6 +87,23 @@ if [ "${UPDATE_TOOLS}" -eq 1 ]; then
             cp "${FFPLAY_STORE}/bin/ffplay" "${MNTDIR}/bin/ffplay"
             echo "  ffplay -> /nix/bin/ffplay ($ADDED new store paths)"
         fi
+
+        # Copy brook-player (minimal wl_shm video player)
+        BROOK_PLAYER_STORE="/nix/store/xn7f6dgxm6jriw8irzvplri1jxdayzk1-brook-player-0.1-brook"
+        if [ -x "${BROOK_PLAYER_STORE}/bin/brook-player" ]; then
+            ADDED=0
+            while IFS= read -r p; do
+                [ -n "$p" ] || continue
+                base=$(basename "$p")
+                dst="${MNTDIR}/store/${base}"
+                if [ ! -e "$dst" ]; then
+                    cp -a --no-preserve=links "$p" "$dst"
+                    ADDED=$((ADDED + 1))
+                fi
+            done < <(nix-store -qR "$BROOK_PLAYER_STORE")
+            cp "${BROOK_PLAYER_STORE}/bin/brook-player" "${MNTDIR}/bin/brook-player"
+            echo "  brook-player -> /nix/bin/brook-player ($ADDED new store paths)"
+        fi
     fi
     for tool in nix-fetch nix-search nix-install; do
         src="${TOOLS_BIN}/${tool}/${tool}"
