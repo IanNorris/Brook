@@ -96,6 +96,7 @@ static AVStream *g_audStream = NULL;
 #define AUDIO_RATE     44100
 #define AUDIO_CHANNELS 2
 #define AUDIO_FORMAT   AV_SAMPLE_FMT_S16
+static uint64_t g_audio_bytes_written = 0; /* bytes submitted to /dev/dsp */
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -466,7 +467,8 @@ static void audio_decode_packet(AVPacket *pkt)
                                     aframe->nb_samples);
         if (converted > 0) {
             int bytes = converted * AUDIO_CHANNELS * 2;
-            (void)!write(g_dsp_fd, out_buf, bytes);
+            int w = write(g_dsp_fd, out_buf, bytes);
+            if (w > 0) g_audio_bytes_written += w;
         }
 
         free(out_buf);
@@ -645,9 +647,13 @@ int main(int argc, char **argv)
                       0, g_vid_h,
                       dst_data, dst_linesize);
 
-            /* Frame timing: pace output to match PTS */
+            /* Frame timing: pace output to match PTS.
+             * When audio is active, audio backpressure from /dev/dsp
+             * (HDA blocks when 278ms buffer is full) provides natural
+             * pacing — don't sleep or audio starves and gets choppy.
+             * Only use nanosleep for video-only files. */
             int64_t pts = frame->best_effort_timestamp;
-            if (pts != AV_NOPTS_VALUE) {
+            if (pts != AV_NOPTS_VALUE && g_audIdx < 0) {
                 if (first_pts == AV_NOPTS_VALUE) {
                     first_pts  = pts;
                     start_time = now_us();
