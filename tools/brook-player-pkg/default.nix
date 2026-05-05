@@ -29,7 +29,7 @@ stdenv.mkDerivation {
         -I. \
         brook-player.c xdg-shell-protocol.c \
         -L${wayland}/lib -lwayland-client \
-        -L${ffmpeg.lib}/lib -lavformat -lavcodec -lavutil -lswscale \
+        -L${ffmpeg.lib}/lib -lavformat -lavcodec -lavutil -lswscale -lswresample \
         -Wl,-rpath,${wayland}/lib:${ffmpeg.lib}/lib:${stdenv.cc.libc}/lib \
         -lm \
         -o brook-player

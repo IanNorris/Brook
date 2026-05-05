@@ -2,6 +2,7 @@
  * brook-player.c — Minimal video player for Brook OS.
  *
  * Uses ffmpeg libav* for decoding and Wayland wl_shm for display.
+ * Audio output via direct /dev/dsp writes (OSS, S16_LE 44100 stereo).
  * Bypasses SDL entirely — renders decoded frames directly to wl_shm
  * buffers via xdg_toplevel.
  *
@@ -12,6 +13,7 @@
  *   - Double-buffered wl_shm: draw into back buffer while front is
  *     displayed, swap on wl_buffer.release
  *   - Frame pacing via nanosleep based on video PTS
+ *   - Audio: decoded → resampled to S16_LE/44100/2ch → /dev/dsp
  *   - Fullscreen via xdg_toplevel.set_fullscreen
  *   - Exits on video end (always, for now)
  */
@@ -28,13 +30,17 @@
 #include <errno.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/ioctl.h>
 #include <poll.h>
 
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
+#include <libswresample/swresample.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/time.h>
+#include <libavutil/opt.h>
+#include <libavutil/channel_layout.h>
 
 #include <wayland-client.h>
 #include <wayland-client-protocol.h>
@@ -78,6 +84,18 @@ static int       g_back = 0;   /* index of the back buffer to draw into */
 static int g_vid_w = 0;
 static int g_vid_h = 0;
 static int g_fullscreen = 0;
+
+/* Audio state */
+static int g_dsp_fd = -1;              /* /dev/dsp file descriptor */
+static struct SwrContext *g_swr = NULL; /* audio resampler */
+static AVCodecContext *g_audDecCtx = NULL;
+static int g_audIdx = -1;              /* audio stream index */
+static AVStream *g_audStream = NULL;
+
+/* Audio output parameters (Brook's /dev/dsp default) */
+#define AUDIO_RATE     44100
+#define AUDIO_CHANNELS 2
+#define AUDIO_FORMAT   AV_SAMPLE_FMT_S16
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -344,6 +362,126 @@ static void display_frame(uint8_t *rgb_data, int linesize)
 }
 
 /* ------------------------------------------------------------------ */
+/* Audio output                                                        */
+/* ------------------------------------------------------------------ */
+
+static int audio_init(AVFormatContext *fmtCtx)
+{
+    /* Find audio stream */
+    for (unsigned i = 0; i < fmtCtx->nb_streams; i++) {
+        if (fmtCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            g_audIdx = (int)i;
+            g_audStream = fmtCtx->streams[i];
+            break;
+        }
+    }
+    if (g_audIdx < 0) {
+        fprintf(stderr, "[brook-player] no audio stream found\n");
+        return -1;
+    }
+
+    /* Open audio decoder */
+    const AVCodec *acodec = avcodec_find_decoder(g_audStream->codecpar->codec_id);
+    if (!acodec) {
+        fprintf(stderr, "[brook-player] unsupported audio codec\n");
+        return -1;
+    }
+
+    g_audDecCtx = avcodec_alloc_context3(acodec);
+    avcodec_parameters_to_context(g_audDecCtx, g_audStream->codecpar);
+    if (avcodec_open2(g_audDecCtx, acodec, NULL) < 0) {
+        fprintf(stderr, "[brook-player] failed to open audio codec\n");
+        return -1;
+    }
+
+    fprintf(stderr, "[brook-player] audio: %d Hz, %d ch, fmt=%d codec=%s\n",
+            g_audDecCtx->sample_rate,
+            g_audDecCtx->ch_layout.nb_channels,
+            g_audDecCtx->sample_fmt,
+            acodec->name);
+
+    /* Set up resampler: source format → S16_LE / 44100 / stereo */
+    g_swr = swr_alloc();
+    if (!g_swr) {
+        fprintf(stderr, "[brook-player] swr_alloc failed\n");
+        return -1;
+    }
+
+    AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_STEREO;
+    AVChannelLayout in_layout;
+    if (g_audDecCtx->ch_layout.nb_channels > 0) {
+        av_channel_layout_copy(&in_layout, &g_audDecCtx->ch_layout);
+    } else {
+        av_channel_layout_default(&in_layout, 2);
+    }
+
+    swr_alloc_set_opts2(&g_swr,
+                        &out_layout, AUDIO_FORMAT, AUDIO_RATE,
+                        &in_layout, g_audDecCtx->sample_fmt,
+                        g_audDecCtx->sample_rate,
+                        0, NULL);
+
+    if (swr_init(g_swr) < 0) {
+        fprintf(stderr, "[brook-player] swr_init failed\n");
+        swr_free(&g_swr);
+        g_swr = NULL;
+        return -1;
+    }
+
+    /* Open /dev/dsp for raw PCM output */
+    g_dsp_fd = open("/dev/dsp", O_WRONLY);
+    if (g_dsp_fd < 0) {
+        fprintf(stderr, "[brook-player] failed to open /dev/dsp: %s\n",
+                strerror(errno));
+        return -1;
+    }
+
+    fprintf(stderr, "[brook-player] audio output: /dev/dsp fd=%d "
+            "(S16_LE %d Hz stereo)\n", g_dsp_fd, AUDIO_RATE);
+    return 0;
+}
+
+static void audio_decode_packet(AVPacket *pkt)
+{
+    if (!g_audDecCtx || !g_swr || g_dsp_fd < 0)
+        return;
+
+    int ret = avcodec_send_packet(g_audDecCtx, pkt);
+    if (ret < 0) return;
+
+    AVFrame *aframe = av_frame_alloc();
+    while (avcodec_receive_frame(g_audDecCtx, aframe) == 0) {
+        /* Calculate output sample count after resampling */
+        int out_samples = swr_get_out_samples(g_swr, aframe->nb_samples);
+        if (out_samples <= 0) continue;
+
+        /* Allocate output buffer: S16_LE, stereo = 4 bytes per sample */
+        int buf_size = out_samples * AUDIO_CHANNELS * 2;
+        uint8_t *out_buf = malloc(buf_size);
+        if (!out_buf) continue;
+
+        uint8_t *out_planes[1] = { out_buf };
+        int converted = swr_convert(g_swr, out_planes, out_samples,
+                                    (const uint8_t **)aframe->extended_data,
+                                    aframe->nb_samples);
+        if (converted > 0) {
+            int bytes = converted * AUDIO_CHANNELS * 2;
+            (void)!write(g_dsp_fd, out_buf, bytes);
+        }
+
+        free(out_buf);
+    }
+    av_frame_free(&aframe);
+}
+
+static void audio_cleanup(void)
+{
+    if (g_swr) swr_free(&g_swr);
+    if (g_audDecCtx) avcodec_free_context(&g_audDecCtx);
+    if (g_dsp_fd >= 0) close(g_dsp_fd);
+}
+
+/* ------------------------------------------------------------------ */
 /* Main                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -415,6 +553,9 @@ int main(int argc, char **argv)
     fprintf(stderr, "[brook-player] video: %dx%d codec=%s\n",
             g_vid_w, g_vid_h, codec->name);
 
+    /* ----- Audio init ----- */
+    audio_init(fmtCtx);
+
     /* ----- Wayland init ----- */
     {
         /* Derive a title from filename */
@@ -481,6 +622,12 @@ int main(int argc, char **argv)
             break;
         }
 
+        if (pkt->stream_index == g_audIdx) {
+            audio_decode_packet(pkt);
+            av_packet_unref(pkt);
+            continue;
+        }
+
         if (pkt->stream_index != vidIdx) {
             av_packet_unref(pkt);
             continue;
@@ -536,6 +683,7 @@ int main(int argc, char **argv)
             frames_shown);
 
     /* Cleanup */
+    audio_cleanup();
     av_freep(&dst_data[0]);
     av_frame_free(&frame);
     av_packet_free(&pkt);

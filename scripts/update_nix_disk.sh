@@ -89,7 +89,7 @@ if [ "${UPDATE_TOOLS}" -eq 1 ]; then
         fi
 
         # Copy brook-player (minimal wl_shm video player)
-        BROOK_PLAYER_STORE="/nix/store/xn7f6dgxm6jriw8irzvplri1jxdayzk1-brook-player-0.1-brook"
+        BROOK_PLAYER_STORE="/nix/store/553l2b8i9cjxdf3i39czp9cy11l0n7aw-brook-player-0.1-brook"
         if [ -x "${BROOK_PLAYER_STORE}/bin/brook-player" ]; then
             ADDED=0
             while IFS= read -r p; do
