@@ -211,6 +211,13 @@ if [ -f "${HOME_DISK}" ]; then
     echo "  Home disk: ${HOME_DISK}"
 fi
 
+DATA_DISK="${BROOK_DATA_DISK:-${ROOT_DIR}/brook_data_disk.img}"
+DATA_DRIVE=""
+if [ -f "${DATA_DISK}" ]; then
+    DATA_DRIVE="-drive if=virtio,format=raw,file=${DATA_DISK},file.locking=off"
+    echo "  Data disk: ${DATA_DISK}"
+fi
+
 # Select boot script: --script <name> copies data/scripts/<name>.rc to INIT.RC
 # on the disk image. Without --script, the existing INIT.RC is used.
 if [ -n "${SCRIPT_NAME}" ]; then
@@ -303,6 +310,7 @@ qemu-system-x86_64 \
     ${EXT2_DRIVE} \
     ${NIX_DRIVE} \
     ${HOME_DRIVE} \
+    ${DATA_DRIVE} \
     -device virtio-tablet-pci \
     -device virtio-rng-pci \
     -device virtio-net-pci,netdev=net0${NIC_MAC_ARG} \
