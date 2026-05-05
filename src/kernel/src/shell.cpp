@@ -129,7 +129,6 @@ const char* const g_defaultEnvp[] = {
     "VDPAU_DRIVER=none",
     "SDL_VIDEODRIVER=wayland",
     "SDL_AUDIODRIVER=alsa",
-    "SDL_RENDER_DRIVER=software",
     "XDG_CACHE_HOME=/tmp/cache",
     "XDG_CONFIG_HOME=/tmp/config",
     "XDG_DATA_HOME=/tmp/share",
