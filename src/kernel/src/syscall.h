@@ -170,6 +170,7 @@ static constexpr uint64_t SYS_RECVFROM        = 45;
 static constexpr uint64_t SYS_SENDMSG         = 46;
 static constexpr uint64_t SYS_RECVMSG         = 47;
 static constexpr uint64_t SYS_SENDMMSG        = 307;
+static constexpr uint64_t SYS_RECVMMSG        = 299;
 static constexpr uint64_t SYS_SHUTDOWN        = 48;
 static constexpr uint64_t SYS_BIND            = 49;
 static constexpr uint64_t SYS_LISTEN          = 50;

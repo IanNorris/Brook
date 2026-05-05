@@ -10689,6 +10689,35 @@ static int64_t sys_sendmmsg(uint64_t fdVal, uint64_t msgvecVal, uint64_t vlenVal
     return static_cast<int64_t>(sent);
 }
 
+// recvmmsg(2) — receive multiple messages in one syscall.
+// Signature: int recvmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen,
+//                         int flags, struct timespec *timeout);
+// We ignore the timeout parameter for now (treat as non-blocking batch).
+static int64_t sys_recvmmsg(uint64_t fdVal, uint64_t msgvecVal, uint64_t vlenVal,
+                             uint64_t flagsVal, uint64_t timeoutVal, uint64_t)
+{
+    (void)timeoutVal; // timeout not implemented
+    if (vlenVal == 0) return 0;
+    if (vlenVal > 1024) vlenVal = 1024;
+    if (!UserBufferWritable(msgvecVal, vlenVal * sizeof(LinuxMMsgHdr)))
+        return -EFAULT;
+
+    auto* vec = reinterpret_cast<LinuxMMsgHdr*>(msgvecVal);
+    uint64_t received = 0;
+    for (uint64_t i = 0; i < vlenVal; i++) {
+        // After the first message, use MSG_DONTWAIT to avoid blocking
+        uint64_t flags = flagsVal;
+        if (i > 0) flags |= 0x40; // MSG_DONTWAIT
+        int64_t ret = sys_recvmsg(fdVal, reinterpret_cast<uint64_t>(&vec[i].msg_hdr),
+                                  flags, 0, 0, 0);
+        if (ret < 0)
+            return received ? static_cast<int64_t>(received) : ret;
+        vec[i].msg_len = static_cast<uint32_t>(ret);
+        received++;
+    }
+    return static_cast<int64_t>(received);
+}
+
 // Lives in its own page (.syscall_table) so we can mark it read-only
 // after init. See VmmKernelMarkReadOnly + linker.ld.
 static SyscallFn g_syscallTable[SYSCALL_MAX]
@@ -10873,6 +10902,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_SENDMSG]         = sys_sendmsg;
     g_syscallTable[SYS_RECVMSG]         = sys_recvmsg;
     g_syscallTable[SYS_SENDMMSG]        = sys_sendmmsg;
+    g_syscallTable[SYS_RECVMMSG]        = sys_recvmmsg;
     g_syscallTable[SYS_SHUTDOWN]        = sys_shutdown;
     g_syscallTable[SYS_BIND]            = sys_bind;
     g_syscallTable[SYS_LISTEN]          = sys_listen;
@@ -11016,7 +11046,7 @@ static const char* SyscallName(uint64_t num)
     case 270: return "pselect6";  case 271: return "ppoll";     case 273: return "set_robust_list";
     case 292: return "dup3";
     case 290: return "eventfd2";  case 293: return "pipe2";     case 302: return "prlimit64";
-    case 307: return "sendmmsg";
+    case 299: return "recvmmsg";  case 307: return "sendmmsg";
     case 318: return "getrandom"; case 334: return "rseq";
     case 439: return "faccessat2";
     case 73: return "flock";      case 76: return "truncate";
