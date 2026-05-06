@@ -153,6 +153,21 @@ if [ ! -L "${MNTDIR}/sh" ]; then
     ln -s bin/busybox "${MNTDIR}/sh" 2>/dev/null && echo "  → sh -> bin/busybox (symlink)" || true
 fi
 
+# Busybox applet symlinks
+if [ -f "${MNTDIR}/bin/busybox" ]; then
+    APPLETS="ls cat cp mv rm mkdir rmdir ln chmod chown stat du df mount umount \
+             echo printf test expr head tail wc sort uniq cut tr sed grep awk \
+             find xargs touch date sleep kill ps top env id uname basename dirname \
+             tar gzip gunzip bzip2 bunzip2 unzip md5sum sha256sum dd \
+             less more clear reset tee"
+    for app in $APPLETS; do
+        if [ ! -e "${MNTDIR}/bin/${app}" ]; then
+            ln -s busybox "${MNTDIR}/bin/${app}" 2>/dev/null
+        fi
+    done
+    echo "  → busybox applet symlinks created"
+fi
+
 echo "Unmounting..."
 # Explicit sync before unmount to ensure all writes are flushed
 sync
