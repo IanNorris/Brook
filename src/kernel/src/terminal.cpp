@@ -908,12 +908,23 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     stdFds[2].handle = stdoutPipe;
     stdFds[2].refCount = 1;
 
-    // Load bash ELF
+    // Load bash ELF — try multiple known paths
     VnodeStat st;
-    const char* bashPath = "/boot/BIN/BASH";
-    if (VfsStatPath(bashPath, &st) != 0)
+    const char* bashPaths[] = {
+        "/boot/BIN/BASH", "/boot/BIN/bash", "/boot/bin/bash", "/bin/bash"
+    };
+    const char* bashPath = nullptr;
+    for (int i = 0; i < 4; i++)
     {
-        SerialPrintf("TERMINAL: bash not found at %s\n", bashPath);
+        if (VfsStatPath(bashPaths[i], &st) == 0)
+        {
+            bashPath = bashPaths[i];
+            break;
+        }
+    }
+    if (!bashPath)
+    {
+        SerialPrintf("TERMINAL: bash not found at any known path\n");
         PipeBufferDestroy(stdinPipe);
         PipeBufferDestroy(stdoutPipe);
         kfree(t->vfb);

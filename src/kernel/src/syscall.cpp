@@ -4197,18 +4197,24 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
         if (useBusybox)
         {
             VnodeStat st;
-            if (VfsStatPath("/boot/BIN/BUSYBOX", &st) == 0 && !st.isDir)
+            static const char* busyboxPaths[] = {
+                "/boot/BIN/busybox", "/boot/BIN/BUSYBOX",
+                "/boot/bin/busybox", "/bin/busybox"
+            };
+            for (int i = 0; i < 4; i++)
             {
-                const char* bbPath = "/boot/BIN/BUSYBOX";
-                uint32_t k = 0;
-                while (bbPath[k]) { resolvedPath[k] = bbPath[k]; k++; }
-                resolvedPath[k] = '\0';
-                lookupPath = resolvedPath;
-                found = true;
-                busyboxFallback = true;
-                DbgPrintf("sys_execve: busybox fallback for '%s'\n", kPath);
-                DbgPrintf("sys_execve: busybox fallback — original='%s' resolved='%s'\n",
-                             kPath, lookupPath);
+                if (VfsStatPath(busyboxPaths[i], &st) == 0 && !st.isDir)
+                {
+                    uint32_t k = 0;
+                    const char* p = busyboxPaths[i];
+                    while (p[k]) { resolvedPath[k] = p[k]; k++; }
+                    resolvedPath[k] = '\0';
+                    lookupPath = resolvedPath;
+                    found = true;
+                    busyboxFallback = true;
+                    DbgPrintf("sys_execve: busybox fallback for '%s'\n", kPath);
+                    break;
+                }
             }
         }
     }
@@ -5559,7 +5565,16 @@ static bool BusyboxStatFallback(const char* path, VnodeStat* vs)
     }
     if (!isBinPath) return false;
 
-    return VfsStatPath("/boot/BIN/BUSYBOX", vs) == 0;
+    static const char* busyboxPaths[] = {
+        "/boot/BIN/busybox", "/boot/BIN/BUSYBOX",
+        "/boot/bin/busybox", "/bin/busybox"
+    };
+    for (int i = 0; i < 4; i++)
+    {
+        if (VfsStatPath(busyboxPaths[i], vs) == 0)
+            return true;
+    }
+    return false;
 }
 
 // Internal stat helper — takes a kernel-space path directly (no user copy).
