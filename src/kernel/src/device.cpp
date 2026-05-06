@@ -5,8 +5,20 @@ namespace brook {
 
 // ---- Registry storage ----
 
+static constexpr uint32_t DEVICE_CANARY = 0xDE41CE42;
+static uint32_t g_deviceCanaryPre = DEVICE_CANARY;
 static Device* g_devices[DEVICE_MAX];
 static uint32_t g_deviceCount = 0;
+static uint32_t g_deviceCanaryPost = DEVICE_CANARY;
+
+uint32_t DeviceCountRaw() { return g_deviceCount; }
+
+bool DeviceRegistryCorrupted()
+{
+    return g_deviceCanaryPre != DEVICE_CANARY ||
+           g_deviceCanaryPost != DEVICE_CANARY ||
+           g_deviceCount > DEVICE_MAX;
+}
 
 // ---- String helpers (no libc) ----
 
@@ -92,6 +104,20 @@ bool DeviceIsRegistered(Device* dev)
             return true;
     }
     return false;
+}
+
+void DeviceDumpRegistry()
+{
+    SerialPrintf("DEV_DUMP: count=%u canaryPre=0x%08x canaryPost=0x%08x\n",
+                 g_deviceCount, g_deviceCanaryPre, g_deviceCanaryPost);
+    for (uint32_t i = 0; i < g_deviceCount && i < 16; ++i)
+    {
+        Device* d = g_devices[i];
+        SerialPrintf("  [%u] %p name='%s' type=%u ops=%p\n",
+                     i, d, d ? d->name : "(null)",
+                     d ? static_cast<unsigned>(d->type) : 0,
+                     d ? d->ops : nullptr);
+    }
 }
 
 void DeviceIterate(DeviceType type, bool (*cb)(Device* dev, void* ctx), void* ctx)

@@ -44,14 +44,18 @@ static bool FatFsDeviceReady(uint8_t pdrv, Device** out)
     {
         static volatile uint32_t warnCount = 0;
         uint32_t n = __atomic_fetch_add(&warnCount, 1, __ATOMIC_RELAXED);
-        if (n < 8 || (n & 0xFF) == 0)
+        if (n == 0)
         {
-            SerialPrintf("FatFS: drive %u invalid dev=%p registered=%u ops=%p read=%p write=%p [#%u]\n",
+            extern uint32_t DeviceCountRaw();
+            extern bool DeviceRegistryCorrupted();
+            extern void DeviceDumpRegistry();
+            bool corrupt = DeviceRegistryCorrupted();
+            uint32_t cnt = DeviceCountRaw();
+            SerialPrintf("FatFS: drive %u FIRST FAILURE dev=%p registered=%u ops=%p devCount=%u corrupt=%u\n",
                          pdrv, dev, registered ? 1u : 0u,
                          (registered && dev) ? dev->ops : nullptr,
-                         ops ? ops->read : nullptr,
-                         ops ? ops->write : nullptr,
-                         n);
+                         cnt, corrupt ? 1u : 0u);
+            DeviceDumpRegistry();
         }
         return false;
     }

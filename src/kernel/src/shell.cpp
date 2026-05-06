@@ -89,7 +89,7 @@ const char* const g_defaultEnvp[] = {
           "/nix/store/xkqd49dmldkqn4xk6dlm640f5blbv6hp-curl-8.18.0-bin/bin:"
           "/nix/store/g6mlwdvpg92rchq352ll7jbi0pz7h43r-xz-5.8.2-bin/bin:"
           "/nix/store/v8sa6r6q037ihghxfbwzjj4p59v2x0pv-bash-5.3p9/bin:"
-          "/boot/BIN:/boot/bin:/usr/bin:/bin",
+          "/boot/BIN:/boot/bin:/data/bin:/usr/bin:/bin",
     "TERM=linux",
     "SHELL=/boot/BIN/BASH",
     "USER=root",
