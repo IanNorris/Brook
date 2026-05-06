@@ -3879,9 +3879,9 @@ static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAd
 
     SchedulerAddProcess(child);
 
-    DbgPrintf("CLONE: parent pid=%u tgid=%u -> child pid=%u tgid=%u flags=0x%lx %s rip=0x%lx rsp=0x%lx\n",
-              parent->pid, parent->tgid, child->pid, child->tgid, flags,
-              (flags & CLONE_THREAD) ? "THREAD" : "FORK", userRip, userRsp);
+    SerialPrintf("CLONE: parent '%s' pid=%u tgid=%u -> child pid=%u tgid=%u flags=0x%lx %s\n",
+              parent->name, parent->pid, parent->tgid, child->pid, child->tgid, flags,
+              (flags & CLONE_THREAD) ? "THREAD" : "FORK");
     return static_cast<int64_t>(child->pid);
 }
 
@@ -4170,6 +4170,8 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
     if (!found)
     {
         DbgPrintf("sys_execve: not found: %s\n", kPath);
+        SerialPrintf("sys_execve: ENOENT path='%s' pid=%u\n", kPath,
+                     ProcessCurrent() ? ProcessCurrent()->pid : 0);
         return -ENOENT;
     }
 
