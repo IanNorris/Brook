@@ -3913,7 +3913,7 @@ static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAd
 
     SchedulerAddProcess(child);
 
-    SerialPrintf("CLONE: parent '%s' pid=%u tgid=%u -> child pid=%u tgid=%u flags=0x%lx %s\n",
+    DbgPrintf("CLONE: parent '%s' pid=%u tgid=%u -> child pid=%u tgid=%u flags=0x%lx %s\n",
               parent->name, parent->pid, parent->tgid, child->pid, child->tgid, flags,
               (flags & CLONE_THREAD) ? "THREAD" : "FORK");
 
@@ -4094,7 +4094,7 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
     char kPath[256];
     if (!CopyUserCString(pathAddr, kPath, sizeof(kPath))) return -EFAULT;
 
-    SerialPrintf("sys_execve: pid=%u path='%s'\n", proc->pid, kPath);
+    DbgPrintf("sys_execve: pid=%u path='%s'\n", proc->pid, kPath);
 
     // Resolve path: try as-is, then /boot/BIN/<UPPER>, then /boot/<UPPER>
     char resolvedPath[256];
@@ -4207,7 +4207,7 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
                 found = true;
                 busyboxFallback = true;
                 DbgPrintf("sys_execve: busybox fallback for '%s'\n", kPath);
-                SerialPrintf("sys_execve: busybox fallback — original='%s' resolved='%s'\n",
+                DbgPrintf("sys_execve: busybox fallback — original='%s' resolved='%s'\n",
                              kPath, lookupPath);
             }
         }
@@ -4330,8 +4330,6 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
     auto* elfBuf = reinterpret_cast<uint8_t*>(bufAddr.raw());
     uint64_t elfSize = 0;
     uint64_t offset = 0;
-    extern volatile uint64_t g_lapicTickCount;
-    uint64_t readStart = g_lapicTickCount;
     while (elfSize < MAX_ELF_SIZE)
     {
         int ret = VfsRead(vn, elfBuf + elfSize, 4096, &offset);
@@ -4339,8 +4337,8 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
         elfSize += static_cast<uint64_t>(ret);
     }
     VfsClose(vn);
-    SerialPrintf("sys_execve: read '%s' %lu bytes in %lu ms (pid %u)\n",
-                 lookupPath, elfSize, g_lapicTickCount - readStart, proc->pid);
+    DbgPrintf("sys_execve: read '%s' %lu bytes (pid %u)\n",
+                 lookupPath, elfSize, proc->pid);
 
     if (elfSize < 64) // Too small to be a valid ELF
     {
@@ -4392,7 +4390,7 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
         // Done reading elfBuf — free it now
         VmmFreePages(bufAddr, ELF_BUF_PAGES);
 
-        SerialPrintf("sys_execve: shebang interp='%s' arg='%s' script='%s'\n",
+        DbgPrintf("sys_execve: shebang interp='%s' arg='%s' script='%s'\n",
                      interpPath, interpArg, lookupPath);
 
         // Build new argv: [interp, interpArg?, script, original_argv[1:]]
@@ -4455,7 +4453,7 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
     }
     proc->name[ni] = '\0';
 
-    SerialPrintf("sys_execve: entering user mode for '%s' pid=%u entry=0x%lx sp=0x%lx\n",
+    DbgPrintf("sys_execve: entering user mode for '%s' pid=%u entry=0x%lx sp=0x%lx\n",
               proc->name, proc->pid, newEntry, newStackPtr);
 
     // Validate that entry point and stack are mapped in the new address space.

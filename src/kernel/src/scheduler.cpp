@@ -367,7 +367,7 @@ static void ForkChildTrampoline()
     DrainPostSwitch(cpu);
 
     Process* proc = g_perCpu[cpu].currentProcess;
-    SerialPrintf("SCHED: fork child '%s' (pid %u) entering user mode rip=0x%lx rsp=0x%lx\n",
+    DbgPrintf("SCHED: fork child '%s' (pid %u) entering user mode rip=0x%lx rsp=0x%lx\n",
                  proc->name, proc->pid, proc->forkReturnRip, proc->forkReturnRsp);
 
     uint64_t userRip = proc->forkReturnRip;
