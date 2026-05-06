@@ -3845,6 +3845,7 @@ static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAd
     static constexpr uint64_t CLONE_PARENT_SETTID   = 0x00100000;
     static constexpr uint64_t CLONE_CHILD_CLEARTID  = 0x00200000;
     static constexpr uint64_t CLONE_VFORK           = 0x00004000;
+    static constexpr uint64_t CLONE_CLEAR_SIGHAND   = 0x100000000ULL;
 
     Process* parent = ProcessCurrent();
     if (!parent) return -ENOSYS;
@@ -3891,6 +3892,24 @@ static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAd
     child->forkRdi = parent->syscallUserRdi;  child->forkRsi = parent->syscallUserRsi;
     child->forkRdx = parent->syscallUserRdx;  child->forkR8  = parent->syscallUserR8;
     child->forkR9  = parent->syscallUserR9;   child->forkR10 = parent->syscallUserR10;
+
+    // CLONE_CLEAR_SIGHAND: reset all signal handlers to SIG_DFL in the child.
+    // Used by Ladybird's WebContent spawn so inherited handlers don't fire
+    // before exec replaces the address space.
+    if ((flags & CLONE_CLEAR_SIGHAND) && !(flags & CLONE_THREAD))
+    {
+        uint32_t childPid = child->pid;
+        if (childPid < MAX_PROCESSES)
+        {
+            for (int s = 0; s < 64; s++)
+            {
+                g_sigHandlers[childPid][s].handler = 0; // SIG_DFL
+                g_sigHandlers[childPid][s].flags = 0;
+                g_sigHandlers[childPid][s].restorer = 0;
+                g_sigHandlers[childPid][s].mask = 0;
+            }
+        }
+    }
 
     SchedulerAddProcess(child);
 
