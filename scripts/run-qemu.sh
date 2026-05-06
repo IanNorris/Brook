@@ -215,7 +215,15 @@ DATA_DISK="${BROOK_DATA_DISK:-${ROOT_DIR}/brook_data_disk.img}"
 DATA_DRIVE=""
 if [ -f "${DATA_DISK}" ]; then
     DATA_DRIVE="-drive if=virtio,format=raw,file=${DATA_DISK},file.locking=off"
-    echo "  Data disk: ${DATA_DISK}"
+    echo "  Data disk: ${DATA_DISK} (image)"
+fi
+
+# Media folder: mount a host directory as a virtual FAT drive (like the ESP).
+# Set BROOK_MEDIA_DIR to a directory path, or use the default ./media/.
+MEDIA_DIR="${BROOK_MEDIA_DIR:-${ROOT_DIR}/media}"
+if [ -d "${MEDIA_DIR}" ] && [ -z "${DATA_DRIVE}" ]; then
+    DATA_DRIVE="-drive if=virtio,format=raw,file=fat:rw:${MEDIA_DIR}"
+    echo "  Media folder: ${MEDIA_DIR} (fat:rw)"
 fi
 
 # Select boot script: --script <name> copies data/scripts/<name>.rc to INIT.RC

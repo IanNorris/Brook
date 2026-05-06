@@ -4100,29 +4100,66 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
         }
     }
 
-    // Busybox fallback: if a bare command is not found, try running busybox
+    // Busybox fallback: if the command is not found, try running busybox
     // with the command name as argv[0]. Busybox reads argv[0] to determine
-    // which applet to run. Do not do this for paths containing '/', because
-    // Linux execve("/missing/path", ...) must return ENOENT.
+    // which applet to run.
+    //
+    // This handles two cases:
+    //   1. Simple commands (no '/') — e.g. "ls"
+    //   2. Full paths under bin directories — e.g. "/boot/BIN/ls"
+    //      (bash resolves these via stat's BusyboxStatFallback, then calls
+    //       execve with the full path)
     bool busyboxFallback = false;
-    bool simpleCommand = true;
-    for (const char* p = kPath; *p; ++p)
-        if (*p == '/') { simpleCommand = false; break; }
-    if (!found && simpleCommand)
+    if (!found)
     {
-        VnodeStat st;
-        if (VfsStatPath("/boot/BIN/BUSYBOX", &st) == 0 && !st.isDir)
+        bool useBusybox = false;
+        bool simpleCommand = true;
+        for (const char* p = kPath; *p; ++p)
+            if (*p == '/') { simpleCommand = false; break; }
+
+        if (simpleCommand)
         {
-            const char* bbPath = "/boot/BIN/BUSYBOX";
-            uint32_t k = 0;
-            while (bbPath[k]) { resolvedPath[k] = bbPath[k]; k++; }
-            resolvedPath[k] = '\0';
-            lookupPath = resolvedPath;
-            found = true;
-            busyboxFallback = true;
-            DbgPrintf("sys_execve: busybox fallback for '%s'\n", kPath);
-            SerialPrintf("sys_execve: busybox fallback — original='%s' resolved='%s'\n",
-                         kPath, lookupPath);
+            useBusybox = true;
+        }
+        else
+        {
+            // Check if path is under a bin-like directory (same as BusyboxStatFallback)
+            const char* binPrefixes[] = {
+                "/boot/BIN/", "/boot/bin/", "/bin/", "/usr/bin/",
+                "/usr/local/bin/", "/sbin/", "/usr/sbin/"
+            };
+            for (int i = 0; i < 7; ++i)
+            {
+                const char* pfx = binPrefixes[i];
+                const char* a = kPath;
+                const char* b = pfx;
+                while (*b && *a == *b) { a++; b++; }
+                if (!*b && *a)
+                {
+                    bool hasSlash = false;
+                    for (const char* c = a; *c; ++c)
+                        if (*c == '/') { hasSlash = true; break; }
+                    if (!hasSlash) { useBusybox = true; break; }
+                }
+            }
+        }
+
+        if (useBusybox)
+        {
+            VnodeStat st;
+            if (VfsStatPath("/boot/BIN/BUSYBOX", &st) == 0 && !st.isDir)
+            {
+                const char* bbPath = "/boot/BIN/BUSYBOX";
+                uint32_t k = 0;
+                while (bbPath[k]) { resolvedPath[k] = bbPath[k]; k++; }
+                resolvedPath[k] = '\0';
+                lookupPath = resolvedPath;
+                found = true;
+                busyboxFallback = true;
+                DbgPrintf("sys_execve: busybox fallback for '%s'\n", kPath);
+                SerialPrintf("sys_execve: busybox fallback — original='%s' resolved='%s'\n",
+                             kPath, lookupPath);
+            }
         }
     }
 
