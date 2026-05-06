@@ -4050,6 +4050,8 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
     char kPath[256];
     if (!CopyUserCString(pathAddr, kPath, sizeof(kPath))) return -EFAULT;
 
+    SerialPrintf("sys_execve: pid=%u path='%s'\n", proc->pid, kPath);
+
     // Resolve path: try as-is, then /boot/BIN/<UPPER>, then /boot/<UPPER>
     char resolvedPath[256];
     bool found = false;
