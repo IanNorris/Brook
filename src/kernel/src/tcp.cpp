@@ -136,6 +136,8 @@ TcpAction TcpProcessSegment(Socket& s,
             s.tcpFinRecv = true;
             act.sendAck = true;
             s.tcpState = TcpState::CloseWait;
+            extern volatile uint64_t g_lapicTickCount;
+            s.tcpCloseWaitTick = g_lapicTickCount;
         }
         break;
 

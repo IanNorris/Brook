@@ -1267,8 +1267,82 @@ int SockCreate(int domain, int type, int protocol)
             return static_cast<int>(i);
         }
     }
-    SerialPrintf("net: socket table full (MAX_SOCKETS=%u) — all slots in use\n", MAX_SOCKETS);
-    return -1; // no free sockets
+    // Diagnostic: count sockets by state to identify leaks
+    uint32_t nEstab = 0, nCloseWait = 0, nFinWait = 0, nSynSent = 0, nOther = 0;
+    uint32_t nUdp = 0;
+    for (uint32_t i = 0; i < MAX_SOCKETS; i++) {
+        if (!g_sockUsed[i]) continue;
+        if (g_sockets[i].type == SOCK_DGRAM) { nUdp++; continue; }
+        switch (g_sockets[i].tcpState) {
+        case TcpState::Established: nEstab++; break;
+        case TcpState::CloseWait:   nCloseWait++; break;
+        case TcpState::FinWait1:
+        case TcpState::FinWait2:    nFinWait++; break;
+        case TcpState::SynSent:     nSynSent++; break;
+        default:                    nOther++; break;
+        }
+    }
+    SerialPrintf("net: socket table full (MAX_SOCKETS=%u) — "
+                 "ESTAB=%u CLOSE_WAIT=%u FIN_WAIT=%u SYN_SENT=%u UDP=%u other=%u\n",
+                 MAX_SOCKETS, nEstab, nCloseWait, nFinWait, nSynSent, nUdp, nOther);
+
+    // Reap stale CloseWait sockets (peer sent FIN >30s ago, app never closed).
+    // This handles the common case where Ladybird's RequestServer holds HTTP
+    // connections that the server has closed but the app hasn't acknowledged.
+    extern volatile uint64_t g_lapicTickCount;
+    static constexpr uint64_t CLOSE_WAIT_TIMEOUT_MS = 30000; // 30 seconds
+    for (uint32_t i = 0; i < MAX_SOCKETS; i++) {
+        if (!g_sockUsed[i]) continue;
+        Socket& s = g_sockets[i];
+        if (s.type != SOCK_STREAM) continue;
+        if (s.tcpState != TcpState::CloseWait) continue;
+        if (s.tcpCloseWaitTick == 0) continue;
+        uint64_t age = g_lapicTickCount - s.tcpCloseWaitTick;
+        if (age >= CLOSE_WAIT_TIMEOUT_MS) {
+            SerialPrintf("net: reaping stale CLOSE_WAIT socket %u (pid=%u, age=%lums)\n",
+                         i, s.ownerPid, age);
+            TcpSendSegment(s, TCP_FIN | TCP_ACK, nullptr, 0, "reap-closewait");
+            if (s.tcpOooBuf) kfree(s.tcpOooBuf);
+            if (s.rxBuf) kfree(s.rxBuf);
+            NetMemset(&g_sockets[i], 0, sizeof(Socket));
+            g_sockUsed[i] = false;
+        }
+    }
+
+    // Retry allocation after reaping
+    for (uint32_t i = 0; i < MAX_SOCKETS; i++) {
+        if (!g_sockUsed[i]) {
+            g_sockUsed[i] = true;
+            NetMemset(&g_sockets[i], 0, sizeof(Socket));
+            g_sockets[i].domain = domain;
+            g_sockets[i].type = type;
+            g_sockets[i].protocol = protocol ? protocol :
+                (type == SOCK_DGRAM ? IPPROTO_UDP : IPPROTO_TCP);
+            g_sockets[i].rxBuf = static_cast<uint8_t*>(kmalloc(Socket::RX_BUF_SIZE));
+            if (!g_sockets[i].rxBuf) {
+                g_sockUsed[i] = false;
+                return -1;
+            }
+            if (type == SOCK_STREAM) {
+                g_sockets[i].tcpOooBuf = static_cast<uint8_t*>(
+                    kmalloc(Socket::TCP_OOO_SLOT_COUNT * Socket::TCP_OOO_SLOT_SIZE));
+                if (!g_sockets[i].tcpOooBuf) {
+                    kfree(g_sockets[i].rxBuf);
+                    g_sockUsed[i] = false;
+                    return -1;
+                }
+            }
+            g_sockets[i].refCount = 1;
+            {
+                Process* self = ProcessCurrent();
+                g_sockets[i].ownerPid = self ? self->tgid : 0;
+            }
+            SerialPrintf("net: socket %u recovered after CLOSE_WAIT reap\n", i);
+            return static_cast<int>(i);
+        }
+    }
+
+    return -1; // truly exhausted
 }
 
 int SockBind(int sockIdx, const SockAddrIn* addr)

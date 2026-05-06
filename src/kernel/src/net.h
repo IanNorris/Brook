@@ -299,6 +299,7 @@ struct Socket {
     uint16_t  tcpSndWnd;   // peer's advertised receive window (host-endian)
     volatile bool tcpFinRecv; // FIN received from peer
     volatile bool tcpRstRecv; // RST received from peer (→ ECONNRESET)
+    uint64_t tcpCloseWaitTick; // tick when socket entered CloseWait (for reaper)
 
     // Listen/accept queue (server-side)
     static constexpr int ACCEPT_QUEUE_MAX = 16;
