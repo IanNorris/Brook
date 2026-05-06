@@ -3628,7 +3628,11 @@ static int64_t sys_arch_prctl(uint64_t code, uint64_t addr, uint64_t,
 static int64_t sys_exit(uint64_t status, uint64_t, uint64_t,
                          uint64_t, uint64_t, uint64_t)
 {
-    SerialPrintf("sys_exit: process exited with status %lu\n", status);
+    {
+        Process* p = ProcessCurrent();
+        SerialPrintf("sys_exit: '%s' (pid %u, tgid %u) exited with status %lu\n",
+                     p ? p->name : "?", p ? p->pid : 0, p ? p->tgid : 0, status);
+    }
 
     // If the thread group leader calls plain sys_exit while sibling threads
     // are still alive, treat it as exit_group. Otherwise the leader's user
