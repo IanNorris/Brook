@@ -129,8 +129,13 @@ int main(int argc, char **argv)
 
     // Write the first decoded frame
     if (samples > 0) {
-        ssize_t w = write(dsp_fd, pcm, (size_t)(samples * channels * sizeof(short)));
-        if (w < 0) { close(dsp_fd); free(mp3_data); return 1; }
+        size_t bytes = (size_t)(samples * channels * sizeof(short));
+        size_t written = 0;
+        while (written < bytes) {
+            ssize_t w = write(dsp_fd, (char*)pcm + written, bytes - written);
+            if (w <= 0) { close(dsp_fd); free(mp3_data); return 1; }
+            written += (size_t)w;
+        }
     }
 
     // Decode and play remaining frames
@@ -149,8 +154,13 @@ int main(int argc, char **argv)
 
         if (samples > 0) {
             size_t bytes = (size_t)(samples * channels * sizeof(short));
-            ssize_t w = write(dsp_fd, pcm, bytes);
-            if (w < 0) break;
+            size_t written = 0;
+            while (written < bytes) {
+                ssize_t w = write(dsp_fd, (char*)pcm + written, bytes - written);
+                if (w <= 0) break;
+                written += (size_t)w;
+            }
+            if (written == 0) break;
             total_samples += (unsigned long)samples;
         }
     }
