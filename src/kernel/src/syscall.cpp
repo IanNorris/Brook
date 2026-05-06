@@ -3650,6 +3650,13 @@ static int64_t sys_exit(uint64_t status, uint64_t, uint64_t,
                                  static_cast<int>(status));
     }
 
+    // Wake vfork parent if child exits without exec
+    if (proc && proc->vforkParent)
+    {
+        SchedulerUnblock(proc->vforkParent);
+        proc->vforkParent = nullptr;
+    }
+
     SchedulerExitCurrentProcess(static_cast<int>(status));
     // never reached
     return 0;
@@ -3671,6 +3678,13 @@ static int64_t sys_exit_group(uint64_t status, uint64_t, uint64_t,
     // and cause use-after-free on shared resources after the leader exits.
     if (proc)
         SchedulerKillThreadGroup(proc->tgid, proc);
+
+    // Wake vfork parent if child exits without exec
+    if (proc && proc->vforkParent)
+    {
+        SchedulerUnblock(proc->vforkParent);
+        proc->vforkParent = nullptr;
+    }
 
     SchedulerExitCurrentProcess(static_cast<int>(status));
     // never reached
@@ -3830,6 +3844,7 @@ static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAd
     static constexpr uint64_t CLONE_SETTLS          = 0x00080000;
     static constexpr uint64_t CLONE_PARENT_SETTID   = 0x00100000;
     static constexpr uint64_t CLONE_CHILD_CLEARTID  = 0x00200000;
+    static constexpr uint64_t CLONE_VFORK           = 0x00004000;
 
     Process* parent = ProcessCurrent();
     if (!parent) return -ENOSYS;
@@ -3882,15 +3897,25 @@ static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAd
     SerialPrintf("CLONE: parent '%s' pid=%u tgid=%u -> child pid=%u tgid=%u flags=0x%lx %s\n",
               parent->name, parent->pid, parent->tgid, child->pid, child->tgid, flags,
               (flags & CLONE_THREAD) ? "THREAD" : "FORK");
+
+    // CLONE_VFORK: parent blocks until child calls exec or exit.
+    if ((flags & CLONE_VFORK) && !(flags & CLONE_THREAD))
+    {
+        child->vforkParent = parent;
+        SchedulerBlock(parent);
+        // Parent resumes here after child exec/exit wakes us
+    }
+
     return static_cast<int64_t>(child->pid);
 }
 
 static int64_t sys_vfork(uint64_t, uint64_t, uint64_t,
                           uint64_t, uint64_t, uint64_t)
 {
-    // vfork is like fork but parent blocks until child exec/exit.
-    // For now, implement as plain fork (parent doesn't block).
-    return sys_fork(0, 0, 0, 0, 0, 0);
+    // vfork: fork + parent blocks until child exec/exit.
+    // Implemented via CLONE_VFORK in sys_clone.
+    static constexpr uint64_t CLONE_VFORK = 0x00004000;
+    return sys_clone(CLONE_VFORK, 0, 0, 0, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -4444,6 +4469,13 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
                 "r"(static_cast<uint32_t>(hi))
             : "ecx", "eax", "edx"
         );
+    }
+
+    // Wake vfork parent — exec is complete, parent can resume
+    if (proc->vforkParent)
+    {
+        SchedulerUnblock(proc->vforkParent);
+        proc->vforkParent = nullptr;
     }
 
     // Enter user mode — this does NOT return

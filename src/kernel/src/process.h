@@ -290,6 +290,7 @@ struct Process
     Process* threadLeader;       // Points to the thread group leader (self if leader)
     uint64_t clearChildTid;      // User address to write 0 + futex_wake on exit (set_tid_address / CLONE_CHILD_CLEARTID)
     uint64_t parentSetTid;       // User address where parent's clone() stores child TID (CLONE_PARENT_SETTID)
+    Process* vforkParent;        // If non-null, wake this process when we exec/exit (CLONE_VFORK)
 
     // Crash-dump hook: when set, an unhandled synchronous fault in this
     // process is redirected to a user-mode writer thread entered at this VA.
