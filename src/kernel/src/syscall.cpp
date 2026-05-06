@@ -4286,6 +4286,8 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
     auto* elfBuf = reinterpret_cast<uint8_t*>(bufAddr.raw());
     uint64_t elfSize = 0;
     uint64_t offset = 0;
+    extern volatile uint64_t g_lapicTickCount;
+    uint64_t readStart = g_lapicTickCount;
     while (elfSize < MAX_ELF_SIZE)
     {
         int ret = VfsRead(vn, elfBuf + elfSize, 4096, &offset);
@@ -4293,6 +4295,8 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
         elfSize += static_cast<uint64_t>(ret);
     }
     VfsClose(vn);
+    SerialPrintf("sys_execve: read '%s' %lu bytes in %lu ms (pid %u)\n",
+                 lookupPath, elfSize, g_lapicTickCount - readStart, proc->pid);
 
     if (elfSize < 64) // Too small to be a valid ELF
     {
@@ -4407,8 +4411,8 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
     }
     proc->name[ni] = '\0';
 
-    DbgPrintf("sys_execve: entering user mode for '%s' entry=0x%lx sp=0x%lx\n",
-              proc->name, newEntry, newStackPtr);
+    SerialPrintf("sys_execve: entering user mode for '%s' pid=%u entry=0x%lx sp=0x%lx\n",
+              proc->name, proc->pid, newEntry, newStackPtr);
 
     // Validate that entry point and stack are mapped in the new address space.
     {
