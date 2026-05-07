@@ -1,0 +1,3 @@
+# title: Text Editor
+# desc: Simple text editor - open, edit, save
+source /boot/SCRIPTS/wayland_edit.rc

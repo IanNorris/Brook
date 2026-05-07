@@ -180,6 +180,30 @@ if [ "${UPDATE_TOOLS}" -eq 1 ]; then
                 break
             done
         fi
+        # Copy brook-edit (text editor) — build fresh or find in store
+        BROOK_EDIT_OUT=""
+        if command -v nix-build &>/dev/null; then
+            BROOK_EDIT_OUT=$(nix-build "${ROOT_DIR}/tools/brook-edit-pkg" --no-out-link 2>/dev/null)
+        fi
+        if [ -n "$BROOK_EDIT_OUT" ] && [ -x "${BROOK_EDIT_OUT}/bin/brook-edit" ]; then
+            while IFS= read -r p; do
+                [ -n "$p" ] || continue
+                base=$(basename "$p")
+                dst="${MNTDIR}/store/${base}"
+                if [ ! -e "$dst" ]; then
+                    cp -a --no-preserve=links "$p" "$dst"
+                fi
+            done < <(nix-store -qR "$BROOK_EDIT_OUT")
+            cp "${BROOK_EDIT_OUT}/bin/brook-edit" "${MNTDIR}/bin/brook-edit"
+            echo "  brook-edit -> /nix/bin/brook-edit"
+        else
+            for d in "${MNTDIR}"/store/*-brook-edit-brook-*; do
+                [ -x "$d/bin/brook-edit" ] || continue
+                cp "$d/bin/brook-edit" "${MNTDIR}/bin/brook-edit"
+                echo "  brook-edit -> /nix/bin/brook-edit"
+                break
+            done
+        fi
         for d in "${MNTDIR}"/store/*-gimp-*; do
             [ -x "$d/bin/gimp" ] || continue
             ln -sf "../store/$(basename "$d")/bin/gimp" "${MNTDIR}/bin/gimp"
