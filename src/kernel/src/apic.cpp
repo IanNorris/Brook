@@ -5,6 +5,9 @@
 #include "serial.h"
 #include "portio.h"
 
+// Declared at global scope in idt.cpp
+void IdtInstallHandler(uint8_t vector, void* handler);
+
 namespace brook {
 
 // ---------------------------------------------------------------------------
@@ -539,6 +542,87 @@ void ApicBroadcastNmi()
 
     // Shorthand = 11 (all excluding self), delivery mode = NMI
     LapicWrite(LapicReg::ICR_LO, (0x3 << 18) | (0x4 << 8) | (1u << 14));
+}
+
+// ---------------------------------------------------------------------------
+// Reschedule IPI — kicks idle CPUs into running the scheduler
+// ---------------------------------------------------------------------------
+
+// The handler needs the same naked ISR treatment as the timer handler
+// because SchedulerTimerTick can context-switch, which requires all GPRs
+// saved and swapgs handled properly.
+static void ReschedIpiHandlerInner()
+{
+    LapicWrite(LapicReg::EOI, 0);
+    SchedulerTimerTick(true);
+}
+
+__attribute__((naked))
+static void ReschedIpiHandler(void)
+{
+    __asm__ volatile(
+        "testq $3, 8(%%rsp)\n\t"
+        "jz 1f\n\t"
+        "swapgs\n\t"
+        "1:\n\t"
+        "push %%rax\n\t"
+        "push %%rbx\n\t"
+        "push %%rcx\n\t"
+        "push %%rdx\n\t"
+        "push %%rsi\n\t"
+        "push %%rdi\n\t"
+        "push %%rbp\n\t"
+        "push %%r8\n\t"
+        "push %%r9\n\t"
+        "push %%r10\n\t"
+        "push %%r11\n\t"
+        "push %%r12\n\t"
+        "push %%r13\n\t"
+        "push %%r14\n\t"
+        "push %%r15\n\t"
+        "cld\n\t"
+        "call %P0\n\t"
+        "pop %%r15\n\t"
+        "pop %%r14\n\t"
+        "pop %%r13\n\t"
+        "pop %%r12\n\t"
+        "pop %%r11\n\t"
+        "pop %%r10\n\t"
+        "pop %%r9\n\t"
+        "pop %%r8\n\t"
+        "pop %%rbp\n\t"
+        "pop %%rdi\n\t"
+        "pop %%rsi\n\t"
+        "pop %%rdx\n\t"
+        "pop %%rcx\n\t"
+        "pop %%rbx\n\t"
+        "pop %%rax\n\t"
+        "testq $3, 8(%%rsp)\n\t"
+        "jz 2f\n\t"
+        "swapgs\n\t"
+        "2:\n\t"
+        "iretq\n\t"
+        :
+        : "i"(ReschedIpiHandlerInner)
+        : "memory"
+    );
+}
+
+void ApicSendRescheduleIpi(uint8_t targetApicId)
+{
+    // Wait for previous IPI to be delivered
+    while (LapicRead(LapicReg::ICR_LO) & (1u << 12))
+        __asm__ volatile("pause");
+
+    LapicWrite(LapicReg::ICR_HI, static_cast<uint32_t>(targetApicId) << 24);
+    // Delivery mode = fixed (0), level assert, vector = LAPIC_RESCHED_VECTOR
+    LapicWrite(LapicReg::ICR_LO, LAPIC_RESCHED_VECTOR | (1u << 14));
+}
+
+void ApicInitReschedIpi()
+{
+    ::IdtInstallHandler(LAPIC_RESCHED_VECTOR,
+                        reinterpret_cast<void*>(ReschedIpiHandler));
 }
 
 // ---------------------------------------------------------------------------

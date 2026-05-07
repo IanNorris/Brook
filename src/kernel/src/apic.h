@@ -96,4 +96,15 @@ void ApicSendNmi(uint8_t targetApicId);
 // Broadcast NMI to all CPUs except self (for panic halt).
 void ApicBroadcastNmi();
 
+// Reschedule IPI vector — a fixed-delivery IPI used to kick idle CPUs into
+// running the scheduler immediately rather than waiting for the next LAPIC
+// timer tick.
+static constexpr uint8_t LAPIC_RESCHED_VECTOR = 0xFE;
+
+// Send a reschedule IPI to the specified CPU (by LAPIC ID).
+void ApicSendRescheduleIpi(uint8_t targetApicId);
+
+// Register the reschedule IPI handler in the IDT. Called once during init.
+void ApicInitReschedIpi();
+
 } // namespace brook

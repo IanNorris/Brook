@@ -3,6 +3,7 @@
 #include "panic.h"
 #include "cpu.h"
 #include "smp.h"
+#include "apic.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "memory/heap.h"
@@ -76,6 +77,32 @@ struct PerCpuSchedState {
 };
 
 static PerCpuSchedState g_perCpu[SCHED_MAX_CPUS] = {};
+
+// ---------------------------------------------------------------------------
+// Reschedule IPI — kick an idle CPU to pick up a newly-enqueued process
+// ---------------------------------------------------------------------------
+
+static void KickIdleCpu()
+{
+    uint32_t cpuCount = brook::SmpGetCpuCount();
+    if (cpuCount <= 1) return;
+
+    uint32_t self = brook::SmpCurrentCpuIndex();
+
+    // Find a CPU running its idle process and send it a reschedule IPI.
+    // Skip self — the caller will pick up work via its own timer tick.
+    for (uint32_t i = 0; i < cpuCount; ++i) {
+        if (i == self) continue;
+        Process* cur = g_perCpu[i].currentProcess;
+        if (cur && cur == g_perCpu[i].idleProcess) {
+            const brook::CpuInfo* ci = brook::SmpGetCpu(i);
+            if (ci && ci->online) {
+                brook::ApicSendRescheduleIpi(ci->apicId);
+                return;
+            }
+        }
+    }
+}
 
 // Helpers
 static inline uint32_t ThisCpu() { return SmpCurrentCpuIndex(); }
@@ -505,6 +532,8 @@ void SchedulerAddProcess(Process* proc)
 
     DbgPrintf("SCHED: added '%s' (pid %u) to ready queue\n",
                  proc->name, proc->pid);
+
+    KickIdleCpu();
 }
 
 void SchedulerRemoveProcess(Process* proc)
@@ -648,6 +677,8 @@ void SchedulerUnblock(Process* proc)
     __atomic_store_n(&proc->pendingWakeup, 0, __ATOMIC_RELEASE);
     ReadyQueueInsertLocked(proc);
     SchedLockRelease(g_readyLock, rlf4);
+
+    KickIdleCpu();
 }
 
 uint32_t SchedulerReadyCount()
