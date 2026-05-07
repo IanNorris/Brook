@@ -1,0 +1,3 @@
+# title: Files
+# desc: Browse files and directories
+source /boot/SCRIPTS/wayland_files.rc
