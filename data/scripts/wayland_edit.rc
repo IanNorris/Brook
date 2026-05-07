@@ -1,5 +1,5 @@
 # Brook Wayland text editor.
 set wm
 set vfb none
-run /nix/bin/waylandd --seconds 60
-run /nix/bin/brook-edit 50
+run --once /nix/bin/waylandd
+run /nix/bin/brook-edit

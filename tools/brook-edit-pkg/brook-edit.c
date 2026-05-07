@@ -779,7 +779,13 @@ int main(int argc, char *argv[]) {
         strncpy(g_filename, argv[1], sizeof(g_filename) - 1);
     }
 
-    struct wl_display *dpy = wl_display_connect(NULL);
+    struct wl_display *dpy = NULL;
+    /* Retry connection — waylandd may not have bound the socket yet */
+    for (int attempt = 0; attempt < 20; attempt++) {
+        dpy = wl_display_connect(NULL);
+        if (dpy) break;
+        usleep(100000); /* 100ms */
+    }
     if (!dpy) { fprintf(stderr, "wl_display_connect failed\n"); return 1; }
 
     struct wl_registry *reg = wl_display_get_registry(dpy);

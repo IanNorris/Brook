@@ -890,7 +890,13 @@ int main(int argc, char *argv[]) {
     const char *start_dir = "/";
     if (argc > 1) start_dir = argv[1];
 
-    struct wl_display *dpy = wl_display_connect(NULL);
+    struct wl_display *dpy = NULL;
+    /* Retry connection — waylandd may not have bound the socket yet */
+    for (int attempt = 0; attempt < 20; attempt++) {
+        dpy = wl_display_connect(NULL);
+        if (dpy) break;
+        usleep(100000); /* 100ms */
+    }
     if (!dpy) { fprintf(stderr, "wl_display_connect failed\n"); return 1; }
 
     struct wl_registry *reg = wl_display_get_registry(dpy);
