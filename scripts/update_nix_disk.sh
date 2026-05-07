@@ -204,7 +204,6 @@ if [ "${UPDATE_TOOLS}" -eq 1 ]; then
                 break
             done
         fi
-        for d in "${MNTDIR}"/store/*-gimp-*; do
 
         # Copy brook-console (kernel console viewer) — build fresh or find in store
         BROOK_CONSOLE_OUT=""
