@@ -1546,7 +1546,10 @@ void WmInputPush(Window* win, const InputEvent& ev, int16_t localX, int16_t loca
     uint32_t head = __atomic_load_n(&win->inputHead, __ATOMIC_ACQUIRE);
     uint32_t tail = __atomic_load_n(&win->inputTail, __ATOMIC_ACQUIRE);
     uint32_t next = (head + 1) % Window::WM_INPUT_QUEUE;
-    if (next == tail) return;  // full — drop
+    if (next == tail) {
+        SerialPrintf("WmInputPush: queue FULL wm=%u type=%d\n", win->wmId, (int)ev.type);
+        return;
+    }
     Window::WmInputEvent& slot = win->inputQueue[head];
     slot.type      = static_cast<uint8_t>(ev.type);
     slot.scanCode  = ev.scanCode;

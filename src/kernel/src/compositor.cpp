@@ -971,10 +971,6 @@ static void CompositorLoopWM()
         if (ev.type == InputEventType::MouseButtonDown && ev.scanCode == 0)
         {
             g_wmBtnLatch = true;
-            // Also route LMB to the window under the cursor so Wayland
-            // apps can see it.  WM drag/resize uses the latch above; this
-            // forwards to the app's input queue if the click lands inside
-            // a client area.
             int32_t mx = 0, my = 0;
             MouseGetPosition(&mx, &my);
             WmHitResult hit = WmHitTest(mx, my);

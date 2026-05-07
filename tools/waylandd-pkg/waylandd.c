@@ -1251,6 +1251,7 @@ static void seat_get_keyboard(struct wl_client *c, struct wl_resource *r, uint32
                                 kfd, (uint32_t)kmsize);
         close(kfd);
     } else {
+        fprintf(stderr, "[waylandd] keyboard keymap FAILED, sending no_keymap\n");
         wl_keyboard_send_keymap(k, WL_KEYBOARD_KEYMAP_FORMAT_NO_KEYMAP, -1, 0);
     }
     if (wl_resource_get_version(k) >= 4)
