@@ -1,0 +1,2 @@
+# Single Ladybird test with strace for debugging
+run --strace /nix/store/vhgw630gzklyph73lzajvazczbz4vhx5-ladybird-tests-0-unstable-2026-05-04/bin/TestLibCoreStream

@@ -1,0 +1,22 @@
+# Brook OS — run Ladybird test suite
+# Tests exercise LibCore, LibDNS, LibTLS, LibIPC, LibThreading
+# against the Brook syscall layer without needing the full browser.
+
+# Set working directory to where test data lives (tests open ./long_lines.txt etc.)
+cd /nix/store/vhgw630gzklyph73lzajvazczbz4vhx5-ladybird-tests-0-unstable-2026-05-04/data
+
+# Core tests (no network needed)
+run /nix/store/vhgw630gzklyph73lzajvazczbz4vhx5-ladybird-tests-0-unstable-2026-05-04/bin/TestLibCoreAnonymousBuffer
+run /nix/store/vhgw630gzklyph73lzajvazczbz4vhx5-ladybird-tests-0-unstable-2026-05-04/bin/TestLibCoreMappedFile
+run /nix/store/vhgw630gzklyph73lzajvazczbz4vhx5-ladybird-tests-0-unstable-2026-05-04/bin/TestLibCoreStream
+run /nix/store/vhgw630gzklyph73lzajvazczbz4vhx5-ladybird-tests-0-unstable-2026-05-04/bin/TestLibCoreEventLoop
+run /nix/store/vhgw630gzklyph73lzajvazczbz4vhx5-ladybird-tests-0-unstable-2026-05-04/bin/TestThread
+run /nix/store/vhgw630gzklyph73lzajvazczbz4vhx5-ladybird-tests-0-unstable-2026-05-04/bin/TestTransportSocket
+
+# Filesystem tests (needs inotify)
+run /nix/store/vhgw630gzklyph73lzajvazczbz4vhx5-ladybird-tests-0-unstable-2026-05-04/bin/TestLibCoreFileWatcher
+
+# Network tests (need UDP/TCP/TLS)
+run /nix/store/vhgw630gzklyph73lzajvazczbz4vhx5-ladybird-tests-0-unstable-2026-05-04/bin/TestTLSCertificateParser
+run /nix/store/vhgw630gzklyph73lzajvazczbz4vhx5-ladybird-tests-0-unstable-2026-05-04/bin/TestDNSResolver
+run /nix/store/vhgw630gzklyph73lzajvazczbz4vhx5-ladybird-tests-0-unstable-2026-05-04/bin/TestTLSHandshake
