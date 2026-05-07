@@ -70,3 +70,4 @@ doomgeneric_brook/doomgeneric.map
 profile*.txt\nprofile*.json\nprofile*.folded
 brook_disk.img.lock
 result
+media/VIDEOS/

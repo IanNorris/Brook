@@ -416,11 +416,29 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
 
     /* Cursor surface: upload pixels to kernel compositor, don't create a window */
     if (s->is_cursor) {
-        if (w > 0 && h > 0 && w <= 64 && h <= 64) {
+        if (w > 0 && h > 0) {
             wl_shm_buffer_begin_access(shm);
             const uint32_t *pixels = (const uint32_t *)wl_shm_buffer_get_data(shm);
-            wm_set_cursor_image(pixels, (uint32_t)w, (uint32_t)h,
-                                s->cursor_hot_x, s->cursor_hot_y);
+            if (w <= 64 && h <= 64) {
+                wm_set_cursor_image(pixels, (uint32_t)w, (uint32_t)h,
+                                    s->cursor_hot_x, s->cursor_hot_y);
+            } else {
+                /* Downsample to fit 64×64 max with nearest-neighbor */
+                uint32_t dw = (uint32_t)w > 64 ? 64 : (uint32_t)w;
+                uint32_t dh = (uint32_t)h > 64 ? 64 : (uint32_t)h;
+                uint32_t scaled[64*64];
+                int32_t src_stride = stride / 4;
+                for (uint32_t dy = 0; dy < dh; dy++) {
+                    uint32_t sy = dy * (uint32_t)h / dh;
+                    for (uint32_t dx = 0; dx < dw; dx++) {
+                        uint32_t sx = dx * (uint32_t)w / dw;
+                        scaled[dy * dw + dx] = pixels[sy * src_stride + sx];
+                    }
+                }
+                int32_t shx = s->cursor_hot_x * (int32_t)dw / w;
+                int32_t shy = s->cursor_hot_y * (int32_t)dh / h;
+                wm_set_cursor_image(scaled, dw, dh, shx, shy);
+            }
             wl_shm_buffer_end_access(shm);
         }
         wl_buffer_send_release(s->pending_buffer);
@@ -1071,10 +1089,26 @@ static void pointer_set_cursor(struct wl_client *c, struct wl_resource *r,
             if (shm) {
                 int32_t w = wl_shm_buffer_get_width(shm);
                 int32_t h = wl_shm_buffer_get_height(shm);
-                if (w > 0 && h > 0 && w <= 64 && h <= 64) {
+                if (w > 0 && h > 0) {
                     wl_shm_buffer_begin_access(shm);
                     const uint32_t *pixels = (const uint32_t *)wl_shm_buffer_get_data(shm);
-                    wm_set_cursor_image(pixels, (uint32_t)w, (uint32_t)h, hx, hy);
+                    int32_t stride_px = wl_shm_buffer_get_stride(shm) / 4;
+                    if (w <= 64 && h <= 64) {
+                        wm_set_cursor_image(pixels, (uint32_t)w, (uint32_t)h, hx, hy);
+                    } else {
+                        uint32_t dw = (uint32_t)w > 64 ? 64 : (uint32_t)w;
+                        uint32_t dh = (uint32_t)h > 64 ? 64 : (uint32_t)h;
+                        uint32_t scaled[64*64];
+                        for (uint32_t dy = 0; dy < dh; dy++) {
+                            uint32_t sy = dy * (uint32_t)h / dh;
+                            for (uint32_t dx = 0; dx < dw; dx++) {
+                                uint32_t sx = dx * (uint32_t)w / dw;
+                                scaled[dy * dw + dx] = pixels[sy * stride_px + sx];
+                            }
+                        }
+                        wm_set_cursor_image(scaled, dw, dh,
+                                            hx * (int32_t)dw / w, hy * (int32_t)dh / h);
+                    }
                     wl_shm_buffer_end_access(shm);
                 }
             }
@@ -1493,6 +1527,14 @@ static void pointer_enter_if_needed(struct brook_seat_client *sc,
             wl_pointer_send_frame(sc->pointer);
     }
     sc->entered_surface = s;
+    /* When entering a new surface, restore cursor visibility — a previous
+     * client may have hidden it with set_cursor(NULL). Reset the per-client
+     * flag so the cursor reappears with the built-in arrow until the new
+     * client calls set_cursor. */
+    if (s && !sc->cursor_visible) {
+        sc->cursor_visible = 1;
+        wm_set_cursor_image(NULL, 0, 0, 0, 0); /* restore built-in arrow */
+    }
     seat_apply_cursor_visibility(sc);
 }
 

@@ -552,7 +552,16 @@ static bool g_kbdInitialized = false;
 void KbdInit()
 {
     // Flush any stale bytes in the PS/2 output buffer.
-    while (inb(0x64) & 0x01) inb(0x60);
+    // UEFI firmware may leave residual scan codes during the handoff.
+    for (int i = 0; i < 32; i++) {
+        if (!(inb(0x64) & 0x01)) break;
+        inb(0x60);
+    }
+
+    // Clear the legacy ring buffer in case any stale data was pushed
+    // before init (e.g. from early ISR setup or firmware handoff).
+    g_kbdHead = 0;
+    g_kbdTail = 0;
 
     // Register with the generic input subsystem.
     InputRegister(&g_kbdInputDev);

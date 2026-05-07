@@ -230,6 +230,7 @@ static int     g_scroll_y = 0;
 static int     g_running = 1;
 static int     g_needs_redraw = 1;
 static int     g_ctrl_held = 0;
+static int     g_shift_held = 0;
 
 static void line_ensure_cap(Line *l, int need) {
     if (l->cap >= need) return;
@@ -669,22 +670,22 @@ static void on_key(void *data, struct wl_keyboard *kb, uint32_t serial,
                 /* 39-41 */ ";'`"
                 /* 43-50 */ "\\zxcvbnm"
                 /* 51-52 */ ",.";
-            static const struct { int code; char ch; } simple[] = {
-                {2,'1'},{3,'2'},{4,'3'},{5,'4'},{6,'5'},{7,'6'},{8,'7'},
-                {9,'8'},{10,'9'},{11,'0'},{12,'-'},{13,'='},
-                {16,'q'},{17,'w'},{18,'e'},{19,'r'},{20,'t'},{21,'y'},
-                {22,'u'},{23,'i'},{24,'o'},{25,'p'},{26,'['},{27,']'},
-                {30,'a'},{31,'s'},{32,'d'},{33,'f'},{34,'g'},{35,'h'},
-                {36,'j'},{37,'k'},{38,'l'},{39,';'},{40,'\''},{41,'`'},
-                {43,'\\'},{44,'z'},{45,'x'},{46,'c'},{47,'v'},{48,'b'},
-                {49,'n'},{50,'m'},{51,','},{52,'.'},{53,'/'},
-                {57,' '},
-                {0, 0}
+            static const struct { int code; char lower; char upper; } simple[] = {
+                {2,'1','!'},{3,'2','@'},{4,'3','#'},{5,'4','$'},{6,'5','%'},{7,'6','^'},{8,'7','&'},
+                {9,'8','*'},{10,'9','('},{11,'0',')'},{12,'-','_'},{13,'=','+'},
+                {16,'q','Q'},{17,'w','W'},{18,'e','E'},{19,'r','R'},{20,'t','T'},{21,'y','Y'},
+                {22,'u','U'},{23,'i','I'},{24,'o','O'},{25,'p','P'},{26,'[','{'},{27,']','}'},
+                {30,'a','A'},{31,'s','S'},{32,'d','D'},{33,'f','F'},{34,'g','G'},{35,'h','H'},
+                {36,'j','J'},{37,'k','K'},{38,'l','L'},{39,';',':'},{40,'\'','"'},{41,'`','~'},
+                {43,'\\','|'},{44,'z','Z'},{45,'x','X'},{46,'c','C'},{47,'v','V'},{48,'b','B'},
+                {49,'n','N'},{50,'m','M'},{51,',','<'},{52,'.','>'},{53,'/','?'},
+                {57,' ',' '},
+                {0, 0, 0}
             };
             (void)keymap_lower;
             for (int i = 0; simple[i].code; i++) {
                 if ((int)key == simple[i].code) {
-                    insert_char(simple[i].ch);
+                    insert_char(g_shift_held ? simple[i].upper : simple[i].lower);
                     return;
                 }
             }
@@ -710,8 +711,9 @@ static void on_kb_modifiers(void *d, struct wl_keyboard *k, uint32_t s,
                               uint32_t depressed, uint32_t latched,
                               uint32_t locked, uint32_t group) {
     (void)d; (void)k; (void)s; (void)latched; (void)locked; (void)group;
-    /* Track Ctrl state via mods_depressed bit 2 (control) */
-    g_ctrl_held = (depressed & 0x4) ? 1 : 0;
+    /* Track modifier state via mods_depressed bits (Shift=0, Ctrl=2) */
+    g_shift_held = (depressed & 0x1) ? 1 : 0;
+    g_ctrl_held  = (depressed & 0x4) ? 1 : 0;
 }
 static void on_kb_repeat(void *d, struct wl_keyboard *k,
                            int32_t rate, int32_t delay) {
