@@ -4535,13 +4535,19 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
         return -ENOENT;
     }
 
-    // 32 MB accommodates most real binaries, including statically-linked
-    // Go executables which routinely run 10-20 MB.  The buffer is freed
-    // immediately after ELF loading, so it's only a transient cost.
-    constexpr uint64_t MAX_ELF_SIZE = 32 * 1024 * 1024;
-    constexpr uint64_t ELF_BUF_PAGES = MAX_ELF_SIZE / 4096;
+    // Stat the file to get its exact size, then read in one bulk operation.
+    VnodeStat vnSt;
+    uint64_t fileSize = 0;
+    if (VfsStat(vn, &vnSt) == 0 && vnSt.size > 0)
+        fileSize = vnSt.size;
 
-    VirtualAddress bufAddr = VmmAllocPages(ELF_BUF_PAGES,
+    // 32 MB accommodates most real binaries, including statically-linked
+    // Go executables which routinely run 10-20 MB.
+    constexpr uint64_t MAX_ELF_SIZE = 32 * 1024 * 1024;
+    if (fileSize > MAX_ELF_SIZE) fileSize = MAX_ELF_SIZE;
+
+    uint64_t bufPages = fileSize ? (fileSize + 4095) / 4096 : MAX_ELF_SIZE / 4096;
+    VirtualAddress bufAddr = VmmAllocPages(bufPages,
         VMM_WRITABLE, MemTag::Heap, KernelPid);
     if (!bufAddr)
     {
@@ -4552,11 +4558,19 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
     auto* elfBuf = reinterpret_cast<uint8_t*>(bufAddr.raw());
     uint64_t elfSize = 0;
     uint64_t offset = 0;
-    while (elfSize < MAX_ELF_SIZE)
-    {
-        int ret = VfsRead(vn, elfBuf + elfSize, 4096, &offset);
-        if (ret <= 0) break;
-        elfSize += static_cast<uint64_t>(ret);
+
+    if (fileSize > 0) {
+        // Single bulk read — avoids thousands of 4KB VfsRead calls
+        int ret = VfsRead(vn, elfBuf, fileSize, &offset);
+        if (ret > 0) elfSize = static_cast<uint64_t>(ret);
+    } else {
+        // Unknown size (e.g. procfs) — fall back to incremental reads
+        while (elfSize < MAX_ELF_SIZE)
+        {
+            int ret = VfsRead(vn, elfBuf + elfSize, 65536, &offset);
+            if (ret <= 0) break;
+            elfSize += static_cast<uint64_t>(ret);
+        }
     }
     VfsClose(vn);
     DbgPrintf("sys_execve: read '%s' %lu bytes (pid %u)\n",
@@ -4564,7 +4578,7 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
 
     if (elfSize < 64) // Too small to be a valid ELF
     {
-        VmmFreePages(bufAddr, ELF_BUF_PAGES);
+        VmmFreePages(bufAddr, bufPages);
         DbgPrintf("sys_execve: file too small (%lu bytes)\n", elfSize);
         return -ENOEXEC;
     }
@@ -4610,7 +4624,7 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
         interpArg[argLen] = '\0';
 
         // Done reading elfBuf — free it now
-        VmmFreePages(bufAddr, ELF_BUF_PAGES);
+        VmmFreePages(bufAddr, bufPages);
 
         DbgPrintf("sys_execve: shebang interp='%s' arg='%s' script='%s'\n",
                      interpPath, interpArg, lookupPath);
@@ -4647,7 +4661,7 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
                                      &newStackPtr);
 
     // Free ELF buffer
-    VmmFreePages(bufAddr, ELF_BUF_PAGES);
+    VmmFreePages(bufAddr, bufPages);
 
     if (!newEntry)
     {
