@@ -874,6 +874,26 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
                     return true;
                 return false;
             }
+
+            // Speculative batch: map adjacent cached pages to avoid future
+            // faults.  Only look at pages within this VMA that are already
+            // in the page cache — no I/O, no allocation, just PTE installs.
+            static constexpr uint32_t BATCH_AHEAD = 15;
+            uint64_t mapEnd = m.vaddr + m.length;
+            for (uint32_t b = 1; b <= BATCH_AHEAD; ++b) {
+                uint64_t adjVA = pageVA + b * 4096;
+                if (adjVA >= mapEnd) break;
+                if (VmmVirtToPhys(proc->pageTable, VirtualAddress(adjVA)))
+                    continue; // already mapped
+                uint64_t adjFileIdx = filePageIdx + b;
+                PhysicalAddress adjPhys = PageCacheLookup(vn, adjFileIdx);
+                if (!adjPhys) continue;
+                __atomic_fetch_add(&g_profCacheHit, 1, __ATOMIC_RELAXED);
+                if (!VmmMapPage(proc->pageTable, VirtualAddress(adjVA), adjPhys,
+                                VMM_PRESENT | m.vmmFlags, MemTag::User, proc->pid)) {
+                    PmmUnrefPage(adjPhys);
+                }
+            }
             return true;
         }
 
