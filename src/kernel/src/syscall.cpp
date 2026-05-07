@@ -843,7 +843,12 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
 
     for (uint32_t i = 0; i < Process::MAX_FILE_MAPS; i++) {
         auto& m = proc->fileMaps[i];
-        if (m.length == 0 || !m.vnode) continue;
+        if (m.length == 0) continue;
+        // Atomic load: ProcessClearLazyMappings may be clearing this entry on
+        // another CPU (e.g. leader destroying while a child thread faults).
+        Vnode* vn = static_cast<Vnode*>(
+            __atomic_load_n(reinterpret_cast<void**>(&m.vnode), __ATOMIC_ACQUIRE));
+        if (!vn) continue;
         if (pageVA < m.vaddr || pageVA >= m.vaddr + m.length) continue;
 
         if ((errCode & PF_WRITE) && !(m.vmmFlags & VMM_WRITABLE))
@@ -859,7 +864,7 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
         uint64_t filePageIdx = fileOff / 4096;
 
         // Check page cache first (another process may have loaded this page)
-        PhysicalAddress cached = PageCacheLookup(m.vnode, filePageIdx);
+        PhysicalAddress cached = PageCacheLookup(vn, filePageIdx);
         if (cached) {
             __atomic_fetch_add(&g_profCacheHit, 1, __ATOMIC_RELAXED);
             if (!VmmMapPage(proc->pageTable, VirtualAddress(pageVA), cached,
@@ -876,7 +881,7 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
         uint64_t missN = __atomic_fetch_add(&g_profCacheMiss, 1, __ATOMIC_RELAXED);
         if (missN < 20 || (missN % 1000 == 0)) {
             SerialPrintf("[PROFILE] cache_miss #%lu cacheId=%lu page=%lu\n",
-                         missN, m.vnode->cacheId, filePageIdx);
+                         missN, vn->cacheId, filePageIdx);
         }
         PhysicalAddress phys = PmmAllocPage(MemTag::User, proc->pid);
         if (!phys) return false;
@@ -887,7 +892,7 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
         memset(kp, 0, 4096);
 
         uint64_t readOff = fileOff;
-        int got = VfsRead(m.vnode, kp, 4096, &readOff);
+        int got = VfsRead(vn, kp, 4096, &readOff);
         if (got < 0) {
             PmmFreePage(phys);
             return false;
@@ -895,7 +900,7 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
 
         // Insert into cache (cache adopts one ref) and take extra ref for PTE
         PmmRefPage(phys);
-        PageCacheInsert(m.vnode, filePageIdx, phys);
+        PageCacheInsert(vn, filePageIdx, phys);
 
         if (!VmmMapPage(proc->pageTable, VirtualAddress(pageVA), phys,
                         VMM_PRESENT | m.vmmFlags, MemTag::User, proc->pid)) {
@@ -4653,6 +4658,14 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
                           reinterpret_cast<uint64_t>(newArgvPtrs),
                           envpAddr, 0, 0, 0);
     }
+
+    // --- Kill sibling threads before replacing the process image ---
+    // Linux: execve terminates all other threads in the thread group
+    // before the old address space is destroyed.  Without this, sibling
+    // threads may still be executing user code backed by the old page
+    // table / file VMAs, causing use-after-free crashes (BRO-091).
+    if (proc->tgid && proc->pid == proc->tgid)
+        SchedulerKillThreadGroup(proc->tgid, proc);
 
     // --- Replace the process image ---
     uint64_t newStackPtr = 0;

@@ -1495,6 +1495,27 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus)
         SerialPrintf("SCHED: exit_group killing thread pid=%u tgid=%u\n",
                      p->pid, p->tgid);
     }
+
+    // Wait for all sibling threads to stop executing on their CPUs.
+    // Without this, the caller (leader) may proceed to ProcessDestroy
+    // and free the shared page table / fileMaps while sibling threads
+    // are still running and may fault on those shared resources.
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        Process* p = targets[i];
+        uint32_t spin = 0;
+        while (__atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) >= 0)
+        {
+            __asm__ volatile("pause");
+            if (++spin > 100000)
+            {
+                SerialPrintf("SCHED: exit_group waiting for pid=%u to stop (cpu=%d)\n",
+                             p->pid, __atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE));
+                spin = 0;
+            }
+        }
+        __atomic_store_n(&p->reapable, true, __ATOMIC_RELEASE);
+    }
 }
 
 

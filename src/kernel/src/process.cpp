@@ -57,8 +57,16 @@ static void ProcessClearLazyMappings(Process* proc)
     for (uint32_t i = 0; i < Process::MAX_FILE_MAPS; i++) {
         auto& m = proc->fileMaps[i];
         if (m.length == 0) continue;
-        if (m.vnode) VnodeHandleUnref(m.vnode);
-        m.vaddr = 0; m.length = 0; m.offset = 0; m.vmmFlags = 0; m.vnode = nullptr;
+        // Atomically steal the vnode pointer before unreffing. Another CPU
+        // may be in FileMapHandleUserFault reading this entry via
+        // MemoryMapOwner; nulling the pointer first ensures the concurrent
+        // reader sees nullptr (and skips) rather than a dangling pointer
+        // to a freed vnode.
+        Vnode* vn = static_cast<Vnode*>(
+            __atomic_exchange_n(reinterpret_cast<void**>(&m.vnode),
+                                nullptr, __ATOMIC_ACQ_REL));
+        m.vaddr = 0; m.length = 0; m.offset = 0; m.vmmFlags = 0;
+        if (vn) VnodeHandleUnref(vn);
     }
 }
 
