@@ -17,11 +17,17 @@
 #include "rtc.h"
 #include "apic.h"
 #include "vfs.h"
+#include "input.h"
+#include "mouse.h"
 
 // External C functions used by debug channel
 extern "C" void MouseGetPosition(int32_t*, int32_t*);
 extern "C" uint8_t MouseGetButtons();
 extern "C" bool MouseIsAvailable();
+extern "C" void MouseSetPosition(int32_t x, int32_t y);
+extern "C" void MouseSetButtons(uint8_t buttons);
+extern "C" bool InputRegister(brook::InputDevice* dev);
+extern "C" void InputWakeWaiters();
 
 namespace brook {
 
@@ -2648,7 +2654,13 @@ static void DebugChannelThreadFn(void* /*arg*/)
 void DebugChannelInit()
 {
     if (!g_netIf) return;
-    KernelThreadCreate("debug_ch", DebugChannelThreadFn, nullptr, 3);
+    Process* thread = KernelThreadCreate("debug_ch", DebugChannelThreadFn, nullptr, 3);
+    if (!thread) {
+        SerialPuts("debug: failed to create thread\n");
+        return;
+    }
+    SchedulerAddProcess(thread);
+    SerialPrintf("debug: channel thread created pid=%u\n", thread->pid);
 }
 
 void DebugChannelSend(const char* msg)
@@ -2795,6 +2807,12 @@ static void DebugHandleCommand(const char* cmd, uint32_t len)
             "  prof start [ms]  - start profiler (ms=0 or omitted: indefinite)\n"
             "  prof stop        - stop profiler + flush\n"
             "  prof status      - profiler status\n"
+            "\n"
+            "Input injection:\n"
+            "  inject click X Y      - click at absolute coords\n"
+            "  inject move X Y       - move cursor without clicking\n"
+            "  inject key SC [ASCII] - press+release scan code (decimal)\n"
+            "  inject type TEXT      - type ASCII string (auto shift)\n"
             "\n"
         );
     }
@@ -3172,6 +3190,186 @@ static void DebugHandleCommand(const char* cmd, uint32_t len)
             DebugChannelSend("Profiler: RUNNING\n");
         } else {
             DebugChannelSend("Profiler: IDLE\n");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // inject — synthetic input event injection for automated testing
+    // -----------------------------------------------------------------------
+    else if (StrStartsWith(cmd, "inject ")) {
+        const char* sub = cmd + 7;
+
+        // Lazy-init a virtual input device for injected events
+        static InputDevice s_debugInput = {};
+        static InputDeviceOps s_debugOps = { "debug_inject", nullptr };
+        static bool s_debugRegistered = false;
+        if (!s_debugRegistered) {
+            s_debugInput.ops = &s_debugOps;
+            s_debugInput.head = 0;
+            s_debugInput.tail = 0;
+            InputRegister(&s_debugInput);
+            s_debugRegistered = true;
+        }
+
+        // inject click X Y — move mouse and click at absolute coordinates
+        if (StrStartsWith(sub, "click ")) {
+            const char* args = sub + 6;
+            uint32_t x = 0, y = 0;
+            int consumed = ParseUint(args, &x);
+            if (consumed > 0 && args[consumed] == ' ') {
+                ParseUint(args + consumed + 1, &y);
+            }
+            MouseSetPosition(static_cast<int32_t>(x), static_cast<int32_t>(y));
+
+            InputEvent ev = {};
+            ev.type = InputEventType::MouseMove;
+            InputDevicePush(&s_debugInput, ev);
+
+            ev.type = InputEventType::MouseButtonDown;
+            ev.scanCode = 0; // left button
+            InputDevicePush(&s_debugInput, ev);
+            InputWakeWaiters();
+
+            // Schedule button-up after a short delay — push it immediately
+            // (the compositor will process it on the next poll cycle).
+            ev.type = InputEventType::MouseButtonUp;
+            ev.scanCode = 0;
+            InputDevicePush(&s_debugInput, ev);
+            InputWakeWaiters();
+
+            char resp[64];
+            int p = 0;
+            const char* h1 = "inject: click at ";
+            for (int i = 0; h1[i]; i++) resp[p++] = h1[i];
+            p += UintToStr(resp + p, x);
+            resp[p++] = ',';
+            p += UintToStr(resp + p, y);
+            resp[p++] = '\n';
+            SockSend(g_debugSockIdx, resp, static_cast<uint32_t>(p));
+        }
+
+        // inject move X Y — move mouse without clicking
+        else if (StrStartsWith(sub, "move ")) {
+            const char* args = sub + 5;
+            uint32_t x = 0, y = 0;
+            int consumed = ParseUint(args, &x);
+            if (consumed > 0 && args[consumed] == ' ') {
+                ParseUint(args + consumed + 1, &y);
+            }
+            MouseSetPosition(static_cast<int32_t>(x), static_cast<int32_t>(y));
+
+            InputEvent ev = {};
+            ev.type = InputEventType::MouseMove;
+            InputDevicePush(&s_debugInput, ev);
+            InputWakeWaiters();
+
+            DebugChannelSend("inject: moved\n");
+        }
+
+        // inject key SCANCODE [ASCII] — press and release a key
+        // e.g. "inject key 28" for Enter (scan code 0x1C = 28 decimal)
+        else if (StrStartsWith(sub, "key ")) {
+            const char* args = sub + 4;
+            uint32_t sc = 0;
+            int consumed = ParseUint(args, &sc);
+            uint32_t ascii = 0;
+            if (consumed > 0 && args[consumed] == ' ') {
+                ParseUint(args + consumed + 1, &ascii);
+            }
+
+            InputEvent ev = {};
+            ev.type = InputEventType::KeyPress;
+            ev.scanCode = static_cast<uint8_t>(sc);
+            ev.ascii = static_cast<char>(ascii);
+            InputDevicePush(&s_debugInput, ev);
+            InputWakeWaiters();
+
+            ev.type = InputEventType::KeyRelease;
+            InputDevicePush(&s_debugInput, ev);
+            InputWakeWaiters();
+
+            char resp[64];
+            int p = 0;
+            const char* h1 = "inject: key sc=";
+            for (int i = 0; h1[i]; i++) resp[p++] = h1[i];
+            p += UintToStr(resp + p, sc);
+            const char* h2 = " ascii=";
+            for (int i = 0; h2[i]; i++) resp[p++] = h2[i];
+            p += UintToStr(resp + p, ascii);
+            resp[p++] = '\n';
+            SockSend(g_debugSockIdx, resp, static_cast<uint32_t>(p));
+        }
+
+        // inject type TEXT — type a string (ASCII only, auto-maps to scan codes)
+        else if (StrStartsWith(sub, "type ")) {
+            const char* text = sub + 5;
+            // ASCII to scan code set 1 lookup (lowercase only)
+            static const uint8_t asciiToScan[128] = {
+                0,0,0,0,0,0,0,0, 0x0E,0x0F,0x1C,0,0,0x1C,0,0, // \b=0E \t=0F \n=1C \r=1C
+                0,0,0,0,0,0,0,0, 0,0,0,0x01,0,0,0,0,           // Esc=01
+                0x39,0x02,0x28,0x04,0x05,0x06,0x08,0x28,         // space=39 !=02 "=28 #=04 $=05 %=06 &=08 '=28
+                0x0A,0x0B,0x09,0x0D,0x33,0x0C,0x34,0x35,         // (=0A )=0B *=09 +=0D ,=33 -=0C .=34 /=35
+                0x0B,0x02,0x03,0x04,0x05,0x06,0x07,0x08,         // 0-7
+                0x09,0x0A,0x27,0x27,0x33,0x0D,0x34,0x35,         // 8-9 :=27 ;=27 <=33 ==0D >=34 ?=35
+                0x03,0x1E,0x30,0x2E,0x20,0x12,0x21,0x22,         // @=03 A-G
+                0x23,0x17,0x24,0x25,0x26,0x32,0x31,0x18,         // H-O
+                0x19,0x10,0x13,0x1F,0x14,0x16,0x2F,0x11,         // P-W
+                0x2D,0x15,0x2C,0x1A,0x2B,0x1B,0x07,0x0C,         // X-Z [=1A \=2B ]=1B ^=07 _=0C
+                0x29,0x1E,0x30,0x2E,0x20,0x12,0x21,0x22,         // `=29 a-g
+                0x23,0x17,0x24,0x25,0x26,0x32,0x31,0x18,         // h-o
+                0x19,0x10,0x13,0x1F,0x14,0x16,0x2F,0x11,         // p-w
+                0x2D,0x15,0x2C,0x1A,0x2B,0x1B,0x29,0,            // x-z {=1A |=2B }=1B ~=29
+            };
+            bool needsShift[128] = {};
+            // Characters that need shift
+            for (const char* s = "!@#$%^&*()_+{}|:\"<>?~ABCDEFGHIJKLMNOPQRSTUVWXYZ"; *s; s++)
+                needsShift[static_cast<uint8_t>(*s)] = true;
+
+            for (int i = 0; text[i]; i++) {
+                uint8_t ch = static_cast<uint8_t>(text[i]);
+                if (ch >= 128) continue;
+                uint8_t sc = asciiToScan[ch];
+                if (sc == 0 && ch != 0) continue; // unmapped
+
+                if (needsShift[ch]) {
+                    InputEvent shift = {};
+                    shift.type = InputEventType::KeyPress;
+                    shift.scanCode = 0x2A; // left shift
+                    InputDevicePush(&s_debugInput, shift);
+                }
+
+                InputEvent ev = {};
+                ev.type = InputEventType::KeyPress;
+                ev.scanCode = sc;
+                ev.ascii = static_cast<char>(ch);
+                InputDevicePush(&s_debugInput, ev);
+
+                ev.type = InputEventType::KeyRelease;
+                InputDevicePush(&s_debugInput, ev);
+
+                if (needsShift[ch]) {
+                    InputEvent shift = {};
+                    shift.type = InputEventType::KeyRelease;
+                    shift.scanCode = 0x2A;
+                    InputDevicePush(&s_debugInput, shift);
+                }
+            }
+            InputWakeWaiters();
+
+            char resp[64];
+            int p = 0;
+            const char* h1 = "inject: typed ";
+            for (int i = 0; h1[i]; i++) resp[p++] = h1[i];
+            int tlen = 0;
+            while (text[tlen]) tlen++;
+            p += UintToStr(resp + p, static_cast<uint32_t>(tlen));
+            const char* h2 = " chars\n";
+            for (int i = 0; h2[i]; i++) resp[p++] = h2[i];
+            SockSend(g_debugSockIdx, resp, static_cast<uint32_t>(p));
+        }
+
+        else {
+            DebugChannelSend("inject commands: click X Y, move X Y, key SC [ASCII], type TEXT\n");
         }
     }
 
