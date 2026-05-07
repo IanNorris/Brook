@@ -341,6 +341,9 @@ namespace brook {
 static volatile uint64_t g_profOpenCount = 0;
 static volatile uint64_t g_profMmapCount = 0;
 extern volatile uint64_t g_profFaultCount;  // defined in idt.cpp
+static volatile uint64_t g_profCacheHit = 0;
+static volatile uint64_t g_profCacheMiss = 0;
+static volatile uint64_t g_profPreloadPages = 0;
 
 // ---------------------------------------------------------------------------
 // Error codes (Linux)
@@ -693,7 +696,7 @@ struct PageCacheEntry {
     Vnode*          vnode;       // vnode holding a ref (lifecycle only, not used as key)
 };
 
-static constexpr uint32_t PAGE_CACHE_SLOTS = 32768;
+static constexpr uint32_t PAGE_CACHE_SLOTS = 65536;
 static PageCacheEntry g_pageCache[PAGE_CACHE_SLOTS];
 static SpinLock g_pageCacheLock;
 
@@ -818,6 +821,7 @@ static uint32_t PageCachePreload(Vnode* vn, uint64_t startPageIdx,
     }
 
     kfree(readBuf);
+    __atomic_fetch_add(&g_profPreloadPages, totalCached, __ATOMIC_RELAXED);
     return totalCached;
 }
 
@@ -857,6 +861,7 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
         // Check page cache first (another process may have loaded this page)
         PhysicalAddress cached = PageCacheLookup(m.vnode, filePageIdx);
         if (cached) {
+            __atomic_fetch_add(&g_profCacheHit, 1, __ATOMIC_RELAXED);
             if (!VmmMapPage(proc->pageTable, VirtualAddress(pageVA), cached,
                             VMM_PRESENT | m.vmmFlags, MemTag::User, proc->pid)) {
                 PmmUnrefPage(cached);
@@ -868,6 +873,11 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
         }
 
         // Cache miss (or validation failure) — demand-page from disk
+        uint64_t missN = __atomic_fetch_add(&g_profCacheMiss, 1, __ATOMIC_RELAXED);
+        if (missN < 20 || (missN % 1000 == 0)) {
+            SerialPrintf("[PROFILE] cache_miss #%lu cacheId=%lu page=%lu\n",
+                         missN, m.vnode->cacheId, filePageIdx);
+        }
         PhysicalAddress phys = PmmAllocPage(MemTag::User, proc->pid);
         if (!phys) return false;
 
@@ -3351,15 +3361,21 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         }
         if (!tracked) return -ENOMEM;
 
-        // Preload entire file into page cache if ≤1MB.
-        // Converts thousands of individual 4KB page faults into a single
-        // bulk disk read — critical for shared library loading performance.
+        // Preload mapped region into page cache.
+        // For files ≤4MB, preload the entire file. For larger files,
+        // preload just the mapped region. Converts page faults into bulk reads.
         static constexpr uint64_t PRELOAD_THRESHOLD = 4 * 1024 * 1024; // 4MB
+        static constexpr uint32_t MAX_REGION_PRELOAD = 2048;           // 8MB region
         VnodeStat st;
-        if (VfsStat(vn, &st) == 0 && st.size <= PRELOAD_THRESHOLD && st.size > 0) {
+        if (VfsStat(vn, &st) == 0 && st.size > 0) {
             uint64_t startPage = offset / 4096;
             uint32_t mapPages = static_cast<uint32_t>(pages);
-            PageCachePreload(vn, startPage, st.size, mapPages);
+            if (st.size <= PRELOAD_THRESHOLD) {
+                PageCachePreload(vn, startPage, st.size, mapPages);
+            } else if (mapPages <= MAX_REGION_PRELOAD) {
+                // Large file but manageable mapping — preload just the region
+                PageCachePreload(vn, startPage, st.size, mapPages);
+            }
         }
 
         return static_cast<int64_t>(vaddr);
@@ -9377,9 +9393,11 @@ static int64_t sys_brook_wm_set_title(uint64_t wmId, uint64_t titlePtr,
     {
         extern volatile uint64_t g_lapicTickCount;
         SerialPrintf("[PROFILE] set_title t=%lums pid=%u '%s'"
-                     " opens=%lu mmaps=%lu faults=%lu\n",
+                     " opens=%lu mmaps=%lu faults=%lu"
+                     " cache_hit=%lu cache_miss=%lu preloaded=%lu\n",
                      g_lapicTickCount, proc->pid, buf,
-                     g_profOpenCount, g_profMmapCount, g_profFaultCount);
+                     g_profOpenCount, g_profMmapCount, g_profFaultCount,
+                     g_profCacheHit, g_profCacheMiss, g_profPreloadPages);
     }
     brook::WmSetTitleById(proc, static_cast<uint32_t>(wmId), buf);
     return 0;
