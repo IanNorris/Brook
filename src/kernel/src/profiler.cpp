@@ -422,7 +422,10 @@ static void ProfileWriterDrain(ProfileWriter& pw)
         }
         buf.readIdx = ri;
     }
-    ProfileWriterFlush(pw);
+    // Don't force-flush here — let the write buffer fill naturally.
+    // ProfileWriterAppend flushes at 16KB boundaries; forcing a flush
+    // after every drain caused a virtio-blk write every drain cycle
+    // (~16% of a CPU on steady-state workloads like Q2).
 }
 
 // Write PROF_END, flush and close the file.
