@@ -397,6 +397,7 @@ struct EventFdData {
     uint32_t flags;
     volatile uint32_t refCount;
     Process* readerWaiter;
+    Process* epollWaiter;  // process blocked in epoll_wait watching this eventfd
 };
 static constexpr uint32_t EFD_SEMAPHORE = 0x01;
 [[maybe_unused]] static constexpr uint32_t EFD_CLOEXEC = 0x80000;
@@ -1387,9 +1388,12 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
             efd->readerWaiter = nullptr;
             WakeProcess(reader);
         }
-        // Note: eventfd readability may also be observed through epoll, but
-        // EventFdData has no epollWaiter slot yet — covered by the 5ms
-        // safety poll in epoll_wait_impl.
+        // Wake epoll waiter watching this eventfd for readability
+        Process* ew = efd->epollWaiter;
+        if (ew) {
+            efd->epollWaiter = nullptr;
+            WakeProcess(ew);
+        }
         return 8;
     }
 
@@ -7060,6 +7064,7 @@ static int64_t sys_eventfd2(uint64_t initval, uint64_t flagsVal, uint64_t,
     efd->flags = static_cast<uint32_t>(flagsVal);
     efd->refCount = 1;
     efd->readerWaiter = nullptr;
+    efd->epollWaiter = nullptr;
 
     int fd = FdAlloc(proc, FdType::EventFd, efd);
     if (fd < 0) { kfree(efd); return -EMFILE; }
@@ -7328,9 +7333,8 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
     proc->wakeupTick = timeoutTicks;
 
     // Register proc as the epoll waiter on every watched pipe / listen
-    // socket so writers can SchedulerUnblock us directly. For resources
-    // that don't yet have epoll-waiter slots (EventFd, Socket, TimerFd,
-    // Vnode) we fall back to the 50ms safety poll below.
+    // socket / eventfd / timerfd / TCP socket so writers/receivers can
+    // SchedulerUnblock us directly — no more polling needed.
     auto registerWaiters = [&]() {
         for (int i = 0; i < ep->count; i++) {
             int wfd = ep->entries[i].fd;
@@ -7339,6 +7343,13 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
             if (!fde || !fde->handle) continue;
             if (fde->type == FdType::Pipe) {
                 static_cast<PipeBuffer*>(fde->handle)->epollWaiter = proc;
+            } else if (fde->type == FdType::EventFd) {
+                static_cast<EventFdData*>(fde->handle)->epollWaiter = proc;
+            } else if (fde->type == FdType::TimerFd) {
+                static_cast<TimerFdData*>(fde->handle)->waiter = proc;
+            } else if (fde->type == FdType::Socket) {
+                int si = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+                brook::SockSetPollWaiter(si, proc);
             } else if (fde->type == FdType::UnixSocket) {
                 auto* usd = static_cast<UnixSocketData*>(fde->handle);
                 uint32_t events = ep->entries[i].events;
@@ -7363,6 +7374,15 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
             if (fde->type == FdType::Pipe) {
                 auto* pb = static_cast<PipeBuffer*>(fde->handle);
                 if (pb->epollWaiter == proc) pb->epollWaiter = nullptr;
+            } else if (fde->type == FdType::EventFd) {
+                auto* efd = static_cast<EventFdData*>(fde->handle);
+                if (efd->epollWaiter == proc) efd->epollWaiter = nullptr;
+            } else if (fde->type == FdType::TimerFd) {
+                auto* tfd = static_cast<TimerFdData*>(fde->handle);
+                if (tfd->waiter == proc) tfd->waiter = nullptr;
+            } else if (fde->type == FdType::Socket) {
+                int si = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+                brook::SockSetPollWaiter(si, nullptr);
             } else if (fde->type == FdType::UnixSocket) {
                 auto* usd = static_cast<UnixSocketData*>(fde->handle);
                 if (usd->epollWaiter == proc) usd->epollWaiter = nullptr;
@@ -7377,14 +7397,32 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
     while (true) {
         registerWaiters();
 
-        // Safety poll: 50ms for resources without epoll-waiter wiring.
-        // Much longer than the original 5ms stopgap because writers on
-        // Pipe/UnixSocket now wake us directly.
-        uint64_t pollDeadline = g_lapicTickCount + 50;
-        if (pollDeadline < timeoutTicks)
-            proc->wakeupTick = pollDeadline;
-        else
-            proc->wakeupTick = timeoutTicks;
+        // Compute the earliest wakeup needed:
+        // 1. TimerFd expiry deadlines (wake precisely when timer fires)
+        // 2. User-specified timeout
+        // All fd types now have direct wake wiring, so the safety poll is
+        // only needed as a fallback for edge cases (e.g. closed fd race).
+        uint64_t now = g_lapicTickCount;
+        uint64_t wakeAt = timeoutTicks;
+
+        for (int i = 0; i < ep->count; i++) {
+            int wfd = ep->entries[i].fd;
+            if (wfd < 0) continue;
+            FdEntry* fde = FdGet(proc, wfd);
+            if (!fde || !fde->handle) continue;
+            if (fde->type == FdType::TimerFd) {
+                auto* tfd = static_cast<TimerFdData*>(fde->handle);
+                if (tfd->armed && tfd->nextExpiry < wakeAt)
+                    wakeAt = tfd->nextExpiry;
+            }
+        }
+
+        // Safety poll as ultimate fallback (100ms — should rarely fire now
+        // that all fd types wake directly)
+        uint64_t safetyPoll = now + 100;
+        if (safetyPoll < wakeAt) wakeAt = safetyPoll;
+
+        proc->wakeupTick = wakeAt;
 
         SchedulerBlock(proc);
         unregisterWaiters();
@@ -7396,7 +7434,7 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
         n = EpollScanReady(proc, ep, kEvents, maxevents);
         if (n > 0) { ep->waiter = nullptr; return n; }
 
-        uint64_t now = g_lapicTickCount;
+        now = g_lapicTickCount;
         if (timeout_ms >= 0 && now >= timeoutTicks) {
             ep->waiter = nullptr;
             return 0; // timeout
