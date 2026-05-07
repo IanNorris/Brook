@@ -71,6 +71,9 @@ static bool     g_vfbFullscreenConsumed = false;
 // Track spawned process count for auto-tiling placement
 static uint32_t g_spawnCount = 0;
 
+// Shell CWD — propagated to spawned processes (overrides the /boot default)
+static char g_shellCwd[256] = "";
+
 // True while executing a boot script (before scheduler starts)
 static bool g_scriptMode = false;
 
@@ -664,6 +667,40 @@ static int ExecCommand(int argc, const char* const* argv)
         return 0;
     }
 
+    // Built-in: cd <path> — change shell working directory (propagates to spawned procs)
+    if (StrEq(cmd, "cd"))
+    {
+        if (argc < 2)
+        {
+            KPrintf("cd: %s\n", g_shellCwd[0] ? g_shellCwd : "/");
+            return 0;
+        }
+        const char* target = argv[1];
+        if (target[0] == '/')
+        {
+            StrCopy(g_shellCwd, target, sizeof(g_shellCwd));
+        }
+        else
+        {
+            // Relative path: append to current CWD
+            char buf[128];
+            uint32_t ci = 0;
+            const char* base = g_shellCwd[0] ? g_shellCwd : "/";
+            for (uint32_t i = 0; base[i] && ci < sizeof(buf) - 2; ++i)
+                buf[ci++] = base[i];
+            if (ci > 0 && buf[ci-1] != '/') buf[ci++] = '/';
+            for (uint32_t i = 0; target[i] && ci < sizeof(buf) - 1; ++i)
+                buf[ci++] = target[i];
+            buf[ci] = '\0';
+            StrCopy(g_shellCwd, buf, sizeof(g_shellCwd));
+        }
+        // Strip trailing slash (unless root)
+        uint32_t len = 0;
+        while (g_shellCwd[len]) len++;
+        if (len > 1 && g_shellCwd[len-1] == '/') g_shellCwd[len-1] = '\0';
+        return 0;
+    }
+
     // Built-in: ls [path]
     if (StrEq(cmd, "ls") || StrEq(cmd, "dir"))
     {
@@ -1006,6 +1043,18 @@ static int ExecCommand(int argc, const char* const* argv)
         else
         {
             proc = SpawnProcess(shebangPath, effArgc, effArgv, uidOverride);
+        }
+
+        // Propagate shell CWD to spawned process
+        if (proc && g_shellCwd[0])
+        {
+            uint32_t ci = 0;
+            while (g_shellCwd[ci] && ci < sizeof(proc->cwd) - 1)
+            {
+                proc->cwd[ci] = g_shellCwd[ci];
+                ci++;
+            }
+            proc->cwd[ci] = '\0';
         }
 
         if (proc && strace) {
@@ -1390,6 +1439,7 @@ static void CmdHelp()
     KPrintf("  run [--as name] <prog> [args]  Launch a program\n");
     KPrintf("  <prog> [args]      Same as 'run <prog>'\n");
     KPrintf("  wait               Wait for all processes to exit\n");
+    KPrintf("  cd <path>          Change working directory\n");
     KPrintf("  ps                 List running processes\n");
     KPrintf("  mem                Show memory usage\n");
     KPrintf("  ls [path]          List directory contents\n");

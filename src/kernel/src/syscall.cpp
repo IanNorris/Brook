@@ -7740,16 +7740,16 @@ static int64_t sys_chdir(uint64_t pathAddr, uint64_t, uint64_t,
     if (!proc) return -EBADF;
 
     // Resolve relative paths against current CWD
-    char resolved[64];
+    char resolved[256];
     const char* newCwd = path;
     if (path[0] != '/')
     {
         uint32_t ri = 0;
-        for (uint32_t i = 0; proc->cwd[i] && ri < 58; ++i)
+        for (uint32_t i = 0; proc->cwd[i] && ri < 250; ++i)
             resolved[ri++] = proc->cwd[i];
         if (ri > 0 && resolved[ri-1] != '/')
             resolved[ri++] = '/';
-        for (uint32_t i = 0; path[i] && ri < 62; ++i)
+        for (uint32_t i = 0; path[i] && ri < 254; ++i)
             resolved[ri++] = path[i];
         resolved[ri] = '\0';
         newCwd = resolved;
@@ -7762,7 +7762,7 @@ static int64_t sys_chdir(uint64_t pathAddr, uint64_t, uint64_t,
 
     // Update CWD
     uint32_t ci = 0;
-    while (newCwd[ci] && ci < 62) { proc->cwd[ci] = newCwd[ci]; ci++; }
+    while (newCwd[ci] && ci < 254) { proc->cwd[ci] = newCwd[ci]; ci++; }
     proc->cwd[ci] = '\0';
 
     return 0;
@@ -7778,7 +7778,7 @@ static int64_t sys_fchdir(uint64_t fd, uint64_t, uint64_t,
 
     // Use the stored dirPath (without trailing slash)
     uint32_t ci = 0;
-    while (fde->dirPath[ci] && ci < 62) { proc->cwd[ci] = fde->dirPath[ci]; ci++; }
+    while (fde->dirPath[ci] && ci < 254) { proc->cwd[ci] = fde->dirPath[ci]; ci++; }
     // Remove trailing slash if not root
     if (ci > 1 && proc->cwd[ci-1] == '/') ci--;
     proc->cwd[ci] = '\0';

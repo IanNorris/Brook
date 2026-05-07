@@ -402,7 +402,7 @@ struct Process
     char exePath[256];
 
     // Working directory (for relative path resolution)
-    char cwd[64];
+    char cwd[256];
 
     // True if this is a kernel-mode thread (ring 0, kernel CR3, no user stack).
     bool isKernelThread;
