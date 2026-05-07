@@ -931,12 +931,26 @@ static void on_ptr_axis(void *d, struct wl_pointer *p, uint32_t t,
                           uint32_t axis, wl_fixed_t value) {
     (void)d; (void)p; (void)t; (void)axis; (void)value;
 }
+static void on_ptr_frame(void *d, struct wl_pointer *p) { (void)d; (void)p; }
+static void on_ptr_axis_source(void *d, struct wl_pointer *p, uint32_t s) {
+    (void)d; (void)p; (void)s;
+}
+static void on_ptr_axis_stop(void *d, struct wl_pointer *p, uint32_t t, uint32_t a) {
+    (void)d; (void)p; (void)t; (void)a;
+}
+static void on_ptr_axis_discrete(void *d, struct wl_pointer *p, uint32_t a, int32_t v) {
+    (void)d; (void)p; (void)a; (void)v;
+}
 static const struct wl_pointer_listener ptr_lis = {
     .enter  = on_ptr_enter,
     .leave  = on_ptr_leave,
     .motion = on_ptr_motion,
     .button = on_ptr_button,
     .axis   = on_ptr_axis,
+    .frame  = on_ptr_frame,
+    .axis_source   = on_ptr_axis_source,
+    .axis_stop     = on_ptr_axis_stop,
+    .axis_discrete = on_ptr_axis_discrete,
 };
 
 /* --- Seat capabilities --- */
