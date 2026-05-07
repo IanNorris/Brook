@@ -7,6 +7,7 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 # Parse arguments
 BUILD_TYPE="debug"
 DEBUG_FLAGS=""
+INT_DEBUG=0
 SCRIPT_NAME=""
 HEADLESS=0
 VNC_DISPLAY=""
@@ -40,6 +41,9 @@ for arg in "$@"; do
             ;;
         --no-audio)
             NO_AUDIO=1
+            ;;
+        --int-debug)
+            INT_DEBUG=1
             ;;
         --script=*)
             SCRIPT_NAME="${arg#--script=}"
@@ -306,6 +310,14 @@ export GDK_DPI_SCALE=1
 export QT_SCALE_FACTOR=1
 export GDK_BACKEND=x11
 
+# Interrupt/CPU-reset debug logging (--int-debug flag)
+INT_DEBUG_FLAGS=""
+if [ "${INT_DEBUG}" -eq 1 ]; then
+    INT_DEBUG_LOG="/tmp/qemu_int_$(date +%Y%m%d_%H%M%S).log"
+    INT_DEBUG_FLAGS="-d cpu_reset -D ${INT_DEBUG_LOG}"
+    echo "INT DEBUG: logging CPU resets to ${INT_DEBUG_LOG}"
+fi
+
 qemu-system-x86_64 \
     -machine q35 \
     ${KVM_FLAGS} \
@@ -330,6 +342,7 @@ qemu-system-x86_64 \
     -no-reboot \
     -no-shutdown \
     ${DEBUG_FLAGS} \
+    ${INT_DEBUG_FLAGS} \
     "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
 
 # If a profile was written to the boot disk, offer to extract it.

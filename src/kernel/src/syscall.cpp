@@ -1795,7 +1795,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
 
         // Read available lines from the ring buffer into a temp buffer
         static constexpr uint32_t KLOG_LINE_LEN = 161; // 160 chars + null
-        static constexpr uint32_t KLOG_BATCH    = 32;
+        static constexpr uint32_t KLOG_BATCH    = 8;  // 8 × 161 = ~1.3KB stack
         char lineBuf[KLOG_BATCH][KLOG_LINE_LEN];
 
         uint64_t written = 0;

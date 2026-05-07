@@ -592,6 +592,35 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
     for (;;) { __asm__ volatile("cli; pause"); }
 }
 
+// Lockless read-only page-table walk for use in the #DF handler.
+// Returns true if the virtual address has a present mapping via the given CR3.
+// No locks, no allocations, no side effects — safe even on a corrupt stack.
+static bool DfProbePageMapped(uint64_t cr3val, uint64_t va)
+{
+    static constexpr uint64_t HHDM = 0xFFFF800000000000ULL;
+    static constexpr uint64_t PHYS = 0x000FFFFFFFFFF000ULL;
+    uint64_t ptBase = cr3val & ~0xFFFULL;
+    if (!ptBase) return false;
+
+    auto* pml4 = reinterpret_cast<volatile uint64_t*>(ptBase + HHDM);
+    uint64_t e4 = pml4[(va >> 39) & 0x1FF];
+    if (!(e4 & 1)) return false;
+
+    auto* pdpt = reinterpret_cast<volatile uint64_t*>((e4 & PHYS) + HHDM);
+    uint64_t e3 = pdpt[(va >> 30) & 0x1FF];
+    if (!(e3 & 1)) return false;
+    if (e3 & (1ULL << 7)) return true; // 1GB page
+
+    auto* pd = reinterpret_cast<volatile uint64_t*>((e3 & PHYS) + HHDM);
+    uint64_t e2 = pd[(va >> 21) & 0x1FF];
+    if (!(e2 & 1)) return false;
+    if (e2 & (1ULL << 7)) return true; // 2MB page
+
+    auto* pt = reinterpret_cast<volatile uint64_t*>((e2 & PHYS) + HHDM);
+    uint64_t e1 = pt[(va >> 12) & 0x1FF];
+    return (e1 & 1) != 0;
+}
+
 static void HandleDoubleFault(InterruptFrame* frame, uint64_t errorCode)
 {
     __asm__ volatile("cli");
@@ -629,18 +658,27 @@ static void HandleDoubleFault(InterruptFrame* frame, uint64_t errorCode)
     ExcPutsRaw(cpuTag); ExcPutsRaw("  CR3   "); ExcPutHex(cr3);          ExcPutsRaw("\n");
     ExcPutsRaw(cpuTag); ExcPutsRaw("  RBP   "); ExcPutHex(rbp);          ExcPutsRaw("\n");
     ExcPutsRaw(cpuTag); ExcPutsRaw("  CURPROC_RAW "); ExcPutHex(currentProcRaw); ExcPutsRaw("\n");
+    // Only dereference the process pointer if the page is provably mapped.
+    // Use lockless PT walk to avoid faulting inside #DF (which = triple fault).
     if (currentProcRaw >= 0xFFFF800000000000ULL && (currentProcRaw & 0x7) == 0)
     {
-        auto* cur = reinterpret_cast<brook::Process*>(currentProcRaw);
-        ExcPutsRaw(cpuTag); ExcPutsRaw("  CUR_PID "); ExcPutHex(cur->pid);
-        ExcPutsRaw("  KSTACK_BASE "); ExcPutHex(cur->kernelStackBase);
-        ExcPutsRaw("  KSTACK_TOP "); ExcPutHex(cur->kernelStackTop);
-        ExcPutsRaw("\n");
+        if (DfProbePageMapped(cr3, currentProcRaw))
+        {
+            auto* cur = reinterpret_cast<brook::Process*>(currentProcRaw);
+            ExcPutsRaw(cpuTag); ExcPutsRaw("  CUR_PID "); ExcPutHex(cur->pid);
+            ExcPutsRaw("  KSTACK_BASE "); ExcPutHex(cur->kernelStackBase);
+            ExcPutsRaw("  KSTACK_TOP "); ExcPutHex(cur->kernelStackTop);
+            ExcPutsRaw("\n");
+        }
+        else
+        {
+            ExcPutsRaw(cpuTag); ExcPutsRaw("  CUR_PROC page UNMAPPED — skipping dereference\n");
+        }
     }
     ExcPutsRaw(cpuTag); ExcPutsRaw("  DESC  A second exception occurred while handling the first.\n");
     ExcPutsRaw(cpuTag); ExcPutsRaw("  NOTE  Minimal #DF dump: skipped ProcessCurrent(), stack walk, compositor halt.\n");
 
-    if (frame->sp >= 0xFFFF800000000000ULL)
+    if (frame->sp >= 0xFFFF800000000000ULL && DfProbePageMapped(cr3, frame->sp))
     {
         auto* sp = reinterpret_cast<uint64_t*>(frame->sp);
         uint64_t handlerRet = sp[5];
@@ -648,7 +686,8 @@ static void HandleDoubleFault(InterruptFrame* frame, uint64_t errorCode)
         ExcPutsRaw(cpuTag); ExcPutsRaw("  HANDLER_RET "); ExcPutHex(handlerRet); ExcPutsRaw("\n");
         ExcPutsRaw(cpuTag); ExcPutsRaw("  FULL_FRAME  "); ExcPutHex(savedFramePtr); ExcPutsRaw("\n");
 
-        if (savedFramePtr >= frame->sp && savedFramePtr < frame->sp + 4096)
+        if (savedFramePtr >= frame->sp && savedFramePtr < frame->sp + 4096
+            && DfProbePageMapped(cr3, savedFramePtr))
         {
             auto* ef = reinterpret_cast<FullExceptionFrame*>(savedFramePtr);
             ExcPutsRaw(cpuTag); ExcPutsRaw("  FIRST_RIP   "); ExcPutHex(ef->rip);       ExcPutsRaw("\n");
