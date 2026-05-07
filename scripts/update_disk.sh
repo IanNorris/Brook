@@ -368,6 +368,13 @@ if [ -d "$shortcuts_dir" ]; then
     done
 fi
 
+# --- File type associations ---
+filetypes="${ROOT_DIR}/data/filetypes.conf"
+if [ -f "$filetypes" ]; then
+    echo "File types:"
+    sync_file "$filetypes" "FILETYPES.CFG"
+fi
+
 # --- Wallpaper ---
 wallpaper="${ROOT_DIR}/data/wallpaper.raw"
 if [ -f "$wallpaper" ]; then

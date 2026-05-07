@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 
 #include <wayland-client.h>
 #include <wayland-client-protocol.h>
@@ -71,6 +72,75 @@ static int memfd_create_shim(const char *name, unsigned int flags) {
 #define MAX_ENTRIES  512
 #define MAX_PATH_LEN 512
 #define MAX_TREE     128
+#define MAX_ASSOC    64
+
+/* ========================= File type associations ========================= */
+
+typedef struct {
+    char ext[16];       /* file extension (lowercase, no dot) */
+    char binary[256];   /* path to binary */
+} FileAssoc;
+
+static FileAssoc g_assoc[MAX_ASSOC];
+static int       g_assoc_count = 0;
+
+static void load_filetypes(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "[files] no filetypes config at %s\n", path);
+        return;
+    }
+    char line[300];
+    while (fgets(line, sizeof(line), f) && g_assoc_count < MAX_ASSOC) {
+        /* Strip newline */
+        int len = (int)strlen(line);
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
+            line[--len] = '\0';
+        /* Skip comments and empty lines */
+        if (line[0] == '#' || line[0] == '\0') continue;
+        /* Parse "ext=binary" */
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        FileAssoc *a = &g_assoc[g_assoc_count];
+        strncpy(a->ext, line, sizeof(a->ext) - 1);
+        strncpy(a->binary, eq + 1, sizeof(a->binary) - 1);
+        g_assoc_count++;
+    }
+    fclose(f);
+    fprintf(stderr, "[files] loaded %d file associations\n", g_assoc_count);
+}
+
+static const char *find_assoc(const char *filename) {
+    const char *dot = strrchr(filename, '.');
+    if (!dot || dot == filename) return NULL;
+    const char *ext = dot + 1;
+    for (int i = 0; i < g_assoc_count; i++) {
+        if (strcasecmp(g_assoc[i].ext, ext) == 0)
+            return g_assoc[i].binary;
+    }
+    return NULL;
+}
+
+static void launch_file(const char *filepath) {
+    const char *binary = find_assoc(filepath);
+    if (!binary) {
+        fprintf(stderr, "[files] no association for: %s\n", filepath);
+        return;
+    }
+    fprintf(stderr, "[files] launching: %s %s\n", binary, filepath);
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* Child: exec the associated app */
+        execl(binary, binary, filepath, (char *)NULL);
+        _exit(127);
+    } else if (pid > 0) {
+        /* Parent: don't wait — let the child run independently */
+        fprintf(stderr, "[files] spawned pid %d\n", (int)pid);
+    } else {
+        fprintf(stderr, "[files] fork failed: %s\n", strerror(errno));
+    }
+}
 
 /* ========================= Bitmap Font (6x10) ========================= */
 
@@ -342,14 +412,18 @@ static void navigate_up(void) {
 static void open_selected(void) {
     if (g_selected < 0 || g_selected >= g_entry_count) return;
     FileEntry *e = &g_entries[g_selected];
-    if (!e->is_dir) return;
 
-    char newpath[MAX_PATH_LEN];
+    char fullpath[MAX_PATH_LEN];
     if (strcmp(g_cwd, "/") == 0)
-        snprintf(newpath, MAX_PATH_LEN, "/%s", e->name);
+        snprintf(fullpath, MAX_PATH_LEN, "/%s", e->name);
     else
-        snprintf(newpath, MAX_PATH_LEN, "%s/%s", g_cwd, e->name);
-    navigate_to(newpath);
+        snprintf(fullpath, MAX_PATH_LEN, "%s/%s", g_cwd, e->name);
+
+    if (e->is_dir) {
+        navigate_to(fullpath);
+    } else {
+        launch_file(fullpath);
+    }
 }
 
 /* ========================= Tree management ========================= */
@@ -600,9 +674,18 @@ static void render(void) {
     if (g_selected >= 0 && g_selected < g_entry_count) {
         FileEntry *e = &g_entries[g_selected];
         if (!e->is_dir) {
-            char info[64];
-            format_size(e->size, info, sizeof(info));
-            draw_text(WIN_W - 120, WIN_H - STATUS_H + 5, info, COL_TEXT);
+            char info[96];
+            char size_str[32];
+            format_size(e->size, size_str, sizeof(size_str));
+            const char *assoc = find_assoc(e->name);
+            if (assoc) {
+                const char *base = strrchr(assoc, '/');
+                base = base ? base + 1 : assoc;
+                snprintf(info, sizeof(info), "%s  [%s]", size_str, base);
+            } else {
+                snprintf(info, sizeof(info), "%s", size_str);
+            }
+            draw_text(WIN_W - 200, WIN_H - STATUS_H + 5, info, COL_TEXT);
         }
     }
 }
@@ -799,9 +882,13 @@ static void on_ptr_motion(void *d, struct wl_pointer *p, uint32_t t,
     g_ptr_x = wl_fixed_to_double(x);
     g_ptr_y = wl_fixed_to_double(y);
 }
+static uint32_t g_last_click_time = 0;
+static int      g_last_click_row = -1;
+#define DOUBLE_CLICK_MS 400
+
 static void on_ptr_button(void *d, struct wl_pointer *p, uint32_t serial,
                             uint32_t time, uint32_t button, uint32_t state) {
-    (void)d; (void)p; (void)serial; (void)time;
+    (void)d; (void)p; (void)serial;
     if (state != 1 || button != 0x110 /* BTN_LEFT */) return;
 
     int mx = (int)g_ptr_x, my = (int)g_ptr_y;
@@ -811,16 +898,32 @@ static void on_ptr_button(void *d, struct wl_pointer *p, uint32_t serial,
         int row = (my - HEADER_H) / ROW_H;
         if (row >= 0 && row < g_tree_count) {
             g_active_pane = 0;
-            g_tree_selected = row;
-            tree_select(row);
+            if (row == g_tree_selected &&
+                time - g_last_click_time < DOUBLE_CLICK_MS) {
+                tree_toggle(row);
+            } else {
+                g_tree_selected = row;
+                tree_select(row);
+            }
         }
+        g_last_click_time = time;
+        g_last_click_row = -1;
     } else if (mx > LIST_X && my >= HEADER_H && my < CONTENT_H) {
         /* Click in list pane */
         int row = (my - HEADER_H) / ROW_H + g_scroll_offset;
         if (row >= 0 && row < g_entry_count) {
             g_active_pane = 1;
-            g_selected = row;
-            g_needs_redraw = 1;
+            if (row == g_last_click_row &&
+                time - g_last_click_time < DOUBLE_CLICK_MS) {
+                /* Double-click: open */
+                g_selected = row;
+                open_selected();
+            } else {
+                g_selected = row;
+                g_needs_redraw = 1;
+            }
+            g_last_click_row = row;
+            g_last_click_time = time;
         }
     }
 }
@@ -938,6 +1041,7 @@ int main(int argc, char *argv[]) {
     wl_display_roundtrip(dpy);
 
     /* Initialise content */
+    load_filetypes("/boot/FILETYPES.CFG");
     tree_init();
     load_directory(start_dir);
 
