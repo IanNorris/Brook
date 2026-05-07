@@ -336,6 +336,13 @@ extern "C" __attribute__((naked, used)) void BrookSyscallDispatcher()
 namespace brook {
 
 // ---------------------------------------------------------------------------
+// Profiling counters (atomic, dumped on title changes)
+// ---------------------------------------------------------------------------
+static volatile uint64_t g_profOpenCount = 0;
+static volatile uint64_t g_profMmapCount = 0;
+extern volatile uint64_t g_profFaultCount;  // defined in idt.cpp
+
+// ---------------------------------------------------------------------------
 // Error codes (Linux)
 // ---------------------------------------------------------------------------
 
@@ -672,8 +679,154 @@ extern "C" bool MemFdHandleUserFault(uint64_t cr2, uint64_t errCode)
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// File Page Cache — global cache of clean file-backed pages.
+// Key: (Vnode*, file_page_index).  Maps to a PhysicalAddress with refcount.
+// Used by demand-paged MAP_PRIVATE file mappings to share identical read-only
+// pages across processes and enable 64KB read-ahead batches.
+// ---------------------------------------------------------------------------
+
+struct PageCacheEntry {
+    Vnode*          vnode;       // owning vnode (nullptr = empty slot)
+    uint64_t        pageIndex;   // file offset / 4096
+    PhysicalAddress phys;        // cached physical page
+};
+
+static constexpr uint32_t PAGE_CACHE_SLOTS = 16384;  // 64MB worth of 4KB pages
+static PageCacheEntry g_pageCache[PAGE_CACHE_SLOTS];
+static SpinLock g_pageCacheLock;
+
+static inline uint32_t PageCacheHash(Vnode* vn, uint64_t pageIdx)
+{
+    uint64_t key = reinterpret_cast<uint64_t>(vn) ^ (pageIdx * 2654435761ULL);
+    return static_cast<uint32_t>(key % PAGE_CACHE_SLOTS);
+}
+
+// Look up a cached page. Returns valid PhysicalAddress if found (bumps PMM refcount).
+static PhysicalAddress PageCacheLookup(Vnode* vn, uint64_t pageIdx)
+{
+    uint64_t flags = SpinLockAcquire(&g_pageCacheLock);
+    uint32_t slot = PageCacheHash(vn, pageIdx);
+    for (uint32_t i = 0; i < 32; ++i) {
+        uint32_t s = (slot + i) % PAGE_CACHE_SLOTS;
+        auto& e = g_pageCache[s];
+        if (e.vnode == vn && e.pageIndex == pageIdx) {
+            PmmRefPage(e.phys);
+            SpinLockRelease(&g_pageCacheLock, flags);
+            return e.phys;
+        }
+        if (!e.vnode) break;
+    }
+    SpinLockRelease(&g_pageCacheLock, flags);
+    return PhysicalAddress(0);
+}
+
+// Insert a page into the cache. Caller transfers ownership of one ref to the cache.
+// Also takes a VnodeRef to prevent the vnode from being freed while cached (ABA prevention).
+static void PageCacheInsert(Vnode* vn, uint64_t pageIdx, PhysicalAddress phys)
+{
+    uint64_t flags = SpinLockAcquire(&g_pageCacheLock);
+    uint32_t slot = PageCacheHash(vn, pageIdx);
+    for (uint32_t i = 0; i < 32; ++i) {
+        uint32_t s = (slot + i) % PAGE_CACHE_SLOTS;
+        auto& e = g_pageCache[s];
+        if (!e.vnode) {
+            VnodeRef(vn);  // prevent vnode reuse while cached
+            e.vnode = vn;
+            e.pageIndex = pageIdx;
+            e.phys = phys;
+            SpinLockRelease(&g_pageCacheLock, flags);
+            return;
+        }
+        if (e.vnode == vn && e.pageIndex == pageIdx) {
+            SpinLockRelease(&g_pageCacheLock, flags);
+            PmmUnrefPage(phys);
+            return;
+        }
+    }
+    SpinLockRelease(&g_pageCacheLock, flags);
+    PmmUnrefPage(phys);
+}
+
+// Read-ahead: preload file pages into the cache in a single bulk read.
+// For files ≤1MB (256 pages), loads the entire mapping at mmap time so
+// subsequent page faults are instant cache hits instead of individual disk reads.
+static uint32_t PageCachePreload(Vnode* vn, uint64_t startPageIdx,
+                                  uint64_t fileSize, uint32_t maxPages)
+{
+    static constexpr uint32_t MAX_PRELOAD_PAGES = 256; // 1MB
+    if (maxPages > MAX_PRELOAD_PAGES) maxPages = MAX_PRELOAD_PAGES;
+
+    // Cap by file size
+    uint64_t maxFilePages = (fileSize + 4095) / 4096;
+    if (startPageIdx >= maxFilePages) return 0;
+    if (startPageIdx + maxPages > maxFilePages)
+        maxPages = static_cast<uint32_t>(maxFilePages - startPageIdx);
+
+    // Skip pages already in cache (find first uncached)
+    uint32_t uncachedStart = 0;
+    while (uncachedStart < maxPages) {
+        PhysicalAddress p = PageCacheLookup(vn, startPageIdx + uncachedStart);
+        if (p) { PmmUnrefPage(p); uncachedStart++; continue; }
+        break;
+    }
+    if (uncachedStart >= maxPages) return maxPages;
+
+    uint32_t toRead = maxPages - uncachedStart;
+
+    // Allocate physical pages for the batch
+    PhysicalAddress* pages = static_cast<PhysicalAddress*>(
+        kmalloc(toRead * sizeof(PhysicalAddress)));
+    if (!pages) return uncachedStart;
+
+    for (uint32_t i = 0; i < toRead; ++i) {
+        pages[i] = PmmAllocPage(MemTag::User, 0);
+        if (!pages[i]) { toRead = i; break; }
+    }
+    if (toRead == 0) { kfree(pages); return uncachedStart; }
+
+    // Single bulk read from disk
+    uint64_t readOffset = (startPageIdx + uncachedStart) * 4096;
+    uint64_t totalBytes = static_cast<uint64_t>(toRead) * 4096;
+    uint64_t off = readOffset;
+
+    auto* readBuf = static_cast<uint8_t*>(kmalloc(static_cast<uint32_t>(totalBytes)));
+    if (!readBuf) {
+        for (uint32_t i = 0; i < toRead; ++i) PmmFreePage(pages[i]);
+        kfree(pages);
+        return uncachedStart;
+    }
+
+    __builtin_memset(readBuf, 0, totalBytes);
+    int got = VfsRead(vn, readBuf, totalBytes, &off);
+    if (got < 0) got = 0;
+
+    // Scatter data into physical pages and insert each into cache
+    for (uint32_t i = 0; i < toRead; ++i) {
+        auto* kp = reinterpret_cast<uint8_t*>(PhysToVirt(pages[i]).raw());
+
+        uint64_t srcOff = i * 4096;
+        if (srcOff < static_cast<uint64_t>(got)) {
+            uint64_t toCopy = static_cast<uint64_t>(got) - srcOff;
+            if (toCopy > 4096) toCopy = 4096;
+            __builtin_memcpy(kp, readBuf + srcOff, toCopy);
+            if (toCopy < 4096)
+                __builtin_memset(kp + toCopy, 0, 4096 - toCopy);
+        } else {
+            __builtin_memset(kp, 0, 4096);
+        }
+
+        PageCacheInsert(vn, startPageIdx + uncachedStart + i, pages[i]);
+    }
+
+    kfree(readBuf);
+    kfree(pages);
+    return uncachedStart + toRead;
+}
+
 // Demand-page a private file-backed mapping.  File VMAs own a Vnode reference,
 // so the backing remains valid even after userspace closes the original fd.
+// Uses the global page cache for sharing and 64KB read-ahead.
 extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
 {
     static constexpr uint64_t PF_PRESENT = 0x1;
@@ -695,11 +848,29 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
         if ((errCode & PF_WRITE) && !(m.vmmFlags & VMM_WRITABLE))
             return false;
 
+        // Already mapped (race with another thread/CPU)
         PhysicalAddress existing = VmmVirtToPhys(proc->pageTable,
                                                   VirtualAddress(pageVA));
         if (existing)
             return true;
 
+        uint64_t fileOff = m.offset + (pageVA - m.vaddr);
+        uint64_t filePageIdx = fileOff / 4096;
+
+        // Check page cache first (another process may have loaded this page)
+        PhysicalAddress cached = PageCacheLookup(m.vnode, filePageIdx);
+        if (cached) {
+            if (!VmmMapPage(proc->pageTable, VirtualAddress(pageVA), cached,
+                            VMM_PRESENT | m.vmmFlags, MemTag::User, proc->pid)) {
+                PmmUnrefPage(cached);
+                if (VmmVirtToPhys(proc->pageTable, VirtualAddress(pageVA)))
+                    return true;
+                return false;
+            }
+            return true;
+        }
+
+        // Cache miss (or validation failure) — demand-page from disk
         PhysicalAddress phys = PmmAllocPage(MemTag::User, proc->pid);
         if (!phys) return false;
 
@@ -708,7 +879,6 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
             reinterpret_cast<uint64_t>(kp) & ~0xFFFULL);
         memset(kp, 0, 4096);
 
-        uint64_t fileOff = m.offset + (pageVA - m.vaddr);
         uint64_t readOff = fileOff;
         int got = VfsRead(m.vnode, kp, 4096, &readOff);
         if (got < 0) {
@@ -716,13 +886,17 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
             return false;
         }
 
+        // Insert into cache (cache adopts one ref) and take extra ref for PTE
+        PmmRefPage(phys);
+        PageCacheInsert(m.vnode, filePageIdx, phys);
+
         if (!VmmMapPage(proc->pageTable, VirtualAddress(pageVA), phys,
                         VMM_PRESENT | m.vmmFlags, MemTag::User, proc->pid)) {
             if (VmmVirtToPhys(proc->pageTable, VirtualAddress(pageVA))) {
-                PmmFreePage(phys);
+                PmmUnrefPage(phys);
                 return true;
             }
-            PmmFreePage(phys);
+            PmmUnrefPage(phys);
             return false;
         }
         return true;
@@ -2909,6 +3083,7 @@ static uint64_t ProtToVmmFlags(uint64_t prot)
 static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                          uint64_t flags, uint64_t fd, uint64_t offset)
 {
+    __atomic_fetch_add(&g_profMmapCount, 1, __ATOMIC_RELAXED);
     if (length == 0) return -EINVAL;
 
     Process* proc = ProcessCurrent();
@@ -2941,7 +3116,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                 PhysicalAddress existing = VmmVirtToPhys(proc->pageTable, va);
                 if (existing) {
                     VmmUnmapPage(proc->pageTable, va);
-                    PmmFreePage(existing);
+                    PmmUnrefPage(existing);
                 }
             }
             result = addr;
@@ -3178,6 +3353,18 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             }
         }
         if (!tracked) return -ENOMEM;
+
+        // Preload entire file into page cache if ≤1MB.
+        // Converts thousands of individual 4KB page faults into a single
+        // bulk disk read — critical for shared library loading performance.
+        static constexpr uint64_t PRELOAD_THRESHOLD = 1024 * 1024; // 1MB
+        VnodeStat st;
+        if (VfsStat(vn, &st) == 0 && st.size <= PRELOAD_THRESHOLD && st.size > 0) {
+            uint64_t startPage = offset / 4096;
+            uint32_t mapPages = static_cast<uint32_t>(pages);
+            PageCachePreload(vn, startPage, st.size, mapPages);
+        }
+
         return static_cast<int64_t>(vaddr);
     }
 
@@ -3483,7 +3670,7 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t,
         if (phys)
         {
             VmmUnmapPage(proc->pageTable, va);
-            if (!isMemFd && !isFbMap) PmmFreePage(phys);
+            if (!isMemFd && !isFbMap) PmmUnrefPage(phys);
         }
     }
 
@@ -3530,7 +3717,7 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
             if (phys)
             {
                 VmmUnmapPage(proc->pageTable, va);
-                PmmFreePage(phys);
+                PmmUnrefPage(phys);
             }
         }
         return static_cast<int64_t>(old_addr);
@@ -3570,7 +3757,7 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
         if (phys)
         {
             VmmUnmapPage(proc->pageTable, va);
-            PmmFreePage(phys);
+            PmmUnrefPage(phys);
         }
     }
 
@@ -3917,6 +4104,13 @@ static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAd
 
     SchedulerAddProcess(child);
 
+    {
+        extern volatile uint64_t g_lapicTickCount;
+        if (!(flags & CLONE_THREAD))
+            SerialPrintf("[PROFILE] fork t=%lums parent_pid=%u child_pid=%u\n",
+                         g_lapicTickCount, parent->pid, child->pid);
+    }
+
     DbgPrintf("CLONE: parent '%s' pid=%u tgid=%u -> child pid=%u tgid=%u flags=0x%lx %s\n",
               parent->name, parent->pid, parent->tgid, child->pid, child->tgid, flags,
               (flags & CLONE_THREAD) ? "THREAD" : "FORK");
@@ -4099,6 +4293,11 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
     if (!CopyUserCString(pathAddr, kPath, sizeof(kPath))) return -EFAULT;
 
     DbgPrintf("sys_execve: pid=%u path='%s'\n", proc->pid, kPath);
+    {
+        extern volatile uint64_t g_lapicTickCount;
+        SerialPrintf("[PROFILE] execve t=%lums pid=%u '%s'\n",
+                     g_lapicTickCount, proc->pid, kPath);
+    }
 
     // Resolve path: try as-is, then /boot/BIN/<UPPER>, then /boot/<UPPER>
     char resolvedPath[256];
@@ -6177,6 +6376,7 @@ static int64_t sys_getrandom(uint64_t bufAddr, uint64_t count, uint64_t,
 static int64_t sys_openat(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
                            uint64_t mode, uint64_t, uint64_t)
 {
+    __atomic_fetch_add(&g_profOpenCount, 1, __ATOMIC_RELAXED);
     char pathBuf[256];
     if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) {
         // Diagnostic: identify exactly where the path copy failed.
@@ -9177,6 +9377,13 @@ static int64_t sys_brook_wm_set_title(uint64_t wmId, uint64_t titlePtr,
         if (!c) break;
     }
     buf[sizeof(buf) - 1] = '\0';
+    {
+        extern volatile uint64_t g_lapicTickCount;
+        SerialPrintf("[PROFILE] set_title t=%lums pid=%u '%s'"
+                     " opens=%lu mmaps=%lu faults=%lu\n",
+                     g_lapicTickCount, proc->pid, buf,
+                     g_profOpenCount, g_profMmapCount, g_profFaultCount);
+    }
     brook::WmSetTitleById(proc, static_cast<uint32_t>(wmId), buf);
     return 0;
 }

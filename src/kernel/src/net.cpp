@@ -1393,6 +1393,17 @@ int SockSendTo(int sockIdx, const void* buf, uint32_t len,
         s.bound = true;
     }
 
+    // Profile DNS sends (port 53)
+    if (dstPort == 53) {
+        extern volatile uint64_t g_lapicTickCount;
+        SerialPrintf("[PROFILE] dns_query t=%lums -> %u.%u.%u.%u\n",
+                     g_lapicTickCount,
+                     (ntohl(dstIp) >> 24) & 0xFF,
+                     (ntohl(dstIp) >> 16) & 0xFF,
+                     (ntohl(dstIp) >> 8) & 0xFF,
+                     ntohl(dstIp) & 0xFF);
+    }
+
     return NetSendUdp(dstIp, ntohs(s.localPort), dstPort, buf, len);
 }
 
@@ -1565,6 +1576,16 @@ void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
                     uint32_t dstIp, uint16_t dstPort,
                     const void* data, uint32_t len)
 {
+    // Profile DNS responses (from port 53)
+    if (srcPort == 53) {
+        extern volatile uint64_t g_lapicTickCount;
+        SerialPrintf("[PROFILE] dns_response t=%lums from %u.%u.%u.%u\n",
+                     g_lapicTickCount,
+                     (ntohl(srcIp) >> 24) & 0xFF,
+                     (ntohl(srcIp) >> 16) & 0xFF,
+                     (ntohl(srcIp) >> 8) & 0xFF,
+                     ntohl(srcIp) & 0xFF);
+    }
     uint16_t dstPortBE = htons(dstPort);
     for (uint32_t i = 0; i < MAX_SOCKETS; i++) {
         if (!g_sockUsed[i]) continue;
@@ -2169,14 +2190,15 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
     TcpSendSegment(s, TCP_SYN, nullptr, 0, "connect");
     s.tcpSndNxt++; // SYN consumes one sequence number
 
-    SerialPrintf("tcp: SYN queued to %u.%u.%u.%u:%u\n",
+    extern volatile uint64_t g_lapicTickCount;
+    SerialPrintf("[PROFILE] tcp_connect t=%lums -> %u.%u.%u.%u:%u\n",
+                 g_lapicTickCount,
                  (ntohl(s.remoteIp) >> 24) & 0xFF,
                  (ntohl(s.remoteIp) >> 16) & 0xFF,
                  (ntohl(s.remoteIp) >> 8) & 0xFF,
                  ntohl(s.remoteIp) & 0xFF,
                  ntohs(s.remotePort));
 
-    extern volatile uint64_t g_lapicTickCount;
     Process* self = SchedulerCurrentProcess();
 
     // Block until SYN-ACK arrives or timeout (5 second per attempt, 2 attempts)
@@ -2198,7 +2220,8 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
         }
 
         if (s.tcpState == TcpState::Established) {
-            SerialPrintf("tcp: connected%s!\n", attempt ? " (retry)" : "");
+            SerialPrintf("[PROFILE] tcp_established t=%lums%s\n",
+                         g_lapicTickCount, attempt ? " (retry)" : "");
             return 0;
         }
         if (s.tcpState == TcpState::Closed || s.tcpRstRecv) {

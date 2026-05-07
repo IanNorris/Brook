@@ -21,6 +21,9 @@ using brook::SerialPrintf;
 using brook::IoApicUnmaskIrq;
 using brook::ApicSendEoi;
 
+// Global page-fault counter for profiling (shared with syscall.cpp)
+namespace brook { volatile uint64_t g_profFaultCount = 0; }
+
 // ---- IDT storage ----
 static IdtEntry      g_idt[256];
 static IdtDescriptor g_idtDesc;
@@ -718,6 +721,8 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
     // fault path to avoid a spurious panic.
     if (vector == 14)
     {
+        __atomic_fetch_add(&brook::g_profFaultCount, 1, __ATOMIC_RELAXED);
+
         uint64_t cr2cow = 0;
         __asm__ volatile("movq %%cr2, %0" : "=r"(cr2cow));
 

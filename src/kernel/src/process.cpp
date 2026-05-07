@@ -1563,7 +1563,9 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     // 1. Free all user-space pages and destroy old page table.
     ProcessClearLazyMappings(proc);
     VmmDestroyUserPageTable(oldPt);
-    PmmFreeByTag(proc->pid, MemTag::User);
+    // NOTE: PmmFreeByTag removed here. VmmDestroyUserPageTable already calls
+    // PmmUnrefPage on every leaf PTE, which correctly frees pages at refcount=0
+    // and preserves pages still referenced by the global file page cache.
 
     // Any user-space pointers the kernel held into the old address space are
     // now stale. If we fail later in ProcessExec, SchedulerExitCurrentProcess
