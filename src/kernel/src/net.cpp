@@ -2717,9 +2717,22 @@ static int ParseUint(const char* s, uint32_t* out)
 {
     uint32_t val = 0;
     int i = 0;
-    while (s[i] >= '0' && s[i] <= '9') {
-        val = val * 10 + static_cast<uint32_t>(s[i] - '0');
-        i++;
+    // Support 0x hex prefix
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        i = 2;
+        while (true) {
+            char c = s[i];
+            if (c >= '0' && c <= '9')      val = val * 16 + static_cast<uint32_t>(c - '0');
+            else if (c >= 'a' && c <= 'f') val = val * 16 + static_cast<uint32_t>(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') val = val * 16 + static_cast<uint32_t>(c - 'A' + 10);
+            else break;
+            i++;
+        }
+    } else {
+        while (s[i] >= '0' && s[i] <= '9') {
+            val = val * 10 + static_cast<uint32_t>(s[i] - '0');
+            i++;
+        }
     }
     *out = val;
     return i;
@@ -2811,7 +2824,9 @@ static void DebugHandleCommand(const char* cmd, uint32_t len)
             "Input injection:\n"
             "  inject click X Y      - click at absolute coords\n"
             "  inject move X Y       - move cursor without clicking\n"
-            "  inject key SC [ASCII] - press+release scan code (decimal)\n"
+            "  inject key SC [ASCII] - press+release scan code (decimal or 0x hex)\n"
+            "  inject keydown SC     - press key (no release, for modifiers)\n"
+            "  inject keyup SC       - release key\n"
             "  inject type TEXT      - type ASCII string (auto shift)\n"
             "\n"
         );
@@ -3203,6 +3218,7 @@ static void DebugHandleCommand(const char* cmd, uint32_t len)
         static InputDevice s_debugInput = {};
         static InputDeviceOps s_debugOps = { "debug_inject", nullptr };
         static bool s_debugRegistered = false;
+        static uint8_t s_injectMods = 0; // tracked modifier state for inject
         if (!s_debugRegistered) {
             s_debugInput.ops = &s_debugOps;
             s_debugInput.head = 0;
@@ -3266,6 +3282,37 @@ static void DebugHandleCommand(const char* cmd, uint32_t len)
             DebugChannelSend("inject: moved\n");
         }
 
+        // inject keydown SC — press (no release) a key (for modifiers)
+        // inject keyup SC — release a key
+        else if (StrStartsWith(sub, "keydown ") || StrStartsWith(sub, "keyup ")) {
+            bool isDown = sub[3] == 'd';
+            const char* args = sub + (isDown ? 8 : 6);
+            uint32_t sc = 0;
+            ParseUint(args, &sc);
+
+            // Update tracked modifier state (Ctrl=0x1D, LShift=0x2A, RShift=0x36, Alt=0x38)
+            if (sc == 0x1D) { if (isDown) s_injectMods |= INPUT_MOD_CTRL; else s_injectMods &= ~INPUT_MOD_CTRL; }
+            if (sc == 0x2A) { if (isDown) s_injectMods |= INPUT_MOD_LSHIFT; else s_injectMods &= ~INPUT_MOD_LSHIFT; }
+            if (sc == 0x36) { if (isDown) s_injectMods |= INPUT_MOD_RSHIFT; else s_injectMods &= ~INPUT_MOD_RSHIFT; }
+            if (sc == 0x38) { if (isDown) s_injectMods |= INPUT_MOD_ALT; else s_injectMods &= ~INPUT_MOD_ALT; }
+
+            InputEvent ev = {};
+            ev.type = isDown ? InputEventType::KeyPress : InputEventType::KeyRelease;
+            ev.scanCode = static_cast<uint8_t>(sc);
+            ev.ascii = 0;
+            ev.modifiers = s_injectMods;
+            InputDevicePush(&s_debugInput, ev);
+            InputWakeWaiters();
+
+            char resp[64];
+            int p = 0;
+            const char* h1 = isDown ? "inject: keydown sc=" : "inject: keyup sc=";
+            for (int i = 0; h1[i]; i++) resp[p++] = h1[i];
+            p += UintToStr(resp + p, sc);
+            resp[p++] = '\n';
+            SockSend(g_debugSockIdx, resp, static_cast<uint32_t>(p));
+        }
+
         // inject key SCANCODE [ASCII] — press and release a key
         // e.g. "inject key 28" for Enter (scan code 0x1C = 28 decimal)
         else if (StrStartsWith(sub, "key ")) {
@@ -3281,6 +3328,7 @@ static void DebugHandleCommand(const char* cmd, uint32_t len)
             ev.type = InputEventType::KeyPress;
             ev.scanCode = static_cast<uint8_t>(sc);
             ev.ascii = static_cast<char>(ascii);
+            ev.modifiers = s_injectMods;
             InputDevicePush(&s_debugInput, ev);
             InputWakeWaiters();
 
@@ -3332,9 +3380,11 @@ static void DebugHandleCommand(const char* cmd, uint32_t len)
                 if (sc == 0 && ch != 0) continue; // unmapped
 
                 if (needsShift[ch]) {
+                    s_injectMods |= INPUT_MOD_LSHIFT;
                     InputEvent shift = {};
                     shift.type = InputEventType::KeyPress;
                     shift.scanCode = 0x2A; // left shift
+                    shift.modifiers = s_injectMods;
                     InputDevicePush(&s_debugInput, shift);
                 }
 
@@ -3342,15 +3392,18 @@ static void DebugHandleCommand(const char* cmd, uint32_t len)
                 ev.type = InputEventType::KeyPress;
                 ev.scanCode = sc;
                 ev.ascii = static_cast<char>(ch);
+                ev.modifiers = s_injectMods;
                 InputDevicePush(&s_debugInput, ev);
 
                 ev.type = InputEventType::KeyRelease;
                 InputDevicePush(&s_debugInput, ev);
 
                 if (needsShift[ch]) {
+                    s_injectMods &= ~INPUT_MOD_LSHIFT;
                     InputEvent shift = {};
                     shift.type = InputEventType::KeyRelease;
                     shift.scanCode = 0x2A;
+                    shift.modifiers = s_injectMods;
                     InputDevicePush(&s_debugInput, shift);
                 }
             }
