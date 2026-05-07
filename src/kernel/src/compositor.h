@@ -90,4 +90,10 @@ void CompositorClearInputGrabberIfMatches(Process* proc);
 // only visibility state; Wayland cursor surface pixels are a separate concern.
 bool CompositorSetCursorVisible(Process* proc, bool visible);
 
+// Upload a custom ARGB8888 cursor image. Pixels are copied into a
+// kernel-side buffer. Max 64×64. hotX/hotY are the click-point offset.
+// Pass w=0 to reset to the built-in arrow cursor.
+bool CompositorSetCursorImage(const uint32_t* pixels, uint32_t w, uint32_t h,
+                              int32_t hotX, int32_t hotY);
+
 } // namespace brook

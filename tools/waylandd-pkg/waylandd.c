@@ -54,6 +54,7 @@
 #define BROOK_SYS_WM_SET_MINIMIZED   516
 #define BROOK_SYS_WM_BEGIN_RESIZE    517
 #define BROOK_SYS_WM_SET_CURSOR_VISIBLE 518
+#define BROOK_SYS_WM_SET_CURSOR_IMAGE  519
 #define BROOK_WM_CREATE_FLAG_CSD     1u
 #define BROOK_WM_CREATE_FLAG_NO_FOCUS 2u
 
@@ -145,6 +146,11 @@ static long wm_begin_resize(uint32_t id, uint32_t edges) {
 static long wm_set_cursor_visible(int visible) {
     return syscall(BROOK_SYS_WM_SET_CURSOR_VISIBLE, (long)(visible != 0));
 }
+static long wm_set_cursor_image(const uint32_t *pixels, uint32_t w, uint32_t h,
+                                int32_t hot_x, int32_t hot_y) {
+    return syscall(BROOK_SYS_WM_SET_CURSOR_IMAGE, (long)pixels, (long)w,
+                   (long)h, (long)hot_x, (long)hot_y);
+}
 
 /* ---------------- per-surface state ---------------- */
 
@@ -196,6 +202,13 @@ struct brook_surface {
      * chrome for normal toplevels; popups are forced CSD/no-chrome. */
     int  deco_csd;          /* 1 = client-side, 0 = server-side */
     int  deco_pending;      /* mode change requested but wm_id not yet known */
+
+    /* Cursor surface state. When a surface is assigned as cursor via
+     * wl_pointer.set_cursor, its commits upload pixels to the kernel
+     * compositor rather than blitting to a window VFB. */
+    int     is_cursor;
+    int32_t cursor_hot_x;
+    int32_t cursor_hot_y;
 
     /* Linked list of all surfaces — used by the input pump. */
     struct brook_surface *next;
@@ -400,6 +413,26 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
     int32_t w      = wl_shm_buffer_get_width(shm);
     int32_t h      = wl_shm_buffer_get_height(shm);
     int32_t stride = wl_shm_buffer_get_stride(shm);
+
+    /* Cursor surface: upload pixels to kernel compositor, don't create a window */
+    if (s->is_cursor) {
+        if (w > 0 && h > 0 && w <= 64 && h <= 64) {
+            wl_shm_buffer_begin_access(shm);
+            const uint32_t *pixels = (const uint32_t *)wl_shm_buffer_get_data(shm);
+            wm_set_cursor_image(pixels, (uint32_t)w, (uint32_t)h,
+                                s->cursor_hot_x, s->cursor_hot_y);
+            wl_shm_buffer_end_access(shm);
+        }
+        wl_buffer_send_release(s->pending_buffer);
+        s->pending_buffer = NULL;
+        /* Fire frame callbacks so the client keeps sending updates */
+        for (int i = 0; i < s->pending_frame_cb_count; i++) {
+            wl_callback_send_done(s->pending_frame_cbs[i], g_now_ms());
+            wl_resource_destroy(s->pending_frame_cbs[i]);
+        }
+        s->pending_frame_cb_count = 0;
+        return;
+    }
 
     int may_blit = (!s->xdg_toplevel && !s->xdg_popup) || s->xdg_acked;
     if (may_blit && w > 0 && h > 0 && (s->xdg_toplevel || s->xdg_popup)) {
@@ -1016,13 +1049,40 @@ static void seat_apply_cursor_visibility(struct brook_seat_client *sc) {
 static void pointer_set_cursor(struct wl_client *c, struct wl_resource *r,
                                 uint32_t serial, struct wl_resource *surface,
                                 int32_t hx, int32_t hy) {
-    (void)c; (void)serial; (void)hx; (void)hy;
+    (void)c; (void)serial;
     struct brook_seat_client *sc = seat_for_resource(r);
     if (!sc) return;
     sc->cursor_visible = surface != NULL;
     seat_apply_cursor_visibility(sc);
-    fprintf(stderr, "[waylandd] wl_pointer.set_cursor visible=%d\n",
-            sc->cursor_visible);
+
+    if (surface) {
+        /* Mark this surface as a cursor surface so commits upload pixels
+         * to the kernel compositor instead of creating a window. */
+        struct brook_surface *cs = wl_resource_get_user_data(surface);
+        if (cs) {
+            cs->is_cursor = 1;
+            cs->cursor_hot_x = hx;
+            cs->cursor_hot_y = hy;
+        }
+
+        /* If buffer is already attached, upload immediately */
+        if (cs && cs->pending_buffer) {
+            struct wl_shm_buffer *shm = wl_shm_buffer_get(cs->pending_buffer);
+            if (shm) {
+                int32_t w = wl_shm_buffer_get_width(shm);
+                int32_t h = wl_shm_buffer_get_height(shm);
+                if (w > 0 && h > 0 && w <= 64 && h <= 64) {
+                    wl_shm_buffer_begin_access(shm);
+                    const uint32_t *pixels = (const uint32_t *)wl_shm_buffer_get_data(shm);
+                    wm_set_cursor_image(pixels, (uint32_t)w, (uint32_t)h, hx, hy);
+                    wl_shm_buffer_end_access(shm);
+                }
+            }
+        }
+    } else {
+        /* Reset to built-in cursor */
+        wm_set_cursor_image(NULL, 0, 0, 0, 0);
+    }
 }
 static void pointer_release(struct wl_client *c, struct wl_resource *r) {
     (void)c; wl_resource_destroy(r);

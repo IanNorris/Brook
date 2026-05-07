@@ -710,11 +710,11 @@ static void BlitWallpaper()
 }
 
 // ---------------------------------------------------------------------------
-// Hardware cursor — simple 12×16 arrow pointer
+// Hardware cursor — software-rendered pointer
 // ---------------------------------------------------------------------------
 
-// 1 = white, 2 = black outline, 0 = transparent
-static const uint8_t g_cursorBitmap[16][12] = {
+// Built-in 12×16 arrow: 1=white, 2=black outline, 0=transparent
+static const uint8_t g_cursorBitmapBuiltin[16][12] = {
     {2,0,0,0,0,0,0,0,0,0,0,0},
     {2,2,0,0,0,0,0,0,0,0,0,0},
     {2,1,2,0,0,0,0,0,0,0,0,0},
@@ -733,32 +733,43 @@ static const uint8_t g_cursorBitmap[16][12] = {
     {0,0,0,0,0,2,2,2,2,0,0,0},
 };
 
-static constexpr uint32_t CURSOR_W = 12;
-static constexpr uint32_t CURSOR_H = 16;
+static constexpr uint32_t CURSOR_MAX = 64;
+// Active cursor state
+static uint32_t g_cursorW = 12;
+static uint32_t g_cursorH = 16;
+static int32_t  g_cursorHotX = 0;
+static int32_t  g_cursorHotY = 0;
+static bool     g_cursorCustom = false;
+static uint32_t g_cursorPixels[CURSOR_MAX * CURSOR_MAX]; // ARGB8888 custom cursor
 
 // Saved pixels under the cursor (for restore before re-blit)
-static uint32_t g_cursorSave[CURSOR_W * CURSOR_H];
+static uint32_t g_cursorSave[CURSOR_MAX * CURSOR_MAX];
 static int32_t  g_cursorSaveX = -1;
 static int32_t  g_cursorSaveY = -1;
+static int32_t  g_cursorSaveW = 0;
+static int32_t  g_cursorSaveH = 0;
 static bool     g_cursorVisible = false;
 
 static void CursorSaveUnder(int32_t cx, int32_t cy)
 {
     uint32_t* buf = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
     uint32_t  stride = g_backBuffer ? g_backBufStride : g_physFbStride;
-    for (uint32_t row = 0; row < CURSOR_H; row++)
+    uint32_t cw = g_cursorW, ch = g_cursorH;
+    for (uint32_t row = 0; row < ch; row++)
     {
         int32_t sy = cy + static_cast<int32_t>(row);
         if (sy < 0 || static_cast<uint32_t>(sy) >= g_physFbHeight) continue;
-        for (uint32_t col = 0; col < CURSOR_W; col++)
+        for (uint32_t col = 0; col < cw; col++)
         {
             int32_t sx = cx + static_cast<int32_t>(col);
             if (sx < 0 || static_cast<uint32_t>(sx) >= g_physFbWidth) continue;
-            g_cursorSave[row * CURSOR_W + col] = buf[sy * stride + sx];
+            g_cursorSave[row * cw + col] = buf[sy * stride + sx];
         }
     }
     g_cursorSaveX = cx;
     g_cursorSaveY = cy;
+    g_cursorSaveW = static_cast<int32_t>(cw);
+    g_cursorSaveH = static_cast<int32_t>(ch);
     g_cursorVisible = true;
 }
 
@@ -769,38 +780,101 @@ static void CursorRestore()
     uint32_t  stride = g_backBuffer ? g_backBufStride : g_physFbStride;
     int32_t cx = g_cursorSaveX;
     int32_t cy = g_cursorSaveY;
-    for (uint32_t row = 0; row < CURSOR_H; row++)
+    uint32_t cw = static_cast<uint32_t>(g_cursorSaveW);
+    uint32_t ch = static_cast<uint32_t>(g_cursorSaveH);
+    for (uint32_t row = 0; row < ch; row++)
     {
         int32_t sy = cy + static_cast<int32_t>(row);
         if (sy < 0 || static_cast<uint32_t>(sy) >= g_physFbHeight) continue;
-        for (uint32_t col = 0; col < CURSOR_W; col++)
+        for (uint32_t col = 0; col < cw; col++)
         {
             int32_t sx = cx + static_cast<int32_t>(col);
             if (sx < 0 || static_cast<uint32_t>(sx) >= g_physFbWidth) continue;
-            buf[sy * stride + sx] = g_cursorSave[row * CURSOR_W + col];
+            buf[sy * stride + sx] = g_cursorSave[row * cw + col];
         }
     }
     g_cursorVisible = false;
 }
 
-static void CursorDraw(int32_t cx, int32_t cy)
+static void CursorDraw(int32_t mx, int32_t my)
 {
+    // Apply hotspot offset
+    int32_t cx = mx - g_cursorHotX;
+    int32_t cy = my - g_cursorHotY;
+
     CursorSaveUnder(cx, cy);
     uint32_t* buf = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
     uint32_t  stride = g_backBuffer ? g_backBufStride : g_physFbStride;
-    for (uint32_t row = 0; row < CURSOR_H; row++)
-    {
-        int32_t sy = cy + static_cast<int32_t>(row);
-        if (sy < 0 || static_cast<uint32_t>(sy) >= g_physFbHeight) continue;
-        for (uint32_t col = 0; col < CURSOR_W; col++)
+    uint32_t cw = g_cursorW, ch = g_cursorH;
+
+    if (g_cursorCustom) {
+        // Custom ARGB8888 cursor with alpha blending
+        for (uint32_t row = 0; row < ch; row++)
         {
-            uint8_t px = g_cursorBitmap[row][col];
-            if (px == 0) continue; // transparent
-            int32_t sx = cx + static_cast<int32_t>(col);
-            if (sx < 0 || static_cast<uint32_t>(sx) >= g_physFbWidth) continue;
-            buf[sy * stride + sx] = (px == 1) ? 0x00FFFFFF : 0x00000000;
+            int32_t sy = cy + static_cast<int32_t>(row);
+            if (sy < 0 || static_cast<uint32_t>(sy) >= g_physFbHeight) continue;
+            for (uint32_t col = 0; col < cw; col++)
+            {
+                int32_t sx = cx + static_cast<int32_t>(col);
+                if (sx < 0 || static_cast<uint32_t>(sx) >= g_physFbWidth) continue;
+                uint32_t src = g_cursorPixels[row * cw + col];
+                uint32_t alpha = (src >> 24) & 0xFF;
+                if (alpha == 0) continue;
+                if (alpha == 255) {
+                    buf[sy * stride + sx] = src | 0xFF000000;
+                } else {
+                    uint32_t dst = buf[sy * stride + sx];
+                    uint32_t invA = 255 - alpha;
+                    uint32_t r = (((src >> 16) & 0xFF) * alpha + ((dst >> 16) & 0xFF) * invA) / 255;
+                    uint32_t g = (((src >>  8) & 0xFF) * alpha + ((dst >>  8) & 0xFF) * invA) / 255;
+                    uint32_t b = (((src      ) & 0xFF) * alpha + ((dst      ) & 0xFF) * invA) / 255;
+                    buf[sy * stride + sx] = 0xFF000000 | (r << 16) | (g << 8) | b;
+                }
+            }
+        }
+    } else {
+        // Built-in arrow bitmap
+        for (uint32_t row = 0; row < ch; row++)
+        {
+            int32_t sy = cy + static_cast<int32_t>(row);
+            if (sy < 0 || static_cast<uint32_t>(sy) >= g_physFbHeight) continue;
+            for (uint32_t col = 0; col < cw; col++)
+            {
+                uint8_t px = g_cursorBitmapBuiltin[row][col];
+                if (px == 0) continue;
+                int32_t sx = cx + static_cast<int32_t>(col);
+                if (sx < 0 || static_cast<uint32_t>(sx) >= g_physFbWidth) continue;
+                buf[sy * stride + sx] = (px == 1) ? 0x00FFFFFF : 0x00000000;
+            }
         }
     }
+}
+
+bool CompositorSetCursorImage(const uint32_t* pixels, uint32_t w, uint32_t h,
+                                     int32_t hotX, int32_t hotY)
+{
+    if (w == 0 || h == 0) {
+        // Reset to built-in cursor
+        g_cursorCustom = false;
+        g_cursorW = 12;
+        g_cursorH = 16;
+        g_cursorHotX = 0;
+        g_cursorHotY = 0;
+        return true;
+    }
+    if (w > CURSOR_MAX || h > CURSOR_MAX) return false;
+
+    // Copy pixels into kernel buffer
+    for (uint32_t row = 0; row < h; row++)
+        for (uint32_t col = 0; col < w; col++)
+            g_cursorPixels[row * w + col] = pixels[row * w + col];
+
+    g_cursorW = w;
+    g_cursorH = h;
+    g_cursorHotX = hotX;
+    g_cursorHotY = hotY;
+    g_cursorCustom = true;
+    return true;
 }
 
 // Global halt flag — set by panic to stop compositing.
@@ -1078,6 +1152,54 @@ static void CompositorLoopWM()
         if (ev.type != InputEventType::KeyPress && ev.type != InputEventType::KeyRelease)
             continue;
 
+        // --- Global hotkeys (work regardless of focus state) ---
+        if (ev.type == InputEventType::KeyPress)
+        {
+            // Alt+Tab — cycle focus to next window
+            if ((ev.modifiers & INPUT_MOD_ALT) && ev.scanCode == 0x0F) // Tab
+            {
+                int cur = WmGetFocusedWindow();
+                int zOrder[WM_MAX_WINDOWS];
+                uint32_t zCount = WmGetZOrder(zOrder, WM_MAX_WINDOWS);
+                if (zCount > 1) {
+                    // Find current in z-order, cycle to previous (below current)
+                    int nextIdx = zOrder[0]; // default to backmost
+                    for (uint32_t z = 0; z < zCount; z++) {
+                        if (zOrder[z] == cur && z > 0) {
+                            nextIdx = zOrder[z - 1];
+                            break;
+                        }
+                    }
+                    WmSetFocus(nextIdx);
+                }
+                continue;
+            }
+
+            // Super+T or Ctrl+T — spawn new terminal window
+            if (((ev.modifiers & INPUT_MOD_SUPER) || (ev.modifiers & INPUT_MOD_CTRL))
+                && ev.scanCode == 0x14) // T
+            {
+                WmSpawnTerminal();
+                continue;
+            }
+
+            // Super+Q — close focused window
+            if ((ev.modifiers & INPUT_MOD_SUPER) && ev.scanCode == 0x10) // Q
+            {
+                int cur = WmGetFocusedWindow();
+                if (cur >= 0) {
+                    Window* w = WmGetWindow(cur);
+                    if (w && w->proc) {
+                        if (w->vfb) // WM-API (Wayland) window
+                            WmPushWmEvent(w, WM_EVT_CLOSE_REQUESTED, 0, 0);
+                        else // Terminal — send SIGTERM
+                            ProcessSendSignal(w->proc, 15);
+                    }
+                }
+                continue;
+            }
+        }
+
         // Find the focused window (needed for both press and release)
         Window* focused = nullptr;
         for (uint32_t i = 0; i < WM_MAX_WINDOWS; i++)
@@ -1099,17 +1221,6 @@ static void CompositorLoopWM()
         else
         {
         DbgPrintf("KEY: scan=0x%02x ascii=0x%02x\n", ev.scanCode, ev.ascii);
-
-        // Global hotkeys (no focused window needed)
-        if (ev.modifiers & INPUT_MOD_CTRL)
-        {
-            // Ctrl+T — spawn new terminal window
-            if (ev.scanCode == 0x14) // T
-            {
-                WmSpawnTerminal();
-                continue;
-            }
-        }
 
         // Check for terminal signal keys (Ctrl+C, Ctrl+Z, Ctrl+\)
         if (ev.modifiers & INPUT_MOD_CTRL)
@@ -1677,7 +1788,7 @@ static void CompositorLoop()
     // Restore pixels under the old cursor position before blitting.
     if (g_cursorVisible) {
         uint32_t oldMinY = (g_cursorSaveY >= 0) ? static_cast<uint32_t>(g_cursorSaveY) : 0;
-        uint32_t oldMaxY = static_cast<uint32_t>(g_cursorSaveY) + CURSOR_H;
+        uint32_t oldMaxY = static_cast<uint32_t>(g_cursorSaveY) + static_cast<uint32_t>(g_cursorSaveH);
         if (oldMaxY > g_physFbHeight) oldMaxY = g_physFbHeight;
         CursorRestore();
         MarkDirtyRows(oldMinY, oldMaxY);
@@ -1761,8 +1872,10 @@ static void CompositorLoop()
     {
         int32_t mx, my;
         MouseGetPosition(&mx, &my);
-        uint32_t newMinY = (my >= 0) ? static_cast<uint32_t>(my) : 0;
-        uint32_t newMaxY = static_cast<uint32_t>(my) + CURSOR_H;
+        // CursorDraw applies hotspot internally; dirty region needs hotspot-adjusted coords
+        int32_t drawY = my - g_cursorHotY;
+        uint32_t newMinY = (drawY >= 0) ? static_cast<uint32_t>(drawY) : 0;
+        uint32_t newMaxY = static_cast<uint32_t>(drawY) + g_cursorH;
         if (newMaxY > g_physFbHeight) newMaxY = g_physFbHeight;
         MarkDirtyRows(newMinY, newMaxY);
         CursorDraw(mx, my);

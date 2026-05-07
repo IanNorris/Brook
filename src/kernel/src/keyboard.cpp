@@ -391,6 +391,7 @@ static char BufPop()
 static volatile bool g_shiftHeld = false;
 static volatile bool g_ctrlHeld  = false;
 static volatile bool g_altHeld   = false;
+static volatile bool g_superHeld = false;
 static volatile bool g_capsLock  = false;
 static volatile bool g_e0Prefix  = false; // E0-prefixed extended key pending
 
@@ -451,6 +452,11 @@ static void KbdIrqHandler(InterruptFrame* frame)
             g_altHeld = !release;
             ApicSendEoi();
             return;
+        case 0x5B: // Left Super (GUI)
+        case 0x5C: // Right Super (GUI)
+            g_superHeld = !release;
+            ApicSendEoi();
+            return;
         default:
             // Unknown E0 key — ignore
             ApicSendEoi();
@@ -463,6 +469,7 @@ static void KbdIrqHandler(InterruptFrame* frame)
     if (g_shiftHeld) mods |= INPUT_MOD_LSHIFT;
     if (g_ctrlHeld)  mods |= INPUT_MOD_CTRL;
     if (g_altHeld)   mods |= INPUT_MOD_ALT;
+    if (g_superHeld) mods |= INPUT_MOD_SUPER;
     if (g_capsLock)  mods |= INPUT_MOD_CAPSLOCK;
 
     // Track modifier state (non-extended keys only).

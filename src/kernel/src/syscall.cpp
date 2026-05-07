@@ -9695,6 +9695,25 @@ static int64_t sys_brook_wm_set_cursor_visible(uint64_t visible, uint64_t,
     return brook::CompositorSetCursorVisible(proc, visible != 0) ? 0 : -EPERM;
 }
 
+// 519: WM_SET_CURSOR_IMAGE(pixels_ptr, w, h, hotX, hotY)
+// Upload a custom ARGB8888 cursor image (max 64×64). Pass w=0 to reset.
+static int64_t sys_brook_wm_set_cursor_image(uint64_t pixelsAddr, uint64_t w,
+                                              uint64_t h, uint64_t hotX,
+                                              uint64_t hotY, uint64_t)
+{
+    if (w == 0) {
+        brook::CompositorSetCursorImage(nullptr, 0, 0, 0, 0);
+        return 0;
+    }
+    if (w > 64 || h > 64) return -EINVAL;
+    uint64_t byteSize = w * h * 4;
+    if (!UserBufferReadable(pixelsAddr, byteSize)) return -EFAULT;
+    return brook::CompositorSetCursorImage(
+        reinterpret_cast<const uint32_t*>(pixelsAddr),
+        static_cast<uint32_t>(w), static_cast<uint32_t>(h),
+        static_cast<int32_t>(hotX), static_cast<int32_t>(hotY)) ? 0 : -EINVAL;
+}
+
 // ---------------------------------------------------------------------------
 // sys_not_implemented
 // ---------------------------------------------------------------------------
@@ -11436,6 +11455,7 @@ void SyscallTableInit()
     g_syscallTable[516]                  = sys_brook_wm_set_minimized;
     g_syscallTable[517]                  = sys_brook_wm_begin_resize;
     g_syscallTable[518]                  = sys_brook_wm_set_cursor_visible;
+    g_syscallTable[519]                  = sys_brook_wm_set_cursor_image;
 
     uint32_t count = 0;
     for (uint64_t i = 0; i < SYSCALL_MAX; ++i)

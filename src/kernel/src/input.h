@@ -42,6 +42,7 @@ static constexpr uint8_t INPUT_MOD_RSHIFT   = (1 << 1);
 static constexpr uint8_t INPUT_MOD_CTRL     = (1 << 2);
 static constexpr uint8_t INPUT_MOD_ALT      = (1 << 3);
 static constexpr uint8_t INPUT_MOD_CAPSLOCK = (1 << 4);
+static constexpr uint8_t INPUT_MOD_SUPER    = (1 << 5);
 
 static constexpr uint8_t INPUT_MOD_SHIFT = (INPUT_MOD_LSHIFT | INPUT_MOD_RSHIFT);
 
