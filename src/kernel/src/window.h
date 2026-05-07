@@ -83,6 +83,7 @@ struct Window
     WmInputEvent inputQueue[WM_INPUT_QUEUE];
     volatile uint32_t inputHead;
     volatile uint32_t inputTail;
+    uint32_t inputDropCount;
 
     // Pre-maximise geometry (for restore)
     int16_t     savedX, savedY;

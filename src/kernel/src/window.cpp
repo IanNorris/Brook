@@ -207,6 +207,7 @@ int WmCreateWindow(Process* proc, int16_t x, int16_t y,
     w.wmId      = static_cast<uint16_t>(idx + 1);
     w.inputHead = 0;
     w.inputTail = 0;
+    w.inputDropCount = 0;
     WmStrCopy(w.title, title ? title : "Window", sizeof(w.title));
 
     SerialPrintf("WM: created window %d '%s' at (%d,%d) %ux%u scale=%u for pid %u\n",
@@ -1547,7 +1548,26 @@ void WmInputPush(Window* win, const InputEvent& ev, int16_t localX, int16_t loca
     uint32_t tail = __atomic_load_n(&win->inputTail, __ATOMIC_ACQUIRE);
     uint32_t next = (head + 1) % Window::WM_INPUT_QUEUE;
     if (next == tail) {
-        SerialPrintf("WmInputPush: queue FULL wm=%u type=%d\n", win->wmId, (int)ev.type);
+        // Queue full — for mouse-move events, coalesce by overwriting the
+        // newest entry if it's also a mouse-move (consumer only needs latest
+        // position). For other event types, drop with a rate-limited warning.
+        if (ev.type == InputEventType::MouseMove && head != tail)
+        {
+            uint32_t prev = (head + Window::WM_INPUT_QUEUE - 1) % Window::WM_INPUT_QUEUE;
+            Window::WmInputEvent& slot = win->inputQueue[prev];
+            if (slot.type == static_cast<uint8_t>(InputEventType::MouseMove))
+            {
+                slot.x = localX;
+                slot.y = localY;
+                slot.modifiers = ev.modifiers;
+                return; // coalesced
+            }
+        }
+        // Rate-limit the warning: only print once per ~256 drops per window
+        win->inputDropCount++;
+        if ((win->inputDropCount & 0xFF) == 1)
+            SerialPrintf("WmInputPush: queue FULL wm=%u type=%d (dropped %u)\n",
+                         win->wmId, (int)ev.type, win->inputDropCount);
         return;
     }
     Window::WmInputEvent& slot = win->inputQueue[head];
