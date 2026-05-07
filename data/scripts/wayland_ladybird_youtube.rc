@@ -1,0 +1,5 @@
+# Brook + Ladybird Wayland YouTube test.
+set wm
+set vfb none
+run --once /nix/bin/waylandd
+run /nix/profile/bin/Ladybird --force-cpu-painting --disable-sql-database --disable-http-disk-cache https://www.youtube.com
