@@ -687,58 +687,63 @@ extern "C" bool MemFdHandleUserFault(uint64_t cr2, uint64_t errCode)
 // ---------------------------------------------------------------------------
 
 struct PageCacheEntry {
-    Vnode*          vnode;       // owning vnode (nullptr = empty slot)
+    uint64_t        cacheId;     // file identity (0 = empty slot)
     uint64_t        pageIndex;   // file offset / 4096
     PhysicalAddress phys;        // cached physical page
+    Vnode*          vnode;       // vnode holding a ref (lifecycle only, not used as key)
 };
 
-static constexpr uint32_t PAGE_CACHE_SLOTS = 16384;  // 64MB worth of 4KB pages
+static constexpr uint32_t PAGE_CACHE_SLOTS = 32768;
 static PageCacheEntry g_pageCache[PAGE_CACHE_SLOTS];
 static SpinLock g_pageCacheLock;
 
-static inline uint32_t PageCacheHash(Vnode* vn, uint64_t pageIdx)
+static inline uint32_t PageCacheHash(uint64_t cacheId, uint64_t pageIdx)
 {
-    uint64_t key = reinterpret_cast<uint64_t>(vn) ^ (pageIdx * 2654435761ULL);
+    uint64_t key = cacheId ^ (pageIdx * 2654435761ULL);
     return static_cast<uint32_t>(key % PAGE_CACHE_SLOTS);
 }
 
-// Look up a cached page. Returns valid PhysicalAddress if found (bumps PMM refcount).
+// Look up a cached page by file identity. Returns valid PhysicalAddress if found (bumps refcount).
 static PhysicalAddress PageCacheLookup(Vnode* vn, uint64_t pageIdx)
 {
+    uint64_t cid = vn->cacheId;
+    if (!cid) return PhysicalAddress(0); // no cache identity
     uint64_t flags = SpinLockAcquire(&g_pageCacheLock);
-    uint32_t slot = PageCacheHash(vn, pageIdx);
+    uint32_t slot = PageCacheHash(cid, pageIdx);
     for (uint32_t i = 0; i < 32; ++i) {
         uint32_t s = (slot + i) % PAGE_CACHE_SLOTS;
         auto& e = g_pageCache[s];
-        if (e.vnode == vn && e.pageIndex == pageIdx) {
+        if (e.cacheId == cid && e.pageIndex == pageIdx) {
             PmmRefPage(e.phys);
             SpinLockRelease(&g_pageCacheLock, flags);
             return e.phys;
         }
-        if (!e.vnode) break;
+        if (!e.cacheId) break;
     }
     SpinLockRelease(&g_pageCacheLock, flags);
     return PhysicalAddress(0);
 }
 
 // Insert a page into the cache. Caller transfers ownership of one ref to the cache.
-// Also takes a VnodeRef to prevent the vnode from being freed while cached (ABA prevention).
 static void PageCacheInsert(Vnode* vn, uint64_t pageIdx, PhysicalAddress phys)
 {
+    uint64_t cid = vn->cacheId;
+    if (!cid) { PmmUnrefPage(phys); return; } // no cache identity
     uint64_t flags = SpinLockAcquire(&g_pageCacheLock);
-    uint32_t slot = PageCacheHash(vn, pageIdx);
+    uint32_t slot = PageCacheHash(cid, pageIdx);
     for (uint32_t i = 0; i < 32; ++i) {
         uint32_t s = (slot + i) % PAGE_CACHE_SLOTS;
         auto& e = g_pageCache[s];
-        if (!e.vnode) {
-            VnodeRef(vn);  // prevent vnode reuse while cached
+        if (!e.cacheId) {
+            VnodeRef(vn);
+            e.cacheId = cid;
             e.vnode = vn;
             e.pageIndex = pageIdx;
             e.phys = phys;
             SpinLockRelease(&g_pageCacheLock, flags);
             return;
         }
-        if (e.vnode == vn && e.pageIndex == pageIdx) {
+        if (e.cacheId == cid && e.pageIndex == pageIdx) {
             SpinLockRelease(&g_pageCacheLock, flags);
             PmmUnrefPage(phys);
             return;
@@ -748,13 +753,15 @@ static void PageCacheInsert(Vnode* vn, uint64_t pageIdx, PhysicalAddress phys)
     PmmUnrefPage(phys);
 }
 
-// Read-ahead: preload file pages into the cache in a single bulk read.
-// For files ≤1MB (256 pages), loads the entire mapping at mmap time so
-// subsequent page faults are instant cache hits instead of individual disk reads.
+// Preload file pages into the cache in bulk.
+// Reads directly into physical pages via 64KB VfsRead chunks, avoiding a
+// single large bounce buffer. Handles files up to 4MB.
 static uint32_t PageCachePreload(Vnode* vn, uint64_t startPageIdx,
                                   uint64_t fileSize, uint32_t maxPages)
 {
-    static constexpr uint32_t MAX_PRELOAD_PAGES = 256; // 1MB
+    static constexpr uint32_t MAX_PRELOAD_PAGES = 1024; // 4MB
+    static constexpr uint32_t CHUNK_PAGES = 16;         // 64KB per VfsRead
+
     if (maxPages > MAX_PRELOAD_PAGES) maxPages = MAX_PRELOAD_PAGES;
 
     // Cap by file size
@@ -763,65 +770,55 @@ static uint32_t PageCachePreload(Vnode* vn, uint64_t startPageIdx,
     if (startPageIdx + maxPages > maxFilePages)
         maxPages = static_cast<uint32_t>(maxFilePages - startPageIdx);
 
-    // Skip pages already in cache (find first uncached)
-    uint32_t uncachedStart = 0;
-    while (uncachedStart < maxPages) {
-        PhysicalAddress p = PageCacheLookup(vn, startPageIdx + uncachedStart);
-        if (p) { PmmUnrefPage(p); uncachedStart++; continue; }
-        break;
-    }
-    if (uncachedStart >= maxPages) return maxPages;
+    // Fast check: if first page is already cached, entire file likely is
+    PhysicalAddress probe = PageCacheLookup(vn, startPageIdx);
+    if (probe) { PmmUnrefPage(probe); return maxPages; }
 
-    uint32_t toRead = maxPages - uncachedStart;
+    // 64KB bounce buffer for disk reads
+    auto* readBuf = static_cast<uint8_t*>(kmalloc(CHUNK_PAGES * 4096));
+    if (!readBuf) return 0;
 
-    // Allocate physical pages for the batch
-    PhysicalAddress* pages = static_cast<PhysicalAddress*>(
-        kmalloc(toRead * sizeof(PhysicalAddress)));
-    if (!pages) return uncachedStart;
+    uint32_t totalCached = 0;
 
-    for (uint32_t i = 0; i < toRead; ++i) {
-        pages[i] = PmmAllocPage(MemTag::User, 0);
-        if (!pages[i]) { toRead = i; break; }
-    }
-    if (toRead == 0) { kfree(pages); return uncachedStart; }
+    for (uint32_t base = 0; base < maxPages; base += CHUNK_PAGES) {
+        uint32_t chunkPages = maxPages - base;
+        if (chunkPages > CHUNK_PAGES) chunkPages = CHUNK_PAGES;
 
-    // Single bulk read from disk
-    uint64_t readOffset = (startPageIdx + uncachedStart) * 4096;
-    uint64_t totalBytes = static_cast<uint64_t>(toRead) * 4096;
-    uint64_t off = readOffset;
-
-    auto* readBuf = static_cast<uint8_t*>(kmalloc(static_cast<uint32_t>(totalBytes)));
-    if (!readBuf) {
-        for (uint32_t i = 0; i < toRead; ++i) PmmFreePage(pages[i]);
-        kfree(pages);
-        return uncachedStart;
-    }
-
-    __builtin_memset(readBuf, 0, totalBytes);
-    int got = VfsRead(vn, readBuf, totalBytes, &off);
-    if (got < 0) got = 0;
-
-    // Scatter data into physical pages and insert each into cache
-    for (uint32_t i = 0; i < toRead; ++i) {
-        auto* kp = reinterpret_cast<uint8_t*>(PhysToVirt(pages[i]).raw());
-
-        uint64_t srcOff = i * 4096;
-        if (srcOff < static_cast<uint64_t>(got)) {
-            uint64_t toCopy = static_cast<uint64_t>(got) - srcOff;
-            if (toCopy > 4096) toCopy = 4096;
-            __builtin_memcpy(kp, readBuf + srcOff, toCopy);
-            if (toCopy < 4096)
-                __builtin_memset(kp + toCopy, 0, 4096 - toCopy);
-        } else {
-            __builtin_memset(kp, 0, 4096);
+        // Allocate physical pages for this chunk
+        PhysicalAddress pages[CHUNK_PAGES];
+        for (uint32_t i = 0; i < chunkPages; ++i) {
+            pages[i] = PmmAllocPage(MemTag::User, 0);
+            if (!pages[i]) { chunkPages = i; break; }
         }
+        if (chunkPages == 0) break;
 
-        PageCacheInsert(vn, startPageIdx + uncachedStart + i, pages[i]);
+        // Bulk read from disk
+        uint64_t off = (startPageIdx + base) * 4096;
+        uint64_t chunkBytes = static_cast<uint64_t>(chunkPages) * 4096;
+        __builtin_memset(readBuf, 0, chunkBytes);
+        int got = VfsRead(vn, readBuf, chunkBytes, &off);
+        if (got < 0) got = 0;
+
+        // Scatter into physical pages and insert into cache
+        for (uint32_t i = 0; i < chunkPages; ++i) {
+            auto* kp = reinterpret_cast<uint8_t*>(PhysToVirt(pages[i]).raw());
+            uint64_t srcOff = i * 4096;
+            if (srcOff < static_cast<uint64_t>(got)) {
+                uint64_t toCopy = static_cast<uint64_t>(got) - srcOff;
+                if (toCopy > 4096) toCopy = 4096;
+                __builtin_memcpy(kp, readBuf + srcOff, toCopy);
+                if (toCopy < 4096)
+                    __builtin_memset(kp + toCopy, 0, 4096 - toCopy);
+            } else {
+                __builtin_memset(kp, 0, 4096);
+            }
+            PageCacheInsert(vn, startPageIdx + base + i, pages[i]);
+        }
+        totalCached += chunkPages;
     }
 
     kfree(readBuf);
-    kfree(pages);
-    return uncachedStart + toRead;
+    return totalCached;
 }
 
 // Demand-page a private file-backed mapping.  File VMAs own a Vnode reference,
@@ -3357,7 +3354,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         // Preload entire file into page cache if ≤1MB.
         // Converts thousands of individual 4KB page faults into a single
         // bulk disk read — critical for shared library loading performance.
-        static constexpr uint64_t PRELOAD_THRESHOLD = 1024 * 1024; // 1MB
+        static constexpr uint64_t PRELOAD_THRESHOLD = 4 * 1024 * 1024; // 4MB
         VnodeStat st;
         if (VfsStat(vn, &st) == 0 && st.size <= PRELOAD_THRESHOLD && st.size > 0) {
             uint64_t startPage = offset / 4096;

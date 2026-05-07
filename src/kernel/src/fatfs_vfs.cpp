@@ -376,7 +376,7 @@ static Vnode* FatFsOpen(void* /*mountPriv*/, uint8_t pdrv,
                 return nullptr;
             }
             vn->ops = &g_cachedFileOps; vn->type = VnodeType::File;
-            vn->priv = existing; vn->refCount = 1;
+            vn->priv = existing; vn->refCount = 1; vn->cacheId = 0;
             return vn;
         }
         KMutexUnlock(&g_fatLock);
@@ -415,7 +415,7 @@ static Vnode* FatFsOpen(void* /*mountPriv*/, uint8_t pdrv,
                 cf->data = nullptr;
                 kfree(cf);
                 vn->ops = &g_cachedFileOps; vn->type = VnodeType::File;
-                vn->priv = placeholder; vn->refCount = 1;
+                vn->priv = placeholder; vn->refCount = 1; vn->cacheId = 0;
                 return vn;
             }
             if (placeholder)
@@ -425,7 +425,7 @@ static Vnode* FatFsOpen(void* /*mountPriv*/, uint8_t pdrv,
                 FileCacheInsert(cf);
                 KMutexUnlock(&g_fatLock);
                 vn->ops = &g_cachedFileOps; vn->type = VnodeType::File;
-                vn->priv = cf; vn->refCount = 1;
+                vn->priv = cf; vn->refCount = 1; vn->cacheId = 0;
                 return vn;
             }
         } else {
@@ -433,7 +433,7 @@ static Vnode* FatFsOpen(void* /*mountPriv*/, uint8_t pdrv,
         }
 
         vn->ops = &g_fatFileOps; vn->type = VnodeType::File;
-        vn->priv = fil; vn->refCount = 1;
+        vn->priv = fil; vn->refCount = 1; vn->cacheId = 0;
 
         if (flags & VFS_O_APPEND) {
             KMutexLock(&g_fatLock);
@@ -463,7 +463,7 @@ static Vnode* FatFsOpen(void* /*mountPriv*/, uint8_t pdrv,
             return nullptr;
         }
         vn->ops = &g_fatDirOps; vn->type = VnodeType::Dir;
-        vn->priv = dir; vn->refCount = 1;
+        vn->priv = dir; vn->refCount = 1; vn->cacheId = 0;
         return vn;
     }
     kfree(dir);

@@ -41,6 +41,7 @@ struct Vnode {
     VnodeType       type;
     void*           priv;     // filesystem-private state (e.g. FIL* or DIR*)
     uint32_t        refCount; // reference count for fork/dup sharing
+    uint64_t        cacheId;  // unique file identity for page cache dedup (e.g. inode number)
 };
 
 struct DirEntry {

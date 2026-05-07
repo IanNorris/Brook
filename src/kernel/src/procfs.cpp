@@ -213,7 +213,7 @@ static Vnode* MakeProcVnode(char* data, uint32_t size, bool isDir = false, Vnode
     vn->ops = ops ? ops : &g_procFileOps;
     vn->type = isDir ? VnodeType::Dir : VnodeType::File;
     vn->priv = pp;
-    vn->refCount = 1;
+    vn->refCount = 1; vn->cacheId = 0;
     return vn;
 }
 

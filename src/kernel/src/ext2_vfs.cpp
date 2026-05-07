@@ -11,7 +11,7 @@
 #include "memory/heap.h"
 #include "serial.h"
 #include "string.h"
-#include "sync/kmutex.h"
+#include "sync/krwlock.h"
 #include "spinlock.h"
 
 namespace brook {
@@ -228,18 +228,19 @@ struct Ext2DirPriv {
     uint32_t   readOffset; // byte offset into directory data
 };
 
-static KMutex g_ext2Lock;
-static bool   g_ext2LockInit = false;
+static KRwLock g_ext2Lock;
+static bool    g_ext2LockInit = false;
 
 static void EnsureLock()
 {
-    if (!g_ext2LockInit) { KMutexInit(&g_ext2Lock); g_ext2LockInit = true; }
+    if (!g_ext2LockInit) { KRwLockInit(&g_ext2Lock); g_ext2LockInit = true; }
 }
 
 void Ext2ForceUnlockForPid(uint32_t pid)
 {
-    if (g_ext2LockInit)
-        KMutexForceUnlock(&g_ext2Lock, pid);
+    // RwLock doesn't support force-unlock per PID; skip for now.
+    // The old KMutex force-unlock was a safety net for process cleanup.
+    (void)pid;
 }
 
 // ---------------------------------------------------------------------------
@@ -1365,9 +1366,9 @@ static int Ext2FileOpen(Vnode* vn, int flags) { (void)vn; (void)flags; return 0;
 static int Ext2FileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
 {
     auto* fp = static_cast<Ext2FilePriv*>(vn->priv);
-    KMutexLock(&g_ext2Lock);
+    KRwLockReadLock(&g_ext2Lock);
     int r = Ext2ReadInodeData(fp->mnt, &fp->inodeData, buf, len, *offset);
-    KMutexUnlock(&g_ext2Lock);
+    KRwLockReadUnlock(&g_ext2Lock);
     if (r > 0) *offset += r;
     return r;
 }
@@ -1375,9 +1376,9 @@ static int Ext2FileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
 static int Ext2FileWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset)
 {
     auto* fp = static_cast<Ext2FilePriv*>(vn->priv);
-    KMutexLock(&g_ext2Lock);
+    KRwLockWriteLock(&g_ext2Lock);
     int r = Ext2WriteInodeData(fp->mnt, &fp->inodeData, fp->inode, buf, len, *offset);
-    KMutexUnlock(&g_ext2Lock);
+    KRwLockWriteUnlock(&g_ext2Lock);
     if (r > 0) *offset += r;
     return r;
 }
@@ -1402,17 +1403,17 @@ static int Ext2DirReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
     uint64_t dirSize = Ext2InodeSize(&dp->inodeData);
     (void)cookie;
 
-    KMutexLock(&g_ext2Lock);
+    KRwLockReadLock(&g_ext2Lock);
 
     while (dp->readOffset < dirSize) {
         // Read directory entry at current offset
         uint8_t entBuf[264]; // max dir entry: 8 + 255 name
         int r = Ext2ReadInodeData(dp->mnt, &dp->inodeData, entBuf,
                                   sizeof(entBuf), dp->readOffset);
-        if (r < 8) { KMutexUnlock(&g_ext2Lock); return 0; } // end or error
+        if (r < 8) { KRwLockReadUnlock(&g_ext2Lock); return 0; } // end or error
 
         auto* de = reinterpret_cast<Ext2DirEntry2*>(entBuf);
-        if (de->rec_len == 0) { KMutexUnlock(&g_ext2Lock); return 0; }
+        if (de->rec_len == 0) { KRwLockReadUnlock(&g_ext2Lock); return 0; }
 
         dp->readOffset += de->rec_len;
 
@@ -1440,11 +1441,11 @@ static int Ext2DirReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
                 out->size = 0;
         }
 
-        KMutexUnlock(&g_ext2Lock);
+        KRwLockReadUnlock(&g_ext2Lock);
         return 1;
     }
 
-    KMutexUnlock(&g_ext2Lock);
+    KRwLockReadUnlock(&g_ext2Lock);
     return 0;
 }
 
@@ -1500,9 +1501,9 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
 
     // Read superblock at byte offset 1024
     Ext2Superblock sb;
-    KMutexLock(&g_ext2Lock);
+    KRwLockReadLock(&g_ext2Lock);
     int r = dev->ops->read(dev, 1024, &sb, sizeof(sb));
-    KMutexUnlock(&g_ext2Lock);
+    KRwLockReadUnlock(&g_ext2Lock);
     if (r != sizeof(sb)) {
         SerialPrintf("ext2: failed to read superblock from %s\n", dev->name);
         return false;
@@ -1539,9 +1540,9 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
     auto* bgdt = static_cast<Ext2BlockGroupDesc*>(kmalloc(bgdtSize));
     if (!bgdt) { SerialPuts("ext2: BGDT alloc failed\n"); return false; }
 
-    KMutexLock(&g_ext2Lock);
+    KRwLockReadLock(&g_ext2Lock);
     r = dev->ops->read(dev, bgdtOff, bgdt, bgdtSize);
-    KMutexUnlock(&g_ext2Lock);
+    KRwLockReadUnlock(&g_ext2Lock);
     if (r != static_cast<int>(bgdtSize)) {
         SerialPuts("ext2: failed to read BGDT\n");
         kfree(bgdt);
@@ -1645,9 +1646,9 @@ static void Ext2FsSync(void* mountPriv)
 {
     auto* mnt = static_cast<Ext2Mount*>(mountPriv);
     if (!mnt) return;
-    KMutexLock(&g_ext2Lock);
+    KRwLockWriteLock(&g_ext2Lock);
     Ext2Sync(mnt);
-    KMutexUnlock(&g_ext2Lock);
+    KRwLockWriteUnlock(&g_ext2Lock);
 }
 
 static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
@@ -1656,7 +1657,7 @@ static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
     (void)pdrv;
     auto* mnt = static_cast<Ext2Mount*>(mountPriv);
 
-    KMutexLock(&g_ext2Lock);
+    KRwLockReadLock(&g_ext2Lock);
 
     // Handle root directory
     bool isRoot = (!relPath[0] || (relPath[0] == '/' && !relPath[1]));
@@ -1681,15 +1682,15 @@ static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
             SerialPrintf("ext2: CREATE file '%s' [#%u]\n", relPath, s_createCount);
         char name[256];
         uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name));
-        if (!parentIno || !name[0]) { KMutexUnlock(&g_ext2Lock); return nullptr; }
+        if (!parentIno || !name[0]) { KRwLockReadUnlock(&g_ext2Lock); return nullptr; }
 
         Ext2Inode parentData;
-        if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KMutexUnlock(&g_ext2Lock); return nullptr; }
-        if ((parentData.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) { KMutexUnlock(&g_ext2Lock); return nullptr; }
+        if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KRwLockReadUnlock(&g_ext2Lock); return nullptr; }
+        if ((parentData.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) { KRwLockReadUnlock(&g_ext2Lock); return nullptr; }
 
         // Allocate new inode
         ino = Ext2AllocInode(mnt, false);
-        if (!ino) { KMutexUnlock(&g_ext2Lock); return nullptr; }
+        if (!ino) { KRwLockReadUnlock(&g_ext2Lock); return nullptr; }
 
         // Initialize inode
         for (uint32_t i = 0; i < sizeof(inodeData); ++i)
@@ -1701,7 +1702,7 @@ static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
         // Add directory entry
         if (!Ext2DirAdd(mnt, parentIno, &parentData, ino, name, 1 /*EXT2_FT_REG_FILE*/)) {
             Ext2FreeInode(mnt, ino, false);
-            KMutexUnlock(&g_ext2Lock);
+            KRwLockReadUnlock(&g_ext2Lock);
             return nullptr;
         }
     }
@@ -1713,13 +1714,13 @@ static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
         // g_ext2Lock — visible as 96% idle, 3% disk, 0% userspace in
         // a 240s nix-install vlc profile.  Gate behind g_kdebugTrace so
         // callers that need it can re-enable at runtime.
-        KMutexUnlock(&g_ext2Lock);
+        KRwLockReadUnlock(&g_ext2Lock);
         if (g_kdebugTrace)
             SerialPrintf("ext2: open '%s' → not found\n", relPath);
         return nullptr;
     }
 
-    if (!Ext2ReadInode(mnt, ino, &inodeData)) { KMutexUnlock(&g_ext2Lock); return nullptr; }
+    if (!Ext2ReadInode(mnt, ino, &inodeData)) { KRwLockReadUnlock(&g_ext2Lock); return nullptr; }
 
     // Truncate if requested
     if ((flags & VFS_O_TRUNC) && (inodeData.i_mode & EXT2_S_IFMT) == EXT2_S_IFREG) {
@@ -1727,7 +1728,7 @@ static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
         Ext2WriteInode(mnt, ino, &inodeData);
     }
 
-    KMutexUnlock(&g_ext2Lock);
+    KRwLockReadUnlock(&g_ext2Lock);
 
     uint16_t mode = inodeData.i_mode & EXT2_S_IFMT;
 
@@ -1745,6 +1746,7 @@ static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
         vn->type = VnodeType::Dir;
         vn->priv = dp;
         vn->refCount = 1;
+        vn->cacheId = static_cast<uint64_t>(ino);
         return vn;
     }
 
@@ -1761,6 +1763,7 @@ static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
         vn->type = VnodeType::File;
         vn->priv = fp;
         vn->refCount = 1;
+        vn->cacheId = static_cast<uint64_t>(ino);
         return vn;
     }
 
@@ -1776,7 +1779,7 @@ static int Ext2FsStatPath(void* mountPriv, uint8_t pdrv,
 
     bool isRoot = (!relPath[0] || (relPath[0] == '/' && !relPath[1]));
 
-    KMutexLock(&g_ext2Lock);
+    KRwLockReadLock(&g_ext2Lock);
 
     uint32_t ino;
     if (isRoot) {
@@ -1789,18 +1792,18 @@ static int Ext2FsStatPath(void* mountPriv, uint8_t pdrv,
 
     if (!ino) {
         DbgPrintf("ext2: stat '%s' → not found\n", relPath);
-        KMutexUnlock(&g_ext2Lock);
+        KRwLockReadUnlock(&g_ext2Lock);
         return -1;
     }
 
     Ext2Inode inodeData;
     if (!Ext2ReadInode(mnt, ino, &inodeData)) {
         SerialPrintf("ext2: stat '%s' ino=%u → read failed\n", relPath, ino);
-        KMutexUnlock(&g_ext2Lock);
+        KRwLockReadUnlock(&g_ext2Lock);
         return -1;
     }
 
-    KMutexUnlock(&g_ext2Lock);
+    KRwLockReadUnlock(&g_ext2Lock);
 
     uint16_t mode = inodeData.i_mode & EXT2_S_IFMT;
     st->isDir = (mode == EXT2_S_IFDIR);
@@ -1818,15 +1821,15 @@ static int Ext2FsLstatPath(void* mountPriv, uint8_t pdrv,
 
     bool isRoot = (!relPath[0] || (relPath[0] == '/' && !relPath[1]));
 
-    KMutexLock(&g_ext2Lock);
+    KRwLockReadLock(&g_ext2Lock);
 
     if (isRoot) {
         Ext2Inode inodeData;
         if (!Ext2ReadInode(mnt, EXT2_ROOT_INO, &inodeData)) {
-            KMutexUnlock(&g_ext2Lock);
+            KRwLockReadUnlock(&g_ext2Lock);
             return -1;
         }
-        KMutexUnlock(&g_ext2Lock);
+        KRwLockReadUnlock(&g_ext2Lock);
         st->isDir = true;
         st->isSymlink = false;
         st->size = 0;
@@ -1837,18 +1840,18 @@ static int Ext2FsLstatPath(void* mountPriv, uint8_t pdrv,
     // look up the final component directly without following it.
     char name[256];
     uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name));
-    if (!parentIno || !name[0]) { KMutexUnlock(&g_ext2Lock); return -1; }
+    if (!parentIno || !name[0]) { KRwLockReadUnlock(&g_ext2Lock); return -1; }
 
     Ext2Inode parentData;
-    if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KMutexUnlock(&g_ext2Lock); return -1; }
+    if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KRwLockReadUnlock(&g_ext2Lock); return -1; }
 
     uint32_t ino = Ext2DirLookup(mnt, parentIno, &parentData, name);
-    if (!ino) { KMutexUnlock(&g_ext2Lock); return -1; }
+    if (!ino) { KRwLockReadUnlock(&g_ext2Lock); return -1; }
 
     Ext2Inode inodeData;
-    if (!Ext2ReadInode(mnt, ino, &inodeData)) { KMutexUnlock(&g_ext2Lock); return -1; }
+    if (!Ext2ReadInode(mnt, ino, &inodeData)) { KRwLockReadUnlock(&g_ext2Lock); return -1; }
 
-    KMutexUnlock(&g_ext2Lock);
+    KRwLockReadUnlock(&g_ext2Lock);
 
     uint16_t mode = inodeData.i_mode & EXT2_S_IFMT;
     st->isDir     = (mode == EXT2_S_IFDIR);
@@ -1866,17 +1869,17 @@ static int Ext2FsUnlink(void* mountPriv, uint8_t pdrv, const char* relPath)
     (void)pdrv;
     auto* mnt = static_cast<Ext2Mount*>(mountPriv);
 
-    KMutexLock(&g_ext2Lock);
+    KRwLockWriteLock(&g_ext2Lock);
 
     char name[256];
     uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name));
-    if (!parentIno || !name[0]) { KMutexUnlock(&g_ext2Lock); return -1; }
+    if (!parentIno || !name[0]) { KRwLockWriteUnlock(&g_ext2Lock); return -1; }
 
     Ext2Inode parentData;
-    if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KMutexUnlock(&g_ext2Lock); return -1; }
+    if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KRwLockWriteUnlock(&g_ext2Lock); return -1; }
 
     uint32_t removedIno = Ext2DirRemove(mnt, &parentData, parentIno, name);
-    if (!removedIno) { KMutexUnlock(&g_ext2Lock); return -1; }
+    if (!removedIno) { KRwLockWriteUnlock(&g_ext2Lock); return -1; }
 
     // Decrement link count, free if zero
     Ext2Inode removedData;
@@ -1892,7 +1895,7 @@ static int Ext2FsUnlink(void* mountPriv, uint8_t pdrv, const char* relPath)
         }
     }
 
-    KMutexUnlock(&g_ext2Lock);
+    KRwLockWriteUnlock(&g_ext2Lock);
     return 0;
 }
 
@@ -1903,24 +1906,24 @@ static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath)
 
     DbgPrintf("ext2: MKDIR '%s'\n", relPath);
 
-    KMutexLock(&g_ext2Lock);
+    KRwLockWriteLock(&g_ext2Lock);
 
     char name[256];
     uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name));
-    if (!parentIno || !name[0]) { KMutexUnlock(&g_ext2Lock); return -1; }
+    if (!parentIno || !name[0]) { KRwLockWriteUnlock(&g_ext2Lock); return -1; }
 
     Ext2Inode parentData;
-    if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KMutexUnlock(&g_ext2Lock); return -1; }
+    if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KRwLockWriteUnlock(&g_ext2Lock); return -1; }
 
     // Check if already exists
     if (Ext2DirLookup(mnt, parentIno, &parentData, name)) {
-        KMutexUnlock(&g_ext2Lock);
+        KRwLockWriteUnlock(&g_ext2Lock);
         return 0; // Already exists, not an error (like FAT driver)
     }
 
     // Allocate inode
     uint32_t newIno = Ext2AllocInode(mnt, true);
-    if (!newIno) { KMutexUnlock(&g_ext2Lock); return -1; }
+    if (!newIno) { KRwLockWriteUnlock(&g_ext2Lock); return -1; }
 
     // Initialize directory inode
     Ext2Inode newData;
@@ -1933,7 +1936,7 @@ static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath)
     uint32_t dataBlock = Ext2AllocBlock(mnt);
     if (!dataBlock) {
         Ext2FreeInode(mnt, newIno, true);
-        KMutexUnlock(&g_ext2Lock);
+        KRwLockWriteUnlock(&g_ext2Lock);
         return -1;
     }
 
@@ -1946,7 +1949,7 @@ static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath)
     if (!blockBuf) {
         Ext2FreeBlock(mnt, dataBlock);
         Ext2FreeInode(mnt, newIno, true);
-        KMutexUnlock(&g_ext2Lock);
+        KRwLockWriteUnlock(&g_ext2Lock);
         return -1;
     }
     for (uint32_t i = 0; i < mnt->blockSize; ++i) blockBuf[i] = 0;
@@ -1978,7 +1981,7 @@ static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath)
         // Rollback
         Ext2FreeBlock(mnt, dataBlock);
         Ext2FreeInode(mnt, newIno, true);
-        KMutexUnlock(&g_ext2Lock);
+        KRwLockWriteUnlock(&g_ext2Lock);
         return -1;
     }
 
@@ -1986,7 +1989,7 @@ static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath)
     parentData.i_links_count++;
     Ext2WriteInode(mnt, parentIno, &parentData);
 
-    KMutexUnlock(&g_ext2Lock);
+    KRwLockWriteUnlock(&g_ext2Lock);
     return 0;
 }
 
@@ -1996,22 +1999,22 @@ static int Ext2FsRename(void* mountPriv, uint8_t pdrv,
     (void)pdrv;
     auto* mnt = static_cast<Ext2Mount*>(mountPriv);
 
-    KMutexLock(&g_ext2Lock);
+    KRwLockWriteLock(&g_ext2Lock);
 
     // Resolve old path
     char oldName[256];
     uint32_t oldParentIno = Ext2ResolveParent(mnt, oldRelPath, oldName, sizeof(oldName));
-    if (!oldParentIno) { KMutexUnlock(&g_ext2Lock); return -1; }
+    if (!oldParentIno) { KRwLockWriteUnlock(&g_ext2Lock); return -1; }
 
     Ext2Inode oldParentData;
-    if (!Ext2ReadInode(mnt, oldParentIno, &oldParentData)) { KMutexUnlock(&g_ext2Lock); return -1; }
+    if (!Ext2ReadInode(mnt, oldParentIno, &oldParentData)) { KRwLockWriteUnlock(&g_ext2Lock); return -1; }
 
     // Look up the inode being moved
     uint32_t targetIno = Ext2DirLookup(mnt, oldParentIno, &oldParentData, oldName);
-    if (!targetIno) { KMutexUnlock(&g_ext2Lock); return -1; }
+    if (!targetIno) { KRwLockWriteUnlock(&g_ext2Lock); return -1; }
 
     Ext2Inode targetData;
-    if (!Ext2ReadInode(mnt, targetIno, &targetData)) { KMutexUnlock(&g_ext2Lock); return -1; }
+    if (!Ext2ReadInode(mnt, targetIno, &targetData)) { KRwLockWriteUnlock(&g_ext2Lock); return -1; }
 
     // Determine file type for new dir entry
     uint8_t ft = 1; // EXT2_FT_REG_FILE
@@ -2022,10 +2025,10 @@ static int Ext2FsRename(void* mountPriv, uint8_t pdrv,
     // Resolve new path
     char newName[256];
     uint32_t newParentIno = Ext2ResolveParent(mnt, newRelPath, newName, sizeof(newName));
-    if (!newParentIno) { KMutexUnlock(&g_ext2Lock); return -1; }
+    if (!newParentIno) { KRwLockWriteUnlock(&g_ext2Lock); return -1; }
 
     Ext2Inode newParentData;
-    if (!Ext2ReadInode(mnt, newParentIno, &newParentData)) { KMutexUnlock(&g_ext2Lock); return -1; }
+    if (!Ext2ReadInode(mnt, newParentIno, &newParentData)) { KRwLockWriteUnlock(&g_ext2Lock); return -1; }
 
     // Remove from old directory
     Ext2DirRemove(mnt, &oldParentData, oldParentIno, oldName);
@@ -2034,7 +2037,7 @@ static int Ext2FsRename(void* mountPriv, uint8_t pdrv,
     if (!Ext2DirAdd(mnt, newParentIno, &newParentData, targetIno, newName, ft)) {
         // Try to re-add to old location on failure
         Ext2DirAdd(mnt, oldParentIno, &oldParentData, targetIno, oldName, ft);
-        KMutexUnlock(&g_ext2Lock);
+        KRwLockWriteUnlock(&g_ext2Lock);
         return -1;
     }
 
@@ -2061,7 +2064,7 @@ static int Ext2FsRename(void* mountPriv, uint8_t pdrv,
         }
     }
 
-    KMutexUnlock(&g_ext2Lock);
+    KRwLockWriteUnlock(&g_ext2Lock);
     return 0;
 }
 
@@ -2079,26 +2082,26 @@ static int Ext2FsSymlink(void* mountPriv, uint8_t pdrv,
     for (const char* p = target; *p; ++p) ++targetLen;
     if (targetLen == 0 || targetLen > 4096) return -22; // -EINVAL
 
-    KMutexLock(&g_ext2Lock);
+    KRwLockWriteLock(&g_ext2Lock);
 
     char name[256];
     uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name));
     if (!parentIno || !name[0]) {
         SerialPrintf("ext2 symlink: ResolveParent FAILED for '%s' (target='%s')\n",
                      relPath, target);
-        KMutexUnlock(&g_ext2Lock); return -2; // -ENOENT
+        KRwLockWriteUnlock(&g_ext2Lock); return -2; // -ENOENT
     }
 
     Ext2Inode parentData;
     if (!Ext2ReadInode(mnt, parentIno, &parentData)) {
         SerialPrintf("ext2 symlink: ReadInode parent %u FAILED for '%s'\n",
                      parentIno, relPath);
-        KMutexUnlock(&g_ext2Lock); return -5; // -EIO
+        KRwLockWriteUnlock(&g_ext2Lock); return -5; // -EIO
     }
 
     // Check if already exists
     if (Ext2DirLookup(mnt, parentIno, &parentData, name)) {
-        KMutexUnlock(&g_ext2Lock);
+        KRwLockWriteUnlock(&g_ext2Lock);
         return -17; // -EEXIST
     }
 
@@ -2106,7 +2109,7 @@ static int Ext2FsSymlink(void* mountPriv, uint8_t pdrv,
     if (!newIno) {
         SerialPrintf("ext2 symlink: AllocInode FAILED (likely out of inodes) for '%s'\n",
                      relPath);
-        KMutexUnlock(&g_ext2Lock); return -28; // -ENOSPC
+        KRwLockWriteUnlock(&g_ext2Lock); return -28; // -ENOSPC
     }
 
     Ext2Inode newData;
@@ -2128,7 +2131,7 @@ static int Ext2FsSymlink(void* mountPriv, uint8_t pdrv,
             SerialPrintf("ext2 symlink: AllocBlock FAILED (disk full?) for '%s' target len=%u\n",
                          relPath, targetLen);
             Ext2FreeInode(mnt, newIno, false);
-            KMutexUnlock(&g_ext2Lock);
+            KRwLockWriteUnlock(&g_ext2Lock);
             return -28; // -ENOSPC
         }
         auto* buf = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
@@ -2137,7 +2140,7 @@ static int Ext2FsSymlink(void* mountPriv, uint8_t pdrv,
                          mnt->blockSize, relPath);
             Ext2FreeBlock(mnt, blk);
             Ext2FreeInode(mnt, newIno, false);
-            KMutexUnlock(&g_ext2Lock);
+            KRwLockWriteUnlock(&g_ext2Lock);
             return -12; // -ENOMEM
         }
         for (uint32_t i = 0; i < mnt->blockSize; ++i) buf[i] = 0;
@@ -2158,11 +2161,11 @@ static int Ext2FsSymlink(void* mountPriv, uint8_t pdrv,
                      parentIno, name, relPath);
         Ext2FreeInodeBlocks(mnt, &newData);
         Ext2FreeInode(mnt, newIno, false);
-        KMutexUnlock(&g_ext2Lock);
+        KRwLockWriteUnlock(&g_ext2Lock);
         return -28; // -ENOSPC (probably couldn't extend dir)
     }
 
-    KMutexUnlock(&g_ext2Lock);
+    KRwLockWriteUnlock(&g_ext2Lock);
     return 0;
 }
 
@@ -2176,31 +2179,31 @@ static int Ext2FsReadlink(void* mountPriv, uint8_t pdrv,
     (void)pdrv;
     auto* mnt = static_cast<Ext2Mount*>(mountPriv);
 
-    KMutexLock(&g_ext2Lock);
+    KRwLockReadLock(&g_ext2Lock);
 
     // Resolve path WITHOUT following the final symlink component.
     // We split the path into parent + name and resolve the parent,
     // then look up the name directly in the parent directory.
     char name[256];
     uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name));
-    if (!parentIno || !name[0]) { KMutexUnlock(&g_ext2Lock); return -1; }
+    if (!parentIno || !name[0]) { KRwLockReadUnlock(&g_ext2Lock); return -1; }
 
     Ext2Inode parentData;
-    if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KMutexUnlock(&g_ext2Lock); return -1; }
+    if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KRwLockReadUnlock(&g_ext2Lock); return -1; }
 
     uint32_t ino = Ext2DirLookup(mnt, parentIno, &parentData, name);
-    if (!ino) { KMutexUnlock(&g_ext2Lock); return -22; } // -EINVAL
+    if (!ino) { KRwLockReadUnlock(&g_ext2Lock); return -22; } // -EINVAL
 
     Ext2Inode inodeData;
-    if (!Ext2ReadInode(mnt, ino, &inodeData)) { KMutexUnlock(&g_ext2Lock); return -1; }
+    if (!Ext2ReadInode(mnt, ino, &inodeData)) { KRwLockReadUnlock(&g_ext2Lock); return -1; }
 
     if ((inodeData.i_mode & EXT2_S_IFMT) != EXT2_S_IFLNK) {
-        KMutexUnlock(&g_ext2Lock);
+        KRwLockReadUnlock(&g_ext2Lock);
         return -22; // -EINVAL: not a symlink
     }
 
     char* target = Ext2ReadSymlink(mnt, &inodeData);
-    if (!target) { KMutexUnlock(&g_ext2Lock); return -1; }
+    if (!target) { KRwLockReadUnlock(&g_ext2Lock); return -1; }
 
     uint32_t targetLen = 0;
     for (const char* p = target; *p; ++p) ++targetLen;
@@ -2210,7 +2213,7 @@ static int Ext2FsReadlink(void* mountPriv, uint8_t pdrv,
     for (uint32_t i = 0; i < copyLen; ++i) buf[i] = target[i];
 
     kfree(target);
-    KMutexUnlock(&g_ext2Lock);
+    KRwLockReadUnlock(&g_ext2Lock);
     return static_cast<int>(copyLen);
 }
 
