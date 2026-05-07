@@ -199,6 +199,7 @@ enum class FdType : uint8_t
     TimerFd,       // timerfd — timer-based event notification
     MemFd,         // memfd_create — anonymous in-memory file
     UnixSocket,    // AF_UNIX domain socket
+    DevKlog,       // /dev/klog — kernel log ring buffer reader
 };
 
 struct TtyDevicePair {

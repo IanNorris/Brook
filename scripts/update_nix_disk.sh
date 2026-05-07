@@ -205,6 +205,33 @@ if [ "${UPDATE_TOOLS}" -eq 1 ]; then
             done
         fi
         for d in "${MNTDIR}"/store/*-gimp-*; do
+
+        # Copy brook-console (kernel console viewer) — build fresh or find in store
+        BROOK_CONSOLE_OUT=""
+        if command -v nix-build &>/dev/null; then
+            BROOK_CONSOLE_OUT=$(nix-build "${ROOT_DIR}/tools/brook-console-pkg" --no-out-link 2>/dev/null)
+        fi
+        if [ -n "$BROOK_CONSOLE_OUT" ] && [ -x "${BROOK_CONSOLE_OUT}/bin/brook-console" ]; then
+            while IFS= read -r p; do
+                [ -n "$p" ] || continue
+                base=$(basename "$p")
+                dst="${MNTDIR}/store/${base}"
+                if [ ! -e "$dst" ]; then
+                    cp -a --no-preserve=links "$p" "$dst"
+                fi
+            done < <(nix-store -qR "$BROOK_CONSOLE_OUT")
+            cp "${BROOK_CONSOLE_OUT}/bin/brook-console" "${MNTDIR}/bin/brook-console"
+            echo "  brook-console -> /nix/bin/brook-console"
+        else
+            for d in "${MNTDIR}"/store/*-brook-console-brook-*; do
+                [ -x "$d/bin/brook-console" ] || continue
+                cp "$d/bin/brook-console" "${MNTDIR}/bin/brook-console"
+                echo "  brook-console -> /nix/bin/brook-console"
+                break
+            done
+        fi
+
+        for d in "${MNTDIR}"/store/*-gimp-*; do
             [ -x "$d/bin/gimp" ] || continue
             ln -sf "../store/$(basename "$d")/bin/gimp" "${MNTDIR}/bin/gimp"
 

@@ -28,6 +28,7 @@
 #include "profiler.h"
 #include "smp.h"
 #include "serial_writer.h"
+#include "debug_overlay.h"
 
 // Forward declaration
 extern "C" __attribute__((naked)) void ReturnToKernel();
@@ -1783,6 +1784,63 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         return static_cast<int64_t>(count);
     }
 
+    // /dev/klog — read new lines from the kernel log ring buffer
+    if (fde->type == FdType::DevKlog && fde->handle)
+    {
+        if (bufAddr == 0 || bufAddr >= 0x0000800000000000ULL) return -EFAULT;
+        if (count > 0 && (bufAddr + count - 1) >= 0x0000800000000000ULL) return -EFAULT;
+
+        auto* cursor = static_cast<uint32_t*>(fde->handle);
+        auto* dst = reinterpret_cast<char*>(bufAddr);
+
+        // Read available lines from the ring buffer into a temp buffer
+        static constexpr uint32_t KLOG_LINE_LEN = 161; // 160 chars + null
+        static constexpr uint32_t KLOG_BATCH    = 32;
+        char lineBuf[KLOG_BATCH][KLOG_LINE_LEN];
+
+        uint64_t written = 0;
+
+        for (;;) {
+            uint32_t nread = DebugOverlayReadFrom(cursor, reinterpret_cast<char*>(lineBuf),
+                                                   KLOG_BATCH, KLOG_LINE_LEN);
+            if (nread == 0) break;
+
+            for (uint32_t i = 0; i < nread; i++) {
+                uint32_t len = 0;
+                while (len < KLOG_LINE_LEN - 1 && lineBuf[i][len]) len++;
+
+                // Need space for line + newline
+                if (written + len + 1 > count) goto done;
+
+                for (uint32_t j = 0; j < len; j++)
+                    dst[written++] = lineBuf[i][j];
+                dst[written++] = '\n';
+            }
+        }
+
+    done:
+        if (written == 0 && !(fde->statusFlags & 0x800)) { // O_NONBLOCK
+            // Blocking mode: sleep briefly and retry once
+            Process* self = ProcessCurrent();
+            extern volatile uint64_t g_lapicTickCount;
+            self->wakeupTick = g_lapicTickCount + 100;
+            SchedulerBlock(self);
+
+            uint32_t nread = DebugOverlayReadFrom(cursor, reinterpret_cast<char*>(lineBuf),
+                                                   KLOG_BATCH, KLOG_LINE_LEN);
+            for (uint32_t i = 0; i < nread; i++) {
+                uint32_t len = 0;
+                while (len < KLOG_LINE_LEN - 1 && lineBuf[i][len]) len++;
+                if (written + len + 1 > count) break;
+                for (uint32_t j = 0; j < len; j++)
+                    dst[written++] = lineBuf[i][j];
+                dst[written++] = '\n';
+            }
+        }
+
+        return static_cast<int64_t>(written);
+    }
+
     // Synthetic in-memory files (/etc/passwd, /etc/group, etc.)
     if (fde->type == FdType::SyntheticMem && fde->handle)
     {
@@ -2432,6 +2490,19 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         return fd;
     }
 
+    // /dev/klog — kernel log ring buffer reader
+    if (StrEq(path, "/dev/klog"))
+    {
+        // Allocate a cursor (uint32_t) to track read position in ring buffer.
+        auto* cursor = static_cast<uint32_t*>(kmalloc(sizeof(uint32_t)));
+        if (!cursor) return -ENOMEM;
+        *cursor = 0; // start from beginning of ring
+        int fd = FdAlloc(proc, FdType::DevKlog, cursor);
+        if (fd < 0) { kfree(cursor); return -EMFILE; }
+        DbgPrintf("sys_open: /dev/klog → fd %d\n", fd);
+        return fd;
+    }
+
     // /dev/dsp — OSS audio output
     if (StrEq(path, "/dev/dsp"))
     {
@@ -2759,6 +2830,9 @@ int64_t CloseProcessFd(Process* proc, int fd)
         kfree(dsp->buffer);
         kfree(dsp);
     }
+
+    if (fde->type == FdType::DevKlog && fde->handle)
+        kfree(fde->handle); // free the cursor
 
     FdFree(proc, fd);
     return 0;

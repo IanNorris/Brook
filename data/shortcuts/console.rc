@@ -1,0 +1,3 @@
+# title: Console
+# desc: Kernel log console viewer
+source /boot/SCRIPTS/wayland_console.rc

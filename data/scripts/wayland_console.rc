@@ -1,0 +1,5 @@
+# Brook Wayland kernel console viewer.
+set wm
+set vfb none
+run --once /nix/bin/waylandd
+run /nix/bin/brook-console
