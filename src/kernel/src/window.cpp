@@ -819,28 +819,29 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
                    titleX + WM_TITLE_TEXT_PAD_X, textY, w.title,
                    WM_TITLE_FG, titleBg, titleMaxW);
 
-    // Close button — circular red dot with 'X', brighter on hover
+    // Close button — circular red dot with small × icon
     int closeBtnX = wx + ow - WM_BORDER_WIDTH - WM_BUTTON_WIDTH;
     int btnCenterY = titleY + titleH / 2;
     bool closeHover = w.focused && mouseX >= closeBtnX && mouseX < closeBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
                       mouseY >= titleY && mouseY < titleY + titleH;
     uint32_t closeBg = closeHover ? 0x00CC3333 : WM_CLOSE_BTN_BG;
     static constexpr int CHROME_BTN_RADIUS = 7;
+    static constexpr int ICON_HALF = 3; // half-size of icon (6×6 total)
     int closeCenterX = closeBtnX + static_cast<int>(WM_BUTTON_WIDTH) / 2;
     WmFillRect(buf, stride, screenW, screenH, closeBtnX, titleY,
                WM_BUTTON_WIDTH, titleH, titleBg);
     WmFillCircle(buf, stride, screenW, screenH,
                  closeCenterX, btnCenterY, CHROME_BTN_RADIUS, closeBg);
-    int glyphW = 8;
-    if ('X' >= g_fontAtlas.firstChar && 'X' < g_fontAtlas.firstChar + g_fontAtlas.glyphCount)
-        glyphW = g_fontAtlas.glyphs['X' - g_fontAtlas.firstChar].advance;
-    int closeGlyphX = closeBtnX + (WM_BUTTON_WIDTH - glyphW) / 2;
-    int closeGlyphY = titleY + (titleH - g_fontAtlas.lineHeight) / 2;
-    WmRenderGlyph(buf, stride, screenW, screenH,
-                  closeGlyphX, closeGlyphY, 'X',
-                  0x00FFFFFF, closeBg);
+    // Draw × with two diagonal lines (2px thick)
+    for (int d = -ICON_HALF; d <= ICON_HALF; d++)
+    {
+        WmPutPixel(buf, stride, screenW, screenH, closeCenterX + d, btnCenterY + d, WM_TITLE_FG);
+        WmPutPixel(buf, stride, screenW, screenH, closeCenterX + d + 1, btnCenterY + d, WM_TITLE_FG);
+        WmPutPixel(buf, stride, screenW, screenH, closeCenterX + d, btnCenterY - d, WM_TITLE_FG);
+        WmPutPixel(buf, stride, screenW, screenH, closeCenterX + d + 1, btnCenterY - d, WM_TITLE_FG);
+    }
 
-    // Maximize button — circular with box icon, lighten on hover
+    // Maximize button — circular with small box icon
     int maxBtnX = closeBtnX - WM_BUTTON_WIDTH;
     bool maxHover = w.focused && mouseX >= maxBtnX && mouseX < maxBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
                     mouseY >= titleY && mouseY < titleY + titleH;
@@ -850,15 +851,16 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
                WM_BUTTON_WIDTH, titleH, titleBg);
     WmFillCircle(buf, stride, screenW, screenH,
                  maxCenterX, btnCenterY, CHROME_BTN_RADIUS, maxBg);
-    int sqS = WM_BTN_ICON_SIZE - 2;
-    int sqX = maxCenterX - sqS / 2;
-    int sqY = btnCenterY - sqS / 2;
-    WmFillRect(buf, stride, screenW, screenH, sqX, sqY, sqS, 2, WM_TITLE_FG);
+    // 6×6 box centered in the circle
+    int sqS = ICON_HALF * 2;
+    int sqX = maxCenterX - ICON_HALF;
+    int sqY = btnCenterY - ICON_HALF;
+    WmFillRect(buf, stride, screenW, screenH, sqX, sqY, sqS, 1, WM_TITLE_FG);
     WmFillRect(buf, stride, screenW, screenH, sqX, sqY + sqS - 1, sqS, 1, WM_TITLE_FG);
     WmFillRect(buf, stride, screenW, screenH, sqX, sqY, 1, sqS, WM_TITLE_FG);
     WmFillRect(buf, stride, screenW, screenH, sqX + sqS - 1, sqY, 1, sqS, WM_TITLE_FG);
 
-    // Minimize button — circular with dash icon, lighten on hover
+    // Minimize button — circular with small centered dash
     int minBtnX = maxBtnX - WM_BUTTON_WIDTH;
     bool minHover = w.focused && mouseX >= minBtnX && mouseX < minBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
                     mouseY >= titleY && mouseY < titleY + titleH;
@@ -868,10 +870,9 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
                WM_BUTTON_WIDTH, titleH, titleBg);
     WmFillCircle(buf, stride, screenW, screenH,
                  minCenterX, btnCenterY, CHROME_BTN_RADIUS, minBg);
-    int lineW = WM_BTN_ICON_SIZE - 2;
-    int lineX = minCenterX - lineW / 2;
-    int lineY = btnCenterY;
-    WmFillRect(buf, stride, screenW, screenH, lineX, lineY, lineW, 2, WM_TITLE_FG);
+    // 6px horizontal dash centered vertically
+    WmFillRect(buf, stride, screenW, screenH,
+               minCenterX - ICON_HALF, btnCenterY, ICON_HALF * 2, 1, WM_TITLE_FG);
 }
 
 void WmRenderChrome(uint32_t* backBuffer, uint32_t stride,
