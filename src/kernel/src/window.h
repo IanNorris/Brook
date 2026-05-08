@@ -293,11 +293,16 @@ void WmPushWmEvent(Window* win, uint8_t type, int16_t x = 0, int16_t y = 0);
 
 static constexpr uint32_t WM_LAUNCHER_MAX_ITEMS = 32;
 
+static constexpr uint32_t LAUNCHER_ICON_PX = 24;  // Icon dimensions (24x24 pixels)
+static constexpr uint32_t LAUNCHER_ICON_BYTES = LAUNCHER_ICON_PX * LAUNCHER_ICON_PX * 4;
+
 struct LauncherItem {
     char title[48];
-    char scriptPath[128];  // e.g. "/boot/SHORTCUTS/QUAKE.RC"
+    char scriptPath[128];  // e.g. "/boot/SHORTCUTS/QUAKE.RC" or exec command
     uint32_t iconColor;    // Icon background color (0 = auto from title)
+    uint32_t* iconPixels;  // Raw ARGB icon data (24x24), or nullptr for letter icon
     bool valid;
+    bool isDesktopEntry;   // true if sourced from .desktop file (exec directly)
 };
 
 // Load shortcut files from /boot/SHORTCUTS/ directory.

@@ -16,6 +16,7 @@
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "memory/address.h"
+#include "memory/heap.h"
 #include "mem_tag.h"
 
 namespace brook {
@@ -1050,9 +1051,44 @@ static uint32_t LauncherIconColor(const char* title)
 // Draw a small colored icon with first letter
 static void LauncherDrawIcon(uint32_t* backBuffer, uint32_t stride,
                              uint32_t screenW, uint32_t screenH,
-                             int32_t x, int32_t y, uint32_t color, char letter)
+                             int32_t x, int32_t y, const LauncherItem* item)
 {
-    // Filled rounded-ish rectangle (just a solid square with slightly inset corners)
+    // If we have a bitmap icon, blit it directly with alpha blending
+    if (item->iconPixels)
+    {
+        for (uint32_t iy = 0; iy < LAUNCHER_ICON_PX; iy++)
+        {
+            for (uint32_t ix = 0; ix < LAUNCHER_ICON_PX; ix++)
+            {
+                int32_t px = x + static_cast<int32_t>(ix);
+                int32_t py2 = y + static_cast<int32_t>(iy);
+                if (px < 0 || px >= static_cast<int32_t>(screenW) ||
+                    py2 < 0 || py2 >= static_cast<int32_t>(screenH))
+                    continue;
+
+                uint32_t sp = item->iconPixels[iy * LAUNCHER_ICON_PX + ix];
+                uint32_t a = sp >> 24;
+                if (a == 0) continue;
+
+                uint32_t dstIdx = py2 * stride + px;
+                if (a == 255)
+                {
+                    backBuffer[dstIdx] = sp & 0x00FFFFFF;
+                    continue;
+                }
+                uint32_t dp = backBuffer[dstIdx];
+                uint32_t inv = 255 - a;
+                uint32_t r = (((sp >> 16) & 0xff) * a + ((dp >> 16) & 0xff) * inv + 127) / 255;
+                uint32_t g = (((sp >> 8) & 0xff) * a + ((dp >> 8) & 0xff) * inv + 127) / 255;
+                uint32_t b = ((sp & 0xff) * a + (dp & 0xff) * inv + 127) / 255;
+                backBuffer[dstIdx] = (r << 16) | (g << 8) | b;
+            }
+        }
+        return;
+    }
+
+    // Fallback: colored square with letter
+    uint32_t color = item->iconColor;
     for (uint32_t iy = 0; iy < LAUNCHER_ICON_SIZE; iy++)
     {
         for (uint32_t ix = 0; ix < LAUNCHER_ICON_SIZE; ix++)
@@ -1071,8 +1107,8 @@ static void LauncherDrawIcon(uint32_t* backBuffer, uint32_t stride,
         }
     }
 
-    // Render the letter centered in the icon
-    if (letter >= 'a' && letter <= 'z') letter -= 32; // uppercase
+    char letter = item->title[0];
+    if (letter >= 'a' && letter <= 'z') letter -= 32;
     char str[2] = { letter, '\0' };
     int32_t lx = x + static_cast<int32_t>(LAUNCHER_ICON_SIZE / 2) - 4;
     int32_t ly = y + static_cast<int32_t>(LAUNCHER_ICON_SIZE / 2) -
@@ -1123,55 +1159,275 @@ static bool ParseShortcutTitle(const char* path, char* titleOut, uint32_t titleM
     return false;
 }
 
+// Load a raw RGBA icon file for a launcher item. Looks for an icon file
+// whose name matches a lowercased/sanitized version of the item title.
+static void LauncherLoadIcon(LauncherItem* item)
+{
+    // Build icon path: /nix/share/applications/icons/<title_lower>.rgba
+    char iconPath[192];
+    const char* prefix = "/nix/share/applications/icons/";
+    uint32_t pi = 0;
+    while (*prefix && pi < sizeof(iconPath) - 1)
+        iconPath[pi++] = *prefix++;
+
+    // Convert title to lowercase filename
+    for (uint32_t i = 0; item->title[i] && pi < sizeof(iconPath) - 6; ++i)
+    {
+        char c = item->title[i];
+        if (c >= 'A' && c <= 'Z') c += 32;
+        else if (c == ' ' || c == '/') c = '_';
+        else if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_'))
+            continue;
+        iconPath[pi++] = c;
+    }
+    iconPath[pi++] = '.';
+    iconPath[pi++] = 'r';
+    iconPath[pi++] = 'g';
+    iconPath[pi++] = 'b';
+    iconPath[pi++] = 'a';
+    iconPath[pi] = '\0';
+
+    Vnode* vn = VfsOpen(iconPath, 0);
+    if (!vn) return;
+
+    uint64_t offset = 0;
+    uint32_t* pixels = static_cast<uint32_t*>(kmalloc(LAUNCHER_ICON_BYTES));
+    if (!pixels) { VfsClose(vn); return; }
+
+    int rd = VfsRead(vn, pixels, LAUNCHER_ICON_BYTES, &offset);
+    VfsClose(vn);
+
+    if (rd == static_cast<int>(LAUNCHER_ICON_BYTES))
+    {
+        item->iconPixels = pixels;
+    }
+    else
+    {
+        kfree(pixels);
+    }
+}
+
+// Helper: case-insensitive prefix compare
+static bool StrStartsWithI(const char* str, const char* prefix)
+{
+    while (*prefix)
+    {
+        char a = *str++;
+        char b = *prefix++;
+        if (a >= 'A' && a <= 'Z') a += 32;
+        if (b >= 'A' && b <= 'Z') b += 32;
+        if (a != b) return false;
+    }
+    return true;
+}
+
+// Load .desktop entries from the nix disk manifest.
+// Format: Name\tExec\tIconFile\tCategories\n
+static void LauncherLoadDesktopEntries()
+{
+    Vnode* vn = VfsOpen("/nix/share/applications/applications.idx", 0);
+    if (!vn)
+    {
+        SerialPuts("WM: no /nix/share/applications/applications.idx\n");
+        return;
+    }
+
+    // Read the manifest (limited to 8KB for now)
+    char buf[8192];
+    uint64_t offset = 0;
+    int rd = VfsRead(vn, buf, sizeof(buf) - 1, &offset);
+    VfsClose(vn);
+    if (rd <= 0) return;
+    buf[rd] = '\0';
+
+    char* p = buf;
+    while (*p && g_launcherCount < WM_LAUNCHER_MAX_ITEMS)
+    {
+        // Parse one line: Name\tExec\tIconFile\tCategories\n
+        char* lineEnd = p;
+        while (*lineEnd && *lineEnd != '\n') ++lineEnd;
+
+        char* name = p;
+        char* exec = nullptr;
+        char* iconFile = nullptr;
+
+        // Find tab separators
+        char* tab1 = name;
+        while (*tab1 && *tab1 != '\t' && *tab1 != '\n') ++tab1;
+        if (*tab1 == '\t') { *tab1 = '\0'; exec = tab1 + 1; }
+
+        char* tab2 = exec ? exec : tab1;
+        while (*tab2 && *tab2 != '\t' && *tab2 != '\n') ++tab2;
+        if (*tab2 == '\t') { *tab2 = '\0'; iconFile = tab2 + 1; }
+
+        char* tab3 = iconFile ? iconFile : tab2;
+        while (*tab3 && *tab3 != '\t' && *tab3 != '\n') ++tab3;
+        if (*tab3 == '\t' || *tab3 == '\n') *tab3 = '\0';
+
+        if (name[0] && exec && exec[0])
+        {
+            // Check for duplicate (same title already loaded from shortcuts)
+            bool dup = false;
+            for (uint32_t i = 0; i < g_launcherCount; ++i)
+            {
+                if (StrStartsWithI(g_launcherItems[i].title, name) &&
+                    g_launcherItems[i].title[0])
+                {
+                    // If existing shortcut doesn't have an icon, try to load one
+                    if (!g_launcherItems[i].iconPixels && iconFile && iconFile[0])
+                    {
+                        char path[192];
+                        uint32_t idx = 0;
+                        const char* pfx = "/nix/share/applications/icons/";
+                        while (*pfx && idx < sizeof(path) - 1) path[idx++] = *pfx++;
+                        uint32_t fi = 0;
+                        while (iconFile[fi] && iconFile[fi] != '\t' &&
+                               iconFile[fi] != '\n' && idx < sizeof(path) - 1)
+                            path[idx++] = iconFile[fi++];
+                        path[idx] = '\0';
+
+                        Vnode* iv = VfsOpen(path, 0);
+                        if (iv)
+                        {
+                            uint64_t ioff = 0;
+                            uint32_t* px = static_cast<uint32_t*>(kmalloc(LAUNCHER_ICON_BYTES));
+                            if (px)
+                            {
+                                int ird = VfsRead(iv, px, LAUNCHER_ICON_BYTES, &ioff);
+                                if (ird == static_cast<int>(LAUNCHER_ICON_BYTES))
+                                    g_launcherItems[i].iconPixels = px;
+                                else
+                                    kfree(px);
+                            }
+                            VfsClose(iv);
+                        }
+                    }
+                    dup = true;
+                    break;
+                }
+            }
+
+            if (!dup)
+            {
+                LauncherItem& item = g_launcherItems[g_launcherCount];
+                item.iconPixels = nullptr;
+                item.isDesktopEntry = true;
+                item.valid = true;
+
+                // Copy title
+                uint32_t ti = 0;
+                while (name[ti] && ti < sizeof(item.title) - 1)
+                { item.title[ti] = name[ti]; ++ti; }
+                item.title[ti] = '\0';
+
+                // Copy exec path
+                uint32_t ei = 0;
+                while (exec[ei] && exec[ei] != '\t' && exec[ei] != '\n' &&
+                       ei < sizeof(item.scriptPath) - 1)
+                { item.scriptPath[ei] = exec[ei]; ++ei; }
+                item.scriptPath[ei] = '\0';
+
+                item.iconColor = LauncherIconColor(item.title);
+
+                // Try to load icon
+                if (iconFile && iconFile[0])
+                {
+                    char path[192];
+                    uint32_t idx = 0;
+                    const char* pfx = "/nix/share/applications/icons/";
+                    while (*pfx && idx < sizeof(path) - 1) path[idx++] = *pfx++;
+                    uint32_t fi = 0;
+                    while (iconFile[fi] && iconFile[fi] != '\t' &&
+                           iconFile[fi] != '\n' && idx < sizeof(path) - 1)
+                        path[idx++] = iconFile[fi++];
+                    path[idx] = '\0';
+
+                    Vnode* iv = VfsOpen(path, 0);
+                    if (iv)
+                    {
+                        uint64_t ioff = 0;
+                        uint32_t* px = static_cast<uint32_t*>(kmalloc(LAUNCHER_ICON_BYTES));
+                        if (px)
+                        {
+                            int ird = VfsRead(iv, px, LAUNCHER_ICON_BYTES, &ioff);
+                            if (ird == static_cast<int>(LAUNCHER_ICON_BYTES))
+                                item.iconPixels = px;
+                            else
+                                kfree(px);
+                        }
+                        VfsClose(iv);
+                    }
+                }
+
+                SerialPrintf("WM: launcher[%u] = '%s' -> %s [desktop]%s\n",
+                             g_launcherCount, item.title, item.scriptPath,
+                             item.iconPixels ? " [icon]" : "");
+                g_launcherCount++;
+            }
+        }
+
+        p = (*lineEnd == '\n') ? lineEnd + 1 : lineEnd;
+    }
+}
+
 void WmLauncherLoad()
 {
     if (g_launcherLoaded) return;
     g_launcherLoaded = true;
     g_launcherCount = 0;
 
+    // --- Phase 1: Load .rc shortcut scripts from /boot/SHORTCUTS/ ---
     Vnode* dir = VfsOpen("/boot/SHORTCUTS", 0);
     if (!dir)
     {
         SerialPuts("WM: no /boot/SHORTCUTS directory\n");
-        return;
     }
-
-    DirEntry de;
-    uint32_t cookie = 0;
-    while (VfsReaddir(dir, &de, &cookie) == 1 && g_launcherCount < WM_LAUNCHER_MAX_ITEMS)
+    else
     {
-        if (de.isDir) continue;
-
-        // Build full path
-        LauncherItem& item = g_launcherItems[g_launcherCount];
-        uint32_t pi = 0;
-        const char* prefix = "/boot/SHORTCUTS/";
-        while (*prefix && pi < sizeof(item.scriptPath) - 1)
-            item.scriptPath[pi++] = *prefix++;
-        uint32_t ni = 0;
-        while (de.name[ni] && pi < sizeof(item.scriptPath) - 1)
-            item.scriptPath[pi++] = de.name[ni++];
-        item.scriptPath[pi] = '\0';
-
-        // Try to parse title from the file
-        if (!ParseShortcutTitle(item.scriptPath, item.title, sizeof(item.title)))
+        DirEntry de;
+        uint32_t cookie = 0;
+        while (VfsReaddir(dir, &de, &cookie) == 1 && g_launcherCount < WM_LAUNCHER_MAX_ITEMS)
         {
-            // Fallback: use filename without extension
-            uint32_t ti = 0;
-            for (uint32_t j = 0; de.name[j] && de.name[j] != '.' && ti < sizeof(item.title) - 1; ++j)
-                item.title[ti++] = de.name[j];
-            item.title[ti] = '\0';
-        }
+            if (de.isDir) continue;
 
-        item.valid = true;
-        item.iconColor = LauncherIconColor(item.title);
-        SerialPrintf("WM: launcher[%u] = '%s' -> %s\n",
-                     g_launcherCount, item.title, item.scriptPath);
-        g_launcherCount++;
+            LauncherItem& item = g_launcherItems[g_launcherCount];
+            item.iconPixels = nullptr;
+            item.isDesktopEntry = false;
+            uint32_t pi = 0;
+            const char* prefix = "/boot/SHORTCUTS/";
+            while (*prefix && pi < sizeof(item.scriptPath) - 1)
+                item.scriptPath[pi++] = *prefix++;
+            uint32_t ni = 0;
+            while (de.name[ni] && pi < sizeof(item.scriptPath) - 1)
+                item.scriptPath[pi++] = de.name[ni++];
+            item.scriptPath[pi] = '\0';
+
+            if (!ParseShortcutTitle(item.scriptPath, item.title, sizeof(item.title)))
+            {
+                uint32_t ti = 0;
+                for (uint32_t j = 0; de.name[j] && de.name[j] != '.' && ti < sizeof(item.title) - 1; ++j)
+                    item.title[ti++] = de.name[j];
+                item.title[ti] = '\0';
+            }
+
+            item.valid = true;
+            item.iconColor = LauncherIconColor(item.title);
+
+            // Try to load a matching icon from /nix/share/applications/icons/
+            LauncherLoadIcon(&item);
+
+            SerialPrintf("WM: launcher[%u] = '%s' -> %s%s\n",
+                         g_launcherCount, item.title, item.scriptPath,
+                         item.iconPixels ? " [icon]" : "");
+            g_launcherCount++;
+        }
+        VfsClose(dir);
     }
 
-    VfsClose(dir);
-    SerialPrintf("WM: loaded %u launcher shortcuts\n", g_launcherCount);
+    // --- Phase 2: Load .desktop entries from /nix/share/applications/applications.idx ---
+    LauncherLoadDesktopEntries();
+
+    SerialPrintf("WM: loaded %u launcher items total\n", g_launcherCount);
 }
 
 void WmLauncherToggle()
@@ -1247,9 +1503,8 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
         // Draw icon
         int32_t iconX = itemX + 6;
         int32_t iconY = itemY + static_cast<int32_t>((LAUNCHER_ITEM_HEIGHT - LAUNCHER_ICON_SIZE) / 2);
-        char firstLetter = g_launcherItems[i].title[0];
         LauncherDrawIcon(backBuffer, stride, screenW, screenH,
-                         iconX, iconY, g_launcherItems[i].iconColor, firstLetter);
+                         iconX, iconY, &g_launcherItems[i]);
 
         // Title text (offset to right of icon)
         int32_t textX = iconX + static_cast<int32_t>(LAUNCHER_ICON_SIZE) +
@@ -1298,15 +1553,57 @@ void WmLauncherExec(int itemIdx)
     if (itemIdx < 0 || itemIdx >= static_cast<int>(g_launcherCount)) return;
     if (!g_launcherItems[itemIdx].valid) return;
 
-    SerialPrintf("WM: launching '%s' via %s\n",
+    SerialPrintf("WM: launching '%s' via %s%s\n",
                  g_launcherItems[itemIdx].title,
-                 g_launcherItems[itemIdx].scriptPath);
+                 g_launcherItems[itemIdx].scriptPath,
+                 g_launcherItems[itemIdx].isDesktopEntry ? " [desktop]" : "");
 
     g_launcherOpen = false;
 
-    // Execute the shortcut script (uses existing shell infrastructure)
-    extern int ShellExecScript(const char* path);
-    ShellExecScript(g_launcherItems[itemIdx].scriptPath);
+    if (g_launcherItems[itemIdx].isDesktopEntry)
+    {
+        // For .desktop entries: generate a temporary script that launches
+        // waylandd + the app in WM mode. Write to /tmp/launch.rc and exec.
+        const char* exec = g_launcherItems[itemIdx].scriptPath;
+        char script[512];
+        uint32_t si = 0;
+        const char* hdr = "set wm\nset vfb none\nrun --once /nix/bin/waylandd\nrun ";
+        while (*hdr && si < sizeof(script) - 2) script[si++] = *hdr++;
+        while (*exec && si < sizeof(script) - 2) script[si++] = *exec++;
+        script[si++] = '\n';
+        script[si] = '\0';
+
+        // Write to /tmp/launch_<idx>.rc
+        char tmpPath[64];
+        uint32_t ti = 0;
+        const char* tp = "/tmp/launch_";
+        while (*tp) tmpPath[ti++] = *tp++;
+        if (itemIdx >= 10) tmpPath[ti++] = '0' + (itemIdx / 10);
+        tmpPath[ti++] = '0' + (itemIdx % 10);
+        const char* ext = ".rc";
+        while (*ext) tmpPath[ti++] = *ext++;
+        tmpPath[ti] = '\0';
+
+        Vnode* vn = VfsOpen(tmpPath, VFS_O_CREATE);
+        if (vn)
+        {
+            uint64_t off = 0;
+            VfsWrite(vn, script, si, &off);
+            VfsClose(vn);
+            extern int ShellExecScript(const char* path);
+            ShellExecScript(tmpPath);
+        }
+        else
+        {
+            SerialPrintf("WM: failed to create %s for desktop launch\n", tmpPath);
+        }
+    }
+    else
+    {
+        // Traditional .rc shortcut script
+        extern int ShellExecScript(const char* path);
+        ShellExecScript(g_launcherItems[itemIdx].scriptPath);
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -316,6 +316,25 @@ EOF
     fi
 fi
 
+# Collect .desktop entries and icons from installed packages
+if [ "${UPDATE_TOOLS}" -eq 1 ] && [ -d "${MNTDIR}/store" ]; then
+    echo "Collecting .desktop entries and icons..."
+    APPS_DIR="${MNTDIR}/share/applications"
+    rm -rf "${APPS_DIR}"
+    mkdir -p "${APPS_DIR}"
+    if python3 "${SCRIPT_DIR}/collect_desktop_entries.py" \
+            "${MNTDIR}/store" "${APPS_DIR}" 2>&1 | sed 's/^/  /'; then
+        # Count results
+        if [ -f "${APPS_DIR}/applications.idx" ]; then
+            N_APPS=$(wc -l < "${APPS_DIR}/applications.idx")
+            N_ICONS=$(find "${APPS_DIR}/icons" -name "*.rgba" 2>/dev/null | wc -l)
+            echo "  Collected ${N_APPS} apps, ${N_ICONS} icons"
+        fi
+    else
+        echo "  WARNING: desktop entry collection failed (Pillow missing?)"
+    fi
+fi
+
 if [ "${UPDATE_INDEX}" -eq 1 ]; then
     if [ ! -f "${INDEX_FILE}" ]; then
         echo "Index not found: ${INDEX_FILE}"
