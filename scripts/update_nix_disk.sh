@@ -89,7 +89,7 @@ if [ "${UPDATE_TOOLS}" -eq 1 ]; then
         fi
 
         # Copy brook-player (minimal wl_shm video player)
-        BROOK_PLAYER_STORE=$(nix-build tools/brook-player-pkg/ --no-out-link)
+        BROOK_PLAYER_STORE=$(nix-build "${ROOT_DIR}/tools/brook-player-pkg" --no-out-link)
         if [ -z "$BROOK_PLAYER_STORE" ]; then
             echo "  ERROR: nix-build brook-player failed!"
         elif [ -x "${BROOK_PLAYER_STORE}/bin/brook-player" ]; then
