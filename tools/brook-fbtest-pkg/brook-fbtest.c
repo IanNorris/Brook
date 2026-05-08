@@ -24,6 +24,7 @@
 #include <wayland-client.h>
 #include <wayland-client-protocol.h>
 #include "xdg-shell-client-protocol.h"
+#include "xdg-decoration-client-protocol.h"
 
 /* ------------------------------------------------------------------ */
 /* Globals                                                             */
@@ -38,6 +39,7 @@ static struct wl_registry   *g_reg   = NULL;
 static struct wl_shm        *g_shm   = NULL;
 static struct wl_compositor *g_comp  = NULL;
 static struct xdg_wm_base   *g_wm   = NULL;
+static struct zxdg_decoration_manager_v1 *g_deco_mgr = NULL;
 static struct wl_surface    *g_surf  = NULL;
 static struct xdg_surface   *g_xsurf = NULL;
 static struct xdg_toplevel  *g_tl    = NULL;
@@ -127,6 +129,9 @@ static void on_global(void *data, struct wl_registry *reg, uint32_t name,
     else if (!strcmp(iface, "xdg_wm_base"))
         g_wm = wl_registry_bind(reg, name, &xdg_wm_base_interface,
                                  version < 3 ? version : 3);
+    else if (!strcmp(iface, "zxdg_decoration_manager_v1"))
+        g_deco_mgr = wl_registry_bind(reg, name,
+                                       &zxdg_decoration_manager_v1_interface, 1);
 }
 static void on_global_remove(void *d, struct wl_registry *r, uint32_t n)
 { (void)d; (void)r; (void)n; }
@@ -261,6 +266,14 @@ int main(int argc, char **argv)
     xdg_toplevel_add_listener(g_tl, &tl_lis, NULL);
     xdg_toplevel_set_title(g_tl, "FB Test");
     xdg_toplevel_set_app_id(g_tl, "brook-fbtest");
+
+    /* Request server-side decoration so the kernel WM draws chrome. */
+    if (g_deco_mgr) {
+        struct zxdg_toplevel_decoration_v1 *deco =
+            zxdg_decoration_manager_v1_get_toplevel_decoration(g_deco_mgr, g_tl);
+        zxdg_toplevel_decoration_v1_set_mode(deco,
+            ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+    }
 
     wl_surface_commit(g_surf);
     wl_display_roundtrip(g_dpy);

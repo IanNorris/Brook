@@ -199,9 +199,13 @@ struct brook_surface {
     uint32_t  vfb_w, vfb_h; /* the size we created the Window at */
 
     /* Decoration mode requested by client.  Brook's policy is server-side
-     * chrome for normal toplevels; popups are forced CSD/no-chrome. */
+     * chrome for normal toplevels; popups are forced CSD/no-chrome.
+     * If the client never binds zxdg_toplevel_decoration_v1 before the
+     * first commit, we assume CSD — GTK3/4 apps draw their own header
+     * bar and may not negotiate via xdg-decoration. */
     int  deco_csd;          /* 1 = client-side, 0 = server-side */
     int  deco_pending;      /* mode change requested but wm_id not yet known */
+    int  deco_negotiated;   /* 1 = client used xdg-decoration to set mode */
 
     /* Cursor surface state. When a surface is assigned as cursor via
      * wl_pointer.set_cursor, its commits upload pixels to the kernel
@@ -458,7 +462,12 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
         if (s->wm_id == 0) {
             struct brook_wm_create_out out = {0};
             uint32_t create_flags = 0;
-            if (s->xdg_popup || s->deco_csd)
+            /* CSD if: popup, explicit CSD request, OR the client never
+             * negotiated via xdg-decoration (assume it draws its own
+             * header bar, like GTK3/4 apps). */
+            int effective_csd = s->deco_csd ||
+                                (s->xdg_toplevel && !s->deco_negotiated);
+            if (s->xdg_popup || effective_csd)
                 create_flags |= BROOK_WM_CREATE_FLAG_CSD;
             if (s->xdg_popup)
                 create_flags |= BROOK_WM_CREATE_FLAG_NO_FOCUS;
@@ -473,9 +482,10 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
                 s->vfb_w      = (uint32_t)w;
                 s->vfb_h      = (uint32_t)h;
                 fprintf(stderr,
-                        "[waylandd] WM_CREATE_WINDOW id=%u %dx%d stride=%u vfb=%p deco=%s\n",
+                        "[waylandd] WM_CREATE_WINDOW id=%u %dx%d stride=%u vfb=%p deco=%s%s\n",
                         s->wm_id, w, h, s->vfb_stride, (void*)s->vfb,
-                        s->deco_csd ? "client_side" : "server_side");
+                        effective_csd ? "client_side" : "server_side",
+                        s->deco_negotiated ? "" : " (inferred)");
                 /* The initial decoration mode is applied atomically by
                  * WM_CREATE_WINDOW; later mode changes use syscall 512. */
                 if (s->deco_pending) {
@@ -1744,6 +1754,7 @@ static void deco_mgr_get_toplevel_decoration(struct wl_client *c,
         wl_resource_get_version(r), id);
     if (!d) { wl_client_post_no_memory(c); return; }
     wl_resource_set_implementation(d, &deco_impl, s, NULL);
+    if (s) s->deco_negotiated = 1;
     fprintf(stderr, "[waylandd] decoration get_toplevel_decoration surface=%p\n",
             (void*)s);
     /* Default to CSD: the client opted in by binding the manager. */

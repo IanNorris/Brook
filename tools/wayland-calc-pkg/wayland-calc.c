@@ -27,6 +27,7 @@
 #include <wayland-client.h>
 #include <wayland-client-protocol.h>
 #include "xdg-shell-client-protocol.h"
+#include "xdg-decoration-client-protocol.h"
 
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC 0x0001
@@ -41,6 +42,7 @@ static int memfd_create_shim(const char *name, unsigned int flags) {
 static struct wl_shm        *g_shm  = NULL;
 static struct wl_compositor *g_comp = NULL;
 static struct xdg_wm_base   *g_wm   = NULL;
+static struct zxdg_decoration_manager_v1 *g_deco_mgr = NULL;
 static int g_got_configure = 0;
 static uint32_t g_configure_serial = 0;
 
@@ -55,6 +57,9 @@ static void on_global(void *data, struct wl_registry *reg, uint32_t name,
     else if (!strcmp(iface, "xdg_wm_base"))
         g_wm = wl_registry_bind(reg, name, &xdg_wm_base_interface,
                                  version < 3 ? version : 3);
+    else if (!strcmp(iface, "zxdg_decoration_manager_v1"))
+        g_deco_mgr = wl_registry_bind(reg, name,
+                                       &zxdg_decoration_manager_v1_interface, 1);
 }
 static void on_global_remove(void *d, struct wl_registry *r, uint32_t n) {
     (void)d; (void)r; (void)n;
@@ -412,6 +417,14 @@ int main(int argc, char **argv) {
     xdg_toplevel_set_title(tl, "Brook Calc");
     xdg_toplevel_set_app_id(tl, "brook.calc");
 
+    /* Request server-side decoration so the kernel WM draws chrome. */
+    struct zxdg_toplevel_decoration_v1 *deco = NULL;
+    if (g_deco_mgr) {
+        deco = zxdg_decoration_manager_v1_get_toplevel_decoration(g_deco_mgr, tl);
+        zxdg_toplevel_decoration_v1_set_mode(deco,
+            ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+    }
+
     wl_surface_commit(surf);
     fprintf(stderr, "[calc] xdg_toplevel committed, awaiting configure\n");
 
@@ -448,6 +461,7 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "[calc] hold complete (%ds), tearing down\n", hold_seconds);
 
+    if (deco) zxdg_toplevel_decoration_v1_destroy(deco);
     xdg_toplevel_destroy(tl);
     xdg_surface_destroy(xs);
     wl_surface_destroy(surf);

@@ -32,6 +32,7 @@
 #include <wayland-client.h>
 #include <wayland-client-protocol.h>
 #include "xdg-shell-client-protocol.h"
+#include "xdg-decoration-client-protocol.h"
 
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC 0x0001
@@ -503,6 +504,7 @@ static void render(void) {
 static struct wl_shm        *g_shm  = NULL;
 static struct wl_compositor *g_comp = NULL;
 static struct xdg_wm_base   *g_wm   = NULL;
+static struct zxdg_decoration_manager_v1 *g_deco_mgr = NULL;
 static struct wl_surface    *g_surf  = NULL;
 static struct wl_buffer     *g_buf   = NULL;
 static struct wl_seat       *g_seat  = NULL;
@@ -520,6 +522,9 @@ static void on_global(void *data, struct wl_registry *reg, uint32_t name,
     else if (!strcmp(iface, "xdg_wm_base"))
         g_wm = wl_registry_bind(reg, name, &xdg_wm_base_interface,
                                  version < 3 ? version : 3);
+    else if (!strcmp(iface, "zxdg_decoration_manager_v1"))
+        g_deco_mgr = wl_registry_bind(reg, name,
+                                       &zxdg_decoration_manager_v1_interface, 1);
     else if (!strcmp(iface, "wl_seat"))
         g_seat = wl_registry_bind(reg, name, &wl_seat_interface,
                                    version < 5 ? version : 5);
@@ -830,6 +835,15 @@ int main(int argc, char *argv[]) {
              g_filename[0] ? g_filename : "[new file]");
     xdg_toplevel_set_title(toplevel, title);
     xdg_toplevel_set_app_id(toplevel, "brook-edit");
+
+    /* Request server-side decoration so the kernel WM draws chrome. */
+    if (g_deco_mgr) {
+        struct zxdg_toplevel_decoration_v1 *deco =
+            zxdg_decoration_manager_v1_get_toplevel_decoration(g_deco_mgr, toplevel);
+        zxdg_toplevel_decoration_v1_set_mode(deco,
+            ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+    }
+
     wl_surface_commit(g_surf);
     wl_display_roundtrip(dpy);
 

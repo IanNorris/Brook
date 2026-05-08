@@ -22,14 +22,17 @@ stdenv.mkDerivation {
 
   buildPhase = ''
     XDG_XML=${wayland-protocols}/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml
+    DECO_XML=${wayland-protocols}/share/wayland-protocols/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml
     wayland-scanner client-header $XDG_XML xdg-shell-client-protocol.h
     wayland-scanner private-code  $XDG_XML xdg-shell-protocol.c
+    wayland-scanner client-header $DECO_XML xdg-decoration-client-protocol.h
+    wayland-scanner private-code  $DECO_XML xdg-decoration-protocol.c
 
     $CC -O2 -Wall -Wextra \
         -I${wayland.dev}/include \
         -I${ffmpeg.dev}/include \
         -I. \
-        brook-player.c xdg-shell-protocol.c \
+        brook-player.c xdg-shell-protocol.c xdg-decoration-protocol.c \
         -L${wayland}/lib -lwayland-client \
         -L${ffmpeg.lib}/lib -lavformat -lavcodec -lavutil -lswscale -lswresample \
         -Wl,-rpath,${wayland}/lib:${ffmpeg.lib}/lib:${stdenv.cc.libc}/lib \

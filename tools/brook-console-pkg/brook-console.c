@@ -26,6 +26,7 @@
 #include <wayland-client.h>
 #include <wayland-client-protocol.h>
 #include "xdg-shell-client-protocol.h"
+#include "xdg-decoration-client-protocol.h"
 
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC 0x0001
@@ -266,6 +267,7 @@ static struct wl_compositor *g_compositor;
 static struct wl_shm        *g_shm;
 static struct wl_seat       *g_seat;
 static struct xdg_wm_base   *g_xdg_wm_base;
+static struct zxdg_decoration_manager_v1 *g_deco_mgr = NULL;
 
 static struct wl_surface      *g_surface;
 static struct xdg_surface     *g_xdg_surface;
@@ -457,6 +459,9 @@ static void registry_global(void *data, struct wl_registry *reg,
         g_shm = wl_registry_bind(reg, id, &wl_shm_interface, 1);
     else if (!strcmp(iface, xdg_wm_base_interface.name))
         g_xdg_wm_base = wl_registry_bind(reg, id, &xdg_wm_base_interface, 1);
+    else if (!strcmp(iface, "zxdg_decoration_manager_v1"))
+        g_deco_mgr = wl_registry_bind(reg, id,
+                                       &zxdg_decoration_manager_v1_interface, 1);
     else if (!strcmp(iface, wl_seat_interface.name)) {
         g_seat = wl_registry_bind(reg, id, &wl_seat_interface, 5);
         wl_seat_add_listener(g_seat, &seat_listener, NULL);
@@ -563,6 +568,14 @@ int main(int argc, char **argv) {
     xdg_toplevel_add_listener(g_xdg_toplevel, &toplevel_listener, NULL);
     xdg_toplevel_set_title(g_xdg_toplevel, "Brook Console");
     xdg_toplevel_set_app_id(g_xdg_toplevel, "brook-console");
+
+    /* Request server-side decoration so the kernel WM draws chrome. */
+    if (g_deco_mgr) {
+        struct zxdg_toplevel_decoration_v1 *deco =
+            zxdg_decoration_manager_v1_get_toplevel_decoration(g_deco_mgr, g_xdg_toplevel);
+        zxdg_toplevel_decoration_v1_set_mode(deco,
+            ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+    }
 
     /* Initial frame callback */
     g_frame_cb = wl_surface_frame(g_surface);
