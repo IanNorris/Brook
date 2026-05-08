@@ -1,0 +1,6 @@
+# Brook + brook-fbtest framebuffer stress test via Wayland wl_shm.
+# No video decoding — just renders a sweeping bar at target FPS.
+set wm
+set vfb none
+run --once /nix/bin/waylandd
+run --uid 1000 /nix/bin/brook-fbtest 24

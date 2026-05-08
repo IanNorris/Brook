@@ -1,0 +1,3 @@
+# title: FB Test
+# desc: Framebuffer stress test (24fps bar)
+source /boot/SCRIPTS/wayland_fbtest.rc
