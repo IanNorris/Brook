@@ -440,7 +440,7 @@ struct EpollEvent {
     } data;
 } __attribute__((packed)); // Linux x86_64 ABI: packed to 12 bytes
 
-static constexpr int EPOLL_MAX_FDS = 64;
+static constexpr int EPOLL_MAX_FDS = 256;
 
 struct EpollEntry {
     int      fd;      // watched fd (-1 = free)
@@ -1087,7 +1087,7 @@ static bool FileMapsUnmapRange(Process* proc, uint64_t addr, uint64_t length)
 static constexpr int AF_UNIX           = 1;
 static constexpr int UNIX_SOCK_NONBLOCK = 0x800;
 static constexpr int UNIX_SOCK_CLOEXEC  = 0x80000;
-static constexpr int UNIX_MAX_SERVERS   = 16;
+static constexpr int UNIX_MAX_SERVERS   = 32;
 static constexpr int UNIX_ACCEPT_QUEUE  = 8;
 static constexpr int UNIX_FD_QUEUE_CAP  = 64;
 
