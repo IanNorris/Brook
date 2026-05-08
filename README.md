@@ -143,16 +143,30 @@ nix-shell
 
 ### Run in QEMU
 
+**Linux:**
 ```bash
 ./scripts/run-qemu.sh --release               # Single VM
+./scripts/run-qemu.sh --release --script desktop.rc  # Desktop with app launcher
 ./scripts/vde-up.sh up && \
 ./scripts/run-qemu-pair.sh --release --script wm   # Two VMs on a VDE switch
 ```
+
+**Windows:**
+```batch
+scripts\run-qemu.bat                         # Desktop mode (default)
+scripts\run-qemu.bat --script wmdoom.rc      # DOOM + terminal
+scripts\run-qemu.bat --no-audio --smp 4      # No audio, 4 CPUs
+```
+
+Windows requires [QEMU for Windows](https://www.qemu.org/download/#windows)
+installed and on PATH. OVMF firmware is auto-detected from the QEMU install.
+Copy `build/release/esp/` and `*.img` files from a Linux build.
 
 Boot scripts in `data/scripts/` control what runs at startup:
 
 | Script | Description |
 |--------|-------------|
+| `desktop.rc` | Desktop with app launcher (default) |
 | `wm.rc` | Window manager with bash terminal |
 | `wmdoom.rc` | Window manager with DOOM + bash terminal |
 | `doomfs.rc` | Full-screen DOOM (no WM) |
