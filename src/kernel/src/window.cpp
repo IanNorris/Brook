@@ -271,6 +271,8 @@ void WmDestroyWindow(int idx)
         }
         if (bestIdx >= 0) WmSetFocus(bestIdx);
     }
+    extern void CompositorMarkDirty();
+    CompositorMarkDirty();
 }
 
 void WmDestroyWindowForProcess(Process* proc)
@@ -551,6 +553,8 @@ void WmMoveWindow(int idx, int16_t newX, int16_t newY)
     if (!w.proc) return;
     w.x = newX;
     w.y = newY;
+    extern void CompositorMarkDirty();
+    CompositorMarkDirty();
 }
 
 bool WmMoveWindowRelativeToParent(Process* proc, uint32_t wmId,
@@ -617,6 +621,8 @@ void WmResizeWindow(int idx, uint16_t newClientW, uint16_t newClientH)
         // Legacy per-process VFB (not WM-API): stays the same size,
         // upscale handles it.
     }
+    extern void CompositorMarkDirty();
+    CompositorMarkDirty();
 }
 
 void WmMinimizeWindow(int idx)
@@ -647,6 +653,8 @@ void WmMinimizeWindow(int idx)
         }
         if (bestIdx >= 0) WmSetFocus(bestIdx);
     }
+    extern void CompositorMarkDirty();
+    CompositorMarkDirty();
 }
 
 void WmRestoreWindow(int idx)
@@ -658,6 +666,8 @@ void WmRestoreWindow(int idx)
     w.minimized = false;
     SerialPrintf("WM: restored window %d '%s'\n", idx, w.title);
     WmSetFocus(idx);
+    extern void CompositorMarkDirty();
+    CompositorMarkDirty();
 }
 
 uint32_t WmGetZOrder(int* outIndices, uint32_t maxOut)

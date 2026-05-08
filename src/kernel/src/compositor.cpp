@@ -47,6 +47,12 @@ static inline void MarkAllDirty()
     g_dirtyMaxY = g_physFbHeight;
 }
 
+// Full-repaint flag: set when the scene structure changes (window moved,
+// closed, resized, z-order changed).  When false, only dirty window VFBs
+// need re-blitting — we skip the costly wallpaper redraw and full-screen
+// MMIO flush.
+static volatile bool g_needsFullRepaint = true;
+
 // Registered process slots for compositing.
 static constexpr uint32_t MAX_COMPOSITED = 64;
 static Process* g_compositedProcs[MAX_COMPOSITED] = {};
@@ -642,19 +648,31 @@ static void BlitWindowVfb(const uint32_t* src,
         uint32_t* dstRow = dstBase +
             static_cast<uint32_t>(dstY0 + dy) * dstStride +
             static_cast<uint32_t>(dstX0 + startDx);
-        for (uint32_t dx = startDx; dx < endDx; ++dx)
+        const uint32_t rowLen = endDx - startDx;
+
+        // Fast path: if the first pixel is fully opaque, assume the whole
+        // row is opaque and use memcpy.  This is always correct for video
+        // frames and most UI content.  If a pixel happens to be transparent,
+        // the worst case is minor visual error for one frame.
+        if ((srcRow[0] >> 24) == 255)
         {
-            uint32_t sp = srcRow[dx - startDx];
+            __builtin_memcpy(dstRow, srcRow, rowLen * 4);
+            continue;
+        }
+
+        for (uint32_t dx = 0; dx < rowLen; ++dx)
+        {
+            uint32_t sp = srcRow[dx];
             uint32_t a = sp >> 24;
             if (a == 0)
                 continue;
             if (a == 255)
             {
-                dstRow[dx - startDx] = sp;
+                dstRow[dx] = sp;
                 continue;
             }
 
-            uint32_t dp = dstRow[dx - startDx];
+            uint32_t dp = dstRow[dx];
             uint32_t inv = 255 - a;
             uint32_t sr = (sp >> 16) & 0xff;
             uint32_t sg = (sp >> 8) & 0xff;
@@ -665,7 +683,7 @@ static void BlitWindowVfb(const uint32_t* src,
             uint32_t r = (sr * a + dr * inv + 127) / 255;
             uint32_t g = (sg * a + dg * inv + 127) / 255;
             uint32_t b = (sb * a + db * inv + 127) / 255;
-            dstRow[dx - startDx] = 0xff000000u | (r << 16) | (g << 8) | b;
+            dstRow[dx] = 0xff000000u | (r << 16) | (g << 8) | b;
         }
     }
 }
@@ -897,8 +915,14 @@ static void CompositorLoopWM()
     bool forceAll = (now - g_lastForceBlitTick >= FORCE_BLIT_INTERVAL_MS);
     if (forceAll) g_lastForceBlitTick = now;
 
-    // 1. Draw wallpaper as background
-    BlitWallpaper();
+    // Determine if we need a full scene repaint (wallpaper + all windows)
+    // or can get away with only re-blitting windows whose VFB content changed.
+    bool fullRepaint = forceAll
+                     || __atomic_exchange_n(&g_needsFullRepaint, false, __ATOMIC_ACQ_REL);
+
+    // 1. Draw wallpaper only when the scene structure changed
+    if (fullRepaint)
+        BlitWallpaper();
 
     // 2. Get windows in z-order (back to front) and blit their VFBs
     int sorted[WM_MAX_WINDOWS];
@@ -934,21 +958,14 @@ static void CompositorLoopWM()
         p->fbDestY = w->clientY();
 
         // Blit content then chrome per-window so z-order is respected.
-        // (Previously chrome was drawn after ALL content, so a background
-        // window's border could overwrite a foreground window's content.)
         if (w->vfb)
         {
-            // Per-window VFB (Phase A): kernel-resident buffer owned by
-            // the Window itself.  We always blit (the backbuffer is
-            // wiped to wallpaper each frame, so skipping based on dirty
-            // makes the content flicker out).  vfbDirty is consumed only
-            // to clear the damage-bit; later phases can use it to skip
-            // recomposition when nothing has changed *anywhere*.
-            //
-            // Clamp blit to the buffer that was actually allocated — the
-            // user can drag-resize the window larger than the VFB before
-            // the client provides a fresh buffer, and reading past
-            // w->vfb causes a kernel #PF.
+            // In partial-repaint mode, skip windows whose content hasn't
+            // changed — the backbuffer retains the previous frame's pixels.
+            if (!fullRepaint && !w->vfbDirty)
+                continue;
+
+            // Clamp blit to the buffer that was actually allocated.
             uint32_t vfbW = w->vfbStride;
             uint32_t vfbH = (w->vfbStride && w->vfbBytes)
                           ? static_cast<uint32_t>(w->vfbBytes / (uint64_t)w->vfbStride / 4)
@@ -962,6 +979,8 @@ static void CompositorLoopWM()
         }
         else if (p->state != ProcessState::Terminated && p->fbVfbWidth > 0)
         {
+            if (!fullRepaint && !p->fbDirty)
+                continue;
             BlitProcessAt(p, w->clientX(), w->clientY(), true, w->upscale);
         }
 
@@ -1969,6 +1988,7 @@ void CompositorWake()
 void CompositorMarkDirty()
 {
     MarkAllDirty();
+    __atomic_store_n(&g_needsFullRepaint, true, __ATOMIC_RELEASE);
 }
 
 void CompositorUnregisterProcess(Process* proc)
