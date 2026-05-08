@@ -13,7 +13,9 @@ stdenv.mkDerivation {
   pname = "brook-player";
   version = "0.1-brook";
 
-  src = ./.;
+  src = builtins.filterSource
+    (path: type: baseNameOf path != "result" && baseNameOf path != ".git")
+    ./.;
 
   nativeBuildInputs = [ patchelf wayland-scanner ];
   buildInputs = [ wayland ffmpeg ];
