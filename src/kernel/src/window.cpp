@@ -703,6 +703,26 @@ uint32_t WmGetZOrder(int* outIndices, uint32_t maxOut)
 // Chrome rendering
 // ---------------------------------------------------------------------------
 
+// Draw a filled circle at (cx, cy) with given radius and color
+static void WmFillCircle(uint32_t* buf, uint32_t stride,
+                          uint32_t screenW, uint32_t screenH,
+                          int cx, int cy, int radius, uint32_t color)
+{
+    int r2 = radius * radius;
+    for (int dy = -radius; dy <= radius; dy++)
+    {
+        int py = cy + dy;
+        if (py < 0 || py >= static_cast<int>(screenH)) continue;
+        for (int dx = -radius; dx <= radius; dx++)
+        {
+            if (dx * dx + dy * dy > r2) continue;
+            int px = cx + dx;
+            if (px < 0 || px >= static_cast<int>(screenW)) continue;
+            buf[py * stride + px] = color;
+        }
+    }
+}
+
 static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
                                 uint32_t screenW, uint32_t screenH,
                                 const Window& w,
@@ -766,13 +786,18 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
                    titleX + WM_TITLE_TEXT_PAD_X, textY, w.title,
                    WM_TITLE_FG, titleBg);
 
-    // Close button — red background with 'X', brighter on hover
+    // Close button — circular red dot with 'X', brighter on hover
     int closeBtnX = wx + ow - WM_BORDER_WIDTH - WM_BUTTON_WIDTH;
+    int btnCenterY = titleY + titleH / 2;
     bool closeHover = w.focused && mouseX >= closeBtnX && mouseX < closeBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
                       mouseY >= titleY && mouseY < titleY + titleH;
     uint32_t closeBg = closeHover ? 0x00CC3333 : WM_CLOSE_BTN_BG;
+    static constexpr int CHROME_BTN_RADIUS = 7;
+    int closeCenterX = closeBtnX + static_cast<int>(WM_BUTTON_WIDTH) / 2;
     WmFillRect(buf, stride, screenW, screenH, closeBtnX, titleY,
-               WM_BUTTON_WIDTH, titleH, closeBg);
+               WM_BUTTON_WIDTH, titleH, titleBg);
+    WmFillCircle(buf, stride, screenW, screenH,
+                 closeCenterX, btnCenterY, CHROME_BTN_RADIUS, closeBg);
     int glyphW = 8;
     if ('X' >= g_fontAtlas.firstChar && 'X' < g_fontAtlas.firstChar + g_fontAtlas.glyphCount)
         glyphW = g_fontAtlas.glyphs['X' - g_fontAtlas.firstChar].advance;
@@ -782,31 +807,37 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
                   closeGlyphX, closeGlyphY, 'X',
                   0x00FFFFFF, closeBg);
 
-    // Maximize button — box icon, lighten on hover
+    // Maximize button — circular with box icon, lighten on hover
     int maxBtnX = closeBtnX - WM_BUTTON_WIDTH;
     bool maxHover = w.focused && mouseX >= maxBtnX && mouseX < maxBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
                     mouseY >= titleY && mouseY < titleY + titleH;
-    uint32_t maxBg = maxHover ? 0x003A5A7A : titleBg;
+    uint32_t maxBg = maxHover ? 0x003A5A7A : 0x00304050;
+    int maxCenterX = maxBtnX + static_cast<int>(WM_BUTTON_WIDTH) / 2;
     WmFillRect(buf, stride, screenW, screenH, maxBtnX, titleY,
-               WM_BUTTON_WIDTH, titleH, maxBg);
-    int sqS = WM_BTN_ICON_SIZE;
-    int sqX = maxBtnX + (WM_BUTTON_WIDTH - sqS) / 2;
-    int sqY = titleY + (titleH - sqS) / 2;
+               WM_BUTTON_WIDTH, titleH, titleBg);
+    WmFillCircle(buf, stride, screenW, screenH,
+                 maxCenterX, btnCenterY, CHROME_BTN_RADIUS, maxBg);
+    int sqS = WM_BTN_ICON_SIZE - 2;
+    int sqX = maxCenterX - sqS / 2;
+    int sqY = btnCenterY - sqS / 2;
     WmFillRect(buf, stride, screenW, screenH, sqX, sqY, sqS, 2, WM_TITLE_FG);
     WmFillRect(buf, stride, screenW, screenH, sqX, sqY + sqS - 1, sqS, 1, WM_TITLE_FG);
     WmFillRect(buf, stride, screenW, screenH, sqX, sqY, 1, sqS, WM_TITLE_FG);
     WmFillRect(buf, stride, screenW, screenH, sqX + sqS - 1, sqY, 1, sqS, WM_TITLE_FG);
 
-    // Minimize button — horizontal dash, lighten on hover
+    // Minimize button — circular with dash icon, lighten on hover
     int minBtnX = maxBtnX - WM_BUTTON_WIDTH;
     bool minHover = w.focused && mouseX >= minBtnX && mouseX < minBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
                     mouseY >= titleY && mouseY < titleY + titleH;
-    uint32_t minBg = minHover ? 0x003A5A7A : titleBg;
+    uint32_t minBg = minHover ? 0x003A5A7A : 0x00304050;
+    int minCenterX = minBtnX + static_cast<int>(WM_BUTTON_WIDTH) / 2;
     WmFillRect(buf, stride, screenW, screenH, minBtnX, titleY,
-               WM_BUTTON_WIDTH, titleH, minBg);
-    int lineW = WM_BTN_ICON_SIZE;
-    int lineX = minBtnX + (WM_BUTTON_WIDTH - lineW) / 2;
-    int lineY = titleY + titleH - WM_BTN_ICON_PAD_BOT;
+               WM_BUTTON_WIDTH, titleH, titleBg);
+    WmFillCircle(buf, stride, screenW, screenH,
+                 minCenterX, btnCenterY, CHROME_BTN_RADIUS, minBg);
+    int lineW = WM_BTN_ICON_SIZE - 2;
+    int lineX = minCenterX - lineW / 2;
+    int lineY = btnCenterY;
     WmFillRect(buf, stride, screenW, screenH, lineX, lineY, lineW, 2, WM_TITLE_FG);
 }
 
@@ -1592,7 +1623,8 @@ static void LauncherGetRect(uint32_t screenW, uint32_t screenH,
 }
 
 void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
-                      uint32_t screenW, uint32_t screenH)
+                      uint32_t screenW, uint32_t screenH,
+                      int32_t mouseX, int32_t mouseY)
 {
     if (!g_launcherOpen || g_launcherCount == 0) return;
 
@@ -1612,13 +1644,18 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
 
     uint32_t textYOff = (LAUNCHER_ITEM_HEIGHT - static_cast<uint32_t>(g_fontAtlas.lineHeight)) / 2;
 
-    // Header: "Apps"
+    // Header: "Applications"
     int32_t iy = py + static_cast<int32_t>(LAUNCHER_PADDING);
     WmRenderString(backBuffer, stride, screenW, screenH,
                    px + static_cast<int32_t>(LAUNCHER_PADDING) + 4,
                    iy + static_cast<int32_t>(textYOff),
                    "Applications", LAUNCHER_HEADER_FG, LAUNCHER_BG);
     iy += LAUNCHER_ITEM_HEIGHT;
+
+    // Separator line below header
+    WmFillRect(backBuffer, stride, screenW, screenH,
+               px + static_cast<int32_t>(LAUNCHER_PADDING),
+               iy - 1, static_cast<int>(LAUNCHER_ITEM_WIDTH), 1, LAUNCHER_BORDER_CLR);
 
     // Items — render only the visible window based on scroll offset
     uint32_t validIdx = 0;
@@ -1638,11 +1675,18 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
         int32_t itemX = px + static_cast<int32_t>(LAUNCHER_PADDING);
         int32_t itemY = iy;
 
+        // Hover detection
+        bool hovered = (mouseX >= itemX &&
+                        mouseX < itemX + static_cast<int32_t>(LAUNCHER_ITEM_WIDTH) &&
+                        mouseY >= itemY &&
+                        mouseY < itemY + static_cast<int32_t>(LAUNCHER_ITEM_HEIGHT));
+        uint32_t itemBg = hovered ? 0x00404060 : LAUNCHER_ITEM_BG;
+
         WmFillRect(backBuffer, stride, screenW, screenH,
                    itemX, itemY,
                    static_cast<int>(LAUNCHER_ITEM_WIDTH),
                    static_cast<int>(LAUNCHER_ITEM_HEIGHT),
-                   LAUNCHER_ITEM_BG);
+                   itemBg);
 
         // Draw icon
         int32_t iconX = itemX + 6;
@@ -1653,10 +1697,11 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
         // Title text (offset to right of icon)
         int32_t textX = iconX + static_cast<int32_t>(LAUNCHER_ICON_SIZE) +
                         static_cast<int32_t>(LAUNCHER_ICON_MARGIN);
+        uint32_t textFg = hovered ? 0x00FFFFFF : LAUNCHER_ITEM_FG;
         WmRenderString(backBuffer, stride, screenW, screenH,
                        textX, itemY + static_cast<int32_t>(textYOff),
                        g_launcherItems[i].title,
-                       LAUNCHER_ITEM_FG, LAUNCHER_ITEM_BG);
+                       textFg, itemBg);
 
         iy += LAUNCHER_ITEM_HEIGHT + 2;
         rendered++;

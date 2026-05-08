@@ -1049,7 +1049,8 @@ static void CompositorLoopWM()
         if (WmLauncherVisible())
         {
             WmLauncherRender(g_backBuffer, g_backBufStride,
-                             g_physFbWidth, g_physFbHeight);
+                             g_physFbWidth, g_physFbHeight,
+                             chromeMx, chromeMy);
             // Mark the launcher area dirty (it's above the taskbar)
             MarkDirtyRows(0, g_physFbHeight);
         }

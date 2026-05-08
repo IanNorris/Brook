@@ -333,7 +333,8 @@ void WmLauncherScroll(int delta, uint32_t screenW, uint32_t screenH);
 
 // Render the launcher popup over the desktop.
 void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
-                      uint32_t screenW, uint32_t screenH);
+                      uint32_t screenW, uint32_t screenH,
+                      int32_t mouseX, int32_t mouseY);
 
 // Hit-test the launcher popup. Returns item index (0..N) or -1 if miss.
 int WmLauncherHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH);
