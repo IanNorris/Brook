@@ -265,7 +265,7 @@ static void FreeElfBuffer(uint8_t* buf)
 }
 
 // ---------------------------------------------------------------------------
-// Try to resolve a binary path: check path as-is, then /boot/BIN/<NAME>
+// Try to resolve a binary path: check path as-is, then nix paths, then /boot/BIN/<NAME>
 // ---------------------------------------------------------------------------
 
 static bool ResolveBinaryPath(const char* name, char* outPath, uint32_t maxLen)
@@ -277,6 +277,28 @@ static bool ResolveBinaryPath(const char* name, char* outPath, uint32_t maxLen)
         if (VfsStatPath(name, &st) == 0 && !st.isDir)
         {
             StrCopy(outPath, name, maxLen);
+            return true;
+        }
+    }
+
+    // Try nix paths first (case-sensitive, as-is)
+    static const char* nixPrefixes[] = {
+        "/nix/profile/bin/",
+        "/nix/bin/",
+    };
+    for (const char* prefix : nixPrefixes)
+    {
+        char tryNix[128];
+        StrCopy(tryNix, prefix, sizeof(tryNix));
+        uint32_t pLen = StrLen(tryNix);
+        for (uint32_t j = 0; name[j] && pLen < 126; ++j)
+            tryNix[pLen++] = name[j];
+        tryNix[pLen] = '\0';
+
+        VnodeStat st;
+        if (VfsStatPath(tryNix, &st) == 0 && !st.isDir)
+        {
+            StrCopy(outPath, tryNix, maxLen);
             return true;
         }
     }
