@@ -89,9 +89,10 @@ if [ "${UPDATE_TOOLS}" -eq 1 ]; then
         fi
 
         # Copy brook-player (minimal wl_shm video player)
-        BROOK_PLAYER_STORE=$(nix-build tools/brook-player-pkg/ --no-out-link 2>/dev/null)
-        [ -z "$BROOK_PLAYER_STORE" ] && BROOK_PLAYER_STORE="/nix/store/gjardwnmds8s5ww9qyq4j44i4hbiaqmc-brook-player-0.1-brook"
-        if [ -x "${BROOK_PLAYER_STORE}/bin/brook-player" ]; then
+        BROOK_PLAYER_STORE=$(nix-build tools/brook-player-pkg/ --no-out-link)
+        if [ -z "$BROOK_PLAYER_STORE" ]; then
+            echo "  ERROR: nix-build brook-player failed!"
+        elif [ -x "${BROOK_PLAYER_STORE}/bin/brook-player" ]; then
             ADDED=0
             while IFS= read -r p; do
                 [ -n "$p" ] || continue
@@ -160,7 +161,7 @@ if [ "${UPDATE_TOOLS}" -eq 1 ]; then
         # Copy brook-files (file browser) — build fresh or find in store
         BROOK_FILES_OUT=""
         if command -v nix-build &>/dev/null; then
-            BROOK_FILES_OUT=$(nix-build "${ROOT_DIR}/tools/brook-files-pkg" --no-out-link 2>/dev/null)
+            BROOK_FILES_OUT=$(nix-build "${ROOT_DIR}/tools/brook-files-pkg" --no-out-link)
         fi
         if [ -n "$BROOK_FILES_OUT" ] && [ -x "${BROOK_FILES_OUT}/bin/brook-files" ]; then
             while IFS= read -r p; do
@@ -184,7 +185,7 @@ if [ "${UPDATE_TOOLS}" -eq 1 ]; then
         # Copy brook-edit (text editor) — build fresh or find in store
         BROOK_EDIT_OUT=""
         if command -v nix-build &>/dev/null; then
-            BROOK_EDIT_OUT=$(nix-build "${ROOT_DIR}/tools/brook-edit-pkg" --no-out-link 2>/dev/null)
+            BROOK_EDIT_OUT=$(nix-build "${ROOT_DIR}/tools/brook-edit-pkg" --no-out-link)
         fi
         if [ -n "$BROOK_EDIT_OUT" ] && [ -x "${BROOK_EDIT_OUT}/bin/brook-edit" ]; then
             while IFS= read -r p; do
@@ -209,7 +210,7 @@ if [ "${UPDATE_TOOLS}" -eq 1 ]; then
         # Copy brook-console (kernel console viewer) — build fresh or find in store
         BROOK_CONSOLE_OUT=""
         if command -v nix-build &>/dev/null; then
-            BROOK_CONSOLE_OUT=$(nix-build "${ROOT_DIR}/tools/brook-console-pkg" --no-out-link 2>/dev/null)
+            BROOK_CONSOLE_OUT=$(nix-build "${ROOT_DIR}/tools/brook-console-pkg" --no-out-link)
         fi
         if [ -n "$BROOK_CONSOLE_OUT" ] && [ -x "${BROOK_CONSOLE_OUT}/bin/brook-console" ]; then
             while IFS= read -r p; do
