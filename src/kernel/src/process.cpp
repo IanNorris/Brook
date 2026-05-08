@@ -564,6 +564,19 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
         }
     }
 
+    // Print FNV-1a hash of ELF data so we can verify the on-disk binary
+    // matches the one we built (catches stale disk image issues).
+    {
+        uint64_t h = 0xcbf29ce484222325ULL;
+        for (uint64_t i = 0; i < elfSize; i++)
+        {
+            h ^= elfData[i];
+            h *= 0x100000001b3ULL;
+        }
+        SerialPrintf("ELF HASH: %s size=%lu hash=0x%lx entry=0x%lx\n",
+                     argv[0], elfSize, h, proc->elf.entryPoint);
+    }
+
     proc->programBreak = proc->elf.programBreakLow;
     proc->mmapNext = USER_MMAP_BASE;
 

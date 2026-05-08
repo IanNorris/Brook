@@ -13,8 +13,6 @@ stdenv.mkDerivation {
   pname = "brook-player";
   version = "0.1-brook";
 
-  dontStrip = true;
-
   src = ./.;
 
   nativeBuildInputs = [ patchelf wayland-scanner ];
@@ -42,6 +40,6 @@ stdenv.mkDerivation {
     install -m 755 brook-player $out/bin/brook-player
     patchelf --set-interpreter "${stdenv.cc.libc}/lib/ld-linux-x86-64.so.2" \
         $out/bin/brook-player
-    # Don't strip — preserve symbols for crash debugging
+    strip $out/bin/brook-player
   '';
 }
