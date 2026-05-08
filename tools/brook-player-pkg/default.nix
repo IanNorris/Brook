@@ -1,9 +1,9 @@
-{ stdenv ? (import <nixpkgs> {}).stdenv
-, wayland ? (import <nixpkgs> {}).wayland
-, wayland-scanner ? (import <nixpkgs> {}).wayland-scanner
-, wayland-protocols ? (import <nixpkgs> {}).wayland-protocols
-, ffmpeg ? (import <nixpkgs> {}).ffmpeg
-, patchelf ? (import <nixpkgs> {}).patchelf
+{ stdenv ? (import ../../nix/nixpkgs.nix {}).stdenv
+, wayland ? (import ../../nix/nixpkgs.nix {}).wayland
+, wayland-scanner ? (import ../../nix/nixpkgs.nix {}).wayland-scanner
+, wayland-protocols ? (import ../../nix/nixpkgs.nix {}).wayland-protocols
+, ffmpeg ? (import ../../nix/nixpkgs.nix {}).ffmpeg
+, patchelf ? (import ../../nix/nixpkgs.nix {}).patchelf
 }:
 
 # brook-player: minimal wl_shm video player using ffmpeg libav* decoding.

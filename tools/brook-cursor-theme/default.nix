@@ -1,5 +1,5 @@
-{ stdenvNoCC ? (import <nixpkgs> {}).stdenvNoCC
-, adwaita-icon-theme ? (import <nixpkgs> {}).adwaita-icon-theme
+{ stdenvNoCC ? (import ../../nix/nixpkgs.nix {}).stdenvNoCC
+, adwaita-icon-theme ? (import ../../nix/nixpkgs.nix {}).adwaita-icon-theme
 }:
 
 # Brook cursor theme:

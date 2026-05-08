@@ -1,7 +1,7 @@
-{ stdenv ? (import <nixpkgs> {}).stdenv
-, dejavu_fonts ? (import <nixpkgs> {}).dejavu_fonts
-, fontconfig ? (import <nixpkgs> {}).fontconfig
-, writeText ? (import <nixpkgs> {}).writeText
+{ stdenv ? (import ../../nix/nixpkgs.nix {}).stdenv
+, dejavu_fonts ? (import ../../nix/nixpkgs.nix {}).dejavu_fonts
+, fontconfig ? (import ../../nix/nixpkgs.nix {}).fontconfig
+, writeText ? (import ../../nix/nixpkgs.nix {}).writeText
 }:
 
 # Brook fonts bundle.

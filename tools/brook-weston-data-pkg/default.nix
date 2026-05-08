@@ -1,5 +1,5 @@
-{ stdenv ? (import <nixpkgs> {}).stdenv
-, weston ? (import <nixpkgs> {}).weston
+{ stdenv ? (import ../../nix/nixpkgs.nix {}).stdenv
+, weston ? (import ../../nix/nixpkgs.nix {}).weston
 }:
 
 # Brook bundle of weston's share/weston/ data files (PNG icons used by

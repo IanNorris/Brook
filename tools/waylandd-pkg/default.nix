@@ -1,8 +1,8 @@
-{ stdenv ? (import <nixpkgs> {}).stdenv
-, wayland ? (import <nixpkgs> {}).wayland
-, wayland-scanner ? (import <nixpkgs> {}).wayland-scanner
-, wayland-protocols ? (import <nixpkgs> {}).wayland-protocols
-, patchelf ? (import <nixpkgs> {}).patchelf
+{ stdenv ? (import ../../nix/nixpkgs.nix {}).stdenv
+, wayland ? (import ../../nix/nixpkgs.nix {}).wayland
+, wayland-scanner ? (import ../../nix/nixpkgs.nix {}).wayland-scanner
+, wayland-protocols ? (import ../../nix/nixpkgs.nix {}).wayland-protocols
+, patchelf ? (import ../../nix/nixpkgs.nix {}).patchelf
 }:
 
 # Package the Brook Wayland server.

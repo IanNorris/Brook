@@ -8,7 +8,7 @@
 # mkShellNoCC is used to prevent Nix from injecting system include paths that
 # break libc++'s #include_next header chain.
 
-{ pkgs ? import <nixpkgs> {} }:
+{ pkgs ? import ./nix/nixpkgs.nix {} }:
 
 let
   llvm = pkgs.llvmPackages_18;

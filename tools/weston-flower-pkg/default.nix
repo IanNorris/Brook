@@ -1,7 +1,7 @@
-{ stdenv ? (import <nixpkgs> {}).stdenv
-, weston ? (import <nixpkgs> {}).weston
-, patchelf ? (import <nixpkgs> {}).patchelf
-, glibc ? (import <nixpkgs> {}).glibc
+{ stdenv ? (import ../../nix/nixpkgs.nix {}).stdenv
+, weston ? (import ../../nix/nixpkgs.nix {}).weston
+, patchelf ? (import ../../nix/nixpkgs.nix {}).patchelf
+, glibc ? (import ../../nix/nixpkgs.nix {}).glibc
 }:
 
 # Build a "fat" weston-flower package: copies the binary plus exactly the

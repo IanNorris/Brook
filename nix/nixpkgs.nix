@@ -10,12 +10,10 @@
 # Prefetch hash:           nix-prefetch-url --unpack https://github.com/NixOS/nixpkgs/archive/<rev>.tar.gz
 
 let
-  rev = "68a8af93ff42f2bce34e4f8521a55e5e8a3eb153";  # nixpkgs-unstable 2026-04
-  sha256 = ""; # empty = trust-on-first-use (Nix will fetch & cache)
+  rev = "68a8af93ff42";  # nixpkgs-unstable 2026-04 (26.05pre993588)
   src = builtins.fetchTarball {
     url = "https://github.com/NixOS/nixpkgs/archive/${rev}.tar.gz";
-    # Omitting sha256 allows first use without prefetching. Once cached,
-    # the tarball is content-addressed and won't re-download.
+    sha256 = "1slqf8p2178xszw0y1li79kq23kdxnyzdm9ndcrzfwv24fs350d5";
   };
 in
   import src

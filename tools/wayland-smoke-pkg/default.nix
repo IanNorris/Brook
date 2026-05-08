@@ -1,6 +1,6 @@
-{ stdenv ? (import <nixpkgs> {}).stdenv
-, wayland ? (import <nixpkgs> {}).wayland
-, patchelf ? (import <nixpkgs> {}).patchelf
+{ stdenv ? (import ../../nix/nixpkgs.nix {}).stdenv
+, wayland ? (import ../../nix/nixpkgs.nix {}).wayland
+, patchelf ? (import ../../nix/nixpkgs.nix {}).patchelf
 }:
 
 # Brook Wayland client smoke test — connects to waylandd, enumerates

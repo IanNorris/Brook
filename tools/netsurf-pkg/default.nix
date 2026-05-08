@@ -1,7 +1,7 @@
-{ stdenv ? (import <nixpkgs> {}).stdenv
-, expat ? (import <nixpkgs> {}).expat
-, zlib ? (import <nixpkgs> {}).zlib
-, patchelf ? (import <nixpkgs> {}).patchelf
+{ stdenv ? (import ../../nix/nixpkgs.nix {}).stdenv
+, expat ? (import ../../nix/nixpkgs.nix {}).expat
+, zlib ? (import ../../nix/nixpkgs.nix {}).zlib
+, patchelf ? (import ../../nix/nixpkgs.nix {}).patchelf
 }:
 
 # Package the pre-built NetSurf framebuffer binary for Brook OS.
