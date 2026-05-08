@@ -35,6 +35,7 @@ static LauncherItem g_launcherItems[WM_LAUNCHER_MAX_ITEMS] = {};
 static uint32_t     g_launcherCount = 0;
 static bool         g_launcherOpen  = false;
 static bool         g_launcherLoaded = false;
+static uint32_t     g_launcherScroll = 0; // first visible item index
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1077,6 +1078,7 @@ static constexpr uint32_t LAUNCHER_ICON_MARGIN  = 8;
 static constexpr uint32_t LAUNCHER_ITEM_HEIGHT  = 32;
 static constexpr uint32_t LAUNCHER_ITEM_WIDTH   = 230;
 static constexpr uint32_t LAUNCHER_PADDING      = 6;
+static constexpr uint32_t LAUNCHER_MAX_VISIBLE  = 12; // max items visible before scrolling
 static constexpr uint32_t LAUNCHER_BG           = 0x00252535;
 static constexpr uint32_t LAUNCHER_ITEM_BG      = 0x00303045;
 static constexpr uint32_t LAUNCHER_ITEM_FG      = 0x00E0E0E0;
@@ -1508,11 +1510,30 @@ void WmLauncherToggle()
 {
     if (!g_launcherLoaded) WmLauncherLoad();
     g_launcherOpen = !g_launcherOpen;
+    if (g_launcherOpen) g_launcherScroll = 0; // reset scroll on open
 }
 
 bool WmLauncherVisible()
 {
     return g_launcherOpen;
+}
+
+void WmLauncherScroll(int delta, uint32_t /*screenW*/, uint32_t /*screenH*/)
+{
+    if (!g_launcherOpen) return;
+
+    // Count total valid items
+    uint32_t totalValid = 0;
+    for (uint32_t i = 0; i < g_launcherCount; i++)
+        if (g_launcherItems[i].valid) totalValid++;
+
+    if (totalValid <= LAUNCHER_MAX_VISIBLE) return; // no scrolling needed
+
+    uint32_t maxScroll = totalValid - LAUNCHER_MAX_VISIBLE;
+    if (delta > 0 && g_launcherScroll < maxScroll)
+        g_launcherScroll++;
+    else if (delta < 0 && g_launcherScroll > 0)
+        g_launcherScroll--;
 }
 
 // Get the launcher panel geometry (anchored above the Apps button on the taskbar)
@@ -1521,9 +1542,10 @@ static void LauncherGetRect(uint32_t screenW, uint32_t screenH,
                             uint32_t* outW, uint32_t* outH)
 {
     uint32_t itemCount = g_launcherCount > 0 ? g_launcherCount : 1;
+    uint32_t visibleItems = itemCount < LAUNCHER_MAX_VISIBLE ? itemCount : LAUNCHER_MAX_VISIBLE;
     uint32_t headerH = LAUNCHER_ITEM_HEIGHT; // "Apps" header row
     uint32_t panelW = LAUNCHER_ITEM_WIDTH + LAUNCHER_PADDING * 2;
-    uint32_t panelH = headerH + itemCount * (LAUNCHER_ITEM_HEIGHT + 2) + LAUNCHER_PADDING * 2;
+    uint32_t panelH = headerH + visibleItems * (LAUNCHER_ITEM_HEIGHT + 2) + LAUNCHER_PADDING * 2;
 
     *outX = static_cast<int32_t>(WM_TASKBAR_PADDING);
     *outY = static_cast<int32_t>(screenH - WM_TASKBAR_HEIGHT - panelH - 2);
@@ -1560,10 +1582,20 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
                    "Applications", LAUNCHER_HEADER_FG, LAUNCHER_BG);
     iy += LAUNCHER_ITEM_HEIGHT;
 
-    // Items
-    for (uint32_t i = 0; i < g_launcherCount; i++)
+    // Items — render only the visible window based on scroll offset
+    uint32_t validIdx = 0;
+    uint32_t rendered = 0;
+    for (uint32_t i = 0; i < g_launcherCount && rendered < LAUNCHER_MAX_VISIBLE; i++)
     {
         if (!g_launcherItems[i].valid) continue;
+
+        // Skip items before scroll offset
+        if (validIdx < g_launcherScroll)
+        {
+            validIdx++;
+            continue;
+        }
+        validIdx++;
 
         int32_t itemX = px + static_cast<int32_t>(LAUNCHER_PADDING);
         int32_t itemY = iy;
@@ -1589,6 +1621,29 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
                        LAUNCHER_ITEM_FG, LAUNCHER_ITEM_BG);
 
         iy += LAUNCHER_ITEM_HEIGHT + 2;
+        rendered++;
+    }
+
+    // Scroll indicators (arrows) if content overflows
+    uint32_t totalValid = 0;
+    for (uint32_t i = 0; i < g_launcherCount; i++)
+        if (g_launcherItems[i].valid) totalValid++;
+
+    if (g_launcherScroll > 0)
+    {
+        // Up arrow indicator at top-right of panel
+        WmRenderString(backBuffer, stride, screenW, screenH,
+                       px + static_cast<int32_t>(pw) - 16,
+                       py + static_cast<int32_t>(LAUNCHER_PADDING) + static_cast<int32_t>(textYOff),
+                       "^", 0x0080A0C0, LAUNCHER_BG);
+    }
+    if (g_launcherScroll + LAUNCHER_MAX_VISIBLE < totalValid)
+    {
+        // Down arrow indicator at bottom-right of panel
+        WmRenderString(backBuffer, stride, screenW, screenH,
+                       px + static_cast<int32_t>(pw) - 16,
+                       py + static_cast<int32_t>(ph) - static_cast<int32_t>(LAUNCHER_PADDING) - g_fontAtlas.lineHeight,
+                       "v", 0x0080A0C0, LAUNCHER_BG);
     }
 }
 
@@ -1609,14 +1664,22 @@ int WmLauncherHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH
     int32_t itemStartY = py + static_cast<int32_t>(LAUNCHER_PADDING + LAUNCHER_ITEM_HEIGHT);
     int32_t itemX = px + static_cast<int32_t>(LAUNCHER_PADDING);
 
-    for (uint32_t i = 0; i < g_launcherCount; i++)
+    // Map visual slot to actual launcher item, accounting for scroll
+    uint32_t validIdx = 0;
+    uint32_t slot = 0;
+    for (uint32_t i = 0; i < g_launcherCount && slot < LAUNCHER_MAX_VISIBLE; i++)
     {
-        int32_t iy = itemStartY + static_cast<int32_t>(i * (LAUNCHER_ITEM_HEIGHT + 2));
+        if (!g_launcherItems[i].valid) continue;
+        if (validIdx < g_launcherScroll) { validIdx++; continue; }
+        validIdx++;
+
+        int32_t iy = itemStartY + static_cast<int32_t>(slot * (LAUNCHER_ITEM_HEIGHT + 2));
         if (mx >= itemX && mx < itemX + static_cast<int32_t>(LAUNCHER_ITEM_WIDTH) &&
             my >= iy && my < iy + static_cast<int32_t>(LAUNCHER_ITEM_HEIGHT))
         {
             return static_cast<int>(i);
         }
+        slot++;
     }
 
     return -1; // clicked in panel but not on an item (header or padding)

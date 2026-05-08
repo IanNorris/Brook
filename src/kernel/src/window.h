@@ -328,6 +328,9 @@ void WmLauncherToggle();
 // Is the launcher popup currently visible?
 bool WmLauncherVisible();
 
+// Scroll the launcher by delta (negative = up, positive = down).
+void WmLauncherScroll(int delta, uint32_t screenW, uint32_t screenH);
+
 // Render the launcher popup over the desktop.
 void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
                       uint32_t screenW, uint32_t screenH);

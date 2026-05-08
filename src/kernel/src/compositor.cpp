@@ -1151,6 +1151,15 @@ static void CompositorLoopWM()
         {
             int32_t mx = 0, my = 0;
             MouseGetPosition(&mx, &my);
+
+            // If launcher is open, scroll it instead of windows
+            if (WmLauncherVisible())
+            {
+                int8_t dy = static_cast<int8_t>(ev.scanCode);
+                WmLauncherScroll(dy, g_physFbWidth, g_physFbHeight);
+                continue;
+            }
+
             WmHitResult hit = WmHitTest(mx, my);
             if (hit.windowIndex >= 0)
             {
