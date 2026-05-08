@@ -71,7 +71,12 @@ echo "--- Ext2 Disk Image ---"
 "${SCRIPT_DIR}/update_ext2_disk.sh" --create
 echo ""
 
-# 7. Run host tests
+# 7. Update Nix tools disk (waylandd, brook-player, brook-files, etc.)
+echo "--- Nix Tools Disk ---"
+"${SCRIPT_DIR}/update_nix_disk.sh" --tools
+echo ""
+
+# 8. Run host tests
 BUILD_TYPE_LOWER="$(echo "${BUILD_TYPE}" | tr '[:upper:]' '[:lower:]')"
 HOST_TEST_DIR="${ROOT_DIR}/build/${BUILD_TYPE_LOWER}/host_tests"
 if [ -d "${HOST_TEST_DIR}" ]; then

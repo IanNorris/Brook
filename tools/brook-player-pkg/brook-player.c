@@ -673,6 +673,21 @@ int main(int argc, char **argv)
                 }
             }
 
+            /* DEBUG: render a moving vertical bar so we can visually
+             * confirm that frames are actually reaching the display.
+             * The bar sweeps left-to-right, cycling every g_width pixels. */
+            {
+                int bar_x = frames_shown % g_width;
+                int bar_w = 8;
+                uint32_t bar_color = 0xFF00FF00; /* green BGRA */
+                uint32_t *px = (uint32_t*)dst_data[0];
+                int stride_px = dst_linesize[0] / 4;
+                for (int y = 0; y < g_height; y++) {
+                    for (int bx = bar_x; bx < bar_x + bar_w && bx < g_width; bx++)
+                        px[y * stride_px + bx] = bar_color;
+                }
+            }
+
             display_frame(dst_data[0], dst_linesize[0]);
             frames_shown++;
 
