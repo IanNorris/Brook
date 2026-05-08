@@ -116,15 +116,18 @@ static int WmRenderGlyph(uint32_t* buf, uint32_t stride,
     return gi.advance;
 }
 
-// Render a string
+// Render a string, optionally clipped to maxWidth pixels from starting x.
+// maxWidth <= 0 means no clipping.
 static void WmRenderString(uint32_t* buf, uint32_t stride,
                             uint32_t screenW, uint32_t screenH,
                             int x, int y, const char* str,
-                            uint32_t fg, uint32_t bg)
+                            uint32_t fg, uint32_t bg,
+                            int maxWidth = 0)
 {
     int penX = x;
     while (*str)
     {
+        if (maxWidth > 0 && (penX - x) >= maxWidth) break;
         penX += WmRenderGlyph(buf, stride, screenW, screenH,
                                penX, y, static_cast<uint8_t>(*str), fg, bg);
         ++str;
@@ -780,11 +783,13 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     uint32_t sepCol = w.focused ? 0x001A3A5A : 0x00303030;
     WmFillRect(buf, stride, screenW, screenH, titleX, sepY, titleW, 1, sepCol);
 
-    // Title text
+    // Title text — clipped to avoid overlapping chrome buttons
     int textY = titleY + (titleH - g_fontAtlas.lineHeight) / 2;
+    int titleMaxW = titleW - WM_TITLE_TEXT_PAD_X - 3 * static_cast<int>(WM_BUTTON_WIDTH) - 4;
+    if (titleMaxW < 0) titleMaxW = 0;
     WmRenderString(buf, stride, screenW, screenH,
                    titleX + WM_TITLE_TEXT_PAD_X, textY, w.title,
-                   WM_TITLE_FG, titleBg);
+                   WM_TITLE_FG, titleBg, titleMaxW);
 
     // Close button — circular red dot with 'X', brighter on hover
     int closeBtnX = wx + ow - WM_BORDER_WIDTH - WM_BUTTON_WIDTH;
@@ -986,19 +991,12 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
                        dynBtnWidth - 4, 1, 0x00808080);
         }
 
-        // Truncate title to fit button
-        char label[20];
-        uint32_t maxChars = (dynBtnWidth - 8) / 8; // rough estimate
-        if (maxChars > sizeof(label) - 1) maxChars = sizeof(label) - 1;
-        uint32_t ti = 0;
-        while (ti < maxChars && w.title[ti]) { label[ti] = w.title[ti]; ti++; }
-        label[ti] = '\0';
-
-        // Render title text
+        // Render title text — clipped to button width
         WmRenderString(backBuffer, stride, screenW, screenH,
                        static_cast<int>(btnX + 4),
                        static_cast<int>(btnY + textYOff),
-                       label, WM_TASKBAR_BTN_FG, btnBg);
+                       w.title, WM_TASKBAR_BTN_FG, btnBg,
+                       static_cast<int>(dynBtnWidth - 8));
 
         btnX += dynBtnWidth + WM_TASKBAR_PADDING;
     }
@@ -1704,6 +1702,16 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
                        textFg, itemBg);
 
         iy += LAUNCHER_ITEM_HEIGHT + 2;
+
+        // Subtle separator line between items
+        if (rendered < LAUNCHER_MAX_VISIBLE - 1)
+        {
+            WmFillRect(backBuffer, stride, screenW, screenH,
+                       itemX + 4, iy - 1,
+                       static_cast<int>(LAUNCHER_ITEM_WIDTH) - 8, 1,
+                       0x00404060);
+        }
+
         rendered++;
     }
 
