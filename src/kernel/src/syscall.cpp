@@ -3431,13 +3431,13 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                 break;
             }
         }
-        if (!tracked) return -ENOMEM;
+        if (!tracked) {
+            SerialPrintf("sys_mmap: WARNING MAX_MEMFD_MAPS (%u) exhausted for pid=%u\n",
+                         Process::MAX_MEMFD_MAPS, proc->pid);
+            return -ENOMEM;
+        }
         return static_cast<int64_t>(vaddr);
     }
-
-    // File-backed mmap
-    if (fde->type != FdType::Vnode || !fde->handle)
-        return -EBADF;
 
     // Trace file-backed mmaps during early process startup (ld-linux loading
     // shared libraries).  Rate-limited to first 200 per process.
@@ -3480,7 +3480,12 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                 break;
             }
         }
-        if (!tracked) return -ENOMEM;
+        if (!tracked) {
+            SerialPrintf("sys_mmap: WARNING MAX_FILE_MAPS (%u) exhausted for pid=%u, "
+                         "falling back to eager read\n",
+                         Process::MAX_FILE_MAPS, proc->pid);
+            return -ENOMEM;
+        }
 
         // Preload mapped region into page cache.
         // For files ≤4MB, preload the entire file. For larger files,
@@ -4595,7 +4600,14 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
 
             uint32_t len = 0;
             while (len < MAX_STR_LEN && arg[len]) len++;
-            if (argBufPos + len + 1 > ARG_BUF_SIZE) break;
+            if (len == MAX_STR_LEN)
+                SerialPrintf("sys_execve: WARNING arg[%d] truncated at %lu bytes\n",
+                             i, MAX_STR_LEN);
+            if (argBufPos + len + 1 > ARG_BUF_SIZE) {
+                SerialPrintf("sys_execve: WARNING arg buffer full (%u/%lu), "
+                             "dropping args %d+\n", argBufPos, ARG_BUF_SIZE, i);
+                break;
+            }
 
             for (uint32_t j = 0; j < len; j++)
                 argBuf[argBufPos + j] = arg[j];
@@ -4604,6 +4616,10 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
             argBufPos += len + 1;
             argc++;
         }
+        // Warn if there are more args beyond MAX_EXEC_ARGS
+        if (argc == MAX_EXEC_ARGS - 1 && userArgv[MAX_EXEC_ARGS - 1])
+            SerialPrintf("sys_execve: WARNING argc=%d hit MAX_EXEC_ARGS=%d, "
+                         "extra args dropped\n", argc, MAX_EXEC_ARGS);
     }
 
     // If no argv provided, use the path as argv[0]
@@ -4637,7 +4653,14 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
 
             uint32_t len = 0;
             while (len < MAX_STR_LEN && env[len]) len++;
-            if (envBufPos + len + 1 > ARG_BUF_SIZE) break;
+            if (len == MAX_STR_LEN)
+                SerialPrintf("sys_execve: WARNING env[%d] truncated at %lu bytes\n",
+                             i, MAX_STR_LEN);
+            if (envBufPos + len + 1 > ARG_BUF_SIZE) {
+                SerialPrintf("sys_execve: WARNING env buffer full (%u/%lu), "
+                             "dropping env vars %d+\n", envBufPos, ARG_BUF_SIZE, i);
+                break;
+            }
 
             for (uint32_t j = 0; j < len; j++)
                 envBuf[envBufPos + j] = env[j];
@@ -4646,6 +4669,9 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
             envBufPos += len + 1;
             envc++;
         }
+        if (envc == MAX_EXEC_ENVP - 1 && userEnvp[MAX_EXEC_ENVP - 1])
+            SerialPrintf("sys_execve: WARNING envc=%d hit MAX_EXEC_ENVP=%d, "
+                         "extra env vars dropped\n", envc, MAX_EXEC_ENVP);
     }
 
     SerialPrintf("sys_execve: envpAddr=0x%lx envc=%d argc=%d path='%s'\n",

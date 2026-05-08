@@ -236,6 +236,9 @@ static uint64_t SetupUserStack(Process* proc,
     // 2. Push environment strings and record pointers
     static constexpr int MAX_ENV = 64;
     uint64_t envAddrs[MAX_ENV] = {};
+    if (envc > MAX_ENV)
+        SerialPrintf("SetupUserStack: WARNING envc=%d clamped to MAX_ENV=%d for pid %u\n",
+                     envc, MAX_ENV, proc->pid);
     for (int i = 0; i < envc && i < MAX_ENV; ++i)
     {
         uint64_t len = 0;
@@ -244,8 +247,12 @@ static uint64_t SetupUserStack(Process* proc,
     }
 
     // 3. Push argument strings and record pointers
-    uint64_t argAddrs[32] = {};
-    for (int i = 0; i < argc && i < 32; ++i)
+    static constexpr int MAX_SETUP_ARGS = 32;
+    uint64_t argAddrs[MAX_SETUP_ARGS] = {};
+    if (argc > MAX_SETUP_ARGS)
+        SerialPrintf("SetupUserStack: WARNING argc=%d clamped to %d for pid %u\n",
+                     argc, MAX_SETUP_ARGS, proc->pid);
+    for (int i = 0; i < argc && i < MAX_SETUP_ARGS; ++i)
     {
         uint64_t len = 0;
         while (argv[i][len]) ++len;
