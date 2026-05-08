@@ -326,36 +326,42 @@ static uint64_t LoadInterpreter(Process* proc)
 {
     if (proc->elf.interpPath[0] == '\0') return 0;
 
-    DbgPrintf("INTERP: loading '%s' for pid %u\n",
+    SerialPrintf("INTERP: loading '%s' for pid %u\n",
                  proc->elf.interpPath, proc->pid);
 
     // Try the exact path first.
+    const char* whichPath = proc->elf.interpPath;
     Vnode* vn = VfsOpen(proc->elf.interpPath);
 
     // Fallback: try /boot prefix.
+    char bootPath[256];
     if (!vn)
     {
-        char bootPath[256] = "/boot";
+        bootPath[0]='/',bootPath[1]='b',bootPath[2]='o',bootPath[3]='o',bootPath[4]='t';
         uint32_t bi = 5;
         const char* p = proc->elf.interpPath;
         while (*p && bi + 1 < sizeof(bootPath)) bootPath[bi++] = *p++;
         bootPath[bi] = '\0';
+        whichPath = bootPath;
         vn = VfsOpen(bootPath);
     }
 
     // Fallback: extract filename and look in /boot/lib/.
+    char libPath[256];
     if (!vn)
     {
         const char* fname = proc->elf.interpPath;
         for (const char* p = proc->elf.interpPath; *p; ++p)
             if (*p == '/') fname = p + 1;
 
-        char libPath[256] = "/boot/lib/";
+        libPath[0]='/',libPath[1]='b',libPath[2]='o',libPath[3]='o',libPath[4]='t';
+        libPath[5]='/',libPath[6]='l',libPath[7]='i',libPath[8]='b',libPath[9]='/';
         uint32_t li = 10;
         while (*fname && li + 1 < sizeof(libPath)) libPath[li++] = *fname++;
         libPath[li] = '\0';
 
         SerialPrintf("INTERP: trying '%s'\n", libPath);
+        whichPath = libPath;
         vn = VfsOpen(libPath);
     }
 
@@ -372,6 +378,9 @@ static uint64_t LoadInterpreter(Process* proc)
         VfsClose(vn);
         return 0;
     }
+
+    SerialPrintf("INTERP: opened '%s' size=%lu (expected glibc-2.42-61=263056)\n",
+                 whichPath, st.size);
 
     auto* buf = static_cast<uint8_t*>(kmalloc(st.size));
     if (!buf)
