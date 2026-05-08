@@ -3217,6 +3217,14 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         uint64_t result = 0;
         if (flags & MAP_FIXED) {
             if (addr == 0) { SpinLockRelease(&s_mmapLock, lf); return 0; }
+            // Warn if MAP_FIXED overlaps the interpreter region
+            constexpr uint64_t INTERP_BASE = 0x7F0000000000ULL;
+            constexpr uint64_t INTERP_END  = INTERP_BASE + 0x40000; // ~256KB for ld-linux
+            uint64_t mapEnd = addr + pages * 4096;
+            if (addr < INTERP_END && mapEnd > INTERP_BASE) {
+                SerialPrintf("[MMAP] WARNING: MAP_FIXED pid=%u addr=0x%lx len=0x%lx OVERLAPS INTERP [0x%lx-0x%lx]\n",
+                             proc->pid, addr, pages * 4096, INTERP_BASE, INTERP_END);
+            }
             for (uint64_t i = 0; i < pages; i++) {
                 VirtualAddress va(addr + i * 4096);
                 PhysicalAddress existing = VmmVirtToPhys(proc->pageTable, va);
