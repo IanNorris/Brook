@@ -31,6 +31,9 @@
 #define MANIFEST_PATH   "/nix/profile/manifest.tsv"
 #define PROFILE_BIN     "/nix/profile/bin"
 #define PROFILE_LIB     "/nix/profile/lib"
+#define APPS_DIR        "/nix/share/applications"
+#define APPS_IDX        "/nix/share/applications/applications.idx"
+#define APPS_ICONS_DIR  "/nix/share/applications/icons"
 #define MAX_LINE        4096
 #define MAX_PACKAGES    256
 
@@ -609,6 +612,174 @@ static int unlink_package_libs(const char *store_name) {
     return removed;
 }
 
+/* -----------------------------------------------------------------------
+ * Desktop entry collection — rebuild applications.idx after install/remove.
+ * Scans nix store packages for .desktop files and writes a tab-separated
+ * manifest. Icon conversion is skipped (no libpng in userspace) — existing
+ * .rgba icons from the host build are preserved.
+ * ----------------------------------------------------------------------- */
+
+/* Simple .desktop file parser — extract Name, Exec, Icon, Categories */
+static int parse_desktop_entry(const char *path, char *name, size_t name_sz,
+                               char *exec_cmd, size_t exec_sz,
+                               char *icon, size_t icon_sz,
+                               char *categories, size_t cat_sz)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+
+    name[0] = exec_cmd[0] = icon[0] = categories[0] = '\0';
+    int in_desktop = 0;
+    char line[1024];
+
+    while (fgets(line, sizeof(line), f)) {
+        /* Strip trailing newline */
+        size_t len = strlen(line);
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
+            line[--len] = '\0';
+
+        if (strcmp(line, "[Desktop Entry]") == 0) { in_desktop = 1; continue; }
+        if (line[0] == '[') { in_desktop = 0; continue; }
+        if (!in_desktop) continue;
+
+        if (strncmp(line, "Name=", 5) == 0)
+            snprintf(name, name_sz, "%s", line + 5);
+        else if (strncmp(line, "Exec=", 5) == 0)
+            snprintf(exec_cmd, exec_sz, "%s", line + 5);
+        else if (strncmp(line, "Icon=", 5) == 0)
+            snprintf(icon, icon_sz, "%s", line + 5);
+        else if (strncmp(line, "Categories=", 11) == 0)
+            snprintf(categories, cat_sz, "%s", line + 11);
+        else if (strncmp(line, "Hidden=true", 11) == 0) { fclose(f); return -1; }
+        else if (strncmp(line, "NoDisplay=true", 14) == 0) { fclose(f); return -1; }
+        else if (strncmp(line, "Type=", 5) == 0 && strcmp(line + 5, "Application") != 0)
+            { fclose(f); return -1; }
+    }
+    fclose(f);
+
+    if (name[0] == '\0' || exec_cmd[0] == '\0') return -1;
+
+    /* Strip Exec field codes (%f, %F, %u, %U, etc.) */
+    char *pct = exec_cmd;
+    while ((pct = strchr(pct, '%')) != NULL) {
+        if (pct[1]) {
+            /* Remove %X and any preceding space */
+            char *start = pct;
+            if (start > exec_cmd && start[-1] == ' ') start--;
+            memmove(start, pct + 2, strlen(pct + 2) + 1);
+            pct = start;
+        } else {
+            *pct = '\0';
+        }
+    }
+    /* Trim trailing spaces */
+    size_t elen = strlen(exec_cmd);
+    while (elen > 0 && exec_cmd[elen-1] == ' ') exec_cmd[--elen] = '\0';
+
+    return 0;
+}
+
+static void refresh_desktop_entries(void)
+{
+    /* Ensure output directories exist */
+    mkdir(APPS_DIR, 0755);
+    mkdir(APPS_ICONS_DIR, 0755);
+
+    /* Scan nix store packages for .desktop files */
+    DIR *store = opendir("/nix/store");
+    if (!store) return;
+
+    struct {
+        char name[256];
+        char exec_cmd[512];
+        char icon_file[256];
+        char categories[256];
+    } entries[MAX_PACKAGES];
+    int entry_count = 0;
+    char seen_names[MAX_PACKAGES][256];
+    int seen_count = 0;
+
+    struct dirent *pkg_ent;
+    while ((pkg_ent = readdir(store)) != NULL && entry_count < MAX_PACKAGES) {
+        if (pkg_ent->d_name[0] == '.') continue;
+
+        char apps_path[1024];
+        snprintf(apps_path, sizeof(apps_path),
+                 "/nix/store/%s/share/applications", pkg_ent->d_name);
+
+        DIR *apps = opendir(apps_path);
+        if (!apps) continue;
+
+        struct dirent *de;
+        while ((de = readdir(apps)) != NULL && entry_count < MAX_PACKAGES) {
+            size_t nlen = strlen(de->d_name);
+            if (nlen < 9 || strcmp(de->d_name + nlen - 8, ".desktop") != 0)
+                continue;
+
+            char desktop_path[1536];
+            snprintf(desktop_path, sizeof(desktop_path), "%s/%s", apps_path, de->d_name);
+
+            char name[256], exec_cmd[512], icon[256], categories[256];
+            if (parse_desktop_entry(desktop_path, name, sizeof(name),
+                                    exec_cmd, sizeof(exec_cmd),
+                                    icon, sizeof(icon),
+                                    categories, sizeof(categories)) != 0)
+                continue;
+
+            /* Deduplicate by name */
+            int dup = 0;
+            for (int i = 0; i < seen_count; i++) {
+                if (strcmp(seen_names[i], name) == 0) { dup = 1; break; }
+            }
+            if (dup) continue;
+            snprintf(seen_names[seen_count++], 256, "%s", name);
+
+            /* Check if an .rgba icon already exists from host-side build */
+            char icon_file[256] = "";
+            if (icon[0]) {
+                char safe[256];
+                int si = 0;
+                for (int i = 0; icon[i] && si < 254; i++) {
+                    char c = icon[i];
+                    if (c == '/' || c == ' ') c = '_';
+                    if (isalnum(c) || c == '-' || c == '_') safe[si++] = c;
+                }
+                safe[si] = '\0';
+
+                char rgba_path[512];
+                snprintf(rgba_path, sizeof(rgba_path), "%s/%s.rgba", APPS_ICONS_DIR, safe);
+                if (access(rgba_path, F_OK) == 0) {
+                    snprintf(icon_file, sizeof(icon_file), "%s.rgba", safe);
+                }
+            }
+
+            snprintf(entries[entry_count].name, 256, "%s", name);
+            snprintf(entries[entry_count].exec_cmd, 512, "%s", exec_cmd);
+            snprintf(entries[entry_count].icon_file, 256, "%s", icon_file);
+            snprintf(entries[entry_count].categories, 256, "%s", categories);
+            entry_count++;
+        }
+        closedir(apps);
+    }
+    closedir(store);
+
+    /* Write applications.idx */
+    FILE *idx = fopen(APPS_IDX, "w");
+    if (!idx) {
+        fprintf(stderr, "Warning: could not write %s\n", APPS_IDX);
+        return;
+    }
+    for (int i = 0; i < entry_count; i++) {
+        fprintf(idx, "%s\t%s\t%s\t%s\n",
+                entries[i].name, entries[i].exec_cmd,
+                entries[i].icon_file, entries[i].categories);
+    }
+    fclose(idx);
+
+    if (entry_count > 0)
+        printf("  Updated launcher: %d app(s) in %s\n", entry_count, APPS_IDX);
+}
+
 static int cmd_install(const char *name) {
     printf("Looking up '%s'...\n", name);
 
@@ -746,6 +917,8 @@ static int cmd_install(const char *name) {
     if (rpath_linked > 0)
         printf("  %d runtime library file(s) linked beside package binaries\n", rpath_linked);
 
+    refresh_desktop_entries();
+
     return 0;
 }
 
@@ -791,6 +964,7 @@ static int cmd_remove(const char *name) {
     }
 
     printf("\033[32m✓ Removed %s\033[0m\n", name);
+    refresh_desktop_entries();
     return 0;
 }
 

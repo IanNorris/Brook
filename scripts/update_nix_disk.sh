@@ -316,8 +316,8 @@ EOF
     fi
 fi
 
-# Collect .desktop entries and icons from installed packages
-if [ "${UPDATE_TOOLS}" -eq 1 ] && [ -d "${MNTDIR}/store" ]; then
+# Collect .desktop entries and icons from installed packages (always runs)
+if [ -d "${MNTDIR}/store" ]; then
     echo "Collecting .desktop entries and icons..."
     APPS_DIR="${MNTDIR}/share/applications"
     rm -rf "${APPS_DIR}"
