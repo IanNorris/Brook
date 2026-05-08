@@ -3192,6 +3192,10 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     __atomic_fetch_add(&g_profMmapCount, 1, __ATOMIC_RELAXED);
     if (length == 0) return -EINVAL;
 
+    // File-backed mmaps require page-aligned offset (Linux ABI)
+    if (!(flags & MAP_ANONYMOUS) && (offset & 0xFFFULL))
+        return -EINVAL;
+
     Process* proc = ProcessCurrent();
     if (!proc) return -ENOMEM;
 

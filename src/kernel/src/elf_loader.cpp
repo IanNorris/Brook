@@ -276,6 +276,11 @@ bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
     DbgPrintf("ELF: loaded OK, entry=0x%lx, break=0x%lx-0x%lx\n",
                  out->entryPoint, out->programBreakLow, out->programBreakHigh);
 
+    // NOTE: All pages are currently mapped writable. Proper segment permissions
+    // (read-only .text/.rodata) require COW support for pages shared between
+    // a read-only and a read-write segment at page boundaries. Deferred until
+    // Brook has full mmap MAP_PRIVATE COW semantics.
+
     // Memory fence: ensure all PTE writes are globally visible.
     __asm__ volatile("mfence" ::: "memory");
 
