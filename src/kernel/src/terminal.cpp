@@ -586,38 +586,96 @@ static void TermHandleCSI(Terminal* t, const char* params, int paramLen, char fi
         break;
     case 'm': // SGR — Select Graphic Rendition
     {
-        if (argCount == 0) { t->fgColor = 0x00CCCCCC; t->bgColor = 0x00001A2A; break; }
+        // Standard and bright ANSI color palettes
+        static const uint32_t kAnsiNormal[] = {
+            0x00000000, 0x00CC0000, 0x0000CC00, 0x00CCCC00,
+            0x000000CC, 0x00CC00CC, 0x0000CCCC, 0x00CCCCCC
+        };
+        static const uint32_t kAnsiBright[] = {
+            0x00555555, 0x00FF5555, 0x0055FF55, 0x00FFFF55,
+            0x005555FF, 0x00FF55FF, 0x0055FFFF, 0x00FFFFFF
+        };
+
+        if (argCount == 0) { t->fgColor = 0x00CCCCCC; t->bgColor = 0x00001A2A; t->bold = false; break; }
         for (int i = 0; i < argCount; i++)
         {
             int code = args[i];
-            if (code == 0) { t->fgColor = 0x00CCCCCC; t->bgColor = 0x00001A2A; }
-            else if (code == 1) { /* bold — brighten fg */ t->fgColor |= 0x00404040; }
-            else if (code == 30) t->fgColor = 0x00000000;
-            else if (code == 31) t->fgColor = 0x00CC0000;
-            else if (code == 32) t->fgColor = 0x0000CC00;
-            else if (code == 33) t->fgColor = 0x00CCCC00;
-            else if (code == 34) t->fgColor = 0x000000CC;
-            else if (code == 35) t->fgColor = 0x00CC00CC;
-            else if (code == 36) t->fgColor = 0x0000CCCC;
-            else if (code == 37) t->fgColor = 0x00CCCCCC;
-            else if (code == 39) t->fgColor = 0x00CCCCCC; // default fg
-            else if (code == 40) t->bgColor = 0x00000000;
-            else if (code == 41) t->bgColor = 0x00CC0000;
-            else if (code == 42) t->bgColor = 0x0000CC00;
-            else if (code == 43) t->bgColor = 0x00CCCC00;
-            else if (code == 44) t->bgColor = 0x000000CC;
-            else if (code == 45) t->bgColor = 0x00CC00CC;
-            else if (code == 46) t->bgColor = 0x0000CCCC;
-            else if (code == 47) t->bgColor = 0x00CCCCCC;
-            else if (code == 49) t->bgColor = 0x00001A2A; // default bg
-            // Bright colors (90-97, 100-107)
-            else if (code >= 90 && code <= 97)
+            if (code == 0) { t->fgColor = 0x00CCCCCC; t->bgColor = 0x00001A2A; t->bold = false; }
+            else if (code == 1)
             {
-                static const uint32_t bright[] = {
-                    0x00555555, 0x00FF5555, 0x0055FF55, 0x00FFFF55,
-                    0x005555FF, 0x00FF55FF, 0x0055FFFF, 0x00FFFFFF
-                };
-                t->fgColor = bright[code - 90];
+                // Bold: brighten current fg by mapping to bright palette if it
+                // matches a normal color, otherwise add brightness safely.
+                t->bold = true;
+                for (int ci = 0; ci < 8; ++ci)
+                {
+                    if (t->fgColor == kAnsiNormal[ci])
+                    { t->fgColor = kAnsiBright[ci]; goto bold_done; }
+                }
+                {
+                    // Generic brightening with clamping
+                    uint32_t r = ((t->fgColor >> 16) & 0xff) + 0x40;
+                    uint32_t g = ((t->fgColor >> 8) & 0xff) + 0x40;
+                    uint32_t b = (t->fgColor & 0xff) + 0x40;
+                    if (r > 255) r = 255;
+                    if (g > 255) g = 255;
+                    if (b > 255) b = 255;
+                    t->fgColor = (r << 16) | (g << 8) | b;
+                }
+                bold_done:;
+            }
+            else if (code == 22) { t->bold = false; } // normal intensity
+            else if (code >= 30 && code <= 37)
+                t->fgColor = t->bold ? kAnsiBright[code - 30] : kAnsiNormal[code - 30];
+            else if (code == 39) { t->fgColor = 0x00CCCCCC; } // default fg
+            else if (code >= 40 && code <= 47) t->bgColor = kAnsiNormal[code - 40];
+            else if (code == 49) { t->bgColor = 0x00001A2A; } // default bg
+            // Bright colors (90-97 fg, 100-107 bg)
+            else if (code >= 90 && code <= 97)
+                t->fgColor = kAnsiBright[code - 90];
+            else if (code >= 100 && code <= 107)
+                t->bgColor = kAnsiBright[code - 100];
+            // 256-color: ESC[38;5;Nm (fg) and ESC[48;5;Nm (bg)
+            else if (code == 38 && i + 2 < argCount && args[i + 1] == 5)
+            {
+                int idx = args[i + 2];
+                i += 2;
+                if (idx >= 0 && idx < 8) t->fgColor = kAnsiNormal[idx];
+                else if (idx < 16) t->fgColor = kAnsiBright[idx - 8];
+                else if (idx < 232)
+                {
+                    // 6x6x6 color cube (indices 16-231)
+                    idx -= 16;
+                    uint32_t r = (idx / 36) * 51;
+                    uint32_t g = ((idx / 6) % 6) * 51;
+                    uint32_t b = (idx % 6) * 51;
+                    t->fgColor = (r << 16) | (g << 8) | b;
+                }
+                else if (idx < 256)
+                {
+                    // Grayscale ramp (indices 232-255): 8, 18, 28, ... 238
+                    uint32_t v = static_cast<uint32_t>((idx - 232) * 10 + 8);
+                    t->fgColor = (v << 16) | (v << 8) | v;
+                }
+            }
+            else if (code == 48 && i + 2 < argCount && args[i + 1] == 5)
+            {
+                int idx = args[i + 2];
+                i += 2;
+                if (idx >= 0 && idx < 8) t->bgColor = kAnsiNormal[idx];
+                else if (idx < 16) t->bgColor = kAnsiBright[idx - 8];
+                else if (idx < 232)
+                {
+                    idx -= 16;
+                    uint32_t r = (idx / 36) * 51;
+                    uint32_t g = ((idx / 6) % 6) * 51;
+                    uint32_t b = (idx % 6) * 51;
+                    t->bgColor = (r << 16) | (g << 8) | b;
+                }
+                else if (idx < 256)
+                {
+                    uint32_t v = static_cast<uint32_t>((idx - 232) * 10 + 8);
+                    t->bgColor = (v << 16) | (v << 8) | v;
+                }
             }
         }
         break;
@@ -842,6 +900,7 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     t->curY = 0;
     t->fgColor = 0x00CCCCCC;
     t->bgColor = 0x001A1A2E;
+    t->bold = false;
     t->active = true;
     t->dirty = false;
 

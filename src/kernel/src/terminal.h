@@ -35,6 +35,7 @@ struct Terminal
     uint32_t  cols, rows;      // terminal size in characters
     uint32_t  fgColor;         // current foreground (XRGB)
     uint32_t  bgColor;         // current background (XRGB)
+    bool      bold;            // bold/bright mode active
     void*     stdinPipe;       // PipeBuffer* — terminal writes here, bash reads
     void*     stdoutPipe;      // PipeBuffer* — bash writes here, terminal reads
     uint16_t  foregroundPgid;  // foreground process group (for Ctrl+C)
