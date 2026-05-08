@@ -106,6 +106,25 @@ if [ "${UPDATE_TOOLS}" -eq 1 ]; then
             cp "${BROOK_PLAYER_STORE}/bin/brook-player" "${MNTDIR}/bin/brook-player"
             echo "  brook-player -> /nix/bin/brook-player ($ADDED new store paths)"
         fi
+
+        # Copy brook-fbtest (framebuffer stress test — no ffmpeg)
+        BROOK_FBTEST_STORE=$(nix-build "${ROOT_DIR}/tools/brook-fbtest-pkg" --no-out-link)
+        if [ -z "$BROOK_FBTEST_STORE" ]; then
+            echo "  ERROR: nix-build brook-fbtest failed!"
+        elif [ -x "${BROOK_FBTEST_STORE}/bin/brook-fbtest" ]; then
+            ADDED=0
+            while IFS= read -r p; do
+                [ -n "$p" ] || continue
+                base=$(basename "$p")
+                dst="${MNTDIR}/store/${base}"
+                if [ ! -e "$dst" ]; then
+                    cp -a --no-preserve=links "$p" "$dst"
+                    ADDED=$((ADDED + 1))
+                fi
+            done < <(nix-store -qR "$BROOK_FBTEST_STORE")
+            cp "${BROOK_FBTEST_STORE}/bin/brook-fbtest" "${MNTDIR}/bin/brook-fbtest"
+            echo "  brook-fbtest -> /nix/bin/brook-fbtest ($ADDED new store paths)"
+        fi
     fi
     for tool in nix-fetch nix-search nix-install; do
         src="${TOOLS_BIN}/${tool}/${tool}"
