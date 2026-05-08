@@ -912,6 +912,26 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
                    "+", 0x0088CCFF, newBg);
     btnX += TASKBAR_NEW_BTN_W + WM_TASKBAR_PADDING;
 
+    // Count active windows and compute responsive button width
+    uint32_t windowCount = 0;
+    for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
+    {
+        const Window& w2 = g_windows[i];
+        if (w2.proc && w2.visible) windowCount++;
+    }
+
+    // Available space: screen width minus fixed elements minus clock area (~100px)
+    uint32_t fixedWidth = btnX + 100 + WM_TASKBAR_PADDING * 2;
+    uint32_t availableWidth = (screenW > fixedWidth) ? screenW - fixedWidth : 0;
+    uint32_t dynBtnWidth = WM_TASKBAR_BTN_WIDTH; // default max
+    if (windowCount > 0)
+    {
+        uint32_t maxFit = availableWidth / (windowCount);
+        if (maxFit < WM_TASKBAR_BTN_WIDTH)
+            dynBtnWidth = maxFit > 40 ? maxFit - WM_TASKBAR_PADDING : 40; // min 40px
+    }
+    if (dynBtnWidth > WM_TASKBAR_BTN_WIDTH) dynBtnWidth = WM_TASKBAR_BTN_WIDTH;
+
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
     {
         const Window& w = g_windows[i];
@@ -919,12 +939,12 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
 
         // Button background — highlight if focused, lighten on hover
         bool btnHover = mouseInTaskbar && mouseX >= static_cast<int32_t>(btnX) &&
-                        mouseX < static_cast<int32_t>(btnX + WM_TASKBAR_BTN_WIDTH);
+                        mouseX < static_cast<int32_t>(btnX + dynBtnWidth);
         uint32_t btnBg = (w.focused && !w.minimized) ? WM_TASKBAR_BTN_ACTIVE :
                          btnHover ? 0x00384858 : WM_TASKBAR_BTN_BG;
         WmFillRect(backBuffer, stride, screenW, screenH,
                    static_cast<int>(btnX), static_cast<int>(btnY),
-                   WM_TASKBAR_BTN_WIDTH, WM_TASKBAR_BTN_HEIGHT, btnBg);
+                   dynBtnWidth, WM_TASKBAR_BTN_HEIGHT, btnBg);
 
         // If minimized, draw a subtle underline indicator
         if (w.minimized)
@@ -932,12 +952,12 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
             WmFillRect(backBuffer, stride, screenW, screenH,
                        static_cast<int>(btnX + 2),
                        static_cast<int>(btnY + WM_TASKBAR_BTN_HEIGHT - 2),
-                       WM_TASKBAR_BTN_WIDTH - 4, 1, 0x00808080);
+                       dynBtnWidth - 4, 1, 0x00808080);
         }
 
         // Truncate title to fit button
         char label[20];
-        uint32_t maxChars = (WM_TASKBAR_BTN_WIDTH - 8) / 8; // rough estimate
+        uint32_t maxChars = (dynBtnWidth - 8) / 8; // rough estimate
         if (maxChars > sizeof(label) - 1) maxChars = sizeof(label) - 1;
         uint32_t ti = 0;
         while (ti < maxChars && w.title[ti]) { label[ti] = w.title[ti]; ti++; }
@@ -949,7 +969,7 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
                        static_cast<int>(btnY + textYOff),
                        label, WM_TASKBAR_BTN_FG, btnBg);
 
-        btnX += WM_TASKBAR_BTN_WIDTH + WM_TASKBAR_PADDING;
+        btnX += dynBtnWidth + WM_TASKBAR_PADDING;
     }
 
     // Real-time clock — right-aligned in taskbar
@@ -1010,6 +1030,24 @@ int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
         btnX += TASKBAR_NEW_BTN_W + WM_TASKBAR_PADDING;
     }
 
+    // Compute dynamic button width (must match WmRenderTaskbar)
+    uint32_t windowCount = 0;
+    for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
+    {
+        const Window& w2 = g_windows[i];
+        if (w2.proc && w2.visible) windowCount++;
+    }
+    uint32_t fixedWidth = btnX + 100 + WM_TASKBAR_PADDING * 2;
+    uint32_t availableWidth = (screenW > fixedWidth) ? screenW - fixedWidth : 0;
+    uint32_t dynBtnWidth = WM_TASKBAR_BTN_WIDTH;
+    if (windowCount > 0)
+    {
+        uint32_t maxFit = availableWidth / windowCount;
+        if (maxFit < WM_TASKBAR_BTN_WIDTH)
+            dynBtnWidth = maxFit > 40 ? maxFit - WM_TASKBAR_PADDING : 40;
+    }
+    if (dynBtnWidth > WM_TASKBAR_BTN_WIDTH) dynBtnWidth = WM_TASKBAR_BTN_WIDTH;
+
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
     {
         const Window& w = g_windows[i];
@@ -1017,13 +1055,13 @@ int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
 
         uint32_t btnY = tbY + (WM_TASKBAR_HEIGHT - WM_TASKBAR_BTN_HEIGHT) / 2;
         if (mx >= static_cast<int32_t>(btnX) &&
-            mx < static_cast<int32_t>(btnX + WM_TASKBAR_BTN_WIDTH) &&
+            mx < static_cast<int32_t>(btnX + dynBtnWidth) &&
             my >= static_cast<int32_t>(btnY) &&
             my < static_cast<int32_t>(btnY + WM_TASKBAR_BTN_HEIGHT))
         {
             return static_cast<int>(i);
         }
-        btnX += WM_TASKBAR_BTN_WIDTH + WM_TASKBAR_PADDING;
+        btnX += dynBtnWidth + WM_TASKBAR_PADDING;
     }
 
     return -1; // clicked taskbar background but not a button
