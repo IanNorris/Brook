@@ -273,12 +273,12 @@ static uint64_t SetupUserStack(Process* proc,
 
     // Compute total 8-byte slots to be pushed below, and pad so final RSP
     // is 16-byte aligned (Linux ABI: RSP mod 16 == 0 at process entry).
-    //   auxv: 17 entries × 2 slots = 34
+    //   auxv: 19 entries × 2 slots = 38
     //   envp: (envc + 1) slots (including NULL terminator)
     //   argv: (argc + 1) slots (including NULL terminator)
     //   argc: 1 slot
     int envcClamped = (envc > MAX_ENV) ? MAX_ENV : envc;
-    int totalSlots = 34 + (envcClamped + 1) + (argc + 1) + 1;
+    int totalSlots = 38 + (envcClamped + 1) + (argc + 1) + 1;
     if (totalSlots & 1)
         pushU64(0); // padding to maintain 16-byte alignment
 
