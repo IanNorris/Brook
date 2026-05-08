@@ -57,6 +57,15 @@ static void ProcessClearLazyMappings(Process* proc)
     for (uint32_t i = 0; i < Process::MAX_FILE_MAPS; i++) {
         auto& m = proc->fileMaps[i];
         if (m.length == 0) continue;
+        // Unmap PTEs for demand-paged file pages.  If we skip this,
+        // VmmDestroyUserPageTable → FreeTableLevel calls PmmUnrefPage on
+        // each mapped page (refcount 2→1), and then PmmKillPid sees the
+        // page as exclusive (refcount 1) and FREES it — even though the
+        // page cache still holds a reference.  That corrupts cached library
+        // data for every future process loading the same shared object.
+        uint64_t pages = (m.length + 4095) / 4096;
+        for (uint64_t p = 0; p < pages; p++)
+            VmmUnmapPage(proc->pageTable, VirtualAddress(m.vaddr + p * 4096));
         // Atomically steal the vnode pointer before unreffing. Another CPU
         // may be in FileMapHandleUserFault reading this entry via
         // MemoryMapOwner; nulling the pointer first ensures the concurrent
