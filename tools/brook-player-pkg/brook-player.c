@@ -647,13 +647,13 @@ int main(int argc, char **argv)
                       0, g_vid_h,
                       dst_data, dst_linesize);
 
-            /* Frame timing: pace output to match PTS.
-             * When audio is active, audio backpressure from /dev/dsp
-             * (HDA blocks when 278ms buffer is full) provides natural
-             * pacing — don't sleep or audio starves and gets choppy.
-             * Only use nanosleep for video-only files. */
+            /* Frame timing: always pace video to PTS.  The audio buffer
+             * (278ms) is large enough to tolerate short video sleeps
+             * without starving.  Without this, audio backpressure causes
+             * bursty frame delivery (frames dump in rapid pulses separated
+             * by stalls while waiting for the audio buffer to drain). */
             int64_t pts = frame->best_effort_timestamp;
-            if (pts != AV_NOPTS_VALUE && g_audIdx < 0) {
+            if (pts != AV_NOPTS_VALUE) {
                 if (first_pts == AV_NOPTS_VALUE) {
                     first_pts  = pts;
                     start_time = now_us();
