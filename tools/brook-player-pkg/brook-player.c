@@ -596,6 +596,12 @@ int main(int argc, char **argv)
     int64_t first_pts  = AV_NOPTS_VALUE;
     int frames_shown = 0;
 
+    /* Per-frame timing stats */
+    int64_t t_decode_max = 0, t_scale_max = 0, t_display_max = 0;
+    int64_t t_total_max  = 0;
+    int     slow_frames  = 0;
+    const int64_t SLOW_THRESH_US = 30000; /* 30ms = warn threshold */
+
     while (!g_close_req) {
         /* Drain Wayland events (non-blocking) */
         while (wl_display_prepare_read(g_dpy) != 0)
@@ -636,16 +642,22 @@ int main(int argc, char **argv)
         }
 
         /* Decode */
+        int64_t t0_decode = now_us();
         ret = avcodec_send_packet(decCtx, pkt);
         av_packet_unref(pkt);
         if (ret < 0) continue;
 
         while (avcodec_receive_frame(decCtx, frame) == 0) {
+            int64_t t1_decode = now_us();
+            int64_t dt_decode = t1_decode - t0_decode;
+
             /* Scale to display size as BGRA */
+            int64_t t0_scale = now_us();
             sws_scale(swsCtx,
                       (const uint8_t *const *)frame->data, frame->linesize,
                       0, g_vid_h,
                       dst_data, dst_linesize);
+            int64_t dt_scale = now_us() - t0_scale;
 
             /* Frame timing: always pace video to PTS.  The audio buffer
              * (278ms) is large enough to tolerate short video sleeps
@@ -674,35 +686,56 @@ int main(int argc, char **argv)
                 }
             }
 
-            /* DEBUG: render a moving vertical bar so we can visually
-             * confirm that frames are actually reaching the display.
-             * The bar sweeps left-to-right, cycling every g_width pixels. */
-            {
-                int bar_x = frames_shown % g_width;
-                int bar_w = 8;
-                uint32_t bar_color = 0xFF00FF00; /* green BGRA */
-                uint32_t *px = (uint32_t*)dst_data[0];
-                int stride_px = dst_linesize[0] / 4;
-                for (int y = 0; y < g_height; y++) {
-                    for (int bx = bar_x; bx < bar_x + bar_w && bx < g_width; bx++)
-                        px[y * stride_px + bx] = bar_color;
-                }
-            }
-
+            /* Display */
+            int64_t t0_display = now_us();
             display_frame(dst_data[0], dst_linesize[0]);
+            int64_t dt_display = now_us() - t0_display;
+
+            int64_t dt_total = dt_decode + dt_scale + dt_display;
             frames_shown++;
+
+            /* Track maximums */
+            if (dt_decode  > t_decode_max)  t_decode_max  = dt_decode;
+            if (dt_scale   > t_scale_max)   t_scale_max   = dt_scale;
+            if (dt_display > t_display_max) t_display_max = dt_display;
+            if (dt_total   > t_total_max)   t_total_max   = dt_total;
+
+            /* Log slow frames (>30ms total work) */
+            if (dt_total > SLOW_THRESH_US) {
+                slow_frames++;
+                fprintf(stderr,
+                    "[brook-player] SLOW frame %d: "
+                    "decode=%lldus scale=%lldus display=%lldus "
+                    "total=%lldus\n",
+                    frames_shown,
+                    (long long)dt_decode,  (long long)dt_scale,
+                    (long long)dt_display, (long long)dt_total);
+            }
 
             if (frames_shown % 100 == 0) {
                 int64_t elapsed = now_us() - start_time;
-                fprintf(stderr, "[brook-player] frame %d, %.1f fps\n",
-                        frames_shown,
-                        frames_shown * 1e6 / (double)elapsed);
+                fprintf(stderr,
+                    "[brook-player] frame %d, %.1f fps | "
+                    "max: dec=%lldus scl=%lldus dsp=%lldus tot=%lldus | "
+                    "slow=%d\n",
+                    frames_shown,
+                    frames_shown * 1e6 / (double)elapsed,
+                    (long long)t_decode_max,  (long long)t_scale_max,
+                    (long long)t_display_max, (long long)t_total_max,
+                    slow_frames);
             }
+
+            /* Reset decode timer for next frame in same packet */
+            t0_decode = now_us();
         }
     }
 
-    fprintf(stderr, "[brook-player] done: %d frames displayed\n",
-            frames_shown);
+    fprintf(stderr,
+        "[brook-player] done: %d frames, %d slow (>%lldms) | "
+        "max: dec=%lldus scl=%lldus dsp=%lldus tot=%lldus\n",
+        frames_shown, slow_frames, (long long)(SLOW_THRESH_US / 1000),
+        (long long)t_decode_max,  (long long)t_scale_max,
+        (long long)t_display_max, (long long)t_total_max);
 
     /* Cleanup */
     audio_cleanup();
