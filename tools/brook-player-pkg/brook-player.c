@@ -664,12 +664,13 @@ int main(int argc, char **argv)
                 int64_t frame_time_us = (int64_t)((pts - first_pts) * tb * 1e6);
                 int64_t elapsed = now_us() - start_time;
                 int64_t delay = frame_time_us - elapsed;
-                if (delay > 1000 && delay < 2000000) {
-                    struct timespec ts = {
-                        .tv_sec  = delay / 1000000,
-                        .tv_nsec = (delay % 1000000) * 1000
-                    };
-                    nanosleep(&ts, NULL);
+                if (delay > 1000 && delay < 200000) {
+                    /* Busy-wait: nanosleep crashes in glibc on Brook
+                     * (likely TLS/vDSO issue).  Use clock_gettime
+                     * spin which is known-working. */
+                    int64_t target = now_us() + delay;
+                    while (now_us() < target)
+                        ;  /* spin */
                 }
             }
 
