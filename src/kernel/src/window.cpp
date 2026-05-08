@@ -715,68 +715,87 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     uint32_t borderCol = w.focused ? WM_BORDER_FOCUSED : WM_BORDER_UNFOCUSED;
     uint32_t titleBg   = w.focused ? WM_TITLE_BG_FOCUSED : WM_TITLE_BG_UNFOCUSED;
 
-    // Top border
+    // Borders
     WmFillRect(buf, stride, screenW, screenH, wx, wy, ow, WM_BORDER_WIDTH, borderCol);
-    // Left border
     WmFillRect(buf, stride, screenW, screenH, wx, wy, WM_BORDER_WIDTH, oh, borderCol);
-    // Right border
     WmFillRect(buf, stride, screenW, screenH, wx + ow - WM_BORDER_WIDTH, wy, WM_BORDER_WIDTH, oh, borderCol);
-    // Bottom border
     WmFillRect(buf, stride, screenW, screenH, wx, wy + oh - WM_BORDER_WIDTH, ow, WM_BORDER_WIDTH, borderCol);
 
-    // Title bar background (fills between top border and client area)
+    // Title bar background
     int titleX = wx + WM_BORDER_WIDTH;
     int titleY = wy + WM_BORDER_WIDTH;
     int titleW = ow - 2 * WM_BORDER_WIDTH;
-    int titleH = WM_TITLE_BAR_HEIGHT; // full height to meet client area
+    int titleH = WM_TITLE_BAR_HEIGHT;
     WmFillRect(buf, stride, screenW, screenH, titleX, titleY, titleW, titleH, titleBg);
 
-    // Title text (vertically centered in title bar)
+    // Subtle vertical gradient on title bar (lighter at top, darker at bottom)
+    if (w.focused)
+    {
+        for (int row = 0; row < titleH && row < 6; ++row)
+        {
+            int py = titleY + row;
+            if (py < 0 || py >= static_cast<int>(screenH)) continue;
+            // Lighten top rows progressively (alpha blend white at decreasing opacity)
+            uint32_t alpha = static_cast<uint32_t>(12 - row * 2); // 12,10,8,6,4,2
+            for (int col = 0; col < titleW; ++col)
+            {
+                int px = titleX + col;
+                if (px < 0 || px >= static_cast<int>(screenW)) continue;
+                uint32_t& pixel = buf[py * stride + px];
+                uint32_t r = ((pixel >> 16) & 0xff) + alpha;
+                uint32_t g = ((pixel >> 8) & 0xff) + alpha;
+                uint32_t b = (pixel & 0xff) + alpha;
+                if (r > 255) r = 255;
+                if (g > 255) g = 255;
+                if (b > 255) b = 255;
+                pixel = (r << 16) | (g << 8) | b;
+            }
+        }
+    }
+
+    // 1px separator line between title bar and client area
+    int sepY = titleY + titleH - 1;
+    uint32_t sepCol = w.focused ? 0x001A3A5A : 0x00303030;
+    WmFillRect(buf, stride, screenW, screenH, titleX, sepY, titleW, 1, sepCol);
+
+    // Title text
     int textY = titleY + (titleH - g_fontAtlas.lineHeight) / 2;
     WmRenderString(buf, stride, screenW, screenH,
-                   titleX + 6, textY, w.title,
+                   titleX + WM_TITLE_TEXT_PAD_X, textY, w.title,
                    WM_TITLE_FG, titleBg);
 
-    // Close button — 'X' character, right-aligned
+    // Close button — red background with 'X'
     int closeBtnX = wx + ow - WM_BORDER_WIDTH - WM_BUTTON_WIDTH;
     WmFillRect(buf, stride, screenW, screenH, closeBtnX, titleY,
-               WM_BUTTON_WIDTH, titleH, 0x00C04040); // red tint
-    // Center 'X' glyph in button
-    int glyphW = 8; // default
+               WM_BUTTON_WIDTH, titleH, WM_CLOSE_BTN_BG);
+    int glyphW = 8;
     if ('X' >= g_fontAtlas.firstChar && 'X' < g_fontAtlas.firstChar + g_fontAtlas.glyphCount)
         glyphW = g_fontAtlas.glyphs['X' - g_fontAtlas.firstChar].advance;
     int closeGlyphX = closeBtnX + (WM_BUTTON_WIDTH - glyphW) / 2;
     int closeGlyphY = titleY + (titleH - g_fontAtlas.lineHeight) / 2;
     WmRenderGlyph(buf, stride, screenW, screenH,
                   closeGlyphX, closeGlyphY, 'X',
-                  0x00FFFFFF, 0x00C04040);
+                  0x00FFFFFF, WM_CLOSE_BTN_BG);
 
-    // Maximize button — box icon, left of close button
+    // Maximize button — box icon
     int maxBtnX = closeBtnX - WM_BUTTON_WIDTH;
-    uint32_t maxBtnBg = titleBg;
     WmFillRect(buf, stride, screenW, screenH, maxBtnX, titleY,
-               WM_BUTTON_WIDTH, titleH, maxBtnBg);
-    // Draw a centered square to represent maximize
-    int sqS = 10;
+               WM_BUTTON_WIDTH, titleH, titleBg);
+    int sqS = WM_BTN_ICON_SIZE;
     int sqX = maxBtnX + (WM_BUTTON_WIDTH - sqS) / 2;
     int sqY = titleY + (titleH - sqS) / 2;
-    // Top edge (thicker)
     WmFillRect(buf, stride, screenW, screenH, sqX, sqY, sqS, 2, WM_TITLE_FG);
-    // Bottom edge
     WmFillRect(buf, stride, screenW, screenH, sqX, sqY + sqS - 1, sqS, 1, WM_TITLE_FG);
-    // Left edge
     WmFillRect(buf, stride, screenW, screenH, sqX, sqY, 1, sqS, WM_TITLE_FG);
-    // Right edge
     WmFillRect(buf, stride, screenW, screenH, sqX + sqS - 1, sqY, 1, sqS, WM_TITLE_FG);
 
-    // Minimize button — underscore icon, left of maximize button
+    // Minimize button — horizontal dash
     int minBtnX = maxBtnX - WM_BUTTON_WIDTH;
     WmFillRect(buf, stride, screenW, screenH, minBtnX, titleY,
                WM_BUTTON_WIDTH, titleH, titleBg);
-    // Draw a horizontal line at the bottom of the button area
-    int lineW = 10;
+    int lineW = WM_BTN_ICON_SIZE;
     int lineX = minBtnX + (WM_BUTTON_WIDTH - lineW) / 2;
-    int lineY = titleY + titleH - 6;
+    int lineY = titleY + titleH - WM_BTN_ICON_PAD_BOT;
     WmFillRect(buf, stride, screenW, screenH, lineX, lineY, lineW, 2, WM_TITLE_FG);
 }
 
@@ -808,9 +827,6 @@ void WmRenderChromeForWindow(uint32_t* backBuffer, uint32_t stride,
 // Taskbar
 // ---------------------------------------------------------------------------
 
-static constexpr uint32_t TASKBAR_BTN_WIDTH  = 140;
-static constexpr uint32_t TASKBAR_BTN_HEIGHT = 24;
-static constexpr uint32_t TASKBAR_PADDING    = 4;
 static constexpr uint32_t TASKBAR_SEPARATOR  = 1; // thin line between taskbar and desktop
 static constexpr uint32_t TASKBAR_NEW_BTN_W  = 28; // "+" button width
 static constexpr uint32_t TASKBAR_APPS_BTN_W = 48; // "Apps" button width
@@ -823,41 +839,58 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
 
     uint32_t tbY = screenH - WM_TASKBAR_HEIGHT;
 
-    // Taskbar background
+    // Taskbar background with subtle top-to-bottom gradient
     WmFillRect(backBuffer, stride, screenW, screenH,
                0, static_cast<int>(tbY), static_cast<int>(screenW),
                static_cast<int>(WM_TASKBAR_HEIGHT), WM_TASKBAR_BG);
+    // Lighten the top 3 rows for a raised effect
+    for (uint32_t row = 0; row < 3 && tbY + row < screenH; ++row)
+    {
+        uint32_t alpha = 8 - row * 2; // 8, 6, 4
+        uint32_t* rowPtr = backBuffer + (tbY + row) * stride;
+        for (uint32_t col = 0; col < screenW; ++col)
+        {
+            uint32_t p = rowPtr[col];
+            uint32_t r = ((p >> 16) & 0xff) + alpha;
+            uint32_t g = ((p >> 8) & 0xff) + alpha;
+            uint32_t b = (p & 0xff) + alpha;
+            if (r > 255) r = 255;
+            if (g > 255) g = 255;
+            if (b > 255) b = 255;
+            rowPtr[col] = (r << 16) | (g << 8) | b;
+        }
+    }
 
-    // Top separator line
+    // Top separator line (1px highlight)
     WmFillRect(backBuffer, stride, screenW, screenH,
                0, static_cast<int>(tbY), static_cast<int>(screenW),
                TASKBAR_SEPARATOR, 0x00404050);
 
     // Collect all active windows (including minimized) for taskbar buttons
-    uint32_t btnX = TASKBAR_PADDING;
-    uint32_t btnY = tbY + (WM_TASKBAR_HEIGHT - TASKBAR_BTN_HEIGHT) / 2;
-    uint32_t textYOff = (TASKBAR_BTN_HEIGHT - static_cast<uint32_t>(g_fontAtlas.lineHeight)) / 2;
+    uint32_t btnX = WM_TASKBAR_PADDING;
+    uint32_t btnY = tbY + (WM_TASKBAR_HEIGHT - WM_TASKBAR_BTN_HEIGHT) / 2;
+    uint32_t textYOff = (WM_TASKBAR_BTN_HEIGHT - static_cast<uint32_t>(g_fontAtlas.lineHeight)) / 2;
 
     // "Apps" launcher button
     uint32_t appsBg = g_launcherOpen ? WM_TASKBAR_BTN_ACTIVE : 0x00334455;
     WmFillRect(backBuffer, stride, screenW, screenH,
                static_cast<int>(btnX), static_cast<int>(btnY),
-               TASKBAR_APPS_BTN_W, TASKBAR_BTN_HEIGHT, appsBg);
+               TASKBAR_APPS_BTN_W, WM_TASKBAR_BTN_HEIGHT, appsBg);
     WmRenderString(backBuffer, stride, screenW, screenH,
-                   static_cast<int>(btnX + 6),
+                   static_cast<int>(btnX + WM_TASKBAR_TEXT_PAD_X),
                    static_cast<int>(btnY + textYOff),
                    "Apps", 0x0088CCFF, appsBg);
-    btnX += TASKBAR_APPS_BTN_W + TASKBAR_PADDING;
+    btnX += TASKBAR_APPS_BTN_W + WM_TASKBAR_PADDING;
 
     // "+" new terminal button
     WmFillRect(backBuffer, stride, screenW, screenH,
                static_cast<int>(btnX), static_cast<int>(btnY),
-               TASKBAR_NEW_BTN_W, TASKBAR_BTN_HEIGHT, 0x00334455);
+               TASKBAR_NEW_BTN_W, WM_TASKBAR_BTN_HEIGHT, 0x00334455);
     WmRenderString(backBuffer, stride, screenW, screenH,
                    static_cast<int>(btnX + (TASKBAR_NEW_BTN_W - 8) / 2),
                    static_cast<int>(btnY + textYOff),
                    "+", 0x0088CCFF, 0x00334455);
-    btnX += TASKBAR_NEW_BTN_W + TASKBAR_PADDING;
+    btnX += TASKBAR_NEW_BTN_W + WM_TASKBAR_PADDING;
 
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
     {
@@ -868,20 +901,20 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
         uint32_t btnBg = (w.focused && !w.minimized) ? WM_TASKBAR_BTN_ACTIVE : WM_TASKBAR_BTN_BG;
         WmFillRect(backBuffer, stride, screenW, screenH,
                    static_cast<int>(btnX), static_cast<int>(btnY),
-                   TASKBAR_BTN_WIDTH, TASKBAR_BTN_HEIGHT, btnBg);
+                   WM_TASKBAR_BTN_WIDTH, WM_TASKBAR_BTN_HEIGHT, btnBg);
 
         // If minimized, draw a subtle underline indicator
         if (w.minimized)
         {
             WmFillRect(backBuffer, stride, screenW, screenH,
                        static_cast<int>(btnX + 2),
-                       static_cast<int>(btnY + TASKBAR_BTN_HEIGHT - 2),
-                       TASKBAR_BTN_WIDTH - 4, 1, 0x00808080);
+                       static_cast<int>(btnY + WM_TASKBAR_BTN_HEIGHT - 2),
+                       WM_TASKBAR_BTN_WIDTH - 4, 1, 0x00808080);
         }
 
         // Truncate title to fit button
         char label[20];
-        uint32_t maxChars = (TASKBAR_BTN_WIDTH - 8) / 8; // rough estimate
+        uint32_t maxChars = (WM_TASKBAR_BTN_WIDTH - 8) / 8; // rough estimate
         if (maxChars > sizeof(label) - 1) maxChars = sizeof(label) - 1;
         uint32_t ti = 0;
         while (ti < maxChars && w.title[ti]) { label[ti] = w.title[ti]; ti++; }
@@ -893,7 +926,7 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
                        static_cast<int>(btnY + textYOff),
                        label, WM_TASKBAR_BTN_FG, btnBg);
 
-        btnX += TASKBAR_BTN_WIDTH + TASKBAR_PADDING;
+        btnX += WM_TASKBAR_BTN_WIDTH + WM_TASKBAR_PADDING;
     }
 
     // Real-time clock — right-aligned in taskbar
@@ -912,7 +945,7 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
             clockW += static_cast<uint32_t>(fa.glyphs[code - static_cast<int>(fa.firstChar)].advance);
     }
 
-    uint32_t clockX = screenW - clockW - TASKBAR_PADDING * 2;
+    uint32_t clockX = screenW - clockW - WM_TASKBAR_PADDING * 2;
     WmRenderString(backBuffer, stride, screenW, screenH,
                    static_cast<int>(clockX),
                    static_cast<int>(btnY + textYOff),
@@ -926,32 +959,32 @@ int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
         return -1;
 
     // Walk window buttons left to right
-    uint32_t btnX = TASKBAR_PADDING;
+    uint32_t btnX = WM_TASKBAR_PADDING;
 
     // "Apps" launcher button
     {
-        uint32_t btnY2 = tbY + (WM_TASKBAR_HEIGHT - TASKBAR_BTN_HEIGHT) / 2;
+        uint32_t btnY2 = tbY + (WM_TASKBAR_HEIGHT - WM_TASKBAR_BTN_HEIGHT) / 2;
         if (mx >= static_cast<int32_t>(btnX) &&
             mx < static_cast<int32_t>(btnX + TASKBAR_APPS_BTN_W) &&
             my >= static_cast<int32_t>(btnY2) &&
-            my < static_cast<int32_t>(btnY2 + TASKBAR_BTN_HEIGHT))
+            my < static_cast<int32_t>(btnY2 + WM_TASKBAR_BTN_HEIGHT))
         {
             return -3; // special: apps launcher button
         }
-        btnX += TASKBAR_APPS_BTN_W + TASKBAR_PADDING;
+        btnX += TASKBAR_APPS_BTN_W + WM_TASKBAR_PADDING;
     }
 
     // "+" new terminal button
     {
-        uint32_t btnY2 = tbY + (WM_TASKBAR_HEIGHT - TASKBAR_BTN_HEIGHT) / 2;
+        uint32_t btnY2 = tbY + (WM_TASKBAR_HEIGHT - WM_TASKBAR_BTN_HEIGHT) / 2;
         if (mx >= static_cast<int32_t>(btnX) &&
             mx < static_cast<int32_t>(btnX + TASKBAR_NEW_BTN_W) &&
             my >= static_cast<int32_t>(btnY2) &&
-            my < static_cast<int32_t>(btnY2 + TASKBAR_BTN_HEIGHT))
+            my < static_cast<int32_t>(btnY2 + WM_TASKBAR_BTN_HEIGHT))
         {
             return -2; // special: new terminal button
         }
-        btnX += TASKBAR_NEW_BTN_W + TASKBAR_PADDING;
+        btnX += TASKBAR_NEW_BTN_W + WM_TASKBAR_PADDING;
     }
 
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
@@ -959,15 +992,15 @@ int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
         const Window& w = g_windows[i];
         if (!w.proc || !w.visible) continue;
 
-        uint32_t btnY = tbY + (WM_TASKBAR_HEIGHT - TASKBAR_BTN_HEIGHT) / 2;
+        uint32_t btnY = tbY + (WM_TASKBAR_HEIGHT - WM_TASKBAR_BTN_HEIGHT) / 2;
         if (mx >= static_cast<int32_t>(btnX) &&
-            mx < static_cast<int32_t>(btnX + TASKBAR_BTN_WIDTH) &&
+            mx < static_cast<int32_t>(btnX + WM_TASKBAR_BTN_WIDTH) &&
             my >= static_cast<int32_t>(btnY) &&
-            my < static_cast<int32_t>(btnY + TASKBAR_BTN_HEIGHT))
+            my < static_cast<int32_t>(btnY + WM_TASKBAR_BTN_HEIGHT))
         {
             return static_cast<int>(i);
         }
-        btnX += TASKBAR_BTN_WIDTH + TASKBAR_PADDING;
+        btnX += WM_TASKBAR_BTN_WIDTH + WM_TASKBAR_PADDING;
     }
 
     return -1; // clicked taskbar background but not a button
@@ -1451,7 +1484,7 @@ static void LauncherGetRect(uint32_t screenW, uint32_t screenH,
     uint32_t panelW = LAUNCHER_ITEM_WIDTH + LAUNCHER_PADDING * 2;
     uint32_t panelH = headerH + itemCount * (LAUNCHER_ITEM_HEIGHT + 2) + LAUNCHER_PADDING * 2;
 
-    *outX = static_cast<int32_t>(TASKBAR_PADDING);
+    *outX = static_cast<int32_t>(WM_TASKBAR_PADDING);
     *outY = static_cast<int32_t>(screenH - WM_TASKBAR_HEIGHT - panelH - 2);
     *outW = panelW;
     *outH = panelH;

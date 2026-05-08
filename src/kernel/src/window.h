@@ -18,19 +18,32 @@ static constexpr uint32_t WM_MIN_HEIGHT       = 100;
 static constexpr uint32_t WM_MAX_WINDOWS      = 32;
 static constexpr uint32_t WM_TASKBAR_HEIGHT   = 32;   // bottom taskbar height
 
+// Chrome layout constants
+static constexpr uint32_t WM_TITLE_TEXT_PAD_X  = 8;   // left padding before title text
+static constexpr uint32_t WM_BTN_ICON_SIZE     = 10;  // size of max/min button icons
+static constexpr uint32_t WM_BTN_ICON_PAD_BOT  = 6;   // minimize icon bottom offset
+
 // Window chrome colours
 static constexpr uint32_t WM_TITLE_BG_FOCUSED   = 0x002B4A7A; // blue-ish
 static constexpr uint32_t WM_TITLE_BG_UNFOCUSED = 0x00404040; // dark grey
 static constexpr uint32_t WM_TITLE_FG           = 0x00E0E0E0; // light grey text
 static constexpr uint32_t WM_BORDER_FOCUSED     = 0x004080C0; // lighter blue
 static constexpr uint32_t WM_BORDER_UNFOCUSED   = 0x00505050; // grey
-static constexpr uint32_t WM_CLOSE_BTN_HOVER    = 0x00E04040; // red
+static constexpr uint32_t WM_CLOSE_BTN_BG       = 0x00C04040; // close button normal
+static constexpr uint32_t WM_CLOSE_BTN_HOVER    = 0x00E04040; // close button hover
 static constexpr uint32_t WM_MAX_BTN_HOVER      = 0x00606060; // grey
+static constexpr uint32_t WM_TITLE_HIGHLIGHT    = 0x00FFFFFF; // 1px top highlight (subtle)
 static constexpr uint32_t WM_TASKBAR_BG         = 0x001E1E2E; // dark blue-grey
 static constexpr uint32_t WM_TASKBAR_BTN_BG     = 0x002D2D3D; // slightly lighter
 static constexpr uint32_t WM_TASKBAR_BTN_ACTIVE = 0x003B5998; // active/focused button
 static constexpr uint32_t WM_TASKBAR_BTN_FG     = 0x00D0D0D0; // button text
 static constexpr uint32_t WM_TASKBAR_CLOCK_FG   = 0x0090D0FF; // clock text (light blue)
+
+// Taskbar layout constants
+static constexpr uint32_t WM_TASKBAR_BTN_WIDTH  = 140; // max taskbar button width
+static constexpr uint32_t WM_TASKBAR_BTN_HEIGHT = 24;
+static constexpr uint32_t WM_TASKBAR_PADDING    = 4;
+static constexpr uint32_t WM_TASKBAR_TEXT_PAD_X = 6;   // text offset within button
 
 enum class WindowState : uint8_t
 {
