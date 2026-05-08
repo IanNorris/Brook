@@ -2152,10 +2152,37 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     // returns when the handler was installed with SA_RESTART. Bash relies on
     // this for SIGWINCH while blocked in terminal read(); otherwise resize
     // converts the read into EINTR and the interactive shell can exit.
+    //
+    // SA_RESTART applies to most "slow" syscalls: read, write, open, ioctl,
+    // wait4, nanosleep, poll, pselect6, ppoll, futex, etc.
+    // The exceptions (never restarted) are: connect, accept, recvfrom,
+    // sendto, epoll_wait — we don't restart those.
     uint64_t syscallNum = 0;
     __asm__ volatile("movq %%gs:120, %0" : "=r"(syscallNum));
+    bool restartable = false;
+    switch (syscallNum)
+    {
+    case 0:   // read
+    case 1:   // write
+    case 2:   // open
+    case 3:   // close
+    case 7:   // poll
+    case 16:  // ioctl
+    case 17:  // pread64
+    case 18:  // pwrite64
+    case 19:  // readv
+    case 20:  // writev
+    case 35:  // nanosleep
+    case 61:  // wait4
+    case 202: // futex
+    case 230: // clock_nanosleep
+    case 270: // pselect6
+    case 271: // ppoll
+        restartable = true;
+        break;
+    }
     if (syscallResult == -4 /* -EINTR */ && (sa.flags & SA_RESTART) &&
-        syscallNum == 0 /* read */ && mc.rip >= 2)
+        restartable && mc.rip >= 2)
     {
         mc.rax = syscallNum;
         mc.rip -= 2; // x86_64 syscall instruction length

@@ -1174,7 +1174,8 @@ static constexpr uint32_t LAUNCHER_ICON_MARGIN  = 8;
 static constexpr uint32_t LAUNCHER_ITEM_HEIGHT  = 32;
 static constexpr uint32_t LAUNCHER_ITEM_WIDTH   = 230;
 static constexpr uint32_t LAUNCHER_PADDING      = 6;
-static constexpr uint32_t LAUNCHER_MAX_VISIBLE  = 12; // max items visible before scrolling
+static constexpr uint32_t LAUNCHER_MAX_ROWS     = 14; // max rows before scrolling
+static constexpr uint32_t LAUNCHER_MAX_COLS     = 3;  // max columns
 static constexpr uint32_t LAUNCHER_BG           = 0x00252535;
 static constexpr uint32_t LAUNCHER_ITEM_BG      = 0x00303045;
 static constexpr uint32_t LAUNCHER_ITEM_FG      = 0x00E0E0E0;
@@ -1614,6 +1615,19 @@ bool WmLauncherVisible()
     return g_launcherOpen;
 }
 
+// Compute how many columns and visible items the launcher should show
+static uint32_t LauncherColumns(uint32_t totalValid)
+{
+    if (totalValid <= LAUNCHER_MAX_ROWS) return 1;
+    if (totalValid <= LAUNCHER_MAX_ROWS * 2) return 2;
+    return LAUNCHER_MAX_COLS;
+}
+
+static uint32_t LauncherMaxVisible(uint32_t totalValid)
+{
+    return LauncherColumns(totalValid) * LAUNCHER_MAX_ROWS;
+}
+
 void WmLauncherScroll(int delta, uint32_t /*screenW*/, uint32_t /*screenH*/)
 {
     if (!g_launcherOpen) return;
@@ -1623,12 +1637,14 @@ void WmLauncherScroll(int delta, uint32_t /*screenW*/, uint32_t /*screenH*/)
     for (uint32_t i = 0; i < g_launcherCount; i++)
         if (g_launcherItems[i].valid) totalValid++;
 
-    if (totalValid <= LAUNCHER_MAX_VISIBLE) return; // no scrolling needed
+    uint32_t maxVisible = LauncherMaxVisible(totalValid);
+    if (totalValid <= maxVisible) return; // no scrolling needed
 
-    uint32_t maxScroll = totalValid - LAUNCHER_MAX_VISIBLE;
-    if (delta > 0 && g_launcherScroll < maxScroll)
+    uint32_t maxScroll = totalValid - maxVisible;
+    // Positive delta = wheel up = show earlier items (decrease offset)
+    if (delta < 0 && g_launcherScroll < maxScroll)
         g_launcherScroll++;
-    else if (delta < 0 && g_launcherScroll > 0)
+    else if (delta > 0 && g_launcherScroll > 0)
         g_launcherScroll--;
 }
 
@@ -1637,11 +1653,19 @@ static void LauncherGetRect(uint32_t screenW, uint32_t screenH,
                             int32_t* outX, int32_t* outY,
                             uint32_t* outW, uint32_t* outH)
 {
-    uint32_t itemCount = g_launcherCount > 0 ? g_launcherCount : 1;
-    uint32_t visibleItems = itemCount < LAUNCHER_MAX_VISIBLE ? itemCount : LAUNCHER_MAX_VISIBLE;
+    uint32_t totalValid = 0;
+    for (uint32_t i = 0; i < g_launcherCount; i++)
+        if (g_launcherItems[i].valid) totalValid++;
+    if (totalValid == 0) totalValid = 1;
+
+    uint32_t cols = LauncherColumns(totalValid);
+    uint32_t maxVisible = LauncherMaxVisible(totalValid);
+    uint32_t visibleItems = totalValid < maxVisible ? totalValid : maxVisible;
+    uint32_t rows = (visibleItems + cols - 1) / cols;
+
     uint32_t headerH = LAUNCHER_ITEM_HEIGHT; // "Apps" header row
-    uint32_t panelW = LAUNCHER_ITEM_WIDTH + LAUNCHER_PADDING * 2;
-    uint32_t panelH = headerH + visibleItems * (LAUNCHER_ITEM_HEIGHT + 2) + LAUNCHER_PADDING * 2;
+    uint32_t panelW = cols * (LAUNCHER_ITEM_WIDTH + 4) + LAUNCHER_PADDING * 2;
+    uint32_t panelH = headerH + rows * (LAUNCHER_ITEM_HEIGHT + 2) + LAUNCHER_PADDING * 2;
 
     *outX = static_cast<int32_t>(WM_TASKBAR_PADDING);
     *outY = static_cast<int32_t>(screenH - WM_TASKBAR_HEIGHT - panelH - 2);
@@ -1684,10 +1708,18 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
                px + static_cast<int32_t>(LAUNCHER_PADDING),
                iy - 1, static_cast<int>(LAUNCHER_ITEM_WIDTH), 1, LAUNCHER_BORDER_CLR);
 
-    // Items — render only the visible window based on scroll offset
+    // Items — render in multi-column layout based on scroll offset
+    uint32_t totalValid = 0;
+    for (uint32_t i = 0; i < g_launcherCount; i++)
+        if (g_launcherItems[i].valid) totalValid++;
+
+    uint32_t cols = LauncherColumns(totalValid);
+    uint32_t maxVisible = LauncherMaxVisible(totalValid);
+    uint32_t colWidth = LAUNCHER_ITEM_WIDTH + 4;
+
     uint32_t validIdx = 0;
     uint32_t rendered = 0;
-    for (uint32_t i = 0; i < g_launcherCount && rendered < LAUNCHER_MAX_VISIBLE; i++)
+    for (uint32_t i = 0; i < g_launcherCount && rendered < maxVisible; i++)
     {
         if (!g_launcherItems[i].valid) continue;
 
@@ -1699,8 +1731,11 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
         }
         validIdx++;
 
-        int32_t itemX = px + static_cast<int32_t>(LAUNCHER_PADDING);
-        int32_t itemY = iy;
+        uint32_t col = rendered % cols;
+        uint32_t row = rendered / cols;
+
+        int32_t itemX = px + static_cast<int32_t>(LAUNCHER_PADDING + col * colWidth);
+        int32_t itemY = iy + static_cast<int32_t>(row * (LAUNCHER_ITEM_HEIGHT + 2));
 
         // Hover detection
         bool hovered = (mouseX >= itemX &&
@@ -1725,30 +1760,16 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
         int32_t textX = iconX + static_cast<int32_t>(LAUNCHER_ICON_SIZE) +
                         static_cast<int32_t>(LAUNCHER_ICON_MARGIN);
         uint32_t textFg = hovered ? 0x00FFFFFF : LAUNCHER_ITEM_FG;
+        uint32_t maxTextW = LAUNCHER_ITEM_WIDTH - LAUNCHER_ICON_SIZE - LAUNCHER_ICON_MARGIN - 12;
         WmRenderString(backBuffer, stride, screenW, screenH,
                        textX, itemY + static_cast<int32_t>(textYOff),
                        g_launcherItems[i].title,
-                       textFg, itemBg);
-
-        iy += LAUNCHER_ITEM_HEIGHT + 2;
-
-        // Subtle separator line between items
-        if (rendered < LAUNCHER_MAX_VISIBLE - 1)
-        {
-            WmFillRect(backBuffer, stride, screenW, screenH,
-                       itemX + 4, iy - 1,
-                       static_cast<int>(LAUNCHER_ITEM_WIDTH) - 8, 1,
-                       0x00404060);
-        }
+                       textFg, itemBg, maxTextW);
 
         rendered++;
     }
 
     // Scroll indicators (arrows) if content overflows
-    uint32_t totalValid = 0;
-    for (uint32_t i = 0; i < g_launcherCount; i++)
-        if (g_launcherItems[i].valid) totalValid++;
-
     if (g_launcherScroll > 0)
     {
         // Up arrow indicator at top-right of panel
@@ -1757,7 +1778,7 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
                        py + static_cast<int32_t>(LAUNCHER_PADDING) + static_cast<int32_t>(textYOff),
                        "^", 0x0080A0C0, LAUNCHER_BG);
     }
-    if (g_launcherScroll + LAUNCHER_MAX_VISIBLE < totalValid)
+    if (g_launcherScroll + maxVisible < totalValid)
     {
         // Down arrow indicator at bottom-right of panel
         WmRenderString(backBuffer, stride, screenW, screenH,
@@ -1782,20 +1803,32 @@ int WmLauncherHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH
 
     // Skip header
     int32_t itemStartY = py + static_cast<int32_t>(LAUNCHER_PADDING + LAUNCHER_ITEM_HEIGHT);
-    int32_t itemX = px + static_cast<int32_t>(LAUNCHER_PADDING);
+
+    uint32_t totalValid = 0;
+    for (uint32_t i = 0; i < g_launcherCount; i++)
+        if (g_launcherItems[i].valid) totalValid++;
+
+    uint32_t cols = LauncherColumns(totalValid);
+    uint32_t maxVisible = LauncherMaxVisible(totalValid);
+    uint32_t colWidth = LAUNCHER_ITEM_WIDTH + 4;
 
     // Map visual slot to actual launcher item, accounting for scroll
     uint32_t validIdx = 0;
     uint32_t slot = 0;
-    for (uint32_t i = 0; i < g_launcherCount && slot < LAUNCHER_MAX_VISIBLE; i++)
+    for (uint32_t i = 0; i < g_launcherCount && slot < maxVisible; i++)
     {
         if (!g_launcherItems[i].valid) continue;
         if (validIdx < g_launcherScroll) { validIdx++; continue; }
         validIdx++;
 
-        int32_t iy = itemStartY + static_cast<int32_t>(slot * (LAUNCHER_ITEM_HEIGHT + 2));
+        uint32_t col = slot % cols;
+        uint32_t row = slot / cols;
+
+        int32_t itemX = px + static_cast<int32_t>(LAUNCHER_PADDING + col * colWidth);
+        int32_t itemY = itemStartY + static_cast<int32_t>(row * (LAUNCHER_ITEM_HEIGHT + 2));
+
         if (mx >= itemX && mx < itemX + static_cast<int32_t>(LAUNCHER_ITEM_WIDTH) &&
-            my >= iy && my < iy + static_cast<int32_t>(LAUNCHER_ITEM_HEIGHT))
+            my >= itemY && my < itemY + static_cast<int32_t>(LAUNCHER_ITEM_HEIGHT))
         {
             return static_cast<int>(i);
         }
