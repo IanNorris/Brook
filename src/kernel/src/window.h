@@ -291,7 +291,7 @@ void WmPushWmEvent(Window* win, uint8_t type, int16_t x = 0, int16_t y = 0);
 // App Launcher
 // ---------------------------------------------------------------------------
 
-static constexpr uint32_t WM_LAUNCHER_MAX_ITEMS = 16;
+static constexpr uint32_t WM_LAUNCHER_MAX_ITEMS = 32;
 
 struct LauncherItem {
     char title[48];
