@@ -74,6 +74,8 @@ struct PerCpuSchedState {
     KernelCpuEnv*    cpuEnv;
     Process*         pendingRequeue;   // Set before context_switch; consumed after
     Process*         pendingRetire;    // Terminated process to mark reapable after context_switch
+    volatile uint64_t busyTicks;      // ticks spent running non-idle processes
+    volatile uint64_t idleTicks;      // ticks spent in idle process
 };
 
 static PerCpuSchedState g_perCpu[SCHED_MAX_CPUS] = {};
@@ -979,7 +981,14 @@ void SchedulerTimerTick(bool allowPreempt)
 
     // CPU time accounting: charge one tick to the running process.
     if (cur != g_perCpu[cpu].idleProcess)
+    {
         cur->userTicks++;
+        g_perCpu[cpu].busyTicks++;
+    }
+    else
+    {
+        g_perCpu[cpu].idleTicks++;
+    }
 
     // Idle — if something became ready, switch to it.
     if (cur == g_perCpu[cpu].idleProcess)
@@ -1647,9 +1656,19 @@ uint32_t SchedulerSnapshotProcesses(ProcessSnapshot* out, uint32_t maxCount)
     return count;
 }
 
-// ---------------------------------------------------------------------------
-// Dynamic policy registration and switching
-// ---------------------------------------------------------------------------
+void SchedulerGetCpuTicks(uint32_t cpuIndex, uint64_t& busyTicks, uint64_t& idleTicks)
+{
+    if (cpuIndex < SCHED_MAX_CPUS)
+    {
+        busyTicks = g_perCpu[cpuIndex].busyTicks;
+        idleTicks = g_perCpu[cpuIndex].idleTicks;
+    }
+    else
+    {
+        busyTicks = 0;
+        idleTicks = 0;
+    }
+}
 
 void SchedulerRegisterPolicy(const SchedOps* ops)
 {

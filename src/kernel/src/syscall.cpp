@@ -8134,10 +8134,20 @@ static int64_t sys_sysinfo(uint64_t infoAddr, uint64_t, uint64_t,
     if (!UserBufferWritable(infoAddr, sizeof(sysinfo_s))) return -EFAULT;
     auto* info = reinterpret_cast<sysinfo_s*>(infoAddr);
     __builtin_memset(info, 0, sizeof(sysinfo_s));
-    info->uptime = 60; // placeholder
-    info->totalram = 6ULL * 1024 * 1024 * 1024;
-    info->freeram  = 4ULL * 1024 * 1024 * 1024;
-    info->procs = 32;
+
+    extern volatile uint64_t g_lapicTickCount;
+    info->uptime = static_cast<int64_t>(g_lapicTickCount / 1000);
+
+    uint64_t totalPages = PmmGetTotalPageCount();
+    uint64_t freePages  = PmmGetFreePageCount();
+    info->totalram = totalPages * 4096;
+    info->freeram  = freePages  * 4096;
+
+    // Count running processes
+    ProcessSnapshot snaps[MAX_PROCESSES];
+    uint32_t count = SchedulerSnapshotProcesses(snaps, MAX_PROCESSES);
+    info->procs = static_cast<uint16_t>(count);
+
     info->mem_unit = 1;
     return 0;
 }

@@ -276,15 +276,17 @@ static Vnode* GenStat()
         "cpu  %lu %lu %lu %lu 0 0 0 0 0 0\n",
         user, 0UL, sys, idle);
 
-    // Per-CPU lines (split evenly for now — we don't track per-CPU time yet)
+    // Per-CPU lines with actual per-CPU tick counters
     for (uint32_t c = 0; c < cpuCount; ++c)
     {
-        uint64_t perUser = user / cpuCount;
-        uint64_t perSys  = sys / cpuCount;
-        uint64_t perIdle = idle / cpuCount;
+        uint64_t cpuBusy = 0, cpuIdle = 0;
+        SchedulerGetCpuTicks(c, cpuBusy, cpuIdle);
+        // Convert ms ticks to centiseconds (HZ=100)
+        uint64_t perUser = cpuBusy / 10;
+        uint64_t perIdle = cpuIdle / 10;
         n += ProcFmt(buf + n, bufSize - n,
             "cpu%u %lu %lu %lu %lu 0 0 0 0 0 0\n",
-            c, perUser, 0UL, perSys, perIdle);
+            c, perUser, 0UL, 0UL, perIdle);
     }
 
     n += ProcFmt(buf + n, bufSize - n,

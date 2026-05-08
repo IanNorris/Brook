@@ -106,6 +106,10 @@ struct ProcessSnapshot {
 // Returns the number of entries written.
 uint32_t SchedulerSnapshotProcesses(ProcessSnapshot* out, uint32_t maxCount);
 
+// Get per-CPU tick counters for /proc/stat.
+// Writes busy and idle tick counts for CPU `cpuIndex`.
+void SchedulerGetCpuTicks(uint32_t cpuIndex, uint64_t& busyTicks, uint64_t& idleTicks);
+
 // Register a scheduling policy. Called by scheduler modules during init().
 // Multiple policies can be registered; only the active one is used.
 extern "C" void SchedulerRegisterPolicy(const SchedOps* ops);
