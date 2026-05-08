@@ -69,6 +69,34 @@ static void WmFillRect(uint32_t* buf, uint32_t stride,
             WmPutPixel(buf, stride, screenW, screenH, x, y, color);
 }
 
+// Fill a rectangle with rounded corners (radius r).
+static void WmFillRoundedRect(uint32_t* buf, uint32_t stride,
+                               uint32_t screenW, uint32_t screenH,
+                               int x0, int y0, int w, int h,
+                               int r, uint32_t color)
+{
+    int r2 = r * r;
+    for (int dy = 0; dy < h; ++dy)
+    {
+        int py = y0 + dy;
+        for (int dx = 0; dx < w; ++dx)
+        {
+            // Check if pixel is in a corner region that should be clipped
+            bool skip = false;
+            // Top-left
+            if (dx < r && dy < r && (r - dx) * (r - dx) + (r - dy) * (r - dy) > r2) skip = true;
+            // Top-right
+            if (dx >= w - r && dy < r && (dx - (w - r - 1)) * (dx - (w - r - 1)) + (r - dy) * (r - dy) > r2) skip = true;
+            // Bottom-left
+            if (dx < r && dy >= h - r && (r - dx) * (r - dx) + (dy - (h - r - 1)) * (dy - (h - r - 1)) > r2) skip = true;
+            // Bottom-right
+            if (dx >= w - r && dy >= h - r && (dx - (w - r - 1)) * (dx - (w - r - 1)) + (dy - (h - r - 1)) * (dy - (h - r - 1)) > r2) skip = true;
+            if (!skip)
+                WmPutPixel(buf, stride, screenW, screenH, x0 + dx, py, color);
+        }
+    }
+}
+
 // Render a single glyph from g_fontAtlas at (penX, penY) into buffer.
 // Returns advance width.
 static int WmRenderGlyph(uint32_t* buf, uint32_t stride,
@@ -926,9 +954,9 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
                      mouseX < static_cast<int32_t>(btnX + TASKBAR_APPS_BTN_W);
     uint32_t appsBg = g_launcherOpen ? WM_TASKBAR_BTN_ACTIVE :
                       appsHover ? 0x00445566 : 0x00334455;
-    WmFillRect(backBuffer, stride, screenW, screenH,
+    WmFillRoundedRect(backBuffer, stride, screenW, screenH,
                static_cast<int>(btnX), static_cast<int>(btnY),
-               TASKBAR_APPS_BTN_W, WM_TASKBAR_BTN_HEIGHT, appsBg);
+               TASKBAR_APPS_BTN_W, WM_TASKBAR_BTN_HEIGHT, 3, appsBg);
     WmRenderString(backBuffer, stride, screenW, screenH,
                    static_cast<int>(btnX + WM_TASKBAR_TEXT_PAD_X),
                    static_cast<int>(btnY + textYOff),
@@ -939,9 +967,9 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     bool newHover = mouseInTaskbar && mouseX >= static_cast<int32_t>(btnX) &&
                     mouseX < static_cast<int32_t>(btnX + TASKBAR_NEW_BTN_W);
     uint32_t newBg = newHover ? 0x00445566 : 0x00334455;
-    WmFillRect(backBuffer, stride, screenW, screenH,
+    WmFillRoundedRect(backBuffer, stride, screenW, screenH,
                static_cast<int>(btnX), static_cast<int>(btnY),
-               TASKBAR_NEW_BTN_W, WM_TASKBAR_BTN_HEIGHT, newBg);
+               TASKBAR_NEW_BTN_W, WM_TASKBAR_BTN_HEIGHT, 3, newBg);
     WmRenderString(backBuffer, stride, screenW, screenH,
                    static_cast<int>(btnX + (TASKBAR_NEW_BTN_W - 8) / 2),
                    static_cast<int>(btnY + textYOff),
@@ -978,9 +1006,9 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
                         mouseX < static_cast<int32_t>(btnX + dynBtnWidth);
         uint32_t btnBg = (w.focused && !w.minimized) ? WM_TASKBAR_BTN_ACTIVE :
                          btnHover ? 0x00384858 : WM_TASKBAR_BTN_BG;
-        WmFillRect(backBuffer, stride, screenW, screenH,
+        WmFillRoundedRect(backBuffer, stride, screenW, screenH,
                    static_cast<int>(btnX), static_cast<int>(btnY),
-                   dynBtnWidth, WM_TASKBAR_BTN_HEIGHT, btnBg);
+                   dynBtnWidth, WM_TASKBAR_BTN_HEIGHT, 3, btnBg);
 
         // If minimized, draw a subtle underline indicator
         if (w.minimized)
