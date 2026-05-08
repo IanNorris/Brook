@@ -3439,6 +3439,20 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     if (fde->type != FdType::Vnode || !fde->handle)
         return -EBADF;
 
+    // Trace file-backed mmaps during early process startup (ld-linux loading
+    // shared libraries).  Rate-limited to first 200 per process.
+    {
+        static uint32_t s_mmapTraceCount[256];
+        uint16_t tid = proc->pid;
+        if (tid < 256 && s_mmapTraceCount[tid] < 200) {
+            s_mmapTraceCount[tid]++;
+            auto* vn = static_cast<Vnode*>(fde->handle);
+            SerialPrintf("MMAP_TRACE: pid=%u fd=%d off=0x%lx len=0x%lx prot=0x%lx flags=0x%lx cacheId=%lu\n",
+                         proc->pid, static_cast<int>(fd), offset, length,
+                         prot, flags, vn->cacheId);
+        }
+    }
+
     // Private, non-writable file mappings are demand-paged.  This avoids
     // synchronously reading large shared libraries/resources at mmap() time.
     // Writable or shared mappings stay on the existing eager path until Brook

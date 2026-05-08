@@ -1413,6 +1413,53 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
             if (next <= rbp || next >= 0x800000000000ULL) break;
             rbp = next;
         }
+
+        // If the crash is a null-deref inside ld-linux (RIP in interpreter
+        // region) and R12 looks like a link_map pointer, dump the first
+        // few fields of that link_map so we can identify which library has
+        // corrupt metadata.  This targets the _dl_check_map_versions crash
+        // where l_info[DT_STRTAB] (offset 0x68) is NULL.
+        constexpr uint64_t INTERP_BASE_DIAG = 0x7F0000000000ULL;
+        constexpr uint64_t INTERP_END_DIAG  = INTERP_BASE_DIAG + 0x100000;
+        if (ef->rip >= INTERP_BASE_DIAG && ef->rip < INTERP_END_DIAG
+            && cr2 < 0x1000
+            && ef->r12 >= 0x10000 && ef->r12 < 0x800000000000ULL)
+        {
+            ExcPutsRaw("  LD-LINUX DIAG: link_map at R12=");
+            ExcPutHex(ef->r12);
+            ExcPutsRaw("\n");
+            for (uint64_t off = 0; off <= 0x70; off += 8) {
+                uint64_t val = readUser64(ef->r12 + off);
+                ExcPutsRaw("    [+"); ExcPutHex(off); ExcPutsRaw("] = ");
+                ExcPutHex(val); ExcPutsRaw("\n");
+            }
+            uint64_t namePtr = readUser64(ef->r12 + 0x08);
+            if (namePtr >= 0x1000 && namePtr < 0x800000000000ULL) {
+                ExcPutsRaw("    l_name=\"");
+                for (int ci = 0; ci < 80; ++ci) {
+                    uint64_t cWord = readUser64(namePtr + (ci & ~7));
+                    uint8_t ch = static_cast<uint8_t>(cWord >> ((ci & 7) * 8));
+                    if (ch == 0 || ch < 0x20 || ch > 0x7e) break;
+                    char buf[2] = {static_cast<char>(ch), 0};
+                    ExcPutsRaw(buf);
+                }
+                ExcPutsRaw("\"\n");
+            }
+            if (ef->r15 >= 0x10000 && ef->r15 < 0x800000000000ULL) {
+                uint64_t r15name = readUser64(ef->r15 + 0x08);
+                if (r15name >= 0x1000 && r15name < 0x800000000000ULL) {
+                    ExcPutsRaw("    R15 l_name=\"");
+                    for (int ci = 0; ci < 80; ++ci) {
+                        uint64_t cWord = readUser64(r15name + (ci & ~7));
+                        uint8_t ch = static_cast<uint8_t>(cWord >> ((ci & 7) * 8));
+                        if (ch == 0 || ch < 0x20 || ch > 0x7e) break;
+                        char buf[2] = {static_cast<char>(ch), 0};
+                        ExcPutsRaw(buf);
+                    }
+                    ExcPutsRaw("\"\n");
+                }
+            }
+        }
     }
 
     // ---- User-mode crash-dump redirect -----------------------------------
