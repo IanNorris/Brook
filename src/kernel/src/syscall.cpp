@@ -4634,6 +4634,9 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
         }
     }
 
+    SerialPrintf("sys_execve: envpAddr=0x%lx envc=%d argc=%d path='%s'\n",
+                 envpAddr, envc, argc, lookupPath);
+
     // --- Load ELF from VFS ---
     Vnode* vn = VfsOpen(lookupPath, 0);
     if (!vn)
