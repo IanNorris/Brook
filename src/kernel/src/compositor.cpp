@@ -928,6 +928,10 @@ static void CompositorLoopWM()
     int sorted[WM_MAX_WINDOWS];
     uint32_t wcount = WmGetZOrder(sorted, WM_MAX_WINDOWS);
 
+    // Get mouse position once for hover effects
+    int32_t chromeMx = 0, chromeMy = 0;
+    MouseGetPosition(&chromeMx, &chromeMy);
+
     for (uint32_t i = 0; i < wcount; ++i)
     {
         Window* w = WmGetWindow(sorted[i]);
@@ -1029,14 +1033,15 @@ static void CompositorLoopWM()
 
         if (g_backBuffer)
             WmRenderChromeForWindow(g_backBuffer, g_backBufStride,
-                                     g_physFbWidth, g_physFbHeight, sorted[i]);
+                                     g_physFbWidth, g_physFbHeight, sorted[i],
+                                     chromeMx, chromeMy);
     }
 
     // 3. Render taskbar at bottom of screen
     if (g_backBuffer)
     {
         WmRenderTaskbar(g_backBuffer, g_backBufStride,
-                        g_physFbWidth, g_physFbHeight, now);
+                        g_physFbWidth, g_physFbHeight, now, chromeMx, chromeMy);
         uint32_t tbY = g_physFbHeight - WM_TASKBAR_HEIGHT;
         MarkDirtyRows(tbY, g_physFbHeight);
 

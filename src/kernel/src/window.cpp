@@ -704,7 +704,8 @@ uint32_t WmGetZOrder(int* outIndices, uint32_t maxOut)
 
 static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
                                 uint32_t screenW, uint32_t screenH,
-                                const Window& w)
+                                const Window& w,
+                                int32_t mouseX = -1, int32_t mouseY = -1)
 {
     if (w.noChrome) return;  // CSD: client draws its own chrome
     int wx = w.x;
@@ -764,10 +765,13 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
                    titleX + WM_TITLE_TEXT_PAD_X, textY, w.title,
                    WM_TITLE_FG, titleBg);
 
-    // Close button — red background with 'X'
+    // Close button — red background with 'X', brighter on hover
     int closeBtnX = wx + ow - WM_BORDER_WIDTH - WM_BUTTON_WIDTH;
+    bool closeHover = w.focused && mouseX >= closeBtnX && mouseX < closeBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
+                      mouseY >= titleY && mouseY < titleY + titleH;
+    uint32_t closeBg = closeHover ? 0x00CC3333 : WM_CLOSE_BTN_BG;
     WmFillRect(buf, stride, screenW, screenH, closeBtnX, titleY,
-               WM_BUTTON_WIDTH, titleH, WM_CLOSE_BTN_BG);
+               WM_BUTTON_WIDTH, titleH, closeBg);
     int glyphW = 8;
     if ('X' >= g_fontAtlas.firstChar && 'X' < g_fontAtlas.firstChar + g_fontAtlas.glyphCount)
         glyphW = g_fontAtlas.glyphs['X' - g_fontAtlas.firstChar].advance;
@@ -775,12 +779,15 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     int closeGlyphY = titleY + (titleH - g_fontAtlas.lineHeight) / 2;
     WmRenderGlyph(buf, stride, screenW, screenH,
                   closeGlyphX, closeGlyphY, 'X',
-                  0x00FFFFFF, WM_CLOSE_BTN_BG);
+                  0x00FFFFFF, closeBg);
 
-    // Maximize button — box icon
+    // Maximize button — box icon, lighten on hover
     int maxBtnX = closeBtnX - WM_BUTTON_WIDTH;
+    bool maxHover = w.focused && mouseX >= maxBtnX && mouseX < maxBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
+                    mouseY >= titleY && mouseY < titleY + titleH;
+    uint32_t maxBg = maxHover ? 0x003A5A7A : titleBg;
     WmFillRect(buf, stride, screenW, screenH, maxBtnX, titleY,
-               WM_BUTTON_WIDTH, titleH, titleBg);
+               WM_BUTTON_WIDTH, titleH, maxBg);
     int sqS = WM_BTN_ICON_SIZE;
     int sqX = maxBtnX + (WM_BUTTON_WIDTH - sqS) / 2;
     int sqY = titleY + (titleH - sqS) / 2;
@@ -789,10 +796,13 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     WmFillRect(buf, stride, screenW, screenH, sqX, sqY, 1, sqS, WM_TITLE_FG);
     WmFillRect(buf, stride, screenW, screenH, sqX + sqS - 1, sqY, 1, sqS, WM_TITLE_FG);
 
-    // Minimize button — horizontal dash
+    // Minimize button — horizontal dash, lighten on hover
     int minBtnX = maxBtnX - WM_BUTTON_WIDTH;
+    bool minHover = w.focused && mouseX >= minBtnX && mouseX < minBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
+                    mouseY >= titleY && mouseY < titleY + titleH;
+    uint32_t minBg = minHover ? 0x003A5A7A : titleBg;
     WmFillRect(buf, stride, screenW, screenH, minBtnX, titleY,
-               WM_BUTTON_WIDTH, titleH, titleBg);
+               WM_BUTTON_WIDTH, titleH, minBg);
     int lineW = WM_BTN_ICON_SIZE;
     int lineX = minBtnX + (WM_BUTTON_WIDTH - lineW) / 2;
     int lineY = titleY + titleH - WM_BTN_ICON_PAD_BOT;
@@ -815,12 +825,13 @@ void WmRenderChrome(uint32_t* backBuffer, uint32_t stride,
 }
 
 void WmRenderChromeForWindow(uint32_t* backBuffer, uint32_t stride,
-                              uint32_t screenW, uint32_t screenH, int idx)
+                              uint32_t screenW, uint32_t screenH, int idx,
+                              int32_t mouseX, int32_t mouseY)
 {
     if (!g_wmActive || idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
     const Window& w = g_windows[idx];
     if (!w.proc || !w.visible) return;
-    RenderWindowChrome(backBuffer, stride, screenW, screenH, w);
+    RenderWindowChrome(backBuffer, stride, screenW, screenH, w, mouseX, mouseY);
 }
 
 // ---------------------------------------------------------------------------
@@ -833,11 +844,13 @@ static constexpr uint32_t TASKBAR_APPS_BTN_W = 48; // "Apps" button width
 
 void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
                      uint32_t screenW, uint32_t screenH,
-                     uint64_t /*uptimeMs*/)
+                     uint64_t /*uptimeMs*/, int32_t mouseX, int32_t mouseY)
 {
     if (!g_wmActive || !backBuffer) return;
 
     uint32_t tbY = screenH - WM_TASKBAR_HEIGHT;
+    bool mouseInTaskbar = (mouseY >= static_cast<int32_t>(tbY) &&
+                           mouseY < static_cast<int32_t>(screenH));
 
     // Taskbar background with subtle top-to-bottom gradient
     WmFillRect(backBuffer, stride, screenW, screenH,
@@ -872,7 +885,10 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     uint32_t textYOff = (WM_TASKBAR_BTN_HEIGHT - static_cast<uint32_t>(g_fontAtlas.lineHeight)) / 2;
 
     // "Apps" launcher button
-    uint32_t appsBg = g_launcherOpen ? WM_TASKBAR_BTN_ACTIVE : 0x00334455;
+    bool appsHover = mouseInTaskbar && mouseX >= static_cast<int32_t>(btnX) &&
+                     mouseX < static_cast<int32_t>(btnX + TASKBAR_APPS_BTN_W);
+    uint32_t appsBg = g_launcherOpen ? WM_TASKBAR_BTN_ACTIVE :
+                      appsHover ? 0x00445566 : 0x00334455;
     WmFillRect(backBuffer, stride, screenW, screenH,
                static_cast<int>(btnX), static_cast<int>(btnY),
                TASKBAR_APPS_BTN_W, WM_TASKBAR_BTN_HEIGHT, appsBg);
@@ -883,13 +899,16 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     btnX += TASKBAR_APPS_BTN_W + WM_TASKBAR_PADDING;
 
     // "+" new terminal button
+    bool newHover = mouseInTaskbar && mouseX >= static_cast<int32_t>(btnX) &&
+                    mouseX < static_cast<int32_t>(btnX + TASKBAR_NEW_BTN_W);
+    uint32_t newBg = newHover ? 0x00445566 : 0x00334455;
     WmFillRect(backBuffer, stride, screenW, screenH,
                static_cast<int>(btnX), static_cast<int>(btnY),
-               TASKBAR_NEW_BTN_W, WM_TASKBAR_BTN_HEIGHT, 0x00334455);
+               TASKBAR_NEW_BTN_W, WM_TASKBAR_BTN_HEIGHT, newBg);
     WmRenderString(backBuffer, stride, screenW, screenH,
                    static_cast<int>(btnX + (TASKBAR_NEW_BTN_W - 8) / 2),
                    static_cast<int>(btnY + textYOff),
-                   "+", 0x0088CCFF, 0x00334455);
+                   "+", 0x0088CCFF, newBg);
     btnX += TASKBAR_NEW_BTN_W + WM_TASKBAR_PADDING;
 
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
@@ -897,8 +916,11 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
         const Window& w = g_windows[i];
         if (!w.proc || !w.visible) continue;
 
-        // Button background — highlight if focused
-        uint32_t btnBg = (w.focused && !w.minimized) ? WM_TASKBAR_BTN_ACTIVE : WM_TASKBAR_BTN_BG;
+        // Button background — highlight if focused, lighten on hover
+        bool btnHover = mouseInTaskbar && mouseX >= static_cast<int32_t>(btnX) &&
+                        mouseX < static_cast<int32_t>(btnX + WM_TASKBAR_BTN_WIDTH);
+        uint32_t btnBg = (w.focused && !w.minimized) ? WM_TASKBAR_BTN_ACTIVE :
+                         btnHover ? 0x00384858 : WM_TASKBAR_BTN_BG;
         WmFillRect(backBuffer, stride, screenW, screenH,
                    static_cast<int>(btnX), static_cast<int>(btnY),
                    WM_TASKBAR_BTN_WIDTH, WM_TASKBAR_BTN_HEIGHT, btnBg);
@@ -1120,17 +1142,36 @@ static void LauncherDrawIcon(uint32_t* backBuffer, uint32_t stride,
         return;
     }
 
-    // Fallback: colored square with letter
+    // Fallback: colored rounded rectangle with letter
     uint32_t color = item->iconColor;
+    static constexpr uint32_t ICON_RADIUS = 4; // corner radius in pixels
     for (uint32_t iy = 0; iy < LAUNCHER_ICON_SIZE; iy++)
     {
         for (uint32_t ix = 0; ix < LAUNCHER_ICON_SIZE; ix++)
         {
-            // Skip corner pixels for rounded look
-            bool corner = (ix == 0 && iy == 0) || (ix == LAUNCHER_ICON_SIZE-1 && iy == 0) ||
-                          (ix == 0 && iy == LAUNCHER_ICON_SIZE-1) ||
-                          (ix == LAUNCHER_ICON_SIZE-1 && iy == LAUNCHER_ICON_SIZE-1);
-            if (corner) continue;
+            // Rounded corner check using distance from corner center
+            bool skip = false;
+            uint32_t corners[4][2] = {
+                {ICON_RADIUS, ICON_RADIUS},                                     // top-left
+                {LAUNCHER_ICON_SIZE - 1 - ICON_RADIUS, ICON_RADIUS},           // top-right
+                {ICON_RADIUS, LAUNCHER_ICON_SIZE - 1 - ICON_RADIUS},           // bottom-left
+                {LAUNCHER_ICON_SIZE - 1 - ICON_RADIUS, LAUNCHER_ICON_SIZE - 1 - ICON_RADIUS} // bottom-right
+            };
+            for (int c = 0; c < 4; ++c)
+            {
+                uint32_t cx = corners[c][0], cy = corners[c][1];
+                bool inCornerX = (c & 1) ? (ix > cx) : (ix < cx);
+                bool inCornerY = (c & 2) ? (iy > cy) : (iy < cy);
+                if (inCornerX && inCornerY)
+                {
+                    int32_t dx = static_cast<int32_t>(ix) - static_cast<int32_t>(cx);
+                    int32_t dy = static_cast<int32_t>(iy) - static_cast<int32_t>(cy);
+                    if (dx * dx + dy * dy > static_cast<int32_t>(ICON_RADIUS * ICON_RADIUS))
+                        skip = true;
+                    break;
+                }
+            }
+            if (skip) continue;
 
             int32_t px = x + static_cast<int32_t>(ix);
             int32_t py2 = y + static_cast<int32_t>(iy);

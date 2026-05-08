@@ -213,7 +213,8 @@ void WmRenderChrome(uint32_t* backBuffer, uint32_t stride,
 
 // Render chrome for a single window (used when interleaving content + chrome per z-layer).
 void WmRenderChromeForWindow(uint32_t* backBuffer, uint32_t stride,
-                              uint32_t screenW, uint32_t screenH, int idx);
+                              uint32_t screenW, uint32_t screenH, int idx,
+                              int32_t mouseX, int32_t mouseY);
 
 // Check if window manager mode is active.
 bool WmIsActive();
@@ -228,7 +229,7 @@ uint32_t WmGetZOrder(int* outIndices, uint32_t maxOut);
 // Render the taskbar (bottom of screen) with window buttons and clock.
 void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
                      uint32_t screenW, uint32_t screenH,
-                     uint64_t uptimeMs);
+                     uint64_t uptimeMs, int32_t mouseX, int32_t mouseY);
 
 // Hit-test the taskbar. Returns the window index if a button was clicked, -1 otherwise.
 int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH);
