@@ -11599,6 +11599,56 @@ uint64_t SyscallGetEntryPoint()
 // Strace — syscall tracing facility
 // ---------------------------------------------------------------------------
 
+// Category bitmask for strace filtering
+enum StraceCategory : uint32_t {
+    SC_NET    = 1 << 0,  // socket, connect, sendto, recvfrom, etc.
+    SC_FILE   = 1 << 1,  // open, read, write, close, stat, etc.
+    SC_MEM    = 1 << 2,  // mmap, munmap, mprotect, brk
+    SC_PROC   = 1 << 3,  // fork, clone, execve, exit, wait
+    SC_SIG    = 1 << 4,  // rt_sigaction, rt_sigprocmask, kill, etc.
+    SC_IO     = 1 << 5,  // ioctl, poll, pselect, ppoll, epoll
+    SC_OTHER  = 1 << 6,  // everything else
+};
+
+static uint32_t SyscallCategory(uint64_t num)
+{
+    switch (num) {
+    // Network
+    case 41: case 42: case 43: case 44: case 45: case 46: case 47: case 48:
+    case 49: case 50: case 51: case 52: case 53: case 54: case 55:
+    case 299: case 307:
+        return SC_NET;  // socket..shutdown, recvmmsg, sendmmsg
+    // File
+    case 0: case 1: case 2: case 3: case 4: case 5: case 6: case 8:
+    case 17: case 18: case 19: case 20: case 21:
+    case 32: case 33: case 72: case 73: case 76: case 77:
+    case 79: case 80: case 82: case 83: case 84: case 85: case 86: case 87: case 88:
+    case 89: case 90: case 91: case 92: case 93: case 94:
+    case 217: case 257: case 258: case 260: case 262: case 263: case 264:
+    case 265: case 266: case 267: case 268: case 280: case 285:
+    case 292: case 293: case 316: case 332: case 439:
+        return SC_FILE;
+    // Memory
+    case 9: case 10: case 11: case 12: case 25: case 26: case 27: case 28:
+        return SC_MEM;  // mmap..mremap, madvise
+    // Process
+    case 56: case 57: case 58: case 59: case 60: case 61: case 62:
+    case 231: case 234: case 435:
+        return SC_PROC; // clone..wait4, exit_group, tgkill, clone3
+    // Signal
+    case 13: case 14: case 15: case 34: case 127: case 128: case 129: case 130: case 131:
+    case 200:
+        return SC_SIG;  // rt_sigaction..rt_sigreturn, kill, tkill
+    // I/O control
+    case 7: case 16: case 23: case 270: case 271:
+    case 213: case 214: case 232: case 233:
+    case 290:
+        return SC_IO;   // poll, ioctl, select, pselect6, ppoll, epoll_*
+    default:
+        return SC_OTHER;
+    }
+}
+
 static const char* SyscallName(uint64_t num)
 {
     switch (num) {
@@ -11780,7 +11830,15 @@ int64_t SyscallDispatchInternal(uint64_t num, uint64_t a0, uint64_t a1,
 {
     Process* proc = ProcessCurrent();
     if (proc && proc->straceEnabled)
-        return SyscallDispatchTraced(num, a0, a1, a2, a3, a4, a5);
+    {
+        // If a filter is set, only trace matching categories
+        if (proc->straceFilter == 0 || (SyscallCategory(num) & proc->straceFilter))
+            return SyscallDispatchTraced(num, a0, a1, a2, a3, a4, a5);
+        // Filtered out — dispatch without tracing
+        SyscallFn fn2 = (num < SYSCALL_MAX) ? g_syscallTable[num] : nullptr;
+        if (!fn2) return -38;
+        return fn2(a0, a1, a2, a3, a4, a5);
+    }
     SyscallFn fn = (num < SYSCALL_MAX) ? g_syscallTable[num] : nullptr;
     if (!fn) {
         SerialPrintf("[syscall] FATAL-AVOIDED: pid=%u (%s) num=%lu has null/oob entry "
@@ -11849,16 +11907,17 @@ __attribute__((naked)) void SwitchToUserMode(uint64_t, uint64_t)
 // Strace control functions
 // ---------------------------------------------------------------------------
 
-bool StraceEnablePid(uint32_t pid, bool enable)
+bool StraceEnablePid(uint32_t pid, bool enable, uint32_t filter)
 {
     using namespace brook;
     Process* p = ProcessFindByPid(static_cast<uint16_t>(pid));
     if (!p) return false;
     p->straceEnabled = enable;
+    p->straceFilter = filter;
     return true;
 }
 
-int StraceEnableName(const char* name, bool enable)
+int StraceEnableName(const char* name, bool enable, uint32_t filter)
 {
     using namespace brook;
     int count = 0;
@@ -11874,6 +11933,7 @@ int StraceEnableName(const char* name, bool enable)
             }
             if (match) {
                 p->straceEnabled = enable;
+                p->straceFilter = filter;
                 count++;
             }
         }
@@ -11881,12 +11941,15 @@ int StraceEnableName(const char* name, bool enable)
     return count;
 }
 
-void StraceEnableAll(bool enable)
+void StraceEnableAll(bool enable, uint32_t filter)
 {
     using namespace brook;
     for (uint16_t pid = 1; pid < 256; pid++) {
         Process* p = ProcessFindByPid(pid);
-        if (p) p->straceEnabled = enable;
+        if (p) {
+            p->straceEnabled = enable;
+            p->straceFilter = filter;
+        }
     }
 }
 

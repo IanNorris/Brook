@@ -34,9 +34,9 @@
 #include "debug_overlay.h"
 
 // Strace control (defined in syscall.cpp)
-bool StraceEnablePid(uint32_t pid, bool enable);
-int  StraceEnableName(const char* name, bool enable);
-void StraceEnableAll(bool enable);
+bool StraceEnablePid(uint32_t pid, bool enable, uint32_t filter = 0);
+int  StraceEnableName(const char* name, bool enable, uint32_t filter = 0);
+void StraceEnableAll(bool enable, uint32_t filter = 0);
 
 namespace brook {
 

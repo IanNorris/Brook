@@ -31,9 +31,9 @@ extern "C" bool InputRegister(brook::InputDevice* dev);
 extern "C" void InputWakeWaiters();
 
 // Strace functions (defined in syscall.cpp)
-bool StraceEnablePid(uint32_t pid, bool enable);
-int  StraceEnableName(const char* name, bool enable);
-void StraceEnableAll(bool enable);
+bool StraceEnablePid(uint32_t pid, bool enable, uint32_t filter = 0);
+int  StraceEnableName(const char* name, bool enable, uint32_t filter = 0);
+void StraceEnableAll(bool enable, uint32_t filter = 0);
 
 namespace brook {
 
@@ -2869,10 +2869,10 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  exec <path>           - execute a shell script\n"
             "\n"
             "Syscall tracing:\n"
-            "  strace <pid>          - enable strace for PID\n"
-            "  strace <name>         - enable strace for processes matching name\n"
-            "  strace all            - enable strace for all processes\n"
-            "  strace off <pid|all>  - disable strace\n"
+            "  strace <pid|name|all> [filter]  - enable strace\n"
+            "  strace off <pid|name|all>       - disable strace\n"
+            "  Filters: net file mem proc sig io (combine with spaces)\n"
+            "  Example: strace all net         - trace only network syscalls\n"
             "\n"
         );
     }
@@ -3505,44 +3505,69 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             while (*arg == ' ') arg++;
         }
 
+        // Parse target (all, pid, or name) — stop at space
+        char target[64];
+        int ti2 = 0;
+        const char* ap = arg;
+        while (*ap && *ap != ' ' && ti2 < 63) target[ti2++] = *ap++;
+        target[ti2] = '\0';
+        while (*ap == ' ') ap++;
+
+        // Parse optional filter: net, file, mem, proc, sig, io
+        uint32_t filter = 0;
+        while (*ap) {
+            if (StrStartsWith(ap, "net"))  { filter |= 1; ap += 3; }
+            else if (StrStartsWith(ap, "file")) { filter |= 2; ap += 4; }
+            else if (StrStartsWith(ap, "mem"))  { filter |= 4; ap += 3; }
+            else if (StrStartsWith(ap, "proc")) { filter |= 8; ap += 4; }
+            else if (StrStartsWith(ap, "sig"))  { filter |= 16; ap += 3; }
+            else if (StrStartsWith(ap, "io"))   { filter |= 32; ap += 2; }
+            else break;
+            while (*ap == ' ' || *ap == ',') ap++;
+        }
+
         char resp[128];
         int p = 0;
 
-        if (NetStrEq(arg, "all")) {
-            StraceEnableAll(enable);
-            const char* h = enable ? "strace: enabled for all processes\n"
-                                   : "strace: disabled for all processes\n";
+        if (NetStrEq(target, "all")) {
+            StraceEnableAll(enable, filter);
+            const char* h = enable ? "strace: enabled for all processes"
+                                   : "strace: disabled for all processes";
             for (int i = 0; h[i]; i++) resp[p++] = h[i];
+            if (filter) {
+                const char* fh = " (filtered)";
+                for (int i = 0; fh[i]; i++) resp[p++] = fh[i];
+            }
+            resp[p++] = '\n';
         } else {
             // Try as PID first
             uint32_t pid = 0;
-            const char* s = arg;
+            const char* s = target;
             while (*s >= '0' && *s <= '9') pid = pid * 10 + (*s++ - '0');
 
             if (*s == '\0' && pid > 0) {
-                if (StraceEnablePid(pid, enable)) {
+                if (StraceEnablePid(pid, enable, filter)) {
                     const char* h = enable ? "strace: enabled pid " : "strace: disabled pid ";
                     for (int i = 0; h[i]; i++) resp[p++] = h[i];
-                    // Append PID number
-                    char tmp[11]; int ti = 10; tmp[ti] = 0;
+                    char tmp[11]; int txi = 10; tmp[txi] = 0;
                     uint32_t v = pid;
-                    if (v == 0) tmp[--ti] = '0';
-                    else while (v > 0) { tmp[--ti] = '0' + (v % 10); v /= 10; }
-                    for (const char* t = &tmp[ti]; *t; t++) resp[p++] = *t;
+                    if (v == 0) tmp[--txi] = '0';
+                    else while (v > 0) { tmp[--txi] = '0' + (v % 10); v /= 10; }
+                    for (const char* t = &tmp[txi]; *t; t++) resp[p++] = *t;
                     resp[p++] = '\n';
                 } else {
                     const char* h = "strace: pid not found\n";
                     for (int i = 0; h[i]; i++) resp[p++] = h[i];
                 }
             } else {
-                int count = StraceEnableName(arg, enable);
+                int count = StraceEnableName(target, enable, filter);
                 const char* h = enable ? "strace: enabled for " : "strace: disabled for ";
                 for (int i = 0; h[i]; i++) resp[p++] = h[i];
-                char tmp[11]; int ti = 10; tmp[ti] = 0;
+                char tmp[11]; int txi = 10; tmp[txi] = 0;
                 uint32_t v = static_cast<uint32_t>(count);
-                if (v == 0) tmp[--ti] = '0';
-                else while (v > 0) { tmp[--ti] = '0' + (v % 10); v /= 10; }
-                for (const char* t = &tmp[ti]; *t; t++) resp[p++] = *t;
+                if (v == 0) tmp[--txi] = '0';
+                else while (v > 0) { tmp[--txi] = '0' + (v % 10); v /= 10; }
+                for (const char* t = &tmp[txi]; *t; t++) resp[p++] = *t;
                 const char* h2 = " process(es)\n";
                 for (int i = 0; h2[i]; i++) resp[p++] = h2[i];
             }
