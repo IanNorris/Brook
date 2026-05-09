@@ -1200,18 +1200,20 @@ static int ExecCommand(int argc, const char* const* argv)
         return 0;
     }
 
-    // Built-in: profile <duration_ms> — start sampling profiler
+    // Built-in: profile <duration_s> — start sampling profiler
+    // Duration is in seconds (converted to ms internally).
     if (StrEq(cmd, "profile"))
     {
-        uint32_t ms = 0;
+        uint32_t secs = 0;
         if (argc >= 2) {
             // Simple atoi
             const char* s = argv[1];
             while (*s >= '0' && *s <= '9')
-                ms = ms * 10 + (*s++ - '0');
+                secs = secs * 10 + (*s++ - '0');
         }
-        if (ms == 0) ms = 10000;  // default 10 seconds
-        ProfilerStart(ms);
+        if (secs == 0) secs = 10;  // default 10 seconds
+        KPrintf("PROFILER: starting %u second capture\n", secs);
+        ProfilerStart(secs * 1000);
         return 0;
     }
 

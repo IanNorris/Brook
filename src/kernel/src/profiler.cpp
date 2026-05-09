@@ -484,15 +484,16 @@ static void ProfilerThreadFn(void* /*arg*/)
             bool fileOk = ProfileWriterOpen(pw);
 
             uint32_t cpuCount = SmpGetCpuCount();
-            uint32_t elapsed = 0;
             while (g_profilerEnabled) {
                 Process* self = ProcessCurrent();
                 if (self) {
                     self->wakeupTick = g_lapicTickCount + 1000; // 1 s
                     SchedulerBlock(self);
                 }
-                elapsed++;
-                if (elapsed % 10 == 0)
+                // Use real wall time for progress messages, not wake count
+                uint32_t elapsed = static_cast<uint32_t>(
+                    (g_lapicTickCount - g_profilerStartTick) / 1000);
+                if (elapsed % 10 == 0 && elapsed > 0)
                     SerialPrintf("PROFILER: recording (%u s)\n", elapsed);
 
                 // Drain ring buffers into the file every second so they

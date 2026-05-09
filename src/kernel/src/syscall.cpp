@@ -901,40 +901,90 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
             return true;
         }
 
-        // Cache miss (or validation failure) — demand-page from disk
+        // Cache miss — demand-page from disk with 64KB readahead.
+        // Reading 16 pages at once amortizes virtio overhead and reduces
+        // future page faults for sequential access patterns.
         uint64_t missN = __atomic_fetch_add(&g_profCacheMiss, 1, __ATOMIC_RELAXED);
         if (missN < 20 || (missN % 1000 == 0)) {
             SerialPrintf("[PROFILE] cache_miss #%lu cacheId=%lu page=%lu\n",
                          missN, vn->cacheId, filePageIdx);
         }
-        PhysicalAddress phys = PmmAllocPage(MemTag::User, proc->pid);
-        if (!phys) return false;
 
-        auto* kp = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
-        kp = reinterpret_cast<uint8_t*>(
-            reinterpret_cast<uint64_t>(kp) & ~0xFFFULL);
-        memset(kp, 0, 4096);
+        static constexpr uint32_t READAHEAD_PAGES = 16; // 64KB
+        uint64_t mapEnd = m.vaddr + m.length;
 
+        // Get file size for bounds checking
+        VnodeStat fileSt;
+        uint64_t fileSizePages = ~0ULL;
+        if (VfsStat(vn, &fileSt) == 0 && fileSt.size > 0)
+            fileSizePages = (fileSt.size + 4095) / 4096;
+
+        // Determine how many pages we can readahead within VMA and file bounds
+        uint32_t raCount = 1;
+        for (uint32_t r = 1; r < READAHEAD_PAGES; ++r) {
+            uint64_t adjVA = pageVA + r * 4096;
+            if (adjVA >= mapEnd) break;
+            if (filePageIdx + r >= fileSizePages) break;
+            // Don't readahead pages already mapped
+            if (VmmVirtToPhys(proc->pageTable, VirtualAddress(adjVA))) break;
+            // Don't readahead pages already in cache
+            PhysicalAddress probe = PageCacheLookup(vn, filePageIdx + r);
+            if (probe) { PmmUnrefPage(probe); break; }
+            raCount++;
+        }
+
+        // Allocate physical pages for readahead batch
+        PhysicalAddress raPages[READAHEAD_PAGES];
+        for (uint32_t r = 0; r < raCount; ++r) {
+            raPages[r] = PmmAllocPage(MemTag::User, proc->pid);
+            if (!raPages[r]) { raCount = r; break; }
+        }
+        if (raCount == 0) return false;
+
+        // Bulk read from disk via bounce buffer
+        auto* readBuf = static_cast<uint8_t*>(kmalloc(raCount * 4096));
+        if (!readBuf) {
+            for (uint32_t r = 0; r < raCount; ++r) PmmFreePage(raPages[r]);
+            return false;
+        }
+        memset(readBuf, 0, raCount * 4096);
         uint64_t readOff = fileOff;
-        int got = VfsRead(vn, kp, 4096, &readOff);
-        if (got < 0) {
-            PmmFreePage(phys);
-            return false;
-        }
+        int got = VfsRead(vn, readBuf, raCount * 4096, &readOff);
+        if (got < 0) got = 0;
 
-        // Insert into cache (cache adopts one ref) and take extra ref for PTE
-        PmmRefPage(phys);
-        PageCacheInsert(vn, filePageIdx, phys);
-
-        if (!VmmMapPage(proc->pageTable, VirtualAddress(pageVA), phys,
-                        VMM_PRESENT | m.vmmFlags, MemTag::User, proc->pid)) {
-            if (VmmVirtToPhys(proc->pageTable, VirtualAddress(pageVA))) {
-                PmmUnrefPage(phys);
-                return true;
+        // Scatter into physical pages and insert into cache
+        for (uint32_t r = 0; r < raCount; ++r) {
+            auto* kp = reinterpret_cast<uint8_t*>(PhysToVirt(raPages[r]).raw());
+            kp = reinterpret_cast<uint8_t*>(
+                reinterpret_cast<uint64_t>(kp) & ~0xFFFULL);
+            uint64_t srcOff = r * 4096;
+            if (srcOff < static_cast<uint64_t>(got)) {
+                uint64_t toCopy = static_cast<uint64_t>(got) - srcOff;
+                if (toCopy > 4096) toCopy = 4096;
+                __builtin_memcpy(kp, readBuf + srcOff, toCopy);
+                if (toCopy < 4096)
+                    __builtin_memset(kp + toCopy, 0, 4096 - toCopy);
+            } else {
+                __builtin_memset(kp, 0, 4096);
             }
-            PmmUnrefPage(phys);
-            return false;
+
+            // Insert into cache (cache adopts one ref) and keep one for PTE
+            PmmRefPage(raPages[r]);
+            PageCacheInsert(vn, filePageIdx + r, raPages[r]);
+
+            uint64_t targetVA = pageVA + r * 4096;
+            if (!VmmMapPage(proc->pageTable, VirtualAddress(targetVA), raPages[r],
+                            VMM_PRESENT | m.vmmFlags, MemTag::User, proc->pid)) {
+                PmmUnrefPage(raPages[r]);
+                if (r == 0) {
+                    // Failed to map the faulting page — bail
+                    kfree(readBuf);
+                    return VmmVirtToPhys(proc->pageTable, VirtualAddress(pageVA)) != PhysicalAddress(0);
+                }
+                // Non-critical: couldn't map a readahead page, skip it
+            }
         }
+        kfree(readBuf);
         return true;
     }
     return false;

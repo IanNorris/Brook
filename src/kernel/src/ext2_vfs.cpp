@@ -158,15 +158,14 @@ struct Ext2Mount {
 
     // --- Indirect-block read cache ---
     // BlockMap() is called once per file-block during sequential reads,
-    // and for every fileBlock past the first 12 it has to read a
-    // singly-indirect block from disk to find the disk-block number.
-    // Without caching, a 1MB sequential read does ~256 4-byte virtio
-    // reads of the same indirect block.  One slot is enough because
-    // sequential reads stream through 1024 file-blocks (4MB) of one
-    // indirect block before crossing.
+    // and for every fileBlock past the first 12 it has to read
+    // indirect blocks from disk.  4 cached slots avoid thrashing when
+    // doubly/triply-indirect lookups alternate between L1 and L2 blocks.
+    static constexpr uint32_t IND_CACHE_SLOTS = 4;
     SpinLock indCacheLock;
-    uint32_t indCacheBlockNum;    // 0 = empty
-    uint8_t* indCacheData;        // blockSize bytes; lazy-alloced
+    uint32_t indCacheBlockNum[IND_CACHE_SLOTS];  // 0 = empty
+    uint8_t* indCacheData[IND_CACHE_SLOTS];      // blockSize bytes each; lazy-alloced
+    uint32_t indCacheLru;                         // next slot to evict (simple round-robin)
 
     // --- Bitmap allocation hints ---
     // Without these, Ext2AllocBlock/Ext2AllocInode rescan each bitmap from
@@ -358,9 +357,12 @@ static bool Ext2WriteBlock(Ext2Mount* mnt, uint32_t blockNum, const void* buf)
     // SerialPrintf("ext2: WriteBlock %u\n", blockNum);
     uint64_t off = static_cast<uint64_t>(blockNum) << mnt->blockShift;
     // Invalidate the indirect-block read cache if we're overwriting it.
-    if (mnt->indCacheBlockNum == blockNum) {
+    {
         uint64_t lf = SpinLockAcquire(&mnt->indCacheLock);
-        if (mnt->indCacheBlockNum == blockNum) mnt->indCacheBlockNum = 0;
+        for (uint32_t s = 0; s < Ext2Mount::IND_CACHE_SLOTS; ++s) {
+            if (mnt->indCacheBlockNum[s] == blockNum)
+                mnt->indCacheBlockNum[s] = 0;
+        }
         SpinLockRelease(&mnt->indCacheLock, lf);
     }
     return Ext2DevWrite(mnt, off, buf, mnt->blockSize);
@@ -635,12 +637,14 @@ static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
         if (!nb) return 0;
         uint64_t off = (static_cast<uint64_t>(ino->i_block[12]) << mnt->blockShift)
                        + fileBlock * 4;
-        // Invalidate cache before mutating the indirect block on disk.
-        if (mnt->indCacheBlockNum == ino->i_block[12]) {
+        // Update cache if the indirect block is currently cached.
+        {
             uint64_t lf = SpinLockAcquire(&mnt->indCacheLock);
-            if (mnt->indCacheBlockNum == ino->i_block[12]) {
-                if (mnt->indCacheData)
-                    *reinterpret_cast<uint32_t*>(mnt->indCacheData + fileBlock * 4) = nb;
+            for (uint32_t s = 0; s < Ext2Mount::IND_CACHE_SLOTS; ++s) {
+                if (mnt->indCacheBlockNum[s] == ino->i_block[12] && mnt->indCacheData[s]) {
+                    *reinterpret_cast<uint32_t*>(mnt->indCacheData[s] + fileBlock * 4) = nb;
+                    break;
+                }
             }
             SpinLockRelease(&mnt->indCacheLock, lf);
         }
@@ -1003,29 +1007,39 @@ static uint32_t Ext2ReadIndPointer(Ext2Mount* mnt, uint32_t indBlock, uint32_t i
     if (!indBlock) return 0;
     uint32_t entry = 0;
     uint64_t lf = SpinLockAcquire(&mnt->indCacheLock);
-    if (mnt->indCacheBlockNum == indBlock && mnt->indCacheData) {
-        entry = *reinterpret_cast<uint32_t*>(mnt->indCacheData + idx * 4);
-        SpinLockRelease(&mnt->indCacheLock, lf);
-        return entry;
-    }
-    if (!mnt->indCacheData) {
-        mnt->indCacheData = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
-        if (!mnt->indCacheData) {
+
+    // Search all cache slots
+    for (uint32_t s = 0; s < Ext2Mount::IND_CACHE_SLOTS; ++s) {
+        if (mnt->indCacheBlockNum[s] == indBlock && mnt->indCacheData[s]) {
+            entry = *reinterpret_cast<uint32_t*>(mnt->indCacheData[s] + idx * 4);
             SpinLockRelease(&mnt->indCacheLock, lf);
-            // Fall back to direct read.
+            return entry;
+        }
+    }
+
+    // Cache miss — pick eviction slot (round-robin)
+    uint32_t victim = mnt->indCacheLru % Ext2Mount::IND_CACHE_SLOTS;
+    mnt->indCacheLru++;
+
+    if (!mnt->indCacheData[victim]) {
+        mnt->indCacheData[victim] = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+        if (!mnt->indCacheData[victim]) {
+            SpinLockRelease(&mnt->indCacheLock, lf);
+            // Fall back to direct read
             uint64_t off = (static_cast<uint64_t>(indBlock) << mnt->blockShift) + idx * 4;
             if (!Ext2DevRead(mnt, off, &entry, 4)) return 0;
             return entry;
         }
     }
+
     uint64_t blockOff = static_cast<uint64_t>(indBlock) << mnt->blockShift;
-    if (!Ext2DevRead(mnt, blockOff, mnt->indCacheData, mnt->blockSize)) {
-        mnt->indCacheBlockNum = 0; // mark cache empty on failure
+    if (!Ext2DevRead(mnt, blockOff, mnt->indCacheData[victim], mnt->blockSize)) {
+        mnt->indCacheBlockNum[victim] = 0;
         SpinLockRelease(&mnt->indCacheLock, lf);
         return 0;
     }
-    mnt->indCacheBlockNum = indBlock;
-    entry = *reinterpret_cast<uint32_t*>(mnt->indCacheData + idx * 4);
+    mnt->indCacheBlockNum[victim] = indBlock;
+    entry = *reinterpret_cast<uint32_t*>(mnt->indCacheData[victim] + idx * 4);
     SpinLockRelease(&mnt->indCacheLock, lf);
     return entry;
 }
@@ -1057,18 +1071,12 @@ static uint32_t Ext2BlockMap(Ext2Mount* mnt, const Ext2Inode* ino, uint32_t file
         }
         uint32_t idx1 = fileBlock / ptrsPerBlock;
         uint32_t idx2 = fileBlock % ptrsPerBlock;
-        uint32_t indBlock = 0;
-        uint64_t off1 = (static_cast<uint64_t>(dindBlock) << mnt->blockShift) + idx1 * 4;
-        if (!Ext2DevRead(mnt, off1, &indBlock, 4) || !indBlock) {
-            SerialPrintf("ext2: dind L1 fail idx1=%u indBlock=%u dindBlock=%u\n", idx1, indBlock, dindBlock);
+        uint32_t indBlock = Ext2ReadIndPointer(mnt, dindBlock, idx1);
+        if (!indBlock) {
+            SerialPrintf("ext2: dind L1 fail idx1=%u dindBlock=%u\n", idx1, dindBlock);
             return 0;
         }
-        uint32_t entry = 0;
-        uint64_t off2 = (static_cast<uint64_t>(indBlock) << mnt->blockShift) + idx2 * 4;
-        if (!Ext2DevRead(mnt, off2, &entry, 4)) {
-            SerialPrintf("ext2: dind L2 fail idx2=%u indBlock=%u\n", idx2, indBlock);
-            return 0;
-        }
+        uint32_t entry = Ext2ReadIndPointer(mnt, indBlock, idx2);
         if (!entry) {
             // sparse hole — block not allocated
         }
@@ -1083,16 +1091,11 @@ static uint32_t Ext2BlockMap(Ext2Mount* mnt, const Ext2Inode* ino, uint32_t file
     uint32_t rem  = fileBlock % (ptrsPerBlock * ptrsPerBlock);
     uint32_t idx2 = rem / ptrsPerBlock;
     uint32_t idx3 = rem % ptrsPerBlock;
-    uint32_t dindB = 0;
-    uint64_t o1 = (static_cast<uint64_t>(tindBlock) << mnt->blockShift) + idx1 * 4;
-    if (!Ext2DevRead(mnt, o1, &dindB, 4) || !dindB) return 0;
-    uint32_t indB = 0;
-    uint64_t o2 = (static_cast<uint64_t>(dindB) << mnt->blockShift) + idx2 * 4;
-    if (!Ext2DevRead(mnt, o2, &indB, 4) || !indB) return 0;
-    uint32_t entry = 0;
-    uint64_t o3 = (static_cast<uint64_t>(indB) << mnt->blockShift) + idx3 * 4;
-    if (!Ext2DevRead(mnt, o3, &entry, 4)) return 0;
-    return entry;
+    uint32_t dindB = Ext2ReadIndPointer(mnt, tindBlock, idx1);
+    if (!dindB) return 0;
+    uint32_t indB = Ext2ReadIndPointer(mnt, dindB, idx2);
+    if (!indB) return 0;
+    return Ext2ReadIndPointer(mnt, indB, idx3);
 }
 
 // Read `len` bytes from inode data at `offset`. Returns bytes read.
@@ -1569,8 +1572,11 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
     mnt->bgdtDirty         = false;
     mnt->pendingMetaOps    = 0;
     mnt->indCacheLock      = SpinLock{};
-    mnt->indCacheBlockNum  = 0;
-    mnt->indCacheData      = nullptr;
+    mnt->indCacheLru       = 0;
+    for (uint32_t s = 0; s < Ext2Mount::IND_CACHE_SLOTS; ++s) {
+        mnt->indCacheBlockNum[s] = 0;
+        mnt->indCacheData[s]     = nullptr;
+    }
     mnt->blockBitmapCache  = static_cast<uint8_t**>(kmalloc(groupCount * sizeof(uint8_t*)));
     mnt->blockBitmapDirty  = static_cast<bool*>(kmalloc(groupCount * sizeof(bool)));
     mnt->inodeBitmapCache  = static_cast<uint8_t**>(kmalloc(groupCount * sizeof(uint8_t*)));
