@@ -2000,6 +2000,12 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
         DbgPrintf("SIGRETURN: pid %u restored rip=0x%lx rsp=0x%lx\n",
                   proc->pid, mc.rip, mc.rsp);
 
+        // Debug: detect SA_RESTART sigreturn — if rax looks like a syscall
+        // number and rip points to a syscall instruction, log it
+        if (mc.rax <= 512 && mc.rip < 0x0000800000000000ULL)
+            brook::SerialPrintf("SIGRETURN: pid %u rip=0x%lx rax=%lu (restart? rsp=0x%lx)\n",
+                                proc->pid, mc.rip, mc.rax, mc.rsp);
+
         return static_cast<int64_t>(mc.rax); // restore original RAX
     }
 
@@ -2069,8 +2075,9 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     // Promote SIGWINCH delivery debug to SerialPrintf in release until the
     // resize-kills-terminal bug is closed.
     if (signum == 28)
-        brook::SerialPrintf("SIGNAL: deliver SIGWINCH pid=%u tgid=%u handler=0x%lx restorer=0x%lx flags=0x%lx\n",
-                            proc->pid, proc->tgid, sa.handler, sa.restorer, sa.flags);
+        brook::SerialPrintf("SIGNAL: deliver SIGWINCH pid=%u tgid=%u handler=0x%lx restorer=0x%lx flags=0x%lx syscallResult=%ld syscall=%lu\n",
+                            proc->pid, proc->tgid, sa.handler, sa.restorer, sa.flags,
+                            syscallResult, proc->currentSyscallNum);
 
     proc->inSignalHandler = true;
 

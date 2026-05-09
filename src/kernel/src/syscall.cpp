@@ -2134,7 +2134,12 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 uint64_t pending = self->sigPending & ~self->sigMask;
                 uint64_t sigchldBit = (1ULL << (17 - 1)); // SIGCHLD = 17
                 if ((pending & ~sigchldBit) != 0)
+                {
+                    int signo = __builtin_ctzll(pending & ~sigchldBit) + 1;
+                    SerialPrintf("PIPE_READ: pid %u '%s' interrupted by sig %d\n",
+                                 self->pid, self->name, signo);
                     return -EINTR;
+                }
                 self->sigPending &= ~sigchldBit;
             }
         }
@@ -4001,13 +4006,8 @@ static int64_t sys_exit_group(uint64_t status, uint64_t, uint64_t,
                                uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
-    if (status != 0) {
-        SerialPrintf("sys_exit_group: tgid %u exiting with status %lu\n",
-                     proc ? proc->tgid : 0, status);
-    } else {
-        DbgPrintf("sys_exit_group: tgid %u exiting with status %lu\n",
-                  proc ? proc->tgid : 0, status);
-    }
+    SerialPrintf("sys_exit_group: '%s' tgid %u exiting with status %lu\n",
+                 proc ? proc->name : "?", proc ? proc->tgid : 0, status);
 
     // Kill all other threads in this thread group so they don't linger
     // and cause use-after-free on shared resources after the leader exits.
