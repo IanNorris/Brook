@@ -1143,6 +1143,24 @@ static void CompositorLoopWM()
                                 static_cast<int16_t>(my - target->clientY()));
                 }
             }
+            else
+            {
+                // Mouse is over desktop/chrome/taskbar — not a Wayland client
+                // area.  If a Wayland client previously hid the cursor via
+                // wl_pointer.set_cursor(NULL), restore it now so the user
+                // sees the built-in arrow on non-client areas.
+                if (__atomic_load_n(&g_defaultCursorVisible, __ATOMIC_ACQUIRE) == 0)
+                {
+                    __atomic_store_n(&g_defaultCursorVisible, 1u, __ATOMIC_RELEASE);
+                    // Also reset to built-in arrow in case a custom cursor
+                    // was set by the previous Wayland client.
+                    g_cursorCustom = false;
+                    g_cursorW = 12;
+                    g_cursorH = 16;
+                    g_cursorHotX = 0;
+                    g_cursorHotY = 0;
+                }
+            }
             continue;
         }
 
