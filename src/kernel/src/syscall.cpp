@@ -9242,6 +9242,38 @@ static int64_t sys_select(uint64_t nfds, uint64_t readfdsAddr, uint64_t writefds
     // Block
     SchedulerBlock(self);
 
+    // If woken by a signal (not by data arriving), return -EINTR so that
+    // SA_RESTART can re-issue the syscall after the signal handler runs.
+    // Without this, pselect returns 0 ("no fds ready") which bash/readline
+    // misinterprets as EOF, causing the terminal to exit on SIGWINCH.
+    if (HasPendingSignals())
+    {
+        // Clean up waiter registrations before returning
+        for (uint64_t fd = 0; fd < nfds && fd < 128; fd++)
+        {
+            uint64_t mask = 1ULL << (fd % 64);
+            uint64_t word = fd / 64;
+            bool wantRead = rfds && (rfds[word] & mask);
+            if (!wantRead) continue;
+            FdEntry* fde = FdGet(proc, static_cast<int>(fd));
+            if (!fde) continue;
+            if (fde->type == FdType::Pipe && fde->handle && !(fde->flags & 1))
+            {
+                auto* pb = static_cast<PipeBuffer*>(fde->handle);
+                if (pb->readerWaiter == self) pb->readerWaiter = nullptr;
+            }
+            if (fde->type == FdType::DevKeyboard)
+                InputRemoveWaiter(self);
+            if (fde->type == FdType::DevTty && fde->handle)
+            {
+                auto* pair = static_cast<TtyDevicePair*>(fde->handle);
+                auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
+                if (rp->readerWaiter == self) rp->readerWaiter = nullptr;
+            }
+        }
+        return -EINTR;
+    }
+
     // After wakeup, do one final scan
     ready = 0;
     rResult[0] = rResult[1] = 0;
