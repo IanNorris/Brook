@@ -2157,8 +2157,11 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     // wait4, nanosleep, poll, pselect6, ppoll, futex, etc.
     // The exceptions (never restarted) are: connect, accept, recvfrom,
     // sendto, epoll_wait — we don't restart those.
-    uint64_t syscallNum = 0;
-    __asm__ volatile("movq %%gs:120, %0" : "=r"(syscallNum));
+    //
+    // We read the syscall number from the per-process snapshot rather than
+    // gs:120 (per-CPU) because other processes may have overwritten gs:120
+    // while this process was blocked in SchedulerBlock().
+    uint64_t syscallNum = proc->currentSyscallNum;
     bool restartable = false;
     switch (syscallNum)
     {
@@ -2184,8 +2187,17 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     if (syscallResult == -4 /* -EINTR */ && (sa.flags & SA_RESTART) &&
         restartable && mc.rip >= 2)
     {
+        brook::SerialPrintf("SIGNAL: SA_RESTART restarting syscall %lu for pid %u (sig %d)\n",
+                            syscallNum, proc->pid, signum);
         mc.rax = syscallNum;
         mc.rip -= 2; // x86_64 syscall instruction length
+    }
+    else if (syscallResult == -4 && signum == 28)
+    {
+        // Debug: SIGWINCH with -EINTR but NOT restarting — log why
+        brook::SerialPrintf("SIGNAL: SIGWINCH NOT restarted for pid %u: syscall=%lu restartable=%d SA_RESTART=%d rip=0x%lx\n",
+                            proc->pid, syscallNum, restartable,
+                            (sa.flags & SA_RESTART) ? 1 : 0, mc.rip);
     }
 
     // Fill siginfo

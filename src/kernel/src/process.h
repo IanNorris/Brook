@@ -430,6 +430,7 @@ struct Process
     bool     inSignalHandler;   // Currently executing a user signal handler
     bool     inSignalHandlerOnAltStack; // Current handler entered on sigaltstack
     bool     sigReturnPending;  // Set by sys_rt_sigreturn, handled by SyscallCheckSignals
+    uint64_t currentSyscallNum;  // Syscall number (RAX) saved per-process for SA_RESTART
 
     // Fork child state: when true, the trampoline enters user mode at
     // forkReturnRip with RAX=0 (child's fork() return value).

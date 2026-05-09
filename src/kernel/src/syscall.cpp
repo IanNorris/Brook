@@ -172,6 +172,7 @@ extern "C" void SyscallSnapshotCurrentC()
     uint64_t userRip, userRsp, userRflags;
     uint64_t userRbx, userRbp, userR12, userR13, userR14, userR15;
     uint64_t userRdi, userRsi, userRdx, userR8, userR9, userR10;
+    uint64_t syscallNum;
 
     asm volatile("movq %%gs:184, %0" : "=r"(procPtr));
     asm volatile("movq %%gs:48,  %0" : "=r"(userRip));
@@ -189,6 +190,7 @@ extern "C" void SyscallSnapshotCurrentC()
     asm volatile("movq %%gs:152, %0" : "=r"(userR8));
     asm volatile("movq %%gs:160, %0" : "=r"(userR9));
     asm volatile("movq %%gs:168, %0" : "=r"(userR10));
+    asm volatile("movq %%gs:120, %0" : "=r"(syscallNum));
 
     auto* proc = reinterpret_cast<brook::Process*>(procPtr);
     if (!proc)
@@ -209,6 +211,7 @@ extern "C" void SyscallSnapshotCurrentC()
     proc->syscallUserR8 = userR8;
     proc->syscallUserR9 = userR9;
     proc->syscallUserR10 = userR10;
+    proc->currentSyscallNum = syscallNum;
 }
 
 // ---------------------------------------------------------------------------
