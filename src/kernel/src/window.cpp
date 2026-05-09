@@ -98,11 +98,12 @@ static void WmFillRoundedRect(uint32_t* buf, uint32_t stride,
 }
 
 // Render a single glyph from g_fontAtlas at (penX, penY) into buffer.
-// Returns advance width.
+// Returns advance width. Clips pixels to [0, clipRight) horizontally.
 static int WmRenderGlyph(uint32_t* buf, uint32_t stride,
                           uint32_t screenW, uint32_t screenH,
                           int penX, int penY, int code,
-                          uint32_t fg, uint32_t bg)
+                          uint32_t fg, uint32_t bg,
+                          int clipRight = 0)
 {
     const FontAtlas& fa = g_fontAtlas;
     if (code < static_cast<int>(fa.firstChar) ||
@@ -116,6 +117,8 @@ static int WmRenderGlyph(uint32_t* buf, uint32_t stride,
     int drawX = penX + gi.bearingX;
     int drawY = penY + fa.ascent - gi.bearingY;
 
+    int maxX = (clipRight > 0) ? clipRight : static_cast<int>(screenW);
+
     for (int row = 0; row < gh; ++row)
     {
         for (int col = 0; col < gw; ++col)
@@ -127,6 +130,7 @@ static int WmRenderGlyph(uint32_t* buf, uint32_t stride,
             int px = drawX + col;
             int py = drawY + row;
             if (px < 0 || py < 0) continue;
+            if (px >= maxX) continue;
             if (static_cast<uint32_t>(px) >= screenW) continue;
             if (static_cast<uint32_t>(py) >= screenH) continue;
 
@@ -153,11 +157,13 @@ static void WmRenderString(uint32_t* buf, uint32_t stride,
                             int maxWidth = 0)
 {
     int penX = x;
+    int clipRight = (maxWidth > 0) ? (x + maxWidth) : 0;
     while (*str)
     {
         if (maxWidth > 0 && (penX - x) >= maxWidth) break;
         penX += WmRenderGlyph(buf, stride, screenW, screenH,
-                               penX, y, static_cast<uint8_t>(*str), fg, bg);
+                               penX, y, static_cast<uint8_t>(*str), fg, bg,
+                               clipRight);
         ++str;
     }
 }
@@ -819,30 +825,34 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
                    titleX + WM_TITLE_TEXT_PAD_X, textY, w.title,
                    WM_TITLE_FG, titleBg, titleMaxW);
 
+    // Close/maximize/minimize buttons — circles centered in their button cells.
+    // The circle is centered in the square WM_BUTTON_WIDTH × titleH cell.
+    // The center is offset by 0.5px due to even dimensions, so we use
+    // (btnX + width/2) which gives a consistent pixel center.
+    static constexpr int CHROME_BTN_RADIUS = 8;
+    static constexpr int ICON_HALF = 3;  // half-size of icons (6×6 total)
+    static constexpr int CLOSE_ICON_HALF = 3; // smaller × for close button
+    int btnCenterY = titleY + static_cast<int>(titleH) / 2;
+
     // Close button — circular red dot with small × icon
-    int closeBtnX = wx + ow - WM_BORDER_WIDTH - WM_BUTTON_WIDTH;
-    int btnCenterY = titleY + titleH / 2;
+    int closeBtnX = wx + ow - static_cast<int>(WM_BORDER_WIDTH) - static_cast<int>(WM_BUTTON_WIDTH);
     bool closeHover = w.focused && mouseX >= closeBtnX && mouseX < closeBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
                       mouseY >= titleY && mouseY < titleY + titleH;
     uint32_t closeBg = closeHover ? 0x00CC3333 : WM_CLOSE_BTN_BG;
-    static constexpr int CHROME_BTN_RADIUS = 7;
-    static constexpr int ICON_HALF = 3; // half-size of icon (6×6 total)
     int closeCenterX = closeBtnX + static_cast<int>(WM_BUTTON_WIDTH) / 2;
     WmFillRect(buf, stride, screenW, screenH, closeBtnX, titleY,
                WM_BUTTON_WIDTH, titleH, titleBg);
     WmFillCircle(buf, stride, screenW, screenH,
                  closeCenterX, btnCenterY, CHROME_BTN_RADIUS, closeBg);
-    // Draw × with two diagonal lines (2px thick)
-    for (int d = -ICON_HALF; d <= ICON_HALF; d++)
+    // Draw × with 1px diagonal lines (thinner, more delicate)
+    for (int d = -CLOSE_ICON_HALF; d <= CLOSE_ICON_HALF; d++)
     {
         WmPutPixel(buf, stride, screenW, screenH, closeCenterX + d, btnCenterY + d, WM_TITLE_FG);
-        WmPutPixel(buf, stride, screenW, screenH, closeCenterX + d + 1, btnCenterY + d, WM_TITLE_FG);
         WmPutPixel(buf, stride, screenW, screenH, closeCenterX + d, btnCenterY - d, WM_TITLE_FG);
-        WmPutPixel(buf, stride, screenW, screenH, closeCenterX + d + 1, btnCenterY - d, WM_TITLE_FG);
     }
 
     // Maximize button — circular with small box icon
-    int maxBtnX = closeBtnX - WM_BUTTON_WIDTH;
+    int maxBtnX = closeBtnX - static_cast<int>(WM_BUTTON_WIDTH);
     bool maxHover = w.focused && mouseX >= maxBtnX && mouseX < maxBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
                     mouseY >= titleY && mouseY < titleY + titleH;
     uint32_t maxBg = maxHover ? 0x003A5A7A : 0x00304050;
@@ -861,7 +871,7 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     WmFillRect(buf, stride, screenW, screenH, sqX + sqS - 1, sqY, 1, sqS, WM_TITLE_FG);
 
     // Minimize button — circular with small centered dash
-    int minBtnX = maxBtnX - WM_BUTTON_WIDTH;
+    int minBtnX = maxBtnX - static_cast<int>(WM_BUTTON_WIDTH);
     bool minHover = w.focused && mouseX >= minBtnX && mouseX < minBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
                     mouseY >= titleY && mouseY < titleY + titleH;
     uint32_t minBg = minHover ? 0x003A5A7A : 0x00304050;
