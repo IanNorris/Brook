@@ -19,6 +19,7 @@
 #include "vfs.h"
 #include "input.h"
 #include "mouse.h"
+#include "shell.h"
 
 // External C functions used by debug channel
 extern "C" void MouseGetPosition(int32_t*, int32_t*);
@@ -586,7 +587,7 @@ void NetStartPollThread()
         extern volatile uint64_t g_lapicTickCount;
         while (true) {
             uint32_t n = NetIfCount();
-            for (int burst = 0; burst < 8; burst++) {
+            for (int burst = 0; burst < 16; burst++) {
                 for (uint32_t i = 0; i < n; i++) {
                     NetIf* nif = NetIfAt(i);
                     if (nif && nif->poll) nif->poll(nif);
@@ -594,12 +595,11 @@ void NetStartPollThread()
             }
             Process* self = ProcessCurrent();
             if (self) {
-                // Wake every ~50ms instead of every tick.  A 1-tick wake
-                // rate generates ~60k context switches per minute, which
-                // multiplies the chance of any latent UAF in the scheduler
-                // queues turning into a panic.  Real network traffic
-                // doesn't need millisecond polling for our use cases.
-                self->wakeupTick = g_lapicTickCount + 50;
+                // Wake every ~5ms for responsive networking. TLS page loads
+                // require 10+ round trips; at 50ms poll interval each RT
+                // added ~25ms average latency. 5ms keeps RT latency under
+                // 3ms average while not starving other threads.
+                self->wakeupTick = g_lapicTickCount + 5;
                 SchedulerBlock(self);
             }
         }
@@ -1203,12 +1203,12 @@ uint32_t DnsResolve(const char* hostname)
         SerialPrintf("net: DNS query '%s' (attempt %d)\n", hostname, attempt + 1);
         NetSendUdp(g_netIf->dns, DNS_LOCAL_PORT, DNS_PORT, pkt, pktLen);
 
-        // Block until DNS reply arrives (2 second timeout per attempt)
-        uint64_t deadline = g_lapicTickCount + 2000;
+        // Block until DNS reply arrives (500ms timeout per attempt)
+        uint64_t deadline = g_lapicTickCount + 500;
         while (!g_dnsGotReply && g_lapicTickCount < deadline) {
             if (self) {
                 g_dnsWaiter = self;
-                self->wakeupTick = g_lapicTickCount + 2000;
+                self->wakeupTick = g_lapicTickCount + 50; // check every 50ms
                 SchedulerBlock(self);
             } else if (g_netIf->poll) {
                 // Early-boot: no scheduler yet, fall back to polling
@@ -2243,7 +2243,7 @@ static int TcpWaitForDataAck(Socket& s, int sockIdx,
     Process* self = SchedulerCurrentProcess();
     uint32_t seqEnd = seq + len;
     uint64_t deadline = g_lapicTickCount + 30000;
-    uint64_t nextRetransmit = g_lapicTickCount + 1000;
+    uint64_t nextRetransmit = g_lapicTickCount + 200;  // 200ms initial RTO (was 1000ms)
     uint32_t retransmits = 0;
 
     while (true) {
@@ -2274,7 +2274,7 @@ static int TcpWaitForDataAck(Socket& s, int sockIdx,
             retransmits++;
             TcpSendSegmentAtSeq(s, seq, TCP_ACK | TCP_PSH, data, len,
                                 "data-retry");
-            uint64_t backoff = 1000ULL << (retransmits < 4 ? retransmits : 4);
+            uint64_t backoff = 200ULL << (retransmits < 4 ? retransmits : 4);
             nextRetransmit = now + backoff;
             continue;
         }
@@ -2354,10 +2354,9 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
 
         extern volatile uint64_t g_lapicTickCount;
         Process* self = SchedulerCurrentProcess();
-        // 3-minute hard deadline — enough for slow TLS handshakes / server
-        // cache misses, but still bounded so a truly dead peer releases the
-        // caller rather than hanging forever.
-        uint64_t hardDeadline = g_lapicTickCount + 180000;
+        // 30-second hard deadline — enough for slow TLS handshakes but
+        // won't hang the browser for 3 minutes on a dead peer.
+        uint64_t hardDeadline = g_lapicTickCount + 30000;
 
         while (true) {
             uint64_t irqFlags = SpinLockAcquire(&s.lock);
@@ -2371,7 +2370,7 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
             // Set pollWaiter while holding the lock so HandleTcp can never
             // enqueue data and miss the wakeup in a race window.
             s.pollWaiter = self;
-            self->wakeupTick = g_lapicTickCount + 10000; // heartbeat every 10s
+            self->wakeupTick = g_lapicTickCount + 100; // heartbeat every 100ms
             SpinLockRelease(&s.lock, irqFlags);
             SchedulerBlock(self);
             // Woken by data (HandleTcp), heartbeat tick, or spurious —
@@ -2851,6 +2850,9 @@ static void DebugHandleCommand(const char* cmd, uint32_t len)
             "  inject keydown SC     - press key (no release, for modifiers)\n"
             "  inject keyup SC       - release key\n"
             "  inject type TEXT      - type ASCII string (auto shift)\n"
+            "\n"
+            "Execution:\n"
+            "  exec <path>           - execute a shell script\n"
             "\n"
         );
     }
@@ -3449,6 +3451,25 @@ static void DebugHandleCommand(const char* cmd, uint32_t len)
         }
     }
 
+    // -----------------------------------------------------------------------
+    // exec <path> — execute a shell script by path
+    // -----------------------------------------------------------------------
+    else if (StrStartsWith(cmd, "exec ")) {
+        const char* path = cmd + 5;
+        while (*path == ' ') path++;
+        if (*path) {
+            char resp[256];
+            int p = 0;
+            const char* h = "exec: running '";
+            for (int i = 0; h[i]; i++) resp[p++] = h[i];
+            for (int i = 0; path[i] && p < 240; i++) resp[p++] = path[i];
+            resp[p++] = '\''; resp[p++] = '\n'; resp[p] = '\0';
+            DebugChannelSend(resp);
+            ShellExecScript(path);
+        } else {
+            DebugChannelSend("Usage: exec <script-path>\n");
+        }
+    }
     // -----------------------------------------------------------------------
     // Unknown command
     // -----------------------------------------------------------------------

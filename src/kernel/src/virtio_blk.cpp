@@ -7,12 +7,8 @@
 #include "memory/heap.h"
 #include "serial.h"
 #include "mem_tag.h"
-#include "scheduler.h"
-#include "process.h"
 
 namespace brook {
-
-extern volatile uint64_t g_lapicTickCount;
 
 // ---- virtio-blk PCI register offsets (legacy BAR0 I/O) ----
 
@@ -318,29 +314,13 @@ static bool SubmitRequest(VirtioBlkState& s,
     // Notify device that queue 0 has work.
     VioWrite16(s.ioBase, VIRTIO_PCI_QUEUE_NOTIFY, 0);
 
-    // Adaptive poll: spin briefly for fast KVM completions, then sleep
-    // with wakeupTick to let other processes run. The ticket lock prevents
-    // concurrent disk requests, but SchedulerBlock releases the CPU so
-    // non-disk work can proceed.
-    for (uint32_t i = 0; i < 1000u; ++i) {
+    // Poll for completion — busy-wait with pause.
+    // KVM virtio completions are typically sub-microsecond, so this
+    // loop rarely runs more than a few iterations.
+    for (uint32_t i = 0; i < 100000000u; ++i) {
         if (*s.usedIdx != s.usedIdxShadow)
             goto done;
         __asm__ volatile("pause" ::: "memory");
-    }
-    // Phase 2: timed-sleep poll with 1ms wakeups for ~2 seconds
-    {
-        uint64_t deadline = g_lapicTickCount + 2000;
-        Process* self = ProcessCurrent();
-        while (g_lapicTickCount < deadline) {
-            if (*s.usedIdx != s.usedIdxShadow)
-                goto done;
-            if (self) {
-                self->wakeupTick = g_lapicTickCount + 1; // wake in ~1ms
-                SchedulerBlock(self);
-            } else {
-                __asm__ volatile("pause" ::: "memory");
-            }
-        }
     }
     SerialPuts("virtio-blk: timeout waiting for response\n");
     return false;
@@ -355,15 +335,8 @@ done:
 static void AcquireRequestLock(VirtioBlkState& s)
 {
     uint32_t ticket = __atomic_fetch_add(&s.requestGuardNext, 1, __ATOMIC_RELAXED);
-    // Spin briefly, then yield to avoid burning full timeslices
-    uint32_t spins = 0;
     while (__atomic_load_n(&s.requestGuardServing, __ATOMIC_ACQUIRE) != ticket) {
-        if (++spins < 100) {
-            __asm__ volatile("pause" ::: "memory");
-        } else {
-            spins = 0;
-            SchedulerYield();
-        }
+        __asm__ volatile("pause" ::: "memory");
     }
 }
 
