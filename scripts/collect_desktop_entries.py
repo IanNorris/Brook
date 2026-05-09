@@ -177,6 +177,35 @@ def main():
         # Deduplicate by name
         if name in seen_names:
             continue
+
+        # Validate: check that the binary actually exists in the store.
+        # The first token of exec_cmd is the binary path or name.
+        binary = exec_cmd.split()[0] if exec_cmd else ""
+        binary_found = False
+
+        if binary.startswith('/'):
+            # Absolute path — check directly (relative to store root parent)
+            # e.g. /nix/store/xxx/bin/vlc -> store_dir/../xxx/bin/vlc
+            store_parent = os.path.dirname(store_dir)  # parent of "store/"
+            abs_check = os.path.join(store_parent, binary.lstrip('/').replace('nix/', '', 1))
+            if os.path.isfile(abs_check):
+                binary_found = True
+            # Also try the raw path under store_dir
+            for sp in glob.glob(os.path.join(store_dir, '*/bin', os.path.basename(binary))):
+                if os.path.isfile(sp):
+                    binary_found = True
+                    break
+        else:
+            # Bare command name — search all store packages' bin/ directories
+            for sp in glob.glob(os.path.join(store_dir, '*/bin', binary)):
+                if os.path.isfile(sp):
+                    binary_found = True
+                    break
+
+        if not binary_found:
+            print(f"  Skip: {name} [{binary}] — binary not found in store")
+            continue
+
         seen_names.add(name)
 
         # Try to find and convert the icon
