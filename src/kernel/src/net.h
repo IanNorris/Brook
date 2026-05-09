@@ -385,6 +385,13 @@ void DebugChannelInit();
 void DebugChannelSend(const char* msg);
 void DebugChannelSendf(const char* fmt, ...);
 
+// Route DebugChannelSend responses to a specific socket (for port 1234 server).
+void DebugChannelSetReplySock(int sock);
+void DebugChannelClearReplySock();
+
+// Dispatch a debug command string (used by both outbound and listener channels).
+void DebugHandleCommand(const char* cmd, uint32_t len);
+
 // Poll for incoming commands from the debug server.
 // Called periodically (e.g., from compositor or heartbeat).
 void DebugChannelPoll();

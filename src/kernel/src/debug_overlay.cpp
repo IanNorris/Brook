@@ -364,12 +364,37 @@ static void DebugTcpThread(void* /*arg*/)
         const char* banner = "=== Brook OS Debug Console ===\r\n";
         SockSend(clientSock, banner, strlen(banner));
 
-        // Stream ring buffer content
+        // Stream ring buffer content AND handle incoming commands
         uint32_t cursor = 0; // start from beginning of ring
         char lineBuf[TCP_BATCH][TCP_LINE_LEN + 1];
+        char cmdBuf[256];
+        int  cmdLen = 0;
 
         for (;;)
         {
+            // --- Check for incoming commands (non-blocking) ---
+            if (SockPollReady(clientSock, true, false)) {
+                char tmp[128];
+                int n = SockRecv(clientSock, tmp, sizeof(tmp) - 1);
+                if (n <= 0) goto client_done; // disconnect or error
+                // Accumulate into cmdBuf, dispatch on newline
+                for (int i = 0; i < n; i++) {
+                    char c = tmp[i];
+                    if (c == '\n' || c == '\r') {
+                        if (cmdLen > 0) {
+                            cmdBuf[cmdLen] = '\0';
+                            DebugChannelSetReplySock(clientSock);
+                            DebugHandleCommand(cmdBuf, static_cast<uint32_t>(cmdLen));
+                            DebugChannelClearReplySock();
+                            cmdLen = 0;
+                        }
+                    } else if (cmdLen < static_cast<int>(sizeof(cmdBuf)) - 1) {
+                        cmdBuf[cmdLen++] = c;
+                    }
+                }
+            }
+
+            // --- Stream log lines ---
             uint32_t count = DebugOverlayReadFrom(&cursor,
                 reinterpret_cast<char*>(lineBuf), TCP_BATCH, TCP_LINE_LEN + 1);
 

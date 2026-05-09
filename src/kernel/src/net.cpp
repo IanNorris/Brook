@@ -2616,7 +2616,7 @@ static int UintToStr(char* buf, uint32_t val)
     return pos;
 }
 
-static void DebugHandleCommand(const char* cmd, uint32_t len);
+void DebugHandleCommand(const char* cmd, uint32_t len);
 
 // Kernel thread: attempts to connect the debug channel without blocking boot.
 // Tries once with a short timeout; if no server is listening, exits quietly.
@@ -2690,12 +2690,21 @@ void DebugChannelInit()
     SerialPrintf("debug: channel thread created pid=%u\n", thread->pid);
 }
 
+// Thread-local override for routing DebugChannelSend responses to
+// whichever socket initiated the command (port 1234 or outbound 9999).
+static int g_debugReplySockOverride = -1;
+
+void DebugChannelSetReplySock(int sock) { g_debugReplySockOverride = sock; }
+void DebugChannelClearReplySock()       { g_debugReplySockOverride = -1; }
+
 void DebugChannelSend(const char* msg)
 {
-    if (g_debugSockIdx < 0) return;
+    int sock = g_debugReplySockOverride >= 0 ? g_debugReplySockOverride
+                                             : g_debugSockIdx;
+    if (sock < 0) return;
     uint32_t len = 0;
     while (msg[len]) len++;
-    SockSend(g_debugSockIdx, msg, len);
+    SockSend(sock, msg, len);
 }
 
 bool DebugChannelConnected()
@@ -2814,7 +2823,7 @@ static bool MatchLogLevel(const char* name, LogLevel* out)
     return false;
 }
 
-static void DebugHandleCommand(const char* cmd, uint32_t len)
+void DebugHandleCommand(const char* cmd, uint32_t len)
 {
     (void)len;
 
