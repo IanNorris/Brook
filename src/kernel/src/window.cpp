@@ -1852,8 +1852,8 @@ void WmLauncherExec(int itemIdx)
 
     if (g_launcherItems[itemIdx].isDesktopEntry)
     {
-        // For .desktop entries: generate a temporary script that launches
-        // waylandd + the app in WM mode. Write to /tmp/launch.rc and exec.
+        // For .desktop entries: build an inline script that launches
+        // waylandd + the app in WM mode, then exec directly from memory.
         const char* exec = g_launcherItems[itemIdx].scriptPath;
         char script[512];
         uint32_t si = 0;
@@ -1863,30 +1863,8 @@ void WmLauncherExec(int itemIdx)
         script[si++] = '\n';
         script[si] = '\0';
 
-        // Write to /tmp/launch_<idx>.rc
-        char tmpPath[64];
-        uint32_t ti = 0;
-        const char* tp = "/tmp/launch_";
-        while (*tp) tmpPath[ti++] = *tp++;
-        if (itemIdx >= 10) tmpPath[ti++] = '0' + (itemIdx / 10);
-        tmpPath[ti++] = '0' + (itemIdx % 10);
-        const char* ext = ".rc";
-        while (*ext) tmpPath[ti++] = *ext++;
-        tmpPath[ti] = '\0';
-
-        Vnode* vn = VfsOpen(tmpPath, VFS_O_CREATE);
-        if (vn)
-        {
-            uint64_t off = 0;
-            VfsWrite(vn, script, si, &off);
-            VfsClose(vn);
-            extern int ShellExecScript(const char* path);
-            ShellExecScript(tmpPath);
-        }
-        else
-        {
-            SerialPrintf("WM: failed to create %s for desktop launch\n", tmpPath);
-        }
+        extern int ShellExecString(const char* script);
+        ShellExecString(script);
     }
     else
     {

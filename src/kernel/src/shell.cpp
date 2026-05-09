@@ -1650,6 +1650,47 @@ int ShellExecScript(const char* path)
     return 0;
 }
 
+int ShellExecString(const char* script)
+{
+    if (!script || !script[0]) return -1;
+
+    SerialPrintf("SHELL: executing inline script\n");
+    g_scriptMode = true;
+
+    char line[MAX_LINE];
+    [[maybe_unused]] uint32_t lineNum = 0;
+    const char* src = script;
+
+    while (*src)
+    {
+        // Copy one line
+        uint32_t li = 0;
+        while (*src && *src != '\n' && li < MAX_LINE - 1)
+            line[li++] = *src++;
+        line[li] = '\0';
+        if (*src == '\n') ++src;
+        ++lineNum;
+
+        // Skip empty lines and comments
+        const char* p = line;
+        while (IsWhitespace(*p)) ++p;
+        if (*p == '\0' || *p == '#') continue;
+
+        DbgPrintf("SHELL: [inline:%u] %s\n", lineNum, line);
+
+        const char* argv[MAX_ARGS];
+        int argc = ParseLine(line, argv, MAX_ARGS);
+        if (argc > 0)
+        {
+            ExecCommand(argc, argv);
+        }
+    }
+
+    g_scriptMode = false;
+    SerialPrintf("SHELL: inline script finished\n");
+    return 0;
+}
+
 [[noreturn]] void ShellInteractive()
 {
     KPrintf("\nBrook OS shell — type 'help' for commands\n");
