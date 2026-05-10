@@ -59,6 +59,7 @@ struct ArpEntry {
 
 static ArpEntry g_arpCache[ARP_CACHE_SIZE];
 static uint32_t g_arpCount = 0;
+static SpinLock g_arpLock;
 
 // Pending ARP resolution
 static volatile bool g_arpReplyPending = false;
@@ -75,8 +76,8 @@ static constexpr uint32_t MAX_SOCKETS = 1024;
 static Socket g_sockets[MAX_SOCKETS];
 static bool   g_sockUsed[MAX_SOCKETS];
 
-// IPv4 identification counter
-static uint16_t g_ipId = 1;
+// IPv4 identification counter (atomic for SMP safety)
+static volatile uint16_t g_ipId = 1;
 
 static uint32_t g_tcpEphemeralPort = 49200; // accessed via atomic fetch-add
 
@@ -132,11 +133,13 @@ static void* NetMemcpy(void* dst, const void* src, uint64_t n)
 
 void ArpCacheInsert(uint32_t ip, const MacAddr& mac)
 {
+    uint64_t flags = SpinLockAcquire(&g_arpLock);
     // Update existing entry
     for (uint32_t i = 0; i < g_arpCount; i++) {
         if (g_arpCache[i].ip == ip) {
             g_arpCache[i].mac = mac;
             g_arpCache[i].valid = true;
+            SpinLockRelease(&g_arpLock, flags);
             return;
         }
     }
@@ -147,16 +150,20 @@ void ArpCacheInsert(uint32_t ip, const MacAddr& mac)
         g_arpCache[g_arpCount].valid = true;
         g_arpCount++;
     }
+    SpinLockRelease(&g_arpLock, flags);
 }
 
 static bool ArpCacheLookup(uint32_t ip, MacAddr* out)
 {
+    uint64_t flags = SpinLockAcquire(&g_arpLock);
     for (uint32_t i = 0; i < g_arpCount; i++) {
         if (g_arpCache[i].ip == ip && g_arpCache[i].valid) {
             *out = g_arpCache[i].mac;
+            SpinLockRelease(&g_arpLock, flags);
             return true;
         }
     }
+    SpinLockRelease(&g_arpLock, flags);
     return false;
 }
 
@@ -341,7 +348,7 @@ int NetSendIpv4(uint32_t dstIp, uint8_t proto,
         auto* ip = reinterpret_cast<Ipv4Header*>(frame + sizeof(EthHeader));
         ip->verIhl   = 0x45;
         ip->totalLen = htons(static_cast<uint16_t>(ipLen));
-        ip->id       = htons(g_ipId++);
+        ip->id       = htons(__atomic_fetch_add(&g_ipId, 1, __ATOMIC_RELAXED));
         ip->flagsFrag = htons(0x4000);
         ip->ttl      = 64;
         ip->protocol = proto;
@@ -384,7 +391,7 @@ int NetSendIpv4(uint32_t dstIp, uint8_t proto,
     ip->verIhl   = 0x45;
     ip->tos      = 0;
     ip->totalLen = htons(static_cast<uint16_t>(ipLen));
-    ip->id       = htons(g_ipId++);
+    ip->id       = htons(__atomic_fetch_add(&g_ipId, 1, __ATOMIC_RELAXED));
     ip->flagsFrag = htons(0x4000);
     ip->ttl      = 64;
     ip->protocol = proto;
@@ -676,7 +683,7 @@ static void DhcpSend(uint8_t msgType, uint32_t serverIp, uint32_t requestedIp)
 
     ip->verIhl    = 0x45;
     ip->totalLen  = htons(static_cast<uint16_t>(ipLen));
-    ip->id        = htons(g_ipId++);
+    ip->id        = htons(__atomic_fetch_add(&g_ipId, 1, __ATOMIC_RELAXED));
     ip->flagsFrag = htons(0x4000);
     ip->ttl       = 64;
     ip->protocol  = IP_PROTO_UDP;
@@ -1061,7 +1068,8 @@ static const uint8_t* DnsSkipName(const uint8_t* p, const uint8_t* end)
     while (p < end) {
         uint8_t len = *p;
         if (len == 0) return p + 1;
-        if ((len & 0xC0) == 0xC0) return p + 2; // compression pointer
+        if ((len & 0xC0) == 0xC0) return (p + 2 <= end) ? p + 2 : nullptr;
+        if (p + 1 + len > end) return nullptr;
         p += 1 + len;
     }
     return nullptr;
@@ -1088,7 +1096,7 @@ static uint32_t DnsParseResponse(const uint8_t* data, uint32_t len, uint16_t exp
     // Skip question section
     for (uint16_t i = 0; i < qdCount && p < end; i++) {
         p = DnsSkipName(p, end);
-        if (!p) return 0;
+        if (!p || p + 4 > end) return 0;
         p += 4; // QTYPE + QCLASS
     }
 
@@ -2121,7 +2129,8 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             child.listenSockIdx = static_cast<int>(i);
 
             // Generate ISS for the server side
-            child.tcpSndIss = static_cast<uint32_t>(g_ipId) * 64000 +
+            // NOTE: predictable ISS — acceptable for hobby OS, not production-safe
+            child.tcpSndIss = static_cast<uint32_t>(__atomic_load_n(&g_ipId, __ATOMIC_RELAXED)) * 64000 +
                               ntohs(srcPort) + ntohs(dstPort);
             child.tcpSndNxt = child.tcpSndIss + 1; // after SYN-ACK
             child.tcpSndUna = child.tcpSndIss;
@@ -2217,7 +2226,7 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
 
     // Initialize TCP state
     // Use a simple ISS from the IP ID counter + port for uniqueness
-    s.tcpSndIss = static_cast<uint32_t>(g_ipId) * 12345 +
+    s.tcpSndIss = static_cast<uint32_t>(__atomic_load_n(&g_ipId, __ATOMIC_RELAXED)) * 12345 +
                   ntohs(s.localPort) * 67890;
     s.tcpSndNxt = s.tcpSndIss;
     s.tcpSndUna = s.tcpSndIss;
@@ -2700,7 +2709,7 @@ static void DebugChannelThreadFn(void* /*arg*/)
         s.bound     = true;
     }
 
-    s.tcpSndIss  = static_cast<uint32_t>(g_ipId) * 12345 + ntohs(s.localPort) * 67890;
+    s.tcpSndIss  = static_cast<uint32_t>(__atomic_load_n(&g_ipId, __ATOMIC_RELAXED)) * 12345 + ntohs(s.localPort) * 67890;
     s.tcpSndNxt  = s.tcpSndIss;
     s.tcpSndUna  = s.tcpSndIss;
     s.tcpRcvNxt  = 0;
