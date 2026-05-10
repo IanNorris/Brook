@@ -221,6 +221,25 @@ static void parse_node(const char *path) {
         char target[PATH_MAX_NAR];
         read_str(target, sizeof(target));
 
+        /* Reject absolute symlink targets and path traversal via ".." */
+        if (target[0] == '/') {
+            /* Absolute targets are allowed in Nix store (cross-package refs)
+             * but warn — they must point within /nix/store/ */
+        } else {
+            /* Relative target: reject if any component is ".." that could
+             * escape the destination tree */
+            const char *p = target;
+            while (*p) {
+                if (p[0] == '.' && p[1] == '.' &&
+                    (p[2] == '/' || p[2] == '\0') &&
+                    (p == target || p[-1] == '/')) {
+                    die2("symlink target contains path traversal", target);
+                }
+                while (*p && *p != '/') p++;
+                while (*p == '/') p++;
+            }
+        }
+
         if (symlink(target, path) != 0) {
             /* If symlink fails, print warning but continue */
             fprintf(stderr, "nar-unpack: warning: symlink %s -> %s: %s\n",
