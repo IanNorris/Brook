@@ -4364,6 +4364,8 @@ static int64_t sys_clone3(uint64_t argsPtr, uint64_t size, uint64_t,
 {
     if (!argsPtr || size < offsetof(CloneArgs, tls) + sizeof(uint64_t))
         return -EINVAL;
+    if (!UserBufferReadable(argsPtr, size))
+        return -EFAULT;
 
     const CloneArgs* ca = reinterpret_cast<const CloneArgs*>(argsPtr);
 
@@ -4655,9 +4657,15 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
 
     if (argvAddr)
     {
+        // Validate argv array is readable (at least one pointer for NULL sentinel)
+        if (!UserBufferReadable(argvAddr, sizeof(char*)))
+            return -EFAULT;
         auto** userArgv = reinterpret_cast<const char**>(argvAddr);
         for (int i = 0; i < MAX_EXEC_ARGS - 1; i++)
         {
+            // Validate next pointer slot is readable
+            if (!UserBufferReadable(argvAddr + i * sizeof(char*), sizeof(char*)))
+                break;
             const char* arg = userArgv[i];
             if (!arg) break;
 
@@ -5384,7 +5392,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     // live in the same 0x54xx range as terminal ioctls.
     if (cmd == 0x5421) // FIONBIO
     {
-        if (arg < 0x1000) return -EFAULT;
+        if (!UserBufferReadable(arg, sizeof(int))) return -EFAULT;
         bool nonblock = *reinterpret_cast<int*>(arg) != 0;
         if (fde->type == FdType::Socket || fde->type == FdType::UnixSocket ||
             fde->type == FdType::Pipe || fde->type == FdType::DevTty) {
@@ -5401,7 +5409,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
 
     if (cmd == 0x541B) // FIONREAD
     {
-        if (arg < 0x1000) return -EFAULT;
+        if (!UserBufferWritable(arg, sizeof(int))) return -EFAULT;
         int available = 0;
         if (fde->type == FdType::Pipe && fde->handle) {
             auto* pipe = (fde->flags == 2)
@@ -5466,6 +5474,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
 
         if (cmd == FBIOGET_VSCREENINFO)
         {
+            if (!UserBufferWritable(arg, sizeof(FbVarScreeninfo))) return -EFAULT;
             auto* info = reinterpret_cast<FbVarScreeninfo*>(arg);
             auto* raw = reinterpret_cast<uint8_t*>(info);
             for (uint64_t i = 0; i < sizeof(FbVarScreeninfo); ++i) raw[i] = 0;
@@ -5485,6 +5494,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
 
         if (cmd == FBIOGET_FSCREENINFO)
         {
+            if (!UserBufferWritable(arg, sizeof(FbFixScreeninfo))) return -EFAULT;
             auto* info = reinterpret_cast<FbFixScreeninfo*>(arg);
             auto* raw = reinterpret_cast<uint8_t*>(info);
             for (uint64_t i = 0; i < sizeof(FbFixScreeninfo); ++i) raw[i] = 0;
@@ -5507,6 +5517,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
             // Honor requested xres/yres: resize the process VFB and its
             // associated WM window so the renderer blits 1:1.
             const auto* info = reinterpret_cast<const FbVarScreeninfo*>(arg);
+            if (!UserBufferReadable(arg, sizeof(FbVarScreeninfo))) return -EFAULT;
             uint32_t newW = info->xres;
             uint32_t newH = info->yres;
             if (newW == 0 || newH == 0) return -EINVAL;
@@ -5642,6 +5653,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         // TIOCGWINSZ
         if (cmd == 0x5413)
         {
+            if (!UserBufferWritable(arg, 4 * sizeof(uint16_t))) return -EFAULT;
             auto* ws = reinterpret_cast<uint16_t*>(arg);
             Terminal* term = TerminalFindByProcess(proc);
             ws[0] = term ? static_cast<uint16_t>(term->rows) : 25;
@@ -5759,6 +5771,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     if (isTtyFd && cmd == 0x5413)
     {
         struct winsize { uint16_t ws_row, ws_col, ws_xpixel, ws_ypixel; };
+        if (!UserBufferWritable(arg, sizeof(winsize))) return -EFAULT;
         auto* ws = reinterpret_cast<winsize*>(arg);
         Terminal* term = TerminalFindByProcess(proc);
         ws->ws_row = term ? static_cast<uint16_t>(term->rows) : 25;
@@ -5794,6 +5807,9 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
             dsp->bufferOffset = 0;
             return 0;
         }
+
+        // All remaining DSP ioctls use arg as a pointer — validate it
+        if (!UserBufferWritable(arg, sizeof(int))) return -EFAULT;
 
         // SNDCTL_DSP_SPEED — set/get sample rate
         if (cmd == SNDCTL_DSP_SPEED)
@@ -5839,6 +5855,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         if (cmd == SNDCTL_DSP_GETOSPACE)
         {
             struct audio_buf_info { int fragments; int fragstotal; int fragsize; int bytes; };
+            if (!UserBufferWritable(arg, sizeof(audio_buf_info))) return -EFAULT;
             auto* info = reinterpret_cast<audio_buf_info*>(arg);
             uint32_t queued = AudioGetPosition();
             uint32_t avail = queued < DSP_REPORT_BUFFER_SIZE
@@ -10295,6 +10312,8 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
     }
 
     if (op == FUTEX_WAKE_OP) {
+        if (!UserBufferWritable(arg5, sizeof(uint32_t)))
+            return -EFAULT;
         auto* uaddr2 = reinterpret_cast<volatile uint32_t*>(arg5);
         uint32_t encoded = static_cast<uint32_t>(arg6);
         uint32_t opCode = (encoded >> 28) & 0xF;
@@ -10342,6 +10361,8 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
     }
 
     if (op == FUTEX_WAIT || op == FUTEX_WAIT_BITSET) {
+        if (!UserBufferReadable(uaddrVal, sizeof(uint32_t)))
+            return -EFAULT;
         auto* uaddr = reinterpret_cast<volatile uint32_t*>(uaddrVal);
 
         if (!proc) {
