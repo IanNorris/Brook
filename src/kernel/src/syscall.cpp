@@ -10334,9 +10334,12 @@ static int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
 
     // AF_INET6 (10) — not supported
     if (domain != AF_INET) {
-        extern volatile uint64_t g_lapicTickCount;
-        SerialPrintf("[NET_DIAG] socket_REJECTED t=%lums pid=%u tgid=%u domain=%lu type=0x%lx\n",
-                     g_lapicTickCount, proc->pid, proc->tgid, domain, type);
+        // Only log interesting rejections (AF_INET6), not AF_NETLINK spam
+        if (domain == 10) { // AF_INET6
+            extern volatile uint64_t g_lapicTickCount;
+            SerialPrintf("[NET_DIAG] socket_AF_INET6 t=%lums pid=%u tgid=%u type=0x%lx\n",
+                         g_lapicTickCount, proc->pid, proc->tgid, type);
+        }
         return -EAFNOSUPPORT;
     }
 
