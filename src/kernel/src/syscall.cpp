@@ -3458,6 +3458,9 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 
     // Trace file-backed mmaps during early process startup (ld-linux loading
     // shared libraries).  Rate-limited to first 200 per process.
+    // MMAP tracing disabled for now — too noisy during Ladybird loading.
+    // Re-enable when debugging specific mmap issues.
+#if 0
     {
         static uint32_t s_mmapTraceCount[256];
         uint16_t tid = proc->pid;
@@ -3469,6 +3472,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                          prot, flags, vn->cacheId);
         }
     }
+#endif
 
     // Private, non-writable file mappings are demand-paged.  This avoids
     // synchronously reading large shared libraries/resources at mmap() time.
@@ -7878,6 +7882,22 @@ static int64_t sys_epoll_wait(uint64_t epfd, uint64_t eventsAddr,
 
     if (maxevents <= 0 || maxevents > 1024) return -EINVAL;
 
+    // Check if this epoll watches any inet sockets (for NET_DIAG)
+    bool watchesInetSock = false;
+    for (int i = 0; i < ep->count; i++) {
+        if (ep->entries[i].fd < 0) continue;
+        FdEntry* wfde = FdGet(proc, ep->entries[i].fd);
+        if (wfde && wfde->type == FdType::Socket) { watchesInetSock = true; break; }
+    }
+    // Only log blocking epoll_wait (timeout != 0) to avoid tight-poll spam
+    bool logEpoll = watchesInetSock && static_cast<int64_t>(timeout_ms) != 0;
+    if (logEpoll) {
+        extern volatile uint64_t g_lapicTickCount;
+        SerialPrintf("[NET_DIAG] epoll_wait_enter t=%lums pid=%u tgid=%u timeout=%ld nfds=%d\n",
+                     g_lapicTickCount, proc->pid, proc->tgid,
+                     static_cast<int64_t>(timeout_ms), ep->count);
+    }
+
     // Allocate kernel-side event buffer
     auto* kEvents = static_cast<EpollEvent*>(
         kmalloc(sizeof(EpollEvent) * static_cast<uint32_t>(maxevents)));
@@ -7886,6 +7906,12 @@ static int64_t sys_epoll_wait(uint64_t epfd, uint64_t eventsAddr,
     int n = epoll_wait_impl(proc, ep, kEvents,
                              static_cast<int>(maxevents),
                              static_cast<int>(static_cast<int64_t>(timeout_ms)));
+
+    if (logEpoll) {
+        extern volatile uint64_t g_lapicTickCount;
+        SerialPrintf("[NET_DIAG] epoll_wait_return t=%lums pid=%u n=%d\n",
+                     g_lapicTickCount, proc->pid, n);
+    }
 
     if (n > 0) {
         if (eventsAddr < 0x1000) { kfree(kEvents); return -EFAULT; }
