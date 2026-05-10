@@ -2084,7 +2084,9 @@ static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath)
 
     DbgPrintf("ext2: MKDIR '%s'\n", relPath);
 
+    SerialPrintf("ext2: MKDIR '%s' acquiring write lock...\n", relPath);
     KRwLockWriteLock(&g_ext2Lock);
+    SerialPrintf("ext2: MKDIR '%s' write lock acquired\n", relPath);
 
     char name[256];
     uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name));

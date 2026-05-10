@@ -79,8 +79,9 @@ done
 # Remove old image if it exists (we're recreating from scratch)
 rm -f "${DISK_IMG}"
 
-# Create and format
-dd if=/dev/zero of="${DISK_IMG}" bs=1M count="${SIZE_MB}" status=progress 2>&1
+# Create and format — use truncate for sparse allocation so a 64GB virtual
+# disk only consumes actual data bytes on the host filesystem.
+truncate -s "${SIZE_MB}M" "${DISK_IMG}"
 mkfs.ext2 -q -b 4096 -L "NIXSTORE" "${DISK_IMG}"
 
 # Build all requested packages and collect closures
