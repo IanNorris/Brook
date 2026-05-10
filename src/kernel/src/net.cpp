@@ -1666,6 +1666,12 @@ void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
 
         SpinLockRelease(&s.lock, irqFlags);
 
+        // Log DNS delivery diagnostics
+        if (srcPort == 53) {
+            SerialPrintf("[NET_DIAG] udp_deliver_dns sock=%u rxCount=%u waiter=%s\n",
+                         i, s.rxCount, waiter ? "yes" : "NO");
+        }
+
         // Wake poll waiter after releasing the lock
         if (waiter) {
             __atomic_store_n(&waiter->pendingWakeup, 1, __ATOMIC_RELEASE);

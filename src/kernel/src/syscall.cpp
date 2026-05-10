@@ -2809,6 +2809,9 @@ int64_t CloseProcessFd(Process* proc, int fd)
     if (fde->type == FdType::Socket && fde->handle)
     {
         int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+        extern volatile uint64_t g_lapicTickCount;
+        SerialPrintf("[NET_DIAG] close t=%lums pid=%u tgid=%u fd=%d sockIdx=%d\n",
+                     g_lapicTickCount, proc->pid, proc->tgid, fd, sockIdx);
         brook::SockUnref(sockIdx);
     }
 
@@ -7597,6 +7600,13 @@ static int EpollScanReady(Process* proc, EpollInstance* ep,
         if (e.fd < 0) continue;
         uint32_t ready = EpollFdReady(proc, e.fd, e.events);
         if (ready) {
+            // Log inet socket epoll events (connect completion, DNS readable)
+            FdEntry* fde = FdGet(proc, e.fd);
+            if (fde && fde->type == FdType::Socket) {
+                extern volatile uint64_t g_lapicTickCount;
+                SerialPrintf("[NET_DIAG] epoll_ready t=%lums pid=%u fd=%d events=0x%x\n",
+                             g_lapicTickCount, proc->pid, e.fd, ready);
+            }
             events[n].events = ready;
             events[n].data.u64 = e.data;
             n++;
@@ -10340,6 +10350,16 @@ static int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
         SockClose(sockIdx);
         return -EMFILE;
     }
+
+    {
+        extern volatile uint64_t g_lapicTickCount;
+        int rawType = static_cast<int>(type & 0xFF);
+        SerialPrintf("[NET_DIAG] socket t=%lums pid=%u tgid=%u fd=%d type=%s%s\n",
+                     g_lapicTickCount, proc->pid, proc->tgid, fd,
+                     rawType == 1 ? "STREAM" : rawType == 2 ? "DGRAM" : "other",
+                     (type & 0x800) ? "|NONBLOCK" : "");
+    }
+
     DbgPrintf("sys_socket: fd=%d sockIdx=%d\n", fd, sockIdx);
     return fd;
 }
@@ -10497,7 +10517,19 @@ static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
                  brook::ntohs(uaddr->sin_port));
     // For UDP, "connect" just sets the default destination
     // For TCP, perform the 3-way handshake
-    return brook::SockConnect(sockIdx, uaddr);
+    int connectResult = brook::SockConnect(sockIdx, uaddr);
+    {
+        extern volatile uint64_t g_lapicTickCount;
+        SerialPrintf("[NET_DIAG] connect t=%lums pid=%u tgid=%u fd=%d -> %u.%u.%u.%u:%u = %d\n",
+                     g_lapicTickCount, proc->pid, proc->tgid, fd,
+                     (brook::ntohl(uaddr->sin_addr) >> 24) & 0xFF,
+                     (brook::ntohl(uaddr->sin_addr) >> 16) & 0xFF,
+                     (brook::ntohl(uaddr->sin_addr) >> 8) & 0xFF,
+                     brook::ntohl(uaddr->sin_addr) & 0xFF,
+                     brook::ntohs(uaddr->sin_port),
+                     connectResult);
+    }
+    return connectResult;
 }
 
 static int64_t sys_sendto(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
@@ -10586,6 +10618,17 @@ static int64_t sys_recvfrom(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
                             static_cast<uint32_t>(lenVal), src);
     if (ret > 0 && srcVal && addrLenVal >= 0x1000)
         *reinterpret_cast<uint32_t*>(addrLenVal) = sizeof(SockAddrIn);
+
+    // Log DNS response delivery to userspace
+    if (ret > 0) {
+        uint16_t sport = brook::ntohs(src->sin_port);
+        if (sport == 53) {
+            extern volatile uint64_t g_lapicTickCount;
+            SerialPrintf("[NET_DIAG] recvfrom_dns t=%lums pid=%u tgid=%u fd=%d len=%d\n",
+                         g_lapicTickCount, proc->pid, proc->tgid, fd, ret);
+        }
+    }
+
     if (ret < 0) return -EAGAIN;
     return static_cast<int64_t>(ret);
 }
@@ -10619,6 +10662,9 @@ static int64_t sys_getsockopt(uint64_t fdVal, uint64_t levelVal, uint64_t optnam
                 *lenPtr = 4;
             }
         }
+        extern volatile uint64_t g_lapicTickCount;
+        SerialPrintf("[NET_DIAG] getsockopt_SO_ERROR t=%lums pid=%u fd=%d err=%d\n",
+                     g_lapicTickCount, proc->pid, fd, err);
         return 0;
     }
 

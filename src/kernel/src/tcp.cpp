@@ -59,6 +59,12 @@ TcpAction TcpProcessSegment(Socket& s,
             s.connectError = 0; // success
             act.justConnected = true;
             act.sendAck = true;
+            {
+                extern volatile uint64_t g_lapicTickCount;
+                SerialPrintf("[NET_DIAG] tcp_established t=%lums lport=%u rport=%u nonblock=%d waiter=%s\n",
+                             g_lapicTickCount, ntohs(s.localPort), ntohs(s.remotePort),
+                             s.nonblock, s.pollWaiter ? "yes" : "no");
+            }
         } else if (flags & TCP_RST) {
             SerialPrintf("tcp: RST received in SynSent (lport=%u rport=%u) — connection refused\n",
                          ntohs(s.localPort), ntohs(s.remotePort));
