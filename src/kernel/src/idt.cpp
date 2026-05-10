@@ -900,7 +900,24 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         // SCHED/CLOSE/etc. messages don't interleave with this dump.
         ExcForceSerialLock();
         // Print all GPRs before delegating — HandleException only gets basic frame
-        ExcPutsRaw("\n=== KERNEL GPRs ===\n");
+        ExcPutsRaw("\n=== KERNEL FAULT ===\n");
+        ExcPutsRaw("  VEC ");
+        {
+            char vbuf[4] = {'0','0','0','\0'};
+            vbuf[0] = static_cast<char>('0' + (vector / 100) % 10);
+            vbuf[1] = static_cast<char>('0' + (vector / 10) % 10);
+            vbuf[2] = static_cast<char>('0' + vector % 10);
+            ExcPutsRaw(vbuf);
+        }
+        ExcPutsRaw(" (");
+        {
+            static const char* excNames[] = {
+                "#DE","#DB","NMI","#BP","#OF","#BR","#UD","#NM",
+                "#DF","---","#TS","#NP","#SS","#GP","#PF","---"
+            };
+            ExcPutsRaw(vector < 16 ? excNames[vector] : "???");
+        }
+        ExcPutsRaw(")\n");
         ExcPutsRaw("  RIP "); ExcPutHex(ef->rip); ExcPutsRaw("  RSP "); ExcPutHex(ef->rsp); ExcPutsRaw("\n");
         ExcPutsRaw("  ERR "); ExcPutHex(ef->errorCode); ExcPutsRaw("  RFLAGS "); ExcPutHex(ef->rflags); ExcPutsRaw("\n");
         ExcPutsRaw("  RAX "); ExcPutHex(ef->rax); ExcPutsRaw("  RBX "); ExcPutHex(ef->rbx); ExcPutsRaw("\n");
@@ -911,6 +928,22 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         ExcPutsRaw("  R10 "); ExcPutHex(ef->r10); ExcPutsRaw("  R11 "); ExcPutHex(ef->r11); ExcPutsRaw("\n");
         ExcPutsRaw("  R12 "); ExcPutHex(ef->r12); ExcPutsRaw("  R13 "); ExcPutHex(ef->r13); ExcPutsRaw("\n");
         ExcPutsRaw("  R14 "); ExcPutHex(ef->r14); ExcPutsRaw("  R15 "); ExcPutHex(ef->r15); ExcPutsRaw("\n");
+        // CR2 is essential for #PF diagnosis
+        {
+            uint64_t cr2val;
+            __asm__ volatile("movq %%cr2, %0" : "=r"(cr2val));
+            ExcPutsRaw("  CR2 "); ExcPutHex(cr2val); ExcPutsRaw("\n");
+        }
+        // Symbolicate faulting RIP
+        {
+            const char* symName = nullptr;
+            uint64_t symOff = 0;
+            if (brook::KsymFindByAddr(ef->rip, &symName, &symOff))
+            {
+                ExcPutsRaw("  SYM "); ExcPutsRaw(symName);
+                ExcPutsRaw("+0x"); ExcPutHex(symOff); ExcPutsRaw("\n");
+            }
+        }
 
         brook::Process* faultProc = brook::ProcessCurrent();
         if (faultProc && faultProc->kernelStackBase &&

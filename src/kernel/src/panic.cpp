@@ -225,12 +225,6 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
 {
     __asm__ volatile("cli");
 
-    // Halt all other CPUs first — they must stop before we touch FB/serial
-    brook::SmpHaltAllAPs();
-
-    // Stop the compositor so nothing overwrites the panic screen.
-    brook::CompositorHalt();
-
     int depth = __atomic_add_fetch(&g_panicNesting, 1, __ATOMIC_SEQ_CST);
     if (depth > 1)
     {
@@ -257,7 +251,9 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
     PanicFormatStr(g_panicBuf, static_cast<int>(sizeof(g_panicBuf)), fmt, args);
     __builtin_va_end(args);
 
-    // -- Serial output (always available) ------------------------------------
+    // -- Serial output FIRST (before SmpHaltAllAPs) --------------------------
+    // Print diagnostic info to serial before halting other CPUs.  If the
+    // NMI broadcast crashes (BRO-109), the panic reason is still captured.
     brook::SerialPuts("\n*** KERNEL PANIC ***\n");
     brook::SerialPuts("Brook OS "); brook::SerialPuts(brook::BuildDate());
     brook::SerialPuts(" ("); brook::SerialPuts(brook::BuildGitHash());
@@ -312,6 +308,13 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
         brook::SerialPuts("\n");
     }
     brook::SerialPuts("System halted.\n");
+
+    // Halt other CPUs AFTER serial output — if the NMI broadcast crashes,
+    // we've already printed the full diagnostic to serial.
+    brook::SmpHaltAllAPs();
+
+    // Stop the compositor so nothing overwrites the panic screen.
+    brook::CompositorHalt();
 
     // -- Visual panic screen (if framebuffer is up) ----------------------------
     // Use the physical framebuffer directly — the compositor's backbuffer
