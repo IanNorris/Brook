@@ -32,7 +32,8 @@ Uses `PROCESS_MAGIC` sentinel for use-after-free detection.
 - `state` (ProcessState): Ready, Running, Blocked, Stopped, Terminated
 - `schedNext/Prev`: Circular doubly-linked ready queue
 - `runningOnCpu`: CPU index (-1 = not running)
-- `cpuAffinity`: Pinned CPU (-1 = unset, required because no TLB shootdown)
+- `cpuAffinity`: Explicit CPU pin (-1 = any CPU; retained for future sched_setaffinity)
+- `tlbCpuMask`: Bitmask of CPUs with TLB entries for this process
 - `wakeupTick`: Timer-based wakeup
 - `syncNext`, `pendingWakeup`: Mutex/sync wait queue linkage
 
@@ -91,7 +92,7 @@ Uses `PROCESS_MAGIC` sentinel for use-after-free detection.
 |----------|----------|
 | `ProcessCreate(elfData, elfSize, argc, argv, envc, envp, stdFds)` | Creates a new process from an ELF binary. Allocates pid, kernel stack, page table, loads ELF + interpreter, sets up user stack with Linux ABI (argc/argv/envp/auxv), initializes TLS, wires fd 0/1/2. Returns Process* or null. |
 | `KernelThreadCreate(name, fn, arg, priority)` | Creates a ring-0 kernel thread. Uses kernel page table, no user stack. fn/arg stored on kernel stack for trampoline. |
-| `ProcessFork(parent, userRip, userRsp, userRflags)` | Copy-on-write fork. All user pages are shared via PmmRefPage; writable pages are marked RO+COW in both parent and child (local CR3 reload flushes stale TLB on affinity-pinned CPU). First write triggers COW page fault (handled in idt.cpp). Duplicates fd table with proper refcounting for pipes, vnodes, sockets, memfds, eventfds, epollfd, timerfds, unix sockets. |
+| `ProcessFork(parent, userRip, userRsp, userRflags)` | Copy-on-write fork. All user pages are shared via PmmRefPage; writable pages are marked RO+COW in both parent and child. TlbShootdownFull flushes stale TLB entries on all CPUs after PTE downgrade. First write triggers COW page fault (handled in idt.cpp). Duplicates fd table with proper refcounting for pipes, vnodes, sockets, memfds, eventfds, epollfd, timerfds, unix sockets. |
 | `ProcessCreateThread(parent, userRip, userRsp, userRflags, tlsBase)` | CLONE_VM\|CLONE_FILES thread. Shares page table, fd table, tgid. Gets own kernel stack and PID (TID). |
 | `CreateRemoteThread(target, entry, stackSize, argBytes, argLen)` | Injects a new thread into target's address space. Allocates stack in target's mmap region, copies arg data. Used for crash dump writers. |
 | `ProcessExec(proc, elfData, elfSize, argc, argv, envc, envp, outStackPtr)` | Replaces address space. Frees old page table, loads new ELF, resets mmap/brk, closes FD_CLOEXEC fds, resets signal handlers (SIG_IGN preserved). |
@@ -132,13 +133,13 @@ Uses `PROCESS_MAGIC` sentinel for use-after-free detection.
 
 3. **Self-copy in ProcessCreateThread**: Line 1344 copies `g_sigHandlers[parent->tgid]` to `g_sigHandlers[thread->tgid]`, but `thread->tgid == parent->tgid`, making this a no-op self-copy. Wasted work.
 
-4. **No lock on fd table**: FdAlloc/FdFree/FdGet have no synchronization. With CLONE_FILES threads sharing one fd table, concurrent open/close can race. Currently mitigated by SMP CPU affinity pinning, but will need a lock for true SMP.
+4. **No lock on fd table**: FdAlloc/FdFree/FdGet have no synchronization. With CLONE_FILES threads sharing one fd table, concurrent open/close can race. Will need a lock for true multi-threaded SMP processes.
 
 5. **ProcessSendSignal SIGKILL race**: Directly sets `state = Terminated` without holding any scheduler lock. If target is running on another CPU, the state change races with the scheduler's timer tick check.
 
 6. **MAX_PROCESSES = 256**: PID space is 8-bit effective range. `g_sigHandlers[256][64]` = 128KB static. Adequate for current workload but could be tight for complex app stacks (Ladybird spawns ~10 processes).
 
-7. **ProcessFork uses Copy-on-Write**: Writable pages are shared between parent and child as RO+COW. First write triggers a page fault that copies the page on demand. Parent TLB is flushed via local CR3 reload (safe because CPU affinity pinning guarantees the parent runs on a single CPU). TLB shootdown will be needed if affinity pinning is removed.
+7. **ProcessFork uses Copy-on-Write**: Writable pages are shared between parent and child as RO+COW. First write triggers a page fault that copies the page on demand. TlbShootdownFull flushes stale writable TLB entries on all CPUs after PTE downgrade. COW fault handler also calls TlbShootdown to invalidate the resolved page on remote CPUs.
 
 8. **TLS setup is duplicated**: Identical TLS allocation + initialization code appears in both ProcessCreate (~line 598-662) and ProcessExec (~line 1630-1687). Should be factored into a shared helper.
 

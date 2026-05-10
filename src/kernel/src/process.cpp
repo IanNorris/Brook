@@ -19,6 +19,7 @@
 #include "string.h"
 #include "spinlock.h"
 #include "smp.h"
+#include "apic.h"
 
 namespace brook {
 
@@ -508,6 +509,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     proc->state = ProcessState::Ready;
     proc->runningOnCpu = -1;
     proc->cpuAffinity = -1;
+    proc->tlbCpuMask = 0;
     proc->schedPriority = 2;  // SCHED_PRIORITY_NORMAL
 
     // Allocate shared fd table (shared across CLONE_FILES threads).
@@ -797,6 +799,7 @@ Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
     proc->state = ProcessState::Ready;
     proc->runningOnCpu = -1;
     proc->cpuAffinity = -1;
+    proc->tlbCpuMask = 0;
     proc->isKernelThread = true;
     proc->schedPriority = priority;
 
@@ -1008,10 +1011,8 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                     // COW fork: share writable pages between parent and
                     // child instead of copying.  Mark both PTEs read-only
                     // with PTE_COW_BIT set.  The page fault handler (idt.cpp)
-                    // copies on first write.  CPU affinity pinning guarantees
-                    // the parent runs on a single CPU, so a local CR3 reload
-                    // after the loop suffices to flush stale writable TLB
-                    // entries — no cross-CPU TLB shootdown needed.
+                    // copies on first write.  TlbShootdownFull after the
+                    // loop flushes stale writable TLB entries on all CPUs.
                     if (privateWritable)
                     {
                         // Downgrade parent PTE: clear writable, set COW bit.
@@ -1113,15 +1114,12 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                  static_cast<uint32_t>(srcPid), static_cast<uint32_t>(dstPid),
                  copiedCount, sharedCount, forkElapsed);
 
-    // Flush the parent's TLB to clear stale writable entries for pages
-    // we just downgraded to RO+COW.  CPU affinity pinning guarantees
-    // only one CPU has this address space loaded, so a local CR3 reload
-    // is sufficient — no cross-CPU TLB shootdown required.
+    // Flush all TLB entries for the parent's address space. Parent PTEs
+    // were downgraded from writable to RO+COW, so any stale writable
+    // entry on any CPU must be flushed.
     if (copiedCount > 0)
     {
-        uint64_t cr3;
-        __asm__ volatile("movq %%cr3, %0" : "=r"(cr3));
-        __asm__ volatile("movq %0, %%cr3" :: "r"(cr3) : "memory");
+        TlbShootdownFull(srcPt.pml4.raw());
     }
 
     return true;
@@ -1177,6 +1175,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->state = ProcessState::Ready;
     child->runningOnCpu = -1;
     child->cpuAffinity = -1;
+    child->tlbCpuMask = 0;
     child->reapable = false;
     child->compositorRegistered = false;
     child->schedNext = nullptr;
@@ -1400,6 +1399,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     thread->state = ProcessState::Ready;
     thread->runningOnCpu = -1;
     thread->cpuAffinity = leader->cpuAffinity;
+    thread->tlbCpuMask = 0;
     thread->reapable = false;
     thread->compositorRegistered = false;
     thread->schedNext = nullptr;
@@ -1671,25 +1671,27 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
 {
     if (!proc || proc->isKernelThread) return 0;
 
-    // Pin this process to the current CPU for the duration of the address
-    // space transition.  Without pinning, a preemption between the CR3
-    // switch to kernel page table and the new page table setup could leave
-    // stale user TLB entries on another CPU — allowing reads/writes to
-    // freed physical pages (BRO-133).
-    int32_t oldAffinity = __atomic_load_n(&proc->cpuAffinity, __ATOMIC_ACQUIRE);
-    uint32_t currentCpu = SmpCurrentCpuIndex();
-    __atomic_store_n(&proc->cpuAffinity, static_cast<int32_t>(currentCpu), __ATOMIC_RELEASE);
+    // TLB shootdown (below) flushes stale entries for the old address space
+    // on all remote CPUs before we destroy the page tables. This replaces
+    // the previous CPU pinning workaround for BRO-133.
 
     // Save the old page table and switch CR3 to the kernel's page table
     // BEFORE destroying the old one. This avoids a use-after-free: the
     // CPU's CR3 would point to a freed PML4 page otherwise.
     PageTable oldPt = proc->pageTable;
     PageTable kernelPt = VmmKernelCR3();
+
+    // Flush TLB entries for the old address space on all remote CPUs before
+    // we destroy the page tables and free the underlying physical pages.
+    TlbShootdownFull(oldPt.pml4.raw());
+
     __asm__ volatile("mov %0, %%cr3" : : "r"(kernelPt.pml4.raw()) : "memory");
 
     // 1. Free all user-space pages and destroy old page table.
     ProcessClearLazyMappings(proc);
     VmmDestroyUserPageTable(oldPt);
+    // Old address space is gone — reset TLB CPU mask
+    proc->tlbCpuMask = 0;
     // NOTE: PmmFreeByTag removed here. VmmDestroyUserPageTable already calls
     // PmmUnrefPage on every leaf PTE, which correctly frees pages at refcount=0
     // and preserves pages still referenced by the global file page cache.
@@ -1860,10 +1862,6 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     }
 
     *outStackPtr = userSP;
-
-    // Address space transition complete — new page table is fully set up.
-    // Restore the original CPU affinity.
-    __atomic_store_n(&proc->cpuAffinity, oldAffinity, __ATOMIC_RELEASE);
 
     // If dynamically linked, start at the interpreter's entry point;
     // otherwise, start at the main binary's entry.

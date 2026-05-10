@@ -177,6 +177,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         brook::ApicInit(madt.localApicPhysical);
         brook::IoApicInit(madt.ioApicPhysical, madt.ioApicGsiBase);
         brook::ApicInitReschedIpi();
+        brook::ApicInitTlbShootdown();
 
         // Read CMOS RTC to get wall-clock time before LAPIC timer starts.
         brook::RtcInit();
