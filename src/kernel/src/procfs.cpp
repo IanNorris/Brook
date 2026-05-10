@@ -397,10 +397,11 @@ static Vnode* GenCpuinfo()
     // Build flags string
     char flags[512];
     char* fp = flags;
+    char* fEnd = flags + sizeof(flags) - 1;
     auto addFlag = [&](bool cond, const char* name) {
         if (!cond) return;
-        if (fp > flags) *fp++ = ' ';
-        while (*name) *fp++ = *name++;
+        if (fp > flags && fp < fEnd) *fp++ = ' ';
+        while (*name && fp < fEnd) *fp++ = *name++;
     };
     // EDX flags
     addFlag(feat_edx & (1U << 0),  "fpu");
