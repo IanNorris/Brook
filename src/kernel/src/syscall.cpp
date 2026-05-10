@@ -9794,12 +9794,16 @@ static int64_t sys_brook_wm_set_title(uint64_t wmId, uint64_t titlePtr,
     buf[sizeof(buf) - 1] = '\0';
     {
         extern volatile uint64_t g_lapicTickCount;
+        extern volatile uint64_t g_blockCacheHits;
+        extern volatile uint64_t g_blockCacheMisses;
         SerialPrintf("[PROFILE] set_title t=%lums pid=%u '%s'"
                      " opens=%lu mmaps=%lu faults=%lu"
-                     " cache_hit=%lu cache_miss=%lu preloaded=%lu\n",
+                     " cache_hit=%lu cache_miss=%lu preloaded=%lu"
+                     " blkcache_hit=%lu blkcache_miss=%lu\n",
                      g_lapicTickCount, proc->pid, buf,
                      g_profOpenCount, g_profMmapCount, g_profFaultCount,
-                     g_profCacheHit, g_profCacheMiss, g_profPreloadPages);
+                     g_profCacheHit, g_profCacheMiss, g_profPreloadPages,
+                     g_blockCacheHits, g_blockCacheMisses);
     }
     brook::WmSetTitleById(proc, static_cast<uint32_t>(wmId), buf);
     return 0;

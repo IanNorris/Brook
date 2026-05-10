@@ -215,6 +215,17 @@ struct Ext2Mount {
     // Protected by direntCacheLock on SMP (same reason as inodeCacheLock).
     SpinLock direntCacheLock;
     void* direntCache;            // Ext2DirentCacheEntry[1024]; lazy-alloced
+
+    // --- Data block read cache ---
+    // Without this, every read() syscall hits disk even for blocks that
+    // were just read by another process (e.g. every GTK app re-reads
+    // libgtk-4.so).  Direct-mapped 8192 slots keyed on disk block
+    // number.  Each slot stores a full block (blockSize bytes).
+    // Invalidated on Ext2WriteBlock.  ~32 MB for 4KB blocks.
+    static constexpr uint32_t BLOCK_CACHE_SLOTS = 8192;
+    SpinLock blockCacheLock;
+    uint32_t* blockCacheBlockNum;  // [BLOCK_CACHE_SLOTS]; 0 = empty
+    uint8_t** blockCacheData;      // [BLOCK_CACHE_SLOTS]; lazy-alloced per slot
 };
 static constexpr uint32_t EXT2_INODE_CACHE_SIZE = 1024;
 static constexpr uint32_t EXT2_DIRENT_CACHE_SIZE = 1024;
@@ -278,12 +289,22 @@ static bool Ext2DevRead(Ext2Mount* mnt, uint64_t byteOffset, void* buf, uint64_t
     return true;
 }
 
-// Read a single block into buf.
+// Forward declarations for block cache helpers (defined after dirent cache).
+static bool Ext2BlockCacheLookup(Ext2Mount* mnt, uint32_t blockNum, void* buf);
+static void Ext2BlockCachePut(Ext2Mount* mnt, uint32_t blockNum, const void* buf);
+
+// Read a single block into buf. Checks the data block cache first.
 static bool Ext2ReadBlock(Ext2Mount* mnt, uint32_t blockNum, void* buf)
 {
     if (blockNum == 0) return false;
+    // Fast path: serve from cache
+    if (Ext2BlockCacheLookup(mnt, blockNum, buf)) return true;
+    // Cache miss: read from disk
     uint64_t off = static_cast<uint64_t>(blockNum) << mnt->blockShift;
-    return Ext2DevRead(mnt, off, buf, mnt->blockSize);
+    if (!Ext2DevRead(mnt, off, buf, mnt->blockSize)) return false;
+    // Populate cache with the freshly read block
+    Ext2BlockCachePut(mnt, blockNum, buf);
+    return true;
 }
 
 // Forward declarations for functions defined later but needed by write helpers
@@ -391,6 +412,65 @@ static void Ext2DirentCacheInvalidateParent(Ext2Mount* mnt, uint32_t parentIno)
     SpinLockRelease(&mnt->direntCacheLock, flags);
 }
 
+// --- Data block read cache helpers ---
+// Direct-mapped cache: slot = blockNum % BLOCK_CACHE_SLOTS.
+// On collision, the new block replaces the old one (simple, no chaining).
+
+// Cache hit/miss counters (atomic, lock-free) for diagnostics.
+volatile uint64_t g_blockCacheHits;
+volatile uint64_t g_blockCacheMisses;
+
+static inline uint32_t Ext2BlockCacheSlot(uint32_t blockNum)
+{
+    return blockNum & (Ext2Mount::BLOCK_CACHE_SLOTS - 1);
+}
+
+// Look up a cached data block. Returns true and copies into `buf` on hit.
+static bool Ext2BlockCacheLookup(Ext2Mount* mnt, uint32_t blockNum, void* buf)
+{
+    if (!mnt->blockCacheBlockNum) return false;
+    uint32_t slot = Ext2BlockCacheSlot(blockNum);
+    uint64_t flags = SpinLockAcquire(&mnt->blockCacheLock);
+    if (mnt->blockCacheBlockNum[slot] == blockNum && mnt->blockCacheData[slot]) {
+        memcpy(buf, mnt->blockCacheData[slot], mnt->blockSize);
+        SpinLockRelease(&mnt->blockCacheLock, flags);
+        __atomic_fetch_add(&g_blockCacheHits, 1, __ATOMIC_RELAXED);
+        return true;
+    }
+    SpinLockRelease(&mnt->blockCacheLock, flags);
+    __atomic_fetch_add(&g_blockCacheMisses, 1, __ATOMIC_RELAXED);
+    return false;
+}
+
+// Insert a data block into the cache. Replaces any existing entry in the slot.
+static void Ext2BlockCachePut(Ext2Mount* mnt, uint32_t blockNum, const void* buf)
+{
+    if (!mnt->blockCacheBlockNum) return;
+    uint32_t slot = Ext2BlockCacheSlot(blockNum);
+    uint64_t flags = SpinLockAcquire(&mnt->blockCacheLock);
+    if (!mnt->blockCacheData[slot]) {
+        mnt->blockCacheData[slot] = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+        if (!mnt->blockCacheData[slot]) {
+            SpinLockRelease(&mnt->blockCacheLock, flags);
+            return;
+        }
+    }
+    mnt->blockCacheBlockNum[slot] = blockNum;
+    memcpy(mnt->blockCacheData[slot], buf, mnt->blockSize);
+    SpinLockRelease(&mnt->blockCacheLock, flags);
+}
+
+// Invalidate a cached data block (e.g. after a write).
+static void Ext2BlockCacheInvalidate(Ext2Mount* mnt, uint32_t blockNum)
+{
+    if (!mnt->blockCacheBlockNum) return;
+    uint32_t slot = Ext2BlockCacheSlot(blockNum);
+    uint64_t flags = SpinLockAcquire(&mnt->blockCacheLock);
+    if (mnt->blockCacheBlockNum[slot] == blockNum)
+        mnt->blockCacheBlockNum[slot] = 0;
+    SpinLockRelease(&mnt->blockCacheLock, flags);
+}
+
 // Write a single block from buf.
 static bool Ext2WriteBlock(Ext2Mount* mnt, uint32_t blockNum, const void* buf)
 {
@@ -406,6 +486,8 @@ static bool Ext2WriteBlock(Ext2Mount* mnt, uint32_t blockNum, const void* buf)
         }
         SpinLockRelease(&mnt->indCacheLock, lf);
     }
+    // Invalidate the data block cache.
+    Ext2BlockCacheInvalidate(mnt, blockNum);
     return Ext2DevWrite(mnt, off, buf, mnt->blockSize);
 }
 
@@ -1211,6 +1293,14 @@ static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
         // full block. Find the longest run of contiguous file-blocks
         // mapping to contiguous disk-blocks (capped at MAX_RUN_BYTES
         // and at the data still requested).
+        //
+        // Before hitting disk, check if the first block is cached.
+        // If so, serve it from cache (breaks the run, but avoids I/O).
+        if (Ext2BlockCacheLookup(mnt, diskBlock, dst + bytesRead)) {
+            bytesRead += mnt->blockSize;
+            continue;
+        }
+
         uint32_t runBlocks = 1;
         uint32_t maxRun = static_cast<uint32_t>(remaining >> mnt->blockShift);
         if (maxRun > (MAX_RUN_BYTES >> mnt->blockShift))
@@ -1227,6 +1317,11 @@ static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
             SerialPrintf("ext2: coalesced read failed off=%lu len=%lu\n",
                          runOff, runBytes);
             break;
+        }
+        // Populate the block cache with each block from the coalesced read.
+        for (uint32_t b = 0; b < runBlocks; ++b) {
+            Ext2BlockCachePut(mnt, diskBlock + b,
+                              dst + bytesRead + (static_cast<uint64_t>(b) << mnt->blockShift));
         }
         bytesRead += runBytes;
     }
@@ -1673,6 +1768,24 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
     mnt->direntCache = kmalloc(EXT2_DIRENT_CACHE_SIZE * sizeof(Ext2DirentCacheEntry));
     if (mnt->direntCache) {
         memset(mnt->direntCache, 0, EXT2_DIRENT_CACHE_SIZE * sizeof(Ext2DirentCacheEntry));
+    }
+
+    // Data block read cache: 8192 direct-mapped slots.
+    // Pointer array ~64 KB; block buffers lazy-alloced on first use (~32 MB at full capacity).
+    mnt->blockCacheLock = SpinLock{};
+    mnt->blockCacheBlockNum = static_cast<uint32_t*>(
+        kmalloc(Ext2Mount::BLOCK_CACHE_SLOTS * sizeof(uint32_t)));
+    mnt->blockCacheData = static_cast<uint8_t**>(
+        kmalloc(Ext2Mount::BLOCK_CACHE_SLOTS * sizeof(uint8_t*)));
+    if (mnt->blockCacheBlockNum && mnt->blockCacheData) {
+        memset(mnt->blockCacheBlockNum, 0,
+               Ext2Mount::BLOCK_CACHE_SLOTS * sizeof(uint32_t));
+        memset(mnt->blockCacheData, 0,
+               Ext2Mount::BLOCK_CACHE_SLOTS * sizeof(uint8_t*));
+    } else {
+        // Non-fatal: cache just won't be used.
+        if (mnt->blockCacheBlockNum) { kfree(mnt->blockCacheBlockNum); mnt->blockCacheBlockNum = nullptr; }
+        if (mnt->blockCacheData) { kfree(mnt->blockCacheData); mnt->blockCacheData = nullptr; }
     }
 
     *mountPriv = mnt;
