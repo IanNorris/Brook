@@ -13,6 +13,7 @@
 #include "memory/physical_memory.h"
 #include "klog.h"
 #include "profiler.h"
+#include "window.h"
 #include "smp.h"
 #include "rtc.h"
 #include "apic.h"
@@ -2921,6 +2922,10 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "Execution:\n"
             "  exec <path>           - execute a shell script\n"
             "\n"
+            "Window manager:\n"
+            "  wm [list]             - list all windows\n"
+            "  wm focus IDX          - focus window by index\n"
+            "\n"
             "Syscall tracing:\n"
             "  strace <pid|name|all> [filter]  - enable strace\n"
             "  strace off <pid|name|all>       - disable strace\n"
@@ -3606,6 +3611,68 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
 
         else {
             DebugChannelSend("inject commands: click X Y, move X Y, key SC [ASCII], keydown SC, keyup SC, type TEXT, sleep MS, combo MOD+KEY\n");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // wm — window manager query commands
+    // -----------------------------------------------------------------------
+    else if (NetStrEq(cmd, "wm") || NetStrEq(cmd, "wm list")) {
+        char buf[256];
+        uint32_t count = WmWindowCount();
+        for (uint32_t i = 0; i < WM_MAX_WINDOWS; i++) {
+            Window* w = WmGetWindow(static_cast<int>(i));
+            if (!w || !w->proc) continue;
+
+            int p = 0;
+            const char* h = "  wm[";
+            for (int j = 0; h[j]; j++) buf[p++] = h[j];
+            p += UintToStr(buf + p, i);
+            const char* h2 = "] pid=";
+            for (int j = 0; h2[j]; j++) buf[p++] = h2[j];
+            p += UintToStr(buf + p, w->proc->pid);
+            const char* h3 = " \"";
+            for (int j = 0; h3[j]; j++) buf[p++] = h3[j];
+            for (int j = 0; w->title[j] && p < 200; j++) buf[p++] = w->title[j];
+            const char* h4 = "\" pos=";
+            for (int j = 0; h4[j]; j++) buf[p++] = h4[j];
+            p += IntToStr(buf + p, w->x);
+            buf[p++] = ',';
+            p += IntToStr(buf + p, w->y);
+            const char* h5 = " size=";
+            for (int j = 0; h5[j]; j++) buf[p++] = h5[j];
+            p += UintToStr(buf + p, w->clientW);
+            buf[p++] = 'x';
+            p += UintToStr(buf + p, w->clientH);
+            if (w->focused) {
+                const char* f = " [focused]";
+                for (int j = 0; f[j]; j++) buf[p++] = f[j];
+            }
+            if (w->minimized) {
+                const char* f = " [min]";
+                for (int j = 0; f[j]; j++) buf[p++] = f[j];
+            }
+            if (w->noChrome) {
+                const char* f = " [csd]";
+                for (int j = 0; f[j]; j++) buf[p++] = f[j];
+            }
+            buf[p++] = '\n';
+            SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
+        }
+        if (count == 0) {
+            DebugChannelSend("wm: no windows\n");
+        }
+    }
+
+    else if (StrStartsWith(cmd, "wm focus ")) {
+        uint32_t idx = 0;
+        ParseUint(cmd + 9, &idx);
+        Window* w = WmGetWindow(static_cast<int>(idx));
+        if (w && w->proc) {
+            WmSetFocus(static_cast<int>(idx));
+            DebugChannelSend("wm: focused\n");
+        } else {
+            DebugChannelSend("wm: invalid window index\n");
         }
     }
 
