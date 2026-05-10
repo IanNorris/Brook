@@ -162,6 +162,7 @@ EXPORT_SYMBOL(KernelPanic);
 EXPORT_SYMBOL(IdtInstallHandler);
 EXPORT_SYMBOL(IoApicUnmaskIrq);
 EXPORT_SYMBOL(IoApicRegisterHandler);
+EXPORT_SYMBOL(IoApicUnregisterHandler);
 EXPORT_SYMBOL(ApicSendEoi);
 
 // Network

@@ -19,6 +19,7 @@
 
 using brook::SerialPrintf;
 using brook::IoApicUnmaskIrq;
+using brook::IoApicMaskIrq;
 using brook::ApicSendEoi;
 
 // Global page-fault counter for profiling (shared with syscall.cpp)
@@ -1749,6 +1750,31 @@ uint8_t IoApicRegisterHandler(uint8_t irq, uint8_t preferredVector, void* handle
 
     SerialPrintf("IRQ: WARNING — shared IRQ table full\n");
     return preferredVector;
+}
+
+void IoApicUnregisterHandler(uint8_t irq, void* handler)
+{
+    SharedIrqEntry* entry = FindSharedIrq(irq);
+    if (!entry) return;
+
+    auto fn = reinterpret_cast<IrqHandlerFn>(handler);
+    for (int i = 0; i < entry->count; ++i)
+    {
+        if (entry->handlers[i] == fn)
+        {
+            // Shift remaining handlers down
+            for (int j = i; j < entry->count - 1; ++j)
+                entry->handlers[j] = entry->handlers[j + 1];
+            entry->handlers[--entry->count] = nullptr;
+
+            SerialPrintf("IRQ: unregistered handler from IRQ %u (vector %u, %u remaining)\n",
+                         irq, entry->vector, entry->count);
+
+            if (entry->count == 0)
+                IoApicMaskIrq(irq);
+            return;
+        }
+    }
 }
 
 void IdtInstallHandler(uint8_t vector, void* handler)

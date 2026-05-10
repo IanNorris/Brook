@@ -39,3 +39,6 @@ extern "C" void IdtInstallHandler(uint8_t vector, void* handler);
 // Returns the actual vector assigned (may differ from preferredVector if
 // the IRQ is already mapped).
 extern "C" uint8_t IoApicRegisterHandler(uint8_t irq, uint8_t preferredVector, void* handler);
+
+// Remove a handler from an IRQ chain. If the chain becomes empty, masks the IRQ.
+extern "C" void IoApicUnregisterHandler(uint8_t irq, void* handler);
