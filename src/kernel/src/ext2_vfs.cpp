@@ -124,6 +124,21 @@ struct Ext2DirEntry2 {
 // file_type values (used in readdir)
 static constexpr uint8_t EXT2_FT_DIR      = 2;
 
+// Validate a directory entry from untrusted disk data.
+// `pos` is the byte offset within the block, `blockSize` is the block size.
+// Returns false if the entry is corrupt (rec_len misaligned, too small, or
+// name_len exceeds rec_len).
+static inline bool Ext2DirEntryValid(const Ext2DirEntry2* de, uint32_t pos,
+                                     uint32_t blockSize)
+{
+    if (de->rec_len < 8)              return false; // minimum: header only
+    if ((de->rec_len & 3) != 0)       return false; // must be 4-byte aligned
+    if (pos + de->rec_len > blockSize) return false; // must not exceed block
+    if (de->inode != 0 && de->name_len > de->rec_len - 8)
+        return false; // name must fit in entry
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Mount-private state
 // ---------------------------------------------------------------------------
@@ -828,7 +843,7 @@ static bool Ext2DirAdd(Ext2Mount* mnt, uint32_t dirIno, Ext2Inode* dirData,
         uint32_t pos = 0;
         while (pos < mnt->blockSize) {
             auto* de = reinterpret_cast<Ext2DirEntry2*>(blockBuf + pos);
-            if (de->rec_len == 0) break;
+            if (!Ext2DirEntryValid(de, pos, mnt->blockSize)) break;
 
             // Calculate actual size of this entry
             uint32_t actualLen = ((8 + de->name_len + 3) / 4) * 4;
@@ -907,7 +922,7 @@ static uint32_t Ext2DirRemove(Ext2Mount* mnt, Ext2Inode* dirData,
         Ext2DirEntry2* prevDe = nullptr;
         while (pos < mnt->blockSize) {
             auto* de = reinterpret_cast<Ext2DirEntry2*>(blockBuf + pos);
-            if (de->rec_len == 0) break;
+            if (!Ext2DirEntryValid(de, pos, mnt->blockSize)) break;
 
             if (de->inode != 0 && de->name_len == nameLen) {
                 bool match = true;
@@ -1005,6 +1020,7 @@ static uint64_t Ext2InodeSize(const Ext2Inode* ino)
 static uint32_t Ext2ReadIndPointer(Ext2Mount* mnt, uint32_t indBlock, uint32_t idx)
 {
     if (!indBlock) return 0;
+    if (indBlock >= mnt->totalBlocks) return 0; // out-of-range block pointer
     uint32_t entry = 0;
     uint64_t lf = SpinLockAcquire(&mnt->indCacheLock);
 
@@ -1222,7 +1238,7 @@ static uint32_t Ext2DirLookup(Ext2Mount* mnt, uint32_t parentIno, const Ext2Inod
         uint32_t pos = 0;
         while (pos < mnt->blockSize && off + pos < dirSize) {
             auto* de = reinterpret_cast<Ext2DirEntry2*>(buf + pos);
-            if (de->rec_len == 0) break; // corrupt
+            if (!Ext2DirEntryValid(de, pos, mnt->blockSize)) break;
             if (de->inode != 0 && de->name_len == nameLen) {
                 bool match = true;
                 for (uint32_t i = 0; i < nameLen; ++i) {
@@ -1416,7 +1432,12 @@ static int Ext2DirReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
         if (r < 8) { KRwLockReadUnlock(&g_ext2Lock); return 0; } // end or error
 
         auto* de = reinterpret_cast<Ext2DirEntry2*>(entBuf);
-        if (de->rec_len == 0) { KRwLockReadUnlock(&g_ext2Lock); return 0; }
+        if (de->rec_len < 8 || (de->rec_len & 3) != 0) {
+            KRwLockReadUnlock(&g_ext2Lock); return 0;
+        }
+        if (de->inode != 0 && de->name_len > de->rec_len - 8) {
+            KRwLockReadUnlock(&g_ext2Lock); return 0;
+        }
 
         dp->readOffset += de->rec_len;
 
@@ -1515,6 +1536,18 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
     if (sb.s_magic != EXT2_SUPER_MAGIC) {
         SerialPrintf("ext2: bad magic 0x%x (expected 0xEF53) on %s\n",
                      sb.s_magic, dev->name);
+        return false;
+    }
+
+    // Sanity-check critical superblock fields to avoid division-by-zero or
+    // wildly oversized allocations from a corrupted image.
+    if (sb.s_blocks_per_group == 0 || sb.s_inodes_per_group == 0) {
+        SerialPrintf("ext2: corrupt superblock — blocks_per_group=%u inodes_per_group=%u\n",
+                     sb.s_blocks_per_group, sb.s_inodes_per_group);
+        return false;
+    }
+    if (sb.s_log_block_size > 6) { // max 64K blocks
+        SerialPrintf("ext2: unreasonable s_log_block_size=%u\n", sb.s_log_block_size);
         return false;
     }
 
