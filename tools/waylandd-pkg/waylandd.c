@@ -1067,10 +1067,15 @@ static struct brook_seat_client *seat_for_resource(struct wl_resource *r) {
 
 static void seat_apply_cursor_visibility(struct brook_seat_client *sc) {
     if (!sc || !sc->entered_surface) return;
-    long rc = wm_set_cursor_visible(sc->cursor_visible);
+    /* Always keep the kernel cursor visible.  Brook does not yet track
+     * cursor visibility per-window in the kernel WM, so calling
+     * wm_set_cursor_visible(0) would hide the cursor globally — even over
+     * the desktop and taskbar.  When a client calls set_cursor(NULL) we
+     * reset to the built-in arrow instead of hiding.  sc->cursor_visible
+     * still tracks the Wayland protocol state for cleanup paths. */
+    long rc = wm_set_cursor_visible(1);
     if (rc != 0) {
-        fprintf(stderr, "[waylandd] WM_SET_CURSOR_VISIBLE visible=%d failed rc=%ld\n",
-                sc->cursor_visible, rc);
+        fprintf(stderr, "[waylandd] WM_SET_CURSOR_VISIBLE visible=1 failed rc=%ld\n", rc);
     }
 }
 
