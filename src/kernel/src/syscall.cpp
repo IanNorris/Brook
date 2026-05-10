@@ -1615,6 +1615,9 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
         int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
         if (brook::SockIsStream(sockIdx))
         {
+            extern volatile uint64_t g_lapicTickCount;
+            SerialPrintf("[NET_DIAG] tcp_write t=%lums pid=%u fd=%lu len=%lu\n",
+                         g_lapicTickCount, proc->pid, fd, count);
             return brook::SockSend(sockIdx,
                                    reinterpret_cast<const void*>(bufAddr),
                                    static_cast<uint32_t>(count));
@@ -6806,6 +6809,40 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
                timeout == static_cast<uint64_t>(0xffffffffu);
     };
 
+    // [NET_DIAG] Log poll() calls from the networking process when watching inet sockets
+    bool logPoll = false;
+    {
+        for (uint64_t i = 0; i < nfds; i++) {
+            if (fds[i].fd < 0) continue;
+            FdEntry* fde = FdGet(proc, fds[i].fd);
+            if (fde && fde->type == FdType::Socket) { logPoll = true; break; }
+        }
+    }
+    if (logPoll) {
+        extern volatile uint64_t g_lapicTickCount;
+        SerialPrintf("[NET_DIAG] poll_enter t=%lums pid=%u tgid=%u timeout=%ld nfds=%lu fds=[",
+                     g_lapicTickCount, proc->pid, proc->tgid,
+                     static_cast<int64_t>(timeout_ms), nfds);
+        for (uint64_t i = 0; i < nfds && i < 8; i++) {
+            FdEntry* fde = fds[i].fd >= 0 ? FdGet(proc, fds[i].fd) : nullptr;
+            const char* tname = "?";
+            if (fde) {
+                switch (fde->type) {
+                    case FdType::Socket: tname = "inet"; break;
+                    case FdType::UnixSocket: tname = "unix"; break;
+                    case FdType::Pipe: tname = "pipe"; break;
+                    case FdType::EventFd: tname = "evfd"; break;
+                    case FdType::TimerFd: tname = "tmfd"; break;
+                    default: tname = "oth"; break;
+                }
+            }
+            SerialPrintf("%s%d(%s,ev=0x%x)", i ? "," : "",
+                         fds[i].fd, tname, fds[i].events);
+        }
+        if (nfds > 8) SerialPrintf(",... +%lu more", nfds - 8);
+        SerialPrintf("]\n");
+    }
+
 retry_poll:
     int ready = 0;
     for (uint64_t i = 0; i < nfds; i++)
@@ -7298,6 +7335,21 @@ retry_poll:
 
     if (ready == 0 && isInfiniteTimeout(timeout_ms))
         goto retry_poll;
+
+    if (logPoll && ready > 0) {
+        extern volatile uint64_t g_lapicTickCount;
+        SerialPrintf("[NET_DIAG] poll_return t=%lums pid=%u ready=%d revents=[",
+                     g_lapicTickCount, proc->pid, ready);
+        int logged = 0;
+        for (uint64_t i = 0; i < nfds && logged < 8; i++) {
+            if (fds[i].revents) {
+                SerialPrintf("%s%d(0x%x)", logged ? "," : "",
+                             fds[i].fd, fds[i].revents);
+                logged++;
+            }
+        }
+        SerialPrintf("]\n");
+    }
 
     return ready;
 }
