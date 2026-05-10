@@ -140,8 +140,12 @@ void CompositorDeferFreePages(uint64_t virtAddr, uint64_t pageCount)
     }
     DeferredFreeLockRelease(flags);
 
-    SerialPrintf("COMPOSITOR: deferred page-free queue full; leaking 0x%lx (%lu pages)\n",
+    // Queue full — free immediately rather than leak. The deferred queue
+    // exists to avoid freeing pages mid-blit, but an immediate free is
+    // safer than a permanent leak. Worst case: one frame of visual glitch.
+    SerialPrintf("COMPOSITOR: deferred page-free queue full; immediate free 0x%lx (%lu pages)\n",
                  virtAddr, pageCount);
+    VmmFreePages(VirtualAddress(virtAddr), pageCount);
 }
 
 // Global input "grabber" — set by waylandd via sys_brook_input_grab so it
