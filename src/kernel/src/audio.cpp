@@ -8,10 +8,12 @@
 #include "serial.h"
 #include "kprintf.h"
 #include "memory/heap.h"
+#include "spinlock.h"
 
 namespace brook {
 
 static const AudioDriver* g_audioDriver = nullptr;
+static SpinLock g_mixerLock;
 
 // --- Mixer state ---
 // Mix buffer holds accumulated frames (stereo int32 to avoid clipping during add).
@@ -25,6 +27,8 @@ static int32_t* g_mixBuf = nullptr;     // [MIXER_BUF_FRAMES * 2] (L/R interleav
 static uint32_t g_mixFrames = 0;        // high-water mark of frames written
 static uint32_t g_mixStreamPos[MIXER_MAX_STREAMS]; // per-stream write cursor
 static bool     g_mixerReady = false;
+
+static void AudioMixerFlushLocked();  // forward decl
 
 void AudioMixerInit()
 {
@@ -45,12 +49,14 @@ void AudioMixerSubmit(const int16_t* samples, uint32_t frameCount, uint32_t stre
     if (!g_mixerReady || !samples || frameCount == 0) return;
     if (streamId >= MIXER_MAX_STREAMS) streamId = 0;
 
+    uint64_t flags = SpinLockAcquire(&g_mixerLock);
+
     uint32_t writePos = g_mixStreamPos[streamId];
 
     // If this write won't fit, flush everything first
     if (writePos + frameCount > MIXER_BUF_FRAMES)
     {
-        AudioMixerFlush();
+        AudioMixerFlushLocked();
         writePos = 0;
     }
 
@@ -68,9 +74,12 @@ void AudioMixerSubmit(const int16_t* samples, uint32_t frameCount, uint32_t stre
     g_mixStreamPos[streamId] = writePos;
     if (writePos > g_mixFrames)
         g_mixFrames = writePos;
+
+    SpinLockRelease(&g_mixerLock, flags);
 }
 
-void AudioMixerFlush()
+// Internal flush — caller must hold g_mixerLock.
+static void AudioMixerFlushLocked()
 {
     if (!g_mixerReady || !g_audioDriver || !g_audioDriver->play || g_mixFrames == 0)
         return;
@@ -108,6 +117,13 @@ void AudioMixerFlush()
             g_mixStreamPos[i] -= flushedFrames;
     }
     g_mixFrames = 0;
+}
+
+void AudioMixerFlush()
+{
+    uint64_t flags = SpinLockAcquire(&g_mixerLock);
+    AudioMixerFlushLocked();
+    SpinLockRelease(&g_mixerLock, flags);
 }
 
 // --- Driver registration ---
