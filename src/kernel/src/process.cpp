@@ -959,6 +959,10 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
         PhysToVirt(srcPt.pml4).raw());
 
     [[maybe_unused]] uint64_t sharedCount = 0;
+    uint64_t copiedCount = 0;
+
+    extern volatile uint64_t g_lapicTickCount;
+    uint64_t forkStartTick = g_lapicTickCount;
 
     // Only copy user-half (PML4 entries 0..255)
     for (uint64_t i4 = 0; i4 < 256; i4++)
@@ -1015,9 +1019,7 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                             PhysToVirt(srcPhys).raw());
                         auto* dst = reinterpret_cast<uint8_t*>(
                             PhysToVirt(childPhys).raw());
-                        for (uint64_t b = 0; b < 4096; b += 8)
-                            *reinterpret_cast<uint64_t*>(dst + b) =
-                                *reinterpret_cast<const uint64_t*>(src + b);
+                        memcpy(dst, src, 4096);
 
                         uint64_t childPte = (childPhys.raw() & PTE_PHYS_MASK)
                                           | VMM_PRESENT
@@ -1048,6 +1050,7 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                         auto* dstPt4 = reinterpret_cast<uint64_t*>(
                             PhysToVirt(PhysicalAddress(dstPd[i2] & PTE_PHYS_MASK)).raw());
                         dstPt4[i1] = childPte;
+                        copiedCount++;
                         continue;
                     }
 
@@ -1100,8 +1103,11 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
         }
     }
 
-    DbgPrintf("FORK: shared %lu read-only pages (parent PID %u -> child PID %u)\n",
-                 sharedCount, static_cast<uint32_t>(srcPid), static_cast<uint32_t>(dstPid));
+    uint64_t forkElapsed = g_lapicTickCount - forkStartTick;
+    SerialPrintf("[PROFILE] fork_pages t=%lums pid=%u->%u copied=%lu shared=%lu elapsed=%lums\n",
+                 g_lapicTickCount,
+                 static_cast<uint32_t>(srcPid), static_cast<uint32_t>(dstPid),
+                 copiedCount, sharedCount, forkElapsed);
     return true;
 }
 
