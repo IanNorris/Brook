@@ -343,7 +343,8 @@ static void TermHandleCSI(Terminal* t, const char* params, int paramLen, char fi
     {
         if (params[i] >= '0' && params[i] <= '9')
         {
-            val = val * 10 + (params[i] - '0');
+            if (val < 100000) // clamp to sane range, prevent int overflow
+                val = val * 10 + (params[i] - '0');
             hasVal = true;
         }
         else if (params[i] == ';')
@@ -364,6 +365,8 @@ static void TermHandleCSI(Terminal* t, const char* params, int paramLen, char fi
         int col = (argCount >= 2 && args[1] > 0) ? args[1] - 1 : 0;
         if (row >= 0) t->curY = static_cast<uint32_t>(row);
         if (col >= 0) t->curX = static_cast<uint32_t>(col);
+        if (t->rows > 0 && t->curY >= t->rows) t->curY = t->rows - 1;
+        if (t->cols > 0 && t->curX >= t->cols) t->curX = t->cols - 1;
         break;
     }
     case 'J': // Erase in display
