@@ -458,6 +458,17 @@ struct EpollInstance {
     Process*   waiter; // process blocked in epoll_wait
 };
 
+// Helper: detect RequestServer process by name (PIDs change between boots)
+static inline bool IsRequestServer(const Process* p) {
+    if (!p || !p->name[0]) return false;
+    // Match ".RequestServer-wrapped" or "RequestServer" variants
+    const char* n = p->name;
+    for (int i = 0; n[i]; i++) {
+        if (n[i] == 'R' && n[i+1] == 'e' && n[i+2] == 'q' && n[i+3] == 'u') return true;
+    }
+    return false;
+}
+
 // memfd constants and data — defined here so sys_read/sys_write/fstat can use them
 static constexpr uint32_t MFD_CLOEXEC       = 0x0001u;
 [[maybe_unused]] static constexpr uint32_t MFD_ALLOW_SEALING = 0x0002u;
@@ -1570,20 +1581,20 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 Process* reader = pipe->readerWaiter;
                 if (reader)
                 {
-                    // [NET_DIAG] Log pipe writes that wake pid 13 (RequestServer)
-                    if (reader->pid == 13) {
+                    // [NET_DIAG] Log pipe writes that wake RequestServer
+                    if (IsRequestServer(reader)) {
                         extern volatile uint64_t g_lapicTickCount;
-                        SerialPrintf("[NET_DIAG] pipe_wake_13 t=%lums writer_pid=%u fd=%lu bytes=%u\n",
+                        SerialPrintf("[NET_DIAG] pipe_wake_RS t=%lums writer_pid=%u fd=%lu bytes=%u\n",
                                      g_lapicTickCount, proc ? proc->pid : 0,
                                      fd, chunk);
                     }
                     pipe->readerWaiter = nullptr;
                     WakeProcess(reader);
                 }
-                // [NET_DIAG] Log ALL pipe writes from pid 13 (catches self-pipe)
-                else if (proc && proc->pid == 13) {
+                // [NET_DIAG] Log ALL pipe writes from RequestServer (catches self-pipe)
+                else if (proc && IsRequestServer(proc)) {
                     extern volatile uint64_t g_lapicTickCount;
-                    SerialPrintf("[NET_DIAG] pipe_write_by_13 t=%lums fd=%lu bytes=%u\n",
+                    SerialPrintf("[NET_DIAG] pipe_write_RS t=%lums fd=%lu bytes=%u\n",
                                  g_lapicTickCount, fd, chunk);
                 }
                 PipeWakeEpoll(pipe);
@@ -6832,8 +6843,8 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
             FdEntry* fde = FdGet(proc, fds[i].fd);
             if (fde && fde->type == FdType::Socket) { hasInetSock = true; break; }
         }
-        // Always log for pid 13 (RequestServer) to catch pipe-only polls
-        logPoll = hasInetSock || (proc->pid == 13);
+        // Always log for RequestServer to catch pipe-only polls
+        logPoll = hasInetSock || IsRequestServer(proc);
     }
     if (logPoll) {
         extern volatile uint64_t g_lapicTickCount;
@@ -12073,7 +12084,7 @@ int64_t SyscallDispatchInternal(uint64_t num, uint64_t a0, uint64_t a1,
 
     // Mini-strace for tgid 13 (RequestServer) — skip poll/ppoll (NET_DIAG covers
     // those), mmap/mprotect/brk/sigaction/sigprocmask/rt_sigreturn (noise).
-    if (proc && proc->tgid == 13 &&
+    if (proc && IsRequestServer(proc) &&
         num != 7 && num != 271 &&                    // poll, ppoll
         num != 9 && num != 10 && num != 11 &&        // mmap, mprotect, munmap
         num != 12 && num != 28 &&                    // brk, madvise
