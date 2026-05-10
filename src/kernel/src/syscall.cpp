@@ -6809,14 +6809,18 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
                timeout == static_cast<uint64_t>(0xffffffffu);
     };
 
-    // [NET_DIAG] Log poll() calls from the networking process when watching inet sockets
+    // [NET_DIAG] Log poll() calls from pid 13 (RequestServer) always,
+    // or from any process when watching inet sockets
     bool logPoll = false;
+    bool hasInetSock = false;
     {
         for (uint64_t i = 0; i < nfds; i++) {
             if (fds[i].fd < 0) continue;
             FdEntry* fde = FdGet(proc, fds[i].fd);
-            if (fde && fde->type == FdType::Socket) { logPoll = true; break; }
+            if (fde && fde->type == FdType::Socket) { hasInetSock = true; break; }
         }
+        // Always log for pid 13 (RequestServer) to catch pipe-only polls
+        logPoll = hasInetSock || (proc->pid == 13);
     }
     if (logPoll) {
         extern volatile uint64_t g_lapicTickCount;
@@ -10645,6 +10649,9 @@ static int64_t sys_sendto(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
     // For connected TCP sockets, use SockSend (stream send)
     if (brook::SockIsStream(sockIdx))
     {
+        extern volatile uint64_t g_lapicTickCount;
+        SerialPrintf("[NET_DIAG] tcp_send t=%lums pid=%u fd=%d len=%lu\n",
+                     g_lapicTickCount, proc->pid, fd, lenVal);
         int ret = brook::SockSend(sockIdx,
                                    reinterpret_cast<const void*>(bufVal),
                                    static_cast<uint32_t>(lenVal));
