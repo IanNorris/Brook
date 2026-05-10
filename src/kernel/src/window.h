@@ -83,7 +83,7 @@ struct Window
     // the event is pushed here in addition to the legacy per-process queue.
     // Userspace drains via syscall WM_POP_INPUT.  Mouse coords are
     // *client-local* (0,0 = top-left of the window's client area).
-    static constexpr uint32_t WM_INPUT_QUEUE = 64;
+    static constexpr uint32_t WM_INPUT_QUEUE = 256;
     struct WmInputEvent {
         uint8_t  type;       // InputEventType
         uint8_t  scanCode;
