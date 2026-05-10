@@ -915,6 +915,7 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
     }
     PinUserAddressSpaceToCpu(newProc, cpu);
     newProc->state = ProcessState::Running;
+    __atomic_store_n(&newProc->runningOnCpu, static_cast<int32_t>(cpu), __ATOMIC_RELEASE);
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
 
     // Store requeue info in per-CPU state BEFORE context_switch.

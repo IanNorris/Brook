@@ -469,6 +469,7 @@ static inline bool IsRequestServer(const Process* p) {
     return false;
 }
 
+
 // memfd constants and data — defined here so sys_read/sys_write/fstat can use them
 static constexpr uint32_t MFD_CLOEXEC       = 0x0001u;
 [[maybe_unused]] static constexpr uint32_t MFD_ALLOW_SEALING = 0x0002u;
@@ -1746,11 +1747,22 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
                     extern volatile uint64_t g_lapicTickCount;
                     Process* ew = pipe->epollWaiter;
                     SerialPrintf("[NET_DIAG] unix_write t=%lums pid=%u fd=%d len=%lu "
-                                 "readerWaiter=%u epollWaiter=%u\n",
+                                 "readerWaiter=%u epollWaiter=%u "
+                                 "pipeCount=%u\n",
                                  g_lapicTickCount, caller->pid,
                                  static_cast<int>(fd), count,
                                  reader ? reader->pid : 0,
-                                 ew ? ew->pid : 0);
+                                 ew ? ew->pid : 0,
+                                 pipe->count());
+                    if (reader) {
+                        SerialPrintf("[NET_DIAG] unix_write_wake reader pid=%u name='%s' "
+                                     "state=%d tgid=%u cpu=%d pendWake=%d\n",
+                                     reader->pid, reader->name,
+                                     static_cast<int>(reader->state),
+                                     reader->tgid,
+                                     __atomic_load_n(&reader->runningOnCpu, __ATOMIC_ACQUIRE),
+                                     __atomic_load_n(&reader->pendingWakeup, __ATOMIC_ACQUIRE));
+                    }
                 }
                 if (reader) {
                     pipe->readerWaiter = nullptr;
@@ -7174,6 +7186,7 @@ retry_poll:
                 self->wakeupTick = g_lapicTickCount + 50;
             }
             SchedulerBlock(self);
+
             if (HasPendingSignals())
             {
                 // Clean up waiters before returning
@@ -7373,8 +7386,9 @@ retry_poll:
         }
     }
 
-    if (ready == 0 && isInfiniteTimeout(timeout_ms))
+    if (ready == 0 && isInfiniteTimeout(timeout_ms)) {
         goto retry_poll;
+    }
 
     if (logPoll && ready > 0) {
         extern volatile uint64_t g_lapicTickCount;
@@ -10261,7 +10275,13 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
 {
     int op = static_cast<int>(opVal) & ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
     Process* proc = ProcessCurrent();
-    uint64_t owner = (opVal & FUTEX_PRIVATE_FLAG) && proc ? proc->tgid : 0;
+    // FUTEX_PRIVATE_FLAG is a performance hint on Linux — it tells the kernel
+    // to skip physical-page lookup and use (mm, vaddr) directly.  The flag must
+    // NOT change matching behavior for threads in the same address space.
+    // Brook threads always share their leader's page table, so the owner is
+    // always tgid regardless of the private flag.  A non-private wait must
+    // still be woken by a private wake from a sibling thread.
+    uint64_t owner = proc ? proc->tgid : 0;
 
     if (op == FUTEX_WAKE || op == FUTEX_WAKE_BITSET) {
         uint32_t maxWake = static_cast<uint32_t>(val);
@@ -12075,6 +12095,7 @@ int64_t SyscallDispatchInternal(uint64_t num, uint64_t a0, uint64_t a1,
                                  uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
 {
     Process* proc = ProcessCurrent();
+
     if (proc && proc->straceEnabled)
     {
         // If a filter is set, only trace matching categories
