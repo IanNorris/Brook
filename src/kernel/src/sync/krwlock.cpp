@@ -68,14 +68,23 @@ void KRwLockInit(KRwLock* rw)
 
 void KRwLockReadLock(KRwLock* rw)
 {
-    Process* self = SchedulerCurrentProcess();
-    if (!self) return;
-
     uint64_t flags = RwGuardAcquire(rw);
 
     // Grant immediately if no writer is active and none waiting.
     if (!rw->writerActive && rw->writersWaiting == 0)
     {
+        rw->readerCount++;
+        RwGuardRelease(rw, flags);
+        return;
+    }
+
+    // Must block — need a valid process context.
+    Process* self = SchedulerCurrentProcess();
+    if (!self) {
+        // No process context (early boot / ISR) — grant anyway to avoid
+        // underflow when ReadUnlock is called later.  This is safe only
+        // because the writer that triggered the wait is in a process that
+        // hasn't been scheduled yet.
         rw->readerCount++;
         RwGuardRelease(rw, flags);
         return;
@@ -110,14 +119,22 @@ void KRwLockReadUnlock(KRwLock* rw)
 
 void KRwLockWriteLock(KRwLock* rw)
 {
-    Process* self = SchedulerCurrentProcess();
-    if (!self) return;
-
     uint64_t flags = RwGuardAcquire(rw);
 
     // Grant immediately if no readers and no writer active.
     if (rw->readerCount == 0 && !rw->writerActive)
     {
+        rw->writerActive = 1;
+        RwGuardRelease(rw, flags);
+        return;
+    }
+
+    // Must block — need a valid process context.
+    Process* self = SchedulerCurrentProcess();
+    if (!self) {
+        // No process context — cannot sleep.  Force-grant to avoid hang.
+        // This should only happen during very early boot before any
+        // contention is possible.
         rw->writerActive = 1;
         RwGuardRelease(rw, flags);
         return;

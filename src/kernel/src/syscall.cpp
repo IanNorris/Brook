@@ -8480,10 +8480,7 @@ static int64_t sys_mkdir(uint64_t pathAddr, uint64_t, uint64_t,
     if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
     const char* path = pathBuf;
 
-    SerialPrintf("sys_mkdir: '%s' pid=%u\n", path, ProcessCurrent()->pid);
-
     int rc = VfsMkdir(path);
-    SerialPrintf("sys_mkdir: '%s' VfsMkdir=%d\n", path, rc);
     if (rc == 0) return 0;
 
     char bootPath[256] = "/boot";
@@ -8492,7 +8489,6 @@ static int64_t sys_mkdir(uint64_t pathAddr, uint64_t, uint64_t,
         bootPath[bi++] = *p;
     bootPath[bi] = '\0';
     rc = VfsMkdir(bootPath);
-    SerialPrintf("sys_mkdir: '%s' boot-fallback=%d\n", path, rc);
     if (rc == 0) return 0;
 
     return -ENOENT;

@@ -528,14 +528,8 @@ int VfsMkdir(const char* path)
     if (!path || !path[0]) return -1;
     const char* relPath = nullptr;
     MountEntry* mount = FindMount(path, &relPath);
-    if (!mount || !mount->fsOps || !mount->fsOps->mkdir) {
-        SerialPrintf("VfsMkdir: '%s' no mount/op (mount=%p)\n", path, mount);
-        return -1;
-    }
-    SerialPrintf("VfsMkdir: '%s' -> mount='%s' rel='%s'\n", path, mount->mountPoint, relPath);
-    int rc = mount->fsOps->mkdir(mount->mountPriv, mount->pdrv, relPath);
-    SerialPrintf("VfsMkdir: '%s' result=%d\n", path, rc);
-    return rc;
+    if (!mount || !mount->fsOps || !mount->fsOps->mkdir) return -1;
+    return mount->fsOps->mkdir(mount->mountPriv, mount->pdrv, relPath);
 }
 
 int VfsRename(const char* oldPath, const char* newPath)
