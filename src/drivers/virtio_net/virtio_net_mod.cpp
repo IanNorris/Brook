@@ -34,6 +34,7 @@ MODULE_IMPORT_SYMBOL(VmmAllocPages);
 MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 MODULE_IMPORT_SYMBOL(VmmMapPage);
 MODULE_IMPORT_SYMBOL(IoApicRegisterHandler);
+MODULE_IMPORT_SYMBOL(IoApicUnregisterHandler);
 MODULE_IMPORT_SYMBOL(NetRegisterIf);
 MODULE_IMPORT_SYMBOL(NetReceive);
 
@@ -120,6 +121,7 @@ static volatile uint8_t* g_notifyCfg = nullptr;
 static volatile uint8_t* g_isrCfg    = nullptr;
 static volatile uint8_t* g_deviceCfg = nullptr;
 static uint32_t          g_notifyMultiplier = 0;
+static uint8_t           g_irqLine = 0;
 
 static inline void mmio_write8(volatile uint8_t* base, uint32_t off, uint8_t v)
 { *reinterpret_cast<volatile uint8_t*>(base + off) = v; }
@@ -682,6 +684,7 @@ static int VirtioNetModuleInit()
 
     // Set up IRQ
     uint32_t intLine = PciConfigRead32(dev.bus, dev.dev, dev.fn, 0x3C) & 0xFF;
+    g_irqLine = static_cast<uint8_t>(intLine);
     SerialPrintf("virtio_net: PCI interrupt line %u\n", intLine);
 
     IoApicRegisterHandler(static_cast<uint8_t>(intLine), VIRTIO_NET_IRQ_VECTOR,
@@ -716,7 +719,8 @@ static int VirtioNetModuleInit()
 
 static void VirtioNetModuleExit()
 {
-    SerialPuts("virtio_net: exit\n");
+    IoApicUnregisterHandler(g_irqLine, reinterpret_cast<void*>(VirtioNetIrqBody));
+    SerialPuts("virtio_net: exit (IRQ handler unregistered)\n");
 }
 
 DECLARE_MODULE("virtio_net", VirtioNetModuleInit, VirtioNetModuleExit,
