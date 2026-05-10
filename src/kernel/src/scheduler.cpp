@@ -213,6 +213,9 @@ static bool ProcessCanRunOnCpu(Process* proc, uint32_t cpu)
     return affinity < 0 || affinity == static_cast<int32_t>(cpu);
 }
 
+// Retained for future sched_setaffinity — not called during normal scheduling
+// now that TLB shootdown handles cross-CPU invalidation.
+[[maybe_unused]]
 static void PinUserAddressSpaceToCpu(Process* proc, uint32_t cpu)
 {
     if (!proc || proc->pid == 0 || proc->isKernelThread)
@@ -914,9 +917,10 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
         g_perCpu[cpu].cpuEnv->currentPid = newProc->pid;
         g_perCpu[cpu].cpuEnv->currentProcess = reinterpret_cast<uint64_t>(newProc);
     }
-    PinUserAddressSpaceToCpu(newProc, cpu);
     newProc->state = ProcessState::Running;
     __atomic_store_n(&newProc->runningOnCpu, static_cast<int32_t>(cpu), __ATOMIC_RELEASE);
+    // Track which CPUs have this process's TLB entries loaded
+    __atomic_or_fetch(&newProc->tlbCpuMask, 1ULL << cpu, __ATOMIC_RELEASE);
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
 
     // Store requeue info in per-CPU state BEFORE context_switch.
@@ -934,6 +938,11 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
                      (void*)oldFxAddr, (void*)newFxAddr);
         for (;;) __asm__ volatile("hlt");
     }
+
+    // Clear old process's TLB CPU mask bit — after CR3 switch, this CPU's TLB
+    // no longer has the old process's entries (different address spaces).
+    if (oldProc != newProc)
+        __atomic_and_fetch(&oldProc->tlbCpuMask, ~(1ULL << cpu), __ATOMIC_RELEASE);
 
     ProfilerContextSwitch(oldProc->pid, newProc->pid);
     context_switch(&oldProc->savedCtx, &newProc->savedCtx,
@@ -1246,15 +1255,17 @@ parent_done:
     __asm__ volatile("cli" ::: "memory");
 
     __atomic_store_n(&proc->runningOnCpu, (int32_t)-1, __ATOMIC_RELEASE);
+    // Exiting process will never run again — clear its TLB CPU mask
+    __atomic_and_fetch(&proc->tlbCpuMask, ~(1ULL << cpu), __ATOMIC_RELEASE);
 
     g_perCpu[cpu].currentProcess = next;
     if (g_perCpu[cpu].cpuEnv) {
         g_perCpu[cpu].cpuEnv->currentPid = next->pid;
         g_perCpu[cpu].cpuEnv->currentProcess = reinterpret_cast<uint64_t>(next);
     }
-    PinUserAddressSpaceToCpu(next, cpu);
     next->state = ProcessState::Running;
     __atomic_store_n(&next->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
+    __atomic_or_fetch(&next->tlbCpuMask, 1ULL << cpu, __ATOMIC_RELEASE);
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
     GdtSetTssRsp0ForCpu(cpu, next->kernelStackTop);
     SetSyscallStack(cpu, next->kernelStackTop);
@@ -1287,9 +1298,10 @@ parent_done:
 
     g_perCpu[cpu].currentProcess = first;
     if (g_perCpu[cpu].cpuEnv) { g_perCpu[cpu].cpuEnv->currentPid = first->pid; g_perCpu[cpu].cpuEnv->currentProcess = reinterpret_cast<uint64_t>(first); }
-    PinUserAddressSpaceToCpu(first, cpu);
+    
     first->state = ProcessState::Running;
     __atomic_store_n(&first->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
+    __atomic_or_fetch(&first->tlbCpuMask, 1ULL << cpu, __ATOMIC_RELEASE);
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
     GdtSetTssRsp0ForCpu(cpu, first->kernelStackTop);
     SetSyscallStack(cpu, first->kernelStackTop);
@@ -1351,9 +1363,10 @@ parent_done:
 
     g_perCpu[cpu].currentProcess = first;
     if (g_perCpu[cpu].cpuEnv) { g_perCpu[cpu].cpuEnv->currentPid = first->pid; g_perCpu[cpu].cpuEnv->currentProcess = reinterpret_cast<uint64_t>(first); }
-    PinUserAddressSpaceToCpu(first, cpu);
+    
     first->state = ProcessState::Running;
     __atomic_store_n(&first->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
+    __atomic_or_fetch(&first->tlbCpuMask, 1ULL << cpu, __ATOMIC_RELEASE);
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
     GdtSetTssRsp0ForCpu(cpu, first->kernelStackTop);
     SetSyscallStack(cpu, first->kernelStackTop);
