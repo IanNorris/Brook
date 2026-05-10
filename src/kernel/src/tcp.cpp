@@ -56,6 +56,7 @@ TcpAction TcpProcessSegment(Socket& s,
             s.tcpSndUna = ack;
             s.tcpState  = TcpState::Established;
             s.connected = true;
+            s.connectError = 0; // success
             act.justConnected = true;
             act.sendAck = true;
         } else if (flags & TCP_RST) {
@@ -64,6 +65,7 @@ TcpAction TcpProcessSegment(Socket& s,
             s.tcpState   = TcpState::Closed;
             s.connected  = false;
             s.tcpRstRecv = true;
+            s.connectError = 111; // ECONNREFUSED
         }
         break;
 

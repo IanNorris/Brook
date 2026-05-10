@@ -2185,7 +2185,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if (fde->type == FdType::Socket && fde->handle)
     {
         int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
-        bool nonblock = (fde->statusFlags & 0x800) != 0;
+        bool nonblock = (fde->statusFlags & 0x800) != 0 || brook::SockIsNonblock(sockIdx);
         if (brook::SockIsStream(sockIdx))
         {
             if (nonblock && brook::SockRxCount(sockIdx) == 0 && !brook::SockPollReady(sockIdx, true, false))
@@ -6762,7 +6762,9 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
     case F_GETFL:
         return fde->statusFlags;
     case F_SETFL:
-        // We don't really support changing flags yet, but return success
+        // Only O_NONBLOCK (0x800) and O_APPEND (0x400) are settable via F_SETFL.
+        // Access mode bits (O_RDONLY/O_WRONLY/O_RDWR) are preserved from open.
+        fde->statusFlags = (fde->statusFlags & 0x3) | (static_cast<uint32_t>(arg) & ~0x3u);
         return 0;
     default:
         return 0; // Unknown command, pretend success
@@ -10328,6 +10330,10 @@ static int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
                               static_cast<int>(protocol));
     if (sockIdx < 0) return -ENOMEM;
 
+    // Record nonblocking flag
+    if (type & 0x800) // SOCK_NONBLOCK
+        brook::SockSetNonblock(sockIdx, true);
+
     // Allocate an fd for this socket
     int fd = FdAlloc(proc, FdType::Socket, reinterpret_cast<void*>(static_cast<uintptr_t>(sockIdx + 1)));
     if (fd < 0) {
@@ -10564,7 +10570,7 @@ static int64_t sys_recvfrom(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
     // For TCP sockets, use SockRecv (stream receive)
     if (brook::SockIsStream(sockIdx))
     {
-        bool nonblock = fde && (fde->statusFlags & 0x800) != 0;
+        bool nonblock = (fde && (fde->statusFlags & 0x800) != 0) || brook::SockIsNonblock(sockIdx);
         if (nonblock && brook::SockRxCount(sockIdx) == 0 && !brook::SockPollReady(sockIdx, true, false))
             return -EAGAIN;
         int ret = brook::SockRecv(sockIdx,
@@ -10590,10 +10596,33 @@ static int64_t sys_setsockopt(uint64_t, uint64_t, uint64_t,
     return 0; // stub — pretend success
 }
 
-static int64_t sys_getsockopt(uint64_t, uint64_t, uint64_t,
-                               uint64_t, uint64_t, uint64_t)
+static int64_t sys_getsockopt(uint64_t fdVal, uint64_t levelVal, uint64_t optnameVal,
+                               uint64_t optvalAddr, uint64_t optlenAddr, uint64_t)
 {
-    return 0; // stub
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ENOSYS;
+
+    int fd = static_cast<int>(fdVal);
+    int level = static_cast<int>(levelVal);
+    int optname = static_cast<int>(optnameVal);
+
+    // SOL_SOCKET(1), SO_ERROR(4): return pending async connect error
+    if (level == 1 && optname == 4) {
+        int sockIdx = GetSockIdx(proc, fd);
+        if (sockIdx < 0) return 0; // not a socket, just return 0
+        int err = brook::SockGetConnectError(sockIdx);
+        if (optvalAddr >= 0x1000 && optlenAddr >= 0x1000) {
+            auto* valPtr = reinterpret_cast<int*>(optvalAddr);
+            auto* lenPtr = reinterpret_cast<uint32_t*>(optlenAddr);
+            if (*lenPtr >= 4) {
+                *valPtr = err;
+                *lenPtr = 4;
+            }
+        }
+        return 0;
+    }
+
+    return 0; // stub — pretend success for other options
 }
 
 static int64_t sys_getsockname(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,

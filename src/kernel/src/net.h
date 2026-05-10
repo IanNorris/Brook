@@ -262,6 +262,7 @@ struct Socket {
     uint16_t  remotePort;  // big-endian
     bool      bound;
     bool      connected;
+    bool      nonblock;    // SOCK_NONBLOCK — connect returns EINPROGRESS, recv returns EAGAIN
     // Receive buffer (ring buffer for incoming data).
     // 512 KB gives enough headroom for multi-MB NAR downloads: curl does TLS
     // crypto + pipes to xz while the server sends at line rate, so the kernel
@@ -299,6 +300,7 @@ struct Socket {
     uint16_t  tcpSndWnd;   // peer's advertised receive window (host-endian)
     volatile bool tcpFinRecv; // FIN received from peer
     volatile bool tcpRstRecv; // RST received from peer (→ ECONNRESET)
+    int       connectError;  // async connect() result for getsockopt(SO_ERROR)
     uint64_t tcpCloseWaitTick; // tick when socket entered CloseWait (for reaper)
 
     // Listen/accept queue (server-side)
@@ -350,6 +352,9 @@ bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite);
 bool SockPollHangup(int sockIdx);
 uint32_t SockRxCount(int sockIdx);
 void SockSetPollWaiter(int sockIdx, Process* waiter);
+void SockSetNonblock(int sockIdx, bool nonblock);
+bool SockIsNonblock(int sockIdx);
+int  SockGetConnectError(int sockIdx); // consume async connect error (SO_ERROR)
 void SockClose(int sockIdx);
 void SockRef(int sockIdx);    // increment refcount (fork/dup)
 void SockUnref(int sockIdx);  // decrement refcount, destroy at 0

@@ -1577,6 +1577,30 @@ void SockSetPollWaiter(int sockIdx, Process* waiter)
     g_sockets[sockIdx].pollWaiter = waiter;
 }
 
+void SockSetNonblock(int sockIdx, bool nonblock)
+{
+    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return;
+    if (!g_sockUsed[sockIdx]) return;
+    g_sockets[sockIdx].nonblock = nonblock;
+}
+
+bool SockIsNonblock(int sockIdx)
+{
+    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return false;
+    if (!g_sockUsed[sockIdx]) return false;
+    return g_sockets[sockIdx].nonblock;
+}
+
+int SockGetConnectError(int sockIdx)
+{
+    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return 0;
+    if (!g_sockUsed[sockIdx]) return 0;
+    Socket& s = g_sockets[sockIdx];
+    int err = s.connectError;
+    s.connectError = 0; // consumed
+    return err;
+}
+
 void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
                     uint32_t dstIp, uint16_t dstPort,
                     const void* data, uint32_t len)
@@ -2167,6 +2191,11 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
 
     if (s.type != SOCK_STREAM) return -95; // -EOPNOTSUPP
 
+    // Already connecting (nonblocking connect in progress)
+    if (s.tcpState == TcpState::SynSent) return -114; // EALREADY
+    // Already connected
+    if (s.tcpState == TcpState::Established) return -106; // EISCONN
+
     s.remoteIp   = addr->sin_addr;
     s.remotePort = addr->sin_port; // already big-endian
 
@@ -2188,6 +2217,7 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
     s.tcpRcvNxt = 0;
     s.tcpFinRecv = false;
     s.tcpRstRecv = false;
+    s.connectError = 0;
     s.tcpSndWnd  = 65535; // assume full window until server tells us otherwise
     s.tcpState = TcpState::SynSent;
 
@@ -2196,13 +2226,19 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
     s.tcpSndNxt++; // SYN consumes one sequence number
 
     extern volatile uint64_t g_lapicTickCount;
-    SerialPrintf("[PROFILE] tcp_connect t=%lums -> %u.%u.%u.%u:%u\n",
+    SerialPrintf("[PROFILE] tcp_connect t=%lums -> %u.%u.%u.%u:%u%s\n",
                  g_lapicTickCount,
                  (ntohl(s.remoteIp) >> 24) & 0xFF,
                  (ntohl(s.remoteIp) >> 16) & 0xFF,
                  (ntohl(s.remoteIp) >> 8) & 0xFF,
                  ntohl(s.remoteIp) & 0xFF,
-                 ntohs(s.remotePort));
+                 ntohs(s.remotePort),
+                 s.nonblock ? " (nonblock)" : "");
+
+    // Nonblocking: return immediately, application polls for completion
+    if (s.nonblock) {
+        return -115; // EINPROGRESS
+    }
 
     Process* self = SchedulerCurrentProcess();
 
