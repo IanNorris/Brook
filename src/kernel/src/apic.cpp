@@ -536,9 +536,14 @@ void ApicSendNmi(uint8_t targetApicId)
 
 void ApicBroadcastNmi()
 {
-    // Wait for previous IPI to be delivered
-    while (LapicRead(LapicReg::ICR_LO) & (1u << 12))
+    if (!g_lapicVirt) return; // LAPIC not initialized
+
+    // Wait for previous IPI to be delivered (with bounded timeout)
+    for (int i = 0; i < 100000; i++) {
+        if (!(LapicRead(LapicReg::ICR_LO) & (1u << 12)))
+            break;
         __asm__ volatile("pause");
+    }
 
     // Shorthand = 11 (all excluding self), delivery mode = NMI
     LapicWrite(LapicReg::ICR_LO, (0x3 << 18) | (0x4 << 8) | (1u << 14));
