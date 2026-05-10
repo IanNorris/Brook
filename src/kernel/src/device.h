@@ -79,6 +79,10 @@ extern "C" Device* DeviceFind(const char* name);
 // subsystem's cached state.
 extern "C" bool DeviceIsRegistered(Device* dev);
 
+// Verify device registry integrity (canaries + checksum).  Returns true if OK.
+// Logs diagnostic details on corruption.  Safe to call from timer tick context.
+extern "C" bool DeviceCheckIntegrity();
+
 // Iterate over all devices of a given type.
 // Calls cb(dev, ctx) for each match.  Stops if cb returns false.
 extern "C" void DeviceIterate(DeviceType type, bool (*cb)(Device* dev, void* ctx), void* ctx);

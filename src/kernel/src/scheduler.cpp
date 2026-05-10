@@ -13,6 +13,7 @@
 #include "spinlock.h"
 #include "sched_ops.h"
 #include "profiler.h"
+#include "device.h"
 
 #include <stdint.h>
 
@@ -970,6 +971,16 @@ void SchedulerTimerTick(bool allowPreempt)
         SchedLockRelease(g_allProcLock, alf_alarm);
 
         ReapTerminated();
+
+        // Periodically verify device registry integrity (~every 1000 ticks ≈ 1s).
+        // This catches silent BSS corruption early before it causes a #GP.
+        static uint32_t s_devCheckCounter = 0;
+        if (++s_devCheckCounter >= 1000)
+        {
+            s_devCheckCounter = 0;
+            DeviceCheckIntegrity();
+        }
+
         // Notify policy of time passing (for anti-starvation boosts etc.).
         uint64_t rlf_tick = SchedLockAcquire(g_readyLock);
         g_schedOps->Tick(g_schedState, g_lapicTickCount);
