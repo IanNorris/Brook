@@ -1570,8 +1570,21 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 Process* reader = pipe->readerWaiter;
                 if (reader)
                 {
+                    // [NET_DIAG] Log pipe writes that wake pid 13 (RequestServer)
+                    if (reader->pid == 13) {
+                        extern volatile uint64_t g_lapicTickCount;
+                        SerialPrintf("[NET_DIAG] pipe_wake_13 t=%lums writer_pid=%u fd=%lu bytes=%u\n",
+                                     g_lapicTickCount, proc ? proc->pid : 0,
+                                     fd, chunk);
+                    }
                     pipe->readerWaiter = nullptr;
                     WakeProcess(reader);
+                }
+                // [NET_DIAG] Log ALL pipe writes from pid 13 (catches self-pipe)
+                else if (proc && proc->pid == 13) {
+                    extern volatile uint64_t g_lapicTickCount;
+                    SerialPrintf("[NET_DIAG] pipe_write_by_13 t=%lums fd=%lu bytes=%u\n",
+                                 g_lapicTickCount, fd, chunk);
                 }
                 PipeWakeEpoll(pipe);
                 break;  // Return partial writes immediately
