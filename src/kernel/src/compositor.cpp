@@ -447,7 +447,7 @@ static void BlitProcess(Process* proc, bool forceAll)
     if (!src || proc->fbVfbWidth == 0) return;
     if (proc->state == ProcessState::Terminated) return;
     if (!forceAll && !proc->fbDirty) return;
-    proc->fbDirty = 0;
+    __atomic_store_n(&proc->fbDirty, 0, __ATOMIC_RELAXED);
 
     // One-time diagnostic: log first blit for each process
     static uint32_t s_blitLogMask = 0;
@@ -540,7 +540,7 @@ static void BlitProcessAt(Process* proc, int dstX0, int dstY0, bool forceAll,
     if (!src || proc->fbVfbWidth == 0) return;
     if (proc->state == ProcessState::Terminated) return;
     if (!forceAll && !proc->fbDirty) return;
-    proc->fbDirty = 0;
+    __atomic_store_n(&proc->fbDirty, 0, __ATOMIC_RELAXED);
 
     const uint32_t  srcW = proc->fbVfbWidth;
     const uint32_t  srcH = proc->fbVfbHeight;
@@ -979,7 +979,7 @@ static void CompositorLoopWM()
             if (blitW && blitH)
                 BlitWindowVfb(w->vfb, blitW, blitH, w->vfbStride,
                               w->clientX(), w->clientY());
-            w->vfbDirty = 0;
+            w->vfbDirty = 0;  // single-writer (compositor thread), no race
         }
         else if (p->state != ProcessState::Terminated && p->fbVfbWidth > 0)
         {
