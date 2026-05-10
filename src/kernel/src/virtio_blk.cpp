@@ -356,6 +356,11 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
     static constexpr uint32_t DMA_BUF_SIZE = VirtioBlkState::DMA_BUF_PAGES * 4096;
     static constexpr uint32_t SECTORS_PER_DMA = DMA_BUF_SIZE / SECTOR_SIZE; // 128
 
+    // Guard against offset+len overflow and reads past device end
+    uint64_t deviceBytes = s->sectorCount * SECTOR_SIZE;
+    if (offset >= deviceBytes) return 0;
+    if (len > deviceBytes - offset) len = deviceBytes - offset;
+
     uint64_t startSector = offset / SECTOR_SIZE;
     uint64_t endSector   = (offset + len + SECTOR_SIZE - 1) / SECTOR_SIZE;
 
@@ -460,6 +465,11 @@ static int VirtioBlkWrite(Device* dev, uint64_t offset, const void* buf, uint64_
     static constexpr uint32_t SECTOR_SIZE = 512;
     static constexpr uint32_t DMA_BUF_SIZE = VirtioBlkState::DMA_BUF_PAGES * 4096;
     static constexpr uint32_t SECTORS_PER_DMA = DMA_BUF_SIZE / SECTOR_SIZE;
+
+    // Guard against offset+len overflow and writes past device end
+    uint64_t deviceBytes = s->sectorCount * SECTOR_SIZE;
+    if (offset >= deviceBytes) return -1;
+    if (len > deviceBytes - offset) len = deviceBytes - offset;
 
     uint64_t startSector = offset / SECTOR_SIZE;
     uint64_t endSector   = (offset + len + SECTOR_SIZE - 1) / SECTOR_SIZE;
@@ -659,6 +669,13 @@ static Device* InitOnePciDevice(const PciDevice& pci, uint32_t slot)
     uint32_t capLo = inl(ioBase + VIRTIO_PCI_BLK_CAPACITY);
     uint32_t capHi = inl(ioBase + VIRTIO_PCI_BLK_CAPACITY + 4);
     state->sectorCount = (static_cast<uint64_t>(capHi) << 32) | capLo;
+    if (state->sectorCount == 0)
+    {
+        SerialPrintf("virtio-blk: %s — zero sector count, skipping\n",
+                     g_virtioNames[slot]);
+        kfree(state);
+        return nullptr;
+    }
     SerialPrintf("virtio-blk: %s — %lu sectors (%lu MB)\n",
                  g_virtioNames[slot],
                  state->sectorCount,
