@@ -200,7 +200,10 @@ struct Ext2Mount {
     // hundreds of files per invocation, almost all repeat lookups
     // through the same /store/<hash>/... prefixes.  Slot is keyed on
     // ino number (not hash) so collisions just mean replacement.
-    // Entry.ino==0 means empty.  Lock-free: protected by g_ext2Lock.
+    // Entry.ino==0 means empty.  Protected by inodeCacheLock on SMP
+    // (g_ext2Lock only guarantees mutual exclusion with writers, not
+    // between concurrent readers which both call Ext2InodeCachePut).
+    SpinLock inodeCacheLock;
     void* inodeCache;             // Ext2InodeCacheEntry[1024]; lazy-alloced
 
     // --- Directory entry name cache ---
@@ -209,6 +212,8 @@ struct Ext2Mount {
     // can have thousands of entries, so this dominates lookup cost.
     // Direct-mapped 1024-slot cache of (parentIno, name) -> childIno.
     // Names longer than EXT2_DIRENT_CACHE_NAMELEN are not cached.
+    // Protected by direntCacheLock on SMP (same reason as inodeCacheLock).
+    SpinLock direntCacheLock;
     void* direntCache;            // Ext2DirentCacheEntry[1024]; lazy-alloced
 };
 static constexpr uint32_t EXT2_INODE_CACHE_SIZE = 1024;
@@ -308,21 +313,29 @@ static inline Ext2InodeCacheEntry* Ext2InodeCacheSlot(Ext2Mount* mnt, uint32_t i
 static bool Ext2InodeCacheLookup(Ext2Mount* mnt, uint32_t ino, Ext2Inode* out)
 {
     auto* slot = Ext2InodeCacheSlot(mnt, ino);
-    if (!slot || slot->ino != ino) return false;
+    if (!slot) return false;
+    uint64_t flags = SpinLockAcquire(&mnt->inodeCacheLock);
+    if (slot->ino != ino) { SpinLockRelease(&mnt->inodeCacheLock, flags); return false; }
     *out = slot->data;
+    SpinLockRelease(&mnt->inodeCacheLock, flags);
     return true;
 }
 static void Ext2InodeCachePut(Ext2Mount* mnt, uint32_t ino, const Ext2Inode* data)
 {
     auto* slot = Ext2InodeCacheSlot(mnt, ino);
     if (!slot) return;
+    uint64_t flags = SpinLockAcquire(&mnt->inodeCacheLock);
     slot->ino = ino;
     slot->data = *data;
+    SpinLockRelease(&mnt->inodeCacheLock, flags);
 }
 static void Ext2InodeCacheInvalidate(Ext2Mount* mnt, uint32_t ino)
 {
     auto* slot = Ext2InodeCacheSlot(mnt, ino);
-    if (slot && slot->ino == ino) slot->ino = 0;
+    if (!slot) return;
+    uint64_t flags = SpinLockAcquire(&mnt->inodeCacheLock);
+    if (slot->ino == ino) slot->ino = 0;
+    SpinLockRelease(&mnt->inodeCacheLock, flags);
 }
 
 // --- Dirent cache helpers ---
@@ -338,11 +351,20 @@ static bool Ext2DirentCacheLookup(Ext2Mount* mnt, uint32_t parentIno,
 {
     if (!mnt->direntCache || nameLen == 0 || nameLen > EXT2_DIRENT_CACHE_NAMELEN) return false;
     auto* table = static_cast<Ext2DirentCacheEntry*>(mnt->direntCache);
+    uint64_t flags = SpinLockAcquire(&mnt->direntCacheLock);
     auto& slot = table[Ext2DirentCacheHash(parentIno, name, nameLen)];
-    if (slot.parentIno != parentIno || slot.nameLen != nameLen) return false;
-    for (uint32_t i = 0; i < nameLen; ++i)
-        if (slot.name[i] != name[i]) return false;
+    if (slot.parentIno != parentIno || slot.nameLen != nameLen) {
+        SpinLockRelease(&mnt->direntCacheLock, flags);
+        return false;
+    }
+    for (uint32_t i = 0; i < nameLen; ++i) {
+        if (slot.name[i] != name[i]) {
+            SpinLockRelease(&mnt->direntCacheLock, flags);
+            return false;
+        }
+    }
     *outChild = slot.childIno;
+    SpinLockRelease(&mnt->direntCacheLock, flags);
     return true;
 }
 static void Ext2DirentCachePut(Ext2Mount* mnt, uint32_t parentIno,
@@ -350,19 +372,23 @@ static void Ext2DirentCachePut(Ext2Mount* mnt, uint32_t parentIno,
 {
     if (!mnt->direntCache || nameLen == 0 || nameLen > EXT2_DIRENT_CACHE_NAMELEN) return;
     auto* table = static_cast<Ext2DirentCacheEntry*>(mnt->direntCache);
+    uint64_t flags = SpinLockAcquire(&mnt->direntCacheLock);
     auto& slot = table[Ext2DirentCacheHash(parentIno, name, nameLen)];
     slot.parentIno = parentIno;
     slot.childIno  = childIno;
     slot.nameLen   = static_cast<uint8_t>(nameLen);
     for (uint32_t i = 0; i < nameLen; ++i) slot.name[i] = name[i];
+    SpinLockRelease(&mnt->direntCacheLock, flags);
 }
 // Invalidate every cache entry referencing parentIno.  Called after add/remove.
 static void Ext2DirentCacheInvalidateParent(Ext2Mount* mnt, uint32_t parentIno)
 {
     if (!mnt->direntCache) return;
     auto* table = static_cast<Ext2DirentCacheEntry*>(mnt->direntCache);
+    uint64_t flags = SpinLockAcquire(&mnt->direntCacheLock);
     for (uint32_t i = 0; i < EXT2_DIRENT_CACHE_SIZE; ++i)
         if (table[i].parentIno == parentIno) table[i].parentIno = 0;
+    SpinLockRelease(&mnt->direntCacheLock, flags);
 }
 
 // Write a single block from buf.
