@@ -196,23 +196,18 @@ reacquires it and restarts the scan from index 0. This is correct but
 potentially quadratic: each reap restarts the full scan. With MAX_PROCESSES=256
 this is bounded and fast enough.
 
-### 6. TLB shootdown enables process migration
+### 6. CPU affinity pinning prevents load balancing
 
-TLB shootdown (vector 0xFC) invalidates stale TLB entries on remote CPUs
-when page table entries are modified. This replaces the previous CPU affinity
-pinning approach where `PinUserAddressSpaceToCpu` locked each process to
-the first CPU that ran it. Processes now migrate freely between CPUs,
-enabling better SMP load balancing.
+`PinUserAddressSpaceToCpu` uses CAS to pin a process to the first CPU that
+runs it. Once pinned, the process can never migrate. This is intentional
+(no SMP TLB shootdown) but means workloads can become unbalanced if many
+processes are pinned to the same CPU.
 
-The `cpuAffinity` field is retained for future explicit pinning
-(sched_setaffinity) but is no longer set automatically.
+### 7. No SMP TLB shootdown
 
-### 7. TLB CPU mask tracking
-
-Each process has a `tlbCpuMask` bitmask tracking which CPUs have (or may
-have) TLB entries for that process's address space. Updated on context
-switch: bit set when a CPU loads the process, cleared when switching away.
-TlbShootdown/TlbShootdownFull send IPIs only to CPUs in the mask.
+The fundamental constraint behind CPU pinning, eager fork copies, and several
+other design decisions. Documented in plan.md and throughout the codebase.
+Future work.
 
 ---
 
@@ -221,7 +216,7 @@ TlbShootdown/TlbShootdownFull send IPIs only to CPUs in the mask.
 1. `DoSwitch(old, new, requeueOld)` validates both process pointers
 2. CAS `newProc->runningOnCpu` from -1 to current CPU (double-schedule check)
 3. Update per-CPU state: `currentProcess`, `cpuEnv`, TSS RSP0, syscall stack
-4. Set `tlbCpuMask` bit for new process, clear for old (if different)
+4. Pin new process to CPU if not already pinned
 5. Set `pendingRequeue` if old should be re-enqueued
 6. Call `context_switch()` assembly (saves GPRs, FPU/SSE, CR3, FS base; publishes `runningOnCpu = -1` for old process)
 7. **Return point**: `DrainPostSwitch()` — marks retired process reapable, re-enqueues old process

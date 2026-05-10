@@ -27,7 +27,6 @@
 #include "audio.h"
 #include "profiler.h"
 #include "smp.h"
-#include "apic.h"
 #include "serial_writer.h"
 #include "debug_overlay.h"
 
@@ -3753,10 +3752,6 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
         VmmMapPage(proc->pageTable, va, phys, newFlags, MemTag::User, proc->pid);
     }
 
-    // Permission changes may leave stale TLB entries on remote CPUs
-    if (pages > 0)
-        TlbShootdownFull(proc->pageTable.pml4.raw());
-
     return 0;
 }
 
@@ -3886,10 +3881,6 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t,
         }
     }
 
-    // Flush stale TLB entries on remote CPUs after bulk unmap
-    if (pages > 0)
-        TlbShootdownFull(proc->pageTable.pml4.raw());
-
     if (unmappedMfd) MemFdUnref(unmappedMfd);
 
     return 0;
@@ -3936,7 +3927,6 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
                 PmmUnrefPage(phys);
             }
         }
-        TlbShootdownFull(proc->pageTable.pml4.raw());
         return static_cast<int64_t>(old_addr);
     }
 
@@ -3977,7 +3967,6 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
             PmmUnrefPage(phys);
         }
     }
-    TlbShootdownFull(proc->pageTable.pml4.raw());
 
     DbgPrintf("sys_mremap: 0x%lx (%lu) -> 0x%lx (%lu)\n",
               old_addr, oldPages, newAddr, newPages);
