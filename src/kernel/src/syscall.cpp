@@ -5559,6 +5559,8 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         // TCGETS — return current termios state
         if (cmd == 0x5401)
         {
+            // termios struct: 4 × uint32_t + 1 byte c_line + 19 bytes c_cc = 36 bytes
+            if (!UserBufferWritable(arg, 36)) return -EFAULT;
             auto* t = reinterpret_cast<uint32_t*>(arg);
             t[0] = 0x0500;   // c_iflag: ICRNL | IXON
             t[1] = 0x0005;   // c_oflag: OPOST | ONLCR
@@ -5597,6 +5599,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         // TCSETS/TCSETSW/TCSETSF — track ICANON and ECHO flags
         if (cmd >= 0x5402 && cmd <= 0x5404)
         {
+            if (!UserBufferReadable(arg, 16)) return -EFAULT;
             auto* t = reinterpret_cast<const uint32_t*>(arg);
             Process* cur = ProcessCurrent();
             if (cur)
@@ -5611,6 +5614,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         // TIOCGPGRP
         if (cmd == 0x540F)
         {
+            if (!UserBufferWritable(arg, sizeof(int))) return -EFAULT;
             auto* pgrp = reinterpret_cast<int*>(arg);
             Process* cur = ProcessCurrent();
             if (cur)
@@ -5631,6 +5635,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         // TIOCSPGRP
         if (cmd == 0x5410)
         {
+            if (!UserBufferReadable(arg, sizeof(int))) return -EFAULT;
             auto* pgrpPtr = reinterpret_cast<const int*>(arg);
             int newPgid = *pgrpPtr;
             Process* cur = ProcessCurrent();
@@ -5681,6 +5686,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
                                  fde->type != FdType::Socket);
     if (isTtyFd && cmd == 0x5401)
     {
+        if (!UserBufferWritable(arg, 36)) return -EFAULT;
         auto* t = reinterpret_cast<uint32_t*>(arg);
         t[0] = 0x0500;   // c_iflag: ICRNL | IXON
         t[1] = 0x0005;   // c_oflag: OPOST | ONLCR
@@ -5714,6 +5720,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     }
     if (isTtyFd && cmd >= 0x5402 && cmd <= 0x5404)
     {
+        if (!UserBufferReadable(arg, 16)) return -EFAULT;
         auto* t = reinterpret_cast<const uint32_t*>(arg);
         Process* cur = ProcessCurrent();
         if (cur)
@@ -5728,6 +5735,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     // TIOCGPGRP = 0x540F — get foreground process group
     if (isTtyFd && cmd == 0x540F)
     {
+        if (!UserBufferWritable(arg, sizeof(int))) return -EFAULT;
         auto* pgrp = reinterpret_cast<int*>(arg);
         Process* cur = ProcessCurrent();
         if (cur)
@@ -5748,6 +5756,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     // TIOCSPGRP = 0x5410 — set foreground process group
     if (isTtyFd && cmd == 0x5410)
     {
+        if (!UserBufferReadable(arg, sizeof(int))) return -EFAULT;
         auto* pgrpPtr = reinterpret_cast<const int*>(arg);
         int newPgid = *pgrpPtr;
         Process* cur = ProcessCurrent();
@@ -5918,6 +5927,8 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     // TCGETS2 = 0x802c542a — termios2 (like TCGETS plus ispeed/ospeed uint32s)
     if (isTtyFd && cmd == 0x802c542aUL)
     {
+        // termios2: 4 × uint32 flags + 1 c_line + 19 c_cc + 2 × uint32 speeds = 44 bytes
+        if (!UserBufferWritable(arg, 44)) return -EFAULT;
         auto* t = reinterpret_cast<uint32_t*>(arg);
         t[0] = 0x0500;
         t[1] = 0x0005;
