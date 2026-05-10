@@ -1239,6 +1239,12 @@ parent_done:
 
     if (!next) next = g_perCpu[cpu].idleProcess;
 
+    // Disable interrupts before updating TSS RSP0 and switching context.
+    // Without cli, a timer interrupt between GdtSetTssRsp0 and context_switch
+    // would push an interrupt frame onto next's kernel stack while proc is
+    // still executing on its own stack — corrupting the iretq frame (BRO-131).
+    __asm__ volatile("cli" ::: "memory");
+
     __atomic_store_n(&proc->runningOnCpu, (int32_t)-1, __ATOMIC_RELEASE);
 
     g_perCpu[cpu].currentProcess = next;
