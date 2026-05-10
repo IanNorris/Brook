@@ -21,14 +21,19 @@ static constexpr uint32_t FG_GREY    = 0x00B0B0B0;
 static constexpr uint32_t FG_YELLOW  = 0x00FFD700;
 static constexpr uint32_t FG_CYAN    = 0x0080D0FF;
 
-// Fill a rectangle with a solid colour.
+// Fill a rectangle with a solid colour, clipped to framebuffer bounds.
 static void FillRect(uint32_t* fb, uint32_t stride,
+                     uint32_t fbH,
                      uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                      uint32_t color)
 {
-    for (uint32_t row = 0; row < h; row++)
-        for (uint32_t col = 0; col < w; col++)
-            fb[(y + row) * stride + (x + col)] = color;
+    if (!fb || stride == 0) return;
+    if (x >= stride || y >= fbH) return;
+    uint32_t xEnd = (x + w > stride) ? stride : x + w;
+    uint32_t yEnd = (y + h > fbH)    ? fbH    : y + h;
+    for (uint32_t row = y; row < yEnd; row++)
+        for (uint32_t col = x; col < xEnd; col++)
+            fb[row * stride + col] = color;
 }
 
 // Render a single glyph at (px, py) with a given foreground colour.
@@ -142,11 +147,11 @@ void PanicScreenRender(uint32_t* fb, uint32_t fbW, uint32_t fbH,
     int glyphW = (fa.glyphCount > 0) ? fa.glyphs[0].advance : 8;
 
     // 1. Fill entire screen with dark red background
-    FillRect(fb, stride, 0, 0, fbW, fbH, BG_DARK);
+    FillRect(fb, stride, fbH, 0, 0, fbW, fbH, BG_DARK);
 
     // 2. Draw bright red banner at top
     uint32_t bannerH = static_cast<uint32_t>(lineH) + 16;
-    FillRect(fb, stride, 0, 0, fbW, bannerH, BG_BANNER);
+    FillRect(fb, stride, fbH, 0, 0, fbW, bannerH, BG_BANNER);
     DrawString(fb, stride, fbW, fbH, 20, 8, "KERNEL PANIC", FG_WHITE);
 
     // Build info on banner right side
