@@ -165,9 +165,9 @@ static int FatFileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
     }
     UINT br = 0;
     FRESULT res = f_read(fil, buf, static_cast<UINT>(len), &br);
-    KMutexUnlock(&g_fatLock);
-    if (res != FR_OK) return -1;
+    if (res != FR_OK) { KMutexUnlock(&g_fatLock); return -1; }
     *offset += br;
+    KMutexUnlock(&g_fatLock);
     return static_cast<int>(br);
 }
 
@@ -183,9 +183,9 @@ static int FatFileWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offs
     }
     UINT bw = 0;
     FRESULT res = f_write(fil, buf, static_cast<UINT>(len), &bw);
-    KMutexUnlock(&g_fatLock);
-    if (res != FR_OK) return -1;
+    if (res != FR_OK) { KMutexUnlock(&g_fatLock); return -1; }
     *offset += bw;
+    KMutexUnlock(&g_fatLock);
     return static_cast<int>(bw);
 }
 

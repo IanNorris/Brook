@@ -1508,8 +1508,8 @@ static int Ext2FileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
     auto* fp = static_cast<Ext2FilePriv*>(vn->priv);
     KRwLockReadLock(&g_ext2Lock);
     int r = Ext2ReadInodeData(fp->mnt, &fp->inodeData, buf, len, *offset);
-    KRwLockReadUnlock(&g_ext2Lock);
     if (r > 0) *offset += r;
+    KRwLockReadUnlock(&g_ext2Lock);
     return r;
 }
 
@@ -1518,8 +1518,8 @@ static int Ext2FileWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* off
     auto* fp = static_cast<Ext2FilePriv*>(vn->priv);
     KRwLockWriteLock(&g_ext2Lock);
     int r = Ext2WriteInodeData(fp->mnt, &fp->inodeData, fp->inode, buf, len, *offset);
-    KRwLockWriteUnlock(&g_ext2Lock);
     if (r > 0) *offset += r;
+    KRwLockWriteUnlock(&g_ext2Lock);
     return r;
 }
 
