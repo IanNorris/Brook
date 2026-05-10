@@ -390,16 +390,16 @@ static void ProcessRxPackets()
     bool didWork = false;
 
     for (;;) {
-        uint64_t flags = SpinLockAcquire(&g_rxLock);
+        SpinLockAcquire(&g_rxLock);
         if (g_rxq.usedIdxShadow == *g_rxq.usedIdx) {
-            SpinLockRelease(&g_rxLock, flags);
+            SpinLockRelease(&g_rxLock);
             break;
         }
         uint16_t slot    = g_rxq.usedIdxShadow & (g_rxq.size - 1);
         uint32_t descIdx = g_rxq.usedRing[slot].id;
         uint32_t totalLen = g_rxq.usedRing[slot].len;
         g_rxq.usedIdxShadow++;
-        SpinLockRelease(&g_rxLock, flags);
+        SpinLockRelease(&g_rxLock);
 
         if (descIdx < g_rxq.size && totalLen > VIRTIO_NET_HDR_SIZE) {
             uint8_t* pkt = g_rxBufs + descIdx * RX_BUF_SIZE;
@@ -412,14 +412,14 @@ static void ProcessRxPackets()
 
         // Repost buffer to available ring. availIdxShadow is shared with
         // other invocations so must be advanced under the lock too.
-        flags = SpinLockAcquire(&g_rxLock);
+        SpinLockAcquire(&g_rxLock);
         uint16_t availSlot = g_rxq.availIdxShadow & (g_rxq.size - 1);
         g_rxq.availRing[availSlot] = static_cast<uint16_t>(descIdx);
         g_rxq.availIdxShadow++;
         __asm__ volatile("sfence" ::: "memory");
         *g_rxq.availIdx = g_rxq.availIdxShadow;
         didWork = true;
-        SpinLockRelease(&g_rxLock, flags);
+        SpinLockRelease(&g_rxLock);
     }
 
     // Only notify QEMU when we've actually reposted buffers. Kicking with no
