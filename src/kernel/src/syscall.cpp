@@ -12070,6 +12070,24 @@ int64_t SyscallDispatchInternal(uint64_t num, uint64_t a0, uint64_t a1,
                      num, a0, a1, a2, a3, a4, a5);
         return -38; // -ENOSYS
     }
+
+    // Mini-strace for tgid 13 (RequestServer) — skip poll/ppoll (NET_DIAG covers
+    // those), mmap/mprotect/brk/sigaction/sigprocmask/rt_sigreturn (noise).
+    if (proc && proc->tgid == 13 &&
+        num != 7 && num != 271 &&                    // poll, ppoll
+        num != 9 && num != 10 && num != 11 &&        // mmap, mprotect, munmap
+        num != 12 && num != 28 &&                    // brk, madvise
+        num != 13 && num != 14 && num != 15 &&       // sigaction, sigprocmask, sigreturn
+        num != 228 && num != 334 && num != 218)      // clock_gettime, rseq, set_tid_address
+    {
+        extern volatile uint64_t g_lapicTickCount;
+        int64_t ret = fn(a0, a1, a2, a3, a4, a5);
+        const char* nm = SyscallName(num);
+        SerialPrintf("[STRACE13] t=%lums %s(%lu, 0x%lx, 0x%lx) = %ld\n",
+                     g_lapicTickCount, nm ? nm : "?", a0, a1, a2, ret);
+        return ret;
+    }
+
     return fn(a0, a1, a2, a3, a4, a5);
 }
 
