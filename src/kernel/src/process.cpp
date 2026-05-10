@@ -1524,15 +1524,15 @@ uint16_t CreateRemoteThread(Process* target, uint64_t entry,
     uint64_t stackBase = 0;
     uint32_t pages = stackSize / 4096;
     {
-        uint64_t lf = SpinLockAcquire(&s_remoteStackLock);
+        SpinLockAcquire(&s_remoteStackLock);
         stackBase = leader->mmapNext;
         if (stackBase + stackSize > USER_MMAP_END) {
-            SpinLockRelease(&s_remoteStackLock, lf);
+            SpinLockRelease(&s_remoteStackLock);
             SerialPrintf("CRT: out of user VA (pid %u)\n", target->pid);
             return 0;
         }
         leader->mmapNext = stackBase + stackSize;
-        SpinLockRelease(&s_remoteStackLock, lf);
+        SpinLockRelease(&s_remoteStackLock);
     }
 
     // Allocate + map pages as User/RW.  NX is set via the architecture

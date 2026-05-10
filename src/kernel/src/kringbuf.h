@@ -32,7 +32,7 @@ struct KRingBuffer {
     // Drops excess bytes if the buffer is full (never blocks).
     uint32_t write(const char* src, uint32_t len)
     {
-        uint64_t flags = SpinLockAcquire(&lock);
+        SpinLockAcquire(&lock);
 
         uint32_t avail = Capacity - 1 - ((head - tail + Capacity) % Capacity);
         if (len > avail) len = avail;
@@ -42,7 +42,7 @@ struct KRingBuffer {
             head = (head + 1) % Capacity;
         }
 
-        SpinLockRelease(&lock, flags);
+        SpinLockRelease(&lock);
         return len;
     }
 
@@ -50,7 +50,7 @@ struct KRingBuffer {
     // Only called by the single consumer thread.
     uint32_t read(char* dst, uint32_t maxLen)
     {
-        uint64_t flags = SpinLockAcquire(&lock);
+        SpinLockAcquire(&lock);
 
         uint32_t avail = (head - tail + Capacity) % Capacity;
         if (maxLen > avail) maxLen = avail;
@@ -60,7 +60,7 @@ struct KRingBuffer {
             tail = (tail + 1) % Capacity;
         }
 
-        SpinLockRelease(&lock, flags);
+        SpinLockRelease(&lock);
         return maxLen;
     }
 
@@ -69,7 +69,7 @@ struct KRingBuffer {
     // output so serial messages don't interleave mid-line.
     uint32_t readUntilNewline(char* dst, uint32_t maxLen)
     {
-        uint64_t flags = SpinLockAcquire(&lock);
+        SpinLockAcquire(&lock);
 
         uint32_t avail = (head - tail + Capacity) % Capacity;
         if (maxLen > avail) maxLen = avail;
@@ -90,7 +90,7 @@ struct KRingBuffer {
             tail = (tail + 1) % Capacity;
         }
 
-        SpinLockRelease(&lock, flags);
+        SpinLockRelease(&lock);
         return limit;
     }
 };

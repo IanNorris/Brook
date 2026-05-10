@@ -657,7 +657,7 @@ void ApicInitReschedIpi()
 // and waits synchronously, so any lock attempt would deadlock.
 
 struct TlbShootdownRequest {
-    SpinLock        lock;
+    IrqSpinLock     lock;             // Must be IrqSpinLock: initiator needs IF=0 during wait
     volatile uint64_t pendingCount;   // decremented by each responder
     uint64_t        targetCr3;        // only invalidate if CPU's CR3 matches
     uint64_t        addr;             // page VA to invalidate (0 = full flush)
@@ -869,7 +869,7 @@ void TlbShootdown(uint64_t targetCr3, uint64_t virtualAddr)
 
     uint32_t targetCount = __builtin_popcountll(targetMask);
 
-    uint64_t flags = SpinLockAcquire(&g_tlbRequest.lock);
+    uint64_t flags = IrqSpinLockAcquire(&g_tlbRequest.lock);
 
     g_tlbRequest.targetCr3 = targetCr3;
     g_tlbRequest.addr      = virtualAddr;
@@ -885,7 +885,7 @@ void TlbShootdown(uint64_t targetCr3, uint64_t virtualAddr)
 
     TlbShootdownWait(myCpu, targetMask, targetCr3, virtualAddr);
 
-    SpinLockRelease(&g_tlbRequest.lock, flags);
+    IrqSpinLockRelease(&g_tlbRequest.lock, flags);
 }
 
 void TlbShootdownFull(uint64_t targetCr3)
@@ -915,7 +915,7 @@ void TlbShootdownFull(uint64_t targetCr3)
 
     uint32_t targetCount = __builtin_popcountll(targetMask);
 
-    uint64_t flags = SpinLockAcquire(&g_tlbRequest.lock);
+    uint64_t flags = IrqSpinLockAcquire(&g_tlbRequest.lock);
 
     g_tlbRequest.targetCr3 = targetCr3;
     g_tlbRequest.addr      = 0;  // 0 = full flush
@@ -930,7 +930,7 @@ void TlbShootdownFull(uint64_t targetCr3)
 
     TlbShootdownWait(myCpu, targetMask, targetCr3, 0);
 
-    SpinLockRelease(&g_tlbRequest.lock, flags);
+    IrqSpinLockRelease(&g_tlbRequest.lock, flags);
 }
 
 // ---------------------------------------------------------------------------

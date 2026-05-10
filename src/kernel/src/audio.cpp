@@ -49,7 +49,7 @@ void AudioMixerSubmit(const int16_t* samples, uint32_t frameCount, uint32_t stre
     if (!g_mixerReady || !samples || frameCount == 0) return;
     if (streamId >= MIXER_MAX_STREAMS) streamId = 0;
 
-    uint64_t flags = SpinLockAcquire(&g_mixerLock);
+    SpinLockAcquire(&g_mixerLock);
 
     uint32_t writePos = g_mixStreamPos[streamId];
 
@@ -75,7 +75,7 @@ void AudioMixerSubmit(const int16_t* samples, uint32_t frameCount, uint32_t stre
     if (writePos > g_mixFrames)
         g_mixFrames = writePos;
 
-    SpinLockRelease(&g_mixerLock, flags);
+    SpinLockRelease(&g_mixerLock);
 }
 
 // Internal flush — caller must hold g_mixerLock.
@@ -121,9 +121,9 @@ static void AudioMixerFlushLocked()
 
 void AudioMixerFlush()
 {
-    uint64_t flags = SpinLockAcquire(&g_mixerLock);
+    SpinLockAcquire(&g_mixerLock);
     AudioMixerFlushLocked();
-    SpinLockRelease(&g_mixerLock, flags);
+    SpinLockRelease(&g_mixerLock);
 }
 
 // --- Driver registration ---

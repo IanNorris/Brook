@@ -55,7 +55,7 @@ void DebugOverlayPuts(const char* text)
 {
     if (!text) return;
 
-    uint64_t flags = SpinLockAcquire(&g_ringLock);
+    SpinLockAcquire(&g_ringLock);
 
     for (const char* p = text; *p; ++p)
     {
@@ -68,12 +68,12 @@ void DebugOverlayPuts(const char* text)
             g_ring[g_writeHead][g_curCol++] = *p;
     }
 
-    SpinLockRelease(&g_ringLock, flags);
+    SpinLockRelease(&g_ringLock);
 }
 
 uint32_t DebugOverlayRead(char* out, uint32_t maxLines, uint32_t lineLen)
 {
-    uint64_t flags = SpinLockAcquire(&g_ringLock);
+    SpinLockAcquire(&g_ringLock);
 
     // How many completed lines are available since last read?
     uint32_t available = g_totalLines - g_readHead;
@@ -105,7 +105,7 @@ uint32_t DebugOverlayRead(char* out, uint32_t maxLines, uint32_t lineLen)
 
     g_readHead = startIdx + count;
 
-    SpinLockRelease(&g_ringLock, flags);
+    SpinLockRelease(&g_ringLock);
     return count;
 }
 
@@ -116,7 +116,7 @@ uint32_t DebugOverlayTotalLines()
 
 uint32_t DebugOverlayReadFrom(uint32_t* cursor, char* out, uint32_t maxLines, uint32_t lineLen)
 {
-    uint64_t flags = SpinLockAcquire(&g_ringLock);
+    SpinLockAcquire(&g_ringLock);
 
     uint32_t available = g_totalLines - *cursor;
     if (available > RING_LINES) available = RING_LINES;
@@ -145,7 +145,7 @@ uint32_t DebugOverlayReadFrom(uint32_t* cursor, char* out, uint32_t maxLines, ui
 
     *cursor = startIdx + count;
 
-    SpinLockRelease(&g_ringLock, flags);
+    SpinLockRelease(&g_ringLock);
     return count;
 }
 
@@ -237,7 +237,7 @@ static void KernelConsoleThread(void* /*arg*/)
             // New content available — re-render the VFB.
             // Read all available lines from ring (up to visible count).
             // We want the LATEST visibleLines lines, not just new ones.
-            uint64_t flags = SpinLockAcquire(&g_ringLock);
+            SpinLockAcquire(&g_ringLock);
 
             uint32_t totalAvail = g_totalLines;
             uint32_t count = (totalAvail < visibleLines) ? totalAvail : visibleLines;
@@ -261,7 +261,7 @@ static void KernelConsoleThread(void* /*arg*/)
             // Update read cursor so we don't re-read
             g_readHead = totalAvail;
 
-            SpinLockRelease(&g_ringLock, flags);
+            SpinLockRelease(&g_ringLock);
             lastTotal = nowTotal;
 
             // Clear VFB to background

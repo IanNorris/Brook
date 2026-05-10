@@ -225,11 +225,11 @@ static void KLogWrite(LogCat cat, LogLevel level, const char* fmt, __builtin_va_
 
     // Write to disk under lock.
     if (g_logFile) {
-        uint64_t flags = SpinLockAcquire(&g_logLock);
+        SpinLockAcquire(&g_logLock);
         uint64_t off = g_logOffset;
         VfsWrite(g_logFile, line, pos, &off);
         g_logOffset = off;
-        SpinLockRelease(&g_logLock, flags);
+        SpinLockRelease(&g_logLock);
     }
 
     // Echo to serial.
@@ -264,11 +264,11 @@ void KLog(const char* fmt, ...)
     line[pos]   = '\0';
 
     // Write under lock.
-    uint64_t flags = SpinLockAcquire(&g_logLock);
+    SpinLockAcquire(&g_logLock);
     uint64_t off = g_logOffset;
     VfsWrite(g_logFile, line, pos, &off);
     g_logOffset = off;
-    SpinLockRelease(&g_logLock, flags);
+    SpinLockRelease(&g_logLock);
 
     // Also echo to serial and debug overlay.
     SerialPuts(line);
@@ -286,9 +286,9 @@ void KLogCat(LogCat cat, LogLevel level, const char* fmt, ...)
 void KLogSync()
 {
     if (!g_logFile) return;
-    uint64_t flags = SpinLockAcquire(&g_logLock);
+    SpinLockAcquire(&g_logLock);
     VfsSync(g_logFile);
-    SpinLockRelease(&g_logLock, flags);
+    SpinLockRelease(&g_logLock);
 }
 
 void KLogDump()

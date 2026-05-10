@@ -133,13 +133,13 @@ static void* NetMemcpy(void* dst, const void* src, uint64_t n)
 
 void ArpCacheInsert(uint32_t ip, const MacAddr& mac)
 {
-    uint64_t flags = SpinLockAcquire(&g_arpLock);
+    SpinLockAcquire(&g_arpLock);
     // Update existing entry
     for (uint32_t i = 0; i < g_arpCount; i++) {
         if (g_arpCache[i].ip == ip) {
             g_arpCache[i].mac = mac;
             g_arpCache[i].valid = true;
-            SpinLockRelease(&g_arpLock, flags);
+            SpinLockRelease(&g_arpLock);
             return;
         }
     }
@@ -150,20 +150,20 @@ void ArpCacheInsert(uint32_t ip, const MacAddr& mac)
         g_arpCache[g_arpCount].valid = true;
         g_arpCount++;
     }
-    SpinLockRelease(&g_arpLock, flags);
+    SpinLockRelease(&g_arpLock);
 }
 
 static bool ArpCacheLookup(uint32_t ip, MacAddr* out)
 {
-    uint64_t flags = SpinLockAcquire(&g_arpLock);
+    SpinLockAcquire(&g_arpLock);
     for (uint32_t i = 0; i < g_arpCount; i++) {
         if (g_arpCache[i].ip == ip && g_arpCache[i].valid) {
             *out = g_arpCache[i].mac;
-            SpinLockRelease(&g_arpLock, flags);
+            SpinLockRelease(&g_arpLock);
             return true;
         }
     }
-    SpinLockRelease(&g_arpLock, flags);
+    SpinLockRelease(&g_arpLock);
     return false;
 }
 
@@ -1545,10 +1545,10 @@ void SockClose(int sockIdx)
                    s.tcpState == TcpState::FinWait2 ||
                    s.tcpState == TcpState::LastAck) {
                 if (g_lapicTickCount >= deadline) break;
-                uint64_t lf = SpinLockAcquire(&s.lock);
+                SpinLockAcquire(&s.lock);
                 s.pollWaiter = self;
                 self->wakeupTick = g_lapicTickCount + 50; // check every 50ms
-                SpinLockRelease(&s.lock, lf);
+                SpinLockRelease(&s.lock);
                 SchedulerBlock(self);
             }
         }
@@ -1636,11 +1636,11 @@ void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
         // Format: [len:4][srcIp:4][srcPort:2][data:len]
         uint32_t needed = 10 + len;
 
-        uint64_t irqFlags = SpinLockAcquire(&s.lock);
+        SpinLockAcquire(&s.lock);
 
         uint32_t avail = Socket::RX_BUF_SIZE - s.rxCount;
         if (needed > avail) {
-            SpinLockRelease(&s.lock, irqFlags);
+            SpinLockRelease(&s.lock);
             SerialPrintf("net: socket %u rx buffer full, dropping\n", i);
             return;
         }
@@ -1673,7 +1673,7 @@ void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
         Process* waiter = s.pollWaiter;
         if (waiter) s.pollWaiter = nullptr;
 
-        SpinLockRelease(&s.lock, irqFlags);
+        SpinLockRelease(&s.lock);
 
         // Log DNS delivery diagnostics
         if (srcPort == 53) {
@@ -2012,7 +2012,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         if (s.remotePort != srcPort) continue;
         if (s.remoteIp != ip->srcIp) continue;
 
-        uint64_t irqFlags = SpinLockAcquire(&s.lock);
+        SpinLockAcquire(&s.lock);
 
         // Update peer's advertised window
         s.tcpSndWnd = window;
@@ -2072,7 +2072,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             s.pollWaiter = nullptr;
         }
 
-        SpinLockRelease(&s.lock, irqFlags);
+        SpinLockRelease(&s.lock);
 
         // Send ACK outside the lock — TcpSendSegment is not re-entrant under
         // s.lock and may acquire other locks (e.g. TX queue).
@@ -2269,10 +2269,10 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
 
         uint64_t deadline = g_lapicTickCount + 5000;
         while (s.tcpState == TcpState::SynSent && g_lapicTickCount < deadline) {
-            uint64_t irqFlags = SpinLockAcquire(&s.lock);
+            SpinLockAcquire(&s.lock);
             s.pollWaiter = self;
             self->wakeupTick = g_lapicTickCount + 5000;
-            SpinLockRelease(&s.lock, irqFlags);
+            SpinLockRelease(&s.lock);
             SchedulerBlock(self);
         }
 
@@ -2306,12 +2306,12 @@ static int TcpWaitForDataAck(Socket& s, int sockIdx,
     while (true) {
         uint64_t now = g_lapicTickCount;
 
-        uint64_t irqFlags = SpinLockAcquire(&s.lock);
+        SpinLockAcquire(&s.lock);
         bool acked = TcpSeqAcked(s.tcpSndUna, seqEnd);
         bool closed = s.tcpRstRecv || s.tcpFinRecv ||
                       s.tcpState != TcpState::Established;
         if (acked || closed || now >= deadline) {
-            SpinLockRelease(&s.lock, irqFlags);
+            SpinLockRelease(&s.lock);
             if (acked) return 0;
             if (closed) return -104; // ECONNRESET
             SerialPrintf("tcp: data ACK timeout fd=%d seq=%u end=%u una=%u retx=%u\n",
@@ -2325,7 +2325,7 @@ static int TcpWaitForDataAck(Socket& s, int sockIdx,
                                    ? nextRetransmit
                                    : deadline;
         }
-        SpinLockRelease(&s.lock, irqFlags);
+        SpinLockRelease(&s.lock);
 
         if (now >= nextRetransmit) {
             retransmits++;
@@ -2416,19 +2416,19 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
         uint64_t hardDeadline = g_lapicTickCount + 30000;
 
         while (true) {
-            uint64_t irqFlags = SpinLockAcquire(&s.lock);
+            SpinLockAcquire(&s.lock);
             bool ready = s.rxCount > 0 || s.tcpRstRecv || s.tcpFinRecv
                          || s.tcpState == TcpState::Closed
                          || g_lapicTickCount >= hardDeadline;
             if (ready) {
-                SpinLockRelease(&s.lock, irqFlags);
+                SpinLockRelease(&s.lock);
                 break;
             }
             // Set pollWaiter while holding the lock so HandleTcp can never
             // enqueue data and miss the wakeup in a race window.
             s.pollWaiter = self;
             self->wakeupTick = g_lapicTickCount + 100; // heartbeat every 100ms
-            SpinLockRelease(&s.lock, irqFlags);
+            SpinLockRelease(&s.lock);
             SchedulerBlock(self);
             // Woken by data (HandleTcp), heartbeat tick, or spurious —
             // loop back to re-check under the lock.
@@ -2453,7 +2453,7 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
     }
 
     // Stream read — no framing, just read bytes from ring buffer
-    uint64_t irqFlags = SpinLockAcquire(&s.lock);
+    SpinLockAcquire(&s.lock);
     uint32_t copyLen = s.rxCount < len ? s.rxCount : len;
     // Capture free space BEFORE consuming, to decide whether window was constrained.
     uint32_t freeBefore = Socket::RX_BUF_SIZE - s.rxCount;
@@ -2466,7 +2466,7 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
     s.rxCount -= copyLen;
     uint32_t freeAfter = Socket::RX_BUF_SIZE - s.rxCount;
     TcpState stateSnap = s.tcpState;
-    SpinLockRelease(&s.lock, irqFlags);
+    SpinLockRelease(&s.lock);
 
     // Send a window update ACK only when:
     //   1. The receive window was constrained (< 2 MSS of free space), AND
@@ -2552,12 +2552,12 @@ bool SockPollHangup(int sockIdx)
     Socket& s = g_sockets[sockIdx];
     if (s.type != SOCK_STREAM) return false;
 
-    uint64_t irqFlags = SpinLockAcquire(&s.lock);
+    SpinLockAcquire(&s.lock);
     bool hungUp = s.tcpFinRecv || s.tcpRstRecv ||
                   (s.tcpState != TcpState::Established &&
                    s.tcpState != TcpState::SynSent &&
                    s.tcpState != TcpState::Listen);
-    SpinLockRelease(&s.lock, irqFlags);
+    SpinLockRelease(&s.lock);
     return hungUp;
 }
 

@@ -79,11 +79,11 @@ bool DeviceRegister(Device* dev)
         return false;
     }
 
-    uint64_t flags = SpinLockAcquire(&g_deviceLock);
+    SpinLockAcquire(&g_deviceLock);
 
     if (g_deviceCount >= DEVICE_MAX)
     {
-        SpinLockRelease(&g_deviceLock, flags);
+        SpinLockRelease(&g_deviceLock);
         SerialPuts("DeviceRegister: device table full\n");
         return false;
     }
@@ -93,7 +93,7 @@ bool DeviceRegister(Device* dev)
     {
         if (StrEq(g_devices[i]->name, dev->name))
         {
-            SpinLockRelease(&g_deviceLock, flags);
+            SpinLockRelease(&g_deviceLock);
             SerialPrintf("DeviceRegister: duplicate name '%s'\n", dev->name);
             return false;
         }
@@ -101,7 +101,7 @@ bool DeviceRegister(Device* dev)
 
     g_devices[g_deviceCount++] = dev;
     UpdateDeviceChecksum();
-    SpinLockRelease(&g_deviceLock, flags);
+    SpinLockRelease(&g_deviceLock);
 
     SerialPrintf("DEV: registered '%s' (type %u)\n",
                  dev->name, static_cast<unsigned>(dev->type));
@@ -112,7 +112,7 @@ bool DeviceUnregister(Device* dev)
 {
     if (!dev) return false;
 
-    uint64_t flags = SpinLockAcquire(&g_deviceLock);
+    SpinLockAcquire(&g_deviceLock);
 
     for (uint32_t i = 0; i < g_deviceCount; ++i)
     {
@@ -123,47 +123,47 @@ bool DeviceUnregister(Device* dev)
                 g_devices[j] = g_devices[j + 1];
             g_devices[--g_deviceCount] = nullptr;
             UpdateDeviceChecksum();
-            SpinLockRelease(&g_deviceLock, flags);
+            SpinLockRelease(&g_deviceLock);
 
             SerialPrintf("DEV: unregistered '%s'\n", dev->name);
             return true;
         }
     }
 
-    SpinLockRelease(&g_deviceLock, flags);
+    SpinLockRelease(&g_deviceLock);
     return false;
 }
 
 Device* DeviceFind(const char* name)
 {
     if (!name) return nullptr;
-    uint64_t flags = SpinLockAcquire(&g_deviceLock);
+    SpinLockAcquire(&g_deviceLock);
     for (uint32_t i = 0; i < g_deviceCount; ++i)
     {
         if (StrEq(g_devices[i]->name, name))
         {
             Device* result = g_devices[i];
-            SpinLockRelease(&g_deviceLock, flags);
+            SpinLockRelease(&g_deviceLock);
             return result;
         }
     }
-    SpinLockRelease(&g_deviceLock, flags);
+    SpinLockRelease(&g_deviceLock);
     return nullptr;
 }
 
 bool DeviceIsRegistered(Device* dev)
 {
     if (!dev) return false;
-    uint64_t flags = SpinLockAcquire(&g_deviceLock);
+    SpinLockAcquire(&g_deviceLock);
     for (uint32_t i = 0; i < g_deviceCount; ++i)
     {
         if (g_devices[i] == dev)
         {
-            SpinLockRelease(&g_deviceLock, flags);
+            SpinLockRelease(&g_deviceLock);
             return true;
         }
     }
-    SpinLockRelease(&g_deviceLock, flags);
+    SpinLockRelease(&g_deviceLock);
     return false;
 }
 
@@ -212,7 +212,7 @@ void DeviceDumpRegistry()
 
 bool DeviceCheckIntegrity()
 {
-    uint64_t flags = SpinLockAcquire(&g_deviceLock);
+    SpinLockAcquire(&g_deviceLock);
     bool ok = true;
     if (g_deviceCanaryPre != DEVICE_CANARY ||
         g_deviceCanaryPost != DEVICE_CANARY)
@@ -243,14 +243,14 @@ bool DeviceCheckIntegrity()
             ok = false;
         }
     }
-    SpinLockRelease(&g_deviceLock, flags);
+    SpinLockRelease(&g_deviceLock);
     return ok;
 }
 
 void DeviceIterate(DeviceType type, bool (*cb)(Device* dev, void* ctx), void* ctx)
 {
     if (!cb) return;
-    uint64_t flags = SpinLockAcquire(&g_deviceLock);
+    SpinLockAcquire(&g_deviceLock);
     for (uint32_t i = 0; i < g_deviceCount; ++i)
     {
         if (!DevicePtrLooksValid(g_devices[i])) continue;
@@ -258,12 +258,12 @@ void DeviceIterate(DeviceType type, bool (*cb)(Device* dev, void* ctx), void* ct
         {
             if (!cb(g_devices[i], ctx))
             {
-                SpinLockRelease(&g_deviceLock, flags);
+                SpinLockRelease(&g_deviceLock);
                 return;
             }
         }
     }
-    SpinLockRelease(&g_deviceLock, flags);
+    SpinLockRelease(&g_deviceLock);
 }
 
 } // namespace brook

@@ -335,28 +335,28 @@ static bool Ext2InodeCacheLookup(Ext2Mount* mnt, uint32_t ino, Ext2Inode* out)
 {
     auto* slot = Ext2InodeCacheSlot(mnt, ino);
     if (!slot) return false;
-    uint64_t flags = SpinLockAcquire(&mnt->inodeCacheLock);
-    if (slot->ino != ino) { SpinLockRelease(&mnt->inodeCacheLock, flags); return false; }
+    SpinLockAcquire(&mnt->inodeCacheLock);
+    if (slot->ino != ino) { SpinLockRelease(&mnt->inodeCacheLock); return false; }
     *out = slot->data;
-    SpinLockRelease(&mnt->inodeCacheLock, flags);
+    SpinLockRelease(&mnt->inodeCacheLock);
     return true;
 }
 static void Ext2InodeCachePut(Ext2Mount* mnt, uint32_t ino, const Ext2Inode* data)
 {
     auto* slot = Ext2InodeCacheSlot(mnt, ino);
     if (!slot) return;
-    uint64_t flags = SpinLockAcquire(&mnt->inodeCacheLock);
+    SpinLockAcquire(&mnt->inodeCacheLock);
     slot->ino = ino;
     slot->data = *data;
-    SpinLockRelease(&mnt->inodeCacheLock, flags);
+    SpinLockRelease(&mnt->inodeCacheLock);
 }
 static void Ext2InodeCacheInvalidate(Ext2Mount* mnt, uint32_t ino)
 {
     auto* slot = Ext2InodeCacheSlot(mnt, ino);
     if (!slot) return;
-    uint64_t flags = SpinLockAcquire(&mnt->inodeCacheLock);
+    SpinLockAcquire(&mnt->inodeCacheLock);
     if (slot->ino == ino) slot->ino = 0;
-    SpinLockRelease(&mnt->inodeCacheLock, flags);
+    SpinLockRelease(&mnt->inodeCacheLock);
 }
 
 // --- Dirent cache helpers ---
@@ -372,20 +372,20 @@ static bool Ext2DirentCacheLookup(Ext2Mount* mnt, uint32_t parentIno,
 {
     if (!mnt->direntCache || nameLen == 0 || nameLen > EXT2_DIRENT_CACHE_NAMELEN) return false;
     auto* table = static_cast<Ext2DirentCacheEntry*>(mnt->direntCache);
-    uint64_t flags = SpinLockAcquire(&mnt->direntCacheLock);
+    SpinLockAcquire(&mnt->direntCacheLock);
     auto& slot = table[Ext2DirentCacheHash(parentIno, name, nameLen)];
     if (slot.parentIno != parentIno || slot.nameLen != nameLen) {
-        SpinLockRelease(&mnt->direntCacheLock, flags);
+        SpinLockRelease(&mnt->direntCacheLock);
         return false;
     }
     for (uint32_t i = 0; i < nameLen; ++i) {
         if (slot.name[i] != name[i]) {
-            SpinLockRelease(&mnt->direntCacheLock, flags);
+            SpinLockRelease(&mnt->direntCacheLock);
             return false;
         }
     }
     *outChild = slot.childIno;
-    SpinLockRelease(&mnt->direntCacheLock, flags);
+    SpinLockRelease(&mnt->direntCacheLock);
     return true;
 }
 static void Ext2DirentCachePut(Ext2Mount* mnt, uint32_t parentIno,
@@ -393,23 +393,23 @@ static void Ext2DirentCachePut(Ext2Mount* mnt, uint32_t parentIno,
 {
     if (!mnt->direntCache || nameLen == 0 || nameLen > EXT2_DIRENT_CACHE_NAMELEN) return;
     auto* table = static_cast<Ext2DirentCacheEntry*>(mnt->direntCache);
-    uint64_t flags = SpinLockAcquire(&mnt->direntCacheLock);
+    SpinLockAcquire(&mnt->direntCacheLock);
     auto& slot = table[Ext2DirentCacheHash(parentIno, name, nameLen)];
     slot.parentIno = parentIno;
     slot.childIno  = childIno;
     slot.nameLen   = static_cast<uint8_t>(nameLen);
     for (uint32_t i = 0; i < nameLen; ++i) slot.name[i] = name[i];
-    SpinLockRelease(&mnt->direntCacheLock, flags);
+    SpinLockRelease(&mnt->direntCacheLock);
 }
 // Invalidate every cache entry referencing parentIno.  Called after add/remove.
 static void Ext2DirentCacheInvalidateParent(Ext2Mount* mnt, uint32_t parentIno)
 {
     if (!mnt->direntCache) return;
     auto* table = static_cast<Ext2DirentCacheEntry*>(mnt->direntCache);
-    uint64_t flags = SpinLockAcquire(&mnt->direntCacheLock);
+    SpinLockAcquire(&mnt->direntCacheLock);
     for (uint32_t i = 0; i < EXT2_DIRENT_CACHE_SIZE; ++i)
         if (table[i].parentIno == parentIno) table[i].parentIno = 0;
-    SpinLockRelease(&mnt->direntCacheLock, flags);
+    SpinLockRelease(&mnt->direntCacheLock);
 }
 
 // --- Data block read cache helpers ---
@@ -430,14 +430,14 @@ static bool Ext2BlockCacheLookup(Ext2Mount* mnt, uint32_t blockNum, void* buf)
 {
     if (!mnt->blockCacheBlockNum) return false;
     uint32_t slot = Ext2BlockCacheSlot(blockNum);
-    uint64_t flags = SpinLockAcquire(&mnt->blockCacheLock);
+    SpinLockAcquire(&mnt->blockCacheLock);
     if (mnt->blockCacheBlockNum[slot] == blockNum && mnt->blockCacheData[slot]) {
         memcpy(buf, mnt->blockCacheData[slot], mnt->blockSize);
-        SpinLockRelease(&mnt->blockCacheLock, flags);
+        SpinLockRelease(&mnt->blockCacheLock);
         __atomic_fetch_add(&g_blockCacheHits, 1, __ATOMIC_RELAXED);
         return true;
     }
-    SpinLockRelease(&mnt->blockCacheLock, flags);
+    SpinLockRelease(&mnt->blockCacheLock);
     __atomic_fetch_add(&g_blockCacheMisses, 1, __ATOMIC_RELAXED);
     return false;
 }
@@ -447,17 +447,17 @@ static void Ext2BlockCachePut(Ext2Mount* mnt, uint32_t blockNum, const void* buf
 {
     if (!mnt->blockCacheBlockNum) return;
     uint32_t slot = Ext2BlockCacheSlot(blockNum);
-    uint64_t flags = SpinLockAcquire(&mnt->blockCacheLock);
+    SpinLockAcquire(&mnt->blockCacheLock);
     if (!mnt->blockCacheData[slot]) {
         mnt->blockCacheData[slot] = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
         if (!mnt->blockCacheData[slot]) {
-            SpinLockRelease(&mnt->blockCacheLock, flags);
+            SpinLockRelease(&mnt->blockCacheLock);
             return;
         }
     }
     mnt->blockCacheBlockNum[slot] = blockNum;
     memcpy(mnt->blockCacheData[slot], buf, mnt->blockSize);
-    SpinLockRelease(&mnt->blockCacheLock, flags);
+    SpinLockRelease(&mnt->blockCacheLock);
 }
 
 // Invalidate a cached data block (e.g. after a write).
@@ -465,10 +465,10 @@ static void Ext2BlockCacheInvalidate(Ext2Mount* mnt, uint32_t blockNum)
 {
     if (!mnt->blockCacheBlockNum) return;
     uint32_t slot = Ext2BlockCacheSlot(blockNum);
-    uint64_t flags = SpinLockAcquire(&mnt->blockCacheLock);
+    SpinLockAcquire(&mnt->blockCacheLock);
     if (mnt->blockCacheBlockNum[slot] == blockNum)
         mnt->blockCacheBlockNum[slot] = 0;
-    SpinLockRelease(&mnt->blockCacheLock, flags);
+    SpinLockRelease(&mnt->blockCacheLock);
 }
 
 // Write a single block from buf.
@@ -479,12 +479,12 @@ static bool Ext2WriteBlock(Ext2Mount* mnt, uint32_t blockNum, const void* buf)
     uint64_t off = static_cast<uint64_t>(blockNum) << mnt->blockShift;
     // Invalidate the indirect-block read cache if we're overwriting it.
     {
-        uint64_t lf = SpinLockAcquire(&mnt->indCacheLock);
+        SpinLockAcquire(&mnt->indCacheLock);
         for (uint32_t s = 0; s < Ext2Mount::IND_CACHE_SLOTS; ++s) {
             if (mnt->indCacheBlockNum[s] == blockNum)
                 mnt->indCacheBlockNum[s] = 0;
         }
-        SpinLockRelease(&mnt->indCacheLock, lf);
+        SpinLockRelease(&mnt->indCacheLock);
     }
     // Invalidate the data block cache.
     Ext2BlockCacheInvalidate(mnt, blockNum);
@@ -762,14 +762,14 @@ static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
                        + fileBlock * 4;
         // Update cache if the indirect block is currently cached.
         {
-            uint64_t lf = SpinLockAcquire(&mnt->indCacheLock);
+            SpinLockAcquire(&mnt->indCacheLock);
             for (uint32_t s = 0; s < Ext2Mount::IND_CACHE_SLOTS; ++s) {
                 if (mnt->indCacheBlockNum[s] == ino->i_block[12] && mnt->indCacheData[s]) {
                     *reinterpret_cast<uint32_t*>(mnt->indCacheData[s] + fileBlock * 4) = nb;
                     break;
                 }
             }
-            SpinLockRelease(&mnt->indCacheLock, lf);
+            SpinLockRelease(&mnt->indCacheLock);
         }
         Ext2DevWrite(mnt, off, &nb, 4);
         return nb;
@@ -1130,13 +1130,13 @@ static uint32_t Ext2ReadIndPointer(Ext2Mount* mnt, uint32_t indBlock, uint32_t i
     if (!indBlock) return 0;
     if (indBlock >= mnt->totalBlocks) return 0; // out-of-range block pointer
     uint32_t entry = 0;
-    uint64_t lf = SpinLockAcquire(&mnt->indCacheLock);
+    SpinLockAcquire(&mnt->indCacheLock);
 
     // Search all cache slots
     for (uint32_t s = 0; s < Ext2Mount::IND_CACHE_SLOTS; ++s) {
         if (mnt->indCacheBlockNum[s] == indBlock && mnt->indCacheData[s]) {
             entry = *reinterpret_cast<uint32_t*>(mnt->indCacheData[s] + idx * 4);
-            SpinLockRelease(&mnt->indCacheLock, lf);
+            SpinLockRelease(&mnt->indCacheLock);
             return entry;
         }
     }
@@ -1148,7 +1148,7 @@ static uint32_t Ext2ReadIndPointer(Ext2Mount* mnt, uint32_t indBlock, uint32_t i
     if (!mnt->indCacheData[victim]) {
         mnt->indCacheData[victim] = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
         if (!mnt->indCacheData[victim]) {
-            SpinLockRelease(&mnt->indCacheLock, lf);
+            SpinLockRelease(&mnt->indCacheLock);
             // Fall back to direct read
             uint64_t off = (static_cast<uint64_t>(indBlock) << mnt->blockShift) + idx * 4;
             if (!Ext2DevRead(mnt, off, &entry, 4)) return 0;
@@ -1159,12 +1159,12 @@ static uint32_t Ext2ReadIndPointer(Ext2Mount* mnt, uint32_t indBlock, uint32_t i
     uint64_t blockOff = static_cast<uint64_t>(indBlock) << mnt->blockShift;
     if (!Ext2DevRead(mnt, blockOff, mnt->indCacheData[victim], mnt->blockSize)) {
         mnt->indCacheBlockNum[victim] = 0;
-        SpinLockRelease(&mnt->indCacheLock, lf);
+        SpinLockRelease(&mnt->indCacheLock);
         return 0;
     }
     mnt->indCacheBlockNum[victim] = indBlock;
     entry = *reinterpret_cast<uint32_t*>(mnt->indCacheData[victim] + idx * 4);
-    SpinLockRelease(&mnt->indCacheLock, lf);
+    SpinLockRelease(&mnt->indCacheLock);
     return entry;
 }
 

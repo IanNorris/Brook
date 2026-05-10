@@ -271,12 +271,12 @@ bool VmmMapPage(PageTable pt, VirtualAddress virtAddr, PhysicalAddress physAddr,
     // levels (PML4 → PDPT → PD → PT pages).
     bool isKernel = !pt;
     SpinLock& ptLock = isKernel ? g_kernelPtLock : g_userPtLock;
-    uint64_t lf = SpinLockAcquire(&ptLock);
+    SpinLockAcquire(&ptLock);
 
     uint64_t* pte = WalkToPtr(pt, virtAddr, /*create=*/true, flags);
     if (!pte)
     {
-        SpinLockRelease(&ptLock, lf);
+        SpinLockRelease(&ptLock);
         return false;
     }
 
@@ -288,7 +288,7 @@ bool VmmMapPage(PageTable pt, VirtualAddress virtAddr, PhysicalAddress physAddr,
          | (flags & VMM_NO_EXEC);
     Invlpg(virtAddr);
 
-    SpinLockRelease(&ptLock, lf);
+    SpinLockRelease(&ptLock);
     return true;
 }
 
@@ -296,7 +296,7 @@ void VmmUnmapPage(PageTable pt, VirtualAddress virtAddr)
 {
     bool isKernel = !pt;
     SpinLock& ptLock = isKernel ? g_kernelPtLock : g_userPtLock;
-    uint64_t lf = SpinLockAcquire(&ptLock);
+    SpinLockAcquire(&ptLock);
 
     uint64_t* pte = WalkToPtr(pt, virtAddr, /*create=*/false);
     if (pte && (*pte & VMM_PRESENT))
@@ -305,18 +305,18 @@ void VmmUnmapPage(PageTable pt, VirtualAddress virtAddr)
         Invlpg(virtAddr);
     }
 
-    SpinLockRelease(&ptLock, lf);
+    SpinLockRelease(&ptLock);
 }
 
 VirtualAddress VmmAllocPages(uint64_t pageCount, uint64_t flags, MemTag tag, uint16_t pid)
 {
     if (pageCount == 0) return VirtualAddress{};
 
-    uint64_t lf = SpinLockAcquire(&g_vmmLock);
+    SpinLockAcquire(&g_vmmLock);
 
     if (g_vmallocNext + pageCount * PAGE_SIZE > VMALLOC_BASE + VMALLOC_SIZE)
     {
-        SpinLockRelease(&g_vmmLock, lf);
+        SpinLockRelease(&g_vmmLock);
         return VirtualAddress{};
     }
 
@@ -340,7 +340,7 @@ VirtualAddress VmmAllocPages(uint64_t pageCount, uint64_t flags, MemTag tag, uin
                 }
             }
             g_vmallocNext = virtBase;
-            SpinLockRelease(&g_vmmLock, lf);
+            SpinLockRelease(&g_vmmLock);
             return VirtualAddress{};
         }
 
@@ -359,7 +359,7 @@ VirtualAddress VmmAllocPages(uint64_t pageCount, uint64_t flags, MemTag tag, uin
                 }
             }
             g_vmallocNext = virtBase;
-            SpinLockRelease(&g_vmmLock, lf);
+            SpinLockRelease(&g_vmmLock);
             return VirtualAddress{};
         }
     }
@@ -373,7 +373,7 @@ VirtualAddress VmmAllocPages(uint64_t pageCount, uint64_t flags, MemTag tag, uin
         slot->pid       = pid;
     }
 
-    SpinLockRelease(&g_vmmLock, lf);
+    SpinLockRelease(&g_vmmLock);
     return VirtualAddress(virtBase);
 }
 
@@ -384,11 +384,11 @@ VirtualAddress VmmAllocKernelStack(uint64_t pageCount, MemTag tag, uint16_t pid)
     // Reserve pageCount + 2 virtual pages: [guard] [usable * pageCount] [guard]
     uint64_t totalPages = pageCount + 2;
 
-    uint64_t lf = SpinLockAcquire(&g_vmmLock);
+    SpinLockAcquire(&g_vmmLock);
 
     if (g_vmallocNext + totalPages * PAGE_SIZE > VMALLOC_BASE + VMALLOC_SIZE)
     {
-        SpinLockRelease(&g_vmmLock, lf);
+        SpinLockRelease(&g_vmmLock);
         return VirtualAddress{};
     }
 
@@ -414,7 +414,7 @@ VirtualAddress VmmAllocKernelStack(uint64_t pageCount, MemTag tag, uint16_t pid)
                 }
             }
             g_vmallocNext = virtBase;
-            SpinLockRelease(&g_vmmLock, lf);
+            SpinLockRelease(&g_vmmLock);
             return VirtualAddress{};
         }
 
@@ -433,7 +433,7 @@ VirtualAddress VmmAllocKernelStack(uint64_t pageCount, MemTag tag, uint16_t pid)
                 }
             }
             g_vmallocNext = virtBase;
-            SpinLockRelease(&g_vmmLock, lf);
+            SpinLockRelease(&g_vmmLock);
             return VirtualAddress{};
         }
     }
@@ -447,7 +447,7 @@ VirtualAddress VmmAllocKernelStack(uint64_t pageCount, MemTag tag, uint16_t pid)
         slot->pid       = pid;
     }
 
-    SpinLockRelease(&g_vmmLock, lf);
+    SpinLockRelease(&g_vmmLock);
     return VirtualAddress(usableBase);
 }
 
@@ -463,11 +463,11 @@ VirtualAddress VmmAllocModulePages(uint64_t pageCount, uint64_t flags, MemTag ta
 {
     if (pageCount == 0) return VirtualAddress{};
 
-    uint64_t lf = SpinLockAcquire(&g_vmmLock);
+    SpinLockAcquire(&g_vmmLock);
 
     if (g_moduleNext + pageCount * PAGE_SIZE > MODULE_BASE + MODULE_SIZE)
     {
-        SpinLockRelease(&g_vmmLock, lf);
+        SpinLockRelease(&g_vmmLock);
         return VirtualAddress{};
     }
 
@@ -491,7 +491,7 @@ VirtualAddress VmmAllocModulePages(uint64_t pageCount, uint64_t flags, MemTag ta
                 }
             }
             g_moduleNext = virtBase;
-            SpinLockRelease(&g_vmmLock, lf);
+            SpinLockRelease(&g_vmmLock);
             return VirtualAddress{};
         }
 
@@ -510,7 +510,7 @@ VirtualAddress VmmAllocModulePages(uint64_t pageCount, uint64_t flags, MemTag ta
                 }
             }
             g_moduleNext = virtBase;
-            SpinLockRelease(&g_vmmLock, lf);
+            SpinLockRelease(&g_vmmLock);
             return VirtualAddress{};
         }
     }
@@ -524,13 +524,13 @@ VirtualAddress VmmAllocModulePages(uint64_t pageCount, uint64_t flags, MemTag ta
         slot->pid       = pid;
     }
 
-    SpinLockRelease(&g_vmmLock, lf);
+    SpinLockRelease(&g_vmmLock);
     return VirtualAddress(virtBase);
 }
 
 void VmmFreePages(VirtualAddress virtAddr, uint64_t pageCount)
 {
-    uint64_t lf = SpinLockAcquire(&g_vmmLock);
+    SpinLockAcquire(&g_vmmLock);
 
     for (uint64_t i = 0; i < pageCount; i++)
     {
@@ -548,7 +548,7 @@ void VmmFreePages(VirtualAddress virtAddr, uint64_t pageCount)
     VmmAllocation* alloc = FindAllocSlot(virtAddr.raw());
     if (alloc) alloc->virtBase = 0;
 
-    SpinLockRelease(&g_vmmLock, lf);
+    SpinLockRelease(&g_vmmLock);
 }
 
 PhysicalAddress VmmVirtToPhys(PageTable pt, VirtualAddress virtAddr)
@@ -641,7 +641,7 @@ bool VmmKernelMarkReadOnly(VirtualAddress virtAddr, uint64_t size)
         return false;
     }
 
-    uint64_t lf = SpinLockAcquire(&g_kernelPtLock);
+    SpinLockAcquire(&g_kernelPtLock);
     bool ok = true;
     for (uint64_t off = 0; off < size; off += PAGE_SIZE)
     {
@@ -657,7 +657,7 @@ bool VmmKernelMarkReadOnly(VirtualAddress virtAddr, uint64_t size)
         *pte &= ~VMM_WRITABLE;
         Invlpg(page);
     }
-    SpinLockRelease(&g_kernelPtLock, lf);
+    SpinLockRelease(&g_kernelPtLock);
     return ok;
 }
 

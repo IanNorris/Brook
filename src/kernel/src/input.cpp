@@ -17,7 +17,7 @@ static SpinLock g_waiterLock;
 
 void InputAddWaiter(Process* proc)
 {
-    uint64_t flags = SpinLockAcquire(&g_waiterLock);
+    SpinLockAcquire(&g_waiterLock);
     uint32_t n = g_waiterCount;
     if (n < WAITER_MAX)
     {
@@ -31,12 +31,12 @@ void InputAddWaiter(Process* proc)
             g_waiterCount = n + 1;
         }
     }
-    SpinLockRelease(&g_waiterLock, flags);
+    SpinLockRelease(&g_waiterLock);
 }
 
 void InputRemoveWaiter(Process* proc)
 {
-    uint64_t flags = SpinLockAcquire(&g_waiterLock);
+    SpinLockAcquire(&g_waiterLock);
     uint32_t n = g_waiterCount;
     for (uint32_t i = 0; i < n; ++i)
     {
@@ -48,16 +48,16 @@ void InputRemoveWaiter(Process* proc)
             break;
         }
     }
-    SpinLockRelease(&g_waiterLock, flags);
+    SpinLockRelease(&g_waiterLock);
 }
 
 void InputWakeWaiters()
 {
-    uint64_t flags = SpinLockAcquire(&g_waiterLock);
+    SpinLockAcquire(&g_waiterLock);
     uint32_t n = g_waiterCount;
     if (n == 0)
     {
-        SpinLockRelease(&g_waiterLock, flags);
+        SpinLockRelease(&g_waiterLock);
         return;
     }
 
@@ -71,7 +71,7 @@ void InputWakeWaiters()
         __atomic_store_n(&snap[i]->pendingWakeup, 1, __ATOMIC_RELEASE);
     }
     g_waiterCount = 0;
-    SpinLockRelease(&g_waiterLock, flags);
+    SpinLockRelease(&g_waiterLock);
 
     for (uint32_t i = 0; i < n; ++i)
         SchedulerUnblock(snap[i]);

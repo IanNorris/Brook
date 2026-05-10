@@ -50,11 +50,11 @@ struct PipeBuffer
     // Non-blocking write. Returns bytes written (may be partial).
     uint32_t write(const char* src, uint32_t len)
     {
-        uint64_t flags = SpinLockAcquire(&lock);
+        SpinLockAcquire(&lock);
 
         if (!data || capacity == 0)
         {
-            SpinLockRelease(&lock, flags);
+            SpinLockRelease(&lock);
             return 0;
         }
 
@@ -67,18 +67,18 @@ struct PipeBuffer
             head = (head + 1) % capacity;
         }
 
-        SpinLockRelease(&lock, flags);
+        SpinLockRelease(&lock);
         return len;
     }
 
     // Non-blocking read. Returns bytes read (may be 0).
     uint32_t read(char* dst, uint32_t len)
     {
-        uint64_t flags = SpinLockAcquire(&lock);
+        SpinLockAcquire(&lock);
 
         if (!data || capacity == 0)
         {
-            SpinLockRelease(&lock, flags);
+            SpinLockRelease(&lock);
             return 0;
         }
 
@@ -91,7 +91,7 @@ struct PipeBuffer
             tail = (tail + 1) % capacity;
         }
 
-        SpinLockRelease(&lock, flags);
+        SpinLockRelease(&lock);
         return len;
     }
 };

@@ -727,19 +727,19 @@ static PhysicalAddress PageCacheLookup(Vnode* vn, uint64_t pageIdx)
 {
     uint64_t cid = vn->cacheId;
     if (!cid) return PhysicalAddress(0); // no cache identity
-    uint64_t flags = SpinLockAcquire(&g_pageCacheLock);
+    SpinLockAcquire(&g_pageCacheLock);
     uint32_t slot = PageCacheHash(cid, pageIdx);
     for (uint32_t i = 0; i < 32; ++i) {
         uint32_t s = (slot + i) % PAGE_CACHE_SLOTS;
         auto& e = g_pageCache[s];
         if (e.cacheId == cid && e.pageIndex == pageIdx) {
             PmmRefPage(e.phys);
-            SpinLockRelease(&g_pageCacheLock, flags);
+            SpinLockRelease(&g_pageCacheLock);
             return e.phys;
         }
         if (!e.cacheId) break;
     }
-    SpinLockRelease(&g_pageCacheLock, flags);
+    SpinLockRelease(&g_pageCacheLock);
     return PhysicalAddress(0);
 }
 
@@ -748,7 +748,7 @@ static void PageCacheInsert(Vnode* vn, uint64_t pageIdx, PhysicalAddress phys)
 {
     uint64_t cid = vn->cacheId;
     if (!cid) { PmmUnrefPage(phys); return; } // no cache identity
-    uint64_t flags = SpinLockAcquire(&g_pageCacheLock);
+    SpinLockAcquire(&g_pageCacheLock);
     uint32_t slot = PageCacheHash(cid, pageIdx);
     for (uint32_t i = 0; i < 32; ++i) {
         uint32_t s = (slot + i) % PAGE_CACHE_SLOTS;
@@ -759,16 +759,16 @@ static void PageCacheInsert(Vnode* vn, uint64_t pageIdx, PhysicalAddress phys)
             e.vnode = vn;
             e.pageIndex = pageIdx;
             e.phys = phys;
-            SpinLockRelease(&g_pageCacheLock, flags);
+            SpinLockRelease(&g_pageCacheLock);
             return;
         }
         if (e.cacheId == cid && e.pageIndex == pageIdx) {
-            SpinLockRelease(&g_pageCacheLock, flags);
+            SpinLockRelease(&g_pageCacheLock);
             PmmUnrefPage(phys);
             return;
         }
     }
-    SpinLockRelease(&g_pageCacheLock, flags);
+    SpinLockRelease(&g_pageCacheLock);
     PmmUnrefPage(phys);
 }
 
@@ -3281,10 +3281,10 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     // read-modify-write of leader->mmapNext AND any unmap-in-place
     // operation for MAP_FIXED, so two threads can't race on the same range.
     auto pickAddr = [&]() -> uint64_t {
-        uint64_t lf = SpinLockAcquire(&s_mmapLock);
+        SpinLockAcquire(&s_mmapLock);
         uint64_t result = 0;
         if (flags & MAP_FIXED) {
-            if (addr == 0) { SpinLockRelease(&s_mmapLock, lf); return 0; }
+            if (addr == 0) { SpinLockRelease(&s_mmapLock); return 0; }
             // Warn if MAP_FIXED overlaps the interpreter region
             constexpr uint64_t INTERP_BASE = 0x7F0000000000ULL;
             constexpr uint64_t INTERP_END  = INTERP_BASE + 0x40000; // ~256KB for ld-linux
@@ -3312,14 +3312,14 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                 if (free) base = addr;
             }
             if (base + pages * 4096 > USER_MMAP_END) {
-                SpinLockRelease(&s_mmapLock, lf);
+                SpinLockRelease(&s_mmapLock);
                 return 0;
             }
             if (base >= leader->mmapNext)
                 leader->mmapNext = base + pages * 4096;
             result = base;
         }
-        SpinLockRelease(&s_mmapLock, lf);
+        SpinLockRelease(&s_mmapLock);
         return result;
     };
 
