@@ -779,14 +779,18 @@ static void TerminalThreadFn(void* arg)
 
         if (n == 0)
         {
-            // Check if child still alive — use a brief delay to avoid
-            // racing with transient pipe-empty conditions (e.g. child
-            // forked a subprocess that just closed its write end).
-            self->wakeupTick = g_lapicTickCount + 50;
+            // Check if child still alive — use a delay to avoid racing
+            // with transient pipe-empty conditions (e.g. child forked a
+            // subprocess that just closed its write end).
+            self->wakeupTick = g_lapicTickCount + 200;
             SchedulerBlock(self);
 
-            // Re-check after waking — only close if bash is truly gone
-            if (t->child && t->child->state == ProcessState::Terminated)
+            // Only close when bash is truly gone AND no writers remain on
+            // the output pipe. Checking writers prevents premature close
+            // when bash is alive but a background child just exited and
+            // caused a transient pipe-empty condition.
+            if (t->child && t->child->state == ProcessState::Terminated
+                && outPipe->writers == 0)
             {
                 SerialPrintf("TERMINAL: child exited (pid=%u status=%d), closing\n",
                              t->child->pid, t->child->exitStatus);
