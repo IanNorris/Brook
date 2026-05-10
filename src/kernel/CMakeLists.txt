@@ -192,6 +192,7 @@ add_executable(kernel
     src/virtio_blk.cpp
     src/acpi.cpp
     src/apic.cpp
+    src/tlb_test.cpp
     src/tty.cpp
     src/sync/kmutex.cpp
     src/sync/krwlock.cpp
@@ -285,6 +286,7 @@ target_compile_definitions(kernel PRIVATE
 set_source_files_properties(
     src/idt.cpp
     src/apic.cpp
+    src/tlb_test.cpp
     src/scheduler.cpp
     src/compositor.cpp
     src/keyboard.cpp

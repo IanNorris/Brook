@@ -127,4 +127,8 @@ void TlbShootdown(uint64_t targetCr3, uint64_t virtualAddr);
 // loaded. Used after bulk PTE changes (exec, fork PTE downgrade).
 void TlbShootdownFull(uint64_t targetCr3);
 
+// Run TLB shootdown self-test (call after SMP is fully online).
+// Returns true if all tests pass, false on failure.
+bool TlbShootdownSelfTest();
+
 } // namespace brook
