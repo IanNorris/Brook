@@ -18,6 +18,7 @@
 #include "ext2_vfs.h"
 #include "string.h"
 #include "spinlock.h"
+#include "smp.h"
 
 namespace brook {
 
@@ -1670,6 +1671,15 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
 {
     if (!proc || proc->isKernelThread) return 0;
 
+    // Pin this process to the current CPU for the duration of the address
+    // space transition.  Without pinning, a preemption between the CR3
+    // switch to kernel page table and the new page table setup could leave
+    // stale user TLB entries on another CPU — allowing reads/writes to
+    // freed physical pages (BRO-133).
+    int32_t oldAffinity = __atomic_load_n(&proc->cpuAffinity, __ATOMIC_ACQUIRE);
+    uint32_t currentCpu = SmpCurrentCpuIndex();
+    __atomic_store_n(&proc->cpuAffinity, static_cast<int32_t>(currentCpu), __ATOMIC_RELEASE);
+
     // Save the old page table and switch CR3 to the kernel's page table
     // BEFORE destroying the old one. This avoids a use-after-free: the
     // CPU's CR3 would point to a freed PML4 page otherwise.
@@ -1850,6 +1860,11 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     }
 
     *outStackPtr = userSP;
+
+    // Address space transition complete — new page table is fully set up.
+    // Restore the original CPU affinity.
+    __atomic_store_n(&proc->cpuAffinity, oldAffinity, __ATOMIC_RELEASE);
+
     // If dynamically linked, start at the interpreter's entry point;
     // otherwise, start at the main binary's entry.
     return interpEntry ? interpEntry : proc->elf.entryPoint;
