@@ -10333,7 +10333,12 @@ static int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
     }
 
     // AF_INET6 (10) — not supported
-    if (domain != AF_INET) return -EAFNOSUPPORT;
+    if (domain != AF_INET) {
+        extern volatile uint64_t g_lapicTickCount;
+        SerialPrintf("[NET_DIAG] socket_REJECTED t=%lums pid=%u tgid=%u domain=%lu type=0x%lx\n",
+                     g_lapicTickCount, proc->pid, proc->tgid, domain, type);
+        return -EAFNOSUPPORT;
+    }
 
     int sockIdx = SockCreate(static_cast<int>(domain),
                               static_cast<int>(type & 0xFF), // mask SOCK_NONBLOCK etc
@@ -10693,6 +10698,17 @@ static int64_t sys_getsockname(uint64_t fdVal, uint64_t addrVal, uint64_t addrLe
     local.sin_addr = tmpIp;
     local.sin_port = tmpPort;
 
+    {
+        extern volatile uint64_t g_lapicTickCount;
+        SerialPrintf("[NET_DIAG] getsockname t=%lums pid=%u fd=%d -> %u.%u.%u.%u:%u\n",
+                     g_lapicTickCount, proc->pid, fd,
+                     (brook::ntohl(tmpIp) >> 24) & 0xFF,
+                     (brook::ntohl(tmpIp) >> 16) & 0xFF,
+                     (brook::ntohl(tmpIp) >> 8) & 0xFF,
+                     brook::ntohl(tmpIp) & 0xFF,
+                     brook::ntohs(tmpPort));
+    }
+
     uint32_t copyLen = *ulen;
     if (copyLen > sizeof(local)) copyLen = sizeof(local);
     __builtin_memcpy(uaddr, &local, copyLen);
@@ -10700,9 +10716,40 @@ static int64_t sys_getsockname(uint64_t fdVal, uint64_t addrVal, uint64_t addrLe
     return 0;
 }
 
-static int64_t sys_getpeername(uint64_t, uint64_t, uint64_t,
+static int64_t sys_getpeername(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
                                 uint64_t, uint64_t, uint64_t)
 {
+    Process* proc = ProcessCurrent();
+    extern volatile uint64_t g_lapicTickCount;
+    SerialPrintf("[NET_DIAG] getpeername t=%lums pid=%u fd=%d\n",
+                 g_lapicTickCount, proc ? proc->pid : 0, static_cast<int>(fdVal));
+
+    if (!proc) return -ENOSYS;
+    int fd = static_cast<int>(fdVal);
+
+    // For inet DGRAM sockets that are "connected" via connect(), return the peer address
+    int sockIdx = GetSockIdx(proc, fd);
+    if (sockIdx >= 0) {
+        uint32_t remIp = 0;
+        uint16_t remPort = 0;
+        brook::SockGetRemote(sockIdx, &remIp, &remPort);
+        if (remIp != 0 || remPort != 0) {
+            auto* uaddr = reinterpret_cast<brook::SockAddrIn*>(addrVal);
+            auto* ulen  = reinterpret_cast<uint32_t*>(addrLenVal);
+            if (uaddr && ulen) {
+                brook::SockAddrIn peer{};
+                peer.sin_family = AF_INET;
+                peer.sin_addr = remIp;
+                peer.sin_port = remPort;
+                uint32_t copyLen = *ulen;
+                if (copyLen > sizeof(peer)) copyLen = sizeof(peer);
+                __builtin_memcpy(uaddr, &peer, copyLen);
+                *ulen = sizeof(peer);
+                return 0;
+            }
+        }
+    }
+
     return -ENOTCONN;
 }
 

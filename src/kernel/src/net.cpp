@@ -2496,6 +2496,15 @@ void SockGetLocal(int sockIdx, uint32_t* ip, uint16_t* port)
     if (port) *port = s.localPort;
 }
 
+void SockGetRemote(int sockIdx, uint32_t* ip, uint16_t* port)
+{
+    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return;
+    if (!g_sockUsed[sockIdx]) return;
+    Socket& s = g_sockets[sockIdx];
+    if (ip)   *ip   = s.remoteIp;
+    if (port) *port = s.remotePort;
+}
+
 bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite)
 {
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return false;
