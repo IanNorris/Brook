@@ -4,11 +4,16 @@
 #include "memory/physical_memory.h"
 #include "serial.h"
 #include "portio.h"
+#include "smp.h"
+#include "spinlock.h"
 
 // Declared at global scope in idt.cpp
 void IdtInstallHandler(uint8_t vector, void* handler);
 
 namespace brook {
+
+// Per-CPU lock diagnostics — indexed by CPU index.
+LockDiagInfo g_lockDiag[MAX_CPUS] = {};
 
 // ---------------------------------------------------------------------------
 // Port I/O
@@ -628,6 +633,304 @@ void ApicInitReschedIpi()
 {
     ::IdtInstallHandler(LAPIC_RESCHED_VECTOR,
                         reinterpret_cast<void*>(ReschedIpiHandler));
+}
+
+// ---------------------------------------------------------------------------
+// TLB Shootdown IPI — with deadlock detection diagnostics
+// ---------------------------------------------------------------------------
+//
+// Protocol:
+//   1. Initiator modifies PTE, does local invlpg
+//   2. Initiator acquires g_tlbRequest.lock (IF=0)
+//   3. Fills targetCr3, addr (0 = full flush), sets pendingCount
+//   4. Sends TLB_SHOOTDOWN_VECTOR IPI to each target CPU
+//   5. Spins waiting for pendingCount to reach 0, with TIMEOUT
+//   6. Releases lock
+//
+// Handler (naked ISR on target CPU):
+//   1. Compare current CR3 with g_tlbRequest.targetCr3
+//   2. If match: invlpg(addr) or CR3 reload (addr == 0)
+//   3. Decrement pendingCount
+//   4. EOI
+//
+// The handler must NOT acquire any lock — the initiator holds the spinlock
+// and waits synchronously, so any lock attempt would deadlock.
+
+struct TlbShootdownRequest {
+    SpinLock        lock;
+    volatile uint64_t pendingCount;   // decremented by each responder
+    uint64_t        targetCr3;        // only invalidate if CPU's CR3 matches
+    uint64_t        addr;             // page VA to invalidate (0 = full flush)
+    volatile uint64_t ackBitmap;      // bit set by each CPU on ack (diagnostic)
+};
+
+static TlbShootdownRequest g_tlbRequest;
+
+// Timeout for the spin-wait: ~10ms at 2.5GHz ≈ 25M iterations of pause loop.
+// Each pause is ~10-100 cycles, so 500K iterations ≈ 5-50ms.
+static constexpr uint64_t TLB_SHOOTDOWN_TIMEOUT = 500000;
+
+static void TlbShootdownHandlerInner()
+{
+    uint64_t myCr3;
+    __asm__ volatile("movq %%cr3, %0" : "=r"(myCr3));
+
+    if ((myCr3 & ~0xFFFULL) == (g_tlbRequest.targetCr3 & ~0xFFFULL))
+    {
+        if (g_tlbRequest.addr != 0)
+        {
+            // Single-page invalidation
+            __asm__ volatile("invlpg (%0)" :: "r"(g_tlbRequest.addr) : "memory");
+        }
+        else
+        {
+            // Full flush: reload CR3
+            __asm__ volatile("movq %0, %%cr3" :: "r"(myCr3) : "memory");
+        }
+    }
+
+    // Mark this CPU as acked (diagnostic bitmap).
+    uint32_t cpu;
+    __asm__ volatile("movl %%gs:176, %0" : "=r"(cpu));
+    if (cpu < 64)
+        __atomic_fetch_or(&g_tlbRequest.ackBitmap, 1ULL << cpu, __ATOMIC_RELAXED);
+
+    __atomic_fetch_sub(&g_tlbRequest.pendingCount, 1, __ATOMIC_ACQ_REL);
+
+    LapicWrite(LapicReg::EOI, 0);
+}
+
+// Naked ISR — same structure as ReschedIpiHandler.
+__attribute__((naked))
+static void TlbShootdownHandler(void)
+{
+    __asm__ volatile(
+        // swapgs if we interrupted user mode
+        "testq $3, 8(%%rsp)\n\t"
+        "jz 1f\n\t"
+        "swapgs\n\t"
+        "1:\n\t"
+        "push %%rax\n\t"
+        "push %%rbx\n\t"
+        "push %%rcx\n\t"
+        "push %%rdx\n\t"
+        "push %%rsi\n\t"
+        "push %%rdi\n\t"
+        "push %%rbp\n\t"
+        "push %%r8\n\t"
+        "push %%r9\n\t"
+        "push %%r10\n\t"
+        "push %%r11\n\t"
+        "push %%r12\n\t"
+        "push %%r13\n\t"
+        "push %%r14\n\t"
+        "push %%r15\n\t"
+        "cld\n\t"
+        "call %P0\n\t"
+        "pop %%r15\n\t"
+        "pop %%r14\n\t"
+        "pop %%r13\n\t"
+        "pop %%r12\n\t"
+        "pop %%r11\n\t"
+        "pop %%r10\n\t"
+        "pop %%r9\n\t"
+        "pop %%r8\n\t"
+        "pop %%rbp\n\t"
+        "pop %%rdi\n\t"
+        "pop %%rsi\n\t"
+        "pop %%rdx\n\t"
+        "pop %%rcx\n\t"
+        "pop %%rbx\n\t"
+        "pop %%rax\n\t"
+        "testq $3, 8(%%rsp)\n\t"
+        "jz 2f\n\t"
+        "swapgs\n\t"
+        "2:\n\t"
+        "iretq\n\t"
+        :
+        : "i"(TlbShootdownHandlerInner)
+        : "memory"
+    );
+}
+
+void ApicInitTlbShootdown()
+{
+    ::IdtInstallHandler(TLB_SHOOTDOWN_VECTOR,
+                        reinterpret_cast<void*>(TlbShootdownHandler));
+}
+
+// Send a TLB shootdown IPI to a specific CPU by its CPU index.
+static void ApicSendTlbShootdownIpi(uint32_t targetCpuIndex)
+{
+    const CpuInfo* info = SmpGetCpu(targetCpuIndex);
+    if (!info || !info->online)
+        return;
+
+    uint8_t apicId = info->apicId;
+
+    // Wait for previous IPI delivery to complete
+    while (LapicRead(LapicReg::ICR_LO) & (1u << 12))
+        __asm__ volatile("pause");
+
+    LapicWrite(LapicReg::ICR_HI, static_cast<uint32_t>(apicId) << 24);
+    // Fixed delivery, level assert, vector = TLB_SHOOTDOWN_VECTOR
+    LapicWrite(LapicReg::ICR_LO, TLB_SHOOTDOWN_VECTOR | (1u << 14));
+}
+
+// Dump diagnostic info when TLB shootdown times out — called with IF=0.
+// Uses SerialPrintf which busy-waits the UART (safe without locks).
+[[noreturn]]
+static void TlbShootdownTimeoutPanic(uint32_t myCpu, uint64_t targetMask,
+                                      uint64_t ackBitmap, uint64_t targetCr3,
+                                      uint64_t addr)
+{
+    uint64_t pending = __atomic_load_n(&g_tlbRequest.pendingCount, __ATOMIC_ACQUIRE);
+    uint64_t notAcked = targetMask & ~ackBitmap;
+
+    SerialPrintf("\n!!! TLB_SHOOTDOWN: TIMEOUT — deadlock detected !!!\n");
+    SerialPrintf("  initiator: CPU %u\n", myCpu);
+    SerialPrintf("  targetCr3: 0x%lx  addr: 0x%lx\n", targetCr3, addr);
+    SerialPrintf("  pendingCount: %lu\n", pending);
+    SerialPrintf("  targetMask: 0x%lx  ackBitmap: 0x%lx\n", targetMask, ackBitmap);
+    SerialPrintf("  not-acked CPUs (IF=0, holding lock?):\n");
+
+    uint32_t cpuCount = SmpGetCpuCount();
+    for (uint32_t i = 0; i < cpuCount; i++)
+    {
+        if (!(notAcked & (1ULL << i))) continue;
+
+        const auto& diag = g_lockDiag[i];
+        if (diag.held && diag.file)
+        {
+            SerialPrintf("    CPU %u: IF=0, lock at %s:%u\n",
+                         i, diag.file, diag.line);
+        }
+        else
+        {
+            SerialPrintf("    CPU %u: IF=0, no lock info (held=%u)\n",
+                         i, diag.held);
+        }
+    }
+
+    SerialPrintf("  acked CPUs:\n");
+    for (uint32_t i = 0; i < cpuCount; i++)
+    {
+        if (!(ackBitmap & (1ULL << i))) continue;
+        SerialPrintf("    CPU %u: acked OK\n", i);
+    }
+
+    // Halt all APs and panic
+    SerialPrintf("KERNEL PANIC: TLB shootdown deadlock\n");
+    SmpHaltAllAPs();
+    while (true) __asm__ volatile("hlt");
+}
+
+// Common spin-wait with timeout. Returns true if all CPUs acked, false on timeout.
+static bool TlbShootdownWait(uint32_t myCpu, uint64_t targetMask,
+                              uint64_t targetCr3, uint64_t addr)
+{
+    uint64_t spins = 0;
+    while (__atomic_load_n(&g_tlbRequest.pendingCount, __ATOMIC_ACQUIRE) != 0)
+    {
+        __asm__ volatile("pause" ::: "memory");
+        if (++spins > TLB_SHOOTDOWN_TIMEOUT)
+        {
+            uint64_t ackBitmap = __atomic_load_n(&g_tlbRequest.ackBitmap, __ATOMIC_ACQUIRE);
+            TlbShootdownTimeoutPanic(myCpu, targetMask, ackBitmap, targetCr3, addr);
+            // noreturn
+        }
+    }
+    return true;
+}
+
+void TlbShootdown(uint64_t targetCr3, uint64_t virtualAddr)
+{
+    if (SmpGetCpuCount() <= 1)
+        return;
+
+    // Local invalidation first
+    __asm__ volatile("invlpg (%0)" :: "r"(virtualAddr) : "memory");
+
+    uint32_t myCpu = SmpCurrentCpuIndex();
+    uint32_t cpuCount = SmpGetCpuCount();
+
+    // Build target mask: all online CPUs except self
+    uint64_t targetMask = 0;
+    for (uint32_t i = 0; i < cpuCount; i++)
+    {
+        if (i == myCpu) continue;
+        const CpuInfo* info = SmpGetCpu(i);
+        if (info && info->online)
+            targetMask |= (1ULL << i);
+    }
+
+    if (targetMask == 0)
+        return;
+
+    uint32_t targetCount = __builtin_popcountll(targetMask);
+
+    uint64_t flags = SpinLockAcquire(&g_tlbRequest.lock);
+
+    g_tlbRequest.targetCr3 = targetCr3;
+    g_tlbRequest.addr      = virtualAddr;
+    __atomic_store_n(&g_tlbRequest.ackBitmap, 0ULL, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_tlbRequest.pendingCount, targetCount, __ATOMIC_RELEASE);
+
+    // Send IPI to each target
+    for (uint32_t i = 0; i < cpuCount; i++)
+    {
+        if (targetMask & (1ULL << i))
+            ApicSendTlbShootdownIpi(i);
+    }
+
+    TlbShootdownWait(myCpu, targetMask, targetCr3, virtualAddr);
+
+    SpinLockRelease(&g_tlbRequest.lock, flags);
+}
+
+void TlbShootdownFull(uint64_t targetCr3)
+{
+    if (SmpGetCpuCount() <= 1)
+        return;
+
+    // Local full flush
+    uint64_t cr3;
+    __asm__ volatile("movq %%cr3, %0" : "=r"(cr3));
+    __asm__ volatile("movq %0, %%cr3" :: "r"(cr3) : "memory");
+
+    uint32_t myCpu = SmpCurrentCpuIndex();
+    uint32_t cpuCount = SmpGetCpuCount();
+
+    uint64_t targetMask = 0;
+    for (uint32_t i = 0; i < cpuCount; i++)
+    {
+        if (i == myCpu) continue;
+        const CpuInfo* info = SmpGetCpu(i);
+        if (info && info->online)
+            targetMask |= (1ULL << i);
+    }
+
+    if (targetMask == 0)
+        return;
+
+    uint32_t targetCount = __builtin_popcountll(targetMask);
+
+    uint64_t flags = SpinLockAcquire(&g_tlbRequest.lock);
+
+    g_tlbRequest.targetCr3 = targetCr3;
+    g_tlbRequest.addr      = 0;  // 0 = full flush
+    __atomic_store_n(&g_tlbRequest.ackBitmap, 0ULL, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_tlbRequest.pendingCount, targetCount, __ATOMIC_RELEASE);
+
+    for (uint32_t i = 0; i < cpuCount; i++)
+    {
+        if (targetMask & (1ULL << i))
+            ApicSendTlbShootdownIpi(i);
+    }
+
+    TlbShootdownWait(myCpu, targetMask, targetCr3, 0);
+
+    SpinLockRelease(&g_tlbRequest.lock, flags);
 }
 
 // ---------------------------------------------------------------------------

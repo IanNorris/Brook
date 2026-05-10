@@ -107,4 +107,28 @@ void ApicSendRescheduleIpi(uint8_t targetApicId);
 // Register the reschedule IPI handler in the IDT. Called once during init.
 void ApicInitReschedIpi();
 
+// ---------------------------------------------------------------------------
+// TLB Shootdown
+// ---------------------------------------------------------------------------
+
+// TLB shootdown IPI vector — sent to remote CPUs to invalidate stale TLB
+// entries after PTE modifications (unmap, COW, mprotect, exec).
+static constexpr uint8_t TLB_SHOOTDOWN_VECTOR = 0xFC;
+
+// Register the TLB shootdown IPI handler in the IDT. Called once during init.
+void ApicInitTlbShootdown();
+
+// Invalidate a single page on all remote CPUs that have the given process's
+// address space loaded. Does a local invlpg first, then sends IPIs and waits.
+// No-op on single-CPU systems.
+void TlbShootdown(uint64_t targetCr3, uint64_t virtualAddr);
+
+// Full TLB flush (CR3 reload) on all remote CPUs that have the given CR3
+// loaded. Used after bulk PTE changes (exec, fork PTE downgrade).
+void TlbShootdownFull(uint64_t targetCr3);
+
+// Run TLB shootdown self-test (call after SMP is fully online).
+// Returns true if all tests pass, false on failure.
+bool TlbShootdownSelfTest();
+
 } // namespace brook

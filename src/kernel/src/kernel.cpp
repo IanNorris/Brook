@@ -177,6 +177,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         brook::ApicInit(madt.localApicPhysical);
         brook::IoApicInit(madt.ioApicPhysical, madt.ioApicGsiBase);
         brook::ApicInitReschedIpi();
+        brook::ApicInitTlbShootdown();
 
         // Read CMOS RTC to get wall-clock time before LAPIC timer starts.
         brook::RtcInit();
@@ -566,6 +567,13 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
         // Activate APs now — BSP is about to enter the scheduler.
         brook::SmpActivateAPs();
+
+        // Run TLB shootdown self-test while all CPUs are online but before
+        // user processes start — any failure here is a hard boot error.
+        if (!brook::TlbShootdownSelfTest())
+        {
+            brook::KPuts("FATAL: TLB shootdown self-test failed\n");
+        }
 
         // Start the scheduler on all queued processes.
         if (brook::SchedulerReadyCount() > 0)

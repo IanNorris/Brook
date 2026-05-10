@@ -192,6 +192,7 @@ add_executable(kernel
     src/virtio_blk.cpp
     src/acpi.cpp
     src/apic.cpp
+    src/tlb_test.cpp
     src/tty.cpp
     src/sync/kmutex.cpp
     src/sync/krwlock.cpp
@@ -275,6 +276,7 @@ endif()
 target_compile_definitions(kernel PRIVATE
     BROOK_GIT_HASH="${BROOK_GIT_HASH}"
     BROOK_BUILD_DATE="${BROOK_BUILD_DATE}"
+    __BROOK_KERNEL__=1
 )
 
 # Interrupt handler files and panic must NOT use SSE/FPU registers.
@@ -285,6 +287,7 @@ target_compile_definitions(kernel PRIVATE
 set_source_files_properties(
     src/idt.cpp
     src/apic.cpp
+    src/tlb_test.cpp
     src/scheduler.cpp
     src/compositor.cpp
     src/keyboard.cpp
