@@ -2915,6 +2915,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  inject keydown SC     - press key (no release, for modifiers)\n"
             "  inject keyup SC       - release key\n"
             "  inject type TEXT      - type ASCII string (auto shift)\n"
+            "  inject combo MOD+KEY  - modifier combo (e.g. ctrl+a, alt+f)\n"
+            "  inject sleep MS       - pause for MS milliseconds\n"
             "\n"
             "Execution:\n"
             "  exec <path>           - execute a shell script\n"
@@ -3517,8 +3519,93 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             SockSend(g_debugSockIdx, resp, static_cast<uint32_t>(p));
         }
 
+        // inject sleep MS — pause for MS milliseconds (for automation scripts)
+        else if (StrStartsWith(sub, "sleep ")) {
+            uint32_t ms = 0;
+            ParseUint(sub + 6, &ms);
+            if (ms > 10000) ms = 10000; // cap at 10 seconds
+
+            extern volatile uint64_t g_lapicTickCount;
+            Process* self = ProcessCurrent();
+            if (self && ms > 0) {
+                self->wakeupTick = g_lapicTickCount + ms;
+                SchedulerBlock(self);
+            }
+            DebugChannelSend("inject: sleep done\n");
+        }
+
+        // inject combo MODKEY+KEY — press modifier combo (e.g. "inject combo ctrl+a")
+        else if (StrStartsWith(sub, "combo ")) {
+            const char* args = sub + 6;
+            // Parse modifier+key format
+            uint8_t modSc = 0;
+            uint8_t keySc = 0;
+            uint8_t keyAscii = 0;
+            uint8_t modBit = 0;
+
+            if (StrStartsWith(args, "ctrl+")) {
+                modSc = 0x1D; modBit = INPUT_MOD_CTRL; args += 5;
+            } else if (StrStartsWith(args, "alt+")) {
+                modSc = 0x38; modBit = INPUT_MOD_ALT; args += 4;
+            } else if (StrStartsWith(args, "shift+")) {
+                modSc = 0x2A; modBit = INPUT_MOD_LSHIFT; args += 6;
+            }
+
+            if (modSc && args[0] && !args[1]) {
+                // Single ASCII char — look up scan code
+                uint8_t ch = static_cast<uint8_t>(args[0]);
+                // Simple a-z mapping
+                static const uint8_t letterScan[26] = {
+                    0x1E,0x30,0x2E,0x20,0x12,0x21,0x22,0x23,
+                    0x17,0x24,0x25,0x26,0x32,0x31,0x18,0x19,
+                    0x10,0x13,0x1F,0x14,0x16,0x2F,0x11,0x2D,
+                    0x15,0x2C
+                };
+                if (ch >= 'a' && ch <= 'z') {
+                    keySc = letterScan[ch - 'a'];
+                    keyAscii = ch;
+                } else if (ch >= 'A' && ch <= 'Z') {
+                    keySc = letterScan[ch - 'A'];
+                    keyAscii = static_cast<uint8_t>(ch - 'A' + 'a');
+                }
+            }
+
+            if (modSc && keySc) {
+                // Press modifier
+                s_injectMods |= modBit;
+                InputEvent ev = {};
+                ev.type = InputEventType::KeyPress;
+                ev.scanCode = modSc;
+                ev.modifiers = s_injectMods;
+                InputDevicePush(&s_debugInput, ev);
+
+                // Press+release key
+                ev.scanCode = keySc;
+                ev.ascii = static_cast<char>(keyAscii);
+                InputDevicePush(&s_debugInput, ev);
+                ev.type = InputEventType::KeyRelease;
+                InputDevicePush(&s_debugInput, ev);
+
+                // Release modifier
+                s_injectMods &= ~modBit;
+                ev.scanCode = modSc;
+                ev.ascii = 0;
+                ev.modifiers = s_injectMods;
+                InputDevicePush(&s_debugInput, ev);
+                InputWakeWaiters();
+
+                char resp[64];
+                int p = 0;
+                const char* h1 = "inject: combo done\n";
+                for (int j = 0; h1[j]; j++) resp[p++] = h1[j];
+                SockSend(g_debugSockIdx, resp, static_cast<uint32_t>(p));
+            } else {
+                DebugChannelSend("inject combo: usage: inject combo ctrl+a\n");
+            }
+        }
+
         else {
-            DebugChannelSend("inject commands: click X Y, move X Y, key SC [ASCII], type TEXT\n");
+            DebugChannelSend("inject commands: click X Y, move X Y, key SC [ASCII], keydown SC, keyup SC, type TEXT, sleep MS, combo MOD+KEY\n");
         }
     }
 
