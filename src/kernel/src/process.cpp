@@ -945,7 +945,10 @@ void ProcessDestroy(Process* proc)
 // ---------------------------------------------------------------------------
 // ProcessFork -- create a child process that is a copy of the parent.
 // ---------------------------------------------------------------------------
-// Copies the entire user-space address space (full copy, no CoW).
+// Uses Copy-on-Write (COW) for writable pages: both parent and child share
+// the same physical page marked read-only with PTE_COW_BIT. First write
+// triggers a page fault that copies the page (handled in idt.cpp).
+// Read-only pages are shared directly with PmmRefPage.
 // The child inherits open file descriptors (shallow copy).
 // The child's trampoline returns to user mode with RAX=0 (fork return value).
 
@@ -1001,46 +1004,42 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                     bool alreadyCow  = (pteFlags & PTE_COW_BIT) != 0;
                     bool privateWritable = wasWritable || alreadyCow;
 
-                    // Brook does not yet have SMP TLB shootdown. Downgrading
-                    // a parent's writable PTE to COW is unsafe if that address
-                    // space has stale writable translations on another CPU.
-                    // Eager-copy writable pages for now; keep sharing only
-                    // pages that are already read-only.
+                    // COW fork: share writable pages between parent and
+                    // child instead of copying.  Mark both PTEs read-only
+                    // with PTE_COW_BIT set.  The page fault handler (idt.cpp)
+                    // copies on first write.  CPU affinity pinning guarantees
+                    // the parent runs on a single CPU, so a local CR3 reload
+                    // after the loop suffices to flush stale writable TLB
+                    // entries — no cross-CPU TLB shootdown needed.
                     if (privateWritable)
                     {
-                        PhysicalAddress childPhys = PmmAllocPage(MemTag::User, dstPid);
-                        if (!childPhys)
-                        {
-                            SerialPrintf("FORK: failed to copy writable page at vaddr 0x%lx\n", vaddr);
-                            return false;
-                        }
+                        // Downgrade parent PTE: clear writable, set COW bit.
+                        // Keep the PID unchanged (still parent's).
+                        srcPt4[i1] = (srcPt4[i1] & ~VMM_WRITABLE) | PTE_COW_BIT;
 
-                        auto* src = reinterpret_cast<const uint8_t*>(
-                            PhysToVirt(srcPhys).raw());
-                        auto* dst = reinterpret_cast<uint8_t*>(
-                            PhysToVirt(childPhys).raw());
-                        memcpy(dst, src, 4096);
-
-                        uint64_t childPte = (childPhys.raw() & PTE_PHYS_MASK)
+                        // Build child PTE: same physical page, read-only + COW.
+                        uint64_t childPte = (srcPhys.raw() & PTE_PHYS_MASK)
                                           | VMM_PRESENT
                                           | (pteFlags & VMM_USER)
                                           | (pteFlags & VMM_NO_EXEC)
-                                          | VMM_WRITABLE
                                           | (pteFlags & PTE_TAG_MASK)
+                                          | PTE_COW_BIT
                                           | (((uint64_t)dstPid & 0x3FF) << PTE_PID_SHIFT);
 
-                        uint64_t childMapFlags = VMM_USER | VMM_WRITABLE;
+                        // Create intermediate page table entries in child.
+                        uint64_t childMapFlags = VMM_USER;
                         if (pteFlags & VMM_NO_EXEC)
                             childMapFlags |= VMM_NO_EXEC;
-
-                        if (!VmmMapPage(dstPt, VirtualAddress(vaddr), childPhys,
+                        if (!VmmMapPage(dstPt, VirtualAddress(vaddr), srcPhys,
                                         childMapFlags, MemTag::User, dstPid))
                         {
-                            SerialPrintf("FORK: failed to map copied page at vaddr 0x%lx\n", vaddr);
-                            PmmFreePage(childPhys);
+                            SerialPrintf("FORK: failed to map COW page at vaddr 0x%lx\n", vaddr);
+                            // Restore parent PTE to writable
+                            srcPt4[i1] = (srcPt4[i1] | VMM_WRITABLE) & ~PTE_COW_BIT;
                             return false;
                         }
 
+                        // Overwrite the leaf PTE with our carefully built one.
                         auto* dstPml4 = reinterpret_cast<uint64_t*>(
                             PhysToVirt(dstPt.pml4).raw());
                         auto* dstPdpt = reinterpret_cast<uint64_t*>(
@@ -1050,6 +1049,10 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                         auto* dstPt4 = reinterpret_cast<uint64_t*>(
                             PhysToVirt(PhysicalAddress(dstPd[i2] & PTE_PHYS_MASK)).raw());
                         dstPt4[i1] = childPte;
+
+                        // Increment refcount so both parent and child hold a ref.
+                        PmmRefPage(srcPhys);
+
                         copiedCount++;
                         continue;
                     }
@@ -1104,10 +1107,22 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
     }
 
     uint64_t forkElapsed = g_lapicTickCount - forkStartTick;
-    SerialPrintf("[PROFILE] fork_pages t=%lums pid=%u->%u copied=%lu shared=%lu elapsed=%lums\n",
+    SerialPrintf("[PROFILE] fork_pages t=%lums pid=%u->%u cow=%lu shared=%lu elapsed=%lums\n",
                  g_lapicTickCount,
                  static_cast<uint32_t>(srcPid), static_cast<uint32_t>(dstPid),
                  copiedCount, sharedCount, forkElapsed);
+
+    // Flush the parent's TLB to clear stale writable entries for pages
+    // we just downgraded to RO+COW.  CPU affinity pinning guarantees
+    // only one CPU has this address space loaded, so a local CR3 reload
+    // is sufficient — no cross-CPU TLB shootdown required.
+    if (copiedCount > 0)
+    {
+        uint64_t cr3;
+        __asm__ volatile("movq %%cr3, %0" : "=r"(cr3));
+        __asm__ volatile("movq %0, %%cr3" :: "r"(cr3) : "memory");
+    }
+
     return true;
 }
 
