@@ -2,6 +2,7 @@
 #include "serial.h"
 #include "scheduler.h"
 #include "process.h"
+#include "spinlock.h"
 
 namespace brook {
 
@@ -12,20 +13,30 @@ namespace brook {
 static constexpr uint32_t WAITER_MAX = INPUT_MAX_WAITERS;
 static Process* g_waiters[WAITER_MAX];
 static volatile uint32_t g_waiterCount = 0;
+static SpinLock g_waiterLock;
 
 void InputAddWaiter(Process* proc)
 {
+    uint64_t flags = SpinLockAcquire(&g_waiterLock);
     uint32_t n = g_waiterCount;
-    if (n >= WAITER_MAX) return;
-    // Avoid duplicates
-    for (uint32_t i = 0; i < n; ++i)
-        if (g_waiters[i] == proc) return;
-    g_waiters[n] = proc;
-    __atomic_store_n(&g_waiterCount, n + 1, __ATOMIC_RELEASE);
+    if (n < WAITER_MAX)
+    {
+        // Avoid duplicates
+        bool found = false;
+        for (uint32_t i = 0; i < n; ++i)
+            if (g_waiters[i] == proc) { found = true; break; }
+        if (!found)
+        {
+            g_waiters[n] = proc;
+            g_waiterCount = n + 1;
+        }
+    }
+    SpinLockRelease(&g_waiterLock, flags);
 }
 
 void InputRemoveWaiter(Process* proc)
 {
+    uint64_t flags = SpinLockAcquire(&g_waiterLock);
     uint32_t n = g_waiterCount;
     for (uint32_t i = 0; i < n; ++i)
     {
@@ -33,21 +44,25 @@ void InputRemoveWaiter(Process* proc)
         {
             g_waiters[i] = g_waiters[n - 1];
             g_waiters[n - 1] = nullptr;
-            __atomic_store_n(&g_waiterCount, n - 1, __ATOMIC_RELEASE);
-            return;
+            g_waiterCount = n - 1;
+            break;
         }
     }
+    SpinLockRelease(&g_waiterLock, flags);
 }
 
 void InputWakeWaiters()
 {
-    uint32_t n = __atomic_load_n(&g_waiterCount, __ATOMIC_ACQUIRE);
-    if (n == 0) return;
+    uint64_t flags = SpinLockAcquire(&g_waiterLock);
+    uint32_t n = g_waiterCount;
+    if (n == 0)
+    {
+        SpinLockRelease(&g_waiterLock, flags);
+        return;
+    }
 
-    // Snapshot and clear the waiter list, then unblock each process.
-    // Set pendingWakeup FIRST to handle the race where the process hasn't
-    // called SchedulerBlock yet — SchedulerBlock checks pendingWakeup and
-    // skips blocking if set.
+    // Snapshot and clear the waiter list under the lock, then release
+    // before calling SchedulerUnblock (which may itself take locks).
     Process* snap[WAITER_MAX];
     for (uint32_t i = 0; i < n; ++i)
     {
@@ -55,7 +70,8 @@ void InputWakeWaiters()
         g_waiters[i] = nullptr;
         __atomic_store_n(&snap[i]->pendingWakeup, 1, __ATOMIC_RELEASE);
     }
-    __atomic_store_n(&g_waiterCount, 0u, __ATOMIC_RELEASE);
+    g_waiterCount = 0;
+    SpinLockRelease(&g_waiterLock, flags);
 
     for (uint32_t i = 0; i < n; ++i)
         SchedulerUnblock(snap[i]);
