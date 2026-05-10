@@ -118,14 +118,14 @@ static constexpr uint8_t TLB_SHOOTDOWN_VECTOR = 0xFC;
 // Register the TLB shootdown IPI handler in the IDT. Called once during init.
 void ApicInitTlbShootdown();
 
-// Invalidate a single page on all remote CPUs that have the given process's
-// address space loaded. Does a local invlpg first, then sends IPIs and waits.
-// No-op on single-CPU systems.
-void TlbShootdown(uint64_t targetCr3, uint64_t virtualAddr);
+// Invalidate a single page on remote CPUs whose bits are set in cpuMask
+// (typically proc->tlbCpuMask). Does a local invlpg first, then sends IPIs.
+// Pass ~0ULL to target all online CPUs (e.g. kernel address space).
+void TlbShootdown(uint64_t targetCr3, uint64_t virtualAddr, uint64_t cpuMask);
 
-// Full TLB flush (CR3 reload) on all remote CPUs that have the given CR3
-// loaded. Used after bulk PTE changes (exec, fork PTE downgrade).
-void TlbShootdownFull(uint64_t targetCr3);
+// Full TLB flush (CR3 reload) on remote CPUs whose bits are set in cpuMask.
+// Used after bulk PTE changes (exec, fork PTE downgrade).
+void TlbShootdownFull(uint64_t targetCr3, uint64_t cpuMask);
 
 // Run TLB shootdown self-test (call after SMP is fully online).
 // Returns true if all tests pass, false on failure.

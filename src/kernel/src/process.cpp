@@ -958,7 +958,8 @@ void ProcessDestroy(Process* proc)
 
 // Helper: walk a 4-level page table and copy all leaf pages.
 static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
-                              uint16_t srcPid, uint16_t dstPid)
+                              uint16_t srcPid, uint16_t dstPid,
+                              volatile uint64_t& srcTlbCpuMask)
 {
     static constexpr uint64_t PTE_PHYS_MASK = 0x000FFFFFFFFFF000ULL;
 
@@ -1119,7 +1120,7 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
     // entry on any CPU must be flushed.
     if (copiedCount > 0)
     {
-        TlbShootdownFull(srcPt.pml4.raw());
+        TlbShootdownFull(srcPt.pml4.raw(), srcTlbCpuMask);
     }
 
     return true;
@@ -1228,7 +1229,8 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
 
     // Copy writable user pages and share read-only mappings.
     if (!ForkCopyUserPages(parent->pageTable, child->pageTable,
-                           parent->pid, child->pid))
+                           parent->pid, child->pid,
+                           parent->tlbCpuMask))
     {
         SerialPuts("FORK: address space copy failed\n");
         VmmDestroyUserPageTable(child->pageTable);
@@ -1682,7 +1684,7 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     PageTable kernelPt = VmmKernelCR3();
 
     // Flush TLB entries for the old address space on all remote CPUs
-    TlbShootdownFull(oldPt.pml4.raw());
+    TlbShootdownFull(oldPt.pml4.raw(), proc->tlbCpuMask);
 
     __asm__ volatile("mov %0, %%cr3" : : "r"(kernelPt.pml4.raw()) : "memory");
 

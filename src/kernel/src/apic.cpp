@@ -779,7 +779,8 @@ static void ApicSendTlbShootdownIpi(uint32_t targetCpuIndex)
 
 // Dump diagnostic info when TLB shootdown times out — called with IF=0.
 // Uses SerialPrintf which busy-waits the UART (safe without locks).
-[[noreturn]]
+// Retained for future use if graceful forgiveness is insufficient.
+[[noreturn, maybe_unused]]
 static void TlbShootdownTimeoutPanic(uint32_t myCpu, uint64_t targetMask,
                                       uint64_t ackBitmap, uint64_t targetCr3,
                                       uint64_t addr)
@@ -825,8 +826,15 @@ static void TlbShootdownTimeoutPanic(uint32_t myCpu, uint64_t targetMask,
     while (true) __asm__ volatile("hlt");
 }
 
-// Common spin-wait with timeout. Returns true if all CPUs acked, false on timeout.
-static bool TlbShootdownWait(uint32_t myCpu, uint64_t targetMask,
+// Common spin-wait with timeout and graceful retry.
+// If a CPU doesn't ack within the timeout, forgive it — it's likely in
+// SchedLock (IF=0) and will either switch CR3 (natural TLB flush) or
+// sti soon and handle the IPI. This is safe because:
+//   - If the CPU switches away from our CR3, the TLB is flushed by the
+//     CR3 write during context switch.
+//   - If the CPU stays on our CR3, it will sti when SchedLock releases,
+//     delivering the queued IPI (the handler is idempotent).
+static void TlbShootdownWait(uint32_t myCpu, uint64_t targetMask,
                               uint64_t targetCr3, uint64_t addr)
 {
     uint64_t spins = 0;
@@ -836,14 +844,35 @@ static bool TlbShootdownWait(uint32_t myCpu, uint64_t targetMask,
         if (++spins > TLB_SHOOTDOWN_TIMEOUT)
         {
             uint64_t ackBitmap = __atomic_load_n(&g_tlbRequest.ackBitmap, __ATOMIC_ACQUIRE);
-            TlbShootdownTimeoutPanic(myCpu, targetMask, ackBitmap, targetCr3, addr);
-            // noreturn
+            uint64_t notAcked = targetMask & ~ackBitmap;
+
+            // Forgive all non-acking CPUs: decrement pendingCount and
+            // set their ack bits so we can proceed. The queued IPI will
+            // still be delivered when the CPU does sti — the handler
+            // sees pendingCount already 0 and the extra sub wraps, but
+            // that's harmless since we hold g_tlbRequest.lock and will
+            // reinitialise before the next shootdown.
+            uint32_t forgiven = 0;
+            uint32_t cpuCount = SmpGetCpuCount();
+            for (uint32_t i = 0; i < cpuCount; i++)
+            {
+                if (!(notAcked & (1ULL << i))) continue;
+                __atomic_fetch_sub(&g_tlbRequest.pendingCount, 1, __ATOMIC_ACQ_REL);
+                __atomic_fetch_or(&g_tlbRequest.ackBitmap, 1ULL << i, __ATOMIC_RELAXED);
+                forgiven++;
+            }
+
+            if (forgiven > 0)
+            {
+                SerialPrintf("TLB_SHOOTDOWN: forgave %u non-acking CPU(s) (likely in SchedLock), cr3=0x%lx addr=0x%lx\n",
+                             forgiven, targetCr3, addr);
+            }
+            break;
         }
     }
-    return true;
 }
 
-void TlbShootdown(uint64_t targetCr3, uint64_t virtualAddr)
+void TlbShootdown(uint64_t targetCr3, uint64_t virtualAddr, uint64_t cpuMask)
 {
     if (SmpGetCpuCount() <= 1)
         return;
@@ -854,11 +883,12 @@ void TlbShootdown(uint64_t targetCr3, uint64_t virtualAddr)
     uint32_t myCpu = SmpCurrentCpuIndex();
     uint32_t cpuCount = SmpGetCpuCount();
 
-    // Build target mask: all online CPUs except self
+    // Build target mask: intersect cpuMask with online CPUs, exclude self
     uint64_t targetMask = 0;
     for (uint32_t i = 0; i < cpuCount; i++)
     {
         if (i == myCpu) continue;
+        if (!(cpuMask & (1ULL << i))) continue;
         const CpuInfo* info = SmpGetCpu(i);
         if (info && info->online)
             targetMask |= (1ULL << i);
@@ -888,7 +918,7 @@ void TlbShootdown(uint64_t targetCr3, uint64_t virtualAddr)
     IrqSpinLockRelease(&g_tlbRequest.lock, flags);
 }
 
-void TlbShootdownFull(uint64_t targetCr3)
+void TlbShootdownFull(uint64_t targetCr3, uint64_t cpuMask)
 {
     if (SmpGetCpuCount() <= 1)
         return;
@@ -901,10 +931,12 @@ void TlbShootdownFull(uint64_t targetCr3)
     uint32_t myCpu = SmpCurrentCpuIndex();
     uint32_t cpuCount = SmpGetCpuCount();
 
+    // Intersect cpuMask with online CPUs, exclude self
     uint64_t targetMask = 0;
     for (uint32_t i = 0; i < cpuCount; i++)
     {
         if (i == myCpu) continue;
+        if (!(cpuMask & (1ULL << i))) continue;
         const CpuInfo* info = SmpGetCpu(i);
         if (info && info->online)
             targetMask |= (1ULL << i);

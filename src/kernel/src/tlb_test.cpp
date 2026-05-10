@@ -40,7 +40,7 @@ bool TlbShootdownSelfTest()
         extern volatile uint64_t g_lapicTickCount;
         uint64_t t0 = g_lapicTickCount;
 
-        TlbShootdownFull(kernelCr3);
+        TlbShootdownFull(kernelCr3, ~0ULL);
 
         uint64_t elapsed = g_lapicTickCount - t0;
         SerialPrintf("TLB_TEST: test 1 PASS — full flush completed in %lu ms\n", elapsed);
@@ -66,7 +66,7 @@ bool TlbShootdownSelfTest()
         extern volatile uint64_t g_lapicTickCount;
         uint64_t t0 = g_lapicTickCount;
 
-        TlbShootdown(kernelCr3, 0x0000100000000000ULL);
+        TlbShootdown(kernelCr3, 0x0000100000000000ULL, ~0ULL);
 
         uint64_t elapsed = g_lapicTickCount - t0;
         PmmFreePage(testPhys);
@@ -88,9 +88,9 @@ bool TlbShootdownSelfTest()
         for (uint32_t i = 0; i < 100; i++)
         {
             if (i & 1)
-                TlbShootdownFull(kernelCr3);
+                TlbShootdownFull(kernelCr3, ~0ULL);
             else
-                TlbShootdown(kernelCr3, 0x0000200000000000ULL + i * 4096);
+                TlbShootdown(kernelCr3, 0x0000200000000000ULL + i * 4096, ~0ULL);
         }
 
         uint64_t elapsed = g_lapicTickCount - t0;
@@ -108,7 +108,7 @@ bool TlbShootdownSelfTest()
         extern volatile uint64_t g_lapicTickCount;
         uint64_t t0 = g_lapicTickCount;
 
-        TlbShootdownFull(fakeCr3);
+        TlbShootdownFull(fakeCr3, ~0ULL);
 
         uint64_t elapsed = g_lapicTickCount - t0;
         SerialPrintf("TLB_TEST: test 4 PASS — non-matching CR3 flush completed in %lu ms\n",

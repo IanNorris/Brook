@@ -811,7 +811,8 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                         __asm__ volatile("invlpg (%0)" :: "r"(cr2cow & ~0xFFFULL) : "memory");
                         // Shootdown stale TLB entries on other CPUs
                         brook::TlbShootdown(cowProc->pageTable.pml4.raw(),
-                                            cr2cow & ~0xFFFULL);
+                                            cr2cow & ~0xFFFULL,
+                                            cowProc->tlbCpuMask);
                         __asm__ volatile("sti");
                         return;
                     }
@@ -823,7 +824,8 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                     *pte = ((*pte) & ~PTE_COW_BIT) | VMM_WRITABLE;
                     __asm__ volatile("invlpg (%0)" :: "r"(cr2cow & ~0xFFFULL) : "memory");
                     brook::TlbShootdown(cowProc->pageTable.pml4.raw(),
-                                        cr2cow & ~0xFFFULL);
+                                        cr2cow & ~0xFFFULL,
+                                        cowProc->tlbCpuMask);
                     __asm__ volatile("sti");
                     return;
                 }
@@ -851,7 +853,8 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                     *pte |= VMM_WRITABLE;
                     __asm__ volatile("invlpg (%0)" :: "r"(cr2cow & ~0xFFFULL) : "memory");
                     brook::TlbShootdown(cowProc->pageTable.pml4.raw(),
-                                        cr2cow & ~0xFFFULL);
+                                        cr2cow & ~0xFFFULL,
+                                        cowProc->tlbCpuMask);
                     __asm__ volatile("sti");
                     return;
                 }
