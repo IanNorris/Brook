@@ -1740,6 +1740,18 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
             written += chunk;
             if (written > 0) {
                 Process* reader = pipe->readerWaiter;
+                // [NET_DIAG] Log unix socket write waiter state for RequestServer
+                Process* caller = ProcessCurrent();
+                if (caller && IsRequestServer(caller)) {
+                    extern volatile uint64_t g_lapicTickCount;
+                    Process* ew = pipe->epollWaiter;
+                    SerialPrintf("[NET_DIAG] unix_write t=%lums pid=%u fd=%d len=%lu "
+                                 "readerWaiter=%u epollWaiter=%u\n",
+                                 g_lapicTickCount, caller->pid,
+                                 static_cast<int>(fd), count,
+                                 reader ? reader->pid : 0,
+                                 ew ? ew->pid : 0);
+                }
                 if (reader) {
                     pipe->readerWaiter = nullptr;
                     WakeProcess(reader);
