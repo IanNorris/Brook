@@ -110,6 +110,14 @@ static bool ValidateElf(const uint8_t* data, uint64_t size)
         SerialPrintf("module: too many sections (%u)\n", ehdr->e_shnum);
         return false;
     }
+    // Validate section header table fits within buffer.
+    uint64_t shEnd = static_cast<uint64_t>(ehdr->e_shoff) +
+                     static_cast<uint64_t>(ehdr->e_shnum) * sizeof(Elf64_Shdr);
+    if (shEnd > size || ehdr->e_shoff >= size)
+    {
+        SerialPuts("module: section header table out of bounds\n");
+        return false;
+    }
     return true;
 }
 
@@ -143,6 +151,7 @@ static uint64_t ResolveSymbol(const Elf64_Sym* sym, const uint8_t* data,
 
 // Apply relocations from a SHT_RELA section.
 static bool ApplyRela(const Elf64_Shdr* relaSec, const uint8_t* data,
+                      uint64_t dataSize,
                       const Elf64_Shdr* shdrs, uint32_t shnum,
                       const Elf64_Sym* symtab, uint32_t symCount,
                       const char* strtab, const LoadedSection* secs)
@@ -152,6 +161,14 @@ static bool ApplyRela(const Elf64_Shdr* relaSec, const uint8_t* data,
     if (targetSecIdx >= shnum) return true; // nothing to do
     uint64_t targetBase = secs[targetSecIdx].base;
     if (!targetBase) return true; // section not loaded (ok to skip)
+
+    // Validate relocation data fits within buffer.
+    if (relaSec->sh_offset >= dataSize ||
+        relaSec->sh_size > dataSize - relaSec->sh_offset)
+    {
+        SerialPuts("module: rela section data out of bounds\n");
+        return false;
+    }
 
     auto* relas = reinterpret_cast<const Elf64_Rela*>(data + relaSec->sh_offset);
     uint32_t count = static_cast<uint32_t>(relaSec->sh_size / sizeof(Elf64_Rela));
@@ -267,7 +284,8 @@ static bool ParseAndLoad(const uint8_t* data, uint64_t size, ParseResult& out)
 
     // Section name string table.
     const char* shstrtab = nullptr;
-    if (ehdr->e_shstrndx < shnum)
+    if (ehdr->e_shstrndx < shnum &&
+        shdrs[ehdr->e_shstrndx].sh_offset < size)
         shstrtab = reinterpret_cast<const char*>(
             data + shdrs[ehdr->e_shstrndx].sh_offset);
 
@@ -279,10 +297,21 @@ static bool ParseAndLoad(const uint8_t* data, uint64_t size, ParseResult& out)
     {
         const Elf64_Shdr& s = shdrs[i];
         if (!(s.sh_flags & SHF_ALLOC)) continue;
-        // Align to section alignment.
+        // Validate section data fits within the ELF buffer.
+        if (s.sh_type != SHT_NOBITS &&
+            (s.sh_offset >= size || s.sh_size > size - s.sh_offset))
+        {
+            SerialPrintf("module: section %u data out of bounds\n", i);
+            return false;
+        }
         uint64_t align = s.sh_addralign > 1 ? s.sh_addralign : 1;
         totalSize = (totalSize + align - 1) & ~(align - 1);
         totalSize += s.sh_size;
+        if (totalSize > 256 * 1024 * 1024ULL) // sanity cap: 256 MiB
+        {
+            SerialPuts("module: total section size exceeds 256 MiB limit\n");
+            return false;
+        }
     }
     if (totalSize == 0)
     {
@@ -335,11 +364,19 @@ static bool ParseAndLoad(const uint8_t* data, uint64_t size, ParseResult& out)
     {
         if (shdrs[i].sh_type == SHT_SYMTAB)
         {
+            // Validate symtab data fits within buffer.
+            if (shdrs[i].sh_offset >= size ||
+                shdrs[i].sh_size > size - shdrs[i].sh_offset)
+            {
+                SerialPuts("module: symtab section out of bounds\n");
+                return false;
+            }
             symtab   = reinterpret_cast<const Elf64_Sym*>(data + shdrs[i].sh_offset);
             symCount = static_cast<uint32_t>(shdrs[i].sh_size / sizeof(Elf64_Sym));
             // sh_link = index of associated string table.
             uint32_t strIdx = shdrs[i].sh_link;
-            if (strIdx < shnum)
+            if (strIdx < shnum &&
+                shdrs[strIdx].sh_offset < size)
                 strtab = reinterpret_cast<const char*>(data + shdrs[strIdx].sh_offset);
             break;
         }
@@ -356,7 +393,7 @@ static bool ParseAndLoad(const uint8_t* data, uint64_t size, ParseResult& out)
     for (uint32_t i = 0; i < shnum; ++i)
     {
         if (shdrs[i].sh_type != SHT_RELA) continue;
-        if (!ApplyRela(&shdrs[i], data, shdrs, shnum, symtab, symCount, strtab, secs))
+        if (!ApplyRela(&shdrs[i], data, size, shdrs, shnum, symtab, symCount, strtab, secs))
         {
             VmmFreePages(VirtualAddress(baseVirt), pageCount);
             return false;
