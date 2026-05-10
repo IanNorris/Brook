@@ -1063,7 +1063,7 @@ static int cmd_shell(int npkgs, char *const *pkgs) {
             new_path = grown;
         }
         if (used > 0) new_path[used++] = ':';
-        strcpy(new_path + used, bin);
+        memcpy(new_path + used, bin, strlen(bin) + 1);
         used += strlen(bin);
     }
 
@@ -1077,7 +1077,7 @@ static int cmd_shell(int npkgs, char *const *pkgs) {
         new_path = grown;
     }
     if (used > 0) { new_path[used++] = ':'; }
-    strcpy(new_path + used, old_path);
+    memcpy(new_path + used, old_path, strlen(old_path) + 1);
 
     if (setenv("PATH", new_path, 1) != 0) {
         fprintf(stderr, "Error: setenv PATH failed: %s\n", strerror(errno));
@@ -1087,12 +1087,12 @@ static int cmd_shell(int npkgs, char *const *pkgs) {
 
     /* Mark the shell so it's clear we're in a nix shell. */
     char ps1_prefix[256];
-    snprintf(ps1_prefix, sizeof(ps1_prefix), "[nix-shell:%s", pkgs[0]);
-    for (int i = 1; i < npkgs && strlen(ps1_prefix) + strlen(pkgs[i]) + 3 < sizeof(ps1_prefix); ++i) {
-        strcat(ps1_prefix, ",");
-        strcat(ps1_prefix, pkgs[i]);
+    size_t ps1_used = (size_t)snprintf(ps1_prefix, sizeof(ps1_prefix), "[nix-shell:%s", pkgs[0]);
+    for (int i = 1; i < npkgs && ps1_used + strlen(pkgs[i]) + 3 < sizeof(ps1_prefix); ++i) {
+        ps1_used += (size_t)snprintf(ps1_prefix + ps1_used, sizeof(ps1_prefix) - ps1_used,
+                                     ",%s", pkgs[i]);
     }
-    strncat(ps1_prefix, "] \\w \\$ ", sizeof(ps1_prefix) - strlen(ps1_prefix) - 1);
+    snprintf(ps1_prefix + ps1_used, sizeof(ps1_prefix) - ps1_used, "] \\w \\$ ");
     setenv("PS1", ps1_prefix, 1);
     setenv("IN_NIX_SHELL", "impure", 1);
 
