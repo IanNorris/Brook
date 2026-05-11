@@ -338,8 +338,20 @@ static Vnode* GenUptime()
     uint64_t secs = ticks / 1000;
     uint64_t frac = (ticks % 1000) / 10;  // centiseconds
 
+    // Idle time: sum idle ticks across all CPUs
+    uint64_t totalIdle = 0;
+    uint32_t cpuCount = SmpGetCpuCount();
+    for (uint32_t i = 0; i < cpuCount; ++i)
+    {
+        uint64_t busy, idle;
+        SchedulerGetCpuTicks(i, busy, idle);
+        totalIdle += idle;
+    }
+    uint64_t idleSecs = totalIdle / 1000;
+    uint64_t idleFrac = (totalIdle % 1000) / 10;
+
     uint32_t n = ProcFmt(buf, 64, "%lu.%lu %lu.%lu\n",
-        secs, frac, secs, frac);
+        secs, frac, idleSecs, idleFrac);
     return MakeProcVnode(buf, n);
 }
 
