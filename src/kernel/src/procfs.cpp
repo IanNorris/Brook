@@ -590,6 +590,33 @@ static Vnode* GenPidMaps(const ProcessSnapshot& proc)
     return MakeProcVnode(buf, static_cast<uint32_t>(p - buf));
 }
 
+// /proc/[pid]/exe — symlink-like content: the executable path
+static Vnode* GenPidExe(const ProcessSnapshot& proc)
+{
+    uint32_t len = ProcStrLen(proc.exePath);
+    if (len == 0) return nullptr;
+    auto* buf = static_cast<char*>(kmalloc(len + 2));
+    if (!buf) return nullptr;
+    ProcStrCopy(buf, proc.exePath, len + 1);
+    buf[len] = '\n';
+    return MakeProcVnode(buf, len + 1);
+}
+
+// /proc/[pid]/cwd — current working directory
+static Vnode* GenPidCwd(const ProcessSnapshot& proc)
+{
+    uint32_t len = ProcStrLen(proc.cwd);
+    if (len == 0) len = 1;  // fallback to "/"
+    auto* buf = static_cast<char*>(kmalloc(len + 2));
+    if (!buf) return nullptr;
+    if (proc.cwd[0])
+        ProcStrCopy(buf, proc.cwd, len + 1);
+    else
+        ProcStrCopy(buf, "/", 2);
+    buf[len] = '\n';
+    return MakeProcVnode(buf, len + 1);
+}
+
 // ---- Path parsing helpers ----
 
 static bool IsDigit(char c) { return c >= '0' && c <= '9'; }
@@ -831,6 +858,8 @@ static ProcPidEntry g_pidEntries[] = {
     { "status",  GenPidStatus },
     { "cmdline", GenPidCmdline },
     { "maps",    GenPidMaps },
+    { "exe",     GenPidExe },
+    { "cwd",     GenPidCwd },
 };
 static constexpr uint32_t NUM_PID_ENTRIES = sizeof(g_pidEntries) / sizeof(g_pidEntries[0]);
 

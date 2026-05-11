@@ -1743,6 +1743,15 @@ uint32_t SchedulerSnapshotProcesses(ProcessSnapshot* out, uint32_t maxCount)
         for (; j < 31 && p->name[j]; ++j)
             s.name[j] = p->name[j];
         s.name[j] = '\0';
+        // Copy exePath and cwd
+        j = 0;
+        for (; j < 255 && p->exePath[j]; ++j)
+            s.exePath[j] = p->exePath[j];
+        s.exePath[j] = '\0';
+        j = 0;
+        for (; j < 255 && p->cwd[j]; ++j)
+            s.cwd[j] = p->cwd[j];
+        s.cwd[j] = '\0';
     }
     SchedLockRelease(g_allProcLock, flags);
     return count;
