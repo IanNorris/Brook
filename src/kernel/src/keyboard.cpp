@@ -395,6 +395,12 @@ static volatile bool g_superHeld = false;
 static volatile bool g_capsLock  = false;
 static volatile bool g_e0Prefix  = false; // E0-prefixed extended key pending
 
+// SysRq-style panic: Ctrl+ScrollLock fires a diagnostic kernel panic.
+// ScrollLock = scancode 0x46.  Only triggers on key-press (not release).
+static constexpr uint8_t SC_SCROLL_LOCK = 0x46;
+
+extern "C" void KernelPanic(const char* fmt, ...);
+
 // ---------------------------------------------------------------------------
 // IRQ1 interrupt handler
 // ---------------------------------------------------------------------------
@@ -414,6 +420,14 @@ static void KbdIrqHandler(InterruptFrame* frame)
     }
 
     uint8_t sc = inb(0x60); // read scan code from PS/2 data port
+
+    // Ctrl+ScrollLock → diagnostic panic (like Linux SysRq+c).
+    // Fires from IRQ context so it works even when all threads are deadlocked.
+    if (sc == SC_SCROLL_LOCK && g_ctrlHeld)
+    {
+        ApicSendEoi();
+        KernelPanic("Manual panic triggered (Ctrl+ScrollLock)");
+    }
 
     // Handle E0 prefix (extended keys: arrows, Home, End, etc.)
     if (sc == 0xE0)
