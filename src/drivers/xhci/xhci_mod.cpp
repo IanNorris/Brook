@@ -1563,6 +1563,102 @@ static void XhciKeyboardPoll(InputDevice* /*dev*/)
 }
 
 // ---------------------------------------------------------------------------
+// USB mouse support
+// ---------------------------------------------------------------------------
+
+// USB HID boot mouse report: 3 bytes minimum
+// Byte 0: buttons (bit0=left, bit1=right, bit2=middle)
+// Byte 1: X displacement (signed int8)
+// Byte 2: Y displacement (signed int8)
+
+MODULE_IMPORT_SYMBOL(MouseGetPosition);
+MODULE_IMPORT_SYMBOL(MouseSetPosition);
+MODULE_IMPORT_SYMBOL(MouseSetButtons);
+MODULE_IMPORT_SYMBOL(MouseSetAvailable);
+
+extern "C" void MouseGetPosition(int32_t* x, int32_t* y);
+extern "C" void MouseSetPosition(int32_t x, int32_t y);
+extern "C" void MouseSetButtons(uint8_t buttons);
+extern "C" void MouseSetAvailable(bool available);
+
+static InputDevice g_usbMouseDev;
+static InputDeviceOps g_usbMouseOps = { "usb_mouse", nullptr };
+
+static void XhciProcessMouseReport(const uint8_t* report)
+{
+    uint8_t buttons = report[0] & 0x07;
+    int8_t  dx = static_cast<int8_t>(report[1]);
+    int8_t  dy = static_cast<int8_t>(report[2]);
+
+    // Update global mouse position via the kernel mouse API
+    if (dx != 0 || dy != 0) {
+        int32_t mx = 0, my = 0;
+        MouseGetPosition(&mx, &my);
+        // USB boot protocol: positive Y = down in most implementations,
+        // but QEMU USB mouse matches PS/2 convention (positive Y = up)
+        MouseSetPosition(mx + dx, my - dy);
+
+        InputEvent ev;
+        ev.type     = InputEventType::MouseMove;
+        ev.scanCode = buttons;
+        ev.ascii    = 0;
+        ev.modifiers = 0;
+        InputDevicePush(&g_usbMouseDev, ev);
+    }
+
+    // Update buttons through the kernel mouse API
+    MouseSetButtons(buttons);
+
+    // Push button change events
+    static uint8_t prevButtons = 0;
+    for (int btn = 0; btn < 3; btn++) {
+        bool now  = (buttons & (1 << btn)) != 0;
+        bool prev = (prevButtons & (1 << btn)) != 0;
+        if (now != prev) {
+            InputEvent ev;
+            ev.type = now ? InputEventType::MouseButtonDown : InputEventType::MouseButtonUp;
+            ev.scanCode = static_cast<uint8_t>(btn);
+            ev.ascii = 0;
+            ev.modifiers = 0;
+            InputDevicePush(&g_usbMouseDev, ev);
+        }
+    }
+    prevButtons = buttons;
+
+    InputWakeWaiters();
+}
+
+static uint64_t g_mouseReportBufPhys = 0;
+static uint32_t g_mouseDevIndex = 0;
+static bool     g_mousePresent = false;
+
+static void XhciMousePoll(InputDevice* /*dev*/)
+{
+    if (g_controllerCount == 0 || !g_mousePresent) return;
+    XhciController& ctrl = g_controllers[0];
+    if (!ctrl.initialized) return;
+    if (g_mouseDevIndex >= g_deviceCount) return;
+
+    XhciDevice& mouse = g_devices[g_mouseDevIndex];
+    if (!mouse.isMouse || !mouse.intRing) return;
+
+    Trb* evt = XhciWaitForEvent(ctrl, TRB_TYPE_TRANSFER_EVENT, 0);
+    if (!evt) return;
+
+    uint32_t cc = (evt->status >> TRB_CC_SHIFT) & 0xFF;
+    if (cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT_PACKET) {
+        auto* report = static_cast<uint8_t*>(mouse.priv);
+        if (report)
+            XhciProcessMouseReport(report);
+    }
+
+    if (mouse.priv && g_mouseReportBufPhys) {
+        XhciQueueInterruptIn(ctrl, mouse,
+                              mouse.priv, g_mouseReportBufPhys, 4);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Phase 3+4+5+6 combined: enumerate and configure a connected port
 // ---------------------------------------------------------------------------
 
@@ -1609,9 +1705,16 @@ static void XhciEnumeratePort(XhciController& ctrl, uint32_t portNum,
         }
     }
 
-    if (dev.isMouse) {
+    if (dev.isMouse && dev.interruptEpAddr) {
         SerialPrintf("xhci: USB mouse detected on port %u (slot %u)\n",
                      portNum, dev.slotId);
+
+        XhciSetBootProtocol(ctrl, dev);
+
+        if (XhciConfigureInterruptEndpoint(ctrl, dev)) {
+            SerialPuts("xhci: mouse interrupt endpoint ready\n");
+            g_mousePresent = true;
+        }
     }
 }
 
@@ -1738,6 +1841,30 @@ static int XhciModuleInit()
             }
 
             SerialPuts("xhci: USB keyboard registered as input device\n");
+            break;
+        }
+    }
+
+    // Register USB mouse input device if a mouse was found
+    for (uint32_t i = 0; i < g_deviceCount; i++) {
+        if (g_devices[i].isMouse && g_devices[i].intRing) {
+            g_usbMouseOps.poll = XhciMousePoll;
+            g_usbMouseDev.ops = &g_usbMouseOps;
+            g_usbMouseDev.head = 0;
+            g_usbMouseDev.tail = 0;
+            InputRegister(&g_usbMouseDev);
+
+            uint64_t mouseBufPhys;
+            auto* mouseBuf = static_cast<uint8_t*>(AllocDmaBuffer(1, mouseBufPhys));
+            if (mouseBuf) {
+                g_devices[i].priv = mouseBuf;
+                g_mouseReportBufPhys = mouseBufPhys;
+                g_mouseDevIndex = i;
+                XhciQueueInterruptIn(g_controllers[0], g_devices[i],
+                                      mouseBuf, mouseBufPhys, 4);
+            }
+
+            SerialPuts("xhci: USB mouse registered as input device\n");
             break;
         }
     }
