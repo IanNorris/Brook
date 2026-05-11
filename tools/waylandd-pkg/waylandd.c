@@ -55,6 +55,7 @@
 #define BROOK_SYS_WM_BEGIN_RESIZE    517
 #define BROOK_SYS_WM_SET_CURSOR_VISIBLE 518
 #define BROOK_SYS_WM_SET_CURSOR_IMAGE  519
+#define BROOK_SYS_WM_GET_SCREEN_INFO  520
 #define BROOK_WM_CREATE_FLAG_CSD     1u
 #define BROOK_WM_CREATE_FLAG_NO_FOCUS 2u
 
@@ -150,6 +151,12 @@ static long wm_set_cursor_image(const uint32_t *pixels, uint32_t w, uint32_t h,
                                 int32_t hot_x, int32_t hot_y) {
     return syscall(BROOK_SYS_WM_SET_CURSOR_IMAGE, (long)pixels, (long)w,
                    (long)h, (long)hot_x, (long)hot_y);
+}
+static long wm_get_screen_info(uint32_t *w_out, uint32_t *h_out) {
+    uint32_t buf[2] = {0, 0};
+    long rc = syscall(BROOK_SYS_WM_GET_SCREEN_INFO, (long)buf, 0, 0, 0, 0);
+    if (rc == 0) { *w_out = buf[0]; *h_out = buf[1]; }
+    return rc;
 }
 
 /* ---------------- per-surface state ---------------- */
@@ -1468,6 +1475,12 @@ static void output_bind(struct wl_client *client, void *data,
         g_outputs = o;
     }
     int w = 1920, h = 1080;
+    {
+        uint32_t sw = 0, sh = 0;
+        if (wm_get_screen_info(&sw, &sh) == 0 && sw > 0 && sh > 0) {
+            w = (int)sw; h = (int)sh;
+        }
+    }
     wl_output_send_geometry(r, 0, 0,
         (int)((w * 254 + 480) / 960), (int)((h * 254 + 480) / 960),
         WL_OUTPUT_SUBPIXEL_UNKNOWN, "Brook", "vfb-0",

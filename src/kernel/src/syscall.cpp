@@ -9949,6 +9949,20 @@ static int64_t sys_brook_wm_set_cursor_image(uint64_t pixelsAddr, uint64_t w,
         static_cast<int32_t>(hotX), static_cast<int32_t>(hotY)) ? 0 : -EINVAL;
 }
 
+// 520: WM_GET_SCREEN_INFO(out_ptr) — return screen width and height
+// Writes two uint32_t values [width, height] to the user-supplied buffer.
+static int64_t sys_brook_wm_get_screen_info(uint64_t outAddr, uint64_t, uint64_t,
+                                             uint64_t, uint64_t, uint64_t)
+{
+    if (!UserBufferWritable(outAddr, 8)) return -EFAULT;
+    uint32_t w = 0, h = 0;
+    brook::CompositorGetPhysDims(&w, &h);
+    uint32_t* out = reinterpret_cast<uint32_t*>(outAddr);
+    out[0] = w;
+    out[1] = h;
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // sys_not_implemented
 // ---------------------------------------------------------------------------
@@ -11783,6 +11797,7 @@ void SyscallTableInit()
     g_syscallTable[517]                  = sys_brook_wm_begin_resize;
     g_syscallTable[518]                  = sys_brook_wm_set_cursor_visible;
     g_syscallTable[519]                  = sys_brook_wm_set_cursor_image;
+    g_syscallTable[520]                  = sys_brook_wm_get_screen_info;
 
     uint32_t count = 0;
     for (uint64_t i = 0; i < SYSCALL_MAX; ++i)
