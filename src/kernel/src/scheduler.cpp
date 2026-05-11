@@ -1701,6 +1701,13 @@ void SchedulerGetCpuTicks(uint32_t cpuIndex, uint64_t& busyTicks, uint64_t& idle
     }
 }
 
+Process* SchedulerGetCpuProcess(uint32_t cpuIndex)
+{
+    if (cpuIndex < SCHED_MAX_CPUS)
+        return g_perCpu[cpuIndex].currentProcess;
+    return nullptr;
+}
+
 void SchedulerRegisterPolicy(const SchedOps* ops)
 {
     if (!ops || !ops->name)

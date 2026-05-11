@@ -43,6 +43,7 @@
 #include "fw_cfg.h"
 #include "rtc.h"
 #include "kvmclock.h"
+#include "watchdog.h"
 
 // All kernel initialization and runtime — called by KernelMain after stack switch.
 __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootProtocol);
@@ -574,6 +575,10 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         {
             brook::KPuts("FATAL: TLB shootdown self-test failed\n");
         }
+
+        // Start the software watchdog (must be after APs are active so
+        // per-CPU tick counters are updating on all cores).
+        brook::WatchdogInit();
 
         // Start the scheduler on all queued processes.
         if (brook::SchedulerReadyCount() > 0)

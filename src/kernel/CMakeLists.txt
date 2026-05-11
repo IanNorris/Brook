@@ -199,6 +199,7 @@ add_executable(kernel
     src/sync/ksemaphore.cpp
     src/serial_writer.cpp
     src/profiler.cpp
+    src/watchdog.cpp
     src/sched_policy.cpp
     src/exception_info.cpp
     src/debug_overlay.cpp

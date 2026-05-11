@@ -1835,12 +1835,20 @@ static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
     (void)pdrv;
     auto* mnt = static_cast<Ext2Mount*>(mountPriv);
 
-    KRwLockReadLock(&g_ext2Lock);
+    // Determine whether this open may mutate the filesystem.
+    bool needsWrite = (flags & VFS_O_CREATE) || (flags & VFS_O_TRUNC);
 
     // Handle root directory
     bool isRoot = (!relPath[0] || (relPath[0] == '/' && !relPath[1]));
     uint32_t ino = 0;
     Ext2Inode inodeData;
+
+    if (needsWrite) {
+        // Take write lock up front — create and truncate mutate metadata.
+        KRwLockWriteLock(&g_ext2Lock);
+    } else {
+        KRwLockReadLock(&g_ext2Lock);
+    }
 
     if (isRoot) {
         ino = EXT2_ROOT_INO;
@@ -1860,15 +1868,15 @@ static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
             SerialPrintf("ext2: CREATE file '%s' [#%u]\n", relPath, s_createCount);
         char name[256];
         uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name));
-        if (!parentIno || !name[0]) { KRwLockReadUnlock(&g_ext2Lock); return nullptr; }
+        if (!parentIno || !name[0]) { KRwLockWriteUnlock(&g_ext2Lock); return nullptr; }
 
         Ext2Inode parentData;
-        if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KRwLockReadUnlock(&g_ext2Lock); return nullptr; }
-        if ((parentData.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) { KRwLockReadUnlock(&g_ext2Lock); return nullptr; }
+        if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KRwLockWriteUnlock(&g_ext2Lock); return nullptr; }
+        if ((parentData.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) { KRwLockWriteUnlock(&g_ext2Lock); return nullptr; }
 
         // Allocate new inode
         ino = Ext2AllocInode(mnt, false);
-        if (!ino) { KRwLockReadUnlock(&g_ext2Lock); return nullptr; }
+        if (!ino) { KRwLockWriteUnlock(&g_ext2Lock); return nullptr; }
 
         // Initialize inode
         for (uint32_t i = 0; i < sizeof(inodeData); ++i)
@@ -1880,25 +1888,26 @@ static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
         // Add directory entry
         if (!Ext2DirAdd(mnt, parentIno, &parentData, ino, name, 1 /*EXT2_FT_REG_FILE*/)) {
             Ext2FreeInode(mnt, ino, false);
-            KRwLockReadUnlock(&g_ext2Lock);
+            KRwLockWriteUnlock(&g_ext2Lock);
             return nullptr;
         }
     }
 
     if (!ino) {
-        // Note: not-found is the common case for dynamic-linker probes
-        // (glibc-hwcaps + every entry on RPATH).  Logging each one was
-        // costing ~35s of UART busy-wait per nix-install while holding
-        // g_ext2Lock — visible as 96% idle, 3% disk, 0% userspace in
-        // a 240s nix-install vlc profile.  Gate behind g_kdebugTrace so
-        // callers that need it can re-enable at runtime.
-        KRwLockReadUnlock(&g_ext2Lock);
+        if (needsWrite)
+            KRwLockWriteUnlock(&g_ext2Lock);
+        else
+            KRwLockReadUnlock(&g_ext2Lock);
         if (g_kdebugTrace)
             SerialPrintf("ext2: open '%s' → not found\n", relPath);
         return nullptr;
     }
 
-    if (!Ext2ReadInode(mnt, ino, &inodeData)) { KRwLockReadUnlock(&g_ext2Lock); return nullptr; }
+    if (!Ext2ReadInode(mnt, ino, &inodeData)) {
+        if (needsWrite) KRwLockWriteUnlock(&g_ext2Lock);
+        else            KRwLockReadUnlock(&g_ext2Lock);
+        return nullptr;
+    }
 
     // Truncate if requested
     if ((flags & VFS_O_TRUNC) && (inodeData.i_mode & EXT2_S_IFMT) == EXT2_S_IFREG) {
@@ -1906,7 +1915,10 @@ static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
         Ext2WriteInode(mnt, ino, &inodeData);
     }
 
-    KRwLockReadUnlock(&g_ext2Lock);
+    if (needsWrite)
+        KRwLockWriteUnlock(&g_ext2Lock);
+    else
+        KRwLockReadUnlock(&g_ext2Lock);
 
     uint16_t mode = inodeData.i_mode & EXT2_S_IFMT;
 
