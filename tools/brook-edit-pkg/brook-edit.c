@@ -10,10 +10,12 @@
  *   Arrow keys      Move cursor
  *   Home / End      Start / end of line
  *   Page Up/Down    Scroll by page
+ *   Tab             Insert 4 spaces
  *   Backspace       Delete char before cursor
  *   Delete          Delete char at cursor
  *   Enter           Insert newline
  *   Ctrl+S          Save file
+ *   Ctrl+D          Duplicate current line
  *   Ctrl+Q / Esc    Quit
  */
 
@@ -584,10 +586,11 @@ static void on_key(void *data, struct wl_keyboard *kb, uint32_t serial,
 
     enum {
         KEY_ESC = 1, KEY_ENTER = 28, KEY_BACKSPACE = 14,
+        KEY_TAB = 15,
         KEY_UP = 103, KEY_DOWN = 108, KEY_LEFT = 105, KEY_RIGHT = 106,
         KEY_DELETE = 111, KEY_HOME = 102, KEY_END = 107,
         KEY_PAGEUP = 104, KEY_PAGEDOWN = 109,
-        KEY_S = 31, KEY_Q = 16,
+        KEY_S = 31, KEY_Q = 16, KEY_D = 32,
         KEY_LEFTCTRL = 29, KEY_RIGHTCTRL = 97,
     };
 
@@ -596,6 +599,20 @@ static void on_key(void *data, struct wl_keyboard *kb, uint32_t serial,
         switch (key) {
         case KEY_S: buffer_save(); return;
         case KEY_Q: g_running = 0; return;
+        case KEY_D: /* Duplicate current line */
+            if (g_line_count < MAX_LINES) {
+                buffer_insert_line(g_cy);
+                Line *src = &g_lines[g_cy];
+                Line *dst = &g_lines[g_cy + 1];
+                line_ensure_cap(dst, src->len + 1);
+                memcpy(dst->data, src->data, (size_t)src->len);
+                dst->len = src->len;
+                dst->data[dst->len] = '\0';
+                g_cy++;
+                g_modified = 1;
+                g_needs_redraw = 1;
+            }
+            return;
         }
     }
 
@@ -661,6 +678,10 @@ static void on_key(void *data, struct wl_keyboard *kb, uint32_t serial,
         break;
     case KEY_ENTER:
         insert_newline();
+        break;
+    case KEY_TAB:
+        /* Insert 4 spaces */
+        for (int i = 0; i < 4; i++) insert_char(' ');
         break;
     default:
         /* Map evdev keycode to ASCII (simplified US layout) */
