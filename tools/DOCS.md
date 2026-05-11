@@ -32,10 +32,10 @@ nix-install <pkg>
 |------|-------|---------|
 | waylandd | ~2200 | Wayland compositor relay (protocol → kernel WM, subsurfaces, popups) |
 | brook-files | ~1330 | Two-pane file browser with toolbar, breadcrumbs, column sorting |
-| brook-edit | ~900 | Text editor with save/load, Tab, Ctrl+D duplicate |
+| brook-edit | ~1040 | Text editor with Ctrl+S save, Ctrl+F search, Tab, Ctrl+D duplicate |
 | brook-player | 764 | Audio/video player |
-| brook-console | 600 | Kernel log viewer |
-| wayland-calc | 476 | Calculator |
+| brook-console | ~730 | Kernel log viewer with Ctrl+F filter |
+| wayland-calc | 816 | Interactive calculator with keyboard and mouse input |
 
 ## Test Programs
 
