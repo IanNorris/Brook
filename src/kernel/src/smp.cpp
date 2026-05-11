@@ -412,6 +412,7 @@ void SmpPrepareAPs()
 
         // Allocate per-CPU KernelCpuEnv + syscall stack.
         auto* env = static_cast<KernelCpuEnv*>(kmalloc(sizeof(KernelCpuEnv)));
+        if (!env) { SerialPrintf("SMP: OOM allocating KernelCpuEnv for AP%u\n", i); continue; }
         __builtin_memset(env, 0, sizeof(KernelCpuEnv));
 
         constexpr uint64_t SYSCALL_STACK_PAGES = 16;  // 64 KB

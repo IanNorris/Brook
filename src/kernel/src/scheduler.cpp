@@ -386,6 +386,7 @@ void SchedulerInit()
 
     // Create idle process for BSP (CPU 0).
     auto* idle = static_cast<Process*>(kmalloc(sizeof(Process)));
+    if (!idle) KernelPanic("SCHED: OOM allocating BSP idle process");
     __builtin_memset(idle, 0, sizeof(Process));
     idle->magic = PROCESS_MAGIC;
     // Safe x87/SSE defaults for xrstor
@@ -1505,6 +1506,7 @@ void SchedulerSetCpuEnv(uint32_t cpuIndex, KernelCpuEnv* env)
 void SchedulerInitApIdle(uint32_t cpuIndex)
 {
     auto* idle = static_cast<Process*>(kmalloc(sizeof(Process)));
+    if (!idle) KernelPanic("SCHED: OOM allocating AP%u idle process", cpuIndex);
     __builtin_memset(idle, 0, sizeof(Process));
     idle->magic = PROCESS_MAGIC;
     // Safe FPU/SSE defaults for fxrstor

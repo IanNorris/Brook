@@ -693,6 +693,7 @@ static Device* InitOnePciDevice(const PciDevice& pci, uint32_t slot)
                  (state->sectorCount * 512) / (1024 * 1024));
 
     auto* dev = static_cast<Device*>(kmalloc(sizeof(Device)));
+    if (!dev) { SerialPuts("virtio-blk: OOM allocating Device\n"); return nullptr; }
     dev->ops  = reinterpret_cast<const DeviceOps*>(&g_virtioBlkOps);
     dev->name = g_virtioNames[slot];
     dev->type = DeviceType::Block;
