@@ -385,6 +385,7 @@ static Vnode* FatFsOpen(void* /*mountPriv*/, uint8_t pdrv,
     KMutexLock(&g_fatLock);
     FRESULT res = f_open(fil, fatPath, mode);
     if (res != FR_OK) {
+        SerialPrintf("FATFS: f_open('%s', 0x%x) failed: %d\n", fatPath, mode, res);
         KMutexUnlock(&g_fatLock);
     }
     if (res == FR_OK) {
