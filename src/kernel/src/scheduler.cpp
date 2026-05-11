@@ -1023,9 +1023,13 @@ void SchedulerTimerTick(bool allowPreempt)
         return;
 
     // CPU time accounting: charge one tick to the running process.
+    // allowPreempt is true when the timer interrupted user mode (ring 3).
     if (cur != g_perCpu[cpu].idleProcess)
     {
-        cur->userTicks++;
+        if (allowPreempt)
+            cur->userTicks++;
+        else
+            cur->sysTicks++;
         g_perCpu[cpu].busyTicks++;
     }
     else
