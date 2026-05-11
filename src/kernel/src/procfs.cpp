@@ -380,8 +380,27 @@ static Vnode* GenLoadavg()
     auto* buf = static_cast<char*>(kmalloc(64));
     if (!buf) return nullptr;
 
-    uint32_t n = ProcFmt(buf, 64, "0.00 0.00 0.00 1/1 1\n");
-    return MakeProcVnode(buf, n);
+    uint32_t total = 0, running = 0;
+    SchedulerGetProcessCounts(total, running);
+
+    // Format: 1min 5min 15min running/total lastpid
+    // We approximate load from running count (no EWMA yet)
+    char* p = buf;
+    p = AppendU64(p, running);
+    p = AppendStr(p, ".00 ");
+    p = AppendU64(p, running);
+    p = AppendStr(p, ".00 ");
+    p = AppendU64(p, running);
+    p = AppendStr(p, ".00 ");
+    p = AppendU64(p, running);
+    *p++ = '/';
+    p = AppendU64(p, total);
+    *p++ = ' ';
+    p = AppendU64(p, SchedulerGetTotalForks());
+    *p++ = '\n';
+    *p = '\0';
+
+    return MakeProcVnode(buf, static_cast<uint32_t>(p - buf));
 }
 
 // /proc/cpuinfo — per-CPU information including feature flags.

@@ -1834,6 +1834,22 @@ void SchedulerGetReapedTicks(uint64_t& userTicks, uint64_t& sysTicks)
     sysTicks = g_reapedSysTicks;
 }
 
+void SchedulerGetProcessCounts(uint32_t& total, uint32_t& running)
+{
+    uint64_t flags = SchedLockAcquire(g_allProcLock);
+    total = 0;
+    running = 0;
+    for (uint32_t i = 0; i < g_processCount; ++i)
+    {
+        Process* p = g_allProcesses[i];
+        if (!p) continue;
+        ++total;
+        if (p->state == ProcessState::Ready || p->state == ProcessState::Running)
+            ++running;
+    }
+    SchedLockRelease(g_allProcLock, flags);
+}
+
 void SchedulerGetCpuTicks(uint32_t cpuIndex, uint64_t& busyTicks, uint64_t& idleTicks)
 {
     if (cpuIndex < SCHED_MAX_CPUS)
