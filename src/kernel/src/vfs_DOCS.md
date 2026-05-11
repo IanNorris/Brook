@@ -176,6 +176,7 @@ Virtual filesystem generating process and system information on the fly.
 | `exe` | Executable path |
 | `cwd` | Current working directory |
 | `limits` | Resource limits (open files, stack, data, max processes) |
+| `fd/` | Directory listing open file descriptors (entries are fd numbers, reading shows target path/type) |
 
 ### Special Paths
 - `/proc/self` → resolves to current process's PID directory

@@ -9237,17 +9237,32 @@ static int64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
-// sys_getrlimit (97) — stub
+// sys_getrlimit (97) — return resource limits consistent with prlimit64
 // ---------------------------------------------------------------------------
 
 static int64_t sys_getrlimit(uint64_t resource, uint64_t rlimAddr, uint64_t,
                               uint64_t, uint64_t, uint64_t)
 {
-    (void)resource;
     if (!UserBufferWritable(rlimAddr, 16)) return -EFAULT;
     auto* rlim = reinterpret_cast<uint64_t*>(rlimAddr);
-    rlim[0] = 0x7FFFFFFFFFFFFFFFULL; // rlim_cur = unlimited
-    rlim[1] = 0x7FFFFFFFFFFFFFFFULL; // rlim_max = unlimited
+    switch (resource)
+    {
+    case 7: // RLIMIT_NOFILE
+        rlim[0] = MAX_FDS;
+        rlim[1] = MAX_FDS;
+        break;
+    case 3: // RLIMIT_STACK
+        rlim[0] = 8 * 1024 * 1024;
+        rlim[1] = RLIM_INFINITY;
+        break;
+    case 0: // RLIMIT_CPU
+    case 1: // RLIMIT_FSIZE
+    case 2: // RLIMIT_DATA
+    default:
+        rlim[0] = RLIM_INFINITY;
+        rlim[1] = RLIM_INFINITY;
+        break;
+    }
     return 0;
 }
 
