@@ -13,6 +13,7 @@
 #include "memory/physical_memory.h"
 #include "klog.h"
 #include "profiler.h"
+#include "string.h"
 #include "window.h"
 #include "smp.h"
 #include "rtc.h"
@@ -110,20 +111,8 @@ static uint16_t InetChecksum(const void* data, uint32_t len)
 // Memory helpers
 // ---------------------------------------------------------------------------
 
-static void* NetMemset(void* dst, int val, uint64_t n)
-{
-    uint8_t* d = static_cast<uint8_t*>(dst);
-    for (uint64_t i = 0; i < n; i++) d[i] = static_cast<uint8_t>(val);
-    return dst;
-}
-
-static void* NetMemcpy(void* dst, const void* src, uint64_t n)
-{
-    uint8_t* d = static_cast<uint8_t*>(dst);
-    const uint8_t* s = static_cast<const uint8_t*>(src);
-    for (uint64_t i = 0; i < n; i++) d[i] = s[i];
-    return dst;
-}
+// NetMemset / NetMemcpy removed — callers now use standard memset / memcpy
+// from string.h (ERMS-accelerated rep stosb / rep movsb).
 
 
 
@@ -177,10 +166,10 @@ static void ArpSendRequest(uint32_t targetIp)
     if (!nif) return;
 
     uint8_t frame[42]; // 14 eth + 28 arp
-    NetMemset(frame, 0, sizeof(frame));
+    memset(frame, 0, sizeof(frame));
 
     auto* eth = reinterpret_cast<EthHeader*>(frame);
-    NetMemset(eth->dst.b, 0xFF, 6); // broadcast
+    memset(eth->dst.b, 0xFF, 6); // broadcast
     eth->src = nif->mac;
     eth->etherType = htons(ETH_TYPE_ARP);
 
@@ -192,7 +181,7 @@ static void ArpSendRequest(uint32_t targetIp)
     arp->oper  = htons(ARP_OP_REQUEST);
     arp->sha   = nif->mac;
     arp->spa   = nif->ipAddr;
-    NetMemset(arp->tha.b, 0, 6);
+    memset(arp->tha.b, 0, 6);
     arp->tpa   = targetIp;
 
     nif->transmit(nif, frame, 42);
@@ -203,7 +192,7 @@ static void ArpSendReply(NetIf* nif, const MacAddr& dstMac, uint32_t dstIp)
     if (!nif) return;
 
     uint8_t frame[42];
-    NetMemset(frame, 0, sizeof(frame));
+    memset(frame, 0, sizeof(frame));
 
     auto* eth = reinterpret_cast<EthHeader*>(frame);
     eth->dst = dstMac;
@@ -277,7 +266,7 @@ bool ArpResolve(uint32_t ip, MacAddr* outMac)
 
     // Broadcast address
     if (ip == 0xFFFFFFFF) {
-        NetMemset(outMac->b, 0xFF, 6);
+        memset(outMac->b, 0xFF, 6);
         return true;
     }
 
@@ -338,7 +327,7 @@ int NetSendIpv4(uint32_t dstIp, uint8_t proto,
         if (frameLen > ETH_FRAME_MAX) return -3;
 
         alignas(16) uint8_t frame[ETH_FRAME_MAX];
-        NetMemset(frame, 0, frameLen);
+        memset(frame, 0, frameLen);
 
         auto* eth = reinterpret_cast<EthHeader*>(frame);
         eth->src = nif->mac;
@@ -357,7 +346,7 @@ int NetSendIpv4(uint32_t dstIp, uint8_t proto,
         ip->checksum = 0;
         ip->checksum = InetChecksum(ip, sizeof(Ipv4Header));
 
-        NetMemcpy(frame + sizeof(EthHeader) + sizeof(Ipv4Header), payload, payloadLen);
+        memcpy(frame + sizeof(EthHeader) + sizeof(Ipv4Header), payload, payloadLen);
         HandleIpv4(frame, frameLen);
         return 0;
     }
@@ -380,7 +369,7 @@ int NetSendIpv4(uint32_t dstIp, uint8_t proto,
     if (frameLen > ETH_FRAME_MAX) return -3;
 
     alignas(16) uint8_t frame[ETH_FRAME_MAX];
-    NetMemset(frame, 0, frameLen);
+    memset(frame, 0, frameLen);
 
     auto* eth = reinterpret_cast<EthHeader*>(frame);
     eth->dst = dstMac;
@@ -400,7 +389,7 @@ int NetSendIpv4(uint32_t dstIp, uint8_t proto,
     ip->checksum = 0;
     ip->checksum = InetChecksum(ip, sizeof(Ipv4Header));
 
-    NetMemcpy(frame + sizeof(EthHeader) + sizeof(Ipv4Header), payload, payloadLen);
+    memcpy(frame + sizeof(EthHeader) + sizeof(Ipv4Header), payload, payloadLen);
 
     nif->txPackets++;
     nif->txBytes += frameLen;
@@ -420,7 +409,7 @@ int NetSendUdp(uint32_t dstIp, uint16_t srcPort, uint16_t dstPort,
     udp->length   = htons(static_cast<uint16_t>(udpLen));
     udp->checksum = 0; // optional for UDP over IPv4
 
-    NetMemcpy(buf + sizeof(UdpHeader), data, dataLen);
+    memcpy(buf + sizeof(UdpHeader), data, dataLen);
 
     return NetSendIpv4(dstIp, IP_PROTO_UDP, buf, udpLen);
 }
@@ -444,7 +433,7 @@ static void HandleIcmp(const Ipv4Header* ip, const uint8_t* payload, uint32_t pa
         uint8_t reply[ETH_MTU];
         if (payloadLen > sizeof(reply)) return;
 
-        NetMemcpy(reply, payload, payloadLen);
+        memcpy(reply, payload, payloadLen);
         auto* replyIcmp = reinterpret_cast<IcmpHeader*>(reply);
         replyIcmp->type = ICMP_ECHO_REPLY;
         replyIcmp->checksum = 0;
@@ -541,10 +530,10 @@ void NetReceive(NetIf* nif, const void* frame, uint32_t len)
 
 void NetInit()
 {
-    NetMemset(g_arpCache, 0, sizeof(g_arpCache));
+    memset(g_arpCache, 0, sizeof(g_arpCache));
     g_arpCount = 0;
-    NetMemset(g_sockets, 0, sizeof(g_sockets));
-    NetMemset(g_sockUsed, 0, sizeof(g_sockUsed));
+    memset(g_sockets, 0, sizeof(g_sockets));
+    memset(g_sockUsed, 0, sizeof(g_sockUsed));
     g_netIf = nullptr;
     for (uint32_t i = 0; i < NET_MAX_IFS; i++) g_netIfs[i] = nullptr;
     g_netIfCount = 0;
@@ -694,10 +683,10 @@ static void DhcpSend(uint8_t msgType, uint32_t serverIp, uint32_t requestedIp)
 
     // Build DHCP over UDP over IP over Ethernet
     alignas(16) uint8_t frame[ETH_FRAME_MAX];
-    NetMemset(frame, 0, sizeof(frame));
+    memset(frame, 0, sizeof(frame));
 
     auto* eth = reinterpret_cast<EthHeader*>(frame);
-    NetMemset(eth->dst.b, 0xFF, 6); // broadcast
+    memset(eth->dst.b, 0xFF, 6); // broadcast
     eth->src = g_netIf->mac;
     eth->etherType = htons(ETH_TYPE_IPV4);
 
@@ -729,7 +718,7 @@ static void DhcpSend(uint8_t msgType, uint32_t serverIp, uint32_t requestedIp)
     dhcp->hlen  = 6;
     dhcp->xid   = g_dhcpXid;
     dhcp->flags = htons(0x8000); // broadcast flag
-    NetMemcpy(dhcp->chaddr, g_netIf->mac.b, 6);
+    memcpy(dhcp->chaddr, g_netIf->mac.b, 6);
     dhcp->magic = DHCP_MAGIC;
 
     // Options
@@ -740,10 +729,10 @@ static void DhcpSend(uint8_t msgType, uint32_t serverIp, uint32_t requestedIp)
     if (msgType == DHCP_REQUEST) {
         // Option 50: Requested IP
         *opt++ = 50; *opt++ = 4;
-        NetMemcpy(opt, &requestedIp, 4); opt += 4;
+        memcpy(opt, &requestedIp, 4); opt += 4;
         // Option 54: Server Identifier
         *opt++ = 54; *opt++ = 4;
-        NetMemcpy(opt, &serverIp, 4); opt += 4;
+        memcpy(opt, &serverIp, 4); opt += 4;
     }
 
     // Option 55: Parameter Request List
@@ -789,10 +778,10 @@ static void HandleDhcpReply(const uint8_t* data, uint32_t len)
 
         switch (code) {
         case 53: if (olen >= 1) msgType = opt[0]; break;
-        case 1:  if (olen >= 4) NetMemcpy(&subnetMask, opt, 4); break;
-        case 3:  if (olen >= 4) NetMemcpy(&router, opt, 4); break;
-        case 6:  if (olen >= 4) NetMemcpy(&dns, opt, 4); break;
-        case 54: if (olen >= 4) NetMemcpy(&serverIp, opt, 4); break;
+        case 1:  if (olen >= 4) memcpy(&subnetMask, opt, 4); break;
+        case 3:  if (olen >= 4) memcpy(&router, opt, 4); break;
+        case 6:  if (olen >= 4) memcpy(&dns, opt, 4); break;
+        case 54: if (olen >= 4) memcpy(&serverIp, opt, 4); break;
         }
         opt += olen;
     }
@@ -1140,7 +1129,7 @@ static uint32_t DnsParseResponse(const uint8_t* data, uint32_t len, uint16_t exp
 
         if (rtype == 1 && rdlen == 4) { // A record
             uint32_t ip;
-            NetMemcpy(&ip, p, 4);
+            memcpy(&ip, p, 4);
             return ip; // big-endian
         }
 
@@ -1192,7 +1181,7 @@ static void DnsCacheInsert(const char* hostname, uint32_t ip)
     int idx = g_dnsCacheCount < DNS_CACHE_SIZE ? g_dnsCacheCount++ : 0;
     int nameLen = NetStrLen(hostname);
     if (nameLen >= 127) nameLen = 127;
-    NetMemcpy(g_dnsCache[idx].name, hostname, nameLen);
+    memcpy(g_dnsCache[idx].name, hostname, nameLen);
     g_dnsCache[idx].name[nameLen] = 0;
     g_dnsCache[idx].ip = ip;
 }
@@ -1210,7 +1199,7 @@ uint32_t DnsResolve(const char* hostname)
 
     // Build DNS query
     uint8_t pkt[512];
-    NetMemset(pkt, 0, sizeof(pkt));
+    memset(pkt, 0, sizeof(pkt));
 
     static uint16_t s_dnsId = 1;
     uint16_t qid = s_dnsId++;
@@ -1282,7 +1271,7 @@ int SockCreate(int domain, int type, int protocol)
     for (uint32_t i = 0; i < MAX_SOCKETS; i++) {
         if (!g_sockUsed[i]) {
             g_sockUsed[i] = true;
-            NetMemset(&g_sockets[i], 0, sizeof(Socket));
+            memset(&g_sockets[i], 0, sizeof(Socket));
             g_sockets[i].domain = domain;
             g_sockets[i].type = type;
             g_sockets[i].protocol = protocol ? protocol :
@@ -1349,7 +1338,7 @@ int SockCreate(int domain, int type, int protocol)
             TcpSendSegment(s, TCP_FIN | TCP_ACK, nullptr, 0, "reap-closewait");
             if (s.tcpOooBuf) kfree(s.tcpOooBuf);
             if (s.rxBuf) kfree(s.rxBuf);
-            NetMemset(&g_sockets[i], 0, sizeof(Socket));
+            memset(&g_sockets[i], 0, sizeof(Socket));
             g_sockUsed[i] = false;
         }
     }
@@ -1358,7 +1347,7 @@ int SockCreate(int domain, int type, int protocol)
     for (uint32_t i = 0; i < MAX_SOCKETS; i++) {
         if (!g_sockUsed[i]) {
             g_sockUsed[i] = true;
-            NetMemset(&g_sockets[i], 0, sizeof(Socket));
+            memset(&g_sockets[i], 0, sizeof(Socket));
             g_sockets[i].domain = domain;
             g_sockets[i].type = type;
             g_sockets[i].protocol = protocol ? protocol :
@@ -1498,7 +1487,7 @@ int SockRecvFrom(int sockIdx, void* buf, uint32_t len,
         src->sin_family = AF_INET;
         src->sin_addr = srcIp;
         src->sin_port = htons(srcPort);
-        NetMemset(src->sin_zero, 0, 8);
+        memset(src->sin_zero, 0, 8);
     }
 
     return static_cast<int>(copyLen);
@@ -1527,7 +1516,7 @@ void SockClose(int sockIdx)
                 }
                 if (child.tcpOooBuf) kfree(child.tcpOooBuf);
                 if (child.rxBuf) kfree(child.rxBuf);
-                NetMemset(&g_sockets[childIdx], 0, sizeof(Socket));
+                memset(&g_sockets[childIdx], 0, sizeof(Socket));
                 g_sockUsed[childIdx] = false;
             }
         }
@@ -1584,7 +1573,7 @@ void SockClose(int sockIdx)
     if (s.rxBuf)
         kfree(s.rxBuf);
 
-    NetMemset(&g_sockets[sockIdx], 0, sizeof(Socket));
+    memset(&g_sockets[sockIdx], 0, sizeof(Socket));
     g_sockUsed[sockIdx] = false;
 }
 
@@ -1862,7 +1851,7 @@ static bool TcpStoreOoo(Socket& s, uint32_t seq, const uint8_t* data,
         if (slot.used)
             continue;
 
-        NetMemcpy(s.tcpOooBuf + i * Socket::TCP_OOO_SLOT_SIZE, data, len);
+        memcpy(s.tcpOooBuf + i * Socket::TCP_OOO_SLOT_SIZE, data, len);
         slot.seq = seq;
         slot.len = static_cast<uint16_t>(len);
         slot.tick = now;
@@ -1934,7 +1923,7 @@ static void TcpSendSegmentAtSeq(Socket& s, uint32_t seq, uint8_t flags,
     uint32_t optLen  = addMss ? 4 : 0;   // MSS option is 4 bytes
     uint32_t tcpLen  = sizeof(TcpHeader) + optLen + dataLen;
     alignas(16) uint8_t buf[ETH_MTU];
-    NetMemset(buf, 0, tcpLen);
+    memset(buf, 0, tcpLen);
 
     auto* tcp = reinterpret_cast<TcpHeader*>(buf);
     tcp->srcPort  = s.localPort;
@@ -1961,7 +1950,7 @@ static void TcpSendSegmentAtSeq(Socket& s, uint32_t seq, uint8_t flags,
     }
 
     if (data && dataLen > 0)
-        NetMemcpy(buf + sizeof(TcpHeader) + optLen, data, dataLen);
+        memcpy(buf + sizeof(TcpHeader) + optLen, data, dataLen);
 
     tcp->checksum = 0;
     tcp->checksum = TcpChecksum(g_netIf->ipAddr, s.remoteIp, buf, tcpLen);
@@ -2185,7 +2174,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
                      (ntohl(ip->srcIp) >> 8) & 0xFF, ntohl(ip->srcIp) & 0xFF,
                      ntohs(srcPort), ntohs(dstPort), flags);
         uint8_t rstBuf[sizeof(TcpHeader)];
-        NetMemset(rstBuf, 0, sizeof(TcpHeader));
+        memset(rstBuf, 0, sizeof(TcpHeader));
         auto* rst = reinterpret_cast<TcpHeader*>(rstBuf);
         rst->srcPort = dstPort;
         rst->dstPort = srcPort;
@@ -2715,7 +2704,7 @@ static void DebugChannelThreadFn(void* /*arg*/)
     }
 
     SockAddrIn addr;
-    NetMemset(&addr, 0, sizeof(addr));
+    memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(9999);
     addr.sin_addr = htonl(0x0A000202); // 10.0.2.2

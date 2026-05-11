@@ -92,8 +92,7 @@ static FdEntry* AllocFdTable()
 {
     auto* table = static_cast<FdEntry*>(kmalloc(sizeof(FdEntry) * MAX_FDS));
     if (!table) return nullptr;
-    auto* raw = reinterpret_cast<uint8_t*>(table);
-    for (uint64_t i = 0; i < sizeof(FdEntry) * MAX_FDS; ++i) raw[i] = 0;
+    memset(table, 0, sizeof(FdEntry) * MAX_FDS);
     return table;
 }
 
@@ -231,7 +230,7 @@ static void SetupTLS(Process* proc, uint64_t stackVirtBase, uint64_t guardPages)
             break;
         }
         auto* p = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
-        for (uint64_t b = 0; b < 4096; b++) p[b] = 0;
+        memset(p, 0, 4096);
     }
 
     if (!tlsOk) return;
@@ -746,7 +745,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
             break;
         }
         auto* p = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
-        for (uint64_t b = 0; b < 4096; b++) p[b] = 0;
+        memset(p, 0, 4096);
     }
     if (!stackOk)
     {
@@ -1819,7 +1818,7 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
             return 0;
         }
         auto* p = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
-        for (uint64_t b = 0; b < 4096; b++) p[b] = 0;
+        memset(p, 0, 4096);
     }
     proc->stackBase = stackVirtBase + guardPages * 4096;
     proc->stackTop  = stackVirtTop - 8;

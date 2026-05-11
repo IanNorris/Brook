@@ -758,7 +758,7 @@ static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
             // Zero out new indirect block
             auto* zb = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
             if (!zb) return 0;
-            for (uint32_t i = 0; i < mnt->blockSize; ++i) zb[i] = 0;
+            memset(zb, 0, mnt->blockSize);
             Ext2WriteBlock(mnt, nb, zb);
             kfree(zb);
             ino->i_block[12] = nb;
@@ -795,7 +795,7 @@ static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
             if (!nb) return 0;
             auto* zb = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
             if (!zb) return 0;
-            for (uint32_t i = 0; i < mnt->blockSize; ++i) zb[i] = 0;
+            memset(zb, 0, mnt->blockSize);
             Ext2WriteBlock(mnt, nb, zb);
             kfree(zb);
             ino->i_block[13] = nb;
@@ -811,7 +811,7 @@ static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
             if (!indBlock) return 0;
             auto* zb = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
             if (!zb) return 0;
-            for (uint32_t i = 0; i < mnt->blockSize; ++i) zb[i] = 0;
+            memset(zb, 0, mnt->blockSize);
             Ext2WriteBlock(mnt, indBlock, zb);
             kfree(zb);
             Ext2DevWrite(mnt, off1, &indBlock, 4);
@@ -1046,7 +1046,7 @@ static bool Ext2DirAdd(Ext2Mount* mnt, uint32_t dirIno, Ext2Inode* dirData,
     if (!newBlock) { kfree(blockBuf); return false; }
 
     // Fill the new block with our entry
-    for (uint32_t i = 0; i < mnt->blockSize; ++i) blockBuf[i] = 0;
+    memset(blockBuf, 0, mnt->blockSize);
     auto* newDe = reinterpret_cast<Ext2DirEntry2*>(blockBuf);
     newDe->inode = childIno;
     newDe->rec_len = static_cast<uint16_t>(mnt->blockSize); // spans entire block
@@ -2199,7 +2199,7 @@ static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath)
         KRwLockWriteUnlock(&g_ext2Lock);
         return -1;
     }
-    for (uint32_t i = 0; i < mnt->blockSize; ++i) blockBuf[i] = 0;
+    memset(blockBuf, 0, mnt->blockSize);
 
     // . entry
     auto* dot = reinterpret_cast<Ext2DirEntry2*>(blockBuf);
@@ -2390,7 +2390,7 @@ static int Ext2FsSymlink(void* mountPriv, uint8_t pdrv,
             KRwLockWriteUnlock(&g_ext2Lock);
             return -12; // -ENOMEM
         }
-        for (uint32_t i = 0; i < mnt->blockSize; ++i) buf[i] = 0;
+        memset(buf, 0, mnt->blockSize);
         for (uint32_t i = 0; i < targetLen; ++i) buf[i] = static_cast<uint8_t>(target[i]);
         Ext2WriteBlock(mnt, blk, buf);
         kfree(buf);

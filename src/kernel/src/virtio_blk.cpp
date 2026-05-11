@@ -239,7 +239,7 @@ static bool AllocVirtqueue(VirtioBlkState& s)
                  qVirt + usedOff + 2);
 
     uint8_t* base = reinterpret_cast<uint8_t*>(qVirt);
-    for (uint32_t i = 0; i < totalPages * 4096; ++i) base[i] = 0;
+    memset(base, 0, totalPages * 4096);
 
     s.descTable  = reinterpret_cast<VirtqDesc*>(qVirt);
 

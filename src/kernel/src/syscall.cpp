@@ -9006,7 +9006,7 @@ static int64_t sys_statx(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
 
     auto fillStatxFromLinuxStat = [&](const LinuxStat& st) {
         auto* raw = reinterpret_cast<uint8_t*>(stx);
-        for (uint64_t i = 0; i < sizeof(linux_statx); i++) raw[i] = 0;
+        memset(raw, 0, sizeof(linux_statx));
         stx->stx_mask = 0x7FF; // STATX_BASIC_STATS
         stx->stx_blksize = static_cast<uint32_t>(st.st_blksize ? st.st_blksize : 4096);
         stx->stx_nlink = static_cast<uint32_t>(st.st_nlink);
@@ -9052,7 +9052,7 @@ static int64_t sys_statx(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
 
     // Zero-fill then populate
     auto* raw = reinterpret_cast<uint8_t*>(stx);
-    for (uint64_t i = 0; i < sizeof(linux_statx); i++) raw[i] = 0;
+    memset(raw, 0, sizeof(linux_statx));
 
     stx->stx_mask = 0x7FF; // STATX_BASIC_STATS
     stx->stx_blksize = 4096;
