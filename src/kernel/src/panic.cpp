@@ -337,7 +337,7 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
             e.pid   = p->pid;
             e.state = static_cast<uint8_t>(p->state);
             e.cpu   = (p->runningOnCpu >= 0) ? static_cast<uint8_t>(p->runningOnCpu) : 0xFF;
-            e.rip   = 0; // TODO: capture from saved context
+            e.rip   = p->savedCtx.rip;
             // Copy name (truncate if needed)
             for (uint32_t j = 0; j < brook::PANIC_PROCESS_NAME_LEN; j++)
                 e.name[j] = (p->name[j]) ? p->name[j] : '\0';
