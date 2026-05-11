@@ -2949,6 +2949,50 @@ static int64_t sys_pipe(uint64_t pipefdAddr, uint64_t, uint64_t,
 // sys_dup (32) / sys_dup2 (33)
 // ---------------------------------------------------------------------------
 
+// Bump refcount on the underlying object for a duplicated fd entry.
+static void FdBumpRefcount(FdEntry* fde)
+{
+    if (!fde->handle) return;
+    switch (fde->type)
+    {
+    case FdType::Pipe: {
+        auto* pipe = static_cast<PipeBuffer*>(fde->handle);
+        if (fde->flags & 1)
+            __atomic_fetch_add(&pipe->writers, 1, __ATOMIC_RELEASE);
+        else
+            __atomic_fetch_add(&pipe->readers, 1, __ATOMIC_RELEASE);
+        break;
+    }
+    case FdType::Vnode:
+        __atomic_fetch_add(&static_cast<Vnode*>(fde->handle)->refCount, 1, __ATOMIC_RELEASE);
+        break;
+    case FdType::Socket: {
+        int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+        brook::SockRef(sockIdx);
+        break;
+    }
+    case FdType::MemFd:
+        MemFdRef(static_cast<MemFdData*>(fde->handle));
+        break;
+    case FdType::EventFd:
+        EventFdRef(static_cast<EventFdData*>(fde->handle));
+        break;
+    case FdType::EpollFd:
+        EpollFdRef(static_cast<EpollInstance*>(fde->handle));
+        break;
+    case FdType::TimerFd:
+        TimerFdRef(static_cast<TimerFdData*>(fde->handle));
+        break;
+    case FdType::UnixSocket: {
+        auto* usd = static_cast<UnixSocketData*>(fde->handle);
+        __atomic_fetch_add(&usd->refCount, 1, __ATOMIC_RELEASE);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
 static int64_t sys_dup(uint64_t oldfd, uint64_t, uint64_t,
                         uint64_t, uint64_t, uint64_t)
 {
@@ -2967,44 +3011,7 @@ static int64_t sys_dup(uint64_t oldfd, uint64_t, uint64_t,
     for (int i = 0; i < 64; ++i)
         proc->fds[newfd].dirPath[i] = old->dirPath[i];
 
-    // Bump pipe refcount
-    if (old->type == FdType::Pipe && old->handle)
-    {
-        auto* pipe = static_cast<PipeBuffer*>(old->handle);
-        if (old->flags & 1)
-            __atomic_fetch_add(&pipe->writers, 1, __ATOMIC_RELEASE);
-        else
-            __atomic_fetch_add(&pipe->readers, 1, __ATOMIC_RELEASE);
-    }
-
-    // Bump vnode refcount
-    if (old->type == FdType::Vnode && old->handle)
-        __atomic_fetch_add(&static_cast<Vnode*>(old->handle)->refCount, 1, __ATOMIC_RELEASE);
-
-    // Bump socket refcount
-    if (old->type == FdType::Socket && old->handle)
-    {
-        int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(old->handle)) - 1;
-        brook::SockRef(sockIdx);
-    }
-
-    // Bump memfd refcount
-    if (old->type == FdType::MemFd && old->handle)
-        MemFdRef(static_cast<MemFdData*>(old->handle));
-
-    if (old->type == FdType::EventFd && old->handle)
-        EventFdRef(static_cast<EventFdData*>(old->handle));
-    if (old->type == FdType::EpollFd && old->handle)
-        EpollFdRef(static_cast<EpollInstance*>(old->handle));
-    if (old->type == FdType::TimerFd && old->handle)
-        TimerFdRef(static_cast<TimerFdData*>(old->handle));
-
-    // Bump unix socket refcount
-    if (old->type == FdType::UnixSocket && old->handle)
-    {
-        auto* usd = static_cast<UnixSocketData*>(old->handle);
-        __atomic_fetch_add(&usd->refCount, 1, __ATOMIC_RELEASE);
-    }
+    FdBumpRefcount(&proc->fds[newfd]);
 
     return newfd;
 }
@@ -3036,44 +3043,7 @@ static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd, uint64_t,
     for (int i = 0; i < 64; ++i)
         proc->fds[newfd].dirPath[i] = old->dirPath[i];
 
-    // Bump pipe refcount
-    if (old->type == FdType::Pipe && old->handle)
-    {
-        auto* pipe = static_cast<PipeBuffer*>(old->handle);
-        if (old->flags & 1)
-            __atomic_fetch_add(&pipe->writers, 1, __ATOMIC_RELEASE);
-        else
-            __atomic_fetch_add(&pipe->readers, 1, __ATOMIC_RELEASE);
-    }
-
-    // Bump vnode refcount
-    if (old->type == FdType::Vnode && old->handle)
-        __atomic_fetch_add(&static_cast<Vnode*>(old->handle)->refCount, 1, __ATOMIC_RELEASE);
-
-    // Bump socket refcount
-    if (old->type == FdType::Socket && old->handle)
-    {
-        int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(old->handle)) - 1;
-        brook::SockRef(sockIdx);
-    }
-
-    // Bump memfd refcount
-    if (old->type == FdType::MemFd && old->handle)
-        MemFdRef(static_cast<MemFdData*>(old->handle));
-
-    if (old->type == FdType::EventFd && old->handle)
-        EventFdRef(static_cast<EventFdData*>(old->handle));
-    if (old->type == FdType::EpollFd && old->handle)
-        EpollFdRef(static_cast<EpollInstance*>(old->handle));
-    if (old->type == FdType::TimerFd && old->handle)
-        TimerFdRef(static_cast<TimerFdData*>(old->handle));
-
-    // Bump unix socket refcount
-    if (old->type == FdType::UnixSocket && old->handle)
-    {
-        auto* usd = static_cast<UnixSocketData*>(old->handle);
-        __atomic_fetch_add(&usd->refCount, 1, __ATOMIC_RELEASE);
-    }
+    FdBumpRefcount(&proc->fds[newfd]);
 
     return static_cast<int64_t>(newfd);
 }
