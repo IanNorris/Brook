@@ -1325,7 +1325,7 @@ static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
         // alignment padding as sparse blocks on disk).
         if (!diskBlock) {
             uint64_t toCopy = avail < remaining ? avail : remaining;
-            for (uint64_t i = 0; i < toCopy; ++i) dst[bytesRead + i] = 0;
+            memset(dst + bytesRead, 0, toCopy);
             bytesRead += toCopy;
             continue;
         }
