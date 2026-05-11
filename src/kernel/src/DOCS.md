@@ -35,6 +35,8 @@ UEFI Bootloader
 | File | Purpose |
 |------|---------|
 | `kernel.cpp` | Entry point, BSP boot sequence |
+| `runtime.cpp` | Compiler builtins (memcpy/memmove/memset) using ERMS `rep movsb`/`rep stosb` |
+| `string.h` | C-linkage string/mem functions (inline ERMS, for headers) |
 | `gdt.cpp` | GDT/TSS setup (per-CPU kernel stacks, syscall segments) |
 | `idt.cpp` | IDT, exception/interrupt handlers, signal delivery |
 | `cpu.cpp` | CPUID feature detection |
