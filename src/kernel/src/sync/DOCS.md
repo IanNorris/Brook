@@ -132,7 +132,7 @@ struct KRwLock {
 | Function | Signature | Contract |
 |----------|-----------|----------|
 | `KRwLockInit` | `(KRwLock*)` | Zero all fields. |
-| `KRwLockReadLock` | `(KRwLock*)` | Grant if no writer active. **⚠️ BUG (BRO-078): doesn't check `writersWaiting` — contradicts header comment, can starve writers.** |
+| `KRwLockReadLock` | `(KRwLock*)` | Grant if no writer active and none waiting. Blocks if writers are waiting (writer-preference). |
 | `KRwLockReadUnlock` | `(KRwLock*)` | Decrement readerCount. If last reader and writers waiting, wake next writer. |
 | `KRwLockWriteLock` | `(KRwLock*)` | Grant if no readers and no writer active. Otherwise enqueue and block. Increments `writersWaiting`. |
 | `KRwLockWriteUnlock` | `(KRwLock*)` | Prefer waking ALL queued readers (batch, up to 128). If no readers, wake next writer. |
@@ -140,8 +140,8 @@ struct KRwLock {
 ### Known Issues
 - **BRO-077**: Missing `pendingWakeup` pattern — lost wakeup race between
   GuardRelease and SchedulerBlock. Both ReadLock and WriteLock are affected.
-- **BRO-078**: `KRwLockReadLock` only checks `writerActive`, ignoring
-  `writersWaiting`. New readers can starve waiting writers indefinitely.
+- **~~BRO-078~~**: Fixed — `KRwLockReadLock` now checks both `writerActive` and
+  `writersWaiting`. Writers cannot be starved by new readers.
 - Batch reader wakeup caps at 128 (stack array). More than 128 queued readers
   would require multiple passes — currently not handled (excess readers stay queued).
 - No `ForceUnlock` equivalent for process teardown (KMutex has `KMutexForceUnlock`).
@@ -221,6 +221,6 @@ MLFQ scheduler.
 |-----|----------|-----------|-------------|
 | BRO-076 | low | Heap | g_freeBytes tracking drifts (diagnostic-only) |
 | BRO-077 | high | KSemaphore/KRwLock | Missing pendingWakeup — lost wakeup race |
-| BRO-078 | medium | KRwLock | ReadLock ignores writersWaiting — writer starvation |
+| ~~BRO-078~~ | ~~medium~~ | KRwLock | Fixed — ReadLock now checks writersWaiting |
 | BRO-079 | low | Heap | HeapCheckIntegrity doesn't hold lock |
 | BRO-080 | low | PMM | PmmSetOwner lacks lock (dead code) |

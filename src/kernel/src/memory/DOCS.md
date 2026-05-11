@@ -92,7 +92,7 @@ selectively freeing usable regions from the boot memory map.
 | `PmmAllocPage` | `(MemTag, uint16_t pid) → PhysicalAddress` | Single page allocation. Uses search hint for O(1) average case. Returns null on OOM. |
 | `PmmAllocPages` | `(count, MemTag, pid) → PhysicalAddress` | Contiguous allocation. Linear scan for free run. Returns null if no run found. |
 | `PmmFreePage` | `(PhysicalAddress)` | Free one page. No-op on null/unaligned/OOB/already-free. Respects refcount: shared pages are just decremented. |
-| `PmmSetOwner` | `(PhysicalAddress, MemTag, pid)` | Change page ownership. **⚠️ BUG (BRO-080): no lock held; also dead code — never called.** |
+| ~~`PmmSetOwner`~~ | — | Removed (was dead code). |
 | `PmmGetTag` | `(PhysicalAddress) → MemTag` | Read-only tag query. No lock held (acceptable for single-word reads). |
 | `PmmGetPid` | `(PhysicalAddress) → uint16_t` | Read-only PID query. Same note. |
 | `PmmRefPage` | `(PhysicalAddress)` | Increment COW refcount. Legacy pages (refCount=0) jump to 2. Capped at 255. |
@@ -112,7 +112,7 @@ the lock. This is generally safe for single-field reads but not for atomic
 multi-field consistency.
 
 ### Known Issues
-- **BRO-080**: `PmmSetOwner()` doesn't hold `g_pmmLock`. Dead code — never called.
+- **~~BRO-080~~**: `PmmSetOwner()` — removed (was dead code).
 - `PmmFreeByTag` does inline list surgery instead of using `ListRemove`, duplicating
   logic. Should use the helper for consistency.
 - `PmmGetTag`/`PmmGetPid` don't hold the lock. Safe for reads but could return stale
@@ -229,7 +229,7 @@ Minimum block size: 192 bytes (OVERHEAD + ALIGN).
 | `kfree` | `(void* ptr)` | Validates header magic. No-op on null or already-free. Coalesces with adjacent free blocks in both directions. Poison-fills on free. |
 | `krealloc` | `(void* ptr, uint64_t newSize) → void*` | In-place if block is large enough. Otherwise alloc+copy+free. Null ptr → kmalloc. Zero size → kfree+null. |
 | `HeapFreeBytes` | `() → uint64_t` | **⚠️ BUG (BRO-076): returns inflated values due to g_freeBytes tracking drift.** |
-| `HeapCheckIntegrity` | `() → bool` | Walk all blocks, verify magic/size consistency. **⚠️ BUG (BRO-079): doesn't hold g_heapLock.** |
+| `HeapCheckIntegrity` | `() → bool` | Walk all blocks, verify magic/size consistency. Holds `g_heapLock` during walk. |
 | `HeapSetPoison` | `(bool enable)` | Toggle poison fill. Disabling improves performance. |
 | `HeapGetStats` | `(HeapStats* out)` | Snapshot heap state. Takes lock internally. Thread-safe. |
 | `HeapDumpStats` | `()` | Print stats to serial. |
