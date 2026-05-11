@@ -932,6 +932,11 @@ static void CompositorLoopWM()
     int sorted[WM_MAX_WINDOWS];
     uint32_t wcount = WmGetZOrder(sorted, WM_MAX_WINDOWS);
 
+    // Track whether any lower-z window was blitted. If so, higher-z windows
+    // must also be re-blitted to maintain correct occlusion (prevents
+    // background window content bleeding through foreground windows).
+    bool anyBelowBlitted = false;
+
     // Get mouse position once for hover effects
     int32_t chromeMx = 0, chromeMy = 0;
     MouseGetPosition(&chromeMx, &chromeMy);
@@ -969,9 +974,12 @@ static void CompositorLoopWM()
         if (w->vfb)
         {
             // In partial-repaint mode, skip windows whose content hasn't
-            // changed — the backbuffer retains the previous frame's pixels.
-            if (!fullRepaint && !w->vfbDirty)
+            // changed AND no lower-z window was re-blitted (which could
+            // overwrite our region in the backbuffer).
+            if (!fullRepaint && !w->vfbDirty && !anyBelowBlitted)
                 continue;
+
+            anyBelowBlitted = true;
 
             // Clamp blit to the buffer that was actually allocated.
             uint32_t vfbW = w->vfbStride;
@@ -987,8 +995,9 @@ static void CompositorLoopWM()
         }
         else if (p->state != ProcessState::Terminated && p->fbVfbWidth > 0)
         {
-            if (!fullRepaint && !p->fbDirty)
+            if (!fullRepaint && !p->fbDirty && !anyBelowBlitted)
                 continue;
+            anyBelowBlitted = true;
             BlitProcessAt(p, w->clientX(), w->clientY(), true, w->upscale);
         }
 
