@@ -20,6 +20,7 @@
 #include "smp.h"
 #include "serial.h"
 #include "vfs.h"
+#include "rtc.h"
 #include "memory/heap.h"
 
 // LAPIC tick counter (defined in apic.cpp).
@@ -339,14 +340,79 @@ static uint32_t AppendStr(char* buf, uint32_t pos, const char* str)
 //       ProfileWriterClose(&pw);
 //   }
 //
-// Extract after QEMU exits:
-//   mcopy -i build/release/brook_disk.img ::profile.txt ./profile.txt
+// Extract after QEMU exits (filenames are timestamped PROF_YYYYMMDD_HHMMSS.TXT):
+//   mcopy -i build/release/brook_disk.img '::PROF_*.TXT' ./
 // then:
-//   python3 scripts/profiler_to_speedscope.py profile.txt
+//   python3 scripts/profiler_to_speedscope.py PROF_20260511_143022.TXT
 // ---------------------------------------------------------------------------
 
 static constexpr uint32_t kProfBufSize = 16384;
-static constexpr const char* kProfPath = "/boot/profile.txt";
+
+// Generate a timestamped profile path: /boot/PROF_YYYYMMDD_HHMMSS.TXT
+// Falls back to /boot/PROFILE.TXT if RTC is unavailable.
+static void BuildProfilePath(char* out, uint32_t outLen)
+{
+    uint64_t epoch = RtcNow();
+    if (epoch == 0 || outLen < 40)
+    {
+        // Fallback
+        const char* fb = "/boot/profile.txt";
+        uint32_t i = 0;
+        while (fb[i] && i + 1 < outLen) { out[i] = fb[i]; i++; }
+        out[i] = '\0';
+        return;
+    }
+
+    // Break epoch into date/time components
+    uint64_t rem = epoch;
+    uint32_t sec  = static_cast<uint32_t>(rem % 60); rem /= 60;
+    uint32_t min  = static_cast<uint32_t>(rem % 60); rem /= 60;
+    uint32_t hr   = static_cast<uint32_t>(rem % 24); rem /= 24;
+    uint64_t days = rem;
+    uint32_t yr   = 1970;
+    while (true)
+    {
+        bool leap = (yr % 4 == 0 && (yr % 100 != 0 || yr % 400 == 0));
+        uint32_t diy = leap ? 366 : 365;
+        if (days < diy) break;
+        days -= diy;
+        yr++;
+    }
+    static const uint32_t dpm[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    bool leap = (yr % 4 == 0 && (yr % 100 != 0 || yr % 400 == 0));
+    uint32_t mon = 1;
+    for (uint32_t m = 0; m < 12; m++)
+    {
+        uint32_t d = dpm[m];
+        if (m == 1 && leap) d = 29;
+        if (days < d) { mon = m + 1; break; }
+        days -= d;
+    }
+    uint32_t day = static_cast<uint32_t>(days) + 1;
+
+    // Format: /boot/PROF_YYYYMMDD_HHMMSS.TXT
+    auto d2 = [](char* p, uint32_t v) { p[0] = '0' + (v / 10); p[1] = '0' + (v % 10); };
+    auto d4 = [](char* p, uint32_t v) {
+        p[0] = '0' + (v / 1000) % 10;
+        p[1] = '0' + (v / 100) % 10;
+        p[2] = '0' + (v / 10) % 10;
+        p[3] = '0' + v % 10;
+    };
+    //           /boot/PROF_YYYYMMDD_HHMMSS.TXT
+    const char prefix[] = "/boot/PROF_";
+    uint32_t i = 0;
+    for (const char* p = prefix; *p; p++) out[i++] = *p;
+    d4(out + i, yr);     i += 4;
+    d2(out + i, mon);    i += 2;
+    d2(out + i, day);    i += 2;
+    out[i++] = '_';
+    d2(out + i, hr);     i += 2;
+    d2(out + i, min);    i += 2;
+    d2(out + i, sec);    i += 2;
+    const char suffix[] = ".TXT";
+    for (const char* p = suffix; *p; p++) out[i++] = *p;
+    out[i] = '\0';
+}
 
 struct ProfileWriter {
     Vnode*   file;
@@ -380,16 +446,19 @@ static void ProfileWriterAppend(ProfileWriter& pw, const char* src, uint32_t len
 // Open the profile file and write the PROF_BEGIN header.
 static bool ProfileWriterOpen(ProfileWriter& pw)
 {
-    pw.file     = VfsOpen(kProfPath, VFS_O_WRITE | VFS_O_CREATE | VFS_O_TRUNC);
+    char profPath[64];
+    BuildProfilePath(profPath, sizeof(profPath));
+    pw.file     = VfsOpen(profPath, VFS_O_WRITE | VFS_O_CREATE | VFS_O_TRUNC);
     pw.buf      = nullptr;
     pw.fileOff  = 0;
     pw.bufPos   = 0;
     pw.written  = 0;
 
     if (!pw.file) {
-        SerialPrintf("PROFILER: failed to create %s\n", kProfPath);
+        SerialPrintf("PROFILER: failed to create %s\n", profPath);
         return false;
     }
+    SerialPrintf("PROFILER: writing to %s\n", profPath);
 
     pw.buf = static_cast<char*>(kmalloc(kProfBufSize));
     if (!pw.buf) {
