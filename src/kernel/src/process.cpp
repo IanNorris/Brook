@@ -1192,9 +1192,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     if (!child) return nullptr;
 
     // Copy entire parent process struct as a starting point
-    auto* rawDst = reinterpret_cast<uint8_t*>(child);
-    auto* rawSrc = reinterpret_cast<const uint8_t*>(parent);
-    for (uint64_t i = 0; i < sizeof(Process); i++) rawDst[i] = rawSrc[i];
+    memcpy(child, parent, sizeof(Process));
     child->magic = PROCESS_MAGIC;
 
     // Allocate new PID
@@ -1426,9 +1424,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     if (!thread) return nullptr;
 
     // Copy parent process struct as starting point
-    auto* rawDst = reinterpret_cast<uint8_t*>(thread);
-    auto* rawSrc = reinterpret_cast<const uint8_t*>(parent);
-    for (uint64_t i = 0; i < sizeof(Process); i++) rawDst[i] = rawSrc[i];
+    memcpy(thread, parent, sizeof(Process));
     thread->magic = PROCESS_MAGIC;
 
     // Allocate TID (threads get unique PIDs but share tgid)

@@ -528,8 +528,8 @@ static bool MemFdGrowLocked(MemFdData* mfd, uint64_t needed)
                      bytes, newCount);
         return false;
     }
-    for (uint64_t i = 0; i < mfd->pageMapCount; i++) newMap[i] = mfd->pageMap[i];
-    for (uint64_t i = mfd->pageMapCount; i < newCount; i++) newMap[i] = 0;
+    memcpy(newMap, mfd->pageMap, mfd->pageMapCount * sizeof(uint64_t));
+    memset(newMap + mfd->pageMapCount, 0, (newCount - mfd->pageMapCount) * sizeof(uint64_t));
     if (mfd->pageMap) kfree(mfd->pageMap);
     mfd->pageMap = newMap;
     mfd->pageMapCount = newCount;
@@ -6785,7 +6785,7 @@ static int64_t sys_getcwd(uint64_t bufAddr, uint64_t size, uint64_t,
     if (size < len + 1) return -ERANGE;
     if (!UserBufferWritable(bufAddr, len + 1)) return -EFAULT;
     auto* buf = reinterpret_cast<char*>(bufAddr);
-    for (uint32_t i = 0; i <= len; i++) buf[i] = cwd[i];
+    memcpy(buf, cwd, len + 1);
     return static_cast<int64_t>(len + 1);
 }
 
