@@ -20,6 +20,7 @@
 #include "spinlock.h"
 #include "smp.h"
 #include "apic.h"
+#include "cpu.h"
 
 namespace brook {
 
@@ -174,6 +175,21 @@ static uint64_t SimpleRand(uint64_t seed)
     return seed;
 }
 
+// Generate a random 64-bit value using RDRAND if available, TSC fallback otherwise.
+static uint64_t RandomU64()
+{
+    if (CpuHasRdrand()) {
+        uint64_t val;
+        uint8_t ok = 0;
+        for (int i = 0; i < 10 && !ok; i++)
+            __asm__ volatile("rdrand %0; setc %1" : "=r"(val), "=qm"(ok));
+        if (ok) return val;
+    }
+    uint64_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return SimpleRand((hi << 32) | lo);
+}
+
 // ---------------------------------------------------------------------------
 // SetupUserStack -- Build the initial user stack with argc/argv/envp/auxv.
 // ---------------------------------------------------------------------------
@@ -226,12 +242,9 @@ static uint64_t SetupUserStack(Process* proc,
         return pushBytes(&val, 8);
     };
 
-    // 1. Push 16 random bytes for AT_RANDOM
-    uint64_t randSeed = 0xDEADBEEFCAFEBABEULL;
-    randSeed = SimpleRand(randSeed);
-    pushU64(randSeed);
-    randSeed = SimpleRand(randSeed);
-    uint64_t randomAddr = pushU64(randSeed);
+    // 1. Push 16 random bytes for AT_RANDOM (RDRAND if available, TSC fallback)
+    pushU64(RandomU64());
+    uint64_t randomAddr = pushU64(RandomU64());
 
     // 1b. Push AT_PLATFORM string + AT_EXECFN string
     static const char k_plat[] = "x86_64";
@@ -752,7 +765,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
             if (tcbSlot) *tcbSlot = tcbAddr; // Self-pointer (user vaddr)
 
             // Stack canary at offset 40 (0x28) from FS base
-            uint64_t canary = 0x57a0000012345678ULL;
+            uint64_t canary = RandomU64();
             if (tcbAddr + 48 < tlsBase + tlsPages * 4096)
             {
                 auto* canarySlot = reinterpret_cast<uint64_t*>(
@@ -1814,7 +1827,7 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
             auto* tcbSlot = reinterpret_cast<uint64_t*>(tlsToKernel(tcbAddr));
             if (tcbSlot) *tcbSlot = tcbAddr;
 
-            uint64_t canary = 0x57a0000012345678ULL;
+            uint64_t canary = RandomU64();
             if (tcbAddr + 48 < tlsBase + tlsPages * 4096)
             {
                 auto* canarySlot = reinterpret_cast<uint64_t*>(
