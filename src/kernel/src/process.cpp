@@ -191,6 +191,72 @@ static uint64_t RandomU64()
 }
 
 // ---------------------------------------------------------------------------
+// SetupTLS -- Allocate and initialize a TLS block for a process.
+// Called by both ProcessCreate and ProcessExec.
+// ---------------------------------------------------------------------------
+static void SetupTLS(Process* proc, uint64_t stackVirtBase, uint64_t guardPages)
+{
+    proc->fsBase = 0;
+    if (proc->elf.tlsTotalSize == 0) return;
+
+    uint64_t tlsPages = (proc->elf.tlsTotalSize + 64 + 4095) / 4096;
+    uint64_t tlsBase = stackVirtBase - guardPages * 4096 - tlsPages * 4096;
+
+    auto tlsToKernel = [&](uint64_t userAddr) -> uint8_t* {
+        PhysicalAddress phys = VmmVirtToPhys(proc->pageTable, VirtualAddress(userAddr));
+        return phys ? reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw()) : nullptr;
+    };
+
+    bool tlsOk = true;
+    for (uint64_t i = 0; i < tlsPages; i++)
+    {
+        VirtualAddress vaddr(tlsBase + i * 4096);
+        PhysicalAddress phys = PmmAllocPage(MemTag::User, proc->pid);
+        if (!phys || !VmmMapPage(proc->pageTable, vaddr, phys,
+                                  VMM_WRITABLE | VMM_USER,
+                                  MemTag::User, proc->pid))
+        {
+            tlsOk = false;
+            break;
+        }
+        auto* p = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
+        for (uint64_t b = 0; b < 4096; b++) p[b] = 0;
+    }
+
+    if (!tlsOk) return;
+
+    // Copy initial TLS data via direct map
+    if (proc->elf.tlsInitData && proc->elf.tlsInitSize > 0)
+    {
+        for (uint64_t i = 0; i < proc->elf.tlsInitSize; ++i)
+        {
+            uint8_t* src = tlsToKernel(
+                reinterpret_cast<uint64_t>(proc->elf.tlsInitData) + i);
+            uint8_t* dst = tlsToKernel(tlsBase + i);
+            if (src && dst) *dst = *src;
+        }
+    }
+
+    // TCB pointer: variant II (x86-64), FS:0 = pointer to self
+    uint64_t tcbAddr = tlsBase + proc->elf.tlsTotalSize;
+    tcbAddr = (tcbAddr + 15) & ~15ULL;
+
+    auto* tcbSlot = reinterpret_cast<uint64_t*>(tlsToKernel(tcbAddr));
+    if (tcbSlot) *tcbSlot = tcbAddr;
+
+    // Stack canary at offset 40 (0x28) from FS base
+    uint64_t canary = RandomU64();
+    if (tcbAddr + 48 < tlsBase + tlsPages * 4096)
+    {
+        auto* canarySlot = reinterpret_cast<uint64_t*>(
+            tlsToKernel(tcbAddr + 0x28));
+        if (canarySlot) *canarySlot = canary;
+    }
+
+    proc->fsBase = tcbAddr;
+}
+
+// ---------------------------------------------------------------------------
 // SetupUserStack -- Build the initial user stack with argc/argv/envp/auxv.
 // ---------------------------------------------------------------------------
 // Linux x86-64 process stack layout (top = high address, stack grows down):
@@ -712,70 +778,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     proc->stackTop = userSP;
 
     // Set up TLS if the ELF has a PT_TLS segment
-    if (proc->elf.tlsTotalSize > 0)
-    {
-        // Allocate TLS block at a user-space virtual address.
-        // Place it just below the stack guard page.
-        uint64_t tlsPages = (proc->elf.tlsTotalSize + 64 + 4095) / 4096;
-        uint64_t tlsBase = stackVirtBase - guardPages * 4096 - tlsPages * 4096;
-
-        // Helper: translate user vaddr to kernel pointer via direct map
-        auto tlsToKernel = [&](uint64_t userAddr) -> uint8_t* {
-            PhysicalAddress phys = VmmVirtToPhys(proc->pageTable, VirtualAddress(userAddr));
-            return phys ? reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw()) : nullptr;
-        };
-
-        bool tlsOk = true;
-        for (uint64_t i = 0; i < tlsPages; i++)
-        {
-            VirtualAddress vaddr(tlsBase + i * 4096);
-            PhysicalAddress phys = PmmAllocPage(MemTag::User, proc->pid);
-            if (!phys || !VmmMapPage(proc->pageTable, vaddr, phys,
-                                      VMM_WRITABLE | VMM_USER,
-                                      MemTag::User, proc->pid))
-            {
-                tlsOk = false;
-                break;
-            }
-            auto* p = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
-            for (uint64_t b = 0; b < 4096; b++) p[b] = 0;
-        }
-
-        if (tlsOk)
-        {
-            // Copy initial TLS data via direct map.
-            // tlsInitData points to user vaddr in the loaded ELF image.
-            if (proc->elf.tlsInitData && proc->elf.tlsInitSize > 0)
-            {
-                for (uint64_t i = 0; i < proc->elf.tlsInitSize; ++i)
-                {
-                    uint8_t* src = tlsToKernel(
-                        reinterpret_cast<uint64_t>(proc->elf.tlsInitData) + i);
-                    uint8_t* dst = tlsToKernel(tlsBase + i);
-                    if (src && dst) *dst = *src;
-                }
-            }
-
-            // TCB pointer: variant II (x86-64), FS:0 = pointer to self
-            uint64_t tcbAddr = tlsBase + proc->elf.tlsTotalSize;
-            tcbAddr = (tcbAddr + 15) & ~15ULL;
-
-            // Write self-pointer via direct map
-            auto* tcbSlot = reinterpret_cast<uint64_t*>(tlsToKernel(tcbAddr));
-            if (tcbSlot) *tcbSlot = tcbAddr; // Self-pointer (user vaddr)
-
-            // Stack canary at offset 40 (0x28) from FS base
-            uint64_t canary = RandomU64();
-            if (tcbAddr + 48 < tlsBase + tlsPages * 4096)
-            {
-                auto* canarySlot = reinterpret_cast<uint64_t*>(
-                    tlsToKernel(tcbAddr + 0x28));
-                if (canarySlot) *canarySlot = canary;
-            }
-
-            proc->fsBase = tcbAddr;
-        }
-    }
+    SetupTLS(proc, stackVirtBase, guardPages);
 
     // Set actual initial entry point (interpreter entry if dynamically linked).
     proc->initialEntry = interpEntry ? interpEntry : proc->elf.entryPoint;
@@ -1777,63 +1780,7 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     proc->stackTop = userSP;
 
     // 6. Set up TLS
-    proc->fsBase = 0;
-    if (proc->elf.tlsTotalSize > 0)
-    {
-        uint64_t tlsPages = (proc->elf.tlsTotalSize + 64 + 4095) / 4096;
-        uint64_t tlsBase = stackVirtBase - guardPages * 4096 - tlsPages * 4096;
-
-        auto tlsToKernel = [&](uint64_t userAddr) -> uint8_t* {
-            PhysicalAddress phys = VmmVirtToPhys(proc->pageTable, VirtualAddress(userAddr));
-            return phys ? reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw()) : nullptr;
-        };
-
-        bool tlsOk = true;
-        for (uint64_t i = 0; i < tlsPages; i++)
-        {
-            VirtualAddress vaddr(tlsBase + i * 4096);
-            PhysicalAddress phys = PmmAllocPage(MemTag::User, proc->pid);
-            if (!phys || !VmmMapPage(proc->pageTable, vaddr, phys,
-                                      VMM_WRITABLE | VMM_USER,
-                                      MemTag::User, proc->pid))
-            {
-                tlsOk = false;
-                break;
-            }
-            auto* p = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
-            for (uint64_t b = 0; b < 4096; b++) p[b] = 0;
-        }
-
-        if (tlsOk)
-        {
-            if (proc->elf.tlsInitData && proc->elf.tlsInitSize > 0)
-            {
-                for (uint64_t i = 0; i < proc->elf.tlsInitSize; ++i)
-                {
-                    uint8_t* src = tlsToKernel(
-                        reinterpret_cast<uint64_t>(proc->elf.tlsInitData) + i);
-                    uint8_t* dst = tlsToKernel(tlsBase + i);
-                    if (src && dst) *dst = *src;
-                }
-            }
-
-            uint64_t tcbAddr = tlsBase + proc->elf.tlsTotalSize;
-            tcbAddr = (tcbAddr + 15) & ~15ULL;
-
-            auto* tcbSlot = reinterpret_cast<uint64_t*>(tlsToKernel(tcbAddr));
-            if (tcbSlot) *tcbSlot = tcbAddr;
-
-            uint64_t canary = RandomU64();
-            if (tcbAddr + 48 < tlsBase + tlsPages * 4096)
-            {
-                auto* canarySlot = reinterpret_cast<uint64_t*>(
-                    tlsToKernel(tcbAddr + 0x28));
-                if (canarySlot) *canarySlot = canary;
-            }
-
-            proc->fsBase = tcbAddr;
-        }
-    }
+    SetupTLS(proc, stackVirtBase, guardPages);
 
     // 7. Clear framebuffer state (new program starts fresh)
     proc->fbVirtual = nullptr;
