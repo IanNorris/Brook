@@ -235,15 +235,26 @@ static void SetupTLS(Process* proc, uint64_t stackVirtBase, uint64_t guardPages)
 
     if (!tlsOk) return;
 
-    // Copy initial TLS data via direct map
+    // Copy initial TLS data via direct map, page-at-a-time to avoid
+    // a VmmVirtToPhys page-table walk per byte.
     if (proc->elf.tlsInitData && proc->elf.tlsInitSize > 0)
     {
-        for (uint64_t i = 0; i < proc->elf.tlsInitSize; ++i)
+        uint64_t srcAddr = reinterpret_cast<uint64_t>(proc->elf.tlsInitData);
+        uint64_t remaining = proc->elf.tlsInitSize;
+        uint64_t off = 0;
+        while (remaining > 0)
         {
-            uint8_t* src = tlsToKernel(
-                reinterpret_cast<uint64_t>(proc->elf.tlsInitData) + i);
-            uint8_t* dst = tlsToKernel(tlsBase + i);
-            if (src && dst) *dst = *src;
+            uint64_t srcOff  = (srcAddr + off) & 0xFFF;
+            uint64_t dstOff  = (tlsBase + off) & 0xFFF;
+            uint64_t chunk = 4096 - (srcOff > dstOff ? srcOff : dstOff);
+            if (chunk > remaining) chunk = remaining;
+
+            uint8_t* src = tlsToKernel(srcAddr + off);
+            uint8_t* dst = tlsToKernel(tlsBase + off);
+            if (src && dst) memcpy(dst, src, chunk);
+
+            off += chunk;
+            remaining -= chunk;
         }
     }
 
