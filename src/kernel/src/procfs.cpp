@@ -193,6 +193,8 @@ static void ProcDirClose(Vnode* vn)
 // Forward declare readdir
 static int ProcRootReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie);
 static int ProcPidReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie);
+static int ProcFdReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie);
+static Vnode* GenPidFdLink(uint16_t pid, int fd);
 
 static int ProcDirStat(Vnode* vn, VnodeStat* st)
 {
@@ -200,6 +202,10 @@ static int ProcDirStat(Vnode* vn, VnodeStat* st)
     st->isDir = true;
     return 0;
 }
+
+static VnodeOps g_procFdDirOps = {
+    ProcFileOpen, ProcDirRead, ProcFileWrite, ProcFdReaddir, ProcDirClose, ProcDirStat
+};
 
 static VnodeOps g_procRootDirOps = {
     ProcFileOpen, ProcDirRead, ProcFileWrite, ProcRootReaddir, ProcDirClose, ProcDirStat
@@ -1176,6 +1182,21 @@ Vnode* ProcFsOpen(const char* relPath, int /*flags*/)
             if (StrEqProc(rest, g_pidEntries[i].name))
                 return g_pidEntries[i].gen(snap);
         }
+
+        // "PID/fd" → open fd directory
+        if (StrEqProc(rest, "fd"))
+            return ProcFsOpenDir(relPath);
+
+        // "PID/fd/N" → fd link
+        if (rest[0] == 'f' && rest[1] == 'd' && rest[2] == '/')
+        {
+            const char* fdStr = rest + 3;
+            int fdNum = 0;
+            while (*fdStr >= '0' && *fdStr <= '9')
+                fdNum = fdNum * 10 + (*fdStr++ - '0');
+            if (*fdStr == '\0')
+                return GenPidFdLink(static_cast<uint16_t>(pid), fdNum);
+        }
     }
 
     return nullptr;
@@ -1243,6 +1264,31 @@ int ProcFsStatPath(const char* relPath, VnodeStat* st)
                 return 0;
             }
         }
+
+        // "PID/fd" → directory
+        if (StrEqProc(rest, "fd"))
+        {
+            st->size = 0; st->isDir = true; return 0;
+        }
+
+        // "PID/fd/N" → file (symlink-like)
+        if (rest[0] == 'f' && rest[1] == 'd' && rest[2] == '/')
+        {
+            const char* fdStr = rest + 3;
+            int fdNum = 0;
+            bool valid = (*fdStr >= '0' && *fdStr <= '9');
+            while (*fdStr >= '0' && *fdStr <= '9')
+                fdNum = fdNum * 10 + (*fdStr++ - '0');
+            if (valid && *fdStr == '\0')
+            {
+                FdSnapshot fdSnap;
+                if (SchedulerGetFdInfo(static_cast<uint16_t>(pid), fdNum, &fdSnap))
+                {
+                    st->size = 0; st->isDir = false; st->isSymlink = true;
+                    return 0;
+                }
+            }
+        }
     }
 
     return -1;  // not found
@@ -1253,15 +1299,27 @@ Vnode* ProcFsOpenDir(const char* relPath)
     // Determine if this is /proc root or /proc/PID
     uint32_t pid = 0;
     const char* rest = nullptr;
-    bool isPidDir = relPath && relPath[0] && IsPidPath(relPath, &pid, &rest) && (!rest || !rest[0]);
+    bool isPidPath = relPath && relPath[0] && IsPidPath(relPath, &pid, &rest);
 
-    if (isPidDir)
+    if (isPidPath && rest && StrEqProc(rest, "fd"))
     {
-        // Check process exists
+        // /proc/PID/fd directory
         ProcessSnapshot snap;
         if (!FindProcess(pid, &snap)) return nullptr;
 
-        // Store PID in data buffer for readdir
+        auto* buf = static_cast<char*>(kmalloc(8));
+        if (!buf) return nullptr;
+        char* p = U64ToDec(buf, pid);
+        *p = '\0';
+        return MakeProcVnode(buf, static_cast<uint32_t>(p - buf), true, &g_procFdDirOps);
+    }
+
+    if (isPidPath && (!rest || !rest[0]))
+    {
+        // /proc/PID directory
+        ProcessSnapshot snap;
+        if (!FindProcess(pid, &snap)) return nullptr;
+
         auto* buf = static_cast<char*>(kmalloc(8));
         if (!buf) return nullptr;
         char* p = U64ToDec(buf, pid);
@@ -1309,13 +1367,68 @@ static int ProcRootReaddir(Vnode* /*vn*/, DirEntry* out, uint32_t* cookie)
 static int ProcPidReaddir(Vnode* /*vn*/, DirEntry* out, uint32_t* cookie)
 {
     uint32_t idx = *cookie;
-    if (idx >= NUM_PID_ENTRIES) return 0;
+    if (idx < NUM_PID_ENTRIES)
+    {
+        ProcStrCopy(out->name, g_pidEntries[idx].name, sizeof(out->name));
+        out->size = 0;
+        out->isDir = false;
+        *cookie = idx + 1;
+        return 1;
+    }
+    // After regular entries, emit "fd" directory
+    if (idx == NUM_PID_ENTRIES)
+    {
+        ProcStrCopy(out->name, "fd", sizeof(out->name));
+        out->size = 0;
+        out->isDir = true;
+        *cookie = idx + 1;
+        return 1;
+    }
+    return 0;
+}
 
-    ProcStrCopy(out->name, g_pidEntries[idx].name, sizeof(out->name));
+// /proc/PID/fd/ directory: list open file descriptors
+static int ProcFdReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
+{
+    auto* pp = static_cast<ProcPriv*>(vn->priv);
+    if (!pp || !pp->data) return 0;
+
+    // Parse PID from stored data
+    uint32_t pid = 0;
+    for (const char* p = pp->data; *p >= '0' && *p <= '9'; ++p)
+        pid = pid * 10 + (*p - '0');
+
+    int fdNum = 0;
+    FdSnapshot snap = {};
+    if (!SchedulerGetFdByIndex(static_cast<uint16_t>(pid), *cookie, &fdNum, &snap))
+        return 0;
+
+    char fdStr[12];
+    char* p = U64ToDec(fdStr, static_cast<uint64_t>(fdNum));
+    *p = '\0';
+    ProcStrCopy(out->name, fdStr, sizeof(out->name));
     out->size = 0;
     out->isDir = false;
-    *cookie = idx + 1;
+    *cookie = *cookie + 1;
     return 1;
+}
+
+// Generate content for /proc/PID/fd/N — symlink-like target path
+static Vnode* GenPidFdLink(uint16_t pid, int fd)
+{
+    FdSnapshot snap = {};
+    if (!SchedulerGetFdInfo(pid, fd, &snap)) return nullptr;
+
+    char* buf = static_cast<char*>(kmalloc(128));
+    if (!buf) return nullptr;
+
+    // Copy the path from the snapshot
+    uint32_t len = 0;
+    for (; len < 127 && snap.path[len]; ++len)
+        buf[len] = snap.path[len];
+    buf[len++] = '\n';
+    buf[len] = '\0';
+    return MakeProcVnode(buf, len);
 }
 
 } // namespace brook

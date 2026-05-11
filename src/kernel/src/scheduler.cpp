@@ -1910,6 +1910,93 @@ Process* SchedulerGetCpuProcess(uint32_t cpuIndex)
     return nullptr;
 }
 
+static void FillFdSnapshot(FdSnapshot* out, const FdEntry& fde)
+{
+    out->type = static_cast<uint8_t>(fde.type);
+    out->flags = fde.statusFlags;
+    out->seekPos = fde.seekPos;
+    // Copy dirPath if it has content, otherwise describe by type
+    if (fde.dirPath[0])
+    {
+        uint32_t j = 0;
+        for (; j < 63 && fde.dirPath[j]; ++j)
+            out->path[j] = fde.dirPath[j];
+        out->path[j] = '\0';
+    }
+    else
+    {
+        static const char* typeNames[] = {
+            "none", "file", "fb", "kbd", "pipe", "/dev/null", "/dev/urandom",
+            "mem", "socket", "tty", "eventfd", "dsp", "epoll", "timerfd",
+            "memfd", "unix", "klog"
+        };
+        uint8_t t = static_cast<uint8_t>(fde.type);
+        const char* name = (t < sizeof(typeNames)/sizeof(typeNames[0])) ? typeNames[t] : "?";
+        uint32_t j = 0;
+        for (; j < 63 && name[j]; ++j)
+            out->path[j] = name[j];
+        out->path[j] = '\0';
+    }
+}
+
+bool SchedulerGetFdByIndex(uint16_t pid, uint32_t index, int* outFd, FdSnapshot* outSnap)
+{
+    uint64_t flags = SchedLockAcquire(g_allProcLock);
+    for (uint32_t i = 0; i < g_processCount; ++i)
+    {
+        Process* p = g_allProcesses[i];
+        if (!p || p->pid != pid) continue;
+        if (!p->fds) { SchedLockRelease(g_allProcLock, flags); return false; }
+
+        SpinLockAcquire(&p->fdLock);
+        uint32_t found = 0;
+        for (uint32_t fd = 0; fd < MAX_FDS; ++fd)
+        {
+            if (p->fds[fd].type == FdType::None) continue;
+            if (found == index)
+            {
+                *outFd = static_cast<int>(fd);
+                FillFdSnapshot(outSnap, p->fds[fd]);
+                SpinLockRelease(&p->fdLock);
+                SchedLockRelease(g_allProcLock, flags);
+                return true;
+            }
+            ++found;
+        }
+        SpinLockRelease(&p->fdLock);
+        SchedLockRelease(g_allProcLock, flags);
+        return false;
+    }
+    SchedLockRelease(g_allProcLock, flags);
+    return false;
+}
+
+bool SchedulerGetFdInfo(uint16_t pid, int fd, FdSnapshot* outSnap)
+{
+    if (fd < 0 || fd >= static_cast<int>(MAX_FDS)) return false;
+    uint64_t flags = SchedLockAcquire(g_allProcLock);
+    for (uint32_t i = 0; i < g_processCount; ++i)
+    {
+        Process* p = g_allProcesses[i];
+        if (!p || p->pid != pid) continue;
+        if (!p->fds) { SchedLockRelease(g_allProcLock, flags); return false; }
+
+        SpinLockAcquire(&p->fdLock);
+        if (p->fds[fd].type == FdType::None)
+        {
+            SpinLockRelease(&p->fdLock);
+            SchedLockRelease(g_allProcLock, flags);
+            return false;
+        }
+        FillFdSnapshot(outSnap, p->fds[fd]);
+        SpinLockRelease(&p->fdLock);
+        SchedLockRelease(g_allProcLock, flags);
+        return true;
+    }
+    SchedLockRelease(g_allProcLock, flags);
+    return false;
+}
+
 void SchedulerRegisterPolicy(const SchedOps* ops)
 {
     if (!ops || !ops->name)

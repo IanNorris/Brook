@@ -124,6 +124,21 @@ void SchedulerGetProcessCounts(uint32_t& total, uint32_t& running);
 // Get EWMA load averages (each value * 1000 for fixed-point)
 void SchedulerGetLoadAvg(uint32_t& avg1, uint32_t& avg5, uint32_t& avg15);
 
+// Snapshot of an open fd for /proc/PID/fd/.
+struct FdSnapshot {
+    uint8_t  type;      // FdType as uint8_t
+    uint32_t flags;     // statusFlags (O_* flags)
+    uint64_t seekPos;
+    char     path[64];  // dirPath or type name
+};
+
+// Get the Nth open fd for a process. Returns the fd number in outFd, info in outSnap.
+// cookie is the iteration index (0, 1, 2, ...). Returns false when no more fds.
+bool SchedulerGetFdByIndex(uint16_t pid, uint32_t index, int* outFd, FdSnapshot* outSnap);
+
+// Get info about a specific fd of a process. Returns false if fd not open.
+bool SchedulerGetFdInfo(uint16_t pid, int fd, FdSnapshot* outSnap);
+
 // Get per-CPU tick counters for /proc/stat.
 // Writes busy and idle tick counts for CPU `cpuIndex`.
 void SchedulerGetCpuTicks(uint32_t cpuIndex, uint64_t& busyTicks, uint64_t& idleTicks);
