@@ -78,7 +78,6 @@ add_test(NAME test_sched_modules
 )
 
 # Ext2 filesystem structure tests (run against a real ext2 disk image)
-# Ext2 filesystem structure tests (run against a real ext2 disk image)
 add_executable(test_ext2
     "${BROOK_ROOT}/src/tests/test_ext2/main.cpp"
 )
