@@ -261,6 +261,12 @@ static uint32_t line_colour(const char *line) {
     return COL_TEXT;
 }
 
+/* Filter state (forward declarations for line_matches_filter) */
+#define MAX_FILTER 128
+static int  g_filter_mode = 0;
+static char g_filter_buf[MAX_FILTER] = "";
+static int  g_filter_len = 0;
+
 /* Case-insensitive substring search */
 static int line_matches_filter(const char *line) {
     if (g_filter_len == 0) return 1;
@@ -298,12 +304,6 @@ static int  g_needs_draw = 1;
 static int  g_configured = 0;
 static int  g_ctrl_held  = 0;
 static int  g_shift_held = 0;
-
-/* Filter state */
-#define MAX_FILTER 128
-static int  g_filter_mode = 0;
-static char g_filter_buf[MAX_FILTER] = "";
-static int  g_filter_len = 0;
 
 /* SHM buffer */
 static struct wl_buffer *g_buffer;
