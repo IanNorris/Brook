@@ -12,6 +12,7 @@
 //   Phase 5: Control transfers (GET_DESCRIPTOR, SET_CONFIGURATION)
 //   Phase 6: HID drivers (keyboard, mouse)
 //   Phase 7: Mass storage (bulk transfers)
+//   Phase 8: Interrupt-driven I/O (INTx, event ring ISR)
 
 #include "module_abi.h"
 #include "pci.h"
@@ -299,6 +300,7 @@ static constexpr uint32_t EVT_RING_SIZE   = 256;  // TRBs in event ring
 static constexpr uint32_t XFER_RING_SIZE  = 256;  // TRBs per transfer ring
 static constexpr uint32_t MAX_DEVICES     = 16;   // max USB devices tracked
 static constexpr uint32_t MAX_CONTROLLERS = 2;    // max xHCI controllers
+static constexpr uint8_t  XHCI_IRQ_VECTOR = 49;   // IDT vector for xHCI interrupt
 
 // ---------------------------------------------------------------------------
 // MMIO helpers
@@ -367,11 +369,20 @@ struct XhciController {
     uint8_t  irqLine;
     uint8_t  irqVector;
 
+    // Interrupt-driven event completion (Phase 8)
+    // Command completion: ISR copies the completion TRB here and sets flag
+    volatile bool    cmdComplete;
+    Trb              cmdCompletionTrb;   // copy of the command completion event
+    // Transfer event: ISR copies here for non-HID transfer events (bulk, etc.)
+    volatile bool    xferComplete;
+    Trb              xferCompletionTrb;
+
     bool     initialized;
 };
 
 static XhciController g_controllers[MAX_CONTROLLERS];
 static uint32_t       g_controllerCount = 0;
+static volatile bool  g_irqActive = false;  // true once ISR is registered
 
 // ---------------------------------------------------------------------------
 // Utility: allocate physically contiguous, page-aligned DMA buffer
@@ -754,9 +765,44 @@ static bool XhciSubmitCommand(XhciController& ctrl, uint64_t param,
 
 // Poll the event ring for a command completion. Returns the completion
 // TRB or nullptr after timeout.
+// During init (before IRQ is active), polls the event ring directly.
+// After IRQ registration, waits on the completion flag set by the ISR.
 static Trb* XhciWaitForEvent(XhciController& ctrl, uint32_t expectedType,
                               uint32_t timeoutMs)
 {
+    if (g_irqActive) {
+        // Interrupt-driven mode: wait on the volatile completion flag
+        volatile bool* flag = nullptr;
+        Trb* result = nullptr;
+
+        if (expectedType == TRB_TYPE_CMD_COMPLETION) {
+            flag = &ctrl.cmdComplete;
+            result = &ctrl.cmdCompletionTrb;
+        } else if (expectedType == TRB_TYPE_TRANSFER_EVENT) {
+            flag = &ctrl.xferComplete;
+            result = &ctrl.xferCompletionTrb;
+        } else {
+            // For wildcard (type 0) or port status change, use polling fallback
+            flag = nullptr;
+        }
+
+        if (flag) {
+            uint64_t deadline = brook::g_lapicTickCount + timeoutMs;
+            while (brook::g_lapicTickCount < deadline) {
+                __asm__ volatile("" ::: "memory"); // compiler barrier
+                if (*flag) {
+                    *flag = false;
+                    return result;
+                }
+                // Yield briefly to avoid burning CPU
+                __asm__ volatile("pause" ::: "memory");
+            }
+            return nullptr;
+        }
+        // Fall through to polling for wildcard/port status events
+    }
+
+    // Polling mode (used during init or for wildcard event draining)
     uint64_t deadline = brook::g_lapicTickCount + timeoutMs;
 
     while (brook::g_lapicTickCount < deadline) {
@@ -1584,9 +1630,13 @@ static void XhciProcessKeyboardReport(const uint8_t* report)
 static uint64_t g_kbdReportBufPhys = 0;
 static uint32_t g_kbdDevIndex = 0;
 
-// Poll for USB keyboard events — called by the input subsystem
+// Poll for USB keyboard events — called by the input subsystem.
+// In interrupt-driven mode (g_irqActive), the ISR handles reports
+// directly, so this is a no-op. In polling mode, it checks for events.
 static void XhciKeyboardPoll(InputDevice* /*dev*/)
 {
+    if (g_irqActive) return; // ISR handles this
+
     if (g_controllerCount == 0) return;
     XhciController& ctrl = g_controllers[0];
     if (!ctrl.initialized) return;
@@ -1686,6 +1736,8 @@ static bool     g_mousePresent = false;
 
 static void XhciMousePoll(InputDevice* /*dev*/)
 {
+    if (g_irqActive) return; // ISR handles this
+
     if (g_controllerCount == 0 || !g_mousePresent) return;
     XhciController& ctrl = g_controllers[0];
     if (!ctrl.initialized) return;
@@ -2385,6 +2437,151 @@ static void XhciScanPorts(XhciController& ctrl)
 }
 
 // ---------------------------------------------------------------------------
+// Phase 8: Interrupt-driven event ring processing (ISR)
+// ---------------------------------------------------------------------------
+
+// Match a transfer event's TRB pointer to a device. The event ring's param
+// field holds the physical address of the completed TRB. We check each
+// device's interrupt and bulk transfer ring physical address ranges.
+static int XhciMatchTransferEvent(const Trb& evt)
+{
+    uint64_t trbPhys = evt.param;
+    uint32_t ringBytes = XFER_RING_SIZE * sizeof(Trb);
+
+    for (uint32_t i = 0; i < g_deviceCount; i++) {
+        XhciDevice& dev = g_devices[i];
+
+        // Check interrupt endpoint ring
+        if (dev.intRingPhys &&
+            trbPhys >= dev.intRingPhys &&
+            trbPhys < dev.intRingPhys + ringBytes)
+            return static_cast<int>(i);
+
+        // Check bulk IN ring
+        if (dev.bulkInRingPhys &&
+            trbPhys >= dev.bulkInRingPhys &&
+            trbPhys < dev.bulkInRingPhys + ringBytes)
+            return static_cast<int>(i);
+
+        // Check bulk OUT ring
+        if (dev.bulkOutRingPhys &&
+            trbPhys >= dev.bulkOutRingPhys &&
+            trbPhys < dev.bulkOutRingPhys + ringBytes)
+            return static_cast<int>(i);
+
+        // Check EP0 ring (control transfers during enumeration)
+        if (dev.ep0RingPhys &&
+            trbPhys >= dev.ep0RingPhys &&
+            trbPhys < dev.ep0RingPhys + ringBytes)
+            return static_cast<int>(i);
+    }
+
+    return -1; // unknown device
+}
+
+// ISR body — called from the kernel's shared IRQ dispatch stub.
+// Drains all pending event ring entries and dispatches them.
+static void XhciIrqHandler()
+{
+    if (g_controllerCount == 0) return;
+    XhciController& ctrl = g_controllers[0];
+    if (!ctrl.initialized) return;
+
+    // Acknowledge the interrupt: clear USBSTS.EINT
+    uint32_t sts = xhci_read32(ctrl.opBase, XHCI_OP_USBSTS);
+    if (sts & USBSTS_EINT) {
+        xhci_write32(ctrl.opBase, XHCI_OP_USBSTS, USBSTS_EINT);
+    }
+
+    // Clear Interrupt Pending (IP) on Interrupter 0
+    uint32_t iman = xhci_read32(ctrl.rtBase, XHCI_RT_IMAN);
+    if (iman & 0x1) {
+        xhci_write32(ctrl.rtBase, XHCI_RT_IMAN, iman | 0x1); // W1C IP bit
+    }
+
+    // Process all pending events
+    uint32_t processed = 0;
+    while (processed < EVT_RING_SIZE) {
+        uint32_t idx = ctrl.evtDequeue;
+        Trb& evt = ctrl.evtRing[idx];
+
+        bool evtCycleBit = (evt.control & TRB_CYCLE) != 0;
+        if (evtCycleBit != ctrl.evtCycle)
+            break; // no more events
+
+        // Advance dequeue
+        ctrl.evtDequeue++;
+        if (ctrl.evtDequeue >= EVT_RING_SIZE) {
+            ctrl.evtDequeue = 0;
+            ctrl.evtCycle = !ctrl.evtCycle;
+        }
+
+        uint32_t type = evt.control & TRB_TYPE_MASK;
+        uint32_t cc = (evt.status >> TRB_CC_SHIFT) & 0xFF;
+
+        if (type == TRB_TYPE_CMD_COMPLETION) {
+            // Copy completion TRB and signal waiter
+            ctrl.cmdCompletionTrb = evt;
+            __asm__ volatile("" ::: "memory");
+            ctrl.cmdComplete = true;
+        }
+        else if (type == TRB_TYPE_TRANSFER_EVENT) {
+            int devIdx = XhciMatchTransferEvent(evt);
+
+            if (devIdx >= 0) {
+                XhciDevice& dev = g_devices[devIdx];
+
+                if (dev.isKeyboard && dev.intRing &&
+                    (cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT_PACKET)) {
+                    // Process keyboard HID report directly in ISR
+                    auto* report = static_cast<uint8_t*>(dev.priv);
+                    if (report)
+                        XhciProcessKeyboardReport(report);
+                    // Re-queue the interrupt IN transfer
+                    if (dev.priv && g_kbdReportBufPhys)
+                        XhciQueueInterruptIn(ctrl, dev,
+                                              dev.priv, g_kbdReportBufPhys, 8);
+                }
+                else if (dev.isMouse && dev.intRing &&
+                         (cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT_PACKET)) {
+                    // Process mouse HID report directly in ISR
+                    auto* report = static_cast<uint8_t*>(dev.priv);
+                    if (report)
+                        XhciProcessMouseReport(report);
+                    // Re-queue the interrupt IN transfer
+                    if (dev.priv && g_mouseReportBufPhys)
+                        XhciQueueInterruptIn(ctrl, dev,
+                                              dev.priv, g_mouseReportBufPhys, 4);
+                }
+                else {
+                    // Bulk or other transfer — signal waiter
+                    ctrl.xferCompletionTrb = evt;
+                    __asm__ volatile("" ::: "memory");
+                    ctrl.xferComplete = true;
+                }
+            } else {
+                // Unknown device — signal as generic transfer completion
+                ctrl.xferCompletionTrb = evt;
+                __asm__ volatile("" ::: "memory");
+                ctrl.xferComplete = true;
+            }
+        }
+        else if (type == TRB_TYPE_PORT_STATUS_CHANGE) {
+            // Log but don't do hot-plug enumeration in ISR
+            // (future: set flag for deferred hot-plug handling)
+        }
+
+        processed++;
+    }
+
+    // Update ERDP (write after processing all events for efficiency)
+    if (processed > 0) {
+        uint64_t erdpPhys = ctrl.evtRingPhys + ctrl.evtDequeue * sizeof(Trb);
+        xhci_write64(ctrl.rtBase, XHCI_RT_ERDP, erdpPhys | (1ULL << 3));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Module init / exit
 // ---------------------------------------------------------------------------
 
@@ -2423,6 +2620,19 @@ static int XhciModuleInit()
         Trb* evt = XhciWaitForEvent(ctrl, 0, 50);
         if (!evt) break;
     }
+
+    // --- Phase 8: Register IRQ handler for interrupt-driven event processing ---
+    // Read PCI interrupt line and register our ISR
+    ctrl.cmdComplete = false;
+    ctrl.xferComplete = false;
+    uint32_t intLine = PciConfigRead32(ctrl.pciDev.bus, ctrl.pciDev.dev,
+                                        ctrl.pciDev.fn, 0x3C) & 0xFF;
+    ctrl.irqLine = static_cast<uint8_t>(intLine);
+    ctrl.irqVector = IoApicRegisterHandler(ctrl.irqLine, XHCI_IRQ_VECTOR,
+                                            reinterpret_cast<void*>(XhciIrqHandler));
+    g_irqActive = true;
+    SerialPrintf("xhci: IRQ registered (line=%u, vector=%u) — interrupt-driven mode\n",
+                 ctrl.irqLine, ctrl.irqVector);
 
     // Register USB keyboard input device if a keyboard was found
     for (uint32_t i = 0; i < g_deviceCount; i++) {
@@ -2480,13 +2690,19 @@ static int XhciModuleInit()
 
 static void XhciModuleExit()
 {
+    // Disable IRQ before stopping controller
+    g_irqActive = false;
     for (uint32_t i = 0; i < g_controllerCount; i++) {
         XhciController& ctrl = g_controllers[i];
         if (!ctrl.initialized) continue;
 
-        // Stop the controller
+        // Unregister IRQ handler
+        IoApicUnregisterHandler(ctrl.irqLine,
+                                 reinterpret_cast<void*>(XhciIrqHandler));
+
+        // Disable interrupts on the controller
         uint32_t cmd = xhci_read32(ctrl.opBase, XHCI_OP_USBCMD);
-        xhci_write32(ctrl.opBase, XHCI_OP_USBCMD, cmd & ~USBCMD_RS);
+        xhci_write32(ctrl.opBase, XHCI_OP_USBCMD, cmd & ~(USBCMD_RS | USBCMD_INTE));
         SerialPrintf("xhci: controller %u stopped\n", i);
     }
     SerialPuts("xhci: driver unloaded\n");
