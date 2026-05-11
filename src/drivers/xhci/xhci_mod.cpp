@@ -2140,8 +2140,7 @@ static int UsbMscRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
         }
 
         // Copy from DMA buffer to caller's buffer
-        for (uint32_t i = 0; i < xferLen; i++)
-            dst[i] = dmaBuf[i];
+        memcpy(dst, dmaBuf, xferLen);
 
         dst += xferLen;
         startSector += batch;
@@ -2181,8 +2180,7 @@ static int UsbMscWrite(Device* dev, uint64_t offset, const void* buf, uint64_t l
         if (!dmaBuf) return -1;
 
         // Copy data to DMA buffer
-        for (uint32_t i = 0; i < xferLen; i++)
-            dmaBuf[i] = src[i];
+        memcpy(dmaBuf, src, xferLen);
 
         uint8_t cdb[10] = {};
         cdb[0] = SCSI_WRITE_10;

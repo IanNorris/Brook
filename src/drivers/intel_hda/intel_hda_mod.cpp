@@ -805,8 +805,7 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
             continue;
         }
 
-        for (uint32_t i = 0; i < chunk; i++)
-            g_audioBuf[ringPos + i] = src[totalWritten + i];
+        memcpy(g_audioBuf + ringPos, src + totalWritten, chunk);
         g_submittedBytes += chunk;
         totalWritten += chunk;
 
