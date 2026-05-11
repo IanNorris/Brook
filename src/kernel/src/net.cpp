@@ -569,6 +569,26 @@ void NetRegisterIf(NetIf* nif)
 uint32_t NetIfCount() { return g_netIfCount; }
 NetIf* NetIfAt(uint32_t idx) { return (idx < g_netIfCount) ? g_netIfs[idx] : nullptr; }
 
+uint32_t NetMaxSockets() { return MAX_SOCKETS; }
+
+SocketSnapshot NetSnapshotSocket(uint32_t idx)
+{
+    SocketSnapshot snap = {};
+    if (idx >= MAX_SOCKETS) return snap;
+    snap.used = g_sockUsed[idx];
+    if (!snap.used) return snap;
+    const Socket& s = g_sockets[idx];
+    snap.type       = s.type;
+    snap.localIp    = s.localIp;
+    snap.localPort  = s.localPort;
+    snap.remoteIp   = s.remoteIp;
+    snap.remotePort = s.remotePort;
+    snap.tcpState   = s.tcpState;
+    snap.rxCount    = s.rxCount;
+    snap.txQueued   = (s.tcpSndNxt - s.tcpSndUna);
+    return snap;
+}
+
 // Pick the interface that should source packets destined for dstIp.
 // Prefers subnet match; falls back to NIC 0 (default route).
 NetIf* NetIfForDst(uint32_t dstIp)

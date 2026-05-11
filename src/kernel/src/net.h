@@ -193,6 +193,21 @@ NetIf* NetGetIf();
 uint32_t NetIfCount();
 NetIf* NetIfAt(uint32_t idx);
 
+// Socket table accessors for procfs.
+struct SocketSnapshot {
+    bool     used;
+    int      type;        // SOCK_STREAM, SOCK_DGRAM
+    uint32_t localIp;
+    uint16_t localPort;   // network byte order
+    uint32_t remoteIp;
+    uint16_t remotePort;  // network byte order
+    TcpState tcpState;
+    uint32_t rxCount;
+    uint32_t txQueued;    // unacked bytes
+};
+uint32_t NetMaxSockets();
+SocketSnapshot NetSnapshotSocket(uint32_t idx);
+
 // Pick the interface that should source packets destined for dstIp. Chooses
 // a configured interface whose subnet matches dstIp; falls back to the
 // primary (default-route) interface when no subnet matches.

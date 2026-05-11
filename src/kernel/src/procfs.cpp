@@ -640,6 +640,147 @@ static Vnode* GenNetDev()
     return MakeProcVnode(buf, static_cast<uint32_t>(p - buf));
 }
 
+// ---- /proc/net/tcp — TCP socket table (Linux-compatible format) ----
+
+static const char* TcpStateStr(TcpState s)
+{
+    switch (s) {
+    case TcpState::Established: return "01";
+    case TcpState::SynSent:     return "02";
+    case TcpState::SynRecv:     return "03";
+    case TcpState::FinWait1:    return "04";
+    case TcpState::FinWait2:    return "05";
+    case TcpState::TimeWait:    return "06";
+    case TcpState::Closed:      return "07";
+    case TcpState::CloseWait:   return "08";
+    case TcpState::LastAck:     return "09";
+    case TcpState::Listen:      return "0A";
+    default:                    return "00";
+    }
+}
+
+static char* AppendHex32(char* p, uint32_t v)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    for (int i = 7; i >= 0; --i) *p++ = hex[(v >> (i * 4)) & 0xF];
+    return p;
+}
+
+static char* AppendHex16(char* p, uint16_t v)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    for (int i = 3; i >= 0; --i) *p++ = hex[(v >> (i * 4)) & 0xF];
+    return p;
+}
+
+static Vnode* GenNetTcp()
+{
+    // Linux /proc/net/tcp format (one line per socket):
+    //  sl  local_address rem_address   st tx_queue rx_queue
+    uint32_t maxSock = NetMaxSockets();
+    uint32_t bufSize = 256 + maxSock * 128;
+    auto* buf = static_cast<char*>(kmalloc(bufSize));
+    if (!buf) return nullptr;
+
+    char* p = buf;
+    p = AppendStr(p, "  sl  local_address rem_address   st tx_queue rx_queue\n");
+
+    uint32_t sl = 0;
+    for (uint32_t i = 0; i < maxSock; ++i)
+    {
+        SocketSnapshot snap = NetSnapshotSocket(i);
+        if (!snap.used) continue;
+        if (snap.type != 1 /* SOCK_STREAM */) continue;
+
+        if (static_cast<uint32_t>(p - buf) + 128 >= bufSize) break;
+
+        p = AppendStr(p, "  ");
+        if (sl < 10) *p++ = ' ';
+        if (sl < 100) *p++ = ' ';
+        if (sl < 1000) *p++ = ' ';
+        p = U64ToDec(p, sl);
+        p = AppendStr(p, ": ");
+
+        // local_address (IP:port in hex)
+        p = AppendHex32(p, snap.localIp);
+        *p++ = ':';
+        p = AppendHex16(p, snap.localPort);
+        *p++ = ' ';
+
+        // rem_address
+        p = AppendHex32(p, snap.remoteIp);
+        *p++ = ':';
+        p = AppendHex16(p, snap.remotePort);
+        *p++ = ' ';
+
+        // state
+        const char* st = TcpStateStr(snap.tcpState);
+        *p++ = st[0]; *p++ = st[1];
+        *p++ = ' ';
+
+        // tx_queue:rx_queue
+        p = AppendHex32(p, snap.txQueued);
+        *p++ = ':';
+        p = AppendHex32(p, snap.rxCount);
+        *p++ = '\n';
+
+        ++sl;
+    }
+
+    *p = '\0';
+    return MakeProcVnode(buf, static_cast<uint32_t>(p - buf));
+}
+
+// ---- /proc/net/udp — UDP socket table ----
+
+static Vnode* GenNetUdp()
+{
+    uint32_t maxSock = NetMaxSockets();
+    uint32_t bufSize = 256 + maxSock * 128;
+    auto* buf = static_cast<char*>(kmalloc(bufSize));
+    if (!buf) return nullptr;
+
+    char* p = buf;
+    p = AppendStr(p, "  sl  local_address rem_address   st tx_queue rx_queue\n");
+
+    uint32_t sl = 0;
+    for (uint32_t i = 0; i < maxSock; ++i)
+    {
+        SocketSnapshot snap = NetSnapshotSocket(i);
+        if (!snap.used) continue;
+        if (snap.type != 2 /* SOCK_DGRAM */) continue;
+
+        if (static_cast<uint32_t>(p - buf) + 128 >= bufSize) break;
+
+        p = AppendStr(p, "  ");
+        if (sl < 10) *p++ = ' ';
+        if (sl < 100) *p++ = ' ';
+        if (sl < 1000) *p++ = ' ';
+        p = U64ToDec(p, sl);
+        p = AppendStr(p, ": ");
+
+        p = AppendHex32(p, snap.localIp);
+        *p++ = ':';
+        p = AppendHex16(p, snap.localPort);
+        *p++ = ' ';
+
+        p = AppendHex32(p, snap.remoteIp);
+        *p++ = ':';
+        p = AppendHex16(p, snap.remotePort);
+        p = AppendStr(p, " 07 "); // UDP is always "07" (Closed equivalent)
+
+        p = AppendHex32(p, 0);
+        *p++ = ':';
+        p = AppendHex32(p, snap.rxCount);
+        *p++ = '\n';
+
+        ++sl;
+    }
+
+    *p = '\0';
+    return MakeProcVnode(buf, static_cast<uint32_t>(p - buf));
+}
+
 // ---- Global file table ----
 
 struct ProcGlobalEntry {
@@ -709,9 +850,13 @@ Vnode* ProcFsOpen(const char* relPath, int /*flags*/)
             return g_globalEntries[i].gen();
     }
 
-    // Handle "net/dev" subdirectory
+    // Handle "net/dev", "net/tcp", "net/udp" subdirectories
     if (StrEqProc(relPath, "net/dev"))
         return GenNetDev();
+    if (StrEqProc(relPath, "net/tcp"))
+        return GenNetTcp();
+    if (StrEqProc(relPath, "net/udp"))
+        return GenNetUdp();
 
     // Check pid paths: "PID" (directory) or "PID/file"
     uint32_t pid;
@@ -765,12 +910,13 @@ int ProcFsStatPath(const char* relPath, VnodeStat* st)
         }
     }
 
-    // "net" directory and "net/dev" file
+    // "net" directory and "net/dev", "net/tcp", "net/udp" files
     if (StrEqProc(relPath, "net"))
     {
         st->size = 0; st->isDir = true; return 0;
     }
-    if (StrEqProc(relPath, "net/dev"))
+    if (StrEqProc(relPath, "net/dev") || StrEqProc(relPath, "net/tcp") ||
+        StrEqProc(relPath, "net/udp"))
     {
         st->size = 0; st->isDir = false; return 0;
     }
