@@ -50,6 +50,10 @@ These run as unmodified Linux ELF binaries on Brook, linked against musl libc:
 | [musl libc](https://musl.libc.org/) | 1.2 | ✅ Working | Standard C library, dynamically linked |
 | [Go](https://go.dev/) runtime | 1.22 | ✅ Working | Static Go binaries (lazy PROT_NONE heap + on-demand mprotect) |
 | Nix binaries | — | ✅ Working | Stock NixOS closures fetched via `nix-install` (cowsay, coreutils, curl, …) |
+| [NetSurf](https://www.netsurf-browser.org/) | 3.11 | ✅ Working | Web browser rendering HTML/CSS via custom framebuffer surface |
+| [Ladybird](https://ladybird.dev/) | dev | ⚠️ Partial | Renders pages (example.com, IANA) via Wayland; some resource loads time out |
+| [Qalculate!](https://qalculate.github.io/) | — | ✅ Working | GTK3 calculator via Wayland (CSD decorations) |
+| [GIMP](https://www.gimp.org/) | 2.10 | ⚠️ Partial | Launches via Wayland/GTK; plugin loading slow, UAF under investigation |
 
 ## Features
 
@@ -61,6 +65,8 @@ These run as unmodified Linux ELF binaries on Brook, linked against musl libc:
 - **Kernel heap** — kmalloc/kfree with slab-style allocation; kmutex, krwlock, ksemaphore
 - **Loadable kernel modules** — drivers compiled separately and loaded from disk at boot (Phase 1 from initrd, Phase 2 from /boot/drivers)
 - **VFS with FAT and ext2** — virtio-blk backed storage with full read/write support, metadata cache, mount points
+- **USB (xHCI)** — USB 3.0 host controller with keyboard, mouse, and mass storage support; interrupt-driven I/O
+- **Sampling profiler** — per-CPU ring buffers, ISR hot path, timestamped output files, Speedscope-compatible JSON export
 - **Panic decoder** — kernel panics render a scannable QR code with a stack-trace payload that Brook's companion `EnkelCrashDecoder` can read
 - **Boot self-test** — cross-checks LAPIC tick rate against a PIT-gated wall-clock window at boot to catch calibration drift
 - **Debug socket** — runtime heap + per-PID PMM dumps over a unix-domain socket, for post-hoc inspection without a debugger
@@ -91,20 +97,25 @@ These run as unmodified Linux ELF binaries on Brook, linked against musl libc:
 
 ### Window Manager
 - **Compositing WM** — desktop wallpaper, window chrome with title bars, z-ordered rendering, drag + resize + maximize (VFB resizes with window)
-- **Terminal emulator** — VT100/ANSI escape sequences (16-colour palette), cell-grid scrollback preserved across resize, mouse-wheel viewport scroll, connected to bash via a pipe pair
-- **Mouse + keyboard** — cursor rendering, click-to-focus, virtio-input absolute positioning, PS/2 IntelliMouse wheel, Ctrl+C/Z/\ signal keys
+- **Wayland compositor** — `waylandd` user-mode daemon implements wl_compositor, xdg_shell, wl_seat, wl_shm, wl_output, xdg-decoration; GTK3 apps render natively
+- **Terminal emulator** — VT100/ANSI escape sequences (16-colour palette, full CSI A/B/C/D/G/H/J/K/L), cell-grid scrollback, mouse-wheel scroll, connected to bash via a pipe pair
+- **Mouse + keyboard** — cursor rendering, click-to-focus, virtio-input absolute positioning, USB HID keyboard/mouse, PS/2 IntelliMouse wheel, Ctrl+C/Z/\ signal keys
 - **Per-process framebuffers** — each window renders to its own VFB
 - **Upscaling** — configurable per-window scale factor (DOOM renders at 4× to fill the screen)
+- **Taskbar** — shows all windows with click-to-raise/minimize, app launcher with desktop entry icons
 
 ### Userspace / bundled apps
 - **Games** — DOOM (`doomgeneric`), **Quake 2** (single-player + LAN multiplayer over VDE), 2048
-- **Shells / tools** — bash, busybox, TCC, NetSurf (experimental)
-- **Graphical** — mandelbrot, clock, wavplay, sinetest
+- **Web browsers** — NetSurf (custom framebuffer surface), Ladybird (Wayland, experimental)
+- **GTK apps** — Qalculate! (calculator), Mousepad (text editor), GIMP (experimental)
+- **Shells / tools** — bash, busybox, TCC
+- **Brook-native apps** — file browser (`brook-files`), calculator, Wayland smoke tests
 - **Smoke tests** — fork/exec, pipe, signals, SCM_RIGHTS fd passing, symlink, epoll, TCP, Wayland client stub
 
 ### Drivers (loadable modules)
 | Module | Description |
 |--------|-------------|
+| `xhci` | USB 3.0 host controller — keyboard, mouse, mass storage |
 | `bochs_display` | BGA/bochs VBE display driver (1920×1080) |
 | `ps2_kbd` | PS/2 keyboard — Shift, Ctrl, Alt, CapsLock |
 | `ps2_mouse` | PS/2 mouse driver |
