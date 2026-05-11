@@ -820,11 +820,20 @@ static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
 }
 
 // Write `len` bytes to inode data at `offset`. Returns bytes written.
+//
+// Performance: coalesces runs of contiguous full-block writes into a
+// single Ext2DevWrite, bypassing per-block cache invalidation overhead.
+// For typical sequential writes (nix-install extracting large files),
+// ext2 allocates blocks contiguously, so the run often spans the whole
+// request — collapsing many per-block virtio round-trips into one.
 static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
                               const void* buf, uint64_t len, uint64_t offset)
 {
     auto* src = static_cast<const uint8_t*>(buf);
     uint64_t bytesWritten = 0;
+
+    // Cap run-coalesce length to match read path / virtio DMA buffer.
+    static constexpr uint64_t MAX_RUN_BYTES = 64 * 1024;
 
     auto* blockBuf = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
     if (!blockBuf) return -1;
@@ -836,20 +845,56 @@ static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
         if (!diskBlock) break;
 
         uint32_t avail = mnt->blockSize - blockOff;
-        uint64_t toCopy = len - bytesWritten;
-        if (toCopy > avail) toCopy = avail;
+        uint64_t remaining = len - bytesWritten;
 
-        // Fast path: full-block write — skip the bounce buffer entirely
-        // and pass the caller's data straight through to the block device.
-        if (blockOff == 0 && toCopy == mnt->blockSize) {
-            if (!Ext2WriteBlock(mnt, diskBlock, src + bytesWritten)) break;
+        // Full-block write: try to coalesce a run of contiguous blocks
+        if (blockOff == 0 && remaining >= mnt->blockSize) {
+            uint32_t runBlocks = 1;
+            uint32_t maxRun = static_cast<uint32_t>(remaining >> mnt->blockShift);
+            if (maxRun > (MAX_RUN_BYTES >> mnt->blockShift))
+                maxRun = MAX_RUN_BYTES >> mnt->blockShift;
+
+            while (runBlocks < maxRun) {
+                uint32_t nextDb = Ext2EnsureBlock(mnt, ino, inoNum, fileBlock + runBlocks);
+                if (nextDb != diskBlock + runBlocks) break;
+                ++runBlocks;
+            }
+
+            uint64_t runBytes = static_cast<uint64_t>(runBlocks) << mnt->blockShift;
+            uint64_t runOff   = static_cast<uint64_t>(diskBlock) << mnt->blockShift;
+
+            // Invalidate caches for all blocks in the run
+            for (uint32_t b = 0; b < runBlocks; ++b) {
+                Ext2BlockCacheInvalidate(mnt, diskBlock + b);
+                // Also invalidate indirect-block cache entries
+                SpinLockAcquire(&mnt->indCacheLock);
+                for (uint32_t s = 0; s < Ext2Mount::IND_CACHE_SLOTS; ++s) {
+                    if (mnt->indCacheBlockNum[s] == diskBlock + b)
+                        mnt->indCacheBlockNum[s] = 0;
+                }
+                SpinLockRelease(&mnt->indCacheLock);
+            }
+
+            if (!Ext2DevWrite(mnt, runOff, src + bytesWritten, runBytes)) break;
+            bytesWritten += runBytes;
         } else {
             // Partial block: read-modify-write via bounce buffer.
-            Ext2ReadBlock(mnt, diskBlock, blockBuf);
-            memcpy(blockBuf + blockOff, src + bytesWritten, toCopy);
-            if (!Ext2WriteBlock(mnt, diskBlock, blockBuf)) break;
+            uint64_t toCopy = remaining;
+            if (toCopy > avail) toCopy = avail;
+
+            if (blockOff == 0 && toCopy == mnt->blockSize) {
+                // Full block but couldn't coalesce (shouldn't normally happen)
+                Ext2BlockCacheInvalidate(mnt, diskBlock);
+                if (!Ext2DevWrite(mnt, static_cast<uint64_t>(diskBlock) << mnt->blockShift,
+                                  src + bytesWritten, mnt->blockSize))
+                    break;
+            } else {
+                Ext2ReadBlock(mnt, diskBlock, blockBuf);
+                memcpy(blockBuf + blockOff, src + bytesWritten, toCopy);
+                if (!Ext2WriteBlock(mnt, diskBlock, blockBuf)) break;
+            }
+            bytesWritten += toCopy;
         }
-        bytesWritten += toCopy;
     }
 
     kfree(blockBuf);
