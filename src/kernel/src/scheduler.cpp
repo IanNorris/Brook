@@ -199,6 +199,11 @@ static SchedLock g_pidLock;
 // Guard: timer ticks are ignored until SchedulerStart sets this.
 static volatile bool g_schedulerRunning = false;
 
+// Cumulative stats (for /proc/stat)
+static volatile uint64_t g_totalForks = 0;
+static volatile uint64_t g_reapedUserTicks = 0;
+static volatile uint64_t g_reapedSysTicks = 0;
+
 // ---------------------------------------------------------------------------
 // Ready queue operations — delegate to the pluggable policy module.
 // Caller must hold g_readyLock.
@@ -548,7 +553,10 @@ void SchedulerAddProcess(Process* proc)
 
     uint64_t alf1 = SchedLockAcquire(g_allProcLock);
     if (g_processCount < MAX_PROCESSES)
+    {
         g_allProcesses[g_processCount++] = proc;
+        ++g_totalForks;
+    }
     else
     {
         SchedLockRelease(g_allProcLock, alf1);
@@ -1716,6 +1724,9 @@ Process* SchedulerFindProcessByBaseName(const char* basename)
 void SchedulerReapChild(Process* child)
 {
     DbgPrintf("SCHED: reaping child '%s' (pid %u)\n", child->name, child->pid);
+    // Preserve ticks from reaped processes for accurate /proc/stat accounting
+    g_reapedUserTicks += child->userTicks;
+    g_reapedSysTicks += child->sysTicks;
     ProcessDestroy(child);
 }
 
@@ -1813,6 +1824,14 @@ bool SchedulerGetPidByIndex(uint32_t index, uint16_t* outPid)
     }
     SchedLockRelease(g_allProcLock, flags);
     return false;
+}
+
+uint64_t SchedulerGetTotalForks() { return g_totalForks; }
+
+void SchedulerGetReapedTicks(uint64_t& userTicks, uint64_t& sysTicks)
+{
+    userTicks = g_reapedUserTicks;
+    sysTicks = g_reapedSysTicks;
 }
 
 void SchedulerGetCpuTicks(uint32_t cpuIndex, uint64_t& busyTicks, uint64_t& idleTicks)

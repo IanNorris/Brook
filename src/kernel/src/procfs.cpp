@@ -306,7 +306,7 @@ static Vnode* GenStat()
         "procs_running 1\n"
         "procs_blocked 0\n",
         0UL,  // btime
-        0UL); // processes (cumulative forks — not tracked yet)
+        SchedulerGetTotalForks());
 
     return MakeProcVnode(buf, n);
 }

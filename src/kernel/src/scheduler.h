@@ -114,6 +114,10 @@ bool SchedulerSnapshotProcess(uint16_t pid, ProcessSnapshot* out);
 // Return the PID of the Nth active process (0-indexed). Returns false if out of range.
 bool SchedulerGetPidByIndex(uint32_t index, uint16_t* outPid);
 
+// Cumulative scheduler stats for /proc/stat
+uint64_t SchedulerGetTotalForks();
+void SchedulerGetReapedTicks(uint64_t& userTicks, uint64_t& sysTicks);
+
 // Get per-CPU tick counters for /proc/stat.
 // Writes busy and idle tick counts for CPU `cpuIndex`.
 void SchedulerGetCpuTicks(uint32_t cpuIndex, uint64_t& busyTicks, uint64_t& idleTicks);
