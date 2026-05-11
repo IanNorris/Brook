@@ -952,7 +952,7 @@ static void on_key(void *data, struct wl_keyboard *kb, uint32_t serial,
             } else {
                 unlink(full);
             }
-            scan_directory();
+            load_directory(g_cwd);
             if (g_selected >= g_entry_count && g_entry_count > 0)
                 g_selected = g_entry_count - 1;
             g_needs_redraw = 1;
@@ -1048,12 +1048,12 @@ static void on_ptr_button(void *d, struct wl_pointer *p, uint32_t serial,
         /* Home button */
         else if (mx >= CHAR_W * 2 + 16 && mx < CHAR_W * 4 + 24) {
             strncpy(g_cwd, "/", sizeof(g_cwd));
-            scan_directory();
+            load_directory(g_cwd);
             g_needs_redraw = 1;
         }
         /* Refresh button */
         else if (mx >= CHAR_W * 4 + 28 && mx < CHAR_W * 5 + 36) {
-            scan_directory();
+            load_directory(g_cwd);
             g_needs_redraw = 1;
         }
         /* Breadcrumb click */
