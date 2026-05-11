@@ -318,6 +318,13 @@ if [ "${INT_DEBUG}" -eq 1 ]; then
     echo "INT DEBUG: logging CPU resets to ${INT_DEBUG_LOG}"
 fi
 
+# Create USB test disk if it doesn't exist
+USB_TEST_IMG="${SCRIPT_DIR}/../usb_test.img"
+if [ ! -f "${USB_TEST_IMG}" ]; then
+    dd if=/dev/zero of="${USB_TEST_IMG}" bs=1M count=32 status=none
+    echo "Created 32MB USB test disk"
+fi
+
 qemu-system-x86_64 \
     -machine q35 \
     ${KVM_FLAGS} \
@@ -337,7 +344,7 @@ qemu-system-x86_64 \
     -device qemu-xhci,id=xhci \
     -device usb-kbd,bus=xhci.0 \
     -device usb-mouse,bus=xhci.0 \
-    -drive if=none,id=usbdisk,file="${SCRIPT_DIR}/../usb_test.img",format=raw \
+    -drive if=none,id=usbdisk,file="${USB_TEST_IMG}",format=raw \
     -device usb-storage,bus=xhci.0,drive=usbdisk \
     ${AUDIO_OPTS} \
     ${NETDEV_OPT} \
