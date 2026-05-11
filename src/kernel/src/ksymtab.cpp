@@ -56,6 +56,7 @@ EXPORT_SYMBOL(SerialPuts);
 // Physical memory
 EXPORT_SYMBOL(PmmAllocPage);
 EXPORT_SYMBOL(PmmAllocPages);
+EXPORT_SYMBOL_NAMED(PmmAllocPages, "_ZN5brook13PmmAllocPagesEmNS_6MemTagEt");
 EXPORT_SYMBOL(PmmFreePage);
 
 // Virtual memory
@@ -173,6 +174,14 @@ EXPORT_SYMBOL_NAMED(NetReceive,    "_ZN5brook10NetReceiveEPNS_5NetIfEPKvj");
 
 // Audio
 EXPORT_SYMBOL(AudioRegister);
+
+// Timer / timing
+namespace brook { extern volatile uint64_t g_lapicTickCount; }
+static __attribute__((section(".ksymtab"), used)) const brook::KernelSymbol
+    __ksym_named_g_lapicTickCount = {
+        "_ZN5brook16g_lapicTickCountE",
+        reinterpret_cast<const void*>(const_cast<const uint64_t*>(&brook::g_lapicTickCount))
+    };
 
 namespace brook {
 

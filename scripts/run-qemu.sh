@@ -334,6 +334,8 @@ qemu-system-x86_64 \
     -device virtio-tablet-pci \
     -device virtio-rng-pci \
     -device virtio-net-pci,netdev=net0${NIC_MAC_ARG} \
+    -device qemu-xhci,id=xhci \
+    -device usb-kbd,bus=xhci.0 \
     ${AUDIO_OPTS} \
     ${NETDEV_OPT} \
     ${SERIAL_OPT} \
