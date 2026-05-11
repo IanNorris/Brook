@@ -9,7 +9,9 @@
  * Keyboard:
  *   Page Up / Page Down  Scroll by page
  *   Home / End           Scroll to top / bottom (re-enables auto-scroll)
- *   Esc / Ctrl+Q         Quit
+ *   Ctrl+F               Filter log lines (case-insensitive search)
+ *   Esc                  Clear filter / Quit
+ *   Ctrl+Q               Quit
  */
 
 #define _GNU_SOURCE
@@ -259,6 +261,23 @@ static uint32_t line_colour(const char *line) {
     return COL_TEXT;
 }
 
+/* Case-insensitive substring search */
+static int line_matches_filter(const char *line) {
+    if (g_filter_len == 0) return 1;
+    for (int i = 0; line[i]; i++) {
+        int match = 1;
+        for (int k = 0; k < g_filter_len; k++) {
+            char a = line[i + k], b = g_filter_buf[k];
+            if (!a) { match = 0; break; }
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (b >= 'A' && b <= 'Z') b += 32;
+            if (a != b) { match = 0; break; }
+        }
+        if (match) return 1;
+    }
+    return 0;
+}
+
 /* ========================= Wayland Globals ========================= */
 
 static struct wl_display    *g_display;
@@ -278,6 +297,13 @@ static int  g_running    = 1;
 static int  g_needs_draw = 1;
 static int  g_configured = 0;
 static int  g_ctrl_held  = 0;
+static int  g_shift_held = 0;
+
+/* Filter state */
+#define MAX_FILTER 128
+static int  g_filter_mode = 0;
+static char g_filter_buf[MAX_FILTER] = "";
+static int  g_filter_len = 0;
 
 /* SHM buffer */
 static struct wl_buffer *g_buffer;
@@ -293,31 +319,66 @@ static void render(void) {
     /* Background */
     fill_rect(0, 0, WIN_W, WIN_H, COL_BG);
 
-    /* Log lines */
+    /* Log lines — with optional filter */
     int max_cols = (WIN_W - MARGIN_L * 2) / FONT_W;
-    for (int row = 0; row < VISIBLE_ROWS; row++) {
-        int line_idx = g_scroll_pos + row;
-        if (line_idx >= g_line_count) break;
-        const char *line = get_line(line_idx);
-        uint32_t col = line_colour(line);
-        int y = row * ROW_H;
-        int x = MARGIN_L;
-        for (int c = 0; line[c] && c < max_cols; c++) {
-            draw_char(x, y, line[c], col);
-            x += FONT_W;
+    int drawn = 0;
+    int filtered_total = 0;
+
+    if (g_filter_mode && g_filter_len > 0) {
+        /* Count total matching lines for status bar */
+        for (int i = 0; i < g_line_count; i++) {
+            if (line_matches_filter(get_line(i))) filtered_total++;
+        }
+        /* Draw matching lines, respecting scroll */
+        int skipped = 0;
+        for (int i = 0; i < g_line_count && drawn < VISIBLE_ROWS; i++) {
+            const char *line = get_line(i);
+            if (!line_matches_filter(line)) continue;
+            if (skipped < g_scroll_pos) { skipped++; continue; }
+
+            uint32_t col = line_colour(line);
+            int y = drawn * ROW_H;
+            int x = MARGIN_L;
+            for (int c = 0; line[c] && c < max_cols; c++) {
+                draw_char(x, y, line[c], col);
+                x += FONT_W;
+            }
+            drawn++;
+        }
+    } else {
+        filtered_total = g_line_count;
+        for (int row = 0; row < VISIBLE_ROWS; row++) {
+            int line_idx = g_scroll_pos + row;
+            if (line_idx >= g_line_count) break;
+            const char *line = get_line(line_idx);
+            uint32_t col = line_colour(line);
+            int y = row * ROW_H;
+            int x = MARGIN_L;
+            for (int c = 0; line[c] && c < max_cols; c++) {
+                draw_char(x, y, line[c], col);
+                x += FONT_W;
+            }
         }
     }
 
     /* Status bar */
     fill_rect(0, WIN_H - STATUS_H, WIN_W, STATUS_H, COL_STATUS_BG);
-    char status[128];
-    int top = g_scroll_pos + 1;
-    int bot = g_scroll_pos + VISIBLE_ROWS;
-    if (bot > g_line_count) bot = g_line_count;
-    snprintf(status, sizeof(status), " Brook Kernel Console  |  Lines %d-%d / %d  %s",
-             top, bot, g_line_count,
-             g_auto_scroll ? "[AUTO]" : "[MANUAL]");
-    draw_str(0, WIN_H - STATUS_H + 5, status, COL_STATUS_TXT);
+
+    if (g_filter_mode) {
+        char status[256];
+        snprintf(status, sizeof(status), " Filter: %s_  (%d/%d lines)  Esc=clear",
+                 g_filter_buf, filtered_total, g_line_count);
+        draw_str(0, WIN_H - STATUS_H + 5, status, COL_ACCENT);
+    } else {
+        char status[128];
+        int top = g_scroll_pos + 1;
+        int bot = g_scroll_pos + VISIBLE_ROWS;
+        if (bot > g_line_count) bot = g_line_count;
+        snprintf(status, sizeof(status), " Brook Kernel Console  |  Lines %d-%d / %d  %s  Ctrl+F=filter",
+                 top, bot, g_line_count,
+                 g_auto_scroll ? "[AUTO]" : "[MANUAL]");
+        draw_str(0, WIN_H - STATUS_H + 5, status, COL_STATUS_TXT);
+    }
 }
 
 /* ========================= Wayland Callbacks ========================= */
@@ -379,6 +440,71 @@ static void kbd_key(void *d, struct wl_keyboard *k, uint32_t serial,
     (void)d; (void)k; (void)serial; (void)time;
     if (state != 1) return; /* press only */
 
+    /* Ctrl+F: enter filter mode */
+    if (g_ctrl_held && key == 33 /* F */) {
+        g_filter_mode = 1;
+        g_filter_buf[0] = '\0';
+        g_filter_len = 0;
+        g_scroll_pos = 0;
+        g_needs_draw = 1;
+        return;
+    }
+
+    /* Filter mode input */
+    if (g_filter_mode) {
+        if (key == 1 /* Esc */) {
+            g_filter_mode = 0;
+            g_filter_len = 0;
+            g_filter_buf[0] = '\0';
+            g_auto_scroll = 1;
+            g_scroll_pos = g_line_count > VISIBLE_ROWS ? g_line_count - VISIBLE_ROWS : 0;
+            g_needs_draw = 1;
+            return;
+        }
+        if (key == 14 /* Backspace */) {
+            if (g_filter_len > 0) {
+                g_filter_buf[--g_filter_len] = '\0';
+                g_scroll_pos = 0;
+                g_needs_draw = 1;
+            }
+            return;
+        }
+        /* Type into filter */
+        if (g_filter_len < MAX_FILTER - 1) {
+            static const struct { int code; char lower; char upper; } fm[] = {
+                {2,'1','!'},{3,'2','@'},{4,'3','#'},{5,'4','$'},{6,'5','%'},
+                {7,'6','^'},{8,'7','&'},{9,'8','*'},{10,'9','('},{11,'0',')'},
+                {12,'-','_'},{13,'=','+'},
+                {16,'q','Q'},{17,'w','W'},{18,'e','E'},{19,'r','R'},{20,'t','T'},
+                {21,'y','Y'},{22,'u','U'},{23,'i','I'},{24,'o','O'},{25,'p','P'},
+                {26,'[','{'},{27,']','}'},
+                {30,'a','A'},{31,'s','S'},{32,'d','D'},{33,'f','F'},{34,'g','G'},
+                {35,'h','H'},{36,'j','J'},{37,'k','K'},{38,'l','L'},
+                {39,';',':'},{40,'\'','"'},{41,'`','~'},
+                {43,'\\','|'},
+                {44,'z','Z'},{45,'x','X'},{46,'c','C'},{47,'v','V'},{48,'b','B'},
+                {49,'n','N'},{50,'m','M'},
+                {51,',','<'},{52,'.','>'},
+            };
+            for (int i = 0; i < (int)(sizeof(fm)/sizeof(fm[0])); i++) {
+                if (fm[i].code == (int)key) {
+                    g_filter_buf[g_filter_len++] = g_shift_held ? fm[i].upper : fm[i].lower;
+                    g_filter_buf[g_filter_len] = '\0';
+                    g_scroll_pos = 0;
+                    g_needs_draw = 1;
+                    break;
+                }
+            }
+            if (key == 57 /* space */) {
+                g_filter_buf[g_filter_len++] = ' ';
+                g_filter_buf[g_filter_len] = '\0';
+                g_scroll_pos = 0;
+                g_needs_draw = 1;
+            }
+        }
+        return;
+    }
+
     switch (key) {
     case 1:  /* Esc */
         g_running = 0;
@@ -417,6 +543,7 @@ static void kbd_modifiers(void *d, struct wl_keyboard *k, uint32_t serial,
                           uint32_t locked, uint32_t group) {
     (void)d; (void)k; (void)serial; (void)latched; (void)locked; (void)group;
     g_ctrl_held = (depressed & 0x4) != 0;
+    g_shift_held = (depressed & 0x1) != 0;
 }
 
 static void kbd_repeat(void *d, struct wl_keyboard *k, int32_t rate, int32_t delay) {
