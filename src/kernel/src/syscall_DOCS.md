@@ -2,8 +2,8 @@
 
 ## Overview
 
-`syscall.cpp` is Brook's monolithic syscall dispatcher at ~11,000 lines. It
-implements ~100 Linux-compatible system calls plus Brook-specific extensions
+`syscall.cpp` is Brook's monolithic syscall dispatcher at ~12,500 lines. It
+implements ~120 Linux-compatible system calls plus Brook-specific extensions
 (500-series). Entry is via the SYSCALL instruction (LSTAR MSR →
 `BrookSyscallDispatcher`).
 
@@ -11,8 +11,8 @@ implements ~100 Linux-compatible system calls plus Brook-specific extensions
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `syscall.cpp` | ~11076 | All syscall implementations + dispatcher |
-| `syscall.h` | ~30 | SyscallFrame, SwitchToUserMode declaration |
+| `syscall.cpp` | ~12500 | All syscall implementations + dispatcher |
+| `syscall.h` | ~235 | Syscall numbers, SyscallFrame, FdBumpRefcount, handle ref helpers |
 
 ---
 

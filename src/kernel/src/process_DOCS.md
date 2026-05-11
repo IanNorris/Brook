@@ -142,6 +142,18 @@ Uses `PROCESS_MAGIC` sentinel for use-after-free detection.
 
 8. **~~TLS setup is duplicated~~** — **FIXED**: Factored into shared `SetupTLS(proc, stackVirtBase, guardPages)` helper.
 
+9. **Fork fd refcounting is comprehensive**: All FdType variants are handled in the fork fd copy loop:
+   - Pipe: bump readers/writers
+   - Vnode: bump refCount
+   - Socket: SockRef
+   - MemFd/EventFd/EpollFd/TimerFd/UnixSocket: HandleRef
+   - DevDsp: DspHandleRef (refcount added to DspState)
+   - DevTty: deep-copy TtyDevicePair + bump pipe reader/writer counts
+   - DevKlog: deep-copy cursor (independent read positions)
+   - DevFramebuf/DevKeyboard/DevNull/DevUrandom/SyntheticMem: no shared state, safe as-is
+
+10. **CloseProcessFd handles all types**: Close path properly decrements refcounts / frees handles for all FdType variants including DevTty (pipe refcount decrement + kfree pair) and DevDsp (refcounted free).
+
 ---
 
 ## Init Sequence
