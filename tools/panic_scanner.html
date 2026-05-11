@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Brook Panic Scanner</title>
+<style>
+:root {
+  --bg: #0d1117; --surface: #161b22; --border: #30363d;
+  --text: #e6edf3; --dim: #8b949e; --accent: #58a6ff;
+  --green: #3fb950; --red: #f85149; --yellow: #d29922;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--bg); color: var(--text);
+  min-height: 100vh; display: flex; flex-direction: column;
+  -webkit-tap-highlight-color: transparent;
+}
+header {
+  background: var(--surface); border-bottom: 1px solid var(--border);
+  padding: 12px 16px; display: flex; align-items: center; gap: 10px;
+}
+header h1 { font-size: 18px; font-weight: 600; }
+header .logo { font-size: 24px; }
+.status-bar {
+  background: var(--surface); border-bottom: 1px solid var(--border);
+  padding: 8px 16px; font-size: 13px; color: var(--dim);
+  display: flex; justify-content: space-between; align-items: center;
+}
+.status-bar .pages { display: flex; gap: 6px; }
+.page-dot {
+  width: 28px; height: 28px; border-radius: 50%;
+  border: 2px solid var(--border); display: flex;
+  align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 600; transition: all 0.3s;
+}
+.page-dot.received {
+  border-color: var(--green); background: rgba(63,185,80,0.15);
+  color: var(--green);
+}
+.page-dot.current {
+  border-color: var(--accent); background: rgba(88,166,255,0.15);
+  color: var(--accent);
+}
+main { flex: 1; display: flex; flex-direction: column; position: relative; }
+#video-container {
+  flex: 1; position: relative; overflow: hidden;
+  background: #000; min-height: 300px;
+}
+#video-container video {
+  width: 100%; height: 100%; object-fit: cover;
+}
+#video-container canvas {
+  display: none;
+}
+.overlay {
+  position: absolute; top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  width: 70vw; height: 70vw; max-width: 300px; max-height: 300px;
+  border: 2px solid rgba(88,166,255,0.5); border-radius: 12px;
+  pointer-events: none;
+}
+.overlay.scanning { animation: pulse 2s infinite; }
+@keyframes pulse {
+  0%, 100% { border-color: rgba(88,166,255,0.3); }
+  50% { border-color: rgba(88,166,255,0.8); }
+}
+.overlay.success { border-color: var(--green); animation: none; }
+.controls {
+  background: var(--surface); border-top: 1px solid var(--border);
+  padding: 16px; display: flex; flex-direction: column; gap: 10px;
+}
+button {
+  padding: 12px 20px; border-radius: 8px; border: 1px solid var(--border);
+  background: var(--surface); color: var(--text);
+  font-size: 15px; font-weight: 500; cursor: pointer;
+  transition: background 0.15s;
+}
+button:active { background: var(--border); }
+button.primary { background: var(--accent); color: #000; border-color: var(--accent); }
+button.primary:active { background: #4090e0; }
+button.success { background: var(--green); color: #000; border-color: var(--green); }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-row { display: flex; gap: 10px; }
+.btn-row button { flex: 1; }
+#log {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px; font-family: 'SF Mono', Menlo, monospace;
+  font-size: 12px; color: var(--dim); max-height: 120px;
+  overflow-y: auto; line-height: 1.5;
+}
+#log .ok { color: var(--green); }
+#log .err { color: var(--red); }
+#log .info { color: var(--accent); }
+#log .warn { color: var(--yellow); }
+.result-banner {
+  display: none; padding: 16px; text-align: center;
+  background: rgba(63,185,80,0.1); border-top: 1px solid var(--green);
+}
+.result-banner.show { display: block; }
+.result-banner h3 { color: var(--green); margin-bottom: 4px; }
+/* Manual input modal */
+.modal-overlay {
+  display: none; position: fixed; inset: 0;
+  background: rgba(0,0,0,0.7); z-index: 100;
+  align-items: center; justify-content: center;
+}
+.modal-overlay.show { display: flex; }
+.modal {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 12px; padding: 20px; width: 90vw; max-width: 400px;
+}
+.modal h3 { margin-bottom: 12px; }
+.modal textarea {
+  width: 100%; height: 120px; background: var(--bg);
+  border: 1px solid var(--border); border-radius: 8px;
+  color: var(--text); font-family: monospace; font-size: 13px;
+  padding: 8px; resize: vertical;
+}
+.modal .btn-row { margin-top: 12px; }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="logo">🔴</span>
+  <h1>Brook Panic Scanner</h1>
+</header>
+
+<div class="status-bar">
+  <span id="status-text">Initializing camera...</span>
+  <div class="pages" id="page-dots"></div>
+</div>
+
+<main>
+  <div id="video-container">
+    <video id="video" playsinline autoplay muted></video>
+    <canvas id="canvas"></canvas>
+    <div class="overlay scanning" id="overlay"></div>
+  </div>
+
+  <div class="result-banner" id="result-banner">
+    <h3>✓ Crash dump sent!</h3>
+    <p id="result-msg"></p>
+  </div>
+
+  <div class="controls">
+    <div id="log"></div>
+    <div class="btn-row">
+      <button id="btn-reset" onclick="resetScan()">Reset</button>
+      <button id="btn-send" class="primary" onclick="sendToReceiver()" disabled>
+        Send to Decoder
+      </button>
+    </div>
+    <div class="btn-row">
+      <button onclick="showManualInput()">Paste Text</button>
+      <button onclick="toggleFlash()">💡 Flash</button>
+    </div>
+  </div>
+</main>
+
+<!-- Manual paste modal -->
+<div class="modal-overlay" id="manual-modal">
+  <div class="modal">
+    <h3>Paste QR Text</h3>
+    <p style="color:var(--dim);font-size:13px;margin-bottom:8px">
+      Paste the Base45 text from a QR scanner app:
+    </p>
+    <textarea id="manual-input" placeholder="Paste Base45 text here..."></textarea>
+    <div class="btn-row">
+      <button onclick="hideManualInput()">Cancel</button>
+      <button class="primary" onclick="submitManualInput()">Add Page</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── Configuration ──────────────────────────────────────────────────────
+// The receiver URL is derived from the page's origin (same host that served this file).
+const RECEIVER_URL = window.location.origin + '/api/crash';
+
+// ── State ──────────────────────────────────────────────────────────────
+let pages = {};           // page_index -> base45 string
+let expectedPages = null; // total page count (learned from first scan)
+let scanning = true;
+let stream = null;
+let scanTimer = null;
+
+// ── Base45 ─────────────────────────────────────────────────────────────
+const B45 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:\n';
+const B45_TABLE = {};
+for (let i = 0; i < B45.length; i++) B45_TABLE[B45[i]] = i;
+
+function base45Decode(s) {
+  const out = [];
+  let i = 0;
+  while (i < s.length) {
+    if (i + 2 < s.length) {
+      const c0 = B45_TABLE[s[i]], c1 = B45_TABLE[s[i+1]], c2 = B45_TABLE[s[i+2]];
+      if (c0 === undefined || c1 === undefined || c2 === undefined)
+        throw new Error(`Bad Base45 char at ${i}`);
+      const val = c0 + c1 * 45 + c2 * 2025;
+      out.push((val >> 8) & 0xFF, val & 0xFF);
+      i += 3;
+    } else if (i + 1 < s.length) {
+      const c0 = B45_TABLE[s[i]], c1 = B45_TABLE[s[i+1]];
+      if (c0 === undefined || c1 === undefined)
+        throw new Error(`Bad Base45 char at ${i}`);
+      out.push(c0 + c1 * 45);
+      i += 2;
+    } else {
+      throw new Error('Trailing Base45 character');
+    }
+  }
+  return new Uint8Array(out);
+}
+
+// ── Panic header parsing (just enough to get page info) ────────────────
+const PANIC_MAGIC = 0x2D;
+const PANIC_PAD   = 0xCAFEF00D;
+
+function parsePanicHeader(data) {
+  if (data.length < 8) return null;
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const magic = data[0];
+  const version = data[1];
+  const page = data[2];
+  const pageCount = data[3];
+  const pad = view.getUint32(4, true);
+  if (magic !== PANIC_MAGIC || pad !== PANIC_PAD) return null;
+  return { magic, version, page, pageCount };
+}
+
+// ── Logging ────────────────────────────────────────────────────────────
+const logEl = document.getElementById('log');
+function log(msg, cls = '') {
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// ── Page dots UI ───────────────────────────────────────────────────────
+function updatePageDots() {
+  const container = document.getElementById('page-dots');
+  container.innerHTML = '';
+  if (!expectedPages) return;
+  for (let i = 0; i < expectedPages; i++) {
+    const dot = document.createElement('div');
+    dot.className = 'page-dot';
+    dot.textContent = i + 1;
+    if (pages[i]) dot.classList.add('received');
+    container.appendChild(dot);
+  }
+}
+
+function updateStatus() {
+  const el = document.getElementById('status-text');
+  const received = Object.keys(pages).length;
+  if (!expectedPages) {
+    el.textContent = 'Scanning for QR codes...';
+  } else if (received < expectedPages) {
+    el.textContent = `Page ${received}/${expectedPages} — scan next QR`;
+  } else {
+    el.textContent = `All ${expectedPages} pages received ✓`;
+  }
+
+  const btn = document.getElementById('btn-send');
+  btn.disabled = !expectedPages || received < expectedPages;
+  if (!btn.disabled) btn.classList.add('success');
+  else btn.classList.remove('success');
+}
+
+// ── QR Processing ──────────────────────────────────────────────────────
+function processQRText(text) {
+  text = text.trim().toUpperCase();
+  if (!text) return;
+
+  // Deduplicate: check if we've already seen this exact text
+  for (const [idx, existing] of Object.entries(pages)) {
+    if (existing === text) return; // already have it
+  }
+
+  try {
+    const decoded = base45Decode(text);
+    const hdr = parsePanicHeader(decoded);
+    if (!hdr) {
+      log('QR scanned but not a Brook panic packet', 'warn');
+      return;
+    }
+
+    const pageIdx = hdr.page;
+    const pageCount = hdr.pageCount;
+
+    if (expectedPages === null) {
+      expectedPages = pageCount;
+      log(`Panic dump: ${pageCount} page(s), v${hdr.version}`, 'info');
+    } else if (pageCount !== expectedPages) {
+      log(`Page count mismatch: expected ${expectedPages}, got ${pageCount}`, 'err');
+      return;
+    }
+
+    if (pages[pageIdx]) {
+      return; // already have this page
+    }
+
+    pages[pageIdx] = text;
+    log(`✓ Page ${pageIdx + 1}/${pageCount} received (${text.length} chars)`, 'ok');
+
+    // Flash overlay green
+    const overlay = document.getElementById('overlay');
+    overlay.classList.remove('scanning');
+    overlay.classList.add('success');
+    setTimeout(() => {
+      overlay.classList.remove('success');
+      overlay.classList.add('scanning');
+    }, 500);
+
+    updatePageDots();
+    updateStatus();
+
+    // Auto-send if all pages received
+    if (Object.keys(pages).length === expectedPages) {
+      log('All pages received — ready to send', 'ok');
+    }
+  } catch (e) {
+    log(`Decode error: ${e.message}`, 'err');
+  }
+}
+
+// ── Camera + scanning ──────────────────────────────────────────────────
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+async function startCamera() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
+    });
+    video.srcObject = stream;
+    await video.play();
+    log('Camera started', 'ok');
+    document.getElementById('status-text').textContent = 'Scanning for QR codes...';
+    startScanning();
+  } catch (e) {
+    log(`Camera error: ${e.message}`, 'err');
+    document.getElementById('status-text').textContent = 'Camera unavailable — use Paste Text';
+  }
+}
+
+function startScanning() {
+  if (scanTimer) return;
+
+  // Prefer BarcodeDetector API (Chrome Android, Safari 15.4+)
+  if ('BarcodeDetector' in window) {
+    const detector = new BarcodeDetector({ formats: ['qr_code'] });
+    scanTimer = setInterval(async () => {
+      if (!scanning || video.readyState < 2) return;
+      try {
+        const codes = await detector.detect(video);
+        for (const code of codes) {
+          processQRText(code.rawValue);
+        }
+      } catch (e) { /* ignore frame errors */ }
+    }, 200);
+    log('Using BarcodeDetector API', 'info');
+  } else {
+    // Fallback: manual frame capture + jsQR (loaded dynamically)
+    loadJsQR().then(() => {
+      scanTimer = setInterval(() => {
+        if (!scanning || video.readyState < 2 || !window.jsQR) return;
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        ctx.drawImage(video, 0, 0);
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const code = window.jsQR(imageData.data, canvas.width, canvas.height, {
+          inversionAttempts: 'dontInvert'
+        });
+        if (code) processQRText(code.data);
+      }, 250);
+      log('Using jsQR fallback', 'info');
+    });
+  }
+}
+
+async function loadJsQR() {
+  if (window.jsQR) return;
+  // Load jsQR from CDN (small, well-tested QR decoder)
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js';
+    s.onload = () => { log('jsQR library loaded', 'info'); resolve(); };
+    s.onerror = () => { log('Failed to load jsQR — use Paste Text', 'err'); reject(); };
+    document.head.appendChild(s);
+  });
+}
+
+async function toggleFlash() {
+  if (!stream) return;
+  const track = stream.getVideoTracks()[0];
+  const caps = track.getCapabilities?.();
+  if (!caps?.torch) { log('Flash not available on this device', 'warn'); return; }
+  const settings = track.getSettings();
+  try {
+    await track.applyConstraints({ advanced: [{ torch: !settings.torch }] });
+    log(settings.torch ? 'Flash off' : 'Flash on', 'info');
+  } catch (e) { log(`Flash error: ${e.message}`, 'err'); }
+}
+
+// ── Send to receiver ───────────────────────────────────────────────────
+async function sendToReceiver() {
+  if (!expectedPages || Object.keys(pages).length < expectedPages) return;
+
+  const btn = document.getElementById('btn-send');
+  btn.disabled = true;
+  btn.textContent = 'Sending...';
+  log('Sending crash data to receiver...', 'info');
+
+  // Assemble pages in order
+  const pageData = [];
+  for (let i = 0; i < expectedPages; i++) {
+    if (!pages[i]) {
+      log(`Missing page ${i + 1}!`, 'err');
+      btn.disabled = false;
+      btn.textContent = 'Send to Decoder';
+      return;
+    }
+    pageData.push(pages[i]);
+  }
+
+  try {
+    const resp = await fetch(RECEIVER_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        pages: pageData,
+        timestamp: new Date().toISOString(),
+        page_count: expectedPages,
+      })
+    });
+
+    if (resp.ok) {
+      const result = await resp.json();
+      log(`✓ Sent! Report saved: ${result.report_path}`, 'ok');
+      const banner = document.getElementById('result-banner');
+      banner.classList.add('show');
+      document.getElementById('result-msg').textContent =
+        `Report saved to ${result.report_path}`;
+      scanning = false;
+    } else {
+      const text = await resp.text();
+      log(`Server error (${resp.status}): ${text}`, 'err');
+      btn.disabled = false;
+      btn.textContent = 'Send to Decoder';
+    }
+  } catch (e) {
+    log(`Connection failed: ${e.message}`, 'err');
+    log('Is panic_receiver.py running?', 'warn');
+    btn.disabled = false;
+    btn.textContent = 'Send to Decoder';
+  }
+}
+
+// ── Manual paste ───────────────────────────────────────────────────────
+function showManualInput() {
+  document.getElementById('manual-modal').classList.add('show');
+  document.getElementById('manual-input').focus();
+}
+function hideManualInput() {
+  document.getElementById('manual-modal').classList.remove('show');
+}
+function submitManualInput() {
+  const text = document.getElementById('manual-input').value.trim();
+  if (text) {
+    // Support pasting multiple pages separated by newlines
+    const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+    for (const line of lines) {
+      processQRText(line);
+    }
+  }
+  document.getElementById('manual-input').value = '';
+  hideManualInput();
+}
+
+// ── Reset ──────────────────────────────────────────────────────────────
+function resetScan() {
+  pages = {};
+  expectedPages = null;
+  scanning = true;
+  document.getElementById('result-banner').classList.remove('show');
+  document.getElementById('btn-send').disabled = true;
+  document.getElementById('btn-send').textContent = 'Send to Decoder';
+  document.getElementById('btn-send').classList.remove('success');
+  logEl.innerHTML = '';
+  updatePageDots();
+  updateStatus();
+  log('Reset — ready to scan', 'info');
+}
+
+// ── Init ───────────────────────────────────────────────────────────────
+startCamera();
+updateStatus();
+log('Brook Panic Scanner ready', 'info');
+</script>
+</body>
+</html>
