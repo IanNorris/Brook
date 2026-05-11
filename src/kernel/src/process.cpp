@@ -1478,12 +1478,8 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     thread->inSignalHandlerOnAltStack = false;
     thread->sigReturnPending = false;
 
-    // Threads get a unique pid (TID) but share the process group's signal
-    // handlers. The g_sigHandlers table is per-pid, so copy the parent's
-    // slot into the thread's slot. Without this the thread's slot contains
-    // whatever stale data was left by a previous process with the same pid.
-    for (int s = 0; s < 64; ++s)
-        g_sigHandlers[thread->tgid][s] = g_sigHandlers[parent->tgid][s];
+    // Threads share the parent's tgid (set above), so they already index
+    // into the same g_sigHandlers[tgid] slot — no copy needed.
 
     // Set thread name
     {
