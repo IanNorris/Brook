@@ -2964,6 +2964,8 @@ static int64_t sys_dup(uint64_t oldfd, uint64_t, uint64_t,
     proc->fds[newfd].flags = old->flags;
     proc->fds[newfd].seekPos = old->seekPos;
     proc->fds[newfd].statusFlags = old->statusFlags;
+    for (int i = 0; i < 64; ++i)
+        proc->fds[newfd].dirPath[i] = old->dirPath[i];
 
     // Bump pipe refcount
     if (old->type == FdType::Pipe && old->handle)
@@ -3031,6 +3033,8 @@ static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd, uint64_t,
     proc->fds[newfd].seekPos = old->seekPos;
     proc->fds[newfd].statusFlags = old->statusFlags;
     proc->fds[newfd].refCount = 1;
+    for (int i = 0; i < 64; ++i)
+        proc->fds[newfd].dirPath[i] = old->dirPath[i];
 
     // Bump pipe refcount
     if (old->type == FdType::Pipe && old->handle)
