@@ -1583,21 +1583,14 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 Process* reader = pipe->readerWaiter;
                 if (reader)
                 {
-                    // [NET_DIAG] Log pipe writes that wake RequestServer
                     if (IsRequestServer(reader)) {
                         extern volatile uint64_t g_lapicTickCount;
-                        SerialPrintf("[NET_DIAG] pipe_wake_RS t=%lums writer_pid=%u fd=%lu bytes=%u\n",
-                                     g_lapicTickCount, proc ? proc->pid : 0,
-                                     fd, chunk);
                     }
                     pipe->readerWaiter = nullptr;
                     WakeProcess(reader);
                 }
-                // [NET_DIAG] Log ALL pipe writes from RequestServer (catches self-pipe)
                 else if (proc && IsRequestServer(proc)) {
                     extern volatile uint64_t g_lapicTickCount;
-                    SerialPrintf("[NET_DIAG] pipe_write_RS t=%lums fd=%lu bytes=%u\n",
-                                 g_lapicTickCount, fd, chunk);
                 }
                 PipeWakeEpoll(pipe);
                 break;  // Return partial writes immediately
@@ -1642,8 +1635,6 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
         if (brook::SockIsStream(sockIdx))
         {
             extern volatile uint64_t g_lapicTickCount;
-            SerialPrintf("[NET_DIAG] tcp_write t=%lums pid=%u fd=%lu len=%lu\n",
-                         g_lapicTickCount, proc->pid, fd, count);
             return brook::SockSend(sockIdx,
                                    reinterpret_cast<const void*>(bufAddr),
                                    static_cast<uint32_t>(count));
@@ -1742,29 +1733,6 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
             written += chunk;
             if (written > 0) {
                 Process* reader = pipe->readerWaiter;
-                // [NET_DIAG] Log unix socket write waiter state for RequestServer
-                Process* caller = ProcessCurrent();
-                if (caller && IsRequestServer(caller)) {
-                    extern volatile uint64_t g_lapicTickCount;
-                    Process* ew = pipe->epollWaiter;
-                    SerialPrintf("[NET_DIAG] unix_write t=%lums pid=%u fd=%d len=%lu "
-                                 "readerWaiter=%u epollWaiter=%u "
-                                 "pipeCount=%u\n",
-                                 g_lapicTickCount, caller->pid,
-                                 static_cast<int>(fd), count,
-                                 reader ? reader->pid : 0,
-                                 ew ? ew->pid : 0,
-                                 pipe->count());
-                    if (reader) {
-                        SerialPrintf("[NET_DIAG] unix_write_wake reader pid=%u name='%s' "
-                                     "state=%d tgid=%u cpu=%d pendWake=%d\n",
-                                     reader->pid, reader->name,
-                                     static_cast<int>(reader->state),
-                                     reader->tgid,
-                                     __atomic_load_n(&reader->runningOnCpu, __ATOMIC_ACQUIRE),
-                                     __atomic_load_n(&reader->pendingWakeup, __ATOMIC_ACQUIRE));
-                    }
-                }
                 if (reader) {
                     pipe->readerWaiter = nullptr;
                     WakeProcess(reader);
@@ -2862,8 +2830,6 @@ int64_t CloseProcessFd(Process* proc, int fd)
     {
         int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
         extern volatile uint64_t g_lapicTickCount;
-        SerialPrintf("[NET_DIAG] close t=%lums pid=%u tgid=%u fd=%d sockIdx=%d\n",
-                     g_lapicTickCount, proc->pid, proc->tgid, fd, sockIdx);
         brook::SockUnref(sockIdx);
     }
 
@@ -6896,7 +6862,6 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
                timeout == static_cast<uint64_t>(0xffffffffu);
     };
 
-    // [NET_DIAG] Log poll() calls from pid 13 (RequestServer) always,
     // or from any process when watching inet sockets
     bool logPoll = false;
     bool hasInetSock = false;
@@ -6911,9 +6876,6 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
     }
     if (logPoll) {
         extern volatile uint64_t g_lapicTickCount;
-        SerialPrintf("[NET_DIAG] poll_enter t=%lums pid=%u tgid=%u timeout=%ld nfds=%lu fds=[",
-                     g_lapicTickCount, proc->pid, proc->tgid,
-                     static_cast<int64_t>(timeout_ms), nfds);
         for (uint64_t i = 0; i < nfds && i < 8; i++) {
             FdEntry* fde = fds[i].fd >= 0 ? FdGet(proc, fds[i].fd) : nullptr;
             const char* tname = "?";
@@ -7431,8 +7393,6 @@ retry_poll:
 
     if (logPoll && ready > 0) {
         extern volatile uint64_t g_lapicTickCount;
-        SerialPrintf("[NET_DIAG] poll_return t=%lums pid=%u ready=%d revents=[",
-                     g_lapicTickCount, proc->pid, ready);
         int logged = 0;
         for (uint64_t i = 0; i < nfds && logged < 8; i++) {
             if (fds[i].revents) {
@@ -8031,9 +7991,6 @@ static int64_t sys_epoll_wait(uint64_t epfd, uint64_t eventsAddr,
     bool logEpoll = watchesInetSock && static_cast<int64_t>(timeout_ms) != 0;
     if (logEpoll) {
         extern volatile uint64_t g_lapicTickCount;
-        SerialPrintf("[NET_DIAG] epoll_wait_enter t=%lums pid=%u tgid=%u timeout=%ld nfds=%d\n",
-                     g_lapicTickCount, proc->pid, proc->tgid,
-                     static_cast<int64_t>(timeout_ms), ep->count);
     }
 
     // Allocate kernel-side event buffer
@@ -8047,8 +8004,6 @@ static int64_t sys_epoll_wait(uint64_t epfd, uint64_t eventsAddr,
 
     if (logEpoll) {
         extern volatile uint64_t g_lapicTickCount;
-        SerialPrintf("[NET_DIAG] epoll_wait_return t=%lums pid=%u n=%d\n",
-                     g_lapicTickCount, proc->pid, n);
     }
 
     if (n > 0) {
@@ -10517,8 +10472,6 @@ static int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
         // Only log interesting rejections (AF_INET6), not AF_NETLINK spam
         if (domain == 10) { // AF_INET6
             extern volatile uint64_t g_lapicTickCount;
-            SerialPrintf("[NET_DIAG] socket_AF_INET6 t=%lums pid=%u tgid=%u type=0x%lx\n",
-                         g_lapicTickCount, proc->pid, proc->tgid, type);
         }
         return -EAFNOSUPPORT;
     }
@@ -10537,15 +10490,6 @@ static int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
     if (fd < 0) {
         SockClose(sockIdx);
         return -EMFILE;
-    }
-
-    {
-        extern volatile uint64_t g_lapicTickCount;
-        int rawType = static_cast<int>(type & 0xFF);
-        SerialPrintf("[NET_DIAG] socket t=%lums pid=%u tgid=%u fd=%d type=%s%s\n",
-                     g_lapicTickCount, proc->pid, proc->tgid, fd,
-                     rawType == 1 ? "STREAM" : rawType == 2 ? "DGRAM" : "other",
-                     (type & 0x800) ? "|NONBLOCK" : "");
     }
 
     DbgPrintf("sys_socket: fd=%d sockIdx=%d\n", fd, sockIdx);
@@ -10708,14 +10652,6 @@ static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
     int connectResult = brook::SockConnect(sockIdx, uaddr);
     {
         extern volatile uint64_t g_lapicTickCount;
-        SerialPrintf("[NET_DIAG] connect t=%lums pid=%u tgid=%u fd=%d -> %u.%u.%u.%u:%u = %d\n",
-                     g_lapicTickCount, proc->pid, proc->tgid, fd,
-                     (brook::ntohl(uaddr->sin_addr) >> 24) & 0xFF,
-                     (brook::ntohl(uaddr->sin_addr) >> 16) & 0xFF,
-                     (brook::ntohl(uaddr->sin_addr) >> 8) & 0xFF,
-                     brook::ntohl(uaddr->sin_addr) & 0xFF,
-                     brook::ntohs(uaddr->sin_port),
-                     connectResult);
     }
     return connectResult;
 }
@@ -10748,8 +10684,6 @@ static int64_t sys_sendto(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
     if (brook::SockIsStream(sockIdx))
     {
         extern volatile uint64_t g_lapicTickCount;
-        SerialPrintf("[NET_DIAG] tcp_send t=%lums pid=%u fd=%d len=%lu\n",
-                     g_lapicTickCount, proc->pid, fd, lenVal);
         int ret = brook::SockSend(sockIdx,
                                    reinterpret_cast<const void*>(bufVal),
                                    static_cast<uint32_t>(lenVal));
@@ -10815,8 +10749,6 @@ static int64_t sys_recvfrom(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
         uint16_t sport = brook::ntohs(src->sin_port);
         if (sport == 53) {
             extern volatile uint64_t g_lapicTickCount;
-            SerialPrintf("[NET_DIAG] recvfrom_dns t=%lums pid=%u tgid=%u fd=%d len=%d\n",
-                         g_lapicTickCount, proc->pid, proc->tgid, fd, ret);
         }
     }
 
@@ -10854,8 +10786,6 @@ static int64_t sys_getsockopt(uint64_t fdVal, uint64_t levelVal, uint64_t optnam
             }
         }
         extern volatile uint64_t g_lapicTickCount;
-        SerialPrintf("[NET_DIAG] getsockopt_SO_ERROR t=%lums pid=%u fd=%d err=%d\n",
-                     g_lapicTickCount, proc->pid, fd, err);
         return 0;
     }
 
@@ -10886,13 +10816,6 @@ static int64_t sys_getsockname(uint64_t fdVal, uint64_t addrVal, uint64_t addrLe
 
     {
         extern volatile uint64_t g_lapicTickCount;
-        SerialPrintf("[NET_DIAG] getsockname t=%lums pid=%u fd=%d -> %u.%u.%u.%u:%u\n",
-                     g_lapicTickCount, proc->pid, fd,
-                     (brook::ntohl(tmpIp) >> 24) & 0xFF,
-                     (brook::ntohl(tmpIp) >> 16) & 0xFF,
-                     (brook::ntohl(tmpIp) >> 8) & 0xFF,
-                     brook::ntohl(tmpIp) & 0xFF,
-                     brook::ntohs(tmpPort));
     }
 
     uint32_t copyLen = *ulen;
@@ -10907,8 +10830,6 @@ static int64_t sys_getpeername(uint64_t fdVal, uint64_t addrVal, uint64_t addrLe
 {
     Process* proc = ProcessCurrent();
     extern volatile uint64_t g_lapicTickCount;
-    SerialPrintf("[NET_DIAG] getpeername t=%lums pid=%u fd=%d\n",
-                 g_lapicTickCount, proc ? proc->pid : 0, static_cast<int>(fdVal));
 
     if (!proc) return -ENOSYS;
     int fd = static_cast<int>(fdVal);

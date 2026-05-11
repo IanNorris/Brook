@@ -1575,14 +1575,15 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus)
     {
         Process* p = targets[i];
         uint32_t spin = 0;
+        bool logged = false;
         while (__atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) >= 0)
         {
             __asm__ volatile("pause");
-            if (++spin > 100000)
+            if (++spin > 1000000 && !logged)
             {
                 SerialPrintf("SCHED: exit_group waiting for pid=%u to stop (cpu=%d)\n",
                              p->pid, __atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE));
-                spin = 0;
+                logged = true;
             }
         }
         __atomic_store_n(&p->reapable, true, __ATOMIC_RELEASE);
