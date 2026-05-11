@@ -7749,13 +7749,6 @@ static int EpollScanReady(Process* proc, EpollInstance* ep,
         if (e.fd < 0) continue;
         uint32_t ready = EpollFdReady(proc, e.fd, e.events);
         if (ready) {
-            // Log inet socket epoll events (connect completion, DNS readable)
-            FdEntry* fde = FdGet(proc, e.fd);
-            if (fde && fde->type == FdType::Socket) {
-                extern volatile uint64_t g_lapicTickCount;
-                SerialPrintf("[NET_DIAG] epoll_ready t=%lums pid=%u fd=%d events=0x%x\n",
-                             g_lapicTickCount, proc->pid, e.fd, ready);
-            }
             events[n].events = ready;
             events[n].data.u64 = e.data;
             n++;

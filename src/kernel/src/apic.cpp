@@ -561,10 +561,15 @@ void ApicBroadcastNmi()
 // The handler needs the same naked ISR treatment as the timer handler
 // because SchedulerTimerTick can context-switch, which requires all GPRs
 // saved and swapgs handled properly.
-static void ReschedIpiHandlerInner()
+static void ReschedIpiHandlerInner(uint64_t interruptedCs)
 {
     LapicWrite(LapicReg::EOI, 0);
-    SchedulerTimerTick(true);
+    // Only allow preemption when the IPI interrupted user mode (CPL 3).
+    // Brook kernel code is not preemptible — it may hold internal locks
+    // (KMutex, KRwLock, ticket locks) that would deadlock or corrupt
+    // callee-saved register state if the process were descheduled mid-hold.
+    bool userMode = (interruptedCs & 3) != 0;
+    SchedulerTimerTick(userMode);
 }
 
 __attribute__((naked))
@@ -590,6 +595,11 @@ static void ReschedIpiHandler(void)
         "push %%r13\n\t"
         "push %%r14\n\t"
         "push %%r15\n\t"
+
+        // Extract interrupted CS from the interrupt frame.
+        // After 15 GPR pushes the interrupt frame CS is at RSP + 128.
+        "movq 128(%%rsp), %%rdi\n\t"    // arg1 = interrupted CS
+
         "cld\n\t"
         "call %P0\n\t"
         "pop %%r15\n\t"

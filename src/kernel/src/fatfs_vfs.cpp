@@ -473,6 +473,18 @@ static Vnode* FatFsOpen(void* /*mountPriv*/, uint8_t pdrv,
 static int FatFsStatPath(void* /*mountPriv*/, uint8_t pdrv,
                          const char* relPath, VnodeStat* st)
 {
+    // Guard: st must be a canonical kernel-half pointer.
+    // BRO-051 showed callee-saved reg corruption setting st to 0x46.
+    uint64_t stVal = reinterpret_cast<uint64_t>(st);
+    if (stVal < 0xFFFF800000000000ULL)
+    {
+        SerialPrintf("FATFS: FatFsStatPath st=%p (corrupt!) pdrv=%u path='%s' "
+                     "caller=%p\n",
+                     st, pdrv, relPath ? relPath : "(null)",
+                     __builtin_return_address(0));
+        return -1;
+    }
+
     bool isRoot = (relPath[0] == '/' && relPath[1] == '\0') || relPath[0] == '\0';
     if (isRoot) { st->size = 0; st->isDir = true; st->isSymlink = false; return 0; }
 
@@ -484,6 +496,17 @@ static int FatFsStatPath(void* /*mountPriv*/, uint8_t pdrv,
     FRESULT res = f_stat(fatPath, &fno);
     KMutexUnlock(&g_fatLock);
     if (res != FR_OK) return -1;
+
+    // Recheck st after lock round-trip — catches SMP register corruption.
+    stVal = reinterpret_cast<uint64_t>(st);
+    if (stVal < 0xFFFF800000000000ULL)
+    {
+        SerialPrintf("FATFS: FatFsStatPath st=%p CORRUPTED after f_stat! "
+                     "pdrv=%u path='%s' fattrib=0x%x caller=%p\n",
+                     st, pdrv, relPath ? relPath : "(null)",
+                     fno.fattrib, __builtin_return_address(0));
+        return -1;
+    }
 
     st->isDir = (fno.fattrib & AM_DIR) != 0;
     st->size  = st->isDir ? 0 : fno.fsize;
