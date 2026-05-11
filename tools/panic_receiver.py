@@ -350,10 +350,34 @@ def print_qr_url(url: str):
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
+def generate_self_signed_cert(cert_dir: Path) -> tuple[str, str]:
+    """Generate a self-signed TLS certificate for HTTPS. Returns (certfile, keyfile)."""
+    cert_file = cert_dir / "panic_receiver.pem"
+    key_file = cert_dir / "panic_receiver.key"
+
+    if cert_file.exists() and key_file.exists():
+        return str(cert_file), str(key_file)
+
+    cert_dir.mkdir(parents=True, exist_ok=True)
+
+    # Use openssl to generate a self-signed cert
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048",
+        "-keyout", str(key_file), "-out", str(cert_file),
+        "-days", "365", "-nodes",
+        "-subj", "/CN=Brook Panic Receiver",
+        "-addext", "subjectAltName=DNS:khione,DNS:localhost,IP:127.0.0.1",
+    ], capture_output=True, check=True)
+
+    print(f"  Generated self-signed certificate: {cert_file}")
+    return str(cert_file), str(key_file)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Brook Panic Receiver")
     ap.add_argument("--port", type=int, default=8080, help="Listen port (default: 8080)")
     ap.add_argument("--bind", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
+    ap.add_argument("--no-tls", action="store_true", help="Disable HTTPS (camera won't work)")
     args = ap.parse_args()
 
     # Ensure reports directory exists
@@ -362,22 +386,39 @@ def main():
     # Start server
     server = http.server.HTTPServer((args.bind, args.port), PanicReceiverHandler)
 
+    # Wrap with TLS for camera access (navigator.mediaDevices requires secure context)
+    use_tls = not args.no_tls
+    if use_tls:
+        import ssl
+        cert_dir = WORKSPACE / ".certs"
+        try:
+            cert_file, key_file = generate_self_signed_cert(cert_dir)
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(cert_file, key_file)
+            server.socket = ctx.wrap_socket(server.socket, server_side=True)
+        except Exception as e:
+            print(f"  [warn] TLS setup failed: {e} — falling back to HTTP")
+            use_tls = False
+
     ips = get_local_ips()
+    scheme = "https" if use_tls else "http"
     print()
     print("  ╔═══════════════════════════════════════════════╗")
     print("  ║       🔴 Brook Panic Receiver                 ║")
     print("  ╚═══════════════════════════════════════════════╝")
     print()
-    print(f"  Listening on {args.bind}:{args.port}")
+    print(f"  Listening on {args.bind}:{args.port} ({scheme.upper()})")
     print(f"  Reports dir: {REPORTS_DIR}")
     print()
 
-    url = f"http://{ips[0] if ips else 'localhost'}:{args.port}"
+    url = f"{scheme}://{ips[0] if ips else 'localhost'}:{args.port}"
     print(f"  📱 Open on your phone:")
     print(f"     {url}")
     if len(ips) > 1:
         for ip in ips[1:]:
-            print(f"     http://{ip}:{args.port}")
+            print(f"     {scheme}://{ip}:{args.port}")
+    if use_tls:
+        print(f"\n  ⚠️  Accept the self-signed certificate warning on your phone")
     print()
 
     # Try to print QR code for the URL
