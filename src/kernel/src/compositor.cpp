@@ -1200,14 +1200,18 @@ static void CompositorLoopWM()
                 {
                     int8_t dy = static_cast<int8_t>(ev.scanCode);
                     int8_t dx = static_cast<int8_t>(ev.ascii);
-                    // If the target is a terminal, consume the scroll as
-                    // scrollback navigation.  Otherwise drop for now — we
-                    // don't have a per-window scroll event channel yet.
                     Terminal* term = TerminalFindByProcess(target->proc);
                     if (term)
                     {
                         TerminalScroll(term, dy);
                         (void)dx;
+                    }
+                    else
+                    {
+                        // Route scroll to Wayland/VFB windows via WmInputPush
+                        WmInputPush(target, ev,
+                                    static_cast<int16_t>(mx - target->clientX()),
+                                    static_cast<int16_t>(my - target->clientY()));
                     }
                 }
             }

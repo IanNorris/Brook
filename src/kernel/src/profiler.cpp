@@ -99,6 +99,11 @@ void ProfilerSample(uint64_t interruptedRip, uint64_t interruptedCs, uint64_t in
     if (g_profilerEndTick != 0 && now >= g_profilerEndTick) {
         g_profilerEnabled = false;
         g_profilerFlushReq = true;
+        // Wake the profiler thread promptly via pendingWakeup — we can't call
+        // SchedulerUnblock from ISR context (it acquires g_readyLock), but
+        // CheckBlockedWakeups checks pendingWakeup on the next timer tick.
+        if (g_profilerThread)
+            __atomic_store_n(&g_profilerThread->pendingWakeup, 1, __ATOMIC_RELEASE);
         return;
     }
 
