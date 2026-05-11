@@ -56,6 +56,7 @@ EXPORT_SYMBOL(SerialPuts);
 // Physical memory
 EXPORT_SYMBOL(PmmAllocPage);
 EXPORT_SYMBOL(PmmAllocPages);
+EXPORT_SYMBOL_NAMED(PmmAllocPages, "_ZN5brook13PmmAllocPagesEmNS_6MemTagEt");
 EXPORT_SYMBOL(PmmFreePage);
 
 // Virtual memory
@@ -173,6 +174,22 @@ EXPORT_SYMBOL_NAMED(NetReceive,    "_ZN5brook10NetReceiveEPNS_5NetIfEPKvj");
 
 // Audio
 EXPORT_SYMBOL(AudioRegister);
+
+// C runtime support (compiler may emit calls to these)
+extern "C" void* memcpy(void* dest, const void* src, uint64_t n);
+extern "C" void* memset(void* dest, int c, uint64_t n);
+extern "C" void* memmove(void* dest, const void* src, uint64_t n);
+EXPORT_SYMBOL(memcpy);
+EXPORT_SYMBOL(memset);
+EXPORT_SYMBOL(memmove);
+
+// Timer / timing
+namespace brook { extern volatile uint64_t g_lapicTickCount; }
+static __attribute__((section(".ksymtab"), used)) const brook::KernelSymbol
+    __ksym_named_g_lapicTickCount = {
+        "_ZN5brook16g_lapicTickCountE",
+        reinterpret_cast<const void*>(const_cast<const uint64_t*>(&brook::g_lapicTickCount))
+    };
 
 namespace brook {
 

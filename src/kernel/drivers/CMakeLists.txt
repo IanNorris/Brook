@@ -39,3 +39,7 @@ add_driver_module(virtio_rng
 add_driver_module(intel_hda
     "${BROOK_ROOT}/src/drivers/intel_hda/intel_hda_mod.cpp"
 )
+
+add_driver_module(xhci
+    "${BROOK_ROOT}/src/drivers/xhci/xhci_mod.cpp"
+)
