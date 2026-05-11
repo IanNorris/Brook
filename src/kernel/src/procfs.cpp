@@ -861,6 +861,33 @@ static Vnode* GenModules()
     return MakeProcVnode(buf, static_cast<uint32_t>(p - buf));
 }
 
+// ---- /proc/mounts — mounted filesystems ----
+
+static Vnode* GenMounts()
+{
+    uint32_t maxSlots = VfsMountMaxSlots();
+    uint32_t bufSize = 128 + maxSlots * 128;
+    auto* buf = static_cast<char*>(kmalloc(bufSize));
+    if (!buf) return nullptr;
+
+    char* p = buf;
+    for (uint32_t i = 0; i < maxSlots; ++i)
+    {
+        VfsMountSnapshot snap = VfsMountSnapshotAt(i);
+        if (!snap.used) continue;
+        if (static_cast<uint32_t>(p - buf) + 128 >= bufSize) break;
+        // Linux format: device mountpoint type options dump pass
+        p = AppendStr(p, snap.fsType);
+        *p++ = ' ';
+        p = AppendStr(p, snap.mountPoint);
+        *p++ = ' ';
+        p = AppendStr(p, snap.fsType);
+        p = AppendStr(p, " rw 0 0\n");
+    }
+    *p = '\0';
+    return MakeProcVnode(buf, static_cast<uint32_t>(p - buf));
+}
+
 // ---- Global file table ----
 
 struct ProcGlobalEntry {
@@ -876,6 +903,7 @@ static ProcGlobalEntry g_globalEntries[] = {
     { "loadavg", GenLoadavg },
     { "cpuinfo", GenCpuinfo },
     { "modules", GenModules },
+    { "mounts",  GenMounts },
 };
 static constexpr uint32_t NUM_GLOBAL = sizeof(g_globalEntries) / sizeof(g_globalEntries[0]);
 

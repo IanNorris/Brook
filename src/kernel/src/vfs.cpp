@@ -78,6 +78,7 @@ static constexpr uint32_t VFS_MAX_MOUNTS = 8;
 
 struct MountEntry {
     char             mountPoint[64];
+    char             fsType[16];     // filesystem type name (e.g. "fatfs", "ext2")
     const VfsFsOps*  fsOps;       // filesystem driver vtable
     void*            mountPriv;   // filesystem-private mount data
     uint8_t          pdrv;        // physical drive (for block FS)
@@ -343,6 +344,7 @@ bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
     slot->pdrv       = pdrv;
     slot->used       = true;
     StrCopy(slot->mountPoint, mountPoint, sizeof(slot->mountPoint));
+    StrCopy(slot->fsType, fsName, sizeof(slot->fsType));
 
     DbgPrintf("VFS: mounted '%s' at '%s' (pdrv=%u)\n", fsName, mountPoint, pdrv);
     return true;
@@ -414,6 +416,20 @@ bool VfsRootMountNameAt(uint32_t index, char* out, uint32_t outSize)
         return true;
     }
     return false;
+}
+
+uint32_t VfsMountMaxSlots() { return VFS_MAX_MOUNTS; }
+
+VfsMountSnapshot VfsMountSnapshotAt(uint32_t idx)
+{
+    VfsMountSnapshot snap = {};
+    if (idx >= VFS_MAX_MOUNTS) return snap;
+    const auto& m = g_mounts[idx];
+    snap.used = m.used;
+    if (!m.used) return snap;
+    StrCopy(snap.mountPoint, m.mountPoint, sizeof(snap.mountPoint));
+    StrCopy(snap.fsType, m.fsType, sizeof(snap.fsType));
+    return snap;
 }
 
 Vnode* VfsOpen(const char* path, int flags)

@@ -146,6 +146,15 @@ extern "C" bool VfsUnmount(const char* mountPoint);
 uint32_t VfsRootMountCount();
 bool VfsRootMountNameAt(uint32_t index, char* out, uint32_t outSize);
 
+// Mount table snapshot for procfs (/proc/mounts).
+struct VfsMountSnapshot {
+    char mountPoint[64];
+    char fsType[16];
+    bool used;
+};
+uint32_t VfsMountMaxSlots();
+VfsMountSnapshot VfsMountSnapshotAt(uint32_t idx);
+
 // Open a file or directory.  Caller owns the returned Vnode*; call VfsClose().
 // Returns nullptr on error.
 extern "C" Vnode* VfsOpen(const char* path, int flags = 0);
