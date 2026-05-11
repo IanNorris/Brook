@@ -155,7 +155,7 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
       </button>
     </div>
     <div class="btn-row">
-      <button onclick="showManualInput()">Paste Text</button>
+      <button id="btn-paste" class="primary" onclick="showManualInput()">📋 Paste QR Text</button>
       <button onclick="toggleFlash()">💡 Flash</button>
     </div>
   </div>
@@ -502,7 +502,22 @@ function resetScan() {
 }
 
 // ── Init ───────────────────────────────────────────────────────────────
-startCamera();
+// Camera requires HTTPS (except localhost). Try to start it, but don't
+// fail if unavailable — the paste flow works over plain HTTP.
+if (window.isSecureContext && navigator.mediaDevices) {
+  startCamera();
+} else {
+  log('Camera unavailable (requires HTTPS) — use Paste Text or your phone QR app', 'warn');
+  document.getElementById('status-text').textContent = 'Paste scanned QR text below';
+  document.getElementById('overlay').style.display = 'none';
+  document.getElementById('video').style.display = 'none';
+  // Show a helpful message in the video area
+  const vc = document.getElementById('video-container');
+  vc.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;flex-direction:column;gap:12px;padding:20px;text-align:center">' +
+    '<span style="font-size:48px">📷</span>' +
+    '<p style="color:var(--dim);font-size:14px">Camera requires HTTPS.<br>Use your phone\'s QR scanner app, then paste the text below.</p>' +
+    '</div>';
+}
 updateStatus();
 log('Brook Panic Scanner ready', 'info');
 </script>
