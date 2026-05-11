@@ -19,7 +19,6 @@ import struct
 import subprocess
 import sys
 import time
-import uuid
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -29,27 +28,19 @@ SCANNER_HTML = SCRIPT_DIR / "panic_scanner.html"
 CRASH_DECODER = SCRIPT_DIR / "crash_decoder.py"
 WORKSPACE = Path(os.environ.get("BROOK_WORKSPACE", SCRIPT_DIR.parent))
 REPORTS_DIR = WORKSPACE / "crash_reports"
-IPC_SOCKET = os.environ.get("IPC_SOCKET", "/socket/orchestrator.sock")
 
 
 # ── Agent IPC notification ──────────────────────────────────────────────────
+INBOX_DIR = Path("/workspace/.enclave/inbox")
+
 def notify_agent(message: str) -> None:
-    """Send a notification to the Enclave agent via IPC socket."""
-    if not os.path.exists(IPC_SOCKET):
-        return
-    msg = {
-        "id": str(uuid.uuid4()),
-        "type": "user_message",
-        "payload": {"content": message},
-        "reply_to": None,
-    }
+    """Notify the Enclave agent via file-based inbox."""
     try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.connect(IPC_SOCKET)
-        sock.sendall((json.dumps(msg) + "\n").encode())
-        sock.close()
+        INBOX_DIR.mkdir(parents=True, exist_ok=True)
+        filename = f"{int(time.time() * 1000)}.json"
+        (INBOX_DIR / filename).write_text(json.dumps({"content": message}))
     except Exception as e:
-        print(f"  [warn] IPC notify failed: {e}")
+        print(f"  [warn] Inbox notify failed: {e}")
 
 
 # ── Base45 ──────────────────────────────────────────────────────────────────
