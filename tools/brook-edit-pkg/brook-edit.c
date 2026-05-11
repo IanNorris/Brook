@@ -16,6 +16,7 @@
  *   Enter           Insert newline
  *   Ctrl+S          Save file
  *   Ctrl+D          Duplicate current line
+ *   Ctrl+F          Find (search) — Enter for next, Esc to close
  *   Ctrl+Q / Esc    Quit
  */
 
@@ -69,6 +70,8 @@ static int memfd_create_shim(const char *name, unsigned int flags) {
 #define COL_STATUS_TXT 0xFFCDD6F4
 #define COL_MODIFIED  0xFFF38BA8
 #define COL_LINEHL    0xFF24243A   /* current line highlight */
+#define COL_SEARCH_HL 0xFF89B4FA   /* search match highlight */
+#define COL_SEARCH_BG 0xFF45475A   /* search match background */
 
 /* Limits */
 #define MAX_LINES    16384
@@ -234,6 +237,12 @@ static int     g_running = 1;
 static int     g_needs_redraw = 1;
 static int     g_ctrl_held = 0;
 static int     g_shift_held = 0;
+
+/* Search state */
+#define MAX_SEARCH 128
+static int     g_search_mode = 0;
+static char    g_search_buf[MAX_SEARCH] = "";
+static int     g_search_len = 0;
 
 static void line_ensure_cap(Line *l, int need) {
     if (l->cap >= need) return;
@@ -431,6 +440,48 @@ static void do_delete(void) {
     g_needs_redraw = 1;
 }
 
+/* ========================= Search ========================= */
+
+/* Find next occurrence of g_search_buf starting from (g_cy, g_cx+1).
+ * Wraps around to the beginning of the file. */
+static void search_next(void) {
+    if (g_search_len == 0) return;
+
+    int start_line = g_cy;
+    int start_col = g_cx + 1;
+
+    for (int i = 0; i < g_line_count; i++) {
+        int li = (start_line + i) % g_line_count;
+        Line *l = &g_lines[li];
+        int sc = (i == 0) ? start_col : 0;
+
+        for (int c = sc; c <= l->len - g_search_len; c++) {
+            int match = 1;
+            for (int k = 0; k < g_search_len; k++) {
+                if (l->data[c + k] != g_search_buf[k]) { match = 0; break; }
+            }
+            if (match) {
+                g_cy = li;
+                g_cx = c;
+                clamp_cursor();
+                g_needs_redraw = 1;
+                return;
+            }
+        }
+    }
+}
+
+/* Check if line has a search match at position col */
+static int is_search_match(int line, int col) {
+    if (g_search_len == 0 || !g_search_mode) return 0;
+    Line *l = &g_lines[line];
+    if (col + g_search_len > l->len) return 0;
+    for (int k = 0; k < g_search_len; k++) {
+        if (l->data[col + k] != g_search_buf[k]) return 0;
+    }
+    return 1;
+}
+
 /* ========================= Rendering ========================= */
 
 static void render(void) {
@@ -464,14 +515,35 @@ static void render(void) {
         uint32_t lnum_col = (line_idx == g_cy) ? COL_TEXT : COL_GUTTER_TXT;
         draw_text(3, y + 1, lnum, lnum_col);
 
-        /* Text content */
+        /* Text content — with search highlighting */
         Line *l = &g_lines[line_idx];
         int max_chars = EDIT_W / FONT_W;
         int draw_len = l->len < max_chars ? l->len : max_chars;
+
+        /* Draw search match backgrounds first */
+        if (g_search_mode && g_search_len > 0) {
+            for (int ci = 0; ci <= draw_len - g_search_len; ci++) {
+                if (is_search_match(line_idx, ci)) {
+                    fill_rect(EDIT_X + ci * FONT_W, y,
+                              g_search_len * FONT_W, ROW_H, COL_SEARCH_BG);
+                }
+            }
+        }
+
         for (int ci = 0; ci < draw_len; ci++) {
             char ch = l->data[ci];
-            if (ch == '\t') ch = ' '; /* simple tab display */
-            draw_char(EDIT_X + ci * FONT_W, y + 1, ch, COL_TEXT);
+            if (ch == '\t') ch = ' ';
+            /* Highlight search match chars */
+            uint32_t col = COL_TEXT;
+            if (g_search_mode && g_search_len > 0) {
+                for (int k = 0; k < g_search_len && k <= ci; k++) {
+                    if (ci - k >= 0 && is_search_match(line_idx, ci - k)) {
+                        col = COL_SEARCH_HL;
+                        break;
+                    }
+                }
+            }
+            draw_char(EDIT_X + ci * FONT_W, y + 1, ch, col);
         }
 
         /* Cursor */
@@ -486,19 +558,29 @@ static void render(void) {
     /* Status bar */
     fill_rect(0, WIN_H - STATUS_H, WIN_W, STATUS_H, COL_STATUS_BG);
 
-    /* Filename + modified indicator */
-    char status[256];
-    const char *fname = g_filename[0] ? g_filename : "[new file]";
-    snprintf(status, sizeof(status), " %s%s", fname,
-             g_modified ? " [modified]" : "");
-    draw_text(4, WIN_H - STATUS_H + 5, status,
-              g_modified ? COL_MODIFIED : COL_STATUS_TXT);
+    if (g_search_mode) {
+        /* Search bar */
+        char search_status[256];
+        snprintf(search_status, sizeof(search_status), " Find: %s_", g_search_buf);
+        draw_text(4, WIN_H - STATUS_H + 5, search_status, COL_SEARCH_HL);
+        char hint[] = "Enter=next  Esc=close";
+        int hint_x = WIN_W - (int)strlen(hint) * FONT_W - 4;
+        draw_text(hint_x, WIN_H - STATUS_H + 5, hint, COL_GUTTER_TXT);
+    } else {
+        /* Filename + modified indicator */
+        char status[256];
+        const char *fname = g_filename[0] ? g_filename : "[new file]";
+        snprintf(status, sizeof(status), " %s%s", fname,
+                 g_modified ? " [modified]" : "");
+        draw_text(4, WIN_H - STATUS_H + 5, status,
+                  g_modified ? COL_MODIFIED : COL_STATUS_TXT);
 
-    /* Position indicator */
-    char pos[64];
-    snprintf(pos, sizeof(pos), "Ln %d, Col %d  ", g_cy + 1, g_cx + 1);
-    int pos_x = WIN_W - (int)strlen(pos) * FONT_W - 4;
-    draw_text(pos_x, WIN_H - STATUS_H + 5, pos, COL_STATUS_TXT);
+        /* Position indicator */
+        char pos[64];
+        snprintf(pos, sizeof(pos), "Ln %d, Col %d  ", g_cy + 1, g_cx + 1);
+        int pos_x = WIN_W - (int)strlen(pos) * FONT_W - 4;
+        draw_text(pos_x, WIN_H - STATUS_H + 5, pos, COL_STATUS_TXT);
+    }
 }
 
 /* ========================= Wayland plumbing ========================= */
@@ -590,7 +672,7 @@ static void on_key(void *data, struct wl_keyboard *kb, uint32_t serial,
         KEY_UP = 103, KEY_DOWN = 108, KEY_LEFT = 105, KEY_RIGHT = 106,
         KEY_DELETE = 111, KEY_HOME = 102, KEY_END = 107,
         KEY_PAGEUP = 104, KEY_PAGEDOWN = 109,
-        KEY_S = 31, KEY_Q = 16, KEY_D = 32,
+        KEY_S = 31, KEY_Q = 16, KEY_D = 32, KEY_F = 33,
         KEY_LEFTCTRL = 29, KEY_RIGHTCTRL = 97,
     };
 
@@ -599,6 +681,12 @@ static void on_key(void *data, struct wl_keyboard *kb, uint32_t serial,
         switch (key) {
         case KEY_S: buffer_save(); return;
         case KEY_Q: g_running = 0; return;
+        case KEY_F:
+            g_search_mode = 1;
+            g_search_buf[0] = '\0';
+            g_search_len = 0;
+            g_needs_redraw = 1;
+            return;
         case KEY_D: /* Duplicate current line */
             if (g_line_count < MAX_LINES) {
                 buffer_insert_line(g_cy);
@@ -614,6 +702,59 @@ static void on_key(void *data, struct wl_keyboard *kb, uint32_t serial,
             }
             return;
         }
+    }
+
+    /* Search mode key handling */
+    if (g_search_mode) {
+        switch (key) {
+        case KEY_ESC:
+            g_search_mode = 0;
+            g_needs_redraw = 1;
+            return;
+        case KEY_ENTER:
+            search_next();
+            return;
+        case KEY_BACKSPACE:
+            if (g_search_len > 0) {
+                g_search_buf[--g_search_len] = '\0';
+                g_needs_redraw = 1;
+            }
+            return;
+        default: break;
+        }
+        /* Type into search buffer */
+        if (!g_ctrl_held && key >= 2 && key <= 52 && g_search_len < MAX_SEARCH - 1) {
+            /* Reuse the keymap from the editor */
+            static const struct { int code; char lower; char upper; } smap[] = {
+                {2,'1','!'},{3,'2','@'},{4,'3','#'},{5,'4','$'},{6,'5','%'},
+                {7,'6','^'},{8,'7','&'},{9,'8','*'},{10,'9','('},{11,'0',')'},
+                {12,'-','_'},{13,'=','+'},
+                {16,'q','Q'},{17,'w','W'},{18,'e','E'},{19,'r','R'},{20,'t','T'},
+                {21,'y','Y'},{22,'u','U'},{23,'i','I'},{24,'o','O'},{25,'p','P'},
+                {26,'[','{'},{27,']','}'},
+                {30,'a','A'},{31,'s','S'},{32,'d','D'},{33,'f','F'},{34,'g','G'},
+                {35,'h','H'},{36,'j','J'},{37,'k','K'},{38,'l','L'},
+                {39,';',':'},{40,'\'','"'},{41,'`','~'},
+                {43,'\\','|'},
+                {44,'z','Z'},{45,'x','X'},{46,'c','C'},{47,'v','V'},{48,'b','B'},
+                {49,'n','N'},{50,'m','M'},
+                {51,',','<'},{52,'.','>'},
+            };
+            for (int i = 0; i < (int)(sizeof(smap)/sizeof(smap[0])); i++) {
+                if (smap[i].code == (int)key) {
+                    g_search_buf[g_search_len++] = g_shift_held ? smap[i].upper : smap[i].lower;
+                    g_search_buf[g_search_len] = '\0';
+                    g_needs_redraw = 1;
+                    break;
+                }
+            }
+            if (key == 57) { /* space */
+                g_search_buf[g_search_len++] = ' ';
+                g_search_buf[g_search_len] = '\0';
+                g_needs_redraw = 1;
+            }
+        }
+        return;
     }
 
     int visible = EDIT_H / ROW_H;
