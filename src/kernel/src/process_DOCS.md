@@ -122,7 +122,7 @@ Uses `PROCESS_MAGIC` sentinel for use-after-free detection.
 | Bug | Severity | Description |
 |-----|----------|-------------|
 | **~~BRO-081~~** | medium | ~~Error paths in ProcessCreate/Fork leak kernel stack and fd table~~ — **FIXED** |
-| **BRO-082** | high | SyscallCheckSignals reads/writes user memory without validation |
+| **~~BRO-082~~** | high | ~~SyscallCheckSignals reads/writes user memory without validation~~ — **FIXED** |
 
 ### Additional Observations
 

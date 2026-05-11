@@ -162,6 +162,23 @@ A TCP connection to the QEMU host (`10.0.2.2:9999`) for realtime debugging:
 5. `NetStartPollThread()` — start background packet processing
 6. `DebugChannelInit()` — optional debug connection
 
+## Procfs Integration
+
+The networking subsystem exposes statistics via `/proc/net/`:
+
+| Path | Content |
+|------|---------|
+| `/proc/net/dev` | Per-interface packet/byte counters (Linux-compatible format) |
+| `/proc/net/tcp` | TCP socket table: local/remote addresses, state, queue depths |
+| `/proc/net/udp` | UDP socket table: local/remote addresses, queue depths |
+
+Per-interface counters (`rxBytes`, `txBytes`, `rxPackets`, `txPackets`) are
+maintained as volatile counters on the `NetIf` struct, incremented in
+`NetReceive()` and `NetSendIpv4()`.
+
+Socket snapshots use `NetSnapshotSocket()` to safely read socket state
+without exposing the internal `g_sockets[]` array.
+
 ## Known Limitations
 
 1. **No retransmission**: TCP relies on reliable in-memory QEMU networking. Real hardware
@@ -169,7 +186,6 @@ A TCP connection to the QEMU host (`10.0.2.2:9999`) for realtime debugging:
 2. **No fragmentation**: IPv4 packets larger than MTU are not fragmented or reassembled.
 3. **Single DNS server**: only uses the first DNS server from DHCP.
 4. **No IPv6**: entire stack is IPv4-only.
-5. **Fixed socket limit**: 64 sockets max. Adequate for current workloads but could be
-   tight for complex app stacks.
+5. **Fixed socket limit**: 1024 sockets max. Adequate for current workloads.
 6. **No SO_REUSEADDR**: bind() rejects ports already in use, even in TIME_WAIT.
 7. **Poll thread is cooperative**: no interrupt-driven receive; relies on regular polling.

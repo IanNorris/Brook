@@ -12,11 +12,11 @@ in `sched_policy.cpp` and a loadable round-robin module in `sched_mlfq`.
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `scheduler.h` | ~125 | Public scheduler API declarations |
-| `scheduler.cpp` | ~1725 | Scheduler mechanism: context switch, per-CPU, locks |
+| `scheduler.h` | ~131 | Public scheduler API declarations |
+| `scheduler.cpp` | ~1890 | Scheduler mechanism: context switch, per-CPU, locks |
 | `sched_ops.h` | ~80 | SchedOps vtable interface (policy ABI) |
 | `sched_policy.h` | ~108 | MLFQ policy declarations + SchedInfo/SchedProcess structs |
-| `sched_policy.cpp` | ~147 | MLFQ policy implementation |
+| `sched_policy.cpp` | ~146 | MLFQ policy implementation |
 
 ---
 
