@@ -12,6 +12,7 @@
 #include "memory/heap.h"
 #include "serial.h"
 #include "net.h"
+#include "module.h"
 
 namespace brook {
 
@@ -829,6 +830,37 @@ static Vnode* GenNetUdp()
     return MakeProcVnode(buf, static_cast<uint32_t>(p - buf));
 }
 
+// ---- /proc/modules — loaded kernel modules ----
+
+static Vnode* GenModules()
+{
+    uint32_t maxSlots = ModuleMaxSlots();
+    uint32_t bufSize = 128 + maxSlots * 128;
+    auto* buf = static_cast<char*>(kmalloc(bufSize));
+    if (!buf) return nullptr;
+
+    char* p = buf;
+    for (uint32_t i = 0; i < maxSlots; ++i)
+    {
+        ModuleSnapshot snap = ModuleSnapshotAt(i);
+        if (!snap.active || !snap.name) continue;
+        if (static_cast<uint32_t>(p - buf) + 128 >= bufSize) break;
+        // Linux format: name size refcount deps state
+        p = AppendStr(p, snap.name);
+        *p++ = ' ';
+        p = U64ToDec(p, snap.sizeBytes);
+        p = AppendStr(p, " 0 - Live\n");
+    }
+
+    if (p == buf) {
+        // No modules loaded
+        *p = '\0';
+    } else {
+        *p = '\0';
+    }
+    return MakeProcVnode(buf, static_cast<uint32_t>(p - buf));
+}
+
 // ---- Global file table ----
 
 struct ProcGlobalEntry {
@@ -843,6 +875,7 @@ static ProcGlobalEntry g_globalEntries[] = {
     { "version", GenVersion },
     { "loadavg", GenLoadavg },
     { "cpuinfo", GenCpuinfo },
+    { "modules", GenModules },
 };
 static constexpr uint32_t NUM_GLOBAL = sizeof(g_globalEntries) / sizeof(g_globalEntries[0]);
 

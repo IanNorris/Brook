@@ -647,4 +647,19 @@ uint32_t ModuleDiscoverAndLoad(const char* dirPath)
     return loaded;
 }
 
+uint32_t ModuleMaxSlots() { return MODULE_MAX; }
+
+ModuleSnapshot ModuleSnapshotAt(uint32_t idx)
+{
+    ModuleSnapshot snap = {};
+    if (idx >= MODULE_MAX) return snap;
+    const auto& m = g_modules[idx];
+    snap.active = m.active;
+    if (!m.active || !m.info) return snap;
+    snap.name = m.info->name;
+    snap.version = m.info->version;
+    snap.sizeBytes = m.pageCount * 4096;
+    return snap;
+}
+
 } // namespace brook

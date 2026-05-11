@@ -45,4 +45,14 @@ void ModuleDump();
 // Returns the number of successfully loaded modules.
 uint32_t ModuleDiscoverAndLoad(const char* dirPath);
 
+// Module enumeration for procfs.
+struct ModuleSnapshot {
+    const char* name;
+    const char* version;
+    uint64_t    sizeBytes;  // pageCount * 4096
+    bool        active;
+};
+uint32_t ModuleMaxSlots();
+ModuleSnapshot ModuleSnapshotAt(uint32_t idx);
+
 } // namespace brook
