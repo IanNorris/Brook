@@ -513,9 +513,9 @@ static int VirtioBlkWrite(Device* dev, uint64_t offset, const void* buf, uint64_
                 ReleaseRequestLock(*s);
                 return -1;
             }
-        } else {
-            memset(dmaBuf, 0, dmaLen);
         }
+        // No memset needed: when !needPreRead, all sectors in this batch
+        // are fully overwritten by the memcpy loop below.
 
         for (uint32_t i = 0; i < batch && bytesWritten < len; ++i)
         {
