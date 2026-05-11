@@ -79,6 +79,7 @@ static volatile bool     g_profilerEnabled  = false;
 static volatile uint64_t g_profilerStartTick = 0;
 static volatile uint64_t g_profilerEndTick   = 0;  // 0 = no auto-stop
 static volatile bool     g_profilerFlushReq  = false;
+static volatile bool     g_profilerFlushing  = false; // true while drain/close in progress
 static Process*          g_profilerThread    = nullptr;
 
 // ---------------------------------------------------------------------------
@@ -504,6 +505,7 @@ static void ProfilerThreadFn(void* /*arg*/)
 
             // Final drain to catch any events that arrived after the last
             // 1 s tick.
+            __atomic_store_n(&g_profilerFlushing, true, __ATOMIC_RELEASE);
             if (fileOk)
                 ProfileWriterDrain(pw);
 
@@ -528,6 +530,7 @@ static void ProfilerThreadFn(void* /*arg*/)
                 g_cpuBuf[c].readIdx  = 0;
                 g_cpuBuf[c].dropped  = 0;
             }
+            __atomic_store_n(&g_profilerFlushing, false, __ATOMIC_RELEASE);
         }
         else if (g_profilerFlushReq) {
             // Legacy: flush without continuous drain (shouldn't normally hit)
@@ -562,6 +565,10 @@ void ProfilerStart(uint32_t durationMs)
         SerialPrintf("PROFILER: already running\n");
         return;
     }
+    if (__atomic_load_n(&g_profilerFlushing, __ATOMIC_ACQUIRE)) {
+        SerialPrintf("PROFILER: still flushing previous run, try again shortly\n");
+        return;
+    }
 
     g_profilerStartTick = g_lapicTickCount;
     g_profilerEndTick   = durationMs > 0 ? (g_profilerStartTick + durationMs) : 0;
@@ -590,7 +597,7 @@ void ProfilerStop()
 
 bool ProfilerIsRunning()
 {
-    return g_profilerEnabled;
+    return g_profilerEnabled || __atomic_load_n(&g_profilerFlushing, __ATOMIC_ACQUIRE);
 }
 
 } // namespace brook
