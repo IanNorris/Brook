@@ -45,13 +45,35 @@ struct SchedLock {
     volatile uint32_t serving = 0;
 };
 
-static inline uint64_t SchedLockAcquire(SchedLock& lock)
+// ~25 million cycles at 2.5GHz ≈ 10ms — generous for any SchedLock
+// critical section, which should be <1µs.
+static constexpr uint64_t SCHEDLOCK_TIMEOUT_SPINS = 50000000ULL;
+
+static inline uint64_t SchedLockAcquire(SchedLock& lock, const char* caller = __builtin_FUNCTION())
 {
     uint64_t flags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
     uint32_t ticket = __atomic_fetch_add(&lock.next, 1, __ATOMIC_RELAXED);
+    uint64_t spins = 0;
     while (__atomic_load_n(&lock.serving, __ATOMIC_ACQUIRE) != ticket)
+    {
         __asm__ volatile("pause" ::: "memory");
+        if (++spins > SCHEDLOCK_TIMEOUT_SPINS)
+        {
+            // Deadlock detected. Re-enable interrupts for serial output.
+            __asm__ volatile("sti" ::: "memory");
+            // Use direct serial write to avoid any lock dependencies
+            SerialPrintf("\n*** SCHEDLOCK DEADLOCK: %s waiting for ticket %u, "
+                         "serving %u (spun %llu times) ***\n",
+                         caller, ticket,
+                         __atomic_load_n(&lock.serving, __ATOMIC_RELAXED),
+                         (unsigned long long)spins);
+            KernelPanic("SchedLock deadlock detected in %s "
+                        "(ticket=%u serving=%u)",
+                        caller, ticket,
+                        __atomic_load_n(&lock.serving, __ATOMIC_RELAXED));
+        }
+    }
     return flags;
 }
 
@@ -1595,19 +1617,21 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus)
     // are still running and may fault on those shared resources.
     //
     // The timer tick handler checks for Terminated state and will
-    // deschedule the thread even from kernel mode. We yield between
-    // checks so the calling CPU can do useful work (run the timer,
-    // schedule other processes). A hard timeout prevents infinite hang
-    // if something goes wrong.
+    // deschedule the thread even from kernel mode. We use a lightweight
+    // pause loop with sti to let timer interrupts fire on our CPU
+    // (so the scheduler can deschedule targets on other CPUs).
+    // Avoid SchedulerYield() here — it hammers g_readyLock and can
+    // cause massive contention leading to a spinlock pile-up.
     for (uint32_t i = 0; i < count; ++i)
     {
         Process* p = targets[i];
         uint32_t attempts = 0;
-        constexpr uint32_t MAX_ATTEMPTS = 10000; // ~10s at 1ms yield
+        constexpr uint32_t MAX_ATTEMPTS = 10000000; // ~10s
         while (__atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) >= 0)
         {
-            // Yield so timer ticks can fire and deschedule the target
-            SchedulerYield();
+            // Ensure interrupts are enabled so timer ticks can fire
+            // and deschedule the Terminated thread on its CPU.
+            __asm__ volatile("sti; pause; pause; pause; pause" ::: "memory");
 
             if (++attempts >= MAX_ATTEMPTS)
             {
