@@ -134,7 +134,7 @@ Uses `PROCESS_MAGIC` sentinel for use-after-free detection.
 
 4. **~~No lock on fd table~~**: **FIXED**: Added `SpinLock fdLock` to Process struct. `FdAlloc`, `FdFree`, and `FdGet` now acquire `proc->fdLock` to prevent races between CLONE_FILES threads sharing one fd table. `ProcessCloseAllFds` and `ProcessCloseCloexecFds` also hold the lock during iteration (releasing around individual close calls to avoid deadlock).
 
-5. **ProcessSendSignal SIGKILL race**: Directly sets `state = Terminated` without holding any scheduler lock. If target is running on another CPU, the state change races with the scheduler's timer tick check.
+5. **~~ProcessSendSignal SIGKILL race~~** — **IMPROVED**: Now uses `__atomic_store` with RELEASE ordering for the Terminated state transition. SIGSTOP uses `SchedulerStop()` for proper ready queue removal. A small race window remains for processes Running on other CPUs (acceptable for hobby OS; production fix would need IPI).
 
 6. **MAX_PROCESSES = 256**: PID space is 8-bit effective range. `g_sigHandlers[256][64]` = 128KB static. Adequate for current workload but could be tight for complex app stacks (Ladybird spawns ~10 processes).
 
