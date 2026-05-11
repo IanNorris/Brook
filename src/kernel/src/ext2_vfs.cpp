@@ -876,16 +876,17 @@ static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
             uint64_t runOff   = static_cast<uint64_t>(diskBlock) << mnt->blockShift;
 
             // Invalidate caches for all blocks in the run
-            for (uint32_t b = 0; b < runBlocks; ++b) {
+            for (uint32_t b = 0; b < runBlocks; ++b)
                 Ext2BlockCacheInvalidate(mnt, diskBlock + b);
-                // Also invalidate indirect-block cache entries
-                SpinLockAcquire(&mnt->indCacheLock);
-                for (uint32_t s = 0; s < Ext2Mount::IND_CACHE_SLOTS; ++s) {
-                    if (mnt->indCacheBlockNum[s] == diskBlock + b)
-                        mnt->indCacheBlockNum[s] = 0;
-                }
-                SpinLockRelease(&mnt->indCacheLock);
+
+            // Batch-invalidate indirect-block cache entries
+            SpinLockAcquire(&mnt->indCacheLock);
+            for (uint32_t s = 0; s < Ext2Mount::IND_CACHE_SLOTS; ++s) {
+                uint32_t bn = mnt->indCacheBlockNum[s];
+                if (bn >= diskBlock && bn < diskBlock + runBlocks)
+                    mnt->indCacheBlockNum[s] = 0;
             }
+            SpinLockRelease(&mnt->indCacheLock);
 
             if (!Ext2DevWrite(mnt, runOff, src + bytesWritten, runBytes)) break;
             bytesWritten += runBytes;
