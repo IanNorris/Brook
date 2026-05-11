@@ -223,6 +223,13 @@ struct brook_surface {
 
     /* Linked list of all surfaces — used by the input pump. */
     struct brook_surface *next;
+
+    /* Subsurface relationship (non-NULL when this surface has a subsurface role). */
+    struct brook_surface *subsurface_parent;
+    int32_t sub_x, sub_y;            /* position relative to parent */
+    struct brook_surface *children;   /* linked list of child subsurfaces */
+    struct brook_surface *sibling;    /* next child in parent's children list */
+    struct wl_resource   *subsurface_resource; /* wl_subsurface resource if role is subsurface */
 };
 
 static struct brook_surface *g_surfaces = NULL;
@@ -463,6 +470,64 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
         return;
     }
 
+    /* Subsurface commit: blit into parent's VFB at the subsurface offset. */
+    if (s->subsurface_parent && s->pending_buffer) {
+        struct brook_surface *par = s->subsurface_parent;
+        if (par->vfb && par->vfb_w > 0 && par->vfb_h > 0) {
+            struct wl_shm_buffer *sub_shm = wl_shm_buffer_get(s->pending_buffer);
+            if (sub_shm) {
+                int32_t sw = wl_shm_buffer_get_width(sub_shm);
+                int32_t sh = wl_shm_buffer_get_height(sub_shm);
+                int32_t ss_stride = wl_shm_buffer_get_stride(sub_shm);
+                uint32_t fmt = wl_shm_buffer_get_format(sub_shm);
+                int has_alpha = (fmt == WL_SHM_FORMAT_ARGB8888);
+
+                wl_shm_buffer_begin_access(sub_shm);
+                const uint8_t *px = wl_shm_buffer_get_data(sub_shm);
+                if (px) {
+                    /* Clip to parent VFB bounds */
+                    int32_t dx = s->sub_x, dy = s->sub_y;
+                    int32_t cx0 = dx < 0 ? -dx : 0;
+                    int32_t cy0 = dy < 0 ? -dy : 0;
+                    int32_t cx1 = sw; if (dx + cx1 > (int32_t)par->vfb_w) cx1 = (int32_t)par->vfb_w - dx;
+                    int32_t cy1 = sh; if (dy + cy1 > (int32_t)par->vfb_h) cy1 = (int32_t)par->vfb_h - dy;
+
+                    for (int32_t y = cy0; y < cy1; y++) {
+                        const uint32_t *srow = (const uint32_t*)(px + y * ss_stride);
+                        uint32_t *drow = par->vfb + (size_t)(dy + y) * par->vfb_stride + dx;
+                        for (int32_t x = cx0; x < cx1; x++) {
+                            uint32_t pixel = srow[x];
+                            if (has_alpha) {
+                                uint32_t a = (pixel >> 24) & 0xff;
+                                if (a == 0xff) { drow[x] = pixel; }
+                                else if (a > 0) {
+                                    uint32_t dst = drow[x];
+                                    uint32_t rb = ((pixel & 0xff00ff) * a + (dst & 0xff00ff) * (255 - a) + 0x800080) >> 8;
+                                    uint32_t g  = ((pixel & 0x00ff00) * a + (dst & 0x00ff00) * (255 - a) + 0x008000) >> 8;
+                                    drow[x] = 0xff000000 | (rb & 0xff00ff) | (g & 0x00ff00);
+                                }
+                            } else {
+                                drow[x] = 0xff000000 | (pixel & 0x00ffffff);
+                            }
+                        }
+                    }
+                }
+                wl_shm_buffer_end_access(sub_shm);
+                wm_signal_dirty(par->wm_id);
+            }
+        }
+        wl_buffer_send_release(s->pending_buffer);
+        s->pending_buffer = NULL;
+        /* Fire frame callbacks */
+        uint32_t now = g_now_ms();
+        for (int i = 0; i < s->pending_frame_cb_count; i++) {
+            wl_callback_send_done(s->pending_frame_cbs[i], now);
+            wl_resource_destroy(s->pending_frame_cbs[i]);
+        }
+        s->pending_frame_cb_count = 0;
+        return;
+    }
+
     int may_blit = (!s->xdg_toplevel && !s->xdg_popup) || s->xdg_acked;
     if (may_blit && w > 0 && h > 0 && (s->xdg_toplevel || s->xdg_popup)) {
         /* Lazy create the kernel Window now that we know the size. */
@@ -596,6 +661,21 @@ static void surface_destroy_userdata(struct wl_resource *r) {
     }
     for (struct brook_surface *it = g_surfaces; it; it = it->next) {
         if (it->popup_parent == s) it->popup_parent = NULL;
+    }
+    /* Clean up subsurface relationships */
+    if (s->subsurface_parent) {
+        struct brook_surface **pp2 = &s->subsurface_parent->children;
+        while (*pp2) {
+            if (*pp2 == s) { *pp2 = s->sibling; break; }
+            pp2 = &(*pp2)->sibling;
+        }
+    }
+    /* Orphan any children */
+    for (struct brook_surface *ch = s->children; ch; ) {
+        struct brook_surface *next_ch = ch->sibling;
+        ch->subsurface_parent = NULL;
+        ch->sibling = NULL;
+        ch = next_ch;
     }
     if (s->wm_id) wm_destroy_window(s->wm_id);
     free(s);
@@ -1838,13 +1918,27 @@ static void viewporter_bind(struct wl_client *client, void *data,
     fprintf(stderr, "[waylandd] wp_viewporter bind v=%u id=%u\n", version, id);
 }
 
-/* ---------------- wl_subcompositor (stub) ---------------- */
+/* ---------------- wl_subcompositor ---------------- */
 static void subsurface_destroy(struct wl_client *c, struct wl_resource *r) {
-    (void)c; wl_resource_destroy(r);
+    (void)c;
+    struct brook_surface *s = wl_resource_get_user_data(r);
+    if (s && s->subsurface_parent) {
+        /* Unlink from parent's children list */
+        struct brook_surface **pp = &s->subsurface_parent->children;
+        while (*pp) {
+            if (*pp == s) { *pp = s->sibling; break; }
+            pp = &(*pp)->sibling;
+        }
+        s->subsurface_parent = NULL;
+        s->subsurface_resource = NULL;
+    }
+    wl_resource_destroy(r);
 }
 static void subsurface_set_position(struct wl_client *c, struct wl_resource *r,
                                     int32_t x, int32_t y) {
-    (void)c; (void)r; (void)x; (void)y;
+    (void)c;
+    struct brook_surface *s = wl_resource_get_user_data(r);
+    if (s) { s->sub_x = x; s->sub_y = y; }
 }
 static void subsurface_place_above(struct wl_client *c, struct wl_resource *r,
                                    struct wl_resource *sib) {
@@ -1876,11 +1970,25 @@ static void subcomp_get_subsurface(struct wl_client *c, struct wl_resource *r,
                                     uint32_t id,
                                     struct wl_resource *surface,
                                     struct wl_resource *parent) {
-    (void)r; (void)surface; (void)parent;
+    (void)r;
+    struct brook_surface *child = wl_resource_get_user_data(surface);
+    struct brook_surface *par   = wl_resource_get_user_data(parent);
     struct wl_resource *ss = wl_resource_create(c, &wl_subsurface_interface,
                                                  wl_resource_get_version(r), id);
     if (!ss) { wl_client_post_no_memory(c); return; }
-    wl_resource_set_implementation(ss, &subsurface_impl, NULL, NULL);
+    wl_resource_set_implementation(ss, &subsurface_impl, child, NULL);
+    if (child && par) {
+        child->subsurface_parent = par;
+        child->subsurface_resource = ss;
+        child->sub_x = 0;
+        child->sub_y = 0;
+        /* Add to parent's children list */
+        child->sibling = par->children;
+        par->children = child;
+        fprintf(stderr, "[waylandd] subsurface: child surface %p -> parent %p\n",
+                (void*)child, (void*)par);
+        waylandd_send_enter_for_surface(child->resource);
+    }
 }
 static const struct wl_subcompositor_interface subcomp_impl = {
     .destroy        = subcomp_destroy,
