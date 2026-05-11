@@ -101,9 +101,9 @@ Uses `PROCESS_MAGIC` sentinel for use-after-free detection.
 
 | Function | Contract |
 |----------|----------|
-| `FdAlloc(proc, type, handle) → int` | Find first free slot, return fd index. Returns -EMFILE if full. |
-| `FdFree(proc, fd)` | Zero-fill the slot. |
-| `FdGet(proc, fd) → FdEntry*` | Bounds-check + None-check, return pointer or null. |
+| `FdAlloc(proc, type, handle) → int` | Find first free slot, return fd index. Acquires proc->fdLock. Returns -EMFILE if full. |
+| `FdFree(proc, fd)` | Zero-fill the slot. Acquires proc->fdLock. |
+| `FdGet(proc, fd) → FdEntry*` | Bounds-check + None-check, return pointer or null. Acquires proc->fdLock for the type check. |
 | `ProcessCloseAllFds(proc)` | Close all fds (process exit). Delegates to CloseProcessFd. |
 | `ProcessCloseCloexecFds(proc)` | Close FD_CLOEXEC fds (execve). |
 
@@ -132,7 +132,7 @@ Uses `PROCESS_MAGIC` sentinel for use-after-free detection.
 
 3. **~~Self-copy in ProcessCreateThread~~** — **FIXED**: Removed no-op `g_sigHandlers` copy (thread->tgid == parent->tgid).
 
-4. **No lock on fd table**: FdAlloc/FdFree/FdGet have no synchronization. With CLONE_FILES threads sharing one fd table, concurrent open/close can race. Currently mitigated by SMP CPU affinity pinning, but will need a lock for true SMP.
+4. **~~No lock on fd table~~**: **FIXED**: Added `SpinLock fdLock` to Process struct. `FdAlloc`, `FdFree`, and `FdGet` now acquire `proc->fdLock` to prevent races between CLONE_FILES threads sharing one fd table. `ProcessCloseAllFds` and `ProcessCloseCloexecFds` also hold the lock during iteration (releasing around individual close calls to avoid deadlock).
 
 5. **ProcessSendSignal SIGKILL race**: Directly sets `state = Terminated` without holding any scheduler lock. If target is running on another CPU, the state change races with the scheduler's timer tick check.
 

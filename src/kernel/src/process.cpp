@@ -100,6 +100,7 @@ static FdEntry* AllocFdTable()
 int FdAlloc(Process* proc, FdType type, void* handle)
 {
     if (!proc || !proc->fds) return -24; // EMFILE
+    SpinLockAcquire(&proc->fdLock);
     // fd 0-2 are reserved (stdin/stdout/stderr), start searching from 3
     for (uint32_t i = 0; i < MAX_FDS; ++i)
     {
@@ -113,9 +114,11 @@ int FdAlloc(Process* proc, FdType type, void* handle)
             proc->fds[i].handle   = handle;
             proc->fds[i].seekPos  = 0;
             proc->fds[i].dirPath[0] = '\0';
+            SpinLockRelease(&proc->fdLock);
             return static_cast<int>(i);
         }
     }
+    SpinLockRelease(&proc->fdLock);
     SerialPrintf("FD: pid %u exhausted %u fds\n", proc->pid, MAX_FDS);
     return -24; // EMFILE
 }
@@ -124,6 +127,7 @@ void FdFree(Process* proc, int fd)
 {
     if (!proc || !proc->fds) return;
     if (fd < 0 || fd >= static_cast<int>(MAX_FDS)) return;
+    SpinLockAcquire(&proc->fdLock);
     proc->fds[fd].type     = FdType::None;
     proc->fds[fd].flags    = 0;
     proc->fds[fd].fdFlags  = 0;
@@ -132,13 +136,20 @@ void FdFree(Process* proc, int fd)
     proc->fds[fd].refCount = 0;
     proc->fds[fd].seekPos  = 0;
     proc->fds[fd].dirPath[0] = '\0';
+    SpinLockRelease(&proc->fdLock);
 }
 
 FdEntry* FdGet(Process* proc, int fd)
 {
     if (!proc || !proc->fds) return nullptr;
     if (fd < 0 || fd >= static_cast<int>(MAX_FDS)) return nullptr;
-    if (proc->fds[fd].type == FdType::None) return nullptr;
+    SpinLockAcquire(&proc->fdLock);
+    if (proc->fds[fd].type == FdType::None)
+    {
+        SpinLockRelease(&proc->fdLock);
+        return nullptr;
+    }
+    SpinLockRelease(&proc->fdLock);
     return &proc->fds[fd];
 }
 
@@ -861,25 +872,33 @@ static void CloseFdEntry(Process* proc, uint32_t i)
 void ProcessCloseCloexecFds(Process* proc)
 {
     if (!proc) return;
+    SpinLockAcquire(&proc->fdLock);
     for (uint32_t i = 0; i < MAX_FDS; ++i)
     {
         FdEntry& fde = proc->fds[i];
         if (fde.type == FdType::None) continue;
         if (!(fde.fdFlags & 1)) continue; // not FD_CLOEXEC
+        SpinLockRelease(&proc->fdLock);
         CloseFdEntry(proc, i);
+        SpinLockAcquire(&proc->fdLock);
     }
+    SpinLockRelease(&proc->fdLock);
 }
 
 void ProcessCloseAllFds(Process* proc)
 {
     if (!proc) return;
 
+    SpinLockAcquire(&proc->fdLock);
     for (uint32_t i = 0; i < MAX_FDS; ++i)
     {
         FdEntry& fde = proc->fds[i];
         if (fde.type == FdType::None) continue;
+        SpinLockRelease(&proc->fdLock);
         CloseFdEntry(proc, i);
+        SpinLockAcquire(&proc->fdLock);
     }
+    SpinLockRelease(&proc->fdLock);
 }
 
 void ProcessDestroy(Process* proc)

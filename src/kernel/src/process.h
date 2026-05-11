@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include "memory/address.h"
 #include "input.h"
+#include "spinlock.h"
 
 namespace brook {
 
@@ -379,6 +380,7 @@ struct Process
     // and copies entries. The leader (or fork root) frees the table when
     // the process is destroyed.
     FdEntry* fds;
+    SpinLock fdLock;             // Protects fds array (alloc/free/dup races)
 
     // Per-process virtual framebuffer (for compositor)
     // When non-null, fb mmap maps this buffer instead of the physical FB.
