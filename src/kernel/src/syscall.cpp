@@ -8369,6 +8369,43 @@ static int64_t sys_sysinfo(uint64_t infoAddr, uint64_t, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
+// sys_times (100) — process times
+// ---------------------------------------------------------------------------
+
+static int64_t sys_times(uint64_t bufAddr, uint64_t, uint64_t,
+                          uint64_t, uint64_t, uint64_t)
+{
+    // struct tms { clock_t tms_utime, tms_stime, tms_cutime, tms_cstime; }
+    // clock_t is int64_t on x86_64, 4 fields = 32 bytes
+    if (bufAddr)
+    {
+        if (!UserBufferWritable(bufAddr, 32)) return -EFAULT;
+        auto* tms = reinterpret_cast<int64_t*>(bufAddr);
+
+        Process* proc = ProcessCurrent();
+        if (proc)
+        {
+            tms[0] = static_cast<int64_t>(proc->userTicks); // tms_utime
+            tms[1] = static_cast<int64_t>(proc->sysTicks);  // tms_stime
+        }
+        else
+        {
+            tms[0] = 0;
+            tms[1] = 0;
+        }
+        // Children times (accumulated from reaped processes)
+        uint64_t reapedUser = 0, reapedSys = 0;
+        SchedulerGetReapedTicks(reapedUser, reapedSys);
+        tms[2] = static_cast<int64_t>(reapedUser); // tms_cutime
+        tms[3] = static_cast<int64_t>(reapedSys);  // tms_cstime
+    }
+
+    // Return value: clock ticks since boot
+    extern volatile uint64_t g_lapicTickCount;
+    return static_cast<int64_t>(g_lapicTickCount);
+}
+
+// ---------------------------------------------------------------------------
 // sys_umask (95) — stub, always returns 022
 // ---------------------------------------------------------------------------
 
@@ -11759,6 +11796,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_GETRLIMIT]       = sys_getrlimit;
     g_syscallTable[SYS_GETRUSAGE]       = sys_getrusage;
     g_syscallTable[SYS_SYSINFO]         = sys_sysinfo;
+    g_syscallTable[SYS_TIMES]           = sys_times;
     g_syscallTable[SYS_SETPGID]         = sys_setpgid;
     g_syscallTable[SYS_GETPGRP]         = sys_getpgrp;
     g_syscallTable[SYS_SETSID]          = sys_setsid;

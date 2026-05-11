@@ -97,6 +97,7 @@ static constexpr uint64_t SYS_UMASK           = 95;
 static constexpr uint64_t SYS_GETRLIMIT       = 97;
 static constexpr uint64_t SYS_GETRUSAGE       = 98;
 static constexpr uint64_t SYS_SYSINFO         = 99;
+static constexpr uint64_t SYS_TIMES           = 100;
 static constexpr uint64_t SYS_SETPGID         = 109;
 static constexpr uint64_t SYS_GETPGRP         = 111;
 static constexpr uint64_t SYS_SETSID          = 112;
