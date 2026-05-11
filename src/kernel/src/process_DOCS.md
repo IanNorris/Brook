@@ -126,11 +126,11 @@ Uses `PROCESS_MAGIC` sentinel for use-after-free detection.
 
 ### Additional Observations
 
-1. **Duplicate declaration**: `FdGet` is declared twice in process.h (lines 575 and 581). Harmless but should be cleaned up.
+1. **~~Duplicate declaration~~** — **FIXED**: Removed duplicate `FdGet` declaration in process.h.
 
 2. **~~Deterministic AT_RANDOM and stack canary~~** — **FIXED**: `RandomU64()` uses RDRAND (with TSC fallback) for both AT_RANDOM auxv values and per-process stack canaries. Each process gets unique, unpredictable values.
 
-3. **Self-copy in ProcessCreateThread**: Line 1344 copies `g_sigHandlers[parent->tgid]` to `g_sigHandlers[thread->tgid]`, but `thread->tgid == parent->tgid`, making this a no-op self-copy. Wasted work.
+3. **~~Self-copy in ProcessCreateThread~~** — **FIXED**: Removed no-op `g_sigHandlers` copy (thread->tgid == parent->tgid).
 
 4. **No lock on fd table**: FdAlloc/FdFree/FdGet have no synchronization. With CLONE_FILES threads sharing one fd table, concurrent open/close can race. Currently mitigated by SMP CPU affinity pinning, but will need a lock for true SMP.
 
@@ -138,9 +138,9 @@ Uses `PROCESS_MAGIC` sentinel for use-after-free detection.
 
 6. **MAX_PROCESSES = 256**: PID space is 8-bit effective range. `g_sigHandlers[256][64]` = 128KB static. Adequate for current workload but could be tight for complex app stacks (Ladybird spawns ~10 processes).
 
-7. **ProcessFork uses Copy-on-Write**: Writable pages are shared between parent and child as RO+COW. First write triggers a page fault that copies the page on demand. Parent TLB is flushed via local CR3 reload (safe because CPU affinity pinning guarantees the parent runs on a single CPU). TLB shootdown will be needed if affinity pinning is removed.
+7. **ProcessFork uses Copy-on-Write**: Writable pages are shared between parent and child as RO+COW. First write triggers a page fault that copies the page on demand. TLB shootdown is now fully integrated (affinity pinning removed).
 
-8. **TLS setup is duplicated**: Identical TLS allocation + initialization code appears in both ProcessCreate (~line 598-662) and ProcessExec (~line 1630-1687). Should be factored into a shared helper.
+8. **~~TLS setup is duplicated~~** — **FIXED**: Factored into shared `SetupTLS(proc, stackVirtBase, guardPages)` helper.
 
 ---
 
