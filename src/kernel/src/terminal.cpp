@@ -12,6 +12,7 @@
 #include "serial.h"
 #include "serial_writer.h"
 #include "vfs.h"
+#include "string.h"
 
 namespace brook {
 
@@ -63,16 +64,14 @@ static void CellShiftUp(Terminal* t)
     if (t->scrollback && !t->inAltScreen && t->scrollbackRows > 0)
     {
         TermCell* dst = t->scrollback + (t->scrollbackHead * t->cols);
-        for (uint32_t i = 0; i < t->cols; i++) dst[i] = t->cells[i];
+        memcpy(dst, t->cells, t->cols * sizeof(TermCell));
         t->scrollbackHead = (t->scrollbackHead + 1) % t->scrollbackRows;
         if (t->scrollbackUsed < t->scrollbackRows) t->scrollbackUsed++;
     }
 
-    for (uint32_t y = 0; y + 1 < t->rows; y++)
-    {
-        for (uint32_t x = 0; x < t->cols; x++)
-            t->cells[y * t->cols + x] = t->cells[(y + 1) * t->cols + x];
-    }
+    // Scroll all rows up by one using memmove (overlapping regions)
+    memmove(t->cells, t->cells + t->cols,
+            (t->rows - 1) * t->cols * sizeof(TermCell));
     CellFillBlank(t, t->cells + (t->rows - 1) * t->cols, t->cols);
 }
 
@@ -207,11 +206,10 @@ static void TermRenderGlyph(Terminal* t, char ch)
             if (!frozen)
             {
                 uint32_t lineH = static_cast<uint32_t>(g_fontAtlas.lineHeight);
-                uint32_t scrollBytes = t->vfbW * (t->vfbH - lineH);
+                uint32_t scrollBytes = t->vfbW * (t->vfbH - lineH) * 4;
                 auto* dst = reinterpret_cast<uint8_t*>(t->vfb);
                 auto* src = dst + t->vfbW * lineH * 4;
-                for (uint32_t i = 0; i < scrollBytes * 4; i++)
-                    dst[i] = src[i];
+                memmove(dst, src, scrollBytes);
                 uint32_t clearStart = t->vfbW * (t->vfbH - lineH);
                 for (uint32_t i = clearStart; i < t->vfbW * t->vfbH; i++)
                     t->vfb[i] = t->bgColor;
@@ -312,11 +310,10 @@ static void TermRenderGlyph(Terminal* t, char ch)
             if (!frozen)
             {
                 uint32_t lineH = static_cast<uint32_t>(g_fontAtlas.lineHeight);
-                uint32_t scrollBytes = t->vfbW * (t->vfbH - lineH);
+                uint32_t scrollBytes = t->vfbW * (t->vfbH - lineH) * 4;
                 auto* dst = reinterpret_cast<uint8_t*>(t->vfb);
                 auto* src = dst + t->vfbW * lineH * 4;
-                for (uint32_t i = 0; i < scrollBytes * 4; i++)
-                    dst[i] = src[i];
+                memmove(dst, src, scrollBytes);
                 uint32_t clearStart = t->vfbW * (t->vfbH - lineH);
                 for (uint32_t i = clearStart; i < t->vfbW * t->vfbH; i++)
                     t->vfb[i] = t->bgColor;
@@ -1325,8 +1322,7 @@ void TerminalResize(Terminal* t, uint32_t newW, uint32_t newH)
     {
         auto* src = t->vfb + y * t->vfbW;
         auto* dst = newVfb + y * newW;
-        for (uint32_t x = 0; x < copyW; x++)
-            dst[x] = src[x];
+        memcpy(dst, src, copyW * sizeof(uint32_t));
     }
 
     // Free old VFBs (including alt screen if active)
@@ -1416,7 +1412,7 @@ void TerminalResize(Terminal* t, uint32_t newW, uint32_t newH)
             {
                 TermCell* src = t->cells + (srcRowStart + y) * oldCols;
                 TermCell* dst = newCells + (dstRowStart + y) * t->cols;
-                for (uint32_t x = 0; x < copyCols; x++) dst[x] = src[x];
+                memcpy(dst, src, copyCols * sizeof(TermCell));
             }
             kfree(t->cells);
             t->cells = newCells;
@@ -1445,7 +1441,7 @@ void TerminalResize(Terminal* t, uint32_t newW, uint32_t newH)
                                   % t->scrollbackRows;
                 TermCell* src = oldRing + srcIdx * oldCols;
                 TermCell* dst = newRing + i * t->cols;
-                for (uint32_t x = 0; x < copyC; x++) dst[x] = src[x];
+                memcpy(dst, src, copyC * sizeof(TermCell));
             }
             kfree(oldRing);
             t->scrollback = newRing;
