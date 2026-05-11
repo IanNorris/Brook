@@ -41,19 +41,19 @@ static int memfd_create_shim(const char *name, unsigned int flags) {
 
 /* ========================= Configuration ========================= */
 
-#define WIN_W  720
-#define WIN_H  480
+#define WIN_W  1024
+#define WIN_H  700
 #define BPP    4
 #define STRIDE (WIN_W * BPP)
 
 /* Layout */
-#define TREE_W       200   /* left pane width */
-#define DIVIDER_W    1
+#define TREE_W       280   /* left pane width */
+#define DIVIDER_W    2
 #define LIST_X       (TREE_W + DIVIDER_W)
 #define LIST_W       (WIN_W - LIST_X)
-#define STATUS_H     20    /* status bar height */
-#define HEADER_H     22    /* column header height */
-#define ROW_H        18    /* row height */
+#define STATUS_H     28    /* status bar height */
+#define HEADER_H     30    /* column header height */
+#define ROW_H        24    /* row height */
 #define CONTENT_H    (WIN_H - STATUS_H)
 
 /* Colours (ARGB8888) */
@@ -247,6 +247,9 @@ static const uint8_t g_font6x10[][10] = {
 
 #define FONT_W 6
 #define FONT_H 10
+#define FONT_SCALE 2
+#define CHAR_W (FONT_W * FONT_SCALE)
+#define CHAR_H (FONT_H * FONT_SCALE)
 
 static uint32_t *g_px;
 
@@ -268,8 +271,12 @@ static void draw_char(int cx, int cy, char ch, uint32_t colour) {
     for (int row = 0; row < FONT_H; row++) {
         uint8_t bits = glyph[row];
         for (int col = 0; col < FONT_W; col++) {
-            if (bits & (0x80 >> col))
-                put_px(cx + col, cy + row, colour);
+            if (bits & (0x80 >> col)) {
+                for (int sy = 0; sy < FONT_SCALE; sy++)
+                    for (int sx = 0; sx < FONT_SCALE; sx++)
+                        put_px(cx + col * FONT_SCALE + sx,
+                               cy + row * FONT_SCALE + sy, colour);
+            }
         }
     }
 }
@@ -277,7 +284,7 @@ static void draw_char(int cx, int cy, char ch, uint32_t colour) {
 static void draw_text(int x, int y, const char *s, uint32_t colour) {
     while (*s) {
         draw_char(x, y, *s, colour);
-        x += FONT_W;
+        x += CHAR_W;
         s++;
     }
 }
@@ -285,16 +292,15 @@ static void draw_text(int x, int y, const char *s, uint32_t colour) {
 /* Draw text clipped to a maximum pixel width. */
 static void draw_text_clipped(int x, int y, const char *s, uint32_t colour,
                                int max_w) {
-    int max_chars = max_w / FONT_W;
+    int max_chars = max_w / CHAR_W;
     int len = (int)strlen(s);
     if (len <= max_chars) {
         draw_text(x, y, s, colour);
     } else if (max_chars > 3) {
-        /* Truncate with "..." */
         for (int i = 0; i < max_chars - 3; i++) {
-            draw_char(x + i * FONT_W, y, s[i], colour);
+            draw_char(x + i * CHAR_W, y, s[i], colour);
         }
-        draw_text(x + (max_chars - 3) * FONT_W, y, "...", colour);
+        draw_text(x + (max_chars - 3) * CHAR_W, y, "...", colour);
     }
 }
 
@@ -579,11 +585,15 @@ static void render(void) {
     /* Divider */
     fill_rect(TREE_W, 0, DIVIDER_W, WIN_H, COL_DIVIDER);
 
+    /* Text vertical centering within ROW_H */
+    int text_vpad = (ROW_H - CHAR_H) / 2;
+    int hdr_vpad  = (HEADER_H - CHAR_H) / 2;
+
     /* --- Tree pane --- */
     int tree_visible = (CONTENT_H - HEADER_H) / ROW_H;
     /* Tree header */
     fill_rect(0, 0, TREE_W, HEADER_H, COL_HEADER_BG);
-    draw_text(6, 6, "Folders", COL_TEXT);
+    draw_text(8, hdr_vpad, "Folders", COL_TEXT);
 
     for (int i = 0; i < g_tree_count && i < tree_visible; i++) {
         TreeNode *n = &g_tree[i];
@@ -593,25 +603,25 @@ static void render(void) {
         if (i == g_tree_selected && g_active_pane == 0)
             fill_rect(0, y, TREE_W, ROW_H, COL_SELECT);
 
-        int indent = n->depth * 12 + 4;
+        int indent = n->depth * CHAR_W * 2 + 8;
 
         /* Expand/collapse arrow */
         if (n->has_children) {
             char arrow = n->expanded ? 'v' : '>';
-            draw_char(indent, y + 4, arrow, COL_TREE_ARROW);
+            draw_char(indent, y + text_vpad, arrow, COL_TREE_ARROW);
         }
 
         /* Folder icon (just a prefix char) */
-        draw_text_clipped(indent + 10, y + 4, n->name, COL_DIR_TEXT,
-                          TREE_W - indent - 14);
+        draw_text_clipped(indent + CHAR_W + 4, y + text_vpad, n->name, COL_DIR_TEXT,
+                          TREE_W - indent - CHAR_W - 8);
     }
 
     /* --- File list pane --- */
     /* Column header */
     fill_rect(LIST_X, 0, LIST_W, HEADER_H, COL_HEADER_BG);
-    draw_text(LIST_X + 6, 6, "Name", COL_TEXT);
-    draw_text(LIST_X + LIST_W - 160, 6, "Size", COL_TEXT);
-    draw_text(LIST_X + LIST_W - 96, 6, "Modified", COL_TEXT);
+    draw_text(LIST_X + 8, hdr_vpad, "Name", COL_TEXT);
+    draw_text(LIST_X + LIST_W - 200, hdr_vpad, "Size", COL_TEXT);
+    draw_text(LIST_X + LIST_W - 120, hdr_vpad, "Modified", COL_TEXT);
 
     int list_visible = (CONTENT_H - HEADER_H) / ROW_H;
 
@@ -643,33 +653,34 @@ static void render(void) {
         else
             snprintf(display_name, sizeof(display_name), "%s", e->name);
 
-        draw_text_clipped(LIST_X + 6, y + 4, display_name, name_col,
-                          LIST_W - 170);
+        draw_text_clipped(LIST_X + 8, y + text_vpad, display_name, name_col,
+                          LIST_W - 210);
 
         /* Size */
         if (!e->is_dir) {
             char size_str[32];
             format_size(e->size, size_str, sizeof(size_str));
-            draw_text(LIST_X + LIST_W - 160, y + 4, size_str, COL_TEXT_DIM);
+            draw_text(LIST_X + LIST_W - 200, y + text_vpad, size_str, COL_TEXT_DIM);
         }
 
         /* Modified date */
         char time_str[32];
         format_time(e->mtime, time_str, sizeof(time_str));
-        draw_text(LIST_X + LIST_W - 96, y + 4, time_str, COL_TEXT_DIM);
+        draw_text(LIST_X + LIST_W - 120, y + text_vpad, time_str, COL_TEXT_DIM);
     }
 
     /* --- Status bar --- */
     fill_rect(0, WIN_H - STATUS_H, WIN_W, STATUS_H, COL_STATUS_BG);
+    int status_vpad = (STATUS_H - CHAR_H) / 2;
 
     /* Path */
-    draw_text_clipped(6, WIN_H - STATUS_H + 5, g_cwd, COL_TEXT,
-                      WIN_W / 2 - 10);
+    draw_text_clipped(8, WIN_H - STATUS_H + status_vpad, g_cwd, COL_TEXT,
+                      WIN_W / 2 - 16);
 
     /* Entry count */
     char count_str[64];
     snprintf(count_str, sizeof(count_str), "%d items", g_entry_count);
-    draw_text(WIN_W / 2 + 6, WIN_H - STATUS_H + 5, count_str, COL_TEXT_DIM);
+    draw_text(WIN_W / 2 + 8, WIN_H - STATUS_H + status_vpad, count_str, COL_TEXT_DIM);
 
     /* Selected file info */
     if (g_selected >= 0 && g_selected < g_entry_count) {
@@ -686,7 +697,7 @@ static void render(void) {
             } else {
                 snprintf(info, sizeof(info), "%s", size_str);
             }
-            draw_text(WIN_W - 200, WIN_H - STATUS_H + 5, info, COL_TEXT);
+            draw_text(WIN_W - 260, WIN_H - STATUS_H + status_vpad, info, COL_TEXT);
         }
     }
 }
