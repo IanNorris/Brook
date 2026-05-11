@@ -402,6 +402,8 @@ int NetSendIpv4(uint32_t dstIp, uint8_t proto,
 
     NetMemcpy(frame + sizeof(EthHeader) + sizeof(Ipv4Header), payload, payloadLen);
 
+    nif->txPackets++;
+    nif->txBytes += frameLen;
     return nif->transmit(nif, frame, frameLen);
 }
 
@@ -516,6 +518,9 @@ static void HandleIpv4(const uint8_t* frame, uint32_t len)
 void NetReceive(NetIf* nif, const void* frame, uint32_t len)
 {
     if (len < sizeof(EthHeader)) return;
+
+    nif->rxPackets++;
+    nif->rxBytes += len;
 
     auto* eth = reinterpret_cast<const EthHeader*>(frame);
     uint16_t etherType = ntohs(eth->etherType);

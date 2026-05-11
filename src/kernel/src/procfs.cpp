@@ -11,6 +11,7 @@
 #include "memory/physical_memory.h"
 #include "memory/heap.h"
 #include "serial.h"
+#include "net.h"
 
 namespace brook {
 
@@ -603,6 +604,42 @@ static bool FindProcess(uint32_t pid, ProcessSnapshot* out)
     return false;
 }
 
+// ---- /proc/net/dev — network interface statistics ----
+
+static Vnode* GenNetDev()
+{
+    auto* buf = static_cast<char*>(kmalloc(1024));
+    if (!buf) return nullptr;
+
+    char* p = buf;
+    p = AppendStr(p, "Inter-|   Receive                            "
+                     "|  Transmit\n");
+    p = AppendStr(p, " face |bytes    packets errs drop fifo frame "
+                     "|bytes    packets errs drop fifo colls carrier\n");
+
+    uint32_t count = NetIfCount();
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        NetIf* nif = NetIfAt(i);
+        if (!nif) continue;
+        // "  eth0: rxBytes rxPkts 0 0 0 0  txBytes txPkts 0 0 0 0 0"
+        p = AppendStr(p, "  eth");
+        p = U64ToDec(p, i);
+        p = AppendStr(p, ": ");
+        p = U64ToDec(p, nif->rxBytes);
+        *p++ = ' ';
+        p = U64ToDec(p, nif->rxPackets);
+        p = AppendStr(p, " 0 0 0 0  ");
+        p = U64ToDec(p, nif->txBytes);
+        *p++ = ' ';
+        p = U64ToDec(p, nif->txPackets);
+        p = AppendStr(p, " 0 0 0 0 0\n");
+    }
+
+    *p = '\0';
+    return MakeProcVnode(buf, static_cast<uint32_t>(p - buf));
+}
+
 // ---- Global file table ----
 
 struct ProcGlobalEntry {
@@ -672,6 +709,10 @@ Vnode* ProcFsOpen(const char* relPath, int /*flags*/)
             return g_globalEntries[i].gen();
     }
 
+    // Handle "net/dev" subdirectory
+    if (StrEqProc(relPath, "net/dev"))
+        return GenNetDev();
+
     // Check pid paths: "PID" (directory) or "PID/file"
     uint32_t pid;
     const char* rest;
@@ -722,6 +763,16 @@ int ProcFsStatPath(const char* relPath, VnodeStat* st)
             st->isDir = false;
             return 0;
         }
+    }
+
+    // "net" directory and "net/dev" file
+    if (StrEqProc(relPath, "net"))
+    {
+        st->size = 0; st->isDir = true; return 0;
+    }
+    if (StrEqProc(relPath, "net/dev"))
+    {
+        st->size = 0; st->isDir = false; return 0;
     }
 
     // PID paths

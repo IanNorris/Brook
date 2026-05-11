@@ -165,6 +165,12 @@ struct NetIf {
     void (*poll)(NetIf* nif);
 
     void* driverPriv;     // driver-specific state
+
+    // Per-interface traffic counters (updated by stack, not driver)
+    volatile uint64_t rxBytes;
+    volatile uint64_t txBytes;
+    volatile uint32_t rxPackets;
+    volatile uint32_t txPackets;
 };
 
 // ---------------------------------------------------------------------------
