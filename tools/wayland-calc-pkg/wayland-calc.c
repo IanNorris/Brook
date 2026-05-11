@@ -343,13 +343,19 @@ static void draw_digit(int x, int y, int w, int h, int digit, uint32_t on) {
 
 static void draw_digit_string(int x, int y, int dw, int dh, int gap,
                                  const char *s, uint32_t on) {
+    int t = dh / 14; if (t < 1) t = 1;
+    int sw = dw - 2 * t;
+    int sh = (dh - 3 * t) / 2;
     for (; *s; s++) {
         if (*s >= '0' && *s <= '9') {
             draw_digit(x, y, dw, dh, *s - '0', on);
             x += dw + gap;
         } else if (*s == '.') {
-            fill_rect(x, y + dh - 4, 4, 4, on);
-            x += 4 + gap;
+            fill_rect(x, y + dh - t - 1, t + 1, t + 1, on);
+            x += t + 1 + gap;
+        } else if (*s == '-') {
+            fill_rect(x + t, y + t + sh, sw, t, on);
+            x += dw + gap;
         } else {
             x += dw + gap;
         }
@@ -621,11 +627,24 @@ static void render_calculator(void) {
     for (int i = 0; i < n_digits; i++)
         draw_digit(sx + i * (digit_w + gap), sy, digit_w, digit_h, 8, COL_DIGIT_DIM);
 
-    /* Show the current display value. */
+    /* Show the current display value, right-aligned. */
     const char *value = g_display;
-    int vw = (int)strlen(value) * digit_w + ((int)strlen(value) - 1) * gap;
-    int vx = dx + dw - vw - 8;
-    draw_digit_string(vx, sy, digit_w, digit_h, gap, value, COL_DIGIT);
+    {
+        /* Compute rendered width — digits and minus are digit_w, dots are smaller */
+        int t = digit_h / 14; if (t < 1) t = 1;
+        int vw = 0;
+        int nch = 0;
+        for (const char *p = value; *p; p++) {
+            if (*p == '.')
+                vw += t + 1;
+            else
+                vw += digit_w;
+            nch++;
+        }
+        if (nch > 1) vw += (nch - 1) * gap;
+        int vx = dx + dw - vw - 8;
+        draw_digit_string(vx, sy, digit_w, digit_h, gap, value, COL_DIGIT);
+    }
 
     /* Button grid: 4 cols x 5 rows below the display. */
     int gy0 = dy + dh + 8;
