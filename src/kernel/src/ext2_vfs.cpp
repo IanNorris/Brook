@@ -241,7 +241,7 @@ struct Ext2DirentCacheEntry {
     char     name[EXT2_DIRENT_CACHE_NAMELEN];
 };
 
-static constexpr uint32_t EXT2_OPS_PER_AUTO_SYNC = 64;
+static constexpr uint32_t EXT2_OPS_PER_AUTO_SYNC = 256;
 
 // Per-open-file state
 struct Ext2FilePriv {
