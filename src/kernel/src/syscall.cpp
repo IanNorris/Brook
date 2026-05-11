@@ -7438,6 +7438,66 @@ static int64_t DoReadlink(const char* path, uint64_t bufAddr, uint64_t bufsiz)
         return static_cast<int64_t>(slen);
     }
 
+    // /proc/self/fd/N or /proc/PID/fd/N → return fd target path
+    {
+        uint16_t pid = 0;
+        int fdNum = -1;
+        const char* p = path;
+
+        if (p[0] == '/' && p[1] == 'p' && p[2] == 'r' && p[3] == 'o' &&
+            p[4] == 'c' && p[5] == '/')
+        {
+            p += 6;
+            // "self/fd/N" or "PID/fd/N"
+            if (p[0] == 's' && p[1] == 'e' && p[2] == 'l' && p[3] == 'f' && p[4] == '/') {
+                Process* proc = ProcessCurrent();
+                if (proc) pid = proc->pid;
+                p += 5;
+            } else {
+                while (*p >= '0' && *p <= '9') { pid = pid * 10 + (*p - '0'); p++; }
+                if (*p == '/') p++;
+            }
+
+            if (p[0] == 'f' && p[1] == 'd' && p[2] == '/') {
+                p += 3;
+                fdNum = 0;
+                while (*p >= '0' && *p <= '9') { fdNum = fdNum * 10 + (*p - '0'); p++; }
+                if (*p == '\0' && pid > 0 && fdNum >= 0) {
+                    FdSnapshot fdSnap = {};
+                    if (SchedulerGetFdInfo(pid, fdNum, &fdSnap)) {
+                        uint64_t slen = 0;
+                        while (fdSnap.path[slen]) slen++;
+                        if (slen > bufsiz) slen = bufsiz;
+                        if (!CopyToUser(bufAddr, fdSnap.path, slen)) return -EFAULT;
+                        return static_cast<int64_t>(slen);
+                    }
+                }
+            }
+        }
+    }
+
+    // /proc/PID/exe → return executable path for any process
+    {
+        const char* p = path;
+        if (p[0] == '/' && p[1] == 'p' && p[2] == 'r' && p[3] == 'o' &&
+            p[4] == 'c' && p[5] == '/')
+        {
+            p += 6;
+            uint16_t pid = 0;
+            while (*p >= '0' && *p <= '9') { pid = pid * 10 + (*p - '0'); p++; }
+            if (*p == '/' && p[1] == 'e' && p[2] == 'x' && p[3] == 'e' && p[4] == '\0' && pid > 0) {
+                ProcessSnapshot snap = {};
+                if (SchedulerSnapshotProcess(pid, &snap) && snap.exePath[0]) {
+                    uint64_t slen = 0;
+                    while (snap.exePath[slen]) slen++;
+                    if (slen > bufsiz) slen = bufsiz;
+                    if (!CopyToUser(bufAddr, snap.exePath, slen)) return -EFAULT;
+                    return static_cast<int64_t>(slen);
+                }
+            }
+        }
+    }
+
     // Try VFS readlink for real symlinks
     char linkTarget[1024];
     uint64_t cap = (bufsiz < sizeof(linkTarget)) ? bufsiz : sizeof(linkTarget);
