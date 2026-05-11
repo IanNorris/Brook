@@ -1730,6 +1730,21 @@ static void TcpStatsMaybeFlush()
     extern volatile uint64_t g_lapicTickCount;
     uint64_t now = g_lapicTickCount;
     if (g_tcpStatsLastTick == 0) g_tcpStatsLastTick = now;
+
+    // Flush delayed ACKs every call (~each packet) if >40ms old.
+    // This ensures sparse-traffic sockets don't hold an ACK indefinitely.
+    static constexpr uint64_t DELAYED_ACK_MS = 40;
+    for (uint32_t i = 0; i < MAX_SOCKETS; i++) {
+        if (!g_sockUsed[i]) continue;
+        Socket& s = g_sockets[i];
+        if (s.type != SOCK_STREAM) continue;
+        if (s.tcpUnackedSegs == 0) continue;
+        if (now - s.tcpLastDataTick >= DELAYED_ACK_MS) {
+            s.tcpUnackedSegs = 0;
+            TcpSendSegment(s, TCP_ACK, nullptr, 0, "delayed-ack-timer");
+        }
+    }
+
     if (now - g_tcpStatsLastTick < 5000) return;
     if (g_tcpStats.txPkts == 0 && g_tcpStats.rxPkts == 0) {
         g_tcpStatsLastTick = now;
@@ -1900,13 +1915,14 @@ static void TcpSendSegmentAtSeq(Socket& s, uint32_t seq, uint8_t flags,
                                 const void* data, uint32_t dataLen,
                                 const char* why)
 {
-    // SYN packets include MSS option (4 bytes): kind=2, len=2, mss=1460
+    // SYN packets include MSS option (4 bytes) + Window Scale option (3+1 bytes)
     // This makes us look like a real Linux client and avoids CDNs defaulting
     // to MSS=536 (which some servers use as a signal to reject the connection).
     static constexpr uint16_t TCP_OPT_MSS = 1460;
-    bool addMss = (flags & TCP_SYN) && !(flags & TCP_ACK); // SYN only, not SYN-ACK
+    bool isSyn = (flags & TCP_SYN) && !(flags & TCP_ACK); // SYN only, not SYN-ACK
 
-    uint32_t optLen  = addMss ? 4 : 0;   // MSS option is 4 bytes
+    // SYN options: MSS(4) + NOP(1) + WScale(3) = 8 bytes (word-aligned)
+    uint32_t optLen  = isSyn ? 8 : 0;
     uint32_t tcpLen  = sizeof(TcpHeader) + optLen + dataLen;
     alignas(16) uint8_t buf[ETH_MTU];
     NetMemset(buf, 0, tcpLen);
@@ -1918,21 +1934,29 @@ static void TcpSendSegmentAtSeq(Socket& s, uint32_t seq, uint8_t flags,
     tcp->ackNum   = htonl(s.tcpRcvNxt);
     tcp->dataOff  = ((sizeof(TcpHeader) + optLen) / 4) << 4;
     tcp->flags    = flags;
-    // Advertise actual free space to prevent the sender from overflowing our buffer
+    // Advertise actual free space, scaled by our window scale factor
     {
         uint32_t freeSpace = TcpReceiveFree(s);
-        uint16_t wnd = freeSpace > 65535u ? 65535u : static_cast<uint16_t>(freeSpace);
+        uint32_t scaled = freeSpace >> s.tcpRcvWndScale;
+        uint16_t wnd = scaled > 65535u ? 65535u : static_cast<uint16_t>(scaled);
         tcp->window = htons(wnd);
     }
     tcp->urgentPtr = 0;
 
-    // Write MSS option immediately after the TCP header (SYN only)
-    if (addMss) {
+    // Write TCP options for SYN: MSS + NOP + Window Scale
+    if (isSyn) {
         uint8_t* opts = buf + sizeof(TcpHeader);
-        opts[0] = 2;                                          // kind: MSS
-        opts[1] = 4;                                          // length: 4 bytes
-        opts[2] = static_cast<uint8_t>(TCP_OPT_MSS >> 8);    // MSS high byte
-        opts[3] = static_cast<uint8_t>(TCP_OPT_MSS & 0xFF);  // MSS low byte
+        // MSS option (kind=2, len=4, value=1460)
+        opts[0] = 2;
+        opts[1] = 4;
+        opts[2] = static_cast<uint8_t>(TCP_OPT_MSS >> 8);
+        opts[3] = static_cast<uint8_t>(TCP_OPT_MSS & 0xFF);
+        // NOP padding (kind=1)
+        opts[4] = 1;
+        // Window Scale option (kind=3, len=3, shift=tcpRcvWndScale)
+        opts[5] = 3;
+        opts[6] = 3;
+        opts[7] = s.tcpRcvWndScale;
     }
 
     if (data && dataLen > 0)
@@ -2014,8 +2038,29 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
 
         SpinLockAcquire(&s.lock);
 
-        // Update peer's advertised window
-        s.tcpSndWnd = window;
+        // Parse TCP options from SYN-ACK to extract window scale (RFC 1323)
+        if ((flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK) &&
+            s.tcpState == TcpState::SynSent) {
+            const uint8_t* optPtr = static_cast<const uint8_t*>(payload) + sizeof(TcpHeader);
+            const uint8_t* optEnd = static_cast<const uint8_t*>(payload) + dataOff;
+            while (optPtr < optEnd) {
+                uint8_t kind = *optPtr;
+                if (kind == 0) break;
+                if (kind == 1) { optPtr++; continue; }
+                if (optPtr + 1 >= optEnd) break;
+                uint8_t optLength = optPtr[1];
+                if (optLength < 2 || optPtr + optLength > optEnd) break;
+                if (kind == 3 && optLength == 3) // Window Scale
+                    s.tcpSndWndScale = optPtr[2] > 14 ? 14 : optPtr[2];
+                optPtr += optLength;
+            }
+        }
+
+        // Update peer's advertised window (apply scale for non-SYN segments)
+        if (flags & TCP_SYN)
+            s.tcpSndWnd = window;
+        else
+            s.tcpSndWnd = static_cast<uint32_t>(window) << s.tcpSndWndScale;
 
         // Log TCP segments — per-socket counter so each new connection gets
         // fresh verbose logging (the old global static went silent after 3
@@ -2074,11 +2119,25 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
 
         SpinLockRelease(&s.lock);
 
-        // Send ACK outside the lock — TcpSendSegment is not re-entrant under
-        // s.lock and may acquire other locks (e.g. TX queue).
-        if (act.sendAck || bufferWasFull)
-            TcpSendSegment(s, TCP_ACK, nullptr, 0,
-                           bufferWasFull ? "rx-bufferfull" : "rx-action");
+        // Delayed ACK: ACK every 2nd data segment, or immediately for
+        // control events (FIN, OOO, buffer-full, connect). This halves
+        // the ACK packet count for bulk downloads.
+        bool mustAckNow = bufferWasFull
+                          || act.justConnected
+                          || s.tcpFinRecv
+                          || act.holdOooData   // gap detected — dup-ACK for fast retransmit
+                          || !act.enqueueData; // pure ACK / control segment
+        if (act.sendAck) {
+            if (mustAckNow || s.tcpUnackedSegs >= 1) {
+                TcpSendSegment(s, TCP_ACK, nullptr, 0,
+                               bufferWasFull ? "rx-bufferfull" : "rx-action");
+                s.tcpUnackedSegs = 0;
+            } else {
+                s.tcpUnackedSegs++;
+                if (s.tcpUnackedSegs == 1)
+                    s.tcpLastDataTick = g_lapicTickCount;
+            }
+        }
 
         // Wake the waiter outside the lock — SchedulerUnblock may need the
         // scheduler lock which must not be acquired while holding s.lock.
@@ -2235,6 +2294,9 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
     s.tcpRstRecv = false;
     s.connectError = 0;
     s.tcpSndWnd  = 65535; // assume full window until server tells us otherwise
+    s.tcpSndWndScale = 0; // no peer scale until SYN-ACK parsed
+    // Window scale: RX_BUF_SIZE=512KB needs shift 3 (÷8) to fit in uint16_t
+    s.tcpRcvWndScale = 3;
     s.tcpState = TcpState::SynSent;
 
     // Send SYN
@@ -2716,6 +2778,8 @@ static void DebugChannelThreadFn(void* /*arg*/)
     s.tcpFinRecv = false;
     s.tcpRstRecv = false;
     s.tcpSndWnd  = 65535;
+    s.tcpSndWndScale = 0;
+    s.tcpRcvWndScale = 3;
     s.tcpState   = TcpState::SynSent;
 
     TcpSendSegment(s, TCP_SYN, nullptr, 0, "connect-poll");
