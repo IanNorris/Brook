@@ -47,6 +47,7 @@ static int memfd_create_shim(const char *name, unsigned int flags) {
 #define STRIDE (WIN_W * BPP)
 
 /* Layout */
+#define TOOLBAR_H    30    /* toolbar/address bar height */
 #define TREE_W       280   /* left pane width */
 #define DIVIDER_W    2
 #define LIST_X       (TREE_W + DIVIDER_W)
@@ -54,11 +55,14 @@ static int memfd_create_shim(const char *name, unsigned int flags) {
 #define STATUS_H     28    /* status bar height */
 #define HEADER_H     30    /* column header height */
 #define ROW_H        24    /* row height */
+#define PANES_TOP    TOOLBAR_H
 #define CONTENT_H    (WIN_H - STATUS_H)
 
 /* Colours (ARGB8888) */
 #define COL_BG          0xFF1E1E2E   /* dark background */
 #define COL_TREE_BG     0xFF181825   /* tree pane bg */
+#define COL_TOOLBAR_BG  0xFF11111B   /* toolbar bg */
+#define COL_TOOLBAR_BTN 0xFF313244   /* toolbar button bg */
 #define COL_HEADER_BG   0xFF313244   /* column header */
 #define COL_STATUS_BG   0xFF313244   /* status bar */
 #define COL_DIVIDER     0xFF45475A   /* pane divider */
@@ -579,25 +583,49 @@ static void render(void) {
     /* Clear background */
     fill_rect(0, 0, WIN_W, WIN_H, COL_BG);
 
+    /* --- Toolbar / Address bar --- */
+    fill_rect(0, 0, WIN_W, TOOLBAR_H, COL_TOOLBAR_BG);
+    int tb_vpad = (TOOLBAR_H - CHAR_H) / 2;
+
+    /* Back button */
+    fill_rect(4, 4, CHAR_W * 2 + 8, TOOLBAR_H - 8, COL_TOOLBAR_BTN);
+    draw_text(8, tb_vpad, "<-", COL_TEXT);
+
+    /* Home button */
+    fill_rect(CHAR_W * 2 + 16, 4, CHAR_W * 2 + 8, TOOLBAR_H - 8, COL_TOOLBAR_BTN);
+    draw_char(CHAR_W * 2 + 20, tb_vpad, '~', COL_TEXT);
+
+    /* Refresh button */
+    fill_rect(CHAR_W * 4 + 28, 4, CHAR_W + 8, TOOLBAR_H - 8, COL_TOOLBAR_BTN);
+    draw_char(CHAR_W * 4 + 32, tb_vpad, 'R', COL_TEXT);
+
+    /* Path display */
+    int path_x = CHAR_W * 5 + 44;
+    draw_text_clipped(path_x, tb_vpad, g_cwd, COL_TEXT, WIN_W - path_x - 8);
+
+    /* Pane origins shifted down by toolbar */
+    int pane_top = PANES_TOP;
+
     /* Tree pane background */
-    fill_rect(0, 0, TREE_W, CONTENT_H, COL_TREE_BG);
+    fill_rect(0, pane_top, TREE_W, CONTENT_H - pane_top, COL_TREE_BG);
 
     /* Divider */
-    fill_rect(TREE_W, 0, DIVIDER_W, WIN_H, COL_DIVIDER);
+    fill_rect(TREE_W, pane_top, DIVIDER_W, WIN_H - pane_top, COL_DIVIDER);
 
     /* Text vertical centering within ROW_H */
     int text_vpad = (ROW_H - CHAR_H) / 2;
     int hdr_vpad  = (HEADER_H - CHAR_H) / 2;
 
     /* --- Tree pane --- */
-    int tree_visible = (CONTENT_H - HEADER_H) / ROW_H;
+    int tree_area_h = CONTENT_H - pane_top - HEADER_H;
+    int tree_visible = tree_area_h / ROW_H;
     /* Tree header */
-    fill_rect(0, 0, TREE_W, HEADER_H, COL_HEADER_BG);
-    draw_text(8, hdr_vpad, "Folders", COL_TEXT);
+    fill_rect(0, pane_top, TREE_W, HEADER_H, COL_HEADER_BG);
+    draw_text(8, pane_top + hdr_vpad, "Folders", COL_TEXT);
 
     for (int i = 0; i < g_tree_count && i < tree_visible; i++) {
         TreeNode *n = &g_tree[i];
-        int y = HEADER_H + i * ROW_H;
+        int y = pane_top + HEADER_H + i * ROW_H;
 
         /* Selection highlight */
         if (i == g_tree_selected && g_active_pane == 0)
@@ -618,12 +646,13 @@ static void render(void) {
 
     /* --- File list pane --- */
     /* Column header */
-    fill_rect(LIST_X, 0, LIST_W, HEADER_H, COL_HEADER_BG);
-    draw_text(LIST_X + 8, hdr_vpad, "Name", COL_TEXT);
-    draw_text(LIST_X + LIST_W - 200, hdr_vpad, "Size", COL_TEXT);
-    draw_text(LIST_X + LIST_W - 120, hdr_vpad, "Modified", COL_TEXT);
+    fill_rect(LIST_X, pane_top, LIST_W, HEADER_H, COL_HEADER_BG);
+    draw_text(LIST_X + 8, pane_top + hdr_vpad, "Name", COL_TEXT);
+    draw_text(LIST_X + LIST_W - 200, pane_top + hdr_vpad, "Size", COL_TEXT);
+    draw_text(LIST_X + LIST_W - 120, pane_top + hdr_vpad, "Modified", COL_TEXT);
 
-    int list_visible = (CONTENT_H - HEADER_H) / ROW_H;
+    int list_area_h = CONTENT_H - pane_top - HEADER_H;
+    int list_visible = list_area_h / ROW_H;
 
     /* Ensure selected is visible */
     if (g_selected < g_scroll_offset) g_scroll_offset = g_selected;
@@ -636,7 +665,7 @@ static void render(void) {
         if (idx >= g_entry_count) break;
 
         FileEntry *e = &g_entries[idx];
-        int y = HEADER_H + vi * ROW_H;
+        int y = pane_top + HEADER_H + vi * ROW_H;
 
         /* Selection highlight */
         if (idx == g_selected && g_active_pane == 1)
@@ -908,10 +937,34 @@ static void on_ptr_button(void *d, struct wl_pointer *p, uint32_t serial,
     if (state != 1 || button != 0x110 /* BTN_LEFT */) return;
 
     int mx = (int)g_ptr_x, my = (int)g_ptr_y;
+    int pane_top = PANES_TOP;
+    int content_top = pane_top + HEADER_H;
 
-    if (mx < TREE_W && my >= HEADER_H && my < CONTENT_H) {
+    /* Click in toolbar area */
+    if (my < pane_top) {
+        /* Back button: x=4..4+CHAR_W*2+8 */
+        if (mx >= 4 && mx < 4 + CHAR_W * 2 + 8) {
+            navigate_up();
+            g_needs_redraw = 1;
+        }
+        /* Home button */
+        else if (mx >= CHAR_W * 2 + 16 && mx < CHAR_W * 4 + 24) {
+            strncpy(g_cwd, "/", sizeof(g_cwd));
+            scan_directory();
+            g_needs_redraw = 1;
+        }
+        /* Refresh button */
+        else if (mx >= CHAR_W * 4 + 28 && mx < CHAR_W * 5 + 36) {
+            scan_directory();
+            g_needs_redraw = 1;
+        }
+        g_last_click_time = time;
+        return;
+    }
+
+    if (mx < TREE_W && my >= content_top && my < CONTENT_H) {
         /* Click in tree pane */
-        int row = (my - HEADER_H) / ROW_H;
+        int row = (my - content_top) / ROW_H;
         if (row >= 0 && row < g_tree_count) {
             g_active_pane = 0;
             if (row == g_tree_selected &&
@@ -924,9 +977,9 @@ static void on_ptr_button(void *d, struct wl_pointer *p, uint32_t serial,
         }
         g_last_click_time = time;
         g_last_click_row = -1;
-    } else if (mx > LIST_X && my >= HEADER_H && my < CONTENT_H) {
+    } else if (mx > LIST_X && my >= content_top && my < CONTENT_H) {
         /* Click in list pane */
-        int row = (my - HEADER_H) / ROW_H + g_scroll_offset;
+        int row = (my - content_top) / ROW_H + g_scroll_offset;
         if (row >= 0 && row < g_entry_count) {
             g_active_pane = 1;
             if (row == g_last_click_row &&
