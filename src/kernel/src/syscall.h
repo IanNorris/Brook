@@ -222,6 +222,8 @@ void EventFdHandleRef(void* handle);
 void EpollFdHandleRef(void* handle);
 void TimerFdHandleRef(void* handle);
 void UnixSocketHandleRef(void* handle);
+void DspHandleRef(void* handle);
+void* DevKlogDeepCopy(void* handle);
 int64_t CloseProcessFd(Process* proc, int fd);
 
 // Switch to user mode.

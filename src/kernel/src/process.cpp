@@ -1341,6 +1341,14 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
             // Increment unix socket refcount for the child's copy
             if (parent->fds[i].type == FdType::UnixSocket && parent->fds[i].handle)
                 UnixSocketHandleRef(parent->fds[i].handle);
+
+            // Increment DevDsp refcount for the child's copy
+            if (parent->fds[i].type == FdType::DevDsp && parent->fds[i].handle)
+                brook::DspHandleRef(parent->fds[i].handle);
+
+            // Deep-copy DevKlog cursor so parent/child have independent positions
+            if (parent->fds[i].type == FdType::DevKlog && parent->fds[i].handle)
+                child->fds[i].handle = brook::DevKlogDeepCopy(parent->fds[i].handle);
         }
     }
 

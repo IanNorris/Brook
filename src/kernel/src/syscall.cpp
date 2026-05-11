@@ -659,6 +659,36 @@ void EventFdHandleRef(void* handle) { EventFdRef(static_cast<EventFdData*>(handl
 void EpollFdHandleRef(void* handle) { EpollFdRef(static_cast<EpollInstance*>(handle)); }
 void TimerFdHandleRef(void* handle) { TimerFdRef(static_cast<TimerFdData*>(handle)); }
 
+// DspState defined here so DspHandleRef can access refCount.
+// /dev/dsp ioctl constants and handling code are further below.
+struct DspState {
+    uint32_t sampleRate;
+    uint8_t  channels;
+    uint8_t  bitsPerSample;
+    uint16_t fragmentSize;   // bytes per fragment
+    uint32_t bufferOffset;   // write cursor into staging buffer
+    uint8_t* buffer;         // staging buffer (kmalloc'd)
+    uint32_t bufferSize;     // total staging buffer size
+    uint32_t mixerStreamId;  // mixer stream slot (0-7)
+    uint32_t refCount;       // fork-safe refcount (1 on creation)
+};
+
+void DspHandleRef(void* handle)
+{
+    if (!handle) return;
+    auto* dsp = static_cast<DspState*>(handle);
+    __atomic_fetch_add(&dsp->refCount, 1, __ATOMIC_ACQ_REL);
+}
+
+void* DevKlogDeepCopy(void* handle)
+{
+    if (!handle) return nullptr;
+    auto* src = static_cast<uint64_t*>(handle);
+    auto* dst = static_cast<uint64_t*>(kmalloc(sizeof(uint64_t)));
+    if (dst) *dst = *src;
+    return dst;
+}
+
 // Demand-page a memfd-backed user mapping. Called from the user #PF path
 // in idt.cpp before the kill flow. Returns true if the fault was on a
 // memfd VMA and was successfully resolved (PTE installed).
@@ -1325,17 +1355,7 @@ static constexpr int AFMT_S16_LE = 0x00000010;
 // OSS capabilities
 static constexpr int DSP_CAP_TRIGGER = 0x00000010;
 
-// Per-fd audio device state
-struct DspState {
-    uint32_t sampleRate;
-    uint8_t  channels;
-    uint8_t  bitsPerSample;
-    uint16_t fragmentSize;   // bytes per fragment
-    uint32_t bufferOffset;   // write cursor into staging buffer
-    uint8_t* buffer;         // staging buffer (kmalloc'd)
-    uint32_t bufferSize;     // total staging buffer size
-    uint32_t mixerStreamId;  // mixer stream slot (0-7)
-};
+// DspState is defined earlier in the file (near DspHandleRef).
 
 static constexpr uint32_t DSP_DEFAULT_RATE     = 44100;
 static constexpr uint8_t  DSP_DEFAULT_CHANNELS = 2;
@@ -2547,6 +2567,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         dsp->bufferOffset  = 0;
         dsp->bufferSize    = DSP_BUFFER_SIZE;
         dsp->mixerStreamId = s_nextMixerStream++ % 8;
+        dsp->refCount      = 1;
         dsp->buffer        = static_cast<uint8_t*>(kmalloc(DSP_BUFFER_SIZE));
         if (!dsp->buffer) { kfree(dsp); return -ENOMEM; }
         int fd = FdAlloc(proc, FdType::DevDsp, dsp);
@@ -2856,14 +2877,21 @@ int64_t CloseProcessFd(Process* proc, int fd)
     if (fde->type == FdType::DevDsp && fde->handle)
     {
         auto* dsp = static_cast<DspState*>(fde->handle);
-        // Stop any in-flight playback — don't block on flush during teardown
-        AudioStop();
-        kfree(dsp->buffer);
-        kfree(dsp);
+        uint32_t prev = __atomic_fetch_sub(&dsp->refCount, 1, __ATOMIC_ACQ_REL);
+        if (prev <= 1)
+        {
+            AudioStop();
+            kfree(dsp->buffer);
+            kfree(dsp);
+        }
     }
 
     if (fde->type == FdType::DevKlog && fde->handle)
-        kfree(fde->handle); // free the cursor
+    {
+        // DevKlog handle is a bare uint64_t* cursor — no refcount, just free.
+        // Fork deep-copies it, so each process owns its own cursor.
+        kfree(fde->handle);
+    }
 
     FdFree(proc, fd);
     return 0;
@@ -2988,6 +3016,9 @@ static void FdBumpRefcount(FdEntry* fde)
         __atomic_fetch_add(&usd->refCount, 1, __ATOMIC_RELEASE);
         break;
     }
+    case FdType::DevDsp:
+        __atomic_fetch_add(&static_cast<DspState*>(fde->handle)->refCount, 1, __ATOMIC_ACQ_REL);
+        break;
     default:
         break;
     }
@@ -3012,6 +3043,10 @@ static int64_t sys_dup(uint64_t oldfd, uint64_t, uint64_t,
         proc->fds[newfd].dirPath[i] = old->dirPath[i];
 
     FdBumpRefcount(&proc->fds[newfd]);
+
+    // DevKlog has no refcount — deep-copy the cursor
+    if (proc->fds[newfd].type == FdType::DevKlog && proc->fds[newfd].handle)
+        proc->fds[newfd].handle = DevKlogDeepCopy(proc->fds[newfd].handle);
 
     return newfd;
 }
@@ -3044,6 +3079,10 @@ static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd, uint64_t,
         proc->fds[newfd].dirPath[i] = old->dirPath[i];
 
     FdBumpRefcount(&proc->fds[newfd]);
+
+    // DevKlog has no refcount — deep-copy the cursor
+    if (proc->fds[newfd].type == FdType::DevKlog && proc->fds[newfd].handle)
+        proc->fds[newfd].handle = DevKlogDeepCopy(proc->fds[newfd].handle);
 
     return static_cast<int64_t>(newfd);
 }
