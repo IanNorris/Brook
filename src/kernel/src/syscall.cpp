@@ -8215,16 +8215,65 @@ static int64_t sys_memfd_create(uint64_t nameAddr, uint64_t flags,
 static int64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd, uint64_t offsetAddr,
                              uint64_t count, uint64_t, uint64_t)
 {
-    (void)offsetAddr;
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
     FdEntry* in_fde = FdGet(proc, static_cast<int>(in_fd));
     FdEntry* out_fde = FdGet(proc, static_cast<int>(out_fd));
     if (!in_fde || !out_fde) return -EBADF;
 
-    // Simple implementation: read from in_fd, write to out_fd via syscalls
-    // For now, just return 0 (no bytes transferred) — apps will fallback to read+write
-    return 0;
+    // Read optional offset
+    uint64_t offset = in_fde->seekPos;
+    bool useExplicitOffset = false;
+    if (offsetAddr)
+    {
+        if (!UserBufferReadable(offsetAddr, 8)) return -EFAULT;
+        offset = *reinterpret_cast<uint64_t*>(offsetAddr);
+        useExplicitOffset = true;
+    }
+
+    if (count > 256 * 1024) count = 256 * 1024; // cap at 256KB per call
+
+    // Allocate kernel bounce buffer
+    uint32_t chunkSize = count > 4096 ? 4096 : static_cast<uint32_t>(count);
+    auto* bounce = static_cast<uint8_t*>(kmalloc(chunkSize));
+    if (!bounce) return -ENOMEM;
+
+    int64_t totalSent = 0;
+    while (static_cast<uint64_t>(totalSent) < count)
+    {
+        uint32_t toRead = chunkSize;
+        if (static_cast<uint64_t>(totalSent) + toRead > count)
+            toRead = static_cast<uint32_t>(count - totalSent);
+
+        // Read from input fd
+        int rd = -1;
+        if (in_fde->type == FdType::Vnode && in_fde->handle)
+        {
+            rd = VfsRead(static_cast<Vnode*>(in_fde->handle), bounce, toRead, &offset);
+        }
+        if (rd <= 0) break;
+
+        // Write to output fd
+        uint64_t woff = out_fde->seekPos;
+        int wr = -1;
+        if (out_fde->type == FdType::Vnode && out_fde->handle)
+        {
+            wr = VfsWrite(static_cast<Vnode*>(out_fde->handle), bounce, rd, &woff);
+            if (wr > 0) out_fde->seekPos = woff;
+        }
+        if (wr <= 0) break;
+
+        totalSent += wr;
+        if (wr < rd) break; // partial write — stop
+    }
+
+    if (!useExplicitOffset)
+        in_fde->seekPos = offset;
+    else if (offsetAddr)
+        *reinterpret_cast<uint64_t*>(offsetAddr) = offset;
+
+    kfree(bounce);
+    return totalSent > 0 ? totalSent : (totalSent == 0 && count > 0 ? 0 : -EIO);
 }
 
 // ---------------------------------------------------------------------------
@@ -8234,9 +8283,36 @@ static int64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd, uint64_t offsetAddr
 static int64_t sys_getrusage(uint64_t who, uint64_t usageAddr, uint64_t,
                               uint64_t, uint64_t, uint64_t)
 {
-    (void)who;
     if (!UserBufferWritable(usageAddr, 144)) return -EFAULT;
-    __builtin_memset(reinterpret_cast<void*>(usageAddr), 0, 144); // sizeof(struct rusage)
+    __builtin_memset(reinterpret_cast<void*>(usageAddr), 0, 144);
+
+    Process* proc = ProcessCurrent();
+    if (!proc) return 0;
+
+    // struct rusage: first two fields are struct timeval (utime, stime)
+    // timeval = { int64_t tv_sec; int64_t tv_usec; }
+    auto* ru = reinterpret_cast<int64_t*>(usageAddr);
+
+    uint64_t uticks = proc->userTicks;
+    uint64_t sticks = proc->sysTicks;
+
+    if (who == 0) // RUSAGE_SELF
+    {
+        ru[0] = static_cast<int64_t>(uticks / 1000);        // utime.tv_sec
+        ru[1] = static_cast<int64_t>((uticks % 1000) * 1000); // utime.tv_usec
+        ru[2] = static_cast<int64_t>(sticks / 1000);        // stime.tv_sec
+        ru[3] = static_cast<int64_t>((sticks % 1000) * 1000); // stime.tv_usec
+    }
+    // RUSAGE_CHILDREN (-1) — we include reaped ticks
+    else if (who == static_cast<uint64_t>(-1ULL))
+    {
+        uint64_t reapedUser = 0, reapedSys = 0;
+        SchedulerGetReapedTicks(reapedUser, reapedSys);
+        ru[0] = static_cast<int64_t>(reapedUser / 1000);
+        ru[1] = static_cast<int64_t>((reapedUser % 1000) * 1000);
+        ru[2] = static_cast<int64_t>(reapedSys / 1000);
+        ru[3] = static_cast<int64_t>((reapedSys % 1000) * 1000);
+    }
     return 0;
 }
 
@@ -8275,10 +8351,18 @@ static int64_t sys_sysinfo(uint64_t infoAddr, uint64_t, uint64_t,
     info->totalram = totalPages * 4096;
     info->freeram  = freePages  * 4096;
 
-    // Count running processes
-    ProcessSnapshot snaps[MAX_PROCESSES];
-    uint32_t count = SchedulerSnapshotProcesses(snaps, MAX_PROCESSES);
-    info->procs = static_cast<uint16_t>(count);
+    // Count running processes and set load averages
+    uint32_t total = 0, running = 0;
+    SchedulerGetProcessCounts(total, running);
+    info->procs = static_cast<uint16_t>(total);
+
+    // Load averages: Linux uses SI_LOAD_SHIFT=16, values are fixed-point << 16
+    uint32_t avg1, avg5, avg15;
+    SchedulerGetLoadAvg(avg1, avg5, avg15);
+    // Our values are * 1000; Linux expects * 65536. Convert: (val * 65536) / 1000
+    info->loads[0] = static_cast<uint64_t>(avg1) * 65536 / 1000;
+    info->loads[1] = static_cast<uint64_t>(avg5) * 65536 / 1000;
+    info->loads[2] = static_cast<uint64_t>(avg15) * 65536 / 1000;
 
     info->mem_unit = 1;
     return 0;
