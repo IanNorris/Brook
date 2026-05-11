@@ -3004,7 +3004,11 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
     else if (NetStrEq(cmd, "procs")) {
         extern uint32_t SchedulerSnapshotProcesses(ProcessSnapshot* out, uint32_t maxCount);
 
-        ProcessSnapshot snaps[MAX_PROCESSES];
+        auto* snaps = static_cast<ProcessSnapshot*>(kmalloc(MAX_PROCESSES * sizeof(ProcessSnapshot)));
+        if (!snaps) {
+            DebugChannelSend("procs: out of memory\n");
+            return;
+        }
         uint32_t count = SchedulerSnapshotProcesses(snaps, MAX_PROCESSES);
 
         char buf[128];
@@ -3029,6 +3033,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         }
         const char* done = "---\n";
         SockSend(g_debugSockIdx, done, 4);
+        kfree(snaps);
     }
 
     // -----------------------------------------------------------------------
