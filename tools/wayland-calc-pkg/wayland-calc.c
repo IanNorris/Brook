@@ -1,15 +1,17 @@
 /*
- * wayland-calc.c — Brook-native Wayland "calculator" client.
+ * wayland-calc.c -- Brook-native Wayland calculator.
  *
- * Renders a static calculator-face UI (display + 4x5 button grid) into
- * a 240x320 wl_shm buffer, attaches it to an xdg_toplevel, and stays
- * mapped for a few seconds so it's visible on the framebuffer.
+ * Fully interactive calculator with mouse and keyboard input.
+ * Renders a 240x320 UI (display + 4x5 button grid) into a wl_shm buffer.
  *
- * No font/cairo/pango dependencies — buttons are coloured rects, digits
- * are simple 7-segment style polylines hand-drawn from filled rectangles.
+ * Keyboard: 0-9 digits, + - * / operators, Enter = equals, C clear,
+ *           Backspace delete, . decimal, Esc quit.
+ * Mouse: click buttons directly.
  *
- * Pure C, only depends on libwayland-client + xdg-shell-protocol. This
- * is the "any Wayland app rendering visually with low deps" target.
+ * No font/cairo/pango dependencies -- buttons are coloured rects, digits
+ * are simple 7-segment style polylines drawn from filled rectangles.
+ *
+ * Pure C, only depends on libwayland-client + xdg-shell-protocol.
  */
 
 #define _GNU_SOURCE
@@ -43,8 +45,24 @@ static struct wl_shm        *g_shm  = NULL;
 static struct wl_compositor *g_comp = NULL;
 static struct xdg_wm_base   *g_wm   = NULL;
 static struct zxdg_decoration_manager_v1 *g_deco_mgr = NULL;
+static struct wl_seat       *g_seat = NULL;
+static struct wl_keyboard   *g_kb   = NULL;
+static struct wl_pointer    *g_ptr  = NULL;
 static int g_got_configure = 0;
 static uint32_t g_configure_serial = 0;
+static int g_running = 1;
+static int g_needs_redraw = 0;
+static int g_ctrl_held = 0;
+
+/* Calculator state */
+static char g_display[32] = "0";
+static double g_accum = 0.0;
+static char g_op = 0;        /* pending operator: +, -, *, / or 0 */
+static int g_new_input = 1;  /* next digit starts fresh display */
+static int g_has_dot = 0;
+
+/* Mouse position (for button hit testing) */
+static int g_mx = -1, g_my = -1;
 
 static void on_global(void *data, struct wl_registry *reg, uint32_t name,
                        const char *iface, uint32_t version) {
@@ -60,6 +78,9 @@ static void on_global(void *data, struct wl_registry *reg, uint32_t name,
     else if (!strcmp(iface, "zxdg_decoration_manager_v1"))
         g_deco_mgr = wl_registry_bind(reg, name,
                                        &zxdg_decoration_manager_v1_interface, 1);
+    else if (!strcmp(iface, "wl_seat"))
+        g_seat = wl_registry_bind(reg, name, &wl_seat_interface,
+                                   version < 5 ? version : 5);
 }
 static void on_global_remove(void *d, struct wl_registry *r, uint32_t n) {
     (void)d; (void)r; (void)n;
@@ -106,6 +127,141 @@ static const struct xdg_toplevel_listener tl_lis = {
     .close             = on_toplevel_close,
     .configure_bounds  = on_toplevel_configure_bounds,
     .wm_capabilities   = on_toplevel_wm_capabilities,
+};
+
+/* Forward declarations for calculator logic (defined after drawing code) */
+static void calc_digit(char d);
+static void calc_dot(void);
+static void calc_clear(void);
+static void calc_backspace(void);
+static void calc_negate(void);
+static void calc_percent(void);
+static void calc_operator(char op);
+static void calc_equals(void);
+static void calc_press(const char *label);
+static const char *hit_test_button(int mx, int my);
+
+/* ----------------------- Keyboard input ----------------------------- */
+
+static void kbd_keymap(void *d, struct wl_keyboard *k, uint32_t f,
+                       int fd, uint32_t s) {
+    (void)d; (void)k; (void)f; (void)s; close(fd);
+}
+static void kbd_enter(void *d, struct wl_keyboard *k, uint32_t s,
+                      struct wl_surface *sf, struct wl_array *keys) {
+    (void)d; (void)k; (void)s; (void)sf; (void)keys;
+}
+static void kbd_leave(void *d, struct wl_keyboard *k, uint32_t s,
+                      struct wl_surface *sf) {
+    (void)d; (void)k; (void)s; (void)sf;
+}
+static void kbd_key(void *d, struct wl_keyboard *k, uint32_t serial,
+                    uint32_t time, uint32_t key, uint32_t state) {
+    (void)d; (void)k; (void)serial; (void)time;
+    if (state != 1) return;
+
+    /* evdev keycodes */
+    switch (key) {
+    case 1: /* Esc */ g_running = 0; return;
+    case 2:  calc_digit('1'); return;
+    case 3:  calc_digit('2'); return;
+    case 4:  calc_digit('3'); return;
+    case 5:  calc_digit('4'); return;
+    case 6:  calc_digit('5'); return;
+    case 7:  calc_digit('6'); return;
+    case 8:  calc_digit('7'); return;
+    case 9:  calc_digit('8'); return;
+    case 10: calc_digit('9'); return;
+    case 11: calc_digit('0'); return;
+    case 14: /* Backspace */ calc_backspace(); return;
+    case 28: /* Enter */ calc_equals(); return;
+    case 52: /* . */ calc_dot(); return;
+    case 78: /* Numpad + */ calc_operator('+'); return;
+    case 74: /* Numpad - */ calc_operator('-'); return;
+    case 55: /* Numpad * */ calc_operator('*'); return;
+    case 98: /* Numpad / */ calc_operator('/'); return;
+    case 46: /* C */ calc_clear(); return;
+    }
+    /* Shift+= is + on US layout */
+    if (key == 13 /* = */) { calc_equals(); return; }
+    /* Minus key */
+    if (key == 12) { calc_operator('-'); return; }
+}
+static void kbd_modifiers(void *d, struct wl_keyboard *k, uint32_t serial,
+                          uint32_t dep, uint32_t lat, uint32_t lock, uint32_t grp) {
+    (void)d; (void)k; (void)serial; (void)lat; (void)lock; (void)grp;
+    g_ctrl_held = (dep & 0x4) != 0;
+}
+static void kbd_repeat(void *d, struct wl_keyboard *k, int32_t r, int32_t dl) {
+    (void)d; (void)k; (void)r; (void)dl;
+}
+static const struct wl_keyboard_listener kbd_lis = {
+    .keymap = kbd_keymap, .enter = kbd_enter, .leave = kbd_leave,
+    .key = kbd_key, .modifiers = kbd_modifiers, .repeat_info = kbd_repeat,
+};
+
+/* ----------------------- Pointer input ------------------------------ */
+
+static void ptr_enter(void *d, struct wl_pointer *p, uint32_t s,
+                      struct wl_surface *sf, wl_fixed_t sx, wl_fixed_t sy) {
+    (void)d; (void)p; (void)s; (void)sf;
+    g_mx = wl_fixed_to_int(sx); g_my = wl_fixed_to_int(sy);
+}
+static void ptr_leave(void *d, struct wl_pointer *p, uint32_t s,
+                      struct wl_surface *sf) {
+    (void)d; (void)p; (void)s; (void)sf;
+    g_mx = -1; g_my = -1;
+}
+static void ptr_motion(void *d, struct wl_pointer *p, uint32_t t,
+                       wl_fixed_t sx, wl_fixed_t sy) {
+    (void)d; (void)p; (void)t;
+    g_mx = wl_fixed_to_int(sx); g_my = wl_fixed_to_int(sy);
+}
+static void ptr_button(void *d, struct wl_pointer *p, uint32_t serial,
+                       uint32_t time, uint32_t button, uint32_t state) {
+    (void)d; (void)p; (void)serial; (void)time;
+    if (state != 1 || button != 0x110 /* BTN_LEFT */) return;
+    const char *label = hit_test_button(g_mx, g_my);
+    if (label) calc_press(label);
+}
+static void ptr_axis(void *d, struct wl_pointer *p, uint32_t t,
+                     uint32_t axis, wl_fixed_t v) {
+    (void)d; (void)p; (void)t; (void)axis; (void)v;
+}
+static void ptr_frame(void *d, struct wl_pointer *p) { (void)d; (void)p; }
+static void ptr_source(void *d, struct wl_pointer *p, uint32_t s) {
+    (void)d; (void)p; (void)s;
+}
+static void ptr_stop(void *d, struct wl_pointer *p, uint32_t t, uint32_t a) {
+    (void)d; (void)p; (void)t; (void)a;
+}
+static void ptr_discrete(void *d, struct wl_pointer *p, uint32_t a, int32_t v) {
+    (void)d; (void)p; (void)a; (void)v;
+}
+static const struct wl_pointer_listener ptr_lis = {
+    .enter = ptr_enter, .leave = ptr_leave, .motion = ptr_motion,
+    .button = ptr_button, .axis = ptr_axis, .frame = ptr_frame,
+    .axis_source = ptr_source, .axis_stop = ptr_stop,
+    .axis_discrete = ptr_discrete,
+};
+
+/* Seat capabilities */
+static void seat_caps(void *d, struct wl_seat *seat, uint32_t caps) {
+    (void)d;
+    if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !g_kb) {
+        g_kb = wl_seat_get_keyboard(seat);
+        wl_keyboard_add_listener(g_kb, &kbd_lis, NULL);
+    }
+    if ((caps & WL_SEAT_CAPABILITY_POINTER) && !g_ptr) {
+        g_ptr = wl_seat_get_pointer(seat);
+        wl_pointer_add_listener(g_ptr, &ptr_lis, NULL);
+    }
+}
+static void seat_name(void *d, struct wl_seat *s, const char *n) {
+    (void)d; (void)s; (void)n;
+}
+static const struct wl_seat_listener seat_lis = {
+    .capabilities = seat_caps, .name = seat_name,
 };
 
 /* ----------------------- 2D drawing helpers ------------------------- */
@@ -279,6 +435,170 @@ static int label_width(int scale, const char *s) {
     return n * (GLYPH_W + 1) * scale - scale;
 }
 
+/* ----------------------- Calculator Logic ---------------------- */
+
+static void calc_update_display(double val) {
+    /* Format number for display: avoid trailing zeros */
+    if (val == (long long)val && val >= -9999999 && val <= 99999999)
+        snprintf(g_display, sizeof(g_display), "%lld", (long long)val);
+    else
+        snprintf(g_display, sizeof(g_display), "%.6g", val);
+}
+
+static void calc_digit(char d) {
+    if (g_new_input) {
+        g_display[0] = d;
+        g_display[1] = '\0';
+        g_new_input = 0;
+        g_has_dot = 0;
+    } else {
+        int len = (int)strlen(g_display);
+        if (len < 12) {
+            g_display[len] = d;
+            g_display[len + 1] = '\0';
+        }
+    }
+    g_needs_redraw = 1;
+}
+
+static void calc_dot(void) {
+    if (g_new_input) {
+        strcpy(g_display, "0.");
+        g_new_input = 0;
+        g_has_dot = 1;
+    } else if (!g_has_dot) {
+        int len = (int)strlen(g_display);
+        if (len < 12) {
+            g_display[len] = '.';
+            g_display[len + 1] = '\0';
+            g_has_dot = 1;
+        }
+    }
+    g_needs_redraw = 1;
+}
+
+static void calc_clear(void) {
+    strcpy(g_display, "0");
+    g_accum = 0.0;
+    g_op = 0;
+    g_new_input = 1;
+    g_has_dot = 0;
+    g_needs_redraw = 1;
+}
+
+static void calc_backspace(void) {
+    if (g_new_input) return;
+    int len = (int)strlen(g_display);
+    if (len > 1) {
+        if (g_display[len - 1] == '.') g_has_dot = 0;
+        g_display[len - 1] = '\0';
+    } else {
+        strcpy(g_display, "0");
+        g_new_input = 1;
+    }
+    g_needs_redraw = 1;
+}
+
+static void calc_negate(void) {
+    double v = atof(g_display);
+    v = -v;
+    calc_update_display(v);
+    g_new_input = 0;
+    g_needs_redraw = 1;
+}
+
+static void calc_percent(void) {
+    double v = atof(g_display);
+    v /= 100.0;
+    calc_update_display(v);
+    g_new_input = 1;
+    g_needs_redraw = 1;
+}
+
+static double calc_apply(double lhs, char op, double rhs) {
+    switch (op) {
+    case '+': return lhs + rhs;
+    case '-': return lhs - rhs;
+    case '*': return lhs * rhs;
+    case '/': return rhs != 0.0 ? lhs / rhs : 0.0;
+    default:  return rhs;
+    }
+}
+
+static void calc_operator(char op) {
+    double v = atof(g_display);
+    if (g_op && !g_new_input) {
+        g_accum = calc_apply(g_accum, g_op, v);
+        calc_update_display(g_accum);
+    } else {
+        g_accum = v;
+    }
+    g_op = op;
+    g_new_input = 1;
+    g_needs_redraw = 1;
+}
+
+static void calc_equals(void) {
+    double v = atof(g_display);
+    if (g_op) {
+        double result = calc_apply(g_accum, g_op, v);
+        calc_update_display(result);
+        g_accum = result;
+        g_op = 0;
+    }
+    g_new_input = 1;
+    g_needs_redraw = 1;
+}
+
+/* Handle a button press by label */
+static void calc_press(const char *label) {
+    if (label[0] >= '0' && label[0] <= '9' && label[1] == '\0') {
+        calc_digit(label[0]);
+    } else if (!strcmp(label, ".")) {
+        calc_dot();
+    } else if (!strcmp(label, "C")) {
+        calc_clear();
+    } else if (!strcmp(label, "DEL")) {
+        calc_backspace();
+    } else if (!strcmp(label, "+/-")) {
+        calc_negate();
+    } else if (!strcmp(label, "%")) {
+        calc_percent();
+    } else if (!strcmp(label, "=")) {
+        calc_equals();
+    } else if (!strcmp(label, "+") || !strcmp(label, "-") ||
+               !strcmp(label, "*") || !strcmp(label, "/")) {
+        calc_operator(label[0]);
+    }
+}
+
+/* Button grid geometry — must match render_calculator layout */
+#define GRID_M   6
+#define GRID_DH  64
+#define GRID_DY  (GRID_M + 6)
+#define GRID_Y0  (GRID_DY + GRID_DH + 8)
+#define GRID_GH  (H - GRID_M - 8 - GRID_Y0)
+#define GRID_X0  (GRID_M + 6)
+#define GRID_GW  (W - 2*(GRID_M + 6))
+#define GRID_COLS 4
+#define GRID_ROWS 5
+#define GRID_GAP  6
+
+/* Find which button was clicked, or NULL if none */
+static const char *hit_test_button(int mx, int my) {
+    int bw = (GRID_GW - (GRID_COLS - 1) * GRID_GAP) / GRID_COLS;
+    int bh = (GRID_GH - (GRID_ROWS - 1) * GRID_GAP) / GRID_ROWS;
+    for (int r = 0; r < GRID_ROWS; r++) {
+        for (int c = 0; c < GRID_COLS; c++) {
+            int bx = GRID_X0 + c * (bw + GRID_GAP);
+            int by = GRID_Y0 + r * (bh + GRID_GAP);
+            if (mx >= bx && mx < bx + bw && my >= by && my < by + bh)
+                return kButtons[r][c];
+        }
+    }
+    return NULL;
+}
+
 static void render_calculator(void) {
     /* Background. */
     fill_rect(0, 0, W, H, COL_BG);
@@ -301,8 +621,8 @@ static void render_calculator(void) {
     for (int i = 0; i < n_digits; i++)
         draw_digit(sx + i * (digit_w + gap), sy, digit_w, digit_h, 8, COL_DIGIT_DIM);
 
-    /* Show a sample number "1337". */
-    const char *value = "1337";
+    /* Show the current display value. */
+    const char *value = g_display;
     int vw = (int)strlen(value) * digit_w + ((int)strlen(value) - 1) * gap;
     int vx = dx + dw - vw - 8;
     draw_digit_string(vx, sy, digit_w, digit_h, gap, value, COL_DIGIT);
@@ -362,11 +682,39 @@ static void on_buf_release(void *d, struct wl_buffer *b) {
 }
 static const struct wl_buffer_listener buf_lis = { .release = on_buf_release };
 
+/* Frame callback for redraw */
+static struct wl_callback *g_frame_cb = NULL;
+static struct wl_surface  *g_surf_global = NULL;
+static struct wl_buffer   *g_buf_global  = NULL;
+
+static void on_frame(void *data, struct wl_callback *cb, uint32_t time);
+static const struct wl_callback_listener frame_lis = { .done = on_frame };
+
+static void request_frame(void) {
+    if (g_frame_cb) return;
+    g_frame_cb = wl_surface_frame(g_surf_global);
+    wl_callback_add_listener(g_frame_cb, &frame_lis, NULL);
+    wl_surface_commit(g_surf_global);
+}
+
+static void on_frame(void *data, struct wl_callback *cb, uint32_t time) {
+    (void)data; (void)time;
+    wl_callback_destroy(cb);
+    g_frame_cb = NULL;
+
+    if (g_needs_redraw) {
+        render_calculator();
+        wl_surface_attach(g_surf_global, g_buf_global, 0, 0);
+        wl_surface_damage(g_surf_global, 0, 0, W, H);
+        g_needs_redraw = 0;
+    }
+
+    /* Always request next frame to stay responsive */
+    request_frame();
+}
+
 int main(int argc, char **argv) {
-    int hold_seconds = 8;
-    if (argc >= 2) hold_seconds = atoi(argv[1]);
-    if (hold_seconds < 1) hold_seconds = 1;
-    if (hold_seconds > 60) hold_seconds = 60;
+    (void)argc; (void)argv;
 
     struct timespec ts = { .tv_sec = 0, .tv_nsec = 500 * 1000 * 1000 };
     nanosleep(&ts, NULL);
@@ -379,7 +727,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[calc] FAIL: wl_display_connect: %s\n", strerror(errno));
         return 1;
     }
-    fprintf(stderr, "[calc] connected\n");
 
     struct wl_registry *reg = wl_display_get_registry(dpy);
     wl_registry_add_listener(reg, &reg_lis, NULL);
@@ -390,7 +737,11 @@ int main(int argc, char **argv) {
         return 1;
     }
     xdg_wm_base_add_listener(g_wm, &wm_lis, NULL);
-    fprintf(stderr, "[calc] globals bound\n");
+
+    if (g_seat)
+        wl_seat_add_listener(g_seat, &seat_lis, NULL);
+
+    wl_display_roundtrip(dpy);
 
     int SIZE = STRIDE * H;
     int fd = memfd_create_shim("brook-calc", MFD_CLOEXEC);
@@ -405,19 +756,18 @@ int main(int argc, char **argv) {
     }
 
     struct wl_shm_pool *pool = wl_shm_create_pool(g_shm, fd, SIZE);
-    struct wl_buffer *buf = wl_shm_pool_create_buffer(pool, 0, W, H, STRIDE,
-                                                       WL_SHM_FORMAT_XRGB8888);
-    wl_buffer_add_listener(buf, &buf_lis, NULL);
+    g_buf_global = wl_shm_pool_create_buffer(pool, 0, W, H, STRIDE,
+                                              WL_SHM_FORMAT_XRGB8888);
+    wl_buffer_add_listener(g_buf_global, &buf_lis, NULL);
 
-    struct wl_surface *surf = wl_compositor_create_surface(g_comp);
-    struct xdg_surface *xs  = xdg_wm_base_get_xdg_surface(g_wm, surf);
+    g_surf_global = wl_compositor_create_surface(g_comp);
+    struct xdg_surface *xs  = xdg_wm_base_get_xdg_surface(g_wm, g_surf_global);
     xdg_surface_add_listener(xs, &xs_lis, NULL);
     struct xdg_toplevel *tl = xdg_surface_get_toplevel(xs);
     xdg_toplevel_add_listener(tl, &tl_lis, NULL);
     xdg_toplevel_set_title(tl, "Brook Calc");
     xdg_toplevel_set_app_id(tl, "brook.calc");
 
-    /* Request server-side decoration so the kernel WM draws chrome. */
     struct zxdg_toplevel_decoration_v1 *deco = NULL;
     if (g_deco_mgr) {
         deco = zxdg_decoration_manager_v1_get_toplevel_decoration(g_deco_mgr, tl);
@@ -425,9 +775,9 @@ int main(int argc, char **argv) {
             ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
     }
 
-    wl_surface_commit(surf);
-    fprintf(stderr, "[calc] xdg_toplevel committed, awaiting configure\n");
+    wl_surface_commit(g_surf_global);
 
+    /* Wait for configure */
     for (int i = 0; i < 40 && !g_got_configure; i++) {
         wl_display_roundtrip(dpy);
         if (g_got_configure) break;
@@ -438,39 +788,29 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[calc] FAIL: never got configure\n");
         return 1;
     }
-    wl_display_flush(dpy);
 
+    /* Initial render */
     render_calculator();
+    wl_surface_attach(g_surf_global, g_buf_global, 0, 0);
+    wl_surface_damage(g_surf_global, 0, 0, W, H);
+    request_frame();
 
-    wl_surface_attach(surf, buf, 0, 0);
-    wl_surface_damage(surf, 0, 0, W, H);
-    wl_surface_commit(surf);
-    fprintf(stderr, "[calc] frame 1 committed (%dx%d)\n", W, H);
+    fprintf(stderr, "[calc] running (interactive mode)\n");
 
-    /* Hold for N seconds, dispatching events so the server can ping us. */
-    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
-    for (;;) {
-        wl_display_dispatch_pending(dpy);
-        wl_display_flush(dpy);
-        struct timespec n; clock_gettime(CLOCK_MONOTONIC, &n);
-        long elapsed = n.tv_sec - t0.tv_sec;
-        if (elapsed >= hold_seconds) break;
-        struct timespec st = { .tv_sec = 0, .tv_nsec = 100 * 1000 * 1000 };
-        nanosleep(&st, NULL);
+    /* Event loop */
+    while (g_running) {
+        if (wl_display_dispatch(dpy) < 0) break;
     }
 
-    fprintf(stderr, "[calc] hold complete (%ds), tearing down\n", hold_seconds);
-
+    fprintf(stderr, "[calc] shutting down\n");
     if (deco) zxdg_toplevel_decoration_v1_destroy(deco);
     xdg_toplevel_destroy(tl);
     xdg_surface_destroy(xs);
-    wl_surface_destroy(surf);
-    wl_buffer_destroy(buf);
+    wl_surface_destroy(g_surf_global);
+    wl_buffer_destroy(g_buf_global);
     wl_shm_pool_destroy(pool);
     munmap(g_px, SIZE);
     close(fd);
     wl_display_disconnect(dpy);
-
-    fprintf(stderr, "[calc] PASS\n");
     return 0;
 }

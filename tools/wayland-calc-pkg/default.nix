@@ -25,7 +25,7 @@ stdenv.mkDerivation {
     $CC -O2 -Wall -Wextra \
         -I${wayland.dev}/include -I. \
         wayland-calc.c xdg-shell-protocol.c xdg-decoration-protocol.c \
-        -L${wayland}/lib -lwayland-client \
+        -L${wayland}/lib -lwayland-client -lm \
         -Wl,-rpath,${wayland}/lib:${stdenv.cc.libc}/lib \
         -o wayland-calc
   '';
