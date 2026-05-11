@@ -689,6 +689,22 @@ void* DevKlogDeepCopy(void* handle)
     return dst;
 }
 
+void* DevTtyDeepCopy(void* handle)
+{
+    if (!handle) return nullptr;
+    auto* src = static_cast<TtyDevicePair*>(handle);
+    auto* dst = static_cast<TtyDevicePair*>(kmalloc(sizeof(TtyDevicePair)));
+    if (!dst) return nullptr;
+    dst->readPipe = src->readPipe;
+    dst->writePipe = src->writePipe;
+    // Bump pipe refcounts for the new copy
+    if (dst->readPipe)
+        __atomic_fetch_add(&static_cast<PipeBuffer*>(dst->readPipe)->readers, 1, __ATOMIC_RELEASE);
+    if (dst->writePipe)
+        __atomic_fetch_add(&static_cast<PipeBuffer*>(dst->writePipe)->writers, 1, __ATOMIC_RELEASE);
+    return dst;
+}
+
 // Demand-page a memfd-backed user mapping. Called from the user #PF path
 // in idt.cpp before the kill flow. Returns true if the fault was on a
 // memfd VMA and was successfully resolved (PTE installed).
@@ -2893,6 +2909,33 @@ int64_t CloseProcessFd(Process* proc, int fd)
         kfree(fde->handle);
     }
 
+    if (fde->type == FdType::DevTty && fde->handle)
+    {
+        // DevTty wraps a TtyDevicePair that references stdin/stdout pipes.
+        // Opening /dev/tty incremented reader/writer counts on those pipes,
+        // so closing must decrement them and free the pair struct.
+        auto* pair = static_cast<TtyDevicePair*>(fde->handle);
+        if (pair->readPipe)
+        {
+            auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
+            __atomic_fetch_sub(&rp->readers, 1, __ATOMIC_RELEASE);
+        }
+        if (pair->writePipe)
+        {
+            auto* wp = static_cast<PipeBuffer*>(pair->writePipe);
+            __atomic_fetch_sub(&wp->writers, 1, __ATOMIC_RELEASE);
+            // Wake blocked reader so it can see EOF
+            Process* reader = wp->readerWaiter;
+            if (reader)
+            {
+                wp->readerWaiter = nullptr;
+                WakeProcess(reader);
+            }
+            PipeWakeEpoll(wp);
+        }
+        kfree(pair);
+    }
+
     FdFree(proc, fd);
     return 0;
 }
@@ -3048,6 +3091,10 @@ static int64_t sys_dup(uint64_t oldfd, uint64_t, uint64_t,
     if (proc->fds[newfd].type == FdType::DevKlog && proc->fds[newfd].handle)
         proc->fds[newfd].handle = DevKlogDeepCopy(proc->fds[newfd].handle);
 
+    // DevTty needs a deep-copied TtyDevicePair with bumped pipe refcounts
+    if (proc->fds[newfd].type == FdType::DevTty && proc->fds[newfd].handle)
+        proc->fds[newfd].handle = DevTtyDeepCopy(proc->fds[newfd].handle);
+
     return newfd;
 }
 
@@ -3083,6 +3130,10 @@ static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd, uint64_t,
     // DevKlog has no refcount — deep-copy the cursor
     if (proc->fds[newfd].type == FdType::DevKlog && proc->fds[newfd].handle)
         proc->fds[newfd].handle = DevKlogDeepCopy(proc->fds[newfd].handle);
+
+    // DevTty needs a deep-copied TtyDevicePair with bumped pipe refcounts
+    if (proc->fds[newfd].type == FdType::DevTty && proc->fds[newfd].handle)
+        proc->fds[newfd].handle = DevTtyDeepCopy(proc->fds[newfd].handle);
 
     return static_cast<int64_t>(newfd);
 }

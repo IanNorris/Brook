@@ -1349,6 +1349,10 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
             // Deep-copy DevKlog cursor so parent/child have independent positions
             if (parent->fds[i].type == FdType::DevKlog && parent->fds[i].handle)
                 child->fds[i].handle = brook::DevKlogDeepCopy(parent->fds[i].handle);
+
+            // Deep-copy DevTty pair and bump pipe refcounts for the child
+            if (parent->fds[i].type == FdType::DevTty && parent->fds[i].handle)
+                child->fds[i].handle = brook::DevTtyDeepCopy(parent->fds[i].handle);
         }
     }
 
