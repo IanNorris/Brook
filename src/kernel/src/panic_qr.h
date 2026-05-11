@@ -1,8 +1,9 @@
 #pragma once
 // QR code panic screen — encode CPU state into a scannable QR code.
 //
-// Data pipeline: CPURegs → binary packet → Base45 → Nayuki QR → framebuffer
-// (zlib compression will be added later for smaller QR codes)
+// Data pipeline: CPURegs → binary TLV packet → Base45 → QR alphanumeric → framebuffer
+// Uses Base45 encoding so QR codes are readable by any phone camera app.
+// Multi-page support: large payloads are split across up to QR_MAX_PAGES QR codes.
 //
 // Constants hand-tuned on real hardware (Surface Go) via Enkel project:
 //   PixelsPerModule = 3
@@ -16,7 +17,8 @@ namespace brook {
 
 // Panic QR protocol constants
 static constexpr uint8_t  QR_MAGIC_BYTE  = 0x2D;
-static constexpr uint8_t  QR_VERSION     = 0x01;
+static constexpr uint8_t  QR_VERSION     = 0x02;  // v2: LZ4 + Base45
+static constexpr uint8_t  QR_VERSION_RAW = 0x01;  // v1: uncompressed binary
 static constexpr uint32_t QR_HEADER_PAD  = 0xCAFEF00D;
 static constexpr uint32_t QR_PACKET_TYPE_CPU_REGS       = 0xA3000001;
 static constexpr uint32_t QR_PACKET_TYPE_STACK_TRACE    = 0xA3000002;
@@ -29,6 +31,7 @@ static constexpr uint32_t QR_START_X           = 50;
 static constexpr uint32_t QR_START_Y           = 50;
 static constexpr int      QR_BORDER_WIDTH      = 2;
 static constexpr int      QR_CONTRAST          = 2;
+static constexpr uint8_t  QR_MAX_PAGES         = 4;
 
 // Packet header
 struct __attribute__((packed)) PanicHeader {

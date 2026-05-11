@@ -222,6 +222,8 @@ add_executable(kernel
     "${FATFS_BUILD_DIR}/ffunicode.c"
     # Nayuki QR Code Generator (C source)
     "${BROOK_ROOT}/src/third_party/qrcodegen/qrcodegen.c"
+    # LZ4 compression (C source) — used in panic QR for data compression
+    "${BROOK_ROOT}/src/third_party/lz4/lz4.c"
 )
 
 target_include_directories(kernel PRIVATE
@@ -231,6 +233,7 @@ target_include_directories(kernel PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}"          # for the generated font_atlas.cpp
     "${FATFS_BUILD_DIR}"                  # ff.h, diskio.h, our ffconf.h overlay
     "${BROOK_ROOT}/src/third_party/qrcodegen"    # qrcodegen.h
+    "${BROOK_ROOT}/src/third_party/lz4"          # lz4.h
 )
 
 target_compile_options(kernel PRIVATE
@@ -317,6 +320,14 @@ set_source_files_properties(
     "${BROOK_ROOT}/src/third_party/qrcodegen/qrcodegen.c"
     PROPERTIES COMPILE_OPTIONS
         "-mgeneral-regs-only;-mno-sse;-mno-sse2;-mfpmath=;-Wno-unused-parameter;-Wno-unused-function;-Wno-sign-compare;-Wno-implicit-fallthrough;-Wno-unused-variable"
+)
+
+# LZ4 — freestanding mode, no heap, panic-safe (no SSE).
+set_source_files_properties(
+    "${BROOK_ROOT}/src/third_party/lz4/lz4.c"
+    PROPERTIES
+        COMPILE_OPTIONS "-mgeneral-regs-only;-mno-sse;-mno-sse2;-mfpmath=;-include;${BROOK_ROOT}/src/third_party/lz4/lz4_freestanding.h;-Wno-unused-parameter;-Wno-unused-function;-Wno-sign-compare;-Wno-implicit-fallthrough;-Wno-unused-variable"
+        COMPILE_DEFINITIONS "LZ4_FREESTANDING=1;LZ4_memcpy=memcpy;LZ4_memset=memset;LZ4_memmove=memmove"
 )
 
 # Generated symbol table: suppress unused-const-variable (the extern refs are
