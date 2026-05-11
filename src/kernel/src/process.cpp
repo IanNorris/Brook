@@ -607,6 +607,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     if (!proc->fds)
     {
         SerialPuts("PROC: fd table allocation failed\n");
+        SchedulerFreePid(proc->pid);
         FreeProcessStruct(proc);
         return nullptr;
     }
@@ -621,6 +622,8 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     if (!kstackAddr)
     {
         SerialPuts("PROC: kernel stack allocation failed\n");
+        kfree(proc->fds);
+        SchedulerFreePid(proc->pid);
         FreeProcessStruct(proc);
         return nullptr;
     }
@@ -634,6 +637,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
         SerialPuts("PROC: page table allocation failed\n");
         VmmFreeKernelStack(kstackAddr, KERNEL_STACK_PAGES);
         kfree(proc->fds);
+        SchedulerFreePid(proc->pid);
         FreeProcessStruct(proc);
         return nullptr;
     }
@@ -646,6 +650,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
         VmmDestroyUserPageTable(proc->pageTable);
         VmmFreeKernelStack(kstackAddr, KERNEL_STACK_PAGES);
         kfree(proc->fds);
+        SchedulerFreePid(proc->pid);
         FreeProcessStruct(proc);
         return nullptr;
     }
@@ -712,6 +717,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
             VmmDestroyUserPageTable(proc->pageTable);
             VmmFreeKernelStack(VirtualAddress(proc->kernelStackBase), KERNEL_STACK_PAGES);
             kfree(proc->fds);
+            SchedulerFreePid(proc->pid);
             FreeProcessStruct(proc);
             return nullptr;
         }
@@ -749,6 +755,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
         VmmDestroyUserPageTable(proc->pageTable);
         VmmFreeKernelStack(VirtualAddress(proc->kernelStackBase), KERNEL_STACK_PAGES);
         kfree(proc->fds);
+        SchedulerFreePid(proc->pid);
         FreeProcessStruct(proc);
         return nullptr;
     }
@@ -843,6 +850,7 @@ Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
     if (!kstackAddr)
     {
         SerialPuts("KTHREAD: kernel stack allocation failed\n");
+        SchedulerFreePid(proc->pid);
         FreeProcessStruct(proc);
         return nullptr;
     }
@@ -1207,6 +1215,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     if (!child->fds)
     {
         SerialPuts("FORK: fd table allocation failed\n");
+        SchedulerFreePid(child->pid);
         FreeProcessStruct(child);
         return nullptr;
     }
@@ -1250,6 +1259,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     {
         SerialPuts("FORK: kernel stack allocation failed\n");
         kfree(child->fds);
+        SchedulerFreePid(child->pid);
         FreeProcessStruct(child);
         return nullptr;
     }
@@ -1263,6 +1273,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
         SerialPuts("FORK: page table allocation failed\n");
         VmmFreeKernelStack(kstackAddr, KERNEL_STACK_PAGES);
         kfree(child->fds);
+        SchedulerFreePid(child->pid);
         FreeProcessStruct(child);
         return nullptr;
     }
@@ -1276,6 +1287,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
         VmmDestroyUserPageTable(child->pageTable);
         VmmFreeKernelStack(kstackAddr, KERNEL_STACK_PAGES);
         kfree(child->fds);
+        SchedulerFreePid(child->pid);
         FreeProcessStruct(child);
         return nullptr;
     }
@@ -1482,6 +1494,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
         MemTag::KernelData, thread->pid);
     if (!kstackAddr)
     {
+        SchedulerFreePid(thread->pid);
         FreeProcessStruct(thread);
         return nullptr;
     }
