@@ -11194,8 +11194,7 @@ static int64_t sys_accept(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
                 // Create a connected server-side socket
                 auto* serverSock = static_cast<UnixSocketData*>(kmalloc(sizeof(UnixSocketData)));
                 if (!serverSock) return -ENOMEM;
-                for (uint64_t i = 0; i < sizeof(UnixSocketData); i++)
-                    reinterpret_cast<uint8_t*>(serverSock)[i] = 0;
+                memset(serverSock, 0, sizeof(UnixSocketData));
                 serverSock->state  = UnixSocketData::State::Connected;
                 serverSock->refCount = 1;
                 serverSock->rxPipe = usd->pending[slot].serverRx;
@@ -11313,14 +11312,10 @@ static int64_t sys_socketpair(uint64_t domain, uint64_t type, uint64_t protocol,
     if (!endB) { kfree(endA); kfree(fdqBtoA); kfree(fdqAtoB); PipeBufferDestroy(pipeAtoB); PipeBufferDestroy(pipeBtoA); return -ENOMEM; }
 
     // Zero-init backing objects
-    for (uint64_t i = 0; i < sizeof(UnixFdQueue); i++) {
-        reinterpret_cast<uint8_t*>(fdqAtoB)[i] = 0;
-        reinterpret_cast<uint8_t*>(fdqBtoA)[i] = 0;
-    }
-    for (uint64_t i = 0; i < sizeof(UnixSocketData); i++) {
-        reinterpret_cast<uint8_t*>(endA)[i] = 0;
-        reinterpret_cast<uint8_t*>(endB)[i] = 0;
-    }
+    memset(fdqAtoB, 0, sizeof(UnixFdQueue));
+    memset(fdqBtoA, 0, sizeof(UnixFdQueue));
+    memset(endA, 0, sizeof(UnixSocketData));
+    memset(endB, 0, sizeof(UnixSocketData));
 
     pipeAtoB->readers = 1;
     pipeAtoB->writers = 1;
