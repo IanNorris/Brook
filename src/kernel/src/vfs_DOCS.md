@@ -200,3 +200,7 @@ Virtual filesystem generating process and system information on the fly.
 5. **Single ext2 lock**: All ext2 operations serialize globally. Performance
    impact mitigated by block cache but heavy concurrent I/O will bottleneck.
 6. **No tmpfs**: `/tmp` is not memory-backed; writes go to ext2 on disk.
+
+### Security Notes
+- No permission checks on /proc — any process can read any `/proc/[pid]/*`
+- Kernel pointers exposed in `/proc/[pid]/maps` (acceptable for hobby OS)
