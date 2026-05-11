@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include "memory/heap.h"
 #include "spinlock.h"
+#include "string.h"
 
 namespace brook {
 
@@ -61,11 +62,15 @@ struct PipeBuffer
         uint32_t avail = capacity - 1 - ((head - tail + capacity) % capacity);
         if (len > avail) len = avail;
 
-        for (uint32_t i = 0; i < len; ++i)
-        {
-            data[head] = src[i];
-            head = (head + 1) % capacity;
-        }
+        // Copy in up to two contiguous chunks (ring buffer wrap)
+        uint32_t firstChunk = capacity - head;
+        if (firstChunk > len) firstChunk = len;
+        memcpy(data + head, src, firstChunk);
+
+        if (len > firstChunk)
+            memcpy(data, src + firstChunk, len - firstChunk);
+
+        head = (head + len) % capacity;
 
         SpinLockRelease(&lock);
         return len;
@@ -85,11 +90,15 @@ struct PipeBuffer
         uint32_t avail = (head - tail + capacity) % capacity;
         if (len > avail) len = avail;
 
-        for (uint32_t i = 0; i < len; ++i)
-        {
-            dst[i] = data[tail];
-            tail = (tail + 1) % capacity;
-        }
+        // Copy in up to two contiguous chunks (ring buffer wrap)
+        uint32_t firstChunk = capacity - tail;
+        if (firstChunk > len) firstChunk = len;
+        memcpy(dst, data + tail, firstChunk);
+
+        if (len > firstChunk)
+            memcpy(dst + firstChunk, data, len - firstChunk);
+
+        tail = (tail + len) % capacity;
 
         SpinLockRelease(&lock);
         return len;
@@ -102,8 +111,7 @@ static inline PipeBuffer* PipeBufferCreate(uint32_t capacity)
 
     auto* pipe = static_cast<PipeBuffer*>(kmalloc(sizeof(PipeBuffer)));
     if (!pipe) return nullptr;
-    for (uint64_t i = 0; i < sizeof(PipeBuffer); i++)
-        reinterpret_cast<uint8_t*>(pipe)[i] = 0;
+    memset(pipe, 0, sizeof(PipeBuffer));
 
     pipe->data = static_cast<char*>(kmalloc(capacity));
     if (!pipe->data)
@@ -111,8 +119,7 @@ static inline PipeBuffer* PipeBufferCreate(uint32_t capacity)
         kfree(pipe);
         return nullptr;
     }
-    for (uint32_t i = 0; i < capacity; i++)
-        pipe->data[i] = 0;
+    memset(pipe->data, 0, capacity);
 
     pipe->capacity = capacity;
     return pipe;
