@@ -23,6 +23,7 @@
 #include "memory/physical_memory.h"
 #include "memory/address.h"
 #include "mem_tag.h"
+#include "string.h"
 
 MODULE_IMPORT_SYMBOL(PciFindDevice);
 MODULE_IMPORT_SYMBOL(PciEnableMemSpace);
@@ -225,7 +226,7 @@ static bool AllocEventQueue()
     if (!qAddr) return false;
 
     uint8_t* base = reinterpret_cast<uint8_t*>(qAddr.raw());
-    for (uint32_t i = 0; i < totalPages * 4096; ++i) base[i] = 0;
+    memset(base, 0, totalPages * 4096);
 
     uint8_t* descBase  = base;
     uint8_t* availBase = base + descPages * 4096;

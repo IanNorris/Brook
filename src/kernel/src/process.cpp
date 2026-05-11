@@ -589,7 +589,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
 
     // Zero-initialize
     auto* raw = reinterpret_cast<uint8_t*>(proc);
-    for (uint64_t i = 0; i < sizeof(Process); ++i) raw[i] = 0;
+    memset(raw, 0, sizeof(Process));
     proc->magic = PROCESS_MAGIC;
 
     // Initialize FPU/SSE state with safe defaults so fxrstor works correctly
@@ -830,7 +830,7 @@ Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
 
     // Zero-initialize
     auto* raw = reinterpret_cast<uint8_t*>(proc);
-    for (uint64_t i = 0; i < sizeof(Process); ++i) raw[i] = 0;
+    memset(raw, 0, sizeof(Process));
     proc->magic = PROCESS_MAGIC;
 
     // Initialize FPU/SSE state
@@ -1505,7 +1505,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     thread->fbExitColor = 0;
 
     // Initialize FPU/SSE state
-    for (uint32_t i = 0; i < 512; ++i) thread->fxsave.data[i] = 0;
+    memset(thread->fxsave.data, 0, 512);
     thread->fxsave.data[0] = 0x7F;
     thread->fxsave.data[1] = 0x03;
     thread->fxsave.data[24] = 0x80;
@@ -2175,8 +2175,7 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     auto* sf = reinterpret_cast<SignalFrame*>(userRsp);
 
     // Clear the frame
-    for (uint64_t i = 0; i < sizeof(SignalFrame) / 8; i++)
-        reinterpret_cast<uint64_t*>(sf)[i] = 0;
+    memset(sf, 0, sizeof(SignalFrame));
 
     // Return address: sa_restorer (musl's __restore_rt which calls rt_sigreturn)
     sf->pretcode = sa.restorer;

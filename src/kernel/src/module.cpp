@@ -7,6 +7,7 @@
 #include "serial.h"
 #include "kprintf.h"
 #include "mem_tag.h"
+#include "string.h"
 
 namespace brook {
 
@@ -53,16 +54,13 @@ static bool ModStrEndsWith(const char* str, const char* suffix)
 // it with a memset call (which isn't available in our freestanding environment).
 static void ModZero(void* dst, uint64_t len)
 {
-    volatile uint8_t* p = static_cast<volatile uint8_t*>(dst);
-    for (uint64_t i = 0; i < len; ++i) p[i] = 0;
+    memset(dst, 0, len);
 }
 
 // Copy bytes.
 static void ModCopy(void* dst, const void* src, uint64_t len)
 {
-    uint8_t* d = static_cast<uint8_t*>(dst);
-    const uint8_t* s = static_cast<const uint8_t*>(src);
-    for (uint64_t i = 0; i < len; ++i) d[i] = s[i];
+    memcpy(dst, src, len);
 }
 
 // ---- ELF loader internals ----

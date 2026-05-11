@@ -16,6 +16,7 @@
 #include "tty.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
+#include "string.h"
 
 using brook::SerialPrintf;
 using brook::IoApicUnmaskIrq;
@@ -1324,8 +1325,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         auto* sf = reinterpret_cast<brook::SignalFrame*>(userRsp);
 
         // Clear the frame
-        for (uint64_t i = 0; i < sizeof(brook::SignalFrame) / 8; i++)
-            reinterpret_cast<uint64_t*>(sf)[i] = 0;
+        memset(sf, 0, sizeof(brook::SignalFrame));
 
         // Return address: sa_restorer (musl's __restore_rt → rt_sigreturn)
         sf->pretcode = sa.restorer;

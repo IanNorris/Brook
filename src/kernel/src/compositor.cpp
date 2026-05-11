@@ -12,6 +12,7 @@
 #include "net.h"
 #include "font_atlas.h"
 #include "debug_overlay.h"
+#include "string.h"
 
 namespace brook {
 
@@ -369,9 +370,7 @@ bool CompositorSetupProcess(Process* proc, int16_t destX, int16_t destY,
     }
 
     auto* vfbPtr = reinterpret_cast<uint32_t*>(vfbAddr.raw());
-
-    for (uint64_t i = 0; i < (fbSizeBytes / 4); ++i)
-        vfbPtr[i] = 0;
+    memset(vfbPtr, 0, fbSizeBytes);
 
     proc->fbVirtual     = vfbPtr;
     proc->fbVirtualSize = static_cast<uint32_t>(fbSizeBytes);
@@ -422,8 +421,7 @@ bool CompositorResizeVfb(Process* proc, uint32_t newWidth, uint32_t newHeight)
     }
 
     auto* newVfb = reinterpret_cast<uint32_t*>(vfbAddr.raw());
-    for (uint64_t i = 0; i < (fbSizeBytes / 4); ++i)
-        newVfb[i] = 0;
+    memset(newVfb, 0, fbSizeBytes);
 
     // Wait for any in-progress blit using the old VFB pointer to retire.
     CompositorWaitFrame();

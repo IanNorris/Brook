@@ -19,6 +19,7 @@
 #include "memory/physical_memory.h"
 #include "memory/address.h"
 #include "mem_tag.h"
+#include "string.h"
 
 MODULE_IMPORT_SYMBOL(PciFindDevice);
 MODULE_IMPORT_SYMBOL(PciEnableMemSpace);
@@ -632,8 +633,7 @@ static bool SetupOutputStream(uint32_t sampleRate, uint8_t channels, uint8_t bit
     hda_write32(sdBase + SD_CBL, AUDIO_BUF_SIZE);
 
     // Zero entire buffer
-    for (uint32_t i = 0; i < AUDIO_BUF_SIZE; i++)
-        g_audioBuf[i] = 0;
+    memset(g_audioBuf, 0, AUDIO_BUF_SIZE);
     g_writeFrag = 0;
     g_writeOffset = 0;
     g_submittedBytes = 0;
@@ -703,8 +703,7 @@ static void ResetPlaybackQueueLocked(bool reconfigure)
                           g_curBits ? g_curBits : 16);
     else
     {
-        for (uint32_t i = 0; i < AUDIO_BUF_SIZE; i++)
-            g_audioBuf[i] = 0;
+        memset(g_audioBuf, 0, AUDIO_BUF_SIZE);
         g_writeFrag = 0;
         g_writeOffset = 0;
         g_submittedBytes = 0;
@@ -770,8 +769,7 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
                 // Without this, DMA advances through old audio and LPIB
                 // races ahead of g_submittedBytes on every call, causing
                 // perpetual underrun (no backpressure → plays too fast).
-                for (uint32_t i = 0; i < AUDIO_BUF_SIZE; i++)
-                    g_audioBuf[i] = 0;
+                memset(g_audioBuf, 0, AUDIO_BUF_SIZE);
                 uint32_t lpib = hda_read32(g_outStreamBase + SD_LPIB) % AUDIO_BUF_SIZE;
                 g_submittedBytes = lpib;
                 g_playedBytes = lpib;
@@ -841,8 +839,7 @@ extern "C" void HdaStop()
     g_playedBytes = 0;
     g_lastLpib = 0;
     // Zero buffer so next open doesn't replay stale data
-    for (uint32_t i = 0; i < AUDIO_BUF_SIZE; i++)
-        g_audioBuf[i] = 0;
+    memset(g_audioBuf, 0, AUDIO_BUF_SIZE);
     PlayUnlock();
 }
 
@@ -956,8 +953,7 @@ static int IntelHdaInit()
     }
     g_bdl = reinterpret_cast<BdlEntry*>(bdlPage.raw());
     g_bdlPhys = VmmVirtToPhys(KernelPageTable, bdlPage).raw();
-    for (int i = 0; i < 4096 / 4; i++)
-        reinterpret_cast<uint32_t*>(g_bdl)[i] = 0;
+    memset(g_bdl, 0, 4096);
 
     // Allocate audio buffer (64 pages = 256KB, uncacheable for DMA)
     uint32_t audioPages = AUDIO_BUF_SIZE / 4096;

@@ -624,8 +624,7 @@ static Device* InitOnePciDevice(const PciDevice& pci, uint32_t slot)
 
     auto* state = static_cast<VirtioBlkState*>(kmalloc(sizeof(VirtioBlkState)));
     if (!state) return nullptr;
-    for (uint32_t i = 0; i < sizeof(VirtioBlkState); ++i)
-        reinterpret_cast<uint8_t*>(state)[i] = 0;
+    memset(state, 0, sizeof(VirtioBlkState));
     state->ioBase         = ioBase;
     state->queueSize      = qSize;
     state->availIdxShadow = 0;

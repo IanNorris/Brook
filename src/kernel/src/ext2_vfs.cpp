@@ -1936,8 +1936,7 @@ static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
         if (!ino) { KRwLockWriteUnlock(&g_ext2Lock); return nullptr; }
 
         // Initialize inode
-        for (uint32_t i = 0; i < sizeof(inodeData); ++i)
-            reinterpret_cast<uint8_t*>(&inodeData)[i] = 0;
+        memset(&inodeData, 0, sizeof(inodeData));
         inodeData.i_mode = EXT2_S_IFREG | 0644;
         inodeData.i_links_count = 1;
         Ext2WriteInode(mnt, ino, &inodeData);
@@ -2174,8 +2173,7 @@ static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath)
 
     // Initialize directory inode
     Ext2Inode newData;
-    for (uint32_t i = 0; i < sizeof(newData); ++i)
-        reinterpret_cast<uint8_t*>(&newData)[i] = 0;
+    memset(&newData, 0, sizeof(newData));
     newData.i_mode = EXT2_S_IFDIR | 0755;
     newData.i_links_count = 2; // . and parent's entry
 
@@ -2360,8 +2358,7 @@ static int Ext2FsSymlink(void* mountPriv, uint8_t pdrv,
     }
 
     Ext2Inode newData;
-    for (uint32_t i = 0; i < sizeof(newData); ++i)
-        reinterpret_cast<uint8_t*>(&newData)[i] = 0;
+    memset(&newData, 0, sizeof(newData));
     newData.i_mode = EXT2_S_IFLNK | 0777;
     newData.i_links_count = 1;
 

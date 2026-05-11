@@ -5518,7 +5518,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
             if (!UserBufferWritable(arg, sizeof(FbVarScreeninfo))) return -EFAULT;
             auto* info = reinterpret_cast<FbVarScreeninfo*>(arg);
             auto* raw = reinterpret_cast<uint8_t*>(info);
-            for (uint64_t i = 0; i < sizeof(FbVarScreeninfo); ++i) raw[i] = 0;
+            memset(raw, 0, sizeof(FbVarScreeninfo));
 
             info->xres = repW;
             info->yres = repH;
@@ -5538,7 +5538,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
             if (!UserBufferWritable(arg, sizeof(FbFixScreeninfo))) return -EFAULT;
             auto* info = reinterpret_cast<FbFixScreeninfo*>(arg);
             auto* raw = reinterpret_cast<uint8_t*>(info);
-            for (uint64_t i = 0; i < sizeof(FbFixScreeninfo); ++i) raw[i] = 0;
+            memset(raw, 0, sizeof(FbFixScreeninfo));
 
             const char* name = "brook_fb";
             for (int i = 0; name[i] && i < 15; ++i) info->id[i] = name[i];
@@ -6034,7 +6034,7 @@ struct LinuxStat {
 static void FillStat(LinuxStat* st, const VnodeStat& vs)
 {
     auto* raw = reinterpret_cast<uint8_t*>(st);
-    for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+    memset(raw, 0, sizeof(LinuxStat));
 
     // Generate a unique inode number from the file's attributes.
     // This is critical: musl's dynamic linker uses dev+ino to detect
@@ -6212,7 +6212,7 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
 
     if (fd <= 2) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
-        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        memset(raw, 0, sizeof(LinuxStat));
         st->st_mode = 0020666; // S_IFCHR | rw-rw-rw-
         st->st_rdev = 0x8800 + fd;
         st->st_blksize = 4096;
@@ -6234,7 +6234,7 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
 
     if (fde->type == FdType::DevFramebuf) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
-        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        memset(raw, 0, sizeof(LinuxStat));
         st->st_mode = 0020666; // S_IFCHR
         st->st_rdev = 0x1D00;
         st->st_blksize = 4096;
@@ -6244,7 +6244,7 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
     if (fde->type == FdType::DevKeyboard || fde->type == FdType::DevNull ||
         fde->type == FdType::DevUrandom || fde->type == FdType::DevDsp) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
-        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        memset(raw, 0, sizeof(LinuxStat));
         st->st_mode = 0020666; // S_IFCHR
         st->st_rdev = (fde->type == FdType::DevNull) ? 0x0103 :
                       (fde->type == FdType::DevUrandom) ? 0x0109 :
@@ -6255,7 +6255,7 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
 
     if (fde->type == FdType::Pipe) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
-        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        memset(raw, 0, sizeof(LinuxStat));
         st->st_mode = 0010666; // S_IFIFO | rw-rw-rw-
         st->st_blksize = 4096;
         return 0;
@@ -6263,7 +6263,7 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
 
     if (fde->type == FdType::SyntheticMem) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
-        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        memset(raw, 0, sizeof(LinuxStat));
         st->st_mode = 0100444; // S_IFREG | r--r--r--
         if (fde->handle) {
             auto* content = static_cast<const char*>(fde->handle);
@@ -6277,7 +6277,7 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
 
     if (fde->type == FdType::Socket) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
-        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        memset(raw, 0, sizeof(LinuxStat));
         st->st_mode = 0140666; // S_IFSOCK | rw-rw-rw-
         st->st_blksize = 4096;
         return 0;
@@ -6285,7 +6285,7 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
 
     if (fde->type == FdType::EventFd) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
-        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        memset(raw, 0, sizeof(LinuxStat));
         st->st_mode = 0100666; // S_IFREG | rw-rw-rw-
         st->st_blksize = 4096;
         return 0;
@@ -6293,7 +6293,7 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
 
     if (fde->type == FdType::EpollFd) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
-        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        memset(raw, 0, sizeof(LinuxStat));
         st->st_mode = 0100666;
         st->st_blksize = 4096;
         return 0;
@@ -6301,7 +6301,7 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
 
     if (fde->type == FdType::TimerFd) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
-        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        memset(raw, 0, sizeof(LinuxStat));
         st->st_mode = 0100666;
         st->st_blksize = 4096;
         return 0;
@@ -6310,7 +6310,7 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
     if (fde->type == FdType::MemFd && fde->handle) {
         auto* mfd = static_cast<MemFdData*>(fde->handle);
         auto* raw = reinterpret_cast<uint8_t*>(st);
-        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        memset(raw, 0, sizeof(LinuxStat));
         st->st_mode = 0100666; // S_IFREG | rw-rw-rw-
         st->st_size = static_cast<int64_t>(mfd->size);
         st->st_blksize = 4096;
@@ -6320,7 +6320,7 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
 
     if (fde->type == FdType::UnixSocket) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
-        for (uint64_t i = 0; i < sizeof(LinuxStat); ++i) raw[i] = 0;
+        memset(raw, 0, sizeof(LinuxStat));
         st->st_mode = 0140666; // S_IFSOCK | rw-rw-rw-
         st->st_blksize = 4096;
         return 0;
@@ -10731,8 +10731,7 @@ static int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
     if (domain == AF_UNIX) {
         auto* usd = static_cast<UnixSocketData*>(kmalloc(sizeof(UnixSocketData)));
         if (!usd) return -ENOMEM;
-        for (uint64_t i = 0; i < sizeof(UnixSocketData); i++)
-            reinterpret_cast<uint8_t*>(usd)[i] = 0;
+        memset(usd, 0, sizeof(UnixSocketData));
         usd->state    = UnixSocketData::State::Unbound;
         usd->nonblock = (type & UNIX_SOCK_NONBLOCK) != 0;
         usd->refCount = 1;
@@ -10852,10 +10851,8 @@ static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
             if (fdqSC)  kfree(fdqSC);
             return -ENOMEM;
         }
-        for (uint64_t i = 0; i < sizeof(UnixFdQueue); i++) {
-            reinterpret_cast<uint8_t*>(fdqCS)[i] = 0;
-            reinterpret_cast<uint8_t*>(fdqSC)[i] = 0;
-        }
+        memset(fdqCS, 0, sizeof(UnixFdQueue));
+        memset(fdqSC, 0, sizeof(UnixFdQueue));
         pipeCS->readers = 1; pipeCS->writers = 1;
         pipeSC->readers = 1; pipeSC->writers = 1;
         fdqCS->refCount = 1; // client side will point at it as peerIncomingFds; server gets a ref in accept

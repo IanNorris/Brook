@@ -20,6 +20,7 @@
 #include "memory/physical_memory.h"
 #include "memory/address.h"
 #include "mem_tag.h"
+#include "string.h"
 
 MODULE_IMPORT_SYMBOL(PciFindDevice);
 MODULE_IMPORT_SYMBOL(PciEnableMemSpace);
@@ -204,7 +205,7 @@ static bool AllocQueue(VirtqState& q, uint16_t queueSize)
     if (!qAddr) return false;
 
     uint8_t* base = reinterpret_cast<uint8_t*>(qAddr.raw());
-    for (uint32_t i = 0; i < totalPages * 4096; ++i) base[i] = 0;
+    memset(base, 0, totalPages * 4096);
 
     q.descTable  = reinterpret_cast<VirtqDesc*>(base);
     q.availFlags = reinterpret_cast<uint16_t*>(base + descPages * 4096);
@@ -241,7 +242,7 @@ static bool AllocRxBuffers()
     g_rxBufsPhys = VmmVirtToPhys(KernelPageTable, vaddr).raw();
 
     // Zero all buffers
-    for (uint32_t i = 0; i < totalSize; i++) g_rxBufs[i] = 0;
+    memset(g_rxBufs, 0, totalSize);
 
     return true;
 }

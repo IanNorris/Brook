@@ -18,6 +18,7 @@
 #include "memory/address.h"
 #include "memory/heap.h"
 #include "mem_tag.h"
+#include "string.h"
 
 namespace brook {
 
@@ -1937,7 +1938,7 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
         return res;
     }
     auto* kVfb = reinterpret_cast<uint32_t*>(kAddr.raw());
-    for (uint64_t i = 0; i < bytes / 4; ++i) kVfb[i] = 0;
+    memset(kVfb, 0, bytes);
 
     // Map the same physical pages into the calling process's address
     // space, user-readable.  Reuse the user-mmap window allocator
@@ -2029,7 +2030,7 @@ int WmResizeVfbForProcess(Process* proc, uint32_t wmId,
         return -12; // -ENOMEM
     }
     auto* newKVfb = reinterpret_cast<uint32_t*>(newKAddr.raw());
-    for (uint64_t i = 0; i < roundedBytes / 4; ++i) newKVfb[i] = 0;
+    memset(newKVfb, 0, roundedBytes);
 
     // Carve a fresh user-VA range for the new mapping (we don't try to
     // reuse the old userBase to avoid TLB races; we unmap the old one

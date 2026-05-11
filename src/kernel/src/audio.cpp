@@ -9,6 +9,7 @@
 #include "kprintf.h"
 #include "memory/heap.h"
 #include "spinlock.h"
+#include "string.h"
 
 namespace brook {
 
@@ -35,11 +36,9 @@ void AudioMixerInit()
     g_mixBuf = static_cast<int32_t*>(kmalloc(MIXER_BUF_FRAMES * 2 * sizeof(int32_t)));
     if (g_mixBuf)
     {
-        for (uint32_t i = 0; i < MIXER_BUF_FRAMES * 2; i++)
-            g_mixBuf[i] = 0;
+        memset(g_mixBuf, 0, MIXER_BUF_FRAMES * 2 * sizeof(int32_t));
         g_mixFrames = 0;
-        for (uint32_t i = 0; i < MIXER_MAX_STREAMS; i++)
-            g_mixStreamPos[i] = 0;
+        memset(g_mixStreamPos, 0, MIXER_MAX_STREAMS * sizeof(g_mixStreamPos[0]));
         g_mixerReady = true;
     }
 }
@@ -105,8 +104,7 @@ static void AudioMixerFlushLocked()
 
     // Clear the flushed region and reset stream positions
     uint32_t flushedFrames = g_mixFrames;
-    for (uint32_t i = 0; i < flushedFrames * 2; i++)
-        g_mixBuf[i] = 0;
+    memset(g_mixBuf, 0, flushedFrames * 2 * sizeof(int32_t));
 
     // Adjust stream positions: subtract flushed amount (they start fresh)
     for (uint32_t i = 0; i < MIXER_MAX_STREAMS; i++)

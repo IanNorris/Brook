@@ -28,6 +28,7 @@
 #include "input.h"
 #include "device.h"
 #include "memory/heap.h"
+#include "string.h"
 
 MODULE_IMPORT_SYMBOL(PciFindDevice);
 MODULE_IMPORT_SYMBOL(PciFindNextDevice);
@@ -416,8 +417,7 @@ static void* AllocDmaBuffer(uint32_t pages, uint64_t& outPhys)
 
     // Zero the buffer
     auto* ptr = reinterpret_cast<uint8_t*>(virt.raw());
-    for (uint32_t i = 0; i < pages * 4096; i++)
-        ptr[i] = 0;
+    memset(ptr, 0, pages * 4096);
 
     return ptr;
 }
@@ -1402,7 +1402,7 @@ static bool XhciConfigureInterruptEndpoint(XhciController& ctrl, XhciDevice& dev
 
     // Reuse the input context — zero it first
     auto* input = static_cast<uint8_t*>(dev.inputCtx);
-    for (uint32_t i = 0; i < ctxSize * 33; i++) input[i] = 0;
+    memset(input, 0, ctxSize * 33);
 
     // Input Control Context: add slot + the interrupt endpoint
     auto* icc = reinterpret_cast<uint32_t*>(input);
@@ -1787,7 +1787,7 @@ static bool XhciConfigureBulkEndpoint(XhciController& ctrl, XhciDevice& dev,
     uint32_t ctxSize = CtxEntrySize(ctrl);
 
     auto* input = static_cast<uint8_t*>(dev.inputCtx);
-    for (uint32_t i = 0; i < ctxSize * 33; i++) input[i] = 0;
+    memset(input, 0, ctxSize * 33);
 
     auto* icc = reinterpret_cast<uint32_t*>(input);
     icc[1] = (1 << 0) | (1 << dci); // Add Slot + EP
@@ -1939,8 +1939,7 @@ static bool XhciMscCommand(XhciController& ctrl, XhciDevice& dev,
     if (!cbw) return false;
 
     // Fill CBW
-    for (uint32_t i = 0; i < sizeof(UsbMscCbw); i++)
-        reinterpret_cast<uint8_t*>(cbw)[i] = 0;
+    memset(cbw, 0, sizeof(UsbMscCbw));
     cbw->dCBWSignature = CBW_SIGNATURE;
     cbw->dCBWTag = ++dev.mscTag;
     cbw->dCBWDataTransferLength = dataLen;
@@ -1971,8 +1970,7 @@ static bool XhciMscCommand(XhciController& ctrl, XhciDevice& dev,
     auto* csw = static_cast<UsbMscCsw*>(AllocDmaBuffer(1, cswPhys));
     if (!csw) return false;
 
-    for (uint32_t i = 0; i < sizeof(UsbMscCsw); i++)
-        reinterpret_cast<uint8_t*>(csw)[i] = 0;
+    memset(csw, 0, sizeof(UsbMscCsw));
 
     if (!XhciBulkTransfer(ctrl, dev, true, csw, cswPhys, sizeof(UsbMscCsw))) {
         SerialPuts("xhci: MSC CSW receive failed\n");
@@ -2000,7 +1998,7 @@ static bool XhciMscInquiry(XhciController& ctrl, XhciDevice& dev)
     auto* data = static_cast<uint8_t*>(AllocDmaBuffer(1, dataPhys));
     if (!data) return false;
 
-    for (uint32_t i = 0; i < 4096; i++) data[i] = 0;
+    memset(data, 0, 4096);
 
     uint8_t cdb[6] = {};
     cdb[0] = SCSI_INQUIRY;
@@ -2038,7 +2036,7 @@ static bool XhciMscReadCapacity(XhciController& ctrl, XhciDevice& dev)
     auto* data = static_cast<uint8_t*>(AllocDmaBuffer(1, dataPhys));
     if (!data) return false;
 
-    for (uint32_t i = 0; i < 4096; i++) data[i] = 0;
+    memset(data, 0, 4096);
 
     uint8_t cdb[10] = {};
     cdb[0] = SCSI_READ_CAPACITY_10;
