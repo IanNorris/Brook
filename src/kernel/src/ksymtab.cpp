@@ -175,6 +175,14 @@ EXPORT_SYMBOL_NAMED(NetReceive,    "_ZN5brook10NetReceiveEPNS_5NetIfEPKvj");
 // Audio
 EXPORT_SYMBOL(AudioRegister);
 
+// C runtime support (compiler may emit calls to these)
+extern "C" void* memcpy(void* dest, const void* src, uint64_t n);
+extern "C" void* memset(void* dest, int c, uint64_t n);
+extern "C" void* memmove(void* dest, const void* src, uint64_t n);
+EXPORT_SYMBOL(memcpy);
+EXPORT_SYMBOL(memset);
+EXPORT_SYMBOL(memmove);
+
 // Timer / timing
 namespace brook { extern volatile uint64_t g_lapicTickCount; }
 static __attribute__((section(".ksymtab"), used)) const brook::KernelSymbol

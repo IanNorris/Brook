@@ -337,6 +337,8 @@ qemu-system-x86_64 \
     -device qemu-xhci,id=xhci \
     -device usb-kbd,bus=xhci.0 \
     -device usb-mouse,bus=xhci.0 \
+    -drive if=none,id=usbdisk,file="${SCRIPT_DIR}/../usb_test.img",format=raw \
+    -device usb-storage,bus=xhci.0,drive=usbdisk \
     ${AUDIO_OPTS} \
     ${NETDEV_OPT} \
     ${SERIAL_OPT} \

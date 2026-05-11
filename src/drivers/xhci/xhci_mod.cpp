@@ -25,6 +25,8 @@
 #include "memory/address.h"
 #include "mem_tag.h"
 #include "input.h"
+#include "device.h"
+#include "memory/heap.h"
 
 MODULE_IMPORT_SYMBOL(PciFindDevice);
 MODULE_IMPORT_SYMBOL(PciFindNextDevice);
@@ -47,6 +49,7 @@ MODULE_IMPORT_SYMBOL(InputRegister);
 MODULE_IMPORT_SYMBOL(InputWakeWaiters);
 MODULE_IMPORT_SYMBOL(kmalloc);
 MODULE_IMPORT_SYMBOL(kfree);
+MODULE_IMPORT_SYMBOL(DeviceRegister);
 
 using namespace brook;
 
@@ -263,6 +266,14 @@ static constexpr uint8_t USB_CLASS_MASS_STORAGE = 8;
 static constexpr uint8_t USB_HID_SUBCLASS_BOOT = 1;
 static constexpr uint8_t USB_HID_PROTOCOL_KEYBOARD = 1;
 static constexpr uint8_t USB_HID_PROTOCOL_MOUSE = 2;
+
+// Mass Storage subclass/protocol
+static constexpr uint8_t USB_MSC_SUBCLASS_SCSI    = 0x06; // SCSI transparent command set
+static constexpr uint8_t USB_MSC_PROTOCOL_BBB     = 0x50; // Bulk-Only (BBB) transport
+
+// Mass Storage class-specific requests
+static constexpr uint8_t USB_MSC_REQ_RESET        = 0xFF;
+static constexpr uint8_t USB_MSC_REQ_GET_MAX_LUN  = 0xFE;
 
 // USB setup packet
 struct UsbSetupPacket {
@@ -871,9 +882,33 @@ struct XhciDevice {
     bool     intCycle;
     uint32_t intDci;            // device context index for interrupt EP
 
+    // Bulk endpoints (for mass storage)
+    uint8_t  bulkInAddr;        // bulk IN endpoint address
+    uint8_t  bulkOutAddr;       // bulk OUT endpoint address
+    uint16_t bulkInMaxPacket;
+    uint16_t bulkOutMaxPacket;
+
+    Trb*     bulkInRing;
+    uint64_t bulkInRingPhys;
+    uint32_t bulkInEnqueue;
+    bool     bulkInCycle;
+    uint32_t bulkInDci;
+
+    Trb*     bulkOutRing;
+    uint64_t bulkOutRingPhys;
+    uint32_t bulkOutEnqueue;
+    bool     bulkOutCycle;
+    uint32_t bulkOutDci;
+
     bool     configured;
     bool     isKeyboard;
     bool     isMouse;
+    bool     isMassStorage;
+
+    // Mass storage state
+    uint32_t mscTag;            // CBW tag counter
+    uint64_t mscSectorCount;    // total sectors
+    uint32_t mscBlockSize;      // bytes per sector (usually 512)
 
     void*    priv;          // driver-private (DMA report buffer for HID)
 };
@@ -1229,6 +1264,12 @@ static bool XhciConfigureDevice(XhciController& ctrl, XhciDevice& dev)
                 if (iface->bInterfaceProtocol == USB_HID_PROTOCOL_MOUSE)
                     dev.isMouse = true;
             }
+
+            if (iface->bInterfaceClass == USB_CLASS_MASS_STORAGE &&
+                iface->bInterfaceSubClass == USB_MSC_SUBCLASS_SCSI &&
+                iface->bInterfaceProtocol == USB_MSC_PROTOCOL_BBB) {
+                dev.isMassStorage = true;
+            }
         }
 
         if (dType == USB_DESC_ENDPOINT && dLen >= sizeof(UsbEndpointDescriptor)) {
@@ -1247,6 +1288,17 @@ static bool XhciConfigureDevice(XhciController& ctrl, XhciDevice& dev)
                 dev.interruptEpAddr = epAddr;
                 dev.interruptMaxPacket = ep->wMaxPacketSize;
                 dev.interruptInterval = ep->bInterval;
+            }
+
+            // Remember bulk endpoints for mass storage
+            if (epType == 2) { // Bulk
+                if (isIn) {
+                    dev.bulkInAddr = epAddr;
+                    dev.bulkInMaxPacket = ep->wMaxPacketSize;
+                } else {
+                    dev.bulkOutAddr = epAddr;
+                    dev.bulkOutMaxPacket = ep->wMaxPacketSize;
+                }
             }
         }
 
@@ -1659,6 +1711,545 @@ static void XhciMousePoll(InputDevice* /*dev*/)
 }
 
 // ---------------------------------------------------------------------------
+// Phase 8: Bulk transfer support for USB Mass Storage
+// ---------------------------------------------------------------------------
+
+// Configure a bulk endpoint in the xHCI (IN or OUT)
+static bool XhciConfigureBulkEndpoint(XhciController& ctrl, XhciDevice& dev,
+                                       uint8_t epAddr, uint16_t maxPacket,
+                                       Trb*& ring, uint64_t& ringPhys,
+                                       uint32_t& enqueue, bool& cycle,
+                                       uint32_t& dci)
+{
+    uint8_t epNum = epAddr & 0x0F;
+    bool isIn = (epAddr & 0x80) != 0;
+    dci = epNum * 2 + (isIn ? 1 : 0);
+
+    SerialPrintf("xhci: configuring bulk EP 0x%02x (DCI %u)\n", epAddr, dci);
+
+    if (!XhciAllocTransferRing(ring, ringPhys, enqueue, cycle)) {
+        SerialPuts("xhci: failed to allocate bulk transfer ring\n");
+        return false;
+    }
+
+    uint32_t ctxSize = CtxEntrySize(ctrl);
+
+    auto* input = static_cast<uint8_t*>(dev.inputCtx);
+    for (uint32_t i = 0; i < ctxSize * 33; i++) input[i] = 0;
+
+    auto* icc = reinterpret_cast<uint32_t*>(input);
+    icc[1] = (1 << 0) | (1 << dci); // Add Slot + EP
+
+    // Copy slot context from output
+    auto* slotCtx = reinterpret_cast<uint32_t*>(input + ctxSize);
+    auto* outSlot = reinterpret_cast<uint32_t*>(
+        static_cast<uint8_t*>(dev.outputCtx));
+    slotCtx[0] = outSlot[0];
+    slotCtx[1] = outSlot[1];
+    slotCtx[2] = outSlot[2];
+    slotCtx[3] = outSlot[3];
+
+    // Update Context Entries to include this DCI if it's the highest
+    uint32_t curEntries = (slotCtx[0] >> 27) & 0x1F;
+    if (dci > curEntries)
+        slotCtx[0] = (slotCtx[0] & ~(0x1F << 27)) | (dci << 27);
+
+    // Endpoint Context
+    auto* epCtx = reinterpret_cast<uint32_t*>(input + ctxSize * (dci + 1));
+
+    // EP Type: 2 = Bulk OUT, 6 = Bulk IN
+    uint32_t epType = isIn ? 6 : 2;
+    epCtx[1] = (3 << 1) |            // CErr = 3
+               (epType << 3) |       // EP Type
+               (maxPacket << 16);     // Max Packet Size
+
+    // TR Dequeue Pointer with DCS=1
+    uint64_t trDqp = ringPhys | 1;
+    epCtx[2] = static_cast<uint32_t>(trDqp);
+    epCtx[3] = static_cast<uint32_t>(trDqp >> 32);
+
+    // Average TRB Length = max packet, Max ESIT = 0 for bulk
+    epCtx[4] = maxPacket;
+
+    __asm__ volatile("mfence" ::: "memory");
+
+    XhciSubmitCommand(ctrl, dev.inputCtxPhys, 0,
+                      TRB_TYPE_CONFIG_EP | (dev.slotId << 24));
+
+    Trb* evt = XhciWaitForEvent(ctrl, TRB_TYPE_CMD_COMPLETION, 2000);
+    if (!evt) {
+        SerialPuts("xhci: Configure Bulk EP timeout\n");
+        return false;
+    }
+
+    uint32_t cc = (evt->status >> TRB_CC_SHIFT) & 0xFF;
+    if (cc != TRB_CC_SUCCESS) {
+        SerialPrintf("xhci: Configure Bulk EP failed (cc=%u)\n", cc);
+        return false;
+    }
+
+    SerialPrintf("xhci: bulk endpoint 0x%02x configured (DCI %u)\n", epAddr, dci);
+    return true;
+}
+
+// Perform a bulk transfer (IN or OUT)
+static bool XhciBulkTransfer(XhciController& ctrl, XhciDevice& dev,
+                              bool isIn, void* buf, uint64_t bufPhys,
+                              uint32_t len, uint32_t timeoutMs = 5000)
+{
+    Trb*&     ring    = isIn ? dev.bulkInRing    : dev.bulkOutRing;
+    uint32_t& enqueue = isIn ? dev.bulkInEnqueue : dev.bulkOutEnqueue;
+    bool&     cycle   = isIn ? dev.bulkInCycle   : dev.bulkOutCycle;
+    uint32_t  dci     = isIn ? dev.bulkInDci     : dev.bulkOutDci;
+
+    if (!ring) return false;
+
+    // Handle ring wrap
+    if (enqueue >= XFER_RING_SIZE - 1) {
+        ring[XFER_RING_SIZE - 1].control =
+            TRB_TYPE_LINK | TRB_TC | (cycle ? TRB_CYCLE : 0);
+        cycle = !cycle;
+        enqueue = 0;
+    }
+
+    Trb& trb = ring[enqueue];
+    trb.param = bufPhys;
+    trb.status = len;
+    trb.control = TRB_TYPE_NORMAL | TRB_IOC | (cycle ? TRB_CYCLE : 0);
+    enqueue++;
+
+    __asm__ volatile("mfence" ::: "memory");
+
+    XhciRingDoorbell(ctrl, dev.slotId, dci);
+
+    Trb* evt = XhciWaitForEvent(ctrl, TRB_TYPE_TRANSFER_EVENT, timeoutMs);
+    if (!evt) {
+        SerialPrintf("xhci: bulk %s transfer timeout\n", isIn ? "IN" : "OUT");
+        return false;
+    }
+
+    uint32_t cc = (evt->status >> TRB_CC_SHIFT) & 0xFF;
+    if (cc != TRB_CC_SUCCESS && cc != TRB_CC_SHORT_PACKET) {
+        SerialPrintf("xhci: bulk %s transfer failed (cc=%u)\n",
+                     isIn ? "IN" : "OUT", cc);
+        return false;
+    }
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// USB Mass Storage Bulk-Only (BBB) protocol
+// ---------------------------------------------------------------------------
+
+// Command Block Wrapper (CBW) — 31 bytes, sent via Bulk OUT
+struct UsbMscCbw {
+    uint32_t dCBWSignature;        // 0x43425355 = "USBC"
+    uint32_t dCBWTag;
+    uint32_t dCBWDataTransferLength;
+    uint8_t  bmCBWFlags;           // bit 7: 0=OUT, 1=IN
+    uint8_t  bCBWLUN;
+    uint8_t  bCBWCBLength;         // length of CBWCB (1-16)
+    uint8_t  CBWCB[16];            // SCSI command block
+} __attribute__((packed));
+static_assert(sizeof(UsbMscCbw) == 31, "CBW must be 31 bytes");
+
+// Command Status Wrapper (CSW) — 13 bytes, received via Bulk IN
+struct UsbMscCsw {
+    uint32_t dCSWSignature;        // 0x53425355 = "USBS"
+    uint32_t dCSWTag;
+    uint32_t dCSWDataResidue;
+    uint8_t  bCSWStatus;           // 0=passed, 1=failed, 2=phase error
+} __attribute__((packed));
+static_assert(sizeof(UsbMscCsw) == 13, "CSW must be 13 bytes");
+
+static constexpr uint32_t CBW_SIGNATURE = 0x43425355;
+static constexpr uint32_t CSW_SIGNATURE = 0x53425355;
+static constexpr uint8_t  CBW_FLAG_IN   = 0x80;
+static constexpr uint8_t  CBW_FLAG_OUT  = 0x00;
+
+// SCSI command opcodes
+static constexpr uint8_t SCSI_TEST_UNIT_READY  = 0x00;
+static constexpr uint8_t SCSI_INQUIRY          = 0x12;
+static constexpr uint8_t SCSI_READ_CAPACITY_10 = 0x25;
+static constexpr uint8_t SCSI_READ_10          = 0x28;
+static constexpr uint8_t SCSI_WRITE_10         = 0x2A;
+
+// Execute a SCSI command via BBB protocol
+static bool XhciMscCommand(XhciController& ctrl, XhciDevice& dev,
+                            const uint8_t* cdb, uint8_t cdbLen,
+                            void* data, uint64_t dataPhys, uint32_t dataLen,
+                            bool dataIn)
+{
+    // Allocate DMA buffer for CBW
+    uint64_t cbwPhys;
+    auto* cbw = static_cast<UsbMscCbw*>(AllocDmaBuffer(1, cbwPhys));
+    if (!cbw) return false;
+
+    // Fill CBW
+    for (uint32_t i = 0; i < sizeof(UsbMscCbw); i++)
+        reinterpret_cast<uint8_t*>(cbw)[i] = 0;
+    cbw->dCBWSignature = CBW_SIGNATURE;
+    cbw->dCBWTag = ++dev.mscTag;
+    cbw->dCBWDataTransferLength = dataLen;
+    cbw->bmCBWFlags = dataIn ? CBW_FLAG_IN : CBW_FLAG_OUT;
+    cbw->bCBWLUN = 0;
+    cbw->bCBWCBLength = cdbLen;
+    for (uint8_t i = 0; i < cdbLen && i < 16; i++)
+        cbw->CBWCB[i] = cdb[i];
+
+    __asm__ volatile("mfence" ::: "memory");
+
+    // 1. Send CBW via Bulk OUT
+    if (!XhciBulkTransfer(ctrl, dev, false, cbw, cbwPhys, sizeof(UsbMscCbw))) {
+        SerialPuts("xhci: MSC CBW send failed\n");
+        return false;
+    }
+
+    // 2. Data phase (if any)
+    if (dataLen > 0 && data) {
+        if (!XhciBulkTransfer(ctrl, dev, dataIn, data, dataPhys, dataLen)) {
+            SerialPrintf("xhci: MSC data %s failed\n", dataIn ? "IN" : "OUT");
+            return false;
+        }
+    }
+
+    // 3. Receive CSW via Bulk IN
+    uint64_t cswPhys;
+    auto* csw = static_cast<UsbMscCsw*>(AllocDmaBuffer(1, cswPhys));
+    if (!csw) return false;
+
+    for (uint32_t i = 0; i < sizeof(UsbMscCsw); i++)
+        reinterpret_cast<uint8_t*>(csw)[i] = 0;
+
+    if (!XhciBulkTransfer(ctrl, dev, true, csw, cswPhys, sizeof(UsbMscCsw))) {
+        SerialPuts("xhci: MSC CSW receive failed\n");
+        return false;
+    }
+
+    if (csw->dCSWSignature != CSW_SIGNATURE) {
+        SerialPrintf("xhci: MSC bad CSW signature 0x%08x\n", csw->dCSWSignature);
+        return false;
+    }
+
+    if (csw->bCSWStatus != 0) {
+        SerialPrintf("xhci: MSC command failed (status=%u residue=%u)\n",
+                     csw->bCSWStatus, csw->dCSWDataResidue);
+        return false;
+    }
+
+    return true;
+}
+
+// SCSI INQUIRY — identify the device
+static bool XhciMscInquiry(XhciController& ctrl, XhciDevice& dev)
+{
+    uint64_t dataPhys;
+    auto* data = static_cast<uint8_t*>(AllocDmaBuffer(1, dataPhys));
+    if (!data) return false;
+
+    for (uint32_t i = 0; i < 4096; i++) data[i] = 0;
+
+    uint8_t cdb[6] = {};
+    cdb[0] = SCSI_INQUIRY;
+    cdb[4] = 36; // allocation length
+
+    if (!XhciMscCommand(ctrl, dev, cdb, 6, data, dataPhys, 36, true)) {
+        SerialPuts("xhci: SCSI INQUIRY failed\n");
+        return false;
+    }
+
+    // data[0] bits 4:0 = peripheral device type (0=disk)
+    // data[8..15] = vendor, data[16..31] = product
+    char vendor[9] = {};
+    char product[17] = {};
+    for (int i = 0; i < 8; i++) vendor[i] = data[8 + i];
+    for (int i = 0; i < 16; i++) product[i] = data[16 + i];
+
+    SerialPrintf("xhci: SCSI device type=%u vendor='%s' product='%s'\n",
+                 data[0] & 0x1F, vendor, product);
+    return true;
+}
+
+// SCSI TEST UNIT READY
+static bool XhciMscTestUnitReady(XhciController& ctrl, XhciDevice& dev)
+{
+    uint8_t cdb[6] = {};
+    cdb[0] = SCSI_TEST_UNIT_READY;
+    return XhciMscCommand(ctrl, dev, cdb, 6, nullptr, 0, 0, false);
+}
+
+// SCSI READ CAPACITY(10) — get disk size
+static bool XhciMscReadCapacity(XhciController& ctrl, XhciDevice& dev)
+{
+    uint64_t dataPhys;
+    auto* data = static_cast<uint8_t*>(AllocDmaBuffer(1, dataPhys));
+    if (!data) return false;
+
+    for (uint32_t i = 0; i < 4096; i++) data[i] = 0;
+
+    uint8_t cdb[10] = {};
+    cdb[0] = SCSI_READ_CAPACITY_10;
+
+    if (!XhciMscCommand(ctrl, dev, cdb, 10, data, dataPhys, 8, true)) {
+        SerialPuts("xhci: SCSI READ CAPACITY failed\n");
+        return false;
+    }
+
+    // Response is 8 bytes, big-endian:
+    // bytes 0-3: last logical block address
+    // bytes 4-7: block length in bytes
+    uint32_t lastLba = (static_cast<uint32_t>(data[0]) << 24) |
+                       (static_cast<uint32_t>(data[1]) << 16) |
+                       (static_cast<uint32_t>(data[2]) << 8)  |
+                       static_cast<uint32_t>(data[3]);
+    uint32_t blockLen = (static_cast<uint32_t>(data[4]) << 24) |
+                        (static_cast<uint32_t>(data[5]) << 16) |
+                        (static_cast<uint32_t>(data[6]) << 8)  |
+                        static_cast<uint32_t>(data[7]);
+
+    dev.mscSectorCount = static_cast<uint64_t>(lastLba) + 1;
+    dev.mscBlockSize = blockLen;
+
+    uint32_t sizeMB = static_cast<uint32_t>(
+        (dev.mscSectorCount * dev.mscBlockSize) / (1024 * 1024));
+    SerialPrintf("xhci: disk capacity: %u sectors × %u bytes = %u MB\n",
+                 static_cast<uint32_t>(dev.mscSectorCount), blockLen, sizeMB);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Block device ops for USB mass storage
+// ---------------------------------------------------------------------------
+
+// Forward declarations for the DeviceOps callbacks
+static int UsbMscRead(Device* dev, uint64_t offset, void* buf, uint64_t len);
+static int UsbMscWrite(Device* dev, uint64_t offset, const void* buf, uint64_t len);
+static int UsbMscIoctl(Device* dev, uint32_t cmd, void* arg);
+static void UsbMscClose(Device* dev);
+static uint64_t UsbMscBlockCount(Device* dev);
+static uint32_t UsbMscBlockSize(Device* dev);
+
+// Per-device state passed through Device::priv
+struct UsbMscState {
+    XhciController* ctrl;
+    uint32_t devIndex;   // index into g_devices
+};
+
+static const BlockDeviceOps g_usbMscOps = {
+    .read        = UsbMscRead,
+    .write       = UsbMscWrite,
+    .ioctl       = UsbMscIoctl,
+    .close       = UsbMscClose,
+    .block_count = UsbMscBlockCount,
+    .block_size  = UsbMscBlockSize,
+};
+
+// Read sectors from USB mass storage
+static int UsbMscRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
+{
+    auto* st = static_cast<UsbMscState*>(dev->priv);
+    XhciDevice& udev = g_devices[st->devIndex];
+    uint32_t blockSize = udev.mscBlockSize;
+    if (blockSize == 0) return -1;
+
+    uint64_t startSector = offset / blockSize;
+    uint64_t sectorCount = len / blockSize;
+    if (sectorCount == 0) return 0;
+
+    // Limit to 128 sectors per transfer (64KB with 512B sectors)
+    static constexpr uint32_t MAX_SECTORS_PER_XFER = 128;
+
+    auto* dst = static_cast<uint8_t*>(buf);
+    uint64_t totalRead = 0;
+
+    while (sectorCount > 0) {
+        uint32_t batch = sectorCount > MAX_SECTORS_PER_XFER
+                             ? MAX_SECTORS_PER_XFER
+                             : static_cast<uint32_t>(sectorCount);
+        uint32_t xferLen = batch * blockSize;
+
+        // Allocate DMA buffer for the read
+        uint64_t dmaPhys;
+        auto* dmaBuf = static_cast<uint8_t*>(AllocDmaBuffer(
+            (xferLen + 4095) / 4096, dmaPhys));
+        if (!dmaBuf) return -1;
+
+        uint8_t cdb[10] = {};
+        cdb[0] = SCSI_READ_10;
+        cdb[2] = static_cast<uint8_t>((startSector >> 24) & 0xFF);
+        cdb[3] = static_cast<uint8_t>((startSector >> 16) & 0xFF);
+        cdb[4] = static_cast<uint8_t>((startSector >> 8)  & 0xFF);
+        cdb[5] = static_cast<uint8_t>(startSector & 0xFF);
+        cdb[7] = static_cast<uint8_t>((batch >> 8) & 0xFF);
+        cdb[8] = static_cast<uint8_t>(batch & 0xFF);
+
+        if (!XhciMscCommand(*st->ctrl, udev, cdb, 10,
+                            dmaBuf, dmaPhys, xferLen, true)) {
+            return static_cast<int>(totalRead);
+        }
+
+        // Copy from DMA buffer to caller's buffer
+        for (uint32_t i = 0; i < xferLen; i++)
+            dst[i] = dmaBuf[i];
+
+        dst += xferLen;
+        startSector += batch;
+        sectorCount -= batch;
+        totalRead += xferLen;
+    }
+
+    return static_cast<int>(totalRead);
+}
+
+// Write sectors to USB mass storage
+static int UsbMscWrite(Device* dev, uint64_t offset, const void* buf, uint64_t len)
+{
+    auto* st = static_cast<UsbMscState*>(dev->priv);
+    XhciDevice& udev = g_devices[st->devIndex];
+    uint32_t blockSize = udev.mscBlockSize;
+    if (blockSize == 0) return -1;
+
+    uint64_t startSector = offset / blockSize;
+    uint64_t sectorCount = len / blockSize;
+    if (sectorCount == 0) return 0;
+
+    static constexpr uint32_t MAX_SECTORS_PER_XFER = 128;
+
+    auto* src = static_cast<const uint8_t*>(buf);
+    uint64_t totalWritten = 0;
+
+    while (sectorCount > 0) {
+        uint32_t batch = sectorCount > MAX_SECTORS_PER_XFER
+                             ? MAX_SECTORS_PER_XFER
+                             : static_cast<uint32_t>(sectorCount);
+        uint32_t xferLen = batch * blockSize;
+
+        uint64_t dmaPhys;
+        auto* dmaBuf = static_cast<uint8_t*>(AllocDmaBuffer(
+            (xferLen + 4095) / 4096, dmaPhys));
+        if (!dmaBuf) return -1;
+
+        // Copy data to DMA buffer
+        for (uint32_t i = 0; i < xferLen; i++)
+            dmaBuf[i] = src[i];
+
+        uint8_t cdb[10] = {};
+        cdb[0] = SCSI_WRITE_10;
+        cdb[2] = static_cast<uint8_t>((startSector >> 24) & 0xFF);
+        cdb[3] = static_cast<uint8_t>((startSector >> 16) & 0xFF);
+        cdb[4] = static_cast<uint8_t>((startSector >> 8)  & 0xFF);
+        cdb[5] = static_cast<uint8_t>(startSector & 0xFF);
+        cdb[7] = static_cast<uint8_t>((batch >> 8) & 0xFF);
+        cdb[8] = static_cast<uint8_t>(batch & 0xFF);
+
+        __asm__ volatile("mfence" ::: "memory");
+
+        if (!XhciMscCommand(*st->ctrl, udev, cdb, 10,
+                            dmaBuf, dmaPhys, xferLen, false)) {
+            return static_cast<int>(totalWritten);
+        }
+
+        src += xferLen;
+        startSector += batch;
+        sectorCount -= batch;
+        totalWritten += xferLen;
+    }
+
+    return static_cast<int>(totalWritten);
+}
+
+static int UsbMscIoctl(Device* /*dev*/, uint32_t /*cmd*/, void* /*arg*/)
+{
+    return -1;
+}
+
+static void UsbMscClose(Device* /*dev*/) {}
+
+static uint64_t UsbMscBlockCount(Device* dev)
+{
+    auto* st = static_cast<UsbMscState*>(dev->priv);
+    return g_devices[st->devIndex].mscSectorCount;
+}
+
+static uint32_t UsbMscBlockSize(Device* dev)
+{
+    auto* st = static_cast<UsbMscState*>(dev->priv);
+    return g_devices[st->devIndex].mscBlockSize;
+}
+
+// Initialize a USB mass storage device after enumeration
+static bool XhciInitMassStorage(XhciController& ctrl, XhciDevice& dev,
+                                 uint32_t devIndex)
+{
+    SerialPuts("xhci: initializing mass storage device\n");
+
+    // Configure bulk IN endpoint
+    if (dev.bulkInAddr) {
+        if (!XhciConfigureBulkEndpoint(ctrl, dev, dev.bulkInAddr,
+                                        dev.bulkInMaxPacket,
+                                        dev.bulkInRing, dev.bulkInRingPhys,
+                                        dev.bulkInEnqueue, dev.bulkInCycle,
+                                        dev.bulkInDci)) {
+            SerialPuts("xhci: failed to configure bulk IN\n");
+            return false;
+        }
+    }
+
+    // Configure bulk OUT endpoint
+    if (dev.bulkOutAddr) {
+        if (!XhciConfigureBulkEndpoint(ctrl, dev, dev.bulkOutAddr,
+                                        dev.bulkOutMaxPacket,
+                                        dev.bulkOutRing, dev.bulkOutRingPhys,
+                                        dev.bulkOutEnqueue, dev.bulkOutCycle,
+                                        dev.bulkOutDci)) {
+            SerialPuts("xhci: failed to configure bulk OUT\n");
+            return false;
+        }
+    }
+
+    // SCSI INQUIRY
+    XhciMscInquiry(ctrl, dev);
+
+    // TEST UNIT READY (may need retries for slow devices)
+    for (int retry = 0; retry < 3; retry++) {
+        if (XhciMscTestUnitReady(ctrl, dev)) break;
+        // Brief delay between retries
+        for (volatile int d = 0; d < 1000000; d++) {}
+    }
+
+    // READ CAPACITY
+    if (!XhciMscReadCapacity(ctrl, dev)) {
+        SerialPuts("xhci: READ CAPACITY failed\n");
+        return false;
+    }
+
+    // Register as block device
+    auto* state = static_cast<UsbMscState*>(kmalloc(sizeof(UsbMscState)));
+    if (!state) return false;
+    state->ctrl = &ctrl;
+    state->devIndex = devIndex;
+
+    auto* blkDev = static_cast<Device*>(kmalloc(sizeof(Device)));
+    if (!blkDev) { kfree(state); return false; }
+
+    blkDev->ops  = reinterpret_cast<const DeviceOps*>(&g_usbMscOps);
+    blkDev->name = "usb0";
+    blkDev->type = DeviceType::Block;
+    blkDev->priv = state;
+
+    if (!DeviceRegister(blkDev)) {
+        SerialPuts("xhci: failed to register USB block device\n");
+        kfree(blkDev);
+        kfree(state);
+        return false;
+    }
+
+    SerialPrintf("xhci: USB mass storage registered as '%s'\n", blkDev->name);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Phase 3+4+5+6 combined: enumerate and configure a connected port
 // ---------------------------------------------------------------------------
 
@@ -1716,6 +2307,13 @@ static void XhciEnumeratePort(XhciController& ctrl, uint32_t portNum,
             g_mousePresent = true;
         }
     }
+
+    // If it's a mass storage device, initialize SCSI and register block device
+    if (dev.isMassStorage && dev.bulkInAddr && dev.bulkOutAddr) {
+        SerialPrintf("xhci: USB mass storage detected on port %u (slot %u)\n",
+                     portNum, dev.slotId);
+        XhciInitMassStorage(ctrl, dev, g_deviceCount - 1);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1743,7 +2341,12 @@ static void XhciScanPorts(XhciController& ctrl)
                      XhciSpeedString(speed),
                      portsc);
 
-        if (connected && !enabled) {
+        if (connected && enabled) {
+            // USB 3.0 (SuperSpeed) ports are auto-enabled — enumerate directly
+            SerialPrintf("xhci: port %u already enabled, enumerating\n", port + 1);
+            XhciEnumeratePort(ctrl, port + 1, speed);
+        }
+        else if (connected && !enabled) {
             // Reset the port to enable it
             SerialPrintf("xhci: resetting port %u...\n", port + 1);
 
