@@ -605,8 +605,14 @@ static uint32_t Ext2AllocBlock(Ext2Mount* mnt)
         for (uint32_t pass = 0; pass < 2; ++pass) {
             uint32_t end = (pass == 0) ? blocksInGroup : start;
             uint32_t bit = (pass == 0) ? start : 0;
-            // Word-at-a-time scan: skip 8 bits at once when fully-set.
+            // 64-bit word-at-a-time scan: skip 64 bits at once when fully set.
             while (bit < end) {
+                // Align to qword boundary for fast scanning
+                if ((bit & 63) == 0 && bit + 64 <= end) {
+                    uint32_t qwordIdx = bit / 64;
+                    uint64_t word = reinterpret_cast<const uint64_t*>(bitmap)[qwordIdx];
+                    if (word == ~uint64_t{0}) { bit += 64; continue; }
+                }
                 uint32_t byteIdx = bit / 8;
                 uint8_t  byte    = bitmap[byteIdx];
                 if (byte == 0xFF) { bit = (byteIdx + 1) * 8; continue; }
