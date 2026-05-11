@@ -128,7 +128,7 @@ Uses `PROCESS_MAGIC` sentinel for use-after-free detection.
 
 1. **Duplicate declaration**: `FdGet` is declared twice in process.h (lines 575 and 581). Harmless but should be cleaned up.
 
-2. **Deterministic AT_RANDOM and stack canary**: `SimpleRand` uses a hardcoded seed (`0xDEADBEEFCAFEBABE`). Stack canary is always `0x57a0000012345678`. Both are predictable. Should use RDRAND if available (the RNG is already available via VirtIO RNG / /dev/urandom).
+2. **~~Deterministic AT_RANDOM and stack canary~~** — **FIXED**: `RandomU64()` uses RDRAND (with TSC fallback) for both AT_RANDOM auxv values and per-process stack canaries. Each process gets unique, unpredictable values.
 
 3. **Self-copy in ProcessCreateThread**: Line 1344 copies `g_sigHandlers[parent->tgid]` to `g_sigHandlers[thread->tgid]`, but `thread->tgid == parent->tgid`, making this a no-op self-copy. Wasted work.
 
