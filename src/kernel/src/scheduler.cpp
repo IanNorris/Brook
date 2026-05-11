@@ -204,6 +204,18 @@ static volatile uint64_t g_totalForks = 0;
 static volatile uint64_t g_reapedUserTicks = 0;
 static volatile uint64_t g_reapedSysTicks = 0;
 
+// EWMA load averages (fixed-point: value * 1000)
+// Linux uses e^(-5/60), e^(-5/300), e^(-5/900) ≈ 0.920, 0.983, 0.994
+// We approximate with integer math: new = old * decay + sample * (1000-decay)
+// All divided by 1000 for scaling.
+static volatile uint32_t g_loadAvg1  = 0;  // 1-minute EWMA * 1000
+static volatile uint32_t g_loadAvg5  = 0;  // 5-minute EWMA * 1000
+static volatile uint32_t g_loadAvg15 = 0;  // 15-minute EWMA * 1000
+static constexpr uint32_t LOAD_DECAY_1  = 920;  // e^(-5/60) * 1000
+static constexpr uint32_t LOAD_DECAY_5  = 983;  // e^(-5/300) * 1000
+static constexpr uint32_t LOAD_DECAY_15 = 994;  // e^(-5/900) * 1000
+static constexpr uint64_t LOAD_SAMPLE_INTERVAL = 5000; // 5 seconds in ms ticks
+
 // ---------------------------------------------------------------------------
 // Ready queue operations — delegate to the pluggable policy module.
 // Caller must hold g_readyLock.
@@ -1024,6 +1036,26 @@ void SchedulerTimerTick(bool allowPreempt)
         uint64_t rlf_tick = SchedLockAcquire(g_readyLock);
         g_schedOps->Tick(g_schedState, g_lapicTickCount);
         SchedLockRelease(g_readyLock, rlf_tick);
+
+        // Sample load average every 5 seconds (on CPU 0 only)
+        if (g_lapicTickCount % LOAD_SAMPLE_INTERVAL == 0)
+        {
+            uint32_t running = 0;
+            uint64_t alf_load = SchedLockAcquire(g_allProcLock);
+            for (uint32_t i = 0; i < g_processCount; ++i)
+            {
+                Process* p = g_allProcesses[i];
+                if (!p) continue;
+                if (p->state == ProcessState::Ready || p->state == ProcessState::Running)
+                    ++running;
+            }
+            SchedLockRelease(g_allProcLock, alf_load);
+
+            uint32_t sample = running * 1000;
+            g_loadAvg1  = (g_loadAvg1  * LOAD_DECAY_1  + sample * (1000 - LOAD_DECAY_1))  / 1000;
+            g_loadAvg5  = (g_loadAvg5  * LOAD_DECAY_5  + sample * (1000 - LOAD_DECAY_5))  / 1000;
+            g_loadAvg15 = (g_loadAvg15 * LOAD_DECAY_15 + sample * (1000 - LOAD_DECAY_15)) / 1000;
+        }
     }
 
     Process* cur = g_perCpu[cpu].currentProcess;
@@ -1848,6 +1880,13 @@ void SchedulerGetProcessCounts(uint32_t& total, uint32_t& running)
             ++running;
     }
     SchedLockRelease(g_allProcLock, flags);
+}
+
+void SchedulerGetLoadAvg(uint32_t& avg1, uint32_t& avg5, uint32_t& avg15)
+{
+    avg1 = g_loadAvg1;
+    avg5 = g_loadAvg5;
+    avg15 = g_loadAvg15;
 }
 
 void SchedulerGetCpuTicks(uint32_t cpuIndex, uint64_t& busyTicks, uint64_t& idleTicks)

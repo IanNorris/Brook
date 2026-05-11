@@ -121,6 +121,9 @@ void SchedulerGetReapedTicks(uint64_t& userTicks, uint64_t& sysTicks);
 // Get total and running process counts for /proc/loadavg
 void SchedulerGetProcessCounts(uint32_t& total, uint32_t& running);
 
+// Get EWMA load averages (each value * 1000 for fixed-point)
+void SchedulerGetLoadAvg(uint32_t& avg1, uint32_t& avg5, uint32_t& avg15);
+
 // Get per-CPU tick counters for /proc/stat.
 // Writes busy and idle tick counts for CPU `cpuIndex`.
 void SchedulerGetCpuTicks(uint32_t cpuIndex, uint64_t& busyTicks, uint64_t& idleTicks);

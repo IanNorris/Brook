@@ -383,15 +383,27 @@ static Vnode* GenLoadavg()
     uint32_t total = 0, running = 0;
     SchedulerGetProcessCounts(total, running);
 
+    uint32_t avg1, avg5, avg15;
+    SchedulerGetLoadAvg(avg1, avg5, avg15);
+
     // Format: 1min 5min 15min running/total lastpid
-    // We approximate load from running count (no EWMA yet)
+    // Values are fixed-point * 1000, so 1500 = "1.50"
     char* p = buf;
-    p = AppendU64(p, running);
-    p = AppendStr(p, ".00 ");
-    p = AppendU64(p, running);
-    p = AppendStr(p, ".00 ");
-    p = AppendU64(p, running);
-    p = AppendStr(p, ".00 ");
+    p = AppendU64(p, avg1 / 1000); *p++ = '.';
+    uint32_t frac1 = (avg1 % 1000) / 10;
+    if (frac1 < 10) *p++ = '0';
+    p = AppendU64(p, frac1);
+    *p++ = ' ';
+    p = AppendU64(p, avg5 / 1000); *p++ = '.';
+    uint32_t frac5 = (avg5 % 1000) / 10;
+    if (frac5 < 10) *p++ = '0';
+    p = AppendU64(p, frac5);
+    *p++ = ' ';
+    p = AppendU64(p, avg15 / 1000); *p++ = '.';
+    uint32_t frac15 = (avg15 % 1000) / 10;
+    if (frac15 < 10) *p++ = '0';
+    p = AppendU64(p, frac15);
+    *p++ = ' ';
     p = AppendU64(p, running);
     *p++ = '/';
     p = AppendU64(p, total);
