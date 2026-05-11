@@ -265,12 +265,21 @@ static Vnode* GenStat()
         totalSys  += snaps[i].sysTicks;
     }
 
-    uint64_t ticks = g_lapicTickCount;
+    // Use actual per-CPU busy/idle counters for the summary line too.
+    // This is more accurate than summing per-process ticks, because per-process
+    // ticks don't account for processes that have already been reaped.
+    uint64_t totalIdle = 0;
+    for (uint32_t c = 0; c < cpuCount; ++c)
+    {
+        uint64_t cpuBusy = 0, cpuIdle = 0;
+        SchedulerGetCpuTicks(c, cpuBusy, cpuIdle);
+        totalIdle += cpuIdle;
+    }
+
     // Convert ms ticks to centiseconds (HZ=100)
     uint64_t user = totalUser / 10;
     uint64_t sys  = totalSys / 10;
-    uint64_t idle = (ticks - totalUser - totalSys) / 10;
-    if (idle > ticks / 10) idle = 0; // underflow guard
+    uint64_t idle = totalIdle / 10;
 
     // Summary line (aggregate across all CPUs)
     uint32_t n = ProcFmt(buf, bufSize,
