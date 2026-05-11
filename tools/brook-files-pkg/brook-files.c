@@ -78,6 +78,16 @@ static int memfd_create_shim(const char *name, unsigned int flags) {
 #define MAX_PATH_LEN 512
 #define MAX_TREE     128
 #define MAX_ASSOC    64
+#define MAX_CRUMBS   32
+
+/* Breadcrumb segment for clickable path navigation */
+typedef struct {
+    int x0, x1;         /* pixel extents in toolbar */
+    int path_end;       /* index into g_cwd where this segment's path ends */
+} Breadcrumb;
+
+static Breadcrumb g_crumbs[MAX_CRUMBS];
+static int        g_crumb_count = 0;
 
 /* ========================= File type associations ========================= */
 
@@ -622,9 +632,50 @@ static void render(void) {
     fill_rect(CHAR_W * 4 + 28, 4, CHAR_W + 8, TOOLBAR_H - 8, COL_TOOLBAR_BTN);
     draw_char(CHAR_W * 4 + 32, tb_vpad, 'R', COL_TEXT);
 
-    /* Path display */
-    int path_x = CHAR_W * 5 + 44;
-    draw_text_clipped(path_x, tb_vpad, g_cwd, COL_TEXT, WIN_W - path_x - 8);
+    /* Breadcrumb path display */
+    int crumb_x = CHAR_W * 5 + 44;
+    int crumb_max_x = WIN_W - 8;
+    g_crumb_count = 0;
+
+    /* Always show root "/" as first crumb */
+    if (g_crumb_count < MAX_CRUMBS) {
+        int sx = crumb_x;
+        draw_text(crumb_x, tb_vpad, "/", COL_DIR_TEXT);
+        crumb_x += CHAR_W + 2;
+        g_crumbs[g_crumb_count].x0 = sx;
+        g_crumbs[g_crumb_count].x1 = crumb_x;
+        g_crumbs[g_crumb_count].path_end = 0; /* "/" */
+        g_crumb_count++;
+    }
+
+    /* Parse remaining path segments */
+    if (g_cwd[0] == '/' && g_cwd[1] != '\0') {
+        const char *p = g_cwd + 1;
+        while (*p && crumb_x < crumb_max_x && g_crumb_count < MAX_CRUMBS) {
+            const char *seg = p;
+            while (*p && *p != '/') p++;
+            int seg_len = (int)(p - seg);
+
+            /* Draw separator */
+            draw_text(crumb_x, tb_vpad, ">", COL_TEXT_DIM);
+            crumb_x += CHAR_W + 2;
+
+            int sx = crumb_x;
+            /* Draw segment text, clipped */
+            for (int i = 0; i < seg_len && crumb_x < crumb_max_x; i++) {
+                draw_char(crumb_x, tb_vpad, seg[i], COL_DIR_TEXT);
+                crumb_x += CHAR_W;
+            }
+            crumb_x += 4; /* padding after segment */
+
+            g_crumbs[g_crumb_count].x0 = sx;
+            g_crumbs[g_crumb_count].x1 = crumb_x;
+            g_crumbs[g_crumb_count].path_end = (int)(p - g_cwd);
+            g_crumb_count++;
+
+            if (*p == '/') p++;
+        }
+    }
 
     /* Pane origins shifted down by toolbar */
     int pane_top = PANES_TOP;
@@ -1004,6 +1055,24 @@ static void on_ptr_button(void *d, struct wl_pointer *p, uint32_t serial,
         else if (mx >= CHAR_W * 4 + 28 && mx < CHAR_W * 5 + 36) {
             scan_directory();
             g_needs_redraw = 1;
+        }
+        /* Breadcrumb click */
+        else {
+            for (int i = 0; i < g_crumb_count; i++) {
+                if (mx >= g_crumbs[i].x0 && mx < g_crumbs[i].x1) {
+                    if (g_crumbs[i].path_end == 0) {
+                        navigate_to("/");
+                    } else {
+                        char target[MAX_PATH_LEN];
+                        int len = g_crumbs[i].path_end;
+                        if (len >= (int)sizeof(target)) len = (int)sizeof(target) - 1;
+                        memcpy(target, g_cwd, (size_t)len);
+                        target[len] = '\0';
+                        navigate_to(target);
+                    }
+                    break;
+                }
+            }
         }
         g_last_click_time = time;
         return;
