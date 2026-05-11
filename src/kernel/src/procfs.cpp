@@ -13,6 +13,7 @@
 #include "serial.h"
 #include "net.h"
 #include "module.h"
+#include "virtio_blk.h"
 
 namespace brook {
 
@@ -69,6 +70,14 @@ static char* AppendStr(char* p, const char* s)
 {
     while (*s) *p++ = *s++;
     return p;
+}
+
+static char* AppendU64(char* p, uint64_t val)
+{
+    char tmp[21];
+    char* end = U64ToDec(tmp, val);
+    *end = '\0';
+    return AppendStr(p, tmp);
 }
 
 static char* I64ToDec(char* buf, int64_t val)
@@ -256,36 +265,25 @@ static Vnode* GenStat()
     auto* buf = static_cast<char*>(kmalloc(bufSize));
     if (!buf) return nullptr;
 
-    // Sum actual CPU time from all processes
-    ProcessSnapshot snaps[MAX_PROCESSES];
-    uint32_t count = SchedulerSnapshotProcesses(snaps, MAX_PROCESSES);
-    uint64_t totalUser = 0, totalSys = 0;
-    for (uint32_t i = 0; i < count; ++i)
-    {
-        totalUser += snaps[i].userTicks;
-        totalSys  += snaps[i].sysTicks;
-    }
-
-    // Use actual per-CPU busy/idle counters for the summary line too.
-    // This is more accurate than summing per-process ticks, because per-process
-    // ticks don't account for processes that have already been reaped.
-    uint64_t totalIdle = 0;
+    // Sum per-CPU counters for both busy (user+system) and idle.
+    // Using per-CPU counters avoids a 153KB stack allocation for process snapshots.
+    uint64_t totalBusy = 0, totalIdle = 0;
     for (uint32_t c = 0; c < cpuCount; ++c)
     {
         uint64_t cpuBusy = 0, cpuIdle = 0;
         SchedulerGetCpuTicks(c, cpuBusy, cpuIdle);
+        totalBusy += cpuBusy;
         totalIdle += cpuIdle;
     }
 
     // Convert ms ticks to centiseconds (HZ=100)
-    uint64_t user = totalUser / 10;
-    uint64_t sys  = totalSys / 10;
+    uint64_t user = totalBusy / 10;
     uint64_t idle = totalIdle / 10;
 
     // Summary line (aggregate across all CPUs)
     uint32_t n = ProcFmt(buf, bufSize,
         "cpu  %lu %lu %lu %lu 0 0 0 0 0 0\n",
-        user, 0UL, sys, idle);
+        user, 0UL, 0UL, idle);
 
     // Per-CPU lines with actual per-CPU tick counters
     for (uint32_t c = 0; c < cpuCount; ++c)
@@ -308,7 +306,7 @@ static Vnode* GenStat()
         "procs_running 1\n"
         "procs_blocked 0\n",
         0UL,  // btime
-        (uint64_t)count);
+        0UL); // processes (cumulative forks — not tracked yet)
 
     return MakeProcVnode(buf, n);
 }
@@ -644,13 +642,7 @@ static bool IsPidPath(const char* path, uint32_t* pid, const char** rest)
 // Find a process snapshot by PID
 static bool FindProcess(uint32_t pid, ProcessSnapshot* out)
 {
-    ProcessSnapshot snaps[MAX_PROCESSES];
-    uint32_t count = SchedulerSnapshotProcesses(snaps, MAX_PROCESSES);
-    for (uint32_t i = 0; i < count; ++i)
-    {
-        if (snaps[i].pid == pid) { *out = snaps[i]; return true; }
-    }
-    return false;
+    return SchedulerSnapshotProcess(static_cast<uint16_t>(pid), out);
 }
 
 // ---- /proc/net/dev — network interface statistics ----
@@ -888,6 +880,56 @@ static Vnode* GenMounts()
     return MakeProcVnode(buf, static_cast<uint32_t>(p - buf));
 }
 
+// ---- /proc/diskstats — block device I/O statistics ----
+
+static Vnode* GenDiskstats()
+{
+    // Format: major minor name reads rd_merged rd_sectors rd_ms writes wr_merged wr_sectors wr_ms io_cur io_ms weighted_ms
+    // We use a simplified form with real read/write counts and sectors.
+    uint32_t bufSize = 512;
+    auto* buf = static_cast<char*>(kmalloc(bufSize));
+    if (!buf) return nullptr;
+
+    char* p = buf;
+    // Iterate virtio block devices (virtio0, virtio1, ...)
+    for (uint32_t i = 0; i < 16; ++i)
+    {
+        char devName[16];
+        devName[0] = 'v'; devName[1] = 'i'; devName[2] = 'r'; devName[3] = 't';
+        devName[4] = 'i'; devName[5] = 'o'; 
+        if (i < 10) { devName[6] = '0' + i; devName[7] = '\0'; }
+        else { devName[6] = '0' + (i / 10); devName[7] = '0' + (i % 10); devName[8] = '\0'; }
+
+        Device* dev = DeviceFind(devName);
+        if (!dev) continue;
+
+        uint64_t rdOps, wrOps, rdBytes, wrBytes;
+        brook::VirtioBlkGetStats(dev, rdOps, wrOps, rdBytes, wrBytes);
+
+        uint64_t rdSectors = rdBytes / 512;
+        uint64_t wrSectors = wrBytes / 512;
+
+        if (static_cast<uint32_t>(p - buf) + 128 >= bufSize) break;
+
+        // major=253 minor=i  (virtio convention)
+        p = AppendStr(p, " 253    ");
+        p = AppendU64(p, i);
+        *p++ = ' ';
+        p = AppendStr(p, devName);
+        *p++ = ' ';
+        p = AppendU64(p, rdOps);
+        p = AppendStr(p, " 0 ");
+        p = AppendU64(p, rdSectors);
+        p = AppendStr(p, " 0 ");
+        p = AppendU64(p, wrOps);
+        p = AppendStr(p, " 0 ");
+        p = AppendU64(p, wrSectors);
+        p = AppendStr(p, " 0 0 0 0\n");
+    }
+    *p = '\0';
+    return MakeProcVnode(buf, static_cast<uint32_t>(p - buf));
+}
+
 // ---- Global file table ----
 
 struct ProcGlobalEntry {
@@ -904,6 +946,7 @@ static ProcGlobalEntry g_globalEntries[] = {
     { "cpuinfo", GenCpuinfo },
     { "modules", GenModules },
     { "mounts",  GenMounts },
+    { "diskstats", GenDiskstats },
 };
 static constexpr uint32_t NUM_GLOBAL = sizeof(g_globalEntries) / sizeof(g_globalEntries[0]);
 
@@ -1100,15 +1143,13 @@ static int ProcRootReaddir(Vnode* /*vn*/, DirEntry* out, uint32_t* cookie)
         return 1;
     }
 
-    // Then: PID directories
+    // Then: PID directories — use indexed lookup to avoid large heap allocation
     uint32_t pidIdx = idx - NUM_GLOBAL;
-    ProcessSnapshot snaps[MAX_PROCESSES];
-    uint32_t count = SchedulerSnapshotProcesses(snaps, MAX_PROCESSES);
-
-    if (pidIdx >= count) return 0;  // end of directory
+    uint16_t pid = 0;
+    if (!SchedulerGetPidByIndex(pidIdx, &pid)) return 0;
 
     char pidStr[8];
-    char* p = U64ToDec(pidStr, snaps[pidIdx].pid);
+    char* p = U64ToDec(pidStr, pid);
     *p = '\0';
     ProcStrCopy(out->name, pidStr, sizeof(out->name));
     out->size = 0;

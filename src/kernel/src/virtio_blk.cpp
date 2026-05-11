@@ -115,6 +115,12 @@ struct VirtioBlkState {
     VirtioBlkCacheEntry* cacheEntries;
     uint8_t*             cacheData;
 
+    // I/O statistics
+    volatile uint64_t readOps;
+    volatile uint64_t writeOps;
+    volatile uint64_t readBytes;
+    volatile uint64_t writeBytes;
+
     // Serialises concurrent requests from multiple processes.  The current
     // driver still uses hardcoded descriptor slots 0-2 and one shared DMA
     // buffer, so only one request can be in-flight at a time.
@@ -416,6 +422,8 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
         }
 
         ReleaseRequestLock(*s);
+        s->readOps++;
+        s->readBytes += bytesRead;
         return static_cast<int>(bytesRead);
     }
 
@@ -454,6 +462,8 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
     }
 
     ReleaseRequestLock(*s);
+    s->readOps++;
+    s->readBytes += bytesRead;
     return static_cast<int>(bytesRead);
 }
 
@@ -531,6 +541,8 @@ static int VirtioBlkWrite(Device* dev, uint64_t offset, const void* buf, uint64_
     }
 
     ReleaseRequestLock(*s);
+    s->writeOps++;
+    s->writeBytes += bytesWritten;
     return static_cast<int>(bytesWritten);
 }
 
@@ -718,6 +730,19 @@ uint32_t VirtioBlkInitAll()
     }
 
     return count;
+}
+
+// I/O statistics for procfs /proc/diskstats
+void VirtioBlkGetStats(Device* dev, uint64_t& readOps, uint64_t& writeOps,
+                       uint64_t& readBytes, uint64_t& writeBytes)
+{
+    readOps = writeOps = readBytes = writeBytes = 0;
+    if (!dev || !dev->priv) return;
+    auto* s = static_cast<VirtioBlkState*>(dev->priv);
+    readOps    = s->readOps;
+    writeOps   = s->writeOps;
+    readBytes  = s->readBytes;
+    writeBytes = s->writeBytes;
 }
 
 } // namespace brook

@@ -1757,6 +1757,64 @@ uint32_t SchedulerSnapshotProcesses(ProcessSnapshot* out, uint32_t maxCount)
     return count;
 }
 
+bool SchedulerSnapshotProcess(uint16_t pid, ProcessSnapshot* out)
+{
+    uint64_t flags = SchedLockAcquire(g_allProcLock);
+    for (uint32_t i = 0; i < g_processCount; ++i)
+    {
+        Process* p = g_allProcesses[i];
+        if (!p || p->pid != pid) continue;
+        out->pid = p->pid;
+        out->parentPid = p->parentPid;
+        out->pgid = p->pgid;
+        out->sid = p->sid;
+        out->state = p->state;
+        out->runningOnCpu = p->runningOnCpu;
+        out->stackBase = p->stackBase;
+        out->stackTop = p->stackTop;
+        out->programBreak = p->programBreak;
+        out->userTicks = p->userTicks;
+        out->sysTicks = p->sysTicks;
+        uint32_t j = 0;
+        for (; j < 31 && p->name[j]; ++j)
+            out->name[j] = p->name[j];
+        out->name[j] = '\0';
+        j = 0;
+        for (; j < 255 && p->exePath[j]; ++j)
+            out->exePath[j] = p->exePath[j];
+        out->exePath[j] = '\0';
+        j = 0;
+        for (; j < 255 && p->cwd[j]; ++j)
+            out->cwd[j] = p->cwd[j];
+        out->cwd[j] = '\0';
+        SchedLockRelease(g_allProcLock, flags);
+        return true;
+    }
+    SchedLockRelease(g_allProcLock, flags);
+    return false;
+}
+
+// Return the PID of the Nth active process (0-indexed). Returns false if index is out of range.
+bool SchedulerGetPidByIndex(uint32_t index, uint16_t* outPid)
+{
+    uint64_t flags = SchedLockAcquire(g_allProcLock);
+    uint32_t found = 0;
+    for (uint32_t i = 0; i < g_processCount; ++i)
+    {
+        Process* p = g_allProcesses[i];
+        if (!p) continue;
+        if (found == index)
+        {
+            *outPid = p->pid;
+            SchedLockRelease(g_allProcLock, flags);
+            return true;
+        }
+        ++found;
+    }
+    SchedLockRelease(g_allProcLock, flags);
+    return false;
+}
+
 void SchedulerGetCpuTicks(uint32_t cpuIndex, uint64_t& busyTicks, uint64_t& idleTicks)
 {
     if (cpuIndex < SCHED_MAX_CPUS)

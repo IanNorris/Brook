@@ -108,6 +108,12 @@ struct ProcessSnapshot {
 // Returns the number of entries written.
 uint32_t SchedulerSnapshotProcesses(ProcessSnapshot* out, uint32_t maxCount);
 
+// Snapshot a single process by PID. Returns true if found.
+bool SchedulerSnapshotProcess(uint16_t pid, ProcessSnapshot* out);
+
+// Return the PID of the Nth active process (0-indexed). Returns false if out of range.
+bool SchedulerGetPidByIndex(uint32_t index, uint16_t* outPid);
+
 // Get per-CPU tick counters for /proc/stat.
 // Writes busy and idle tick counts for CPU `cpuIndex`.
 void SchedulerGetCpuTicks(uint32_t cpuIndex, uint64_t& busyTicks, uint64_t& idleTicks);

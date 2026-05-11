@@ -24,4 +24,8 @@ extern "C" uint32_t VirtioBlkInitAll();
 // A disk containing this file at its root gets mounted at the path it specifies.
 static constexpr const char* VIRTIO_ESP_MARKER = "BROOK.MNT";
 
+// I/O statistics for procfs. Returns cumulative read/write ops and bytes.
+void VirtioBlkGetStats(Device* dev, uint64_t& readOps, uint64_t& writeOps,
+                       uint64_t& readBytes, uint64_t& writeBytes);
+
 } // namespace brook
