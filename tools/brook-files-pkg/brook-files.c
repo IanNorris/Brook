@@ -702,9 +702,10 @@ static void render(void) {
     fill_rect(0, WIN_H - STATUS_H, WIN_W, STATUS_H, COL_STATUS_BG);
     int status_vpad = (STATUS_H - CHAR_H) / 2;
 
-    /* Path */
-    draw_text_clipped(8, WIN_H - STATUS_H + status_vpad, g_cwd, COL_TEXT,
-                      WIN_W / 2 - 16);
+    /* Keyboard shortcuts */
+    draw_text(8, WIN_H - STATUS_H + status_vpad,
+              "Enter:Open  Bksp:Up  Del:Delete  Tab:Switch pane",
+              COL_TEXT_DIM);
 
     /* Entry count */
     char count_str[64];
@@ -819,7 +820,7 @@ static void on_key(void *data, struct wl_keyboard *kb, uint32_t serial,
     enum {
         KEY_ESC = 1, KEY_ENTER = 28, KEY_BACKSPACE = 14,
         KEY_UP = 103, KEY_DOWN = 108, KEY_LEFT = 105, KEY_RIGHT = 106,
-        KEY_TAB = 15,
+        KEY_TAB = 15, KEY_DELETE = 111,
     };
 
     switch (key) {
@@ -859,6 +860,22 @@ static void on_key(void *data, struct wl_keyboard *kb, uint32_t serial,
         break;
     case KEY_BACKSPACE:
         navigate_up();
+        break;
+    case KEY_DELETE:
+        if (g_active_pane == 1 && g_selected >= 0 && g_selected < g_entry_count) {
+            FileEntry *e = &g_entries[g_selected];
+            char full[512];
+            snprintf(full, sizeof(full), "%s/%s", g_cwd, e->name);
+            if (e->is_dir) {
+                rmdir(full);
+            } else {
+                unlink(full);
+            }
+            scan_directory();
+            if (g_selected >= g_entry_count && g_entry_count > 0)
+                g_selected = g_entry_count - 1;
+            g_needs_redraw = 1;
+        }
         break;
     case KEY_LEFT:
         if (g_active_pane == 0 && g_tree_selected < g_tree_count) {
