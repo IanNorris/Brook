@@ -10,6 +10,7 @@ symbols through the ksymtab relocation mechanism.
 
 | Driver | Files | Purpose |
 |--------|-------|---------|
+| **xhci** | xhci/xhci_mod.cpp (~2700 lines) | xHCI USB 3.0 host controller: device enumeration, HID keyboard/mouse, mass storage |
 | **intel_hda** | intel_hda_mod.cpp (~900 lines) | Intel HD Audio controller: PCM playback via BDL/DMA ring |
 | **virtio_input** | virtio_input_mod.cpp (~750 lines) | VirtIO input device: keyboard/mouse/tablet events |
 | **virtio_net** | virtio_net_mod.cpp (~720 lines) | VirtIO network: TX/RX virtqueues, interrupt-driven |
