@@ -343,14 +343,37 @@ static int           g_active_pane = 1;  /* 0=tree, 1=list */
 static int           g_running = 1;
 static int           g_needs_redraw = 1;
 
+/* Sort mode: 0=name, 1=size, 2=mtime; negative = descending */
+static int           g_sort_mode = 0;
+
 /* ========================= Directory loading ========================= */
 
 static int entry_cmp(const void *a, const void *b) {
     const FileEntry *ea = (const FileEntry *)a;
     const FileEntry *eb = (const FileEntry *)b;
-    /* Directories first, then alphabetical */
+    /* Directories first always */
     if (ea->is_dir != eb->is_dir) return eb->is_dir - ea->is_dir;
-    return strcasecmp(ea->name, eb->name);
+
+    int mode = g_sort_mode < 0 ? -g_sort_mode : g_sort_mode;
+    int dir  = g_sort_mode < 0 ? -1 : 1;
+    int cmp = 0;
+    switch (mode) {
+    case 1: /* size */
+        cmp = (ea->size > eb->size) - (ea->size < eb->size);
+        break;
+    case 2: /* mtime */
+        cmp = (ea->mtime > eb->mtime) - (ea->mtime < eb->mtime);
+        break;
+    default: /* name */
+        cmp = strcasecmp(ea->name, eb->name);
+        break;
+    }
+    return cmp * dir;
+}
+
+static void resort_entries(void) {
+    qsort(g_entries, (size_t)g_entry_count, sizeof(FileEntry), entry_cmp);
+    g_needs_redraw = 1;
 }
 
 static void load_directory(const char *path) {
@@ -647,9 +670,16 @@ static void render(void) {
     /* --- File list pane --- */
     /* Column header */
     fill_rect(LIST_X, pane_top, LIST_W, HEADER_H, COL_HEADER_BG);
-    draw_text(LIST_X + 8, pane_top + hdr_vpad, "Name", COL_TEXT);
-    draw_text(LIST_X + LIST_W - 200, pane_top + hdr_vpad, "Size", COL_TEXT);
-    draw_text(LIST_X + LIST_W - 120, pane_top + hdr_vpad, "Modified", COL_TEXT);
+    /* Column headers with sort indicator */
+    int abs_mode = g_sort_mode < 0 ? -g_sort_mode : g_sort_mode;
+    const char *arrow = g_sort_mode >= 0 ? " v" : " ^";
+    char name_hdr[16], size_hdr[16], mod_hdr[16];
+    snprintf(name_hdr, sizeof(name_hdr), "Name%s", abs_mode == 0 ? arrow : "");
+    snprintf(size_hdr, sizeof(size_hdr), "Size%s", abs_mode == 1 ? arrow : "");
+    snprintf(mod_hdr, sizeof(mod_hdr), "Modified%s", abs_mode == 2 ? arrow : "");
+    draw_text(LIST_X + 8, pane_top + hdr_vpad, name_hdr, COL_TEXT);
+    draw_text(LIST_X + LIST_W - 200, pane_top + hdr_vpad, size_hdr, COL_TEXT);
+    draw_text(LIST_X + LIST_W - 120, pane_top + hdr_vpad, mod_hdr, COL_TEXT);
 
     int list_area_h = CONTENT_H - pane_top - HEADER_H;
     int list_visible = list_area_h / ROW_H;
@@ -975,6 +1005,27 @@ static void on_ptr_button(void *d, struct wl_pointer *p, uint32_t serial,
             scan_directory();
             g_needs_redraw = 1;
         }
+        g_last_click_time = time;
+        return;
+    }
+
+    /* Click on list column headers — toggle sort mode */
+    if (mx > LIST_X && my >= pane_top && my < content_top) {
+        int new_mode;
+        if (mx < LIST_X + LIST_W - 200) {
+            new_mode = 0; /* Name */
+        } else if (mx < LIST_X + LIST_W - 120) {
+            new_mode = 1; /* Size */
+        } else {
+            new_mode = 2; /* Modified */
+        }
+        int abs_mode = g_sort_mode < 0 ? -g_sort_mode : g_sort_mode;
+        if (abs_mode == new_mode) {
+            g_sort_mode = -g_sort_mode; /* toggle direction */
+        } else {
+            g_sort_mode = new_mode;
+        }
+        resort_entries();
         g_last_click_time = time;
         return;
     }
