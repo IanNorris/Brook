@@ -1878,13 +1878,18 @@ int ProcessSendSignal(Process* proc, int signum)
     // SIGKILL and SIGSTOP cannot be caught/blocked
     if (signum == SIGKILL)
     {
-        // Immediately terminate
+        // Immediately terminate. There's a race window if the process is
+        // Running on another CPU — it may execute a few more instructions
+        // before the next timer tick preempts it. This is acceptable for a
+        // hobby OS; a production kernel would use an IPI to force-preempt.
         proc->exitStatus = 128 + SIGKILL;
         proc->fbVirtual = nullptr;
         proc->fbVirtualSize = 0;
-        proc->state = ProcessState::Terminated;
+        __atomic_store_n(reinterpret_cast<volatile int*>(&proc->state),
+                         static_cast<int>(ProcessState::Terminated),
+                         __ATOMIC_RELEASE);
         if (!__atomic_load_n(&proc->compositorRegistered, __ATOMIC_ACQUIRE))
-            proc->reapable = true;
+            __atomic_store_n(&proc->reapable, true, __ATOMIC_RELEASE);
         DbgPrintf("SIGNAL: SIGKILL -> pid %u\n", proc->pid);
         return 0;
     }
@@ -1892,7 +1897,7 @@ int ProcessSendSignal(Process* proc, int signum)
     if (signum == SIGSTOP)
     {
         // Immediately stop (cannot be caught/blocked)
-        proc->state = ProcessState::Stopped;
+        SchedulerStop(proc);
         DbgPrintf("SIGNAL: SIGSTOP -> pid %u stopped (default)\n", proc->pid);
         return 0;
     }
@@ -1922,7 +1927,7 @@ int ProcessSendSignal(Process* proc, int signum)
         {
             if (sa.handler == 1) return 0; // SIG_IGN — ignore
             // Default action: stop
-            proc->state = ProcessState::Stopped;
+            SchedulerStop(proc);
             DbgPrintf("SIGNAL: sig %d -> pid %u stopped (default)\n", signum, proc->pid);
             // Wake parent for waitpid WUNTRACED
             Process* parent = ProcessFindByPid(proc->parentPid);
