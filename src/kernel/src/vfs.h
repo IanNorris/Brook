@@ -155,6 +155,11 @@ struct VfsMountSnapshot {
 uint32_t VfsMountMaxSlots();
 VfsMountSnapshot VfsMountSnapshotAt(uint32_t idx);
 
+// Filesystem driver registry snapshot for /proc/filesystems
+struct VfsFsSnapshot { bool used; char name[16]; };
+uint32_t VfsFsMaxSlots();
+VfsFsSnapshot VfsFsSnapshotAt(uint32_t idx);
+
 // Open a file or directory.  Caller owns the returned Vnode*; call VfsClose().
 // Returns nullptr on error.
 extern "C" Vnode* VfsOpen(const char* path, int flags = 0);

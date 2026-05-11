@@ -432,6 +432,21 @@ VfsMountSnapshot VfsMountSnapshotAt(uint32_t idx)
     return snap;
 }
 
+uint32_t VfsFsMaxSlots() { return VFS_MAX_FS_DRIVERS; }
+
+VfsFsSnapshot VfsFsSnapshotAt(uint32_t idx)
+{
+    VfsFsSnapshot snap = {};
+    if (idx >= VFS_MAX_FS_DRIVERS) return snap;
+    snap.used = g_fsDrivers[idx].used;
+    if (!snap.used) return snap;
+    const char* src = g_fsDrivers[idx].name;
+    uint32_t j = 0;
+    for (; j < 15 && src && src[j]; ++j) snap.name[j] = src[j];
+    snap.name[j] = '\0';
+    return snap;
+}
+
 Vnode* VfsOpen(const char* path, int flags)
 {
     if (!path || !path[0]) return nullptr;

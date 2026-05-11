@@ -533,6 +533,8 @@ static Vnode* GenPidStatus(const ProcessSnapshot& proc)
         "Tgid:\t%u\n"
         "Pid:\t%u\n"
         "PPid:\t%u\n"
+        "Pgid:\t%u\n"
+        "Sid:\t%u\n"
         "VmSize:\t%lu kB\n"
         "VmRSS:\t%lu kB\n"
         "Threads:\t1\n",
@@ -541,6 +543,8 @@ static Vnode* GenPidStatus(const ProcessSnapshot& proc)
         (uint32_t)proc.pid,
         (uint32_t)proc.pid,
         (uint32_t)proc.parentPid,
+        (uint32_t)proc.pgid,
+        (uint32_t)proc.sid,
         vsize / 1024,
         (proc.stackTop - proc.stackBase) / 1024);
 
@@ -614,6 +618,38 @@ static Vnode* GenPidCwd(const ProcessSnapshot& proc)
         ProcStrCopy(buf, "/", 2);
     buf[len] = '\n';
     return MakeProcVnode(buf, len + 1);
+}
+
+// /proc/[pid]/limits — resource limits (Linux-compatible format)
+static Vnode* GenPidLimits(const ProcessSnapshot& /*proc*/)
+{
+    auto* buf = static_cast<char*>(kmalloc(1024));
+    if (!buf) return nullptr;
+
+    char* p = buf;
+    p = AppendStr(p, "Limit                     Soft Limit           Hard Limit           Units     \n");
+    p = AppendStr(p, "Max open files            ");
+    p = AppendU64(p, MAX_FDS);
+    p = AppendStr(p, "                  ");
+    p = AppendU64(p, MAX_FDS);
+    p = AppendStr(p, "                  files     \n");
+    p = AppendStr(p, "Max stack size            ");
+    p = AppendU64(p, USER_STACK_SIZE);
+    p = AppendStr(p, "             ");
+    p = AppendU64(p, USER_STACK_SIZE);
+    p = AppendStr(p, "             bytes     \n");
+    p = AppendStr(p, "Max data size             ");
+    p = AppendU64(p, PROGRAM_BREAK_SIZE);
+    p = AppendStr(p, "            ");
+    p = AppendU64(p, PROGRAM_BREAK_SIZE);
+    p = AppendStr(p, "            bytes     \n");
+    p = AppendStr(p, "Max processes             ");
+    p = AppendU64(p, MAX_PROCESSES);
+    p = AppendStr(p, "                  ");
+    p = AppendU64(p, MAX_PROCESSES);
+    p = AppendStr(p, "                  processes \n");
+    *p = '\0';
+    return MakeProcVnode(buf, static_cast<uint32_t>(p - buf));
 }
 
 // ---- Path parsing helpers ----
@@ -822,6 +858,38 @@ static Vnode* GenNetUdp()
     return MakeProcVnode(buf, static_cast<uint32_t>(p - buf));
 }
 
+// ---- /proc/net/sockstat — socket count summary ----
+
+static Vnode* GenNetSockstat()
+{
+    uint32_t maxSock = NetMaxSockets();
+    uint32_t tcpInUse = 0, udpInUse = 0, rawInUse = 0;
+    for (uint32_t i = 0; i < maxSock; ++i)
+    {
+        SocketSnapshot snap = NetSnapshotSocket(i);
+        if (!snap.used) continue;
+        if (snap.type == 1)      ++tcpInUse;  // SOCK_STREAM
+        else if (snap.type == 2) ++udpInUse;  // SOCK_DGRAM
+        else                     ++rawInUse;
+    }
+
+    auto* buf = static_cast<char*>(kmalloc(256));
+    if (!buf) return nullptr;
+
+    char* p = buf;
+    p = AppendStr(p, "sockets: used ");
+    p = AppendU64(p, tcpInUse + udpInUse + rawInUse);
+    p = AppendStr(p, "\nTCP: inuse ");
+    p = AppendU64(p, tcpInUse);
+    p = AppendStr(p, "\nUDP: inuse ");
+    p = AppendU64(p, udpInUse);
+    p = AppendStr(p, "\nRAW: inuse ");
+    p = AppendU64(p, rawInUse);
+    *p++ = '\n';
+    *p = '\0';
+    return MakeProcVnode(buf, static_cast<uint32_t>(p - buf));
+}
+
 // ---- /proc/modules — loaded kernel modules ----
 
 static Vnode* GenModules()
@@ -875,6 +943,35 @@ static Vnode* GenMounts()
         *p++ = ' ';
         p = AppendStr(p, snap.fsType);
         p = AppendStr(p, " rw 0 0\n");
+    }
+    *p = '\0';
+    return MakeProcVnode(buf, static_cast<uint32_t>(p - buf));
+}
+
+// ---- /proc/filesystems — registered filesystem types ----
+
+static Vnode* GenFilesystems()
+{
+    uint32_t maxSlots = VfsFsMaxSlots();
+    uint32_t bufSize = 128 + maxSlots * 32;
+    auto* buf = static_cast<char*>(kmalloc(bufSize));
+    if (!buf) return nullptr;
+
+    char* p = buf;
+    for (uint32_t i = 0; i < maxSlots; ++i)
+    {
+        VfsFsSnapshot snap = VfsFsSnapshotAt(i);
+        if (!snap.used) continue;
+        if (static_cast<uint32_t>(p - buf) + 32 >= bufSize) break;
+        // nodev prefix for virtual filesystems
+        bool isVirtual = (snap.name[0] == 'p' && snap.name[1] == 'r' && snap.name[2] == 'o' &&
+                          snap.name[3] == 'c');
+        if (isVirtual)
+            p = AppendStr(p, "nodev\t");
+        else
+            p = AppendStr(p, "\t");
+        p = AppendStr(p, snap.name);
+        *p++ = '\n';
     }
     *p = '\0';
     return MakeProcVnode(buf, static_cast<uint32_t>(p - buf));
@@ -947,6 +1044,7 @@ static ProcGlobalEntry g_globalEntries[] = {
     { "modules", GenModules },
     { "mounts",  GenMounts },
     { "diskstats", GenDiskstats },
+    { "filesystems", GenFilesystems },
 };
 static constexpr uint32_t NUM_GLOBAL = sizeof(g_globalEntries) / sizeof(g_globalEntries[0]);
 
@@ -964,6 +1062,7 @@ static ProcPidEntry g_pidEntries[] = {
     { "maps",    GenPidMaps },
     { "exe",     GenPidExe },
     { "cwd",     GenPidCwd },
+    { "limits",  GenPidLimits },
 };
 static constexpr uint32_t NUM_PID_ENTRIES = sizeof(g_pidEntries) / sizeof(g_pidEntries[0]);
 
@@ -1011,6 +1110,8 @@ Vnode* ProcFsOpen(const char* relPath, int /*flags*/)
         return GenNetTcp();
     if (StrEqProc(relPath, "net/udp"))
         return GenNetUdp();
+    if (StrEqProc(relPath, "net/sockstat"))
+        return GenNetSockstat();
 
     // Check pid paths: "PID" (directory) or "PID/file"
     uint32_t pid;
@@ -1070,7 +1171,7 @@ int ProcFsStatPath(const char* relPath, VnodeStat* st)
         st->size = 0; st->isDir = true; return 0;
     }
     if (StrEqProc(relPath, "net/dev") || StrEqProc(relPath, "net/tcp") ||
-        StrEqProc(relPath, "net/udp"))
+        StrEqProc(relPath, "net/udp") || StrEqProc(relPath, "net/sockstat"))
     {
         st->size = 0; st->isDir = false; return 0;
     }
