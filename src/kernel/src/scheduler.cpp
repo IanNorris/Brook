@@ -1026,8 +1026,30 @@ void SchedulerTimerTick(bool allowPreempt)
     // sample, account, wake sleepers, and dispatch away from idle, but a tick
     // that interrupted a syscall/driver path must not deschedule the process
     // while it owns filesystem, VFS, or device-driver locks.
+    //
+    // Exception: Terminated and Stopped processes MUST be descheduled even from
+    // kernel mode. exit_group marks sibling threads Terminated and spin-waits
+    // for runningOnCpu == -1. If we skip preemption here, those siblings stay
+    // stuck in kernel code forever and exit_group deadlocks.
     if (!allowPreempt)
+    {
+        if (cur->state == ProcessState::Terminated)
+        {
+            uint64_t rlf_term = SchedLockAcquire(g_readyLock);
+            ReadyQueueRemoveLocked(cur);
+            Process* next = PickNextLocked(cpu);
+            SchedLockRelease(g_readyLock, rlf_term);
+            if (next)
+                DoSwitch(cur, next, /* requeueOld */ false);
+            else
+            {
+                Process* idle = g_perCpu[cpu].idleProcess;
+                if (idle && idle != cur)
+                    DoSwitch(cur, idle, /* requeueOld */ false);
+            }
+        }
         return;
+    }
 
     // Check timeslice (per-process, from policy module).
     uint64_t timeslice = g_schedOps->Timeslice(g_schedState, cur->pid);
@@ -1571,19 +1593,29 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus)
     // Without this, the caller (leader) may proceed to ProcessDestroy
     // and free the shared page table / fileMaps while sibling threads
     // are still running and may fault on those shared resources.
+    //
+    // The timer tick handler checks for Terminated state and will
+    // deschedule the thread even from kernel mode. We yield between
+    // checks so the calling CPU can do useful work (run the timer,
+    // schedule other processes). A hard timeout prevents infinite hang
+    // if something goes wrong.
     for (uint32_t i = 0; i < count; ++i)
     {
         Process* p = targets[i];
-        uint32_t spin = 0;
-        bool logged = false;
+        uint32_t attempts = 0;
+        constexpr uint32_t MAX_ATTEMPTS = 10000; // ~10s at 1ms yield
         while (__atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) >= 0)
         {
-            __asm__ volatile("pause");
-            if (++spin > 1000000 && !logged)
+            // Yield so timer ticks can fire and deschedule the target
+            SchedulerYield();
+
+            if (++attempts >= MAX_ATTEMPTS)
             {
-                SerialPrintf("SCHED: exit_group waiting for pid=%u to stop (cpu=%d)\n",
-                             p->pid, __atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE));
-                logged = true;
+                int cpu = __atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE);
+                SerialPrintf("SCHED: exit_group timeout waiting for pid=%u "
+                             "(stuck on cpu=%d), forcing reapable\n",
+                             p->pid, cpu);
+                break;
             }
         }
         __atomic_store_n(&p->reapable, true, __ATOMIC_RELEASE);
