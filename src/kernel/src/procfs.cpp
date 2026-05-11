@@ -577,14 +577,29 @@ static Vnode* GenPidStatm(const ProcessSnapshot& proc)
     return MakeProcVnode(buf, n);
 }
 
-// /proc/[pid]/maps — minimal Linux-style VM map.
+// /proc/[pid]/maps — Linux-style VM map showing stack and heap regions.
 // glibc's pthread_getattr_np() consults this for the initial thread's stack.
 static Vnode* GenPidMaps(const ProcessSnapshot& proc)
 {
-    auto* buf = static_cast<char*>(kmalloc(256));
+    auto* buf = static_cast<char*>(kmalloc(512));
     if (!buf) return nullptr;
 
     char* p = buf;
+
+    // Heap region (program break)
+    if (proc.programBreak > 0)
+    {
+        // The heap starts at the end of loaded ELF segments.
+        // We approximate the heap start as programBreak rounded down to a reasonable base.
+        uint64_t heapEnd = proc.programBreak;
+        uint64_t heapStart = heapEnd > (64 * 1024) ? heapEnd - (64 * 1024) : 0x400000;
+        p = U64ToHex(p, heapStart);
+        *p++ = '-';
+        p = U64ToHex(p, heapEnd);
+        p = AppendStr(p, " rw-p 00000000 00:00 0                          [heap]\n");
+    }
+
+    // Stack region
     p = U64ToHex(p, proc.stackBase);
     *p++ = '-';
     p = U64ToHex(p, USER_STACK_TOP);
