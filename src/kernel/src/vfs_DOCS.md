@@ -15,7 +15,7 @@ the correct filesystem driver based on mount-point prefix matching.
 | `ext2_vfs.cpp` | ~2440 | Ext2 read/write filesystem driver |
 | `ext2_vfs.h` | ~20 | Ext2 driver registration and globals |
 | `fatfs_vfs.cpp` | ~570 | FAT32 filesystem driver (boot partition) |
-| `procfs.cpp` | ~825 | /proc virtual filesystem |
+| `procfs.cpp` | ~1290 | /proc virtual filesystem |
 | `procfs_vfs.cpp` | ~50 | Procfs VfsFsOps adapter |
 
 ## Architecture
@@ -150,21 +150,32 @@ Virtual filesystem generating process and system information on the fly.
 ### Global Files (`/proc/`)
 | File | Content |
 |------|---------|
-| `stat` | Per-CPU tick counters (user/nice/system/idle) |
+| `stat` | Per-CPU tick counters (user/nice/system/idle), fork count |
 | `meminfo` | MemTotal, MemFree, MemAvailable (from PMM) |
-| `uptime` | Seconds since boot (from LAPIC tick count) |
+| `uptime` | Seconds since boot, idle time (from per-CPU counters) |
 | `version` | Kernel version string |
 | `loadavg` | Approximate load average |
 | `cpuinfo` | Per-CPU model name, MHz, features |
+| `modules` | Loaded kernel modules (name, size, state) |
+| `mounts` | Mounted filesystems (device, mountpoint, type) |
+| `diskstats` | Block device I/O statistics (reads, writes, sectors) |
+| `filesystems` | Registered filesystem drivers |
+| `net/dev` | Per-interface traffic counters (bytes/packets Rx/Tx) |
+| `net/tcp` | TCP socket table (Linux-compatible format) |
+| `net/udp` | UDP socket table |
+| `net/sockstat` | Socket count summary (TCP, UDP, RAW in-use) |
 
 ### Per-PID Files (`/proc/[pid]/`)
 | File | Content |
 |------|---------|
 | `stat` | PID, name, state, ppid, threads, utime, stime, vsize, rss |
-| `status` | Human-readable process status (Name, Pid, PPid, Uid, VmSize, Threads) |
+| `status` | Human-readable: Name, Pid, PPid, Pgid, Sid, VmSize, VmRSS, Threads |
 | `statm` | Memory usage in pages |
 | `cmdline` | NUL-terminated command name |
-| `maps` | Minimal VM map (stack region, for glibc pthread_getattr_np) |
+| `maps` | VM map (heap and stack regions) |
+| `exe` | Executable path |
+| `cwd` | Current working directory |
+| `limits` | Resource limits (open files, stack, data, max processes) |
 
 ### Special Paths
 - `/proc/self` → resolves to current process's PID directory
