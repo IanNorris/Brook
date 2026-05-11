@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include "spinlock.h"
+#include "string.h"
 
 namespace brook {
 
@@ -37,10 +38,14 @@ struct KRingBuffer {
         uint32_t avail = Capacity - 1 - ((head - tail + Capacity) % Capacity);
         if (len > avail) len = avail;
 
-        for (uint32_t i = 0; i < len; ++i) {
-            data[head] = src[i];
-            head = (head + 1) % Capacity;
-        }
+        uint32_t firstChunk = Capacity - head;
+        if (firstChunk > len) firstChunk = len;
+        memcpy(data + head, src, firstChunk);
+
+        if (len > firstChunk)
+            memcpy(data, src + firstChunk, len - firstChunk);
+
+        head = (head + len) % Capacity;
 
         SpinLockRelease(&lock);
         return len;
@@ -55,10 +60,14 @@ struct KRingBuffer {
         uint32_t avail = (head - tail + Capacity) % Capacity;
         if (maxLen > avail) maxLen = avail;
 
-        for (uint32_t i = 0; i < maxLen; ++i) {
-            dst[i] = data[tail];
-            tail = (tail + 1) % Capacity;
-        }
+        uint32_t firstChunk = Capacity - tail;
+        if (firstChunk > maxLen) firstChunk = maxLen;
+        memcpy(dst, data + tail, firstChunk);
+
+        if (maxLen > firstChunk)
+            memcpy(dst + firstChunk, data, maxLen - firstChunk);
+
+        tail = (tail + maxLen) % Capacity;
 
         SpinLockRelease(&lock);
         return maxLen;
@@ -85,10 +94,14 @@ struct KRingBuffer {
             scan = (scan + 1) % Capacity;
         }
 
-        for (uint32_t i = 0; i < limit; ++i) {
-            dst[i] = data[tail];
-            tail = (tail + 1) % Capacity;
-        }
+        uint32_t firstChunk = Capacity - tail;
+        if (firstChunk > limit) firstChunk = limit;
+        memcpy(dst, data + tail, firstChunk);
+
+        if (limit > firstChunk)
+            memcpy(dst + firstChunk, data, limit - firstChunk);
+
+        tail = (tail + limit) % Capacity;
 
         SpinLockRelease(&lock);
         return limit;

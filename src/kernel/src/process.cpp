@@ -1667,7 +1667,7 @@ uint16_t CreateRemoteThread(Process* target, uint64_t entry,
             }
             auto* dst = reinterpret_cast<uint8_t*>(
                 PhysToVirt(phys).raw() + pageOff);
-            for (uint32_t b = 0; b < thisPage; ++b) dst[b] = src[b];
+            memcpy(dst, src, thisPage);
             src += thisPage;
             cursor += thisPage;
             remaining -= thisPage;

@@ -44,6 +44,7 @@
 #include "rtc.h"
 #include "kvmclock.h"
 #include "watchdog.h"
+#include "string.h"
 
 // All kernel initialization and runtime — called by KernelMain after stack switch.
 __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootProtocol);
@@ -265,8 +266,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             auto* src = reinterpret_cast<const uint8_t*>(
                 brook::PhysToVirt(brook::PhysicalAddress(bootProtocol->initrdPhysBase)).raw());
             auto* dst = reinterpret_cast<uint8_t*>(rdBuf.raw());
-            for (uint64_t i = 0; i < bootProtocol->initrdSize; ++i)
-                dst[i] = src[i];
+            memcpy(dst, src, bootProtocol->initrdSize);
 
             brook::Device* rd = brook::RamdiskCreate(dst,
                 bootProtocol->initrdSize, 512, "ramdisk0");
@@ -298,8 +298,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         if (rdBuf)
         {
             auto* dst = reinterpret_cast<uint8_t*>(rdBuf.raw());
-            for (uint32_t i = 0; i < g_fatTestImageSize; ++i)
-                dst[i] = g_fatTestImage[i];
+            memcpy(dst, g_fatTestImage, g_fatTestImageSize);
 
             brook::Device* rd = brook::RamdiskCreate(dst, g_fatTestImageSize, 512, "ramdisk0");
             if (rd && brook::DeviceRegister(rd))

@@ -4,6 +4,7 @@
 #include "serial.h"
 #include "mem_tag.h"
 #include "spinlock.h"
+#include "string.h"
 
 namespace brook {
 
@@ -380,9 +381,7 @@ void* krealloc(void* ptr, uint64_t newSize)
     void* newPtr = kmalloc(newSize);
     if (!newPtr) return nullptr;
 
-    const uint8_t* src = reinterpret_cast<const uint8_t*>(ptr);
-    uint8_t*       dst = reinterpret_cast<uint8_t*>(newPtr);
-    for (uint64_t i = 0; i < copyBytes; i++) dst[i] = src[i];
+    memcpy(newPtr, ptr, copyBytes);
 
     kfree(ptr);
     return newPtr;

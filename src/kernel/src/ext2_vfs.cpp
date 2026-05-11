@@ -1340,8 +1340,7 @@ static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
                 break;
             }
             uint64_t toCopy = avail < remaining ? avail : remaining;
-            for (uint64_t i = 0; i < toCopy; ++i)
-                dst[bytesRead + i] = bb[blockOff + i];
+            memcpy(dst + bytesRead, bb + blockOff, toCopy);
             bytesRead += toCopy;
             continue;
         }
@@ -1449,7 +1448,7 @@ static char* Ext2ReadSymlink(Ext2Mount* mnt, const Ext2Inode* ino)
     // Fast symlinks: if size <= 60 and no data blocks allocated, target is in i_block[]
     if (size <= 60 && ino->i_blocks == 0) {
         auto* src = reinterpret_cast<const char*>(ino->i_block);
-        for (uint64_t i = 0; i < size; ++i) target[i] = src[i];
+        memcpy(target, src, size);
         target[size] = '\0';
         return target;
     }
@@ -2365,7 +2364,7 @@ static int Ext2FsSymlink(void* mountPriv, uint8_t pdrv,
     // Fast symlink: store target directly in i_block[] if it fits (≤60 bytes)
     if (targetLen <= 60) {
         auto* dst = reinterpret_cast<char*>(newData.i_block);
-        for (uint32_t i = 0; i < targetLen; ++i) dst[i] = target[i];
+        memcpy(dst, target, targetLen);
         newData.i_size = targetLen;
         newData.i_blocks = 0;
     } else {

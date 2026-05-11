@@ -5,6 +5,7 @@
 #include "serial.h"
 #include "memory/virtual_memory.h"
 #include "sync/kmutex.h"
+#include "string.h"
 
 // Forward-declare SchedulerYield — weak so test builds link without the scheduler.
 namespace brook { __attribute__((weak)) void SchedulerYield(); }
@@ -242,7 +243,7 @@ static int CachedFileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
     if (len > avail) len = avail;
     auto* dst = static_cast<uint8_t*>(buf);
     auto* src = cf->data + *offset;
-    for (uint64_t i = 0; i < len; ++i) dst[i] = src[i];
+    memcpy(dst, src, len);
     *offset += len;
     return static_cast<int>(len);
 }

@@ -1,6 +1,7 @@
 #include "ramdisk.h"
 #include "memory/heap.h"
 #include "serial.h"
+#include "string.h"
 
 namespace brook {
 
@@ -14,7 +15,7 @@ static int RamdiskRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
 
     const uint8_t* src = p->data + offset;
     uint8_t*       dst = static_cast<uint8_t*>(buf);
-    for (uint64_t i = 0; i < len; ++i) dst[i] = src[i];
+    memcpy(dst, src, len);
     return static_cast<int>(len);
 }
 
@@ -26,7 +27,7 @@ static int RamdiskWrite(Device* dev, uint64_t offset, const void* buf, uint64_t 
 
     const uint8_t* src = static_cast<const uint8_t*>(buf);
     uint8_t*       dst = p->data + offset;
-    for (uint64_t i = 0; i < len; ++i) dst[i] = src[i];
+    memcpy(dst, src, len);
     return static_cast<int>(len);
 }
 

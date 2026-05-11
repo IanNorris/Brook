@@ -329,7 +329,7 @@ static int VirtioNetTransmit(NetIf* nif, const void* frame, uint32_t len)
     // Copy frame data after header
     const uint8_t* src = static_cast<const uint8_t*>(frame);
     uint8_t* dst = g_txBuf + VIRTIO_NET_HDR_SIZE;
-    for (uint32_t i = 0; i < len; i++) dst[i] = src[i];
+    memcpy(dst, src, len);
 
     uint32_t totalLen = VIRTIO_NET_HDR_SIZE + len;
 

@@ -2472,10 +2472,13 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
     // Capture free space BEFORE consuming, to decide whether window was constrained.
     uint32_t freeBefore = Socket::RX_BUF_SIZE - s.rxCount;
     uint8_t* dst = static_cast<uint8_t*>(buf);
-    for (uint32_t i = 0; i < copyLen; i++) {
-        dst[i] = s.rxBuf[s.rxTail];
-        s.rxTail = (s.rxTail + 1) % Socket::RX_BUF_SIZE;
-    }
+    // Copy in up to two contiguous chunks (ring buffer wrap)
+    uint32_t firstChunk = Socket::RX_BUF_SIZE - s.rxTail;
+    if (firstChunk > copyLen) firstChunk = copyLen;
+    memcpy(dst, s.rxBuf + s.rxTail, firstChunk);
+    if (copyLen > firstChunk)
+        memcpy(dst + firstChunk, s.rxBuf, copyLen - firstChunk);
+    s.rxTail = (s.rxTail + copyLen) % Socket::RX_BUF_SIZE;
     __asm__ volatile("mfence" ::: "memory");
     s.rxCount -= copyLen;
     uint32_t freeAfter = Socket::RX_BUF_SIZE - s.rxCount;

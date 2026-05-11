@@ -14,6 +14,7 @@
 #include "net.h"
 #include "module.h"
 #include "virtio_blk.h"
+#include "string.h"
 
 namespace brook {
 
@@ -157,7 +158,7 @@ static int ProcFileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
     if (len > avail) len = avail;
     auto* src = reinterpret_cast<const uint8_t*>(pp->data + *offset);
     auto* dst = static_cast<uint8_t*>(buf);
-    for (uint64_t i = 0; i < len; ++i) dst[i] = src[i];
+    memcpy(dst, src, len);
     *offset += len;
     return static_cast<int>(len);
 }
