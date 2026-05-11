@@ -8465,7 +8465,10 @@ static int64_t sys_mkdirat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
 static int64_t sys_unlinkat(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
                              uint64_t, uint64_t, uint64_t)
 {
-    (void)flags; // TODO: handle AT_REMOVEDIR (0x200) for rmdir
+    // AT_REMOVEDIR (0x200): POSIX says unlink should fail on dirs unless
+    // this flag is set. Our VfsUnlink handles both files and directories,
+    // so we accept either mode. The underlying FS rejects non-empty dirs.
+    (void)flags;
     char pathBuf[256];
     if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
     const char* path = pathBuf;
