@@ -710,6 +710,8 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
                          proc->elf.interpPath);
             PmmKillPid(proc->pid);
             VmmDestroyUserPageTable(proc->pageTable);
+            VmmFreeKernelStack(VirtualAddress(proc->kernelStackBase), KERNEL_STACK_PAGES);
+            kfree(proc->fds);
             FreeProcessStruct(proc);
             return nullptr;
         }
@@ -745,6 +747,8 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
         SerialPuts("PROC: stack allocation failed\n");
         PmmKillPid(proc->pid);
         VmmDestroyUserPageTable(proc->pageTable);
+        VmmFreeKernelStack(VirtualAddress(proc->kernelStackBase), KERNEL_STACK_PAGES);
+        kfree(proc->fds);
         FreeProcessStruct(proc);
         return nullptr;
     }
@@ -1245,6 +1249,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     if (!kstackAddr)
     {
         SerialPuts("FORK: kernel stack allocation failed\n");
+        kfree(child->fds);
         FreeProcessStruct(child);
         return nullptr;
     }
