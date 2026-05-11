@@ -1135,7 +1135,33 @@ static void on_ptr_button(void *d, struct wl_pointer *p, uint32_t serial,
 }
 static void on_ptr_axis(void *d, struct wl_pointer *p, uint32_t t,
                           uint32_t axis, wl_fixed_t value) {
-    (void)d; (void)p; (void)t; (void)axis; (void)value;
+    (void)d; (void)p; (void)t;
+    if (axis != 0) return; /* only vertical scroll */
+    int delta = wl_fixed_to_int(value);
+    if (delta == 0) delta = (value > 0) ? 1 : -1;
+    int scroll_lines = delta > 0 ? 3 : -3;
+
+    int mx = (int)g_ptr_x;
+    int pane_top = PANES_TOP;
+
+    if (mx < TREE_W && g_tree_count > 0) {
+        /* Scroll tree pane (move selection) */
+        g_tree_selected += scroll_lines;
+        if (g_tree_selected < 0) g_tree_selected = 0;
+        if (g_tree_selected >= g_tree_count) g_tree_selected = g_tree_count - 1;
+        g_active_pane = 0;
+        tree_select(g_tree_selected);
+    } else if (mx > LIST_X && g_entry_count > 0) {
+        /* Scroll list pane */
+        int list_area_h = CONTENT_H - pane_top - HEADER_H;
+        int list_visible = list_area_h / ROW_H;
+        g_scroll_offset += scroll_lines;
+        if (g_scroll_offset < 0) g_scroll_offset = 0;
+        int max_off = g_entry_count - list_visible;
+        if (max_off < 0) max_off = 0;
+        if (g_scroll_offset > max_off) g_scroll_offset = max_off;
+        g_needs_redraw = 1;
+    }
 }
 static void on_ptr_frame(void *d, struct wl_pointer *p) { (void)d; (void)p; }
 static void on_ptr_axis_source(void *d, struct wl_pointer *p, uint32_t s) {
