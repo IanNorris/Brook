@@ -47,6 +47,10 @@ def base45_decode(s: str) -> bytes:
 PANIC_MAGIC = 0x2D
 PANIC_PAD   = 0xCAFEF00D
 
+# Protocol versions
+PANIC_VERSION_RAW = 0x01  # v1: uncompressed TLV payload
+PANIC_VERSION_LZ4 = 0x02  # v2: LZ4-compressed TLV payload (4-byte size prefix)
+
 PKT_CPU_REGS       = 0xA3000001
 PKT_STACK_TRACE    = 0xA3000002
 PKT_EXCEPTION_INFO = 0xA3000003
@@ -257,9 +261,66 @@ class Symbolicator:
         return None
 
 
+# ── LZ4 decompression ───────────────────────────────────────────────────────
+def lz4_decompress(data: bytes, uncompressed_size: int) -> bytes:
+    """Decompress LZ4 block data. Uses python-lz4 if available, else pure-Python."""
+    try:
+        import lz4.block
+        return lz4.block.decompress(data, uncompressed_size=uncompressed_size)
+    except ImportError:
+        pass
+    # Pure-Python LZ4 block decoder (no dependencies)
+    src = data
+    dst = bytearray(uncompressed_size)
+    si, di = 0, 0
+    while si < len(src):
+        token = src[si]; si += 1
+        lit_len = token >> 4
+        if lit_len == 15:
+            while si < len(src):
+                extra = src[si]; si += 1
+                lit_len += extra
+                if extra != 255: break
+        if si + lit_len > len(src):
+            lit_len = len(src) - si
+        dst[di:di+lit_len] = src[si:si+lit_len]
+        si += lit_len; di += lit_len
+        if si >= len(src):
+            break
+        offset = src[si] | (src[si+1] << 8); si += 2
+        if offset == 0:
+            raise ValueError("LZ4: zero offset")
+        match_len = (token & 0x0F) + 4
+        if match_len == 19:
+            while si < len(src):
+                extra = src[si]; si += 1
+                match_len += extra
+                if extra != 255: break
+        match_pos = di - offset
+        for j in range(match_len):
+            dst[di] = dst[match_pos + j]
+            di += 1
+    return bytes(dst[:di])
+
+
+def decompress_payload(data: bytes, version: int) -> bytes:
+    """If v2, strip 4-byte size prefix and LZ4-decompress. Otherwise pass through."""
+    if version == PANIC_VERSION_LZ4:
+        if len(data) < 4:
+            raise ValueError("LZ4 payload too short (need 4-byte size prefix)")
+        uncompressed_size = struct.unpack_from("<I", data, 0)[0]
+        compressed = data[4:]
+        return lz4_decompress(compressed, uncompressed_size)
+    return data
+
+
 # ── QR scanning ─────────────────────────────────────────────────────────────
 def scan_qr(image_path: str) -> bytes:
-    """Scan QR code from image. Returns raw bytes (binary QR mode)."""
+    """Scan QR code from image. Returns raw bytes.
+
+    If the QR contains Base45 alphanumeric text (v2 format), decode it.
+    If the QR contains raw binary data (v1 format), return as-is.
+    """
     try:
         from pyzbar.pyzbar import decode as pyzbar_decode
         from PIL import Image
@@ -272,9 +333,18 @@ def scan_qr(image_path: str) -> bytes:
     results = pyzbar_decode(img)
     if not results:
         raise RuntimeError(f"No QR code found in {image_path}")
-    # pyzbar interprets binary QR data as Latin-1 codepoints then UTF-8
-    # encodes them. Reverse: decode UTF-8 → Latin-1 chars → encode Latin-1.
-    return results[0].data.decode("utf-8").encode("latin-1")
+    qr_data = results[0].data
+    # Try Base45 decode first (v2 format — alphanumeric QR text)
+    try:
+        text = qr_data.decode("ascii")
+        decoded = base45_decode(text)
+        # Validate it's a panic packet
+        if len(decoded) >= 8 and decoded[0] == PANIC_MAGIC:
+            return decoded
+    except (UnicodeDecodeError, KeyError, ValueError):
+        pass
+    # Fall back to binary QR mode (v1 format)
+    return qr_data.decode("utf-8").encode("latin-1")
 
 
 # ── VNC capture ─────────────────────────────────────────────────────────────
@@ -484,15 +554,24 @@ def print_report(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | Non
 
 
 def build_json(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | None,
-               sym: Symbolicator | None) -> dict:
+               sym: Symbolicator | None, exc_info: ExceptionInfo | None = None,
+               proc_list: ProcessList | None = None) -> dict:
     out: dict = {
         "header": {
             "magic": f"0x{hdr.magic:02X}",
             "version": hdr.version,
             "page": hdr.page + 1,
             "page_count": hdr.page_count,
+            "compressed": hdr.version == PANIC_VERSION_LZ4,
         }
     }
+    if exc_info:
+        out["exception"] = {
+            "vector": exc_info.vector,
+            "name": exc_info.name,
+            "error_code": f"0x{exc_info.error_code:08X}",
+            "pid": exc_info.pid,
+        }
     if regs:
         rd = {}
         for k, v in regs.gprs.items():
@@ -512,8 +591,22 @@ def build_json(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | None,
                 name = sym.resolve(addr)
                 if name:
                     entry["symbol"] = name
+                loc = sym.addr2line(addr)
+                if loc:
+                    entry["location"] = loc
             frames.append(entry)
         out["stack_trace"] = frames
+    if proc_list and proc_list.entries:
+        procs = []
+        for pe in proc_list.entries:
+            procs.append({
+                "pid": pe.pid,
+                "state": pe.state_name,
+                "cpu": pe.cpu_str,
+                "name": pe.name,
+                "rip": f"0x{pe.rip:016X}" if pe.rip else None,
+            })
+        out["processes"] = procs
     return out
 
 
@@ -539,33 +632,40 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
     hdr = PanicHeader(data)
     hdr.validate()
 
-    off = PanicHeader.SIZE
+    # Decompress payload if v2 (LZ4)
+    payload = data[PanicHeader.SIZE:]
+    try:
+        payload = decompress_payload(payload, hdr.version)
+    except Exception as e:
+        print(f"[warn] Decompression failed: {e} — trying raw", file=sys.stderr)
+
+    off = 0
     regs = None
     trace = None
     exc_info = None
     proc_list = None
 
-    while off + PacketHeader.SIZE <= len(data):
-        pkt = PacketHeader(data, off)
+    while off + PacketHeader.SIZE <= len(payload):
+        pkt = PacketHeader(payload, off)
         payload_start = off + PacketHeader.SIZE
         payload_end = payload_start + pkt.size
 
-        if payload_end > len(data):
+        if payload_end > len(payload):
             print(f"[warn] Packet at offset {off} truncated "
-                  f"(need {pkt.size}B, have {len(data) - payload_start}B)",
+                  f"(need {pkt.size}B, have {len(payload) - payload_start}B)",
                   file=sys.stderr)
-            payload_end = len(data)
+            payload_end = len(payload)
 
-        payload = data[payload_start:payload_end]
+        pkt_data = payload[payload_start:payload_end]
 
         if pkt.type == PKT_CPU_REGS:
-            regs = CPURegs(payload)
+            regs = CPURegs(pkt_data)
         elif pkt.type == PKT_STACK_TRACE:
-            trace = StackTrace(payload)
+            trace = StackTrace(pkt_data)
         elif pkt.type == PKT_EXCEPTION_INFO:
-            exc_info = ExceptionInfo(payload)
+            exc_info = ExceptionInfo(pkt_data)
         elif pkt.type == PKT_PROCESS_LIST:
-            proc_list = ProcessList(payload)
+            proc_list = ProcessList(pkt_data)
         else:
             print(f"[warn] Unknown packet type 0x{pkt.type:08X} ({pkt.size}B)",
                   file=sys.stderr)
@@ -573,10 +673,22 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
         off = payload_end
 
     if as_json:
-        print(json.dumps(build_json(hdr, regs, trace, sym), indent=2))
+        print(json.dumps(build_json(hdr, regs, trace, sym,
+                                    exc_info=exc_info, proc_list=proc_list), indent=2))
     else:
         print_report(hdr, regs, trace, sym, data, show_raw,
                      exc_info=exc_info, proc_list=proc_list)
+
+
+def parse_serial_log(path: str) -> bytes:
+    """Extract PANIC_HEX: line from serial log file and decode it."""
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("PANIC_HEX:"):
+                hex_data = line[len("PANIC_HEX:"):]
+                return bytes.fromhex(hex_data)
+    raise ValueError(f"No PANIC_HEX: line found in {path}")
 
 
 def main():
@@ -587,14 +699,20 @@ def main():
   %(prog)s screenshot.png                 # Decode QR from image
   %(prog)s --vnc localhost:5943           # Live VNC capture + decode
   %(prog)s --hex "2d01..."                # Decode raw hex bytes directly
-  %(prog)s --base45 "1A2B..."            # Decode legacy Base45 text
+  %(prog)s --base45 "1A2B..."            # Decode Base45 text from QR scan
+  %(prog)s --serial /tmp/serial.log      # Extract from QEMU serial log
+  %(prog)s --stdin                        # Read hex from stdin (paste mode)
   %(prog)s screenshot.png --raw --json   # JSON output with hex dump
+  %(prog)s --save crash_report.txt       # Save report to file
 """)
     ap.add_argument("image", nargs="?", help="Path to screenshot image with QR code")
     ap.add_argument("--hex", metavar="HEX", help="Decode raw hex bytes directly")
-    ap.add_argument("--base45", metavar="TEXT", help="Decode legacy Base45 text (v0x00)")
+    ap.add_argument("--base45", metavar="TEXT", help="Decode Base45 text (from QR scan)")
     ap.add_argument("--elf", metavar="PATH", help="Path to BROOK.elf for symbolication")
     ap.add_argument("--vnc", metavar="HOST:PORT", help="Capture from VNC server")
+    ap.add_argument("--serial", metavar="PATH", help="Extract from serial log (PANIC_HEX: line)")
+    ap.add_argument("--stdin", action="store_true", help="Read hex from stdin (paste mode)")
+    ap.add_argument("--save", metavar="PATH", help="Save report to file")
     ap.add_argument("--raw", action="store_true", help="Show raw hex dump")
     ap.add_argument("--json", action="store_true", help="Output as JSON")
     ap.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
@@ -609,22 +727,39 @@ def main():
     raw = None
     if args.hex:
         try:
-            raw = bytes.fromhex(args.hex)
+            raw = bytes.fromhex(args.hex.strip())
+        except ValueError as e:
+            print(f"{C.RED}[error]{C.RESET} Hex decode failed: {e}", file=sys.stderr)
+            sys.exit(1)
+    elif args.stdin:
+        print(f"  {C.CYAN}Paste hex data (PANIC_HEX: prefix accepted), then press Enter:{C.RESET}",
+              file=sys.stderr)
+        line = sys.stdin.readline().strip()
+        if line.startswith("PANIC_HEX:"):
+            line = line[len("PANIC_HEX:"):]
+        try:
+            raw = bytes.fromhex(line)
         except ValueError as e:
             print(f"{C.RED}[error]{C.RESET} Hex decode failed: {e}", file=sys.stderr)
             sys.exit(1)
     elif args.base45:
         try:
-            raw = base45_decode(args.base45)
+            raw = base45_decode(args.base45.strip())
         except (KeyError, ValueError) as e:
             print(f"{C.RED}[error]{C.RESET} Base45 decode failed: {e}", file=sys.stderr)
+            sys.exit(1)
+    elif args.serial:
+        try:
+            raw = parse_serial_log(args.serial)
+        except (FileNotFoundError, ValueError) as e:
+            print(f"{C.RED}[error]{C.RESET} Serial log parse failed: {e}", file=sys.stderr)
             sys.exit(1)
     elif args.vnc:
         raw = vnc_capture(args.vnc)
     elif args.image:
         raw = scan_qr(args.image)
     else:
-        ap.error("Provide an image path, --hex bytes, --base45 text, or --vnc host:port")
+        ap.error("Provide an image, --hex, --base45, --serial, --stdin, or --vnc")
 
     # Symbolicator — auto-detect ELF if not specified
     elf_path = args.elf or find_brook_elf()
@@ -638,7 +773,25 @@ def main():
         print(f"  {C.YELLOW}⚠{C.RESET} No BROOK.elf found — use --elf for symbolication",
               file=sys.stderr)
 
+    # If --save, redirect stdout to file while still printing to terminal
+    save_file = None
+    if args.save:
+        save_file = open(args.save, 'w')
+        # Disable colors for saved output
+        old_stdout = sys.stdout
+        sys.stdout = save_file
+        for attr in dir(C):
+            if not attr.startswith("_"):
+                setattr(C, attr, "")
+
     decode_crash(raw, sym, args.raw, args.json)
+
+    if save_file:
+        save_file.close()
+        sys.stdout = old_stdout
+        print(f"  {C.GREEN}✓{C.RESET} Report saved to {args.save}", file=sys.stderr)
+        # Also print to terminal with colors
+        decode_crash(raw, sym, args.raw, args.json)
 
 
 if __name__ == "__main__":
