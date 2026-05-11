@@ -341,7 +341,7 @@ static uint32_t AppendStr(char* buf, uint32_t pos, const char* str)
 // ---------------------------------------------------------------------------
 
 static constexpr uint32_t kProfBufSize = 16384;
-static constexpr const char* kProfPath = "/boot/profile.txt";
+static constexpr const char* kProfPath = "/data/profile.txt";
 
 struct ProfileWriter {
     Vnode*   file;

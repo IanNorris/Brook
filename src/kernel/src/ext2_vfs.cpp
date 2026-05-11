@@ -820,6 +820,10 @@ static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
 }
 
 // Write `len` bytes to inode data at `offset`. Returns bytes written.
+//
+// Coalesces consecutive full-block writes into a single device write
+// for dramatically better throughput (up to 16× fewer virtio requests
+// for sequential writes like nar-unpack).
 static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
                               const void* buf, uint64_t len, uint64_t offset)
 {
@@ -839,17 +843,54 @@ static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
         uint64_t toCopy = len - bytesWritten;
         if (toCopy > avail) toCopy = avail;
 
-        // Fast path: full-block write — skip the bounce buffer entirely
-        // and pass the caller's data straight through to the block device.
         if (blockOff == 0 && toCopy == mnt->blockSize) {
-            if (!Ext2WriteBlock(mnt, diskBlock, src + bytesWritten)) break;
+            // Full-block write — try to coalesce with subsequent consecutive
+            // blocks into a single large device write.
+            uint32_t runStart = diskBlock;
+            uint32_t runBlocks = 1;
+            // Max coalesce = 16 blocks (64KB with 4K blocks) to match virtio
+            // DMA buffer size.
+            static constexpr uint32_t MAX_COALESCE = 16;
+
+            while (runBlocks < MAX_COALESCE &&
+                   bytesWritten + runBlocks * mnt->blockSize < len)
+            {
+                uint32_t nextFileBlock = fileBlock + runBlocks;
+                uint32_t nextDiskBlock = Ext2EnsureBlock(mnt, ino, inoNum, nextFileBlock);
+                if (!nextDiskBlock || nextDiskBlock != runStart + runBlocks)
+                    break;
+                // Verify the next chunk is also a full-block write
+                uint64_t nextRemaining = len - (bytesWritten + runBlocks * mnt->blockSize);
+                if (nextRemaining < mnt->blockSize)
+                    break;
+                runBlocks++;
+            }
+
+            // Write all coalesced blocks in one device call
+            uint64_t writeOff = static_cast<uint64_t>(runStart) << mnt->blockShift;
+            uint64_t writeLen = static_cast<uint64_t>(runBlocks) << mnt->blockShift;
+            if (!Ext2DevWrite(mnt, writeOff, src + bytesWritten, writeLen)) break;
+
+            // Invalidate caches for all written blocks
+            for (uint32_t b = 0; b < runBlocks; b++) {
+                Ext2BlockCacheInvalidate(mnt, runStart + b);
+                // Also invalidate indirect block cache
+                SpinLockAcquire(&mnt->indCacheLock);
+                for (uint32_t s = 0; s < Ext2Mount::IND_CACHE_SLOTS; ++s) {
+                    if (mnt->indCacheBlockNum[s] == runStart + b)
+                        mnt->indCacheBlockNum[s] = 0;
+                }
+                SpinLockRelease(&mnt->indCacheLock);
+            }
+
+            bytesWritten += writeLen;
         } else {
             // Partial block: read-modify-write via bounce buffer.
             Ext2ReadBlock(mnt, diskBlock, blockBuf);
             memcpy(blockBuf + blockOff, src + bytesWritten, toCopy);
             if (!Ext2WriteBlock(mnt, diskBlock, blockBuf)) break;
+            bytesWritten += toCopy;
         }
-        bytesWritten += toCopy;
     }
 
     kfree(blockBuf);
