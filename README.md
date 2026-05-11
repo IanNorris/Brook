@@ -197,6 +197,12 @@ src/
     src_km/         Kernel-mode shared sources
     inc_um/         Usermode shared headers
     src_um/         Usermode shared sources
+tools/
+  brook-files-pkg/  Native Wayland file browser
+  brook-edit-pkg/   Native Wayland text editor (Ctrl+S/F/D)
+  brook-console-pkg/ Native Wayland kernel log viewer (Ctrl+F filter)
+  wayland-calc-pkg/ Native Wayland interactive calculator
+  waylandd-pkg/     Wayland compositor daemon (kernel ↔ wl_shm bridge)
 cmake/
   toolchains/       Clang cross-compilation toolchain files
 vendor/
@@ -208,6 +214,13 @@ docs/
   images/           Screenshots and logo
 ```
 
+### Tests
+
+```bash
+ctest --test-dir build/release/host_tests --output-on-failure  # Host-native unit tests
+./scripts/run-tests.sh release                                  # Bare-metal test ELFs in QEMU
+```
+
 ## Acknowledgements
 
 - [DOOM Generic](https://github.com/ozkl/doomgeneric) — portable DOOM engine
@@ -216,6 +229,10 @@ docs/
 - [busybox](https://busybox.net/) — Unix utilities in a single binary
 - [TCC](https://bellard.org/tcc/) — Tiny C Compiler
 - [Hack](https://sourcefoundry.org/hack/) — terminal typeface
+- [Nix](https://nixos.org/) — reproducible build system and package manager
+- [QEMU](https://www.qemu.org/) — machine emulator for development and testing
+- [Ladybird](https://ladybird.dev/) — independent web browser
+- [NetSurf](https://www.netsurf-browser.org/) — lightweight web browser
 
 ## License
 
