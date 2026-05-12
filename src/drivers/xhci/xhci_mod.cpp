@@ -47,6 +47,8 @@ MODULE_IMPORT_SYMBOL(VmmMapPage);
 MODULE_IMPORT_SYMBOL(PmmAllocPages);
 MODULE_IMPORT_SYMBOL(IoApicRegisterHandler);
 MODULE_IMPORT_SYMBOL(IoApicUnregisterHandler);
+MODULE_IMPORT_SYMBOL(ApicGetId);
+MODULE_IMPORT_SYMBOL(IdtInstallHandler);
 MODULE_IMPORT_SYMBOL(InputRegister);
 MODULE_IMPORT_SYMBOL(InputWakeWaiters);
 MODULE_IMPORT_SYMBOL(kmalloc);
@@ -2629,55 +2631,115 @@ static int XhciModuleInit()
 
     // --- Phase 8: Register IRQ handler for interrupt-driven event processing ---
 
-    // Disable MSI/MSI-X so the controller falls back to legacy INTx.
-    // QEMU's qemu-xhci enables MSI-X by default; if we don't disable it,
-    // interrupts go via MSI-X message writes (bypassing the IOAPIC) and our
-    // legacy IRQ handler never fires.
+    // Set up MSI-X for interrupt delivery.  QEMU's qemu-xhci uses MSI-X and
+    // does not support legacy INTx fallback, so we must program the MSI-X
+    // table directly.  We configure a single entry (interrupter 0) to deliver
+    // our chosen vector to the BSP's LAPIC.
+    ctrl.cmdComplete = false;
+    ctrl.xferComplete = false;
+    bool msixConfigured = false;
     {
         uint8_t capPtr = static_cast<uint8_t>(
             PciConfigRead8(ctrl.pciDev.bus, ctrl.pciDev.dev, ctrl.pciDev.fn, 0x34));
         while (capPtr && capPtr != 0xFF) {
             uint8_t capId = PciConfigRead8(ctrl.pciDev.bus, ctrl.pciDev.dev,
                                            ctrl.pciDev.fn, capPtr);
-            if (capId == 0x11) {
-                // MSI-X: clear Enable bit (bit 15 of Message Control at capPtr+2)
+            if (capId == 0x11) { // MSI-X capability
+                // Read Message Control
                 uint16_t msgCtrl = static_cast<uint16_t>(
                     PciConfigRead16(ctrl.pciDev.bus, ctrl.pciDev.dev,
                                     ctrl.pciDev.fn, capPtr + 2));
-                if (msgCtrl & 0x8000) {
-                    PciConfigWrite16(ctrl.pciDev.bus, ctrl.pciDev.dev,
-                                     ctrl.pciDev.fn, capPtr + 2,
-                                     msgCtrl & ~0x8000);
-                    SerialPuts("xhci: MSI-X disabled, using legacy INTx\n");
+                uint16_t tableSize = (msgCtrl & 0x07FF) + 1;
+
+                // Read Table Offset/BIR
+                uint32_t tableOffBir = PciConfigRead32(ctrl.pciDev.bus,
+                    ctrl.pciDev.dev, ctrl.pciDev.fn, capPtr + 4);
+                uint32_t tableBir    = tableOffBir & 0x7;
+                uint32_t tableOffset = tableOffBir & ~0x7u;
+
+                SerialPrintf("xhci: MSI-X cap at 0x%x: %u entries, BAR%u+0x%x\n",
+                             capPtr, tableSize, tableBir, tableOffset);
+
+                // Get the BAR physical address for the MSI-X table
+                uint64_t barPhys = PciBarMemBase32(ctrl.pciDev.bar[tableBir]);
+                if (PciBarIs64(ctrl.pciDev.bar[tableBir]) && tableBir + 1 < 6)
+                    barPhys |= static_cast<uint64_t>(ctrl.pciDev.bar[tableBir + 1]) << 32;
+
+                if (barPhys == 0) {
+                    SerialPuts("xhci: MSI-X table BAR is zero\n");
+                    break;
                 }
-            } else if (capId == 0x05) {
-                // MSI: clear Enable bit (bit 0 of Message Control at capPtr+2)
-                uint16_t msgCtrl = static_cast<uint16_t>(
-                    PciConfigRead16(ctrl.pciDev.bus, ctrl.pciDev.dev,
-                                    ctrl.pciDev.fn, capPtr + 2));
-                if (msgCtrl & 0x0001) {
-                    PciConfigWrite16(ctrl.pciDev.bus, ctrl.pciDev.dev,
-                                     ctrl.pciDev.fn, capPtr + 2,
-                                     msgCtrl & ~0x0001);
-                    SerialPuts("xhci: MSI disabled, using legacy INTx\n");
+
+                // Map the MSI-X table page(s)
+                uint64_t tablePhys = barPhys + tableOffset;
+                uint32_t tableBytes = tableSize * 16; // 16 bytes per entry
+                uint32_t tablePages = (tableBytes + tableOffset % 4096 + 4095) / 4096;
+                auto tblVaddr = VmmAllocPages(tablePages, VMM_WRITABLE | VMM_NO_EXEC,
+                                              MemTag::Device, KernelPid);
+                if (!tblVaddr) {
+                    SerialPuts("xhci: failed to alloc pages for MSI-X table\n");
+                    break;
                 }
+                uint64_t pageAlignedPhys = tablePhys & ~0xFFFULL;
+                for (uint32_t p = 0; p < tablePages; p++) {
+                    VmmMapPage(KernelPageTable,
+                               VirtualAddress(tblVaddr.raw() + p * 4096),
+                               PhysicalAddress(pageAlignedPhys + p * 4096),
+                               VMM_WRITABLE | VMM_NO_EXEC | VMM_CACHE_DISABLE,
+                               MemTag::Device, KernelPid);
+                }
+
+                volatile uint32_t* table = reinterpret_cast<volatile uint32_t*>(
+                    tblVaddr.raw() + (tablePhys & 0xFFF));
+
+                // Program entry 0: target BSP LAPIC (ID 0), edge-triggered,
+                // fixed delivery, our chosen vector.
+                // Message Address: 0xFEE0_0000 | (destApic << 12)
+                // Message Data:    vector (bits 7:0)
+                uint8_t destLapic = ApicGetId();
+                table[0] = 0xFEE00000u | (static_cast<uint32_t>(destLapic) << 12);
+                table[1] = 0; // upper address = 0
+                table[2] = XHCI_IRQ_VECTOR; // message data = vector
+                table[3] = 0; // vector control: unmask (bit 0 = 0)
+
+                // Mask all other entries
+                for (uint16_t i = 1; i < tableSize; i++)
+                    table[i * 4 + 3] = 1; // mask
+
+                // Enable MSI-X (set bit 15), clear function mask (bit 14)
+                msgCtrl |= 0x8000;   // MSI-X Enable
+                msgCtrl &= ~0x4000;  // Clear Function Mask
+                PciConfigWrite16(ctrl.pciDev.bus, ctrl.pciDev.dev,
+                                 ctrl.pciDev.fn, capPtr + 2, msgCtrl);
+
+                // Install our ISR in the IDT for the MSI-X vector
+                IdtInstallHandler(XHCI_IRQ_VECTOR,
+                                  reinterpret_cast<void*>(XhciIrqHandler));
+
+                msixConfigured = true;
+                SerialPrintf("xhci: MSI-X configured — vector %u → LAPIC %u\n",
+                             XHCI_IRQ_VECTOR, destLapic);
+                break;
             }
             capPtr = PciConfigRead8(ctrl.pciDev.bus, ctrl.pciDev.dev,
                                     ctrl.pciDev.fn, capPtr + 1);
         }
     }
 
-    // Read PCI interrupt line and register our ISR
-    ctrl.cmdComplete = false;
-    ctrl.xferComplete = false;
-    uint32_t intLine = PciConfigRead32(ctrl.pciDev.bus, ctrl.pciDev.dev,
-                                        ctrl.pciDev.fn, 0x3C) & 0xFF;
-    ctrl.irqLine = static_cast<uint8_t>(intLine);
-    ctrl.irqVector = IoApicRegisterHandler(ctrl.irqLine, XHCI_IRQ_VECTOR,
-                                            reinterpret_cast<void*>(XhciIrqHandler));
+    if (!msixConfigured) {
+        // Fallback: legacy INTx via IOAPIC
+        uint32_t intLine = PciConfigRead32(ctrl.pciDev.bus, ctrl.pciDev.dev,
+                                            ctrl.pciDev.fn, 0x3C) & 0xFF;
+        ctrl.irqLine = static_cast<uint8_t>(intLine);
+        ctrl.irqVector = IoApicRegisterHandler(ctrl.irqLine, XHCI_IRQ_VECTOR,
+                                                reinterpret_cast<void*>(XhciIrqHandler));
+        SerialPrintf("xhci: legacy INTx — IRQ %u, vector %u\n",
+                     ctrl.irqLine, ctrl.irqVector);
+    }
+
     g_irqActive = true;
-    SerialPrintf("xhci: IRQ registered (line=%u, vector=%u) — interrupt-driven mode\n",
-                 ctrl.irqLine, ctrl.irqVector);
+    SerialPrintf("xhci: interrupt-driven mode active (MSI-X=%s)\n",
+                 msixConfigured ? "yes" : "no");
 
     // Register USB keyboard input device if a keyboard was found
     for (uint32_t i = 0; i < g_deviceCount; i++) {
