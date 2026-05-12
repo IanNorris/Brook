@@ -428,6 +428,16 @@ static void VirtioInputPoll(InputDevice* /*dev*/)
     if (!g_usedIdx)
         return;
 
+    // DEBUG: one-time dump of virtio ring pointers and first read
+    static bool s_once = false;
+    if (!s_once) {
+        s_once = true;
+        uint16_t val = *g_usedIdx;
+        SerialPrintf("VIRTIO_POLL_INIT: g_usedIdx=%p *g_usedIdx=%u shadow=%u "
+                     "g_usedPhys=0x%lx g_queueSize=%u\n",
+                     g_usedIdx, val, g_usedIdxShadow, g_usedPhys, g_queueSize);
+    }
+
     uint32_t count = 0;
     while (g_usedIdxShadow != *g_usedIdx)
     {
