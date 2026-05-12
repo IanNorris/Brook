@@ -421,6 +421,7 @@ struct Process
     bool ttyCanonical;
     bool ttyEcho;
     bool straceEnabled;  // Per-process syscall tracing
+    bool straceErrorsOnly; // Only log syscalls that return errors
     uint32_t straceFilter; // 0=all, bitmask of StraceCategory for selective tracing
 
     // Signal state
