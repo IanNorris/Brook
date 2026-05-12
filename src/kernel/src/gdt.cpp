@@ -1,4 +1,13 @@
 #include "gdt.h"
+#include "serial.h"
+#include "memory/virtual_memory.h"
+
+using brook::VmmGetPte;
+using brook::KernelPageTable;
+using brook::VirtualAddress;
+using brook::VMM_PRESENT;
+using brook::VMM_WRITABLE;
+using brook::SerialPrintf;
 
 // ---- Stacks allocated in BSS (zeroed by bootloader) ----
 
@@ -22,8 +31,9 @@ void* g_kernelStackTop = static_cast<void*>(g_kernelStack + sizeof(g_kernelStack
 static constexpr uint32_t GDT_FIXED_ENTRIES = 6;
 static constexpr uint32_t GDT_TOTAL_SLOTS = GDT_FIXED_ENTRIES + GDT_MAX_CPUS * 2;
 
-// Raw GDT as array of 8-byte entries.
-static GdtEntry g_gdtRaw[GDT_TOTAL_SLOTS] __attribute__((aligned(16)));
+// Raw GDT as array of 8-byte entries — page-aligned so we can write-protect
+// the page after boot to catch stray writes (BRO-GP-DIAG).
+static GdtEntry g_gdtRaw[GDT_TOTAL_SLOTS] __attribute__((aligned(4096)));
 static GdtDescriptor g_gdtDesc;
 
 // Per-CPU TSS instances.
@@ -187,4 +197,26 @@ Tss64* GdtGetTss(uint32_t cpuIndex)
 {
     if (cpuIndex >= GDT_MAX_CPUS) return nullptr;
     return &g_tssArray[cpuIndex];
+}
+
+void GdtWriteProtect()
+{
+    // Make the GDT page(s) read-only. Any stray write will trigger a #PF
+    // with the exact faulting RIP, letting us identify the culprit.
+    uint64_t gdtAddr = reinterpret_cast<uint64_t>(&g_gdtRaw[0]);
+    uint64_t gdtEnd  = gdtAddr + sizeof(g_gdtRaw);
+
+    // Round down to page boundary and iterate pages
+    for (uint64_t page = gdtAddr & ~0xFFFULL; page < gdtEnd; page += 4096)
+    {
+        uint64_t* pte = VmmGetPte(KernelPageTable, VirtualAddress(page));
+        if (pte && (*pte & VMM_PRESENT))
+        {
+            *pte &= ~VMM_WRITABLE;
+            __asm__ volatile("invlpg (%0)" :: "r"(page) : "memory");
+        }
+    }
+
+    SerialPrintf("GDT: write-protected %lu bytes at 0x%lx\n",
+                 sizeof(g_gdtRaw), gdtAddr);
 }

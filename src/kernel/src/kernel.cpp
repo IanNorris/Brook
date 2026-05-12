@@ -236,6 +236,10 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     {
         uint32_t cpuCount = brook::SmpInit();
         brook::KPrintf("SMP          %u CPU(s) online\n", cpuCount);
+
+        // Write-protect the GDT now that all APs have loaded their TSS
+        // descriptors. Any stray write will trigger a #PF.
+        GdtWriteProtect();
     }
     brook::BootLogoProgress(30, "SMP");
 
