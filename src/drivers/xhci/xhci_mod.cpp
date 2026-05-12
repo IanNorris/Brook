@@ -54,6 +54,7 @@ MODULE_IMPORT_SYMBOL(InputWakeWaiters);
 MODULE_IMPORT_SYMBOL(kmalloc);
 MODULE_IMPORT_SYMBOL(kfree);
 MODULE_IMPORT_SYMBOL(DeviceRegister);
+MODULE_IMPORT_SYMBOL(ApicSendEoi);
 
 using namespace brook;
 
@@ -2512,8 +2513,8 @@ static int XhciMatchTransferEvent(const Trb& evt)
     return -1; // unknown device
 }
 
-// ISR body — called from the kernel's shared IRQ dispatch stub.
-// Drains all pending event ring entries and dispatches them.
+// ISR body — called from either the shared IRQ stub (legacy INTx) or
+// the MSI-X wrapper below.  Drains all pending event ring entries.
 static void XhciIrqHandler()
 {
     if (g_controllerCount == 0) return;
@@ -2622,6 +2623,43 @@ static void XhciIrqHandler()
         SerialPrintf("XHCI_ISR: #%u eint=%u processed=%u\n",
                      irqN, (sts & USBSTS_EINT) ? 1u : 0u, processed);
     }
+}
+
+// MSI-X IDT entry — a naked asm stub that saves caller-saved GPRs,
+// calls the C++ handler body, sends LAPIC EOI, restores, and iretq.
+static void (*volatile g_xhciHandlerFn)() = XhciIrqHandler;
+static void (*volatile g_eoiFn)()          = nullptr; // set in init
+
+__attribute__((naked))
+static void XhciMsixIsr()
+{
+    asm volatile(
+        "push %%rax\n\t"
+        "push %%rcx\n\t"
+        "push %%rdx\n\t"
+        "push %%rsi\n\t"
+        "push %%rdi\n\t"
+        "push %%r8\n\t"
+        "push %%r9\n\t"
+        "push %%r10\n\t"
+        "push %%r11\n\t"
+        "call *%[handler]\n\t"
+        "call *%[eoi]\n\t"
+        "pop  %%r11\n\t"
+        "pop  %%r10\n\t"
+        "pop  %%r9\n\t"
+        "pop  %%r8\n\t"
+        "pop  %%rdi\n\t"
+        "pop  %%rsi\n\t"
+        "pop  %%rdx\n\t"
+        "pop  %%rcx\n\t"
+        "pop  %%rax\n\t"
+        "iretq\n\t"
+        :
+        : [handler] "m"(g_xhciHandlerFn),
+          [eoi]     "m"(g_eoiFn)
+        : "memory"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2747,9 +2785,10 @@ static int XhciModuleInit()
                 PciConfigWrite16(ctrl.pciDev.bus, ctrl.pciDev.dev,
                                  ctrl.pciDev.fn, capPtr + 2, msgCtrl);
 
-                // Install our ISR in the IDT for the MSI-X vector
+                // Install our MSI-X ISR wrapper in the IDT
+                g_eoiFn = ApicSendEoi;
                 IdtInstallHandler(XHCI_IRQ_VECTOR,
-                                  reinterpret_cast<void*>(XhciIrqHandler));
+                                  reinterpret_cast<void*>(XhciMsixIsr));
 
                 msixConfigured = true;
                 SerialPrintf("xhci: MSI-X configured — vector %u → LAPIC %u\n",
