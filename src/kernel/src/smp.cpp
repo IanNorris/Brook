@@ -500,6 +500,12 @@ void SmpEnableFastCpuIndex()
     g_smpReady = true;
 }
 
+void SmpSetCurrentCr3(uint32_t cpuIndex, uint64_t cr3)
+{
+    if (cpuIndex < g_cpuCount)
+        __atomic_store_n(&g_cpus[cpuIndex].currentCr3, cr3, __ATOMIC_RELEASE);
+}
+
 // ---------------------------------------------------------------------------
 // NMI handler for panic halt
 // ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ struct CpuInfo {
     bool     isBsp;          // true for the Bootstrap Processor
     bool     online;         // true after AP has signalled it's running
     uint64_t kernelStack;    // top of per-CPU kernel stack (for AP boot)
+    volatile uint64_t currentCr3;   // current CR3 value (updated at context switch)
 };
 
 // Initialise SMP: detect CPUs from MADT, boot all APs.
@@ -34,6 +35,9 @@ const CpuInfo* SmpGetCpu(uint32_t index);
 
 // Get the current CPU's index (based on LAPIC ID).
 uint32_t SmpCurrentCpuIndex();
+
+// Update per-CPU CR3 tracking (called from scheduler context switch).
+void SmpSetCurrentCr3(uint32_t cpuIndex, uint64_t cr3);
 
 // Enable fast (gs-based) CPU index lookup.  Call this *after* the BSP's
 // KernelCpuEnv is allocated, env->cpuIndex = 0 is written, and

@@ -681,7 +681,7 @@ static TlbShootdownRequest g_tlbRequest;
 
 // Timeout for the spin-wait: ~10ms at 2.5GHz ≈ 25M iterations of pause loop.
 // Each pause is ~10-100 cycles, so 500K iterations ≈ 5-50ms.
-static constexpr uint64_t TLB_SHOOTDOWN_TIMEOUT = 500000;
+static constexpr uint64_t TLB_SHOOTDOWN_TIMEOUT = 10000000; // ~10ms at 1GHz loop
 
 static void TlbShootdownHandlerInner()
 {
@@ -840,13 +840,11 @@ static void TlbShootdownTimeoutPanic(uint32_t myCpu, uint64_t targetMask,
 }
 
 // Common spin-wait with timeout and graceful retry.
-// If a CPU doesn't ack within the timeout, forgive it — it's likely in
-// SchedLock (IF=0) and will either switch CR3 (natural TLB flush) or
-// sti soon and handle the IPI. This is safe because:
-//   - If the CPU switches away from our CR3, the TLB is flushed by the
-//     CR3 write during context switch.
-//   - If the CPU stays on our CR3, it will sti when SchedLock releases,
-//     delivering the queued IPI (the handler is idempotent).
+// If a CPU doesn't ack within the timeout, forgive it — but ONLY if it's
+// not running the target CR3. A CPU on a different CR3 will flush its TLB
+// naturally when it switches back. A CPU on the target CR3 with stale
+// entries is dangerous (e.g., stale writable entry after CoW fork), so
+// we keep waiting for those.
 static void TlbShootdownWait(uint32_t myCpu, uint64_t targetMask,
                               uint64_t targetCr3, uint64_t addr)
 {
@@ -859,28 +857,52 @@ static void TlbShootdownWait(uint32_t myCpu, uint64_t targetMask,
             uint64_t ackBitmap = __atomic_load_n(&g_tlbRequest.ackBitmap, __ATOMIC_ACQUIRE);
             uint64_t notAcked = targetMask & ~ackBitmap;
 
-            // Forgive all non-acking CPUs: decrement pendingCount and
-            // set their ack bits so we can proceed. The queued IPI will
-            // still be delivered when the CPU does sti — the handler
-            // sees pendingCount already 0 and the extra sub wraps, but
-            // that's harmless since we hold g_tlbRequest.lock and will
-            // reinitialise before the next shootdown.
+            // Only forgive CPUs that are NOT currently running the target
+            // CR3. Those CPUs will flush their TLB on the next context
+            // switch (CR3 reload). CPUs still on the target CR3 must ack
+            // to guarantee no stale writable entries remain (critical for
+            // CoW fork correctness).
             uint32_t forgiven = 0;
+            uint32_t stillWaiting = 0;
             uint32_t cpuCount = SmpGetCpuCount();
             for (uint32_t i = 0; i < cpuCount; i++)
             {
                 if (!(notAcked & (1ULL << i))) continue;
-                __atomic_fetch_sub(&g_tlbRequest.pendingCount, 1, __ATOMIC_ACQ_REL);
-                __atomic_fetch_or(&g_tlbRequest.ackBitmap, 1ULL << i, __ATOMIC_RELAXED);
-                forgiven++;
+
+                // Read the CPU's current CR3 from per-CPU data.
+                const CpuInfo* info = SmpGetCpu(i);
+                uint64_t cpuCr3 = info ? __atomic_load_n(&info->currentCr3, __ATOMIC_ACQUIRE) : 0;
+                bool onTargetCr3 = cpuCr3 && ((cpuCr3 & ~0xFFFULL) == (targetCr3 & ~0xFFFULL));
+
+                if (!onTargetCr3)
+                {
+                    __atomic_fetch_sub(&g_tlbRequest.pendingCount, 1, __ATOMIC_ACQ_REL);
+                    __atomic_fetch_or(&g_tlbRequest.ackBitmap, 1ULL << i, __ATOMIC_RELAXED);
+                    forgiven++;
+                }
+                else
+                {
+                    stillWaiting++;
+                }
             }
 
-            if (forgiven > 0)
+            if (forgiven > 0 && stillWaiting == 0)
             {
-                SerialPrintf("TLB_SHOOTDOWN: forgave %u non-acking CPU(s) (likely in SchedLock), cr3=0x%lx addr=0x%lx\n",
+                SerialPrintf("TLB_SHOOTDOWN: forgave %u CPU(s) (different CR3), cr3=0x%lx addr=0x%lx\n",
                              forgiven, targetCr3, addr);
+                break;
             }
-            break;
+            else if (forgiven > 0 || stillWaiting > 0)
+            {
+                SerialPrintf("TLB_SHOOTDOWN: forgave %u, waiting for %u on target CR3=0x%lx\n",
+                             forgiven, stillWaiting, targetCr3);
+                // Reset spin counter to keep waiting for CPUs on target CR3
+                spins = 0;
+            }
+            else
+            {
+                break;
+            }
         }
     }
 }
