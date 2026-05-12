@@ -517,10 +517,10 @@ using KernelThreadFn = void (*)(void* arg);
 // ---------------------------------------------------------------------------
 
 // Get the current process (for syscall handlers).
-extern "C" Process* ProcessCurrent();
+Process* ProcessCurrent();
 
 // Find a process by PID (returns nullptr if not found).
-extern "C" Process* ProcessFindByPid(uint16_t pid);
+Process* ProcessFindByPid(uint16_t pid);
 
 // Create a new process, loading an ELF binary from a memory buffer.
 // Returns null on failure.
@@ -588,7 +588,7 @@ void ProcessCloseCloexecFds(Process* proc); // close FD_CLOEXEC fds on execve
 
 // Signal delivery: send a signal to a process.
 // Returns 0 on success, -ESRCH if not found, -EINVAL if bad signal.
-extern "C" int ProcessSendSignal(Process* proc, int signum);
+int ProcessSendSignal(Process* proc, int signum);
 
 // Send a signal to all processes in the given process group.
 // Returns the number of processes signalled.

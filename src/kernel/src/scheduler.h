@@ -27,10 +27,10 @@ void SchedulerAddProcess(Process* proc);
 void SchedulerRemoveProcess(Process* proc);
 
 // Block the current process. Triggers an immediate reschedule.
-extern "C" void SchedulerBlock(Process* proc);
+void SchedulerBlock(Process* proc);
 
 // Unblock a process — move it from Blocked back to Ready queue.
-extern "C" void SchedulerUnblock(Process* proc);
+void SchedulerUnblock(Process* proc);
 
 // Called from the LAPIC timer ISR on each CPU. `allowPreempt` should be true
 // only when the interrupted context was preemptible user mode; wakeups and idle
