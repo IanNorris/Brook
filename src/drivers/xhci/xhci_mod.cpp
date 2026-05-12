@@ -1673,8 +1673,6 @@ static uint32_t g_kbdDevIndex = 0;
 // directly, so this is a no-op. In polling mode, it checks for events.
 static void XhciKeyboardPoll(InputDevice* /*dev*/)
 {
-    if (g_irqActive) return; // ISR handles this
-
     if (g_controllerCount == 0) return;
     XhciController& ctrl = g_controllers[0];
     if (!ctrl.initialized) return;
@@ -1774,8 +1772,6 @@ static bool     g_mousePresent = false;
 
 static void XhciMousePoll(InputDevice* /*dev*/)
 {
-    if (g_irqActive) return; // ISR handles this
-
     if (g_controllerCount == 0 || !g_mousePresent) return;
     XhciController& ctrl = g_controllers[0];
     if (!ctrl.initialized) return;
