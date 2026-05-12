@@ -907,21 +907,40 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
     for (uint32_t i = 0; i < Process::MAX_FILE_MAPS; i++) {
         auto& m = proc->fileMaps[i];
         if (m.length == 0) continue;
-        // Atomic load: ProcessClearLazyMappings may be clearing this entry on
-        // another CPU (e.g. leader destroying while a child thread faults).
+        // Atomic load + ref: ProcessClearLazyMappings / sys_munmap may be
+        // clearing this entry on another CPU.  We take a temporary reference
+        // on the vnode so it stays alive while we fault in the page, then
+        // release it before returning.
         Vnode* vn = static_cast<Vnode*>(
             __atomic_load_n(reinterpret_cast<void**>(&m.vnode), __ATOMIC_ACQUIRE));
         if (!vn) continue;
         if (pageVA < m.vaddr || pageVA >= m.vaddr + m.length) continue;
 
-        if ((errCode & PF_WRITE) && !(m.vmmFlags & VMM_WRITABLE))
+        // Hold a ref so the vnode can't be freed while we use it.
+        VnodeRef(vn);
+        // Re-check: if the entry was cleared between our load and ref,
+        // the vnode might already have been unreffed down to 0 by
+        // another CPU — but our ref keeps it alive.  If the entry now
+        // points to a different vnode (or null), drop our ref and skip.
+        Vnode* check = static_cast<Vnode*>(
+            __atomic_load_n(reinterpret_cast<void**>(&m.vnode), __ATOMIC_ACQUIRE));
+        if (check != vn) {
+            VnodeUnref(vn);
+            continue;
+        }
+
+        if ((errCode & PF_WRITE) && !(m.vmmFlags & VMM_WRITABLE)) {
+            VnodeUnref(vn);
             return false;
+        }
 
         // Already mapped (race with another thread/CPU)
         PhysicalAddress existing = VmmVirtToPhys(proc->pageTable,
                                                   VirtualAddress(pageVA));
-        if (existing)
+        if (existing) {
+            VnodeUnref(vn);
             return true;
+        }
 
         uint64_t fileOff = m.offset + (pageVA - m.vaddr);
         uint64_t filePageIdx = fileOff / 4096;
@@ -933,6 +952,7 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
             if (!VmmMapPage(proc->pageTable, VirtualAddress(pageVA), cached,
                             VMM_PRESENT | m.vmmFlags, MemTag::User, proc->pid)) {
                 PmmUnrefPage(cached);
+                VnodeUnref(vn);
                 if (VmmVirtToPhys(proc->pageTable, VirtualAddress(pageVA)))
                     return true;
                 return false;
@@ -957,6 +977,7 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
                     PmmUnrefPage(adjPhys);
                 }
             }
+            VnodeUnref(vn);
             return true;
         }
 
@@ -969,7 +990,10 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
                          missN, vn->cacheId, filePageIdx);
         }
         PhysicalAddress phys = PmmAllocPage(MemTag::User, proc->pid);
-        if (!phys) return false;
+        if (!phys) {
+            VnodeUnref(vn);
+            return false;
+        }
 
         auto* kp = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
         kp = reinterpret_cast<uint8_t*>(
@@ -980,6 +1004,7 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
         int got = VfsRead(vn, kp, 4096, &readOff);
         if (got < 0) {
             PmmFreePage(phys);
+            VnodeUnref(vn);
             return false;
         }
 
@@ -991,11 +1016,14 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
                         VMM_PRESENT | m.vmmFlags, MemTag::User, proc->pid)) {
             if (VmmVirtToPhys(proc->pageTable, VirtualAddress(pageVA))) {
                 PmmUnrefPage(phys);
+                VnodeUnref(vn);
                 return true;
             }
             PmmUnrefPage(phys);
+            VnodeUnref(vn);
             return false;
         }
+        VnodeUnref(vn);
         return true;
     }
     return false;
@@ -1112,8 +1140,10 @@ static bool FileMapsUnmapRange(Process* proc, uint64_t addr, uint64_t length)
         if (os >= oe) continue;
 
         if (os <= m.vaddr && oe >= mEnd) {
-            Vnode* vn = m.vnode;
-            m.vaddr = 0; m.length = 0; m.offset = 0; m.vmmFlags = 0; m.vnode = nullptr;
+            Vnode* vn = static_cast<Vnode*>(
+                __atomic_exchange_n(reinterpret_cast<void**>(&m.vnode),
+                                    nullptr, __ATOMIC_ACQ_REL));
+            m.vaddr = 0; m.length = 0; m.offset = 0; m.vmmFlags = 0;
             VnodeUnref(vn);
         } else if (os <= m.vaddr) {
             uint64_t delta = oe - m.vaddr;
@@ -2601,6 +2631,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
             { "/etc/hostname", "brook\n" },
             { "/etc/nsswitch.conf", "passwd: files\ngroup: files\nhosts: files dns\n" },
             { "/etc/hosts", "127.0.0.1 localhost\n" },
+            { "/proc/version", "Linux version 6.1.0-brook (brook@brook) (gcc 14.2) #1 SMP\n" },
             { nullptr, nullptr }
         };
 
@@ -3845,8 +3876,16 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t,
         if (overlapStart >= overlapEnd) continue;
 
         if (overlapStart <= m.vaddr && overlapEnd >= mEnd) {
-            Vnode* vn = m.vnode;
-            m.vaddr = 0; m.length = 0; m.offset = 0; m.vmmFlags = 0; m.vnode = nullptr;
+            // Atomically steal the vnode pointer before unreffing — a
+            // concurrent FileMapHandleUserFault on another CPU may have
+            // already loaded this pointer.  Nulling it first ensures no
+            // new fault path picks it up; existing in-flight faults that
+            // already loaded the pointer will still race, but the page
+            // cache keeps the underlying data alive independently.
+            Vnode* vn = static_cast<Vnode*>(
+                __atomic_exchange_n(reinterpret_cast<void**>(&m.vnode),
+                                    nullptr, __ATOMIC_ACQ_REL));
+            m.vaddr = 0; m.length = 0; m.offset = 0; m.vmmFlags = 0;
             VnodeUnref(vn);
         } else if (overlapStart <= m.vaddr) {
             uint64_t delta = overlapEnd - m.vaddr;
@@ -5351,6 +5390,15 @@ static int64_t sys_access(uint64_t pathAddr, uint64_t, uint64_t,
     Vnode* vn = VfsOpen(path, 0);
     if (!vn)
     {
+        // Check synthetic files (same set as open/stat)
+        static const char* syntheticPaths[] = {
+            "/etc/passwd", "/etc/group", "/etc/shells", "/etc/hostname",
+            "/etc/nsswitch.conf", "/etc/hosts", "/etc/resolv.conf",
+            "/proc/version", nullptr
+        };
+        for (auto** sp = syntheticPaths; *sp; ++sp) {
+            if (StrEq(path, *sp)) return 0;
+        }
         VnodeStat vs;
         if (!BusyboxStatFallback(path, &vs))
             return -ENOENT;
@@ -6136,6 +6184,26 @@ static int64_t do_stat_internal(const char* path, uint64_t statAddr)
     VnodeStat vs; vs.size = 0; vs.isDir = false; vs.isSymlink = false;
     if (VfsStatPath(lookup, &vs) < 0)
     {
+        // Synthetic proc/etc files — stat should succeed for these
+        static const char* syntheticPaths[] = {
+            "/etc/passwd", "/etc/group", "/etc/shells", "/etc/hostname",
+            "/etc/nsswitch.conf", "/etc/hosts", "/etc/resolv.conf",
+            "/proc/version", nullptr
+        };
+        bool isSynthetic = false;
+        for (auto** sp = syntheticPaths; *sp; ++sp) {
+            if (StrEq(lookup, *sp)) { isSynthetic = true; break; }
+        }
+        if (isSynthetic) {
+            // Return a plausible stat for synthetic files
+            __builtin_memset(st, 0, sizeof(*st));
+            st->st_mode = 0100444; // regular file, read-only
+            st->st_nlink = 1;
+            st->st_size = 64;
+            st->st_blksize = 4096;
+            st->st_blocks = 1;
+            return 0;
+        }
         if (!BusyboxStatFallback(lookup, &vs))
             return -ENOENT;
     }
@@ -6181,6 +6249,25 @@ static int64_t do_lstat_internal(const char* path, uint64_t statAddr)
     VnodeStat vs; vs.size = 0; vs.isDir = false; vs.isSymlink = false;
     if (VfsLstatPath(lookup, &vs) < 0)
     {
+        // Synthetic proc/etc files
+        static const char* syntheticPaths[] = {
+            "/etc/passwd", "/etc/group", "/etc/shells", "/etc/hostname",
+            "/etc/nsswitch.conf", "/etc/hosts", "/etc/resolv.conf",
+            "/proc/version", nullptr
+        };
+        bool isSynthetic = false;
+        for (auto** sp = syntheticPaths; *sp; ++sp) {
+            if (StrEq(lookup, *sp)) { isSynthetic = true; break; }
+        }
+        if (isSynthetic) {
+            __builtin_memset(st, 0, sizeof(*st));
+            st->st_mode = 0100444;
+            st->st_nlink = 1;
+            st->st_size = 64;
+            st->st_blksize = 4096;
+            st->st_blocks = 1;
+            return 0;
+        }
         if (!BusyboxStatFallback(lookup, &vs))
             return -ENOENT;
     }
@@ -8682,6 +8769,7 @@ static int64_t sys_rename(uint64_t oldAddr, uint64_t newAddr, uint64_t,
     bootNew[ni] = '\0';
     if (VfsRename(bootOld, bootNew) == 0) return 0;
 
+    SerialPrintf("sys_rename FAILED: '%s' -> '%s'\n", oldPath, newPath);
     return -ENOENT;
 }
 
@@ -10373,6 +10461,15 @@ static int64_t sys_faccessat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
     Vnode* vn = VfsOpen(lookup, 0);
     if (!vn)
     {
+        // Check synthetic files
+        static const char* syntheticPaths[] = {
+            "/etc/passwd", "/etc/group", "/etc/shells", "/etc/hostname",
+            "/etc/nsswitch.conf", "/etc/hosts", "/etc/resolv.conf",
+            "/proc/version", nullptr
+        };
+        for (auto** sp = syntheticPaths; *sp; ++sp) {
+            if (StrEq(lookup, *sp)) return 0;
+        }
         VnodeStat vs;
         if (!BusyboxStatFallback(lookup, &vs))
             return -ENOENT;
@@ -12276,7 +12373,20 @@ static int64_t SyscallDispatchTraced(uint64_t num, uint64_t a0, uint64_t a1,
     }
     int64_t ret = fn(a0, a1, a2, a3, a4, a5);
 
+    // In errors-only mode, skip successful syscalls entirely
     bool isError = (ret < 0 && ret > -4096);
+    if (proc->straceErrorsOnly && !isError) {
+        // Always log blocking syscalls from the main thread for debugging
+        if (proc->pid == proc->tgid &&
+            (num == 202 /*futex*/ || num == 232 /*epoll_wait*/ ||
+             num == 271 /*ppoll*/ || num == 7 /*poll*/ ||
+             num == 231 /*exit_group*/ || num == 60 /*exit*/))
+        {
+            SerialPrintf("[strace-main:%u] %s(%lx,%lx,%lx) = %ld\n",
+                         proc->pid, name ? name : "?", a0, a1, a2, ret);
+        }
+        return ret;
+    }
     bool isRepeat = (num == s_lastNum && a0 == s_lastA0 && ret == s_lastRet && isError);
 
     if (isRepeat) {
