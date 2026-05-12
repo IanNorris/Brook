@@ -73,3 +73,9 @@ result
 media/
 *.txt
 usb_test.img
+.certs/
+
+# Test artifacts
+crash_reports/
+*.gif
+.certs/

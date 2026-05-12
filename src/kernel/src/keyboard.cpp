@@ -410,6 +410,19 @@ static void KbdIrqHandler(InterruptFrame* frame)
 {
     (void)frame;
 
+    // DEBUG: confirm PS/2 keyboard IRQ fires at all
+    {
+        static volatile uint32_t s_kbdIrqCount = 0;
+        uint32_t c = ++s_kbdIrqCount;
+        if (c <= 5 || (c & 0xFF) == 0) {
+            const char* msg = "KBD_IRQ\r\n";
+            while (*msg) {
+                while ((inb(0x3FD) & 0x20) == 0) {}
+                outb(0x3F8, static_cast<uint8_t>(*msg++));
+            }
+        }
+    }
+
     // Check that OBF is set and the byte is NOT from the auxiliary (mouse) port.
     // If bit 5 (AUXB) is set, this is mouse data — don't consume it here.
     uint8_t status = inb(0x64);

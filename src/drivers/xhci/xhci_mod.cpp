@@ -2483,6 +2483,10 @@ static void XhciIrqHandler()
     XhciController& ctrl = g_controllers[0];
     if (!ctrl.initialized) return;
 
+    // DEBUG: confirm xHCI ISR fires
+    static volatile uint32_t s_xhciIrqCount = 0;
+    uint32_t irqN = ++s_xhciIrqCount;
+
     // Acknowledge the interrupt: clear USBSTS.EINT
     uint32_t sts = xhci_read32(ctrl.opBase, XHCI_OP_USBSTS);
     if (sts & USBSTS_EINT) {
@@ -2574,6 +2578,12 @@ static void XhciIrqHandler()
     if (processed > 0) {
         uint64_t erdpPhys = ctrl.evtRingPhys + ctrl.evtDequeue * sizeof(Trb);
         xhci_write64(ctrl.rtBase, XHCI_RT_ERDP, erdpPhys | (1ULL << 3));
+    }
+
+    // DEBUG: report ISR activity
+    if (irqN <= 5 || (irqN & 0x3FF) == 0) {
+        SerialPrintf("XHCI_ISR: #%u eint=%u processed=%u\n",
+                     irqN, (sts & USBSTS_EINT) ? 1u : 0u, processed);
     }
 }
 
