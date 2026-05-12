@@ -119,22 +119,6 @@ bool InputRegister(InputDevice* dev)
 
 bool InputPollEvent(InputEvent* out)
 {
-    // DEBUG: periodic report on input polling state
-    static volatile uint32_t s_pollCount = 0;
-    uint32_t pc = ++s_pollCount;
-    if (pc == 100 || pc == 1000) {
-        SerialPrintf("INPUT_POLL: %u calls so far, %u devices registered\n",
-                     pc, g_inputDeviceCount);
-        for (uint32_t d = 0; d < g_inputDeviceCount; d++) {
-            InputDevice* dd = g_inputDevices[d];
-            SerialPrintf("  [%u] '%s' head=%u tail=%u poll=%p\n",
-                         d, dd->ops->name ? dd->ops->name : "?",
-                         __atomic_load_n(&dd->head, __ATOMIC_RELAXED),
-                         __atomic_load_n(&dd->tail, __ATOMIC_RELAXED),
-                         reinterpret_cast<void*>(dd->ops->poll));
-        }
-    }
-
     // Round-robin across devices so no single device starves others.
     for (uint32_t i = 0; i < g_inputDeviceCount; ++i)
     {

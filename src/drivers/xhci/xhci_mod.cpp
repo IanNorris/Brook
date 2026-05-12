@@ -26,6 +26,7 @@
 #include "memory/address.h"
 #include "mem_tag.h"
 #include "input.h"
+#include "keyboard.h"
 #include "device.h"
 #include "memory/heap.h"
 #include "string.h"
@@ -51,6 +52,7 @@ MODULE_IMPORT_SYMBOL(ApicGetId);
 MODULE_IMPORT_SYMBOL(IdtInstallHandler);
 MODULE_IMPORT_SYMBOL(InputRegister);
 MODULE_IMPORT_SYMBOL(InputWakeWaiters);
+MODULE_IMPORT_SYMBOL(KbdPushChar);
 MODULE_IMPORT_SYMBOL(kmalloc);
 MODULE_IMPORT_SYMBOL(kfree);
 MODULE_IMPORT_SYMBOL(DeviceRegister);
@@ -773,7 +775,7 @@ static bool XhciSubmitCommand(XhciController& ctrl, uint64_t param,
 static Trb* XhciWaitForEvent(XhciController& ctrl, uint32_t expectedType,
                               uint32_t timeoutMs)
 {
-    if (g_irqActive) {
+    if (g_irqActive && timeoutMs > 0) {
         // Interrupt-driven mode: wait on the volatile completion flag
         volatile bool* flag = nullptr;
         Trb* result = nullptr;
@@ -805,17 +807,20 @@ static Trb* XhciWaitForEvent(XhciController& ctrl, uint32_t expectedType,
         // Fall through to polling for wildcard/port status events
     }
 
-    // Polling mode (used during init or for wildcard event draining)
+    // Direct polling — checks event ring at least once even with timeout=0.
+    // This is the path used by poll functions (timeout=0) and during init.
     uint64_t deadline = brook::g_lapicTickCount + timeoutMs;
+    bool firstPass = true;
 
-    while (brook::g_lapicTickCount < deadline) {
+    while (firstPass || brook::g_lapicTickCount < deadline) {
+        firstPass = false;
         uint32_t idx = ctrl.evtDequeue;
         Trb& evt = ctrl.evtRing[idx];
 
         // Check cycle bit — if it matches our expected cycle, this is a new event
         bool evtCycleBit = (evt.control & TRB_CYCLE) != 0;
         if (evtCycleBit != ctrl.evtCycle) {
-            // No new event yet
+            if (timeoutMs == 0) return nullptr; // single check — no event
             for (volatile int d = 0; d < 10000; d++);
             continue;
         }
@@ -1457,7 +1462,8 @@ static bool XhciConfigureInterruptEndpoint(XhciController& ctrl, XhciDevice& dev
         return false;
     }
 
-    SerialPrintf("xhci: interrupt endpoint configured (DCI %u)\n", dev.intDci);
+    SerialPrintf("xhci: interrupt endpoint configured (DCI %u) ring=0x%lx\n",
+                 dev.intDci, dev.intRingPhys);
     return true;
 }
 
@@ -1601,6 +1607,11 @@ static void XhciPushKey(uint8_t scancode, bool pressed, uint8_t modifiers)
     }
 
     InputDevicePush(&g_usbKbdDev, ev);
+
+    // Also push to the legacy KbdGetChar ring buffer so the kernel shell
+    // (which uses KbdGetChar, not InputPollEvent) receives USB keyboard input.
+    if (pressed && ev.ascii != 0)
+        KbdPushChar(static_cast<char>(ev.ascii));
 }
 
 static void XhciProcessKeyboardReport(const uint8_t* report)
@@ -1667,37 +1678,106 @@ static void XhciProcessKeyboardReport(const uint8_t* report)
 
 static uint64_t g_kbdReportBufPhys = 0;
 static uint32_t g_kbdDevIndex = 0;
+static uint64_t g_mouseReportBufPhys = 0;
+static uint32_t g_mouseDevIndex = 0;
+static bool     g_mousePresent = false;
+
+// Forward declarations — defined later in this file
+static int XhciMatchTransferEvent(const Trb& evt);
+static void XhciProcessMouseReport(const uint8_t* report);
 
 // Poll for USB keyboard events — called by the input subsystem.
 // In interrupt-driven mode (g_irqActive), the ISR handles reports
 // directly, so this is a no-op. In polling mode, it checks for events.
-static void XhciKeyboardPoll(InputDevice* /*dev*/)
+
+// Unified event drain — processes all pending events on the event ring
+// and routes transfer completions to the correct device. Called from
+// both keyboard and mouse poll paths.
+static void XhciPollDrainEvents()
 {
     if (g_controllerCount == 0) return;
     XhciController& ctrl = g_controllers[0];
     if (!ctrl.initialized) return;
-    if (g_kbdDevIndex >= g_deviceCount) return;
 
-    XhciDevice& kbd = g_devices[g_kbdDevIndex];
-    if (!kbd.isKeyboard || !kbd.intRing) return;
+    uint32_t processed = 0;
+    while (processed < EVT_RING_SIZE) {
+        uint32_t idx = ctrl.evtDequeue;
+        Trb& evt = ctrl.evtRing[idx];
 
-    // Check for transfer completion events on the event ring
-    Trb* evt = XhciWaitForEvent(ctrl, TRB_TYPE_TRANSFER_EVENT, 0);
-    if (!evt) return;
+        bool evtCycleBit = (evt.control & TRB_CYCLE) != 0;
+        if (evtCycleBit != ctrl.evtCycle)
+            break; // no more events
 
-    uint32_t cc = (evt->status >> TRB_CC_SHIFT) & 0xFF;
-    if (cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT_PACKET) {
-        // Process the HID boot report
-        auto* report = static_cast<uint8_t*>(kbd.priv);
-        if (report)
-            XhciProcessKeyboardReport(report);
+        // Advance dequeue
+        ctrl.evtDequeue++;
+        if (ctrl.evtDequeue >= EVT_RING_SIZE) {
+            ctrl.evtDequeue = 0;
+            ctrl.evtCycle = !ctrl.evtCycle;
+        }
+
+        uint32_t type = evt.control & TRB_TYPE_MASK;
+        uint32_t cc = (evt.status >> TRB_CC_SHIFT) & 0xFF;
+
+        if (type == TRB_TYPE_TRANSFER_EVENT) {
+            int devIdx = XhciMatchTransferEvent(evt);
+
+            if (devIdx >= 0) {
+                XhciDevice& dev = g_devices[devIdx];
+
+                if (dev.isKeyboard && dev.intRing &&
+                    (cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT_PACKET)) {
+                    auto* report = static_cast<uint8_t*>(dev.priv);
+                    if (report)
+                        XhciProcessKeyboardReport(report);
+                    if (dev.priv && g_kbdReportBufPhys)
+                        XhciQueueInterruptIn(ctrl, dev,
+                                              dev.priv, g_kbdReportBufPhys, 8);
+                }
+                else if (dev.isMouse && dev.intRing &&
+                         (cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT_PACKET)) {
+                    auto* report = static_cast<uint8_t*>(dev.priv);
+                    if (report)
+                        XhciProcessMouseReport(report);
+                    if (dev.priv && g_mouseReportBufPhys)
+                        XhciQueueInterruptIn(ctrl, dev,
+                                              dev.priv, g_mouseReportBufPhys, 4);
+                }
+                else {
+                    ctrl.xferCompletionTrb = evt;
+                    __asm__ volatile("" ::: "memory");
+                    ctrl.xferComplete = true;
+                }
+            } else {
+                ctrl.xferCompletionTrb = evt;
+                __asm__ volatile("" ::: "memory");
+                ctrl.xferComplete = true;
+            }
+        }
+        else if (type == TRB_TYPE_CMD_COMPLETION) {
+            ctrl.cmdCompletionTrb = evt;
+            __asm__ volatile("" ::: "memory");
+            ctrl.cmdComplete = true;
+        }
+
+        processed++;
     }
 
-    // Re-queue the interrupt IN transfer for the next report
-    if (kbd.priv && g_kbdReportBufPhys) {
-        XhciQueueInterruptIn(ctrl, kbd,
-                              kbd.priv, g_kbdReportBufPhys, 8);
+    if (processed > 0) {
+        uint64_t erdpPhys = ctrl.evtRingPhys + ctrl.evtDequeue * sizeof(Trb);
+        xhci_write64(ctrl.rtBase, XHCI_RT_ERDP, erdpPhys | (1ULL << 3));
+
+        // Clear IMAN IP and USBSTS EINT so the controller can reassert
+        uint32_t sts = xhci_read32(ctrl.opBase, XHCI_OP_USBSTS);
+        if (sts & USBSTS_EINT)
+            xhci_write32(ctrl.opBase, XHCI_OP_USBSTS, USBSTS_EINT);
+        uint32_t iman = xhci_read32(ctrl.rtBase, XHCI_RT_IMAN);
+        xhci_write32(ctrl.rtBase, XHCI_RT_IMAN, iman | 0x3);
     }
+}
+
+static void XhciKeyboardPoll(InputDevice* /*dev*/)
+{
+    XhciPollDrainEvents();
 }
 
 // ---------------------------------------------------------------------------
@@ -1766,34 +1846,9 @@ static void XhciProcessMouseReport(const uint8_t* report)
     InputWakeWaiters();
 }
 
-static uint64_t g_mouseReportBufPhys = 0;
-static uint32_t g_mouseDevIndex = 0;
-static bool     g_mousePresent = false;
-
 static void XhciMousePoll(InputDevice* /*dev*/)
 {
-    if (g_controllerCount == 0 || !g_mousePresent) return;
-    XhciController& ctrl = g_controllers[0];
-    if (!ctrl.initialized) return;
-    if (g_mouseDevIndex >= g_deviceCount) return;
-
-    XhciDevice& mouse = g_devices[g_mouseDevIndex];
-    if (!mouse.isMouse || !mouse.intRing) return;
-
-    Trb* evt = XhciWaitForEvent(ctrl, TRB_TYPE_TRANSFER_EVENT, 0);
-    if (!evt) return;
-
-    uint32_t cc = (evt->status >> TRB_CC_SHIFT) & 0xFF;
-    if (cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT_PACKET) {
-        auto* report = static_cast<uint8_t*>(mouse.priv);
-        if (report)
-            XhciProcessMouseReport(report);
-    }
-
-    if (mouse.priv && g_mouseReportBufPhys) {
-        XhciQueueInterruptIn(ctrl, mouse,
-                              mouse.priv, g_mouseReportBufPhys, 4);
-    }
+    XhciPollDrainEvents();
 }
 
 // ---------------------------------------------------------------------------

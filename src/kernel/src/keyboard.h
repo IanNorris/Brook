@@ -35,4 +35,8 @@ extern "C" char KbdPeekChar();
 // Blocking: spin until a character is available, then return it.
 extern "C" char KbdGetChar();
 
+// Push a character into the legacy ring buffer from an external source
+// (e.g. USB keyboard driver). This feeds KbdGetChar/KbdPeekChar.
+extern "C" void KbdPushChar(char c);
+
 } // namespace brook

@@ -619,4 +619,9 @@ char KbdGetChar()
     return BufPop();
 }
 
+void KbdPushChar(char c)
+{
+    BufPush(c);
+}
+
 } // namespace brook

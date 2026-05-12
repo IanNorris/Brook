@@ -130,6 +130,7 @@ EXPORT_SYMBOL(KbdInit);
 EXPORT_SYMBOL(KbdGetChar);
 EXPORT_SYMBOL(KbdPeekChar);
 EXPORT_SYMBOL(KbdIsAvailable);
+EXPORT_SYMBOL(KbdPushChar);
 
 // Input subsystem
 EXPORT_SYMBOL(InputInit);
