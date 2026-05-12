@@ -57,11 +57,6 @@ EXPORT_SYMBOL(SerialPuts);
 EXPORT_SYMBOL(PmmAllocPage);
 EXPORT_SYMBOL(PmmAllocPages);
 EXPORT_SYMBOL(PmmFreePage);
-// These use C++ value types (PhysicalAddress, MemTag) so must also export
-// under their mangled names for C++ module linkage.
-EXPORT_SYMBOL_NAMED(PmmAllocPage,  "_ZN5brook12PmmAllocPageENS_6MemTagEt");
-EXPORT_SYMBOL_NAMED(PmmAllocPages, "_ZN5brook13PmmAllocPagesEmNS_6MemTagEt");
-EXPORT_SYMBOL_NAMED(PmmFreePage,   "_ZN5brook11PmmFreePageENS_15PhysicalAddressE");
 
 // Virtual memory
 EXPORT_SYMBOL(VmmAllocPages);
@@ -69,11 +64,6 @@ EXPORT_SYMBOL(VmmFreePages);
 EXPORT_SYMBOL(VmmVirtToPhys);
 EXPORT_SYMBOL(KsymPhysToVirt);
 EXPORT_SYMBOL(VmmMapPage);
-// Mangled names for C++ module linkage (value types prevent extern "C").
-EXPORT_SYMBOL_NAMED(VmmAllocPages, "_ZN5brook13VmmAllocPagesEmmNS_6MemTagEt");
-EXPORT_SYMBOL_NAMED(VmmVirtToPhys, "_ZN5brook13VmmVirtToPhysENS_9PageTableENS_14VirtualAddressE");
-EXPORT_SYMBOL_NAMED(VmmFreePages,  "_ZN5brook12VmmFreePagesENS_14VirtualAddressEm");
-EXPORT_SYMBOL_NAMED(VmmMapPage,    "_ZN5brook10VmmMapPageENS_9PageTableENS_14VirtualAddressENS_15PhysicalAddressEmNS_6MemTagEt");
 
 // Device registry
 EXPORT_SYMBOL(DeviceRegister);
@@ -191,7 +181,7 @@ EXPORT_SYMBOL(memmove);
 namespace brook { extern volatile uint64_t g_lapicTickCount; }
 static __attribute__((section(".ksymtab"), used)) const brook::KernelSymbol
     __ksym_named_g_lapicTickCount = {
-        "_ZN5brook16g_lapicTickCountE",
+        "g_lapicTickCount",
         reinterpret_cast<const void*>(const_cast<const uint64_t*>(&brook::g_lapicTickCount))
     };
 
@@ -205,13 +195,59 @@ static bool StrEq(const char* a, const char* b)
     return *a == *b;
 }
 
+// Try to extract the function name from an Itanium-mangled symbol.
+// Handles the common case: _ZN5brook<len><name>E...
+// Returns pointer to a static buffer with the extracted name, or nullptr.
+static const char* TryDemangleBase(const char* mangled)
+{
+    // Must start with "_ZN5brook"
+    if (mangled[0] != '_' || mangled[1] != 'Z' || mangled[2] != 'N')
+        return nullptr;
+
+    // Skip "_ZN", then parse the namespace length+name
+    const char* p = mangled + 3;
+
+    // Parse first component (namespace): digit(s) then that many chars
+    uint32_t nsLen = 0;
+    while (*p >= '0' && *p <= '9')
+        nsLen = nsLen * 10 + (*p++ - '0');
+    if (nsLen == 0) return nullptr;
+    p += nsLen; // skip namespace chars (e.g. "brook")
+
+    // Parse second component (function name): digit(s) then that many chars
+    uint32_t fnLen = 0;
+    while (*p >= '0' && *p <= '9')
+        fnLen = fnLen * 10 + (*p++ - '0');
+    if (fnLen == 0 || fnLen > 127) return nullptr;
+
+    // Extract function name
+    static char buf[128];
+    for (uint32_t i = 0; i < fnLen; i++)
+        buf[i] = p[i];
+    buf[fnLen] = '\0';
+    return buf;
+}
+
 const void* KsymLookup(const char* name)
 {
     if (!name) return nullptr;
+
+    // Exact match first
     for (KernelSymbol* sym = __start_ksymtab; sym < __stop_ksymtab; ++sym)
     {
         if (StrEq(sym->name, name)) return sym->addr;
     }
+
+    // Fallback: if mangled C++ name, try extracting the base function name
+    const char* base = TryDemangleBase(name);
+    if (base)
+    {
+        for (KernelSymbol* sym = __start_ksymtab; sym < __stop_ksymtab; ++sym)
+        {
+            if (StrEq(sym->name, base)) return sym->addr;
+        }
+    }
+
     return nullptr;
 }
 
