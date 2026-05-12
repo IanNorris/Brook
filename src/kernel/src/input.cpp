@@ -13,11 +13,11 @@ namespace brook {
 static constexpr uint32_t WAITER_MAX = INPUT_MAX_WAITERS;
 static Process* g_waiters[WAITER_MAX];
 static volatile uint32_t g_waiterCount = 0;
-static SpinLock g_waiterLock;
+static IrqSpinLock g_waiterLock;
 
 void InputAddWaiter(Process* proc)
 {
-    SpinLockAcquire(&g_waiterLock);
+    uint64_t flags = IrqSpinLockAcquire(&g_waiterLock);
     uint32_t n = g_waiterCount;
     if (n < WAITER_MAX)
     {
@@ -31,12 +31,12 @@ void InputAddWaiter(Process* proc)
             g_waiterCount = n + 1;
         }
     }
-    SpinLockRelease(&g_waiterLock);
+    IrqSpinLockRelease(&g_waiterLock, flags);
 }
 
 void InputRemoveWaiter(Process* proc)
 {
-    SpinLockAcquire(&g_waiterLock);
+    uint64_t flags = IrqSpinLockAcquire(&g_waiterLock);
     uint32_t n = g_waiterCount;
     for (uint32_t i = 0; i < n; ++i)
     {
@@ -48,16 +48,16 @@ void InputRemoveWaiter(Process* proc)
             break;
         }
     }
-    SpinLockRelease(&g_waiterLock);
+    IrqSpinLockRelease(&g_waiterLock, flags);
 }
 
 void InputWakeWaiters()
 {
-    SpinLockAcquire(&g_waiterLock);
+    uint64_t flags = IrqSpinLockAcquire(&g_waiterLock);
     uint32_t n = g_waiterCount;
     if (n == 0)
     {
-        SpinLockRelease(&g_waiterLock);
+        IrqSpinLockRelease(&g_waiterLock, flags);
         return;
     }
 
@@ -71,7 +71,7 @@ void InputWakeWaiters()
         __atomic_store_n(&snap[i]->pendingWakeup, 1, __ATOMIC_RELEASE);
     }
     g_waiterCount = 0;
-    SpinLockRelease(&g_waiterLock);
+    IrqSpinLockRelease(&g_waiterLock, flags);
 
     for (uint32_t i = 0; i < n; ++i)
         SchedulerUnblock(snap[i]);
