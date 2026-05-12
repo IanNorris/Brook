@@ -2676,6 +2676,21 @@ static int XhciModuleInit()
         if (!evt) break;
     }
 
+    // Clear any stale interrupt state from polling phase.  The controller
+    // won't generate new MSI-X messages while IMAN.IP or USBSTS.EINT are set.
+    {
+        uint32_t sts = xhci_read32(ctrl.opBase, XHCI_OP_USBSTS);
+        if (sts & USBSTS_EINT)
+            xhci_write32(ctrl.opBase, XHCI_OP_USBSTS, USBSTS_EINT); // W1C
+
+        uint32_t iman = xhci_read32(ctrl.rtBase, XHCI_RT_IMAN);
+        xhci_write32(ctrl.rtBase, XHCI_RT_IMAN, iman | 0x3); // W1C IP, keep IE
+
+        // Write ERDP with EHB=1 to clear Event Handler Busy
+        uint64_t erdpPhys = ctrl.evtRingPhys + ctrl.evtDequeue * sizeof(Trb);
+        xhci_write64(ctrl.rtBase, XHCI_RT_ERDP, erdpPhys | (1ULL << 3));
+    }
+
     // --- Phase 8: Register IRQ handler for interrupt-driven event processing ---
 
     // Set up MSI-X for interrupt delivery.  QEMU's qemu-xhci uses MSI-X and
