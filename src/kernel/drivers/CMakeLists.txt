@@ -42,4 +42,5 @@ add_driver_module(intel_hda
 
 add_driver_module(xhci
     "${BROOK_ROOT}/src/drivers/xhci/xhci_mod.cpp"
+    EXTRA_FLAGS "-mgeneral-regs-only" "-mno-sse" "-mno-sse2" "-mfpmath="
 )

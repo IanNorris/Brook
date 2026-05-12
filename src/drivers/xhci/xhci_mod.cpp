@@ -2625,41 +2625,15 @@ static void XhciIrqHandler()
     }
 }
 
-// MSI-X IDT entry — a naked asm stub that saves caller-saved GPRs,
-// calls the C++ handler body, sends LAPIC EOI, restores, and iretq.
-static void (*volatile g_xhciHandlerFn)() = XhciIrqHandler;
-static void (*volatile g_eoiFn)()          = nullptr; // set in init
-
-__attribute__((naked))
-static void XhciMsixIsr()
+// MSI-X IDT entry — compiler-generated interrupt stub.
+// Built with -mgeneral-regs-only so the compiler saves/restores GPRs
+// and emits iretq automatically. No SSE state to worry about.
+__attribute__((interrupt))
+static void XhciMsixIsr(InterruptFrame* frame)
 {
-    asm volatile(
-        "push %%rax\n\t"
-        "push %%rcx\n\t"
-        "push %%rdx\n\t"
-        "push %%rsi\n\t"
-        "push %%rdi\n\t"
-        "push %%r8\n\t"
-        "push %%r9\n\t"
-        "push %%r10\n\t"
-        "push %%r11\n\t"
-        "call *%[handler]\n\t"
-        "call *%[eoi]\n\t"
-        "pop  %%r11\n\t"
-        "pop  %%r10\n\t"
-        "pop  %%r9\n\t"
-        "pop  %%r8\n\t"
-        "pop  %%rdi\n\t"
-        "pop  %%rsi\n\t"
-        "pop  %%rdx\n\t"
-        "pop  %%rcx\n\t"
-        "pop  %%rax\n\t"
-        "iretq\n\t"
-        :
-        : [handler] "m"(g_xhciHandlerFn),
-          [eoi]     "m"(g_eoiFn)
-        : "memory"
-    );
+    (void)frame;
+    XhciIrqHandler();
+    ApicSendEoi();
 }
 
 // ---------------------------------------------------------------------------
@@ -2786,7 +2760,6 @@ static int XhciModuleInit()
                                  ctrl.pciDev.fn, capPtr + 2, msgCtrl);
 
                 // Install our MSI-X ISR wrapper in the IDT
-                g_eoiFn = ApicSendEoi;
                 IdtInstallHandler(XHCI_IRQ_VECTOR,
                                   reinterpret_cast<void*>(XhciMsixIsr));
 
