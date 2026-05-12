@@ -24,6 +24,8 @@ static constexpr uint32_t QR_PACKET_TYPE_CPU_REGS       = 0xA3000001;
 static constexpr uint32_t QR_PACKET_TYPE_STACK_TRACE    = 0xA3000002;
 static constexpr uint32_t QR_PACKET_TYPE_EXCEPTION_INFO = 0xA3000003;
 static constexpr uint32_t QR_PACKET_TYPE_PROCESS_LIST   = 0xA3000004;
+static constexpr uint32_t QR_PACKET_TYPE_SYSTEM_INFO    = 0xA3000005;
+static constexpr uint32_t QR_PACKET_TYPE_STACK_DUMP     = 0xA3000006;
 
 // Rendering constants (tuned on real hardware — Enkel required dozens of iterations)
 //
@@ -113,6 +115,27 @@ struct __attribute__((packed)) PanicProcessList {
     PanicProcessEntry entries[PANIC_MAX_PROCESSES];
 };
 
+// System-level metadata for crash diagnosis
+static constexpr uint32_t PANIC_GIT_HASH_LEN = 12;  // short git hash (null-terminated)
+
+struct __attribute__((packed)) PanicSystemInfo {
+    uint8_t  cpuIndex;                      // CPU that panicked
+    uint8_t  cpuCount;                      // total CPUs online
+    uint16_t reserved;
+    uint64_t tscTicks;                      // RDTSC at panic time
+    uint64_t tssRsp0;                       // TSS RSP0 of faulting CPU
+    char     gitHash[PANIC_GIT_HASH_LEN];   // short commit hash
+};
+
+// Raw stack dump from RSP at panic time
+static constexpr uint32_t PANIC_STACK_DUMP_BYTES = 256;
+
+struct __attribute__((packed)) PanicStackDump {
+    uint64_t rsp;                           // RSP value at capture time
+    uint16_t length;                        // actual bytes captured (≤ PANIC_STACK_DUMP_BYTES)
+    uint8_t  data[PANIC_STACK_DUMP_BYTES];  // raw memory from [RSP, RSP+length)
+};
+
 // Render a QR code containing CPU state + stack trace to the framebuffer.
 // Called from KernelPanic after capturing registers.
 // fbBase: physical address of framebuffer
@@ -122,6 +145,8 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
                    uint32_t fbStride, const PanicCPURegs* regs,
                    const PanicStackTrace* trace,
                    const PanicExceptionInfo* excInfo = nullptr,
-                   const PanicProcessList* procList = nullptr);
+                   const PanicProcessList* procList = nullptr,
+                   const PanicSystemInfo* sysInfo = nullptr,
+                   const PanicStackDump* stackDump = nullptr);
 
 } // namespace brook

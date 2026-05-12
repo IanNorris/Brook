@@ -299,7 +299,7 @@ void PanicScreenRender(uint32_t* fb, uint32_t fbW, uint32_t fbH,
 
     // 6. Render QR code in the right column
     PanicRenderQR(fb, fbW, fbH, fbStride, info->regs, info->trace,
-                  info->excInfo, info->procList);
+                  info->excInfo, info->procList, info->sysInfo, info->stackDump);
 
     // 7. "System halted" at bottom
     DrawString(fb, stride, fbW, fbH, leftMargin,

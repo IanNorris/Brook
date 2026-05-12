@@ -11,6 +11,7 @@
 #include "ksym_addrs.h"
 #include "scheduler.h"
 #include "process.h"
+#include "gdt.h"
 
 // ---- Register capture -------------------------------------------------------
 struct PanicRegs {
@@ -344,6 +345,48 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
             procList.count++;
         }
 
+        // Capture system metadata
+        static brook::PanicSystemInfo sysInfo = {};
+        {
+            uint32_t cpuIdx = brook::SmpCurrentCpuIndex();
+            sysInfo.cpuIndex = static_cast<uint8_t>(cpuIdx);
+            sysInfo.cpuCount = static_cast<uint8_t>(brook::SmpGetCpuCount());
+
+            // RDTSC for uptime approximation
+            uint32_t lo, hi;
+            __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+            sysInfo.tscTicks = (static_cast<uint64_t>(hi) << 32) | lo;
+
+            // TSS RSP0 for faulting CPU
+            auto* tss = GdtGetTss(cpuIdx);
+            sysInfo.tssRsp0 = tss ? tss->rsp[0] : 0;
+
+            // Copy short git hash
+            const char* hash = brook::BuildGitHash();
+            for (uint32_t j = 0; j < brook::PANIC_GIT_HASH_LEN - 1 && hash[j]; j++)
+                sysInfo.gitHash[j] = hash[j];
+            sysInfo.gitHash[brook::PANIC_GIT_HASH_LEN - 1] = '\0';
+        }
+
+        // Capture raw stack bytes from RSP
+        static brook::PanicStackDump stackDump = {};
+        {
+            stackDump.rsp = regs.rsp;
+            stackDump.length = 0;
+            const uint8_t* rspPtr = reinterpret_cast<const uint8_t*>(regs.rsp);
+            uint64_t rspAddr = regs.rsp;
+            // Only read if RSP is in kernel-half canonical range
+            if (rspAddr >= 0xFFFF800000000000ULL && rspAddr != 0)
+            {
+                uint16_t maxBytes = brook::PANIC_STACK_DUMP_BYTES;
+                for (uint16_t i = 0; i < maxBytes; i++)
+                {
+                    stackDump.data[i] = rspPtr[i];
+                    stackDump.length = i + 1;
+                }
+            }
+        }
+
         uint32_t fbStride = physStride * 4; // pixel stride → byte stride
         brook::PanicScreenInfo psi = {};
         psi.message   = g_panicBuf;
@@ -351,6 +394,8 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
         psi.trace     = &trace;
         psi.excInfo   = nullptr;  // KernelPanic — no exception
         psi.procList  = &procList;
+        psi.sysInfo   = &sysInfo;
+        psi.stackDump = &stackDump;
         psi.vector    = 0;
         psi.errorCode = 0;
         brook::PanicScreenRender(const_cast<uint32_t*>(physFb), fbW, fbH, fbStride, &psi);

@@ -1034,12 +1034,47 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                     procList.count++;
                 }
 
+                // System metadata
+                static brook::PanicSystemInfo sysInfo = {};
+                {
+                    uint32_t cpuIdx = brook::SmpCurrentCpuIndex();
+                    sysInfo.cpuIndex = static_cast<uint8_t>(cpuIdx);
+                    sysInfo.cpuCount = static_cast<uint8_t>(brook::SmpGetCpuCount());
+                    uint32_t lo, hi;
+                    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+                    sysInfo.tscTicks = (static_cast<uint64_t>(hi) << 32) | lo;
+                    auto* tss = GdtGetTss(cpuIdx);
+                    sysInfo.tssRsp0 = tss ? tss->rsp[0] : 0;
+                    const char* hash = brook::BuildGitHash();
+                    for (uint32_t j = 0; j < brook::PANIC_GIT_HASH_LEN - 1 && hash[j]; j++)
+                        sysInfo.gitHash[j] = hash[j];
+                    sysInfo.gitHash[brook::PANIC_GIT_HASH_LEN - 1] = '\0';
+                }
+
+                // Raw stack dump from exception RSP
+                static brook::PanicStackDump stackDump = {};
+                {
+                    stackDump.rsp = ef->rsp;
+                    stackDump.length = 0;
+                    const uint8_t* rspPtr = reinterpret_cast<const uint8_t*>(ef->rsp);
+                    if (ef->rsp >= 0xFFFF800000000000ULL && ef->rsp != 0)
+                    {
+                        for (uint16_t i = 0; i < brook::PANIC_STACK_DUMP_BYTES; i++)
+                        {
+                            stackDump.data[i] = rspPtr[i];
+                            stackDump.length = i + 1;
+                        }
+                    }
+                }
+
                 brook::PanicScreenInfo psi = {};
                 psi.message   = "Unrecoverable kernel exception";
                 psi.regs      = &pregs;
                 psi.trace     = &ptrace;
                 psi.excInfo   = &excInfo;
                 psi.procList  = &procList;
+                psi.sysInfo   = &sysInfo;
+                psi.stackDump = &stackDump;
                 psi.vector    = vector;
                 psi.errorCode = ef->errorCode;
                 brook::PanicScreenRender(const_cast<uint32_t*>(physFb), fbW, fbH, fbStride, &psi);

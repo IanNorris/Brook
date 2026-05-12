@@ -55,6 +55,8 @@ PKT_CPU_REGS       = 0xA3000001
 PKT_STACK_TRACE    = 0xA3000002
 PKT_EXCEPTION_INFO = 0xA3000003
 PKT_PROCESS_LIST   = 0xA3000004
+PKT_SYSTEM_INFO    = 0xA3000005
+PKT_STACK_DUMP     = 0xA3000006
 
 GPR_NAMES = [
     "RAX", "RBX", "RCX", "RDX", "RSI", "RDI",
@@ -191,6 +193,30 @@ class ProcessList:
                 break
             self.entries.append(ProcessEntry(data, off))
             off += 24
+
+
+PANIC_GIT_HASH_LEN = 12
+
+
+class SystemInfo:
+    def __init__(self, data: bytes):
+        if len(data) < 4 + 8 + 8 + PANIC_GIT_HASH_LEN:
+            raise ValueError("Truncated SystemInfo")
+        self.cpu_index, self.cpu_count, self.reserved = \
+            struct.unpack_from("<BBH", data, 0)
+        self.tsc_ticks = struct.unpack_from("<Q", data, 4)[0]
+        self.tss_rsp0 = struct.unpack_from("<Q", data, 12)[0]
+        raw_hash = data[20:20 + PANIC_GIT_HASH_LEN]
+        self.git_hash = raw_hash.split(b'\x00')[0].decode('ascii', errors='replace')
+
+
+class StackDump:
+    def __init__(self, data: bytes):
+        if len(data) < 10:
+            raise ValueError("Truncated StackDump")
+        self.rsp = struct.unpack_from("<Q", data, 0)[0]
+        self.length = struct.unpack_from("<H", data, 8)[0]
+        self.data = data[10:10 + self.length]
 
 
 # ── Symbolication ───────────────────────────────────────────────────────────
@@ -471,12 +497,25 @@ def _box_line(text: str):
 def print_report(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | None,
                  sym: Symbolicator | None, raw_data: bytes, show_raw: bool,
                  exc_info: ExceptionInfo | None = None,
-                 proc_list: ProcessList | None = None):
+                 proc_list: ProcessList | None = None,
+                 sys_info: SystemInfo | None = None,
+                 stack_dump: StackDump | None = None):
     bar = "═" * (W + 4)
     print(f"\n  {C.RED}{C.BOLD}{bar}{C.RESET}")
     print(f"  {C.RED}{C.BOLD}{'🔴 BROOK OS CRASH DUMP':^{W + 4}}{C.RESET}")
-    print(f"  {C.DIM}{'Version: 0x%02X  Page: %d/%d' % (hdr.version, hdr.page + 1, hdr.page_count):^{W + 4}}{C.RESET}")
+    version_str = 'Version: 0x%02X  Page: %d/%d' % (hdr.version, hdr.page + 1, hdr.page_count)
+    if sys_info:
+        version_str += f"  Build: {sys_info.git_hash}"
+    print(f"  {C.DIM}{version_str:^{W + 4}}{C.RESET}")
     print(f"  {C.RED}{C.BOLD}{bar}{C.RESET}\n")
+
+    # System info
+    if sys_info:
+        print(f"  {C.CYAN}{C.BOLD}System Info:{C.RESET}")
+        print(f"  {C.YELLOW}CPU:{C.RESET} {C.WHITE}{sys_info.cpu_index}/{sys_info.cpu_count}{C.RESET}  "
+              f"{C.YELLOW}TSC:{C.RESET} {C.WHITE}0x{sys_info.tsc_ticks:016X}{C.RESET}  "
+              f"{C.YELLOW}TSS RSP0:{C.RESET} {C.WHITE}0x{sys_info.tss_rsp0:016X}{C.RESET}  "
+              f"{C.YELLOW}Git:{C.RESET} {C.WHITE}{sys_info.git_hash}{C.RESET}\n")
 
     # Exception info
     if exc_info:
@@ -542,6 +581,23 @@ def print_report(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | Non
             ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
             print(f"  {C.DIM}{off:04X}{C.RESET}  {hex_part:<48s}  {C.DIM}{ascii_part}{C.RESET}")
 
+    if stack_dump and stack_dump.length > 0:
+        print(f"\n  {C.CYAN}{C.BOLD}Stack Dump ({stack_dump.length} bytes from RSP=0x{stack_dump.rsp:016X}):{C.RESET}")
+        for off in range(0, stack_dump.length, 16):
+            addr = stack_dump.rsp + off
+            chunk = stack_dump.data[off:off + 16]
+            hex_part = " ".join(f"{b:02X}" for b in chunk)
+            ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+            # Try to decode 8-byte values as potential pointers
+            ptr_str = ""
+            if len(chunk) >= 8:
+                ptr = struct.unpack_from("<Q", chunk, 0)[0]
+                if sym and ptr > 0xFFFF800000000000:
+                    name = sym.resolve(ptr)
+                    if name:
+                        ptr_str = f"  {C.GREEN}{name}{C.RESET}"
+            print(f"  {C.DIM}{addr:016X}{C.RESET}  {hex_part:<48s}  {C.DIM}{ascii_part}{C.RESET}{ptr_str}")
+
     if proc_list and proc_list.entries:
         print(f"\n  {C.CYAN}{C.BOLD}Running Processes ({len(proc_list.entries)}):{C.RESET}")
         print(f"  {C.DIM}{'PID':>5s}  {'STATE':<10s}  {'CPU':>3s}  {'NAME':<12s}  {'RIP'}{C.RESET}")
@@ -555,7 +611,9 @@ def print_report(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | Non
 
 def build_json(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | None,
                sym: Symbolicator | None, exc_info: ExceptionInfo | None = None,
-               proc_list: ProcessList | None = None) -> dict:
+               proc_list: ProcessList | None = None,
+               sys_info: SystemInfo | None = None,
+               stack_dump: StackDump | None = None) -> dict:
     out: dict = {
         "header": {
             "magic": f"0x{hdr.magic:02X}",
@@ -607,6 +665,20 @@ def build_json(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | None,
                 "rip": f"0x{pe.rip:016X}" if pe.rip else None,
             })
         out["processes"] = procs
+    if sys_info:
+        out["system_info"] = {
+            "cpu_index": sys_info.cpu_index,
+            "cpu_count": sys_info.cpu_count,
+            "tsc_ticks": f"0x{sys_info.tsc_ticks:016X}",
+            "tss_rsp0": f"0x{sys_info.tss_rsp0:016X}",
+            "git_hash": sys_info.git_hash,
+        }
+    if stack_dump and stack_dump.length > 0:
+        out["stack_dump"] = {
+            "rsp": f"0x{stack_dump.rsp:016X}",
+            "length": stack_dump.length,
+            "hex": stack_dump.data.hex(),
+        }
     return out
 
 
@@ -644,6 +716,8 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
     trace = None
     exc_info = None
     proc_list = None
+    sys_info = None
+    stack_dump = None
 
     while off + PacketHeader.SIZE <= len(payload):
         pkt = PacketHeader(payload, off)
@@ -666,6 +740,10 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
             exc_info = ExceptionInfo(pkt_data)
         elif pkt.type == PKT_PROCESS_LIST:
             proc_list = ProcessList(pkt_data)
+        elif pkt.type == PKT_SYSTEM_INFO:
+            sys_info = SystemInfo(pkt_data)
+        elif pkt.type == PKT_STACK_DUMP:
+            stack_dump = StackDump(pkt_data)
         else:
             print(f"[warn] Unknown packet type 0x{pkt.type:08X} ({pkt.size}B)",
                   file=sys.stderr)
@@ -674,10 +752,12 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
 
     if as_json:
         print(json.dumps(build_json(hdr, regs, trace, sym,
-                                    exc_info=exc_info, proc_list=proc_list), indent=2))
+                                    exc_info=exc_info, proc_list=proc_list,
+                                    sys_info=sys_info, stack_dump=stack_dump), indent=2))
     else:
         print_report(hdr, regs, trace, sym, data, show_raw,
-                     exc_info=exc_info, proc_list=proc_list)
+                     exc_info=exc_info, proc_list=proc_list,
+                     sys_info=sys_info, stack_dump=stack_dump)
 
 
 def parse_serial_log(path: str) -> bytes:
