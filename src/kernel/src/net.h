@@ -181,10 +181,10 @@ struct NetIf {
 void NetInit();
 
 // Register a network interface. Up to NET_MAX_IFS (4) may be registered.
-void NetRegisterIf(NetIf* nif);
+extern "C" void NetRegisterIf(NetIf* nif);
 
 // Called by the NIC driver when a frame arrives.
-void NetReceive(NetIf* nif, const void* frame, uint32_t len);
+extern "C" void NetReceive(NetIf* nif, const void* frame, uint32_t len);
 
 // Get the primary (first-registered) network interface.
 NetIf* NetGetIf();

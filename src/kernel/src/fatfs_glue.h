@@ -17,6 +17,6 @@ namespace brook {
 
 // Bind a block Device to a FatFS physical drive number (0-3).
 // Must be called before f_mount() for that drive.
-bool FatFsBindDrive(uint8_t pdrv, Device* dev);
+extern "C" bool FatFsBindDrive(uint8_t pdrv, Device* dev);
 
 } // namespace brook

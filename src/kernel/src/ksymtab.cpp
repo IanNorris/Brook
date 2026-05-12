@@ -56,15 +56,20 @@ EXPORT_SYMBOL(SerialPuts);
 // Physical memory
 EXPORT_SYMBOL(PmmAllocPage);
 EXPORT_SYMBOL(PmmAllocPages);
-EXPORT_SYMBOL_NAMED(PmmAllocPages, "_ZN5brook13PmmAllocPagesEmNS_6MemTagEt");
 EXPORT_SYMBOL(PmmFreePage);
+// These use C++ value types (PhysicalAddress, MemTag) so must also export
+// under their mangled names for C++ module linkage.
+EXPORT_SYMBOL_NAMED(PmmAllocPage,  "_ZN5brook12PmmAllocPageENS_6MemTagEt");
+EXPORT_SYMBOL_NAMED(PmmAllocPages, "_ZN5brook13PmmAllocPagesEmNS_6MemTagEt");
+EXPORT_SYMBOL_NAMED(PmmFreePage,   "_ZN5brook11PmmFreePageENS_15PhysicalAddressE");
 
 // Virtual memory
 EXPORT_SYMBOL(VmmAllocPages);
 EXPORT_SYMBOL(VmmFreePages);
 EXPORT_SYMBOL(VmmVirtToPhys);
 EXPORT_SYMBOL(KsymPhysToVirt);
-// Also export with mangled names for C++ modules that include the header.
+EXPORT_SYMBOL(VmmMapPage);
+// Mangled names for C++ module linkage (value types prevent extern "C").
 EXPORT_SYMBOL_NAMED(VmmAllocPages, "_ZN5brook13VmmAllocPagesEmmNS_6MemTagEt");
 EXPORT_SYMBOL_NAMED(VmmVirtToPhys, "_ZN5brook13VmmVirtToPhysENS_9PageTableENS_14VirtualAddressE");
 EXPORT_SYMBOL_NAMED(VmmFreePages,  "_ZN5brook12VmmFreePagesENS_14VirtualAddressEm");
@@ -170,8 +175,6 @@ EXPORT_SYMBOL(ApicSendEoi);
 // Network
 EXPORT_SYMBOL(NetRegisterIf);
 EXPORT_SYMBOL(NetReceive);
-EXPORT_SYMBOL_NAMED(NetRegisterIf, "_ZN5brook13NetRegisterIfEPNS_5NetIfE");
-EXPORT_SYMBOL_NAMED(NetReceive,    "_ZN5brook10NetReceiveEPNS_5NetIfEPKvj");
 
 // Audio
 EXPORT_SYMBOL(AudioRegister);
