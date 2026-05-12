@@ -87,7 +87,7 @@ static bool g_scriptMode = false;
 // run with a stripped-down environment and TLS / fontconfig / wayland
 // would silently break.
 const char* const g_defaultEnvp[] = {
-    "HOME=/tmp",
+    "HOME=/home",
     "PATH=/nix/profile/bin:/nix/bin:"
           "/nix/store/sm2nq18jjqp4x0sxpl6lrvwl9rx6mvj2-curl-8.19.0-bin/bin:"
           "/nix/store/2nm5c858fh52s6mhcffm07s3biaxys44-xz-5.8.3-bin/bin:"
@@ -133,11 +133,14 @@ const char* const g_defaultEnvp[] = {
     "SAL_USE_VCLPLUGIN=gtk3",
     "GDK_PIXBUF_MODULE_FILE=/nix/store/4cvbp49wlc9d7s6rivyz2s4fg8rrz9wd-librsvg-2.61.4/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache",
     "SAL_DISABLE_OPENCL=1",
+    "SAL_DISABLE_PRINTERLIST=1",
+    "CUPS_SERVER=/dev/null",
+    "SAL_LOG=+WARN+ERR+INFO.desktop.app+INFO.desktop.splash",
     "SDL_VIDEODRIVER=wayland",
     "SDL_AUDIODRIVER=alsa",
-    "XDG_CACHE_HOME=/tmp/cache",
-    "XDG_CONFIG_HOME=/tmp/config",
-    "XDG_DATA_HOME=/tmp/share",
+    "XDG_CACHE_HOME=/home/.cache",
+    "XDG_CONFIG_HOME=/home/.config",
+    "XDG_DATA_HOME=/home/.local/share",
     "XDG_DATA_DIRS=/nix/store/jmp6v1wk4cwrm0m9ba8ri9ah8y4745g7-brook-fonts-0.1/share:/usr/share",
     nullptr
 };
@@ -960,6 +963,7 @@ static int ExecCommand(int argc, const char* const* argv)
         const char* argv0Override = nullptr;
         int32_t uidOverride = -1;
         bool strace = false;
+        bool straceErrors = false;
         bool runOnce = false;
 
         // Parse flags before the path
@@ -972,6 +976,9 @@ static int ExecCommand(int argc, const char* const* argv)
                 pathIdx += 2;
             } else if (StrEq(argv[pathIdx], "--strace")) {
                 strace = true;
+                pathIdx++;
+            } else if (StrEq(argv[pathIdx], "--strace-errors")) {
+                straceErrors = true;
                 pathIdx++;
             } else if (StrEq(argv[pathIdx], "--once")) {
                 // Idempotent spawn: skip if a process with the same basename
@@ -1085,6 +1092,11 @@ static int ExecCommand(int argc, const char* const* argv)
         if (proc && strace) {
             proc->straceEnabled = true;
             KPrintf("[strace enabled for pid %u]\n", proc->pid);
+        }
+        if (proc && straceErrors) {
+            proc->straceEnabled = true;
+            proc->straceErrorsOnly = true;
+            KPrintf("[strace-errors enabled for pid %u]\n", proc->pid);
         }
         return 0;
     }

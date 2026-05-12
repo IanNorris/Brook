@@ -1,5 +1,5 @@
-profile 300
+profile 600
 set wm
 terminal
 run --once /nix/bin/waylandd
-run /nix/store/miip9x1vv3n5w47m0w6frpsnyxnbwj0n-libreoffice-25.8.5.2/lib/libreoffice/program/soffice.bin -env:UserInstallation=file:///tmp/lo_user --nofirststartwizard --norestore --writer
+run --strace-errors /nix/store/miip9x1vv3n5w47m0w6frpsnyxnbwj0n-libreoffice-25.8.5.2/lib/libreoffice/program/oosplash -env:UserInstallation=file:///tmp/lo_user --nofirststartwizard --norestore --writer

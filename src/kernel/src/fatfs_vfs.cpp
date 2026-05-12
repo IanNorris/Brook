@@ -543,6 +543,10 @@ static int FatFsRename(void* /*mountPriv*/, uint8_t pdrv,
     BuildFatPath(fatOld, sizeof(fatOld), pdrv, oldRelPath);
     BuildFatPath(fatNew, sizeof(fatNew), pdrv, newRelPath);
     KMutexLock(&g_fatLock);
+    // POSIX rename atomically replaces destination; FatFS f_rename fails if
+    // destination exists.  Delete the target first (ignore errors — it may
+    // not exist).
+    f_unlink(fatNew);
     FRESULT res = f_rename(fatOld, fatNew);
     KMutexUnlock(&g_fatLock);
     return (res == FR_OK) ? 0 : -1;

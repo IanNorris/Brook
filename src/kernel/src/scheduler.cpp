@@ -994,6 +994,10 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
     if (oldProc != newProc)
         __atomic_and_fetch(&oldProc->tlbCpuMask, ~(1ULL << cpu), __ATOMIC_RELEASE);
 
+    // Update per-CPU currentCr3 so TLB shootdown can determine which CPUs
+    // are running a given address space (critical for CoW fork correctness).
+    SmpSetCurrentCr3(cpu, newProc->savedCtx.cr3);
+
     ProfilerContextSwitch(oldProc->pid, newProc->pid);
     context_switch(&oldProc->savedCtx, &newProc->savedCtx,
                    &oldProc->fxsave, &newProc->fxsave,

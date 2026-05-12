@@ -2275,6 +2275,13 @@ static int Ext2FsRename(void* mountPriv, uint8_t pdrv,
     Ext2Inode newParentData;
     if (!Ext2ReadInode(mnt, newParentIno, &newParentData)) { KRwLockWriteUnlock(&g_ext2Lock); return -1; }
 
+    // POSIX rename replaces destination if it exists — remove it first
+    uint32_t existingIno = Ext2DirLookup(mnt, newParentIno, &newParentData, newName);
+    if (existingIno) {
+        Ext2DirRemove(mnt, &newParentData, newParentIno, newName);
+        Ext2ReadInode(mnt, newParentIno, &newParentData);
+    }
+
     // Remove from old directory
     Ext2DirRemove(mnt, &oldParentData, oldParentIno, oldName);
 

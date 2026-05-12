@@ -772,7 +772,9 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
                                 const Window& w,
                                 int32_t mouseX = -1, int32_t mouseY = -1)
 {
+    if (!buf || !stride || !screenW || !screenH) return;
     if (w.noChrome) return;  // CSD: client draws its own chrome
+    if (!w.proc || !w.visible) return;  // skip destroyed/hidden windows
     int wx = w.x;
     int wy = w.y;
     int ow = w.outerWidth();
@@ -903,6 +905,7 @@ void WmRenderChrome(uint32_t* backBuffer, uint32_t stride,
     for (uint32_t i = 0; i < count; ++i)
     {
         const Window& w = g_windows[sorted[i]];
+        if (!w.proc || !w.visible) continue;
         RenderWindowChrome(backBuffer, stride, screenW, screenH, w);
     }
 }
