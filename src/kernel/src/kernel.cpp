@@ -529,10 +529,6 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         brook::SmpPrepareAPs();
         brook::KLog("SMP: all APs prepared");
 
-        // Write-protect the GDT now that all APs have their TSS
-        // descriptors installed. Any stray write will trigger a #PF.
-        GdtWriteProtect();
-
         brook::BootLogoProgress(100, "Ready");
         brook::KLog("BOOT: complete, entering shell/scheduler");
         brook::KLogSync();
@@ -571,6 +567,11 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
         // Activate APs now — BSP is about to enter the scheduler.
         brook::SmpActivateAPs();
+
+        // Write-protect the GDT now that all APs have executed ltr
+        // (which sets the TSS "busy" bit in the GDT). Any subsequent
+        // stray write will trigger a #PF at the exact faulting instruction.
+        GdtWriteProtect();
 
         // Run TLB shootdown self-test while all CPUs are online but before
         // user processes start — any failure here is a hard boot error.

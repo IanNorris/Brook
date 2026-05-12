@@ -69,6 +69,9 @@ static void InstallPanicNmiHandler();
 // Per-AP activation flag: BSP sets to 1 to tell AP to proceed.
 static volatile uint32_t g_apActivate[MAX_CPUS] = {};
 
+// Count of APs that have completed GdtLoadOnAp (including ltr).
+static volatile uint32_t g_apGdtReady = 0;
+
 // Per-AP TSS selector (set by BSP, read by AP).
 static uint16_t g_apTssSelector[MAX_CPUS] = {};
 
@@ -155,6 +158,9 @@ void ApEntryFunction()
 
     // Load per-CPU GDT/TSS.
     GdtLoadOnAp(g_apTssSelector[myCpuIndex]);
+
+    // Signal BSP that this AP has completed ltr (GDT is now modified).
+    __atomic_fetch_add(&g_apGdtReady, 1, __ATOMIC_RELEASE);
 
     // Set up KernelCpuEnv and GS base for SWAPGS.
     KernelCpuEnv* env = g_apEnv[myCpuIndex];
@@ -445,12 +451,19 @@ void SmpActivateAPs()
 
     // Signal all APs to start — they will init per-CPU state and enter
     // SchedulerStartAp which waits for g_schedulerRunning.
+    uint32_t apCount = 0;
     for (uint32_t i = 0; i < g_cpuCount && i < MAX_CPUS; ++i)
     {
         if (g_cpus[i].isBsp || !g_cpus[i].online)
             continue;
         __atomic_store_n(&g_apActivate[i], 1, __ATOMIC_RELEASE);
+        apCount++;
     }
+
+    // Wait for all APs to complete GdtLoadOnAp (ltr modifies the GDT
+    // by setting the TSS busy bit — must finish before write-protect).
+    while (__atomic_load_n(&g_apGdtReady, __ATOMIC_ACQUIRE) < apCount)
+        __asm__ volatile("pause" ::: "memory");
 }
 
 uint32_t SmpGetCpuCount()
