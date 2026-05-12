@@ -2487,6 +2487,18 @@ void Ext2VfsRegister()
 
 } // namespace brook
 
+// Diagnostic: dump ext2 rwlock state (called from scheduler thread dump)
+extern "C" void Ext2DumpLockState()
+{
+    brook::SerialPrintf("  ext2Lock: readers=%d writerActive=%u writersWaiting=%u "
+                        "readWaitHead=%p writeWaitHead=%p\n",
+                        brook::g_ext2Lock.readerCount,
+                        brook::g_ext2Lock.writerActive,
+                        brook::g_ext2Lock.writersWaiting,
+                        brook::g_ext2Lock.readWaitHead,
+                        brook::g_ext2Lock.writeWaitHead);
+}
+
 // Bind a block device to an ext2 pdrv slot.
 extern "C" bool Ext2BindDevice(uint8_t pdrv, brook::Device* dev)
 {

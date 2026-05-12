@@ -180,6 +180,9 @@ volatile uint64_t g_lapicTickCount = 0;
 // Forward-declare scheduler tick (defined in scheduler.cpp).
 void SchedulerTimerTick(bool allowPreempt);
 
+// Forward-declare thread state dump (defined in scheduler.cpp).
+void SchedulerDumpThreadStates();
+
 // Forward-declare profiler sample (defined in profiler.cpp).
 void ProfilerSample(uint64_t interruptedRip, uint64_t interruptedCs, uint64_t interruptedRbp);
 
@@ -201,6 +204,10 @@ static void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interrupted
     {
         g_lapicTickCount++;
         g_lapicRawTickCount++;
+
+        // Periodic thread state dump for hang diagnosis (every 30s)
+        if ((g_lapicTickCount % 30000) == 0 && g_lapicTickCount >= 30000)
+            SchedulerDumpThreadStates();
 
         // Re-check CMOS every ~1024 ticks (~1 second) to correct for
         // LAPIC calibration drift under host turbo / KVM dilation.

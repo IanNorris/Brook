@@ -91,10 +91,14 @@ void KRwLockReadLock(KRwLock* rw)
     }
 
     // Block — enqueue on reader wait list.
+    self->blockedOnRwLock = rw;
+    self->blockedAsWriter = false;
     __atomic_store_n(&self->pendingWakeup, 0, __ATOMIC_RELEASE);
     Enqueue(rw->readWaitHead, rw->readWaitTail, self);
     RwGuardRelease(rw, flags);
     SchedulerBlock(self);
+    // Woken — clear tracking.
+    self->blockedOnRwLock = nullptr;
 }
 
 void KRwLockReadUnlock(KRwLock* rw)
@@ -126,6 +130,9 @@ void KRwLockWriteLock(KRwLock* rw)
     {
         rw->writerActive = 1;
         RwGuardRelease(rw, flags);
+        // Track ownership.
+        Process* self = SchedulerCurrentProcess();
+        if (self) self->heldWriteLock = rw;
         return;
     }
 
@@ -142,14 +149,24 @@ void KRwLockWriteLock(KRwLock* rw)
 
     // Block — enqueue on writer wait list.
     rw->writersWaiting++;
+    self->blockedOnRwLock = rw;
+    self->blockedAsWriter = true;
     __atomic_store_n(&self->pendingWakeup, 0, __ATOMIC_RELEASE);
     Enqueue(rw->writeWaitHead, rw->writeWaitTail, self);
     RwGuardRelease(rw, flags);
     SchedulerBlock(self);
+    // Woken — we now hold the write lock.
+    self->blockedOnRwLock = nullptr;
+    self->heldWriteLock = rw;
 }
 
 void KRwLockWriteUnlock(KRwLock* rw)
 {
+    // Clear ownership tracking.
+    Process* self = SchedulerCurrentProcess();
+    if (self && self->heldWriteLock == rw)
+        self->heldWriteLock = nullptr;
+
     uint64_t flags = RwGuardAcquire(rw);
     rw->writerActive = 0;
 
@@ -188,6 +205,81 @@ void KRwLockWriteUnlock(KRwLock* rw)
     }
 
     RwGuardRelease(rw, flags);
+}
+
+// Remove a specific process from a singly-linked wait queue.
+static inline bool RemoveFromQueue(Process*& head, Process*& tail, Process* target)
+{
+    if (!head || !target) return false;
+    if (head == target) {
+        head = target->syncNext;
+        if (!head) tail = nullptr;
+        target->syncNext = nullptr;
+        return true;
+    }
+    for (Process* prev = head; prev->syncNext; prev = prev->syncNext) {
+        if (prev->syncNext == target) {
+            prev->syncNext = target->syncNext;
+            if (tail == target) tail = prev;
+            target->syncNext = nullptr;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Called when a thread is about to exit. Releases any held write lock and
+// removes the thread from any rwlock wait queue it may be blocked on.
+void KRwLockCleanupOnExit(Process* p)
+{
+    if (!p) return;
+
+    // Case 1: Thread holds a write lock — release it.
+    if (p->heldWriteLock) {
+        KRwLock* rw = p->heldWriteLock;
+        p->heldWriteLock = nullptr;
+        // Perform the same logic as KRwLockWriteUnlock.
+        uint64_t flags = RwGuardAcquire(rw);
+        rw->writerActive = 0;
+
+        // Wake all queued readers.
+        if (rw->readWaitHead) {
+            Process* readers[128];
+            uint32_t count = 0;
+            while (rw->readWaitHead && count < 128) {
+                readers[count] = Dequeue(rw->readWaitHead, rw->readWaitTail);
+                __atomic_store_n(&readers[count]->pendingWakeup, 1, __ATOMIC_RELEASE);
+                count++;
+                rw->readerCount++;
+            }
+            RwGuardRelease(rw, flags);
+            for (uint32_t i = 0; i < count; ++i)
+                SchedulerUnblock(readers[i]);
+        } else if (rw->writeWaitHead) {
+            Process* writer = Dequeue(rw->writeWaitHead, rw->writeWaitTail);
+            rw->writerActive = 1;
+            rw->writersWaiting--;
+            __atomic_store_n(&writer->pendingWakeup, 1, __ATOMIC_RELEASE);
+            RwGuardRelease(rw, flags);
+            SchedulerUnblock(writer);
+        } else {
+            RwGuardRelease(rw, flags);
+        }
+    }
+
+    // Case 2: Thread is blocked waiting on a rwlock — remove from queue.
+    if (p->blockedOnRwLock) {
+        KRwLock* rw = p->blockedOnRwLock;
+        uint64_t flags = RwGuardAcquire(rw);
+        if (p->blockedAsWriter) {
+            if (RemoveFromQueue(rw->writeWaitHead, rw->writeWaitTail, p))
+                rw->writersWaiting--;
+        } else {
+            RemoveFromQueue(rw->readWaitHead, rw->readWaitTail, p);
+        }
+        RwGuardRelease(rw, flags);
+        p->blockedOnRwLock = nullptr;
+    }
 }
 
 } // namespace brook
