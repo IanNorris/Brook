@@ -161,6 +161,7 @@ EXPORT_SYMBOL(KernelPanic);
 
 // IDT / APIC — for driver IRQ setup
 EXPORT_SYMBOL(IdtInstallHandler);
+EXPORT_SYMBOL(ApicGetId);
 EXPORT_SYMBOL(IoApicUnmaskIrq);
 EXPORT_SYMBOL(IoApicRegisterHandler);
 EXPORT_SYMBOL(IoApicUnregisterHandler);
