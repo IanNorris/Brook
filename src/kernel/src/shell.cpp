@@ -87,7 +87,7 @@ static bool g_scriptMode = false;
 // run with a stripped-down environment and TLS / fontconfig / wayland
 // would silently break.
 const char* const g_defaultEnvp[] = {
-    "HOME=/",
+    "HOME=/tmp",
     "PATH=/nix/profile/bin:/nix/bin:"
           "/nix/store/sm2nq18jjqp4x0sxpl6lrvwl9rx6mvj2-curl-8.19.0-bin/bin:"
           "/nix/store/2nm5c858fh52s6mhcffm07s3biaxys44-xz-5.8.3-bin/bin:"

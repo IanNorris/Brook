@@ -205,10 +205,6 @@ static void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interrupted
         g_lapicTickCount++;
         g_lapicRawTickCount++;
 
-        // Periodic thread state dump for hang diagnosis (every 30s)
-        if ((g_lapicTickCount % 30000) == 0 && g_lapicTickCount >= 30000)
-            SchedulerDumpThreadStates();
-
         // Re-check CMOS every ~1024 ticks (~1 second) to correct for
         // LAPIC calibration drift under host turbo / KVM dilation.
         if ((g_lapicTickCount & 0x3FF) == 0)

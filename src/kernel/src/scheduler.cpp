@@ -33,6 +33,9 @@ extern "C" int64_t FutexWake(uint64_t owner, uint64_t uaddr, uint32_t maxWake,
 // Ext2 lock state diagnostic — implemented in ext2_vfs.cpp
 extern "C" void Ext2DumpLockState();
 
+// FatFS lock state diagnostic — implemented in fatfs_vfs.cpp
+extern "C" void FatFsDumpLockState();
+
 // Enter user mode for the first time (existing function in syscall.cpp).
 namespace brook { void SwitchToUserMode(uint64_t userRsp, uint64_t userRip); }
 
@@ -2152,6 +2155,7 @@ void SchedulerDumpThreadStates()
     extern volatile uint64_t g_lapicTickCount;
     SerialPrintf("  now=%lu\n", g_lapicTickCount);
     Ext2DumpLockState();
+    FatFsDumpLockState();
     SerialPrintf("=========================\n\n");
     SchedLockRelease(g_allProcLock, flags);
 }

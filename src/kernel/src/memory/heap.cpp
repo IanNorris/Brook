@@ -76,7 +76,9 @@ static uint8_t* g_heapEnd     = nullptr;  // exclusive
 static uint64_t g_freeBytes   = 0;
 
 // SMP lock protecting all heap metadata.
-static SpinLock g_heapLock;
+// IrqSpinLock: prevents preemption deadlock when timer interrupt
+// fires while a CPU holds the lock.
+static IrqSpinLock g_heapLock;
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -237,7 +239,7 @@ void* kmalloc(uint64_t size)
 {
     if (size == 0 || g_heapStart == nullptr) return nullptr;
 
-    SpinLockAcquire(&g_heapLock);
+    uint64_t heapFlags = IrqSpinLockAcquire(&g_heapLock);
 
     // Round size up to alignment, then account for overhead.
     uint64_t aligned = (size + ALIGN - 1) & ~(ALIGN - 1);
@@ -301,7 +303,7 @@ void* kmalloc(uint64_t size)
                         dst[i] = POISON_ALLOC;
                 }
 
-                SpinLockRelease(&g_heapLock);
+                IrqSpinLockRelease(&g_heapLock, heapFlags);
                 return result;
             }
 
@@ -309,10 +311,10 @@ void* kmalloc(uint64_t size)
         }
 
         // First pass exhausted — try to expand with enough room.
-        if (pass == 0 && !ExpandHeap(needed)) { SpinLockRelease(&g_heapLock); return nullptr; }
+        if (pass == 0 && !ExpandHeap(needed)) { IrqSpinLockRelease(&g_heapLock, heapFlags); return nullptr; }
     }
 
-    SpinLockRelease(&g_heapLock);
+    IrqSpinLockRelease(&g_heapLock, heapFlags);
     return nullptr;
 }
 
@@ -320,11 +322,11 @@ void kfree(void* ptr)
 {
     if (ptr == nullptr) return;
 
-    SpinLockAcquire(&g_heapLock);
+    uint64_t heapFlags = IrqSpinLockAcquire(&g_heapLock);
 
     BlockHeader* h = ToHeader(ptr);
-    if (!IsValidHeader(h)) { SpinLockRelease(&g_heapLock); return; }
-    if (h->free) { SpinLockRelease(&g_heapLock); return; }
+    if (!IsValidHeader(h)) { IrqSpinLockRelease(&g_heapLock, heapFlags); return; }
+    if (h->free) { IrqSpinLockRelease(&g_heapLock, heapFlags); return; }
 
     g_freeBytes += h->size - OVERHEAD;
 
@@ -351,17 +353,17 @@ void kfree(void* ptr)
         }
     }
 
-    SpinLockRelease(&g_heapLock);
+    IrqSpinLockRelease(&g_heapLock, heapFlags);
 }
 void* krealloc(void* ptr, uint64_t newSize)
 {
     if (ptr == nullptr) return kmalloc(newSize);
     if (newSize == 0) { kfree(ptr); return nullptr; }
 
-    SpinLockAcquire(&g_heapLock);
+    uint64_t heapFlags = IrqSpinLockAcquire(&g_heapLock);
 
     BlockHeader* h = ToHeader(ptr);
-    if (!IsValidHeader(h)) { SpinLockRelease(&g_heapLock); return nullptr; }
+    if (!IsValidHeader(h)) { IrqSpinLockRelease(&g_heapLock, heapFlags); return nullptr; }
 
     uint64_t aligned = (newSize + ALIGN - 1) & ~(ALIGN - 1);
     uint32_t needed  = static_cast<uint32_t>(aligned + OVERHEAD);
@@ -369,13 +371,13 @@ void* krealloc(void* ptr, uint64_t newSize)
         needed = static_cast<uint32_t>(MIN_BLOCK);
 
     // Block is already large enough.
-    if (h->size >= needed) { SpinLockRelease(&g_heapLock); return ptr; }
+    if (h->size >= needed) { IrqSpinLockRelease(&g_heapLock, heapFlags); return ptr; }
 
     // Snapshot the copy size while we still hold the lock and the block is valid.
     uint64_t copyBytes = h->size - OVERHEAD;
     if (copyBytes > newSize) copyBytes = newSize;
 
-    SpinLockRelease(&g_heapLock);
+    IrqSpinLockRelease(&g_heapLock, heapFlags);
 
     // Allocate new block, copy, free old.
     void* newPtr = kmalloc(newSize);
@@ -396,7 +398,7 @@ bool HeapCheckIntegrity()
 {
     if (!g_heapStart) return true;
 
-    SpinLockAcquire(&g_heapLock);
+    uint64_t heapFlags = IrqSpinLockAcquire(&g_heapLock);
 
     uint32_t blockCount = 0;
     BlockHeader* cur = reinterpret_cast<BlockHeader*>(g_heapStart);
@@ -408,7 +410,7 @@ bool HeapCheckIntegrity()
             uint64_t off = reinterpret_cast<uint8_t*>(cur) - g_heapStart;
             SerialPrintf("HeapCheck: corrupt header at block #%u offset 0x%lx "
                          "(magic=0x%x)\n", blockCount, (unsigned long)off, cur->magic);
-            SpinLockRelease(&g_heapLock);
+            IrqSpinLockRelease(&g_heapLock, heapFlags);
             return false;
         }
 
@@ -417,7 +419,7 @@ bool HeapCheckIntegrity()
             uint64_t off = reinterpret_cast<uint8_t*>(cur) - g_heapStart;
             SerialPrintf("HeapCheck: invalid size %u at block #%u offset 0x%lx\n",
                          cur->size, blockCount, (unsigned long)off);
-            SpinLockRelease(&g_heapLock);
+            IrqSpinLockRelease(&g_heapLock, heapFlags);
             return false;
         }
 
@@ -428,7 +430,7 @@ bool HeapCheckIntegrity()
             SerialPrintf("HeapCheck: footer mismatch at block #%u offset 0x%lx "
                          "(ftr_magic=0x%x ftr_size=%u hdr_size=%u)\n",
                          blockCount, (unsigned long)off, f->magic, f->size, cur->size);
-            SpinLockRelease(&g_heapLock);
+            IrqSpinLockRelease(&g_heapLock, heapFlags);
             return false;
         }
 
@@ -436,7 +438,7 @@ bool HeapCheckIntegrity()
         cur = NextBlock(cur);
     }
 
-    SpinLockRelease(&g_heapLock);
+    IrqSpinLockRelease(&g_heapLock, heapFlags);
     return true;
 }
 
@@ -451,7 +453,7 @@ void HeapGetStats(HeapStats* out)
     *out = {};
     if (!g_heapStart) return;
 
-    SpinLockAcquire(&g_heapLock);
+    uint64_t heapFlags = IrqSpinLockAcquire(&g_heapLock);
 
     uint32_t totalBlocks = 0, freeBlocks = 0, usedBlocks = 0;
     uint64_t freeBytes = 0, usedBytes = 0;
@@ -475,7 +477,7 @@ void HeapGetStats(HeapStats* out)
         cur = NextBlock(cur);
     }
 
-    SpinLockRelease(&g_heapLock);
+    IrqSpinLockRelease(&g_heapLock, heapFlags);
 
     out->regionStart      = reinterpret_cast<uint64_t>(g_heapStart);
     out->regionEnd        = reinterpret_cast<uint64_t>(g_heapEnd);

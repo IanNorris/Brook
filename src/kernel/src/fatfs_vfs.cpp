@@ -571,3 +571,10 @@ void FatFsVfsRegister()
 }
 
 } // namespace brook
+
+extern "C" void FatFsDumpLockState()
+{
+    brook::SerialPrintf("  fatLock: locked=%u owner=%u waitHead=%p\n",
+                        brook::g_fatLock.locked, brook::g_fatLock.ownerPid,
+                        brook::g_fatLock.waitHead);
+}
