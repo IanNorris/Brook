@@ -8601,6 +8601,29 @@ static int64_t sys_fchdir(uint64_t fd, uint64_t, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
+// sys_rmdir (84) — remove an empty directory
+// ---------------------------------------------------------------------------
+
+static int64_t sys_rmdir(uint64_t pathAddr, uint64_t, uint64_t,
+                          uint64_t, uint64_t, uint64_t)
+{
+    char pathBuf[256];
+    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
+    const char* path = pathBuf;
+
+    if (VfsUnlink(path) == 0) return 0;
+
+    char bootPath[256] = "/boot";
+    uint32_t bi = 5;
+    for (const char* p = path; *p && bi + 1 < sizeof(bootPath); ++p)
+        bootPath[bi++] = *p;
+    bootPath[bi] = '\0';
+    if (VfsUnlink(bootPath) == 0) return 0;
+
+    return -ENOENT;
+}
+
+// ---------------------------------------------------------------------------
 // sys_unlink (87) — delete a file
 // ---------------------------------------------------------------------------
 
@@ -8661,10 +8684,6 @@ static int64_t sys_rename(uint64_t oldAddr, uint64_t newAddr, uint64_t,
 
     return -ENOENT;
 }
-
-// ---------------------------------------------------------------------------
-// sys_mkdir (83) — create a directory
-// ---------------------------------------------------------------------------
 
 static int64_t sys_mkdir(uint64_t pathAddr, uint64_t, uint64_t,
                           uint64_t, uint64_t, uint64_t)
@@ -11920,6 +11939,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_FCHDIR]          = sys_fchdir;
     g_syscallTable[SYS_RENAME]          = sys_rename;
     g_syscallTable[SYS_MKDIR]           = sys_mkdir;
+    g_syscallTable[SYS_RMDIR]           = sys_rmdir;
     g_syscallTable[SYS_UNLINK]          = sys_unlink;
     g_syscallTable[SYS_SYMLINK]         = sys_symlink;
     g_syscallTable[SYS_READLINK]        = sys_readlink;
@@ -12183,7 +12203,7 @@ static const char* SyscallName(uint64_t num)
     case 74: return "fsync";      case 75: return "fdatasync";
     case 79: return "getcwd";     case 80: return "chdir";
     case 81: return "fchdir";     case 82: return "rename";
-    case 83: return "mkdir";      case 87: return "unlink";
+    case 83: return "mkdir";      case 84: return "rmdir";      case 87: return "unlink";
     case 88: return "symlink";    case 89: return "readlink";   case 95: return "umask";
     case 96: return "gettimeofday"; case 97: return "getrlimit";
     case 98: return "getrusage";  case 99: return "sysinfo";

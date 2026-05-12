@@ -90,6 +90,7 @@ static constexpr uint64_t SYS_CHDIR           = 80;
 static constexpr uint64_t SYS_FCHDIR          = 81;
 static constexpr uint64_t SYS_RENAME          = 82;
 static constexpr uint64_t SYS_MKDIR           = 83;
+static constexpr uint64_t SYS_RMDIR           = 84;
 static constexpr uint64_t SYS_UNLINK          = 87;
 static constexpr uint64_t SYS_SYMLINK         = 88;
 static constexpr uint64_t SYS_READLINK        = 89;
