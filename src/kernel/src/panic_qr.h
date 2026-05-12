@@ -25,13 +25,27 @@ static constexpr uint32_t QR_PACKET_TYPE_STACK_TRACE    = 0xA3000002;
 static constexpr uint32_t QR_PACKET_TYPE_EXCEPTION_INFO = 0xA3000003;
 static constexpr uint32_t QR_PACKET_TYPE_PROCESS_LIST   = 0xA3000004;
 
-// Rendering constants (tuned on real hardware)
-static constexpr uint32_t QR_PIXELS_PER_MODULE = 3;
-static constexpr uint32_t QR_START_X           = 50;
-static constexpr uint32_t QR_START_Y           = 50;
-static constexpr int      QR_BORDER_WIDTH      = 2;
-static constexpr int      QR_CONTRAST          = 2;
-static constexpr uint8_t  QR_MAX_PAGES         = 4;
+// Rendering constants (tuned on real hardware — Enkel required dozens of iterations)
+//
+// QR_PIXELS_PER_MODULE: 3 works well on high-DPI displays.
+//   Use 9 for low-DPI devices like Surface Go where the camera can't resolve
+//   small modules.  The kernel auto-selects based on framebuffer resolution.
+//
+// QR_CONTRAST: reduces white from 0xFFFFFF to avoid camera bloom on screens.
+//   2 → white = 0xDDDDDD (slightly off-white, good for most screens)
+//   Range 0–7, higher = dimmer white.
+//
+// QR_INVERT_MODULES: when true, draws white modules on black background.
+//   Can improve readability on some displays (especially OLED).
+static constexpr uint32_t QR_PIXELS_PER_MODULE_HIDPI = 3;
+static constexpr uint32_t QR_PIXELS_PER_MODULE_LODPI = 9;
+static constexpr uint32_t QR_LODPI_THRESHOLD         = 1280; // fb width <= this uses LODPI
+static constexpr uint32_t QR_START_X                 = 50;
+static constexpr uint32_t QR_START_Y                 = 50;
+static constexpr int      QR_BORDER_WIDTH            = 2;
+static constexpr int      QR_CONTRAST                = 2;
+static constexpr bool     QR_INVERT_MODULES          = false;
+static constexpr uint8_t  QR_MAX_PAGES               = 4;
 
 // Packet header
 struct __attribute__((packed)) PanicHeader {

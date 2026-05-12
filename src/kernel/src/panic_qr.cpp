@@ -139,13 +139,18 @@ static uint32_t BuildBase45Page(char* b45Buf, uint32_t b45BufLen,
 // Render a single QR code to framebuffer at a given X origin.
 static void RenderQRToFramebuffer(uint32_t* fb, uint32_t fbWidth, uint32_t fbHeight,
                                    uint32_t fbStride, const uint8_t* qrcode,
-                                   uint32_t originX, uint32_t originY)
+                                   uint32_t originX, uint32_t originY,
+                                   uint32_t pixelsPerModule)
 {
     int size = qrcodegen_getSize(qrcode);
     uint32_t strideQuads = fbStride / 4;
 
-    const uint32_t black = 0x00000000;
-    const uint32_t white = 0xFFFFFFFF - (QR_CONTRAST * 0x11111111);
+    const uint32_t moduleBlack = 0x00000000;
+    const uint32_t moduleWhite = 0xFFFFFFFF - (QR_CONTRAST * 0x11111111);
+
+    // Inverted mode: white modules on black background (like Enkel's QRDump for text)
+    const uint32_t moduleColour = QR_INVERT_MODULES ? moduleWhite : moduleBlack;
+    const uint32_t bgColour     = QR_INVERT_MODULES ? moduleBlack : moduleWhite;
 
     for (int y = -QR_BORDER_WIDTH; y < size + QR_BORDER_WIDTH; ++y)
     {
@@ -153,16 +158,16 @@ static void RenderQRToFramebuffer(uint32_t* fb, uint32_t fbWidth, uint32_t fbHei
         {
             bool valid = (x >= 0 && x < size && y >= 0 && y < size);
             bool set = valid && qrcodegen_getModule(qrcode, x, y);
-            uint32_t colour = set ? black : white;
+            uint32_t colour = set ? moduleColour : bgColour;
 
-            for (uint32_t my = 0; my < QR_PIXELS_PER_MODULE; ++my)
+            for (uint32_t my = 0; my < pixelsPerModule; ++my)
             {
-                for (uint32_t mx = 0; mx < QR_PIXELS_PER_MODULE; ++mx)
+                for (uint32_t mx = 0; mx < pixelsPerModule; ++mx)
                 {
                     uint32_t px = originX + static_cast<uint32_t>(
-                        (x + QR_BORDER_WIDTH) * static_cast<int>(QR_PIXELS_PER_MODULE)) + mx;
+                        (x + QR_BORDER_WIDTH) * static_cast<int>(pixelsPerModule)) + mx;
                     uint32_t py = originY + static_cast<uint32_t>(
-                        (y + QR_BORDER_WIDTH) * static_cast<int>(QR_PIXELS_PER_MODULE)) + my;
+                        (y + QR_BORDER_WIDTH) * static_cast<int>(pixelsPerModule)) + my;
                     if (px < fbWidth && py < fbHeight)
                         fb[py * strideQuads + px] = colour;
                 }
@@ -177,6 +182,14 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
                    const PanicExceptionInfo* excInfo,
                    const PanicProcessList* procList)
 {
+    // Auto-select pixels per module based on display resolution
+    // Low-DPI devices (e.g. Surface Go at 1024x768) need larger modules
+    const uint32_t QR_PIXELS_PER_MODULE = (fbWidth <= QR_LODPI_THRESHOLD)
+                                          ? QR_PIXELS_PER_MODULE_LODPI
+                                          : QR_PIXELS_PER_MODULE_HIDPI;
+    SerialPrintf("PANIC QR: %ux%u fb, using %u px/module\n",
+                 fbWidth, fbHeight, QR_PIXELS_PER_MODULE);
+
     // Step 1: Build binary TLV payload (no header yet — added per page)
     static uint8_t payloadBuf[2048];
     uint32_t payloadLen = BuildPanicPayload(payloadBuf, sizeof(payloadBuf),
@@ -319,7 +332,7 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
             startY = baseY + page * (qrPixelSize + 16);
         }
 
-        RenderQRToFramebuffer(fbBase, fbWidth, fbHeight, fbStride, qrBuf, startX, startY);
+        RenderQRToFramebuffer(fbBase, fbWidth, fbHeight, fbStride, qrBuf, startX, startY, QR_PIXELS_PER_MODULE);
     }
 
     SerialPuts("PANIC QR: rendered to framebuffer\n");
