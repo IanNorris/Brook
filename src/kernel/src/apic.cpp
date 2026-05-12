@@ -189,6 +189,83 @@ void ProfilerSample(uint64_t interruptedRip, uint64_t interruptedCs, uint64_t in
 // Forward-declare RTC recalibration (defined in rtc.cpp).
 void RtcRecalibrateLapic();
 
+// Validate the iret frame on the stack before iretq.  Called from the naked
+// timer ISR after LapicTimerHandlerInner returns but before we pop registers.
+// The iret frame starts 120 bytes above the current RSP (15 pushed GPRs).
+//
+// frame layout: [RIP, CS, RFLAGS, RSP, SS]  (each 8 bytes)
+extern "C" __attribute__((used))
+void ValidateIretFrame(const uint64_t* frame)
+{
+    uint64_t rip    = frame[0];
+    uint64_t cs     = frame[1];
+    uint64_t rflags = frame[2];
+    uint64_t rsp    = frame[3];
+    uint64_t ss     = frame[4];
+
+    bool bad = false;
+
+    // Validate CS is a known selector
+    if (cs != 0x08 && cs != 0x2B && cs != 0x28)
+    {
+        SerialPrintf("!!! IRET VALIDATE: bad CS=0x%lx\n", cs);
+        bad = true;
+    }
+
+    // Validate SS matches expected value for the privilege level
+    uint64_t expectedSs = (cs & 3) ? 0x23 : 0x10;
+    if (ss != expectedSs && ss != 0)
+    {
+        SerialPrintf("!!! IRET VALIDATE: bad SS=0x%lx (expected 0x%lx) CS=0x%lx\n",
+                     ss, expectedSs, cs);
+        bad = true;
+    }
+
+    // Validate RIP is canonical
+    uint64_t ripTop = rip >> 47;
+    if (ripTop != 0 && ripTop != 0x1FFFF)
+    {
+        SerialPrintf("!!! IRET VALIDATE: non-canonical RIP=0x%lx\n", rip);
+        bad = true;
+    }
+
+    // Validate RSP is canonical
+    uint64_t rspTop = rsp >> 47;
+    if (rspTop != 0 && rspTop != 0x1FFFF)
+    {
+        SerialPrintf("!!! IRET VALIDATE: non-canonical RSP=0x%lx\n", rsp);
+        bad = true;
+    }
+
+    // Check GDT entry for SS=0x10 (kernel data segment)
+    // Read GDTR to get GDT base
+    struct { uint16_t limit; uint64_t base; } __attribute__((packed)) gdtr;
+    __asm__ volatile("sgdt %0" : "=m"(gdtr));
+    auto* gdt = reinterpret_cast<const uint8_t*>(gdtr.base);
+    // GDT[2] = offset 0x10, access byte is at offset 5 within the entry
+    uint8_t access = gdt[0x10 + 5];
+    if (access != 0x92 && access != 0x93)
+    {
+        SerialPrintf("!!! IRET VALIDATE: GDT[2] access=0x%x (expected 0x92/0x93)\n",
+                     access);
+        bad = true;
+    }
+
+    if (bad)
+    {
+        SerialPrintf("!!! IRET frame: RIP=0x%lx CS=0x%lx RFLAGS=0x%lx RSP=0x%lx SS=0x%lx\n",
+                     rip, cs, rflags, rsp, ss);
+        SerialPrintf("!!! GDT base=0x%lx limit=0x%x\n", gdtr.base, gdtr.limit);
+        // Dump GDT entries 0-5
+        auto* gdtEntries = reinterpret_cast<const uint64_t*>(gdtr.base);
+        for (int i = 0; i < 6; i++)
+            SerialPrintf("!!!   GDT[%d] = 0x%016lx\n", i, gdtEntries[i]);
+
+        // Halt this CPU
+        __asm__ volatile("cli\n\thlt");
+    }
+}
+
 // C handler called from the naked ISR wrapper below.
 // interruptedRip/interruptedCs/interruptedRbp are passed from the naked
 // handler (extracted from the CPU interrupt frame on the stack).
@@ -288,6 +365,11 @@ static void LapicTimerHandler(void)
         "cld\n\t"
         "call %P0\n\t"
 
+        // Validate iret frame before restoring GPRs.
+        // The frame is at RSP+120 (15 pushed regs × 8 bytes).
+        "leaq 120(%%rsp), %%rdi\n\t"
+        "call %P1\n\t"
+
         // Restore GPRs
         "pop %%r15\n\t"
         "pop %%r14\n\t"
@@ -312,7 +394,7 @@ static void LapicTimerHandler(void)
         "2:\n\t"
         "iretq\n\t"
         :
-        : "i"(LapicTimerHandlerInner)
+        : "i"(LapicTimerHandlerInner), "i"(ValidateIretFrame)
         : "memory"
     );
 }
