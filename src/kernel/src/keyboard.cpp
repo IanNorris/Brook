@@ -395,6 +395,10 @@ static volatile bool g_superHeld = false;
 static volatile bool g_capsLock  = false;
 static volatile bool g_e0Prefix  = false; // E0-prefixed extended key pending
 
+// Drop the first few IRQs after init — UEFI/QEMU generates spurious scancodes
+// during keyboard reset that arrive after our flush in KbdInit.
+static volatile int g_settleCount = 2;
+
 // SysRq-style panic: Ctrl+ScrollLock fires a diagnostic kernel panic.
 // ScrollLock = scancode 0x46.  Only triggers on key-press (not release).
 static constexpr uint8_t SC_SCROLL_LOCK = 0x46;
@@ -410,19 +414,6 @@ static void KbdIrqHandler(InterruptFrame* frame)
 {
     (void)frame;
 
-    // DEBUG: confirm PS/2 keyboard IRQ fires at all
-    {
-        static volatile uint32_t s_kbdIrqCount = 0;
-        uint32_t c = ++s_kbdIrqCount;
-        if (c <= 5 || (c & 0xFF) == 0) {
-            const char* msg = "KBD_IRQ\r\n";
-            while (*msg) {
-                while ((inb(0x3FD) & 0x20) == 0) {}
-                outb(0x3F8, static_cast<uint8_t>(*msg++));
-            }
-        }
-    }
-
     // Check that OBF is set and the byte is NOT from the auxiliary (mouse) port.
     // If bit 5 (AUXB) is set, this is mouse data — don't consume it here.
     uint8_t status = inb(0x64);
@@ -433,6 +424,24 @@ static void KbdIrqHandler(InterruptFrame* frame)
     }
 
     uint8_t sc = inb(0x60); // read scan code from PS/2 data port
+
+    // Filter out keyboard self-test/command response codes that the i8042
+    // generates during boot (UEFI handoff). These are NOT valid key scancodes.
+    if (sc == 0xAA || sc == 0xFC || sc == 0xFE || sc == 0xFF || sc == 0x00)
+    {
+        ApicSendEoi();
+        return;
+    }
+
+    // Drop spurious scancodes generated during UEFI→OS keyboard handoff.
+    // These arrive after KbdInit's flush because QEMU/firmware sends them
+    // asynchronously during the keyboard self-test/reset sequence.
+    if (g_settleCount > 0)
+    {
+        g_settleCount--;
+        ApicSendEoi();
+        return;
+    }
 
     // Ctrl+ScrollLock → diagnostic panic (like Linux SysRq+c).
     // Fires from IRQ context so it works even when all threads are deadlocked.

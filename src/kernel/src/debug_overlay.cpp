@@ -212,10 +212,10 @@ static void KernelConsoleThread(void* /*arg*/)
         return;
     }
 
-    // Create WM window
+    // Create WM window (non-focusable — read-only log display)
     WmCreateWindow(self, 20, 60,
                    static_cast<uint16_t>(CONSOLE_W),
-                   static_cast<uint16_t>(CONSOLE_H), "Kernel Console");
+                   static_cast<uint16_t>(CONSOLE_H), "Kernel Console", 1, false);
 
     const FontAtlas& fa = g_fontAtlas;
     uint32_t lineH = static_cast<uint32_t>(fa.lineHeight);
