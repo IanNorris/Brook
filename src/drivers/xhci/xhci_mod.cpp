@@ -2628,6 +2628,45 @@ static int XhciModuleInit()
     }
 
     // --- Phase 8: Register IRQ handler for interrupt-driven event processing ---
+
+    // Disable MSI/MSI-X so the controller falls back to legacy INTx.
+    // QEMU's qemu-xhci enables MSI-X by default; if we don't disable it,
+    // interrupts go via MSI-X message writes (bypassing the IOAPIC) and our
+    // legacy IRQ handler never fires.
+    {
+        uint8_t capPtr = static_cast<uint8_t>(
+            PciConfigRead8(ctrl.pciDev.bus, ctrl.pciDev.dev, ctrl.pciDev.fn, 0x34));
+        while (capPtr && capPtr != 0xFF) {
+            uint8_t capId = PciConfigRead8(ctrl.pciDev.bus, ctrl.pciDev.dev,
+                                           ctrl.pciDev.fn, capPtr);
+            if (capId == 0x11) {
+                // MSI-X: clear Enable bit (bit 15 of Message Control at capPtr+2)
+                uint16_t msgCtrl = static_cast<uint16_t>(
+                    PciConfigRead16(ctrl.pciDev.bus, ctrl.pciDev.dev,
+                                    ctrl.pciDev.fn, capPtr + 2));
+                if (msgCtrl & 0x8000) {
+                    PciConfigWrite16(ctrl.pciDev.bus, ctrl.pciDev.dev,
+                                     ctrl.pciDev.fn, capPtr + 2,
+                                     msgCtrl & ~0x8000);
+                    SerialPuts("xhci: MSI-X disabled, using legacy INTx\n");
+                }
+            } else if (capId == 0x05) {
+                // MSI: clear Enable bit (bit 0 of Message Control at capPtr+2)
+                uint16_t msgCtrl = static_cast<uint16_t>(
+                    PciConfigRead16(ctrl.pciDev.bus, ctrl.pciDev.dev,
+                                    ctrl.pciDev.fn, capPtr + 2));
+                if (msgCtrl & 0x0001) {
+                    PciConfigWrite16(ctrl.pciDev.bus, ctrl.pciDev.dev,
+                                     ctrl.pciDev.fn, capPtr + 2,
+                                     msgCtrl & ~0x0001);
+                    SerialPuts("xhci: MSI disabled, using legacy INTx\n");
+                }
+            }
+            capPtr = PciConfigRead8(ctrl.pciDev.bus, ctrl.pciDev.dev,
+                                    ctrl.pciDev.fn, capPtr + 1);
+        }
+    }
+
     // Read PCI interrupt line and register our ISR
     ctrl.cmdComplete = false;
     ctrl.xferComplete = false;
