@@ -1557,13 +1557,48 @@ static InputDeviceOps g_usbKbdOps = { "usb_kbd", nullptr };
 // Track previous report for key up/down detection
 static uint8_t g_prevReport[8] = {};
 
+// PS/2 scancode set 1 → ASCII (US layout, unshifted)
+// Matches keyboard.cpp g_scancodeToAscii_US for the common range.
+static const char g_sc1ToAscii[128] = {
+    0,0x1B,'1','2','3','4','5','6','7','8','9','0','-','=','\b','\t',  // 0x00
+    'q','w','e','r','t','y','u','i','o','p','[',']','\n',0,            // 0x10
+    'a','s','d','f','g','h','j','k','l',';','\'','`',0,'\\',           // 0x1E
+    'z','x','c','v','b','n','m',',','.','/',0,'*',0,' ',               // 0x2C
+    0,0,0,0,0,0,0,0,0,0,0,0,                                           // 0x3A (F1-F10,NumLk,ScrLk)
+    '7','8','9','-','4','5','6','+','1','2','3','0','.',                // 0x47 (KP)
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0            // 0x54-0x7F
+};
+
+// PS/2 scancode set 1 → ASCII (US layout, shifted)
+static const char g_sc1ToAsciiShift[128] = {
+    0,0x1B,'!','@','#','$','%','^','&','*','(',')','_','+','\b','\t',  // 0x00
+    'Q','W','E','R','T','Y','U','I','O','P','{','}','\n',0,            // 0x10
+    'A','S','D','F','G','H','J','K','L',':','"','~',0,'|',             // 0x1E
+    'Z','X','C','V','B','N','M','<','>','?',0,'*',0,' ',               // 0x2C
+    0,0,0,0,0,0,0,0,0,0,0,0,                                           // 0x3A
+    '7','8','9','-','4','5','6','+','1','2','3','0','.',                // 0x47
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0            // 0x54-0x7F
+};
+
 static void XhciPushKey(uint8_t scancode, bool pressed, uint8_t modifiers)
 {
     InputEvent ev;
     ev.type = pressed ? InputEventType::KeyPress : InputEventType::KeyRelease;
     ev.scanCode = scancode;
     ev.modifiers = modifiers;
-    ev.ascii = 0; // ASCII translation handled by keyboard subsystem
+
+    // Translate scancode → ASCII so the compositor/terminal can use it
+    ev.ascii = 0;
+    if (scancode < 128) {
+        bool shifted = (modifiers & (INPUT_MOD_LSHIFT | INPUT_MOD_RSHIFT)) != 0;
+        bool capsLock = false; // TODO: track caps lock state
+        char c = shifted ? g_sc1ToAsciiShift[scancode] : g_sc1ToAscii[scancode];
+        // CapsLock inverts letter case
+        if (capsLock && c >= 'A' && c <= 'Z' && !shifted)
+            c = g_sc1ToAscii[scancode]; // already lowercase
+        ev.ascii = static_cast<uint8_t>(c);
+    }
+
     InputDevicePush(&g_usbKbdDev, ev);
 }
 
