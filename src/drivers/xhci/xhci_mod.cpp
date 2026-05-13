@@ -1962,9 +1962,19 @@ static bool XhciBulkTransfer(XhciController& ctrl, XhciDevice& dev,
 
     __asm__ volatile("mfence" ::: "memory");
 
+    // Temporarily force polling mode for bulk transfers.  The ISR may race
+    // with XhciWaitForEvent for the same completion TRB (both dequeue from
+    // the event ring), causing missed events.  Polling is safe and fast for
+    // synchronous block I/O.
+    bool wasIrqActive = g_irqActive;
+    g_irqActive = false;
+
     XhciRingDoorbell(ctrl, dev.slotId, dci);
 
     Trb* evt = XhciWaitForEvent(ctrl, TRB_TYPE_TRANSFER_EVENT, timeoutMs);
+
+    g_irqActive = wasIrqActive;
+
     if (!evt) {
         SerialPrintf("xhci: bulk %s transfer timeout\n", isIn ? "IN" : "OUT");
         return false;
