@@ -69,15 +69,13 @@ static void ProcessClearLazyMappings(Process* proc)
         uint64_t pages = (m.length + 4095) / 4096;
         for (uint64_t p = 0; p < pages; p++)
             VmmUnmapPage(proc->pageTable, VirtualAddress(m.vaddr + p * 4096));
-        // Atomically steal the vnode pointer before unreffing. Another CPU
-        // may be in FileMapHandleUserFault reading this entry via
-        // MemoryMapOwner; nulling the pointer first ensures the concurrent
-        // reader sees nullptr (and skips) rather than a dangling pointer
-        // to a freed vnode.
-        Vnode* vn = static_cast<Vnode*>(
-            __atomic_exchange_n(reinterpret_cast<void**>(&m.vnode),
-                                nullptr, __ATOMIC_ACQ_REL));
+        // Hold the fileMapLock to prevent FileMapHandleUserFault from
+        // loading a stale vnode pointer while we clear and free it.
+        SpinLockAcquire(&proc->fileMapLock);
+        Vnode* vn = m.vnode;
+        m.vnode = nullptr;
         m.vaddr = 0; m.length = 0; m.offset = 0; m.vmmFlags = 0;
+        SpinLockRelease(&proc->fileMapLock);
         if (vn) VnodeHandleUnref(vn);
     }
 }

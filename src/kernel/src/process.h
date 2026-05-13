@@ -362,6 +362,7 @@ struct Process
     static constexpr uint32_t MAX_FILE_MAPS = 4096;
     struct FileMap { uint64_t vaddr; uint64_t length; uint64_t offset; uint64_t vmmFlags; Vnode* vnode; };
     FileMap fileMaps[MAX_FILE_MAPS];
+    SpinLock fileMapLock;  // protects fileMaps vnode load+ref
 
     // /dev/fb0 mmap ranges — recorded so sys_munmap can unmap without
     // freeing the underlying physical pages, which are owned by

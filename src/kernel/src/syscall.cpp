@@ -589,6 +589,10 @@ static inline void VnodeRef(Vnode* vn)
     if (vn) __atomic_fetch_add(&vn->refCount, 1, __ATOMIC_RELEASE);
 }
 
+// Try to take a reference on a vnode that might be concurrently freed.
+// Returns true if the ref was taken (refCount was > 0 and is now +1).
+// Returns false if refCount was already 0 (vnode is being freed).
+
 static inline void VnodeUnref(Vnode* vn)
 {
     if (!vn) return;
@@ -907,27 +911,20 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
     for (uint32_t i = 0; i < Process::MAX_FILE_MAPS; i++) {
         auto& m = proc->fileMaps[i];
         if (m.length == 0) continue;
-        // Atomic load + ref: ProcessClearLazyMappings / sys_munmap may be
-        // clearing this entry on another CPU.  We take a temporary reference
-        // on the vnode so it stays alive while we fault in the page, then
-        // release it before returning.
-        Vnode* vn = static_cast<Vnode*>(
-            __atomic_load_n(reinterpret_cast<void**>(&m.vnode), __ATOMIC_ACQUIRE));
-        if (!vn) continue;
         if (pageVA < m.vaddr || pageVA >= m.vaddr + m.length) continue;
 
-        // Hold a ref so the vnode can't be freed while we use it.
-        VnodeRef(vn);
-        // Re-check: if the entry was cleared between our load and ref,
-        // the vnode might already have been unreffed down to 0 by
-        // another CPU — but our ref keeps it alive.  If the entry now
-        // points to a different vnode (or null), drop our ref and skip.
-        Vnode* check = static_cast<Vnode*>(
-            __atomic_load_n(reinterpret_cast<void**>(&m.vnode), __ATOMIC_ACQUIRE));
-        if (check != vn) {
-            VnodeUnref(vn);
+        // Hold the fileMapLock to safely load vnode and take a ref.
+        // ProcessClearLazyMappings holds the same lock while clearing
+        // entries, preventing the vnode from being freed between our
+        // load and ref.
+        SpinLockAcquire(&proc->fileMapLock);
+        Vnode* vn = m.vnode;
+        if (!vn) {
+            SpinLockRelease(&proc->fileMapLock);
             continue;
         }
+        VnodeRef(vn);
+        SpinLockRelease(&proc->fileMapLock);
 
         if ((errCode & PF_WRITE) && !(m.vmmFlags & VMM_WRITABLE)) {
             VnodeUnref(vn);
@@ -3876,16 +3873,13 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t,
         if (overlapStart >= overlapEnd) continue;
 
         if (overlapStart <= m.vaddr && overlapEnd >= mEnd) {
-            // Atomically steal the vnode pointer before unreffing — a
-            // concurrent FileMapHandleUserFault on another CPU may have
-            // already loaded this pointer.  Nulling it first ensures no
-            // new fault path picks it up; existing in-flight faults that
-            // already loaded the pointer will still race, but the page
-            // cache keeps the underlying data alive independently.
-            Vnode* vn = static_cast<Vnode*>(
-                __atomic_exchange_n(reinterpret_cast<void**>(&m.vnode),
-                                    nullptr, __ATOMIC_ACQ_REL));
+            // Hold the lock while clearing the entry to prevent
+            // FileMapHandleUserFault from loading a stale vnode pointer.
+            SpinLockAcquire(&mmOwner->fileMapLock);
+            Vnode* vn = m.vnode;
+            m.vnode = nullptr;
             m.vaddr = 0; m.length = 0; m.offset = 0; m.vmmFlags = 0;
+            SpinLockRelease(&mmOwner->fileMapLock);
             VnodeUnref(vn);
         } else if (overlapStart <= m.vaddr) {
             uint64_t delta = overlapEnd - m.vaddr;
