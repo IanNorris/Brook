@@ -1706,6 +1706,13 @@ static void pump_input_for_surface(struct brook_surface *s) {
             uint32_t st = (e->type == EVT_KEY_PRESS)
                             ? WL_KEYBOARD_KEY_STATE_PRESSED
                             : WL_KEYBOARD_KEY_STATE_RELEASED;
+            /* Send the key event first, then modifiers (per Wayland spec).
+             * xkbcommon clients call xkb_state_update_key() on the key event
+             * which internally updates modifier state; the subsequent
+             * modifiers event confirms or corrects that state. Sending
+             * modifiers before the key causes double-toggling. */
+            wl_keyboard_send_key(sc->keyboard, next_serial(), now,
+                                 scancode_to_xkb(e->scan), st);
             /* Translate kernel's modifier bitmask to xkb modifier indices.
              * Order matches our keymap's modifier_map: Shift=0, Lock=1,
              * Control=2, Mod1(Alt)=3.  Without this, clients (e.g. GTK
@@ -1724,8 +1731,6 @@ static void pump_input_for_surface(struct brook_surface *s) {
                 sc->kb_mods_depressed = depressed;
                 sc->kb_mods_locked    = locked;
             }
-            wl_keyboard_send_key(sc->keyboard, next_serial(), now,
-                                 scancode_to_xkb(e->scan), st);
             break;
         }
         case WM_EVT_CLOSE_REQUESTED: {

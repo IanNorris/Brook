@@ -498,14 +498,6 @@ static void KbdIrqHandlerInner(void)
         }
     }
 
-    // Build modifier bitmask for the input event.
-    uint8_t mods = 0;
-    if (g_shiftHeld) mods |= INPUT_MOD_LSHIFT;
-    if (g_ctrlHeld)  mods |= INPUT_MOD_CTRL;
-    if (g_altHeld)   mods |= INPUT_MOD_ALT;
-    if (g_superHeld) mods |= INPUT_MOD_SUPER;
-    if (g_capsLock)  mods |= INPUT_MOD_CAPSLOCK;
-
     // Track modifier state (non-extended keys only).
     if (!isExtended)
     {
@@ -518,6 +510,15 @@ static void KbdIrqHandlerInner(void)
         else if (key == 0x3A && !release)    // Caps Lock (toggle on press)
             g_capsLock = !g_capsLock;
     }
+
+    // Build modifier bitmask AFTER state update so modifier key events
+    // carry the resulting state (e.g. shift press has shift in mods).
+    uint8_t mods = 0;
+    if (g_shiftHeld) mods |= INPUT_MOD_LSHIFT;
+    if (g_ctrlHeld)  mods |= INPUT_MOD_CTRL;
+    if (g_altHeld)   mods |= INPUT_MOD_ALT;
+    if (g_superHeld) mods |= INPUT_MOD_SUPER;
+    if (g_capsLock)  mods |= INPUT_MOD_CAPSLOCK;
 
     // Push raw scan code event to input subsystem (for userspace consumers like DOOM).
     // All keys (including modifiers) and both press/release are forwarded.
