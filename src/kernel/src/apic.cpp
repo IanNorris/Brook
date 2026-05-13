@@ -266,6 +266,42 @@ void ValidateIretFrame(const uint64_t* frame)
     }
 }
 
+// Check that GS base (MSR 0xC0000101) is non-zero.  In kernel mode it must
+// point to the per-CPU KernelCpuEnv — zero means a stray SWAPGS has swapped
+// it with the (zero-initialised) MSR_KERNEL_GS_BASE.
+static void ValidateGsBase(const char* where)
+{
+    uint64_t gsBase = ReadMsr(0xC0000101);
+    if (gsBase == 0)
+    {
+        // Also read KERNEL_GS_BASE — if it holds our env pointer the swap
+        // direction is confirmed.
+        uint64_t kgsBase = ReadMsr(0xC0000102);
+        uint8_t cpuId = static_cast<uint8_t>(LapicRead(LapicReg::ID) >> 24);
+        SerialPrintf("!!! GS_BASE=0 at %s on LAPIC-ID %u  KERNEL_GS_BASE=0x%lx\n",
+                     where, cpuId, kgsBase);
+
+        // Capture a mini-backtrace for the serial log.
+        uint64_t rbp;
+        __asm__ volatile("movq %%rbp, %0" : "=r"(rbp));
+        SerialPrintf("!!!   RBP chain:");
+        for (int i = 0; i < 10 && rbp >= 0xFFFF800000000000ULL; i++) {
+            uint64_t ret = reinterpret_cast<uint64_t*>(rbp)[1];
+            SerialPrintf(" 0x%lx", ret);
+            rbp = reinterpret_cast<uint64_t*>(rbp)[0];
+        }
+        SerialPrintf("\n");
+
+        // Don't halt — restore GS so we can keep running and gather more info.
+        // Swap back: move the env ptr from KERNEL_GS_BASE to GS_BASE.
+        if (kgsBase != 0) {
+            WriteMsr(0xC0000101, kgsBase);
+            WriteMsr(0xC0000102, 0);
+            SerialPrintf("!!! GS_BASE restored to 0x%lx — continuing\n", kgsBase);
+        }
+    }
+}
+
 // C handler called from the naked ISR wrapper below.
 // interruptedRip/interruptedCs/interruptedRbp are passed from the naked
 // handler (extracted from the CPU interrupt frame on the stack).
@@ -273,6 +309,9 @@ static void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interrupted
                                     uint64_t interruptedRbp)
 {
     LapicWrite(LapicReg::EOI, 0);
+
+    // Check GS base on every timer tick (1ms) — catches stray SWAPGS fast.
+    ValidateGsBase("timer-tick");
 
     // Only BSP maintains the global tick and composites framebuffers.
     // Using LAPIC ID check (cheaper than SmpCurrentCpuIndex).

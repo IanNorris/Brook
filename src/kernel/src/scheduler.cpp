@@ -999,11 +999,38 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
     SmpSetCurrentCr3(cpu, newProc->savedCtx.cr3);
 
     ProfilerContextSwitch(oldProc->pid, newProc->pid);
+
+    // GS base diagnostic: catch stray SWAPGS around context switches.
+    {
+        uint64_t gsb = ReadMsr(0xC0000101);  // MSR_GS_BASE
+        if (gsb == 0) {
+            uint64_t kgsb = ReadMsr(0xC0000102);
+            SerialPrintf("!!! GS_BASE=0 PRE-switch cpu=%u old=%s(%u) new=%s(%u) KERNEL_GS=0x%lx\n",
+                         cpu, oldProc->name, oldProc->pid,
+                         newProc->name, newProc->pid, kgsb);
+            // Auto-fix so we can keep running and gather more data
+            if (kgsb) { WriteMsr(0xC0000101, kgsb); WriteMsr(0xC0000102, 0); }
+        }
+    }
+
     context_switch(&oldProc->savedCtx, &newProc->savedCtx,
                    &oldProc->fxsave, &newProc->fxsave,
                    &oldProc->runningOnCpu);
 
     // --- We return here when another CPU (or this one) switches back to us ---
+
+    // GS base diagnostic: catch stray SWAPGS after resuming on this CPU.
+    {
+        uint64_t gsb = ReadMsr(0xC0000101);
+        if (gsb == 0) {
+            uint64_t kgsb = ReadMsr(0xC0000102);
+            uint32_t resumeCpu = ThisCpu();
+            SerialPrintf("!!! GS_BASE=0 POST-switch cpu=%u KERNEL_GS=0x%lx\n",
+                         resumeCpu, kgsb);
+            if (kgsb) { WriteMsr(0xC0000101, kgsb); WriteMsr(0xC0000102, 0); }
+        }
+    }
+
     DrainPostSwitch(ThisCpu());
 }
 
