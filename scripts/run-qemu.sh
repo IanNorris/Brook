@@ -214,6 +214,11 @@ if [ -f "${NIX_DISK}" ]; then
 fi
 
 HOME_DISK="${BROOK_HOME_DISK:-${ROOT_DIR}/brook_home_disk.img}"
+# Prefer GPT disk if available (tests GPT partition scanner on virtio)
+GPT_DISK="${BROOK_GPT_DISK:-${ROOT_DIR}/brook_gpt_disk.img}"
+if [ -f "${GPT_DISK}" ]; then
+    HOME_DISK="${GPT_DISK}"
+fi
 HOME_DRIVE=""
 if [ -f "${HOME_DISK}" ]; then
     HOME_DRIVE="-drive if=virtio,format=raw,file=${HOME_DISK},file.locking=off"

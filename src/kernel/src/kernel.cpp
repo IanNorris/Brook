@@ -403,12 +403,13 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     // Drives without BROOK.MNT are registered but not auto-mounted.
     brook::PciScanPrint();
     uint32_t vioCount = brook::VirtioBlkInitAll();
+    // Shared pdrv counter: 0 = ramdisk, 1+ = everything else.
+    uint8_t nextPdrv = 1;
     if (vioCount > 0)
     {
         brook::KPrintf("virtio: found %u device(s)\n", vioCount);
 
-        // Probe each virtio drive: try FAT first, then ext2.
-        // FatFS physical drives: 0 = ramdisk, 1..N = virtio0..N-1
+        // Probe each virtio drive: try GPT first, then whole-disk filesystem.
         for (uint32_t i = 0; i < vioCount; ++i)
         {
             char name[16] = "virtio";
@@ -417,10 +418,35 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             brook::Device* vd = brook::DeviceFind(name);
             if (!vd) continue;
 
-            uint8_t pdrv = static_cast<uint8_t>(i + 1);
-            char label[24] = "virtio: ";
-            for (int j = 0; name[j]; ++j) label[8 + j] = name[j];
-            ProbeAndMountDevice(label, vd, pdrv);
+            uint32_t parts = brook::GptProbeDevice(vd);
+            if (parts > 0)
+            {
+                // Mount each GPT partition sub-device.
+                for (uint32_t p = 1; p <= parts; ++p)
+                {
+                    char pname[16];
+                    uint32_t ni = 0;
+                    for (int j = 0; name[j]; ++j) pname[ni++] = name[j];
+                    pname[ni++] = 'p';
+                    if (p >= 10) pname[ni++] = '0' + (p / 10);
+                    pname[ni++] = '0' + (p % 10);
+                    pname[ni] = '\0';
+
+                    brook::Device* pd = brook::DeviceFind(pname);
+                    if (!pd) continue;
+
+                    char label[24] = "virtio-gpt: ";
+                    for (uint32_t j = 0; pname[j] && j < 10; ++j) label[12 + j] = pname[j];
+                    ProbeAndMountDevice(label, pd, nextPdrv++);
+                }
+            }
+            else
+            {
+                // No GPT — whole-disk filesystem.
+                char label[24] = "virtio: ";
+                for (int j = 0; name[j]; ++j) label[8 + j] = name[j];
+                ProbeAndMountDevice(label, vd, nextPdrv++);
+            }
         }
     }
 
@@ -457,7 +483,6 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     // The xHCI module registers "usb0", "usb1", etc. as block devices.
     // First scan each for GPT partition tables; then probe all resulting
     // partition sub-devices (usb0p1, usb0p2, ...) for filesystems.
-    static constexpr uint8_t USB_PDRV_BASE = 7;
     for (uint32_t i = 0; i < 4; ++i)
     {
         char name[8] = "usb";
@@ -483,19 +508,17 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
                 brook::Device* pd = brook::DeviceFind(pname);
                 if (!pd) continue;
 
-                uint8_t pdrv = static_cast<uint8_t>(USB_PDRV_BASE + i * 4 + p);
                 char label[24] = "usb-gpt: ";
                 for (uint32_t j = 0; pname[j] && j < 12; ++j) label[9 + j] = pname[j];
-                ProbeAndMountDevice(label, pd, pdrv);
+                ProbeAndMountDevice(label, pd, nextPdrv++);
             }
         }
         else
         {
             // No GPT — try the whole device as a single filesystem.
-            uint8_t pdrv = static_cast<uint8_t>(USB_PDRV_BASE + i * 4);
             char label[16] = "usb: ";
             for (int j = 0; name[j]; ++j) label[5 + j] = name[j];
-            ProbeAndMountDevice(label, ud, pdrv);
+            ProbeAndMountDevice(label, ud, nextPdrv++);
         }
     }
 
