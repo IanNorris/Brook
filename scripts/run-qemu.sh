@@ -349,7 +349,7 @@ qemu-system-x86_64 \
     -device qemu-xhci,id=xhci \
     ${BROOK_USB_KBD:+-device usb-kbd,bus=xhci.0} \
     ${BROOK_USB_MOUSE:+-device usb-mouse,bus=xhci.0} \
-    -drive if=none,id=usbdisk,file="${USB_TEST_IMG}",format=raw \
+    -drive if=none,id=usbdisk,file="${USB_TEST_IMG}",format=raw,file.locking=off \
     -device usb-storage,bus=xhci.0,drive=usbdisk \
     ${AUDIO_OPTS} \
     ${NETDEV_OPT} \

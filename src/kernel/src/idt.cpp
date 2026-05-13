@@ -1287,8 +1287,8 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
     {
         const brook::KernelSigaction& sa = brook::g_sigHandlers[proc->tgid][signum - 1];
 
-        SerialPrintf("[SIG] Delivering signal %u to pid %u (handler=0x%lx faultAddr=0x%lx)\n",
-                     signum, proc->pid, sa.handler, cr2);
+        SerialPrintf("[SIG] Delivering signal %u to pid %u (handler=0x%lx faultAddr=0x%lx RIP=0x%lx)\n",
+                     signum, proc->pid, sa.handler, cr2, ef->rip);
 
         if (vector == 14 && cr2) {
             static constexpr uint64_t DMAP_USR_PT = 0xFFFF800000000000ULL;
