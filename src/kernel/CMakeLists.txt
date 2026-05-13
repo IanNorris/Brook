@@ -190,6 +190,7 @@ add_executable(kernel
     src/net.cpp
     src/tcp.cpp
     src/virtio_blk.cpp
+    src/gpt.cpp
     src/acpi.cpp
     src/apic.cpp
     src/tlb_test.cpp

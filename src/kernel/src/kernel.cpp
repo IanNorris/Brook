@@ -22,6 +22,7 @@
 #include "fatfs_glue.h"
 #include "vfs.h"
 #include "virtio_blk.h"
+#include "gpt.h"
 #include "syscall.h"
 #include "process.h"
 #include "scheduler.h"
@@ -454,9 +455,10 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
     // ---- USB block devices: probe after xHCI module has loaded ----
     // The xHCI module registers "usb0", "usb1", etc. as block devices.
-    // Use pdrv slots 7+ (virtio uses 1-6).
+    // First scan each for GPT partition tables; then probe all resulting
+    // partition sub-devices (usb0p1, usb0p2, ...) for filesystems.
     static constexpr uint8_t USB_PDRV_BASE = 7;
-    for (uint32_t i = 0; i < 2; ++i)
+    for (uint32_t i = 0; i < 4; ++i)
     {
         char name[8] = "usb";
         name[3] = static_cast<char>('0' + i);
@@ -464,10 +466,37 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         brook::Device* ud = brook::DeviceFind(name);
         if (!ud) continue;
 
-        uint8_t pdrv = static_cast<uint8_t>(USB_PDRV_BASE + i);
-        char label[16] = "usb: ";
-        for (int j = 0; name[j]; ++j) label[5 + j] = name[j];
-        ProbeAndMountDevice(label, ud, pdrv);
+        uint32_t parts = brook::GptProbeDevice(ud);
+        if (parts > 0)
+        {
+            // Mount each GPT partition sub-device.
+            for (uint32_t p = 1; p <= parts; ++p)
+            {
+                char pname[16];
+                uint32_t ni = 0;
+                for (int j = 0; name[j]; ++j) pname[ni++] = name[j];
+                pname[ni++] = 'p';
+                if (p >= 10) pname[ni++] = '0' + (p / 10);
+                pname[ni++] = '0' + (p % 10);
+                pname[ni] = '\0';
+
+                brook::Device* pd = brook::DeviceFind(pname);
+                if (!pd) continue;
+
+                uint8_t pdrv = static_cast<uint8_t>(USB_PDRV_BASE + i * 4 + p);
+                char label[24] = "usb-gpt: ";
+                for (uint32_t j = 0; pname[j] && j < 12; ++j) label[9 + j] = pname[j];
+                ProbeAndMountDevice(label, pd, pdrv);
+            }
+        }
+        else
+        {
+            // No GPT — try the whole device as a single filesystem.
+            uint8_t pdrv = static_cast<uint8_t>(USB_PDRV_BASE + i * 4);
+            char label[16] = "usb: ";
+            for (int j = 0; name[j]; ++j) label[5 + j] = name[j];
+            ProbeAndMountDevice(label, ud, pdrv);
+        }
     }
 
     // ---- Network (static config from BROOK.CFG, or DHCP) ----
