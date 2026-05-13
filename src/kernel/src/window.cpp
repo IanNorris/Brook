@@ -248,6 +248,7 @@ int WmCreateWindow(Process* proc, int16_t x, int16_t y,
     w.inputHead = 0;
     w.inputTail = 0;
     w.inputDropCount = 0;
+    w.closeRequestedAt = 0;
     WmStrCopy(w.title, title ? title : "Window", sizeof(w.title));
 
     SerialPrintf("WM: created window %d '%s' at (%d,%d) %ux%u scale=%u for pid %u\n",

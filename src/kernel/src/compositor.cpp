@@ -917,6 +917,36 @@ static void CompositorLoopWM()
     bool forceAll = (now - g_lastForceBlitTick >= FORCE_BLIT_INTERVAL_MS);
     if (forceAll) g_lastForceBlitTick = now;
 
+    // Close-request escalation: if a Wayland client hasn't responded to
+    // a close request within the grace period, escalate to signals.
+    static constexpr uint64_t CLOSE_GRACE_MS  = 3000; // SIGTERM after 3s
+    static constexpr uint64_t CLOSE_KILL_MS   = 5000; // SIGKILL after 5s
+    for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
+    {
+        Window* w = WmGetWindow(i);
+        if (!w || !w->proc || w->closeRequestedAt == 0) continue;
+
+        uint64_t elapsed = now - w->closeRequestedAt;
+        if (elapsed >= CLOSE_KILL_MS)
+        {
+            SerialPrintf("WM: force-killing window %d '%s' (timeout %llums)\n",
+                         i, w->title, elapsed);
+            ProcessSendSignal(w->proc, 9); // SIGKILL
+            w->closeRequestedAt = 0;
+        }
+        else if (elapsed >= CLOSE_GRACE_MS)
+        {
+            // Send SIGTERM once (use a high bit to mark "already sent")
+            if (!(w->closeRequestedAt & (1ULL << 63)))
+            {
+                SerialPrintf("WM: sending SIGTERM to window %d '%s' (timeout %llums)\n",
+                             i, w->title, elapsed);
+                ProcessSendSignal(w->proc, 15); // SIGTERM
+                w->closeRequestedAt |= (1ULL << 63); // mark SIGTERM sent
+            }
+        }
+    }
+
     // Determine if we need a full scene repaint (wallpaper + all windows)
     // or can get away with only re-blitting windows whose VFB content changed.
     bool fullRepaint = forceAll
@@ -1581,7 +1611,20 @@ static void CompositorHandleMouseWM()
                         // WM-API window: push CloseRequested so the client
                         // can do its own teardown (close wl_clients, free
                         // resources, then call WM_DESTROY_WINDOW).
-                        WmPushWmEvent(w, WM_EVT_CLOSE_REQUESTED, 0, 0);
+                        // If the client ignores it, the compositor loop
+                        // will escalate to SIGTERM after 3s, SIGKILL after 5s.
+                        if (w->closeRequestedAt == 0)
+                        {
+                            w->closeRequestedAt = g_lapicTickCount;
+                            WmPushWmEvent(w, WM_EVT_CLOSE_REQUESTED, 0, 0);
+                        }
+                        else
+                        {
+                            // Second click while waiting — force kill immediately
+                            SerialPrintf("WM: force-killing window %d '%s' (second close click)\n",
+                                         hit.windowIndex, w->title);
+                            ProcessSendSignal(w->proc, 9); // SIGKILL
+                        }
                     }
                     else
                     {

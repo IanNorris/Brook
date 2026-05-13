@@ -102,6 +102,11 @@ struct Window
     int16_t     savedX, savedY;
     uint16_t    savedW, savedH;
 
+    // Close-request escalation: timestamp (lapic ticks) of last close
+    // request.  If the process is still alive after the grace period,
+    // the compositor escalates to SIGTERM then SIGKILL.
+    uint64_t    closeRequestedAt;  // 0 = no pending close
+
     // Outer dimensions including chrome.  CSD (noChrome) windows have
     // no kernel chrome, so outer == client.
     uint16_t outerWidth()  const { return noChrome ? clientW : (clientW + 2 * WM_BORDER_WIDTH); }
