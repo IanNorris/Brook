@@ -437,26 +437,25 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
         if (w > 0 && h > 0) {
             wl_shm_buffer_begin_access(shm);
             const uint32_t *pixels = (const uint32_t *)wl_shm_buffer_get_data(shm);
-            if (w <= 64 && h <= 64) {
-                wm_set_cursor_image(pixels, (uint32_t)w, (uint32_t)h,
-                                    s->cursor_hot_x, s->cursor_hot_y);
-            } else {
-                /* Downsample to fit 64×64 max with nearest-neighbor */
-                uint32_t dw = (uint32_t)w > 64 ? 64 : (uint32_t)w;
-                uint32_t dh = (uint32_t)h > 64 ? 64 : (uint32_t)h;
-                uint32_t scaled[64*64];
-                int32_t src_stride = stride / 4;
-                for (uint32_t dy = 0; dy < dh; dy++) {
-                    uint32_t sy = dy * (uint32_t)h / dh;
-                    for (uint32_t dx = 0; dx < dw; dx++) {
-                        uint32_t sx = dx * (uint32_t)w / dw;
-                        scaled[dy * dw + dx] = pixels[sy * src_stride + sx];
-                    }
+            uint32_t format = wl_shm_buffer_get_format(shm);
+            int force_opaque = (format != WL_SHM_FORMAT_ARGB8888);
+            int32_t src_stride = stride / 4;
+            /* Copy through local buffer: handles stride != width and
+             * forces alpha=0xFF for XRGB format (kernel alpha-blends). */
+            uint32_t dw = (uint32_t)w > 64 ? 64 : (uint32_t)w;
+            uint32_t dh = (uint32_t)h > 64 ? 64 : (uint32_t)h;
+            uint32_t buf[64*64];
+            for (uint32_t dy = 0; dy < dh; dy++) {
+                uint32_t sy = (dw == (uint32_t)w) ? dy : (dy * (uint32_t)h / dh);
+                for (uint32_t dx = 0; dx < dw; dx++) {
+                    uint32_t sx = (dh == (uint32_t)h) ? dx : (dx * (uint32_t)w / dw);
+                    uint32_t px = pixels[sy * src_stride + sx];
+                    buf[dy * dw + dx] = force_opaque ? (0xFF000000u | (px & 0x00FFFFFFu)) : px;
                 }
-                int32_t shx = s->cursor_hot_x * (int32_t)dw / w;
-                int32_t shy = s->cursor_hot_y * (int32_t)dh / h;
-                wm_set_cursor_image(scaled, dw, dh, shx, shy);
             }
+            int32_t shx = s->cursor_hot_x * (int32_t)dw / w;
+            int32_t shy = s->cursor_hot_y * (int32_t)dh / h;
+            wm_set_cursor_image(buf, dw, dh, shx, shy);
             wl_shm_buffer_end_access(shm);
         }
         wl_buffer_send_release(s->pending_buffer);
@@ -1195,22 +1194,22 @@ static void pointer_set_cursor(struct wl_client *c, struct wl_resource *r,
                     wl_shm_buffer_begin_access(shm);
                     const uint32_t *pixels = (const uint32_t *)wl_shm_buffer_get_data(shm);
                     int32_t stride_px = wl_shm_buffer_get_stride(shm) / 4;
-                    if (w <= 64 && h <= 64) {
-                        wm_set_cursor_image(pixels, (uint32_t)w, (uint32_t)h, hx, hy);
-                    } else {
-                        uint32_t dw = (uint32_t)w > 64 ? 64 : (uint32_t)w;
-                        uint32_t dh = (uint32_t)h > 64 ? 64 : (uint32_t)h;
-                        uint32_t scaled[64*64];
-                        for (uint32_t dy = 0; dy < dh; dy++) {
-                            uint32_t sy = dy * (uint32_t)h / dh;
-                            for (uint32_t dx = 0; dx < dw; dx++) {
-                                uint32_t sx = dx * (uint32_t)w / dw;
-                                scaled[dy * dw + dx] = pixels[sy * stride_px + sx];
-                            }
+                    uint32_t format = wl_shm_buffer_get_format(shm);
+                    int force_opaque = (format != WL_SHM_FORMAT_ARGB8888);
+                    uint32_t dw = (uint32_t)w > 64 ? 64 : (uint32_t)w;
+                    uint32_t dh = (uint32_t)h > 64 ? 64 : (uint32_t)h;
+                    uint32_t buf[64*64];
+                    for (uint32_t dy = 0; dy < dh; dy++) {
+                        uint32_t sy = (dw == (uint32_t)w) ? dy : (dy * (uint32_t)h / dh);
+                        for (uint32_t dx = 0; dx < dw; dx++) {
+                            uint32_t sx = (dh == (uint32_t)h) ? dx : (dx * (uint32_t)w / dw);
+                            uint32_t px = pixels[sy * stride_px + sx];
+                            buf[dy * dw + dx] = force_opaque ? (0xFF000000u | (px & 0x00FFFFFFu)) : px;
                         }
-                        wm_set_cursor_image(scaled, dw, dh,
-                                            hx * (int32_t)dw / w, hy * (int32_t)dh / h);
                     }
+                    int32_t shx = hx * (int32_t)dw / w;
+                    int32_t shy = hy * (int32_t)dh / h;
+                    wm_set_cursor_image(buf, dw, dh, shx, shy);
                     wl_shm_buffer_end_access(shm);
                 }
             }
