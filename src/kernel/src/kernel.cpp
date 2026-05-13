@@ -629,6 +629,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         // Start the compositor kernel thread (blits VFBs to physical FB).
         brook::CompositorStartThread();
 
+        // Start the audio mixer drain thread.
+        brook::AudioMixerThreadStart();
+
         // Start debug channel kernel thread (connects asynchronously).
         brook::DebugChannelInit();
 

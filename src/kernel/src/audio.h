@@ -66,4 +66,11 @@ void AudioMixerFlush();
 // Initialize the mixer (call once at boot, after kmalloc is available).
 void AudioMixerInit();
 
+// Start the mixer drain thread (call after scheduler is running).
+void AudioMixerThreadStart();
+
+// Periodic tick — called from mixer thread every ~10ms.
+// Drains accumulated mix data to the hardware in consistent chunks.
+void AudioMixerTick();
+
 } // namespace brook

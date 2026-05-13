@@ -1601,20 +1601,7 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
 
         if (mixSrc && mixFrames > 0)
         {
-            bool nonblock = (fde->statusFlags & 0x800) != 0; // O_NONBLOCK
-            uint32_t hwBytes = mixFrames * MIXER_FRAME_BYTES;
-            int queued = AudioPlay(mixSrc, hwBytes,
-                                   MIXER_HW_RATE, MIXER_HW_CHANNELS, MIXER_HW_BITS, nonblock);
-            if (queued < 0)
-                return queued;
-            if (queued == 0)
-                return nonblock ? -EAGAIN : 0;
-            if (static_cast<uint32_t>(queued) < hwBytes)
-            {
-                uint64_t accepted = (static_cast<uint64_t>(queued) * count) / hwBytes;
-                accepted -= accepted % bytesPerFrame;
-                return static_cast<int64_t>(accepted);
-            }
+            AudioMixerSubmit(mixSrc, mixFrames, dsp->mixerStreamId);
         }
 
         return static_cast<int64_t>(count);
