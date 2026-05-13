@@ -263,6 +263,7 @@ static constexpr uint8_t USB_DESC_ENDPOINT  = 5;
 // USB device classes
 static constexpr uint8_t USB_CLASS_HID      = 3;
 static constexpr uint8_t USB_CLASS_MASS_STORAGE = 8;
+static constexpr uint8_t USB_CLASS_HUB      = 9;
 
 // HID subclasses
 static constexpr uint8_t USB_HID_SUBCLASS_BOOT = 1;
@@ -276,6 +277,41 @@ static constexpr uint8_t USB_MSC_PROTOCOL_BBB     = 0x50; // Bulk-Only (BBB) tra
 // Mass Storage class-specific requests
 static constexpr uint8_t USB_MSC_REQ_RESET        = 0xFF;
 static constexpr uint8_t USB_MSC_REQ_GET_MAX_LUN  = 0xFE;
+
+// Hub descriptor types
+static constexpr uint8_t USB_DESC_HUB_USB2 = 0x29;
+static constexpr uint8_t USB_DESC_HUB_USB3 = 0x2A;
+
+// Hub class-specific requests (bmRequestType = 0x20/0xA0 for hub, 0x23/0xA3 for port)
+static constexpr uint8_t USB_HUB_REQ_GET_STATUS    = 0;
+static constexpr uint8_t USB_HUB_REQ_CLEAR_FEATURE = 1;
+static constexpr uint8_t USB_HUB_REQ_SET_FEATURE   = 3;
+static constexpr uint8_t USB_HUB_REQ_GET_DESCRIPTOR = 6;
+
+// Hub port features
+static constexpr uint16_t USB_PORT_FEAT_CONNECTION  = 0;
+static constexpr uint16_t USB_PORT_FEAT_ENABLE      = 1;
+static constexpr uint16_t USB_PORT_FEAT_RESET       = 4;
+static constexpr uint16_t USB_PORT_FEAT_POWER       = 8;
+static constexpr uint16_t USB_PORT_FEAT_C_CONNECTION = 16;
+static constexpr uint16_t USB_PORT_FEAT_C_ENABLE    = 17;
+static constexpr uint16_t USB_PORT_FEAT_C_RESET     = 20;
+
+// Hub port status bits
+static constexpr uint16_t USB_PORT_STAT_CONNECTION  = (1 << 0);
+static constexpr uint16_t USB_PORT_STAT_ENABLE      = (1 << 1);
+static constexpr uint16_t USB_PORT_STAT_RESET       = (1 << 4);
+static constexpr uint16_t USB_PORT_STAT_POWER       = (1 << 8);
+
+// Hub descriptor (USB 2.0 §11.23.2.1)
+struct UsbHubDescriptor {
+    uint8_t  bDescLength;
+    uint8_t  bDescriptorType;
+    uint8_t  bNbrPorts;
+    uint16_t wHubCharacteristics;
+    uint8_t  bPwrOn2PwrGood;      // Time in 2ms intervals from power-on to power-good
+    uint8_t  bHubContrCurrent;
+} __attribute__((packed));
 
 // USB setup packet
 struct UsbSetupPacket {
@@ -950,17 +986,28 @@ struct XhciDevice {
     bool     isKeyboard;
     bool     isMouse;
     bool     isMassStorage;
+    bool     isHub;
 
     // Mass storage state
     uint32_t mscTag;            // CBW tag counter
     uint64_t mscSectorCount;    // total sectors
     uint32_t mscBlockSize;      // bytes per sector (usually 512)
 
+    // Hub state
+    uint8_t  hubNumPorts;       // number of downstream ports
+    uint16_t hubCharacteristics;
+    uint8_t  hubPwrOnDelay;     // bPwrOn2PwrGood * 2ms units
+    uint32_t routeString;       // xHCI route string to this device
+    uint32_t parentSlotId;      // parent hub's slot (0 = root hub)
+    uint8_t  parentPortNum;     // port on parent hub (1-based)
+    uint8_t  hubTier;           // 0 = directly on root hub
+
     void*    priv;          // driver-private (DMA report buffer for HID)
 };
 
 static XhciDevice g_devices[MAX_DEVICES];
 static uint32_t   g_deviceCount = 0;
+static bool        g_mousePresent = false; // set when a mouse is successfully configured
 
 // ---------------------------------------------------------------------------
 // Phase 4: Enable Slot
@@ -1064,13 +1111,21 @@ static bool XhciAddressDevice(XhciController& ctrl, XhciDevice& dev)
     auto* slotCtx = reinterpret_cast<uint32_t*>(
         static_cast<uint8_t*>(dev.inputCtx) + ctxSize);
 
-    // Slot Context DW0: Route String (0), Speed, Context Entries (1 = just EP0)
+    // Slot Context DW0: Route String, Speed, Context Entries (1 = just EP0)
     uint32_t speed = XhciSlotSpeed(dev.portSpeed);
-    slotCtx[0] = (1 << 27) | // Context Entries = 1
-                 (speed << 20); // Speed
+    slotCtx[0] = (1 << 27) |           // Context Entries = 1
+                 (speed << 20) |        // Speed
+                 (dev.routeString & 0xFFFFF); // Route String (bits 19:0)
 
     // Slot Context DW1: Root Hub Port Number (1-based)
     slotCtx[1] = (dev.portNum << 16); // Root Hub Port Number
+
+    // For devices behind a hub, set the parent hub slot and port
+    if (dev.parentSlotId != 0) {
+        // DW2 bits 7:0 = Parent Hub Slot ID, bits 15:8 = Parent Port Number
+        slotCtx[2] = (dev.parentSlotId & 0xFF) |
+                     ((static_cast<uint32_t>(dev.parentPortNum) & 0xFF) << 8);
+    }
 
     // Fill EP0 Context (entry 2 in input context)
     auto* ep0Ctx = reinterpret_cast<uint32_t*>(
@@ -1316,6 +1371,12 @@ static bool XhciConfigureDevice(XhciController& ctrl, XhciDevice& dev)
                 iface->bInterfaceProtocol == USB_MSC_PROTOCOL_BBB) {
                 dev.isMassStorage = true;
             }
+
+            // Hub devices: class 9 at device level or interface level
+            if (iface->bInterfaceClass == USB_CLASS_HUB ||
+                dev.deviceClass == USB_CLASS_HUB) {
+                dev.isHub = true;
+            }
         }
 
         if (dType == USB_DESC_ENDPOINT && dLen >= sizeof(UsbEndpointDescriptor)) {
@@ -1367,6 +1428,262 @@ static bool XhciConfigureDevice(XhciController& ctrl, XhciDevice& dev)
     SerialPrintf("xhci: device configured (cfg=%u)\n", cfgValue);
     dev.configured = true;
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 9: USB Hub support
+// ---------------------------------------------------------------------------
+
+// Forward declare for hub downstream enumeration
+static void XhciEnumeratePort(XhciController& ctrl, uint32_t portNum,
+                               uint32_t portSpeed);
+static void XhciEnumerateHubDevice(XhciController& ctrl, XhciDevice& hub,
+                                    uint8_t hubPort, uint32_t speed);
+static bool XhciConfigureInterruptEndpoint(XhciController& ctrl, XhciDevice& dev);
+static bool XhciSetBootProtocol(XhciController& ctrl, XhciDevice& dev);
+static bool XhciInitMassStorage(XhciController& ctrl, XhciDevice& dev, uint32_t devIndex);
+
+// Read the hub descriptor and initialize hub state
+static bool XhciHubInit(XhciController& ctrl, XhciDevice& dev)
+{
+    uint64_t bufPhys;
+    auto* buf = static_cast<uint8_t*>(AllocDmaBuffer(1, bufPhys));
+    if (!buf) return false;
+
+    // GET_DESCRIPTOR(HUB) — class-specific request to device
+    UsbSetupPacket setup = {};
+    setup.bmRequestType = 0xA0; // Device-to-Host, Class, Device
+    setup.bRequest = USB_HUB_REQ_GET_DESCRIPTOR;
+    setup.wValue = (USB_DESC_HUB_USB2 << 8) | 0;
+    setup.wIndex = 0;
+    setup.wLength = sizeof(UsbHubDescriptor);
+
+    if (!XhciControlTransfer(ctrl, dev, setup, buf, sizeof(UsbHubDescriptor),
+                              bufPhys, 3)) {
+        // Try USB3 hub descriptor type
+        setup.wValue = (USB_DESC_HUB_USB3 << 8) | 0;
+        if (!XhciControlTransfer(ctrl, dev, setup, buf, sizeof(UsbHubDescriptor),
+                                  bufPhys, 3)) {
+            SerialPuts("xhci: GET_HUB_DESCRIPTOR failed\n");
+            return false;
+        }
+    }
+
+    auto* hubDesc = reinterpret_cast<UsbHubDescriptor*>(buf);
+    dev.hubNumPorts = hubDesc->bNbrPorts;
+    dev.hubCharacteristics = hubDesc->wHubCharacteristics;
+    dev.hubPwrOnDelay = hubDesc->bPwrOn2PwrGood;
+
+    SerialPrintf("xhci: hub has %u ports, pwrOn=%ums, char=0x%04x\n",
+                 dev.hubNumPorts, dev.hubPwrOnDelay * 2, dev.hubCharacteristics);
+
+    if (dev.hubNumPorts > 15) dev.hubNumPorts = 15;
+
+    // Power on each downstream port
+    for (uint8_t p = 1; p <= dev.hubNumPorts; p++) {
+        UsbSetupPacket pwr = {};
+        pwr.bmRequestType = 0x23; // Host-to-Device, Class, Other (port)
+        pwr.bRequest = USB_HUB_REQ_SET_FEATURE;
+        pwr.wValue = USB_PORT_FEAT_POWER;
+        pwr.wIndex = p;
+        pwr.wLength = 0;
+
+        XhciControlTransfer(ctrl, dev, pwr, nullptr, 0, 0, 0);
+    }
+
+    // Wait for power-good (bPwrOn2PwrGood * 2ms)
+    // Simple busy-wait using LAPIC tick count (~1ms per tick)
+    uint32_t delayMs = dev.hubPwrOnDelay * 2;
+    if (delayMs < 100) delayMs = 100; // minimum 100ms for safety
+    uint64_t start = brook::g_lapicTickCount;
+    while ((brook::g_lapicTickCount - start) < delayMs) {
+        __asm__ volatile("pause");
+    }
+
+    SerialPuts("xhci: hub ports powered\n");
+    return true;
+}
+
+// Get port status from a hub
+static bool XhciHubGetPortStatus(XhciController& ctrl, XhciDevice& hub,
+                                  uint8_t port, uint16_t* status, uint16_t* change)
+{
+    uint64_t bufPhys;
+    auto* buf = static_cast<uint8_t*>(AllocDmaBuffer(1, bufPhys));
+    if (!buf) return false;
+
+    UsbSetupPacket setup = {};
+    setup.bmRequestType = 0xA3; // Device-to-Host, Class, Other (port)
+    setup.bRequest = USB_HUB_REQ_GET_STATUS;
+    setup.wValue = 0;
+    setup.wIndex = port;
+    setup.wLength = 4;
+
+    if (!XhciControlTransfer(ctrl, hub, setup, buf, 4, bufPhys, 3)) {
+        SerialPrintf("xhci: GET_PORT_STATUS(port %u) failed\n", port);
+        return false;
+    }
+
+    *status = buf[0] | (buf[1] << 8);
+    *change = buf[2] | (buf[3] << 8);
+    return true;
+}
+
+// Clear a port feature on a hub
+static bool XhciHubClearPortFeature(XhciController& ctrl, XhciDevice& hub,
+                                     uint8_t port, uint16_t feature)
+{
+    UsbSetupPacket setup = {};
+    setup.bmRequestType = 0x23; // Host-to-Device, Class, Other (port)
+    setup.bRequest = USB_HUB_REQ_CLEAR_FEATURE;
+    setup.wValue = feature;
+    setup.wIndex = port;
+    setup.wLength = 0;
+
+    return XhciControlTransfer(ctrl, hub, setup, nullptr, 0, 0, 0);
+}
+
+// Set a port feature on a hub
+static bool XhciHubSetPortFeature(XhciController& ctrl, XhciDevice& hub,
+                                    uint8_t port, uint16_t feature)
+{
+    UsbSetupPacket setup = {};
+    setup.bmRequestType = 0x23; // Host-to-Device, Class, Other (port)
+    setup.bRequest = USB_HUB_REQ_SET_FEATURE;
+    setup.wValue = feature;
+    setup.wIndex = port;
+    setup.wLength = 0;
+
+    return XhciControlTransfer(ctrl, hub, setup, nullptr, 0, 0, 0);
+}
+
+// Poll hub ports for newly connected devices
+static void XhciHubPollPorts(XhciController& ctrl, XhciDevice& hub)
+{
+    for (uint8_t p = 1; p <= hub.hubNumPorts; p++) {
+        uint16_t status = 0, change = 0;
+        if (!XhciHubGetPortStatus(ctrl, hub, p, &status, &change))
+            continue;
+
+        // Check for connection status change
+        if (!(change & USB_PORT_STAT_CONNECTION))
+            continue;
+
+        // Clear the change bit
+        XhciHubClearPortFeature(ctrl, hub, p, USB_PORT_FEAT_C_CONNECTION);
+
+        if (status & USB_PORT_STAT_CONNECTION) {
+            // New device connected — reset the port
+            SerialPrintf("xhci: hub port %u: device connected, resetting\n", p);
+            XhciHubSetPortFeature(ctrl, hub, p, USB_PORT_FEAT_RESET);
+
+            // Wait for reset complete (~50ms)
+            uint64_t start = brook::g_lapicTickCount;
+            while ((brook::g_lapicTickCount - start) < 50) {
+                __asm__ volatile("pause");
+            }
+
+            // Clear reset change
+            XhciHubClearPortFeature(ctrl, hub, p, USB_PORT_FEAT_C_RESET);
+
+            // Check port is now enabled
+            uint16_t newStatus = 0, newChange = 0;
+            if (!XhciHubGetPortStatus(ctrl, hub, p, &newStatus, &newChange))
+                continue;
+
+            if (!(newStatus & USB_PORT_STAT_ENABLE)) {
+                SerialPrintf("xhci: hub port %u: reset failed (not enabled)\n", p);
+                continue;
+            }
+
+            // Determine speed from port status (bits 9-10 for USB 2.0)
+            uint32_t speed = (newStatus >> 9) & 0x3;
+            // Map hub port speed encoding to xHCI speed:
+            // 0=full, 1=low, 2=high; xHCI: 1=full, 2=low, 3=high, 4=super
+            uint32_t xhciSpeed;
+            switch (speed) {
+                case 0: xhciSpeed = 1; break; // Full Speed
+                case 1: xhciSpeed = 2; break; // Low Speed
+                case 2: xhciSpeed = 3; break; // High Speed
+                default: xhciSpeed = 4; break; // Super Speed
+            }
+
+            SerialPrintf("xhci: hub port %u: enabled, speed=%u\n", p, xhciSpeed);
+
+            // Enumerate the downstream device
+            XhciEnumerateHubDevice(ctrl, hub, p, xhciSpeed);
+        } else {
+            // Device disconnected
+            SerialPrintf("xhci: hub port %u: device disconnected\n", p);
+            // TODO: find and clean up the device slot
+        }
+    }
+}
+
+// Enumerate a device connected through a hub
+static void XhciEnumerateHubDevice(XhciController& ctrl, XhciDevice& hub,
+                                    uint8_t hubPort, uint32_t speed)
+{
+    if (g_deviceCount >= MAX_DEVICES) {
+        SerialPuts("xhci: max devices reached\n");
+        return;
+    }
+
+    int slotId = XhciEnableSlot(ctrl);
+    if (slotId < 0) return;
+
+    XhciDevice& dev = g_devices[g_deviceCount];
+    dev = {};
+    dev.slotId = static_cast<uint32_t>(slotId);
+    dev.portNum = hub.portNum; // root hub port number (for xHCI slot context)
+    dev.portSpeed = speed;
+    dev.ep0Cycle = true;
+    dev.intCycle = true;
+    dev.parentSlotId = hub.slotId;
+    dev.parentPortNum = hubPort;
+    dev.hubTier = hub.hubTier + 1;
+
+    // Build route string: append hubPort to parent's route string
+    // Route string: 4 bits per tier, tier 0 in bits 3:0
+    dev.routeString = hub.routeString | (static_cast<uint32_t>(hubPort) << (hub.hubTier * 4));
+
+    SerialPrintf("xhci: enumerating hub device: rootPort=%u, route=0x%05x, tier=%u\n",
+                 dev.portNum, dev.routeString, dev.hubTier);
+
+    if (!XhciAddressDevice(ctrl, dev)) return;
+    if (!XhciGetDeviceDescriptor(ctrl, dev)) return;
+    if (!XhciConfigureDevice(ctrl, dev)) return;
+
+    g_deviceCount++;
+
+    // Handle device type same as root port devices
+    if (dev.isKeyboard && dev.interruptEpAddr) {
+        SerialPrintf("xhci: USB keyboard via hub (slot %u)\n", dev.slotId);
+        XhciSetBootProtocol(ctrl, dev);
+        XhciConfigureInterruptEndpoint(ctrl, dev);
+    }
+
+    if (dev.isMouse && dev.interruptEpAddr) {
+        SerialPrintf("xhci: USB mouse via hub (slot %u)\n", dev.slotId);
+        XhciSetBootProtocol(ctrl, dev);
+        if (XhciConfigureInterruptEndpoint(ctrl, dev))
+            g_mousePresent = true;
+    }
+
+    if (dev.isMassStorage && dev.bulkInAddr && dev.bulkOutAddr) {
+        SerialPrintf("xhci: USB mass storage via hub (slot %u)\n", dev.slotId);
+        XhciInitMassStorage(ctrl, dev, g_deviceCount - 1);
+    }
+
+    if (dev.isHub) {
+        SerialPrintf("xhci: nested hub detected (slot %u)\n", dev.slotId);
+        if (dev.hubTier < 5) {
+            XhciHubInit(ctrl, dev);
+            XhciHubPollPorts(ctrl, dev);
+        } else {
+            SerialPuts("xhci: max hub tier depth reached\n");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1732,7 +2049,6 @@ static void XhciProcessMouseReport(const uint8_t* report)
 
 static uint64_t g_mouseReportBufPhys = 0;
 static uint32_t g_mouseDevIndex = 0;
-static bool     g_mousePresent = false;
 
 static void XhciMousePoll(InputDevice* /*dev*/)
 {
@@ -2361,6 +2677,16 @@ static void XhciEnumeratePort(XhciController& ctrl, uint32_t portNum,
         SerialPrintf("xhci: USB mass storage detected on port %u (slot %u)\n",
                      portNum, dev.slotId);
         XhciInitMassStorage(ctrl, dev, g_deviceCount - 1);
+    }
+
+    // If it's a hub, initialize and enumerate downstream devices
+    if (dev.isHub) {
+        SerialPrintf("xhci: USB hub detected on port %u (slot %u)\n",
+                     portNum, dev.slotId);
+        dev.hubTier = 0; // directly on root hub
+        if (XhciHubInit(ctrl, dev)) {
+            XhciHubPollPorts(ctrl, dev);
+        }
     }
 }
 
