@@ -652,11 +652,11 @@ static void BlitWindowVfb(const uint32_t* src,
             static_cast<uint32_t>(dstX0 + startDx);
         const uint32_t rowLen = endDx - startDx;
 
-        // Fast path: if the first pixel is fully opaque, assume the whole
-        // row is opaque and use memcpy.  This is always correct for video
-        // frames and most UI content.  If a pixel happens to be transparent,
-        // the worst case is minor visual error for one frame.
-        if ((srcRow[0] >> 24) == 255)
+        // Fast path: if both the first and last pixel are fully opaque,
+        // the row is almost certainly all opaque — use memcpy.  This is
+        // correct for solid UI content and video.  CSD windows have
+        // transparent shadow edges, so checking both endpoints catches them.
+        if ((srcRow[0] >> 24) == 255 && (srcRow[rowLen - 1] >> 24) == 255)
         {
             __builtin_memcpy(dstRow, srcRow, rowLen * 4);
             continue;
