@@ -1,0 +1,46 @@
+{
+  "header": {
+    "magic": "0x2D",
+    "version": 2,
+    "page": 1,
+    "page_count": 1,
+    "compressed": true
+  },
+  "exception": {
+    "vector": 14,
+    "name": "#PF Page Fault",
+    "error_code": "0x00000002",
+    "pid": 0
+  },
+  "registers": {
+    "RAX": "0xDEADBEEF00000000",
+    "RBX": "0xDEADBEEF00000001",
+    "RCX": "0xDEADBEEF00000002",
+    "RDX": "0xDEADBEEF00000003",
+    "RSI": "0xDEADBEEF00000004",
+    "RDI": "0xDEADBEEF00000005",
+    "R8": "0xDEADBEEF00000006",
+    "R9": "0xDEADBEEF00000007",
+    "R10": "0xDEADBEEF00000008",
+    "R11": "0xDEADBEEF00000009",
+    "R12": "0xDEADBEEF0000000A",
+    "R13": "0xDEADBEEF0000000B",
+    "R14": "0xDEADBEEF0000000C",
+    "R15": "0xDEADBEEF0000000D",
+    "RIP": "0xFFFFFFFF80102345",
+    "RSP": "0xFFFFFFFF80200000",
+    "RBP": "0xFFFFFFFF80200100",
+    "RFLAGS": "0x0000000000000246",
+    "CR0": "0x0000000080050033",
+    "CR2": "0x0000000080051033",
+    "CR3": "0x0000000080052033",
+    "CR4": "0x0000000080053033",
+    "CS": "0x0008",
+    "DS": "0x0010",
+    "SS": "0x0010",
+    "ES": "0x0010",
+    "FS": "0x0000",
+    "GS": "0x0000"
+  },
+  "stack_trace": []
+}

@@ -1,0 +1,141 @@
+{
+  "header": {
+    "magic": "0x2D",
+    "version": 2,
+    "page": 1,
+    "page_count": 1,
+    "compressed": true
+  },
+  "exception": {
+    "vector": 14,
+    "name": "#PF Page Fault",
+    "error_code": "0x00000000",
+    "pid": 4
+  },
+  "registers": {
+    "RAX": "0x0000000000000082",
+    "RBX": "0x0000000000CFDB08",
+    "RCX": "0x0000000000000559",
+    "RDX": "0x0000000000000559",
+    "RSI": "0xFFFFC0000C207EE8",
+    "RDI": "0x0000000000000000",
+    "R8": "0x00000000102FFCFD",
+    "R9": "0x00007FFFFFFDC620",
+    "R10": "0xFFFFFFFFFFFFFEF8",
+    "R11": "0x00000000000014FD",
+    "R12": "0x0000000000000000",
+    "R13": "0x0000000010049120",
+    "R14": "0x00000000103948DA",
+    "R15": "0x0000000000E07CFC",
+    "RIP": "0xFFFFFFFF8000E91C",
+    "RSP": "0xFFFFC0000C207E70",
+    "RBP": "0xFFFFC0000C207EC0",
+    "RFLAGS": "0x0000000000010046",
+    "CR0": "0x0000000080010033",
+    "CR2": "0x00000000000000B0",
+    "CR3": "0x000000000D547000",
+    "CR4": "0x0000000000040668",
+    "CS": "0x0008",
+    "DS": "0x0000",
+    "SS": "0x0000",
+    "ES": "0x0000",
+    "FS": "0x0000",
+    "GS": "0x0000"
+  },
+  "stack_trace": [
+    {
+      "address": "0xFFFFFFFF8000E91C",
+      "symbol": "_ZL14PanicFormatStrPciPKcP13__va_list_tag+0x36c",
+      "location": "/workspace/brook/src/kernel/src/panic.cpp:199"
+    },
+    {
+      "address": "0xFFFFFFFF90011601"
+    },
+    {
+      "address": "0xFFFFFFFF90010318"
+    },
+    {
+      "address": "0xFFFFFFFF90010020"
+    },
+    {
+      "address": "0x000000000048BE8A"
+    }
+  ],
+  "processes": [
+    {
+      "pid": 1,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "net_poll",
+      "rip": null
+    },
+    {
+      "pid": 2,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "serial_wr",
+      "rip": null
+    },
+    {
+      "pid": 3,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "profiler",
+      "rip": null
+    },
+    {
+      "pid": 9,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "compositor",
+      "rip": null
+    },
+    {
+      "pid": 5,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "kconsole",
+      "rip": null
+    },
+    {
+      "pid": 6,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "debug_tcp",
+      "rip": null
+    },
+    {
+      "pid": 7,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "",
+      "rip": null
+    },
+    {
+      "pid": 8,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "terminal",
+      "rip": null
+    },
+    {
+      "pid": 4,
+      "state": "Running",
+      "cpu": "0",
+      "name": "quake2_0",
+      "rip": null
+    }
+  ],
+  "system_info": {
+    "cpu_index": 0,
+    "cpu_count": 8,
+    "tsc_ticks": "0x0000001768079CB3",
+    "tss_rsp0": "0xFFFFC0000C208000",
+    "git_hash": "ad37bb5"
+  },
+  "stack_dump": {
+    "rsp": "0xFFFFC0000C207E70",
+    "length": 256,
+    "hex": "405e370180c0ffff60ce0090fffffffff07e200c00c0ffff3d9c0680ffffffff000000001000000002000000360000003300000036000000350000003500000008dbcf0000000000da48391000000000007f200c00c0ffff01160190ffffffff00f0ffffff7f0000c0730190ffffffff020000000300000002000000a30300007d01000000fc1b0000d07b0800c0ffff707f200c00c0ffff18030190ffffffff707f200c00c02f0400f01480ffffffff00d07b0800c0ffff08dbcf0000000000c0730190ffffffff0200000001000000008000000000000010e7790800c0ffff90b8fdff7100000000000000020000000800000009040000d06f0190ffffffff"
+  }
+}

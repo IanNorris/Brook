@@ -1,0 +1,57 @@
+{
+  "header": {
+    "magic": "0x2D",
+    "version": 1,
+    "page": 1,
+    "page_count": 1,
+    "compressed": false
+  },
+  "exception": {
+    "vector": 14,
+    "name": "#PF Page Fault",
+    "error_code": "0x00000002",
+    "pid": 7
+  },
+  "registers": {
+    "RAX": "0x0000000000000001",
+    "RBX": "0x0000000000000002",
+    "RCX": "0x0000000000000003",
+    "RDX": "0x0000000000000004",
+    "RSI": "0x0000000000000005",
+    "RDI": "0x0000000000000006",
+    "R8": "0x0000000000000007",
+    "R9": "0x0000000000000008",
+    "R10": "0x0000000000000009",
+    "R11": "0x000000000000000A",
+    "R12": "0x000000000000000B",
+    "R13": "0x000000000000000C",
+    "R14": "0x000000000000000D",
+    "R15": "0x000000000000000E",
+    "RIP": "0xFFFFFFFF80012345",
+    "RSP": "0xFFFFFFFF80099000",
+    "RBP": "0xFFFFFFFF80098F00",
+    "RFLAGS": "0x0000000000000246",
+    "CR0": "0x0000000080050033",
+    "CR2": "0x00000000DEADBEEF",
+    "CR3": "0x0000000000001000",
+    "CR4": "0x00000000000006A0",
+    "CS": "0x0008",
+    "DS": "0x0010",
+    "SS": "0x0010",
+    "ES": "0x0010",
+    "FS": "0x0000",
+    "GS": "0x0000"
+  },
+  "stack_trace": [
+    {
+      "address": "0xFFFFFFFF80012345",
+      "symbol": "_ZN5brook14CloseProcessFdEPNS_7ProcessEi+0x2a5",
+      "location": "/workspace/brook/src/kernel/src/syscall.cpp:2830"
+    },
+    {
+      "address": "0xFFFFFFFF80023456",
+      "symbol": "_ZN5brookL8sys_pollEmmmmmm+0x4b6",
+      "location": "/workspace/brook/src/kernel/src/syscall.cpp:6885"
+    }
+  ]
+}

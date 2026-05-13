@@ -1,0 +1,76 @@
+{
+  "header": {
+    "magic": "0x2D",
+    "version": 2,
+    "page": 1,
+    "page_count": 1,
+    "compressed": true
+  },
+  "exception": {
+    "vector": 14,
+    "name": "#PF Page Fault",
+    "error_code": "0x00000003",
+    "pid": 0
+  },
+  "registers": {
+    "RAX": "0xFFFFFFFF8034F498",
+    "RBX": "0x0000000000000001",
+    "RCX": "0x0000000000000002",
+    "RDX": "0x0000000000000068",
+    "RSI": "0xFFFFFFFF8015F420",
+    "RDI": "0x0000000000000001",
+    "R8": "0x0000000000002A23",
+    "R9": "0x0000000000000022",
+    "R10": "0xCCCCCCCCCCCCCCCD",
+    "R11": "0x0000000000000000",
+    "R12": "0xFFFFFFFF80A42CB8",
+    "R13": "0xFFFFFFFF80A4253A",
+    "R14": "0x0000000000000001",
+    "R15": "0xFFFFFFFF80A42C32",
+    "RIP": "0xFFFFFFFF800027E5",
+    "RSP": "0xFFFFC00001E08FA0",
+    "RBP": "0xFFFFC00001E08FA0",
+    "RFLAGS": "0x0000000000010206",
+    "CR0": "0x0000000080010033",
+    "CR2": "0xFFFFFFFF8014F040",
+    "CR3": "0x000000007D9C3000",
+    "CR4": "0x0000000000040668",
+    "CS": "0x0008",
+    "DS": "0x0000",
+    "SS": "0x0010",
+    "ES": "0x0000",
+    "FS": "0x0000",
+    "GS": "0x0000"
+  },
+  "stack_trace": [
+    {
+      "address": "0xFFFFFFFF800027E5",
+      "symbol": "_ZN5brook9FwCfgInitEv+0xa5",
+      "location": "/workspace/brook/src/kernel/src/fw_cfg.cpp:85"
+    },
+    {
+      "address": "0xFFFFFFFF8005191E",
+      "symbol": "_ZN5brook11TerminalGetEi+0x3e",
+      "location": "/workspace/brook/src/kernel/src/terminal.cpp:1211"
+    },
+    {
+      "address": "0xFFFFFFFF80000B36",
+      "symbol": "_ZL14KernelMainBodyPN5brook12BootProtocolE+0xb06",
+      "location": "/workspace/brook/src/kernel/src/kernel.cpp:389"
+    },
+    {
+      "address": "0xFFFFFFFF80000013",
+      "symbol": "KernelMain+0x13",
+      "location": "/workspace/brook/src/kernel/src/kernel.cpp:63"
+    }
+  ],
+  "processes": [
+    {
+      "pid": 1,
+      "state": "Ready",
+      "cpu": "-",
+      "name": "net_poll",
+      "rip": null
+    }
+  ]
+}

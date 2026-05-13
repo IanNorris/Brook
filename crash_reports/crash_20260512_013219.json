@@ -1,0 +1,114 @@
+{
+  "header": {
+    "magic": "0x2D",
+    "version": 2,
+    "page": 1,
+    "page_count": 1,
+    "compressed": true
+  },
+  "registers": {
+    "RAX": "0x000000007D9FC000",
+    "RBX": "0x0000000000000046",
+    "RCX": "0x0000000000000046",
+    "RDX": "0x0000000000000000",
+    "RSI": "0xFFFFC080001AD9F8",
+    "RDI": "0xFFFFFFFF800A9C48",
+    "R8": "0xFFFFC080006FFA68",
+    "R9": "0xFFFFC080006FFB80",
+    "R10": "0xFFFFC080001ADA80",
+    "R11": "0x0000000000000000",
+    "R12": "0x0000000000000000",
+    "R13": "0x0000000000000000",
+    "R14": "0x0000000000000000",
+    "R15": "0x0000000000000000",
+    "RIP": "0xFFFFFFFF80010B71",
+    "RSP": "0xFFFFFFFF80637240",
+    "RBP": "0xFFFFFFFF80637480",
+    "RFLAGS": "0x0000000000000097",
+    "CR0": "0x0000000080010033",
+    "CR2": "0x000000001003E050",
+    "CR3": "0x000000007D9FC000",
+    "CR4": "0x0000000000040668",
+    "CS": "0x0008",
+    "DS": "0x0000",
+    "SS": "0x0010",
+    "ES": "0x0000",
+    "FS": "0x0000",
+    "GS": "0x0000"
+  },
+  "stack_trace": [
+    {
+      "address": "0xFFFFFFFF80010AEC",
+      "symbol": "_ZN5brook23SyscallDispatchInternalEmmmmmmm+0x19c",
+      "location": "/workspace/brook/src/kernel/src/syscall.cpp:11846"
+    },
+    {
+      "address": "0xFFFFFFFF8000EC14",
+      "symbol": "_ZL14PanicFormatStrPciPKcP13__va_list_tag+0x664",
+      "location": "/workspace/brook/src/kernel/src/panic.cpp:?"
+    },
+    {
+      "address": "0xFFFFFFFF80030A72",
+      "symbol": "_ZN5brookL15SyscallCategoryEm+0x72",
+      "location": "/workspace/brook/src/kernel/src/syscall.cpp:11646"
+    }
+  ],
+  "processes": [
+    {
+      "pid": 1,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "net_poll",
+      "rip": "0xFFFFFFFF80051095"
+    },
+    {
+      "pid": 2,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "serial_wr",
+      "rip": "0xFFFFFFFF80051095"
+    },
+    {
+      "pid": 3,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "profiler",
+      "rip": "0xFFFFFFFF80051095"
+    },
+    {
+      "pid": 9,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "compositor",
+      "rip": "0xFFFFFFFF80051095"
+    },
+    {
+      "pid": 5,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "kconsole",
+      "rip": "0xFFFFFFFF80051095"
+    },
+    {
+      "pid": 6,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "debug_tcp",
+      "rip": "0xFFFFFFFF80051095"
+    },
+    {
+      "pid": 7,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "",
+      "rip": "0xFFFFFFFF80051095"
+    },
+    {
+      "pid": 8,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "terminal",
+      "rip": "0xFFFFFFFF80051095"
+    }
+  ]
+}

@@ -1,0 +1,135 @@
+{
+  "header": {
+    "magic": "0x2D",
+    "version": 2,
+    "page": 1,
+    "page_count": 1,
+    "compressed": true
+  },
+  "exception": {
+    "vector": 14,
+    "name": "#PF Page Fault",
+    "error_code": "0x00000003",
+    "pid": 0
+  },
+  "registers": {
+    "RAX": "0xFFFFFFFF80002871",
+    "RBX": "0x0000000000000004",
+    "RCX": "0xFFFFFFFF80A42580",
+    "RDX": "0x0000000000000004",
+    "RSI": "0x0000000000000004",
+    "RDI": "0x0000000000000070",
+    "R8": "0x0000000000000000",
+    "R9": "0x0000000000000001",
+    "R10": "0xCCCCCCCCCCCCCCCD",
+    "R11": "0xFFFFFFFF800AB6F8",
+    "R12": "0x0000000000000000",
+    "R13": "0x0000000000000000",
+    "R14": "0x0000000000000004",
+    "R15": "0x0000000000000000",
+    "RIP": "0xFFFFFFFF80002871",
+    "RSP": "0xFFFFC00002614FC8",
+    "RBP": "0xFFFFC00002614FC8",
+    "RFLAGS": "0x0000000000010002",
+    "CR0": "0x0000000080010033",
+    "CR2": "0xFFFFFFFF8014F070",
+    "CR3": "0x000000007D9C3000",
+    "CR4": "0x0000000000040668",
+    "CS": "0x0008",
+    "DS": "0x0000",
+    "SS": "0x0010",
+    "ES": "0x0000",
+    "FS": "0x0000",
+    "GS": "0x0000"
+  },
+  "stack_trace": [
+    {
+      "address": "0xFFFFFFFF80002871",
+      "symbol": "_ZN5brook9FwCfgInitEv+0x131",
+      "location": "/workspace/brook/src/kernel/src/fw_cfg.cpp:97"
+    },
+    {
+      "address": "0xFFFFFFFF80050EDC",
+      "symbol": "_ZN5brook18TerminalWriteInputEiPKcj+0x26c",
+      "location": "/workspace/brook/src/kernel/src/terminal.cpp:1203"
+    },
+    {
+      "address": "0x0000000000000000"
+    },
+    {
+      "address": "0x0000000000000000"
+    }
+  ],
+  "processes": [
+    {
+      "pid": 1,
+      "state": "Ready",
+      "cpu": "-",
+      "name": "net_poll",
+      "rip": null
+    },
+    {
+      "pid": 2,
+      "state": "Ready",
+      "cpu": "-",
+      "name": "serial_wr",
+      "rip": null
+    },
+    {
+      "pid": 3,
+      "state": "Ready",
+      "cpu": "-",
+      "name": "profiler",
+      "rip": null
+    },
+    {
+      "pid": 4,
+      "state": "Ready",
+      "cpu": "-",
+      "name": "wp_loader",
+      "rip": null
+    },
+    {
+      "pid": 5,
+      "state": "Ready",
+      "cpu": "-",
+      "name": "kconsole",
+      "rip": null
+    },
+    {
+      "pid": 6,
+      "state": "Ready",
+      "cpu": "-",
+      "name": "debug_tcp",
+      "rip": null
+    },
+    {
+      "pid": 7,
+      "state": "Ready",
+      "cpu": "-",
+      "name": "",
+      "rip": null
+    },
+    {
+      "pid": 8,
+      "state": "Ready",
+      "cpu": "-",
+      "name": "terminal",
+      "rip": null
+    },
+    {
+      "pid": 9,
+      "state": "Ready",
+      "cpu": "-",
+      "name": "compositor",
+      "rip": null
+    },
+    {
+      "pid": 10,
+      "state": "Ready",
+      "cpu": "-",
+      "name": "debug_ch",
+      "rip": null
+    }
+  ]
+}

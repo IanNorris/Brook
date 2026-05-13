@@ -1,0 +1,120 @@
+{
+  "header": {
+    "magic": "0x2D",
+    "version": 2,
+    "page": 1,
+    "page_count": 1,
+    "compressed": true
+  },
+  "exception": {
+    "vector": 13,
+    "name": "#GP General Protection",
+    "error_code": "0x00000010",
+    "pid": 0
+  },
+  "registers": {
+    "RAX": "0xFFFFFFFF800315B0",
+    "RBX": "0x0000000000000000",
+    "RCX": "0x000000000001FFFF",
+    "RDX": "0x0000000000000000",
+    "RSI": "0xFFFFC0800022FC90",
+    "RDI": "0xFFFFC080003B5AD0",
+    "R8": "0xFFFFC080003B5A28",
+    "R9": "0xFFFFC080003B5B40",
+    "R10": "0xFFFFC0800022FD00",
+    "R11": "0x000000000000001A",
+    "R12": "0x0000000000000000",
+    "R13": "0x0000000000000000",
+    "R14": "0x0000000000000000",
+    "R15": "0x0000000000000000",
+    "RIP": "0xFFFFFFFF80075C72",
+    "RSP": "0xFFFFFFFF80658558",
+    "RBP": "0xFFFFFFFF80658580",
+    "RFLAGS": "0x0000000000010046",
+    "CR0": "0x0000000080010033",
+    "CR2": "0x0000000010000040",
+    "CR3": "0x000000007D9C3000",
+    "CR4": "0x0000000000040668",
+    "CS": "0x0008",
+    "DS": "0x0000",
+    "SS": "0x0010",
+    "ES": "0x0000",
+    "FS": "0x0000",
+    "GS": "0x0000"
+  },
+  "stack_trace": [
+    {
+      "address": "0xFFFFFFFF80075C72",
+      "symbol": "_ZN5brook18DebugHandleCommandEPKcj+0x2e2",
+      "location": "/workspace/brook/src/kernel/src/net.cpp:2903"
+    },
+    {
+      "address": "0x0000000000000000"
+    }
+  ],
+  "processes": [
+    {
+      "pid": 1,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "net_poll",
+      "rip": null
+    },
+    {
+      "pid": 2,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "serial_wr",
+      "rip": null
+    },
+    {
+      "pid": 3,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "profiler",
+      "rip": null
+    },
+    {
+      "pid": 9,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "compositor",
+      "rip": null
+    },
+    {
+      "pid": 5,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "kconsole",
+      "rip": null
+    },
+    {
+      "pid": 6,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "debug_tcp",
+      "rip": null
+    },
+    {
+      "pid": 7,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "",
+      "rip": null
+    },
+    {
+      "pid": 8,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "terminal",
+      "rip": null
+    },
+    {
+      "pid": 4,
+      "state": "Running",
+      "cpu": "0",
+      "name": "quake2_0",
+      "rip": null
+    }
+  ]
+}

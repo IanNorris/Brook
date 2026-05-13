@@ -1,0 +1,2 @@
+# Nix install timing test — install cowsay (small, ~13 deps)
+run /nix/bin/nix-install cowsay

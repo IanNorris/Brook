@@ -1,0 +1,102 @@
+{
+  "header": {
+    "magic": "0x2D",
+    "version": 1,
+    "page": 1,
+    "page_count": 1,
+    "compressed": false
+  },
+  "exception": {
+    "vector": 14,
+    "name": "#PF Page Fault",
+    "error_code": "0x00000000",
+    "pid": 7
+  },
+  "registers": {
+    "RAX": "0x0000000000000042",
+    "RBX": "0xFFFFFFFF80098000",
+    "RCX": "0x0000000000000003",
+    "RDX": "0x0000000000001000",
+    "RSI": "0xFFFFFFFF800A0000",
+    "RDI": "0xFFFFFFFF800B0010",
+    "R8": "0x0000000000000000",
+    "R9": "0x0000000000000001",
+    "R10": "0x0000000000000002",
+    "R11": "0x0000000000000003",
+    "R12": "0x0000000000000004",
+    "R13": "0x0000000000000005",
+    "R14": "0xFFFFFFFF80010000",
+    "R15": "0xFFFFFFFF80020000",
+    "RIP": "0xFFFFFFFF80012345",
+    "RSP": "0xFFFFFFFF80099F80",
+    "RBP": "0xFFFFFFFF80099FA0",
+    "RFLAGS": "0x0000000000010246",
+    "CR0": "0x0000000080050033",
+    "CR2": "0x0000000000400000",
+    "CR3": "0x0000000001234000",
+    "CR4": "0x00000000000006A0",
+    "CS": "0x0008",
+    "DS": "0x0010",
+    "SS": "0x0010",
+    "ES": "0x0010",
+    "FS": "0x0000",
+    "GS": "0x0000"
+  },
+  "stack_trace": [
+    {
+      "address": "0xFFFFFFFF80012345",
+      "symbol": "_ZN5brook14CloseProcessFdEPNS_7ProcessEi+0x2a5",
+      "location": "/workspace/brook/src/kernel/src/syscall.cpp:2830"
+    },
+    {
+      "address": "0xFFFFFFFF80015678",
+      "symbol": "_ZN5brookL9sys_writeEmmmmmm+0x228",
+      "location": "/workspace/brook/src/kernel/src/syscall.cpp:1399"
+    },
+    {
+      "address": "0xFFFFFFFF8001ABCD",
+      "symbol": "_ZN5brookL10sys_munmapEmmmmmm+0x1bd",
+      "location": "/workspace/brook/src/kernel/src/syscall.cpp:3737"
+    },
+    {
+      "address": "0xFFFFFFFF80023456",
+      "symbol": "_ZN5brookL8sys_pollEmmmmmm+0x4b6",
+      "location": "/workspace/brook/src/kernel/src/syscall.cpp:6885"
+    },
+    {
+      "address": "0xFFFFFFFF80034567",
+      "symbol": "_ZN5brookL8StrCopyNEPcPKcm+0xb7",
+      "location": "/workspace/brook/src/kernel/src/syscall.cpp:4093"
+    }
+  ],
+  "processes": [
+    {
+      "pid": 1,
+      "state": "Running",
+      "cpu": "0",
+      "name": "compositor",
+      "rip": "0xFFFFFFFF80050000"
+    },
+    {
+      "pid": 4,
+      "state": "Running",
+      "cpu": "2",
+      "name": "nix-install",
+      "rip": "0xFFFFFFFF80060000"
+    },
+    {
+      "pid": 7,
+      "state": "Running",
+      "cpu": "1",
+      "name": "waylandd",
+      "rip": "0xFFFFFFFF80012345"
+    },
+    {
+      "pid": 8,
+      "state": "Ready",
+      "cpu": "-",
+      "name": "shell",
+      "rip": null
+    }
+  ]
+}

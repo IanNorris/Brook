@@ -1,0 +1,129 @@
+{
+  "header": {
+    "magic": "0x2D",
+    "version": 2,
+    "page": 1,
+    "page_count": 1,
+    "compressed": true
+  },
+  "exception": {
+    "vector": 14,
+    "name": "#PF Page Fault",
+    "error_code": "0x00000003",
+    "pid": 7
+  },
+  "registers": {
+    "RAX": "0x0000000000000000",
+    "RBX": "0x0000000000000000",
+    "RCX": "0x0000000000000000",
+    "RDX": "0x0000000000000000",
+    "RSI": "0x0000000000000000",
+    "RDI": "0x0000000000000000",
+    "R8": "0x0000000000000000",
+    "R9": "0x0000000000000000",
+    "R10": "0x0000000000000000",
+    "R11": "0x0000000000000000",
+    "R12": "0x0000000000000000",
+    "R13": "0x0000000000000000",
+    "R14": "0x0000000000000000",
+    "R15": "0x0000000000000000",
+    "RIP": "0xFFFFFFFF8002A075",
+    "RSP": "0xFFFFC00002610F00",
+    "RBP": "0x0000000000000000",
+    "RFLAGS": "0x0000000000010246",
+    "CR0": "0x0000000080010033",
+    "CR2": "0xFFFFFFFF8014F028",
+    "CR3": "0x0000000009C50000",
+    "CR4": "0x0000000000040668",
+    "CS": "0x0008",
+    "DS": "0x0000",
+    "SS": "0x0010",
+    "ES": "0x0000",
+    "FS": "0x0000",
+    "GS": "0x0000"
+  },
+  "stack_trace": [
+    {
+      "address": "0xFFFFFFFF8002A075",
+      "symbol": "_ZN5brookL13sys_ftruncateEmmmmmm+0x95",
+      "location": "/workspace/brook/src/kernel/src/syscall.cpp:8402"
+    }
+  ],
+  "processes": [
+    {
+      "pid": 1,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "net_poll",
+      "rip": null
+    },
+    {
+      "pid": 2,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "serial_wr",
+      "rip": null
+    },
+    {
+      "pid": 3,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "profiler",
+      "rip": null
+    },
+    {
+      "pid": 4,
+      "state": "Running",
+      "cpu": "7",
+      "name": "wp_loader",
+      "rip": null
+    },
+    {
+      "pid": 5,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "kconsole",
+      "rip": null
+    },
+    {
+      "pid": 6,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "debug_tcp",
+      "rip": null
+    },
+    {
+      "pid": 7,
+      "state": "Running",
+      "cpu": "3",
+      "name": "",
+      "rip": null
+    },
+    {
+      "pid": 8,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "terminal",
+      "rip": null
+    },
+    {
+      "pid": 9,
+      "state": "Blocked",
+      "cpu": "-",
+      "name": "compositor",
+      "rip": null
+    }
+  ],
+  "system_info": {
+    "cpu_index": 3,
+    "cpu_count": 8,
+    "tsc_ticks": "0x00000003F1C69F70",
+    "tss_rsp0": "0xFFFFC00009335000",
+    "git_hash": "16a5e8d"
+  },
+  "stack_dump": {
+    "rsp": "0xFFFFC00002610F00",
+    "length": 256,
+    "hex": "78520700007f00002b000000000000000202000000000000f0d5ffffff7f000023000000000000004602000000000000c00000000000000040e27f0080c0ffff000000000000000048a6a180ffffffff3db80a80ffffffffcdcccccccccccccc22cea180ffffffff0800000000000000f0d5ffffff7f000078520700007f000007000000000000000050330900c0ffff0300000000000000000000000000000084470380ffffffff0300000000000000000000000000000003000000000000000000000000000000e80f610200c0ffff79130580ffffffff00800000000000000000000000000000f00f610200c0ffff00000000000000000000000000000000"
+  }
+}

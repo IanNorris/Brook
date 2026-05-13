@@ -318,11 +318,17 @@ struct Socket {
     uint32_t  tcpSndUna;   // oldest unacknowledged
     uint32_t  tcpRcvNxt;   // next expected receive sequence
     uint32_t  tcpSndIss;   // initial send sequence number
-    uint16_t  tcpSndWnd;   // peer's advertised receive window (host-endian)
+    uint32_t  tcpSndWnd;   // peer's advertised receive window (host-endian, scaled)
+    uint8_t   tcpSndWndScale; // peer's window scale factor (0-14, from SYN-ACK)
+    uint8_t   tcpRcvWndScale; // our window scale factor (advertised in SYN)
     volatile bool tcpFinRecv; // FIN received from peer
     volatile bool tcpRstRecv; // RST received from peer (→ ECONNRESET)
     int       connectError;  // async connect() result for getsockopt(SO_ERROR)
     uint64_t tcpCloseWaitTick; // tick when socket entered CloseWait (for reaper)
+
+    // Delayed ACK — ACK every 2nd data segment or after 40ms timer
+    uint32_t tcpUnackedSegs;   // data segments received since last ACK
+    uint64_t tcpLastDataTick;  // tick when first unacked data segment arrived
 
     // Listen/accept queue (server-side)
     static constexpr int ACCEPT_QUEUE_MAX = 16;
