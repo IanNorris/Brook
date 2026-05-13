@@ -17,7 +17,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
 # Parse size (first numeric arg) and packages
-SIZE_MB=3072
+SIZE_MB=5120
 PACKAGES=()
 for arg in "$@"; do
     if [[ "$arg" =~ ^[0-9]+$ ]]; then
@@ -56,6 +56,7 @@ if [ ${#PACKAGES[@]} -eq 0 ]; then
         mousepad           # default text editor (Xfce GTK3, ~430MB closure)
         foot               # terminal — needs pty; carried for staged bring-up
         gimp               # Tier-2 photo editor; pulled but launched only when ready (~1.2GB)
+        libreoffice        # LibreOffice suite (~2.6GB closure, shares GTK3 libs with above)
     )
 fi
 
@@ -306,6 +307,15 @@ EOF
 (save-session-info no)
 (num-processors 1)
 EOF
+                fi
+                ;;
+            *-libreoffice-*-wrapped)
+                if [ -d "$p/bin" ]; then
+                    for lo_bin in libreoffice soffice swriter scalc sdraw simpress sbase smath; do
+                        if [ -e "$p/bin/$lo_bin" ]; then
+                            ln -sf "../store/$(basename "$p")/bin/$lo_bin" "${MOUNT_DIR}/bin/$lo_bin"
+                        fi
+                    done
                 fi
                 ;;
             *-nss-cacert-*|*-cacert-*)

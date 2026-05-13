@@ -1,2 +1,3 @@
 profile 300
-run /nix/bin/nix-install cowsay
+set wm
+terminal

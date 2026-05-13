@@ -71,6 +71,17 @@ fi
 mmd -i "${INITRD_IMG}.tmp" "::TEST" 2>/dev/null || true
 echo "Hello from initrd!" | mcopy -i "${INITRD_IMG}.tmp" - "::TEST/HELLO.TXT"
 
+# Create /tmp — needed by graphical apps for runtime state (Wayland sockets,
+# LibreOffice user profile, XDG_RUNTIME_DIR).
+mmd -i "${INITRD_IMG}.tmp" "::TMP" 2>/dev/null || true
+
+# Minimal /sys stub — some apps read /sys/devices/system/cpu/online.
+mmd -i "${INITRD_IMG}.tmp" "::SYS" 2>/dev/null || true
+mmd -i "${INITRD_IMG}.tmp" "::SYS/DEVICES" 2>/dev/null || true
+mmd -i "${INITRD_IMG}.tmp" "::SYS/DEVICES/SYSTEM" 2>/dev/null || true
+mmd -i "${INITRD_IMG}.tmp" "::SYS/DEVICES/SYSTEM/CPU" 2>/dev/null || true
+echo "0-7" | mcopy -i "${INITRD_IMG}.tmp" - "::SYS/DEVICES/SYSTEM/CPU/ONLINE"
+
 # GLib/GIO and DBus require a valid machine-id even for session-bus
 # autolaunch. A deterministic ID is sufficient for Brook's single-VM
 # development images and avoids toolkit startup stalls.

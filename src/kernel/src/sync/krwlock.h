@@ -53,4 +53,7 @@ void KRwLockWriteLock(KRwLock* rw);
 // Release the write lock. Wakes all queued readers, or the next writer.
 void KRwLockWriteUnlock(KRwLock* rw);
 
+// Cleanup on thread exit: release held write lock and/or remove from wait queues.
+void KRwLockCleanupOnExit(Process* p);
+
 } // namespace brook

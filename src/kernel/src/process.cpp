@@ -802,6 +802,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     proc->ttyCanonical = true;
     proc->ttyEcho = true;
     proc->straceEnabled = false;
+    proc->straceErrorsOnly = false;
 
     // Build user stack with argc/argv/envp/auxv
     uint64_t userSP = SetupUserStack(proc, argc, argv, envc, envp, interpBase);
@@ -1206,6 +1207,9 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->clearChildTid = 0;
     child->parentSetTid = 0;
     child->vforkParent = nullptr;
+    child->blockedOnRwLock = nullptr;
+    child->heldWriteLock = nullptr;
+    child->blockedAsWriter = false;
     // Crash entry is inherited from the parent: fork keeps the same VAS
     // contents, so __brook_crash_entry is at the same VA in the child.
     // (exec() does clear it — see ProcessExec.)
@@ -1384,6 +1388,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->ttyCanonical = parent->ttyCanonical;
     child->ttyEcho = parent->ttyEcho;
     child->straceEnabled = parent->straceEnabled;
+    child->straceErrorsOnly = parent->straceErrorsOnly;
 
     // Inherit parent's signal handlers (POSIX fork semantics). The
     // g_sigHandlers table is indexed by pid, so we must explicitly copy;
@@ -1481,6 +1486,9 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     thread->syncNext = nullptr;
     thread->pendingWakeup = 0;
     thread->vforkParent = nullptr;
+    thread->blockedOnRwLock = nullptr;
+    thread->heldWriteLock = nullptr;
+    thread->blockedAsWriter = false;
 
     // Fork-child trampoline state
     thread->isForkChild = true;
@@ -1970,6 +1978,28 @@ int ProcessSendSignal(Process* proc, int signum)
         if (sa.handler == 1 ||
             (sa.handler == 0 && defaultIsIgnore))
         {
+            return 0;
+        }
+
+        // SIG_DFL where the default action is "terminate": kill the process.
+        // Without this, abort()'s raise(SIGABRT) with SIG_DFL sets the bit
+        // pending but never terminates — execution falls through to HLT.
+        bool defaultIsTerminate = (signum == 1  || signum == 2  || signum == 3  ||
+                                   signum == 4  || signum == 6  || signum == 8  ||
+                                   signum == 11 || signum == 13 || signum == 14 ||
+                                   signum == 15);
+        if (sa.handler == 0 && defaultIsTerminate)
+        {
+            proc->exitStatus = 128 + signum;
+            proc->fbVirtual = nullptr;
+            proc->fbVirtualSize = 0;
+            __atomic_store_n(reinterpret_cast<volatile int*>(&proc->state),
+                             static_cast<int>(ProcessState::Terminated),
+                             __ATOMIC_RELEASE);
+            if (!__atomic_load_n(&proc->compositorRegistered, __ATOMIC_ACQUIRE))
+                __atomic_store_n(&proc->reapable, true, __ATOMIC_RELEASE);
+            DbgPrintf("SIGNAL: sig %d -> pid %u terminated (default action)\n",
+                      signum, proc->pid);
             return 0;
         }
     }

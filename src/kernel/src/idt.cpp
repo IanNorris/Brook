@@ -17,6 +17,7 @@
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "string.h"
+#include "irq_wrapper.h"
 
 using brook::SerialPrintf;
 using brook::IoApicUnmaskIrq;
@@ -744,6 +745,33 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
     // The assembly stub has already done SWAPGS if needed.
     __asm__ volatile("cli");
 
+    // GS base diagnostic: catch stray SWAPGS before any gs-relative access.
+    // Only check kernel-mode exceptions — user-mode exceptions have user GS
+    // which is legitimately zero (the stub swaps to kernel GS before calling us).
+    if ((ef->cs & 3) == 0)
+    {
+        uint32_t gsLo, gsHi;
+        __asm__ volatile("rdmsr" : "=a"(gsLo), "=d"(gsHi) : "c"(0xC0000101u));
+        uint64_t gsBase = (static_cast<uint64_t>(gsHi) << 32) | gsLo;
+        if (gsBase == 0)
+        {
+            uint32_t kLo, kHi;
+            __asm__ volatile("rdmsr" : "=a"(kLo), "=d"(kHi) : "c"(0xC0000102u));
+            uint64_t kgsBase = (static_cast<uint64_t>(kHi) << 32) | kLo;
+            SerialPrintf("!!! GS_BASE=0 in HandleExceptionFull! vec=%lu RIP=0x%lx "
+                         "KERNEL_GS=0x%lx\n", vector, ef->rip, kgsBase);
+            // Auto-fix
+            if (kgsBase) {
+                __asm__ volatile("wrmsr" :: "c"(0xC0000101u),
+                    "a"(static_cast<uint32_t>(kgsBase)),
+                    "d"(static_cast<uint32_t>(kgsBase >> 32)));
+                __asm__ volatile("wrmsr" :: "c"(0xC0000102u), "a"(0u), "d"(0u));
+                SerialPrintf("!!! GS_BASE restored to 0x%lx — faulting RIP was 0x%lx\n",
+                             kgsBase, ef->rip);
+            }
+        }
+    }
+
     // If a panic is already active, this CPU must not produce output or
     // render a panic screen — it would garble the panicking CPU's work.
     // This catches CPUs that enter via ExceptionStub13/14 (which bypass
@@ -834,32 +862,27 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         }
 
         // Safety net: present + write + user page without COW bit.
-        // If the PTE belongs to this process, it likely lost its W bit
-        // due to a memory visibility race — just set it writable.
+        // The PTE is already writable but the CPU has a stale TLB entry
+        // from before a COW resolution. This can happen when multiple
+        // processes share a page table (e.g. fork chain) and another
+        // process resolved the COW first, tagging the PTE with its PID.
+        // Since the PTE is in this process's page table and is already
+        // present+writable+user, an invlpg is always safe.
         if (pfPresent && pfWrite && isUserAddr && cowProc)
         {
             using namespace brook;
             uint64_t* pte = VmmGetPte(cowProc->pageTable,
                                        VirtualAddress(cr2cow & ~0xFFFULL));
             if (pte && (*pte & VMM_PRESENT) && !(*pte & PTE_COW_BIT)
-                && (*pte & VMM_USER))
+                && (*pte & VMM_USER) && (*pte & VMM_WRITABLE))
             {
-                uint16_t ptePid = static_cast<uint16_t>(
-                    (*pte >> PTE_PID_SHIFT) & 0x3FF);
-                if (ptePid == cowProc->pid)
-                {
-                    SerialPrintf("PF: recovering stale RO page at 0x%lx "
-                                 "(pid %u, PTE=0x%lx)\n",
-                                 cr2cow, cowProc->pid, *pte);
-                    *pte |= VMM_WRITABLE;
-                    __asm__ volatile("invlpg (%0)" :: "r"(cr2cow & ~0xFFFULL) : "memory");
-                    brook::TlbShootdown(cowProc->pageTable.pml4.raw(),
-                                        cr2cow & ~0xFFFULL,
-                                        cowProc->tlbCpuMask);
-                    __asm__ volatile("sti");
-                    return;
-                }
+                // PTE is already writable — just flush the stale TLB entry
+                __asm__ volatile("invlpg (%0)" :: "r"(cr2cow & ~0xFFFULL) : "memory");
+                __asm__ volatile("sti");
+                return;
             }
+            // PTE is present+user but NOT writable (and no COW bit) —
+            // this is a genuine protection fault, fall through to kill.
         }
 
         // --- MemFd lazy-page-in (user faults only) ---
@@ -1039,12 +1062,47 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                     procList.count++;
                 }
 
+                // System metadata
+                static brook::PanicSystemInfo sysInfo = {};
+                {
+                    uint32_t cpuIdx = brook::SmpCurrentCpuIndex();
+                    sysInfo.cpuIndex = static_cast<uint8_t>(cpuIdx);
+                    sysInfo.cpuCount = static_cast<uint8_t>(brook::SmpGetCpuCount());
+                    uint32_t lo, hi;
+                    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+                    sysInfo.tscTicks = (static_cast<uint64_t>(hi) << 32) | lo;
+                    auto* tss = GdtGetTss(cpuIdx);
+                    sysInfo.tssRsp0 = tss ? tss->rsp[0] : 0;
+                    const char* hash = brook::BuildGitHash();
+                    for (uint32_t j = 0; j < brook::PANIC_GIT_HASH_LEN - 1 && hash[j]; j++)
+                        sysInfo.gitHash[j] = hash[j];
+                    sysInfo.gitHash[brook::PANIC_GIT_HASH_LEN - 1] = '\0';
+                }
+
+                // Raw stack dump from exception RSP
+                static brook::PanicStackDump stackDump = {};
+                {
+                    stackDump.rsp = ef->rsp;
+                    stackDump.length = 0;
+                    const uint8_t* rspPtr = reinterpret_cast<const uint8_t*>(ef->rsp);
+                    if (ef->rsp >= 0xFFFF800000000000ULL && ef->rsp != 0)
+                    {
+                        for (uint16_t i = 0; i < brook::PANIC_STACK_DUMP_BYTES; i++)
+                        {
+                            stackDump.data[i] = rspPtr[i];
+                            stackDump.length = i + 1;
+                        }
+                    }
+                }
+
                 brook::PanicScreenInfo psi = {};
                 psi.message   = "Unrecoverable kernel exception";
                 psi.regs      = &pregs;
                 psi.trace     = &ptrace;
                 psi.excInfo   = &excInfo;
                 psi.procList  = &procList;
+                psi.sysInfo   = &sysInfo;
+                psi.stackDump = &stackDump;
                 psi.vector    = vector;
                 psi.errorCode = ef->errorCode;
                 brook::PanicScreenRender(const_cast<uint32_t*>(physFb), fbW, fbH, fbStride, &psi);
@@ -1692,25 +1750,27 @@ static SharedIrqEntry* FindSharedIrq(uint8_t irq)
     return nullptr;
 }
 
-// Per-IRQ dispatch stubs. Each is an __attribute__((interrupt)) function that
-// iterates handlers[0..count) for one SharedIrqEntry, then sends EOI.
-// We generate a small fixed set (one per MAX_SHARED_IRQS slot).
-#define SHARED_IRQ_STUB(N) \
-    __attribute__((interrupt)) \
-    static void SharedIrqStub##N(InterruptFrame* frame) { \
-        (void)frame; \
+// Per-IRQ dispatch stubs with proper SWAPGS handling.
+// Each inner function iterates handlers[0..count) for one SharedIrqEntry,
+// then sends EOI.  The naked wrapper handles SWAPGS + GPR save/restore.
+#define SHARED_IRQ_INNER(N) \
+    static void SharedIrqInner##N(void) { \
         SharedIrqEntry& e = g_sharedIrqs[N]; \
         for (int j = 0; j < e.count; j++) \
             e.handlers[j](); \
         ApicSendEoi(); \
     }
 
+#define SHARED_IRQ_STUB(N) \
+    SHARED_IRQ_INNER(N) \
+    IRQ_NAKED_HANDLER(SharedIrqStub##N, SharedIrqInner##N)
+
 SHARED_IRQ_STUB(0)
 SHARED_IRQ_STUB(1)
 SHARED_IRQ_STUB(2)
 SHARED_IRQ_STUB(3)
 
-using StubFn = void (*)(InterruptFrame*);
+using StubFn = void (*)(void);
 static StubFn g_sharedIrqStubs[] = {
     SharedIrqStub0, SharedIrqStub1, SharedIrqStub2, SharedIrqStub3
 };

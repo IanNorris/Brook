@@ -8,6 +8,7 @@
 namespace brook {
 
 struct Vnode;
+struct KRwLock;
 
 // Maximum number of open file descriptors per process.
 static constexpr uint32_t MAX_FDS = 256;
@@ -314,6 +315,11 @@ struct Process
     volatile uint32_t pendingWakeup; // Set by KMutexUnlock before SchedulerUnblock;
                                      // checked by SchedulerBlock to avoid lost wakeups.
 
+    // RwLock tracking for cleanup on thread exit
+    KRwLock* blockedOnRwLock;   // Non-null if blocked waiting on this rwlock
+    KRwLock* heldWriteLock;     // Non-null if holding this rwlock for write
+    bool     blockedAsWriter;   // True if on write wait queue, false if on read wait queue
+
     // Saved CPU context (written by context_switch asm)
     SavedContext savedCtx;
     FxsaveArea   fxsave;
@@ -415,6 +421,7 @@ struct Process
     bool ttyCanonical;
     bool ttyEcho;
     bool straceEnabled;  // Per-process syscall tracing
+    bool straceErrorsOnly; // Only log syscalls that return errors
     uint32_t straceFilter; // 0=all, bitmask of StraceCategory for selective tracing
 
     // Signal state

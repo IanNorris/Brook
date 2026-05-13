@@ -52,7 +52,7 @@ bool ApicInit(uint64_t localApicPhysical);
 extern "C" void ApicSendEoi();
 
 // Read the LAPIC ID of the current CPU.
-uint8_t ApicGetId();
+extern "C" uint8_t ApicGetId();
 
 // Return the calibrated LAPIC timer ticks per millisecond.
 // Valid only after ApicInit().

@@ -7,6 +7,7 @@
 #include "tty.h"
 #include "kprintf.h"
 #include "portio.h"
+#include "irq_wrapper.h"
 
 namespace brook {
 
@@ -395,6 +396,10 @@ static volatile bool g_superHeld = false;
 static volatile bool g_capsLock  = false;
 static volatile bool g_e0Prefix  = false; // E0-prefixed extended key pending
 
+// Drop the first few IRQs after init — UEFI/QEMU generates spurious scancodes
+// during keyboard reset that arrive after our flush in KbdInit.
+static volatile int g_settleCount = 2;
+
 // SysRq-style panic: Ctrl+ScrollLock fires a diagnostic kernel panic.
 // ScrollLock = scancode 0x46.  Only triggers on key-press (not release).
 static constexpr uint8_t SC_SCROLL_LOCK = 0x46;
@@ -405,11 +410,8 @@ extern "C" void KernelPanic(const char* fmt, ...);
 // IRQ1 interrupt handler
 // ---------------------------------------------------------------------------
 
-__attribute__((interrupt))
-static void KbdIrqHandler(InterruptFrame* frame)
+static void KbdIrqHandlerInner(void)
 {
-    (void)frame;
-
     // Check that OBF is set and the byte is NOT from the auxiliary (mouse) port.
     // If bit 5 (AUXB) is set, this is mouse data — don't consume it here.
     uint8_t status = inb(0x64);
@@ -420,6 +422,24 @@ static void KbdIrqHandler(InterruptFrame* frame)
     }
 
     uint8_t sc = inb(0x60); // read scan code from PS/2 data port
+
+    // Filter out keyboard self-test/command response codes that the i8042
+    // generates during boot (UEFI handoff). These are NOT valid key scancodes.
+    if (sc == 0xAA || sc == 0xFC || sc == 0xFE || sc == 0xFF || sc == 0x00)
+    {
+        ApicSendEoi();
+        return;
+    }
+
+    // Drop spurious scancodes generated during UEFI→OS keyboard handoff.
+    // These arrive after KbdInit's flush because QEMU/firmware sends them
+    // asynchronously during the keyboard self-test/reset sequence.
+    if (g_settleCount > 0)
+    {
+        g_settleCount--;
+        ApicSendEoi();
+        return;
+    }
 
     // Ctrl+ScrollLock → diagnostic panic (like Linux SysRq+c).
     // Fires from IRQ context so it works even when all threads are deadlocked.
@@ -556,6 +576,9 @@ static void KbdIrqHandler(InterruptFrame* frame)
     ApicSendEoi();
 }
 
+// Naked ISR wrapper — handles SWAPGS + GPR save/restore around the inner handler.
+IRQ_NAKED_HANDLER(KbdIrqHandler, KbdIrqHandlerInner)
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -604,6 +627,11 @@ char KbdGetChar()
 {
     while (BufEmpty()) { __asm__ volatile("pause"); }
     return BufPop();
+}
+
+void KbdPushChar(char c)
+{
+    BufPush(c);
 }
 
 } // namespace brook

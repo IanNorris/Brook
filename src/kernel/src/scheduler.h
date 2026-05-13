@@ -161,4 +161,7 @@ const char* SchedulerPolicyName();
 uint32_t PanicGetProcessCount();
 Process* PanicGetProcess(uint32_t index);
 
+// Dump all thread states to serial (for debugging hangs).
+void SchedulerDumpThreadStates();
+
 } // namespace brook

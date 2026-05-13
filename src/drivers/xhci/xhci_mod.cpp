@@ -26,7 +26,9 @@
 #include "memory/address.h"
 #include "mem_tag.h"
 #include "input.h"
+#include "keyboard.h"
 #include "device.h"
+#include "irq_wrapper.h"
 #include "memory/heap.h"
 #include "string.h"
 
@@ -47,11 +49,15 @@ MODULE_IMPORT_SYMBOL(VmmMapPage);
 MODULE_IMPORT_SYMBOL(PmmAllocPages);
 MODULE_IMPORT_SYMBOL(IoApicRegisterHandler);
 MODULE_IMPORT_SYMBOL(IoApicUnregisterHandler);
+MODULE_IMPORT_SYMBOL(ApicGetId);
+MODULE_IMPORT_SYMBOL(IdtInstallHandler);
 MODULE_IMPORT_SYMBOL(InputRegister);
 MODULE_IMPORT_SYMBOL(InputWakeWaiters);
+MODULE_IMPORT_SYMBOL(KbdPushChar);
 MODULE_IMPORT_SYMBOL(kmalloc);
 MODULE_IMPORT_SYMBOL(kfree);
 MODULE_IMPORT_SYMBOL(DeviceRegister);
+MODULE_IMPORT_SYMBOL(ApicSendEoi);
 
 using namespace brook;
 
@@ -806,7 +812,7 @@ static bool XhciSubmitCommand(XhciController& ctrl, uint64_t param,
 static Trb* XhciWaitForEvent(XhciController& ctrl, uint32_t expectedType,
                               uint32_t timeoutMs)
 {
-    if (g_irqActive) {
+    if (g_irqActive && timeoutMs > 0) {
         // Interrupt-driven mode: wait on the volatile completion flag
         volatile bool* flag = nullptr;
         Trb* result = nullptr;
@@ -838,17 +844,20 @@ static Trb* XhciWaitForEvent(XhciController& ctrl, uint32_t expectedType,
         // Fall through to polling for wildcard/port status events
     }
 
-    // Polling mode (used during init or for wildcard event draining)
+    // Direct polling — checks event ring at least once even with timeout=0.
+    // This is the path used by poll functions (timeout=0) and during init.
     uint64_t deadline = brook::g_lapicTickCount + timeoutMs;
+    bool firstPass = true;
 
-    while (brook::g_lapicTickCount < deadline) {
+    while (firstPass || brook::g_lapicTickCount < deadline) {
+        firstPass = false;
         uint32_t idx = ctrl.evtDequeue;
         Trb& evt = ctrl.evtRing[idx];
 
         // Check cycle bit — if it matches our expected cycle, this is a new event
         bool evtCycleBit = (evt.control & TRB_CYCLE) != 0;
         if (evtCycleBit != ctrl.evtCycle) {
-            // No new event yet
+            if (timeoutMs == 0) return nullptr; // single check — no event
             for (volatile int d = 0; d < 10000; d++);
             continue;
         }
@@ -1771,7 +1780,8 @@ static bool XhciConfigureInterruptEndpoint(XhciController& ctrl, XhciDevice& dev
         return false;
     }
 
-    SerialPrintf("xhci: interrupt endpoint configured (DCI %u)\n", dev.intDci);
+    SerialPrintf("xhci: interrupt endpoint configured (DCI %u) ring=0x%lx\n",
+                 dev.intDci, dev.intRingPhys);
     return true;
 }
 
@@ -1872,14 +1882,54 @@ static InputDeviceOps g_usbKbdOps = { "usb_kbd", nullptr };
 // Track previous report for key up/down detection
 static uint8_t g_prevReport[8] = {};
 
+// PS/2 scancode set 1 → ASCII (US layout, unshifted)
+// Matches keyboard.cpp g_scancodeToAscii_US for the common range.
+static const char g_sc1ToAscii[128] = {
+    0,0x1B,'1','2','3','4','5','6','7','8','9','0','-','=','\b','\t',  // 0x00
+    'q','w','e','r','t','y','u','i','o','p','[',']','\n',0,            // 0x10
+    'a','s','d','f','g','h','j','k','l',';','\'','`',0,'\\',           // 0x1E
+    'z','x','c','v','b','n','m',',','.','/',0,'*',0,' ',               // 0x2C
+    0,0,0,0,0,0,0,0,0,0,0,0,                                           // 0x3A (F1-F10,NumLk,ScrLk)
+    '7','8','9','-','4','5','6','+','1','2','3','0','.',                // 0x47 (KP)
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0            // 0x54-0x7F
+};
+
+// PS/2 scancode set 1 → ASCII (US layout, shifted)
+static const char g_sc1ToAsciiShift[128] = {
+    0,0x1B,'!','@','#','$','%','^','&','*','(',')','_','+','\b','\t',  // 0x00
+    'Q','W','E','R','T','Y','U','I','O','P','{','}','\n',0,            // 0x10
+    'A','S','D','F','G','H','J','K','L',':','"','~',0,'|',             // 0x1E
+    'Z','X','C','V','B','N','M','<','>','?',0,'*',0,' ',               // 0x2C
+    0,0,0,0,0,0,0,0,0,0,0,0,                                           // 0x3A
+    '7','8','9','-','4','5','6','+','1','2','3','0','.',                // 0x47
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0            // 0x54-0x7F
+};
+
 static void XhciPushKey(uint8_t scancode, bool pressed, uint8_t modifiers)
 {
     InputEvent ev;
     ev.type = pressed ? InputEventType::KeyPress : InputEventType::KeyRelease;
     ev.scanCode = scancode;
     ev.modifiers = modifiers;
-    ev.ascii = 0; // ASCII translation handled by keyboard subsystem
+
+    // Translate scancode → ASCII so the compositor/terminal can use it
+    ev.ascii = 0;
+    if (scancode < 128) {
+        bool shifted = (modifiers & (INPUT_MOD_LSHIFT | INPUT_MOD_RSHIFT)) != 0;
+        bool capsLock = false; // TODO: track caps lock state
+        char c = shifted ? g_sc1ToAsciiShift[scancode] : g_sc1ToAscii[scancode];
+        // CapsLock inverts letter case
+        if (capsLock && c >= 'A' && c <= 'Z' && !shifted)
+            c = g_sc1ToAscii[scancode]; // already lowercase
+        ev.ascii = static_cast<uint8_t>(c);
+    }
+
     InputDevicePush(&g_usbKbdDev, ev);
+
+    // Also push to the legacy KbdGetChar ring buffer so the kernel shell
+    // (which uses KbdGetChar, not InputPollEvent) receives USB keyboard input.
+    if (pressed && ev.ascii != 0)
+        KbdPushChar(static_cast<char>(ev.ascii));
 }
 
 static void XhciProcessKeyboardReport(const uint8_t* report)
@@ -1946,39 +1996,105 @@ static void XhciProcessKeyboardReport(const uint8_t* report)
 
 static uint64_t g_kbdReportBufPhys = 0;
 static uint32_t g_kbdDevIndex = 0;
+static uint64_t g_mouseReportBufPhys = 0;
+static uint32_t g_mouseDevIndex = 0;
+
+// Forward declarations — defined later in this file
+static int XhciMatchTransferEvent(const Trb& evt);
+static void XhciProcessMouseReport(const uint8_t* report);
 
 // Poll for USB keyboard events — called by the input subsystem.
 // In interrupt-driven mode (g_irqActive), the ISR handles reports
 // directly, so this is a no-op. In polling mode, it checks for events.
-static void XhciKeyboardPoll(InputDevice* /*dev*/)
-{
-    if (g_irqActive) return; // ISR handles this
 
+// Unified event drain — processes all pending events on the event ring
+// and routes transfer completions to the correct device. Called from
+// both keyboard and mouse poll paths.
+static void XhciPollDrainEvents()
+{
     if (g_controllerCount == 0) return;
     XhciController& ctrl = g_controllers[0];
     if (!ctrl.initialized) return;
-    if (g_kbdDevIndex >= g_deviceCount) return;
 
-    XhciDevice& kbd = g_devices[g_kbdDevIndex];
-    if (!kbd.isKeyboard || !kbd.intRing) return;
+    uint32_t processed = 0;
+    while (processed < EVT_RING_SIZE) {
+        uint32_t idx = ctrl.evtDequeue;
+        Trb& evt = ctrl.evtRing[idx];
 
-    // Check for transfer completion events on the event ring
-    Trb* evt = XhciWaitForEvent(ctrl, TRB_TYPE_TRANSFER_EVENT, 0);
-    if (!evt) return;
+        bool evtCycleBit = (evt.control & TRB_CYCLE) != 0;
+        if (evtCycleBit != ctrl.evtCycle)
+            break; // no more events
 
-    uint32_t cc = (evt->status >> TRB_CC_SHIFT) & 0xFF;
-    if (cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT_PACKET) {
-        // Process the HID boot report
-        auto* report = static_cast<uint8_t*>(kbd.priv);
-        if (report)
-            XhciProcessKeyboardReport(report);
+        // Advance dequeue
+        ctrl.evtDequeue++;
+        if (ctrl.evtDequeue >= EVT_RING_SIZE) {
+            ctrl.evtDequeue = 0;
+            ctrl.evtCycle = !ctrl.evtCycle;
+        }
+
+        uint32_t type = evt.control & TRB_TYPE_MASK;
+        uint32_t cc = (evt.status >> TRB_CC_SHIFT) & 0xFF;
+
+        if (type == TRB_TYPE_TRANSFER_EVENT) {
+            int devIdx = XhciMatchTransferEvent(evt);
+
+            if (devIdx >= 0) {
+                XhciDevice& dev = g_devices[devIdx];
+
+                if (dev.isKeyboard && dev.intRing &&
+                    (cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT_PACKET)) {
+                    auto* report = static_cast<uint8_t*>(dev.priv);
+                    if (report)
+                        XhciProcessKeyboardReport(report);
+                    if (dev.priv && g_kbdReportBufPhys)
+                        XhciQueueInterruptIn(ctrl, dev,
+                                              dev.priv, g_kbdReportBufPhys, 8);
+                }
+                else if (dev.isMouse && dev.intRing &&
+                         (cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT_PACKET)) {
+                    auto* report = static_cast<uint8_t*>(dev.priv);
+                    if (report)
+                        XhciProcessMouseReport(report);
+                    if (dev.priv && g_mouseReportBufPhys)
+                        XhciQueueInterruptIn(ctrl, dev,
+                                              dev.priv, g_mouseReportBufPhys, 4);
+                }
+                else {
+                    ctrl.xferCompletionTrb = evt;
+                    __asm__ volatile("" ::: "memory");
+                    ctrl.xferComplete = true;
+                }
+            } else {
+                ctrl.xferCompletionTrb = evt;
+                __asm__ volatile("" ::: "memory");
+                ctrl.xferComplete = true;
+            }
+        }
+        else if (type == TRB_TYPE_CMD_COMPLETION) {
+            ctrl.cmdCompletionTrb = evt;
+            __asm__ volatile("" ::: "memory");
+            ctrl.cmdComplete = true;
+        }
+
+        processed++;
     }
 
-    // Re-queue the interrupt IN transfer for the next report
-    if (kbd.priv && g_kbdReportBufPhys) {
-        XhciQueueInterruptIn(ctrl, kbd,
-                              kbd.priv, g_kbdReportBufPhys, 8);
+    if (processed > 0) {
+        uint64_t erdpPhys = ctrl.evtRingPhys + ctrl.evtDequeue * sizeof(Trb);
+        xhci_write64(ctrl.rtBase, XHCI_RT_ERDP, erdpPhys | (1ULL << 3));
+
+        // Clear IMAN IP and USBSTS EINT so the controller can reassert
+        uint32_t sts = xhci_read32(ctrl.opBase, XHCI_OP_USBSTS);
+        if (sts & USBSTS_EINT)
+            xhci_write32(ctrl.opBase, XHCI_OP_USBSTS, USBSTS_EINT);
+        uint32_t iman = xhci_read32(ctrl.rtBase, XHCI_RT_IMAN);
+        xhci_write32(ctrl.rtBase, XHCI_RT_IMAN, iman | 0x3);
     }
+}
+
+static void XhciKeyboardPoll(InputDevice* /*dev*/)
+{
+    XhciPollDrainEvents();
 }
 
 // ---------------------------------------------------------------------------
@@ -2013,9 +2129,9 @@ static void XhciProcessMouseReport(const uint8_t* report)
     if (dx != 0 || dy != 0) {
         int32_t mx = 0, my = 0;
         MouseGetPosition(&mx, &my);
-        // USB boot protocol: positive Y = down in most implementations,
-        // but QEMU USB mouse matches PS/2 convention (positive Y = up)
-        MouseSetPosition(mx + dx, my - dy);
+        // USB boot protocol: positive Y = down (screen convention).
+        // No inversion needed — unlike PS/2 where positive Y = up.
+        MouseSetPosition(mx + dx, my + dy);
 
         InputEvent ev;
         ev.type     = InputEventType::MouseMove;
@@ -2047,35 +2163,9 @@ static void XhciProcessMouseReport(const uint8_t* report)
     InputWakeWaiters();
 }
 
-static uint64_t g_mouseReportBufPhys = 0;
-static uint32_t g_mouseDevIndex = 0;
-
 static void XhciMousePoll(InputDevice* /*dev*/)
 {
-    if (g_irqActive) return; // ISR handles this
-
-    if (g_controllerCount == 0 || !g_mousePresent) return;
-    XhciController& ctrl = g_controllers[0];
-    if (!ctrl.initialized) return;
-    if (g_mouseDevIndex >= g_deviceCount) return;
-
-    XhciDevice& mouse = g_devices[g_mouseDevIndex];
-    if (!mouse.isMouse || !mouse.intRing) return;
-
-    Trb* evt = XhciWaitForEvent(ctrl, TRB_TYPE_TRANSFER_EVENT, 0);
-    if (!evt) return;
-
-    uint32_t cc = (evt->status >> TRB_CC_SHIFT) & 0xFF;
-    if (cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT_PACKET) {
-        auto* report = static_cast<uint8_t*>(mouse.priv);
-        if (report)
-            XhciProcessMouseReport(report);
-    }
-
-    if (mouse.priv && g_mouseReportBufPhys) {
-        XhciQueueInterruptIn(ctrl, mouse,
-                              mouse.priv, g_mouseReportBufPhys, 4);
-    }
+    XhciPollDrainEvents();
 }
 
 // ---------------------------------------------------------------------------
@@ -2188,9 +2278,19 @@ static bool XhciBulkTransfer(XhciController& ctrl, XhciDevice& dev,
 
     __asm__ volatile("mfence" ::: "memory");
 
+    // Temporarily force polling mode for bulk transfers.  The ISR may race
+    // with XhciWaitForEvent for the same completion TRB (both dequeue from
+    // the event ring), causing missed events.  Polling is safe and fast for
+    // synchronous block I/O.
+    bool wasIrqActive = g_irqActive;
+    g_irqActive = false;
+
     XhciRingDoorbell(ctrl, dev.slotId, dci);
 
     Trb* evt = XhciWaitForEvent(ctrl, TRB_TYPE_TRANSFER_EVENT, timeoutMs);
+
+    g_irqActive = wasIrqActive;
+
     if (!evt) {
         SerialPrintf("xhci: bulk %s transfer timeout\n", isIn ? "IN" : "OUT");
         return false;
@@ -2801,13 +2901,17 @@ static int XhciMatchTransferEvent(const Trb& evt)
     return -1; // unknown device
 }
 
-// ISR body — called from the kernel's shared IRQ dispatch stub.
-// Drains all pending event ring entries and dispatches them.
+// ISR body — called from either the shared IRQ stub (legacy INTx) or
+// the MSI-X wrapper below.  Drains all pending event ring entries.
 static void XhciIrqHandler()
 {
     if (g_controllerCount == 0) return;
     XhciController& ctrl = g_controllers[0];
     if (!ctrl.initialized) return;
+
+    // DEBUG: confirm xHCI ISR fires
+    static volatile uint32_t s_xhciIrqCount = 0;
+    uint32_t irqN = ++s_xhciIrqCount;
 
     // Acknowledge the interrupt: clear USBSTS.EINT
     uint32_t sts = xhci_read32(ctrl.opBase, XHCI_OP_USBSTS);
@@ -2901,7 +3005,24 @@ static void XhciIrqHandler()
         uint64_t erdpPhys = ctrl.evtRingPhys + ctrl.evtDequeue * sizeof(Trb);
         xhci_write64(ctrl.rtBase, XHCI_RT_ERDP, erdpPhys | (1ULL << 3));
     }
+
+    // DEBUG: report ISR activity
+    if (irqN <= 5 || (irqN & 0x3FF) == 0) {
+        SerialPrintf("XHCI_ISR: #%u eint=%u processed=%u\n",
+                     irqN, (sts & USBSTS_EINT) ? 1u : 0u, processed);
+    }
 }
+
+// MSI-X IDT entry — compiler-generated interrupt stub.
+// Inner function called from the naked SWAPGS wrapper below.
+static void XhciMsixIsrInner()
+{
+    XhciIrqHandler();
+    ApicSendEoi();
+}
+
+// Naked wrapper with proper SWAPGS for user→kernel transitions.
+IRQ_NAKED_HANDLER(XhciMsixIsr, XhciMsixIsrInner)
 
 // ---------------------------------------------------------------------------
 // Module init / exit
@@ -2943,18 +3064,132 @@ static int XhciModuleInit()
         if (!evt) break;
     }
 
+    // Clear any stale interrupt state from polling phase.  The controller
+    // won't generate new MSI-X messages while IMAN.IP or USBSTS.EINT are set.
+    {
+        uint32_t sts = xhci_read32(ctrl.opBase, XHCI_OP_USBSTS);
+        if (sts & USBSTS_EINT)
+            xhci_write32(ctrl.opBase, XHCI_OP_USBSTS, USBSTS_EINT); // W1C
+
+        uint32_t iman = xhci_read32(ctrl.rtBase, XHCI_RT_IMAN);
+        xhci_write32(ctrl.rtBase, XHCI_RT_IMAN, iman | 0x3); // W1C IP, keep IE
+
+        // Write ERDP with EHB=1 to clear Event Handler Busy
+        uint64_t erdpPhys = ctrl.evtRingPhys + ctrl.evtDequeue * sizeof(Trb);
+        xhci_write64(ctrl.rtBase, XHCI_RT_ERDP, erdpPhys | (1ULL << 3));
+    }
+
     // --- Phase 8: Register IRQ handler for interrupt-driven event processing ---
-    // Read PCI interrupt line and register our ISR
+
+    // Set up MSI-X for interrupt delivery.  QEMU's qemu-xhci uses MSI-X and
+    // does not support legacy INTx fallback, so we must program the MSI-X
+    // table directly.  We configure a single entry (interrupter 0) to deliver
+    // our chosen vector to the BSP's LAPIC.
     ctrl.cmdComplete = false;
     ctrl.xferComplete = false;
-    uint32_t intLine = PciConfigRead32(ctrl.pciDev.bus, ctrl.pciDev.dev,
-                                        ctrl.pciDev.fn, 0x3C) & 0xFF;
-    ctrl.irqLine = static_cast<uint8_t>(intLine);
-    ctrl.irqVector = IoApicRegisterHandler(ctrl.irqLine, XHCI_IRQ_VECTOR,
-                                            reinterpret_cast<void*>(XhciIrqHandler));
+    bool msixConfigured = false;
+    {
+        uint8_t capPtr = static_cast<uint8_t>(
+            PciConfigRead8(ctrl.pciDev.bus, ctrl.pciDev.dev, ctrl.pciDev.fn, 0x34));
+        while (capPtr && capPtr != 0xFF) {
+            uint8_t capId = PciConfigRead8(ctrl.pciDev.bus, ctrl.pciDev.dev,
+                                           ctrl.pciDev.fn, capPtr);
+            if (capId == 0x11) { // MSI-X capability
+                // Read Message Control
+                uint16_t msgCtrl = static_cast<uint16_t>(
+                    PciConfigRead16(ctrl.pciDev.bus, ctrl.pciDev.dev,
+                                    ctrl.pciDev.fn, capPtr + 2));
+                uint16_t tableSize = (msgCtrl & 0x07FF) + 1;
+
+                // Read Table Offset/BIR
+                uint32_t tableOffBir = PciConfigRead32(ctrl.pciDev.bus,
+                    ctrl.pciDev.dev, ctrl.pciDev.fn, capPtr + 4);
+                uint32_t tableBir    = tableOffBir & 0x7;
+                uint32_t tableOffset = tableOffBir & ~0x7u;
+
+                SerialPrintf("xhci: MSI-X cap at 0x%x: %u entries, BAR%u+0x%x\n",
+                             capPtr, tableSize, tableBir, tableOffset);
+
+                // Get the BAR physical address for the MSI-X table
+                uint64_t barPhys = PciBarMemBase32(ctrl.pciDev.bar[tableBir]);
+                if (PciBarIs64(ctrl.pciDev.bar[tableBir]) && tableBir + 1 < 6)
+                    barPhys |= static_cast<uint64_t>(ctrl.pciDev.bar[tableBir + 1]) << 32;
+
+                if (barPhys == 0) {
+                    SerialPuts("xhci: MSI-X table BAR is zero\n");
+                    break;
+                }
+
+                // Map the MSI-X table page(s)
+                uint64_t tablePhys = barPhys + tableOffset;
+                uint32_t tableBytes = tableSize * 16; // 16 bytes per entry
+                uint32_t tablePages = (tableBytes + tableOffset % 4096 + 4095) / 4096;
+                auto tblVaddr = VmmAllocPages(tablePages, VMM_WRITABLE | VMM_NO_EXEC,
+                                              MemTag::Device, KernelPid);
+                if (!tblVaddr) {
+                    SerialPuts("xhci: failed to alloc pages for MSI-X table\n");
+                    break;
+                }
+                uint64_t pageAlignedPhys = tablePhys & ~0xFFFULL;
+                for (uint32_t p = 0; p < tablePages; p++) {
+                    VmmMapPage(KernelPageTable,
+                               VirtualAddress(tblVaddr.raw() + p * 4096),
+                               PhysicalAddress(pageAlignedPhys + p * 4096),
+                               VMM_WRITABLE | VMM_NO_EXEC | VMM_CACHE_DISABLE,
+                               MemTag::Device, KernelPid);
+                }
+
+                volatile uint32_t* table = reinterpret_cast<volatile uint32_t*>(
+                    tblVaddr.raw() + (tablePhys & 0xFFF));
+
+                // Program entry 0: target BSP LAPIC (ID 0), edge-triggered,
+                // fixed delivery, our chosen vector.
+                // Message Address: 0xFEE0_0000 | (destApic << 12)
+                // Message Data:    vector (bits 7:0)
+                uint8_t destLapic = ApicGetId();
+                table[0] = 0xFEE00000u | (static_cast<uint32_t>(destLapic) << 12);
+                table[1] = 0; // upper address = 0
+                table[2] = XHCI_IRQ_VECTOR; // message data = vector
+                table[3] = 0; // vector control: unmask (bit 0 = 0)
+
+                // Mask all other entries
+                for (uint16_t i = 1; i < tableSize; i++)
+                    table[i * 4 + 3] = 1; // mask
+
+                // Enable MSI-X (set bit 15), clear function mask (bit 14)
+                msgCtrl |= 0x8000;   // MSI-X Enable
+                msgCtrl &= ~0x4000;  // Clear Function Mask
+                PciConfigWrite16(ctrl.pciDev.bus, ctrl.pciDev.dev,
+                                 ctrl.pciDev.fn, capPtr + 2, msgCtrl);
+
+                // Install our MSI-X ISR wrapper in the IDT
+                IdtInstallHandler(XHCI_IRQ_VECTOR,
+                                  reinterpret_cast<void*>(XhciMsixIsr));
+
+                msixConfigured = true;
+                SerialPrintf("xhci: MSI-X configured — vector %u → LAPIC %u\n",
+                             XHCI_IRQ_VECTOR, destLapic);
+                break;
+            }
+            capPtr = PciConfigRead8(ctrl.pciDev.bus, ctrl.pciDev.dev,
+                                    ctrl.pciDev.fn, capPtr + 1);
+        }
+    }
+
+    if (!msixConfigured) {
+        // Fallback: legacy INTx via IOAPIC
+        uint32_t intLine = PciConfigRead32(ctrl.pciDev.bus, ctrl.pciDev.dev,
+                                            ctrl.pciDev.fn, 0x3C) & 0xFF;
+        ctrl.irqLine = static_cast<uint8_t>(intLine);
+        ctrl.irqVector = IoApicRegisterHandler(ctrl.irqLine, XHCI_IRQ_VECTOR,
+                                                reinterpret_cast<void*>(XhciIrqHandler));
+        SerialPrintf("xhci: legacy INTx — IRQ %u, vector %u\n",
+                     ctrl.irqLine, ctrl.irqVector);
+    }
+
     g_irqActive = true;
-    SerialPrintf("xhci: IRQ registered (line=%u, vector=%u) — interrupt-driven mode\n",
-                 ctrl.irqLine, ctrl.irqVector);
+    SerialPrintf("xhci: interrupt-driven mode active (MSI-X=%s)\n",
+                 msixConfigured ? "yes" : "no");
 
     // Register USB keyboard input device if a keyboard was found
     for (uint32_t i = 0; i < g_deviceCount; i++) {

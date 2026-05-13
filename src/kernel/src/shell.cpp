@@ -87,11 +87,11 @@ static bool g_scriptMode = false;
 // run with a stripped-down environment and TLS / fontconfig / wayland
 // would silently break.
 const char* const g_defaultEnvp[] = {
-    "HOME=/",
+    "HOME=/home",
     "PATH=/nix/profile/bin:/nix/bin:"
-          "/nix/store/xkqd49dmldkqn4xk6dlm640f5blbv6hp-curl-8.18.0-bin/bin:"
-          "/nix/store/g6mlwdvpg92rchq352ll7jbi0pz7h43r-xz-5.8.2-bin/bin:"
-          "/nix/store/v8sa6r6q037ihghxfbwzjj4p59v2x0pv-bash-5.3p9/bin:"
+          "/nix/store/sm2nq18jjqp4x0sxpl6lrvwl9rx6mvj2-curl-8.19.0-bin/bin:"
+          "/nix/store/2nm5c858fh52s6mhcffm07s3biaxys44-xz-5.8.3-bin/bin:"
+          "/nix/store/4bwbk4an4bx7cb8xwffghvjjyfyl7m2i-bash-interactive-5.3p9/bin:"
           "/boot/BIN:/boot/bin:/data/bin:/usr/bin:/bin",
     "TERM=linux",
     "SHELL=/boot/BIN/BASH",
@@ -101,16 +101,16 @@ const char* const g_defaultEnvp[] = {
     "CURL_CA_BUNDLE=/nix/etc/ssl/certs/ca-bundle.crt",
     "ALSA_CONFIG_PATH=/nix/etc/asound.conf",
     "TZ=UTC0",
-    "NETSURFRES=/nix/store/m64fp6340nd6s98fawnwvvkx4v81660k-netsurf-brook-3.11-brook/share/netsurf/",
+    "NETSURFRES=/nix/store/gmnvrjdanknxjyp3ccjch8jybi126ayy-netsurf-brook-3.11-brook/share/netsurf/",
     "WAYLAND_DISPLAY=wayland-0",
     "XDG_RUNTIME_DIR=/tmp",
     "TMPDIR=/tmp",
     "XCURSOR_PATH=/nix/store/aaipci08wnfa7d64lmd5vyn9l2bkihg5-brook-cursor-theme-0.1/share/icons",
     "XCURSOR_THEME=default",
     "XCURSOR_SIZE=24",
-    "FONTCONFIG_FILE=/nix/store/5xrdnxfmz6fs3w5q4iyq1xd6gr6imgzf-brook-fonts-0.1/etc/fonts/fonts.conf",
-    "FONTCONFIG_PATH=/nix/store/5xrdnxfmz6fs3w5q4iyq1xd6gr6imgzf-brook-fonts-0.1/etc/fonts",
-    "WESTON_DATA_DIR=/nix/store/ls7lby8cwwvbdrwvlswjgxky7lrwjy97-brook-weston-data-0.1/share/weston",
+    "FONTCONFIG_FILE=/nix/store/jmp6v1wk4cwrm0m9ba8ri9ah8y4745g7-brook-fonts-0.1/etc/fonts/fonts.conf",
+    "FONTCONFIG_PATH=/nix/store/jmp6v1wk4cwrm0m9ba8ri9ah8y4745g7-brook-fonts-0.1/etc/fonts",
+    "WESTON_DATA_DIR=/nix/store/ihbxcdlyk93afg1wkcy6sxln4dcq599q-brook-weston-data-0.1/share/weston",
     // GTK / dbus / portal — keep GTK from hanging on session-bus probe.
     "GTK_USE_PORTAL=0",
     // Brook policy: kernel WM draws all chrome (titlebar, border, close
@@ -130,12 +130,18 @@ const char* const g_defaultEnvp[] = {
     "GIMP3_PLUGINDIR=/nix/share/gimp-lite",
     "LIBVA_DRIVERS_PATH=/nonexistent",
     "VDPAU_DRIVER=none",
+    "SAL_USE_VCLPLUGIN=gtk3",
+    "GDK_PIXBUF_MODULE_FILE=/nix/store/4cvbp49wlc9d7s6rivyz2s4fg8rrz9wd-librsvg-2.61.4/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache",
+    "SAL_DISABLE_OPENCL=1",
+    "SAL_DISABLE_PRINTERLIST=1",
+    "CUPS_SERVER=/dev/null",
+    "SAL_LOG=+WARN+ERR+INFO.desktop.app+INFO.desktop.splash",
     "SDL_VIDEODRIVER=wayland",
     "SDL_AUDIODRIVER=alsa",
-    "XDG_CACHE_HOME=/tmp/cache",
-    "XDG_CONFIG_HOME=/tmp/config",
-    "XDG_DATA_HOME=/tmp/share",
-    "XDG_DATA_DIRS=/nix/store/5xrdnxfmz6fs3w5q4iyq1xd6gr6imgzf-brook-fonts-0.1/share:/usr/share",
+    "XDG_CACHE_HOME=/home/.cache",
+    "XDG_CONFIG_HOME=/home/.config",
+    "XDG_DATA_HOME=/home/.local/share",
+    "XDG_DATA_DIRS=/nix/store/jmp6v1wk4cwrm0m9ba8ri9ah8y4745g7-brook-fonts-0.1/share:/usr/share",
     nullptr
 };
 
@@ -957,6 +963,7 @@ static int ExecCommand(int argc, const char* const* argv)
         const char* argv0Override = nullptr;
         int32_t uidOverride = -1;
         bool strace = false;
+        bool straceErrors = false;
         bool runOnce = false;
 
         // Parse flags before the path
@@ -969,6 +976,9 @@ static int ExecCommand(int argc, const char* const* argv)
                 pathIdx += 2;
             } else if (StrEq(argv[pathIdx], "--strace")) {
                 strace = true;
+                pathIdx++;
+            } else if (StrEq(argv[pathIdx], "--strace-errors")) {
+                straceErrors = true;
                 pathIdx++;
             } else if (StrEq(argv[pathIdx], "--once")) {
                 // Idempotent spawn: skip if a process with the same basename
@@ -1082,6 +1092,11 @@ static int ExecCommand(int argc, const char* const* argv)
         if (proc && strace) {
             proc->straceEnabled = true;
             KPrintf("[strace enabled for pid %u]\n", proc->pid);
+        }
+        if (proc && straceErrors) {
+            proc->straceEnabled = true;
+            proc->straceErrorsOnly = true;
+            KPrintf("[strace-errors enabled for pid %u]\n", proc->pid);
         }
         return 0;
     }

@@ -49,6 +49,79 @@
 // All kernel initialization and runtime — called by KernelMain after stack switch.
 __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootProtocol);
 
+// Probe a block device for a filesystem (FAT or ext2), read BROOK.MNT,
+// and mount at the specified path.  Returns true if mounted.
+static bool ProbeAndMountDevice(const char* label, brook::Device* dev, uint8_t pdrv)
+{
+    brook::FatFsBindDrive(pdrv, dev);
+    bool mounted = brook::VfsMount("/mnt/probe", "fatfs", pdrv);
+    const char* fsType = "fatfs";
+
+    if (!mounted) {
+        Ext2BindDevice(pdrv, dev);
+        mounted = brook::VfsMount("/mnt/probe", "ext2", pdrv);
+        fsType = "ext2";
+    }
+
+    if (!mounted) {
+        brook::SerialPrintf("%s — no recognized filesystem\n", label);
+        return false;
+    }
+
+    brook::Vnode* mnt = brook::VfsOpen("/mnt/probe/BROOK.MNT");
+    if (!mnt) {
+        brook::SerialPrintf("%s — no BROOK.MNT, skipping\n", label);
+        brook::VfsUnmount("/mnt/probe");
+        return false;
+    }
+
+    char mntPath[64] = {};
+    uint64_t off = 0;
+    int n = brook::VfsRead(mnt, mntPath, sizeof(mntPath) - 1, &off);
+    brook::VfsClose(mnt);
+
+    if (n <= 0) {
+        brook::SerialPrintf("%s — BROOK.MNT empty\n", label);
+        brook::VfsUnmount("/mnt/probe");
+        return false;
+    }
+
+    // Strip trailing whitespace/newline.
+    for (int j = n - 1; j >= 0; --j) {
+        if (mntPath[j] == '\n' || mntPath[j] == '\r' || mntPath[j] == ' ')
+            mntPath[j] = '\0';
+        else
+            break;
+    }
+
+    brook::VfsUnmount("/mnt/probe");
+    if (brook::VfsMount(mntPath, fsType, pdrv)) {
+        brook::KPrintf("%s mounted at %s\n", label, mntPath);
+
+        // Read BROOK.CFG as sanity check.
+        char cfgPath[80] = {};
+        uint32_t plen = 0;
+        while (mntPath[plen]) { cfgPath[plen] = mntPath[plen]; ++plen; }
+        const char* suffix = "/BROOK.CFG";
+        for (uint32_t j = 0; suffix[j]; ++j) cfgPath[plen++] = suffix[j];
+        cfgPath[plen] = '\0';
+
+        brook::Vnode* cfg = brook::VfsOpen(cfgPath);
+        if (cfg) {
+            char buf[256] = {};
+            uint64_t coff = 0;
+            int nr = brook::VfsRead(cfg, buf, sizeof(buf) - 1, &coff);
+            brook::VfsClose(cfg);
+            if (nr > 0)
+                brook::KPrintf("%s (%d bytes): %s", cfgPath, nr, buf);
+        }
+        return true;
+    }
+
+    brook::KPrintf("%s — remount at %s failed\n", label, mntPath);
+    return false;
+}
+
 // Global kernel CPU environment (needed to set syscall table after init).
 // Non-static so the scheduler can update syscallStack on context switch.
 KernelCpuEnv* g_kernelEnv = nullptr;
@@ -338,91 +411,15 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         for (uint32_t i = 0; i < vioCount; ++i)
         {
             char name[16] = "virtio";
-            // Simple uint-to-string for drive index.
             name[6] = static_cast<char>('0' + i);
             name[7] = '\0';
             brook::Device* vd = brook::DeviceFind(name);
             if (!vd) continue;
 
-            uint8_t pdrv = static_cast<uint8_t>(i + 1); // pdrv 1+ for virtio
-
-            // Try FAT first
-            brook::FatFsBindDrive(pdrv, vd);
-            bool mounted = brook::VfsMount("/mnt/probe", "fatfs", pdrv);
-            const char* fsType = "fatfs";
-
-            // If FAT failed, try ext2
-            if (!mounted) {
-                Ext2BindDevice(pdrv, vd);
-                mounted = brook::VfsMount("/mnt/probe", "ext2", pdrv);
-                fsType = "ext2";
-            }
-
-            if (!mounted)
-            {
-                brook::SerialPrintf("virtio: %s — no recognized filesystem\n", name);
-                continue;
-            }
-
-            // Read BROOK.MNT to discover the intended mount path.
-            brook::Vnode* mnt = brook::VfsOpen("/mnt/probe/BROOK.MNT");
-            if (!mnt)
-            {
-                brook::SerialPrintf("virtio: %s — no BROOK.MNT, skipping\n", name);
-                brook::VfsUnmount("/mnt/probe");
-                continue;
-            }
-
-            char mntPath[64] = {};
-            uint64_t off = 0;
-            int n = brook::VfsRead(mnt, mntPath, sizeof(mntPath) - 1, &off);
-            brook::VfsClose(mnt);
-
-            if (n <= 0)
-            {
-                brook::SerialPrintf("virtio: %s — BROOK.MNT empty\n", name);
-                continue;
-            }
-
-            // Strip trailing whitespace/newline from the path.
-            for (int j = n - 1; j >= 0; --j)
-            {
-                if (mntPath[j] == '\n' || mntPath[j] == '\r' || mntPath[j] == ' ')
-                    mntPath[j] = '\0';
-                else
-                    break;
-            }
-
-            // Remount at the target path.
-            brook::VfsUnmount("/mnt/probe");
-            if (brook::VfsMount(mntPath, fsType, pdrv))
-            {
-                brook::KPrintf("virtio: %s mounted at %s\n", name, mntPath);
-
-                // Read BROOK.CFG from the mounted volume as a sanity check.
-                char cfgPath[80] = {};
-                // Build "<mntPath>/BROOK.CFG"
-                uint32_t plen = 0;
-                while (mntPath[plen]) { cfgPath[plen] = mntPath[plen]; ++plen; }
-                const char* suffix = "/BROOK.CFG";
-                for (uint32_t j = 0; suffix[j]; ++j) cfgPath[plen++] = suffix[j];
-                cfgPath[plen] = '\0';
-
-                brook::Vnode* cfg = brook::VfsOpen(cfgPath);
-                if (cfg)
-                {
-                    char buf[256] = {};
-                    uint64_t coff = 0;
-                    int nr = brook::VfsRead(cfg, buf, sizeof(buf) - 1, &coff);
-                    brook::VfsClose(cfg);
-                    if (nr > 0)
-                        brook::KPrintf("virtio: %s (%d bytes): %s", cfgPath, nr, buf);
-                }
-            }
-            else
-            {
-                brook::KPrintf("virtio: %s — remount at %s failed\n", name, mntPath);
-            }
+            uint8_t pdrv = static_cast<uint8_t>(i + 1);
+            char label[24] = "virtio: ";
+            for (int j = 0; name[j]; ++j) label[8 + j] = name[j];
+            ProbeAndMountDevice(label, vd, pdrv);
         }
     }
 
@@ -454,6 +451,24 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::SerialPuts("module: Phase 2 — loading from /boot/drivers (virtio)\n");
     brook::ModuleDiscoverAndLoad("/boot/drivers");
     brook::SerialPuts("module: Phase 2 — done\n");
+
+    // ---- USB block devices: probe after xHCI module has loaded ----
+    // The xHCI module registers "usb0", "usb1", etc. as block devices.
+    // Use pdrv slots 7+ (virtio uses 1-6).
+    static constexpr uint8_t USB_PDRV_BASE = 7;
+    for (uint32_t i = 0; i < 2; ++i)
+    {
+        char name[8] = "usb";
+        name[3] = static_cast<char>('0' + i);
+        name[4] = '\0';
+        brook::Device* ud = brook::DeviceFind(name);
+        if (!ud) continue;
+
+        uint8_t pdrv = static_cast<uint8_t>(USB_PDRV_BASE + i);
+        char label[16] = "usb: ";
+        for (int j = 0; name[j]; ++j) label[5 + j] = name[j];
+        ProbeAndMountDevice(label, ud, pdrv);
+    }
 
     // ---- Network (static config from BROOK.CFG, or DHCP) ----
     if (brook::NetGetIf()) {
@@ -567,6 +582,11 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
         // Activate APs now — BSP is about to enter the scheduler.
         brook::SmpActivateAPs();
+
+        // GDT write-protect removed — iretq legitimately writes "accessed"
+        // bits to segment descriptors, which causes #PF on read-only GDT.
+        // The GDT corruption was a symptom of GS base being zero (BRO-013),
+        // not direct stray writes.
 
         // Run TLB shootdown self-test while all CPUs are online but before
         // user processes start — any failure here is a hard boot error.

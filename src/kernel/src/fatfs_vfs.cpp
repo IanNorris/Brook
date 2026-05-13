@@ -543,6 +543,10 @@ static int FatFsRename(void* /*mountPriv*/, uint8_t pdrv,
     BuildFatPath(fatOld, sizeof(fatOld), pdrv, oldRelPath);
     BuildFatPath(fatNew, sizeof(fatNew), pdrv, newRelPath);
     KMutexLock(&g_fatLock);
+    // POSIX rename atomically replaces destination; FatFS f_rename fails if
+    // destination exists.  Delete the target first (ignore errors — it may
+    // not exist).
+    f_unlink(fatNew);
     FRESULT res = f_rename(fatOld, fatNew);
     KMutexUnlock(&g_fatLock);
     return (res == FR_OK) ? 0 : -1;
@@ -571,3 +575,10 @@ void FatFsVfsRegister()
 }
 
 } // namespace brook
+
+extern "C" void FatFsDumpLockState()
+{
+    brook::SerialPrintf("  fatLock: locked=%u owner=%u waitHead=%p\n",
+                        brook::g_fatLock.locked, brook::g_fatLock.ownerPid,
+                        brook::g_fatLock.waitHead);
+}

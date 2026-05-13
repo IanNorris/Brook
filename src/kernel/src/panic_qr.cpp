@@ -34,7 +34,9 @@ static uint32_t BuildPanicPayload(uint8_t* buf, uint32_t bufLen,
                                   const PanicCPURegs* regs,
                                   const PanicStackTrace* trace,
                                   const PanicExceptionInfo* excInfo,
-                                  const PanicProcessList* procList)
+                                  const PanicProcessList* procList,
+                                  const PanicSystemInfo* sysInfo,
+                                  const PanicStackDump* stackDump)
 {
     uint32_t tracePayloadSize = 1 + trace->depth * 8;
 
@@ -42,6 +44,8 @@ static uint32_t BuildPanicPayload(uint8_t* buf, uint32_t bufLen,
                     + sizeof(PanicPacketHeader) + tracePayloadSize;
     if (excInfo) needed += sizeof(PanicPacketHeader) + sizeof(PanicExceptionInfo);
     if (procList) needed += sizeof(PanicPacketHeader) + 1 + procList->count * sizeof(PanicProcessEntry);
+    if (sysInfo) needed += sizeof(PanicPacketHeader) + sizeof(PanicSystemInfo);
+    if (stackDump) needed += sizeof(PanicPacketHeader) + 8 + 2 + stackDump->length;
 
     if (bufLen < needed) return 0;
 
@@ -86,6 +90,27 @@ static uint32_t BuildPanicPayload(uint8_t* buf, uint32_t bufLen,
         buf[off++] = procList->count;
         for (uint8_t i = 0; i < procList->count; i++)
             appendRaw(&procList->entries[i], sizeof(PanicProcessEntry));
+    }
+
+    // Packet 5: System info (optional)
+    if (sysInfo)
+    {
+        ph.type = QR_PACKET_TYPE_SYSTEM_INFO;
+        ph.size = sizeof(PanicSystemInfo);
+        appendRaw(&ph, sizeof(ph));
+        appendRaw(sysInfo, sizeof(PanicSystemInfo));
+    }
+
+    // Packet 6: Stack dump (optional)
+    if (stackDump && stackDump->length > 0)
+    {
+        uint32_t sdSize = 8 + 2 + stackDump->length;  // rsp + length + data
+        ph.type = QR_PACKET_TYPE_STACK_DUMP;
+        ph.size = sdSize;
+        appendRaw(&ph, sizeof(ph));
+        appendRaw(&stackDump->rsp, 8);
+        appendRaw(&stackDump->length, 2);
+        appendRaw(stackDump->data, stackDump->length);
     }
 
     return off;
@@ -180,7 +205,9 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
                    uint32_t fbStride, const PanicCPURegs* regs,
                    const PanicStackTrace* trace,
                    const PanicExceptionInfo* excInfo,
-                   const PanicProcessList* procList)
+                   const PanicProcessList* procList,
+                   const PanicSystemInfo* sysInfo,
+                   const PanicStackDump* stackDump)
 {
     // Auto-select pixels per module based on display resolution
     // Low-DPI devices (e.g. Surface Go at 1024x768) need larger modules
@@ -193,7 +220,8 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
     // Step 1: Build binary TLV payload (no header yet — added per page)
     static uint8_t payloadBuf[2048];
     uint32_t payloadLen = BuildPanicPayload(payloadBuf, sizeof(payloadBuf),
-                                            regs, trace, excInfo, procList);
+                                            regs, trace, excInfo, procList,
+                                            sysInfo, stackDump);
     if (payloadLen == 0)
     {
         SerialPuts("PANIC QR: payload build failed\n");

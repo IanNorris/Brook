@@ -14,6 +14,7 @@
 #include "sched_ops.h"
 #include "profiler.h"
 #include "device.h"
+#include "sync/krwlock.h"
 
 #include <stdint.h>
 
@@ -28,6 +29,12 @@ extern "C" void context_switch(brook::SavedContext* oldCtx, brook::SavedContext*
 // Futex wake — implemented in syscall.cpp, called for clear_child_tid on thread exit
 extern "C" int64_t FutexWake(uint64_t owner, uint64_t uaddr, uint32_t maxWake,
                               uint32_t wake_bitset = 0xFFFFFFFFu);
+
+// Ext2 lock state diagnostic — implemented in ext2_vfs.cpp
+extern "C" void Ext2DumpLockState();
+
+// FatFS lock state diagnostic — implemented in fatfs_vfs.cpp
+extern "C" void FatFsDumpLockState();
 
 // Enter user mode for the first time (existing function in syscall.cpp).
 namespace brook { void SwitchToUserMode(uint64_t userRsp, uint64_t userRip); }
@@ -987,12 +994,43 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
     if (oldProc != newProc)
         __atomic_and_fetch(&oldProc->tlbCpuMask, ~(1ULL << cpu), __ATOMIC_RELEASE);
 
+    // Update per-CPU currentCr3 so TLB shootdown can determine which CPUs
+    // are running a given address space (critical for CoW fork correctness).
+    SmpSetCurrentCr3(cpu, newProc->savedCtx.cr3);
+
     ProfilerContextSwitch(oldProc->pid, newProc->pid);
+
+    // GS base diagnostic: catch stray SWAPGS around context switches.
+    {
+        uint64_t gsb = ReadMsr(0xC0000101);  // MSR_GS_BASE
+        if (gsb == 0) {
+            uint64_t kgsb = ReadMsr(0xC0000102);
+            SerialPrintf("!!! GS_BASE=0 PRE-switch cpu=%u old=%s(%u) new=%s(%u) KERNEL_GS=0x%lx\n",
+                         cpu, oldProc->name, oldProc->pid,
+                         newProc->name, newProc->pid, kgsb);
+            // Auto-fix so we can keep running and gather more data
+            if (kgsb) { WriteMsr(0xC0000101, kgsb); WriteMsr(0xC0000102, 0); }
+        }
+    }
+
     context_switch(&oldProc->savedCtx, &newProc->savedCtx,
                    &oldProc->fxsave, &newProc->fxsave,
                    &oldProc->runningOnCpu);
 
     // --- We return here when another CPU (or this one) switches back to us ---
+
+    // GS base diagnostic: catch stray SWAPGS after resuming on this CPU.
+    {
+        uint64_t gsb = ReadMsr(0xC0000101);
+        if (gsb == 0) {
+            uint64_t kgsb = ReadMsr(0xC0000102);
+            uint32_t resumeCpu = ThisCpu();
+            SerialPrintf("!!! GS_BASE=0 POST-switch cpu=%u KERNEL_GS=0x%lx\n",
+                         resumeCpu, kgsb);
+            if (kgsb) { WriteMsr(0xC0000101, kgsb); WriteMsr(0xC0000102, 0); }
+        }
+    }
+
     DrainPostSwitch(ThisCpu());
 }
 
@@ -1221,6 +1259,10 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
 {
     uint32_t cpu = ThisCpu();
     Process* proc = g_perCpu[cpu].currentProcess;
+
+    // Release any held kernel rwlocks / remove from wait queues.
+    KRwLockCleanupOnExit(proc);
+
     char procName[33];
     CopyProcessNameForLog(proc, procName);
     if (status != 0) {
@@ -1544,6 +1586,44 @@ Process* ProcessCurrent()
     // read 0 — fall through to the array path so very-early callers
     // (kernel init code that uses ProcessCurrent before scheduler is
     // running) still work.
+
+    // GS base diagnostic: if MSR_GS_BASE is zero a stray SWAPGS has
+    // swapped it with the (zero) KERNEL_GS_BASE.  Detect and auto-fix
+    // before the gs-relative load reads from address 0xb8.
+    {
+        uint32_t lo, hi;
+        __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000101u));
+        uint64_t gsBase = (static_cast<uint64_t>(hi) << 32) | lo;
+        if (__builtin_expect(gsBase == 0, 0))
+        {
+            // Read KERNEL_GS_BASE — should hold the env pointer.
+            uint32_t klo, khi;
+            __asm__ volatile("rdmsr" : "=a"(klo), "=d"(khi) : "c"(0xC0000102u));
+            uint64_t kgsBase = (static_cast<uint64_t>(khi) << 32) | klo;
+
+            // Log with a mini-backtrace.
+            uint64_t rbp;
+            __asm__ volatile("movq %%rbp, %0" : "=r"(rbp));
+            SerialPrintf("!!! GS_BASE=0 in ProcessCurrent! KERNEL_GS=0x%lx\n", kgsBase);
+            SerialPrintf("!!!   callers:");
+            for (int i = 0; i < 8 && rbp >= 0xFFFF800000000000ULL; i++) {
+                uint64_t ret = reinterpret_cast<uint64_t*>(rbp)[1];
+                SerialPrintf(" 0x%lx", ret);
+                rbp = reinterpret_cast<uint64_t*>(rbp)[0];
+            }
+            SerialPrintf("\n");
+
+            // Auto-fix: restore GS_BASE from KERNEL_GS_BASE.
+            if (kgsBase) {
+                WriteMsr(0xC0000101, kgsBase);
+                WriteMsr(0xC0000102, 0);
+            } else {
+                // Both zero — can't recover, fall through to array path.
+                return g_perCpu[ThisCpu()].currentProcess;
+            }
+        }
+    }
+
     uint64_t cur;
     __asm__ volatile("movq %%gs:184, %0" : "=r"(cur));
     if (cur)
@@ -1646,6 +1726,8 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus)
     for (uint32_t i = 0; i < count; ++i)
     {
         Process* p = targets[i];
+        // Release any kernel rwlocks held by (or waited on by) this thread.
+        KRwLockCleanupOnExit(p);
         p->state     = ProcessState::Terminated;
         p->exitStatus = exitStatus;
         // Threads that are not yet reapable will be reaped by the scheduler
@@ -2119,6 +2201,32 @@ Process* PanicGetProcess(uint32_t index)
 {
     if (index >= g_processCount) return nullptr;
     return g_allProcesses[index];
+}
+
+void SchedulerDumpThreadStates()
+{
+    static const char* stateNames[] = {
+        "READY", "RUNNING", "BLOCKED", "ZOMBIE", "STOPPED", "SLEEPING"
+    };
+    SerialPrintf("\n=== THREAD STATE DUMP ===\n");
+    uint64_t flags = SchedLockAcquire(g_allProcLock);
+    for (uint32_t i = 0; i < g_processCount; ++i)
+    {
+        Process* p = g_allProcesses[i];
+        if (!p) continue;
+        const char* st = "?";
+        int si = static_cast<int>(p->state);
+        if (si >= 0 && si <= 5) st = stateNames[si];
+        SerialPrintf("  pid=%u tgid=%u '%s' state=%s cpu=%d syscall=%lu wakeup=%lu\n",
+                     p->pid, p->tgid, p->name, st,
+                     p->runningOnCpu, p->currentSyscallNum, p->wakeupTick);
+    }
+    extern volatile uint64_t g_lapicTickCount;
+    SerialPrintf("  now=%lu\n", g_lapicTickCount);
+    Ext2DumpLockState();
+    FatFsDumpLockState();
+    SerialPrintf("=========================\n\n");
+    SchedLockRelease(g_allProcLock, flags);
 }
 
 } // namespace brook

@@ -12,6 +12,7 @@
 #include "serial.h"
 #include "kprintf.h"
 #include "portio.h"
+#include "irq_wrapper.h"
 
 namespace brook {
 
@@ -77,10 +78,8 @@ static InputDevice    g_mouseInputDev = { &g_mouseOps, {}, 0, 0, nullptr };
 // IRQ12 interrupt handler
 // ---------------------------------------------------------------------------
 
-__attribute__((interrupt))
-static void MouseIrqHandler(InterruptFrame* frame)
+static void MouseIrqHandlerInner(void)
 {
-    (void)frame;
 
     // On IOAPIC-based systems, IRQ12 fires specifically for mouse data.
     // Check that output buffer is full (bit 0 OBF). We intentionally do NOT
@@ -251,6 +250,10 @@ static void MouseIrqHandler(InterruptFrame* frame)
 
     ApicSendEoi();
 }
+
+// Naked ISR wrapper — handles SWAPGS + GPR save/restore around the inner handler.
+IRQ_NAKED_HANDLER(MouseIrqHandler, MouseIrqHandlerInner)
+
 // ---------------------------------------------------------------------------
 
 void MouseInit()

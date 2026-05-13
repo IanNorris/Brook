@@ -31,7 +31,10 @@ static uint64_t g_freePages  = 0;
 static uint64_t g_nextHint   = 0;       // search hint for fast sequential alloc
 
 // SMP lock protecting the bitmap, free count, and page descriptors.
-static SpinLock g_pmmLock;
+// IrqSpinLock: memory allocation can be called from any context, and a timer
+// interrupt preempting a lock holder would deadlock if the new thread tries
+// the same lock on the same CPU.
+static IrqSpinLock g_pmmLock;
 
 // ---------------------------------------------------------------------------
 // Ownership tracking — dynamically allocated after PmmEnableTracking().
@@ -224,7 +227,7 @@ void PmmInit(const BootProtocol* proto)
 
 PhysicalAddress PmmAllocPage(MemTag tag, uint16_t pid)
 {
-    SpinLockAcquire(&g_pmmLock);
+    uint64_t pmmFlags = IrqSpinLockAcquire(&g_pmmLock);
 
     // Search from hint forward, then wrap around once.
     uint64_t startWord = g_nextHint / 64;
@@ -242,17 +245,17 @@ PhysicalAddress PmmAllocPage(MemTag tag, uint16_t pid)
             // Find first free bit in this word.
             int bit = __builtin_ctzll(~g_bitmap[w]);
             uint64_t idx = w * 64 + static_cast<uint64_t>(bit);
-            if (idx >= g_totalPages) { SpinLockRelease(&g_pmmLock); return PhysicalAddress{}; }
+            if (idx >= g_totalPages) { IrqSpinLockRelease(&g_pmmLock, pmmFlags); return PhysicalAddress{}; }
 
             SetUsed(idx);
             g_freePages--;
             g_nextHint = idx + 1;
             TrackAlloc(static_cast<uint32_t>(idx), tag, pid);
-            SpinLockRelease(&g_pmmLock);
+            IrqSpinLockRelease(&g_pmmLock, pmmFlags);
             return PhysicalAddress(idx * PAGE_SIZE);
         }
     }
-    SpinLockRelease(&g_pmmLock);
+    IrqSpinLockRelease(&g_pmmLock, pmmFlags);
     return PhysicalAddress{}; // out of memory
 }
 
@@ -261,7 +264,7 @@ PhysicalAddress PmmAllocPages(uint64_t count, MemTag tag, uint16_t pid)
     if (count == 0) return PhysicalAddress{};
     if (count == 1) return PmmAllocPage(tag, pid);
 
-    SpinLockAcquire(&g_pmmLock);
+    uint64_t pmmFlags = IrqSpinLockAcquire(&g_pmmLock);
 
     // Linear scan for a contiguous run of 'count' free pages.
     uint64_t runStart = 0;
@@ -281,7 +284,7 @@ PhysicalAddress PmmAllocPages(uint64_t count, MemTag tag, uint16_t pid)
                     g_freePages--;
                     TrackAlloc(static_cast<uint32_t>(runStart + i), tag, pid);
                 }
-                SpinLockRelease(&g_pmmLock);
+                IrqSpinLockRelease(&g_pmmLock, pmmFlags);
                 return PhysicalAddress(runStart * PAGE_SIZE);
             }
         }
@@ -290,7 +293,7 @@ PhysicalAddress PmmAllocPages(uint64_t count, MemTag tag, uint16_t pid)
             runLen = 0;
         }
     }
-    SpinLockRelease(&g_pmmLock);
+    IrqSpinLockRelease(&g_pmmLock, pmmFlags);
     return PhysicalAddress{}; // no contiguous run found
 }
 
@@ -302,15 +305,15 @@ void PmmFreePage(PhysicalAddress physAddr)
     uint64_t idx = physAddr.raw() / PAGE_SIZE;
     if (idx >= g_totalPages) return;
 
-    SpinLockAcquire(&g_pmmLock);
+    uint64_t pmmFlags = IrqSpinLockAcquire(&g_pmmLock);
 
-    if (!IsUsed(idx)) { SpinLockRelease(&g_pmmLock); return; }
+    if (!IsUsed(idx)) { IrqSpinLockRelease(&g_pmmLock, pmmFlags); return; }
 
     // If refcounted and shared, just decrement — don't free yet
     if (g_pageDescs && Desc(static_cast<uint32_t>(idx)).refCount > 1)
     {
         Desc(static_cast<uint32_t>(idx)).refCount--;
-        SpinLockRelease(&g_pmmLock);
+        IrqSpinLockRelease(&g_pmmLock, pmmFlags);
         return;
     }
 
@@ -327,7 +330,7 @@ void PmmFreePage(PhysicalAddress physAddr)
         d.refCount = 0;
     }
 
-    SpinLockRelease(&g_pmmLock);
+    IrqSpinLockRelease(&g_pmmLock, pmmFlags);
 }
 
 MemTag PmmGetTag(PhysicalAddress physAddr)
@@ -357,13 +360,13 @@ void PmmRefPage(PhysicalAddress physAddr)
     if (idx64 >= g_totalPages) return;
     uint32_t idx = static_cast<uint32_t>(idx64);
 
-    SpinLockAcquire(&g_pmmLock);
+    uint64_t pmmFlags = IrqSpinLockAcquire(&g_pmmLock);
     auto& d = Desc(idx);
     if (d.refCount == 0)
         d.refCount = 2;  // legacy page: count existing owner + new sharer
     else if (d.refCount < 255)
         d.refCount++;
-    SpinLockRelease(&g_pmmLock);
+    IrqSpinLockRelease(&g_pmmLock, pmmFlags);
 }
 
 void PmmUnrefPage(PhysicalAddress physAddr)
@@ -373,12 +376,12 @@ void PmmUnrefPage(PhysicalAddress physAddr)
     if (idx64 >= g_totalPages) return;
     uint32_t idx = static_cast<uint32_t>(idx64);
 
-    SpinLockAcquire(&g_pmmLock);
+    uint64_t pmmFlags = IrqSpinLockAcquire(&g_pmmLock);
     auto& d = Desc(idx);
     if (d.refCount > 1)
     {
         d.refCount--;
-        SpinLockRelease(&g_pmmLock);
+        IrqSpinLockRelease(&g_pmmLock, pmmFlags);
         return; // still shared, don't free
     }
     // refCount is 0 or 1 — this was the last (or only) reference, actually free
@@ -391,7 +394,7 @@ void PmmUnrefPage(PhysicalAddress physAddr)
     ListRemove(idx);
     d = { PMM_NULL_PAGE, PMM_NULL_PAGE, 0,
           static_cast<uint8_t>(MemTag::Free), 0 };
-    SpinLockRelease(&g_pmmLock);
+    IrqSpinLockRelease(&g_pmmLock, pmmFlags);
 }
 
 uint8_t PmmGetRefCount(PhysicalAddress physAddr)
@@ -463,7 +466,7 @@ void PmmKillPid(uint16_t pid)
     if (!g_pageDescs) return;
     if (pid == KernelPid) return;  // never kill kernel pages
 
-    SpinLockAcquire(&g_pmmLock);
+    uint64_t pmmFlags = IrqSpinLockAcquire(&g_pmmLock);
 
     uint32_t idx = g_pidLists[pid].head;
     [[maybe_unused]] uint32_t count = 0;
@@ -499,7 +502,7 @@ void PmmKillPid(uint16_t pid)
 
     g_pidLists[pid] = { PMM_NULL_PAGE, PMM_NULL_PAGE, 0, 0 };
 
-    SpinLockRelease(&g_pmmLock);
+    IrqSpinLockRelease(&g_pmmLock, pmmFlags);
 
     DbgPrintf("PMM: PmmKillPid(%u): processed %u pages (%u shared, refcount decremented)\n",
                  static_cast<uint32_t>(pid), count, shared);
@@ -510,7 +513,7 @@ void PmmFreeByTag(uint16_t pid, MemTag tag)
     if (!g_pageDescs) return;
     if (pid == KernelPid) return;
 
-    SpinLockAcquire(&g_pmmLock);
+    uint64_t pmmFlags = IrqSpinLockAcquire(&g_pmmLock);
 
     uint32_t idx = g_pidLists[pid].head;
     uint32_t count = 0;
@@ -545,7 +548,7 @@ void PmmFreeByTag(uint16_t pid, MemTag tag)
         idx = next;
     }
 
-    SpinLockRelease(&g_pmmLock);
+    IrqSpinLockRelease(&g_pmmLock, pmmFlags);
 
     (void)count;
     DbgPrintf("PMM: PmmFreeByTag(%u, %u): freed %u pages\n",

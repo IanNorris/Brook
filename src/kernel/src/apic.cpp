@@ -180,11 +180,127 @@ volatile uint64_t g_lapicTickCount = 0;
 // Forward-declare scheduler tick (defined in scheduler.cpp).
 void SchedulerTimerTick(bool allowPreempt);
 
+// Forward-declare thread state dump (defined in scheduler.cpp).
+void SchedulerDumpThreadStates();
+
 // Forward-declare profiler sample (defined in profiler.cpp).
 void ProfilerSample(uint64_t interruptedRip, uint64_t interruptedCs, uint64_t interruptedRbp);
 
 // Forward-declare RTC recalibration (defined in rtc.cpp).
 void RtcRecalibrateLapic();
+
+// Validate the iret frame on the stack before iretq.  Called from the naked
+// timer ISR after LapicTimerHandlerInner returns but before we pop registers.
+// The iret frame starts 120 bytes above the current RSP (15 pushed GPRs).
+//
+// frame layout: [RIP, CS, RFLAGS, RSP, SS]  (each 8 bytes)
+extern "C" __attribute__((used))
+void ValidateIretFrame(const uint64_t* frame)
+{
+    uint64_t rip    = frame[0];
+    uint64_t cs     = frame[1];
+    uint64_t rflags = frame[2];
+    uint64_t rsp    = frame[3];
+    uint64_t ss     = frame[4];
+
+    bool bad = false;
+
+    // Validate CS is a known selector
+    if (cs != 0x08 && cs != 0x2B && cs != 0x28)
+    {
+        SerialPrintf("!!! IRET VALIDATE: bad CS=0x%lx\n", cs);
+        bad = true;
+    }
+
+    // Validate SS matches expected value for the privilege level
+    uint64_t expectedSs = (cs & 3) ? 0x23 : 0x10;
+    if (ss != expectedSs && ss != 0)
+    {
+        SerialPrintf("!!! IRET VALIDATE: bad SS=0x%lx (expected 0x%lx) CS=0x%lx\n",
+                     ss, expectedSs, cs);
+        bad = true;
+    }
+
+    // Validate RIP is canonical
+    uint64_t ripTop = rip >> 47;
+    if (ripTop != 0 && ripTop != 0x1FFFF)
+    {
+        SerialPrintf("!!! IRET VALIDATE: non-canonical RIP=0x%lx\n", rip);
+        bad = true;
+    }
+
+    // Validate RSP is canonical
+    uint64_t rspTop = rsp >> 47;
+    if (rspTop != 0 && rspTop != 0x1FFFF)
+    {
+        SerialPrintf("!!! IRET VALIDATE: non-canonical RSP=0x%lx\n", rsp);
+        bad = true;
+    }
+
+    // Check GDT entry for SS=0x10 (kernel data segment)
+    // Read GDTR to get GDT base
+    struct { uint16_t limit; uint64_t base; } __attribute__((packed)) gdtr;
+    __asm__ volatile("sgdt %0" : "=m"(gdtr));
+    auto* gdt = reinterpret_cast<const uint8_t*>(gdtr.base);
+    // GDT[2] = offset 0x10, access byte is at offset 5 within the entry
+    uint8_t access = gdt[0x10 + 5];
+    if (access != 0x92 && access != 0x93)
+    {
+        SerialPrintf("!!! IRET VALIDATE: GDT[2] access=0x%x (expected 0x92/0x93)\n",
+                     access);
+        bad = true;
+    }
+
+    if (bad)
+    {
+        SerialPrintf("!!! IRET frame: RIP=0x%lx CS=0x%lx RFLAGS=0x%lx RSP=0x%lx SS=0x%lx\n",
+                     rip, cs, rflags, rsp, ss);
+        SerialPrintf("!!! GDT base=0x%lx limit=0x%x\n", gdtr.base, gdtr.limit);
+        // Dump GDT entries 0-5
+        auto* gdtEntries = reinterpret_cast<const uint64_t*>(gdtr.base);
+        for (int i = 0; i < 6; i++)
+            SerialPrintf("!!!   GDT[%d] = 0x%016lx\n", i, gdtEntries[i]);
+
+        // Halt this CPU
+        __asm__ volatile("cli\n\thlt");
+    }
+}
+
+// Check that GS base (MSR 0xC0000101) is non-zero.  In kernel mode it must
+// point to the per-CPU KernelCpuEnv — zero means a stray SWAPGS has swapped
+// it with the (zero-initialised) MSR_KERNEL_GS_BASE.
+static void ValidateGsBase(const char* where)
+{
+    uint64_t gsBase = ReadMsr(0xC0000101);
+    if (gsBase == 0)
+    {
+        // Also read KERNEL_GS_BASE — if it holds our env pointer the swap
+        // direction is confirmed.
+        uint64_t kgsBase = ReadMsr(0xC0000102);
+        uint8_t cpuId = static_cast<uint8_t>(LapicRead(LapicReg::ID) >> 24);
+        SerialPrintf("!!! GS_BASE=0 at %s on LAPIC-ID %u  KERNEL_GS_BASE=0x%lx\n",
+                     where, cpuId, kgsBase);
+
+        // Capture a mini-backtrace for the serial log.
+        uint64_t rbp;
+        __asm__ volatile("movq %%rbp, %0" : "=r"(rbp));
+        SerialPrintf("!!!   RBP chain:");
+        for (int i = 0; i < 10 && rbp >= 0xFFFF800000000000ULL; i++) {
+            uint64_t ret = reinterpret_cast<uint64_t*>(rbp)[1];
+            SerialPrintf(" 0x%lx", ret);
+            rbp = reinterpret_cast<uint64_t*>(rbp)[0];
+        }
+        SerialPrintf("\n");
+
+        // Don't halt — restore GS so we can keep running and gather more info.
+        // Swap back: move the env ptr from KERNEL_GS_BASE to GS_BASE.
+        if (kgsBase != 0) {
+            WriteMsr(0xC0000101, kgsBase);
+            WriteMsr(0xC0000102, 0);
+            SerialPrintf("!!! GS_BASE restored to 0x%lx — continuing\n", kgsBase);
+        }
+    }
+}
 
 // C handler called from the naked ISR wrapper below.
 // interruptedRip/interruptedCs/interruptedRbp are passed from the naked
@@ -193,6 +309,9 @@ static void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interrupted
                                     uint64_t interruptedRbp)
 {
     LapicWrite(LapicReg::EOI, 0);
+
+    // Check GS base on every timer tick (1ms) — catches stray SWAPGS fast.
+    ValidateGsBase("timer-tick");
 
     // Only BSP maintains the global tick and composites framebuffers.
     // Using LAPIC ID check (cheaper than SmpCurrentCpuIndex).
@@ -285,6 +404,11 @@ static void LapicTimerHandler(void)
         "cld\n\t"
         "call %P0\n\t"
 
+        // Validate iret frame before restoring GPRs.
+        // The frame is at RSP+120 (15 pushed regs × 8 bytes).
+        "leaq 120(%%rsp), %%rdi\n\t"
+        "call %P1\n\t"
+
         // Restore GPRs
         "pop %%r15\n\t"
         "pop %%r14\n\t"
@@ -309,7 +433,7 @@ static void LapicTimerHandler(void)
         "2:\n\t"
         "iretq\n\t"
         :
-        : "i"(LapicTimerHandlerInner)
+        : "i"(LapicTimerHandlerInner), "i"(ValidateIretFrame)
         : "memory"
     );
 }
@@ -678,7 +802,7 @@ static TlbShootdownRequest g_tlbRequest;
 
 // Timeout for the spin-wait: ~10ms at 2.5GHz ≈ 25M iterations of pause loop.
 // Each pause is ~10-100 cycles, so 500K iterations ≈ 5-50ms.
-static constexpr uint64_t TLB_SHOOTDOWN_TIMEOUT = 500000;
+static constexpr uint64_t TLB_SHOOTDOWN_TIMEOUT = 10000000; // ~10ms at 1GHz loop
 
 static void TlbShootdownHandlerInner()
 {
@@ -837,13 +961,11 @@ static void TlbShootdownTimeoutPanic(uint32_t myCpu, uint64_t targetMask,
 }
 
 // Common spin-wait with timeout and graceful retry.
-// If a CPU doesn't ack within the timeout, forgive it — it's likely in
-// SchedLock (IF=0) and will either switch CR3 (natural TLB flush) or
-// sti soon and handle the IPI. This is safe because:
-//   - If the CPU switches away from our CR3, the TLB is flushed by the
-//     CR3 write during context switch.
-//   - If the CPU stays on our CR3, it will sti when SchedLock releases,
-//     delivering the queued IPI (the handler is idempotent).
+// If a CPU doesn't ack within the timeout, forgive it — but ONLY if it's
+// not running the target CR3. A CPU on a different CR3 will flush its TLB
+// naturally when it switches back. A CPU on the target CR3 with stale
+// entries is dangerous (e.g., stale writable entry after CoW fork), so
+// we keep waiting for those.
 static void TlbShootdownWait(uint32_t myCpu, uint64_t targetMask,
                               uint64_t targetCr3, uint64_t addr)
 {
@@ -856,28 +978,52 @@ static void TlbShootdownWait(uint32_t myCpu, uint64_t targetMask,
             uint64_t ackBitmap = __atomic_load_n(&g_tlbRequest.ackBitmap, __ATOMIC_ACQUIRE);
             uint64_t notAcked = targetMask & ~ackBitmap;
 
-            // Forgive all non-acking CPUs: decrement pendingCount and
-            // set their ack bits so we can proceed. The queued IPI will
-            // still be delivered when the CPU does sti — the handler
-            // sees pendingCount already 0 and the extra sub wraps, but
-            // that's harmless since we hold g_tlbRequest.lock and will
-            // reinitialise before the next shootdown.
+            // Only forgive CPUs that are NOT currently running the target
+            // CR3. Those CPUs will flush their TLB on the next context
+            // switch (CR3 reload). CPUs still on the target CR3 must ack
+            // to guarantee no stale writable entries remain (critical for
+            // CoW fork correctness).
             uint32_t forgiven = 0;
+            uint32_t stillWaiting = 0;
             uint32_t cpuCount = SmpGetCpuCount();
             for (uint32_t i = 0; i < cpuCount; i++)
             {
                 if (!(notAcked & (1ULL << i))) continue;
-                __atomic_fetch_sub(&g_tlbRequest.pendingCount, 1, __ATOMIC_ACQ_REL);
-                __atomic_fetch_or(&g_tlbRequest.ackBitmap, 1ULL << i, __ATOMIC_RELAXED);
-                forgiven++;
+
+                // Read the CPU's current CR3 from per-CPU data.
+                const CpuInfo* info = SmpGetCpu(i);
+                uint64_t cpuCr3 = info ? __atomic_load_n(&info->currentCr3, __ATOMIC_ACQUIRE) : 0;
+                bool onTargetCr3 = cpuCr3 && ((cpuCr3 & ~0xFFFULL) == (targetCr3 & ~0xFFFULL));
+
+                if (!onTargetCr3)
+                {
+                    __atomic_fetch_sub(&g_tlbRequest.pendingCount, 1, __ATOMIC_ACQ_REL);
+                    __atomic_fetch_or(&g_tlbRequest.ackBitmap, 1ULL << i, __ATOMIC_RELAXED);
+                    forgiven++;
+                }
+                else
+                {
+                    stillWaiting++;
+                }
             }
 
-            if (forgiven > 0)
+            if (forgiven > 0 && stillWaiting == 0)
             {
-                SerialPrintf("TLB_SHOOTDOWN: forgave %u non-acking CPU(s) (likely in SchedLock), cr3=0x%lx addr=0x%lx\n",
+                SerialPrintf("TLB_SHOOTDOWN: forgave %u CPU(s) (different CR3), cr3=0x%lx addr=0x%lx\n",
                              forgiven, targetCr3, addr);
+                break;
             }
-            break;
+            else if (forgiven > 0 || stillWaiting > 0)
+            {
+                SerialPrintf("TLB_SHOOTDOWN: forgave %u, waiting for %u on target CR3=0x%lx\n",
+                             forgiven, stillWaiting, targetCr3);
+                // Reset spin counter to keep waiting for CPUs on target CR3
+                spins = 0;
+            }
+            else
+            {
+                break;
+            }
         }
     }
 }

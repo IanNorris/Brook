@@ -428,6 +428,17 @@ static void VirtioInputPoll(InputDevice* /*dev*/)
     if (!g_usedIdx)
         return;
 
+    // DEBUG: one-time dump of virtio ring pointers and first read
+    static bool s_once = false;
+    if (!s_once) {
+        s_once = true;
+        uint16_t val = *g_usedIdx;
+        SerialPrintf("VIRTIO_POLL_INIT: g_usedIdx=%p *g_usedIdx=%u shadow=%u "
+                     "g_usedPhys=0x%lx g_queueSize=%u\n",
+                     g_usedIdx, val, g_usedIdxShadow, g_usedPhys, g_queueSize);
+    }
+
+    uint32_t count = 0;
     while (g_usedIdxShadow != *g_usedIdx)
     {
         uint16_t slot = g_usedIdxShadow & (g_queueSize - 1);
@@ -438,6 +449,17 @@ static void VirtioInputPoll(InputDevice* /*dev*/)
             RepostDescriptor(static_cast<uint16_t>(descIdx));
         }
         g_usedIdxShadow++;
+        count++;
+    }
+
+    // DEBUG: report when virtio-tablet events are drained
+    if (count > 0)
+    {
+        static volatile uint32_t s_pollHits = 0;
+        uint32_t n = ++s_pollHits;
+        if (n <= 10 || (n & 0x3FF) == 0)
+            SerialPrintf("VIRTIO_INPUT_POLL: drained %u events (total polls with data: %u)\n",
+                         count, n);
     }
 }
 

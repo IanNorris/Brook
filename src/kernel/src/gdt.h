@@ -82,3 +82,7 @@ void GdtSetTssRsp0ForCpu(uint32_t cpuIndex, uint64_t stackTop);
 
 // Get the TSS for a specific CPU.
 Tss64* GdtGetTss(uint32_t cpuIndex);
+
+// Write-protect the GDT page(s) after all APs have booted.
+// Any stray write will trigger a #PF at the offending instruction.
+void GdtWriteProtect();
