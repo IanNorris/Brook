@@ -455,7 +455,9 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
             }
             int32_t shx = s->cursor_hot_x * (int32_t)dw / w;
             int32_t shy = s->cursor_hot_y * (int32_t)dh / h;
-            wm_set_cursor_image(buf, dw, dh, shx, shy);
+            long rc = wm_set_cursor_image(buf, dw, dh, shx, shy);
+            fprintf(stderr, "[waylandd] cursor commit: %dx%d fmt=%s hot=(%d,%d) rc=%ld px[0]=0x%08x\n",
+                    dw, dh, force_opaque ? "XRGB" : "ARGB", shx, shy, rc, buf[0]);
             wl_shm_buffer_end_access(shm);
         }
         wl_buffer_send_release(s->pending_buffer);
@@ -1188,6 +1190,7 @@ static void pointer_set_cursor(struct wl_client *c, struct wl_resource *r,
         if (cs && cs->pending_buffer) {
             struct wl_shm_buffer *shm = wl_shm_buffer_get(cs->pending_buffer);
             if (shm) {
+                fprintf(stderr, "[waylandd] set_cursor: buf attached, uploading immediately\n");
                 int32_t w = wl_shm_buffer_get_width(shm);
                 int32_t h = wl_shm_buffer_get_height(shm);
                 if (w > 0 && h > 0) {
@@ -1705,31 +1708,30 @@ static void pump_input_for_surface(struct brook_surface *s) {
             uint32_t st = (e->type == EVT_KEY_PRESS)
                             ? WL_KEYBOARD_KEY_STATE_PRESSED
                             : WL_KEYBOARD_KEY_STATE_RELEASED;
-            /* Send the key event first, then modifiers (per Wayland spec).
-             * xkbcommon clients call xkb_state_update_key() on the key event
-             * which internally updates modifier state; the subsequent
-             * modifiers event confirms or corrects that state. Sending
-             * modifiers before the key causes double-toggling. */
-            wl_keyboard_send_key(sc->keyboard, next_serial(), now,
-                                 scancode_to_xkb(e->scan), st);
+
             /* Translate kernel's modifier bitmask to xkb modifier indices.
              * Order matches our keymap's modifier_map: Shift=0, Lock=1,
-             * Control=2, Mod1(Alt)=3.  Without this, clients (e.g. GTK
-             * via xkbcommon) never see Shift held and silently drop
-             * shifted keys. */
+             * Control=2, Mod1(Alt)=3. */
             uint32_t depressed = 0;
             uint32_t locked    = 0;
             if (e->mods & 0x03) depressed |= (1u << 0); /* Shift */
             if (e->mods & 0x04) depressed |= (1u << 2); /* Control */
             if (e->mods & 0x08) depressed |= (1u << 3); /* Mod1/Alt */
             if (e->mods & 0x10) locked    |= (1u << 1); /* Lock/Caps */
-            if (depressed != sc->kb_mods_depressed ||
-                locked    != sc->kb_mods_locked) {
-                wl_keyboard_send_modifiers(sc->keyboard, next_serial(),
-                                           depressed, 0u, locked, 0u);
-                sc->kb_mods_depressed = depressed;
-                sc->kb_mods_locked    = locked;
-            }
+
+            /* Send key event first. */
+            wl_keyboard_send_key(sc->keyboard, next_serial(), now,
+                                 scancode_to_xkb(e->scan), st);
+
+            /* Always send modifiers after every key event so the client's
+             * xkb_state stays in sync. Some toolkits (GTK via xkbcommon)
+             * only update their modifier state from wl_keyboard.modifiers,
+             * not from xkb_state_update_key on the key event. Sending it
+             * unconditionally (even if unchanged) ensures correctness. */
+            wl_keyboard_send_modifiers(sc->keyboard, next_serial(),
+                                       depressed, 0u, locked, 0u);
+            sc->kb_mods_depressed = depressed;
+            sc->kb_mods_locked    = locked;
             break;
         }
         case WM_EVT_CLOSE_REQUESTED: {
@@ -1746,6 +1748,11 @@ static void pump_input_for_surface(struct brook_surface *s) {
                 wl_keyboard_send_enter(sc->keyboard, next_serial(),
                                        s->resource, &keys);
                 wl_array_release(&keys);
+                /* Send current modifier state so client starts with
+                 * correct xkb_state (protocol requires modifiers after enter). */
+                wl_keyboard_send_modifiers(sc->keyboard, next_serial(),
+                                           sc->kb_mods_depressed, 0u,
+                                           sc->kb_mods_locked, 0u);
                 sc->kb_focus = s;
                 fprintf(stderr, "[waylandd] FOCUS_GAINED wm=%u\n", s->wm_id);
             }
