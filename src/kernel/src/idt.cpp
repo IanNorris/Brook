@@ -1544,8 +1544,17 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
     // frame.  Writer does its work in user mode — kernel stays out of
     // the filesystem.  See files/crash-dump-plan.md.
     if (fromUser && proc) {
-        brook::Process* leader =
-            proc->threadLeader ? proc->threadLeader : proc;
+        // Guard against use-after-free: the thread leader may have been
+        // reaped by exit_group on another CPU while this thread faulted.
+        // Check the pointer is a valid kernel-heap address before deref.
+        brook::Process* rawLeader = proc->threadLeader;
+        brook::Process* leader = proc;
+        if (rawLeader &&
+            reinterpret_cast<uint64_t>(rawLeader) >= 0xffffc00000000000ULL &&
+            reinterpret_cast<uint64_t>(rawLeader) < 0xffffd00000000000ULL &&
+            rawLeader->magic == brook::PROCESS_MAGIC) {
+            leader = rawLeader;
+        }
 
         if (leader->crashEntry && !leader->crashInProgress) {
             leader->crashInProgress = true;

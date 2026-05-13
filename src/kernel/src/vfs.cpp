@@ -470,7 +470,15 @@ Vnode* VfsOpen(const char* path, int flags)
 
 int VfsRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
 {
-    if (!vn || !vn->ops->read) return -1;
+    if (!vn) return -1;
+    // Detect use-after-free: kfree fills with 0xDF
+    uintptr_t opsVal = reinterpret_cast<uintptr_t>(vn->ops);
+    if (opsVal == 0xdfdfdfdfdfdfdfdfULL) {
+        SerialPrintf("BUG: VfsRead on freed vnode %p (ops=POISON refCount=%u)\n",
+                     vn, vn->refCount);
+        return -1;
+    }
+    if (!vn->ops->read) return -1;
     int r = vn->ops->read(vn, buf, len, offset);
     return r;
 }

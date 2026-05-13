@@ -587,7 +587,16 @@ static inline void MemFdUnref(MemFdData* mfd)
 
 static inline void VnodeRef(Vnode* vn)
 {
-    if (vn) __atomic_fetch_add(&vn->refCount, 1, __ATOMIC_RELEASE);
+    if (!vn) return;
+    // Detect use-after-free: kfree poisons memory with 0xDF bytes.
+    // If the ops pointer is the poison pattern, the vnode was already freed.
+    uintptr_t opsVal = reinterpret_cast<uintptr_t>(vn->ops);
+    if (opsVal == 0xdfdfdfdfdfdfdfdfULL || vn->refCount == 0) {
+        SerialPrintf("BUG: VnodeRef on freed/zero-ref vnode %p (ops=%p refCount=%u)\n",
+                     vn, vn->ops, vn->refCount);
+        return; // refuse to ref a dead vnode
+    }
+    __atomic_fetch_add(&vn->refCount, 1, __ATOMIC_RELEASE);
 }
 
 // Try to take a reference on a vnode that might be concurrently freed.
@@ -924,8 +933,19 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
             SpinLockRelease(&proc->fileMapLock);
             continue;
         }
+        // Snapshot refCount before ref for diagnostics
+        uint32_t preRef = __atomic_load_n(&vn->refCount, __ATOMIC_ACQUIRE);
         VnodeRef(vn);
         SpinLockRelease(&proc->fileMapLock);
+
+        // If VnodeRef refused (detected freed vnode), skip
+        uintptr_t opsCheck = reinterpret_cast<uintptr_t>(vn->ops);
+        if (opsCheck == 0xdfdfdfdfdfdfdfdfULL || preRef == 0) {
+            SerialPrintf("BUG: FileMapHandleUserFault got stale vnode %p "
+                         "refCount_was=%u pid=%u i=%u\n",
+                         vn, preRef, proc->pid, i);
+            return false;
+        }
 
         if ((errCode & PF_WRITE) && !(m.vmmFlags & VMM_WRITABLE)) {
             VnodeUnref(vn);
