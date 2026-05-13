@@ -17,6 +17,7 @@
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "string.h"
+#include "irq_wrapper.h"
 
 using brook::SerialPrintf;
 using brook::IoApicUnmaskIrq;
@@ -1749,25 +1750,27 @@ static SharedIrqEntry* FindSharedIrq(uint8_t irq)
     return nullptr;
 }
 
-// Per-IRQ dispatch stubs. Each is an __attribute__((interrupt)) function that
-// iterates handlers[0..count) for one SharedIrqEntry, then sends EOI.
-// We generate a small fixed set (one per MAX_SHARED_IRQS slot).
-#define SHARED_IRQ_STUB(N) \
-    __attribute__((interrupt)) \
-    static void SharedIrqStub##N(InterruptFrame* frame) { \
-        (void)frame; \
+// Per-IRQ dispatch stubs with proper SWAPGS handling.
+// Each inner function iterates handlers[0..count) for one SharedIrqEntry,
+// then sends EOI.  The naked wrapper handles SWAPGS + GPR save/restore.
+#define SHARED_IRQ_INNER(N) \
+    static void SharedIrqInner##N(void) { \
         SharedIrqEntry& e = g_sharedIrqs[N]; \
         for (int j = 0; j < e.count; j++) \
             e.handlers[j](); \
         ApicSendEoi(); \
     }
 
+#define SHARED_IRQ_STUB(N) \
+    SHARED_IRQ_INNER(N) \
+    IRQ_NAKED_HANDLER(SharedIrqStub##N, SharedIrqInner##N)
+
 SHARED_IRQ_STUB(0)
 SHARED_IRQ_STUB(1)
 SHARED_IRQ_STUB(2)
 SHARED_IRQ_STUB(3)
 
-using StubFn = void (*)(InterruptFrame*);
+using StubFn = void (*)(void);
 static StubFn g_sharedIrqStubs[] = {
     SharedIrqStub0, SharedIrqStub1, SharedIrqStub2, SharedIrqStub3
 };

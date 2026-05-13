@@ -7,6 +7,7 @@
 #include "tty.h"
 #include "kprintf.h"
 #include "portio.h"
+#include "irq_wrapper.h"
 
 namespace brook {
 
@@ -409,11 +410,8 @@ extern "C" void KernelPanic(const char* fmt, ...);
 // IRQ1 interrupt handler
 // ---------------------------------------------------------------------------
 
-__attribute__((interrupt))
-static void KbdIrqHandler(InterruptFrame* frame)
+static void KbdIrqHandlerInner(void)
 {
-    (void)frame;
-
     // Check that OBF is set and the byte is NOT from the auxiliary (mouse) port.
     // If bit 5 (AUXB) is set, this is mouse data — don't consume it here.
     uint8_t status = inb(0x64);
@@ -577,6 +575,9 @@ static void KbdIrqHandler(InterruptFrame* frame)
     // Send EOI to LAPIC.
     ApicSendEoi();
 }
+
+// Naked ISR wrapper — handles SWAPGS + GPR save/restore around the inner handler.
+IRQ_NAKED_HANDLER(KbdIrqHandler, KbdIrqHandlerInner)
 
 // ---------------------------------------------------------------------------
 // Public API
