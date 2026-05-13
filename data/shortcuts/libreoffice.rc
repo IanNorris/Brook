@@ -1,0 +1,3 @@
+# title: LibreOffice
+# desc: LibreOffice Writer
+source /boot/SCRIPTS/wayland_libreoffice.rc
