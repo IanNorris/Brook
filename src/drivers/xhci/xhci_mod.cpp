@@ -28,6 +28,7 @@
 #include "input.h"
 #include "keyboard.h"
 #include "device.h"
+#include "irq_wrapper.h"
 #include "memory/heap.h"
 #include "string.h"
 
@@ -2677,15 +2678,15 @@ static void XhciIrqHandler()
 }
 
 // MSI-X IDT entry — compiler-generated interrupt stub.
-// Built with -mgeneral-regs-only so the compiler saves/restores GPRs
-// and emits iretq automatically. No SSE state to worry about.
-__attribute__((interrupt))
-static void XhciMsixIsr(InterruptFrame* frame)
+// Inner function called from the naked SWAPGS wrapper below.
+static void XhciMsixIsrInner()
 {
-    (void)frame;
     XhciIrqHandler();
     ApicSendEoi();
 }
+
+// Naked wrapper with proper SWAPGS for user→kernel transitions.
+IRQ_NAKED_HANDLER(XhciMsixIsr, XhciMsixIsrInner)
 
 // ---------------------------------------------------------------------------
 // Module init / exit
