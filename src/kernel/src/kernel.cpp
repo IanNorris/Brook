@@ -568,10 +568,10 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         // Activate APs now — BSP is about to enter the scheduler.
         brook::SmpActivateAPs();
 
-        // Write-protect the GDT now that all APs have executed ltr
-        // (which sets the TSS "busy" bit in the GDT). Any subsequent
-        // stray write will trigger a #PF at the exact faulting instruction.
-        GdtWriteProtect();
+        // GDT write-protect removed — iretq legitimately writes "accessed"
+        // bits to segment descriptors, which causes #PF on read-only GDT.
+        // The GDT corruption was a symptom of GS base being zero (BRO-013),
+        // not direct stray writes.
 
         // Run TLB shootdown self-test while all CPUs are online but before
         // user processes start — any failure here is a hard boot error.

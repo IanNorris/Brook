@@ -744,6 +744,33 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
     // The assembly stub has already done SWAPGS if needed.
     __asm__ volatile("cli");
 
+    // GS base diagnostic: catch stray SWAPGS before any gs-relative access.
+    // Only check kernel-mode exceptions — user-mode exceptions have user GS
+    // which is legitimately zero (the stub swaps to kernel GS before calling us).
+    if ((ef->cs & 3) == 0)
+    {
+        uint32_t gsLo, gsHi;
+        __asm__ volatile("rdmsr" : "=a"(gsLo), "=d"(gsHi) : "c"(0xC0000101u));
+        uint64_t gsBase = (static_cast<uint64_t>(gsHi) << 32) | gsLo;
+        if (gsBase == 0)
+        {
+            uint32_t kLo, kHi;
+            __asm__ volatile("rdmsr" : "=a"(kLo), "=d"(kHi) : "c"(0xC0000102u));
+            uint64_t kgsBase = (static_cast<uint64_t>(kHi) << 32) | kLo;
+            SerialPrintf("!!! GS_BASE=0 in HandleExceptionFull! vec=%lu RIP=0x%lx "
+                         "KERNEL_GS=0x%lx\n", vector, ef->rip, kgsBase);
+            // Auto-fix
+            if (kgsBase) {
+                __asm__ volatile("wrmsr" :: "c"(0xC0000101u),
+                    "a"(static_cast<uint32_t>(kgsBase)),
+                    "d"(static_cast<uint32_t>(kgsBase >> 32)));
+                __asm__ volatile("wrmsr" :: "c"(0xC0000102u), "a"(0u), "d"(0u));
+                SerialPrintf("!!! GS_BASE restored to 0x%lx — faulting RIP was 0x%lx\n",
+                             kgsBase, ef->rip);
+            }
+        }
+    }
+
     // If a panic is already active, this CPU must not produce output or
     // render a panic screen — it would garble the panicking CPU's work.
     // This catches CPUs that enter via ExceptionStub13/14 (which bypass
