@@ -169,6 +169,11 @@ fi
 
 # Use persistent disk image (shared between debug/release).
 # Create it automatically on first run if missing.
+#
+# Optional toggles:
+#   BROOK_SKIP_UPDATE_DISK=1   — skip syncing files to disk
+#   BROOK_USB_KBD=1            — attach USB keyboard (off by default; PS/2 is primary)
+#   BROOK_USB_MOUSE=1          — attach USB mouse (off by default; virtio-tablet is primary)
 DISK_IMG="${BROOK_DISK_IMG:-${ROOT_DIR}/brook_disk.img}"
 if [ ! -f "${DISK_IMG}" ]; then
     echo "Creating persistent disk image..."
@@ -342,8 +347,8 @@ qemu-system-x86_64 \
     -device virtio-rng-pci \
     -device virtio-net-pci,netdev=net0${NIC_MAC_ARG} \
     -device qemu-xhci,id=xhci \
-    -device usb-kbd,bus=xhci.0 \
-    -device usb-mouse,bus=xhci.0 \
+    ${BROOK_USB_KBD:+-device usb-kbd,bus=xhci.0} \
+    ${BROOK_USB_MOUSE:+-device usb-mouse,bus=xhci.0} \
     -drive if=none,id=usbdisk,file="${USB_TEST_IMG}",format=raw \
     -device usb-storage,bus=xhci.0,drive=usbdisk \
     ${AUDIO_OPTS} \

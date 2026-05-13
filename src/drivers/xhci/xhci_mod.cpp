@@ -1813,9 +1813,9 @@ static void XhciProcessMouseReport(const uint8_t* report)
     if (dx != 0 || dy != 0) {
         int32_t mx = 0, my = 0;
         MouseGetPosition(&mx, &my);
-        // USB boot protocol: positive Y = down in most implementations,
-        // but QEMU USB mouse matches PS/2 convention (positive Y = up)
-        MouseSetPosition(mx + dx, my - dy);
+        // USB boot protocol: positive Y = down (screen convention).
+        // No inversion needed — unlike PS/2 where positive Y = up.
+        MouseSetPosition(mx + dx, my + dy);
 
         InputEvent ev;
         ev.type     = InputEventType::MouseMove;
