@@ -1586,6 +1586,44 @@ Process* ProcessCurrent()
     // read 0 — fall through to the array path so very-early callers
     // (kernel init code that uses ProcessCurrent before scheduler is
     // running) still work.
+
+    // GS base diagnostic: if MSR_GS_BASE is zero a stray SWAPGS has
+    // swapped it with the (zero) KERNEL_GS_BASE.  Detect and auto-fix
+    // before the gs-relative load reads from address 0xb8.
+    {
+        uint32_t lo, hi;
+        __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000101u));
+        uint64_t gsBase = (static_cast<uint64_t>(hi) << 32) | lo;
+        if (__builtin_expect(gsBase == 0, 0))
+        {
+            // Read KERNEL_GS_BASE — should hold the env pointer.
+            uint32_t klo, khi;
+            __asm__ volatile("rdmsr" : "=a"(klo), "=d"(khi) : "c"(0xC0000102u));
+            uint64_t kgsBase = (static_cast<uint64_t>(khi) << 32) | klo;
+
+            // Log with a mini-backtrace.
+            uint64_t rbp;
+            __asm__ volatile("movq %%rbp, %0" : "=r"(rbp));
+            SerialPrintf("!!! GS_BASE=0 in ProcessCurrent! KERNEL_GS=0x%lx\n", kgsBase);
+            SerialPrintf("!!!   callers:");
+            for (int i = 0; i < 8 && rbp >= 0xFFFF800000000000ULL; i++) {
+                uint64_t ret = reinterpret_cast<uint64_t*>(rbp)[1];
+                SerialPrintf(" 0x%lx", ret);
+                rbp = reinterpret_cast<uint64_t*>(rbp)[0];
+            }
+            SerialPrintf("\n");
+
+            // Auto-fix: restore GS_BASE from KERNEL_GS_BASE.
+            if (kgsBase) {
+                WriteMsr(0xC0000101, kgsBase);
+                WriteMsr(0xC0000102, 0);
+            } else {
+                // Both zero — can't recover, fall through to array path.
+                return g_perCpu[ThisCpu()].currentProcess;
+            }
+        }
+    }
+
     uint64_t cur;
     __asm__ volatile("movq %%gs:184, %0" : "=r"(cur));
     if (cur)
