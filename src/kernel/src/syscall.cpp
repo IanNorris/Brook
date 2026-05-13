@@ -375,6 +375,7 @@ static constexpr int64_t ENOTCONN = 107;
 static constexpr int64_t EAFNOSUPPORT = 97;
 static constexpr int64_t ECONNREFUSED = 111;
 static constexpr int64_t ETIMEDOUT    = 110;
+static constexpr int64_t ELOOP       = 40;
 
 // Check if the current process has deliverable signals pending.
 // Call after SchedulerBlock() returns to decide whether to return -EINTR.
@@ -4578,6 +4579,9 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
     }
 
     // Resolve path: try as-is, then /boot/BIN/<UPPER>, then /boot/<UPPER>
+    int shebangDepth = 0;
+    static constexpr int MAX_SHEBANG_DEPTH = 4;
+resolve_path:
     char resolvedPath[256];
     bool found = false;
 
@@ -4883,19 +4887,25 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
 
     // --- Shebang (#!) support ---
     // If the file starts with "#!", extract the interpreter path and re-exec.
+    // Uses goto instead of recursive sys_execve to avoid passing kernel-space
+    // pointers through user-pointer validation (which returns EFAULT).
     if (elfSize >= 2 && elfBuf[0] == '#' && elfBuf[1] == '!')
     {
+        if (++shebangDepth > MAX_SHEBANG_DEPTH) {
+            VmmFreePages(bufAddr, bufPages);
+            SerialPrintf("sys_execve: shebang depth exceeded for '%s'\n", lookupPath);
+            return -ELOOP;
+        }
+
         // Parse interpreter line: "#!<interp> [arg]\n"
-        // Do this BEFORE freeing the buffer.
         const char* line = reinterpret_cast<const char*>(elfBuf);
         const char* lineEnd = line + (elfSize < 256 ? elfSize : 256);
         const char* p = line + 2;
 
-        // Skip whitespace
         while (p < lineEnd && (*p == ' ' || *p == '\t')) p++;
 
-        // Extract interpreter path
-        char interpPath[128];
+        // Extract interpreter path into kPath (reuse existing buffer)
+        char interpPath[256];
         uint32_t interpLen = 0;
         while (p < lineEnd && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r' && *p != '\0')
         {
@@ -4909,44 +4919,58 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
         while (p < lineEnd && (*p == ' ' || *p == '\t')) p++;
 
         char interpArg[128];
-        uint32_t argLen = 0;
+        uint32_t interpArgLen = 0;
         while (p < lineEnd && *p != '\n' && *p != '\r' && *p != '\0')
         {
-            if (argLen < sizeof(interpArg) - 1)
-                interpArg[argLen++] = *p;
+            if (interpArgLen < sizeof(interpArg) - 1)
+                interpArg[interpArgLen++] = *p;
             p++;
         }
-        interpArg[argLen] = '\0';
+        interpArg[interpArgLen] = '\0';
 
-        // Done reading elfBuf — free it now
         VmmFreePages(bufAddr, bufPages);
 
-        DbgPrintf("sys_execve: shebang interp='%s' arg='%s' script='%s'\n",
+        SerialPrintf("sys_execve: shebang interp='%s' arg='%s' script='%s'\n",
                      interpPath, interpArg, lookupPath);
 
-        // Build new argv: [interp, interpArg?, script, original_argv[1:]]
-        static constexpr int MAX_SHEBANG_ARGS = 34;
-        const char* newArgv[MAX_SHEBANG_ARGS];
-        int newArgc = 0;
-        newArgv[newArgc++] = interpPath;
-        if (argLen > 0)
-            newArgv[newArgc++] = interpArg;
-        newArgv[newArgc++] = lookupPath; // the script itself
+        // Rebuild argv in-place: [interp, interpArg?, scriptPath, orig_argv[1:]]
+        // Save the script path (lookupPath may point into resolvedPath which gets
+        // overwritten on the next resolve_path iteration).
+        char scriptPath[256];
+        uint32_t spi = 0;
+        while (lookupPath[spi] && spi < 255) { scriptPath[spi] = lookupPath[spi]; spi++; }
+        scriptPath[spi] = '\0';
 
-        // Append original argv[1..] (skip argv[0] which was the script)
-        for (int i = 1; i < argc && newArgc < MAX_SHEBANG_ARGS - 1; i++)
-            newArgv[newArgc++] = kArgv[i];
-        newArgv[newArgc] = nullptr;
+        // Shift existing argv[1:] to make room at the front
+        const char* oldArgv[MAX_EXEC_ARGS];
+        int oldArgc = 0;
+        for (int i = 1; i < argc && oldArgc < MAX_EXEC_ARGS - 4; i++)
+            oldArgv[oldArgc++] = kArgv[i];
 
-        // Build pointer array and recurse
-        uint64_t newArgvPtrs[MAX_SHEBANG_ARGS];
-        for (int i = 0; i < newArgc; i++)
-            newArgvPtrs[i] = reinterpret_cast<uint64_t>(newArgv[i]);
-        newArgvPtrs[newArgc] = 0;
+        // Rebuild argBuf and kArgv from scratch
+        argBufPos = 0;
+        argc = 0;
 
-        return sys_execve(reinterpret_cast<uint64_t>(interpPath),
-                          reinterpret_cast<uint64_t>(newArgvPtrs),
-                          envpAddr, 0, 0, 0);
+        auto pushArg = [&](const char* s) {
+            uint32_t len = 0;
+            while (s[len]) len++;
+            if (argBufPos + len + 1 > ARG_BUF_SIZE || argc >= MAX_EXEC_ARGS - 1) return;
+            for (uint32_t j = 0; j < len; j++) argBuf[argBufPos + j] = s[j];
+            argBuf[argBufPos + len] = '\0';
+            kArgv[argc++] = &argBuf[argBufPos];
+            argBufPos += len + 1;
+        };
+
+        pushArg(interpPath);
+        if (interpArgLen > 0) pushArg(interpArg);
+        pushArg(scriptPath);
+        for (int i = 0; i < oldArgc; i++) pushArg(oldArgv[i]);
+
+        // Set kPath to the interpreter for path resolution
+        for (uint32_t i = 0; i <= interpLen && i < sizeof(kPath) - 1; i++)
+            kPath[i] = interpPath[i];
+
+        goto resolve_path;
     }
 
     // --- Kill sibling threads before replacing the process image ---
