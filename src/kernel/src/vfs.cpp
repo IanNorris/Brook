@@ -498,7 +498,10 @@ int VfsReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
 int VfsStat(Vnode* vn, VnodeStat* st)
 {
     if (!vn || !vn->ops->stat) return -1;
-    return vn->ops->stat(vn, st);
+    int ret = vn->ops->stat(vn, st);
+    if (ret == 0)
+        st->ino = vn->cacheId;
+    return ret;
 }
 
 int VfsStatPath(const char* path, VnodeStat* st)

@@ -2055,6 +2055,7 @@ static int Ext2FsStatPath(void* mountPriv, uint8_t pdrv,
     st->isDir = (mode == EXT2_S_IFDIR);
     st->isSymlink = false; // stat follows symlinks, so result is never a symlink
     st->size  = st->isDir ? 0 : Ext2InodeSize(&inodeData);
+    st->ino   = static_cast<uint64_t>(ino);
     return 0;
 }
 
@@ -2079,6 +2080,7 @@ static int Ext2FsLstatPath(void* mountPriv, uint8_t pdrv,
         st->isDir = true;
         st->isSymlink = false;
         st->size = 0;
+        st->ino = EXT2_ROOT_INO;
         return 0;
     }
 
@@ -2103,6 +2105,7 @@ static int Ext2FsLstatPath(void* mountPriv, uint8_t pdrv,
     st->isDir     = (mode == EXT2_S_IFDIR);
     st->isSymlink = (mode == EXT2_S_IFLNK);
     st->size      = Ext2InodeSize(&inodeData);
+    st->ino       = static_cast<uint64_t>(ino);
     return 0;
 }
 

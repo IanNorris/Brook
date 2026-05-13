@@ -30,6 +30,7 @@ static uint64_t g_totalPages = 0;       // highest tracked page index
 static uint64_t g_freePages  = 0;
 static uint64_t g_nextHint   = 0;       // search hint for fast sequential alloc
 
+
 // SMP lock protecting the bitmap, free count, and page descriptors.
 // IrqSpinLock: memory allocation can be called from any context, and a timer
 // interrupt preempting a lock holder would deadlock if the new thread tries
@@ -252,6 +253,7 @@ PhysicalAddress PmmAllocPage(MemTag tag, uint16_t pid)
             g_nextHint = idx + 1;
             TrackAlloc(static_cast<uint32_t>(idx), tag, pid);
             IrqSpinLockRelease(&g_pmmLock, pmmFlags);
+
             return PhysicalAddress(idx * PAGE_SIZE);
         }
     }

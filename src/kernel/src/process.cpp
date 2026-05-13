@@ -1507,8 +1507,9 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
         thread->name[31] = '\0';
     }
 
-    DbgPrintf("THREAD: parent pid=%u -> thread tid=%u tgid=%u, rip=0x%lx rsp=0x%lx tls=0x%lx\n",
-                 parent->pid, thread->pid, thread->tgid, userRip, userRsp, tlsBase);
+    SerialPrintf("THREAD: parent pid=%u -> thread tid=%u tgid=%u pt=0x%lx\n",
+                 parent->pid, thread->pid, thread->tgid,
+                 thread->pageTable.pml4.raw());
 
     return thread;
 }
@@ -1707,15 +1708,33 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     PageTable oldPt = proc->pageTable;
     PageTable kernelPt = VmmKernelCR3();
 
+    // When a thread exec's, it shares the page table with the leader and
+    // other threads.  We must NOT destroy the shared PT — the group leader's
+    // reaper will do that once all threads have exited.  Instead, just detach
+    // from the thread group and create a fresh address space below.
+    bool wasThread = proc->isThread;
+
     // Flush TLB entries for the old address space on all remote CPUs
     TlbShootdownFull(oldPt.pml4.raw(), proc->tlbCpuMask);
 
     __asm__ volatile("mov %0, %%cr3" : : "r"(kernelPt.pml4.raw()) : "memory");
 
-    // 1. Free all user-space pages and destroy old page table.
-    ProcessClearLazyMappings(proc);
-    VmmDestroyUserPageTable(oldPt);
-    // Old address space is gone — reset TLB CPU mask
+    // 1. Free all user-space pages and destroy old page table — but ONLY if
+    //    we are the sole owner.  Threads share the PT with the leader; if we
+    //    destroy it here, the leader (and siblings) lose their address space.
+    if (!wasThread)
+    {
+        ProcessClearLazyMappings(proc);
+        VmmDestroyUserPageTable(oldPt);
+    }
+    else
+    {
+        // Detach from the thread group — this thread becomes its own leader.
+        proc->isThread = false;
+        proc->tgid = proc->pid;
+        proc->threadLeader = proc;
+    }
+    // Old address space is gone (or detached) — reset TLB CPU mask
     proc->tlbCpuMask = 0;
     // NOTE: PmmFreeByTag removed here. VmmDestroyUserPageTable already calls
     // PmmUnrefPage on every leaf PTE, which correctly frees pages at refcount=0

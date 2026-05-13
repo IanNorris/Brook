@@ -52,6 +52,7 @@ struct DirEntry {
 
 struct VnodeStat {
     uint64_t size;
+    uint64_t ino;       // stable inode number (0 = not available)
     bool     isDir;
     bool     isSymlink;
 };

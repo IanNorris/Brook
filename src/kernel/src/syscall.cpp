@@ -3435,6 +3435,16 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         uint64_t vaddr = pickAddr();
         if (!vaddr) return -ENOMEM;
 
+        // MAP_FIXED anonymous mappings may overlay existing file-backed VMAs
+        // (e.g. BSS anonymous mmap over the tail of a library reservation).
+        // Remove any stale fileMap entries so the demand-page handler doesn't
+        // incorrectly serve file data for these now-anonymous pages.
+        if (flags & MAP_FIXED) {
+            Process* mmOwner = MemoryMapOwner(proc);
+            if (mmOwner)
+                FileMapsUnmapRange(mmOwner, vaddr, pages * 4096);
+        }
+
         // Trace mmaps in Go's arena range so we can correlate with later faults.
         if (vaddr >= 0x2d7700000000ULL && vaddr < 0x2d8000000000ULL) {
             SerialPrintf("MMAP: pid=%u vaddr=0x%lx pages=%lu prot=0x%lx flags=0x%lx (anon)\n",
@@ -6117,16 +6127,25 @@ struct LinuxStat {
     int64_t  __unused[3];
 };
 
-static void FillStat(LinuxStat* st, const VnodeStat& vs)
+static void FillStat(LinuxStat* st, const VnodeStat& vs, const Vnode* vn = nullptr)
 {
     auto* raw = reinterpret_cast<uint8_t*>(st);
     memset(raw, 0, sizeof(LinuxStat));
 
-    // Generate a unique inode number from the file's attributes.
-    // This is critical: musl's dynamic linker uses dev+ino to detect
-    // already-loaded libraries.  Every distinct file MUST have a distinct ino.
-    static volatile uint64_t s_nextIno = 100;
-    st->st_ino = __atomic_fetch_add(&s_nextIno, 1, __ATOMIC_RELAXED);
+    // Use the stable inode number when available (from ext2 or vnode cacheId).
+    // This is critical: the dynamic linker uses dev+ino to detect
+    // already-loaded libraries.  The same file must return the same ino
+    // across multiple stat calls; otherwise libraries get loaded twice.
+    uint64_t ino = vs.ino;
+    if (!ino && vn && vn->cacheId)
+        ino = vn->cacheId;
+    if (ino) {
+        st->st_ino = ino;
+    } else {
+        // Fallback for filesystems without stable inode numbers (FATFS, procfs)
+        static volatile uint64_t s_nextIno = 100;
+        st->st_ino = __atomic_fetch_add(&s_nextIno, 1, __ATOMIC_RELAXED);
+    }
     st->st_dev = 1;
     st->st_nlink = 1;
     st->st_blksize = 4096;
@@ -6219,7 +6238,7 @@ static int64_t do_stat_internal(const char* path, uint64_t statAddr)
         lookup = resolved;
     }
 
-    VnodeStat vs; vs.size = 0; vs.isDir = false; vs.isSymlink = false;
+    VnodeStat vs{}; vs.size = 0; vs.isDir = false; vs.isSymlink = false;
     if (VfsStatPath(lookup, &vs) < 0)
     {
         // Synthetic proc/etc files — stat should succeed for these
@@ -6284,7 +6303,7 @@ static int64_t do_lstat_internal(const char* path, uint64_t statAddr)
         lookup = resolved;
     }
 
-    VnodeStat vs; vs.size = 0; vs.isDir = false; vs.isSymlink = false;
+    VnodeStat vs{}; vs.size = 0; vs.isDir = false; vs.isSymlink = false;
     if (VfsLstatPath(lookup, &vs) < 0)
     {
         // Synthetic proc/etc files
@@ -6351,9 +6370,9 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
 
     if (fde->type == FdType::Vnode && fde->handle) {
         auto* vn = static_cast<Vnode*>(fde->handle);
-        VnodeStat vs; vs.size = 0; vs.isDir = false; vs.isSymlink = false;
+        VnodeStat vs{}; vs.size = 0; vs.isDir = false; vs.isSymlink = false;
         if (VfsStat(vn, &vs) < 0) return -EBADF;
-        FillStat(st, vs);
+        FillStat(st, vs, vn);
         return 0;
     }
 
@@ -8695,7 +8714,7 @@ static int64_t sys_chdir(uint64_t pathAddr, uint64_t, uint64_t,
     }
 
     // Verify path exists and is a directory
-    VnodeStat vs; vs.size = 0; vs.isDir = false; vs.isSymlink = false;
+    VnodeStat vs{}; vs.size = 0; vs.isDir = false; vs.isSymlink = false;
     if (VfsStatPath(newCwd, &vs) < 0) return -ENOENT;
     if (!vs.isDir) return -ENOTDIR;
 
@@ -12409,6 +12428,7 @@ static int64_t SyscallDispatchTraced(uint64_t num, uint64_t a0, uint64_t a1,
                      num, a0, a1, a2, a3, a4, a5);
         return -38; // -ENOSYS
     }
+
     int64_t ret = fn(a0, a1, a2, a3, a4, a5);
 
     // In errors-only mode, skip successful syscalls entirely
