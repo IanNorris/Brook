@@ -1257,22 +1257,19 @@ static void CompositorLoopWM()
         // --- Global hotkeys (work regardless of focus state) ---
         if (ev.type == InputEventType::KeyPress)
         {
-            // Alt+Tab — cycle focus to next window
+            // Alt+Tab — cycle focus to next window by sending current
+            // to back of z-order, then focusing the new top window.
             if ((ev.modifiers & INPUT_MOD_ALT) && ev.scanCode == 0x0F) // Tab
             {
-                int cur = WmGetFocusedWindow();
                 int zOrder[WM_MAX_WINDOWS];
                 uint32_t zCount = WmGetZOrder(zOrder, WM_MAX_WINDOWS);
                 if (zCount > 1) {
-                    // Find current in z-order, cycle to previous (below current)
-                    int nextIdx = zOrder[0]; // default to backmost
-                    for (uint32_t z = 0; z < zCount; z++) {
-                        if (zOrder[z] == cur && z > 0) {
-                            nextIdx = zOrder[z - 1];
-                            break;
-                        }
-                    }
-                    WmSetFocus(nextIdx);
+                    // zOrder is back-to-front: [0]=backmost, [n-1]=frontmost
+                    int topIdx = zOrder[zCount - 1];
+                    WmSendToBack(topIdx);
+                    // Focus the new frontmost (was second from top)
+                    int newTop = zOrder[zCount - 2];
+                    WmSetFocus(newTop);
                 }
                 continue;
             }

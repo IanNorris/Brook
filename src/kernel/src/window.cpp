@@ -503,6 +503,21 @@ void WmSetFocus(int idx)
     WmPushWmEvent(&g_windows[idx], WM_EVT_FOCUS_GAINED, 0, 0);
 }
 
+void WmSendToBack(int idx)
+{
+    if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
+    if (!g_windows[idx].proc) return;
+
+    // Find the current minimum z-order across all windows
+    uint8_t minZ = 255;
+    for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i) {
+        if (g_windows[i].proc && g_windows[i].zOrder < minZ)
+            minZ = g_windows[i].zOrder;
+    }
+    // Place this window below the current minimum
+    g_windows[idx].zOrder = (minZ > 0) ? (minZ - 1) : 0;
+}
+
 int WmGetFocusedWindow()
 {
     return g_focusedIdx;

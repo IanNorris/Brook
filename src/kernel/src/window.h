@@ -168,6 +168,9 @@ WmHitResult WmHitTest(int32_t mx, int32_t my);
 // Set focus to window at index. Unfocuses all others. Raises to top.
 void WmSetFocus(int idx);
 
+// Send a window to the back of the z-order (lowest z).
+void WmSendToBack(int idx);
+
 // Get the currently focused window index (-1 if none).
 int WmGetFocusedWindow();
 
