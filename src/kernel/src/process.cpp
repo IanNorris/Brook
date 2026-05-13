@@ -478,7 +478,7 @@ static uint64_t LoadInterpreter(Process* proc)
         while (*fname && li + 1 < sizeof(libPath)) libPath[li++] = *fname++;
         libPath[li] = '\0';
 
-        SerialPrintf("INTERP: trying '%s'\n", libPath);
+        SerialPrintf("INTERP: loading '%s' for pid %d\n", libPath, proc->pid);
         whichPath = libPath;
         vn = VfsOpen(libPath);
     }
@@ -521,55 +521,6 @@ static uint64_t LoadInterpreter(Process* proc)
 
     uint64_t entry = ElfLoadAt(buf, st.size, INTERP_LOAD_BASE,
                                proc->pageTable, proc->pid);
-
-    // DIAGNOSTIC: check bytes at the known crash offset (0x14cf1) in the
-    // interpreter.  Compare file buffer vs mapped page right after loading.
-    if (entry && st.size > 0x14cf8)
-    {
-        // 1. What's in the file buffer (should be correct from VfsRead)?
-        SerialPrintf("INTERP DIAG: file buf[0x14cf1]: "
-                     "%02x %02x %02x %02x %02x %02x %02x %02x\n",
-                     buf[0x14cf1], buf[0x14cf2], buf[0x14cf3], buf[0x14cf4],
-                     buf[0x14cf5], buf[0x14cf6], buf[0x14cf7], buf[0x14cf8]);
-
-        // 2. What's in the mapped user page?
-        uint64_t crashVA = INTERP_LOAD_BASE + 0x14cf1;
-        PhysicalAddress crashPhys = VmmVirtToPhys(proc->pageTable,
-                                                   VirtualAddress(crashVA));
-        if (crashPhys) {
-            auto* kp = reinterpret_cast<uint8_t*>(PhysToVirt(crashPhys).raw());
-            SerialPrintf("INTERP DIAG: mapped[0x%lx] phys=0x%lx: "
-                         "%02x %02x %02x %02x %02x %02x %02x %02x\n",
-                         crashVA, crashPhys.raw(),
-                         kp[0], kp[1], kp[2], kp[3],
-                         kp[4], kp[5], kp[6], kp[7]);
-
-            // 3. Also check page 0x14000 start (same page, different offset)
-            uint64_t pageVA = INTERP_LOAD_BASE + 0x14000;
-            PhysicalAddress pagePhys = VmmVirtToPhys(proc->pageTable,
-                                                      VirtualAddress(pageVA));
-            SerialPrintf("INTERP DIAG: page VA 0x%lx phys=0x%lx\n",
-                         pageVA, pagePhys.raw());
-
-            // 4. Check if this physical page is also mapped by the main binary
-            // Scan main binary range 0x200000..breakLow for colliding phys
-            uint64_t interpPagePhys = crashPhys.raw() & ~0xFFFULL;
-            for (uint64_t va = proc->elf.baseAddress;
-                 va < proc->elf.programBreakLow; va += 4096)
-            {
-                PhysicalAddress mp = VmmVirtToPhys(proc->pageTable,
-                                                    VirtualAddress(va));
-                if (mp && (mp.raw() & ~0xFFFULL) == interpPagePhys) {
-                    SerialPrintf("INTERP DIAG: COLLISION! main VA 0x%lx shares "
-                                 "phys page 0x%lx with interp crash page\n",
-                                 va, interpPagePhys);
-                }
-            }
-        } else {
-            SerialPrintf("INTERP DIAG: VA 0x%lx UNMAPPED after ElfLoadAt!\n",
-                         crashVA);
-        }
-    }
 
     kfree(buf);
 

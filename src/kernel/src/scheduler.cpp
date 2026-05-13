@@ -1000,36 +1000,11 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
 
     ProfilerContextSwitch(oldProc->pid, newProc->pid);
 
-    // GS base diagnostic: catch stray SWAPGS around context switches.
-    {
-        uint64_t gsb = ReadMsr(0xC0000101);  // MSR_GS_BASE
-        if (gsb == 0) {
-            uint64_t kgsb = ReadMsr(0xC0000102);
-            SerialPrintf("!!! GS_BASE=0 PRE-switch cpu=%u old=%s(%u) new=%s(%u) KERNEL_GS=0x%lx\n",
-                         cpu, oldProc->name, oldProc->pid,
-                         newProc->name, newProc->pid, kgsb);
-            // Auto-fix so we can keep running and gather more data
-            if (kgsb) { WriteMsr(0xC0000101, kgsb); WriteMsr(0xC0000102, 0); }
-        }
-    }
-
     context_switch(&oldProc->savedCtx, &newProc->savedCtx,
                    &oldProc->fxsave, &newProc->fxsave,
                    &oldProc->runningOnCpu);
 
     // --- We return here when another CPU (or this one) switches back to us ---
-
-    // GS base diagnostic: catch stray SWAPGS after resuming on this CPU.
-    {
-        uint64_t gsb = ReadMsr(0xC0000101);
-        if (gsb == 0) {
-            uint64_t kgsb = ReadMsr(0xC0000102);
-            uint32_t resumeCpu = ThisCpu();
-            SerialPrintf("!!! GS_BASE=0 POST-switch cpu=%u KERNEL_GS=0x%lx\n",
-                         resumeCpu, kgsb);
-            if (kgsb) { WriteMsr(0xC0000101, kgsb); WriteMsr(0xC0000102, 0); }
-        }
-    }
 
     DrainPostSwitch(ThisCpu());
 }
@@ -1587,38 +1562,22 @@ Process* ProcessCurrent()
     // (kernel init code that uses ProcessCurrent before scheduler is
     // running) still work.
 
-    // GS base diagnostic: if MSR_GS_BASE is zero a stray SWAPGS has
-    // swapped it with the (zero) KERNEL_GS_BASE.  Detect and auto-fix
-    // before the gs-relative load reads from address 0xb8.
+    // Safety net: if GS_BASE is zero (stray SWAPGS), auto-fix from
+    // KERNEL_GS_BASE before the gs-relative load at gs:184.
     {
         uint32_t lo, hi;
         __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000101u));
         uint64_t gsBase = (static_cast<uint64_t>(hi) << 32) | lo;
         if (__builtin_expect(gsBase == 0, 0))
         {
-            // Read KERNEL_GS_BASE — should hold the env pointer.
             uint32_t klo, khi;
             __asm__ volatile("rdmsr" : "=a"(klo), "=d"(khi) : "c"(0xC0000102u));
             uint64_t kgsBase = (static_cast<uint64_t>(khi) << 32) | klo;
 
-            // Log with a mini-backtrace.
-            uint64_t rbp;
-            __asm__ volatile("movq %%rbp, %0" : "=r"(rbp));
-            SerialPrintf("!!! GS_BASE=0 in ProcessCurrent! KERNEL_GS=0x%lx\n", kgsBase);
-            SerialPrintf("!!!   callers:");
-            for (int i = 0; i < 8 && rbp >= 0xFFFF800000000000ULL; i++) {
-                uint64_t ret = reinterpret_cast<uint64_t*>(rbp)[1];
-                SerialPrintf(" 0x%lx", ret);
-                rbp = reinterpret_cast<uint64_t*>(rbp)[0];
-            }
-            SerialPrintf("\n");
-
-            // Auto-fix: restore GS_BASE from KERNEL_GS_BASE.
             if (kgsBase) {
                 WriteMsr(0xC0000101, kgsBase);
                 WriteMsr(0xC0000102, 0);
             } else {
-                // Both zero — can't recover, fall through to array path.
                 return g_perCpu[ThisCpu()].currentProcess;
             }
         }

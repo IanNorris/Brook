@@ -969,7 +969,14 @@ static void CompositorLoopWM()
         p->fbDestY = w->clientY();
 
         // Blit content then chrome per-window so z-order is respected.
-        if (w->vfb)
+        // Snapshot VFB fields once to avoid TOCTOU: waylandd can destroy
+        // the window (nullifying vfb/vfbStride/vfbBytes) concurrently.
+        uint32_t* localVfb = w->vfb;
+        uint32_t  localStride = w->vfbStride;
+        uint64_t  localBytes  = w->vfbBytes;
+        __asm__ volatile("" ::: "memory"); // compiler barrier
+
+        if (localVfb && localStride)
         {
             // In partial-repaint mode, skip windows whose content hasn't
             // changed AND no lower-z window was re-blitted (which could
@@ -980,14 +987,12 @@ static void CompositorLoopWM()
             anyBelowBlitted = true;
 
             // Clamp blit to the buffer that was actually allocated.
-            uint32_t vfbW = w->vfbStride;
-            uint32_t vfbH = (w->vfbStride && w->vfbBytes)
-                          ? static_cast<uint32_t>(w->vfbBytes / (uint64_t)w->vfbStride / 4)
-                          : 0;
+            uint32_t vfbW = localStride;
+            uint32_t vfbH = static_cast<uint32_t>(localBytes / (uint64_t)localStride / 4);
             uint32_t blitW = w->clientW < vfbW ? w->clientW : vfbW;
             uint32_t blitH = w->clientH < vfbH ? w->clientH : vfbH;
             if (blitW && blitH)
-                BlitWindowVfb(w->vfb, blitW, blitH, w->vfbStride,
+                BlitWindowVfb(localVfb, blitW, blitH, localStride,
                               w->clientX(), w->clientY());
             w->vfbDirty = 0;  // single-writer (compositor thread), no race
         }

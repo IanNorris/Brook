@@ -20,6 +20,10 @@ namespace brook {
 static KMutex g_fatLock;
 static bool   g_fatLockInit = false;
 
+// Gate noisy "f_open failed" messages — off by default to avoid blocking
+// serial on the ~100+ failed opens the dynamic linker generates per app.
+static bool g_fatfsDebug = false;
+
 struct FatFsMountData {
     FATFS fs;
     uint8_t pdrv;
@@ -386,7 +390,8 @@ static Vnode* FatFsOpen(void* /*mountPriv*/, uint8_t pdrv,
     KMutexLock(&g_fatLock);
     FRESULT res = f_open(fil, fatPath, mode);
     if (res != FR_OK) {
-        SerialPrintf("FATFS: f_open('%s', 0x%x) failed: %d\n", fatPath, mode, res);
+        if (g_fatfsDebug)
+            SerialPrintf("FATFS: f_open('%s', 0x%x) failed: %d\n", fatPath, mode, res);
         KMutexUnlock(&g_fatLock);
     }
     if (res == FR_OK) {
