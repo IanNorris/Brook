@@ -98,6 +98,12 @@ static bool ProbeAndMountDevice(const char* label, brook::Device* dev, uint8_t p
     if (brook::VfsMount(mntPath, fsType, pdrv)) {
         brook::KPrintf("%s mounted at %s\n", label, mntPath);
 
+        // /nix store must remain world-accessible regardless of user
+        if (mntPath[0] == '/' && mntPath[1] == 'n' && mntPath[2] == 'i' &&
+            mntPath[3] == 'x' && (mntPath[4] == '\0' || mntPath[4] == '/')) {
+            brook::Ext2SetSkipPermChecks(pdrv, true);
+        }
+
         // Read BROOK.CFG as sanity check.
         char cfgPath[80] = {};
         uint32_t plen = 0;

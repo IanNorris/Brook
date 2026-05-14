@@ -227,6 +227,11 @@ struct Ext2Mount {
     SpinLock blockCacheLock;
     uint32_t* blockCacheBlockNum;  // [BLOCK_CACHE_SLOTS]; 0 = empty
     uint8_t** blockCacheData;      // [BLOCK_CACHE_SLOTS]; lazy-alloced per slot
+
+    // --- Access control ---
+    // When true, Unix permission checks are skipped for this mount.
+    // Used for /nix (packages must remain world-readable/executable).
+    bool skipPermChecks;
 };
 static constexpr uint32_t EXT2_INODE_CACHE_SIZE = 1024;
 static constexpr uint32_t EXT2_DIRENT_CACHE_SIZE = 1024;
@@ -1856,6 +1861,7 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
 
     *mountPriv = mnt;
     g_ext2Mounts[pdrv] = mnt;
+    mnt->skipPermChecks = false;  // Caller can override for nix mount
     DbgPrintf("ext2: mounted successfully\n");
     return true;
 }
@@ -1979,6 +1985,34 @@ static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
         if (needsWrite) KRwLockWriteUnlock(&g_ext2Lock);
         else            KRwLockReadUnlock(&g_ext2Lock);
         return nullptr;
+    }
+
+    // Permission check (skipped for root or mounts with skipPermChecks set).
+    // Only applies to existing files — newly created files skip this.
+    if (!(flags & VFS_O_CREATE) || ino) {
+        Process* cur = ProcessCurrent();
+        if (cur && cur->euid != 0 && !mnt->skipPermChecks) {
+            uint16_t fmode = inodeData.i_mode & 07777;
+            uint16_t perm;
+            if (cur->euid == inodeData.i_uid)
+                perm = (fmode >> 6) & 7;
+            else if (cur->egid == inodeData.i_gid)
+                perm = (fmode >> 3) & 7;
+            else
+                perm = fmode & 7;
+
+            bool denied = false;
+            if (flags & VFS_O_WRITE)
+                denied = !(perm & 2);
+            else
+                denied = !(perm & 4);  // read access
+
+            if (denied) {
+                if (needsWrite) KRwLockWriteUnlock(&g_ext2Lock);
+                else            KRwLockReadUnlock(&g_ext2Lock);
+                return nullptr;  // EACCES (caller sees null = open failed)
+            }
+        }
     }
 
     // Truncate if requested
@@ -2588,6 +2622,12 @@ void Ext2VfsRegister()
 {
     EnsureLock();
     VfsRegisterFs("ext2", &g_ext2FsOps);
+}
+
+void Ext2SetSkipPermChecks(uint8_t pdrv, bool skip)
+{
+    if (pdrv >= EXT2_MAX_MOUNTS || !g_ext2Mounts[pdrv]) return;
+    g_ext2Mounts[pdrv]->skipPermChecks = skip;
 }
 
 } // namespace brook

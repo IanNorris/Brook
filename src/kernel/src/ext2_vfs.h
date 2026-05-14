@@ -21,6 +21,10 @@ int Ext2Chmod(const char* path, uint16_t mode);
 // Change inode uid/gid. Pass (uint32_t)-1 to leave unchanged.
 int Ext2Chown(const char* path, uint32_t uid, uint32_t gid);
 
+// Mark an ext2 mount (by pdrv) as skipping permission checks.
+// Used for /nix — packages must remain world-accessible regardless of user.
+void Ext2SetSkipPermChecks(uint8_t pdrv, bool skip);
+
 } // namespace brook
 
 // Bind a block device to an ext2 physical-drive slot (0-based).
