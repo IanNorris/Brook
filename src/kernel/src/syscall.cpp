@@ -6201,8 +6201,13 @@ static void FillStat(LinuxStat* st, const VnodeStat& vs)
     st->st_blksize = 4096;
     st->st_size = static_cast<int64_t>(vs.size);
     st->st_blocks = (st->st_size + 511) / 512;
+    st->st_uid = vs.uid;
+    st->st_gid = vs.gid;
 
-    if (vs.isSymlink)
+    // Use real mode from VnodeStat if available, otherwise generate from flags
+    if (vs.mode)
+        st->st_mode = vs.mode;
+    else if (vs.isSymlink)
         st->st_mode = 0120777; // S_IFLNK | rwxrwxrwx
     else if (vs.isDir)
         st->st_mode = 0040755; // S_IFDIR | rwxr-xr-x
@@ -6288,7 +6293,7 @@ static int64_t do_stat_internal(const char* path, uint64_t statAddr)
         lookup = resolved;
     }
 
-    VnodeStat vs; vs.size = 0; vs.isDir = false; vs.isSymlink = false;
+    VnodeStat vs{};
     if (VfsStatPath(lookup, &vs) < 0)
     {
         // Synthetic proc/etc files — stat should succeed for these
@@ -6353,7 +6358,7 @@ static int64_t do_lstat_internal(const char* path, uint64_t statAddr)
         lookup = resolved;
     }
 
-    VnodeStat vs; vs.size = 0; vs.isDir = false; vs.isSymlink = false;
+    VnodeStat vs{};
     if (VfsLstatPath(lookup, &vs) < 0)
     {
         // Synthetic proc/etc files
@@ -6420,7 +6425,7 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
 
     if (fde->type == FdType::Vnode && fde->handle) {
         auto* vn = static_cast<Vnode*>(fde->handle);
-        VnodeStat vs; vs.size = 0; vs.isDir = false; vs.isSymlink = false;
+        VnodeStat vs{};
         if (VfsStat(vn, &vs) < 0) return -EBADF;
         FillStat(st, vs);
         return 0;
@@ -8774,7 +8779,7 @@ static int64_t sys_chdir(uint64_t pathAddr, uint64_t, uint64_t,
     }
 
     // Verify path exists and is a directory
-    VnodeStat vs; vs.size = 0; vs.isDir = false; vs.isSymlink = false;
+    VnodeStat vs{};
     if (VfsStatPath(newCwd, &vs) < 0) return -ENOENT;
     if (!vs.isDir) return -ENOTDIR;
 

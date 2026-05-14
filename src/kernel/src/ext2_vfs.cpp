@@ -1493,8 +1493,7 @@ static uint32_t Ext2ResolvePathInternal(Ext2Mount* mnt, uint32_t startIno,
         return 0;
     }
     if ((dirIno.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) {
-        SerialPrintf("ext2: ino %u not a dir (mode 0x%x) for component '%s'\n",
-                     curIno, dirIno.i_mode, component);
+        // Normal ENOTDIR — don't spam serial for routine path probes
         return 0;
     }
 
@@ -1592,6 +1591,10 @@ static int Ext2FileStat(Vnode* vn, VnodeStat* st)
     auto* fp = static_cast<Ext2FilePriv*>(vn->priv);
     st->size  = Ext2InodeSize(&fp->inodeData);
     st->isDir = false;
+    st->isSymlink = false;
+    st->uid   = fp->inodeData.i_uid;
+    st->gid   = fp->inodeData.i_gid;
+    st->mode  = fp->inodeData.i_mode;
     return 0;
 }
 
@@ -1660,9 +1663,13 @@ static void Ext2DirClose(Vnode* vn)
 
 static int Ext2DirStat(Vnode* vn, VnodeStat* st)
 {
-    (void)vn;
+    auto* dp = static_cast<Ext2DirPriv*>(vn->priv);
     st->size  = 0;
     st->isDir = true;
+    st->isSymlink = false;
+    st->uid   = dp->inodeData.i_uid;
+    st->gid   = dp->inodeData.i_gid;
+    st->mode  = dp->inodeData.i_mode;
     return 0;
 }
 
@@ -2062,6 +2069,9 @@ static int Ext2FsStatPath(void* mountPriv, uint8_t pdrv,
     st->isDir = (mode == EXT2_S_IFDIR);
     st->isSymlink = false; // stat follows symlinks, so result is never a symlink
     st->size  = st->isDir ? 0 : Ext2InodeSize(&inodeData);
+    st->uid   = inodeData.i_uid;
+    st->gid   = inodeData.i_gid;
+    st->mode  = inodeData.i_mode;
     return 0;
 }
 
@@ -2086,6 +2096,9 @@ static int Ext2FsLstatPath(void* mountPriv, uint8_t pdrv,
         st->isDir = true;
         st->isSymlink = false;
         st->size = 0;
+        st->uid  = inodeData.i_uid;
+        st->gid  = inodeData.i_gid;
+        st->mode = inodeData.i_mode;
         return 0;
     }
 
@@ -2110,6 +2123,9 @@ static int Ext2FsLstatPath(void* mountPriv, uint8_t pdrv,
     st->isDir     = (mode == EXT2_S_IFDIR);
     st->isSymlink = (mode == EXT2_S_IFLNK);
     st->size      = Ext2InodeSize(&inodeData);
+    st->uid       = inodeData.i_uid;
+    st->gid       = inodeData.i_gid;
+    st->mode      = inodeData.i_mode;
     return 0;
 }
 
