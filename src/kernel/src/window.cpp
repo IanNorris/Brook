@@ -29,7 +29,7 @@ namespace brook {
 static Window   g_windows[WM_MAX_WINDOWS] = {};
 static bool     g_wmActive = false;
 static int      g_focusedIdx = -1;
-static uint8_t  g_nextZOrder = 1;  // 0 = backmost, higher = front
+static uint32_t g_nextZOrder = 1;  // 0 = backmost, higher = front
 
 // App launcher state (implementation at bottom of file)
 static LauncherItem g_launcherItems[WM_LAUNCHER_MAX_ITEMS] = {};
@@ -496,6 +496,18 @@ void WmSetFocus(int idx)
     g_windows[idx].focused = true;
     g_windows[idx].zOrder = g_nextZOrder++;
     g_focusedIdx = idx;
+
+    // Re-raise any non-focusable windows (popups, menus) belonging to the
+    // same process so they stay above the newly-raised parent.
+    Process* focusProc = g_windows[idx].proc;
+    for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
+    {
+        if (static_cast<int>(i) == idx) continue;
+        Window& sib = g_windows[i];
+        if (sib.proc == focusProc && sib.visible && !sib.focusable)
+            sib.zOrder = g_nextZOrder++;
+    }
+
     WmPushWmEvent(&g_windows[idx], WM_EVT_FOCUS_GAINED, 0, 0);
 }
 
@@ -727,7 +739,7 @@ uint32_t WmGetZOrder(int* outIndices, uint32_t maxOut)
     for (uint32_t i = 1; i < count; ++i)
     {
         int key = outIndices[i];
-        uint8_t keyZ = g_windows[key].zOrder;
+        uint32_t keyZ = g_windows[key].zOrder;
         int j = static_cast<int>(i) - 1;
         while (j >= 0 && g_windows[outIndices[j]].zOrder > keyZ)
         {
