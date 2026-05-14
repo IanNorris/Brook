@@ -46,6 +46,7 @@ static const char *g_unpack_path = NULL;
 static int g_fetch_deps = 0;
 static int g_force_root = 0;
 static int g_cache_disabled = 0;  /* set to 1 if cache dir creation fails */
+static int g_packages_fetched = 0; /* progress counter for large closures */
 
 /* Set of hashes already fetched or in-progress — prevents redundant downloads
  * when a package lists itself in its own References, or when the same dep
@@ -251,11 +252,13 @@ static void batch_prefetch_narinfos(char hashes[][33], int n) {
             execlp(g_curl_path, "curl", "-4", "-sS", "--http1.1",
                    "-Z", "--parallel-max", "4",
                    "-H", "Connection: close",
+                   "--connect-timeout", "15", "--max-time", "60",
                    "--cacert", g_cacert_path, "-K", cfg_path, (char*)NULL);
         else
             execlp(g_curl_path, "curl", "-4", "-sS", "--http1.1",
                    "-Z", "--parallel-max", "4",
                    "-H", "Connection: close",
+                   "--connect-timeout", "15", "--max-time", "60",
                    "-K", cfg_path, (char*)NULL);
         _exit(127);
     }
@@ -280,14 +283,23 @@ static void exec_curl(const char *url) {
      * the stream ends but the TCP connection stays open for reuse. That
      * leaves curl blocked in recv() waiting for a FIN that never comes
      * until our SockRecv hard-timeout fires 180s later. Forcing HTTP/1.1
-     * makes "Connection: close" meaningful and the server FINs promptly. */
+     * makes "Connection: close" meaningful and the server FINs promptly.
+     *
+     * --connect-timeout 15: bail if TCP+TLS handshake takes > 15s.
+     * --max-time 300: bail if any single transfer takes > 5 minutes
+     *   (large packages like VLC deps can be 50-100MB).
+     * --retry 2: retry on transient network errors. */
     if (g_cacert_path)
         execlp(g_curl_path, "curl", "-4", "-sSL", "--http1.1",
                "-H", "Connection: close",
+               "--connect-timeout", "15", "--max-time", "300",
+               "--retry", "2",
                "--cacert", g_cacert_path, url, (char*)NULL);
     else
         execlp(g_curl_path, "curl", "-4", "-sSL", "--http1.1",
                "-H", "Connection: close",
+               "--connect-timeout", "15", "--max-time", "300",
+               "--retry", "2",
                url, (char*)NULL);
     perror("execl curl");
     _exit(127);
@@ -698,7 +710,8 @@ static int fetch_package(const char *hash, int force) {
 
         if (had_old)
             remove_tree(old_dest);
-        printf("  Installed: %s\n", basename);
+        g_packages_fetched++;
+        printf("  [%d] Installed: %s\n", g_packages_fetched, basename);
     } else {
         remove_tree(tmp_dest);
         fprintf(stderr, "  FAILED: %s\n", basename);
