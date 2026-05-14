@@ -255,15 +255,11 @@ int WmCreateWindow(Process* proc, int16_t x, int16_t y,
                  idx, w.title, x, y, clientW, clientH, upscale, proc ? proc->pid : 0);
 
     // Auto-focus normal windows. Popup/tooltips are raised by z-order but keep
-    // keyboard focus on the invoking toplevel.
+    // keyboard focus on the invoking toplevel. Non-focusable windows (popups,
+    // menus) already received the highest z-order above, so they'll render
+    // on top of existing windows without stealing keyboard focus.
     if (w.focusable)
         WmSetFocus(idx);
-    else if (g_focusedIdx >= 0)
-    {
-        // Non-focusable window created — re-raise the focused window so it
-        // stays visually on top (e.g. Kernel Console shouldn't cover Terminal).
-        g_windows[g_focusedIdx].zOrder = g_nextZOrder++;
-    }
 
     return idx;
 }

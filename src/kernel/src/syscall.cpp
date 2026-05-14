@@ -4007,6 +4007,77 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
 
     if (newPages == oldPages) return static_cast<int64_t>(old_addr);
 
+    // Check if this is a MemFd-backed mapping. If so, we must NOT free the
+    // underlying physical pages (they're owned by the MemFdData) and must
+    // keep the new mapping connected to the same MemFdData so that shared
+    // memory continues to work (wl_shm_pool resize depends on this).
+    Process* mmOwner = MemoryMapOwner(proc);
+    if (!mmOwner) return -ESRCH;
+    int32_t memfdMapIdx = -1;
+    for (uint32_t i = 0; i < Process::MAX_MEMFD_MAPS; i++) {
+        auto& m = mmOwner->memfdMaps[i];
+        if (m.length == 0 || !m.mfd) continue;
+        if (old_addr >= m.vaddr && old_addr < m.vaddr + m.length) {
+            memfdMapIdx = static_cast<int32_t>(i);
+            break;
+        }
+    }
+
+    if (memfdMapIdx >= 0) {
+        // MemFd-backed mremap: keep the mapping connected to the MemFdData.
+        auto& m = mmOwner->memfdMaps[memfdMapIdx];
+        auto* mfd = static_cast<MemFdData*>(m.mfd);
+
+        if (newPages < oldPages) {
+            // Shrink: unmap tail PTEs (don't free pages — they belong to mfd).
+            for (uint64_t i = newPages; i < oldPages; ++i) {
+                VirtualAddress va(old_addr + i * 4096);
+                VmmUnmapPage(proc->pageTable, va);
+            }
+            TlbShootdownFull(proc->pageTable.pml4.raw(), proc->tlbCpuMask);
+            m.length = newPages * 4096;
+            return static_cast<int64_t>(old_addr);
+        }
+
+        // Grow: ensure the MemFd has enough capacity for the new size.
+        uint64_t neededBytes = m.offset + newPages * 4096;
+        if (neededBytes > mfd->capacity) {
+            if (!MemFdGrow(mfd, neededBytes)) return -ENOMEM;
+        }
+        if (neededBytes > mfd->size) mfd->size = neededBytes;
+
+        if (!(flags & MREMAP_MAYMOVE)) return -ENOMEM;
+
+        // Allocate a new virtual address range (no physical pages — lazy fault).
+        Process* leader = (proc->tgid && proc->tgid != proc->pid)
+                        ? ProcessFindByPid(proc->tgid) : proc;
+        if (!leader) leader = proc;
+        uint64_t newAddr = leader->mmapNext;
+        leader->mmapNext += newPages * 4096;
+
+        // Move any already-faulted PTEs from old range to new range.
+        // Pages remain owned by the MemFdData; we just remap the same phys.
+        for (uint64_t i = 0; i < oldPages; ++i) {
+            VirtualAddress oldVA(old_addr + i * 4096);
+            PhysicalAddress phys = VmmVirtToPhys(proc->pageTable, oldVA);
+            if (phys) {
+                VirtualAddress newVA(newAddr + i * 4096);
+                VmmMapPage(proc->pageTable, newVA, phys,
+                           VMM_PRESENT | m.vmmFlags, MemTag::User, proc->pid);
+                VmmUnmapPage(proc->pageTable, oldVA);
+            }
+        }
+        TlbShootdownFull(proc->pageTable.pml4.raw(), proc->tlbCpuMask);
+
+        // Update the memfdMaps entry to reflect the new address and size.
+        m.vaddr  = newAddr;
+        m.length = newPages * 4096;
+
+        return static_cast<int64_t>(newAddr);
+    }
+
+    // --- Anonymous / file-backed mapping (non-MemFd) ---
+
     // Shrink: unmap the tail.
     if (newPages < oldPages)
     {
@@ -4044,8 +4115,6 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
         PhysicalAddress sp = VmmVirtToPhys(proc->pageTable, src);
         PhysicalAddress dp = VmmVirtToPhys(proc->pageTable, dst);
         if (!sp || !dp) continue;
-        // Both pages are mapped in the current page table (current process).
-        // We can copy directly via the user virtual addresses.
         __builtin_memcpy(reinterpret_cast<void*>(newAddr + i * 4096),
                          reinterpret_cast<void*>(old_addr + i * 4096), 4096);
     }
