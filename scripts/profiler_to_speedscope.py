@@ -3,9 +3,12 @@
 
 Usage:
     python3 profiler_to_speedscope.py serial.log [output] [--elf kernel.elf] [--symmap symbols.txt] [--folded]
+    python3 profiler_to_speedscope.py --disk brook_disk.img   # extract profile + symbols from disk
 
     --elf <path>      Resolve symbols from kernel ELF (auto-detected from build/ if omitted)
     --symmap <path>   Use pre-generated symbol map (addr name, one per line)
+    --ksym <path>     Use ksym_addr_table.cpp (auto-generated C++ symbol table)
+    --disk <path>     Extract latest profile + KSYM_ADDR.TXT from a brook disk image
     --folded          Output folded stacks format instead of speedscope JSON
                       (compatible with flamegraph.pl and speedscope's import)
 
@@ -49,6 +52,83 @@ def load_symmap(path):
                 except ValueError:
                     continue
     return syms
+
+
+def load_ksym_addr_table(path):
+    """Load symbols from ksym_addr_table.cpp (auto-generated C++ symbol table).
+
+    Format: { 0xffffffff80000000ULL, "KernelMain" },
+    """
+    syms = {}
+    if not path:
+        return syms
+    pattern = re.compile(r'\{\s*(0x[0-9a-fA-F]+)ULL,\s*"([^"]+)"\s*\}')
+    with open(path) as f:
+        for line in f:
+            m = pattern.search(line)
+            if m:
+                addr = int(m.group(1), 16)
+                syms[addr] = m.group(2)
+    return syms
+
+
+def extract_from_disk(disk_img):
+    """Extract the latest profile and KSYM_ADDR.TXT from a brook disk image.
+
+    Returns (profile_path, ksym_path) as temp files, or (None, None) on failure.
+    """
+    import subprocess, tempfile, glob as glob_mod
+
+    tmpdir = tempfile.mkdtemp(prefix='brook_profile_')
+
+    # List files on disk to find profile(s)
+    result = subprocess.run(['mdir', '-i', disk_img, '::'],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"  Failed to read disk image: {result.stderr.strip()}")
+        return None, None
+
+    # Find PROF_*.TXT files (take the latest by name which includes timestamp)
+    prof_files = []
+    ksym_found = False
+    for line in result.stdout.splitlines():
+        upper = line.upper()
+        if 'PROF_' in upper and '.TXT' in upper:
+            # Extract the long filename
+            parts = line.split()
+            for p in parts:
+                if 'PROF_' in p.upper() and p.upper().endswith('.TXT'):
+                    prof_files.append(p)
+                    break
+        if 'KSYM_ADDR' in upper:
+            ksym_found = True
+
+    profile_path = None
+    ksym_path = None
+
+    if prof_files:
+        # Take the last (newest) profile
+        latest = sorted(prof_files)[-1]
+        profile_path = os.path.join(tmpdir, 'profile.txt')
+        rc = subprocess.run(['mcopy', '-i', disk_img, f'::{latest}', profile_path],
+                            capture_output=True, text=True)
+        if rc.returncode == 0:
+            print(f"  Extracted profile: {latest}")
+        else:
+            print(f"  Failed to extract {latest}: {rc.stderr.strip()}")
+            profile_path = None
+
+    if ksym_found:
+        ksym_path = os.path.join(tmpdir, 'ksym_addr_table.cpp')
+        rc = subprocess.run(['mcopy', '-i', disk_img, '::KSYM_ADDR.TXT', ksym_path],
+                            capture_output=True, text=True)
+        if rc.returncode == 0:
+            print(f"  Extracted symbol table: KSYM_ADDR.TXT")
+        else:
+            print(f"  Failed to extract KSYM_ADDR.TXT: {rc.stderr.strip()}")
+            ksym_path = None
+
+    return profile_path, ksym_path
 
 
 def resolve_rip(rip, syms, sorted_addrs):
@@ -183,16 +263,18 @@ def write_folded(outpath, samples, syms, sorted_addrs):
 
 def main():
     if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} serial.log [output] [--symmap symbols.txt] [--elf kernel.elf] [--folded]")
+        print(f"Usage: {sys.argv[0]} serial.log [output] [--symmap symbols.txt] [--elf kernel.elf] [--ksym ksym_addr_table.cpp] [--disk brook_disk.img] [--folded]")
         sys.exit(1)
 
-    inpath = sys.argv[1]
+    inpath = None
     outpath = None
     symmap_path = None
+    ksym_path = None
     elf_path = None
+    disk_path = None
     folded = False
 
-    i = 2
+    i = 1
     while i < len(sys.argv):
         if sys.argv[i] == '--symmap' and i + 1 < len(sys.argv):
             symmap_path = sys.argv[i + 1]
@@ -200,37 +282,87 @@ def main():
         elif sys.argv[i] == '--elf' and i + 1 < len(sys.argv):
             elf_path = sys.argv[i + 1]
             i += 2
+        elif sys.argv[i] == '--ksym' and i + 1 < len(sys.argv):
+            ksym_path = sys.argv[i + 1]
+            i += 2
+        elif sys.argv[i] == '--disk' and i + 1 < len(sys.argv):
+            disk_path = sys.argv[i + 1]
+            i += 2
         elif sys.argv[i] == '--folded':
             folded = True
             i += 1
-        elif outpath is None and not sys.argv[i].startswith('--'):
-            outpath = sys.argv[i]
+        elif not sys.argv[i].startswith('--'):
+            if inpath is None:
+                inpath = sys.argv[i]
+            elif outpath is None:
+                outpath = sys.argv[i]
             i += 1
         else:
             i += 1
 
-    # Auto-detect ELF if not given
-    if elf_path is None and symmap_path is None:
+    # --disk mode: extract profile + symbols from disk image
+    if disk_path:
+        disk_profile, disk_ksym = extract_from_disk(disk_path)
+        if disk_ksym and not ksym_path and not symmap_path:
+            ksym_path = disk_ksym
+        if disk_profile:
+            if not inpath:
+                # No positional args given: disk provides input
+                inpath = disk_profile
+            elif not outpath:
+                # One positional arg: in disk mode, it's the output (disk provides input)
+                outpath = inpath
+                inpath = disk_profile
+
+    if not inpath:
+        print("Error: no input file specified (provide a serial log or use --disk)")
+        sys.exit(1)
+
+    # Load symbols from ksym_addr_table.cpp if provided
+    if ksym_path and not symmap_path:
+        syms_from_ksym = load_ksym_addr_table(ksym_path)
+        if syms_from_ksym:
+            print(f"Loaded {len(syms_from_ksym)} symbols from ksym_addr_table")
+
+    # Auto-detect ELF if no symbol source given
+    if elf_path is None and symmap_path is None and ksym_path is None:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         root = os.path.dirname(script_dir)
+        # Check for ksym_addr_table.cpp first (faster, no nm/cxxfilt needed)
         for candidate in [
-            os.path.join(root, 'build', 'release', 'kernel', 'BROOK.elf'),
-            os.path.join(root, 'build', 'debug', 'kernel', 'BROOK.elf'),
+            os.path.join(root, 'build', 'release', 'kernel', 'ksym_addr_table.cpp'),
+            os.path.join(root, 'build', 'debug', 'kernel', 'ksym_addr_table.cpp'),
         ]:
             if os.path.exists(candidate):
-                elf_path = candidate
-                print(f"Auto-detected ELF: {elf_path}")
+                ksym_path = candidate
+                print(f"Auto-detected ksym table: {ksym_path}")
                 break
+        # Fall back to ELF
+        if not ksym_path:
+            for candidate in [
+                os.path.join(root, 'build', 'release', 'kernel', 'BROOK.elf'),
+                os.path.join(root, 'build', 'debug', 'kernel', 'BROOK.elf'),
+            ]:
+                if os.path.exists(candidate):
+                    elf_path = candidate
+                    print(f"Auto-detected ELF: {elf_path}")
+                    break
 
     # Generate symmap from ELF using nm + llvm-cxxfilt
-    if elf_path and not symmap_path:
+    if elf_path and not symmap_path and not ksym_path:
         symmap_path = _symmap_from_elf(elf_path)
 
     if outpath is None:
         stem = inpath.rsplit('.', 1)[0]
         outpath = stem + '.folded' if folded else stem + '.speedscope.json'
 
-    syms = load_symmap(symmap_path)
+    # Load symbols: prefer ksym_addr_table.cpp, then symmap, then ELF-generated
+    if ksym_path:
+        syms = load_ksym_addr_table(ksym_path)
+        if not syms:
+            print(f"Warning: no symbols loaded from {ksym_path}")
+    else:
+        syms = load_symmap(symmap_path)
     sorted_addrs = sorted(syms.keys()) if syms else []
 
     cpuCount, startTick, samples, context_switches, dropped = parse_serial_log(inpath)
