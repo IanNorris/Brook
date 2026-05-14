@@ -8,6 +8,7 @@
 #include "ext2_vfs.h"
 #include "vfs.h"
 #include "device.h"
+#include "process.h"
 #include "memory/heap.h"
 #include "serial.h"
 #include "string.h"
@@ -1937,7 +1938,13 @@ static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
 
         // Initialize inode
         memset(&inodeData, 0, sizeof(inodeData));
-        inodeData.i_mode = EXT2_S_IFREG | 0644;
+        {
+            Process* cur = ProcessCurrent();
+            uint16_t mask = cur ? cur->umask : 022;
+            inodeData.i_mode = EXT2_S_IFREG | (0666 & ~mask);
+            inodeData.i_uid = cur ? static_cast<uint16_t>(cur->euid) : 0;
+            inodeData.i_gid = cur ? static_cast<uint16_t>(cur->egid) : 0;
+        }
         inodeData.i_links_count = 1;
         Ext2WriteInode(mnt, ino, &inodeData);
 
@@ -2174,7 +2181,13 @@ static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath)
     // Initialize directory inode
     Ext2Inode newData;
     memset(&newData, 0, sizeof(newData));
-    newData.i_mode = EXT2_S_IFDIR | 0755;
+    {
+        Process* cur = ProcessCurrent();
+        uint16_t mask = cur ? cur->umask : 022;
+        newData.i_mode = EXT2_S_IFDIR | (0777 & ~mask);
+        newData.i_uid = cur ? static_cast<uint16_t>(cur->euid) : 0;
+        newData.i_gid = cur ? static_cast<uint16_t>(cur->egid) : 0;
+    }
     newData.i_links_count = 2; // . and parent's entry
 
     // Allocate first data block for . and .. entries

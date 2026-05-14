@@ -8724,13 +8724,16 @@ static int64_t sys_times(uint64_t bufAddr, uint64_t, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
-// sys_umask (95) — stub, always returns 022
+// sys_umask (95) — set process umask, return old value
 // ---------------------------------------------------------------------------
 
-static int64_t sys_umask(uint64_t, uint64_t, uint64_t,
+static int64_t sys_umask(uint64_t newMask, uint64_t, uint64_t,
                           uint64_t, uint64_t, uint64_t)
 {
-    return 022;
+    Process* proc = ProcessCurrent();
+    uint16_t old = proc->umask;
+    proc->umask = static_cast<uint16_t>(newMask & 0777);
+    return old;
 }
 
 // ---------------------------------------------------------------------------

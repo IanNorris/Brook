@@ -79,3 +79,4 @@ usb_test.img
 crash_reports/
 *.gif
 .certs/
+brook_gpt_disk.img
