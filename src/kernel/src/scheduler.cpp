@@ -1698,6 +1698,20 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus)
                      p->pid, p->tgid);
     }
 
+    // Send reschedule IPIs to all CPUs running target threads to force
+    // immediate preemption rather than waiting for the timer tick.
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        Process* p = targets[i];
+        int cpu = __atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE);
+        if (cpu >= 0 && static_cast<uint32_t>(cpu) != ThisCpu())
+        {
+            const brook::CpuInfo* cpuInfo = brook::SmpGetCpu(static_cast<uint32_t>(cpu));
+            if (cpuInfo)
+                ApicSendRescheduleIpi(cpuInfo->apicId);
+        }
+    }
+
     // Wait for all sibling threads to stop executing on their CPUs.
     // Without this, the caller (leader) may proceed to ProcessDestroy
     // and free the shared page table / fileMaps while sibling threads

@@ -1853,10 +1853,12 @@ int ProcessSendSignal(Process* proc, int signum)
     // SIGKILL and SIGSTOP cannot be caught/blocked
     if (signum == SIGKILL)
     {
-        // Immediately terminate. There's a race window if the process is
-        // Running on another CPU — it may execute a few more instructions
-        // before the next timer tick preempts it. This is acceptable for a
-        // hobby OS; a production kernel would use an IPI to force-preempt.
+        // If this is the thread group leader, kill all threads first.
+        // Otherwise, sibling threads survive with dangling threadLeader
+        // pointers after the leader is freed (BRO-146).
+        if (proc->pid == proc->tgid && !proc->isThread)
+            SchedulerKillThreadGroup(proc->tgid, proc, 128 + SIGKILL);
+
         proc->exitStatus = 128 + SIGKILL;
         proc->fbVirtual = nullptr;
         proc->fbVirtualSize = 0;
@@ -1865,7 +1867,20 @@ int ProcessSendSignal(Process* proc, int signum)
                          __ATOMIC_RELEASE);
         if (!__atomic_load_n(&proc->compositorRegistered, __ATOMIC_ACQUIRE))
             __atomic_store_n(&proc->reapable, true, __ATOMIC_RELEASE);
-        DbgPrintf("SIGNAL: SIGKILL -> pid %u\n", proc->pid);
+
+        // Send a reschedule IPI to the CPU running this process so it gets
+        // descheduled immediately rather than waiting for the next timer tick.
+        // This closes the race window where a killed process continues
+        // executing on a remote CPU and dereferences freed shared state.
+        int cpu = __atomic_load_n(&proc->runningOnCpu, __ATOMIC_ACQUIRE);
+        if (cpu >= 0 && static_cast<uint32_t>(cpu) != brook::SmpCurrentCpuIndex())
+        {
+            const brook::CpuInfo* cpuInfo = brook::SmpGetCpu(static_cast<uint32_t>(cpu));
+            if (cpuInfo)
+                ApicSendRescheduleIpi(cpuInfo->apicId);
+        }
+
+        DbgPrintf("SIGNAL: SIGKILL -> pid %u (ipi to cpu %d)\n", proc->pid, cpu);
         return 0;
     }
 
