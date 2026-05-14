@@ -14,6 +14,13 @@ void Ext2VfsRegister();
 // Force-release the ext2 lock if held by a dying process.
 void Ext2ForceUnlockForPid(uint32_t pid);
 
+// Change inode mode (permissions only, preserves type bits).
+// Returns 0 on success, -errno on failure.
+int Ext2Chmod(const char* path, uint16_t mode);
+
+// Change inode uid/gid. Pass (uint32_t)-1 to leave unchanged.
+int Ext2Chown(const char* path, uint32_t uid, uint32_t gid);
+
 } // namespace brook
 
 // Bind a block device to an ext2 physical-drive slot (0-based).

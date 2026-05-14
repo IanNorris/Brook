@@ -1698,6 +1698,7 @@ static const VnodeOps g_ext2DirOps = {
 // Device binding table (similar to FatFS pdrv concept)
 static constexpr uint8_t EXT2_MAX_MOUNTS = 8;
 static Device* g_ext2Devices[EXT2_MAX_MOUNTS] = {};
+static Ext2Mount* g_ext2Mounts[EXT2_MAX_MOUNTS] = {};
 
 static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
 {
@@ -1854,6 +1855,7 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
     }
 
     *mountPriv = mnt;
+    g_ext2Mounts[pdrv] = mnt;
     DbgPrintf("ext2: mounted successfully\n");
     return true;
 }
@@ -2495,6 +2497,73 @@ static int Ext2FsReadlink(void* mountPriv, uint8_t pdrv,
     kfree(target);
     KRwLockReadUnlock(&g_ext2Lock);
     return static_cast<int>(copyLen);
+}
+
+// ---------------------------------------------------------------------------
+// Ext2Chmod / Ext2Chown — modify inode metadata
+// ---------------------------------------------------------------------------
+
+int Ext2Chmod(const char* path, uint16_t newMode)
+{
+    // Find which ext2 mount this path belongs to
+    Ext2Mount* mnt = nullptr;
+    const char* relPath = nullptr;
+
+    // Try all ext2 mounts (typically "/" and "/home")
+    for (int i = 0; i < EXT2_MAX_MOUNTS; ++i) {
+        if (!g_ext2Mounts[i]) continue;
+        // Check if path starts with this mount's prefix
+        // For simplicity, use mount index 0 as root ext2
+        mnt = g_ext2Mounts[i];
+        relPath = path;
+        break;
+    }
+    if (!mnt) return -2; // -ENOENT
+
+    KRwLockWriteLock(&g_ext2Lock);
+
+    const char* p = relPath;
+    while (*p == '/') ++p;
+    uint32_t ino = *p ? Ext2ResolvePath(mnt, EXT2_ROOT_INO, p, 0) : EXT2_ROOT_INO;
+    if (!ino) { KRwLockWriteUnlock(&g_ext2Lock); return -2; }
+
+    Ext2Inode inodeData;
+    if (!Ext2ReadInode(mnt, ino, &inodeData)) { KRwLockWriteUnlock(&g_ext2Lock); return -5; }
+
+    // Preserve type bits, replace permission bits
+    inodeData.i_mode = (inodeData.i_mode & EXT2_S_IFMT) | (newMode & 07777);
+    Ext2WriteInode(mnt, ino, &inodeData);
+
+    KRwLockWriteUnlock(&g_ext2Lock);
+    return 0;
+}
+
+int Ext2Chown(const char* path, uint32_t uid, uint32_t gid)
+{
+    Ext2Mount* mnt = nullptr;
+    for (int i = 0; i < EXT2_MAX_MOUNTS; ++i) {
+        if (!g_ext2Mounts[i]) continue;
+        mnt = g_ext2Mounts[i];
+        break;
+    }
+    if (!mnt) return -2;
+
+    KRwLockWriteLock(&g_ext2Lock);
+
+    const char* p = path;
+    while (*p == '/') ++p;
+    uint32_t ino = *p ? Ext2ResolvePath(mnt, EXT2_ROOT_INO, p, 0) : EXT2_ROOT_INO;
+    if (!ino) { KRwLockWriteUnlock(&g_ext2Lock); return -2; }
+
+    Ext2Inode inodeData;
+    if (!Ext2ReadInode(mnt, ino, &inodeData)) { KRwLockWriteUnlock(&g_ext2Lock); return -5; }
+
+    if (uid != 0xFFFFFFFF) inodeData.i_uid = static_cast<uint16_t>(uid);
+    if (gid != 0xFFFFFFFF) inodeData.i_gid = static_cast<uint16_t>(gid);
+    Ext2WriteInode(mnt, ino, &inodeData);
+
+    KRwLockWriteUnlock(&g_ext2Lock);
+    return 0;
 }
 
 static const VfsFsOps g_ext2FsOps = {

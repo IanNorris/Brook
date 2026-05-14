@@ -14,6 +14,7 @@
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "vfs.h"
+#include "ext2_vfs.h"
 #include "tty.h"
 #include "input.h"
 #include "pipe.h"
@@ -9053,54 +9054,77 @@ static int64_t sys_flock(uint64_t fd, uint64_t operation, uint64_t,
 
 // ---------------------------------------------------------------------------
 // sys_chmod (90) / sys_fchmod (91) / sys_fchmodat (268)
-// — stub: succeed silently (no permission model yet)
+// — apply mode changes to ext2 files
 // ---------------------------------------------------------------------------
 
-static int64_t sys_chmod(uint64_t, uint64_t, uint64_t,
+static int64_t sys_chmod(uint64_t pathAddr, uint64_t mode, uint64_t,
                           uint64_t, uint64_t, uint64_t)
 {
-    return 0; // no-op
+    char pathBuf[256];
+    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
+    int rc = brook::Ext2Chmod(pathBuf, static_cast<uint16_t>(mode & 07777));
+    return (rc == -2) ? 0 : rc;
 }
 
 static int64_t sys_fchmod(uint64_t, uint64_t, uint64_t,
                            uint64_t, uint64_t, uint64_t)
 {
-    return 0; // no-op
+    return 0; // TODO: implement via fd lookup
 }
 
-static int64_t sys_fchmodat(uint64_t, uint64_t, uint64_t,
+static int64_t sys_fchmodat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
                              uint64_t, uint64_t, uint64_t)
 {
-    return 0; // no-op
+    (void)dirfd;
+    char pathBuf[256];
+    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
+    int rc = brook::Ext2Chmod(pathBuf, static_cast<uint16_t>(mode & 07777));
+    return (rc == -2) ? 0 : rc;
 }
 
 // ---------------------------------------------------------------------------
 // sys_chown (92) / sys_fchown (93) / sys_lchown (94) / sys_fchownat (260)
-// — stub: succeed silently (no user model yet)
+// — apply ownership changes to ext2 files (root only)
 // ---------------------------------------------------------------------------
 
-static int64_t sys_chown(uint64_t, uint64_t, uint64_t,
+static int64_t sys_chown(uint64_t pathAddr, uint64_t uid, uint64_t gid,
                           uint64_t, uint64_t, uint64_t)
 {
-    return 0; // no-op
+    Process* proc = ProcessCurrent();
+    if (!proc || proc->euid != 0) return -EPERM;
+    char pathBuf[256];
+    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
+    int rc = brook::Ext2Chown(pathBuf, static_cast<uint32_t>(uid), static_cast<uint32_t>(gid));
+    return (rc == -2) ? 0 : rc;
 }
 
 static int64_t sys_fchown(uint64_t, uint64_t, uint64_t,
                            uint64_t, uint64_t, uint64_t)
 {
-    return 0; // no-op
+    return 0; // TODO: implement via fd lookup
 }
 
-static int64_t sys_lchown(uint64_t, uint64_t, uint64_t,
+static int64_t sys_lchown(uint64_t pathAddr, uint64_t uid, uint64_t gid,
                            uint64_t, uint64_t, uint64_t)
 {
-    return 0; // no-op
+    Process* proc = ProcessCurrent();
+    if (!proc || proc->euid != 0) return -EPERM;
+    char pathBuf[256];
+    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
+    int rc = brook::Ext2Chown(pathBuf, static_cast<uint32_t>(uid), static_cast<uint32_t>(gid));
+    return (rc == -2) ? 0 : rc;
 }
 
-static int64_t sys_fchownat(uint64_t, uint64_t, uint64_t,
-                             uint64_t, uint64_t, uint64_t)
+static int64_t sys_fchownat(uint64_t dirfd, uint64_t pathAddr, uint64_t uid,
+                             uint64_t gid, uint64_t, uint64_t)
 {
-    return 0; // no-op
+    (void)dirfd;
+    Process* proc = ProcessCurrent();
+    if (!proc || proc->euid != 0) return -EPERM;
+    char pathBuf[256];
+    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
+    int rc = brook::Ext2Chown(pathBuf, static_cast<uint32_t>(uid), static_cast<uint32_t>(gid));
+    return (rc == -2) ? 0 : rc;
 }
 
 // ---------------------------------------------------------------------------
