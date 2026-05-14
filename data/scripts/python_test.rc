@@ -1,0 +1,60 @@
+# Brook OS — Python 3 comprehensive test
+# Exercises: dynlink, stdlib, mmap, fork+exec, signals, filesystem, encoding
+# Run with: scripts/run-qemu.sh --release --script python_test
+run /nix/bin/python3 -c "
+import sys, os, signal, mmap, subprocess, json, io
+
+print('=== Brook Python Test Suite ===')
+print(f'Python {sys.version}')
+print(f'PID: {os.getpid()}')
+print(f'UID: {os.getuid()}, GID: {os.getgid()}')
+
+# Test 1: arithmetic and data structures
+print('T1_ARITH:', 2**32, hex(255))
+d = {'hello': 'world', 'n': 42}
+print('T1_DICT:', json.dumps(d))
+
+# Test 2: file I/O
+with open('/tmp/pytest.txt', 'w') as f:
+    f.write('hello brook\n')
+with open('/tmp/pytest.txt', 'r') as f:
+    assert f.read().strip() == 'hello brook'
+print('T2_FILE_IO: OK')
+
+# Test 3: mmap (anonymous)
+m = mmap.mmap(-1, 4096)
+m.write(b'mmap works!')
+m.seek(0)
+assert m.read(11) == b'mmap works!'
+m.close()
+print('T3_MMAP: OK')
+
+# Test 4: fork+exec via subprocess
+result = subprocess.run(['/nix/bin/echo', 'subprocess_ok'], capture_output=True, text=True)
+assert result.stdout.strip() == 'subprocess_ok'
+print('T4_SUBPROCESS: OK')
+
+# Test 5: signal handling
+caught = []
+def handler(sig, frame):
+    caught.append(sig)
+signal.signal(signal.SIGUSR1, handler)
+os.kill(os.getpid(), signal.SIGUSR1)
+assert caught == [signal.SIGUSR1]
+print('T5_SIGNALS: OK')
+
+# Test 6: encoding
+s = 'Hello Brook \u2603'
+b = s.encode('utf-8')
+assert b.decode('utf-8') == s
+print('T6_ENCODING: OK')
+
+# Test 7: /proc access
+with open(f'/proc/{os.getpid()}/status', 'r') as f:
+    for line in f:
+        if line.startswith('Name:'):
+            print(f'T7_PROC: {line.strip()}')
+            break
+
+print('=== ALL TESTS PASSED ===')
+"
