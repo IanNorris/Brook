@@ -873,6 +873,11 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                 __asm__ volatile("sti");
                 return;
             }
+            extern bool AnonMapHandleUserFault(uint64_t, uint64_t);
+            if (AnonMapHandleUserFault(cr2cow, ef->errorCode)) {
+                __asm__ volatile("sti");
+                return;
+            }
         }
 
         // Kernel syscalls still copy some user buffers directly.  Until the
@@ -887,6 +892,11 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
             }
             extern bool FileMapHandleUserFault(uint64_t, uint64_t);
             if (FileMapHandleUserFault(cr2cow, ef->errorCode)) {
+                __asm__ volatile("sti");
+                return;
+            }
+            extern bool AnonMapHandleUserFault(uint64_t, uint64_t);
+            if (AnonMapHandleUserFault(cr2cow, ef->errorCode)) {
                 __asm__ volatile("sti");
                 return;
             }

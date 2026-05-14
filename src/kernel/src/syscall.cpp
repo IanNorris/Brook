@@ -902,6 +902,65 @@ static uint32_t PageCachePreload(Vnode* vn, uint64_t startPageIdx,
     return totalCached;
 }
 
+// Demand-page an anonymous mapping.  Called from the #PF handler when a user
+// fault hits an address in an AnonMap that hasn't been backed yet.  Allocates
+// a single zeroed page and installs the PTE.
+extern "C" bool AnonMapHandleUserFault(uint64_t cr2, uint64_t errCode)
+{
+    static constexpr uint64_t PF_PRESENT = 0x1;
+    static constexpr uint64_t PF_WRITE   = 0x2;
+
+    // Only handle not-present faults (page hasn't been allocated yet)
+    if (errCode & PF_PRESENT)
+        return false;
+
+    Process* proc = MemoryMapOwner(ProcessCurrent());
+    if (!proc) return false;
+
+    uint64_t pageVA = cr2 & ~uint64_t{0xFFF};
+
+    for (uint32_t i = 0; i < Process::MAX_ANON_MAPS; i++) {
+        auto& m = proc->anonMaps[i];
+        if (m.length == 0) continue;
+        if (pageVA < m.vaddr || pageVA >= m.vaddr + m.length) continue;
+
+        // Check write permission
+        if ((errCode & PF_WRITE) && !(m.vmmFlags & VMM_WRITABLE))
+            return false;
+
+        // Race check: another CPU may have resolved this fault already
+        PhysicalAddress existing = VmmVirtToPhys(proc->pageTable,
+                                                  VirtualAddress(pageVA));
+        if (existing)
+            return true;
+
+        // Allocate and zero a page
+        PhysicalAddress phys = PmmAllocPage(MemTag::User, proc->pid);
+        if (!phys) return false;
+
+        auto* kp = reinterpret_cast<uint8_t*>(
+            PhysToVirt(phys).raw());
+        kp = reinterpret_cast<uint8_t*>(
+            reinterpret_cast<uint64_t>(kp) & ~0xFFFULL);
+        memset(kp, 0, 4096);
+
+        if (!VmmMapPage(proc->pageTable, VirtualAddress(pageVA), phys,
+                        VMM_PRESENT | m.vmmFlags, MemTag::User, proc->pid)) {
+            // Another thread may have raced us — check before freeing
+            if (VmmVirtToPhys(proc->pageTable, VirtualAddress(pageVA))) {
+                PmmFreePage(phys);
+                return true;
+            }
+            PmmFreePage(phys);
+            return false;
+        }
+
+        __atomic_fetch_add(&g_profFaultCount, 1, __ATOMIC_RELAXED);
+        return true;
+    }
+    return false;
+}
+
 // Demand-page a private file-backed mapping.  File VMAs own a Vnode reference,
 // so the backing remains valid even after userspace closes the original fd.
 // Uses the global page cache for sharing and 64KB read-ahead.
@@ -3450,6 +3509,36 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         if (prot == 0)
             return static_cast<int64_t>(vaddr);
 
+        // Large anonymous mappings are demand-paged: record the VMA and
+        // allocate physical pages on first access (#PF). This avoids
+        // allocating memory upfront for regions the process may never
+        // touch (common in large allocators, Go runtime, etc.).
+        // Small mappings (< 16 pages = 64KB) are still eager since the
+        // per-fault overhead isn't worth it for a few pages.
+        static constexpr uint64_t LAZY_ANON_THRESHOLD = 16;
+        if (pages >= LAZY_ANON_THRESHOLD)
+        {
+            Process* mmOwner = MemoryMapOwner(proc);
+            if (!mmOwner) mmOwner = proc;
+            bool recorded = false;
+            for (uint32_t i = 0; i < Process::MAX_ANON_MAPS; i++) {
+                auto& m = mmOwner->anonMaps[i];
+                if (m.length == 0) {
+                    m.vaddr = vaddr;
+                    m.length = pages * 4096;
+                    m.vmmFlags = vmmFlags;
+                    recorded = true;
+                    break;
+                }
+            }
+            if (recorded) {
+                DbgPrintf("mmap: pid=%u lazy anon vaddr=0x%lx pages=%lu\n",
+                          proc->pid, vaddr, pages);
+                return static_cast<int64_t>(vaddr);
+            }
+            // No free AnonMap slots — fall through to eager allocation
+        }
+
         if (!allocAt(vaddr, MemTag::User)) return -ENOMEM;
 
         // Zero via direct map (safe even for PROT_NONE / read-only pages).
@@ -3799,6 +3888,25 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
             continue;
         }
 
+        // Check if this page is in a lazy anonymous mapping and update its
+        // flags so future demand-page faults use the new protection.
+        Process::AnonMap* anonMap = nullptr;
+        for (uint32_t ai = 0; ai < Process::MAX_ANON_MAPS; ++ai) {
+            auto& m = mmOwner->anonMaps[ai];
+            if (m.length == 0) continue;
+            if (va.raw() >= m.vaddr && va.raw() < m.vaddr + m.length) {
+                anonMap = &m;
+                break;
+            }
+        }
+        if (anonMap) {
+            anonMap->vmmFlags = newFlags;
+            if (!phys) continue;
+            VmmUnmapPage(proc->pageTable, va);
+            VmmMapPage(proc->pageTable, va, phys, newFlags, MemTag::User, proc->pid);
+            continue;
+        }
+
         if (!phys)
         {
             // Page not mapped.  If the caller is upgrading to a real
@@ -3956,6 +4064,38 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t,
                 m.vaddr = 0; m.length = 0;
             }
             break;
+        }
+    }
+
+    // Clear or shrink overlapping anonymous map entries.
+    for (uint32_t i = 0; i < Process::MAX_ANON_MAPS; i++) {
+        auto& m = mmOwner->anonMaps[i];
+        if (m.length == 0) continue;
+        uint64_t mEnd = m.vaddr + m.length;
+        uint64_t overlapStart = (addr > m.vaddr) ? addr : m.vaddr;
+        uint64_t overlapEnd = (unmapEnd < mEnd) ? unmapEnd : mEnd;
+        if (overlapStart >= overlapEnd) continue;
+
+        if (overlapStart <= m.vaddr && overlapEnd >= mEnd) {
+            m.vaddr = 0; m.length = 0; m.vmmFlags = 0;
+        } else if (overlapStart <= m.vaddr) {
+            uint64_t delta = overlapEnd - m.vaddr;
+            m.vaddr = overlapEnd;
+            m.length -= delta;
+        } else if (overlapEnd >= mEnd) {
+            m.length = overlapStart - m.vaddr;
+        } else {
+            uint64_t rightVaddr = overlapEnd;
+            uint64_t rightLength = mEnd - overlapEnd;
+            for (uint32_t j = 0; j < Process::MAX_ANON_MAPS; j++) {
+                if (mmOwner->anonMaps[j].length == 0) {
+                    mmOwner->anonMaps[j].vaddr = rightVaddr;
+                    mmOwner->anonMaps[j].length = rightLength;
+                    mmOwner->anonMaps[j].vmmFlags = m.vmmFlags;
+                    break;
+                }
+            }
+            m.length = overlapStart - m.vaddr;
         }
     }
 

@@ -364,6 +364,12 @@ struct Process
     FileMap fileMaps[MAX_FILE_MAPS];
     SpinLock fileMapLock;  // protects fileMaps vnode load+ref
 
+    // Lazy anonymous memory mappings (demand-paged).  Physical pages are
+    // allocated on first access (#PF) rather than at mmap time.
+    static constexpr uint32_t MAX_ANON_MAPS = 512;
+    struct AnonMap { uint64_t vaddr; uint64_t length; uint64_t vmmFlags; };
+    AnonMap anonMaps[MAX_ANON_MAPS];
+
     // /dev/fb0 mmap ranges — recorded so sys_munmap can unmap without
     // freeing the underlying physical pages, which are owned by
     // proc->fbVirtual (the kernel-side compositor VFB).  Without this,
