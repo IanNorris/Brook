@@ -994,12 +994,14 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
                    "+", 0x0088CCFF, newBg);
     btnX += TASKBAR_NEW_BTN_W + WM_TASKBAR_PADDING;
 
-    // Count active windows and compute responsive button width
+    // Count active windows and compute responsive button width.
+    // Skip non-focusable windows (popups, menus, tooltips) — they're
+    // transient and shouldn't appear on the taskbar.
     uint32_t windowCount = 0;
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
     {
         const Window& w2 = g_windows[i];
-        if (w2.proc && w2.visible) windowCount++;
+        if (w2.proc && w2.visible && w2.focusable) windowCount++;
     }
 
     // Available space: screen width minus fixed elements minus clock area (~100px)
@@ -1017,7 +1019,7 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
     {
         const Window& w = g_windows[i];
-        if (!w.proc || !w.visible) continue;
+        if (!w.proc || !w.visible || !w.focusable) continue;
 
         // Button background — highlight if focused, lighten on hover
         bool btnHover = mouseInTaskbar && mouseX >= static_cast<int32_t>(btnX) &&
@@ -1110,7 +1112,7 @@ int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
     {
         const Window& w2 = g_windows[i];
-        if (w2.proc && w2.visible) windowCount++;
+        if (w2.proc && w2.visible && w2.focusable) windowCount++;
     }
     uint32_t fixedWidth = btnX + 100 + WM_TASKBAR_PADDING * 2;
     uint32_t availableWidth = (screenW > fixedWidth) ? screenW - fixedWidth : 0;
@@ -1126,7 +1128,7 @@ int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
     {
         const Window& w = g_windows[i];
-        if (!w.proc || !w.visible) continue;
+        if (!w.proc || !w.visible || !w.focusable) continue;
 
         uint32_t btnY = tbY + (WM_TASKBAR_HEIGHT - WM_TASKBAR_BTN_HEIGHT) / 2;
         if (mx >= static_cast<int32_t>(btnX) &&
