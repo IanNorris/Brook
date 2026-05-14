@@ -1,0 +1,4 @@
+# Brook OS — Python 3 REPL smoke test
+# Tests: dynamic linking, stdlib import, basic arithmetic, subprocess, signals
+# Run with: scripts/run-qemu.sh --release --script python_repl
+run /nix/bin/python3 -c "import sys; print('Python', sys.version); print('2+2 =', 2+2); import os; print('PID:', os.getpid()); print('PYTHON_OK')"

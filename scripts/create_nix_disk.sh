@@ -57,6 +57,7 @@ if [ ${#PACKAGES[@]} -eq 0 ]; then
         foot               # terminal — needs pty; carried for staged bring-up
         gimp               # Tier-2 photo editor; pulled but launched only when ready (~1.2GB)
         libreoffice        # LibreOffice suite (~2.6GB closure, shares GTK3 libs with above)
+        python3            # Python 3 interpreter — exercises dynlink, signals, PTY, mmap
     )
 fi
 
