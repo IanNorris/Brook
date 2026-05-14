@@ -2251,4 +2251,93 @@ int CompositorScanoutFlip(uint32_t minY, uint32_t maxY)
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2: Window state query for usermode compositor
+// ---------------------------------------------------------------------------
+
+uint32_t CompositorGetWindows(Process* caller, WmWindowDesc* out, uint32_t maxCount)
+{
+    if (!caller || !out || maxCount == 0) return 0;
+
+    uint32_t written = 0;
+    for (uint32_t i = 0; i < WM_MAX_WINDOWS && written < maxCount; ++i)
+    {
+        const Window* w = WmGetWindow(static_cast<int>(i));
+        if (!w || !w->proc) continue;
+
+        WmWindowDesc& d = out[written];
+        d.wmId    = w->wmId;
+        d.x       = w->x;
+        d.y       = w->y;
+        d.clientW = w->clientW;
+        d.clientH = w->clientH;
+        d.zOrder  = w->zOrder;
+        d.flags   = 0;
+        if (w->focused)   d.flags |= WM_DESC_FOCUSED;
+        if (w->visible)   d.flags |= WM_DESC_VISIBLE;
+        if (w->minimized) d.flags |= WM_DESC_MINIMIZED;
+        if (w->noChrome)  d.flags |= WM_DESC_NO_CHROME;
+        if (w->focusable) d.flags |= WM_DESC_FOCUSABLE;
+        d.vfbStride = w->vfbStride;
+        d.vfbBytes  = static_cast<uint32_t>(w->vfbBytes);
+        d.pid       = w->proc->pid;
+
+        // Copy title
+        for (uint32_t t = 0; t < 63 && w->title[t]; t++)
+            d.title[t] = w->title[t];
+        d.title[63] = '\0';
+
+        // Map the window's VFB into the compositor process (if not already)
+        if (w->vfb && w->vfbBytes > 0)
+            d.vfbUserAddr = CompositorMapWindowVfb(caller, w->wmId);
+        else
+            d.vfbUserAddr = 0;
+
+        written++;
+    }
+    return written;
+}
+
+uint64_t CompositorMapWindowVfb(Process* caller, uint32_t wmId)
+{
+    if (!caller) return 0;
+
+    // Find the window by wmId
+    const Window* w = nullptr;
+    for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
+    {
+        const Window* candidate = WmGetWindow(static_cast<int>(i));
+        if (candidate && candidate->wmId == wmId)
+        {
+            w = candidate;
+            break;
+        }
+    }
+    if (!w || !w->vfb || w->vfbBytes == 0) return 0;
+
+    // Allocate user-space virtual range
+    uint64_t pages = (w->vfbBytes + 4095) / 4096;
+    uint64_t userBase = caller->mmapNext;
+    if (userBase + pages * 4096 > USER_MMAP_END) {
+        SerialPrintf("COMPOSITOR: map_window_vfb: mmap window exhausted for wm=%u\n", wmId);
+        return 0;
+    }
+    caller->mmapNext = userBase + pages * 4096;
+
+    // Map VFB pages read-only into compositor process
+    VirtualAddress vfbKernAddr(reinterpret_cast<uint64_t>(w->vfb));
+    for (uint64_t i = 0; i < pages; i++) {
+        PhysicalAddress phys = VmmVirtToPhys(KernelPageTable,
+                                             VirtualAddress(vfbKernAddr.raw() + i * 4096));
+        if (!phys) continue;
+        VmmMapPage(caller->pageTable,
+                   VirtualAddress(userBase + i * 4096),
+                   phys,
+                   VMM_PRESENT | VMM_USER | VMM_NO_EXEC,  // read-only
+                   MemTag::Device, caller->pid);
+    }
+
+    return userBase;
+}
+
 } // namespace brook

@@ -10467,6 +10467,31 @@ static int64_t sys_brook_wm_scanout_flip(uint64_t minY, uint64_t maxY, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
+// 523: WM_GET_WINDOWS(out_ptr, max_count) — query window state for usermode compositor
+// ---------------------------------------------------------------------------
+static int64_t sys_brook_wm_get_windows(uint64_t outAddr, uint64_t maxCount, uint64_t,
+                                         uint64_t, uint64_t, uint64_t)
+{
+    if (maxCount == 0) return 0;
+    uint64_t bufSize = maxCount * sizeof(brook::WmWindowDesc);
+    if (!UserBufferWritable(outAddr, bufSize)) return -EFAULT;
+    Process* proc = ProcessCurrent();
+    auto* out = reinterpret_cast<brook::WmWindowDesc*>(outAddr);
+    return static_cast<int64_t>(brook::CompositorGetWindows(proc, out, static_cast<uint32_t>(maxCount)));
+}
+
+// ---------------------------------------------------------------------------
+// 524: WM_MAP_WINDOW_VFB(wmId) — map a window's VFB into compositor process
+// ---------------------------------------------------------------------------
+static int64_t sys_brook_wm_map_window_vfb(uint64_t wmId, uint64_t, uint64_t,
+                                            uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    uint64_t addr = brook::CompositorMapWindowVfb(proc, static_cast<uint32_t>(wmId));
+    return addr ? static_cast<int64_t>(addr) : -ENOENT;
+}
+
+// ---------------------------------------------------------------------------
 // sys_not_implemented
 // ---------------------------------------------------------------------------
 
@@ -12306,6 +12331,8 @@ void SyscallTableInit()
     g_syscallTable[520]                  = sys_brook_wm_get_screen_info;
     g_syscallTable[521]                  = sys_brook_wm_scanout_map;
     g_syscallTable[522]                  = sys_brook_wm_scanout_flip;
+    g_syscallTable[523]                  = sys_brook_wm_get_windows;
+    g_syscallTable[524]                  = sys_brook_wm_map_window_vfb;
 
     uint32_t count = 0;
     for (uint64_t i = 0; i < SYSCALL_MAX; ++i)
