@@ -6678,8 +6678,12 @@ static int64_t sys_setuid(uint64_t uid, uint64_t, uint64_t,
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -EINVAL;
-    proc->uid = static_cast<uint32_t>(uid);
-    proc->euid = static_cast<uint32_t>(uid);
+    uint32_t newUid = static_cast<uint32_t>(uid);
+    // Non-root can only set euid to real uid or saved uid (simplified: only own uid)
+    if (proc->euid != 0 && newUid != proc->uid)
+        return -EPERM;
+    proc->uid = newUid;
+    proc->euid = newUid;
     return 0;
 }
 static int64_t sys_setgid(uint64_t gid, uint64_t, uint64_t,
@@ -6687,8 +6691,11 @@ static int64_t sys_setgid(uint64_t gid, uint64_t, uint64_t,
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -EINVAL;
-    proc->gid = static_cast<uint32_t>(gid);
-    proc->egid = static_cast<uint32_t>(gid);
+    uint32_t newGid = static_cast<uint32_t>(gid);
+    if (proc->euid != 0 && newGid != proc->gid)
+        return -EPERM;
+    proc->gid = newGid;
+    proc->egid = newGid;
     return 0;
 }
 
