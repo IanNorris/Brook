@@ -57,7 +57,7 @@ struct Window
     int16_t     x, y;           // window position (outer top-left, including chrome)
     uint16_t    clientW;        // client area width (= VFB width * upscale)
     uint16_t    clientH;        // client area height (= VFB height * upscale)
-    uint8_t     zOrder;         // higher = on top (0 = backmost)
+    uint32_t    zOrder;         // higher = on top (0 = backmost)
     uint8_t     upscale;        // integer upscale factor (1 = 1:1, 2 = 2×, 4 = 4×)
     WindowState state;
     bool        focused;
