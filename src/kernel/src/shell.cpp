@@ -970,6 +970,7 @@ static int ExecCommand(int argc, const char* const* argv)
         bool strace = false;
         bool straceErrors = false;
         bool runOnce = false;
+        bool quiet = false;
 
         // Parse flags before the path
         while (pathIdx < argc) {
@@ -992,6 +993,9 @@ static int ExecCommand(int argc, const char* const* argv)
                 // the launcher doesn't double-spawn the rendering server.
                 runOnce = true;
                 pathIdx++;
+            } else if (StrEq(argv[pathIdx], "--quiet")) {
+                quiet = true;
+                pathIdx++;
             } else {
                 break;
             }
@@ -999,7 +1003,7 @@ static int ExecCommand(int argc, const char* const* argv)
 
         if (pathIdx >= argc)
         {
-            KPrintf("usage: run [--as <name>] [--uid <uid>] [--strace] [--once] <path> [args...]\n");
+            KPrintf("usage: run [--as <name>] [--uid <uid>] [--strace] [--quiet] [--once] <path> [args...]\n");
             return -1;
         }
 
@@ -1102,6 +1106,13 @@ static int ExecCommand(int argc, const char* const* argv)
             proc->straceEnabled = true;
             proc->straceErrorsOnly = true;
             KPrintf("[strace-errors enabled for pid %u]\n", proc->pid);
+        }
+        if (proc && quiet) {
+            // Redirect stdout/stderr to /dev/null
+            proc->fds[1].type = FdType::DevNull;
+            proc->fds[1].handle = nullptr;
+            proc->fds[2].type = FdType::DevNull;
+            proc->fds[2].handle = nullptr;
         }
         return 0;
     }

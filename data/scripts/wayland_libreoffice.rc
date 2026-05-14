@@ -3,4 +3,4 @@ set wm
 terminal
 set vfb none
 run --once /nix/bin/waylandd
-run --strace /nix/store/miip9x1vv3n5w47m0w6frpsnyxnbwj0n-libreoffice-25.8.5.2/lib/libreoffice/program/oosplash -env:UserInstallation=file:///tmp/lo_user --nofirststartwizard --norestore --writer
+run --quiet /nix/store/miip9x1vv3n5w47m0w6frpsnyxnbwj0n-libreoffice-25.8.5.2/lib/libreoffice/program/oosplash -env:UserInstallation=file:///tmp/lo_user --nofirststartwizard --norestore --writer
