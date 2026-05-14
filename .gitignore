@@ -80,3 +80,4 @@ crash_reports/
 *.gif
 .certs/
 brook_gpt_disk.img
+brook_disk.img.backup

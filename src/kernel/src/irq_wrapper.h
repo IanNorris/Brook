@@ -16,11 +16,12 @@
 // fired from user mode, gs:N reads went to user memory instead of the
 // kernel's per-CPU KernelCpuEnv — causing #PF or silent corruption.
 //
-// The inner function must NOT be __attribute__((interrupt)).
+// The inner function must be extern "C" so its symbol name is usable
+// in the inline asm call instruction.
 // It must handle EOI itself (call ApicSendEoi()).
 //
 // Usage:
-//   static void MyIrqInner(void) { ... ApicSendEoi(); }
+//   extern "C" void MyIrqInner(void) { ... ApicSendEoi(); }
 //   IRQ_NAKED_HANDLER(MyIrq, MyIrqInner)
 //   // Then install &MyIrq as the IDT handler.
 
@@ -51,7 +52,7 @@
             "push %%r14\n\t" \
             "push %%r15\n\t" \
             "cld\n\t" \
-            "call %P0\n\t" \
+            "call " #inner_fn "\n\t" \
             /* Restore GPRs */ \
             "pop %%r15\n\t" \
             "pop %%r14\n\t" \
@@ -75,7 +76,7 @@
             "2:\n\t" \
             "iretq\n\t" \
             : \
-            : "i"(inner_fn) \
+            : \
             : "memory" \
         ); \
     }

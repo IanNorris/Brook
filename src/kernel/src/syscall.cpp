@@ -1683,6 +1683,26 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
             // Buffer full — block until reader drains some
             Process* self = ProcessCurrent();
             pipe->writerWaiter = self;
+            // Re-check after registering waiter to close the race where
+            // a reader drained space between our write() and waiter set.
+            chunk = pipe->write(src + written,
+                static_cast<uint32_t>(count - written > 4096 ? 4096 : count - written));
+            if (chunk > 0)
+            {
+                pipe->writerWaiter = nullptr;
+                written += chunk;
+                Process* reader = pipe->readerWaiter;
+                if (reader)
+                {
+                    pipe->readerWaiter = nullptr;
+                    WakeProcess(reader);
+                }
+                PipeWakeEpoll(pipe);
+                break;
+            }
+            // Safety timeout — recheck every 10ms in case wakeup was missed
+            extern volatile uint64_t g_lapicTickCount;
+            self->wakeupTick = g_lapicTickCount + 10;
             SchedulerBlock(self);
             if (HasPendingSignals())
                 return written > 0 ? static_cast<int64_t>(written) : -EINTR;
@@ -1763,6 +1783,20 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
             }
             Process* self = ProcessCurrent();
             pipe->writerWaiter = self;
+            // Re-check after registering waiter
+            chunk = pipe->write(src + written,
+                static_cast<uint32_t>(count - written > 4096 ? 4096 : count - written));
+            if (chunk > 0)
+            {
+                pipe->writerWaiter = nullptr;
+                written += chunk;
+                Process* reader = pipe->readerWaiter;
+                if (reader) { pipe->readerWaiter = nullptr; WakeProcess(reader); }
+                PipeWakeEpoll(pipe);
+                break;
+            }
+            extern volatile uint64_t g_lapicTickCount;
+            self->wakeupTick = g_lapicTickCount + 10;
             SchedulerBlock(self);
             if (HasPendingSignals())
                 return written > 0 ? static_cast<int64_t>(written) : -EINTR;
@@ -1828,6 +1862,18 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
             if (nonblock) return -EAGAIN;
             Process* self = ProcessCurrent();
             pipe->writerWaiter = self;
+            // Re-check after registering waiter
+            chunk = pipe->write(src + written, static_cast<uint32_t>(count - written));
+            if (chunk > 0) {
+                pipe->writerWaiter = nullptr;
+                written += chunk;
+                Process* reader = pipe->readerWaiter;
+                if (reader) { pipe->readerWaiter = nullptr; WakeProcess(reader); }
+                PipeWakeEpoll(pipe);
+                break;
+            }
+            extern volatile uint64_t g_lapicTickCount;
+            self->wakeupTick = g_lapicTickCount + 10;
             SchedulerBlock(self);
             if (HasPendingSignals()) return written > 0 ? static_cast<int64_t>(written) : -EINTR;
         }

@@ -3015,7 +3015,7 @@ static void XhciIrqHandler()
 
 // MSI-X IDT entry — compiler-generated interrupt stub.
 // Inner function called from the naked SWAPGS wrapper below.
-static void XhciMsixIsrInner()
+extern "C" void XhciMsixIsrInner()
 {
     XhciIrqHandler();
     ApicSendEoi();
