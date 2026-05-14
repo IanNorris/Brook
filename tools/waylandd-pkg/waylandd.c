@@ -457,6 +457,7 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
                 int32_t shy = s->cursor_hot_y * (int32_t)dh / h;
                 wm_set_cursor_image(scaled, dw, dh, shx, shy);
             }
+
             wl_shm_buffer_end_access(shm);
         }
         wl_buffer_send_release(s->pending_buffer);
@@ -1118,6 +1119,7 @@ struct brook_seat_client {
     int cursor_visible;                     /* policy; kernel is mechanism */
     uint32_t kb_mods_depressed;
     uint32_t kb_mods_locked;
+    int keymap_fd;                          /* kept alive until client receives it */
     struct brook_seat_client *next;
 };
 
@@ -1414,12 +1416,44 @@ static int make_keymap_fd(size_t *out_size) {
         "};\n";
     size_t len = sizeof(keymap);
     int fd = syscall(SYS_memfd_create, "brook-keymap", 0u);
-    if (fd < 0) return -1;
-    if (ftruncate(fd, (off_t)len) < 0) { close(fd); return -1; }
-    void *p = mmap(NULL, len, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-    if (p == MAP_FAILED) { close(fd); return -1; }
-    memcpy(p, keymap, len);
-    munmap(p, len);
+    if (fd < 0) { fprintf(stderr, "[waylandd] keymap: memfd_create FAILED errno=%d\n", errno); return -1; }
+    if (ftruncate(fd, (off_t)len) < 0) { fprintf(stderr, "[waylandd] keymap: ftruncate FAILED\n"); close(fd); return -1; }
+
+    /* Use write() to populate the memfd instead of mmap+memcpy.
+     * This ensures pages are allocated in the kernel's MemFdData pageMap
+     * via sys_write, guaranteeing cross-process visibility when the client
+     * later mmap's this fd. The mmap+memcpy approach wrote to pages that
+     * were installed in waylandd's page table but might not have been
+     * properly committed to the shared MemFdData backing store. */
+    ssize_t written = 0;
+    const char *src = keymap;
+    size_t remaining = len;
+    while (remaining > 0) {
+        ssize_t n = write(fd, src + written, remaining);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            fprintf(stderr, "[waylandd] keymap: write FAILED errno=%d\n", errno);
+            close(fd);
+            return -1;
+        }
+        written += n;
+        remaining -= (size_t)n;
+    }
+    /* Seek back to start so client can read from offset 0 (mmap ignores
+     * file position, but some implementations check it). */
+    lseek(fd, 0, SEEK_SET);
+
+    /* Verify: mmap the fd and check the data is readable */
+    void *verify = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0);
+    if (verify != MAP_FAILED) {
+        int match = (memcmp(verify, keymap, len) == 0);
+        fprintf(stderr, "[waylandd] keymap: wrote %zu bytes to memfd=%d via write(), verify=%s first4='%.4s'\n",
+                len, fd, match ? "OK" : "MISMATCH",
+                (const char*)verify);
+        munmap(verify, len);
+    } else {
+        fprintf(stderr, "[waylandd] keymap: wrote %zu bytes via write(), verify mmap FAILED errno=%d\n", len, errno);
+    }
     *out_size = len;
     return fd;
 }
@@ -1445,7 +1479,15 @@ static void seat_get_keyboard(struct wl_client *c, struct wl_resource *r, uint32
     if (kfd >= 0) {
         wl_keyboard_send_keymap(k, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1,
                                 kfd, (uint32_t)kmsize);
-        close(kfd);
+        /* Do NOT close(kfd) here! libwayland queues the fd for delivery via
+         * SCM_RIGHTS on the next wl_display_flush_clients(). If we close it
+         * now, the fd number may be recycled before sendmsg transmits it,
+         * causing the client to receive a stale/wrong fd.
+         *
+         * We intentionally leak this fd — it's one memfd per client session
+         * and keeps the backing MemFdData alive so the client can mmap it.
+         * The fd is cleaned up when waylandd exits or the client disconnects. */
+        if (sc) sc->keymap_fd = kfd;
     } else {
         fprintf(stderr, "[waylandd] keyboard keymap FAILED, sending no_keymap\n");
         wl_keyboard_send_keymap(k, WL_KEYBOARD_KEYMAP_FORMAT_NO_KEYMAP, -1, 0);
@@ -1487,6 +1529,7 @@ static void seat_bind(struct wl_client *client, void *data,
     sc->seat = r;
     sc->client = client;
     sc->cursor_visible = 1;
+    sc->keymap_fd = -1;
     sc->next = g_seat_clients;
     g_seat_clients = sc;
     wl_resource_set_implementation(r, &seat_impl, sc, seat_resource_destroy);
