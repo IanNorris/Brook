@@ -5,30 +5,24 @@
 <h3 align="center">A hobby x86-64 operating system built from scratch</h3>
 
 <p align="center">
-  UEFI · C++ · Clang/LLVM · SMP · Window Manager · Runs DOOM
+  UEFI · C++ · Clang/LLVM · SMP · Wayland · Networking · Nix · Runs DOOM
 </p>
 
 ---
 
 <p align="center">
-  <img src="docs/images/brook_wm.png" alt="Brook OS window manager running DOOM and a bash terminal" width="800">
+  <img src="docs/images/brook_netsurf_quake2.png" alt="NetSurf web browser and Quake 2 running side by side on Brook OS" width="800">
 </p>
 
-<p align="center"><em>Brook's compositing window manager running DOOM alongside an interactive bash terminal</em></p>
-
-<p align="center">
-  <img src="docs/images/brook_quake2_lan.png" alt="Two Brook VMs playing Quake 2 LAN deathmatch over a VDE virtual switch" width="800">
-</p>
-
-<p align="center"><em>Two Brook VMs playing Quake 2 LAN deathmatch over a VDE virtual switch — real UDP sockets, static-IP config, multi-NIC kernel routing</em></p>
+<p align="center"><em>NetSurf and Quake 2 running side by side — compositing WM, TCP/IP networking, HDA audio, all on a from-scratch kernel</em></p>
 
 ## What is Brook?
 
 Brook is a hobby operating system for x86-64, written from scratch in C++ with
 a unified Clang/LLVM toolchain. It boots via UEFI, runs on multiple CPU cores,
-has a compositing window manager with window chrome, and implements enough of
-the Linux syscall ABI to run unmodified Linux binaries — including bash, DOOM,
-and a C compiler.
+has a compositing window manager with a Wayland compositor, and implements
+enough of the Linux syscall ABI (~175 syscalls) to run unmodified Linux
+binaries — including web browsers, GTK apps, and games.
 
 This is my second OS project (the first being
 [Enkel](https://github.com/IanNorris/Enkel)). Where Enkel was about getting
@@ -54,6 +48,8 @@ These run as unmodified Linux ELF binaries on Brook, linked against musl libc:
 | [Ladybird](https://ladybird.dev/) | dev | ⚠️ Partial | Renders pages (example.com, IANA) via Wayland; some resource loads time out |
 | [Qalculate!](https://qalculate.github.io/) | — | ✅ Working | GTK3 calculator via Wayland (CSD decorations) |
 | [GIMP](https://www.gimp.org/) | 2.10 | ⚠️ Partial | Launches via Wayland/GTK; plugin loading slow, UAF under investigation |
+| [LibreOffice](https://www.libreoffice.org/) | 24.8 | ⚠️ Partial | Writer launches via Wayland; slow startup, rendering works |
+| [VLC](https://www.videolan.org/vlc/) | 3.0 | ⚠️ Partial | Installs from Nix binary cache; playback under testing |
 
 ## Features
 
@@ -89,7 +85,7 @@ These run as unmodified Linux ELF binaries on Brook, linked against musl libc:
 - **Real Nix binaries** — cowsay, coreutils, curl, bash, etc. run unmodified
 
 ### Linux Compatibility
-- **~150 syscalls** — open, read, write, mmap (lazy/PROT_NONE), mprotect, fork, execve, clone, pipe, dup/dup2/dup3, ioctl, poll, select, epoll (create/ctl/wait), socket family (bind, connect, listen, accept, send/recv, setsockopt, sendmsg/recvmsg with **SCM_RIGHTS** fd passing), futex, clock_gettime, nanosleep, rt_sigaction/rt_sigprocmask, signalfd, eventfd, timerfd, **memfd_create**, dirfd-aware *at syscalls, symlinkat/readlinkat, TCGETS2/TCSETS, and more
+- **~175 syscalls** — open, read, write, mmap (lazy/PROT_NONE), mprotect, fork, execve, clone, pipe, dup/dup2/dup3, ioctl, poll, select, epoll (create/ctl/wait), socket family (bind, connect, listen, accept, send/recv, setsockopt, sendmsg/recvmsg with **SCM_RIGHTS** fd passing), futex, clock_gettime, nanosleep, rt_sigaction/rt_sigprocmask, signalfd, eventfd, timerfd, **memfd_create**, dirfd-aware *at syscalls, symlinkat/readlinkat, TCGETS2/TCSETS, and more
 - **ELF loader** — standard Linux ELF64 with dynamic linking (musl ld.so, glibc closures from Nix)
 - **Signals** — full rt_sigaction lifecycle, SIGINT/QUIT/TSTP/CONT/KILL/PIPE/CHLD with signal-safe TTY + AF_UNIX read (SIGCHLD doesn't spuriously EINTR)
 - **IPC** — anonymous pipes, **AF_UNIX stream sockets with SCM_RIGHTS**, memfd-backed shared memory (backs `wl_shm`), full address-space cloning on fork
@@ -125,6 +121,50 @@ These run as unmodified Linux ELF binaries on Brook, linked against musl libc:
 | `virtio_rng` | Virtio entropy source |
 | `intel_hda` | Intel HDA audio controller (DAC + pin output) |
 | `sched_mlfq` | Multi-level feedback queue scheduling policy |
+
+## Gallery
+
+<p align="center">
+  <img src="docs/images/brook_quake2_lan.png" alt="Two Brook VMs playing Quake 2 LAN deathmatch" width="800">
+</p>
+
+<p align="center"><em>Two Brook VMs playing Quake 2 LAN deathmatch over a VDE virtual switch — real UDP sockets, static-IP config, multi-NIC kernel routing</em></p>
+
+<p align="center">
+  <img src="docs/images/brook_wayland_qalculate.png" alt="Qalculate! running on Brook via Wayland" width="800">
+</p>
+
+<p align="center"><em>Qalculate! (GTK3) running natively via Brook's Wayland compositor with client-side decorations</em></p>
+
+<p align="center">
+  <img src="docs/images/brook_ladybird_browser.png" alt="Ladybird web browser rendering example.com on Brook" width="800">
+</p>
+
+<p align="center"><em>Ladybird web browser rendering example.com — Wayland display, DNS resolver, TCP/IP stack, all from scratch</em></p>
+
+<p align="center">
+  <img src="docs/images/brook_app_launcher.png" alt="Brook desktop with app launcher" width="800">
+</p>
+
+<p align="center"><em>App launcher grid with desktop entry icons and taskbar</em></p>
+
+<p align="center">
+  <img src="docs/images/brook_file_browser.png" alt="Brook native file browser" width="800">
+</p>
+
+<p align="center"><em>Brook-native Wayland file browser navigating the filesystem</em></p>
+
+<p align="center">
+  <img src="docs/images/brook_panic_qr.png" alt="Kernel panic with QR code" width="600">
+</p>
+
+<p align="center"><em>Kernel panic screen with scannable QR code — decoded by <a href="https://github.com/IanNorris/EnkelCrashDecoder">EnkelCrashDecoder</a> for instant stack traces</em></p>
+
+<p align="center">
+  <img src="docs/images/brook_nix_cowsay.png" alt="Nix cowsay running on Brook" width="600">
+</p>
+
+<p align="center"><em>cowsay fetched from the NixOS binary cache and running unmodified on Brook</em></p>
 
 ## Building
 
@@ -224,6 +264,7 @@ ctest --test-dir build/release/host_tests --output-on-failure  # Host-native uni
 ## Acknowledgements
 
 - [DOOM Generic](https://github.com/ozkl/doomgeneric) — portable DOOM engine
+- [Quake 2](https://github.com/id-Software/Quake-2) — id Software's classic FPS
 - [musl libc](https://musl.libc.org/) — C standard library
 - [bash](https://www.gnu.org/software/bash/) — Bourne Again Shell
 - [busybox](https://busybox.net/) — Unix utilities in a single binary
@@ -233,6 +274,10 @@ ctest --test-dir build/release/host_tests --output-on-failure  # Host-native uni
 - [QEMU](https://www.qemu.org/) — machine emulator for development and testing
 - [Ladybird](https://ladybird.dev/) — independent web browser
 - [NetSurf](https://www.netsurf-browser.org/) — lightweight web browser
+- [Qalculate!](https://qalculate.github.io/) — powerful desktop calculator
+- [GIMP](https://www.gimp.org/) — GNU Image Manipulation Program
+- [LibreOffice](https://www.libreoffice.org/) — open-source office suite
+- [stb_vorbis](https://github.com/nothings/stb) — OGG Vorbis decoder
 
 ## License
 

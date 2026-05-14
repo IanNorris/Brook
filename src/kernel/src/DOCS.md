@@ -156,9 +156,9 @@ so this avoids full-frame MMIO flushes (~8 MB at 1920×1080×4).
 
 ### Syscall Interface: Linux-Compatible
 
-Brook implements ~200 Linux syscalls via LSTAR/STAR MSRs. User programs compiled
+Brook implements ~175 Linux syscalls via LSTAR/STAR MSRs. User programs compiled
 against musl or glibc can run without modification. The syscall table lives in
-`syscall.cpp` (~12,000 lines) and covers: process management, file I/O, memory
+`syscall.cpp` (~12,800 lines) and covers: process management, file I/O, memory
 mapping, networking (socket/connect/bind/listen/accept/send/recv), signals,
 futex, epoll, inotify stubs, and Brook-specific WM syscalls (512+).
 
