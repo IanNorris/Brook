@@ -2110,8 +2110,19 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             }
             uint32_t newBytes = dataLen - staleBytes;
             bufferWasFull = (newBytes > 0 && freeSpace == 0);
-            if (newBytes > freeSpace)
+            if (newBytes > freeSpace) {
                 dataLen = staleBytes + freeSpace;
+                // If we clamped data away and this segment carries FIN,
+                // strip the FIN flag.  FIN occupies the sequence position
+                // after the last data byte; accepting it when some data
+                // was dropped would advance rcvNxt past bytes never
+                // delivered to the application — causing premature EOF
+                // and a truncated download.  The server will retransmit
+                // the FIN once we ACK the data we did accept and re-open
+                // the receive window.
+                if (flags & TCP_FIN)
+                    flags &= ~TCP_FIN;
+            }
         }
 
         // Delegate to testable state machine
