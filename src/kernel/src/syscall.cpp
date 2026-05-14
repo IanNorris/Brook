@@ -10441,6 +10441,32 @@ static int64_t sys_brook_wm_get_screen_info(uint64_t outAddr, uint64_t, uint64_t
 }
 
 // ---------------------------------------------------------------------------
+// 521: WM_SCANOUT_MAP(out_ptr) — map compositor backbuffer into caller's space.
+// Writes a ScanoutMapResult struct to out_ptr.
+// ---------------------------------------------------------------------------
+static int64_t sys_brook_wm_scanout_map(uint64_t outAddr, uint64_t, uint64_t,
+                                         uint64_t, uint64_t, uint64_t)
+{
+    if (!UserBufferWritable(outAddr, sizeof(brook::ScanoutMapResult)))
+        return -EFAULT;
+
+    Process* proc = ProcessCurrent();
+    auto* out = reinterpret_cast<brook::ScanoutMapResult*>(outAddr);
+    uint64_t addr = brook::CompositorScanoutMap(proc, out);
+    return addr ? 0 : -ENOMEM;
+}
+
+// ---------------------------------------------------------------------------
+// 522: WM_SCANOUT_FLIP(minY, maxY) — copy dirty rows to MMIO framebuffer.
+// ---------------------------------------------------------------------------
+static int64_t sys_brook_wm_scanout_flip(uint64_t minY, uint64_t maxY, uint64_t,
+                                          uint64_t, uint64_t, uint64_t)
+{
+    return brook::CompositorScanoutFlip(static_cast<uint32_t>(minY),
+                                        static_cast<uint32_t>(maxY));
+}
+
+// ---------------------------------------------------------------------------
 // sys_not_implemented
 // ---------------------------------------------------------------------------
 
@@ -12278,6 +12304,8 @@ void SyscallTableInit()
     g_syscallTable[518]                  = sys_brook_wm_set_cursor_visible;
     g_syscallTable[519]                  = sys_brook_wm_set_cursor_image;
     g_syscallTable[520]                  = sys_brook_wm_get_screen_info;
+    g_syscallTable[521]                  = sys_brook_wm_scanout_map;
+    g_syscallTable[522]                  = sys_brook_wm_scanout_flip;
 
     uint32_t count = 0;
     for (uint64_t i = 0; i < SYSCALL_MAX; ++i)

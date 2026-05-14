@@ -96,4 +96,23 @@ bool CompositorSetCursorVisible(Process* proc, bool visible);
 bool CompositorSetCursorImage(const uint32_t* pixels, uint32_t w, uint32_t h,
                               int32_t hotX, int32_t hotY);
 
+// --- Scanout interface (Phase 1 of usermode compositor migration) ---
+// These allow a privileged userspace process to take over compositing duties.
+
+// Map the compositor backbuffer into the calling process's address space.
+// Returns the user-space virtual address, or 0 on failure.
+// Also writes screen dimensions and stride to the output struct.
+struct ScanoutMapResult {
+    uint64_t userAddr;    // mapped address in caller's page table
+    uint32_t width;       // screen width in pixels
+    uint32_t height;      // screen height in pixels
+    uint32_t stride;      // row stride in pixels
+    uint32_t bufferBytes; // total buffer size
+};
+uint64_t CompositorScanoutMap(Process* proc, ScanoutMapResult* out);
+
+// Flip dirty rows from the (userspace-written) backbuffer to MMIO framebuffer.
+// Only copies rows in [minY, maxY). Returns 0 on success.
+int CompositorScanoutFlip(uint32_t minY, uint32_t maxY);
+
 } // namespace brook
