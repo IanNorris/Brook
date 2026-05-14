@@ -142,6 +142,11 @@ const char* const g_defaultEnvp[] = {
     "XDG_CONFIG_HOME=/home/.config",
     "XDG_DATA_HOME=/home/.local/share",
     "XDG_DATA_DIRS=/nix/store/jmp6v1wk4cwrm0m9ba8ri9ah8y4745g7-brook-fonts-0.1/share:/usr/share",
+    // Python: avoid write attempts to read-only nix store, skip user site
+    "PYTHONDONTWRITEBYTECODE=1",
+    "PYTHONNOUSERSITE=1",
+    "PYTHONIOENCODING=utf-8",
+    "LANG=C.UTF-8",
     nullptr
 };
 
