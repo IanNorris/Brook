@@ -445,19 +445,23 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
             uint32_t dw = (uint32_t)w > 64 ? 64 : (uint32_t)w;
             uint32_t dh = (uint32_t)h > 64 ? 64 : (uint32_t)h;
             uint32_t buf[64*64];
+            uint32_t nonzero = 0;
             for (uint32_t dy = 0; dy < dh; dy++) {
                 uint32_t sy = (dw == (uint32_t)w) ? dy : (dy * (uint32_t)h / dh);
                 for (uint32_t dx = 0; dx < dw; dx++) {
                     uint32_t sx = (dh == (uint32_t)h) ? dx : (dx * (uint32_t)w / dw);
                     uint32_t px = pixels[sy * src_stride + sx];
+                    if (px) nonzero++;
                     buf[dy * dw + dx] = force_opaque ? (0xFF000000u | (px & 0x00FFFFFFu)) : px;
                 }
             }
             int32_t shx = s->cursor_hot_x * (int32_t)dw / w;
             int32_t shy = s->cursor_hot_y * (int32_t)dh / h;
             long rc = wm_set_cursor_image(buf, dw, dh, shx, shy);
-            fprintf(stderr, "[waylandd] cursor commit: %dx%d fmt=%s hot=(%d,%d) rc=%ld px[0]=0x%08x\n",
-                    dw, dh, force_opaque ? "XRGB" : "ARGB", shx, shy, rc, buf[0]);
+            fprintf(stderr, "[waylandd] cursor commit: %dx%d fmt=%s hot=(%d,%d) rc=%ld "
+                    "nonzero=%u/%u src=%p stride=%d\n",
+                    dw, dh, force_opaque ? "XRGB" : "ARGB", shx, shy, rc,
+                    nonzero, dw*dh, (const void*)pixels, src_stride);
             wl_shm_buffer_end_access(shm);
         }
         wl_buffer_send_release(s->pending_buffer);
@@ -1720,8 +1724,9 @@ static void pump_input_for_surface(struct brook_surface *s) {
             if (e->mods & 0x10) locked    |= (1u << 1); /* Lock/Caps */
 
             /* Send key event first. */
+            uint32_t xkb_code = scancode_to_xkb(e->scan);
             wl_keyboard_send_key(sc->keyboard, next_serial(), now,
-                                 scancode_to_xkb(e->scan), st);
+                                 xkb_code, st);
 
             /* Always send modifiers after every key event so the client's
              * xkb_state stays in sync. Some toolkits (GTK via xkbcommon)
@@ -1730,6 +1735,13 @@ static void pump_input_for_surface(struct brook_surface *s) {
              * unconditionally (even if unchanged) ensures correctness. */
             wl_keyboard_send_modifiers(sc->keyboard, next_serial(),
                                        depressed, 0u, locked, 0u);
+
+            /* Debug: log key events with modifier info */
+            if (e->scan == 0x2A || e->scan == 0x36 || depressed || locked)
+                fprintf(stderr, "[waylandd] KEY sc=0x%02x xkb=%u %s mods=0x%02x dep=%u lock=%u\n",
+                        e->scan, xkb_code,
+                        st == WL_KEYBOARD_KEY_STATE_PRESSED ? "DN" : "UP",
+                        e->mods, depressed, locked);
             sc->kb_mods_depressed = depressed;
             sc->kb_mods_locked    = locked;
             break;

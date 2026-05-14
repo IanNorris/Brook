@@ -508,14 +508,30 @@ void WmSendToBack(int idx)
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
     if (!g_windows[idx].proc) return;
 
-    // Find the current minimum z-order across all windows
-    uint8_t minZ = 255;
+    // Renumber all z-orders to avoid collision: get sorted order, then
+    // assign sequential values starting from 1, placing idx at 0.
+    int sorted[WM_MAX_WINDOWS];
+    uint32_t count = 0;
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i) {
-        if (g_windows[i].proc && g_windows[i].zOrder < minZ)
-            minZ = g_windows[i].zOrder;
+        if (g_windows[i].proc && (int)i != idx)
+            sorted[count++] = (int)i;
     }
-    // Place this window below the current minimum
-    g_windows[idx].zOrder = (minZ > 0) ? (minZ - 1) : 0;
+    // Sort by current z-order (ascending)
+    for (uint32_t i = 1; i < count; ++i) {
+        int key = sorted[i];
+        uint8_t keyZ = g_windows[key].zOrder;
+        int j = (int)i - 1;
+        while (j >= 0 && g_windows[sorted[j]].zOrder > keyZ) {
+            sorted[j + 1] = sorted[j];
+            --j;
+        }
+        sorted[j + 1] = key;
+    }
+    // Assign: target gets 0, others get 1..count
+    g_windows[idx].zOrder = 0;
+    for (uint32_t i = 0; i < count; ++i)
+        g_windows[sorted[i]].zOrder = (uint8_t)(i + 1);
+    g_nextZOrder = (uint8_t)(count + 1);
 }
 
 int WmGetFocusedWindow()
