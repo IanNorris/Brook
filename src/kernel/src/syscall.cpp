@@ -165,6 +165,7 @@ extern "C" int64_t SyscallDispatchC(uint64_t a0, uint64_t a1, uint64_t a2,
 {
     uint64_t num;
     asm volatile("movq %%gs:120, %0" : "=r"(num));
+
     return brook::SyscallDispatchInternal(num, a0, a1, a2, a3, a4, a5);
 }
 
@@ -357,6 +358,7 @@ static volatile uint64_t g_profPreloadPages = 0;
 
 static constexpr int64_t ENOENT  = 2;
 static constexpr int64_t ESRCH   = 3;
+static constexpr int64_t ECHILD  = 10;
 static constexpr int64_t EPERM   = 1;
 static constexpr int64_t EBADF   = 9;
 static constexpr int64_t ENOMEM  = 12;
@@ -4613,6 +4615,7 @@ static int64_t sys_wait4(uint64_t pidArg, uint64_t statusAddr, uint64_t options,
     if (targetPid == 0) targetPid = -1;
 
     // Spin until a terminated (or stopped, if WUNTRACED) child is found
+    uint32_t retries = 0;
     for (;;)
     {
         // Check for stopped children if WUNTRACED
@@ -4651,21 +4654,35 @@ static int64_t sys_wait4(uint64_t pidArg, uint64_t statusAddr, uint64_t options,
             }
 
             SchedulerReapChild(child);
-            // Diagnostic: log the user-mode RIP we'll return to — catches
-            // cases where a stray corruption lands control flow off in the weeds.
-            {
-                uint64_t retRip = 0, retRsp = 0;
-                __asm__ volatile("movq %%gs:48, %0\n\t"
-                                 "movq %%gs:56, %1"
-                                 : "=r"(retRip), "=r"(retRsp));
-                DbgPrintf("WAIT4: pid=%u reaped child=%u status=0x%x -> user RIP=0x%lx RSP=0x%lx\n",
-                          parent->pid, childPid, childStatus, retRip, retRsp);
-            }
+            DbgPrintf("WAIT4: pid=%u reaped child=%u status=0x%x -> rip=0x%lx\n",
+                      parent->pid, childPid, childStatus, parent->syscallUserRip);
             return static_cast<int64_t>(childPid);
+        }
+
+        // No child with matching parentPid exists at all — return ECHILD
+        // instead of blocking forever. This handles the case where a child
+        // was already destroyed (e.g. by ReapTerminated) before the parent
+        // called waitpid.
+        if (targetPid > 0)
+        {
+            if (!SchedulerChildExists(parent->pid, static_cast<uint16_t>(targetPid)))
+            {
+                SerialPrintf("WAIT4: pid=%u target=%ld child NOT FOUND in proclist — returning ECHILD\n",
+                             parent->pid, targetPid);
+                return -ECHILD;
+            }
         }
 
         if (options & WNOHANG)
             return 0;
+
+        // Diagnostic: after many retries, dump the child's state
+        if (++retries == 100 && targetPid > 0)
+        {
+            SchedulerDumpChildState(parent->pid, static_cast<uint16_t>(targetPid));
+            SerialPrintf("WAIT4: pid=%u waiting for target=%ld after %u retries\n",
+                         parent->pid, targetPid, retries);
+        }
 
         extern volatile uint64_t g_lapicTickCount;
         parent->wakeupTick = g_lapicTickCount + 5;

@@ -74,6 +74,8 @@ void SchedulerFreePid(uint16_t pid);
 // matches a specific child PID. Returns the child Process* or nullptr.
 Process* SchedulerFindTerminatedChild(uint16_t parentPid, int64_t pid);
 Process* SchedulerFindStoppedChild(uint16_t parentPid, int64_t pid);
+bool SchedulerChildExists(uint16_t parentPid, uint16_t childPid);
+void SchedulerDumpChildState(uint16_t parentPid, uint16_t targetPid);
 void SchedulerStop(Process* proc);
 
 // Find a non-terminated process whose name (basename, possibly suffixed

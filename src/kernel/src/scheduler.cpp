@@ -173,7 +173,7 @@ static void CopyProcessNameForLog(const Process* proc, char out[33])
 
 // Pluggable scheduling policy (loaded at init, called through vtable).
 static const SchedOps* g_schedOps = nullptr;
-static uint8_t g_schedStateStorage[4096] __attribute__((aligned(16)));
+static uint8_t g_schedStateStorage[8192] __attribute__((aligned(16)));
 static void*   g_schedState = g_schedStateStorage;
 
 // Policy registry — modules register here; we can switch at runtime.
@@ -343,7 +343,8 @@ static void DrainPostSwitch(uint32_t cpu)
         }
         else
         {
-            DbgPrintf("SCHED: deferring reap for pid %u (compositorRegistered)\n", retired->pid);
+            SerialPrintf("SCHED: deferring reap for pid %u (compositorRegistered)\n",
+                         retired->pid);
         }
     }
 
@@ -831,9 +832,18 @@ static void ReapTerminated()
                 continue;
             }
 
+            // Threads (isThread=true) are never wait()-able children —
+            // auto-reap them regardless of parent state. Without this,
+            // c-ares resolver threads (CLONE_THREAD) from curl accumulate
+            // as zombies because parentPid points to the grandparent
+            // (nix-fetch) which is alive and never calls waitpid for them.
+            if (p->isThread)
+            {
+                // Thread — auto-reap immediately
+            }
             // If parentPid != 0, check if the parent still exists.
             // If the parent is gone, reparent to 0 so we can reap.
-            if (p->parentPid != 0)
+            else if (p->parentPid != 0)
             {
                 bool parentAlive = false;
                 for (uint32_t j = 0; j < g_processCount; j++)
@@ -1022,8 +1032,15 @@ void SchedulerTimerTick(bool allowPreempt)
     if (!g_schedulerRunning)
         return;
 
-    // Only BSP (CPU 0) does wakeup checks, reaping, and policy ticks.
+    // Drain pendingRetire on EVERY CPU, every tick. Without this, a process
+    // that exits on CPU N while idle is running may leave pendingRetire set
+    // until the next DoSwitch — which might not happen for a long time if
+    // no processes are ready. The child's reapable flag stays false and
+    // waitpid spins forever.
     uint32_t cpu = ThisCpu();
+    DrainPostSwitch(cpu);
+
+    // Only BSP (CPU 0) does wakeup checks, reaping, and policy ticks.
     if (cpu == 0)
     {
         CheckBlockedWakeups();
@@ -1752,6 +1769,7 @@ Process* SchedulerFindTerminatedChild(uint16_t parentPid, int64_t pid)
         if (p->parentPid == parentPid
             && p->state == ProcessState::Terminated
             && __atomic_load_n(&p->reapable, __ATOMIC_ACQUIRE)
+            && !p->isThread  // Threads are not waitable children
             && (pid == -1 || pid == static_cast<int64_t>(p->pid)))
         {
             SchedLockRelease(g_allProcLock, alf);
@@ -1779,6 +1797,40 @@ Process* SchedulerFindStoppedChild(uint16_t parentPid, int64_t pid)
     }
     SchedLockRelease(g_allProcLock, alf);
     return nullptr;
+}
+
+bool SchedulerChildExists(uint16_t parentPid, uint16_t childPid)
+{
+    uint64_t alf = SchedLockAcquire(g_allProcLock);
+    for (uint32_t i = 0; i < g_processCount; i++)
+    {
+        Process* p = g_allProcesses[i];
+        if (p->pid == childPid && p->parentPid == parentPid && !p->isThread)
+        {
+            SchedLockRelease(g_allProcLock, alf);
+            return true;
+        }
+    }
+    SchedLockRelease(g_allProcLock, alf);
+    return false;
+}
+
+void SchedulerDumpChildState(uint16_t parentPid, uint16_t targetPid)
+{
+    uint64_t alf = SchedLockAcquire(g_allProcLock);
+    for (uint32_t i = 0; i < g_processCount; i++)
+    {
+        Process* p = g_allProcesses[i];
+        if (p->pid == targetPid || p->parentPid == parentPid)
+        {
+            SerialPrintf("WAIT4-DIAG: pid=%u ppid=%u state=%d reapable=%d "
+                         "isThread=%d tgid=%u name='%s'\n",
+                         p->pid, p->parentPid, (int)p->state,
+                         __atomic_load_n(&p->reapable, __ATOMIC_ACQUIRE),
+                         p->isThread, p->tgid, p->name);
+        }
+    }
+    SchedLockRelease(g_allProcLock, alf);
 }
 
 Process* SchedulerFindProcessByBaseName(const char* basename)

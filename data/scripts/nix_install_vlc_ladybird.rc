@@ -1,0 +1,5 @@
+# Brook OS — install VLC and Ladybird from Nix binary cache
+# Target: < 5 minutes total install time
+vfb 1920 1080 1
+run /nix/bin/nix-install vlc
+run --once /nix/bin/nix-install ladybird
