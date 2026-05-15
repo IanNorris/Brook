@@ -543,6 +543,164 @@ static bool WaitAllSlots(VirtioBlkState& s, uint32_t count)
     return false;
 }
 
+// ---- Scatter-gather DMA read ----
+// Reads `sectorCount` sectors starting at `startSector` directly into
+// the virtual buffer `dst`.  Builds a descriptor chain with one data
+// descriptor per physical page, avoiding the intermediate DMA buffer copy.
+//
+// Head/tail partial pages use the legacy DMA bounce buffer.
+// Returns bytes read, or -1 on error.  Caller must hold the request lock.
+
+// Max data descriptors in one SG chain.  header(1) + data(N) + status(1)
+// must fit in the descriptor table region above the slot pool + legacy slot.
+static constexpr uint32_t SG_DESC_BASE  = LEGACY_DESC_BASE + DESCS_PER_SLOT; // first SG descriptor
+static constexpr uint32_t SG_MAX_DATA   = MAX_QUEUE_SIZE - SG_DESC_BASE - 2; // -2 for header+status
+
+static int SubmitScatterGatherRead(VirtioBlkState& s, uint64_t startSector,
+                                    uint32_t sectorCount, uint8_t* dst,
+                                    uint64_t dstOffset, uint64_t copyLen)
+{
+    // Build descriptor chain: [header] → [data0] → [data1] → ... → [status]
+    //
+    // The device reads sectors into a sequence of physically-addressed
+    // buffers.  For pages that are fully covered by the read, we point
+    // the descriptor directly at the destination page's physical address
+    // (zero-copy).  For partial head/tail pages we use the bounce buffer
+    // and memcpy the relevant bytes afterward.
+
+    uint64_t totalBytes  = static_cast<uint64_t>(sectorCount) * 512;
+    uint8_t* readDst     = dst; // start of destination for this chunk
+
+    // Determine page-granularity segments.
+    // headBytes: bytes before first page-aligned boundary in dst
+    // tailBytes: bytes after last page-aligned boundary
+    uintptr_t dstAddr   = reinterpret_cast<uintptr_t>(readDst);
+    uint64_t  headBytes = 0;
+    uint64_t  tailBytes = 0;
+
+    if (dstAddr & 0xFFF) {
+        headBytes = 4096 - (dstAddr & 0xFFF);
+        if (headBytes > totalBytes) headBytes = totalBytes;
+    }
+    uint64_t  midBytes = 0;
+    if (totalBytes > headBytes) {
+        midBytes = (totalBytes - headBytes) & ~0xFFFULL;
+        tailBytes = totalBytes - headBytes - midBytes;
+    }
+    uint32_t midPages = static_cast<uint32_t>(midBytes / 4096);
+
+    // Check descriptor budget: head(0-1) + midPages + tail(0-1)
+    uint32_t dataDescs = (headBytes ? 1 : 0) + midPages + (tailBytes ? 1 : 0);
+    if (dataDescs == 0 || dataDescs > SG_MAX_DATA)
+    {
+        // Fallback: too many pages for SG chain, use legacy DMA path.
+        return -1;
+    }
+
+    // ---- Fill header descriptor ----
+    uint16_t di = SG_DESC_BASE;
+
+    s.reqBuf->type     = VIRTIO_BLK_T_IN;
+    s.reqBuf->reserved = 0;
+    s.reqBuf->sector   = startSector;
+
+    s.descTable[di].addr  = s.reqBufPhys;
+    s.descTable[di].len   = sizeof(VirtioBlkReq);
+    s.descTable[di].flags = VIRTQ_DESC_F_NEXT;
+    s.descTable[di].next  = di + 1;
+    ++di;
+
+    // ---- Head partial page → bounce buffer ----
+    bool usedBounceHead = false;
+    if (headBytes > 0)
+    {
+        // DMA into the start of the legacy DMA bounce buffer.
+        s.descTable[di].addr  = s.dmaBufPhys;
+        s.descTable[di].len   = static_cast<uint32_t>(headBytes);
+        s.descTable[di].flags = VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE;
+        s.descTable[di].next  = di + 1;
+        ++di;
+        usedBounceHead = true;
+    }
+
+    // ---- Middle full pages → direct to destination ----
+    uint8_t* midStart = readDst + headBytes;
+    for (uint32_t p = 0; p < midPages; ++p)
+    {
+        uint64_t pageVirt = reinterpret_cast<uint64_t>(midStart) + p * 4096;
+        uint64_t pagePhys = VmmVirtToPhys(KernelPageTable, VirtualAddress(pageVirt)).raw();
+
+        s.descTable[di].addr  = pagePhys;
+        s.descTable[di].len   = 4096;
+        s.descTable[di].flags = VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE;
+        s.descTable[di].next  = di + 1;
+        ++di;
+    }
+
+    // ---- Tail partial page → bounce buffer ----
+    bool usedBounceTail = false;
+    if (tailBytes > 0)
+    {
+        // DMA into bounce buffer after the head portion.
+        uint64_t bounceOff = usedBounceHead ? headBytes : 0;
+        s.descTable[di].addr  = s.dmaBufPhys + bounceOff;
+        s.descTable[di].len   = static_cast<uint32_t>(tailBytes);
+        s.descTable[di].flags = VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE;
+        s.descTable[di].next  = di + 1;
+        ++di;
+        usedBounceTail = true;
+    }
+
+    // ---- Status descriptor ----
+    *s.statusBuf = 0xFF;
+    s.descTable[di].addr  = s.statusBufPhys;
+    s.descTable[di].len   = 1;
+    s.descTable[di].flags = VIRTQ_DESC_F_WRITE;
+    s.descTable[di].next  = 0;
+
+    // ---- Submit ----
+    __asm__ volatile("mfence" ::: "memory");
+
+    uint16_t ringSlot = s.availIdxShadow % s.queueSize;
+    s.availRing[ringSlot] = SG_DESC_BASE;
+    __asm__ volatile("mfence" ::: "memory");
+    *s.availIdx = ++s.availIdxShadow;
+    __asm__ volatile("mfence" ::: "memory");
+
+    __atomic_store_n(&s.irqComplete, 0, __ATOMIC_RELEASE);
+    VioWrite16(s.ioBase, VIRTIO_PCI_QUEUE_NOTIFY, 0);
+
+    // Wait for completion (same spin→hlt pattern).
+    static constexpr uint32_t SPIN_LIMIT = 1024;
+    for (uint32_t i = 0; i < SPIN_LIMIT; ++i) {
+        if (*s.usedIdx != s.usedIdxShadow) goto sg_done;
+        __asm__ volatile("pause" ::: "memory");
+    }
+    for (uint32_t i = 0; i < 100000u; ++i) {
+        if (*s.usedIdx != s.usedIdxShadow) goto sg_done;
+        __asm__ volatile("hlt" ::: "memory");
+    }
+    SerialPuts("virtio-blk: SG timeout\n");
+    return -1;
+
+sg_done:
+    __asm__ volatile("mfence" ::: "memory");
+    ++s.usedIdxShadow;
+
+    if (*s.statusBuf != VIRTIO_BLK_S_OK)
+        return -1;
+
+    // Copy bounce buffer portions into destination.
+    if (usedBounceHead)
+        memcpy(readDst, s.dmaBuf, headBytes);
+    if (usedBounceTail) {
+        uint64_t bounceOff = usedBounceHead ? headBytes : 0;
+        memcpy(readDst + headBytes + midBytes, s.dmaBuf + bounceOff, tailBytes);
+    }
+
+    return static_cast<int>(totalBytes);
+}
+
 static void AcquireRequestLock(VirtioBlkState& s)
 {
     uint32_t ticket = __atomic_fetch_add(&s.requestGuardNext, 1, __ATOMIC_RELAXED);
@@ -717,12 +875,30 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
         return static_cast<int>(bytesRead);
     }
 
+    // ---- Large read path: try scatter-gather DMA, fall back to bounce ----
     uint64_t sec = startSector;
     while (sec < endSector && bytesRead < len)
     {
-        uint64_t batchStart = sec;
         uint32_t batch = static_cast<uint32_t>(endSector - sec);
         if (batch > SECTORS_PER_DMA) batch = SECTORS_PER_DMA;
+
+        // Try scatter-gather: DMA directly into destination pages.
+        int sgResult = SubmitScatterGatherRead(*s, sec, batch,
+                                               dstBytes + bytesRead,
+                                               offset + bytesRead,
+                                               len - bytesRead);
+        if (sgResult > 0)
+        {
+            // SG succeeded — data is already in the destination buffer.
+            // Also populate the block cache from the destination.
+            CacheStoreFullBlocks(*s, sec, batch, dstBytes + bytesRead);
+            bytesRead += static_cast<uint64_t>(sgResult);
+            sec += batch;
+            continue;
+        }
+
+        // SG failed or not applicable — fall back to bounce buffer.
+        uint64_t batchStart = sec;
         uint32_t dmaLen = batch * SECTOR_SIZE;
 
         if (!SubmitRequest(*s, VIRTIO_BLK_T_IN, sec, s->dmaBufPhys, dmaLen))
@@ -735,7 +911,6 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
 
         CacheStoreFullBlocks(*s, batchStart, batch, s->dmaBuf);
 
-        // Copy relevant bytes from the DMA buffer into the output.
         for (uint32_t i = 0; i < batch && bytesRead < len; ++i, ++sec)
         {
             uint64_t sectorStart = sec * SECTOR_SIZE;

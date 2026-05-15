@@ -56,7 +56,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 // Outputs results to serial.  Uncomment RunIOBenchmarkSuite() call in boot
 // sequence to enable.
 // ---------------------------------------------------------------------------
-#if 0
+#if 0 // benchmark (enable + uncomment RunIOBenchmarkSuite() call below)
 static void RunIOBenchmark(const char* path, uint32_t readSize, bool warmup)
 {
     using namespace brook;
@@ -115,13 +115,13 @@ static void RunIOBenchmarkSuite()
     SerialPrintf("BENCH: === IO Benchmark Suite ===\n");
 
     // Cold reads (first access, no cache)
-    static const uint32_t bufSizes[] = { 512, 4096, 16384, 65536 };
-    for (uint32_t i = 0; i < 4; ++i) {
+    static const uint32_t bufSizes[] = { 512, 4096, 16384, 65536, 262144 };
+    for (uint32_t i = 0; i < 5; ++i) {
         RunIOBenchmark("/data/BENCH4M.DAT", bufSizes[i], false);
     }
 
     // Warm reads (second access, cached)
-    for (uint32_t i = 0; i < 4; ++i) {
+    for (uint32_t i = 0; i < 5; ++i) {
         RunIOBenchmark("/data/BENCH4M.DAT", bufSizes[i], true);
     }
 
