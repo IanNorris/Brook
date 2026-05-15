@@ -2091,14 +2091,39 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         }
         TcpStatsMaybeFlush();
 
-        // Clamp incoming data to bytes we can either expose to recv() now or
-        // hold for later reassembly.  Without this, tcpRcvNxt could advance
-        // past bytes the kernel cannot eventually deliver.
+        // Clamp incoming data so rcvNxt never advances past bytes we can
+        // actually store.  Only *new* bytes (past rcvNxt) consume buffer
+        // space; stale/retransmitted bytes before rcvNxt are trimmed by
+        // TcpProcessSegment and never enqueued.  The old code clamped the
+        // total segment length, which could make a partially-stale retransmit
+        // look fully stale — dropping its useful tail and stalling the
+        // connection on large downloads.
         extern volatile uint64_t g_lapicTickCount;
         TcpReapOoo(s, g_lapicTickCount);
         uint32_t freeSpace = TcpReceiveFree(s);
-        bool bufferWasFull = (dataLen > 0 && freeSpace == 0);
-        if (dataLen > freeSpace) dataLen = freeSpace;
+        bool bufferWasFull = false;
+        if (dataLen > 0) {
+            uint32_t staleBytes = 0;
+            if (TcpSeqBefore(seq, s.tcpRcvNxt)) {
+                uint32_t gap = s.tcpRcvNxt - seq;
+                staleBytes = gap < dataLen ? gap : dataLen;
+            }
+            uint32_t newBytes = dataLen - staleBytes;
+            bufferWasFull = (newBytes > 0 && freeSpace == 0);
+            if (newBytes > freeSpace) {
+                dataLen = staleBytes + freeSpace;
+                // If we clamped data away and this segment carries FIN,
+                // strip the FIN flag.  FIN occupies the sequence position
+                // after the last data byte; accepting it when some data
+                // was dropped would advance rcvNxt past bytes never
+                // delivered to the application — causing premature EOF
+                // and a truncated download.  The server will retransmit
+                // the FIN once we ACK the data we did accept and re-open
+                // the receive window.
+                if (flags & TCP_FIN)
+                    flags &= ~TCP_FIN;
+            }
+        }
 
         // Delegate to testable state machine
         uint32_t prevRxCount = s.rxCount;
@@ -2136,12 +2161,18 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         // Delayed ACK: ACK every 2nd data segment, or immediately for
         // control events (FIN, OOO, buffer-full, connect). This halves
         // the ACK packet count for bulk downloads.
+        //
+        // CRITICAL: when the buffer is full, we MUST send an ACK even if
+        // TcpProcessSegment didn't request one (e.g. because dataLen was
+        // clamped to 0).  Without this, the server never sees window=0
+        // and keeps blasting data that we silently drop, eventually
+        // causing retransmit timeouts and a stalled connection.
         bool mustAckNow = bufferWasFull
                           || act.justConnected
                           || s.tcpFinRecv
                           || act.holdOooData   // gap detected — dup-ACK for fast retransmit
                           || !act.enqueueData; // pure ACK / control segment
-        if (act.sendAck) {
+        if (act.sendAck || bufferWasFull) {
             if (mustAckNow || s.tcpUnackedSegs >= 1) {
                 TcpSendSegment(s, TCP_ACK, nullptr, 0,
                                bufferWasFull ? "rx-bufferfull" : "rx-action");

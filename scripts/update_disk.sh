@@ -150,6 +150,20 @@ for build_type in release debug; do
     fi
 done
 
+# --- Kernel symbol table (for profiler address resolution) ---
+# The ksym_addr_table.cpp is auto-generated during build and embeds symbol
+# addresses. Placing it on the boot disk lets the profiler_to_speedscope.py
+# script (or any host-side tool) resolve addresses without needing the full
+# ELF binary.
+for build_type in release debug; do
+    ksym_file="${ROOT_DIR}/build/${build_type}/kernel/ksym_addr_table.cpp"
+    if [ -f "$ksym_file" ]; then
+        echo "Kernel symbols (from ${build_type} build):"
+        sync_file "$ksym_file" "KSYM_ADDR.TXT"
+        break
+    fi
+done
+
 # --- User binaries ---
 echo "User binaries:"
 # Check build/*/user/ directories

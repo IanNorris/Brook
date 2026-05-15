@@ -8,6 +8,7 @@
 #include "ext2_vfs.h"
 #include "vfs.h"
 #include "device.h"
+#include "process.h"
 #include "memory/heap.h"
 #include "serial.h"
 #include "string.h"
@@ -226,6 +227,11 @@ struct Ext2Mount {
     SpinLock blockCacheLock;
     uint32_t* blockCacheBlockNum;  // [BLOCK_CACHE_SLOTS]; 0 = empty
     uint8_t** blockCacheData;      // [BLOCK_CACHE_SLOTS]; lazy-alloced per slot
+
+    // --- Access control ---
+    // When true, Unix permission checks are skipped for this mount.
+    // Used for /nix (packages must remain world-readable/executable).
+    bool skipPermChecks;
 };
 static constexpr uint32_t EXT2_INODE_CACHE_SIZE = 1024;
 static constexpr uint32_t EXT2_DIRENT_CACHE_SIZE = 1024;
@@ -1492,8 +1498,7 @@ static uint32_t Ext2ResolvePathInternal(Ext2Mount* mnt, uint32_t startIno,
         return 0;
     }
     if ((dirIno.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) {
-        SerialPrintf("ext2: ino %u not a dir (mode 0x%x) for component '%s'\n",
-                     curIno, dirIno.i_mode, component);
+        // Normal ENOTDIR — don't spam serial for routine path probes
         return 0;
     }
 
@@ -1591,6 +1596,10 @@ static int Ext2FileStat(Vnode* vn, VnodeStat* st)
     auto* fp = static_cast<Ext2FilePriv*>(vn->priv);
     st->size  = Ext2InodeSize(&fp->inodeData);
     st->isDir = false;
+    st->isSymlink = false;
+    st->uid   = fp->inodeData.i_uid;
+    st->gid   = fp->inodeData.i_gid;
+    st->mode  = fp->inodeData.i_mode;
     return 0;
 }
 
@@ -1659,9 +1668,13 @@ static void Ext2DirClose(Vnode* vn)
 
 static int Ext2DirStat(Vnode* vn, VnodeStat* st)
 {
-    (void)vn;
+    auto* dp = static_cast<Ext2DirPriv*>(vn->priv);
     st->size  = 0;
     st->isDir = true;
+    st->isSymlink = false;
+    st->uid   = dp->inodeData.i_uid;
+    st->gid   = dp->inodeData.i_gid;
+    st->mode  = dp->inodeData.i_mode;
     return 0;
 }
 
@@ -1690,6 +1703,7 @@ static const VnodeOps g_ext2DirOps = {
 // Device binding table (similar to FatFS pdrv concept)
 static constexpr uint8_t EXT2_MAX_MOUNTS = 8;
 static Device* g_ext2Devices[EXT2_MAX_MOUNTS] = {};
+static Ext2Mount* g_ext2Mounts[EXT2_MAX_MOUNTS] = {};
 
 static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
 {
@@ -1846,6 +1860,8 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
     }
 
     *mountPriv = mnt;
+    g_ext2Mounts[pdrv] = mnt;
+    mnt->skipPermChecks = false;  // Caller can override for nix mount
     DbgPrintf("ext2: mounted successfully\n");
     return true;
 }
@@ -1937,7 +1953,13 @@ static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
 
         // Initialize inode
         memset(&inodeData, 0, sizeof(inodeData));
-        inodeData.i_mode = EXT2_S_IFREG | 0644;
+        {
+            Process* cur = ProcessCurrent();
+            uint16_t mask = cur ? cur->umask : 022;
+            inodeData.i_mode = EXT2_S_IFREG | (0666 & ~mask);
+            inodeData.i_uid = cur ? static_cast<uint16_t>(cur->euid) : 0;
+            inodeData.i_gid = cur ? static_cast<uint16_t>(cur->egid) : 0;
+        }
         inodeData.i_links_count = 1;
         Ext2WriteInode(mnt, ino, &inodeData);
 
@@ -1963,6 +1985,34 @@ static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
         if (needsWrite) KRwLockWriteUnlock(&g_ext2Lock);
         else            KRwLockReadUnlock(&g_ext2Lock);
         return nullptr;
+    }
+
+    // Permission check (skipped for root or mounts with skipPermChecks set).
+    // Only applies to existing files — newly created files skip this.
+    if (!(flags & VFS_O_CREATE) || ino) {
+        Process* cur = ProcessCurrent();
+        if (cur && cur->euid != 0 && !mnt->skipPermChecks) {
+            uint16_t fmode = inodeData.i_mode & 07777;
+            uint16_t perm;
+            if (cur->euid == inodeData.i_uid)
+                perm = (fmode >> 6) & 7;
+            else if (cur->egid == inodeData.i_gid)
+                perm = (fmode >> 3) & 7;
+            else
+                perm = fmode & 7;
+
+            bool denied = false;
+            if (flags & VFS_O_WRITE)
+                denied = !(perm & 2);
+            else
+                denied = !(perm & 4);  // read access
+
+            if (denied) {
+                if (needsWrite) KRwLockWriteUnlock(&g_ext2Lock);
+                else            KRwLockReadUnlock(&g_ext2Lock);
+                return nullptr;  // EACCES (caller sees null = open failed)
+            }
+        }
     }
 
     // Truncate if requested
@@ -2055,6 +2105,9 @@ static int Ext2FsStatPath(void* mountPriv, uint8_t pdrv,
     st->isDir = (mode == EXT2_S_IFDIR);
     st->isSymlink = false; // stat follows symlinks, so result is never a symlink
     st->size  = st->isDir ? 0 : Ext2InodeSize(&inodeData);
+    st->uid   = inodeData.i_uid;
+    st->gid   = inodeData.i_gid;
+    st->mode  = inodeData.i_mode;
     return 0;
 }
 
@@ -2079,6 +2132,9 @@ static int Ext2FsLstatPath(void* mountPriv, uint8_t pdrv,
         st->isDir = true;
         st->isSymlink = false;
         st->size = 0;
+        st->uid  = inodeData.i_uid;
+        st->gid  = inodeData.i_gid;
+        st->mode = inodeData.i_mode;
         return 0;
     }
 
@@ -2103,6 +2159,9 @@ static int Ext2FsLstatPath(void* mountPriv, uint8_t pdrv,
     st->isDir     = (mode == EXT2_S_IFDIR);
     st->isSymlink = (mode == EXT2_S_IFLNK);
     st->size      = Ext2InodeSize(&inodeData);
+    st->uid       = inodeData.i_uid;
+    st->gid       = inodeData.i_gid;
+    st->mode      = inodeData.i_mode;
     return 0;
 }
 
@@ -2174,7 +2233,13 @@ static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath)
     // Initialize directory inode
     Ext2Inode newData;
     memset(&newData, 0, sizeof(newData));
-    newData.i_mode = EXT2_S_IFDIR | 0755;
+    {
+        Process* cur = ProcessCurrent();
+        uint16_t mask = cur ? cur->umask : 022;
+        newData.i_mode = EXT2_S_IFDIR | (0777 & ~mask);
+        newData.i_uid = cur ? static_cast<uint16_t>(cur->euid) : 0;
+        newData.i_gid = cur ? static_cast<uint16_t>(cur->egid) : 0;
+    }
     newData.i_links_count = 2; // . and parent's entry
 
     // Allocate first data block for . and .. entries
@@ -2468,6 +2533,73 @@ static int Ext2FsReadlink(void* mountPriv, uint8_t pdrv,
     return static_cast<int>(copyLen);
 }
 
+// ---------------------------------------------------------------------------
+// Ext2Chmod / Ext2Chown — modify inode metadata
+// ---------------------------------------------------------------------------
+
+int Ext2Chmod(const char* path, uint16_t newMode)
+{
+    // Find which ext2 mount this path belongs to
+    Ext2Mount* mnt = nullptr;
+    const char* relPath = nullptr;
+
+    // Try all ext2 mounts (typically "/" and "/home")
+    for (int i = 0; i < EXT2_MAX_MOUNTS; ++i) {
+        if (!g_ext2Mounts[i]) continue;
+        // Check if path starts with this mount's prefix
+        // For simplicity, use mount index 0 as root ext2
+        mnt = g_ext2Mounts[i];
+        relPath = path;
+        break;
+    }
+    if (!mnt) return -2; // -ENOENT
+
+    KRwLockWriteLock(&g_ext2Lock);
+
+    const char* p = relPath;
+    while (*p == '/') ++p;
+    uint32_t ino = *p ? Ext2ResolvePath(mnt, EXT2_ROOT_INO, p, 0) : EXT2_ROOT_INO;
+    if (!ino) { KRwLockWriteUnlock(&g_ext2Lock); return -2; }
+
+    Ext2Inode inodeData;
+    if (!Ext2ReadInode(mnt, ino, &inodeData)) { KRwLockWriteUnlock(&g_ext2Lock); return -5; }
+
+    // Preserve type bits, replace permission bits
+    inodeData.i_mode = (inodeData.i_mode & EXT2_S_IFMT) | (newMode & 07777);
+    Ext2WriteInode(mnt, ino, &inodeData);
+
+    KRwLockWriteUnlock(&g_ext2Lock);
+    return 0;
+}
+
+int Ext2Chown(const char* path, uint32_t uid, uint32_t gid)
+{
+    Ext2Mount* mnt = nullptr;
+    for (int i = 0; i < EXT2_MAX_MOUNTS; ++i) {
+        if (!g_ext2Mounts[i]) continue;
+        mnt = g_ext2Mounts[i];
+        break;
+    }
+    if (!mnt) return -2;
+
+    KRwLockWriteLock(&g_ext2Lock);
+
+    const char* p = path;
+    while (*p == '/') ++p;
+    uint32_t ino = *p ? Ext2ResolvePath(mnt, EXT2_ROOT_INO, p, 0) : EXT2_ROOT_INO;
+    if (!ino) { KRwLockWriteUnlock(&g_ext2Lock); return -2; }
+
+    Ext2Inode inodeData;
+    if (!Ext2ReadInode(mnt, ino, &inodeData)) { KRwLockWriteUnlock(&g_ext2Lock); return -5; }
+
+    if (uid != 0xFFFFFFFF) inodeData.i_uid = static_cast<uint16_t>(uid);
+    if (gid != 0xFFFFFFFF) inodeData.i_gid = static_cast<uint16_t>(gid);
+    Ext2WriteInode(mnt, ino, &inodeData);
+
+    KRwLockWriteUnlock(&g_ext2Lock);
+    return 0;
+}
+
 static const VfsFsOps g_ext2FsOps = {
     .mount      = Ext2FsMount,
     .unmount    = Ext2FsUnmount,
@@ -2490,6 +2622,12 @@ void Ext2VfsRegister()
 {
     EnsureLock();
     VfsRegisterFs("ext2", &g_ext2FsOps);
+}
+
+void Ext2SetSkipPermChecks(uint8_t pdrv, bool skip)
+{
+    if (pdrv >= EXT2_MAX_MOUNTS || !g_ext2Mounts[pdrv]) return;
+    g_ext2Mounts[pdrv]->skipPermChecks = skip;
 }
 
 } // namespace brook
