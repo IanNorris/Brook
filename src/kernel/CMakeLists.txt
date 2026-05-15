@@ -185,6 +185,7 @@ add_executable(kernel
     src/vfs.cpp
     src/fatfs_vfs.cpp
     src/ext2_vfs.cpp
+    src/ext4_vfs.cpp
     src/procfs.cpp
     src/procfs_vfs.cpp
     src/net.cpp
@@ -423,15 +424,27 @@ function(add_driver_module mod_name)
     endforeach()
 
     # Compile each source to an object, then partial-link with -r.
+    # C files use CMAKE_C_COMPILER and skip C++-only flags.
     set(OBJ_FILES)
     foreach(src IN LISTS MOD_SOURCES)
         get_filename_component(src_name "${src}" NAME_WE)
+        get_filename_component(src_ext  "${src}" EXT)
         set(obj "${DRIVER_OUTPUT_DIR}/${mod_name}_${src_name}.o")
+
+        if("${src_ext}" STREQUAL ".c")
+            set(_compiler "${CMAKE_C_COMPILER}")
+            # C files: use gnu11 (not c11) so GNU extensions like asm() work
+            set(_lang_flags "-std=gnu11")
+        else()
+            set(_compiler "${CMAKE_CXX_COMPILER}")
+            set(_lang_flags "")
+        endif()
 
         add_custom_command(
             OUTPUT  "${obj}"
-            COMMAND "${CMAKE_CXX_COMPILER}"
+            COMMAND "${_compiler}"
                     ${DRIVER_MODULE_FLAGS}
+                    ${_lang_flags}
                     ${MOD_EXTRA_FLAGS}
                     ${INCLUDE_FLAGS}
                     -c "${src}" -o "${obj}"

@@ -29,6 +29,7 @@
 #include "procfs.h"
 #include "fatfs_vfs.h"
 #include "ext2_vfs.h"
+#include "ext4_vfs.h"
 #include "procfs_vfs.h"
 #include "net.h"
 #include "compositor.h"
@@ -50,13 +51,110 @@
 // All kernel initialization and runtime — called by KernelMain after stack switch.
 __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootProtocol);
 
-// Probe a block device for a filesystem (FAT or ext2), read BROOK.MNT,
+// ---------------------------------------------------------------------------
+// IO Benchmark — measures sequential read throughput on a given VFS path.
+// Outputs results to serial.  Uncomment RunIOBenchmarkSuite() call in boot
+// sequence to enable.
+// ---------------------------------------------------------------------------
+#if 0 // benchmark (enable + uncomment RunIOBenchmarkSuite() call below)
+static void RunIOBenchmark(const char* path, uint32_t readSize, bool warmup)
+{
+    using namespace brook;
+
+    Vnode* vn = VfsOpen(path, 0);
+    if (!vn) {
+        SerialPrintf("BENCH: cannot open '%s'\n", path);
+        return;
+    }
+
+    VnodeStat st;
+    if (vn->ops->stat && vn->ops->stat(vn, &st) == 0) {
+        SerialPrintf("BENCH: '%s' size=%u bytes\n", path, (unsigned)st.size);
+    }
+
+    // Allocate read buffer
+    auto* buf = static_cast<uint8_t*>(kmalloc(readSize));
+    if (!buf) {
+        SerialPrintf("BENCH: alloc failed (%u)\n", readSize);
+        VfsClose(vn);
+        return;
+    }
+
+    if (warmup) {
+        // Warm-up pass (populate caches)
+        uint64_t off = 0;
+        int64_t n;
+        while ((n = VfsRead(vn, buf, readSize, &off)) > 0) {}
+    }
+
+    // Timed pass — sequential read of entire file
+    uint64_t off = 0;
+    uint64_t totalBytes = 0;
+    uint64_t tStart = ApicTickCount();
+    int64_t n;
+    while ((n = VfsRead(vn, buf, readSize, &off)) > 0) {
+        totalBytes += n;
+    }
+    uint64_t tEnd = ApicTickCount();
+    uint64_t elapsedMs = tEnd - tStart;
+    if (elapsedMs == 0) elapsedMs = 1;
+
+    uint64_t kbPerSec = (totalBytes * 1000) / (elapsedMs * 1024);
+    SerialPrintf("BENCH: '%s' %s read %u bytes in %u ms = %u KB/s (buf=%u)\n",
+                 path, warmup ? "warm" : "cold",
+                 (unsigned)totalBytes, (unsigned)elapsedMs,
+                 (unsigned)kbPerSec, readSize);
+
+    kfree(buf);
+    VfsClose(vn);
+}
+
+static void RunIOBenchmarkSuite()
+{
+    using namespace brook;
+    SerialPrintf("BENCH: === IO Benchmark Suite ===\n");
+
+    // Cold reads (first access, no cache)
+    static const uint32_t bufSizes[] = { 512, 4096, 16384, 65536, 262144 };
+    for (uint32_t i = 0; i < 5; ++i) {
+        RunIOBenchmark("/data/BENCH4M.DAT", bufSizes[i], false);
+    }
+
+    // Warm reads (second access, cached)
+    for (uint32_t i = 0; i < 5; ++i) {
+        RunIOBenchmark("/data/BENCH4M.DAT", bufSizes[i], true);
+    }
+
+    SerialPrintf("BENCH: === Suite complete ===\n");
+}
+#endif
+
+// Deferred probe list: devices that couldn't be mounted during initial scan
+// (e.g. ext4 VFS not yet registered). Re-probed after module loading.
+struct DeferredProbe {
+    brook::Device* dev;
+    uint8_t pdrv;
+    char label[24];
+};
+static DeferredProbe g_deferredProbes[16];
+static uint32_t g_deferredCount = 0;
+
+// Probe a block device for a filesystem (FAT, ext4, or ext2), read BROOK.MNT,
 // and mount at the specified path.  Returns true if mounted.
-static bool ProbeAndMountDevice(const char* label, brook::Device* dev, uint8_t pdrv)
+// When allowDefer is true, devices that fail to mount or find BROOK.MNT are
+// queued for re-probe after module loading.
+static bool ProbeAndMountDevice(const char* label, brook::Device* dev, uint8_t pdrv,
+                                bool allowDefer = true)
 {
     brook::FatFsBindDrive(pdrv, dev);
     bool mounted = brook::VfsMount("/mnt/probe", "fatfs", pdrv);
     const char* fsType = "fatfs";
+
+    if (!mounted) {
+        Ext4BindDevice(pdrv, dev);
+        mounted = brook::VfsMount("/mnt/probe", "ext4", pdrv);
+        fsType = "ext4";
+    }
 
     if (!mounted) {
         Ext2BindDevice(pdrv, dev);
@@ -65,7 +163,16 @@ static bool ProbeAndMountDevice(const char* label, brook::Device* dev, uint8_t p
     }
 
     if (!mounted) {
-        brook::SerialPrintf("%s — no recognized filesystem\n", label);
+        // Queue for re-probe after modules load (ext4 may not be registered yet).
+        if (allowDefer && g_deferredCount < 16) {
+            auto& d = g_deferredProbes[g_deferredCount++];
+            d.dev = dev;
+            d.pdrv = pdrv;
+            for (int i = 0; i < 23 && label[i]; ++i) d.label[i] = label[i];
+            d.label[23] = '\0';
+        }
+        brook::SerialPrintf("%s — no recognized filesystem%s\n", label,
+                           allowDefer ? " (deferred)" : "");
         return false;
     }
 
@@ -73,6 +180,14 @@ static bool ProbeAndMountDevice(const char* label, brook::Device* dev, uint8_t p
     if (!mnt) {
         brook::SerialPrintf("%s — no BROOK.MNT, skipping\n", label);
         brook::VfsUnmount("/mnt/probe");
+        // Defer for re-probe: a better driver loaded later may read the file.
+        if (allowDefer && g_deferredCount < 16) {
+            auto& d = g_deferredProbes[g_deferredCount++];
+            d.dev = dev;
+            d.pdrv = pdrv;
+            for (int i = 0; i < 23 && label[i]; ++i) d.label[i] = label[i];
+            d.label[23] = '\0';
+        }
         return false;
     }
 
@@ -96,6 +211,11 @@ static bool ProbeAndMountDevice(const char* label, brook::Device* dev, uint8_t p
     }
 
     brook::VfsUnmount("/mnt/probe");
+
+    // Unmount any existing filesystem at this path (e.g. ext2 claimed it
+    // before the ext4 module was loaded and re-probed the device).
+    brook::VfsUnmount(mntPath);
+
     if (brook::VfsMount(mntPath, fsType, pdrv)) {
         brook::KPrintf("%s mounted at %s\n", label, mntPath);
 
@@ -485,6 +605,16 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::ModuleDiscoverAndLoad("/boot/drivers");
     brook::SerialPuts("module: Phase 2 — done\n");
 
+    // ---- Re-probe deferred devices (e.g. ext4 now registered) ----
+    if (g_deferredCount > 0) {
+        brook::SerialPrintf("module: re-probing %u deferred device(s)\n", g_deferredCount);
+        for (uint32_t i = 0; i < g_deferredCount; ++i) {
+            auto& d = g_deferredProbes[i];
+            ProbeAndMountDevice(d.label, d.dev, d.pdrv, /*allowDefer=*/false);
+        }
+        g_deferredCount = 0;
+    }
+
     // ---- USB block devices: probe after xHCI module has loaded ----
     // The xHCI module registers "usb0", "usb1", etc. as block devices.
     // First scan each for GPT partition tables; then probe all resulting
@@ -527,6 +657,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             ProbeAndMountDevice(label, ud, nextPdrv++);
         }
     }
+
+    // ---- IO Benchmark (uncomment to run before compositor starts) ----
+    // RunIOBenchmarkSuite();
 
     // ---- Network (static config from BROOK.CFG, or DHCP) ----
     if (brook::NetGetIf()) {

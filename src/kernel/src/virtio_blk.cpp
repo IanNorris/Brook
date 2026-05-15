@@ -7,6 +7,7 @@
 #include "memory/heap.h"
 #include "serial.h"
 #include "mem_tag.h"
+#include "idt.h"
 
 namespace brook {
 
@@ -19,6 +20,7 @@ static constexpr uint8_t VIRTIO_PCI_QUEUE_SIZE     = 0x0C;
 static constexpr uint8_t VIRTIO_PCI_QUEUE_SEL      = 0x0E;
 static constexpr uint8_t VIRTIO_PCI_QUEUE_NOTIFY   = 0x10;
 static constexpr uint8_t VIRTIO_PCI_STATUS         = 0x12;
+static constexpr uint8_t VIRTIO_PCI_ISR            = 0x13; // ISR status (read clears)
 
 // Device config space starts at 0x14 for legacy; blk config has capacity first.
 static constexpr uint8_t VIRTIO_PCI_BLK_CAPACITY   = 0x14; // 64-bit sector count
@@ -40,10 +42,11 @@ static constexpr uint32_t VIRTIO_BLK_T_OUT = 1; // write
 static constexpr uint8_t VIRTIO_BLK_S_OK = 0;
 
 static constexpr uint32_t VIRTIO_MAX_DEVS = 8;
+static constexpr uint8_t  VIRTIO_BLK_IRQ_VECTOR = 50; // preferred IDT vector
 static constexpr uint32_t VIRTIO_CACHE_BLOCK_SECTORS = 8;     // 4 KiB
 static constexpr uint32_t VIRTIO_CACHE_BLOCK_SIZE    = 4096;
 static constexpr uint32_t VIRTIO_CACHE_ENTRIES       = 4096;  // 16 MiB
-static constexpr uint64_t VIRTIO_SMALL_READ_LIMIT    = 16 * 1024;
+static constexpr uint64_t VIRTIO_SMALL_READ_LIMIT    = 64 * 1024;
 
 // ---- Virtqueue structures (packed for DMA) ----
 
@@ -54,20 +57,42 @@ struct __attribute__((packed)) VirtqDesc {
     uint16_t next;
 };
 
-// Maximum queue size we're willing to handle.  The device may advertise
-// up to 32768; we cap to keep DMA allocation bounded (~32 KB total).
-static constexpr uint32_t MAX_QUEUE_SIZE = 256;
-
-struct __attribute__((packed)) VirtqUsedElem {
-    uint32_t id;
-    uint32_t len;
-};
-
 // virtio-blk request header (placed before the data buffer)
 struct __attribute__((packed)) VirtioBlkReq {
     uint32_t type;
     uint32_t reserved;
     uint64_t sector;
+};
+
+// ---- Multi-request slot pool ----
+// Each slot owns 3 contiguous descriptors, a request header, a status byte,
+// and a small (4 KiB) DMA buffer used for cache-fill reads.  Up to
+// MAX_INFLIGHT requests can be outstanding simultaneously.
+
+static constexpr uint32_t MAX_INFLIGHT       = 16;
+static constexpr uint32_t DESCS_PER_SLOT     = 3; // header + data + status
+static constexpr uint32_t SLOT_DMA_SIZE      = VIRTIO_CACHE_BLOCK_SIZE; // 4 KiB
+
+struct RequestSlot {
+    VirtioBlkReq* reqBuf;       // 16-byte request header (DMA-visible)
+    uint64_t      reqBufPhys;
+    uint8_t*      statusBuf;    // 1-byte status (DMA-visible)
+    uint64_t      statusBufPhys;
+    uint8_t*      dmaBuf;       // 4 KiB data buffer (DMA-visible)
+    uint64_t      dmaBufPhys;
+    uint16_t      descBase;     // first descriptor index in the table
+    volatile bool complete;     // set by completion reaper
+    uint64_t      blockNumber;  // which cache block this slot is filling
+};
+
+// Maximum queue size we're willing to handle.  The device may advertise
+// up to 32768; we cap to keep DMA allocation bounded.
+// Must be >= MAX_INFLIGHT * DESCS_PER_SLOT + DESCS_PER_SLOT (for the legacy slot).
+static constexpr uint32_t MAX_QUEUE_SIZE = 256;
+
+struct __attribute__((packed)) VirtqUsedElem {
+    uint32_t id;
+    uint32_t len;
 };
 
 struct VirtioBlkCacheEntry {
@@ -106,9 +131,9 @@ struct VirtioBlkState {
     uint8_t*      statusBuf;
     uint64_t      statusBufPhys;
 
-    // Persistent page-aligned DMA data buffer (64 KB = 128 sectors).
+    // Persistent page-aligned DMA data buffer (256 KB = 512 sectors).
     // Larger buffer means fewer SubmitRequest round-trips for big reads.
-    static constexpr uint32_t DMA_BUF_PAGES = 16;
+    static constexpr uint32_t DMA_BUF_PAGES = 64;
     uint8_t*      dmaBuf;
     uint64_t      dmaBufPhys;
 
@@ -126,6 +151,18 @@ struct VirtioBlkState {
     // buffer, so only one request can be in-flight at a time.
     volatile uint32_t requestGuardNext;
     volatile uint32_t requestGuardServing;
+
+    // Interrupt-driven completion: the ISR sets this flag; SubmitRequest
+    // spins briefly then falls back to hlt until the interrupt fires.
+    volatile uint32_t irqComplete;
+    uint8_t           irqLine;   // PCI interrupt line (ISA IRQ number)
+    uint8_t           irqVector; // actual IDT vector assigned
+
+    // Multi-request slot pool for batched cache-fill reads.
+    // Slots 0..MAX_INFLIGHT-1 each own descriptors [slot*3 .. slot*3+2].
+    // The legacy single-request path uses descriptors [MAX_INFLIGHT*3 .. MAX_INFLIGHT*3+2].
+    RequestSlot       slots[MAX_INFLIGHT];
+    uint32_t          slotsInFlight; // how many slots have been submitted but not reaped
 };
 
 // ---- Register helpers ----
@@ -256,10 +293,52 @@ static bool AllocVirtqueue(VirtioBlkState& s)
     s.queuePhys = VmmVirtToPhys(KernelPageTable, VirtualAddress(qVirt)).raw();
 
     uint64_t extraVirt = qVirt + (totalPages - 1) * 4096;
+    // Legacy single-request slot (used for writes and large DMA reads).
+    // Descriptor indices: MAX_INFLIGHT*3 .. MAX_INFLIGHT*3+2.
     s.reqBuf         = reinterpret_cast<VirtioBlkReq*>(extraVirt);
     s.reqBufPhys     = VmmVirtToPhys(KernelPageTable, VirtualAddress(extraVirt)).raw();
     s.statusBuf      = reinterpret_cast<uint8_t*>(extraVirt + sizeof(VirtioBlkReq));
     s.statusBufPhys  = s.reqBufPhys + sizeof(VirtioBlkReq);
+
+    // ---- Allocate multi-request slot pool ----
+    // One page for all slot metadata (reqBuf + statusBuf per slot),
+    // plus MAX_INFLIGHT pages for the 4 KiB DMA data buffers.
+    uint32_t slotMetaPages = 1;
+    uint32_t slotDmaPages  = MAX_INFLIGHT; // one 4 KiB page per slot
+    uint32_t slotTotalPages = slotMetaPages + slotDmaPages;
+
+    uint64_t slotVirt = VmmAllocPages(slotTotalPages, VMM_WRITABLE, MemTag::Device, KernelPid).raw();
+    if (!slotVirt)
+    {
+        SerialPuts("virtio: slot pool alloc failed\n");
+        return false;
+    }
+    memset(reinterpret_cast<void*>(slotVirt), 0, slotTotalPages * 4096);
+    uint64_t slotPhysBase = VmmVirtToPhys(KernelPageTable, VirtualAddress(slotVirt)).raw();
+
+    // Metadata page layout: [VirtioBlkReq(16) + status(1)] × MAX_INFLIGHT
+    // Each entry is 17 bytes; 16 entries = 272 bytes (fits in one page).
+    for (uint32_t i = 0; i < MAX_INFLIGHT; ++i)
+    {
+        RequestSlot& rs = s.slots[i];
+        uint64_t metaOff = i * 32; // 32-byte stride for alignment
+        rs.reqBuf      = reinterpret_cast<VirtioBlkReq*>(slotVirt + metaOff);
+        rs.reqBufPhys  = slotPhysBase + metaOff;
+        rs.statusBuf   = reinterpret_cast<uint8_t*>(slotVirt + metaOff + sizeof(VirtioBlkReq));
+        rs.statusBufPhys = slotPhysBase + metaOff + sizeof(VirtioBlkReq);
+
+        // DMA data buffer: one page per slot, starting after the metadata page.
+        uint64_t dmaOff = (slotMetaPages + i) * 4096;
+        rs.dmaBuf     = reinterpret_cast<uint8_t*>(slotVirt + dmaOff);
+        rs.dmaBufPhys = VmmVirtToPhys(KernelPageTable, VirtualAddress(slotVirt + dmaOff)).raw();
+
+        rs.descBase   = static_cast<uint16_t>(i * DESCS_PER_SLOT);
+        rs.complete   = false;
+        rs.blockNumber = 0;
+    }
+    s.slotsInFlight = 0;
+
+    SerialPrintf("virtio: slot pool: %u slots, %u pages\n", MAX_INFLIGHT, slotTotalPages);
 
     SerialPrintf("virtio: queuePhys=0x%lx reqBufPhys=0x%lx\n",
                  s.queuePhys, s.reqBufPhys);
@@ -276,57 +355,83 @@ static bool AllocVirtqueue(VirtioBlkState& s)
     return true;
 }
 
-// ---- Synchronous request (polling, interrupts left enabled) ----
+// ---- Interrupt handler ----
+
+// Per-device state pointers indexed by slot (for ISR lookup).
+static VirtioBlkState* g_devStates[VIRTIO_MAX_DEVS];
+static uint32_t        g_devCount = 0;
+
+// Plain function — called by the shared IRQ dispatch stub.
+// Must NOT be __attribute__((interrupt)). Must NOT call ApicSendEoi().
+static void VirtioBlkIrqBody()
+{
+    for (uint32_t i = 0; i < g_devCount; ++i)
+    {
+        VirtioBlkState* s = g_devStates[i];
+        if (!s) continue;
+
+        // Read ISR status register — clears the interrupt on the device.
+        uint8_t isr = inb(s->ioBase + VIRTIO_PCI_ISR);
+        if (isr & 1)
+        {
+            // Queue completion — signal the waiting SubmitRequest.
+            __atomic_store_n(&s->irqComplete, 1, __ATOMIC_RELEASE);
+        }
+    }
+}
+
+// ---- Synchronous request (legacy path for writes & large DMA reads) ----
+// Uses descriptors at offset MAX_INFLIGHT*3 to avoid collision with slot pool.
+
+static constexpr uint16_t LEGACY_DESC_BASE = MAX_INFLIGHT * DESCS_PER_SLOT;
 
 static bool SubmitRequest(VirtioBlkState& s,
                            uint32_t type, uint64_t sector,
                            uint64_t dataBufPhys, uint32_t dataLen)
 {
-    // Descriptor 0: request header (device-readable)
+    uint16_t d0 = LEGACY_DESC_BASE;
+    uint16_t d1 = LEGACY_DESC_BASE + 1;
+    uint16_t d2 = LEGACY_DESC_BASE + 2;
+
     s.reqBuf->type     = type;
     s.reqBuf->reserved = 0;
     s.reqBuf->sector   = sector;
 
-    s.descTable[0].addr  = s.reqBufPhys;
-    s.descTable[0].len   = sizeof(VirtioBlkReq);
-    s.descTable[0].flags = VIRTQ_DESC_F_NEXT;
-    s.descTable[0].next  = 1;
+    s.descTable[d0].addr  = s.reqBufPhys;
+    s.descTable[d0].len   = sizeof(VirtioBlkReq);
+    s.descTable[d0].flags = VIRTQ_DESC_F_NEXT;
+    s.descTable[d0].next  = d1;
 
-    // Descriptor 1: data buffer
-    // For reads (VIRTIO_BLK_T_IN), the device writes data → VIRTQ_DESC_F_WRITE.
-    // For writes (VIRTIO_BLK_T_OUT), we write data → no write flag.
-    s.descTable[1].addr  = dataBufPhys;
-    s.descTable[1].len   = dataLen;
-    s.descTable[1].flags = VIRTQ_DESC_F_NEXT | (type == VIRTIO_BLK_T_IN ? VIRTQ_DESC_F_WRITE : 0);
-    s.descTable[1].next  = 2;
+    s.descTable[d1].addr  = dataBufPhys;
+    s.descTable[d1].len   = dataLen;
+    s.descTable[d1].flags = VIRTQ_DESC_F_NEXT | (type == VIRTIO_BLK_T_IN ? VIRTQ_DESC_F_WRITE : 0);
+    s.descTable[d1].next  = d2;
 
-    // Descriptor 2: status byte (device writes result)
-    *s.statusBuf         = 0xFF; // sentinel
-    s.descTable[2].addr  = s.statusBufPhys;
-    s.descTable[2].len   = 1;
-    s.descTable[2].flags = VIRTQ_DESC_F_WRITE;
-    s.descTable[2].next  = 0;
+    *s.statusBuf         = 0xFF;
+    s.descTable[d2].addr  = s.statusBufPhys;
+    s.descTable[d2].len   = 1;
+    s.descTable[d2].flags = VIRTQ_DESC_F_WRITE;
+    s.descTable[d2].next  = 0;
 
-    // Memory barrier before making descriptors visible.
     __asm__ volatile("mfence" ::: "memory");
 
-    // Add head descriptor (0) to available ring.
-    uint16_t slot = s.availIdxShadow % s.queueSize;
-    s.availRing[slot] = 0;
+    uint16_t ringSlot = s.availIdxShadow % s.queueSize;
+    s.availRing[ringSlot] = d0;
     __asm__ volatile("mfence" ::: "memory");
     *s.availIdx = ++s.availIdxShadow;
     __asm__ volatile("mfence" ::: "memory");
 
-    // Notify device that queue 0 has work.
+    __atomic_store_n(&s.irqComplete, 0, __ATOMIC_RELEASE);
     VioWrite16(s.ioBase, VIRTIO_PCI_QUEUE_NOTIFY, 0);
 
-    // Poll for completion — busy-wait with pause.
-    // KVM virtio completions are typically sub-microsecond, so this
-    // loop rarely runs more than a few iterations.
-    for (uint32_t i = 0; i < 100000000u; ++i) {
-        if (*s.usedIdx != s.usedIdxShadow)
-            goto done;
+    static constexpr uint32_t SPIN_LIMIT = 1024;
+    for (uint32_t i = 0; i < SPIN_LIMIT; ++i) {
+        if (*s.usedIdx != s.usedIdxShadow) goto done;
         __asm__ volatile("pause" ::: "memory");
+    }
+    for (uint32_t i = 0; i < 100000u; ++i) {
+        if (*s.usedIdx != s.usedIdxShadow) goto done;
+        __asm__ volatile("hlt" ::: "memory");
     }
     SerialPuts("virtio-blk: timeout waiting for response\n");
     return false;
@@ -334,8 +439,266 @@ static bool SubmitRequest(VirtioBlkState& s,
 done:
     __asm__ volatile("mfence" ::: "memory");
     ++s.usedIdxShadow;
-
     return (*s.statusBuf == VIRTIO_BLK_S_OK);
+}
+
+// ---- Async multi-request API (for batched cache-fill reads) ----
+
+// Submit a 4 KiB read into a slot's DMA buffer. Non-blocking.
+static void SubmitSlotRead(VirtioBlkState& s, uint32_t slotIdx, uint64_t sector)
+{
+    RequestSlot& rs = s.slots[slotIdx];
+    uint16_t d0 = rs.descBase;
+    uint16_t d1 = rs.descBase + 1;
+    uint16_t d2 = rs.descBase + 2;
+
+    rs.reqBuf->type     = VIRTIO_BLK_T_IN;
+    rs.reqBuf->reserved = 0;
+    rs.reqBuf->sector   = sector;
+    rs.complete         = false;
+
+    s.descTable[d0].addr  = rs.reqBufPhys;
+    s.descTable[d0].len   = sizeof(VirtioBlkReq);
+    s.descTable[d0].flags = VIRTQ_DESC_F_NEXT;
+    s.descTable[d0].next  = d1;
+
+    s.descTable[d1].addr  = rs.dmaBufPhys;
+    s.descTable[d1].len   = SLOT_DMA_SIZE;
+    s.descTable[d1].flags = VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE;
+    s.descTable[d1].next  = d2;
+
+    *rs.statusBuf        = 0xFF;
+    s.descTable[d2].addr  = rs.statusBufPhys;
+    s.descTable[d2].len   = 1;
+    s.descTable[d2].flags = VIRTQ_DESC_F_WRITE;
+    s.descTable[d2].next  = 0;
+
+    __asm__ volatile("mfence" ::: "memory");
+
+    uint16_t ringSlot = s.availIdxShadow % s.queueSize;
+    s.availRing[ringSlot] = d0;
+    __asm__ volatile("mfence" ::: "memory");
+    *s.availIdx = ++s.availIdxShadow;
+    // Don't notify yet — caller batches multiple submissions then notifies once.
+}
+
+// Notify the device after batching one or more SubmitSlotRead calls.
+static void NotifyDevice(VirtioBlkState& s)
+{
+    __asm__ volatile("mfence" ::: "memory");
+    __atomic_store_n(&s.irqComplete, 0, __ATOMIC_RELEASE);
+    VioWrite16(s.ioBase, VIRTIO_PCI_QUEUE_NOTIFY, 0);
+}
+
+// Reap completed requests from the used ring.  Marks completed slots.
+// Returns the number of completions reaped this call.
+static uint32_t ReapCompletions(VirtioBlkState& s)
+{
+    uint32_t reaped = 0;
+    while (*s.usedIdx != s.usedIdxShadow)
+    {
+        __asm__ volatile("mfence" ::: "memory");
+        uint16_t usedSlot = s.usedIdxShadow % s.queueSize;
+        uint32_t descId = s.usedRing[usedSlot].id;
+        ++s.usedIdxShadow;
+
+        // Identify which request slot completed by descriptor base.
+        // Slot i uses descriptors [i*3 .. i*3+2].
+        if (descId < MAX_INFLIGHT * DESCS_PER_SLOT)
+        {
+            uint32_t slotIdx = descId / DESCS_PER_SLOT;
+            s.slots[slotIdx].complete = true;
+        }
+        // else: legacy slot completion (handled by SubmitRequest's wait loop)
+        ++reaped;
+    }
+    return reaped;
+}
+
+// Wait until all submitted slots are complete.
+static bool WaitAllSlots(VirtioBlkState& s, uint32_t count)
+{
+    // Spin first, then hlt.
+    for (uint32_t spin = 0; spin < 2048; ++spin)
+    {
+        ReapCompletions(s);
+        bool allDone = true;
+        for (uint32_t i = 0; i < count; ++i)
+            if (!s.slots[i].complete) { allDone = false; break; }
+        if (allDone) return true;
+        __asm__ volatile("pause" ::: "memory");
+    }
+
+    for (uint32_t iter = 0; iter < 100000u; ++iter)
+    {
+        ReapCompletions(s);
+        bool allDone = true;
+        for (uint32_t i = 0; i < count; ++i)
+            if (!s.slots[i].complete) { allDone = false; break; }
+        if (allDone) return true;
+        __asm__ volatile("hlt" ::: "memory");
+    }
+
+    SerialPuts("virtio-blk: timeout waiting for batch completion\n");
+    return false;
+}
+
+// ---- Scatter-gather DMA read ----
+// Reads `sectorCount` sectors starting at `startSector` directly into
+// the virtual buffer `dst`.  Builds a descriptor chain with one data
+// descriptor per physical page, avoiding the intermediate DMA buffer copy.
+//
+// Head/tail partial pages use the legacy DMA bounce buffer.
+// Returns bytes read, or -1 on error.  Caller must hold the request lock.
+
+// Max data descriptors in one SG chain.  header(1) + data(N) + status(1)
+// must fit in the descriptor table region above the slot pool + legacy slot.
+static constexpr uint32_t SG_DESC_BASE  = LEGACY_DESC_BASE + DESCS_PER_SLOT; // first SG descriptor
+static constexpr uint32_t SG_MAX_DATA   = MAX_QUEUE_SIZE - SG_DESC_BASE - 2; // -2 for header+status
+
+static int SubmitScatterGatherRead(VirtioBlkState& s, uint64_t startSector,
+                                    uint32_t sectorCount, uint8_t* dst,
+                                    uint64_t dstOffset, uint64_t copyLen)
+{
+    // Build descriptor chain: [header] → [data0] → [data1] → ... → [status]
+    //
+    // The device reads sectors into a sequence of physically-addressed
+    // buffers.  For pages that are fully covered by the read, we point
+    // the descriptor directly at the destination page's physical address
+    // (zero-copy).  For partial head/tail pages we use the bounce buffer
+    // and memcpy the relevant bytes afterward.
+
+    uint64_t totalBytes  = static_cast<uint64_t>(sectorCount) * 512;
+    uint8_t* readDst     = dst; // start of destination for this chunk
+
+    // Determine page-granularity segments.
+    // headBytes: bytes before first page-aligned boundary in dst
+    // tailBytes: bytes after last page-aligned boundary
+    uintptr_t dstAddr   = reinterpret_cast<uintptr_t>(readDst);
+    uint64_t  headBytes = 0;
+    uint64_t  tailBytes = 0;
+
+    if (dstAddr & 0xFFF) {
+        headBytes = 4096 - (dstAddr & 0xFFF);
+        if (headBytes > totalBytes) headBytes = totalBytes;
+    }
+    uint64_t  midBytes = 0;
+    if (totalBytes > headBytes) {
+        midBytes = (totalBytes - headBytes) & ~0xFFFULL;
+        tailBytes = totalBytes - headBytes - midBytes;
+    }
+    uint32_t midPages = static_cast<uint32_t>(midBytes / 4096);
+
+    // Check descriptor budget: head(0-1) + midPages + tail(0-1)
+    uint32_t dataDescs = (headBytes ? 1 : 0) + midPages + (tailBytes ? 1 : 0);
+    if (dataDescs == 0 || dataDescs > SG_MAX_DATA)
+    {
+        // Fallback: too many pages for SG chain, use legacy DMA path.
+        return -1;
+    }
+
+    // ---- Fill header descriptor ----
+    uint16_t di = SG_DESC_BASE;
+
+    s.reqBuf->type     = VIRTIO_BLK_T_IN;
+    s.reqBuf->reserved = 0;
+    s.reqBuf->sector   = startSector;
+
+    s.descTable[di].addr  = s.reqBufPhys;
+    s.descTable[di].len   = sizeof(VirtioBlkReq);
+    s.descTable[di].flags = VIRTQ_DESC_F_NEXT;
+    s.descTable[di].next  = di + 1;
+    ++di;
+
+    // ---- Head partial page → bounce buffer ----
+    bool usedBounceHead = false;
+    if (headBytes > 0)
+    {
+        // DMA into the start of the legacy DMA bounce buffer.
+        s.descTable[di].addr  = s.dmaBufPhys;
+        s.descTable[di].len   = static_cast<uint32_t>(headBytes);
+        s.descTable[di].flags = VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE;
+        s.descTable[di].next  = di + 1;
+        ++di;
+        usedBounceHead = true;
+    }
+
+    // ---- Middle full pages → direct to destination ----
+    uint8_t* midStart = readDst + headBytes;
+    for (uint32_t p = 0; p < midPages; ++p)
+    {
+        uint64_t pageVirt = reinterpret_cast<uint64_t>(midStart) + p * 4096;
+        uint64_t pagePhys = VmmVirtToPhys(KernelPageTable, VirtualAddress(pageVirt)).raw();
+
+        s.descTable[di].addr  = pagePhys;
+        s.descTable[di].len   = 4096;
+        s.descTable[di].flags = VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE;
+        s.descTable[di].next  = di + 1;
+        ++di;
+    }
+
+    // ---- Tail partial page → bounce buffer ----
+    bool usedBounceTail = false;
+    if (tailBytes > 0)
+    {
+        // DMA into bounce buffer after the head portion.
+        uint64_t bounceOff = usedBounceHead ? headBytes : 0;
+        s.descTable[di].addr  = s.dmaBufPhys + bounceOff;
+        s.descTable[di].len   = static_cast<uint32_t>(tailBytes);
+        s.descTable[di].flags = VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE;
+        s.descTable[di].next  = di + 1;
+        ++di;
+        usedBounceTail = true;
+    }
+
+    // ---- Status descriptor ----
+    *s.statusBuf = 0xFF;
+    s.descTable[di].addr  = s.statusBufPhys;
+    s.descTable[di].len   = 1;
+    s.descTable[di].flags = VIRTQ_DESC_F_WRITE;
+    s.descTable[di].next  = 0;
+
+    // ---- Submit ----
+    __asm__ volatile("mfence" ::: "memory");
+
+    uint16_t ringSlot = s.availIdxShadow % s.queueSize;
+    s.availRing[ringSlot] = SG_DESC_BASE;
+    __asm__ volatile("mfence" ::: "memory");
+    *s.availIdx = ++s.availIdxShadow;
+    __asm__ volatile("mfence" ::: "memory");
+
+    __atomic_store_n(&s.irqComplete, 0, __ATOMIC_RELEASE);
+    VioWrite16(s.ioBase, VIRTIO_PCI_QUEUE_NOTIFY, 0);
+
+    // Wait for completion (same spin→hlt pattern).
+    static constexpr uint32_t SPIN_LIMIT = 1024;
+    for (uint32_t i = 0; i < SPIN_LIMIT; ++i) {
+        if (*s.usedIdx != s.usedIdxShadow) goto sg_done;
+        __asm__ volatile("pause" ::: "memory");
+    }
+    for (uint32_t i = 0; i < 100000u; ++i) {
+        if (*s.usedIdx != s.usedIdxShadow) goto sg_done;
+        __asm__ volatile("hlt" ::: "memory");
+    }
+    SerialPuts("virtio-blk: SG timeout\n");
+    return -1;
+
+sg_done:
+    __asm__ volatile("mfence" ::: "memory");
+    ++s.usedIdxShadow;
+
+    if (*s.statusBuf != VIRTIO_BLK_S_OK)
+        return -1;
+
+    // Copy bounce buffer portions into destination.
+    if (usedBounceHead)
+        memcpy(readDst, s.dmaBuf, headBytes);
+    if (usedBounceTail) {
+        uint64_t bounceOff = usedBounceHead ? headBytes : 0;
+        memcpy(readDst + headBytes + midBytes, s.dmaBuf + bounceOff, tailBytes);
+    }
+
+    return static_cast<int>(totalBytes);
 }
 
 static void AcquireRequestLock(VirtioBlkState& s)
@@ -377,43 +740,128 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
 
     // Serialise against concurrent reads/writes without masking timer IRQs
     // across device latency.
-    AcquireRequestLock(*s);
-
-    uint64_t roundedEndSector = endSector;
+    //
+    // Optimistic fast path: try to serve entirely from cache without the lock.
+    // The cache is safe to read concurrently (direct-mapped, entries are
+    // word-aligned, and we validate blockNumber after reading data).
     bool cacheableSmallRead =
         len <= VIRTIO_SMALL_READ_LIMIT &&
         s->cacheEntries && s->cacheData &&
-        roundedEndSector <= s->sectorCount &&
-        ((((roundedEndSector - 1) / VIRTIO_CACHE_BLOCK_SECTORS) + 1) *
+        endSector <= s->sectorCount &&
+        ((((endSector - 1) / VIRTIO_CACHE_BLOCK_SECTORS) + 1) *
              VIRTIO_CACHE_BLOCK_SECTORS) <= s->sectorCount;
 
     if (cacheableSmallRead)
     {
+        // Optimistic: try all blocks from cache without lock
+        bool allCached = true;
+        uint64_t probe = 0;
+        while (probe < len) {
+            uint64_t absolute = offset + probe;
+            uint64_t blockNumber = absolute / VIRTIO_CACHE_BLOCK_SIZE;
+            uint8_t* cacheBlock = nullptr;
+            if (!CacheLookup(*s, blockNumber, &cacheBlock)) {
+                allCached = false;
+                break;
+            }
+            probe += VIRTIO_CACHE_BLOCK_SIZE - (absolute % VIRTIO_CACHE_BLOCK_SIZE);
+        }
+
+        if (allCached) {
+            // All blocks cached — serve without lock
+            while (bytesRead < len) {
+                uint64_t absolute = offset + bytesRead;
+                uint64_t blockNumber = absolute / VIRTIO_CACHE_BLOCK_SIZE;
+                uint64_t blockOffset = absolute % VIRTIO_CACHE_BLOCK_SIZE;
+                uint8_t* cacheBlock = nullptr;
+                CacheLookup(*s, blockNumber, &cacheBlock);
+
+                uint64_t n = VIRTIO_CACHE_BLOCK_SIZE - blockOffset;
+                if (n > len - bytesRead) n = len - bytesRead;
+                memcpy(dstBytes + bytesRead, cacheBlock + blockOffset, n);
+                bytesRead += n;
+            }
+            s->readOps++;
+            s->readBytes += bytesRead;
+            return static_cast<int>(bytesRead);
+        }
+
+        // Cache miss — fall through to locked path
+    }
+
+    AcquireRequestLock(*s);
+
+    if (cacheableSmallRead)
+    {
+        // Batched cache-fill: collect up to MAX_INFLIGHT cache misses,
+        // submit them all to the device, wait for completion, store in cache,
+        // then copy from cache to the user buffer.
+        //
+        // First pass: identify all cache-miss blocks.
+        uint64_t missBlocks[MAX_INFLIGHT];
+        uint32_t missCount = 0;
+        {
+            uint64_t probe = 0;
+            while (probe < len && missCount < MAX_INFLIGHT)
+            {
+                uint64_t absolute = offset + probe;
+                uint64_t blockNumber = absolute / VIRTIO_CACHE_BLOCK_SIZE;
+                uint8_t* cacheBlock = nullptr;
+                if (!CacheLookup(*s, blockNumber, &cacheBlock))
+                {
+                    // Avoid duplicate entries for the same block.
+                    bool dup = false;
+                    for (uint32_t j = 0; j < missCount; ++j)
+                        if (missBlocks[j] == blockNumber) { dup = true; break; }
+                    if (!dup)
+                        missBlocks[missCount++] = blockNumber;
+                }
+                probe += VIRTIO_CACHE_BLOCK_SIZE - (absolute % VIRTIO_CACHE_BLOCK_SIZE);
+            }
+        }
+
+        // Submit all misses as async slot reads.
+        if (missCount > 0)
+        {
+            for (uint32_t i = 0; i < missCount; ++i)
+            {
+                uint64_t blockSector = missBlocks[i] * VIRTIO_CACHE_BLOCK_SECTORS;
+                s->slots[i].blockNumber = missBlocks[i];
+                SubmitSlotRead(*s, i, blockSector);
+            }
+
+            // Single notification for the whole batch.
+            NotifyDevice(*s);
+
+            // Wait for all slots to complete.
+            if (!WaitAllSlots(*s, missCount))
+            {
+                ReleaseRequestLock(*s);
+                return -1;
+            }
+
+            // Store all completed reads into the cache.
+            for (uint32_t i = 0; i < missCount; ++i)
+            {
+                if (*s->slots[i].statusBuf != VIRTIO_BLK_S_OK)
+                {
+                    brook::SerialPrintf("virtio-blk: batch slot %u failed (block %lu)\n",
+                                        i, static_cast<unsigned long>(missBlocks[i]));
+                    ReleaseRequestLock(*s);
+                    return -1;
+                }
+                CacheStore(*s, missBlocks[i], s->slots[i].dmaBuf);
+            }
+        }
+
+        // All blocks now in cache — copy to user buffer.
         while (bytesRead < len)
         {
             uint64_t absolute = offset + bytesRead;
             uint64_t blockNumber = absolute / VIRTIO_CACHE_BLOCK_SIZE;
             uint64_t blockOffset = absolute % VIRTIO_CACHE_BLOCK_SIZE;
             uint8_t* cacheBlock = nullptr;
-
-            if (!CacheLookup(*s, blockNumber, &cacheBlock))
-            {
-                uint64_t blockSector = blockNumber * VIRTIO_CACHE_BLOCK_SECTORS;
-                if (!SubmitRequest(*s, VIRTIO_BLK_T_IN, blockSector,
-                                   s->dmaBufPhys, VIRTIO_CACHE_BLOCK_SIZE))
-                {
-                    brook::SerialPrintf("virtio-blk: cached read failed at sector %lu\n",
-                                        static_cast<unsigned long>(blockSector));
-                    ReleaseRequestLock(*s);
-                    return -1;
-                }
-                CacheStore(*s, blockNumber, s->dmaBuf);
-                if (!CacheLookup(*s, blockNumber, &cacheBlock))
-                {
-                    ReleaseRequestLock(*s);
-                    return -1;
-                }
-            }
+            CacheLookup(*s, blockNumber, &cacheBlock);
 
             uint64_t n = VIRTIO_CACHE_BLOCK_SIZE - blockOffset;
             if (n > len - bytesRead) n = len - bytesRead;
@@ -427,12 +875,30 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
         return static_cast<int>(bytesRead);
     }
 
+    // ---- Large read path: try scatter-gather DMA, fall back to bounce ----
     uint64_t sec = startSector;
     while (sec < endSector && bytesRead < len)
     {
-        uint64_t batchStart = sec;
         uint32_t batch = static_cast<uint32_t>(endSector - sec);
         if (batch > SECTORS_PER_DMA) batch = SECTORS_PER_DMA;
+
+        // Try scatter-gather: DMA directly into destination pages.
+        int sgResult = SubmitScatterGatherRead(*s, sec, batch,
+                                               dstBytes + bytesRead,
+                                               offset + bytesRead,
+                                               len - bytesRead);
+        if (sgResult > 0)
+        {
+            // SG succeeded — data is already in the destination buffer.
+            // Also populate the block cache from the destination.
+            CacheStoreFullBlocks(*s, sec, batch, dstBytes + bytesRead);
+            bytesRead += static_cast<uint64_t>(sgResult);
+            sec += batch;
+            continue;
+        }
+
+        // SG failed or not applicable — fall back to bounce buffer.
+        uint64_t batchStart = sec;
         uint32_t dmaLen = batch * SECTOR_SIZE;
 
         if (!SubmitRequest(*s, VIRTIO_BLK_T_IN, sec, s->dmaBufPhys, dmaLen))
@@ -445,7 +911,6 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
 
         CacheStoreFullBlocks(*s, batchStart, batch, s->dmaBuf);
 
-        // Copy relevant bytes from the DMA buffer into the output.
         for (uint32_t i = 0; i < batch && bytesRead < len; ++i, ++sec)
         {
             uint64_t sectorStart = sec * SECTOR_SIZE;
@@ -675,6 +1140,21 @@ static Device* InitOnePciDevice(const PciDevice& pci, uint32_t slot)
     // 5. Driver OK.
     VioWrite8(ioBase, VIRTIO_PCI_STATUS,
               VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_DRIVER_OK);
+
+    // 6. Register interrupt handler.
+    // Read PCI interrupt line (offset 0x3C, low byte).
+    uint8_t intLine = static_cast<uint8_t>(PciConfigRead32(pci.bus, pci.dev, pci.fn, 0x3C) & 0xFF);
+    state->irqLine = intLine;
+    state->irqComplete = 0;
+
+    // Store state pointer for ISR lookup before registering.
+    g_devStates[slot] = state;
+    if (slot >= g_devCount) g_devCount = slot + 1;
+
+    state->irqVector = IoApicRegisterHandler(intLine, VIRTIO_BLK_IRQ_VECTOR,
+                                             reinterpret_cast<void*>(VirtioBlkIrqBody));
+    SerialPrintf("virtio-blk: %s — IRQ %u, vector %u (interrupt-driven)\n",
+                 g_virtioNames[slot], intLine, state->irqVector);
 
     // Read capacity (two 32-bit reads for the 64-bit sector count).
     uint32_t capLo = inl(ioBase + VIRTIO_PCI_BLK_CAPACITY);

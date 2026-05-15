@@ -17,6 +17,7 @@ extern "C" brook::KernelSymbol __stop_ksymtab[];
 #include "vfs.h"
 #include "fatfs_glue.h"
 #include "ext2_vfs.h"
+#include "ext4_vfs.h"
 #include "serial.h"
 #include "panic.h"
 #include "pci.h"
@@ -51,6 +52,7 @@ EXPORT_SYMBOL(krealloc);
 EXPORT_SYMBOL(KPrintf);
 EXPORT_SYMBOL(KPuts);
 EXPORT_SYMBOL(SerialPrintf);
+EXPORT_SYMBOL(SerialVPrintf);
 EXPORT_SYMBOL(SerialPuts);
 
 // Physical memory
@@ -87,6 +89,8 @@ EXPORT_SYMBOL(FatFsBindDrive);
 
 // Ext2
 EXPORT_SYMBOL(Ext2BindDevice);
+EXPORT_SYMBOL(Ext4BindDevice);
+EXPORT_SYMBOL(Ext4GetDevice);
 
 // PCI
 EXPORT_SYMBOL(PciFindDevice);

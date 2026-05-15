@@ -101,6 +101,34 @@ static inline const char* strchr(const char* s, int c)
     return (c == '\0') ? s : (const char*)0;
 }
 
+static inline char* strcpy(char* dst, const char* src)
+{
+    char* ret = dst;
+    while ((*dst++ = *src++) != '\0')
+        ;
+    return ret;
+}
+
+static inline char* strncpy(char* dst, const char* src, size_t n)
+{
+    char* ret = dst;
+    while (n && (*dst++ = *src++) != '\0')
+        --n;
+    while (n--)
+        *dst++ = '\0';
+    return ret;
+}
+
+static inline char* strcat(char* dst, const char* src)
+{
+    char* ret = dst;
+    while (*dst)
+        ++dst;
+    while ((*dst++ = *src++) != '\0')
+        ;
+    return ret;
+}
+
 #ifdef __cplusplus
 }
 #endif
