@@ -20,7 +20,7 @@
 namespace brook {
 
 // Maximum PIDs the policy must support (must match kernel MAX_PROCESSES).
-static constexpr uint32_t SCHED_MAX_PIDS = 256;
+static constexpr uint32_t SCHED_MAX_PIDS = 1024;
 
 // Sentinel value: no process (returned by PickNext when queue is empty).
 static constexpr uint16_t SCHED_PID_NONE = 0xFFFF;

@@ -193,8 +193,8 @@ reaping, but the state transition itself is racy.
 
 `ReapTerminated` drops `g_allProcLock` to call `ProcessDestroy()`, then
 reacquires it and restarts the scan from index 0. This is correct but
-potentially quadratic: each reap restarts the full scan. With MAX_PROCESSES=256
-this is bounded and fast enough.
+potentially quadratic: each reap restarts the full scan. With MAX_PROCESSES=1024
+this is bounded and fast enough for current workloads.
 
 ### 6. CPU affinity pinning prevents load balancing
 

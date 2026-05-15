@@ -136,7 +136,7 @@ Uses `PROCESS_MAGIC` sentinel for use-after-free detection.
 
 5. **~~ProcessSendSignal SIGKILL race~~** — **IMPROVED**: Now uses `__atomic_store` with RELEASE ordering for the Terminated state transition. SIGSTOP uses `SchedulerStop()` for proper ready queue removal. A small race window remains for processes Running on other CPUs (acceptable for hobby OS; production fix would need IPI).
 
-6. **MAX_PROCESSES = 256**: PID space is 8-bit effective range. `g_sigHandlers[256][64]` = 128KB static. Adequate for current workload but could be tight for complex app stacks (Ladybird spawns ~10 processes).
+6. **MAX_PROCESSES = 1024**: PID space supports up to 1024 concurrent processes. `g_sigHandlers[1024][64]` = 2MB static. Sized for package-manager workloads (nix-install spawns ~3 processes per package × 150+ packages).
 
 7. **ProcessFork uses Copy-on-Write**: Writable pages are shared between parent and child as RO+COW. First write triggers a page fault that copies the page on demand. TLB shootdown is now fully integrated (affinity pinning removed).
 
