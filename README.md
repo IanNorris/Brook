@@ -21,8 +21,8 @@
 Brook is a hobby operating system for x86-64, written from scratch in C++ with
 a unified Clang/LLVM toolchain. It boots via UEFI, runs on multiple CPU cores,
 has a compositing window manager with a Wayland compositor, and implements
-enough of the Linux syscall ABI (~175 syscalls) to run unmodified Linux
-binaries — including web browsers, GTK apps, and games.
+enough of the Linux syscall ABI (~40% of the x86-64 syscall surface) to run
+unmodified Linux binaries — including web browsers, GTK apps, and games.
 
 This is my second OS project (the first being
 [Enkel](https://github.com/IanNorris/Enkel)). Where Enkel was about getting
@@ -85,7 +85,7 @@ These run as unmodified Linux ELF binaries on Brook, linked against musl libc:
 - **Real Nix binaries** — cowsay, coreutils, curl, bash, etc. run unmodified
 
 ### Linux Compatibility
-- **~175 syscalls** — open, read, write, mmap (lazy/PROT_NONE), mprotect, fork, execve, clone, pipe, dup/dup2/dup3, ioctl, poll, select, epoll (create/ctl/wait), socket family (bind, connect, listen, accept, send/recv, setsockopt, sendmsg/recvmsg with **SCM_RIGHTS** fd passing), futex, clock_gettime, nanosleep, rt_sigaction/rt_sigprocmask, signalfd, eventfd, timerfd, **memfd_create**, dirfd-aware *at syscalls, symlinkat/readlinkat, TCGETS2/TCSETS, and more
+- **~40% of the Linux x86-64 syscall surface** — open, read, write, mmap (lazy/PROT_NONE), mprotect, fork, execve, clone, pipe, dup/dup2/dup3, ioctl, poll, select, epoll (create/ctl/wait), socket family (bind, connect, listen, accept, send/recv, setsockopt, sendmsg/recvmsg with **SCM_RIGHTS** fd passing), futex, clock_gettime, nanosleep, rt_sigaction/rt_sigprocmask, signalfd, eventfd, timerfd, **memfd_create**, dirfd-aware *at syscalls, symlinkat/readlinkat, TCGETS2/TCSETS, and more
 - **ELF loader** — standard Linux ELF64 with dynamic linking (musl ld.so, glibc closures from Nix)
 - **Signals** — full rt_sigaction lifecycle, SIGINT/QUIT/TSTP/CONT/KILL/PIPE/CHLD with signal-safe TTY + AF_UNIX read (SIGCHLD doesn't spuriously EINTR)
 - **IPC** — anonymous pipes, **AF_UNIX stream sockets with SCM_RIGHTS**, memfd-backed shared memory (backs `wl_shm`), full address-space cloning on fork
