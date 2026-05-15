@@ -377,30 +377,34 @@ static int VirtioNetTransmit(NetIf* nif, const void* frame, uint32_t len)
 // data packets thousands of times per second. It was entirely self-inflicted:
 // we were re-reading our own used ring.
 //
-// Fix: take a ticket spinlock (which also disables local IRQs) around the
+// Fix: take an IrqSpinLock (which disables local IRQs) around the
 // short critical section that reads a slot and advances usedIdxShadow, then
 // release before calling NetReceive. A re-entrant IRQ on the same CPU cannot
 // preempt us while the lock is held; concurrent IRQs on other CPUs spin
 // briefly. The actual packet processing (NetReceive) runs lock-free.
 // ---------------------------------------------------------------------------
 
-static SpinLock g_rxLock;
+// Must be IrqSpinLock, not SpinLock: ProcessRxPackets is called from both
+// the poll path (process context) and VirtioNetIrqBody (IRQ context).
+// A plain SpinLock doesn't disable IRQs, so an IRQ on the same CPU while
+// the lock is held re-enters ProcessRxPackets and deadlocks on the ticket.
+static IrqSpinLock g_rxLock;
 
 static void ProcessRxPackets()
 {
     bool didWork = false;
 
     for (;;) {
-        SpinLockAcquire(&g_rxLock);
+        uint64_t flags = IrqSpinLockAcquire(&g_rxLock);
         if (g_rxq.usedIdxShadow == *g_rxq.usedIdx) {
-            SpinLockRelease(&g_rxLock);
+            IrqSpinLockRelease(&g_rxLock, flags);
             break;
         }
         uint16_t slot    = g_rxq.usedIdxShadow & (g_rxq.size - 1);
         uint32_t descIdx = g_rxq.usedRing[slot].id;
         uint32_t totalLen = g_rxq.usedRing[slot].len;
         g_rxq.usedIdxShadow++;
-        SpinLockRelease(&g_rxLock);
+        IrqSpinLockRelease(&g_rxLock, flags);
 
         if (descIdx < g_rxq.size && totalLen > VIRTIO_NET_HDR_SIZE) {
             uint8_t* pkt = g_rxBufs + descIdx * RX_BUF_SIZE;
@@ -413,14 +417,14 @@ static void ProcessRxPackets()
 
         // Repost buffer to available ring. availIdxShadow is shared with
         // other invocations so must be advanced under the lock too.
-        SpinLockAcquire(&g_rxLock);
+        flags = IrqSpinLockAcquire(&g_rxLock);
         uint16_t availSlot = g_rxq.availIdxShadow & (g_rxq.size - 1);
         g_rxq.availRing[availSlot] = static_cast<uint16_t>(descIdx);
         g_rxq.availIdxShadow++;
         __asm__ volatile("sfence" ::: "memory");
         *g_rxq.availIdx = g_rxq.availIdxShadow;
         didWork = true;
-        SpinLockRelease(&g_rxLock);
+        IrqSpinLockRelease(&g_rxLock, flags);
     }
 
     // Only notify QEMU when we've actually reposted buffers. Kicking with no
