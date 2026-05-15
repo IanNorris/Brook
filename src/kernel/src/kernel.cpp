@@ -53,8 +53,10 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
 // ---------------------------------------------------------------------------
 // IO Benchmark — measures sequential read throughput on a given VFS path.
-// Outputs results to serial.  Called once after filesystems are mounted.
+// Outputs results to serial.  Uncomment RunIOBenchmarkSuite() call in boot
+// sequence to enable.
 // ---------------------------------------------------------------------------
+#if 0
 static void RunIOBenchmark(const char* path, uint32_t readSize, bool warmup)
 {
     using namespace brook;
@@ -125,6 +127,7 @@ static void RunIOBenchmarkSuite()
 
     SerialPrintf("BENCH: === Suite complete ===\n");
 }
+#endif
 
 // Deferred probe list: devices that couldn't be mounted during initial scan
 // (e.g. ext4 VFS not yet registered). Re-probed after module loading.
@@ -655,8 +658,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         }
     }
 
-    // ---- IO Benchmark (before compositor/shell to avoid contention) ----
-    RunIOBenchmarkSuite();
+    // ---- IO Benchmark (uncomment to run before compositor starts) ----
+    // RunIOBenchmarkSuite();
 
     // ---- Network (static config from BROOK.CFG, or DHCP) ----
     if (brook::NetGetIf()) {
