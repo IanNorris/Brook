@@ -106,15 +106,25 @@ void AudioMixerSubmit(const int16_t* samples, uint32_t frameCount, uint32_t stre
     SpinLockRelease(&g_mixerLock);
 }
 
-// Flush accumulated mix data to hardware.  Called periodically by scheduler.
-static void AudioMixerFlushLocked()
+// Flush accumulated mix data to hardware.
+// Lock is acquired/released internally — play() may block.
+
+void AudioMixerFlush()
 {
+    SpinLockAcquire(&g_mixerLock);
+
     if (!g_mixerReady || !g_audioDriver || !g_audioDriver->play)
+    {
+        SpinLockRelease(&g_mixerLock);
         return;
+    }
 
     uint32_t buffered = MixerBufferedFrames();
     if (buffered == 0)
+    {
+        SpinLockRelease(&g_mixerLock);
         return;
+    }
 
     // Flush up to 2x tick size per call (avoid huge bursts)
     uint32_t toFlush = buffered;
@@ -131,24 +141,20 @@ static void AudioMixerFlushLocked()
         if (r > 32767) r = 32767; else if (r < -32768) r = -32768;
         g_flushBuf[i * 2 + 0] = static_cast<int16_t>(l);
         g_flushBuf[i * 2 + 1] = static_cast<int16_t>(r);
-        // Clear the consumed ring position for future accumulation
         g_mixBuf[ringIdx * 2 + 0] = 0;
         g_mixBuf[ringIdx * 2 + 1] = 0;
     }
 
     g_readPos += toFlush;
 
-    // Send to hardware (blocking — HDA driver handles backpressure)
+    // Release lock BEFORE calling into the HDA driver — play() may block
+    // (SchedulerSleepMs) when the HDA ring buffer is full. Holding a
+    // spinlock across a sleep would stall all AudioMixerSubmit callers.
+    SpinLockRelease(&g_mixerLock);
+
     uint32_t byteCount = toFlush * MIXER_FRAME_BYTES;
     g_audioDriver->play(g_flushBuf, byteCount,
                         MIXER_HW_RATE, MIXER_HW_CHANNELS, MIXER_HW_BITS, false);
-}
-
-void AudioMixerFlush()
-{
-    SpinLockAcquire(&g_mixerLock);
-    AudioMixerFlushLocked();
-    SpinLockRelease(&g_mixerLock);
 }
 
 void AudioMixerTick()
