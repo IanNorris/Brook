@@ -794,13 +794,15 @@ static bool ThreadGroupHasLivePeerLocked(Process* proc)
     for (uint32_t i = 0; i < g_processCount; ++i)
     {
         Process* p = g_allProcesses[i];
-        if (p && p != proc && p->tgid == proc->tgid)
+        if (p && p != proc && p->tgid == proc->tgid &&
+            p->state != ProcessState::Terminated)
         {
-            // Any peer still in the process list blocks leader reaping.
+            // Only non-terminated peers block leader fd cleanup and reaping.
             // Threads share the page table with the leader — destroying it
-            // while a sleeping thread still references it causes corruption.
-            // Threads are reaped independently (no ThreadGroupHasLivePeer
-            // guard for isThread), so the leader is always reaped last.
+            // while a running/sleeping thread still references it causes
+            // corruption. Once a peer is Terminated it no longer executes,
+            // so the leader can safely close its fds (pipe write ends, etc.)
+            // without waiting for the peer to be reaped from g_allProcesses.
             return true;
         }
     }
