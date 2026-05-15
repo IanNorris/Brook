@@ -424,14 +424,13 @@ static bool SubmitRequest(VirtioBlkState& s,
     __atomic_store_n(&s.irqComplete, 0, __ATOMIC_RELEASE);
     VioWrite16(s.ioBase, VIRTIO_PCI_QUEUE_NOTIFY, 0);
 
-    static constexpr uint32_t SPIN_LIMIT = 1024;
-    for (uint32_t i = 0; i < SPIN_LIMIT; ++i) {
+    // Spin-wait for completion. We hold requestGuard (and callers may hold
+    // other spinlocks like g_mpLock), so we must NOT hlt — if the completion
+    // IRQ routes to another CPU, this CPU would never wake and every other
+    // CPU spinning on our locks would deadlock.
+    for (uint32_t i = 0; i < 20000000u; ++i) {
         if (*s.usedIdx != s.usedIdxShadow) goto done;
         __asm__ volatile("pause" ::: "memory");
-    }
-    for (uint32_t i = 0; i < 100000u; ++i) {
-        if (*s.usedIdx != s.usedIdxShadow) goto done;
-        __asm__ volatile("hlt" ::: "memory");
     }
     SerialPuts("virtio-blk: timeout waiting for response\n");
     return false;
@@ -518,8 +517,10 @@ static uint32_t ReapCompletions(VirtioBlkState& s)
 // Wait until all submitted slots are complete.
 static bool WaitAllSlots(VirtioBlkState& s, uint32_t count)
 {
-    // Spin first, then hlt.
-    for (uint32_t spin = 0; spin < 2048; ++spin)
+    // Spin-wait for completion. We hold requestGuard (and callers may hold
+    // filesystem locks), so we must NOT hlt — the completion IRQ may route
+    // to another CPU, leaving this one halted with locks held.
+    for (uint32_t iter = 0; iter < 20000000u; ++iter)
     {
         ReapCompletions(s);
         bool allDone = true;
@@ -527,16 +528,6 @@ static bool WaitAllSlots(VirtioBlkState& s, uint32_t count)
             if (!s.slots[i].complete) { allDone = false; break; }
         if (allDone) return true;
         __asm__ volatile("pause" ::: "memory");
-    }
-
-    for (uint32_t iter = 0; iter < 100000u; ++iter)
-    {
-        ReapCompletions(s);
-        bool allDone = true;
-        for (uint32_t i = 0; i < count; ++i)
-            if (!s.slots[i].complete) { allDone = false; break; }
-        if (allDone) return true;
-        __asm__ volatile("hlt" ::: "memory");
     }
 
     SerialPuts("virtio-blk: timeout waiting for batch completion\n");
@@ -670,15 +661,11 @@ static int SubmitScatterGatherRead(VirtioBlkState& s, uint64_t startSector,
     __atomic_store_n(&s.irqComplete, 0, __ATOMIC_RELEASE);
     VioWrite16(s.ioBase, VIRTIO_PCI_QUEUE_NOTIFY, 0);
 
-    // Wait for completion (same spin→hlt pattern).
-    static constexpr uint32_t SPIN_LIMIT = 1024;
-    for (uint32_t i = 0; i < SPIN_LIMIT; ++i) {
+    // Spin-wait for completion — same rationale as SubmitRequest: we hold
+    // requestGuard and callers hold filesystem locks, so hlt is unsafe.
+    for (uint32_t i = 0; i < 20000000u; ++i) {
         if (*s.usedIdx != s.usedIdxShadow) goto sg_done;
         __asm__ volatile("pause" ::: "memory");
-    }
-    for (uint32_t i = 0; i < 100000u; ++i) {
-        if (*s.usedIdx != s.usedIdxShadow) goto sg_done;
-        __asm__ volatile("hlt" ::: "memory");
     }
     SerialPuts("virtio-blk: SG timeout\n");
     return -1;
