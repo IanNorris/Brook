@@ -425,7 +425,10 @@ extern "C" void KbdIrqHandlerInner(void)
 
     // Filter out keyboard self-test/command response codes that the i8042
     // generates during boot (UEFI handoff). These are NOT valid key scancodes.
-    if (sc == 0xAA || sc == 0xFC || sc == 0xFE || sc == 0xFF || sc == 0x00)
+    // NOTE: 0xAA is both the keyboard self-test pass AND the Left Shift
+    // release (0x2A | 0x80).  Only filter it during the settle window;
+    // after that it's a real key release.
+    if (sc == 0xFC || sc == 0xFE || sc == 0xFF || sc == 0x00)
     {
         ApicSendEoi();
         return;
