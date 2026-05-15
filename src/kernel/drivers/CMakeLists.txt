@@ -72,6 +72,7 @@ add_driver_module(ext4
     "${LWEXT4_DIR}/src/ext4_trans.c"
     "${LWEXT4_DIR}/src/ext4_xattr.c"
     "${BROOK_ROOT}/src/drivers/ext4/ext4_osal_brook.c"
+    "${BROOK_ROOT}/src/drivers/ext4/ext4_vfs_mod.cpp"
     EXTRA_FLAGS
         "-I${BROOK_ROOT}/src/drivers/ext4/include"
         "-I${LWEXT4_DIR}/include"
