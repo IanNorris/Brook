@@ -7,6 +7,7 @@
 #include "memory/heap.h"
 #include "serial.h"
 #include "mem_tag.h"
+#include "idt.h"
 
 namespace brook {
 
@@ -19,6 +20,7 @@ static constexpr uint8_t VIRTIO_PCI_QUEUE_SIZE     = 0x0C;
 static constexpr uint8_t VIRTIO_PCI_QUEUE_SEL      = 0x0E;
 static constexpr uint8_t VIRTIO_PCI_QUEUE_NOTIFY   = 0x10;
 static constexpr uint8_t VIRTIO_PCI_STATUS         = 0x12;
+static constexpr uint8_t VIRTIO_PCI_ISR            = 0x13; // ISR status (read clears)
 
 // Device config space starts at 0x14 for legacy; blk config has capacity first.
 static constexpr uint8_t VIRTIO_PCI_BLK_CAPACITY   = 0x14; // 64-bit sector count
@@ -40,6 +42,7 @@ static constexpr uint32_t VIRTIO_BLK_T_OUT = 1; // write
 static constexpr uint8_t VIRTIO_BLK_S_OK = 0;
 
 static constexpr uint32_t VIRTIO_MAX_DEVS = 8;
+static constexpr uint8_t  VIRTIO_BLK_IRQ_VECTOR = 50; // preferred IDT vector
 static constexpr uint32_t VIRTIO_CACHE_BLOCK_SECTORS = 8;     // 4 KiB
 static constexpr uint32_t VIRTIO_CACHE_BLOCK_SIZE    = 4096;
 static constexpr uint32_t VIRTIO_CACHE_ENTRIES       = 4096;  // 16 MiB
@@ -126,6 +129,12 @@ struct VirtioBlkState {
     // buffer, so only one request can be in-flight at a time.
     volatile uint32_t requestGuardNext;
     volatile uint32_t requestGuardServing;
+
+    // Interrupt-driven completion: the ISR sets this flag; SubmitRequest
+    // spins briefly then falls back to hlt until the interrupt fires.
+    volatile uint32_t irqComplete;
+    uint8_t           irqLine;   // PCI interrupt line (ISA IRQ number)
+    uint8_t           irqVector; // actual IDT vector assigned
 };
 
 // ---- Register helpers ----
@@ -276,7 +285,32 @@ static bool AllocVirtqueue(VirtioBlkState& s)
     return true;
 }
 
-// ---- Synchronous request (polling, interrupts left enabled) ----
+// ---- Interrupt handler ----
+
+// Per-device state pointers indexed by slot (for ISR lookup).
+static VirtioBlkState* g_devStates[VIRTIO_MAX_DEVS];
+static uint32_t        g_devCount = 0;
+
+// Plain function — called by the shared IRQ dispatch stub.
+// Must NOT be __attribute__((interrupt)). Must NOT call ApicSendEoi().
+static void VirtioBlkIrqBody()
+{
+    for (uint32_t i = 0; i < g_devCount; ++i)
+    {
+        VirtioBlkState* s = g_devStates[i];
+        if (!s) continue;
+
+        // Read ISR status register — clears the interrupt on the device.
+        uint8_t isr = inb(s->ioBase + VIRTIO_PCI_ISR);
+        if (isr & 1)
+        {
+            // Queue completion — signal the waiting SubmitRequest.
+            __atomic_store_n(&s->irqComplete, 1, __ATOMIC_RELEASE);
+        }
+    }
+}
+
+// ---- Synchronous request (interrupt-driven with spin fast-path) ----
 
 static bool SubmitRequest(VirtioBlkState& s,
                            uint32_t type, uint64_t sector,
@@ -317,16 +351,28 @@ static bool SubmitRequest(VirtioBlkState& s,
     *s.availIdx = ++s.availIdxShadow;
     __asm__ volatile("mfence" ::: "memory");
 
+    // Clear completion flag before notifying device.
+    __atomic_store_n(&s.irqComplete, 0, __ATOMIC_RELEASE);
+
     // Notify device that queue 0 has work.
     VioWrite16(s.ioBase, VIRTIO_PCI_QUEUE_NOTIFY, 0);
 
-    // Poll for completion — busy-wait with pause.
-    // KVM virtio completions are typically sub-microsecond, so this
-    // loop rarely runs more than a few iterations.
-    for (uint32_t i = 0; i < 100000000u; ++i) {
+    // Wait for completion: short spin first (KVM virtio typically completes
+    // in sub-microsecond), then fall back to hlt which suspends the CPU
+    // until the next interrupt — including the virtio completion IRQ.
+    static constexpr uint32_t SPIN_LIMIT = 1024;
+    for (uint32_t i = 0; i < SPIN_LIMIT; ++i) {
         if (*s.usedIdx != s.usedIdxShadow)
             goto done;
         __asm__ volatile("pause" ::: "memory");
+    }
+
+    // Slow path: halt until any interrupt wakes us (virtio IRQ, timer, etc.)
+    // The LAPIC timer fires every ~1ms, so worst case we wake every tick.
+    for (uint32_t i = 0; i < 100000u; ++i) {
+        if (*s.usedIdx != s.usedIdxShadow)
+            goto done;
+        __asm__ volatile("hlt" ::: "memory");
     }
     SerialPuts("virtio-blk: timeout waiting for response\n");
     return false;
@@ -716,6 +762,21 @@ static Device* InitOnePciDevice(const PciDevice& pci, uint32_t slot)
     // 5. Driver OK.
     VioWrite8(ioBase, VIRTIO_PCI_STATUS,
               VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_DRIVER_OK);
+
+    // 6. Register interrupt handler.
+    // Read PCI interrupt line (offset 0x3C, low byte).
+    uint8_t intLine = static_cast<uint8_t>(PciConfigRead32(pci.bus, pci.dev, pci.fn, 0x3C) & 0xFF);
+    state->irqLine = intLine;
+    state->irqComplete = 0;
+
+    // Store state pointer for ISR lookup before registering.
+    g_devStates[slot] = state;
+    if (slot >= g_devCount) g_devCount = slot + 1;
+
+    state->irqVector = IoApicRegisterHandler(intLine, VIRTIO_BLK_IRQ_VECTOR,
+                                             reinterpret_cast<void*>(VirtioBlkIrqBody));
+    SerialPrintf("virtio-blk: %s — IRQ %u, vector %u (interrupt-driven)\n",
+                 g_virtioNames[slot], intLine, state->irqVector);
 
     // Read capacity (two 32-bit reads for the 64-bit sector count).
     uint32_t capLo = inl(ioBase + VIRTIO_PCI_BLK_CAPACITY);
