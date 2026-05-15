@@ -1386,7 +1386,15 @@ int SockBind(int sockIdx, const SockAddrIn* addr)
 
     Socket& s = g_sockets[sockIdx];
     s.localIp   = addr->sin_addr;
-    s.localPort  = addr->sin_port; // already big-endian
+
+    // bind(port=0) means "assign an ephemeral port" (Linux semantics)
+    if (addr->sin_port == 0) {
+        uint32_t port = __atomic_fetch_add(&g_tcpEphemeralPort, 1, __ATOMIC_RELAXED);
+        if (port >= 65535) __atomic_store_n(&g_tcpEphemeralPort, 49200, __ATOMIC_RELAXED);
+        s.localPort = htons(static_cast<uint16_t>(port));
+    } else {
+        s.localPort = addr->sin_port; // already big-endian
+    }
     s.bound = true;
     return 0;
 }
