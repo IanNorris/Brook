@@ -14,6 +14,7 @@
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "vfs.h"
+#include "ext2_vfs.h"
 #include "tty.h"
 #include "input.h"
 #include "pipe.h"
@@ -1669,6 +1670,26 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
             // Buffer full — block until reader drains some
             Process* self = ProcessCurrent();
             pipe->writerWaiter = self;
+            // Re-check after registering waiter to close the race where
+            // a reader drained space between our write() and waiter set.
+            chunk = pipe->write(src + written,
+                static_cast<uint32_t>(count - written > 4096 ? 4096 : count - written));
+            if (chunk > 0)
+            {
+                pipe->writerWaiter = nullptr;
+                written += chunk;
+                Process* reader = pipe->readerWaiter;
+                if (reader)
+                {
+                    pipe->readerWaiter = nullptr;
+                    WakeProcess(reader);
+                }
+                PipeWakeEpoll(pipe);
+                break;
+            }
+            // Safety timeout — recheck every 10ms in case wakeup was missed
+            extern volatile uint64_t g_lapicTickCount;
+            self->wakeupTick = g_lapicTickCount + 10;
             SchedulerBlock(self);
             if (HasPendingSignals())
                 return written > 0 ? static_cast<int64_t>(written) : -EINTR;
@@ -1749,6 +1770,20 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
             }
             Process* self = ProcessCurrent();
             pipe->writerWaiter = self;
+            // Re-check after registering waiter
+            chunk = pipe->write(src + written,
+                static_cast<uint32_t>(count - written > 4096 ? 4096 : count - written));
+            if (chunk > 0)
+            {
+                pipe->writerWaiter = nullptr;
+                written += chunk;
+                Process* reader = pipe->readerWaiter;
+                if (reader) { pipe->readerWaiter = nullptr; WakeProcess(reader); }
+                PipeWakeEpoll(pipe);
+                break;
+            }
+            extern volatile uint64_t g_lapicTickCount;
+            self->wakeupTick = g_lapicTickCount + 10;
             SchedulerBlock(self);
             if (HasPendingSignals())
                 return written > 0 ? static_cast<int64_t>(written) : -EINTR;
@@ -1814,6 +1849,18 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
             if (nonblock) return -EAGAIN;
             Process* self = ProcessCurrent();
             pipe->writerWaiter = self;
+            // Re-check after registering waiter
+            chunk = pipe->write(src + written, static_cast<uint32_t>(count - written));
+            if (chunk > 0) {
+                pipe->writerWaiter = nullptr;
+                written += chunk;
+                Process* reader = pipe->readerWaiter;
+                if (reader) { pipe->readerWaiter = nullptr; WakeProcess(reader); }
+                PipeWakeEpoll(pipe);
+                break;
+            }
+            extern volatile uint64_t g_lapicTickCount;
+            self->wakeupTick = g_lapicTickCount + 10;
             SchedulerBlock(self);
             if (HasPendingSignals()) return written > 0 ? static_cast<int64_t>(written) : -EINTR;
         }
@@ -4004,6 +4051,77 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
 
     if (newPages == oldPages) return static_cast<int64_t>(old_addr);
 
+    // Check if this is a MemFd-backed mapping. If so, we must NOT free the
+    // underlying physical pages (they're owned by the MemFdData) and must
+    // keep the new mapping connected to the same MemFdData so that shared
+    // memory continues to work (wl_shm_pool resize depends on this).
+    Process* mmOwner = MemoryMapOwner(proc);
+    if (!mmOwner) return -ESRCH;
+    int32_t memfdMapIdx = -1;
+    for (uint32_t i = 0; i < Process::MAX_MEMFD_MAPS; i++) {
+        auto& m = mmOwner->memfdMaps[i];
+        if (m.length == 0 || !m.mfd) continue;
+        if (old_addr >= m.vaddr && old_addr < m.vaddr + m.length) {
+            memfdMapIdx = static_cast<int32_t>(i);
+            break;
+        }
+    }
+
+    if (memfdMapIdx >= 0) {
+        // MemFd-backed mremap: keep the mapping connected to the MemFdData.
+        auto& m = mmOwner->memfdMaps[memfdMapIdx];
+        auto* mfd = static_cast<MemFdData*>(m.mfd);
+
+        if (newPages < oldPages) {
+            // Shrink: unmap tail PTEs (don't free pages — they belong to mfd).
+            for (uint64_t i = newPages; i < oldPages; ++i) {
+                VirtualAddress va(old_addr + i * 4096);
+                VmmUnmapPage(proc->pageTable, va);
+            }
+            TlbShootdownFull(proc->pageTable.pml4.raw(), proc->tlbCpuMask);
+            m.length = newPages * 4096;
+            return static_cast<int64_t>(old_addr);
+        }
+
+        // Grow: ensure the MemFd has enough capacity for the new size.
+        uint64_t neededBytes = m.offset + newPages * 4096;
+        if (neededBytes > mfd->capacity) {
+            if (!MemFdGrow(mfd, neededBytes)) return -ENOMEM;
+        }
+        if (neededBytes > mfd->size) mfd->size = neededBytes;
+
+        if (!(flags & MREMAP_MAYMOVE)) return -ENOMEM;
+
+        // Allocate a new virtual address range (no physical pages — lazy fault).
+        Process* leader = (proc->tgid && proc->tgid != proc->pid)
+                        ? ProcessFindByPid(proc->tgid) : proc;
+        if (!leader) leader = proc;
+        uint64_t newAddr = leader->mmapNext;
+        leader->mmapNext += newPages * 4096;
+
+        // Move any already-faulted PTEs from old range to new range.
+        // Pages remain owned by the MemFdData; we just remap the same phys.
+        for (uint64_t i = 0; i < oldPages; ++i) {
+            VirtualAddress oldVA(old_addr + i * 4096);
+            PhysicalAddress phys = VmmVirtToPhys(proc->pageTable, oldVA);
+            if (phys) {
+                VirtualAddress newVA(newAddr + i * 4096);
+                VmmMapPage(proc->pageTable, newVA, phys,
+                           VMM_PRESENT | m.vmmFlags, MemTag::User, proc->pid);
+                VmmUnmapPage(proc->pageTable, oldVA);
+            }
+        }
+        TlbShootdownFull(proc->pageTable.pml4.raw(), proc->tlbCpuMask);
+
+        // Update the memfdMaps entry to reflect the new address and size.
+        m.vaddr  = newAddr;
+        m.length = newPages * 4096;
+
+        return static_cast<int64_t>(newAddr);
+    }
+
+    // --- Anonymous / file-backed mapping (non-MemFd) ---
+
     // Shrink: unmap the tail.
     if (newPages < oldPages)
     {
@@ -4041,8 +4159,6 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
         PhysicalAddress sp = VmmVirtToPhys(proc->pageTable, src);
         PhysicalAddress dp = VmmVirtToPhys(proc->pageTable, dst);
         if (!sp || !dp) continue;
-        // Both pages are mapped in the current page table (current process).
-        // We can copy directly via the user virtual addresses.
         __builtin_memcpy(reinterpret_cast<void*>(newAddr + i * 4096),
                          reinterpret_cast<void*>(old_addr + i * 4096), 4096);
     }
@@ -6138,8 +6254,13 @@ static void FillStat(LinuxStat* st, const VnodeStat& vs, const Vnode* vn = nullp
     st->st_blksize = 4096;
     st->st_size = static_cast<int64_t>(vs.size);
     st->st_blocks = (st->st_size + 511) / 512;
+    st->st_uid = vs.uid;
+    st->st_gid = vs.gid;
 
-    if (vs.isSymlink)
+    // Use real mode from VnodeStat if available, otherwise generate from flags
+    if (vs.mode)
+        st->st_mode = vs.mode;
+    else if (vs.isSymlink)
         st->st_mode = 0120777; // S_IFLNK | rwxrwxrwx
     else if (vs.isDir)
         st->st_mode = 0040755; // S_IFDIR | rwxr-xr-x
@@ -6225,7 +6346,7 @@ static int64_t do_stat_internal(const char* path, uint64_t statAddr)
         lookup = resolved;
     }
 
-    VnodeStat vs{}; vs.size = 0; vs.isDir = false; vs.isSymlink = false;
+    VnodeStat vs{};
     if (VfsStatPath(lookup, &vs) < 0)
     {
         // Synthetic proc/etc files — stat should succeed for these
@@ -6290,7 +6411,7 @@ static int64_t do_lstat_internal(const char* path, uint64_t statAddr)
         lookup = resolved;
     }
 
-    VnodeStat vs{}; vs.size = 0; vs.isDir = false; vs.isSymlink = false;
+    VnodeStat vs{};
     if (VfsLstatPath(lookup, &vs) < 0)
     {
         // Synthetic proc/etc files
@@ -6357,7 +6478,7 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
 
     if (fde->type == FdType::Vnode && fde->handle) {
         auto* vn = static_cast<Vnode*>(fde->handle);
-        VnodeStat vs{}; vs.size = 0; vs.isDir = false; vs.isSymlink = false;
+        VnodeStat vs{};
         if (VfsStat(vn, &vs) < 0) return -EBADF;
         FillStat(st, vs, vn);
         return 0;
@@ -6615,8 +6736,12 @@ static int64_t sys_setuid(uint64_t uid, uint64_t, uint64_t,
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -EINVAL;
-    proc->uid = static_cast<uint32_t>(uid);
-    proc->euid = static_cast<uint32_t>(uid);
+    uint32_t newUid = static_cast<uint32_t>(uid);
+    // Non-root can only set euid to real uid or saved uid (simplified: only own uid)
+    if (proc->euid != 0 && newUid != proc->uid)
+        return -EPERM;
+    proc->uid = newUid;
+    proc->euid = newUid;
     return 0;
 }
 static int64_t sys_setgid(uint64_t gid, uint64_t, uint64_t,
@@ -6624,8 +6749,11 @@ static int64_t sys_setgid(uint64_t gid, uint64_t, uint64_t,
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -EINVAL;
-    proc->gid = static_cast<uint32_t>(gid);
-    proc->egid = static_cast<uint32_t>(gid);
+    uint32_t newGid = static_cast<uint32_t>(gid);
+    if (proc->euid != 0 && newGid != proc->gid)
+        return -EPERM;
+    proc->gid = newGid;
+    proc->egid = newGid;
     return 0;
 }
 
@@ -8661,13 +8789,16 @@ static int64_t sys_times(uint64_t bufAddr, uint64_t, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
-// sys_umask (95) — stub, always returns 022
+// sys_umask (95) — set process umask, return old value
 // ---------------------------------------------------------------------------
 
-static int64_t sys_umask(uint64_t, uint64_t, uint64_t,
+static int64_t sys_umask(uint64_t newMask, uint64_t, uint64_t,
                           uint64_t, uint64_t, uint64_t)
 {
-    return 022;
+    Process* proc = ProcessCurrent();
+    uint16_t old = proc->umask;
+    proc->umask = static_cast<uint16_t>(newMask & 0777);
+    return old;
 }
 
 // ---------------------------------------------------------------------------
@@ -8701,7 +8832,7 @@ static int64_t sys_chdir(uint64_t pathAddr, uint64_t, uint64_t,
     }
 
     // Verify path exists and is a directory
-    VnodeStat vs{}; vs.size = 0; vs.isDir = false; vs.isSymlink = false;
+    VnodeStat vs{};
     if (VfsStatPath(newCwd, &vs) < 0) return -ENOENT;
     if (!vs.isDir) return -ENOTDIR;
 
@@ -8975,54 +9106,77 @@ static int64_t sys_flock(uint64_t fd, uint64_t operation, uint64_t,
 
 // ---------------------------------------------------------------------------
 // sys_chmod (90) / sys_fchmod (91) / sys_fchmodat (268)
-// — stub: succeed silently (no permission model yet)
+// — apply mode changes to ext2 files
 // ---------------------------------------------------------------------------
 
-static int64_t sys_chmod(uint64_t, uint64_t, uint64_t,
+static int64_t sys_chmod(uint64_t pathAddr, uint64_t mode, uint64_t,
                           uint64_t, uint64_t, uint64_t)
 {
-    return 0; // no-op
+    char pathBuf[256];
+    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
+    int rc = brook::Ext2Chmod(pathBuf, static_cast<uint16_t>(mode & 07777));
+    return (rc == -2) ? 0 : rc;
 }
 
 static int64_t sys_fchmod(uint64_t, uint64_t, uint64_t,
                            uint64_t, uint64_t, uint64_t)
 {
-    return 0; // no-op
+    return 0; // TODO: implement via fd lookup
 }
 
-static int64_t sys_fchmodat(uint64_t, uint64_t, uint64_t,
+static int64_t sys_fchmodat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
                              uint64_t, uint64_t, uint64_t)
 {
-    return 0; // no-op
+    (void)dirfd;
+    char pathBuf[256];
+    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
+    int rc = brook::Ext2Chmod(pathBuf, static_cast<uint16_t>(mode & 07777));
+    return (rc == -2) ? 0 : rc;
 }
 
 // ---------------------------------------------------------------------------
 // sys_chown (92) / sys_fchown (93) / sys_lchown (94) / sys_fchownat (260)
-// — stub: succeed silently (no user model yet)
+// — apply ownership changes to ext2 files (root only)
 // ---------------------------------------------------------------------------
 
-static int64_t sys_chown(uint64_t, uint64_t, uint64_t,
+static int64_t sys_chown(uint64_t pathAddr, uint64_t uid, uint64_t gid,
                           uint64_t, uint64_t, uint64_t)
 {
-    return 0; // no-op
+    Process* proc = ProcessCurrent();
+    if (!proc || proc->euid != 0) return -EPERM;
+    char pathBuf[256];
+    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
+    int rc = brook::Ext2Chown(pathBuf, static_cast<uint32_t>(uid), static_cast<uint32_t>(gid));
+    return (rc == -2) ? 0 : rc;
 }
 
 static int64_t sys_fchown(uint64_t, uint64_t, uint64_t,
                            uint64_t, uint64_t, uint64_t)
 {
-    return 0; // no-op
+    return 0; // TODO: implement via fd lookup
 }
 
-static int64_t sys_lchown(uint64_t, uint64_t, uint64_t,
+static int64_t sys_lchown(uint64_t pathAddr, uint64_t uid, uint64_t gid,
                            uint64_t, uint64_t, uint64_t)
 {
-    return 0; // no-op
+    Process* proc = ProcessCurrent();
+    if (!proc || proc->euid != 0) return -EPERM;
+    char pathBuf[256];
+    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
+    int rc = brook::Ext2Chown(pathBuf, static_cast<uint32_t>(uid), static_cast<uint32_t>(gid));
+    return (rc == -2) ? 0 : rc;
 }
 
-static int64_t sys_fchownat(uint64_t, uint64_t, uint64_t,
-                             uint64_t, uint64_t, uint64_t)
+static int64_t sys_fchownat(uint64_t dirfd, uint64_t pathAddr, uint64_t uid,
+                             uint64_t gid, uint64_t, uint64_t)
 {
-    return 0; // no-op
+    (void)dirfd;
+    Process* proc = ProcessCurrent();
+    if (!proc || proc->euid != 0) return -EPERM;
+    char pathBuf[256];
+    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
+    int rc = brook::Ext2Chown(pathBuf, static_cast<uint32_t>(uid), static_cast<uint32_t>(gid));
+    return (rc == -2) ? 0 : rc;
 }
 
 // ---------------------------------------------------------------------------
@@ -10375,6 +10529,57 @@ static int64_t sys_brook_wm_get_screen_info(uint64_t outAddr, uint64_t, uint64_t
     out[0] = w;
     out[1] = h;
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// 521: WM_SCANOUT_MAP(out_ptr) — map compositor backbuffer into caller's space.
+// Writes a ScanoutMapResult struct to out_ptr.
+// ---------------------------------------------------------------------------
+static int64_t sys_brook_wm_scanout_map(uint64_t outAddr, uint64_t, uint64_t,
+                                         uint64_t, uint64_t, uint64_t)
+{
+    if (!UserBufferWritable(outAddr, sizeof(brook::ScanoutMapResult)))
+        return -EFAULT;
+
+    Process* proc = ProcessCurrent();
+    auto* out = reinterpret_cast<brook::ScanoutMapResult*>(outAddr);
+    uint64_t addr = brook::CompositorScanoutMap(proc, out);
+    return addr ? 0 : -ENOMEM;
+}
+
+// ---------------------------------------------------------------------------
+// 522: WM_SCANOUT_FLIP(minY, maxY) — copy dirty rows to MMIO framebuffer.
+// ---------------------------------------------------------------------------
+static int64_t sys_brook_wm_scanout_flip(uint64_t minY, uint64_t maxY, uint64_t,
+                                          uint64_t, uint64_t, uint64_t)
+{
+    return brook::CompositorScanoutFlip(static_cast<uint32_t>(minY),
+                                        static_cast<uint32_t>(maxY));
+}
+
+// ---------------------------------------------------------------------------
+// 523: WM_GET_WINDOWS(out_ptr, max_count) — query window state for usermode compositor
+// ---------------------------------------------------------------------------
+static int64_t sys_brook_wm_get_windows(uint64_t outAddr, uint64_t maxCount, uint64_t,
+                                         uint64_t, uint64_t, uint64_t)
+{
+    if (maxCount == 0) return 0;
+    uint64_t bufSize = maxCount * sizeof(brook::WmWindowDesc);
+    if (!UserBufferWritable(outAddr, bufSize)) return -EFAULT;
+    Process* proc = ProcessCurrent();
+    auto* out = reinterpret_cast<brook::WmWindowDesc*>(outAddr);
+    return static_cast<int64_t>(brook::CompositorGetWindows(proc, out, static_cast<uint32_t>(maxCount)));
+}
+
+// ---------------------------------------------------------------------------
+// 524: WM_MAP_WINDOW_VFB(wmId) — map a window's VFB into compositor process
+// ---------------------------------------------------------------------------
+static int64_t sys_brook_wm_map_window_vfb(uint64_t wmId, uint64_t, uint64_t,
+                                            uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    uint64_t addr = brook::CompositorMapWindowVfb(proc, static_cast<uint32_t>(wmId));
+    return addr ? static_cast<int64_t>(addr) : -ENOENT;
 }
 
 // ---------------------------------------------------------------------------
@@ -12215,6 +12420,10 @@ void SyscallTableInit()
     g_syscallTable[518]                  = sys_brook_wm_set_cursor_visible;
     g_syscallTable[519]                  = sys_brook_wm_set_cursor_image;
     g_syscallTable[520]                  = sys_brook_wm_get_screen_info;
+    g_syscallTable[521]                  = sys_brook_wm_scanout_map;
+    g_syscallTable[522]                  = sys_brook_wm_scanout_flip;
+    g_syscallTable[523]                  = sys_brook_wm_get_windows;
+    g_syscallTable[524]                  = sys_brook_wm_map_window_vfb;
 
     uint32_t count = 0;
     for (uint64_t i = 0; i < SYSCALL_MAX; ++i)

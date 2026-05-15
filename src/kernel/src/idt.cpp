@@ -1736,7 +1736,7 @@ static SharedIrqEntry* FindSharedIrq(uint8_t irq)
 // Each inner function iterates handlers[0..count) for one SharedIrqEntry,
 // then sends EOI.  The naked wrapper handles SWAPGS + GPR save/restore.
 #define SHARED_IRQ_INNER(N) \
-    static void SharedIrqInner##N(void) { \
+    extern "C" void SharedIrqInner##N(void) { \
         SharedIrqEntry& e = g_sharedIrqs[N]; \
         for (int j = 0; j < e.count; j++) \
             e.handlers[j](); \

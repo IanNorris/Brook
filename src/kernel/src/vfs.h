@@ -53,6 +53,9 @@ struct DirEntry {
 struct VnodeStat {
     uint64_t size;
     uint64_t ino;       // stable inode number (0 = not available)
+    uint32_t uid;
+    uint32_t gid;
+    uint16_t mode;       // Full mode (type + permissions, e.g. S_IFREG | 0644)
     bool     isDir;
     bool     isSymlink;
 };

@@ -29,7 +29,7 @@ namespace brook {
 static Window   g_windows[WM_MAX_WINDOWS] = {};
 static bool     g_wmActive = false;
 static int      g_focusedIdx = -1;
-static uint8_t  g_nextZOrder = 1;  // 0 = backmost, higher = front
+static uint32_t g_nextZOrder = 1;  // 0 = backmost, higher = front
 
 // App launcher state (implementation at bottom of file)
 static LauncherItem g_launcherItems[WM_LAUNCHER_MAX_ITEMS] = {};
@@ -255,15 +255,11 @@ int WmCreateWindow(Process* proc, int16_t x, int16_t y,
                  idx, w.title, x, y, clientW, clientH, upscale, proc ? proc->pid : 0);
 
     // Auto-focus normal windows. Popup/tooltips are raised by z-order but keep
-    // keyboard focus on the invoking toplevel.
+    // keyboard focus on the invoking toplevel. Non-focusable windows (popups,
+    // menus) already received the highest z-order above, so they'll render
+    // on top of existing windows without stealing keyboard focus.
     if (w.focusable)
         WmSetFocus(idx);
-    else if (g_focusedIdx >= 0)
-    {
-        // Non-focusable window created — re-raise the focused window so it
-        // stays visually on top (e.g. Kernel Console shouldn't cover Terminal).
-        g_windows[g_focusedIdx].zOrder = g_nextZOrder++;
-    }
 
     return idx;
 }
@@ -500,6 +496,18 @@ void WmSetFocus(int idx)
     g_windows[idx].focused = true;
     g_windows[idx].zOrder = g_nextZOrder++;
     g_focusedIdx = idx;
+
+    // Re-raise any non-focusable windows (popups, menus) belonging to the
+    // same process so they stay above the newly-raised parent.
+    Process* focusProc = g_windows[idx].proc;
+    for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
+    {
+        if (static_cast<int>(i) == idx) continue;
+        Window& sib = g_windows[i];
+        if (sib.proc == focusProc && sib.visible && !sib.focusable)
+            sib.zOrder = g_nextZOrder++;
+    }
+
     WmPushWmEvent(&g_windows[idx], WM_EVT_FOCUS_GAINED, 0, 0);
 }
 
@@ -762,7 +770,7 @@ uint32_t WmGetZOrder(int* outIndices, uint32_t maxOut)
     for (uint32_t i = 1; i < count; ++i)
     {
         int key = outIndices[i];
-        uint8_t keyZ = g_windows[key].zOrder;
+        uint32_t keyZ = g_windows[key].zOrder;
         int j = static_cast<int>(i) - 1;
         while (j >= 0 && g_windows[outIndices[j]].zOrder > keyZ)
         {
@@ -1029,12 +1037,14 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
                    "+", 0x0088CCFF, newBg);
     btnX += TASKBAR_NEW_BTN_W + WM_TASKBAR_PADDING;
 
-    // Count active windows and compute responsive button width
+    // Count active windows and compute responsive button width.
+    // Skip non-focusable windows (popups, menus, tooltips) — they're
+    // transient and shouldn't appear on the taskbar.
     uint32_t windowCount = 0;
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
     {
         const Window& w2 = g_windows[i];
-        if (w2.proc && w2.visible) windowCount++;
+        if (w2.proc && w2.visible && w2.focusable) windowCount++;
     }
 
     // Available space: screen width minus fixed elements minus clock area (~100px)
@@ -1052,7 +1062,7 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
     {
         const Window& w = g_windows[i];
-        if (!w.proc || !w.visible) continue;
+        if (!w.proc || !w.visible || !w.focusable) continue;
 
         // Button background — highlight if focused, lighten on hover
         bool btnHover = mouseInTaskbar && mouseX >= static_cast<int32_t>(btnX) &&
@@ -1145,7 +1155,7 @@ int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
     {
         const Window& w2 = g_windows[i];
-        if (w2.proc && w2.visible) windowCount++;
+        if (w2.proc && w2.visible && w2.focusable) windowCount++;
     }
     uint32_t fixedWidth = btnX + 100 + WM_TASKBAR_PADDING * 2;
     uint32_t availableWidth = (screenW > fixedWidth) ? screenW - fixedWidth : 0;
@@ -1161,7 +1171,7 @@ int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
     {
         const Window& w = g_windows[i];
-        if (!w.proc || !w.visible) continue;
+        if (!w.proc || !w.visible || !w.focusable) continue;
 
         uint32_t btnY = tbY + (WM_TASKBAR_HEIGHT - WM_TASKBAR_BTN_HEIGHT) / 2;
         if (mx >= static_cast<int32_t>(btnX) &&

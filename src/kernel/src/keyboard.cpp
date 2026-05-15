@@ -410,7 +410,7 @@ extern "C" void KernelPanic(const char* fmt, ...);
 // IRQ1 interrupt handler
 // ---------------------------------------------------------------------------
 
-static void KbdIrqHandlerInner(void)
+extern "C" void KbdIrqHandlerInner(void)
 {
     // Check that OBF is set and the byte is NOT from the auxiliary (mouse) port.
     // If bit 5 (AUXB) is set, this is mouse data — don't consume it here.

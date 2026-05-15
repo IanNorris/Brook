@@ -560,6 +560,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     proc->cpuAffinity = -1;
     proc->tlbCpuMask = 0;
     proc->schedPriority = 2;  // SCHED_PRIORITY_NORMAL
+    proc->umask = 022;         // Default umask
 
     // Allocate shared fd table (shared across CLONE_FILES threads).
     proc->fds = AllocFdTable();

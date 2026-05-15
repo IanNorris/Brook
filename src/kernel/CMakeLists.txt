@@ -465,4 +465,14 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/drivers/CMakeLists.txt")
     add_subdirectory(drivers)
 endif()
 
+# ---------------------------------------------------------------------------
+# Build-time check: verify all MODULE_IMPORT_SYMBOL references resolve
+# ---------------------------------------------------------------------------
+add_custom_target(check_module_symbols ALL
+    COMMAND bash "${BROOK_ROOT}/scripts/check-module-symbols.sh"
+    WORKING_DIRECTORY "${BROOK_ROOT}"
+    COMMENT "Checking module import/export symbol consistency"
+    VERBATIM
+)
+
 

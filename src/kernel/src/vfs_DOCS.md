@@ -89,7 +89,14 @@ Each driver registers via `VfsRegisterFs(name, ops)`:
 | `rename(mountPriv, pdrv, old, new)` | Rename/move |
 | `symlink(mountPriv, pdrv, target, link)` | Create symbolic link |
 | `readlink(mountPriv, pdrv, path, buf, sz)` | Read symlink target |
+| `chmod(mountPriv, pdrv, relPath, mode)` | Change file permissions |
+| `chown(mountPriv, pdrv, relPath, uid, gid)` | Change file ownership |
 | `sync(mountPriv)` | Flush dirty metadata to disk |
+
+The ext2 driver enforces Unix permission checks on `open()` — access is denied
+if the caller's euid/egid lacks the required read/write bits in the inode's
+`i_mode`. Permission checks are skipped for paths under `/nix` (read-only
+store). chmod and chown modify the on-disk inode and flush via `sync()`.
 
 ## Open Flags
 

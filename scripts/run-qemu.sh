@@ -15,6 +15,7 @@ VDE_SOCK=""
 NIC_MAC=""
 INSTANCE=""
 NO_AUDIO=0
+REAL_ESP=0
 EXTRA_ARGS=()
 for arg in "$@"; do
     case "$arg" in
@@ -26,6 +27,9 @@ for arg in "$@"; do
             ;;
         --headless)
             HEADLESS=1
+            ;;
+        --real-esp)
+            REAL_ESP=1
             ;;
         --vnc)
             VNC_DISPLAY="__NEXT_VNC__"
@@ -158,6 +162,26 @@ fi
 OVMF_VARS_COPY="$(mktemp /tmp/brook-OVMF_VARS-XXXXXX.fd)"
 cp "${OVMF_VARS}" "${OVMF_VARS_COPY}"
 trap 'rm -f "${OVMF_VARS_COPY}"' EXIT
+
+# Build a real FAT32 ESP image if --real-esp was passed.
+# Some OVMF builds (e.g. Nix OVMF) don't detect QEMU's fat:rw: virtual device
+# as a bootable medium. A real FAT32 image on IDE always works.
+ESP_IMG=""
+if [ "${REAL_ESP}" = "1" ]; then
+    ESP_IMG="$(mktemp /tmp/brook-esp-XXXXXX.img)"
+    trap 'rm -f "${OVMF_VARS_COPY}" "${ESP_IMG}"' EXIT
+    dd if=/dev/zero of="${ESP_IMG}" bs=1M count=64 2>/dev/null
+    mkfs.vfat -F 32 "${ESP_IMG}" >/dev/null
+    # Recursively copy ESP directory contents into the FAT32 image
+    (cd "${BUILD_DIR}/esp" && find . -type d | while read -r d; do
+        [ "$d" = "." ] && continue
+        mmd -i "${ESP_IMG}" "::${d#.}" 2>/dev/null || true
+    done
+    find . -type f | while read -r f; do
+        mcopy -i "${ESP_IMG}" "$f" "::${f#.}"
+    done)
+    echo "  ESP image: ${ESP_IMG} (real FAT32)"
+fi
 
 echo "Starting QEMU (${BUILD_TYPE})..."
 echo "  OVMF: ${OVMF_CODE}"
@@ -342,7 +366,7 @@ qemu-system-x86_64 \
     -m 8G \
     -drive if=pflash,format=raw,readonly=on,file="${OVMF_CODE}" \
     -drive if=pflash,format=raw,file="${OVMF_VARS_COPY}" \
-    -drive format=raw,file=fat:rw:"${ESP_OVERRIDE:-${BUILD_DIR}/esp}" \
+    $(if [ -n "${ESP_IMG}" ]; then echo "-drive if=ide,format=raw,file=${ESP_IMG}"; else echo "-drive format=raw,file=fat:rw:${ESP_OVERRIDE:-${BUILD_DIR}/esp}"; fi) \
     -drive if=virtio,format=raw,file="${DISK_IMG}",file.locking=off \
     ${EXT2_DRIVE} \
     ${NIX_DRIVE} \

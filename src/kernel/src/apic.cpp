@@ -269,7 +269,7 @@ void ValidateIretFrame(const uint64_t* frame)
 // C handler called from the naked ISR wrapper below.
 // interruptedRip/interruptedCs/interruptedRbp are passed from the naked
 // handler (extracted from the CPU interrupt frame on the stack).
-static void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interruptedCs,
+extern "C" void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interruptedCs,
                                     uint64_t interruptedRbp)
 {
     LapicWrite(LapicReg::EOI, 0);
@@ -363,12 +363,12 @@ static void LapicTimerHandler(void)
         "movq 64(%%rax), %%rdx\n\t"     // arg3 = interrupted RBP
 
         "cld\n\t"
-        "call %P0\n\t"
+        "call LapicTimerHandlerInner\n\t"
 
         // Validate iret frame before restoring GPRs.
         // The frame is at RSP+120 (15 pushed regs × 8 bytes).
         "leaq 120(%%rsp), %%rdi\n\t"
-        "call %P1\n\t"
+        "call ValidateIretFrame\n\t"
 
         // Restore GPRs
         "pop %%r15\n\t"
@@ -394,7 +394,7 @@ static void LapicTimerHandler(void)
         "2:\n\t"
         "iretq\n\t"
         :
-        : "i"(LapicTimerHandlerInner), "i"(ValidateIretFrame)
+        :
         : "memory"
     );
 }
@@ -646,7 +646,7 @@ void ApicBroadcastNmi()
 // The handler needs the same naked ISR treatment as the timer handler
 // because SchedulerTimerTick can context-switch, which requires all GPRs
 // saved and swapgs handled properly.
-static void ReschedIpiHandlerInner(uint64_t interruptedCs)
+extern "C" void ReschedIpiHandlerInner(uint64_t interruptedCs)
 {
     LapicWrite(LapicReg::EOI, 0);
     // Only allow preemption when the IPI interrupted user mode (CPL 3).
@@ -686,7 +686,7 @@ static void ReschedIpiHandler(void)
         "movq 128(%%rsp), %%rdi\n\t"    // arg1 = interrupted CS
 
         "cld\n\t"
-        "call %P0\n\t"
+        "call ReschedIpiHandlerInner\n\t"
         "pop %%r15\n\t"
         "pop %%r14\n\t"
         "pop %%r13\n\t"
@@ -708,7 +708,7 @@ static void ReschedIpiHandler(void)
         "2:\n\t"
         "iretq\n\t"
         :
-        : "i"(ReschedIpiHandlerInner)
+        :
         : "memory"
     );
 }
@@ -765,7 +765,7 @@ static TlbShootdownRequest g_tlbRequest;
 // Each pause is ~10-100 cycles, so 500K iterations ≈ 5-50ms.
 static constexpr uint64_t TLB_SHOOTDOWN_TIMEOUT = 10000000; // ~10ms at 1GHz loop
 
-static void TlbShootdownHandlerInner()
+extern "C" void TlbShootdownHandlerInner()
 {
     uint64_t myCr3;
     __asm__ volatile("movq %%cr3, %0" : "=r"(myCr3));
@@ -821,7 +821,7 @@ static void TlbShootdownHandler(void)
         "push %%r14\n\t"
         "push %%r15\n\t"
         "cld\n\t"
-        "call %P0\n\t"
+        "call TlbShootdownHandlerInner\n\t"
         "pop %%r15\n\t"
         "pop %%r14\n\t"
         "pop %%r13\n\t"
@@ -843,7 +843,7 @@ static void TlbShootdownHandler(void)
         "2:\n\t"
         "iretq\n\t"
         :
-        : "i"(TlbShootdownHandlerInner)
+        :
         : "memory"
     );
 }

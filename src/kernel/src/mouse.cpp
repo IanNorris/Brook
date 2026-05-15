@@ -78,7 +78,7 @@ static InputDevice    g_mouseInputDev = { &g_mouseOps, {}, 0, 0, nullptr };
 // IRQ12 interrupt handler
 // ---------------------------------------------------------------------------
 
-static void MouseIrqHandlerInner(void)
+extern "C" void MouseIrqHandlerInner(void)
 {
 
     // On IOAPIC-based systems, IRQ12 fires specifically for mouse data.

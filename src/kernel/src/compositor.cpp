@@ -2178,4 +2178,163 @@ void CompositorSetWallpaper(uint32_t* pixels, uint32_t w, uint32_t h)
     SerialPrintf("COMPOSITOR: wallpaper set %ux%u\n", w, h);
 }
 
+// ---------------------------------------------------------------------------
+// Scanout interface — Phase 1 of usermode compositor migration.
+// Maps the kernel backbuffer into a privileged process's address space so
+// it can composite frames directly, then call ScanoutFlip to push to MMIO.
+// ---------------------------------------------------------------------------
+
+uint64_t CompositorScanoutMap(Process* proc, ScanoutMapResult* out)
+{
+    if (!proc || !out || !g_backBuffer) return 0;
+
+    uint64_t bufSize = static_cast<uint64_t>(g_backBufStride) * g_physFbHeight * 4;
+    uint64_t pages = (bufSize + 4095) / 4096;
+
+    // Allocate user-space virtual range from the process's mmap window.
+    uint64_t userBase = proc->mmapNext;
+    if (userBase + pages * 4096 > USER_MMAP_END) {
+        SerialPrintf("COMPOSITOR: scanout_map: mmap window exhausted\n");
+        return 0;
+    }
+    proc->mmapNext = userBase + pages * 4096;
+
+    // Map each page of the kernel backbuffer into the user page table.
+    VirtualAddress bbKernAddr(reinterpret_cast<uint64_t>(g_backBuffer));
+    for (uint64_t i = 0; i < pages; i++) {
+        PhysicalAddress phys = VmmVirtToPhys(KernelPageTable,
+                                             VirtualAddress(bbKernAddr.raw() + i * 4096));
+        if (!phys) {
+            SerialPrintf("COMPOSITOR: scanout_map: failed to get phys for page %lu\n", i);
+            return 0;
+        }
+        if (!VmmMapPage(proc->pageTable,
+                        VirtualAddress(userBase + i * 4096),
+                        phys,
+                        VMM_PRESENT | VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
+                        MemTag::Device, proc->pid)) {
+            SerialPrintf("COMPOSITOR: scanout_map: failed to map page %lu\n", i);
+            return 0;
+        }
+    }
+
+    out->userAddr    = userBase;
+    out->width       = g_physFbWidth;
+    out->height      = g_physFbHeight;
+    out->stride      = g_backBufStride;
+    out->bufferBytes = static_cast<uint32_t>(bufSize);
+
+    SerialPrintf("COMPOSITOR: scanout mapped %lu pages at user 0x%lx (%ux%u stride=%u)\n",
+                 pages, userBase, g_physFbWidth, g_physFbHeight, g_backBufStride);
+    return userBase;
+}
+
+int CompositorScanoutFlip(uint32_t minY, uint32_t maxY)
+{
+    if (!g_physFb || !g_backBuffer) return -1;
+    if (minY >= g_physFbHeight) return -1;
+    if (maxY > g_physFbHeight) maxY = g_physFbHeight;
+    if (minY >= maxY) return 0; // nothing to do
+
+    // Copy dirty rows from cached backbuffer to MMIO framebuffer.
+    // This is the expensive part — MMIO writes are uncacheable.
+    uint32_t rowBytes = g_physFbWidth * 4;
+    for (uint32_t y = minY; y < maxY; y++) {
+        __builtin_memcpy(
+            const_cast<uint32_t*>(g_physFb + y * g_physFbStride),
+            g_backBuffer + y * g_backBufStride,
+            rowBytes);
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: Window state query for usermode compositor
+// ---------------------------------------------------------------------------
+
+uint32_t CompositorGetWindows(Process* caller, WmWindowDesc* out, uint32_t maxCount)
+{
+    if (!caller || !out || maxCount == 0) return 0;
+
+    uint32_t written = 0;
+    for (uint32_t i = 0; i < WM_MAX_WINDOWS && written < maxCount; ++i)
+    {
+        const Window* w = WmGetWindow(static_cast<int>(i));
+        if (!w || !w->proc) continue;
+
+        WmWindowDesc& d = out[written];
+        d.wmId    = w->wmId;
+        d.x       = w->x;
+        d.y       = w->y;
+        d.clientW = w->clientW;
+        d.clientH = w->clientH;
+        d.zOrder  = w->zOrder;
+        d.flags   = 0;
+        if (w->focused)   d.flags |= WM_DESC_FOCUSED;
+        if (w->visible)   d.flags |= WM_DESC_VISIBLE;
+        if (w->minimized) d.flags |= WM_DESC_MINIMIZED;
+        if (w->noChrome)  d.flags |= WM_DESC_NO_CHROME;
+        if (w->focusable) d.flags |= WM_DESC_FOCUSABLE;
+        d.vfbStride = w->vfbStride;
+        d.vfbBytes  = static_cast<uint32_t>(w->vfbBytes);
+        d.pid       = w->proc->pid;
+
+        // Copy title
+        for (uint32_t t = 0; t < 63 && w->title[t]; t++)
+            d.title[t] = w->title[t];
+        d.title[63] = '\0';
+
+        // Map the window's VFB into the compositor process (if not already)
+        if (w->vfb && w->vfbBytes > 0)
+            d.vfbUserAddr = CompositorMapWindowVfb(caller, w->wmId);
+        else
+            d.vfbUserAddr = 0;
+
+        written++;
+    }
+    return written;
+}
+
+uint64_t CompositorMapWindowVfb(Process* caller, uint32_t wmId)
+{
+    if (!caller) return 0;
+
+    // Find the window by wmId
+    const Window* w = nullptr;
+    for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
+    {
+        const Window* candidate = WmGetWindow(static_cast<int>(i));
+        if (candidate && candidate->wmId == wmId)
+        {
+            w = candidate;
+            break;
+        }
+    }
+    if (!w || !w->vfb || w->vfbBytes == 0) return 0;
+
+    // Allocate user-space virtual range
+    uint64_t pages = (w->vfbBytes + 4095) / 4096;
+    uint64_t userBase = caller->mmapNext;
+    if (userBase + pages * 4096 > USER_MMAP_END) {
+        SerialPrintf("COMPOSITOR: map_window_vfb: mmap window exhausted for wm=%u\n", wmId);
+        return 0;
+    }
+    caller->mmapNext = userBase + pages * 4096;
+
+    // Map VFB pages read-only into compositor process
+    VirtualAddress vfbKernAddr(reinterpret_cast<uint64_t>(w->vfb));
+    for (uint64_t i = 0; i < pages; i++) {
+        PhysicalAddress phys = VmmVirtToPhys(KernelPageTable,
+                                             VirtualAddress(vfbKernAddr.raw() + i * 4096));
+        if (!phys) continue;
+        VmmMapPage(caller->pageTable,
+                   VirtualAddress(userBase + i * 4096),
+                   phys,
+                   VMM_PRESENT | VMM_USER | VMM_NO_EXEC,  // read-only
+                   MemTag::Device, caller->pid);
+    }
+
+    return userBase;
+}
+
 } // namespace brook

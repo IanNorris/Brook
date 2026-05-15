@@ -96,4 +96,55 @@ bool CompositorSetCursorVisible(Process* proc, bool visible);
 bool CompositorSetCursorImage(const uint32_t* pixels, uint32_t w, uint32_t h,
                               int32_t hotX, int32_t hotY);
 
+// --- Scanout interface (Phase 1 of usermode compositor migration) ---
+// These allow a privileged userspace process to take over compositing duties.
+
+// Map the compositor backbuffer into the calling process's address space.
+// Returns the user-space virtual address, or 0 on failure.
+// Also writes screen dimensions and stride to the output struct.
+struct ScanoutMapResult {
+    uint64_t userAddr;    // mapped address in caller's page table
+    uint32_t width;       // screen width in pixels
+    uint32_t height;      // screen height in pixels
+    uint32_t stride;      // row stride in pixels
+    uint32_t bufferBytes; // total buffer size
+};
+uint64_t CompositorScanoutMap(Process* proc, ScanoutMapResult* out);
+
+// Flip dirty rows from the (userspace-written) backbuffer to MMIO framebuffer.
+// Only copies rows in [minY, maxY). Returns 0 on success.
+int CompositorScanoutFlip(uint32_t minY, uint32_t maxY);
+
+// --- Phase 2: Window state query interface for usermode compositor ---
+
+// Descriptor returned by WM_GET_WINDOWS syscall (523).
+// Packed for user-space consumption.
+struct WmWindowDesc {
+    uint32_t wmId;
+    int16_t  x, y;
+    uint16_t clientW, clientH;
+    uint32_t zOrder;
+    uint32_t flags;       // bit 0=focused, 1=visible, 2=minimized, 3=noChrome, 4=focusable
+    uint64_t vfbUserAddr; // user-mapped VFB address (in compositor's address space)
+    uint32_t vfbStride;   // pixels per row
+    uint32_t vfbBytes;    // total VFB size
+    uint16_t pid;
+    char     title[64];
+};
+
+static constexpr uint32_t WM_DESC_FOCUSED    = (1u << 0);
+static constexpr uint32_t WM_DESC_VISIBLE    = (1u << 1);
+static constexpr uint32_t WM_DESC_MINIMIZED  = (1u << 2);
+static constexpr uint32_t WM_DESC_NO_CHROME  = (1u << 3);
+static constexpr uint32_t WM_DESC_FOCUSABLE  = (1u << 4);
+
+// Fill an array of window descriptors for the userspace compositor.
+// Maps each window's VFB into the calling process if not already mapped.
+// Returns the number of windows written.
+uint32_t CompositorGetWindows(Process* caller, WmWindowDesc* out, uint32_t maxCount);
+
+// Map a specific window's VFB into the compositor process (read-only).
+// Returns user-space address, or 0 on failure.
+uint64_t CompositorMapWindowVfb(Process* caller, uint32_t wmId);
+
 } // namespace brook

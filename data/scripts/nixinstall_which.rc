@@ -1,0 +1,2 @@
+# Brook OS — nix-install which (small package, quick test)
+run /nix/bin/nix-install which

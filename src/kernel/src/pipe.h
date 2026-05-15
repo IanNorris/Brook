@@ -11,7 +11,7 @@ struct Process;  // forward declaration for waiter
 
 // Kernel pipe buffer — ring buffer with reader/writer reference counts.
 // Blocking read/write via SchedulerBlock() when buffer is empty/full.
-static constexpr uint32_t PIPE_BUF_DEFAULT_SIZE = 4096;
+static constexpr uint32_t PIPE_BUF_DEFAULT_SIZE = 65536;
 static constexpr uint32_t PIPE_BUF_UNIX_SIZE    = 65536;
 
 struct PipeBuffer
