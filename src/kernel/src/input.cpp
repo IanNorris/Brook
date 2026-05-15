@@ -17,6 +17,7 @@ static IrqSpinLock g_waiterLock;
 
 void InputAddWaiter(Process* proc)
 {
+    if (!proc) return;
     uint64_t flags = IrqSpinLockAcquire(&g_waiterLock);
     uint32_t n = g_waiterCount;
     if (n < WAITER_MAX)
@@ -36,6 +37,7 @@ void InputAddWaiter(Process* proc)
 
 void InputRemoveWaiter(Process* proc)
 {
+    if (!proc) return;
     uint64_t flags = IrqSpinLockAcquire(&g_waiterLock);
     uint32_t n = g_waiterCount;
     for (uint32_t i = 0; i < n; ++i)
