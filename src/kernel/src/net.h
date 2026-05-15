@@ -329,6 +329,7 @@ struct Socket {
     // Delayed ACK — ACK every 2nd data segment or after 40ms timer
     uint32_t tcpUnackedSegs;   // data segments received since last ACK
     uint64_t tcpLastDataTick;  // tick when first unacked data segment arrived
+    uint64_t tcpLastRxTick;    // tick when last data segment was received (for stall detection)
 
     // Listen/accept queue (server-side)
     static constexpr int ACCEPT_QUEUE_MAX = 16;

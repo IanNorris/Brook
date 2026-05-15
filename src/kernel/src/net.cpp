@@ -1747,6 +1747,8 @@ static void TcpStatsRecord(bool tx, uint8_t flags, uint32_t dataLen)
     }
 }
 
+static uint32_t TcpReceiveFree(const Socket& s);
+
 static void TcpStatsMaybeFlush()
 {
     extern volatile uint64_t g_lapicTickCount;
@@ -1756,19 +1758,54 @@ static void TcpStatsMaybeFlush()
     // Flush delayed ACKs every call (~each packet) if >40ms old.
     // This ensures sparse-traffic sockets don't hold an ACK indefinitely.
     static constexpr uint64_t DELAYED_ACK_MS = 40;
+    // Proactive window update: if no data received in 2s and we have free
+    // buffer, re-send ACK with current window.  Recovers from lost window
+    // updates where server thinks window=0 but we've since drained data.
+    // Without this, stall continues until server's zero-window probe timer
+    // fires (30-120s in SLiRP), often exceeding our 30s recv timeout.
+    static constexpr uint64_t WINDOW_KEEPALIVE_MS = 2000;
+    static constexpr uint32_t WINDOW_KEEPALIVE_MSS = 1460;
     for (uint32_t i = 0; i < MAX_SOCKETS; i++) {
         if (!g_sockUsed[i]) continue;
         Socket& s = g_sockets[i];
         if (s.type != SOCK_STREAM) continue;
-        if (s.tcpUnackedSegs == 0) continue;
-        if (now - s.tcpLastDataTick >= DELAYED_ACK_MS) {
+        if (s.tcpUnackedSegs > 0 && now - s.tcpLastDataTick >= DELAYED_ACK_MS) {
             s.tcpUnackedSegs = 0;
             TcpSendSegment(s, TCP_ACK, nullptr, 0, "delayed-ack-timer");
+        }
+        // Proactive window update for stalled connections
+        if (s.tcpState == TcpState::Established &&
+            s.tcpLastRxTick != 0 &&
+            now - s.tcpLastRxTick >= WINDOW_KEEPALIVE_MS &&
+            TcpReceiveFree(s) >= WINDOW_KEEPALIVE_MSS)
+        {
+            TcpSendSegment(s, TCP_ACK, nullptr, 0, "wnd-keepalive");
+            s.tcpLastRxTick = now; // don't spam — re-arm for next 2s
         }
     }
 
     if (now - g_tcpStatsLastTick < 5000) return;
     if (g_tcpStats.txPkts == 0 && g_tcpStats.rxPkts == 0) {
+        // No traffic in 5s — dump state of all established sockets to help
+        // diagnose stalls (BRO-153).
+        for (uint32_t i = 0; i < MAX_SOCKETS; i++) {
+            if (!g_sockUsed[i]) continue;
+            Socket& sock = g_sockets[i];
+            if (sock.type != SOCK_STREAM) continue;
+            if (sock.tcpState != TcpState::Established) continue;
+            uint32_t freeSpace = TcpReceiveFree(sock);
+            uint32_t wnd = freeSpace >> sock.tcpRcvWndScale;
+            if (wnd > 65535u) wnd = 65535u;
+            SerialPrintf("tcp: IDLE sock=%u pid=%u rxCount=%u free=%u wnd=%u(scale=%u) "
+                         "rcvNxt=%u sndUna=%u sndNxt=%u unacked=%u oooBytes=%u "
+                         "waiter=%s rxPkts=%u txPkts=%u\n",
+                         i, sock.ownerPid, sock.rxCount, freeSpace, wnd,
+                         sock.tcpRcvWndScale, sock.tcpRcvNxt,
+                         sock.tcpSndUna, sock.tcpSndNxt, sock.tcpUnackedSegs,
+                         sock.tcpOooBytes,
+                         sock.pollWaiter ? "yes" : "no",
+                         sock.rxPktCount, sock.txPktCount);
+        }
         g_tcpStatsLastTick = now;
         return;
     }
@@ -2088,6 +2125,11 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         // fresh verbose logging (the old global static went silent after 3
         // packets from the first connection).
         s.rxPktCount++;
+        {
+            extern volatile uint64_t g_lapicTickCount;
+            if (dataLen > 0)
+                s.tcpLastRxTick = g_lapicTickCount;
+        }
         TcpStatsRecord(/*tx=*/false, flags, dataLen);
         bool isControl = (flags & (TCP_SYN | TCP_FIN | TCP_RST)) != 0;
         if (isControl)
