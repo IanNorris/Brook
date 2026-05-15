@@ -281,7 +281,7 @@ struct ext4_sblock {
 #define EXT4_SUPPORTED_FINCOM                              \
 	(EXT4_FINCOM_FILETYPE | EXT4_FINCOM_META_BG |      \
 	 EXT4_FINCOM_EXTENTS | EXT4_FINCOM_FLEX_BG |       \
-	 EXT4_FINCOM_64BIT)
+	 EXT4_FINCOM_64BIT | EXT4_FINCOM_BG_USE_META_CSUM)
 
 #define EXT4_SUPPORTED_FRO_COM                             \
 	(EXT4_FRO_COM_SPARSE_SUPER |                       \

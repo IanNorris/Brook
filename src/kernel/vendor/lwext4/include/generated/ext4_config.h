@@ -10,7 +10,7 @@
 #define CONFIG_JOURNALING_ENABLE    1
 
 /* Enable extended attributes */
-#define CONFIG_XATTR_ENABLE         0
+#define CONFIG_XATTR_ENABLE         1
 
 /* Enable extents (better large-file performance) */
 #define CONFIG_EXTENTS_ENABLE       1

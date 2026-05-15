@@ -72,11 +72,13 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 	fs->read_only = read_only;
 
 	r = ext4_sb_read(fs->bdev, &fs->sb);
-	if (r != EOK)
+	if (r != EOK) {
 		return r;
+	}
 
-	if (!ext4_sb_check(&fs->sb))
+	if (!ext4_sb_check(&fs->sb)) {
 		return ENOTSUP;
+	}
 
 	bsize = ext4_sb_get_block_size(&fs->sb);
 	if (bsize > EXT4_MAX_BLOCK_SIZE)

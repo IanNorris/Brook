@@ -62,6 +62,20 @@ struct Ext4Mount {
 
 static Ext4Mount* g_mounts[EXT4_MAX_MOUNTS] = {};
 
+// Allocate a mount slot (independent of pdrv)
+static int alloc_mount_slot() {
+    for (uint8_t i = 0; i < EXT4_MAX_MOUNTS; ++i)
+        if (!g_mounts[i]) return i;
+    return -1;
+}
+
+// Find mount slot by Ext4Mount pointer
+static int find_mount_slot(Ext4Mount* m) {
+    for (uint8_t i = 0; i < EXT4_MAX_MOUNTS; ++i)
+        if (g_mounts[i] == m) return i;
+    return -1;
+}
+
 // Kernel-side device lookup (exported from kernel ksymtab)
 extern "C" Device* Ext4GetDevice(uint8_t pdrv);
 
@@ -151,7 +165,8 @@ static const ext4_lock g_mpLocks[EXT4_MAX_MOUNTS] = {
 static void build_lwext4_path(const Ext4Mount* m, const char* relPath,
                               char* out, uint32_t outSize) {
     // lwext4 expects paths like "/mp0/path/to/file"
-    // relPath from Brook VFS is already relative, e.g. "path/to/file"
+    // relPath from Brook VFS may have leading '/', strip it
+    if (relPath[0] == '/') relPath++;
     uint32_t mpLen = strlen(m->mountPt);
     uint32_t relLen = strlen(relPath);
 
@@ -310,6 +325,13 @@ static bool ext4_fs_mount(uint8_t pdrv, void** mountPriv) {
         SerialPrintf("ext4: no device bound for pdrv %u\n", pdrv);
         return false;
     }
+
+    int slot = alloc_mount_slot();
+    if (slot < 0) {
+        SerialPrintf("ext4: no free mount slots\n");
+        return false;
+    }
+
     auto* blkOps = reinterpret_cast<const BlockDeviceOps*>(dev->ops);
 
     auto* m = static_cast<Ext4Mount*>(kmalloc(sizeof(Ext4Mount)));
@@ -328,6 +350,11 @@ static bool ext4_fs_mount(uint8_t pdrv, void** mountPriv) {
     m->bdif.ph_bsize = blkOps->block_size(dev);
     m->bdif.ph_bcnt  = blkOps->block_count(dev);
     m->bdif.ph_bbuf  = static_cast<uint8_t*>(kmalloc(m->bdif.ph_bsize));
+
+    SerialPrintf("ext4: dev=%s ph_bsize=%u ph_bcnt=%llu part_size=%llu\n",
+                 dev->name, m->bdif.ph_bsize,
+                 (unsigned long long)m->bdif.ph_bcnt,
+                 (unsigned long long)(m->bdif.ph_bcnt * m->bdif.ph_bsize));
     if (!m->bdif.ph_bbuf) {
         kfree(m);
         return false;
@@ -338,11 +365,10 @@ static bool ext4_fs_mount(uint8_t pdrv, void** mountPriv) {
     m->bdev.part_offset = 0;
     m->bdev.part_size = m->bdif.ph_bcnt * m->bdif.ph_bsize;
 
-    // Generate unique names
-    // lwext4 device name: "ext4dev0"
+    // Generate unique names using slot index
     const char* digits = "0123456789";
     strcpy(m->devName, "ext4dev");
-    char d[2] = { digits[pdrv % 10], '\0' };
+    char d[2] = { digits[slot % 10], '\0' };
     strcat(m->devName, d);
 
     // lwext4 mount point: "/mp0/"
@@ -370,7 +396,7 @@ static bool ext4_fs_mount(uint8_t pdrv, void** mountPriv) {
     }
 
     // Set mount-point lock
-    r = ext4_mount_setup_locks(m->mountPt, &g_mpLocks[pdrv]);
+    r = ext4_mount_setup_locks(m->mountPt, &g_mpLocks[slot]);
     if (r != 0) {
         SerialPrintf("ext4: lock setup failed: %d\n", r);
         ext4_umount(m->mountPt);
@@ -392,7 +418,7 @@ static bool ext4_fs_mount(uint8_t pdrv, void** mountPriv) {
     }
 
     m->mounted = true;
-    g_mounts[pdrv] = m;
+    g_mounts[slot] = m;
     *mountPriv = m;
 
     SerialPrintf("ext4: mounted pdrv %u (%s) as %s — %lu blocks × %u bytes\n",
@@ -432,7 +458,9 @@ static Vnode* ext4_fs_open(void* mountPriv, uint8_t pdrv, const char* relPath, i
 
     // Check if it's a directory
     ext4_dir dir;
-    if (ext4_dir_open(&dir, path) == 0) {
+    memset(&dir, 0, sizeof(dir));
+    int dr = ext4_dir_open(&dir, path);
+    if (dr == 0) {
         // It's a directory
         auto* fp = static_cast<Ext4FilePriv*>(kmalloc(sizeof(Ext4FilePriv)));
         if (!fp) { ext4_dir_close(&dir); return nullptr; }
@@ -469,6 +497,7 @@ static Vnode* ext4_fs_open(void* mountPriv, uint8_t pdrv, const char* relPath, i
         // Try read-only
         r = ext4_fopen2(&f, path, O_RDONLY);
         if (r != 0) {
+            SerialPrintf("ext4: fopen2 failed: %d for '%s'\n", r, path);
             if (flags & VFS_O_CREATE) {
                 r = ext4_fopen2(&f, path, O_RDWR | O_CREAT);
                 if (r != 0) return nullptr;
@@ -509,9 +538,13 @@ static int ext4_fs_stat_path(void* mountPriv, uint8_t pdrv, const char* relPath,
     char path[MAX_PATH_LEN];
     build_lwext4_path(m, relPath, path, sizeof(path));
 
+    SerialPrintf("ext4: stat_path '%s'\n", path);
+
     // Check directory first
     ext4_dir dir;
-    if (ext4_dir_open(&dir, path) == 0) {
+    memset(&dir, 0, sizeof(dir));
+    int dr = ext4_dir_open(&dir, path);
+    if (dr == 0) {
         ext4_dir_close(&dir);
         st->size = 0;
         st->isDir = true;
@@ -525,6 +558,7 @@ static int ext4_fs_stat_path(void* mountPriv, uint8_t pdrv, const char* relPath,
 
     // Try as file
     ext4_file f;
+    memset(&f, 0, sizeof(f));
     int r = ext4_fopen2(&f, path, O_RDONLY);
     if (r != 0) return -ENOENT;
 

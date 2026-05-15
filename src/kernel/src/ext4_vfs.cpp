@@ -10,7 +10,7 @@
 #include "serial.h"
 
 namespace {
-constexpr uint8_t EXT4_MAX_SLOTS = 4;
+constexpr uint8_t EXT4_MAX_SLOTS = 16;
 brook::Device* g_ext4Devices[EXT4_MAX_SLOTS] = {};
 }
 

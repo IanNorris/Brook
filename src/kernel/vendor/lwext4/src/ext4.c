@@ -373,11 +373,13 @@ int ext4_mount(const char *dev_name, const char *mount_point,
 
 	size_t mp_len = strlen(mount_point);
 
-	if (mp_len > CONFIG_EXT4_MAX_MP_NAME)
+	if (mp_len > CONFIG_EXT4_MAX_MP_NAME) {
 		return EINVAL;
+	}
 
-	if (mount_point[mp_len - 1] != '/')
+	if (mount_point[mp_len - 1] != '/') {
 		return ENOTSUP;
+	}
 
 	for (size_t i = 0; i < CONFIG_EXT4_BLOCKDEVS_COUNT; ++i) {
 		if (!strcmp(dev_name, s_bdevices[i].name)) {
@@ -386,8 +388,9 @@ int ext4_mount(const char *dev_name, const char *mount_point,
 		}
 	}
 
-	if (!bd)
+	if (!bd) {
 		return ENODEV;
+	}
 
 	for (size_t i = 0; i < CONFIG_EXT4_MOUNTPOINTS_COUNT; ++i) {
 		if (!s_mp[i].mounted) {
@@ -400,12 +403,14 @@ int ext4_mount(const char *dev_name, const char *mount_point,
 			return EOK;
 	}
 
-	if (!mp)
+	if (!mp) {
 		return ENOMEM;
+	}
 
 	r = ext4_block_init(bd);
-	if (r != EOK)
+	if (r != EOK) {
 		return r;
+	}
 
 	r = ext4_fs_init(&mp->fs, bd, read_only);
 	if (r != EOK) {
@@ -423,8 +428,9 @@ int ext4_mount(const char *dev_name, const char *mount_point,
 		return r;
 	}
 
-	if (bsize != bc->itemsize)
+	if (bsize != bc->itemsize) {
 		return ENOTSUP;
+	}
 
 	/*Bind block cache to block device*/
 	r = ext4_block_bind_bcache(bd, bc);

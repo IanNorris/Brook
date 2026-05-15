@@ -81,3 +81,4 @@ crash_reports/
 .certs/
 brook_gpt_disk.img
 brook_disk.img.backup
+brook_ext4_disk.img

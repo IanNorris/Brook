@@ -27,9 +27,9 @@ ESP_DIR="${BUILD_DIR}/esp"
 INITRD_IMG="${ESP_DIR}/INITRD.IMG"
 MOD_DIR="${BUILD_DIR}/kernel/drivers"
 
-# Image size in KB — enough for config + a few modules.
-# mformat needs power-of-two-ish sizes; 720KB is a standard floppy format.
-SIZE_KB=720
+# Image size in KB — enough for config + all driver modules.
+# With ext4.mod (~764KB) the total easily exceeds 1MB.
+SIZE_KB=2048
 
 echo "Creating initrd image (${SIZE_KB} KB)..."
 

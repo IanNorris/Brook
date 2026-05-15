@@ -51,19 +51,26 @@
 // All kernel initialization and runtime — called by KernelMain after stack switch.
 __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootProtocol);
 
-// Probe a block device for a filesystem (FAT or ext2), read BROOK.MNT,
+// Deferred probe list: devices that couldn't be mounted during initial scan
+// (e.g. ext4 VFS not yet registered). Re-probed after module loading.
+struct DeferredProbe {
+    brook::Device* dev;
+    uint8_t pdrv;
+    char label[24];
+};
+static DeferredProbe g_deferredProbes[16];
+static uint32_t g_deferredCount = 0;
+
+// Probe a block device for a filesystem (FAT, ext4, or ext2), read BROOK.MNT,
 // and mount at the specified path.  Returns true if mounted.
-static bool ProbeAndMountDevice(const char* label, brook::Device* dev, uint8_t pdrv)
+// When allowDefer is true, devices that fail to mount or find BROOK.MNT are
+// queued for re-probe after module loading.
+static bool ProbeAndMountDevice(const char* label, brook::Device* dev, uint8_t pdrv,
+                                bool allowDefer = true)
 {
     brook::FatFsBindDrive(pdrv, dev);
     bool mounted = brook::VfsMount("/mnt/probe", "fatfs", pdrv);
     const char* fsType = "fatfs";
-
-    if (!mounted) {
-        Ext2BindDevice(pdrv, dev);
-        mounted = brook::VfsMount("/mnt/probe", "ext2", pdrv);
-        fsType = "ext2";
-    }
 
     if (!mounted) {
         Ext4BindDevice(pdrv, dev);
@@ -72,7 +79,22 @@ static bool ProbeAndMountDevice(const char* label, brook::Device* dev, uint8_t p
     }
 
     if (!mounted) {
-        brook::SerialPrintf("%s — no recognized filesystem\n", label);
+        Ext2BindDevice(pdrv, dev);
+        mounted = brook::VfsMount("/mnt/probe", "ext2", pdrv);
+        fsType = "ext2";
+    }
+
+    if (!mounted) {
+        // Queue for re-probe after modules load (ext4 may not be registered yet).
+        if (allowDefer && g_deferredCount < 16) {
+            auto& d = g_deferredProbes[g_deferredCount++];
+            d.dev = dev;
+            d.pdrv = pdrv;
+            for (int i = 0; i < 23 && label[i]; ++i) d.label[i] = label[i];
+            d.label[23] = '\0';
+        }
+        brook::SerialPrintf("%s — no recognized filesystem%s\n", label,
+                           allowDefer ? " (deferred)" : "");
         return false;
     }
 
@@ -80,6 +102,14 @@ static bool ProbeAndMountDevice(const char* label, brook::Device* dev, uint8_t p
     if (!mnt) {
         brook::SerialPrintf("%s — no BROOK.MNT, skipping\n", label);
         brook::VfsUnmount("/mnt/probe");
+        // Defer for re-probe: a better driver loaded later may read the file.
+        if (allowDefer && g_deferredCount < 16) {
+            auto& d = g_deferredProbes[g_deferredCount++];
+            d.dev = dev;
+            d.pdrv = pdrv;
+            for (int i = 0; i < 23 && label[i]; ++i) d.label[i] = label[i];
+            d.label[23] = '\0';
+        }
         return false;
     }
 
@@ -491,6 +521,16 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::SerialPuts("module: Phase 2 — loading from /boot/drivers (virtio)\n");
     brook::ModuleDiscoverAndLoad("/boot/drivers");
     brook::SerialPuts("module: Phase 2 — done\n");
+
+    // ---- Re-probe deferred devices (e.g. ext4 now registered) ----
+    if (g_deferredCount > 0) {
+        brook::SerialPrintf("module: re-probing %u deferred device(s)\n", g_deferredCount);
+        for (uint32_t i = 0; i < g_deferredCount; ++i) {
+            auto& d = g_deferredProbes[i];
+            ProbeAndMountDevice(d.label, d.dev, d.pdrv, /*allowDefer=*/false);
+        }
+        g_deferredCount = 0;
+    }
 
     // ---- USB block devices: probe after xHCI module has loaded ----
     // The xHCI module registers "usb0", "usb1", etc. as block devices.

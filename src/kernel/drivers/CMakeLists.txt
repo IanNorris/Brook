@@ -83,4 +83,6 @@ add_driver_module(ext4
         "-Wno-missing-field-initializers"
         "-Wno-unused-function"
         "-Wno-unused-but-set-variable"
+        "-Wno-null-pointer-arithmetic"
+        "-Wno-null-pointer-subtraction"
 )
