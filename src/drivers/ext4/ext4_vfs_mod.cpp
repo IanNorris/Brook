@@ -32,6 +32,7 @@ MODULE_IMPORT_SYMBOL(kmalloc);
 MODULE_IMPORT_SYMBOL(kfree);
 MODULE_IMPORT_SYMBOL(krealloc);
 MODULE_IMPORT_SYMBOL(DeviceFind);
+MODULE_IMPORT_SYMBOL(Ext4GetDevice);
 MODULE_IMPORT_SYMBOL(SerialPrintf);
 MODULE_IMPORT_SYMBOL(SerialVPrintf);
 
@@ -60,7 +61,9 @@ struct Ext4Mount {
 };
 
 static Ext4Mount* g_mounts[EXT4_MAX_MOUNTS] = {};
-static Device*    g_devices[EXT4_MAX_MOUNTS] = {};
+
+// Kernel-side device lookup (exported from kernel ksymtab)
+extern "C" Device* Ext4GetDevice(uint8_t pdrv);
 
 // ---------------------------------------------------------------------------
 // Block device adapter: Brook Device* → ext4_blockdev_iface
@@ -302,12 +305,11 @@ static Ext4Mount* find_mount_by_priv(void* mountPriv) {
 }
 
 static bool ext4_fs_mount(uint8_t pdrv, void** mountPriv) {
-    if (pdrv >= EXT4_MAX_MOUNTS || !g_devices[pdrv]) {
+    Device* dev = Ext4GetDevice(pdrv);
+    if (!dev) {
         SerialPrintf("ext4: no device bound for pdrv %u\n", pdrv);
         return false;
     }
-
-    Device* dev = g_devices[pdrv];
     auto* blkOps = reinterpret_cast<const BlockDeviceOps*>(dev->ops);
 
     auto* m = static_cast<Ext4Mount*>(kmalloc(sizeof(Ext4Mount)));
@@ -654,14 +656,3 @@ static void Ext4ModExit() {
 
 DECLARE_MODULE("ext4", Ext4ModInit, Ext4ModExit,
                "ext4 filesystem driver (lwext4)");
-
-// ---------------------------------------------------------------------------
-// Public API: bind a block device to an ext4 pdrv slot
-// ---------------------------------------------------------------------------
-
-extern "C" bool Ext4BindDevice(uint8_t pdrv, Device* dev) {
-    if (pdrv >= EXT4_MAX_MOUNTS || !dev) return false;
-    g_devices[pdrv] = dev;
-    SerialPrintf("ext4: bound device '%s' to pdrv %u\n", dev->name, pdrv);
-    return true;
-}

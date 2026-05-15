@@ -185,6 +185,7 @@ add_executable(kernel
     src/vfs.cpp
     src/fatfs_vfs.cpp
     src/ext2_vfs.cpp
+    src/ext4_vfs.cpp
     src/procfs.cpp
     src/procfs_vfs.cpp
     src/net.cpp

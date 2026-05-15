@@ -29,6 +29,7 @@
 #include "procfs.h"
 #include "fatfs_vfs.h"
 #include "ext2_vfs.h"
+#include "ext4_vfs.h"
 #include "procfs_vfs.h"
 #include "net.h"
 #include "compositor.h"
@@ -62,6 +63,12 @@ static bool ProbeAndMountDevice(const char* label, brook::Device* dev, uint8_t p
         Ext2BindDevice(pdrv, dev);
         mounted = brook::VfsMount("/mnt/probe", "ext2", pdrv);
         fsType = "ext2";
+    }
+
+    if (!mounted) {
+        Ext4BindDevice(pdrv, dev);
+        mounted = brook::VfsMount("/mnt/probe", "ext4", pdrv);
+        fsType = "ext4";
     }
 
     if (!mounted) {
