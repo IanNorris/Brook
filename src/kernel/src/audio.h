@@ -60,6 +60,9 @@ static constexpr uint32_t MIXER_FRAME_BYTES  = MIXER_HW_CHANNELS * (MIXER_HW_BIT
 // streamId identifies the /dev/dsp fd (0-7), allowing independent write cursors.
 void AudioMixerSubmit(const int16_t* samples, uint32_t frameCount, uint32_t streamId = 0);
 
+// Query available space in mixer ring for a given stream (in frames).
+uint32_t AudioMixerAvailableFrames(uint32_t streamId = 0);
+
 // Flush the accumulated mix buffer to the hardware driver and reset.
 void AudioMixerFlush();
 

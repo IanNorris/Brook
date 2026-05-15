@@ -66,6 +66,20 @@ static inline uint32_t MixerBufferedFrames()
     return g_writeHighWater - g_readPos;
 }
 
+uint32_t AudioMixerAvailableFrames(uint32_t streamId)
+{
+    if (!g_mixerReady) return 0;
+    if (streamId >= MIXER_MAX_STREAMS) streamId = 0;
+
+    SpinLockAcquire(&g_mixerLock);
+    uint32_t writePos = g_streamWritePos[streamId];
+    if (writePos < g_readPos)
+        writePos = g_readPos;
+    uint32_t available = MIXER_BUF_FRAMES - (writePos - g_readPos);
+    SpinLockRelease(&g_mixerLock);
+    return available;
+}
+
 void AudioMixerSubmit(const int16_t* samples, uint32_t frameCount, uint32_t streamId)
 {
     if (!g_mixerReady || !samples || frameCount == 0) return;

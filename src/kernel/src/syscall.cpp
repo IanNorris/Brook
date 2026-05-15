@@ -1523,6 +1523,8 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
     // /dev/dsp — pass PCM data through the audio mixer.
     // All streams are resampled to 44100 Hz stereo 16-bit, then submitted
     // to the mixer which accumulates and flushes to hardware.
+    // Block when the mixer ring is full so we apply backpressure instead
+    // of silently dropping samples (which causes audible stutter/gaps).
     if (fde->type == FdType::DevDsp && fde->handle)
     {
         auto* dsp = static_cast<DspState*>(fde->handle);
@@ -1530,6 +1532,27 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
         uint32_t appRate = dsp->sampleRate;
         uint32_t bytesPerFrame = (dsp->bitsPerSample / 8) * dsp->channels;
         if (bytesPerFrame == 0) bytesPerFrame = 1;
+
+        uint32_t totalInFrames = static_cast<uint32_t>(count) / bytesPerFrame;
+        uint32_t totalOutFrames;
+        if (appRate == DSP_HW_RATE || appRate == 0)
+            totalOutFrames = totalInFrames;
+        else
+            totalOutFrames = (totalInFrames * DSP_HW_RATE + appRate - 1) / appRate;
+
+        // Block until mixer has enough space (avoid silent sample drops).
+        // Timeout after 500ms to avoid permanent hang on broken stream.
+        extern volatile uint64_t g_lapicTickCount;
+        uint64_t deadline = g_lapicTickCount + 500;
+        while (AudioMixerAvailableFrames(dsp->mixerStreamId) < totalOutFrames)
+        {
+            if (g_lapicTickCount >= deadline) break;
+            Process* self = SchedulerCurrentProcess();
+            if (self) {
+                self->wakeupTick = g_lapicTickCount + 5; // 5ms poll
+                SchedulerBlock(self);
+            }
+        }
 
         const int16_t* mixSrc = nullptr;
         uint32_t mixFrames = 0;
