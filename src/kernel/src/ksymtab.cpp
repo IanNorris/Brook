@@ -51,6 +51,7 @@ EXPORT_SYMBOL(krealloc);
 EXPORT_SYMBOL(KPrintf);
 EXPORT_SYMBOL(KPuts);
 EXPORT_SYMBOL(SerialPrintf);
+EXPORT_SYMBOL(SerialVPrintf);
 EXPORT_SYMBOL(SerialPuts);
 
 // Physical memory
