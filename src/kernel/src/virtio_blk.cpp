@@ -43,7 +43,7 @@ static constexpr uint32_t VIRTIO_MAX_DEVS = 8;
 static constexpr uint32_t VIRTIO_CACHE_BLOCK_SECTORS = 8;     // 4 KiB
 static constexpr uint32_t VIRTIO_CACHE_BLOCK_SIZE    = 4096;
 static constexpr uint32_t VIRTIO_CACHE_ENTRIES       = 4096;  // 16 MiB
-static constexpr uint64_t VIRTIO_SMALL_READ_LIMIT    = 16 * 1024;
+static constexpr uint64_t VIRTIO_SMALL_READ_LIMIT    = 64 * 1024;
 
 // ---- Virtqueue structures (packed for DMA) ----
 
@@ -106,9 +106,9 @@ struct VirtioBlkState {
     uint8_t*      statusBuf;
     uint64_t      statusBufPhys;
 
-    // Persistent page-aligned DMA data buffer (64 KB = 128 sectors).
+    // Persistent page-aligned DMA data buffer (256 KB = 512 sectors).
     // Larger buffer means fewer SubmitRequest round-trips for big reads.
-    static constexpr uint32_t DMA_BUF_PAGES = 16;
+    static constexpr uint32_t DMA_BUF_PAGES = 64;
     uint8_t*      dmaBuf;
     uint64_t      dmaBufPhys;
 

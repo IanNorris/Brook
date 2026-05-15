@@ -51,6 +51,81 @@
 // All kernel initialization and runtime — called by KernelMain after stack switch.
 __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootProtocol);
 
+// ---------------------------------------------------------------------------
+// IO Benchmark — measures sequential read throughput on a given VFS path.
+// Outputs results to serial.  Called once after filesystems are mounted.
+// ---------------------------------------------------------------------------
+static void RunIOBenchmark(const char* path, uint32_t readSize, bool warmup)
+{
+    using namespace brook;
+
+    Vnode* vn = VfsOpen(path, 0);
+    if (!vn) {
+        SerialPrintf("BENCH: cannot open '%s'\n", path);
+        return;
+    }
+
+    VnodeStat st;
+    if (vn->ops->stat && vn->ops->stat(vn, &st) == 0) {
+        SerialPrintf("BENCH: '%s' size=%u bytes\n", path, (unsigned)st.size);
+    }
+
+    // Allocate read buffer
+    auto* buf = static_cast<uint8_t*>(kmalloc(readSize));
+    if (!buf) {
+        SerialPrintf("BENCH: alloc failed (%u)\n", readSize);
+        VfsClose(vn);
+        return;
+    }
+
+    if (warmup) {
+        // Warm-up pass (populate caches)
+        uint64_t off = 0;
+        int64_t n;
+        while ((n = VfsRead(vn, buf, readSize, &off)) > 0) {}
+    }
+
+    // Timed pass — sequential read of entire file
+    uint64_t off = 0;
+    uint64_t totalBytes = 0;
+    uint64_t tStart = ApicTickCount();
+    int64_t n;
+    while ((n = VfsRead(vn, buf, readSize, &off)) > 0) {
+        totalBytes += n;
+    }
+    uint64_t tEnd = ApicTickCount();
+    uint64_t elapsedMs = tEnd - tStart;
+    if (elapsedMs == 0) elapsedMs = 1;
+
+    uint64_t kbPerSec = (totalBytes * 1000) / (elapsedMs * 1024);
+    SerialPrintf("BENCH: '%s' %s read %u bytes in %u ms = %u KB/s (buf=%u)\n",
+                 path, warmup ? "warm" : "cold",
+                 (unsigned)totalBytes, (unsigned)elapsedMs,
+                 (unsigned)kbPerSec, readSize);
+
+    kfree(buf);
+    VfsClose(vn);
+}
+
+static void RunIOBenchmarkSuite()
+{
+    using namespace brook;
+    SerialPrintf("BENCH: === IO Benchmark Suite ===\n");
+
+    // Cold reads (first access, no cache)
+    static const uint32_t bufSizes[] = { 512, 4096, 16384, 65536 };
+    for (uint32_t i = 0; i < 4; ++i) {
+        RunIOBenchmark("/data/BENCH4M.DAT", bufSizes[i], false);
+    }
+
+    // Warm reads (second access, cached)
+    for (uint32_t i = 0; i < 4; ++i) {
+        RunIOBenchmark("/data/BENCH4M.DAT", bufSizes[i], true);
+    }
+
+    SerialPrintf("BENCH: === Suite complete ===\n");
+}
+
 // Deferred probe list: devices that couldn't be mounted during initial scan
 // (e.g. ext4 VFS not yet registered). Re-probed after module loading.
 struct DeferredProbe {
@@ -133,6 +208,11 @@ static bool ProbeAndMountDevice(const char* label, brook::Device* dev, uint8_t p
     }
 
     brook::VfsUnmount("/mnt/probe");
+
+    // Unmount any existing filesystem at this path (e.g. ext2 claimed it
+    // before the ext4 module was loaded and re-probed the device).
+    brook::VfsUnmount(mntPath);
+
     if (brook::VfsMount(mntPath, fsType, pdrv)) {
         brook::KPrintf("%s mounted at %s\n", label, mntPath);
 
@@ -574,6 +654,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             ProbeAndMountDevice(label, ud, nextPdrv++);
         }
     }
+
+    // ---- IO Benchmark (before compositor/shell to avoid contention) ----
+    RunIOBenchmarkSuite();
 
     // ---- Network (static config from BROOK.CFG, or DHCP) ----
     if (brook::NetGetIf()) {

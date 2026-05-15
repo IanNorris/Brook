@@ -184,12 +184,21 @@ static void build_lwext4_path(const Ext4Mount* m, const char* relPath,
 // Vnode private data
 // ---------------------------------------------------------------------------
 
+// Read-ahead buffer size — lwext4 per-call overhead is high, so we read
+// in 64KB chunks and serve smaller VFS reads from the buffer.
+static constexpr uint32_t EXT4_READAHEAD_SIZE = 64 * 1024;
+
 struct Ext4FilePriv {
     ext4_file file;
     Ext4Mount* mount;
     bool isDir;
     ext4_dir dir;
     char path[MAX_PATH_LEN];  // full lwext4 path, needed for readdir
+
+    // Read-ahead buffer for sequential reads
+    uint8_t* raBuf;       // heap-allocated, EXT4_READAHEAD_SIZE bytes (or nullptr)
+    uint64_t raStart;     // file offset of first byte in buffer
+    uint32_t raValid;     // number of valid bytes in buffer
 };
 
 // ---------------------------------------------------------------------------
@@ -205,21 +214,58 @@ static int ext4_vn_read(Vnode* vn, void* buf, uint64_t len, uint64_t* offset) {
     auto* fp = static_cast<Ext4FilePriv*>(vn->priv);
     if (fp->isDir) return -EISDIR;
 
-    // Seek to offset
-    int r = ext4_fseek(&fp->file, *offset, SEEK_SET);
-    if (r != 0) return -EIO;
+    uint8_t* dst = static_cast<uint8_t*>(buf);
+    uint64_t pos = *offset;
+    uint64_t remaining = len;
+    uint64_t totalRead = 0;
 
-    size_t bytesRead = 0;
-    r = ext4_fread(&fp->file, buf, len, &bytesRead);
-    if (r != 0 && bytesRead == 0) return -EIO;
+    while (remaining > 0) {
+        // Check read-ahead buffer
+        if (fp->raBuf && fp->raValid > 0 &&
+            pos >= fp->raStart && pos < fp->raStart + fp->raValid)
+        {
+            uint32_t bufOff = static_cast<uint32_t>(pos - fp->raStart);
+            uint32_t avail = fp->raValid - bufOff;
+            uint32_t chunk = (remaining < avail) ? static_cast<uint32_t>(remaining) : avail;
+            memcpy(dst, fp->raBuf + bufOff, chunk);
+            dst += chunk;
+            pos += chunk;
+            remaining -= chunk;
+            totalRead += chunk;
+            continue;
+        }
 
-    *offset += bytesRead;
-    return (int)bytesRead;
+        // Buffer miss — fill read-ahead buffer from lwext4
+        if (!fp->raBuf) {
+            fp->raBuf = static_cast<uint8_t*>(kmalloc(EXT4_READAHEAD_SIZE));
+            if (!fp->raBuf) break;
+        }
+
+        // Seek if needed
+        if (fp->file.fpos != pos) {
+            int r = ext4_fseek(&fp->file, pos, SEEK_SET);
+            if (r != 0) break;
+        }
+
+        size_t bytesRead = 0;
+        (void)ext4_fread(&fp->file, fp->raBuf, EXT4_READAHEAD_SIZE, &bytesRead);
+        if (bytesRead == 0) break;  // EOF or error
+
+        fp->raStart = pos;
+        fp->raValid = static_cast<uint32_t>(bytesRead);
+        // Loop will now serve from buffer
+    }
+
+    *offset = pos;
+    return totalRead > 0 ? static_cast<int>(totalRead) : 0;
 }
 
 static int ext4_vn_write(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset) {
     auto* fp = static_cast<Ext4FilePriv*>(vn->priv);
     if (fp->isDir) return -EISDIR;
+
+    // Invalidate read-ahead buffer (data changed)
+    fp->raValid = 0;
 
     int r = ext4_fseek(&fp->file, *offset, SEEK_SET);
     if (r != 0) return -EIO;
@@ -267,6 +313,11 @@ static int ext4_vn_readdir(Vnode* vn, DirEntry* out, uint32_t* cookie) {
 static void ext4_vn_close(Vnode* vn) {
     auto* fp = static_cast<Ext4FilePriv*>(vn->priv);
     if (!fp) return;
+
+    if (fp->raBuf) {
+        kfree(fp->raBuf);
+        fp->raBuf = nullptr;
+    }
 
     if (fp->isDir) {
         ext4_dir_close(&fp->dir);

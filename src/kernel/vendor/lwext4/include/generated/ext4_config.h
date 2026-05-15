@@ -23,8 +23,8 @@
 #define CONFIG_DEBUG_ASSERT         1
 #define CONFIG_HAVE_OWN_ASSERT      1
 
-/* Block device cache — 32 blocks should be reasonable for kernel use */
-#define CONFIG_BLOCK_DEV_CACHE_SIZE 32
+/* Block device cache — 1024 blocks (~4 MB for 4KB blocks) for good cache hit rate */
+#define CONFIG_BLOCK_DEV_CACHE_SIZE 1024
 #define CONFIG_BLOCK_DEV_ENABLE_STATS 0
 
 /* Use Brook's memory allocator */
