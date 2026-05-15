@@ -1765,17 +1765,23 @@ static void pump_input_for_surface(struct brook_surface *s) {
             if (e->mods & 0x08) depressed |= (1u << 3); /* Mod1/Alt */
             if (e->mods & 0x10) locked    |= (1u << 1); /* Lock/Caps */
 
-            /* Send modifiers before the key event so the client's xkb_state
-             * is current when it processes the key. Some toolkits (GTK via
-             * xkbcommon) only update modifier state from wl_keyboard.modifiers,
-             * not from xkb_state_update_key. */
-            wl_keyboard_send_modifiers(sc->keyboard, next_serial(),
-                                       depressed, 0u, locked, 0u);
-
-            /* Send key event. */
+            /* Send key event first — xkbcommon clients call
+             * xkb_state_update_key() which internally tracks modifier
+             * state from the keymap. */
             uint32_t xkb_code = scancode_to_xkb(e->scan);
             wl_keyboard_send_key(sc->keyboard, next_serial(), now,
                                  xkb_code, st);
+
+            /* Send modifiers only when they changed — avoids double-toggle
+             * where xkb_state_update_key already updated the modifier
+             * internally and a redundant wl_keyboard.modifiers would flip
+             * it back. */
+            if (depressed != sc->kb_mods_depressed ||
+                locked    != sc->kb_mods_locked)
+            {
+                wl_keyboard_send_modifiers(sc->keyboard, next_serial(),
+                                           depressed, 0u, locked, 0u);
+            }
 
             /* Debug: log key events with modifier info */
             if (e->scan == 0x2A || e->scan == 0x36 || depressed || locked)
