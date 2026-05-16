@@ -1541,16 +1541,22 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
             totalOutFrames = (totalInFrames * DSP_HW_RATE + appRate - 1) / appRate;
 
         // Block until mixer has enough space (avoid silent sample drops).
+        // Skip blocking for O_NONBLOCK fds (games need non-blocking writes
+        // to avoid stalling their render loop — they tolerate small gaps).
         // Timeout after 500ms to avoid permanent hang on broken stream.
-        extern volatile uint64_t g_lapicTickCount;
-        uint64_t deadline = g_lapicTickCount + 500;
-        while (AudioMixerAvailableFrames(dsp->mixerStreamId) < totalOutFrames)
+        bool isNonBlock = (fde->statusFlags & 0x800) != 0;
+        if (!isNonBlock)
         {
-            if (g_lapicTickCount >= deadline) break;
-            Process* self = SchedulerCurrentProcess();
-            if (self) {
-                self->wakeupTick = g_lapicTickCount + 5; // 5ms poll
-                SchedulerBlock(self);
+            extern volatile uint64_t g_lapicTickCount;
+            uint64_t deadline = g_lapicTickCount + 500;
+            while (AudioMixerAvailableFrames(dsp->mixerStreamId) < totalOutFrames)
+            {
+                if (g_lapicTickCount >= deadline) break;
+                Process* self = SchedulerCurrentProcess();
+                if (self) {
+                    self->wakeupTick = g_lapicTickCount + 5; // 5ms poll
+                    SchedulerBlock(self);
+                }
             }
         }
 
