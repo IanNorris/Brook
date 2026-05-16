@@ -94,6 +94,9 @@ fi
 # Build initrd image (contains BROOK.CFG + early driver modules)
 "${SCRIPT_DIR}/make_initrd.sh" "--${BUILD_TYPE}"
 
+# Archive debug symbols for crash decoder (idempotent — skips if already done)
+"${SCRIPT_DIR}/archive_symbols.sh" --build-dir "${BUILD_DIR}" 2>&1 | sed 's/^/  /'
+
 # Write default BROOK.CFG if not already present
 BROOK_CFG="${BUILD_DIR}/esp/BROOK.CFG"
 if [ ! -f "${BROOK_CFG}" ]; then

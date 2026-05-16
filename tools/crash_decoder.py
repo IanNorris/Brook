@@ -699,9 +699,30 @@ def build_json(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | None,
 
 
 # ── Auto-detect ELF ─────────────────────────────────────────────────────────
-def find_brook_elf() -> str | None:
-    """Search common locations for BROOK.elf."""
+def find_brook_elf(git_hash: str | None = None) -> str | None:
+    """Search for BROOK.elf, preferring the symbol archive matching git_hash."""
     script_dir = Path(__file__).parent.parent
+    symbols_dir = script_dir / "symbols"
+
+    # If we have a git hash, try to extract from the symbol archive first
+    if git_hash and symbols_dir.is_dir():
+        archive = symbols_dir / f"{git_hash}.tar.xz"
+        if archive.exists():
+            extract_dir = symbols_dir / f".extract_{git_hash}"
+            elf_path = extract_dir / "kernel" / "BROOK.elf"
+            if not elf_path.exists():
+                # Extract on demand
+                extract_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    import subprocess as sp
+                    sp.run(["tar", "-xJf", str(archive), "-C", str(extract_dir)],
+                           check=True, capture_output=True)
+                except Exception as e:
+                    print(f"  [warn] Failed to extract symbol archive: {e}")
+            if elf_path.exists():
+                return str(elf_path)
+
+    # Fallback: current build directory
     candidates = [
         script_dir / "build" / "debug" / "kernel" / "BROOK.elf",
         script_dir / "build" / "release" / "kernel" / "BROOK.elf",
@@ -710,6 +731,8 @@ def find_brook_elf() -> str | None:
     ]
     for p in candidates:
         if p.exists():
+            if git_hash:
+                print(f"  [warn] No symbol archive for {git_hash}, using current build ELF")
             return str(p)
     return None
 
@@ -765,6 +788,12 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
                   file=sys.stderr)
 
         off = payload_end
+
+    # If no symbolicator was provided, try to find one matching the dump's git hash
+    if sym is None and sys_info and sys_info.git_hash:
+        elf_path = find_brook_elf(sys_info.git_hash)
+        if elf_path:
+            sym = Symbolicator(elf_path)
 
     if as_json:
         print(json.dumps(build_json(hdr, regs, trace, sym,
@@ -857,17 +886,15 @@ def main():
     else:
         ap.error("Provide an image, --hex, --base45, --serial, --stdin, or --vnc")
 
-    # Symbolicator — auto-detect ELF if not specified
-    elf_path = args.elf or find_brook_elf()
+    # Symbolicator — use explicit --elf if provided, otherwise let
+    # decode_crash() auto-detect from the dump's git hash + symbol archive
     sym = None
-    if elf_path:
-        sym = Symbolicator(elf_path)
+    if args.elf:
+        sym = Symbolicator(args.elf)
         if sym.symbols:
-            print(f"  {C.GREEN}✓{C.RESET} Loaded {len(sym.symbols)} symbols from {elf_path}",
+            print(f"  {C.GREEN}✓{C.RESET} Loaded {len(sym.symbols)} symbols from {args.elf}",
                   file=sys.stderr)
-    else:
-        print(f"  {C.YELLOW}⚠{C.RESET} No BROOK.elf found — use --elf for symbolication",
-              file=sys.stderr)
+    # If no --elf, decode_crash will try symbol archive lookup using the dump's git hash
 
     # If --save, redirect stdout to file while still printing to terminal
     save_file = None

@@ -82,3 +82,6 @@ crash_reports/
 brook_gpt_disk.img
 brook_disk.img.backup
 brook_ext4_disk.img
+
+# Symbol archives (per-build, local only)
+symbols/
