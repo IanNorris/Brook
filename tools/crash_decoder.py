@@ -195,12 +195,14 @@ class ProcessList:
             off += 24
 
 
-PANIC_GIT_HASH_LEN = 12
+PANIC_GIT_HASH_LEN   = 12
+PANIC_GIT_BRANCH_LEN = 24
 
 
 class SystemInfo:
     def __init__(self, data: bytes):
-        if len(data) < 4 + 8 + 8 + PANIC_GIT_HASH_LEN:
+        min_size_v1 = 4 + 8 + 8 + PANIC_GIT_HASH_LEN  # without branch
+        if len(data) < min_size_v1:
             raise ValueError("Truncated SystemInfo")
         self.cpu_index, self.cpu_count, self.reserved = \
             struct.unpack_from("<BBH", data, 0)
@@ -208,6 +210,13 @@ class SystemInfo:
         self.tss_rsp0 = struct.unpack_from("<Q", data, 12)[0]
         raw_hash = data[20:20 + PANIC_GIT_HASH_LEN]
         self.git_hash = raw_hash.split(b'\x00')[0].decode('ascii', errors='replace')
+        # Branch field added in v2 — optional for backwards compatibility
+        branch_off = 20 + PANIC_GIT_HASH_LEN
+        if len(data) >= branch_off + PANIC_GIT_BRANCH_LEN:
+            raw_branch = data[branch_off:branch_off + PANIC_GIT_BRANCH_LEN]
+            self.git_branch = raw_branch.split(b'\x00')[0].decode('ascii', errors='replace')
+        else:
+            self.git_branch = ""
 
 
 class StackDump:
@@ -505,17 +514,23 @@ def print_report(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | Non
     print(f"  {C.RED}{C.BOLD}{'🔴 BROOK OS CRASH DUMP':^{W + 4}}{C.RESET}")
     version_str = 'Version: 0x%02X  Page: %d/%d' % (hdr.version, hdr.page + 1, hdr.page_count)
     if sys_info:
-        version_str += f"  Build: {sys_info.git_hash}"
+        build_id = sys_info.git_hash
+        if sys_info.git_branch:
+            build_id = f"{sys_info.git_branch}/{build_id}"
+        version_str += f"  Build: {build_id}"
     print(f"  {C.DIM}{version_str:^{W + 4}}{C.RESET}")
     print(f"  {C.RED}{C.BOLD}{bar}{C.RESET}\n")
 
     # System info
     if sys_info:
         print(f"  {C.CYAN}{C.BOLD}System Info:{C.RESET}")
+        git_str = sys_info.git_hash
+        if sys_info.git_branch:
+            git_str = f"{sys_info.git_branch}/{git_str}"
         print(f"  {C.YELLOW}CPU:{C.RESET} {C.WHITE}{sys_info.cpu_index}/{sys_info.cpu_count}{C.RESET}  "
               f"{C.YELLOW}TSC:{C.RESET} {C.WHITE}0x{sys_info.tsc_ticks:016X}{C.RESET}  "
               f"{C.YELLOW}TSS RSP0:{C.RESET} {C.WHITE}0x{sys_info.tss_rsp0:016X}{C.RESET}  "
-              f"{C.YELLOW}Git:{C.RESET} {C.WHITE}{sys_info.git_hash}{C.RESET}\n")
+              f"{C.YELLOW}Git:{C.RESET} {C.WHITE}{git_str}{C.RESET}\n")
 
     # Exception info
     if exc_info:
@@ -672,6 +687,7 @@ def build_json(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | None,
             "tsc_ticks": f"0x{sys_info.tsc_ticks:016X}",
             "tss_rsp0": f"0x{sys_info.tss_rsp0:016X}",
             "git_hash": sys_info.git_hash,
+            "git_branch": sys_info.git_branch,
         }
     if stack_dump and stack_dump.length > 0:
         out["stack_dump"] = {

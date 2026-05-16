@@ -9,11 +9,16 @@ namespace brook {
 #define BROOK_GIT_HASH "unknown"
 #endif
 
+#ifndef BROOK_GIT_BRANCH
+#define BROOK_GIT_BRANCH "unknown"
+#endif
+
 #ifndef BROOK_BUILD_DATE
 #define BROOK_BUILD_DATE "unknown"
 #endif
 
-inline const char* BuildGitHash()  { return BROOK_GIT_HASH; }
-inline const char* BuildDate()     { return BROOK_BUILD_DATE; }
+inline const char* BuildGitHash()   { return BROOK_GIT_HASH; }
+inline const char* BuildGitBranch() { return BROOK_GIT_BRANCH; }
+inline const char* BuildDate()      { return BROOK_BUILD_DATE; }
 
 } // namespace brook

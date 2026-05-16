@@ -161,6 +161,8 @@ void PanicScreenRender(uint32_t* fb, uint32_t fbW, uint32_t fbH,
         bx = DrawString(fb, stride, fbW, fbH, bx, 8, "Brook OS ", FG_GREY);
         bx = DrawString(fb, stride, fbW, fbH, bx, 8, BuildDate(), FG_GREY);
         bx = DrawString(fb, stride, fbW, fbH, bx, 8, " (", FG_GREY);
+        bx = DrawString(fb, stride, fbW, fbH, bx, 8, BuildGitBranch(), FG_GREY);
+        bx = DrawString(fb, stride, fbW, fbH, bx, 8, "/", FG_GREY);
         bx = DrawString(fb, stride, fbW, fbH, bx, 8, BuildGitHash(), FG_GREY);
         DrawString(fb, stride, fbW, fbH, bx, 8, ")", FG_GREY);
     }

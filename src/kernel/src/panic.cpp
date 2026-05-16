@@ -257,7 +257,8 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
     // NMI broadcast crashes (BRO-109), the panic reason is still captured.
     brook::SerialPuts("\n*** KERNEL PANIC ***\n");
     brook::SerialPuts("Brook OS "); brook::SerialPuts(brook::BuildDate());
-    brook::SerialPuts(" ("); brook::SerialPuts(brook::BuildGitHash());
+    brook::SerialPuts(" ("); brook::SerialPuts(brook::BuildGitBranch());
+    brook::SerialPuts("/"); brook::SerialPuts(brook::BuildGitHash());
     brook::SerialPuts(")\n");
     brook::SerialPuts(g_panicBuf);
     brook::SerialPuts("RIP "); SerialPutHex64(regs.rip);
@@ -366,6 +367,12 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
             for (uint32_t j = 0; j < brook::PANIC_GIT_HASH_LEN - 1 && hash[j]; j++)
                 sysInfo.gitHash[j] = hash[j];
             sysInfo.gitHash[brook::PANIC_GIT_HASH_LEN - 1] = '\0';
+
+            // Copy branch name
+            const char* branch = brook::BuildGitBranch();
+            for (uint32_t j = 0; j < brook::PANIC_GIT_BRANCH_LEN - 1 && branch[j]; j++)
+                sysInfo.gitBranch[j] = branch[j];
+            sysInfo.gitBranch[brook::PANIC_GIT_BRANCH_LEN - 1] = '\0';
         }
 
         // Capture raw stack bytes from RSP

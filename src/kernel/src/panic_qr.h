@@ -116,15 +116,17 @@ struct __attribute__((packed)) PanicProcessList {
 };
 
 // System-level metadata for crash diagnosis
-static constexpr uint32_t PANIC_GIT_HASH_LEN = 12;  // short git hash (null-terminated)
+static constexpr uint32_t PANIC_GIT_HASH_LEN   = 12;  // short git hash (null-terminated)
+static constexpr uint32_t PANIC_GIT_BRANCH_LEN = 24;  // branch name (null-terminated, truncated)
 
 struct __attribute__((packed)) PanicSystemInfo {
-    uint8_t  cpuIndex;                      // CPU that panicked
-    uint8_t  cpuCount;                      // total CPUs online
+    uint8_t  cpuIndex;                        // CPU that panicked
+    uint8_t  cpuCount;                        // total CPUs online
     uint16_t reserved;
-    uint64_t tscTicks;                      // RDTSC at panic time
-    uint64_t tssRsp0;                       // TSS RSP0 of faulting CPU
-    char     gitHash[PANIC_GIT_HASH_LEN];   // short commit hash
+    uint64_t tscTicks;                        // RDTSC at panic time
+    uint64_t tssRsp0;                         // TSS RSP0 of faulting CPU
+    char     gitHash[PANIC_GIT_HASH_LEN];     // short commit hash
+    char     gitBranch[PANIC_GIT_BRANCH_LEN]; // branch name at build time
 };
 
 // Raw stack dump from RSP at panic time

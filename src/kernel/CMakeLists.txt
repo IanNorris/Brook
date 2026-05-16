@@ -264,6 +264,17 @@ if(NOT BROOK_GIT_HASH)
     set(BROOK_GIT_HASH "unknown")
 endif()
 
+execute_process(
+    COMMAND git rev-parse --abbrev-ref HEAD
+    WORKING_DIRECTORY "${BROOK_ROOT}"
+    OUTPUT_VARIABLE BROOK_GIT_BRANCH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if(NOT BROOK_GIT_BRANCH)
+    set(BROOK_GIT_BRANCH "unknown")
+endif()
+
 string(TIMESTAMP BROOK_BUILD_DATE "%Y-%m-%d" UTC)
 # In Nix's hermetic build sandbox, SOURCE_DATE_EPOCH forces the above
 # to "1980-01-01" for reproducibility. Use the git commit date instead:
@@ -281,6 +292,7 @@ endif()
 
 target_compile_definitions(kernel PRIVATE
     BROOK_GIT_HASH="${BROOK_GIT_HASH}"
+    BROOK_GIT_BRANCH="${BROOK_GIT_BRANCH}"
     BROOK_BUILD_DATE="${BROOK_BUILD_DATE}"
     __BROOK_KERNEL__=1
 )
