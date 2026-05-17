@@ -2587,8 +2587,15 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
             self->wakeupTick = g_lapicTickCount + 100; // heartbeat every 100ms
             SpinLockRelease(&s.lock);
             SchedulerBlock(self);
-            // Woken by data (HandleTcp), heartbeat tick, or spurious —
-            // loop back to re-check under the lock.
+
+            // Allow signals (e.g. SIGALRM from curl's --max-time) to
+            // interrupt the recv.  Without this, curl can never enforce
+            // its own timeout while blocked in our kernel recv path.
+            {
+                uint64_t pending = self->sigPending & ~self->sigMask;
+                if (pending != 0)
+                    return -4; // EINTR
+            }
         }
     }
 
@@ -2712,11 +2719,31 @@ bool SockPollHangup(int sockIdx)
     Socket& s = g_sockets[sockIdx];
     if (s.type != SOCK_STREAM) return false;
 
+    extern volatile uint64_t g_lapicTickCount;
+
     SpinLockAcquire(&s.lock);
     bool hungUp = s.tcpFinRecv || s.tcpRstRecv ||
                   (s.tcpState != TcpState::Established &&
                    s.tcpState != TcpState::SynSent &&
                    s.tcpState != TcpState::Listen);
+
+    // Idle timeout: if we're Established, have received at least one data
+    // packet (tcpLastRxTick != 0), but no data has arrived in 60 seconds,
+    // the connection is effectively dead.  Report POLLHUP so poll()/select()
+    // callers (e.g. curl) notice instead of blocking indefinitely.
+    // This prevents the 24h stall seen in nix-install where a TCP connection
+    // silently stops delivering data and curl's --max-time can't fire because
+    // it relies on poll() returning.
+    static constexpr uint64_t TCP_IDLE_TIMEOUT_MS = 60000;
+    if (!hungUp && s.tcpState == TcpState::Established &&
+        s.tcpLastRxTick != 0 &&
+        g_lapicTickCount - s.tcpLastRxTick >= TCP_IDLE_TIMEOUT_MS)
+    {
+        SerialPrintf("tcp: sock=%d pid=%u idle %lums — reporting POLLHUP\n",
+                     sockIdx, s.ownerPid,
+                     g_lapicTickCount - s.tcpLastRxTick);
+        hungUp = true;
+    }
     SpinLockRelease(&s.lock);
     return hungUp;
 }

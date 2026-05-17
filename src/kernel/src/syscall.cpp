@@ -4713,8 +4713,13 @@ static int64_t sys_wait4(uint64_t pidArg, uint64_t statusAddr, uint64_t options,
                          parent->pid, targetPid, retries);
         }
 
+        // Block until SIGCHLD arrives from child exit (scheduler.cpp delivers
+        // SIGCHLD and calls SchedulerUnblock on the parent).  The 1-second
+        // heartbeat is a safety net in case the SIGCHLD delivery races with
+        // us entering the blocked state — it was previously 5ms which burned
+        // ~800 wakeups/sec per waiting process for the 24h nix-install stall.
         extern volatile uint64_t g_lapicTickCount;
-        parent->wakeupTick = g_lapicTickCount + 5;
+        parent->wakeupTick = g_lapicTickCount + 1000;
         SchedulerBlock(parent);
         if (HasPendingSignals())
         {
