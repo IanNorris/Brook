@@ -36,6 +36,10 @@ TcpAction TcpProcessSegment(Socket& s,
             s.tcpSndUna = ack;
             s.tcpState  = TcpState::Established;
             s.connected = true;
+            {
+                extern volatile uint64_t g_lapicTickCount;
+                s.tcpLastRxTick = g_lapicTickCount;
+            }
             // If data piggy-backed on the ACK, enqueue it
             if (dataLen > 0 && seq == s.tcpRcvNxt) {
                 act.enqueueData = true;
@@ -61,6 +65,11 @@ TcpAction TcpProcessSegment(Socket& s,
             act.sendAck = true;
             {
                 extern volatile uint64_t g_lapicTickCount;
+                // Seed the idle-timeout clock so SockPollHangup can detect
+                // connections that establish but never deliver data (e.g. TLS
+                // stall).  Without this, tcpLastRxTick stays 0 and the 60s
+                // idle timeout never fires.
+                s.tcpLastRxTick = g_lapicTickCount;
                 SerialPrintf("[NET_DIAG] tcp_established t=%lums lport=%u rport=%u nonblock=%d waiter=%s\n",
                              g_lapicTickCount, ntohs(s.localPort), ntohs(s.remotePort),
                              s.nonblock, s.pollWaiter ? "yes" : "no");
