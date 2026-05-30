@@ -915,6 +915,15 @@ void ProcessDestroy(Process* proc)
     // Threads share the page table with the leader — don't destroy it
     if (!proc->isKernelThread && !isThread)
     {
+        // Flush stale TLB entries for this address space on all remote CPUs
+        // before tearing down the page table and freeing the physical pages,
+        // so a CPU that still has this AS cached cannot read/write memory that
+        // is about to be freed (and possibly reallocated). Mirrors the exec
+        // teardown path (ProcessExec). The reaper runs on CPU0 and never has a
+        // terminated process's page table loaded, so unlike exec there is no
+        // local CR3 to switch away first.
+        TlbShootdownFull(proc->pageTable.pml4.raw(), proc->tlbCpuMask);
+
         // Clear lazy VMAs before page-table destruction. MemFd PTEs point at
         // memfd-owned pages, and file VMAs hold vnode references independent of
         // the fd table.
