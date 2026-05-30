@@ -483,6 +483,9 @@ function(add_driver_module mod_name)
     )
 
     add_custom_target("module_${mod_name}" ALL DEPENDS "${MOD_OBJ}")
+    # Track module targets so the symbol checker can depend on them (it needs
+    # the compiled .mod binaries to exist before it inspects them).
+    set_property(GLOBAL APPEND PROPERTY BROOK_MODULE_TARGETS "module_${mod_name}")
 endfunction()
 
 # Add driver module subdirectory (will be populated when drivers are extracted).
@@ -491,13 +494,20 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/drivers/CMakeLists.txt")
 endif()
 
 # ---------------------------------------------------------------------------
-# Build-time check: verify all MODULE_IMPORT_SYMBOL references resolve
+# Build-time check: every undefined symbol referenced by a compiled module
+# must resolve against the kernel's .ksymtab exports, or the module fails to
+# load at boot. This inspects the .mod binaries directly (see the script for
+# why a source-level scan is insufficient — cf. BRO-154).
 # ---------------------------------------------------------------------------
+get_property(BROOK_MODULE_TARGETS GLOBAL PROPERTY BROOK_MODULE_TARGETS)
 add_custom_target(check_module_symbols ALL
-    COMMAND bash "${BROOK_ROOT}/scripts/check-module-symbols.sh"
+    COMMAND bash "${BROOK_ROOT}/scripts/check-module-symbols.sh" "${DRIVER_OUTPUT_DIR}"
     WORKING_DIRECTORY "${BROOK_ROOT}"
     COMMENT "Checking module import/export symbol consistency"
     VERBATIM
 )
+if(BROOK_MODULE_TARGETS)
+    add_dependencies(check_module_symbols ${BROOK_MODULE_TARGETS})
+endif()
 
 
