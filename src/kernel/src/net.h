@@ -252,6 +252,13 @@ bool NetApplyStaticConfig(NetIf* nif);
 // Start the net_poll background thread. Must be called AFTER SchedulerInit().
 void NetStartPollThread();
 
+// Wake the net_poll thread so it drains the RX ring promptly.
+// Safe to call from ISR context (delegates to SchedulerUnblock, which is
+// ISR-safe). Used by NIC drivers in their RX interrupt handler instead of
+// processing packets inline in IRQ context — keeping all packet processing
+// (and the socket/ARP SpinLocks it takes) in process context.
+void NetWakePollThread();
+
 // ---------------------------------------------------------------------------
 // Socket layer (kernel-side)
 // ---------------------------------------------------------------------------

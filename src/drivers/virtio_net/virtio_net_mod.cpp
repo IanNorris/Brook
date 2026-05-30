@@ -384,10 +384,12 @@ static int VirtioNetTransmit(NetIf* nif, const void* frame, uint32_t len)
 // briefly. The actual packet processing (NetReceive) runs lock-free.
 // ---------------------------------------------------------------------------
 
-// Must be IrqSpinLock, not SpinLock: ProcessRxPackets is called from both
-// the poll path (process context) and VirtioNetIrqBody (IRQ context).
-// A plain SpinLock doesn't disable IRQs, so an IRQ on the same CPU while
-// the lock is held re-enters ProcessRxPackets and deadlocks on the ticket.
+// Kept as IrqSpinLock defensively. As of the BRO-154 fix, ProcessRxPackets is
+// only called from the poll path (process context, via VirtioNetPoll) — the
+// IRQ handler now only wakes the net_poll thread rather than processing inline.
+// IrqSpinLock is retained because its critical section is tiny and it guards
+// against any future re-introduction of an IRQ-context caller; a plain SpinLock
+// would deadlock if the same CPU ever re-entered ProcessRxPackets from an ISR.
 static IrqSpinLock g_rxLock;
 
 static void ProcessRxPackets()
@@ -442,7 +444,12 @@ static void VirtioNetIrqBody()
 {
     (void)mmio_read8(g_isrCfg, 0); // acknowledge ISR
 
-    ProcessRxPackets();
+    // Do NOT process packets inline in IRQ context. NetReceive → HandleTcp /
+    // ARP take plain (non-IRQ) SpinLocks; processing them here would allow a
+    // same-CPU RX IRQ to re-enter and deadlock on a held socket/ARP lock.
+    // Instead wake the net_poll thread, which drains the ring in process
+    // context where those SpinLocks are safe.
+    NetWakePollThread();
 }
 
 // ---------------------------------------------------------------------------
