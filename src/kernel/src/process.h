@@ -4,14 +4,15 @@
 #include "memory/address.h"
 #include "input.h"
 #include "spinlock.h"
+#include "fd_table.h"
 
 namespace brook {
 
 struct Vnode;
 struct KRwLock;
 
-// Maximum number of open file descriptors per process.
-static constexpr uint32_t MAX_FDS = 256;
+// MAX_FDS, FdType and FdEntry are defined in fd_table.h (extracted for
+// host-side unit testing — see BRO-156).
 
 // Maximum concurrent processes.
 static constexpr uint32_t MAX_PROCESSES = 1024;
@@ -182,44 +183,12 @@ struct alignas(64) FxsaveArea
 // ---------------------------------------------------------------------------
 // File descriptor entry
 // ---------------------------------------------------------------------------
-
-enum class FdType : uint8_t
-{
-    None = 0,
-    Vnode,         // Regular VFS file
-    DevFramebuf,   // /dev/fb0
-    DevKeyboard,   // /dev/keyboard
-    Pipe,          // pipe() read/write end
-    DevNull,       // /dev/null — discard writes, EOF on read
-    DevUrandom,    // /dev/urandom — RDRAND-backed random bytes
-    SyntheticMem,  // In-memory synthetic file (e.g. /etc/passwd)
-    Socket,        // Network socket (UDP/TCP)
-    DevTty,        // /dev/tty — bidirectional terminal (read=stdin pipe, write=stdout pipe)
-    EventFd,       // eventfd — uint64 counter for event notification
-    DevDsp,        // /dev/dsp — OSS audio output
-    EpollFd,       // epoll instance
-    TimerFd,       // timerfd — timer-based event notification
-    MemFd,         // memfd_create — anonymous in-memory file
-    UnixSocket,    // AF_UNIX domain socket
-    DevKlog,       // /dev/klog — kernel log ring buffer reader
-};
+// FdType and FdEntry are defined in fd_table.h (extracted for host-side unit
+// testing — see BRO-156).
 
 struct TtyDevicePair {
     void* readPipe;   // PipeBuffer* for stdin
     void* writePipe;  // PipeBuffer* for stdout
-};
-
-struct FdEntry
-{
-    FdType   type;
-    uint8_t  flags;        // O_NONBLOCK, pipe direction, etc.
-    uint8_t  fdFlags;      // FD-level flags: FD_CLOEXEC (bit 0)
-    uint8_t  _pad;
-    uint32_t refCount;
-    uint32_t statusFlags;  // Linux O_* flags from open (for F_GETFL/F_SETFL)
-    void*    handle;       // VFS Vnode* or device-specific state
-    uint64_t seekPos;      // Current file offset (for lseek)
-    char     dirPath[64];  // For directory fds: path prefix for openat resolution
 };
 
 // ---------------------------------------------------------------------------
@@ -589,6 +558,11 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
 int       FdAlloc(Process* proc, FdType type, void* handle);
 void      FdFree(Process* proc, int fd);
 FdEntry*  FdGet(Process* proc, int fd);
+
+// Atomically read-and-clear an fd slot, returning its prior owning state in
+// *out. Returns true for exactly one caller across threads racing to close
+// the same fd, so the handle is unref'd/freed once (BRO-156).
+bool      FdClaim(Process* proc, int fd, FdClaimResult* out);
 
 // Close all file descriptors for a process (called at exit time).
 // Properly handles pipe refcounting and wakes blocked readers/writers.

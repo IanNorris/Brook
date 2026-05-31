@@ -97,57 +97,31 @@ static FdEntry* AllocFdTable()
 int FdAlloc(Process* proc, FdType type, void* handle)
 {
     if (!proc || !proc->fds) return -24; // EMFILE
-    SpinLockAcquire(&proc->fdLock);
-    // fd 0-2 are reserved (stdin/stdout/stderr), start searching from 3
-    for (uint32_t i = 0; i < MAX_FDS; ++i)
+    int fd = FdTableAlloc(proc->fds, &proc->fdLock, type, handle);
+    if (fd < 0)
     {
-        if (proc->fds[i].type == FdType::None)
-        {
-            proc->fds[i].type     = type;
-            proc->fds[i].flags    = 0;
-            proc->fds[i].fdFlags  = 0;
-            proc->fds[i].refCount = 1;
-            proc->fds[i].statusFlags = 0;
-            proc->fds[i].handle   = handle;
-            proc->fds[i].seekPos  = 0;
-            proc->fds[i].dirPath[0] = '\0';
-            SpinLockRelease(&proc->fdLock);
-            return static_cast<int>(i);
-        }
+        SerialPrintf("FD: pid %u exhausted %u fds\n", proc->pid, MAX_FDS);
+        return -24; // EMFILE
     }
-    SpinLockRelease(&proc->fdLock);
-    SerialPrintf("FD: pid %u exhausted %u fds\n", proc->pid, MAX_FDS);
-    return -24; // EMFILE
+    return fd;
 }
 
 void FdFree(Process* proc, int fd)
 {
     if (!proc || !proc->fds) return;
-    if (fd < 0 || fd >= static_cast<int>(MAX_FDS)) return;
-    SpinLockAcquire(&proc->fdLock);
-    proc->fds[fd].type     = FdType::None;
-    proc->fds[fd].flags    = 0;
-    proc->fds[fd].fdFlags  = 0;
-    proc->fds[fd].statusFlags = 0;
-    proc->fds[fd].handle   = nullptr;
-    proc->fds[fd].refCount = 0;
-    proc->fds[fd].seekPos  = 0;
-    proc->fds[fd].dirPath[0] = '\0';
-    SpinLockRelease(&proc->fdLock);
+    FdTableFree(proc->fds, &proc->fdLock, fd);
 }
 
 FdEntry* FdGet(Process* proc, int fd)
 {
     if (!proc || !proc->fds) return nullptr;
-    if (fd < 0 || fd >= static_cast<int>(MAX_FDS)) return nullptr;
-    SpinLockAcquire(&proc->fdLock);
-    if (proc->fds[fd].type == FdType::None)
-    {
-        SpinLockRelease(&proc->fdLock);
-        return nullptr;
-    }
-    SpinLockRelease(&proc->fdLock);
-    return &proc->fds[fd];
+    return FdTableGet(proc->fds, &proc->fdLock, fd);
+}
+
+bool FdClaim(Process* proc, int fd, FdClaimResult* out)
+{
+    if (!proc || !proc->fds) return false;
+    return FdTableClaim(proc->fds, &proc->fdLock, fd, out);
 }
 
 // ---------------------------------------------------------------------------

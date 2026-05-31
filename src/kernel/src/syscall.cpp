@@ -2929,23 +2929,28 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
 int64_t CloseProcessFd(Process* proc, int fd)
 {
     if (!proc) return -EBADF;
-    FdEntry* fde = FdGet(proc, fd);
-    if (!fde) return -EBADF;
+    // Atomically claim the slot: this both reads the owning state and clears
+    // the slot under fdLock, so a sibling thread racing to close() the same
+    // fd cannot also reach the unref below (it sees the slot already None and
+    // returns -EBADF). This prevents the double-unref/double-free that the
+    // old FdGet()+...+FdFree() split allowed (BRO-156).
+    FdClaimResult c;
+    if (!FdClaim(proc, fd, &c)) return -EBADF;
 
-    if (fde->type == FdType::Vnode && fde->handle)
+    if (c.type == FdType::Vnode && c.handle)
     {
-        auto* vn = static_cast<Vnode*>(fde->handle);
+        auto* vn = static_cast<Vnode*>(c.handle);
         uint32_t prev = __atomic_fetch_sub(&vn->refCount, 1, __ATOMIC_ACQ_REL);
         if (prev <= 1)
             VfsClose(vn);
         // else: other processes still reference this vnode
     }
 
-    if (fde->type == FdType::Pipe && fde->handle)
+    if (c.type == FdType::Pipe && c.handle)
     {
-        auto* pipe = static_cast<PipeBuffer*>(fde->handle);
+        auto* pipe = static_cast<PipeBuffer*>(c.handle);
         // flags bit 0: 1=write end, 0=read end
-        if (fde->flags & 1)
+        if (c.flags & 1)
         {
             __atomic_fetch_sub(&pipe->writers, 1, __ATOMIC_RELEASE);
             // Wake blocked reader so it sees EOF
@@ -2978,36 +2983,36 @@ int64_t CloseProcessFd(Process* proc, int fd)
         }
     }
 
-    if (fde->type == FdType::Socket && fde->handle)
+    if (c.type == FdType::Socket && c.handle)
     {
-        int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+        int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(c.handle)) - 1;
         extern volatile uint64_t g_lapicTickCount;
         brook::SockUnref(sockIdx);
     }
 
-    if (fde->type == FdType::EventFd && fde->handle)
-        EventFdUnref(static_cast<EventFdData*>(fde->handle));
+    if (c.type == FdType::EventFd && c.handle)
+        EventFdUnref(static_cast<EventFdData*>(c.handle));
 
-    if (fde->type == FdType::EpollFd && fde->handle)
-        EpollFdUnref(static_cast<EpollInstance*>(fde->handle));
+    if (c.type == FdType::EpollFd && c.handle)
+        EpollFdUnref(static_cast<EpollInstance*>(c.handle));
 
-    if (fde->type == FdType::TimerFd && fde->handle)
-        TimerFdUnref(static_cast<TimerFdData*>(fde->handle));
+    if (c.type == FdType::TimerFd && c.handle)
+        TimerFdUnref(static_cast<TimerFdData*>(c.handle));
 
-    if (fde->type == FdType::MemFd && fde->handle)
+    if (c.type == FdType::MemFd && c.handle)
     {
-        auto* mfd = static_cast<MemFdData*>(fde->handle);
+        auto* mfd = static_cast<MemFdData*>(c.handle);
         MemFdUnref(mfd);
     }
 
-    if (fde->type == FdType::UnixSocket && fde->handle)
+    if (c.type == FdType::UnixSocket && c.handle)
     {
-        UnixSocketHandleUnref(fde->handle);
+        UnixSocketHandleUnref(c.handle);
     }
 
-    if (fde->type == FdType::DevDsp && fde->handle)
+    if (c.type == FdType::DevDsp && c.handle)
     {
-        auto* dsp = static_cast<DspState*>(fde->handle);
+        auto* dsp = static_cast<DspState*>(c.handle);
         uint32_t prev = __atomic_fetch_sub(&dsp->refCount, 1, __ATOMIC_ACQ_REL);
         if (prev <= 1)
         {
@@ -3017,19 +3022,19 @@ int64_t CloseProcessFd(Process* proc, int fd)
         }
     }
 
-    if (fde->type == FdType::DevKlog && fde->handle)
+    if (c.type == FdType::DevKlog && c.handle)
     {
         // DevKlog handle is a bare uint64_t* cursor — no refcount, just free.
         // Fork deep-copies it, so each process owns its own cursor.
-        kfree(fde->handle);
+        kfree(c.handle);
     }
 
-    if (fde->type == FdType::DevTty && fde->handle)
+    if (c.type == FdType::DevTty && c.handle)
     {
         // DevTty wraps a TtyDevicePair that references stdin/stdout pipes.
         // Opening /dev/tty incremented reader/writer counts on those pipes,
         // so closing must decrement them and free the pair struct.
-        auto* pair = static_cast<TtyDevicePair*>(fde->handle);
+        auto* pair = static_cast<TtyDevicePair*>(c.handle);
         if (pair->readPipe)
         {
             auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
@@ -3051,7 +3056,6 @@ int64_t CloseProcessFd(Process* proc, int fd)
         kfree(pair);
     }
 
-    FdFree(proc, fd);
     return 0;
 }
 
