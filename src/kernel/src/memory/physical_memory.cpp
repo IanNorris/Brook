@@ -55,10 +55,18 @@ static inline PageDescriptor& Desc(uint32_t idx) { return g_pageDescs[idx]; }
 
 // Remove a page from whatever PID list it currently belongs to.
 // Does NOT reset the descriptor's tag/pid — caller must do that.
+// Idempotent: a no-op if the page is not currently on its PID's list, so it
+// is safe to call repeatedly (e.g. when a shared page is unref'd by several
+// owners during teardown — see PmmUnrefPage/PmmKillPid, BRO-161).
 static void ListRemove(uint32_t idx)
 {
     PageDescriptor& d = Desc(idx);
     uint16_t pid = d.pid;
+
+    // Not linked: no prev/next and not the list head -> already removed.
+    if (d.prev == PMM_NULL_PAGE && d.next == PMM_NULL_PAGE &&
+        g_pidLists[pid].head != idx)
+        return;
 
     if (d.prev != PMM_NULL_PAGE)
         Desc(d.prev).next = d.next;
@@ -311,10 +319,16 @@ void PmmFreePage(PhysicalAddress physAddr)
 
     if (!IsUsed(idx)) { IrqSpinLockRelease(&g_pmmLock, pmmFlags); return; }
 
-    // If refcounted and shared, just decrement — don't free yet
+    // If refcounted and shared, just decrement — don't free yet. Also drop the
+    // page from this owner's PID list: once a page is shared, the page-table
+    // walk (FreeTableLevel) is the single freeing authority and decrements once
+    // per mapper at each process's exit. Leaving the page on the original
+    // owner's list would let PmmKillPid later free it out from under a live
+    // co-owner (BRO-161). ListRemove is idempotent, so repeated unrefs are safe.
     if (g_pageDescs && Desc(static_cast<uint32_t>(idx)).refCount > 1)
     {
         Desc(static_cast<uint32_t>(idx)).refCount--;
+        ListRemove(static_cast<uint32_t>(idx));
         IrqSpinLockRelease(&g_pmmLock, pmmFlags);
         return;
     }
@@ -383,6 +397,11 @@ void PmmUnrefPage(PhysicalAddress physAddr)
     if (d.refCount > 1)
     {
         d.refCount--;
+        // Drop the page from its owner's PID list — see PmmFreePage and BRO-161.
+        // Once shared, freeing is driven solely by the page-table walk (one
+        // unref per mapper); leaving it listed lets PmmKillPid free it under a
+        // live co-owner. ListRemove is idempotent.
+        ListRemove(idx);
         IrqSpinLockRelease(&g_pmmLock, pmmFlags);
         return; // still shared, don't free
     }
