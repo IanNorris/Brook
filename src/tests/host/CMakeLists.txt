@@ -57,6 +57,10 @@ target_compile_options(test_tcp PRIVATE
 add_host_test(test_kmutex)
 add_host_test(test_krwlock)
 add_host_test(test_ksemaphore)
+add_host_test(test_futex_pool)
+target_compile_options(test_futex_pool PRIVATE
+    "-iquote${BROOK_ROOT}/src/kernel/src"
+)
 add_host_test(test_sched_policy
     "${BROOK_ROOT}/src/kernel/src/sched_policy.cpp"
 )

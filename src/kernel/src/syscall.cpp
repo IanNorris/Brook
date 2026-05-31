@@ -10,6 +10,7 @@
 #include "process.h"
 #include "scheduler.h"
 #include "spinlock.h"
+#include "sync/futex_waiter_pool.h"
 #include "string.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
@@ -10824,40 +10825,30 @@ static constexpr int FUTEX_CLOCK_REALTIME  = 256;
 // Since threads share address space (same page tables), the VA is sufficient.
 static constexpr uint32_t FUTEX_HASH_SIZE = 64;
 
-struct FutexWaiter {
-    uint64_t uaddr;     // User virtual address being waited on
-    uint64_t owner;     // 0 for shared futexes; tgid for FUTEX_PRIVATE_FLAG
-    Process* proc;      // Blocked process
-    uint32_t bitset;    // Bitset this waiter accepts (FUTEX_BITSET_MATCH_ANY for plain WAIT)
-    FutexWaiter* next;  // Next in hash bucket chain
-};
+// FutexWaiter and the slot pool live in sync/futex_waiter_pool.h so the pool's
+// atomic alloc/free can be unit-tested against the real code (BRO-160).
 
 static constexpr uint32_t FUTEX_BITSET_MATCH_ANY = 0xFFFFFFFFu;
 
 static FutexWaiter* g_futexBuckets[FUTEX_HASH_SIZE];
 static volatile uint64_t g_futexLock = 0;  // Spinlock for the hash table
 
-// Pool of waiter nodes (avoid kmalloc from IRQ context)
-static constexpr uint32_t FUTEX_MAX_WAITERS = 128;
-static FutexWaiter g_futexWaiterPool[FUTEX_MAX_WAITERS];
-static bool        g_futexWaiterUsed[FUTEX_MAX_WAITERS];
+// Pool of waiter nodes (avoid kmalloc from IRQ context). Sized to MAX_PROCESSES:
+// a thread blocked in a futex wait cannot start another, so one slot per thread
+// is the true upper bound and the pool can never be legitimately exhausted
+// (BRO-160 — the old 128 cap returned -ENOMEM under heavy threading). Slot
+// claim/release is atomic, so it is safe across FutexWake's lock drop window.
+static constexpr uint32_t FUTEX_MAX_WAITERS = MAX_PROCESSES;
+static FutexWaiterPool<FUTEX_MAX_WAITERS> g_futexWaiterPool;
 
 static FutexWaiter* FutexAllocWaiter()
 {
-    for (uint32_t i = 0; i < FUTEX_MAX_WAITERS; ++i) {
-        if (!g_futexWaiterUsed[i]) {
-            g_futexWaiterUsed[i] = true;
-            return &g_futexWaiterPool[i];
-        }
-    }
-    return nullptr;
+    return g_futexWaiterPool.Alloc();
 }
 
 static void FutexFreeWaiter(FutexWaiter* w)
 {
-    uint32_t idx = static_cast<uint32_t>(w - g_futexWaiterPool);
-    if (idx < FUTEX_MAX_WAITERS)
-        g_futexWaiterUsed[idx] = false;
+    g_futexWaiterPool.Free(w);
 }
 
 static uint32_t FutexHash(uint64_t owner, uint64_t addr)
