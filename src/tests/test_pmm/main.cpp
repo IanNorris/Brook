@@ -120,4 +120,76 @@ TEST_MAIN("pmm", {
                         (uint32_t)brook::PmmGetFreePageCount(),
                         (uint32_t)brook::PmmGetTotalPageCount(),
                         enumCount);
+
+    // -----------------------------------------------------------------------
+    // BRO-161 regression: a COW-shared page must NOT be freed when its
+    // original owner exits while another process still references it.
+    //
+    // Ownership == membership in the owner's PID list (set at PmmAllocPage and
+    // never transferred on share). On exit, the leader is torn down by TWO
+    // paths: the page-table walk (FreeTableLevel -> PmmUnrefPage per mapped
+    // PTE) and the PID-list sweep (PmmKillPid). For a shared page on the
+    // owner's list, the unref drops refcount 2->1; PmmKillPid must then NOT
+    // mistake the survivor for an exclusive page and free it out from under
+    // the live co-owner.
+    // -----------------------------------------------------------------------
+    constexpr uint16_t PID_OWNER  = 10;  // original allocator (e.g. parent)
+    constexpr uint16_t PID_SHARER = 11;  // COW co-owner (e.g. forked child)
+
+    // Variant 1: owner exits while the page is still shared & still mapped.
+    {
+        PhysicalAddress shared = brook::PmmAllocPage(brook::MemTag::User, PID_OWNER);
+        ASSERT_TRUE(shared.raw() != 0);
+        brook::PmmRefPage(shared);                 // fork: child shares the page
+        ASSERT_EQ(brook::PmmGetRefCount(shared), (uint8_t)2);
+
+        // Owner teardown: page-table walk unrefs the owner's mapping...
+        brook::PmmUnrefPage(shared);               // 2 -> 1
+        ASSERT_EQ(brook::PmmGetRefCount(shared), (uint8_t)1);
+        // ...then the PID-list sweep runs. It must skip the still-shared page.
+        brook::PmmKillPid(PID_OWNER);
+
+        // The sharer still references the page — it MUST remain allocated.
+        ASSERT_NE(brook::PmmGetTag(shared), brook::MemTag::Free);
+        ASSERT_EQ(brook::PmmGetRefCount(shared), (uint8_t)1);
+
+        // Sharer exits last (page-table walk) — now it is genuinely freed.
+        brook::PmmUnrefPage(shared);               // 1 -> 0, freed
+        ASSERT_EQ(brook::PmmGetTag(shared), brook::MemTag::Free);
+        brook::PmmKillPid(PID_SHARER);             // sharer list empty: no-op
+    }
+
+    // Variant 2: owner resolves its COW copy (stops mapping the shared page),
+    // then exits. The shared page is still on the owner's PID list but no
+    // longer in the owner's page table, so only PmmKillPid would reach it —
+    // and it must not free it while the sharer is alive.
+    {
+        PhysicalAddress shared = brook::PmmAllocPage(brook::MemTag::User, PID_OWNER);
+        ASSERT_TRUE(shared.raw() != 0);
+        brook::PmmRefPage(shared);                 // shared owner+sharer
+        ASSERT_EQ(brook::PmmGetRefCount(shared), (uint8_t)2);
+
+        // Owner writes -> COW resolve: copies to a private page and drops its
+        // reference on the shared one (without a page-table mapping remaining).
+        PhysicalAddress copy = brook::PmmAllocPage(brook::MemTag::User, PID_OWNER);
+        ASSERT_TRUE(copy.raw() != 0);
+        brook::PmmUnrefPage(shared);               // 2 -> 1 (owner no longer maps it)
+        ASSERT_EQ(brook::PmmGetRefCount(shared), (uint8_t)1);
+
+        // Owner exits: page-table walk frees the private copy; PID-list sweep
+        // must not free `shared`.
+        brook::PmmUnrefPage(copy);                 // owner's private page: 1 -> 0
+        ASSERT_EQ(brook::PmmGetTag(copy), brook::MemTag::Free);
+        brook::PmmKillPid(PID_OWNER);
+
+        ASSERT_NE(brook::PmmGetTag(shared), brook::MemTag::Free);
+        ASSERT_EQ(brook::PmmGetRefCount(shared), (uint8_t)1);
+
+        // Sharer exits: shared page finally freed.
+        brook::PmmUnrefPage(shared);
+        ASSERT_EQ(brook::PmmGetTag(shared), brook::MemTag::Free);
+        brook::PmmKillPid(PID_SHARER);
+    }
+
+    brook::SerialPrintf("PMM BRO-161 COW-owner-exit: shared pages survived owner teardown\n");
 })
