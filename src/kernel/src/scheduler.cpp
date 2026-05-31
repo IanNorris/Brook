@@ -1717,38 +1717,50 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus)
     }
     SchedLockRelease(g_allProcLock, alf);
 
+    // Phase 1: mark every sibling Terminated so the remote timer tick will
+    // deschedule it.  We deliberately DO NOT touch each thread's kernel-lock
+    // state here: the thread may still be running on another CPU and could be
+    // mid-KRwLock{Read,Write}Lock, racing KRwLockCleanupOnExit's lock-free
+    // reads of heldWriteLock/blockedOnRwLock (BRO-157).  Cleanup is deferred to
+    // phase 2, after each thread is confirmed quiesced.
+    //
+    // Publish order matters: set exitStatus first, then store state with
+    // release semantics so a remote CPU that observes Terminated also observes
+    // the matching exitStatus.  state is a single aligned byte (atomic on x86);
+    // the release store adds the compiler/memory barrier the plain store lacked.
     for (uint32_t i = 0; i < count; ++i)
     {
         Process* p = targets[i];
-        // Release any kernel rwlocks held by (or waited on by) this thread.
-        KRwLockCleanupOnExit(p);
-        p->state     = ProcessState::Terminated;
         p->exitStatus = exitStatus;
-        // Threads that are not yet reapable will be reaped by the scheduler
-        // once they stop running.  Set reapable only if they are not
-        // currently executing on a CPU.
-        if (__atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) < 0)
-            __atomic_store_n(&p->reapable, true, __ATOMIC_RELEASE);
+        __atomic_store_n(reinterpret_cast<uint8_t*>(&p->state),
+                         static_cast<uint8_t>(ProcessState::Terminated),
+                         __ATOMIC_RELEASE);
         SerialPrintf("SCHED: exit_group killing thread pid=%u tgid=%u\n",
                      p->pid, p->tgid);
     }
 
-    // Wait for all sibling threads to stop executing on their CPUs.
-    // Without this, the caller (leader) may proceed to ProcessDestroy
-    // and free the shared page table / fileMaps while sibling threads
-    // are still running and may fault on those shared resources.
+    // Phase 2: wait for each sibling to stop executing, THEN clean up its
+    // kernel-lock state and mark it reapable.
     //
-    // The timer tick handler checks for Terminated state and will
-    // deschedule the thread even from kernel mode. We use a lightweight
-    // pause loop with sti to let timer interrupts fire on our CPU
-    // (so the scheduler can deschedule targets on other CPUs).
-    // Avoid SchedulerYield() here — it hammers g_readyLock and can
-    // cause massive contention leading to a spinlock pile-up.
+    // The quiesce wait is required so the caller (leader) doesn't proceed to
+    // ProcessDestroy and free the shared page table / fileMaps while a sibling
+    // is still running on those shared resources.  Performing the rwlock
+    // cleanup only after runningOnCpu < 0 also closes the BRO-157 race: the
+    // thread is now parked at a stable point, so its heldWriteLock /
+    // blockedOnRwLock fields are no longer being mutated concurrently and
+    // KRwLockCleanupOnExit can read them safely.
+    //
+    // The timer tick handler checks for Terminated state and will deschedule
+    // the thread even from kernel mode.  We use a lightweight pause loop with
+    // sti to let timer interrupts fire on our CPU (so the scheduler can
+    // deschedule targets on other CPUs).  Avoid SchedulerYield() here — it
+    // hammers g_readyLock and can cause massive contention.
     for (uint32_t i = 0; i < count; ++i)
     {
         Process* p = targets[i];
         uint32_t attempts = 0;
         constexpr uint32_t MAX_ATTEMPTS = 10000000; // ~10s
+        bool quiesced = true;
         while (__atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) >= 0)
         {
             // Ensure interrupts are enabled so timer ticks can fire
@@ -1761,9 +1773,18 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus)
                 SerialPrintf("SCHED: exit_group timeout waiting for pid=%u "
                              "(stuck on cpu=%d), forcing reapable\n",
                              p->pid, cpu);
+                quiesced = false;
                 break;
             }
         }
+
+        // Now that the thread is parked (or we gave up after the timeout),
+        // release any kernel rwlocks it held or was waiting on.  On the forced
+        // timeout path the thread is presumably wedged and won't make further
+        // progress, so cleaning up is still the least-bad option.
+        (void)quiesced;
+        KRwLockCleanupOnExit(p);
+
         __atomic_store_n(&p->reapable, true, __ATOMIC_RELEASE);
     }
 }
