@@ -593,6 +593,81 @@ uint16_t VmmGetPagePid(PageTable pt, VirtualAddress virtAddr)
     return static_cast<uint16_t>((*pte & PTE_PID_MASK) >> PTE_PID_SHIFT);
 }
 
+VmmCowResult VmmCowResolveWrite(PageTable pt, VirtualAddress faultAddr, uint16_t pid)
+{
+    VirtualAddress pageAddr(faultAddr.raw() & ~(PAGE_SIZE - 1));
+
+    // Hold g_userPtLock across the whole refcount-check + PTE update so this is
+    // atomic against concurrent COW faults on the same page, against fork's
+    // COW-share (VmmForkCommitCowShare), and against munmap/mprotect — all of
+    // which take this lock. Under it, the only refcount INCREASE (fork) cannot
+    // run, so a plain PmmGetRefCount read is a sound basis for the copy vs.
+    // in-place decision; a concurrent DECREASE (process exit) only ever makes
+    // in-place safer. The TLB shootdown is intentionally deferred to the caller
+    // (see header): it busy-waits for remote IPI ACKs and we hold this lock
+    // with interrupts disabled.
+    uint64_t ptFlags = IrqSpinLockAcquire(&g_userPtLock);
+
+    uint64_t* pte = WalkToPtr(pt, pageAddr, /*create=*/false);
+    if (!pte || !(*pte & VMM_PRESENT) || !(*pte & PTE_COW_BIT))
+    {
+        IrqSpinLockRelease(&g_userPtLock, ptFlags);
+        return VmmCowResult::NotCow;
+    }
+
+    PhysicalAddress oldPhys(*pte & PHYS_MASK);
+
+    if (PmmGetRefCount(oldPhys) > 1)
+    {
+        // Shared page: copy to a fresh page and drop our ref on the shared one.
+        PhysicalAddress newPhys = PmmAllocPage(MemTag::User, pid);
+        if (!newPhys)
+        {
+            IrqSpinLockRelease(&g_userPtLock, ptFlags);
+            return VmmCowResult::OutOfMemory;
+        }
+
+        auto* src = reinterpret_cast<const uint64_t*>(PhysToVirt(oldPhys).raw());
+        auto* dst = reinterpret_cast<uint64_t*>(PhysToVirt(newPhys).raw());
+        for (uint64_t b = 0; b < PAGE_SIZE / sizeof(uint64_t); b++)
+            dst[b] = src[b];
+
+        uint64_t newPte = (newPhys.raw() & PHYS_MASK)
+                        | ((*pte) & ~(PHYS_MASK | PTE_COW_BIT))
+                        | VMM_WRITABLE;
+        newPte = (newPte & ~PTE_PID_MASK)
+               | (((uint64_t)pid & 0x3FF) << PTE_PID_SHIFT);
+        *pte = newPte;
+
+        // Safe to drop our ref AFTER repointing the PTE and copying: we still
+        // held a reference throughout the copy, so the source could not be
+        // freed underneath us even if another owner unref'd concurrently.
+        PmmUnrefPage(oldPhys);
+    }
+    else
+    {
+        // Sole owner: just make the existing page writable and clear COW.
+        *pte = ((*pte) & ~PTE_COW_BIT) | VMM_WRITABLE;
+    }
+
+    IrqSpinLockRelease(&g_userPtLock, ptFlags);
+    return VmmCowResult::Resolved;
+}
+
+void VmmForkCommitCowShare(uint64_t* parentLeaf, uint64_t* childLeaf,
+                           uint64_t childPte, PhysicalAddress srcPhys)
+{
+    uint64_t ptFlags = IrqSpinLockAcquire(&g_userPtLock);
+    // Downgrade parent to read-only+COW, install child's read-only+COW PTE, and
+    // bump the shared refcount as one atomic step vs. the COW write-fault
+    // handler, closing the window where the handler could see refcount==1 and
+    // upgrade in place while fork is mid-share.
+    *parentLeaf = (*parentLeaf & ~VMM_WRITABLE) | PTE_COW_BIT;
+    *childLeaf  = childPte;
+    PmmRefPage(srcPhys);
+    IrqSpinLockRelease(&g_userPtLock, ptFlags);
+}
+
 void VmmKillPid(uint16_t pid)
 {
     if (pid == KernelPid) return;

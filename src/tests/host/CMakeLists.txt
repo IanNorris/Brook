@@ -13,6 +13,23 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Threads REQUIRED)
 
+# ---------------------------------------------------------------------------
+# ThreadSanitizer layer (opt-in via -DBROOK_SANITIZE_THREAD=ON).
+# Several of these tests drive the kernel lock primitives (kmutex/krwlock/
+# ksemaphore) and lock-free paths under real pthreads, so TSan can flag data
+# races and lock-order inversions that the assertions alone won't. TSan
+# understands C++11 std::atomic (unlike valgrind/helgrind, which false-positives
+# on it), making it the correct race detector for this codebase.
+#
+# Use scripts/run-tsan-tests.sh to build+run this variant. NOTE: TSan must
+# disable ASLR via the personality() syscall at startup; environments that
+# block that syscall (some sandboxes/containers) cannot run TSan binaries.
+option(BROOK_SANITIZE_THREAD "Build host tests with ThreadSanitizer" OFF)
+if(BROOK_SANITIZE_THREAD)
+    add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g -O1)
+    add_link_options(-fsanitize=thread)
+endif()
+
 function(add_host_test TEST_NAME)
     add_executable(${TEST_NAME}
         "${BROOK_ROOT}/src/tests/${TEST_NAME}/main.cpp"

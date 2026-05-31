@@ -49,6 +49,11 @@ static uint32_t g_netIfCount = 0;
 // g_netIfs[0] (the primary / default-route interface).
 static NetIf* g_netIf = nullptr;
 
+// The background RX poll thread (see NetStartPollThread). NIC drivers wake it
+// from their IRQ handler via NetWakePollThread() so packet processing stays in
+// process context rather than running inline in the ISR.
+static Process* g_netPollThread = nullptr;
+
 // ARP cache — small fixed table
 static constexpr uint32_t ARP_CACHE_SIZE = 32;
 
@@ -632,9 +637,21 @@ void NetStartPollThread()
         }
     }, nullptr, 2 /* NORMAL priority — same as user processes */);
     if (pollThread) {
+        g_netPollThread = pollThread;
         SchedulerAddProcess(pollThread);
         SerialPrintf("net: net_poll thread started (pid=%u)\n", pollThread->pid);
     }
+}
+
+void NetWakePollThread()
+{
+    // Called from NIC RX IRQ handlers. SchedulerUnblock is ISR-safe and
+    // correctly handles the case where the poll thread is mid-flight between
+    // draining and SchedulerBlock (it sets pendingWakeup so the imminent block
+    // returns immediately). If the thread isn't blocked yet, the 5ms timed
+    // wakeup in the poll loop bounds worst-case latency.
+    if (g_netPollThread)
+        SchedulerUnblock(g_netPollThread);
 }
 
 NetIf* NetGetIf()

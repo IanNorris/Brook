@@ -170,6 +170,7 @@ EXPORT_SYMBOL(ApicSendEoi);
 // Network
 EXPORT_SYMBOL(NetRegisterIf);
 EXPORT_SYMBOL(NetReceive);
+EXPORT_SYMBOL(NetWakePollThread);
 
 // Audio
 EXPORT_SYMBOL(AudioRegister);

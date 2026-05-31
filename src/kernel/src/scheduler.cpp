@@ -1348,29 +1348,39 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     // clear_child_tid (handled above).
     if (!proc->isThread && proc->parentPid != 0)
     {
+        // Send SIGCHLD (17) to the parent.
+        constexpr int SIGCHLD = 17;
+        uint64_t bit = 1ULL << (SIGCHLD - 1);
+
         uint64_t alf = SchedLockAcquire(g_allProcLock);
         for (uint32_t i = 0; i < g_processCount; i++)
         {
             if (g_allProcesses[i]->pid == proc->parentPid)
             {
                 Process* parent = g_allProcesses[i];
-                SchedLockRelease(g_allProcLock, alf);
 
-                // Send SIGCHLD (17) to parent
-                constexpr int SIGCHLD = 17;
-                uint64_t bit = 1ULL << (SIGCHLD - 1);
+                // Mutate `parent` ONLY while holding g_allProcLock. The reaper
+                // frees a Process strictly after SchedulerRemoveProcess pulls
+                // it out of g_allProcesses under this same lock, so a parent we
+                // found in the array here cannot be freed until we release —
+                // closing the use-after-free (BRO-158).
+                //
+                // We must NOT call SchedulerUnblock (which takes g_readyLock)
+                // while holding g_allProcLock: SchedulerSetPolicy establishes
+                // the g_readyLock -> g_allProcLock order, so the reverse would
+                // deadlock. Instead set pendingWakeup and let the BSP's
+                // CheckBlockedWakeups perform the unblock on the next tick. That
+                // path runs on CPU 0 right alongside ReapTerminated, so it can
+                // never race the reaper freeing the parent. SchedulerBlock also
+                // honours pendingWakeup, so a parent racing into wait4 won't
+                // miss the signal.
                 __atomic_or_fetch(&parent->sigPending, bit, __ATOMIC_RELEASE);
-
-                // Set pendingWakeup in case parent hasn't blocked yet
                 __atomic_store_n(&parent->pendingWakeup, 1, __ATOMIC_RELEASE);
-                if (parent->state == ProcessState::Blocked)
-                    SchedulerUnblock(parent);
-                goto parent_done;
+                break;
             }
         }
         SchedLockRelease(g_allProcLock, alf);
     }
-parent_done:
 
     uint64_t rlf10 = SchedLockAcquire(g_readyLock);
     ReadyQueueRemoveLocked(proc);

@@ -915,6 +915,15 @@ void ProcessDestroy(Process* proc)
     // Threads share the page table with the leader — don't destroy it
     if (!proc->isKernelThread && !isThread)
     {
+        // Flush stale TLB entries for this address space on all remote CPUs
+        // before tearing down the page table and freeing the physical pages,
+        // so a CPU that still has this AS cached cannot read/write memory that
+        // is about to be freed (and possibly reallocated). Mirrors the exec
+        // teardown path (ProcessExec). The reaper runs on CPU0 and never has a
+        // terminated process's page table loaded, so unlike exec there is no
+        // local CR3 to switch away first.
+        TlbShootdownFull(proc->pageTable.pml4.raw(), proc->tlbCpuMask);
+
         // Clear lazy VMAs before page-table destruction. MemFd PTEs point at
         // memfd-owned pages, and file VMAs hold vnode references independent of
         // the fd table.
@@ -1024,11 +1033,10 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                     // loop flushes stale writable TLB entries on all CPUs.
                     if (privateWritable)
                     {
-                        // Downgrade parent PTE: clear writable, set COW bit.
-                        // Keep the PID unchanged (still parent's).
-                        srcPt4[i1] = (srcPt4[i1] & ~VMM_WRITABLE) | PTE_COW_BIT;
-
                         // Build child PTE: same physical page, read-only + COW.
+                        // Do NOT touch the parent PTE yet — that happens
+                        // atomically with the child leaf write and refcount bump
+                        // inside VmmForkCommitCowShare (BRO-155).
                         uint64_t childPte = (srcPhys.raw() & PTE_PHYS_MASK)
                                           | VMM_PRESENT
                                           | (pteFlags & VMM_USER)
@@ -1037,7 +1045,11 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                                           | PTE_COW_BIT
                                           | (((uint64_t)dstPid & 0x3FF) << PTE_PID_SHIFT);
 
-                        // Create intermediate page table entries in child.
+                        // Create intermediate page table entries in child FIRST.
+                        // VmmMapPage takes g_userPtLock internally, so it must
+                        // run BEFORE the locked commit (calling it under the lock
+                        // would deadlock). The leaf PTE it writes here is
+                        // overwritten by the commit below.
                         uint64_t childMapFlags = VMM_USER;
                         if (pteFlags & VMM_NO_EXEC)
                             childMapFlags |= VMM_NO_EXEC;
@@ -1045,12 +1057,15 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                                         childMapFlags, MemTag::User, dstPid))
                         {
                             SerialPrintf("FORK: failed to map COW page at vaddr 0x%lx\n", vaddr);
-                            // Restore parent PTE to writable
-                            srcPt4[i1] = (srcPt4[i1] | VMM_WRITABLE) & ~PTE_COW_BIT;
+                            // Parent PTE was not modified — nothing to restore.
                             return false;
                         }
 
-                        // Overwrite the leaf PTE with our carefully built one.
+                        // Locate the child's leaf PTE (intermediate tables now
+                        // exist) and commit the COW share atomically: downgrade
+                        // parent, install child leaf, bump refcount under
+                        // g_userPtLock so the COW write-fault handler can't
+                        // observe a half-shared state.
                         auto* dstPml4 = reinterpret_cast<uint64_t*>(
                             PhysToVirt(dstPt.pml4).raw());
                         auto* dstPdpt = reinterpret_cast<uint64_t*>(
@@ -1059,10 +1074,9 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                             PhysToVirt(PhysicalAddress(dstPdpt[i3] & PTE_PHYS_MASK)).raw());
                         auto* dstPt4 = reinterpret_cast<uint64_t*>(
                             PhysToVirt(PhysicalAddress(dstPd[i2] & PTE_PHYS_MASK)).raw());
-                        dstPt4[i1] = childPte;
 
-                        // Increment refcount so both parent and child hold a ref.
-                        PmmRefPage(srcPhys);
+                        VmmForkCommitCowShare(&srcPt4[i1], &dstPt4[i1],
+                                              childPte, srcPhys);
 
                         copiedCount++;
                         continue;
