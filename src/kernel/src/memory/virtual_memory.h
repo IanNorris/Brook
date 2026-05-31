@@ -90,6 +90,39 @@ MemTag VmmGetPageTag(PageTable pt, VirtualAddress virtAddr);
 uint16_t VmmGetPagePid(PageTable pt, VirtualAddress virtAddr);
 
 // ---------------------------------------------------------------------------
+// Copy-on-write resolution (SMP-safe)
+// ---------------------------------------------------------------------------
+//
+// COW has two halves that race on the same user PTE + physical refcount:
+// the write-fault handler (resolves a COW page) and fork (shares a page COW).
+// Both, plus munmap/mprotect, are serialized under the single user page-table
+// lock (g_userPtLock) so the refcount check + PTE update is atomic. See
+// BRO-155.
+
+enum class VmmCowResult {
+    NotCow,        // PTE absent or not a COW page — caller handles otherwise.
+    Resolved,      // PTE made writable (copied if shared); caller must TLB-flush.
+    OutOfMemory,   // shared page needed a copy but no page was free.
+};
+
+// Resolve a write fault on a COW page for `pid`'s address space. Performs the
+// refcount check, page copy (if shared) or in-place upgrade (if sole owner),
+// and PTE update atomically under g_userPtLock. Does NOT issue the cross-CPU
+// TLB shootdown — the caller must do that AFTER this returns, because the
+// shootdown busy-waits for remote IPI ACKs and g_userPtLock is held with
+// interrupts disabled (holding it across the wait would deadlock).
+VmmCowResult VmmCowResolveWrite(PageTable pt, VirtualAddress faultAddr, uint16_t pid);
+
+// Commit fork's COW-share of a single leaf page atomically against the COW
+// write-fault handler: downgrade the parent PTE to read-only+COW, install the
+// child's read-only+COW PTE, and bump the physical page refcount — all under
+// g_userPtLock. The child intermediate tables must already exist (build them
+// with VmmMapPage BEFORE calling this; VmmMapPage also takes g_userPtLock and
+// must not be called while it is held).
+void VmmForkCommitCowShare(uint64_t* parentLeaf, uint64_t* childLeaf,
+                           uint64_t childPte, PhysicalAddress srcPhys);
+
+// ---------------------------------------------------------------------------
 // VMALLOC / module allocators (always kernel page table)
 // ---------------------------------------------------------------------------
 

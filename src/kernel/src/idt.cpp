@@ -781,49 +781,15 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                                       VirtualAddress(cr2cow & ~0xFFFULL));
             if (pte && (*pte & PTE_COW_BIT))
             {
-                static constexpr uint64_t PTE_PHYS_MASK = 0x000FFFFFFFFFF000ULL;
-                PhysicalAddress oldPhys((*pte) & PTE_PHYS_MASK);
-                uint8_t refCount = PmmGetRefCount(oldPhys);
+                // Resolve the COW page atomically under g_userPtLock (closes the
+                // refcount TOCTOU / torn-PTE races — BRO-155). The TLB shootdown
+                // is issued here, AFTER the lock is dropped inside the helper,
+                // because it busy-waits for remote IPI ACKs.
+                VmmCowResult cow = VmmCowResolveWrite(
+                    cowProc->pageTable, VirtualAddress(cr2cow), cowProc->pid);
 
-                if (refCount > 1)
+                if (cow == VmmCowResult::Resolved)
                 {
-                    // Shared COW page: allocate new page, copy, remap writable
-                    PhysicalAddress newPhys = PmmAllocPage(MemTag::User, cowProc->pid);
-                    if (newPhys)
-                    {
-                        auto* src = reinterpret_cast<const uint8_t*>(
-                            PhysToVirt(oldPhys).raw());
-                        auto* dst = reinterpret_cast<uint8_t*>(
-                            PhysToVirt(newPhys).raw());
-                        for (uint64_t b = 0; b < 4096; b += 8)
-                            *reinterpret_cast<uint64_t*>(dst + b) =
-                                *reinterpret_cast<const uint64_t*>(src + b);
-
-                        // Update PTE: new phys, writable, clear COW bit
-                        uint64_t newPte = (newPhys.raw() & PTE_PHYS_MASK)
-                                        | ((*pte) & ~(PTE_PHYS_MASK | PTE_COW_BIT))
-                                        | VMM_WRITABLE;
-                        // Update PID in PTE to this process
-                        newPte = (newPte & ~PTE_PID_MASK)
-                               | (((uint64_t)cowProc->pid & 0x3FF) << PTE_PID_SHIFT);
-                        *pte = newPte;
-
-                        PmmUnrefPage(oldPhys);
-
-                        __asm__ volatile("invlpg (%0)" :: "r"(cr2cow & ~0xFFFULL) : "memory");
-                        // Shootdown stale TLB entries on other CPUs
-                        brook::TlbShootdown(cowProc->pageTable.pml4.raw(),
-                                            cr2cow & ~0xFFFULL,
-                                            cowProc->tlbCpuMask);
-                        __asm__ volatile("sti");
-                        return;
-                    }
-                    // OOM — fall through to normal fault handling
-                }
-                else
-                {
-                    // Last reference: just make writable, clear COW
-                    *pte = ((*pte) & ~PTE_COW_BIT) | VMM_WRITABLE;
                     __asm__ volatile("invlpg (%0)" :: "r"(cr2cow & ~0xFFFULL) : "memory");
                     brook::TlbShootdown(cowProc->pageTable.pml4.raw(),
                                         cr2cow & ~0xFFFULL,
@@ -831,6 +797,8 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                     __asm__ volatile("sti");
                     return;
                 }
+                // OutOfMemory or NotCow (e.g. another CPU resolved it first):
+                // fall through to the safety net / normal fault handling.
             }
         }
 
