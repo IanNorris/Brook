@@ -731,17 +731,13 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     {
         // Default: fd 0 = keyboard, fd 1/2 = serial
         proc->fds[0].type = FdType::DevKeyboard;
-        proc->fds[0].refCount = 1;
         proc->fds[1].type = FdType::Vnode; // treated as serial stdout in syscall
-        proc->fds[1].refCount = 1;
         proc->fds[1].statusFlags = 1; // O_WRONLY
         proc->fds[2].type = FdType::Vnode; // treated as serial stderr in syscall
-        proc->fds[2].refCount = 1;
         proc->fds[2].statusFlags = 2; // O_RDWR
     }
     // fd 3 = debug serial (hardcoded in sys_write); reserve it
     proc->fds[3].type = FdType::DevNull;
-    proc->fds[3].refCount = 1;
     proc->fds[3].statusFlags = 1; // O_WRONLY
 
     // Default TTY mode: canonical with echo
