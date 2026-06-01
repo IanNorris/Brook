@@ -14,6 +14,7 @@
 #include "klog.h"
 #include "profiler.h"
 #include "string.h"
+#include "loopback_queue.h"
 #include "window.h"
 #include "smp.h"
 #include "rtc.h"
@@ -66,6 +67,20 @@ struct ArpEntry {
 static ArpEntry g_arpCache[ARP_CACHE_SIZE];
 static uint32_t g_arpCount = 0;
 static SpinLock g_arpLock;
+
+// ---------------------------------------------------------------------------
+// Loopback delivery trampoline (BRO-163): never deliver loopback frames by
+// calling HandleIpv4() recursively on the sender's stack. A loopback TCP
+// transfer is ACK-clocked, so each delivered segment can synchronously emit
+// the next one; delivering inline turned that into unbounded recursion (each
+// level holds a ~1.5 KiB on-stack frame) and overflowed the kernel stack
+// (#DF). Frames are copied into a bounded FIFO and drained iteratively so the
+// stack depth stays O(1). See loopback_queue.h / test_loopback.
+// ---------------------------------------------------------------------------
+static constexpr uint32_t LOOPBACK_QUEUE_SLOTS = 64;
+static LoopbackQueueT<LOOPBACK_QUEUE_SLOTS, ETH_FRAME_MAX> g_loopbackQueue;
+static SpinLock g_loopbackLock;
+static bool     g_loopbackDraining = false;  // guarded by g_loopbackLock
 
 // Pending ARP resolution
 static volatile bool g_arpReplyPending = false;
@@ -352,7 +367,17 @@ int NetSendIpv4(uint32_t dstIp, uint8_t proto,
         ip->checksum = InetChecksum(ip, sizeof(Ipv4Header));
 
         memcpy(frame + sizeof(EthHeader) + sizeof(Ipv4Header), payload, payloadLen);
-        HandleIpv4(frame, frameLen);
+
+        // BRO-163: queue for iterative delivery instead of calling HandleIpv4
+        // inline. A loopback ACK can drive the next segment send, which would
+        // re-enter NetSendIpv4 -> HandleIpv4 and recurse until the kernel
+        // stack overflows. LoopbackSubmit drains the queue iteratively so at
+        // most one HandleIpv4 frame is ever live per drainer.
+        LoopbackSubmit(
+            g_loopbackQueue, g_loopbackDraining, frame, frameLen,
+            []() { SpinLockAcquire(&g_loopbackLock); },
+            []() { SpinLockRelease(&g_loopbackLock); },
+            [](const uint8_t* f, uint32_t l) { HandleIpv4(f, l); });
         return 0;
     }
 
