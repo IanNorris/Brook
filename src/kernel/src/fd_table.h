@@ -55,12 +55,28 @@ struct FdEntry
     FdType   type;
     uint8_t  flags;        // O_NONBLOCK, pipe direction, etc.
     uint8_t  fdFlags;      // FD-level flags: FD_CLOEXEC (bit 0)
-    uint8_t  _pad;
-    uint32_t refCount;
+    uint8_t  closing;      // BRO-156: a close() raced an active pin; the slot's
+                           // teardown is deferred to the last FdPut. While set,
+                           // FdGetRef/Pin refuses the slot (no new users).
+    uint32_t refCount;     // vestigial: written (always 1) but never read for any
+                           // decision — kept only for struct ABI stability. The
+                           // real lifetime is the handle's own refcount + pinCount.
     uint32_t statusFlags;  // Linux O_* flags from open (for F_GETFL/F_SETFL)
+    uint32_t pinCount;     // BRO-156: active fget/fput pins. A slot with pinCount>0
+                           // must not be cleared or reused; close() defers until 0.
     void*    handle;       // VFS Vnode* or device-specific state
     uint64_t seekPos;      // Current file offset (for lseek)
     char     dirPath[64];  // For directory fds: path prefix for openat resolution
+};
+
+// Outcome of an FdTableClose: either the slot was claimed-and-cleared right now
+// (caller must finalize *out immediately), or its teardown was deferred to the
+// last in-flight FdTableUnpin, or the fd was already unused/closing.
+enum class FdCloseResult : uint8_t
+{
+    NotFound,    // fd out of range, unused, or already closing → -EBADF
+    ClaimedNow,  // slot cleared; *out filled; caller finalizes the handle now
+    Deferred,    // slot still pinned; marked closing; finalize happens at last unpin
 };
 
 // Snapshot of a slot's owning state captured atomically while the slot is
@@ -79,9 +95,11 @@ inline void FdSlotClear(FdEntry& e)
     e.type        = FdType::None;
     e.flags       = 0;
     e.fdFlags     = 0;
+    e.closing     = 0;
     e.statusFlags = 0;
     e.handle      = nullptr;
     e.refCount    = 0;
+    e.pinCount    = 0;
     e.seekPos     = 0;
     e.dirPath[0]  = '\0';
 }
@@ -98,8 +116,10 @@ inline int FdTableAlloc(FdEntry* fds, SpinLock* lock, FdType type, void* handle)
             fds[i].type        = type;
             fds[i].flags       = 0;
             fds[i].fdFlags     = 0;
+            fds[i].closing     = 0;
             fds[i].refCount    = 1;
             fds[i].statusFlags = 0;
+            fds[i].pinCount    = 0;
             fds[i].handle      = handle;
             fds[i].seekPos     = 0;
             fds[i].dirPath[0]  = '\0';
@@ -161,6 +181,105 @@ inline bool FdTableClaim(FdEntry* fds, SpinLock* lock, int fd, FdClaimResult* ou
     FdSlotClear(fds[fd]);
     SpinLockRelease(lock);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Pinned fget/fput path (BRO-156).
+//
+// FdTableGet above returns a raw pointer after dropping the lock — a sibling
+// thread can then close() the fd and free the underlying handle while the
+// first thread is still dereferencing it (a UAF that widens dramatically on
+// paths that *sleep* mid-operation, e.g. a 500ms blocking /dev/dsp write).
+//
+// The pin protocol closes that window without holding the table lock across a
+// sleeping operation (which is impossible — the handle ops block):
+//
+//   * FdTablePin(fd)   live & not-closing → pinCount++ and return the slot.
+//   * FdTableUnpin(fd) pinCount-- ; if that was the last pin AND a close was
+//                      deferred, snapshot+clear the slot and return true so the
+//                      caller finalizes the handle outside the lock.
+//   * FdTableClose(fd) if unpinned, claim+clear immediately (ClaimedNow); if
+//                      pinned, set `closing` and defer teardown to the last
+//                      unpin (Deferred); otherwise NotFound.
+//
+// While pinned, the slot cannot be cleared or reused, so the returned pointer
+// (and the handle it names) stays valid for the duration of the operation.
+// ---------------------------------------------------------------------------
+
+// Pin a live slot for use, returning a pointer that stays valid until the
+// matching FdTableUnpin. Returns nullptr if the fd is out of range, unused, or
+// already closing (a close is pending and no new users are admitted).
+inline FdEntry* FdTablePin(FdEntry* fds, SpinLock* lock, int fd)
+{
+    if (fd < 0 || fd >= static_cast<int>(MAX_FDS)) return nullptr;
+    SpinLockAcquire(lock);
+    if (fds[fd].type == FdType::None || fds[fd].closing)
+    {
+        SpinLockRelease(lock);
+        return nullptr;
+    }
+    fds[fd].pinCount++;
+    SpinLockRelease(lock);
+    return &fds[fd];
+}
+
+// Release a pin taken by FdTablePin. If this drops the last pin on a slot whose
+// close() was deferred, snapshot the owning state into *out, clear the slot,
+// and return true — the caller must then finalize (unref/free) the handle
+// outside the lock, exactly as the immediate-close path does. Returns false in
+// all other cases (still pinned, or no deferred close pending).
+inline bool FdTableUnpin(FdEntry* fds, SpinLock* lock, int fd, FdClaimResult* out)
+{
+    if (fd < 0 || fd >= static_cast<int>(MAX_FDS)) return false;
+    SpinLockAcquire(lock);
+    if (fds[fd].pinCount > 0)
+        fds[fd].pinCount--;
+    bool finalize = false;
+    if (fds[fd].pinCount == 0 && fds[fd].closing)
+    {
+        if (out)
+        {
+            out->type   = fds[fd].type;
+            out->handle = fds[fd].handle;
+            out->flags  = fds[fd].flags;
+        }
+        FdSlotClear(fds[fd]);
+        finalize = true;
+    }
+    SpinLockRelease(lock);
+    return finalize;
+}
+
+// Close a slot. If it is unpinned, atomically claim-and-clear it now and fill
+// *out (ClaimedNow) — equivalent to FdTableClaim. If it is pinned, mark it
+// `closing` (refusing further pins) and leave the owning state in place so the
+// last FdTableUnpin can finalize it (Deferred). If already unused or closing,
+// return NotFound. Exactly one caller across racing close()s observes a live,
+// non-closing slot, so the handle is torn down exactly once.
+inline FdCloseResult FdTableClose(FdEntry* fds, SpinLock* lock, int fd, FdClaimResult* out)
+{
+    if (fd < 0 || fd >= static_cast<int>(MAX_FDS)) return FdCloseResult::NotFound;
+    SpinLockAcquire(lock);
+    if (fds[fd].type == FdType::None || fds[fd].closing)
+    {
+        SpinLockRelease(lock);
+        return FdCloseResult::NotFound;
+    }
+    if (fds[fd].pinCount > 0)
+    {
+        fds[fd].closing = 1;
+        SpinLockRelease(lock);
+        return FdCloseResult::Deferred;
+    }
+    if (out)
+    {
+        out->type   = fds[fd].type;
+        out->handle = fds[fd].handle;
+        out->flags  = fds[fd].flags;
+    }
+    FdSlotClear(fds[fd]);
+    SpinLockRelease(lock);
+    return FdCloseResult::ClaimedNow;
 }
 
 } // namespace brook

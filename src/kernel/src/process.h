@@ -564,6 +564,25 @@ FdEntry*  FdGet(Process* proc, int fd);
 // the same fd, so the handle is unref'd/freed once (BRO-156).
 bool      FdClaim(Process* proc, int fd, FdClaimResult* out);
 
+// Pinned fget/fput path (BRO-156). FdGetRef pins a live slot and returns a
+// pointer that stays valid (slot can't be reused, handle can't be freed) until
+// the matching FdPut. Every FdGetRef that returns non-null MUST be balanced by
+// exactly one FdPut on every return path (use the FdRef RAII guard). FdPut runs
+// any deferred close teardown when it drops the last pin.
+FdEntry*  FdGetRef(Process* proc, int fd);
+void      FdPut(Process* proc, int fd);
+
+// Close a slot honouring outstanding pins: claims-and-clears immediately if
+// unpinned (ClaimedNow, *out filled), or marks it closing and defers teardown
+// to the last FdPut if pinned (Deferred). NotFound if already gone.
+FdCloseResult FdClose(Process* proc, int fd, FdClaimResult* out);
+
+// Tear down the handle named by a claimed/finalized fd snapshot (per-type
+// unref/free + waiter wakeups). Defined in syscall.cpp; called from both the
+// immediate-close path and FdPut's deferred-close path. Must run outside the
+// fd table lock.
+void FinalizeClosedFd(const FdClaimResult& c);
+
 // Close all file descriptors for a process (called at exit time).
 // Properly handles pipe refcounting and wakes blocked readers/writers.
 void ProcessCloseAllFds(Process* proc);
