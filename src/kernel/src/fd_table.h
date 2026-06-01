@@ -58,9 +58,6 @@ struct FdEntry
     uint8_t  closing;      // BRO-156: a close() raced an active pin; the slot's
                            // teardown is deferred to the last FdPut. While set,
                            // FdGetRef/Pin refuses the slot (no new users).
-    uint32_t refCount;     // vestigial: written (always 1) but never read for any
-                           // decision — kept only for struct ABI stability. The
-                           // real lifetime is the handle's own refcount + pinCount.
     uint32_t statusFlags;  // Linux O_* flags from open (for F_GETFL/F_SETFL)
     uint32_t pinCount;     // BRO-156: active fget/fput pins. A slot with pinCount>0
                            // must not be cleared or reused; close() defers until 0.
@@ -98,7 +95,6 @@ inline void FdSlotClear(FdEntry& e)
     e.closing     = 0;
     e.statusFlags = 0;
     e.handle      = nullptr;
-    e.refCount    = 0;
     e.pinCount    = 0;
     e.seekPos     = 0;
     e.dirPath[0]  = '\0';
@@ -117,7 +113,6 @@ inline int FdTableAlloc(FdEntry* fds, SpinLock* lock, FdType type, void* handle)
             fds[i].flags       = 0;
             fds[i].fdFlags     = 0;
             fds[i].closing     = 0;
-            fds[i].refCount    = 1;
             fds[i].statusFlags = 0;
             fds[i].pinCount    = 0;
             fds[i].handle      = handle;
