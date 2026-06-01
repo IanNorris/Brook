@@ -65,6 +65,10 @@ add_host_test(test_fd_table)
 target_compile_options(test_fd_table PRIVATE
     "-iquote${BROOK_ROOT}/src/kernel/src"
 )
+add_host_test(test_loopback)
+target_compile_options(test_loopback PRIVATE
+    "-iquote${BROOK_ROOT}/src/kernel/src"
+)
 add_host_test(test_sched_policy
     "${BROOK_ROOT}/src/kernel/src/sched_policy.cpp"
 )
