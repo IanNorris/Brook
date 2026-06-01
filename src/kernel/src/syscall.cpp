@@ -1432,6 +1432,29 @@ static constexpr uint32_t DSP_HW_RATE          = 44100; // hardware playback rat
 static constexpr uint32_t DSP_BUFFER_SIZE      = 65536; // 64KB staging buffer
 static constexpr uint32_t DSP_REPORT_BUFFER_SIZE = 24576; // HDA target queue (~139ms)
 
+// RAII guard for the pinned fget/fput path (BRO-156). Constructing it pins the
+// fd; destruction (on *every* return path, including the blocking ones) runs
+// the matching FdPut, which performs any deferred-close teardown. Use this
+// instead of a bare FdGet anywhere the handle is dereferenced across a point
+// where the operation can sleep — a sibling thread could otherwise close() the
+// fd and free the handle mid-use.
+struct FdRef
+{
+    Process* proc;
+    int      fd;
+    FdEntry* fde;
+
+    FdRef(Process* p, int f) : proc(p), fd(f), fde(FdGetRef(p, f)) {}
+    ~FdRef() { if (fde) FdPut(proc, fd); }
+
+    FdRef(const FdRef&)            = delete;
+    FdRef& operator=(const FdRef&) = delete;
+
+    explicit operator bool() const { return fde != nullptr; }
+    FdEntry* operator->() const     { return fde; }
+    FdEntry* get() const            { return fde; }
+};
+
 // ---------------------------------------------------------------------------
 // sys_write (1)
 // ---------------------------------------------------------------------------
@@ -1497,8 +1520,13 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
     // File descriptor write
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
-    FdEntry* fde = FdGet(proc, static_cast<int>(fd));
-    if (!fde) return -EBADF;
+    // Pin the slot for the whole operation: the dsp/pipe/tty/unix-socket paths
+    // below dereference fde->handle across blocking sleeps, so a bare FdGet
+    // would expose a use-after-free if a sibling closes the fd (BRO-156). The
+    // guard's destructor runs FdPut on every return path.
+    FdRef ref(proc, static_cast<int>(fd));
+    if (!ref) return -EBADF;
+    FdEntry* fde = ref.get();
 
     if (fde->type == FdType::Vnode && fde->handle)
     {
@@ -1911,8 +1939,13 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
-    FdEntry* fde = FdGet(proc, static_cast<int>(fd));
-    if (!fde) return -EBADF;
+    // Pin the slot for the whole operation: the pipe/socket/tty/timerfd/eventfd
+    // paths below block while holding fde->handle, so a bare FdGet would expose
+    // a use-after-free if a sibling closes the fd (BRO-156). The guard's
+    // destructor runs FdPut on every return path.
+    FdRef ref(proc, static_cast<int>(fd));
+    if (!ref) return -EBADF;
+    FdEntry* fde = ref.get();
 
     // Validate user buffer up-front — every read path below ultimately
     // writes to bufAddr. If the user munmapped or never mapped the range,
@@ -2926,17 +2959,13 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
 // sys_close (3)
 // ---------------------------------------------------------------------------
 
-int64_t CloseProcessFd(Process* proc, int fd)
+// Tear down the handle named by an fd snapshot: per-type unref/free plus any
+// waiter wakeups. Runs outside the fd table lock. Called from the immediate
+// close() path (CloseProcessFd) and from FdPut when it drains the last pin on a
+// slot whose close() was deferred (BRO-156). The snapshot makes this path
+// independent of the slot, which by now is already cleared (or about to be).
+void FinalizeClosedFd(const FdClaimResult& c)
 {
-    if (!proc) return -EBADF;
-    // Atomically claim the slot: this both reads the owning state and clears
-    // the slot under fdLock, so a sibling thread racing to close() the same
-    // fd cannot also reach the unref below (it sees the slot already None and
-    // returns -EBADF). This prevents the double-unref/double-free that the
-    // old FdGet()+...+FdFree() split allowed (BRO-156).
-    FdClaimResult c;
-    if (!FdClaim(proc, fd, &c)) return -EBADF;
-
     if (c.type == FdType::Vnode && c.handle)
     {
         auto* vn = static_cast<Vnode*>(c.handle);
@@ -3055,7 +3084,32 @@ int64_t CloseProcessFd(Process* proc, int fd)
         }
         kfree(pair);
     }
+}
 
+int64_t CloseProcessFd(Process* proc, int fd)
+{
+    if (!proc) return -EBADF;
+    // Close the slot honouring any in-flight pin. FdClose either:
+    //   * ClaimedNow — slot was unpinned; it has been cleared and we own the
+    //     snapshot, so finalize the handle now;
+    //   * Deferred   — a sibling is mid-operation on this fd (pinned); the slot
+    //     is marked closing and the last FdPut will finalize it — nothing to do
+    //     here, and the caller still sees a successful close();
+    //   * NotFound   — already closed (or a sibling won a concurrent close()).
+    // This both prevents the double-unref the old FdGet()+FdFree() split allowed
+    // and closes the use-after-free window where a blocking op dereferenced a
+    // handle a sibling had freed (BRO-156).
+    FdClaimResult c;
+    switch (FdClose(proc, fd, &c))
+    {
+        case FdCloseResult::NotFound:
+            return -EBADF;
+        case FdCloseResult::ClaimedNow:
+            FinalizeClosedFd(c);
+            return 0;
+        case FdCloseResult::Deferred:
+            return 0;
+    }
     return 0;
 }
 

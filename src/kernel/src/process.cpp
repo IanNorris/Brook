@@ -124,6 +124,28 @@ bool FdClaim(Process* proc, int fd, FdClaimResult* out)
     return FdTableClaim(proc->fds, &proc->fdLock, fd, out);
 }
 
+FdEntry* FdGetRef(Process* proc, int fd)
+{
+    if (!proc || !proc->fds) return nullptr;
+    return FdTablePin(proc->fds, &proc->fdLock, fd);
+}
+
+void FdPut(Process* proc, int fd)
+{
+    if (!proc || !proc->fds) return;
+    FdClaimResult c;
+    // If this drops the last pin on a slot whose close() was deferred, the core
+    // hands back the snapshot to finalize the handle outside the table lock.
+    if (FdTableUnpin(proc->fds, &proc->fdLock, fd, &c))
+        FinalizeClosedFd(c);
+}
+
+FdCloseResult FdClose(Process* proc, int fd, FdClaimResult* out)
+{
+    if (!proc || !proc->fds) return FdCloseResult::NotFound;
+    return FdTableClose(proc->fds, &proc->fdLock, fd, out);
+}
+
 // ---------------------------------------------------------------------------
 // Auxiliary vector constants (Linux ABI)
 // ---------------------------------------------------------------------------
@@ -1251,6 +1273,13 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
         if (parent->fds[i].type != FdType::None)
         {
             child->fds[i] = parent->fds[i];
+
+            // The child has no in-flight operations on its fresh table, so it
+            // must not inherit the parent's transient pin/close state (BRO-156):
+            // a slot the parent has pinned mid-read would otherwise never be
+            // finalizable in the child.
+            child->fds[i].pinCount = 0;
+            child->fds[i].closing  = 0;
 
             // Increment pipe reader/writer counts for the child's copy
             if (parent->fds[i].type == FdType::Pipe && parent->fds[i].handle)
