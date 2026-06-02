@@ -227,6 +227,7 @@ void DspHandleRef(void* handle);
 void* DevKlogDeepCopy(void* handle);
 void* DevTtyDeepCopy(void* handle);
 int64_t CloseProcessFd(Process* proc, int fd);
+int64_t CloseProcessFdForced(Process* proc, int fd);
 
 // Switch to user mode.
 // Saves kernel state, builds IRETQ frame, SWAPGS, jumps to ring 3.

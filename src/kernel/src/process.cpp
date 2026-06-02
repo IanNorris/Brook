@@ -860,7 +860,9 @@ void ProcessCloseAllFds(Process* proc)
         FdEntry& fde = proc->fds[i];
         if (fde.type == FdType::None) continue;
         SpinLockRelease(&proc->fdLock);
-        CloseFdEntry(proc, i);
+        // BRO-156: force teardown even if a killed thread left this slot pinned;
+        // all sibling threads are gone by now, so no FdPut will ever drain it.
+        CloseProcessFdForced(proc, static_cast<int>(i));
         SpinLockAcquire(&proc->fdLock);
     }
     SpinLockRelease(&proc->fdLock);
