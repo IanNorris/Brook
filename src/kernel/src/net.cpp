@@ -333,6 +333,7 @@ bool ArpResolve(uint32_t ip, MacAddr* outMac)
 // ---------------------------------------------------------------------------
 
 static void HandleIpv4(const uint8_t* frame, uint32_t len);
+static void TcpStatsMaybeFlush();
 
 // BRO-163 instrument: detect dangerous kernel-stack depth on the egress path.
 //
@@ -719,6 +720,15 @@ void NetStartPollThread()
                     if (nif && nif->poll) nif->poll(nif);
                 }
             }
+            // BRO-163: periodic TCP maintenance (delayed-ACK flush, window
+            // keepalive, stats roll-up) runs here, on the poll thread, exactly
+            // once per ~5ms wake. It used to be piggybacked on the segment-send
+            // primitive (TcpSendSegmentAtSeq), but TcpStatsMaybeFlush itself
+            // sends ACKs, so send -> flush -> send -> flush recursed once per
+            // socket needing service and overflowed the kernel stack under
+            // many parallel connections (speedtest-go). Driving it from the
+            // poll loop decouples maintenance from the send path entirely.
+            TcpStatsMaybeFlush();
             Process* self = ProcessCurrent();
             if (self) {
                 // Wake every ~5ms for responsive networking. TLS page loads
@@ -2153,7 +2163,10 @@ static void TcpSendSegmentAtSeq(Socket& s, uint32_t seq, uint8_t flags,
                           seq, s.tcpRcvNxt, dataLen, why, s.txPktCount);
         }
     }
-    TcpStatsMaybeFlush();
+    // BRO-163: do NOT call TcpStatsMaybeFlush() here. It sends ACKs, which
+    // re-enter this function, recursing once per socket needing service until
+    // the kernel stack overflows (#DF) under many parallel connections.
+    // Periodic maintenance is driven from the net_poll loop instead.
 }
 
 static void TcpSendSegment(Socket& s, uint8_t flags,
@@ -2250,7 +2263,10 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             SerialPrintf("tcp: RX pid=%u sock=%d t=%lums flags=0x%02x seq=%u ack=%u datalen=%u rcvNxt=%u [pkt#%u]\n",
                          s.ownerPid, sockIdx, g_lapicTickCount, flags, seq, ack, dataLen, s.tcpRcvNxt, s.rxPktCount);
         }
-        TcpStatsMaybeFlush();
+        // BRO-163: TcpStatsMaybeFlush() is no longer called per-RX-packet here.
+        // It is driven once per cycle from the net_poll loop, decoupling TCP
+        // maintenance (which sends ACKs) from packet processing and the send
+        // primitive so it can never recurse into the egress path.
 
         // Clamp incoming data so rcvNxt never advances past bytes we can
         // actually store.  Only *new* bytes (past rcvNxt) consume buffer
