@@ -3113,6 +3113,22 @@ int64_t CloseProcessFd(Process* proc, int fd)
     return 0;
 }
 
+// Force-close a slot at process teardown, IGNORING any outstanding pin. Used
+// only by ProcessCloseAllFds, which runs after all sibling threads of the group
+// are gone (scheduler.cpp gates it on !hasLiveThreadPeer). A thread killed while
+// blocked in a pinned op (read/write/lseek) never runs its FdRef destructor, so
+// pinCount stays >0 and the ordinary FdClose would defer the teardown forever —
+// leaking the handle's bumped refcount. With no live peer left to call FdPut,
+// it is safe to claim-and-clear the slot unconditionally and finalize now.
+int64_t CloseProcessFdForced(Process* proc, int fd)
+{
+    if (!proc) return -EBADF;
+    FdClaimResult c;
+    if (FdClaim(proc, fd, &c))
+        FinalizeClosedFd(c);
+    return 0;
+}
+
 static int64_t sys_close(uint64_t fd, uint64_t, uint64_t,
                           uint64_t, uint64_t, uint64_t)
 {
@@ -3245,8 +3261,11 @@ static int64_t sys_dup(uint64_t oldfd, uint64_t, uint64_t,
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
-    FdEntry* old = FdGet(proc, static_cast<int>(oldfd));
-    if (!old) return -EBADF;
+    // BRO-156: pin oldfd so a sibling close() can't free old->handle while we
+    // copy it into the new slot and bump its refcount.
+    FdRef oldref(proc, static_cast<int>(oldfd));
+    if (!oldref) return -EBADF;
+    FdEntry* old = oldref.get();
 
     // Find lowest free fd
     int newfd = FdAlloc(proc, old->type, old->handle);
@@ -3278,15 +3297,19 @@ static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd, uint64_t,
 
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
-    FdEntry* old = FdGet(proc, static_cast<int>(oldfd));
-    if (!old) return -EBADF;
+    // BRO-156: pin oldfd so old->handle/fields stay valid across the copy below.
+    FdRef oldref(proc, static_cast<int>(oldfd));
+    if (!oldref) return -EBADF;
+    FdEntry* old = oldref.get();
 
     if (newfd >= MAX_FDS) return -EBADF;
 
-    // Close newfd if open
-    FdEntry* existing = FdGet(proc, static_cast<int>(newfd));
-    if (existing)
-        sys_close(newfd, 0, 0, 0, 0, 0);
+    // Close newfd if currently open (sys_close is a no-op returning -EBADF for an
+    // unused slot, so the unconditional call is safe). NOTE: the install into
+    // fds[newfd] further down is not yet atomic against a concurrent allocator
+    // claiming the same slot — that residual dup2 race is tracked separately; the
+    // BRO-156 fix here is pinning oldfd so its handle can't be freed mid-copy.
+    sys_close(newfd, 0, 0, 0, 0, 0);
 
     // Copy the FD entry
     proc->fds[newfd].type = old->type;
@@ -3338,8 +3361,13 @@ static int64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
-    FdEntry* fde = FdGet(proc, static_cast<int>(fd));
-    if (!fde) return -EBADF;
+    // BRO-156: pin the slot for the whole op. SEEK_END dereferences fde->handle
+    // across VfsStat, which can block on disk I/O — a bare FdGet would let a
+    // sibling close() free the handle mid-stat. The pin also keeps the slot
+    // alive for the seekPos read-modify-write below.
+    FdRef ref(proc, static_cast<int>(fd));
+    if (!ref) return -EBADF;
+    FdEntry* fde = ref.get();
 
     int64_t soff = static_cast<int64_t>(offset);
 
@@ -7179,8 +7207,12 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
-    FdEntry* fde = FdGet(proc, static_cast<int>(fd));
-    if (!fde) return -EBADF;
+    // BRO-156: pin the slot so a sibling close() can't free it while we read or
+    // mutate the FD's scalar flags (F_GETFD/F_SETFD/F_GETFL/F_SETFL) or read the
+    // source slot for F_DUPFD.
+    FdRef ref(proc, static_cast<int>(fd));
+    if (!ref) return -EBADF;
+    FdEntry* fde = ref.get();
 
     switch (static_cast<int>(cmd))
     {
@@ -7334,7 +7366,8 @@ retry_poll:
         fds[i].revents = 0;
         if (fds[i].fd < 0) continue;
 
-        FdEntry* fde = FdGet(proc, fds[i].fd);
+        FdRef fde_ref(proc, fds[i].fd);  // BRO-156: pin across handle deref
+        FdEntry* fde = fde_ref.get();
 
         if (!fde || fde->type == FdType::None)
         {
@@ -7513,7 +7546,8 @@ retry_poll:
         for (uint64_t i = 0; i < waiterCap; i++)
         {
             if (fds[i].fd < 0) continue;
-            FdEntry* fde = FdGet(proc, fds[i].fd);
+            FdRef fde_ref(proc, fds[i].fd);  // BRO-156: pin across handle deref
+            FdEntry* fde = fde_ref.get();
             if (!fde) continue;
             if (fde->type == FdType::Pipe && fde->handle && (fds[i].events & POLLIN))
             {
@@ -7560,7 +7594,8 @@ retry_poll:
         for (uint64_t i = 0; i < nfds; i++)
         {
             if (fds[i].fd < 0) continue;
-            FdEntry* fde = FdGet(proc, fds[i].fd);
+            FdRef fde_ref(proc, fds[i].fd);  // BRO-156: pin across handle deref
+            FdEntry* fde = fde_ref.get();
             if (!fde) continue;
             if (fde->type == FdType::DevKeyboard && (fds[i].events & POLLIN) && InputHasEvents())
             { ready++; break; }
@@ -7626,7 +7661,8 @@ retry_poll:
                 for (uint64_t i = 0; i < waiterCap; i++)
                 {
                     if (fds[i].fd < 0) continue;
-                    FdEntry* fde2 = FdGet(proc, fds[i].fd);
+                    FdRef fde2_ref(proc, fds[i].fd);  // BRO-156: pin across handle deref
+                    FdEntry* fde2 = fde2_ref.get();
                     if (!fde2) continue;
                     if (fde2->type == FdType::Pipe && fde2->handle && (fds[i].events & POLLIN))
                     {
@@ -7665,7 +7701,8 @@ retry_poll:
         for (uint64_t i = 0; i < waiterCap; i++)
         {
             if (fds[i].fd < 0) continue;
-            FdEntry* fde = FdGet(proc, fds[i].fd);
+            FdRef fde_ref(proc, fds[i].fd);  // BRO-156: pin across handle deref
+            FdEntry* fde = fde_ref.get();
             if (!fde) continue;
             if (fde->type == FdType::Pipe && fde->handle && (fds[i].events & POLLIN))
             {
@@ -7715,7 +7752,8 @@ retry_poll:
         {
             fds[i].revents = 0;
             if (fds[i].fd < 0) continue;
-            FdEntry* fde = FdGet(proc, fds[i].fd);
+            FdRef fde_ref(proc, fds[i].fd);  // BRO-156: pin across handle deref
+            FdEntry* fde = fde_ref.get();
             if (!fde || fde->type == FdType::None) { fds[i].revents = POLLNVAL; ready++; continue; }
             if (fde->type == FdType::Pipe && fde->handle)
             {
@@ -8100,7 +8138,8 @@ static constexpr int EPOLL_CTL_MOD = 3;
 // Returns the set of events that are actually ready.
 static uint32_t EpollFdReady(Process* proc, int fd, uint32_t events)
 {
-    FdEntry* fde = FdGet(proc, fd);
+    FdRef fde_ref(proc, fd);
+    FdEntry* fde = fde_ref.get();
     if (!fde) return EPOLLERR | EPOLLHUP;
 
     uint32_t ready = 0;
@@ -8334,7 +8373,8 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
         for (int i = 0; i < ep->count; i++) {
             int wfd = ep->entries[i].fd;
             if (wfd < 0) continue;
-            FdEntry* fde = FdGet(proc, wfd);
+            FdRef fde_ref(proc, wfd);  // BRO-156: pin across handle deref
+            FdEntry* fde = fde_ref.get();
             if (!fde || !fde->handle) continue;
             if (fde->type == FdType::Pipe) {
                 static_cast<PipeBuffer*>(fde->handle)->epollWaiter = proc;
@@ -8364,7 +8404,8 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
         for (int i = 0; i < ep->count; i++) {
             int wfd = ep->entries[i].fd;
             if (wfd < 0) continue;
-            FdEntry* fde = FdGet(proc, wfd);
+            FdRef fde_ref(proc, wfd);  // BRO-156: pin across handle deref
+            FdEntry* fde = fde_ref.get();
             if (!fde || !fde->handle) continue;
             if (fde->type == FdType::Pipe) {
                 auto* pb = static_cast<PipeBuffer*>(fde->handle);
@@ -8403,7 +8444,8 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
         for (int i = 0; i < ep->count; i++) {
             int wfd = ep->entries[i].fd;
             if (wfd < 0) continue;
-            FdEntry* fde = FdGet(proc, wfd);
+            FdRef fde_ref(proc, wfd);  // BRO-156: pin across handle deref
+            FdEntry* fde = fde_ref.get();
             if (!fde || !fde->handle) continue;
             if (fde->type == FdType::TimerFd) {
                 auto* tfd = static_cast<TimerFdData*>(fde->handle);
@@ -8447,7 +8489,11 @@ static int64_t sys_epoll_wait(uint64_t epfd, uint64_t eventsAddr,
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
 
-    FdEntry* epfde = FdGet(proc, static_cast<int>(epfd));
+    // BRO-156: pin epfd for the whole wait — epoll_wait_impl dereferences `ep`
+    // (= epfde->handle) across SchedulerBlock, so a sibling close() of epfd must
+    // not free the EpollInstance mid-wait.
+    FdRef epfde_ref(proc, static_cast<int>(epfd));
+    FdEntry* epfde = epfde_ref.get();
     if (!epfde || epfde->type != FdType::EpollFd || !epfde->handle) {
         // BRO-005 diagnostic: cross-check ProcessCurrent() against the pid
         // the scheduler stamped into cpuEnv->currentPid (gs:40) at the most
