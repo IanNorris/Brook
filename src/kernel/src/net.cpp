@@ -15,6 +15,7 @@
 #include "profiler.h"
 #include "string.h"
 #include "loopback_queue.h"
+#include "ksym_addrs.h"
 #include "window.h"
 #include "smp.h"
 #include "rtc.h"
@@ -332,10 +333,79 @@ bool ArpResolve(uint32_t ip, MacAddr* outMac)
 // ---------------------------------------------------------------------------
 
 static void HandleIpv4(const uint8_t* frame, uint32_t len);
+static void TcpStatsMaybeFlush();
+
+// BRO-163 instrument: detect dangerous kernel-stack depth on the egress path.
+//
+// The speedtest-go #DF is a kernel-stack overflow (CR2 == RSP-8, RSP near the
+// guard page). Static reading could not localize the driver, and the crashing
+// PIDs are syscall-context app threads — not net_poll — which points at IRQ
+// *nesting* onto an already-deep synchronous send rather than self-recursion
+// (device IRQs use ist=0, so a NIC interrupt nests on the current kernel
+// stack). This watermark check logs stack-used plus a frame-pointer backtrace
+// *before* the overflow commits, so the real chain is visible on serial: a
+// homogeneous NetSendIpv4/TcpSendSegment chain means recursion; an IRQ-stub
+// return address in the chain proves nesting. Kept as a permanent guardrail.
+static constexpr uint64_t NET_STACK_WARN_USED = 0x30000; // 192KB of a 256KB stack
+static uint32_t g_netStackWarnBudget = 12;               // cap dumps; avoid flooding serial
+
+static void NetSendStackWatermark(uint32_t dstIp, uint8_t proto, uint32_t payloadLen)
+{
+    Process* cur = SchedulerCurrentProcess();
+    if (!cur || !cur->kernelStackTop)
+        return;
+
+    uint64_t rsp;
+    __asm__ volatile("mov %%rsp, %0" : "=r"(rsp));
+    // RSP outside this proc's kstack (e.g. early boot, or a dedicated stack).
+    if (rsp >= cur->kernelStackTop || rsp < cur->kernelStackBase)
+        return;
+
+    uint64_t used = cur->kernelStackTop - rsp;
+    if (used < NET_STACK_WARN_USED)
+        return;
+
+    // Budget the dumps so a sustained overflow doesn't itself flood serial and
+    // perturb timing. Atomic so concurrent CPUs don't double-spend.
+    uint32_t remaining = __atomic_load_n(&g_netStackWarnBudget, __ATOMIC_RELAXED);
+    if (remaining == 0 ||
+        !__atomic_compare_exchange_n(&g_netStackWarnBudget, &remaining, remaining - 1,
+                                     false, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        return;
+
+    uint64_t total = cur->kernelStackTop - cur->kernelStackBase;
+    SerialPrintf("BRO163_STACK: cpu=%u pid=%u used=%lu/%lu rsp=0x%lx dst=%u.%u.%u.%u proto=%u len=%u\n",
+                 SmpCurrentCpuIndex(), cur->pid, used, total, rsp,
+                 dstIp & 0xFF, (dstIp >> 8) & 0xFF, (dstIp >> 16) & 0xFF, (dstIp >> 24) & 0xFF,
+                 proto, payloadLen);
+
+    // Frame-pointer backtrace. RBP chain: [RBP]=saved RBP, [RBP+8]=return RIP.
+    // Kernel is built with -fno-omit-frame-pointer, so this is reliable.
+    struct StackFrame { StackFrame* rbp; uint64_t rip; };
+    auto* fp = reinterpret_cast<StackFrame*>(__builtin_frame_address(0));
+    StackFrame* prev = nullptr;
+    for (int i = 0; i < 48 && fp; ++i) {
+        if (fp == prev || fp->rip == 0)
+            break;
+        uint64_t a = reinterpret_cast<uint64_t>(fp);
+        if (a < 0xFFFF800000000000ULL || a >= cur->kernelStackTop)
+            break;
+        const char* name = nullptr;
+        uint64_t off = 0;
+        if (KsymFindByAddr(fp->rip, &name, &off))
+            SerialPrintf("BRO163_STACK:   #%d 0x%lx %s+0x%lx\n", i, fp->rip, name, off);
+        else
+            SerialPrintf("BRO163_STACK:   #%d 0x%lx\n", i, fp->rip);
+        prev = fp;
+        fp = fp->rbp;
+    }
+}
 
 int NetSendIpv4(uint32_t dstIp, uint8_t proto,
                 const void* payload, uint32_t payloadLen)
 {
+    NetSendStackWatermark(dstIp, proto, payloadLen);
+
     NetIf* nif = NetIfForDst(dstIp);
     if (!nif || !nif->ipAddr) return -1;
 
@@ -650,6 +720,15 @@ void NetStartPollThread()
                     if (nif && nif->poll) nif->poll(nif);
                 }
             }
+            // BRO-163: periodic TCP maintenance (delayed-ACK flush, window
+            // keepalive, stats roll-up) runs here, on the poll thread, exactly
+            // once per ~5ms wake. It used to be piggybacked on the segment-send
+            // primitive (TcpSendSegmentAtSeq), but TcpStatsMaybeFlush itself
+            // sends ACKs, so send -> flush -> send -> flush recursed once per
+            // socket needing service and overflowed the kernel stack under
+            // many parallel connections (speedtest-go). Driving it from the
+            // poll loop decouples maintenance from the send path entirely.
+            TcpStatsMaybeFlush();
             Process* self = ProcessCurrent();
             if (self) {
                 // Wake every ~5ms for responsive networking. TLS page loads
@@ -2084,7 +2163,10 @@ static void TcpSendSegmentAtSeq(Socket& s, uint32_t seq, uint8_t flags,
                           seq, s.tcpRcvNxt, dataLen, why, s.txPktCount);
         }
     }
-    TcpStatsMaybeFlush();
+    // BRO-163: do NOT call TcpStatsMaybeFlush() here. It sends ACKs, which
+    // re-enter this function, recursing once per socket needing service until
+    // the kernel stack overflows (#DF) under many parallel connections.
+    // Periodic maintenance is driven from the net_poll loop instead.
 }
 
 static void TcpSendSegment(Socket& s, uint8_t flags,
@@ -2181,7 +2263,10 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             SerialPrintf("tcp: RX pid=%u sock=%d t=%lums flags=0x%02x seq=%u ack=%u datalen=%u rcvNxt=%u [pkt#%u]\n",
                          s.ownerPid, sockIdx, g_lapicTickCount, flags, seq, ack, dataLen, s.tcpRcvNxt, s.rxPktCount);
         }
-        TcpStatsMaybeFlush();
+        // BRO-163: TcpStatsMaybeFlush() is no longer called per-RX-packet here.
+        // It is driven once per cycle from the net_poll loop, decoupling TCP
+        // maintenance (which sends ACKs) from packet processing and the send
+        // primitive so it can never recurse into the egress path.
 
         // Clamp incoming data so rcvNxt never advances past bytes we can
         // actually store.  Only *new* bytes (past rcvNxt) consume buffer
