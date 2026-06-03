@@ -43,6 +43,36 @@ static constexpr uint8_t VIRTIO_BLK_S_OK = 0;
 
 static constexpr uint32_t VIRTIO_MAX_DEVS = 8;
 static constexpr uint8_t  VIRTIO_BLK_IRQ_VECTOR = 50; // preferred IDT vector
+
+// Features we actually implement. We deliberately negotiate NONE: the driver
+// uses a plain split virtqueue with direct descriptors and polls the used ring
+// for completion. In particular we must NOT accept VIRTIO_F_RING_EVENT_IDX
+// (bit 29) or VIRTIO_RING_F_INDIRECT_DESC (bit 28) — accepting a feature the
+// driver doesn't honour leaves the device's notification/interrupt suppression
+// in an undefined state. (BRO-164)
+static constexpr uint32_t VIRTIO_BLK_SUPPORTED_FEATURES = 0;
+
+// Completion wait budget. The primary bound is wall-clock: under heavy
+// multi-device load a legitimately-slow completion can take far longer than a
+// fixed spin count, and a premature "timeout" used to permanently desync the
+// queue (BRO-164). The iteration cap is only a safety net for the rare caller
+// that spins with interrupts disabled (where the tick count is frozen).
+static constexpr uint64_t VIRTIO_WAIT_DEADLINE_MS = 5000;        // 5 s wall-clock
+static constexpr uint32_t VIRTIO_WAIT_ITER_CAP    = 2000000000u; // ~tens of seconds of pure spin
+
+// Global millisecond tick, incremented by the LAPIC timer ISR.
+extern volatile uint64_t g_lapicTickCount;
+
+// True once the spin budget is exhausted. Wall-clock deadline is primary;
+// the iteration cap bounds the wait if ticks are frozen (interrupts masked).
+static inline bool WaitBudgetExhausted(uint32_t iter, uint64_t startTick)
+{
+    if (iter >= VIRTIO_WAIT_ITER_CAP) return true;
+    if ((iter & 0xFFFFu) == 0 &&
+        (g_lapicTickCount - startTick) >= VIRTIO_WAIT_DEADLINE_MS)
+        return true;
+    return false;
+}
 static constexpr uint32_t VIRTIO_CACHE_BLOCK_SECTORS = 8;     // 4 KiB
 static constexpr uint32_t VIRTIO_CACHE_BLOCK_SIZE    = 4096;
 static constexpr uint32_t VIRTIO_CACHE_ENTRIES       = 4096;  // 16 MiB
@@ -355,6 +385,50 @@ static bool AllocVirtqueue(VirtioBlkState& s)
     return true;
 }
 
+// ---- Queue recovery (BRO-164) ----
+//
+// A completion wait that times out must NOT leave the split virtqueue in a
+// half-consumed state: the device still owns the in-flight descriptors and
+// will eventually post their completions, advancing the device used-index past
+// our shadow. Without recovery, every later reap consumes a stale used-ring
+// entry, misattributes it, and reads a status byte the device never wrote for
+// that request — bricking the queue for the rest of the boot.
+//
+// Recovery performs a legacy per-queue reset: write QUEUE_PFN=0 to make the
+// device drop all in-flight descriptors, zero the rings, realign both shadow
+// indices to 0, then re-publish the PFN. Any abandoned request is discarded;
+// the caller returns -EIO and the filesystem layer retries with a fresh submit.
+static void ResetQueue(VirtioBlkState& s)
+{
+    uint32_t N = s.queueSize;
+
+    // 1. Tell the device to tear down queue 0.
+    VioWrite16(s.ioBase, VIRTIO_PCI_QUEUE_SEL, 0);
+    VioWrite32(s.ioBase, VIRTIO_PCI_QUEUE_PFN, 0);
+
+    // 2. Zero the ring memory so no stale descriptor/used entry survives.
+    if (s.descTable)  memset(s.descTable, 0, 16u * N);
+    if (s.availFlags) memset(s.availFlags, 0, 6u + 2u * N);
+    if (s.usedFlags)  memset(s.usedFlags, 0, 6u + 8u * N);
+    __asm__ volatile("mfence" ::: "memory");
+
+    // 3. Realign shadows to the freshly-zeroed device rings.
+    s.availIdxShadow = 0;
+    s.usedIdxShadow  = 0;
+    s.slotsInFlight  = 0;
+    for (uint32_t i = 0; i < MAX_INFLIGHT; ++i)
+        s.slots[i].complete = false;
+
+    // 4. Re-publish the queue PFN to bring the queue back online.
+    __asm__ volatile("mfence" ::: "memory");
+    uint32_t pfn = static_cast<uint32_t>(s.queuePhys >> 12);
+    VioWrite16(s.ioBase, VIRTIO_PCI_QUEUE_SEL, 0);
+    VioWrite32(s.ioBase, VIRTIO_PCI_QUEUE_PFN, pfn);
+    __atomic_store_n(&s.irqComplete, 0, __ATOMIC_RELEASE);
+
+    SerialPuts("virtio-blk: queue reset after timeout — recovered\n");
+}
+
 // ---- Interrupt handler ----
 
 // Per-device state pointers indexed by slot (for ISR lookup).
@@ -428,16 +502,34 @@ static bool SubmitRequest(VirtioBlkState& s,
     // other spinlocks like g_mpLock), so we must NOT hlt — if the completion
     // IRQ routes to another CPU, this CPU would never wake and every other
     // CPU spinning on our locks would deadlock.
-    for (uint32_t i = 0; i < 20000000u; ++i) {
-        if (*s.usedIdx != s.usedIdxShadow) goto done;
-        __asm__ volatile("pause" ::: "memory");
+    {
+        uint64_t startTick = g_lapicTickCount;
+        for (uint32_t i = 0; ; ++i) {
+            if (*s.usedIdx != s.usedIdxShadow) goto done;
+            if (WaitBudgetExhausted(i, startTick)) break;
+            __asm__ volatile("pause" ::: "memory");
+        }
     }
     SerialPuts("virtio-blk: timeout waiting for response\n");
+    ResetQueue(s); // BRO-164: recover instead of corrupting the shared shadow
     return false;
 
 done:
     __asm__ volatile("mfence" ::: "memory");
-    ++s.usedIdxShadow;
+    // BRO-164: validate the completion belongs to THIS request before consuming
+    // it. A stale completion from an abandoned request would otherwise be
+    // misattributed and we'd read a status byte the device never wrote for us.
+    {
+        uint16_t usedSlot = s.usedIdxShadow % s.queueSize;
+        uint32_t descId   = s.usedRing[usedSlot].id;
+        ++s.usedIdxShadow;
+        if (descId != d0) {
+            SerialPrintf("virtio-blk: stale completion descId=%u expected=%u — resetting\n",
+                         descId, static_cast<unsigned>(d0));
+            ResetQueue(s);
+            return false;
+        }
+    }
     return (*s.statusBuf == VIRTIO_BLK_S_OK);
 }
 
@@ -520,17 +612,20 @@ static bool WaitAllSlots(VirtioBlkState& s, uint32_t count)
     // Spin-wait for completion. We hold requestGuard (and callers may hold
     // filesystem locks), so we must NOT hlt — the completion IRQ may route
     // to another CPU, leaving this one halted with locks held.
-    for (uint32_t iter = 0; iter < 20000000u; ++iter)
+    uint64_t startTick = g_lapicTickCount;
+    for (uint32_t iter = 0; ; ++iter)
     {
         ReapCompletions(s);
         bool allDone = true;
         for (uint32_t i = 0; i < count; ++i)
             if (!s.slots[i].complete) { allDone = false; break; }
         if (allDone) return true;
+        if (WaitBudgetExhausted(iter, startTick)) break;
         __asm__ volatile("pause" ::: "memory");
     }
 
     SerialPuts("virtio-blk: timeout waiting for batch completion\n");
+    ResetQueue(s); // BRO-164: recover instead of permanently desyncing the queue
     return false;
 }
 
@@ -663,16 +758,32 @@ static int SubmitScatterGatherRead(VirtioBlkState& s, uint64_t startSector,
 
     // Spin-wait for completion — same rationale as SubmitRequest: we hold
     // requestGuard and callers hold filesystem locks, so hlt is unsafe.
-    for (uint32_t i = 0; i < 20000000u; ++i) {
-        if (*s.usedIdx != s.usedIdxShadow) goto sg_done;
-        __asm__ volatile("pause" ::: "memory");
+    {
+        uint64_t startTick = g_lapicTickCount;
+        for (uint32_t i = 0; ; ++i) {
+            if (*s.usedIdx != s.usedIdxShadow) goto sg_done;
+            if (WaitBudgetExhausted(i, startTick)) break;
+            __asm__ volatile("pause" ::: "memory");
+        }
     }
     SerialPuts("virtio-blk: SG timeout\n");
+    ResetQueue(s); // BRO-164: recover instead of permanently desyncing the queue
     return -1;
 
 sg_done:
     __asm__ volatile("mfence" ::: "memory");
-    ++s.usedIdxShadow;
+    // BRO-164: validate the completion is ours before consuming it.
+    {
+        uint16_t usedSlot = s.usedIdxShadow % s.queueSize;
+        uint32_t descId   = s.usedRing[usedSlot].id;
+        ++s.usedIdxShadow;
+        if (descId != SG_DESC_BASE) {
+            SerialPrintf("virtio-blk: stale SG completion descId=%u expected=%u — resetting\n",
+                         descId, static_cast<unsigned>(SG_DESC_BASE));
+            ResetQueue(s);
+            return -1;
+        }
+    }
 
     if (*s.statusBuf != VIRTIO_BLK_S_OK)
         return -1;
@@ -1057,9 +1168,13 @@ static Device* InitOnePciDevice(const PciDevice& pci, uint32_t slot)
     VioWrite8(ioBase, VIRTIO_PCI_STATUS,
               VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
 
-    // 3. Feature negotiation — accept everything the host offers.
+    // 3. Feature negotiation — only accept features we actually implement.
+    // Blindly echoing the host's offered features (incl. EVENT_IDX /
+    // INDIRECT_DESC) left notification/IRQ-suppression in an undefined state
+    // that could drop a completion notification (BRO-164).
     uint32_t features = VioRead32(ioBase, VIRTIO_PCI_HOST_FEATURES);
-    VioWrite32(ioBase, VIRTIO_PCI_GUEST_FEATURES, features);
+    VioWrite32(ioBase, VIRTIO_PCI_GUEST_FEATURES,
+               features & VIRTIO_BLK_SUPPORTED_FEATURES);
 
     // 4. Set up virtqueue 0.
     VioWrite16(ioBase, VIRTIO_PCI_QUEUE_SEL, 0);
