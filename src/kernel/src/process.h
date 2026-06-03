@@ -288,6 +288,7 @@ struct Process
     // RwLock tracking for cleanup on thread exit
     KRwLock* blockedOnRwLock;   // Non-null if blocked waiting on this rwlock
     KRwLock* heldWriteLock;     // Non-null if holding this rwlock for write
+    KRwLock* heldReadLock;      // Non-null if holding this rwlock for read (BRO-162)
     bool     blockedAsWriter;   // True if on write wait queue, false if on read wait queue
 
     // Saved CPU context (written by context_switch asm)
