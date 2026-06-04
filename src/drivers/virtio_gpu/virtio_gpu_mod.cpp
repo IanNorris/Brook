@@ -15,6 +15,9 @@
 #include "pci.h"
 #include "serial.h"
 #include "kprintf.h"
+#include "display.h"
+#include "tty.h"
+#include "compositor.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "memory/address.h"
@@ -34,6 +37,11 @@ MODULE_IMPORT_SYMBOL(KPrintf);
 MODULE_IMPORT_SYMBOL(VmmAllocPages);
 MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 MODULE_IMPORT_SYMBOL(VmmMapPage);
+MODULE_IMPORT_SYMBOL(PmmAllocPages);
+MODULE_IMPORT_SYMBOL(DisplayRegister);
+MODULE_IMPORT_SYMBOL(TtyGetFramebuffer);
+MODULE_IMPORT_SYMBOL(TtyRemap);
+MODULE_IMPORT_SYMBOL(CompositorRemap);
 MODULE_IMPORT_SYMBOL(PmmAllocPages);
 
 using namespace brook;
@@ -228,13 +236,12 @@ static constexpr uint32_t CMD_REQ_OFF  = 0;
 static constexpr uint32_t CMD_RESP_OFF = (CMD_PAGES - 1) * 4096;
 static constexpr uint32_t CMD_RESP_CAP = 4096;
 
-// Framebuffer resource backing (guest RAM the device scans out of).
+// Framebuffer resource backing — the front buffer the device scans out of AND
+// the surface the compositor renders into. Physically contiguous (PmmAllocPages)
+// so it doubles as the compositor's PhysToVirt-mapped framebuffer.
 static uint8_t* g_fbBacking = nullptr;
+static uint64_t g_fbBackingPhys = 0;
 static uint32_t g_fbW = 0, g_fbH = 0;
-
-// Max coalesced backing entries that fit in the request region.
-static constexpr uint32_t MAX_BACKING_ENTRIES =
-    (CMD_RESP_OFF - sizeof(VirtioGpuResourceAttachBacking)) / sizeof(VirtioGpuMemEntry);
 
 // Display geometry from GET_DISPLAY_INFO (scanout 0).
 static uint32_t g_dispWidth = 0, g_dispHeight = 0;
@@ -481,57 +488,29 @@ static bool ResourceCreate2D(uint32_t resId, uint32_t format, uint32_t w, uint32
     return CmdRespOk(SubmitCommand(sizeof(*req), CMD_RESP_CAP));
 }
 
-// Walk a virtually-contiguous buffer page-by-page, coalescing physically
-// adjacent pages into as few mem-entries as possible (VmmAllocPages is not
-// physically contiguous). Returns the entry count, or 0 if it overflows.
-static uint32_t BuildBackingEntries(uint8_t* virtBase, uint32_t sizeBytes,
-                                    VirtioGpuMemEntry* out, uint32_t maxEntries)
-{
-    uint32_t pages = AlignUp(sizeBytes, 4096) / 4096;
-    uint32_t n = 0;
-    for (uint32_t p = 0; p < pages; ++p)
-    {
-        uint64_t phys = VmmVirtToPhys(KernelPageTable,
-            VirtualAddress(reinterpret_cast<uint64_t>(virtBase) + p * 4096)).raw();
-        if (phys == 0) return 0;
-        if (n > 0 && out[n - 1].addr + out[n - 1].length == phys)
-        {
-            out[n - 1].length += 4096; // extend the current contiguous run
-        }
-        else
-        {
-            if (n >= maxEntries) return 0;
-            out[n].addr    = phys;
-            out[n].length  = 4096;
-            out[n].padding = 0;
-            ++n;
-        }
-    }
-    return n;
-}
-
-static bool ResourceAttachBacking(uint32_t resId, uint8_t* virtBase, uint32_t sizeBytes)
+// Attach a physically-contiguous backing buffer as a single mem-entry. The
+// framebuffer is allocated via PmmAllocPages (contiguous) so one entry suffices
+// — and we must NOT walk it with VmmVirtToPhys, since the direct map is
+// huge-page-mapped and the 4K-PTE walker returns 0 there.
+static bool ResourceAttachBackingContig(uint32_t resId, uint64_t phys, uint32_t sizeBytes)
 {
     auto* req = reinterpret_cast<VirtioGpuResourceAttachBacking*>(g_cmdBuf + CMD_REQ_OFF);
     auto* entries = reinterpret_cast<VirtioGpuMemEntry*>(
         g_cmdBuf + CMD_REQ_OFF + sizeof(VirtioGpuResourceAttachBacking));
 
-    uint32_t n = BuildBackingEntries(virtBase, sizeBytes, entries, MAX_BACKING_ENTRIES);
-    if (n == 0)
-    {
-        SerialPuts("virtio_gpu: backing scatter-list overflow\n");
-        return false;
-    }
+    entries[0].addr    = phys;
+    entries[0].length  = sizeBytes;
+    entries[0].padding = 0;
 
     memset(&req->hdr, 0, sizeof(req->hdr));
     req->hdr.type    = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
     req->resource_id = resId;
-    req->nr_entries  = n;
+    req->nr_entries  = 1;
 
-    SerialPrintf("virtio_gpu: attach backing res %u — %u entries for %u KB\n",
-                 resId, n, sizeBytes / 1024);
+    SerialPrintf("virtio_gpu: attach backing res %u — contiguous %u KB at 0x%lx\n",
+                 resId, sizeBytes / 1024, phys);
 
-    uint32_t reqLen = sizeof(VirtioGpuResourceAttachBacking) + n * sizeof(VirtioGpuMemEntry);
+    uint32_t reqLen = sizeof(VirtioGpuResourceAttachBacking) + sizeof(VirtioGpuMemEntry);
     return CmdRespOk(SubmitCommand(reqLen, CMD_RESP_CAP));
 }
 
@@ -569,39 +548,91 @@ static bool ResourceFlush(uint32_t resId, uint32_t x, uint32_t y, uint32_t w, ui
     return CmdRespOk(SubmitCommand(sizeof(*req), CMD_RESP_CAP));
 }
 
-// Phase 4 self-test: create a display-sized resource backed by guest RAM, paint
-// a recognisable gradient, and present it on scanout 0. Proves the full
-// create → attach-backing → set-scanout → transfer → flush pipeline produces
-// pixels. (Phase 5 replaces the static fill with live compositor output.)
-static bool VirtioGpuTestFill(uint32_t w, uint32_t h)
+// ---------------------------------------------------------------------------
+// DisplayOps integration (primary-display path)
+// ---------------------------------------------------------------------------
+
+// Push a dirty scanline span [minY, maxY) of the framebuffer to the device.
+// Called from the compositor flip via DisplayFlush. The compositor renders into
+// g_fbBacking; here we transfer just the damaged rows to the host resource and
+// flush them to the scanout. Runs on the compositor thread (never an ISR), so
+// the synchronous controlq poll in SubmitCommand is safe.
+static void VirtioGpuFlush(uint32_t minY, uint32_t maxY)
 {
+    if (!g_fbBacking || maxY <= minY) return;
+    if (maxY > g_fbH) maxY = g_fbH;
+    uint32_t rows   = maxY - minY;
+    uint64_t offset = static_cast<uint64_t>(minY) * g_fbW * 4;
+    if (!TransferToHost2D(RESOURCE_FB, 0, minY, g_fbW, rows, offset)) return;
+    ResourceFlush(RESOURCE_FB, 0, minY, g_fbW, rows);
+}
+
+static bool VgpuSetMode(uint32_t /*w*/, uint32_t /*h*/) { return false; } // Phase 6
+static void VgpuGetMode(brook::DisplayMode* m)
+{
+    m->width = g_fbW; m->height = g_fbH; m->stride = g_fbW * 4; m->bpp = 32;
+}
+static volatile uint32_t* VgpuGetFramebuffer()
+{ return reinterpret_cast<volatile uint32_t*>(g_fbBacking); }
+static uint64_t VgpuGetFramebufferPhys() { return g_fbBackingPhys; }
+
+static const brook::DisplayOps g_vgpuDisplayOps = {
+    "virtio-gpu",
+    VgpuSetMode,
+    VgpuGetMode,
+    VgpuGetFramebuffer,
+    VgpuGetFramebufferPhys,
+    VirtioGpuFlush,
+};
+
+// Take over the display: create a framebuffer resource backed by physically
+// contiguous guest RAM, point both the TTY and compositor at that backing (so
+// CompositorInit — which runs after module load — adopts it), set scanout, and
+// register as the active DisplayOps. After this the compositor composites into
+// g_fbBacking and each flip calls VirtioGpuFlush to present the damage rect.
+static bool VirtioGpuTakeOverDisplay()
+{
+    // Adopt the current boot framebuffer resolution (GOP/VGA set by firmware).
+    uint32_t* ttyPix; uint32_t w, h, strideBytes;
+    if (!TtyGetFramebuffer(&ttyPix, &w, &h, &strideBytes) || w == 0 || h == 0)
+    {
+        SerialPuts("virtio_gpu: no TTY framebuffer to adopt\n");
+        return false;
+    }
+
     uint32_t bytes = w * h * 4;
     uint32_t pages = AlignUp(bytes, 4096) / 4096;
-    auto vaddr = VmmAllocPages(pages, VMM_WRITABLE, MemTag::Device, KernelPid);
-    if (!vaddr) { SerialPuts("virtio_gpu: fb backing alloc failed\n"); return false; }
-    g_fbBacking = reinterpret_cast<uint8_t*>(vaddr.raw());
-    g_fbW = w; g_fbH = h;
 
-    // Gradient: B = x, G = y, R = 0x40 (format is B8G8R8X8 → u32 = R<<16|G<<8|B).
-    auto* px = reinterpret_cast<uint32_t*>(g_fbBacking);
-    for (uint32_t y = 0; y < h; ++y)
-        for (uint32_t x = 0; x < w; ++x)
-            px[y * w + x] = (0x40u << 16) | ((y & 0xFF) << 8) | (x & 0xFF);
+    // Physically contiguous: serves as the device backing AND the compositor's
+    // PhysToVirt-mapped front buffer (CompositorRemap assumes contiguous phys).
+    PhysicalAddress phys = PmmAllocPages(pages, MemTag::Device, KernelPid);
+    if (!phys) { SerialPuts("virtio_gpu: fb backing alloc failed\n"); return false; }
+    g_fbBackingPhys = phys.raw();
+    g_fbBacking     = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
+    g_fbW = w; g_fbH = h;
+    memset(g_fbBacking, 0, bytes);
 
     if (!ResourceCreate2D(RESOURCE_FB, VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM, w, h))
     { SerialPuts("virtio_gpu: RESOURCE_CREATE_2D failed\n"); return false; }
-    if (!ResourceAttachBacking(RESOURCE_FB, g_fbBacking, bytes))
+    if (!ResourceAttachBackingContig(RESOURCE_FB, g_fbBackingPhys, bytes))
     { SerialPuts("virtio_gpu: ATTACH_BACKING failed\n"); return false; }
     if (!SetScanout(0, RESOURCE_FB, w, h))
     { SerialPuts("virtio_gpu: SET_SCANOUT failed\n"); return false; }
-    if (!TransferToHost2D(RESOURCE_FB, 0, 0, w, h, 0))
-    { SerialPuts("virtio_gpu: TRANSFER_TO_HOST_2D failed\n"); return false; }
-    if (!ResourceFlush(RESOURCE_FB, 0, 0, w, h))
-    { SerialPuts("virtio_gpu: RESOURCE_FLUSH failed\n"); return false; }
 
-    SerialPuts("virtio_gpu: test fill presented OK\n");
+    // Redirect TTY + compositor into our backing, then register as the display.
+    // stride == width (no row padding) since we allocated exactly w*h*4.
+    TtyRemap(g_fbBackingPhys, w, h, w);
+    CompositorRemap(g_fbBackingPhys, w, h, w);
+    DisplayRegister(&g_vgpuDisplayOps);
+
+    // Present the initial (cleared) frame.
+    TransferToHost2D(RESOURCE_FB, 0, 0, w, h, 0);
+    ResourceFlush(RESOURCE_FB, 0, 0, w, h);
+
+    KPrintf("virtio_gpu: registered as primary display %ux%u\n", w, h);
     return true;
 }
+
 
 static int VirtioGpuModuleInit()
 {
@@ -709,14 +740,27 @@ static int VirtioGpuModuleInit()
         return -1;
     }
 
-    if (!VirtioGpuTestFill(g_dispWidth, g_dispHeight))
-    {
-        SerialPuts("virtio_gpu: test fill failed\n");
-        return -1;
-    }
+    // Take over the display only when we are the PRIMARY device — i.e. a
+    // VGA-class device (virtio-vga, PCI subclass 0x00) that provided the boot
+    // GOP. A secondary virtio-gpu-pci head (display-other, subclass 0x80) is
+    // left idle so the default stdvga+bochs boot is unaffected.
+    uint8_t baseClass = PciConfigRead8(dev.bus, dev.dev, dev.fn, 0x0B);
+    uint8_t subClass  = PciConfigRead8(dev.bus, dev.dev, dev.fn, 0x0A);
+    bool isPrimaryVga = (baseClass == 0x03 && subClass == 0x00);
 
-    KPrintf("virtio_gpu: ready — scanout 0 %ux%u (Phase 4 resource+scanout)\n",
-            g_dispWidth, g_dispHeight);
+    if (isPrimaryVga)
+    {
+        if (!VirtioGpuTakeOverDisplay())
+        {
+            SerialPuts("virtio_gpu: display takeover failed\n");
+            return -1;
+        }
+    }
+    else
+    {
+        KPrintf("virtio_gpu: secondary head (class %02x:%02x) — not driving display\n",
+                baseClass, subClass);
+    }
     return 0;
 }
 

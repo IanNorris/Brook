@@ -333,6 +333,21 @@ if [ "${NO_AUDIO}" -eq 1 ]; then
     AUDIO_OPTS="-audiodev none,id=hda0"
 fi
 
+# GPU device selection.
+#   default            : stdvga (q35) primary + virtio-gpu-pci secondary head.
+#                        Boot GOP comes from stdvga; the virtio-gpu driver drives
+#                        a secondary head (screendump it via the 'vgpu' id).
+#   BROOK_VIRTIO_VGA=1 : single virtio-vga device as the primary display. Its VGA
+#                        compat provides the boot GOP (bare virtio-gpu-pci does
+#                        NOT — the bootloader needs a GOP source), and the
+#                        virtio-gpu interface drives the live desktop. stdvga is
+#                        dropped, so bochs_display won't load.
+if [ "${BROOK_VIRTIO_VGA:-0}" = "1" ]; then
+    GPU_OPTS="-vga none -device virtio-vga,id=vgpu"
+else
+    GPU_OPTS="-device virtio-gpu-pci,id=vgpu"
+fi
+
 KVM_FLAGS=""
 if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] && [ "${NO_KVM:-}" != "1" ]; then
     KVM_FLAGS="-enable-kvm -cpu host"
@@ -376,7 +391,7 @@ qemu-system-x86_64 \
     ${HOME_DRIVE} \
     ${DATA_DRIVE} \
     -device virtio-tablet-pci \
-    -device virtio-gpu-pci,id=vgpu \
+    ${GPU_OPTS} \
     -device virtio-rng-pci \
     -device virtio-net-pci,netdev=net0${NIC_MAC_ARG} \
     -device qemu-xhci,id=xhci \
