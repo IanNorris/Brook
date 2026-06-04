@@ -1167,6 +1167,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->vforkParent = nullptr;
     child->blockedOnRwLock = nullptr;
     child->heldWriteLock = nullptr;
+    child->heldReadLock = nullptr;
     child->blockedAsWriter = false;
     // Crash entry is inherited from the parent: fork keeps the same VAS
     // contents, so __brook_crash_entry is at the same VA in the child.
@@ -1453,6 +1454,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     thread->vforkParent = nullptr;
     thread->blockedOnRwLock = nullptr;
     thread->heldWriteLock = nullptr;
+    thread->heldReadLock = nullptr;
     thread->blockedAsWriter = false;
 
     // Fork-child trampoline state

@@ -5,13 +5,42 @@
 namespace brook {
 
 // ---------------------------------------------------------------------------
+// Interrupt-flag save/disable + restore.
+//
+// On the kernel target these are the privileged cli/sti. Under host unit tests
+// (BROOK_HOST_TEST) they compile to no-ops so the real lock logic in this file
+// can be exercised in user space (cli/sti would #GP in ring 3). Kernel builds
+// never define BROOK_HOST_TEST, so their codegen is unchanged.
+// ---------------------------------------------------------------------------
+
+static inline uint64_t RwSaveAndDisableIrq()
+{
+#ifdef BROOK_HOST_TEST
+    return 0;
+#else
+    uint64_t flags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+    return flags;
+#endif
+}
+
+static inline void RwRestoreIrq(uint64_t savedFlags)
+{
+#ifdef BROOK_HOST_TEST
+    (void)savedFlags;
+#else
+    if (savedFlags & 0x200)
+        __asm__ volatile("sti" ::: "memory");
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // Internal guard lock (same pattern as KMutex)
 // ---------------------------------------------------------------------------
 
 static inline uint64_t RwGuardAcquire(KRwLock* rw)
 {
-    uint64_t flags;
-    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+    uint64_t flags = RwSaveAndDisableIrq();
     uint32_t ticket = __atomic_fetch_add(&rw->guardNext, 1, __ATOMIC_RELAXED);
     while (__atomic_load_n(&rw->guardServing, __ATOMIC_ACQUIRE) != ticket)
         __asm__ volatile("pause" ::: "memory");
@@ -21,8 +50,7 @@ static inline uint64_t RwGuardAcquire(KRwLock* rw)
 static inline void RwGuardRelease(KRwLock* rw, uint64_t savedFlags)
 {
     __atomic_fetch_add(&rw->guardServing, 1, __ATOMIC_RELEASE);
-    if (savedFlags & 0x200)
-        __asm__ volatile("sti" ::: "memory");
+    RwRestoreIrq(savedFlags);
 }
 
 extern Process* SchedulerCurrentProcess();
@@ -68,18 +96,21 @@ void KRwLockInit(KRwLock* rw)
 
 void KRwLockReadLock(KRwLock* rw)
 {
+    Process* self = SchedulerCurrentProcess();
     uint64_t flags = RwGuardAcquire(rw);
 
     // Grant immediately if no writer is active and none waiting.
     if (!rw->writerActive && rw->writersWaiting == 0)
     {
         rw->readerCount++;
+        // BRO-162: record read ownership so KRwLockCleanupOnExit can drop this
+        // reference if the thread exits while holding it.
+        if (self) self->heldReadLock = rw;
         RwGuardRelease(rw, flags);
         return;
     }
 
     // Must block — need a valid process context.
-    Process* self = SchedulerCurrentProcess();
     if (!self) {
         // No process context (early boot / ISR) — grant anyway to avoid
         // underflow when ReadUnlock is called later.  This is safe only
@@ -97,12 +128,18 @@ void KRwLockReadLock(KRwLock* rw)
     Enqueue(rw->readWaitHead, rw->readWaitTail, self);
     RwGuardRelease(rw, flags);
     SchedulerBlock(self);
-    // Woken — clear tracking.
+    // Woken — the waker already incremented readerCount and recorded
+    // heldReadLock on our behalf (BRO-162); just clear the blocked marker.
     self->blockedOnRwLock = nullptr;
 }
 
 void KRwLockReadUnlock(KRwLock* rw)
 {
+    // BRO-162: drop recorded read ownership (mirrors heldWriteLock handling).
+    Process* self = SchedulerCurrentProcess();
+    if (self && self->heldReadLock == rw)
+        self->heldReadLock = nullptr;
+
     uint64_t flags = RwGuardAcquire(rw);
     rw->readerCount--;
 
@@ -112,6 +149,10 @@ void KRwLockReadUnlock(KRwLock* rw)
         Process* writer = Dequeue(rw->writeWaitHead, rw->writeWaitTail);
         rw->writerActive = 1;
         rw->writersWaiting--;
+        // BRO-162: record ownership on the woken writer BEFORE unblock so a kill
+        // in the unblocked-but-not-yet-scheduled window is recoverable by cleanup.
+        writer->heldWriteLock = rw;
+        writer->blockedOnRwLock = nullptr;
         __atomic_store_n(&writer->pendingWakeup, 1, __ATOMIC_RELEASE);
         RwGuardRelease(rw, flags);
         SchedulerUnblock(writer);
@@ -180,6 +221,11 @@ void KRwLockWriteUnlock(KRwLock* rw)
         while (rw->readWaitHead && count < 128)
         {
             readers[count] = Dequeue(rw->readWaitHead, rw->readWaitTail);
+            // BRO-162: record the grant on the woken reader BEFORE unblocking so
+            // a kill in the unblocked-but-not-scheduled window is recoverable by
+            // KRwLockCleanupOnExit (read case) instead of leaking readerCount.
+            readers[count]->heldReadLock = rw;
+            readers[count]->blockedOnRwLock = nullptr;
             __atomic_store_n(&readers[count]->pendingWakeup, 1, __ATOMIC_RELEASE);
             count++;
             rw->readerCount++;
@@ -198,6 +244,9 @@ void KRwLockWriteUnlock(KRwLock* rw)
         Process* writer = Dequeue(rw->writeWaitHead, rw->writeWaitTail);
         rw->writerActive = 1;
         rw->writersWaiting--;
+        // BRO-162: record ownership on the woken writer before unblock.
+        writer->heldWriteLock = rw;
+        writer->blockedOnRwLock = nullptr;
         __atomic_store_n(&writer->pendingWakeup, 1, __ATOMIC_RELEASE);
         RwGuardRelease(rw, flags);
         SchedulerUnblock(writer);
@@ -248,6 +297,9 @@ void KRwLockCleanupOnExit(Process* p)
             uint32_t count = 0;
             while (rw->readWaitHead && count < 128) {
                 readers[count] = Dequeue(rw->readWaitHead, rw->readWaitTail);
+                // BRO-162: record grant before unblock (see KRwLockWriteUnlock).
+                readers[count]->heldReadLock = rw;
+                readers[count]->blockedOnRwLock = nullptr;
                 __atomic_store_n(&readers[count]->pendingWakeup, 1, __ATOMIC_RELEASE);
                 count++;
                 rw->readerCount++;
@@ -259,6 +311,33 @@ void KRwLockCleanupOnExit(Process* p)
             Process* writer = Dequeue(rw->writeWaitHead, rw->writeWaitTail);
             rw->writerActive = 1;
             rw->writersWaiting--;
+            // BRO-162: record grant before unblock.
+            writer->heldWriteLock = rw;
+            writer->blockedOnRwLock = nullptr;
+            __atomic_store_n(&writer->pendingWakeup, 1, __ATOMIC_RELEASE);
+            RwGuardRelease(rw, flags);
+            SchedulerUnblock(writer);
+        } else {
+            RwGuardRelease(rw, flags);
+        }
+    }
+
+    // Case 3 (BRO-162): Thread holds a read lock — drop its reference.  This
+    // covers both fully-acquired read locks and reads granted in the
+    // unblocked-but-not-yet-scheduled window (the waker recorded heldReadLock).
+    if (p->heldReadLock) {
+        KRwLock* rw = p->heldReadLock;
+        p->heldReadLock = nullptr;
+        uint64_t flags = RwGuardAcquire(rw);
+        if (rw->readerCount > 0)
+            rw->readerCount--;
+        // If we were the last reader and a writer is waiting, hand off.
+        if (rw->readerCount == 0 && rw->writeWaitHead) {
+            Process* writer = Dequeue(rw->writeWaitHead, rw->writeWaitTail);
+            rw->writerActive = 1;
+            rw->writersWaiting--;
+            writer->heldWriteLock = rw;
+            writer->blockedOnRwLock = nullptr;
             __atomic_store_n(&writer->pendingWakeup, 1, __ATOMIC_RELEASE);
             RwGuardRelease(rw, flags);
             SchedulerUnblock(writer);
