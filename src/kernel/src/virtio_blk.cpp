@@ -8,6 +8,7 @@
 #include "serial.h"
 #include "mem_tag.h"
 #include "idt.h"
+#include "kvmclock.h"
 
 namespace brook {
 
@@ -175,6 +176,21 @@ struct VirtioBlkState {
     volatile uint64_t writeOps;
     volatile uint64_t readBytes;
     volatile uint64_t writeBytes;
+
+    // ---- Latency probe (BRO-165 cold-read investigation) ----
+    // Per-completion-wait instrumentation. Always recorded (cost is two
+    // rdtsc reads + a few adds, negligible against a microsecond-scale wait).
+    // Surfaced read-only via /proc/blkprobe; deltas taken across a workload.
+    struct {
+        volatile uint64_t waitCount;      // number of completion waits
+        volatile uint64_t reqSubmitted;   // total requests/slots awaited
+        volatile uint64_t waitNsTotal;    // cumulative ns spent waiting
+        volatile uint64_t waitNsMax;      // worst single wait (ns)
+        volatile uint64_t spinItersTotal; // cumulative spin iterations
+        volatile uint64_t pathLegacy;     // legacy SubmitRequest waits
+        volatile uint64_t pathBatch;      // small-read batched-slot waits
+        volatile uint64_t pathSG;         // scatter-gather waits
+    } probe;
 
     // Serialises concurrent requests from multiple processes.  The current
     // driver still uses hardcoded descriptor slots 0-2 and one shared DMA
@@ -459,6 +475,21 @@ static void VirtioBlkIrqBody()
 
 static constexpr uint16_t LEGACY_DESC_BASE = MAX_INFLIGHT * DESCS_PER_SLOT;
 
+// Record one completion-wait into the latency probe. path: 0=legacy 1=batch 2=SG.
+static inline void ProbeRecordWait(VirtioBlkState& s, uint64_t startNs,
+                                   uint64_t iters, uint64_t reqs, int path)
+{
+    uint64_t dur = KvmClockReadNs() - startNs; // 0 if pvclock unavailable
+    s.probe.waitCount++;
+    s.probe.reqSubmitted   += reqs;
+    s.probe.waitNsTotal    += dur;
+    if (dur > s.probe.waitNsMax) s.probe.waitNsMax = dur;
+    s.probe.spinItersTotal += iters;
+    if (path == 0)      s.probe.pathLegacy++;
+    else if (path == 1) s.probe.pathBatch++;
+    else                s.probe.pathSG++;
+}
+
 static bool SubmitRequest(VirtioBlkState& s,
                            uint32_t type, uint64_t sector,
                            uint64_t dataBufPhys, uint32_t dataLen)
@@ -502,10 +533,12 @@ static bool SubmitRequest(VirtioBlkState& s,
     // other spinlocks like g_mpLock), so we must NOT hlt — if the completion
     // IRQ routes to another CPU, this CPU would never wake and every other
     // CPU spinning on our locks would deadlock.
+    uint64_t probeStartNs = KvmClockReadNs();
+    uint64_t probeIters   = 0;
     {
         uint64_t startTick = g_lapicTickCount;
         for (uint32_t i = 0; ; ++i) {
-            if (*s.usedIdx != s.usedIdxShadow) goto done;
+            if (*s.usedIdx != s.usedIdxShadow) { probeIters = i; goto done; }
             if (WaitBudgetExhausted(i, startTick)) break;
             __asm__ volatile("pause" ::: "memory");
         }
@@ -515,6 +548,7 @@ static bool SubmitRequest(VirtioBlkState& s,
     return false;
 
 done:
+    ProbeRecordWait(s, probeStartNs, probeIters, 1, 0);
     __asm__ volatile("mfence" ::: "memory");
     // BRO-164: validate the completion belongs to THIS request before consuming
     // it. A stale completion from an abandoned request would otherwise be
@@ -613,13 +647,14 @@ static bool WaitAllSlots(VirtioBlkState& s, uint32_t count)
     // filesystem locks), so we must NOT hlt — the completion IRQ may route
     // to another CPU, leaving this one halted with locks held.
     uint64_t startTick = g_lapicTickCount;
+    uint64_t probeStartNs = KvmClockReadNs();
     for (uint32_t iter = 0; ; ++iter)
     {
         ReapCompletions(s);
         bool allDone = true;
         for (uint32_t i = 0; i < count; ++i)
             if (!s.slots[i].complete) { allDone = false; break; }
-        if (allDone) return true;
+        if (allDone) { ProbeRecordWait(s, probeStartNs, iter, count, 1); return true; }
         if (WaitBudgetExhausted(iter, startTick)) break;
         __asm__ volatile("pause" ::: "memory");
     }
@@ -758,10 +793,12 @@ static int SubmitScatterGatherRead(VirtioBlkState& s, uint64_t startSector,
 
     // Spin-wait for completion — same rationale as SubmitRequest: we hold
     // requestGuard and callers hold filesystem locks, so hlt is unsafe.
+    uint64_t probeStartNs = KvmClockReadNs();
+    uint64_t probeIters   = 0;
     {
         uint64_t startTick = g_lapicTickCount;
         for (uint32_t i = 0; ; ++i) {
-            if (*s.usedIdx != s.usedIdxShadow) goto sg_done;
+            if (*s.usedIdx != s.usedIdxShadow) { probeIters = i; goto sg_done; }
             if (WaitBudgetExhausted(i, startTick)) break;
             __asm__ volatile("pause" ::: "memory");
         }
@@ -771,6 +808,7 @@ static int SubmitScatterGatherRead(VirtioBlkState& s, uint64_t startSector,
     return -1;
 
 sg_done:
+    ProbeRecordWait(s, probeStartNs, probeIters, 1, 2);
     __asm__ volatile("mfence" ::: "memory");
     // BRO-164: validate the completion is ours before consuming it.
     {
@@ -1325,6 +1363,22 @@ void VirtioBlkGetStats(Device* dev, uint64_t& readOps, uint64_t& writeOps,
     writeOps   = s->writeOps;
     readBytes  = s->readBytes;
     writeBytes = s->writeBytes;
+}
+
+// Latency-probe snapshot for /proc/blkprobe (BRO-165 cold-read investigation).
+void VirtioBlkGetProbe(Device* dev, VirtioBlkProbeStats& out)
+{
+    out = VirtioBlkProbeStats{};
+    if (!dev || !dev->priv) return;
+    auto* s = static_cast<VirtioBlkState*>(dev->priv);
+    out.waitCount      = s->probe.waitCount;
+    out.reqSubmitted   = s->probe.reqSubmitted;
+    out.waitNsTotal    = s->probe.waitNsTotal;
+    out.waitNsMax      = s->probe.waitNsMax;
+    out.spinItersTotal = s->probe.spinItersTotal;
+    out.pathLegacy     = s->probe.pathLegacy;
+    out.pathBatch      = s->probe.pathBatch;
+    out.pathSG         = s->probe.pathSG;
 }
 
 } // namespace brook

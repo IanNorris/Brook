@@ -1,0 +1,1 @@
+run /boot/BIN/BASH --norc --noprofile /boot/diskbench.sh
