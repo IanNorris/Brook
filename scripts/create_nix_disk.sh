@@ -17,7 +17,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
 # Parse size (first numeric arg) and packages
-SIZE_MB=5120
+SIZE_MB=32768
 PACKAGES=()
 for arg in "$@"; do
     if [[ "$arg" =~ ^[0-9]+$ ]]; then
