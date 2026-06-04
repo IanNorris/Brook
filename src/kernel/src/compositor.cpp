@@ -10,6 +10,7 @@
 #include "terminal.h"
 #include "input.h"
 #include "net.h"
+#include "display.h"
 #include "font_atlas.h"
 #include "debug_overlay.h"
 #include "string.h"
@@ -2012,6 +2013,11 @@ static void CompositorLoop()
                 g_backBuffer + y * g_backBufStride,
                 g_physFbWidth * 4);
         }
+
+        // Push the damaged span to the active display. No-op for direct-mapped
+        // linear framebuffers (GOP/bochs); virtio-gpu transfers + flushes the
+        // dirty rect to the host here.
+        brook::DisplayFlush(minY, maxY);
     }
 
     // Present-timing: record this frame's period + loop time and

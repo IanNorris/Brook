@@ -48,7 +48,7 @@ static uint64_t GopGetFramebufferPhys()
     return 0;
 }
 
-static void GopFlush() { /* linear FB, no-op */ }
+static void GopFlush(uint32_t /*minY*/, uint32_t /*maxY*/) { /* linear FB, no-op */ }
 
 static const DisplayOps g_gopOps = {
     "gop",
@@ -96,6 +96,11 @@ volatile uint32_t* DisplayGetFramebuffer()
 uint64_t DisplayGetFramebufferPhys()
 {
     return g_activeDisplay->GetFramebufferPhys();
+}
+
+void DisplayFlush(uint32_t minY, uint32_t maxY)
+{
+    g_activeDisplay->Flush(minY, maxY);
 }
 
 } // namespace brook

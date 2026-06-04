@@ -145,7 +145,7 @@ static uint64_t BochsGetFramebufferPhys()
     return g_fbPhys;
 }
 
-static void BochsFlush() { /* linear FB — no flush needed */ }
+static void BochsFlush(uint32_t /*minY*/, uint32_t /*maxY*/) { /* linear FB — no flush needed */ }
 
 static const DisplayOps g_bochsOps = {
     "bochs-vga",
