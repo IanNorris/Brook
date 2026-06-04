@@ -34,6 +34,7 @@ MODULE_IMPORT_SYMBOL(KPrintf);
 MODULE_IMPORT_SYMBOL(VmmAllocPages);
 MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 MODULE_IMPORT_SYMBOL(VmmMapPage);
+MODULE_IMPORT_SYMBOL(PmmAllocPages);
 
 using namespace brook;
 
@@ -75,9 +76,21 @@ static constexpr uint16_t VIRTQ_DESC_F_WRITE = 2;
 // virtio-gpu control protocol (virtio 1.1 §5.7.6) — see VIRTIO_GPU_DOCS.md
 // ---------------------------------------------------------------------------
 
-static constexpr uint32_t VIRTIO_GPU_CMD_GET_DISPLAY_INFO  = 0x0100;
-static constexpr uint32_t VIRTIO_GPU_RESP_OK_DISPLAY_INFO  = 0x1101;
-static constexpr uint32_t VIRTIO_GPU_MAX_SCANOUTS          = 16;
+static constexpr uint32_t VIRTIO_GPU_CMD_GET_DISPLAY_INFO      = 0x0100;
+static constexpr uint32_t VIRTIO_GPU_CMD_RESOURCE_CREATE_2D    = 0x0101;
+static constexpr uint32_t VIRTIO_GPU_CMD_SET_SCANOUT           = 0x0103;
+static constexpr uint32_t VIRTIO_GPU_CMD_RESOURCE_FLUSH        = 0x0104;
+static constexpr uint32_t VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D   = 0x0105;
+static constexpr uint32_t VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING = 0x0106;
+static constexpr uint32_t VIRTIO_GPU_RESP_OK_NODATA           = 0x1100;
+static constexpr uint32_t VIRTIO_GPU_RESP_OK_DISPLAY_INFO     = 0x1101;
+static constexpr uint32_t VIRTIO_GPU_MAX_SCANOUTS            = 16;
+
+// Brook framebuffer is Bgr8 (memory bytes B,G,R,X) → B8G8R8X8_UNORM.
+static constexpr uint32_t VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM   = 2;
+
+// Single framebuffer resource id used for scanout 0.
+static constexpr uint32_t RESOURCE_FB = 1;
 
 struct __attribute__((packed)) VirtioGpuCtrlHdr {
     uint32_t type;
@@ -99,6 +112,49 @@ struct __attribute__((packed)) VirtioGpuRespDisplayInfo {
         uint32_t      enabled;
         uint32_t      flags;
     } pmodes[VIRTIO_GPU_MAX_SCANOUTS];
+};
+
+struct __attribute__((packed)) VirtioGpuResourceCreate2D {
+    VirtioGpuCtrlHdr hdr;
+    uint32_t resource_id;
+    uint32_t format;
+    uint32_t width;
+    uint32_t height;
+};
+
+struct __attribute__((packed)) VirtioGpuMemEntry {
+    uint64_t addr;
+    uint32_t length;
+    uint32_t padding;
+};
+
+// Followed immediately by nr_entries × VirtioGpuMemEntry in the same buffer.
+struct __attribute__((packed)) VirtioGpuResourceAttachBacking {
+    VirtioGpuCtrlHdr hdr;
+    uint32_t resource_id;
+    uint32_t nr_entries;
+};
+
+struct __attribute__((packed)) VirtioGpuSetScanout {
+    VirtioGpuCtrlHdr hdr;
+    VirtioGpuRect r;
+    uint32_t scanout_id;
+    uint32_t resource_id;
+};
+
+struct __attribute__((packed)) VirtioGpuTransferToHost2D {
+    VirtioGpuCtrlHdr hdr;
+    VirtioGpuRect r;
+    uint64_t offset;
+    uint32_t resource_id;
+    uint32_t padding;
+};
+
+struct __attribute__((packed)) VirtioGpuResourceFlush {
+    VirtioGpuCtrlHdr hdr;
+    VirtioGpuRect r;
+    uint32_t resource_id;
+    uint32_t padding;
 };
 
 // ---------------------------------------------------------------------------
@@ -162,11 +218,23 @@ static uint16_t            g_usedIdxShadow = 0;
 
 static uint64_t g_descPhys = 0, g_availPhys = 0, g_usedPhys = 0;
 
-// Command request/response bounce page (req at 0, resp at 2048).
+// Command request/response buffer — physically contiguous (PmmAllocPages) so a
+// large RESOURCE_ATTACH_BACKING request (header + many mem-entries) is valid as
+// a single descriptor. Request region at offset 0; response in the last page.
 static uint8_t* g_cmdBuf = nullptr;
 static uint64_t g_cmdBufPhys = 0;
+static constexpr uint32_t CMD_PAGES    = 16;
 static constexpr uint32_t CMD_REQ_OFF  = 0;
-static constexpr uint32_t CMD_RESP_OFF = 2048;
+static constexpr uint32_t CMD_RESP_OFF = (CMD_PAGES - 1) * 4096;
+static constexpr uint32_t CMD_RESP_CAP = 4096;
+
+// Framebuffer resource backing (guest RAM the device scans out of).
+static uint8_t* g_fbBacking = nullptr;
+static uint32_t g_fbW = 0, g_fbH = 0;
+
+// Max coalesced backing entries that fit in the request region.
+static constexpr uint32_t MAX_BACKING_ENTRIES =
+    (CMD_RESP_OFF - sizeof(VirtioGpuResourceAttachBacking)) / sizeof(VirtioGpuMemEntry);
 
 // Display geometry from GET_DISPLAY_INFO (scanout 0).
 static uint32_t g_dispWidth = 0, g_dispHeight = 0;
@@ -266,8 +334,7 @@ static bool AllocControlQueue()
     uint32_t descPages  = AlignUp(16 * N, 4096) / 4096;
     uint32_t availPages = AlignUp(6 + 2 * N, 4096) / 4096;
     uint32_t usedPages  = AlignUp(6 + 8 * N, 4096) / 4096;
-    uint32_t cmdPages   = 1; // single req/resp bounce page
-    uint32_t totalPages = descPages + availPages + usedPages + cmdPages;
+    uint32_t totalPages = descPages + availPages + usedPages;
 
     auto qAddr = VmmAllocPages(totalPages, VMM_WRITABLE, MemTag::Device, KernelPid);
     if (!qAddr) return false;
@@ -278,7 +345,6 @@ static bool AllocControlQueue()
     uint8_t* descBase  = base;
     uint8_t* availBase = descBase + descPages * 4096;
     uint8_t* usedBase  = availBase + availPages * 4096;
-    uint8_t* cmdBase   = usedBase + usedPages * 4096;
 
     g_descTable  = reinterpret_cast<VirtqDesc*>(descBase);
     g_availFlags = reinterpret_cast<uint16_t*>(availBase);
@@ -286,12 +352,17 @@ static bool AllocControlQueue()
     g_availRing  = reinterpret_cast<uint16_t*>(availBase + 4);
     g_usedIdx    = reinterpret_cast<volatile uint16_t*>(usedBase + 2);
     g_usedRing   = reinterpret_cast<VirtqUsedElem*>(usedBase + 4);
-    g_cmdBuf     = cmdBase;
 
     g_descPhys   = VmmVirtToPhys(KernelPageTable, VirtualAddress(reinterpret_cast<uint64_t>(descBase))).raw();
     g_availPhys  = VmmVirtToPhys(KernelPageTable, VirtualAddress(reinterpret_cast<uint64_t>(availBase))).raw();
     g_usedPhys   = VmmVirtToPhys(KernelPageTable, VirtualAddress(reinterpret_cast<uint64_t>(usedBase))).raw();
-    g_cmdBufPhys = VmmVirtToPhys(KernelPageTable, VirtualAddress(reinterpret_cast<uint64_t>(cmdBase))).raw();
+
+    // Command buffer: physically contiguous so multi-page requests are valid.
+    PhysicalAddress cmdPhys = PmmAllocPages(CMD_PAGES, MemTag::Device, KernelPid);
+    if (!cmdPhys) return false;
+    g_cmdBufPhys = cmdPhys.raw();
+    g_cmdBuf     = reinterpret_cast<uint8_t*>(PhysToVirt(cmdPhys).raw());
+    memset(g_cmdBuf, 0, CMD_PAGES * 4096);
 
     return true;
 }
@@ -387,8 +458,150 @@ static bool QueryDisplayInfo()
 }
 
 // ---------------------------------------------------------------------------
-// Module init
+// 2D resource / scanout commands. Each builds its request in g_cmdBuf and
+// checks the device returned RESP_OK_NODATA.
 // ---------------------------------------------------------------------------
+
+static bool CmdRespOk(uint32_t respLen)
+{
+    if (respLen < sizeof(VirtioGpuCtrlHdr)) return false;
+    auto* resp = reinterpret_cast<VirtioGpuCtrlHdr*>(g_cmdBuf + CMD_RESP_OFF);
+    return resp->type == VIRTIO_GPU_RESP_OK_NODATA;
+}
+
+static bool ResourceCreate2D(uint32_t resId, uint32_t format, uint32_t w, uint32_t h)
+{
+    auto* req = reinterpret_cast<VirtioGpuResourceCreate2D*>(g_cmdBuf + CMD_REQ_OFF);
+    memset(req, 0, sizeof(*req));
+    req->hdr.type    = VIRTIO_GPU_CMD_RESOURCE_CREATE_2D;
+    req->resource_id = resId;
+    req->format      = format;
+    req->width       = w;
+    req->height      = h;
+    return CmdRespOk(SubmitCommand(sizeof(*req), CMD_RESP_CAP));
+}
+
+// Walk a virtually-contiguous buffer page-by-page, coalescing physically
+// adjacent pages into as few mem-entries as possible (VmmAllocPages is not
+// physically contiguous). Returns the entry count, or 0 if it overflows.
+static uint32_t BuildBackingEntries(uint8_t* virtBase, uint32_t sizeBytes,
+                                    VirtioGpuMemEntry* out, uint32_t maxEntries)
+{
+    uint32_t pages = AlignUp(sizeBytes, 4096) / 4096;
+    uint32_t n = 0;
+    for (uint32_t p = 0; p < pages; ++p)
+    {
+        uint64_t phys = VmmVirtToPhys(KernelPageTable,
+            VirtualAddress(reinterpret_cast<uint64_t>(virtBase) + p * 4096)).raw();
+        if (phys == 0) return 0;
+        if (n > 0 && out[n - 1].addr + out[n - 1].length == phys)
+        {
+            out[n - 1].length += 4096; // extend the current contiguous run
+        }
+        else
+        {
+            if (n >= maxEntries) return 0;
+            out[n].addr    = phys;
+            out[n].length  = 4096;
+            out[n].padding = 0;
+            ++n;
+        }
+    }
+    return n;
+}
+
+static bool ResourceAttachBacking(uint32_t resId, uint8_t* virtBase, uint32_t sizeBytes)
+{
+    auto* req = reinterpret_cast<VirtioGpuResourceAttachBacking*>(g_cmdBuf + CMD_REQ_OFF);
+    auto* entries = reinterpret_cast<VirtioGpuMemEntry*>(
+        g_cmdBuf + CMD_REQ_OFF + sizeof(VirtioGpuResourceAttachBacking));
+
+    uint32_t n = BuildBackingEntries(virtBase, sizeBytes, entries, MAX_BACKING_ENTRIES);
+    if (n == 0)
+    {
+        SerialPuts("virtio_gpu: backing scatter-list overflow\n");
+        return false;
+    }
+
+    memset(&req->hdr, 0, sizeof(req->hdr));
+    req->hdr.type    = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
+    req->resource_id = resId;
+    req->nr_entries  = n;
+
+    SerialPrintf("virtio_gpu: attach backing res %u — %u entries for %u KB\n",
+                 resId, n, sizeBytes / 1024);
+
+    uint32_t reqLen = sizeof(VirtioGpuResourceAttachBacking) + n * sizeof(VirtioGpuMemEntry);
+    return CmdRespOk(SubmitCommand(reqLen, CMD_RESP_CAP));
+}
+
+static bool SetScanout(uint32_t scanoutId, uint32_t resId, uint32_t w, uint32_t h)
+{
+    auto* req = reinterpret_cast<VirtioGpuSetScanout*>(g_cmdBuf + CMD_REQ_OFF);
+    memset(req, 0, sizeof(*req));
+    req->hdr.type     = VIRTIO_GPU_CMD_SET_SCANOUT;
+    req->r.width      = w;
+    req->r.height     = h;
+    req->scanout_id   = scanoutId;
+    req->resource_id  = resId;
+    return CmdRespOk(SubmitCommand(sizeof(*req), CMD_RESP_CAP));
+}
+
+static bool TransferToHost2D(uint32_t resId, uint32_t x, uint32_t y,
+                             uint32_t w, uint32_t h, uint64_t offsetBytes)
+{
+    auto* req = reinterpret_cast<VirtioGpuTransferToHost2D*>(g_cmdBuf + CMD_REQ_OFF);
+    memset(req, 0, sizeof(*req));
+    req->hdr.type    = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
+    req->r.x = x; req->r.y = y; req->r.width = w; req->r.height = h;
+    req->offset      = offsetBytes;
+    req->resource_id = resId;
+    return CmdRespOk(SubmitCommand(sizeof(*req), CMD_RESP_CAP));
+}
+
+static bool ResourceFlush(uint32_t resId, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    auto* req = reinterpret_cast<VirtioGpuResourceFlush*>(g_cmdBuf + CMD_REQ_OFF);
+    memset(req, 0, sizeof(*req));
+    req->hdr.type    = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
+    req->r.x = x; req->r.y = y; req->r.width = w; req->r.height = h;
+    req->resource_id = resId;
+    return CmdRespOk(SubmitCommand(sizeof(*req), CMD_RESP_CAP));
+}
+
+// Phase 4 self-test: create a display-sized resource backed by guest RAM, paint
+// a recognisable gradient, and present it on scanout 0. Proves the full
+// create → attach-backing → set-scanout → transfer → flush pipeline produces
+// pixels. (Phase 5 replaces the static fill with live compositor output.)
+static bool VirtioGpuTestFill(uint32_t w, uint32_t h)
+{
+    uint32_t bytes = w * h * 4;
+    uint32_t pages = AlignUp(bytes, 4096) / 4096;
+    auto vaddr = VmmAllocPages(pages, VMM_WRITABLE, MemTag::Device, KernelPid);
+    if (!vaddr) { SerialPuts("virtio_gpu: fb backing alloc failed\n"); return false; }
+    g_fbBacking = reinterpret_cast<uint8_t*>(vaddr.raw());
+    g_fbW = w; g_fbH = h;
+
+    // Gradient: B = x, G = y, R = 0x40 (format is B8G8R8X8 → u32 = R<<16|G<<8|B).
+    auto* px = reinterpret_cast<uint32_t*>(g_fbBacking);
+    for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x)
+            px[y * w + x] = (0x40u << 16) | ((y & 0xFF) << 8) | (x & 0xFF);
+
+    if (!ResourceCreate2D(RESOURCE_FB, VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM, w, h))
+    { SerialPuts("virtio_gpu: RESOURCE_CREATE_2D failed\n"); return false; }
+    if (!ResourceAttachBacking(RESOURCE_FB, g_fbBacking, bytes))
+    { SerialPuts("virtio_gpu: ATTACH_BACKING failed\n"); return false; }
+    if (!SetScanout(0, RESOURCE_FB, w, h))
+    { SerialPuts("virtio_gpu: SET_SCANOUT failed\n"); return false; }
+    if (!TransferToHost2D(RESOURCE_FB, 0, 0, w, h, 0))
+    { SerialPuts("virtio_gpu: TRANSFER_TO_HOST_2D failed\n"); return false; }
+    if (!ResourceFlush(RESOURCE_FB, 0, 0, w, h))
+    { SerialPuts("virtio_gpu: RESOURCE_FLUSH failed\n"); return false; }
+
+    SerialPuts("virtio_gpu: test fill presented OK\n");
+    return true;
+}
 
 static int VirtioGpuModuleInit()
 {
@@ -496,7 +709,13 @@ static int VirtioGpuModuleInit()
         return -1;
     }
 
-    KPrintf("virtio_gpu: ready — scanout 0 %ux%u (Phase 3 skeleton)\n",
+    if (!VirtioGpuTestFill(g_dispWidth, g_dispHeight))
+    {
+        SerialPuts("virtio_gpu: test fill failed\n");
+        return -1;
+    }
+
+    KPrintf("virtio_gpu: ready — scanout 0 %ux%u (Phase 4 resource+scanout)\n",
             g_dispWidth, g_dispHeight);
     return 0;
 }
