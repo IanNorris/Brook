@@ -78,7 +78,6 @@ static constexpr uint32_t VIRTIO_CACHE_BLOCK_SECTORS = 8;     // 4 KiB
 static constexpr uint32_t VIRTIO_CACHE_BLOCK_SIZE    = 4096;
 static constexpr uint32_t VIRTIO_CACHE_ENTRIES       = 4096;  // 16 MiB
 static constexpr uint64_t VIRTIO_SMALL_READ_LIMIT    = 64 * 1024;
-
 // ---- Virtqueue structures (packed for DMA) ----
 
 struct __attribute__((packed)) VirtqDesc {
@@ -103,6 +102,13 @@ struct __attribute__((packed)) VirtioBlkReq {
 static constexpr uint32_t MAX_INFLIGHT       = 16;
 static constexpr uint32_t DESCS_PER_SLOT     = 3; // header + data + status
 static constexpr uint32_t SLOT_DMA_SIZE      = VIRTIO_CACHE_BLOCK_SIZE; // 4 KiB
+
+// Sequential readahead target (BRO-165): when a cold read misses the cache we
+// pay one virtio round-trip regardless, so prefetch the following blocks in the
+// SAME batch up to the full slot pool. This turns a serial 16×4KB cold scan
+// (queue depth 1, ~38µs each) into a single 16-block round-trip. Capped at the
+// slot count so it always fits one batch submission.
+static constexpr uint32_t VIRTIO_READAHEAD_BLOCKS = MAX_INFLIGHT;
 
 struct RequestSlot {
     VirtioBlkReq* reqBuf;       // 16-byte request header (DMA-visible)
@@ -953,6 +959,30 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
                         missBlocks[missCount++] = blockNumber;
                 }
                 probe += VIRTIO_CACHE_BLOCK_SIZE - (absolute % VIRTIO_CACHE_BLOCK_SIZE);
+            }
+        }
+
+        // Sequential readahead (BRO-165): if the requested range missed, we are
+        // already committed to a device round-trip — so fill the remaining batch
+        // slots with the blocks immediately following the request. This collapses
+        // a cold sequential scan from N serialized single-block round-trips into
+        // ceil(N/MAX_INFLIGHT) batched ones. We only prefetch on an actual miss
+        // (pure cache hits return on the lock-free fast path above), so warm and
+        // random-access workloads pay nothing. Stop at the first already-cached
+        // block (the region ahead is already warm) or the device end.
+        if (missCount > 0 && missCount < VIRTIO_READAHEAD_BLOCKS)
+        {
+            uint64_t nextBlock = ((offset + len - 1) / VIRTIO_CACHE_BLOCK_SIZE) + 1;
+            while (missCount < VIRTIO_READAHEAD_BLOCKS)
+            {
+                uint64_t blockSector = nextBlock * VIRTIO_CACHE_BLOCK_SECTORS;
+                if (blockSector + VIRTIO_CACHE_BLOCK_SECTORS > s->sectorCount)
+                    break; // would read past device end
+                uint8_t* cacheBlock = nullptr;
+                if (CacheLookup(*s, nextBlock, &cacheBlock))
+                    break; // ahead already cached — stop contiguous prefetch
+                missBlocks[missCount++] = nextBlock;
+                ++nextBlock;
             }
         }
 
