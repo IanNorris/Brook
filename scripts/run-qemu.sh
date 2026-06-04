@@ -376,6 +376,7 @@ qemu-system-x86_64 \
     ${HOME_DRIVE} \
     ${DATA_DRIVE} \
     -device virtio-tablet-pci \
+    -device virtio-gpu-pci \
     -device virtio-rng-pci \
     -device virtio-net-pci,netdev=net0${NIC_MAC_ARG} \
     -device qemu-xhci,id=xhci \
