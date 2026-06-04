@@ -53,7 +53,7 @@ if [ ${#PACKAGES[@]} -eq 0 ]; then
         "${ROOT_DIR}/tools/brook-fonts-pkg"  # DejaVu fonts + fontconfig (window_frame_create needs cairo+pango)
         "${ROOT_DIR}/tools/brook-weston-data-pkg"  # weston share/weston PNG icons (frame_create needs sign_close.png etc)
         qalculate-gtk      # default calculator (GTK3, ~390MB closure — smallest GTK calc)
-        mousepad           # default text editor (Xfce GTK3, ~430MB closure)
+        xfce.mousepad      # default text editor (Xfce GTK3, ~430MB closure)
         foot               # terminal — needs pty; carried for staged bring-up
         gimp               # Tier-2 photo editor; pulled but launched only when ready (~1.2GB)
         libreoffice        # LibreOffice suite (~2.6GB closure, shares GTK3 libs with above)
