@@ -481,37 +481,81 @@ static void store_hash_from_name(const char *store_name, char out[33]) {
     }
 }
 
-static int link_closure_libs_from_narinfo(const char *store_name) {
+/* Seen-set for the transitive closure walk: grows dynamically so a large
+ * closure (hundreds of paths) is fully covered. */
+static char (*g_libseen)[33] = NULL;
+static int   g_libseen_count = 0;
+static int   g_libseen_cap   = 0;
+
+static int libseen_test_and_add(const char *hash) {
+    for (int i = 0; i < g_libseen_count; i++)
+        if (memcmp(g_libseen[i], hash, 32) == 0) return 1; /* already seen */
+    if (g_libseen_count >= g_libseen_cap) {
+        int newcap = g_libseen_cap ? g_libseen_cap * 2 : 512;
+        void *np = realloc(g_libseen, (size_t)newcap * 33);
+        if (!np) return 1; /* OOM: treat as seen to bound recursion */
+        g_libseen = (char (*)[33])np;
+        g_libseen_cap = newcap;
+    }
+    memcpy(g_libseen[g_libseen_count++], hash, 33);
+    return 0;
+}
+
+/* Link the libs of a store path AND its entire transitive reference closure
+ * into /nix/profile/lib. The previous one-level walk missed libraries that are
+ * only reachable through an intermediate package (e.g. ffmpeg -> ffmpeg-lib ->
+ * libopus), so ffplay failed at runtime with "libopus.so.0: cannot open shared
+ * object file" despite the .so being present in the store. */
+static int link_closure_libs_transitive(const char *store_name) {
     char hash[33];
     store_hash_from_name(store_name, hash);
     if (!hash[0]) return 0;
+    if (libseen_test_and_add(hash)) return 0;
+
+    int linked = link_package_libs(store_name);
 
     char narinfo_path[512];
     snprintf(narinfo_path, sizeof(narinfo_path),
              "/nix/var/cache/narinfo/%s.narinfo", hash);
-
     FILE *f = fopen(narinfo_path, "r");
-    if (!f) return 0;
+    if (!f) return linked;
 
-    int linked = 0;
     char line[MAX_LINE];
     while (fgets(line, sizeof(line), f)) {
         if (strncmp(line, "References:", 11) != 0) continue;
-
         char *p = line + 11;
         while (*p && isspace((unsigned char)*p)) p++;
 
+        /* Collect refs first, then recurse — strtok_r state does not survive
+         * the recursive call (it reuses the same global tokeniser). */
+        char refs[MAX_LINE];
+        snprintf(refs, sizeof(refs), "%s", p);
         char *saveptr = NULL;
-        char *tok = strtok_r(p, " \t\r\n", &saveptr);
-        while (tok) {
-            linked += link_package_libs(tok);
+        char *tok = strtok_r(refs, " \t\r\n", &saveptr);
+        char ref_names[64][256];
+        int nref = 0;
+        while (tok && nref < 64) {
+            snprintf(ref_names[nref++], 256, "%s", tok);
             tok = strtok_r(NULL, " \t\r\n", &saveptr);
+        }
+        for (int i = 0; i < nref; i++) {
+            char rh[33];
+            store_hash_from_name(ref_names[i], rh);
+            if (rh[0] && strcmp(ref_names[i], store_name) != 0)
+                linked += link_closure_libs_transitive(ref_names[i]);
         }
         break;
     }
-
     fclose(f);
     return linked;
+}
+
+/* Free + reset the seen-set between top-level installs. */
+static void link_closure_reset(void) {
+    free(g_libseen);
+    g_libseen = NULL;
+    g_libseen_count = 0;
+    g_libseen_cap = 0;
 }
 
 static int link_closure_libs_into_package(const char *store_name) {
@@ -813,7 +857,8 @@ static int cmd_install(const char *name) {
          * ran). This is idempotent — link_package_bins unlinks first. */
         int linked = link_package_bins(existing_store);
         int lib_linked = link_package_libs(existing_store);
-        lib_linked += link_closure_libs_from_narinfo(existing_store);
+        link_closure_reset();
+        lib_linked += link_closure_libs_transitive(existing_store);
         int rpath_linked = link_closure_libs_into_package(existing_store);
         printf("'%s' is already installed.\n", name);
         if (linked > 0)
@@ -906,7 +951,8 @@ static int cmd_install(const char *name) {
     /* Link binaries */
     int linked = link_package_bins(pkg.store_name);
     int lib_linked = link_package_libs(pkg.store_name);
-    lib_linked += link_closure_libs_from_narinfo(pkg.store_name);
+    link_closure_reset();
+    lib_linked += link_closure_libs_transitive(pkg.store_name);
     int rpath_linked = link_closure_libs_into_package(pkg.store_name);
 
     printf("\n\033[32m✓ Installed %s %s\033[0m\n", pkg.name, pkg.version);
