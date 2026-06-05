@@ -253,6 +253,20 @@ struct Process
     volatile uint64_t tlbCpuMask;  // Bitmask of CPUs that have this process's CR3 loaded in TLB
     volatile bool reapable;  // Set after context_switch completes away from this process
     volatile bool compositorRegistered; // True while compositor holds a reference to this process's VFB
+    // BRO-173: set while a SchedulerKillThreadGroup leader owns this thread's
+    // teardown.  While true, ONLY the owning leader (Phase 2, after
+    // KRwLockCleanupOnExit) may mark this process reapable — DrainPostSwitch
+    // and signal paths must NOT, otherwise the reaper could free the Process
+    // out from under the leader's still-pending cleanup (use-after-free).
+    volatile bool groupKillOwned;
+    // BRO-173: death-latch set on the thread-group LEADER (pid==tgid) when the
+    // group begins exiting (exit_group / SchedulerKillThreadGroup), under
+    // g_allProcLock.  ProcessCreateThread checks it (also under g_allProcLock)
+    // and refuses to spawn a new thread into a dying group — otherwise a thread
+    // born after the kill snapshot is never terminated, the group never
+    // empties, the leader is never reaped, and the parent's wait/fork loop
+    // livelocks (the "Terminated leader keeps creating threads" symptom).
+    volatile bool tgidExiting;
     int32_t exitStatus;      // Exit status (stored when process exits, for wait4)
 
     // CPU time accounting (in LAPIC ticks, ~1ms each)

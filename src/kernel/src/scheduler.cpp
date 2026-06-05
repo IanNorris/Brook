@@ -286,14 +286,22 @@ static Process* PickNextLocked(uint32_t cpu)
             break;
 
         Process* proc = g_pidToProcess[pid];
-        if (proc && ProcessCanRunOnCpu(proc, cpu))
+        // Drop stale / non-runnable entries entirely (PickNext already
+        // dequeued the pid; do NOT re-enqueue it).  A pid can linger in the
+        // queue as Terminated (exit_group marks Terminated without dequeuing)
+        // or reference a freed/empty slot.  Scheduling such an entry was a
+        // path into the use-after-free; skip it so only genuinely Ready
+        // processes are ever returned.
+        if (!proc || proc->state != ProcessState::Ready)
+            continue;
+        if (ProcessCanRunOnCpu(proc, cpu))
         {
             for (uint32_t j = 0; j < skippedCount; ++j)
                 ReadyQueueInsertLocked(skipped[j]);
             return proc;
         }
 
-        if (proc && skippedCount < SCHED_MAX_PIDS)
+        if (skippedCount < SCHED_MAX_PIDS)
             skipped[skippedCount++] = proc;
     }
 
@@ -337,7 +345,14 @@ static void DrainPostSwitch(uint32_t cpu)
         // For processes with compositor-registered VFBs, don't mark reapable
         // yet — the compositor must unregister first to avoid a race where
         // PmmKillPid frees VFB pages while the compositor is mid-blit.
-        if (!__atomic_load_n(&retired->compositorRegistered, __ATOMIC_ACQUIRE))
+        //
+        // BRO-173: likewise, if a SchedulerKillThreadGroup leader owns this
+        // thread's teardown, only that leader may mark it reapable (after its
+        // KRwLockCleanupOnExit).  Marking it reapable here — the moment the
+        // thread is descheduled — is exactly what let the reaper free it while
+        // the leader was still about to dereference it.
+        if (!__atomic_load_n(&retired->compositorRegistered, __ATOMIC_ACQUIRE)
+            && !__atomic_load_n(&retired->groupKillOwned, __ATOMIC_ACQUIRE))
         {
             __atomic_store_n(&retired->reapable, true, __ATOMIC_RELEASE);
         }
@@ -568,11 +583,49 @@ void SchedulerAddProcess(Process* proc)
         g_pidToProcess[proc->pid] = proc;
     g_schedOps->InitProcess(g_schedState, proc->pid, proc->schedPriority);
 
-    uint64_t rlf1 = SchedLockAcquire(g_readyLock);
-    ReadyQueueInsertLocked(proc);
-    SchedLockRelease(g_readyLock, rlf1);
-
+    // BRO-173: serialize thread birth against group exit.  A new thread of an
+    // already-exiting group must NOT become runnable — it was born after the
+    // exit_group kill snapshot, so nothing would ever terminate it, the group
+    // would never empty, and the leader/parent would livelock.  We check the
+    // group leader's death-latch under g_allProcLock (the same lock
+    // SchedulerKillThreadGroup sets it under), and if the group is exiting we
+    // register the thread already-Terminated+reapable so it is reaped instead
+    // of run.
+    //
+    // The check uses the thread's OWN generation-specific leader pointer, NOT a
+    // scan for any process with a matching tgid: pids/tgids are reused, so a
+    // tgid scan can false-positive against a still-unreaped corpse from a prior
+    // generation and stillbirth a healthy new group's threads (which then hang
+    // the new leader in pthread_create forever).  The leader pointer is stable
+    // while it has live threads (it is parked in exit_group) and is validated
+    // by magic; a dangling/invalid leader is treated as not-exiting (the normal
+    // teardown paths still apply).
+    bool stillborn = false;
     uint64_t alf1 = SchedLockAcquire(g_allProcLock);
+    if (proc->isThread && !proc->isKernelThread)
+    {
+        Process* ldr = proc->threadLeader;
+        if (ldr && ldr->magic == PROCESS_MAGIC
+            && __atomic_load_n(&ldr->tgidExiting, __ATOMIC_ACQUIRE))
+        {
+            stillborn = true;
+        }
+    }
+    if (stillborn)
+    {
+        proc->state = ProcessState::Terminated;
+        proc->exitStatus = 0;
+        __atomic_store_n(&proc->reapable, true, __ATOMIC_RELEASE);
+        SerialPrintf("SCHED: thread pid=%u stillborn into exiting tgid=%u\n",
+                     proc->pid, proc->tgid);
+    }
+    else
+    {
+        uint64_t rlf1 = SchedLockAcquire(g_readyLock);
+        ReadyQueueInsertLocked(proc);
+        SchedLockRelease(g_readyLock, rlf1);
+    }
+
     if (g_processCount < MAX_PROCESSES)
     {
         g_allProcesses[g_processCount++] = proc;
@@ -596,8 +649,17 @@ void SchedulerAddProcess(Process* proc)
 void SchedulerRemoveProcess(Process* proc)
 {
     uint64_t rlf2 = SchedLockAcquire(g_readyLock);
-    if (proc->state == ProcessState::Ready)
-        ReadyQueueRemoveLocked(proc);
+    // BRO-173: ALWAYS unlink from the policy ready-queue, not just when
+    // state==Ready.  A process being destroyed is typically Terminated (it was
+    // reaped), but it may still be linked in the policy's intrusive
+    // doubly-linked queue — e.g. a thread that was Ready (enqueued) when
+    // exit_group marked it Terminated; Terminated does not dequeue.  Skipping
+    // the remove here left dangling next/prev links and a stale readyCount in
+    // the RR queue; once the pid was freed and reused the list corrupted,
+    // PickNext then handed back a freed/wrong pid and the scheduler jumped
+    // through a use-after-freed Process (0xcc-poison panic).  Remove is
+    // idempotent (no-op if the pid isn't queued), so this is always safe.
+    ReadyQueueRemoveLocked(proc);
     SchedLockRelease(g_readyLock, rlf2);
 
     uint64_t alf2 = SchedLockAcquire(g_allProcLock);
@@ -824,6 +886,7 @@ static void ReapTerminated()
         Process* p = g_allProcesses[i];
         if (p->state == ProcessState::Terminated
             && __atomic_load_n(&p->reapable, __ATOMIC_ACQUIRE)
+            && __atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) == -1
             && p != g_perCpu[cpu].currentProcess)
         {
             if (!p->isThread && ThreadGroupHasLivePeerLocked(p))
@@ -1706,13 +1769,36 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus)
     uint32_t count = 0;
 
     uint64_t alf = SchedLockAcquire(g_allProcLock);
+    // BRO-173: latch the whole group as exiting BEFORE snapshotting members,
+    // under g_allProcLock — the same lock ProcessCreateThread/SchedulerAddProcess
+    // take to publish a new thread.  This serializes group-exit vs thread birth:
+    // a clone that wins the lock first is in our snapshot (and gets killed); a
+    // clone that loses sees the latch and is refused.  Mark every current member
+    // (leaders look themselves up by pid==tgid) so the check is robust even if
+    // the leader pointer is stale.
+    for (uint32_t i = 0; i < g_processCount; ++i)
+    {
+        Process* p = g_allProcesses[i];
+        if (p && p->tgid == tgid)
+            __atomic_store_n(&p->tgidExiting, true, __ATOMIC_RELEASE);
+    }
     for (uint32_t i = 0; i < g_processCount; ++i)
     {
         Process* p = g_allProcesses[i];
         if (p && p != caller && p->tgid == tgid
             && p->state != ProcessState::Terminated)
         {
-            if (count < MAX_PROCESSES) targets[count++] = p;
+            if (count < MAX_PROCESSES) {
+                // BRO-173: claim teardown ownership while still holding
+                // g_allProcLock.  The reaper removes a Process from
+                // g_allProcesses (under this same lock) strictly before
+                // freeing it, so a target we select+flag here cannot be freed
+                // until we release — and once flagged, no other path will mark
+                // it reapable, so our raw `targets[]` pointers stay valid
+                // through the unlocked Phase 2 below.
+                __atomic_store_n(&p->groupKillOwned, true, __ATOMIC_RELEASE);
+                targets[count++] = p;
+            }
         }
     }
     SchedLockRelease(g_allProcLock, alf);

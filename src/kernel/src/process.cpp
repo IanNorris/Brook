@@ -1198,6 +1198,8 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->tlbCpuMask = 0;
     child->reapable = false;
     child->compositorRegistered = false;
+    child->groupKillOwned = false;   // BRO-173: fresh group, clean teardown state
+    child->tgidExiting = false;
     child->schedNext = nullptr;
     child->schedPrev = nullptr;
     child->inReadyQueue = 0;
@@ -1445,6 +1447,10 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     thread->tlbCpuMask = 0;
     thread->reapable = false;
     thread->compositorRegistered = false;
+    // BRO-173: these lifecycle latches were memcpy'd from the parent; a new
+    // thread must start with a clean teardown state.
+    thread->groupKillOwned = false;
+    thread->tgidExiting = false;
     thread->schedNext = nullptr;
     thread->schedPrev = nullptr;
     thread->inReadyQueue = 0;
@@ -1900,7 +1906,8 @@ int ProcessSendSignal(Process* proc, int signum)
         __atomic_store_n(reinterpret_cast<volatile int*>(&proc->state),
                          static_cast<int>(ProcessState::Terminated),
                          __ATOMIC_RELEASE);
-        if (!__atomic_load_n(&proc->compositorRegistered, __ATOMIC_ACQUIRE))
+        if (!__atomic_load_n(&proc->compositorRegistered, __ATOMIC_ACQUIRE)
+            && !__atomic_load_n(&proc->groupKillOwned, __ATOMIC_ACQUIRE))
             __atomic_store_n(&proc->reapable, true, __ATOMIC_RELEASE);
         DbgPrintf("SIGNAL: SIGKILL -> pid %u\n", proc->pid);
         return 0;
@@ -1982,7 +1989,8 @@ int ProcessSendSignal(Process* proc, int signum)
             __atomic_store_n(reinterpret_cast<volatile int*>(&proc->state),
                              static_cast<int>(ProcessState::Terminated),
                              __ATOMIC_RELEASE);
-            if (!__atomic_load_n(&proc->compositorRegistered, __ATOMIC_ACQUIRE))
+            if (!__atomic_load_n(&proc->compositorRegistered, __ATOMIC_ACQUIRE)
+                && !__atomic_load_n(&proc->groupKillOwned, __ATOMIC_ACQUIRE))
                 __atomic_store_n(&proc->reapable, true, __ATOMIC_RELEASE);
             DbgPrintf("SIGNAL: sig %d -> pid %u terminated (default action)\n",
                       signum, proc->pid);
