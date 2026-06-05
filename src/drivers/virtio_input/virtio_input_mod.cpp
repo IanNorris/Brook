@@ -47,8 +47,6 @@ MODULE_IMPORT_SYMBOL(InputWakeWaiters);
 MODULE_IMPORT_SYMBOL(VmmAllocPages);
 MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 MODULE_IMPORT_SYMBOL(VmmMapPage);
-MODULE_IMPORT_SYMBOL(IoApicRegisterHandler);
-MODULE_IMPORT_SYMBOL(IoApicUnregisterHandler);
 
 using namespace brook;
 
@@ -89,6 +87,15 @@ static constexpr uint8_t VIRTIO_STATUS_DRIVER_OK   = 4;
 
 // Virtqueue descriptor flags
 static constexpr uint16_t VIRTQ_DESC_F_WRITE = 2;
+
+// Avail-ring flag: ask the device not to interrupt on used-ring updates for
+// this queue. We drain the eventq purely by polling (VirtioInputPoll, called
+// every compositor frame). This is essential because the virtio INTx line is
+// SHARED (chained on the same IOAPIC vector as virtio-net): an ISR drainer
+// would run on every co-resident device's interrupt and race the poll on the
+// non-atomic used-index shadow, producing phantom "drained 100000+ events"
+// floods under load (BRO: input lockup with virtio-gpu active).
+static constexpr uint16_t VIRTQ_AVAIL_F_NO_INTERRUPT = 1;
 
 // ---------------------------------------------------------------------------
 // Linux input event types/codes
@@ -193,7 +200,6 @@ static int32_t  g_lastAbsX = 0,  g_lastAbsY = 0;
 static InputDevice g_inputDev;
 static void VirtioInputPoll(InputDevice* dev);
 static InputDeviceOps g_inputOps = { "virtio-tablet", nullptr };
-static constexpr uint8_t VIRTIO_INPUT_IRQ_VECTOR = 46;
 
 // Queue notify offset (from common config Q_NOTIFY_OFF)
 static uint16_t g_queueNotifyOff = 0;
@@ -262,6 +268,8 @@ static void FillEventQueue()
     }
     g_availIdxShadow = g_queueSize;
     *g_availIdx = g_queueSize;
+    // Poll-only: never ask the device to raise an interrupt for the eventq.
+    *g_availFlags = VIRTQ_AVAIL_F_NO_INTERRUPT;
     __asm__ volatile("mfence" ::: "memory");
 }
 
@@ -393,28 +401,6 @@ static void ProcessEvent(const VirtioInputEvent& ev)
             g_pendingX = -1;
             g_pendingY = -1;
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// IRQ handler (plain function — called by kernel's shared IRQ dispatch stub)
-// ---------------------------------------------------------------------------
-
-static void VirtioInputIrqBody()
-{
-    uint8_t isr = mmio_read8(g_isrCfg, 0);
-    (void)isr;
-
-    while (g_usedIdxShadow != *g_usedIdx)
-    {
-        uint16_t slot = g_usedIdxShadow & (g_queueSize - 1);
-        uint32_t descIdx = g_usedRing[slot].id;
-        if (descIdx < g_queueSize)
-        {
-            ProcessEvent(g_eventBufs[descIdx]);
-            RepostDescriptor(static_cast<uint16_t>(descIdx));
-        }
-        g_usedIdxShadow++;
     }
 }
 
@@ -738,13 +724,17 @@ static int VirtioInputModuleInit()
     // Enable queue.
     mmio_write16(g_commonCfg, VIRTIO_COMMON_Q_ENABLE, 1);
 
-    // Set up IRQ.
+    // Poll-only input: we deliberately do NOT register an interrupt handler.
+    // The eventq is drained from VirtioInputPoll (compositor thread) every
+    // frame, and FillEventQueue set VIRTQ_AVAIL_F_NO_INTERRUPT so the device
+    // never raises an INTx for it. Registering a handler here would chain it
+    // onto the SHARED virtio INTx vector and run it on every co-resident
+    // device's interrupt (e.g. virtio-net RX), racing the poll on the
+    // non-atomic used-index shadow → phantom event floods + input lockup.
     uint32_t intLine = PciConfigRead32(dev.bus, dev.dev, dev.fn, 0x3C) & 0xFF;
     g_irqLine = static_cast<uint8_t>(intLine);
-    SerialPrintf("virtio_input: PCI interrupt line %u\n", intLine);
-
-    IoApicRegisterHandler(static_cast<uint8_t>(intLine), VIRTIO_INPUT_IRQ_VECTOR,
-                          reinterpret_cast<void*>(VirtioInputIrqBody));
+    SerialPrintf("virtio_input: PCI interrupt line %u (poll-only, IRQ not registered)\n",
+                 intLine);
 
     // Mark device as ready.
     mmio_write8(g_commonCfg, VIRTIO_COMMON_STATUS,
@@ -771,8 +761,8 @@ static int VirtioInputModuleInit()
 
 static void VirtioInputModuleExit()
 {
-    IoApicUnregisterHandler(g_irqLine, reinterpret_cast<void*>(VirtioInputIrqBody));
-    SerialPuts("virtio_input: exit (IRQ handler unregistered)\n");
+    // Poll-only driver: no IRQ handler was registered, so nothing to unregister.
+    SerialPuts("virtio_input: exit\n");
 }
 
 DECLARE_MODULE("virtio_input", VirtioInputModuleInit, VirtioInputModuleExit,

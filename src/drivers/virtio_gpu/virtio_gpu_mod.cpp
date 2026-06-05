@@ -80,6 +80,10 @@ static constexpr uint8_t VIRTIO_STATUS_FEATURES_OK = 8;
 static constexpr uint16_t VIRTQ_DESC_F_NEXT  = 1;
 static constexpr uint16_t VIRTQ_DESC_F_WRITE = 2;
 
+// Avail-ring flag: tell the device not to interrupt on used-ring updates for
+// this queue (we poll instead). virtio 1.0 §2.6.7.
+static constexpr uint16_t VIRTQ_AVAIL_F_NO_INTERRUPT = 1;
+
 // ---------------------------------------------------------------------------
 // virtio-gpu control protocol (virtio 1.1 §5.7.6) — see VIRTIO_GPU_DOCS.md
 // ---------------------------------------------------------------------------
@@ -359,6 +363,14 @@ static bool AllocControlQueue()
     g_availRing  = reinterpret_cast<uint16_t*>(availBase + 4);
     g_usedIdx    = reinterpret_cast<volatile uint16_t*>(usedBase + 2);
     g_usedRing   = reinterpret_cast<VirtqUsedElem*>(usedBase + 4);
+
+    // We drive the controlq purely by polling the used ring (SubmitCommand),
+    // so ask the device never to raise an interrupt for it. Without this the
+    // device asserts its (shared, INTx) IRQ line on every command completion;
+    // since this driver never reads the ISR to acknowledge it, the line stays
+    // asserted → interrupt storm on the shared vector, starving the CPU and
+    // hammering the co-resident virtio-input handler (input flood + lockup).
+    *g_availFlags = VIRTQ_AVAIL_F_NO_INTERRUPT;
 
     g_descPhys   = VmmVirtToPhys(KernelPageTable, VirtualAddress(reinterpret_cast<uint64_t>(descBase))).raw();
     g_availPhys  = VmmVirtToPhys(KernelPageTable, VirtualAddress(reinterpret_cast<uint64_t>(availBase))).raw();

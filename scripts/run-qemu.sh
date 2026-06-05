@@ -299,7 +299,10 @@ if [ "$HEADLESS" -eq 1 ]; then
     fi
 else
     SERIAL_OPT="-serial stdio"
-    DISPLAY_OPT="-display sdl"
+    # BROOK_DISPLAY selects the QEMU UI backend. Default sdl; set BROOK_DISPLAY=gtk
+    # to get the View menu (switch between heads — e.g. virtio-vga's VGA surface
+    # vs the virtio-gpu scanout). gtk needs host GTK libs + a real display.
+    DISPLAY_OPT="-display ${BROOK_DISPLAY:-sdl}"
 fi
 
 # Network device selection: default is user-mode slirp with tcp host-forward.
