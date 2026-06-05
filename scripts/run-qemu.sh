@@ -351,6 +351,60 @@ else
     GPU_OPTS="-device virtio-gpu-pci,id=vgpu"
 fi
 
+# ---------------------------------------------------------------------------
+# Hardware-accelerated GPU mode (BROOK_GPU=gl | venus).
+#
+# Switches the secondary head to virtio-gpu-gl (Virgl/Venus 3D transport) and
+# the display to egl-headless backed by the host's DRM render node, so 3D
+# command streams are executed on the real host GPU.  Requires a QEMU built
+# with virglrenderer + OpenGL display support and a working host GL/Vulkan
+# stack — neither is in the Brook dev shell's QEMU (10.x, no virgl), so we
+# resolve nixpkgs#qemu_full + mesa + libglvnd on demand and point the EGL/GBM
+# loader at them.  In-container the render node is the host Intel iGPU.
+#
+#   BROOK_GPU=gl    : Virgl (GL) + Venus capset available; blob resources on.
+#   BROOK_GPU=venus : as gl, plus host-visible blob memory (memfd machine RAM)
+#                     for Vulkan vkMapMemory — the Venus end-to-end target.
+#
+# Screendump still works via the QEMU monitor (egl-headless renders to an
+# offscreen scanout the monitor can capture).
+MEM_BACKEND_OPTS=""
+if [ -n "${BROOK_GPU:-}" ] && [ "${BROOK_GPU}" != "0" ]; then
+    GPU_RENDERNODE="${BROOK_RENDERNODE:-/dev/dri/renderD128}"
+    if [ ! -e "${GPU_RENDERNODE}" ]; then
+        echo "ERROR: BROOK_GPU=${BROOK_GPU} needs a DRM render node at ${GPU_RENDERNODE} (none found)." >&2
+        exit 1
+    fi
+    echo "  GPU:  hardware mode '${BROOK_GPU}' via ${GPU_RENDERNODE} (resolving qemu_full + mesa)..."
+    # Resolve a virgl/venus-capable QEMU and the matching host GL stack.  Each
+    # may be pre-provided via env (BROOK_GPU_QEMU / BROOK_GPU_MESA /
+    # BROOK_GPU_GLVND) to skip the nix lookups — useful when backgrounding,
+    # where a concurrent `nix build` can stall on a held eval lock.
+    QEMU_FULL_PATH="${BROOK_GPU_QEMU:-$(nix build --no-link --print-out-paths nixpkgs#qemu_full 2>/dev/null | tail -1)}"
+    MESA_PATH="${BROOK_GPU_MESA:-$(nix build --no-link --print-out-paths nixpkgs#mesa 2>/dev/null | tail -1)}"
+    GLVND_PATH="${BROOK_GPU_GLVND:-$(nix build --no-link --print-out-paths nixpkgs#libglvnd 2>/dev/null | tail -1)}"
+    if [ -z "${QEMU_FULL_PATH}" ] || [ -z "${MESA_PATH}" ] || [ -z "${GLVND_PATH}" ]; then
+        echo "ERROR: failed to resolve qemu_full/mesa/libglvnd via nix." >&2
+        exit 1
+    fi
+    QEMU_BIN="${QEMU_FULL_PATH}/bin/qemu-system-x86_64"
+    # Point QEMU's bundled libgbm/EGL (libglvnd) at the full mesa backends.
+    export GBM_BACKENDS_PATH="${MESA_PATH}/lib/gbm"
+    export LIBGL_DRIVERS_PATH="${MESA_PATH}/lib/dri"
+    export __EGL_VENDOR_LIBRARY_DIRS="${MESA_PATH}/share/glvnd/egl_vendor.d"
+    export LD_LIBRARY_PATH="${GLVND_PATH}/lib:${MESA_PATH}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    DISPLAY_OPT="-display egl-headless,rendernode=${GPU_RENDERNODE}"
+    if [ "${BROOK_GPU}" = "venus" ]; then
+        GPU_OPTS="-device virtio-gpu-gl-pci,id=vgpu,blob=true,venus=true,hostmem=${BROOK_GPU_HOSTMEM:-4G}"
+        # Host-visible blob memory needs shareable machine RAM (memfd). The
+        # ,memory-backend=mem1 suffix is appended to the -machine q35 line.
+        MEM_BACKEND_OPTS="-object memory-backend-memfd,id=mem1,size=8G,share=on"
+        MACHINE_MEMBACKEND=",memory-backend=mem1"
+    else
+        GPU_OPTS="-device virtio-gpu-gl-pci,id=vgpu,blob=true"
+    fi
+fi
+
 KVM_FLAGS=""
 if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] && [ "${NO_KVM:-}" != "1" ]; then
     KVM_FLAGS="-enable-kvm -cpu host"
@@ -380,11 +434,12 @@ if [ ! -f "${USB_TEST_IMG}" ]; then
     echo "Created 32MB USB test disk"
 fi
 
-qemu-system-x86_64 \
-    -machine q35 \
+${QEMU_BIN:-qemu-system-x86_64} \
+    -machine q35${MACHINE_MEMBACKEND:-} \
     ${KVM_FLAGS} \
     -smp "${BROOK_SMP:-8}" \
     -m 8G \
+    ${MEM_BACKEND_OPTS:-} \
     -drive if=pflash,format=raw,readonly=on,file="${OVMF_CODE}" \
     -drive if=pflash,format=raw,file="${OVMF_VARS_COPY}" \
     $(if [ -n "${ESP_IMG}" ]; then echo "-drive if=ide,format=raw,file=${ESP_IMG}"; else echo "-drive format=raw,file=fat:rw:${ESP_OVERRIDE:-${BUILD_DIR}/esp}"; fi) \
