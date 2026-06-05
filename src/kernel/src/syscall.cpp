@@ -1465,7 +1465,7 @@ struct FdRef
 // buffer; sendfile passes a kernel bounce buffer that is always readable).
 // Handles every fd type: serial, vnode, framebuffer, /dev/null, dsp, tty,
 // pipe, eventfd, socket, memfd, unix-socket.
-static int64_t WriteFdBytes(uint64_t fd, uint64_t bufAddr, uint64_t count)
+static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count)
 {
     // fd 3 = debug serial — writes directly, bypassing the async ring buffer.
     // Hold the serial lock across the entire write so multi-CPU output
@@ -1927,6 +1927,8 @@ static int64_t WriteFdBytes(uint64_t fd, uint64_t bufAddr, uint64_t count)
         return static_cast<int64_t>(written);
     }
 
+    // No fd-type handler above matched — unknown/unsupported descriptor.
+    // (This is the terminal return of WriteToFdByType, not sys_write.)
     return -EBADF;
 }
 
@@ -1937,7 +1939,7 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
     // range is unmapped — without this, a bad user pointer faults the kernel.
     if (count > 0 && !UserBufferReadable(bufAddr, count))
         return -EFAULT;
-    return WriteFdBytes(fd, bufAddr, count);
+    return WriteToFdByType(fd, bufAddr, count);
 }
 
 // ---------------------------------------------------------------------------
@@ -8806,7 +8808,7 @@ static int64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd, uint64_t offsetAddr
         // (BRO: previously this only handled FdType::Vnode, so sendfile to a
         // TTY/pipe — e.g. busybox `cat` to stdout — silently returned 0.)
         int wr = static_cast<int>(
-            WriteFdBytes(out_fd, reinterpret_cast<uint64_t>(bounce),
+            WriteToFdByType(out_fd, reinterpret_cast<uint64_t>(bounce),
                          static_cast<uint64_t>(rd)));
         if (wr <= 0) break;
 
