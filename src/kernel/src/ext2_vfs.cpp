@@ -1685,6 +1685,7 @@ static const VnodeOps g_ext2FileOps = {
     .readdir = nullptr,
     .close   = Ext2FileClose,
     .stat    = Ext2FileStat,
+    .fsync   = nullptr,
 };
 
 static const VnodeOps g_ext2DirOps = {
@@ -1694,6 +1695,7 @@ static const VnodeOps g_ext2DirOps = {
     .readdir = Ext2DirReaddir,
     .close   = Ext2DirClose,
     .stat    = Ext2DirStat,
+    .fsync   = nullptr,
 };
 
 // ---------------------------------------------------------------------------

@@ -180,7 +180,7 @@ static int ProcFileStat(Vnode* vn, VnodeStat* st)
 }
 
 static VnodeOps g_procFileOps = {
-    ProcFileOpen, ProcFileRead, ProcFileWrite, nullptr, ProcFileClose, ProcFileStat
+    ProcFileOpen, ProcFileRead, ProcFileWrite, nullptr, ProcFileClose, ProcFileStat, nullptr
 };
 
 // VnodeOps for procfs directories (readdir support)
@@ -205,15 +205,15 @@ static int ProcDirStat(Vnode* vn, VnodeStat* st)
 }
 
 static VnodeOps g_procFdDirOps = {
-    ProcFileOpen, ProcDirRead, ProcFileWrite, ProcFdReaddir, ProcDirClose, ProcDirStat
+    ProcFileOpen, ProcDirRead, ProcFileWrite, ProcFdReaddir, ProcDirClose, ProcDirStat, nullptr
 };
 
 static VnodeOps g_procRootDirOps = {
-    ProcFileOpen, ProcDirRead, ProcFileWrite, ProcRootReaddir, ProcDirClose, ProcDirStat
+    ProcFileOpen, ProcDirRead, ProcFileWrite, ProcRootReaddir, ProcDirClose, ProcDirStat, nullptr
 };
 
 static VnodeOps g_procPidDirOps = {
-    ProcFileOpen, ProcDirRead, ProcFileWrite, ProcPidReaddir, ProcDirClose, ProcDirStat
+    ProcFileOpen, ProcDirRead, ProcFileWrite, ProcPidReaddir, ProcDirClose, ProcDirStat, nullptr
 };
 
 // ---- Helper: create a procfs vnode from a buffer ----

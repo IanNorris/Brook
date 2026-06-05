@@ -225,6 +225,19 @@ static void FatFileClose(Vnode* vn)
     KMutexUnlock(&g_fatLock);
 }
 
+static int FatFileFsync(Vnode* vn)
+{
+    if (vn->type != VnodeType::File) return -1;
+    FIL* fil = static_cast<FIL*>(vn->priv);
+    KMutexLock(&g_fatLock);
+    // f_sync flushes the file's cached window AND rewrites the directory
+    // entry (size, first cluster, timestamps) + FAT, so the on-disk file is
+    // valid even if the system loses power before f_close.
+    FRESULT res = f_sync(fil);
+    KMutexUnlock(&g_fatLock);
+    return res == FR_OK ? 0 : -1;
+}
+
 static int FatStat(Vnode* vn, VnodeStat* st)
 {
     if (vn->type == VnodeType::File) {
@@ -282,16 +295,19 @@ static int CachedFileStat(Vnode* vn, VnodeStat* st)
 static const VnodeOps g_cachedFileOps = {
     .open = FatFileOpen, .read = CachedFileRead, .write = nullptr,
     .readdir = nullptr, .close = CachedFileClose, .stat = CachedFileStat,
+    .fsync = nullptr,
 };
 
 static const VnodeOps g_fatFileOps = {
     .open = FatFileOpen, .read = FatFileRead, .write = FatFileWrite,
     .readdir = nullptr, .close = FatFileClose, .stat = FatStat,
+    .fsync = FatFileFsync,
 };
 
 static const VnodeOps g_fatDirOps = {
     .open = FatFileOpen, .read = nullptr, .write = nullptr,
     .readdir = FatDirReaddir, .close = FatFileClose, .stat = FatStat,
+    .fsync = nullptr,
 };
 
 // ---- VfsFsOps callbacks ----
