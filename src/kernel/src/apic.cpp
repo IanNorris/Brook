@@ -6,6 +6,7 @@
 #include "portio.h"
 #include "smp.h"
 #include "spinlock.h"
+#include "panic.h"
 
 // Declared at global scope in idt.cpp
 void IdtInstallHandler(uint8_t vector, void* handler);
@@ -272,6 +273,24 @@ void ValidateIretFrame(const uint64_t* frame)
 extern "C" void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interruptedCs,
                                     uint64_t interruptedRbp)
 {
+    // BRO-166 invariant guard. In ring 0 the active GS base must be this CPU's
+    // KernelCpuEnv (a kernel-canonical, high-half address). If a SWAPGS
+    // imbalance left it at the user value (0, or any non-kernel address) the
+    // first gs-relative access below (e.g. SmpCurrentCpuIndex's gs:176) would
+    // #PF at a low address — or silently read garbage and corrupt g_perCpu[].
+    // Read the base via rdmsr (NOT gs-relative — a gs read would itself fault
+    // when the base is 0) and fail loudly with the interrupted context instead.
+    {
+        constexpr uint32_t IA32_GS_BASE_MSR = 0xC0000101;
+        uint64_t gsBase = ReadMsr(IA32_GS_BASE_MSR);
+        if (gsBase < 0xFFFF800000000000ULL)
+        {
+            KernelPanic("BRO-166: LAPIC timer ISR with bad GS base 0x%lx — "
+                        "interrupted RIP=0x%lx CS=0x%lx RBP=0x%lx",
+                        gsBase, interruptedRip, interruptedCs, interruptedRbp);
+        }
+    }
+
     LapicWrite(LapicReg::EOI, 0);
 
     // Only BSP maintains the global tick and composites framebuffers.
