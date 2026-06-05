@@ -94,9 +94,27 @@ static constexpr uint32_t VIRTIO_GPU_CMD_SET_SCANOUT           = 0x0103;
 static constexpr uint32_t VIRTIO_GPU_CMD_RESOURCE_FLUSH        = 0x0104;
 static constexpr uint32_t VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D   = 0x0105;
 static constexpr uint32_t VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING = 0x0106;
+static constexpr uint32_t VIRTIO_GPU_CMD_GET_CAPSET_INFO      = 0x0107;
 static constexpr uint32_t VIRTIO_GPU_RESP_OK_NODATA           = 0x1100;
 static constexpr uint32_t VIRTIO_GPU_RESP_OK_DISPLAY_INFO     = 0x1101;
+static constexpr uint32_t VIRTIO_GPU_RESP_OK_CAPSET_INFO      = 0x1102;
 static constexpr uint32_t VIRTIO_GPU_MAX_SCANOUTS            = 16;
+
+// virtio-gpu 3D feature bits (page 0 / low 32, virtio 1.2 §5.7.3). These gate
+// the Virgl/Venus 3D transport the GPU-accel roadmap is built on.
+static constexpr uint32_t VIRTIO_GPU_F_VIRGL         = 1u << 0;  // 3D rendering (Virgl/Venus capsets)
+static constexpr uint32_t VIRTIO_GPU_F_EDID          = 1u << 1;  // GET_EDID
+static constexpr uint32_t VIRTIO_GPU_F_RESOURCE_UUID = 1u << 2;  // ASSIGN_UUID (dmabuf export)
+static constexpr uint32_t VIRTIO_GPU_F_RESOURCE_BLOB = 1u << 3;  // blob resources (host-visible memory)
+static constexpr uint32_t VIRTIO_GPU_F_CONTEXT_INIT  = 1u << 4;  // per-context capset selection (Venus needs this)
+
+// Capset ids reported by GET_CAPSET_INFO (Linux drm/virtgpu + Mesa).
+static constexpr uint32_t VIRTIO_GPU_CAPSET_VIRGL       = 1;
+static constexpr uint32_t VIRTIO_GPU_CAPSET_VIRGL2      = 2;
+static constexpr uint32_t VIRTIO_GPU_CAPSET_GFXSTREAM   = 3;
+static constexpr uint32_t VIRTIO_GPU_CAPSET_VENUS       = 4;
+static constexpr uint32_t VIRTIO_GPU_CAPSET_CROSS_DOMAIN= 5;
+static constexpr uint32_t VIRTIO_GPU_CAPSET_DRM         = 6;
 
 // Brook framebuffer is Bgr8 (memory bytes B,G,R,X) → B8G8R8X8_UNORM.
 static constexpr uint32_t VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM   = 2;
@@ -169,6 +187,30 @@ struct __attribute__((packed)) VirtioGpuResourceFlush {
     uint32_t padding;
 };
 
+// GET_CAPSET_INFO: enumerate the host 3D capsets (virgl, virgl2, venus, …).
+struct __attribute__((packed)) VirtioGpuGetCapsetInfo {
+    VirtioGpuCtrlHdr hdr;
+    uint32_t capset_index;
+    uint32_t padding;
+};
+
+struct __attribute__((packed)) VirtioGpuRespCapsetInfo {
+    VirtioGpuCtrlHdr hdr;
+    uint32_t capset_id;
+    uint32_t capset_max_version;
+    uint32_t capset_max_size;
+    uint32_t padding;
+};
+
+// virtio-gpu device config (virtio 1.2 §5.7.4). num_capsets is meaningful only
+// when VIRGL is negotiated (0 on a plain 2D device).
+enum VirtioGpuConfigReg : uint32_t {
+    VIRTIO_GPU_CFG_EVENTS_READ  = 0x00,
+    VIRTIO_GPU_CFG_EVENTS_CLEAR = 0x04,
+    VIRTIO_GPU_CFG_NUM_SCANOUTS = 0x08,
+    VIRTIO_GPU_CFG_NUM_CAPSETS  = 0x0C,
+};
+
 // ---------------------------------------------------------------------------
 // Virtqueue structures
 // ---------------------------------------------------------------------------
@@ -216,6 +258,13 @@ static volatile uint8_t* g_isrCfg    = nullptr;
 static volatile uint8_t* g_deviceCfg = nullptr;
 static uint32_t          g_notifyMultiplier = 0;
 static uint16_t          g_queueNotifyOff = 0;
+
+// Negotiated 3D feature set (page-0 device features ∩ what we accept). Zero on a
+// plain virtio-gpu-pci (2D) device. g_numCapsets is read from device config once
+// VIRGL is live and gates the Venus/Virgl bring-up (Phase B onward).
+static uint32_t          g_gpu3dFeatures = 0;
+static uint32_t          g_numCapsets = 0;
+static bool              g_haveVenusCapset = false;
 
 // controlq (queue 0)
 static uint16_t            g_queueSize = 0;
@@ -477,7 +526,76 @@ static bool QueryDisplayInfo()
 }
 
 // ---------------------------------------------------------------------------
-// 2D resource / scanout commands. Each builds its request in g_cmdBuf and
+// GET_CAPSET_INFO — enumerate host 3D capsets (Phase A).
+// Only meaningful once VIRGL is negotiated; on a 2D device num_capsets==0 and
+// this is skipped. Logs each capset and records whether Venus is available,
+// which the later DRM-shim / Venus bring-up (Phases B–C) depends on.
+//
+// KNOWN ISSUE (qemu 11.0 virtio-gpu-gl): GET_CAPSET_INFO currently comes back
+// as RESP_OK_NODATA (0x1100) rather than RESP_OK_CAPSET_INFO (0x1102), even
+// though the request carries the correct type (0x107) and num_capsets reads as
+// 2.  Per the QEMU source the virgl dispatch handles 0x107 and would respond
+// 0x1102, so the OK_NODATA fallthrough implies the command is being routed as a
+// context/ring op — the prime suspect is our VIRTIO_GPU_F_CONTEXT_INIT
+// negotiation (which makes ring_idx/flags significant) or an async-fence
+// used-ring interaction.  Resolving it needs QEMU virgl tracing (-d) rather
+// than static analysis; tracked as a follow-up.  num_capsets>0 already proves
+// the 3D transport is live, which is what Phase B/C gate on.
+// ---------------------------------------------------------------------------
+
+static const char* CapsetName(uint32_t id)
+{
+    switch (id)
+    {
+        case VIRTIO_GPU_CAPSET_VIRGL:        return "virgl";
+        case VIRTIO_GPU_CAPSET_VIRGL2:       return "virgl2";
+        case VIRTIO_GPU_CAPSET_GFXSTREAM:    return "gfxstream";
+        case VIRTIO_GPU_CAPSET_VENUS:        return "venus";
+        case VIRTIO_GPU_CAPSET_CROSS_DOMAIN: return "cross-domain";
+        case VIRTIO_GPU_CAPSET_DRM:          return "drm-native";
+        default:                             return "unknown";
+    }
+}
+
+static void QueryCapsets()
+{
+    if (!(g_gpu3dFeatures & VIRTIO_GPU_F_VIRGL))
+        return;  // 2D-only device; no 3D capsets to enumerate.
+
+    g_numCapsets = mmio_read32(g_deviceCfg, VIRTIO_GPU_CFG_NUM_CAPSETS);
+    SerialPrintf("virtio_gpu: 3D enabled, num_capsets=%u\n", g_numCapsets);
+
+    for (uint32_t i = 0; i < g_numCapsets; ++i)
+    {
+        memset(g_cmdBuf, 0, 4096);
+        auto* req = reinterpret_cast<VirtioGpuGetCapsetInfo*>(g_cmdBuf + CMD_REQ_OFF);
+        req->hdr.type     = VIRTIO_GPU_CMD_GET_CAPSET_INFO;
+        req->capset_index = i;
+
+        uint32_t respLen = SubmitCommand(sizeof(VirtioGpuGetCapsetInfo),
+                                         sizeof(VirtioGpuRespCapsetInfo));
+        auto* resp = reinterpret_cast<VirtioGpuRespCapsetInfo*>(g_cmdBuf + CMD_RESP_OFF);
+        if (respLen < sizeof(VirtioGpuRespCapsetInfo) ||
+            resp->hdr.type != VIRTIO_GPU_RESP_OK_CAPSET_INFO)
+        {
+            SerialPrintf("virtio_gpu: GET_CAPSET_INFO[%u] failed (len=%u type=0x%x)\n",
+                         i, respLen, resp->hdr.type);
+            continue;
+        }
+
+        SerialPrintf("virtio_gpu: capset[%u] id=%u (%s) max_version=%u max_size=%u\n",
+                     i, resp->capset_id, CapsetName(resp->capset_id),
+                     resp->capset_max_version, resp->capset_max_size);
+
+        if (resp->capset_id == VIRTIO_GPU_CAPSET_VENUS &&
+            resp->capset_max_version > 0)
+            g_haveVenusCapset = true;
+    }
+
+    if (g_haveVenusCapset)
+        SerialPuts("virtio_gpu: Venus capset present — Vulkan transport available\n");
+}
+
 // checks the device returned RESP_OK_NODATA.
 // ---------------------------------------------------------------------------
 
@@ -693,11 +811,30 @@ static int VirtioGpuModuleInit()
     mmio_write8(g_commonCfg, VIRTIO_COMMON_STATUS,
                 VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
 
-    // Feature negotiation: accept only VIRTIO_F_VERSION_1 (page 1, bit 0).
+    // Feature negotiation.
+    //   Page 0 (low 32 bits): virtio-gpu device features. We surface and accept
+    //   the 3D-transport features the GPU-accel roadmap needs — VIRGL (3D),
+    //   RESOURCE_BLOB (host-visible memory) and CONTEXT_INIT (per-context capset,
+    //   required by Venus) — but only those the device actually offers. On a
+    //   plain virtio-gpu-pci (2D) device none are offered and we fall through to
+    //   the existing 2D behaviour unchanged. Accepting VIRGL does NOT disturb the
+    //   2D path (GET_DISPLAY_INFO / RESOURCE_CREATE_2D / SET_SCANOUT still work);
+    //   it only unlocks the capset query + future 3D contexts.
+    //   Page 1 (bits 32-63): transport features; accept VIRTIO_F_VERSION_1 only.
     mmio_write32(g_commonCfg, VIRTIO_COMMON_DFSELECT, 0);
-    (void)mmio_read32(g_commonCfg, VIRTIO_COMMON_DF);
+    uint32_t devF0 = mmio_read32(g_commonCfg, VIRTIO_COMMON_DF);
+    const uint32_t wanted0 = VIRTIO_GPU_F_VIRGL | VIRTIO_GPU_F_RESOURCE_BLOB |
+                             VIRTIO_GPU_F_CONTEXT_INIT;
+    g_gpu3dFeatures = devF0 & wanted0;
+    SerialPrintf("virtio_gpu: device features page0=0x%x [virgl=%d edid=%d uuid=%d blob=%d ctx_init=%d]\n",
+                 devF0,
+                 (devF0 & VIRTIO_GPU_F_VIRGL)         ? 1 : 0,
+                 (devF0 & VIRTIO_GPU_F_EDID)          ? 1 : 0,
+                 (devF0 & VIRTIO_GPU_F_RESOURCE_UUID) ? 1 : 0,
+                 (devF0 & VIRTIO_GPU_F_RESOURCE_BLOB) ? 1 : 0,
+                 (devF0 & VIRTIO_GPU_F_CONTEXT_INIT)  ? 1 : 0);
     mmio_write32(g_commonCfg, VIRTIO_COMMON_GFSELECT, 0);
-    mmio_write32(g_commonCfg, VIRTIO_COMMON_GF, 0);
+    mmio_write32(g_commonCfg, VIRTIO_COMMON_GF, g_gpu3dFeatures);
     mmio_write32(g_commonCfg, VIRTIO_COMMON_DFSELECT, 1);
     uint32_t devF1 = mmio_read32(g_commonCfg, VIRTIO_COMMON_DF);
     mmio_write32(g_commonCfg, VIRTIO_COMMON_GFSELECT, 1);
@@ -751,6 +888,10 @@ static int VirtioGpuModuleInit()
         SerialPuts("virtio_gpu: GET_DISPLAY_INFO failed\n");
         return -1;
     }
+
+    // Phase A: enumerate host 3D capsets (no-op on a 2D device). This proves the
+    // VIRGL negotiation + capset-query path that the Venus/DRM bring-up builds on.
+    QueryCapsets();
 
     // Take over the display only when we are the PRIMARY device — i.e. a
     // VGA-class device (virtio-vga, PCI subclass 0x00) that provided the boot
