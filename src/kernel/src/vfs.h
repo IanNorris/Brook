@@ -34,6 +34,12 @@ struct VnodeOps {
     void (*close) (Vnode* vn);
     // Fill stat.  Returns 0 on success.
     int (*stat)   (Vnode* vn, VnodeStat* st);
+    // Flush this file's buffered data AND its directory entry (size/clusters)
+    // to the backing device.  Optional; nullptr if the FS has no per-file
+    // sync.  Distinct from the per-mount VfsSync hook: this targets one open
+    // file so callers (e.g. the profiler) can make a long-lived file durable
+    // mid-write without closing it.
+    int (*fsync)  (Vnode* vn);
 };
 
 struct Vnode {
@@ -206,5 +212,11 @@ extern "C" void VfsClose(Vnode* vn);
 
 // Flush pending writes on a writable file vnode.
 int VfsSync(Vnode* vn);
+
+// Flush a single open file's data + directory entry to the backing device.
+// Unlike VfsSync (per-mount), this persists the on-disk size of one file so a
+// long-lived writer survives an abrupt poweroff without an explicit close.
+// Returns 0 on success, <0 if the file's FS has no fsync hook.
+int VfsFsync(Vnode* vn);
 
 } // namespace brook
