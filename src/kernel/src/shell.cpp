@@ -1249,6 +1249,48 @@ static int ExecCommand(int argc, const char* const* argv)
         return 0;
     }
 
+    // Built-in: composite [alpha [pct] | opaque] — toggle the screen-space
+    // compositing model.  `alpha` enables translucent back-to-front
+    // compositing (GPU-runway test vehicle); an optional percentage sets the
+    // per-desktop window opacity (default 85%).  `opaque` restores the
+    // production path.  No argument prints the current mode.
+    if (StrEq(cmd, "composite"))
+    {
+        if (argc < 2)
+        {
+            uint8_t op = 255;
+            bool alpha = CompositorGetCompositeMode(&op);
+            KPrintf("composite: %s (window opacity %u%%)\n",
+                    alpha ? "alpha (translucent)" : "opaque",
+                    (op * 100u) / 255u);
+            return 0;
+        }
+        if (StrEq(argv[1], "opaque"))
+        {
+            CompositorSetCompositeMode(false, 255);
+            KPrintf("composite: opaque\n");
+            return 0;
+        }
+        if (StrEq(argv[1], "alpha"))
+        {
+            uint32_t pct = 85;
+            if (argc >= 3)
+            {
+                pct = 0;
+                const char* s = argv[2];
+                while (*s >= '0' && *s <= '9')
+                    pct = pct * 10 + static_cast<uint32_t>(*s++ - '0');
+                if (pct > 100) pct = 100;
+            }
+            uint8_t op = static_cast<uint8_t>((pct * 255u) / 100u);
+            CompositorSetCompositeMode(true, op);
+            KPrintf("composite: alpha (window opacity %u%%)\n", pct);
+            return 0;
+        }
+        KPrintf("usage: composite [alpha [pct] | opaque]\n");
+        return 0;
+    }
+
     // Built-in: heap [check|poison on|poison off] — heap diagnostics
     if (StrEq(cmd, "heap"))
     {

@@ -46,6 +46,15 @@ extern "C" void CompositorWake();
 // Called by the TTY after rendering text into the backbuffer.
 void CompositorMarkDirty();
 
+// Screen-space compositing model toggle (test vehicle for the GPU-composition
+// runway).  alpha=true switches to back-to-front translucent compositing with
+// the given per-desktop window opacity (0-255); alpha=false restores the
+// production opaque/partial-repaint path.  Forces a full repaint on change.
+void CompositorSetCompositeMode(bool alpha, uint8_t opacity);
+// Reports the current mode.  Returns true if alpha (translucent) mode is
+// active; *opacity (if non-null) receives the current per-desktop opacity.
+bool CompositorGetCompositeMode(uint8_t* opacity);
+
 // Begin a WM drag operation for a window at the current mouse position.
 // Used by Wayland clients via xdg_toplevel.move when they draw their own chrome.
 bool CompositorBeginWindowMove(int windowIdx);

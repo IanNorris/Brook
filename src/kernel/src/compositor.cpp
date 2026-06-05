@@ -54,6 +54,22 @@ static inline void MarkAllDirty()
 // MMIO flush.
 static volatile bool g_needsFullRepaint = true;
 
+// Compositing model.  Opaque (default) is the production path: windows are
+// blitted with per-pixel source alpha and the partial-repaint optimization
+// skips occluded/unchanged windows.  Alpha is the screen-space-transparency
+// test vehicle for the GPU-composition runway (see brook-3d-accel-design.md):
+// every window is composited back-to-front over the full scene each frame
+// with an additional per-desktop opacity, so an opaque window becomes
+// translucent and reveals the wallpaper/windows behind it.  This deliberately
+// mirrors the data-flow a Venus/Vulkan GPU compositor will use — full
+// back-to-front composite per frame, no occlusion shortcuts — so the two
+// paths can be compared.  Toggled at runtime via the `composite` shell builtin.
+enum class CompositeMode : uint8_t { Opaque, Alpha };
+static volatile CompositeMode g_compositeMode = CompositeMode::Opaque;
+// Per-desktop window opacity applied in Alpha mode (0 = fully transparent,
+// 255 = fully opaque).  Folded into each pixel's source alpha.
+static volatile uint8_t g_windowOpacity = 217; // ~0.85 — visibly translucent
+
 // Registered process slots for compositing.
 static constexpr uint32_t MAX_COMPOSITED = 64;
 static Process* g_compositedProcs[MAX_COMPOSITED] = {};
@@ -533,8 +549,22 @@ static void BlitProcess(Process* proc, bool forceAll)
 
 // Blit a process VFB at an explicit destination (for WM-managed windows).
 // Supports integer upscaling via nearest-neighbor (for DOOM at 320×200 → 4×).
+// Blend an opaque (XRGB) source pixel over a destination at a constant
+// opacity (0-255).  Used for screen-space window transparency of content
+// whose buffers carry no meaningful per-pixel alpha (terminals, DOOM, etc.).
+static inline uint32_t BlendConstOpacity(uint32_t sp, uint32_t dp,
+                                         uint32_t a, uint32_t inv)
+{
+    uint32_t sr = (sp >> 16) & 0xff, sg = (sp >> 8) & 0xff, sb = sp & 0xff;
+    uint32_t dr = (dp >> 16) & 0xff, dg = (dp >> 8) & 0xff, db = dp & 0xff;
+    uint32_t r = (sr * a + dr * inv + 127) / 255;
+    uint32_t g = (sg * a + dg * inv + 127) / 255;
+    uint32_t b = (sb * a + db * inv + 127) / 255;
+    return 0xff000000u | (r << 16) | (g << 8) | b;
+}
+
 static void BlitProcessAt(Process* proc, int dstX0, int dstY0, bool forceAll,
-                           uint8_t upscale = 1)
+                           uint8_t upscale = 1, uint8_t opacity = 255)
 {
     // Snapshot VFB pointer atomically to avoid TOCTOU race with process exit
     // (another CPU may null fbVirtual between check and use).
@@ -575,7 +605,17 @@ static void BlitProcessAt(Process* proc, int dstX0, int dstY0, bool forceAll,
             uint32_t* dstRow = dstBase +
                 static_cast<uint32_t>(dstY0 + dy) * dstStride +
                 static_cast<uint32_t>(dstX0 + startDx);
-            __builtin_memcpy(dstRow, srcRow, copyWidth);
+            if (opacity == 255)
+            {
+                __builtin_memcpy(dstRow, srcRow, copyWidth);
+            }
+            else
+            {
+                const uint32_t a = opacity, inv = 255u - opacity;
+                const uint32_t n = endDx - startDx;
+                for (uint32_t dx = 0; dx < n; ++dx)
+                    dstRow[dx] = BlendConstOpacity(srcRow[dx], dstRow[dx], a, inv);
+            }
         }
     }
     else
@@ -598,6 +638,7 @@ static void BlitProcessAt(Process* proc, int dstX0, int dstY0, bool forceAll,
         MarkDirtyRows(static_cast<uint32_t>(dstY0) + startDy,
                       static_cast<uint32_t>(dstY0) + endDy);
 
+        const uint32_t a = opacity, inv = 255u - opacity;
         for (uint32_t dy = startDy; dy < endDy; ++dy)
         {
             uint32_t srcY = dy / upscale;
@@ -611,7 +652,9 @@ static void BlitProcessAt(Process* proc, int dstX0, int dstY0, bool forceAll,
             {
                 uint32_t srcX = dx / upscale;
                 if (srcX >= srcW) break;
-                dstRow[dx] = srcRow[srcX];
+                dstRow[dx] = (opacity == 255)
+                    ? srcRow[srcX]
+                    : BlendConstOpacity(srcRow[srcX], dstRow[dx], a, inv);
             }
         }
     }
@@ -620,9 +663,14 @@ static void BlitProcessAt(Process* proc, int dstX0, int dstY0, bool forceAll,
 // Blit a kernel-resident VFB at an explicit destination.  Used for
 // per-window VFBs (Window::vfb) — separate from the per-process
 // `BlitProcessAt` so we don't need to fake a Process struct.
+//
+// `opacity` (0-255) scales every source pixel's alpha, enabling screen-space
+// window transparency in Alpha composite mode.  At 255 (the default) the
+// behaviour is identical to a plain per-pixel-alpha blit, including the
+// all-opaque memcpy fast path.
 static void BlitWindowVfb(const uint32_t* src,
                            uint32_t srcW, uint32_t srcH, uint32_t srcStride,
-                           int dstX0, int dstY0)
+                           int dstX0, int dstY0, uint8_t opacity = 255)
 {
     if (!src || srcW == 0) return;
     uint32_t* dstBase = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
@@ -656,7 +704,9 @@ static void BlitWindowVfb(const uint32_t* src,
         // the row is almost certainly all opaque — use memcpy.  This is
         // correct for solid UI content and video.  CSD windows have
         // transparent shadow edges, so checking both endpoints catches them.
-        if ((srcRow[0] >> 24) == 255 && (srcRow[rowLen - 1] >> 24) == 255)
+        // Only valid at full opacity; translucent compositing must blend.
+        if (opacity == 255 &&
+            (srcRow[0] >> 24) == 255 && (srcRow[rowLen - 1] >> 24) == 255)
         {
             __builtin_memcpy(dstRow, srcRow, rowLen * 4);
             continue;
@@ -666,6 +716,9 @@ static void BlitWindowVfb(const uint32_t* src,
         {
             uint32_t sp = srcRow[dx];
             uint32_t a = sp >> 24;
+            // Fold per-desktop opacity into the source alpha.
+            if (opacity != 255)
+                a = (a * opacity + 127) / 255;
             if (a == 0)
                 continue;
             if (a == 255)
@@ -949,8 +1002,16 @@ static void CompositorLoopWM()
 
     // Determine if we need a full scene repaint (wallpaper + all windows)
     // or can get away with only re-blitting windows whose VFB content changed.
+    const bool alphaMode = (g_compositeMode == CompositeMode::Alpha);
     bool fullRepaint = forceAll
                      || __atomic_exchange_n(&g_needsFullRepaint, false, __ATOMIC_ACQ_REL);
+
+    // Translucent windows reveal whatever is behind them, so the partial-repaint
+    // occlusion shortcuts are invalid: the whole scene must be recomposited
+    // back-to-front every frame.  This is intentional — it matches the cost
+    // model of a GPU compositor and lets the two paths be compared.
+    if (alphaMode) fullRepaint = true;
+    const uint8_t winOpacity = alphaMode ? g_windowOpacity : 255;
 
     // 1. Draw wallpaper only when the scene structure changed
     if (fullRepaint)
@@ -1023,7 +1084,7 @@ static void CompositorLoopWM()
             uint32_t blitH = w->clientH < vfbH ? w->clientH : vfbH;
             if (blitW && blitH)
                 BlitWindowVfb(localVfb, blitW, blitH, localStride,
-                              w->clientX(), w->clientY());
+                              w->clientX(), w->clientY(), winOpacity);
             w->vfbDirty = 0;  // single-writer (compositor thread), no race
         }
         else if (p->state != ProcessState::Terminated && p->fbVfbWidth > 0)
@@ -1031,7 +1092,7 @@ static void CompositorLoopWM()
             if (!fullRepaint && !p->fbDirty && !anyBelowBlitted)
                 continue;
             anyBelowBlitted = true;
-            BlitProcessAt(p, w->clientX(), w->clientY(), true, w->upscale);
+            BlitProcessAt(p, w->clientX(), w->clientY(), true, w->upscale, winOpacity);
         }
 
         // Draw text cursor for terminal windows
@@ -2082,6 +2143,23 @@ void CompositorMarkDirty()
 {
     MarkAllDirty();
     __atomic_store_n(&g_needsFullRepaint, true, __ATOMIC_RELEASE);
+}
+
+void CompositorSetCompositeMode(bool alpha, uint8_t opacity)
+{
+    g_compositeMode = alpha ? CompositeMode::Alpha : CompositeMode::Opaque;
+    if (alpha) g_windowOpacity = opacity;
+    // Force a clean full-scene recomposite so the new model takes effect
+    // immediately (and any translucency-revealed regions are repainted).
+    MarkAllDirty();
+    __atomic_store_n(&g_needsFullRepaint, true, __ATOMIC_RELEASE);
+    CompositorWake();
+}
+
+bool CompositorGetCompositeMode(uint8_t* opacity)
+{
+    if (opacity) *opacity = g_windowOpacity;
+    return g_compositeMode == CompositeMode::Alpha;
 }
 
 void CompositorUnregisterProcess(Process* proc)
