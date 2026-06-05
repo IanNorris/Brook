@@ -12942,6 +12942,15 @@ __attribute__((naked)) void SwitchToUserMode(uint64_t, uint64_t)
         "xor %%r14, %%r14\n\t"
         "xor %%r15, %%r15\n\t"
         "xor %%rbp, %%rbp\n\t"
+        // BRO-166: clear IF before swapgs so a LAPIC timer (or any maskable
+        // IRQ) cannot fire in the ring-0 window between swapgs and iretq. In
+        // that window active GS is already the user base (0); a timer landing
+        // here pushes a ring-0 CS, so the ISR entry stub's conditional
+        // `testq $3,CS; swapgs` would SKIP swapgs and run the handler with
+        // GS=0 → #PF at gs:176 (CR2=0xB0). The hand-built frame's RFLAGS=0x202
+        // re-enables IF atomically on iretq to ring 3, so this only closes the
+        // kernel-side window with no change to the delivered user context.
+        "cli\n\t"
         "swapgs\n\t"
         "iretq\n\t"
         ::: "memory"
