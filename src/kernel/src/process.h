@@ -251,6 +251,15 @@ struct Process
     int32_t  runningOnCpu;   // CPU index (-1 = not running, used for double-schedule detection)
     int32_t  cpuAffinity;    // CPU affinity pin (-1 = any CPU, >=0 = pinned to that CPU)
     volatile uint64_t tlbCpuMask;  // Bitmask of CPUs that have this process's CR3 loaded in TLB
+    // BRO-173/175: liveness refcount — counts external holders of a raw
+    // Process* that could deref this struct (a CPU currently running it, a
+    // SchedulerKillThreadGroup leader's snapshot, the compositor's VFB
+    // registration).  The reaper frees a Process ONLY when state==Terminated
+    // AND refCount==0, replacing the old free-gate flag soup (reapable +
+    // runningOnCpu==-1 + groupKillOwned + compositorRegistered-defer) with one
+    // monotonic invariant: never free while any reference is outstanding.
+    // ORTHOGONAL to `state` (which answers "may it run?", not "is it freeable?").
+    volatile int32_t refCount;
     volatile bool reapable;  // Set after context_switch completes away from this process
     volatile bool compositorRegistered; // True while compositor holds a reference to this process's VFB
     // BRO-173: set while a SchedulerKillThreadGroup leader owns this thread's
@@ -532,6 +541,22 @@ Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
 
 // Destroy a process and free all its resources.
 void ProcessDestroy(Process* proc);
+
+// BRO-173/175 liveness refcount.  ProcessRef takes a reference on a Process the
+// caller is about to hold a raw pointer to across a window where the reaper
+// could otherwise free it; ProcessUnref drops it.  The reaper only frees a
+// Terminated process when its refCount has fallen to 0.  ProcessRef callers
+// must already hold a valid reference OR g_allProcLock (so the struct cannot be
+// freed underneath the increment).  Neither call frees inline — freeing is done
+// solely by the reaper in its safe (CPU0, non-ISR) context.
+static inline void ProcessRef(Process* p)
+{
+    if (p) __atomic_add_fetch(&p->refCount, 1, __ATOMIC_ACQ_REL);
+}
+static inline void ProcessUnref(Process* p)
+{
+    if (p) __atomic_sub_fetch(&p->refCount, 1, __ATOMIC_ACQ_REL);
+}
 
 // Fork the current process, creating a child with a copy of its address space.
 // The caller must provide the user-mode context so the child can resume.

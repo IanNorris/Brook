@@ -1119,8 +1119,15 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     child->fbVfbHeight = clientH;
     child->fbVfbStride = clientW;
     child->fbDirty = 1;
-    // Mark as compositor-registered so pages aren't freed while blitting
-    __atomic_store_n(&child->compositorRegistered, true, __ATOMIC_RELEASE);
+    // Mark as compositor-registered so pages aren't freed while blitting.
+    // BRO-173/175: take a matching liveness ref (CAS false→true) so the later
+    // CompositorUnregisterProcess (on terminal child exit) balances it.
+    {
+        bool wasReg = false;
+        if (__atomic_compare_exchange_n(&child->compositorRegistered, &wasReg,
+                true, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            ProcessRef(child);
+    }
 
     // Add both to scheduler
     SchedulerAddProcess(child);

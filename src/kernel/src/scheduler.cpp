@@ -342,25 +342,16 @@ static void DrainPostSwitch(uint32_t cpu)
     g_perCpu[cpu].pendingRetire = nullptr;
     if (retired)
     {
-        // For processes with compositor-registered VFBs, don't mark reapable
-        // yet — the compositor must unregister first to avoid a race where
-        // PmmKillPid frees VFB pages while the compositor is mid-blit.
-        //
-        // BRO-173: likewise, if a SchedulerKillThreadGroup leader owns this
-        // thread's teardown, only that leader may mark it reapable (after its
-        // KRwLockCleanupOnExit).  Marking it reapable here — the moment the
-        // thread is descheduled — is exactly what let the reaper free it while
-        // the leader was still about to dereference it.
-        if (!__atomic_load_n(&retired->compositorRegistered, __ATOMIC_ACQUIRE)
-            && !__atomic_load_n(&retired->groupKillOwned, __ATOMIC_ACQUIRE))
-        {
-            __atomic_store_n(&retired->reapable, true, __ATOMIC_RELEASE);
-        }
-        else
-        {
-            SerialPrintf("SCHED: deferring reap for pid %u (compositorRegistered)\n",
-                         retired->pid);
-        }
+        // BRO-173/175: `reapable` now means only "switched away cleanly, no
+        // longer on a kernel stack".  It is DECOUPLED from whether other
+        // subsystems still reference the proc — those hold a liveness refCount,
+        // and the reaper additionally requires refCount==0 before freeing.  So
+        // we can always mark a retired Terminated proc reapable here; the
+        // compositor's VFB reference (and any kill-group reference) keeps it
+        // alive via refCount until released.  Previously this deferred reapable
+        // while compositorRegistered, which livelocked if the compositor never
+        // unregistered the proc (BRO-175).
+        __atomic_store_n(&retired->reapable, true, __ATOMIC_RELEASE);
     }
 
     // Re-enqueue the process we were switched away from.
@@ -384,7 +375,19 @@ static uint8_t g_idleStacks[SCHED_MAX_CPUS][65536] __attribute__((aligned(16)));
 static void IdleLoop()
 {
     for (;;)
+    {
+        // BRO-173/175: drain per-CPU post-switch bookkeeping here too.  When an
+        // exiting/blocking thread switches directly to idle (PickNextLocked
+        // returned nothing), idle is the resumed process — and unlike the
+        // trampolines and DoSwitch it would otherwise NEVER call
+        // DrainPostSwitch, so the exited thread's pendingRetire is never
+        // consumed and its `reapable` flag is never set.  That left Terminated
+        // threads stuck unreapable (reaper saw runCpu=-1, refCount=0, but
+        // reapable=0) and livelocked the parent's wait/fork loop under heavy
+        // thread churn.  Draining at the top of every idle iteration closes it.
+        DrainPostSwitch(ThisCpu());
         __asm__ volatile("sti\n\thlt" ::: "memory");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -887,6 +890,7 @@ static void ReapTerminated()
         if (p->state == ProcessState::Terminated
             && __atomic_load_n(&p->reapable, __ATOMIC_ACQUIRE)
             && __atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) == -1
+            && __atomic_load_n(&p->refCount, __ATOMIC_ACQUIRE) == 0
             && p != g_perCpu[cpu].currentProcess)
         {
             if (!p->isThread && ThreadGroupHasLivePeerLocked(p))
@@ -1057,6 +1061,27 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
     // Store requeue info in per-CPU state BEFORE context_switch.
     g_perCpu[cpu].pendingRequeue = requeueOld ? oldProc : nullptr;
 
+    // BRO-173/175: if we are switching away from a process that is already
+    // Terminated, hand it to the retire path so the resuming process's
+    // DrainPostSwitch marks it reapable once it is fully off its kernel stack.
+    // This closes a race in the self-exit path: SchedulerExitCurrentProcess
+    // sets state=Terminated with interrupts still ENABLED (it does SIGCHLD /
+    // reparent work under g_allProcLock before the cli + its own pendingRetire
+    // store).  A timer tick landing in that window descheduls the Terminated
+    // proc through here (SchedulerTimerTick's Terminated branch) — it would
+    // otherwise be switched out Terminated/runningOnCpu=-1 but never marked
+    // reapable (its own pendingRetire store at the tail of
+    // SchedulerExitCurrentProcess is never reached), wedging the reaper and
+    // livelocking the parent's wait/fork loop.  The leader hits this far more
+    // often than a plain thread because of the extra SIGCHLD/reparent work that
+    // widens the interrupts-enabled window.
+    if (oldProc != newProc &&
+        oldProc->state == ProcessState::Terminated &&
+        !g_perCpu[cpu].pendingRetire)
+    {
+        g_perCpu[cpu].pendingRetire = oldProc;
+    }
+
     GdtSetTssRsp0ForCpu(cpu, newProc->kernelStackTop);
     SetSyscallStack(cpu, newProc->kernelStackTop);
 
@@ -1190,34 +1215,39 @@ void SchedulerTimerTick(bool allowPreempt)
         return;
     }
 
+    // A Terminated process MUST be descheduled immediately, regardless of
+    // whether the tick interrupted user or kernel mode.  exit_group /
+    // SchedulerKillThreadGroup marks sibling threads Terminated and then
+    // spin-waits for runningOnCpu == -1.  If the victim is a pure user-mode
+    // CPU spinner, ticks arrive with allowPreempt=true and the old code fell
+    // through to the timeslice path, where `cur->state != Running` returned
+    // WITHOUT descheduling — so the Terminated spinner kept burning its CPU
+    // forever, the quiesce-wait never completed, and the teardown
+    // reference/reap was leaked (BRO-173/175 residual stall).  Handle it here,
+    // up front, for both modes.
+    if (cur->state == ProcessState::Terminated)
+    {
+        uint64_t rlf_term = SchedLockAcquire(g_readyLock);
+        ReadyQueueRemoveLocked(cur);
+        Process* next = PickNextLocked(cpu);
+        SchedLockRelease(g_readyLock, rlf_term);
+        if (next)
+            DoSwitch(cur, next, /* requeueOld */ false);
+        else
+        {
+            Process* idle = g_perCpu[cpu].idleProcess;
+            if (idle && idle != cur)
+                DoSwitch(cur, idle, /* requeueOld */ false);
+        }
+        return;
+    }
+
     // Brook currently treats kernel code as non-preemptible. Timer ticks still
     // sample, account, wake sleepers, and dispatch away from idle, but a tick
     // that interrupted a syscall/driver path must not deschedule the process
     // while it owns filesystem, VFS, or device-driver locks.
-    //
-    // Exception: Terminated and Stopped processes MUST be descheduled even from
-    // kernel mode. exit_group marks sibling threads Terminated and spin-waits
-    // for runningOnCpu == -1. If we skip preemption here, those siblings stay
-    // stuck in kernel code forever and exit_group deadlocks.
     if (!allowPreempt)
-    {
-        if (cur->state == ProcessState::Terminated)
-        {
-            uint64_t rlf_term = SchedLockAcquire(g_readyLock);
-            ReadyQueueRemoveLocked(cur);
-            Process* next = PickNextLocked(cpu);
-            SchedLockRelease(g_readyLock, rlf_term);
-            if (next)
-                DoSwitch(cur, next, /* requeueOld */ false);
-            else
-            {
-                Process* idle = g_perCpu[cpu].idleProcess;
-                if (idle && idle != cur)
-                    DoSwitch(cur, idle, /* requeueOld */ false);
-            }
-        }
         return;
-    }
 
     // Check timeslice (per-process, from policy module).
     uint64_t timeslice = g_schedOps->Timeslice(g_schedState, cur->pid);
@@ -1796,7 +1826,13 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus)
                 // until we release — and once flagged, no other path will mark
                 // it reapable, so our raw `targets[]` pointers stay valid
                 // through the unlocked Phase 2 below.
-                __atomic_store_n(&p->groupKillOwned, true, __ATOMIC_RELEASE);
+                // BRO-173/175: take a liveness reference (instead of the old
+                // groupKillOwned flag) while still holding g_allProcLock, so
+                // the reaper cannot free this target until our unlocked Phase 2
+                // drops the ref.  The reaper removes a Process from
+                // g_allProcesses under this same lock strictly before freeing,
+                // so a target we ref here cannot already be mid-free.
+                ProcessRef(p);
                 targets[count++] = p;
             }
         }
@@ -1872,6 +1908,12 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus)
         KRwLockCleanupOnExit(p);
 
         __atomic_store_n(&p->reapable, true, __ATOMIC_RELEASE);
+
+        // BRO-173/175: drop the teardown reference taken in the snapshot.  Once
+        // this falls to 0 (and the thread is Terminated, reapable, off-CPU) the
+        // reaper is free to destroy it.  Our raw `targets[]` pointer must not be
+        // dereferenced after this point.
+        ProcessUnref(p);
     }
 }
 
