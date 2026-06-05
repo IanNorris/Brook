@@ -28,4 +28,18 @@ static constexpr const char* VIRTIO_ESP_MARKER = "BROOK.MNT";
 void VirtioBlkGetStats(Device* dev, uint64_t& readOps, uint64_t& writeOps,
                        uint64_t& readBytes, uint64_t& writeBytes);
 
+// Cold-read latency probe (BRO-165). Cumulative-since-boot counters per device;
+// surfaced read-only via /proc/blkprobe. Take deltas across a workload.
+struct VirtioBlkProbeStats {
+    uint64_t waitCount;      // number of completion waits
+    uint64_t reqSubmitted;   // total requests/slots awaited across those waits
+    uint64_t waitNsTotal;    // cumulative ns spent in completion waits
+    uint64_t waitNsMax;      // worst single wait (ns)
+    uint64_t spinItersTotal; // cumulative spin iterations
+    uint64_t pathLegacy;     // waits via SubmitRequest (legacy single-request)
+    uint64_t pathBatch;      // waits via WaitAllSlots (small-read batched)
+    uint64_t pathSG;         // waits via SubmitScatterGatherRead (zero-copy DMA)
+};
+void VirtioBlkGetProbe(Device* dev, VirtioBlkProbeStats& out);
+
 } // namespace brook

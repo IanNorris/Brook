@@ -1459,14 +1459,14 @@ struct FdRef
 // sys_write (1)
 // ---------------------------------------------------------------------------
 
-static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
-                          uint64_t, uint64_t, uint64_t)
+// Shared write dispatch used by sys_write (user buffer) and sys_sendfile
+// (kernel bounce buffer). bufAddr is treated as a raw readable byte pointer;
+// the CALLER is responsible for validating it (sys_write checks the user
+// buffer; sendfile passes a kernel bounce buffer that is always readable).
+// Handles every fd type: serial, vnode, framebuffer, /dev/null, dsp, tty,
+// pipe, eventfd, socket, memfd, unix-socket.
+static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count)
 {
-    // Validate the user buffer once, up front. EFAULT if any page in the
-    // range is unmapped — without this, a bad user pointer faults the kernel.
-    if (count > 0 && !UserBufferReadable(bufAddr, count))
-        return -EFAULT;
-
     // fd 3 = debug serial — writes directly, bypassing the async ring buffer.
     // Hold the serial lock across the entire write so multi-CPU output
     // doesn't interleave character-by-character.
@@ -1927,7 +1927,19 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
         return static_cast<int64_t>(written);
     }
 
+    // No fd-type handler above matched — unknown/unsupported descriptor.
+    // (This is the terminal return of WriteToFdByType, not sys_write.)
     return -EBADF;
+}
+
+static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
+                          uint64_t, uint64_t, uint64_t)
+{
+    // Validate the user buffer once, up front. EFAULT if any page in the
+    // range is unmapped — without this, a bad user pointer faults the kernel.
+    if (count > 0 && !UserBufferReadable(bufAddr, count))
+        return -EFAULT;
+    return WriteToFdByType(fd, bufAddr, count);
 }
 
 // ---------------------------------------------------------------------------
@@ -8790,14 +8802,14 @@ static int64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd, uint64_t offsetAddr
         }
         if (rd <= 0) break;
 
-        // Write to output fd
-        uint64_t woff = out_fde->seekPos;
-        int wr = -1;
-        if (out_fde->type == FdType::Vnode && out_fde->handle)
-        {
-            wr = VfsWrite(static_cast<Vnode*>(out_fde->handle), bounce, rd, &woff);
-            if (wr > 0) out_fde->seekPos = woff;
-        }
+        // Write to output fd via the shared write dispatch so sendfile works
+        // to ANY destination (terminal/serial, pipe, socket, file, ...), not
+        // just regular files. bounce is a kernel buffer, always readable.
+        // (BRO: previously this only handled FdType::Vnode, so sendfile to a
+        // TTY/pipe — e.g. busybox `cat` to stdout — silently returned 0.)
+        int wr = static_cast<int>(
+            WriteToFdByType(out_fd, reinterpret_cast<uint64_t>(bounce),
+                         static_cast<uint64_t>(rd)));
         if (wr <= 0) break;
 
         totalSent += wr;

@@ -8,6 +8,7 @@
 #include "serial.h"
 #include "mem_tag.h"
 #include "idt.h"
+#include "kvmclock.h"
 
 namespace brook {
 
@@ -77,7 +78,6 @@ static constexpr uint32_t VIRTIO_CACHE_BLOCK_SECTORS = 8;     // 4 KiB
 static constexpr uint32_t VIRTIO_CACHE_BLOCK_SIZE    = 4096;
 static constexpr uint32_t VIRTIO_CACHE_ENTRIES       = 4096;  // 16 MiB
 static constexpr uint64_t VIRTIO_SMALL_READ_LIMIT    = 64 * 1024;
-
 // ---- Virtqueue structures (packed for DMA) ----
 
 struct __attribute__((packed)) VirtqDesc {
@@ -102,6 +102,13 @@ struct __attribute__((packed)) VirtioBlkReq {
 static constexpr uint32_t MAX_INFLIGHT       = 16;
 static constexpr uint32_t DESCS_PER_SLOT     = 3; // header + data + status
 static constexpr uint32_t SLOT_DMA_SIZE      = VIRTIO_CACHE_BLOCK_SIZE; // 4 KiB
+
+// Sequential readahead target (BRO-165): when a cold read misses the cache we
+// pay one virtio round-trip regardless, so prefetch the following blocks in the
+// SAME batch up to the full slot pool. This turns a serial 16×4KB cold scan
+// (queue depth 1, ~38µs each) into a single 16-block round-trip. Capped at the
+// slot count so it always fits one batch submission.
+static constexpr uint32_t VIRTIO_READAHEAD_BLOCKS = MAX_INFLIGHT;
 
 struct RequestSlot {
     VirtioBlkReq* reqBuf;       // 16-byte request header (DMA-visible)
@@ -175,6 +182,21 @@ struct VirtioBlkState {
     volatile uint64_t writeOps;
     volatile uint64_t readBytes;
     volatile uint64_t writeBytes;
+
+    // ---- Latency probe (BRO-165 cold-read investigation) ----
+    // Per-completion-wait instrumentation. Always recorded (cost is two
+    // rdtsc reads + a few adds, negligible against a microsecond-scale wait).
+    // Surfaced read-only via /proc/blkprobe; deltas taken across a workload.
+    struct {
+        volatile uint64_t waitCount;      // number of completion waits
+        volatile uint64_t reqSubmitted;   // total requests/slots awaited
+        volatile uint64_t waitNsTotal;    // cumulative ns spent waiting
+        volatile uint64_t waitNsMax;      // worst single wait (ns)
+        volatile uint64_t spinItersTotal; // cumulative spin iterations
+        volatile uint64_t pathLegacy;     // legacy SubmitRequest waits
+        volatile uint64_t pathBatch;      // small-read batched-slot waits
+        volatile uint64_t pathSG;         // scatter-gather waits
+    } probe;
 
     // Serialises concurrent requests from multiple processes.  The current
     // driver still uses hardcoded descriptor slots 0-2 and one shared DMA
@@ -459,6 +481,21 @@ static void VirtioBlkIrqBody()
 
 static constexpr uint16_t LEGACY_DESC_BASE = MAX_INFLIGHT * DESCS_PER_SLOT;
 
+// Record one completion-wait into the latency probe. path: 0=legacy 1=batch 2=SG.
+static inline void ProbeRecordWait(VirtioBlkState& s, uint64_t startNs,
+                                   uint64_t iters, uint64_t reqs, int path)
+{
+    uint64_t dur = KvmClockReadNs() - startNs; // 0 if pvclock unavailable
+    s.probe.waitCount++;
+    s.probe.reqSubmitted   += reqs;
+    s.probe.waitNsTotal    += dur;
+    if (dur > s.probe.waitNsMax) s.probe.waitNsMax = dur;
+    s.probe.spinItersTotal += iters;
+    if (path == 0)      s.probe.pathLegacy++;
+    else if (path == 1) s.probe.pathBatch++;
+    else                s.probe.pathSG++;
+}
+
 static bool SubmitRequest(VirtioBlkState& s,
                            uint32_t type, uint64_t sector,
                            uint64_t dataBufPhys, uint32_t dataLen)
@@ -502,10 +539,12 @@ static bool SubmitRequest(VirtioBlkState& s,
     // other spinlocks like g_mpLock), so we must NOT hlt — if the completion
     // IRQ routes to another CPU, this CPU would never wake and every other
     // CPU spinning on our locks would deadlock.
+    uint64_t probeStartNs = KvmClockReadNs();
+    uint64_t probeIters   = 0;
     {
         uint64_t startTick = g_lapicTickCount;
         for (uint32_t i = 0; ; ++i) {
-            if (*s.usedIdx != s.usedIdxShadow) goto done;
+            if (*s.usedIdx != s.usedIdxShadow) { probeIters = i; goto done; }
             if (WaitBudgetExhausted(i, startTick)) break;
             __asm__ volatile("pause" ::: "memory");
         }
@@ -515,6 +554,7 @@ static bool SubmitRequest(VirtioBlkState& s,
     return false;
 
 done:
+    ProbeRecordWait(s, probeStartNs, probeIters, 1, 0);
     __asm__ volatile("mfence" ::: "memory");
     // BRO-164: validate the completion belongs to THIS request before consuming
     // it. A stale completion from an abandoned request would otherwise be
@@ -613,13 +653,14 @@ static bool WaitAllSlots(VirtioBlkState& s, uint32_t count)
     // filesystem locks), so we must NOT hlt — the completion IRQ may route
     // to another CPU, leaving this one halted with locks held.
     uint64_t startTick = g_lapicTickCount;
+    uint64_t probeStartNs = KvmClockReadNs();
     for (uint32_t iter = 0; ; ++iter)
     {
         ReapCompletions(s);
         bool allDone = true;
         for (uint32_t i = 0; i < count; ++i)
             if (!s.slots[i].complete) { allDone = false; break; }
-        if (allDone) return true;
+        if (allDone) { ProbeRecordWait(s, probeStartNs, iter, count, 1); return true; }
         if (WaitBudgetExhausted(iter, startTick)) break;
         __asm__ volatile("pause" ::: "memory");
     }
@@ -758,10 +799,12 @@ static int SubmitScatterGatherRead(VirtioBlkState& s, uint64_t startSector,
 
     // Spin-wait for completion — same rationale as SubmitRequest: we hold
     // requestGuard and callers hold filesystem locks, so hlt is unsafe.
+    uint64_t probeStartNs = KvmClockReadNs();
+    uint64_t probeIters   = 0;
     {
         uint64_t startTick = g_lapicTickCount;
         for (uint32_t i = 0; ; ++i) {
-            if (*s.usedIdx != s.usedIdxShadow) goto sg_done;
+            if (*s.usedIdx != s.usedIdxShadow) { probeIters = i; goto sg_done; }
             if (WaitBudgetExhausted(i, startTick)) break;
             __asm__ volatile("pause" ::: "memory");
         }
@@ -771,6 +814,7 @@ static int SubmitScatterGatherRead(VirtioBlkState& s, uint64_t startSector,
     return -1;
 
 sg_done:
+    ProbeRecordWait(s, probeStartNs, probeIters, 1, 2);
     __asm__ volatile("mfence" ::: "memory");
     // BRO-164: validate the completion is ours before consuming it.
     {
@@ -795,6 +839,137 @@ sg_done:
         uint64_t bounceOff = usedBounceHead ? headBytes : 0;
         memcpy(readDst + headBytes + midBytes, s.dmaBuf + bounceOff, tailBytes);
     }
+
+    return static_cast<int>(totalBytes);
+}
+
+// ---- Scatter-gather DMA write (BRO-169) ----
+// Writes `sectorCount` whole sectors starting at `startSector`, with the device
+// reading the data DIRECTLY from the source virtual buffer `src` — zero-copy,
+// no bounce-buffer memcpy. This is the write analog of SubmitScatterGatherRead.
+//
+// Requirements: the caller guarantees a whole-sector write (the source supplies
+// exactly sectorCount*512 bytes); partial first/last sectors are NOT handled
+// here (those keep the legacy read-modify-write bounce path). The source buffer
+// may span non-contiguous physical pages, so each page becomes its own data
+// descriptor pointed at that page's physical address.
+//
+// Returns bytes written, or -1 to signal the caller to fall back to the legacy
+// bounce-buffer write path (descriptor budget exceeded or an unmapped page).
+// Caller must hold the request lock.
+static int SubmitScatterGatherWrite(VirtioBlkState& s, uint64_t startSector,
+                                    uint32_t sectorCount, const uint8_t* src)
+{
+    uint64_t  totalBytes = static_cast<uint64_t>(sectorCount) * 512;
+    uintptr_t srcAddr    = reinterpret_cast<uintptr_t>(src);
+    uint64_t  headBytes  = 0;
+    uint64_t  tailBytes  = 0;
+
+    // Split the source by physical-page granularity: an unaligned start gives a
+    // head fragment up to the next page boundary, then full middle pages, then a
+    // tail fragment. Unlike the SG read this needs no bounce buffer — the device
+    // only reads, so every fragment can point straight at its source page.
+    if (srcAddr & 0xFFF) {
+        headBytes = 4096 - (srcAddr & 0xFFF);
+        if (headBytes > totalBytes) headBytes = totalBytes;
+    }
+    uint64_t midBytes = 0;
+    if (totalBytes > headBytes) {
+        midBytes  = (totalBytes - headBytes) & ~0xFFFULL;
+        tailBytes = totalBytes - headBytes - midBytes;
+    }
+    uint32_t midPages = static_cast<uint32_t>(midBytes / 4096);
+
+    uint32_t dataDescs = (headBytes ? 1 : 0) + midPages + (tailBytes ? 1 : 0);
+    if (dataDescs == 0 || dataDescs > SG_MAX_DATA)
+        return -1; // too many pages for one chain — fall back to legacy
+
+    // ---- Header descriptor (device reads the request header) ----
+    uint16_t di = SG_DESC_BASE;
+
+    s.reqBuf->type     = VIRTIO_BLK_T_OUT;
+    s.reqBuf->reserved = 0;
+    s.reqBuf->sector   = startSector;
+
+    s.descTable[di].addr  = s.reqBufPhys;
+    s.descTable[di].len   = sizeof(VirtioBlkReq);
+    s.descTable[di].flags = VIRTQ_DESC_F_NEXT;
+    s.descTable[di].next  = di + 1;
+    ++di;
+
+    // ---- Data descriptors: device READS from source, so NO VIRTQ_DESC_F_WRITE ----
+    const uint8_t* p = src;
+    auto appendData = [&](uint64_t bytes) -> bool {
+        uint64_t phys = VmmVirtToPhys(KernelPageTable,
+                                      VirtualAddress(reinterpret_cast<uint64_t>(p))).raw();
+        if (phys == 0) return false; // unmapped — bail to legacy path
+        s.descTable[di].addr  = phys;
+        s.descTable[di].len   = static_cast<uint32_t>(bytes);
+        s.descTable[di].flags = VIRTQ_DESC_F_NEXT;
+        s.descTable[di].next  = di + 1;
+        ++di;
+        p += bytes;
+        return true;
+    };
+
+    if (headBytes && !appendData(headBytes)) return -1;
+    for (uint32_t pg = 0; pg < midPages; ++pg)
+        if (!appendData(4096)) return -1;
+    if (tailBytes && !appendData(tailBytes)) return -1;
+
+    // ---- Status descriptor (device writes the status byte) ----
+    *s.statusBuf = 0xFF;
+    s.descTable[di].addr  = s.statusBufPhys;
+    s.descTable[di].len   = 1;
+    s.descTable[di].flags = VIRTQ_DESC_F_WRITE;
+    s.descTable[di].next  = 0;
+
+    // ---- Submit ----
+    __asm__ volatile("mfence" ::: "memory");
+
+    uint16_t ringSlot = s.availIdxShadow % s.queueSize;
+    s.availRing[ringSlot] = SG_DESC_BASE;
+    __asm__ volatile("mfence" ::: "memory");
+    *s.availIdx = ++s.availIdxShadow;
+    __asm__ volatile("mfence" ::: "memory");
+
+    __atomic_store_n(&s.irqComplete, 0, __ATOMIC_RELEASE);
+    VioWrite16(s.ioBase, VIRTIO_PCI_QUEUE_NOTIFY, 0);
+
+    // Spin-wait — same rationale as SubmitRequest/SG read: we hold requestGuard
+    // and callers hold filesystem locks, so hlt is unsafe.
+    uint64_t probeStartNs = KvmClockReadNs();
+    uint64_t probeIters   = 0;
+    {
+        uint64_t startTick = g_lapicTickCount;
+        for (uint32_t i = 0; ; ++i) {
+            if (*s.usedIdx != s.usedIdxShadow) { probeIters = i; goto sgw_done; }
+            if (WaitBudgetExhausted(i, startTick)) break;
+            __asm__ volatile("pause" ::: "memory");
+        }
+    }
+    SerialPuts("virtio-blk: SG write timeout\n");
+    ResetQueue(s); // BRO-164: recover instead of permanently desyncing the queue
+    return -1;
+
+sgw_done:
+    ProbeRecordWait(s, probeStartNs, probeIters, 1, 3);
+    __asm__ volatile("mfence" ::: "memory");
+    // BRO-164: validate the completion is ours before consuming it.
+    {
+        uint16_t usedSlot = s.usedIdxShadow % s.queueSize;
+        uint32_t descId   = s.usedRing[usedSlot].id;
+        ++s.usedIdxShadow;
+        if (descId != SG_DESC_BASE) {
+            SerialPrintf("virtio-blk: stale SG write completion descId=%u expected=%u — resetting\n",
+                         descId, static_cast<unsigned>(SG_DESC_BASE));
+            ResetQueue(s);
+            return -1;
+        }
+    }
+
+    if (*s.statusBuf != VIRTIO_BLK_S_OK)
+        return -1;
 
     return static_cast<int>(totalBytes);
 }
@@ -915,6 +1090,30 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
                         missBlocks[missCount++] = blockNumber;
                 }
                 probe += VIRTIO_CACHE_BLOCK_SIZE - (absolute % VIRTIO_CACHE_BLOCK_SIZE);
+            }
+        }
+
+        // Sequential readahead (BRO-165): if the requested range missed, we are
+        // already committed to a device round-trip — so fill the remaining batch
+        // slots with the blocks immediately following the request. This collapses
+        // a cold sequential scan from N serialized single-block round-trips into
+        // ceil(N/MAX_INFLIGHT) batched ones. We only prefetch on an actual miss
+        // (pure cache hits return on the lock-free fast path above), so warm and
+        // random-access workloads pay nothing. Stop at the first already-cached
+        // block (the region ahead is already warm) or the device end.
+        if (missCount > 0 && missCount < VIRTIO_READAHEAD_BLOCKS)
+        {
+            uint64_t nextBlock = ((offset + len - 1) / VIRTIO_CACHE_BLOCK_SIZE) + 1;
+            while (missCount < VIRTIO_READAHEAD_BLOCKS)
+            {
+                uint64_t blockSector = nextBlock * VIRTIO_CACHE_BLOCK_SECTORS;
+                if (blockSector + VIRTIO_CACHE_BLOCK_SECTORS > s->sectorCount)
+                    break; // would read past device end
+                uint8_t* cacheBlock = nullptr;
+                if (CacheLookup(*s, nextBlock, &cacheBlock))
+                    break; // ahead already cached — stop contiguous prefetch
+                missBlocks[missCount++] = nextBlock;
+                ++nextBlock;
             }
         }
 
@@ -1061,6 +1260,43 @@ static int VirtioBlkWrite(Device* dev, uint64_t offset, const void* buf, uint64_
     AcquireRequestLock(*s);
 
     uint64_t sec = startSector;
+
+    // Fast path (BRO-169): a fully sector-aligned write needs no read-modify-write,
+    // so stream it to the device zero-copy via scatter-gather — the device reads
+    // straight from the source pages, skipping the bounce-buffer memcpy and lifting
+    // the 256 KB legacy-buffer cap (up to ~800 KB per round-trip). On any SG failure
+    // we simply fall through to the legacy loop below, which resumes from the
+    // already-written sector (still aligned, so it too needs no RMW).
+    if (!partialFirst && !partialLast &&
+        (offset % SECTOR_SIZE) == 0 && (len % SECTOR_SIZE) == 0)
+    {
+        // Cap each chunk so the worst-case descriptor count (mid pages + head +
+        // tail) stays within SG_MAX_DATA.
+        static constexpr uint32_t SG_CHUNK_SECTORS = (SG_MAX_DATA - 2) * 8;
+        while (sec < endSector)
+        {
+            uint32_t chunkSectors = static_cast<uint32_t>(endSector - sec);
+            if (chunkSectors > SG_CHUNK_SECTORS) chunkSectors = SG_CHUNK_SECTORS;
+
+            int sgResult = SubmitScatterGatherWrite(*s, sec, chunkSectors,
+                                                    srcBytes + bytesWritten);
+            if (sgResult <= 0)
+                break; // fall back to legacy bounce path for the remainder
+
+            CacheInvalidateRange(*s, sec, sec + chunkSectors);
+            sec          += chunkSectors;
+            bytesWritten += static_cast<uint64_t>(sgResult);
+        }
+
+        if (sec >= endSector)
+        {
+            ReleaseRequestLock(*s);
+            s->writeOps++;
+            s->writeBytes += bytesWritten;
+            return static_cast<int>(bytesWritten);
+        }
+    }
+
     while (sec < endSector && bytesWritten < len)
     {
         uint32_t batch = static_cast<uint32_t>(endSector - sec);
@@ -1325,6 +1561,22 @@ void VirtioBlkGetStats(Device* dev, uint64_t& readOps, uint64_t& writeOps,
     writeOps   = s->writeOps;
     readBytes  = s->readBytes;
     writeBytes = s->writeBytes;
+}
+
+// Latency-probe snapshot for /proc/blkprobe (BRO-165 cold-read investigation).
+void VirtioBlkGetProbe(Device* dev, VirtioBlkProbeStats& out)
+{
+    out = VirtioBlkProbeStats{};
+    if (!dev || !dev->priv) return;
+    auto* s = static_cast<VirtioBlkState*>(dev->priv);
+    out.waitCount      = s->probe.waitCount;
+    out.reqSubmitted   = s->probe.reqSubmitted;
+    out.waitNsTotal    = s->probe.waitNsTotal;
+    out.waitNsMax      = s->probe.waitNsMax;
+    out.spinItersTotal = s->probe.spinItersTotal;
+    out.pathLegacy     = s->probe.pathLegacy;
+    out.pathBatch      = s->probe.pathBatch;
+    out.pathSG         = s->probe.pathSG;
 }
 
 } // namespace brook

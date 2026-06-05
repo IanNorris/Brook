@@ -46,6 +46,26 @@ static inline void SpinLockRelease(SpinLock* lock)
     __atomic_fetch_add(&lock->serving, 1, __ATOMIC_RELEASE);
 }
 
+// Non-blocking acquire: succeeds only when the lock is completely free
+// (no holder and no waiters). Returns true if acquired (caller must
+// SpinLockRelease), false if the lock is currently busy.
+//
+// Required for code that runs in ISR context but shares a plain SpinLock
+// with normal kernel code (e.g. the periodic DeviceCheckIntegrity run from
+// the timer tick). Blocking there would self-deadlock if the timer fires on
+// a CPU that already holds the lock in interrupted normal-context code.
+static inline bool SpinLockTryAcquire(SpinLock* lock)
+{
+    uint32_t serving = __atomic_load_n(&lock->serving, __ATOMIC_ACQUIRE);
+    uint32_t next    = __atomic_load_n(&lock->next, __ATOMIC_RELAXED);
+    if (next != serving)
+        return false; // held or has waiters
+    // Claim ticket `next` only if `next` is still unchanged. On success we
+    // hold the lock (serving == our ticket already).
+    return __atomic_compare_exchange_n(&lock->next, &next, next + 1,
+                                       false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+}
+
 // ---------------------------------------------------------------------------
 // IrqSpinLock — disables interrupts (cli) while held.
 //
