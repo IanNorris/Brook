@@ -35,6 +35,15 @@ static inline void FreeProcessStruct(Process* p)
     kfree(p);
 }
 
+// BRO-176: monotonically-increasing incarnation id, never reused — lets a
+// thread's teardown verify its leader struct hasn't been freed+reused for a
+// different incarnation before decrementing that leader's asLiveThreads.
+static uint64_t g_incarnationCounter = 0;
+static inline uint64_t NextIncarnation()
+{
+    return __atomic_add_fetch(&g_incarnationCounter, 1, __ATOMIC_ACQ_REL);
+}
+
 static inline void VnodeHandleUnref(Vnode* vn)
 {
     if (!vn) return;
@@ -536,6 +545,8 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     auto* raw = reinterpret_cast<uint8_t*>(proc);
     memset(raw, 0, sizeof(Process));
     proc->magic = PROCESS_MAGIC;
+    proc->incarnation = NextIncarnation();
+    proc->leaderIncarnation = 0;
 
     // Initialize FPU/SSE state with safe defaults so fxrstor works correctly
     // on the first context switch to this process.
@@ -775,6 +786,8 @@ Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
     auto* raw = reinterpret_cast<uint8_t*>(proc);
     memset(raw, 0, sizeof(Process));
     proc->magic = PROCESS_MAGIC;
+    proc->incarnation = NextIncarnation();
+    proc->leaderIncarnation = 0;
 
     // Initialize FPU/SSE state
     proc->fxsave.data[0] = 0x7F;
@@ -873,6 +886,36 @@ void ProcessDestroy(Process* proc)
     if (!proc) return;
 
     bool isThread = proc->isThread;
+
+    // BRO-176: a thread being reaped releases its hold on the leader's shared
+    // address space.  Decrement the leader's live-thread count so that once the
+    // last thread is gone the leader becomes reapable and its ProcessDestroy can
+    // safely free the shared page table + user pages (no thread can still be in
+    // the pick->switch window onto this address space).  The leader is reaped
+    // last (gated on asLiveThreads==0 in ReapTerminated), so threadLeader is a
+    // valid live pointer here; guard with a magic check defensively.
+    if (isThread && !proc->isKernelThread)
+    {
+        Process* leader = proc->threadLeader;
+        if (leader && leader->magic == PROCESS_MAGIC &&
+            leader->incarnation == proc->leaderIncarnation)
+        {
+            int32_t after = __atomic_sub_fetch(&leader->asLiveThreads, 1, __ATOMIC_ACQ_REL);
+            if (after < 0)
+            {
+                // Safety net: asLiveThreads must never go negative.  A negative
+                // count never equals 0, which would block the leader's reap (and
+                // thus the shared-AS free) forever.  Clamp + warn loudly so a
+                // future accounting bug surfaces as a log line, not a silent hang.
+                SerialPrintf("SCHED: BUG asLiveThreads<0 leader pid=%u (thr pid=%u) — clamping\n",
+                             leader->pid, proc->pid);
+                __atomic_store_n(&leader->asLiveThreads, 0, __ATOMIC_RELEASE);
+            }
+        }
+        // If the leader pointer is stale or its incarnation no longer matches
+        // (struct freed+reused), this thread's increment already retired with the
+        // old leader; do nothing rather than decrement an unrelated incarnation.
+    }
 
     // Release any kernel mutexes held by this process (prevents deadlock)
     Ext2ForceUnlockForPid(proc->pid);
@@ -1125,11 +1168,11 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
         }
     }
 
-    uint64_t forkElapsed = g_lapicTickCount - forkStartTick;
-    SerialPrintf("[PROFILE] fork_pages t=%lums pid=%u->%u cow=%lu shared=%lu elapsed=%lums\n",
-                 g_lapicTickCount,
-                 static_cast<uint32_t>(srcPid), static_cast<uint32_t>(dstPid),
-                 copiedCount, sharedCount, forkElapsed);
+    [[maybe_unused]] uint64_t forkElapsed = g_lapicTickCount - forkStartTick;
+    DbgPrintf("[PROFILE] fork_pages t=%lums pid=%u->%u cow=%lu shared=%lu elapsed=%lums\n",
+              g_lapicTickCount,
+              static_cast<uint32_t>(srcPid), static_cast<uint32_t>(dstPid),
+              copiedCount, sharedCount, forkElapsed);
 
     // Flush all TLB entries for the parent's address space. Parent PTEs
     // were downgraded from writable to RO+COW, so any stale writable
@@ -1153,6 +1196,8 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     // Copy entire parent process struct as a starting point
     memcpy(child, parent, sizeof(Process));
     child->magic = PROCESS_MAGIC;
+    child->incarnation = NextIncarnation();
+    child->leaderIncarnation = 0;   // a fork child is its own leader
 
     // Allocate new PID
     child->pid = SchedulerAllocPid();
@@ -1199,6 +1244,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->reapable = false;
     child->compositorRegistered = false;
     child->refCount = 0;             // BRO-173/175: fresh process holds no external refs
+    child->asLiveThreads = 0;        // BRO-176: a fresh address space has no extra threads yet
     child->groupKillOwned = false;   // BRO-173: fresh group, clean teardown state
     child->tgidExiting = false;
     child->schedNext = nullptr;
@@ -1400,7 +1446,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     // Copy parent process struct as starting point
     memcpy(thread, parent, sizeof(Process));
     thread->magic = PROCESS_MAGIC;
-
+    thread->incarnation = NextIncarnation();
     // Allocate TID (threads get unique PIDs but share tgid)
     thread->pid = SchedulerAllocPid();
     if (thread->pid == 0)
@@ -1430,6 +1476,10 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     }
     thread->threadLeader = leader;
     thread->isThread = true;
+    // BRO-176 diagnostic: stamp the leader's incarnation at thread-creation so
+    // a cross-incarnation decrement (leader struct freed+reused under us) is
+    // detectable at teardown.
+    thread->leaderIncarnation = leader->incarnation;
 
     // Share the leader's fd table (CLONE_FILES semantics). The memcpy above
     // already copied the pointer from parent->fds, but that pointer could be
@@ -1449,6 +1499,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     thread->reapable = false;
     thread->compositorRegistered = false;
     thread->refCount = 0;            // BRO-173/175: fresh thread holds no external refs
+    thread->asLiveThreads = 0;      // BRO-176: per-thread copy unused; only the leader's count matters
     // BRO-173: these lifecycle latches were memcpy'd from the parent; a new
     // thread must start with a clean teardown state.
     thread->groupKillOwned = false;
@@ -1533,9 +1584,15 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
         thread->name[31] = '\0';
     }
 
-    SerialPrintf("THREAD: parent pid=%u -> thread tid=%u tgid=%u pt=0x%lx\n",
-                 parent->pid, thread->pid, thread->tgid,
-                 thread->pageTable.pml4.raw());
+    // BRO-176: the increment that registers a thread against its leader's
+    // address space lives in SchedulerAddProcess (the commit-to-g_allProcesses
+    // point), balanced exactly against the decrement in ProcessDestroy (the
+    // remove-from-g_allProcesses point).  Tying it to list membership keeps the
+    // count correct regardless of which clone failure path frees a half-built
+    // thread before it is ever published.
+    DbgPrintf("THREAD: parent pid=%u -> thread tid=%u tgid=%u pt=0x%lx\n",
+              parent->pid, thread->pid, thread->tgid,
+              thread->pageTable.pml4.raw());
 
     return thread;
 }

@@ -24,8 +24,18 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <unistd.h>
+#include <time.h>
 #include <sys/wait.h>
 #include <sys/syscall.h>
+
+/* Monotonic milliseconds, or 0 if the clock is unavailable. */
+static unsigned long now_ms(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0;
+    return (unsigned long)ts.tv_sec * 1000UL + (unsigned long)(ts.tv_nsec / 1000000L);
+}
 
 /* Defaults chosen for HIGH-FREQUENCY exit_group churn: short-lived children
  * that spawn threads and tear the group down almost immediately, so victim
@@ -80,11 +90,17 @@ int main(int argc, char **argv)
     if (concurrent <= 0) concurrent = DEFAULT_CONCURRENT;
     if (nthreads <= 0)   nthreads = DEFAULT_THREADS;
 
+    /* Line-buffer stdout so progress/summary appear immediately even when
+     * stdout is a pipe/serial sink rather than a TTY. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     printf("=== schedstress (BRO-173): rounds=%d concurrent=%d threads/proc=%d ===\n",
            rounds, concurrent, nthreads);
+    fflush(stdout);
 
     int live = 0;
     int spawned = 0, reaped = 0;
+    unsigned long t0 = now_ms();
 
     for (int r = 0; r < rounds; r++) {
         pid_t pid = fork();
@@ -110,9 +126,11 @@ int main(int argc, char **argv)
             else break;
         }
 
-        if ((r & 63) == 0)
+        if ((r & 63) == 0) {
             printf("  progress: spawned=%d reaped=%d live=%d\n",
                    spawned, reaped, live);
+            fflush(stdout);
+        }
     }
 
     /* Drain remaining children. */
@@ -122,7 +140,34 @@ int main(int argc, char **argv)
         else break;
     }
 
-    printf("=== schedstress done: spawned=%d reaped=%d (no scheduler panic) ===\n",
-           spawned, reaped);
-    return 0;
+    unsigned long t1 = now_ms();
+    unsigned long elapsed_ms = (t1 >= t0) ? (t1 - t0) : 0;
+
+    /* If we reached here at all, the kernel survived the churn (no scheduler
+     * panic/UAF/livelock would have let us return).  The remaining health
+     * check is that every spawned child was reaped — a leak or stuck zombie
+     * shows up as reaped < spawned. */
+    int leaked = spawned - reaped;
+    int pass = (live == 0 && leaked == 0);
+
+    /* threads created total = one spinner set per child. */
+    unsigned long total_threads = (unsigned long)spawned * (unsigned long)nthreads;
+
+    printf("\n");
+    printf("================ schedstress TEST COMPLETE ================\n");
+    printf("  result          : %s\n", pass ? "PASS" : "FAIL");
+    printf("  children spawned : %d\n", spawned);
+    printf("  children reaped  : %d\n", reaped);
+    printf("  leaked/stuck     : %d\n", leaked);
+    printf("  threads created  : %lu  (%d per child)\n", total_threads, nthreads);
+    printf("  elapsed          : %lu ms\n", elapsed_ms);
+    if (elapsed_ms > 0) {
+        unsigned long cps = (unsigned long)spawned * 1000UL / elapsed_ms;
+        unsigned long tps = total_threads * 1000UL / elapsed_ms;
+        printf("  throughput       : %lu children/s, %lu threads/s\n", cps, tps);
+    }
+    printf("  scheduler        : no panic / UAF / livelock\n");
+    printf("==========================================================\n");
+    fflush(stdout);
+    return pass ? 0 : 1;
 }

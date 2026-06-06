@@ -4353,8 +4353,9 @@ static int64_t sys_exit(uint64_t status, uint64_t, uint64_t,
 {
     {
         Process* p = ProcessCurrent();
-        SerialPrintf("sys_exit: '%s' (pid %u, tgid %u) exited with status %lu\n",
-                     p ? p->name : "?", p ? p->pid : 0, p ? p->tgid : 0, status);
+        (void)p;
+        DbgPrintf("sys_exit: '%s' (pid %u, tgid %u) exited with status %lu\n",
+                  p ? p->name : "?", p ? p->pid : 0, p ? p->tgid : 0, status);
     }
 
     // If the thread group leader calls plain sys_exit while sibling threads
@@ -4389,8 +4390,8 @@ static int64_t sys_exit_group(uint64_t status, uint64_t, uint64_t,
                                uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
-    SerialPrintf("sys_exit_group: '%s' tgid %u exiting with status %lu\n",
-                 proc ? proc->name : "?", proc ? proc->tgid : 0, status);
+    DbgPrintf("sys_exit_group: '%s' tgid %u exiting with status %lu\n",
+              proc ? proc->name : "?", proc ? proc->tgid : 0, status);
 
     // Kill all other threads in this thread group so they don't linger
     // and cause use-after-free on shared resources after the leader exits.

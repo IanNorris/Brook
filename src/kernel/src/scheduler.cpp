@@ -633,6 +633,19 @@ void SchedulerAddProcess(Process* proc)
     {
         g_allProcesses[g_processCount++] = proc;
         ++g_totalForks;
+        // BRO-176: register a thread against its leader's address space at the
+        // exact moment it becomes visible in g_allProcesses (so it is guaranteed
+        // to be reaped via ProcessDestroy, which decrements).  This keeps the
+        // leader alive — and thus the shared page table / user pages mapped —
+        // until every thread sharing the address space is gone, closing the
+        // pick->switch UAF where a Terminated-but-pick-pending sibling resumes
+        // on a freed cr3.  Balanced 1:1 with the decrement in ProcessDestroy.
+        if (proc->isThread && !proc->isKernelThread)
+        {
+            Process* ldr = proc->threadLeader;
+            if (ldr && ldr->magic == PROCESS_MAGIC)
+                __atomic_add_fetch(&ldr->asLiveThreads, 1, __ATOMIC_ACQ_REL);
+        }
     }
     else
     {
@@ -930,6 +943,23 @@ static void ReapTerminated()
                 }
                 // Parent is gone — reparent to init (0) for reaping
                 p->parentPid = 0;
+            }
+
+            // BRO-176: do NOT reap a thread-group LEADER (which frees the shared
+            // user address space in ProcessDestroy) while any thread sharing that
+            // address space is still un-reaped.  asLiveThreads counts those
+            // threads, INCLUDING a Terminated sibling still in the pick->switch
+            // window (picked Ready, runningOnCpu transiently -1) — which slips
+            // past both ThreadGroupHasLivePeerLocked (it is Terminated) and the
+            // Phase-2 quiesce-wait (its runningOnCpu reads -1).  Gating the
+            // leader's reap here keeps the shared page table + user pages alive
+            // until every such thread has been switched-away and reaped, so a
+            // thread resuming via DoSwitch never loads a freed cr3 (BRO-176 UAF).
+            if (!p->isThread &&
+                __atomic_load_n(&p->asLiveThreads, __ATOMIC_ACQUIRE) > 0)
+            {
+                ++i;
+                continue;
             }
 
             SchedLockRelease(g_allProcLock, alf);
@@ -1857,8 +1887,8 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus)
         __atomic_store_n(reinterpret_cast<uint8_t*>(&p->state),
                          static_cast<uint8_t>(ProcessState::Terminated),
                          __ATOMIC_RELEASE);
-        SerialPrintf("SCHED: exit_group killing thread pid=%u tgid=%u\n",
-                     p->pid, p->tgid);
+        DbgPrintf("SCHED: exit_group killing thread pid=%u tgid=%u\n",
+                  p->pid, p->tgid);
     }
 
     // Phase 2: wait for each sibling to stop executing, THEN clean up its
@@ -1931,6 +1961,14 @@ Process* SchedulerFindTerminatedChild(uint16_t parentPid, int64_t pid)
             && !p->isThread  // Threads are not waitable children
             && (pid == -1 || pid == static_cast<int64_t>(p->pid)))
         {
+            // BRO-176: do not let waitpid reap a thread-group leader (which frees
+            // the shared address space in ProcessDestroy) while any thread still
+            // shares that address space — a sibling in the pick->switch window,
+            // or one running musl thread-exit cleanup, would then fault on a
+            // freed AS.  Gate on asLiveThreads, the same invariant the auto-reaper
+            // uses; the leader becomes reapable once the last thread is reaped.
+            if (__atomic_load_n(&p->asLiveThreads, __ATOMIC_ACQUIRE) != 0)
+                continue;  // skip this leader; revisit once threads drain
             SchedLockRelease(g_allProcLock, alf);
             return p;
         }

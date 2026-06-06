@@ -260,6 +260,30 @@ struct Process
     // monotonic invariant: never free while any reference is outstanding.
     // ORTHOGONAL to `state` (which answers "may it run?", not "is it freeable?").
     volatile int32_t refCount;
+    // BRO-176: address-space lifetime count, maintained ONLY on the thread-group
+    // leader (pid==tgid, the owner of the shared user page table).  Counts the
+    // number of not-yet-reaped threads sharing the leader's address space.  The
+    // reaper must not reap the leader (which is what frees the shared page table
+    // and user pages in ProcessDestroy) while this is > 0 — otherwise a sibling
+    // thread still in the pick->switch window (picked Ready, runningOnCpu still
+    // -1, about to be context-switched to) would resume on a freed cr3 and #PF
+    // in user mode (the BRO-176 UAF: a Terminated-but-pick-pending sibling slips
+    // past the Phase-2 quiesce-wait because its runningOnCpu is transiently -1).
+    // Incremented when a thread is created, decremented when a thread is reaped;
+    // the leader is therefore always reaped LAST, so the shared address space
+    // outlives every thread that could still be dispatched onto it.
+    volatile int32_t asLiveThreads;
+    // BRO-176: a monotonically-increasing incarnation id assigned at creation,
+    // NEVER reused (unlike pid or the struct pointer, both of which recycle
+    // under churn).  A thread records its leader's incarnation at creation
+    // (leaderIncarnation); at teardown the decrement of the leader's
+    // asLiveThreads is skipped unless the leader struct's current incarnation
+    // still matches, so a freed+reused leader slot can never have an unrelated
+    // incarnation's count corrupted.  In practice the asLiveThreads gate keeps a
+    // leader alive while any thread references it, so incarnations always match;
+    // the check is a cheap correctness guard that documents that invariant.
+    uint64_t incarnation;
+    uint64_t leaderIncarnation;
     volatile bool reapable;  // Set after context_switch completes away from this process
     volatile bool compositorRegistered; // True while compositor holds a reference to this process's VFB
     // BRO-173: set while a SchedulerKillThreadGroup leader owns this thread's
