@@ -241,6 +241,78 @@ static inline void SetFree(uint64_t idx)
     g_bitmap[idx / 64] &= ~(1ULL << (idx % 64));
 }
 
+// ---------------------------------------------------------------------------
+// BRO-179 STOPGAP: physical-frame free quarantine.
+//
+// Root class (proven by the RSVD #PF capture): cross-domain physical-frame
+// reuse / "freed-while-mapped". A user page is freed and immediately handed to
+// a new owner (e.g. a kernel page table) while a stale TLB entry — or, in the
+// worst case, a leaked PTE — still references the OLD mapping, so the old owner
+// corrupts the new use (garbage PTEs → reserved-bit #PF; heap/stack poison read
+// in userspace → SIG1).
+//
+// Rather than chase the exact leaking path (a long tail in the COW/refcount/
+// TLB-shootdown machinery — see plan.md / DOCS.md), we close the WINDOW: a
+// freed frame is not returned to the allocatable pool immediately. It sits in a
+// FIFO quarantine of depth QUARANTINE_DEPTH; only the oldest frame is actually
+// released (its bitmap bit cleared) when a new free pushes it out. Under load,
+// thousands of frees/sec and per-tick context switches on every CPU mean that
+// by the time a frame is reissued (QUARANTINE_DEPTH frees later) every CPU has
+// reloaded CR3 (a full TLB flush, since CR4.PGE is off) many times — so any
+// stale TLB entry for the frame is gone.
+//
+// TRADEOFFS / LIMITATIONS (deliberate — see DOCS.md design note):
+//  * Holds up to QUARANTINE_DEPTH frames out of circulation (bounded ~4 MiB at
+//    1024). Negligible vs total RAM.
+//  * The grace period is a function of free/context-switch RATE, not a formally
+//    proven all-CPU TLB epoch. Effective under the churn that triggers the bug;
+//    a future hardening would gate release on an explicit all-CPU TLB epoch
+//    counter instead of FIFO depth.
+//  * Closes the STALE-TLB sub-case (the captured signature: frames freed via
+//    FreeTableLevel with the PTE already gone). It does NOT fix a hypothetical
+//    LIVE-PTE refcount UNDERCOUNT (a process still holding a present PTE to the
+//    freed frame) — that PTE would persist past the quarantine. No evidence of
+//    that sub-case yet; the reverse-map diagnostic (idt.cpp/scheduler.cpp) would
+//    surface it. If it appears, the refcount path needs a separate fix.
+// ---------------------------------------------------------------------------
+static constexpr uint32_t QUARANTINE_DEPTH = 1024;
+static uint32_t g_quarRing[QUARANTINE_DEPTH];
+static uint32_t g_quarHead  = 0;   // next write slot
+static uint32_t g_quarCount = 0;   // frames currently held
+static bool     g_quarantineOn = true;
+
+// Caller MUST hold g_pmmLock. Release a frame's bitmap bit + free accounting.
+static inline void ReleaseFrameLocked(uint32_t idx)
+{
+    SetFree(idx);
+    g_freePages++;
+    if (idx < g_nextHint) g_nextHint = idx;
+}
+
+// Caller MUST hold g_pmmLock. Retire a frame that has reached refcount 0 and had
+// its descriptor reset. With quarantine on, defer the actual release by
+// QUARANTINE_DEPTH frees; otherwise release immediately (legacy behaviour).
+static inline void RetireFrameLocked(uint32_t idx)
+{
+    if (!g_quarantineOn)
+    {
+        ReleaseFrameLocked(idx);
+        return;
+    }
+    if (g_quarCount == QUARANTINE_DEPTH)
+    {
+        // Ring full: evict the oldest and actually release it now.
+        uint32_t evicted = g_quarRing[g_quarHead];
+        ReleaseFrameLocked(evicted);
+    }
+    else
+    {
+        g_quarCount++;
+    }
+    g_quarRing[g_quarHead] = idx;            // frame stays bitmap-USED (not allocatable)
+    g_quarHead = (g_quarHead + 1) % QUARANTINE_DEPTH;
+}
+
 // Mark [physBase, physBase + pages*PAGE_SIZE) as used.
 // Decrements g_freePages for each page that was previously free.
 static void MarkRangeUsed(uint64_t physBase, uint64_t pages)
@@ -435,6 +507,16 @@ void PmmFreePage(PhysicalAddress physAddr)
 
     if (!IsUsed(idx)) { IrqSpinLockRelease(&g_pmmLock, pmmFlags); return; }
 
+    // BRO-179 quarantine: a frame already retired (descriptor reset to Free) but
+    // still bitmap-USED because it is sitting in the quarantine ring. A second
+    // free of it must NOT re-quarantine (double free → frame released twice).
+    if (g_pageDescs && Desc(static_cast<uint32_t>(idx)).tag
+                       == static_cast<uint8_t>(MemTag::Free))
+    {
+        IrqSpinLockRelease(&g_pmmLock, pmmFlags);
+        return;
+    }
+
     // If refcounted and shared, just decrement — don't free yet. Also drop the
     // page from this owner's PID list: once a page is shared, the page-table
     // walk (FreeTableLevel) is the single freeing authority and decrements once
@@ -451,10 +533,6 @@ void PmmFreePage(PhysicalAddress physAddr)
         IrqSpinLockRelease(&g_pmmLock, pmmFlags);
         return;
     }
-
-    SetFree(idx);
-    g_freePages++;
-    if (idx < g_nextHint) g_nextHint = idx;
 
     if (g_pageDescs)
     {
@@ -475,6 +553,10 @@ void PmmFreePage(PhysicalAddress physAddr)
         d.refCount = 0;
         __atomic_store_n(&d.mapCount, 0, __ATOMIC_RELAXED);
     }
+
+    // Retire (quarantine then release the oldest) — defers reuse so a stale TLB
+    // entry for this frame is gone before it is handed to a new owner.
+    RetireFrameLocked(static_cast<uint32_t>(idx));
 
     IrqSpinLockRelease(&g_pmmLock, pmmFlags);
 }
@@ -571,6 +653,15 @@ void PmmUnrefPage(PhysicalAddress physAddr)
 
     uint64_t pmmFlags = IrqSpinLockAcquire(&g_pmmLock);
     auto& d = Desc(idx);
+    // BRO-179 quarantine: already retired (tag reset to Free) but still
+    // bitmap-USED while it sits in the quarantine ring — a further unref must
+    // not retire it again (double free).
+    if (IsUsed(idx) && d.tag == static_cast<uint8_t>(MemTag::Free)
+                    && d.refCount == 0)
+    {
+        IrqSpinLockRelease(&g_pmmLock, pmmFlags);
+        return;
+    }
     if (d.refCount > 1)
     {
         d.refCount--;
@@ -585,18 +676,21 @@ void PmmUnrefPage(PhysicalAddress physAddr)
         return; // still shared, don't free
     }
     // refCount is 0 or 1 — this was the last (or only) reference, actually free
+    bool retire = false;
     if (IsUsed(idx))
     {
         MapLeakCheckLocked(idx, "PmmUnrefPage");
         if (d.tag == static_cast<uint8_t>(MemTag::User))
             FreeLogRecord(physAddr.raw(), d.pid, "PmmUnrefPage");
-        SetFree(idx);
-        g_freePages++;
-        if (idx < g_nextHint) g_nextHint = idx;
+        retire = true;
     }
     ListRemove(idx);
     d = { PMM_NULL_PAGE, PMM_NULL_PAGE, 0,
           static_cast<uint8_t>(MemTag::Free), 0, 0 };
+    // Quarantine the frame (defer reuse) instead of releasing it immediately,
+    // so a stale TLB entry is gone before the frame is handed to a new owner.
+    if (retire)
+        RetireFrameLocked(idx);
     IrqSpinLockRelease(&g_pmmLock, pmmFlags);
 }
 
@@ -849,18 +943,19 @@ void PmmKillPid(uint16_t pid)
         }
         else
         {
-            // Exclusive page — actually free it
+            // Exclusive page — actually free it (via quarantine)
+            bool retire = false;
             if (IsUsed(idx))
             {
                 MapLeakCheckLocked(idx, "PmmKillPid");
                 if (Desc(idx).tag == static_cast<uint8_t>(MemTag::User))
                     FreeLogRecord(static_cast<uint64_t>(idx) * PAGE_SIZE, pid, "PmmKillPid");
-                SetFree(idx);
-                g_freePages++;
-                if (idx < g_nextHint) g_nextHint = idx;
+                retire = true;
             }
             Desc(idx) = { PMM_NULL_PAGE, PMM_NULL_PAGE, 0,
                           static_cast<uint8_t>(MemTag::Free), 0, 0 };
+            if (retire)
+                RetireFrameLocked(idx);
         }
         count++;
 
@@ -903,12 +998,10 @@ void PmmFreeByTag(uint16_t pid, MemTag tag)
                 g_pidLists[pid].tail = prev;
             g_pidLists[pid].pageCount--;
 
-            // Free the page
-            SetFree(idx);
-            g_freePages++;
-            if (idx < g_nextHint) g_nextHint = idx;
+            // Free the page (via quarantine)
             Desc(idx) = { PMM_NULL_PAGE, PMM_NULL_PAGE, 0,
                           static_cast<uint8_t>(MemTag::Free), 0, 0 };
+            RetireFrameLocked(idx);
             count++;
         }
 
