@@ -304,6 +304,39 @@ void KRwLockCleanupOnExit(Process* p)
         ProcessDumpFreeLog(p);
         return;
     }
+    // BRO-179: a LIVE process (magic intact) was observed with a poison VALUE in
+    // its heldWriteLock field (rax=0xDFDF... -> #GP at the lock acquire). That is
+    // NOT a whole-struct UAF; it is corruption of the lock-pointer field itself
+    // on an otherwise-live Process. Detect poison in each lock pointer, name the
+    // field + process identity/state, and neutralize it (treat as null) so we
+    // don't fault and the run survives to reveal the writer.
+    auto isPoison = [](void* v) {
+        uint64_t u = reinterpret_cast<uint64_t>(v);
+        return (u >> 32) == 0xDFDFDFDFULL || (u & 0xFFFFFFFFULL) == 0xDFDFDFDFULL;
+    };
+    if (isPoison(p->heldWriteLock) || isPoison(p->heldReadLock) ||
+        isPoison(p->blockedOnRwLock)) {
+        SerialPrintf("BRO179-RWLOCKFIELD-POISON: LIVE proc=%p pid=%u incarnation=%lu "
+                     "state=%d heldWriteLock=%p heldReadLock=%p blockedOnRwLock=%p "
+                     "blockedAsWriter=%d — lock-pointer field holds heap poison!\n",
+                     p, (unsigned)p->pid, p->incarnation, (int)p->state,
+                     (void*)p->heldWriteLock, (void*)p->heldReadLock,
+                     (void*)p->blockedOnRwLock, (int)p->blockedAsWriter);
+        // Re-read magic NOW: if the struct has since been poisoned/zeroed, the
+        // magic check above passed but a concurrent FreeProcessStruct(p) has
+        // freed p underneath us — a TOCTOU between the magic read and the field
+        // read (the racing free poisons the whole block, including these
+        // fields). The free-log names the racing free site.
+        SerialPrintf("  magic-now=0x%lx (expected 0x%lx) — %s\n",
+                     p->magic, PROCESS_MAGIC,
+                     p->magic == PROCESS_MAGIC ? "still live: genuine field corruption"
+                                               : "POISONED NOW: concurrent free TOCTOU");
+        ProcessDumpFreeLog(p);
+        if (isPoison(p->heldWriteLock))  p->heldWriteLock  = nullptr;
+        if (isPoison(p->heldReadLock))   p->heldReadLock   = nullptr;
+        if (isPoison(p->blockedOnRwLock)) p->blockedOnRwLock = nullptr;
+        return;
+    }
 #endif
 
     // Case 1: Thread holds a write lock — release it.
