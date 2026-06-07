@@ -56,7 +56,12 @@ enum : uint8_t {
     REFOP_FREE  = 3,   // actually freed (refcount hit 0)
 };
 struct FreeRec { uint64_t phys; uint32_t seq; uint16_t ownerPid; uint8_t op; uint8_t count; const char* site; };
-static constexpr uint32_t FREELOG_SIZE = 1u << 17; // 131072 records (ref+unref doubles volume)
+// BRO-179: logging ALL alloc/free tags (not just User) ~triples record volume,
+// so a frame's cross-domain history is held for a shorter seq window than the
+// old User-only log — but recent kernel use of a frame (the SIG1 gap) still
+// shows. Ring kept at 2^17 (the known-good size; 2^19 overflowed the kernel
+// load region and faulted at boot).
+static constexpr uint32_t FREELOG_SIZE = 1u << 17; // 131072 records
 static FreeRec  g_freeLog[FREELOG_SIZE];
 static uint32_t g_freeLogSeq = 0;
 static bool     g_freeLogOn  = false;
@@ -203,8 +208,18 @@ static inline void TrackAlloc(uint32_t pageIdx, MemTag tag, uint16_t pid)
     // A freshly (re)allocated frame has no mappers yet. Reset the map accounting
     // so a recycled page starts clean regardless of how it was freed.
     __atomic_store_n(&Desc(pageIdx).mapCount, 0, __ATOMIC_RELAXED);
-    if (tag == MemTag::User)
-        RefLogRecord(static_cast<uint64_t>(pageIdx) * PAGE_SIZE, pid, REFOP_ALLOC, 1, "alloc");
+    // BRO-179: log EVERY allocation tag (not just User) so a frame's free-log
+    // trail reveals cross-domain transitions — e.g. a frame that goes
+    // User→(free)→Heap→(free)→User, which is the SIG1 path where a recycled
+    // user frame briefly served the kernel heap (and got 0xDFDF kfree-poison)
+    // between two user lives. The tag name rides in the `site` string.
+    static const char* kAllocSite[8] = {
+        "alloc:Free","alloc:KCode","alloc:KData","alloc:PageTable",
+        "alloc:Heap","alloc:Device","alloc:User","alloc:System"
+    };
+    uint8_t t = static_cast<uint8_t>(tag);
+    RefLogRecord(static_cast<uint64_t>(pageIdx) * PAGE_SIZE, pid, REFOP_ALLOC, 1,
+                 t < 8 ? kAllocSite[t] : "alloc:?");
 }
 
 // ---------------------------------------------------------------------------
@@ -445,8 +460,15 @@ void PmmFreePage(PhysicalAddress physAddr)
     {
         PageDescriptor& d = Desc(static_cast<uint32_t>(idx));
         MapLeakCheckLocked(static_cast<uint32_t>(idx), "PmmFreePage");
-        if (d.tag == static_cast<uint8_t>(MemTag::User))
-            FreeLogRecord(physAddr.raw(), d.pid, "PmmFreePage");
+        // BRO-179: log frees of ALL tags (not just User) so the trail shows
+        // kernel-domain (Heap/PageTable/KData) frees too — the cross-domain
+        // transition we're hunting.
+        static const char* kFreeSite[8] = {
+            "free:Free","free:KCode","free:KData","free:PageTable",
+            "free:Heap","free:Device","free:User","free:System"
+        };
+        FreeLogRecord(physAddr.raw(), d.pid,
+                      d.tag < 8 ? kFreeSite[d.tag] : "free:?");
         ListRemove(static_cast<uint32_t>(idx));
         d.pid = 0;
         d.tag = static_cast<uint8_t>(MemTag::Free);
