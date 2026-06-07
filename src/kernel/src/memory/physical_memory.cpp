@@ -530,6 +530,38 @@ void PmmRefPage(PhysicalAddress physAddr)
     IrqSpinLockRelease(&g_pmmLock, pmmFlags);
 }
 
+// BRO-179: atomically pin a frame ONLY if it is still live (used + refCount>0).
+// Returns true and increments the refcount if the frame is alive; returns false
+// (and does nothing) if the frame is already free. Unlike PmmRefPage this never
+// RESURRECTS a freed frame. Used by VmmCowResolveWrite to pin the COW source
+// across the page memcpy: the teardown unref path (FreeTableLevel→PmmUnrefPage,
+// from ProcessDestroy) does NOT take g_userPtLock, so without this pin a
+// concurrent unref could drop the source to 0, free it, and let it be recycled
+// (to the kernel heap → 0xDFDF poison) while the memcpy reads it. The
+// check+increment are one atomic step under g_pmmLock, closing the TOCTOU
+// between the caller's PTE-present check and the copy.
+bool PmmRefPageIfAlive(PhysicalAddress physAddr)
+{
+    if (!g_pageDescs || !physAddr) return false;
+    uint64_t idx64 = physAddr.raw() / PAGE_SIZE;
+    if (idx64 >= g_totalPages) return false;
+    uint32_t idx = static_cast<uint32_t>(idx64);
+
+    uint64_t pmmFlags = IrqSpinLockAcquire(&g_pmmLock);
+    auto& d = Desc(idx);
+    if (!IsUsed(idx) || d.refCount == 0)
+    {
+        IrqSpinLockRelease(&g_pmmLock, pmmFlags);
+        return false;  // already free — do NOT resurrect
+    }
+    if (d.refCount < 255)
+        d.refCount++;
+    if (d.tag == static_cast<uint8_t>(MemTag::User))
+        RefLogRecord(physAddr.raw(), d.pid, REFOP_REF, d.refCount, "PmmRefPin");
+    IrqSpinLockRelease(&g_pmmLock, pmmFlags);
+    return true;
+}
+
 void PmmUnrefPage(PhysicalAddress physAddr)
 {
     if (!g_pageDescs || !physAddr) return;

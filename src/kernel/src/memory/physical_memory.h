@@ -89,6 +89,10 @@ void PmmFreeByTag(uint16_t pid, MemTag tag);
 // PmmGetRefCount returns the current refcount (0 if untracked).
 void     PmmRefPage(PhysicalAddress physAddr);
 void     PmmUnrefPage(PhysicalAddress physAddr);
+// BRO-179: atomically pin a frame only if still live (used + refCount>0).
+// Returns true (and increments) if alive, false if already free (never
+// resurrects). Used to pin a COW source across the copy.
+bool     PmmRefPageIfAlive(PhysicalAddress physAddr);
 uint8_t  PmmGetRefCount(PhysicalAddress physAddr);
 
 // BRO-176 stale-mapping detector: track the number of present USER PTEs that

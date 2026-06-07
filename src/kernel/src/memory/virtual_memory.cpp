@@ -662,10 +662,37 @@ VmmCowResult VmmCowResolveWrite(PageTable pt, VirtualAddress faultAddr, uint16_t
             return VmmCowResult::OutOfMemory;
         }
 
-        auto* src = reinterpret_cast<const uint64_t*>(PhysToVirt(oldPhys).raw());
+        // BRO-179: pin the source frame across the copy. We hold g_userPtLock,
+        // which serializes against concurrent COW faults, fork's COW-share, and
+        // munmap/mprotect — but NOT against the teardown unref path
+        // (FreeTableLevel->PmmUnrefPage in ProcessDestroy), which takes only
+        // g_pmmLock. Without an explicit pin, a concurrent unref could drop
+        // oldPhys to 0, free it, and let it be recycled (e.g. to the kernel heap,
+        // which writes 0xDFDFDFDF kfree-poison) WHILE the memcpy below reads it —
+        // the cross-domain frame reuse that made a user process read heap poison
+        // (SIG1). PmmRefPageIfAlive bumps the refcount only if the frame is still
+        // live, atomically under g_pmmLock, closing the TOCTOU between the
+        // PTE-present check above and the copy.
+        bool pinned = (oldRc != 0) && PmmRefPageIfAlive(oldPhys);
+
         auto* dst = reinterpret_cast<uint64_t*>(PhysToVirt(newPhys).raw());
-        for (uint64_t b = 0; b < PAGE_SIZE / sizeof(uint64_t); b++)
-            dst[b] = src[b];
+        if (pinned)
+        {
+            // Source is pinned-alive: safe to copy its contents.
+            auto* src = reinterpret_cast<const uint64_t*>(PhysToVirt(oldPhys).raw());
+            for (uint64_t b = 0; b < PAGE_SIZE / sizeof(uint64_t); b++)
+                dst[b] = src[b];
+            PmmUnrefPage(oldPhys);  // drop the pin
+        }
+        else
+        {
+            // Source is already free (oldRc==0, or freed between the PTE check
+            // and the pin): its bytes are untrustworthy — it may have been
+            // recycled and poisoned. Do NOT propagate poison into the child;
+            // give it a zeroed page. This is the freed-while-COW-mapped bug; the
+            // oldRc==0 detector above logs it.
+            ZeroPage(newPhys);
+        }
 
         uint64_t newPte = (newPhys.raw() & PHYS_MASK)
                         | ((*pte) & ~(PHYS_MASK | PTE_COW_BIT))
@@ -682,10 +709,9 @@ VmmCowResult VmmCowResolveWrite(PageTable pt, VirtualAddress faultAddr, uint16_t
             PmmMapDec(oldPhys);
         PmmMapInc(newPhys);
 
-        // Safe to drop our ref AFTER repointing the PTE and copying: we still
-        // held a reference throughout the copy, so the source could not be
-        // freed underneath us even if another owner unref'd concurrently.
-        // (When oldRc==0 we skip the unref — there is no ref of ours to drop.)
+        // Drop THIS owner's original reference on the shared source (the COW PTE
+        // we just repointed). Separate from the copy pin above. (When oldRc==0
+        // there is no reference of ours to drop.)
         if (oldRc != 0)
             PmmUnrefPage(oldPhys);
     }
