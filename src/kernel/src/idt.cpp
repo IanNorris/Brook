@@ -1333,6 +1333,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
             // Scan the user stack upward for the first poison qword and describe
             // the frame it lives in (may differ from RSP's page).
             uint64_t lastPoisonVA = 0;
+            uint64_t poisonPhys = 0;
             for (int i = 0; i < 512; ++i) {
                 uint64_t slotVA = ef->rsp + static_cast<uint64_t>(i) * 8;
                 uint64_t v = readUser64(slotVA);
@@ -1341,8 +1342,21 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                     if (pageVA != lastPoisonVA) {
                         describePoisonFrame("STACK-POISON", slotVA);
                         lastPoisonVA = pageVA;
+                        if (!poisonPhys) poisonPhys = vaToPhys(slotVA) & ~0xFFFULL;
                     }
                 }
+            }
+            // BRO-179: name every live process that maps the poison-bearing
+            // stack frame. Authoritative (lock-free direct-map page walk; all
+            // APs already halted by SmpHaltAllAPs above). If a process OTHER than
+            // the faulting one maps it, this frame was handed to two owners at
+            // once (cross-domain reuse) — names the leaking co-owner. Uses the
+            // RSP frame if no explicit poison qword was localized.
+            {
+                uint64_t pp = poisonPhys ? poisonPhys
+                                         : (vaToPhys(ef->rsp) & ~0xFFFULL);
+                if (pp)
+                    ProcessDumpFrameMappers(pp);
             }
         }
     }
