@@ -101,6 +101,9 @@ void SerialPutChar(char c)
 // dump and rendering it unreadable on the serial log.
 static volatile uint32_t g_panicInProgress = 0;
 
+// BRO-179 stress-test toggle (see serial.h). Default false = verbose.
+volatile bool g_hotLogQuiet = false;
+
 void SerialPuts(const char* str)
 {
     if (!str) return;

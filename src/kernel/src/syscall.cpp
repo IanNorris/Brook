@@ -4843,6 +4843,7 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
     if (!CopyUserCString(pathAddr, kPath, sizeof(kPath))) return -EFAULT;
 
     DbgPrintf("sys_execve: pid=%u path='%s'\n", proc->pid, kPath);
+    if (!g_hotLogQuiet)
     {
         extern volatile uint64_t g_lapicTickCount;
         SerialPrintf("[PROFILE] execve t=%lums pid=%u '%s'\n",

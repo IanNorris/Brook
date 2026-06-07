@@ -260,11 +260,12 @@ static void PresentStatsReport()
     uint32_t meanL = static_cast<uint32_t>(sumL / n);
     uint32_t fps   = meanP ? (1000u / meanP) : 0;
 
-    SerialPrintf("COMPOSITOR stats[%u]: period min=%u mean=%u max=%u ms "
-                 "(%u fps); loop min=%u mean=%u max=%u ms; "
-                 "frames>33ms=%u >50ms=%u >100ms=%u\n",
-                 n, minP, meanP, maxP, fps, minL, meanL, maxL,
-                 over33, over50, over100);
+    if (!g_hotLogQuiet)
+        SerialPrintf("COMPOSITOR stats[%u]: period min=%u mean=%u max=%u ms "
+                     "(%u fps); loop min=%u mean=%u max=%u ms; "
+                     "frames>33ms=%u >50ms=%u >100ms=%u\n",
+                     n, minP, meanP, maxP, fps, minL, meanL, maxL,
+                     over33, over50, over100);
 }
 
 // Wallpaper: raw XRGB pixel data loaded from disk, or solid color fallback.

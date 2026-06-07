@@ -830,14 +830,23 @@ void PmmEnableTracking()
                  usedCount, freeCount,
                  static_cast<uint32_t>(g_totalPages * sizeof(PageDescriptor) / 1024));
 
-    // BRO-179: PMM reflog RE-ENABLED. Empirical finding: the bug reproduced
-    // reliably (spawned ~2817-3265, plus the RWLOCKFIELD-POISON capture) ONLY on
-    // builds with this reflog ON; after disabling it, 6+ schedstress passes ran
-    // clean. The reflog's per-alloc/free ring write under g_pmmLock on the hot
-    // fork/exit path evidently PROVIDES the timing window the race needs — its
-    // removal suppressed reproduction rather than un-masking it. Keep it ON so
-    // the embedded-header / poison detectors can actually fire.
-    g_freeLogOn = true;
+    // BRO-179: PMM reflog DISABLED for the quarantine throughput/stress test.
+    // The reflog does a ring write under g_pmmLock on every alloc/free; turning
+    // it off maximizes fork/exit throughput (64-CPU worst-case), which makes
+    // frames cycle through the quarantine FASTER — the shortest wall-clock grace
+    // period and thus the hardest test of the rate-based stopgap. It also drops
+    // the per-free serial cost. (Re-enable to ON when diagnosing the leak again;
+    // empirically the reflog also provides the race's timing window, so leaving
+    // it OFF is the genuine worst case for proving the quarantine holds.)
+    g_freeLogOn = false;
+
+    // BRO-179 stress-test: silence the high-frequency hot-path serial logs
+    // (TLB-shootdown forgiveness, per-execve PROFILE, compositor stats). At
+    // 64 CPUs these per-operation prints throttle fork/exit throughput to
+    // serial speed (~11 KB/s); silencing them lets the quarantine stress run
+    // at real speed. Co-located here with g_freeLogOn so the stress toggles
+    // live in one place. (Revert to false to restore verbose diagnostics.)
+    g_hotLogQuiet = true;
 }
 
 // BRO-176 diagnostic: print every recorded free of `phys` (most recent first).

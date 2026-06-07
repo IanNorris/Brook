@@ -984,14 +984,16 @@ static void TlbShootdownWait(uint32_t myCpu, uint64_t targetMask,
 
             if (forgiven > 0 && stillWaiting == 0)
             {
-                SerialPrintf("TLB_SHOOTDOWN: forgave %u CPU(s) (different CR3), cr3=0x%lx addr=0x%lx\n",
-                             forgiven, targetCr3, addr);
+                if (!g_hotLogQuiet)
+                    SerialPrintf("TLB_SHOOTDOWN: forgave %u CPU(s) (different CR3), cr3=0x%lx addr=0x%lx\n",
+                                 forgiven, targetCr3, addr);
                 break;
             }
             else if (forgiven > 0 || stillWaiting > 0)
             {
-                SerialPrintf("TLB_SHOOTDOWN: forgave %u, waiting for %u on target CR3=0x%lx\n",
-                             forgiven, stillWaiting, targetCr3);
+                if (!g_hotLogQuiet)
+                    SerialPrintf("TLB_SHOOTDOWN: forgave %u, waiting for %u on target CR3=0x%lx\n",
+                                 forgiven, stillWaiting, targetCr3);
                 // Reset spin counter to keep waiting for CPUs on target CR3
                 spins = 0;
             }

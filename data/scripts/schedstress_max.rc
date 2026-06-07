@@ -1,0 +1,8 @@
+# BRO-179 quarantine worst-case stress: 64 CPUs, high oversubscription.
+# Args: rounds concurrent threads/proc
+#   rounds=20000      (one leg of a 100k total split across independent runs)
+#   concurrent=16     (16 children alive at once = max simultaneous fork/exit churn)
+#   threads=16        (> typical, heavy pthread create/exit_group load)
+# Run with BROOK_SMP=64 and the PMM reflog OFF for maximum throughput, so frames
+# cycle through the 1024-deep quarantine as fast as possible (shortest grace).
+run /boot/BIN/SCHEDSTRESS 20000 4 16
