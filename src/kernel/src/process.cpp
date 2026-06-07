@@ -631,6 +631,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     proc->runningOnCpu = -1;
     proc->cpuAffinity = -1;
     proc->tlbCpuMask = 0;
+    proc->asTlbCpuMask = 0;
     proc->schedPriority = 2;  // SCHED_PRIORITY_NORMAL
     proc->umask = 022;         // Default umask
 
@@ -869,6 +870,7 @@ Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
     proc->runningOnCpu = -1;
     proc->cpuAffinity = -1;
     proc->tlbCpuMask = 0;
+    proc->asTlbCpuMask = 0;
     proc->isKernelThread = true;
     proc->schedPriority = priority;
 
@@ -1038,7 +1040,7 @@ void ProcessDestroy(Process* proc)
         // teardown path (ProcessExec). The reaper runs on CPU0 and never has a
         // terminated process's page table loaded, so unlike exec there is no
         // local CR3 to switch away first.
-        TlbShootdownFull(proc->pageTable.pml4.raw(), proc->tlbCpuMask);
+        TlbShootdownFull(proc->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
 
         // Clear lazy VMAs before page-table destruction. MemFd PTEs point at
         // memfd-owned pages, and file VMAs hold vnode references independent of
@@ -1351,6 +1353,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->runningOnCpu = -1;
     child->cpuAffinity = -1;
     child->tlbCpuMask = 0;
+    child->asTlbCpuMask = 0;
     child->reapable = false;
     child->compositorRegistered = false;
     child->refCount = 0;             // BRO-173/175: fresh process holds no external refs
@@ -1411,7 +1414,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     // Copy writable user pages and share read-only mappings.
     if (!ForkCopyUserPages(parent->pageTable, child->pageTable,
                            parent->pid, child->pid,
-                           parent->tlbCpuMask))
+                           *AddressSpaceTlbMaskPtr(parent)))
     {
         SerialPuts("FORK: address space copy failed\n");
         VmmDestroyUserPageTable(child->pageTable);
@@ -1606,6 +1609,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     thread->runningOnCpu = -1;
     thread->cpuAffinity = leader->cpuAffinity;
     thread->tlbCpuMask = 0;
+    thread->asTlbCpuMask = 0;
     thread->reapable = false;
     thread->compositorRegistered = false;
     thread->refCount = 0;            // BRO-173/175: fresh thread holds no external refs
@@ -1908,7 +1912,7 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     bool wasThread = proc->isThread;
 
     // Flush TLB entries for the old address space on all remote CPUs
-    TlbShootdownFull(oldPt.pml4.raw(), proc->tlbCpuMask);
+    TlbShootdownFull(oldPt.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
 
     __asm__ volatile("mov %0, %%cr3" : : "r"(kernelPt.pml4.raw()) : "memory");
 
@@ -1929,6 +1933,7 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     }
     // Old address space is gone (or detached) — reset TLB CPU mask
     proc->tlbCpuMask = 0;
+    proc->asTlbCpuMask = 0;
     // NOTE: PmmFreeByTag removed here. VmmDestroyUserPageTable already calls
     // PmmUnrefPage on every leaf PTE, which correctly frees pages at refcount=0
     // and preserves pages still referenced by the global file page cache.

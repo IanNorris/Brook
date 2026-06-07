@@ -1354,6 +1354,9 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
     __atomic_store_n(&newProc->runningOnCpu, static_cast<int32_t>(cpu), __ATOMIC_RELEASE);
     // Track which CPUs have this process's TLB entries loaded
     __atomic_or_fetch(&newProc->tlbCpuMask, 1ULL << cpu, __ATOMIC_RELEASE);
+    // BRO-176/SIG1: also record this CPU in the address-space footprint mask
+    // (leader-owned union) so shootdowns reach every sibling-thread CPU.
+    __atomic_or_fetch(AddressSpaceTlbMaskPtr(newProc), 1ULL << cpu, __ATOMIC_RELEASE);
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
 
     // Store requeue info in per-CPU state BEFORE context_switch.
@@ -1922,6 +1925,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     next->state = ProcessState::Running;
     __atomic_store_n(&next->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
     __atomic_or_fetch(&next->tlbCpuMask, 1ULL << cpu, __ATOMIC_RELEASE);
+    __atomic_or_fetch(AddressSpaceTlbMaskPtr(next), 1ULL << cpu, __ATOMIC_RELEASE);
     // Keep per-CPU currentCr3 in sync with the address space we're switching to.
     // Without this the value stays stale (= the exiting process's CR3), and the
     // TLB-shootdown timeout-forgiveness path (apic.cpp) would mis-read it: a CPU
@@ -1969,6 +1973,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     first->state = ProcessState::Running;
     __atomic_store_n(&first->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
     __atomic_or_fetch(&first->tlbCpuMask, 1ULL << cpu, __ATOMIC_RELEASE);
+    __atomic_or_fetch(AddressSpaceTlbMaskPtr(first), 1ULL << cpu, __ATOMIC_RELEASE);
     SmpSetCurrentCr3(cpu, first->savedCtx.cr3);  // keep tracking in sync (see exit path)
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
     GdtSetTssRsp0ForCpu(cpu, first->kernelStackTop);
@@ -2035,6 +2040,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     first->state = ProcessState::Running;
     __atomic_store_n(&first->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
     __atomic_or_fetch(&first->tlbCpuMask, 1ULL << cpu, __ATOMIC_RELEASE);
+    __atomic_or_fetch(AddressSpaceTlbMaskPtr(first), 1ULL << cpu, __ATOMIC_RELEASE);
     SmpSetCurrentCr3(cpu, first->savedCtx.cr3);  // keep tracking in sync (see exit path)
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
     GdtSetTssRsp0ForCpu(cpu, first->kernelStackTop);

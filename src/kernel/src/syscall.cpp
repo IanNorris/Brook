@@ -3995,7 +3995,7 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
 
     // Permission changes may leave stale TLB entries on remote CPUs
     if (pages > 0)
-        TlbShootdownFull(proc->pageTable.pml4.raw(), proc->tlbCpuMask);
+        TlbShootdownFull(proc->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
 
     return 0;
 }
@@ -4133,7 +4133,7 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t,
 
     // Flush stale TLB entries on remote CPUs after bulk unmap
     if (pages > 0)
-        TlbShootdownFull(proc->pageTable.pml4.raw(), proc->tlbCpuMask);
+        TlbShootdownFull(proc->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
 
     if (unmappedMfd) MemFdUnref(unmappedMfd);
 
@@ -4195,7 +4195,7 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
                 VirtualAddress va(old_addr + i * 4096);
                 VmmUnmapPage(proc->pageTable, va);
             }
-            TlbShootdownFull(proc->pageTable.pml4.raw(), proc->tlbCpuMask);
+            TlbShootdownFull(proc->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
             m.length = newPages * 4096;
             return static_cast<int64_t>(old_addr);
         }
@@ -4228,7 +4228,7 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
                 VmmUnmapPage(proc->pageTable, oldVA);
             }
         }
-        TlbShootdownFull(proc->pageTable.pml4.raw(), proc->tlbCpuMask);
+        TlbShootdownFull(proc->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
 
         // Update the memfdMaps entry to reflect the new address and size.
         m.vaddr  = newAddr;
@@ -4252,7 +4252,7 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
                 PmmUnrefPage(phys);
             }
         }
-        TlbShootdownFull(proc->pageTable.pml4.raw(), proc->tlbCpuMask);
+        TlbShootdownFull(proc->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
         return static_cast<int64_t>(old_addr);
     }
 
@@ -4291,7 +4291,7 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
             PmmUnrefPage(phys);
         }
     }
-    TlbShootdownFull(proc->pageTable.pml4.raw(), proc->tlbCpuMask);
+    TlbShootdownFull(proc->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
 
     DbgPrintf("sys_mremap: 0x%lx (%lu) -> 0x%lx (%lu)\n",
               old_addr, oldPages, newAddr, newPages);

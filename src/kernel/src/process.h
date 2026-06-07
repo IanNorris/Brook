@@ -251,6 +251,21 @@ struct Process
     int32_t  runningOnCpu;   // CPU index (-1 = not running, used for double-schedule detection)
     int32_t  cpuAffinity;    // CPU affinity pin (-1 = any CPU, >=0 = pinned to that CPU)
     volatile uint64_t tlbCpuMask;  // Bitmask of CPUs that have this process's CR3 loaded in TLB
+    // BRO-176/SIG1: address-space TLB footprint, maintained ONLY on the
+    // thread-group leader (threadLeader==self).  tlbCpuMask above is PER-THREAD
+    // and undercounts the address space's real TLB footprint: a thread group
+    // shares one page table / CR3 across all its threads, which may run on
+    // different CPUs simultaneously.  A shootdown that targets only the acting
+    // thread's tlbCpuMask misses sibling-thread CPUs that have the same shared
+    // mapping cached — so a freed user frame stays live in a sibling's TLB, is
+    // reused (e.g. as a page table), and the sibling's stale write corrupts it
+    // (the SIG1 reserved-bit #PF).  asTlbCpuMask is the UNION of every sibling
+    // thread's CPU since the address space was created (monotonic until the AS
+    // is replaced at fork/exec).  ALL user-page shootdowns must target this, not
+    // tlbCpuMask.  Over-approximation is safe: the shootdown IPI handler filters
+    // by CR3 (apic.cpp), so a CPU not running this address space acks without
+    // flushing.
+    volatile uint64_t asTlbCpuMask;
     // BRO-173/175: liveness refcount — counts external holders of a raw
     // Process* that could deref this struct (a CPU currently running it, a
     // SchedulerKillThreadGroup leader's snapshot, the compositor's VFB
@@ -517,6 +532,18 @@ struct Process
     volatile uint32_t inputHead;  // Write index (compositor)
     volatile uint32_t inputTail;  // Read index (process/syscall)
 };
+
+// BRO-176/SIG1: returns a pointer to the address-space TLB footprint mask for
+// `p`, which lives on the thread-group leader (threadLeader==self for a leader).
+// Use this — NOT p->tlbCpuMask — as the recipient set for every user-page TLB
+// shootdown, so sibling-thread CPUs sharing the address space are flushed too.
+// Falls back to `p` itself when threadLeader is null (e.g. idle/kernel threads,
+// whose mask never drives a user shootdown).
+static inline volatile uint64_t* AddressSpaceTlbMaskPtr(Process* p)
+{
+    Process* leader = p->threadLeader ? p->threadLeader : p;
+    return &leader->asTlbCpuMask;
+}
 
 // Push an input event to a process's per-process queue (non-blocking).
 inline void ProcessInputPush(Process* proc, const InputEvent& ev)

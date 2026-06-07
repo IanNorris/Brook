@@ -797,7 +797,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                     __asm__ volatile("invlpg (%0)" :: "r"(cr2cow & ~0xFFFULL) : "memory");
                     brook::TlbShootdown(cowProc->pageTable.pml4.raw(),
                                         cr2cow & ~0xFFFULL,
-                                        cowProc->tlbCpuMask);
+                                        *brook::AddressSpaceTlbMaskPtr(cowProc));
                     __asm__ volatile("sti");
                     return;
                 }
