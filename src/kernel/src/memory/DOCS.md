@@ -144,22 +144,35 @@ leaking path and instead **close the reuse window** durably, then move on.
 
 **The mechanism.** `PmmFreePage` / `PmmUnrefPage` / `PmmKillPid` / `PmmFreeByTag`
 no longer return a frame to the allocatable pool immediately. A retired frame
-enters a FIFO **quarantine ring** (`QUARANTINE_DEPTH = 1024`); it stays
-bitmap-`USED` (so the allocator skips it) until `QUARANTINE_DEPTH` further frees
-push it out, at which point it is actually released. Under the churn that
-triggers the bug (thousands of frees/sec, a context switch on every CPU each
-tick, `CR4.PGE` off so every `CR3` reload is a full TLB flush), a frame is
-reissued only after every CPU has flushed its TLB many times — so any stale TLB
-entry for it is gone before reuse. A double-retire guard on each path prevents a
-quarantined frame from being released twice.
+enters a FIFO **quarantine ring** (`QUARANTINE_DEPTH`); it stays bitmap-`USED`
+(so the allocator skips it) until `QUARANTINE_DEPTH` further frees push it out,
+at which point it is actually released. Under the churn that triggers the bug
+(thousands of frees/sec, a context switch on every CPU each tick, `CR4.PGE` off
+so every `CR3` reload is a full TLB flush), a frame is reissued only after every
+CPU has flushed its TLB many times — so any stale TLB entry for it is gone before
+reuse. A double-retire guard on each path prevents a quarantined frame from being
+released twice.
+
+**Depth must scale with throughput (BRO-179 64-CPU finding).** The grace period
+is `QUARANTINE_DEPTH` *frees*, so its wall-clock length shrinks as free
+throughput rises. `DEPTH = 1024` closed the window at 8 CPUs but was **too
+shallow at 64 CPUs** with hot-path logging off — a recycled frame returned before
+every CPU had flushed, and the corruption resurfaced (as a `CR2 = -16` user #PF;
+no `0xDFDF` because the stale write landed in a non-poison region). An A/B sweep
+was monotonic: quarantine **off** faulted most, `1024` faulted, `16384` ran clean
+(5000+ spawns, 0 faults, 0 OOM) — confirming the mechanism is correct and only
+the depth was undersized. The default is now **16384** (holds ≤ 64 MiB out of
+circulation). A heavier future workload could still outrun a fixed depth — which
+is exactly why the real fix is epoch-based, below.
 
 **Tradeoffs / limitations (accepted):**
-- Holds up to 1024 frames (~4 MiB) out of circulation at once — negligible.
+- Holds up to `QUARANTINE_DEPTH` frames (64 MiB at 16384) out of circulation —
+  negligible vs installed RAM.
 - The grace period is a function of the free / context-switch **rate**, not a
-  formally proven all-CPU TLB epoch. It is effective under the load that
-  triggers the bug; a light or idle system frees slowly, so a frame could in
-  principle be reissued before a TLB flush. The proper fix would gate release on
-  an explicit **all-CPU TLB epoch counter** rather than FIFO depth.
+  formally proven all-CPU TLB epoch. It is effective under the load tested; a
+  sufficiently higher throughput could in principle outrun any fixed depth. The
+  proper fix gates release on an explicit **all-CPU TLB epoch counter** rather
+  than FIFO depth, making it throughput-independent.
 - Closes the **stale-TLB** sub-case (the captured signature: frames freed via
   `FreeTableLevel` with the PTE already removed). It does **not** fix a
   hypothetical **live-PTE refcount undercount** (a process still holding a

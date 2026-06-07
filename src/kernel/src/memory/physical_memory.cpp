@@ -275,7 +275,17 @@ static inline void SetFree(uint64_t idx)
 //    that sub-case yet; the reverse-map diagnostic (idt.cpp/scheduler.cpp) would
 //    surface it. If it appears, the refcount path needs a separate fix.
 // ---------------------------------------------------------------------------
-static constexpr uint32_t QUARANTINE_DEPTH = 1024;
+// QUARANTINE_DEPTH must scale with peak free THROUGHPUT, not be a fixed grace.
+// Empirically (BRO-179): 1024 closed the window at 8 CPUs but was too shallow at
+// 64 CPUs with hot-path logging off (a recycled frame came back before every CPU
+// flushed its TLB → cross-domain corruption resurfaced as a CR2=-16 user #PF).
+// 16384 closes it at 64 CPUs. The A/B was monotonic — deeper is strictly safer —
+// confirming the mechanism is correct and only the depth was undersized. We hold
+// at most DEPTH frames out of circulation: 16384 * 4 KiB = 64 MiB, negligible vs
+// installed RAM. This is the documented rate-based limitation; the depth-
+// independent fix (release only after an all-CPU TLB epoch) is the real
+// follow-up (see DOCS.md). Sized generously here as the hardened stopgap.
+static constexpr uint32_t QUARANTINE_DEPTH = 16384;  // 64 MiB held; see note above
 static uint32_t g_quarRing[QUARANTINE_DEPTH];
 static uint32_t g_quarHead  = 0;   // next write slot
 static uint32_t g_quarCount = 0;   // frames currently held
