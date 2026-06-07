@@ -736,13 +736,14 @@ void PmmEnableTracking()
                  usedCount, freeCount,
                  static_cast<uint32_t>(g_totalPages * sizeof(PageDescriptor) / 1024));
 
-    // BRO-179: PMM reflog DISABLED to un-mask the SIG1 Heisenbug. Logging every
-    // alloc/free (all tags) does a ring write under g_pmmLock on the hot fork/
-    // exit path, perturbing timing enough to hide the race. The free-site
-    // detector (FreeProcessStruct + KRwLockCleanupOnExit in-flight) uses the
-    // separate, light Process free-log, so the PMM reflog is not needed to name
-    // the racing freer. Re-arm only if frame-level provenance is needed again.
-    g_freeLogOn = false; // was: true (BRO-176 diag)
+    // BRO-179: PMM reflog RE-ENABLED. Empirical finding: the bug reproduced
+    // reliably (spawned ~2817-3265, plus the RWLOCKFIELD-POISON capture) ONLY on
+    // builds with this reflog ON; after disabling it, 6+ schedstress passes ran
+    // clean. The reflog's per-alloc/free ring write under g_pmmLock on the hot
+    // fork/exit path evidently PROVIDES the timing window the race needs — its
+    // removal suppressed reproduction rather than un-masking it. Keep it ON so
+    // the embedded-header / poison detectors can actually fire.
+    g_freeLogOn = true;
 }
 
 // BRO-176 diagnostic: print every recorded free of `phys` (most recent first).
