@@ -1277,6 +1277,64 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
             rbp = next;
         }
 
+        // BRO-179 poison-origin trace: the freed-while-mapped sweep below is
+        // capped at 16 hits and only catches frames already in the free-log;
+        // it has been missing the EXACT frame the program dereferenced
+        // (0xDFDFDFDF, the heap kfree-poison written ONLY at heap.cpp:142).
+        // Here we find the first poison qword on the user stack, resolve its
+        // backing VA->phys, and dump that frame's CURRENT PMM descriptor +
+        // free-log. This names the poison-bearing frame's provenance (tag/pid
+        // transitions) directly, regardless of the sweep cap. Crash-only.
+        {
+            auto vaToPhys = [&](uint64_t uva) -> uint64_t {
+                uint64_t* p4 = reinterpret_cast<uint64_t*>(DMAP_USR + cr3val);
+                uint64_t e4 = p4[(uva >> 39) & 0x1FF]; if (!(e4 & 1)) return 0;
+                uint64_t* p3 = reinterpret_cast<uint64_t*>(DMAP_USR + (e4 & 0x000FFFFFFFFFF000ULL));
+                uint64_t e3 = p3[(uva >> 30) & 0x1FF]; if (!(e3 & 1)) return 0;
+                uint64_t* p2 = reinterpret_cast<uint64_t*>(DMAP_USR + (e3 & 0x000FFFFFFFFFF000ULL));
+                uint64_t e2 = p2[(uva >> 21) & 0x1FF]; if (!(e2 & 1)) return 0;
+                if (e2 & (1ULL << 7)) return (e2 & 0x000FFFFFFFE00000ULL) | (uva & 0x1FFFFFULL);
+                uint64_t* p1 = reinterpret_cast<uint64_t*>(DMAP_USR + (e2 & 0x000FFFFFFFFFF000ULL));
+                uint64_t e1 = p1[(uva >> 12) & 0x1FF]; if (!(e1 & 1)) return 0;
+                return (e1 & 0x000FFFFFFFFFF000ULL) | (uva & 0xFFF);
+            };
+            auto describePoisonFrame = [&](const char* label, uint64_t uva) {
+                uint64_t phys = vaToPhys(uva);
+                ExcPutsRaw("  POISON-ORIGIN "); ExcPutsRaw(label);
+                ExcPutsRaw(" VA="); ExcPutHex(uva);
+                ExcPutsRaw(" phys="); ExcPutHex(phys & ~0xFFFULL);
+                if (phys) {
+                    uint32_t used=0, rc=0, mc=0, tg=0, op=0;
+                    PmmDescribe(phys, &used, &rc, &mc, &tg, &op);
+                    ExcPutsRaw(" [used="); ExcPutHex(used);
+                    ExcPutsRaw(" ref="); ExcPutHex(rc);
+                    ExcPutsRaw(" map="); ExcPutHex(mc);
+                    ExcPutsRaw(" tag="); ExcPutHex(tg);
+                    ExcPutsRaw(" owner="); ExcPutHex(op);
+                    ExcPutsRaw("]\n");
+                    PmmDumpFreeLog(phys & ~0xFFFULL);
+                } else {
+                    ExcPutsRaw(" (unmapped)\n");
+                }
+            };
+            // Always describe the frame backing the faulting stack pointer.
+            describePoisonFrame("RSP", ef->rsp);
+            // Scan the user stack upward for the first poison qword and describe
+            // the frame it lives in (may differ from RSP's page).
+            uint64_t lastPoisonVA = 0;
+            for (int i = 0; i < 512; ++i) {
+                uint64_t slotVA = ef->rsp + static_cast<uint64_t>(i) * 8;
+                uint64_t v = readUser64(slotVA);
+                if ((v >> 32) == 0xDFDFDFDFULL || (v & 0xFFFFFFFFULL) == 0xDFDFDFDFULL) {
+                    uint64_t pageVA = slotVA & ~0xFFFULL;
+                    if (pageVA != lastPoisonVA) {
+                        describePoisonFrame("STACK-POISON", slotVA);
+                        lastPoisonVA = pageVA;
+                    }
+                }
+            }
+        }
+
         uint64_t lumphashPtr = readUser64(0x4b3d78);
         uint64_t lumpinfoPtr = readUser64(0x4b3d70);
         uint64_t numlumps    = readUser64(0x4b3d68) & 0xFFFFFFFF;
