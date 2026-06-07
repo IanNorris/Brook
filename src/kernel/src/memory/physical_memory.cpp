@@ -149,6 +149,37 @@ static inline void TrackAlloc(uint32_t pageIdx, MemTag tag, uint16_t pid)
 {
     // Free pages are not in any list; just append to the new owner's list.
     if (!g_pageDescs) return;
+
+    // BRO-179 cross-domain double-alloc detector (the SIG1 root). A frame pulled
+    // from the free list MUST have a cleanly-freed descriptor: refCount==0 and
+    // tag==Free (PmmFreePage resets both). If refCount!=0 or tag!=Free here, the
+    // frame was still OWNED when the allocator handed it out — i.e. it is on the
+    // free bitmap AND live in another domain at once. That is exactly the SIG1
+    // signature: a frame simultaneously the kernel heap's (tag=Heap, which later
+    // writes 0xDFDF kfree-poison) and a user's (this alloc), so the user reads
+    // kernel heap poison. Causes include PmmRefPage resurrecting a free frame
+    // (refCount 0→2 without setting the used bit) and any free of a still-owned
+    // frame. Catch it HERE, naming the STALE owner (tag+pid) before we overwrite.
+    {
+        PageDescriptor& pd = Desc(pageIdx);
+        uint8_t  preTag = pd.tag;
+        int32_t  preRc  = pd.refCount;
+        if (preRc != 0 || preTag != static_cast<uint8_t>(MemTag::Free))
+        {
+            static const char* kTagName[8] = {
+                "Free","KernelCode","KernelData","PageTable",
+                "Heap","Device","User","System"
+            };
+            SerialPrintf("BRO179-DOUBLEALLOC: phys=0x%lx handed to pid=%u (tag=%u) but "
+                         "descriptor still OWNED: refCount=%d tag=%s ownerPid=%u — "
+                         "cross-domain frame reuse (SIG1 0xDFDF source)!\n",
+                         static_cast<uint64_t>(pageIdx) * PAGE_SIZE, (unsigned)pid,
+                         (unsigned)tag, preRc,
+                         preTag < 8 ? kTagName[preTag] : "?", (unsigned)pd.pid);
+            PmmDumpFreeLogLocked(static_cast<uint64_t>(pageIdx) * PAGE_SIZE);
+        }
+    }
+
     ListAppend(pageIdx, pid, tag);
     Desc(pageIdx).refCount = 1;  // exclusive ownership on fresh allocation
     // BRO-176 stale-mapping detector (ALLOC side). A frame returned by the
@@ -455,6 +486,19 @@ void PmmRefPage(PhysicalAddress physAddr)
 
     uint64_t pmmFlags = IrqSpinLockAcquire(&g_pmmLock);
     auto& d = Desc(idx);
+    // BRO-179: a ref on a frame that is FREE in the bitmap is a resurrection bug —
+    // the frame is on the free list yet we are taking a reference to it, so a
+    // subsequent PmmAllocPage will hand it to a new owner while this reference
+    // still treats it as live = cross-domain double-alloc (SIG1). Catch the
+    // resurrection at its source, naming the caller's stale view.
+    if (!IsUsed(idx))
+    {
+        SerialPrintf("BRO179-REFFREE: PmmRefPage on FREE frame phys=0x%lx "
+                     "(refCount=%d tag=%u) — resurrecting a freed frame; next alloc "
+                     "will double-own it (SIG1 source)!\n",
+                     physAddr.raw(), d.refCount, (unsigned)d.tag);
+        PmmDumpFreeLogLocked(physAddr.raw());
+    }
     if (d.refCount == 0)
         d.refCount = 2;  // legacy page: count existing owner + new sharer
     else if (d.refCount < 255)
