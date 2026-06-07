@@ -120,6 +120,58 @@ multi-field consistency.
 - `refCount` is `uint8_t` — max 255 sharers. Sufficient for current workload but
   would overflow if a page is shared across 256+ processes.
 
+### Design Decision (BRO-179): Frame-free quarantine as a SIG1 stopgap
+
+**Status:** stopgap, deliberately accepted. Not a root-cause fix.
+
+**The bug (SIG1 / BRO-179, BRO-176 family).** Under heavy `fork`+`pthread`+
+`exit_group` churn (the `schedstress` reproducer), a physical frame was freed
+and immediately re-issued to a *different domain* (e.g. a user data page recycled
+into a kernel page table) while a stale mapping to its previous life still
+existed. Captured red-handed as a deterministic **reserved-bit #PF in
+`VmmGetPte`**: a freshly-allocated, zeroed page-table frame already contained a
+"present" garbage PTE — user data written through the old mapping after the
+frame was zeroed. The same root also surfaces as userspace reads of kernel-heap
+free-poison `0xDFDFDFDF` (the original SIG1 symptom). This is **freed-while-
+mapped cross-domain frame reuse**.
+
+**Why we stopgapped instead of root-fixing.** The leak lives somewhere in the
+COW / refcount / cross-CPU TLB-shootdown machinery — a long tail that has been
+point-fixed repeatedly across the BRO-176 family (COW double-free, refcount
+TOCTOU, per-AS shootdown, swapgs, …) and kept resurfacing in new forms. After
+extended diagnosis (see `plan.md`) the judgement call was: stop chasing the exact
+leaking path and instead **close the reuse window** durably, then move on.
+
+**The mechanism.** `PmmFreePage` / `PmmUnrefPage` / `PmmKillPid` / `PmmFreeByTag`
+no longer return a frame to the allocatable pool immediately. A retired frame
+enters a FIFO **quarantine ring** (`QUARANTINE_DEPTH = 1024`); it stays
+bitmap-`USED` (so the allocator skips it) until `QUARANTINE_DEPTH` further frees
+push it out, at which point it is actually released. Under the churn that
+triggers the bug (thousands of frees/sec, a context switch on every CPU each
+tick, `CR4.PGE` off so every `CR3` reload is a full TLB flush), a frame is
+reissued only after every CPU has flushed its TLB many times — so any stale TLB
+entry for it is gone before reuse. A double-retire guard on each path prevents a
+quarantined frame from being released twice.
+
+**Tradeoffs / limitations (accepted):**
+- Holds up to 1024 frames (~4 MiB) out of circulation at once — negligible.
+- The grace period is a function of the free / context-switch **rate**, not a
+  formally proven all-CPU TLB epoch. It is effective under the load that
+  triggers the bug; a light or idle system frees slowly, so a frame could in
+  principle be reissued before a TLB flush. The proper fix would gate release on
+  an explicit **all-CPU TLB epoch counter** rather than FIFO depth.
+- Closes the **stale-TLB** sub-case (the captured signature: frames freed via
+  `FreeTableLevel` with the PTE already removed). It does **not** fix a
+  hypothetical **live-PTE refcount undercount** (a process still holding a
+  *present* PTE to the freed frame) — that PTE would persist past the
+  quarantine. No evidence of that sub-case was found; the reverse-map diagnostic
+  (`ProcessDumpFrameMappers`, idt.cpp/scheduler.cpp) would surface it if it
+  exists.
+- Toggle: `g_quarantineOn` (default true). Set false to restore immediate-reuse
+  behaviour for A/B testing.
+
+**Follow-up (deferred):** replace FIFO-depth gating with a true TLB-epoch quarantine; and, separately, find and fix the actual mapping leak so quarantine can be reduced/removed.
+
 ---
 
 ## Virtual Memory Manager (VMM)
