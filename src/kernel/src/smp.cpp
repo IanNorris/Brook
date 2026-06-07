@@ -523,7 +523,8 @@ void SmpSetCurrentCr3(uint32_t cpuIndex, uint64_t cr3)
 // NMI handler for panic halt
 // ---------------------------------------------------------------------------
 // When g_panicHaltActive is true, the NMI handler captures the interrupted
-// RIP/RSP/RBP into g_haltedState[thisCpu], then spins forever with cli;pause.
+// RIP/RSP/RBP into g_haltedState[thisCpu], then parks forever with cli;hlt
+// (BRO-177: hlt, not pause — a halted AP must idle the core, not busy-spin).
 // This is installed as the vector 2 handler during SmpInit. The captured live
 // spin RIP is what PanicCaptureCpuList prefers (panic.cpp) — it reveals where
 // each AP was ACTUALLY executing when the panic fired (e.g. spinning on a lock
@@ -576,7 +577,7 @@ __asm__(
     "    lock incl g_haltedCount(%rip)\n"
     ".Lnmi_spin:\n"
     "    cli\n"
-    "    pause\n"
+    "    hlt\n"
     "    jmp .Lnmi_spin\n"
     ".Lnmi_return:\n"
     "    iretq\n"

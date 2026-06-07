@@ -242,7 +242,7 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
         ExcPutsRaw(" — halting ===\n");
         ExcPutsRaw("  RIP   "); ExcPutHex(frame->ip); ExcPutsRaw("\n");
         ExcPutsRaw("  RSP   "); ExcPutHex(frame->sp); ExcPutsRaw("\n");
-        for (;;) __asm__ volatile("cli; pause");
+        for (;;) __asm__ volatile("cli; hlt");
     }
     ++excDepthPerCpu[cpuSlot];
 
@@ -254,7 +254,7 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
     // it arrived), this guard catches us.
     if (brook::SmpIsPanicActive())
     {
-        for (;;) __asm__ volatile("cli; pause");
+        for (;;) __asm__ volatile("cli; hlt");
     }
 
     // For kernel-mode faults: halt all other CPUs and stop compositor
@@ -596,7 +596,7 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
 
     // Halt here — kernel-mode exception is unrecoverable.
     // Use cli before hlt so timer interrupts don't wake us.
-    for (;;) { __asm__ volatile("cli; pause"); }
+    for (;;) { __asm__ volatile("cli; hlt"); }
 }
 
 // Lockless read-only page-table walk for use in the #DF handler.
@@ -715,7 +715,7 @@ static void HandleDoubleFault(InterruptFrame* frame, uint64_t errorCode)
     }
 
     ExcPutsRaw(cpuTag); ExcPutsRaw("=== HALTED ===\n");
-    for (;;) { __asm__ volatile("cli; pause"); }
+    for (;;) { __asm__ volatile("cli; hlt"); }
 }
 
 // ---------------------------------------------------------------------------
@@ -755,7 +755,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
     // HandleException where the main guard lives).
     if (brook::SmpIsPanicActive())
     {
-        for (;;) __asm__ volatile("cli; pause");
+        for (;;) __asm__ volatile("cli; hlt");
     }
 
     bool fromUser = (ef->cs & 3) != 0;
@@ -1155,7 +1155,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         ifrm.ss    = ef->ss;
         HandleException(static_cast<uint8_t>(vector), &ifrm, ef->errorCode, true);
         // HandleException never returns for kernel faults.
-        for (;;) __asm__ volatile("cli; pause");
+        for (;;) __asm__ volatile("cli; hlt");
     }
 
     // --- User-mode fault ---
