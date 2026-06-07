@@ -1,13 +1,17 @@
 #pragma once
 
+#include "gs_paranoid.h"
+
 // IRQ_NAKED_HANDLER(name, inner_fn)
 //
 // Generates a naked ISR wrapper that:
-//   1. Does SWAPGS if interrupted from ring 3 (user mode)
-//   2. Saves all 15 GPRs
+//   1. Saves all 15 GPRs
+//   2. BRO-178 paranoid SWAPGS: swaps to kernel GS iff the ACTUAL GS base is a
+//      user base (decided by rdmsr, not the saved CS RPL), carrying the
+//      did-swap flag in RBX
 //   3. Calls inner_fn() — a plain void(void) C function
-//   4. Restores all GPRs
-//   5. Does SWAPGS back if returning to ring 3
+//   4. Paranoid SWAPGS restore (swaps back iff entry swapped)
+//   5. Restores all GPRs
 //   6. iretq
 //
 // This is required for ANY interrupt handler that accesses gs-relative
@@ -30,11 +34,6 @@
     static void name(void) \
     { \
         __asm__ volatile( \
-            /* SWAPGS if interrupted from ring 3 */ \
-            "testq $3, 8(%%rsp)\n\t" \
-            "jz 1f\n\t" \
-            "swapgs\n\t" \
-            "1:\n\t" \
             /* Save all GPRs */ \
             "push %%rax\n\t" \
             "push %%rbx\n\t" \
@@ -51,8 +50,12 @@
             "push %%r13\n\t" \
             "push %%r14\n\t" \
             "push %%r15\n\t" \
+            /* BRO-178 paranoid swapgs by actual GS base (ebx = did-swap flag) */ \
+            GS_PARANOID_ENTRY_EBX \
             "cld\n\t" \
             "call " #inner_fn "\n\t" \
+            /* BRO-178 paranoid swapgs restore before popping GPRs */ \
+            GS_PARANOID_EXIT_EBX \
             /* Restore GPRs */ \
             "pop %%r15\n\t" \
             "pop %%r14\n\t" \
@@ -69,11 +72,6 @@
             "pop %%rcx\n\t" \
             "pop %%rbx\n\t" \
             "pop %%rax\n\t" \
-            /* SWAPGS back if returning to ring 3 */ \
-            "testq $3, 8(%%rsp)\n\t" \
-            "jz 2f\n\t" \
-            "swapgs\n\t" \
-            "2:\n\t" \
             "iretq\n\t" \
             : \
             : \

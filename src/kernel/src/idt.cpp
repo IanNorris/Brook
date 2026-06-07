@@ -216,14 +216,26 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
 {
     __asm__ volatile("cli");
 
-    // The __attribute__((interrupt)) stubs do NOT perform SWAPGS.
-    // If we entered from user mode (ring 3), GS base is the user's TLS pointer.
-    // We must swap to get the kernel per-CPU pointer so that later code
-    // (context_switch, etc.) leaves GS in a consistent state.
-    // Skip if the assembly stub already did SWAPGS.
+    // BRO-178: decide SWAPGS by the ACTUAL GS base, not the saved CS RPL.
+    // The __attribute__((interrupt)) stubs do NOT perform SWAPGS, so this C path
+    // owns the decision for every vector routed through it — including #DB (1)
+    // and #MC (18), which IGNORE IF and so can fire in a ring-0 window where the
+    // user GS base is still live. There the saved CS is ring 0 but GS is user;
+    // the old `frame->cs & 3` test skipped the swap and ran this handler at
+    // gs:176 → #PF CR2=0xB0. Read IA32_GS_BASE via rdmsr (NOT a gs access, which
+    // would itself fault when the base is 0) and swap iff it is a user
+    // (non-canonical-high) base. `swapgsDone` covers the vec 13/14 asm stubs
+    // that already swapped (their GS is kernel ⇒ rdmsr sees kernel ⇒ no swap).
     bool fromUser = (frame->cs & 3) != 0;
-    if (fromUser && !swapgsDone)
-        __asm__ volatile("swapgs");
+    if (!swapgsDone)
+    {
+        uint32_t gsLo, gsHi;
+        __asm__ volatile("rdmsr" : "=a"(gsLo), "=d"(gsHi) : "c"(0xC0000101u));
+        (void)gsLo;
+        bool gsIsUser = (gsHi & 0x80000000u) == 0;  // kernel base is canonical-high
+        if (gsIsUser)
+            __asm__ volatile("swapgs");
+    }
 
     // Per-CPU nesting guard — uses LAPIC ID to index, avoiding any lock.
     // 64 entries covers typical SMP configs.  Falls back to entry 0 for

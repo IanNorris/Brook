@@ -1,5 +1,6 @@
 #include "apic.h"
 #include "idt.h"
+#include "gs_paranoid.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "serial.h"
@@ -347,15 +348,9 @@ __attribute__((naked))
 static void LapicTimerHandler(void)
 {
     __asm__ volatile(
-        // If interrupted from ring 3, CS (at RSP+8) has CPL bits set.
-        "testq $3, 8(%%rsp)\n\t"
-        "jz 1f\n\t"
-        "swapgs\n\t"
-        "1:\n\t"
-
-        // Save all GPRs. This ISR can preempt kernel C code and then context
-        // switch before returning; callee-saved registers live in the
-        // interrupted frame must survive that whole path.
+        // BRO-178: GPRs first, THEN paranoid swapgs (rax/rcx/rdx saved for rdmsr,
+        // ebx carries the did-swap flag). The old CS-RPL test ran before the
+        // pushes and mis-decided when an IPI/timer hit a ring-0 user-GS window.
         "push %%rax\n\t"
         "push %%rbx\n\t"
         "push %%rcx\n\t"
@@ -371,6 +366,8 @@ static void LapicTimerHandler(void)
         "push %%r13\n\t"
         "push %%r14\n\t"
         "push %%r15\n\t"
+
+        GS_PARANOID_ENTRY_EBX
 
         // Stack layout after 15 pushes:
         //   RSP+64  = interrupted RBP
@@ -389,6 +386,9 @@ static void LapicTimerHandler(void)
         "leaq 120(%%rsp), %%rdi\n\t"
         "call ValidateIretFrame\n\t"
 
+        // BRO-178: paranoid swapgs restore (ebx flag) BEFORE popping GPRs.
+        GS_PARANOID_EXIT_EBX
+
         // Restore GPRs
         "pop %%r15\n\t"
         "pop %%r14\n\t"
@@ -406,11 +406,6 @@ static void LapicTimerHandler(void)
         "pop %%rbx\n\t"
         "pop %%rax\n\t"
 
-        // If returning to ring 3, swap gs back.
-        "testq $3, 8(%%rsp)\n\t"
-        "jz 2f\n\t"
-        "swapgs\n\t"
-        "2:\n\t"
         "iretq\n\t"
         :
         :
@@ -680,10 +675,6 @@ __attribute__((naked))
 static void ReschedIpiHandler(void)
 {
     __asm__ volatile(
-        "testq $3, 8(%%rsp)\n\t"
-        "jz 1f\n\t"
-        "swapgs\n\t"
-        "1:\n\t"
         "push %%rax\n\t"
         "push %%rbx\n\t"
         "push %%rcx\n\t"
@@ -700,12 +691,19 @@ static void ReschedIpiHandler(void)
         "push %%r14\n\t"
         "push %%r15\n\t"
 
+        // BRO-178: paranoid swapgs by actual GS base (ebx = did-swap flag).
+        GS_PARANOID_ENTRY_EBX
+
         // Extract interrupted CS from the interrupt frame.
         // After 15 GPR pushes the interrupt frame CS is at RSP + 128.
         "movq 128(%%rsp), %%rdi\n\t"    // arg1 = interrupted CS
 
         "cld\n\t"
         "call ReschedIpiHandlerInner\n\t"
+
+        // BRO-178: paranoid swapgs restore (ebx flag) before popping GPRs.
+        GS_PARANOID_EXIT_EBX
+
         "pop %%r15\n\t"
         "pop %%r14\n\t"
         "pop %%r13\n\t"
@@ -721,10 +719,6 @@ static void ReschedIpiHandler(void)
         "pop %%rcx\n\t"
         "pop %%rbx\n\t"
         "pop %%rax\n\t"
-        "testq $3, 8(%%rsp)\n\t"
-        "jz 2f\n\t"
-        "swapgs\n\t"
-        "2:\n\t"
         "iretq\n\t"
         :
         :
@@ -819,11 +813,6 @@ __attribute__((naked))
 static void TlbShootdownHandler(void)
 {
     __asm__ volatile(
-        // swapgs if we interrupted user mode
-        "testq $3, 8(%%rsp)\n\t"
-        "jz 1f\n\t"
-        "swapgs\n\t"
-        "1:\n\t"
         "push %%rax\n\t"
         "push %%rbx\n\t"
         "push %%rcx\n\t"
@@ -839,8 +828,18 @@ static void TlbShootdownHandler(void)
         "push %%r13\n\t"
         "push %%r14\n\t"
         "push %%r15\n\t"
+
+        // BRO-178: paranoid swapgs by actual GS base (ebx = did-swap flag).
+        // This is the handler that was crashing at gs:176 (CR2=0xB0) when a
+        // TLB-shootdown IPI arrived during a ring-0 user-GS window.
+        GS_PARANOID_ENTRY_EBX
+
         "cld\n\t"
         "call TlbShootdownHandlerInner\n\t"
+
+        // BRO-178: paranoid swapgs restore (ebx flag) before popping GPRs.
+        GS_PARANOID_EXIT_EBX
+
         "pop %%r15\n\t"
         "pop %%r14\n\t"
         "pop %%r13\n\t"
@@ -856,10 +855,6 @@ static void TlbShootdownHandler(void)
         "pop %%rcx\n\t"
         "pop %%rbx\n\t"
         "pop %%rax\n\t"
-        "testq $3, 8(%%rsp)\n\t"
-        "jz 2f\n\t"
-        "swapgs\n\t"
-        "2:\n\t"
         "iretq\n\t"
         :
         :
