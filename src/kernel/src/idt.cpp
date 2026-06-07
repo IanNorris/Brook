@@ -942,6 +942,45 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         brook::SmpHaltAllAPs();
         brook::CompositorHalt();
 
+        // BRO-176/SIG1 frame-attribution: a #PF whose error code has the
+        // RESERVED bit (0x8) set means a paging-structure entry had a reserved
+        // bit set — a CORRUPT page-table entry, the signature of a page-table
+        // frame that was freed and reused (cross-domain frame reuse). CR2 is
+        // the (direct-map) linear address whose translation tripped the reserved
+        // bit; if it lies in the kernel direct map, CR2 - DIRECTMAP_BASE is the
+        // physical frame whose entry we were reading. Dump that frame's PMM
+        // descriptor + alloc/free history NOW (all other CPUs halted, so the
+        // lock-free read is safe) — this names the corrupt frame and its owner
+        // trail even if the QR render below re-faults on the same corruption
+        // (which is why these crashes have produced no QR). vector 14 == #PF.
+        if (vector == 14 && (ef->errorCode & 0x8))
+        {
+            uint64_t cr2val;
+            __asm__ volatile("movq %%cr2, %0" : "=r"(cr2val));
+            constexpr uint64_t kDirectMapBase = 0xFFFF800000000000ULL;
+            constexpr uint64_t kDirectMapEnd  = 0xFFFFC00000000000ULL;
+            ExcPutsRaw("  RSVD-BIT #PF — corrupt paging entry (reused page-table frame?)\n");
+            if (cr2val >= kDirectMapBase && cr2val < kDirectMapEnd)
+            {
+                uint64_t phys = (cr2val - kDirectMapBase) & ~0xFFFULL;
+                ExcPutsRaw("  corrupt-table frame phys "); ExcPutHex(phys); ExcPutsRaw("\n");
+                uint32_t used = 0, ref = 0, mapc = 0, tag = 0, owner = 0;
+                PmmDescribe(phys, &used, &ref, &mapc, &tag, &owner);
+                static const char* tagName[8] = {
+                    "Free","KernelCode","KernelData","PageTable",
+                    "Heap","Device","User","System"
+                };
+                ExcPutsRaw("  [PMM used="); ExcPutHex(used);
+                ExcPutsRaw(" ref=");  ExcPutHex(ref);
+                ExcPutsRaw(" map=");  ExcPutHex(mapc);
+                ExcPutsRaw(" tag=");  ExcPutsRaw(tag < 8 ? tagName[tag] : "?");
+                ExcPutsRaw(" owner=pid"); ExcPutHex(owner); ExcPutsRaw("]\n");
+                // Full ref/unref + alloc/free ring for the frame (re-takes the
+                // PMM lock, safe now that every other CPU is halted).
+                PmmDumpFreeLog(phys);
+            }
+        }
+
         // Render visual panic screen with full register state + QR code
         {
             uint32_t physStride = 0;
