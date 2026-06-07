@@ -978,7 +978,35 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                 // Full ref/unref + alloc/free ring for the frame (re-takes the
                 // PMM lock, safe now that every other CPU is halted).
                 PmmDumpFreeLog(phys);
+
+                // Dump the corrupt frame's first 8 qwords + the faulting entry.
+                // CLASSIFIES the corruption: if this "page table" is full of
+                // user data (ASCII, 0x00007fff... stack pointers) the frame was
+                // written THROUGH A STALE TLB mapping after being reused — a
+                // missing cross-CPU shootdown on free (the leading hypothesis:
+                // VmmFreePages only does a local Invlpg). If instead a single
+                // entry is a plausible-but-misflagged PTE, it's a torn/garbage
+                // PTE write. The faulting entry index is (CR2 & 0xFFF) / 8.
+                const uint64_t* frame =
+                    reinterpret_cast<const uint64_t*>(kDirectMapBase + phys);
+                ExcPutsRaw("  frame[0..7]:\n");
+                for (uint32_t q = 0; q < 8; q++)
+                {
+                    ExcPutsRaw("    +"); ExcPutHex(q * 8);
+                    ExcPutsRaw(" "); ExcPutHex(frame[q]); ExcPutsRaw("\n");
+                }
+                uint32_t fidx = static_cast<uint32_t>((cr2val & 0xFFF) / 8);
+                ExcPutsRaw("  faulting entry["); ExcPutHex(fidx);
+                ExcPutsRaw("] = "); ExcPutHex(frame[fidx]); ExcPutsRaw("\n");
             }
+            // These RSVD/corrupt-table faults make the QR renderer re-fault
+            // (it walks memory through the same corrupt tables) — that nested
+            // fault is the "no panic, CPU pegged" livelock. The serial dump
+            // above IS the canonical record for this crash class, so halt this
+            // CPU cleanly now instead of entering the doomed render. Other
+            // CPUs were already halted by SmpHaltAllAPs() above.
+            ExcPutsRaw("  [RSVD-corrupt-table: halting; serial dump above is the record]\n");
+            for (;;) __asm__ volatile("cli; hlt");
         }
 
         // Render visual panic screen with full register state + QR code
