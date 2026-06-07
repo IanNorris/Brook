@@ -57,6 +57,8 @@ PKT_EXCEPTION_INFO = 0xA3000003
 PKT_PROCESS_LIST   = 0xA3000004
 PKT_SYSTEM_INFO    = 0xA3000005
 PKT_STACK_DUMP     = 0xA3000006
+PKT_PROCESS_EXT    = 0xA3000007  # BRO-176 reap-gate fields, merged onto PROCESS_LIST by pid
+PKT_CPU_STATE      = 0xA3000008  # per-CPU RIP/CR3/pid
 
 GPR_NAMES = [
     "RAX", "RBX", "RCX", "RDX", "RSI", "RDI",
@@ -171,7 +173,15 @@ class ExceptionInfo:
 
 
 class ProcessEntry:
-    ENTRY_SIZE = 28  # 2+1+1+12+8 = 24... wait: 2+1+1+12+8=24
+    # PROCESS_LIST wire entry is the stable 24-byte form (pid/state/cpu/name/rip).
+    # Reap-gate fields arrive separately in the PROCESS_EXT packet and are merged
+    # onto matching entries by pid (see ProcessExt / ProcessList.merge_ext).
+    WIRE_SIZE = 24
+
+    FLAG_IS_THREAD  = 0x01
+    FLAG_REAPABLE   = 0x02
+    FLAG_IS_KTHREAD = 0x04
+    FLAG_MAGIC_BAD  = 0x08
 
     def __init__(self, data: bytes, off: int = 0):
         self.pid, self.state, self.cpu = struct.unpack_from("<HBB", data, off)
@@ -179,6 +189,28 @@ class ProcessEntry:
         self.rip = struct.unpack_from("<Q", data, off+16)[0]
         self.state_name = PROCESS_STATE_NAMES.get(self.state, f"?{self.state}")
         self.cpu_str = str(self.cpu) if self.cpu != 0xFF else "-"
+        # Reap-gate fields — populated from a PROCESS_EXT packet if present.
+        self.has_reap = False
+        self.tgid = self.pid
+        self.as_live_threads = -1
+        self.ref_count = 0
+        self.flags = 0
+
+    def apply_ext(self, tgid: int, as_live: int, ref: int, flags: int):
+        self.has_reap = True
+        self.tgid = tgid
+        self.as_live_threads = as_live
+        self.ref_count = ref
+        self.flags = flags
+
+    @property
+    def is_thread(self) -> bool:  return bool(self.flags & self.FLAG_IS_THREAD)
+    @property
+    def reapable(self) -> bool:   return bool(self.flags & self.FLAG_REAPABLE)
+    @property
+    def is_kthread(self) -> bool: return bool(self.flags & self.FLAG_IS_KTHREAD)
+    @property
+    def magic_bad(self) -> bool:  return bool(self.flags & self.FLAG_MAGIC_BAD)
 
 
 class ProcessList:
@@ -189,13 +221,68 @@ class ProcessList:
         self.entries = []
         off = 1
         for _ in range(self.count):
-            if off + 24 > len(data):
+            if off + ProcessEntry.WIRE_SIZE > len(data):
                 break
             self.entries.append(ProcessEntry(data, off))
-            off += 24
+            off += ProcessEntry.WIRE_SIZE
+
+    def merge_ext(self, data: bytes):
+        """Merge a PROCESS_EXT packet (reap-gate fields, keyed by pid)."""
+        if len(data) < 1:
+            return
+        count = data[0]
+        off = 1
+        ext_by_pid = {}
+        for _ in range(count):
+            if off + 10 > len(data):
+                break
+            pid, tgid, as_live, ref, flags, _resv = \
+                struct.unpack_from("<HHhhBB", data, off)
+            ext_by_pid[pid] = (tgid, as_live, ref, flags)
+            off += 10
+        for e in self.entries:
+            if e.pid in ext_by_pid:
+                e.apply_ext(*ext_by_pid[e.pid])
 
 
-PANIC_GIT_HASH_LEN   = 12
+class CpuEntry:
+    WIRE_SIZE = 20  # cpuIndex(1)+flags(1)+pid(2)+rip(8)+cr3(8)
+
+    FLAG_ONLINE   = 0x01
+    FLAG_HALTED   = 0x02
+    FLAG_BSP      = 0x04
+    FLAG_LIVE_RIP = 0x08
+
+    def __init__(self, data: bytes, off: int = 0):
+        self.cpu_index, self.flags, self.pid = struct.unpack_from("<BBH", data, off)
+        self.rip = struct.unpack_from("<Q", data, off+4)[0]
+        self.cr3 = struct.unpack_from("<Q", data, off+12)[0]
+
+    @property
+    def online(self) -> bool:    return bool(self.flags & self.FLAG_ONLINE)
+    @property
+    def halted(self) -> bool:    return bool(self.flags & self.FLAG_HALTED)
+    @property
+    def is_bsp(self) -> bool:    return bool(self.flags & self.FLAG_BSP)
+    @property
+    def live_rip(self) -> bool:  return bool(self.flags & self.FLAG_LIVE_RIP)
+
+
+class CpuList:
+    def __init__(self, data: bytes):
+        if len(data) < 1:
+            raise ValueError("Truncated CpuList")
+        self.count = data[0]
+        self.entries = []
+        off = 1
+        for _ in range(self.count):
+            if off + CpuEntry.WIRE_SIZE > len(data):
+                break
+            self.entries.append(CpuEntry(data, off))
+            off += CpuEntry.WIRE_SIZE
+
+
+PANIC_GIT_HASH_LEN   = 20
 PANIC_GIT_BRANCH_LEN = 24
 
 
@@ -508,7 +595,8 @@ def print_report(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | Non
                  exc_info: ExceptionInfo | None = None,
                  proc_list: ProcessList | None = None,
                  sys_info: SystemInfo | None = None,
-                 stack_dump: StackDump | None = None):
+                 stack_dump: StackDump | None = None,
+                 cpu_list: "CpuList | None" = None):
     bar = "═" * (W + 4)
     print(f"\n  {C.RED}{C.BOLD}{bar}{C.RESET}")
     print(f"  {C.RED}{C.BOLD}{'🔴 BROOK OS CRASH DUMP':^{W + 4}}{C.RESET}")
@@ -614,12 +702,64 @@ def print_report(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | Non
             print(f"  {C.DIM}{addr:016X}{C.RESET}  {hex_part:<48s}  {C.DIM}{ascii_part}{C.RESET}{ptr_str}")
 
     if proc_list and proc_list.entries:
-        print(f"\n  {C.CYAN}{C.BOLD}Running Processes ({len(proc_list.entries)}):{C.RESET}")
-        print(f"  {C.DIM}{'PID':>5s}  {'STATE':<10s}  {'CPU':>3s}  {'NAME':<12s}  {'RIP'}{C.RESET}")
+        has_reap = any(pe.has_reap for pe in proc_list.entries)
+        print(f"\n  {C.CYAN}{C.BOLD}Processes ({len(proc_list.entries)}):{C.RESET}")
+        if has_reap:
+            print(f"  {C.DIM}{'PID':>5s} {'TGID':>5s}  {'STATE':<10s} {'CPU':>3s}  "
+                  f"{'NAME':<12s} {'T':>1s}{'R':>1s}{'K':>1s}  {'asLive':>6s} {'ref':>4s}  {'RIP'}{C.RESET}")
+        else:
+            print(f"  {C.DIM}{'PID':>5s}  {'STATE':<10s}  {'CPU':>3s}  {'NAME':<12s}  {'RIP'}{C.RESET}")
         for pe in proc_list.entries:
             rip_str = f"0x{pe.rip:016X}" if pe.rip else ""
             state_color = C.GREEN if pe.state_name == "Running" else C.YELLOW if pe.state_name == "Ready" else C.DIM
-            print(f"  {C.WHITE}{pe.pid:5d}{C.RESET}  {state_color}{pe.state_name:<10s}{C.RESET}  {C.WHITE}{pe.cpu_str:>3s}{C.RESET}  {C.CYAN}{pe.name:<12s}{C.RESET}  {C.DIM}{rip_str}{C.RESET}")
+            if has_reap:
+                # Flag a leader whose live-thread gate is non-zero while it is a
+                # zombie — the classic BRO-176 reap-stall fingerprint.
+                tflag = "T" if pe.is_thread else "-"
+                rflag = "R" if pe.reapable else "-"
+                kflag = "K" if pe.is_kthread else "-"
+                al = "" if pe.as_live_threads < 0 else str(pe.as_live_threads)
+                name_col = C.RED if pe.magic_bad else C.CYAN
+                stall = ""
+                if (not pe.is_thread and pe.state_name == "Terminated"
+                        and pe.as_live_threads > 0):
+                    stall = f"  {C.RED}{C.BOLD}<-- REAP-STALL (zombie leader, asLive>0){C.RESET}"
+                print(f"  {C.WHITE}{pe.pid:5d}{C.RESET} {pe.tgid:5d}  "
+                      f"{state_color}{pe.state_name:<10s}{C.RESET} {C.WHITE}{pe.cpu_str:>3s}{C.RESET}  "
+                      f"{name_col}{pe.name:<12s}{C.RESET} {tflag}{rflag}{kflag}  "
+                      f"{al:>6s} {pe.ref_count:>4d}  {C.DIM}{rip_str}{C.RESET}{stall}")
+            else:
+                print(f"  {C.WHITE}{pe.pid:5d}{C.RESET}  {state_color}{pe.state_name:<10s}{C.RESET}  "
+                      f"{C.WHITE}{pe.cpu_str:>3s}{C.RESET}  {C.CYAN}{pe.name:<12s}{C.RESET}  "
+                      f"{C.DIM}{rip_str}{C.RESET}")
+
+    if cpu_list and cpu_list.entries:
+        print(f"\n  {C.CYAN}{C.BOLD}Per-CPU State ({len(cpu_list.entries)}):{C.RESET}")
+        print(f"  {C.DIM}{'CPU':>3s} {'PID':>5s}  {'CR3':<18s} {'RIP':<18s} {'WHERE'}{C.RESET}")
+        # Distinct CR3 set helps spot 'all CPUs in kernel AS' at a glance.
+        cr3s = {}
+        for ce in cpu_list.entries:
+            where = ""
+            if sym:
+                name = sym.resolve(ce.rip)
+                if name:
+                    where = name
+                    loc = sym.addr2line(ce.rip)
+                    if loc:
+                        where += f"  {C.DIM}{loc}{C.RESET}"
+            tag = []
+            if ce.is_bsp: tag.append("BSP")
+            if not ce.online: tag.append("OFFLINE")
+            if ce.halted: tag.append("halted")
+            tag.append("live" if ce.live_rip else "sched")
+            tagstr = f"{C.DIM}[{','.join(tag)}]{C.RESET}"
+            cr3s.setdefault(ce.cr3, []).append(ce.cpu_index)
+            print(f"  {C.WHITE}{ce.cpu_index:>3d}{C.RESET} {C.WHITE}{ce.pid:>5d}{C.RESET}  "
+                  f"{C.DIM}0x{ce.cr3:012X}{C.RESET}     0x{ce.rip:012X}     "
+                  f"{C.GREEN}{where}{C.RESET} {tagstr}")
+        if len(cr3s) == 1:
+            only = next(iter(cr3s))
+            print(f"  {C.DIM}(all CPUs share CR3 0x{only:012X} — same address space){C.RESET}")
 
     print(f"\n  {C.RED}{C.BOLD}{bar}{C.RESET}\n")
 
@@ -628,7 +768,8 @@ def build_json(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | None,
                sym: Symbolicator | None, exc_info: ExceptionInfo | None = None,
                proc_list: ProcessList | None = None,
                sys_info: SystemInfo | None = None,
-               stack_dump: StackDump | None = None) -> dict:
+               stack_dump: StackDump | None = None,
+               cpu_list: "CpuList | None" = None) -> dict:
     out: dict = {
         "header": {
             "magic": f"0x{hdr.magic:02X}",
@@ -672,13 +813,27 @@ def build_json(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | None,
     if proc_list and proc_list.entries:
         procs = []
         for pe in proc_list.entries:
-            procs.append({
+            entry = {
                 "pid": pe.pid,
                 "state": pe.state_name,
                 "cpu": pe.cpu_str,
                 "name": pe.name,
                 "rip": f"0x{pe.rip:016X}" if pe.rip else None,
-            })
+            }
+            if pe.has_reap:
+                entry.update({
+                    "tgid": pe.tgid,
+                    "as_live_threads": pe.as_live_threads,
+                    "ref_count": pe.ref_count,
+                    "is_thread": pe.is_thread,
+                    "reapable": pe.reapable,
+                    "is_kthread": pe.is_kthread,
+                    "magic_bad": pe.magic_bad,
+                    "reap_stall": (not pe.is_thread
+                                   and pe.state_name == "Terminated"
+                                   and pe.as_live_threads > 0),
+                })
+            procs.append(entry)
         out["processes"] = procs
     if sys_info:
         out["system_info"] = {
@@ -695,6 +850,28 @@ def build_json(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | None,
             "length": stack_dump.length,
             "hex": stack_dump.data.hex(),
         }
+    if cpu_list and cpu_list.entries:
+        cpus = []
+        for ce in cpu_list.entries:
+            entry = {
+                "cpu": ce.cpu_index,
+                "pid": ce.pid,
+                "rip": f"0x{ce.rip:016X}",
+                "cr3": f"0x{ce.cr3:016X}",
+                "online": ce.online,
+                "halted": ce.halted,
+                "is_bsp": ce.is_bsp,
+                "live_rip": ce.live_rip,
+            }
+            if sym:
+                name = sym.resolve(ce.rip)
+                if name:
+                    entry["symbol"] = name
+                loc = sym.addr2line(ce.rip)
+                if loc:
+                    entry["location"] = loc
+            cpus.append(entry)
+        out["cpus"] = cpus
     return out
 
 
@@ -704,8 +881,18 @@ def find_brook_elf(git_hash: str | None = None) -> str | None:
     script_dir = Path(__file__).parent.parent
     symbols_dir = script_dir / "symbols"
 
-    # If we have a git hash, try to extract from the symbol archive first
-    if git_hash and symbols_dir.is_dir():
+    # A "+" suffix marks a dirty (uncommitted) build: no archive can match it, so
+    # symbolization MUST use the exact local build ELF that produced the running
+    # kernel. Warn loudly because if that ELF has since been rebuilt, addresses
+    # will be shifted and symbols will be wrong.
+    dirty = bool(git_hash) and git_hash.endswith("+")
+    if dirty:
+        print(f"  [warn] Dirty build ({git_hash}) — symbolizing against the LOCAL "
+              f"build ELF. Ensure it is the EXACT kernel you booted, or symbols "
+              f"will be wrong.")
+
+    # If we have a clean git hash, try to extract from the symbol archive first
+    if git_hash and not dirty and symbols_dir.is_dir():
         archive = symbols_dir / f"{git_hash}.tar.xz"
         if archive.exists():
             extract_dir = symbols_dir / f".extract_{git_hash}"
@@ -757,6 +944,8 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
     proc_list = None
     sys_info = None
     stack_dump = None
+    cpu_list = None
+    proc_ext_data = None  # buffered until after the loop (may precede PROCESS_LIST)
 
     while off + PacketHeader.SIZE <= len(payload):
         pkt = PacketHeader(payload, off)
@@ -779,6 +968,10 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
             exc_info = ExceptionInfo(pkt_data)
         elif pkt.type == PKT_PROCESS_LIST:
             proc_list = ProcessList(pkt_data)
+        elif pkt.type == PKT_PROCESS_EXT:
+            proc_ext_data = pkt_data  # merge after the loop (ordering-independent)
+        elif pkt.type == PKT_CPU_STATE:
+            cpu_list = CpuList(pkt_data)
         elif pkt.type == PKT_SYSTEM_INFO:
             sys_info = SystemInfo(pkt_data)
         elif pkt.type == PKT_STACK_DUMP:
@@ -789,6 +982,13 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
 
         off = payload_end
 
+    # Merge reap-gate extension onto the process list (keyed by pid).
+    if proc_list is not None and proc_ext_data is not None:
+        try:
+            proc_list.merge_ext(proc_ext_data)
+        except Exception as e:
+            print(f"[warn] PROCESS_EXT merge failed: {e}", file=sys.stderr)
+
     # If no symbolicator was provided, try to find one matching the dump's git hash
     if sym is None and sys_info and sys_info.git_hash:
         elf_path = find_brook_elf(sys_info.git_hash)
@@ -798,11 +998,13 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
     if as_json:
         print(json.dumps(build_json(hdr, regs, trace, sym,
                                     exc_info=exc_info, proc_list=proc_list,
-                                    sys_info=sys_info, stack_dump=stack_dump), indent=2))
+                                    sys_info=sys_info, stack_dump=stack_dump,
+                                    cpu_list=cpu_list), indent=2))
     else:
         print_report(hdr, regs, trace, sym, data, show_raw,
                      exc_info=exc_info, proc_list=proc_list,
-                     sys_info=sys_info, stack_dump=stack_dump)
+                     sys_info=sys_info, stack_dump=stack_dump,
+                     cpu_list=cpu_list)
 
 
 def parse_serial_log(path: str) -> bytes:

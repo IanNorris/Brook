@@ -10934,7 +10934,16 @@ static constexpr uint32_t FUTEX_HASH_SIZE = 64;
 static constexpr uint32_t FUTEX_BITSET_MATCH_ANY = 0xFFFFFFFFu;
 
 static FutexWaiter* g_futexBuckets[FUTEX_HASH_SIZE];
-static volatile uint64_t g_futexLock = 0;  // Spinlock for the hash table
+// BRO-176: this lock MUST disable interrupts while held. It is a plain spinlock
+// guarding the futex hash table; the critical sections are short and never
+// block. Previously it was a bare test_and_set (interrupts stayed enabled), so a
+// thread could be preempted by the timer while holding it and then be marked
+// Terminated by a sibling's exit_group before reaching the release — leaking the
+// lock permanently and deadlocking every future futex op (observed: 3 CPUs
+// spinning here forever under schedstress). An IrqSpinLock keeps IF=0 while held,
+// so the holder runs to the release uninterrupted and can never be descheduled
+// or killed mid-section.
+static IrqSpinLock g_futexLock;
 
 // Pool of waiter nodes (avoid kmalloc from IRQ context). Sized to MAX_PROCESSES:
 // a thread blocked in a futex wait cannot start another, so one slot per thread
@@ -10968,9 +10977,7 @@ extern "C" int64_t FutexWake(uint64_t owner, uint64_t uaddr, uint32_t maxWake,
     uint32_t bucket = FutexHash(owner, uaddr);
     uint32_t woken = 0;
 
-    while (__atomic_test_and_set(&g_futexLock, __ATOMIC_ACQUIRE)) {
-        __asm__ volatile("pause");
-    }
+    uint64_t fxFlags = IrqSpinLockAcquire(&g_futexLock);
 
     FutexWaiter** pp = &g_futexBuckets[bucket];
     while (*pp && woken < maxWake) {
@@ -10979,21 +10986,19 @@ extern "C" int64_t FutexWake(uint64_t owner, uint64_t uaddr, uint32_t maxWake,
             Process* waiter = w->proc;
             *pp = w->next;
             FutexFreeWaiter(w);
-            __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+            IrqSpinLockRelease(&g_futexLock, fxFlags);
 
             WakeProcess(waiter);
             woken++;
 
-            while (__atomic_test_and_set(&g_futexLock, __ATOMIC_ACQUIRE)) {
-                __asm__ volatile("pause");
-            }
+            fxFlags = IrqSpinLockAcquire(&g_futexLock);
             pp = &g_futexBuckets[bucket];
         } else {
             pp = &(*pp)->next;
         }
     }
 
-    __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+    IrqSpinLockRelease(&g_futexLock, fxFlags);
     return static_cast<int64_t>(woken);
 }
 
@@ -11002,9 +11007,7 @@ static bool FutexRemoveWaiter(uint64_t owner, uint64_t uaddr, Process* proc)
     if (!proc) return false;
     uint32_t bucket = FutexHash(owner, uaddr);
 
-    while (__atomic_test_and_set(&g_futexLock, __ATOMIC_ACQUIRE)) {
-        __asm__ volatile("pause");
-    }
+    uint64_t fxFlags = IrqSpinLockAcquire(&g_futexLock);
 
     FutexWaiter** pp = &g_futexBuckets[bucket];
     while (*pp) {
@@ -11012,13 +11015,13 @@ static bool FutexRemoveWaiter(uint64_t owner, uint64_t uaddr, Process* proc)
         if (w->uaddr == uaddr && w->owner == owner && w->proc == proc) {
             *pp = w->next;
             FutexFreeWaiter(w);
-            __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+            IrqSpinLockRelease(&g_futexLock, fxFlags);
             return true;
         }
         pp = &(*pp)->next;
     }
 
-    __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+    IrqSpinLockRelease(&g_futexLock, fxFlags);
     return false;
 }
 
@@ -11138,20 +11141,18 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
             return -ETIMEDOUT;
 
         // Acquire futex lock, atomically check value, and enqueue
-        while (__atomic_test_and_set(&g_futexLock, __ATOMIC_ACQUIRE)) {
-            __asm__ volatile("pause");
-        }
+        uint64_t fxFlags = IrqSpinLockAcquire(&g_futexLock);
 
         // Check if *uaddr == val while holding the lock
         if (__atomic_load_n(uaddr, __ATOMIC_ACQUIRE) != static_cast<uint32_t>(val)) {
-            __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+            IrqSpinLockRelease(&g_futexLock, fxFlags);
             return -EAGAIN;
         }
 
         // Allocate and enqueue waiter
         FutexWaiter* w = FutexAllocWaiter();
         if (!w) {
-            __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+            IrqSpinLockRelease(&g_futexLock, fxFlags);
             SerialPrintf("sys_futex: ENOMEM (pool exhausted) pid=%u\n", proc->pid);
             return -ENOMEM;
         }
@@ -11163,7 +11164,7 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
             : FUTEX_BITSET_MATCH_ANY;
         if (w->bitset == 0) {
             FutexFreeWaiter(w);
-            __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+            IrqSpinLockRelease(&g_futexLock, fxFlags);
             return -EINVAL;
         }
         uint32_t bucket = FutexHash(owner, uaddrVal);
@@ -11174,7 +11175,9 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
         __atomic_store_n(&proc->pendingWakeup, 0, __ATOMIC_RELEASE);
         proc->wakeupTick = deadline;
 
-        __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+        // Release the futex lock (restoring interrupts) BEFORE blocking — a
+        // process must never be descheduled with interrupts disabled.
+        IrqSpinLockRelease(&g_futexLock, fxFlags);
 
         // Block until FUTEX_WAKE removes our waiter, a signal arrives, or an
         // optional timeout expires and the scheduler wakes us.

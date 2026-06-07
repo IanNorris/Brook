@@ -46,6 +46,13 @@ static uint8_t g_dfStacks[GDT_MAX_CPUS][32768] __attribute__((aligned(16)));
 // Per-CPU NMI stacks (4KB each).
 static uint8_t g_nmiStacks[GDT_MAX_CPUS][4096] __attribute__((aligned(16)));
 
+// Expose the NMI stacks base so the panic NMI handler can derive its CPU index
+// from RSP (each CPU's NMI runs on g_nmiStacks[cpuIndex] via IST2).
+extern "C" uint64_t GdtNmiStacksBase()
+{
+    return reinterpret_cast<uint64_t>(&g_nmiStacks[0][0]);
+}
+
 // Track how many CPUs have been initialized.
 static uint32_t g_cpuTssCount = 0;
 

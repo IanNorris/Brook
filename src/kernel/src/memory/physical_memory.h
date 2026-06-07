@@ -31,6 +31,11 @@ struct PageDescriptor
     uint16_t pid;    // owning PID
     uint8_t  tag;    // MemTag value
     uint8_t  refCount; // COW reference count (0=untracked, 1=exclusive, 2+=shared)
+    uint16_t mapCount; // BRO-176: # of present USER PTEs mapping this frame.
+                       // Maintained O(1) at PTE install/remove. Invariant: when a
+                       // User page is freed (refCount→0) mapCount MUST be 0; a
+                       // nonzero value means a PTE outlived its reference (the
+                       // stale-mapping bug). See PmmMapInc/PmmMapDec.
 };
 
 // Head/tail/count for one PID's page list.
@@ -85,6 +90,14 @@ void PmmFreeByTag(uint16_t pid, MemTag tag);
 void     PmmRefPage(PhysicalAddress physAddr);
 void     PmmUnrefPage(PhysicalAddress physAddr);
 uint8_t  PmmGetRefCount(PhysicalAddress physAddr);
+
+// BRO-176 stale-mapping detector: track the number of present USER PTEs that
+// map a physical frame. Call PmmMapInc when installing a present USER PTE and
+// PmmMapDec when clearing/replacing one. When the frame is freed (refCount→0)
+// the PMM asserts mapCount==0; a nonzero value names a frame freed while still
+// mapped — caught at the instant of the erroneous free, before poison is read.
+void     PmmMapInc(PhysicalAddress physAddr);
+void     PmmMapDec(PhysicalAddress physAddr);
 
 // Enumerate pages owned by a PID. Calls callback(physAddr, tag, ctx) for each.
 void PmmEnumeratePid(uint16_t pid,

@@ -405,6 +405,7 @@ static volatile int g_settleCount = 2;
 static constexpr uint8_t SC_SCROLL_LOCK = 0x46;
 
 extern "C" void KernelPanic(const char* fmt, ...);
+extern "C" void SchedulerDumpHang();  // BRO-176 non-destructive hang dump (scheduler.cpp)
 
 // ---------------------------------------------------------------------------
 // IRQ1 interrupt handler
@@ -444,12 +445,42 @@ extern "C" void KbdIrqHandlerInner(void)
         return;
     }
 
+    // BRO-176 diag: while Ctrl is held, log the raw scancode of every key so we
+    // can identify which scancode (if any) F12 actually emits through QEMU on
+    // this host. Lock-free serial (DbgPrintf is compiled out in Release, so use
+    // SerialPrintf here — this is a temporary diagnostic). Remove once F12's code
+    // is known and the direct binding is corrected.
+    if (g_ctrlHeld)
+        SerialPrintf("KBD: ctrl+scancode=0x%x e0=%d\n", (unsigned)sc, (int)g_e0Prefix);
+
+    // Ctrl+Shift+ScrollLock → NON-DESTRUCTIVE hang dump (BRO-176). Reuses the
+    // ScrollLock scancode (0x46) which is proven to reach this handler, with
+    // Shift as the discriminator vs the panic chord below. This must be checked
+    // BEFORE the plain Ctrl+ScrollLock panic so the dump wins when Shift is held.
+    // (F12 is unreliable: on many laptops it emits an E0 media code, not 0x58.)
+    if (sc == SC_SCROLL_LOCK && g_ctrlHeld && g_shiftHeld)
+    {
+        ApicSendEoi();
+        SchedulerDumpHang();
+        return;
+    }
+
     // Ctrl+ScrollLock → diagnostic panic (like Linux SysRq+c).
     // Fires from IRQ context so it works even when all threads are deadlocked.
     if (sc == SC_SCROLL_LOCK && g_ctrlHeld)
     {
         ApicSendEoi();
         KernelPanic("Manual panic triggered (Ctrl+ScrollLock)");
+    }
+
+    // BRO-176: Ctrl+F12 → same non-destructive hang dump, as a convenience on
+    // keyboards where F12 emits the plain 0x58 scancode (desktops). Harmless if
+    // F12 never reaches here (laptops); use Ctrl+Shift+ScrollLock there.
+    if (sc == 0x58 /* F12 */ && g_ctrlHeld)
+    {
+        ApicSendEoi();
+        SchedulerDumpHang();
+        return;
     }
 
     // Handle E0 prefix (extended keys: arrows, Home, End, etc.)

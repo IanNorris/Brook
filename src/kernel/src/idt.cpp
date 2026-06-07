@@ -208,6 +208,10 @@ static void ExcStackWalk(uint64_t rbp, int maxFrames, const char* tag)
     ExcPutsRaw(tag); ExcPutsRaw("  --- end trace ---\n");
 }
 
+extern "C" int PmmDumpFreeLog(uint64_t phys);  // BRO-176 diag (physical_memory.cpp)
+extern "C" void PmmDescribe(uint64_t phys, uint32_t* used, uint32_t* refCount,
+                            uint32_t* mapCount, uint32_t* tag, uint32_t* ownerPid);
+
 static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t errorCode, bool hasErrorCode, bool swapgsDone = false)
 {
     __asm__ volatile("cli");
@@ -992,14 +996,37 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                 for (uint32_t pi = 0; pi < nProcs && procList.count < brook::PANIC_MAX_PROCESSES; pi++)
                 {
                     brook::Process* p = brook::PanicGetProcess(pi);
-                    if (!p || p->state == brook::ProcessState::Terminated) continue;
+                    if (!p) continue;
                     auto& e = procList.entries[procList.count];
+                    // SIG2: validate before deref (see panic.cpp) so a corrupt
+                    // Process* can't fault the panic handler into a hung double-panic.
+                    uint64_t pv = reinterpret_cast<uint64_t>(p);
+                    bool plausible = pv >= 0xFFFF800000000000ULL && (pv & 0x7) == 0;
+                    if (!plausible || p->magic != brook::PROCESS_MAGIC)
+                    {
+                        e.pid = 0xFFFF; e.state = 0xFF; e.cpu = 0xFF; e.rip = pv;
+                        e.name[0] = '?'; e.name[1] = '\0';
+                        e.tgid = 0; e.asLiveThreads = -1; e.refCount = 0;
+                        e.flags = brook::PANIC_PROC_MAGIC_BAD;
+                        procList.count++;
+                        continue;
+                    }
                     e.pid   = p->pid;
                     e.state = static_cast<uint8_t>(p->state);
                     e.cpu   = (p->runningOnCpu >= 0) ? static_cast<uint8_t>(p->runningOnCpu) : 0xFF;
-                    e.rip   = 0;
+                    e.rip   = p->savedCtx.rip;
                     for (uint32_t j = 0; j < brook::PANIC_PROCESS_NAME_LEN; j++)
                         e.name[j] = (p->name[j]) ? p->name[j] : '\0';
+                    e.tgid = p->tgid;
+                    bool leader = !p->isThread;
+                    e.asLiveThreads = leader
+                        ? static_cast<int16_t>(__atomic_load_n(&p->asLiveThreads, __ATOMIC_RELAXED))
+                        : static_cast<int16_t>(-1);
+                    e.refCount = static_cast<int16_t>(__atomic_load_n(&p->refCount, __ATOMIC_RELAXED));
+                    e.flags = 0;
+                    if (p->isThread)        e.flags |= brook::PANIC_PROC_IS_THREAD;
+                    if (p->reapable)        e.flags |= brook::PANIC_PROC_REAPABLE;
+                    if (p->isKernelThread)  e.flags |= brook::PANIC_PROC_IS_KTHREAD;
                     procList.count++;
                 }
 
@@ -1036,6 +1063,8 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                     }
                 }
 
+                static brook::PanicCpuList cpuList;
+                brook::PanicCaptureCpuList(&cpuList);
                 brook::PanicScreenInfo psi = {};
                 psi.message   = "Unrecoverable kernel exception";
                 psi.regs      = &pregs;
@@ -1044,6 +1073,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                 psi.procList  = &procList;
                 psi.sysInfo   = &sysInfo;
                 psi.stackDump = &stackDump;
+                psi.cpuList   = &cpuList;
                 psi.vector    = vector;
                 psi.errorCode = ef->errorCode;
                 brook::PanicScreenRender(const_cast<uint32_t*>(physFb), fbW, fbH, fbStride, &psi);
@@ -1238,6 +1268,71 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
 
     uint64_t cr2 = 0;
     __asm__ volatile("movq %%cr2, %0" : "=r"(cr2));
+
+    // BRO-176 diagnostic: on a fatal user fault, sweep the faulting process's
+    // entire user page table and look up every mapped frame in the PMM free-log.
+    // A hit means this LIVE process maps a physical frame already freed (and
+    // recycled) — the freed-while-mapped UAF (signature 1) — and the free-log
+    // names who freed it and via which path. One-off at fault time.
+    if (vector == 13 || vector == 14)
+    {
+        static constexpr uint64_t DMAP = 0xFFFF800000000000ULL;
+        static constexpr uint64_t PMASK = 0x000FFFFFFFFFF000ULL;
+        uint64_t cr3val = 0;
+        __asm__ volatile("movq %%cr3, %0" : "=r"(cr3val));
+        cr3val &= PMASK;
+        ExcPutsRaw("  --- BRO176 freed-while-mapped sweep ---\n");
+        int hits = 0, looked = 0;
+        uint64_t* pml4 = reinterpret_cast<uint64_t*>(DMAP + cr3val);
+        for (uint64_t i4 = 0; i4 < 256 && hits < 16; ++i4)
+        {
+            if (!(pml4[i4] & 1)) continue;
+            uint64_t* pdpt = reinterpret_cast<uint64_t*>(DMAP + (pml4[i4] & PMASK));
+            for (uint64_t i3 = 0; i3 < 512 && hits < 16; ++i3)
+            {
+                if (!(pdpt[i3] & 1) || (pdpt[i3] & (1ULL << 7))) continue;
+                uint64_t* pd = reinterpret_cast<uint64_t*>(DMAP + (pdpt[i3] & PMASK));
+                for (uint64_t i2 = 0; i2 < 512 && hits < 16; ++i2)
+                {
+                    if (!(pd[i2] & 1) || (pd[i2] & (1ULL << 7))) continue;
+                    uint64_t* pt = reinterpret_cast<uint64_t*>(DMAP + (pd[i2] & PMASK));
+                    for (uint64_t i1 = 0; i1 < 512 && hits < 16; ++i1)
+                    {
+                        if (!(pt[i1] & 1)) continue;
+                        ++looked;
+                        uint64_t phys = pt[i1] & PMASK;
+                        if (PmmDumpFreeLog(phys) > 0)
+                        {
+                            uint64_t va = (i4 << 39) | (i3 << 30) | (i2 << 21) | (i1 << 12);
+                            ExcPutsRaw("    ^ mapped at user VA "); ExcPutHex(va);
+                            // BRO-176 discriminator: the PMM's CURRENT view of this
+                            // frame. tag=4 (Heap)/2(KernelData) or used=0 while it is
+                            // mapped present here = a user PTE pointing at a frame the
+                            // kernel owns/freed (the 0xDF source). pteW shows if the
+                            // stale mapping is WRITABLE (privesc surface).
+                            uint32_t used=0, rc=0, mc=0, tg=0, op=0;
+                            PmmDescribe(phys, &used, &rc, &mc, &tg, &op);
+                            bool pteW = (pt[i1] & (1ULL << 1)) != 0;
+                            ExcPutsRaw(" [PMM used="); ExcPutHex(used);
+                            ExcPutsRaw(" ref="); ExcPutHex(rc);
+                            ExcPutsRaw(" map="); ExcPutHex(mc);
+                            ExcPutsRaw(" tag="); ExcPutHex(tg);
+                            ExcPutsRaw(" owner="); ExcPutHex(op);
+                            ExcPutsRaw(" pteW="); ExcPutHex(pteW ? 1 : 0);
+                            ExcPutsRaw("]");
+                            if (used == 0)        ExcPutsRaw("  <<< FRAME IS FREE while mapped!");
+                            else if (tg != 6)     ExcPutsRaw("  <<< NON-USER frame (tag!=User) mapped by user!");
+                            ExcPutsRaw("\n");
+                            ++hits;
+                        }
+                    }
+                }
+            }
+        }
+        ExcPutsRaw("  --- end sweep ("); ExcPutHex(static_cast<uint64_t>(hits));
+        ExcPutsRaw(" freed-while-mapped of "); ExcPutHex(static_cast<uint64_t>(looked));
+        ExcPutsRaw(" mapped) ---\n");
+    }
 
     // Note: COW page faults are handled above (before the kernel/user split)
     // for both kernel-mode and user-mode writes to COW-protected user pages.

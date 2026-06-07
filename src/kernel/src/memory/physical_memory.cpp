@@ -1,6 +1,7 @@
 #include "physical_memory.h"
 #include "serial.h"
 #include "spinlock.h"
+#include "portio.h"
 
 // Forward-declared to avoid circular headers.
 namespace brook {
@@ -36,6 +37,43 @@ static uint64_t g_nextHint   = 0;       // search hint for fast sequential alloc
 // interrupt preempting a lock holder would deadlock if the new thread tries
 // the same lock on the same CPU.
 static IrqSpinLock g_pmmLock;
+
+// ---------------------------------------------------------------------------
+// BRO-176 DIAGNOSTIC: low-perturbation free-log.
+// The double-free is a Heisenbug — heavy per-free page-table-walk audits slow
+// the kernel enough to mask the race. This is the cheap alternative: every
+// USER-page ref/unref events write a single ring record (phys, op, pid, count)
+// with NO page-table walk and minimal locking (g_pmmLock already held). The
+// crash handler (idt.cpp) translates the faulting pointer -> phys and dumps that
+// frame's full ref/unref trail, naming the exact unmatched op (the COW undercount).
+// TEMPORARY — strip with the rest of the BRO-176 instrumentation.
+// ---------------------------------------------------------------------------
+// op codes for FreeRec
+enum : uint8_t {
+    REFOP_ALLOC = 0,   // fresh allocation, refcount := 1
+    REFOP_REF   = 1,   // PmmRefPage, refcount++
+    REFOP_DEC   = 2,   // PmmUnrefPage/Free/Kill decremented (still shared)
+    REFOP_FREE  = 3,   // actually freed (refcount hit 0)
+};
+struct FreeRec { uint64_t phys; uint32_t seq; uint16_t ownerPid; uint8_t op; uint8_t count; const char* site; };
+static constexpr uint32_t FREELOG_SIZE = 1u << 17; // 131072 records (ref+unref doubles volume)
+static FreeRec  g_freeLog[FREELOG_SIZE];
+static uint32_t g_freeLogSeq = 0;
+static bool     g_freeLogOn  = false;
+
+// Caller MUST hold g_pmmLock.
+static inline void RefLogRecord(uint64_t phys, uint16_t ownerPid, uint8_t op,
+                                uint8_t count, const char* site)
+{
+    if (!g_freeLogOn) return;
+    uint32_t i = g_freeLogSeq & (FREELOG_SIZE - 1);
+    g_freeLog[i] = { phys & ~0xFFFULL, ++g_freeLogSeq, ownerPid, op, count, site };
+}
+// Back-compat shim for the existing free sites (op=FREE, count=0).
+static inline void FreeLogRecord(uint64_t phys, uint16_t ownerPid, const char* site)
+{
+    RefLogRecord(phys, ownerPid, REFOP_FREE, 0, site);
+}
 
 // ---------------------------------------------------------------------------
 // Ownership tracking — dynamically allocated after PmmEnableTracking().
@@ -103,12 +141,39 @@ static void ListAppend(uint32_t idx, uint16_t pid, MemTag tag)
     g_pidLists[pid].pageCount++;
 }
 
+// BRO-176: lock-free reflog dump (defined later); callers below already hold
+// g_pmmLock, so they must use this variant — PmmDumpFreeLog re-takes the lock.
+static int PmmDumpFreeLogLocked(uint64_t phys);
+
 static inline void TrackAlloc(uint32_t pageIdx, MemTag tag, uint16_t pid)
 {
     // Free pages are not in any list; just append to the new owner's list.
     if (!g_pageDescs) return;
     ListAppend(pageIdx, pid, tag);
     Desc(pageIdx).refCount = 1;  // exclusive ownership on fresh allocation
+    // BRO-176 stale-mapping detector (ALLOC side). A frame returned by the
+    // allocator must have NO existing USER PTE mapping it — it was on the free
+    // list. If mapCount is already nonzero here, some process still maps this
+    // physical frame even though we are about to hand it to a NEW owner: a PTE
+    // outlived its frame's free (the stale-mapping bug). The free-time check
+    // MISSES this case because the stale mapping was uncounted in the freeing
+    // process's generation and the doomed process's later teardown MapDec brings
+    // the count back to 0. Catch it HERE, at the instant of the colliding
+    // allocation, before we reset — naming both the new owner and the frame.
+    uint16_t preMap = __atomic_load_n(&Desc(pageIdx).mapCount, __ATOMIC_RELAXED);
+    if (preMap != 0)
+    {
+        SerialPrintf("BRO176-ALLOCMAPPED: phys=0x%lx handed to pid=%u but mapCount=%u "
+                     "— still mapped by a stale PTE (freed-while-mapped, missed at free)!\n",
+                     static_cast<uint64_t>(pageIdx) * PAGE_SIZE, (unsigned)pid,
+                     (unsigned)preMap);
+        PmmDumpFreeLogLocked(static_cast<uint64_t>(pageIdx) * PAGE_SIZE);
+    }
+    // A freshly (re)allocated frame has no mappers yet. Reset the map accounting
+    // so a recycled page starts clean regardless of how it was freed.
+    __atomic_store_n(&Desc(pageIdx).mapCount, 0, __ATOMIC_RELAXED);
+    if (tag == MemTag::User)
+        RefLogRecord(static_cast<uint64_t>(pageIdx) * PAGE_SIZE, pid, REFOP_ALLOC, 1, "alloc");
 }
 
 // ---------------------------------------------------------------------------
@@ -307,6 +372,11 @@ PhysicalAddress PmmAllocPages(uint64_t count, MemTag tag, uint16_t pid)
     return PhysicalAddress{}; // no contiguous run found
 }
 
+// BRO-176: forward declarations for the stale-mapping leak check (defined after
+// PmmUnrefPage). Used by the free sites below.
+extern "C" int PmmDumpFreeLog(uint64_t phys);
+static inline void MapLeakCheckLocked(uint32_t idx, const char* site);
+
 void PmmFreePage(PhysicalAddress physAddr)
 {
     if (!physAddr) return;
@@ -327,7 +397,10 @@ void PmmFreePage(PhysicalAddress physAddr)
     // co-owner (BRO-161). ListRemove is idempotent, so repeated unrefs are safe.
     if (g_pageDescs && Desc(static_cast<uint32_t>(idx)).refCount > 1)
     {
-        Desc(static_cast<uint32_t>(idx)).refCount--;
+        auto& dd = Desc(static_cast<uint32_t>(idx));
+        dd.refCount--;
+        if (dd.tag == static_cast<uint8_t>(MemTag::User))
+            RefLogRecord(physAddr.raw(), dd.pid, REFOP_DEC, dd.refCount, "PmmFreePage");
         ListRemove(static_cast<uint32_t>(idx));
         IrqSpinLockRelease(&g_pmmLock, pmmFlags);
         return;
@@ -339,11 +412,15 @@ void PmmFreePage(PhysicalAddress physAddr)
 
     if (g_pageDescs)
     {
-        ListRemove(static_cast<uint32_t>(idx));
         PageDescriptor& d = Desc(static_cast<uint32_t>(idx));
+        MapLeakCheckLocked(static_cast<uint32_t>(idx), "PmmFreePage");
+        if (d.tag == static_cast<uint8_t>(MemTag::User))
+            FreeLogRecord(physAddr.raw(), d.pid, "PmmFreePage");
+        ListRemove(static_cast<uint32_t>(idx));
         d.pid = 0;
         d.tag = static_cast<uint8_t>(MemTag::Free);
         d.refCount = 0;
+        __atomic_store_n(&d.mapCount, 0, __ATOMIC_RELAXED);
     }
 
     IrqSpinLockRelease(&g_pmmLock, pmmFlags);
@@ -382,6 +459,8 @@ void PmmRefPage(PhysicalAddress physAddr)
         d.refCount = 2;  // legacy page: count existing owner + new sharer
     else if (d.refCount < 255)
         d.refCount++;
+    if (d.tag == static_cast<uint8_t>(MemTag::User))
+        RefLogRecord(physAddr.raw(), d.pid, REFOP_REF, d.refCount, "PmmRefPage");
     IrqSpinLockRelease(&g_pmmLock, pmmFlags);
 }
 
@@ -397,6 +476,8 @@ void PmmUnrefPage(PhysicalAddress physAddr)
     if (d.refCount > 1)
     {
         d.refCount--;
+        if (d.tag == static_cast<uint8_t>(MemTag::User))
+            RefLogRecord(physAddr.raw(), d.pid, REFOP_DEC, d.refCount, "PmmUnrefPage");
         // Drop the page from its owner's PID list — see PmmFreePage and BRO-161.
         // Once shared, freeing is driven solely by the page-table walk (one
         // unref per mapper); leaving it listed lets PmmKillPid free it under a
@@ -408,14 +489,66 @@ void PmmUnrefPage(PhysicalAddress physAddr)
     // refCount is 0 or 1 — this was the last (or only) reference, actually free
     if (IsUsed(idx))
     {
+        MapLeakCheckLocked(idx, "PmmUnrefPage");
+        if (d.tag == static_cast<uint8_t>(MemTag::User))
+            FreeLogRecord(physAddr.raw(), d.pid, "PmmUnrefPage");
         SetFree(idx);
         g_freePages++;
         if (idx < g_nextHint) g_nextHint = idx;
     }
     ListRemove(idx);
     d = { PMM_NULL_PAGE, PMM_NULL_PAGE, 0,
-          static_cast<uint8_t>(MemTag::Free), 0 };
+          static_cast<uint8_t>(MemTag::Free), 0, 0 };
     IrqSpinLockRelease(&g_pmmLock, pmmFlags);
+}
+
+// BRO-176 stale-mapping detector ------------------------------------------------
+// Called at an ACTUAL free (refCount reached 0) while holding g_pmmLock. If a
+// User frame is freed while a present USER PTE still maps it (mapCount != 0), the
+// mapping outlived its reference — the BRO-176 stale-mapping bug. Name it
+// red-handed, at the instant of the erroneous free, with its full ref/unref
+// trail, BEFORE the page is recycled and poison is ever read.
+static inline void MapLeakCheckLocked(uint32_t idx, const char* site)
+{
+    PageDescriptor& d = Desc(idx);
+    if (d.tag != static_cast<uint8_t>(MemTag::User)) return;
+    uint16_t mc = __atomic_load_n(&d.mapCount, __ATOMIC_RELAXED);
+    if (mc != 0)
+    {
+        SerialPrintf("BRO176-MAPLEAK: phys=0x%lx FREED via %s with mapCount=%u still "
+                     "mapped (owner pid=%u refCount=%u) — PTE outlived its reference!\n",
+                     static_cast<uint64_t>(idx) * PAGE_SIZE, site, (unsigned)mc,
+                     (unsigned)d.pid, (unsigned)d.refCount);
+        PmmDumpFreeLogLocked(static_cast<uint64_t>(idx) * PAGE_SIZE);
+    }
+}
+
+// PmmMapInc/PmmMapDec — O(1) USER-PTE map accounting (see header). Updated under
+// the VMM page-table lock (g_userPtLock), which is independent of g_pmmLock, so
+// mapCount is touched atomically everywhere.
+void PmmMapInc(PhysicalAddress physAddr)
+{
+    if (!g_pageDescs || !physAddr) return;
+    uint64_t idx = physAddr.raw() / PAGE_SIZE;
+    if (idx >= g_totalPages) return;
+    __atomic_add_fetch(&Desc(static_cast<uint32_t>(idx)).mapCount, 1, __ATOMIC_RELAXED);
+}
+
+void PmmMapDec(PhysicalAddress physAddr)
+{
+    if (!g_pageDescs || !physAddr) return;
+    uint64_t idx = physAddr.raw() / PAGE_SIZE;
+    if (idx >= g_totalPages) return;
+    PageDescriptor& d = Desc(static_cast<uint32_t>(idx));
+    if (__atomic_load_n(&d.mapCount, __ATOMIC_RELAXED) == 0)
+    {
+        // Unmap without a matching map — the opposite-end accounting bug from a
+        // leak (a PTE removed twice, or removed for a frame it never mapped).
+        SerialPrintf("BRO176-MAPUNDERFLOW: phys=0x%lx mapDec at mapCount=0 "
+                     "(pid=%u tag=%u)\n", physAddr.raw(), (unsigned)d.pid, (unsigned)d.tag);
+        return;
+    }
+    __atomic_sub_fetch(&d.mapCount, 1, __ATOMIC_RELAXED);
 }
 
 uint8_t PmmGetRefCount(PhysicalAddress physAddr)
@@ -424,6 +557,30 @@ uint8_t PmmGetRefCount(PhysicalAddress physAddr)
     uint64_t idx64 = physAddr.raw() / PAGE_SIZE;
     if (idx64 >= g_totalPages) return 0;
     return Desc(static_cast<uint32_t>(idx64)).refCount;
+}
+
+// BRO-176 crash-time discriminator: report the PMM's current view of a frame so
+// the user-#GP sweep can tell apart (a) frame still owned by a USER process
+// (stale PTE / shared), (b) frame currently FREE in the bitmap (freed-while-
+// mapped), or (c) frame owned by the KERNEL HEAP (tag=Heap) = a frame reachable
+// by a user mapping AND the kernel heap at once (the 0xDF source). Lock-free
+// read — intended for the fault path only.
+extern "C" void PmmDescribe(uint64_t phys, uint32_t* used, uint32_t* refCount,
+                            uint32_t* mapCount, uint32_t* tag, uint32_t* ownerPid)
+{
+    uint64_t idx64 = phys / PAGE_SIZE;
+    if (!g_pageDescs || idx64 >= g_totalPages)
+    {
+        if (used) *used = 0xFF;
+        return;
+    }
+    uint32_t idx = static_cast<uint32_t>(idx64);
+    PageDescriptor& d = Desc(idx);
+    if (used)     *used     = IsUsed(idx) ? 1u : 0u;
+    if (refCount) *refCount = d.refCount;
+    if (mapCount) *mapCount = __atomic_load_n(&d.mapCount, __ATOMIC_RELAXED);
+    if (tag)      *tag      = d.tag;
+    if (ownerPid) *ownerPid = d.pid;
 }
 
 void PmmEnableTracking()
@@ -454,7 +611,7 @@ void PmmEnableTracking()
     for (uint32_t i = 0; i < static_cast<uint32_t>(g_totalPages); i++)
     {
         g_pageDescs[i] = { PMM_NULL_PAGE, PMM_NULL_PAGE, 0,
-                           static_cast<uint8_t>(MemTag::Free), 0 };
+                           static_cast<uint8_t>(MemTag::Free), 0, 0 };
     }
 
     // Backfill: add used pages to KernelPid's list; free pages are left
@@ -480,6 +637,84 @@ void PmmEnableTracking()
                  static_cast<uint32_t>(g_totalPages),
                  usedCount, freeCount,
                  static_cast<uint32_t>(g_totalPages * sizeof(PageDescriptor) / 1024));
+
+    g_freeLogOn = true;  // BRO-176 diag: arm the low-perturbation free-log
+}
+
+// BRO-176 diagnostic: print every recorded free of `phys` (most recent first).
+// Quiet on miss (so it can be called per-leaf during a whole-page-table sweep).
+// Returns the number of matching records found. Takes g_pmmLock.
+//
+// Uses RAW serial port polling rather than SerialPrintf: this is called from the
+// #GP/#PF crash handler AFTER ExcForceSerialLock sets g_panicInProgress, which
+// silences SerialPrintf/SerialPuts. Raw port writes bypass that so the owner/site
+// (the whole point of the free-log) actually reaches the serial log.
+static inline void FlRawChar(char c)
+{
+    if (c == '\n') {
+        while ((inb(0x3FD) & 0x20) == 0) {}
+        outb(0x3F8, '\r');
+    }
+    while ((inb(0x3FD) & 0x20) == 0) {}
+    outb(0x3F8, static_cast<uint8_t>(c));
+}
+static inline void FlRawStr(const char* s) { if (s) while (*s) FlRawChar(*s++); }
+static inline void FlRawHex(uint64_t v)
+{
+    FlRawChar('0'); FlRawChar('x');
+    for (int sh = 60; sh >= 0; sh -= 4) {
+        int n = (int)((v >> sh) & 0xF);
+        FlRawChar((char)(n < 10 ? '0' + n : 'a' + n - 10));
+    }
+}
+static inline void FlRawDec(uint64_t v)
+{
+    char b[20]; int i = 0;
+    if (!v) b[i++] = '0';
+    while (v) { b[i++] = (char)('0' + v % 10); v /= 10; }
+    while (i) FlRawChar(b[--i]);
+}
+
+// Lock-free reflog dump — caller MUST hold g_pmmLock. Used by the leak/alloc
+// checks which run inside the PMM critical section (re-taking g_pmmLock here
+// would self-deadlock the non-recursive ticket lock).
+static int PmmDumpFreeLogLocked(uint64_t phys)
+{
+    static const char* opName[4] = { "ALLOC", "REF  ", "DEC  ", "FREE " };
+    uint64_t target = phys & ~0xFFFULL;
+    int found = 0;
+    uint32_t total = g_freeLogSeq;
+    uint32_t scan = (total < FREELOG_SIZE) ? total : FREELOG_SIZE;
+    static constexpr int MAXSHOW = 24;
+    uint32_t hits[MAXSHOW]; int nh = 0;
+    for (uint32_t n = 1; n <= scan && nh < MAXSHOW; ++n)
+    {
+        uint32_t i = (g_freeLogSeq - n) & (FREELOG_SIZE - 1);
+        FreeRec& r = g_freeLog[i];
+        if (r.phys != target || !r.site) continue;
+        hits[nh++] = i;
+    }
+    for (int k = nh - 1; k >= 0; --k)
+    {
+        FreeRec& r = g_freeLog[hits[k]];
+        FlRawStr("  BRO176-REFLOG phys="); FlRawHex(r.phys);
+        FlRawStr(" seq="); FlRawDec(r.seq);
+        FlRawStr(" "); FlRawStr(r.op < 4 ? opName[r.op] : "?");
+        FlRawStr(" ->count="); FlRawDec(r.count);
+        FlRawStr(" pid="); FlRawDec(r.ownerPid);
+        FlRawStr(" "); FlRawStr(r.site);
+        FlRawChar('\n');
+        ++found;
+    }
+    return found;
+}
+
+extern "C" int PmmDumpFreeLog(uint64_t phys)
+{
+    uint64_t pmmFlags = IrqSpinLockAcquire(&g_pmmLock);
+    int found = PmmDumpFreeLogLocked(phys);
+    IrqSpinLockRelease(&g_pmmLock, pmmFlags);
+    return found;
 }
 
 void PmmKillPid(uint16_t pid)
@@ -501,6 +736,9 @@ void PmmKillPid(uint16_t pid)
         {
             // COW shared page — decrement refcount, remove from this PID's list
             Desc(idx).refCount--;
+            if (Desc(idx).tag == static_cast<uint8_t>(MemTag::User))
+                RefLogRecord(static_cast<uint64_t>(idx) * PAGE_SIZE, pid, REFOP_DEC,
+                             Desc(idx).refCount, "PmmKillPid");
             ListRemove(idx);  // update neighbours so list stays consistent
             shared++;
         }
@@ -509,12 +747,15 @@ void PmmKillPid(uint16_t pid)
             // Exclusive page — actually free it
             if (IsUsed(idx))
             {
+                MapLeakCheckLocked(idx, "PmmKillPid");
+                if (Desc(idx).tag == static_cast<uint8_t>(MemTag::User))
+                    FreeLogRecord(static_cast<uint64_t>(idx) * PAGE_SIZE, pid, "PmmKillPid");
                 SetFree(idx);
                 g_freePages++;
                 if (idx < g_nextHint) g_nextHint = idx;
             }
             Desc(idx) = { PMM_NULL_PAGE, PMM_NULL_PAGE, 0,
-                          static_cast<uint8_t>(MemTag::Free), 0 };
+                          static_cast<uint8_t>(MemTag::Free), 0, 0 };
         }
         count++;
 
@@ -562,7 +803,7 @@ void PmmFreeByTag(uint16_t pid, MemTag tag)
             g_freePages++;
             if (idx < g_nextHint) g_nextHint = idx;
             Desc(idx) = { PMM_NULL_PAGE, PMM_NULL_PAGE, 0,
-                          static_cast<uint8_t>(MemTag::Free), 0 };
+                          static_cast<uint8_t>(MemTag::Free), 0, 0 };
             count++;
         }
 

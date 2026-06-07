@@ -327,6 +327,14 @@ struct Process
     // Blocking info (e.g. nanosleep wakeup tick)
     uint64_t wakeupTick;        // g_lapicTickCount value to unblock at (0 = N/A)
 
+    // BRO-176 lost-enqueue diagnostic: a small ring of recent scheduler events
+    // touching this process. Each entry packs (tick<<16 | site<<8 | state).
+    // Dumped by the SCHED STALL detector to show the exact op sequence that left
+    // a process state==Ready but absent from the policy ready queue. Pure
+    // diagnostic; written O(1) at the key sched sites.
+    uint64_t schedTrace[12];
+    uint8_t  schedTraceHead;
+
     // Mutex wait-queue linkage (used by KMutex when process is blocked on a lock)
     Process* syncNext;          // Next process in sync wait queue (mutex/rwlock/semaphore)
     volatile uint32_t pendingWakeup; // Set by KMutexUnlock before SchedulerUnblock;

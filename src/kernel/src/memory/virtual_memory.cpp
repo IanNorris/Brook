@@ -282,6 +282,12 @@ bool VmmMapPage(PageTable pt, VirtualAddress virtAddr, PhysicalAddress physAddr,
         return false;
     }
 
+    // BRO-176 map accounting: if we are REPLACING a present USER PTE, drop the
+    // old frame's mapcount first (this VA no longer maps it).
+    uint64_t oldPte = *pte;
+    if ((oldPte & VMM_PRESENT) && (oldPte & VMM_USER))
+        PmmMapDec(PhysicalAddress(oldPte & PHYS_MASK));
+
     *pte = (physAddr.raw() & PHYS_MASK)
          | VMM_PRESENT
          | (flags & ~(VMM_PRESENT | PTE_TAG_MASK | PTE_COW_BIT | PTE_PID_MASK | VMM_NO_EXEC))
@@ -289,6 +295,10 @@ bool VmmMapPage(PageTable pt, VirtualAddress virtAddr, PhysicalAddress physAddr,
          | (((uint64_t)pid & 0x3FF) << PTE_PID_SHIFT)
          | (flags & VMM_NO_EXEC);
     Invlpg(virtAddr);
+
+    // A new present USER PTE now maps this frame — count it.
+    if (flags & VMM_USER)
+        PmmMapInc(physAddr);
 
     IrqSpinLockRelease(&ptLock, ptFlags);
     return true;
@@ -303,6 +313,9 @@ void VmmUnmapPage(PageTable pt, VirtualAddress virtAddr)
     uint64_t* pte = WalkToPtr(pt, virtAddr, /*create=*/false);
     if (pte && (*pte & VMM_PRESENT))
     {
+        // BRO-176 map accounting: a present USER PTE is going away.
+        if (*pte & VMM_USER)
+            PmmMapDec(PhysicalAddress(*pte & PHYS_MASK));
         *pte = 0;
         Invlpg(virtAddr);
     }
@@ -593,6 +606,9 @@ uint16_t VmmGetPagePid(PageTable pt, VirtualAddress virtAddr)
     return static_cast<uint16_t>((*pte & PTE_PID_MASK) >> PTE_PID_SHIFT);
 }
 
+// BRO-176 diag: dump a physical page's ref/unref history ring (physical_memory.cpp).
+extern "C" int PmmDumpFreeLog(uint64_t phys);
+
 VmmCowResult VmmCowResolveWrite(PageTable pt, VirtualAddress faultAddr, uint16_t pid)
 {
     VirtualAddress pageAddr(faultAddr.raw() & ~(PAGE_SIZE - 1));
@@ -617,7 +633,26 @@ VmmCowResult VmmCowResolveWrite(PageTable pt, VirtualAddress faultAddr, uint16_t
 
     PhysicalAddress oldPhys(*pte & PHYS_MASK);
 
-    if (PmmGetRefCount(oldPhys) > 1)
+    // BRO-176 red-handed detector: this PTE is Present + COW (checked above), so
+    // oldPhys MUST still be referenced (refcount >= 1) — a COW-mapped frame is by
+    // definition alive. If the refcount is 0 here, the frame was FREED while still
+    // COW-mapped in this AS: the cross-process COW undercount. Catch it at the
+    // instant of use, with the phys known, and dump its ref/unref trail naming the
+    // unmatched op — rather than thousands of forks later when a child reads the
+    // recycled page's poison (SIG1) or a reused page-table page faults reserved-bit
+    // (the kernel #PF in VmmGetPte). One PmmGetRefCount call: low perturbation.
+    uint8_t oldRc = PmmGetRefCount(oldPhys);
+    if (oldRc == 0)
+    {
+        SerialPrintf("BRO176-COWUAF: COW source phys=0x%lx refcount=0 while "
+                     "PTE present+COW va=0x%lx pid=%u — freed-while-mapped!\n",
+                     oldPhys.raw(), pageAddr.raw(), (unsigned)pid);
+        PmmDumpFreeLog(oldPhys.raw());
+        // Fall through to the copy path (treat as shared) so we copy out of the
+        // (poisoned) page and at least don't make a freed frame writable in place.
+    }
+
+    if (oldRc > 1 || oldRc == 0)
     {
         // Shared page: copy to a fresh page and drop our ref on the shared one.
         PhysicalAddress newPhys = PmmAllocPage(MemTag::User, pid);
@@ -639,10 +674,20 @@ VmmCowResult VmmCowResolveWrite(PageTable pt, VirtualAddress faultAddr, uint16_t
                | (((uint64_t)pid & 0x3FF) << PTE_PID_SHIFT);
         *pte = newPte;
 
+        // BRO-176 map accounting: this PTE was repointed from the shared frame
+        // (oldPhys) to a fresh private frame (newPhys). Drop the mapcount on the
+        // old frame and bump it on the new one, in lockstep with the ref change.
+        // A COW PTE is always a USER mapping, so oldPhys is a user frame.
+        if (oldPhys)
+            PmmMapDec(oldPhys);
+        PmmMapInc(newPhys);
+
         // Safe to drop our ref AFTER repointing the PTE and copying: we still
         // held a reference throughout the copy, so the source could not be
         // freed underneath us even if another owner unref'd concurrently.
-        PmmUnrefPage(oldPhys);
+        // (When oldRc==0 we skip the unref — there is no ref of ours to drop.)
+        if (oldRc != 0)
+            PmmUnrefPage(oldPhys);
     }
     else
     {
@@ -777,6 +822,11 @@ static void FreeTableLevel(PhysicalAddress tablePhys, int level)
         {
             if (!(table[i] & VMM_PRESENT)) continue;
             PhysicalAddress pagePhys(table[i] & PHYS_MASK);
+            // BRO-176 map accounting: this process's USER PTE for the frame is
+            // being torn down — drop its mapcount in lockstep with the unref so
+            // the freeing site sees mapCount==0 only when no PTE remains.
+            if (table[i] & VMM_USER)
+                PmmMapDec(pagePhys);
             PmmUnrefPage(pagePhys);
         }
     }

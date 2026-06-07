@@ -523,20 +523,56 @@ void SmpSetCurrentCr3(uint32_t cpuIndex, uint64_t cr3)
 // NMI handler for panic halt
 // ---------------------------------------------------------------------------
 // When g_panicHaltActive is true, the NMI handler captures the interrupted
-// RIP/RSP/RBP and the current PID, then spins forever with cli;hlt.
-// This is installed as the vector 2 handler during SmpInit.
+// RIP/RSP/RBP into g_haltedState[thisCpu], then spins forever with cli;pause.
+// This is installed as the vector 2 handler during SmpInit. The captured live
+// spin RIP is what PanicCaptureCpuList prefers (panic.cpp) — it reveals where
+// each AP was ACTUALLY executing when the panic fired (e.g. spinning on a lock
+// during the BRO-176 reap-stall hang), which the scheduler's stale savedCtx.rip
+// cannot show for a Running process.
 //
 // We use a naked asm handler to avoid any compiler-generated prologue that
-// might fault (e.g., SSE saves, red zone issues). This handler:
-//   1. Checks g_panicHaltActive — if not set, iretq (spurious NMI)
-//   2. Atomically increments g_haltedCount
-//   3. Spins forever with cli; hlt
+// might fault (e.g., SSE saves, red zone issues). On the panic path it never
+// returns, so it clobbers registers freely. The CPU index is derived from RSP
+// (the NMI runs on the per-CPU IST stack g_nmiStacks[idx], stride 4096) rather
+// than GS, because the NMI may land while the interrupted code was in user mode
+// with a user GS base — reading %gs:176 there would index with garbage.
+
+// Base of g_nmiStacks[0][0]; set during InstallPanicNmiHandler. Referenced by
+// the naked asm handler (RIP-relative) to convert RSP → CPU index.
+extern "C" uint64_t g_nmiStackBase = 0;
+
+// C recorder called from the naked NMI asm. Plain integer stores only (no locks,
+// no SSE) so it is safe to call from NMI/IST context. Bounds-checked so a wild
+// index can never fault the handler (which would nest a fault on the IST stack).
+extern "C" void PanicNmiRecord(uint64_t cpuIdx, uint64_t rip,
+                               uint64_t rsp, uint64_t rbp)
+{
+    if (cpuIdx >= MAX_CPUS) return;
+    CpuHaltedState& hs = g_haltedState[cpuIdx];
+    hs.rip    = rip;
+    hs.rsp    = rsp;
+    hs.rbp    = rbp;
+    hs.pid    = 0;  // pid is resolved in panic.cpp from the scheduler's per-CPU table
+    hs.halted = true;
+}
 
 __asm__(
     ".global PanicNmiHandlerAsm\n"
     "PanicNmiHandlerAsm:\n"
     "    cmpb $0, g_panicHaltActive(%rip)\n"
     "    je .Lnmi_return\n"
+    // --- panic path: never returns, free to clobber ---
+    // CPU index = (RSP - g_nmiStackBase) >> 12  (IST NMI stack is per-CPU, 4096B).
+    "    movq %rsp, %rax\n"
+    "    subq g_nmiStackBase(%rip), %rax\n"
+    "    shrq $12, %rax\n"
+    // Gather the interrupted frame the CPU pushed: [rsp+0]=RIP, [rsp+24]=RSP.
+    "    movq 0(%rsp), %rsi\n"          // arg2 = interrupted RIP
+    "    movq 24(%rsp), %rdx\n"         // arg3 = interrupted RSP
+    "    movq %rbp, %rcx\n"             // arg4 = RBP at interrupt
+    "    movq %rax, %rdi\n"             // arg1 = cpu index
+    "    andq $-16, %rsp\n"             // 16-byte align for the SysV call
+    "    call PanicNmiRecord\n"
     "    lock incl g_haltedCount(%rip)\n"
     ".Lnmi_spin:\n"
     "    cli\n"
@@ -589,6 +625,9 @@ const CpuHaltedState* SmpGetHaltedState(uint32_t cpuIndex)
 // Install the panic-aware NMI handler. Called during SmpInit.
 static void InstallPanicNmiHandler()
 {
+    // Cache the IST NMI-stack base for the asm handler's RSP→CPU-index math.
+    // Idempotent (always the same address); safe to set on BSP and each AP.
+    g_nmiStackBase = GdtNmiStacksBase();
     IdtInstallHandler(2, reinterpret_cast<void*>(PanicNmiHandlerAsm));
 }
 

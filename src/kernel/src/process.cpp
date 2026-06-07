@@ -21,18 +21,83 @@
 #include "smp.h"
 #include "apic.h"
 #include "cpu.h"
+#include "ksym_addrs.h"
 
 namespace brook {
+
+// BRO-176 diagnostic: asLiveThreads inc/dec ring recorder (defined in scheduler.cpp).
+extern "C" void SchedulerRecordAsLive(void* leader, uint16_t actingPid, uint16_t leaderPid,
+                                      uint32_t leaderIncarn, uint32_t procLeaderIncarn,
+                                      int32_t result, uint8_t op);
 
 // ProcessCurrent() is now in scheduler.cpp (g_currentProcess lives there).
 
 // Helper: free a Process* and clear its magic so any stale pointer to this
 // page that survives in the scheduler / wakeup lists fails its magic-check
 // at next deref instead of corrupting the run.
+//
+// BRO-176 DIAGNOSTIC: every Process-struct free is also recorded in a small ring
+// (ptr, freed pid, incarnation, caller return-address, seq). The scheduler's
+// ReadyQueueInsertLocked guard, when it catches a stale/corrupt Process*, looks
+// the pointer up here to name WHICH free site retired the struct and when —
+// pinning the premature-free path for signature 2. Cheap: one locked ring write
+// per process teardown (not a hot path). TEMPORARY — strip with the rest of the
+// BRO-176 instrumentation before the fix commit.
+struct ProcFreeRec {
+    Process* ptr;
+    uint64_t seq;
+    uint64_t retaddr;     // __builtin_return_address(0) of FreeProcessStruct
+    uint32_t incarnation;
+    uint16_t pid;
+};
+static constexpr uint32_t PROCFREELOG_SIZE = 2048;
+static ProcFreeRec  g_procFreeLog[PROCFREELOG_SIZE];
+static uint64_t     g_procFreeSeq = 0;
+static IrqSpinLock  g_procFreeLogLock;
+
 static inline void FreeProcessStruct(Process* p)
 {
-    if (p) p->magic = 0;
+    if (p)
+    {
+        // Record the free BEFORE clearing magic / handing memory back, capturing
+        // the caller so we can identify the exact teardown path.
+        uint64_t ret = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+        uint64_t fl = IrqSpinLockAcquire(&g_procFreeLogLock);
+        uint32_t i = g_procFreeSeq & (PROCFREELOG_SIZE - 1);
+        g_procFreeLog[i] = { p, ++g_procFreeSeq, ret,
+                             (uint32_t)p->incarnation, p->pid };
+        IrqSpinLockRelease(&g_procFreeLogLock, fl);
+
+        p->magic = 0;
+    }
     kfree(p);
+}
+
+// BRO-176 diagnostic: print recent free records for a given Process* (newest
+// first). Returns the number of matching records. Safe to call from the crash
+// guard — takes only g_procFreeLogLock.
+extern "C" int ProcessDumpFreeLog(void* ptr)
+{
+    Process* target = reinterpret_cast<Process*>(ptr);
+    int found = 0;
+    uint64_t fl = IrqSpinLockAcquire(&g_procFreeLogLock);
+    uint32_t scan = (g_procFreeSeq < PROCFREELOG_SIZE)
+                  ? (uint32_t)g_procFreeSeq : PROCFREELOG_SIZE;
+    for (uint32_t n = 1; n <= scan; ++n)
+    {
+        uint32_t i = (uint32_t)((g_procFreeSeq - n) & (PROCFREELOG_SIZE - 1));
+        ProcFreeRec& r = g_procFreeLog[i];
+        if (r.ptr != target) continue;
+        const char* sym = nullptr; uint64_t off = 0;
+        bool haveSym = KsymFindByAddr(r.retaddr, &sym, &off);
+        SerialPrintf("  BRO176-PROCFREE ptr=%p freedSeq=%lu pid=%u incarnation=%u "
+                     "freedBy=0x%lx %s+0x%lx\n",
+                     r.ptr, r.seq, (unsigned)r.pid, r.incarnation, r.retaddr,
+                     haveSym ? sym : "?", off);
+        if (++found >= 4) break;
+    }
+    IrqSpinLockRelease(&g_procFreeLogLock, fl);
+    return found;
 }
 
 // BRO-176: monotonically-increasing incarnation id, never reused — lets a
@@ -897,10 +962,14 @@ void ProcessDestroy(Process* proc)
     if (isThread && !proc->isKernelThread)
     {
         Process* leader = proc->threadLeader;
-        if (leader && leader->magic == PROCESS_MAGIC &&
-            leader->incarnation == proc->leaderIncarnation)
+        bool magicOk = leader && leader->magic == PROCESS_MAGIC;
+        bool incarnOk = magicOk && leader->incarnation == proc->leaderIncarnation;
+        if (incarnOk)
         {
             int32_t after = __atomic_sub_fetch(&leader->asLiveThreads, 1, __ATOMIC_ACQ_REL);
+            brook::SchedulerRecordAsLive(leader, proc->pid, leader->pid,
+                                         (uint32_t)leader->incarnation,
+                                         (uint32_t)proc->leaderIncarnation, after, /*dec-applied*/1);
             if (after < 0)
             {
                 // Safety net: asLiveThreads must never go negative.  A negative
@@ -911,6 +980,16 @@ void ProcessDestroy(Process* proc)
                              leader->pid, proc->pid);
                 __atomic_store_n(&leader->asLiveThreads, 0, __ATOMIC_RELEASE);
             }
+        }
+        else
+        {
+            // BRO-176: a SKIPPED decrement is the prime leak suspect — the matching
+            // increment bumped some leader's count that now never comes back down,
+            // wedging a Terminated leader unreapable (reap-stall hang). Record it.
+            brook::SchedulerRecordAsLive(leader, proc->pid, magicOk ? leader->pid : 0,
+                                         magicOk ? (uint32_t)leader->incarnation : 0,
+                                         (uint32_t)proc->leaderIncarnation, -1,
+                                         magicOk ? /*skip-mismatch*/2 : /*bad-leader*/3);
         }
         // If the leader pointer is stale or its incarnation no longer matches
         // (struct freed+reused), this thread's increment already retired with the
@@ -1082,6 +1161,22 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                                           | PTE_COW_BIT
                                           | (((uint64_t)dstPid & 0x3FF) << PTE_PID_SHIFT);
 
+                        // BRO-176: pin the shared frame BEFORE the child mapping
+                        // becomes reachable. Publishing the child's leaf PTE
+                        // (VmmMapPage below) adds a second mapper, but the refcount
+                        // is not bumped until the commit. In that window a
+                        // concurrent teardown of the parent's address space (a
+                        // sibling thread's exit_group) could unref the frame to
+                        // zero and free it while the child maps it — the cross-AS
+                        // COW double-free. Taking an anticipatory reference here
+                        // holds the frame at >=1 across the whole share, so it can
+                        // never be freed mid-share. The matching unref (unpin)
+                        // runs after the commit's own ref is in place. This also
+                        // strengthens BRO-155: refcount is >=2 throughout the
+                        // share window, so the COW write-fault handler always
+                        // observes "shared" and copies, never upgrading in place.
+                        PmmRefPage(srcPhys);
+
                         // Create intermediate page table entries in child FIRST.
                         // VmmMapPage takes g_userPtLock internally, so it must
                         // run BEFORE the locked commit (calling it under the lock
@@ -1095,6 +1190,8 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                         {
                             SerialPrintf("FORK: failed to map COW page at vaddr 0x%lx\n", vaddr);
                             // Parent PTE was not modified — nothing to restore.
+                            // Drop the anticipatory pin taken above.
+                            PmmUnrefPage(srcPhys);
                             return false;
                         }
 
@@ -1115,6 +1212,12 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                         VmmForkCommitCowShare(&srcPt4[i1], &dstPt4[i1],
                                               childPte, srcPhys);
 
+                        // Unpin: the commit's own ref now accounts for the child
+                        // mapper, so drop the anticipatory reference. Net effect of
+                        // pin + commit-ref + unpin is exactly +1 (the child), but
+                        // the frame was never freeable during the share.
+                        PmmUnrefPage(srcPhys);
+
                         copiedCount++;
                         continue;
                     }
@@ -1129,6 +1232,14 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                     // Set child PID
                     childPte |= (((uint64_t)dstPid & 0x3FF) << PTE_PID_SHIFT);
 
+                    // BRO-176: ref the shared frame BEFORE publishing the child
+                    // mapping. VmmMapPage below makes the child a second mapper of
+                    // srcPhys; if the refcount bump came after (as it used to), a
+                    // concurrent parent-AS teardown could free the frame to zero in
+                    // the window while the child maps it. Referencing first holds
+                    // the frame across the publish.
+                    PmmRefPage(srcPhys);
+
                     // Map into child's page table via WalkToPtr (need intermediate tables)
                     // Use VmmMapPage to create intermediates, then override leaf PTE.
                     uint64_t childMapFlags = VMM_USER;
@@ -1141,6 +1252,8 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                                     childMapFlags, MemTag::User, dstPid))
                     {
                         SerialPrintf("FORK: failed to map shared page at vaddr 0x%lx\n", vaddr);
+                        // Drop the reference taken above for the child that never mapped.
+                        PmmUnrefPage(srcPhys);
                         return false;
                     }
 
@@ -1158,9 +1271,6 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                             PhysToVirt(PhysicalAddress(dstPd[i2] & PTE_PHYS_MASK)).raw());
                         dstPt4[i1] = childPte;
                     }
-
-                    // Increment physical page refcount for read-only sharing.
-                    PmmRefPage(srcPhys);
 
                     sharedCount++;
                 }
