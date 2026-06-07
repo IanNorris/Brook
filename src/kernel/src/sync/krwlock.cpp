@@ -371,17 +371,39 @@ void KRwLockCleanupOnExit(Process* p)
                      p->magic == PROCESS_MAGIC ? "still live: genuine field corruption"
                                                : "POISONED NOW: concurrent free TOCTOU");
         ProcessDumpFreeLog(p);
-        // BRO-179: dump the raw struct bytes around the lock fields to pin the
-        // EXACT poison extent (which 8-byte slots are 0xDFDF). The lock fields
-        // live at a known offset; printing the surrounding qwords shows whether
-        // only blockedOnRwLock/heldWriteLock are hit (a targeted ~16-byte heap
-        // free aliasing mid-struct) or a larger contiguous region. &syncNext and
-        // &blockedAsWriter bracket the region of interest.
+        // BRO-179: the corruption is heap free-poison (0xDFDF) written into a
+        // LIVE Process struct (magic + heldReadLock intact). Hypothesis: the
+        // kmalloc free-list contains a "free block" whose BlockHeader sits
+        // INSIDE this live allocation — WriteBlock then poison-fills its payload
+        // (starting at header+64) over our fields. Scan the whole struct for an
+        // embedded heap BlockHeader magic (0xB10CBEEF) and dump a wide window
+        // around the lock fields so we can see the header + poison extent.
         {
-            auto* q = reinterpret_cast<volatile uint64_t*>(&p->syncNext);
-            SerialPrintf("  raw @&syncNext: %p %p %p %p %p %p\n",
-                         (void*)q[0], (void*)q[1], (void*)q[2], (void*)q[3],
-                         (void*)q[4], (void*)q[5]);
+            auto* base = reinterpret_cast<volatile uint8_t*>(p);
+            // Scan every 16 bytes (heap ALIGN-compatible) across the struct for
+            // an embedded header magic; report the first few with their offset.
+            constexpr uint32_t HEAP_HDR_MAGIC = 0xB10CBEEF;
+            int found = 0;
+            for (uint32_t off = 16; off + 4 <= 0x600 && found < 4; off += 16) {
+                uint32_t m = *reinterpret_cast<volatile uint32_t*>(base + off);
+                if (m == HEAP_HDR_MAGIC) {
+                    uint32_t bsz = *reinterpret_cast<volatile uint32_t*>(base + off + 4);
+                    uint32_t bfree = *reinterpret_cast<volatile uint32_t*>(base + off + 8);
+                    SerialPrintf("  EMBEDDED-HEAP-HEADER @proc+0x%x: magic=0xB10CBEEF "
+                                 "size=%u free=%u (payload@+0x%x) — free block INSIDE "
+                                 "live Process = kmalloc free-list/overlap corruption!\n",
+                                 off, bsz, bfree, off + 64);
+                    found++;
+                }
+            }
+            if (!found)
+                SerialPrintf("  (no embedded heap header found in first 0x600 bytes)\n");
+            // Wide qword window from proc+0x100 (suspected header) to +0x178.
+            auto* q = reinterpret_cast<volatile uint64_t*>(base + 0x100);
+            for (uint32_t r = 0; r < 4; ++r)
+                SerialPrintf("  raw @proc+0x%x: %p %p %p %p\n", 0x100 + r * 32,
+                             (void*)q[r * 4 + 0], (void*)q[r * 4 + 1],
+                             (void*)q[r * 4 + 2], (void*)q[r * 4 + 3]);
             SerialPrintf("  fields: syncNext=%p pendingWakeup=0x%x "
                          "blockedAsWriter=%d pid=%u tgid=%u state=%d isThread=%d\n",
                          (void*)p->syncNext, (unsigned)p->pendingWakeup,
