@@ -1172,11 +1172,15 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
 
     // --- User-mode fault ---
 
-    // For #GP, dump all GPRs so we can diagnose alignment / register issues.
-    if (vector == 13)
+    // For fatal user faults that can carry corruption (#GP non-canonical
+    // pointer, #SS bad stack op, #PF unmapped deref), dump all GPRs plus the
+    // BRO-179 poison-origin trace. The corruption surfaces through whichever
+    // vector the bad value happens to hit, so cover all three.
+    if (vector == 13 || vector == 12 || vector == 14)
     {
         ExcForceSerialLock();
-        ExcPutsRaw("\n[GP] User #GP — full register dump:\n");
+        ExcPutsRaw("\n[FAULT] User fault vec="); ExcPutHex(vector);
+        ExcPutsRaw(" — full register dump:\n");
         ExcPutsRaw("  RIP "); ExcPutHex(ef->rip); ExcPutsRaw("\n");
         ExcPutsRaw("  RSP "); ExcPutHex(ef->rsp); ExcPutsRaw("\n");
         ExcPutsRaw("  RDI "); ExcPutHex(ef->rdi); ExcPutsRaw("\n");
