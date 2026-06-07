@@ -6,6 +6,37 @@
 // BRO-179: defined in process.cpp; dumps the Process free-log entry for a
 // pointer (freeing caller symbol + incarnation). Used by the UAF guard below.
 extern "C" int ProcessDumpFreeLog(void* ptr);
+
+// BRO-179: in-flight tracker for KRwLockCleanupOnExit. FreeProcessStruct
+// (process.cpp) consults this to detect a concurrent free racing the cleanup —
+// the TOCTOU that lets cleanup read heap kfree-poison out of a just-freed
+// Process struct (observed: kernel #GP, p->heldWriteLock = 0xDFDF..., magic
+// already validated). Migration-proof: slots hold the proc POINTER, not a CPU
+// id, so a thread that migrates between claim and release still releases its
+// own slot. Concurrent cleanups are bounded by CPU count, so MAX_CPUS slots
+// always suffice.
+static brook::Process* volatile g_rwCleanupInFlight[64];
+
+static inline int RwCleanupInFlightClaim(brook::Process* p) {
+    for (uint32_t i = 0; i < 64; ++i) {
+        brook::Process* expected = nullptr;
+        if (__atomic_compare_exchange_n(&g_rwCleanupInFlight[i], &expected, p,
+                                        false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            return static_cast<int>(i);
+    }
+    return -1;
+}
+static inline void RwCleanupInFlightRelease(int slot) {
+    if (slot >= 0)
+        __atomic_store_n(&g_rwCleanupInFlight[slot], nullptr, __ATOMIC_RELEASE);
+}
+extern "C" int ProcessIsRwCleanupInFlight(void* p) {
+    for (uint32_t i = 0; i < 64; ++i)
+        if (__atomic_load_n(&g_rwCleanupInFlight[i], __ATOMIC_ACQUIRE)
+            == reinterpret_cast<brook::Process*>(p))
+            return 1;
+    return 0;
+}
 #endif
 
 namespace brook {
@@ -337,6 +368,10 @@ void KRwLockCleanupOnExit(Process* p)
         if (isPoison(p->blockedOnRwLock)) p->blockedOnRwLock = nullptr;
         return;
     }
+    // Mark cleanup in-flight for p across the lock-manipulation body below, so
+    // a concurrent FreeProcessStruct(p) can detect (and the eventual fix:
+    // serialize against) the race.
+    int rwInFlightSlot = RwCleanupInFlightClaim(p);
 #endif
 
     // Case 1: Thread holds a write lock — release it.
@@ -415,6 +450,10 @@ void KRwLockCleanupOnExit(Process* p)
         RwGuardRelease(rw, flags);
         p->blockedOnRwLock = nullptr;
     }
+
+#ifndef BROOK_HOST_TEST
+    RwCleanupInFlightRelease(rwInFlightSlot);
+#endif
 }
 
 } // namespace brook

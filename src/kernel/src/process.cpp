@@ -55,6 +55,10 @@ static ProcFreeRec  g_procFreeLog[PROCFREELOG_SIZE];
 static uint64_t     g_procFreeSeq = 0;
 static IrqSpinLock  g_procFreeLogLock;
 
+// BRO-179: defined in sync/krwlock.cpp — true while KRwLockCleanupOnExit(p) is
+// running on p. FreeProcessStruct uses it to detect a free racing the cleanup.
+extern "C" int ProcessIsRwCleanupInFlight(void* p);
+
 static inline void FreeProcessStruct(Process* p)
 {
     if (p)
@@ -67,6 +71,21 @@ static inline void FreeProcessStruct(Process* p)
         g_procFreeLog[i] = { p, ++g_procFreeSeq, ret,
                              (uint32_t)p->incarnation, p->pid };
         IrqSpinLockRelease(&g_procFreeLogLock, fl);
+
+        // BRO-179: detect the SIG1 process-lifetime UAF at the SOURCE — a free
+        // racing an in-flight KRwLockCleanupOnExit(p). If this fires, the heap
+        // poison we then write over p is exactly what the concurrent cleanup
+        // reads out of p->heldWriteLock (kernel #GP). 'ret' names the racing
+        // free path. (Detector only for now; the fix will serialize here.)
+        if (ProcessIsRwCleanupInFlight(p)) {
+            const char* sym = nullptr; uint64_t off = 0;
+            bool haveSym = KsymFindByAddr(ret, &sym, &off);
+            SerialPrintf("BRO179-FREE-DURING-RWCLEANUP: freeing proc=%p pid=%u "
+                         "incarnation=%u while KRwLockCleanupOnExit IN-FLIGHT — "
+                         "SIG1 UAF race! freedBy=0x%lx %s+0x%lx\n",
+                         p, (unsigned)p->pid, (unsigned)p->incarnation, ret,
+                         haveSym ? sym : "?", off);
+        }
 
         p->magic = 0;
     }
