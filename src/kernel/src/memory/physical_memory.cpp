@@ -736,7 +736,13 @@ void PmmEnableTracking()
                  usedCount, freeCount,
                  static_cast<uint32_t>(g_totalPages * sizeof(PageDescriptor) / 1024));
 
-    g_freeLogOn = true;  // BRO-176 diag: arm the low-perturbation free-log
+    // BRO-179: PMM reflog DISABLED to un-mask the SIG1 Heisenbug. Logging every
+    // alloc/free (all tags) does a ring write under g_pmmLock on the hot fork/
+    // exit path, perturbing timing enough to hide the race. The free-site
+    // detector (FreeProcessStruct + KRwLockCleanupOnExit in-flight) uses the
+    // separate, light Process free-log, so the PMM reflog is not needed to name
+    // the racing freer. Re-arm only if frame-level provenance is needed again.
+    g_freeLogOn = false; // was: true (BRO-176 diag)
 }
 
 // BRO-176 diagnostic: print every recorded free of `phys` (most recent first).

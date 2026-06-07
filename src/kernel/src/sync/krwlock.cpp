@@ -16,21 +16,29 @@ extern "C" int ProcessDumpFreeLog(void* ptr);
 // own slot. Concurrent cleanups are bounded by CPU count, so MAX_CPUS slots
 // always suffice.
 static brook::Process* volatile g_rwCleanupInFlight[64];
+static volatile int g_rwCleanupInFlightCount = 0;
 
 static inline int RwCleanupInFlightClaim(brook::Process* p) {
     for (uint32_t i = 0; i < 64; ++i) {
         brook::Process* expected = nullptr;
         if (__atomic_compare_exchange_n(&g_rwCleanupInFlight[i], &expected, p,
-                                        false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+                                        false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            __atomic_add_fetch(&g_rwCleanupInFlightCount, 1, __ATOMIC_ACQ_REL);
             return static_cast<int>(i);
+        }
     }
     return -1;
 }
 static inline void RwCleanupInFlightRelease(int slot) {
-    if (slot >= 0)
+    if (slot >= 0) {
         __atomic_store_n(&g_rwCleanupInFlight[slot], nullptr, __ATOMIC_RELEASE);
+        __atomic_sub_fetch(&g_rwCleanupInFlightCount, 1, __ATOMIC_ACQ_REL);
+    }
 }
 extern "C" int ProcessIsRwCleanupInFlight(void* p) {
+    // O(1) when nothing is in-flight (the overwhelmingly-common case).
+    if (__atomic_load_n(&g_rwCleanupInFlightCount, __ATOMIC_ACQUIRE) == 0)
+        return 0;
     for (uint32_t i = 0; i < 64; ++i)
         if (__atomic_load_n(&g_rwCleanupInFlight[i], __ATOMIC_ACQUIRE)
             == reinterpret_cast<brook::Process*>(p))
@@ -369,9 +377,12 @@ void KRwLockCleanupOnExit(Process* p)
         return;
     }
     // Mark cleanup in-flight for p across the lock-manipulation body below, so
-    // a concurrent FreeProcessStruct(p) can detect (and the eventual fix:
-    // serialize against) the race.
-    int rwInFlightSlot = RwCleanupInFlightClaim(p);
+    // a concurrent FreeProcessStruct(p) can detect the race. Only the rare exit
+    // that actually holds/awaits a kernel rwlock needs the slot (the crash is in
+    // the heldWriteLock release path), so the overwhelmingly-common no-lock exit
+    // stays O(1) — keeping perturbation low so the Heisenbug still reproduces.
+    bool rwHasLockState = p->heldWriteLock || p->heldReadLock || p->blockedOnRwLock;
+    int rwInFlightSlot = rwHasLockState ? RwCleanupInFlightClaim(p) : -1;
 #endif
 
     // Case 1: Thread holds a write lock — release it.
