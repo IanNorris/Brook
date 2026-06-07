@@ -1231,9 +1231,10 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                 }
             }
         }
-        // Dump DOOM hash table diagnostics.
-        // NOTE: these addresses must match the DOOM binary (run: nm build/doom/doom | grep -E 'lumphash|lumpinfo|numlumps')
-        // Read via page table walk + direct map.
+        // Read a user qword via a manual page-table walk + direct map. This
+        // bypasses the TLB (it walks the in-memory tables directly), so it
+        // reflects the CURRENT mapping regardless of stale TLB state — used by
+        // the USER_RSP / RBP-chain dumps and the BRO-179 poison-origin trace.
         auto readUser64 = [&](uint64_t uva) -> uint64_t {
             uint64_t* p4 = reinterpret_cast<uint64_t*>(DMAP_USR + cr3val);
             uint64_t e4 = p4[(uva >> 39) & 0x1FF];
@@ -1333,70 +1334,6 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                     }
                 }
             }
-        }
-
-        uint64_t lumphashPtr = readUser64(0x4b3d78);
-        uint64_t lumpinfoPtr = readUser64(0x4b3d70);
-        uint64_t numlumps    = readUser64(0x4b3d68) & 0xFFFFFFFF;
-        ExcPutsRaw("  lumphash="); ExcPutHex(lumphashPtr); ExcPutsRaw("\n");
-        ExcPutsRaw("  lumpinfo="); ExcPutHex(lumpinfoPtr); ExcPutsRaw("\n");
-        ExcPutsRaw("  numlumps="); ExcPutHex(numlumps);    ExcPutsRaw("\n");
-
-        // Scan hash table for the bad entry
-        if (lumphashPtr > 0x10000000ULL && lumphashPtr < 0x20000000ULL) {
-            ExcPutsRaw("  Scanning hash table for non-canonical entries...\n");
-            int found = 0;
-            for (uint64_t i = 0; i < numlumps && i < 2048 && found < 5; ++i) {
-                uint64_t entry = readUser64(lumphashPtr + i * 8);
-                if (entry != 0 && (entry >> 47) != 0 && (entry >> 47) != 0x1FFFF) {
-                    ExcPutsRaw("  BAD["); ExcPutHex(i); ExcPutsRaw("]=");
-                    ExcPutHex(entry); ExcPutsRaw(" @");
-                    ExcPutHex(lumphashPtr + i * 8); ExcPutsRaw("\n");
-                    // Dump 64 bytes around this entry
-                    ExcPutsRaw("  CONTEXT: ");
-                    uint64_t base = lumphashPtr + i * 8 - 32;
-                    for (int j = 0; j < 8; ++j) {
-                        if (j == 4) ExcPutsRaw(">> ");
-                        uint64_t val = readUser64(base + j * 8);
-                        ExcPutHex(val); ExcPutsRaw(" ");
-                    }
-                    ExcPutsRaw("\n");
-                    ++found;
-                }
-            }
-            if (found == 0) ExcPutsRaw("  (no bad entries found in first 2048)\n");
-
-            // Print physical page backing the hash table start
-            auto readUserPhys = [&](uint64_t uva) -> uint64_t {
-                uint64_t* p4 = reinterpret_cast<uint64_t*>(DMAP_USR + cr3val);
-                uint64_t e4 = p4[(uva >> 39) & 0x1FF];
-                if (!(e4 & 1)) return 0;
-                uint64_t* p3 = reinterpret_cast<uint64_t*>(DMAP_USR + (e4 & 0x000FFFFFFFFFF000ULL));
-                uint64_t e3 = p3[(uva >> 30) & 0x1FF];
-                if (!(e3 & 1)) return 0;
-                uint64_t* p2 = reinterpret_cast<uint64_t*>(DMAP_USR + (e3 & 0x000FFFFFFFFFF000ULL));
-                uint64_t e2 = p2[(uva >> 21) & 0x1FF];
-                if (!(e2 & 1)) return 0;
-                if (e2 & (1ULL << 7))
-                    return (e2 & 0x000FFFFFFFE00000ULL) | (uva & 0x1FFFFFULL);
-                uint64_t* p1 = reinterpret_cast<uint64_t*>(DMAP_USR + (e2 & 0x000FFFFFFFFFF000ULL));
-                uint64_t e1 = p1[(uva >> 12) & 0x1FF];
-                if (!(e1 & 1)) return 0;
-                return (e1 & 0x000FFFFFFFFFF000ULL) | (uva & 0xFFF);
-            };
-
-            // Show physical pages for hash table and surrounding memory
-            ExcPutsRaw("  PHYS lumphash page: ");
-            ExcPutHex(readUserPhys(lumphashPtr) & ~0xFFFULL);
-            ExcPutsRaw("\n");
-            if (lumphashPtr + 0x1000 < lumphashPtr + numlumps * 8) {
-                ExcPutsRaw("  PHYS lumphash+4K page: ");
-                ExcPutHex(readUserPhys(lumphashPtr + 0x1000) & ~0xFFFULL);
-                ExcPutsRaw("\n");
-            }
-            ExcPutsRaw("  PHYS lumpinfo page: ");
-            ExcPutHex(readUserPhys(lumpinfoPtr) & ~0xFFFULL);
-            ExcPutsRaw("\n");
         }
     }
 
