@@ -1308,19 +1308,13 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                 ExcPutsRaw("  POISON-ORIGIN "); ExcPutsRaw(label);
                 ExcPutsRaw(" VA="); ExcPutHex(uva);
                 ExcPutsRaw(" phys="); ExcPutHex(phys & ~0xFFFULL);
-                if (phys) {
-                    uint32_t used=0, rc=0, mc=0, tg=0, op=0;
-                    PmmDescribe(phys, &used, &rc, &mc, &tg, &op);
-                    ExcPutsRaw(" [used="); ExcPutHex(used);
-                    ExcPutsRaw(" ref="); ExcPutHex(rc);
-                    ExcPutsRaw(" map="); ExcPutHex(mc);
-                    ExcPutsRaw(" tag="); ExcPutHex(tg);
-                    ExcPutsRaw(" owner="); ExcPutHex(op);
-                    ExcPutsRaw("]\n");
-                    PmmDumpFreeLog(phys & ~0xFFFULL);
-                } else {
-                    ExcPutsRaw(" (unmapped)\n");
-                }
+                ExcPutsRaw(phys ? "\n" : " (unmapped)\n");
+                // NOTE: deliberately does NOT call PmmDescribe / PmmDumpFreeLog
+                // here. Those take g_pmmLock / g_procFreeLogLock, and this runs
+                // in the exception handler with IF=0; a CPU spinning for
+                // g_pmmLock while another CPU waits on a TLB-shootdown IPI ack
+                // from THIS (faulted) CPU deadlocks the machine (observed: VM
+                // hung mid-sweep). VA->phys is a lock-free direct-map page walk.
             };
             // Always describe the frame backing the faulting stack pointer.
             describePoisonFrame("RSP", ef->rsp);
@@ -1352,7 +1346,17 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
     // A hit means this LIVE process maps a physical frame already freed (and
     // recycled) — the freed-while-mapped UAF (signature 1) — and the free-log
     // names who freed it and via which path. One-off at fault time.
-    if (vector == 13 || vector == 14)
+    //
+    // DISABLED (BRO-179): this sweep calls PmmDumpFreeLog / PmmDescribe (which
+    // take g_pmmLock / g_procFreeLogLock) for up to 16 frames from inside the
+    // exception handler with IF=0. A CPU spinning for g_pmmLock while another
+    // CPU is blocked waiting for a TLB-shootdown IPI ack from THIS faulted CPU
+    // deadlocks the whole machine (observed: VM hung mid-sweep ~2 min into a
+    // run, killing the run before the kernel-side RWLOCKFIELD-POISON detector
+    // could fire). It already served its purpose (it confirmed the user crash
+    // frames are cleanly-owned User frames, ruling out freed-while-mapped). The
+    // lock-free POISON-ORIGIN trace above retains the useful VA->phys info.
+    if (false && (vector == 13 || vector == 14))
     {
         static constexpr uint64_t DMAP = 0xFFFF800000000000ULL;
         static constexpr uint64_t PMASK = 0x000FFFFFFFFFF000ULL;
