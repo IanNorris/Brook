@@ -209,6 +209,83 @@ static Process* g_allProcesses[MAX_PROCESSES] = {};
 static uint32_t g_processCount = 0;
 static SchedLock g_allProcLock;
 
+// BRO-179: reverse-map diagnostic. Given a physical frame, scan EVERY live
+// process's user page table (PML4[0..255]) for a present leaf PTE that still
+// maps it, and print pid + VA + flags. Authoritative (unlike PMM mapCount,
+// which is decoupled from actual PTE teardown). Intended to be called ONLY from
+// the RSVD-#PF panic path, where all APs are already halted — so it does NOT
+// take g_allProcLock (the owner CPU may hold it) and reads page tables straight
+// through the direct map. Every table pointer is range-checked so a corrupt
+// entry cannot fault the walker itself. Reports the leaking mapper behind the
+// freed-while-mapped frame recycling (SIG1 root).
+extern "C" void ProcessDumpFrameMappers(uint64_t targetPhys)
+{
+    constexpr uint64_t PHYS_MASK = 0x000FFFFFFFFFF000ULL; // PTE physical-address bits
+    targetPhys &= ~0xFFFULL;
+    // Bound: physical frames live below the top of installed RAM. Use the
+    // direct-map window as a sanity ceiling (anything mapped is < 0x4000_0000_0000).
+    auto physOk = [](uint64_t p) -> bool {
+        return p != 0 && p < 0x0000400000000000ULL; // 64 TiB ceiling, generous
+    };
+    auto tbl = [](uint64_t physTable) -> const uint64_t* {
+        return reinterpret_cast<const uint64_t*>(DIRECT_MAP_BASE + physTable);
+    };
+
+    SerialPrintf("  --- BRO179 reverse-map: who maps phys 0x%lx? ---\n", targetPhys);
+    uint32_t hits = 0;
+    uint32_t n = g_processCount;
+    if (n > MAX_PROCESSES) n = MAX_PROCESSES;
+    for (uint32_t pi = 0; pi < n && hits < 32; ++pi)
+    {
+        Process* p = g_allProcesses[pi];
+        if (!p || p->magic != PROCESS_MAGIC) continue;
+        uint64_t pml4Phys = p->pageTable.pml4.raw();
+        if (!physOk(pml4Phys)) continue;
+        const uint64_t* pml4 = tbl(pml4Phys);
+
+        for (uint64_t i4 = 0; i4 < 256 && hits < 32; ++i4) // user half only
+        {
+            uint64_t e4 = pml4[i4];
+            if (!(e4 & VMM_PRESENT)) continue;
+            uint64_t pdptPhys = e4 & PHYS_MASK;
+            if (!physOk(pdptPhys)) continue;
+            const uint64_t* pdpt = tbl(pdptPhys);
+            for (uint64_t i3 = 0; i3 < 512 && hits < 32; ++i3)
+            {
+                uint64_t e3 = pdpt[i3];
+                if (!(e3 & VMM_PRESENT) || (e3 & (1ULL << 7))) continue; // skip 1G
+                uint64_t pdPhys = e3 & PHYS_MASK;
+                if (!physOk(pdPhys)) continue;
+                const uint64_t* pd = tbl(pdPhys);
+                for (uint64_t i2 = 0; i2 < 512 && hits < 32; ++i2)
+                {
+                    uint64_t e2 = pd[i2];
+                    if (!(e2 & VMM_PRESENT) || (e2 & (1ULL << 7))) continue; // skip 2M
+                    uint64_t ptPhys = e2 & PHYS_MASK;
+                    if (!physOk(ptPhys)) continue;
+                    const uint64_t* pt = tbl(ptPhys);
+                    for (uint64_t i1 = 0; i1 < 512 && hits < 32; ++i1)
+                    {
+                        uint64_t e1 = pt[i1];
+                        if (!(e1 & VMM_PRESENT)) continue;
+                        if ((e1 & PHYS_MASK) != targetPhys) continue;
+                        uint64_t va = (i4 << 39) | (i3 << 30) | (i2 << 21) | (i1 << 12);
+                        SerialPrintf("    MAPPER pid=%u va=0x%lx pte=0x%lx (W=%d U=%d COW-pid=%lu)\n",
+                                     (unsigned)p->pid, va, e1,
+                                     (int)((e1 >> 1) & 1), (int)((e1 >> 2) & 1),
+                                     (e1 & PTE_PID_MASK) >> PTE_PID_SHIFT);
+                        ++hits;
+                    }
+                }
+            }
+        }
+    }
+    if (hits == 0)
+        SerialPrintf("    (no live user PTE maps this frame — stale-TLB-only write,"
+                     " or mapper already torn down)\n");
+    SerialPrintf("  --- end reverse-map (%u mapper PTE(s)) ---\n", hits);
+}
+
 // Next PID to allocate.
 static uint16_t g_nextPid = 1;
 
