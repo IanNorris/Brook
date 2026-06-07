@@ -371,6 +371,23 @@ void KRwLockCleanupOnExit(Process* p)
                      p->magic == PROCESS_MAGIC ? "still live: genuine field corruption"
                                                : "POISONED NOW: concurrent free TOCTOU");
         ProcessDumpFreeLog(p);
+        // BRO-179: dump the raw struct bytes around the lock fields to pin the
+        // EXACT poison extent (which 8-byte slots are 0xDFDF). The lock fields
+        // live at a known offset; printing the surrounding qwords shows whether
+        // only blockedOnRwLock/heldWriteLock are hit (a targeted ~16-byte heap
+        // free aliasing mid-struct) or a larger contiguous region. &syncNext and
+        // &blockedAsWriter bracket the region of interest.
+        {
+            auto* q = reinterpret_cast<volatile uint64_t*>(&p->syncNext);
+            SerialPrintf("  raw @&syncNext: %p %p %p %p %p %p\n",
+                         (void*)q[0], (void*)q[1], (void*)q[2], (void*)q[3],
+                         (void*)q[4], (void*)q[5]);
+            SerialPrintf("  fields: syncNext=%p pendingWakeup=0x%x "
+                         "blockedAsWriter=%d pid=%u tgid=%u state=%d isThread=%d\n",
+                         (void*)p->syncNext, (unsigned)p->pendingWakeup,
+                         (int)p->blockedAsWriter, (unsigned)p->pid,
+                         (unsigned)p->tgid, (int)p->state, (int)p->isThread);
+        }
         if (isPoison(p->heldWriteLock))  p->heldWriteLock  = nullptr;
         if (isPoison(p->heldReadLock))   p->heldReadLock   = nullptr;
         if (isPoison(p->blockedOnRwLock)) p->blockedOnRwLock = nullptr;
