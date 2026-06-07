@@ -1,6 +1,12 @@
 #include "sync/krwlock.h"
 #include "process.h"
 #include "scheduler.h"
+#ifndef BROOK_HOST_TEST
+#include "serial.h"
+// BRO-179: defined in process.cpp; dumps the Process free-log entry for a
+// pointer (freeing caller symbol + incarnation). Used by the UAF guard below.
+extern "C" int ProcessDumpFreeLog(void* ptr);
+#endif
 
 namespace brook {
 
@@ -282,6 +288,23 @@ static inline bool RemoveFromQueue(Process*& head, Process*& tail, Process* targ
 void KRwLockCleanupOnExit(Process* p)
 {
     if (!p) return;
+
+    // BRO-179: a kernel #GP was observed here with p->heldWriteLock ==
+    // 0xDFDFDFDFDFDFDFDF (heap kfree-poison): the Process struct was already
+    // kfree'd when cleanup ran (a process-lifetime UAF in the exit/reap path).
+    // Validate the struct magic before touching any lock fields. If it is
+    // poisoned/zeroed, name the teardown path that freed it (ProcessDumpFreeLog
+    // records the freeing caller + incarnation) and bail rather than
+    // dereferencing poison into a non-canonical fault.
+#ifndef BROOK_HOST_TEST
+    if (p->magic != PROCESS_MAGIC) {
+        SerialPrintf("BRO179-RWCLEANUP-UAF: KRwLockCleanupOnExit on FREED proc=%p "
+                     "magic=0x%lx (expected 0x%lx) — Process struct already freed!\n",
+                     p, p->magic, PROCESS_MAGIC);
+        ProcessDumpFreeLog(p);
+        return;
+    }
+#endif
 
     // Case 1: Thread holds a write lock — release it.
     if (p->heldWriteLock) {
