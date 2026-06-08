@@ -120,70 +120,91 @@ multi-field consistency.
 - `refCount` is `uint8_t` — max 255 sharers. Sufficient for current workload but
   would overflow if a page is shared across 256+ processes.
 
-### Design Decision (BRO-179): Frame-free quarantine as a SIG1 stopgap
+### Design Decision (BRO-179): TLB-barrier frame-free quarantine
 
-**Status:** stopgap, deliberately accepted. Not a root-cause fix.
+**Status:** the durable fix for the stale-TLB sub-case of SIG1. Replaces the
+earlier rate-based (FIFO-depth) quarantine stopgap, which could be outrun at high
+free throughput (see history below).
 
 **The bug (SIG1 / BRO-179, BRO-176 family).** Under heavy `fork`+`pthread`+
 `exit_group` churn (the `schedstress` reproducer), a physical frame was freed
 and immediately re-issued to a *different domain* (e.g. a user data page recycled
-into a kernel page table) while a stale mapping to its previous life still
-existed. Captured red-handed as a deterministic **reserved-bit #PF in
-`VmmGetPte`**: a freshly-allocated, zeroed page-table frame already contained a
-"present" garbage PTE — user data written through the old mapping after the
-frame was zeroed. The same root also surfaces as userspace reads of kernel-heap
-free-poison `0xDFDFDFDF` (the original SIG1 symptom). This is **freed-while-
-mapped cross-domain frame reuse**.
+into a kernel page table) while a stale **TLB** entry for its previous life still
+existed on a remote CPU. Captured red-handed as a deterministic **reserved-bit
+#PF in `VmmGetPte`**: a freshly-allocated, zeroed page-table frame already
+contained a "present" garbage PTE — user data written through the stale TLB entry
+after the frame was zeroed. The same root also surfaces as userspace reads of
+kernel-heap free-poison `0xDFDFDFDF` (the original SIG1 symptom). This is
+**freed-while-mapped cross-domain frame reuse** via a stale remote-CPU TLB entry
+(the PTE itself is already cleared at the point of free — the reverse-map
+diagnostic found no live PTE; only a cached translation survives).
 
-**Why we stopgapped instead of root-fixing.** The leak lives somewhere in the
-COW / refcount / cross-CPU TLB-shootdown machinery — a long tail that has been
-point-fixed repeatedly across the BRO-176 family (COW double-free, refcount
-TOCTOU, per-AS shootdown, swapgs, …) and kept resurfacing in new forms. After
-extended diagnosis (see `plan.md`) the judgement call was: stop chasing the exact
-leaking path and instead **close the reuse window** durably, then move on.
+**The invariant.** A freed frame is not returned to the allocatable pool until
+**every online CPU has performed a full, unconditional TLB flush (CR3 reload)
+after the free**. `CR4.PGE` is off, so any `mov cr3` evicts all non-global
+entries. Once every CPU has flushed since a frame was unmapped, no CPU can hold a
+stale translation for it, so it is safe to reissue to any domain.
 
-**The mechanism.** `PmmFreePage` / `PmmUnrefPage` / `PmmKillPid` / `PmmFreeByTag`
-no longer return a frame to the allocatable pool immediately. A retired frame
-enters a FIFO **quarantine ring** (`QUARANTINE_DEPTH`); it stays bitmap-`USED`
-(so the allocator skips it) until `QUARANTINE_DEPTH` further frees push it out,
-at which point it is actually released. Under the churn that triggers the bug
-(thousands of frees/sec, a context switch on every CPU each tick, `CR4.PGE` off
-so every `CR3` reload is a full TLB flush), a frame is reissued only after every
-CPU has flushed its TLB many times — so any stale TLB entry for it is gone before
-reuse. A double-retire guard on each path prevents a quarantined frame from being
-released twice.
+**The mechanism (batched all-CPU TLB barrier drain).** `PmmFreePage` /
+`PmmUnrefPage` / `PmmKillPid` / `PmmFreeByTag` no longer return a frame to the
+allocatable pool immediately. A retired frame is queued into a quarantine buffer
+(`RetireFrameLocked`, under `g_pmmLock`); it stays bitmap-`USED` so the allocator
+skips it. A single dedicated kernel thread (`PmmDrainThread`, started by
+`PmmStartDrainThread()` once the scheduler is up) does the release:
 
-**Depth must scale with throughput (BRO-179 64-CPU finding).** The grace period
-is `QUARANTINE_DEPTH` *frees*, so its wall-clock length shrinks as free
-throughput rises. `DEPTH = 1024` closed the window at 8 CPUs but was **too
-shallow at 64 CPUs** with hot-path logging off — a recycled frame returned before
-every CPU had flushed, and the corruption resurfaced (as a `CR2 = -16` user #PF;
-no `0xDFDF` because the stale write landed in a non-poison region). An A/B sweep
-was monotonic: quarantine **off** faulted most, `1024` faulted, `16384` ran clean
-(5000+ spawns, 0 faults, 0 OOM) — confirming the mechanism is correct and only
-the depth was undersized. The default is now **16384** (holds ≤ 64 MiB out of
-circulation). A heavier future workload could still outrun a fixed depth — which
-is exactly why the real fix is epoch-based, below.
+1. When the quarantine reaches a low-water mark it snapshots the live buffer into
+   a private batch and empties the live buffer, **all under `g_pmmLock`**, then
+   drops the lock.
+2. It calls `TlbFlushAllCpusBarrier()` (apic.cpp): an unconditional all-CPU full
+   flush with **positive acknowledgement and no forgiveness** — it does *not*
+   exempt a CPU because it is "on a different CR3" (the forgiveness in the normal
+   `TlbShootdownFull` path is exactly what lets a stale entry survive for a
+   multi-address-space batch), and it **panics on timeout** rather than
+   proceeding (for a privesc-class invariant we fail loud, never silently release
+   an un-flushed frame).
+3. After the barrier returns, every frame in the batch was freed *before* the
+   barrier started, so every CPU has now flushed since each frame's free. The
+   drainer re-acquires `g_pmmLock` and releases the batch back to the pool.
+
+Frames freed *during* the barrier land in the now-empty live buffer and ride the
+**next** drain — correct, because the barrier that freed a frame must have started
+after that frame's free.
+
+**Why a single drainer + snapshot/seal.** Only `PmmDrainThread` ever runs the
+barrier, so the many-CPU per-free shootdown livelock (CPUs cross-contending
+`g_tlbRequest.lock`, mutually timing out) cannot occur. The barrier busy-waits for
+remote ACKs, so it **must** run with `IF=1` and no `IrqSpinLock` held — a CPU
+spinning on a lock the drainer holds (`IF=0`) could not service the IPI. The drain
+thread satisfies this; `RetireFrameLocked` only *queues* (it never barriers), so
+the hot free path stays cheap and lock-safe.
+
+**Safety valve.** If the drainer falls behind and the quarantine buffer hits its
+hard cap (`QUAR_CAP`), `RetireFrameLocked` degrades *that one frame* to immediate
+release and flags the drainer to catch up — bounding memory rather than blocking
+the freeing path. Under the tested load the drainer keeps the buffer well below
+the cap.
 
 **Tradeoffs / limitations (accepted):**
-- Holds up to `QUARANTINE_DEPTH` frames (64 MiB at 16384) out of circulation —
-  negligible vs installed RAM.
-- The grace period is a function of the free / context-switch **rate**, not a
-  formally proven all-CPU TLB epoch. It is effective under the load tested; a
-  sufficiently higher throughput could in principle outrun any fixed depth. The
-  proper fix gates release on an explicit **all-CPU TLB epoch counter** rather
-  than FIFO depth, making it throughput-independent.
-- Closes the **stale-TLB** sub-case (the captured signature: frames freed via
-  `FreeTableLevel` with the PTE already removed). It does **not** fix a
-  hypothetical **live-PTE refcount undercount** (a process still holding a
-  *present* PTE to the freed frame) — that PTE would persist past the
-  quarantine. No evidence of that sub-case was found; the reverse-map diagnostic
-  (`ProcessDumpFrameMappers`, idt.cpp/scheduler.cpp) would surface it if it
-  exists.
+- Holds up to `QUAR_CAP` frames out of circulation transiently — negligible vs
+  installed RAM, and bounded by the safety valve.
+- Closes the **stale-TLB** sub-case (the captured signature: frames freed with
+  the PTE already removed but a remote TLB entry still cached). It does **not**
+  fix a hypothetical **live-PTE refcount undercount** (a process still holding a
+  *present* PTE to the freed frame) — that PTE would persist past the barrier,
+  and a CPU could re-walk and re-cache it after the flush. No evidence of that
+  sub-case was found; the reverse-map diagnostic (`ProcessDumpFrameMappers`,
+  idt.cpp/scheduler.cpp) would surface it if it exists. If SIG1 recurs after this
+  fix, that undercount is the next suspect.
 - Toggle: `g_quarantineOn` (default true). Set false to restore immediate-reuse
   behaviour for A/B testing.
 
-**Follow-up (deferred):** replace FIFO-depth gating with a true TLB-epoch quarantine; and, separately, find and fix the actual mapping leak so quarantine can be reduced/removed.
+**History.** The first stopgap was a *rate-based* FIFO quarantine: a frame was
+released after `QUARANTINE_DEPTH` further frees. That assumed enough CPU TLB
+flushes happen within that many frees, which held at 8 CPUs (`DEPTH=1024`) but was
+**outrun at 64 CPUs** — a 10×10k 64-CPU `schedstress` validation still faulted
+even at `DEPTH=16384`, because the grace period is a function of free *rate*, not
+a proven TLB epoch. The barrier drain above replaces FIFO depth with an explicit,
+throughput-independent all-CPU flush, which is the proper fix.
 
 ---
 

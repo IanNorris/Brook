@@ -770,6 +770,8 @@ struct TlbShootdownRequest {
     uint64_t        targetCr3;        // only invalidate if CPU's CR3 matches
     uint64_t        addr;             // page VA to invalidate (0 = full flush)
     volatile uint64_t ackBitmap;      // bit set by each CPU on ack (diagnostic)
+    volatile uint32_t unconditional;  // BRO-179: 1 = every CPU does a full CR3 reload
+                                      // regardless of targetCr3 (quarantine drain barrier)
 };
 
 static TlbShootdownRequest g_tlbRequest;
@@ -783,7 +785,17 @@ extern "C" void TlbShootdownHandlerInner()
     uint64_t myCr3;
     __asm__ volatile("movq %%cr3, %0" : "=r"(myCr3));
 
-    if ((myCr3 & ~0xFFFULL) == (g_tlbRequest.targetCr3 & ~0xFFFULL))
+    // BRO-179 quarantine drain barrier: when unconditional is set, EVERY CPU
+    // must do a full TLB flush (CR3 reload) regardless of which address space it
+    // is running. The batch being drained holds frames that lived in many
+    // address spaces; a targeted-CR3 flush (the else-branch below) would "forgive"
+    // any CPU not on the target and leave its stale 4KiB entries live — exactly
+    // the freed-while-mapped corruption. No forgiveness here.
+    if (__atomic_load_n(&g_tlbRequest.unconditional, __ATOMIC_ACQUIRE))
+    {
+        __asm__ volatile("movq %0, %%cr3" :: "r"(myCr3) : "memory");
+    }
+    else if ((myCr3 & ~0xFFFULL) == (g_tlbRequest.targetCr3 & ~0xFFFULL))
     {
         if (g_tlbRequest.addr != 0)
         {
@@ -1036,6 +1048,7 @@ void TlbShootdown(uint64_t targetCr3, uint64_t virtualAddr, uint64_t cpuMask)
 
     g_tlbRequest.targetCr3 = targetCr3;
     g_tlbRequest.addr      = virtualAddr;
+    __atomic_store_n(&g_tlbRequest.unconditional, 0u, __ATOMIC_RELAXED);
     __atomic_store_n(&g_tlbRequest.ackBitmap, 0ULL, __ATOMIC_RELAXED);
     __atomic_store_n(&g_tlbRequest.pendingCount, targetCount, __ATOMIC_RELEASE);
 
@@ -1084,6 +1097,7 @@ void TlbShootdownFull(uint64_t targetCr3, uint64_t cpuMask)
 
     g_tlbRequest.targetCr3 = targetCr3;
     g_tlbRequest.addr      = 0;  // 0 = full flush
+    __atomic_store_n(&g_tlbRequest.unconditional, 0u, __ATOMIC_RELAXED);
     __atomic_store_n(&g_tlbRequest.ackBitmap, 0ULL, __ATOMIC_RELAXED);
     __atomic_store_n(&g_tlbRequest.pendingCount, targetCount, __ATOMIC_RELEASE);
 
@@ -1098,10 +1112,88 @@ void TlbShootdownFull(uint64_t targetCr3, uint64_t cpuMask)
     IrqSpinLockRelease(&g_tlbRequest.lock, flags);
 }
 
-// ---------------------------------------------------------------------------
-// I/O APIC
-// ---------------------------------------------------------------------------
+// BRO-179 quarantine drain barrier. Force EVERY online CPU (including idle/
+// halted ones, which wake from hlt to service the IPI) to perform a full,
+// UNCONDITIONAL TLB flush (CR3 reload — CR4.PGE is off so this evicts all
+// non-global entries), and wait for POSITIVE acknowledgement from every one.
 //
+// Unlike TlbShootdownFull this has NO forgiveness: it never exempts a CPU
+// because it is on a "different CR3", and on timeout it PANICS rather than
+// proceeding. The quarantine drain releases physical frames back to the
+// allocator only after this returns, so a single un-flushed CPU would mean a
+// frame is reissued while a stale 4KiB translation for its previous life still
+// lives in that CPU's TLB — the freed-while-mapped cross-domain corruption
+// (SIG1). For a privesc-class invariant we fail loud, never silently release.
+//
+// MUST be called from a context with IF=1 and NO IrqSpinLock held: it busy-waits
+// for remote ACKs, and a CPU spinning on a lock we hold (IF=0) could not service
+// the IPI → guaranteed timeout → panic. The PMM drain thread satisfies this.
+void TlbFlushAllCpusBarrier()
+{
+    uint32_t cpuCount = SmpGetCpuCount();
+    if (cpuCount <= 1)
+    {
+        // Uniprocessor (or pre-SMP): a local reload is the whole barrier.
+        uint64_t cr3;
+        __asm__ volatile("movq %%cr3, %0" : "=r"(cr3));
+        __asm__ volatile("movq %0, %%cr3" :: "r"(cr3) : "memory");
+        return;
+    }
+
+    uint32_t myCpu = SmpCurrentCpuIndex();
+
+    // Local full flush first.
+    uint64_t cr3;
+    __asm__ volatile("movq %%cr3, %0" : "=r"(cr3));
+    __asm__ volatile("movq %0, %%cr3" :: "r"(cr3) : "memory");
+
+    // Target every OTHER online CPU, unconditionally.
+    uint64_t targetMask = 0;
+    for (uint32_t i = 0; i < cpuCount; i++)
+    {
+        if (i == myCpu) continue;
+        const CpuInfo* info = SmpGetCpu(i);
+        if (info && info->online)
+            targetMask |= (1ULL << i);
+    }
+    if (targetMask == 0)
+        return;
+
+    uint32_t targetCount = __builtin_popcountll(targetMask);
+
+    uint64_t flags = IrqSpinLockAcquire(&g_tlbRequest.lock);
+
+    g_tlbRequest.targetCr3 = 0;
+    g_tlbRequest.addr      = 0;
+    __atomic_store_n(&g_tlbRequest.unconditional, 1u, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_tlbRequest.ackBitmap, 0ULL, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_tlbRequest.pendingCount, targetCount, __ATOMIC_RELEASE);
+
+    for (uint32_t i = 0; i < cpuCount; i++)
+    {
+        if (targetMask & (1ULL << i))
+            ApicSendTlbShootdownIpi(i);
+    }
+
+    // Wait for POSITIVE acks from every target — NO forgiveness, panic on timeout.
+    uint64_t spins = 0;
+    while (__atomic_load_n(&g_tlbRequest.pendingCount, __ATOMIC_ACQUIRE) != 0)
+    {
+        __asm__ volatile("pause" ::: "memory");
+        if (++spins > TLB_SHOOTDOWN_TIMEOUT * 4)  // generous: this MUST complete
+        {
+            uint64_t acked = __atomic_load_n(&g_tlbRequest.ackBitmap, __ATOMIC_ACQUIRE);
+            __atomic_store_n(&g_tlbRequest.unconditional, 0u, __ATOMIC_RELEASE);
+            IrqSpinLockRelease(&g_tlbRequest.lock, flags);
+            KernelPanic("BRO-179: TLB drain barrier timeout — targets=0x%lx acked=0x%lx "
+                        "(a CPU never flushed; refusing to release frames unsafely)",
+                        targetMask, acked);
+        }
+    }
+
+    __atomic_store_n(&g_tlbRequest.unconditional, 0u, __ATOMIC_RELEASE);
+    IrqSpinLockRelease(&g_tlbRequest.lock, flags);
+}
 // The I/O APIC is accessed through two MMIO registers:
 //   IOREGSEL (offset 0x00): write the register index to read/write.
 //   IOWIN    (offset 0x10): read or write the selected register.

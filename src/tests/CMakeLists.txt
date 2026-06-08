@@ -55,6 +55,13 @@ add_brook_test(test_heap
     "${BROOK_ROOT}/src/kernel/src/memory/heap.cpp"
 )
 
+# BRO-179: the PMM quarantine drain thread references scheduler/apic symbols
+# (KernelThreadCreate, SchedulerSleepMs, TlbFlushAllCpusBarrier) that host
+# tests don't link. BROOK_HOST_TEST compiles it out and defaults quarantine off.
+target_compile_definitions(test_pmm  PRIVATE BROOK_HOST_TEST)
+target_compile_definitions(test_vmm  PRIVATE BROOK_HOST_TEST)
+target_compile_definitions(test_heap PRIVATE BROOK_HOST_TEST)
+
 add_brook_test(test_string)
 
 add_brook_test(test_device_registry
@@ -88,6 +95,7 @@ add_brook_test(test_vfs
 target_include_directories(test_vfs PRIVATE
     "${FATFS_TEST_BUILD_DIR}"
 )
+target_compile_definitions(test_vfs PRIVATE BROOK_HOST_TEST)
 target_sources(test_vfs PRIVATE
     "${FATFS_TEST_BUILD_DIR}/ff.c"
     "${FATFS_TEST_BUILD_DIR}/ffunicode.c"

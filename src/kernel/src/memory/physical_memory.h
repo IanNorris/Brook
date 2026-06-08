@@ -115,4 +115,10 @@ void PmmDumpPidStats();
 uint64_t PmmGetFreePageCount();
 uint64_t PmmGetTotalPageCount();
 
+// BRO-179: start the quarantine drain kernel thread. Must be called once after
+// the scheduler is up (so KernelThreadCreate works). Until it runs, freed frames
+// queue in quarantine and are released via the safety-valve path; once running,
+// it drains them through an all-CPU TLB barrier.
+void PmmStartDrainThread();
+
 } // namespace brook

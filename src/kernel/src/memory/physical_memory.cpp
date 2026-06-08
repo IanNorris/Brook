@@ -8,6 +8,11 @@ namespace brook {
     extern "C" void* kmalloc(uint64_t);
     VirtualAddress VmmAllocPages(uint64_t pageCount, uint64_t flags,
                                  MemTag tag, uint16_t pid);
+    struct Process;
+    using KernelThreadFn = void (*)(void* arg);
+    Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
+                                uint8_t priority);
+    extern "C" void SchedulerSleepMs(uint32_t ms);
 }
 
 // Linker-defined symbol — end of the kernel image (virtual address).
@@ -242,54 +247,64 @@ static inline void SetFree(uint64_t idx)
 }
 
 // ---------------------------------------------------------------------------
-// BRO-179 STOPGAP: physical-frame free quarantine.
+// BRO-179: physical-frame free quarantine with an all-CPU TLB-barrier drain.
 //
-// Root class (proven by the RSVD #PF capture): cross-domain physical-frame
-// reuse / "freed-while-mapped". A user page is freed and immediately handed to
-// a new owner (e.g. a kernel page table) while a stale TLB entry — or, in the
-// worst case, a leaked PTE — still references the OLD mapping, so the old owner
-// corrupts the new use (garbage PTEs → reserved-bit #PF; heap/stack poison read
-// in userspace → SIG1).
+// Root class (proven): cross-domain physical-frame reuse / "freed-while-mapped".
+// A frame is freed and immediately re-issued to a different domain (e.g. a freed
+// user page becomes a kernel page-table frame) while a stale 4KiB TLB entry for
+// its previous life still lives on some CPU; the old owner writes through it and
+// corrupts the new use (reserved-bit #PF in a recycled PT frame; 0xDFDF heap
+// poison in live structs — SIG1).
 //
-// Rather than chase the exact leaking path (a long tail in the COW/refcount/
-// TLB-shootdown machinery — see plan.md / DOCS.md), we close the WINDOW: a
-// freed frame is not returned to the allocatable pool immediately. It sits in a
-// FIFO quarantine of depth QUARANTINE_DEPTH; only the oldest frame is actually
-// released (its bitmap bit cleared) when a new free pushes it out. Under load,
-// thousands of frees/sec and per-tick context switches on every CPU mean that
-// by the time a frame is reissued (QUARANTINE_DEPTH frees later) every CPU has
-// reloaded CR3 (a full TLB flush, since CR4.PGE is off) many times — so any
-// stale TLB entry for the frame is gone.
+// The fix closes the window with a PROVABLE, throughput-independent invariant:
+//   A freed frame is not returned to the allocatable pool until EVERY online CPU
+//   has performed a full, unconditional TLB flush (CR3 reload) AFTER the free.
 //
-// TRADEOFFS / LIMITATIONS (deliberate — see DOCS.md design note):
-//  * Holds up to QUARANTINE_DEPTH frames out of circulation (bounded ~4 MiB at
-//    1024). Negligible vs total RAM.
-//  * The grace period is a function of free/context-switch RATE, not a formally
-//    proven all-CPU TLB epoch. Effective under the churn that triggers the bug;
-//    a future hardening would gate release on an explicit all-CPU TLB epoch
-//    counter instead of FIFO depth.
-//  * Closes the STALE-TLB sub-case (the captured signature: frames freed via
-//    FreeTableLevel with the PTE already gone). It does NOT fix a hypothetical
-//    LIVE-PTE refcount UNDERCOUNT (a process still holding a present PTE to the
-//    freed frame) — that PTE would persist past the quarantine. No evidence of
-//    that sub-case yet; the reverse-map diagnostic (idt.cpp/scheduler.cpp) would
-//    surface it. If it appears, the refcount path needs a separate fix.
+// Mechanism (batched drain — see DOCS.md design note):
+//  * Free paths (PmmFreePage/PmmUnrefPage/PmmKillPid/PmmFreeByTag) do NOT release
+//    a frame; they push its index into a quarantine buffer (the frame stays
+//    bitmap-USED so the allocator skips it) via RetireFrameLocked, under g_pmmLock.
+//  * A single dedicated kernel thread (PmmDrainThread, IF=1, no spinlocks held)
+//    drains: it SNAPSHOTS the quarantine buffer under g_pmmLock into a private
+//    batch and empties the live buffer; drops g_pmmLock; calls
+//    TlbFlushAllCpusBarrier() (unconditional all-CPU flush, positive ack, panics
+//    on timeout — never forgives); re-acquires g_pmmLock and releases the batch's
+//    frames to the bitmap. Frames freed DURING the barrier land in the now-empty
+//    live buffer and ride the NEXT drain — correct, because the barrier that frees
+//    a frame must have STARTED after that frame's free.
+//  * Single drainer: only PmmDrainThread drains, so the old per-free shootdown
+//    livelock (many CPUs cross-contending the shootdown lock) cannot recur.
+//  * Back-pressure: if the live buffer reaches a hard cap before the drainer
+//    keeps up, the FREEING path that overflows falls back to immediate release
+//    of the oldest entry (degrades to rate-based for that frame only) and flags
+//    the drainer to run — bounded memory, never blocks the allocator with IF=0.
+//
+// LIMITATION: the barrier evicts already-cached stale entries; it does NOT save a
+// frame freed while a still-VALID PTE points at it (a CPU re-walks and re-caches
+// after the barrier). The captured signature is stale-TLB (PTE already removed),
+// which this fixes. A live-PTE refcount undercount, if it exists, needs a
+// separate fix; the reverse-map diagnostic would surface it.
 // ---------------------------------------------------------------------------
-// QUARANTINE_DEPTH must scale with peak free THROUGHPUT, not be a fixed grace.
-// Empirically (BRO-179): 1024 closed the window at 8 CPUs but was too shallow at
-// 64 CPUs with hot-path logging off (a recycled frame came back before every CPU
-// flushed its TLB → cross-domain corruption resurfaced as a CR2=-16 user #PF).
-// 16384 closes it at 64 CPUs. The A/B was monotonic — deeper is strictly safer —
-// confirming the mechanism is correct and only the depth was undersized. We hold
-// at most DEPTH frames out of circulation: 16384 * 4 KiB = 64 MiB, negligible vs
-// installed RAM. This is the documented rate-based limitation; the depth-
-// independent fix (release only after an all-CPU TLB epoch) is the real
-// follow-up (see DOCS.md). Sized generously here as the hardened stopgap.
-static constexpr uint32_t QUARANTINE_DEPTH = 16384;  // 64 MiB held; see note above
-static uint32_t g_quarRing[QUARANTINE_DEPTH];
-static uint32_t g_quarHead  = 0;   // next write slot
-static uint32_t g_quarCount = 0;   // frames currently held
-static bool     g_quarantineOn = true;
+// Capacity of the quarantine buffer. Sized for one drain interval's worth of
+// frees at peak 64-CPU throughput plus headroom; 65536 frames = 256 MiB worst-
+// case held, negligible vs RAM. The drain thread keeps the steady-state held
+// set far below this (it drains at the low-water mark).
+static constexpr uint32_t QUAR_CAP        = 65536;
+static constexpr uint32_t QUAR_LOWWATER   = 4096;   // drainer kicks in above this
+static uint32_t g_quarBuf[QUAR_CAP];
+static uint32_t g_quarCount = 0;          // frames currently queued for drain
+static uint32_t g_quarPeak  = 0;          // high-water mark (diagnostic)
+#ifdef BROOK_HOST_TEST
+static bool     g_quarantineOn = false;   // no drainer in host tests; release now
+#else
+static bool     g_quarantineOn = true;    // false = immediate release (A/B testing)
+#endif
+static volatile bool g_quarDrainWanted = false;
+
+#ifndef BROOK_HOST_TEST
+// Private batch the drain thread snapshots into (only the drainer touches it).
+static uint32_t g_drainBatch[QUAR_CAP];
+#endif
 
 // Caller MUST hold g_pmmLock. Release a frame's bitmap bit + free accounting.
 static inline void ReleaseFrameLocked(uint32_t idx)
@@ -299,9 +314,8 @@ static inline void ReleaseFrameLocked(uint32_t idx)
     if (idx < g_nextHint) g_nextHint = idx;
 }
 
-// Caller MUST hold g_pmmLock. Retire a frame that has reached refcount 0 and had
-// its descriptor reset. With quarantine on, defer the actual release by
-// QUARANTINE_DEPTH frees; otherwise release immediately (legacy behaviour).
+// Caller MUST hold g_pmmLock. Retire a frame that reached refcount 0 (descriptor
+// already reset). Queue it for the TLB-barrier drain instead of releasing it.
 static inline void RetireFrameLocked(uint32_t idx)
 {
     if (!g_quarantineOn)
@@ -309,19 +323,74 @@ static inline void RetireFrameLocked(uint32_t idx)
         ReleaseFrameLocked(idx);
         return;
     }
-    if (g_quarCount == QUARANTINE_DEPTH)
+    if (g_quarCount >= QUAR_CAP)
     {
-        // Ring full: evict the oldest and actually release it now.
-        uint32_t evicted = g_quarRing[g_quarHead];
-        ReleaseFrameLocked(evicted);
+        // Hard cap: drainer is behind. Degrade THIS frame to immediate release
+        // (rate-based for one frame) rather than block the freeing path or grow
+        // unbounded. Flag the drainer to catch up. This is a safety valve; in
+        // steady state the drainer keeps g_quarCount well below QUAR_CAP.
+        ReleaseFrameLocked(idx);
+        g_quarDrainWanted = true;
+        return;
     }
-    else
-    {
-        g_quarCount++;
-    }
-    g_quarRing[g_quarHead] = idx;            // frame stays bitmap-USED (not allocatable)
-    g_quarHead = (g_quarHead + 1) % QUARANTINE_DEPTH;
+    g_quarBuf[g_quarCount++] = idx;        // frame stays bitmap-USED (not allocatable)
+    if (g_quarCount > g_quarPeak) g_quarPeak = g_quarCount;
+    if (g_quarCount >= QUAR_LOWWATER)
+        g_quarDrainWanted = true;
 }
+
+// The drain thread body. Runs forever in a kernel thread (IF=1, no spinlocks
+// held across the barrier). See the design note above.
+#ifndef BROOK_HOST_TEST
+void TlbFlushAllCpusBarrier();   // apic.cpp (namespace brook)
+
+static void PmmDrainThread(void* /*arg*/)
+{
+    for (;;)
+    {
+        if (!__atomic_load_n(&g_quarDrainWanted, __ATOMIC_ACQUIRE))
+        {
+            SchedulerSleepMs(2);
+            continue;
+        }
+
+        // Snapshot the live quarantine buffer into the private batch and empty
+        // the live buffer, all under g_pmmLock.
+        uint64_t f = IrqSpinLockAcquire(&g_pmmLock);
+        uint32_t n = g_quarCount;
+        for (uint32_t i = 0; i < n; i++)
+            g_drainBatch[i] = g_quarBuf[i];
+        g_quarCount = 0;
+        g_quarDrainWanted = false;
+        IrqSpinLockRelease(&g_pmmLock, f);
+
+        if (n == 0)
+            continue;
+
+        // The barrier: every online CPU does a full unconditional TLB flush.
+        // After this returns, no CPU holds a stale 4KiB entry for any frame that
+        // was unmapped before the barrier started — i.e. for every frame in the
+        // batch (all were freed before we snapshotted). MUST run with no
+        // g_pmmLock held (it busy-waits for remote ACKs).
+        TlbFlushAllCpusBarrier();
+
+        // Now safe to return the batch's frames to the allocatable pool.
+        f = IrqSpinLockAcquire(&g_pmmLock);
+        for (uint32_t i = 0; i < n; i++)
+            ReleaseFrameLocked(g_drainBatch[i]);
+        IrqSpinLockRelease(&g_pmmLock, f);
+    }
+}
+
+void PmmStartDrainThread()
+{
+    KernelThreadCreate("pmm_drain", PmmDrainThread, nullptr, 2);
+}
+#else
+// Host unit tests don't link the scheduler/apic; the quarantine drain is a
+// no-op (RetireFrameLocked's safety-valve releases frames immediately).
+void PmmStartDrainThread() {}
+#endif
 
 // Mark [physBase, physBase + pages*PAGE_SIZE) as used.
 // Decrements g_freePages for each page that was previously free.

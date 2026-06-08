@@ -715,6 +715,11 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         if (brook::NetGetIf())
             brook::NetStartPollThread();
 
+        // BRO-179: start the PMM quarantine drain thread (scheduler is up).
+        // It returns freed frames to the allocator only after an all-CPU TLB
+        // barrier, closing the freed-while-mapped cross-domain reuse window.
+        brook::PmmStartDrainThread();
+
         // If keyboard module wasn't loaded, fall back to direct init.
         if (acpiOk && !brook::KbdIsAvailable())
         {
