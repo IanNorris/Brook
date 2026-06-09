@@ -715,6 +715,16 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         if (brook::NetGetIf())
             brook::NetStartPollThread();
 
+        // BRO-179: start the PMM quarantine drain thread (scheduler is up).
+        // It returns freed frames to the allocator only after an all-CPU TLB
+        // barrier, closing the freed-while-mapped cross-domain reuse window.
+        brook::PmmStartDrainThread();
+
+        // BRO-179 forensic: arm PID/seq-encoded heap poison now that the per-CPU
+        // GS base is valid, so a kfree that corrupts a live struct stamps the
+        // poison with the freeing PID + a callstack-ring seq.
+        brook::HeapArmForensicPoison();
+
         // If keyboard module wasn't loaded, fall back to direct init.
         if (acpiOk && !brook::KbdIsAvailable())
         {

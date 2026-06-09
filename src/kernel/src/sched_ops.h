@@ -25,6 +25,19 @@ static constexpr uint32_t SCHED_MAX_PIDS = 1024;
 // Sentinel value: no process (returned by PickNext when queue is empty).
 static constexpr uint16_t SCHED_PID_NONE = 0xFFFF;
 
+// BRO-176 HANG diagnostic snapshot of a policy's internal queue view for one pid.
+// All fields are best-effort; a policy that can't supply one sets it to 0/NONE.
+struct SchedDebugInfo {
+    uint16_t queued;      // 1 if the pid is flagged in-queue, else 0
+    uint16_t active;      // 1 if the pid has been InitProcess'd
+    uint16_t head;        // current queue head pid (NONE if empty)
+    uint16_t tail;        // current queue tail pid (NONE if empty)
+    uint16_t nextPid;     // pid's forward link
+    uint16_t prevPid;     // pid's backward link
+    uint32_t readyCount;  // policy's readyCount
+    uint32_t listLen;     // ACTUAL length of the queue by walking head->next
+};
+
 // Scheduler policy vtable.
 //
 // All functions receive an opaque `state` pointer (allocated by the caller,
@@ -71,6 +84,13 @@ struct SchedOps {
 
     // Return the number of processes currently in the ready queue.
     uint32_t (*ReadyCount)(void* state);
+
+    // BRO-176 HANG diagnostic (optional; may be null): fill `out` with the
+    // policy's internal view of `pid` and the queue, so the kernel can tell
+    // whether a Ready-but-undispatched process is (a) flagged queued while
+    // unlinked (logic desync) or (b) its state struct was corrupted by a wild
+    // write (head/tail/count inconsistent with the per-pid links). Pure reads.
+    void (*DebugDump)(void* state, uint16_t pid, SchedDebugInfo* out);
 };
 
 } // namespace brook

@@ -36,15 +36,21 @@ static uint32_t BuildPanicPayload(uint8_t* buf, uint32_t bufLen,
                                   const PanicExceptionInfo* excInfo,
                                   const PanicProcessList* procList,
                                   const PanicSystemInfo* sysInfo,
-                                  const PanicStackDump* stackDump)
+                                  const PanicStackDump* stackDump,
+                                  const PanicCpuList* cpuList)
 {
     uint32_t tracePayloadSize = 1 + trace->depth * 8;
 
     uint32_t needed = sizeof(PanicPacketHeader) + sizeof(PanicCPURegs)
                     + sizeof(PanicPacketHeader) + tracePayloadSize;
     if (excInfo) needed += sizeof(PanicPacketHeader) + sizeof(PanicExceptionInfo);
-    if (procList) needed += sizeof(PanicPacketHeader) + 1 + procList->count * sizeof(PanicProcessEntry);
+    if (procList) needed += sizeof(PanicPacketHeader) + 1
+                          + procList->count * PANIC_PROCESS_ENTRY_WIRE_SIZE
+                          + sizeof(PanicPacketHeader) + 1
+                          + procList->count * sizeof(PanicProcessExtEntry);
     if (sysInfo) needed += sizeof(PanicPacketHeader) + sizeof(PanicSystemInfo);
+    if (cpuList) needed += sizeof(PanicPacketHeader) + 1
+                         + cpuList->count * sizeof(PanicCpuEntry);
     if (stackDump) needed += sizeof(PanicPacketHeader) + 8 + 2 + stackDump->length;
 
     if (bufLen < needed) return 0;
@@ -80,16 +86,37 @@ static uint32_t BuildPanicPayload(uint8_t* buf, uint32_t bufLen,
         appendRaw(excInfo, sizeof(PanicExceptionInfo));
     }
 
-    // Packet 4: Process list (optional)
+    // Packet 4: Process list (optional) — STABLE 24-byte wire entries only.
     if (procList && procList->count > 0)
     {
-        uint32_t plSize = 1 + procList->count * sizeof(PanicProcessEntry);
+        uint32_t plSize = 1 + procList->count * PANIC_PROCESS_ENTRY_WIRE_SIZE;
         ph.type = QR_PACKET_TYPE_PROCESS_LIST;
         ph.size = plSize;
         appendRaw(&ph, sizeof(ph));
         buf[off++] = procList->count;
         for (uint8_t i = 0; i < procList->count; i++)
-            appendRaw(&procList->entries[i], sizeof(PanicProcessEntry));
+            // Only the first 24 bytes (pid/state/cpu/name/rip) are on the wire.
+            appendRaw(&procList->entries[i], PANIC_PROCESS_ENTRY_WIRE_SIZE);
+
+        // Packet 4b: Process reap-gate extension (BRO-176). Optional, self-
+        // describing TLV — old decoders skip it; new ones merge by pid.
+        uint32_t extSize = 1 + procList->count * sizeof(PanicProcessExtEntry);
+        ph.type = QR_PACKET_TYPE_PROCESS_EXT;
+        ph.size = extSize;
+        appendRaw(&ph, sizeof(ph));
+        buf[off++] = procList->count;
+        for (uint8_t i = 0; i < procList->count; i++)
+        {
+            const PanicProcessEntry& e = procList->entries[i];
+            PanicProcessExtEntry x;
+            x.pid           = e.pid;
+            x.tgid          = e.tgid;
+            x.asLiveThreads = e.asLiveThreads;
+            x.refCount      = e.refCount;
+            x.flags         = e.flags;
+            x.reserved      = 0;
+            appendRaw(&x, sizeof(x));
+        }
     }
 
     // Packet 5: System info (optional)
@@ -99,6 +126,18 @@ static uint32_t BuildPanicPayload(uint8_t* buf, uint32_t bufLen,
         ph.size = sizeof(PanicSystemInfo);
         appendRaw(&ph, sizeof(ph));
         appendRaw(sysInfo, sizeof(PanicSystemInfo));
+    }
+
+    // Packet 5b: Per-CPU state (optional TLV extension)
+    if (cpuList && cpuList->count > 0)
+    {
+        uint32_t clSize = 1 + cpuList->count * sizeof(PanicCpuEntry);
+        ph.type = QR_PACKET_TYPE_CPU_STATE;
+        ph.size = clSize;
+        appendRaw(&ph, sizeof(ph));
+        buf[off++] = cpuList->count;
+        for (uint8_t i = 0; i < cpuList->count; i++)
+            appendRaw(&cpuList->entries[i], sizeof(PanicCpuEntry));
     }
 
     // Packet 6: Stack dump (optional)
@@ -207,7 +246,8 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
                    const PanicExceptionInfo* excInfo,
                    const PanicProcessList* procList,
                    const PanicSystemInfo* sysInfo,
-                   const PanicStackDump* stackDump)
+                   const PanicStackDump* stackDump,
+                   const PanicCpuList* cpuList)
 {
     // Auto-select pixels per module based on display resolution
     // Low-DPI devices (e.g. Surface Go at 1024x768) need larger modules
@@ -218,10 +258,10 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
                  fbWidth, fbHeight, QR_PIXELS_PER_MODULE);
 
     // Step 1: Build binary TLV payload (no header yet — added per page)
-    static uint8_t payloadBuf[2048];
+    static uint8_t payloadBuf[4096];
     uint32_t payloadLen = BuildPanicPayload(payloadBuf, sizeof(payloadBuf),
                                             regs, trace, excInfo, procList,
-                                            sysInfo, stackDump);
+                                            sysInfo, stackDump, cpuList);
     if (payloadLen == 0)
     {
         SerialPuts("PANIC QR: payload build failed\n");
@@ -231,7 +271,7 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
     SerialPrintf("PANIC QR: payload %u bytes\n", payloadLen);
 
     // Step 1b: Compress with LZ4
-    static uint8_t compressedBuf[2048];
+    static uint8_t compressedBuf[4096];
     int compressedLen = LZ4_compress_default(
         reinterpret_cast<const char*>(payloadBuf),
         reinterpret_cast<char*>(compressedBuf + 4),  // leave 4 bytes for uncompressed size
@@ -263,7 +303,7 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
     // Also dump hex to serial for host-side capture (works with crash_decoder.py --hex)
     // Use compressed data with v2 header
     {
-        static uint8_t serialBuf[2048];
+        static uint8_t serialBuf[4096];
         PanicHeader hdr;
         hdr.magic     = QR_MAGIC_BYTE;
         hdr.version   = (dataToEncode == compressedBuf) ? QR_VERSION : QR_VERSION_RAW;
@@ -283,14 +323,38 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
 
     SerialPrintf("PANIC QR: %u pages (max %u bytes/page)\n", pageCount, maxPerPage);
 
+    // Calculate QR layout: position pages horizontally in the right column
+    uint32_t qrAreaX = fbWidth * 55 / 100;
+    uint32_t qrAreaW = fbWidth - qrAreaX;
+
+    // Step 2b: render a small STATIC "ingest URL" QR at the top of the QR column.
+    // Scanning it opens the Brook panic scanner site, which then reads the dense
+    // payload QR(s) below.  Kept separate so the payload stays full-density (see
+    // PANIC_INGEST_URL note in panic_qr.h).  Failure here is non-fatal.
+    uint32_t urlBandH = 0;
+    {
+        static uint8_t urlQrBuf[qrcodegen_BUFFER_LEN_MAX];
+        static uint8_t urlTmpBuf[qrcodegen_BUFFER_LEN_MAX];
+        if (qrcodegen_encodeText(PANIC_INGEST_URL, urlTmpBuf, urlQrBuf,
+                                 qrcodegen_Ecc_MEDIUM,
+                                 qrcodegen_VERSION_MIN, qrcodegen_VERSION_MAX,
+                                 qrcodegen_Mask_AUTO, true))
+        {
+            int urlSize = qrcodegen_getSize(urlQrBuf);
+            uint32_t urlPx = static_cast<uint32_t>(urlSize + 2 * QR_BORDER_WIDTH) * QR_PIXELS_PER_MODULE;
+            uint32_t urlX = qrAreaX + (qrAreaW > urlPx ? (qrAreaW - urlPx) / 2 : 0);
+            uint32_t urlY = 20;
+            RenderQRToFramebuffer(fbBase, fbWidth, fbHeight, fbStride, urlQrBuf,
+                                  urlX, urlY, QR_PIXELS_PER_MODULE);
+            urlBandH = urlY + urlPx + 16;  // reserve this band; payload QRs start below
+            SerialPuts("PANIC QR: ingest URL QR rendered (" PANIC_INGEST_URL ")\n");
+        }
+    }
+
     // Step 3: Encode and render each page
     static char b45Buf[4096];
     static uint8_t qrBuf[qrcodegen_BUFFER_LEN_MAX];
     static uint8_t tempBuf[qrcodegen_BUFFER_LEN_MAX];
-
-    // Calculate QR layout: position pages horizontally in the right column
-    uint32_t qrAreaX = fbWidth * 55 / 100;
-    uint32_t qrAreaW = fbWidth - qrAreaX;
 
     // Use v2 (compressed) or v1 (raw) version in QR headers
     uint8_t qrVersion = (dataToEncode == compressedBuf) ? QR_VERSION : QR_VERSION_RAW;
@@ -339,24 +403,29 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
         int qrSize = qrcodegen_getSize(qrBuf);
         SerialPrintf("PANIC QR: page %u: QR %d modules\n", page, qrSize);
 
-        // Position this QR code — single page centred, multi-page stacked vertically
+        // Position this QR code — single page centred, multi-page stacked vertically.
+        // All payload QRs are kept below the static ingest-URL QR band at top.
         uint32_t qrPixelSize = static_cast<uint32_t>(qrSize + 2 * QR_BORDER_WIDTH) * QR_PIXELS_PER_MODULE;
         uint32_t startX = qrAreaX + (qrAreaW > qrPixelSize ? (qrAreaW - qrPixelSize) / 2 : 0);
         uint32_t startY;
         if (pageCount == 1)
         {
-            // Centre vertically
-            startY = fbHeight > qrPixelSize + 100
-                     ? (fbHeight - qrPixelSize) / 2
-                     : QR_START_Y;
+            // Centre vertically within the area below the URL band.
+            uint32_t availTop = urlBandH;
+            uint32_t availH = fbHeight > availTop ? fbHeight - availTop : 0;
+            startY = (availH > qrPixelSize + 100)
+                     ? availTop + (availH - qrPixelSize) / 2
+                     : (urlBandH ? urlBandH : QR_START_Y);
         }
         else
         {
-            // Stack pages vertically with spacing
+            // Stack pages vertically with spacing, starting below the URL band.
             uint32_t totalH = pageCount * qrPixelSize + (pageCount - 1) * 16;
-            uint32_t baseY = fbHeight > totalH + 40
-                             ? (fbHeight - totalH) / 2
-                             : 20;
+            uint32_t availTop = urlBandH;
+            uint32_t availH = fbHeight > availTop ? fbHeight - availTop : 0;
+            uint32_t baseY = (availH > totalH + 40)
+                             ? availTop + (availH - totalH) / 2
+                             : (urlBandH ? urlBandH : 20);
             startY = baseY + page * (qrPixelSize + 16);
         }
 

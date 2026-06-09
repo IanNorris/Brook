@@ -1459,14 +1459,14 @@ struct FdRef
 // sys_write (1)
 // ---------------------------------------------------------------------------
 
-static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
-                          uint64_t, uint64_t, uint64_t)
+// Shared write dispatch used by sys_write (user buffer) and sys_sendfile
+// (kernel bounce buffer). bufAddr is treated as a raw readable byte pointer;
+// the CALLER is responsible for validating it (sys_write checks the user
+// buffer; sendfile passes a kernel bounce buffer that is always readable).
+// Handles every fd type: serial, vnode, framebuffer, /dev/null, dsp, tty,
+// pipe, eventfd, socket, memfd, unix-socket.
+static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count)
 {
-    // Validate the user buffer once, up front. EFAULT if any page in the
-    // range is unmapped — without this, a bad user pointer faults the kernel.
-    if (count > 0 && !UserBufferReadable(bufAddr, count))
-        return -EFAULT;
-
     // fd 3 = debug serial — writes directly, bypassing the async ring buffer.
     // Hold the serial lock across the entire write so multi-CPU output
     // doesn't interleave character-by-character.
@@ -1927,7 +1927,19 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
         return static_cast<int64_t>(written);
     }
 
+    // No fd-type handler above matched — unknown/unsupported descriptor.
+    // (This is the terminal return of WriteToFdByType, not sys_write.)
     return -EBADF;
+}
+
+static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
+                          uint64_t, uint64_t, uint64_t)
+{
+    // Validate the user buffer once, up front. EFAULT if any page in the
+    // range is unmapped — without this, a bad user pointer faults the kernel.
+    if (count > 0 && !UserBufferReadable(bufAddr, count))
+        return -EFAULT;
+    return WriteToFdByType(fd, bufAddr, count);
 }
 
 // ---------------------------------------------------------------------------
@@ -3995,7 +4007,7 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
 
     // Permission changes may leave stale TLB entries on remote CPUs
     if (pages > 0)
-        TlbShootdownFull(proc->pageTable.pml4.raw(), proc->tlbCpuMask);
+        TlbShootdownFull(proc->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
 
     return 0;
 }
@@ -4133,7 +4145,7 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t,
 
     // Flush stale TLB entries on remote CPUs after bulk unmap
     if (pages > 0)
-        TlbShootdownFull(proc->pageTable.pml4.raw(), proc->tlbCpuMask);
+        TlbShootdownFull(proc->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
 
     if (unmappedMfd) MemFdUnref(unmappedMfd);
 
@@ -4195,7 +4207,7 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
                 VirtualAddress va(old_addr + i * 4096);
                 VmmUnmapPage(proc->pageTable, va);
             }
-            TlbShootdownFull(proc->pageTable.pml4.raw(), proc->tlbCpuMask);
+            TlbShootdownFull(proc->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
             m.length = newPages * 4096;
             return static_cast<int64_t>(old_addr);
         }
@@ -4228,7 +4240,7 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
                 VmmUnmapPage(proc->pageTable, oldVA);
             }
         }
-        TlbShootdownFull(proc->pageTable.pml4.raw(), proc->tlbCpuMask);
+        TlbShootdownFull(proc->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
 
         // Update the memfdMaps entry to reflect the new address and size.
         m.vaddr  = newAddr;
@@ -4252,7 +4264,7 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
                 PmmUnrefPage(phys);
             }
         }
-        TlbShootdownFull(proc->pageTable.pml4.raw(), proc->tlbCpuMask);
+        TlbShootdownFull(proc->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
         return static_cast<int64_t>(old_addr);
     }
 
@@ -4291,7 +4303,7 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
             PmmUnrefPage(phys);
         }
     }
-    TlbShootdownFull(proc->pageTable.pml4.raw(), proc->tlbCpuMask);
+    TlbShootdownFull(proc->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
 
     DbgPrintf("sys_mremap: 0x%lx (%lu) -> 0x%lx (%lu)\n",
               old_addr, oldPages, newAddr, newPages);
@@ -4353,8 +4365,9 @@ static int64_t sys_exit(uint64_t status, uint64_t, uint64_t,
 {
     {
         Process* p = ProcessCurrent();
-        SerialPrintf("sys_exit: '%s' (pid %u, tgid %u) exited with status %lu\n",
-                     p ? p->name : "?", p ? p->pid : 0, p ? p->tgid : 0, status);
+        (void)p;
+        DbgPrintf("sys_exit: '%s' (pid %u, tgid %u) exited with status %lu\n",
+                  p ? p->name : "?", p ? p->pid : 0, p ? p->tgid : 0, status);
     }
 
     // If the thread group leader calls plain sys_exit while sibling threads
@@ -4389,8 +4402,8 @@ static int64_t sys_exit_group(uint64_t status, uint64_t, uint64_t,
                                uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
-    SerialPrintf("sys_exit_group: '%s' tgid %u exiting with status %lu\n",
-                 proc ? proc->name : "?", proc ? proc->tgid : 0, status);
+    DbgPrintf("sys_exit_group: '%s' tgid %u exiting with status %lu\n",
+              proc ? proc->name : "?", proc ? proc->tgid : 0, status);
 
     // Kill all other threads in this thread group so they don't linger
     // and cause use-after-free on shared resources after the leader exits.
@@ -4842,6 +4855,7 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
     if (!CopyUserCString(pathAddr, kPath, sizeof(kPath))) return -EFAULT;
 
     DbgPrintf("sys_execve: pid=%u path='%s'\n", proc->pid, kPath);
+    if (!g_hotLogQuiet)
     {
         extern volatile uint64_t g_lapicTickCount;
         SerialPrintf("[PROFILE] execve t=%lums pid=%u '%s'\n",
@@ -8790,14 +8804,14 @@ static int64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd, uint64_t offsetAddr
         }
         if (rd <= 0) break;
 
-        // Write to output fd
-        uint64_t woff = out_fde->seekPos;
-        int wr = -1;
-        if (out_fde->type == FdType::Vnode && out_fde->handle)
-        {
-            wr = VfsWrite(static_cast<Vnode*>(out_fde->handle), bounce, rd, &woff);
-            if (wr > 0) out_fde->seekPos = woff;
-        }
+        // Write to output fd via the shared write dispatch so sendfile works
+        // to ANY destination (terminal/serial, pipe, socket, file, ...), not
+        // just regular files. bounce is a kernel buffer, always readable.
+        // (BRO: previously this only handled FdType::Vnode, so sendfile to a
+        // TTY/pipe — e.g. busybox `cat` to stdout — silently returned 0.)
+        int wr = static_cast<int>(
+            WriteToFdByType(out_fd, reinterpret_cast<uint64_t>(bounce),
+                         static_cast<uint64_t>(rd)));
         if (wr <= 0) break;
 
         totalSent += wr;
@@ -10933,7 +10947,16 @@ static constexpr uint32_t FUTEX_HASH_SIZE = 64;
 static constexpr uint32_t FUTEX_BITSET_MATCH_ANY = 0xFFFFFFFFu;
 
 static FutexWaiter* g_futexBuckets[FUTEX_HASH_SIZE];
-static volatile uint64_t g_futexLock = 0;  // Spinlock for the hash table
+// BRO-176: this lock MUST disable interrupts while held. It is a plain spinlock
+// guarding the futex hash table; the critical sections are short and never
+// block. Previously it was a bare test_and_set (interrupts stayed enabled), so a
+// thread could be preempted by the timer while holding it and then be marked
+// Terminated by a sibling's exit_group before reaching the release — leaking the
+// lock permanently and deadlocking every future futex op (observed: 3 CPUs
+// spinning here forever under schedstress). An IrqSpinLock keeps IF=0 while held,
+// so the holder runs to the release uninterrupted and can never be descheduled
+// or killed mid-section.
+static IrqSpinLock g_futexLock;
 
 // Pool of waiter nodes (avoid kmalloc from IRQ context). Sized to MAX_PROCESSES:
 // a thread blocked in a futex wait cannot start another, so one slot per thread
@@ -10967,9 +10990,7 @@ extern "C" int64_t FutexWake(uint64_t owner, uint64_t uaddr, uint32_t maxWake,
     uint32_t bucket = FutexHash(owner, uaddr);
     uint32_t woken = 0;
 
-    while (__atomic_test_and_set(&g_futexLock, __ATOMIC_ACQUIRE)) {
-        __asm__ volatile("pause");
-    }
+    uint64_t fxFlags = IrqSpinLockAcquire(&g_futexLock);
 
     FutexWaiter** pp = &g_futexBuckets[bucket];
     while (*pp && woken < maxWake) {
@@ -10978,21 +10999,19 @@ extern "C" int64_t FutexWake(uint64_t owner, uint64_t uaddr, uint32_t maxWake,
             Process* waiter = w->proc;
             *pp = w->next;
             FutexFreeWaiter(w);
-            __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+            IrqSpinLockRelease(&g_futexLock, fxFlags);
 
             WakeProcess(waiter);
             woken++;
 
-            while (__atomic_test_and_set(&g_futexLock, __ATOMIC_ACQUIRE)) {
-                __asm__ volatile("pause");
-            }
+            fxFlags = IrqSpinLockAcquire(&g_futexLock);
             pp = &g_futexBuckets[bucket];
         } else {
             pp = &(*pp)->next;
         }
     }
 
-    __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+    IrqSpinLockRelease(&g_futexLock, fxFlags);
     return static_cast<int64_t>(woken);
 }
 
@@ -11001,9 +11020,7 @@ static bool FutexRemoveWaiter(uint64_t owner, uint64_t uaddr, Process* proc)
     if (!proc) return false;
     uint32_t bucket = FutexHash(owner, uaddr);
 
-    while (__atomic_test_and_set(&g_futexLock, __ATOMIC_ACQUIRE)) {
-        __asm__ volatile("pause");
-    }
+    uint64_t fxFlags = IrqSpinLockAcquire(&g_futexLock);
 
     FutexWaiter** pp = &g_futexBuckets[bucket];
     while (*pp) {
@@ -11011,13 +11028,13 @@ static bool FutexRemoveWaiter(uint64_t owner, uint64_t uaddr, Process* proc)
         if (w->uaddr == uaddr && w->owner == owner && w->proc == proc) {
             *pp = w->next;
             FutexFreeWaiter(w);
-            __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+            IrqSpinLockRelease(&g_futexLock, fxFlags);
             return true;
         }
         pp = &(*pp)->next;
     }
 
-    __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+    IrqSpinLockRelease(&g_futexLock, fxFlags);
     return false;
 }
 
@@ -11137,20 +11154,18 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
             return -ETIMEDOUT;
 
         // Acquire futex lock, atomically check value, and enqueue
-        while (__atomic_test_and_set(&g_futexLock, __ATOMIC_ACQUIRE)) {
-            __asm__ volatile("pause");
-        }
+        uint64_t fxFlags = IrqSpinLockAcquire(&g_futexLock);
 
         // Check if *uaddr == val while holding the lock
         if (__atomic_load_n(uaddr, __ATOMIC_ACQUIRE) != static_cast<uint32_t>(val)) {
-            __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+            IrqSpinLockRelease(&g_futexLock, fxFlags);
             return -EAGAIN;
         }
 
         // Allocate and enqueue waiter
         FutexWaiter* w = FutexAllocWaiter();
         if (!w) {
-            __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+            IrqSpinLockRelease(&g_futexLock, fxFlags);
             SerialPrintf("sys_futex: ENOMEM (pool exhausted) pid=%u\n", proc->pid);
             return -ENOMEM;
         }
@@ -11162,7 +11177,7 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
             : FUTEX_BITSET_MATCH_ANY;
         if (w->bitset == 0) {
             FutexFreeWaiter(w);
-            __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+            IrqSpinLockRelease(&g_futexLock, fxFlags);
             return -EINVAL;
         }
         uint32_t bucket = FutexHash(owner, uaddrVal);
@@ -11173,7 +11188,9 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
         __atomic_store_n(&proc->pendingWakeup, 0, __ATOMIC_RELEASE);
         proc->wakeupTick = deadline;
 
-        __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+        // Release the futex lock (restoring interrupts) BEFORE blocking — a
+        // process must never be descheduled with interrupts disabled.
+        IrqSpinLockRelease(&g_futexLock, fxFlags);
 
         // Block until FUTEX_WAKE removes our waiter, a signal arrives, or an
         // optional timeout expires and the scheduler wakes us.
@@ -12942,6 +12959,15 @@ __attribute__((naked)) void SwitchToUserMode(uint64_t, uint64_t)
         "xor %%r14, %%r14\n\t"
         "xor %%r15, %%r15\n\t"
         "xor %%rbp, %%rbp\n\t"
+        // BRO-166: clear IF before swapgs so a LAPIC timer (or any maskable
+        // IRQ) cannot fire in the ring-0 window between swapgs and iretq. In
+        // that window active GS is already the user base (0); a timer landing
+        // here pushes a ring-0 CS, so the ISR entry stub's conditional
+        // `testq $3,CS; swapgs` would SKIP swapgs and run the handler with
+        // GS=0 → #PF at gs:176 (CR2=0xB0). The hand-built frame's RFLAGS=0x202
+        // re-enables IF atomically on iretq to ring 3, so this only closes the
+        // kernel-side window with no change to the delivered user context.
+        "cli\n\t"
         "swapgs\n\t"
         "iretq\n\t"
         ::: "memory"

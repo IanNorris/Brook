@@ -212,7 +212,14 @@ void DeviceDumpRegistry()
 
 bool DeviceCheckIntegrity()
 {
-    SpinLockAcquire(&g_deviceLock);
+    // Called from the timer-tick ISR (SchedulerTick). g_deviceLock is a plain
+    // SpinLock also held by normal-context code (DeviceRegister/Iterate/...)
+    // with interrupts enabled, so we MUST NOT block here: if the timer fired
+    // on a CPU that already holds the lock, blocking would self-deadlock and
+    // wedge the whole system (BRO-168). Skip this round if the lock is busy —
+    // the check is periodic and best-effort, so it simply runs next tick.
+    if (!SpinLockTryAcquire(&g_deviceLock))
+        return true;
     bool ok = true;
     if (g_deviceCanaryPre != DEVICE_CANARY ||
         g_deviceCanaryPost != DEVICE_CANARY)

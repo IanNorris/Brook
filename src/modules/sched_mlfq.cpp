@@ -196,6 +196,7 @@ static const SchedOps g_mlfqOps = {
     MlfqTick,
     MlfqTimeslice,
     MlfqReadyCount,
+    nullptr,  // DebugDump: not implemented for mlfq (BRO-176 diag is RR-only)
 };
 
 } // anonymous namespace

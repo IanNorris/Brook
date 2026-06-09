@@ -127,6 +127,13 @@ void TlbShootdown(uint64_t targetCr3, uint64_t virtualAddr, uint64_t cpuMask);
 // Used after bulk PTE changes (exec, fork PTE downgrade).
 void TlbShootdownFull(uint64_t targetCr3, uint64_t cpuMask);
 
+// BRO-179: unconditional full-TLB-flush barrier across ALL online CPUs (incl.
+// idle), with positive acknowledgement and NO forgiveness (panics on timeout).
+// The PMM quarantine drain calls this before releasing freed frames so no CPU
+// can hold a stale 4KiB translation for a frame about to be reissued. MUST be
+// called with IF=1 and no IrqSpinLock held (it busy-waits for remote ACKs).
+void TlbFlushAllCpusBarrier();
+
 // Run TLB shootdown self-test (call after SMP is fully online).
 // Returns true if all tests pass, false on failure.
 bool TlbShootdownSelfTest();

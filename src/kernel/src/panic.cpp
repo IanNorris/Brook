@@ -218,6 +218,65 @@ static int PanicFormatStr(char* buf, int cap, const char* fmt, __builtin_va_list
 
 // ---- KernelPanic ------------------------------------------------------------
 
+// Fill a PanicCpuList from current kernel state. Safe to call from the panicking
+// CPU after the APs are halted: per-CPU process + CR3 come from existing tracked
+// state, and the spin RIP comes from the NMI-captured halted state if available
+// (PANIC_CPU_LIVE_RIP), otherwise the last-scheduled RIP.
+uint32_t brook::PanicCaptureCpuList(brook::PanicCpuList* out)
+{
+    if (!out) return 0;
+    uint32_t n = brook::SmpGetCpuCount();
+    if (n > brook::PANIC_MAX_CPUS_DUMP) n = brook::PANIC_MAX_CPUS_DUMP;
+    out->count = 0;
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        brook::PanicCpuEntry& e = out->entries[out->count];
+        e.cpuIndex = static_cast<uint8_t>(i);
+        e.flags = 0;
+        e.pid = 0;
+        e.rip = 0;
+        e.cr3 = 0;
+
+        const brook::CpuInfo* ci = brook::SmpGetCpu(i);
+        if (ci)
+        {
+            if (ci->online) e.flags |= brook::PANIC_CPU_ONLINE;
+            if (ci->isBsp)  e.flags |= brook::PANIC_CPU_BSP;
+            e.cr3 = ci->currentCr3;
+        }
+
+        // Prefer the NMI-captured live spin RIP if the panic NMI handler recorded
+        // it; otherwise fall back to the last-scheduled RIP of the CPU's process.
+        // pid is resolved independently from the scheduler's per-CPU table (the
+        // NMI recorder leaves hs->pid==0), so a live RIP still gets a real pid.
+        const brook::CpuHaltedState* hs = brook::SmpGetHaltedState(i);
+        bool liveRip = false;
+        if (hs && hs->halted)
+        {
+            e.flags |= brook::PANIC_CPU_HALTED;
+            if (hs->rip)
+            {
+                e.rip = hs->rip;
+                e.flags |= brook::PANIC_CPU_LIVE_RIP;
+                liveRip = true;
+            }
+        }
+        {
+            brook::Process* p = brook::SchedulerGetCpuProcess(i);
+            uint64_t pv = reinterpret_cast<uint64_t>(p);
+            bool plausible = pv >= 0xFFFF800000000000ULL && (pv & 0x7) == 0;
+            if (plausible && p->magic == brook::PROCESS_MAGIC)
+            {
+                e.pid = p->pid;
+                if (!liveRip)
+                    e.rip = p->savedCtx.rip;
+            }
+        }
+        out->count++;
+    }
+    return out->count;
+}
+
 // Re-entrance guard — if the panic handler itself faults (e.g. TTY rendering
 // hits an unmapped page), we detect it and emit a minimal serial message + halt.
 static volatile int g_panicNesting = 0;
@@ -315,6 +374,61 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
     // we've already printed the full diagnostic to serial.
     brook::SmpHaltAllAPs();
 
+    // Now that the APs are halted and the panic NMI handler has captured each
+    // CPU's live spin RIP into g_haltedState, print a per-CPU section to serial
+    // symbolized by the KERNEL's own ksym table (reliable even on a dirty build,
+    // unlike the QR decoder which symbolizes against the on-disk ELF). This is
+    // the BRO-176 reap-stall diagnostic: it reveals where each AP was ACTUALLY
+    // executing (e.g. spinning on a lock) rather than the stale savedCtx.rip.
+    {
+        uint32_t nCpus = brook::SmpGetCpuCount();
+        if (nCpus > brook::MAX_CPUS) nCpus = brook::MAX_CPUS;
+        brook::SerialPuts("\n--- per-CPU live state (NMI-captured) ---\n");
+        for (uint32_t c = 0; c < nCpus; ++c)
+        {
+            const brook::CpuHaltedState* hs = brook::SmpGetHaltedState(c);
+            brook::Process* p = brook::SchedulerGetCpuProcess(c);
+            brook::SerialPuts("  CPU");
+            char cbuf[4]; int ci2 = 0;
+            if (c >= 10) cbuf[ci2++] = '0' + (c / 10);
+            cbuf[ci2++] = '0' + (c % 10);
+            cbuf[ci2] = '\0';
+            brook::SerialPuts(cbuf);
+            uint64_t pv = reinterpret_cast<uint64_t>(p);
+            bool pOk = pv >= 0xFFFF800000000000ULL && (pv & 0x7) == 0
+                       && p->magic == brook::PROCESS_MAGIC;
+            brook::SerialPuts(" pid=");
+            SerialPutHex64(pOk ? p->pid : 0);
+            if (hs && hs->halted && hs->rip)
+            {
+                brook::SerialPuts(" LIVE rip=");
+                SerialPutHex64(hs->rip);
+                const char* sym = nullptr; uint64_t off = 0;
+                if (brook::KsymFindByAddr(hs->rip, &sym, &off))
+                {
+                    brook::SerialPuts("  ");
+                    brook::SerialPuts(sym);
+                }
+            }
+            else if (pOk)
+            {
+                brook::SerialPuts(" sched rip=");
+                SerialPutHex64(p->savedCtx.rip);
+                const char* sym = nullptr; uint64_t off = 0;
+                if (brook::KsymFindByAddr(p->savedCtx.rip, &sym, &off))
+                {
+                    brook::SerialPuts("  ");
+                    brook::SerialPuts(sym);
+                }
+            }
+            else
+            {
+                brook::SerialPuts(" (idle/none)");
+            }
+            brook::SerialPuts("\n");
+        }
+    }
+
     // Stop the compositor so nothing overwrites the panic screen.
     brook::CompositorHalt();
 
@@ -334,8 +448,26 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
         for (uint32_t i = 0; i < nProcs && procList.count < brook::PANIC_MAX_PROCESSES; i++)
         {
             brook::Process* p = brook::PanicGetProcess(i);
-            if (!p || p->state == brook::ProcessState::Terminated) continue;
+            if (!p) continue;
             auto& e = procList.entries[procList.count];
+            // BRO-176/SIG2: VALIDATE before dereferencing. A freed-and-reused or
+            // wild Process* in g_allProcesses (the kernel-corruption bug we're
+            // hunting) would fault the panic handler itself if we read its fields
+            // blind — turning a crash into a hung double-panic during QR build.
+            // Range-check the pointer, then check magic; only then read fields.
+            uint64_t pv = reinterpret_cast<uint64_t>(p);
+            bool plausible = pv >= 0xFFFF800000000000ULL && (pv & 0x7) == 0;
+            if (!plausible || p->magic != brook::PROCESS_MAGIC)
+            {
+                // Record a minimal corrupt-entry stub WITHOUT further deref; stash
+                // the bad pointer in rip for forensics. This is SIG2 evidence.
+                e.pid = 0xFFFF; e.state = 0xFF; e.cpu = 0xFF; e.rip = pv;
+                e.name[0] = '?'; e.name[1] = '\0';
+                e.tgid = 0; e.asLiveThreads = -1; e.refCount = 0;
+                e.flags = brook::PANIC_PROC_MAGIC_BAD;
+                procList.count++;
+                continue;
+            }
             e.pid   = p->pid;
             e.state = static_cast<uint8_t>(p->state);
             e.cpu   = (p->runningOnCpu >= 0) ? static_cast<uint8_t>(p->runningOnCpu) : 0xFF;
@@ -343,6 +475,17 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
             // Copy name (truncate if needed)
             for (uint32_t j = 0; j < brook::PANIC_PROCESS_NAME_LEN; j++)
                 e.name[j] = (p->name[j]) ? p->name[j] : '\0';
+            // Reap-gate fields
+            e.tgid = p->tgid;
+            bool leader = !p->isThread;
+            e.asLiveThreads = leader
+                ? static_cast<int16_t>(__atomic_load_n(&p->asLiveThreads, __ATOMIC_RELAXED))
+                : static_cast<int16_t>(-1);
+            e.refCount = static_cast<int16_t>(__atomic_load_n(&p->refCount, __ATOMIC_RELAXED));
+            e.flags = 0;
+            if (p->isThread)        e.flags |= brook::PANIC_PROC_IS_THREAD;
+            if (p->reapable)        e.flags |= brook::PANIC_PROC_REAPABLE;
+            if (p->isKernelThread)  e.flags |= brook::PANIC_PROC_IS_KTHREAD;
             procList.count++;
         }
 
@@ -395,6 +538,8 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
         }
 
         uint32_t fbStride = physStride * 4; // pixel stride → byte stride
+        static brook::PanicCpuList cpuList;
+        brook::PanicCaptureCpuList(&cpuList);
         brook::PanicScreenInfo psi = {};
         psi.message   = g_panicBuf;
         psi.regs      = &fullRegs;
@@ -403,6 +548,7 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
         psi.procList  = &procList;
         psi.sysInfo   = &sysInfo;
         psi.stackDump = &stackDump;
+        psi.cpuList   = &cpuList;
         psi.vector    = 0;
         psi.errorCode = 0;
         brook::PanicScreenRender(const_cast<uint32_t*>(physFb), fbW, fbH, fbStride, &psi);

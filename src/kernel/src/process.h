@@ -251,8 +251,70 @@ struct Process
     int32_t  runningOnCpu;   // CPU index (-1 = not running, used for double-schedule detection)
     int32_t  cpuAffinity;    // CPU affinity pin (-1 = any CPU, >=0 = pinned to that CPU)
     volatile uint64_t tlbCpuMask;  // Bitmask of CPUs that have this process's CR3 loaded in TLB
+    // BRO-176/SIG1: address-space TLB footprint, maintained ONLY on the
+    // thread-group leader (threadLeader==self).  tlbCpuMask above is PER-THREAD
+    // and undercounts the address space's real TLB footprint: a thread group
+    // shares one page table / CR3 across all its threads, which may run on
+    // different CPUs simultaneously.  A shootdown that targets only the acting
+    // thread's tlbCpuMask misses sibling-thread CPUs that have the same shared
+    // mapping cached — so a freed user frame stays live in a sibling's TLB, is
+    // reused (e.g. as a page table), and the sibling's stale write corrupts it
+    // (the SIG1 reserved-bit #PF).  asTlbCpuMask is the UNION of every sibling
+    // thread's CPU since the address space was created (monotonic until the AS
+    // is replaced at fork/exec).  ALL user-page shootdowns must target this, not
+    // tlbCpuMask.  Over-approximation is safe: the shootdown IPI handler filters
+    // by CR3 (apic.cpp), so a CPU not running this address space acks without
+    // flushing.
+    volatile uint64_t asTlbCpuMask;
+    // BRO-173/175: liveness refcount — counts external holders of a raw
+    // Process* that could deref this struct (a CPU currently running it, a
+    // SchedulerKillThreadGroup leader's snapshot, the compositor's VFB
+    // registration).  The reaper frees a Process ONLY when state==Terminated
+    // AND refCount==0, replacing the old free-gate flag soup (reapable +
+    // runningOnCpu==-1 + groupKillOwned + compositorRegistered-defer) with one
+    // monotonic invariant: never free while any reference is outstanding.
+    // ORTHOGONAL to `state` (which answers "may it run?", not "is it freeable?").
+    volatile int32_t refCount;
+    // BRO-176: address-space lifetime count, maintained ONLY on the thread-group
+    // leader (pid==tgid, the owner of the shared user page table).  Counts the
+    // number of not-yet-reaped threads sharing the leader's address space.  The
+    // reaper must not reap the leader (which is what frees the shared page table
+    // and user pages in ProcessDestroy) while this is > 0 — otherwise a sibling
+    // thread still in the pick->switch window (picked Ready, runningOnCpu still
+    // -1, about to be context-switched to) would resume on a freed cr3 and #PF
+    // in user mode (the BRO-176 UAF: a Terminated-but-pick-pending sibling slips
+    // past the Phase-2 quiesce-wait because its runningOnCpu is transiently -1).
+    // Incremented when a thread is created, decremented when a thread is reaped;
+    // the leader is therefore always reaped LAST, so the shared address space
+    // outlives every thread that could still be dispatched onto it.
+    volatile int32_t asLiveThreads;
+    // BRO-176: a monotonically-increasing incarnation id assigned at creation,
+    // NEVER reused (unlike pid or the struct pointer, both of which recycle
+    // under churn).  A thread records its leader's incarnation at creation
+    // (leaderIncarnation); at teardown the decrement of the leader's
+    // asLiveThreads is skipped unless the leader struct's current incarnation
+    // still matches, so a freed+reused leader slot can never have an unrelated
+    // incarnation's count corrupted.  In practice the asLiveThreads gate keeps a
+    // leader alive while any thread references it, so incarnations always match;
+    // the check is a cheap correctness guard that documents that invariant.
+    uint64_t incarnation;
+    uint64_t leaderIncarnation;
     volatile bool reapable;  // Set after context_switch completes away from this process
     volatile bool compositorRegistered; // True while compositor holds a reference to this process's VFB
+    // BRO-173: set while a SchedulerKillThreadGroup leader owns this thread's
+    // teardown.  While true, ONLY the owning leader (Phase 2, after
+    // KRwLockCleanupOnExit) may mark this process reapable — DrainPostSwitch
+    // and signal paths must NOT, otherwise the reaper could free the Process
+    // out from under the leader's still-pending cleanup (use-after-free).
+    volatile bool groupKillOwned;
+    // BRO-173: death-latch set on the thread-group LEADER (pid==tgid) when the
+    // group begins exiting (exit_group / SchedulerKillThreadGroup), under
+    // g_allProcLock.  ProcessCreateThread checks it (also under g_allProcLock)
+    // and refuses to spawn a new thread into a dying group — otherwise a thread
+    // born after the kill snapshot is never terminated, the group never
+    // empties, the leader is never reaped, and the parent's wait/fork loop
+    // livelocks (the "Terminated leader keeps creating threads" symptom).
+    volatile bool tgidExiting;
     int32_t exitStatus;      // Exit status (stored when process exits, for wait4)
 
     // CPU time accounting (in LAPIC ticks, ~1ms each)
@@ -279,6 +341,14 @@ struct Process
 
     // Blocking info (e.g. nanosleep wakeup tick)
     uint64_t wakeupTick;        // g_lapicTickCount value to unblock at (0 = N/A)
+
+    // BRO-176 lost-enqueue diagnostic: a small ring of recent scheduler events
+    // touching this process. Each entry packs (tick<<16 | site<<8 | state).
+    // Dumped by the SCHED STALL detector to show the exact op sequence that left
+    // a process state==Ready but absent from the policy ready queue. Pure
+    // diagnostic; written O(1) at the key sched sites.
+    uint64_t schedTrace[12];
+    uint8_t  schedTraceHead;
 
     // Mutex wait-queue linkage (used by KMutex when process is blocked on a lock)
     Process* syncNext;          // Next process in sync wait queue (mutex/rwlock/semaphore)
@@ -463,6 +533,18 @@ struct Process
     volatile uint32_t inputTail;  // Read index (process/syscall)
 };
 
+// BRO-176/SIG1: returns a pointer to the address-space TLB footprint mask for
+// `p`, which lives on the thread-group leader (threadLeader==self for a leader).
+// Use this — NOT p->tlbCpuMask — as the recipient set for every user-page TLB
+// shootdown, so sibling-thread CPUs sharing the address space are flushed too.
+// Falls back to `p` itself when threadLeader is null (e.g. idle/kernel threads,
+// whose mask never drives a user shootdown).
+static inline volatile uint64_t* AddressSpaceTlbMaskPtr(Process* p)
+{
+    Process* leader = p->threadLeader ? p->threadLeader : p;
+    return &leader->asTlbCpuMask;
+}
+
 // Push an input event to a process's per-process queue (non-blocking).
 inline void ProcessInputPush(Process* proc, const InputEvent& ev)
 {
@@ -518,6 +600,22 @@ Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
 
 // Destroy a process and free all its resources.
 void ProcessDestroy(Process* proc);
+
+// BRO-173/175 liveness refcount.  ProcessRef takes a reference on a Process the
+// caller is about to hold a raw pointer to across a window where the reaper
+// could otherwise free it; ProcessUnref drops it.  The reaper only frees a
+// Terminated process when its refCount has fallen to 0.  ProcessRef callers
+// must already hold a valid reference OR g_allProcLock (so the struct cannot be
+// freed underneath the increment).  Neither call frees inline — freeing is done
+// solely by the reaper in its safe (CPU0, non-ISR) context.
+static inline void ProcessRef(Process* p)
+{
+    if (p) __atomic_add_fetch(&p->refCount, 1, __ATOMIC_ACQ_REL);
+}
+static inline void ProcessUnref(Process* p)
+{
+    if (p) __atomic_sub_fetch(&p->refCount, 1, __ATOMIC_ACQ_REL);
+}
 
 // Fork the current process, creating a child with a copy of its address space.
 // The caller must provide the user-mode context so the child can resume.

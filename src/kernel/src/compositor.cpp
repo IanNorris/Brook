@@ -261,11 +261,12 @@ static void PresentStatsReport()
     uint32_t meanL = static_cast<uint32_t>(sumL / n);
     uint32_t fps   = meanP ? (1000u / meanP) : 0;
 
-    SerialPrintf("COMPOSITOR stats[%u]: period min=%u mean=%u max=%u ms "
-                 "(%u fps); loop min=%u mean=%u max=%u ms; "
-                 "frames>33ms=%u >50ms=%u >100ms=%u\n",
-                 n, minP, meanP, maxP, fps, minL, meanL, maxL,
-                 over33, over50, over100);
+    if (!g_hotLogQuiet)
+        SerialPrintf("COMPOSITOR stats[%u]: period min=%u mean=%u max=%u ms "
+                     "(%u fps); loop min=%u mean=%u max=%u ms; "
+                     "frames>33ms=%u >50ms=%u >100ms=%u\n",
+                     n, minP, meanP, maxP, fps, minL, meanL, maxL,
+                     over33, over50, over100);
 }
 
 // Wallpaper: raw XRGB pixel data loaded from disk, or solid color fallback.
@@ -389,7 +390,18 @@ bool CompositorSetupProcess(Process* proc, int16_t destX, int16_t destY,
         __atomic_store_n(&g_compositedProcs[idx], proc, __ATOMIC_RELEASE);
         __atomic_store_n(&g_compositedCount, idx + 1, __ATOMIC_RELEASE);
     }
-    __atomic_store_n(&proc->compositorRegistered, true, __ATOMIC_RELEASE);
+    // BRO-173/175: take a liveness reference on the proc, exactly once per
+    // registration (CAS false→true), so the reaper cannot free it while the
+    // compositor still holds its VFB.  Released by CompositorUnregisterProcess
+    // and the per-frame Terminated-unregister, also exactly once (CAS true→
+    // false).  This replaces the old `compositorRegistered`-gated reap-defer,
+    // which livelocked if the compositor never unregistered the proc.
+    bool wasRegistered = false;
+    if (__atomic_compare_exchange_n(&proc->compositorRegistered, &wasRegistered,
+                                    true, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+    {
+        ProcessRef(proc);
+    }
 
     DbgPrintf("COMPOSITOR: proc '%s' pid %u → vfb %ux%u at 0x%lx, dest=(%d,%d) scale=%u\n",
                  proc->name, proc->pid, vfbWidth, vfbHeight, vfbAddr.raw(),
@@ -1959,7 +1971,15 @@ static void CompositorLoop()
                 MarkDirtyRows(minY, maxY);
             }
             __atomic_store_n(&g_compositedProcs[i], static_cast<Process*>(nullptr), __ATOMIC_RELEASE);
-            __atomic_store_n(&p->compositorRegistered, false, __ATOMIC_RELEASE);
+            // BRO-173/175: drop the compositor's liveness reference exactly once
+            // (CAS true→false).  After this the reaper may free the proc once
+            // its refCount reaches 0 and it is Terminated/off-CPU/reapable.
+            {
+                bool wasReg = true;
+                if (__atomic_compare_exchange_n(&p->compositorRegistered, &wasReg,
+                        false, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                    ProcessUnref(p);
+            }
             if (p->state == ProcessState::Terminated)
                 __atomic_store_n(&p->reapable, true, __ATOMIC_RELEASE);
             continue;
@@ -2105,10 +2125,15 @@ void CompositorUnregisterProcess(Process* proc)
             break;
         }
     }
-    // Clear compositor reference and allow the reaper to free pages.
-    // DrainPostSwitch skips reapable for compositor-registered processes
-    // to prevent PmmKillPid from freeing VFB pages mid-blit.
-    __atomic_store_n(&proc->compositorRegistered, false, __ATOMIC_RELEASE);
+    // BRO-173/175: drop the compositor's liveness reference exactly once
+    // (CAS true→false).  The reaper may free the proc once its refCount reaches
+    // 0; until then its VFB pages are safe from PmmKillPid.
+    {
+        bool wasReg = true;
+        if (__atomic_compare_exchange_n(&proc->compositorRegistered, &wasReg,
+                false, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            ProcessUnref(proc);
+    }
     if (proc->state == ProcessState::Terminated)
         __atomic_store_n(&proc->reapable, true, __ATOMIC_RELEASE);
 }

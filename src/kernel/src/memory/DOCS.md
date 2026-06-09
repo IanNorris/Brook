@@ -120,6 +120,130 @@ multi-field consistency.
 - `refCount` is `uint8_t` — max 255 sharers. Sufficient for current workload but
   would overflow if a page is shared across 256+ processes.
 
+### Design Decision (BRO-179): TLB-barrier frame-free quarantine
+
+**Status:** the durable fix for the stale-TLB sub-case of SIG1. Replaces the
+earlier rate-based (FIFO-depth) quarantine stopgap, which could be outrun at high
+free throughput (see history below).
+
+**The bug (SIG1 / BRO-179, BRO-176 family).** Under heavy `fork`+`pthread`+
+`exit_group` churn (the `schedstress` reproducer), a physical frame was freed
+and immediately re-issued to a *different domain* (e.g. a user data page recycled
+into a kernel page table) while a stale **TLB** entry for its previous life still
+existed on a remote CPU. Captured red-handed as a deterministic **reserved-bit
+#PF in `VmmGetPte`**: a freshly-allocated, zeroed page-table frame already
+contained a "present" garbage PTE — user data written through the stale TLB entry
+after the frame was zeroed. The same root also surfaces as userspace reads of
+kernel-heap free-poison `0xDFDFDFDF` (the original SIG1 symptom). This is
+**freed-while-mapped cross-domain frame reuse** via a stale remote-CPU TLB entry
+(the PTE itself is already cleared at the point of free — the reverse-map
+diagnostic found no live PTE; only a cached translation survives).
+
+**The invariant.** A freed frame is not returned to the allocatable pool until
+**every online CPU has performed a full, unconditional TLB flush (CR3 reload)
+after the free**. `CR4.PGE` is off, so any `mov cr3` evicts all non-global
+entries. Once every CPU has flushed since a frame was unmapped, no CPU can hold a
+stale translation for it, so it is safe to reissue to any domain.
+
+**The mechanism (passive TLB-epoch barrier + throttled batch drain).**
+`PmmFreePage` / `PmmUnrefPage` / `PmmKillPid` / `PmmFreeByTag` no longer return a
+frame to the allocatable pool immediately. A retired frame is pushed onto a
+**descriptor-linked quarantine list** (`RetireFrameLocked`, under `g_pmmLock`,
+threaded through each `PageDescriptor.next` — zero extra storage, O(1), no fixed
+capacity); it stays bitmap-`USED` so the allocator skips it. A single dedicated
+kernel thread (`PmmDrainThread`, started by `PmmStartDrainThread()` after the
+scheduler is up — it MUST be enqueued via `SchedulerAddProcess`, the omission of
+which silently disabled the barrier for a long time) does the release:
+
+1. It sleeps a short interval (~4ms), then splices out the **entire** accumulated
+   list in O(1) under `g_pmmLock` and drops the lock.
+2. It calls `TlbFlushAllCpusBarrier()` (apic.cpp) — the passive epoch barrier
+   (below) — once for the whole batch.
+3. After the barrier returns, every frame in the batch was freed *before* the
+   barrier, so every CPU has flushed since each frame's free. The drainer
+   re-acquires `g_pmmLock` and releases the whole list back to the pool.
+
+Frames freed *during* the barrier accumulate on a fresh list and ride the **next**
+drain — correct, because the barrier that frees a frame must have started after
+that frame's free.
+
+**The barrier — passive TLB epoch (apic.cpp).** The first implementation used an
+all-CPU IPI: the drainer held `g_tlbRequest.lock`, IPI'd every CPU and spun for
+ACKs. That **deadlocked** once the drainer actually ran: a target CPU spinning
+`IF=0` on that same lock to start its *own* shootdown can never service the
+barrier IPI, so it never ACKs (a true circular deadlock if it also holds
+`g_vmmLock`/`g_pmmLock`). Normal per-AS shootdowns avoid this because they target
+only CPUs whose `CR3 == targetCr3` (in user mode, `IF=1`), never CPUs spinning
+in-kernel on the lock. The all-CPU barrier broke that assumption. The replacement
+is lock-free and passive:
+
+- A global `g_tlbEpoch` is bumped by the drainer when it wants to release a batch.
+- Every CPU, at its LAPIC timer tick (`IF=1` safe point), runs
+  `TlbEpochFlushLocal()`: if behind, it does a full `mov cr3` reload (a serializing
+  full flush — see the invariant; verified `CR4.PGE` is **off**, asserted at the
+  first barrier so it fails loud if PGE is ever enabled) and publishes the epoch it
+  flushed with a release store.
+- The drainer flushes itself, then spins holding **no lock** until every online
+  CPU has published `>= target`, then returns. Generous timeout → **panic** (fail
+  loud; never release an un-flushed frame). Deadlock-free by construction: the
+  drainer holds no lock while waiting, so no CPU can be blocked on it; every CPU
+  reaches its timer tick within a bounded time of leaving any `IF=0` section.
+
+**Why throttle + one barrier per batch.** Each epoch bump forces *every* CPU to
+reload CR3 (full TLB flush) at its next tick. Bumping per small batch makes all
+CPUs flush almost continuously — TLBs never warm, and at 64 CPUs throughput
+collapses (the LAPIC tick rate itself craters). Accumulating ~4ms of frees and
+releasing them behind **one** barrier amortizes the system-wide flush over many
+frees. A freed frame waits at most ~4ms + one barrier before reuse.
+
+**No bypass.** A retired frame is *only* ever released by the drainer, *after* a
+barrier — there is no early-release path. A liveness guard panics if the
+quarantine list grows past half of RAM (the drainer is wedged) rather than
+silently exhausting memory or bypassing the barrier — a privesc-class invariant
+fails loud. (`MaxKernelPTs` in the bootloader was also raised so the kernel's
+larger BSS — the reflog/bitmap — is fully mapped; it now fails loud if exceeded.)
+
+**Real-HW note.** A CPU in deep idle without ARAT can stop its LAPIC timer and
+never advance its epoch → the drainer would time out. On KVM the periodic LAPIC
+timer fires through `hlt`, so the timer backstop suffices; a fire-and-forget nudge
+IPI on epoch bump (to wake such CPUs promptly) is a documented follow-up for bare
+metal.
+
+**Tradeoffs / limitations (accepted):**
+- Holds freed frames out of circulation transiently (buffer + overflow) until the
+  next drain — negligible vs installed RAM; the drainer keeps the held set small.
+- The barrier evicts already-**cached** stale translations. It does not, by
+  itself, save a frame freed while a still-**valid** PTE points at it (a CPU could
+  re-walk and re-cache after the flush). That would be a separate refcount-/
+  PTE-teardown bug; the reflog + reverse-map diagnostics would surface it. The
+  proven BRO-179 root cause is the *stale-TLB* case (PTE already cleared, only a
+  remote cached entry survives), which this closes — see Root Cause below.
+- Toggle: `g_quarantineOn` (default true). Set false to restore immediate-reuse
+  for A/B testing.
+
+**Root cause (proven 2026-06, BRO-179).** Forensic capture (per-alloc/free
+callstacks in the PMM reflog + a lock-free fault-time frame-history dump) named
+it: `VmmFreePages` (virtual_memory.cpp) frees a **kernel** page from the *shared*
+`KernelPageTable` but only issues a **local** `invlpg`, never a cross-CPU
+shootdown. Other CPUs keep a stale kernel-VA→frame translation; when the frame is
+recycled to a user process, a stale kernel mapping on another CPU writes through
+it and corrupts the new owner (observed: a user process loads a `-16` pointer and
+#PFs; or `0xDFDFDFDF` heap poison appears in a live `Process` struct). The
+per-frame `mapCount` leak detector was structurally blind to this because it only
+counts **user** PTEs, not kernel mappings; refcounts were always clean (not a
+UAF). About eight other VMM paths use the same local-only `invlpg`
+(virtual_memory.cpp lines ~193, 297, 320, 354, 373, 428, 447, 505), so it is a
+*class* bug — which is why the fix gates frame **reuse** (covering all of them at
+once) rather than adding a shootdown to one call site.
+
+**History.** A first stopgap was a *rate-based* FIFO quarantine (release after
+`DEPTH` further frees); it held at 8 CPUs but was **outrun at 64 CPUs** because
+the grace period is a function of free *rate*, not a proven TLB epoch. It was
+replaced by this all-CPU barrier drain. The barrier's *first* form still had a
+**safety-valve bypass** (release-early when the buffer filled), which let ~1-in-6
+64-CPU `schedstress` runs still corrupt a frame; the overflow list above closes
+that last hole so no frame is ever reused without a barrier.
+
 ---
 
 ## Virtual Memory Manager (VMM)

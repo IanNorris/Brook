@@ -18,6 +18,14 @@ extern "C" void SerialVPrintf(const char* fmt, __builtin_va_list args);
 void SerialLock();
 void SerialUnlock();
 
+// BRO-179 stress-test toggle: when true, high-frequency hot-path SerialPrintf
+// callers (TLB-shootdown forgiveness, per-execve PROFILE, compositor stats)
+// skip their output. Serial is ~11KB/s and these per-operation logs throttle
+// SMP throughput to serial speed; silencing them is required to drive the
+// 64-CPU quarantine stress test at real speed. Set in PmmInit (co-located with
+// the other stress toggles). Default false = normal verbose behaviour.
+extern volatile bool g_hotLogQuiet;
+
 } // namespace brook
 
 // Debug-only logging — compiles to nothing in Release builds.

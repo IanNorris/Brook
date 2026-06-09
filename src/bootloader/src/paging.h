@@ -15,8 +15,13 @@ static constexpr UINT64 KernelVirtualBase = 0xFFFFFFFF80000000ULL;
 static constexpr UINT64 MaxIdentityMapGB = 128ULL;
 
 // Maximum number of 4KB page tables for the kernel virtual mapping.
-// Each PT covers 512 * 4KB = 2MB.  16 PTs cover 32MB — plenty.
-static constexpr UINT64 MaxKernelPTs = 16ULL;
+// Each PT covers 512 * 4KB = 2MB. The kernel image (incl. BSS — notably the
+// BRO-179 PMM reflog and bitmap, several MB each) crossed 32MB, so 16 PTs were
+// no longer enough: the tail of BSS silently went unmapped and faulted at boot.
+// One PD page addresses 512 PTs = 1GB, so this can grow freely; 64 PTs = 128MB
+// gives ample headroom for kernel growth. Raising it only enlarges the early
+// boot page-table pool (the kernel installs its own tables in VmmInit).
+static constexpr UINT64 MaxKernelPTs = 64ULL;
 
 // Pre-allocated, zeroed page table structures.
 //

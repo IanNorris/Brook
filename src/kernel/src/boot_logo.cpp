@@ -8,6 +8,7 @@
 #include "tty.h"
 #include "font_atlas.h"
 #include "serial.h"
+#include "apic.h"
 
 namespace brook {
 
@@ -233,7 +234,7 @@ void BootLogoProgress(uint8_t percent, const char* text)
 
     RenderText(buf, textCenterX, g_textY, 0x00CCCCCC);
 
-    SerialPrintf("BOOT: %s\n", buf);
+    SerialPrintf("[%u] BOOT: %s\n", static_cast<uint32_t>(ApicTickCount()), buf);
 }
 
 void BootLogoError(uint8_t percentAtError, const char* errorText)

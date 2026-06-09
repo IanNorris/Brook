@@ -1080,7 +1080,55 @@ static Vnode* GenDiskstats()
     return MakeProcVnode(buf, static_cast<uint32_t>(p - buf));
 }
 
-// ---- Global file table ----
+// /proc/blkprobe — virtio-blk cold-read latency probe (BRO-165).
+// One line per device with cumulative-since-boot completion-wait metrics plus
+// derived averages. Read before and after a workload and diff the raw columns;
+// the avg/path columns are convenience views of the same counters.
+static Vnode* GenBlkprobe()
+{
+    uint32_t bufSize = 1024;
+    auto* buf = static_cast<char*>(kmalloc(bufSize));
+    if (!buf) return nullptr;
+
+    char* p = buf;
+    p = AppendStr(p, "dev waits reqs waitNsTotal waitNsMax spinIters legacy batch sg avgReqPerWait avgWaitNs avgSpin\n");
+
+    for (uint32_t i = 0; i < 16; ++i)
+    {
+        char devName[16];
+        devName[0] = 'v'; devName[1] = 'i'; devName[2] = 'r'; devName[3] = 't';
+        devName[4] = 'i'; devName[5] = 'o';
+        if (i < 10) { devName[6] = '0' + i; devName[7] = '\0'; }
+        else { devName[6] = '0' + (i / 10); devName[7] = '0' + (i % 10); devName[8] = '\0'; }
+
+        Device* dev = DeviceFind(devName);
+        if (!dev) continue;
+
+        brook::VirtioBlkProbeStats ps;
+        brook::VirtioBlkGetProbe(dev, ps);
+
+        if (static_cast<uint32_t>(p - buf) + 192 >= bufSize) break;
+
+        uint64_t avgReq  = ps.waitCount ? ps.reqSubmitted   / ps.waitCount : 0;
+        uint64_t avgWait = ps.waitCount ? ps.waitNsTotal    / ps.waitCount : 0;
+        uint64_t avgSpin = ps.waitCount ? ps.spinItersTotal / ps.waitCount : 0;
+
+        p = AppendStr(p, devName); *p++ = ' ';
+        p = AppendU64(p, ps.waitCount);      *p++ = ' ';
+        p = AppendU64(p, ps.reqSubmitted);   *p++ = ' ';
+        p = AppendU64(p, ps.waitNsTotal);    *p++ = ' ';
+        p = AppendU64(p, ps.waitNsMax);      *p++ = ' ';
+        p = AppendU64(p, ps.spinItersTotal); *p++ = ' ';
+        p = AppendU64(p, ps.pathLegacy);     *p++ = ' ';
+        p = AppendU64(p, ps.pathBatch);      *p++ = ' ';
+        p = AppendU64(p, ps.pathSG);         *p++ = ' ';
+        p = AppendU64(p, avgReq);            *p++ = ' ';
+        p = AppendU64(p, avgWait);           *p++ = ' ';
+        p = AppendU64(p, avgSpin);           *p++ = '\n';
+    }
+    *p = '\0';
+    return MakeProcVnode(buf, static_cast<uint32_t>(p - buf));
+}
 
 struct ProcGlobalEntry {
     const char* name;
@@ -1097,6 +1145,7 @@ static ProcGlobalEntry g_globalEntries[] = {
     { "modules", GenModules },
     { "mounts",  GenMounts },
     { "diskstats", GenDiskstats },
+    { "blkprobe", GenBlkprobe },
     { "filesystems", GenFilesystems },
 };
 static constexpr uint32_t NUM_GLOBAL = sizeof(g_globalEntries) / sizeof(g_globalEntries[0]);
