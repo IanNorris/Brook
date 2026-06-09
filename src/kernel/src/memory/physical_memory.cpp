@@ -343,7 +343,12 @@ static uint32_t g_quarPeak  = 0;          // high-water mark (diagnostic)
 #ifdef BROOK_HOST_TEST
 static bool     g_quarantineOn = false;   // no drainer in host tests; release now
 #else
-static bool     g_quarantineOn = true;    // false = immediate release (A/B testing)
+// BRO-179 FORENSIC HUNT: quarantine OFF for maximum reproducibility. The TLB
+// barrier (quarantine ON) only REDUCES the residual cross-domain reuse; turning
+// it off lets a freed frame be reissued immediately, so the bug reproduces fast
+// and deterministically while we capture provenance. (Set true to re-enable the
+// barrier once the leaking path is fixed.)
+static bool     g_quarantineOn = false;
 #endif
 static volatile bool g_quarDrainWanted = false;
 

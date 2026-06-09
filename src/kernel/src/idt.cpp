@@ -16,6 +16,7 @@
 #include "tty.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
+#include "memory/heap.h"
 #include "string.h"
 #include "irq_wrapper.h"
 
@@ -690,6 +691,18 @@ static void HandleDoubleFault(InterruptFrame* frame, uint64_t errorCode)
             ExcPutsRaw("  KSTACK_BASE "); ExcPutHex(cur->kernelStackBase);
             ExcPutsRaw("  KSTACK_TOP "); ExcPutHex(cur->kernelStackTop);
             ExcPutsRaw("\n");
+            // BRO-179 forensic: dump the first struct qwords raw. With encoded
+            // heap poison armed, a word reused from a kfree reads 0xDFDF<pid>_
+            // DFDF<seq> — the FREEING pid (high marker, low payload) is readable
+            // by eye here even though the #DF context is too fragile to run the
+            // (serial-locking) HeapDecodePoison; the enqueue/#PF paths decode the
+            // seq to the kfree callstack.
+            const uint64_t* praw = reinterpret_cast<const uint64_t*>(cur);
+            for (uint32_t w = 0; w < 4; w++)
+            {
+                ExcPutsRaw(cpuTag); ExcPutsRaw("  PROC[+"); ExcPutHex(w * 8);
+                ExcPutsRaw("] = "); ExcPutHex(praw[w]); ExcPutsRaw("\n");
+            }
         }
         else
         {
@@ -1028,10 +1041,15 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                 // poison marker, decode the ORIGINAL owner PID + free-seq and
                 // dump that frame's alloc/free callstack history — the
                 // corruption names the frame's previous life and who freed it.
+                // Try both the heap (kfree-over-live) and PMM (frame) decoders.
                 ExcPutsRaw("  [BRO179 poison decode of corrupt qwords]\n");
                 for (uint32_t q = 0; q < 8; q++)
+                {
                     PmmDecodePoison(frame[q]);
+                    brook::HeapDecodePoison(frame[q]);
+                }
                 PmmDecodePoison(frame[fidx]);
+                brook::HeapDecodePoison(frame[fidx]);
             }
             // These RSVD/corrupt-table faults make the QR renderer re-fault
             // (it walks memory through the same corrupt tables) — that nested

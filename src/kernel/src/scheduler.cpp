@@ -448,9 +448,14 @@ static void ReadyQueueInsertLocked(Process* proc)
         // BRO-179 forensic: if any struct word carries the 0xDFDF poison marker,
         // decode the frame's ORIGINAL owner PID + free-seq and dump its alloc/
         // free callstack history — naming whose freed frame was reused as this
-        // Process struct (the cross-domain SIG1 culprit).
+        // Process struct (the cross-domain SIG1 culprit). The poison may be the
+        // HEAP's (a kfree over this live struct) or the PMM frame poison, so try
+        // both decoders.
         for (int w = 0; w < 8; ++w)
+        {
+            HeapDecodePoison(raw[w]);
             PmmDecodePoison(raw[w]);
+        }
         // BRO-176: was this exact Process* recently freed? If so, name the free
         // site — that is the premature-free path (signature 2).
         if (ProcessDumpFreeLog((void*)proc) == 0)
