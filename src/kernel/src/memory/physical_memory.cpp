@@ -14,12 +14,17 @@ namespace brook {
     using KernelThreadFn = void (*)(void* arg);
     Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
                                 uint8_t priority);
+    void SchedulerAddProcess(Process* proc);   // scheduler.h — enqueue onto ready queue
     extern "C" void SchedulerSleepMs(uint32_t ms);
 }
 
 // Linker-defined symbol — end of the kernel image (virtual address).
 // Declared outside any namespace so the linker resolves it correctly.
 extern "C" uint8_t __kernel_end_sym[] __asm__("__kernel_end");
+
+// panic.h's KernelPanic, forward-declared to avoid pulling the header (and its
+// transitive includes) into this low-level TU.
+__attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...);
 
 namespace brook {
 
@@ -340,15 +345,28 @@ static constexpr uint32_t QUAR_LOWWATER   = 4096;   // drainer kicks in above th
 static uint32_t g_quarBuf[QUAR_CAP];
 static uint32_t g_quarCount = 0;          // frames currently queued for drain
 static uint32_t g_quarPeak  = 0;          // high-water mark (diagnostic)
+
+// BRO-179 (fix B): overflow quarantine. When the fixed buffer is full, freed
+// frames are NOT released early (that was the bug — it returned a frame to the
+// pool without an all-CPU TLB barrier since its free); instead they are pushed
+// onto a singly-linked overflow list threaded through each descriptor's `next`
+// field (free at retire time — the descriptor was just reset). The drainer pulls
+// from the buffer AND the overflow list, so EVERY frame passes a barrier before
+// reuse, with no fixed capacity ceiling and no allocation. The descriptor link
+// costs zero extra storage.
+static uint32_t g_quarOverflowHead  = PMM_NULL_PAGE;
+static uint32_t g_quarOverflowCount = 0;
+static uint32_t g_quarOverflowPeak  = 0;
 #ifdef BROOK_HOST_TEST
 static bool     g_quarantineOn = false;   // no drainer in host tests; release now
 #else
-// BRO-179 FORENSIC HUNT: quarantine OFF for maximum reproducibility. The TLB
-// barrier (quarantine ON) only REDUCES the residual cross-domain reuse; turning
-// it off lets a freed frame be reissued immediately, so the bug reproduces fast
-// and deterministically while we capture provenance. (Set true to re-enable the
-// barrier once the leaking path is fixed.)
-static bool     g_quarantineOn = false;
+// BRO-179 (fix B): quarantine ON. A freed frame is returned to the allocatable
+// pool only after the drain thread has put it through an all-CPU TLB barrier —
+// closing the cross-domain reuse window for EVERY local-only-invlpg free path
+// (e.g. VmmFreePages freeing a shared kernel page with a local invlpg only, the
+// proven BRO-179 root cause). The overflow list (below) guarantees no frame ever
+// bypasses the barrier, even under burst pressure. (Set false for A/B testing.)
+static bool     g_quarantineOn = true;
 #endif
 static volatile bool g_quarDrainWanted = false;
 
@@ -405,20 +423,40 @@ static inline void RetireFrameLocked(uint32_t idx, uint16_t ownerPid)
         ReleaseFrameLocked(idx);
         return;
     }
-    if (g_quarCount >= QUAR_CAP)
+    if (g_quarCount < QUAR_CAP)
     {
-        // Hard cap: drainer is behind. Degrade THIS frame to immediate release
-        // (rate-based for one frame) rather than block the freeing path or grow
-        // unbounded. Flag the drainer to catch up. This is a safety valve; in
-        // steady state the drainer keeps g_quarCount well below QUAR_CAP.
-        ReleaseFrameLocked(idx);
-        g_quarDrainWanted = true;
+        g_quarBuf[g_quarCount++] = idx;        // frame stays bitmap-USED (not allocatable)
+        if (g_quarCount > g_quarPeak) g_quarPeak = g_quarCount;
+        if (g_quarCount >= QUAR_LOWWATER)
+            g_quarDrainWanted = true;
         return;
     }
-    g_quarBuf[g_quarCount++] = idx;        // frame stays bitmap-USED (not allocatable)
-    if (g_quarCount > g_quarPeak) g_quarPeak = g_quarCount;
-    if (g_quarCount >= QUAR_LOWWATER)
+    // Buffer full. BRO-179 (fix B): do NOT release early — that would return the
+    // frame to the pool without an all-CPU TLB barrier since its free, which is
+    // the bug. Push onto the overflow list (threaded through the now-unused
+    // descriptor `next` link) so it still rides a barrier before reuse.
+    if (g_pageDescs)
+    {
+        Desc(idx).next = g_quarOverflowHead;
+        g_quarOverflowHead = idx;
+        g_quarOverflowCount++;
+        if (g_quarOverflowCount > g_quarOverflowPeak)
+            g_quarOverflowPeak = g_quarOverflowCount;
         g_quarDrainWanted = true;
+        // Liveness guard: the drainer should keep the overflow near-empty. If it
+        // grows past half of RAM, the drainer is wedged — fail loud rather than
+        // silently exhaust memory (a hang) or, worse, be tempted to bypass the
+        // barrier (corruption). A privesc-class invariant fails loud.
+        if (g_totalPages && g_quarOverflowCount > (g_totalPages / 2))
+            KernelPanic("BRO-179: quarantine overflow runaway (%u frames) — drain "
+                        "thread wedged; refusing to bypass the TLB barrier",
+                        g_quarOverflowCount);
+        return;
+    }
+    // Pre-tracking / pre-SMP only (g_pageDescs not yet allocated): a single CPU
+    // is running, so no other CPU can hold a stale TLB entry — the local invlpg
+    // already sufficed and immediate release is correct here.
+    ReleaseFrameLocked(idx);
 }
 
 // The drain thread body. Runs forever in a kernel thread (IF=1, no spinlocks
@@ -426,24 +464,50 @@ static inline void RetireFrameLocked(uint32_t idx, uint16_t ownerPid)
 #ifndef BROOK_HOST_TEST
 void TlbFlushAllCpusBarrier();   // apic.cpp (namespace brook)
 
+// BRO-179 drain diagnostics (gated). Counts drain cycles and frames released so
+// we can tell whether the drainer is running and keeping up vs being starved.
+static bool     g_drainDebug   = false;
+static uint64_t g_drainCycles  = 0;
+static uint64_t g_drainedTotal = 0;
+
 static void PmmDrainThread(void* /*arg*/)
 {
+    if (g_drainDebug)
+        SerialPrintf("PMM-DRAIN: thread started\n");
     for (;;)
     {
         if (!__atomic_load_n(&g_quarDrainWanted, __ATOMIC_ACQUIRE))
         {
-            SchedulerSleepMs(2);
-            continue;
+            // Below the eager low-water mark: drain any stragglers anyway so a
+            // freed frame never sits indefinitely (and overflow can't build up
+            // during quiet periods). Cheap lock-protected peek.
+            uint64_t pf = IrqSpinLockAcquire(&g_pmmLock);
+            bool pending = (g_quarCount > 0 || g_quarOverflowHead != PMM_NULL_PAGE);
+            IrqSpinLockRelease(&g_pmmLock, pf);
+            if (!pending)
+            {
+                SchedulerSleepMs(2);
+                continue;
+            }
         }
 
-        // Snapshot the live quarantine buffer into the private batch and empty
-        // the live buffer, all under g_pmmLock.
+        // Snapshot up to QUAR_CAP frames into the private batch: first from the
+        // live buffer, then from the overflow list. Under g_pmmLock. Whatever is
+        // left over rides the next pass (the loop keeps g_quarDrainWanted set).
         uint64_t f = IrqSpinLockAcquire(&g_pmmLock);
-        uint32_t n = g_quarCount;
-        for (uint32_t i = 0; i < n; i++)
-            g_drainBatch[i] = g_quarBuf[i];
-        g_quarCount = 0;
-        g_quarDrainWanted = false;
+        uint32_t n = 0;
+        while (n < QUAR_CAP && g_quarCount > 0)
+            g_drainBatch[n++] = g_quarBuf[--g_quarCount];   // order irrelevant
+        while (n < QUAR_CAP && g_quarOverflowHead != PMM_NULL_PAGE)
+        {
+            uint32_t idx = g_quarOverflowHead;
+            g_quarOverflowHead = Desc(idx).next;
+            g_quarOverflowCount--;
+            g_drainBatch[n++] = idx;
+        }
+        bool more = (g_quarCount > 0 || g_quarOverflowHead != PMM_NULL_PAGE);
+        uint32_t ovf = g_quarOverflowCount;
+        g_quarDrainWanted = more;   // keep draining until both are empty
         IrqSpinLockRelease(&g_pmmLock, f);
 
         if (n == 0)
@@ -461,12 +525,26 @@ static void PmmDrainThread(void* /*arg*/)
         for (uint32_t i = 0; i < n; i++)
             ReleaseFrameLocked(g_drainBatch[i]);
         IrqSpinLockRelease(&g_pmmLock, f);
+
+        if (g_drainDebug)
+        {
+            g_drainCycles++;
+            g_drainedTotal += n;
+            if ((g_drainCycles & 0xF) == 0)   // every 16 cycles
+                SerialPrintf("PMM-DRAIN: cycles=%lu drained=%lu last=%u overflow=%u buf=%u\n",
+                             g_drainCycles, g_drainedTotal, n, ovf, g_quarCount);
+        }
     }
 }
 
 void PmmStartDrainThread()
 {
-    KernelThreadCreate("pmm_drain", PmmDrainThread, nullptr, 2);
+    Process* t = KernelThreadCreate("pmm_drain", PmmDrainThread, nullptr, 2);
+    if (t)
+        SchedulerAddProcess(t);   // enqueue onto the ready queue (else it never runs)
+    if (g_drainDebug)
+        SerialPrintf("PMM-DRAIN: PmmStartDrainThread called, KernelThreadCreate -> %p\n",
+                     (void*)t);
 }
 #else
 // Host unit tests don't link the scheduler/apic; the quarantine drain is a
@@ -1004,22 +1082,27 @@ void PmmEnableTracking()
                  usedCount, freeCount,
                  static_cast<uint32_t>(g_totalPages * sizeof(PageDescriptor) / 1024));
 
-    // BRO-179 FORENSIC HUNT MODE. The TLB barrier is validated; we are now
-    // hunting the RESIDUAL leak (a frame reused while still mapped, which no
-    // barrier can fix). Turn the reflog ON so every alloc/free records its
-    // dynamic callstack + owner PID, and frame-poison ON so a reused frame's
-    // bytes encode the original owner PID + free-seq. The next repro then names
-    // the culprit instead of being another Heisenbug. (Set both to false to
-    // restore the maximum-throughput configuration used to stress the barrier.)
+    // BRO-179 (fix B validated): root cause was VmmFreePages (and ~8 sibling VMM
+    // paths) doing a LOCAL-only invlpg when freeing a shared kernel page, leaving
+    // stale kernel translations on other CPUs that corrupt the recycled frame.
+    // Fix: quarantine ON (the all-CPU TLB-barrier drain, with the overflow list
+    // closing the old release-without-barrier bypass) gates frame REUSE for every
+    // such path at once. Keep the PMM reflog ON: it is the diagnostic that named
+    // this root cause (the fault-time frame-history dump) and its cost is modest;
+    // it stays as a permanent safety net for this expensive bug class. Frame
+    // poison is OFF — its job (proving cross-domain reuse) is done and the 4 KiB
+    // fill per free is too costly for steady state. (Set g_framePoisonOn=true and
+    // g_quarantineOn=false to re-arm a forensic A/B hunt.)
     g_freeLogOn = true;
-    g_framePoisonOn = true;
+    g_framePoisonOn = false;
+#ifndef BROOK_HOST_TEST
+    g_drainDebug = true;   // BRO-179: temporary — confirm the drainer runs/keeps up
+#endif
 
-    // BRO-179 stress-test: silence the high-frequency hot-path serial logs
-    // (TLB-shootdown forgiveness, per-execve PROFILE, compositor stats). At
-    // 64 CPUs these per-operation prints throttle fork/exit throughput to
-    // serial speed (~11 KB/s); silencing them lets the quarantine stress run
-    // at real speed. Kept ON in forensic mode too — the reflog/poison provenance
-    // is captured in-memory and only printed at a fault, so it does not throttle.
+    // Silence the high-frequency hot-path serial logs (TLB-shootdown forgiveness,
+    // per-execve PROFILE, compositor stats). At 64 CPUs these per-operation prints
+    // throttle fork/exit throughput to serial speed; the reflog provenance is
+    // captured in-memory and only printed at a fault. (Revert to restore verbose.)
     g_hotLogQuiet = true;
 }
 

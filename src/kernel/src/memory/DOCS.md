@@ -178,33 +178,51 @@ spinning on a lock the drainer holds (`IF=0`) could not service the IPI. The dra
 thread satisfies this; `RetireFrameLocked` only *queues* (it never barriers), so
 the hot free path stays cheap and lock-safe.
 
-**Safety valve.** If the drainer falls behind and the quarantine buffer hits its
-hard cap (`QUAR_CAP`), `RetireFrameLocked` degrades *that one frame* to immediate
-release and flags the drainer to catch up — bounding memory rather than blocking
-the freeing path. Under the tested load the drainer keeps the buffer well below
-the cap.
+**Overflow (no bypass).** If the drainer falls behind and the fixed buffer
+(`QUAR_CAP`) fills, `RetireFrameLocked` does **not** release the frame early —
+that would return it to the pool without an all-CPU barrier since its free, which
+is exactly the bug. Instead the frame is pushed onto an **overflow list** threaded
+through each descriptor's now-unused `next` link (zero extra storage, no
+allocation, O(1), never blocks the IF=0 free path). The drainer pulls from the
+buffer **and** the overflow list, so *every* frame passes a barrier before reuse,
+with no fixed ceiling. A liveness guard panics if the overflow grows past half of
+RAM (the drainer is wedged) rather than silently exhausting memory or bypassing
+the barrier — a privesc-class invariant fails loud.
 
 **Tradeoffs / limitations (accepted):**
-- Holds up to `QUAR_CAP` frames out of circulation transiently — negligible vs
-  installed RAM, and bounded by the safety valve.
-- Closes the **stale-TLB** sub-case (the captured signature: frames freed with
-  the PTE already removed but a remote TLB entry still cached). It does **not**
-  fix a hypothetical **live-PTE refcount undercount** (a process still holding a
-  *present* PTE to the freed frame) — that PTE would persist past the barrier,
-  and a CPU could re-walk and re-cache it after the flush. No evidence of that
-  sub-case was found; the reverse-map diagnostic (`ProcessDumpFrameMappers`,
-  idt.cpp/scheduler.cpp) would surface it if it exists. If SIG1 recurs after this
-  fix, that undercount is the next suspect.
+- Holds freed frames out of circulation transiently (buffer + overflow) until the
+  next drain — negligible vs installed RAM; the drainer keeps the held set small.
+- The barrier evicts already-**cached** stale translations. It does not, by
+  itself, save a frame freed while a still-**valid** PTE points at it (a CPU could
+  re-walk and re-cache after the flush). That would be a separate refcount-/
+  PTE-teardown bug; the reflog + reverse-map diagnostics would surface it. The
+  proven BRO-179 root cause is the *stale-TLB* case (PTE already cleared, only a
+  remote cached entry survives), which this closes — see Root Cause below.
 - Toggle: `g_quarantineOn` (default true). Set false to restore immediate-reuse
-  behaviour for A/B testing.
+  for A/B testing.
 
-**History.** The first stopgap was a *rate-based* FIFO quarantine: a frame was
-released after `QUARANTINE_DEPTH` further frees. That assumed enough CPU TLB
-flushes happen within that many frees, which held at 8 CPUs (`DEPTH=1024`) but was
-**outrun at 64 CPUs** — a 10×10k 64-CPU `schedstress` validation still faulted
-even at `DEPTH=16384`, because the grace period is a function of free *rate*, not
-a proven TLB epoch. The barrier drain above replaces FIFO depth with an explicit,
-throughput-independent all-CPU flush, which is the proper fix.
+**Root cause (proven 2026-06, BRO-179).** Forensic capture (per-alloc/free
+callstacks in the PMM reflog + a lock-free fault-time frame-history dump) named
+it: `VmmFreePages` (virtual_memory.cpp) frees a **kernel** page from the *shared*
+`KernelPageTable` but only issues a **local** `invlpg`, never a cross-CPU
+shootdown. Other CPUs keep a stale kernel-VA→frame translation; when the frame is
+recycled to a user process, a stale kernel mapping on another CPU writes through
+it and corrupts the new owner (observed: a user process loads a `-16` pointer and
+#PFs; or `0xDFDFDFDF` heap poison appears in a live `Process` struct). The
+per-frame `mapCount` leak detector was structurally blind to this because it only
+counts **user** PTEs, not kernel mappings; refcounts were always clean (not a
+UAF). About eight other VMM paths use the same local-only `invlpg`
+(virtual_memory.cpp lines ~193, 297, 320, 354, 373, 428, 447, 505), so it is a
+*class* bug — which is why the fix gates frame **reuse** (covering all of them at
+once) rather than adding a shootdown to one call site.
+
+**History.** A first stopgap was a *rate-based* FIFO quarantine (release after
+`DEPTH` further frees); it held at 8 CPUs but was **outrun at 64 CPUs** because
+the grace period is a function of free *rate*, not a proven TLB epoch. It was
+replaced by this all-CPU barrier drain. The barrier's *first* form still had a
+**safety-valve bypass** (release-early when the buffer filled), which let ~1-in-6
+64-CPU `schedstress` runs still corrupt a frame; the overflow list above closes
+that last hole so no frame is ever reused without a barrier.
 
 ---
 

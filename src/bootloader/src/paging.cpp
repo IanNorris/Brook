@@ -76,7 +76,12 @@ PageTableAllocation AllocatePageTables(EFI_BOOT_SERVICES* bootServices, UINT64 k
     // Each PT covers 512 pages = 2MB.
     UINT64 kernelPtCount = (kernelPhysPages + 511) / 512;
     if (kernelPtCount == 0) kernelPtCount = 1;
-    if (kernelPtCount > MaxKernelPTs) kernelPtCount = MaxKernelPTs;
+    // Fail LOUD rather than silently truncating the kernel mapping: a clamp here
+    // would leave the tail of BSS unmapped and #PF at early boot (BRO-179 era
+    // regression). If this trips, raise MaxKernelPTs in paging.h.
+    if (kernelPtCount > MaxKernelPTs)
+        Halt(EFI_BUFFER_TOO_SMALL,
+             u"Kernel image too large for MaxKernelPTs — raise it in paging.h");
 
     // Layout (all contiguous):
     //  [0]           pml4         — 1 page

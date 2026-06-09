@@ -271,6 +271,7 @@ void ValidateIretFrame(const uint64_t* frame)
 // C handler called from the naked ISR wrapper below.
 // interruptedRip/interruptedCs/interruptedRbp are passed from the naked
 // handler (extracted from the CPU interrupt frame on the stack).
+void TlbEpochFlushLocal();  // BRO-179 passive epoch flush (defined below)
 extern "C" void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interruptedCs,
                                     uint64_t interruptedRbp)
 {
@@ -293,6 +294,12 @@ extern "C" void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interru
     }
 
     LapicWrite(LapicReg::EOI, 0);
+
+    // BRO-179: passive TLB-epoch flush. If the quarantine drainer has bumped the
+    // epoch, this CPU does its full flush here (IF=1 safe point) and publishes,
+    // letting the drainer release frames once every CPU has flushed. Cheap no-op
+    // when up to date.
+    TlbEpochFlushLocal();
 
     // Only BSP maintains the global tick and composites framebuffers.
     // Using LAPIC ID check (cheaper than SmpCurrentCpuIndex).
@@ -780,6 +787,62 @@ static TlbShootdownRequest g_tlbRequest;
 // Each pause is ~10-100 cycles, so 500K iterations ≈ 5-50ms.
 static constexpr uint64_t TLB_SHOOTDOWN_TIMEOUT = 10000000; // ~10ms at 1GHz loop
 
+// ---------------------------------------------------------------------------
+// BRO-179 passive TLB-epoch barrier (replaces the old IPI-and-wait barrier).
+//
+// Why the old barrier deadlocked: it targeted ALL online CPUs unconditionally
+// while holding g_tlbRequest.lock and spun for their ACKs. A target CPU that was
+// itself trying to start a NORMAL shootdown spins on that SAME lock with IF=0
+// (IrqSpinLockAcquire does cli-then-spin) and so can never service the barrier
+// IPI → never ACKs → timeout. If it also held g_vmmLock/g_pmmLock it was a true
+// circular deadlock (drainer waits for its ack; it waits for the lock the
+// drainer holds). Normal per-AS shootdowns avoid this because they only target
+// CPUs whose CR3 == targetCr3 (running that AS in user mode, IF=1), never CPUs
+// spinning in-kernel on the lock.
+//
+// Passive epoch design (deadlock-free by construction):
+//   * g_tlbEpoch is bumped when the quarantine drainer wants to release a batch.
+//   * Every CPU, at a safe point (LAPIC timer tick, IF=1), runs
+//     TlbEpochFlushLocal(): if it is behind the epoch it does a FULL CR3 reload
+//     (CR4.PGE is OFF — verified — so this evicts ALL entries incl. kernel
+//     mappings, which is the BRO-179 root) and publishes the epoch it flushed.
+//   * The drainer holds NO lock while waiting; it spins (IF=1) until every CPU
+//     in the snapshot's online set has published >= the target epoch, then
+//     releases the batch. Generous timeout → PANIC (fail loud, never release an
+//     unflushed frame — a privesc-class invariant).
+// The drainer holds no lock, so a CPU in a bounded IF=0 section simply flushes on
+// its next tick; normal shootdowns are completely independent of this path.
+//
+// NOTE: correctness here REQUIRES CR4.PGE to stay OFF (so CR3 reload is a full
+// flush). Asserted at init (ApicVerifyNoGlobalPages). If PGE is ever enabled,
+// this barrier must switch to a CR4.PGE toggle or INVPCID-all.
+//
+// LIMITATION (real HW): a CPU in deep idle without ARAT can stop its LAPIC timer
+// and never advance its epoch → the drainer would time out. A fire-and-forget
+// nudge IPI on epoch bump (TODO) wakes such CPUs; on KVM the periodic LAPIC
+// timer fires through hlt, so the timer backstop suffices for validation.
+static volatile uint64_t g_tlbEpoch = 0;
+static volatile uint64_t g_cpuFlushedEpoch[MAX_CPUS] = {};
+
+// Called at a safe point (IF=1) on each CPU — currently the LAPIC timer tick.
+// Cheap no-op when this CPU is already up to date with g_tlbEpoch.
+void TlbEpochFlushLocal()
+{
+    uint32_t cpu;
+    __asm__ volatile("movl %%gs:176, %0" : "=r"(cpu));
+    if (cpu >= MAX_CPUS) return;
+    uint64_t target = __atomic_load_n(&g_tlbEpoch, __ATOMIC_ACQUIRE);
+    if (__atomic_load_n(&g_cpuFlushedEpoch[cpu], __ATOMIC_RELAXED) >= target)
+        return;
+    // Full TLB flush via CR3 reload (serializing; PGE off → evicts everything).
+    uint64_t cr3;
+    __asm__ volatile("movq %%cr3, %0" : "=r"(cr3));
+    __asm__ volatile("movq %0, %%cr3" :: "r"(cr3) : "memory");
+    // Publish AFTER the flush. The CR3 reload is architecturally serializing, so
+    // the flush is globally ordered before this release store.
+    __atomic_store_n(&g_cpuFlushedEpoch[cpu], target, __ATOMIC_RELEASE);
+}
+
 extern "C" void TlbShootdownHandlerInner()
 {
     uint64_t myCr3;
@@ -1112,87 +1175,97 @@ void TlbShootdownFull(uint64_t targetCr3, uint64_t cpuMask)
     IrqSpinLockRelease(&g_tlbRequest.lock, flags);
 }
 
-// BRO-179 quarantine drain barrier. Force EVERY online CPU (including idle/
-// halted ones, which wake from hlt to service the IPI) to perform a full,
-// UNCONDITIONAL TLB flush (CR3 reload — CR4.PGE is off so this evicts all
-// non-global entries), and wait for POSITIVE acknowledgement from every one.
+// BRO-179 quarantine drain barrier — passive epoch implementation (see the
+// design note above TlbEpochFlushLocal). Bumps the global epoch, flushes self,
+// then waits (holding NO lock) until every online CPU has flushed since the bump.
+// PANICS on timeout — never returns having left a CPU un-flushed, because the
+// drainer releases physical frames back to the allocator only after this returns.
 //
-// Unlike TlbShootdownFull this has NO forgiveness: it never exempts a CPU
-// because it is on a "different CR3", and on timeout it PANICS rather than
-// proceeding. The quarantine drain releases physical frames back to the
-// allocator only after this returns, so a single un-flushed CPU would mean a
-// frame is reissued while a stale 4KiB translation for its previous life still
-// lives in that CPU's TLB — the freed-while-mapped cross-domain corruption
-// (SIG1). For a privesc-class invariant we fail loud, never silently release.
-//
-// MUST be called from a context with IF=1 and NO IrqSpinLock held: it busy-waits
-// for remote ACKs, and a CPU spinning on a lock we hold (IF=0) could not service
-// the IPI → guaranteed timeout → panic. The PMM drain thread satisfies this.
+// MUST be called from a context with IF=1 and NO IrqSpinLock held (it busy-waits
+// for remote CPUs to reach their next safe point). The PMM drain thread satisfies
+// this.
 void TlbFlushAllCpusBarrier()
 {
-    uint32_t cpuCount = SmpGetCpuCount();
-    if (cpuCount <= 1)
+    // One-time precondition check: the CR3-reload flush is a FULL flush only when
+    // global pages are disabled (CR4.PGE off). The panel flagged this as the
+    // single thing that would silently defeat the fix. Verify once; fail loud if
+    // PGE is ever enabled so this is caught immediately, not as recurring SIG1.
+    static volatile bool s_pgeChecked = false;
+    if (!s_pgeChecked)
     {
-        // Uniprocessor (or pre-SMP): a local reload is the whole barrier.
+        uint64_t cr4;
+        __asm__ volatile("movq %%cr4, %0" : "=r"(cr4));
+        if (cr4 & (1ULL << 7))
+            KernelPanic("BRO-179: CR4.PGE is set — epoch barrier's CR3 reload no "
+                        "longer flushes global kernel pages; switch to CR4.PGE "
+                        "toggle or INVPCID-all (cr4=0x%lx)", cr4);
+        s_pgeChecked = true;
+    }
+
+    // Always flush self first (covers uniprocessor and the drainer's own CPU).
+    {
         uint64_t cr3;
         __asm__ volatile("movq %%cr3, %0" : "=r"(cr3));
         __asm__ volatile("movq %0, %%cr3" :: "r"(cr3) : "memory");
-        return;
     }
+
+    uint32_t cpuCount = SmpGetCpuCount();
+    if (cpuCount <= 1)
+        return;
 
     uint32_t myCpu = SmpCurrentCpuIndex();
 
-    // Local full flush first.
-    uint64_t cr3;
-    __asm__ volatile("movq %%cr3, %0" : "=r"(cr3));
-    __asm__ volatile("movq %0, %%cr3" :: "r"(cr3) : "memory");
-
-    // Target every OTHER online CPU, unconditionally.
-    uint64_t targetMask = 0;
+    // Snapshot the online set we will wait on.
+    uint64_t onlineMask = 0;
     for (uint32_t i = 0; i < cpuCount; i++)
     {
-        if (i == myCpu) continue;
         const CpuInfo* info = SmpGetCpu(i);
         if (info && info->online)
-            targetMask |= (1ULL << i);
-    }
-    if (targetMask == 0)
-        return;
-
-    uint32_t targetCount = __builtin_popcountll(targetMask);
-
-    uint64_t flags = IrqSpinLockAcquire(&g_tlbRequest.lock);
-
-    g_tlbRequest.targetCr3 = 0;
-    g_tlbRequest.addr      = 0;
-    __atomic_store_n(&g_tlbRequest.unconditional, 1u, __ATOMIC_RELEASE);
-    __atomic_store_n(&g_tlbRequest.ackBitmap, 0ULL, __ATOMIC_RELAXED);
-    __atomic_store_n(&g_tlbRequest.pendingCount, targetCount, __ATOMIC_RELEASE);
-
-    for (uint32_t i = 0; i < cpuCount; i++)
-    {
-        if (targetMask & (1ULL << i))
-            ApicSendTlbShootdownIpi(i);
+            onlineMask |= (1ULL << i);
     }
 
-    // Wait for POSITIVE acks from every target — NO forgiveness, panic on timeout.
+    // Bump the epoch: every CPU must perform a full flush AFTER this point before
+    // any frame freed before this point may be reused.
+    uint64_t target = __atomic_add_fetch(&g_tlbEpoch, 1, __ATOMIC_ACQ_REL);
+
+    // Self is flushed as of the reload above (which happened after the bump's
+    // read-modify-write is irrelevant — self already has a fresh TLB).
+    if (myCpu < MAX_CPUS)
+        __atomic_store_n(&g_cpuFlushedEpoch[myCpu], target, __ATOMIC_RELEASE);
+
+    // Wait, holding NO lock, until every other online CPU has flushed >= target.
+    // Each reaches its LAPIC timer tick (IF=1) within a bounded time of leaving
+    // any IF=0 section and runs TlbEpochFlushLocal(). Deadlock-free: we hold no
+    // lock, so no CPU can be blocked on us.
     uint64_t spins = 0;
-    while (__atomic_load_n(&g_tlbRequest.pendingCount, __ATOMIC_ACQUIRE) != 0)
+    for (;;)
     {
-        __asm__ volatile("pause" ::: "memory");
-        if (++spins > TLB_SHOOTDOWN_TIMEOUT * 4)  // generous: this MUST complete
+        bool allDone = true;
+        for (uint32_t i = 0; i < cpuCount; i++)
         {
-            uint64_t acked = __atomic_load_n(&g_tlbRequest.ackBitmap, __ATOMIC_ACQUIRE);
-            __atomic_store_n(&g_tlbRequest.unconditional, 0u, __ATOMIC_RELEASE);
-            IrqSpinLockRelease(&g_tlbRequest.lock, flags);
-            KernelPanic("BRO-179: TLB drain barrier timeout — targets=0x%lx acked=0x%lx "
-                        "(a CPU never flushed; refusing to release frames unsafely)",
-                        targetMask, acked);
+            if (i == myCpu || !(onlineMask & (1ULL << i))) continue;
+            if (__atomic_load_n(&g_cpuFlushedEpoch[i], __ATOMIC_ACQUIRE) < target)
+            {
+                allDone = false;
+                break;
+            }
+        }
+        if (allDone)
+            return;
+
+        __asm__ volatile("pause" ::: "memory");
+        if (++spins > TLB_SHOOTDOWN_TIMEOUT * 8)  // very generous; this MUST complete
+        {
+            uint64_t missing = 0;
+            for (uint32_t i = 0; i < cpuCount; i++)
+                if (i != myCpu && (onlineMask & (1ULL << i)) &&
+                    __atomic_load_n(&g_cpuFlushedEpoch[i], __ATOMIC_ACQUIRE) < target)
+                    missing |= (1ULL << i);
+            KernelPanic("BRO-179: TLB epoch barrier timeout — online=0x%lx missing=0x%lx "
+                        "target=%lu (a CPU never flushed; refusing to release frames "
+                        "unsafely)", onlineMask, missing, target);
         }
     }
-
-    __atomic_store_n(&g_tlbRequest.unconditional, 0u, __ATOMIC_RELEASE);
-    IrqSpinLockRelease(&g_tlbRequest.lock, flags);
 }
 // The I/O APIC is accessed through two MMIO registers:
 //   IOREGSEL (offset 0x00): write the register index to read/write.
