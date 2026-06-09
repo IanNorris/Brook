@@ -336,27 +336,17 @@ static inline void SetFree(uint64_t idx)
 // which this fixes. A live-PTE refcount undercount, if it exists, needs a
 // separate fix; the reverse-map diagnostic would surface it.
 // ---------------------------------------------------------------------------
-// Capacity of the quarantine buffer. Sized for one drain interval's worth of
-// frees at peak 64-CPU throughput plus headroom; 65536 frames = 256 MiB worst-
-// case held, negligible vs RAM. The drain thread keeps the steady-state held
-// set far below this (it drains at the low-water mark).
-static constexpr uint32_t QUAR_CAP        = 65536;
-static constexpr uint32_t QUAR_LOWWATER   = 4096;   // drainer kicks in above this
-static uint32_t g_quarBuf[QUAR_CAP];
-static uint32_t g_quarCount = 0;          // frames currently queued for drain
-static uint32_t g_quarPeak  = 0;          // high-water mark (diagnostic)
-
-// BRO-179 (fix B): overflow quarantine. When the fixed buffer is full, freed
-// frames are NOT released early (that was the bug — it returned a frame to the
-// pool without an all-CPU TLB barrier since its free); instead they are pushed
-// onto a singly-linked overflow list threaded through each descriptor's `next`
-// field (free at retire time — the descriptor was just reset). The drainer pulls
-// from the buffer AND the overflow list, so EVERY frame passes a barrier before
-// reuse, with no fixed capacity ceiling and no allocation. The descriptor link
-// costs zero extra storage.
-static uint32_t g_quarOverflowHead  = PMM_NULL_PAGE;
-static uint32_t g_quarOverflowCount = 0;
-static uint32_t g_quarOverflowPeak  = 0;
+// BRO-179 quarantine: a single descriptor-linked FIFO/LIFO of retired frames,
+// threaded through each PageDescriptor's `next` field (free at retire time — the
+// caller just reset the descriptor). No fixed-size array (so no BSS cost and no
+// capacity ceiling), and "snapshot the whole batch" is an O(1) list splice. The
+// drain thread accumulates frees for a short interval, then releases the WHOLE
+// accumulated batch behind ONE all-CPU TLB-epoch barrier — amortizing the
+// system-wide flush over many frees (per-batch barriers thrash every CPU's TLB
+// and collapse throughput at high CPU counts).
+static uint32_t g_quarHead  = PMM_NULL_PAGE;  // list of frames awaiting drain
+static uint32_t g_quarCount = 0;              // length of g_quarHead
+static uint32_t g_quarPeak  = 0;              // high-water mark (diagnostic)
 #ifdef BROOK_HOST_TEST
 static bool     g_quarantineOn = false;   // no drainer in host tests; release now
 #else
@@ -368,7 +358,6 @@ static bool     g_quarantineOn = false;   // no drainer in host tests; release n
 // bypasses the barrier, even under burst pressure. (Set false for A/B testing.)
 static bool     g_quarantineOn = true;
 #endif
-static volatile bool g_quarDrainWanted = false;
 
 // BRO-179 forensic frame poison. When enabled, a frame that is actually freed is
 // filled with a pattern that (a) keeps the recognizable 0xDFDF marker in the high
@@ -398,11 +387,6 @@ static inline void PoisonFrameLocked(uint32_t idx, uint16_t ownerPid, uint32_t s
     }
 }
 
-#ifndef BROOK_HOST_TEST
-// Private batch the drain thread snapshots into (only the drainer touches it).
-static uint32_t g_drainBatch[QUAR_CAP];
-#endif
-
 // Caller MUST hold g_pmmLock. Release a frame's bitmap bit + free accounting.
 static inline void ReleaseFrameLocked(uint32_t idx)
 {
@@ -412,51 +396,32 @@ static inline void ReleaseFrameLocked(uint32_t idx)
 }
 
 // Caller MUST hold g_pmmLock. Retire a frame that reached refcount 0 (descriptor
-// already reset). Queue it for the TLB-barrier drain instead of releasing it.
-// `ownerPid` is the frame's owner captured BEFORE the descriptor reset, used to
-// stamp the forensic poison (the "thing that owned it originally").
+// already reset). Push it onto the quarantine list (threaded through the now-
+// unused descriptor `next` link) instead of releasing it — it stays bitmap-USED
+// so the allocator skips it until the drainer puts it through an all-CPU TLB
+// barrier. `ownerPid` is the frame's owner captured BEFORE the descriptor reset,
+// used to stamp the forensic poison (the "thing that owned it originally").
 static inline void RetireFrameLocked(uint32_t idx, uint16_t ownerPid)
 {
     PoisonFrameLocked(idx, ownerPid, g_freeLogSeq);
-    if (!g_quarantineOn)
+    // Pre-tracking / pre-SMP (g_pageDescs not yet allocated) OR quarantine off:
+    // a single CPU is running before SMP, so no other CPU can hold a stale TLB
+    // entry — the local invlpg already sufficed and immediate release is correct.
+    if (!g_quarantineOn || !g_pageDescs)
     {
         ReleaseFrameLocked(idx);
         return;
     }
-    if (g_quarCount < QUAR_CAP)
-    {
-        g_quarBuf[g_quarCount++] = idx;        // frame stays bitmap-USED (not allocatable)
-        if (g_quarCount > g_quarPeak) g_quarPeak = g_quarCount;
-        if (g_quarCount >= QUAR_LOWWATER)
-            g_quarDrainWanted = true;
-        return;
-    }
-    // Buffer full. BRO-179 (fix B): do NOT release early — that would return the
-    // frame to the pool without an all-CPU TLB barrier since its free, which is
-    // the bug. Push onto the overflow list (threaded through the now-unused
-    // descriptor `next` link) so it still rides a barrier before reuse.
-    if (g_pageDescs)
-    {
-        Desc(idx).next = g_quarOverflowHead;
-        g_quarOverflowHead = idx;
-        g_quarOverflowCount++;
-        if (g_quarOverflowCount > g_quarOverflowPeak)
-            g_quarOverflowPeak = g_quarOverflowCount;
-        g_quarDrainWanted = true;
-        // Liveness guard: the drainer should keep the overflow near-empty. If it
-        // grows past half of RAM, the drainer is wedged — fail loud rather than
-        // silently exhaust memory (a hang) or, worse, be tempted to bypass the
-        // barrier (corruption). A privesc-class invariant fails loud.
-        if (g_totalPages && g_quarOverflowCount > (g_totalPages / 2))
-            KernelPanic("BRO-179: quarantine overflow runaway (%u frames) — drain "
-                        "thread wedged; refusing to bypass the TLB barrier",
-                        g_quarOverflowCount);
-        return;
-    }
-    // Pre-tracking / pre-SMP only (g_pageDescs not yet allocated): a single CPU
-    // is running, so no other CPU can hold a stale TLB entry — the local invlpg
-    // already sufficed and immediate release is correct here.
-    ReleaseFrameLocked(idx);
+    Desc(idx).next = g_quarHead;     // frame stays bitmap-USED (not allocatable)
+    g_quarHead = idx;
+    g_quarCount++;
+    if (g_quarCount > g_quarPeak) g_quarPeak = g_quarCount;
+    // Liveness guard: the drainer should keep this list short. If it grows past
+    // half of RAM the drainer is wedged — fail loud rather than silently exhaust
+    // memory or be tempted to bypass the barrier (corruption). Fail loud.
+    if (g_totalPages && g_quarCount > (g_totalPages / 2))
+        KernelPanic("BRO-179: quarantine runaway (%u frames) — drain thread "
+                    "wedged; refusing to bypass the TLB barrier", g_quarCount);
 }
 
 // The drain thread body. Runs forever in a kernel thread (IF=1, no spinlocks
@@ -472,67 +437,54 @@ static uint64_t g_drainedTotal = 0;
 
 static void PmmDrainThread(void* /*arg*/)
 {
+    // Drain interval. The whole batch accumulated during this window is released
+    // behind ONE all-CPU TLB-epoch barrier, amortizing the system-wide flush. A
+    // per-batch barrier (draining continuously) forces every CPU to reload CR3
+    // constantly and collapses throughput at high CPU counts; ~4ms batches keep
+    // the all-CPU flush rate modest while bounding how long a freed frame waits.
+    constexpr uint32_t DRAIN_INTERVAL_MS = 4;
     if (g_drainDebug)
         SerialPrintf("PMM-DRAIN: thread started\n");
     for (;;)
     {
-        if (!__atomic_load_n(&g_quarDrainWanted, __ATOMIC_ACQUIRE))
-        {
-            // Below the eager low-water mark: drain any stragglers anyway so a
-            // freed frame never sits indefinitely (and overflow can't build up
-            // during quiet periods). Cheap lock-protected peek.
-            uint64_t pf = IrqSpinLockAcquire(&g_pmmLock);
-            bool pending = (g_quarCount > 0 || g_quarOverflowHead != PMM_NULL_PAGE);
-            IrqSpinLockRelease(&g_pmmLock, pf);
-            if (!pending)
-            {
-                SchedulerSleepMs(2);
-                continue;
-            }
-        }
+        SchedulerSleepMs(DRAIN_INTERVAL_MS);
 
-        // Snapshot up to QUAR_CAP frames into the private batch: first from the
-        // live buffer, then from the overflow list. Under g_pmmLock. Whatever is
-        // left over rides the next pass (the loop keeps g_quarDrainWanted set).
+        // Splice out the entire accumulated batch in O(1) (descriptor-linked).
         uint64_t f = IrqSpinLockAcquire(&g_pmmLock);
-        uint32_t n = 0;
-        while (n < QUAR_CAP && g_quarCount > 0)
-            g_drainBatch[n++] = g_quarBuf[--g_quarCount];   // order irrelevant
-        while (n < QUAR_CAP && g_quarOverflowHead != PMM_NULL_PAGE)
-        {
-            uint32_t idx = g_quarOverflowHead;
-            g_quarOverflowHead = Desc(idx).next;
-            g_quarOverflowCount--;
-            g_drainBatch[n++] = idx;
-        }
-        bool more = (g_quarCount > 0 || g_quarOverflowHead != PMM_NULL_PAGE);
-        uint32_t ovf = g_quarOverflowCount;
-        g_quarDrainWanted = more;   // keep draining until both are empty
+        uint32_t head = g_quarHead;
+        uint32_t n    = g_quarCount;
+        g_quarHead = PMM_NULL_PAGE;
+        g_quarCount = 0;
         IrqSpinLockRelease(&g_pmmLock, f);
 
-        if (n == 0)
+        if (head == PMM_NULL_PAGE)
             continue;
 
-        // The barrier: every online CPU does a full unconditional TLB flush.
-        // After this returns, no CPU holds a stale 4KiB entry for any frame that
-        // was unmapped before the barrier started — i.e. for every frame in the
-        // batch (all were freed before we snapshotted). MUST run with no
-        // g_pmmLock held (it busy-waits for remote ACKs).
+        // One barrier for the whole batch: every frame in `head` was freed before
+        // this point, so a single all-CPU flush since now covers all of them.
+        // MUST run with no g_pmmLock held (it busy-waits for remote CPUs).
         TlbFlushAllCpusBarrier();
 
-        // Now safe to return the batch's frames to the allocatable pool.
+        // Now safe to return the batch's frames to the allocatable pool. Walk the
+        // list (reading next BEFORE releasing, since release may let the frame be
+        // reallocated and its descriptor reused).
         f = IrqSpinLockAcquire(&g_pmmLock);
-        for (uint32_t i = 0; i < n; i++)
-            ReleaseFrameLocked(g_drainBatch[i]);
+        uint32_t idx = head;
+        while (idx != PMM_NULL_PAGE)
+        {
+            uint32_t next = Desc(idx).next;
+            ReleaseFrameLocked(idx);
+            idx = next;
+        }
         IrqSpinLockRelease(&g_pmmLock, f);
 
         if (g_drainDebug)
         {
             g_drainCycles++;
             g_drainedTotal += n;
-            if ((g_drainCycles & 0xF) == 0)   // every 16 cycles
-                SerialPrintf("PMM-DRAIN: cycles=%lu drained=%lu last=%u overflow=%u buf=%u\n",
-                             g_drainCycles, g_drainedTotal, n, ovf, g_quarCount);
+            if ((g_drainCycles & 0x3F) == 0)   // every 64 cycles
+                SerialPrintf("PMM-DRAIN: cycles=%lu drained=%lu last=%u peak=%u\n",
+                             g_drainCycles, g_drainedTotal, n, g_quarPeak);
         }
     }
 }
