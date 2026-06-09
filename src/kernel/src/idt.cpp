@@ -1365,10 +1365,19 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
             for (int i = 0; i < 512; ++i) {
                 uint64_t slotVA = ef->rsp + static_cast<uint64_t>(i) * 8;
                 uint64_t v = readUser64(slotVA);
-                if ((v >> 32) == 0xDFDFDFDFULL || (v & 0xFFFFFFFFULL) == 0xDFDFDFDFULL) {
+                // BRO-179: match the 0xDFDF marker in the high 16 bits of either
+                // 32-bit half — catches BOTH the plain 0xDFDFDFDF poison and the
+                // PID/seq-encoded forensic poison (0xDFDF<pid>_DFDF<seq>).
+                bool isPoison = ((v >> 48) == 0xDFDFULL) ||
+                                (((v >> 16) & 0xFFFFULL) == 0xDFDFULL);
+                if (isPoison) {
                     uint64_t pageVA = slotVA & ~0xFFFULL;
                     if (pageVA != lastPoisonVA) {
                         describePoisonFrame("STACK-POISON", slotVA);
+                        // Lock-free decode: name the kfree (pid + callstack) that
+                        // wrote this poison. HeapDecodePoison only reads static
+                        // rings (no g_pmmLock), safe with APs halted at IF=0.
+                        brook::HeapDecodePoison(v);
                         lastPoisonVA = pageVA;
                         if (!poisonPhys) poisonPhys = vaToPhys(slotVA) & ~0xFFFULL;
                     }
