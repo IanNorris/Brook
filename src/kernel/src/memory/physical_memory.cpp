@@ -1084,7 +1084,18 @@ static int PmmDumpFreeLogLocked(uint64_t phys)
         FlRawStr(" "); FlRawStr(r.op < 4 ? opName[r.op] : "?");
         FlRawStr(" ->count="); FlRawDec(r.count);
         FlRawStr(" pid="); FlRawDec(r.ownerPid);
-        FlRawStr(" "); FlRawStr(r.site);
+        // r.site is a string literal in kernel .rodata. The fault-context
+        // (no-lock) caller can race a writer mid-update, so validate the pointer
+        // is in kernel range before dereferencing it — a torn read must never
+        // send FlRawStr off into unmapped memory (nested fault).
+        {
+            uint64_t sp = reinterpret_cast<uint64_t>(r.site);
+            FlRawStr(" ");
+            if (sp >= 0xffffffff80000000ULL)
+                FlRawStr(r.site);
+            else
+                FlRawStr("<site?>");
+        }
         FlRawChar('\n');
         // BRO-179: the dynamic callstack of this alloc/free, symbolized — names
         // WHO performed the operation (the cheap mapCount counters can't).
@@ -1162,6 +1173,23 @@ extern "C" int PmmDumpFreeLog(uint64_t phys)
     int found = PmmDumpFreeLogLocked(phys);
     IrqSpinLockRelease(&g_pmmLock, pmmFlags);
     return found;
+}
+
+// BRO-179 fault-context reflog dump. Does NOT take g_pmmLock: an exception
+// handler runs at IF=0, and after SmpHaltAllAPs a remote CPU may have been
+// halted while holding g_pmmLock — taking it here would deadlock. Caller MUST
+// guarantee all other CPUs are halted (one-shot crash dump). The ring read is
+// racy in theory but the records for a frame freed before the fault are stable.
+extern "C" int PmmDumpFreeLogNoLock(uint64_t phys)
+{
+    return PmmDumpFreeLogLocked(phys);
+}
+
+// Fault-context poison decode (no g_pmmLock; APs halted). Same contract as
+// PmmDumpFreeLogNoLock.
+extern "C" bool PmmDecodePoisonNoLock(uint64_t qword)
+{
+    return PmmDecodePoisonLocked(qword);
 }
 
 void PmmKillPid(uint16_t pid)

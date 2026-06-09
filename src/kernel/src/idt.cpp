@@ -214,6 +214,8 @@ extern "C" void PmmDescribe(uint64_t phys, uint32_t* used, uint32_t* refCount,
                             uint32_t* mapCount, uint32_t* tag, uint32_t* ownerPid);
 extern "C" void ProcessDumpFrameMappers(uint64_t targetPhys);  // BRO-179 (scheduler.cpp)
 extern "C" bool PmmDecodePoison(uint64_t qword);  // BRO-179 forensic (physical_memory.cpp)
+extern "C" int  PmmDumpFreeLogNoLock(uint64_t phys);   // BRO-179 fault-context (no g_pmmLock)
+extern "C" bool PmmDecodePoisonNoLock(uint64_t qword); // BRO-179 fault-context (no g_pmmLock)
 
 static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t errorCode, bool hasErrorCode, bool swapgsDone = false)
 {
@@ -1349,12 +1351,16 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                 ExcPutsRaw(" VA="); ExcPutHex(uva);
                 ExcPutsRaw(" phys="); ExcPutHex(phys & ~0xFFFULL);
                 ExcPutsRaw(phys ? "\n" : " (unmapped)\n");
-                // NOTE: deliberately does NOT call PmmDescribe / PmmDumpFreeLog
-                // here. Those take g_pmmLock / g_procFreeLogLock, and this runs
-                // in the exception handler with IF=0; a CPU spinning for
-                // g_pmmLock while another CPU waits on a TLB-shootdown IPI ack
-                // from THIS (faulted) CPU deadlocks the machine (observed: VM
-                // hung mid-sweep). VA->phys is a lock-free direct-map page walk.
+                // BRO-179: dump this frame's PMM alloc/free history (with the
+                // symbolized callstacks) so we see its cross-domain transition
+                // (e.g. freed by pid X via path A, then handed to this process)
+                // EVEN when the corruption is non-poison data and the co-owner
+                // mapping has already gone — the historical reflog survives.
+                // Lock-free (no g_pmmLock): safe only because all APs are halted
+                // here (SmpHaltAllAPs above); taking the lock at IF=0 could
+                // deadlock against an AP halted mid-critical-section.
+                if (phys)
+                    PmmDumpFreeLogNoLock(phys & ~0xFFFULL);
             };
             // Always describe the frame backing the faulting stack pointer.
             describePoisonFrame("RSP", ef->rsp);
