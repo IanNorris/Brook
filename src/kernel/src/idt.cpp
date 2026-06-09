@@ -212,6 +212,7 @@ extern "C" int PmmDumpFreeLog(uint64_t phys);  // BRO-176 diag (physical_memory.
 extern "C" void PmmDescribe(uint64_t phys, uint32_t* used, uint32_t* refCount,
                             uint32_t* mapCount, uint32_t* tag, uint32_t* ownerPid);
 extern "C" void ProcessDumpFrameMappers(uint64_t targetPhys);  // BRO-179 (scheduler.cpp)
+extern "C" bool PmmDecodePoison(uint64_t qword);  // BRO-179 forensic (physical_memory.cpp)
 
 static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t errorCode, bool hasErrorCode, bool swapgsDone = false)
 {
@@ -1022,6 +1023,15 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                 uint32_t fidx = static_cast<uint32_t>((cr2val & 0xFFF) / 8);
                 ExcPutsRaw("  faulting entry["); ExcPutHex(fidx);
                 ExcPutsRaw("] = "); ExcPutHex(frame[fidx]); ExcPutsRaw("\n");
+
+                // BRO-179 forensic: if any of these qwords carries the 0xDFDF
+                // poison marker, decode the ORIGINAL owner PID + free-seq and
+                // dump that frame's alloc/free callstack history — the
+                // corruption names the frame's previous life and who freed it.
+                ExcPutsRaw("  [BRO179 poison decode of corrupt qwords]\n");
+                for (uint32_t q = 0; q < 8; q++)
+                    PmmDecodePoison(frame[q]);
+                PmmDecodePoison(frame[fidx]);
             }
             // These RSVD/corrupt-table faults make the QR renderer re-fault
             // (it walks memory through the same corrupt tables) — that nested

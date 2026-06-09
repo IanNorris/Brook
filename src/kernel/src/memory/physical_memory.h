@@ -121,4 +121,9 @@ uint64_t PmmGetTotalPageCount();
 // it drains them through an all-CPU TLB barrier.
 void PmmStartDrainThread();
 
+// BRO-179 forensic: decode a poison qword (0xDFDF-marked) seen at a crash site
+// into the original owner PID + free-seq and dump that frame's alloc/free
+// callstack history. Returns true if the qword carried the poison marker.
+extern "C" bool PmmDecodePoison(uint64_t qword);
+
 } // namespace brook

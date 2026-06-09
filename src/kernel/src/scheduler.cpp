@@ -445,6 +445,12 @@ static void ReadyQueueInsertLocked(Process* proc)
         for (int w = 0; w < 8; ++w)
             SerialPrintf("            [%p+0x%x] = 0x%lx\n",
                          (void*)proc, w * 8, raw[w]);
+        // BRO-179 forensic: if any struct word carries the 0xDFDF poison marker,
+        // decode the frame's ORIGINAL owner PID + free-seq and dump its alloc/
+        // free callstack history — naming whose freed frame was reused as this
+        // Process struct (the cross-domain SIG1 culprit).
+        for (int w = 0; w < 8; ++w)
+            PmmDecodePoison(raw[w]);
         // BRO-176: was this exact Process* recently freed? If so, name the free
         // site — that is the premature-free path (signature 2).
         if (ProcessDumpFreeLog((void*)proc) == 0)

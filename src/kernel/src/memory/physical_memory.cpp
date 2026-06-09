@@ -2,6 +2,8 @@
 #include "serial.h"
 #include "spinlock.h"
 #include "portio.h"
+#include "../memory/virtual_memory.h"  // PhysToVirt (direct map) for frame poison
+#include "../ksym_addrs.h"             // KsymFindByAddr for callstack symbolization
 
 // Forward-declared to avoid circular headers.
 namespace brook {
@@ -60,7 +62,18 @@ enum : uint8_t {
     REFOP_DEC   = 2,   // PmmUnrefPage/Free/Kill decremented (still shared)
     REFOP_FREE  = 3,   // actually freed (refcount hit 0)
 };
-struct FreeRec { uint64_t phys; uint32_t seq; uint16_t ownerPid; uint8_t op; uint8_t count; const char* site; };
+// BRO-179 forensic provenance: each reflog record also carries a bounded kernel
+// callstack (RBP frame-chain return addresses) so a frame's history names the
+// DYNAMIC caller of each alloc/free, not just a static `site` label. The cheap
+// O(1) mapCount counters can be defeated by the very accounting bug we hunt
+// (they read 0 when a PTE is actually live); ground-truth callstacks cannot.
+static constexpr uint8_t REFLOG_STACK_DEPTH = 6;
+struct FreeRec {
+    uint64_t phys; uint32_t seq; uint16_t ownerPid; uint8_t op; uint8_t count;
+    const char* site;
+    uint64_t stack[REFLOG_STACK_DEPTH];   // [0]=leaf caller .. via RBP chain
+    uint8_t  stackDepth;
+};
 // BRO-179: logging ALL alloc/free tags (not just User) ~triples record volume,
 // so a frame's cross-domain history is held for a shorter seq window than the
 // old User-only log — but recent kernel use of a frame (the SIG1 gap) still
@@ -71,13 +84,46 @@ static FreeRec  g_freeLog[FREELOG_SIZE];
 static uint32_t g_freeLogSeq = 0;
 static bool     g_freeLogOn  = false;
 
+// Walk the caller's RBP frame chain and capture up to `max` return addresses
+// into `out`. Bounded, lock-free, no allocation — safe under g_pmmLock. Mirrors
+// the profiler's kernel-stack walk (profiler.cpp). `startRbp` is the frame
+// pointer to begin from (the caller passes __builtin_frame_address(0)).
+static inline uint8_t CaptureKernelStack(uint64_t startRbp, uint64_t* out, uint8_t max)
+{
+    constexpr uint64_t KBASE = 0xffffffff80000000ULL;
+    constexpr uint64_t KEND  = 0xffffffffffffffffULL;
+    uint64_t rbp = startRbp;
+    uint8_t depth = 0;
+    while (depth < max)
+    {
+        if (rbp < KBASE || rbp >= KEND - 16 || (rbp & 7) != 0) break;
+        const uint64_t* frame = reinterpret_cast<const uint64_t*>(rbp);
+        uint64_t retAddr = frame[1];
+        if (retAddr < KBASE || retAddr >= KEND) break;
+        out[depth++] = retAddr;
+        uint64_t nextRbp = frame[0];
+        if (nextRbp <= rbp) break;   // stack grows down; prevent loops
+        rbp = nextRbp;
+    }
+    return depth;
+}
+
 // Caller MUST hold g_pmmLock.
 static inline void RefLogRecord(uint64_t phys, uint16_t ownerPid, uint8_t op,
                                 uint8_t count, const char* site)
 {
     if (!g_freeLogOn) return;
     uint32_t i = g_freeLogSeq & (FREELOG_SIZE - 1);
-    g_freeLog[i] = { phys & ~0xFFFULL, ++g_freeLogSeq, ownerPid, op, count, site };
+    FreeRec& r = g_freeLog[i];
+    r.phys = phys & ~0xFFFULL;
+    r.seq = ++g_freeLogSeq;
+    r.ownerPid = ownerPid;
+    r.op = op;
+    r.count = count;
+    r.site = site;
+    r.stackDepth = CaptureKernelStack(
+        reinterpret_cast<uint64_t>(__builtin_frame_address(0)),
+        r.stack, REFLOG_STACK_DEPTH);
 }
 // Back-compat shim for the existing free sites (op=FREE, count=0).
 static inline void FreeLogRecord(uint64_t phys, uint16_t ownerPid, const char* site)
@@ -301,6 +347,34 @@ static bool     g_quarantineOn = true;    // false = immediate release (A/B test
 #endif
 static volatile bool g_quarDrainWanted = false;
 
+// BRO-179 forensic frame poison. When enabled, a frame that is actually freed is
+// filled with a pattern that (a) keeps the recognizable 0xDFDF marker in the high
+// 16 bits of EVERY 32-bit word — so existing 0xDFDF detectors/greps still fire —
+// and (b) encodes, in the low 16 bits, the frame's ORIGINAL owner PID and the
+// reflog sequence of its free, alternating word by word. A 64-bit field of a
+// frame wrongly reused while still mapped then reads e.g. 0xDFDF1A2C_DFDF0005,
+// decoding to "owner pid=5, free-seq=0x1A2C" — the corruption names its origin.
+// Gated (diagnostic, ~4KiB write per free); off by default in production.
+static bool g_framePoisonOn = false;
+static constexpr uint32_t POISON_MARK = 0xDFDF0000u;
+
+// Caller MUST hold g_pmmLock. Fill a freed RAM frame with the PID/seq-encoded
+// pattern via the direct map. `ownerPid` is the frame's owner at free time;
+// `seq` is the reflog sequence of this free (0 if reflog disabled).
+static inline void PoisonFrameLocked(uint32_t idx, uint16_t ownerPid, uint32_t seq)
+{
+    if (!g_framePoisonOn) return;
+    uint32_t* p = reinterpret_cast<uint32_t*>(
+        PhysToVirt(PhysicalAddress(static_cast<uint64_t>(idx) * PAGE_SIZE)).raw());
+    const uint32_t wpid = POISON_MARK | (ownerPid & 0xFFFFu);
+    const uint32_t wseq = POISON_MARK | (seq & 0xFFFFu);
+    for (uint32_t i = 0; i < PAGE_SIZE / 4; i += 2)
+    {
+        p[i]     = wpid;
+        p[i + 1] = wseq;
+    }
+}
+
 #ifndef BROOK_HOST_TEST
 // Private batch the drain thread snapshots into (only the drainer touches it).
 static uint32_t g_drainBatch[QUAR_CAP];
@@ -316,8 +390,11 @@ static inline void ReleaseFrameLocked(uint32_t idx)
 
 // Caller MUST hold g_pmmLock. Retire a frame that reached refcount 0 (descriptor
 // already reset). Queue it for the TLB-barrier drain instead of releasing it.
-static inline void RetireFrameLocked(uint32_t idx)
+// `ownerPid` is the frame's owner captured BEFORE the descriptor reset, used to
+// stamp the forensic poison (the "thing that owned it originally").
+static inline void RetireFrameLocked(uint32_t idx, uint16_t ownerPid)
 {
+    PoisonFrameLocked(idx, ownerPid, g_freeLogSeq);
     if (!g_quarantineOn)
     {
         ReleaseFrameLocked(idx);
@@ -613,9 +690,11 @@ void PmmFreePage(PhysicalAddress physAddr)
         return;
     }
 
+    uint16_t freedOwnerPid = KernelPid;
     if (g_pageDescs)
     {
         PageDescriptor& d = Desc(static_cast<uint32_t>(idx));
+        freedOwnerPid = d.pid;
         MapLeakCheckLocked(static_cast<uint32_t>(idx), "PmmFreePage");
         // BRO-179: log frees of ALL tags (not just User) so the trail shows
         // kernel-domain (Heap/PageTable/KData) frees too — the cross-domain
@@ -635,7 +714,7 @@ void PmmFreePage(PhysicalAddress physAddr)
 
     // Retire (quarantine then release the oldest) — defers reuse so a stale TLB
     // entry for this frame is gone before it is handed to a new owner.
-    RetireFrameLocked(static_cast<uint32_t>(idx));
+    RetireFrameLocked(static_cast<uint32_t>(idx), freedOwnerPid);
 
     IrqSpinLockRelease(&g_pmmLock, pmmFlags);
 }
@@ -756,6 +835,7 @@ void PmmUnrefPage(PhysicalAddress physAddr)
     }
     // refCount is 0 or 1 — this was the last (or only) reference, actually free
     bool retire = false;
+    uint16_t freedOwnerPid = d.pid;
     if (IsUsed(idx))
     {
         MapLeakCheckLocked(idx, "PmmUnrefPage");
@@ -769,27 +849,37 @@ void PmmUnrefPage(PhysicalAddress physAddr)
     // Quarantine the frame (defer reuse) instead of releasing it immediately,
     // so a stale TLB entry is gone before the frame is handed to a new owner.
     if (retire)
-        RetireFrameLocked(idx);
+        RetireFrameLocked(idx, freedOwnerPid);
     IrqSpinLockRelease(&g_pmmLock, pmmFlags);
 }
 
-// BRO-176 stale-mapping detector ------------------------------------------------
+// BRO-176/179 stale-mapping detector --------------------------------------------
 // Called at an ACTUAL free (refCount reached 0) while holding g_pmmLock. If a
-// User frame is freed while a present USER PTE still maps it (mapCount != 0), the
+// frame is freed while a present USER PTE still maps it (mapCount != 0), the
 // mapping outlived its reference — the BRO-176 stale-mapping bug. Name it
 // red-handed, at the instant of the erroneous free, with its full ref/unref
 // trail, BEFORE the page is recycled and poison is ever read.
+//
+// BRO-179: this checks ALL tags, not just User. mapCount only counts USER PTEs
+// (PmmMapInc/Dec fire on user-PTE install/remove), so a NON-User frame (e.g.
+// Heap — the observed SIG1 victim is a Process struct in a Heap frame) with
+// mapCount != 0 means that frame is simultaneously a kernel object AND user-
+// mapped: the cross-domain double-ownership we are hunting. The old User-only
+// guard structurally skipped exactly the frame that got corrupted.
 static inline void MapLeakCheckLocked(uint32_t idx, const char* site)
 {
     PageDescriptor& d = Desc(idx);
-    if (d.tag != static_cast<uint8_t>(MemTag::User)) return;
     uint16_t mc = __atomic_load_n(&d.mapCount, __ATOMIC_RELAXED);
     if (mc != 0)
     {
+        static const char* kTagName[8] = {
+            "Free","KCode","KData","PageTable","Heap","Device","User","System" };
         SerialPrintf("BRO176-MAPLEAK: phys=0x%lx FREED via %s with mapCount=%u still "
-                     "mapped (owner pid=%u refCount=%u) — PTE outlived its reference!\n",
+                     "mapped (owner pid=%u tag=%s refCount=%u) — PTE outlived its "
+                     "reference (cross-domain if tag!=User)!\n",
                      static_cast<uint64_t>(idx) * PAGE_SIZE, site, (unsigned)mc,
-                     (unsigned)d.pid, (unsigned)d.refCount);
+                     (unsigned)d.pid, d.tag < 8 ? kTagName[d.tag] : "?",
+                     (unsigned)d.refCount);
         PmmDumpFreeLogLocked(static_cast<uint64_t>(idx) * PAGE_SIZE);
     }
 }
@@ -909,22 +999,22 @@ void PmmEnableTracking()
                  usedCount, freeCount,
                  static_cast<uint32_t>(g_totalPages * sizeof(PageDescriptor) / 1024));
 
-    // BRO-179: PMM reflog DISABLED for the quarantine throughput/stress test.
-    // The reflog does a ring write under g_pmmLock on every alloc/free; turning
-    // it off maximizes fork/exit throughput (64-CPU worst-case), which makes
-    // frames cycle through the quarantine FASTER — the shortest wall-clock grace
-    // period and thus the hardest test of the rate-based stopgap. It also drops
-    // the per-free serial cost. (Re-enable to ON when diagnosing the leak again;
-    // empirically the reflog also provides the race's timing window, so leaving
-    // it OFF is the genuine worst case for proving the quarantine holds.)
-    g_freeLogOn = false;
+    // BRO-179 FORENSIC HUNT MODE. The TLB barrier is validated; we are now
+    // hunting the RESIDUAL leak (a frame reused while still mapped, which no
+    // barrier can fix). Turn the reflog ON so every alloc/free records its
+    // dynamic callstack + owner PID, and frame-poison ON so a reused frame's
+    // bytes encode the original owner PID + free-seq. The next repro then names
+    // the culprit instead of being another Heisenbug. (Set both to false to
+    // restore the maximum-throughput configuration used to stress the barrier.)
+    g_freeLogOn = true;
+    g_framePoisonOn = true;
 
     // BRO-179 stress-test: silence the high-frequency hot-path serial logs
     // (TLB-shootdown forgiveness, per-execve PROFILE, compositor stats). At
     // 64 CPUs these per-operation prints throttle fork/exit throughput to
     // serial speed (~11 KB/s); silencing them lets the quarantine stress run
-    // at real speed. Co-located here with g_freeLogOn so the stress toggles
-    // live in one place. (Revert to false to restore verbose diagnostics.)
+    // at real speed. Kept ON in forensic mode too — the reflog/poison provenance
+    // is captured in-memory and only printed at a fault, so it does not throttle.
     g_hotLogQuiet = true;
 }
 
@@ -991,9 +1081,74 @@ static int PmmDumpFreeLogLocked(uint64_t phys)
         FlRawStr(" pid="); FlRawDec(r.ownerPid);
         FlRawStr(" "); FlRawStr(r.site);
         FlRawChar('\n');
+        // BRO-179: the dynamic callstack of this alloc/free, symbolized — names
+        // WHO performed the operation (the cheap mapCount counters can't).
+        for (uint8_t s = 0; s < r.stackDepth; ++s)
+        {
+            FlRawStr("      #"); FlRawDec(s); FlRawStr(" ");
+            FlRawHex(r.stack[s]);
+            const char* nm = nullptr; uint64_t off = 0;
+#ifndef BROOK_HOST_TEST
+            if (KsymFindByAddr(r.stack[s], &nm, &off) && nm)
+            {
+                FlRawStr("  "); FlRawStr(nm); FlRawStr("+0x"); FlRawHex(off);
+            }
+#else
+            (void)nm; (void)off;
+#endif
+            FlRawChar('\n');
+        }
         ++found;
     }
     return found;
+}
+
+// BRO-179: decode a forensic-poison qword seen at a crime scene. If either 32-bit
+// half carries the 0xDFDF marker, print the embedded owner PID / free-seq and
+// dump that frame's full provenance. `addrParity` (bit 3 of the field's address,
+// i.e. which 8-byte slot) disambiguates which half is pid vs seq when known;
+// pass UINT32_MAX if unknown (both interpretations are printed). Caller must hold
+// g_pmmLock (it calls PmmDumpFreeLogLocked).
+static bool PmmDecodePoisonLocked(uint64_t qword)
+{
+    uint32_t lo = static_cast<uint32_t>(qword & 0xFFFFFFFFu);
+    uint32_t hi = static_cast<uint32_t>(qword >> 32);
+    bool loMark = (lo & 0xFFFF0000u) == POISON_MARK;
+    bool hiMark = (hi & 0xFFFF0000u) == POISON_MARK;
+    if (!loMark && !hiMark) return false;
+    // Frame fill is [pid, seq, pid, seq, ...] in ascending words, so the lower-
+    // addressed 32-bit half is the PID and the higher is the SEQ.
+    uint16_t pid = static_cast<uint16_t>(lo & 0xFFFFu);
+    uint16_t seq = static_cast<uint16_t>(hi & 0xFFFFu);
+    FlRawStr("  BRO179-POISON-DECODE qword="); FlRawHex(qword);
+    FlRawStr(" -> owner pid="); FlRawDec(pid);
+    FlRawStr(" free-seq(low16)="); FlRawHex(seq);
+    FlRawChar('\n');
+    // Find the matching free record by its low-16 seq and dump that frame's
+    // history (which names the exact alloc/free callstacks).
+    uint32_t scan = (g_freeLogSeq < FREELOG_SIZE) ? g_freeLogSeq : FREELOG_SIZE;
+    for (uint32_t n = 1; n <= scan; ++n)
+    {
+        uint32_t i = (g_freeLogSeq - n) & (FREELOG_SIZE - 1);
+        FreeRec& r = g_freeLog[i];
+        if ((r.seq & 0xFFFFu) == seq && r.ownerPid == pid && r.site)
+        {
+            FlRawStr("  BRO179-POISON matches reflog seq="); FlRawDec(r.seq);
+            FlRawStr(" phys="); FlRawHex(r.phys); FlRawChar('\n');
+            PmmDumpFreeLogLocked(r.phys);
+            return true;
+        }
+    }
+    FlRawStr("  BRO179-POISON: no live reflog record for that seq (ring wrapped)\n");
+    return true;
+}
+
+extern "C" bool PmmDecodePoison(uint64_t qword)
+{
+    uint64_t pmmFlags = IrqSpinLockAcquire(&g_pmmLock);
+    bool decoded = PmmDecodePoisonLocked(qword);
+    IrqSpinLockRelease(&g_pmmLock, pmmFlags);
+    return decoded;
 }
 
 extern "C" int PmmDumpFreeLog(uint64_t phys)
@@ -1043,7 +1198,7 @@ void PmmKillPid(uint16_t pid)
             Desc(idx) = { PMM_NULL_PAGE, PMM_NULL_PAGE, 0,
                           static_cast<uint8_t>(MemTag::Free), 0, 0 };
             if (retire)
-                RetireFrameLocked(idx);
+                RetireFrameLocked(idx, pid);
         }
         count++;
 
@@ -1089,7 +1244,7 @@ void PmmFreeByTag(uint16_t pid, MemTag tag)
             // Free the page (via quarantine)
             Desc(idx) = { PMM_NULL_PAGE, PMM_NULL_PAGE, 0,
                           static_cast<uint8_t>(MemTag::Free), 0, 0 };
-            RetireFrameLocked(idx);
+            RetireFrameLocked(idx, pid);
             count++;
         }
 
