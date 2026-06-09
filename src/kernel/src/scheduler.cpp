@@ -41,6 +41,8 @@ namespace brook { void SwitchToUserMode(uint64_t userRsp, uint64_t userRip); }
 
 namespace brook {
 
+extern "C" int ProcessDumpFreeLog(void* ptr);  // BRO-176 diag (process.cpp)
+
 // ---------------------------------------------------------------------------
 // Interrupt-safe spinlock for scheduler
 // ---------------------------------------------------------------------------
@@ -89,6 +91,21 @@ static inline void SchedLockRelease(SchedLock& lock, uint64_t savedFlags)
     __atomic_fetch_add(&lock.serving, 1, __ATOMIC_RELEASE);
     if (savedFlags & 0x200)
         __asm__ volatile("sti" ::: "memory");
+}
+
+// Release the lock WITHOUT touching RFLAGS.IF. Used by the held-across-pick
+// dispatch path (DoSwitch): the scheduler decision holds g_readyLock with IF=0
+// from PickNextLocked through the runningOnCpu claim, then drops the lock here
+// immediately before context_switch — IF must stay 0 across the switch (the
+// resumed thread restores its own IF), exactly as the pre-existing commit path
+// did. This closes the BRO-176 lost-enqueue window: previously the lock was
+// released (re-enabling IF) BEFORE DoSwitch's claim, leaving a gap in which
+// (a) the picked proc was out of the ready queue but not yet claimed, and
+// (b) a timer could divert this CPU. Both vanish when pick+claim are one
+// IF=0 critical section.
+static inline void SchedLockReleaseRaw(SchedLock& lock)
+{
+    __atomic_fetch_add(&lock.serving, 1, __ATOMIC_RELEASE);
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +209,83 @@ static Process* g_allProcesses[MAX_PROCESSES] = {};
 static uint32_t g_processCount = 0;
 static SchedLock g_allProcLock;
 
+// BRO-179: reverse-map diagnostic. Given a physical frame, scan EVERY live
+// process's user page table (PML4[0..255]) for a present leaf PTE that still
+// maps it, and print pid + VA + flags. Authoritative (unlike PMM mapCount,
+// which is decoupled from actual PTE teardown). Intended to be called ONLY from
+// the RSVD-#PF panic path, where all APs are already halted — so it does NOT
+// take g_allProcLock (the owner CPU may hold it) and reads page tables straight
+// through the direct map. Every table pointer is range-checked so a corrupt
+// entry cannot fault the walker itself. Reports the leaking mapper behind the
+// freed-while-mapped frame recycling (SIG1 root).
+extern "C" void ProcessDumpFrameMappers(uint64_t targetPhys)
+{
+    constexpr uint64_t PHYS_MASK = 0x000FFFFFFFFFF000ULL; // PTE physical-address bits
+    targetPhys &= ~0xFFFULL;
+    // Bound: physical frames live below the top of installed RAM. Use the
+    // direct-map window as a sanity ceiling (anything mapped is < 0x4000_0000_0000).
+    auto physOk = [](uint64_t p) -> bool {
+        return p != 0 && p < 0x0000400000000000ULL; // 64 TiB ceiling, generous
+    };
+    auto tbl = [](uint64_t physTable) -> const uint64_t* {
+        return reinterpret_cast<const uint64_t*>(DIRECT_MAP_BASE + physTable);
+    };
+
+    SerialPrintf("  --- BRO179 reverse-map: who maps phys 0x%lx? ---\n", targetPhys);
+    uint32_t hits = 0;
+    uint32_t n = g_processCount;
+    if (n > MAX_PROCESSES) n = MAX_PROCESSES;
+    for (uint32_t pi = 0; pi < n && hits < 32; ++pi)
+    {
+        Process* p = g_allProcesses[pi];
+        if (!p || p->magic != PROCESS_MAGIC) continue;
+        uint64_t pml4Phys = p->pageTable.pml4.raw();
+        if (!physOk(pml4Phys)) continue;
+        const uint64_t* pml4 = tbl(pml4Phys);
+
+        for (uint64_t i4 = 0; i4 < 256 && hits < 32; ++i4) // user half only
+        {
+            uint64_t e4 = pml4[i4];
+            if (!(e4 & VMM_PRESENT)) continue;
+            uint64_t pdptPhys = e4 & PHYS_MASK;
+            if (!physOk(pdptPhys)) continue;
+            const uint64_t* pdpt = tbl(pdptPhys);
+            for (uint64_t i3 = 0; i3 < 512 && hits < 32; ++i3)
+            {
+                uint64_t e3 = pdpt[i3];
+                if (!(e3 & VMM_PRESENT) || (e3 & (1ULL << 7))) continue; // skip 1G
+                uint64_t pdPhys = e3 & PHYS_MASK;
+                if (!physOk(pdPhys)) continue;
+                const uint64_t* pd = tbl(pdPhys);
+                for (uint64_t i2 = 0; i2 < 512 && hits < 32; ++i2)
+                {
+                    uint64_t e2 = pd[i2];
+                    if (!(e2 & VMM_PRESENT) || (e2 & (1ULL << 7))) continue; // skip 2M
+                    uint64_t ptPhys = e2 & PHYS_MASK;
+                    if (!physOk(ptPhys)) continue;
+                    const uint64_t* pt = tbl(ptPhys);
+                    for (uint64_t i1 = 0; i1 < 512 && hits < 32; ++i1)
+                    {
+                        uint64_t e1 = pt[i1];
+                        if (!(e1 & VMM_PRESENT)) continue;
+                        if ((e1 & PHYS_MASK) != targetPhys) continue;
+                        uint64_t va = (i4 << 39) | (i3 << 30) | (i2 << 21) | (i1 << 12);
+                        SerialPrintf("    MAPPER pid=%u va=0x%lx pte=0x%lx (W=%d U=%d COW-pid=%lu)\n",
+                                     (unsigned)p->pid, va, e1,
+                                     (int)((e1 >> 1) & 1), (int)((e1 >> 2) & 1),
+                                     (e1 & PTE_PID_MASK) >> PTE_PID_SHIFT);
+                        ++hits;
+                    }
+                }
+            }
+        }
+    }
+    if (hits == 0)
+        SerialPrintf("    (no live user PTE maps this frame — stale-TLB-only write,"
+                     " or mapper already torn down)\n");
+    SerialPrintf("  --- end reverse-map (%u mapper PTE(s)) ---\n", hits);
+}
+
 // Next PID to allocate.
 static uint16_t g_nextPid = 1;
 
@@ -205,6 +299,69 @@ static SchedLock g_pidLock;
 
 // Guard: timer ticks are ignored until SchedulerStart sets this.
 static volatile bool g_schedulerRunning = false;
+
+// ---------------------------------------------------------------------------
+// BRO-176 DIAGNOSTIC: asLiveThreads inc/dec ring.
+// Records every asLiveThreads increment (SchedulerAddProcess) and decrement
+// attempt (ProcessDestroy), including decrements SKIPPED by the incarnation
+// guard — the prime suspect for a leaked count that wedges a Terminated leader
+// permanently unreaped (the reap-stall hang). Dumped by SchedulerDumpHang
+// (Ctrl+F12) and on demand. Lock-free (atomic seq), like the PMM free-log.
+// TEMPORARY — strip with the rest of the BRO-176 instrumentation.
+// ---------------------------------------------------------------------------
+struct AsLiveEvent {
+    uint64_t seq;
+    void*    leader;        // leader Process* the op targeted
+    uint16_t actingPid;     // the thread/proc whose lifecycle drove the op
+    uint16_t leaderPid;
+    uint32_t leaderIncarn;  // leader->incarnation at op time
+    uint32_t procLeaderIncarn; // proc->leaderIncarnation (decrement guard key)
+    int32_t  result;        // resulting asLiveThreads value
+    uint8_t  op;            // 0=inc, 1=dec-applied, 2=dec-SKIPPED(mismatch), 3=dec-bad-leader
+};
+static constexpr uint32_t ASLIVE_RING_SIZE = 4096;
+static AsLiveEvent g_asLiveRing[ASLIVE_RING_SIZE];
+static volatile uint64_t g_asLiveSeq = 0;
+
+extern "C" void SchedulerRecordAsLive(void* leader, uint16_t actingPid, uint16_t leaderPid,
+                                      uint32_t leaderIncarn, uint32_t procLeaderIncarn,
+                                      int32_t result, uint8_t op)
+{
+    uint64_t s = __atomic_fetch_add(&g_asLiveSeq, 1, __ATOMIC_RELAXED);
+    AsLiveEvent& e = g_asLiveRing[s & (ASLIVE_RING_SIZE - 1)];
+    e.seq = s; e.leader = leader; e.actingPid = actingPid; e.leaderPid = leaderPid;
+    e.leaderIncarn = leaderIncarn; e.procLeaderIncarn = procLeaderIncarn;
+    e.result = result; e.op = op;
+}
+
+// BRO-176 diagnostic: dump the asLiveThreads inc/dec history for one leader
+// (by pointer), so a leaked count's unmatched increment is visible. Lock-free
+// read (best-effort during a hang). op: 0=inc 1=dec 2=dec-SKIPPED 3=dec-badleader.
+static void DumpAsLiveHistory(void* leader)
+{
+    auto puts = [](const char* str){ if (str) while (*str) SerialPutChar(*str++); };
+    auto dec = [](int64_t v){ if(v<0){SerialPutChar('-');v=-v;} char b[20]; int i=0;
+        if(!v)b[i++]='0'; while(v){b[i++]=(char)('0'+v%10);v/=10;} while(i)SerialPutChar(b[--i]); };
+    const char* opName[4] = { "INC      ", "DEC      ", "DEC-SKIP ", "DEC-BADLDR" };
+    uint64_t total = g_asLiveSeq;
+    uint64_t start = (total > ASLIVE_RING_SIZE) ? (total - ASLIVE_RING_SIZE) : 0;
+    int shown = 0;
+    for (uint64_t s = start; s < total; ++s)
+    {
+        AsLiveEvent& e = g_asLiveRing[s & (ASLIVE_RING_SIZE - 1)];
+        if (e.leader != leader) continue;
+        puts("      asLive["); dec((int64_t)e.seq); puts("] ");
+        puts(e.op < 4 ? opName[e.op] : "?");
+        puts(" actingPid="); dec(e.actingPid);
+        puts(" ldrPid="); dec(e.leaderPid);
+        puts(" ldrIncarn="); dec(e.leaderIncarn);
+        puts(" procLdrIncarn="); dec(e.procLeaderIncarn);
+        puts(" -> count="); dec(e.result);
+        SerialPutChar('\n');
+        if (++shown >= 64) { puts("      ...(truncated)\n"); break; }
+    }
+    if (shown == 0) puts("      (no asLiveThreads events recorded for this leader)\n");
+}
 
 // Cumulative stats (for /proc/stat)
 static volatile uint64_t g_totalForks = 0;
@@ -228,6 +385,37 @@ static constexpr uint64_t LOAD_SAMPLE_INTERVAL = 5000; // 5 seconds in ms ticks
 // Caller must hold g_readyLock.
 // ---------------------------------------------------------------------------
 
+// BRO-176 lost-enqueue diagnostic: scheduler-event trace sites.
+enum SchedTraceSite : uint8_t {
+    STR_ENQUEUE = 1,       // ReadyQueueInsertLocked → policy Enqueue
+    STR_REMOVE,            // ReadyQueueRemoveLocked → policy Remove
+    STR_READY_UNBLOCK,     // SchedulerUnblock set state=Ready + enqueue
+    STR_UNBLOCK_DEFER_RR,  // SchedulerUnblock: state already Running/Ready → pendingWakeup
+    STR_UNBLOCK_DEFER_CPU, // SchedulerUnblock: Blocked but runningOnCpu!=-1 → pendingWakeup
+    STR_BLOCK,             // SchedulerBlock set state=Blocked
+    STR_BLOCK_SKIP,        // SchedulerBlock early-return on pendingWakeup
+    STR_READY_PREEMPT,     // SchedulerPreempt set state=Ready (requeueOld)
+    STR_READY_YIELD,       // SchedulerYield set state=Ready (requeue)
+    STR_REQUEUE_ENQ,       // DrainPostSwitch requeued (state==Ready → enqueue)
+    STR_REQUEUE_SKIP,      // DrainPostSwitch saw pendingRequeue but state!=Ready
+    STR_RUN,               // DoSwitch set state=Running
+    STR_PICK_RETURN,       // 13: PickNextLocked about to RETURN proc to DoSwitch
+    STR_PICK_SKIP_RUN,     // 14: PickNextLocked skipped proc (runningOnCpu!=-1) + raw re-enqueue
+    STR_DS_BAIL_ENQ,       // 15: DoSwitch double-schedule bail re-enqueued newProc (Ready)
+    STR_DS_BAIL_SKIP,      // 16: DoSwitch double-schedule bail, newProc state!=Ready (no enq)
+    STR_REMOVE_PROC,       // 17: SchedulerRemoveProcess removed proc (destroy)
+};
+
+static inline void SchedTrace(Process* proc, uint8_t site)
+{
+    if (!proc) return;
+    uint64_t e = (g_lapicTickCount << 16) | ((uint64_t)site << 8)
+               | ((uint64_t)(uint8_t)proc->state);
+    uint8_t h = proc->schedTraceHead;
+    proc->schedTrace[h % 12] = e;
+    proc->schedTraceHead = (uint8_t)(h + 1);
+}
+
 static void ReadyQueueInsertLocked(Process* proc)
 {
     // Idle processes (pid=0) are never managed by the policy module.
@@ -237,17 +425,52 @@ static void ReadyQueueInsertLocked(Process* proc)
     int32_t cpu = __atomic_load_n(&proc->runningOnCpu, __ATOMIC_ACQUIRE);
     if (cpu != -1)
     {
-        SerialPrintf("SCHED BUG: inserting RUNNING proc '%s' (pid %u) into ready queue! "
-                     "runningOnCpu=%d state=%d\n",
-                     proc->name, proc->pid, cpu, (int)proc->state);
+        // BRO-176: print SAFELY. A corrupted/freed-and-reused Process struct is a
+        // prime suspect here, so do not blindly dereference proc->name (it #GP'd
+        // before). Validate the magic first; dump raw struct words either way so
+        // we can see whether this is a live-but-mis-stated proc or freed garbage.
+        bool magicOk = (proc->magic == PROCESS_MAGIC);
+        SerialPrintf("SCHED BUG: inserting RUNNING proc=%p magic=%s pid=%u runningOnCpu=%d "
+                     "state=%d refCount=%d reapable=%d incarnation=%u\n",
+                     (void*)proc, magicOk ? "OK" : "CORRUPT",
+                     magicOk ? proc->pid : 0xFFFF, cpu, (int)proc->state,
+                     (int)proc->refCount, (int)proc->reapable,
+                     magicOk ? proc->incarnation : 0);
+        if (magicOk)
+            SerialPrintf("            name='%s' tgid=%u isThread=%d\n",
+                         proc->name, proc->tgid, (int)proc->isThread);
+        // Dump the first 8 words of the struct for forensic comparison against
+        // PROCESS_MAGIC / freed-poison patterns.
+        const uint64_t* raw = reinterpret_cast<const uint64_t*>(proc);
+        for (int w = 0; w < 8; ++w)
+            SerialPrintf("            [%p+0x%x] = 0x%lx\n",
+                         (void*)proc, w * 8, raw[w]);
+        // BRO-179 forensic: if any struct word carries the 0xDFDF poison marker,
+        // decode the frame's ORIGINAL owner PID + free-seq and dump its alloc/
+        // free callstack history — naming whose freed frame was reused as this
+        // Process struct (the cross-domain SIG1 culprit). The poison may be the
+        // HEAP's (a kfree over this live struct) or the PMM frame poison, so try
+        // both decoders.
+        for (int w = 0; w < 8; ++w)
+        {
+            HeapDecodePoison(raw[w]);
+            PmmDecodePoison(raw[w]);
+        }
+        // BRO-176: was this exact Process* recently freed? If so, name the free
+        // site — that is the premature-free path (signature 2).
+        if (ProcessDumpFreeLog((void*)proc) == 0)
+            SerialPrintf("            (proc not in recent free-log — not a freed-struct reuse, "
+                         "or evicted from ring)\n");
         for (;;) __asm__ volatile("hlt");
     }
+    SchedTrace(proc, STR_ENQUEUE);
     g_schedOps->Enqueue(g_schedState, proc->pid);
 }
 
 static void ReadyQueueRemoveLocked(Process* proc)
 {
     if (proc->pid == 0) return; // idle never in policy queue
+    SchedTrace(proc, STR_REMOVE);
     g_schedOps->Remove(g_schedState, proc->pid);
 }
 
@@ -285,15 +508,84 @@ static Process* PickNextLocked(uint32_t cpu)
         if (pid == SCHED_PID_NONE)
             break;
 
+        // BRO-176/SIG2: bounds-check the pid BEFORE indexing g_pidToProcess.
+        // PickNext is only supposed to return pids < SCHED_MAX_PIDS, but if the
+        // policy state is corrupt it can return an out-of-range value; indexing
+        // the 1024-entry array with it was an out-of-bounds read that returned a
+        // stack/garbage pointer the scheduler then treated as a live Process*
+        // (the "inserting RUNNING proc=<stack addr>" crash). Skip + log loudly.
+        if (pid >= SCHED_MAX_PIDS)
+        {
+            static uint64_t s_lastOob = 0;
+            uint64_t now = g_lapicTickCount;
+            if (now - s_lastOob >= 100)
+            {
+                s_lastOob = now;
+                SerialPrintf("SCHED: PickNext returned OOB pid=%u (>= %u) — policy state "
+                             "corrupt; skipping\n", (unsigned)pid, (unsigned)SCHED_MAX_PIDS);
+            }
+            continue;
+        }
+
         Process* proc = g_pidToProcess[pid];
-        if (proc && ProcessCanRunOnCpu(proc, cpu))
+        // SIG2: validate the mapped pointer is a plausible HEAP Process* (heap
+        // starts at 0xFFFFC080..., stacks/VMALLOC live below it) with good magic
+        // BEFORE dereferencing ->state. A corrupt g_pidToProcess slot holding a
+        // stack/VMALLOC address would otherwise be read as a fake Ready process.
+        if (proc)
+        {
+            uint64_t pv = reinterpret_cast<uint64_t>(proc);
+            bool heapish = pv >= 0xFFFFC08000000000ULL && (pv & 0x7) == 0;
+            if (!heapish || proc->magic != PROCESS_MAGIC)
+            {
+                static uint64_t s_lastBad = 0;
+                uint64_t now = g_lapicTickCount;
+                if (now - s_lastBad >= 100)
+                {
+                    s_lastBad = now;
+                    SerialPrintf("SCHED: g_pidToProcess[%u] = %p is not a valid Process* "
+                                 "(corrupt mapping); scrubbing\n", (unsigned)pid, (void*)proc);
+                }
+                g_pidToProcess[pid] = nullptr;  // scrub the poisoned slot
+                continue;
+            }
+        }
+        // Drop stale / non-runnable entries entirely (PickNext already
+        // dequeued the pid; do NOT re-enqueue it).  A pid can linger in the
+        // queue as Terminated (exit_group marks Terminated without dequeuing)
+        // or reference a freed/empty slot.  Scheduling such an entry was a
+        // path into the use-after-free; skip it so only genuinely Ready
+        // processes are ever returned.
+        if (!proc || proc->state != ProcessState::Ready)
+            continue;
+        // BRO-176 lost-enqueue root fix: never hand DoSwitch a process that is
+        // still marked running on another CPU. RrPickNext already removed this
+        // pid from the queue, and PickNext only gates on state==Ready — but a
+        // process can be Ready while runningOnCpu is briefly still set during the
+        // pick->switch window (runningOnCpu is cleared in context_switch.S only
+        // after the old context is saved). If we returned it, DoSwitch would hit
+        // its double-schedule guard, decline to run it, and (depending on a
+        // racy state re-check) could fail to put it back — leaking it Ready but
+        // unqueued (the schedstress slow-leak strand). Instead, re-enqueue it
+        // here and keep looking. We must use the policy Enqueue directly (not
+        // ReadyQueueInsertLocked, which halts on runningOnCpu!=-1); it is
+        // idempotent via the queued-flag, and bounded by `tries` so an
+        // all-running queue just returns null and the CPU retries next tick.
+        if (__atomic_load_n(&proc->runningOnCpu, __ATOMIC_ACQUIRE) != -1)
+        {
+            SchedTrace(proc, STR_PICK_SKIP_RUN);
+            g_schedOps->Enqueue(g_schedState, proc->pid);
+            continue;
+        }
+        if (ProcessCanRunOnCpu(proc, cpu))
         {
             for (uint32_t j = 0; j < skippedCount; ++j)
                 ReadyQueueInsertLocked(skipped[j]);
+            SchedTrace(proc, STR_PICK_RETURN);
             return proc;
         }
 
-        if (proc && skippedCount < SCHED_MAX_PIDS)
+        if (skippedCount < SCHED_MAX_PIDS)
             skipped[skippedCount++] = proc;
     }
 
@@ -334,18 +626,16 @@ static void DrainPostSwitch(uint32_t cpu)
     g_perCpu[cpu].pendingRetire = nullptr;
     if (retired)
     {
-        // For processes with compositor-registered VFBs, don't mark reapable
-        // yet — the compositor must unregister first to avoid a race where
-        // PmmKillPid frees VFB pages while the compositor is mid-blit.
-        if (!__atomic_load_n(&retired->compositorRegistered, __ATOMIC_ACQUIRE))
-        {
-            __atomic_store_n(&retired->reapable, true, __ATOMIC_RELEASE);
-        }
-        else
-        {
-            SerialPrintf("SCHED: deferring reap for pid %u (compositorRegistered)\n",
-                         retired->pid);
-        }
+        // BRO-173/175: `reapable` now means only "switched away cleanly, no
+        // longer on a kernel stack".  It is DECOUPLED from whether other
+        // subsystems still reference the proc — those hold a liveness refCount,
+        // and the reaper additionally requires refCount==0 before freeing.  So
+        // we can always mark a retired Terminated proc reapable here; the
+        // compositor's VFB reference (and any kill-group reference) keeps it
+        // alive via refCount until released.  Previously this deferred reapable
+        // while compositorRegistered, which livelocked if the compositor never
+        // unregistered the proc (BRO-175).
+        __atomic_store_n(&retired->reapable, true, __ATOMIC_RELEASE);
     }
 
     // Re-enqueue the process we were switched away from.
@@ -356,6 +646,8 @@ static void DrainPostSwitch(uint32_t cpu)
         uint64_t rlf = SchedLockAcquire(g_readyLock);
         if (toRequeue->state == ProcessState::Ready)
             ReadyQueueInsertLocked(toRequeue);
+        else
+            SchedTrace(toRequeue, STR_REQUEUE_SKIP);
         SchedLockRelease(g_readyLock, rlf);
     }
 }
@@ -369,7 +661,19 @@ static uint8_t g_idleStacks[SCHED_MAX_CPUS][65536] __attribute__((aligned(16)));
 static void IdleLoop()
 {
     for (;;)
+    {
+        // BRO-173/175: drain per-CPU post-switch bookkeeping here too.  When an
+        // exiting/blocking thread switches directly to idle (PickNextLocked
+        // returned nothing), idle is the resumed process — and unlike the
+        // trampolines and DoSwitch it would otherwise NEVER call
+        // DrainPostSwitch, so the exited thread's pendingRetire is never
+        // consumed and its `reapable` flag is never set.  That left Terminated
+        // threads stuck unreapable (reaper saw runCpu=-1, refCount=0, but
+        // reapable=0) and livelocked the parent's wait/fork loop under heavy
+        // thread churn.  Draining at the top of every idle iteration closes it.
+        DrainPostSwitch(ThisCpu());
         __asm__ volatile("sti\n\thlt" ::: "memory");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -564,19 +868,84 @@ void SchedulerAddProcess(Process* proc)
     proc->savedCtx.fsBase = proc->fsBase;
 
     // Register with pid lookup and policy module.
-    if (proc->pid < SCHED_MAX_PIDS)
-        g_pidToProcess[proc->pid] = proc;
-    g_schedOps->InitProcess(g_schedState, proc->pid, proc->schedPriority);
+    // BRO-176/SIG2: g_pidToProcess[] and the policy state (RrState) are protected
+    // by g_readyLock — PickNextLocked reads g_pidToProcess[pid] and the RR ops
+    // mutate RrState all under it. These two writes were previously done WITHOUT
+    // the lock, racing those locked readers/writers on other CPUs and corrupting
+    // the intrusive ready-list (head/pid), which surfaced as a wild stack-region
+    // pointer being scheduled as a Process*. Serialize them under g_readyLock.
+    {
+        uint64_t rlf0 = SchedLockAcquire(g_readyLock);
+        if (proc->pid < SCHED_MAX_PIDS)
+            g_pidToProcess[proc->pid] = proc;
+        g_schedOps->InitProcess(g_schedState, proc->pid, proc->schedPriority);
+        SchedLockRelease(g_readyLock, rlf0);
+    }
 
-    uint64_t rlf1 = SchedLockAcquire(g_readyLock);
-    ReadyQueueInsertLocked(proc);
-    SchedLockRelease(g_readyLock, rlf1);
-
+    // BRO-173: serialize thread birth against group exit.  A new thread of an
+    // already-exiting group must NOT become runnable — it was born after the
+    // exit_group kill snapshot, so nothing would ever terminate it, the group
+    // would never empty, and the leader/parent would livelock.  We check the
+    // group leader's death-latch under g_allProcLock (the same lock
+    // SchedulerKillThreadGroup sets it under), and if the group is exiting we
+    // register the thread already-Terminated+reapable so it is reaped instead
+    // of run.
+    //
+    // The check uses the thread's OWN generation-specific leader pointer, NOT a
+    // scan for any process with a matching tgid: pids/tgids are reused, so a
+    // tgid scan can false-positive against a still-unreaped corpse from a prior
+    // generation and stillbirth a healthy new group's threads (which then hang
+    // the new leader in pthread_create forever).  The leader pointer is stable
+    // while it has live threads (it is parked in exit_group) and is validated
+    // by magic; a dangling/invalid leader is treated as not-exiting (the normal
+    // teardown paths still apply).
+    bool stillborn = false;
     uint64_t alf1 = SchedLockAcquire(g_allProcLock);
+    if (proc->isThread && !proc->isKernelThread)
+    {
+        Process* ldr = proc->threadLeader;
+        if (ldr && ldr->magic == PROCESS_MAGIC
+            && __atomic_load_n(&ldr->tgidExiting, __ATOMIC_ACQUIRE))
+        {
+            stillborn = true;
+        }
+    }
+    if (stillborn)
+    {
+        proc->state = ProcessState::Terminated;
+        proc->exitStatus = 0;
+        __atomic_store_n(&proc->reapable, true, __ATOMIC_RELEASE);
+        SerialPrintf("SCHED: thread pid=%u stillborn into exiting tgid=%u\n",
+                     proc->pid, proc->tgid);
+    }
+    else
+    {
+        uint64_t rlf1 = SchedLockAcquire(g_readyLock);
+        ReadyQueueInsertLocked(proc);
+        SchedLockRelease(g_readyLock, rlf1);
+    }
+
     if (g_processCount < MAX_PROCESSES)
     {
         g_allProcesses[g_processCount++] = proc;
         ++g_totalForks;
+        // BRO-176: register a thread against its leader's address space at the
+        // exact moment it becomes visible in g_allProcesses (so it is guaranteed
+        // to be reaped via ProcessDestroy, which decrements).  This keeps the
+        // leader alive — and thus the shared page table / user pages mapped —
+        // until every thread sharing the address space is gone, closing the
+        // pick->switch UAF where a Terminated-but-pick-pending sibling resumes
+        // on a freed cr3.  Balanced 1:1 with the decrement in ProcessDestroy.
+        if (proc->isThread && !proc->isKernelThread)
+        {
+            Process* ldr = proc->threadLeader;
+            if (ldr && ldr->magic == PROCESS_MAGIC)
+            {
+                int32_t after = __atomic_add_fetch(&ldr->asLiveThreads, 1, __ATOMIC_ACQ_REL);
+                SchedulerRecordAsLive(ldr, proc->pid, ldr->pid, (uint32_t)ldr->incarnation,
+                                      (uint32_t)proc->leaderIncarnation, after, /*op=inc*/0);
+            }
+        }
     }
     else
     {
@@ -596,8 +965,25 @@ void SchedulerAddProcess(Process* proc)
 void SchedulerRemoveProcess(Process* proc)
 {
     uint64_t rlf2 = SchedLockAcquire(g_readyLock);
-    if (proc->state == ProcessState::Ready)
-        ReadyQueueRemoveLocked(proc);
+    SchedTrace(proc, STR_REMOVE_PROC);
+    // BRO-173: ALWAYS unlink from the policy ready-queue, not just when
+    // state==Ready.  A process being destroyed is typically Terminated (it was
+    // reaped), but it may still be linked in the policy's intrusive
+    // doubly-linked queue — e.g. a thread that was Ready (enqueued) when
+    // exit_group marked it Terminated; Terminated does not dequeue.  Skipping
+    // the remove here left dangling next/prev links and a stale readyCount in
+    // the RR queue; once the pid was freed and reused the list corrupted,
+    // PickNext then handed back a freed/wrong pid and the scheduler jumped
+    // through a use-after-freed Process (0xcc-poison panic).  Remove is
+    // idempotent (no-op if the pid isn't queued), so this is always safe.
+    ReadyQueueRemoveLocked(proc);
+    // BRO-176/SIG2: clear the pid->proc map under the SAME lock that guards it
+    // (PickNextLocked reads it).  Previously this was done after the lock was
+    // released, racing the locked reader and leaving a window where a reused pid
+    // could observe a stale mapping.  Cleared here, before SchedulerFreePid makes
+    // the pid available for reuse.
+    if (proc->pid > 0 && proc->pid < SCHED_MAX_PIDS)
+        g_pidToProcess[proc->pid] = nullptr;
     SchedLockRelease(g_readyLock, rlf2);
 
     uint64_t alf2 = SchedLockAcquire(g_allProcLock);
@@ -611,8 +997,6 @@ void SchedulerRemoveProcess(Process* proc)
     }
     SchedLockRelease(g_allProcLock, alf2);
 
-    if (proc->pid > 0 && proc->pid < SCHED_MAX_PIDS)
-        g_pidToProcess[proc->pid] = nullptr;
     SchedulerFreePid(proc->pid);
 }
 
@@ -646,6 +1030,7 @@ void SchedulerBlock(Process* proc)
     if (__atomic_load_n(&proc->pendingWakeup, __ATOMIC_ACQUIRE))
     {
         __atomic_store_n(&proc->pendingWakeup, 0, __ATOMIC_RELEASE);
+        SchedTrace(proc, STR_BLOCK_SKIP);
         SchedLockRelease(g_readyLock, rlf3);
         if (flags & 0x200)
             __asm__ volatile("sti" ::: "memory");
@@ -653,6 +1038,7 @@ void SchedulerBlock(Process* proc)
     }
 
     proc->state = ProcessState::Blocked;
+    SchedTrace(proc, STR_BLOCK);
     ReadyQueueRemoveLocked(proc);
     g_schedOps->VoluntaryYield(g_schedState, proc->pid);
     SchedLockRelease(g_readyLock, rlf3);
@@ -715,6 +1101,7 @@ void SchedulerUnblock(Process* proc)
         if (proc->state == ProcessState::Running ||
             proc->state == ProcessState::Ready)
             __atomic_store_n(&proc->pendingWakeup, 1, __ATOMIC_RELEASE);
+        SchedTrace(proc, STR_UNBLOCK_DEFER_RR);
         SchedLockRelease(g_readyLock, rlf4);
         return;
     }
@@ -726,12 +1113,14 @@ void SchedulerUnblock(Process* proc)
         // so CheckBlockedWakeups (timer tick) will retry the unblock once
         // the context switch completes and runningOnCpu is cleared.
         __atomic_store_n(&proc->pendingWakeup, 1, __ATOMIC_RELEASE);
+        SchedTrace(proc, STR_UNBLOCK_DEFER_CPU);
         SchedLockRelease(g_readyLock, rlf4);
         return;
     }
     proc->state = ProcessState::Ready;
     proc->wakeupTick = 0;
     __atomic_store_n(&proc->pendingWakeup, 0, __ATOMIC_RELEASE);
+    SchedTrace(proc, STR_READY_UNBLOCK);
     ReadyQueueInsertLocked(proc);
     SchedLockRelease(g_readyLock, rlf4);
 
@@ -824,6 +1213,8 @@ static void ReapTerminated()
         Process* p = g_allProcesses[i];
         if (p->state == ProcessState::Terminated
             && __atomic_load_n(&p->reapable, __ATOMIC_ACQUIRE)
+            && __atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) == -1
+            && __atomic_load_n(&p->refCount, __ATOMIC_ACQUIRE) == 0
             && p != g_perCpu[cpu].currentProcess)
         {
             if (!p->isThread && ThreadGroupHasLivePeerLocked(p))
@@ -865,6 +1256,23 @@ static void ReapTerminated()
                 p->parentPid = 0;
             }
 
+            // BRO-176: do NOT reap a thread-group LEADER (which frees the shared
+            // user address space in ProcessDestroy) while any thread sharing that
+            // address space is still un-reaped.  asLiveThreads counts those
+            // threads, INCLUDING a Terminated sibling still in the pick->switch
+            // window (picked Ready, runningOnCpu transiently -1) — which slips
+            // past both ThreadGroupHasLivePeerLocked (it is Terminated) and the
+            // Phase-2 quiesce-wait (its runningOnCpu reads -1).  Gating the
+            // leader's reap here keeps the shared page table + user pages alive
+            // until every such thread has been switched-away and reaped, so a
+            // thread resuming via DoSwitch never loads a freed cr3 (BRO-176 UAF).
+            if (!p->isThread &&
+                __atomic_load_n(&p->asLiveThreads, __ATOMIC_ACQUIRE) > 0)
+            {
+                ++i;
+                continue;
+            }
+
             SchedLockRelease(g_allProcLock, alf);
             DbgPrintf("SCHED: reaping '%s' (pid %u) compReg=%d reapable=%d\n",
                        p->name, p->pid,
@@ -895,7 +1303,8 @@ static void ReapTerminated()
 // After context_switch, the resumed process returns into a *previous*
 // DoSwitch invocation with that invocation's stack-local variables.
 // Per-CPU state is tied to the physical CPU and is NOT saved/restored.
-static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false)
+static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false,
+                     bool holdingReadyLock = false)
 {
     __asm__ volatile("cli");
 
@@ -935,6 +1344,49 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
     {
         // Restore the original runningOnCpu — we're not taking this process.
         __atomic_store_n(&newProc->runningOnCpu, prevCpu, __ATOMIC_RELEASE);
+
+        // Held-lock dispatch invariant: when the caller hands us a process it
+        // picked under g_readyLock (still held here), that process was removed
+        // from the policy ready queue AND verified runningOnCpu==-1 inside the
+        // same uninterrupted IF=0 critical section. Nothing can have claimed it
+        // since. If prevCpu!=-1 fires anyway the lock discipline is broken — and
+        // the lock-free bail path below would self-deadlock re-acquiring
+        // g_readyLock. Fail loudly instead.
+        if (holdingReadyLock)
+        {
+            KernelPanic("SCHED: held-lock claim race on pid=%u: runningOnCpu=%d, "
+                        "expected -1 (g_readyLock discipline broken)",
+                        newProc->pid, prevCpu);
+        }
+
+        // BRO-176 lost-enqueue fix: newProc was REMOVED from the ready queue by
+        // the caller's PickNextLocked (PickNext only checks state==Ready, NOT
+        // runningOnCpu, so a process that is Ready but still marked running on
+        // another CPU during the pick->switch window can be selected here). We
+        // are declining to run it. If we just return, newProc is left
+        // state==Ready but absent from the policy ready queue — leaked forever
+        // (the schedstress slow-leak strand the SCHED STALL/SCHEDTRACE caught:
+        // workers vanish one at a time and throughput decays). Put it back.
+        //
+        // We must enqueue via the policy directly: ReadyQueueInsertLocked would
+        // trip its runningOnCpu!=-1 halt-guard (we just restored
+        // runningOnCpu=prevCpu). That is safe — the policy's queued-flag makes
+        // Enqueue idempotent (no double-link if prevCpu also requeues it), and
+        // DoSwitch's own double-schedule guard prevents any premature pick from
+        // actually running it while prevCpu still owns it. If newProc is
+        // concurrently blocked/terminated, a later PickNext drops it from the
+        // queue (it checks state==Ready), so a stale enqueue self-heals.
+        if (newProc->state == ProcessState::Ready && newProc->pid != 0)
+        {
+            uint64_t rlfDs = SchedLockAcquire(g_readyLock);
+            g_schedOps->Enqueue(g_schedState, newProc->pid);
+            SchedLockRelease(g_readyLock, rlfDs);
+            SchedTrace(newProc, STR_DS_BAIL_ENQ);
+        }
+        else
+        {
+            SchedTrace(newProc, STR_DS_BAIL_SKIP);
+        }
 
         // Rate-limit: this path fires repeatedly when a hot process is
         // contended between CPUs (e.g. a long-running nar-unpack).  It's a
@@ -986,13 +1438,49 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
         g_perCpu[cpu].cpuEnv->currentProcess = reinterpret_cast<uint64_t>(newProc);
     }
     newProc->state = ProcessState::Running;
+    SchedTrace(newProc, STR_RUN);
     __atomic_store_n(&newProc->runningOnCpu, static_cast<int32_t>(cpu), __ATOMIC_RELEASE);
     // Track which CPUs have this process's TLB entries loaded
     __atomic_or_fetch(&newProc->tlbCpuMask, 1ULL << cpu, __ATOMIC_RELEASE);
+    // BRO-176/SIG1: also record this CPU in the address-space footprint mask
+    // (leader-owned union) so shootdowns reach every sibling-thread CPU.
+    __atomic_or_fetch(AddressSpaceTlbMaskPtr(newProc), 1ULL << cpu, __ATOMIC_RELEASE);
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
 
     // Store requeue info in per-CPU state BEFORE context_switch.
     g_perCpu[cpu].pendingRequeue = requeueOld ? oldProc : nullptr;
+
+    // BRO-173/175: if we are switching away from a process that is already
+    // Terminated, hand it to the retire path so the resuming process's
+    // DrainPostSwitch marks it reapable once it is fully off its kernel stack.
+    // This closes a race in the self-exit path: SchedulerExitCurrentProcess
+    // sets state=Terminated with interrupts still ENABLED (it does SIGCHLD /
+    // reparent work under g_allProcLock before the cli + its own pendingRetire
+    // store).  A timer tick landing in that window descheduls the Terminated
+    // proc through here (SchedulerTimerTick's Terminated branch) — it would
+    // otherwise be switched out Terminated/runningOnCpu=-1 but never marked
+    // reapable (its own pendingRetire store at the tail of
+    // SchedulerExitCurrentProcess is never reached), wedging the reaper and
+    // livelocking the parent's wait/fork loop.  The leader hits this far more
+    // often than a plain thread because of the extra SIGCHLD/reparent work that
+    // widens the interrupts-enabled window.
+    if (oldProc != newProc &&
+        oldProc->state == ProcessState::Terminated &&
+        !g_perCpu[cpu].pendingRetire)
+    {
+        g_perCpu[cpu].pendingRetire = oldProc;
+    }
+
+    // Held-lock dispatch release point. The run-queue decision is now fully
+    // committed under one IF=0 hold of g_readyLock: newProc was de-queued in
+    // PickNextLocked, claimed (runningOnCpu=cpu), marked Running, and the
+    // outgoing requeue/retire intents are recorded in per-CPU state. Everything
+    // remaining (TSS/syscall-stack/CR3 setup + context_switch) is per-CPU and
+    // intentionally runs with IF still 0 — the resumed thread restores its own
+    // IF. Drop the lock RAW (no sti) so we never re-enable interrupts in the
+    // pick->switch gap that caused the BRO-176 lost-enqueue strand.
+    if (holdingReadyLock)
+        SchedLockReleaseRaw(g_readyLock);
 
     GdtSetTssRsp0ForCpu(cpu, newProc->kernelStackTop);
     SetSyscallStack(cpu, newProc->kernelStackTop);
@@ -1121,9 +1609,139 @@ void SchedulerTimerTick(bool allowPreempt)
     {
         uint64_t rlf7 = SchedLockAcquire(g_readyLock);
         Process* next = PickNextLocked(cpu);
-        SchedLockRelease(g_readyLock, rlf7);
+        uint32_t readyN = g_schedOps->ReadyCount(g_schedState);
         if (next)
-            DoSwitch(cur, next);
+        {
+            // Hold g_readyLock through DoSwitch's claim — it releases the lock
+            // (raw, IF stays 0) right before context_switch.
+            DoSwitch(cur, next, /* requeueOld */ false, /* holdingReadyLock */ true);
+        }
+        else
+        {
+            SchedLockRelease(g_readyLock, rlf7);
+            if (cpu == 0)
+            {
+            // BRO-176 HANG detector: this CPU is idle and PickNext found nothing,
+            // yet a process may be marked state==Ready but missing from the policy
+            // ready queue — a genuine strand would idle every CPU forever. But a
+            // process is LEGITIMATELY Ready-but-unqueued for a brief window during
+            // preemption: SchedulerPreempt/Yield set state=Ready and stash the proc
+            // in g_perCpu[].pendingRequeue; DrainPostSwitch enqueues it a few
+            // instructions later on the resuming CPU. Sampling during that window is
+            // a FALSE positive. To report only REAL strands, require (a) the proc is
+            // not any CPU's pendingRequeue, not running, and (b) the SAME pid stays
+            // stranded across two consecutive checks (the rate-limit interval is far
+            // longer than the requeue window, which never survives it).
+            static uint64_t s_lastStallLog = 0;
+            static uint16_t s_lastStrandedPid = SCHED_PID_NONE;
+            uint64_t now = g_lapicTickCount;
+            if (now - s_lastStallLog >= 500)
+            {
+                uint64_t alf = SchedLockAcquire(g_allProcLock);
+                Process* stranded = nullptr;
+                for (uint32_t i = 0; i < g_processCount; ++i)
+                {
+                    Process* p = g_allProcesses[i];
+                    if (!(p && p->magic == PROCESS_MAGIC
+                          && p->state == ProcessState::Ready
+                          && ProcessCanRunOnCpu(p, cpu)))
+                        continue;
+                    // Skip if running or mid-context-switch on any CPU.
+                    if (__atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) != -1)
+                        continue;
+                    // Skip the legitimate preemption requeue window: a proc parked
+                    // in any CPU's pendingRequeue is about to be enqueued by that
+                    // CPU's DrainPostSwitch — not a strand.
+                    bool pendingRequeue = false;
+                    for (uint32_t c = 0; c < SCHED_MAX_CPUS; ++c)
+                        if (g_perCpu[c].pendingRequeue == p) { pendingRequeue = true; break; }
+                    if (pendingRequeue)
+                        continue;
+                    stranded = p;
+                    break;
+                }
+                SchedLockRelease(g_allProcLock, alf);
+                // Only log a strand that PERSISTS: the same pid must be caught on
+                // two consecutive checks (>=500 ticks apart). A transient requeue
+                // window cannot survive one interval, so this kills false positives.
+                uint16_t prevStrandedPid = s_lastStrandedPid;
+                s_lastStrandedPid = stranded ? stranded->pid : SCHED_PID_NONE;
+                s_lastStallLog = now;
+                if (stranded && stranded->pid == prevStrandedPid)
+                {
+                    SerialPrintf("SCHED STALL: pid=%u '%s' state=Ready but PickNext "
+                                 "returned null (RR readyCount=%u) — persists, real strand!\n",
+                                 stranded->pid, stranded->name, readyN);
+                    // Dump the policy's internal view to distinguish a LOGIC desync
+                    // (queued flag stale) from STRUCT CORRUPTION (listLen != readyCount).
+                    if (g_schedOps->DebugDump)
+                    {
+                        brook::SchedDebugInfo di = {};
+                        uint64_t rlfd = SchedLockAcquire(g_readyLock);
+                        g_schedOps->DebugDump(g_schedState, stranded->pid, &di);
+                        SchedLockRelease(g_readyLock, rlfd);
+                        SerialPrintf("  RR[pid=%u]: queued=%u active=%u next=%u prev=%u | "
+                                     "head=%u tail=%u readyCount=%u listLen=%u%s\n",
+                                     stranded->pid, di.queued, di.active, di.nextPid,
+                                     di.prevPid, di.head, di.tail, di.readyCount,
+                                     di.listLen,
+                                     (di.listLen != di.readyCount)
+                                         ? "  <<< STRUCT CORRUPT (listLen != readyCount)"
+                                         : (di.queued
+                                             ? "  <<< LOGIC DESYNC (queued but not picked)"
+                                             : "  <<< NOT ENQUEUED (queued=0)"));
+                    }
+                    // Dump the stranded process's recent scheduler-event ring:
+                    // the op sequence reveals exactly where state became Ready
+                    // without a following ENQUEUE (the lost-enqueue site).
+                    SerialPrintf("  SCHEDTRACE pid=%u (oldest->newest):\n", stranded->pid);
+                    for (uint32_t k = 0; k < 12; ++k)
+                    {
+                        uint8_t slot = (uint8_t)((stranded->schedTraceHead + k) % 12);
+                        uint64_t e = stranded->schedTrace[slot];
+                        if (e == 0) continue;
+                        SerialPrintf("    site=%u state=%u tick=%lu\n",
+                                     (unsigned)((e >> 8) & 0xFF),
+                                     (unsigned)(e & 0xFF),
+                                     (unsigned long)(e >> 16));
+                    }
+                    SerialPrintf("  (sites 1=ENQ 2=REM 3=RDY_UNBLK 4=DEFER_RR 5=DEFER_CPU "
+                                 "6=BLOCK 7=BLOCK_SKIP 8=PREEMPT 9=YIELD 10=REQ_ENQ "
+                                 "11=REQ_SKIP 12=RUN 13=PICK_RET 14=PICK_SKIP_RUN "
+                                 "15=DS_BAIL_ENQ 16=DS_BAIL_SKIP 17=REM_PROC)\n");
+                }
+            }
+            }
+        }
+        return;
+    }
+
+    // A Terminated process MUST be descheduled immediately, regardless of
+    // whether the tick interrupted user or kernel mode.  exit_group /
+    // SchedulerKillThreadGroup marks sibling threads Terminated and then
+    // spin-waits for runningOnCpu == -1.  If the victim is a pure user-mode
+    // CPU spinner, ticks arrive with allowPreempt=true and the old code fell
+    // through to the timeslice path, where `cur->state != Running` returned
+    // WITHOUT descheduling — so the Terminated spinner kept burning its CPU
+    // forever, the quiesce-wait never completed, and the teardown
+    // reference/reap was leaked (BRO-173/175 residual stall).  Handle it here,
+    // up front, for both modes.
+    if (cur->state == ProcessState::Terminated)
+    {
+        uint64_t rlf_term = SchedLockAcquire(g_readyLock);
+        ReadyQueueRemoveLocked(cur);
+        Process* next = PickNextLocked(cpu);
+        if (next)
+        {
+            DoSwitch(cur, next, /* requeueOld */ false, /* holdingReadyLock */ true);
+        }
+        else
+        {
+            SchedLockRelease(g_readyLock, rlf_term);
+            Process* idle = g_perCpu[cpu].idleProcess;
+            if (idle && idle != cur)
+                DoSwitch(cur, idle, /* requeueOld */ false);
+        }
         return;
     }
 
@@ -1131,30 +1749,8 @@ void SchedulerTimerTick(bool allowPreempt)
     // sample, account, wake sleepers, and dispatch away from idle, but a tick
     // that interrupted a syscall/driver path must not deschedule the process
     // while it owns filesystem, VFS, or device-driver locks.
-    //
-    // Exception: Terminated and Stopped processes MUST be descheduled even from
-    // kernel mode. exit_group marks sibling threads Terminated and spin-waits
-    // for runningOnCpu == -1. If we skip preemption here, those siblings stay
-    // stuck in kernel code forever and exit_group deadlocks.
     if (!allowPreempt)
-    {
-        if (cur->state == ProcessState::Terminated)
-        {
-            uint64_t rlf_term = SchedLockAcquire(g_readyLock);
-            ReadyQueueRemoveLocked(cur);
-            Process* next = PickNextLocked(cpu);
-            SchedLockRelease(g_readyLock, rlf_term);
-            if (next)
-                DoSwitch(cur, next, /* requeueOld */ false);
-            else
-            {
-                Process* idle = g_perCpu[cpu].idleProcess;
-                if (idle && idle != cur)
-                    DoSwitch(cur, idle, /* requeueOld */ false);
-            }
-        }
         return;
-    }
 
     // Check timeslice (per-process, from policy module).
     uint64_t timeslice = g_schedOps->Timeslice(g_schedState, cur->pid);
@@ -1171,11 +1767,13 @@ void SchedulerTimerTick(bool allowPreempt)
         uint64_t rlf_stop = SchedLockAcquire(g_readyLock);
         ReadyQueueRemoveLocked(cur);
         Process* next = PickNextLocked(cpu);
-        SchedLockRelease(g_readyLock, rlf_stop);
         if (next)
-            DoSwitch(cur, next, /* requeueOld */ false);
+        {
+            DoSwitch(cur, next, /* requeueOld */ false, /* holdingReadyLock */ true);
+        }
         else
         {
+            SchedLockRelease(g_readyLock, rlf_stop);
             // No other process — switch to idle
             Process* idle = g_perCpu[cpu].idleProcess;
             if (idle && idle != cur)
@@ -1190,17 +1788,20 @@ void SchedulerTimerTick(bool allowPreempt)
     uint64_t rlf8 = SchedLockAcquire(g_readyLock);
     g_schedOps->TimesliceExpired(g_schedState, cur->pid);
     Process* next = PickNextLocked(cpu);
-    SchedLockRelease(g_readyLock, rlf8);
 
     if (!next)
     {
+        SchedLockRelease(g_readyLock, rlf8);
         // Nothing else — keep running.
         g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
         return;
     }
 
+    // state=Ready set under g_readyLock; DoSwitch claims next + releases the
+    // lock (raw) right before context_switch.
     cur->state = ProcessState::Ready;
-    DoSwitch(cur, next, /* requeueOld */ true);
+    SchedTrace(cur, STR_READY_PREEMPT);
+    DoSwitch(cur, next, /* requeueOld */ true, /* holdingReadyLock */ true);
 }
 
 void SchedulerYield()
@@ -1211,10 +1812,10 @@ void SchedulerYield()
         return;
     uint64_t rlf9 = SchedLockAcquire(g_readyLock);
     Process* next = PickNextLocked(cpu);
-    SchedLockRelease(g_readyLock, rlf9);
 
     if (!next)
     {
+        SchedLockRelease(g_readyLock, rlf9);
         // If the process is Blocked/Terminated, it must NOT continue running.
         // Switch to the idle process so the CPU is available for other work
         // and the blocked process can be properly rescheduled when unblocked.
@@ -1233,8 +1834,12 @@ void SchedulerYield()
     // Re-enqueue old process after context_switch saves its state.
     bool requeue = (old->state == ProcessState::Running);
     if (requeue)
+    {
         old->state = ProcessState::Ready;
-    DoSwitch(old, next, requeue);
+        SchedTrace(old, STR_READY_YIELD);
+    }
+    // DoSwitch claims next + releases g_readyLock (raw) before context_switch.
+    DoSwitch(old, next, requeue, /* holdingReadyLock */ true);
 }
 
 extern "C" void SchedulerSleepMs(uint32_t ms)
@@ -1382,17 +1987,18 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
         SchedLockRelease(g_allProcLock, alf);
     }
 
-    uint64_t rlf10 = SchedLockAcquire(g_readyLock);
+    SchedLockAcquire(g_readyLock);
     ReadyQueueRemoveLocked(proc);
     Process* next = PickNextLocked(cpu);
-    SchedLockRelease(g_readyLock, rlf10);
 
     if (!next) next = g_perCpu[cpu].idleProcess;
 
-    // Disable interrupts before updating TSS RSP0 and switching context.
-    // Without cli, a timer interrupt between GdtSetTssRsp0 and context_switch
-    // would push an interrupt frame onto next's kernel stack while proc is
-    // still executing on its own stack — corrupting the iretq frame (BRO-131).
+    // Held-lock exit dispatch: keep g_readyLock from the pick through the claim
+    // of `next` (runningOnCpu=cpu) so there is no window in which `next` is out
+    // of the ready queue but not yet owned — the BRO-176 lost-enqueue race. The
+    // lock is dropped RAW (IF stays 0) right before context_switch, matching
+    // DoSwitch. Interrupts are already disabled by SchedLockAcquire; the cli
+    // below is redundant but harmless.
     __asm__ volatile("cli" ::: "memory");
 
     __atomic_store_n(&proc->runningOnCpu, (int32_t)-1, __ATOMIC_RELEASE);
@@ -1407,6 +2013,14 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     next->state = ProcessState::Running;
     __atomic_store_n(&next->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
     __atomic_or_fetch(&next->tlbCpuMask, 1ULL << cpu, __ATOMIC_RELEASE);
+    __atomic_or_fetch(AddressSpaceTlbMaskPtr(next), 1ULL << cpu, __ATOMIC_RELEASE);
+    // Keep per-CPU currentCr3 in sync with the address space we're switching to.
+    // Without this the value stays stale (= the exiting process's CR3), and the
+    // TLB-shootdown timeout-forgiveness path (apic.cpp) would mis-read it: a CPU
+    // actually running `next` could be wrongly "forgiven" (its stale CR3 not
+    // matching the shootdown target), leaving a stale writable COW TLB entry —
+    // a COW double-free / UAF. DoSwitch updates this; this exit path must too.
+    SmpSetCurrentCr3(cpu, next->savedCtx.cr3);
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
     GdtSetTssRsp0ForCpu(cpu, next->kernelStackTop);
     SetSyscallStack(cpu, next->kernelStackTop);
@@ -1415,6 +2029,10 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     // resumed process will set reapable once the context_switch is complete
     // and this kernel stack is no longer in use.
     g_perCpu[cpu].pendingRetire = proc;
+
+    // Drop g_readyLock RAW now that `next` is fully claimed and committed; IF
+    // stays 0 across the switch (the resumed thread restores its own IF).
+    SchedLockReleaseRaw(g_readyLock);
 
     ProfilerContextSwitch(proc->pid, next->pid);
     context_switch(&proc->savedCtx, &next->savedCtx,
@@ -1443,6 +2061,8 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     first->state = ProcessState::Running;
     __atomic_store_n(&first->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
     __atomic_or_fetch(&first->tlbCpuMask, 1ULL << cpu, __ATOMIC_RELEASE);
+    __atomic_or_fetch(AddressSpaceTlbMaskPtr(first), 1ULL << cpu, __ATOMIC_RELEASE);
+    SmpSetCurrentCr3(cpu, first->savedCtx.cr3);  // keep tracking in sync (see exit path)
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
     GdtSetTssRsp0ForCpu(cpu, first->kernelStackTop);
     SetSyscallStack(cpu, first->kernelStackTop);
@@ -1508,6 +2128,8 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     first->state = ProcessState::Running;
     __atomic_store_n(&first->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
     __atomic_or_fetch(&first->tlbCpuMask, 1ULL << cpu, __ATOMIC_RELEASE);
+    __atomic_or_fetch(AddressSpaceTlbMaskPtr(first), 1ULL << cpu, __ATOMIC_RELEASE);
+    SmpSetCurrentCr3(cpu, first->savedCtx.cr3);  // keep tracking in sync (see exit path)
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
     GdtSetTssRsp0ForCpu(cpu, first->kernelStackTop);
     SetSyscallStack(cpu, first->kernelStackTop);
@@ -1706,13 +2328,42 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus)
     uint32_t count = 0;
 
     uint64_t alf = SchedLockAcquire(g_allProcLock);
+    // BRO-173: latch the whole group as exiting BEFORE snapshotting members,
+    // under g_allProcLock — the same lock ProcessCreateThread/SchedulerAddProcess
+    // take to publish a new thread.  This serializes group-exit vs thread birth:
+    // a clone that wins the lock first is in our snapshot (and gets killed); a
+    // clone that loses sees the latch and is refused.  Mark every current member
+    // (leaders look themselves up by pid==tgid) so the check is robust even if
+    // the leader pointer is stale.
+    for (uint32_t i = 0; i < g_processCount; ++i)
+    {
+        Process* p = g_allProcesses[i];
+        if (p && p->tgid == tgid)
+            __atomic_store_n(&p->tgidExiting, true, __ATOMIC_RELEASE);
+    }
     for (uint32_t i = 0; i < g_processCount; ++i)
     {
         Process* p = g_allProcesses[i];
         if (p && p != caller && p->tgid == tgid
             && p->state != ProcessState::Terminated)
         {
-            if (count < MAX_PROCESSES) targets[count++] = p;
+            if (count < MAX_PROCESSES) {
+                // BRO-173: claim teardown ownership while still holding
+                // g_allProcLock.  The reaper removes a Process from
+                // g_allProcesses (under this same lock) strictly before
+                // freeing it, so a target we select+flag here cannot be freed
+                // until we release — and once flagged, no other path will mark
+                // it reapable, so our raw `targets[]` pointers stay valid
+                // through the unlocked Phase 2 below.
+                // BRO-173/175: take a liveness reference (instead of the old
+                // groupKillOwned flag) while still holding g_allProcLock, so
+                // the reaper cannot free this target until our unlocked Phase 2
+                // drops the ref.  The reaper removes a Process from
+                // g_allProcesses under this same lock strictly before freeing,
+                // so a target we ref here cannot already be mid-free.
+                ProcessRef(p);
+                targets[count++] = p;
+            }
         }
     }
     SchedLockRelease(g_allProcLock, alf);
@@ -1735,8 +2386,8 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus)
         __atomic_store_n(reinterpret_cast<uint8_t*>(&p->state),
                          static_cast<uint8_t>(ProcessState::Terminated),
                          __ATOMIC_RELEASE);
-        SerialPrintf("SCHED: exit_group killing thread pid=%u tgid=%u\n",
-                     p->pid, p->tgid);
+        DbgPrintf("SCHED: exit_group killing thread pid=%u tgid=%u\n",
+                  p->pid, p->tgid);
     }
 
     // Phase 2: wait for each sibling to stop executing, THEN clean up its
@@ -1786,6 +2437,12 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus)
         KRwLockCleanupOnExit(p);
 
         __atomic_store_n(&p->reapable, true, __ATOMIC_RELEASE);
+
+        // BRO-173/175: drop the teardown reference taken in the snapshot.  Once
+        // this falls to 0 (and the thread is Terminated, reapable, off-CPU) the
+        // reaper is free to destroy it.  Our raw `targets[]` pointer must not be
+        // dereferenced after this point.
+        ProcessUnref(p);
     }
 }
 
@@ -1803,6 +2460,14 @@ Process* SchedulerFindTerminatedChild(uint16_t parentPid, int64_t pid)
             && !p->isThread  // Threads are not waitable children
             && (pid == -1 || pid == static_cast<int64_t>(p->pid)))
         {
+            // BRO-176: do not let waitpid reap a thread-group leader (which frees
+            // the shared address space in ProcessDestroy) while any thread still
+            // shares that address space — a sibling in the pick->switch window,
+            // or one running musl thread-exit cleanup, would then fault on a
+            // freed AS.  Gate on asLiveThreads, the same invariant the auto-reaper
+            // uses; the leader becomes reapable once the last thread is reaped.
+            if (__atomic_load_n(&p->asLiveThreads, __ATOMIC_ACQUIRE) != 0)
+                continue;  // skip this leader; revisit once threads drain
             SchedLockRelease(g_allProcLock, alf);
             return p;
         }
@@ -1894,6 +2559,106 @@ void SchedulerReapChild(Process* child)
     g_reapedUserTicks += child->userTicks;
     g_reapedSysTicks += child->sysTicks;
     ProcessDestroy(child);
+}
+
+// BRO-176 diagnostic: NON-DESTRUCTIVE hang dump (Ctrl+F12). Walks every process
+// — INCLUDING Terminated/zombie ones the panic path skips — and prints the
+// reap-gate fields so a fork+exit reap-stall (live=1, system otherwise alive)
+// can be diagnosed without killing the instance. Lock-free serial output
+// (SerialPutChar polls the UART, takes no lock) and a best-effort lock-free read
+// of g_allProcesses, so it is safe to fire from the keyboard IRQ even while the
+// reaper/waitpid path is stuck. Can be triggered repeatedly. TEMPORARY.
+static void HangPuts(const char* s) { if (s) while (*s) SerialPutChar(*s++); }
+static void HangHex(uint64_t v)
+{
+    SerialPutChar('0'); SerialPutChar('x');
+    for (int sh = 60; sh >= 0; sh -= 4)
+    { int n = (int)((v >> sh) & 0xF); SerialPutChar((char)(n < 10 ? '0' + n : 'a' + n - 10)); }
+}
+static void HangDec(int64_t v)
+{
+    if (v < 0) { SerialPutChar('-'); v = -v; }
+    char buf[20]; int i = 0;
+    if (v == 0) buf[i++] = '0';
+    while (v) { buf[i++] = (char)('0' + (v % 10)); v /= 10; }
+    while (i) SerialPutChar(buf[--i]);
+}
+
+extern "C" void SchedulerDumpHang()
+{
+    HangPuts("\n==================== BRO176 HANG DUMP (Ctrl+F12) ====================\n");
+    // Per-CPU current process + saved RIP — reveals where each CPU is parked or
+    // spinning (the QR panic only shows the one CPU that took the keyboard IRQ).
+    uint32_t cpuCount = SmpGetCpuCount();
+    if (cpuCount > SCHED_MAX_CPUS) cpuCount = SCHED_MAX_CPUS;
+    HangPuts("--- per-CPU current process ---\n");
+    for (uint32_t c = 0; c < cpuCount; ++c)
+    {
+        Process* cur = g_perCpu[c].currentProcess;
+        Process* idle = g_perCpu[c].idleProcess;
+        Process* req = g_perCpu[c].pendingRequeue;
+        Process* ret = g_perCpu[c].pendingRetire;
+        HangPuts("  CPU"); HangDec((int)c); HangPuts(": ");
+        if (!cur) { HangPuts("<null>"); }
+        else if (cur == idle) { HangPuts("idle"); }
+        else if (cur->magic != PROCESS_MAGIC) { HangPuts("cur=CORRUPT "); HangHex((uint64_t)cur); }
+        else {
+            HangPuts("pid="); HangDec(cur->pid);
+            HangPuts(" state="); HangDec((int)cur->state);
+            HangPuts(" rip="); HangHex(cur->savedCtx.rip);
+            HangPuts(" '"); for (int j = 0; j < 20 && cur->name[j]; ++j) SerialPutChar(cur->name[j]); HangPuts("'");
+        }
+        if (req) { HangPuts(" pendingRequeue="); HangHex((uint64_t)req); }
+        if (ret) { HangPuts(" pendingRetire="); HangHex((uint64_t)ret); }
+        HangPuts("\n");
+    }
+    HangPuts("processCount="); HangDec((int64_t)g_processCount); HangPuts("\n");
+    // Best-effort, NO lock (the reaper may hold g_allProcLock while stuck).
+    uint32_t n = g_processCount;
+    if (n > MAX_PROCESSES) n = MAX_PROCESSES;
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        Process* p = g_allProcesses[i];
+        if (!p) continue;
+        bool magicOk = (p->magic == PROCESS_MAGIC);
+        HangPuts("  [");
+        HangDec((int64_t)i); HangPuts("] proc="); HangHex((uint64_t)p);
+        HangPuts(magicOk ? " magic=OK" : " magic=BAD");
+        if (!magicOk) { HangPuts(" (skipped — corrupt)\n"); continue; }
+        HangPuts(" pid="); HangDec(p->pid);
+        HangPuts(" tgid="); HangDec(p->tgid);
+        HangPuts(" state="); HangDec((int)p->state);
+        HangPuts(" isThread="); HangDec(p->isThread ? 1 : 0);
+        HangPuts(" isKthread="); HangDec(p->isKernelThread ? 1 : 0);
+        HangPuts(" asLiveThreads="); HangDec(__atomic_load_n(&p->asLiveThreads, __ATOMIC_RELAXED));
+        HangPuts(" refCount="); HangDec(__atomic_load_n(&p->refCount, __ATOMIC_RELAXED));
+        HangPuts(" reapable="); HangDec(p->reapable ? 1 : 0);
+        HangPuts(" runCpu="); HangDec(__atomic_load_n(&p->runningOnCpu, __ATOMIC_RELAXED));
+        HangPuts(" incarn="); HangDec((int64_t)p->incarnation);
+        HangPuts(" rip="); HangHex(p->savedCtx.rip);
+        HangPuts(" name='"); 
+        for (int j = 0; j < 24 && p->name[j]; ++j) SerialPutChar(p->name[j]);
+        HangPuts("'");
+        // For a thread, show the leader's gate so we can see a stuck reap.
+        if (p->isThread && p->threadLeader && p->threadLeader->magic == PROCESS_MAGIC)
+        {
+            HangPuts(" leaderPid="); HangDec(p->threadLeader->pid);
+            HangPuts(" leaderAsLive="); HangDec(__atomic_load_n(&p->threadLeader->asLiveThreads, __ATOMIC_RELAXED));
+            HangPuts(" leaderIncMatch=");
+            HangDec(p->threadLeader->incarnation == p->leaderIncarnation ? 1 : 0);
+        }
+        HangPuts("\n");
+        // BRO-176: a Terminated leader stuck with asLiveThreads>0 is the reap-stall
+        // fingerprint — dump its full inc/dec history to name the unmatched op.
+        if (!p->isThread && p->state == ProcessState::Terminated &&
+            __atomic_load_n(&p->asLiveThreads, __ATOMIC_RELAXED) > 0)
+        {
+            HangPuts("    ^^ STUCK LEADER (Terminated, asLiveThreads>0) — inc/dec history:\n");
+            DumpAsLiveHistory(p);
+        }
+    }
+    HangPuts("STATE legend: 0=Ready 1=Running 2=Blocked 3=Stopped 4=Terminated\n");
+    HangPuts("==================== END HANG DUMP ====================\n\n");
 }
 
 uint32_t SchedulerSnapshotProcesses(ProcessSnapshot* out, uint32_t maxCount)

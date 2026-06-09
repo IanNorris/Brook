@@ -5,6 +5,9 @@
 #include "mem_tag.h"
 #include "spinlock.h"
 #include "string.h"
+#ifndef BROOK_HOST_TEST
+#include "../ksym_addrs.h"   // KsymFindByAddr for kfree-callstack symbolization
+#endif
 
 namespace brook {
 
@@ -25,9 +28,61 @@ static constexpr uint64_t HEAP_VIRT_MAX  = 0xFFFFC0FF00000000ULL; // 508GB max
 // Poison fill patterns for debugging
 static constexpr uint8_t  POISON_ALLOC  = 0xCD;  // uninitialized alloc
 static constexpr uint32_t POISON_FREE4  = 0xDFDFDFDF;  // freed memory
+static constexpr uint16_t POISON_MARK16 = 0xDFDF;      // high 16 bits of every poison word
 
 // Global toggle — can be disabled at runtime for performance-sensitive paths.
 static volatile bool g_heapPoisonEnabled = true;
+
+// BRO-179 forensic heap poison. When ARMED (post-boot, once the per-CPU GS base
+// is valid), a freed block is filled with a pattern that keeps the 0xDFDF marker
+// in the high 16 bits of every word — so existing 0xDFDF detectors/greps and the
+// write-after-free check still work — and encodes, in the low 16 bits, the PID
+// that performed the free and a heap-free sequence, alternating word by word.
+// The #DF/#PF register dumps that print a corrupted Process struct then show
+// e.g. CUR_PID=0xDFDF0005 KSTACK=0xDFDF1A2C — the freeing PID is readable by eye,
+// and HeapDecodePoison() resolves the seq to the kfree callstack. The observed
+// SIG1 corruption is heap free-poison written over a LIVE Process struct, so the
+// poison that surfaces is the heap's: this names whose kfree did it.
+static volatile bool g_heapPoisonForensic = false;
+
+static constexpr uint32_t HEAP_FREELOG_SIZE = 1u << 14;  // 16384 records
+static constexpr uint8_t  HEAP_STACK_DEPTH  = 6;
+struct HeapFreeRec {
+    uint64_t blockVa; uint32_t seq; uint16_t pid; uint8_t depth;
+    uint64_t stack[HEAP_STACK_DEPTH];
+};
+static HeapFreeRec g_heapFreeLog[HEAP_FREELOG_SIZE];
+static uint32_t    g_heapFreeSeq = 0;
+
+// RBP frame-chain walk (mirrors profiler.cpp / PMM CaptureKernelStack). Bounded,
+// no locks/alloc. Returns captured depth.
+static inline uint8_t HeapCaptureStack(uint64_t startRbp, uint64_t* out, uint8_t max)
+{
+    constexpr uint64_t KBASE = 0xffffffff80000000ULL;
+    constexpr uint64_t KEND  = 0xffffffffffffffffULL;
+    uint64_t rbp = startRbp; uint8_t depth = 0;
+    while (depth < max)
+    {
+        if (rbp < KBASE || rbp >= KEND - 16 || (rbp & 7) != 0) break;
+        const uint64_t* f = reinterpret_cast<const uint64_t*>(rbp);
+        uint64_t ret = f[1];
+        if (ret < KBASE || ret >= KEND) break;
+        out[depth++] = ret;
+        uint64_t next = f[0];
+        if (next <= rbp) break;
+        rbp = next;
+    }
+    return depth;
+}
+
+// Read the current CPU's running PID from the per-CPU block (gs:40). Only valid
+// once the GS base is established; callers gate on g_heapPoisonForensic.
+static inline uint16_t HeapCurrentPid()
+{
+    uint64_t pid = 0xFFFF;
+    __asm__ volatile("movq %%gs:40, %0" : "=r"(pid));
+    return static_cast<uint16_t>(pid);
+}
 
 // ---------------------------------------------------------------------------
 // Block layout
@@ -138,8 +193,30 @@ static void WriteBlock(uint8_t* base, uint32_t size, uint32_t free)
     {
         uint32_t* p32 = reinterpret_cast<uint32_t*>(base + HEADER_SIZE);
         uint64_t count32 = (size - OVERHEAD) / 4;
-        for (uint64_t i = 0; i < count32; i++)
-            p32[i] = POISON_FREE4;
+        if (g_heapPoisonForensic)
+        {
+            // BRO-179: PID/seq-encoded poison. Record the free's PID + callstack
+            // into the ring, then fill with the encoded pattern (marker 0xDFDF in
+            // the high half of every word; low half alternates pid / seq).
+            uint16_t pid = HeapCurrentPid();
+            uint32_t seq = ++g_heapFreeSeq;
+            HeapFreeRec& r = g_heapFreeLog[seq & (HEAP_FREELOG_SIZE - 1)];
+            r.blockVa = reinterpret_cast<uint64_t>(base);
+            r.seq = seq;
+            r.pid = pid;
+            r.depth = HeapCaptureStack(
+                reinterpret_cast<uint64_t>(__builtin_frame_address(0)),
+                r.stack, HEAP_STACK_DEPTH);
+            const uint32_t wpid = (static_cast<uint32_t>(POISON_MARK16) << 16) | pid;
+            const uint32_t wseq = (static_cast<uint32_t>(POISON_MARK16) << 16) | (seq & 0xFFFFu);
+            for (uint64_t i = 0; i < count32; i++)
+                p32[i] = (i & 1) ? wseq : wpid;
+        }
+        else
+        {
+            for (uint64_t i = 0; i < count32; i++)
+                p32[i] = POISON_FREE4;
+        }
     }
 }
 
@@ -266,7 +343,11 @@ void* kmalloc(uint64_t size)
                     if (check > 16) check = 16; // spot-check first 64 bytes
                     for (uint64_t i = 0; i < check; i++)
                     {
-                        if (p32[i] != POISON_FREE4)
+                        // BRO-179: forensic poison varies the low 16 bits (pid/
+                        // seq), so validate the 0xDFDF marker in the high half
+                        // rather than an exact value — still catches any non-
+                        // poison write-after-free.
+                        if ((p32[i] >> 16) != POISON_MARK16)
                         {
                             SerialPrintf("HEAP: write-after-free detected! "
                                          "block at 0x%lx size=%u, offset %lu: "
@@ -509,6 +590,53 @@ void HeapDumpStats()
                  (unsigned long)s.freeBytes, s.largestFreeBlock);
     SerialPrintf("  Poison: %s\n", s.poisonEnabled ? "enabled" : "disabled");
     SerialPrintf("==================\n");
+}
+
+// BRO-179: arm the forensic (PID/seq-encoded) heap poison. Call once after the
+// per-CPU GS base is valid (post-SMP), so HeapCurrentPid() is safe.
+void HeapArmForensicPoison()
+{
+    g_heapPoisonForensic = true;
+}
+
+// BRO-179: decode a heap-poison qword seen at a crash site. If it carries the
+// 0xDFDF marker, print the freeing PID + heap-free-seq and the kfree callstack
+// that wrote it (symbolized). Returns true if the qword carried the marker.
+// Lock-free read of the ring — safe in a panic/#DF dump (other CPUs halted).
+bool HeapDecodePoison(uint64_t qword)
+{
+    uint32_t lo = static_cast<uint32_t>(qword & 0xFFFFFFFFu);
+    uint32_t hi = static_cast<uint32_t>(qword >> 32);
+    if ((lo >> 16) != POISON_MARK16 && (hi >> 16) != POISON_MARK16) return false;
+    // Fill is [pid, seq, pid, seq, ...]; lower-addressed half is pid, higher seq.
+    uint16_t pid = static_cast<uint16_t>(lo & 0xFFFFu);
+    uint16_t seq16 = static_cast<uint16_t>(hi & 0xFFFFu);
+    SerialPrintf("  BRO179-HEAPPOISON-DECODE qword=0x%lx -> freed by pid=%u seq(low16)=0x%x\n",
+                 qword, (unsigned)pid, (unsigned)seq16);
+    for (uint32_t i = 0; i < HEAP_FREELOG_SIZE; i++)
+    {
+        HeapFreeRec& r = g_heapFreeLog[i];
+        if (r.seq == 0) continue;
+        if ((r.seq & 0xFFFFu) != seq16 || r.pid != pid) continue;
+        SerialPrintf("  BRO179-HEAPPOISON matches kfree seq=%u pid=%u blockVa=0x%lx — callstack:\n",
+                     r.seq, (unsigned)r.pid, r.blockVa);
+        for (uint8_t s = 0; s < r.depth; s++)
+        {
+            const char* nm = nullptr; uint64_t off = 0;
+#ifndef BROOK_HOST_TEST
+            if (KsymFindByAddr(r.stack[s], &nm, &off) && nm)
+                SerialPrintf("      #%u 0x%lx  %s+0x%lx\n", s, r.stack[s], nm, off);
+            else
+                SerialPrintf("      #%u 0x%lx\n", s, r.stack[s]);
+#else
+            (void)nm; (void)off;
+            SerialPrintf("      #%u 0x%lx\n", s, r.stack[s]);
+#endif
+        }
+        return true;
+    }
+    SerialPrintf("  BRO179-HEAPPOISON: no live kfree record for that seq (ring wrapped)\n");
+    return true;
 }
 
 } // namespace brook

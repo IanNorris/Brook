@@ -24,6 +24,7 @@ struct PanicScreenInfo {
     const PanicProcessList*  procList;     // running processes snapshot
     const PanicSystemInfo*   sysInfo;      // system metadata (CPU index, git hash, etc.)
     const PanicStackDump*    stackDump;    // raw stack bytes from RSP
+    const PanicCpuList*      cpuList;      // per-CPU state snapshot (RIP/CR3/pid)
     uint64_t                 vector;       // exception vector (or 0 for KernelPanic)
     uint64_t                 errorCode;    // error code
 };

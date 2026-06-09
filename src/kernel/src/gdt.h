@@ -86,3 +86,10 @@ Tss64* GdtGetTss(uint32_t cpuIndex);
 // Write-protect the GDT page(s) after all APs have booted.
 // Any stray write will trigger a #PF at the offending instruction.
 void GdtWriteProtect();
+
+// Base address of the per-CPU IST NMI stacks (g_nmiStacks[0][0]).  Each CPU's
+// NMI runs on its own 4096-byte stack at base + cpuIndex*4096, so the panic NMI
+// handler derives its CPU index from RSP without relying on GS (which may hold a
+// user-mode base when the NMI lands).  Stride is exactly 4096 bytes.
+extern "C" uint64_t GdtNmiStacksBase();
+static constexpr uint64_t GDT_NMI_STACK_STRIDE = 4096;

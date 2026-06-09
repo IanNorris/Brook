@@ -31,6 +31,32 @@
 
 .text
 
+// BRO-178 paranoid SWAPGS (see gs_paranoid.h for the full rationale): decide
+// swapgs by the ACTUAL GS base via rdmsr, not the saved CS RPL, so an interrupt
+// landing in a ring-0 window with user GS still live swaps correctly. Carries
+// the "did we swap" decision in RBX (callee-saved, preserved across the C call;
+// used after GPRs are pushed and before they are popped). \@ gives each macro
+// expansion unique local labels.
+.macro GS_PARANOID_ENTRY
+    movl $0xC0000101, %ecx       // IA32_GS_BASE
+    rdmsr                         // edx:eax = base
+    testl $0x80000000, %edx       // kernel base is canonical-high (EDX bit 31 set)
+    jnz .Lpgs_kernel\@            // already kernel GS: no swap
+    swapgs
+    movl $1, %ebx                 // flag = swapped
+    jmp .Lpgs_done\@
+.Lpgs_kernel\@:
+    xorl %ebx, %ebx               // flag = no swap
+.Lpgs_done\@:
+.endm
+
+.macro GS_PARANOID_EXIT
+    testl %ebx, %ebx
+    jz .Lpgs_noswap\@
+    swapgs
+.Lpgs_noswap\@:
+.endm
+
 // Macro for an exception without a CPU-pushed error code.
 .macro EXCEPTION_STUB_NOERR vector
 .global ExceptionStub\vector
@@ -57,11 +83,8 @@ ExceptionStub\vector:
     push %r14
     push %r15
 
-    // SWAPGS if coming from user mode (check CS on the interrupt frame)
-    testq $3, 0x88(%rsp)
-    jz 1f
-    swapgs
-1:
+        // BRO-178: paranoid swapgs by actual GS base (see gs_paranoid.h)
+    GS_PARANOID_ENTRY
 
     movq %rsp, %rdi
     movq $\vector, %rsi
@@ -74,12 +97,8 @@ ExceptionStub\vector:
     call HandleExceptionFull
 
     pop %rsp
-
-    // SWAPGS back if returning to user mode
-    testq $3, 0x88(%rsp)
-    jz 2f
-    swapgs
-2:
+    // BRO-178: paranoid swapgs restore (see gs_paranoid.h)
+    GS_PARANOID_EXIT
 
     pop %r15
     pop %r14
@@ -128,12 +147,8 @@ ExceptionStub\vector:
     push %r14
     push %r15
 
-    // SWAPGS if coming from user mode (check CS on the interrupt frame)
-    // CS is at [RSP + 0x88] = 15 GPRs * 8 + errorCode(8) + RIP(8) = 0x88
-    testq $3, 0x88(%rsp)
-    jz 1f
-    swapgs
-1:
+        // BRO-178: paranoid swapgs by actual GS base (see gs_paranoid.h)
+    GS_PARANOID_ENTRY
 
     // RDI = pointer to FullExceptionFrame (our pushed regs + CPU frame)
     movq %rsp, %rdi
@@ -156,12 +171,8 @@ ExceptionStub\vector:
     call HandleExceptionFull
 
     pop %rsp           // restore original RSP (FullExceptionFrame pointer)
-
-    // SWAPGS back if returning to user mode
-    testq $3, 0x88(%rsp)
-    jz 2f
-    swapgs
-2:
+    // BRO-178: paranoid swapgs restore (see gs_paranoid.h)
+    GS_PARANOID_EXIT
 
     // Restore all GPRs (handler may have modified them for signal delivery)
     pop %r15

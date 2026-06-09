@@ -4007,7 +4007,7 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
 
     // Permission changes may leave stale TLB entries on remote CPUs
     if (pages > 0)
-        TlbShootdownFull(proc->pageTable.pml4.raw(), proc->tlbCpuMask);
+        TlbShootdownFull(proc->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
 
     return 0;
 }
@@ -4145,7 +4145,7 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t,
 
     // Flush stale TLB entries on remote CPUs after bulk unmap
     if (pages > 0)
-        TlbShootdownFull(proc->pageTable.pml4.raw(), proc->tlbCpuMask);
+        TlbShootdownFull(proc->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
 
     if (unmappedMfd) MemFdUnref(unmappedMfd);
 
@@ -4207,7 +4207,7 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
                 VirtualAddress va(old_addr + i * 4096);
                 VmmUnmapPage(proc->pageTable, va);
             }
-            TlbShootdownFull(proc->pageTable.pml4.raw(), proc->tlbCpuMask);
+            TlbShootdownFull(proc->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
             m.length = newPages * 4096;
             return static_cast<int64_t>(old_addr);
         }
@@ -4240,7 +4240,7 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
                 VmmUnmapPage(proc->pageTable, oldVA);
             }
         }
-        TlbShootdownFull(proc->pageTable.pml4.raw(), proc->tlbCpuMask);
+        TlbShootdownFull(proc->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
 
         // Update the memfdMaps entry to reflect the new address and size.
         m.vaddr  = newAddr;
@@ -4264,7 +4264,7 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
                 PmmUnrefPage(phys);
             }
         }
-        TlbShootdownFull(proc->pageTable.pml4.raw(), proc->tlbCpuMask);
+        TlbShootdownFull(proc->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
         return static_cast<int64_t>(old_addr);
     }
 
@@ -4303,7 +4303,7 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
             PmmUnrefPage(phys);
         }
     }
-    TlbShootdownFull(proc->pageTable.pml4.raw(), proc->tlbCpuMask);
+    TlbShootdownFull(proc->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
 
     DbgPrintf("sys_mremap: 0x%lx (%lu) -> 0x%lx (%lu)\n",
               old_addr, oldPages, newAddr, newPages);
@@ -4365,8 +4365,9 @@ static int64_t sys_exit(uint64_t status, uint64_t, uint64_t,
 {
     {
         Process* p = ProcessCurrent();
-        SerialPrintf("sys_exit: '%s' (pid %u, tgid %u) exited with status %lu\n",
-                     p ? p->name : "?", p ? p->pid : 0, p ? p->tgid : 0, status);
+        (void)p;
+        DbgPrintf("sys_exit: '%s' (pid %u, tgid %u) exited with status %lu\n",
+                  p ? p->name : "?", p ? p->pid : 0, p ? p->tgid : 0, status);
     }
 
     // If the thread group leader calls plain sys_exit while sibling threads
@@ -4401,8 +4402,8 @@ static int64_t sys_exit_group(uint64_t status, uint64_t, uint64_t,
                                uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
-    SerialPrintf("sys_exit_group: '%s' tgid %u exiting with status %lu\n",
-                 proc ? proc->name : "?", proc ? proc->tgid : 0, status);
+    DbgPrintf("sys_exit_group: '%s' tgid %u exiting with status %lu\n",
+              proc ? proc->name : "?", proc ? proc->tgid : 0, status);
 
     // Kill all other threads in this thread group so they don't linger
     // and cause use-after-free on shared resources after the leader exits.
@@ -4854,6 +4855,7 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
     if (!CopyUserCString(pathAddr, kPath, sizeof(kPath))) return -EFAULT;
 
     DbgPrintf("sys_execve: pid=%u path='%s'\n", proc->pid, kPath);
+    if (!g_hotLogQuiet)
     {
         extern volatile uint64_t g_lapicTickCount;
         SerialPrintf("[PROFILE] execve t=%lums pid=%u '%s'\n",
@@ -10945,7 +10947,16 @@ static constexpr uint32_t FUTEX_HASH_SIZE = 64;
 static constexpr uint32_t FUTEX_BITSET_MATCH_ANY = 0xFFFFFFFFu;
 
 static FutexWaiter* g_futexBuckets[FUTEX_HASH_SIZE];
-static volatile uint64_t g_futexLock = 0;  // Spinlock for the hash table
+// BRO-176: this lock MUST disable interrupts while held. It is a plain spinlock
+// guarding the futex hash table; the critical sections are short and never
+// block. Previously it was a bare test_and_set (interrupts stayed enabled), so a
+// thread could be preempted by the timer while holding it and then be marked
+// Terminated by a sibling's exit_group before reaching the release — leaking the
+// lock permanently and deadlocking every future futex op (observed: 3 CPUs
+// spinning here forever under schedstress). An IrqSpinLock keeps IF=0 while held,
+// so the holder runs to the release uninterrupted and can never be descheduled
+// or killed mid-section.
+static IrqSpinLock g_futexLock;
 
 // Pool of waiter nodes (avoid kmalloc from IRQ context). Sized to MAX_PROCESSES:
 // a thread blocked in a futex wait cannot start another, so one slot per thread
@@ -10979,9 +10990,7 @@ extern "C" int64_t FutexWake(uint64_t owner, uint64_t uaddr, uint32_t maxWake,
     uint32_t bucket = FutexHash(owner, uaddr);
     uint32_t woken = 0;
 
-    while (__atomic_test_and_set(&g_futexLock, __ATOMIC_ACQUIRE)) {
-        __asm__ volatile("pause");
-    }
+    uint64_t fxFlags = IrqSpinLockAcquire(&g_futexLock);
 
     FutexWaiter** pp = &g_futexBuckets[bucket];
     while (*pp && woken < maxWake) {
@@ -10990,21 +10999,19 @@ extern "C" int64_t FutexWake(uint64_t owner, uint64_t uaddr, uint32_t maxWake,
             Process* waiter = w->proc;
             *pp = w->next;
             FutexFreeWaiter(w);
-            __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+            IrqSpinLockRelease(&g_futexLock, fxFlags);
 
             WakeProcess(waiter);
             woken++;
 
-            while (__atomic_test_and_set(&g_futexLock, __ATOMIC_ACQUIRE)) {
-                __asm__ volatile("pause");
-            }
+            fxFlags = IrqSpinLockAcquire(&g_futexLock);
             pp = &g_futexBuckets[bucket];
         } else {
             pp = &(*pp)->next;
         }
     }
 
-    __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+    IrqSpinLockRelease(&g_futexLock, fxFlags);
     return static_cast<int64_t>(woken);
 }
 
@@ -11013,9 +11020,7 @@ static bool FutexRemoveWaiter(uint64_t owner, uint64_t uaddr, Process* proc)
     if (!proc) return false;
     uint32_t bucket = FutexHash(owner, uaddr);
 
-    while (__atomic_test_and_set(&g_futexLock, __ATOMIC_ACQUIRE)) {
-        __asm__ volatile("pause");
-    }
+    uint64_t fxFlags = IrqSpinLockAcquire(&g_futexLock);
 
     FutexWaiter** pp = &g_futexBuckets[bucket];
     while (*pp) {
@@ -11023,13 +11028,13 @@ static bool FutexRemoveWaiter(uint64_t owner, uint64_t uaddr, Process* proc)
         if (w->uaddr == uaddr && w->owner == owner && w->proc == proc) {
             *pp = w->next;
             FutexFreeWaiter(w);
-            __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+            IrqSpinLockRelease(&g_futexLock, fxFlags);
             return true;
         }
         pp = &(*pp)->next;
     }
 
-    __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+    IrqSpinLockRelease(&g_futexLock, fxFlags);
     return false;
 }
 
@@ -11149,20 +11154,18 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
             return -ETIMEDOUT;
 
         // Acquire futex lock, atomically check value, and enqueue
-        while (__atomic_test_and_set(&g_futexLock, __ATOMIC_ACQUIRE)) {
-            __asm__ volatile("pause");
-        }
+        uint64_t fxFlags = IrqSpinLockAcquire(&g_futexLock);
 
         // Check if *uaddr == val while holding the lock
         if (__atomic_load_n(uaddr, __ATOMIC_ACQUIRE) != static_cast<uint32_t>(val)) {
-            __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+            IrqSpinLockRelease(&g_futexLock, fxFlags);
             return -EAGAIN;
         }
 
         // Allocate and enqueue waiter
         FutexWaiter* w = FutexAllocWaiter();
         if (!w) {
-            __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+            IrqSpinLockRelease(&g_futexLock, fxFlags);
             SerialPrintf("sys_futex: ENOMEM (pool exhausted) pid=%u\n", proc->pid);
             return -ENOMEM;
         }
@@ -11174,7 +11177,7 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
             : FUTEX_BITSET_MATCH_ANY;
         if (w->bitset == 0) {
             FutexFreeWaiter(w);
-            __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+            IrqSpinLockRelease(&g_futexLock, fxFlags);
             return -EINVAL;
         }
         uint32_t bucket = FutexHash(owner, uaddrVal);
@@ -11185,7 +11188,9 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
         __atomic_store_n(&proc->pendingWakeup, 0, __ATOMIC_RELEASE);
         proc->wakeupTick = deadline;
 
-        __atomic_clear(&g_futexLock, __ATOMIC_RELEASE);
+        // Release the futex lock (restoring interrupts) BEFORE blocking — a
+        // process must never be descheduled with interrupts disabled.
+        IrqSpinLockRelease(&g_futexLock, fxFlags);
 
         // Block until FUTEX_WAKE removes our waiter, a signal arrives, or an
         // optional timeout expires and the scheduler wakes us.

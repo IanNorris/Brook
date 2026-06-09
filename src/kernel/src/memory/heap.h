@@ -61,4 +61,14 @@ struct HeapStats {
 };
 void HeapGetStats(HeapStats* out);
 
+// BRO-179 forensic: arm PID/seq-encoded heap poison (call once post-SMP, when
+// the per-CPU GS base is valid). Until armed, freed blocks use the plain
+// 0xDFDFDFDF poison.
+void HeapArmForensicPoison();
+
+// BRO-179 forensic: decode a heap-poison qword seen at a crash site into the
+// freeing PID + heap-free-seq and dump the kfree callstack that wrote it.
+// Returns true if the qword carried the 0xDFDF marker.
+bool HeapDecodePoison(uint64_t qword);
+
 } // namespace brook

@@ -16,6 +16,7 @@
 #include "tty.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
+#include "memory/heap.h"
 #include "string.h"
 #include "irq_wrapper.h"
 
@@ -208,18 +209,38 @@ static void ExcStackWalk(uint64_t rbp, int maxFrames, const char* tag)
     ExcPutsRaw(tag); ExcPutsRaw("  --- end trace ---\n");
 }
 
+extern "C" int PmmDumpFreeLog(uint64_t phys);  // BRO-176 diag (physical_memory.cpp)
+extern "C" void PmmDescribe(uint64_t phys, uint32_t* used, uint32_t* refCount,
+                            uint32_t* mapCount, uint32_t* tag, uint32_t* ownerPid);
+extern "C" void ProcessDumpFrameMappers(uint64_t targetPhys);  // BRO-179 (scheduler.cpp)
+extern "C" bool PmmDecodePoison(uint64_t qword);  // BRO-179 forensic (physical_memory.cpp)
+extern "C" int  PmmDumpFreeLogNoLock(uint64_t phys);   // BRO-179 fault-context (no g_pmmLock)
+extern "C" bool PmmDecodePoisonNoLock(uint64_t qword); // BRO-179 fault-context (no g_pmmLock)
+
 static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t errorCode, bool hasErrorCode, bool swapgsDone = false)
 {
     __asm__ volatile("cli");
 
-    // The __attribute__((interrupt)) stubs do NOT perform SWAPGS.
-    // If we entered from user mode (ring 3), GS base is the user's TLS pointer.
-    // We must swap to get the kernel per-CPU pointer so that later code
-    // (context_switch, etc.) leaves GS in a consistent state.
-    // Skip if the assembly stub already did SWAPGS.
+    // BRO-178: decide SWAPGS by the ACTUAL GS base, not the saved CS RPL.
+    // The __attribute__((interrupt)) stubs do NOT perform SWAPGS, so this C path
+    // owns the decision for every vector routed through it — including #DB (1)
+    // and #MC (18), which IGNORE IF and so can fire in a ring-0 window where the
+    // user GS base is still live. There the saved CS is ring 0 but GS is user;
+    // the old `frame->cs & 3` test skipped the swap and ran this handler at
+    // gs:176 → #PF CR2=0xB0. Read IA32_GS_BASE via rdmsr (NOT a gs access, which
+    // would itself fault when the base is 0) and swap iff it is a user
+    // (non-canonical-high) base. `swapgsDone` covers the vec 13/14 asm stubs
+    // that already swapped (their GS is kernel ⇒ rdmsr sees kernel ⇒ no swap).
     bool fromUser = (frame->cs & 3) != 0;
-    if (fromUser && !swapgsDone)
-        __asm__ volatile("swapgs");
+    if (!swapgsDone)
+    {
+        uint32_t gsLo, gsHi;
+        __asm__ volatile("rdmsr" : "=a"(gsLo), "=d"(gsHi) : "c"(0xC0000101u));
+        (void)gsLo;
+        bool gsIsUser = (gsHi & 0x80000000u) == 0;  // kernel base is canonical-high
+        if (gsIsUser)
+            __asm__ volatile("swapgs");
+    }
 
     // Per-CPU nesting guard — uses LAPIC ID to index, avoiding any lock.
     // 64 entries covers typical SMP configs.  Falls back to entry 0 for
@@ -238,7 +259,7 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
         ExcPutsRaw(" — halting ===\n");
         ExcPutsRaw("  RIP   "); ExcPutHex(frame->ip); ExcPutsRaw("\n");
         ExcPutsRaw("  RSP   "); ExcPutHex(frame->sp); ExcPutsRaw("\n");
-        for (;;) __asm__ volatile("cli; pause");
+        for (;;) __asm__ volatile("cli; hlt");
     }
     ++excDepthPerCpu[cpuSlot];
 
@@ -250,7 +271,7 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
     // it arrived), this guard catches us.
     if (brook::SmpIsPanicActive())
     {
-        for (;;) __asm__ volatile("cli; pause");
+        for (;;) __asm__ volatile("cli; hlt");
     }
 
     // For kernel-mode faults: halt all other CPUs and stop compositor
@@ -592,7 +613,7 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
 
     // Halt here — kernel-mode exception is unrecoverable.
     // Use cli before hlt so timer interrupts don't wake us.
-    for (;;) { __asm__ volatile("cli; pause"); }
+    for (;;) { __asm__ volatile("cli; hlt"); }
 }
 
 // Lockless read-only page-table walk for use in the #DF handler.
@@ -672,6 +693,18 @@ static void HandleDoubleFault(InterruptFrame* frame, uint64_t errorCode)
             ExcPutsRaw("  KSTACK_BASE "); ExcPutHex(cur->kernelStackBase);
             ExcPutsRaw("  KSTACK_TOP "); ExcPutHex(cur->kernelStackTop);
             ExcPutsRaw("\n");
+            // BRO-179 forensic: dump the first struct qwords raw. With encoded
+            // heap poison armed, a word reused from a kfree reads 0xDFDF<pid>_
+            // DFDF<seq> — the FREEING pid (high marker, low payload) is readable
+            // by eye here even though the #DF context is too fragile to run the
+            // (serial-locking) HeapDecodePoison; the enqueue/#PF paths decode the
+            // seq to the kfree callstack.
+            const uint64_t* praw = reinterpret_cast<const uint64_t*>(cur);
+            for (uint32_t w = 0; w < 4; w++)
+            {
+                ExcPutsRaw(cpuTag); ExcPutsRaw("  PROC[+"); ExcPutHex(w * 8);
+                ExcPutsRaw("] = "); ExcPutHex(praw[w]); ExcPutsRaw("\n");
+            }
         }
         else
         {
@@ -711,7 +744,7 @@ static void HandleDoubleFault(InterruptFrame* frame, uint64_t errorCode)
     }
 
     ExcPutsRaw(cpuTag); ExcPutsRaw("=== HALTED ===\n");
-    for (;;) { __asm__ volatile("cli; pause"); }
+    for (;;) { __asm__ volatile("cli; hlt"); }
 }
 
 // ---------------------------------------------------------------------------
@@ -751,7 +784,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
     // HandleException where the main guard lives).
     if (brook::SmpIsPanicActive())
     {
-        for (;;) __asm__ volatile("cli; pause");
+        for (;;) __asm__ volatile("cli; hlt");
     }
 
     bool fromUser = (ef->cs & 3) != 0;
@@ -793,7 +826,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                     __asm__ volatile("invlpg (%0)" :: "r"(cr2cow & ~0xFFFULL) : "memory");
                     brook::TlbShootdown(cowProc->pageTable.pml4.raw(),
                                         cr2cow & ~0xFFFULL,
-                                        cowProc->tlbCpuMask);
+                                        *brook::AddressSpaceTlbMaskPtr(cowProc));
                     __asm__ volatile("sti");
                     return;
                 }
@@ -938,6 +971,98 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         brook::SmpHaltAllAPs();
         brook::CompositorHalt();
 
+        // BRO-176/SIG1 frame-attribution: a #PF whose error code has the
+        // RESERVED bit (0x8) set means a paging-structure entry had a reserved
+        // bit set — a CORRUPT page-table entry, the signature of a page-table
+        // frame that was freed and reused (cross-domain frame reuse). CR2 is
+        // the (direct-map) linear address whose translation tripped the reserved
+        // bit; if it lies in the kernel direct map, CR2 - DIRECTMAP_BASE is the
+        // physical frame whose entry we were reading. Dump that frame's PMM
+        // descriptor + alloc/free history NOW (all other CPUs halted, so the
+        // lock-free read is safe) — this names the corrupt frame and its owner
+        // trail even if the QR render below re-faults on the same corruption
+        // (which is why these crashes have produced no QR). vector 14 == #PF.
+        if (vector == 14 && (ef->errorCode & 0x8))
+        {
+            uint64_t cr2val;
+            __asm__ volatile("movq %%cr2, %0" : "=r"(cr2val));
+            constexpr uint64_t kDirectMapBase = 0xFFFF800000000000ULL;
+            constexpr uint64_t kDirectMapEnd  = 0xFFFFC00000000000ULL;
+            ExcPutsRaw("  RSVD-BIT #PF — corrupt paging entry (reused page-table frame?)\n");
+            if (cr2val >= kDirectMapBase && cr2val < kDirectMapEnd)
+            {
+                uint64_t phys = (cr2val - kDirectMapBase) & ~0xFFFULL;
+                ExcPutsRaw("  corrupt-table frame phys "); ExcPutHex(phys); ExcPutsRaw("\n");
+                uint32_t used = 0, ref = 0, mapc = 0, tag = 0, owner = 0;
+                PmmDescribe(phys, &used, &ref, &mapc, &tag, &owner);
+                static const char* tagName[8] = {
+                    "Free","KernelCode","KernelData","PageTable",
+                    "Heap","Device","User","System"
+                };
+                ExcPutsRaw("  [PMM used="); ExcPutHex(used);
+                ExcPutsRaw(" ref=");  ExcPutHex(ref);
+                ExcPutsRaw(" map=");  ExcPutHex(mapc);
+                ExcPutsRaw(" tag=");  ExcPutsRaw(tag < 8 ? tagName[tag] : "?");
+                ExcPutsRaw(" owner=pid"); ExcPutHex(owner); ExcPutsRaw("]\n");
+                // Full ref/unref + alloc/free ring for the frame (re-takes the
+                // PMM lock, safe now that every other CPU is halted).
+                PmmDumpFreeLog(phys);
+
+                // BRO-179: name the leaking mapper FIRST — scan every live
+                // process's user page table for a present PTE still pointing at
+                // this recycled frame. Authoritative (PMM mapCount is
+                // unreliable). Done BEFORE the frame[0..7] dump because that dump
+                // reads the corrupt frame through the direct map and has been
+                // observed to nested-fault (the corruption can hit the direct-map
+                // tables themselves), truncating output. The reverse-map reads
+                // OTHER processes' tables, so it survives. All APs are halted and
+                // every table pointer is range-checked.
+                ProcessDumpFrameMappers(phys);
+
+                // Dump the corrupt frame's first 8 qwords + the faulting entry.
+                // CLASSIFIES the corruption: if this "page table" is full of
+                // user data (ASCII, 0x00007fff... stack pointers) the frame was
+                // written THROUGH A STALE TLB mapping after being reused — a
+                // missing cross-CPU shootdown on free (the leading hypothesis:
+                // VmmFreePages only does a local Invlpg). If instead a single
+                // entry is a plausible-but-misflagged PTE, it's a torn/garbage
+                // PTE write. The faulting entry index is (CR2 & 0xFFF) / 8.
+                const uint64_t* frame =
+                    reinterpret_cast<const uint64_t*>(kDirectMapBase + phys);
+                ExcPutsRaw("  frame[0..7]:\n");
+                for (uint32_t q = 0; q < 8; q++)
+                {
+                    ExcPutsRaw("    +"); ExcPutHex(q * 8);
+                    ExcPutsRaw(" "); ExcPutHex(frame[q]); ExcPutsRaw("\n");
+                }
+                uint32_t fidx = static_cast<uint32_t>((cr2val & 0xFFF) / 8);
+                ExcPutsRaw("  faulting entry["); ExcPutHex(fidx);
+                ExcPutsRaw("] = "); ExcPutHex(frame[fidx]); ExcPutsRaw("\n");
+
+                // BRO-179 forensic: if any of these qwords carries the 0xDFDF
+                // poison marker, decode the ORIGINAL owner PID + free-seq and
+                // dump that frame's alloc/free callstack history — the
+                // corruption names the frame's previous life and who freed it.
+                // Try both the heap (kfree-over-live) and PMM (frame) decoders.
+                ExcPutsRaw("  [BRO179 poison decode of corrupt qwords]\n");
+                for (uint32_t q = 0; q < 8; q++)
+                {
+                    PmmDecodePoison(frame[q]);
+                    brook::HeapDecodePoison(frame[q]);
+                }
+                PmmDecodePoison(frame[fidx]);
+                brook::HeapDecodePoison(frame[fidx]);
+            }
+            // These RSVD/corrupt-table faults make the QR renderer re-fault
+            // (it walks memory through the same corrupt tables) — that nested
+            // fault is the "no panic, CPU pegged" livelock. The serial dump
+            // above IS the canonical record for this crash class, so halt this
+            // CPU cleanly now instead of entering the doomed render. Other
+            // CPUs were already halted by SmpHaltAllAPs() above.
+            ExcPutsRaw("  [RSVD-corrupt-table: halting; serial dump above is the record]\n");
+            for (;;) __asm__ volatile("cli; hlt");
+        }
+
         // Render visual panic screen with full register state + QR code
         {
             uint32_t physStride = 0;
@@ -992,14 +1117,37 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                 for (uint32_t pi = 0; pi < nProcs && procList.count < brook::PANIC_MAX_PROCESSES; pi++)
                 {
                     brook::Process* p = brook::PanicGetProcess(pi);
-                    if (!p || p->state == brook::ProcessState::Terminated) continue;
+                    if (!p) continue;
                     auto& e = procList.entries[procList.count];
+                    // SIG2: validate before deref (see panic.cpp) so a corrupt
+                    // Process* can't fault the panic handler into a hung double-panic.
+                    uint64_t pv = reinterpret_cast<uint64_t>(p);
+                    bool plausible = pv >= 0xFFFF800000000000ULL && (pv & 0x7) == 0;
+                    if (!plausible || p->magic != brook::PROCESS_MAGIC)
+                    {
+                        e.pid = 0xFFFF; e.state = 0xFF; e.cpu = 0xFF; e.rip = pv;
+                        e.name[0] = '?'; e.name[1] = '\0';
+                        e.tgid = 0; e.asLiveThreads = -1; e.refCount = 0;
+                        e.flags = brook::PANIC_PROC_MAGIC_BAD;
+                        procList.count++;
+                        continue;
+                    }
                     e.pid   = p->pid;
                     e.state = static_cast<uint8_t>(p->state);
                     e.cpu   = (p->runningOnCpu >= 0) ? static_cast<uint8_t>(p->runningOnCpu) : 0xFF;
-                    e.rip   = 0;
+                    e.rip   = p->savedCtx.rip;
                     for (uint32_t j = 0; j < brook::PANIC_PROCESS_NAME_LEN; j++)
                         e.name[j] = (p->name[j]) ? p->name[j] : '\0';
+                    e.tgid = p->tgid;
+                    bool leader = !p->isThread;
+                    e.asLiveThreads = leader
+                        ? static_cast<int16_t>(__atomic_load_n(&p->asLiveThreads, __ATOMIC_RELAXED))
+                        : static_cast<int16_t>(-1);
+                    e.refCount = static_cast<int16_t>(__atomic_load_n(&p->refCount, __ATOMIC_RELAXED));
+                    e.flags = 0;
+                    if (p->isThread)        e.flags |= brook::PANIC_PROC_IS_THREAD;
+                    if (p->reapable)        e.flags |= brook::PANIC_PROC_REAPABLE;
+                    if (p->isKernelThread)  e.flags |= brook::PANIC_PROC_IS_KTHREAD;
                     procList.count++;
                 }
 
@@ -1036,6 +1184,8 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                     }
                 }
 
+                static brook::PanicCpuList cpuList;
+                brook::PanicCaptureCpuList(&cpuList);
                 brook::PanicScreenInfo psi = {};
                 psi.message   = "Unrecoverable kernel exception";
                 psi.regs      = &pregs;
@@ -1044,6 +1194,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                 psi.procList  = &procList;
                 psi.sysInfo   = &sysInfo;
                 psi.stackDump = &stackDump;
+                psi.cpuList   = &cpuList;
                 psi.vector    = vector;
                 psi.errorCode = ef->errorCode;
                 brook::PanicScreenRender(const_cast<uint32_t*>(physFb), fbW, fbH, fbStride, &psi);
@@ -1058,16 +1209,20 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         ifrm.ss    = ef->ss;
         HandleException(static_cast<uint8_t>(vector), &ifrm, ef->errorCode, true);
         // HandleException never returns for kernel faults.
-        for (;;) __asm__ volatile("cli; pause");
+        for (;;) __asm__ volatile("cli; hlt");
     }
 
     // --- User-mode fault ---
 
-    // For #GP, dump all GPRs so we can diagnose alignment / register issues.
-    if (vector == 13)
+    // For fatal user faults that can carry corruption (#GP non-canonical
+    // pointer, #SS bad stack op, #PF unmapped deref), dump all GPRs plus the
+    // BRO-179 poison-origin trace. The corruption surfaces through whichever
+    // vector the bad value happens to hit, so cover all three.
+    if (vector == 13 || vector == 12 || vector == 14)
     {
         ExcForceSerialLock();
-        ExcPutsRaw("\n[GP] User #GP — full register dump:\n");
+        ExcPutsRaw("\n[FAULT] User fault vec="); ExcPutHex(vector);
+        ExcPutsRaw(" — full register dump:\n");
         ExcPutsRaw("  RIP "); ExcPutHex(ef->rip); ExcPutsRaw("\n");
         ExcPutsRaw("  RSP "); ExcPutHex(ef->rsp); ExcPutsRaw("\n");
         ExcPutsRaw("  RDI "); ExcPutHex(ef->rdi); ExcPutsRaw("\n");
@@ -1122,9 +1277,10 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                 }
             }
         }
-        // Dump DOOM hash table diagnostics.
-        // NOTE: these addresses must match the DOOM binary (run: nm build/doom/doom | grep -E 'lumphash|lumpinfo|numlumps')
-        // Read via page table walk + direct map.
+        // Read a user qword via a manual page-table walk + direct map. This
+        // bypasses the TLB (it walks the in-memory tables directly), so it
+        // reflects the CURRENT mapping regardless of stale TLB state — used by
+        // the USER_RSP / RBP-chain dumps and the BRO-179 poison-origin trace.
         auto readUser64 = [&](uint64_t uva) -> uint64_t {
             uint64_t* p4 = reinterpret_cast<uint64_t*>(DMAP_USR + cr3val);
             uint64_t e4 = p4[(uva >> 39) & 0x1FF];
@@ -1168,68 +1324,83 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
             rbp = next;
         }
 
-        uint64_t lumphashPtr = readUser64(0x4b3d78);
-        uint64_t lumpinfoPtr = readUser64(0x4b3d70);
-        uint64_t numlumps    = readUser64(0x4b3d68) & 0xFFFFFFFF;
-        ExcPutsRaw("  lumphash="); ExcPutHex(lumphashPtr); ExcPutsRaw("\n");
-        ExcPutsRaw("  lumpinfo="); ExcPutHex(lumpinfoPtr); ExcPutsRaw("\n");
-        ExcPutsRaw("  numlumps="); ExcPutHex(numlumps);    ExcPutsRaw("\n");
-
-        // Scan hash table for the bad entry
-        if (lumphashPtr > 0x10000000ULL && lumphashPtr < 0x20000000ULL) {
-            ExcPutsRaw("  Scanning hash table for non-canonical entries...\n");
-            int found = 0;
-            for (uint64_t i = 0; i < numlumps && i < 2048 && found < 5; ++i) {
-                uint64_t entry = readUser64(lumphashPtr + i * 8);
-                if (entry != 0 && (entry >> 47) != 0 && (entry >> 47) != 0x1FFFF) {
-                    ExcPutsRaw("  BAD["); ExcPutHex(i); ExcPutsRaw("]=");
-                    ExcPutHex(entry); ExcPutsRaw(" @");
-                    ExcPutHex(lumphashPtr + i * 8); ExcPutsRaw("\n");
-                    // Dump 64 bytes around this entry
-                    ExcPutsRaw("  CONTEXT: ");
-                    uint64_t base = lumphashPtr + i * 8 - 32;
-                    for (int j = 0; j < 8; ++j) {
-                        if (j == 4) ExcPutsRaw(">> ");
-                        uint64_t val = readUser64(base + j * 8);
-                        ExcPutHex(val); ExcPutsRaw(" ");
-                    }
-                    ExcPutsRaw("\n");
-                    ++found;
-                }
-            }
-            if (found == 0) ExcPutsRaw("  (no bad entries found in first 2048)\n");
-
-            // Print physical page backing the hash table start
-            auto readUserPhys = [&](uint64_t uva) -> uint64_t {
+        // BRO-179 poison-origin trace: the freed-while-mapped sweep below is
+        // capped at 16 hits and only catches frames already in the free-log;
+        // it has been missing the EXACT frame the program dereferenced
+        // (0xDFDFDFDF, the heap kfree-poison written ONLY at heap.cpp:142).
+        // Here we find the first poison qword on the user stack, resolve its
+        // backing VA->phys, and dump that frame's CURRENT PMM descriptor +
+        // free-log. This names the poison-bearing frame's provenance (tag/pid
+        // transitions) directly, regardless of the sweep cap. Crash-only.
+        {
+            auto vaToPhys = [&](uint64_t uva) -> uint64_t {
                 uint64_t* p4 = reinterpret_cast<uint64_t*>(DMAP_USR + cr3val);
-                uint64_t e4 = p4[(uva >> 39) & 0x1FF];
-                if (!(e4 & 1)) return 0;
+                uint64_t e4 = p4[(uva >> 39) & 0x1FF]; if (!(e4 & 1)) return 0;
                 uint64_t* p3 = reinterpret_cast<uint64_t*>(DMAP_USR + (e4 & 0x000FFFFFFFFFF000ULL));
-                uint64_t e3 = p3[(uva >> 30) & 0x1FF];
-                if (!(e3 & 1)) return 0;
+                uint64_t e3 = p3[(uva >> 30) & 0x1FF]; if (!(e3 & 1)) return 0;
                 uint64_t* p2 = reinterpret_cast<uint64_t*>(DMAP_USR + (e3 & 0x000FFFFFFFFFF000ULL));
-                uint64_t e2 = p2[(uva >> 21) & 0x1FF];
-                if (!(e2 & 1)) return 0;
-                if (e2 & (1ULL << 7))
-                    return (e2 & 0x000FFFFFFFE00000ULL) | (uva & 0x1FFFFFULL);
+                uint64_t e2 = p2[(uva >> 21) & 0x1FF]; if (!(e2 & 1)) return 0;
+                if (e2 & (1ULL << 7)) return (e2 & 0x000FFFFFFFE00000ULL) | (uva & 0x1FFFFFULL);
                 uint64_t* p1 = reinterpret_cast<uint64_t*>(DMAP_USR + (e2 & 0x000FFFFFFFFFF000ULL));
-                uint64_t e1 = p1[(uva >> 12) & 0x1FF];
-                if (!(e1 & 1)) return 0;
+                uint64_t e1 = p1[(uva >> 12) & 0x1FF]; if (!(e1 & 1)) return 0;
                 return (e1 & 0x000FFFFFFFFFF000ULL) | (uva & 0xFFF);
             };
-
-            // Show physical pages for hash table and surrounding memory
-            ExcPutsRaw("  PHYS lumphash page: ");
-            ExcPutHex(readUserPhys(lumphashPtr) & ~0xFFFULL);
-            ExcPutsRaw("\n");
-            if (lumphashPtr + 0x1000 < lumphashPtr + numlumps * 8) {
-                ExcPutsRaw("  PHYS lumphash+4K page: ");
-                ExcPutHex(readUserPhys(lumphashPtr + 0x1000) & ~0xFFFULL);
-                ExcPutsRaw("\n");
+            auto describePoisonFrame = [&](const char* label, uint64_t uva) {
+                uint64_t phys = vaToPhys(uva);
+                ExcPutsRaw("  POISON-ORIGIN "); ExcPutsRaw(label);
+                ExcPutsRaw(" VA="); ExcPutHex(uva);
+                ExcPutsRaw(" phys="); ExcPutHex(phys & ~0xFFFULL);
+                ExcPutsRaw(phys ? "\n" : " (unmapped)\n");
+                // BRO-179: dump this frame's PMM alloc/free history (with the
+                // symbolized callstacks) so we see its cross-domain transition
+                // (e.g. freed by pid X via path A, then handed to this process)
+                // EVEN when the corruption is non-poison data and the co-owner
+                // mapping has already gone — the historical reflog survives.
+                // Lock-free (no g_pmmLock): safe only because all APs are halted
+                // here (SmpHaltAllAPs above); taking the lock at IF=0 could
+                // deadlock against an AP halted mid-critical-section.
+                if (phys)
+                    PmmDumpFreeLogNoLock(phys & ~0xFFFULL);
+            };
+            // Always describe the frame backing the faulting stack pointer.
+            describePoisonFrame("RSP", ef->rsp);
+            // Scan the user stack upward for the first poison qword and describe
+            // the frame it lives in (may differ from RSP's page).
+            uint64_t lastPoisonVA = 0;
+            uint64_t poisonPhys = 0;
+            for (int i = 0; i < 512; ++i) {
+                uint64_t slotVA = ef->rsp + static_cast<uint64_t>(i) * 8;
+                uint64_t v = readUser64(slotVA);
+                // BRO-179: match the 0xDFDF marker in the high 16 bits of either
+                // 32-bit half — catches BOTH the plain 0xDFDFDFDF poison and the
+                // PID/seq-encoded forensic poison (0xDFDF<pid>_DFDF<seq>).
+                bool isPoison = ((v >> 48) == 0xDFDFULL) ||
+                                (((v >> 16) & 0xFFFFULL) == 0xDFDFULL);
+                if (isPoison) {
+                    uint64_t pageVA = slotVA & ~0xFFFULL;
+                    if (pageVA != lastPoisonVA) {
+                        describePoisonFrame("STACK-POISON", slotVA);
+                        // Lock-free decode: name the kfree (pid + callstack) that
+                        // wrote this poison. HeapDecodePoison only reads static
+                        // rings (no g_pmmLock), safe with APs halted at IF=0.
+                        brook::HeapDecodePoison(v);
+                        lastPoisonVA = pageVA;
+                        if (!poisonPhys) poisonPhys = vaToPhys(slotVA) & ~0xFFFULL;
+                    }
+                }
             }
-            ExcPutsRaw("  PHYS lumpinfo page: ");
-            ExcPutHex(readUserPhys(lumpinfoPtr) & ~0xFFFULL);
-            ExcPutsRaw("\n");
+            // BRO-179: name every live process that maps the poison-bearing
+            // stack frame. Authoritative (lock-free direct-map page walk; all
+            // APs already halted by SmpHaltAllAPs above). If a process OTHER than
+            // the faulting one maps it, this frame was handed to two owners at
+            // once (cross-domain reuse) — names the leaking co-owner. Uses the
+            // RSP frame if no explicit poison qword was localized.
+            {
+                uint64_t pp = poisonPhys ? poisonPhys
+                                         : (vaToPhys(ef->rsp) & ~0xFFFULL);
+                if (pp)
+                    ProcessDumpFrameMappers(pp);
+            }
         }
     }
 
@@ -1238,6 +1409,81 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
 
     uint64_t cr2 = 0;
     __asm__ volatile("movq %%cr2, %0" : "=r"(cr2));
+
+    // BRO-176 diagnostic: on a fatal user fault, sweep the faulting process's
+    // entire user page table and look up every mapped frame in the PMM free-log.
+    // A hit means this LIVE process maps a physical frame already freed (and
+    // recycled) — the freed-while-mapped UAF (signature 1) — and the free-log
+    // names who freed it and via which path. One-off at fault time.
+    //
+    // DISABLED (BRO-179): this sweep calls PmmDumpFreeLog / PmmDescribe (which
+    // take g_pmmLock / g_procFreeLogLock) for up to 16 frames from inside the
+    // exception handler with IF=0. A CPU spinning for g_pmmLock while another
+    // CPU is blocked waiting for a TLB-shootdown IPI ack from THIS faulted CPU
+    // deadlocks the whole machine (observed: VM hung mid-sweep ~2 min into a
+    // run, killing the run before the kernel-side RWLOCKFIELD-POISON detector
+    // could fire). It already served its purpose (it confirmed the user crash
+    // frames are cleanly-owned User frames, ruling out freed-while-mapped). The
+    // lock-free POISON-ORIGIN trace above retains the useful VA->phys info.
+    if (false && (vector == 13 || vector == 14))
+    {
+        static constexpr uint64_t DMAP = 0xFFFF800000000000ULL;
+        static constexpr uint64_t PMASK = 0x000FFFFFFFFFF000ULL;
+        uint64_t cr3val = 0;
+        __asm__ volatile("movq %%cr3, %0" : "=r"(cr3val));
+        cr3val &= PMASK;
+        ExcPutsRaw("  --- BRO176 freed-while-mapped sweep ---\n");
+        int hits = 0, looked = 0;
+        uint64_t* pml4 = reinterpret_cast<uint64_t*>(DMAP + cr3val);
+        for (uint64_t i4 = 0; i4 < 256 && hits < 16; ++i4)
+        {
+            if (!(pml4[i4] & 1)) continue;
+            uint64_t* pdpt = reinterpret_cast<uint64_t*>(DMAP + (pml4[i4] & PMASK));
+            for (uint64_t i3 = 0; i3 < 512 && hits < 16; ++i3)
+            {
+                if (!(pdpt[i3] & 1) || (pdpt[i3] & (1ULL << 7))) continue;
+                uint64_t* pd = reinterpret_cast<uint64_t*>(DMAP + (pdpt[i3] & PMASK));
+                for (uint64_t i2 = 0; i2 < 512 && hits < 16; ++i2)
+                {
+                    if (!(pd[i2] & 1) || (pd[i2] & (1ULL << 7))) continue;
+                    uint64_t* pt = reinterpret_cast<uint64_t*>(DMAP + (pd[i2] & PMASK));
+                    for (uint64_t i1 = 0; i1 < 512 && hits < 16; ++i1)
+                    {
+                        if (!(pt[i1] & 1)) continue;
+                        ++looked;
+                        uint64_t phys = pt[i1] & PMASK;
+                        if (PmmDumpFreeLog(phys) > 0)
+                        {
+                            uint64_t va = (i4 << 39) | (i3 << 30) | (i2 << 21) | (i1 << 12);
+                            ExcPutsRaw("    ^ mapped at user VA "); ExcPutHex(va);
+                            // BRO-176 discriminator: the PMM's CURRENT view of this
+                            // frame. tag=4 (Heap)/2(KernelData) or used=0 while it is
+                            // mapped present here = a user PTE pointing at a frame the
+                            // kernel owns/freed (the 0xDF source). pteW shows if the
+                            // stale mapping is WRITABLE (privesc surface).
+                            uint32_t used=0, rc=0, mc=0, tg=0, op=0;
+                            PmmDescribe(phys, &used, &rc, &mc, &tg, &op);
+                            bool pteW = (pt[i1] & (1ULL << 1)) != 0;
+                            ExcPutsRaw(" [PMM used="); ExcPutHex(used);
+                            ExcPutsRaw(" ref="); ExcPutHex(rc);
+                            ExcPutsRaw(" map="); ExcPutHex(mc);
+                            ExcPutsRaw(" tag="); ExcPutHex(tg);
+                            ExcPutsRaw(" owner="); ExcPutHex(op);
+                            ExcPutsRaw(" pteW="); ExcPutHex(pteW ? 1 : 0);
+                            ExcPutsRaw("]");
+                            if (used == 0)        ExcPutsRaw("  <<< FRAME IS FREE while mapped!");
+                            else if (tg != 6)     ExcPutsRaw("  <<< NON-USER frame (tag!=User) mapped by user!");
+                            ExcPutsRaw("\n");
+                            ++hits;
+                        }
+                    }
+                }
+            }
+        }
+        ExcPutsRaw("  --- end sweep ("); ExcPutHex(static_cast<uint64_t>(hits));
+        ExcPutsRaw(" freed-while-mapped of "); ExcPutHex(static_cast<uint64_t>(looked));
+        ExcPutsRaw(" mapped) ---\n");
+    }
 
     // Note: COW page faults are handled above (before the kernel/user split)
     // for both kernel-mode and user-mode writes to COW-protected user pages.

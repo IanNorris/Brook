@@ -264,6 +264,52 @@ if(NOT BROOK_GIT_HASH)
     set(BROOK_GIT_HASH "unknown")
 endif()
 
+# Mark dirty (uncommitted) trees so a panic's git hash distinguishes a working
+# build from the clean commit. Without this every uncommitted build reports the
+# same short hash and the crash decoder cannot tell which ELF to symbolize
+# against (silently mis-symbolizing). The decoder treats a "-dirty" suffix as
+# "no symbol archive — use the exact local build ELF".
+execute_process(
+    COMMAND git status --porcelain --untracked-files=no
+    WORKING_DIRECTORY "${BROOK_ROOT}"
+    OUTPUT_VARIABLE BROOK_GIT_DIRTY
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if(NOT BROOK_GIT_DIRTY STREQUAL "")
+    # Disambiguate dirty builds by a CONTENT hash of the working tree, so two
+    # different uncommitted states don't both report the bare "+". `git stash
+    # create` snapshots the index+worktree as a commit object; its ^{tree} is a
+    # content-addressed SHA that is identical for identical content and changes
+    # the instant any tracked file changes — clock-independent (unlike a build
+    # timestamp, which Nix freezes to 1980 under SOURCE_DATE_EPOCH). The 8-hex
+    # tag rides in the (widened, 20-byte) panic git-hash field. Ian can verify a
+    # booted kernel matches his tree with:
+    #   git rev-parse "$(git stash create)^{tree}" | cut -c1-8
+    execute_process(
+        COMMAND git stash create
+        WORKING_DIRECTORY "${BROOK_ROOT}"
+        OUTPUT_VARIABLE BROOK_DIRTY_OBJ
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(NOT BROOK_DIRTY_OBJ STREQUAL "")
+        execute_process(
+            COMMAND git rev-parse "${BROOK_DIRTY_OBJ}^{tree}"
+            WORKING_DIRECTORY "${BROOK_ROOT}"
+            OUTPUT_VARIABLE BROOK_DIRTY_TREE
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+    endif()
+    if(BROOK_DIRTY_TREE STREQUAL "")
+        set(BROOK_GIT_HASH "${BROOK_GIT_HASH}+")
+    else()
+        string(SUBSTRING "${BROOK_DIRTY_TREE}" 0 8 BROOK_DIRTY_TAG)
+        set(BROOK_GIT_HASH "${BROOK_GIT_HASH}+${BROOK_DIRTY_TAG}")
+    endif()
+endif()
+
 execute_process(
     COMMAND git rev-parse --abbrev-ref HEAD
     WORKING_DIRECTORY "${BROOK_ROOT}"

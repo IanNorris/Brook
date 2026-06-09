@@ -21,18 +21,111 @@
 #include "smp.h"
 #include "apic.h"
 #include "cpu.h"
+#include "ksym_addrs.h"
 
 namespace brook {
+
+// BRO-176 diagnostic: asLiveThreads inc/dec ring recorder (defined in scheduler.cpp).
+extern "C" void SchedulerRecordAsLive(void* leader, uint16_t actingPid, uint16_t leaderPid,
+                                      uint32_t leaderIncarn, uint32_t procLeaderIncarn,
+                                      int32_t result, uint8_t op);
 
 // ProcessCurrent() is now in scheduler.cpp (g_currentProcess lives there).
 
 // Helper: free a Process* and clear its magic so any stale pointer to this
 // page that survives in the scheduler / wakeup lists fails its magic-check
 // at next deref instead of corrupting the run.
+//
+// BRO-176 DIAGNOSTIC: every Process-struct free is also recorded in a small ring
+// (ptr, freed pid, incarnation, caller return-address, seq). The scheduler's
+// ReadyQueueInsertLocked guard, when it catches a stale/corrupt Process*, looks
+// the pointer up here to name WHICH free site retired the struct and when —
+// pinning the premature-free path for signature 2. Cheap: one locked ring write
+// per process teardown (not a hot path). TEMPORARY — strip with the rest of the
+// BRO-176 instrumentation before the fix commit.
+struct ProcFreeRec {
+    Process* ptr;
+    uint64_t seq;
+    uint64_t retaddr;     // __builtin_return_address(0) of FreeProcessStruct
+    uint32_t incarnation;
+    uint16_t pid;
+};
+static constexpr uint32_t PROCFREELOG_SIZE = 2048;
+static ProcFreeRec  g_procFreeLog[PROCFREELOG_SIZE];
+static uint64_t     g_procFreeSeq = 0;
+static IrqSpinLock  g_procFreeLogLock;
+
+// BRO-179: defined in sync/krwlock.cpp — true while KRwLockCleanupOnExit(p) is
+// running on p. FreeProcessStruct uses it to detect a free racing the cleanup.
+extern "C" int ProcessIsRwCleanupInFlight(void* p);
+
 static inline void FreeProcessStruct(Process* p)
 {
-    if (p) p->magic = 0;
+    if (p)
+    {
+        // Record the free BEFORE clearing magic / handing memory back, capturing
+        // the caller so we can identify the exact teardown path.
+        uint64_t ret = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+        uint64_t fl = IrqSpinLockAcquire(&g_procFreeLogLock);
+        uint32_t i = g_procFreeSeq & (PROCFREELOG_SIZE - 1);
+        g_procFreeLog[i] = { p, ++g_procFreeSeq, ret,
+                             (uint32_t)p->incarnation, p->pid };
+        IrqSpinLockRelease(&g_procFreeLogLock, fl);
+
+        // BRO-179: detect the SIG1 process-lifetime UAF at the SOURCE — a free
+        // racing an in-flight KRwLockCleanupOnExit(p). If this fires, the heap
+        // poison we then write over p is exactly what the concurrent cleanup
+        // reads out of p->heldWriteLock (kernel #GP). 'ret' names the racing
+        // free path. (Detector only for now; the fix will serialize here.)
+        if (ProcessIsRwCleanupInFlight(p)) {
+            const char* sym = nullptr; uint64_t off = 0;
+            bool haveSym = KsymFindByAddr(ret, &sym, &off);
+            SerialPrintf("BRO179-FREE-DURING-RWCLEANUP: freeing proc=%p pid=%u "
+                         "incarnation=%u while KRwLockCleanupOnExit IN-FLIGHT — "
+                         "SIG1 UAF race! freedBy=0x%lx %s+0x%lx\n",
+                         p, (unsigned)p->pid, (unsigned)p->incarnation, ret,
+                         haveSym ? sym : "?", off);
+        }
+
+        p->magic = 0;
+    }
     kfree(p);
+}
+
+// BRO-176 diagnostic: print recent free records for a given Process* (newest
+// first). Returns the number of matching records. Safe to call from the crash
+// guard — takes only g_procFreeLogLock.
+extern "C" int ProcessDumpFreeLog(void* ptr)
+{
+    Process* target = reinterpret_cast<Process*>(ptr);
+    int found = 0;
+    uint64_t fl = IrqSpinLockAcquire(&g_procFreeLogLock);
+    uint32_t scan = (g_procFreeSeq < PROCFREELOG_SIZE)
+                  ? (uint32_t)g_procFreeSeq : PROCFREELOG_SIZE;
+    for (uint32_t n = 1; n <= scan; ++n)
+    {
+        uint32_t i = (uint32_t)((g_procFreeSeq - n) & (PROCFREELOG_SIZE - 1));
+        ProcFreeRec& r = g_procFreeLog[i];
+        if (r.ptr != target) continue;
+        const char* sym = nullptr; uint64_t off = 0;
+        bool haveSym = KsymFindByAddr(r.retaddr, &sym, &off);
+        SerialPrintf("  BRO176-PROCFREE ptr=%p freedSeq=%lu pid=%u incarnation=%u "
+                     "freedBy=0x%lx %s+0x%lx\n",
+                     r.ptr, r.seq, (unsigned)r.pid, r.incarnation, r.retaddr,
+                     haveSym ? sym : "?", off);
+        if (++found >= 4) break;
+    }
+    IrqSpinLockRelease(&g_procFreeLogLock, fl);
+    return found;
+}
+
+// BRO-176: monotonically-increasing incarnation id, never reused — lets a
+// thread's teardown verify its leader struct hasn't been freed+reused for a
+// different incarnation before decrementing that leader's asLiveThreads.
+static uint64_t g_incarnationCounter = 0;
+static inline uint64_t NextIncarnation()
+{
+    return __atomic_add_fetch(&g_incarnationCounter, 1, __ATOMIC_ACQ_REL);
 }
 
 static inline void VnodeHandleUnref(Vnode* vn)
@@ -536,6 +629,8 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     auto* raw = reinterpret_cast<uint8_t*>(proc);
     memset(raw, 0, sizeof(Process));
     proc->magic = PROCESS_MAGIC;
+    proc->incarnation = NextIncarnation();
+    proc->leaderIncarnation = 0;
 
     // Initialize FPU/SSE state with safe defaults so fxrstor works correctly
     // on the first context switch to this process.
@@ -555,6 +650,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     proc->runningOnCpu = -1;
     proc->cpuAffinity = -1;
     proc->tlbCpuMask = 0;
+    proc->asTlbCpuMask = 0;
     proc->schedPriority = 2;  // SCHED_PRIORITY_NORMAL
     proc->umask = 022;         // Default umask
 
@@ -775,6 +871,8 @@ Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
     auto* raw = reinterpret_cast<uint8_t*>(proc);
     memset(raw, 0, sizeof(Process));
     proc->magic = PROCESS_MAGIC;
+    proc->incarnation = NextIncarnation();
+    proc->leaderIncarnation = 0;
 
     // Initialize FPU/SSE state
     proc->fxsave.data[0] = 0x7F;
@@ -791,6 +889,7 @@ Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
     proc->runningOnCpu = -1;
     proc->cpuAffinity = -1;
     proc->tlbCpuMask = 0;
+    proc->asTlbCpuMask = 0;
     proc->isKernelThread = true;
     proc->schedPriority = priority;
 
@@ -874,6 +973,50 @@ void ProcessDestroy(Process* proc)
 
     bool isThread = proc->isThread;
 
+    // BRO-176: a thread being reaped releases its hold on the leader's shared
+    // address space.  Decrement the leader's live-thread count so that once the
+    // last thread is gone the leader becomes reapable and its ProcessDestroy can
+    // safely free the shared page table + user pages (no thread can still be in
+    // the pick->switch window onto this address space).  The leader is reaped
+    // last (gated on asLiveThreads==0 in ReapTerminated), so threadLeader is a
+    // valid live pointer here; guard with a magic check defensively.
+    if (isThread && !proc->isKernelThread)
+    {
+        Process* leader = proc->threadLeader;
+        bool magicOk = leader && leader->magic == PROCESS_MAGIC;
+        bool incarnOk = magicOk && leader->incarnation == proc->leaderIncarnation;
+        if (incarnOk)
+        {
+            int32_t after = __atomic_sub_fetch(&leader->asLiveThreads, 1, __ATOMIC_ACQ_REL);
+            brook::SchedulerRecordAsLive(leader, proc->pid, leader->pid,
+                                         (uint32_t)leader->incarnation,
+                                         (uint32_t)proc->leaderIncarnation, after, /*dec-applied*/1);
+            if (after < 0)
+            {
+                // Safety net: asLiveThreads must never go negative.  A negative
+                // count never equals 0, which would block the leader's reap (and
+                // thus the shared-AS free) forever.  Clamp + warn loudly so a
+                // future accounting bug surfaces as a log line, not a silent hang.
+                SerialPrintf("SCHED: BUG asLiveThreads<0 leader pid=%u (thr pid=%u) — clamping\n",
+                             leader->pid, proc->pid);
+                __atomic_store_n(&leader->asLiveThreads, 0, __ATOMIC_RELEASE);
+            }
+        }
+        else
+        {
+            // BRO-176: a SKIPPED decrement is the prime leak suspect — the matching
+            // increment bumped some leader's count that now never comes back down,
+            // wedging a Terminated leader unreapable (reap-stall hang). Record it.
+            brook::SchedulerRecordAsLive(leader, proc->pid, magicOk ? leader->pid : 0,
+                                         magicOk ? (uint32_t)leader->incarnation : 0,
+                                         (uint32_t)proc->leaderIncarnation, -1,
+                                         magicOk ? /*skip-mismatch*/2 : /*bad-leader*/3);
+        }
+        // If the leader pointer is stale or its incarnation no longer matches
+        // (struct freed+reused), this thread's increment already retired with the
+        // old leader; do nothing rather than decrement an unrelated incarnation.
+    }
+
     // Release any kernel mutexes held by this process (prevents deadlock)
     Ext2ForceUnlockForPid(proc->pid);
 
@@ -916,7 +1059,7 @@ void ProcessDestroy(Process* proc)
         // teardown path (ProcessExec). The reaper runs on CPU0 and never has a
         // terminated process's page table loaded, so unlike exec there is no
         // local CR3 to switch away first.
-        TlbShootdownFull(proc->pageTable.pml4.raw(), proc->tlbCpuMask);
+        TlbShootdownFull(proc->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
 
         // Clear lazy VMAs before page-table destruction. MemFd PTEs point at
         // memfd-owned pages, and file VMAs hold vnode references independent of
@@ -1039,6 +1182,22 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                                           | PTE_COW_BIT
                                           | (((uint64_t)dstPid & 0x3FF) << PTE_PID_SHIFT);
 
+                        // BRO-176: pin the shared frame BEFORE the child mapping
+                        // becomes reachable. Publishing the child's leaf PTE
+                        // (VmmMapPage below) adds a second mapper, but the refcount
+                        // is not bumped until the commit. In that window a
+                        // concurrent teardown of the parent's address space (a
+                        // sibling thread's exit_group) could unref the frame to
+                        // zero and free it while the child maps it — the cross-AS
+                        // COW double-free. Taking an anticipatory reference here
+                        // holds the frame at >=1 across the whole share, so it can
+                        // never be freed mid-share. The matching unref (unpin)
+                        // runs after the commit's own ref is in place. This also
+                        // strengthens BRO-155: refcount is >=2 throughout the
+                        // share window, so the COW write-fault handler always
+                        // observes "shared" and copies, never upgrading in place.
+                        PmmRefPage(srcPhys);
+
                         // Create intermediate page table entries in child FIRST.
                         // VmmMapPage takes g_userPtLock internally, so it must
                         // run BEFORE the locked commit (calling it under the lock
@@ -1052,6 +1211,8 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                         {
                             SerialPrintf("FORK: failed to map COW page at vaddr 0x%lx\n", vaddr);
                             // Parent PTE was not modified — nothing to restore.
+                            // Drop the anticipatory pin taken above.
+                            PmmUnrefPage(srcPhys);
                             return false;
                         }
 
@@ -1072,6 +1233,12 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                         VmmForkCommitCowShare(&srcPt4[i1], &dstPt4[i1],
                                               childPte, srcPhys);
 
+                        // Unpin: the commit's own ref now accounts for the child
+                        // mapper, so drop the anticipatory reference. Net effect of
+                        // pin + commit-ref + unpin is exactly +1 (the child), but
+                        // the frame was never freeable during the share.
+                        PmmUnrefPage(srcPhys);
+
                         copiedCount++;
                         continue;
                     }
@@ -1086,6 +1253,14 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                     // Set child PID
                     childPte |= (((uint64_t)dstPid & 0x3FF) << PTE_PID_SHIFT);
 
+                    // BRO-176: ref the shared frame BEFORE publishing the child
+                    // mapping. VmmMapPage below makes the child a second mapper of
+                    // srcPhys; if the refcount bump came after (as it used to), a
+                    // concurrent parent-AS teardown could free the frame to zero in
+                    // the window while the child maps it. Referencing first holds
+                    // the frame across the publish.
+                    PmmRefPage(srcPhys);
+
                     // Map into child's page table via WalkToPtr (need intermediate tables)
                     // Use VmmMapPage to create intermediates, then override leaf PTE.
                     uint64_t childMapFlags = VMM_USER;
@@ -1098,6 +1273,8 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                                     childMapFlags, MemTag::User, dstPid))
                     {
                         SerialPrintf("FORK: failed to map shared page at vaddr 0x%lx\n", vaddr);
+                        // Drop the reference taken above for the child that never mapped.
+                        PmmUnrefPage(srcPhys);
                         return false;
                     }
 
@@ -1116,20 +1293,17 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                         dstPt4[i1] = childPte;
                     }
 
-                    // Increment physical page refcount for read-only sharing.
-                    PmmRefPage(srcPhys);
-
                     sharedCount++;
                 }
             }
         }
     }
 
-    uint64_t forkElapsed = g_lapicTickCount - forkStartTick;
-    SerialPrintf("[PROFILE] fork_pages t=%lums pid=%u->%u cow=%lu shared=%lu elapsed=%lums\n",
-                 g_lapicTickCount,
-                 static_cast<uint32_t>(srcPid), static_cast<uint32_t>(dstPid),
-                 copiedCount, sharedCount, forkElapsed);
+    [[maybe_unused]] uint64_t forkElapsed = g_lapicTickCount - forkStartTick;
+    DbgPrintf("[PROFILE] fork_pages t=%lums pid=%u->%u cow=%lu shared=%lu elapsed=%lums\n",
+              g_lapicTickCount,
+              static_cast<uint32_t>(srcPid), static_cast<uint32_t>(dstPid),
+              copiedCount, sharedCount, forkElapsed);
 
     // Flush all TLB entries for the parent's address space. Parent PTEs
     // were downgraded from writable to RO+COW, so any stale writable
@@ -1153,6 +1327,8 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     // Copy entire parent process struct as a starting point
     memcpy(child, parent, sizeof(Process));
     child->magic = PROCESS_MAGIC;
+    child->incarnation = NextIncarnation();
+    child->leaderIncarnation = 0;   // a fork child is its own leader
 
     // Allocate new PID
     child->pid = SchedulerAllocPid();
@@ -1196,8 +1372,13 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->runningOnCpu = -1;
     child->cpuAffinity = -1;
     child->tlbCpuMask = 0;
+    child->asTlbCpuMask = 0;
     child->reapable = false;
     child->compositorRegistered = false;
+    child->refCount = 0;             // BRO-173/175: fresh process holds no external refs
+    child->asLiveThreads = 0;        // BRO-176: a fresh address space has no extra threads yet
+    child->groupKillOwned = false;   // BRO-173: fresh group, clean teardown state
+    child->tgidExiting = false;
     child->schedNext = nullptr;
     child->schedPrev = nullptr;
     child->inReadyQueue = 0;
@@ -1252,7 +1433,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     // Copy writable user pages and share read-only mappings.
     if (!ForkCopyUserPages(parent->pageTable, child->pageTable,
                            parent->pid, child->pid,
-                           parent->tlbCpuMask))
+                           *AddressSpaceTlbMaskPtr(parent)))
     {
         SerialPuts("FORK: address space copy failed\n");
         VmmDestroyUserPageTable(child->pageTable);
@@ -1397,7 +1578,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     // Copy parent process struct as starting point
     memcpy(thread, parent, sizeof(Process));
     thread->magic = PROCESS_MAGIC;
-
+    thread->incarnation = NextIncarnation();
     // Allocate TID (threads get unique PIDs but share tgid)
     thread->pid = SchedulerAllocPid();
     if (thread->pid == 0)
@@ -1427,6 +1608,10 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     }
     thread->threadLeader = leader;
     thread->isThread = true;
+    // BRO-176 diagnostic: stamp the leader's incarnation at thread-creation so
+    // a cross-incarnation decrement (leader struct freed+reused under us) is
+    // detectable at teardown.
+    thread->leaderIncarnation = leader->incarnation;
 
     // Share the leader's fd table (CLONE_FILES semantics). The memcpy above
     // already copied the pointer from parent->fds, but that pointer could be
@@ -1443,8 +1628,15 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     thread->runningOnCpu = -1;
     thread->cpuAffinity = leader->cpuAffinity;
     thread->tlbCpuMask = 0;
+    thread->asTlbCpuMask = 0;
     thread->reapable = false;
     thread->compositorRegistered = false;
+    thread->refCount = 0;            // BRO-173/175: fresh thread holds no external refs
+    thread->asLiveThreads = 0;      // BRO-176: per-thread copy unused; only the leader's count matters
+    // BRO-173: these lifecycle latches were memcpy'd from the parent; a new
+    // thread must start with a clean teardown state.
+    thread->groupKillOwned = false;
+    thread->tgidExiting = false;
     thread->schedNext = nullptr;
     thread->schedPrev = nullptr;
     thread->inReadyQueue = 0;
@@ -1525,9 +1717,15 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
         thread->name[31] = '\0';
     }
 
-    SerialPrintf("THREAD: parent pid=%u -> thread tid=%u tgid=%u pt=0x%lx\n",
-                 parent->pid, thread->pid, thread->tgid,
-                 thread->pageTable.pml4.raw());
+    // BRO-176: the increment that registers a thread against its leader's
+    // address space lives in SchedulerAddProcess (the commit-to-g_allProcesses
+    // point), balanced exactly against the decrement in ProcessDestroy (the
+    // remove-from-g_allProcesses point).  Tying it to list membership keeps the
+    // count correct regardless of which clone failure path frees a half-built
+    // thread before it is ever published.
+    DbgPrintf("THREAD: parent pid=%u -> thread tid=%u tgid=%u pt=0x%lx\n",
+              parent->pid, thread->pid, thread->tgid,
+              thread->pageTable.pml4.raw());
 
     return thread;
 }
@@ -1733,7 +1931,7 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     bool wasThread = proc->isThread;
 
     // Flush TLB entries for the old address space on all remote CPUs
-    TlbShootdownFull(oldPt.pml4.raw(), proc->tlbCpuMask);
+    TlbShootdownFull(oldPt.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
 
     __asm__ volatile("mov %0, %%cr3" : : "r"(kernelPt.pml4.raw()) : "memory");
 
@@ -1754,6 +1952,7 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     }
     // Old address space is gone (or detached) — reset TLB CPU mask
     proc->tlbCpuMask = 0;
+    proc->asTlbCpuMask = 0;
     // NOTE: PmmFreeByTag removed here. VmmDestroyUserPageTable already calls
     // PmmUnrefPage on every leaf PTE, which correctly frees pages at refcount=0
     // and preserves pages still referenced by the global file page cache.
@@ -1900,8 +2099,9 @@ int ProcessSendSignal(Process* proc, int signum)
         __atomic_store_n(reinterpret_cast<volatile int*>(&proc->state),
                          static_cast<int>(ProcessState::Terminated),
                          __ATOMIC_RELEASE);
-        if (!__atomic_load_n(&proc->compositorRegistered, __ATOMIC_ACQUIRE))
-            __atomic_store_n(&proc->reapable, true, __ATOMIC_RELEASE);
+        // BRO-173/175: reapable is decoupled from holders; the reaper requires
+        // refCount==0 before freeing, so it is safe to mark reapable here.
+        __atomic_store_n(&proc->reapable, true, __ATOMIC_RELEASE);
         DbgPrintf("SIGNAL: SIGKILL -> pid %u\n", proc->pid);
         return 0;
     }
@@ -1982,8 +2182,9 @@ int ProcessSendSignal(Process* proc, int signum)
             __atomic_store_n(reinterpret_cast<volatile int*>(&proc->state),
                              static_cast<int>(ProcessState::Terminated),
                              __ATOMIC_RELEASE);
-            if (!__atomic_load_n(&proc->compositorRegistered, __ATOMIC_ACQUIRE))
-                __atomic_store_n(&proc->reapable, true, __ATOMIC_RELEASE);
+            // BRO-173/175: reapable decoupled from holders (reaper requires
+            // refCount==0), so it is safe to mark reapable unconditionally.
+            __atomic_store_n(&proc->reapable, true, __ATOMIC_RELEASE);
             DbgPrintf("SIGNAL: sig %d -> pid %u terminated (default action)\n",
                       signum, proc->pid);
             return 0;
