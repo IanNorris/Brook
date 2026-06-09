@@ -145,49 +145,69 @@ after the free**. `CR4.PGE` is off, so any `mov cr3` evicts all non-global
 entries. Once every CPU has flushed since a frame was unmapped, no CPU can hold a
 stale translation for it, so it is safe to reissue to any domain.
 
-**The mechanism (batched all-CPU TLB barrier drain).** `PmmFreePage` /
-`PmmUnrefPage` / `PmmKillPid` / `PmmFreeByTag` no longer return a frame to the
-allocatable pool immediately. A retired frame is queued into a quarantine buffer
-(`RetireFrameLocked`, under `g_pmmLock`); it stays bitmap-`USED` so the allocator
-skips it. A single dedicated kernel thread (`PmmDrainThread`, started by
-`PmmStartDrainThread()` once the scheduler is up) does the release:
+**The mechanism (passive TLB-epoch barrier + throttled batch drain).**
+`PmmFreePage` / `PmmUnrefPage` / `PmmKillPid` / `PmmFreeByTag` no longer return a
+frame to the allocatable pool immediately. A retired frame is pushed onto a
+**descriptor-linked quarantine list** (`RetireFrameLocked`, under `g_pmmLock`,
+threaded through each `PageDescriptor.next` — zero extra storage, O(1), no fixed
+capacity); it stays bitmap-`USED` so the allocator skips it. A single dedicated
+kernel thread (`PmmDrainThread`, started by `PmmStartDrainThread()` after the
+scheduler is up — it MUST be enqueued via `SchedulerAddProcess`, the omission of
+which silently disabled the barrier for a long time) does the release:
 
-1. When the quarantine reaches a low-water mark it snapshots the live buffer into
-   a private batch and empties the live buffer, **all under `g_pmmLock`**, then
-   drops the lock.
-2. It calls `TlbFlushAllCpusBarrier()` (apic.cpp): an unconditional all-CPU full
-   flush with **positive acknowledgement and no forgiveness** — it does *not*
-   exempt a CPU because it is "on a different CR3" (the forgiveness in the normal
-   `TlbShootdownFull` path is exactly what lets a stale entry survive for a
-   multi-address-space batch), and it **panics on timeout** rather than
-   proceeding (for a privesc-class invariant we fail loud, never silently release
-   an un-flushed frame).
+1. It sleeps a short interval (~4ms), then splices out the **entire** accumulated
+   list in O(1) under `g_pmmLock` and drops the lock.
+2. It calls `TlbFlushAllCpusBarrier()` (apic.cpp) — the passive epoch barrier
+   (below) — once for the whole batch.
 3. After the barrier returns, every frame in the batch was freed *before* the
-   barrier started, so every CPU has now flushed since each frame's free. The
-   drainer re-acquires `g_pmmLock` and releases the batch back to the pool.
+   barrier, so every CPU has flushed since each frame's free. The drainer
+   re-acquires `g_pmmLock` and releases the whole list back to the pool.
 
-Frames freed *during* the barrier land in the now-empty live buffer and ride the
-**next** drain — correct, because the barrier that freed a frame must have started
-after that frame's free.
+Frames freed *during* the barrier accumulate on a fresh list and ride the **next**
+drain — correct, because the barrier that frees a frame must have started after
+that frame's free.
 
-**Why a single drainer + snapshot/seal.** Only `PmmDrainThread` ever runs the
-barrier, so the many-CPU per-free shootdown livelock (CPUs cross-contending
-`g_tlbRequest.lock`, mutually timing out) cannot occur. The barrier busy-waits for
-remote ACKs, so it **must** run with `IF=1` and no `IrqSpinLock` held — a CPU
-spinning on a lock the drainer holds (`IF=0`) could not service the IPI. The drain
-thread satisfies this; `RetireFrameLocked` only *queues* (it never barriers), so
-the hot free path stays cheap and lock-safe.
+**The barrier — passive TLB epoch (apic.cpp).** The first implementation used an
+all-CPU IPI: the drainer held `g_tlbRequest.lock`, IPI'd every CPU and spun for
+ACKs. That **deadlocked** once the drainer actually ran: a target CPU spinning
+`IF=0` on that same lock to start its *own* shootdown can never service the
+barrier IPI, so it never ACKs (a true circular deadlock if it also holds
+`g_vmmLock`/`g_pmmLock`). Normal per-AS shootdowns avoid this because they target
+only CPUs whose `CR3 == targetCr3` (in user mode, `IF=1`), never CPUs spinning
+in-kernel on the lock. The all-CPU barrier broke that assumption. The replacement
+is lock-free and passive:
 
-**Overflow (no bypass).** If the drainer falls behind and the fixed buffer
-(`QUAR_CAP`) fills, `RetireFrameLocked` does **not** release the frame early —
-that would return it to the pool without an all-CPU barrier since its free, which
-is exactly the bug. Instead the frame is pushed onto an **overflow list** threaded
-through each descriptor's now-unused `next` link (zero extra storage, no
-allocation, O(1), never blocks the IF=0 free path). The drainer pulls from the
-buffer **and** the overflow list, so *every* frame passes a barrier before reuse,
-with no fixed ceiling. A liveness guard panics if the overflow grows past half of
-RAM (the drainer is wedged) rather than silently exhausting memory or bypassing
-the barrier — a privesc-class invariant fails loud.
+- A global `g_tlbEpoch` is bumped by the drainer when it wants to release a batch.
+- Every CPU, at its LAPIC timer tick (`IF=1` safe point), runs
+  `TlbEpochFlushLocal()`: if behind, it does a full `mov cr3` reload (a serializing
+  full flush — see the invariant; verified `CR4.PGE` is **off**, asserted at the
+  first barrier so it fails loud if PGE is ever enabled) and publishes the epoch it
+  flushed with a release store.
+- The drainer flushes itself, then spins holding **no lock** until every online
+  CPU has published `>= target`, then returns. Generous timeout → **panic** (fail
+  loud; never release an un-flushed frame). Deadlock-free by construction: the
+  drainer holds no lock while waiting, so no CPU can be blocked on it; every CPU
+  reaches its timer tick within a bounded time of leaving any `IF=0` section.
+
+**Why throttle + one barrier per batch.** Each epoch bump forces *every* CPU to
+reload CR3 (full TLB flush) at its next tick. Bumping per small batch makes all
+CPUs flush almost continuously — TLBs never warm, and at 64 CPUs throughput
+collapses (the LAPIC tick rate itself craters). Accumulating ~4ms of frees and
+releasing them behind **one** barrier amortizes the system-wide flush over many
+frees. A freed frame waits at most ~4ms + one barrier before reuse.
+
+**No bypass.** A retired frame is *only* ever released by the drainer, *after* a
+barrier — there is no early-release path. A liveness guard panics if the
+quarantine list grows past half of RAM (the drainer is wedged) rather than
+silently exhausting memory or bypassing the barrier — a privesc-class invariant
+fails loud. (`MaxKernelPTs` in the bootloader was also raised so the kernel's
+larger BSS — the reflog/bitmap — is fully mapped; it now fails loud if exceeded.)
+
+**Real-HW note.** A CPU in deep idle without ARAT can stop its LAPIC timer and
+never advance its epoch → the drainer would time out. On KVM the periodic LAPIC
+timer fires through `hlt`, so the timer backstop suffices; a fire-and-forget nudge
+IPI on epoch bump (to wake such CPUs promptly) is a documented follow-up for bare
+metal.
 
 **Tradeoffs / limitations (accepted):**
 - Holds freed frames out of circulation transiently (buffer + overflow) until the

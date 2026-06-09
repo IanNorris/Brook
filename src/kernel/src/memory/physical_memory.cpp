@@ -494,9 +494,9 @@ void PmmStartDrainThread()
     Process* t = KernelThreadCreate("pmm_drain", PmmDrainThread, nullptr, 2);
     if (t)
         SchedulerAddProcess(t);   // enqueue onto the ready queue (else it never runs)
-    if (g_drainDebug)
-        SerialPrintf("PMM-DRAIN: PmmStartDrainThread called, KernelThreadCreate -> %p\n",
-                     (void*)t);
+    else
+        KernelPanic("BRO-179: pmm_drain thread creation failed — quarantine cannot "
+                    "drain, refusing to run with the frame-reuse gate disabled");
 }
 #else
 // Host unit tests don't link the scheduler/apic; the quarantine drain is a
@@ -1048,7 +1048,7 @@ void PmmEnableTracking()
     g_freeLogOn = true;
     g_framePoisonOn = false;
 #ifndef BROOK_HOST_TEST
-    g_drainDebug = true;   // BRO-179: temporary — confirm the drainer runs/keeps up
+    g_drainDebug = false;  // drainer verified to run/keep up; enable for diagnosis
 #endif
 
     // Silence the high-frequency hot-path serial logs (TLB-shootdown forgiveness,
