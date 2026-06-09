@@ -1039,13 +1039,15 @@ void PmmEnableTracking()
     // stale kernel translations on other CPUs that corrupt the recycled frame.
     // Fix: quarantine ON (the all-CPU TLB-barrier drain, with the overflow list
     // closing the old release-without-barrier bypass) gates frame REUSE for every
-    // such path at once. Keep the PMM reflog ON: it is the diagnostic that named
-    // this root cause (the fault-time frame-history dump) and its cost is modest;
-    // it stays as a permanent safety net for this expensive bug class. Frame
-    // poison is OFF — its job (proving cross-domain reuse) is done and the 4 KiB
-    // fill per free is too costly for steady state. (Set g_framePoisonOn=true and
-    // g_quarantineOn=false to re-arm a forensic A/B hunt.)
-    g_freeLogOn = true;
+    // such path at once. The PMM reflog (the diagnostic that named this root
+    // cause via the fault-time frame-history dump) is left in place but DEFAULT
+    // OFF — its per-alloc/free ring write + stack-walk is a steady-state cost not
+    // worth paying continuously. Flip g_freeLogOn=true to re-arm provenance when
+    // hunting a relapse/BRO-181. Frame poison is OFF too (its job — proving
+    // cross-domain reuse — is done; the 4 KiB fill per free is costly). (Set
+    // g_freeLogOn=true + g_framePoisonOn=true + g_quarantineOn=false to re-arm a
+    // full forensic A/B hunt.)
+    g_freeLogOn = false;
     g_framePoisonOn = false;
 #ifndef BROOK_HOST_TEST
     g_drainDebug = false;  // drainer verified to run/keep up; enable for diagnosis
