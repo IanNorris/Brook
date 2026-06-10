@@ -348,6 +348,12 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
 // Hit-test the launcher popup. Returns item index (0..N) or -1 if miss.
 int WmLauncherHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH);
 
+// Get the launcher popup panel geometry (screen-space rect). Lets the GPU
+// compositor mark its pixels opaque / compose it as a translucent overlay.
+void WmLauncherGetRect(uint32_t screenW, uint32_t screenH,
+                       int32_t* outX, int32_t* outY,
+                       uint32_t* outW, uint32_t* outH);
+
 // Launch the item at the given index.
 void WmLauncherExec(int itemIdx);
 

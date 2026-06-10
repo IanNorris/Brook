@@ -350,11 +350,19 @@ fi
 if [ "${BROOK_GPU_FULL:-0}" = "1" ]; then
     FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/gpufull,string=1"
 fi
-if [ "${BROOK_GPU_DRAW:-0}" = "1" ]; then
-    FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/gpudraw,string=1"
+# DRAW is the default composition path when BROOK_COMPOSITE=gpu (and 3D accel is
+# present). Pass the value through so BROOK_GPU_DRAW=0 can force the BLIT path.
+if [ -n "${BROOK_GPU_DRAW:-}" ]; then
+    FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/gpudraw,string=${BROOK_GPU_DRAW}"
 fi
 if [ -n "${BROOK_GPU_OPACITY:-}" ]; then
     FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/gpuopacity,string=${BROOK_GPU_OPACITY}"
+fi
+if [ -n "${BROOK_GPU_OVERLAY_OPACITY:-}" ]; then
+    FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/gpuoverlayopacity,string=${BROOK_GPU_OVERLAY_OPACITY}"
+fi
+if [ "${BROOK_GPU_LAUNCH:-0}" = "1" ]; then
+    FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/gpulaunch,string=1"
 fi
 
 # GPU device selection.

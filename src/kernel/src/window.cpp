@@ -1812,6 +1812,13 @@ static void LauncherGetRect(uint32_t screenW, uint32_t screenH,
     *outH = panelH;
 }
 
+void WmLauncherGetRect(uint32_t screenW, uint32_t screenH,
+                       int32_t* outX, int32_t* outY,
+                       uint32_t* outW, uint32_t* outH)
+{
+    LauncherGetRect(screenW, screenH, outX, outY, outW, outH);
+}
+
 void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
                       uint32_t screenW, uint32_t screenH,
                       int32_t mouseX, int32_t mouseY)
