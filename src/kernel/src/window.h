@@ -87,6 +87,7 @@ struct Window
     uint32_t    zOrder;         // higher = on top (0 = backmost)
     uint8_t     upscale;        // integer upscale factor (1 = 1:1, 2 = 2×, 4 = 4×)
     uint8_t     opacity;        // per-window opacity 0..255 (255 = opaque); GPU DRAW path
+    uint8_t     blurRadius;     // backdrop blur behind the window/chrome (0 = off); GPU DRAW path
     WindowState state;
     bool        focused;
     bool        visible;
@@ -224,6 +225,14 @@ void WmRestoreWindow(int idx);
 // kernel WM stops drawing chrome and treats the whole outer area as client.
 // Used by waylandd to honour zxdg_toplevel_decoration_v1.set_mode.
 void WmSetClientSideDecoration(int idx, bool enable);
+
+// Per-window display-property bits for WmSetWindowProperties / syscall 0xB00.
+static constexpr uint32_t WM_PROP_OPACITY = 1u << 0;  // apply opacity arg
+static constexpr uint32_t WM_PROP_BLUR    = 1u << 1;  // apply blurRadius arg
+
+// Set per-window opacity and/or backdrop blur radius (selected by `mask`).
+// Marks the compositor dirty. The GPU DRAW path reads these per window.
+void WmSetWindowProperties(int idx, uint32_t mask, uint8_t opacity, uint8_t blurRadius);
 
 // Move a window to a new position.
 void WmMoveWindow(int idx, int16_t newX, int16_t newY);

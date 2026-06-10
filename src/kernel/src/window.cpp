@@ -245,6 +245,7 @@ int WmCreateWindow(Process* proc, int16_t x, int16_t y,
     w.zOrder = g_nextZOrder++;
     w.upscale = (upscale >= 1) ? upscale : 1;
     w.opacity = 255;
+    w.blurRadius = 0;
     w.state = WindowState::Normal;
     w.focused = false;
     w.visible = true;
@@ -583,6 +584,23 @@ void WmSetClientSideDecoration(int idx, bool enable)
     extern void CompositorMarkDirty();
     CompositorMarkDirty();
     SerialPrintf("WM: window %d CSD=%d\n", idx, (int)enable);
+}
+
+// Set per-window display properties (opacity and/or backdrop blur radius). `mask`
+// selects which fields to apply: bit 0 = opacity, bit 1 = blurRadius. Marks the
+// compositor dirty so the change is composited next frame. The GPU DRAW path
+// reads w.opacity (and, for frosted glass, w.blurRadius).
+void WmSetWindowProperties(int idx, uint32_t mask, uint8_t opacity, uint8_t blurRadius)
+{
+    if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
+    Window& w = g_windows[idx];
+    if (!w.proc) return;
+    bool changed = false;
+    if ((mask & WM_PROP_OPACITY) && w.opacity != opacity)    { w.opacity = opacity; changed = true; }
+    if ((mask & WM_PROP_BLUR)    && w.blurRadius != blurRadius) { w.blurRadius = blurRadius; changed = true; }
+    if (!changed) return;
+    extern void CompositorMarkDirty();
+    CompositorMarkDirty();
 }
 
 uint32_t WmWindowCount()

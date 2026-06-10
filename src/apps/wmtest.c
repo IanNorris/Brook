@@ -14,6 +14,9 @@
 #define BROOK_WM_SIGNAL_DIRTY    508
 #define BROOK_WM_SET_TITLE       509
 #define BROOK_WM_POP_INPUT       510
+#define BROOK_WM_SET_WINDOW_PROPERTIES 0xB00
+#define WM_PROP_OPACITY          (1u << 0)
+#define WM_PROP_BLUR             (1u << 1)
 
 #define WM_EVT_CLOSE_REQUESTED   0x80
 #define WM_EVT_FOCUS_GAINED      0x81
@@ -51,6 +54,11 @@ static long wm_pop(uint32_t id, struct wm_input_evt* buf, long max) {
 
 static long wm_destroy(uint32_t id) {
     return syscall(BROOK_WM_DESTROY_WINDOW, (long)id);
+}
+
+static long wm_set_opacity(uint32_t id, unsigned op) {
+    return syscall(BROOK_WM_SET_WINDOW_PROPERTIES, (long)id,
+                   (long)WM_PROP_OPACITY, (long)op, 0L);
 }
 
 static void fill(uint32_t* fb, uint32_t stride, uint16_t w, uint16_t h,
@@ -106,6 +114,11 @@ int main(void) {
     if (wm_create(A.w, A.h, "wmtest red",  &A.info) != 0) return 1;
     if (wm_create(B.w, B.h, "wmtest blue", &B.info) != 0) return 1;
     printf("wmtest: A id=%u  B id=%u\n", A.info.wm_id, B.info.wm_id);
+
+    // Prove the per-window property syscall (0xB00): make window A translucent
+    // via its own opacity (no demo hook), so the wallpaper shows through it.
+    long pr = wm_set_opacity(A.info.wm_id, 140);
+    printf("wmtest: set A opacity=140 -> %ld\n", pr);
 
     redraw(&A);
     redraw(&B);

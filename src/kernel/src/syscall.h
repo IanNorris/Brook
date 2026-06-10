@@ -7,7 +7,12 @@ namespace brook {
 struct Process;
 
 // Maximum number of syscalls. Must match the dispatcher bounds check.
-static constexpr uint64_t SYSCALL_MAX = 600;
+// Brook implements the Linux x86-64 ABI (0..~460) plus Brook-specific syscalls.
+// The window/WM API lives at 506..524; Brook windowing *extensions* use a high
+// 0xB00 block deliberately clear of both the Linux range and the Windows
+// ntoskrnl (~0..0x1FF) / win32k (0x1000+) syscall index ranges, so there is no
+// risk of collision if Brook ever hosts foreign binaries.
+static constexpr uint64_t SYSCALL_MAX = 0xC00;   // 3072 (covers the 0xB00 extension block)
 
 // Syscall numbers (Linux x86-64 ABI)
 static constexpr uint64_t SYS_READ            = 0;
