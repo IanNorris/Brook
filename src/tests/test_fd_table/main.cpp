@@ -143,7 +143,12 @@ static void CloserWorker()
 static void TestConcurrent()
 {
     constexpr int      THREADS = 16;
-    constexpr uint64_t ROUNDS  = 4000;
+    // Round count kept modest: the per-round cost is dominated by 16 thread
+    // create/join cycles, so high counts made this test take 13s+ idle (and
+    // 30s+ under load, tripping CI timeouts) while adding little race coverage.
+    // ~500 rounds still drives ~128k claims; run-tsan-tests.sh is the
+    // deterministic race oracle for deeper checking.
+    constexpr uint64_t ROUNDS  = 500;
 
     uint64_t totalExpected = 0;
     for (uint64_t r = 0; r < ROUNDS; ++r) {
@@ -308,7 +313,9 @@ static void TestPinConcurrent()
 {
     constexpr int      USERS   = 12;
     constexpr int      CLOSERS = 4;
-    constexpr uint64_t ROUNDS  = 6000;
+    // See TestConcurrent: counts trimmed so the suite stays well under CI
+    // timeouts; TSan remains the deterministic race oracle.
+    constexpr uint64_t ROUNDS  = 800;
 
     for (uint32_t i = 0; i < MAX_FDS; ++i) pin_fds[i].type = FdType::None;
 
