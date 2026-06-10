@@ -394,14 +394,32 @@ if [ -n "${BROOK_GPU:-}" ] && [ "${BROOK_GPU}" != "0" ]; then
     export __EGL_VENDOR_LIBRARY_DIRS="${MESA_PATH}/share/glvnd/egl_vendor.d"
     export LD_LIBRARY_PATH="${GLVND_PATH}/lib:${MESA_PATH}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
     DISPLAY_OPT="-display egl-headless,rendernode=${GPU_RENDERNODE}"
-    if [ "${BROOK_GPU}" = "venus" ]; then
-        GPU_OPTS="-device virtio-gpu-gl-pci,id=vgpu,blob=true,venus=true,hostmem=${BROOK_GPU_HOSTMEM:-4G}"
-        # Host-visible blob memory needs shareable machine RAM (memfd). The
-        # ,memory-backend=mem1 suffix is appended to the -machine q35 line.
-        MEM_BACKEND_OPTS="-object memory-backend-memfd,id=mem1,size=8G,share=on"
-        MACHINE_MEMBACKEND=",memory-backend=mem1"
+    # Use the VGA-class GL device (virtio-vga-gl) as the PRIMARY display, not a
+    # secondary virtio-gpu-gl-pci behind stdvga. virtio-vga-gl provides the boot
+    # GOP (VGA compat) AND the virtio-gpu 3D interface, so the existing driver
+    # takeover (primary-VGA path) drives the live desktop through the host GPU —
+    # exactly like BROOK_VIRTIO_VGA but GL-capable. With stdvga gone, bochs won't
+    # load and the screendump captures the GPU-presented frame.
+    # (Set BROOK_GPU_SECONDARY=1 to keep the old stdvga-primary + idle GL
+    # secondary topology for A/B.)
+    if [ "${BROOK_GPU_SECONDARY:-0}" = "1" ]; then
+        if [ "${BROOK_GPU}" = "venus" ]; then
+            GPU_OPTS="-device virtio-gpu-gl-pci,id=vgpu,blob=true,venus=true,hostmem=${BROOK_GPU_HOSTMEM:-4G}"
+            MEM_BACKEND_OPTS="-object memory-backend-memfd,id=mem1,size=8G,share=on"
+            MACHINE_MEMBACKEND=",memory-backend=mem1"
+        else
+            GPU_OPTS="-device virtio-gpu-gl-pci,id=vgpu,blob=true"
+        fi
     else
-        GPU_OPTS="-device virtio-gpu-gl-pci,id=vgpu,blob=true"
+        if [ "${BROOK_GPU}" = "venus" ]; then
+            GPU_OPTS="-vga none -device virtio-vga-gl,id=vgpu,blob=true,venus=true,hostmem=${BROOK_GPU_HOSTMEM:-4G}"
+            # Host-visible blob memory needs shareable machine RAM (memfd). The
+            # ,memory-backend=mem1 suffix is appended to the -machine q35 line.
+            MEM_BACKEND_OPTS="-object memory-backend-memfd,id=mem1,size=8G,share=on"
+            MACHINE_MEMBACKEND=",memory-backend=mem1"
+        else
+            GPU_OPTS="-vga none -device virtio-vga-gl,id=vgpu,blob=true"
+        fi
     fi
 fi
 

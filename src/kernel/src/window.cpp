@@ -12,6 +12,7 @@
 #include "serial.h"
 #include "rtc.h"
 #include "terminal.h"
+#include "display.h"
 #include "vfs.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
@@ -1113,6 +1114,39 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
                    static_cast<int>(clockX),
                    static_cast<int>(btnY + textYOff),
                    clockBuf, WM_TASKBAR_CLOCK_FG, WM_TASKBAR_BG);
+
+    // GPU-presentation indicator — a small "GPU" badge to the LEFT of the clock.
+    // Lit green when the virtio-gpu driver owns the active display (the takeover
+    // path is presenting frames through the host GPU); dim grey otherwise (GOP/
+    // stdvga software path). Gives an at-a-glance confirmation that accelerated
+    // presentation is live.
+    {
+        const char* gpuLabel = "GPU";
+        const brook::DisplayOps* disp = brook::DisplayGetActive();
+        bool gpuActive = disp && disp->name &&
+                         disp->name[0] == 'v' &&   // "virtio-gpu"
+                         disp->name[1] == 'i' &&
+                         disp->name[2] == 'r' &&
+                         disp->name[3] == 't';
+        // green when active, muted grey otherwise.
+        uint32_t badgeFg = gpuActive ? 0x0040E060u : 0x00606070u;
+
+        uint32_t labelW = 0;
+        for (const char* p = gpuLabel; *p; p++)
+        {
+            int code = static_cast<int>(static_cast<uint8_t>(*p));
+            if (code >= static_cast<int>(fa.firstChar) &&
+                code < static_cast<int>(fa.firstChar + fa.glyphCount))
+                labelW += static_cast<uint32_t>(fa.glyphs[code - static_cast<int>(fa.firstChar)].advance);
+        }
+        // Sit just left of the clock with one padding gap.
+        uint32_t badgeX = clockX - labelW - WM_TASKBAR_PADDING * 2;
+        if (badgeX < screenW)   // guard against underflow on a very narrow screen
+            WmRenderString(backBuffer, stride, screenW, screenH,
+                           static_cast<int>(badgeX),
+                           static_cast<int>(btnY + textYOff),
+                           gpuLabel, badgeFg, WM_TASKBAR_BG);
+    }
 }
 
 int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
