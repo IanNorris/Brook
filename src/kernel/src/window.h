@@ -10,7 +10,7 @@ struct InputEvent;
 // Window manager constants
 static constexpr uint32_t WM_TITLE_BAR_HEIGHT = 30;
 static constexpr uint32_t WM_BORDER_WIDTH     = 2;
-static constexpr uint32_t WM_BUTTON_WIDTH     = 34;
+static constexpr uint32_t WM_BUTTON_WIDTH     = 40;
 static constexpr uint32_t WM_RESIZE_GRAB      = 16;  // corner/edge grab zone for resize
 static constexpr uint32_t WM_RESIZE_EDGE      = 6;   // edge-only grab zone (bottom/right)
 static constexpr uint32_t WM_MIN_WIDTH        = 200;
@@ -41,6 +41,7 @@ static constexpr uint32_t WM_BORDER_UNFOCUSED   = 0x00565A66; // slate edge
 static constexpr uint32_t WM_TITLE_SHEEN_FOCUSED   = 0x00AFD6F5; // 1px top glass sheen
 static constexpr uint32_t WM_TITLE_SHEEN_UNFOCUSED = 0x00707682; // 1px top highlight
 static constexpr uint8_t  WM_CHROME_TITLE_ALPHA = 0xD8;       // ~85% opaque titlebar (glass)
+static constexpr int      WM_BTN_SLANT          = 12;        // ~30deg shear on the button's vertical sides
 // Caption button glass fill (vertical gradient) + faux-engraved bevel edges.
 static constexpr uint32_t WM_BTN_TOP            = 0x004E84C0; // button glass top
 static constexpr uint32_t WM_BTN_BOT            = 0x002B568E; // button glass bottom

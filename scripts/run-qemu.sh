@@ -359,6 +359,9 @@ fi
 if [ "${BROOK_GPU_LAUNCH:-0}" = "1" ]; then
     FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/gpulaunch,string=1"
 fi
+if [ -n "${BROOK_GPU_MOUSE:-}" ]; then
+    FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/gpumouse,string=${BROOK_GPU_MOUSE}"
+fi
 
 # GPU device selection.
 #   default            : stdvga (q35) primary + virtio-gpu-pci secondary head.

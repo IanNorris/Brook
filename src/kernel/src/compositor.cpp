@@ -320,7 +320,11 @@ static GpuTexId  g_overlayTex     = 0;       // g_overlayBuffer as an alpha text
 static bool      g_overlayTexNeedsFull = true; // force a full overlay upload
 static uint32_t  g_overlayOpacity = 255;     // opt/gpuoverlayopacity (255 = opaque)
 static bool      g_overlayLauncherShown = false; // launcher drawn into overlay last frame
+static uint32_t  g_lastHoverSig   = 0xFFFFFFFFu; // last hovered caption-button signature
 static bool      g_gpuLaunchDemo  = false;   // opt/gpulaunch: auto-open launcher for capture
+static bool      g_gpuMouseDemo   = false;   // opt/gpumouse: warp cursor once for capture
+static int32_t   g_gpuMouseDemoX  = 0;
+static int32_t   g_gpuMouseDemoY  = 0;
 static GpuTexId  g_cursorTex      = 0;       // ARGB cursor sprite
 // Per-window-slot content texture tracking (recreated when the VFB changes).
 struct WinTexEntry { GpuTexId tex; uint32_t* vfb; uint32_t w; uint32_t h; };
@@ -475,6 +479,21 @@ void CompositorInit()
     {
         g_gpuLaunchDemo = true;
         SerialPuts("COMPOSITOR: GPU launcher auto-open demo enabled (opt/gpulaunch)\n");
+    }
+
+    // Verification/demo hook: opt/gpumouse == "<x>,<y>" warps the cursor once
+    // after boot, so hover states (e.g. caption-button highlight) can be observed
+    // in a headless capture.
+    char gmc[16] = {};
+    uint32_t gmn = FwCfgReadFile("opt/gpumouse", gmc, sizeof(gmc) - 1);
+    if (gmn >= 3)
+    {
+        int32_t mx = 0, my = 0; uint32_t i = 0;
+        for (; i < gmn && gmc[i] >= '0' && gmc[i] <= '9'; ++i) mx = mx * 10 + (gmc[i] - '0');
+        while (i < gmn && (gmc[i] < '0' || gmc[i] > '9')) ++i;   // skip separator
+        for (; i < gmn && gmc[i] >= '0' && gmc[i] <= '9'; ++i) my = my * 10 + (gmc[i] - '0');
+        g_gpuMouseDemoX = mx; g_gpuMouseDemoY = my; g_gpuMouseDemo = true;
+        SerialPrintf("COMPOSITOR: GPU cursor warp demo enabled (opt/gpumouse=%d,%d)\n", mx, my);
     }
 }
 
@@ -1222,6 +1241,29 @@ static void CompositorLoopWM()
     bool fullRepaint = forceAll
                      || __atomic_exchange_n(&g_needsFullRepaint, false, __ATOMIC_ACQ_REL);
 
+    // Caption-button hover: when the pointer moves onto/off a titlebar button (or
+    // to a different button/window), the chrome must be redrawn so the hovered
+    // button shows its hover colour. Detect a change in the hovered (window,zone)
+    // signature and force a full repaint for this frame. Hover changes are rare,
+    // so the extra repaint is cheap.
+    {
+        int32_t hmx = 0, hmy = 0;
+        MouseGetPosition(&hmx, &hmy);
+        WmHitResult hh = WmHitTest(hmx, hmy);
+        bool overButton = (hh.zone == WmHitZone::CloseButton ||
+                           hh.zone == WmHitZone::MaximizeButton ||
+                           hh.zone == WmHitZone::MinimizeButton);
+        // Signature: window index + zone when over a button, else a sentinel.
+        uint32_t sig = overButton
+            ? ((static_cast<uint32_t>(hh.windowIndex) << 8) | static_cast<uint32_t>(hh.zone))
+            : 0xFFFFFFFFu;
+        if (sig != g_lastHoverSig)
+        {
+            g_lastHoverSig = sig;
+            fullRepaint = true;
+        }
+    }
+
     // GPU path: per-window chrome is composited from a separate alpha layer
     // (g_chromeBuffer) rather than baked into the opaque base desktop, so chrome
     // can honour per-window opacity. Clear the layer on a full repaint (mirrors
@@ -1257,6 +1299,16 @@ static void CompositorLoopWM()
         WmLauncherToggle();
         g_gpuLaunchDemo = false;
         __atomic_store_n(&g_needsFullRepaint, true, __ATOMIC_RELEASE);
+    }
+
+    // Demo: warp the cursor once (opt/gpumouse) so hover states show in a capture.
+    if (g_gpuMouseDemo)
+    {
+        // In headless boots the mouse bounds may be unset (no pointer device),
+        // which would clamp the warp to (-1,-1); set them to the display size.
+        MouseSetBounds(g_physFbWidth, g_physFbHeight);
+        MouseSetPosition(g_gpuMouseDemoX, g_gpuMouseDemoY);
+        g_gpuMouseDemo = false;
     }
 
     // Track whether any lower-z window was blitted. If so, higher-z windows

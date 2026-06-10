@@ -823,29 +823,33 @@ uint32_t WmGetZOrder(int* outIndices, uint32_t maxOut)
     }
 }
 
-// Draw a caption button: a rounded-rect glass cell (vertical gradient) with a
-// faux-engraved bevel — a dark inner shadow along the top+left edges and a light
-// highlight along the bottom+right edges, so the button reads as carved into the
-// titlebar. The 1px corners are left unfilled so the titlebar shows through for a
-// soft rounded look. Icon glyphs are drawn by the caller, engraved on top.
+// Draw a caption button: a sheared parallelogram glass cell (vertical gradient)
+// with a faux-engraved bevel — a dark inner shadow along the top + left-slanted
+// edges and a light highlight along the bottom + right-slanted edges, so the
+// button reads as carved into the titlebar. The vertical sides are slanted by
+// WM_BTN_SLANT (~30deg) for character: the shape leans forward (top-left to
+// bottom-right). Icon glyphs are drawn by the caller, centred on the parallelogram.
 static void WmDrawCaptionButton(uint32_t* buf, uint32_t stride,
                                 uint32_t screenW, uint32_t screenH,
                                 int bx, int by, int bw, int bh,
                                 uint32_t top, uint32_t bot)
 {
+    int slant = WM_BTN_SLANT;
+    if (slant > bw - 2) slant = bw - 2;
+    int fillW = bw - slant;
+    int denom = (bh > 1) ? (bh - 1) : 1;
     for (int r = 0; r < bh; ++r)
     {
         uint32_t rc = WmLerpColor(top, bot, r, bh - 1);
-        // Inset the very top/bottom rows by 1px at each end for rounded corners.
-        int inset = (r == 0 || r == bh - 1) ? 1 : 0;
-        WmFillRect(buf, stride, screenW, screenH,
-                   bx + inset, by + r, bw - 2 * inset, 1, rc);
+        int lx = bx + slant * r / denom;   // forward lean: top at bx, bottom at bx+slant
+        WmFillRect(buf, stride, screenW, screenH, lx, by + r, fillW, 1, rc);
+        // Slanted-side bevel: dark on the left edge, light on the right edge.
+        WmPutPixel(buf, stride, screenW, screenH, lx, by + r, WM_BTN_BEVEL_DARK);
+        WmPutPixel(buf, stride, screenW, screenH, lx + fillW - 1, by + r, WM_BTN_BEVEL_LIGHT);
     }
-    // Engraved bevel: dark top + left, light bottom + right (skip rounded corners).
-    WmFillRect(buf, stride, screenW, screenH, bx + 1, by, bw - 2, 1, WM_BTN_BEVEL_DARK);
-    WmFillRect(buf, stride, screenW, screenH, bx, by + 1, 1, bh - 2, WM_BTN_BEVEL_DARK);
-    WmFillRect(buf, stride, screenW, screenH, bx + 1, by + bh - 1, bw - 2, 1, WM_BTN_BEVEL_LIGHT);
-    WmFillRect(buf, stride, screenW, screenH, bx + bw - 1, by + 1, 1, bh - 2, WM_BTN_BEVEL_LIGHT);
+    // Horizontal bevel: dark top edge, light bottom edge (follow the slant).
+    WmFillRect(buf, stride, screenW, screenH, bx, by, fillW, 1, WM_BTN_BEVEL_DARK);
+    WmFillRect(buf, stride, screenW, screenH, bx + slant, by + bh - 1, fillW, 1, WM_BTN_BEVEL_LIGHT);
 }
 
 // Draw a 1px point with an engraved feel: a light highlight 1px below the dark
@@ -932,7 +936,7 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
 
     // Close button (rightmost) — red glass, engraved ×.
     int closeBtnX = wx + ow - static_cast<int>(WM_BORDER_WIDTH) - static_cast<int>(WM_BUTTON_WIDTH);
-    bool closeHover = w.focused && mouseX >= closeBtnX && mouseX < closeBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
+    bool closeHover = mouseX >= closeBtnX && mouseX < closeBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
                       mouseY >= titleY && mouseY < titleY + titleH;
     int closeBx = closeBtnX + hInset;
     int closeCx = closeBx + bw / 2;
@@ -948,7 +952,7 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
 
     // Maximize button — glass, engraved box outline.
     int maxBtnX = closeBtnX - static_cast<int>(WM_BUTTON_WIDTH);
-    bool maxHover = w.focused && mouseX >= maxBtnX && mouseX < maxBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
+    bool maxHover = mouseX >= maxBtnX && mouseX < maxBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
                     mouseY >= titleY && mouseY < titleY + titleH;
     int maxBx = maxBtnX + hInset;
     int maxCx = maxBx + bw / 2;
@@ -964,7 +968,7 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
 
     // Minimize button — glass, engraved dash near the baseline.
     int minBtnX = maxBtnX - static_cast<int>(WM_BUTTON_WIDTH);
-    bool minHover = w.focused && mouseX >= minBtnX && mouseX < minBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
+    bool minHover = mouseX >= minBtnX && mouseX < minBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
                     mouseY >= titleY && mouseY < titleY + titleH;
     int minBx = minBtnX + hInset;
     int minCx = minBx + bw / 2;
