@@ -941,8 +941,8 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     int closeBx = closeBtnX + hInset;
     int closeCx = closeBx + bw / 2;
     WmDrawCaptionButton(buf, stride, screenW, screenH, closeBx, by, bw, bh,
-                        closeHover ? 0x00E05555 : 0x00C83C3C,
-                        closeHover ? 0x00B02828 : 0x00982020);
+                        closeHover ? 0x00E05555 : (w.focused ? 0x00C83C3C : WM_CLOSE_BTN_TOP_UNF),
+                        closeHover ? 0x00B02828 : (w.focused ? 0x00982020 : WM_CLOSE_BTN_BOT_UNF));
     static constexpr int CLOSE_HALF = 4;
     for (int d = -CLOSE_HALF; d <= CLOSE_HALF; ++d)
     {
@@ -957,8 +957,8 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     int maxBx = maxBtnX + hInset;
     int maxCx = maxBx + bw / 2;
     WmDrawCaptionButton(buf, stride, screenW, screenH, maxBx, by, bw, bh,
-                        maxHover ? WM_BTN_HOVER_TOP : WM_BTN_TOP,
-                        maxHover ? WM_BTN_HOVER_BOT : WM_BTN_BOT);
+                        maxHover ? WM_BTN_HOVER_TOP : (w.focused ? WM_BTN_TOP : WM_BTN_TOP_UNFOCUSED),
+                        maxHover ? WM_BTN_HOVER_BOT : (w.focused ? WM_BTN_BOT : WM_BTN_BOT_UNFOCUSED));
     int boxW = 11, boxH = 9;
     int boxX = maxCx - boxW / 2, boxY = iconCY - boxH / 2;
     engraveHLine(boxX, boxY, boxW, WM_TITLE_FG);              // top
@@ -973,8 +973,8 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     int minBx = minBtnX + hInset;
     int minCx = minBx + bw / 2;
     WmDrawCaptionButton(buf, stride, screenW, screenH, minBx, by, bw, bh,
-                        minHover ? WM_BTN_HOVER_TOP : WM_BTN_TOP,
-                        minHover ? WM_BTN_HOVER_BOT : WM_BTN_BOT);
+                        minHover ? WM_BTN_HOVER_TOP : (w.focused ? WM_BTN_TOP : WM_BTN_TOP_UNFOCUSED),
+                        minHover ? WM_BTN_HOVER_BOT : (w.focused ? WM_BTN_BOT : WM_BTN_BOT_UNFOCUSED));
     engraveHLine(minCx - 5, iconCY + 2, 11, WM_TITLE_FG);
 }
 

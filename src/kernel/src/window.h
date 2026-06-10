@@ -49,8 +49,14 @@ static constexpr uint32_t WM_BTN_BEVEL_DARK     = 0x00152F52; // engraved inner 
 static constexpr uint32_t WM_BTN_BEVEL_LIGHT    = 0x008FC4F0; // engraved highlight (bottom/right)
 static constexpr uint32_t WM_BTN_HOVER_TOP      = 0x0072A8E0; // hover glass top
 static constexpr uint32_t WM_BTN_HOVER_BOT      = 0x003E6FB0; // hover glass bottom
+// Dimmed (slate) glass for caption buttons on UNFOCUSED windows, so the buttons
+// match the slate titlebar instead of staying bright blue. Hover still brightens.
+static constexpr uint32_t WM_BTN_TOP_UNFOCUSED  = 0x004A4F5B; // dim glass top
+static constexpr uint32_t WM_BTN_BOT_UNFOCUSED  = 0x002C303A; // dim glass bottom
 static constexpr uint32_t WM_CLOSE_BTN_BG       = 0x00C04040; // close button normal
 static constexpr uint32_t WM_CLOSE_BTN_HOVER    = 0x00E04040; // close button hover
+static constexpr uint32_t WM_CLOSE_BTN_TOP_UNF  = 0x008A5050; // dim close top (unfocused)
+static constexpr uint32_t WM_CLOSE_BTN_BOT_UNF  = 0x00683A3A; // dim close bottom (unfocused)
 static constexpr uint32_t WM_MAX_BTN_HOVER      = 0x00606060; // grey
 static constexpr uint32_t WM_TITLE_HIGHLIGHT    = 0x00FFFFFF; // 1px top highlight (subtle)
 static constexpr uint32_t WM_TASKBAR_BG         = 0x001E1E2E; // dark blue-grey
