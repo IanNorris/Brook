@@ -172,6 +172,7 @@ add_executable(kernel
     src/rtc.cpp
     src/kvmclock.cpp
     src/display.cpp
+    src/gpu_compositor.cpp
     src/mouse.cpp
     src/shell.cpp
     src/audio.cpp

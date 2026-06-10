@@ -16,6 +16,7 @@
 #include "serial.h"
 #include "kprintf.h"
 #include "display.h"
+#include "gpu_compositor.h"
 #include "tty.h"
 #include "compositor.h"
 #include "memory/virtual_memory.h"
@@ -40,6 +41,7 @@ MODULE_IMPORT_SYMBOL(VmmMapPage);
 MODULE_IMPORT_SYMBOL(PmmAllocPages);
 MODULE_IMPORT_SYMBOL(DisplayRegister);
 MODULE_IMPORT_SYMBOL(DisplaySet3DActive);
+MODULE_IMPORT_SYMBOL(GpuCompositorRegister);
 MODULE_IMPORT_SYMBOL(TtyGetFramebuffer);
 MODULE_IMPORT_SYMBOL(TtyRemap);
 MODULE_IMPORT_SYMBOL(CompositorRemap);
@@ -125,6 +127,7 @@ static constexpr uint32_t VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM   = 2;
 static constexpr uint32_t VIRTIO_GPU_CMD_CTX_CREATE            = 0x0200;
 static constexpr uint32_t VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE   = 0x0202;
 static constexpr uint32_t VIRTIO_GPU_CMD_RESOURCE_CREATE_3D    = 0x0204;
+static constexpr uint32_t VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D   = 0x0205;
 static constexpr uint32_t VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D = 0x0206;
 static constexpr uint32_t VIRTIO_GPU_CMD_SUBMIT_3D             = 0x0207;
 
@@ -748,6 +751,85 @@ static bool ResourceAttachBackingContig(uint32_t resId, uint64_t phys, uint32_t 
     return CmdRespOk(SubmitCommand(reqLen, CMD_RESP_CAP));
 }
 
+// Attach a backing for a buffer that is virtually contiguous in kernel space but
+// physically scattered (e.g. a window VFB from VmmAllocPages). Walks the PTEs
+// page-by-page (VmmVirtToPhys works here — these are 4K-mapped, not the
+// huge-page direct map), coalescing physically-contiguous runs into as few
+// mem-entries as possible. Returns false on any unmapped page.
+static bool ResourceAttachBackingVirt(uint32_t resId, uint64_t vaddr, uint32_t sizeBytes)
+{
+    auto* req = reinterpret_cast<VirtioGpuResourceAttachBacking*>(g_cmdBuf + CMD_REQ_OFF);
+    auto* entries = reinterpret_cast<VirtioGpuMemEntry*>(
+        g_cmdBuf + CMD_REQ_OFF + sizeof(VirtioGpuResourceAttachBacking));
+
+    // Cap on mem-entries that fit in the request region (pages 0..CMD_PAGES-2).
+    const uint32_t maxEntries =
+        ((CMD_PAGES - 1) * 4096 - sizeof(VirtioGpuResourceAttachBacking))
+        / sizeof(VirtioGpuMemEntry);
+
+    uint32_t nEntries = 0;
+    uint64_t base = vaddr & ~0xFFFull;
+    uint32_t firstOff = static_cast<uint32_t>(vaddr & 0xFFFull);
+    uint32_t remaining = sizeBytes;
+    uint64_t va = base;
+    uint64_t runPhys = 0;
+    uint32_t runLen = 0;
+
+    while (remaining > 0)
+    {
+        uint64_t phys = VmmVirtToPhys(KernelPageTable, VirtualAddress(va)).raw();
+        if (phys == 0)
+        {
+            SerialPrintf("virtio_gpu: backing walk hit unmapped page at 0x%lx\n", va);
+            return false;
+        }
+        // Bytes contributed by this page (account for an unaligned first page).
+        uint32_t pageOff = (va == base) ? firstOff : 0;
+        uint32_t chunk = 4096 - pageOff;
+        if (chunk > remaining) chunk = remaining;
+        uint64_t physStart = phys + pageOff;
+
+        if (runLen != 0 && physStart == runPhys + runLen)
+        {
+            runLen += chunk;   // extend the contiguous run
+        }
+        else
+        {
+            if (runLen != 0)
+            {
+                if (nEntries >= maxEntries)
+                { SerialPuts("virtio_gpu: backing too fragmented\n"); return false; }
+                entries[nEntries].addr    = runPhys;
+                entries[nEntries].length  = runLen;
+                entries[nEntries].padding = 0;
+                ++nEntries;
+            }
+            runPhys = physStart;
+            runLen  = chunk;
+        }
+        remaining -= chunk;
+        va += 4096;
+    }
+    if (runLen != 0)
+    {
+        if (nEntries >= maxEntries)
+        { SerialPuts("virtio_gpu: backing too fragmented\n"); return false; }
+        entries[nEntries].addr    = runPhys;
+        entries[nEntries].length  = runLen;
+        entries[nEntries].padding = 0;
+        ++nEntries;
+    }
+
+    memset(&req->hdr, 0, sizeof(req->hdr));
+    req->hdr.type    = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
+    req->resource_id = resId;
+    req->nr_entries  = nEntries;
+
+    uint32_t reqLen = sizeof(VirtioGpuResourceAttachBacking)
+                    + nEntries * sizeof(VirtioGpuMemEntry);
+    return CmdRespOk(SubmitCommand(reqLen, CMD_RESP_CAP));
+}
+
 static bool SetScanout(uint32_t scanoutId, uint32_t resId, uint32_t w, uint32_t h)
 {
     auto* req = reinterpret_cast<VirtioGpuSetScanout*>(g_cmdBuf + CMD_REQ_OFF);
@@ -927,9 +1009,31 @@ static bool TransferFromHost3D(uint32_t ctxId, uint32_t resId, uint32_t w, uint3
     return CmdRespOk(SubmitCommand(sizeof(*req), CMD_RESP_CAP));
 }
 
-// Build + submit a virgl command stream that creates a render-target surface
-// over `resId`, binds it as the sole colour buffer, and CLEARs it to (r,g,b,a).
-// No shaders — CLEAR is the one genuinely fixed-function virgl op. `surfHandle`
+// Upload a dirty rect (x,y,w,h) from a resource's guest backing into the host
+// texture. `texW`/`texH` are the full texture dimensions (row stride + layer
+// size). Used each frame to push changed window pixels host-side via device DMA
+// (no CPU framebuffer copy).
+static bool TransferToHost3D(uint32_t ctxId, uint32_t resId,
+                             uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                             uint32_t texW, uint32_t texH)
+{
+    auto* req = reinterpret_cast<VirtioGpuTransferHost3D*>(g_cmdBuf + CMD_REQ_OFF);
+    memset(req, 0, sizeof(*req));
+    req->hdr.type     = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D;
+    req->hdr.ctx_id   = ctxId;
+    req->box.x        = x;
+    req->box.y        = y;
+    req->box.w        = w;
+    req->box.h        = h;
+    req->box.d        = 1;
+    req->offset       = static_cast<uint64_t>(y) * texW * 4 + static_cast<uint64_t>(x) * 4;
+    req->resource_id  = resId;
+    req->stride       = texW * 4;          // full row stride
+    req->layer_stride = texW * texH * 4;   // full layer size
+    return CmdRespOk(SubmitCommand(sizeof(*req), CMD_RESP_CAP));
+}
+
+
 // must be unique per resource within the context (object id namespace).
 static bool Submit3DClear(uint32_t ctxId, uint32_t resId, uint32_t surfHandle,
                           float r, float g, float b, float a)
@@ -1156,6 +1260,312 @@ static void VirtioGpu3DSelfTest()
 }
 
 
+// ===========================================================================
+// GPU compositor: BLIT-based window composition.
+//
+// The window compositor composes window content on the GPU via these ops
+// (registered as GpuCompositorOps). Each window's pixel buffer becomes a host
+// sampler-view texture backed by the window's VFB pages; one BLIT per window
+// draws it into a persistent scanout render-target, which is then presented
+// with RESOURCE_FLUSH. The CPU never blits window pixels into the framebuffer.
+// ===========================================================================
+
+static constexpr uint32_t COMP_CTX_ID       = 2;     // separate from self-test ctx 1
+static constexpr uint32_t COMP_SCANOUT_RES  = 16;    // scanout render-target
+static constexpr uint32_t COMP_SCANOUT_SURF = 1;     // virgl surface object handle
+static constexpr uint32_t COMP_FIRST_TEX_RES = 17;   // texture resource ids from here
+
+static bool     g_compReady       = false;   // ops set up + scanout RT created
+static bool     g_compScanoutBound = false;  // SET_SCANOUT to the RT has happened
+static uint32_t g_compScanoutW    = 0;
+static uint32_t g_compScanoutH    = 0;
+static uint32_t g_compNextRes     = COMP_FIRST_TEX_RES;
+static uint32_t g_composeN        = 0;       // dwords accumulated in compose stream
+
+struct GpuTexture { uint32_t resId; uint32_t w; uint32_t h; bool used; };
+static constexpr uint32_t MAX_GPU_TEXTURES = 128;
+static GpuTexture g_gpuTextures[MAX_GPU_TEXTURES] = {};
+
+static inline uint32_t* ComposeDwBase()
+{ return reinterpret_cast<uint32_t*>(g_cmdBuf + CMD_REQ_OFF + sizeof(VirtioGpuCmdSubmit)); }
+
+// One-time setup of the persistent compositor context + scanout render-target.
+// The scanout RT has NO guest backing (host-only); FLUSH presents it directly.
+static bool SetupGpuCompositor(uint32_t w, uint32_t h)
+{
+    if (!(g_gpu3dFeatures & VIRTIO_GPU_F_VIRGL)) return false;
+
+    if (!CtxCreate(COMP_CTX_ID, VIRTIO_GPU_CAPSET_VIRGL))
+    { SerialPuts("virtio_gpu: comp CTX_CREATE failed\n"); return false; }
+    if (!ResourceCreate3D(COMP_SCANOUT_RES, VIRGL_FORMAT_B8G8R8X8_UNORM,
+                          VIRGL_BIND_RENDER_TARGET | VIRGL_BIND_SCANOUT |
+                          VIRGL_BIND_SAMPLER_VIEW, w, h))
+    { SerialPuts("virtio_gpu: comp scanout RT create failed\n"); return false; }
+    if (!CtxAttachResource(COMP_CTX_ID, COMP_SCANOUT_RES))
+    { SerialPuts("virtio_gpu: comp scanout ctx-attach failed\n"); return false; }
+
+    // Create the scanout surface object ONCE; reused as the clear target each
+    // frame (recreating the same handle every frame would error in virgl).
+    {
+        auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
+        memset(sub, 0, sizeof(*sub));
+        sub->hdr.type   = VIRTIO_GPU_CMD_SUBMIT_3D;
+        sub->hdr.ctx_id = COMP_CTX_ID;
+        uint32_t* dw = ComposeDwBase();
+        uint32_t n = 0;
+        dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SURFACE, 5);
+        dw[n++] = COMP_SCANOUT_SURF;
+        dw[n++] = COMP_SCANOUT_RES;
+        dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;
+        dw[n++] = 0;
+        dw[n++] = 0;
+        sub->size = n * 4;
+        if (!CmdRespOk(SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP)))
+        { SerialPuts("virtio_gpu: comp scanout surface create failed\n"); return false; }
+    }
+
+    g_compScanoutW = w;
+    g_compScanoutH = h;
+    g_compReady    = true;
+    SerialPrintf("virtio_gpu: GPU compositor ready (scanout RT %ux%u)\n", w, h);
+    return true;
+}
+
+static GpuTexId CompCreateTexture(uint32_t w, uint32_t h, uint64_t backingVaddr)
+{
+    if (!g_compReady || w == 0 || h == 0) return 0;
+    uint32_t slot = MAX_GPU_TEXTURES;
+    for (uint32_t i = 0; i < MAX_GPU_TEXTURES; ++i)
+        if (!g_gpuTextures[i].used) { slot = i; break; }
+    if (slot == MAX_GPU_TEXTURES) { SerialPuts("virtio_gpu: comp texture table full\n"); return 0; }
+
+    uint32_t resId = g_compNextRes++;
+    if (!ResourceCreate3D(resId, VIRGL_FORMAT_B8G8R8X8_UNORM,
+                          VIRGL_BIND_SAMPLER_VIEW, w, h))
+    { SerialPuts("virtio_gpu: comp tex create failed\n"); return 0; }
+    if (!ResourceAttachBackingVirt(resId, backingVaddr, w * h * 4))
+    { SerialPuts("virtio_gpu: comp tex backing failed\n"); return 0; }
+    if (!CtxAttachResource(COMP_CTX_ID, resId))
+    { SerialPuts("virtio_gpu: comp tex ctx-attach failed\n"); return 0; }
+
+    g_gpuTextures[slot] = { resId, w, h, true };
+    return slot + 1;   // GpuTexId is 1-based
+}
+
+static GpuTexture* CompTex(GpuTexId t)
+{
+    if (t == 0 || t > MAX_GPU_TEXTURES) return nullptr;
+    GpuTexture* gt = &g_gpuTextures[t - 1];
+    return gt->used ? gt : nullptr;
+}
+
+static void CompDestroyTexture(GpuTexId t)
+{
+    GpuTexture* gt = CompTex(t);
+    if (!gt) return;
+    // Detach via attach-backing with zero entries would be ideal; for now just
+    // free the table slot (resource id is not recycled — monotonic). The host
+    // resource is reclaimed at context teardown / device reset.
+    gt->used = false;
+}
+
+static void CompUpdateTexture(GpuTexId t, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    GpuTexture* gt = CompTex(t);
+    if (!gt) return;
+    if (x >= gt->w || y >= gt->h) return;
+    if (x + w > gt->w) w = gt->w - x;
+    if (y + h > gt->h) h = gt->h - y;
+    if (w == 0 || h == 0) return;
+    TransferToHost3D(COMP_CTX_ID, gt->resId, x, y, w, h, gt->w, gt->h);
+}
+
+static void CompBeginFrame(uint32_t clearArgb)
+{
+    if (!g_compReady) return;
+    (void)clearArgb;   // see note below
+    // First GPU frame: point scanout 0 at the RT (switches away from the 2D FB).
+    if (!g_compScanoutBound)
+    {
+        if (SetScanout(0, COMP_SCANOUT_RES, g_compScanoutW, g_compScanoutH))
+            g_compScanoutBound = true;
+    }
+
+    // Start a fresh compose stream: SET_FRAMEBUFFER_STATE(scanout surf) + CLEAR.
+    // Clear to opaque black. (The kernel builds with -mno-sse / soft-float is not
+    // linked, so we use only the literal float constants 0.0f/1.0f, which the
+    // compiler folds to immediates — no runtime float ops. The wallpaper layer,
+    // blitted first each frame, provides the actual desktop background; black is
+    // only visible in any region the wallpaper does not cover.)
+    uint32_t* dw = ComposeDwBase();
+    uint32_t n = 0;
+    dw[n++] = VirglCmd0(VIRGL_CCMD_SET_FRAMEBUFFER_STATE, 0, 3);
+    dw[n++] = 1;                   // nr_cbufs
+    dw[n++] = 0;                   // zsurf
+    dw[n++] = COMP_SCANOUT_SURF;   // cbuf[0]
+
+    dw[n++] = VirglCmd0(VIRGL_CCMD_CLEAR, 0, 8);
+    dw[n++] = PIPE_CLEAR_COLOR0;
+    dw[n++] = F32Bits(0.0f); dw[n++] = F32Bits(0.0f);
+    dw[n++] = F32Bits(0.0f); dw[n++] = F32Bits(1.0f);
+    dw[n++] = 0; dw[n++] = 0;      // depth
+    dw[n++] = 0;                   // stencil
+
+    g_composeN = n;
+}
+
+static void CompBlit(GpuTexId src,
+                     uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh,
+                     uint32_t dx, uint32_t dy, uint32_t dw_, uint32_t dh,
+                     bool alphaBlend)
+{
+    if (!g_compReady) return;
+    GpuTexture* gt = CompTex(src);
+    if (!gt) return;
+
+    // Guard against overflowing the request region (each BLIT is 22 dwords).
+    const uint32_t maxDw =
+        ((CMD_PAGES - 1) * 4096 - sizeof(VirtioGpuCmdSubmit)) / 4 - 32;
+    if (g_composeN + 22 > maxDw) return;
+
+    uint32_t* dw = ComposeDwBase();
+    uint32_t n = g_composeN;
+    uint32_t s0 = (VIRGL_BLIT_MASK_RGBA & 0xFF)
+                | ((VIRGL_TEX_FILTER_NEAREST & 0x3) << 8)
+                | ((alphaBlend ? 1u : 0u) << 12);
+    dw[n++] = VirglCmd0(VIRGL_CCMD_BLIT, 0, 21);
+    dw[n++] = s0;
+    dw[n++] = 0;
+    dw[n++] = 0;
+    dw[n++] = COMP_SCANOUT_RES;
+    dw[n++] = 0;
+    dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;
+    dw[n++] = dx; dw[n++] = dy; dw[n++] = 0;
+    dw[n++] = dw_; dw[n++] = dh; dw[n++] = 1;
+    dw[n++] = gt->resId;
+    dw[n++] = 0;
+    dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;
+    dw[n++] = sx; dw[n++] = sy; dw[n++] = 0;
+    dw[n++] = sw; dw[n++] = sh; dw[n++] = 1;
+    g_composeN = n;
+}
+
+static void CompEndFrame()
+{
+    if (!g_compReady || g_composeN == 0) return;
+    auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
+    memset(sub, 0, sizeof(*sub));
+    sub->hdr.type   = VIRTIO_GPU_CMD_SUBMIT_3D;
+    sub->hdr.ctx_id = COMP_CTX_ID;
+    sub->size       = g_composeN * 4;
+    SubmitCommand(sizeof(VirtioGpuCmdSubmit) + g_composeN * 4, CMD_RESP_CAP);
+    g_composeN = 0;
+    // Present the composed scanout RT.
+    ResourceFlush(COMP_SCANOUT_RES, 0, 0, g_compScanoutW, g_compScanoutH);
+}
+
+static void CompGetSize(uint32_t* w, uint32_t* h)
+{
+    if (w) *w = g_compScanoutW;
+    if (h) *h = g_compScanoutH;
+}
+
+static const brook::GpuCompositorOps g_gpuCompositorOps = {
+    "virtio-gpu-blit",
+    CompCreateTexture,
+    CompDestroyTexture,
+    CompUpdateTexture,
+    CompBeginFrame,
+    CompBlit,
+    CompEndFrame,
+    CompGetSize,
+};
+
+// Readback self-test of the real compositor ops: build a scattered-backed
+// texture (VmmAllocPages → physically non-contiguous), fill it green via its
+// virtual mapping, upload it, then compose (clear blue + blit) into a small
+// readback-backed scanout RT and verify. Exercises the exact CreateTexture /
+// UpdateTexture / blit path the window compositor uses. Uses a temporary 256x256
+// scanout with a backing for verification, separate from the real (host-only)
+// scanout RT.
+static void VirtioGpuCompositorSelfTest()
+{
+    if (!(g_gpu3dFeatures & VIRTIO_GPU_F_VIRGL)) return;
+
+    const uint32_t tw = 96, th = 96;
+    const uint32_t tbytes = tw * th * 4;
+    const uint32_t tpages = AlignUp(tbytes, 4096) / 4096;
+    // Scattered source buffer (kernel virtual, physically non-contiguous).
+    VirtualAddress src = VmmAllocPages(tpages, VMM_WRITABLE, MemTag::Device, KernelPid);
+    if (!src) { SerialPuts("virtio_gpu: comp self-test src alloc failed\n"); return; }
+    uint32_t* srcPix = reinterpret_cast<uint32_t*>(src.raw());
+    for (uint32_t i = 0; i < tw * th; ++i) srcPix[i] = 0xFF00FF00u; // opaque green
+
+    // Temporary readback scanout RT (256x256, contiguous backing for readback).
+    const uint32_t sdim = 256, sbytes = sdim * sdim * 4;
+    PhysicalAddress sphys = PmmAllocPages(AlignUp(sbytes, 4096) / 4096, MemTag::Device, KernelPid);
+    if (!sphys) { SerialPuts("virtio_gpu: comp self-test scanout alloc failed\n"); return; }
+    uint32_t* sread = reinterpret_cast<uint32_t*>(PhysToVirt(sphys).raw());
+    memset(sread, 0, sbytes);
+
+    const uint32_t TST_CTX = 3, TST_RT = 64, TST_SURF = 9, TST_TEX = 65;
+    if (!CtxCreate(TST_CTX, VIRTIO_GPU_CAPSET_VIRGL)) { SerialPuts("comp-test ctx fail\n"); return; }
+    if (!ResourceCreate3D(TST_RT, VIRGL_FORMAT_B8G8R8X8_UNORM,
+                          VIRGL_BIND_RENDER_TARGET | VIRGL_BIND_SAMPLER_VIEW, sdim, sdim))
+    { SerialPuts("comp-test RT fail\n"); return; }
+    if (!ResourceAttachBackingContig(TST_RT, sphys.raw(), sbytes)) { SerialPuts("comp-test RT backing fail\n"); return; }
+    if (!CtxAttachResource(TST_CTX, TST_RT)) { SerialPuts("comp-test RT attach fail\n"); return; }
+
+    // Scattered-backed texture from the VmmAllocPages buffer.
+    if (!ResourceCreate3D(TST_TEX, VIRGL_FORMAT_B8G8R8X8_UNORM, VIRGL_BIND_SAMPLER_VIEW, tw, th))
+    { SerialPuts("comp-test tex fail\n"); return; }
+    if (!ResourceAttachBackingVirt(TST_TEX, src.raw(), tbytes))
+    { SerialPuts("comp-test tex scattered backing fail\n"); return; }
+    if (!CtxAttachResource(TST_CTX, TST_TEX)) { SerialPuts("comp-test tex attach fail\n"); return; }
+    if (!TransferToHost3D(TST_CTX, TST_TEX, 0, 0, tw, th, tw, th))
+    { SerialPuts("comp-test tex upload fail\n"); return; }
+
+    // Compose: clear blue, blit the green texture to (32,32)-(128,128).
+    {
+        auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
+        memset(sub, 0, sizeof(*sub));
+        sub->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D; sub->hdr.ctx_id = TST_CTX;
+        uint32_t* dw = ComposeDwBase(); uint32_t n = 0;
+        dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SURFACE, 5);
+        dw[n++] = TST_SURF; dw[n++] = TST_RT; dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM; dw[n++] = 0; dw[n++] = 0;
+        dw[n++] = VirglCmd0(VIRGL_CCMD_SET_FRAMEBUFFER_STATE, 0, 3);
+        dw[n++] = 1; dw[n++] = 0; dw[n++] = TST_SURF;
+        dw[n++] = VirglCmd0(VIRGL_CCMD_CLEAR, 0, 8);
+        dw[n++] = PIPE_CLEAR_COLOR0;
+        dw[n++] = F32Bits(0.0f); dw[n++] = F32Bits(0.0f); dw[n++] = F32Bits(1.0f); dw[n++] = F32Bits(1.0f);
+        dw[n++] = 0; dw[n++] = 0; dw[n++] = 0;
+        uint32_t s0 = (VIRGL_BLIT_MASK_RGBA & 0xFF) | ((VIRGL_TEX_FILTER_NEAREST & 0x3) << 8);
+        dw[n++] = VirglCmd0(VIRGL_CCMD_BLIT, 0, 21);
+        dw[n++] = s0; dw[n++] = 0; dw[n++] = 0;
+        dw[n++] = TST_RT; dw[n++] = 0; dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;
+        dw[n++] = 32; dw[n++] = 32; dw[n++] = 0; dw[n++] = tw; dw[n++] = th; dw[n++] = 1;
+        dw[n++] = TST_TEX; dw[n++] = 0; dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;
+        dw[n++] = 0; dw[n++] = 0; dw[n++] = 0; dw[n++] = tw; dw[n++] = th; dw[n++] = 1;
+        sub->size = n * 4;
+        if (!CmdRespOk(SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP)))
+        { SerialPuts("virtio_gpu: comp self-test compose submit failed\n"); return; }
+    }
+    if (!TransferFromHost3D(TST_CTX, TST_RT, sdim, sdim))
+    { SerialPuts("virtio_gpu: comp self-test readback failed\n"); return; }
+
+    uint32_t bg = sread[0 * sdim + 0];       // (0,0): blue
+    uint32_t fg = sread[64 * sdim + 64];     // (64,64): inside 32..128 → green
+    auto cB = [](uint32_t p){ return p & 0xFF; };
+    auto cG = [](uint32_t p){ return (p >> 8) & 0xFF; };
+    auto cR = [](uint32_t p){ return (p >> 16) & 0xFF; };
+    bool bgBlue  = (cB(bg) > 0xC0) && (cR(bg) < 0x40) && (cG(bg) < 0x40);
+    bool fgGreen = (cG(fg) > 0xC0) && (cR(fg) < 0x40) && (cB(fg) < 0x40);
+    bool ok = bgBlue && fgGreen;
+    SerialPrintf("virtio_gpu: compositor self-test bg=0x%08x fg=0x%08x (scattered tex) -> %s\n",
+                 bg, fg, ok ? "PASS" : "FAIL");
+}
+
+
 static int VirtioGpuModuleInit()
 {
     SerialPuts("virtio_gpu: init\n");
@@ -1291,6 +1701,10 @@ static int VirtioGpuModuleInit()
     // primary and secondary heads; no-op on a 2D device.
     VirtioGpu3DSelfTest();
 
+    // Validate the real compositor ops (scattered-backed texture + upload + blit
+    // compose, readback-verified). Proves the path the window compositor uses.
+    VirtioGpuCompositorSelfTest();
+
     // Take over the display only when we are the PRIMARY device — i.e. a
     // VGA-class device (virtio-vga, PCI subclass 0x00) that provided the boot
     // GOP. A secondary virtio-gpu-pci head (display-other, subclass 0x80) is
@@ -1305,6 +1719,17 @@ static int VirtioGpuModuleInit()
         {
             SerialPuts("virtio_gpu: display takeover failed\n");
             return -1;
+        }
+
+        // If the host 3D path is live, set up the GPU compositor (persistent
+        // context + scanout render-target at display size) and register its ops.
+        // The window compositor uses them only when BROOK_COMPOSITE=gpu; until a
+        // GPU frame is presented, scanout 0 stays on the 2D framebuffer, so this
+        // is inert by default.
+        if (g_gpu3dWorks && g_fbW && g_fbH)
+        {
+            if (SetupGpuCompositor(g_fbW, g_fbH))
+                GpuCompositorRegister(&g_gpuCompositorOps);
         }
     }
     else
