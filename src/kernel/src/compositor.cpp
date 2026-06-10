@@ -1412,7 +1412,14 @@ static void CompositorLoopWM()
         if (g_backBuffer)
         {
             Terminal* term = TerminalFindByProcess(p);
-            if (term && term->active)
+            // Only the terminal's OWN window draws the blinking caret. The
+            // window backing a terminal is owned by the terminal's child (bash),
+            // so require term->child == p. TerminalFindByProcess also matches
+            // DESCENDANTS of that child (needed for input routing), so without
+            // this check a GUI app launched from the shell (e.g. gltri) would
+            // get a phantom caret drawn at the terminal's cell offset by the
+            // app window's own position.
+            if (term && term->active && term->child == p)
             {
                 // Blink: visible for 500ms, hidden for 500ms
                 bool cursorOn = ((now / 500) & 1) == 0;
