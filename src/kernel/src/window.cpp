@@ -71,6 +71,20 @@ static void WmFillRect(uint32_t* buf, uint32_t stride,
             WmPutPixel(buf, stride, screenW, screenH, x, y, color);
 }
 
+// Linear interpolate between two 0x00RRGGBB colours by num/den (integer-only,
+// no FP — the kernel builds with -mno-sse). Used for the glassy titlebar gradient.
+static inline uint32_t WmLerpColor(uint32_t a, uint32_t b, int num, int den)
+{
+    if (den <= 0) return a;
+    int ar = (a >> 16) & 0xff, ag = (a >> 8) & 0xff, ab = a & 0xff;
+    int br = (b >> 16) & 0xff, bg = (b >> 8) & 0xff, bb = b & 0xff;
+    int r = ar + (br - ar) * num / den;
+    int g = ag + (bg - ag) * num / den;
+    int bl = ab + (bb - ab) * num / den;
+    return (static_cast<uint32_t>(r) << 16) | (static_cast<uint32_t>(g) << 8)
+         | static_cast<uint32_t>(bl);
+}
+
 // Fill a rectangle with rounded corners (radius r).
 static void WmFillRoundedRect(uint32_t* buf, uint32_t stride,
                                uint32_t screenW, uint32_t screenH,
@@ -831,37 +845,23 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     WmFillRect(buf, stride, screenW, screenH, wx + ow - WM_BORDER_WIDTH, wy, WM_BORDER_WIDTH, oh, borderCol);
     WmFillRect(buf, stride, screenW, screenH, wx, wy + oh - WM_BORDER_WIDTH, ow, WM_BORDER_WIDTH, borderCol);
 
-    // Title bar background
+    // Title bar background — glassy vertical gradient (light top → deep bottom),
+    // with a 1px sheen highlight along the very top edge. titleBg (the mid tone)
+    // is used as the anti-aliasing background for the title text + button icons.
     int titleX = wx + WM_BORDER_WIDTH;
     int titleY = wy + WM_BORDER_WIDTH;
     int titleW = ow - 2 * WM_BORDER_WIDTH;
     int titleH = WM_TITLE_BAR_HEIGHT;
-    WmFillRect(buf, stride, screenW, screenH, titleX, titleY, titleW, titleH, titleBg);
-
-    // Subtle vertical gradient on title bar (lighter at top, darker at bottom)
-    if (w.focused)
+    uint32_t gTop = w.focused ? WM_TITLE_TOP_FOCUSED : WM_TITLE_TOP_UNFOCUSED;
+    uint32_t gBot = w.focused ? WM_TITLE_BOT_FOCUSED : WM_TITLE_BOT_UNFOCUSED;
+    for (int row = 0; row < titleH; ++row)
     {
-        for (int row = 0; row < titleH && row < 6; ++row)
-        {
-            int py = titleY + row;
-            if (py < 0 || py >= static_cast<int>(screenH)) continue;
-            // Lighten top rows progressively (alpha blend white at decreasing opacity)
-            uint32_t alpha = static_cast<uint32_t>(12 - row * 2); // 12,10,8,6,4,2
-            for (int col = 0; col < titleW; ++col)
-            {
-                int px = titleX + col;
-                if (px < 0 || px >= static_cast<int>(screenW)) continue;
-                uint32_t& pixel = buf[py * stride + px];
-                uint32_t r = ((pixel >> 16) & 0xff) + alpha;
-                uint32_t g = ((pixel >> 8) & 0xff) + alpha;
-                uint32_t b = (pixel & 0xff) + alpha;
-                if (r > 255) r = 255;
-                if (g > 255) g = 255;
-                if (b > 255) b = 255;
-                pixel = (r << 16) | (g << 8) | b;
-            }
-        }
+        uint32_t rc = WmLerpColor(gTop, gBot, row, titleH - 1);
+        WmFillRect(buf, stride, screenW, screenH, titleX, titleY + row, titleW, 1, rc);
     }
+    // 1px glass sheen along the top of the titlebar.
+    WmFillRect(buf, stride, screenW, screenH, titleX, titleY, titleW, 1,
+               w.focused ? WM_TITLE_SHEEN_FOCUSED : WM_TITLE_SHEEN_UNFOCUSED);
 
     // 1px separator line between title bar and client area
     int sepY = titleY + titleH - 1;
@@ -891,8 +891,6 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
                       mouseY >= titleY && mouseY < titleY + titleH;
     uint32_t closeBg = closeHover ? 0x00CC3333 : WM_CLOSE_BTN_BG;
     int closeCenterX = closeBtnX + static_cast<int>(WM_BUTTON_WIDTH) / 2;
-    WmFillRect(buf, stride, screenW, screenH, closeBtnX, titleY,
-               WM_BUTTON_WIDTH, titleH, titleBg);
     WmFillCircle(buf, stride, screenW, screenH,
                  closeCenterX, btnCenterY, CHROME_BTN_RADIUS, closeBg);
     // Draw × with 1px diagonal lines (thinner, more delicate)
@@ -906,10 +904,8 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     int maxBtnX = closeBtnX - static_cast<int>(WM_BUTTON_WIDTH);
     bool maxHover = w.focused && mouseX >= maxBtnX && mouseX < maxBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
                     mouseY >= titleY && mouseY < titleY + titleH;
-    uint32_t maxBg = maxHover ? 0x003A5A7A : 0x00304050;
+    uint32_t maxBg = maxHover ? 0x005E9CDC : 0x003F6BA8;
     int maxCenterX = maxBtnX + static_cast<int>(WM_BUTTON_WIDTH) / 2;
-    WmFillRect(buf, stride, screenW, screenH, maxBtnX, titleY,
-               WM_BUTTON_WIDTH, titleH, titleBg);
     WmFillCircle(buf, stride, screenW, screenH,
                  maxCenterX, btnCenterY, CHROME_BTN_RADIUS, maxBg);
     // 6×6 box centered in the circle
@@ -925,10 +921,8 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     int minBtnX = maxBtnX - static_cast<int>(WM_BUTTON_WIDTH);
     bool minHover = w.focused && mouseX >= minBtnX && mouseX < minBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
                     mouseY >= titleY && mouseY < titleY + titleH;
-    uint32_t minBg = minHover ? 0x003A5A7A : 0x00304050;
+    uint32_t minBg = minHover ? 0x005E9CDC : 0x003F6BA8;
     int minCenterX = minBtnX + static_cast<int>(WM_BUTTON_WIDTH) / 2;
-    WmFillRect(buf, stride, screenW, screenH, minBtnX, titleY,
-               WM_BUTTON_WIDTH, titleH, titleBg);
     WmFillCircle(buf, stride, screenW, screenH,
                  minCenterX, btnCenterY, CHROME_BTN_RADIUS, minBg);
     // 6px horizontal dash centered vertically

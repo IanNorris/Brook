@@ -23,12 +23,22 @@ static constexpr uint32_t WM_TITLE_TEXT_PAD_X  = 8;   // left padding before tit
 static constexpr uint32_t WM_BTN_ICON_SIZE     = 10;  // size of max/min button icons
 static constexpr uint32_t WM_BTN_ICON_PAD_BOT  = 6;   // minimize icon bottom offset
 
-// Window chrome colours
-static constexpr uint32_t WM_TITLE_BG_FOCUSED   = 0x002B4A7A; // blue-ish
-static constexpr uint32_t WM_TITLE_BG_UNFOCUSED = 0x00404040; // dark grey
-static constexpr uint32_t WM_TITLE_FG           = 0x00E0E0E0; // light grey text
-static constexpr uint32_t WM_BORDER_FOCUSED     = 0x004080C0; // lighter blue
-static constexpr uint32_t WM_BORDER_UNFOCUSED   = 0x00505050; // grey
+// Window chrome colours — glassy blue (Aero-inspired). The focused titlebar is a
+// vertical gradient from WM_TITLE_TOP to WM_TITLE_BOT; WM_TITLE_BG_* is the mid
+// tone used for text anti-aliasing. The titlebar composites at ~85% opacity
+// (WM_CHROME_TITLE_ALPHA) for a hint of transparency; borders stay solid.
+static constexpr uint32_t WM_TITLE_TOP_FOCUSED   = 0x005A93D6; // glass top (light blue)
+static constexpr uint32_t WM_TITLE_BOT_FOCUSED   = 0x002F5C9C; // glass bottom (deep blue)
+static constexpr uint32_t WM_TITLE_TOP_UNFOCUSED = 0x004C515E; // slate top
+static constexpr uint32_t WM_TITLE_BOT_UNFOCUSED = 0x00383C46; // slate bottom
+static constexpr uint32_t WM_TITLE_BG_FOCUSED   = 0x00457BB9; // mid tone (text AA bg)
+static constexpr uint32_t WM_TITLE_BG_UNFOCUSED = 0x00424650; // mid tone (text AA bg)
+static constexpr uint32_t WM_TITLE_FG           = 0x00F2F6FF; // crisp near-white text
+static constexpr uint32_t WM_BORDER_FOCUSED     = 0x005E9CDC; // light blue edge
+static constexpr uint32_t WM_BORDER_UNFOCUSED   = 0x00565A66; // slate edge
+static constexpr uint32_t WM_TITLE_SHEEN_FOCUSED   = 0x007FB4E8; // 1px top glass sheen
+static constexpr uint32_t WM_TITLE_SHEEN_UNFOCUSED = 0x00606570; // 1px top highlight
+static constexpr uint8_t  WM_CHROME_TITLE_ALPHA = 0xD8;       // ~85% opaque titlebar (glass)
 static constexpr uint32_t WM_CLOSE_BTN_BG       = 0x00C04040; // close button normal
 static constexpr uint32_t WM_CLOSE_BTN_HOVER    = 0x00E04040; // close button hover
 static constexpr uint32_t WM_MAX_BTN_HOVER      = 0x00606060; // grey

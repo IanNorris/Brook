@@ -1095,10 +1095,11 @@ static bool EnsureChromeBuffer()
 }
 
 // Mark a window's decoration rects (titlebar + 4 borders, i.e. the outer rect
-// minus the client hole) opaque in the chrome buffer, so the alpha texture's
-// gaps (client area + outside the window) stay transparent. The chrome pixels
-// themselves are a hard rectangular mask — no AA against the backdrop — so a
-// simple per-rect alpha OR is exact.
+// minus the client hole) in the chrome buffer's alpha channel, so the alpha
+// texture's gaps (client area + outside the window) stay transparent. The chrome
+// pixels are a hard rectangular mask (no AA against the backdrop), so writing a
+// per-region alpha is exact. The titlebar gets WM_CHROME_TITLE_ALPHA (~85%) for
+// a glassy hint of transparency; the frame borders stay solid (0xFF).
 static void SetChromeDecorAlpha(const Window& w)
 {
     if (!g_chromeBuffer || w.noChrome) return;
@@ -1106,22 +1107,27 @@ static void SetChromeDecorAlpha(const Window& w)
     int ow = (int)w.outerWidth(), oh = (int)w.outerHeight();
     int cx = w.clientX(), cy = w.clientY();
     int cw = (int)w.clientW, ch = (int)w.clientH;
-    auto orAlpha = [](int x, int y, int rw, int rh) {
+    auto setAlpha = [](int x, int y, int rw, int rh, uint32_t a) {
         if (rw <= 0 || rh <= 0) return;
         if (x < 0) { rw += x; x = 0; }
         if (y < 0) { rh += y; y = 0; }
         if (x + rw > (int)g_physFbWidth)  rw = (int)g_physFbWidth  - x;
         if (y + rh > (int)g_physFbHeight) rh = (int)g_physFbHeight - y;
+        uint32_t aShift = a << 24;
         for (int yy = y; yy < y + rh; ++yy)
         {
             uint32_t* row = g_chromeBuffer + (uint32_t)yy * g_backBufStride;
-            for (int xx = x; xx < x + rw; ++xx) row[xx] |= 0xFF000000u;
+            for (int xx = x; xx < x + rw; ++xx) row[xx] = (row[xx] & 0x00FFFFFFu) | aShift;
         }
     };
-    orAlpha(ox, oy, ow, cy - oy);                       // titlebar + top border
-    orAlpha(ox, cy + ch, ow, (oy + oh) - (cy + ch));    // bottom border
-    orAlpha(ox, cy, cx - ox, ch);                       // left border
-    orAlpha(cx + cw, cy, (ox + ow) - (cx + cw), ch);    // right border
+    // Top strip = solid top border (WM_BORDER_WIDTH rows) + glassy titlebar.
+    int topBorderH = (int)WM_BORDER_WIDTH;
+    int titleBarH  = (cy - oy) - topBorderH;          // == WM_TITLE_BAR_HEIGHT
+    setAlpha(ox, oy, ow, topBorderH, 0xFF);                              // top border (solid)
+    setAlpha(ox, oy + topBorderH, ow, titleBarH, WM_CHROME_TITLE_ALPHA); // titlebar (glass)
+    setAlpha(ox, cy + ch, ow, (oy + oh) - (cy + ch), 0xFF);             // bottom border (solid)
+    setAlpha(ox, cy, cx - ox, ch, 0xFF);                                // left border (solid)
+    setAlpha(cx + cw, cy, (ox + ow) - (cx + cw), ch, 0xFF);             // right border (solid)
 }
 
 // GPU DRAW overlay layer (taskbar + launcher): lazily allocate the full-screen
