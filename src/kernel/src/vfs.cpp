@@ -556,6 +556,15 @@ int VfsSync(Vnode* vn)
     return 0;
 }
 
+int VfsFsync(Vnode* vn)
+{
+    // Per-file durability: persist this file's data + on-disk directory
+    // entry (size/clusters).  Used by long-lived writers (e.g. the profiler)
+    // that must survive an abrupt poweroff before an explicit close.
+    if (!vn || !vn->ops || !vn->ops->fsync) return -1;
+    return vn->ops->fsync(vn);
+}
+
 int VfsUnlink(const char* path)
 {
     if (!path || !path[0]) return -1;

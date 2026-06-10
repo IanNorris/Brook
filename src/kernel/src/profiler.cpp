@@ -348,6 +348,14 @@ static uint32_t AppendStr(char* buf, uint32_t pos, const char* str)
 
 static constexpr uint32_t kProfBufSize = 16384;
 
+// Flush + fsync the profile file every ~5 drain cycles (~5 s).  This persists
+// the FatFS directory-entry size so an abrupt VM poweroff before ProfilerStop
+// still yields a valid, parseable file.  Without it the sample sectors are on
+// disk but the dirent reads 0 bytes (FatFS only updates the dirent size on
+// f_sync/f_close).  Coarser than the old per-drain flush (commit a4fbce6) so
+// steady-state recordings keep most of that commit's I/O reduction.
+static constexpr uint32_t kProfSyncDrains = 5;
+
 // Generate a timestamped profile path: /boot/PROF_YYYYMMDD_HHMMSS.TXT
 // Falls back to /boot/PROFILE.TXT if RTC is unavailable.
 static void BuildProfilePath(char* out, uint32_t outLen)
@@ -500,7 +508,18 @@ static void ProfileWriterDrain(ProfileWriter& pw)
     // Don't force-flush here — let the write buffer fill naturally.
     // ProfileWriterAppend flushes at 16KB boundaries; forcing a flush
     // after every drain caused a virtio-blk write every drain cycle
-    // (~16% of a CPU on steady-state workloads like Q2).
+    // (~16% of a CPU on steady-state workloads like Q2).  Durability is
+    // handled separately by ProfileWriterSync on a coarser cadence.
+}
+
+// Flush the in-memory buffer to the file and fsync it, persisting both the
+// sample data and the on-disk directory-entry size.  Called periodically so a
+// long indefinite capture survives an abrupt poweroff before close.
+static void ProfileWriterSync(ProfileWriter& pw)
+{
+    if (!pw.file) return;
+    ProfileWriterFlush(pw);
+    VfsFsync(pw.file);
 }
 
 // Write PROF_END, flush and close the file.
@@ -559,6 +578,7 @@ static void ProfilerThreadFn(void* /*arg*/)
             bool fileOk = ProfileWriterOpen(pw);
 
             uint32_t cpuCount = SmpGetCpuCount();
+            uint32_t drainsSinceSync = 0;
             while (g_profilerEnabled) {
                 Process* self = ProcessCurrent();
                 if (self) {
@@ -573,8 +593,15 @@ static void ProfilerThreadFn(void* /*arg*/)
 
                 // Drain ring buffers into the file every second so they
                 // don't overflow during long recordings.
-                if (fileOk)
+                if (fileOk) {
                     ProfileWriterDrain(pw);
+                    // Persist the dirent periodically so an abrupt poweroff
+                    // before ProfilerStop still leaves a valid file.
+                    if (++drainsSinceSync >= kProfSyncDrains) {
+                        ProfileWriterSync(pw);
+                        drainsSinceSync = 0;
+                    }
+                }
             }
 
             // Final drain to catch any events that arrived after the last

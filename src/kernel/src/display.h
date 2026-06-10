@@ -35,8 +35,10 @@ struct DisplayOps {
     // Get the physical base address of the framebuffer.
     uint64_t (*GetFramebufferPhys)();
 
-    // Flush/sync framebuffer to display (no-op for direct-mapped linear FBs).
-    void (*Flush)();
+    // Flush/sync a dirty scanline span [minY, maxY) from the framebuffer to the
+    // display. No-op for direct-mapped linear FBs (GOP, bochs); transfer-based
+    // devices (virtio-gpu) use the rect to bound the host transfer + flush.
+    void (*Flush)(uint32_t minY, uint32_t maxY);
 };
 
 // Register a display driver. Replaces the current active display.
@@ -57,5 +59,17 @@ volatile uint32_t* DisplayGetFramebuffer();
 
 // Get physical framebuffer address from active display.
 uint64_t DisplayGetFramebufferPhys();
+
+// Flush a dirty scanline span [minY, maxY) to the active display. No-op for
+// linear FBs; virtio-gpu uses it to transfer + flush the damaged region.
+void DisplayFlush(uint32_t minY, uint32_t maxY);
+
+// 3D-acceleration status. A display driver that has proven a live host 3D
+// (virgl/Venus) command path — e.g. the virtio-gpu driver's GPU-clear
+// self-test passing — calls DisplaySet3DActive(true). The taskbar reads
+// DisplayIs3DActive() to surface an at-a-glance "GPU 3D live" indicator.
+// extern "C" so loadable display modules can import the setter.
+extern "C" void DisplaySet3DActive(bool active);
+bool DisplayIs3DActive();
 
 } // namespace brook

@@ -299,7 +299,10 @@ if [ "$HEADLESS" -eq 1 ]; then
     fi
 else
     SERIAL_OPT="-serial stdio"
-    DISPLAY_OPT="-display sdl"
+    # BROOK_DISPLAY selects the QEMU UI backend. Default sdl; set BROOK_DISPLAY=gtk
+    # to get the View menu (switch between heads — e.g. virtio-vga's VGA surface
+    # vs the virtio-gpu scanout). gtk needs host GTK libs + a real display.
+    DISPLAY_OPT="-display ${BROOK_DISPLAY:-sdl}"
 fi
 
 # Network device selection: default is user-mode slirp with tcp host-forward.
@@ -333,6 +336,116 @@ if [ "${NO_AUDIO}" -eq 1 ]; then
     AUDIO_OPTS="-audiodev none,id=hda0"
 fi
 
+# GPU device selection.
+#   default            : stdvga (q35) primary + virtio-gpu-pci secondary head.
+#                        Boot GOP comes from stdvga; the virtio-gpu driver drives
+#                        a secondary head (screendump it via the 'vgpu' id).
+#   BROOK_VIRTIO_VGA=1 : single virtio-vga device as the primary display. Its VGA
+#                        compat provides the boot GOP (bare virtio-gpu-pci does
+#                        NOT — the bootloader needs a GOP source), and the
+#                        virtio-gpu interface drives the live desktop. stdvga is
+#                        dropped, so bochs_display won't load.
+if [ "${BROOK_VIRTIO_VGA:-0}" = "1" ]; then
+    GPU_OPTS="-vga none -device virtio-vga,id=vgpu"
+else
+    GPU_OPTS="-device virtio-gpu-pci,id=vgpu"
+fi
+
+# ---------------------------------------------------------------------------
+# Hardware-accelerated GPU mode (BROOK_GPU=gl | venus).
+#
+# Switches the secondary head to virtio-gpu-gl (Virgl/Venus 3D transport) and
+# the display to egl-headless backed by the host's DRM render node, so 3D
+# command streams are executed on the real host GPU.  Requires a QEMU built
+# with virglrenderer + OpenGL display support and a working host GL/Vulkan
+# stack — neither is in the Brook dev shell's QEMU (10.x, no virgl), so we
+# resolve nixpkgs#qemu_full + mesa + libglvnd on demand and point the EGL/GBM
+# loader at them.  In-container the render node is the host Intel iGPU.
+#
+#   BROOK_GPU=gl    : Virgl (GL) + Venus capset available; blob resources on.
+#   BROOK_GPU=venus : as gl, plus host-visible blob memory (memfd machine RAM)
+#                     for Vulkan vkMapMemory — the Venus end-to-end target.
+#
+# Screendump still works via the QEMU monitor (egl-headless renders to an
+# offscreen scanout the monitor can capture).
+MEM_BACKEND_OPTS=""
+if [ -n "${BROOK_GPU:-}" ] && [ "${BROOK_GPU}" != "0" ]; then
+    GPU_RENDERNODE="${BROOK_RENDERNODE:-/dev/dri/renderD128}"
+    if [ ! -e "${GPU_RENDERNODE}" ]; then
+        echo "ERROR: BROOK_GPU=${BROOK_GPU} needs a DRM render node at ${GPU_RENDERNODE} (none found)." >&2
+        exit 1
+    fi
+    echo "  GPU:  hardware mode '${BROOK_GPU}' via ${GPU_RENDERNODE} (resolving qemu_full + mesa)..."
+    # Resolve a virgl/venus-capable QEMU and the matching host GL stack.  Each
+    # may be pre-provided via env (BROOK_GPU_QEMU / BROOK_GPU_MESA /
+    # BROOK_GPU_GLVND) to skip the nix lookups — useful when backgrounding,
+    # where a concurrent `nix build` can stall on a held eval lock.
+    QEMU_FULL_PATH="${BROOK_GPU_QEMU:-$(nix build --no-link --print-out-paths nixpkgs#qemu_full 2>/dev/null | tail -1)}"
+    MESA_PATH="${BROOK_GPU_MESA:-$(nix build --no-link --print-out-paths nixpkgs#mesa 2>/dev/null | tail -1)}"
+    GLVND_PATH="${BROOK_GPU_GLVND:-$(nix build --no-link --print-out-paths nixpkgs#libglvnd 2>/dev/null | tail -1)}"
+    if [ -z "${QEMU_FULL_PATH}" ] || [ -z "${MESA_PATH}" ] || [ -z "${GLVND_PATH}" ]; then
+        echo "ERROR: failed to resolve qemu_full/mesa/libglvnd via nix." >&2
+        exit 1
+    fi
+    QEMU_BIN="${QEMU_FULL_PATH}/bin/qemu-system-x86_64"
+    # Point QEMU's bundled libgbm/EGL (libglvnd) at the full mesa backends.
+    export GBM_BACKENDS_PATH="${MESA_PATH}/lib/gbm"
+    export LIBGL_DRIVERS_PATH="${MESA_PATH}/lib/dri"
+    export __EGL_VENDOR_LIBRARY_DIRS="${MESA_PATH}/share/glvnd/egl_vendor.d"
+    export LD_LIBRARY_PATH="${GLVND_PATH}/lib:${MESA_PATH}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    # Display backend for the accelerated path:
+    #   (default)              egl-headless — renders the GL scanout OFFSCREEN on
+    #                          the host GPU (no window); for CI/headless + monitor
+    #                          screendump. NB: plain screendump can't read back the
+    #                          GL offscreen scanout reliably.
+    #   BROOK_GPU_DISPLAY=sdl  open a real SDL window with native GL present.
+    #   BROOK_GPU_DISPLAY=gtk  GTK window — but this qemu_full's GTK is built
+    #                          WITHOUT OpenGL ("OpenGL is not supported by display
+    #                          backend 'gtk'"), so gl=on fails. Use sdl for a
+    #                          windowed accelerated desktop.
+    # sdl/gtk require a host display (X11/Wayland) reachable by the qemu_full
+    # binary; virgl/Venus still execute the guest's GL/Vulkan on the host GPU —
+    # the window just presents the resulting scanout, so you SEE the live desktop.
+    case "${BROOK_GPU_DISPLAY:-headless}" in
+        sdl)
+            DISPLAY_OPT="-display sdl,gl=on"
+            ;;
+        gtk)
+            DISPLAY_OPT="-display gtk,gl=on"
+            ;;
+        *)
+            DISPLAY_OPT="-display egl-headless,rendernode=${GPU_RENDERNODE}"
+            ;;
+    esac
+    # Use the VGA-class GL device (virtio-vga-gl) as the PRIMARY display, not a
+    # secondary virtio-gpu-gl-pci behind stdvga. virtio-vga-gl provides the boot
+    # GOP (VGA compat) AND the virtio-gpu 3D interface, so the existing driver
+    # takeover (primary-VGA path) drives the live desktop through the host GPU —
+    # exactly like BROOK_VIRTIO_VGA but GL-capable. With stdvga gone, bochs won't
+    # load and the screendump captures the GPU-presented frame.
+    # (Set BROOK_GPU_SECONDARY=1 to keep the old stdvga-primary + idle GL
+    # secondary topology for A/B.)
+    if [ "${BROOK_GPU_SECONDARY:-0}" = "1" ]; then
+        if [ "${BROOK_GPU}" = "venus" ]; then
+            GPU_OPTS="-device virtio-gpu-gl-pci,id=vgpu,blob=true,venus=true,hostmem=${BROOK_GPU_HOSTMEM:-4G}"
+            MEM_BACKEND_OPTS="-object memory-backend-memfd,id=mem1,size=8G,share=on"
+            MACHINE_MEMBACKEND=",memory-backend=mem1"
+        else
+            GPU_OPTS="-device virtio-gpu-gl-pci,id=vgpu,blob=true"
+        fi
+    else
+        if [ "${BROOK_GPU}" = "venus" ]; then
+            GPU_OPTS="-vga none -device virtio-vga-gl,id=vgpu,blob=true,venus=true,hostmem=${BROOK_GPU_HOSTMEM:-4G}"
+            # Host-visible blob memory needs shareable machine RAM (memfd). The
+            # ,memory-backend=mem1 suffix is appended to the -machine q35 line.
+            MEM_BACKEND_OPTS="-object memory-backend-memfd,id=mem1,size=8G,share=on"
+            MACHINE_MEMBACKEND=",memory-backend=mem1"
+        else
+            GPU_OPTS="-vga none -device virtio-vga-gl,id=vgpu,blob=true"
+        fi
+    fi
+fi
+
 KVM_FLAGS=""
 if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] && [ "${NO_KVM:-}" != "1" ]; then
     KVM_FLAGS="-enable-kvm -cpu host"
@@ -362,11 +475,12 @@ if [ ! -f "${USB_TEST_IMG}" ]; then
     echo "Created 32MB USB test disk"
 fi
 
-qemu-system-x86_64 \
-    -machine q35 \
+${QEMU_BIN:-qemu-system-x86_64} \
+    -machine q35${MACHINE_MEMBACKEND:-} \
     ${KVM_FLAGS} \
     -smp "${BROOK_SMP:-8}" \
     -m 8G \
+    ${MEM_BACKEND_OPTS:-} \
     -drive if=pflash,format=raw,readonly=on,file="${OVMF_CODE}" \
     -drive if=pflash,format=raw,file="${OVMF_VARS_COPY}" \
     $(if [ -n "${ESP_IMG}" ]; then echo "-drive if=ide,format=raw,file=${ESP_IMG}"; else echo "-drive format=raw,file=fat:rw:${ESP_OVERRIDE:-${BUILD_DIR}/esp}"; fi) \
@@ -376,6 +490,7 @@ qemu-system-x86_64 \
     ${HOME_DRIVE} \
     ${DATA_DRIVE} \
     -device virtio-tablet-pci \
+    ${GPU_OPTS} \
     -device virtio-rng-pci \
     -device virtio-net-pci,netdev=net0${NIC_MAC_ARG} \
     -device qemu-xhci,id=xhci \
