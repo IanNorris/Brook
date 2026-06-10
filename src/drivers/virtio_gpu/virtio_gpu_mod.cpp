@@ -275,7 +275,13 @@ static constexpr uint32_t PIPE_CLEAR_COLOR0           = 1u << 2;
 static constexpr uint32_t VIRGL_CCMD_CREATE_OBJECT        = 1;
 static constexpr uint32_t VIRGL_CCMD_SET_FRAMEBUFFER_STATE = 5;
 static constexpr uint32_t VIRGL_CCMD_CLEAR               = 7;
+static constexpr uint32_t VIRGL_CCMD_BLIT                = 16;
 static constexpr uint32_t VIRGL_OBJECT_SURFACE           = 8;
+
+// virgl BLIT: copy mask for an RGBA colour blit (PIPE_MASK_RGBA) and a
+// nearest-filter (PIPE_TEX_FILTER_NEAREST) — exact 1:1 pixel copy.
+static constexpr uint32_t VIRGL_BLIT_MASK_RGBA = 0xF;
+static constexpr uint32_t VIRGL_TEX_FILTER_NEAREST = 0;
 
 // virgl command header: cmd | (obj_type << 8) | (len_in_dwords << 16).
 static inline uint32_t VirglCmd0(uint32_t cmd, uint32_t obj, uint32_t len)
@@ -286,7 +292,10 @@ static inline uint32_t F32Bits(float f)
 
 // Self-test context/resource ids and render-target dimension.
 static constexpr uint32_t CTX_ID_SELFTEST = 1;
-static constexpr uint32_t RES_3D_SELFTEST = 2;
+static constexpr uint32_t RES_3D_SELFTEST = 2;   // src (cleared green)
+static constexpr uint32_t RES_3D_BLITDST  = 3;   // blit target (blue + green square)
+static constexpr uint32_t SURF_SRC        = 1;   // surface handle for src clear
+static constexpr uint32_t SURF_DST        = 2;   // surface handle for dst clear
 static constexpr uint32_t SELFTEST_DIM    = 64;
 
 // virtio-gpu device config (virtio 1.2 §5.7.4). num_capsets is meaningful only
@@ -914,8 +923,9 @@ static bool TransferFromHost3D(uint32_t ctxId, uint32_t resId, uint32_t w, uint3
 
 // Build + submit a virgl command stream that creates a render-target surface
 // over `resId`, binds it as the sole colour buffer, and CLEARs it to (r,g,b,a).
-// No shaders — CLEAR is the one genuinely fixed-function virgl op.
-static bool Submit3DClear(uint32_t ctxId, uint32_t resId,
+// No shaders — CLEAR is the one genuinely fixed-function virgl op. `surfHandle`
+// must be unique per resource within the context (object id namespace).
+static bool Submit3DClear(uint32_t ctxId, uint32_t resId, uint32_t surfHandle,
                           float r, float g, float b, float a)
 {
     auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
@@ -926,11 +936,10 @@ static bool Submit3DClear(uint32_t ctxId, uint32_t resId,
     uint32_t* dw = reinterpret_cast<uint32_t*>(
         g_cmdBuf + CMD_REQ_OFF + sizeof(VirtioGpuCmdSubmit));
     uint32_t n = 0;
-    const uint32_t kSurface = 1;
 
     // CREATE_OBJECT SURFACE (payload 5 dwords) over the render-target texture.
     dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SURFACE, 5);
-    dw[n++] = kSurface;
+    dw[n++] = surfHandle;
     dw[n++] = resId;
     dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;
     dw[n++] = 0;   // texture level
@@ -938,9 +947,9 @@ static bool Submit3DClear(uint32_t ctxId, uint32_t resId,
 
     // SET_FRAMEBUFFER_STATE (payload nr_cbufs+2 = 3): 1 colour buffer, no zsurf.
     dw[n++] = VirglCmd0(VIRGL_CCMD_SET_FRAMEBUFFER_STATE, 0, 3);
-    dw[n++] = 1;          // nr_cbufs
-    dw[n++] = 0;          // zsurf handle
-    dw[n++] = kSurface;   // cbuf[0]
+    dw[n++] = 1;            // nr_cbufs
+    dw[n++] = 0;            // zsurf handle
+    dw[n++] = surfHandle;   // cbuf[0]
 
     // CLEAR (payload 8): colour0 only; depth (double) + stencil zeroed.
     dw[n++] = VirglCmd0(VIRGL_CCMD_CLEAR, 0, 8);
@@ -954,11 +963,59 @@ static bool Submit3DClear(uint32_t ctxId, uint32_t resId,
     return CmdRespOk(SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP));
 }
 
-// Shader-free GPU self-test: create a 3D context + a render-target texture,
-// CLEAR it green on the host GPU via SUBMIT_3D, transfer the rendered pixels
-// back into guest RAM, and verify the readback. Proves the whole 3D context/
-// resource/submit/transfer path end-to-end, verifiable over serial (no GL
-// screendump readback needed). Lights the taskbar 3D badge on success.
+// Build + submit a virgl BLIT that copies a srcW×srcH region at (srcX,srcY) of
+// `srcRes` into `dstRes` at (dstX,dstY,dstW,dstH) — the GPU does the copy/scale
+// (and optional alpha blend) entirely host-side, no guest pixel touch. This is
+// the core compositor primitive: one BLIT per window into the scanout. Nearest
+// filter, full RGBA mask.
+static bool Submit3DBlit(uint32_t ctxId, uint32_t dstRes,
+                         uint32_t dstX, uint32_t dstY, uint32_t dstW, uint32_t dstH,
+                         uint32_t srcRes,
+                         uint32_t srcX, uint32_t srcY, uint32_t srcW, uint32_t srcH,
+                         bool alphaBlend)
+{
+    auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
+    memset(sub, 0, sizeof(*sub));
+    sub->hdr.type   = VIRTIO_GPU_CMD_SUBMIT_3D;
+    sub->hdr.ctx_id = ctxId;
+
+    uint32_t* dw = reinterpret_cast<uint32_t*>(
+        g_cmdBuf + CMD_REQ_OFF + sizeof(VirtioGpuCmdSubmit));
+    uint32_t n = 0;
+
+    // BLIT (payload 21 dwords). S0 packs mask|filter|...|alpha_blend.
+    uint32_t s0 = (VIRGL_BLIT_MASK_RGBA & 0xFF)
+                | ((VIRGL_TEX_FILTER_NEAREST & 0x3) << 8)
+                | ((alphaBlend ? 1u : 0u) << 12);
+    dw[n++] = VirglCmd0(VIRGL_CCMD_BLIT, 0, 21);
+    dw[n++] = s0;
+    dw[n++] = 0;   // scissor minx|miny (disabled)
+    dw[n++] = 0;   // scissor maxx|maxy
+    dw[n++] = dstRes;
+    dw[n++] = 0;                              // dst level
+    dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;    // dst format
+    dw[n++] = dstX; dw[n++] = dstY; dw[n++] = 0;          // dst x,y,z
+    dw[n++] = dstW; dw[n++] = dstH; dw[n++] = 1;          // dst w,h,d
+    dw[n++] = srcRes;
+    dw[n++] = 0;                              // src level
+    dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;    // src format
+    dw[n++] = srcX; dw[n++] = srcY; dw[n++] = 0;          // src x,y,z
+    dw[n++] = srcW; dw[n++] = srcH; dw[n++] = 1;          // src w,h,d
+
+    sub->size = n * 4;
+    return CmdRespOk(SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP));
+}
+
+// Shader-free GPU self-test in two stages, proving the primitives the GPU
+// compositor is built on:
+//   (1) CLEAR  — create a 3D context + render-target texture, CLEAR it green via
+//       SUBMIT_3D, transfer it back, verify. Proves ctx/resource/submit/transfer.
+//   (2) BLIT   — clear a second target blue, then BLIT a 32x32 region of the
+//       green texture into it at (16,16); transfer back and verify a green
+//       square on a blue field. Proves the GPU-side rect copy that backs the
+//       compositor (one BLIT per window, no guest pixel touch, no shaders).
+// All verifiable over serial (no GL screendump needed). Lights the taskbar 3D
+// badge once both stages pass.
 static void VirtioGpu3DSelfTest()
 {
     if (!(g_gpu3dFeatures & VIRTIO_GPU_F_VIRGL))
@@ -983,27 +1040,59 @@ static void VirtioGpu3DSelfTest()
     if (!CtxAttachResource(CTX_ID_SELFTEST, RES_3D_SELFTEST))
     { SerialPuts("virtio_gpu: 3D self-test CTX_ATTACH_RESOURCE failed\n"); return; }
 
-    // Clear to opaque green (R=0, G=1, B=0, A=1).
-    if (!Submit3DClear(CTX_ID_SELFTEST, RES_3D_SELFTEST, 0.0f, 1.0f, 0.0f, 1.0f))
+    // --- Stage 1: CLEAR src to opaque green (R=0, G=1, B=0, A=1). ---
+    if (!Submit3DClear(CTX_ID_SELFTEST, RES_3D_SELFTEST, SURF_SRC, 0.0f, 1.0f, 0.0f, 1.0f))
     { SerialPuts("virtio_gpu: 3D self-test SUBMIT_3D(clear) failed\n"); return; }
     if (!TransferFromHost3D(CTX_ID_SELFTEST, RES_3D_SELFTEST, dim, dim))
     { SerialPuts("virtio_gpu: 3D self-test TRANSFER_FROM_HOST_3D failed\n"); return; }
 
     // B8G8R8X8 green readback = bytes [B=0, G=0xFF, R=0, X] = 0x0000FF00 LE.
     uint32_t px = readback[0];
-    uint32_t b  = (px >> 0)  & 0xFF;
-    uint32_t g  = (px >> 8)  & 0xFF;
-    uint32_t r  = (px >> 16) & 0xFF;
-    bool green = (g > 0xC0) && (r < 0x40) && (b < 0x40);
-    SerialPrintf("virtio_gpu: 3D self-test readback px[0]=0x%08x (r=%u g=%u b=%u) -> %s\n",
-                 px, r, g, b, green ? "PASS" : "FAIL");
+    auto chanB = [](uint32_t p){ return p & 0xFF; };
+    auto chanG = [](uint32_t p){ return (p >> 8) & 0xFF; };
+    auto chanR = [](uint32_t p){ return (p >> 16) & 0xFF; };
+    bool clearGreen = (chanG(px) > 0xC0) && (chanR(px) < 0x40) && (chanB(px) < 0x40);
+    SerialPrintf("virtio_gpu: 3D self-test [clear] px[0]=0x%08x (r=%u g=%u b=%u) -> %s\n",
+                 px, chanR(px), chanG(px), chanB(px), clearGreen ? "PASS" : "FAIL");
+    if (!clearGreen) return;
 
-    if (green)
-    {
-        g_gpu3dWorks = true;
-        DisplaySet3DActive(true);
-        KPrintf("virtio_gpu: host 3D (virgl) acceleration confirmed live\n");
-    }
+    // --- Stage 2: BLIT a 32x32 corner of the green texture onto a blue target. ---
+    PhysicalAddress phys2 = PmmAllocPages(pages, MemTag::Device, KernelPid);
+    if (!phys2) { SerialPuts("virtio_gpu: 3D self-test dst backing alloc failed\n"); return; }
+    uint32_t* readback2 = reinterpret_cast<uint32_t*>(PhysToVirt(phys2).raw());
+    memset(readback2, 0, bytes);
+
+    if (!ResourceCreate3D(RES_3D_BLITDST, VIRGL_FORMAT_B8G8R8X8_UNORM,
+                          VIRGL_BIND_RENDER_TARGET | VIRGL_BIND_SAMPLER_VIEW, dim, dim))
+    { SerialPuts("virtio_gpu: 3D self-test BLITDST create failed\n"); return; }
+    if (!ResourceAttachBackingContig(RES_3D_BLITDST, phys2.raw(), bytes))
+    { SerialPuts("virtio_gpu: 3D self-test BLITDST attach failed\n"); return; }
+    if (!CtxAttachResource(CTX_ID_SELFTEST, RES_3D_BLITDST))
+    { SerialPuts("virtio_gpu: 3D self-test BLITDST ctx-attach failed\n"); return; }
+
+    // Clear dst to opaque blue (R=0, G=0, B=1, A=1).
+    if (!Submit3DClear(CTX_ID_SELFTEST, RES_3D_BLITDST, SURF_DST, 0.0f, 0.0f, 1.0f, 1.0f))
+    { SerialPuts("virtio_gpu: 3D self-test dst clear failed\n"); return; }
+    // BLIT green[0,0..32,32] -> dst[16,16..48,48].
+    if (!Submit3DBlit(CTX_ID_SELFTEST, RES_3D_BLITDST, 16, 16, 32, 32,
+                      RES_3D_SELFTEST, 0, 0, 32, 32, /*alphaBlend=*/false))
+    { SerialPuts("virtio_gpu: 3D self-test SUBMIT_3D(blit) failed\n"); return; }
+    if (!TransferFromHost3D(CTX_ID_SELFTEST, RES_3D_BLITDST, dim, dim))
+    { SerialPuts("virtio_gpu: 3D self-test blit readback failed\n"); return; }
+
+    // Verify: outside the square is blue; centre of the square is green.
+    uint32_t corner = readback2[0 * dim + 0];          // (0,0): blue
+    uint32_t centre = readback2[32 * dim + 32];        // (32,32): inside 16..48 → green
+    bool cornerBlue = (chanB(corner) > 0xC0) && (chanR(corner) < 0x40) && (chanG(corner) < 0x40);
+    bool centreGreen = (chanG(centre) > 0xC0) && (chanR(centre) < 0x40) && (chanB(centre) < 0x40);
+    bool blitOk = cornerBlue && centreGreen;
+    SerialPrintf("virtio_gpu: 3D self-test [blit] corner=0x%08x centre=0x%08x -> %s\n",
+                 corner, centre, blitOk ? "PASS" : "FAIL");
+    if (!blitOk) return;
+
+    g_gpu3dWorks = true;
+    DisplaySet3DActive(true);
+    KPrintf("virtio_gpu: host 3D (virgl) clear+blit compositor primitives confirmed live\n");
 }
 
 
