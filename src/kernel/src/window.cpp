@@ -824,11 +824,11 @@ uint32_t WmGetZOrder(int* outIndices, uint32_t maxOut)
 }
 
 // Draw a caption button: a sheared parallelogram glass cell (vertical gradient)
-// with a faux-engraved bevel — a dark inner shadow along the top + left-slanted
-// edges and a light highlight along the bottom + right-slanted edges, so the
-// button reads as carved into the titlebar. The vertical sides are slanted by
-// WM_BTN_SLANT (~30deg) for character: the shape leans forward (top-left to
-// bottom-right). Icon glyphs are drawn by the caller, centred on the parallelogram.
+// with a faux-engraved bevel — a dark inner shadow along the top + left edges and
+// a light highlight along the bottom + right edges, so the button reads as carved
+// into the titlebar. The vertical sides are slanted by WM_BTN_SLANT (~20deg) for
+// character: the shape leans backward (top-right to bottom-left, "\"). Icon glyphs
+// are drawn by the caller, centred on the parallelogram.
 static void WmDrawCaptionButton(uint32_t* buf, uint32_t stride,
                                 uint32_t screenW, uint32_t screenH,
                                 int bx, int by, int bw, int bh,
@@ -841,15 +841,15 @@ static void WmDrawCaptionButton(uint32_t* buf, uint32_t stride,
     for (int r = 0; r < bh; ++r)
     {
         uint32_t rc = WmLerpColor(top, bot, r, bh - 1);
-        int lx = bx + slant * r / denom;   // forward lean: top at bx, bottom at bx+slant
+        int lx = bx + slant * (denom - r) / denom;   // backward lean: top at bx+slant, bottom at bx
         WmFillRect(buf, stride, screenW, screenH, lx, by + r, fillW, 1, rc);
         // Slanted-side bevel: dark on the left edge, light on the right edge.
         WmPutPixel(buf, stride, screenW, screenH, lx, by + r, WM_BTN_BEVEL_DARK);
         WmPutPixel(buf, stride, screenW, screenH, lx + fillW - 1, by + r, WM_BTN_BEVEL_LIGHT);
     }
     // Horizontal bevel: dark top edge, light bottom edge (follow the slant).
-    WmFillRect(buf, stride, screenW, screenH, bx, by, fillW, 1, WM_BTN_BEVEL_DARK);
-    WmFillRect(buf, stride, screenW, screenH, bx + slant, by + bh - 1, fillW, 1, WM_BTN_BEVEL_LIGHT);
+    WmFillRect(buf, stride, screenW, screenH, bx + slant, by, fillW, 1, WM_BTN_BEVEL_DARK);
+    WmFillRect(buf, stride, screenW, screenH, bx, by + bh - 1, fillW, 1, WM_BTN_BEVEL_LIGHT);
 }
 
 // Draw a 1px point with an engraved feel: a light highlight 1px below the dark
@@ -921,7 +921,7 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     int by = titleY + 4;
     int bh = static_cast<int>(titleH) - 8;
     if (bh < 8) bh = 8;
-    int hInset = 3;                                   // gap inside each cell
+    int hInset = 1;                                   // small gap inside each cell (buttons sit close)
     int bw = static_cast<int>(WM_BUTTON_WIDTH) - 2 * hInset;
     int iconCY = by + bh / 2;
 
