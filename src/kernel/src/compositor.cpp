@@ -229,6 +229,10 @@ static uint32_t g_presentStatsIdx      = 0;
 static uint32_t g_presentStatsFilled   = 0;
 static uint64_t g_presentLastLoopTick  = 0;
 static uint64_t g_presentLastReportTick= 0;
+// Smoothed present rate for the taskbar FPS readout. EMA over the present
+// period (frame interval), updated each presented frame; published as whole fps.
+static uint32_t g_smoothedPeriodMsX16  = 0;   // EMA of periodMs, fixed-point <<4
+static volatile uint32_t g_compositorFps = 0;
 
 static void PresentStatsReport()
 {
@@ -339,6 +343,11 @@ volatile uint32_t* CompositorGetPhysFb(uint32_t* stride)
 {
     if (stride) *stride = g_physFbStride;
     return g_physFb;
+}
+
+uint32_t CompositorGetFps()
+{
+    return __atomic_load_n(&g_compositorFps, __ATOMIC_RELAXED);
 }
 
 bool CompositorSetupProcess(Process* proc, int16_t destX, int16_t destY,
@@ -2053,6 +2062,23 @@ static void CompositorLoop()
             loopMs > 0xFFFFFFFFull ? 0xFFFFFFFFu : loopMs);
         ++g_presentStatsIdx;
         if (g_presentStatsFilled < PRESENT_STATS_WINDOW) ++g_presentStatsFilled;
+
+        // Update the smoothed FPS for the taskbar. EMA (1/8 weight) over the
+        // frame interval; only count plausible intervals (1..1000ms) so a long
+        // idle gap between frames doesn't tank the displayed rate.
+        if (periodMs >= 1 && periodMs <= 1000)
+        {
+            uint32_t pX16 = static_cast<uint32_t>(periodMs) << 4;
+            if (g_smoothedPeriodMsX16 == 0)
+                g_smoothedPeriodMsX16 = pX16;
+            else
+                g_smoothedPeriodMsX16 += (static_cast<int32_t>(pX16) -
+                                          static_cast<int32_t>(g_smoothedPeriodMsX16)) / 8;
+            uint32_t periodMs16 = g_smoothedPeriodMsX16;   // ms<<4
+            __atomic_store_n(&g_compositorFps,
+                             periodMs16 ? (16000u / periodMs16) : 0,
+                             __ATOMIC_RELAXED);
+        }
     }
     PresentStatsReport();
 }

@@ -1120,6 +1120,7 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     // path is presenting frames through the host GPU); dim grey otherwise (GOP/
     // stdvga software path). Gives an at-a-glance confirmation that accelerated
     // presentation is live.
+    uint32_t rightX = clockX;   // left edge of the next right-aligned widget
     {
         const char* gpuLabel = "GPU";
         const brook::DisplayOps* disp = brook::DisplayGetActive();
@@ -1146,6 +1147,42 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
                            static_cast<int>(badgeX),
                            static_cast<int>(btnY + textYOff),
                            gpuLabel, badgeFg, WM_TASKBAR_BG);
+        rightX = badgeX;
+    }
+
+    // Compositor FPS readout — to the LEFT of the GPU badge. Smoothed present
+    // rate from CompositorGetFps(); a live indicator of compositor throughput.
+    {
+        uint32_t fps = CompositorGetFps();
+        if (fps > 999) fps = 999;
+        char fpsBuf[12];
+        // Format "NN FPS" (no libc — manual itoa).
+        int fi = 0;
+        if (fps == 0) fpsBuf[fi++] = '0';
+        else
+        {
+            char tmp[4]; int ti = 0;
+            uint32_t v = fps;
+            while (v && ti < 4) { tmp[ti++] = static_cast<char>('0' + v % 10); v /= 10; }
+            while (ti > 0) fpsBuf[fi++] = tmp[--ti];
+        }
+        fpsBuf[fi++] = ' '; fpsBuf[fi++] = 'F'; fpsBuf[fi++] = 'P'; fpsBuf[fi++] = 'S';
+        fpsBuf[fi] = '\0';
+
+        uint32_t fpsW = 0;
+        for (const char* p = fpsBuf; *p; p++)
+        {
+            int code = static_cast<int>(static_cast<uint8_t>(*p));
+            if (code >= static_cast<int>(fa.firstChar) &&
+                code < static_cast<int>(fa.firstChar + fa.glyphCount))
+                fpsW += static_cast<uint32_t>(fa.glyphs[code - static_cast<int>(fa.firstChar)].advance);
+        }
+        uint32_t fpsX = rightX - fpsW - WM_TASKBAR_PADDING * 2;
+        if (fpsX < screenW)
+            WmRenderString(backBuffer, stride, screenW, screenH,
+                           static_cast<int>(fpsX),
+                           static_cast<int>(btnY + textYOff),
+                           fpsBuf, WM_TASKBAR_CLOCK_FG, WM_TASKBAR_BG);
     }
 }
 
