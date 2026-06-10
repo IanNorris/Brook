@@ -269,6 +269,7 @@ struct __attribute__((packed)) VirtioGpuCmdSubmit {
 
 // --- Gallium/virgl encoding constants (virgl_hw.h / virgl_protocol.h) ---
 static constexpr uint32_t VIRGL_FORMAT_B8G8R8X8_UNORM = 2;
+static constexpr uint32_t VIRGL_FORMAT_B8G8R8A8_UNORM = 1;
 static constexpr uint32_t PIPE_TEXTURE_2D             = 2;
 static constexpr uint32_t VIRGL_BIND_RENDER_TARGET    = 1u << 1;
 static constexpr uint32_t VIRGL_BIND_SAMPLER_VIEW     = 1u << 3;
@@ -1282,7 +1283,7 @@ static uint32_t g_compScanoutH    = 0;
 static uint32_t g_compNextRes     = COMP_FIRST_TEX_RES;
 static uint32_t g_composeN        = 0;       // dwords accumulated in compose stream
 
-struct GpuTexture { uint32_t resId; uint32_t w; uint32_t h; bool used; };
+struct GpuTexture { uint32_t resId; uint32_t w; uint32_t h; uint32_t format; bool used; };
 static constexpr uint32_t MAX_GPU_TEXTURES = 128;
 static GpuTexture g_gpuTextures[MAX_GPU_TEXTURES] = {};
 
@@ -1331,7 +1332,7 @@ static bool SetupGpuCompositor(uint32_t w, uint32_t h)
     return true;
 }
 
-static GpuTexId CompCreateTexture(uint32_t w, uint32_t h, uint64_t backingVaddr)
+static GpuTexId CompCreateTexture(uint32_t w, uint32_t h, uint64_t backingVaddr, bool alpha)
 {
     if (!g_compReady || w == 0 || h == 0) return 0;
     uint32_t slot = MAX_GPU_TEXTURES;
@@ -1339,16 +1340,16 @@ static GpuTexId CompCreateTexture(uint32_t w, uint32_t h, uint64_t backingVaddr)
         if (!g_gpuTextures[i].used) { slot = i; break; }
     if (slot == MAX_GPU_TEXTURES) { SerialPuts("virtio_gpu: comp texture table full\n"); return 0; }
 
+    uint32_t format = alpha ? VIRGL_FORMAT_B8G8R8A8_UNORM : VIRGL_FORMAT_B8G8R8X8_UNORM;
     uint32_t resId = g_compNextRes++;
-    if (!ResourceCreate3D(resId, VIRGL_FORMAT_B8G8R8X8_UNORM,
-                          VIRGL_BIND_SAMPLER_VIEW, w, h))
+    if (!ResourceCreate3D(resId, format, VIRGL_BIND_SAMPLER_VIEW, w, h))
     { SerialPuts("virtio_gpu: comp tex create failed\n"); return 0; }
     if (!ResourceAttachBackingVirt(resId, backingVaddr, w * h * 4))
     { SerialPuts("virtio_gpu: comp tex backing failed\n"); return 0; }
     if (!CtxAttachResource(COMP_CTX_ID, resId))
     { SerialPuts("virtio_gpu: comp tex ctx-attach failed\n"); return 0; }
 
-    g_gpuTextures[slot] = { resId, w, h, true };
+    g_gpuTextures[slot] = { resId, w, h, format, true };
     return slot + 1;   // GpuTexId is 1-based
 }
 
@@ -1444,7 +1445,7 @@ static void CompBlit(GpuTexId src,
     dw[n++] = dw_; dw[n++] = dh; dw[n++] = 1;
     dw[n++] = gt->resId;
     dw[n++] = 0;
-    dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;
+    dw[n++] = gt->format;   // honour the texture's own format (alpha for cursor)
     dw[n++] = sx; dw[n++] = sy; dw[n++] = 0;
     dw[n++] = sw; dw[n++] = sh; dw[n++] = 1;
     g_composeN = n;

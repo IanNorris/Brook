@@ -23,10 +23,12 @@ typedef uint32_t GpuTexId;
 struct GpuCompositorOps {
     const char* name;
 
-    // Create a BGRA (B8G8R8X8) sampler-view texture of (w,h) whose backing is
-    // the w*h*4 byte buffer at kernel virtual address `backingVaddr` (may be
-    // physically scattered, e.g. a VmmAllocPages VFB). Returns 0 on failure.
-    GpuTexId (*CreateTexture)(uint32_t w, uint32_t h, uint64_t backingVaddr);
+    // Create a sampler-view texture of (w,h). If `alpha` is false the texture is
+    // B8G8R8X8 (opaque, window/desktop content); if true it is B8G8R8A8 so the
+    // source alpha is honoured by an alpha-blended Blit (cursor). Backing is the
+    // w*h*4 buffer at kernel virtual address `backingVaddr` (may be physically
+    // scattered, e.g. a VmmAllocPages VFB). Returns 0 on failure.
+    GpuTexId (*CreateTexture)(uint32_t w, uint32_t h, uint64_t backingVaddr, bool alpha);
 
     // Destroy a texture created by CreateTexture.
     void (*DestroyTexture)(GpuTexId tex);

@@ -336,6 +336,15 @@ if [ "${NO_AUDIO}" -eq 1 ]; then
     AUDIO_OPTS="-audiodev none,id=hda0"
 fi
 
+# Compositor mode: BROOK_COMPOSITE=gpu enables GPU (virgl BLIT) window
+# composition in the kernel compositor. Passed via fw_cfg opt/composite; the
+# compositor only uses it when the virtio-gpu 3D path is also live (otherwise it
+# transparently falls back to the CPU composite path). Default: CPU.
+FWCFG_OPTS=""
+if [ -n "${BROOK_COMPOSITE:-}" ]; then
+    FWCFG_OPTS="-fw_cfg name=opt/composite,string=${BROOK_COMPOSITE}"
+fi
+
 # GPU device selection.
 #   default            : stdvga (q35) primary + virtio-gpu-pci secondary head.
 #                        Boot GOP comes from stdvga; the virtio-gpu driver drives
@@ -500,6 +509,7 @@ ${QEMU_BIN:-qemu-system-x86_64} \
     -device usb-storage,bus=xhci.0,drive=usbdisk \
     ${AUDIO_OPTS} \
     ${NETDEV_OPT} \
+    ${FWCFG_OPTS} \
     ${SERIAL_OPT} \
     ${DISPLAY_OPT} \
     -monitor unix:${MONITOR_SOCK},server,nowait \
