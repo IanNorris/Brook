@@ -1362,14 +1362,13 @@ static uint32_t* g_compThumbBuf   = nullptr; // thumbnail RT readback backing (v
 static uint32_t* g_compFullBuf    = nullptr; // full-res RT readback backing (virt, lazy)
 static bool      g_compFullReady  = false;   // full-res readback RT created
 
-// --- DRAW (textured-quad) composition path (BROOK_GPU_DRAW) ---------------
-// An alternative to the BLIT compose path: each layer is drawn as a textured
-// quad through the real GL pipeline (vertex+fragment TGSI shaders, blend),
-// which enables per-window opacity and generalises to Venus/Vulkan. The
-// pipeline objects are always set up when 3D is available; whether DRAW is
-// actually used each frame is the compositor's choice (opt/gpudraw), inferred
-// here from whether CompDrawQuad was called. BLIT stays the default + fallback.
-// Proven in isolation by the DRAW self-test ladder (M1-M5).
+// --- DRAW (textured-quad) composition path --------------------------------
+// The GPU compose path: each layer is drawn as a textured quad through the real
+// GL pipeline (vertex+fragment TGSI shaders, blend), which enables per-window
+// opacity and generalises to Venus/Vulkan. The pipeline objects are set up when
+// 3D is available; the compositor uses this path whenever DrawSupported() is
+// true (else the CPU compositor path is used). Proven in isolation by the DRAW
+// self-test ladder (M1-M5).
 static bool      g_drawReady     = false;    // persistent draw objects created
 static uint32_t* g_drawVtxBuf    = nullptr;  // per-frame vertex staging (mapped backing)
 static uint64_t  g_drawVtxPhys   = 0;        // its physical address
@@ -1611,14 +1610,13 @@ static bool SetupGpuCompositor(uint32_t w, uint32_t h)
     g_compReady    = true;
     SerialPrintf("virtio_gpu: GPU compositor ready (scanout RT %ux%u)\n", w, h);
 
-    // Set up the optional DRAW (textured-quad) pipeline objects. If this fails we
-    // leave g_drawReady false and DrawSupported() reports false, so the compositor
-    // keeps using the BLIT path. Whether DRAW is actually used per frame is the
-    // compositor's choice (opt/gpudraw) and is inferred here from DrawQuad usage.
+    // Set up the DRAW (textured-quad) pipeline objects. If this fails we leave
+    // g_drawReady false and DrawSupported() reports false, so the compositor uses
+    // the CPU compositor path instead (the GPU path requires DRAW).
     if (SetupGpuDrawPipeline())
         SerialPuts("virtio_gpu: GPU DRAW pipeline ready (textured-quad composition available)\n");
     else
-        SerialPuts("virtio_gpu: GPU DRAW pipeline unavailable — BLIT only\n");
+        SerialPuts("virtio_gpu: GPU DRAW pipeline unavailable — CPU compositor will be used\n");
     return true;
 }
 
@@ -1763,41 +1761,6 @@ static void CompDrawQuad(GpuTexId src,
     q.blend = (alphaBlend || opacity < 255) ? DRAW_BLEND_ON : DRAW_BLEND;
 }
 
-static void CompBlit(GpuTexId src,
-                     uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh,
-                     uint32_t dx, uint32_t dy, uint32_t dw_, uint32_t dh,
-                     bool alphaBlend)
-{
-    if (!g_compReady) return;
-    GpuTexture* gt = CompTex(src);
-    if (!gt) return;
-
-    // Guard against overflowing the request region (each BLIT is 22 dwords).
-    const uint32_t maxDw =
-        ((CMD_PAGES - 1) * 4096 - sizeof(VirtioGpuCmdSubmit)) / 4 - 32;
-    if (g_composeN + 22 > maxDw) return;
-
-    uint32_t* dw = ComposeDwBase();
-    uint32_t n = g_composeN;
-    uint32_t s0 = (VIRGL_BLIT_MASK_RGBA & 0xFF)
-                | ((VIRGL_TEX_FILTER_NEAREST & 0x3) << 8)
-                | ((alphaBlend ? 1u : 0u) << 12);
-    dw[n++] = VirglCmd0(VIRGL_CCMD_BLIT, 0, 21);
-    dw[n++] = s0;
-    dw[n++] = 0;
-    dw[n++] = 0;
-    dw[n++] = COMP_SCANOUT_RES;
-    dw[n++] = 0;
-    dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;
-    dw[n++] = dx; dw[n++] = dy; dw[n++] = 0;
-    dw[n++] = dw_; dw[n++] = dh; dw[n++] = 1;
-    dw[n++] = gt->resId;
-    dw[n++] = 0;
-    dw[n++] = gt->format;   // honour the texture's own format (alpha for cursor)
-    dw[n++] = sx; dw[n++] = sy; dw[n++] = 0;
-    dw[n++] = sw; dw[n++] = sh; dw[n++] = 1;
-    g_composeN = n;
-}
 
 // Build the per-frame vertex buffer from the recorded quads, upload it, then
 // emit one batched compose stream (framebuffer + clear + state binds, then per
@@ -1896,7 +1859,7 @@ static void CompEndFrame()
     ResourceFlush(COMP_SCANOUT_RES, 0, 0, g_compScanoutW, g_compScanoutH);
 }
 
-// True if the DRAW composition path is active (opt/gpudraw + pipeline ready).
+// True if the DRAW composition pipeline is set up and ready.
 static bool CompDrawSupported()
 {
     return g_drawReady;
@@ -1996,12 +1959,11 @@ static const uint32_t* CompCaptureFull(uint32_t* outW, uint32_t* outH)
 }
 
 static const brook::GpuCompositorOps g_gpuCompositorOps = {
-    "virtio-gpu-blit",
+    "virtio-gpu-draw",
     CompCreateTexture,
     CompDestroyTexture,
     CompUpdateTexture,
     CompBeginFrame,
-    CompBlit,
     CompEndFrame,
     CompGetSize,
     CompCaptureThumb,

@@ -294,7 +294,7 @@ static uint32_t  g_wallpaperHeight = 0;
 // Default off → CPU path unchanged.
 // ---------------------------------------------------------------------------
 static bool      g_gpuComposite   = false;   // BROOK_COMPOSITE=gpu requested
-static bool      g_gpuDraw        = false;   // BROOK_GPU_DRAW: GL draw path (vs BLIT)
+static bool      g_gpuDrawReady   = false;   // GL DRAW pipeline available (set in CompositorInit)
 static uint32_t  g_gpuTestOpacity = 0;       // BROOK_GPU_OPACITY: demo opacity for topmost window (0 = off)
 static bool      g_gpuThumbDump   = false;   // BROOK_GPU_THUMB: base64 thumbnail over serial
 static uint64_t  g_lastThumbTick  = 0;
@@ -328,7 +328,12 @@ static WinTexEntry g_winTex[WM_MAX_WINDOWS] = {};
 
 bool CompositorGpuActive()
 {
-    return g_gpuComposite && GpuCompositorGet() != nullptr;
+    // GPU composition is active only when requested AND the GL DRAW pipeline is
+    // available. The DRAW path is the sole GPU compose path (it is required for
+    // per-window/overlay opacity); when no 3D acceleration is present the CPU
+    // compositor path is the fallback. g_gpuDrawReady is resolved in
+    // CompositorInit, which runs after the driver registers its ops.
+    return g_gpuComposite && g_gpuDrawReady && GpuCompositorGet() != nullptr;
 }
 
 void CompositorInit()
@@ -414,34 +419,28 @@ void CompositorInit()
         SerialPuts("COMPOSITOR: full-res frame dump enabled (BROOK_GPU_FULL=1)\n");
     }
 
-    // Compose via the GL DRAW path (textured quads) by default whenever GPU
-    // composition is active and the driver's draw pipeline is available — the
-    // DRAW path is required for per-window/overlay opacity. opt/gpudraw overrides:
-    // "0" forces the BLIT path (comparison, or if DRAW misbehaves); absent or
-    // "1" keeps the default. When no 3D acceleration is present DrawSupported()
-    // reports false and we fall back to BLIT automatically. The driver registers
-    // its ops before CompositorInit runs, so DrawSupported() is reliable here.
+    // The GL DRAW path is the only GPU composition path (required for opacity).
+    // Resolve its availability here: if the driver's draw pipeline is up, GPU
+    // composition runs via DRAW; otherwise CompositorGpuActive() stays false and
+    // the CPU compositor path handles everything. The driver registers its ops
+    // before CompositorInit runs, so DrawSupported() is reliable here.
     if (g_gpuComposite)
     {
-        char gdraw[8] = {};
-        uint32_t gdn = FwCfgReadFile("opt/gpudraw", gdraw, sizeof(gdraw) - 1);
-        bool wantDraw = !(gdn >= 1 && gdraw[0] == '0');   // default on; only "0" opts out
         const GpuCompositorOps* gpu = GpuCompositorGet();
-        bool drawAvail = gpu && gpu->DrawSupported && gpu->DrawSupported() && gpu->DrawQuad;
-        if (wantDraw && drawAvail)
+        if (gpu && gpu->DrawSupported && gpu->DrawSupported() && gpu->DrawQuad)
         {
-            g_gpuDraw = true;
-            SerialPuts("COMPOSITOR: GPU DRAW composition path enabled (default)\n");
+            g_gpuDrawReady = true;
+            SerialPuts("COMPOSITOR: GPU DRAW composition active\n");
         }
-        else if (wantDraw)
-            SerialPuts("COMPOSITOR: GPU DRAW unavailable (no 3D accel) — using BLIT\n");
         else
-            SerialPuts("COMPOSITOR: GPU DRAW disabled by opt/gpudraw=0 — using BLIT\n");
+        {
+            SerialPuts("COMPOSITOR: GPU composition requested but DRAW pipeline unavailable — using CPU compositor\n");
+        }
     }
 
-    // Verification/demo hook: opt/gpuopacity == "<0-255>" makes the topmost normal
-    // window render at that opacity on the GPU DRAW path, so per-window translucency
-    // can be observed in a headless capture. No effect on the BLIT path.
+    // Verification/demo hook: opt/gpuopacity == "<0-255>" makes every normal
+    // window render at that opacity, so per-window translucency can be observed
+    // in a headless capture. Only meaningful when GPU composition is active.
     char gop[8] = {};
     uint32_t gn = FwCfgReadFile("opt/gpuopacity", gop, sizeof(gop) - 1);
     if (gn >= 1)
@@ -455,7 +454,7 @@ void CompositorInit()
     }
 
     // opt/gpuoverlayopacity == "<0-255>" sets the opacity of the taskbar + launcher
-    // overlay on the GPU DRAW path (255 = opaque, the default). No effect on BLIT.
+    // overlay (255 = opaque, the default).
     char gov[8] = {};
     uint32_t govn = FwCfgReadFile("opt/gpuoverlayopacity", gov, sizeof(gov) - 1);
     if (govn >= 1)
@@ -1217,20 +1216,20 @@ static void CompositorLoopWM()
     bool fullRepaint = forceAll
                      || __atomic_exchange_n(&g_needsFullRepaint, false, __ATOMIC_ACQ_REL);
 
-    // GPU DRAW path: per-window chrome is composited from a separate alpha layer
+    // GPU path: per-window chrome is composited from a separate alpha layer
     // (g_chromeBuffer) rather than baked into the opaque base desktop, so chrome
     // can honour per-window opacity. Clear the layer on a full repaint (mirrors
     // the wallpaper redraw of g_backBuffer) so stale chrome from moved/closed
     // windows does not linger.
-    bool drawChromeLayer = g_gpuDraw && CompositorGpuActive() && EnsureChromeBuffer();
+    bool drawChromeLayer = CompositorGpuActive() && EnsureChromeBuffer();
     if (drawChromeLayer && fullRepaint)
         __builtin_memset(g_chromeBuffer, 0,
                          static_cast<uint64_t>(g_backBufStride) * g_physFbHeight * 4);
 
-    // GPU DRAW path: taskbar + launcher go into the separate overlay layer
+    // GPU path: taskbar + launcher go into the separate overlay layer
     // (composited on top of all windows at g_overlayOpacity), so they can be
     // translucent and the launcher is no longer hidden behind windows.
-    bool drawOverlayLayer = g_gpuDraw && CompositorGpuActive() && EnsureOverlayBuffer();
+    bool drawOverlayLayer = CompositorGpuActive() && EnsureOverlayBuffer();
     if (drawOverlayLayer && fullRepaint)
     {
         __builtin_memset(g_overlayBuffer, 0,
@@ -2303,32 +2302,28 @@ static void DumpFullFrameOnce()
 }
 
 // ---------------------------------------------------------------------------
-// GPU composition present path. Composes the frame on the GPU via BLITs into
-// the scanout render-target and presents it. The CPU has already rendered the
-// desktop layer (wallpaper + chrome + taskbar) into g_backBuffer; window
-// content is composited here from per-window GPU textures (no CPU memcpy of
-// window pixels into the framebuffer). See gpu_compositor.h.
+// GPU composition present path. Composes the frame on the GPU via textured-quad
+// draws into the scanout render-target and presents it. The CPU has rendered the
+// wallpaper into g_backBuffer (and, in WM mode, chrome into the chrome layer and
+// taskbar/launcher into the overlay layer); window content is composited here
+// from per-window GPU textures (no CPU memcpy of window pixels into the
+// framebuffer). See gpu_compositor.h.
 // ---------------------------------------------------------------------------
 
-// Compose one textured layer into the scanout: DrawQuad on the GL draw path,
-// else Blit. Single dispatch point so both paths stay in lockstep. opacity is
-// 255 (opaque) for most layers; window content passes the window's opacity so
-// the GL DRAW path can render translucent windows (BLIT ignores it — opaque).
+// Compose one textured layer into the scanout via the GL DRAW pipeline. Single
+// dispatch point. opacity is 255 (opaque) for most layers; window content and
+// chrome pass the window's opacity so translucent windows composite correctly.
 static inline void GpuComposeLayer(const GpuCompositorOps* gpu, GpuTexId src,
                                    uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh,
                                    uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh,
                                    bool alphaBlend, uint32_t opacity = 255)
 {
-    if (g_gpuDraw)
-        gpu->DrawQuad(src, sx, sy, sw, sh, dx, dy, dw, dh, opacity, alphaBlend);
-    else
-        gpu->Blit(src, sx, sy, sw, sh, dx, dy, dw, dh, alphaBlend);
+    gpu->DrawQuad(src, sx, sy, sw, sh, dx, dy, dw, dh, opacity, alphaBlend);
 }
 
 // Compose a screen-space rectangle of a full-screen source texture 1:1 into the
-// scanout, clamped to the screen. opacity/alphaBlend let the same helper restore
-// opaque desktop furniture (chrome/taskbar from the desktop tex) or composite the
-// translucent per-window chrome layer at a window's opacity.
+// scanout, clamped to the screen. opacity/alphaBlend let the same helper compose
+// the translucent per-window chrome layer or the taskbar/launcher overlay.
 static void GpuComposeSrcRect(const GpuCompositorOps* gpu, GpuTexId tex,
                               int x, int y, int w, int h,
                               uint32_t opacity, bool alphaBlend)
@@ -2342,14 +2337,6 @@ static void GpuComposeSrcRect(const GpuCompositorOps* gpu, GpuTexId tex,
     if (w <= 0 || h <= 0) return;
     GpuComposeLayer(gpu, tex, (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h,
                     (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h, alphaBlend, opacity);
-}
-
-// Blit a screen-space rectangle of the desktop texture 1:1 into the scanout,
-// clamped to the screen. Used to restore chrome/taskbar on top of content.
-static void GpuBlitDesktopRect(const GpuCompositorOps* gpu,
-                               int x, int y, int w, int h)
-{
-    GpuComposeSrcRect(gpu, g_desktopTex, x, y, w, h, 255, false);
 }
 
 // Compose the chrome layer's decoration rects for one window at its opacity.
@@ -2429,12 +2416,11 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
     gpu->GetSize(&scrW, &scrH);
     if (scrW == 0 || scrH == 0) return;
 
-    // 1. Desktop layer. In the GPU DRAW path this is WALLPAPER ONLY (per-window
-    //    chrome and the taskbar/launcher live in separate alpha layers, below); in
-    //    the BLIT path it carries wallpaper + chrome + taskbar. Upload only the
-    //    changed rows: the desktop is static in steady state, so a full 1920x1080
-    //    re-upload every frame would waste ~8MB of DMA. The window content layer is
-    //    a separate texture, so window animation does NOT dirty this.
+    // 1. Desktop layer: WALLPAPER ONLY (per-window chrome and the taskbar/launcher
+    //    live in separate alpha layers, below). Upload only the changed rows: the
+    //    wallpaper is static in steady state, so a full 1920x1080 re-upload every
+    //    frame would waste ~8MB of DMA. The window content layer is a separate
+    //    texture, so window animation does NOT dirty this.
     EnsureDesktopTex(gpu);
     if (!g_desktopTex) return;
     if (g_desktopTexNeedsFull)
@@ -2450,9 +2436,10 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
                                g_physFbWidth, maxY - dirtyMinY);
     }
 
-    // 1b. Chrome layer (GPU DRAW path only): the per-window decorations as an
-    //     alpha texture, uploaded over the same dirty span as the desktop.
-    bool useChromeLayer = g_gpuDraw && g_chromeBuffer;
+    // 1b. Chrome layer: the per-window decorations as an alpha texture, uploaded
+    //     over the same dirty span as the desktop. (WM mode populates it; in
+    //     legacy mode g_chromeBuffer is null and this is skipped.)
+    bool useChromeLayer = g_chromeBuffer != nullptr;
     if (useChromeLayer)
     {
         EnsureChromeTex(gpu);
@@ -2474,8 +2461,9 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
         else useChromeLayer = false;
     }
 
-    // 1c. Overlay layer (taskbar + launcher) as an alpha texture (GPU DRAW only).
-    bool useOverlayLayer = g_gpuDraw && g_overlayBuffer;
+    // 1c. Overlay layer (taskbar + launcher) as an alpha texture. (WM mode
+    //     populates it; in legacy mode g_overlayBuffer is null and this is skipped.)
+    bool useOverlayLayer = g_overlayBuffer != nullptr;
     if (useOverlayLayer)
     {
         EnsureOverlayTex(gpu);
@@ -2552,17 +2540,18 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
     // 4. Compose into the scanout RT.
     gpu->BeginFrame(0);
 
-    // Base: desktop. In the BLIT path this carries wallpaper + chrome + taskbar;
-    // in the DRAW path it is wallpaper only (chrome and taskbar/launcher are
-    // separate alpha layers composited below). Client areas show wallpaper.
+    // Base: desktop = wallpaper (chrome and taskbar/launcher are separate alpha
+    // layers composited below). Client areas show wallpaper. In legacy (non-WM)
+    // mode the backbuffer carries the full legacy scene, so this one quad presents
+    // it and the chrome/overlay layers are absent.
     GpuComposeLayer(gpu, g_desktopTex, 0, 0, g_physFbWidth, g_physFbHeight,
                     0, 0, g_physFbWidth, g_physFbHeight, false);
 
-    // Windows back-to-front. In the DRAW path each window is composited as a
-    // UNIT — content then its chrome — at the window's opacity, so a higher
-    // window's translucent frame blends over a lower window's content correctly.
-    // (Composing all content first, then all chrome, would let a lower window's
-    // chrome paint over a higher window's content once chrome is translucent.)
+    // Windows back-to-front. Each window is composited as a UNIT — content then
+    // its chrome — at the window's opacity, so a higher window's translucent frame
+    // blends over a lower window's content correctly. (Composing all content
+    // first, then all chrome, would let a lower window's chrome paint over a
+    // higher window's content once chrome is translucent.)
     for (uint32_t i = 0; i < wcount; ++i)
     {
         int idx = sorted[i];
@@ -2599,37 +2588,15 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
             }
         }
 
-        // DRAW path: this window's chrome, at the same opacity, immediately on
-        // top of its content (unit compositing). BLIT path restores chrome from
-        // the desktop texture in a separate pass below.
+        // This window's chrome, at the same opacity, immediately on top of its
+        // content (unit compositing: content then chrome per window, back-to-front).
         if (useChromeLayer)
             GpuComposeChrome(gpu, w, op);
     }
 
-    // BLIT path only: chrome frames on top (back-to-front), restored opaque from
-    // the desktop texture so a higher window's chrome is not covered by a lower
-    // window's content where they overlap.
-    if (!useChromeLayer)
-    {
-        for (uint32_t i = 0; i < wcount; ++i)
-        {
-            Window* w = WmGetWindow(sorted[i]);
-            if (!w || !w->visible || w->minimized || w->noChrome) continue;
-            int ox = w->x, oy = w->y;
-            int ow = (int)w->outerWidth(), oh = (int)w->outerHeight();
-            int cx = w->clientX(), cy = w->clientY();
-            int cw = (int)w->clientW, ch = (int)w->clientH;
-            GpuBlitDesktopRect(gpu, ox, oy, ow, cy - oy);                 // titlebar + top border
-            GpuBlitDesktopRect(gpu, ox, cy + ch, ow, (oy + oh) - (cy + ch)); // bottom border
-            GpuBlitDesktopRect(gpu, ox, cy, cx - ox, ch);                // left border
-            GpuBlitDesktopRect(gpu, cx + cw, cy, (ox + ow) - (cx + cw), ch); // right border
-        }
-    }
-
-    // Taskbar (and launcher) on top of all windows. DRAW path composites them
-    // from the alpha overlay layer at g_overlayOpacity (translucent-capable, and
-    // the launcher sits above windows instead of behind them); BLIT path restores
-    // the opaque taskbar from the desktop texture as before.
+    // Taskbar (and launcher) on top of all windows, composited from the alpha
+    // overlay layer at g_overlayOpacity (translucent-capable; the launcher sits
+    // above windows). Populated in WM mode only; legacy mode has no taskbar.
     if (useOverlayLayer)
     {
         GpuComposeSrcRect(gpu, g_overlayTex, 0, (int)scrH - (int)WM_TASKBAR_HEIGHT,
@@ -2641,11 +2608,6 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
             GpuComposeSrcRect(gpu, g_overlayTex, lx, ly, (int)lw, (int)lh,
                               g_overlayOpacity, true);
         }
-    }
-    else
-    {
-        GpuBlitDesktopRect(gpu, 0, (int)scrH - (int)WM_TASKBAR_HEIGHT,
-                           (int)scrW, (int)WM_TASKBAR_HEIGHT);
     }
 
     // Cursor (alpha) on top of everything.
