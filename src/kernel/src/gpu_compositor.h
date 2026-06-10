@@ -21,6 +21,12 @@ namespace brook {
 // Opaque per-texture handle. 0 == invalid.
 typedef uint32_t GpuTexId;
 
+// Special source handle for DrawQuad: sample the blurred backdrop (the scene as
+// composited up to the most recent BlurBarrier, downsampled + gaussian-blurred)
+// at the quad's destination rect in screen space. Used to paint frosted glass
+// behind a window's titlebar. Only valid in the phase after BlurBarrier().
+static constexpr GpuTexId GPU_TEX_BLUR_BACKDROP = 0xFFFFFFFFu;
+
 struct GpuCompositorOps {
     const char* name;
 
@@ -80,6 +86,14 @@ struct GpuCompositorOps {
                      uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh,
                      uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh,
                      uint32_t opacity, bool alphaBlend);
+
+    // Mark the backdrop barrier: everything drawn so far this frame (wallpaper +
+    // window content) is the "backdrop". At present time the compositor snapshots
+    // the scanout at this point, downsamples + gaussian-blurs it, and makes it
+    // available to subsequent DrawQuad(GPU_TEX_BLUR_BACKDROP, ...) calls so a
+    // window's titlebar can show frosted glass. No-op if blur is unsupported;
+    // optional (only call when at least one window requests blur).
+    void (*BlurBarrier)();
 };
 
 // Register the GPU compositor ops (called by the display driver once its 3D

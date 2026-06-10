@@ -2413,6 +2413,26 @@ static void GpuComposeChrome(const GpuCompositorOps* gpu, const Window* w, uint3
     GpuComposeSrcRect(gpu, g_chromeTex, cx + cw, cy, (ox + ow) - (cx + cw), ch, opacity, true); // right border
 }
 
+// Compose the frosted-glass backdrop under a window's titlebar strip: a quad
+// sampling the blurred backdrop (the scene up to the BlurBarrier) at the strip's
+// screen position, drawn opaque just before the translucent glass chrome blends
+// on top. Clamped to the screen. Requires the driver's blur support + a barrier.
+static void GpuComposeTitlebarBlur(const GpuCompositorOps* gpu, const Window* w)
+{
+    if (!gpu->BlurBarrier || w->noChrome) return;
+    int x = w->x, y = w->y;
+    int wd = (int)w->outerWidth();
+    int hd = w->clientY() - w->y;   // titlebar + top border strip
+    if (x < 0) { wd += x; x = 0; }
+    if (y < 0) { hd += y; y = 0; }
+    if (x >= (int)g_physFbWidth || y >= (int)g_physFbHeight) return;
+    if (x + wd > (int)g_physFbWidth)  wd = (int)g_physFbWidth  - x;
+    if (y + hd > (int)g_physFbHeight) hd = (int)g_physFbHeight - y;
+    if (wd <= 0 || hd <= 0) return;
+    gpu->DrawQuad(GPU_TEX_BLUR_BACKDROP, 0, 0, 0, 0,
+                  (uint32_t)x, (uint32_t)y, (uint32_t)wd, (uint32_t)hd, 255, false);
+}
+
 static void EnsureDesktopTex(const GpuCompositorOps* gpu)
 {
     if (g_desktopTex && g_desktopTexPtr == g_backBuffer) return;
@@ -2605,11 +2625,27 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
     GpuComposeLayer(gpu, g_desktopTex, 0, 0, g_physFbWidth, g_physFbHeight,
                     0, 0, g_physFbWidth, g_physFbHeight, false);
 
-    // Windows back-to-front. Each window is composited as a UNIT — content then
-    // its chrome — at the window's opacity, so a higher window's translucent frame
-    // blends over a lower window's content correctly. (Composing all content
-    // first, then all chrome, would let a lower window's chrome paint over a
-    // higher window's content once chrome is translucent.)
+    // Windows back-to-front. Without blur, each window is composited as a UNIT —
+    // content then its chrome — at the window's opacity, so a higher window's
+    // translucent frame blends over a lower window's content correctly.
+    //
+    // When any window requests frosted-glass blur, we instead use a PHASED order:
+    // all window content first (the "backdrop"), then a BlurBarrier (the driver
+    // snapshots + blurs the backdrop), then per window {blurred backdrop under the
+    // titlebar; chrome on top}. This is correct for opaque windows; translucent +
+    // blur together is a documented follow-up (phasing drops the content/chrome
+    // interleave that strict per-window translucency needs).
+    bool anyBlur = false;
+    if (useChromeLayer && gpu->BlurBarrier)
+    {
+        for (uint32_t i = 0; i < wcount; ++i)
+        {
+            Window* w = WmGetWindow(sorted[i]);
+            if (w && w->visible && !w->minimized && !w->noChrome && w->blurRadius > 0)
+            { anyBlur = true; break; }
+        }
+    }
+
     for (uint32_t i = 0; i < wcount; ++i)
     {
         int idx = sorted[i];
@@ -2646,10 +2682,29 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
             }
         }
 
-        // This window's chrome, at the same opacity, immediately on top of its
-        // content (unit compositing: content then chrome per window, back-to-front).
-        if (useChromeLayer)
+        // Non-blur path: this window's chrome immediately on top of its content
+        // (unit compositing, back-to-front). Blur path defers chrome to the
+        // post-barrier pass below.
+        if (useChromeLayer && !anyBlur)
             GpuComposeChrome(gpu, w, op);
+    }
+
+    // Blur path: snapshot+blur the backdrop, then draw each window's frosted
+    // titlebar backdrop + chrome on top, back-to-front.
+    if (anyBlur)
+    {
+        gpu->BlurBarrier();
+        for (uint32_t i = 0; i < wcount; ++i)
+        {
+            Window* w = WmGetWindow(sorted[i]);
+            if (!w || !w->visible || w->minimized) continue;
+            uint32_t op = w->opacity;
+            if (g_gpuTestOpacity) op = g_gpuTestOpacity;
+            if (w->blurRadius > 0)
+                GpuComposeTitlebarBlur(gpu, w);
+            if (useChromeLayer)
+                GpuComposeChrome(gpu, w, op);
+        }
     }
 
     // Taskbar (and launcher) on top of all windows, composited from the alpha

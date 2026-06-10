@@ -316,6 +316,7 @@ static constexpr uint32_t PIPE_BLEND_ADD                 = 0;
 // nearest-filter (PIPE_TEX_FILTER_NEAREST) — exact 1:1 pixel copy.
 static constexpr uint32_t VIRGL_BLIT_MASK_RGBA = 0xF;
 static constexpr uint32_t VIRGL_TEX_FILTER_NEAREST = 0;
+static constexpr uint32_t VIRGL_TEX_FILTER_LINEAR  = 1;
 
 // virgl command header: cmd | (obj_type << 8) | (len_in_dwords << 16).
 static inline uint32_t VirglCmd0(uint32_t cmd, uint32_t obj, uint32_t len)
@@ -1377,7 +1378,26 @@ static constexpr uint32_t COMP_DRAW_VBUF_RES = 13;   // dynamic vertex buffer re
 static constexpr uint32_t DRAW_BLEND = 2, DRAW_BLEND_ON = 3, DRAW_RAST = 4,
                           DRAW_DSA = 5, DRAW_VE = 6, DRAW_SAMP = 7,
                           DRAW_VS = 8, DRAW_FS = 9;
+// Frosted-glass backdrop blur: fixed-size downsampled RTs + separable gaussian.
+// Fixed dims (independent of display size) keep the gaussian texel offsets as
+// compile-time constants; the downsample BLIT handles any scanout resolution and
+// the backdrop quad samples in normalized [0,1] uv, so this works at any size.
+static constexpr uint32_t COMP_BLUR_W   = 480;   // ~1/4 of 1920
+static constexpr uint32_t COMP_BLUR_H   = 270;   // ~1/4 of 1080
+static constexpr uint32_t COMP_BLUR_A_RES   = 5;    // downsample + final blurred RT
+static constexpr uint32_t COMP_BLUR_B_RES   = 6;    // ping-pong temp RT
+static constexpr uint32_t COMP_BLURVTX_RES  = 7;    // full-screen blur-pass vertex buffer
+static constexpr uint32_t DRAW_FS_BLURH = 10, DRAW_FS_BLURV = 11, DRAW_SAMP_LIN = 12,
+                          BLUR_A_SURF = 13, BLUR_B_SURF = 14;
 static uint32_t  g_drawNextSview = 256;      // monotonic sampler-view handle allocator
+static bool      g_blurReady     = false;    // blur RTs/shaders/sampler set up
+static uint32_t  g_blurAView     = 0;        // sampler view for COMP_BLUR_A_RES
+static uint32_t  g_blurBView     = 0;        // sampler view for COMP_BLUR_B_RES
+static uint64_t  g_blurVtxPhys   = 0;
+static uint32_t* g_blurVtxBuf    = nullptr;
+static uint32_t  g_blurBarrier   = 0xFFFFFFFFu; // quad index at the backdrop barrier (none = no blur this frame)
+// Quad flags.
+static constexpr uint32_t QUAD_SAMPLE_BLUR = 1u << 0;  // sample the blurred backdrop (sview ignored)
 // One recorded quad (filled by CompDrawQuad, consumed by CompEndFrame). Dst is in
 // integer screen pixels; uv is precomputed float bits; blend selects the object.
 struct DrawQuadRec {
@@ -1386,6 +1406,7 @@ struct DrawQuadRec {
     uint32_t opacity;            // per-window opacity in [0,1] as IEEE-754 bits
     uint32_t sview;              // texture sampler-view handle
     uint32_t blend;             // DRAW_BLEND (opaque) or DRAW_BLEND_ON (alpha)
+    uint32_t flags;             // QUAD_* bits
 };
 static constexpr uint32_t MAX_DRAW_QUADS = 256;
 static DrawQuadRec g_drawQuads[MAX_DRAW_QUADS];
@@ -1454,6 +1475,67 @@ static const char* kCompFS =
     "DCL TEMP[0]\n"
     "TEX TEMP[0], IN[0], SAMP[0], 2D\n"
     "MUL TEMP[0].w, TEMP[0].wwww, IN[1].xxxx\n"
+    "MOV OUT[0], TEMP[0]\n"
+    "END\n";
+
+// Separable 5-tap gaussian for the backdrop blur. Taps at 0, +-1, +-2 texels
+// with weights 0.375 / 0.25 / 0.0625 (sum 1.0). The blur RT is a fixed
+// COMP_BLUR_W x COMP_BLUR_H, so the texel offsets are compile-time constants
+// (1/480 in x, 1/270 in y). Reuses kCompVS (uv in GENERIC[0]); opacity unused.
+static const char* kBlurH =
+    "FRAG\n"
+    "DCL IN[0], GENERIC[0], PERSPECTIVE\n"
+    "DCL OUT[0], COLOR\n"
+    "DCL SAMP[0]\n"
+    "DCL SVIEW[0], 2D, FLOAT\n"
+    "DCL TEMP[0]\n"
+    "DCL TEMP[1]\n"
+    "DCL TEMP[2]\n"
+    "IMM[0] FLT32 { 0.00208333, 0.0000, 0.0000, 0.0000 }\n"
+    "IMM[1] FLT32 { 0.00416667, 0.0000, 0.0000, 0.0000 }\n"
+    "IMM[2] FLT32 { 0.3750, 0.2500, 0.0625, 0.0000 }\n"
+    "TEX TEMP[0], IN[0], SAMP[0], 2D\n"
+    "MUL TEMP[0], TEMP[0], IMM[2].xxxx\n"
+    "ADD TEMP[1], IN[0], IMM[0]\n"
+    "TEX TEMP[2], TEMP[1], SAMP[0], 2D\n"
+    "MAD TEMP[0], TEMP[2], IMM[2].yyyy, TEMP[0]\n"
+    "SUB TEMP[1], IN[0], IMM[0]\n"
+    "TEX TEMP[2], TEMP[1], SAMP[0], 2D\n"
+    "MAD TEMP[0], TEMP[2], IMM[2].yyyy, TEMP[0]\n"
+    "ADD TEMP[1], IN[0], IMM[1]\n"
+    "TEX TEMP[2], TEMP[1], SAMP[0], 2D\n"
+    "MAD TEMP[0], TEMP[2], IMM[2].zzzz, TEMP[0]\n"
+    "SUB TEMP[1], IN[0], IMM[1]\n"
+    "TEX TEMP[2], TEMP[1], SAMP[0], 2D\n"
+    "MAD TEMP[0], TEMP[2], IMM[2].zzzz, TEMP[0]\n"
+    "MOV OUT[0], TEMP[0]\n"
+    "END\n";
+static const char* kBlurV =
+    "FRAG\n"
+    "DCL IN[0], GENERIC[0], PERSPECTIVE\n"
+    "DCL OUT[0], COLOR\n"
+    "DCL SAMP[0]\n"
+    "DCL SVIEW[0], 2D, FLOAT\n"
+    "DCL TEMP[0]\n"
+    "DCL TEMP[1]\n"
+    "DCL TEMP[2]\n"
+    "IMM[0] FLT32 { 0.0000, 0.00370370, 0.0000, 0.0000 }\n"
+    "IMM[1] FLT32 { 0.0000, 0.00740741, 0.0000, 0.0000 }\n"
+    "IMM[2] FLT32 { 0.3750, 0.2500, 0.0625, 0.0000 }\n"
+    "TEX TEMP[0], IN[0], SAMP[0], 2D\n"
+    "MUL TEMP[0], TEMP[0], IMM[2].xxxx\n"
+    "ADD TEMP[1], IN[0], IMM[0]\n"
+    "TEX TEMP[2], TEMP[1], SAMP[0], 2D\n"
+    "MAD TEMP[0], TEMP[2], IMM[2].yyyy, TEMP[0]\n"
+    "SUB TEMP[1], IN[0], IMM[0]\n"
+    "TEX TEMP[2], TEMP[1], SAMP[0], 2D\n"
+    "MAD TEMP[0], TEMP[2], IMM[2].yyyy, TEMP[0]\n"
+    "ADD TEMP[1], IN[0], IMM[1]\n"
+    "TEX TEMP[2], TEMP[1], SAMP[0], 2D\n"
+    "MAD TEMP[0], TEMP[2], IMM[2].zzzz, TEMP[0]\n"
+    "SUB TEMP[1], IN[0], IMM[1]\n"
+    "TEX TEMP[2], TEMP[1], SAMP[0], 2D\n"
+    "MAD TEMP[0], TEMP[2], IMM[2].zzzz, TEMP[0]\n"
     "MOV OUT[0], TEMP[0]\n"
     "END\n";
 
@@ -1542,6 +1624,98 @@ static bool SetupGpuDrawPipeline()
     return true;
 }
 
+// Forward decls for blur setup helpers (defined with the draw self-test helpers).
+// One-time setup of the frosted-glass backdrop-blur objects: two fixed-size
+// host-only render targets (downsample/ping-pong), their surfaces + sampler
+// views, a linear+clamp-to-edge sampler, a full-screen vertex buffer, and the
+// separable gaussian shaders. Leaves g_blurReady false (blur disabled, the
+// compositor simply never calls BlurBarrier effectively) on any failure.
+static bool SetupGpuBlur()
+{
+    if (!g_drawReady) return false;
+
+    // Two host-only RTs (no guest backing — sampled + rendered on the host).
+    if (!ResourceCreate3D(COMP_BLUR_A_RES, VIRGL_FORMAT_B8G8R8X8_UNORM,
+                          VIRGL_BIND_RENDER_TARGET | VIRGL_BIND_SAMPLER_VIEW,
+                          COMP_BLUR_W, COMP_BLUR_H) ||
+        !CtxAttachResource(COMP_CTX_ID, COMP_BLUR_A_RES) ||
+        !ResourceCreate3D(COMP_BLUR_B_RES, VIRGL_FORMAT_B8G8R8X8_UNORM,
+                          VIRGL_BIND_RENDER_TARGET | VIRGL_BIND_SAMPLER_VIEW,
+                          COMP_BLUR_W, COMP_BLUR_H) ||
+        !CtxAttachResource(COMP_CTX_ID, COMP_BLUR_B_RES))
+    { SerialPuts("virtio_gpu: blur RT create failed\n"); return false; }
+
+    // Full-screen vertex buffer (NDC quad, uv 0..1, opacity 1). 4 verts * 5 f32.
+    {
+        const uint32_t vbytes = 4 * 5 * 4;
+        PhysicalAddress vp = PmmAllocPages(AlignUp(vbytes, 4096) / 4096, MemTag::Device, KernelPid);
+        if (!vp) { SerialPuts("virtio_gpu: blur vbuf alloc failed\n"); return false; }
+        g_blurVtxPhys = vp.raw();
+        g_blurVtxBuf  = reinterpret_cast<uint32_t*>(PhysToVirt(vp).raw());
+        uint32_t* v = g_blurVtxBuf;
+        const uint32_t one = F32Bits(1.0f), zero = F32Bits(0.0f), nOne = F32Bits(-1.0f);
+        // (x,y,u,v,op): TL(-1,-1,0,0) TR(1,-1,1,0) BL(-1,1,0,1) BR(1,1,1,1)
+        v[0]=nOne; v[1]=nOne; v[2]=zero; v[3]=zero; v[4]=one;
+        v[5]=one;  v[6]=nOne; v[7]=one;  v[8]=zero; v[9]=one;
+        v[10]=nOne;v[11]=one; v[12]=zero;v[13]=one; v[14]=one;
+        v[15]=one; v[16]=one; v[17]=one; v[18]=one; v[19]=one;
+        if (!ResourceCreateBuffer(COMP_BLURVTX_RES, VIRGL_BIND_VERTEX_BUFFER, vbytes) ||
+            !ResourceAttachBackingContig(COMP_BLURVTX_RES, g_blurVtxPhys, vbytes) ||
+            !CtxAttachResource(COMP_CTX_ID, COMP_BLURVTX_RES) ||
+            !TransferToHostBuffer(COMP_CTX_ID, COMP_BLURVTX_RES, vbytes))
+        { SerialPuts("virtio_gpu: blur vbuf resource failed\n"); return false; }
+    }
+
+    // Surfaces (render targets), linear+clamp-to-edge sampler, sampler views.
+    {
+        auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
+        memset(sub, 0, sizeof(*sub));
+        sub->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D; sub->hdr.ctx_id = COMP_CTX_ID;
+        uint32_t* dw = ComposeDwBase(); uint32_t n = 0;
+        dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SURFACE, 5);
+        dw[n++] = BLUR_A_SURF; dw[n++] = COMP_BLUR_A_RES; dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;
+        dw[n++] = 0; dw[n++] = 0;
+        dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SURFACE, 5);
+        dw[n++] = BLUR_B_SURF; dw[n++] = COMP_BLUR_B_RES; dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;
+        dw[n++] = 0; dw[n++] = 0;
+        // Linear, clamp-to-edge sampler: wrap_s/t/r = CLAMP_TO_EDGE(2),
+        // min/mag image filter = LINEAR(1).  S0 = 2|(2<<3)|(2<<6)|(1<<9)|(1<<13).
+        uint32_t s0lin = 2u | (2u << 3) | (2u << 6) | (1u << 9) | (1u << 13);
+        dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SAMPLER_STATE, 9);
+        dw[n++] = DRAW_SAMP_LIN; dw[n++] = s0lin;
+        dw[n++] = 0; dw[n++] = 0; dw[n++] = 0;
+        dw[n++] = 0; dw[n++] = 0; dw[n++] = 0; dw[n++] = 0;
+        sub->size = n * 4;
+        if (!CmdRespOk(SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP)))
+        { SerialPuts("virtio_gpu: blur surfaces/sampler failed\n"); return false; }
+    }
+    // Sampler views for the two blur RTs (identity swizzle 0x688).
+    {
+        g_blurAView = g_drawNextSview++;
+        g_blurBView = g_drawNextSview++;
+        auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
+        memset(sub, 0, sizeof(*sub));
+        sub->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D; sub->hdr.ctx_id = COMP_CTX_ID;
+        uint32_t* dw = ComposeDwBase(); uint32_t n = 0;
+        dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SAMPLER_VIEW, 6);
+        dw[n++] = g_blurAView; dw[n++] = COMP_BLUR_A_RES; dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;
+        dw[n++] = 0; dw[n++] = 0; dw[n++] = 0x688u;
+        dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SAMPLER_VIEW, 6);
+        dw[n++] = g_blurBView; dw[n++] = COMP_BLUR_B_RES; dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;
+        dw[n++] = 0; dw[n++] = 0; dw[n++] = 0x688u;
+        sub->size = n * 4;
+        if (!CmdRespOk(SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP)))
+        { SerialPuts("virtio_gpu: blur sampler-views failed\n"); return false; }
+    }
+    // Gaussian shaders.
+    if (!CreateShaderObj(COMP_CTX_ID, DRAW_FS_BLURH, PIPE_SHADER_FRAGMENT, kBlurH) ||
+        !CreateShaderObj(COMP_CTX_ID, DRAW_FS_BLURV, PIPE_SHADER_FRAGMENT, kBlurV))
+    { SerialPuts("virtio_gpu: blur shader create failed\n"); return false; }
+
+    g_blurReady = true;
+    return true;
+}
+
 // One-time setup of the persistent compositor context + scanout render-target.
 // The scanout RT has NO guest backing (host-only); FLUSH presents it directly.
 static bool SetupGpuCompositor(uint32_t w, uint32_t h)
@@ -1617,6 +1791,16 @@ static bool SetupGpuCompositor(uint32_t w, uint32_t h)
         SerialPuts("virtio_gpu: GPU DRAW pipeline ready (textured-quad composition available)\n");
     else
         SerialPuts("virtio_gpu: GPU DRAW pipeline unavailable — CPU compositor will be used\n");
+
+    // Optional frosted-glass backdrop blur (needs the DRAW pipeline). Non-fatal:
+    // if it fails the compositor just never gets a usable blurred backdrop.
+    if (g_drawReady)
+    {
+        if (SetupGpuBlur())
+            SerialPuts("virtio_gpu: GPU backdrop-blur pipeline ready (frosted glass available)\n");
+        else
+            SerialPuts("virtio_gpu: GPU backdrop-blur unavailable — chrome will not blur\n");
+    }
     return true;
 }
 
@@ -1705,6 +1889,7 @@ static void CompBeginFrame(uint32_t clearArgb)
     // the compositor records quads via CompDrawQuad, CompEndFrame builds the
     // batched draw stream and ignores the BLIT compose stream below.
     g_drawQuadCount = 0;
+    g_blurBarrier = 0xFFFFFFFFu;   // no backdrop barrier unless BlurBarrier() is called
 
     // Start a fresh compose stream: SET_FRAMEBUFFER_STATE(scanout surf) + CLEAR.
     // Clear to opaque black. (The kernel builds with -mno-sse / soft-float is not
@@ -1740,6 +1925,29 @@ static void CompDrawQuad(GpuTexId src,
                          uint32_t opacity, bool alphaBlend)
 {
     if (!g_compReady || !g_drawReady || g_drawQuadCount >= MAX_DRAW_QUADS) return;
+
+    // Special source: the blurred backdrop. Sample it at the destination rect's
+    // screen-space uv (normalized to the scanout), so the quad shows the frosted
+    // scene behind it. No texture/sview lookup; resolved to g_blurAView at emit.
+    if (src == brook::GPU_TEX_BLUR_BACKDROP)
+    {
+        if (!g_blurReady || g_compScanoutW == 0 || g_compScanoutH == 0) return;
+        DrawQuadRec& q = g_drawQuads[g_drawQuadCount++];
+        q.dx  = static_cast<int32_t>(dx);
+        q.dy  = static_cast<int32_t>(dy);
+        q.dx2 = static_cast<int32_t>(dx + dw_);
+        q.dy2 = static_cast<int32_t>(dy + dh);
+        q.u0 = FracBits(static_cast<int32_t>(dx),       static_cast<int32_t>(g_compScanoutW));
+        q.v0 = FracBits(static_cast<int32_t>(dy),       static_cast<int32_t>(g_compScanoutH));
+        q.u1 = FracBits(static_cast<int32_t>(dx + dw_), static_cast<int32_t>(g_compScanoutW));
+        q.v1 = FracBits(static_cast<int32_t>(dy + dh),  static_cast<int32_t>(g_compScanoutH));
+        q.opacity = F32Bits(1.0f);
+        q.sview = g_blurAView;          // final blurred RT
+        q.blend = DRAW_BLEND;           // opaque (the glass chrome blends on top)
+        q.flags = QUAD_SAMPLE_BLUR;
+        return;
+    }
+
     GpuTexture* gt = CompTex(src);
     if (!gt || gt->sview == 0) return;
 
@@ -1759,6 +1967,15 @@ static void CompDrawQuad(GpuTexId src,
                                  : FracBits(static_cast<int32_t>(opacity), 255);
     q.sview = gt->sview;
     q.blend = (alphaBlend || opacity < 255) ? DRAW_BLEND_ON : DRAW_BLEND;
+    q.flags = 0;
+}
+
+// Record the backdrop barrier: subsequent GPU_TEX_BLUR_BACKDROP quads sample the
+// blur of everything recorded before this point. Records the split index.
+static void CompBlurBarrier()
+{
+    if (!g_blurReady) return;
+    g_blurBarrier = g_drawQuadCount;
 }
 
 
@@ -1817,16 +2034,92 @@ static void CompEndFrameDraw()
     dw[n++] = PIPE_SHADER_FRAGMENT; dw[n++] = 0; dw[n++] = DRAW_SAMP;
 
     uint32_t lastBlend = 0;
+    uint32_t lastSamp  = DRAW_SAMP;   // nearest bound above
     for (uint32_t i = 0; i < g_drawQuadCount; ++i)
     {
+        // At the backdrop barrier, snapshot the scanout (everything drawn so far),
+        // downsample it into BLUR_A, run the separable gaussian (H: A->B, V: B->A),
+        // then restore the scanout framebuffer/viewport/shader/sampler so the
+        // following chrome quads (incl. GPU_TEX_BLUR_BACKDROP samples of BLUR_A)
+        // composite normally. One stream, in order — the host serializes it.
+        if (g_blurBarrier == i && g_blurReady)
+        {
+            if (n + 80 > (CMD_PAGES - 1) * 1024) { /* no room for blur */ }
+            else
+            {
+                const int32_t bw = static_cast<int32_t>(COMP_BLUR_W);
+                const int32_t bh = static_cast<int32_t>(COMP_BLUR_H);
+                // Downsample BLIT scanout -> BLUR_A (linear).
+                uint32_t s0 = (VIRGL_BLIT_MASK_RGBA & 0xFF) | ((VIRGL_TEX_FILTER_LINEAR & 0x3) << 8);
+                dw[n++] = VirglCmd0(VIRGL_CCMD_BLIT, 0, 21);
+                dw[n++] = s0; dw[n++] = 0; dw[n++] = 0;
+                dw[n++] = COMP_BLUR_A_RES; dw[n++] = 0; dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;
+                dw[n++] = 0; dw[n++] = 0; dw[n++] = 0;
+                dw[n++] = COMP_BLUR_W; dw[n++] = COMP_BLUR_H; dw[n++] = 1;
+                dw[n++] = COMP_SCANOUT_RES; dw[n++] = 0; dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;
+                dw[n++] = 0; dw[n++] = 0; dw[n++] = 0;
+                dw[n++] = static_cast<uint32_t>(W); dw[n++] = static_cast<uint32_t>(H); dw[n++] = 1;
+                // Opaque blend + linear sampler + blur vertex buffer for both passes.
+                dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_OBJECT, VIRGL_OBJECT_BLEND, 1); dw[n++] = DRAW_BLEND;
+                dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_SAMPLER_STATES, 0, 3);
+                dw[n++] = PIPE_SHADER_FRAGMENT; dw[n++] = 0; dw[n++] = DRAW_SAMP_LIN;
+                dw[n++] = VirglCmd0(VIRGL_CCMD_SET_VIEWPORT_STATE, 0, 7);
+                dw[n++] = 0;
+                dw[n++] = IntToF32Bits(bw / 2); dw[n++] = IntToF32Bits(bh / 2); dw[n++] = F32Bits(1.0f);
+                dw[n++] = IntToF32Bits(bw / 2); dw[n++] = IntToF32Bits(bh / 2); dw[n++] = F32Bits(0.0f);
+                dw[n++] = VirglCmd0(VIRGL_CCMD_SET_VERTEX_BUFFERS, 0, 3);
+                dw[n++] = 20; dw[n++] = 0; dw[n++] = COMP_BLURVTX_RES;
+                // H pass: BLUR_A -> BLUR_B.
+                dw[n++] = VirglCmd0(VIRGL_CCMD_SET_FRAMEBUFFER_STATE, 0, 3);
+                dw[n++] = 1; dw[n++] = 0; dw[n++] = BLUR_B_SURF;
+                dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_SHADER, 0, 2); dw[n++] = DRAW_FS_BLURH; dw[n++] = PIPE_SHADER_FRAGMENT;
+                dw[n++] = VirglCmd0(VIRGL_CCMD_SET_SAMPLER_VIEWS, 0, 3);
+                dw[n++] = PIPE_SHADER_FRAGMENT; dw[n++] = 0; dw[n++] = g_blurAView;
+                dw[n++] = VirglCmd0(VIRGL_CCMD_DRAW_VBO, 0, 12);
+                dw[n++] = 0; dw[n++] = 4; dw[n++] = PIPE_PRIM_TRIANGLE_STRIP; dw[n++] = 0;
+                dw[n++] = 1; dw[n++] = 0; dw[n++] = 0; dw[n++] = 0;
+                dw[n++] = 0; dw[n++] = 0; dw[n++] = 3; dw[n++] = 0;
+                // V pass: BLUR_B -> BLUR_A.
+                dw[n++] = VirglCmd0(VIRGL_CCMD_SET_FRAMEBUFFER_STATE, 0, 3);
+                dw[n++] = 1; dw[n++] = 0; dw[n++] = BLUR_A_SURF;
+                dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_SHADER, 0, 2); dw[n++] = DRAW_FS_BLURV; dw[n++] = PIPE_SHADER_FRAGMENT;
+                dw[n++] = VirglCmd0(VIRGL_CCMD_SET_SAMPLER_VIEWS, 0, 3);
+                dw[n++] = PIPE_SHADER_FRAGMENT; dw[n++] = 0; dw[n++] = g_blurBView;
+                dw[n++] = VirglCmd0(VIRGL_CCMD_DRAW_VBO, 0, 12);
+                dw[n++] = 0; dw[n++] = 4; dw[n++] = PIPE_PRIM_TRIANGLE_STRIP; dw[n++] = 0;
+                dw[n++] = 1; dw[n++] = 0; dw[n++] = 0; dw[n++] = 0;
+                dw[n++] = 0; dw[n++] = 0; dw[n++] = 3; dw[n++] = 0;
+                // Restore scanout framebuffer + viewport + chrome shader + nearest.
+                dw[n++] = VirglCmd0(VIRGL_CCMD_SET_FRAMEBUFFER_STATE, 0, 3);
+                dw[n++] = 1; dw[n++] = 0; dw[n++] = COMP_SCANOUT_SURF;
+                dw[n++] = VirglCmd0(VIRGL_CCMD_SET_VIEWPORT_STATE, 0, 7);
+                dw[n++] = 0;
+                dw[n++] = IntToF32Bits(W / 2); dw[n++] = IntToF32Bits(H / 2); dw[n++] = F32Bits(1.0f);
+                dw[n++] = IntToF32Bits(W / 2); dw[n++] = IntToF32Bits(H / 2); dw[n++] = F32Bits(0.0f);
+                dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_SHADER, 0, 2); dw[n++] = DRAW_FS; dw[n++] = PIPE_SHADER_FRAGMENT;
+                dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_SAMPLER_STATES, 0, 3);
+                dw[n++] = PIPE_SHADER_FRAGMENT; dw[n++] = 0; dw[n++] = DRAW_SAMP;
+                lastBlend = DRAW_BLEND;   // blur bound opaque
+                lastSamp  = DRAW_SAMP;
+            }
+        }
+
         const DrawQuadRec& q = g_drawQuads[i];
-        // ~12 dwords/quad; bail if we'd overflow the compose region (last page
+        // ~16 dwords/quad; bail if we'd overflow the compose region (last page
         // is the response buffer).
-        if (n + 16 > (CMD_PAGES - 1) * 1024) break;
+        if (n + 18 > (CMD_PAGES - 1) * 1024) break;
         if (q.blend != lastBlend) {
             dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_OBJECT, VIRGL_OBJECT_BLEND, 1);
             dw[n++] = q.blend;
             lastBlend = q.blend;
+        }
+        // Frosted-glass backdrop quads sample the (upscaled) blur RT with linear
+        // filtering; everything else stays nearest (crisp 1:1 textures/masks).
+        uint32_t wantSamp = (q.flags & QUAD_SAMPLE_BLUR) ? DRAW_SAMP_LIN : DRAW_SAMP;
+        if (wantSamp != lastSamp) {
+            dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_SAMPLER_STATES, 0, 3);
+            dw[n++] = PIPE_SHADER_FRAGMENT; dw[n++] = 0; dw[n++] = wantSamp;
+            lastSamp = wantSamp;
         }
         dw[n++] = VirglCmd0(VIRGL_CCMD_SET_SAMPLER_VIEWS, 0, 3);
         dw[n++] = PIPE_SHADER_FRAGMENT; dw[n++] = 0; dw[n++] = q.sview;
@@ -1840,6 +2133,7 @@ static void CompEndFrameDraw()
     sub->size = n * 4;
     SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP);
     g_drawQuadCount = 0;
+    g_blurBarrier = 0xFFFFFFFFu;
     ResourceFlush(COMP_SCANOUT_RES, 0, 0, g_compScanoutW, g_compScanoutH);
 }
 
@@ -1970,6 +2264,7 @@ static const brook::GpuCompositorOps g_gpuCompositorOps = {
     CompCaptureFull,
     CompDrawSupported,
     CompDrawQuad,
+    CompBlurBarrier,
 };
 
 // Readback self-test of the real compositor ops: build a scattered-backed
