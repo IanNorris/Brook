@@ -295,7 +295,8 @@ static uint32_t  g_wallpaperHeight = 0;
 // ---------------------------------------------------------------------------
 static bool      g_gpuComposite   = false;   // BROOK_COMPOSITE=gpu requested
 static bool      g_gpuDrawReady   = false;   // GL DRAW pipeline available (set in CompositorInit)
-static uint32_t  g_gpuTestOpacity = 0;       // BROOK_GPU_OPACITY: demo opacity for topmost window (0 = off)
+static uint32_t  g_gpuTestOpacity = 0;       // BROOK_GPU_OPACITY: demo opacity for all windows (0 = off)
+static uint32_t  g_gpuTestBlur    = 0;       // BROOK_GPU_BLUR: demo blur radius for all windows (0 = off)
 static bool      g_gpuThumbDump   = false;   // BROOK_GPU_THUMB: base64 thumbnail over serial
 static uint64_t  g_lastThumbTick  = 0;
 static bool      g_fullDump       = false;   // BROOK_GPU_FULL: one-shot full-res frame dump
@@ -455,6 +456,21 @@ void CompositorInit()
         if (v > 255) v = 255;
         g_gpuTestOpacity = v;
         if (v) SerialPuts("COMPOSITOR: GPU per-window opacity demo enabled (opt/gpuopacity)\n");
+    }
+
+    // opt/gpublur == "<radius>" makes every normal window full-window glass (the
+    // blurred backdrop shows through the whole window, not just the titlebar), so
+    // a translucent terminal etc. can be observed in a headless capture.
+    char gbl[8] = {};
+    uint32_t gbn = FwCfgReadFile("opt/gpublur", gbl, sizeof(gbl) - 1);
+    if (gbn >= 1)
+    {
+        uint32_t v = 0;
+        for (uint32_t i = 0; i < gbn && gbl[i] >= '0' && gbl[i] <= '9'; ++i)
+            v = v * 10 + (uint32_t)(gbl[i] - '0');
+        if (v > 255) v = 255;
+        g_gpuTestBlur = v;
+        if (v) SerialPuts("COMPOSITOR: GPU full-window glass demo enabled (opt/gpublur)\n");
     }
 
     // opt/gpuoverlayopacity == "<0-255>" sets the opacity of the taskbar + launcher
@@ -2413,16 +2429,12 @@ static void GpuComposeChrome(const GpuCompositorOps* gpu, const Window* w, uint3
     GpuComposeSrcRect(gpu, g_chromeTex, cx + cw, cy, (ox + ow) - (cx + cw), ch, opacity, true); // right border
 }
 
-// Compose the frosted-glass backdrop under a window's titlebar strip: a quad
-// sampling the blurred backdrop (the scene up to the BlurBarrier) at the strip's
-// screen position, drawn opaque just before the translucent glass chrome blends
-// on top. Clamped to the screen. Requires the driver's blur support + a barrier.
-static void GpuComposeTitlebarBlur(const GpuCompositorOps* gpu, const Window* w)
+// Compose the frosted-glass backdrop under a screen rect: a quad sampling the
+// blurred backdrop (the scene up to the BlurBarrier) at the rect's screen
+// position, drawn opaque just before translucent content/glass blends on top.
+static void GpuComposeRectBlur(const GpuCompositorOps* gpu, int x, int y, int wd, int hd)
 {
-    if (!gpu->BlurBarrier || w->noChrome) return;
-    int x = w->x, y = w->y;
-    int wd = (int)w->outerWidth();
-    int hd = w->clientY() - w->y;   // titlebar + top border strip
+    if (!gpu->BlurBarrier) return;
     if (x < 0) { wd += x; x = 0; }
     if (y < 0) { hd += y; y = 0; }
     if (x >= (int)g_physFbWidth || y >= (int)g_physFbHeight) return;
@@ -2431,6 +2443,36 @@ static void GpuComposeTitlebarBlur(const GpuCompositorOps* gpu, const Window* w)
     if (wd <= 0 || hd <= 0) return;
     gpu->DrawQuad(GPU_TEX_BLUR_BACKDROP, 0, 0, 0, 0,
                   (uint32_t)x, (uint32_t)y, (uint32_t)wd, (uint32_t)hd, 255, false);
+}
+
+// Frosted backdrop under a window's whole outer rect (full-window glass): the
+// blurred scene shows through the translucent client area and the titlebar glass.
+static void GpuComposeWindowBlur(const GpuCompositorOps* gpu, const Window* w)
+{
+    GpuComposeRectBlur(gpu, w->x, w->y, (int)w->outerWidth(), (int)w->outerHeight());
+}
+
+// Draw a window's content texture into its client area at `opacity`, clamped to
+// the screen (only off-screen left/top is clipped; on-screen windows keep full
+// client size). Shared by the normal and blur present paths.
+static void GpuDrawWindowContent(const GpuCompositorOps* gpu, const Window* w,
+                                 const WinTexEntry& e, uint32_t scrW, uint32_t scrH,
+                                 uint32_t opacity)
+{
+    if (!e.tex) return;
+    int dx = w->clientX(), dy = w->clientY();
+    int dw = w->clientW,  dh = w->clientH;
+    if (dx >= (int)scrW || dy >= (int)scrH || dx + dw <= 0 || dy + dh <= 0) return;
+    int clipL = dx < 0 ? -dx : 0;
+    int clipT = dy < 0 ? -dy : 0;
+    uint32_t cdx = (uint32_t)(dx + clipL);
+    uint32_t cdy = (uint32_t)(dy + clipT);
+    uint32_t cdw = (uint32_t)(dw - clipL);
+    uint32_t cdh = (uint32_t)(dh - clipT);
+    if (cdx + cdw > scrW) cdw = scrW - cdx;
+    if (cdy + cdh > scrH) cdh = scrH - cdy;
+    if (cdw == 0 || cdh == 0) return;
+    GpuComposeLayer(gpu, e.tex, 0, 0, e.w, e.h, cdx, cdy, cdw, cdh, false, opacity);
 }
 
 static void EnsureDesktopTex(const GpuCompositorOps* gpu)
@@ -2629,79 +2671,63 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
     // content then its chrome — at the window's opacity, so a higher window's
     // translucent frame blends over a lower window's content correctly.
     //
-    // When any window requests frosted-glass blur, we instead use a PHASED order:
-    // all window content first (the "backdrop"), then a BlurBarrier (the driver
-    // snapshots + blurs the backdrop), then per window {blurred backdrop under the
-    // titlebar; chrome on top}. This is correct for opaque windows; translucent +
-    // blur together is a documented follow-up (phasing drops the content/chrome
-    // interleave that strict per-window translucency needs).
+    // When any window requests glass (blur), we use a PHASED order: the backdrop
+    // (wallpaper + the content of NON-glass windows) is drawn first, then a
+    // BlurBarrier (the driver snapshots + blurs it), then per window the glass
+    // windows draw their blurred backdrop over the whole window, their translucent
+    // content, and chrome — so the frosted scene shows through the entire window
+    // (e.g. a translucent terminal), not just the titlebar. Correct for glass
+    // windows over the desktop / opaque windows; translucent+overlap is a
+    // documented follow-up (phasing drops the strict content/chrome interleave).
+    auto effBlur    = [&](const Window* w) -> uint32_t {
+        uint32_t b = w->blurRadius; if (g_gpuTestBlur) b = g_gpuTestBlur; return b;
+    };
+    auto effOpacity = [&](const Window* w) -> uint32_t {
+        uint32_t o = w->opacity; if (g_gpuTestOpacity) o = g_gpuTestOpacity; return o;
+    };
+    auto isGlass    = [&](const Window* w) -> bool {
+        return useChromeLayer && gpu->BlurBarrier && !w->noChrome && effBlur(w) > 0;
+    };
+
     bool anyBlur = false;
-    if (useChromeLayer && gpu->BlurBarrier)
+    for (uint32_t i = 0; i < wcount; ++i)
     {
-        for (uint32_t i = 0; i < wcount; ++i)
-        {
-            Window* w = WmGetWindow(sorted[i]);
-            if (w && w->visible && !w->minimized && !w->noChrome && w->blurRadius > 0)
-            { anyBlur = true; break; }
-        }
+        Window* w = WmGetWindow(sorted[i]);
+        if (w && w->visible && !w->minimized && isGlass(w)) { anyBlur = true; break; }
     }
 
+    // Phase 1: backdrop = wallpaper (already) + content of non-glass windows.
+    // Glass windows defer their content to phase 2 so it isn't blurred into its
+    // own backdrop. Without blur, also draw chrome here (unit compositing).
     for (uint32_t i = 0; i < wcount; ++i)
     {
         int idx = sorted[i];
         Window* w = WmGetWindow(idx);
         if (!w || !w->visible || w->minimized) continue;
-        // With the opt/gpuopacity demo hook every normal window takes the test
-        // opacity (so overlapping translucent windows exercise the interleaved
-        // content+chrome compositing); otherwise each window uses its own.
-        uint32_t op = w->opacity;
-        if (g_gpuTestOpacity) op = g_gpuTestOpacity;
-
-        WinTexEntry& e = g_winTex[idx];
-        if (e.tex)
-        {
-            int dx = w->clientX(), dy = w->clientY();
-            int dw = w->clientW,  dh = w->clientH;
-            if (!(dx >= (int)scrW || dy >= (int)scrH || dx + dw <= 0 || dy + dh <= 0))
-            {
-                // Clamp dst into screen. Only the part hanging off the left/top is
-                // clipped (clipL/clipT); an on-screen window keeps its full client
-                // size. (The previous formula subtracted the window's screen
-                // position from its width/height, shrinking every non-(0,0)
-                // window's content away from its right/bottom chrome.)
-                int clipL = dx < 0 ? -dx : 0;
-                int clipT = dy < 0 ? -dy : 0;
-                uint32_t cdx = (uint32_t)(dx + clipL);   // == max(0, dx)
-                uint32_t cdy = (uint32_t)(dy + clipT);
-                uint32_t cdw = (uint32_t)(dw - clipL);
-                uint32_t cdh = (uint32_t)(dh - clipT);
-                if (cdx + cdw > scrW) cdw = scrW - cdx;
-                if (cdy + cdh > scrH) cdh = scrH - cdy;
-                if (cdw != 0 && cdh != 0)
-                    GpuComposeLayer(gpu, e.tex, 0, 0, e.w, e.h, cdx, cdy, cdw, cdh, false, op);
-            }
-        }
-
-        // Non-blur path: this window's chrome immediately on top of its content
-        // (unit compositing, back-to-front). Blur path defers chrome to the
-        // post-barrier pass below.
+        uint32_t op = effOpacity(w);
+        bool glass = anyBlur && isGlass(w);
+        if (!glass)
+            GpuDrawWindowContent(gpu, w, g_winTex[idx], scrW, scrH, op);
         if (useChromeLayer && !anyBlur)
             GpuComposeChrome(gpu, w, op);
     }
 
-    // Blur path: snapshot+blur the backdrop, then draw each window's frosted
-    // titlebar backdrop + chrome on top, back-to-front.
+    // Phase 2 (blur path): blur the backdrop, then per window back-to-front draw
+    // {glass backdrop over the whole window; translucent content; chrome}.
     if (anyBlur)
     {
         gpu->BlurBarrier();
         for (uint32_t i = 0; i < wcount; ++i)
         {
-            Window* w = WmGetWindow(sorted[i]);
+            int idx = sorted[i];
+            Window* w = WmGetWindow(idx);
             if (!w || !w->visible || w->minimized) continue;
-            uint32_t op = w->opacity;
-            if (g_gpuTestOpacity) op = g_gpuTestOpacity;
-            if (w->blurRadius > 0)
-                GpuComposeTitlebarBlur(gpu, w);
+            uint32_t op = effOpacity(w);
+            if (isGlass(w))
+            {
+                GpuComposeWindowBlur(gpu, w);                          // frosted scene under whole window
+                GpuDrawWindowContent(gpu, w, g_winTex[idx], scrW, scrH, op); // translucent content on top
+            }
             if (useChromeLayer)
                 GpuComposeChrome(gpu, w, op);
         }

@@ -353,6 +353,9 @@ fi
 if [ -n "${BROOK_GPU_OPACITY:-}" ]; then
     FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/gpuopacity,string=${BROOK_GPU_OPACITY}"
 fi
+if [ -n "${BROOK_GPU_BLUR:-}" ]; then
+    FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/gpublur,string=${BROOK_GPU_BLUR}"
+fi
 if [ -n "${BROOK_GPU_OVERLAY_OPACITY:-}" ]; then
     FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/gpuoverlayopacity,string=${BROOK_GPU_OVERLAY_OPACITY}"
 fi
