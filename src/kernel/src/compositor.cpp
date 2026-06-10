@@ -11,6 +11,8 @@
 #include "input.h"
 #include "net.h"
 #include "display.h"
+#include "gpu_compositor.h"
+#include "fw_cfg.h"
 #include "font_atlas.h"
 #include "debug_overlay.h"
 #include "string.h"
@@ -278,6 +280,67 @@ static uint32_t* g_wallpaper       = nullptr;
 static uint32_t  g_wallpaperWidth  = 0;
 static uint32_t  g_wallpaperHeight = 0;
 
+// ---------------------------------------------------------------------------
+// GPU composition (BLIT-based). When enabled (BROOK_COMPOSITE=gpu via fw_cfg)
+// and a 3D display driver has registered GpuCompositorOps, window content is
+// composited on the GPU instead of CPU-blitted into g_backBuffer:
+//   - the CPU still renders wallpaper + chrome + taskbar into g_backBuffer
+//     (the "desktop" layer), but SKIPS the per-window content blits;
+//   - g_backBuffer is uploaded as a desktop texture; each window VFB is a
+//     GPU texture; the cursor is an ARGB texture;
+//   - each frame is composed with BLITs into the scanout render-target:
+//     desktop, then window content (z-order), then chrome frames (z-order),
+//     then taskbar, then cursor. No CPU memcpy of window pixels into the FB.
+// Default off → CPU path unchanged.
+// ---------------------------------------------------------------------------
+static bool      g_gpuComposite   = false;   // BROOK_COMPOSITE=gpu requested
+static bool      g_gpuDrawReady   = false;   // GL DRAW pipeline available (set in CompositorInit)
+static uint32_t  g_gpuTestOpacity = 0;       // BROOK_GPU_OPACITY: demo opacity for all windows (0 = off)
+static uint32_t  g_gpuTestBlur    = 0;       // BROOK_GPU_BLUR: demo blur radius for all windows (0 = off)
+static bool      g_gpuThumbDump   = false;   // BROOK_GPU_THUMB: base64 thumbnail over serial
+static uint64_t  g_lastThumbTick  = 0;
+static bool      g_fullDump       = false;   // BROOK_GPU_FULL: one-shot full-res frame dump
+static bool      g_fullDumpDone   = false;   // full dump already emitted
+static GpuTexId  g_desktopTex     = 0;       // g_backBuffer as a texture
+static uint32_t* g_desktopTexPtr  = nullptr; // backing pointer the tex was made for
+static bool      g_desktopTexNeedsFull = true; // force a full desktop upload
+// GPU DRAW path only: per-window chrome is rendered into a SEPARATE full-screen
+// RGBA layer (transparent gaps, decoration rects alpha=0xFF) so the base desktop
+// texture is wallpaper + taskbar only. This lets chrome blend over whatever is
+// behind a window (wallpaper / lower windows) at the window's opacity, which a
+// chrome baked into the opaque base desktop structurally cannot do.
+static uint32_t* g_chromeBuffer   = nullptr; // full-screen, per-window chrome only
+static GpuTexId  g_chromeTex      = 0;       // g_chromeBuffer as an alpha texture
+static bool      g_chromeTexNeedsFull = true; // force a full chrome upload
+// GPU DRAW path only: taskbar + launcher are rendered into a SEPARATE full-screen
+// alpha overlay (transparent gaps) composited ON TOP of all windows, so they can
+// honour an opacity and the launcher popup is no longer hidden behind windows
+// (previously it was only drawn into the base desktop layer).
+static uint32_t* g_overlayBuffer  = nullptr; // full-screen: taskbar + launcher only
+static GpuTexId  g_overlayTex     = 0;       // g_overlayBuffer as an alpha texture
+static bool      g_overlayTexNeedsFull = true; // force a full overlay upload
+static uint32_t  g_overlayOpacity = 255;     // opt/gpuoverlayopacity (255 = opaque)
+static bool      g_overlayLauncherShown = false; // launcher drawn into overlay last frame
+static uint32_t  g_lastHoverSig   = 0xFFFFFFFFu; // last hovered caption-button signature
+static bool      g_gpuLaunchDemo  = false;   // opt/gpulaunch: auto-open launcher for capture
+static bool      g_gpuMouseDemo   = false;   // opt/gpumouse: warp cursor once for capture
+static int32_t   g_gpuMouseDemoX  = 0;
+static int32_t   g_gpuMouseDemoY  = 0;
+static GpuTexId  g_cursorTex      = 0;       // ARGB cursor sprite
+// Per-window-slot content texture tracking (recreated when the VFB changes).
+struct WinTexEntry { GpuTexId tex; uint32_t* vfb; uint32_t w; uint32_t h; };
+static WinTexEntry g_winTex[WM_MAX_WINDOWS] = {};
+
+bool CompositorGpuActive()
+{
+    // GPU composition is active only when requested AND the GL DRAW pipeline is
+    // available. The DRAW path is the sole GPU compose path (it is required for
+    // per-window/overlay opacity); when no 3D acceleration is present the CPU
+    // compositor path is the fallback. g_gpuDrawReady is resolved in
+    // CompositorInit, which runs after the driver registers its ops.
+    return g_gpuComposite && g_gpuDrawReady && GpuCompositorGet() != nullptr;
+}
+
 void CompositorInit()
 {
     // Get the physical framebuffer address so we can map the real MMIO,
@@ -331,6 +394,123 @@ void CompositorInit()
 
     SerialPrintf("COMPOSITOR: initialised, %ux%u stride=%u\n",
                  g_physFbWidth, g_physFbHeight, g_physFbStride);
+
+    // GPU composition opt-in: fw_cfg file opt/composite == "gpu". The GPU
+    // compositor ops are registered later (when the virtio-gpu driver's 3D path
+    // is proven), so CompositorGpuActive() also gates on their presence.
+    char composite[16] = {};
+    uint32_t n = FwCfgReadFile("opt/composite", composite, sizeof(composite) - 1);
+    if (n >= 3 && composite[0] == 'g' && composite[1] == 'p' && composite[2] == 'u')
+    {
+        g_gpuComposite = true;
+        SerialPuts("COMPOSITOR: GPU composition requested (BROOK_COMPOSITE=gpu)\n");
+    }
+
+    // Optional: dump a base64 thumbnail of the GPU-composited scanout over serial
+    // every few seconds, for in-guest visual verification (no host display).
+    char thumb[8] = {};
+    if (FwCfgReadFile("opt/gputhumb", thumb, sizeof(thumb) - 1) >= 1 && thumb[0] == '1')
+    {
+        g_gpuThumbDump = true;
+        SerialPuts("COMPOSITOR: GPU thumbnail serial dump enabled (BROOK_GPU_THUMB=1)\n");
+    }
+
+    // Optional: one-shot full-resolution frame dump (GPU + CPU) for text-fidelity
+    // parity. Emitted once after the desktop settles. opt/gpufull == "1".
+    char full[8] = {};
+    if (FwCfgReadFile("opt/gpufull", full, sizeof(full) - 1) >= 1 && full[0] == '1')
+    {
+        g_fullDump = true;
+        SerialPuts("COMPOSITOR: full-res frame dump enabled (BROOK_GPU_FULL=1)\n");
+    }
+
+    // The GL DRAW path is the only GPU composition path (required for opacity).
+    // Resolve its availability here: if the driver's draw pipeline is up, GPU
+    // composition runs via DRAW; otherwise CompositorGpuActive() stays false and
+    // the CPU compositor path handles everything. The driver registers its ops
+    // before CompositorInit runs, so DrawSupported() is reliable here.
+    if (g_gpuComposite)
+    {
+        const GpuCompositorOps* gpu = GpuCompositorGet();
+        if (gpu && gpu->DrawSupported && gpu->DrawSupported() && gpu->DrawQuad)
+        {
+            g_gpuDrawReady = true;
+            SerialPuts("COMPOSITOR: GPU DRAW composition active\n");
+        }
+        else
+        {
+            SerialPuts("COMPOSITOR: GPU composition requested but DRAW pipeline unavailable — using CPU compositor\n");
+        }
+    }
+
+    // Verification/demo hook: opt/gpuopacity == "<0-255>" makes every normal
+    // window render at that opacity, so per-window translucency can be observed
+    // in a headless capture. Only meaningful when GPU composition is active.
+    char gop[8] = {};
+    uint32_t gn = FwCfgReadFile("opt/gpuopacity", gop, sizeof(gop) - 1);
+    if (gn >= 1)
+    {
+        uint32_t v = 0;
+        for (uint32_t i = 0; i < gn && gop[i] >= '0' && gop[i] <= '9'; ++i)
+            v = v * 10 + (uint32_t)(gop[i] - '0');
+        if (v > 255) v = 255;
+        g_gpuTestOpacity = v;
+        if (v) SerialPuts("COMPOSITOR: GPU per-window opacity demo enabled (opt/gpuopacity)\n");
+    }
+
+    // opt/gpublur == "<radius>" makes every normal window full-window glass (the
+    // blurred backdrop shows through the whole window, not just the titlebar), so
+    // a translucent terminal etc. can be observed in a headless capture.
+    char gbl[8] = {};
+    uint32_t gbn = FwCfgReadFile("opt/gpublur", gbl, sizeof(gbl) - 1);
+    if (gbn >= 1)
+    {
+        uint32_t v = 0;
+        for (uint32_t i = 0; i < gbn && gbl[i] >= '0' && gbl[i] <= '9'; ++i)
+            v = v * 10 + (uint32_t)(gbl[i] - '0');
+        if (v > 255) v = 255;
+        g_gpuTestBlur = v;
+        if (v) SerialPuts("COMPOSITOR: GPU full-window glass demo enabled (opt/gpublur)\n");
+    }
+
+    // opt/gpuoverlayopacity == "<0-255>" sets the opacity of the taskbar + launcher
+    // overlay (255 = opaque, the default).
+    char gov[8] = {};
+    uint32_t govn = FwCfgReadFile("opt/gpuoverlayopacity", gov, sizeof(gov) - 1);
+    if (govn >= 1)
+    {
+        uint32_t v = 0;
+        for (uint32_t i = 0; i < govn && gov[i] >= '0' && gov[i] <= '9'; ++i)
+            v = v * 10 + (uint32_t)(gov[i] - '0');
+        if (v > 255) v = 255;
+        g_overlayOpacity = v;
+        SerialPuts("COMPOSITOR: GPU overlay (taskbar/launcher) opacity set (opt/gpuoverlayopacity)\n");
+    }
+
+    // Verification/demo hook: opt/gpulaunch == "1" auto-opens the app launcher
+    // shortly after boot, so the GPU-composited launcher overlay can be observed
+    // in a headless capture (no mouse).
+    char glc[8] = {};
+    if (FwCfgReadFile("opt/gpulaunch", glc, sizeof(glc) - 1) >= 1 && glc[0] == '1')
+    {
+        g_gpuLaunchDemo = true;
+        SerialPuts("COMPOSITOR: GPU launcher auto-open demo enabled (opt/gpulaunch)\n");
+    }
+
+    // Verification/demo hook: opt/gpumouse == "<x>,<y>" warps the cursor once
+    // after boot, so hover states (e.g. caption-button highlight) can be observed
+    // in a headless capture.
+    char gmc[16] = {};
+    uint32_t gmn = FwCfgReadFile("opt/gpumouse", gmc, sizeof(gmc) - 1);
+    if (gmn >= 3)
+    {
+        int32_t mx = 0, my = 0; uint32_t i = 0;
+        for (; i < gmn && gmc[i] >= '0' && gmc[i] <= '9'; ++i) mx = mx * 10 + (gmc[i] - '0');
+        while (i < gmn && (gmc[i] < '0' || gmc[i] > '9')) ++i;   // skip separator
+        for (; i < gmn && gmc[i] >= '0' && gmc[i] <= '9'; ++i) my = my * 10 + (gmc[i] - '0');
+        g_gpuMouseDemoX = mx; g_gpuMouseDemoY = my; g_gpuMouseDemo = true;
+        SerialPrintf("COMPOSITOR: GPU cursor warp demo enabled (opt/gpumouse=%d,%d)\n", mx, my);
+    }
 }
 
 void CompositorGetPhysDims(uint32_t* w, uint32_t* h)
@@ -932,6 +1112,109 @@ static void CompositorHandleMouseWM();
 static volatile bool g_wmBtnLatch        = false;
 static volatile bool g_wmBtnReleaseLatch = false;
 
+// GPU DRAW chrome layer: lazily allocate the full-screen chrome buffer (same
+// geometry as the backbuffer). Returns false if unavailable (falls back to
+// chrome-in-backbuffer behaviour).
+static bool EnsureChromeBuffer()
+{
+    if (g_chromeBuffer) return true;
+    if (!g_backBuffer || !g_backBufStride || !g_physFbHeight) return false;
+    uint64_t bytes = static_cast<uint64_t>(g_backBufStride) * g_physFbHeight * 4;
+    uint64_t pages = (bytes + 4095) / 4096;
+    VirtualAddress addr = VmmAllocPages(pages, VMM_WRITABLE, MemTag::Device, 0);
+    if (!addr) return false;
+    g_chromeBuffer = reinterpret_cast<uint32_t*>(addr.raw());
+    __builtin_memset(g_chromeBuffer, 0, bytes);   // fully transparent
+    SerialPrintf("COMPOSITOR: chrome layer %lu KB at 0x%lx\n", bytes / 1024, addr.raw());
+    return true;
+}
+
+// Mark a window's decoration rects (titlebar + 4 borders, i.e. the outer rect
+// minus the client hole) in the chrome buffer's alpha channel, so the alpha
+// texture's gaps (client area + outside the window) stay transparent. The chrome
+// pixels are a hard rectangular mask (no AA against the backdrop), so writing a
+// per-region alpha is exact. The titlebar gets WM_CHROME_TITLE_ALPHA (~85%) for
+// a glassy hint of transparency; the frame borders stay solid (0xFF).
+static void SetChromeDecorAlpha(const Window& w)
+{
+    if (!g_chromeBuffer || w.noChrome) return;
+    int ox = w.x, oy = w.y;
+    int ow = (int)w.outerWidth(), oh = (int)w.outerHeight();
+    int cx = w.clientX(), cy = w.clientY();
+    int cw = (int)w.clientW, ch = (int)w.clientH;
+    auto setAlpha = [](int x, int y, int rw, int rh, uint32_t a) {
+        if (rw <= 0 || rh <= 0) return;
+        if (x < 0) { rw += x; x = 0; }
+        if (y < 0) { rh += y; y = 0; }
+        if (x + rw > (int)g_physFbWidth)  rw = (int)g_physFbWidth  - x;
+        if (y + rh > (int)g_physFbHeight) rh = (int)g_physFbHeight - y;
+        uint32_t aShift = a << 24;
+        for (int yy = y; yy < y + rh; ++yy)
+        {
+            uint32_t* row = g_chromeBuffer + (uint32_t)yy * g_backBufStride;
+            for (int xx = x; xx < x + rw; ++xx) row[xx] = (row[xx] & 0x00FFFFFFu) | aShift;
+        }
+    };
+    // Top strip = solid top border (WM_BORDER_WIDTH rows) + glassy titlebar.
+    int topBorderH = (int)WM_BORDER_WIDTH;
+    int titleBarH  = (cy - oy) - topBorderH;          // == WM_TITLE_BAR_HEIGHT
+    setAlpha(ox, oy, ow, topBorderH, 0xFF);                              // top border (solid)
+    setAlpha(ox, oy + topBorderH, ow, titleBarH, WM_CHROME_TITLE_ALPHA); // titlebar (glass)
+    setAlpha(ox, cy + ch, ow, (oy + oh) - (cy + ch), 0xFF);             // bottom border (solid)
+    setAlpha(ox, cy, cx - ox, ch, 0xFF);                                // left border (solid)
+    setAlpha(cx + cw, cy, (ox + ow) - (cx + cw), ch, 0xFF);             // right border (solid)
+}
+
+// GPU DRAW overlay layer (taskbar + launcher): lazily allocate the full-screen
+// overlay buffer. Returns false if unavailable (falls back to taskbar/launcher
+// in the backbuffer).
+static bool EnsureOverlayBuffer()
+{
+    if (g_overlayBuffer) return true;
+    if (!g_backBuffer || !g_backBufStride || !g_physFbHeight) return false;
+    uint64_t bytes = static_cast<uint64_t>(g_backBufStride) * g_physFbHeight * 4;
+    uint64_t pages = (bytes + 4095) / 4096;
+    VirtualAddress addr = VmmAllocPages(pages, VMM_WRITABLE, MemTag::Device, 0);
+    if (!addr) return false;
+    g_overlayBuffer = reinterpret_cast<uint32_t*>(addr.raw());
+    __builtin_memset(g_overlayBuffer, 0, bytes);   // fully transparent
+    SerialPrintf("COMPOSITOR: overlay layer %lu KB at 0x%lx\n", bytes / 1024, addr.raw());
+    return true;
+}
+
+// Clamp a screen-space rect to the framebuffer, returning false if empty.
+static bool ClampScreenRect(int& x, int& y, int& w, int& h)
+{
+    if (w <= 0 || h <= 0) return false;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > (int)g_physFbWidth)  w = (int)g_physFbWidth  - x;
+    if (y + h > (int)g_physFbHeight) h = (int)g_physFbHeight - y;
+    return (w > 0 && h > 0);
+}
+
+// Clear a rect of the overlay buffer to fully transparent (0x00000000).
+static void OverlayClearRect(int x, int y, int w, int h)
+{
+    if (!g_overlayBuffer || !ClampScreenRect(x, y, w, h)) return;
+    for (int yy = y; yy < y + h; ++yy)
+        __builtin_memset(g_overlayBuffer + (uint32_t)yy * g_backBufStride + x, 0,
+                         (size_t)w * 4);
+}
+
+// Mark a rect of the overlay buffer opaque (alpha 0xFF). Taskbar and launcher are
+// solid hard-edged rectangles (no AA against the backdrop), so a per-rect alpha OR
+// is exact — same reasoning as the chrome decoration rects.
+static void OverlaySetAlphaRect(int x, int y, int w, int h)
+{
+    if (!g_overlayBuffer || !ClampScreenRect(x, y, w, h)) return;
+    for (int yy = y; yy < y + h; ++yy)
+    {
+        uint32_t* row = g_overlayBuffer + (uint32_t)yy * g_backBufStride;
+        for (int xx = x; xx < x + w; ++xx) row[xx] |= 0xFF000000u;
+    }
+}
+
 // WM-mode compositor loop: wallpaper → windows (z-ordered) → chrome → cursor.
 static void CompositorLoopWM()
 {
@@ -974,6 +1257,50 @@ static void CompositorLoopWM()
     bool fullRepaint = forceAll
                      || __atomic_exchange_n(&g_needsFullRepaint, false, __ATOMIC_ACQ_REL);
 
+    // Caption-button hover: when the pointer moves onto/off a titlebar button (or
+    // to a different button/window), the chrome must be redrawn so the hovered
+    // button shows its hover colour. Detect a change in the hovered (window,zone)
+    // signature and force a full repaint for this frame. Hover changes are rare,
+    // so the extra repaint is cheap.
+    {
+        int32_t hmx = 0, hmy = 0;
+        MouseGetPosition(&hmx, &hmy);
+        WmHitResult hh = WmHitTest(hmx, hmy);
+        bool overButton = (hh.zone == WmHitZone::CloseButton ||
+                           hh.zone == WmHitZone::MaximizeButton ||
+                           hh.zone == WmHitZone::MinimizeButton);
+        // Signature: window index + zone when over a button, else a sentinel.
+        uint32_t sig = overButton
+            ? ((static_cast<uint32_t>(hh.windowIndex) << 8) | static_cast<uint32_t>(hh.zone))
+            : 0xFFFFFFFFu;
+        if (sig != g_lastHoverSig)
+        {
+            g_lastHoverSig = sig;
+            fullRepaint = true;
+        }
+    }
+
+    // GPU path: per-window chrome is composited from a separate alpha layer
+    // (g_chromeBuffer) rather than baked into the opaque base desktop, so chrome
+    // can honour per-window opacity. Clear the layer on a full repaint (mirrors
+    // the wallpaper redraw of g_backBuffer) so stale chrome from moved/closed
+    // windows does not linger.
+    bool drawChromeLayer = CompositorGpuActive() && EnsureChromeBuffer();
+    if (drawChromeLayer && fullRepaint)
+        __builtin_memset(g_chromeBuffer, 0,
+                         static_cast<uint64_t>(g_backBufStride) * g_physFbHeight * 4);
+
+    // GPU path: taskbar + launcher go into the separate overlay layer
+    // (composited on top of all windows at g_overlayOpacity), so they can be
+    // translucent and the launcher is no longer hidden behind windows.
+    bool drawOverlayLayer = CompositorGpuActive() && EnsureOverlayBuffer();
+    if (drawOverlayLayer && fullRepaint)
+    {
+        __builtin_memset(g_overlayBuffer, 0,
+                         static_cast<uint64_t>(g_backBufStride) * g_physFbHeight * 4);
+        g_overlayLauncherShown = false;
+    }
+
     // 1. Draw wallpaper only when the scene structure changed
     if (fullRepaint)
         BlitWallpaper();
@@ -981,6 +1308,24 @@ static void CompositorLoopWM()
     // 2. Get windows in z-order (back to front) and blit their VFBs
     int sorted[WM_MAX_WINDOWS];
     uint32_t wcount = WmGetZOrder(sorted, WM_MAX_WINDOWS);
+
+    // Demo: auto-open the launcher once (opt/gpulaunch) for headless capture.
+    if (g_gpuLaunchDemo && !WmLauncherVisible())
+    {
+        WmLauncherToggle();
+        g_gpuLaunchDemo = false;
+        __atomic_store_n(&g_needsFullRepaint, true, __ATOMIC_RELEASE);
+    }
+
+    // Demo: warp the cursor once (opt/gpumouse) so hover states show in a capture.
+    if (g_gpuMouseDemo)
+    {
+        // In headless boots the mouse bounds may be unset (no pointer device),
+        // which would clamp the warp to (-1,-1); set them to the display size.
+        MouseSetBounds(g_physFbWidth, g_physFbHeight);
+        MouseSetPosition(g_gpuMouseDemoX, g_gpuMouseDemoY);
+        g_gpuMouseDemo = false;
+    }
 
     // Track whether any lower-z window was blitted. If so, higher-z windows
     // must also be re-blitted to maintain correct occlusion (prevents
@@ -1038,22 +1383,29 @@ static void CompositorLoopWM()
 
             anyBelowBlitted = true;
 
-            // Clamp blit to the buffer that was actually allocated.
-            uint32_t vfbW = localStride;
-            uint32_t vfbH = static_cast<uint32_t>(localBytes / (uint64_t)localStride / 4);
-            uint32_t blitW = w->clientW < vfbW ? w->clientW : vfbW;
-            uint32_t blitH = w->clientH < vfbH ? w->clientH : vfbH;
-            if (blitW && blitH)
-                BlitWindowVfb(localVfb, blitW, blitH, localStride,
-                              w->clientX(), w->clientY());
-            w->vfbDirty = 0;  // single-writer (compositor thread), no race
+            // CPU path: blit window content into the backbuffer. GPU path skips
+            // this — content is composited on the GPU from the window's texture
+            // (vfbDirty is left set so the GPU present knows to upload it).
+            if (!CompositorGpuActive())
+            {
+                // Clamp blit to the buffer that was actually allocated.
+                uint32_t vfbW = localStride;
+                uint32_t vfbH = static_cast<uint32_t>(localBytes / (uint64_t)localStride / 4);
+                uint32_t blitW = w->clientW < vfbW ? w->clientW : vfbW;
+                uint32_t blitH = w->clientH < vfbH ? w->clientH : vfbH;
+                if (blitW && blitH)
+                    BlitWindowVfb(localVfb, blitW, blitH, localStride,
+                                  w->clientX(), w->clientY());
+                w->vfbDirty = 0;  // single-writer (compositor thread), no race
+            }
         }
         else if (p->state != ProcessState::Terminated && p->fbVfbWidth > 0)
         {
             if (!fullRepaint && !p->fbDirty && !anyBelowBlitted)
                 continue;
             anyBelowBlitted = true;
-            BlitProcessAt(p, w->clientX(), w->clientY(), true, w->upscale);
+            if (!CompositorGpuActive())
+                BlitProcessAt(p, w->clientX(), w->clientY(), true, w->upscale);
         }
 
         // Draw text cursor for terminal windows
@@ -1099,18 +1451,64 @@ static void CompositorLoopWM()
             }
         }
 
-        if (g_backBuffer)
+        // Per-window chrome. In the GPU DRAW path it goes into the separate
+        // alpha chrome layer (so the base desktop stays chrome-free and chrome
+        // can be drawn at the window's opacity); otherwise into the backbuffer.
+        if (drawChromeLayer)
+        {
+            Window* cw = WmGetWindow(sorted[i]);
+            if (cw && !cw->noChrome)
+            {
+                WmRenderChromeForWindow(g_chromeBuffer, g_backBufStride,
+                                         g_physFbWidth, g_physFbHeight, sorted[i],
+                                         chromeMx, chromeMy);
+                SetChromeDecorAlpha(*cw);
+            }
+        }
+        else if (g_backBuffer)
+        {
             WmRenderChromeForWindow(g_backBuffer, g_backBufStride,
                                      g_physFbWidth, g_physFbHeight, sorted[i],
                                      chromeMx, chromeMy);
+        }
     }
 
-    // 3. Render taskbar at bottom of screen
-    if (g_backBuffer)
+    // 3. Render taskbar at bottom of screen + launcher popup if open.
+    uint32_t tbY = g_physFbHeight - WM_TASKBAR_HEIGHT;
+    if (drawOverlayLayer)
+    {
+        // GPU DRAW: render into the overlay layer (composited on top of windows
+        // at g_overlayOpacity). Clear+redraw the taskbar strip each frame; mark
+        // its pixels opaque by geometry (solid full-width strip).
+        OverlayClearRect(0, (int)tbY, (int)g_physFbWidth, (int)WM_TASKBAR_HEIGHT);
+        WmRenderTaskbar(g_overlayBuffer, g_backBufStride,
+                        g_physFbWidth, g_physFbHeight, now, chromeMx, chromeMy);
+        OverlaySetAlphaRect(0, (int)tbY, (int)g_physFbWidth, (int)WM_TASKBAR_HEIGHT);
+        MarkDirtyRows(tbY, g_physFbHeight);
+
+        int32_t lx, ly; uint32_t lw, lh;
+        WmLauncherGetRect(g_physFbWidth, g_physFbHeight, &lx, &ly, &lw, &lh);
+        if (WmLauncherVisible())
+        {
+            OverlayClearRect(lx, ly, (int)lw, (int)lh);
+            WmLauncherRender(g_overlayBuffer, g_backBufStride,
+                             g_physFbWidth, g_physFbHeight, chromeMx, chromeMy);
+            OverlaySetAlphaRect(lx, ly, (int)lw, (int)lh);
+            MarkDirtyRows(ly > 0 ? (uint32_t)ly : 0, (uint32_t)(ly + (int)lh));
+            g_overlayLauncherShown = true;
+        }
+        else if (g_overlayLauncherShown)
+        {
+            // Launcher just closed — erase its pixels from the overlay.
+            OverlayClearRect(lx, ly, (int)lw, (int)lh);
+            MarkDirtyRows(ly > 0 ? (uint32_t)ly : 0, (uint32_t)(ly + (int)lh));
+            g_overlayLauncherShown = false;
+        }
+    }
+    else if (g_backBuffer)
     {
         WmRenderTaskbar(g_backBuffer, g_backBufStride,
                         g_physFbWidth, g_physFbHeight, now, chromeMx, chromeMy);
-        uint32_t tbY = g_physFbHeight - WM_TASKBAR_HEIGHT;
         MarkDirtyRows(tbY, g_physFbHeight);
 
         // Render launcher popup over everything if open
@@ -1315,6 +1713,25 @@ static void CompositorLoopWM()
                             WmPushWmEvent(w, WM_EVT_CLOSE_REQUESTED, 0, 0);
                         else // Terminal — send SIGTERM
                             ProcessSendSignal(w->proc, 15);
+                    }
+                }
+                continue;
+            }
+
+            // Super+G — toggle frosted-glass on the focused window (a real
+            // per-window option; uses the same per-window opacity+blur the
+            // 0xB00 syscall exposes). Cycles glass on (translucent + backdrop
+            // blur) <-> off (opaque). Only meaningful on the GPU DRAW path.
+            if ((ev.modifiers & INPUT_MOD_SUPER) && ev.scanCode == 0x22) // G
+            {
+                int cur = WmGetFocusedWindow();
+                if (cur >= 0) {
+                    Window* w = WmGetWindow(cur);
+                    if (w && w->proc) {
+                        bool glassOn = (w->blurRadius == 0);
+                        WmSetWindowProperties(cur, WM_PROP_OPACITY | WM_PROP_BLUR,
+                                              glassOn ? WM_GLASS_OPACITY : 255,
+                                              glassOn ? WM_GLASS_BLUR : 0);
                     }
                 }
                 continue;
@@ -1901,6 +2318,486 @@ static void CompositorDrawClock()
     MarkDirtyRows(y, y + lineH + 2);
 }
 
+// Base64-encode an RGB frame (from a BGRA/XRGB pixel buffer with `stride`
+// pixels per row) over serial, delimited by `TAG BEGIN w h` / `TAG END` so the
+// host can extract + decode it to a PNG. Gives in-guest visual verification
+// without a host display.
+static void DumpFrameBase64(const uint32_t* px, uint32_t w, uint32_t h,
+                            uint32_t stride, const char* tag)
+{
+    if (!px || w == 0 || h == 0) return;
+    SerialPrintf("%s BEGIN %u %u\n", tag, w, h);
+
+    static const char b64[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    char line[97];
+    uint32_t li = 0;
+    uint8_t grp[3]; uint32_t gi = 0;
+    auto flushGroup = [&](uint32_t valid) {
+        uint32_t v = (grp[0] << 16) | (grp[1] << 8) | grp[2];
+        line[li++] = b64[(v >> 18) & 0x3F];
+        line[li++] = b64[(v >> 12) & 0x3F];
+        line[li++] = (valid > 1) ? b64[(v >> 6) & 0x3F] : '=';
+        line[li++] = (valid > 2) ? b64[v & 0x3F] : '=';
+        if (li >= 72) { line[li] = '\0'; SerialPuts(line); SerialPuts("\n"); li = 0; }
+    };
+
+    for (uint32_t y = 0; y < h; ++y)
+    {
+        const uint32_t* row = px + static_cast<uint64_t>(y) * stride;
+        for (uint32_t x = 0; x < w; ++x)
+        {
+            uint32_t p = row[x];
+            grp[gi++] = (p >> 16) & 0xFF;  // R
+            if (gi == 3) { flushGroup(3); gi = 0; }
+            grp[gi++] = (p >> 8) & 0xFF;   // G
+            if (gi == 3) { flushGroup(3); gi = 0; }
+            grp[gi++] = p & 0xFF;          // B
+            if (gi == 3) { flushGroup(3); gi = 0; }
+        }
+    }
+    if (gi > 0) { for (uint32_t k = gi; k < 3; ++k) grp[k] = 0; flushGroup(gi); }
+    if (li > 0) { line[li] = '\0'; SerialPuts(line); SerialPuts("\n"); }
+    SerialPrintf("%s END\n", tag);
+}
+
+// Periodic low-res thumbnail of the GPU-composited scanout.
+static void DumpGpuThumbnail()
+{
+    const GpuCompositorOps* gpu = GpuCompositorGet();
+    if (!gpu || !gpu->CaptureThumb) return;
+    static uint32_t thumb[256 * 144];
+    uint32_t tw = 0, th = 0;
+    uint32_t count = gpu->CaptureThumb(thumb, 256 * 144, &tw, &th);
+    if (count == 0 || tw == 0 || th == 0) return;
+    DumpFrameBase64(thumb, tw, th, tw, "GPUTHUMB");
+}
+
+// One-shot full-resolution frame dump for GPU-vs-CPU text-fidelity parity.
+// GPU mode: read back the full scanout at 1:1 (GPUFULL). CPU mode: dump
+// g_backBuffer directly (CPUFULL). Same encoder → directly diffable.
+static void DumpFullFrameOnce()
+{
+    if (CompositorGpuActive())
+    {
+        const GpuCompositorOps* gpu = GpuCompositorGet();
+        if (!gpu || !gpu->CaptureFull) return;
+        uint32_t fw = 0, fh = 0;
+        const uint32_t* full = gpu->CaptureFull(&fw, &fh);
+        if (full && fw && fh)
+            DumpFrameBase64(full, fw, fh, fw, "GPUFULL");
+    }
+    else if (g_backBuffer)
+    {
+        DumpFrameBase64(g_backBuffer, g_physFbWidth, g_physFbHeight,
+                        g_backBufStride, "CPUFULL");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GPU composition present path. Composes the frame on the GPU via textured-quad
+// draws into the scanout render-target and presents it. The CPU has rendered the
+// wallpaper into g_backBuffer (and, in WM mode, chrome into the chrome layer and
+// taskbar/launcher into the overlay layer); window content is composited here
+// from per-window GPU textures (no CPU memcpy of window pixels into the
+// framebuffer). See gpu_compositor.h.
+// ---------------------------------------------------------------------------
+
+// Compose one textured layer into the scanout via the GL DRAW pipeline. Single
+// dispatch point. opacity is 255 (opaque) for most layers; window content and
+// chrome pass the window's opacity so translucent windows composite correctly.
+static inline void GpuComposeLayer(const GpuCompositorOps* gpu, GpuTexId src,
+                                   uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh,
+                                   uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh,
+                                   bool alphaBlend, uint32_t opacity = 255)
+{
+    gpu->DrawQuad(src, sx, sy, sw, sh, dx, dy, dw, dh, opacity, alphaBlend);
+}
+
+// Compose a screen-space rectangle of a full-screen source texture 1:1 into the
+// scanout, clamped to the screen. opacity/alphaBlend let the same helper compose
+// the translucent per-window chrome layer or the taskbar/launcher overlay.
+static void GpuComposeSrcRect(const GpuCompositorOps* gpu, GpuTexId tex,
+                              int x, int y, int w, int h,
+                              uint32_t opacity, bool alphaBlend)
+{
+    if (w <= 0 || h <= 0 || !tex) return;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x >= (int)g_physFbWidth || y >= (int)g_physFbHeight) return;
+    if (x + w > (int)g_physFbWidth)  w = (int)g_physFbWidth  - x;
+    if (y + h > (int)g_physFbHeight) h = (int)g_physFbHeight - y;
+    if (w <= 0 || h <= 0) return;
+    GpuComposeLayer(gpu, tex, (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h,
+                    (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h, alphaBlend, opacity);
+}
+
+// Compose the chrome layer's decoration rects for one window at its opacity.
+// The chrome texture holds only the titlebar + 4 borders (transparent elsewhere),
+// so a translucent window's frame blends over whatever is behind it.
+static void GpuComposeChrome(const GpuCompositorOps* gpu, const Window* w, uint32_t opacity)
+{
+    if (!g_chromeTex || w->noChrome) return;
+    int ox = w->x, oy = w->y;
+    int ow = (int)w->outerWidth(), oh = (int)w->outerHeight();
+    int cx = w->clientX(), cy = w->clientY();
+    int cw = (int)w->clientW, ch = (int)w->clientH;
+    GpuComposeSrcRect(gpu, g_chromeTex, ox, oy, ow, cy - oy, opacity, true);                 // titlebar + top border
+    GpuComposeSrcRect(gpu, g_chromeTex, ox, cy + ch, ow, (oy + oh) - (cy + ch), opacity, true); // bottom border
+    GpuComposeSrcRect(gpu, g_chromeTex, ox, cy, cx - ox, ch, opacity, true);                 // left border
+    GpuComposeSrcRect(gpu, g_chromeTex, cx + cw, cy, (ox + ow) - (cx + cw), ch, opacity, true); // right border
+}
+
+// Compose the frosted-glass backdrop under a screen rect: a quad sampling the
+// blurred backdrop (the scene up to the BlurBarrier) at the rect's screen
+// position, drawn opaque just before translucent content/glass blends on top.
+static void GpuComposeRectBlur(const GpuCompositorOps* gpu, int x, int y, int wd, int hd)
+{
+    if (!gpu->BlurBarrier) return;
+    if (x < 0) { wd += x; x = 0; }
+    if (y < 0) { hd += y; y = 0; }
+    if (x >= (int)g_physFbWidth || y >= (int)g_physFbHeight) return;
+    if (x + wd > (int)g_physFbWidth)  wd = (int)g_physFbWidth  - x;
+    if (y + hd > (int)g_physFbHeight) hd = (int)g_physFbHeight - y;
+    if (wd <= 0 || hd <= 0) return;
+    gpu->DrawQuad(GPU_TEX_BLUR_BACKDROP, 0, 0, 0, 0,
+                  (uint32_t)x, (uint32_t)y, (uint32_t)wd, (uint32_t)hd, 255, false);
+}
+
+// Frosted backdrop under a window's whole outer rect (full-window glass): the
+// blurred scene shows through the translucent client area and the titlebar glass.
+static void GpuComposeWindowBlur(const GpuCompositorOps* gpu, const Window* w)
+{
+    GpuComposeRectBlur(gpu, w->x, w->y, (int)w->outerWidth(), (int)w->outerHeight());
+}
+
+// Draw a window's content texture into its client area at `opacity`, clamped to
+// the screen (only off-screen left/top is clipped; on-screen windows keep full
+// client size). Shared by the normal and blur present paths.
+static void GpuDrawWindowContent(const GpuCompositorOps* gpu, const Window* w,
+                                 const WinTexEntry& e, uint32_t scrW, uint32_t scrH,
+                                 uint32_t opacity)
+{
+    if (!e.tex) return;
+    int dx = w->clientX(), dy = w->clientY();
+    int dw = w->clientW,  dh = w->clientH;
+    if (dx >= (int)scrW || dy >= (int)scrH || dx + dw <= 0 || dy + dh <= 0) return;
+    int clipL = dx < 0 ? -dx : 0;
+    int clipT = dy < 0 ? -dy : 0;
+    uint32_t cdx = (uint32_t)(dx + clipL);
+    uint32_t cdy = (uint32_t)(dy + clipT);
+    uint32_t cdw = (uint32_t)(dw - clipL);
+    uint32_t cdh = (uint32_t)(dh - clipT);
+    if (cdx + cdw > scrW) cdw = scrW - cdx;
+    if (cdy + cdh > scrH) cdh = scrH - cdy;
+    if (cdw == 0 || cdh == 0) return;
+    GpuComposeLayer(gpu, e.tex, 0, 0, e.w, e.h, cdx, cdy, cdw, cdh, false, opacity);
+}
+
+static void EnsureDesktopTex(const GpuCompositorOps* gpu)
+{
+    if (g_desktopTex && g_desktopTexPtr == g_backBuffer) return;
+    if (g_desktopTex) { gpu->DestroyTexture(g_desktopTex); g_desktopTex = 0; }
+    if (!g_backBuffer) return;
+    g_desktopTex = gpu->CreateTexture(g_backBufStride, g_physFbHeight,
+                                      reinterpret_cast<uint64_t>(g_backBuffer), false);
+    g_desktopTexPtr = g_backBuffer;
+    g_desktopTexNeedsFull = true;   // upload the whole desktop on first use
+}
+
+static void EnsureChromeTex(const GpuCompositorOps* gpu)
+{
+    if (g_chromeTex || !g_chromeBuffer) return;
+    g_chromeTex = gpu->CreateTexture(g_backBufStride, g_physFbHeight,
+                                     reinterpret_cast<uint64_t>(g_chromeBuffer), true);
+    g_chromeTexNeedsFull = true;
+}
+
+static void EnsureOverlayTex(const GpuCompositorOps* gpu)
+{
+    if (g_overlayTex || !g_overlayBuffer) return;
+    g_overlayTex = gpu->CreateTexture(g_backBufStride, g_physFbHeight,
+                                      reinterpret_cast<uint64_t>(g_overlayBuffer), true);
+    g_overlayTexNeedsFull = true;
+}
+
+// Resolve a window's content source buffer. Wayland windows expose w->vfb;
+// legacy framebuffer processes expose p->fbVirtual. Returns false if neither.
+static bool WindowContentSource(Window* w, uint64_t* vaddr,
+                                uint32_t* srcW, uint32_t* srcH)
+{
+    uint32_t* vfb = w->vfb;
+    uint32_t  stride = w->vfbStride;
+    uint64_t  bytes  = w->vfbBytes;
+    if (vfb && stride && bytes)
+    {
+        *vaddr = reinterpret_cast<uint64_t>(vfb);
+        *srcW  = stride;
+        *srcH  = static_cast<uint32_t>(bytes / stride / 4);
+        return (*srcW && *srcH);
+    }
+    Process* p = w->proc;
+    if (p && p->fbVirtual && p->fbVfbWidth && p->fbVfbHeight)
+    {
+        *vaddr = reinterpret_cast<uint64_t>(p->fbVirtual);
+        *srcW  = p->fbVfbWidth;
+        *srcH  = p->fbVfbHeight;
+        return true;
+    }
+    return false;
+}
+
+static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
+{
+    const GpuCompositorOps* gpu = GpuCompositorGet();
+    if (!gpu) return;
+    uint32_t scrW = 0, scrH = 0;
+    gpu->GetSize(&scrW, &scrH);
+    if (scrW == 0 || scrH == 0) return;
+
+    // 1. Desktop layer: WALLPAPER ONLY (per-window chrome and the taskbar/launcher
+    //    live in separate alpha layers, below). Upload only the changed rows: the
+    //    wallpaper is static in steady state, so a full 1920x1080 re-upload every
+    //    frame would waste ~8MB of DMA. The window content layer is a separate
+    //    texture, so window animation does NOT dirty this.
+    EnsureDesktopTex(gpu);
+    if (!g_desktopTex) return;
+    if (g_desktopTexNeedsFull)
+    {
+        gpu->UpdateTexture(g_desktopTex, 0, 0, g_physFbWidth, g_physFbHeight);
+        g_desktopTexNeedsFull = false;
+    }
+    else if (dirtyMinY < dirtyMaxY)
+    {
+        uint32_t maxY = dirtyMaxY > g_physFbHeight ? g_physFbHeight : dirtyMaxY;
+        if (maxY > dirtyMinY)
+            gpu->UpdateTexture(g_desktopTex, 0, dirtyMinY,
+                               g_physFbWidth, maxY - dirtyMinY);
+    }
+
+    // 1b. Chrome layer: the per-window decorations as an alpha texture, uploaded
+    //     over the same dirty span as the desktop. (WM mode populates it; in
+    //     legacy mode g_chromeBuffer is null and this is skipped.)
+    bool useChromeLayer = g_chromeBuffer != nullptr;
+    if (useChromeLayer)
+    {
+        EnsureChromeTex(gpu);
+        if (g_chromeTex)
+        {
+            if (g_chromeTexNeedsFull)
+            {
+                gpu->UpdateTexture(g_chromeTex, 0, 0, g_physFbWidth, g_physFbHeight);
+                g_chromeTexNeedsFull = false;
+            }
+            else if (dirtyMinY < dirtyMaxY)
+            {
+                uint32_t maxY = dirtyMaxY > g_physFbHeight ? g_physFbHeight : dirtyMaxY;
+                if (maxY > dirtyMinY)
+                    gpu->UpdateTexture(g_chromeTex, 0, dirtyMinY,
+                                       g_physFbWidth, maxY - dirtyMinY);
+            }
+        }
+        else useChromeLayer = false;
+    }
+
+    // 1c. Overlay layer (taskbar + launcher) as an alpha texture. (WM mode
+    //     populates it; in legacy mode g_overlayBuffer is null and this is skipped.)
+    bool useOverlayLayer = g_overlayBuffer != nullptr;
+    if (useOverlayLayer)
+    {
+        EnsureOverlayTex(gpu);
+        if (g_overlayTex)
+        {
+            if (g_overlayTexNeedsFull)
+            {
+                gpu->UpdateTexture(g_overlayTex, 0, 0, g_physFbWidth, g_physFbHeight);
+                g_overlayTexNeedsFull = false;
+            }
+            else if (dirtyMinY < dirtyMaxY)
+            {
+                uint32_t maxY = dirtyMaxY > g_physFbHeight ? g_physFbHeight : dirtyMaxY;
+                if (maxY > dirtyMinY)
+                    gpu->UpdateTexture(g_overlayTex, 0, dirtyMinY,
+                                       g_physFbWidth, maxY - dirtyMinY);
+            }
+        }
+        else useOverlayLayer = false;
+    }
+
+    // 2. Cursor sprite (ARGB, alpha-blended).
+    if (!g_cursorTex)
+        g_cursorTex = gpu->CreateTexture(CURSOR_MAX, CURSOR_MAX,
+                                         reinterpret_cast<uint64_t>(g_cursorPixels), true);
+    if (g_cursorTex)
+        gpu->UpdateTexture(g_cursorTex, 0, 0, g_cursorW, g_cursorH);
+
+    int sorted[WM_MAX_WINDOWS];
+    uint32_t wcount = WmGetZOrder(sorted, WM_MAX_WINDOWS);
+
+    // 3. Ensure + upload per-window content textures.
+    for (uint32_t i = 0; i < wcount; ++i)
+    {
+        int idx = sorted[i];
+        Window* w = WmGetWindow(idx);
+        if (!w || !w->visible || w->minimized) continue;
+        uint64_t vaddr; uint32_t sw, sh;
+        if (!WindowContentSource(w, &vaddr, &sw, &sh)) continue;
+
+        // Pick the content-dirty signal matching the source buffer that
+        // WindowContentSource resolved. Wayland windows expose w->vfb and
+        // signal new content via w->vfbDirty; legacy framebuffer processes
+        // (terminals, the kernel console, DOOM) expose p->fbVirtual and signal
+        // via p->fbDirty. The GPU path used to only honour w->vfbDirty, so
+        // legacy-fb windows were uploaded once (while still empty) and never
+        // refreshed — leaving their client areas black. Honour both.
+        Process* p = w->proc;
+        bool isWayland = (w->vfb && w->vfbStride && w->vfbBytes);
+        bool contentDirty = isWayland ? (w->vfbDirty != 0)
+                                      : (p && p->fbDirty != 0);
+
+        WinTexEntry& e = g_winTex[idx];
+        if (e.tex && (e.vfb != reinterpret_cast<uint32_t*>(vaddr) || e.w != sw || e.h != sh))
+        {
+            gpu->DestroyTexture(e.tex);
+            e.tex = 0;
+        }
+        if (!e.tex)
+        {
+            e.tex = gpu->CreateTexture(sw, sh, vaddr, false);
+            e.vfb = reinterpret_cast<uint32_t*>(vaddr);
+            e.w = sw; e.h = sh;
+            contentDirty = true;   // force first upload
+        }
+        if (e.tex && contentDirty)
+        {
+            gpu->UpdateTexture(e.tex, 0, 0, sw, sh);
+            if (isWayland) w->vfbDirty = 0;
+            else if (p)    p->fbDirty = 0;
+        }
+    }
+
+    // 4. Compose into the scanout RT.
+    gpu->BeginFrame(0);
+
+    // Base: desktop = wallpaper (chrome and taskbar/launcher are separate alpha
+    // layers composited below). Client areas show wallpaper. In legacy (non-WM)
+    // mode the backbuffer carries the full legacy scene, so this one quad presents
+    // it and the chrome/overlay layers are absent.
+    GpuComposeLayer(gpu, g_desktopTex, 0, 0, g_physFbWidth, g_physFbHeight,
+                    0, 0, g_physFbWidth, g_physFbHeight, false);
+
+    // Windows back-to-front. Without blur, each window is composited as a UNIT —
+    // content then its chrome — at the window's opacity, so a higher window's
+    // translucent frame blends over a lower window's content correctly.
+    //
+    // When any window requests glass (blur), we use a PHASED order: the backdrop
+    // (wallpaper + the content of NON-glass windows) is drawn first, then a
+    // BlurBarrier (the driver snapshots + blurs it), then per window the glass
+    // windows draw their blurred backdrop over the whole window, their translucent
+    // content, and chrome — so the frosted scene shows through the entire window
+    // (e.g. a translucent terminal), not just the titlebar. Correct for glass
+    // windows over the desktop / opaque windows; translucent+overlap is a
+    // documented follow-up (phasing drops the strict content/chrome interleave).
+    auto effBlur    = [&](const Window* w) -> uint32_t {
+        uint32_t b = w->blurRadius; if (g_gpuTestBlur) b = g_gpuTestBlur; return b;
+    };
+    auto effOpacity = [&](const Window* w) -> uint32_t {
+        uint32_t o = w->opacity; if (g_gpuTestOpacity) o = g_gpuTestOpacity; return o;
+    };
+    auto isGlass    = [&](const Window* w) -> bool {
+        return useChromeLayer && gpu->BlurBarrier && !w->noChrome && effBlur(w) > 0;
+    };
+
+    bool anyBlur = false;
+    for (uint32_t i = 0; i < wcount; ++i)
+    {
+        Window* w = WmGetWindow(sorted[i]);
+        if (w && w->visible && !w->minimized && isGlass(w)) { anyBlur = true; break; }
+    }
+
+    // Phase 1: backdrop = wallpaper (already) + content of non-glass windows.
+    // Glass windows defer their content to phase 2 so it isn't blurred into its
+    // own backdrop. Without blur, also draw chrome here (unit compositing).
+    for (uint32_t i = 0; i < wcount; ++i)
+    {
+        int idx = sorted[i];
+        Window* w = WmGetWindow(idx);
+        if (!w || !w->visible || w->minimized) continue;
+        uint32_t op = effOpacity(w);
+        bool glass = anyBlur && isGlass(w);
+        if (!glass)
+            GpuDrawWindowContent(gpu, w, g_winTex[idx], scrW, scrH, op);
+        if (useChromeLayer && !anyBlur)
+            GpuComposeChrome(gpu, w, op);
+    }
+
+    // Phase 2 (blur path): blur the backdrop, then per window back-to-front draw
+    // {glass backdrop over the whole window; translucent content; chrome}.
+    if (anyBlur)
+    {
+        // Blur strength = max app-requested radius across glass windows.
+        uint32_t blurStrength = 0;
+        for (uint32_t i = 0; i < wcount; ++i)
+        {
+            Window* w = WmGetWindow(sorted[i]);
+            if (w && w->visible && !w->minimized && isGlass(w))
+            {
+                uint32_t b = effBlur(w);
+                if (b > blurStrength) blurStrength = b;
+            }
+        }
+        gpu->BlurBarrier(blurStrength);
+        for (uint32_t i = 0; i < wcount; ++i)
+        {
+            int idx = sorted[i];
+            Window* w = WmGetWindow(idx);
+            if (!w || !w->visible || w->minimized) continue;
+            uint32_t op = effOpacity(w);
+            if (isGlass(w))
+            {
+                GpuComposeWindowBlur(gpu, w);                          // frosted scene under whole window
+                GpuDrawWindowContent(gpu, w, g_winTex[idx], scrW, scrH, op); // translucent content on top
+            }
+            if (useChromeLayer)
+                GpuComposeChrome(gpu, w, op);
+        }
+    }
+
+    // Taskbar (and launcher) on top of all windows, composited from the alpha
+    // overlay layer at g_overlayOpacity (translucent-capable; the launcher sits
+    // above windows). Populated in WM mode only; legacy mode has no taskbar.
+    if (useOverlayLayer)
+    {
+        GpuComposeSrcRect(gpu, g_overlayTex, 0, (int)scrH - (int)WM_TASKBAR_HEIGHT,
+                          (int)scrW, (int)WM_TASKBAR_HEIGHT, g_overlayOpacity, true);
+        if (WmLauncherVisible())
+        {
+            int32_t lx, ly; uint32_t lw, lh;
+            WmLauncherGetRect(scrW, scrH, &lx, &ly, &lw, &lh);
+            GpuComposeSrcRect(gpu, g_overlayTex, lx, ly, (int)lw, (int)lh,
+                              g_overlayOpacity, true);
+        }
+    }
+
+    // Cursor (alpha) on top of everything.
+    if (__atomic_load_n(&g_defaultCursorVisible, __ATOMIC_ACQUIRE) && g_cursorTex &&
+        MouseIsAvailable())
+    {
+        int32_t mx = 0, my = 0;
+        MouseGetPosition(&mx, &my);
+        int cx = mx - g_cursorHotX, cy = my - g_cursorHotY;
+        if (cx < (int)scrW && cy < (int)scrH && cx + (int)g_cursorW > 0 && cy + (int)g_cursorH > 0)
+        {
+            uint32_t bcx = cx < 0 ? 0 : (uint32_t)cx;
+            uint32_t bcy = cy < 0 ? 0 : (uint32_t)cy;
+            GpuComposeLayer(gpu, g_cursorTex, 0, 0, g_cursorW, g_cursorH,
+                            bcx, bcy, g_cursorW, g_cursorH, true);
+        }
+    }
+
+    gpu->EndFrame();
+}
+
 static void CompositorLoop()
 {
     if (!g_physFb)
@@ -1919,8 +2816,10 @@ static void CompositorLoop()
     uint64_t epoch = __atomic_add_fetch(&g_compositorEpoch, 1, __ATOMIC_ACQ_REL);
     DrainDeferredPageFrees(epoch);
 
-    // Restore pixels under the old cursor position before blitting.
-    if (g_cursorVisible) {
+    // Restore pixels under the old cursor position before blitting. Skipped in
+    // GPU mode — the cursor is composited as a separate GPU sprite, never drawn
+    // into g_backBuffer.
+    if (g_cursorVisible && !CompositorGpuActive()) {
         uint32_t oldMinY = (g_cursorSaveY >= 0) ? static_cast<uint32_t>(g_cursorSaveY) : 0;
         uint32_t oldMaxY = static_cast<uint32_t>(g_cursorSaveY) + static_cast<uint32_t>(g_cursorSaveH);
         if (oldMaxY > g_physFbHeight) oldMaxY = g_physFbHeight;
@@ -2009,8 +2908,9 @@ static void CompositorLoop()
     }
     } // end legacy mode
 
-    // Draw mouse cursor on top of everything.
-    if (MouseIsAvailable() && cursorVisibleThisFrame)
+    // Draw mouse cursor on top of everything (CPU path only — GPU mode blits
+    // the cursor as a sprite in CompositorPresentGPU).
+    if (MouseIsAvailable() && cursorVisibleThisFrame && !CompositorGpuActive())
     {
         int32_t mx, my;
         MouseGetPosition(&mx, &my);
@@ -2027,8 +2927,36 @@ static void CompositorLoop()
     if (!WmIsActive())
         CompositorDrawClock();
 
+    // Present. GPU mode composites window content on the GPU and presents the
+    // scanout RT; the CPU dirty-row copy to MMIO is bypassed entirely (no CPU
+    // memcpy of window pixels into the framebuffer). The desktop layer
+    // (wallpaper + chrome + taskbar) was rendered into g_backBuffer above and is
+    // uploaded as a texture inside CompositorPresentGPU.
+    if (CompositorGpuActive())
+    {
+        // Capture the desktop dirty span (decoration changes — wallpaper, chrome,
+        // taskbar, clock) for the GPU desktop-texture upload, then reset it. The
+        // window content layer is composited from separate textures, so window
+        // animation does not appear here.
+        uint32_t dMinY = g_dirtyMinY;
+        uint32_t dMaxY = g_dirtyMaxY;
+        g_dirtyMinY = 0xFFFFFFFFu;
+        g_dirtyMaxY = 0;
+        CompositorPresentGPU(dMinY, dMaxY);
+
+        // Periodic thumbnail dump for in-guest visual verification.
+        if (g_gpuThumbDump)
+        {
+            uint64_t now = g_lapicTickCount;
+            if (now - g_lastThumbTick >= 5000)
+            {
+                g_lastThumbTick = now;
+                DumpGpuThumbnail();
+            }
+        }
+    }
     // Flip: copy only dirty scanlines from backbuffer → MMIO framebuffer.
-    if (g_backBuffer && g_dirtyMinY < g_dirtyMaxY)
+    else if (g_backBuffer && g_dirtyMinY < g_dirtyMaxY)
     {
         uint32_t minY = g_dirtyMinY;
         uint32_t maxY = g_dirtyMaxY;
@@ -2047,6 +2975,15 @@ static void CompositorLoop()
         // linear framebuffers (GOP/bochs); virtio-gpu transfers + flushes the
         // dirty rect to the host here.
         brook::DisplayFlush(minY, maxY);
+    }
+
+    // One-shot full-resolution frame dump (parity check), once the desktop has
+    // settled (~15s uptime). Works in both GPU mode (GPUFULL via scanout
+    // readback) and CPU mode (CPUFULL from g_backBuffer) for a direct diff.
+    if (g_fullDump && !g_fullDumpDone && g_lapicTickCount >= 15000)
+    {
+        g_fullDumpDone = true;
+        DumpFullFrameOnce();
     }
 
     // Present-timing: record this frame's period + loop time and

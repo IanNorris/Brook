@@ -336,6 +336,36 @@ if [ "${NO_AUDIO}" -eq 1 ]; then
     AUDIO_OPTS="-audiodev none,id=hda0"
 fi
 
+# Compositor mode: BROOK_COMPOSITE=gpu enables GPU (virgl BLIT) window
+# composition in the kernel compositor. Passed via fw_cfg opt/composite; the
+# compositor only uses it when the virtio-gpu 3D path is also live (otherwise it
+# transparently falls back to the CPU composite path). Default: CPU.
+FWCFG_OPTS=""
+if [ -n "${BROOK_COMPOSITE:-}" ]; then
+    FWCFG_OPTS="-fw_cfg name=opt/composite,string=${BROOK_COMPOSITE}"
+fi
+if [ "${BROOK_GPU_THUMB:-0}" = "1" ]; then
+    FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/gputhumb,string=1"
+fi
+if [ "${BROOK_GPU_FULL:-0}" = "1" ]; then
+    FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/gpufull,string=1"
+fi
+if [ -n "${BROOK_GPU_OPACITY:-}" ]; then
+    FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/gpuopacity,string=${BROOK_GPU_OPACITY}"
+fi
+if [ -n "${BROOK_GPU_BLUR:-}" ]; then
+    FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/gpublur,string=${BROOK_GPU_BLUR}"
+fi
+if [ -n "${BROOK_GPU_OVERLAY_OPACITY:-}" ]; then
+    FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/gpuoverlayopacity,string=${BROOK_GPU_OVERLAY_OPACITY}"
+fi
+if [ "${BROOK_GPU_LAUNCH:-0}" = "1" ]; then
+    FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/gpulaunch,string=1"
+fi
+if [ -n "${BROOK_GPU_MOUSE:-}" ]; then
+    FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/gpumouse,string=${BROOK_GPU_MOUSE}"
+fi
+
 # GPU device selection.
 #   default            : stdvga (q35) primary + virtio-gpu-pci secondary head.
 #                        Boot GOP comes from stdvga; the virtio-gpu driver drives
@@ -500,6 +530,7 @@ ${QEMU_BIN:-qemu-system-x86_64} \
     -device usb-storage,bus=xhci.0,drive=usbdisk \
     ${AUDIO_OPTS} \
     ${NETDEV_OPT} \
+    ${FWCFG_OPTS} \
     ${SERIAL_OPT} \
     ${DISPLAY_OPT} \
     -monitor unix:${MONITOR_SOCK},server,nowait \

@@ -416,12 +416,16 @@ static inline void RetireFrameLocked(uint32_t idx, uint16_t ownerPid)
     g_quarHead = idx;
     g_quarCount++;
     if (g_quarCount > g_quarPeak) g_quarPeak = g_quarCount;
+#ifndef BROOK_HOST_TEST
     // Liveness guard: the drainer should keep this list short. If it grows past
     // half of RAM the drainer is wedged — fail loud rather than silently exhaust
     // memory or be tempted to bypass the barrier (corruption). Fail loud.
+    // (Compiled out for host tests: quarantine is off there so this is dead, and
+    // KernelPanic — a kernel-only symbol — must not leak into the test link.)
     if (g_totalPages && g_quarCount > (g_totalPages / 2))
         KernelPanic("BRO-179: quarantine runaway (%u frames) — drain thread "
                     "wedged; refusing to bypass the TLB barrier", g_quarCount);
+#endif
 }
 
 // The drain thread body. Runs forever in a kernel thread (IF=1, no spinlocks

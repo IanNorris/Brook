@@ -10561,6 +10561,31 @@ static int64_t sys_brook_wm_set_decoration_mode(uint64_t wmId, uint64_t csd,
     return 0;
 }
 
+// 0xB00 (2816): WM_SET_WINDOW_PROPERTIES(wmId, mask, opacity, blurRadius)
+//   Set per-window display properties. `mask` selects which to apply:
+//     bit 0 (WM_PROP_OPACITY) -> opacity  (0..255, 255 = opaque)
+//     bit 1 (WM_PROP_BLUR)    -> blurRadius (0 = off)
+//   A high (0xB00) number deliberately clear of the Linux and Windows syscall
+//   ranges. Replaces the opt/gpuopacity demo hook with a real per-window API;
+//   the GPU DRAW path composites each window at its own opacity (and, for frosted
+//   glass, its blur radius). Only the owning process may set its window's props.
+static int64_t sys_brook_wm_set_window_properties(uint64_t wmId, uint64_t mask,
+                                                   uint64_t opacity, uint64_t blurRadius,
+                                                   uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    if (wmId == 0 || wmId > 0xFFFFu) return -EINVAL;
+
+    brook::Window* w = brook::WmFindWindowById(proc, static_cast<uint32_t>(wmId));
+    if (!w) return -EINVAL;
+    int idx = static_cast<int>(wmId) - 1;
+    brook::WmSetWindowProperties(idx, static_cast<uint32_t>(mask),
+                                 static_cast<uint8_t>(opacity & 0xFF),
+                                 static_cast<uint8_t>(blurRadius & 0xFF));
+    return 0;
+}
+
 // 513: WM_BEGIN_MOVE(wmId)
 //   Begin moving a waylandd-hosted window. Used to honour xdg_toplevel.move
 //   for client-side-decorated windows, where the titlebar click lands in
@@ -12585,6 +12610,9 @@ void SyscallTableInit()
     g_syscallTable[522]                  = sys_brook_wm_scanout_flip;
     g_syscallTable[523]                  = sys_brook_wm_get_windows;
     g_syscallTable[524]                  = sys_brook_wm_map_window_vfb;
+    // Brook windowing extensions live in a high 0xB00 block, clear of the Linux
+    // and Windows syscall ranges.
+    g_syscallTable[0xB00]                = sys_brook_wm_set_window_properties; // WM_SET_WINDOW_PROPERTIES
 
     uint32_t count = 0;
     for (uint64_t i = 0; i < SYSCALL_MAX; ++i)

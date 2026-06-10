@@ -8,9 +8,9 @@ struct Process;
 struct InputEvent;
 
 // Window manager constants
-static constexpr uint32_t WM_TITLE_BAR_HEIGHT = 24;
+static constexpr uint32_t WM_TITLE_BAR_HEIGHT = 30;
 static constexpr uint32_t WM_BORDER_WIDTH     = 2;
-static constexpr uint32_t WM_BUTTON_WIDTH     = 24;
+static constexpr uint32_t WM_BUTTON_WIDTH     = 46;
 static constexpr uint32_t WM_RESIZE_GRAB      = 16;  // corner/edge grab zone for resize
 static constexpr uint32_t WM_RESIZE_EDGE      = 6;   // edge-only grab zone (bottom/right)
 static constexpr uint32_t WM_MIN_WIDTH        = 200;
@@ -23,14 +23,41 @@ static constexpr uint32_t WM_TITLE_TEXT_PAD_X  = 8;   // left padding before tit
 static constexpr uint32_t WM_BTN_ICON_SIZE     = 10;  // size of max/min button icons
 static constexpr uint32_t WM_BTN_ICON_PAD_BOT  = 6;   // minimize icon bottom offset
 
-// Window chrome colours
-static constexpr uint32_t WM_TITLE_BG_FOCUSED   = 0x002B4A7A; // blue-ish
-static constexpr uint32_t WM_TITLE_BG_UNFOCUSED = 0x00404040; // dark grey
-static constexpr uint32_t WM_TITLE_FG           = 0x00E0E0E0; // light grey text
-static constexpr uint32_t WM_BORDER_FOCUSED     = 0x004080C0; // lighter blue
-static constexpr uint32_t WM_BORDER_UNFOCUSED   = 0x00505050; // grey
+// Window chrome colours — glassy blue (Aero-inspired). The focused titlebar is a
+// vertical gradient from WM_TITLE_TOP to WM_TITLE_BOT; WM_TITLE_BG_* is the mid
+// tone used for text anti-aliasing. The titlebar composites at ~85% opacity
+// (WM_CHROME_TITLE_ALPHA) for a hint of transparency; borders stay solid.
+// Caption buttons are rounded-rect glass cells with a faux-engraved bevel
+// (dark top/left inner edge + light bottom/right edge) and engraved glyphs.
+static constexpr uint32_t WM_TITLE_TOP_FOCUSED   = 0x007FB8EE; // glass top (bright sky)
+static constexpr uint32_t WM_TITLE_BOT_FOCUSED   = 0x001E4684; // glass bottom (deep navy)
+static constexpr uint32_t WM_TITLE_TOP_UNFOCUSED = 0x00565B68; // slate top
+static constexpr uint32_t WM_TITLE_BOT_UNFOCUSED = 0x002B2E36; // slate bottom
+static constexpr uint32_t WM_TITLE_BG_FOCUSED   = 0x00457BB9; // mid tone (text AA bg)
+static constexpr uint32_t WM_TITLE_BG_UNFOCUSED = 0x00424650; // mid tone (text AA bg)
+static constexpr uint32_t WM_TITLE_FG           = 0x00F2F6FF; // crisp near-white text
+static constexpr uint32_t WM_BORDER_FOCUSED     = 0x005E9CDC; // light blue edge
+static constexpr uint32_t WM_BORDER_UNFOCUSED   = 0x00565A66; // slate edge
+static constexpr uint32_t WM_TITLE_SHEEN_FOCUSED   = 0x00AFD6F5; // 1px top glass sheen
+static constexpr uint32_t WM_TITLE_SHEEN_UNFOCUSED = 0x00707682; // 1px top highlight
+static constexpr uint8_t  WM_CHROME_TITLE_ALPHA = 0xD8;       // ~85% opaque titlebar (glass)
+static constexpr int      WM_BTN_SLANT          = 6;         // ~15deg shear on the button's vertical sides
+static constexpr int      WM_BTN_RIGHT_PAD      = 4;         // extra gap between the close button and the right border
+// Caption button glass fill (vertical gradient) + faux-engraved bevel edges.
+static constexpr uint32_t WM_BTN_TOP            = 0x004E84C0; // button glass top
+static constexpr uint32_t WM_BTN_BOT            = 0x002B568E; // button glass bottom
+static constexpr uint32_t WM_BTN_BEVEL_DARK     = 0x00152F52; // engraved inner shadow (top/left)
+static constexpr uint32_t WM_BTN_BEVEL_LIGHT    = 0x008FC4F0; // engraved highlight (bottom/right)
+static constexpr uint32_t WM_BTN_HOVER_TOP      = 0x0072A8E0; // hover glass top
+static constexpr uint32_t WM_BTN_HOVER_BOT      = 0x003E6FB0; // hover glass bottom
+// Dimmed (slate) glass for caption buttons on UNFOCUSED windows, so the buttons
+// match the slate titlebar instead of staying bright blue. Hover still brightens.
+static constexpr uint32_t WM_BTN_TOP_UNFOCUSED  = 0x004A4F5B; // dim glass top
+static constexpr uint32_t WM_BTN_BOT_UNFOCUSED  = 0x002C303A; // dim glass bottom
 static constexpr uint32_t WM_CLOSE_BTN_BG       = 0x00C04040; // close button normal
 static constexpr uint32_t WM_CLOSE_BTN_HOVER    = 0x00E04040; // close button hover
+static constexpr uint32_t WM_CLOSE_BTN_TOP_UNF  = 0x008A5050; // dim close top (unfocused)
+static constexpr uint32_t WM_CLOSE_BTN_BOT_UNF  = 0x00683A3A; // dim close bottom (unfocused)
 static constexpr uint32_t WM_MAX_BTN_HOVER      = 0x00606060; // grey
 static constexpr uint32_t WM_TITLE_HIGHLIGHT    = 0x00FFFFFF; // 1px top highlight (subtle)
 static constexpr uint32_t WM_TASKBAR_BG         = 0x001E1E2E; // dark blue-grey
@@ -59,6 +86,8 @@ struct Window
     uint16_t    clientH;        // client area height (= VFB height * upscale)
     uint32_t    zOrder;         // higher = on top (0 = backmost)
     uint8_t     upscale;        // integer upscale factor (1 = 1:1, 2 = 2×, 4 = 4×)
+    uint8_t     opacity;        // per-window opacity 0..255 (255 = opaque); GPU DRAW path
+    uint8_t     blurRadius;     // backdrop blur behind the window/chrome (0 = off); GPU DRAW path
     WindowState state;
     bool        focused;
     bool        visible;
@@ -196,6 +225,18 @@ void WmRestoreWindow(int idx);
 // kernel WM stops drawing chrome and treats the whole outer area as client.
 // Used by waylandd to honour zxdg_toplevel_decoration_v1.set_mode.
 void WmSetClientSideDecoration(int idx, bool enable);
+
+// Per-window display-property bits for WmSetWindowProperties / syscall 0xB00.
+static constexpr uint32_t WM_PROP_OPACITY = 1u << 0;  // apply opacity arg
+static constexpr uint32_t WM_PROP_BLUR    = 1u << 1;  // apply blurRadius arg
+
+// Frosted-glass preset applied by the Super+G window toggle.
+static constexpr uint8_t  WM_GLASS_OPACITY = 200;     // translucent client (frost reads through)
+static constexpr uint8_t  WM_GLASS_BLUR    = 4;       // backdrop blur radius
+
+// Set per-window opacity and/or backdrop blur radius (selected by `mask`).
+// Marks the compositor dirty. The GPU DRAW path reads these per window.
+void WmSetWindowProperties(int idx, uint32_t mask, uint8_t opacity, uint8_t blurRadius);
 
 // Move a window to a new position.
 void WmMoveWindow(int idx, int16_t newX, int16_t newY);
@@ -346,6 +387,12 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
 
 // Hit-test the launcher popup. Returns item index (0..N) or -1 if miss.
 int WmLauncherHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH);
+
+// Get the launcher popup panel geometry (screen-space rect). Lets the GPU
+// compositor mark its pixels opaque / compose it as a translucent overlay.
+void WmLauncherGetRect(uint32_t screenW, uint32_t screenH,
+                       int32_t* outX, int32_t* outY,
+                       uint32_t* outW, uint32_t* outH);
 
 // Launch the item at the given index.
 void WmLauncherExec(int itemIdx);
