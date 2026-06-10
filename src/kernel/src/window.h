@@ -59,6 +59,7 @@ struct Window
     uint16_t    clientH;        // client area height (= VFB height * upscale)
     uint32_t    zOrder;         // higher = on top (0 = backmost)
     uint8_t     upscale;        // integer upscale factor (1 = 1:1, 2 = 2×, 4 = 4×)
+    uint8_t     opacity;        // per-window opacity 0..255 (255 = opaque); GPU DRAW path
     WindowState state;
     bool        focused;
     bool        visible;

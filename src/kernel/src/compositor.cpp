@@ -295,6 +295,7 @@ static uint32_t  g_wallpaperHeight = 0;
 // ---------------------------------------------------------------------------
 static bool      g_gpuComposite   = false;   // BROOK_COMPOSITE=gpu requested
 static bool      g_gpuDraw        = false;   // BROOK_GPU_DRAW: GL draw path (vs BLIT)
+static uint32_t  g_gpuTestOpacity = 0;       // BROOK_GPU_OPACITY: demo opacity for topmost window (0 = off)
 static bool      g_gpuThumbDump   = false;   // BROOK_GPU_THUMB: base64 thumbnail over serial
 static uint64_t  g_lastThumbTick  = 0;
 static bool      g_fullDump       = false;   // BROOK_GPU_FULL: one-shot full-res frame dump
@@ -411,6 +412,21 @@ void CompositorInit()
         {
             SerialPuts("COMPOSITOR: BROOK_GPU_DRAW set but driver draw path unavailable — using BLIT\n");
         }
+    }
+
+    // Verification/demo hook: opt/gpuopacity == "<0-255>" makes the topmost normal
+    // window render at that opacity on the GPU DRAW path, so per-window translucency
+    // can be observed in a headless capture. No effect on the BLIT path.
+    char gop[8] = {};
+    uint32_t gn = FwCfgReadFile("opt/gpuopacity", gop, sizeof(gop) - 1);
+    if (gn >= 1)
+    {
+        uint32_t v = 0;
+        for (uint32_t i = 0; i < gn && gop[i] >= '0' && gop[i] <= '9'; ++i)
+            v = v * 10 + (uint32_t)(gop[i] - '0');
+        if (v > 255) v = 255;
+        g_gpuTestOpacity = v;
+        if (v) SerialPuts("COMPOSITOR: GPU per-window opacity demo enabled (opt/gpuopacity)\n");
     }
 }
 
@@ -2075,14 +2091,15 @@ static void DumpFullFrameOnce()
 
 // Compose one textured layer into the scanout: DrawQuad on the GL draw path,
 // else Blit. Single dispatch point so both paths stay in lockstep. opacity is
-// 255 (opaque) for the parity milestone.
+// 255 (opaque) for most layers; window content passes the window's opacity so
+// the GL DRAW path can render translucent windows (BLIT ignores it — opaque).
 static inline void GpuComposeLayer(const GpuCompositorOps* gpu, GpuTexId src,
                                    uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh,
                                    uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh,
-                                   bool alphaBlend)
+                                   bool alphaBlend, uint32_t opacity = 255)
 {
     if (g_gpuDraw)
-        gpu->DrawQuad(src, sx, sy, sw, sh, dx, dy, dw, dh, 255, alphaBlend);
+        gpu->DrawQuad(src, sx, sy, sw, sh, dx, dy, dw, dh, opacity, alphaBlend);
     else
         gpu->Blit(src, sx, sy, sw, sh, dx, dy, dw, dh, alphaBlend);
 }
@@ -2253,7 +2270,11 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
         if (cdx + cdw > scrW) cdw = scrW - cdx;
         if (cdy + cdh > scrH) cdh = scrH - cdy;
         if (cdw == 0 || cdh == 0) continue;
-        GpuComposeLayer(gpu, e.tex, 0, 0, e.w, e.h, cdx, cdy, cdw, cdh, false);
+        // Topmost window can take a demo opacity (opt/gpuopacity) to exercise the
+        // per-window translucency path; otherwise each window uses its own opacity.
+        uint32_t op = w->opacity;
+        if (g_gpuTestOpacity && i == wcount - 1) op = g_gpuTestOpacity;
+        GpuComposeLayer(gpu, e.tex, 0, 0, e.w, e.h, cdx, cdy, cdw, cdh, false, op);
     }
 
     // Chrome frames on top (back-to-front), so a higher window's chrome is not

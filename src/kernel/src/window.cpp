@@ -230,6 +230,7 @@ int WmCreateWindow(Process* proc, int16_t x, int16_t y,
     w.clientH = clientH;
     w.zOrder = g_nextZOrder++;
     w.upscale = (upscale >= 1) ? upscale : 1;
+    w.opacity = 255;
     w.state = WindowState::Normal;
     w.focused = false;
     w.visible = true;

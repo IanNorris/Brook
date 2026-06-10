@@ -353,6 +353,9 @@ fi
 if [ "${BROOK_GPU_DRAW:-0}" = "1" ]; then
     FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/gpudraw,string=1"
 fi
+if [ -n "${BROOK_GPU_OPACITY:-}" ]; then
+    FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/gpuopacity,string=${BROOK_GPU_OPACITY}"
+fi
 
 # GPU device selection.
 #   default            : stdvga (q35) primary + virtio-gpu-pci secondary head.
