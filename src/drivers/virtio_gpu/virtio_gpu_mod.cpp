@@ -1405,8 +1405,8 @@ static bool CreateShaderObj(uint32_t ctxId, uint32_t handle, uint32_t shaderType
                             const char* text);
 
 // Pass-through vertex shader (clip-space pos from IN[0], uv from IN[1]) and a
-// textured fragment shader (sample SVIEW[0] at the interpolated uv). Shared by
-// the DRAW self-test and the live DRAW compositor path. Sent as TGSI text.
+// textured fragment shader (sample SVIEW[0] at the interpolated uv). Used by the
+// DRAW self-test. Sent as TGSI text.
 static const char* kDrawVS =
     "VERT\n"
     "DCL IN[0]\n"
@@ -1423,6 +1423,37 @@ static const char* kDrawFS_Tex =
     "DCL SAMP[0]\n"
     "DCL SVIEW[0], 2D, FLOAT\n"
     "TEX OUT[0], IN[0], SAMP[0], 2D\n"
+    "END\n";
+
+// Compositor DRAW shaders. The vertex carries a third attribute (IN[2].x) — the
+// per-window opacity in [0,1] — passed through to the fragment stage, which
+// samples the window texture and multiplies the sampled alpha by it. With
+// src-alpha-over blending this yields proper per-window opacity (BLIT cannot).
+// For opaque layers the compositor binds the no-blend state, so the scaled
+// alpha is simply ignored and the colour overwrites.
+[[maybe_unused]] static const char* kCompVS =
+    "VERT\n"
+    "DCL IN[0]\n"
+    "DCL IN[1]\n"
+    "DCL IN[2]\n"
+    "DCL OUT[0], POSITION\n"
+    "DCL OUT[1], GENERIC[0]\n"
+    "DCL OUT[2], GENERIC[1]\n"
+    "MOV OUT[0], IN[0]\n"
+    "MOV OUT[1], IN[1]\n"
+    "MOV OUT[2], IN[2]\n"
+    "END\n";
+[[maybe_unused]] static const char* kCompFS =
+    "FRAG\n"
+    "DCL IN[0], GENERIC[0], PERSPECTIVE\n"
+    "DCL IN[1], GENERIC[1], PERSPECTIVE\n"
+    "DCL OUT[0], COLOR\n"
+    "DCL SAMP[0]\n"
+    "DCL SVIEW[0], 2D, FLOAT\n"
+    "DCL TEMP[0]\n"
+    "TEX TEMP[0], IN[0], SAMP[0], 2D\n"
+    "MUL TEMP[0].w, TEMP[0].wwww, IN[1].xxxx\n"
+    "MOV OUT[0], TEMP[0]\n"
     "END\n";
 
 // One-time setup of the persistent DRAW pipeline objects in COMP_CTX_ID: a

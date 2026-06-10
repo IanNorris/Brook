@@ -2238,12 +2238,18 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
         int dx = w->clientX(), dy = w->clientY();
         int dw = w->clientW,  dh = w->clientH;
         if (dx >= (int)scrW || dy >= (int)scrH || dx + dw <= 0 || dy + dh <= 0) continue;
-        // Clamp dst into screen (src kept full; minor edge scale error only when
-        // a window is partially off-screen — acceptable for v1).
-        uint32_t cdx = dx < 0 ? 0 : (uint32_t)dx;
-        uint32_t cdy = dy < 0 ? 0 : (uint32_t)dy;
-        uint32_t cdw = (uint32_t)dw - (cdx - (uint32_t)(dx < 0 ? dx : 0));
-        uint32_t cdh = (uint32_t)dh - (cdy - (uint32_t)(dy < 0 ? dy : 0));
+        // Clamp dst into screen. Only the part hanging off the left/top is
+        // clipped (clipL/clipT); an on-screen window keeps its full client size.
+        // (The previous formula subtracted the window's screen position from its
+        // width/height, shrinking every non-(0,0) window's content away from its
+        // right/bottom chrome. src kept full → minor edge scale only for a
+        // partially off-screen window, acceptable for v1.)
+        int clipL = dx < 0 ? -dx : 0;
+        int clipT = dy < 0 ? -dy : 0;
+        uint32_t cdx = (uint32_t)(dx + clipL);   // == max(0, dx)
+        uint32_t cdy = (uint32_t)(dy + clipT);
+        uint32_t cdw = (uint32_t)(dw - clipL);
+        uint32_t cdh = (uint32_t)(dh - clipT);
         if (cdx + cdw > scrW) cdw = scrW - cdx;
         if (cdy + cdh > scrH) cdh = scrH - cdy;
         if (cdw == 0 || cdh == 0) continue;
