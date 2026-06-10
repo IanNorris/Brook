@@ -323,6 +323,41 @@ static inline uint32_t VirglCmd0(uint32_t cmd, uint32_t obj, uint32_t len)
 static inline uint32_t F32Bits(float f)
 { uint32_t u; __builtin_memcpy(&u, &f, sizeof(u)); return u; }
 
+// Convert a signed integer to its IEEE-754 single-precision bit pattern using
+// only integer ops (the kernel is built -mno-sse / soft-float-free, so runtime
+// floating-point math is unavailable). Exact for |v| <= 2^24, which covers all
+// screen-pixel coordinates and NDC numerators at 1080p and beyond. Lets the
+// compositor build per-quad vertex buffers (clip-space positions derived from
+// integer pixel rects) without any runtime FP.
+static inline uint32_t IntToF32Bits(int32_t v)
+{
+    if (v == 0) return 0;
+    uint32_t sign = 0, a;
+    if (v < 0) { sign = 0x80000000u; a = static_cast<uint32_t>(-static_cast<int64_t>(v)); }
+    else       { a = static_cast<uint32_t>(v); }
+    int e = 0; uint32_t m = a;
+    while (m >= (1u << 24)) { m >>= 1; ++e; }   // shrink: too many bits
+    while (m <  (1u << 23)) { m <<= 1; --e; }   // grow: normalise top bit -> bit 23
+    uint32_t exp = static_cast<uint32_t>(23 + e + 127);
+    return sign | (exp << 23) | (m & 0x7FFFFFu);
+}
+
+// Clip-space (NDC) bit pattern for pixel coordinate `px` on an axis of size
+// `dim`: ndc = 2*px/dim - 1, computed entirely in integer/fixed-point so no
+// runtime FP is used. Exact at pixel boundaries and sub-pixel accurate
+// elsewhere (|err| < 1.2e-7 NDC at 1080p). This is how the compositor turns
+// integer window pixel rects into vertex positions for the DRAW path.
+static inline uint32_t NdcBits(int32_t px, int32_t dim)
+{
+    int32_t num = 2 * px - dim;                      // [-dim, dim]
+    if (num == 0 || dim == 0) return 0;
+    int64_t q = (static_cast<int64_t>(num) << 23) / dim;   // ~ ndc * 2^23
+    uint32_t f = IntToF32Bits(static_cast<int32_t>(q));
+    uint32_t exp = (f >> 23) & 0xFF;                 // divide by 2^23 ...
+    exp -= 23;                                       // ... via exponent bias
+    return (f & 0x807FFFFFu) | (exp << 23);
+}
+
 // Self-test context/resource ids and render-target dimension.
 static constexpr uint32_t CTX_ID_SELFTEST = 1;
 static constexpr uint32_t RES_3D_SELFTEST = 2;   // src (cleared green)
@@ -1857,11 +1892,12 @@ static bool VirtioGpuDrawSelfTest()
     { SerialPuts("virtio_gpu: draw-test ctx create failed\n"); return false; }
 
     // Readback RTs (one per rung) — contiguous backing so we can read pixels.
-    // Rung 3 (M4) tests alpha blending over a red-cleared background.
-    const uint32_t RT[4] = { 200, 201, 202, 203 };
-    const uint32_t SURF[4] = { 83, 84, 85, 92 };
-    uint32_t* rd[4] = {};
-    for (int i = 0; i < 4; ++i)
+    // Rung 3 (M4) tests alpha blending; rung 4 (M5) tests an arbitrary sub-rect
+    // quad whose vertices are built at runtime via NdcBits (the M6 geometry path).
+    const uint32_t RT[5] = { 200, 201, 202, 203, 204 };
+    const uint32_t SURF[5] = { 83, 84, 85, 92, 93 };
+    uint32_t* rd[5] = {};
+    for (int i = 0; i < 5; ++i)
     {
         PhysicalAddress p = PmmAllocPages(AlignUp(sbytes, 4096) / 4096, MemTag::Device, KernelPid);
         if (!p) { SerialPuts("virtio_gpu: draw-test RT alloc failed\n"); return false; }
@@ -1899,8 +1935,35 @@ static bool VirtioGpuDrawSelfTest()
         { SerialPuts("virtio_gpu: draw-test vbuf setup failed\n"); return false; }
     }
 
-    // A solid-magenta sampler texture for the M3 rung (distinct from clear-blue
-    // and the M1 solid-red, so a correct sample is unambiguous).
+    // M5 vertex buffer: an arbitrary sub-rect quad (64,64)-(192,192) inside the
+    // 256x256 RT, with positions built AT RUNTIME from integer pixel coords via
+    // NdcBits — exercising the exact pixel->NDC path the compositor will use in
+    // M6 (no literal coords, no runtime FP). uv spans the full texture.
+    const uint32_t VBUF2 = 213;
+    {
+        const int32_t x0 = 64, y0 = 64, x1 = 192, y1 = 192;
+        uint32_t nx0 = NdcBits(x0, sdim), ny0 = NdcBits(y0, sdim);
+        uint32_t nx1 = NdcBits(x1, sdim), ny1 = NdcBits(y1, sdim);
+        const uint32_t F00b = 0x00000000u, FP1b = 0x3F800000u;
+        uint32_t sub[16] = {
+            nx0, ny0, F00b, F00b,
+            nx1, ny0, FP1b, F00b,
+            nx0, ny1, F00b, FP1b,
+            nx1, ny1, FP1b, FP1b,
+        };
+        PhysicalAddress vp = PmmAllocPages(AlignUp(vbytes, 4096) / 4096, MemTag::Device, KernelPid);
+        if (!vp) { SerialPuts("virtio_gpu: draw-test vbuf2 alloc failed\n"); return false; }
+        uint32_t* vbacking = reinterpret_cast<uint32_t*>(PhysToVirt(vp).raw());
+        for (uint32_t i = 0; i < 16; ++i) vbacking[i] = sub[i];
+        if (!ResourceCreateBuffer(VBUF2, VIRGL_BIND_VERTEX_BUFFER, vbytes) ||
+            !ResourceAttachBackingContig(VBUF2, vp.raw(), vbytes) ||
+            !CtxAttachResource(DCTX, VBUF2) ||
+            !TransferToHostBuffer(DCTX, VBUF2, vbytes))
+        { SerialPuts("virtio_gpu: draw-test vbuf2 setup failed\n"); return false; }
+    }
+
+    // A solid-magenta sampler texture for the M3/M5 rungs (distinct from
+    // clear-blue and M1 solid-red, so a correct sample is unambiguous).
     const uint32_t TEX = 211, texDim = 4, texBytes = texDim * texDim * 4;
     {
         PhysicalAddress tp = PmmAllocPages(1, MemTag::Device, KernelPid);
@@ -1949,7 +2012,7 @@ static bool VirtioGpuDrawSelfTest()
         uint32_t* dw = ComposeDwBase(); uint32_t n = 0;
 
         // Surfaces over each readback RT.
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < 5; ++i) {
             dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SURFACE, 5);
             dw[n++] = SURF[i]; dw[n++] = RT[i]; dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;
             dw[n++] = 0; dw[n++] = 0;
@@ -2023,7 +2086,8 @@ static bool VirtioGpuDrawSelfTest()
     //            is the problem, not the draw.
     //   Phase B: viewport + binds + vbuf + DRAW → the actual pipeline.
     auto runRung = [&](int rt, uint32_t fs, bool textured, uint32_t sview,
-                       uint32_t blendObj, uint32_t clrR, uint32_t clrG, uint32_t clrB) {
+                       uint32_t blendObj, uint32_t clrR, uint32_t clrG, uint32_t clrB,
+                       uint32_t vbuf) {
         // --- Phase A: clear only ---
         {
             auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
@@ -2068,7 +2132,7 @@ static bool VirtioGpuDrawSelfTest()
                 dw[n++] = PIPE_SHADER_FRAGMENT; dw[n++] = 0; dw[n++] = SAMP;
             }
             dw[n++] = VirglCmd0(VIRGL_CCMD_SET_VERTEX_BUFFERS, 0, 3);
-            dw[n++] = 16; dw[n++] = 0; dw[n++] = VBUF;
+            dw[n++] = 16; dw[n++] = 0; dw[n++] = vbuf;
             dw[n++] = VirglCmd0(VIRGL_CCMD_DRAW_VBO, 0, 12);
             dw[n++] = 0;  dw[n++] = 4;  dw[n++] = PIPE_PRIM_TRIANGLE_STRIP; dw[n++] = 0;
             dw[n++] = 1;  dw[n++] = 0;  dw[n++] = 0;  dw[n++] = 0;
@@ -2083,10 +2147,11 @@ static bool VirtioGpuDrawSelfTest()
     };
 
     constexpr uint32_t CLR0 = 0x00000000u, CLR1 = 0x3F800000u;  // 0.0f, 1.0f bits
-    runRung(0, FS_SOLID, false, 0,      BLEND,    CLR0, CLR0, CLR1);  // clear blue
-    runRung(1, FS_UV,    false, 0,      BLEND,    CLR0, CLR0, CLR1);  // clear blue
-    runRung(2, FS_TEX,   true,  SVIEW,  BLEND,    CLR0, CLR0, CLR1);  // clear blue
-    runRung(3, FS_TEX,   true,  SVIEW2, BLEND_ON, CLR1, CLR0, CLR0);  // clear red, blend green
+    runRung(0, FS_SOLID, false, 0,      BLEND,    CLR0, CLR0, CLR1, VBUF);   // clear blue
+    runRung(1, FS_UV,    false, 0,      BLEND,    CLR0, CLR0, CLR1, VBUF);   // clear blue
+    runRung(2, FS_TEX,   true,  SVIEW,  BLEND,    CLR0, CLR0, CLR1, VBUF);   // clear blue
+    runRung(3, FS_TEX,   true,  SVIEW2, BLEND_ON, CLR1, CLR0, CLR0, VBUF);   // clear red, blend green
+    runRung(4, FS_TEX,   true,  SVIEW,  BLEND,    CLR0, CLR0, CLR1, VBUF2);  // clear blue, sub-rect quad
 
     auto cR = [](uint32_t p){ return (p >> 16) & 0xFF; };
     auto cG = [](uint32_t p){ return (p >> 8) & 0xFF; };
@@ -2111,7 +2176,19 @@ static bool VirtioGpuDrawSelfTest()
     bool m4 = cR(p3) > 0x50 && cR(p3) < 0xB0 && cG(p3) > 0x50 && cG(p3) < 0xB0 && cB(p3) < 0x40;
     SerialPrintf("virtio_gpu: DRAW M4 blend centre=0x%08x -> %s\n", p3, m4 ? "PASS" : "FAIL");
 
-    return m1 && m2 && m3 && m4;
+    // M5: sub-rect (64,64)-(192,192) of the 256 RT, vertices built at runtime via
+    // NdcBits. Centre (128,128) must be inside → magenta; a corner sample (32,32)
+    // must be OUTSIDE → the blue clear. Proves the integer pixel→NDC geometry the
+    // compositor will use, and that an arbitrary quad lands at the right pixels.
+    uint32_t pIn  = rd[4][128 * sdim + 128];
+    uint32_t pOut = rd[4][32 * sdim + 32];
+    bool inMag  = cR(pIn) > 0xC0 && cG(pIn) < 0x40 && cB(pIn) > 0xC0;   // magenta
+    bool outBlu = cB(pOut) > 0xC0 && cR(pOut) < 0x40 && cG(pOut) < 0x40; // blue
+    bool m5 = inMag && outBlu;
+    SerialPrintf("virtio_gpu: DRAW M5 rect in=0x%08x out=0x%08x -> %s\n",
+                 pIn, pOut, m5 ? "PASS" : "FAIL");
+
+    return m1 && m2 && m3 && m4 && m5;
 }
 
 static int VirtioGpuModuleInit()
