@@ -393,7 +393,30 @@ if [ -n "${BROOK_GPU:-}" ] && [ "${BROOK_GPU}" != "0" ]; then
     export LIBGL_DRIVERS_PATH="${MESA_PATH}/lib/dri"
     export __EGL_VENDOR_LIBRARY_DIRS="${MESA_PATH}/share/glvnd/egl_vendor.d"
     export LD_LIBRARY_PATH="${GLVND_PATH}/lib:${MESA_PATH}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-    DISPLAY_OPT="-display egl-headless,rendernode=${GPU_RENDERNODE}"
+    # Display backend for the accelerated path:
+    #   (default)              egl-headless — renders the GL scanout OFFSCREEN on
+    #                          the host GPU (no window); for CI/headless + monitor
+    #                          screendump. NB: plain screendump can't read back the
+    #                          GL offscreen scanout reliably.
+    #   BROOK_GPU_DISPLAY=sdl  open a real SDL window with native GL present.
+    #   BROOK_GPU_DISPLAY=gtk  GTK window — but this qemu_full's GTK is built
+    #                          WITHOUT OpenGL ("OpenGL is not supported by display
+    #                          backend 'gtk'"), so gl=on fails. Use sdl for a
+    #                          windowed accelerated desktop.
+    # sdl/gtk require a host display (X11/Wayland) reachable by the qemu_full
+    # binary; virgl/Venus still execute the guest's GL/Vulkan on the host GPU —
+    # the window just presents the resulting scanout, so you SEE the live desktop.
+    case "${BROOK_GPU_DISPLAY:-headless}" in
+        sdl)
+            DISPLAY_OPT="-display sdl,gl=on"
+            ;;
+        gtk)
+            DISPLAY_OPT="-display gtk,gl=on"
+            ;;
+        *)
+            DISPLAY_OPT="-display egl-headless,rendernode=${GPU_RENDERNODE}"
+            ;;
+    esac
     # Use the VGA-class GL device (virtio-vga-gl) as the PRIMARY display, not a
     # secondary virtio-gpu-gl-pci behind stdvga. virtio-vga-gl provides the boot
     # GOP (VGA compat) AND the virtio-gpu 3D interface, so the existing driver
