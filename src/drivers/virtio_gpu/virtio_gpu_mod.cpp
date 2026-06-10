@@ -306,6 +306,10 @@ static constexpr uint32_t PIPE_BUFFER                 = 0;    // resource target
 static constexpr uint32_t PIPE_SHADER_VERTEX          = 0;
 static constexpr uint32_t PIPE_SHADER_FRAGMENT        = 1;
 static constexpr uint32_t PIPE_PRIM_TRIANGLE_STRIP    = 5;
+// Gallium blend factors / function for standard src-alpha-over composite.
+static constexpr uint32_t PIPE_BLENDFACTOR_SRC_ALPHA     = 0x3;
+static constexpr uint32_t PIPE_BLENDFACTOR_INV_SRC_ALPHA = 0x13;
+static constexpr uint32_t PIPE_BLEND_ADD                 = 0;
 
 // virgl BLIT: copy mask for an RGBA colour blit (PIPE_MASK_RGBA) and a
 // nearest-filter (PIPE_TEX_FILTER_NEAREST) — exact 1:1 pixel copy.
@@ -1853,10 +1857,11 @@ static bool VirtioGpuDrawSelfTest()
     { SerialPuts("virtio_gpu: draw-test ctx create failed\n"); return false; }
 
     // Readback RTs (one per rung) — contiguous backing so we can read pixels.
-    const uint32_t RT[3] = { 200, 201, 202 };
-    const uint32_t SURF[3] = { 83, 84, 85 };
-    uint32_t* rd[3] = {};
-    for (int i = 0; i < 3; ++i)
+    // Rung 3 (M4) tests alpha blending over a red-cleared background.
+    const uint32_t RT[4] = { 200, 201, 202, 203 };
+    const uint32_t SURF[4] = { 83, 84, 85, 92 };
+    uint32_t* rd[4] = {};
+    for (int i = 0; i < 4; ++i)
     {
         PhysicalAddress p = PmmAllocPages(AlignUp(sbytes, 4096) / 4096, MemTag::Device, KernelPid);
         if (!p) { SerialPuts("virtio_gpu: draw-test RT alloc failed\n"); return false; }
@@ -1909,6 +1914,22 @@ static bool VirtioGpuDrawSelfTest()
         { SerialPuts("virtio_gpu: draw-test tex setup failed\n"); return false; }
     }
 
+    // A half-alpha green texture for the M4 (blend) rung: green at alpha 0x80.
+    // Drawn over a red-cleared RT with SRC_ALPHA blending, the centre should
+    // come back ~50/50 red+green (olive), proving hardware alpha blend.
+    const uint32_t TEX2 = 212;
+    {
+        PhysicalAddress tp = PmmAllocPages(1, MemTag::Device, KernelPid);
+        if (!tp) { SerialPuts("virtio_gpu: draw-test tex2 alloc failed\n"); return false; }
+        uint32_t* tpx = reinterpret_cast<uint32_t*>(PhysToVirt(tp).raw());
+        for (uint32_t i = 0; i < texDim * texDim; ++i) tpx[i] = 0x8000FF00u; // green, alpha 0x80
+        if (!ResourceCreate3D(TEX2, VIRGL_FORMAT_B8G8R8A8_UNORM, VIRGL_BIND_SAMPLER_VIEW, texDim, texDim) ||
+            !ResourceAttachBackingContig(TEX2, tp.raw(), texBytes) ||
+            !CtxAttachResource(DCTX, TEX2) ||
+            !TransferToHost3D(DCTX, TEX2, 0, 0, texDim, texDim, texDim, texDim))
+        { SerialPuts("virtio_gpu: draw-test tex2 setup failed\n"); return false; }
+    }
+
     // Shaders.
     const uint32_t VS = 77, FS_SOLID = 78, FS_UV = 79, FS_TEX = 90;
     bool sv = CreateShaderObj(DCTX, VS, PIPE_SHADER_VERTEX, kDrawVS);
@@ -1920,6 +1941,7 @@ static bool VirtioGpuDrawSelfTest()
 
     // Pipeline state objects + surfaces, all in one SUBMIT_3D.
     const uint32_t BLEND = 73, RAST = 74, DSA = 75, VE = 76, SAMP = 87, SVIEW = 88;
+    const uint32_t BLEND_ON = 91, SVIEW2 = 89;
     {
         auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
         memset(sub, 0, sizeof(*sub));
@@ -1927,7 +1949,7 @@ static bool VirtioGpuDrawSelfTest()
         uint32_t* dw = ComposeDwBase(); uint32_t n = 0;
 
         // Surfaces over each readback RT.
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < 4; ++i) {
             dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SURFACE, 5);
             dw[n++] = SURF[i]; dw[n++] = RT[i]; dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;
             dw[n++] = 0; dw[n++] = 0;
@@ -1937,6 +1959,25 @@ static bool VirtioGpuDrawSelfTest()
         dw[n++] = BLEND; dw[n++] = 0; dw[n++] = 0;
         dw[n++] = (0xFu << 27);              // S2[0]: colormask only
         for (int i = 1; i < 8; ++i) dw[n++] = 0;
+        // Blend (enabled): standard src-alpha over — out = src*srcA + dst*(1-srcA).
+        // S2[0] fields: RT_BLEND_ENABLE(0) | RGB_FUNC(1..3)=ADD |
+        // RGB_SRC_FACTOR(4..8)=SRC_ALPHA | RGB_DST_FACTOR(9..13)=INV_SRC_ALPHA |
+        // ALPHA_FUNC(14..16)=ADD | ALPHA_SRC(17..21)=SRC_ALPHA |
+        // ALPHA_DST(22..26)=INV_SRC_ALPHA | COLORMASK(27..30)=RGBA.
+        {
+            uint32_t blendS2 = 1u
+                        | (PIPE_BLEND_ADD << 1)
+                        | (PIPE_BLENDFACTOR_SRC_ALPHA << 4)
+                        | (PIPE_BLENDFACTOR_INV_SRC_ALPHA << 9)
+                        | (PIPE_BLEND_ADD << 14)
+                        | (PIPE_BLENDFACTOR_SRC_ALPHA << 17)
+                        | (PIPE_BLENDFACTOR_INV_SRC_ALPHA << 22)
+                        | (0xFu << 27);
+            dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_BLEND, 11);
+            dw[n++] = BLEND_ON; dw[n++] = 0; dw[n++] = 0;
+            dw[n++] = blendS2;
+            for (int i = 1; i < 8; ++i) dw[n++] = 0;
+        }
         // Rasterizer: depth-clip + half-pixel-center, no culling.
         dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_RASTERIZER, 9);
         dw[n++] = RAST;
@@ -1965,6 +2006,10 @@ static bool VirtioGpuDrawSelfTest()
         dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SAMPLER_VIEW, 6);
         dw[n++] = SVIEW; dw[n++] = TEX; dw[n++] = VIRGL_FORMAT_B8G8R8A8_UNORM;
         dw[n++] = 0; dw[n++] = 0; dw[n++] = 0x688u;
+        // Sampler view over the half-alpha green texture (M4 blend rung).
+        dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SAMPLER_VIEW, 6);
+        dw[n++] = SVIEW2; dw[n++] = TEX2; dw[n++] = VIRGL_FORMAT_B8G8R8A8_UNORM;
+        dw[n++] = 0; dw[n++] = 0; dw[n++] = 0x688u;
         sub->size = n * 4;
         bool ok = CmdRespOk(SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP));
         SerialPrintf("virtio_gpu: draw-test object create -> %s\n", ok ? "ok" : "SUBMIT-ERR");
@@ -1977,7 +2022,8 @@ static bool VirtioGpuDrawSelfTest()
     //            readback on THIS RT. If A is not blue, the surface/RT/readback
     //            is the problem, not the draw.
     //   Phase B: viewport + binds + vbuf + DRAW → the actual pipeline.
-    auto runRung = [&](int rt, uint32_t fs, bool textured) {
+    auto runRung = [&](int rt, uint32_t fs, bool textured, uint32_t sview,
+                       uint32_t blendObj, uint32_t clrR, uint32_t clrG, uint32_t clrB) {
         // --- Phase A: clear only ---
         {
             auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
@@ -1988,7 +2034,7 @@ static bool VirtioGpuDrawSelfTest()
             dw[n++] = 1; dw[n++] = 0; dw[n++] = SURF[rt];
             dw[n++] = VirglCmd0(VIRGL_CCMD_CLEAR, 0, 8);
             dw[n++] = PIPE_CLEAR_COLOR0;
-            dw[n++] = F32Bits(0.0f); dw[n++] = F32Bits(0.0f); dw[n++] = F32Bits(1.0f); dw[n++] = F32Bits(1.0f);
+            dw[n++] = clrR; dw[n++] = clrG; dw[n++] = clrB; dw[n++] = F32Bits(1.0f);
             dw[n++] = 0; dw[n++] = 0; dw[n++] = 0;
             sub->size = n * 4;
             bool sok = CmdRespOk(SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP));
@@ -2009,7 +2055,7 @@ static bool VirtioGpuDrawSelfTest()
             dw[n++] = 0;
             dw[n++] = F32Bits(128.0f); dw[n++] = F32Bits(128.0f); dw[n++] = F32Bits(1.0f);
             dw[n++] = F32Bits(128.0f); dw[n++] = F32Bits(128.0f); dw[n++] = F32Bits(0.0f);
-            dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_OBJECT, VIRGL_OBJECT_BLEND, 1);       dw[n++] = BLEND;
+            dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_OBJECT, VIRGL_OBJECT_BLEND, 1);       dw[n++] = blendObj;
             dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_OBJECT, VIRGL_OBJECT_RASTERIZER, 1);  dw[n++] = RAST;
             dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_OBJECT, VIRGL_OBJECT_DSA, 1);         dw[n++] = DSA;
             dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_OBJECT, VIRGL_OBJECT_VERTEX_ELEMENTS, 1); dw[n++] = VE;
@@ -2017,7 +2063,7 @@ static bool VirtioGpuDrawSelfTest()
             dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_SHADER, 0, 2); dw[n++] = fs; dw[n++] = PIPE_SHADER_FRAGMENT;
             if (textured) {
                 dw[n++] = VirglCmd0(VIRGL_CCMD_SET_SAMPLER_VIEWS, 0, 3);
-                dw[n++] = PIPE_SHADER_FRAGMENT; dw[n++] = 0; dw[n++] = SVIEW;
+                dw[n++] = PIPE_SHADER_FRAGMENT; dw[n++] = 0; dw[n++] = sview;
                 dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_SAMPLER_STATES, 0, 3);
                 dw[n++] = PIPE_SHADER_FRAGMENT; dw[n++] = 0; dw[n++] = SAMP;
             }
@@ -2036,9 +2082,11 @@ static bool VirtioGpuDrawSelfTest()
         }
     };
 
-    runRung(0, FS_SOLID, false);
-    runRung(1, FS_UV,    false);
-    runRung(2, FS_TEX,   true);
+    constexpr uint32_t CLR0 = 0x00000000u, CLR1 = 0x3F800000u;  // 0.0f, 1.0f bits
+    runRung(0, FS_SOLID, false, 0,      BLEND,    CLR0, CLR0, CLR1);  // clear blue
+    runRung(1, FS_UV,    false, 0,      BLEND,    CLR0, CLR0, CLR1);  // clear blue
+    runRung(2, FS_TEX,   true,  SVIEW,  BLEND,    CLR0, CLR0, CLR1);  // clear blue
+    runRung(3, FS_TEX,   true,  SVIEW2, BLEND_ON, CLR1, CLR0, CLR0);  // clear red, blend green
 
     auto cR = [](uint32_t p){ return (p >> 16) & 0xFF; };
     auto cG = [](uint32_t p){ return (p >> 8) & 0xFF; };
@@ -2057,7 +2105,13 @@ static bool VirtioGpuDrawSelfTest()
     bool m3 = cR(p2) > 0xC0 && cG(p2) < 0x40 && cB(p2) > 0xC0;          // magenta
     SerialPrintf("virtio_gpu: DRAW M3 tex centre=0x%08x -> %s\n", p2, m3 ? "PASS" : "FAIL");
 
-    return m1 && m2 && m3;
+    // M4: half-alpha green over red clear → ~50/50 red+green (olive), with both
+    // channels mid-range and blue near zero. Proves hardware src-alpha blend.
+    uint32_t p3 = rd[3][c];
+    bool m4 = cR(p3) > 0x50 && cR(p3) < 0xB0 && cG(p3) > 0x50 && cG(p3) < 0xB0 && cB(p3) < 0x40;
+    SerialPrintf("virtio_gpu: DRAW M4 blend centre=0x%08x -> %s\n", p3, m4 ? "PASS" : "FAIL");
+
+    return m1 && m2 && m3 && m4;
 }
 
 static int VirtioGpuModuleInit()
