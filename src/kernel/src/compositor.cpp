@@ -303,6 +303,14 @@ static bool      g_fullDumpDone   = false;   // full dump already emitted
 static GpuTexId  g_desktopTex     = 0;       // g_backBuffer as a texture
 static uint32_t* g_desktopTexPtr  = nullptr; // backing pointer the tex was made for
 static bool      g_desktopTexNeedsFull = true; // force a full desktop upload
+// GPU DRAW path only: per-window chrome is rendered into a SEPARATE full-screen
+// RGBA layer (transparent gaps, decoration rects alpha=0xFF) so the base desktop
+// texture is wallpaper + taskbar only. This lets chrome blend over whatever is
+// behind a window (wallpaper / lower windows) at the window's opacity, which a
+// chrome baked into the opaque base desktop structurally cannot do.
+static uint32_t* g_chromeBuffer   = nullptr; // full-screen, per-window chrome only
+static GpuTexId  g_chromeTex      = 0;       // g_chromeBuffer as an alpha texture
+static bool      g_chromeTexNeedsFull = true; // force a full chrome upload
 static GpuTexId  g_cursorTex      = 0;       // ARGB cursor sprite
 // Per-window-slot content texture tracking (recreated when the VFB changes).
 struct WinTexEntry { GpuTexId tex; uint32_t* vfb; uint32_t w; uint32_t h; };
@@ -1029,6 +1037,53 @@ static void CompositorHandleMouseWM();
 static volatile bool g_wmBtnLatch        = false;
 static volatile bool g_wmBtnReleaseLatch = false;
 
+// GPU DRAW chrome layer: lazily allocate the full-screen chrome buffer (same
+// geometry as the backbuffer). Returns false if unavailable (falls back to
+// chrome-in-backbuffer behaviour).
+static bool EnsureChromeBuffer()
+{
+    if (g_chromeBuffer) return true;
+    if (!g_backBuffer || !g_backBufStride || !g_physFbHeight) return false;
+    uint64_t bytes = static_cast<uint64_t>(g_backBufStride) * g_physFbHeight * 4;
+    uint64_t pages = (bytes + 4095) / 4096;
+    VirtualAddress addr = VmmAllocPages(pages, VMM_WRITABLE, MemTag::Device, 0);
+    if (!addr) return false;
+    g_chromeBuffer = reinterpret_cast<uint32_t*>(addr.raw());
+    __builtin_memset(g_chromeBuffer, 0, bytes);   // fully transparent
+    SerialPrintf("COMPOSITOR: chrome layer %lu KB at 0x%lx\n", bytes / 1024, addr.raw());
+    return true;
+}
+
+// Mark a window's decoration rects (titlebar + 4 borders, i.e. the outer rect
+// minus the client hole) opaque in the chrome buffer, so the alpha texture's
+// gaps (client area + outside the window) stay transparent. The chrome pixels
+// themselves are a hard rectangular mask — no AA against the backdrop — so a
+// simple per-rect alpha OR is exact.
+static void SetChromeDecorAlpha(const Window& w)
+{
+    if (!g_chromeBuffer || w.noChrome) return;
+    int ox = w.x, oy = w.y;
+    int ow = (int)w.outerWidth(), oh = (int)w.outerHeight();
+    int cx = w.clientX(), cy = w.clientY();
+    int cw = (int)w.clientW, ch = (int)w.clientH;
+    auto orAlpha = [](int x, int y, int rw, int rh) {
+        if (rw <= 0 || rh <= 0) return;
+        if (x < 0) { rw += x; x = 0; }
+        if (y < 0) { rh += y; y = 0; }
+        if (x + rw > (int)g_physFbWidth)  rw = (int)g_physFbWidth  - x;
+        if (y + rh > (int)g_physFbHeight) rh = (int)g_physFbHeight - y;
+        for (int yy = y; yy < y + rh; ++yy)
+        {
+            uint32_t* row = g_chromeBuffer + (uint32_t)yy * g_backBufStride;
+            for (int xx = x; xx < x + rw; ++xx) row[xx] |= 0xFF000000u;
+        }
+    };
+    orAlpha(ox, oy, ow, cy - oy);                       // titlebar + top border
+    orAlpha(ox, cy + ch, ow, (oy + oh) - (cy + ch));    // bottom border
+    orAlpha(ox, cy, cx - ox, ch);                       // left border
+    orAlpha(cx + cw, cy, (ox + ow) - (cx + cw), ch);    // right border
+}
+
 // WM-mode compositor loop: wallpaper → windows (z-ordered) → chrome → cursor.
 static void CompositorLoopWM()
 {
@@ -1070,6 +1125,16 @@ static void CompositorLoopWM()
     // or can get away with only re-blitting windows whose VFB content changed.
     bool fullRepaint = forceAll
                      || __atomic_exchange_n(&g_needsFullRepaint, false, __ATOMIC_ACQ_REL);
+
+    // GPU DRAW path: per-window chrome is composited from a separate alpha layer
+    // (g_chromeBuffer) rather than baked into the opaque base desktop, so chrome
+    // can honour per-window opacity. Clear the layer on a full repaint (mirrors
+    // the wallpaper redraw of g_backBuffer) so stale chrome from moved/closed
+    // windows does not linger.
+    bool drawChromeLayer = g_gpuDraw && CompositorGpuActive() && EnsureChromeBuffer();
+    if (drawChromeLayer && fullRepaint)
+        __builtin_memset(g_chromeBuffer, 0,
+                         static_cast<uint64_t>(g_backBufStride) * g_physFbHeight * 4);
 
     // 1. Draw wallpaper only when the scene structure changed
     if (fullRepaint)
@@ -1203,10 +1268,26 @@ static void CompositorLoopWM()
             }
         }
 
-        if (g_backBuffer)
+        // Per-window chrome. In the GPU DRAW path it goes into the separate
+        // alpha chrome layer (so the base desktop stays chrome-free and chrome
+        // can be drawn at the window's opacity); otherwise into the backbuffer.
+        if (drawChromeLayer)
+        {
+            Window* cw = WmGetWindow(sorted[i]);
+            if (cw && !cw->noChrome)
+            {
+                WmRenderChromeForWindow(g_chromeBuffer, g_backBufStride,
+                                         g_physFbWidth, g_physFbHeight, sorted[i],
+                                         chromeMx, chromeMy);
+                SetChromeDecorAlpha(*cw);
+            }
+        }
+        else if (g_backBuffer)
+        {
             WmRenderChromeForWindow(g_backBuffer, g_backBufStride,
                                      g_physFbWidth, g_physFbHeight, sorted[i],
                                      chromeMx, chromeMy);
+        }
     }
 
     // 3. Render taskbar at bottom of screen
@@ -2104,20 +2185,47 @@ static inline void GpuComposeLayer(const GpuCompositorOps* gpu, GpuTexId src,
         gpu->Blit(src, sx, sy, sw, sh, dx, dy, dw, dh, alphaBlend);
 }
 
-// Blit a screen-space rectangle of the desktop texture 1:1 into the scanout,
-// clamped to the screen. Used to restore chrome/taskbar on top of content.
-static void GpuBlitDesktopRect(const GpuCompositorOps* gpu,
-                               int x, int y, int w, int h)
+// Compose a screen-space rectangle of a full-screen source texture 1:1 into the
+// scanout, clamped to the screen. opacity/alphaBlend let the same helper restore
+// opaque desktop furniture (chrome/taskbar from the desktop tex) or composite the
+// translucent per-window chrome layer at a window's opacity.
+static void GpuComposeSrcRect(const GpuCompositorOps* gpu, GpuTexId tex,
+                              int x, int y, int w, int h,
+                              uint32_t opacity, bool alphaBlend)
 {
-    if (w <= 0 || h <= 0 || !g_desktopTex) return;
+    if (w <= 0 || h <= 0 || !tex) return;
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
     if (x >= (int)g_physFbWidth || y >= (int)g_physFbHeight) return;
     if (x + w > (int)g_physFbWidth)  w = (int)g_physFbWidth  - x;
     if (y + h > (int)g_physFbHeight) h = (int)g_physFbHeight - y;
     if (w <= 0 || h <= 0) return;
-    GpuComposeLayer(gpu, g_desktopTex, (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h,
-                    (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h, false);
+    GpuComposeLayer(gpu, tex, (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h,
+                    (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h, alphaBlend, opacity);
+}
+
+// Blit a screen-space rectangle of the desktop texture 1:1 into the scanout,
+// clamped to the screen. Used to restore chrome/taskbar on top of content.
+static void GpuBlitDesktopRect(const GpuCompositorOps* gpu,
+                               int x, int y, int w, int h)
+{
+    GpuComposeSrcRect(gpu, g_desktopTex, x, y, w, h, 255, false);
+}
+
+// Compose the chrome layer's decoration rects for one window at its opacity.
+// The chrome texture holds only the titlebar + 4 borders (transparent elsewhere),
+// so a translucent window's frame blends over whatever is behind it.
+static void GpuComposeChrome(const GpuCompositorOps* gpu, const Window* w, uint32_t opacity)
+{
+    if (!g_chromeTex || w->noChrome) return;
+    int ox = w->x, oy = w->y;
+    int ow = (int)w->outerWidth(), oh = (int)w->outerHeight();
+    int cx = w->clientX(), cy = w->clientY();
+    int cw = (int)w->clientW, ch = (int)w->clientH;
+    GpuComposeSrcRect(gpu, g_chromeTex, ox, oy, ow, cy - oy, opacity, true);                 // titlebar + top border
+    GpuComposeSrcRect(gpu, g_chromeTex, ox, cy + ch, ow, (oy + oh) - (cy + ch), opacity, true); // bottom border
+    GpuComposeSrcRect(gpu, g_chromeTex, ox, cy, cx - ox, ch, opacity, true);                 // left border
+    GpuComposeSrcRect(gpu, g_chromeTex, cx + cw, cy, (ox + ow) - (cx + cw), ch, opacity, true); // right border
 }
 
 static void EnsureDesktopTex(const GpuCompositorOps* gpu)
@@ -2129,6 +2237,14 @@ static void EnsureDesktopTex(const GpuCompositorOps* gpu)
                                       reinterpret_cast<uint64_t>(g_backBuffer), false);
     g_desktopTexPtr = g_backBuffer;
     g_desktopTexNeedsFull = true;   // upload the whole desktop on first use
+}
+
+static void EnsureChromeTex(const GpuCompositorOps* gpu)
+{
+    if (g_chromeTex || !g_chromeBuffer) return;
+    g_chromeTex = gpu->CreateTexture(g_backBufStride, g_physFbHeight,
+                                     reinterpret_cast<uint64_t>(g_chromeBuffer), true);
+    g_chromeTexNeedsFull = true;
 }
 
 // Resolve a window's content source buffer. Wayland windows expose w->vfb;
@@ -2165,11 +2281,13 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
     gpu->GetSize(&scrW, &scrH);
     if (scrW == 0 || scrH == 0) return;
 
-    // 1. Desktop layer (wallpaper + chrome + taskbar) from g_backBuffer. Upload
-    //    only the changed rows: the desktop is static in steady state (only the
-    //    clock/taskbar and occasional chrome change), so a full 1920x1080
-    //    re-upload every frame would waste ~8MB of DMA. The window content
-    //    layer is a separate texture, so window animation does NOT dirty this.
+    // 1. Desktop layer. In the GPU DRAW path this is wallpaper + taskbar only
+    //    (per-window chrome lives in the separate alpha chrome layer, below); in
+    //    the BLIT path it also carries chrome. Upload only the changed rows: the
+    //    desktop is static in steady state (only the clock/taskbar and occasional
+    //    chrome change), so a full 1920x1080 re-upload every frame would waste
+    //    ~8MB of DMA. The window content layer is a separate texture, so window
+    //    animation does NOT dirty this.
     EnsureDesktopTex(gpu);
     if (!g_desktopTex) return;
     if (g_desktopTexNeedsFull)
@@ -2183,6 +2301,30 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
         if (maxY > dirtyMinY)
             gpu->UpdateTexture(g_desktopTex, 0, dirtyMinY,
                                g_physFbWidth, maxY - dirtyMinY);
+    }
+
+    // 1b. Chrome layer (GPU DRAW path only): the per-window decorations as an
+    //     alpha texture, uploaded over the same dirty span as the desktop.
+    bool useChromeLayer = g_gpuDraw && g_chromeBuffer;
+    if (useChromeLayer)
+    {
+        EnsureChromeTex(gpu);
+        if (g_chromeTex)
+        {
+            if (g_chromeTexNeedsFull)
+            {
+                gpu->UpdateTexture(g_chromeTex, 0, 0, g_physFbWidth, g_physFbHeight);
+                g_chromeTexNeedsFull = false;
+            }
+            else if (dirtyMinY < dirtyMaxY)
+            {
+                uint32_t maxY = dirtyMaxY > g_physFbHeight ? g_physFbHeight : dirtyMaxY;
+                if (maxY > dirtyMinY)
+                    gpu->UpdateTexture(g_chromeTex, 0, dirtyMinY,
+                                       g_physFbWidth, maxY - dirtyMinY);
+            }
+        }
+        else useChromeLayer = false;
     }
 
     // 2. Cursor sprite (ARGB, alpha-blended).
@@ -2240,57 +2382,78 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
     // 4. Compose into the scanout RT.
     gpu->BeginFrame(0);
 
-    // Base: desktop (wallpaper + chrome + taskbar). Client areas show wallpaper.
+    // Base: desktop. In the BLIT path this carries wallpaper + chrome + taskbar;
+    // in the DRAW path it is wallpaper + taskbar only (chrome is a separate
+    // alpha layer composited per window below). Client areas show wallpaper.
     GpuComposeLayer(gpu, g_desktopTex, 0, 0, g_physFbWidth, g_physFbHeight,
                     0, 0, g_physFbWidth, g_physFbHeight, false);
 
-    // Window content (back-to-front), scaled from source VFB to client area.
+    // Windows back-to-front. In the DRAW path each window is composited as a
+    // UNIT — content then its chrome — at the window's opacity, so a higher
+    // window's translucent frame blends over a lower window's content correctly.
+    // (Composing all content first, then all chrome, would let a lower window's
+    // chrome paint over a higher window's content once chrome is translucent.)
     for (uint32_t i = 0; i < wcount; ++i)
     {
         int idx = sorted[i];
         Window* w = WmGetWindow(idx);
         if (!w || !w->visible || w->minimized) continue;
-        WinTexEntry& e = g_winTex[idx];
-        if (!e.tex) continue;
-        int dx = w->clientX(), dy = w->clientY();
-        int dw = w->clientW,  dh = w->clientH;
-        if (dx >= (int)scrW || dy >= (int)scrH || dx + dw <= 0 || dy + dh <= 0) continue;
-        // Clamp dst into screen. Only the part hanging off the left/top is
-        // clipped (clipL/clipT); an on-screen window keeps its full client size.
-        // (The previous formula subtracted the window's screen position from its
-        // width/height, shrinking every non-(0,0) window's content away from its
-        // right/bottom chrome. src kept full → minor edge scale only for a
-        // partially off-screen window, acceptable for v1.)
-        int clipL = dx < 0 ? -dx : 0;
-        int clipT = dy < 0 ? -dy : 0;
-        uint32_t cdx = (uint32_t)(dx + clipL);   // == max(0, dx)
-        uint32_t cdy = (uint32_t)(dy + clipT);
-        uint32_t cdw = (uint32_t)(dw - clipL);
-        uint32_t cdh = (uint32_t)(dh - clipT);
-        if (cdx + cdw > scrW) cdw = scrW - cdx;
-        if (cdy + cdh > scrH) cdh = scrH - cdy;
-        if (cdw == 0 || cdh == 0) continue;
-        // Topmost window can take a demo opacity (opt/gpuopacity) to exercise the
-        // per-window translucency path; otherwise each window uses its own opacity.
+        // With the opt/gpuopacity demo hook every normal window takes the test
+        // opacity (so overlapping translucent windows exercise the interleaved
+        // content+chrome compositing); otherwise each window uses its own.
         uint32_t op = w->opacity;
-        if (g_gpuTestOpacity && i == wcount - 1) op = g_gpuTestOpacity;
-        GpuComposeLayer(gpu, e.tex, 0, 0, e.w, e.h, cdx, cdy, cdw, cdh, false, op);
+        if (g_gpuTestOpacity) op = g_gpuTestOpacity;
+
+        WinTexEntry& e = g_winTex[idx];
+        if (e.tex)
+        {
+            int dx = w->clientX(), dy = w->clientY();
+            int dw = w->clientW,  dh = w->clientH;
+            if (!(dx >= (int)scrW || dy >= (int)scrH || dx + dw <= 0 || dy + dh <= 0))
+            {
+                // Clamp dst into screen. Only the part hanging off the left/top is
+                // clipped (clipL/clipT); an on-screen window keeps its full client
+                // size. (The previous formula subtracted the window's screen
+                // position from its width/height, shrinking every non-(0,0)
+                // window's content away from its right/bottom chrome.)
+                int clipL = dx < 0 ? -dx : 0;
+                int clipT = dy < 0 ? -dy : 0;
+                uint32_t cdx = (uint32_t)(dx + clipL);   // == max(0, dx)
+                uint32_t cdy = (uint32_t)(dy + clipT);
+                uint32_t cdw = (uint32_t)(dw - clipL);
+                uint32_t cdh = (uint32_t)(dh - clipT);
+                if (cdx + cdw > scrW) cdw = scrW - cdx;
+                if (cdy + cdh > scrH) cdh = scrH - cdy;
+                if (cdw != 0 && cdh != 0)
+                    GpuComposeLayer(gpu, e.tex, 0, 0, e.w, e.h, cdx, cdy, cdw, cdh, false, op);
+            }
+        }
+
+        // DRAW path: this window's chrome, at the same opacity, immediately on
+        // top of its content (unit compositing). BLIT path restores chrome from
+        // the desktop texture in a separate pass below.
+        if (useChromeLayer)
+            GpuComposeChrome(gpu, w, op);
     }
 
-    // Chrome frames on top (back-to-front), so a higher window's chrome is not
-    // covered by a lower window's content where they overlap.
-    for (uint32_t i = 0; i < wcount; ++i)
+    // BLIT path only: chrome frames on top (back-to-front), restored opaque from
+    // the desktop texture so a higher window's chrome is not covered by a lower
+    // window's content where they overlap.
+    if (!useChromeLayer)
     {
-        Window* w = WmGetWindow(sorted[i]);
-        if (!w || !w->visible || w->minimized || w->noChrome) continue;
-        int ox = w->x, oy = w->y;
-        int ow = (int)w->outerWidth(), oh = (int)w->outerHeight();
-        int cx = w->clientX(), cy = w->clientY();
-        int cw = (int)w->clientW, ch = (int)w->clientH;
-        GpuBlitDesktopRect(gpu, ox, oy, ow, cy - oy);                 // titlebar + top border
-        GpuBlitDesktopRect(gpu, ox, cy + ch, ow, (oy + oh) - (cy + ch)); // bottom border
-        GpuBlitDesktopRect(gpu, ox, cy, cx - ox, ch);                // left border
-        GpuBlitDesktopRect(gpu, cx + cw, cy, (ox + ow) - (cx + cw), ch); // right border
+        for (uint32_t i = 0; i < wcount; ++i)
+        {
+            Window* w = WmGetWindow(sorted[i]);
+            if (!w || !w->visible || w->minimized || w->noChrome) continue;
+            int ox = w->x, oy = w->y;
+            int ow = (int)w->outerWidth(), oh = (int)w->outerHeight();
+            int cx = w->clientX(), cy = w->clientY();
+            int cw = (int)w->clientW, ch = (int)w->clientH;
+            GpuBlitDesktopRect(gpu, ox, oy, ow, cy - oy);                 // titlebar + top border
+            GpuBlitDesktopRect(gpu, ox, cy + ch, ow, (oy + oh) - (cy + ch)); // bottom border
+            GpuBlitDesktopRect(gpu, ox, cy, cx - ox, ch);                // left border
+            GpuBlitDesktopRect(gpu, cx + cw, cy, (ox + ow) - (cx + cw), ch); // right border
+        }
     }
 
     // Taskbar always on top.
