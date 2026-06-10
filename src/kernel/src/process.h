@@ -438,6 +438,10 @@ struct Process
     uint32_t  fbVfbHeight;      // VFB height in pixels
     uint32_t  fbVfbStride;      // VFB stride in pixels (= fbVfbWidth)
 
+    // Per-process GPU (virgl) context id for app GL rendering, or 0 if none.
+    // Allocated by GPU_CTX_CREATE (syscall 0xB10); torn down on process exit.
+    int32_t   gpuAppCtx;
+
     // Compositor placement: position and downscale factor on the physical FB.
     // The virtual FB is the full resolution the process thinks it has.
     // The compositor blits the VFB at (fbDestX, fbDestY) with 1:1 pixel mapping.

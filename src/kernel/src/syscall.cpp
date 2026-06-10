@@ -22,6 +22,7 @@
 #include "memory/heap.h"
 #include "compositor.h"
 #include "window.h"
+#include "gpu_app.h"
 #include "terminal.h"
 #include "net.h"
 #include "rtc.h"
@@ -10586,6 +10587,130 @@ static int64_t sys_brook_wm_set_window_properties(uint64_t wmId, uint64_t mask,
     return 0;
 }
 
+// ===========================================================================
+// App-GPU syscalls (0xB10..): per-process virgl context for userspace GL-style
+// rendering. The app gets its own context + resource ids, submits virgl command
+// streams, and reads results back into its window VFB. Backed by GpuAppOps,
+// which a 3D display driver registers. All gate on the caller owning the ctx
+// (proc->gpuAppCtx). Numbers sit in the high 0xB00 block (clear of Linux/Windows).
+// ===========================================================================
+
+// 0xB10: GPU_CTX_CREATE() -> ctxId (>0), or <0. One context per process.
+static int64_t sys_brook_gpu_ctx_create(uint64_t, uint64_t, uint64_t, uint64_t,
+                                         uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    const brook::GpuAppOps* ga = brook::GpuAppGet();
+    if (!ga || !ga->CtxCreate) return -ENODEV;
+    if (proc->gpuAppCtx > 0) return proc->gpuAppCtx;   // already have one
+    int32_t ctx = ga->CtxCreate(proc->pid);
+    if (ctx < 0) return -ENOMEM;
+    proc->gpuAppCtx = ctx;
+    return ctx;
+}
+
+// 0xB11: GPU_RESOURCE_CREATE(ctx, format, bind, w, h) -> host-global resId (>0)
+// or <0. The returned id is used directly in the app's virgl streams.
+static int64_t sys_brook_gpu_resource_create(uint64_t ctx, uint64_t format,
+                                             uint64_t bind, uint64_t w, uint64_t h,
+                                             uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    const brook::GpuAppOps* ga = brook::GpuAppGet();
+    if (!ga || !ga->ResourceCreate3D) return -ENODEV;
+    if ((int32_t)ctx != proc->gpuAppCtx || proc->gpuAppCtx <= 0) return -EPERM;
+    if (w == 0 || h == 0 || w > 8192 || h > 8192) return -EINVAL;
+    int32_t res = ga->ResourceCreate3D((int32_t)ctx, (uint32_t)format, (uint32_t)bind,
+                                       (uint32_t)w, (uint32_t)h);
+    return res < 0 ? -ENOMEM : res;
+}
+
+// 0xB12: GPU_ATTACH_WINDOW(ctx, resId, wmId) — back a resource with the caller's
+// window VFB (kernel-mapped), so host-rendered pixels land straight in the
+// window. Convenience for the common "render into my window" case.
+static int64_t sys_brook_gpu_attach_window(uint64_t ctx, uint64_t resId,
+                                           uint64_t wmId, uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    const brook::GpuAppOps* ga = brook::GpuAppGet();
+    if (!ga || !ga->ResourceAttachUser) return -ENODEV;
+    if ((int32_t)ctx != proc->gpuAppCtx || proc->gpuAppCtx <= 0) return -EPERM;
+    brook::Window* win = brook::WmFindWindowById(proc, static_cast<uint32_t>(wmId));
+    if (!win || !win->vfb || !win->vfbBytes) return -EINVAL;
+    int32_t r = ga->ResourceAttachUser((int32_t)ctx, (int32_t)resId,
+                                       reinterpret_cast<uint64_t>(win->vfb),
+                                       static_cast<uint32_t>(win->vfbBytes));
+    return r < 0 ? -EINVAL : 0;
+}
+
+// 0xB16: GPU_UPLOAD_BUFFER(ctx, srcPtr, bytes) -> host-global resId (>0) or <0.
+// Creates a vertex-buffer resource holding a copy of the app's data (e.g.
+// vertices) and pushes it to the host; the returned id is used in the app's
+// virgl SET_VERTEX_BUFFERS command.
+static int64_t sys_brook_gpu_upload_buffer(uint64_t ctx, uint64_t srcPtr,
+                                           uint64_t bytes, uint64_t,
+                                           uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    const brook::GpuAppOps* ga = brook::GpuAppGet();
+    if (!ga || !ga->BufferUpload) return -ENODEV;
+    if ((int32_t)ctx != proc->gpuAppCtx || proc->gpuAppCtx <= 0) return -EPERM;
+    if (bytes == 0 || bytes > 16u * 1024 * 1024) return -EINVAL;
+    if (!UserBufferReadable(srcPtr, bytes)) return -EFAULT;
+    int32_t r = ga->BufferUpload((int32_t)ctx,
+                                 reinterpret_cast<const void*>(srcPtr), (uint32_t)bytes);
+    return r < 0 ? -EINVAL : r;
+}
+
+// 0xB13: GPU_SUBMIT(ctx, cmdPtr, nDwords) — submit a virgl command stream.
+static int64_t sys_brook_gpu_submit(uint64_t ctx, uint64_t cmdPtr, uint64_t nDwords,
+                                    uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    const brook::GpuAppOps* ga = brook::GpuAppGet();
+    if (!ga || !ga->Submit3D) return -ENODEV;
+    if ((int32_t)ctx != proc->gpuAppCtx || proc->gpuAppCtx <= 0) return -EPERM;
+    if (nDwords == 0 || nDwords > 8192) return -EINVAL;
+    if (!UserBufferReadable(cmdPtr, nDwords * 4)) return -EFAULT;
+    int32_t r = ga->Submit3D((int32_t)ctx, reinterpret_cast<const uint32_t*>(cmdPtr),
+                             (uint32_t)nDwords);
+    return r < 0 ? -EIO : 0;
+}
+
+// 0xB14: GPU_TRANSFER(ctx, resId, dir, w, h) — dir 0=to host, 1=from host.
+static int64_t sys_brook_gpu_transfer(uint64_t ctx, uint64_t resId, uint64_t dir,
+                                      uint64_t w, uint64_t h, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    const brook::GpuAppOps* ga = brook::GpuAppGet();
+    if (!ga || !ga->Transfer3D) return -ENODEV;
+    if ((int32_t)ctx != proc->gpuAppCtx || proc->gpuAppCtx <= 0) return -EPERM;
+    if (w == 0 || h == 0 || w > 8192 || h > 8192) return -EINVAL;
+    int32_t r = ga->Transfer3D((int32_t)ctx, (int32_t)resId, (int)dir,
+                               0, 0, (uint32_t)w, (uint32_t)h, (uint32_t)w, (uint32_t)h);
+    return r < 0 ? -EIO : 0;
+}
+
+// 0xB15: GPU_CTX_DESTROY(ctx) — release the process's GPU context.
+static int64_t sys_brook_gpu_ctx_destroy(uint64_t ctx, uint64_t, uint64_t, uint64_t,
+                                         uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    const brook::GpuAppOps* ga = brook::GpuAppGet();
+    if (!ga || !ga->CtxDestroy) return -ENODEV;
+    if ((int32_t)ctx != proc->gpuAppCtx || proc->gpuAppCtx <= 0) return -EPERM;
+    ga->CtxDestroy((int32_t)ctx);
+    proc->gpuAppCtx = 0;
+    return 0;
+}
+
 // 513: WM_BEGIN_MOVE(wmId)
 //   Begin moving a waylandd-hosted window. Used to honour xdg_toplevel.move
 //   for client-side-decorated windows, where the titlebar click lands in
@@ -12613,6 +12738,14 @@ void SyscallTableInit()
     // Brook windowing extensions live in a high 0xB00 block, clear of the Linux
     // and Windows syscall ranges.
     g_syscallTable[0xB00]                = sys_brook_wm_set_window_properties; // WM_SET_WINDOW_PROPERTIES
+    // App-GPU (per-process virgl) syscalls for userspace GL rendering.
+    g_syscallTable[0xB10]                = sys_brook_gpu_ctx_create;       // GPU_CTX_CREATE
+    g_syscallTable[0xB11]                = sys_brook_gpu_resource_create;  // GPU_RESOURCE_CREATE
+    g_syscallTable[0xB12]                = sys_brook_gpu_attach_window;    // GPU_ATTACH_WINDOW
+    g_syscallTable[0xB16]                = sys_brook_gpu_upload_buffer;    // GPU_UPLOAD_BUFFER
+    g_syscallTable[0xB13]                = sys_brook_gpu_submit;           // GPU_SUBMIT
+    g_syscallTable[0xB14]                = sys_brook_gpu_transfer;         // GPU_TRANSFER
+    g_syscallTable[0xB15]                = sys_brook_gpu_ctx_destroy;      // GPU_CTX_DESTROY
 
     uint32_t count = 0;
     for (uint64_t i = 0; i < SYSCALL_MAX; ++i)

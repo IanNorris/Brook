@@ -17,6 +17,7 @@
 #include "kprintf.h"
 #include "display.h"
 #include "gpu_compositor.h"
+#include "gpu_app.h"
 #include "tty.h"
 #include "compositor.h"
 #include "memory/virtual_memory.h"
@@ -36,12 +37,14 @@ MODULE_IMPORT_SYMBOL(SerialPrintf);
 MODULE_IMPORT_SYMBOL(SerialPuts);
 MODULE_IMPORT_SYMBOL(KPrintf);
 MODULE_IMPORT_SYMBOL(VmmAllocPages);
+MODULE_IMPORT_SYMBOL(VmmFreePages);
 MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 MODULE_IMPORT_SYMBOL(VmmMapPage);
 MODULE_IMPORT_SYMBOL(PmmAllocPages);
 MODULE_IMPORT_SYMBOL(DisplayRegister);
 MODULE_IMPORT_SYMBOL(DisplaySet3DActive);
 MODULE_IMPORT_SYMBOL(GpuCompositorRegister);
+MODULE_IMPORT_SYMBOL(GpuAppRegister);
 MODULE_IMPORT_SYMBOL(TtyGetFramebuffer);
 MODULE_IMPORT_SYMBOL(TtyRemap);
 MODULE_IMPORT_SYMBOL(CompositorRemap);
@@ -125,6 +128,7 @@ static constexpr uint32_t VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM   = 2;
 // 3D (virgl) control commands — virtio 1.2 §5.7.6 / Linux virtio_gpu uapi. Only
 // meaningful once VIRGL is negotiated; gated behind g_gpu3dFeatures.
 static constexpr uint32_t VIRTIO_GPU_CMD_CTX_CREATE            = 0x0200;
+static constexpr uint32_t VIRTIO_GPU_CMD_CTX_DESTROY          = 0x0201;
 static constexpr uint32_t VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE   = 0x0202;
 static constexpr uint32_t VIRTIO_GPU_CMD_RESOURCE_CREATE_3D    = 0x0204;
 static constexpr uint32_t VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D   = 0x0205;
@@ -2264,6 +2268,191 @@ static const uint32_t* CompCaptureFull(uint32_t* outW, uint32_t* outH)
     return g_compFullBuf;
 }
 
+// ===========================================================================
+// App-GPU path: per-process virgl contexts for userspace GL-style rendering.
+// Each app gets its own virgl context + a private resource-id space, kept apart
+// from the compositor's COMP_CTX_ID / COMP_* resources. The app submits virgl
+// command-stream dwords; we relay them via SUBMIT_3D, exactly as the compositor
+// does for its own stream. Resource ids are namespaced per context so apps can
+// use small local ids without colliding with each other or the kernel.
+// ===========================================================================
+static constexpr uint32_t APP_FIRST_CTX  = 0x100;   // app ctx ids start here (1,2 = kernel)
+static constexpr uint32_t APP_RES_STRIDE = 0x1000;  // per-ctx resource-id block
+static constexpr uint32_t APP_RES_BASE   = 0x10000; // app resource ids start here
+static constexpr uint32_t MAX_APP_CTX    = 16;
+struct AppCtx { bool used; uint32_t ctxId; uint32_t pid; };
+static AppCtx g_appCtx[MAX_APP_CTX] = {};
+
+// Kernel bounce-buffers backing app resources uploaded from user memory (e.g.
+// vertex buffers). Tracked so they're freed when the owning context is gone.
+struct AppUpload { bool used; int32_t ctxId; uint64_t vaddr; uint64_t pages; };
+static constexpr uint32_t MAX_APP_UPLOADS = 64;
+static AppUpload g_appUploads[MAX_APP_UPLOADS] = {};
+
+// Map an app's (ctxId, local resId) to a globally-unique host resource id, so an
+// app can pass small local resource ids (1,2,3,...) without collisions.
+static inline uint32_t AppResGlobal(uint32_t ctxId, uint32_t localRes)
+{
+    return APP_RES_BASE + (ctxId - APP_FIRST_CTX) * APP_RES_STRIDE + (localRes & (APP_RES_STRIDE - 1));
+}
+
+// Validate that `gres` is a global resource id inside `ctxId`'s private block.
+// App resource ids are opaque host-global handles: the app receives them from
+// ResourceCreate3D and uses the SAME id both in syscalls AND inside the virgl
+// command streams it submits (where resource ids must be host-global). Bounding
+// each context to its own APP_RES_STRIDE block keeps apps isolated from each
+// other and from the compositor/self-test resources.
+static inline bool AppResValid(int32_t ctxId, uint32_t gres)
+{
+    if (ctxId < (int32_t)APP_FIRST_CTX) return false;
+    uint32_t base = APP_RES_BASE + ((uint32_t)ctxId - APP_FIRST_CTX) * APP_RES_STRIDE;
+    return gres > base && gres < base + APP_RES_STRIDE;
+}
+
+static int32_t AppCtxCreate(uint32_t pid)
+{
+    if (!g_compReady) return -1;
+    for (uint32_t i = 0; i < MAX_APP_CTX; ++i)
+    {
+        if (g_appCtx[i].used) continue;
+        uint32_t ctxId = APP_FIRST_CTX + i;
+        if (!CtxCreate(ctxId, VIRTIO_GPU_CAPSET_VIRGL))
+        { SerialPuts("virtio_gpu: app ctx create failed\n"); return -1; }
+        g_appCtx[i] = { true, ctxId, pid };
+        SerialPrintf("virtio_gpu: app virgl ctx %u for pid %u\n", ctxId, pid);
+        return static_cast<int32_t>(ctxId);
+    }
+    SerialPuts("virtio_gpu: app ctx table full\n");
+    return -1;
+}
+
+static AppCtx* AppCtxFind(int32_t ctxId)
+{
+    if (ctxId < (int32_t)APP_FIRST_CTX) return nullptr;
+    uint32_t i = (uint32_t)ctxId - APP_FIRST_CTX;
+    if (i >= MAX_APP_CTX || !g_appCtx[i].used) return nullptr;
+    return &g_appCtx[i];
+}
+
+static void AppCtxDestroy(int32_t ctxId)
+{
+    AppCtx* c = AppCtxFind(ctxId);
+    if (!c) return;
+    auto* req = reinterpret_cast<VirtioGpuCtrlHdr*>(g_cmdBuf + CMD_REQ_OFF);
+    memset(req, 0, sizeof(*req));
+    req->type   = VIRTIO_GPU_CMD_CTX_DESTROY;
+    req->ctx_id = (uint32_t)ctxId;
+    SubmitCommand(sizeof(*req), CMD_RESP_CAP);
+    c->used = false;
+    // Free any upload bounce-buffers owned by this context.
+    for (uint32_t i = 0; i < MAX_APP_UPLOADS; ++i)
+        if (g_appUploads[i].used && g_appUploads[i].ctxId == ctxId)
+        {
+            VmmFreePages(VirtualAddress(g_appUploads[i].vaddr), g_appUploads[i].pages);
+            g_appUploads[i].used = false;
+        }
+    SerialPrintf("virtio_gpu: app virgl ctx %d destroyed\n", ctxId);
+}
+
+static int32_t AppResourceCreate3D(int32_t ctxId, uint32_t format, uint32_t bind,
+                                   uint32_t w, uint32_t h)
+{
+    AppCtx* c = AppCtxFind(ctxId);
+    if (!c || w == 0 || h == 0) return -1;
+    // Resources are named to the app by their host-global id (1-based per ctx,
+    // mapped into this context's private block) so the app can reference the
+    // same id inside the virgl streams it submits, where ids are host-global.
+    static uint32_t s_localCounter[MAX_APP_CTX] = {};
+    uint32_t i = (uint32_t)ctxId - APP_FIRST_CTX;
+    uint32_t localRes = ++s_localCounter[i];
+    if (localRes >= APP_RES_STRIDE) return -1;
+    uint32_t gres = AppResGlobal((uint32_t)ctxId, localRes);
+    if (!ResourceCreate3D(gres, format, bind, w, h)) return -1;
+    if (!CtxAttachResource((uint32_t)ctxId, gres)) return -1;
+    return static_cast<int32_t>(gres);
+}
+
+static int32_t AppResourceAttachUser(int32_t ctxId, int32_t gres,
+                                     uint64_t vaddr, uint32_t bytes)
+{
+    AppCtx* c = AppCtxFind(ctxId);
+    if (!c || !AppResValid(ctxId, (uint32_t)gres) || bytes == 0) return -1;
+    return ResourceAttachBackingVirt((uint32_t)gres, vaddr, bytes) ? 0 : -1;
+}
+
+// Create a vertex-buffer resource for `ctxId`, back it with a kernel bounce
+// buffer holding a copy of `bytes` from `src` (kernel-readable; the syscall
+// validated it), attach it to the context, and push the contents to the host.
+// Returns the new resource's host-global id (usable directly in the app's virgl
+// SET_VERTEX_BUFFERS command) or <0. The bounce buffer is freed on ctx destroy.
+static int32_t AppBufferUpload(int32_t ctxId, const void* src, uint32_t bytes)
+{
+    AppCtx* c = AppCtxFind(ctxId);
+    if (!c || !src || bytes == 0 || bytes > 16u * 1024 * 1024) return -1;
+    uint32_t slot = MAX_APP_UPLOADS;
+    for (uint32_t i = 0; i < MAX_APP_UPLOADS; ++i)
+        if (!g_appUploads[i].used) { slot = i; break; }
+    if (slot == MAX_APP_UPLOADS) return -1;
+
+    static uint32_t s_bufCounter[MAX_APP_CTX] = {};
+    uint32_t ci = (uint32_t)ctxId - APP_FIRST_CTX;
+    // Buffer ids share the per-ctx block but grow downward from the top so they
+    // never collide with ResourceCreate3D's upward-growing texture ids.
+    uint32_t localRes = (APP_RES_STRIDE - 1) - (++s_bufCounter[ci]);
+    if (s_bufCounter[ci] >= APP_RES_STRIDE / 2) return -1;
+    uint32_t gres = AppResGlobal((uint32_t)ctxId, localRes);
+
+    uint64_t pages = (bytes + 4095) / 4096;
+    VirtualAddress va = VmmAllocPages(pages, VMM_WRITABLE, MemTag::Device, KernelPid);
+    if (!va) return -1;
+    memcpy(reinterpret_cast<void*>(va.raw()), src, bytes);
+    if (!ResourceCreateBuffer(gres, VIRGL_BIND_VERTEX_BUFFER, bytes) ||
+        !ResourceAttachBackingVirt(gres, va.raw(), bytes) ||
+        !CtxAttachResource((uint32_t)ctxId, gres) ||
+        !TransferToHostBuffer((uint32_t)ctxId, gres, bytes))
+    { VmmFreePages(va, pages); return -1; }
+    g_appUploads[slot] = { true, ctxId, va.raw(), pages };
+    return static_cast<int32_t>(gres);
+}
+
+static int32_t AppSubmit3D(int32_t ctxId, const uint32_t* dwords, uint32_t n)
+{
+    AppCtx* c = AppCtxFind(ctxId);
+    if (!c || !dwords || n == 0) return -1;
+    // Bound the stream to the request region (last page is the response buffer).
+    const uint32_t maxDw = ((CMD_PAGES - 1) * 4096 - sizeof(VirtioGpuCmdSubmit)) / 4;
+    if (n > maxDw) return -1;
+    auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
+    memset(sub, 0, sizeof(*sub));
+    sub->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D; sub->hdr.ctx_id = (uint32_t)ctxId;
+    uint32_t* dst = reinterpret_cast<uint32_t*>(g_cmdBuf + CMD_REQ_OFF + sizeof(VirtioGpuCmdSubmit));
+    for (uint32_t i = 0; i < n; ++i) dst[i] = dwords[i];
+    sub->size = n * 4;
+    return CmdRespOk(SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP)) ? 0 : -1;
+}
+
+static int32_t AppTransfer3D(int32_t ctxId, int32_t gres, int dir,
+                             uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                             uint32_t texW, uint32_t texH)
+{
+    AppCtx* c = AppCtxFind(ctxId);
+    if (!c || !AppResValid(ctxId, (uint32_t)gres) || w == 0 || h == 0) return -1;
+    if (dir == 0)
+        return TransferToHost3D((uint32_t)ctxId, (uint32_t)gres, x, y, w, h, texW, texH) ? 0 : -1;
+    return TransferFromHost3D((uint32_t)ctxId, (uint32_t)gres, w, h) ? 0 : -1;
+}
+
+static const brook::GpuAppOps g_gpuAppOps = {
+    "virtio-gpu-app",
+    AppCtxCreate,
+    AppCtxDestroy,
+    AppResourceCreate3D,
+    AppResourceAttachUser,
+    AppBufferUpload,
+    AppSubmit3D,
+    AppTransfer3D,
+};
+
 static const brook::GpuCompositorOps g_gpuCompositorOps = {
     "virtio-gpu-draw",
     CompCreateTexture,
@@ -2948,7 +3137,11 @@ static int VirtioGpuModuleInit()
         if (g_gpu3dWorks && g_fbW && g_fbH)
         {
             if (SetupGpuCompositor(g_fbW, g_fbH))
+            {
                 GpuCompositorRegister(&g_gpuCompositorOps);
+                // Same proven 3D path also backs per-process app GL contexts.
+                GpuAppRegister(&g_gpuAppOps);
+            }
         }
     }
     else
