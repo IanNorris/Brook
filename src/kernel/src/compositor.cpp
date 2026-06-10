@@ -296,6 +296,7 @@ static uint32_t  g_wallpaperHeight = 0;
 static bool      g_gpuComposite   = false;   // BROOK_COMPOSITE=gpu requested
 static GpuTexId  g_desktopTex     = 0;       // g_backBuffer as a texture
 static uint32_t* g_desktopTexPtr  = nullptr; // backing pointer the tex was made for
+static bool      g_desktopTexNeedsFull = true; // force a full desktop upload
 static GpuTexId  g_cursorTex      = 0;       // ARGB cursor sprite
 // Per-window-slot content texture tracking (recreated when the VFB changes).
 struct WinTexEntry { GpuTexId tex; uint32_t* vfb; uint32_t w; uint32_t h; };
@@ -1979,6 +1980,7 @@ static void EnsureDesktopTex(const GpuCompositorOps* gpu)
     g_desktopTex = gpu->CreateTexture(g_backBufStride, g_physFbHeight,
                                       reinterpret_cast<uint64_t>(g_backBuffer), false);
     g_desktopTexPtr = g_backBuffer;
+    g_desktopTexNeedsFull = true;   // upload the whole desktop on first use
 }
 
 // Resolve a window's content source buffer. Wayland windows expose w->vfb;
@@ -2007,7 +2009,7 @@ static bool WindowContentSource(Window* w, uint64_t* vaddr,
     return false;
 }
 
-static void CompositorPresentGPU()
+static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
 {
     const GpuCompositorOps* gpu = GpuCompositorGet();
     if (!gpu) return;
@@ -2015,10 +2017,25 @@ static void CompositorPresentGPU()
     gpu->GetSize(&scrW, &scrH);
     if (scrW == 0 || scrH == 0) return;
 
-    // 1. Desktop layer (wallpaper + chrome + taskbar) from g_backBuffer.
+    // 1. Desktop layer (wallpaper + chrome + taskbar) from g_backBuffer. Upload
+    //    only the changed rows: the desktop is static in steady state (only the
+    //    clock/taskbar and occasional chrome change), so a full 1920x1080
+    //    re-upload every frame would waste ~8MB of DMA. The window content
+    //    layer is a separate texture, so window animation does NOT dirty this.
     EnsureDesktopTex(gpu);
     if (!g_desktopTex) return;
-    gpu->UpdateTexture(g_desktopTex, 0, 0, g_physFbWidth, g_physFbHeight);
+    if (g_desktopTexNeedsFull)
+    {
+        gpu->UpdateTexture(g_desktopTex, 0, 0, g_physFbWidth, g_physFbHeight);
+        g_desktopTexNeedsFull = false;
+    }
+    else if (dirtyMinY < dirtyMaxY)
+    {
+        uint32_t maxY = dirtyMaxY > g_physFbHeight ? g_physFbHeight : dirtyMaxY;
+        if (maxY > dirtyMinY)
+            gpu->UpdateTexture(g_desktopTex, 0, dirtyMinY,
+                               g_physFbWidth, maxY - dirtyMinY);
+    }
 
     // 2. Cursor sprite (ARGB, alpha-blended).
     if (!g_cursorTex)
@@ -2264,11 +2281,15 @@ static void CompositorLoop()
     // uploaded as a texture inside CompositorPresentGPU.
     if (CompositorGpuActive())
     {
-        // Clear the dirty span (decoration changes have been folded into the
-        // desktop texture upload inside the present path).
+        // Capture the desktop dirty span (decoration changes — wallpaper, chrome,
+        // taskbar, clock) for the GPU desktop-texture upload, then reset it. The
+        // window content layer is composited from separate textures, so window
+        // animation does not appear here.
+        uint32_t dMinY = g_dirtyMinY;
+        uint32_t dMaxY = g_dirtyMaxY;
         g_dirtyMinY = 0xFFFFFFFFu;
         g_dirtyMaxY = 0;
-        CompositorPresentGPU();
+        CompositorPresentGPU(dMinY, dMaxY);
     }
     // Flip: copy only dirty scanlines from backbuffer → MMIO framebuffer.
     else if (g_backBuffer && g_dirtyMinY < g_dirtyMaxY)
