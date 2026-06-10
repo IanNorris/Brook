@@ -105,6 +105,7 @@ EXPORT_SYMBOL(PciConfigWrite16);
 
 // Display
 EXPORT_SYMBOL(DisplayRegister);
+EXPORT_SYMBOL(DisplaySet3DActive);
 
 // TTY
 EXPORT_SYMBOL(TtyGetFramebuffer);

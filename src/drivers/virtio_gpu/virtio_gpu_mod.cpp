@@ -39,6 +39,7 @@ MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 MODULE_IMPORT_SYMBOL(VmmMapPage);
 MODULE_IMPORT_SYMBOL(PmmAllocPages);
 MODULE_IMPORT_SYMBOL(DisplayRegister);
+MODULE_IMPORT_SYMBOL(DisplaySet3DActive);
 MODULE_IMPORT_SYMBOL(TtyGetFramebuffer);
 MODULE_IMPORT_SYMBOL(TtyRemap);
 MODULE_IMPORT_SYMBOL(CompositorRemap);
@@ -118,6 +119,14 @@ static constexpr uint32_t VIRTIO_GPU_CAPSET_DRM         = 6;
 
 // Brook framebuffer is Bgr8 (memory bytes B,G,R,X) → B8G8R8X8_UNORM.
 static constexpr uint32_t VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM   = 2;
+
+// 3D (virgl) control commands — virtio 1.2 §5.7.6 / Linux virtio_gpu uapi. Only
+// meaningful once VIRGL is negotiated; gated behind g_gpu3dFeatures.
+static constexpr uint32_t VIRTIO_GPU_CMD_CTX_CREATE            = 0x0200;
+static constexpr uint32_t VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE   = 0x0202;
+static constexpr uint32_t VIRTIO_GPU_CMD_RESOURCE_CREATE_3D    = 0x0204;
+static constexpr uint32_t VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D = 0x0206;
+static constexpr uint32_t VIRTIO_GPU_CMD_SUBMIT_3D             = 0x0207;
 
 // Single framebuffer resource id used for scanout 0.
 static constexpr uint32_t RESOURCE_FB = 1;
@@ -202,6 +211,84 @@ struct __attribute__((packed)) VirtioGpuRespCapsetInfo {
     uint32_t padding;
 };
 
+// 3D (virgl) command structs — Linux virtio_gpu uapi layout.
+struct __attribute__((packed)) VirtioGpuCtxCreate {
+    VirtioGpuCtrlHdr hdr;
+    uint32_t nlen;
+    uint32_t context_init;   // low 8 bits = capset_id when F_CONTEXT_INIT
+    char     debug_name[64];
+};
+
+struct __attribute__((packed)) VirtioGpuCtxResource {
+    VirtioGpuCtrlHdr hdr;
+    uint32_t resource_id;
+    uint32_t padding;
+};
+
+struct __attribute__((packed)) VirtioGpuResourceCreate3D {
+    VirtioGpuCtrlHdr hdr;
+    uint32_t resource_id;
+    uint32_t target;         // PIPE_TEXTURE_2D
+    uint32_t format;         // VIRGL_FORMAT_*
+    uint32_t bind;           // VIRGL_BIND_*
+    uint32_t width;
+    uint32_t height;
+    uint32_t depth;
+    uint32_t array_size;
+    uint32_t last_level;
+    uint32_t nr_samples;
+    uint32_t flags;
+    uint32_t padding;
+};
+
+struct __attribute__((packed)) VirtioGpuBox {
+    uint32_t x, y, z;
+    uint32_t w, h, d;
+};
+
+struct __attribute__((packed)) VirtioGpuTransferHost3D {
+    VirtioGpuCtrlHdr hdr;
+    VirtioGpuBox box;
+    uint64_t offset;
+    uint32_t resource_id;
+    uint32_t level;
+    uint32_t stride;
+    uint32_t layer_stride;
+};
+
+// SUBMIT_3D: followed immediately by `size` bytes of virgl command-stream dwords
+// in the same request buffer.
+struct __attribute__((packed)) VirtioGpuCmdSubmit {
+    VirtioGpuCtrlHdr hdr;
+    uint32_t size;
+    uint32_t padding;
+};
+
+// --- Gallium/virgl encoding constants (virgl_hw.h / virgl_protocol.h) ---
+static constexpr uint32_t VIRGL_FORMAT_B8G8R8X8_UNORM = 2;
+static constexpr uint32_t PIPE_TEXTURE_2D             = 2;
+static constexpr uint32_t VIRGL_BIND_RENDER_TARGET    = 1u << 1;
+static constexpr uint32_t VIRGL_BIND_SAMPLER_VIEW     = 1u << 3;
+static constexpr uint32_t PIPE_CLEAR_COLOR0           = 1u << 2;
+
+// virgl command-stream opcodes + object types.
+static constexpr uint32_t VIRGL_CCMD_CREATE_OBJECT        = 1;
+static constexpr uint32_t VIRGL_CCMD_SET_FRAMEBUFFER_STATE = 5;
+static constexpr uint32_t VIRGL_CCMD_CLEAR               = 7;
+static constexpr uint32_t VIRGL_OBJECT_SURFACE           = 8;
+
+// virgl command header: cmd | (obj_type << 8) | (len_in_dwords << 16).
+static inline uint32_t VirglCmd0(uint32_t cmd, uint32_t obj, uint32_t len)
+{ return cmd | (obj << 8) | (len << 16); }
+
+static inline uint32_t F32Bits(float f)
+{ uint32_t u; __builtin_memcpy(&u, &f, sizeof(u)); return u; }
+
+// Self-test context/resource ids and render-target dimension.
+static constexpr uint32_t CTX_ID_SELFTEST = 1;
+static constexpr uint32_t RES_3D_SELFTEST = 2;
+static constexpr uint32_t SELFTEST_DIM    = 64;
+
 // virtio-gpu device config (virtio 1.2 §5.7.4). num_capsets is meaningful only
 // when VIRGL is negotiated (0 on a plain 2D device).
 enum VirtioGpuConfigReg : uint32_t {
@@ -265,6 +352,8 @@ static uint16_t          g_queueNotifyOff = 0;
 static uint32_t          g_gpu3dFeatures = 0;
 static uint32_t          g_numCapsets = 0;
 static bool              g_haveVenusCapset = false;
+// Set true once the GPU-clear self-test confirms a live host 3D path.
+static bool              g_gpu3dWorks = false;
 
 // controlq (queue 0)
 static uint16_t            g_queueSize = 0;
@@ -763,6 +852,160 @@ static bool VirtioGpuTakeOverDisplay()
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// VirGL 3D bring-up (milestone 1: shader-free GPU CLEAR self-test).
+// ---------------------------------------------------------------------------
+
+static bool CtxCreate(uint32_t ctxId, uint32_t capsetId)
+{
+    auto* req = reinterpret_cast<VirtioGpuCtxCreate*>(g_cmdBuf + CMD_REQ_OFF);
+    memset(req, 0, sizeof(*req));
+    req->hdr.type     = VIRTIO_GPU_CMD_CTX_CREATE;
+    req->hdr.ctx_id   = ctxId;
+    req->context_init = capsetId;   // significant under F_CONTEXT_INIT
+    const char* name = "brook3d";
+    uint32_t n = 0;
+    while (name[n] && n < sizeof(req->debug_name) - 1) { req->debug_name[n] = name[n]; n++; }
+    req->nlen = n;
+    return CmdRespOk(SubmitCommand(sizeof(*req), CMD_RESP_CAP));
+}
+
+static bool CtxAttachResource(uint32_t ctxId, uint32_t resId)
+{
+    auto* req = reinterpret_cast<VirtioGpuCtxResource*>(g_cmdBuf + CMD_REQ_OFF);
+    memset(req, 0, sizeof(*req));
+    req->hdr.type    = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
+    req->hdr.ctx_id  = ctxId;
+    req->resource_id = resId;
+    return CmdRespOk(SubmitCommand(sizeof(*req), CMD_RESP_CAP));
+}
+
+static bool ResourceCreate3D(uint32_t resId, uint32_t format, uint32_t bind,
+                             uint32_t w, uint32_t h)
+{
+    auto* req = reinterpret_cast<VirtioGpuResourceCreate3D*>(g_cmdBuf + CMD_REQ_OFF);
+    memset(req, 0, sizeof(*req));
+    req->hdr.type    = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    req->resource_id = resId;
+    req->target      = PIPE_TEXTURE_2D;
+    req->format      = format;
+    req->bind        = bind;
+    req->width       = w;
+    req->height      = h;
+    req->depth       = 1;
+    req->array_size  = 1;
+    return CmdRespOk(SubmitCommand(sizeof(*req), CMD_RESP_CAP));
+}
+
+static bool TransferFromHost3D(uint32_t ctxId, uint32_t resId, uint32_t w, uint32_t h)
+{
+    auto* req = reinterpret_cast<VirtioGpuTransferHost3D*>(g_cmdBuf + CMD_REQ_OFF);
+    memset(req, 0, sizeof(*req));
+    req->hdr.type     = VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D;
+    req->hdr.ctx_id   = ctxId;
+    req->box.w        = w;
+    req->box.h        = h;
+    req->box.d        = 1;
+    req->resource_id  = resId;
+    req->stride       = w * 4;
+    req->layer_stride = w * h * 4;
+    return CmdRespOk(SubmitCommand(sizeof(*req), CMD_RESP_CAP));
+}
+
+// Build + submit a virgl command stream that creates a render-target surface
+// over `resId`, binds it as the sole colour buffer, and CLEARs it to (r,g,b,a).
+// No shaders — CLEAR is the one genuinely fixed-function virgl op.
+static bool Submit3DClear(uint32_t ctxId, uint32_t resId,
+                          float r, float g, float b, float a)
+{
+    auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
+    memset(sub, 0, sizeof(*sub));
+    sub->hdr.type   = VIRTIO_GPU_CMD_SUBMIT_3D;
+    sub->hdr.ctx_id = ctxId;
+
+    uint32_t* dw = reinterpret_cast<uint32_t*>(
+        g_cmdBuf + CMD_REQ_OFF + sizeof(VirtioGpuCmdSubmit));
+    uint32_t n = 0;
+    const uint32_t kSurface = 1;
+
+    // CREATE_OBJECT SURFACE (payload 5 dwords) over the render-target texture.
+    dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SURFACE, 5);
+    dw[n++] = kSurface;
+    dw[n++] = resId;
+    dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;
+    dw[n++] = 0;   // texture level
+    dw[n++] = 0;   // texture layers (first | last << 16)
+
+    // SET_FRAMEBUFFER_STATE (payload nr_cbufs+2 = 3): 1 colour buffer, no zsurf.
+    dw[n++] = VirglCmd0(VIRGL_CCMD_SET_FRAMEBUFFER_STATE, 0, 3);
+    dw[n++] = 1;          // nr_cbufs
+    dw[n++] = 0;          // zsurf handle
+    dw[n++] = kSurface;   // cbuf[0]
+
+    // CLEAR (payload 8): colour0 only; depth (double) + stencil zeroed.
+    dw[n++] = VirglCmd0(VIRGL_CCMD_CLEAR, 0, 8);
+    dw[n++] = PIPE_CLEAR_COLOR0;
+    dw[n++] = F32Bits(r); dw[n++] = F32Bits(g);
+    dw[n++] = F32Bits(b); dw[n++] = F32Bits(a);
+    dw[n++] = 0; dw[n++] = 0;   // depth
+    dw[n++] = 0;                // stencil
+
+    sub->size = n * 4;
+    return CmdRespOk(SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP));
+}
+
+// Shader-free GPU self-test: create a 3D context + a render-target texture,
+// CLEAR it green on the host GPU via SUBMIT_3D, transfer the rendered pixels
+// back into guest RAM, and verify the readback. Proves the whole 3D context/
+// resource/submit/transfer path end-to-end, verifiable over serial (no GL
+// screendump readback needed). Lights the taskbar 3D badge on success.
+static void VirtioGpu3DSelfTest()
+{
+    if (!(g_gpu3dFeatures & VIRTIO_GPU_F_VIRGL))
+        return;   // 2D device — nothing to test.
+
+    const uint32_t dim   = SELFTEST_DIM;
+    const uint32_t bytes = dim * dim * 4;
+    const uint32_t pages = AlignUp(bytes, 4096) / 4096;
+
+    PhysicalAddress phys = PmmAllocPages(pages, MemTag::Device, KernelPid);
+    if (!phys) { SerialPuts("virtio_gpu: 3D self-test backing alloc failed\n"); return; }
+    uint32_t* readback = reinterpret_cast<uint32_t*>(PhysToVirt(phys).raw());
+    memset(readback, 0, bytes);
+
+    if (!CtxCreate(CTX_ID_SELFTEST, VIRTIO_GPU_CAPSET_VIRGL))
+    { SerialPuts("virtio_gpu: 3D self-test CTX_CREATE failed\n"); return; }
+    if (!ResourceCreate3D(RES_3D_SELFTEST, VIRGL_FORMAT_B8G8R8X8_UNORM,
+                          VIRGL_BIND_RENDER_TARGET | VIRGL_BIND_SAMPLER_VIEW, dim, dim))
+    { SerialPuts("virtio_gpu: 3D self-test RESOURCE_CREATE_3D failed\n"); return; }
+    if (!ResourceAttachBackingContig(RES_3D_SELFTEST, phys.raw(), bytes))
+    { SerialPuts("virtio_gpu: 3D self-test ATTACH_BACKING failed\n"); return; }
+    if (!CtxAttachResource(CTX_ID_SELFTEST, RES_3D_SELFTEST))
+    { SerialPuts("virtio_gpu: 3D self-test CTX_ATTACH_RESOURCE failed\n"); return; }
+
+    // Clear to opaque green (R=0, G=1, B=0, A=1).
+    if (!Submit3DClear(CTX_ID_SELFTEST, RES_3D_SELFTEST, 0.0f, 1.0f, 0.0f, 1.0f))
+    { SerialPuts("virtio_gpu: 3D self-test SUBMIT_3D(clear) failed\n"); return; }
+    if (!TransferFromHost3D(CTX_ID_SELFTEST, RES_3D_SELFTEST, dim, dim))
+    { SerialPuts("virtio_gpu: 3D self-test TRANSFER_FROM_HOST_3D failed\n"); return; }
+
+    // B8G8R8X8 green readback = bytes [B=0, G=0xFF, R=0, X] = 0x0000FF00 LE.
+    uint32_t px = readback[0];
+    uint32_t b  = (px >> 0)  & 0xFF;
+    uint32_t g  = (px >> 8)  & 0xFF;
+    uint32_t r  = (px >> 16) & 0xFF;
+    bool green = (g > 0xC0) && (r < 0x40) && (b < 0x40);
+    SerialPrintf("virtio_gpu: 3D self-test readback px[0]=0x%08x (r=%u g=%u b=%u) -> %s\n",
+                 px, r, g, b, green ? "PASS" : "FAIL");
+
+    if (green)
+    {
+        g_gpu3dWorks = true;
+        DisplaySet3DActive(true);
+        KPrintf("virtio_gpu: host 3D (virgl) acceleration confirmed live\n");
+    }
+}
+
 
 static int VirtioGpuModuleInit()
 {
@@ -892,6 +1135,12 @@ static int VirtioGpuModuleInit()
     // Phase A: enumerate host 3D capsets (no-op on a 2D device). This proves the
     // VIRGL negotiation + capset-query path that the Venus/DRM bring-up builds on.
     QueryCapsets();
+
+    // Milestone 1 of the VirGL fixed-function compositor path: a shader-free
+    // GPU-clear self-test that proves the 3D context/resource/SUBMIT_3D/transfer
+    // path end-to-end (and lights the taskbar 3D badge on success). Runs on both
+    // primary and secondary heads; no-op on a 2D device.
+    VirtioGpu3DSelfTest();
 
     // Take over the display only when we are the PRIMARY device — i.e. a
     // VGA-class device (virtio-vga, PCI subclass 0x00) that provided the boot

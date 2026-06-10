@@ -64,4 +64,12 @@ uint64_t DisplayGetFramebufferPhys();
 // linear FBs; virtio-gpu uses it to transfer + flush the damaged region.
 void DisplayFlush(uint32_t minY, uint32_t maxY);
 
+// 3D-acceleration status. A display driver that has proven a live host 3D
+// (virgl/Venus) command path — e.g. the virtio-gpu driver's GPU-clear
+// self-test passing — calls DisplaySet3DActive(true). The taskbar reads
+// DisplayIs3DActive() to surface an at-a-glance "GPU 3D live" indicator.
+// extern "C" so loadable display modules can import the setter.
+extern "C" void DisplaySet3DActive(bool active);
+bool DisplayIs3DActive();
+
 } // namespace brook

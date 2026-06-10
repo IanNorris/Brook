@@ -103,4 +103,23 @@ void DisplayFlush(uint32_t minY, uint32_t maxY)
     g_activeDisplay->Flush(minY, maxY);
 }
 
+// ---------------------------------------------------------------------------
+// 3D-acceleration status (set by the virtio-gpu driver once its host 3D path
+// is proven; read by the taskbar GPU badge).
+// ---------------------------------------------------------------------------
+
+static bool g_display3dActive = false;
+
+extern "C" void DisplaySet3DActive(bool active)
+{
+    if (active != g_display3dActive)
+        SerialPrintf("DISPLAY: 3D acceleration %s\n", active ? "ACTIVE" : "inactive");
+    g_display3dActive = active;
+}
+
+bool DisplayIs3DActive()
+{
+    return g_display3dActive;
+}
+
 } // namespace brook

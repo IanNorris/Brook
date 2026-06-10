@@ -1129,8 +1129,13 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
                          disp->name[1] == 'i' &&
                          disp->name[2] == 'r' &&
                          disp->name[3] == 't';
-        // green when active, muted grey otherwise.
-        uint32_t badgeFg = gpuActive ? 0x0040E060u : 0x00606070u;
+        // Three states: cyan when host 3D (virgl) acceleration is confirmed live
+        // (GPU-clear self-test passed); green when the virtio-gpu driver owns the
+        // display (accelerated presentation, no 3D yet); muted grey on the
+        // software (GOP/stdvga) path.
+        uint32_t badgeFg = brook::DisplayIs3DActive() ? 0x0030D0FFu
+                         : gpuActive                  ? 0x0040E060u
+                         :                              0x00606070u;
 
         uint32_t labelW = 0;
         for (const char* p = gpuLabel; *p; p++)
