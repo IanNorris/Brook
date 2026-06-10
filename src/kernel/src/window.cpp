@@ -416,8 +416,10 @@ WmHitResult WmHitTest(int32_t mx, int32_t my)
         int relX = mx - wx;
         int relY = my - wy;
 
-        // Close button (top-right)
-        int closeBtnX = ww - static_cast<int>(WM_BORDER_WIDTH) - static_cast<int>(WM_BUTTON_WIDTH);
+        // Close button (top-right). The rectangular hot spot spans the full
+        // button cell, which bounds the slanted parallelogram (incl. its slant
+        // overhang) plus WM_BTN_RIGHT_PAD; the slanted area is fully clickable.
+        int closeBtnX = ww - static_cast<int>(WM_BORDER_WIDTH) - WM_BTN_RIGHT_PAD - static_cast<int>(WM_BUTTON_WIDTH);
         if (relY < static_cast<int>(WM_TITLE_BAR_HEIGHT) &&
             relX >= closeBtnX && relX < closeBtnX + static_cast<int>(WM_BUTTON_WIDTH))
         {
@@ -909,7 +911,7 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
 
     // Title text — clipped to avoid overlapping chrome buttons
     int textY = titleY + (titleH - g_fontAtlas.lineHeight) / 2;
-    int titleMaxW = titleW - WM_TITLE_TEXT_PAD_X - 3 * static_cast<int>(WM_BUTTON_WIDTH) - 4;
+    int titleMaxW = titleW - WM_TITLE_TEXT_PAD_X - 3 * static_cast<int>(WM_BUTTON_WIDTH) - WM_BTN_RIGHT_PAD - 4;
     if (titleMaxW < 0) titleMaxW = 0;
     WmRenderString(buf, stride, screenW, screenH,
                    titleX + WM_TITLE_TEXT_PAD_X, textY, w.title,
@@ -934,8 +936,9 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
         WmFillRect(buf, stride, screenW, screenH, x, y, 1, len, fg);
     };
 
-    // Close button (rightmost) — red glass, engraved ×.
-    int closeBtnX = wx + ow - static_cast<int>(WM_BORDER_WIDTH) - static_cast<int>(WM_BUTTON_WIDTH);
+    // Close button (rightmost) — red glass, engraved ×. WM_BTN_RIGHT_PAD leaves a
+    // little breathing room between the close button and the window's right border.
+    int closeBtnX = wx + ow - static_cast<int>(WM_BORDER_WIDTH) - WM_BTN_RIGHT_PAD - static_cast<int>(WM_BUTTON_WIDTH);
     bool closeHover = mouseX >= closeBtnX && mouseX < closeBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
                       mouseY >= titleY && mouseY < titleY + titleH;
     int closeBx = closeBtnX + hInset;

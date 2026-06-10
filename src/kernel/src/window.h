@@ -41,7 +41,8 @@ static constexpr uint32_t WM_BORDER_UNFOCUSED   = 0x00565A66; // slate edge
 static constexpr uint32_t WM_TITLE_SHEEN_FOCUSED   = 0x00AFD6F5; // 1px top glass sheen
 static constexpr uint32_t WM_TITLE_SHEEN_UNFOCUSED = 0x00707682; // 1px top highlight
 static constexpr uint8_t  WM_CHROME_TITLE_ALPHA = 0xD8;       // ~85% opaque titlebar (glass)
-static constexpr int      WM_BTN_SLANT          = 8;         // ~20deg shear on the button's vertical sides
+static constexpr int      WM_BTN_SLANT          = 6;         // ~15deg shear on the button's vertical sides
+static constexpr int      WM_BTN_RIGHT_PAD      = 4;         // extra gap between the close button and the right border
 // Caption button glass fill (vertical gradient) + faux-engraved bevel edges.
 static constexpr uint32_t WM_BTN_TOP            = 0x004E84C0; // button glass top
 static constexpr uint32_t WM_BTN_BOT            = 0x002B568E; // button glass bottom
