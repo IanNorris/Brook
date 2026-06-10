@@ -1274,6 +1274,9 @@ static void VirtioGpu3DSelfTest()
 static constexpr uint32_t COMP_CTX_ID       = 2;     // separate from self-test ctx 1
 static constexpr uint32_t COMP_SCANOUT_RES  = 16;    // scanout render-target
 static constexpr uint32_t COMP_SCANOUT_SURF = 1;     // virgl surface object handle
+static constexpr uint32_t COMP_THUMB_RES    = 15;    // downscale thumbnail RT
+static constexpr uint32_t COMP_THUMB_W      = 256;   // thumbnail size (16:9-ish)
+static constexpr uint32_t COMP_THUMB_H      = 144;
 static constexpr uint32_t COMP_FIRST_TEX_RES = 17;   // texture resource ids from here
 
 static bool     g_compReady       = false;   // ops set up + scanout RT created
@@ -1282,6 +1285,8 @@ static uint32_t g_compScanoutW    = 0;
 static uint32_t g_compScanoutH    = 0;
 static uint32_t g_compNextRes     = COMP_FIRST_TEX_RES;
 static uint32_t g_composeN        = 0;       // dwords accumulated in compose stream
+static uint64_t g_compThumbPhys   = 0;       // thumbnail RT readback backing (phys)
+static uint32_t* g_compThumbBuf   = nullptr; // thumbnail RT readback backing (virt)
 
 struct GpuTexture { uint32_t resId; uint32_t w; uint32_t h; uint32_t format; bool used; };
 static constexpr uint32_t MAX_GPU_TEXTURES = 128;
@@ -1327,6 +1332,34 @@ static bool SetupGpuCompositor(uint32_t w, uint32_t h)
 
     g_compScanoutW = w;
     g_compScanoutH = h;
+
+    // Thumbnail readback RT: a small render-target with a contiguous backing.
+    // CaptureThumb BLITs the full scanout into this (downscaled) and reads it
+    // back for in-guest visual verification (no host display needed).
+    {
+        uint32_t tbytes = COMP_THUMB_W * COMP_THUMB_H * 4;
+        PhysicalAddress tphys = PmmAllocPages(AlignUp(tbytes, 4096) / 4096,
+                                              MemTag::Device, KernelPid);
+        if (tphys)
+        {
+            g_compThumbPhys = tphys.raw();
+            g_compThumbBuf  = reinterpret_cast<uint32_t*>(PhysToVirt(tphys).raw());
+            memset(g_compThumbBuf, 0, tbytes);
+            if (ResourceCreate3D(COMP_THUMB_RES, VIRGL_FORMAT_B8G8R8X8_UNORM,
+                                 VIRGL_BIND_RENDER_TARGET | VIRGL_BIND_SAMPLER_VIEW,
+                                 COMP_THUMB_W, COMP_THUMB_H) &&
+                ResourceAttachBackingContig(COMP_THUMB_RES, g_compThumbPhys, tbytes))
+            {
+                CtxAttachResource(COMP_CTX_ID, COMP_THUMB_RES);
+            }
+            else
+            {
+                g_compThumbBuf = nullptr;   // thumbnail unavailable; non-fatal
+                SerialPuts("virtio_gpu: comp thumbnail RT unavailable\n");
+            }
+        }
+    }
+
     g_compReady    = true;
     SerialPrintf("virtio_gpu: GPU compositor ready (scanout RT %ux%u)\n", w, h);
     return true;
@@ -1471,6 +1504,44 @@ static void CompGetSize(uint32_t* w, uint32_t* h)
     if (h) *h = g_compScanoutH;
 }
 
+// BLIT the full presented scanout into the small thumbnail RT (downscaled),
+// read it back, and copy it out. Returns the pixel count (0 on failure).
+static uint32_t CompCaptureThumb(uint32_t* out, uint32_t maxPixels,
+                                 uint32_t* outW, uint32_t* outH)
+{
+    if (!g_compReady || !g_compThumbBuf || !out) return 0;
+
+    // One-BLIT submit: scanout (full) -> thumbnail (scaled down).
+    auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
+    memset(sub, 0, sizeof(*sub));
+    sub->hdr.type   = VIRTIO_GPU_CMD_SUBMIT_3D;
+    sub->hdr.ctx_id = COMP_CTX_ID;
+    uint32_t* dw = ComposeDwBase();
+    uint32_t n = 0;
+    uint32_t s0 = (VIRGL_BLIT_MASK_RGBA & 0xFF) | ((VIRGL_TEX_FILTER_NEAREST & 0x3) << 8);
+    dw[n++] = VirglCmd0(VIRGL_CCMD_BLIT, 0, 21);
+    dw[n++] = s0; dw[n++] = 0; dw[n++] = 0;
+    dw[n++] = COMP_THUMB_RES; dw[n++] = 0; dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;
+    dw[n++] = 0; dw[n++] = 0; dw[n++] = 0;
+    dw[n++] = COMP_THUMB_W; dw[n++] = COMP_THUMB_H; dw[n++] = 1;
+    dw[n++] = COMP_SCANOUT_RES; dw[n++] = 0; dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;
+    dw[n++] = 0; dw[n++] = 0; dw[n++] = 0;
+    dw[n++] = g_compScanoutW; dw[n++] = g_compScanoutH; dw[n++] = 1;
+    sub->size = n * 4;
+    if (!CmdRespOk(SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP)))
+        return 0;
+
+    if (!TransferFromHost3D(COMP_CTX_ID, COMP_THUMB_RES, COMP_THUMB_W, COMP_THUMB_H))
+        return 0;
+
+    uint32_t count = COMP_THUMB_W * COMP_THUMB_H;
+    if (count > maxPixels) count = maxPixels;
+    for (uint32_t i = 0; i < count; ++i) out[i] = g_compThumbBuf[i];
+    if (outW) *outW = COMP_THUMB_W;
+    if (outH) *outH = COMP_THUMB_H;
+    return count;
+}
+
 static const brook::GpuCompositorOps g_gpuCompositorOps = {
     "virtio-gpu-blit",
     CompCreateTexture,
@@ -1480,6 +1551,7 @@ static const brook::GpuCompositorOps g_gpuCompositorOps = {
     CompBlit,
     CompEndFrame,
     CompGetSize,
+    CompCaptureThumb,
 };
 
 // Readback self-test of the real compositor ops: build a scattered-backed

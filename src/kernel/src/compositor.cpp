@@ -294,6 +294,8 @@ static uint32_t  g_wallpaperHeight = 0;
 // Default off → CPU path unchanged.
 // ---------------------------------------------------------------------------
 static bool      g_gpuComposite   = false;   // BROOK_COMPOSITE=gpu requested
+static bool      g_gpuThumbDump   = false;   // BROOK_GPU_THUMB: base64 thumbnail over serial
+static uint64_t  g_lastThumbTick  = 0;
 static GpuTexId  g_desktopTex     = 0;       // g_backBuffer as a texture
 static uint32_t* g_desktopTexPtr  = nullptr; // backing pointer the tex was made for
 static bool      g_desktopTexNeedsFull = true; // force a full desktop upload
@@ -370,6 +372,15 @@ void CompositorInit()
     {
         g_gpuComposite = true;
         SerialPuts("COMPOSITOR: GPU composition requested (BROOK_COMPOSITE=gpu)\n");
+    }
+
+    // Optional: dump a base64 thumbnail of the GPU-composited scanout over serial
+    // every few seconds, for in-guest visual verification (no host display).
+    char thumb[8] = {};
+    if (FwCfgReadFile("opt/gputhumb", thumb, sizeof(thumb) - 1) >= 1 && thumb[0] == '1')
+    {
+        g_gpuThumbDump = true;
+        SerialPuts("COMPOSITOR: GPU thumbnail serial dump enabled (BROOK_GPU_THUMB=1)\n");
     }
 }
 
@@ -1948,6 +1959,53 @@ static void CompositorDrawClock()
     MarkDirtyRows(y, y + lineH + 2);
 }
 
+// Dump a base64-encoded RGB thumbnail of the GPU-composited scanout over serial,
+// delimited by markers so the host can extract + decode it to a PNG. This gives
+// in-guest visual verification of the composited desktop without a host display.
+static void DumpGpuThumbnail()
+{
+    const GpuCompositorOps* gpu = GpuCompositorGet();
+    if (!gpu || !gpu->CaptureThumb) return;
+
+    static uint32_t thumb[256 * 144];   // BGRA pixels from CaptureThumb
+    uint32_t tw = 0, th = 0;
+    uint32_t count = gpu->CaptureThumb(thumb, 256 * 144, &tw, &th);
+    if (count == 0 || tw == 0 || th == 0) return;
+
+    SerialPrintf("GPUTHUMB BEGIN %u %u\n", tw, th);
+
+    static const char b64[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    char line[97];   // 72 base64 chars per line + NUL
+    uint32_t li = 0;
+
+    // Emit RGB (3 bytes/pixel) from BGRA, base64 in 3-byte groups.
+    uint8_t grp[3]; uint32_t gi = 0;
+    auto flushGroup = [&](uint32_t valid) {
+        uint32_t v = (grp[0] << 16) | (grp[1] << 8) | grp[2];
+        line[li++] = b64[(v >> 18) & 0x3F];
+        line[li++] = b64[(v >> 12) & 0x3F];
+        line[li++] = (valid > 1) ? b64[(v >> 6) & 0x3F] : '=';
+        line[li++] = (valid > 2) ? b64[v & 0x3F] : '=';
+        if (li >= 72) { line[li] = '\0'; SerialPuts(line); SerialPuts("\n"); li = 0; }
+    };
+
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        uint32_t px = thumb[i];
+        grp[gi++] = (px >> 16) & 0xFF;  // R
+        if (gi == 3) { flushGroup(3); gi = 0; }
+        grp[gi++] = (px >> 8) & 0xFF;   // G
+        if (gi == 3) { flushGroup(3); gi = 0; }
+        grp[gi++] = px & 0xFF;          // B
+        if (gi == 3) { flushGroup(3); gi = 0; }
+    }
+    if (gi > 0) { for (uint32_t k = gi; k < 3; ++k) grp[k] = 0; flushGroup(gi); }
+    if (li > 0) { line[li] = '\0'; SerialPuts(line); SerialPuts("\n"); }
+
+    SerialPuts("GPUTHUMB END\n");
+}
+
 // ---------------------------------------------------------------------------
 // GPU composition present path. Composes the frame on the GPU via BLITs into
 // the scanout render-target and presents it. The CPU has already rendered the
@@ -2290,6 +2348,17 @@ static void CompositorLoop()
         g_dirtyMinY = 0xFFFFFFFFu;
         g_dirtyMaxY = 0;
         CompositorPresentGPU(dMinY, dMaxY);
+
+        // Periodic thumbnail dump for in-guest visual verification.
+        if (g_gpuThumbDump)
+        {
+            uint64_t now = g_lapicTickCount;
+            if (now - g_lastThumbTick >= 5000)
+            {
+                g_lastThumbTick = now;
+                DumpGpuThumbnail();
+            }
+        }
     }
     // Flip: copy only dirty scanlines from backbuffer → MMIO framebuffer.
     else if (g_backBuffer && g_dirtyMinY < g_dirtyMaxY)

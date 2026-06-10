@@ -54,6 +54,14 @@ struct GpuCompositorOps {
 
     // Scanout dimensions (== display size).
     void (*GetSize)(uint32_t* w, uint32_t* h);
+
+    // Capture a downscaled thumbnail of the last presented scanout into `out`
+    // (BGRA, up to `maxPixels`). BLITs the full scanout RT into a small
+    // thumbnail render-target, reads it back, and copies it out. Sets *outW/*outH
+    // to the thumbnail dimensions and returns the pixel count (0 on failure).
+    // Used for in-guest visual verification without a host display.
+    uint32_t (*CaptureThumb)(uint32_t* out, uint32_t maxPixels,
+                             uint32_t* outW, uint32_t* outH);
 };
 
 // Register the GPU compositor ops (called by the display driver once its 3D

@@ -344,6 +344,9 @@ FWCFG_OPTS=""
 if [ -n "${BROOK_COMPOSITE:-}" ]; then
     FWCFG_OPTS="-fw_cfg name=opt/composite,string=${BROOK_COMPOSITE}"
 fi
+if [ "${BROOK_GPU_THUMB:-0}" = "1" ]; then
+    FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/gputhumb,string=1"
+fi
 
 # GPU device selection.
 #   default            : stdvga (q35) primary + virtio-gpu-pci secondary head.
