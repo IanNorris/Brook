@@ -230,6 +230,10 @@ void WmSetClientSideDecoration(int idx, bool enable);
 static constexpr uint32_t WM_PROP_OPACITY = 1u << 0;  // apply opacity arg
 static constexpr uint32_t WM_PROP_BLUR    = 1u << 1;  // apply blurRadius arg
 
+// Frosted-glass preset applied by the Super+G window toggle.
+static constexpr uint8_t  WM_GLASS_OPACITY = 200;     // translucent client (frost reads through)
+static constexpr uint8_t  WM_GLASS_BLUR    = 4;       // backdrop blur radius
+
 // Set per-window opacity and/or backdrop blur radius (selected by `mask`).
 // Marks the compositor dirty. The GPU DRAW path reads these per window.
 void WmSetWindowProperties(int idx, uint32_t mask, uint8_t opacity, uint8_t blurRadius);

@@ -61,9 +61,9 @@ static long wm_set_opacity(uint32_t id, unsigned op) {
                    (long)WM_PROP_OPACITY, (long)op, 0L);
 }
 
-static long wm_set_blur(uint32_t id, unsigned radius) {
+static long wm_set_glass(uint32_t id, unsigned opacity, unsigned radius) {
     return syscall(BROOK_WM_SET_WINDOW_PROPERTIES, (long)id,
-                   (long)WM_PROP_BLUR, 0L, (long)radius);
+                   (long)(WM_PROP_OPACITY | WM_PROP_BLUR), (long)opacity, (long)radius);
 }
 
 static void fill(uint32_t* fb, uint32_t stride, uint16_t w, uint16_t h,
@@ -124,9 +124,10 @@ int main(void) {
     // via its own opacity (no demo hook), so the wallpaper shows through it.
     long pr = wm_set_opacity(A.info.wm_id, 140);
     printf("wmtest: set A opacity=140 -> %ld\n", pr);
-    // Window B: frosted-glass titlebar (backdrop blur) at full opacity.
-    long pb = wm_set_blur(B.info.wm_id, 4);
-    printf("wmtest: set B blur=4 -> %ld\n", pb);
+    // Window B: full-window frosted glass (translucent client + backdrop blur)
+    // set by the app itself via the property syscall — per-window, no demo hook.
+    long pb = wm_set_glass(B.info.wm_id, 200, 6);
+    printf("wmtest: set B glass(opacity=200,blur=6) -> %ld\n", pb);
 
     redraw(&A);
     redraw(&B);

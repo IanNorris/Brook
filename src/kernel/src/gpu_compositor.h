@@ -91,9 +91,10 @@ struct GpuCompositorOps {
     // window content) is the "backdrop". At present time the compositor snapshots
     // the scanout at this point, downsamples + gaussian-blurs it, and makes it
     // available to subsequent DrawQuad(GPU_TEX_BLUR_BACKDROP, ...) calls so a
-    // window's titlebar can show frosted glass. No-op if blur is unsupported;
-    // optional (only call when at least one window requests blur).
-    void (*BlurBarrier)();
+    // window can show frosted glass. `strength` is the app-requested blur amount
+    // (a window's blurRadius; the compositor passes the max across glass windows)
+    // and scales how wide the blur is. No-op if blur is unsupported.
+    void (*BlurBarrier)(uint32_t strength);
 };
 
 // Register the GPU compositor ops (called by the display driver once its 3D

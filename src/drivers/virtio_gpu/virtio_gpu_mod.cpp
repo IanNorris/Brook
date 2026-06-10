@@ -1396,6 +1396,7 @@ static uint32_t  g_blurBView     = 0;        // sampler view for COMP_BLUR_B_RES
 static uint64_t  g_blurVtxPhys   = 0;
 static uint32_t* g_blurVtxBuf    = nullptr;
 static uint32_t  g_blurBarrier   = 0xFFFFFFFFu; // quad index at the backdrop barrier (none = no blur this frame)
+static uint32_t  g_blurStrength  = 0;        // app-requested blur amount (scales gaussian iterations)
 // Quad flags.
 static constexpr uint32_t QUAD_SAMPLE_BLUR = 1u << 0;  // sample the blurred backdrop (sview ignored)
 // One recorded quad (filled by CompDrawQuad, consumed by CompEndFrame). Dst is in
@@ -1971,11 +1972,13 @@ static void CompDrawQuad(GpuTexId src,
 }
 
 // Record the backdrop barrier: subsequent GPU_TEX_BLUR_BACKDROP quads sample the
-// blur of everything recorded before this point. Records the split index.
-static void CompBlurBarrier()
+// blur of everything recorded before this point. Records the split index and the
+// app-requested blur strength (scales the number of gaussian iterations).
+static void CompBlurBarrier(uint32_t strength)
 {
     if (!g_blurReady) return;
     g_blurBarrier = g_drawQuadCount;
+    g_blurStrength = strength;
 }
 
 
@@ -2044,7 +2047,12 @@ static void CompEndFrameDraw()
         // composite normally. One stream, in order — the host serializes it.
         if (g_blurBarrier == i && g_blurReady)
         {
-            if (n + 80 > (CMD_PAGES - 1) * 1024) { /* no room for blur */ }
+            // Iterations scale with the app-requested blur strength (a window's
+            // blurRadius): each extra H/V gaussian pair widens the effective blur.
+            uint32_t iters = (g_blurStrength + 3) / 4;   // radius 4->1, 8->2, ...
+            if (iters < 1) iters = 1;
+            if (iters > 4) iters = 4;                     // cap cost
+            if (n + 40 + iters * 30 > (CMD_PAGES - 1) * 1024) { /* no room */ }
             else
             {
                 const int32_t bw = static_cast<int32_t>(COMP_BLUR_W);
@@ -2059,7 +2067,7 @@ static void CompEndFrameDraw()
                 dw[n++] = COMP_SCANOUT_RES; dw[n++] = 0; dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;
                 dw[n++] = 0; dw[n++] = 0; dw[n++] = 0;
                 dw[n++] = static_cast<uint32_t>(W); dw[n++] = static_cast<uint32_t>(H); dw[n++] = 1;
-                // Opaque blend + linear sampler + blur vertex buffer for both passes.
+                // Opaque blend + linear sampler + blur vertex buffer + blur viewport.
                 dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_OBJECT, VIRGL_OBJECT_BLEND, 1); dw[n++] = DRAW_BLEND;
                 dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_SAMPLER_STATES, 0, 3);
                 dw[n++] = PIPE_SHADER_FRAGMENT; dw[n++] = 0; dw[n++] = DRAW_SAMP_LIN;
@@ -2069,26 +2077,30 @@ static void CompEndFrameDraw()
                 dw[n++] = IntToF32Bits(bw / 2); dw[n++] = IntToF32Bits(bh / 2); dw[n++] = F32Bits(0.0f);
                 dw[n++] = VirglCmd0(VIRGL_CCMD_SET_VERTEX_BUFFERS, 0, 3);
                 dw[n++] = 20; dw[n++] = 0; dw[n++] = COMP_BLURVTX_RES;
-                // H pass: BLUR_A -> BLUR_B.
-                dw[n++] = VirglCmd0(VIRGL_CCMD_SET_FRAMEBUFFER_STATE, 0, 3);
-                dw[n++] = 1; dw[n++] = 0; dw[n++] = BLUR_B_SURF;
-                dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_SHADER, 0, 2); dw[n++] = DRAW_FS_BLURH; dw[n++] = PIPE_SHADER_FRAGMENT;
-                dw[n++] = VirglCmd0(VIRGL_CCMD_SET_SAMPLER_VIEWS, 0, 3);
-                dw[n++] = PIPE_SHADER_FRAGMENT; dw[n++] = 0; dw[n++] = g_blurAView;
-                dw[n++] = VirglCmd0(VIRGL_CCMD_DRAW_VBO, 0, 12);
-                dw[n++] = 0; dw[n++] = 4; dw[n++] = PIPE_PRIM_TRIANGLE_STRIP; dw[n++] = 0;
-                dw[n++] = 1; dw[n++] = 0; dw[n++] = 0; dw[n++] = 0;
-                dw[n++] = 0; dw[n++] = 0; dw[n++] = 3; dw[n++] = 0;
-                // V pass: BLUR_B -> BLUR_A.
-                dw[n++] = VirglCmd0(VIRGL_CCMD_SET_FRAMEBUFFER_STATE, 0, 3);
-                dw[n++] = 1; dw[n++] = 0; dw[n++] = BLUR_A_SURF;
-                dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_SHADER, 0, 2); dw[n++] = DRAW_FS_BLURV; dw[n++] = PIPE_SHADER_FRAGMENT;
-                dw[n++] = VirglCmd0(VIRGL_CCMD_SET_SAMPLER_VIEWS, 0, 3);
-                dw[n++] = PIPE_SHADER_FRAGMENT; dw[n++] = 0; dw[n++] = g_blurBView;
-                dw[n++] = VirglCmd0(VIRGL_CCMD_DRAW_VBO, 0, 12);
-                dw[n++] = 0; dw[n++] = 4; dw[n++] = PIPE_PRIM_TRIANGLE_STRIP; dw[n++] = 0;
-                dw[n++] = 1; dw[n++] = 0; dw[n++] = 0; dw[n++] = 0;
-                dw[n++] = 0; dw[n++] = 0; dw[n++] = 3; dw[n++] = 0;
+                // `iters` separable passes; each pair leaves the result in BLUR_A.
+                for (uint32_t it = 0; it < iters; ++it)
+                {
+                    // H pass: BLUR_A -> BLUR_B.
+                    dw[n++] = VirglCmd0(VIRGL_CCMD_SET_FRAMEBUFFER_STATE, 0, 3);
+                    dw[n++] = 1; dw[n++] = 0; dw[n++] = BLUR_B_SURF;
+                    dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_SHADER, 0, 2); dw[n++] = DRAW_FS_BLURH; dw[n++] = PIPE_SHADER_FRAGMENT;
+                    dw[n++] = VirglCmd0(VIRGL_CCMD_SET_SAMPLER_VIEWS, 0, 3);
+                    dw[n++] = PIPE_SHADER_FRAGMENT; dw[n++] = 0; dw[n++] = g_blurAView;
+                    dw[n++] = VirglCmd0(VIRGL_CCMD_DRAW_VBO, 0, 12);
+                    dw[n++] = 0; dw[n++] = 4; dw[n++] = PIPE_PRIM_TRIANGLE_STRIP; dw[n++] = 0;
+                    dw[n++] = 1; dw[n++] = 0; dw[n++] = 0; dw[n++] = 0;
+                    dw[n++] = 0; dw[n++] = 0; dw[n++] = 3; dw[n++] = 0;
+                    // V pass: BLUR_B -> BLUR_A.
+                    dw[n++] = VirglCmd0(VIRGL_CCMD_SET_FRAMEBUFFER_STATE, 0, 3);
+                    dw[n++] = 1; dw[n++] = 0; dw[n++] = BLUR_A_SURF;
+                    dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_SHADER, 0, 2); dw[n++] = DRAW_FS_BLURV; dw[n++] = PIPE_SHADER_FRAGMENT;
+                    dw[n++] = VirglCmd0(VIRGL_CCMD_SET_SAMPLER_VIEWS, 0, 3);
+                    dw[n++] = PIPE_SHADER_FRAGMENT; dw[n++] = 0; dw[n++] = g_blurBView;
+                    dw[n++] = VirglCmd0(VIRGL_CCMD_DRAW_VBO, 0, 12);
+                    dw[n++] = 0; dw[n++] = 4; dw[n++] = PIPE_PRIM_TRIANGLE_STRIP; dw[n++] = 0;
+                    dw[n++] = 1; dw[n++] = 0; dw[n++] = 0; dw[n++] = 0;
+                    dw[n++] = 0; dw[n++] = 0; dw[n++] = 3; dw[n++] = 0;
+                }
                 // Restore scanout framebuffer + viewport + chrome shader + nearest.
                 dw[n++] = VirglCmd0(VIRGL_CCMD_SET_FRAMEBUFFER_STATE, 0, 3);
                 dw[n++] = 1; dw[n++] = 0; dw[n++] = COMP_SCANOUT_SURF;

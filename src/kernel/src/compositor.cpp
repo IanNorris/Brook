@@ -1717,6 +1717,25 @@ static void CompositorLoopWM()
                 }
                 continue;
             }
+
+            // Super+G — toggle frosted-glass on the focused window (a real
+            // per-window option; uses the same per-window opacity+blur the
+            // 0xB00 syscall exposes). Cycles glass on (translucent + backdrop
+            // blur) <-> off (opaque). Only meaningful on the GPU DRAW path.
+            if ((ev.modifiers & INPUT_MOD_SUPER) && ev.scanCode == 0x22) // G
+            {
+                int cur = WmGetFocusedWindow();
+                if (cur >= 0) {
+                    Window* w = WmGetWindow(cur);
+                    if (w && w->proc) {
+                        bool glassOn = (w->blurRadius == 0);
+                        WmSetWindowProperties(cur, WM_PROP_OPACITY | WM_PROP_BLUR,
+                                              glassOn ? WM_GLASS_OPACITY : 255,
+                                              glassOn ? WM_GLASS_BLUR : 0);
+                    }
+                }
+                continue;
+            }
         }
 
         // Find the focused window (needed for both press and release)
@@ -2716,7 +2735,18 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
     // {glass backdrop over the whole window; translucent content; chrome}.
     if (anyBlur)
     {
-        gpu->BlurBarrier();
+        // Blur strength = max app-requested radius across glass windows.
+        uint32_t blurStrength = 0;
+        for (uint32_t i = 0; i < wcount; ++i)
+        {
+            Window* w = WmGetWindow(sorted[i]);
+            if (w && w->visible && !w->minimized && isGlass(w))
+            {
+                uint32_t b = effBlur(w);
+                if (b > blurStrength) blurStrength = b;
+            }
+        }
+        gpu->BlurBarrier(blurStrength);
         for (uint32_t i = 0; i < wcount; ++i)
         {
             int idx = sorted[i];
