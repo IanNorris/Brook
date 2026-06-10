@@ -62,6 +62,13 @@ struct GpuCompositorOps {
     // Used for in-guest visual verification without a host display.
     uint32_t (*CaptureThumb)(uint32_t* out, uint32_t maxPixels,
                              uint32_t* outW, uint32_t* outH);
+
+    // Capture the FULL presented scanout at native resolution (1:1, no
+    // downscale). BLITs the scanout RT into a full-size readback RT, reads it
+    // back, and returns a pointer to the driver-internal BGRA pixel buffer (do
+    // not free). Sets *outW/*outH to the scanout dimensions. Returns nullptr on
+    // failure. For full-res visual / text-fidelity verification.
+    const uint32_t* (*CaptureFull)(uint32_t* outW, uint32_t* outH);
 };
 
 // Register the GPU compositor ops (called by the display driver once its 3D

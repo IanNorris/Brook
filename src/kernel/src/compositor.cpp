@@ -296,6 +296,8 @@ static uint32_t  g_wallpaperHeight = 0;
 static bool      g_gpuComposite   = false;   // BROOK_COMPOSITE=gpu requested
 static bool      g_gpuThumbDump   = false;   // BROOK_GPU_THUMB: base64 thumbnail over serial
 static uint64_t  g_lastThumbTick  = 0;
+static bool      g_fullDump       = false;   // BROOK_GPU_FULL: one-shot full-res frame dump
+static bool      g_fullDumpDone   = false;   // full dump already emitted
 static GpuTexId  g_desktopTex     = 0;       // g_backBuffer as a texture
 static uint32_t* g_desktopTexPtr  = nullptr; // backing pointer the tex was made for
 static bool      g_desktopTexNeedsFull = true; // force a full desktop upload
@@ -381,6 +383,15 @@ void CompositorInit()
     {
         g_gpuThumbDump = true;
         SerialPuts("COMPOSITOR: GPU thumbnail serial dump enabled (BROOK_GPU_THUMB=1)\n");
+    }
+
+    // Optional: one-shot full-resolution frame dump (GPU + CPU) for text-fidelity
+    // parity. Emitted once after the desktop settles. opt/gpufull == "1".
+    char full[8] = {};
+    if (FwCfgReadFile("opt/gpufull", full, sizeof(full) - 1) >= 1 && full[0] == '1')
+    {
+        g_fullDump = true;
+        SerialPuts("COMPOSITOR: full-res frame dump enabled (BROOK_GPU_FULL=1)\n");
     }
 }
 
@@ -1959,27 +1970,20 @@ static void CompositorDrawClock()
     MarkDirtyRows(y, y + lineH + 2);
 }
 
-// Dump a base64-encoded RGB thumbnail of the GPU-composited scanout over serial,
-// delimited by markers so the host can extract + decode it to a PNG. This gives
-// in-guest visual verification of the composited desktop without a host display.
-static void DumpGpuThumbnail()
+// Base64-encode an RGB frame (from a BGRA/XRGB pixel buffer with `stride`
+// pixels per row) over serial, delimited by `TAG BEGIN w h` / `TAG END` so the
+// host can extract + decode it to a PNG. Gives in-guest visual verification
+// without a host display.
+static void DumpFrameBase64(const uint32_t* px, uint32_t w, uint32_t h,
+                            uint32_t stride, const char* tag)
 {
-    const GpuCompositorOps* gpu = GpuCompositorGet();
-    if (!gpu || !gpu->CaptureThumb) return;
-
-    static uint32_t thumb[256 * 144];   // BGRA pixels from CaptureThumb
-    uint32_t tw = 0, th = 0;
-    uint32_t count = gpu->CaptureThumb(thumb, 256 * 144, &tw, &th);
-    if (count == 0 || tw == 0 || th == 0) return;
-
-    SerialPrintf("GPUTHUMB BEGIN %u %u\n", tw, th);
+    if (!px || w == 0 || h == 0) return;
+    SerialPrintf("%s BEGIN %u %u\n", tag, w, h);
 
     static const char b64[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    char line[97];   // 72 base64 chars per line + NUL
+    char line[97];
     uint32_t li = 0;
-
-    // Emit RGB (3 bytes/pixel) from BGRA, base64 in 3-byte groups.
     uint8_t grp[3]; uint32_t gi = 0;
     auto flushGroup = [&](uint32_t valid) {
         uint32_t v = (grp[0] << 16) | (grp[1] << 8) | grp[2];
@@ -1990,20 +1994,56 @@ static void DumpGpuThumbnail()
         if (li >= 72) { line[li] = '\0'; SerialPuts(line); SerialPuts("\n"); li = 0; }
     };
 
-    for (uint32_t i = 0; i < count; ++i)
+    for (uint32_t y = 0; y < h; ++y)
     {
-        uint32_t px = thumb[i];
-        grp[gi++] = (px >> 16) & 0xFF;  // R
-        if (gi == 3) { flushGroup(3); gi = 0; }
-        grp[gi++] = (px >> 8) & 0xFF;   // G
-        if (gi == 3) { flushGroup(3); gi = 0; }
-        grp[gi++] = px & 0xFF;          // B
-        if (gi == 3) { flushGroup(3); gi = 0; }
+        const uint32_t* row = px + static_cast<uint64_t>(y) * stride;
+        for (uint32_t x = 0; x < w; ++x)
+        {
+            uint32_t p = row[x];
+            grp[gi++] = (p >> 16) & 0xFF;  // R
+            if (gi == 3) { flushGroup(3); gi = 0; }
+            grp[gi++] = (p >> 8) & 0xFF;   // G
+            if (gi == 3) { flushGroup(3); gi = 0; }
+            grp[gi++] = p & 0xFF;          // B
+            if (gi == 3) { flushGroup(3); gi = 0; }
+        }
     }
     if (gi > 0) { for (uint32_t k = gi; k < 3; ++k) grp[k] = 0; flushGroup(gi); }
     if (li > 0) { line[li] = '\0'; SerialPuts(line); SerialPuts("\n"); }
+    SerialPrintf("%s END\n", tag);
+}
 
-    SerialPuts("GPUTHUMB END\n");
+// Periodic low-res thumbnail of the GPU-composited scanout.
+static void DumpGpuThumbnail()
+{
+    const GpuCompositorOps* gpu = GpuCompositorGet();
+    if (!gpu || !gpu->CaptureThumb) return;
+    static uint32_t thumb[256 * 144];
+    uint32_t tw = 0, th = 0;
+    uint32_t count = gpu->CaptureThumb(thumb, 256 * 144, &tw, &th);
+    if (count == 0 || tw == 0 || th == 0) return;
+    DumpFrameBase64(thumb, tw, th, tw, "GPUTHUMB");
+}
+
+// One-shot full-resolution frame dump for GPU-vs-CPU text-fidelity parity.
+// GPU mode: read back the full scanout at 1:1 (GPUFULL). CPU mode: dump
+// g_backBuffer directly (CPUFULL). Same encoder → directly diffable.
+static void DumpFullFrameOnce()
+{
+    if (CompositorGpuActive())
+    {
+        const GpuCompositorOps* gpu = GpuCompositorGet();
+        if (!gpu || !gpu->CaptureFull) return;
+        uint32_t fw = 0, fh = 0;
+        const uint32_t* full = gpu->CaptureFull(&fw, &fh);
+        if (full && fw && fh)
+            DumpFrameBase64(full, fw, fh, fw, "GPUFULL");
+    }
+    else if (g_backBuffer)
+    {
+        DumpFrameBase64(g_backBuffer, g_physFbWidth, g_physFbHeight,
+                        g_backBufStride, "CPUFULL");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2114,6 +2154,18 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
         uint64_t vaddr; uint32_t sw, sh;
         if (!WindowContentSource(w, &vaddr, &sw, &sh)) continue;
 
+        // Pick the content-dirty signal matching the source buffer that
+        // WindowContentSource resolved. Wayland windows expose w->vfb and
+        // signal new content via w->vfbDirty; legacy framebuffer processes
+        // (terminals, the kernel console, DOOM) expose p->fbVirtual and signal
+        // via p->fbDirty. The GPU path used to only honour w->vfbDirty, so
+        // legacy-fb windows were uploaded once (while still empty) and never
+        // refreshed — leaving their client areas black. Honour both.
+        Process* p = w->proc;
+        bool isWayland = (w->vfb && w->vfbStride && w->vfbBytes);
+        bool contentDirty = isWayland ? (w->vfbDirty != 0)
+                                      : (p && p->fbDirty != 0);
+
         WinTexEntry& e = g_winTex[idx];
         if (e.tex && (e.vfb != reinterpret_cast<uint32_t*>(vaddr) || e.w != sw || e.h != sh))
         {
@@ -2125,12 +2177,13 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
             e.tex = gpu->CreateTexture(sw, sh, vaddr, false);
             e.vfb = reinterpret_cast<uint32_t*>(vaddr);
             e.w = sw; e.h = sh;
-            w->vfbDirty = 1;   // force first upload
+            contentDirty = true;   // force first upload
         }
-        if (e.tex && w->vfbDirty)
+        if (e.tex && contentDirty)
         {
             gpu->UpdateTexture(e.tex, 0, 0, sw, sh);
-            w->vfbDirty = 0;
+            if (isWayland) w->vfbDirty = 0;
+            else if (p)    p->fbDirty = 0;
         }
     }
 
@@ -2380,6 +2433,15 @@ static void CompositorLoop()
         // linear framebuffers (GOP/bochs); virtio-gpu transfers + flushes the
         // dirty rect to the host here.
         brook::DisplayFlush(minY, maxY);
+    }
+
+    // One-shot full-resolution frame dump (parity check), once the desktop has
+    // settled (~15s uptime). Works in both GPU mode (GPUFULL via scanout
+    // readback) and CPU mode (CPUFULL from g_backBuffer) for a direct diff.
+    if (g_fullDump && !g_fullDumpDone && g_lapicTickCount >= 15000)
+    {
+        g_fullDumpDone = true;
+        DumpFullFrameOnce();
     }
 
     // Present-timing: record this frame's period + loop time and

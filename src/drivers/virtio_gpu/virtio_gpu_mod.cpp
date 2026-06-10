@@ -1275,6 +1275,7 @@ static constexpr uint32_t COMP_CTX_ID       = 2;     // separate from self-test 
 static constexpr uint32_t COMP_SCANOUT_RES  = 16;    // scanout render-target
 static constexpr uint32_t COMP_SCANOUT_SURF = 1;     // virgl surface object handle
 static constexpr uint32_t COMP_THUMB_RES    = 15;    // downscale thumbnail RT
+static constexpr uint32_t COMP_FULL_RES     = 14;    // full-res 1:1 readback RT (lazy)
 static constexpr uint32_t COMP_THUMB_W      = 256;   // thumbnail size (16:9-ish)
 static constexpr uint32_t COMP_THUMB_H      = 144;
 static constexpr uint32_t COMP_FIRST_TEX_RES = 17;   // texture resource ids from here
@@ -1287,6 +1288,8 @@ static uint32_t g_compNextRes     = COMP_FIRST_TEX_RES;
 static uint32_t g_composeN        = 0;       // dwords accumulated in compose stream
 static uint64_t g_compThumbPhys   = 0;       // thumbnail RT readback backing (phys)
 static uint32_t* g_compThumbBuf   = nullptr; // thumbnail RT readback backing (virt)
+static uint32_t* g_compFullBuf    = nullptr; // full-res RT readback backing (virt, lazy)
+static bool      g_compFullReady  = false;   // full-res readback RT created
 
 struct GpuTexture { uint32_t resId; uint32_t w; uint32_t h; uint32_t format; bool used; };
 static constexpr uint32_t MAX_GPU_TEXTURES = 128;
@@ -1542,6 +1545,55 @@ static uint32_t CompCaptureThumb(uint32_t* out, uint32_t maxPixels,
     return count;
 }
 
+// Capture the full presented scanout at native resolution. Lazily creates a
+// full-size readback RT (contiguous backing, ~8MB at 1080p), BLITs the scanout
+// 1:1 into it, reads it back, and returns a pointer to the readback buffer.
+static const uint32_t* CompCaptureFull(uint32_t* outW, uint32_t* outH)
+{
+    if (!g_compReady || g_compScanoutW == 0) return nullptr;
+
+    if (!g_compFullReady)
+    {
+        uint32_t fbytes = g_compScanoutW * g_compScanoutH * 4;
+        PhysicalAddress fphys = PmmAllocPages(AlignUp(fbytes, 4096) / 4096,
+                                              MemTag::Device, KernelPid);
+        if (!fphys) { SerialPuts("virtio_gpu: comp full-res RT alloc failed\n"); return nullptr; }
+        g_compFullBuf = reinterpret_cast<uint32_t*>(PhysToVirt(fphys).raw());
+        memset(g_compFullBuf, 0, fbytes);
+        if (!ResourceCreate3D(COMP_FULL_RES, VIRGL_FORMAT_B8G8R8X8_UNORM,
+                              VIRGL_BIND_RENDER_TARGET | VIRGL_BIND_SAMPLER_VIEW,
+                              g_compScanoutW, g_compScanoutH) ||
+            !ResourceAttachBackingContig(COMP_FULL_RES, fphys.raw(), fbytes))
+        { SerialPuts("virtio_gpu: comp full-res RT create failed\n"); g_compFullBuf = nullptr; return nullptr; }
+        CtxAttachResource(COMP_CTX_ID, COMP_FULL_RES);
+        g_compFullReady = true;
+    }
+    if (!g_compFullBuf) return nullptr;
+
+    // BLIT scanout -> full-res RT 1:1.
+    auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
+    memset(sub, 0, sizeof(*sub));
+    sub->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D; sub->hdr.ctx_id = COMP_CTX_ID;
+    uint32_t* dw = ComposeDwBase(); uint32_t n = 0;
+    uint32_t s0 = (VIRGL_BLIT_MASK_RGBA & 0xFF) | ((VIRGL_TEX_FILTER_NEAREST & 0x3) << 8);
+    dw[n++] = VirglCmd0(VIRGL_CCMD_BLIT, 0, 21);
+    dw[n++] = s0; dw[n++] = 0; dw[n++] = 0;
+    dw[n++] = COMP_FULL_RES; dw[n++] = 0; dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;
+    dw[n++] = 0; dw[n++] = 0; dw[n++] = 0;
+    dw[n++] = g_compScanoutW; dw[n++] = g_compScanoutH; dw[n++] = 1;
+    dw[n++] = COMP_SCANOUT_RES; dw[n++] = 0; dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;
+    dw[n++] = 0; dw[n++] = 0; dw[n++] = 0;
+    dw[n++] = g_compScanoutW; dw[n++] = g_compScanoutH; dw[n++] = 1;
+    sub->size = n * 4;
+    if (!CmdRespOk(SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP)))
+        return nullptr;
+    if (!TransferFromHost3D(COMP_CTX_ID, COMP_FULL_RES, g_compScanoutW, g_compScanoutH))
+        return nullptr;
+    if (outW) *outW = g_compScanoutW;
+    if (outH) *outH = g_compScanoutH;
+    return g_compFullBuf;
+}
+
 static const brook::GpuCompositorOps g_gpuCompositorOps = {
     "virtio-gpu-blit",
     CompCreateTexture,
@@ -1552,6 +1604,7 @@ static const brook::GpuCompositorOps g_gpuCompositorOps = {
     CompEndFrame,
     CompGetSize,
     CompCaptureThumb,
+    CompCaptureFull,
 };
 
 // Readback self-test of the real compositor ops: build a scattered-backed
