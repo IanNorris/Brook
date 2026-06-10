@@ -278,10 +278,34 @@ static constexpr uint32_t PIPE_CLEAR_COLOR0           = 1u << 2;
 
 // virgl command-stream opcodes + object types.
 static constexpr uint32_t VIRGL_CCMD_CREATE_OBJECT        = 1;
+static constexpr uint32_t VIRGL_CCMD_BIND_OBJECT          = 2;
+static constexpr uint32_t VIRGL_CCMD_SET_VIEWPORT_STATE   = 4;
 static constexpr uint32_t VIRGL_CCMD_SET_FRAMEBUFFER_STATE = 5;
+static constexpr uint32_t VIRGL_CCMD_SET_VERTEX_BUFFERS   = 6;
 static constexpr uint32_t VIRGL_CCMD_CLEAR               = 7;
+static constexpr uint32_t VIRGL_CCMD_DRAW_VBO            = 8;
+static constexpr uint32_t VIRGL_CCMD_SET_SAMPLER_VIEWS   = 10;
 static constexpr uint32_t VIRGL_CCMD_BLIT                = 16;
+static constexpr uint32_t VIRGL_CCMD_BIND_SAMPLER_STATES = 18;
+static constexpr uint32_t VIRGL_CCMD_BIND_SHADER         = 31;
+
+static constexpr uint32_t VIRGL_OBJECT_BLEND            = 1;
+static constexpr uint32_t VIRGL_OBJECT_RASTERIZER       = 2;
+static constexpr uint32_t VIRGL_OBJECT_DSA              = 3;
+static constexpr uint32_t VIRGL_OBJECT_SHADER          = 4;
+static constexpr uint32_t VIRGL_OBJECT_VERTEX_ELEMENTS = 5;
+static constexpr uint32_t VIRGL_OBJECT_SAMPLER_VIEW    = 6;
+static constexpr uint32_t VIRGL_OBJECT_SAMPLER_STATE   = 7;
 static constexpr uint32_t VIRGL_OBJECT_SURFACE           = 8;
+
+// Extra formats / binds / pipe enums for the DRAW (textured-quad) path.
+static constexpr uint32_t VIRGL_FORMAT_R32G32_FLOAT   = 29;   // vertex pos/uv attribute
+static constexpr uint32_t VIRGL_FORMAT_R8_UNORM       = 64;   // raw byte buffer element
+static constexpr uint32_t VIRGL_BIND_VERTEX_BUFFER    = 1u << 4;
+static constexpr uint32_t PIPE_BUFFER                 = 0;    // resource target
+static constexpr uint32_t PIPE_SHADER_VERTEX          = 0;
+static constexpr uint32_t PIPE_SHADER_FRAGMENT        = 1;
+static constexpr uint32_t PIPE_PRIM_TRIANGLE_STRIP    = 5;
 
 // virgl BLIT: copy mask for an RGBA colour blit (PIPE_MASK_RGBA) and a
 // nearest-filter (PIPE_TEX_FILTER_NEAREST) — exact 1:1 pixel copy.
@@ -1691,6 +1715,350 @@ static void VirtioGpuCompositorSelfTest()
                  bg, fg, ok ? "PASS" : "FAIL");
 }
 
+// ---------------------------------------------------------------------------
+// VirGL DRAW pipeline bring-up (Milestone: textured-quad composition).
+//
+// The compositor today composes with BLIT (a host-side copy/resolve). The DRAW
+// path renders textured quads through the real GL pipeline (vertex+fragment
+// TGSI shaders, blend state, DRAW_VBO), which is what enables per-window
+// constant opacity and generalises to Venus/Vulkan + real hardware later.
+//
+// This is a STANDALONE self-test ladder that proves the pipeline in isolation
+// before the compositor is ever switched to it. Each rung renders into its own
+// readback RT with a DISTINCT expected output, so a failure localises to one
+// subsystem rather than collapsing to an ambiguous "black frame":
+//   M1 solid-colour FS   → proves shader compile + vertex elements + VBO +
+//                          viewport + framebuffer bind + DRAW_VBO.
+//   M2 uv-as-colour FS   → proves vertex attribute / uv interpolation.
+//   M3 textured FS       → proves sampler view + sampler state + TEX + swizzle.
+// (M4 alpha-blend + the compositor swap come once these three are green.)
+// ---------------------------------------------------------------------------
+
+// Create a PIPE_BUFFER resource (vertex/constant data) as a raw byte buffer.
+static bool ResourceCreateBuffer(uint32_t resId, uint32_t bind, uint32_t byteLen)
+{
+    auto* req = reinterpret_cast<VirtioGpuResourceCreate3D*>(g_cmdBuf + CMD_REQ_OFF);
+    memset(req, 0, sizeof(*req));
+    req->hdr.type    = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    req->resource_id = resId;
+    req->target      = PIPE_BUFFER;
+    req->format      = VIRGL_FORMAT_R8_UNORM;
+    req->bind        = bind;
+    req->width       = byteLen;
+    req->height      = 1;
+    req->depth       = 1;
+    req->array_size  = 1;
+    return CmdRespOk(SubmitCommand(sizeof(*req), CMD_RESP_CAP));
+}
+
+// Transfer a buffer resource's full backing to the host (1-D box).
+static bool TransferToHostBuffer(uint32_t ctxId, uint32_t resId, uint32_t byteLen)
+{
+    auto* req = reinterpret_cast<VirtioGpuTransferHost3D*>(g_cmdBuf + CMD_REQ_OFF);
+    memset(req, 0, sizeof(*req));
+    req->hdr.type     = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D;
+    req->hdr.ctx_id   = ctxId;
+    req->box.w        = byteLen;
+    req->box.h        = 1;
+    req->box.d        = 1;
+    req->offset       = 0;
+    req->resource_id  = resId;
+    req->stride       = byteLen;
+    req->layer_stride = byteLen;
+    return CmdRespOk(SubmitCommand(sizeof(*req), CMD_RESP_CAP));
+}
+
+// Create a virgl shader object from TGSI *text* (virglrenderer parses it with
+// tgsi_text_translate host-side). Single-pass framing: 5 header dwords (handle,
+// type, offlen=byteLen, num_tokens, num_so_outputs=0) followed by the NUL-
+// terminated text zero-padded to a dword boundary. num_tokens is intentionally
+// generous (host callocs num_tokens+10 tokens; over-estimating only allocates
+// more host memory). Returns true only if the SUBMIT_3D response is OK, giving
+// an in-guest signal for a malformed/oversized command (not a TGSI compile
+// error, which virglrenderer reports only on the host log).
+static bool CreateShaderObj(uint32_t ctxId, uint32_t handle, uint32_t shaderType,
+                            const char* text)
+{
+    uint32_t slen = 0; while (text[slen]) slen++;
+    uint32_t strBytes = slen + 1;            // include the NUL
+    uint32_t strDw    = (strBytes + 3) / 4;  // dwords occupied by the text
+
+    auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
+    memset(sub, 0, sizeof(*sub));
+    sub->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D; sub->hdr.ctx_id = ctxId;
+    uint32_t* dw = ComposeDwBase(); uint32_t n = 0;
+    dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SHADER, 5 + strDw);
+    dw[n++] = handle;
+    dw[n++] = shaderType;        // PIPE_SHADER_VERTEX / PIPE_SHADER_FRAGMENT
+    dw[n++] = strBytes;          // offlen: total length, no continuation bit
+    dw[n++] = strBytes;          // num_tokens (generous over-estimate)
+    dw[n++] = 0;                 // num_so_outputs (no stream-out)
+    uint8_t* dst = reinterpret_cast<uint8_t*>(&dw[n]);
+    for (uint32_t i = 0; i < strBytes; ++i)      dst[i] = static_cast<uint8_t>(text[i]);
+    for (uint32_t i = strBytes; i < strDw * 4; ++i) dst[i] = 0;
+    n += strDw;
+    sub->size = n * 4;
+    return CmdRespOk(SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP));
+}
+
+// Pass-through vertex shader: clip-space position from IN[0], uv from IN[1].
+static const char* kDrawVS =
+    "VERT\n"
+    "DCL IN[0]\n"
+    "DCL IN[1]\n"
+    "DCL OUT[0], POSITION\n"
+    "DCL OUT[1], GENERIC[0]\n"
+    "MOV OUT[0], IN[0]\n"
+    "MOV OUT[1], IN[1]\n"
+    "END\n";
+
+// M1 fragment shader: constant red (proves the pipeline draws at all).
+static const char* kDrawFS_Solid =
+    "FRAG\n"
+    "DCL OUT[0], COLOR\n"
+    "IMM[0] FLT32 { 1.0000, 0.0000, 0.0000, 1.0000}\n"
+    "MOV OUT[0], IMM[0]\n"
+    "END\n";
+
+// M2 fragment shader: output the interpolated uv as colour (r=u, g=v).
+static const char* kDrawFS_UV =
+    "FRAG\n"
+    "DCL IN[0], GENERIC[0], PERSPECTIVE\n"
+    "DCL OUT[0], COLOR\n"
+    "MOV OUT[0], IN[0]\n"
+    "END\n";
+
+// M3 fragment shader: sample the bound texture at the interpolated uv.
+static const char* kDrawFS_Tex =
+    "FRAG\n"
+    "DCL IN[0], GENERIC[0], PERSPECTIVE\n"
+    "DCL OUT[0], COLOR\n"
+    "DCL SAMP[0]\n"
+    "DCL SVIEW[0], 2D, FLOAT\n"
+    "TEX OUT[0], IN[0], SAMP[0], 2D\n"
+    "END\n";
+
+// Drives one rung of the DRAW ladder against a fresh readback RT and returns the
+// centre pixel. ctx/objects are created once by the caller; `fsHandle` selects
+// the fragment shader bound for this rung, and `texView`/`sampState` (non-zero
+// for the textured rung) bind a sampler view + state before the draw.
+static bool VirtioGpuDrawSelfTest()
+{
+    if (!(g_gpu3dFeatures & VIRTIO_GPU_F_VIRGL)) return false;
+
+    const uint32_t DCTX = 4;
+    const uint32_t sdim = 256, sbytes = sdim * sdim * 4;
+
+    if (!CtxCreate(DCTX, VIRTIO_GPU_CAPSET_VIRGL))
+    { SerialPuts("virtio_gpu: draw-test ctx create failed\n"); return false; }
+
+    // Readback RTs (one per rung) — contiguous backing so we can read pixels.
+    const uint32_t RT[3] = { 200, 201, 202 };
+    const uint32_t SURF[3] = { 83, 84, 85 };
+    uint32_t* rd[3] = {};
+    for (int i = 0; i < 3; ++i)
+    {
+        PhysicalAddress p = PmmAllocPages(AlignUp(sbytes, 4096) / 4096, MemTag::Device, KernelPid);
+        if (!p) { SerialPuts("virtio_gpu: draw-test RT alloc failed\n"); return false; }
+        rd[i] = reinterpret_cast<uint32_t*>(PhysToVirt(p).raw());
+        memset(rd[i], 0, sbytes);
+        if (!ResourceCreate3D(RT[i], VIRGL_FORMAT_B8G8R8X8_UNORM,
+                              VIRGL_BIND_RENDER_TARGET | VIRGL_BIND_SAMPLER_VIEW, sdim, sdim) ||
+            !ResourceAttachBackingContig(RT[i], p.raw(), sbytes) ||
+            !CtxAttachResource(DCTX, RT[i]))
+        { SerialPrintf("virtio_gpu: draw-test RT%d setup failed\n", i); return false; }
+    }
+
+    // Fullscreen quad as a triangle strip: {pos.xy, uv.xy} per vertex. Stored as
+    // raw IEEE-754 bit patterns (not float values) so no runtime FP is emitted
+    // under the kernel's -mno-sse build — the GPU interprets the bits as floats.
+    constexpr uint32_t FN1 = 0xBF800000u;  // -1.0f
+    constexpr uint32_t FP1 = 0x3F800000u;  //  1.0f
+    constexpr uint32_t F00 = 0x00000000u;  //  0.0f
+    static const uint32_t quadBits[16] = {
+        FN1, FN1, F00, F00,   // (-1,-1) uv(0,0)
+        FP1, FN1, FP1, F00,   // ( 1,-1) uv(1,0)
+        FN1, FP1, F00, FP1,   // (-1, 1) uv(0,1)
+        FP1, FP1, FP1, FP1,   // ( 1, 1) uv(1,1)
+    };
+    const uint32_t VBUF = 210, vbytes = sizeof(quadBits);
+    {
+        PhysicalAddress vp = PmmAllocPages(AlignUp(vbytes, 4096) / 4096, MemTag::Device, KernelPid);
+        if (!vp) { SerialPuts("virtio_gpu: draw-test vbuf alloc failed\n"); return false; }
+        uint32_t* vbacking = reinterpret_cast<uint32_t*>(PhysToVirt(vp).raw());
+        for (uint32_t i = 0; i < 16; ++i) vbacking[i] = quadBits[i];
+        if (!ResourceCreateBuffer(VBUF, VIRGL_BIND_VERTEX_BUFFER, vbytes) ||
+            !ResourceAttachBackingContig(VBUF, vp.raw(), vbytes) ||
+            !CtxAttachResource(DCTX, VBUF) ||
+            !TransferToHostBuffer(DCTX, VBUF, vbytes))
+        { SerialPuts("virtio_gpu: draw-test vbuf setup failed\n"); return false; }
+    }
+
+    // A solid-magenta sampler texture for the M3 rung (distinct from clear-blue
+    // and the M1 solid-red, so a correct sample is unambiguous).
+    const uint32_t TEX = 211, texDim = 4, texBytes = texDim * texDim * 4;
+    {
+        PhysicalAddress tp = PmmAllocPages(1, MemTag::Device, KernelPid);
+        if (!tp) { SerialPuts("virtio_gpu: draw-test tex alloc failed\n"); return false; }
+        uint32_t* tpx = reinterpret_cast<uint32_t*>(PhysToVirt(tp).raw());
+        for (uint32_t i = 0; i < texDim * texDim; ++i) tpx[i] = 0xFFFF00FFu; // opaque magenta
+        if (!ResourceCreate3D(TEX, VIRGL_FORMAT_B8G8R8A8_UNORM, VIRGL_BIND_SAMPLER_VIEW, texDim, texDim) ||
+            !ResourceAttachBackingContig(TEX, tp.raw(), texBytes) ||
+            !CtxAttachResource(DCTX, TEX) ||
+            !TransferToHost3D(DCTX, TEX, 0, 0, texDim, texDim, texDim, texDim))
+        { SerialPuts("virtio_gpu: draw-test tex setup failed\n"); return false; }
+    }
+
+    // Shaders.
+    const uint32_t VS = 77, FS_SOLID = 78, FS_UV = 79, FS_TEX = 90;
+    bool sv = CreateShaderObj(DCTX, VS, PIPE_SHADER_VERTEX, kDrawVS);
+    bool s1 = CreateShaderObj(DCTX, FS_SOLID, PIPE_SHADER_FRAGMENT, kDrawFS_Solid);
+    bool s2 = CreateShaderObj(DCTX, FS_UV, PIPE_SHADER_FRAGMENT, kDrawFS_UV);
+    bool s3 = CreateShaderObj(DCTX, FS_TEX, PIPE_SHADER_FRAGMENT, kDrawFS_Tex);
+    bool shOk = sv && s1 && s2 && s3;
+    SerialPrintf("virtio_gpu: draw-test shader create -> %s\n", shOk ? "ok" : "SUBMIT-ERR");
+
+    // Pipeline state objects + surfaces, all in one SUBMIT_3D.
+    const uint32_t BLEND = 73, RAST = 74, DSA = 75, VE = 76, SAMP = 87, SVIEW = 88;
+    {
+        auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
+        memset(sub, 0, sizeof(*sub));
+        sub->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D; sub->hdr.ctx_id = DCTX;
+        uint32_t* dw = ComposeDwBase(); uint32_t n = 0;
+
+        // Surfaces over each readback RT.
+        for (int i = 0; i < 3; ++i) {
+            dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SURFACE, 5);
+            dw[n++] = SURF[i]; dw[n++] = RT[i]; dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;
+            dw[n++] = 0; dw[n++] = 0;
+        }
+        // Blend: no blend, write all channels (colormask RGBA = 0xF at bits 27-30).
+        dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_BLEND, 11);
+        dw[n++] = BLEND; dw[n++] = 0; dw[n++] = 0;
+        dw[n++] = (0xFu << 27);              // S2[0]: colormask only
+        for (int i = 1; i < 8; ++i) dw[n++] = 0;
+        // Rasterizer: depth-clip + half-pixel-center, no culling.
+        dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_RASTERIZER, 9);
+        dw[n++] = RAST;
+        dw[n++] = (1u << 1) | (1u << 29);    // S0: DEPTH_CLIP | HALF_PIXEL_CENTER
+        dw[n++] = F32Bits(1.0f);             // point size
+        dw[n++] = 0;                         // sprite coord enable
+        dw[n++] = 0;                         // S3
+        dw[n++] = F32Bits(1.0f);             // line width
+        dw[n++] = 0; dw[n++] = 0; dw[n++] = 0; // offset units/scale/clamp
+        // DSA: depth/stencil/alpha all off.
+        dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_DSA, 5);
+        dw[n++] = DSA; dw[n++] = 0; dw[n++] = 0; dw[n++] = 0; dw[n++] = 0;
+        // Vertex elements: pos @0 (R32G32_FLOAT), uv @8 (R32G32_FLOAT), both vb 0.
+        dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_VERTEX_ELEMENTS, 9);
+        dw[n++] = VE;
+        dw[n++] = 0; dw[n++] = 0; dw[n++] = 0; dw[n++] = VIRGL_FORMAT_R32G32_FLOAT;
+        dw[n++] = 8; dw[n++] = 0; dw[n++] = 0; dw[n++] = VIRGL_FORMAT_R32G32_FLOAT;
+        // Sampler state: nearest filter, clamp-to-edge wrap (for the M3 rung).
+        dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SAMPLER_STATE, 9);
+        dw[n++] = SAMP; dw[n++] = 0;         // S0: all-zero = nearest, wrap repeat
+        dw[n++] = 0; dw[n++] = 0; dw[n++] = 0;
+        dw[n++] = 0; dw[n++] = 0; dw[n++] = 0; dw[n++] = 0; // lod/border
+        // Sampler view over the magenta texture. The last dword is the channel
+        // swizzle: identity R→R,G→G,B→B,A→A = (0)|(1<<3)|(2<<6)|(3<<9). A zero
+        // swizzle would map every channel to X (red), turning magenta into white.
+        dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SAMPLER_VIEW, 6);
+        dw[n++] = SVIEW; dw[n++] = TEX; dw[n++] = VIRGL_FORMAT_B8G8R8A8_UNORM;
+        dw[n++] = 0; dw[n++] = 0; dw[n++] = 0x688u;
+        sub->size = n * 4;
+        bool ok = CmdRespOk(SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP));
+        SerialPrintf("virtio_gpu: draw-test object create -> %s\n", ok ? "ok" : "SUBMIT-ERR");
+    }
+
+    // Run one rung in two separately-submitted, separately-read-back phases so a
+    // failure localises despite QEMU swallowing host-side virgl errors (the
+    // submit response is OK even when virglrenderer rejects a command):
+    //   Phase A: SET_FRAMEBUFFER_STATE + CLEAR(blue) → proves surface + clear +
+    //            readback on THIS RT. If A is not blue, the surface/RT/readback
+    //            is the problem, not the draw.
+    //   Phase B: viewport + binds + vbuf + DRAW → the actual pipeline.
+    auto runRung = [&](int rt, uint32_t fs, bool textured) {
+        // --- Phase A: clear only ---
+        {
+            auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
+            memset(sub, 0, sizeof(*sub));
+            sub->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D; sub->hdr.ctx_id = DCTX;
+            uint32_t* dw = ComposeDwBase(); uint32_t n = 0;
+            dw[n++] = VirglCmd0(VIRGL_CCMD_SET_FRAMEBUFFER_STATE, 0, 3);
+            dw[n++] = 1; dw[n++] = 0; dw[n++] = SURF[rt];
+            dw[n++] = VirglCmd0(VIRGL_CCMD_CLEAR, 0, 8);
+            dw[n++] = PIPE_CLEAR_COLOR0;
+            dw[n++] = F32Bits(0.0f); dw[n++] = F32Bits(0.0f); dw[n++] = F32Bits(1.0f); dw[n++] = F32Bits(1.0f);
+            dw[n++] = 0; dw[n++] = 0; dw[n++] = 0;
+            sub->size = n * 4;
+            bool sok = CmdRespOk(SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP));
+            bool xok = TransferFromHost3D(DCTX, RT[rt], sdim, sdim);
+            uint32_t cpx = rd[rt][sdim / 2 * sdim + sdim / 2];
+            SerialPrintf("virtio_gpu:  rung%d clearA submit=%d xfer=%d centre=0x%08x\n",
+                         rt, sok, xok, cpx);
+        }
+        // --- Phase B: full draw pipeline ---
+        {
+            auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
+            memset(sub, 0, sizeof(*sub));
+            sub->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D; sub->hdr.ctx_id = DCTX;
+            uint32_t* dw = ComposeDwBase(); uint32_t n = 0;
+            dw[n++] = VirglCmd0(VIRGL_CCMD_SET_FRAMEBUFFER_STATE, 0, 3);
+            dw[n++] = 1; dw[n++] = 0; dw[n++] = SURF[rt];
+            dw[n++] = VirglCmd0(VIRGL_CCMD_SET_VIEWPORT_STATE, 0, 7);
+            dw[n++] = 0;
+            dw[n++] = F32Bits(128.0f); dw[n++] = F32Bits(128.0f); dw[n++] = F32Bits(1.0f);
+            dw[n++] = F32Bits(128.0f); dw[n++] = F32Bits(128.0f); dw[n++] = F32Bits(0.0f);
+            dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_OBJECT, VIRGL_OBJECT_BLEND, 1);       dw[n++] = BLEND;
+            dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_OBJECT, VIRGL_OBJECT_RASTERIZER, 1);  dw[n++] = RAST;
+            dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_OBJECT, VIRGL_OBJECT_DSA, 1);         dw[n++] = DSA;
+            dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_OBJECT, VIRGL_OBJECT_VERTEX_ELEMENTS, 1); dw[n++] = VE;
+            dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_SHADER, 0, 2); dw[n++] = VS; dw[n++] = PIPE_SHADER_VERTEX;
+            dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_SHADER, 0, 2); dw[n++] = fs; dw[n++] = PIPE_SHADER_FRAGMENT;
+            if (textured) {
+                dw[n++] = VirglCmd0(VIRGL_CCMD_SET_SAMPLER_VIEWS, 0, 3);
+                dw[n++] = PIPE_SHADER_FRAGMENT; dw[n++] = 0; dw[n++] = SVIEW;
+                dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_SAMPLER_STATES, 0, 3);
+                dw[n++] = PIPE_SHADER_FRAGMENT; dw[n++] = 0; dw[n++] = SAMP;
+            }
+            dw[n++] = VirglCmd0(VIRGL_CCMD_SET_VERTEX_BUFFERS, 0, 3);
+            dw[n++] = 16; dw[n++] = 0; dw[n++] = VBUF;
+            dw[n++] = VirglCmd0(VIRGL_CCMD_DRAW_VBO, 0, 12);
+            dw[n++] = 0;  dw[n++] = 4;  dw[n++] = PIPE_PRIM_TRIANGLE_STRIP; dw[n++] = 0;
+            dw[n++] = 1;  dw[n++] = 0;  dw[n++] = 0;  dw[n++] = 0;
+            dw[n++] = 0;  dw[n++] = 0;  dw[n++] = 3;  dw[n++] = 0;
+            sub->size = n * 4;
+            bool sok = CmdRespOk(SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP));
+            bool xok = TransferFromHost3D(DCTX, RT[rt], sdim, sdim);
+            uint32_t cpx = rd[rt][sdim / 2 * sdim + sdim / 2];
+            SerialPrintf("virtio_gpu:  rung%d drawB  submit=%d xfer=%d centre=0x%08x\n",
+                         rt, sok, xok, cpx);
+        }
+    };
+
+    runRung(0, FS_SOLID, false);
+    runRung(1, FS_UV,    false);
+    runRung(2, FS_TEX,   true);
+
+    auto cR = [](uint32_t p){ return (p >> 16) & 0xFF; };
+    auto cG = [](uint32_t p){ return (p >> 8) & 0xFF; };
+    auto cB = [](uint32_t p){ return p & 0xFF; };
+    uint32_t c = sdim / 2 * sdim + sdim / 2;   // centre pixel index
+
+    uint32_t p0 = rd[0][c];
+    bool m1 = cR(p0) > 0xC0 && cG(p0) < 0x40 && cB(p0) < 0x40;          // red
+    SerialPrintf("virtio_gpu: DRAW M1 solid centre=0x%08x -> %s\n", p0, m1 ? "PASS" : "FAIL");
+
+    uint32_t p1 = rd[1][c];
+    bool m2 = cR(p1) > 0x40 && cG(p1) > 0x40 && cB(p1) < 0x40;          // uv≈(0.5,0.5)
+    SerialPrintf("virtio_gpu: DRAW M2 uv centre=0x%08x -> %s\n", p1, m2 ? "PASS" : "FAIL");
+
+    uint32_t p2 = rd[2][c];
+    bool m3 = cR(p2) > 0xC0 && cG(p2) < 0x40 && cB(p2) > 0xC0;          // magenta
+    SerialPrintf("virtio_gpu: DRAW M3 tex centre=0x%08x -> %s\n", p2, m3 ? "PASS" : "FAIL");
+
+    return m1 && m2 && m3;
+}
 
 static int VirtioGpuModuleInit()
 {
@@ -1830,6 +2198,11 @@ static int VirtioGpuModuleInit()
     // Validate the real compositor ops (scattered-backed texture + upload + blit
     // compose, readback-verified). Proves the path the window compositor uses.
     VirtioGpuCompositorSelfTest();
+
+    // Validate the DRAW (textured-quad) pipeline in isolation — the next-step
+    // composition path (per-window opacity, Venus/Vulkan-portable). Readback-
+    // verified ladder; does not touch the live compositor.
+    VirtioGpuDrawSelfTest();
 
     // Take over the display only when we are the PRIMARY device — i.e. a
     // VGA-class device (virtio-vga, PCI subclass 0x00) that provided the boot
