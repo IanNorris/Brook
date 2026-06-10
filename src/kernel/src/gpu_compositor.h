@@ -69,6 +69,23 @@ struct GpuCompositorOps {
     // not free). Sets *outW/*outH to the scanout dimensions. Returns nullptr on
     // failure. For full-res visual / text-fidelity verification.
     const uint32_t* (*CaptureFull)(uint32_t* outW, uint32_t* outH);
+
+    // --- DRAW (textured-quad) composition path ---------------------------
+    // Optional. When DrawSupported() returns true, the compositor may use
+    // DrawQuad instead of Blit to compose each layer through the GL pipeline
+    // (enables per-window opacity). Falls back to Blit when absent/false.
+
+    // True if the GL DRAW path is set up and active (opt/gpudraw + pipeline OK).
+    bool (*DrawSupported)();
+
+    // Draw a src texture region as a textured quad into the scanout at a dst
+    // region (scaled), with optional src-alpha blend and a uniform opacity
+    // (0..255; 255 = opaque). Recorded per call; the batch is composed +
+    // presented by EndFrame. Coordinates match Blit.
+    void (*DrawQuad)(GpuTexId src,
+                     uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh,
+                     uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh,
+                     uint32_t opacity, bool alphaBlend);
 };
 
 // Register the GPU compositor ops (called by the display driver once its 3D

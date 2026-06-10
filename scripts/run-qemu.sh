@@ -350,6 +350,9 @@ fi
 if [ "${BROOK_GPU_FULL:-0}" = "1" ]; then
     FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/gpufull,string=1"
 fi
+if [ "${BROOK_GPU_DRAW:-0}" = "1" ]; then
+    FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/gpudraw,string=1"
+fi
 
 # GPU device selection.
 #   default            : stdvga (q35) primary + virtio-gpu-pci secondary head.

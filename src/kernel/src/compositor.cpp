@@ -294,6 +294,7 @@ static uint32_t  g_wallpaperHeight = 0;
 // Default off → CPU path unchanged.
 // ---------------------------------------------------------------------------
 static bool      g_gpuComposite   = false;   // BROOK_COMPOSITE=gpu requested
+static bool      g_gpuDraw        = false;   // BROOK_GPU_DRAW: GL draw path (vs BLIT)
 static bool      g_gpuThumbDump   = false;   // BROOK_GPU_THUMB: base64 thumbnail over serial
 static uint64_t  g_lastThumbTick  = 0;
 static bool      g_fullDump       = false;   // BROOK_GPU_FULL: one-shot full-res frame dump
@@ -392,6 +393,24 @@ void CompositorInit()
     {
         g_fullDump = true;
         SerialPuts("COMPOSITOR: full-res frame dump enabled (BROOK_GPU_FULL=1)\n");
+    }
+
+    // Optional: compose via the GL DRAW path (textured quads) instead of BLIT.
+    // Only honoured if the driver reports the draw pipeline is set up; otherwise
+    // we silently keep the BLIT path. opt/gpudraw == "1".
+    char gdraw[8] = {};
+    if (FwCfgReadFile("opt/gpudraw", gdraw, sizeof(gdraw) - 1) >= 1 && gdraw[0] == '1')
+    {
+        const GpuCompositorOps* gpu = GpuCompositorGet();
+        if (gpu && gpu->DrawSupported && gpu->DrawSupported() && gpu->DrawQuad)
+        {
+            g_gpuDraw = true;
+            SerialPuts("COMPOSITOR: GPU DRAW composition path enabled (BROOK_GPU_DRAW=1)\n");
+        }
+        else
+        {
+            SerialPuts("COMPOSITOR: BROOK_GPU_DRAW set but driver draw path unavailable — using BLIT\n");
+        }
     }
 }
 
@@ -2054,6 +2073,20 @@ static void DumpFullFrameOnce()
 // window pixels into the framebuffer). See gpu_compositor.h.
 // ---------------------------------------------------------------------------
 
+// Compose one textured layer into the scanout: DrawQuad on the GL draw path,
+// else Blit. Single dispatch point so both paths stay in lockstep. opacity is
+// 255 (opaque) for the parity milestone.
+static inline void GpuComposeLayer(const GpuCompositorOps* gpu, GpuTexId src,
+                                   uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh,
+                                   uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh,
+                                   bool alphaBlend)
+{
+    if (g_gpuDraw)
+        gpu->DrawQuad(src, sx, sy, sw, sh, dx, dy, dw, dh, 255, alphaBlend);
+    else
+        gpu->Blit(src, sx, sy, sw, sh, dx, dy, dw, dh, alphaBlend);
+}
+
 // Blit a screen-space rectangle of the desktop texture 1:1 into the scanout,
 // clamped to the screen. Used to restore chrome/taskbar on top of content.
 static void GpuBlitDesktopRect(const GpuCompositorOps* gpu,
@@ -2066,8 +2099,8 @@ static void GpuBlitDesktopRect(const GpuCompositorOps* gpu,
     if (x + w > (int)g_physFbWidth)  w = (int)g_physFbWidth  - x;
     if (y + h > (int)g_physFbHeight) h = (int)g_physFbHeight - y;
     if (w <= 0 || h <= 0) return;
-    gpu->Blit(g_desktopTex, (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h,
-              (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h, false);
+    GpuComposeLayer(gpu, g_desktopTex, (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h,
+                    (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h, false);
 }
 
 static void EnsureDesktopTex(const GpuCompositorOps* gpu)
@@ -2191,8 +2224,8 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
     gpu->BeginFrame(0);
 
     // Base: desktop (wallpaper + chrome + taskbar). Client areas show wallpaper.
-    gpu->Blit(g_desktopTex, 0, 0, g_physFbWidth, g_physFbHeight,
-              0, 0, g_physFbWidth, g_physFbHeight, false);
+    GpuComposeLayer(gpu, g_desktopTex, 0, 0, g_physFbWidth, g_physFbHeight,
+                    0, 0, g_physFbWidth, g_physFbHeight, false);
 
     // Window content (back-to-front), scaled from source VFB to client area.
     for (uint32_t i = 0; i < wcount; ++i)
@@ -2214,7 +2247,7 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
         if (cdx + cdw > scrW) cdw = scrW - cdx;
         if (cdy + cdh > scrH) cdh = scrH - cdy;
         if (cdw == 0 || cdh == 0) continue;
-        gpu->Blit(e.tex, 0, 0, e.w, e.h, cdx, cdy, cdw, cdh, false);
+        GpuComposeLayer(gpu, e.tex, 0, 0, e.w, e.h, cdx, cdy, cdw, cdh, false);
     }
 
     // Chrome frames on top (back-to-front), so a higher window's chrome is not
@@ -2248,8 +2281,8 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
         {
             uint32_t bcx = cx < 0 ? 0 : (uint32_t)cx;
             uint32_t bcy = cy < 0 ? 0 : (uint32_t)cy;
-            gpu->Blit(g_cursorTex, 0, 0, g_cursorW, g_cursorH,
-                      bcx, bcy, g_cursorW, g_cursorH, true);
+            GpuComposeLayer(gpu, g_cursorTex, 0, 0, g_cursorW, g_cursorH,
+                            bcx, bcy, g_cursorW, g_cursorH, true);
         }
     }
 

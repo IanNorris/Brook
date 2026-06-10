@@ -342,20 +342,27 @@ static inline uint32_t IntToF32Bits(int32_t v)
     return sign | (exp << 23) | (m & 0x7FFFFFu);
 }
 
-// Clip-space (NDC) bit pattern for pixel coordinate `px` on an axis of size
-// `dim`: ndc = 2*px/dim - 1, computed entirely in integer/fixed-point so no
-// runtime FP is used. Exact at pixel boundaries and sub-pixel accurate
-// elsewhere (|err| < 1.2e-7 NDC at 1080p). This is how the compositor turns
-// integer window pixel rects into vertex positions for the DRAW path.
-static inline uint32_t NdcBits(int32_t px, int32_t dim)
+// IEEE-754 bit pattern of the fraction num/den, computed in integer/fixed-point
+// (no runtime FP). Used for texture uv coordinates (s/texDim) and, via NdcBits,
+// for clip-space vertex positions. Exact when num/den is a dyadic-friendly ratio
+// at these magnitudes; |err| < 1.2e-7 otherwise.
+static inline uint32_t FracBits(int32_t num, int32_t den)
 {
-    int32_t num = 2 * px - dim;                      // [-dim, dim]
-    if (num == 0 || dim == 0) return 0;
-    int64_t q = (static_cast<int64_t>(num) << 23) / dim;   // ~ ndc * 2^23
+    if (num == 0 || den == 0) return 0;
+    int64_t q = (static_cast<int64_t>(num) << 23) / den;   // ~ (num/den) * 2^23
+    if (q == 0) return 0;
     uint32_t f = IntToF32Bits(static_cast<int32_t>(q));
     uint32_t exp = (f >> 23) & 0xFF;                 // divide by 2^23 ...
     exp -= 23;                                       // ... via exponent bias
     return (f & 0x807FFFFFu) | (exp << 23);
+}
+
+// Clip-space (NDC) bit pattern for pixel coordinate `px` on an axis of size
+// `dim`: ndc = 2*px/dim - 1. This is how the compositor turns integer window
+// pixel rects into vertex positions for the DRAW path.
+static inline uint32_t NdcBits(int32_t px, int32_t dim)
+{
+    return FracBits(2 * px - dim, dim);
 }
 
 // Self-test context/resource ids and render-target dimension.
@@ -1354,12 +1361,150 @@ static uint32_t* g_compThumbBuf   = nullptr; // thumbnail RT readback backing (v
 static uint32_t* g_compFullBuf    = nullptr; // full-res RT readback backing (virt, lazy)
 static bool      g_compFullReady  = false;   // full-res readback RT created
 
-struct GpuTexture { uint32_t resId; uint32_t w; uint32_t h; uint32_t format; bool used; };
+// --- DRAW (textured-quad) composition path (BROOK_GPU_DRAW) ---------------
+// An alternative to the BLIT compose path: each layer is drawn as a textured
+// quad through the real GL pipeline (vertex+fragment TGSI shaders, blend),
+// which enables per-window opacity and generalises to Venus/Vulkan. The
+// pipeline objects are always set up when 3D is available; whether DRAW is
+// actually used each frame is the compositor's choice (opt/gpudraw), inferred
+// here from whether CompDrawQuad was called. BLIT stays the default + fallback.
+// Proven in isolation by the DRAW self-test ladder (M1-M5).
+static bool      g_drawReady     = false;    // persistent draw objects created
+static uint32_t* g_drawVtxBuf    = nullptr;  // per-frame vertex staging (mapped backing)
+static uint64_t  g_drawVtxPhys   = 0;        // its physical address
+// Persistent draw-pipeline object handles in COMP_CTX_ID (surface=1 already used).
+static constexpr uint32_t COMP_DRAW_VBUF_RES = 13;   // dynamic vertex buffer resource
+static constexpr uint32_t DRAW_BLEND = 2, DRAW_BLEND_ON = 3, DRAW_RAST = 4,
+                          DRAW_DSA = 5, DRAW_VE = 6, DRAW_SAMP = 7,
+                          DRAW_VS = 8, DRAW_FS = 9;
+static uint32_t  g_drawNextSview = 256;      // monotonic sampler-view handle allocator
+// One recorded quad (filled by CompDrawQuad, consumed by CompEndFrame). Dst is in
+// integer screen pixels; uv is precomputed float bits; blend selects the object.
+struct DrawQuadRec {
+    int32_t  dx, dy, dx2, dy2;   // dst rect (screen px), [dx,dx2) x [dy,dy2)
+    uint32_t u0, v0, u1, v1;     // source uv as IEEE-754 bits
+    uint32_t sview;              // texture sampler-view handle
+    uint32_t blend;             // DRAW_BLEND (opaque) or DRAW_BLEND_ON (alpha)
+};
+static constexpr uint32_t MAX_DRAW_QUADS = 256;
+static DrawQuadRec g_drawQuads[MAX_DRAW_QUADS];
+static uint32_t    g_drawQuadCount = 0;
+
+struct GpuTexture { uint32_t resId; uint32_t w; uint32_t h; uint32_t format; bool used; uint32_t sview; };
 static constexpr uint32_t MAX_GPU_TEXTURES = 128;
 static GpuTexture g_gpuTextures[MAX_GPU_TEXTURES] = {};
 
 static inline uint32_t* ComposeDwBase()
 { return reinterpret_cast<uint32_t*>(g_cmdBuf + CMD_REQ_OFF + sizeof(VirtioGpuCmdSubmit)); }
+
+// Forward declarations for the DRAW-path helpers (defined with the DRAW
+// self-test further down) so the compositor's draw setup can use them.
+static bool ResourceCreateBuffer(uint32_t resId, uint32_t bind, uint32_t byteLen);
+static bool TransferToHostBuffer(uint32_t ctxId, uint32_t resId, uint32_t byteLen);
+static bool CreateShaderObj(uint32_t ctxId, uint32_t handle, uint32_t shaderType,
+                            const char* text);
+
+// Pass-through vertex shader (clip-space pos from IN[0], uv from IN[1]) and a
+// textured fragment shader (sample SVIEW[0] at the interpolated uv). Shared by
+// the DRAW self-test and the live DRAW compositor path. Sent as TGSI text.
+static const char* kDrawVS =
+    "VERT\n"
+    "DCL IN[0]\n"
+    "DCL IN[1]\n"
+    "DCL OUT[0], POSITION\n"
+    "DCL OUT[1], GENERIC[0]\n"
+    "MOV OUT[0], IN[0]\n"
+    "MOV OUT[1], IN[1]\n"
+    "END\n";
+static const char* kDrawFS_Tex =
+    "FRAG\n"
+    "DCL IN[0], GENERIC[0], PERSPECTIVE\n"
+    "DCL OUT[0], COLOR\n"
+    "DCL SAMP[0]\n"
+    "DCL SVIEW[0], 2D, FLOAT\n"
+    "TEX OUT[0], IN[0], SAMP[0], 2D\n"
+    "END\n";
+
+// One-time setup of the persistent DRAW pipeline objects in COMP_CTX_ID: a
+// dynamic vertex buffer (refilled each frame), two blend states (opaque +
+// src-alpha-over), rasterizer, depth/stencil-off, vertex-element layout,
+// nearest sampler, and the pass-through + textured shaders. Mirrors the
+// proven DRAW self-test. Returns false (leaving the BLIT path active) on any
+// failure. Per-texture sampler views are created lazily in CompCreateTexture.
+static bool SetupGpuDrawPipeline()
+{
+    // Dynamic vertex buffer: MAX_DRAW_QUADS quads * 4 verts * 4 floats * 4 bytes.
+    const uint32_t vbytes = MAX_DRAW_QUADS * 4 * 4 * 4;
+    PhysicalAddress vp = PmmAllocPages(AlignUp(vbytes, 4096) / 4096, MemTag::Device, KernelPid);
+    if (!vp) { SerialPuts("virtio_gpu: draw vbuf alloc failed\n"); return false; }
+    g_drawVtxPhys = vp.raw();
+    g_drawVtxBuf  = reinterpret_cast<uint32_t*>(PhysToVirt(vp).raw());
+    memset(g_drawVtxBuf, 0, vbytes);
+    if (!ResourceCreateBuffer(COMP_DRAW_VBUF_RES, VIRGL_BIND_VERTEX_BUFFER, vbytes) ||
+        !ResourceAttachBackingContig(COMP_DRAW_VBUF_RES, g_drawVtxPhys, vbytes) ||
+        !CtxAttachResource(COMP_CTX_ID, COMP_DRAW_VBUF_RES))
+    { SerialPuts("virtio_gpu: draw vbuf resource failed\n"); g_drawVtxBuf = nullptr; return false; }
+
+    // Pipeline state objects, one submit.
+    {
+        auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
+        memset(sub, 0, sizeof(*sub));
+        sub->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D; sub->hdr.ctx_id = COMP_CTX_ID;
+        uint32_t* dw = ComposeDwBase(); uint32_t n = 0;
+        // Opaque blend (colormask only).
+        dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_BLEND, 11);
+        dw[n++] = DRAW_BLEND; dw[n++] = 0; dw[n++] = 0;
+        dw[n++] = (0xFu << 27);
+        for (int i = 1; i < 8; ++i) dw[n++] = 0;
+        // Src-alpha-over blend.
+        {
+            uint32_t s2 = 1u
+                        | (PIPE_BLEND_ADD << 1)
+                        | (PIPE_BLENDFACTOR_SRC_ALPHA << 4)
+                        | (PIPE_BLENDFACTOR_INV_SRC_ALPHA << 9)
+                        | (PIPE_BLEND_ADD << 14)
+                        | (PIPE_BLENDFACTOR_SRC_ALPHA << 17)
+                        | (PIPE_BLENDFACTOR_INV_SRC_ALPHA << 22)
+                        | (0xFu << 27);
+            dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_BLEND, 11);
+            dw[n++] = DRAW_BLEND_ON; dw[n++] = 0; dw[n++] = 0;
+            dw[n++] = s2;
+            for (int i = 1; i < 8; ++i) dw[n++] = 0;
+        }
+        // Rasterizer.
+        dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_RASTERIZER, 9);
+        dw[n++] = DRAW_RAST;
+        dw[n++] = (1u << 1) | (1u << 29);    // DEPTH_CLIP | HALF_PIXEL_CENTER
+        dw[n++] = F32Bits(1.0f);
+        dw[n++] = 0; dw[n++] = 0;
+        dw[n++] = F32Bits(1.0f);
+        dw[n++] = 0; dw[n++] = 0; dw[n++] = 0;
+        // DSA off.
+        dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_DSA, 5);
+        dw[n++] = DRAW_DSA; dw[n++] = 0; dw[n++] = 0; dw[n++] = 0; dw[n++] = 0;
+        // Vertex elements: pos @0, uv @8, both R32G32_FLOAT, vb 0.
+        dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_VERTEX_ELEMENTS, 9);
+        dw[n++] = DRAW_VE;
+        dw[n++] = 0; dw[n++] = 0; dw[n++] = 0; dw[n++] = VIRGL_FORMAT_R32G32_FLOAT;
+        dw[n++] = 8; dw[n++] = 0; dw[n++] = 0; dw[n++] = VIRGL_FORMAT_R32G32_FLOAT;
+        // Sampler state: nearest, wrap repeat (all-zero S0).
+        dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SAMPLER_STATE, 9);
+        dw[n++] = DRAW_SAMP; dw[n++] = 0;
+        dw[n++] = 0; dw[n++] = 0; dw[n++] = 0;
+        dw[n++] = 0; dw[n++] = 0; dw[n++] = 0; dw[n++] = 0;
+        sub->size = n * 4;
+        if (!CmdRespOk(SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP)))
+        { SerialPuts("virtio_gpu: draw pipeline objects failed\n"); return false; }
+    }
+
+    // Shaders.
+    if (!CreateShaderObj(COMP_CTX_ID, DRAW_VS, PIPE_SHADER_VERTEX, kDrawVS) ||
+        !CreateShaderObj(COMP_CTX_ID, DRAW_FS, PIPE_SHADER_FRAGMENT, kDrawFS_Tex))
+    { SerialPuts("virtio_gpu: draw shader create failed\n"); return false; }
+
+    g_drawReady = true;
+    return true;
+}
 
 // One-time setup of the persistent compositor context + scanout render-target.
 // The scanout RT has NO guest backing (host-only); FLUSH presents it directly.
@@ -1428,6 +1573,15 @@ static bool SetupGpuCompositor(uint32_t w, uint32_t h)
 
     g_compReady    = true;
     SerialPrintf("virtio_gpu: GPU compositor ready (scanout RT %ux%u)\n", w, h);
+
+    // Set up the optional DRAW (textured-quad) pipeline objects. If this fails we
+    // leave g_drawReady false and DrawSupported() reports false, so the compositor
+    // keeps using the BLIT path. Whether DRAW is actually used per frame is the
+    // compositor's choice (opt/gpudraw) and is inferred here from DrawQuad usage.
+    if (SetupGpuDrawPipeline())
+        SerialPuts("virtio_gpu: GPU DRAW pipeline ready (textured-quad composition available)\n");
+    else
+        SerialPuts("virtio_gpu: GPU DRAW pipeline unavailable — BLIT only\n");
     return true;
 }
 
@@ -1448,7 +1602,28 @@ static GpuTexId CompCreateTexture(uint32_t w, uint32_t h, uint64_t backingVaddr,
     if (!CtxAttachResource(COMP_CTX_ID, resId))
     { SerialPuts("virtio_gpu: comp tex ctx-attach failed\n"); return 0; }
 
-    g_gpuTextures[slot] = { resId, w, h, format, true };
+    g_gpuTextures[slot] = { resId, w, h, format, true, 0 };
+    GpuTexture& gt = g_gpuTextures[slot];
+
+    // In DRAW mode, every texture needs a sampler view to be drawn as a quad.
+    // Create it once here (outside any frame-compose accumulation, so it can
+    // safely issue its own submit). Identity swizzle (0x688): R->R,G->G,B->B,A->A.
+    if (g_drawReady)
+    {
+        uint32_t sv = g_drawNextSview++;
+        auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
+        memset(sub, 0, sizeof(*sub));
+        sub->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D; sub->hdr.ctx_id = COMP_CTX_ID;
+        uint32_t* dw = ComposeDwBase(); uint32_t n = 0;
+        dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SAMPLER_VIEW, 6);
+        dw[n++] = sv; dw[n++] = resId; dw[n++] = format;
+        dw[n++] = 0; dw[n++] = 0; dw[n++] = 0x688u;
+        sub->size = n * 4;
+        if (CmdRespOk(SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP)))
+            gt.sview = sv;
+        else
+            SerialPuts("virtio_gpu: comp tex sampler-view create failed\n");
+    }
     return slot + 1;   // GpuTexId is 1-based
 }
 
@@ -1491,6 +1666,11 @@ static void CompBeginFrame(uint32_t clearArgb)
             g_compScanoutBound = true;
     }
 
+    // Reset the DRAW record list (whether or not DRAW is used this frame). If
+    // the compositor records quads via CompDrawQuad, CompEndFrame builds the
+    // batched draw stream and ignores the BLIT compose stream below.
+    g_drawQuadCount = 0;
+
     // Start a fresh compose stream: SET_FRAMEBUFFER_STATE(scanout surf) + CLEAR.
     // Clear to opaque black. (The kernel builds with -mno-sse / soft-float is not
     // linked, so we use only the literal float constants 0.0f/1.0f, which the
@@ -1512,6 +1692,34 @@ static void CompBeginFrame(uint32_t clearArgb)
     dw[n++] = 0;                   // stencil
 
     g_composeN = n;
+}
+
+// Record a textured-quad layer for the DRAW path: sample (sx,sy,sw,sh) of the
+// source texture into screen rect (dx,dy,dw,dh), with optional src-alpha blend.
+// uv is precomputed here (needs the texture dims); vertices + GPU commands are
+// emitted in CompEndFrame. `opacity` is accepted for interface parity but not
+// yet applied (opaque-parity milestone; per-window opacity is a follow-up).
+static void CompDrawQuad(GpuTexId src,
+                         uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh,
+                         uint32_t dx, uint32_t dy, uint32_t dw_, uint32_t dh,
+                         uint32_t opacity, bool alphaBlend)
+{
+    (void)opacity;
+    if (!g_compReady || !g_drawReady || g_drawQuadCount >= MAX_DRAW_QUADS) return;
+    GpuTexture* gt = CompTex(src);
+    if (!gt || gt->sview == 0) return;
+
+    DrawQuadRec& q = g_drawQuads[g_drawQuadCount++];
+    q.dx  = static_cast<int32_t>(dx);
+    q.dy  = static_cast<int32_t>(dy);
+    q.dx2 = static_cast<int32_t>(dx + dw_);
+    q.dy2 = static_cast<int32_t>(dy + dh);
+    q.u0 = FracBits(static_cast<int32_t>(sx),       static_cast<int32_t>(gt->w));
+    q.v0 = FracBits(static_cast<int32_t>(sy),       static_cast<int32_t>(gt->h));
+    q.u1 = FracBits(static_cast<int32_t>(sx + sw),  static_cast<int32_t>(gt->w));
+    q.v1 = FracBits(static_cast<int32_t>(sy + sh),  static_cast<int32_t>(gt->h));
+    q.sview = gt->sview;
+    q.blend = alphaBlend ? DRAW_BLEND_ON : DRAW_BLEND;
 }
 
 static void CompBlit(GpuTexId src,
@@ -1550,9 +1758,91 @@ static void CompBlit(GpuTexId src,
     g_composeN = n;
 }
 
+// Build the per-frame vertex buffer from the recorded quads, upload it, then
+// emit one batched compose stream (framebuffer + clear + state binds, then per
+// quad: blend, sampler view, vertex-buffer offset, draw) and present. Keeps the
+// vertex upload and the draw submit as separate sequential submits so the
+// command buffer is never aliased.
+static void CompEndFrameDraw()
+{
+    // 1. Fill the vertex staging buffer: 4 verts/quad, {pos.xy, uv.xy} each.
+    //    NDC positions derived from integer pixel rects via NdcBits (no FP).
+    int32_t W = static_cast<int32_t>(g_compScanoutW);
+    int32_t H = static_cast<int32_t>(g_compScanoutH);
+    for (uint32_t i = 0; i < g_drawQuadCount; ++i)
+    {
+        const DrawQuadRec& q = g_drawQuads[i];
+        uint32_t nx0 = NdcBits(q.dx,  W), ny0 = NdcBits(q.dy,  H);
+        uint32_t nx1 = NdcBits(q.dx2, W), ny1 = NdcBits(q.dy2, H);
+        uint32_t* v = g_drawVtxBuf + i * 16;
+        v[0]=nx0; v[1]=ny0; v[2]=q.u0; v[3]=q.v0;
+        v[4]=nx1; v[5]=ny0; v[6]=q.u1; v[7]=q.v0;
+        v[8]=nx0; v[9]=ny1; v[10]=q.u0; v[11]=q.v1;
+        v[12]=nx1; v[13]=ny1; v[14]=q.u1; v[15]=q.v1;
+    }
+    if (g_drawQuadCount > 0)
+        TransferToHostBuffer(COMP_CTX_ID, COMP_DRAW_VBUF_RES, g_drawQuadCount * 64);
+
+    // 2. Build the compose stream.
+    auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
+    memset(sub, 0, sizeof(*sub));
+    sub->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D; sub->hdr.ctx_id = COMP_CTX_ID;
+    uint32_t* dw = ComposeDwBase(); uint32_t n = 0;
+
+    // Framebuffer + clear (opaque black; wallpaper quad covers it).
+    dw[n++] = VirglCmd0(VIRGL_CCMD_SET_FRAMEBUFFER_STATE, 0, 3);
+    dw[n++] = 1; dw[n++] = 0; dw[n++] = COMP_SCANOUT_SURF;
+    dw[n++] = VirglCmd0(VIRGL_CCMD_CLEAR, 0, 8);
+    dw[n++] = PIPE_CLEAR_COLOR0;
+    dw[n++] = F32Bits(0.0f); dw[n++] = F32Bits(0.0f); dw[n++] = F32Bits(0.0f); dw[n++] = F32Bits(1.0f);
+    dw[n++] = 0; dw[n++] = 0; dw[n++] = 0;
+    // Viewport: clip [-1,1] -> [0,W]x[0,H]. scale=(W/2,H/2), translate=(W/2,H/2),
+    // built from integer dims via IntToF32Bits (no runtime FP).
+    dw[n++] = VirglCmd0(VIRGL_CCMD_SET_VIEWPORT_STATE, 0, 7);
+    dw[n++] = 0;
+    dw[n++] = IntToF32Bits(W / 2); dw[n++] = IntToF32Bits(H / 2); dw[n++] = F32Bits(1.0f);
+    dw[n++] = IntToF32Bits(W / 2); dw[n++] = IntToF32Bits(H / 2); dw[n++] = F32Bits(0.0f);
+    // State bound once for the whole frame.
+    dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_OBJECT, VIRGL_OBJECT_RASTERIZER, 1);      dw[n++] = DRAW_RAST;
+    dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_OBJECT, VIRGL_OBJECT_DSA, 1);             dw[n++] = DRAW_DSA;
+    dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_OBJECT, VIRGL_OBJECT_VERTEX_ELEMENTS, 1); dw[n++] = DRAW_VE;
+    dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_SHADER, 0, 2); dw[n++] = DRAW_VS; dw[n++] = PIPE_SHADER_VERTEX;
+    dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_SHADER, 0, 2); dw[n++] = DRAW_FS; dw[n++] = PIPE_SHADER_FRAGMENT;
+    dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_SAMPLER_STATES, 0, 3);
+    dw[n++] = PIPE_SHADER_FRAGMENT; dw[n++] = 0; dw[n++] = DRAW_SAMP;
+
+    uint32_t lastBlend = 0;
+    for (uint32_t i = 0; i < g_drawQuadCount; ++i)
+    {
+        const DrawQuadRec& q = g_drawQuads[i];
+        // ~12 dwords/quad; bail if we'd overflow the compose region (last page
+        // is the response buffer).
+        if (n + 16 > (CMD_PAGES - 1) * 1024) break;
+        if (q.blend != lastBlend) {
+            dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_OBJECT, VIRGL_OBJECT_BLEND, 1);
+            dw[n++] = q.blend;
+            lastBlend = q.blend;
+        }
+        dw[n++] = VirglCmd0(VIRGL_CCMD_SET_SAMPLER_VIEWS, 0, 3);
+        dw[n++] = PIPE_SHADER_FRAGMENT; dw[n++] = 0; dw[n++] = q.sview;
+        dw[n++] = VirglCmd0(VIRGL_CCMD_SET_VERTEX_BUFFERS, 0, 3);
+        dw[n++] = 16; dw[n++] = i * 64; dw[n++] = COMP_DRAW_VBUF_RES;
+        dw[n++] = VirglCmd0(VIRGL_CCMD_DRAW_VBO, 0, 12);
+        dw[n++] = 0; dw[n++] = 4; dw[n++] = PIPE_PRIM_TRIANGLE_STRIP; dw[n++] = 0;
+        dw[n++] = 1; dw[n++] = 0; dw[n++] = 0; dw[n++] = 0;
+        dw[n++] = 0; dw[n++] = 0; dw[n++] = 3; dw[n++] = 0;
+    }
+    sub->size = n * 4;
+    SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP);
+    g_drawQuadCount = 0;
+    ResourceFlush(COMP_SCANOUT_RES, 0, 0, g_compScanoutW, g_compScanoutH);
+}
+
 static void CompEndFrame()
 {
-    if (!g_compReady || g_composeN == 0) return;
+    if (!g_compReady) return;
+    if (g_drawReady && g_drawQuadCount > 0) { CompEndFrameDraw(); return; }
+    if (g_composeN == 0) return;
     auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
     memset(sub, 0, sizeof(*sub));
     sub->hdr.type   = VIRTIO_GPU_CMD_SUBMIT_3D;
@@ -1562,6 +1852,12 @@ static void CompEndFrame()
     g_composeN = 0;
     // Present the composed scanout RT.
     ResourceFlush(COMP_SCANOUT_RES, 0, 0, g_compScanoutW, g_compScanoutH);
+}
+
+// True if the DRAW composition path is active (opt/gpudraw + pipeline ready).
+static bool CompDrawSupported()
+{
+    return g_drawReady;
 }
 
 static void CompGetSize(uint32_t* w, uint32_t* h)
@@ -1668,6 +1964,8 @@ static const brook::GpuCompositorOps g_gpuCompositorOps = {
     CompGetSize,
     CompCaptureThumb,
     CompCaptureFull,
+    CompDrawSupported,
+    CompDrawQuad,
 };
 
 // Readback self-test of the real compositor ops: build a scattered-backed
@@ -1841,16 +2139,6 @@ static bool CreateShaderObj(uint32_t ctxId, uint32_t handle, uint32_t shaderType
 }
 
 // Pass-through vertex shader: clip-space position from IN[0], uv from IN[1].
-static const char* kDrawVS =
-    "VERT\n"
-    "DCL IN[0]\n"
-    "DCL IN[1]\n"
-    "DCL OUT[0], POSITION\n"
-    "DCL OUT[1], GENERIC[0]\n"
-    "MOV OUT[0], IN[0]\n"
-    "MOV OUT[1], IN[1]\n"
-    "END\n";
-
 // M1 fragment shader: constant red (proves the pipeline draws at all).
 static const char* kDrawFS_Solid =
     "FRAG\n"
@@ -1865,16 +2153,6 @@ static const char* kDrawFS_UV =
     "DCL IN[0], GENERIC[0], PERSPECTIVE\n"
     "DCL OUT[0], COLOR\n"
     "MOV OUT[0], IN[0]\n"
-    "END\n";
-
-// M3 fragment shader: sample the bound texture at the interpolated uv.
-static const char* kDrawFS_Tex =
-    "FRAG\n"
-    "DCL IN[0], GENERIC[0], PERSPECTIVE\n"
-    "DCL OUT[0], COLOR\n"
-    "DCL SAMP[0]\n"
-    "DCL SVIEW[0], 2D, FLOAT\n"
-    "TEX OUT[0], IN[0], SAMP[0], 2D\n"
     "END\n";
 
 // Drives one rung of the DRAW ladder against a fresh readback RT and returns the
