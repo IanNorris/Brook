@@ -804,7 +804,7 @@ uint32_t WmGetZOrder(int* outIndices, uint32_t maxOut)
 // ---------------------------------------------------------------------------
 
 // Draw a filled circle at (cx, cy) with given radius and color
-static void WmFillCircle(uint32_t* buf, uint32_t stride,
+[[maybe_unused]] static void WmFillCircle(uint32_t* buf, uint32_t stride,
                           uint32_t screenW, uint32_t screenH,
                           int cx, int cy, int radius, uint32_t color)
 {
@@ -821,6 +821,41 @@ static void WmFillCircle(uint32_t* buf, uint32_t stride,
             buf[py * stride + px] = color;
         }
     }
+}
+
+// Draw a caption button: a rounded-rect glass cell (vertical gradient) with a
+// faux-engraved bevel — a dark inner shadow along the top+left edges and a light
+// highlight along the bottom+right edges, so the button reads as carved into the
+// titlebar. The 1px corners are left unfilled so the titlebar shows through for a
+// soft rounded look. Icon glyphs are drawn by the caller, engraved on top.
+static void WmDrawCaptionButton(uint32_t* buf, uint32_t stride,
+                                uint32_t screenW, uint32_t screenH,
+                                int bx, int by, int bw, int bh,
+                                uint32_t top, uint32_t bot)
+{
+    for (int r = 0; r < bh; ++r)
+    {
+        uint32_t rc = WmLerpColor(top, bot, r, bh - 1);
+        // Inset the very top/bottom rows by 1px at each end for rounded corners.
+        int inset = (r == 0 || r == bh - 1) ? 1 : 0;
+        WmFillRect(buf, stride, screenW, screenH,
+                   bx + inset, by + r, bw - 2 * inset, 1, rc);
+    }
+    // Engraved bevel: dark top + left, light bottom + right (skip rounded corners).
+    WmFillRect(buf, stride, screenW, screenH, bx + 1, by, bw - 2, 1, WM_BTN_BEVEL_DARK);
+    WmFillRect(buf, stride, screenW, screenH, bx, by + 1, 1, bh - 2, WM_BTN_BEVEL_DARK);
+    WmFillRect(buf, stride, screenW, screenH, bx + 1, by + bh - 1, bw - 2, 1, WM_BTN_BEVEL_LIGHT);
+    WmFillRect(buf, stride, screenW, screenH, bx + bw - 1, by + 1, 1, bh - 2, WM_BTN_BEVEL_LIGHT);
+}
+
+// Draw a 1px point with an engraved feel: a light highlight 1px below the dark
+// glyph pixel, so icons look carved into the glass button.
+static inline void WmEngravePixel(uint32_t* buf, uint32_t stride,
+                                  uint32_t screenW, uint32_t screenH,
+                                  int x, int y, uint32_t fg)
+{
+    WmPutPixel(buf, stride, screenW, screenH, x, y + 1, WM_BTN_BEVEL_LIGHT);
+    WmPutPixel(buf, stride, screenW, screenH, x, y, fg);
 }
 
 static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
@@ -876,58 +911,67 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
                    titleX + WM_TITLE_TEXT_PAD_X, textY, w.title,
                    WM_TITLE_FG, titleBg, titleMaxW);
 
-    // Close/maximize/minimize buttons — circles centered in their button cells.
-    // The circle is centered in the square WM_BUTTON_WIDTH × titleH cell.
-    // The center is offset by 0.5px due to even dimensions, so we use
-    // (btnX + width/2) which gives a consistent pixel center.
-    static constexpr int CHROME_BTN_RADIUS = 8;
-    static constexpr int ICON_HALF = 3;  // half-size of icons (6×6 total)
-    static constexpr int CLOSE_ICON_HALF = 3; // smaller × for close button
-    int btnCenterY = titleY + static_cast<int>(titleH) / 2;
+    // Close / maximize / minimize — larger rounded-rect glass buttons with a
+    // faux-engraved bevel, filling most of the titlebar height. Icons are engraved
+    // (a light highlight under the dark stroke) so they look carved into the glass.
+    int by = titleY + 4;
+    int bh = static_cast<int>(titleH) - 8;
+    if (bh < 8) bh = 8;
+    int hInset = 3;                                   // gap inside each cell
+    int bw = static_cast<int>(WM_BUTTON_WIDTH) - 2 * hInset;
+    int iconCY = by + bh / 2;
 
-    // Close button — circular red dot with small × icon
+    auto engraveHLine = [&](int x, int y, int len, uint32_t fg) {
+        WmFillRect(buf, stride, screenW, screenH, x, y + 1, len, 1, WM_BTN_BEVEL_LIGHT);
+        WmFillRect(buf, stride, screenW, screenH, x, y, len, 1, fg);
+    };
+    auto engraveVLine = [&](int x, int y, int len, uint32_t fg) {
+        WmFillRect(buf, stride, screenW, screenH, x + 1, y, 1, len, WM_BTN_BEVEL_LIGHT);
+        WmFillRect(buf, stride, screenW, screenH, x, y, 1, len, fg);
+    };
+
+    // Close button (rightmost) — red glass, engraved ×.
     int closeBtnX = wx + ow - static_cast<int>(WM_BORDER_WIDTH) - static_cast<int>(WM_BUTTON_WIDTH);
     bool closeHover = w.focused && mouseX >= closeBtnX && mouseX < closeBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
                       mouseY >= titleY && mouseY < titleY + titleH;
-    uint32_t closeBg = closeHover ? 0x00CC3333 : WM_CLOSE_BTN_BG;
-    int closeCenterX = closeBtnX + static_cast<int>(WM_BUTTON_WIDTH) / 2;
-    WmFillCircle(buf, stride, screenW, screenH,
-                 closeCenterX, btnCenterY, CHROME_BTN_RADIUS, closeBg);
-    // Draw × with 1px diagonal lines (thinner, more delicate)
-    for (int d = -CLOSE_ICON_HALF; d <= CLOSE_ICON_HALF; d++)
+    int closeBx = closeBtnX + hInset;
+    int closeCx = closeBx + bw / 2;
+    WmDrawCaptionButton(buf, stride, screenW, screenH, closeBx, by, bw, bh,
+                        closeHover ? 0x00E05555 : 0x00C83C3C,
+                        closeHover ? 0x00B02828 : 0x00982020);
+    static constexpr int CLOSE_HALF = 4;
+    for (int d = -CLOSE_HALF; d <= CLOSE_HALF; ++d)
     {
-        WmPutPixel(buf, stride, screenW, screenH, closeCenterX + d, btnCenterY + d, WM_TITLE_FG);
-        WmPutPixel(buf, stride, screenW, screenH, closeCenterX + d, btnCenterY - d, WM_TITLE_FG);
+        WmEngravePixel(buf, stride, screenW, screenH, closeCx + d, iconCY + d, WM_TITLE_FG);
+        WmEngravePixel(buf, stride, screenW, screenH, closeCx + d, iconCY - d, WM_TITLE_FG);
     }
 
-    // Maximize button — circular with small box icon
+    // Maximize button — glass, engraved box outline.
     int maxBtnX = closeBtnX - static_cast<int>(WM_BUTTON_WIDTH);
     bool maxHover = w.focused && mouseX >= maxBtnX && mouseX < maxBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
                     mouseY >= titleY && mouseY < titleY + titleH;
-    uint32_t maxBg = maxHover ? 0x005E9CDC : 0x003F6BA8;
-    int maxCenterX = maxBtnX + static_cast<int>(WM_BUTTON_WIDTH) / 2;
-    WmFillCircle(buf, stride, screenW, screenH,
-                 maxCenterX, btnCenterY, CHROME_BTN_RADIUS, maxBg);
-    // 6×6 box centered in the circle
-    int sqS = ICON_HALF * 2;
-    int sqX = maxCenterX - ICON_HALF;
-    int sqY = btnCenterY - ICON_HALF;
-    WmFillRect(buf, stride, screenW, screenH, sqX, sqY, sqS, 1, WM_TITLE_FG);
-    WmFillRect(buf, stride, screenW, screenH, sqX, sqY + sqS - 1, sqS, 1, WM_TITLE_FG);
-    WmFillRect(buf, stride, screenW, screenH, sqX, sqY, 1, sqS, WM_TITLE_FG);
-    WmFillRect(buf, stride, screenW, screenH, sqX + sqS - 1, sqY, 1, sqS, WM_TITLE_FG);
+    int maxBx = maxBtnX + hInset;
+    int maxCx = maxBx + bw / 2;
+    WmDrawCaptionButton(buf, stride, screenW, screenH, maxBx, by, bw, bh,
+                        maxHover ? WM_BTN_HOVER_TOP : WM_BTN_TOP,
+                        maxHover ? WM_BTN_HOVER_BOT : WM_BTN_BOT);
+    int boxW = 11, boxH = 9;
+    int boxX = maxCx - boxW / 2, boxY = iconCY - boxH / 2;
+    engraveHLine(boxX, boxY, boxW, WM_TITLE_FG);              // top
+    engraveHLine(boxX, boxY + boxH - 1, boxW, WM_TITLE_FG);   // bottom
+    engraveVLine(boxX, boxY, boxH, WM_TITLE_FG);             // left
+    engraveVLine(boxX + boxW - 1, boxY, boxH, WM_TITLE_FG);  // right
 
-    // Minimize button — circular with small centered dash
+    // Minimize button — glass, engraved dash near the baseline.
     int minBtnX = maxBtnX - static_cast<int>(WM_BUTTON_WIDTH);
     bool minHover = w.focused && mouseX >= minBtnX && mouseX < minBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
                     mouseY >= titleY && mouseY < titleY + titleH;
-    uint32_t minBg = minHover ? 0x005E9CDC : 0x003F6BA8;
-    int minCenterX = minBtnX + static_cast<int>(WM_BUTTON_WIDTH) / 2;
-    WmFillCircle(buf, stride, screenW, screenH,
-                 minCenterX, btnCenterY, CHROME_BTN_RADIUS, minBg);
-    // 6px horizontal dash centered vertically
-    WmFillRect(buf, stride, screenW, screenH,
-               minCenterX - ICON_HALF, btnCenterY, ICON_HALF * 2, 1, WM_TITLE_FG);
+    int minBx = minBtnX + hInset;
+    int minCx = minBx + bw / 2;
+    WmDrawCaptionButton(buf, stride, screenW, screenH, minBx, by, bw, bh,
+                        minHover ? WM_BTN_HOVER_TOP : WM_BTN_TOP,
+                        minHover ? WM_BTN_HOVER_BOT : WM_BTN_BOT);
+    engraveHLine(minCx - 5, iconCY + 2, 11, WM_TITLE_FG);
 }
 
 void WmRenderChrome(uint32_t* backBuffer, uint32_t stride,
