@@ -269,6 +269,7 @@ static constexpr uint32_t VIRGL_FORMAT_B8G8R8X8_UNORM = 2;
 static constexpr uint32_t PIPE_TEXTURE_2D             = 2;
 static constexpr uint32_t VIRGL_BIND_RENDER_TARGET    = 1u << 1;
 static constexpr uint32_t VIRGL_BIND_SAMPLER_VIEW     = 1u << 3;
+static constexpr uint32_t VIRGL_BIND_SCANOUT          = 1u << 18;
 static constexpr uint32_t PIPE_CLEAR_COLOR0           = 1u << 2;
 
 // virgl command-stream opcodes + object types.
@@ -294,9 +295,12 @@ static inline uint32_t F32Bits(float f)
 static constexpr uint32_t CTX_ID_SELFTEST = 1;
 static constexpr uint32_t RES_3D_SELFTEST = 2;   // src (cleared green)
 static constexpr uint32_t RES_3D_BLITDST  = 3;   // blit target (blue + green square)
+static constexpr uint32_t RES_3D_SCANOUT  = 4;   // scanout-RT present-path gate test
 static constexpr uint32_t SURF_SRC        = 1;   // surface handle for src clear
 static constexpr uint32_t SURF_DST        = 2;   // surface handle for dst clear
+static constexpr uint32_t SURF_SCANOUT    = 3;   // surface handle for scanout clear
 static constexpr uint32_t SELFTEST_DIM    = 64;
+static constexpr uint32_t SCANOUT_TEST_DIM = 256; // gate-test scanout RT size
 
 // virtio-gpu device config (virtio 1.2 §5.7.4). num_capsets is meaningful only
 // when VIRGL is negotiated (0 on a plain 2D device).
@@ -363,6 +367,8 @@ static uint32_t          g_numCapsets = 0;
 static bool              g_haveVenusCapset = false;
 // Set true once the GPU-clear self-test confirms a live host 3D path.
 static bool              g_gpu3dWorks = false;
+// Set true once Gate #1 (scanout-as-3D-RT present path) is verified.
+static bool              g_gpuScanoutRtOk = false;
 
 // controlq (queue 0)
 static uint16_t            g_queueSize = 0;
@@ -1089,6 +1095,60 @@ static void VirtioGpu3DSelfTest()
     SerialPrintf("virtio_gpu: 3D self-test [blit] corner=0x%08x centre=0x%08x -> %s\n",
                  corner, centre, blitOk ? "PASS" : "FAIL");
     if (!blitOk) return;
+
+    // --- Gate #1: scanout-as-3D-RT present path ---
+    // The GPU compositor composes into a 3D render-target and presents it via
+    // SET_SCANOUT + FLUSH (no guest framebuffer copy). Prove that path here:
+    // create a scanout-capable 3D RT, SET_SCANOUT it, CLEAR it red, BLIT the
+    // green texture's corner into it, FLUSH (present), then read it back and
+    // verify. A backing is attached only so this test can read the result; the
+    // real compositor scanout needs none. Runs before display takeover, which
+    // re-points scanout 0 at the 2D framebuffer afterwards.
+    {
+        const uint32_t sdim  = SCANOUT_TEST_DIM;
+        const uint32_t sbytes = sdim * sdim * 4;
+        const uint32_t spages = AlignUp(sbytes, 4096) / 4096;
+        PhysicalAddress sphys = PmmAllocPages(spages, MemTag::Device, KernelPid);
+        if (!sphys) { SerialPuts("virtio_gpu: 3D self-test scanout alloc failed\n"); return; }
+        uint32_t* sread = reinterpret_cast<uint32_t*>(PhysToVirt(sphys).raw());
+        memset(sread, 0, sbytes);
+
+        if (!ResourceCreate3D(RES_3D_SCANOUT, VIRGL_FORMAT_B8G8R8X8_UNORM,
+                              VIRGL_BIND_RENDER_TARGET | VIRGL_BIND_SCANOUT |
+                              VIRGL_BIND_SAMPLER_VIEW, sdim, sdim))
+        { SerialPuts("virtio_gpu: 3D self-test scanout RT create failed\n"); return; }
+        if (!ResourceAttachBackingContig(RES_3D_SCANOUT, sphys.raw(), sbytes))
+        { SerialPuts("virtio_gpu: 3D self-test scanout backing failed\n"); return; }
+        if (!CtxAttachResource(CTX_ID_SELFTEST, RES_3D_SCANOUT))
+        { SerialPuts("virtio_gpu: 3D self-test scanout ctx-attach failed\n"); return; }
+
+        bool scanoutSet = SetScanout(0, RES_3D_SCANOUT, sdim, sdim);
+        SerialPrintf("virtio_gpu: 3D self-test [scanout] SET_SCANOUT(3D RT) -> %s\n",
+                     scanoutSet ? "OK" : "REJECTED");
+
+        // Compose: clear red, then BLIT a 32x32 green corner to (64,64).
+        if (!Submit3DClear(CTX_ID_SELFTEST, RES_3D_SCANOUT, SURF_SCANOUT,
+                           1.0f, 0.0f, 0.0f, 1.0f))
+        { SerialPuts("virtio_gpu: 3D self-test scanout clear failed\n"); return; }
+        if (!Submit3DBlit(CTX_ID_SELFTEST, RES_3D_SCANOUT, 64, 64, 32, 32,
+                          RES_3D_SELFTEST, 0, 0, 32, 32, /*alphaBlend=*/false))
+        { SerialPuts("virtio_gpu: 3D self-test scanout blit failed\n"); return; }
+
+        // Present (the op the compositor calls each frame).
+        bool flushed = ResourceFlush(RES_3D_SCANOUT, 0, 0, sdim, sdim);
+
+        // Read back and verify the composed scanout content.
+        if (!TransferFromHost3D(CTX_ID_SELFTEST, RES_3D_SCANOUT, sdim, sdim))
+        { SerialPuts("virtio_gpu: 3D self-test scanout readback failed\n"); return; }
+        uint32_t sBg = sread[0 * sdim + 0];       // (0,0): red
+        uint32_t sFg = sread[80 * sdim + 80];     // (80,80): inside 64..96 → green
+        bool bgRed   = (chanR(sBg) > 0xC0) && (chanG(sBg) < 0x40) && (chanB(sBg) < 0x40);
+        bool fgGreen = (chanG(sFg) > 0xC0) && (chanR(sFg) < 0x40) && (chanB(sFg) < 0x40);
+        bool scanoutOk = scanoutSet && flushed && bgRed && fgGreen;
+        SerialPrintf("virtio_gpu: 3D self-test [scanout] bg=0x%08x fg=0x%08x flush=%d -> %s\n",
+                     sBg, sFg, flushed ? 1 : 0, scanoutOk ? "PASS" : "FAIL");
+        g_gpuScanoutRtOk = scanoutOk;
+    }
 
     g_gpu3dWorks = true;
     DisplaySet3DActive(true);
