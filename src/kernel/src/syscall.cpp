@@ -2700,6 +2700,21 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         return fd;
     }
 
+    // /dev/dri/renderD128 — virtio-gpu DRM render node. A Linux-compatible
+    // render node that maps the virtio-gpu DRM uABI onto Brook's native
+    // per-process GPU path (GpuAppOps), so unmodified Mesa's virgl driver can
+    // drive it. Only the render node (no card0/KMS) is offered. Available only
+    // when a 3D driver has registered GpuAppOps. (GL shim — see
+    // artifacts/gl-drm-enumeration-spike.md.)
+    if (StrEq(path, "/dev/dri/renderD128"))
+    {
+        if (!brook::GpuAppGet()) return -ENODEV;
+        int fd = FdAlloc(proc, FdType::DevDri, nullptr);
+        if (fd < 0) return -EMFILE;
+        DbgPrintf("sys_open: /dev/dri/renderD128 → fd %d\n", fd);
+        return fd;
+    }
+
     // /dev/null — discard writes, EOF on read
     if (StrEq(path, "/dev/null"))
     {
@@ -5770,6 +5785,155 @@ struct FbFixScreeninfo {
     uint16_t reserved[2];
 };
 
+// ---------------------------------------------------------------------------
+// virtio-gpu DRM render node (/dev/dri/renderD128) — GL shim, Milestone 0.
+//
+// Maps the Linux virtio-gpu DRM uABI onto Brook's native per-process GPU path
+// (GpuAppOps) so unmodified Mesa's virgl driver can drive it. M0 implements the
+// device-identification / capability ioctls Mesa issues during initialization
+// (VERSION, GET_CAP, VIRTGPU_GETPARAM, VIRTGPU_GET_CAPS) — verified against a
+// real virtio-gpu node via a host Mesa strace (see
+// artifacts/gl-drm-enumeration-spike.md). Resource/submit ioctls are M1.
+//
+// ioctl command words are _IOWR('d', nr, struct): the low byte is the request
+// number (nr), the next byte is the type ('d' = 0x64); size/dir occupy the high
+// bits and are ignored here (Linux drivers dispatch on type+nr).
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr uint8_t  DRM_IOCTL_TYPE        = 'd';   // 0x64
+constexpr uint8_t  DRM_NR_VERSION        = 0x00;  // DRM_IOCTL_VERSION
+constexpr uint8_t  DRM_NR_GET_CAP        = 0x0c;  // DRM_IOCTL_GET_CAP
+constexpr uint8_t  DRM_COMMAND_BASE      = 0x40;  // driver-private ioctl base
+constexpr uint8_t  DRM_NR_VIRTGPU_GETPARAM = DRM_COMMAND_BASE + 0x03; // 0x43
+constexpr uint8_t  DRM_NR_VIRTGPU_GET_CAPS = DRM_COMMAND_BASE + 0x09; // 0x49
+
+// virtio-gpu DRM driver identity (matches the upstream kernel driver).
+constexpr int32_t  VIRTGPU_DRIVER_MAJOR  = 0;
+constexpr int32_t  VIRTGPU_DRIVER_MINOR  = 1;
+constexpr int32_t  VIRTGPU_DRIVER_PATCH  = 0;
+
+// struct drm_version (64-bit layout; size_t/ptr are 8 bytes, with 4 bytes of
+// padding after the three int fields to align name_len).
+struct DrmVersion {
+    int32_t  version_major;
+    int32_t  version_minor;
+    int32_t  version_patchlevel;
+    int32_t  _pad;
+    uint64_t name_len;
+    uint64_t name;          // char*
+    uint64_t date_len;
+    uint64_t date;          // char*
+    uint64_t desc_len;
+    uint64_t desc;          // char*
+};
+
+struct DrmGetCap   { uint64_t capability; uint64_t value; };
+struct DrmVirtgpuGetparam { uint64_t param; uint64_t value; }; // value = user u64*
+struct DrmVirtgpuGetCaps {
+    uint32_t cap_set_id; uint32_t cap_set_ver;
+    uint64_t addr; uint32_t size; uint32_t pad;
+};
+
+// VIRTGPU_PARAM_* (virtgpu_drm.h).
+constexpr uint64_t VIRTGPU_PARAM_3D_FEATURES        = 1;
+constexpr uint64_t VIRTGPU_PARAM_CAPSET_QUERY_FIX   = 2;
+constexpr uint64_t VIRTGPU_PARAM_RESOURCE_BLOB      = 3;
+constexpr uint64_t VIRTGPU_PARAM_HOST_VISIBLE       = 4;
+constexpr uint64_t VIRTGPU_PARAM_CROSS_DEVICE       = 5;
+constexpr uint64_t VIRTGPU_PARAM_CONTEXT_INIT       = 6;
+constexpr uint64_t VIRTGPU_PARAM_SUPPORTED_CAPSET_IDs = 7;
+constexpr uint64_t VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME  = 8;
+
+} // namespace
+
+// Copy a NUL-padded string into a user buffer following the DRM len/ptr
+// protocol: always report the true length in *outLen; copy min(provided, true)
+// bytes if the user gave a buffer. libdrm calls twice (first to learn the
+// length, then with an allocated buffer).
+static void DrmFillStr(uint64_t userPtr, uint64_t& userLen, const char* s)
+{
+    uint64_t actual = 0;
+    while (s[actual]) ++actual;
+    if (userPtr && userLen)
+    {
+        uint64_t n = userLen < actual ? userLen : actual;
+        CopyToUser(userPtr, s, n);
+    }
+    userLen = actual;
+}
+
+static int64_t DrmRenderIoctl(uint8_t nr, uint64_t arg)
+{
+    switch (nr)
+    {
+    case DRM_NR_VERSION:
+    {
+        if (!UserBufferReadable(arg, sizeof(DrmVersion)) ||
+            !UserBufferWritable(arg, sizeof(DrmVersion)))
+            return -EFAULT;
+        DrmVersion v;
+        for (uint64_t i = 0; i < sizeof(v); ++i)
+            reinterpret_cast<char*>(&v)[i] = reinterpret_cast<char*>(arg)[i];
+        v.version_major = VIRTGPU_DRIVER_MAJOR;
+        v.version_minor = VIRTGPU_DRIVER_MINOR;
+        v.version_patchlevel = VIRTGPU_DRIVER_PATCH;
+        DrmFillStr(v.name, v.name_len, "virtio_gpu");
+        DrmFillStr(v.date, v.date_len, "0");
+        DrmFillStr(v.desc, v.desc_len, "Brook virtio-gpu GL shim");
+        if (!CopyToUser(arg, &v, sizeof(v))) return -EFAULT;
+        return 0;
+    }
+    case DRM_NR_GET_CAP:
+    {
+        if (!UserBufferReadable(arg, sizeof(DrmGetCap)) ||
+            !UserBufferWritable(arg, sizeof(DrmGetCap)))
+            return -EFAULT;
+        DrmGetCap c = *reinterpret_cast<DrmGetCap*>(arg);
+        c.value = 0;   // no PRIME/dumb/etc. advertised in M0
+        return CopyToUser(arg, &c, sizeof(c)) ? 0 : -EFAULT;
+    }
+    case DRM_NR_VIRTGPU_GETPARAM:
+    {
+        if (!UserBufferReadable(arg, sizeof(DrmVirtgpuGetparam)))
+            return -EFAULT;
+        DrmVirtgpuGetparam p = *reinterpret_cast<DrmVirtgpuGetparam*>(arg);
+        uint64_t val;
+        switch (p.param)
+        {
+        case VIRTGPU_PARAM_3D_FEATURES:       val = 1; break;
+        case VIRTGPU_PARAM_CAPSET_QUERY_FIX:  val = 1; break;
+        case VIRTGPU_PARAM_CONTEXT_INIT:      val = 1; break;
+        // capset id bitmask: VIRGL(1) | VIRGL2(2).
+        case VIRTGPU_PARAM_SUPPORTED_CAPSET_IDs: val = (1u << 1) | (1u << 2); break;
+        case VIRTGPU_PARAM_RESOURCE_BLOB:     val = 0; break;
+        case VIRTGPU_PARAM_HOST_VISIBLE:      val = 0; break;
+        case VIRTGPU_PARAM_CROSS_DEVICE:      val = 0; break;
+        case VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME: val = 0; break;
+        default: return -EINVAL;
+        }
+        if (!CopyToUser(p.value, &val, sizeof(val))) return -EFAULT;
+        return 0;
+    }
+    case DRM_NR_VIRTGPU_GET_CAPS:
+    {
+        if (!UserBufferReadable(arg, sizeof(DrmVirtgpuGetCaps)))
+            return -EFAULT;
+        DrmVirtgpuGetCaps gc = *reinterpret_cast<DrmVirtgpuGetCaps*>(arg);
+        if (gc.size == 0 || gc.size > 64u * 1024) return -EINVAL;
+        // M0 stub: zero-fill the capset buffer (a real virgl capset blob is
+        // supplied in M1/M2). Mesa tolerates an all-zero v1 caps header for
+        // initial probing; full caps land with resource/submit support.
+        if (!UserBufferWritable(gc.addr, gc.size)) return -EFAULT;
+        for (uint32_t i = 0; i < gc.size; ++i)
+            reinterpret_cast<char*>(gc.addr)[i] = 0;
+        return 0;
+    }
+    default:
+        return -25; // ENOTTY
+    }
+}
+
 static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
                           uint64_t, uint64_t, uint64_t)
 {
@@ -5820,6 +5984,14 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         }
         *reinterpret_cast<int*>(arg) = available;
         return 0;
+    }
+
+    if (fde->type == FdType::DevDri)
+    {
+        uint8_t type = static_cast<uint8_t>((cmd >> 8) & 0xFF);
+        uint8_t nr   = static_cast<uint8_t>(cmd & 0xFF);
+        if (type != DRM_IOCTL_TYPE) return -25; // ENOTTY
+        return DrmRenderIoctl(nr, arg);
     }
 
     if (fde->type == FdType::DevFramebuf)

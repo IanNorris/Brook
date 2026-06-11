@@ -48,6 +48,7 @@ enum class FdType : uint8_t
     MemFd,         // memfd_create — anonymous in-memory file
     UnixSocket,    // AF_UNIX domain socket
     DevKlog,       // /dev/klog — kernel log ring buffer reader
+    DevDri,        // /dev/dri/renderD128 — virtio-gpu DRM render node (GL shim)
 };
 
 struct FdEntry
