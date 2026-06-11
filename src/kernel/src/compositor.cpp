@@ -968,6 +968,25 @@ static uint32_t g_cursorPixels[CURSOR_MAX * CURSOR_MAX]; // ARGB8888 custom curs
 static uint32_t g_cursorSave[CURSOR_MAX * CURSOR_MAX];
 static int32_t  g_cursorSaveX = -1;
 static int32_t  g_cursorSaveY = -1;
+
+// Populate g_cursorPixels (stride CURSOR_MAX) from the built-in arrow bitmap as
+// opaque ARGB: 1=white, 2=black, 0=transparent. The GPU path uploads
+// g_cursorPixels as the cursor texture, so without this the default cursor is
+// all-zero (fully transparent) and therefore invisible on the GPU compositor.
+// Idempotent; cheap enough to call on init and whenever the cursor is reset.
+static void CursorLoadBuiltinPixels()
+{
+    for (uint32_t i = 0; i < CURSOR_MAX * CURSOR_MAX; ++i) g_cursorPixels[i] = 0;
+    for (uint32_t row = 0; row < 16; ++row)
+        for (uint32_t col = 0; col < 12; ++col)
+        {
+            uint8_t px = g_cursorBitmapBuiltin[row][col];
+            uint32_t argb = (px == 1) ? 0xFFFFFFFFu       // white fill
+                          : (px == 2) ? 0xFF000000u       // black outline
+                                      : 0x00000000u;      // transparent
+            g_cursorPixels[row * CURSOR_MAX + col] = argb;
+        }
+}
 static int32_t  g_cursorSaveW = 0;
 static int32_t  g_cursorSaveH = 0;
 static bool     g_cursorVisible = false;
@@ -1039,7 +1058,7 @@ static void CursorDraw(int32_t mx, int32_t my)
             {
                 int32_t sx = cx + static_cast<int32_t>(col);
                 if (sx < 0 || static_cast<uint32_t>(sx) >= g_physFbWidth) continue;
-                uint32_t src = g_cursorPixels[row * cw + col];
+                uint32_t src = g_cursorPixels[row * CURSOR_MAX + col];
                 uint32_t alpha = (src >> 24) & 0xFF;
                 if (alpha == 0) continue;
                 if (alpha == 255) {
@@ -1082,14 +1101,19 @@ bool CompositorSetCursorImage(const uint32_t* pixels, uint32_t w, uint32_t h,
         g_cursorH = 16;
         g_cursorHotX = 0;
         g_cursorHotY = 0;
+        CursorLoadBuiltinPixels();   // refresh the GPU cursor texture source
         return true;
     }
     if (w > CURSOR_MAX || h > CURSOR_MAX) return false;
 
-    // Copy pixels into kernel buffer
-    for (uint32_t row = 0; row < h; row++)
-        for (uint32_t col = 0; col < w; col++)
-            g_cursorPixels[row * w + col] = pixels[row * w + col];
+    // Copy pixels into kernel buffer at stride CURSOR_MAX so the layout matches
+    // the CURSOR_MAX-wide GPU cursor texture (UpdateTexture reads the source at
+    // the texture's full width) and the CPU blit path, which both index at
+    // stride CURSOR_MAX.
+    for (uint32_t row = 0; row < CURSOR_MAX; row++)
+        for (uint32_t col = 0; col < CURSOR_MAX; col++)
+            g_cursorPixels[row * CURSOR_MAX + col] =
+                (row < h && col < w) ? pixels[row * w + col] : 0;
 
     g_cursorW = w;
     g_cursorH = h;
@@ -2631,10 +2655,16 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
         else useOverlayLayer = false;
     }
 
-    // 2. Cursor sprite (ARGB, alpha-blended).
+    // 2. Cursor sprite (ARGB, alpha-blended). The built-in arrow lives in
+    // g_cursorBitmapBuiltin; convert it into g_cursorPixels (the texture source)
+    // once, before first upload, so the default cursor is visible on the GPU
+    // path (a custom cursor populates g_cursorPixels itself).
     if (!g_cursorTex)
+    {
+        if (!g_cursorCustom) CursorLoadBuiltinPixels();
         g_cursorTex = gpu->CreateTexture(CURSOR_MAX, CURSOR_MAX,
                                          reinterpret_cast<uint64_t>(g_cursorPixels), true);
+    }
     if (g_cursorTex)
         gpu->UpdateTexture(g_cursorTex, 0, 0, g_cursorW, g_cursorH);
 
@@ -2793,13 +2823,22 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
         int32_t mx = 0, my = 0;
         MouseGetPosition(&mx, &my);
         int cx = mx - g_cursorHotX, cy = my - g_cursorHotY;
-        if (cx < (int)scrW && cy < (int)scrH && cx + (int)g_cursorW > 0 && cy + (int)g_cursorH > 0)
-        {
-            uint32_t bcx = cx < 0 ? 0 : (uint32_t)cx;
-            uint32_t bcy = cy < 0 ? 0 : (uint32_t)cy;
-            GpuComposeLayer(gpu, g_cursorTex, 0, 0, g_cursorW, g_cursorH,
-                            bcx, bcy, g_cursorW, g_cursorH, true);
-        }
+        // Crop the SOURCE rect (cursor-texture space) when the sprite straddles a
+        // screen edge. Clamping only the destination (as before) left the source
+        // at (0,0,W,H), so at the left/top edges the pointer was squashed/shifted
+        // instead of cleanly clipped.
+        int sx = 0, sy = 0;
+        int sw = (int)g_cursorW, sh = (int)g_cursorH;
+        int dx = cx, dy = cy;
+        if (dx < 0) { sx = -dx; sw += dx; dx = 0; }
+        if (dy < 0) { sy = -dy; sh += dy; dy = 0; }
+        if (dx + sw > (int)scrW) sw = (int)scrW - dx;
+        if (dy + sh > (int)scrH) sh = (int)scrH - dy;
+        if (sw > 0 && sh > 0)
+            GpuComposeLayer(gpu, g_cursorTex, (uint32_t)sx, (uint32_t)sy,
+                            (uint32_t)sw, (uint32_t)sh,
+                            (uint32_t)dx, (uint32_t)dy,
+                            (uint32_t)sw, (uint32_t)sh, true);
     }
 
     gpu->EndFrame();
