@@ -1399,8 +1399,17 @@ static uint32_t  g_blurAView     = 0;        // sampler view for COMP_BLUR_A_RES
 static uint32_t  g_blurBView     = 0;        // sampler view for COMP_BLUR_B_RES
 static uint64_t  g_blurVtxPhys   = 0;
 static uint32_t* g_blurVtxBuf    = nullptr;
-static uint32_t  g_blurBarrier   = 0xFFFFFFFFu; // quad index at the backdrop barrier (none = no blur this frame)
-static uint32_t  g_blurStrength  = 0;        // app-requested blur amount (scales gaussian iterations)
+// Backdrop blur barriers. Each barrier records a quad index at which the scanout
+// (everything drawn so far = everything below the corresponding glass window) is
+// snapshotted + blurred into BLUR_A; the glass window's following backdrop quad
+// then samples it. Supporting MULTIPLE barriers per frame lets the compositor
+// composite glass windows in a single strict back-to-front pass, so each glass
+// window frosts exactly what is beneath it (incl. lower glass windows) — correct
+// occlusion/blend order for 3+ interleaved or stacked glass windows (BRO-185).
+static constexpr uint32_t MAX_BLUR_BARRIERS = 16;
+static uint32_t  g_blurBarrierIdx[MAX_BLUR_BARRIERS] = {};      // quad index per barrier (ascending)
+static uint32_t  g_blurBarrierStrength[MAX_BLUR_BARRIERS] = {}; // app blur amount per barrier
+static uint32_t  g_blurBarrierCount = 0;                        // active barriers this frame
 // Quad flags.
 static constexpr uint32_t QUAD_SAMPLE_BLUR = 1u << 0;  // sample the blurred backdrop (sview ignored)
 // One recorded quad (filled by CompDrawQuad, consumed by CompEndFrame). Dst is in
@@ -1894,7 +1903,7 @@ static void CompBeginFrame(uint32_t clearArgb)
     // the compositor records quads via CompDrawQuad, CompEndFrame builds the
     // batched draw stream and ignores the BLIT compose stream below.
     g_drawQuadCount = 0;
-    g_blurBarrier = 0xFFFFFFFFu;   // no backdrop barrier unless BlurBarrier() is called
+    g_blurBarrierCount = 0;        // no backdrop barriers unless BlurBarrier() is called
 
     // Start a fresh compose stream: SET_FRAMEBUFFER_STATE(scanout surf) + CLEAR.
     // Clear to opaque black. (The kernel builds with -mno-sse / soft-float is not
@@ -1981,8 +1990,10 @@ static void CompDrawQuad(GpuTexId src,
 static void CompBlurBarrier(uint32_t strength)
 {
     if (!g_blurReady) return;
-    g_blurBarrier = g_drawQuadCount;
-    g_blurStrength = strength;
+    if (g_blurBarrierCount >= MAX_BLUR_BARRIERS) return;   // cap cost; extra glass windows skip frosting
+    g_blurBarrierIdx[g_blurBarrierCount]      = g_drawQuadCount;
+    g_blurBarrierStrength[g_blurBarrierCount] = strength;
+    g_blurBarrierCount++;
 }
 
 
@@ -2042,18 +2053,26 @@ static void CompEndFrameDraw()
 
     uint32_t lastBlend = 0;
     uint32_t lastSamp  = DRAW_SAMP;   // nearest bound above
+    uint32_t barrierCursor = 0;       // next barrier to process (indices ascending)
     for (uint32_t i = 0; i < g_drawQuadCount; ++i)
     {
-        // At the backdrop barrier, snapshot the scanout (everything drawn so far),
-        // downsample it into BLUR_A, run the separable gaussian (H: A->B, V: B->A),
-        // then restore the scanout framebuffer/viewport/shader/sampler so the
-        // following chrome quads (incl. GPU_TEX_BLUR_BACKDROP samples of BLUR_A)
-        // composite normally. One stream, in order — the host serializes it.
-        if (g_blurBarrier == i && g_blurReady)
+        // At each backdrop barrier landing on this quad, snapshot the scanout
+        // (everything drawn so far), downsample it into BLUR_A, run the separable
+        // gaussian (H: A->B, V: B->A), then restore the scanout framebuffer/
+        // viewport/shader/sampler so the following backdrop quad (which samples
+        // BLUR_A via GPU_TEX_BLUR_BACKDROP) composites normally. Multiple barriers
+        // per frame (one per glass window, back-to-front) each re-snapshot the
+        // current scene, so a glass window frosts exactly what is beneath it —
+        // including lower glass windows (BRO-185). One stream, in order — the host
+        // serializes it.
+        while (barrierCursor < g_blurBarrierCount &&
+               g_blurBarrierIdx[barrierCursor] == i && g_blurReady)
         {
+            uint32_t barrierStrength = g_blurBarrierStrength[barrierCursor];
+            ++barrierCursor;
             // Iterations scale with the app-requested blur strength (a window's
             // blurRadius): each extra H/V gaussian pair widens the effective blur.
-            uint32_t iters = (g_blurStrength + 3) / 4;   // radius 4->1, 8->2, ...
+            uint32_t iters = (barrierStrength + 3) / 4;   // radius 4->1, 8->2, ...
             if (iters < 1) iters = 1;
             if (iters > 4) iters = 4;                     // cap cost
             if (n + 40 + iters * 30 > (CMD_PAGES - 1) * 1024) { /* no room */ }
@@ -2149,7 +2168,7 @@ static void CompEndFrameDraw()
     sub->size = n * 4;
     SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP);
     g_drawQuadCount = 0;
-    g_blurBarrier = 0xFFFFFFFFu;
+    g_blurBarrierCount = 0;
     ResourceFlush(COMP_SCANOUT_RES, 0, 0, g_compScanoutW, g_compScanoutH);
 }
 

@@ -2723,18 +2723,18 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
     GpuComposeLayer(gpu, g_desktopTex, 0, 0, g_physFbWidth, g_physFbHeight,
                     0, 0, g_physFbWidth, g_physFbHeight, false);
 
-    // Windows back-to-front. Without blur, each window is composited as a UNIT —
-    // content then its chrome — at the window's opacity, so a higher window's
-    // translucent frame blends over a lower window's content correctly.
+    // Windows back-to-front. Each window composites as a UNIT — content then its
+    // chrome — at the window's opacity, so a higher window's translucent frame
+    // blends over a lower window's content correctly.
     //
-    // When any window requests glass (blur), we use a PHASED order: the backdrop
-    // (wallpaper + the content of NON-glass windows) is drawn first, then a
-    // BlurBarrier (the driver snapshots + blurs it), then per window the glass
-    // windows draw their blurred backdrop over the whole window, their translucent
-    // content, and chrome — so the frosted scene shows through the entire window
-    // (e.g. a translucent terminal), not just the titlebar. Correct for glass
-    // windows over the desktop / opaque windows; translucent+overlap is a
-    // documented follow-up (phasing drops the strict content/chrome interleave).
+    // Glass (blur) windows additionally emit a per-window BlurBarrier just before
+    // their backdrop: the driver snapshots + blurs everything drawn so far (the
+    // scene strictly below this window) and the window's backdrop quad samples it,
+    // so the frosted scene shows through the entire window (e.g. a translucent
+    // terminal), not just the titlebar. The barrier is per-window and in z-order,
+    // and the driver supports multiple barriers per frame, so each glass window
+    // frosts exactly what is beneath it — including lower glass windows — giving
+    // correct occlusion/blend order for 3+ interleaved or stacked glass windows.
     auto effBlur    = [&](const Window* w) -> uint32_t {
         uint32_t b = w->blurRadius; if (g_gpuTestBlur) b = g_gpuTestBlur; return b;
     };
@@ -2745,59 +2745,30 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
         return useChromeLayer && gpu->BlurBarrier && !w->noChrome && effBlur(w) > 0;
     };
 
-    bool anyBlur = false;
-    for (uint32_t i = 0; i < wcount; ++i)
-    {
-        Window* w = WmGetWindow(sorted[i]);
-        if (w && w->visible && !w->minimized && isGlass(w)) { anyBlur = true; break; }
-    }
-
-    // Phase 1: backdrop = wallpaper (already) + content of non-glass windows.
-    // Glass windows defer their content to phase 2 so it isn't blurred into its
-    // own backdrop. Without blur, also draw chrome here (unit compositing).
+    // Single strict back-to-front pass. Each window composites as a unit
+    // (content then chrome) at its opacity, so a higher window's translucent
+    // frame/content blends over lower windows correctly. A glass window first
+    // emits a BlurBarrier — the driver snapshots + blurs everything drawn so far
+    // (i.e. everything strictly below this window) — then draws that frosted
+    // backdrop over its whole outer rect, then its translucent content, then
+    // chrome. Because the barrier is per-window and in z-order, each glass window
+    // frosts exactly what is beneath it, including lower glass windows. The driver
+    // supports multiple barriers per frame; correct for 3+ interleaved/stacked
+    // glass windows (BRO-185).
     for (uint32_t i = 0; i < wcount; ++i)
     {
         int idx = sorted[i];
         Window* w = WmGetWindow(idx);
         if (!w || !w->visible || w->minimized) continue;
         uint32_t op = effOpacity(w);
-        bool glass = anyBlur && isGlass(w);
-        if (!glass)
-            GpuDrawWindowContent(gpu, w, g_winTex[idx], scrW, scrH, op);
-        if (useChromeLayer && !anyBlur)
+        if (isGlass(w))
+        {
+            gpu->BlurBarrier(effBlur(w));                               // blur everything below this window
+            GpuComposeWindowBlur(gpu, w);                              // frosted backdrop over the whole window
+        }
+        GpuDrawWindowContent(gpu, w, g_winTex[idx], scrW, scrH, op);   // content (translucent for glass)
+        if (useChromeLayer)
             GpuComposeChrome(gpu, w, op);
-    }
-
-    // Phase 2 (blur path): blur the backdrop, then per window back-to-front draw
-    // {glass backdrop over the whole window; translucent content; chrome}.
-    if (anyBlur)
-    {
-        // Blur strength = max app-requested radius across glass windows.
-        uint32_t blurStrength = 0;
-        for (uint32_t i = 0; i < wcount; ++i)
-        {
-            Window* w = WmGetWindow(sorted[i]);
-            if (w && w->visible && !w->minimized && isGlass(w))
-            {
-                uint32_t b = effBlur(w);
-                if (b > blurStrength) blurStrength = b;
-            }
-        }
-        gpu->BlurBarrier(blurStrength);
-        for (uint32_t i = 0; i < wcount; ++i)
-        {
-            int idx = sorted[i];
-            Window* w = WmGetWindow(idx);
-            if (!w || !w->visible || w->minimized) continue;
-            uint32_t op = effOpacity(w);
-            if (isGlass(w))
-            {
-                GpuComposeWindowBlur(gpu, w);                          // frosted scene under whole window
-                GpuDrawWindowContent(gpu, w, g_winTex[idx], scrW, scrH, op); // translucent content on top
-            }
-            if (useChromeLayer)
-                GpuComposeChrome(gpu, w, op);
-        }
     }
 
     // Taskbar (and launcher) on top of all windows, composited from the alpha
