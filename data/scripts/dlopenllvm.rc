@@ -1,0 +1,2 @@
+# BRO-187 minimal reproducer: dlopen libLLVM.so directly (no Mesa).
+run /nix/store/n4s6lc6971pw0xm594f5b61bipb9ixbh-dlopenllvm-brook-0.1/bin/dlopenllvm
