@@ -2596,6 +2596,55 @@ static bool StrEq(const char* a, const char* b)
     return *a == *b;
 }
 
+// ---------------------------------------------------------------------------
+// DRM render-node sysfs/devfs shim (GL shim, M0 step 2)
+//
+// Minimal synthetic /dev/dri + /sys topology so the unmodified Linux libdrm
+// (drmGetDevices2) can enumerate /dev/dri/renderD128 as a PCI virtio-gpu device
+// and open it. Backed by the real per-process GPU path (GpuAppOps); no card0 /
+// KMS node. Surface determined empirically from libdrm 2.4.131 source +
+// host strace (see artifacts/gl-drm-enumeration-spike.md):
+//   - get_pci_path() falls back to the literal path if realpath() fails, so the
+//     PCI attributes are served directly at /sys/dev/char/226:128/device/* with
+//     NO symlinks — except 'subsystem', which get_subsystem_type() reads via
+//     readlink() to classify the bus (we return ".../pci" -> DRM_BUS_PCI).
+// All responses are gated on a 3D driver being present (GpuAppGet()).
+// ---------------------------------------------------------------------------
+namespace {
+struct DrmSysAttr { const char* path; const char* content; };
+static const DrmSysAttr kDrmSysAttrs[] = {
+    { "/sys/dev/char/226:128/device/uevent",
+      "DRIVER=virtio_gpu\nPCI_SLOT_NAME=0000:00:02.0\n" },
+    { "/sys/dev/char/226:128/device/vendor",           "0x1af4\n" },
+    { "/sys/dev/char/226:128/device/device",           "0x1050\n" },
+    { "/sys/dev/char/226:128/device/subsystem_vendor", "0x1af4\n" },
+    { "/sys/dev/char/226:128/device/subsystem_device", "0x1100\n" },
+    { "/sys/dev/char/226:128/device/revision",         "0x00\n" },
+    { nullptr, nullptr }
+};
+// Directories that must stat as S_IFDIR (realpath / openat / drmNodeIsDRM).
+static const char* kDrmSysDirs[] = {
+    "/sys/dev/char/226:128/device",
+    "/sys/dev/char/226:128/device/drm",
+    nullptr
+};
+// Marker handle so getdents64 / fstat recognise the /dev/dri synthetic dir fd.
+static const char g_drmDriDirTag[] = "BROOK_DRM_DRI_DIR";
+// Linux dev_t for char 226:128 (gnu_dev: minor low 8 | major<<8).
+static constexpr uint64_t DRM_RENDER_RDEV = 0xE280;
+
+static const char* DrmSysAttrContent(const char* path) {
+    for (auto* a = kDrmSysAttrs; a->path; ++a)
+        if (StrEq(path, a->path)) return a->content;
+    return nullptr;
+}
+static bool DrmSysIsDir(const char* path) {
+    for (auto** d = kDrmSysDirs; *d; ++d)
+        if (StrEq(path, *d)) return true;
+    return false;
+}
+} // namespace
+
 static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
                          uint64_t, uint64_t, uint64_t)
 {
@@ -2713,6 +2762,33 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         if (fd < 0) return -EMFILE;
         DbgPrintf("sys_open: /dev/dri/renderD128 → fd %d\n", fd);
         return fd;
+    }
+
+    // /dev/dri directory — enumerable so libdrm's drmGetDevices2 can list the
+    // render node. Allocate a synthetic-directory fd (recognised by the marker
+    // handle in getdents64/fstat). Only when a 3D driver is present.
+    if (StrEq(path, "/dev/dri") && brook::GpuAppGet())
+    {
+        int fd = FdAlloc(proc, FdType::SyntheticMem,
+                         const_cast<char*>(g_drmDriDirTag));
+        if (fd < 0) return -EMFILE;
+        proc->fds[fd].seekPos = 0;
+        proc->fds[fd].dirPath[0] = '\0';
+        return fd;
+    }
+
+    // DRM sysfs attribute files (/sys/dev/char/226:128/device/{uevent,vendor,…}).
+    // Served as read-only synthetic memory files for libdrm PCI device parsing.
+    if (brook::GpuAppGet())
+    {
+        const char* drmAttr = DrmSysAttrContent(path);
+        if (drmAttr)
+        {
+            int fd = FdAlloc(proc, FdType::SyntheticMem, const_cast<char*>(drmAttr));
+            if (fd < 0) return -EMFILE;
+            proc->fds[fd].seekPos = 0;
+            return fd;
+        }
     }
 
     // /dev/null — discard writes, EOF on read
@@ -6634,6 +6710,45 @@ static bool BusyboxStatFallback(const char* path, VnodeStat* vs)
     return false;
 }
 
+// GL shim (M0): fill a LinuxStat for the synthetic DRM devfs/sysfs entries
+// (/dev/dri[/renderD128], /sys/dev/char/226:128/device/...). Returns true if
+// `path` is a DRM-shim entry (and fills *st), false otherwise. Gated on a 3D
+// driver being present so we never advertise an unusable node.
+static bool DrmStatFill(const char* path, LinuxStat* st)
+{
+    if (!brook::GpuAppGet()) return false;
+    if (StrEq(path, "/dev/dri/renderD128"))
+    {
+        memset(st, 0, sizeof(*st));
+        st->st_mode = 0020666; // S_IFCHR | rw-rw-rw-
+        st->st_rdev = DRM_RENDER_RDEV;
+        st->st_nlink = 1;
+        st->st_blksize = 4096;
+        return true;
+    }
+    if (StrEq(path, "/dev/dri") || DrmSysIsDir(path))
+    {
+        memset(st, 0, sizeof(*st));
+        st->st_mode = 0040755; // S_IFDIR | rwxr-xr-x
+        st->st_nlink = 1;
+        st->st_blksize = 4096;
+        return true;
+    }
+    const char* drmAttr = DrmSysAttrContent(path);
+    if (drmAttr)
+    {
+        uint64_t len = 0; while (drmAttr[len]) ++len;
+        memset(st, 0, sizeof(*st));
+        st->st_mode = 0100444; // S_IFREG | r--r--r--
+        st->st_nlink = 1;
+        st->st_size = static_cast<int64_t>(len);
+        st->st_blksize = 4096;
+        st->st_blocks = 1;
+        return true;
+    }
+    return false;
+}
+
 // Internal stat helper — takes a kernel-space path directly (no user copy).
 // statAddr is the user-space address of the stat buffer.
 static int64_t do_stat_internal(const char* path, uint64_t statAddr)
@@ -6669,6 +6784,11 @@ static int64_t do_stat_internal(const char* path, uint64_t statAddr)
         resolved[ci] = '\0';
         lookup = resolved;
     }
+
+    // GL shim (M0): stat the synthetic DRM devfs/sysfs entries so libdrm can
+    // enumerate the render node. Only when a 3D driver is present.
+    if (DrmStatFill(lookup, st))
+        return 0;
 
     VnodeStat vs{};
     if (VfsStatPath(lookup, &vs) < 0)
@@ -6734,6 +6854,11 @@ static int64_t do_lstat_internal(const char* path, uint64_t statAddr)
         resolved[ci] = '\0';
         lookup = resolved;
     }
+
+    // GL shim (M0): the synthetic DRM entries are not symlinks, so lstat
+    // returns the same as stat (lets glibc realpath() resolve the device dir).
+    if (DrmStatFill(lookup, st))
+        return 0;
 
     VnodeStat vs{};
     if (VfsLstatPath(lookup, &vs) < 0)
@@ -6829,6 +6954,18 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
         return 0;
     }
 
+    // GL shim: /dev/dri/renderD128 is a char device (libdrm fstats the open fd
+    // to recover major:minor for its sysfs lookups).
+    if (fde->type == FdType::DevDri) {
+        auto* raw = reinterpret_cast<uint8_t*>(st);
+        memset(raw, 0, sizeof(LinuxStat));
+        st->st_mode = 0020666; // S_IFCHR | rw-rw-rw-
+        st->st_rdev = DRM_RENDER_RDEV;
+        st->st_nlink = 1;
+        st->st_blksize = 4096;
+        return 0;
+    }
+
     if (fde->type == FdType::Pipe) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
         memset(raw, 0, sizeof(LinuxStat));
@@ -6840,6 +6977,13 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
     if (fde->type == FdType::SyntheticMem) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
         memset(raw, 0, sizeof(LinuxStat));
+        // GL shim: the /dev/dri synthetic directory fd reports as a directory
+        // (opendir() fstats the fd and requires S_ISDIR).
+        if (fde->handle == g_drmDriDirTag) {
+            st->st_mode = 0040755; // S_IFDIR | rwxr-xr-x
+            st->st_blksize = 4096;
+            return 0;
+        }
         st->st_mode = 0100444; // S_IFREG | r--r--r--
         if (fde->handle) {
             auto* content = static_cast<const char*>(fde->handle);
@@ -6954,8 +7098,38 @@ static int64_t sys_getdents64(uint64_t fd, uint64_t bufAddr, uint64_t count,
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
     FdEntry* fde = FdGet(proc, static_cast<int>(fd));
-    if (!fde || fde->type != FdType::Vnode || !fde->handle) return -EBADF;
+    if (!fde) return -EBADF;
 
+    // Synthetic /dev/dri directory (GL shim M0): list ".", "..", "renderD128"
+    // so libdrm's drmGetDevices2 can discover the render node.
+    if (fde->type == FdType::SyntheticMem && fde->handle == g_drmDriDirTag)
+    {
+        static const char* driEntries[] = { ".", "..", "renderD128" };
+        auto* obuf = reinterpret_cast<uint8_t*>(bufAddr);
+        uint64_t opos = 0;
+        uint32_t ck = static_cast<uint32_t>(fde->seekPos);
+        while (ck < 3)
+        {
+            const char* nm = driEntries[ck];
+            uint64_t nameLen = 0;
+            while (nm[nameLen]) ++nameLen;
+            uint64_t reclen = (19 + nameLen + 1 + 7) & ~7ULL;
+            if (opos + reclen > count) break;
+            auto* ent = reinterpret_cast<LinuxDirent64*>(obuf + opos);
+            ent->d_ino = ck + 1;
+            ent->d_off = static_cast<int64_t>(ck + 1);
+            ent->d_reclen = static_cast<uint16_t>(reclen);
+            ent->d_type = (ck < 2) ? 4 : 2; // DT_DIR for . / .. ; DT_CHR for the node
+            for (uint64_t i = 0; i < nameLen; ++i) ent->d_name[i] = nm[i];
+            for (uint64_t i = nameLen; i < reclen - 19; ++i) ent->d_name[i] = '\0';
+            opos += reclen;
+            ++ck;
+        }
+        fde->seekPos = ck;
+        return static_cast<int64_t>(opos);
+    }
+
+    if (fde->type != FdType::Vnode || !fde->handle) return -EBADF;
     auto* vn = static_cast<Vnode*>(fde->handle);
     auto* buf = reinterpret_cast<uint8_t*>(bufAddr);
     uint64_t pos = 0;
@@ -8084,6 +8258,18 @@ static int64_t DoReadlink(const char* path, uint64_t bufAddr, uint64_t bufsiz)
 {
     if (!path) return -EFAULT;
     if (bufsiz == 0) return -EINVAL;
+
+    // GL shim (M0): the DRM device's 'subsystem' symlink. libdrm's
+    // get_subsystem_type() readlinks this and matches the basename to classify
+    // the bus; returning ".../pci" yields DRM_BUS_PCI for the virtio-gpu node.
+    if (StrEq(path, "/sys/dev/char/226:128/device/subsystem") && brook::GpuAppGet())
+    {
+        const char* tgt = "/sys/bus/pci";
+        uint64_t slen = 0; while (tgt[slen]) ++slen;
+        if (slen > bufsiz) slen = bufsiz;
+        if (!CopyToUser(bufAddr, tgt, slen)) return -EFAULT;
+        return static_cast<int64_t>(slen);
+    }
 
     // /proc/self/exe → return the process's executable path
     auto streq = [](const char* a, const char* b) {
@@ -9689,6 +9875,13 @@ static int64_t sys_statx(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
     char resolved[256];
     if (!ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
         return -ENOENT;
+
+    // GL shim (M0): synthetic DRM devfs/sysfs entries (glibc stat() may route
+    // through statx). Reuse the shared LinuxStat filler, then convert.
+    {
+        LinuxStat dst;
+        if (DrmStatFill(resolved, &dst)) { fillStatxFromLinuxStat(dst); return 0; }
+    }
 
     static constexpr uint64_t AT_SYMLINK_NOFOLLOW = 0x100;
     int ret = (flags & AT_SYMLINK_NOFOLLOW)
