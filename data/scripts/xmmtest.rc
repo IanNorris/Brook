@@ -1,0 +1,2 @@
+# BRO-187 root-cause: does the kernel preserve user XMM across syscalls/timer IRQ?
+run /bin/xmmtest
