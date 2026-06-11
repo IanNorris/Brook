@@ -2643,6 +2643,45 @@ static bool DrmSysIsDir(const char* path) {
         if (StrEq(path, *d)) return true;
     return false;
 }
+
+// Per-fd DRM render-node state (GL shim M1). Each open("/dev/dri/renderD128")
+// gets one. Holds the app's GpuApp (virgl) context id plus a per-fd GEM-handle
+// table that translates the Linux DRM model (per-fd GEM handles, small ints)
+// to Brook's host-global virgl resource ids. This is the isolation layer the
+// architecture review called for: an app can only name resources via GEM
+// handles in ITS OWN table, never a raw host-global id, and GEM_CLOSE/teardown
+// are scoped per fd. RESOURCE_CREATE returns res_handle=gres (host id, used
+// inside virgl command streams) and bo_handle=GEM index (used in ioctls) —
+// matching the upstream virtio-gpu uABI.
+static constexpr uint32_t DRM_MAX_GEM = 256;
+struct DrmGemObj {
+    bool     used;
+    uint32_t gres;     // host-global virgl resource id (== res_handle)
+    uint32_t size;     // byte size (validate transfers)
+    uint32_t stride;
+    uint32_t width, height;
+};
+struct DrmCtx {
+    int32_t   ctxId;   // GpuApp virgl context (0 = not yet created)
+    DrmGemObj gem[DRM_MAX_GEM];   // index i -> bo_handle (i+1); 0 is invalid
+};
+
+// Allocate a GEM handle (1-based) for a freshly created resource. Returns 0 on
+// table-full.
+static uint32_t DrmGemAlloc(DrmCtx* c, uint32_t gres, uint32_t size,
+                            uint32_t stride, uint32_t w, uint32_t h) {
+    for (uint32_t i = 0; i < DRM_MAX_GEM; ++i) {
+        if (c->gem[i].used) continue;
+        c->gem[i] = { true, gres, size, stride, w, h };
+        return i + 1;
+    }
+    return 0;
+}
+static DrmGemObj* DrmGemGet(DrmCtx* c, uint32_t bo_handle) {
+    if (bo_handle == 0 || bo_handle > DRM_MAX_GEM) return nullptr;
+    DrmGemObj* g = &c->gem[bo_handle - 1];
+    return g->used ? g : nullptr;
+}
 } // namespace
 
 static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
@@ -2758,8 +2797,11 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     if (StrEq(path, "/dev/dri/renderD128"))
     {
         if (!brook::GpuAppGet()) return -ENODEV;
-        int fd = FdAlloc(proc, FdType::DevDri, nullptr);
-        if (fd < 0) return -EMFILE;
+        auto* dctx = static_cast<DrmCtx*>(kmalloc(sizeof(DrmCtx)));
+        if (!dctx) return -ENOMEM;
+        memset(dctx, 0, sizeof(DrmCtx));
+        int fd = FdAlloc(proc, FdType::DevDri, dctx);
+        if (fd < 0) { kfree(dctx); return -EMFILE; }
         DbgPrintf("sys_open: /dev/dri/renderD128 → fd %d\n", fd);
         return fd;
     }
@@ -3160,6 +3202,17 @@ void FinalizeClosedFd(const FdClaimResult& c)
         // DevKlog handle is a bare uint64_t* cursor — no refcount, just free.
         // Fork deep-copies it, so each process owns its own cursor.
         kfree(c.handle);
+    }
+
+    if (c.type == FdType::DevDri && c.handle)
+    {
+        // GL shim: tear down the per-fd DRM context — destroy its GpuApp virgl
+        // context (frees host resources) and free the GEM table.
+        auto* dctx = static_cast<DrmCtx*>(c.handle);
+        const brook::GpuAppOps* ga = brook::GpuAppGet();
+        if (ga && ga->CtxDestroy && dctx->ctxId > 0)
+            ga->CtxDestroy(dctx->ctxId);
+        kfree(dctx);
     }
 
     if (c.type == FdType::DevTty && c.handle)
@@ -5869,7 +5922,9 @@ struct FbFixScreeninfo {
 // device-identification / capability ioctls Mesa issues during initialization
 // (VERSION, GET_CAP, VIRTGPU_GETPARAM, VIRTGPU_GET_CAPS) — verified against a
 // real virtio-gpu node via a host Mesa strace (see
-// artifacts/gl-drm-enumeration-spike.md). Resource/submit ioctls are M1.
+// artifacts/gl-drm-enumeration-spike.md). M1 adds the resource/submit ioctls
+// (CONTEXT_INIT, RESOURCE_CREATE, RESOURCE_INFO, TRANSFER_*, EXECBUFFER, WAIT,
+// GEM_CLOSE) over GpuAppOps, with a per-fd GEM-handle->virgl-resid table.
 //
 // ioctl command words are _IOWR('d', nr, struct): the low byte is the request
 // number (nr), the next byte is the type ('d' = 0x64); size/dir occupy the high
@@ -5879,10 +5934,19 @@ namespace {
 
 constexpr uint8_t  DRM_IOCTL_TYPE        = 'd';   // 0x64
 constexpr uint8_t  DRM_NR_VERSION        = 0x00;  // DRM_IOCTL_VERSION
+constexpr uint8_t  DRM_NR_GEM_CLOSE      = 0x09;  // DRM_IOCTL_GEM_CLOSE
 constexpr uint8_t  DRM_NR_GET_CAP        = 0x0c;  // DRM_IOCTL_GET_CAP
 constexpr uint8_t  DRM_COMMAND_BASE      = 0x40;  // driver-private ioctl base
-constexpr uint8_t  DRM_NR_VIRTGPU_GETPARAM = DRM_COMMAND_BASE + 0x03; // 0x43
-constexpr uint8_t  DRM_NR_VIRTGPU_GET_CAPS = DRM_COMMAND_BASE + 0x09; // 0x49
+constexpr uint8_t  DRM_NR_VIRTGPU_MAP            = DRM_COMMAND_BASE + 0x01; // 0x41
+constexpr uint8_t  DRM_NR_VIRTGPU_EXECBUFFER     = DRM_COMMAND_BASE + 0x02; // 0x42
+constexpr uint8_t  DRM_NR_VIRTGPU_GETPARAM       = DRM_COMMAND_BASE + 0x03; // 0x43
+constexpr uint8_t  DRM_NR_VIRTGPU_RESOURCE_CREATE= DRM_COMMAND_BASE + 0x04; // 0x44
+constexpr uint8_t  DRM_NR_VIRTGPU_RESOURCE_INFO  = DRM_COMMAND_BASE + 0x05; // 0x45
+constexpr uint8_t  DRM_NR_VIRTGPU_TRANSFER_FROM_HOST = DRM_COMMAND_BASE + 0x06; // 0x46
+constexpr uint8_t  DRM_NR_VIRTGPU_TRANSFER_TO_HOST   = DRM_COMMAND_BASE + 0x07; // 0x47
+constexpr uint8_t  DRM_NR_VIRTGPU_WAIT           = DRM_COMMAND_BASE + 0x08; // 0x48
+constexpr uint8_t  DRM_NR_VIRTGPU_GET_CAPS       = DRM_COMMAND_BASE + 0x09; // 0x49
+constexpr uint8_t  DRM_NR_VIRTGPU_CONTEXT_INIT   = DRM_COMMAND_BASE + 0x0b; // 0x4b
 
 // virtio-gpu DRM driver identity (matches the upstream kernel driver).
 constexpr int32_t  VIRTGPU_DRIVER_MAJOR  = 0;
@@ -5909,6 +5973,40 @@ struct DrmVirtgpuGetparam { uint64_t param; uint64_t value; }; // value = user u
 struct DrmVirtgpuGetCaps {
     uint32_t cap_set_id; uint32_t cap_set_ver;
     uint64_t addr; uint32_t size; uint32_t pad;
+};
+
+// M1 ioctl structs (virtgpu_drm.h, exact layout).
+struct DrmGemClose { uint32_t handle; uint32_t pad; };
+struct DrmVirtgpuResourceCreate {
+    uint32_t target, format, bind, width, height, depth, array_size;
+    uint32_t last_level, nr_samples, flags;
+    uint32_t bo_handle;   // in: recreate attached to this bo; out: GEM handle
+    uint32_t res_handle;  // out: host resource id
+    uint32_t size, stride;
+};
+struct DrmVirtgpuResourceInfo {
+    uint32_t bo_handle, res_handle, size, blob_mem;
+};
+struct DrmVirtgpu3dBox { uint32_t x, y, z, w, h, d; };
+struct DrmVirtgpu3dTransfer {     // to_host and from_host share this layout
+    uint32_t bo_handle;
+    DrmVirtgpu3dBox box;
+    uint32_t level, offset, stride, layer_stride;
+};
+struct DrmVirtgpuExecbuffer {
+    uint32_t flags, size;
+    uint64_t command;        // void* to virgl dwords
+    uint64_t bo_handles;     // u32* residency list
+    uint32_t num_bo_handles;
+    int32_t  fence_fd;
+    uint32_t ring_idx, syncobj_stride, num_in_syncobjs, num_out_syncobjs;
+    uint64_t in_syncobjs, out_syncobjs;
+};
+struct DrmVirtgpu3dWait { uint32_t handle, flags; };
+struct DrmVirtgpuContextSetParam { uint64_t param, value; };
+struct DrmVirtgpuContextInit {
+    uint32_t num_params, pad;
+    uint64_t ctx_set_params;  // DrmVirtgpuContextSetParam*
 };
 
 // VIRTGPU_PARAM_* (virtgpu_drm.h).
@@ -5939,7 +6037,7 @@ static void DrmFillStr(uint64_t userPtr, uint64_t& userLen, const char* s)
     userLen = actual;
 }
 
-static int64_t DrmRenderIoctl(uint8_t nr, uint64_t arg)
+static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
 {
     switch (nr)
     {
@@ -6005,6 +6103,132 @@ static int64_t DrmRenderIoctl(uint8_t nr, uint64_t arg)
             reinterpret_cast<char*>(gc.addr)[i] = 0;
         return 0;
     }
+    // --- M1: resource / submit path (per-fd GEM table -> host virgl ids) ---
+    case DRM_NR_VIRTGPU_CONTEXT_INIT:
+    {
+        // Create the per-fd virgl context. We ignore the requested capset
+        // params (only VIRGL is offered); the GpuApp driver picks VIRGL.
+        if (dctx->ctxId > 0) return 0;   // already initialised
+        const brook::GpuAppOps* ga = brook::GpuAppGet();
+        if (!ga || !ga->CtxCreate) return -ENODEV;
+        Process* proc = ProcessCurrent();
+        int32_t ctx = ga->CtxCreate(proc ? proc->pid : 0);
+        if (ctx < 0) return -ENOMEM;
+        dctx->ctxId = ctx;
+        return 0;
+    }
+    case DRM_NR_VIRTGPU_RESOURCE_CREATE:
+    {
+        if (!UserBufferReadable(arg, sizeof(DrmVirtgpuResourceCreate)) ||
+            !UserBufferWritable(arg, sizeof(DrmVirtgpuResourceCreate)))
+            return -EFAULT;
+        DrmVirtgpuResourceCreate rc = *reinterpret_cast<DrmVirtgpuResourceCreate*>(arg);
+        const brook::GpuAppOps* ga = brook::GpuAppGet();
+        if (!ga || !ga->ResourceCreate3D) return -ENODEV;
+        // Context is created lazily if the client skipped CONTEXT_INIT.
+        if (dctx->ctxId <= 0) {
+            if (!ga->CtxCreate) return -ENODEV;
+            Process* proc = ProcessCurrent();
+            int32_t ctx = ga->CtxCreate(proc ? proc->pid : 0);
+            if (ctx < 0) return -ENOMEM;
+            dctx->ctxId = ctx;
+        }
+        if (rc.width == 0 || rc.height == 0 || rc.width > 16384 || rc.height > 16384)
+            return -EINVAL;
+        int32_t gres = ga->ResourceCreate3D(dctx->ctxId, rc.format, rc.bind,
+                                            rc.width, rc.height);
+        if (gres < 0) return -ENOMEM;
+        // Estimate size/stride if the client didn't supply them (4 bytes/texel).
+        uint32_t stride = rc.stride ? rc.stride : rc.width * 4;
+        uint32_t size = rc.size ? rc.size : stride * rc.height;
+        uint32_t bo = DrmGemAlloc(dctx, (uint32_t)gres, size, stride,
+                                  rc.width, rc.height);
+        if (bo == 0) return -ENOMEM;   // GEM table full
+        rc.res_handle = (uint32_t)gres;   // host id, used inside virgl streams
+        rc.bo_handle  = bo;               // per-fd GEM handle, used in ioctls
+        rc.size = size; rc.stride = stride;
+        return CopyToUser(arg, &rc, sizeof(rc)) ? 0 : -EFAULT;
+    }
+    case DRM_NR_VIRTGPU_RESOURCE_INFO:
+    {
+        if (!UserBufferReadable(arg, sizeof(DrmVirtgpuResourceInfo)) ||
+            !UserBufferWritable(arg, sizeof(DrmVirtgpuResourceInfo)))
+            return -EFAULT;
+        DrmVirtgpuResourceInfo ri = *reinterpret_cast<DrmVirtgpuResourceInfo*>(arg);
+        DrmGemObj* g = DrmGemGet(dctx, ri.bo_handle);
+        if (!g) return -ENOENT;
+        ri.res_handle = g->gres;
+        ri.size = g->size;
+        ri.blob_mem = 0;
+        return CopyToUser(arg, &ri, sizeof(ri)) ? 0 : -EFAULT;
+    }
+    case DRM_NR_VIRTGPU_TRANSFER_TO_HOST:
+    case DRM_NR_VIRTGPU_TRANSFER_FROM_HOST:
+    {
+        if (!UserBufferReadable(arg, sizeof(DrmVirtgpu3dTransfer)))
+            return -EFAULT;
+        DrmVirtgpu3dTransfer t = *reinterpret_cast<DrmVirtgpu3dTransfer*>(arg);
+        if (dctx->ctxId <= 0) return -EINVAL;
+        DrmGemObj* g = DrmGemGet(dctx, t.bo_handle);
+        if (!g) return -ENOENT;
+        const brook::GpuAppOps* ga = brook::GpuAppGet();
+        if (!ga || !ga->Transfer3D) return -ENODEV;
+        int dir = (nr == DRM_NR_VIRTGPU_TRANSFER_TO_HOST) ? 0 : 1;
+        uint32_t w = t.box.w ? t.box.w : g->width;
+        uint32_t h = t.box.h ? t.box.h : g->height;
+        uint32_t texW = g->width ? g->width : w;
+        uint32_t texH = g->height ? g->height : h;
+        int32_t r = ga->Transfer3D(dctx->ctxId, (int32_t)g->gres, dir,
+                                   t.box.x, t.box.y, w, h, texW, texH);
+        return r < 0 ? -EIO : 0;
+    }
+    case DRM_NR_VIRTGPU_EXECBUFFER:
+    {
+        if (!UserBufferReadable(arg, sizeof(DrmVirtgpuExecbuffer)))
+            return -EFAULT;
+        DrmVirtgpuExecbuffer eb = *reinterpret_cast<DrmVirtgpuExecbuffer*>(arg);
+        if (dctx->ctxId <= 0) return -EINVAL;
+        if (eb.size == 0 || (eb.size & 3) || eb.size > 1024u * 1024) return -EINVAL;
+        if (!UserBufferReadable(eb.command, eb.size)) return -EFAULT;
+        const brook::GpuAppOps* ga = brook::GpuAppGet();
+        if (!ga || !ga->Submit3D) return -ENODEV;
+        uint32_t nDw = eb.size / 4;
+        auto* cmd = static_cast<uint32_t*>(kmalloc(eb.size));
+        if (!cmd) return -ENOMEM;
+        for (uint32_t i = 0; i < nDw; ++i)
+            cmd[i] = reinterpret_cast<const uint32_t*>(eb.command)[i];
+        int32_t r = ga->Submit3D(dctx->ctxId, cmd, nDw);
+        kfree(cmd);
+        // fence_fd out is not supported yet; submit is synchronous so signal -1.
+        if (eb.flags & 0x02 /*FENCE_FD_OUT*/) {
+            eb.fence_fd = -1;
+            CopyToUser(arg, &eb, sizeof(eb));
+        }
+        return r < 0 ? -EIO : 0;
+    }
+    case DRM_NR_VIRTGPU_WAIT:
+    {
+        // Submits are synchronous (the driver busy-polls the host), so by the
+        // time a client waits, the work is already complete.
+        return 0;
+    }
+    case DRM_NR_GEM_CLOSE:
+    {
+        if (!UserBufferReadable(arg, sizeof(DrmGemClose))) return -EFAULT;
+        DrmGemClose gc = *reinterpret_cast<DrmGemClose*>(arg);
+        DrmGemObj* g = DrmGemGet(dctx, gc.handle);
+        if (!g) return -ENOENT;
+        // Note: the underlying host resource is reclaimed wholesale on
+        // CtxDestroy (fd close); per-handle host free lands with MAP/blob in M1b.
+        g->used = false;
+        return 0;
+    }
+    case DRM_NR_VIRTGPU_MAP:
+    {
+        // M1b: mmap-able resource readback not yet implemented. Returning
+        // ENOSYS makes Mesa fall back to a copy path rather than mis-map.
+        return -ENOSYS;
+    }
     default:
         return -25; // ENOTTY
     }
@@ -6067,7 +6291,8 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         uint8_t type = static_cast<uint8_t>((cmd >> 8) & 0xFF);
         uint8_t nr   = static_cast<uint8_t>(cmd & 0xFF);
         if (type != DRM_IOCTL_TYPE) return -25; // ENOTTY
-        return DrmRenderIoctl(nr, arg);
+        if (!fde->handle) return -EBADF;
+        return DrmRenderIoctl(static_cast<DrmCtx*>(fde->handle), nr, arg);
     }
 
     if (fde->type == FdType::DevFramebuf)

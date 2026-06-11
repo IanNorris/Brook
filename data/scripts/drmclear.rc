@@ -1,0 +1,4 @@
+# Brook OS — GL shim M1 validation: drive the DRM resource/submit path
+# (CONTEXT_INIT/RESOURCE_CREATE/EXECBUFFER/TRANSFER/WAIT/INFO/GEM_CLOSE) against
+# the real host virglrenderer via /dev/dri/renderD128.
+run /bin/drmclear
