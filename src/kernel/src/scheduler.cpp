@@ -322,6 +322,9 @@ struct AsLiveEvent {
 static constexpr uint32_t ASLIVE_RING_SIZE = 4096;
 static AsLiveEvent g_asLiveRing[ASLIVE_RING_SIZE];
 static volatile uint64_t g_asLiveSeq = 0;
+// BRO-176 theory test: count asLiveThreads increments that hit a leader whose
+// incarnation no longer matches the joining thread's stamped leaderIncarnation.
+static volatile uint64_t g_bro176IncMismatch = 0;
 
 extern "C" void SchedulerRecordAsLive(void* leader, uint16_t actingPid, uint16_t leaderPid,
                                       uint32_t leaderIncarn, uint32_t procLeaderIncarn,
@@ -941,6 +944,22 @@ void SchedulerAddProcess(Process* proc)
             Process* ldr = proc->threadLeader;
             if (ldr && ldr->magic == PROCESS_MAGIC)
             {
+                // BRO-176 THEORY TEST: the decrement (ProcessDestroy) is gated on
+                // ldr->incarnation == proc->leaderIncarnation, but this increment
+                // is gated on magic ONLY. If the leader struct was freed+reused
+                // (magic re-set, new incarnation) between this thread's creation
+                // and now, we are about to increment a DIFFERENT incarnation that
+                // will never be decremented for it — the asLiveThreads resurrection
+                // the super-model predicted. Count it loudly.
+                if (ldr->incarnation != proc->leaderIncarnation)
+                {
+                    __atomic_fetch_add(&g_bro176IncMismatch, 1, __ATOMIC_RELAXED);
+                    SerialPrintf("BRO176-INC-MISMATCH: thr pid=%u leaderInc=%u but "
+                                 "ldr(pid=%u)->incarnation=%u — incrementing WRONG "
+                                 "incarnation (resurrection)\n",
+                                 proc->pid, (uint32_t)proc->leaderIncarnation,
+                                 ldr->pid, (uint32_t)ldr->incarnation);
+                }
                 int32_t after = __atomic_add_fetch(&ldr->asLiveThreads, 1, __ATOMIC_ACQ_REL);
                 SchedulerRecordAsLive(ldr, proc->pid, ldr->pid, (uint32_t)ldr->incarnation,
                                       (uint32_t)proc->leaderIncarnation, after, /*op=inc*/0);
