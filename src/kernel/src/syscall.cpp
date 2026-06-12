@@ -476,7 +476,6 @@ static inline bool IsRequestServer(const Process* p) {
     return false;
 }
 
-
 // memfd constants and data — defined here so sys_read/sys_write/fstat can use them
 static constexpr uint32_t MFD_CLOEXEC       = 0x0001u;
 [[maybe_unused]] static constexpr uint32_t MFD_ALLOW_SEALING = 0x0002u;
@@ -2660,6 +2659,8 @@ struct DrmGemObj {
     uint32_t size;     // byte size (validate transfers)
     uint32_t stride;
     uint32_t width, height;
+    uint64_t backingKva;   // kernel vaddr of mappable backing (0 = not yet mapped)
+    uint32_t backingBytes; // byte size of the backing allocation
 };
 struct DrmCtx {
     int32_t   ctxId;   // GpuApp virgl context (0 = not yet created)
@@ -2672,7 +2673,7 @@ static uint32_t DrmGemAlloc(DrmCtx* c, uint32_t gres, uint32_t size,
                             uint32_t stride, uint32_t w, uint32_t h) {
     for (uint32_t i = 0; i < DRM_MAX_GEM; ++i) {
         if (c->gem[i].used) continue;
-        c->gem[i] = { true, gres, size, stride, w, h };
+        c->gem[i] = { true, gres, size, stride, w, h, 0, 0 };
         return i + 1;
     }
     return 0;
@@ -3212,6 +3213,13 @@ void FinalizeClosedFd(const FdClaimResult& c)
         const brook::GpuAppOps* ga = brook::GpuAppGet();
         if (ga && ga->CtxDestroy && dctx->ctxId > 0)
             ga->CtxDestroy(dctx->ctxId);
+        // Free any mappable resource backing allocated by VIRTGPU_MAP.
+        for (uint32_t i = 0; i < DRM_MAX_GEM; ++i) {
+            if (dctx->gem[i].used && dctx->gem[i].backingKva) {
+                uint64_t bpages = (dctx->gem[i].backingBytes + 4095) / 4096;
+                VmmFreePages(VirtualAddress(dctx->gem[i].backingKva), bpages);
+            }
+        }
         kfree(dctx);
     }
 
@@ -3792,6 +3800,43 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     // Device or file-backed mmap
     FdEntry* fde = FdGet(proc, static_cast<int>(fd));
     if (!fde) return -EBADF;
+
+    // virtio-gpu DRM render node: map a resource's guest backing (allocated by
+    // the VIRTGPU_MAP ioctl) into user space. The mmap offset encodes the GEM
+    // handle in its high 32 bits. The same physical pages are attached to the
+    // host virgl resource, so TRANSFER_FROM_HOST DMAs land in this mapping.
+    if (fde->type == FdType::DevDri)
+    {
+        auto* dctx = static_cast<DrmCtx*>(fde->handle);
+        if (!dctx) return -ENODEV;
+        uint32_t bo = static_cast<uint32_t>(offset >> 32);
+        DrmGemObj* g = DrmGemGet(dctx, bo);
+        if (!g || g->backingKva == 0) return -EINVAL;
+        uint64_t bpages = (g->backingBytes + 4095) / 4096;
+        if (pages > bpages) pages = bpages;
+        uint64_t vaddr = pickAddr();
+        if (!vaddr) return -ENOMEM;
+        for (uint64_t i = 0; i < pages; ++i)
+        {
+            PhysicalAddress phys = VmmVirtToPhys(KernelPageTable,
+                VirtualAddress(g->backingKva + i * 4096));
+            if (!phys) return -ENOMEM;
+            if (!VmmMapPage(proc->pageTable, VirtualAddress(vaddr + i * 4096),
+                            phys, VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
+                            MemTag::Device, proc->pid))
+                return -ENOMEM;
+        }
+        // Record as a device map so munmap leaves the backing pages alone
+        // (they are owned by the GEM object / virgl context, freed on close).
+        for (uint32_t i = 0; i < Process::MAX_FB_MAPS; ++i) {
+            if (proc->fbMaps[i].length == 0) {
+                proc->fbMaps[i].vaddr  = vaddr;
+                proc->fbMaps[i].length = pages * 4096;
+                break;
+            }
+        }
+        return static_cast<int64_t>(vaddr);
+    }
 
     // Framebuffer device: map physical framebuffer memory into user space
     if (fde->type == FdType::DevFramebuf)
@@ -6003,6 +6048,7 @@ struct DrmVirtgpuExecbuffer {
     uint64_t in_syncobjs, out_syncobjs;
 };
 struct DrmVirtgpu3dWait { uint32_t handle, flags; };
+struct DrmVirtgpuMap { uint64_t offset; uint32_t handle, pad; };
 struct DrmVirtgpuContextSetParam { uint64_t param, value; };
 struct DrmVirtgpuContextInit {
     uint32_t num_params, pad;
@@ -6140,16 +6186,28 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
             if (ctx < 0) return -ENOMEM;
             dctx->ctxId = ctx;
         }
-        if (rc.width == 0 || rc.height == 0 || rc.width > 16384 || rc.height > 16384)
+        // target 0 = PIPE_BUFFER: a 1D linear buffer whose "width" is a byte
+        // count (e.g. glReadPixels staging), so it can far exceed the 2D texture
+        // dimension cap. Validate buffers by byte size, textures by dimension.
+        bool isBuffer = (rc.target == 0);
+        if (rc.width == 0) return -EINVAL;
+        if (isBuffer) {
+            if (rc.width > 256u * 1024 * 1024) return -EINVAL;   // 256 MB cap
+        } else if (rc.width > 16384 || rc.height > 16384) {
             return -EINVAL;
+        }
+        uint32_t createH = rc.height ? rc.height : 1;   // PIPE_BUFFER is 1D (h=0)
         int32_t gres = ga->ResourceCreate3D(dctx->ctxId, rc.format, rc.bind,
-                                            rc.width, rc.height);
+                                            rc.width, createH);
         if (gres < 0) return -ENOMEM;
-        // Estimate size/stride if the client didn't supply them (4 bytes/texel).
-        uint32_t stride = rc.stride ? rc.stride : rc.width * 4;
-        uint32_t size = rc.size ? rc.size : stride * rc.height;
+        // For a buffer the "stride" is its byte length, not width*texel; for a
+        // 2D texture default to width*4 bytes/texel when the client omits stride.
+        uint32_t stride = rc.stride ? rc.stride
+                        : (isBuffer ? rc.width : rc.width * 4);
+        uint32_t size = rc.size ? rc.size
+                      : (isBuffer ? rc.width : stride * createH);
         uint32_t bo = DrmGemAlloc(dctx, (uint32_t)gres, size, stride,
-                                  rc.width, rc.height);
+                                  rc.width, createH);
         if (bo == 0) return -ENOMEM;   // GEM table full
         rc.res_handle = (uint32_t)gres;   // host id, used inside virgl streams
         rc.bo_handle  = bo;               // per-fd GEM handle, used in ioctls
@@ -6206,9 +6264,27 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
             cmd[i] = reinterpret_cast<const uint32_t*>(eb.command)[i];
         int32_t r = ga->Submit3D(dctx->ctxId, cmd, nDw);
         kfree(cmd);
-        // fence_fd out is not supported yet; submit is synchronous so signal -1.
+        // Out-fence: Submit3D is synchronous, so by the time we return the GPU
+        // work is already complete. Mesa (FENCE_FD_OUT) expects a sync-file fd it
+        // will poll(POLLIN) on and then close. Hand back an already-signaled
+        // eventfd (counter=1) so the poll completes immediately; a bare -1 makes
+        // Mesa poll a negative fd with an infinite timeout and hang forever.
         if (eb.flags & 0x02 /*FENCE_FD_OUT*/) {
-            eb.fence_fd = -1;
+            int fenceFd = -1;
+            Process* fp = ProcessCurrent();
+            if (fp) {
+                auto* efd = static_cast<EventFdData*>(kmalloc(sizeof(EventFdData)));
+                if (efd) {
+                    efd->counter = 1;        // pre-signaled (work already done)
+                    efd->flags = 0;
+                    efd->refCount = 1;
+                    efd->readerWaiter = nullptr;
+                    efd->epollWaiter = nullptr;
+                    fenceFd = FdAlloc(fp, FdType::EventFd, efd);
+                    if (fenceFd < 0) kfree(efd);
+                }
+            }
+            eb.fence_fd = fenceFd;
             CopyToUser(arg, &eb, sizeof(eb));
         }
         return r < 0 ? -EIO : 0;
@@ -6232,9 +6308,36 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
     }
     case DRM_NR_VIRTGPU_MAP:
     {
-        // M1b: mmap-able resource readback not yet implemented. Returning
-        // ENOSYS makes Mesa fall back to a copy path rather than mis-map.
-        return -ENOSYS;
+        // Map-for-CPU-access (e.g. glReadPixels staging buffers). Lazily
+        // allocate guest backing for the resource and attach it to the host
+        // virgl resource, so a later TRANSFER_FROM_HOST DMAs the rendered
+        // pixels into pages that sys_mmap then maps into user space. The
+        // returned offset is a token encoding the GEM handle (see sys_mmap).
+        if (!UserBufferReadable(arg, sizeof(DrmVirtgpuMap)) ||
+            !UserBufferWritable(arg, sizeof(DrmVirtgpuMap)))
+            return -EFAULT;
+        DrmVirtgpuMap m = *reinterpret_cast<DrmVirtgpuMap*>(arg);
+        DrmGemObj* g = DrmGemGet(dctx, m.handle);
+        if (!g) return -ENOENT;
+        if (g->backingKva == 0) {
+            uint32_t bytes = g->size ? g->size
+                           : g->stride * (g->height ? g->height : 1);
+            if (bytes == 0) return -EINVAL;
+            uint64_t pages = (bytes + 4095) / 4096;
+            VirtualAddress kva = VmmAllocPages(pages, VMM_WRITABLE,
+                                               MemTag::Device, KernelPid);
+            if (!kva.raw()) return -ENOMEM;
+            auto* zp = reinterpret_cast<volatile uint8_t*>(kva.raw());
+            for (uint64_t b = 0; b < pages * 4096; ++b) zp[b] = 0;
+            const brook::GpuAppOps* ga = brook::GpuAppGet();
+            if (ga && ga->ResourceAttachUser)
+                ga->ResourceAttachUser(dctx->ctxId, (int32_t)g->gres,
+                                       kva.raw(), bytes);
+            g->backingKva = kva.raw();
+            g->backingBytes = bytes;
+        }
+        m.offset = static_cast<uint64_t>(m.handle) << 32;  // decoded in sys_mmap
+        return CopyToUser(arg, &m, sizeof(m)) ? 0 : -EFAULT;
     }
     default:
         return -25; // ENOTTY
