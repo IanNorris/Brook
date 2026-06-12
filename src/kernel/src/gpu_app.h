@@ -28,11 +28,15 @@ struct GpuAppOps {
     void (*CtxDestroy)(int32_t ctxId);
 
     // Create a 3D resource in the context. `format`/`bind` are virgl values
-    // (VIRGL_FORMAT_*, VIRGL_BIND_*). Returns the resource's host-global id (>0)
-    // — the app uses this SAME id both in later ops and inside the virgl command
-    // streams it submits (where resource ids must be host-global) — or <0.
-    int32_t (*ResourceCreate3D)(int32_t ctxId, uint32_t format, uint32_t bind,
-                                uint32_t w, uint32_t h);
+    // (VIRGL_FORMAT_*, VIRGL_BIND_*). `target` is a PIPE_* resource target:
+    // 0 (PIPE_BUFFER) creates a 1-D linear buffer (w = byte length, h ignored),
+    // anything else a 2-D texture. The distinction is mandatory — virglrenderer
+    // rejects a resource whose bind flags imply a buffer but whose target is a
+    // texture (Mesa's glReadPixels staging buffer). Returns the resource's
+    // host-global id (>0) — the app uses this SAME id both in later ops and
+    // inside the virgl command streams it submits — or <0.
+    int32_t (*ResourceCreate3D)(int32_t ctxId, uint32_t target, uint32_t format,
+                                uint32_t bind, uint32_t w, uint32_t h);
 
     // Back a resource with guest memory at kernel-virtual `vaddr` (size `bytes`),
     // described to the host page-by-page (scatter-gather). The buffer may be a

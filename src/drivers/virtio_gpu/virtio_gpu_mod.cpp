@@ -2574,12 +2574,14 @@ static void AppCtxDestroy(int32_t ctxId)
     SerialPrintf("virtio_gpu: app virgl ctx %d destroyed\n", ctxId);
 }
 
-static int32_t AppResourceCreate3D(int32_t ctxId, uint32_t format, uint32_t bind,
-                                   uint32_t w, uint32_t h)
+static int32_t AppResourceCreate3D(int32_t ctxId, uint32_t target, uint32_t format,
+                                   uint32_t bind, uint32_t w, uint32_t h)
 {
     GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
     AppCtx* c = AppCtxFind(ctxId);
-    if (!c || w == 0 || h == 0) return -1;
+    if (!c || w == 0) return -1;
+    const bool isBuffer = (target == PIPE_BUFFER);
+    if (!isBuffer && h == 0) return -1;
     // Resources are named to the app by their host-global id (1-based per ctx,
     // mapped into this context's private block) so the app can reference the
     // same id inside the virgl streams it submits, where ids are host-global.
@@ -2588,7 +2590,12 @@ static int32_t AppResourceCreate3D(int32_t ctxId, uint32_t format, uint32_t bind
     uint32_t localRes = ++s_localCounter[i];
     if (localRes >= APP_RES_STRIDE) return -1;
     uint32_t gres = AppResGlobal((uint32_t)ctxId, localRes);
-    if (!ResourceCreate3D(gres, format, bind, w, h)) return -1;
+    // A PIPE_BUFFER must be created as a 1-D linear buffer (target 0), or
+    // virglrenderer rejects buffer bind flags on a texture target — this is
+    // Mesa's glReadPixels staging buffer (BRO-188).
+    bool created = isBuffer ? ResourceCreateBuffer(gres, bind, w)
+                            : ResourceCreate3D(gres, format, bind, w, h);
+    if (!created) return -1;
     if (!CtxAttachResource((uint32_t)ctxId, gres)) return -1;
     return static_cast<int32_t>(gres);
 }

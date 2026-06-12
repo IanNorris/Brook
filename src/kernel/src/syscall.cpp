@@ -6083,6 +6083,34 @@ static void DrmFillStr(uint64_t userPtr, uint64_t& userLen, const char* s)
     userLen = actual;
 }
 
+// Ensure a GEM-backed resource has guest backing pages attached to its host
+// virgl resource (an iov). virglrenderer requires src_res->iov != NULL for the
+// COPY_TRANSFER3D (READ_FROM_HOST) that Mesa emits for glReadPixels — and that
+// applies to the *render target* being read, not just the staging buffer, so we
+// must attach backing to every resource at creation time, not lazily at MAP
+// (Mesa never MAPs a render target). Idempotent: a second call is a no-op once
+// backingKva is set, so MAP reuses the same pages. Returns false only on OOM.
+static bool DrmEnsureBacking(DrmCtx* dctx, DrmGemObj* g)
+{
+    if (g->backingKva != 0) return true;
+    uint32_t bytes = g->backingBytes ? g->backingBytes
+                   : (g->size ? g->size
+                              : g->stride * (g->height ? g->height : 1));
+    if (bytes == 0) return false;
+    uint64_t pages = (bytes + 4095) / 4096;
+    VirtualAddress kva = VmmAllocPages(pages, VMM_WRITABLE,
+                                       MemTag::Device, KernelPid);
+    if (!kva.raw()) return false;
+    auto* zp = reinterpret_cast<volatile uint8_t*>(kva.raw());
+    for (uint64_t b = 0; b < pages * 4096; ++b) zp[b] = 0;
+    const brook::GpuAppOps* ga = brook::GpuAppGet();
+    if (ga && ga->ResourceAttachUser)
+        ga->ResourceAttachUser(dctx->ctxId, (int32_t)g->gres, kva.raw(), bytes);
+    g->backingKva = kva.raw();
+    g->backingBytes = bytes;
+    return true;
+}
+
 static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
 {
     switch (nr)
@@ -6197,18 +6225,26 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
             return -EINVAL;
         }
         uint32_t createH = rc.height ? rc.height : 1;   // PIPE_BUFFER is 1D (h=0)
-        int32_t gres = ga->ResourceCreate3D(dctx->ctxId, rc.format, rc.bind,
-                                            rc.width, createH);
+        int32_t gres = ga->ResourceCreate3D(dctx->ctxId, rc.target, rc.format,
+                                            rc.bind, rc.width, createH);
         if (gres < 0) return -ENOMEM;
         // For a buffer the "stride" is its byte length, not width*texel; for a
         // 2D texture default to width*4 bytes/texel when the client omits stride.
         uint32_t stride = rc.stride ? rc.stride
                         : (isBuffer ? rc.width : rc.width * 4);
-        uint32_t size = rc.size ? rc.size
-                      : (isBuffer ? rc.width : stride * createH);
+        // Mesa allocates no guest storage for host-side textures and passes a
+        // bogus rc.size (often 1), so never honour it for a texture — compute
+        // the full row-stride*height extent. Buffers carry a real byte count.
+        uint32_t size = isBuffer ? (rc.size ? rc.size : rc.width)
+                                 : stride * createH;
         uint32_t bo = DrmGemAlloc(dctx, (uint32_t)gres, size, stride,
                                   rc.width, createH);
         if (bo == 0) return -ENOMEM;   // GEM table full
+        // Attach guest backing now (not lazily at MAP): a render target read by
+        // Mesa's glReadPixels COPY_TRANSFER3D must already have an iov, or
+        // virglrenderer rejects the command (check_copy_transfer3d_handles).
+        DrmGemObj* gobj = DrmGemGet(dctx, bo);
+        if (gobj && !DrmEnsureBacking(dctx, gobj)) return -ENOMEM;
         rc.res_handle = (uint32_t)gres;   // host id, used inside virgl streams
         rc.bo_handle  = bo;               // per-fd GEM handle, used in ioctls
         rc.size = size; rc.stride = stride;
@@ -6319,23 +6355,7 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         DrmVirtgpuMap m = *reinterpret_cast<DrmVirtgpuMap*>(arg);
         DrmGemObj* g = DrmGemGet(dctx, m.handle);
         if (!g) return -ENOENT;
-        if (g->backingKva == 0) {
-            uint32_t bytes = g->size ? g->size
-                           : g->stride * (g->height ? g->height : 1);
-            if (bytes == 0) return -EINVAL;
-            uint64_t pages = (bytes + 4095) / 4096;
-            VirtualAddress kva = VmmAllocPages(pages, VMM_WRITABLE,
-                                               MemTag::Device, KernelPid);
-            if (!kva.raw()) return -ENOMEM;
-            auto* zp = reinterpret_cast<volatile uint8_t*>(kva.raw());
-            for (uint64_t b = 0; b < pages * 4096; ++b) zp[b] = 0;
-            const brook::GpuAppOps* ga = brook::GpuAppGet();
-            if (ga && ga->ResourceAttachUser)
-                ga->ResourceAttachUser(dctx->ctxId, (int32_t)g->gres,
-                                       kva.raw(), bytes);
-            g->backingKva = kva.raw();
-            g->backingBytes = bytes;
-        }
+        if (!DrmEnsureBacking(dctx, g)) return -ENOMEM;
         m.offset = static_cast<uint64_t>(m.handle) << 32;  // decoded in sys_mmap
         return CopyToUser(arg, &m, sizeof(m)) ? 0 : -EFAULT;
     }
@@ -11322,7 +11342,10 @@ static int64_t sys_brook_gpu_resource_create(uint64_t ctx, uint64_t format,
     if (!ga || !ga->ResourceCreate3D) return -ENODEV;
     if ((int32_t)ctx != proc->gpuAppCtx || proc->gpuAppCtx <= 0) return -EPERM;
     if (w == 0 || h == 0 || w > 8192 || h > 8192) return -EINVAL;
-    int32_t res = ga->ResourceCreate3D((int32_t)ctx, (uint32_t)format, (uint32_t)bind,
+    // This native ABI only creates 2-D textures; pass PIPE_TEXTURE_2D (2) so the
+    // driver picks the texture path (target 0 is reserved for PIPE_BUFFER).
+    int32_t res = ga->ResourceCreate3D((int32_t)ctx, /*PIPE_TEXTURE_2D=*/2u,
+                                       (uint32_t)format, (uint32_t)bind,
                                        (uint32_t)w, (uint32_t)h);
     return res < 0 ? -ENOMEM : res;
 }
