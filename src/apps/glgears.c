@@ -74,7 +74,7 @@
 
 #define W 520
 #define H 520
-#define FRAMES 16                  // rotation frames pre-baked; 48*7.5deg = 360
+#define FRAMES 48                  // rotation frames pre-baked; 48*7.5deg = 360
 #define VERT_FLOATS 6              // x,y, r,g,b,a
 #define MAX_VERTS 2048             // generous upper bound for 3 gears
 

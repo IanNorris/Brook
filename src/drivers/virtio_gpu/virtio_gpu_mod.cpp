@@ -25,6 +25,7 @@
 #include "memory/address.h"
 #include "mem_tag.h"
 #include "string.h"
+#include "spinlock.h"
 
 MODULE_IMPORT_SYMBOL(PciFindDevice);
 MODULE_IMPORT_SYMBOL(PciEnableMemSpace);
@@ -482,6 +483,29 @@ static constexpr uint32_t CMD_PAGES    = 16;
 static constexpr uint32_t CMD_REQ_OFF  = 0;
 static constexpr uint32_t CMD_RESP_OFF = (CMD_PAGES - 1) * 4096;
 static constexpr uint32_t CMD_RESP_CAP = 4096;
+
+// BRO-189: the control queue + the single shared staging buffer (g_cmdBuf) are a
+// global resource, but two independent submitters race on them: the compositor
+// kernel thread (virgl ctx 2, presenting every frame) and app processes (e.g.
+// glgears, ctx 256) submitting from their own syscall context on other CPUs.
+// With no serialization they corrupt each other's command streams and the
+// avail/used ring shadows, which the host reports as "Illegal command buffer"
+// and which wedges the whole virgl device (both contexts then fail).
+//
+// Serialize the entire fill-g_cmdBuf + SubmitCommand + read-response critical
+// section at the public-op boundary (every GpuAppOps / GpuCompositorOps entry
+// that submits). A plain ticket SpinLock is used rather than an IrqSpinLock: no
+// GPU submit ever runs in IRQ context (the IRQ path only consumes the used
+// ring), so disabling IRQs across a full device round-trip would needlessly
+// hurt interrupt latency. The lock is non-recursive; no guarded op calls another
+// guarded op (verified), so there is no self-deadlock. Each submit is one
+// complete command to an independent host context, so serializing whole ops is
+// correct even when the compositor and an app interleave between frames.
+static SpinLock g_gpuCmdLock;
+struct GpuCmdGuard {
+    GpuCmdGuard()  { SpinLockAcquire(&g_gpuCmdLock); }
+    ~GpuCmdGuard() { SpinLockRelease(&g_gpuCmdLock); }
+};
 
 // Framebuffer resource backing — the front buffer the device scans out of AND
 // the surface the compositor renders into. Physically contiguous (PmmAllocPages)
@@ -1861,6 +1885,7 @@ static bool SetupGpuCompositor(uint32_t w, uint32_t h)
 
 static GpuTexId CompCreateTexture(uint32_t w, uint32_t h, uint64_t backingVaddr, bool alpha)
 {
+    GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
     if (!g_compReady || w == 0 || h == 0) return 0;
     uint32_t slot = MAX_GPU_TEXTURES;
     for (uint32_t i = 0; i < MAX_GPU_TEXTURES; ++i)
@@ -1920,6 +1945,7 @@ static void CompDestroyTexture(GpuTexId t)
 
 static void CompUpdateTexture(GpuTexId t, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
+    GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
     GpuTexture* gt = CompTex(t);
     if (!gt) return;
     if (x >= gt->w || y >= gt->h) return;
@@ -1931,6 +1957,7 @@ static void CompUpdateTexture(GpuTexId t, uint32_t x, uint32_t y, uint32_t w, ui
 
 static void CompBeginFrame(uint32_t clearArgb)
 {
+    GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
     if (!g_compReady) return;
     (void)clearArgb;   // see note below
     // First GPU frame: point scanout 0 at the RT (switches away from the 2D FB).
@@ -2215,6 +2242,7 @@ static void CompEndFrameDraw()
 
 static void CompEndFrame()
 {
+    GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
     if (!g_compReady) return;
     if (g_drawReady && g_drawQuadCount > 0) { CompEndFrameDraw(); return; }
     if (g_composeN == 0) return;
@@ -2246,6 +2274,7 @@ static void CompGetSize(uint32_t* w, uint32_t* h)
 static uint32_t CompCaptureThumb(uint32_t* out, uint32_t maxPixels,
                                  uint32_t* outW, uint32_t* outH)
 {
+    GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
     if (!g_compReady || !g_compThumbBuf || !out) return 0;
 
     // One-BLIT submit: scanout (full) -> thumbnail (scaled down).
@@ -2284,6 +2313,7 @@ static uint32_t CompCaptureThumb(uint32_t* out, uint32_t maxPixels,
 // 1:1 into it, reads it back, and returns a pointer to the readback buffer.
 static const uint32_t* CompCaptureFull(uint32_t* outW, uint32_t* outH)
 {
+    GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
     if (!g_compReady || g_compScanoutW == 0) return nullptr;
 
     if (!g_compFullReady)
@@ -2371,6 +2401,7 @@ static inline bool AppResValid(int32_t ctxId, uint32_t gres)
 
 static int32_t AppCtxCreate(uint32_t pid)
 {
+    GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
     if (!g_compReady) return -1;
     for (uint32_t i = 0; i < MAX_APP_CTX; ++i)
     {
@@ -2396,6 +2427,7 @@ static AppCtx* AppCtxFind(int32_t ctxId)
 
 static void AppCtxDestroy(int32_t ctxId)
 {
+    GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
     AppCtx* c = AppCtxFind(ctxId);
     if (!c) return;
     auto* req = reinterpret_cast<VirtioGpuCtrlHdr*>(g_cmdBuf + CMD_REQ_OFF);
@@ -2417,6 +2449,7 @@ static void AppCtxDestroy(int32_t ctxId)
 static int32_t AppResourceCreate3D(int32_t ctxId, uint32_t format, uint32_t bind,
                                    uint32_t w, uint32_t h)
 {
+    GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
     AppCtx* c = AppCtxFind(ctxId);
     if (!c || w == 0 || h == 0) return -1;
     // Resources are named to the app by their host-global id (1-based per ctx,
@@ -2435,6 +2468,7 @@ static int32_t AppResourceCreate3D(int32_t ctxId, uint32_t format, uint32_t bind
 static int32_t AppResourceAttachUser(int32_t ctxId, int32_t gres,
                                      uint64_t vaddr, uint32_t bytes)
 {
+    GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
     AppCtx* c = AppCtxFind(ctxId);
     if (!c || !AppResValid(ctxId, (uint32_t)gres) || bytes == 0) return -1;
     return ResourceAttachBackingVirt((uint32_t)gres, vaddr, bytes) ? 0 : -1;
@@ -2447,6 +2481,7 @@ static int32_t AppResourceAttachUser(int32_t ctxId, int32_t gres,
 // SET_VERTEX_BUFFERS command) or <0. The bounce buffer is freed on ctx destroy.
 static int32_t AppBufferUpload(int32_t ctxId, const void* src, uint32_t bytes)
 {
+    GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
     AppCtx* c = AppCtxFind(ctxId);
     if (!c || !src || bytes == 0 || bytes > 16u * 1024 * 1024) return -1;
     uint32_t slot = MAX_APP_UPLOADS;
@@ -2477,6 +2512,7 @@ static int32_t AppBufferUpload(int32_t ctxId, const void* src, uint32_t bytes)
 
 static int32_t AppSubmit3D(int32_t ctxId, const uint32_t* dwords, uint32_t n)
 {
+    GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
     AppCtx* c = AppCtxFind(ctxId);
     if (!c || !dwords || n == 0) return -1;
     // Bound the stream to the request region (last page is the response buffer).
@@ -2495,6 +2531,7 @@ static int32_t AppTransfer3D(int32_t ctxId, int32_t gres, int dir,
                              uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                              uint32_t texW, uint32_t texH)
 {
+    GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
     AppCtx* c = AppCtxFind(ctxId);
     if (!c || !AppResValid(ctxId, (uint32_t)gres) || w == 0 || h == 0) return -1;
     if (dir == 0)
