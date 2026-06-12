@@ -305,6 +305,17 @@ static constexpr uint32_t VIRGL_CCMD_SET_SAMPLER_VIEWS   = 10;
 static constexpr uint32_t VIRGL_CCMD_BLIT                = 16;
 static constexpr uint32_t VIRGL_CCMD_BIND_SAMPLER_STATES = 18;
 static constexpr uint32_t VIRGL_CCMD_BIND_SHADER         = 31;
+static constexpr uint32_t VIRGL_CCMD_COPY_TRANSFER3D     = 45;
+
+// COPY_TRANSFER3D operand layout (virgl_protocol.h): 14 payload dwords. The
+// first 11 mirror VIRGL_RESOURCE_IW_* (res handle, level, usage, stride,
+// layer_stride, box xyz, box whd); dword 12 is the *second* resource handle,
+// dword 13 the source offset, dword 14 the flags. For READ_FROM_HOST the host
+// decode inverts the roles: dword 1 names the GL *source* it reads, dword 12
+// the guest-backed *destination* buffer whose iov it writes synchronously. This
+// is exactly Mesa's glReadPixels staging path (VIRGL_CAP_COPY_TRANSFER).
+static constexpr uint32_t VIRGL_COPY_TRANSFER3D_FLAGS_SYNCHRONIZED   = 1u << 0;
+static constexpr uint32_t VIRGL_COPY_TRANSFER3D_FLAGS_READ_FROM_HOST = 1u << 1;
 
 static constexpr uint32_t VIRGL_OBJECT_BLEND            = 1;
 static constexpr uint32_t VIRGL_OBJECT_RASTERIZER       = 2;
@@ -389,6 +400,7 @@ static constexpr uint32_t CTX_ID_SELFTEST = 1;
 static constexpr uint32_t RES_3D_SELFTEST = 2;   // src (cleared green)
 static constexpr uint32_t RES_3D_BLITDST  = 3;   // blit target (blue + green square)
 static constexpr uint32_t RES_3D_SCANOUT  = 4;   // scanout-RT present-path gate test
+static constexpr uint32_t RES_3D_COPYBUF  = 5;   // COPY_TRANSFER3D readback dst (Mesa glReadPixels path)
 static constexpr uint32_t SURF_SRC        = 1;   // surface handle for src clear
 static constexpr uint32_t SURF_DST        = 2;   // surface handle for dst clear
 static constexpr uint32_t SURF_SCANOUT    = 3;   // surface handle for scanout clear
@@ -462,6 +474,9 @@ static bool              g_haveVenusCapset = false;
 static bool              g_gpu3dWorks = false;
 // Set true once Gate #1 (scanout-as-3D-RT present path) is verified.
 static bool              g_gpuScanoutRtOk = false;
+// Set true once the COPY_TRANSFER3D readback (Mesa glReadPixels path) reads back
+// correctly — the deterministic in-kernel reproduction of BRO-188.
+static bool              g_gpuCopyTransferOk = false;
 
 // controlq (queue 0)
 static uint16_t            g_queueSize = 0;
@@ -1286,7 +1301,54 @@ static bool Submit3DBlit(uint32_t ctxId, uint32_t dstRes,
     return CmdRespOk(SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP));
 }
 
-// Shader-free GPU self-test in two stages, proving the primitives the GPU
+// Defined further down; needed by the COPY_TRANSFER3D self-test stage below.
+static bool ResourceCreateBuffer(uint32_t resId, uint32_t bind, uint32_t byteLen);
+
+// Submit a single VIRGL_CCMD_COPY_TRANSFER3D (READ_FROM_HOST) inside a SUBMIT_3D
+// command buffer: read a `w`x`h` B8G8R8X8 region of `srcTexRes` (a host GL
+// texture/render-target) directly into the guest backing (iov) of `dstBufRes`
+// (a PIPE_BUFFER). This is exactly the protocol Mesa uses to implement
+// glReadPixels on a surfaceless context — the host writes the pixels into the
+// staging buffer's iov synchronously during command decode, so after the
+// control-queue response the backing holds the result (no separate
+// TRANSFER_FROM_HOST). `synchronized` sets the SYNCHRONIZED flag (forces the
+// host to glFinish before reading rather than using a pipelined staging copy).
+static bool Submit3DCopyReadback(uint32_t ctxId, uint32_t srcTexRes,
+                                 uint32_t dstBufRes, uint32_t w, uint32_t h,
+                                 bool synchronized)
+{
+    auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
+    memset(sub, 0, sizeof(*sub));
+    sub->hdr.type   = VIRTIO_GPU_CMD_SUBMIT_3D;
+    sub->hdr.ctx_id = ctxId;
+
+    uint32_t* dw = reinterpret_cast<uint32_t*>(
+        g_cmdBuf + CMD_REQ_OFF + sizeof(VirtioGpuCmdSubmit));
+    uint32_t n = 0;
+
+    // Header: COPY_TRANSFER3D with 14 payload dwords (length field validated
+    // exactly by vrend_decode_copy_transfer3d).
+    dw[n++] = VirglCmd0(VIRGL_CCMD_COPY_TRANSFER3D, 0, 14);
+    dw[n++] = srcTexRes;        // [1]  IW_RES_HANDLE   -> src (read FROM host GL)
+    dw[n++] = 0;                // [2]  level
+    dw[n++] = 0;                // [3]  usage
+    dw[n++] = w * 4;            // [4]  stride       (>= width*bpp)
+    dw[n++] = w * h * 4;        // [5]  layer_stride (>= stride*height)
+    dw[n++] = 0;                // [6]  box.x
+    dw[n++] = 0;                // [7]  box.y
+    dw[n++] = 0;                // [8]  box.z
+    dw[n++] = w;                // [9]  box.w
+    dw[n++] = h;                // [10] box.h
+    dw[n++] = 1;                // [11] box.d
+    dw[n++] = dstBufRes;        // [12] SRC_RES_HANDLE -> dst (iov written here)
+    dw[n++] = 0;                // [13] src/dst offset
+    dw[n++] = VIRGL_COPY_TRANSFER3D_FLAGS_READ_FROM_HOST
+            | (synchronized ? VIRGL_COPY_TRANSFER3D_FLAGS_SYNCHRONIZED : 0u);  // [14] flags
+
+    sub->size = n * 4;
+    return CmdRespOk(SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP));
+}
+
 // compositor is built on:
 //   (1) CLEAR  — create a 3D context + render-target texture, CLEAR it green via
 //       SUBMIT_3D, transfer it back, verify. Proves ctx/resource/submit/transfer.
@@ -1335,6 +1397,44 @@ static void VirtioGpu3DSelfTest()
     SerialPrintf("virtio_gpu: 3D self-test [clear] px[0]=0x%08x (r=%u g=%u b=%u) -> %s\n",
                  px, chanR(px), chanG(px), chanB(px), clearGreen ? "PASS" : "FAIL");
     if (!clearGreen) return;
+
+    // --- Stage 1b: COPY_TRANSFER3D readback (Mesa glReadPixels path) ---
+    // Deterministic, Mesa-free reproduction of BRO-188: read the green texture
+    // back into a PIPE_BUFFER's guest backing via a single COPY_TRANSFER3D
+    // (READ_FROM_HOST) — the exact protocol Mesa emits for glReadPixels on a
+    // surfaceless context. Unlike TRANSFER_FROM_HOST_3D (used above, which works
+    // on textures), this writes the destination buffer's iov directly during
+    // host command decode. If this stage reads green, the in-kernel copy path is
+    // sound and BRO-188's black pixels are isolated to Mesa's guest-side setup;
+    // if it reads zero (with no vrend error on the host log), the host writes the
+    // iov asynchronously and the control-queue response races ahead of it.
+    {
+        PhysicalAddress cphys = PmmAllocPages(pages, MemTag::Device, KernelPid);
+        if (!cphys) { SerialPuts("virtio_gpu: 3D self-test copybuf alloc failed\n"); return; }
+        uint32_t* cread = reinterpret_cast<uint32_t*>(PhysToVirt(cphys).raw());
+        memset(cread, 0, bytes);
+
+        bool copyOk = false;
+        if (!ResourceCreateBuffer(RES_3D_COPYBUF, 0, bytes))
+        { SerialPuts("virtio_gpu: 3D self-test copybuf create failed\n"); }
+        else if (!ResourceAttachBackingContig(RES_3D_COPYBUF, cphys.raw(), bytes))
+        { SerialPuts("virtio_gpu: 3D self-test copybuf attach failed\n"); }
+        else if (!CtxAttachResource(CTX_ID_SELFTEST, RES_3D_COPYBUF))
+        { SerialPuts("virtio_gpu: 3D self-test copybuf ctx-attach failed\n"); }
+        else if (!Submit3DCopyReadback(CTX_ID_SELFTEST, RES_3D_SELFTEST,
+                                       RES_3D_COPYBUF, dim, dim, /*synchronized=*/true))
+        { SerialPuts("virtio_gpu: 3D self-test COPY_TRANSFER3D submit failed\n"); }
+        else
+            copyOk = true;
+
+        if (copyOk) {
+            uint32_t cpx = cread[0];
+            bool copyGreen = (chanG(cpx) > 0xC0) && (chanR(cpx) < 0x40) && (chanB(cpx) < 0x40);
+            SerialPrintf("virtio_gpu: 3D self-test [copybuf] px[0]=0x%08x (r=%u g=%u b=%u) -> %s\n",
+                         cpx, chanR(cpx), chanG(cpx), chanB(cpx), copyGreen ? "PASS" : "FAIL");
+            g_gpuCopyTransferOk = copyGreen;
+        }
+    }
 
     // --- Stage 2: BLIT a 32x32 corner of the green texture onto a blue target. ---
     PhysicalAddress phys2 = PmmAllocPages(pages, MemTag::Device, KernelPid);
