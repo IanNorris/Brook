@@ -347,6 +347,9 @@ fi
 if [ "${BROOK_GPU_THUMB:-0}" = "1" ]; then
     FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/gputhumb,string=1"
 fi
+if [ "${BROOK_WATERLINE:-0}" = "1" ]; then
+    FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/waterline,string=1"
+fi
 if [ "${BROOK_GPU_FULL:-0}" = "1" ]; then
     FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/gpufull,string=1"
 fi

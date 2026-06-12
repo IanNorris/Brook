@@ -415,6 +415,17 @@ void CompositorInit()
         SerialPuts("COMPOSITOR: GPU thumbnail serial dump enabled (BROOK_GPU_THUMB=1)\n");
     }
 
+    // Waterline flow: opt/waterline == "1" animates the focused window's
+    // waterline (light drifting along it). The STATIC waterline look is always
+    // on (it is just the chrome palette); the flow costs a continuous recompose,
+    // so it is opt-in (BROOK_WATERLINE=1) to keep an idle desktop idle.
+    char wl[8] = {};
+    if (FwCfgReadFile("opt/waterline", wl, sizeof(wl) - 1) >= 1 && wl[0] == '1')
+    {
+        WmSetWaterlineFlow(true);
+        SerialPuts("COMPOSITOR: waterline flow enabled (BROOK_WATERLINE=1)\n");
+    }
+
     // Optional: one-shot full-resolution frame dump (GPU + CPU) for text-fidelity
     // parity. Emitted once after the desktop settles. opt/gpufull == "1".
     char full[8] = {};
@@ -1501,6 +1512,22 @@ static void CompositorLoopWM()
             WmRenderChromeForWindow(g_backBuffer, g_backBufStride,
                                      g_physFbWidth, g_physFbHeight, sorted[i],
                                      chromeMx, chromeMy);
+        }
+    }
+
+    // Waterline flow: advance the focused window's phase and mark its titlebar
+    // rows dirty so the next pass re-presents the moving light. Only when the
+    // flow is enabled (opt/waterline) and a focused, chrome-bearing, non-minimized
+    // window exists, so an idle desktop without the flag stays idle. ~2px/frame.
+    if (WmWaterlineFlowEnabled())
+    {
+        int fIdx = WmGetFocusedWindow();
+        Window* fw = (fIdx >= 0) ? WmGetWindow(fIdx) : nullptr;
+        if (fw && fw->proc && fw->visible && !fw->minimized && !fw->noChrome)
+        {
+            WmAdvanceWaterline(2);
+            uint32_t topY = (fw->y > 0) ? (uint32_t)fw->y : 0;
+            MarkDirtyRows(topY, topY + WM_BORDER_WIDTH + WM_TITLE_BAR_HEIGHT);
         }
     }
 

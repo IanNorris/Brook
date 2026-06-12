@@ -882,6 +882,78 @@ static inline void WmEngravePixel(uint32_t* buf, uint32_t stride,
     WmPutPixel(buf, stride, screenW, screenH, x, y, fg);
 }
 
+// Signature "waterline": a luminous aqua band at the base of the titlebar.
+// Focused windows get a bright core; the GPU/animation path drifts brighter
+// crests along it (phase advances per frame) so light appears to flow on the
+// active window. Unfocused windows get a dim, still line. The crest is blended
+// toward WM_WATER_CREST with a triangular falloff so it reads as moving light,
+// not a hard dot. Phase is in pixels and wraps on the line width.
+static uint32_t g_waterPhase = 0;     // advanced by the compositor for the focused window
+static bool     g_waterlineFlow = false;  // animate crests (opt/waterline); static look always on
+
+void WmSetWaterlineFlow(bool on) { g_waterlineFlow = on; }
+bool WmWaterlineFlowEnabled()    { return g_waterlineFlow; }
+
+// Advance the flow phase by `dpx` pixels. The compositor calls this once per
+// presented frame for the focused window; wrapping is handled per-line in the
+// draw helper. Returns the new phase.
+uint32_t WmAdvanceWaterline(uint32_t dpx) { g_waterPhase += dpx; return g_waterPhase; }
+
+static inline uint32_t WmWaterBlend(uint32_t base, uint32_t crest, int num, int den)
+{
+    if (num <= 0 || den <= 0) return base;
+    if (num >= den) return crest;
+    int br = (base >> 16) & 0xff, bg = (base >> 8) & 0xff, bb = base & 0xff;
+    int cr = (crest >> 16) & 0xff, cg = (crest >> 8) & 0xff, cb = crest & 0xff;
+    int r = br + (cr - br) * num / den;
+    int g = bg + (cg - bg) * num / den;
+    int b = bb + (cb - bb) * num / den;
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+}
+
+static void WmDrawWaterline(uint32_t* buf, uint32_t stride,
+                            uint32_t screenW, uint32_t screenH,
+                            int x, int yBase, int width, bool focused,
+                            bool animate, uint32_t phase)
+{
+    if (width <= 0) return;
+    const uint32_t core = focused ? WM_WATER_CORE_FOCUSED : WM_WATER_CORE_UNFOCUS;
+    const uint32_t glow = focused ? WM_WATER_GLOW_FOCUSED : WM_WATER_GLOW_UNFOCUS;
+    const int h = (int)WM_WATER_HEIGHT;          // 3: glow / core / glow
+    // Base band: glow, bright core, glow.
+    WmFillRect(buf, stride, screenW, screenH, x, yBase,     width, 1, glow);
+    WmFillRect(buf, stride, screenW, screenH, x, yBase + 1, width, 1, core);
+    if (h > 2)
+        WmFillRect(buf, stride, screenW, screenH, x, yBase + 2, width, 1, glow);
+
+    // Flowing crests (focused + animated only): a few bright pulses drift along
+    // the core row, each with a triangular brightness falloff over CREST_HALF px.
+    if (!focused || !animate) return;
+    static constexpr int CREST_HALF = 26;        // half-width of each light pulse
+    const int crestCenters[3] = {
+        (int)(phase % (uint32_t)width),
+        (int)((phase + (uint32_t)width / 3) % (uint32_t)width),
+        (int)((phase + 2u * (uint32_t)width / 3) % (uint32_t)width),
+    };
+    for (int c = 0; c < 3; ++c)
+    {
+        int cc = crestCenters[c];
+        for (int d = -CREST_HALF; d <= CREST_HALF; ++d)
+        {
+            int px = cc + d;
+            if (px < 0 || px >= width) continue;
+            int dist = d < 0 ? -d : d;
+            int intensity = CREST_HALF - dist;   // 0..CREST_HALF
+            // Brighten the core row, and faintly the glow rows, toward the crest.
+            uint32_t lit = WmWaterBlend(core, WM_WATER_CREST, intensity, CREST_HALF);
+            WmPutPixel(buf, stride, screenW, screenH, x + px, yBase + 1, lit);
+            uint32_t litG = WmWaterBlend(glow, WM_WATER_CREST, intensity, CREST_HALF * 2);
+            WmPutPixel(buf, stride, screenW, screenH, x + px, yBase, litG);
+            if (h > 2) WmPutPixel(buf, stride, screenW, screenH, x + px, yBase + 2, litG);
+        }
+    }
+}
+
 static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
                                 uint32_t screenW, uint32_t screenH,
                                 const Window& w,
@@ -922,10 +994,13 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     WmFillRect(buf, stride, screenW, screenH, titleX, titleY, titleW, 1,
                w.focused ? WM_TITLE_SHEEN_FOCUSED : WM_TITLE_SHEEN_UNFOCUSED);
 
-    // 1px separator line between title bar and client area
-    int sepY = titleY + titleH - 1;
-    uint32_t sepCol = w.focused ? 0x001A3A5A : 0x00303030;
-    WmFillRect(buf, stride, screenW, screenH, titleX, sepY, titleW, 1, sepCol);
+    // Signature waterline at the base of the titlebar (replaces the old 1px
+    // separator). Bright aqua + flowing crests on the focused window, dim+still
+    // otherwise. Sits flush with the bottom of the titlebar so the title text
+    // floats above the "water" and the client content sits below it.
+    int waterY = titleY + titleH - (int)WM_WATER_HEIGHT;
+    WmDrawWaterline(buf, stride, screenW, screenH, titleX, waterY, titleW,
+                    w.focused, /*animate=*/g_waterlineFlow, g_waterPhase);
 
     // Title text — clipped to avoid overlapping chrome buttons
     int textY = titleY + (titleH - g_fontAtlas.lineHeight) / 2;

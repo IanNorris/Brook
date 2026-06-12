@@ -29,27 +29,27 @@ static constexpr uint32_t WM_BTN_ICON_PAD_BOT  = 6;   // minimize icon bottom of
 // (WM_CHROME_TITLE_ALPHA) for a hint of transparency; borders stay solid.
 // Caption buttons are rounded-rect glass cells with a faux-engraved bevel
 // (dark top/left inner edge + light bottom/right edge) and engraved glyphs.
-static constexpr uint32_t WM_TITLE_TOP_FOCUSED   = 0x007FB8EE; // glass top (bright sky)
-static constexpr uint32_t WM_TITLE_BOT_FOCUSED   = 0x001E4684; // glass bottom (deep navy)
-static constexpr uint32_t WM_TITLE_TOP_UNFOCUSED = 0x00565B68; // slate top
-static constexpr uint32_t WM_TITLE_BOT_UNFOCUSED = 0x002B2E36; // slate bottom
-static constexpr uint32_t WM_TITLE_BG_FOCUSED   = 0x00457BB9; // mid tone (text AA bg)
-static constexpr uint32_t WM_TITLE_BG_UNFOCUSED = 0x00424650; // mid tone (text AA bg)
+static constexpr uint32_t WM_TITLE_TOP_FOCUSED   = 0x00243441; // smoked glass top (steel)
+static constexpr uint32_t WM_TITLE_BOT_FOCUSED   = 0x00131C26; // smoked glass bottom (near-black blue)
+static constexpr uint32_t WM_TITLE_TOP_UNFOCUSED = 0x002A2E36; // slate top (dimmer)
+static constexpr uint32_t WM_TITLE_BOT_UNFOCUSED = 0x00181B20; // slate bottom
+static constexpr uint32_t WM_TITLE_BG_FOCUSED   = 0x001C2A35; // mid tone (text AA bg)
+static constexpr uint32_t WM_TITLE_BG_UNFOCUSED = 0x0023262D; // mid tone (text AA bg)
 static constexpr uint32_t WM_TITLE_FG           = 0x00F2F6FF; // crisp near-white text
-static constexpr uint32_t WM_BORDER_FOCUSED     = 0x005E9CDC; // light blue edge
-static constexpr uint32_t WM_BORDER_UNFOCUSED   = 0x00565A66; // slate edge
-static constexpr uint32_t WM_TITLE_SHEEN_FOCUSED   = 0x00AFD6F5; // 1px top glass sheen
-static constexpr uint32_t WM_TITLE_SHEEN_UNFOCUSED = 0x00707682; // 1px top highlight
+static constexpr uint32_t WM_BORDER_FOCUSED     = 0x00355A5E; // teal-tinted edge
+static constexpr uint32_t WM_BORDER_UNFOCUSED   = 0x0033373F; // slate edge
+static constexpr uint32_t WM_TITLE_SHEEN_FOCUSED   = 0x003C5560; // 1px top glass sheen
+static constexpr uint32_t WM_TITLE_SHEEN_UNFOCUSED = 0x003A3F48; // 1px top highlight
 static constexpr uint8_t  WM_CHROME_TITLE_ALPHA = 0xD8;       // ~85% opaque titlebar (glass)
 static constexpr int      WM_BTN_SLANT          = 6;         // ~15deg shear on the button's vertical sides
 static constexpr int      WM_BTN_RIGHT_PAD      = 4;         // extra gap between the close button and the right border
 // Caption button glass fill (vertical gradient) + faux-engraved bevel edges.
-static constexpr uint32_t WM_BTN_TOP            = 0x004E84C0; // button glass top
-static constexpr uint32_t WM_BTN_BOT            = 0x002B568E; // button glass bottom
-static constexpr uint32_t WM_BTN_BEVEL_DARK     = 0x00152F52; // engraved inner shadow (top/left)
-static constexpr uint32_t WM_BTN_BEVEL_LIGHT    = 0x008FC4F0; // engraved highlight (bottom/right)
-static constexpr uint32_t WM_BTN_HOVER_TOP      = 0x0072A8E0; // hover glass top
-static constexpr uint32_t WM_BTN_HOVER_BOT      = 0x003E6FB0; // hover glass bottom
+static constexpr uint32_t WM_BTN_TOP            = 0x00243E42; // button glass top (teal-steel)
+static constexpr uint32_t WM_BTN_BOT            = 0x00162A2E; // button glass bottom
+static constexpr uint32_t WM_BTN_BEVEL_DARK     = 0x000E1C20; // engraved inner shadow (top/left)
+static constexpr uint32_t WM_BTN_BEVEL_LIGHT    = 0x003E7E78; // engraved highlight (bottom/right)
+static constexpr uint32_t WM_BTN_HOVER_TOP      = 0x00366E68; // hover glass top (aqua-lit)
+static constexpr uint32_t WM_BTN_HOVER_BOT      = 0x00224A46; // hover glass bottom
 // Dimmed (slate) glass for caption buttons on UNFOCUSED windows, so the buttons
 // match the slate titlebar instead of staying bright blue. Hover still brightens.
 static constexpr uint32_t WM_BTN_TOP_UNFOCUSED  = 0x004A4F5B; // dim glass top
@@ -65,6 +65,20 @@ static constexpr uint32_t WM_TASKBAR_BTN_BG     = 0x002D2D3D; // slightly lighte
 static constexpr uint32_t WM_TASKBAR_BTN_ACTIVE = 0x003B5998; // active/focused button
 static constexpr uint32_t WM_TASKBAR_BTN_FG     = 0x00D0D0D0; // button text
 static constexpr uint32_t WM_TASKBAR_CLOCK_FG   = 0x0090D0FF; // clock text (light blue)
+
+// --- Waterline chrome (signature look) -------------------------------------
+// Brook's identity: smoked-glass titlebar with a single luminous aqua "waterline"
+// at its base. The focused window's waterline is bright (and, on the GPU path,
+// has light flowing along it); unfocused windows keep a dim, still line. This is
+// functional, not decorative: the moving/bright water marks where keystrokes go,
+// readable at a glance from across the screen. Colours are 0x00RRGGBB; the
+// titlebar's alpha is applied separately by SetChromeDecorAlpha.
+static constexpr uint32_t WM_WATER_CORE_FOCUSED = 0x002FD8C8; // bright aqua core
+static constexpr uint32_t WM_WATER_GLOW_FOCUSED = 0x001C8C84; // softer aqua halo rows
+static constexpr uint32_t WM_WATER_CORE_UNFOCUS = 0x00356E6A; // dim still line core
+static constexpr uint32_t WM_WATER_GLOW_UNFOCUS = 0x00243F3D; // dim halo
+static constexpr uint32_t WM_WATER_CREST        = 0x00CFF8F2; // flow crest (near-white aqua)
+static constexpr uint32_t WM_WATER_HEIGHT       = 3;          // waterline thickness (px)
 
 // Taskbar layout constants
 static constexpr uint32_t WM_TASKBAR_BTN_WIDTH  = 140; // max taskbar button width
@@ -264,6 +278,13 @@ void WmRenderChrome(uint32_t* backBuffer, uint32_t stride,
 void WmRenderChromeForWindow(uint32_t* backBuffer, uint32_t stride,
                               uint32_t screenW, uint32_t screenH, int idx,
                               int32_t mouseX, int32_t mouseY);
+
+// Waterline flow control: the static smoked-glass + aqua waterline look is
+// always drawn; these toggle/drive the animated "flowing light" on the focused
+// window's waterline (opt-in so an idle desktop stays idle).
+void     WmSetWaterlineFlow(bool on);
+bool     WmWaterlineFlowEnabled();
+uint32_t WmAdvanceWaterline(uint32_t dpx);
 
 // Check if window manager mode is active.
 bool WmIsActive();
