@@ -61,6 +61,8 @@ static constexpr uint8_t VIRTIO_PCI_CAP_COMMON_CFG = 1;
 static constexpr uint8_t VIRTIO_PCI_CAP_NOTIFY_CFG = 2;
 static constexpr uint8_t VIRTIO_PCI_CAP_ISR_CFG    = 3;
 static constexpr uint8_t VIRTIO_PCI_CAP_DEVICE_CFG = 4;
+static constexpr uint8_t VIRTIO_PCI_CAP_SHARED_MEMORY_CFG = 8; // host-visible BAR (blob)
+static constexpr uint8_t VIRTIO_GPU_SHM_ID_HOST_VISIBLE   = 1; // shmid of the host-visible region (QEMU)
 
 // Common config layout offsets (virtio 1.0 §4.1.4.3)
 enum VirtioCommonReg : uint32_t {
@@ -529,6 +531,13 @@ struct VirtioPciCap {
     uint8_t  bar;
 };
 
+// Host-visible shared-memory region (blob memory BAR), discovered in
+// FindVirtioCaps. g_hostVisBar==0xFF means none was found (device has no
+// host-visible blob support / hostmem not configured).
+static uint8_t  g_hostVisBar    = 0xFF;
+static uint64_t g_hostVisOffset = 0;
+static uint64_t g_hostVisLength = 0;
+
 static bool FindVirtioCaps(const PciDevice& dev, VirtioPciCap caps[5])
 {
     uint8_t capPtr = static_cast<uint8_t>(PciConfigRead8(dev.bus, dev.dev, dev.fn, 0x34));
@@ -552,6 +561,25 @@ static bool FindVirtioCaps(const PciDevice& dev, VirtioPciCap caps[5])
                              cfgType, bar, offset, length);
                 if (cfgType == VIRTIO_PCI_CAP_NOTIFY_CFG)
                     g_notifyMultiplier = PciConfigRead32(dev.bus, dev.dev, dev.fn, capPtr + 16);
+            }
+            else if (cfgType == VIRTIO_PCI_CAP_SHARED_MEMORY_CFG)
+            {
+                // 64-bit shared-memory region (blob host-visible BAR). The cap
+                // carries a shmid at +5 and 64-bit offset/length (lo at +8/+12,
+                // hi at +16/+20). shmid 0 is the host-visible region.
+                uint8_t shmId   = PciConfigRead8(dev.bus, dev.dev, dev.fn, capPtr + 5);
+                uint32_t offHi  = PciConfigRead32(dev.bus, dev.dev, dev.fn, capPtr + 16);
+                uint32_t lenHi  = PciConfigRead32(dev.bus, dev.dev, dev.fn, capPtr + 20);
+                uint64_t off64  = (static_cast<uint64_t>(offHi) << 32) | offset;
+                uint64_t len64  = (static_cast<uint64_t>(lenHi) << 32) | length;
+                SerialPrintf("virtio_gpu: SHM cap shmid=%u bar %u off=0x%lx len=0x%lx\n",
+                             shmId, bar, off64, len64);
+                if (shmId == VIRTIO_GPU_SHM_ID_HOST_VISIBLE)
+                {
+                    g_hostVisBar    = bar;
+                    g_hostVisOffset = off64;
+                    g_hostVisLength = len64;
+                }
             }
         }
         capPtr = PciConfigRead8(dev.bus, dev.dev, dev.fn, capPtr + 1);
@@ -3089,6 +3117,12 @@ static int VirtioGpuModuleInit()
         SerialPuts("virtio_gpu: missing virtio PCI caps\n");
         return -1;
     }
+    if (g_hostVisBar != 0xFF)
+        SerialPrintf("virtio_gpu: host-visible blob region: bar %u off 0x%lx len 0x%lx (%lu MB)\n",
+                     g_hostVisBar, g_hostVisOffset, g_hostVisLength,
+                     g_hostVisLength >> 20);
+    else
+        SerialPuts("virtio_gpu: no host-visible blob region (hostmem not configured)\n");
 
     g_commonCfg = MapBar(dev, caps[VIRTIO_PCI_CAP_COMMON_CFG].bar,
                          caps[VIRTIO_PCI_CAP_COMMON_CFG].offset,

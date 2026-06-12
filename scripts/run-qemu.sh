@@ -470,6 +470,14 @@ if [ -n "${BROOK_GPU:-}" ] && [ "${BROOK_GPU}" != "0" ]; then
             # ,memory-backend=mem1 suffix is appended to the -machine q35 line.
             MEM_BACKEND_OPTS="-object memory-backend-memfd,id=mem1,size=8G,share=on"
             MACHINE_MEMBACKEND=",memory-backend=mem1"
+        elif [ "${BROOK_GPU_HOSTVIS:-0}" = "1" ]; then
+            # BRO-188 / option B: virgl + host-visible blob memory. Adds the
+            # shared-memory BAR (hostmem) + shareable memfd machine RAM so Mesa
+            # can create coherent, CPU-mappable blob staging buffers (no async
+            # transfer race on readback).
+            GPU_OPTS="-vga none -device virtio-vga-gl,id=vgpu,blob=true,hostmem=${BROOK_GPU_HOSTMEM:-4G}"
+            MEM_BACKEND_OPTS="-object memory-backend-memfd,id=mem1,size=8G,share=on"
+            MACHINE_MEMBACKEND=",memory-backend=mem1"
         else
             GPU_OPTS="-vga none -device virtio-vga-gl,id=vgpu,blob=true"
         fi
