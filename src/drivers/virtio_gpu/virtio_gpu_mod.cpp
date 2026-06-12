@@ -400,7 +400,8 @@ static constexpr uint32_t CTX_ID_SELFTEST = 1;
 static constexpr uint32_t RES_3D_SELFTEST = 2;   // src (cleared green)
 static constexpr uint32_t RES_3D_BLITDST  = 3;   // blit target (blue + green square)
 static constexpr uint32_t RES_3D_SCANOUT  = 4;   // scanout-RT present-path gate test
-static constexpr uint32_t RES_3D_COPYBUF  = 5;   // COPY_TRANSFER3D readback dst (Mesa glReadPixels path)
+static constexpr uint32_t RES_3D_COPYBUF  = 8;   // COPY_TRANSFER3D readback dst (Mesa glReadPixels path)
+                                                 // id 8: ids 5-7 are COMP_BLUR_*, so this must not be 5 (BRO-190)
 static constexpr uint32_t SURF_SRC        = 1;   // surface handle for src clear
 static constexpr uint32_t SURF_DST        = 2;   // surface handle for dst clear
 static constexpr uint32_t SURF_SCANOUT    = 3;   // surface handle for scanout clear
