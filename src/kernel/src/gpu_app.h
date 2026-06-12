@@ -56,6 +56,16 @@ struct GpuAppOps {
     int32_t (*Transfer3D)(int32_t ctxId, int32_t resId, int dir,
                           uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                           uint32_t texW, uint32_t texH);
+
+    // Fetch a host 3D capability set (virgl_caps blob) via the virtio-gpu
+    // GET_CAPSET command. `capsetId` is a VIRTIO_GPU_CAPSET_* value (1=VIRGL,
+    // 2=VIRGL2), `version` the requested capset version. Copies up to `maxBytes`
+    // of the blob into `out` (kernel-writable). Returns the number of bytes
+    // written (>0) or <0 on failure. Needed so unmodified Mesa's DRM GET_CAPS
+    // ioctl can obtain a real capset and bind the hardware virgl screen instead
+    // of falling back to software (llvmpipe).
+    int32_t (*GetCapset)(uint32_t capsetId, uint32_t version,
+                         void* out, uint32_t maxBytes);
 };
 
 // Register the app-GPU ops (called by the display driver once its 3D path is

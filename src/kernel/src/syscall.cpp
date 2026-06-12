@@ -6095,12 +6095,19 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
             return -EFAULT;
         DrmVirtgpuGetCaps gc = *reinterpret_cast<DrmVirtgpuGetCaps*>(arg);
         if (gc.size == 0 || gc.size > 64u * 1024) return -EINVAL;
-        // M0 stub: zero-fill the capset buffer (a real virgl capset blob is
-        // supplied in M1/M2). Mesa tolerates an all-zero v1 caps header for
-        // initial probing; full caps land with resource/submit support.
         if (!UserBufferWritable(gc.addr, gc.size)) return -EFAULT;
+        // Fetch the REAL virgl capset blob from the host so Mesa binds the
+        // hardware virgl screen (instead of falling back to llvmpipe). The
+        // driver issues VIRTIO_GPU_CMD_GET_CAPSET(id, version) and copies the
+        // blob into the user buffer. Zero the tail so any bytes the host didn't
+        // supply read as 0 (Mesa reads a fixed-size union virgl_caps).
+        const brook::GpuAppOps* ga = brook::GpuAppGet();
+        if (!ga || !ga->GetCapset) return -ENODEV;
         for (uint32_t i = 0; i < gc.size; ++i)
             reinterpret_cast<char*>(gc.addr)[i] = 0;
+        int32_t n = ga->GetCapset(gc.cap_set_id, gc.cap_set_ver,
+                                  reinterpret_cast<void*>(gc.addr), gc.size);
+        if (n < 0) return -EINVAL;
         return 0;
     }
     // --- M1: resource / submit path (per-fd GEM table -> host virgl ids) ---

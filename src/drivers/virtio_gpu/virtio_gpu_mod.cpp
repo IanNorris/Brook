@@ -100,10 +100,12 @@ static constexpr uint32_t VIRTIO_GPU_CMD_SET_SCANOUT           = 0x0103;
 static constexpr uint32_t VIRTIO_GPU_CMD_RESOURCE_FLUSH        = 0x0104;
 static constexpr uint32_t VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D   = 0x0105;
 static constexpr uint32_t VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING = 0x0106;
-static constexpr uint32_t VIRTIO_GPU_CMD_GET_CAPSET_INFO      = 0x0107;
+static constexpr uint32_t VIRTIO_GPU_CMD_GET_CAPSET_INFO      = 0x0108;
+static constexpr uint32_t VIRTIO_GPU_CMD_GET_CAPSET           = 0x0109;
 static constexpr uint32_t VIRTIO_GPU_RESP_OK_NODATA           = 0x1100;
 static constexpr uint32_t VIRTIO_GPU_RESP_OK_DISPLAY_INFO     = 0x1101;
 static constexpr uint32_t VIRTIO_GPU_RESP_OK_CAPSET_INFO      = 0x1102;
+static constexpr uint32_t VIRTIO_GPU_RESP_OK_CAPSET           = 0x1103;
 static constexpr uint32_t VIRTIO_GPU_MAX_SCANOUTS            = 16;
 
 // virtio-gpu 3D feature bits (page 0 / low 32, virtio 1.2 §5.7.3). These gate
@@ -216,6 +218,14 @@ struct __attribute__((packed)) VirtioGpuRespCapsetInfo {
     uint32_t capset_max_version;
     uint32_t capset_max_size;
     uint32_t padding;
+};
+
+// GET_CAPSET: fetch a capset blob (virgl_caps) by id+version. The response is a
+// ctrl header followed by capset_data[] (the blob).
+struct __attribute__((packed)) VirtioGpuGetCapset {
+    VirtioGpuCtrlHdr hdr;
+    uint32_t capset_id;
+    uint32_t capset_version;
 };
 
 // 3D (virgl) command structs — Linux virtio_gpu uapi layout.
@@ -715,16 +725,12 @@ static bool QueryDisplayInfo()
 // this is skipped. Logs each capset and records whether Venus is available,
 // which the later DRM-shim / Venus bring-up (Phases B–C) depends on.
 //
-// KNOWN ISSUE (qemu 11.0 virtio-gpu-gl): GET_CAPSET_INFO currently comes back
-// as RESP_OK_NODATA (0x1100) rather than RESP_OK_CAPSET_INFO (0x1102), even
-// though the request carries the correct type (0x107) and num_capsets reads as
-// 2.  Per the QEMU source the virgl dispatch handles 0x107 and would respond
-// 0x1102, so the OK_NODATA fallthrough implies the command is being routed as a
-// context/ring op — the prime suspect is our VIRTIO_GPU_F_CONTEXT_INIT
-// negotiation (which makes ring_idx/flags significant) or an async-fence
-// used-ring interaction.  Resolving it needs QEMU virgl tracing (-d) rather
-// than static analysis; tracked as a follow-up.  num_capsets>0 already proves
-// the 3D transport is live, which is what Phase B/C gate on.
+// BRO-182 (FIXED): GET_CAPSET_INFO previously came back as RESP_OK_NODATA
+// because the command constant was off by one — 0x0107 is actually
+// RESOURCE_DETACH_BACKING (which the host answers with OK_NODATA), not
+// GET_CAPSET_INFO. Counting the virtio_gpu_ctrl_type enum from 0x0100,
+// GET_CAPSET_INFO is 0x0108 and GET_CAPSET is 0x0109 (0x0107 is the detach op).
+// Corrected above; capset enumeration and GET_CAPSET now return real data.
 // ---------------------------------------------------------------------------
 
 static const char* CapsetName(uint32_t id)
@@ -778,6 +784,41 @@ static void QueryCapsets()
 
     if (g_haveVenusCapset)
         SerialPuts("virtio_gpu: Venus capset present — Vulkan transport available\n");
+}
+
+// Fetch a capset blob (virgl_caps) from the host by id+version via the
+// VIRTIO_GPU_CMD_GET_CAPSET command. Copies up to maxBytes of the returned blob
+// into `out`. Returns bytes written (>0) or <0 on failure. Used by the DRM
+// render-node GET_CAPS ioctl so unmodified Mesa can bind the hardware virgl
+// screen (otherwise it falls back to software/llvmpipe).
+static int32_t GetCapsetBlob(uint32_t capsetId, uint32_t version,
+                             void* out, uint32_t maxBytes)
+{
+    if (!out || maxBytes == 0) return -1;
+    memset(g_cmdBuf, 0, 4096);
+    auto* req = reinterpret_cast<VirtioGpuGetCapset*>(g_cmdBuf + CMD_REQ_OFF);
+    req->hdr.type      = VIRTIO_GPU_CMD_GET_CAPSET;
+    req->capset_id     = capsetId;
+    req->capset_version = version;
+
+    uint32_t respLen = SubmitCommand(sizeof(VirtioGpuGetCapset), CMD_RESP_CAP);
+    auto* resp = reinterpret_cast<VirtioGpuRespCapsetInfo*>(g_cmdBuf + CMD_RESP_OFF);
+    if (respLen <= sizeof(VirtioGpuCtrlHdr) ||
+        reinterpret_cast<VirtioGpuCtrlHdr*>(resp)->type != VIRTIO_GPU_RESP_OK_CAPSET)
+    {
+        SerialPrintf("virtio_gpu: GET_CAPSET(id=%u ver=%u) failed (len=%u type=0x%x)\n",
+                     capsetId, version, respLen,
+                     reinterpret_cast<VirtioGpuCtrlHdr*>(resp)->type);
+        return -1;
+    }
+
+    uint32_t blobLen = respLen - static_cast<uint32_t>(sizeof(VirtioGpuCtrlHdr));
+    if (blobLen > maxBytes) blobLen = maxBytes;
+    const uint8_t* blob = g_cmdBuf + CMD_RESP_OFF + sizeof(VirtioGpuCtrlHdr);
+    memcpy(out, blob, blobLen);
+    SerialPrintf("virtio_gpu: GET_CAPSET(id=%u ver=%u) -> %u bytes\n",
+                 capsetId, version, blobLen);
+    return static_cast<int32_t>(blobLen);
 }
 
 // checks the device returned RESP_OK_NODATA.
@@ -2470,6 +2511,7 @@ static const brook::GpuAppOps g_gpuAppOps = {
     AppBufferUpload,
     AppSubmit3D,
     AppTransfer3D,
+    GetCapsetBlob,
 };
 
 static const brook::GpuCompositorOps g_gpuCompositorOps = {
