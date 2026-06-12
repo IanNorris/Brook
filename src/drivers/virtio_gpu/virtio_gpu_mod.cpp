@@ -2637,11 +2637,16 @@ static int32_t AppBufferUpload(int32_t ctxId, const void* src, uint32_t bytes)
     VirtualAddress va = VmmAllocPages(pages, VMM_WRITABLE, MemTag::Device, KernelPid);
     if (!va) return -1;
     memcpy(reinterpret_cast<void*>(va.raw()), src, bytes);
-    if (!ResourceCreateBuffer(gres, VIRGL_BIND_VERTEX_BUFFER, bytes) ||
-        !ResourceAttachBackingVirt(gres, va.raw(), bytes) ||
-        !CtxAttachResource((uint32_t)ctxId, gres) ||
-        !TransferToHostBuffer((uint32_t)ctxId, gres, bytes))
-    { VmmFreePages(va, pages); return -1; }
+    bool cr = ResourceCreateBuffer(gres, VIRGL_BIND_VERTEX_BUFFER, bytes);
+    bool ab = cr && ResourceAttachBackingVirt(gres, va.raw(), bytes);
+    bool ca = ab && CtxAttachResource((uint32_t)ctxId, gres);
+    bool tr = ca && TransferToHostBuffer((uint32_t)ctxId, gres, bytes);
+    if (!tr)
+    {
+        SerialPrintf("virtio_gpu: AppBufferUpload FAILED ctx=%d gres=%u bytes=%u create=%d attach=%d ctxattach=%d xfer=%d\n",
+                     ctxId, gres, bytes, cr, ab, ca, tr);
+        VmmFreePages(va, pages); return -1;
+    }
     g_appUploads[slot] = { true, ctxId, va.raw(), pages };
     return static_cast<int32_t>(gres);
 }
@@ -2660,7 +2665,11 @@ static int32_t AppSubmit3D(int32_t ctxId, const uint32_t* dwords, uint32_t n)
     uint32_t* dst = reinterpret_cast<uint32_t*>(g_cmdBuf + CMD_REQ_OFF + sizeof(VirtioGpuCmdSubmit));
     for (uint32_t i = 0; i < n; ++i) dst[i] = dwords[i];
     sub->size = n * 4;
-    return CmdRespOk(SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP)) ? 0 : -1;
+    bool ok = CmdRespOk(SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP));
+    if (!ok)
+        SerialPrintf("virtio_gpu: AppSubmit3D FAILED ctx=%d ndw=%u firstcmd=0x%x(cmd=%u len=%u)\n",
+                     ctxId, n, dwords[0], dwords[0] & 0xFF, dwords[0] >> 16);
+    return ok ? 0 : -1;
 }
 
 static int32_t AppTransfer3D(int32_t ctxId, int32_t gres, int dir,
@@ -2670,9 +2679,13 @@ static int32_t AppTransfer3D(int32_t ctxId, int32_t gres, int dir,
     GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
     AppCtx* c = AppCtxFind(ctxId);
     if (!c || !AppResValid(ctxId, (uint32_t)gres) || w == 0 || h == 0) return -1;
-    if (dir == 0)
-        return TransferToHost3D((uint32_t)ctxId, (uint32_t)gres, x, y, w, h, texW, texH) ? 0 : -1;
-    return TransferFromHost3D((uint32_t)ctxId, (uint32_t)gres, w, h) ? 0 : -1;
+    bool ok = (dir == 0)
+        ? TransferToHost3D((uint32_t)ctxId, (uint32_t)gres, x, y, w, h, texW, texH)
+        : TransferFromHost3D((uint32_t)ctxId, (uint32_t)gres, w, h);
+    if (!ok)
+        SerialPrintf("virtio_gpu: AppTransfer3D FAILED ctx=%d gres=%u dir=%d w=%u h=%u texW=%u texH=%u\n",
+                     ctxId, (uint32_t)gres, dir, w, h, texW, texH);
+    return ok ? 0 : -1;
 }
 
 static const brook::GpuAppOps g_gpuAppOps = {
