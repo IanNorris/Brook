@@ -2102,12 +2102,19 @@ static bool CompBlitExternalToTexture(GpuTexId t, uint32_t srcGres,
     // re-attaching the same id is cheap, but skip the common repeat case).
     if (g_compExternalAttached != srcGres)
     {
-        if (!CtxAttachResource(COMP_CTX_ID, srcGres)) return false;
+        if (!CtxAttachResource(COMP_CTX_ID, srcGres))
+        {
+            SerialPrintf("virtio_gpu: present attach FAILED gres=%u\n", srcGres);
+            return false;
+        }
         g_compExternalAttached = srcGres;
     }
     // BLIT src(full) -> dst(full). Nearest filter; scales if sizes differ.
-    return Submit3DBlit(COMP_CTX_ID, gt->resId, 0, 0, gt->w, gt->h,
-                        srcGres, 0, 0, srcW, srcH, /*alphaBlend=*/false);
+    bool blit = Submit3DBlit(COMP_CTX_ID, gt->resId, 0, 0, gt->w, gt->h,
+                             srcGres, 0, 0, srcW, srcH, /*alphaBlend=*/false);
+    if (!blit)
+        SerialPrintf("virtio_gpu: present blit FAILED gres=%u -> res=%u\n", srcGres, gt->resId);
+    return blit;
 }
 
 static void CompBeginFrame(uint32_t clearArgb)
