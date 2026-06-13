@@ -8074,44 +8074,13 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
         proc->fds[newfd].seekPos = fde->seekPos;
         proc->fds[newfd].statusFlags = fde->statusFlags;
 
-        // Bump pipe refcount
-        if (fde->type == FdType::Pipe && fde->handle)
-        {
-            auto* pipe = static_cast<PipeBuffer*>(fde->handle);
-            if (fde->flags & 1)
-                __atomic_fetch_add(&pipe->writers, 1, __ATOMIC_RELEASE);
-            else
-                __atomic_fetch_add(&pipe->readers, 1, __ATOMIC_RELEASE);
-        }
-
-        // Bump vnode refcount
-        if (fde->type == FdType::Vnode && fde->handle)
-            __atomic_fetch_add(&static_cast<Vnode*>(fde->handle)->refCount, 1, __ATOMIC_RELEASE);
-
-        // Bump socket refcount
-        if (fde->type == FdType::Socket && fde->handle)
-        {
-            int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
-            brook::SockRef(sockIdx);
-        }
-
-        // Bump memfd refcount
-        if (fde->type == FdType::MemFd && fde->handle)
-            MemFdRef(static_cast<MemFdData*>(fde->handle));
-
-        if (fde->type == FdType::EventFd && fde->handle)
-            EventFdRef(static_cast<EventFdData*>(fde->handle));
-        if (fde->type == FdType::EpollFd && fde->handle)
-            EpollFdRef(static_cast<EpollInstance*>(fde->handle));
-        if (fde->type == FdType::TimerFd && fde->handle)
-            TimerFdRef(static_cast<TimerFdData*>(fde->handle));
-
-        // Bump unix socket refcount
-        if (fde->type == FdType::UnixSocket && fde->handle)
-        {
-            auto* usd = static_cast<UnixSocketData*>(fde->handle);
-            __atomic_fetch_add(&usd->refCount, 1, __ATOMIC_RELEASE);
-        }
+        // Bump the underlying object's refcount for the new fd. Use the shared
+        // helper (same as sys_dup) rather than a hand-rolled per-type list, so
+        // every fd type — including DrmPrime — is covered. A previous hand-rolled
+        // list here omitted DrmPrime, so a libwayland F_DUPFD_CLOEXEC dup of a
+        // PRIME dmabuf fd didn't take a ref; the client closing the original then
+        // freed the shared resource out from under the dup (BRO-191).
+        FdBumpRefcount(&proc->fds[newfd]);
 
         return newfd;
     }
