@@ -1,0 +1,2 @@
+# Minimal makeWrapper bash-wrapper test (shell shebang-unwind fix)
+run /nix/store/ybxq5gdkk6qcvdcjn4r2i3xpyvbvkr3h-wraptest-0.1/bin/wraptest hello
