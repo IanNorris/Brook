@@ -29,6 +29,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -2399,30 +2400,115 @@ static void dmabuf_create_params(struct wl_client *c, struct wl_resource *r,
 static void dmabuf_destroy(struct wl_client *c, struct wl_resource *r)
 { (void)c; wl_resource_destroy(r); }
 
-static const struct zwp_linux_dmabuf_v1_interface dmabuf_impl = {
-    .destroy        = dmabuf_destroy,
-    .create_params  = dmabuf_create_params,
-};
-
-/* Common B8G8R8X8/A8 formats Mesa will use for a window surface. */
+/* Common B8G8R8X8/A8 formats Mesa uses for a window surface. */
 #define FMT_XRGB8888 0x34325258  /* 'XR24' */
 #define FMT_ARGB8888 0x34325241  /* 'AR24' */
+
+/* dev_t of the DRM render node, used as the dmabuf-feedback main_device.
+ * Resolved once at startup from g_drm_fd. */
+static uint64_t g_drm_dev = 0;
+
+/* Send a full dmabuf-feedback sequence (v4+). This is how Mesa's Wayland EGL
+ * platform learns *which render node* to use: without it (or wl_drm) Mesa can't
+ * find the GPU, falls back to Zink/swrast and crashes. We expose a single tranche
+ * for our render node advertising the LINEAR-modifier XR24/AR24 formats. */
+static void dmabuf_send_feedback(struct wl_resource *fb)
+{
+    /* Format table: 16-byte entries { u32 format, u32 pad, u64 modifier }. */
+    struct fmt_entry { uint32_t format; uint32_t pad; uint64_t modifier; };
+    static const struct fmt_entry table[] = {
+        { FMT_XRGB8888, 0, 0 /* LINEAR */ },
+        { FMT_ARGB8888, 0, 0 /* LINEAR */ },
+    };
+    const uint32_t n = sizeof(table) / sizeof(table[0]);
+
+    int tfd = syscall(SYS_memfd_create, "brook-dmabuf-fmt", 0u);
+    if (tfd >= 0) {
+        if (write(tfd, table, sizeof(table)) == (ssize_t)sizeof(table)) {
+            zwp_linux_dmabuf_feedback_v1_send_format_table(fb, tfd, sizeof(table));
+        }
+        /* The client dup()s the fd during the format_table event; ours can close. */
+    }
+
+    struct wl_array dev;
+    wl_array_init(&dev);
+    uint64_t *dp = wl_array_add(&dev, sizeof(uint64_t));
+    if (dp) *dp = g_drm_dev;
+    zwp_linux_dmabuf_feedback_v1_send_main_device(fb, &dev);
+
+    /* One tranche targeting the same device, all formats in the table. */
+    zwp_linux_dmabuf_feedback_v1_send_tranche_target_device(fb, &dev);
+    struct wl_array idx;
+    wl_array_init(&idx);
+    for (uint32_t i = 0; i < n; ++i) {
+        uint16_t *ip = wl_array_add(&idx, sizeof(uint16_t));
+        if (ip) *ip = (uint16_t)i;
+    }
+    zwp_linux_dmabuf_feedback_v1_send_tranche_formats(fb, &idx);
+    zwp_linux_dmabuf_feedback_v1_send_tranche_flags(fb, 0);
+    zwp_linux_dmabuf_feedback_v1_send_tranche_done(fb);
+    zwp_linux_dmabuf_feedback_v1_send_done(fb);
+
+    wl_array_release(&idx);
+    wl_array_release(&dev);
+    if (tfd >= 0) close(tfd);
+}
+
+static void feedback_destroy(struct wl_client *c, struct wl_resource *r)
+{ (void)c; wl_resource_destroy(r); }
+static const struct zwp_linux_dmabuf_feedback_v1_interface feedback_impl = {
+    .destroy = feedback_destroy,
+};
+
+static struct wl_resource *make_feedback(struct wl_client *c, struct wl_resource *r,
+                                         uint32_t id)
+{
+    struct wl_resource *fb = wl_resource_create(
+        c, &zwp_linux_dmabuf_feedback_v1_interface,
+        wl_resource_get_version(r), id);
+    if (!fb) { wl_client_post_no_memory(c); return NULL; }
+    wl_resource_set_implementation(fb, &feedback_impl, NULL, NULL);
+    dmabuf_send_feedback(fb);
+    return fb;
+}
+
+static void dmabuf_get_default_feedback(struct wl_client *c, struct wl_resource *r,
+                                        uint32_t id)
+{ make_feedback(c, r, id); }
+
+static void dmabuf_get_surface_feedback(struct wl_client *c, struct wl_resource *r,
+                                        uint32_t id, struct wl_resource *surface)
+{ (void)surface; make_feedback(c, r, id); }
+
+static const struct zwp_linux_dmabuf_v1_interface dmabuf_impl = {
+    .destroy               = dmabuf_destroy,
+    .create_params         = dmabuf_create_params,
+    .get_default_feedback  = dmabuf_get_default_feedback,
+    .get_surface_feedback  = dmabuf_get_surface_feedback,
+};
 
 static void dmabuf_bind(struct wl_client *client, void *data, uint32_t version,
                         uint32_t id)
 {
     (void)data;
+    /* Advertise up to v4 — v4 enables get_default_feedback, which is how Mesa's
+     * Wayland EGL platform discovers the render node (main_device). Without it
+     * Mesa can't find the GPU and falls back to Zink/swrast. */
+    uint32_t use = version < 4 ? version : 4;
     struct wl_resource *r = wl_resource_create(
-        client, &zwp_linux_dmabuf_v1_interface,
-        (int)(version < 3 ? version : 3), id);
+        client, &zwp_linux_dmabuf_v1_interface, (int)use, id);
     if (!r) { wl_client_post_no_memory(client); return; }
     wl_resource_set_implementation(r, &dmabuf_impl, NULL, NULL);
-    /* v1/v2 advertise formats (and v3 modifiers) at bind time. */
-    zwp_linux_dmabuf_v1_send_format(r, FMT_XRGB8888);
-    zwp_linux_dmabuf_v1_send_format(r, FMT_ARGB8888);
-    if (version >= 3) {
-        zwp_linux_dmabuf_v1_send_modifier(r, FMT_XRGB8888, 0, 0); /* LINEAR */
-        zwp_linux_dmabuf_v1_send_modifier(r, FMT_ARGB8888, 0, 0);
+    /* v1/v2 advertise formats (and v3 modifiers) at bind time. v4 clients use
+     * get_default_feedback instead and ignore these, but sending them is
+     * harmless and keeps older clients working. */
+    if (use < 4) {
+        zwp_linux_dmabuf_v1_send_format(r, FMT_XRGB8888);
+        zwp_linux_dmabuf_v1_send_format(r, FMT_ARGB8888);
+        if (use >= 3) {
+            zwp_linux_dmabuf_v1_send_modifier(r, FMT_XRGB8888, 0, 0);
+            zwp_linux_dmabuf_v1_send_modifier(r, FMT_ARGB8888, 0, 0);
+        }
     }
 }
 
@@ -2493,13 +2579,21 @@ int main(int argc, char **argv)
     if (!wl_global_create(g_display, &wp_viewporter_interface, 1, NULL, viewporter_bind)) return 1;
     if (!wl_global_create(g_display, &wl_subcompositor_interface, 1, NULL, subcomp_bind)) return 1;
     if (!wl_global_create(g_display, &wl_data_device_manager_interface, 3, NULL, ddm_bind)) return 1;
-    if (!wl_global_create(g_display, &zwp_linux_dmabuf_v1_interface, 3, NULL, dmabuf_bind)) return 1;
+    if (!wl_global_create(g_display, &zwp_linux_dmabuf_v1_interface, 4, NULL, dmabuf_bind)) return 1;
     /* Open the DRM render node once for PRIME dmabuf import (hardware GL windows).
      * Absence is non-fatal: we simply won't advertise working dmabuf import. */
     g_drm_fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
-    if (g_drm_fd < 0)
+    if (g_drm_fd < 0) {
         fprintf(stderr, "[waylandd] dmabuf: no DRM node (%s) — GL windows will be software\n",
                 strerror(errno));
+    } else {
+        /* main_device for dmabuf feedback = the render node's dev_t, so Mesa's
+         * Wayland EGL platform knows which GPU to open. */
+        struct stat st;
+        if (fstat(g_drm_fd, &st) == 0) g_drm_dev = (uint64_t)st.st_rdev;
+        fprintf(stderr, "[waylandd] dmabuf: DRM node fd=%d dev=0x%llx\n",
+                g_drm_fd, (unsigned long long)g_drm_dev);
+    }
     fprintf(stderr, "[waylandd] globals advertised\n");
 
     signal(SIGINT,  on_sigint);
