@@ -1,0 +1,6 @@
+# gltron — first windowed OpenGL *game* on Brook (sdl12-compat -> SDL2 ->
+# Wayland EGL -> hardware zwp_linux_dmabuf_v1 present path). Requires the GPU
+# compositor: boot with BROOK_GPU=gl BROOK_COMPOSITE=gpu (nested-weston GL).
+set wm
+run --once /nix/bin/waylandd
+run /nix/store/5gx25psx8wg7c4l9mz2akq9y2mynzy89-gltron-brook-0.70-brook/bin/gltron
