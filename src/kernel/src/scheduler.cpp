@@ -35,7 +35,6 @@ extern "C" void Ext2DumpLockState();
 
 // FatFS lock state diagnostic — implemented in fatfs_vfs.cpp
 extern "C" void FatFsDumpLockState();
-extern "C" uint32_t FatFsLockOwner();  // BRO-196 diag
 
 // Enter user mode for the first time (existing function in syscall.cpp).
 namespace brook { void SwitchToUserMode(uint64_t userRsp, uint64_t userRip); }

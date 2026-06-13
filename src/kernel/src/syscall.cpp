@@ -38,7 +38,6 @@
 extern "C" __attribute__((naked)) void ReturnToKernel();
 extern "C" bool MemFdHandleUserFault(uint64_t cr2, uint64_t errCode);
 extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode);
-extern "C" uint32_t FatFsLockOwner();  // BRO-196 diag (fatfs_vfs.cpp)
 
 // ---------------------------------------------------------------------------
 // UserBufferReadable — verify [addr, addr+len) is fully mapped in the
