@@ -39,6 +39,17 @@ struct DisplayOps {
     // display. No-op for direct-mapped linear FBs (GOP, bochs); transfer-based
     // devices (virtio-gpu) use the rect to bound the host transfer + flush.
     void (*Flush)(uint32_t minY, uint32_t maxY);
+
+    // Emergency full-screen present from the panic handler. Called once, after
+    // the panic screen has been rendered into the framebuffer backing, with all
+    // other CPUs halted (IF=0). Must be best-effort and self-contained: it may
+    // NOT take any lock that a now-halted CPU could be holding. Direct-mapped
+    // linear FBs (GOP, bochs) are scanned out as-is, so this is nullptr/no-op
+    // for them. virtio-gpu reverts the scanout to the 2D framebuffer resource
+    // (undoing GPU-composite's render-target binding) and transfers + flushes
+    // the whole framebuffer, since the normal compositor present path is halted.
+    // May be nullptr.
+    void (*PanicPresent)();
 };
 
 // Register a display driver. Replaces the current active display.
@@ -63,6 +74,10 @@ uint64_t DisplayGetFramebufferPhys();
 // Flush a dirty scanline span [minY, maxY) to the active display. No-op for
 // linear FBs; virtio-gpu uses it to transfer + flush the damaged region.
 void DisplayFlush(uint32_t minY, uint32_t maxY);
+
+// Emergency full-screen present from the panic handler (best-effort). No-op if
+// the active display has no PanicPresent op (direct-mapped linear FBs).
+void DisplayPanicPresent();
 
 // 3D-acceleration status. A display driver that has proven a live host 3D
 // (virgl/Venus) command path — e.g. the virtio-gpu driver's GPU-clear

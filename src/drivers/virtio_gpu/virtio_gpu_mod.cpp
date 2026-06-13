@@ -1078,6 +1078,33 @@ static volatile uint32_t* VgpuGetFramebuffer()
 { return reinterpret_cast<volatile uint32_t*>(g_fbBacking); }
 static uint64_t VgpuGetFramebufferPhys() { return g_fbBackingPhys; }
 
+// Emergency present from the panic handler. The panic screen has already been
+// rendered into g_fbBacking (RESOURCE_FB's backing, which the compositor's
+// g_physFb maps). Two things stop it from being visible otherwise:
+//   1. The normal present (TRANSFER_TO_HOST_2D + RESOURCE_FLUSH) is never run —
+//      the compositor is halted — so the backing is never pushed to the host.
+//   2. Under GPU composition the scanout was rebound to COMP_SCANOUT_RES (the
+//      3D render target), so even a flush of RESOURCE_FB wouldn't appear.
+// So we revert the scanout to RESOURCE_FB and transfer+flush the whole frame.
+//
+// Best-effort and lock-free BY DESIGN: all other CPUs are halted, and one of
+// them may hold g_gpuCmdLock mid-present, so we must NOT take it. SubmitCommand
+// uses a bounded spin (no infinite hang) and QEMU processes avail-ring
+// descriptors in order, so the scanout→transfer→flush sequence presents
+// correctly even if an in-flight command perturbs the used-ring bookkeeping.
+static void VgpuPanicPresent()
+{
+    if (!g_fbBacking || g_fbW == 0 || g_fbH == 0) return;
+
+    // Revert scanout to the 2D framebuffer the panic was drawn into. Idempotent
+    // if it was already RESOURCE_FB (non-composite path).
+    SetScanout(0, RESOURCE_FB, g_fbW, g_fbH);
+
+    // Push the whole framebuffer to the host and scan it out.
+    TransferToHost2D(RESOURCE_FB, 0, 0, g_fbW, g_fbH, 0);
+    ResourceFlush(RESOURCE_FB, 0, 0, g_fbW, g_fbH);
+}
+
 static const brook::DisplayOps g_vgpuDisplayOps = {
     "virtio-gpu",
     VgpuSetMode,
@@ -1085,6 +1112,7 @@ static const brook::DisplayOps g_vgpuDisplayOps = {
     VgpuGetFramebuffer,
     VgpuGetFramebufferPhys,
     VirtioGpuFlush,
+    VgpuPanicPresent,
 };
 
 // Take over the display: create a framebuffer resource backed by physically

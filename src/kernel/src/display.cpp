@@ -57,6 +57,7 @@ static const DisplayOps g_gopOps = {
     GopGetFramebuffer,
     GopGetFramebufferPhys,
     GopFlush,
+    nullptr,  // PanicPresent: GOP FB is directly scanned out — no-op
 };
 
 // ---------------------------------------------------------------------------
@@ -101,6 +102,12 @@ uint64_t DisplayGetFramebufferPhys()
 void DisplayFlush(uint32_t minY, uint32_t maxY)
 {
     g_activeDisplay->Flush(minY, maxY);
+}
+
+void DisplayPanicPresent()
+{
+    if (g_activeDisplay && g_activeDisplay->PanicPresent)
+        g_activeDisplay->PanicPresent();
 }
 
 // ---------------------------------------------------------------------------

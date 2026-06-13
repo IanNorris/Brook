@@ -6,6 +6,7 @@
 #include "panic_qr.h"
 #include "panic_screen.h"
 #include "compositor.h"
+#include "display.h"
 #include "smp.h"
 #include "build_info.h"
 #include "ksym_addrs.h"
@@ -552,6 +553,13 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
         psi.vector    = 0;
         psi.errorCode = 0;
         brook::PanicScreenRender(const_cast<uint32_t*>(physFb), fbW, fbH, fbStride, &psi);
+
+        // Push the rendered panic screen to the actual scanout. Required for
+        // transfer-based displays (virtio-gpu): the compositor present path is
+        // halted, so nothing else flushes the framebuffer backing — and under
+        // GPU composition the scanout must be reverted from the 3D render target
+        // back to the 2D framebuffer. No-op for direct-mapped linear FBs.
+        brook::DisplayPanicPresent();
     }
 
     // Spin forever (don't use hlt — it causes QEMU to exit when all CPUs halt)

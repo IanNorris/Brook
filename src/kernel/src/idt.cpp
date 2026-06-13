@@ -2,6 +2,7 @@
 #include "gdt.h"
 #include "serial.h"
 #include "panic.h"
+#include "display.h"
 #include "panic_screen.h"
 #include "panic_qr.h"
 #include "process.h"
@@ -1198,6 +1199,10 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                 psi.vector    = vector;
                 psi.errorCode = ef->errorCode;
                 brook::PanicScreenRender(const_cast<uint32_t*>(physFb), fbW, fbH, fbStride, &psi);
+
+                // Present the panic screen to the actual scanout (no-op for
+                // direct-mapped FBs; virtio-gpu reverts scanout + transfers/flushes).
+                brook::DisplayPanicPresent();
             }
         }
 
