@@ -49,6 +49,7 @@ enum class FdType : uint8_t
     UnixSocket,    // AF_UNIX domain socket
     DevKlog,       // /dev/klog — kernel log ring buffer reader
     DevDri,        // /dev/dri/renderD128 — virtio-gpu DRM render node (GL shim)
+    DrmPrime,      // DRM PRIME dmabuf handle — a capability wrapping a shared virgl resource (gres)
 };
 
 struct FdEntry

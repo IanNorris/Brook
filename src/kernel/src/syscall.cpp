@@ -2661,7 +2661,41 @@ struct DrmGemObj {
     uint32_t width, height;
     uint64_t backingKva;   // kernel vaddr of mappable backing (0 = not yet mapped)
     uint32_t backingBytes; // byte size of the backing allocation
+    bool     imported;     // PRIME-imported: gres is owned by another context, so
+                           // this GEM's teardown must NOT free the host resource.
 };
+
+// A DRM PRIME dmabuf handle, modelled as an unforgeable capability: it wraps a
+// host virgl resource id (gres) plus its geometry, and is held by an fd. A
+// client exports its render-target GEM to a PRIME fd (HANDLE_TO_FD), passes the
+// fd over the Wayland socket (SCM_RIGHTS), and the compositor imports it
+// (FD_TO_HANDLE) to obtain a GEM aliasing the SAME gres. Because access is gated
+// by possession of the fd — which only the exporter can hand out — a process
+// cannot reach another process's resource by guessing a gres id. refCount tracks
+// fd references (the export fd, each SCM_RIGHTS copy in flight, each importer
+// fd); the object is freed at zero. NOTE: it deliberately does NOT own the
+// underlying gres lifetime (that stays with the exporter's GpuApp context) —
+// host-side resource refcounting across exporter death is a later hardening step.
+struct DrmPrimeObj {
+    uint32_t gres;        // shared host virgl resource id (the capability target)
+    uint32_t size;        // byte size
+    uint32_t stride;      // row stride in bytes
+    uint32_t width, height;
+    uint32_t fourcc;      // DRM fourcc format (0 if unknown)
+    int32_t  ownerCtxId;  // exporting GpuApp ctx (for validation/logging)
+    uint32_t refCount;    // fd references; freed at 0
+};
+
+static inline void DrmPrimeRef(DrmPrimeObj* p)
+{
+    if (p) __atomic_fetch_add(&p->refCount, 1, __ATOMIC_RELEASE);
+}
+static inline void DrmPrimeUnref(DrmPrimeObj* p)
+{
+    if (!p) return;
+    if (__atomic_fetch_sub(&p->refCount, 1, __ATOMIC_ACQ_REL) <= 1)
+        kfree(p);
+}
 struct DrmCtx {
     int32_t   ctxId;   // GpuApp virgl context (0 = not yet created)
     DrmGemObj gem[DRM_MAX_GEM];   // index i -> bo_handle (i+1); 0 is invalid
@@ -2673,7 +2707,18 @@ static uint32_t DrmGemAlloc(DrmCtx* c, uint32_t gres, uint32_t size,
                             uint32_t stride, uint32_t w, uint32_t h) {
     for (uint32_t i = 0; i < DRM_MAX_GEM; ++i) {
         if (c->gem[i].used) continue;
-        c->gem[i] = { true, gres, size, stride, w, h, 0, 0 };
+        c->gem[i] = { true, gres, size, stride, w, h, 0, 0, false };
+        return i + 1;
+    }
+    return 0;
+}
+// Allocate a GEM handle aliasing an externally-owned (PRIME-imported) gres. The
+// resulting GEM is marked `imported` so teardown never frees the host resource.
+static uint32_t DrmGemAllocImported(DrmCtx* c, uint32_t gres, uint32_t size,
+                                    uint32_t stride, uint32_t w, uint32_t h) {
+    for (uint32_t i = 0; i < DRM_MAX_GEM; ++i) {
+        if (c->gem[i].used) continue;
+        c->gem[i] = { true, gres, size, stride, w, h, 0, 0, true };
         return i + 1;
     }
     return 0;
@@ -3169,6 +3214,9 @@ void FinalizeClosedFd(const FdClaimResult& c)
     if (c.type == FdType::EventFd && c.handle)
         EventFdUnref(static_cast<EventFdData*>(c.handle));
 
+    if (c.type == FdType::DrmPrime && c.handle)
+        DrmPrimeUnref(static_cast<DrmPrimeObj*>(c.handle));
+
     if (c.type == FdType::EpollFd && c.handle)
         EpollFdUnref(static_cast<EpollInstance*>(c.handle));
 
@@ -3401,6 +3449,9 @@ static void FdBumpRefcount(FdEntry* fde)
         break;
     case FdType::EventFd:
         EventFdRef(static_cast<EventFdData*>(fde->handle));
+        break;
+    case FdType::DrmPrime:
+        DrmPrimeRef(static_cast<DrmPrimeObj*>(fde->handle));
         break;
     case FdType::EpollFd:
         EpollFdRef(static_cast<EpollInstance*>(fde->handle));
@@ -5980,6 +6031,8 @@ namespace {
 constexpr uint8_t  DRM_IOCTL_TYPE        = 'd';   // 0x64
 constexpr uint8_t  DRM_NR_VERSION        = 0x00;  // DRM_IOCTL_VERSION
 constexpr uint8_t  DRM_NR_GEM_CLOSE      = 0x09;  // DRM_IOCTL_GEM_CLOSE
+constexpr uint8_t  DRM_NR_PRIME_HANDLE_TO_FD = 0x2d;  // DRM_IOCTL_PRIME_HANDLE_TO_FD
+constexpr uint8_t  DRM_NR_PRIME_FD_TO_HANDLE = 0x2e;  // DRM_IOCTL_PRIME_FD_TO_HANDLE
 constexpr uint8_t  DRM_NR_GET_CAP        = 0x0c;  // DRM_IOCTL_GET_CAP
 constexpr uint8_t  DRM_COMMAND_BASE      = 0x40;  // driver-private ioctl base
 constexpr uint8_t  DRM_NR_VIRTGPU_MAP            = DRM_COMMAND_BASE + 0x01; // 0x41
@@ -6014,6 +6067,19 @@ struct DrmVersion {
 };
 
 struct DrmGetCap   { uint64_t capability; uint64_t value; };
+
+// DRM_CAP_PRIME (capability id 0x5) bits: import/export support. Mesa queries
+// this during init to decide whether dmabuf sharing is available.
+constexpr uint64_t DRM_CAP_PRIME            = 0x5;
+constexpr uint64_t DRM_PRIME_CAP_IMPORT     = 0x1;
+constexpr uint64_t DRM_PRIME_CAP_EXPORT     = 0x2;
+
+// struct drm_prime_handle — the argument to PRIME_HANDLE_TO_FD / FD_TO_HANDLE.
+struct DrmPrimeHandle {
+    uint32_t handle;   // GEM bo_handle (in for export, out for import)
+    uint32_t flags;    // DRM_CLOEXEC | DRM_RDWR (export only)
+    int32_t  fd;       // dmabuf fd (out for export, in for import)
+};
 struct DrmVirtgpuGetparam { uint64_t param; uint64_t value; }; // value = user u64*
 struct DrmVirtgpuGetCaps {
     uint32_t cap_set_id; uint32_t cap_set_ver;
@@ -6138,7 +6204,12 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
             !UserBufferWritable(arg, sizeof(DrmGetCap)))
             return -EFAULT;
         DrmGetCap c = *reinterpret_cast<DrmGetCap*>(arg);
-        c.value = 0;   // no PRIME/dumb/etc. advertised in M0
+        // Advertise PRIME import+export so Mesa enables the dmabuf sharing path
+        // (windowed GL presentation). Everything else (dumb buffers, etc.) stays
+        // unadvertised — we only support the GPU-resource dmabuf path.
+        c.value = (c.capability == DRM_CAP_PRIME)
+                ? (DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT)
+                : 0;
         return CopyToUser(arg, &c, sizeof(c)) ? 0 : -EFAULT;
     }
     case DRM_NR_VIRTGPU_GETPARAM:
@@ -6330,6 +6401,54 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         // Submits are synchronous (the driver busy-polls the host), so by the
         // time a client waits, the work is already complete.
         return 0;
+    }
+    case DRM_NR_PRIME_HANDLE_TO_FD:
+    {
+        // Export a GEM (render target) as a PRIME dmabuf fd: a capability that
+        // wraps the GEM's host virgl resource (gres). The client passes this fd
+        // over the Wayland socket so the compositor can import + present it.
+        if (!UserBufferReadable(arg, sizeof(DrmPrimeHandle)) ||
+            !UserBufferWritable(arg, sizeof(DrmPrimeHandle)))
+            return -EFAULT;
+        DrmPrimeHandle ph = *reinterpret_cast<DrmPrimeHandle*>(arg);
+        DrmGemObj* g = DrmGemGet(dctx, ph.handle);
+        if (!g) return -ENOENT;
+        Process* proc = ProcessCurrent();
+        if (!proc) return -ESRCH;
+        auto* p = static_cast<DrmPrimeObj*>(kmalloc(sizeof(DrmPrimeObj)));
+        if (!p) return -ENOMEM;
+        p->gres       = g->gres;
+        p->size       = g->size;
+        p->stride     = g->stride;
+        p->width      = g->width;
+        p->height     = g->height;
+        p->fourcc     = 0;
+        p->ownerCtxId = dctx->ctxId;
+        p->refCount   = 1;   // held by the fd we are about to allocate
+        int fd = FdAlloc(proc, FdType::DrmPrime, p);
+        if (fd < 0) { kfree(p); return -EMFILE; }
+        ph.fd = fd;
+        return CopyToUser(arg, &ph, sizeof(ph)) ? 0 : -EFAULT;
+    }
+    case DRM_NR_PRIME_FD_TO_HANDLE:
+    {
+        // Import a PRIME dmabuf fd (received over the Wayland socket) into a GEM
+        // handle aliasing the SAME gres. Possession of the fd IS the
+        // authorization — a process cannot reach a gres it was never handed.
+        if (!UserBufferReadable(arg, sizeof(DrmPrimeHandle)) ||
+            !UserBufferWritable(arg, sizeof(DrmPrimeHandle)))
+            return -EFAULT;
+        DrmPrimeHandle ph = *reinterpret_cast<DrmPrimeHandle*>(arg);
+        Process* proc = ProcessCurrent();
+        if (!proc) return -ESRCH;
+        FdEntry* fde = FdGet(proc, ph.fd);
+        if (!fde || fde->type != FdType::DrmPrime || !fde->handle) return -EINVAL;
+        auto* p = static_cast<DrmPrimeObj*>(fde->handle);
+        uint32_t bo = DrmGemAllocImported(dctx, p->gres, p->size, p->stride,
+                                          p->width, p->height);
+        if (bo == 0) return -ENOMEM;
+        ph.handle = bo;
+        return CopyToUser(arg, &ph, sizeof(ph)) ? 0 : -EFAULT;
     }
     case DRM_NR_GEM_CLOSE:
     {
@@ -12805,6 +12924,12 @@ static bool UnixFdSnapFrom(const FdEntry* src, UnixFdSnap* out)
                 __atomic_fetch_add(&static_cast<UnixSocketData*>(src->handle)->refCount,
                                     1, __ATOMIC_RELEASE);
             break;
+        case FdType::DrmPrime:
+            // PRIME dmabuf fd: a client hands its render-target capability to the
+            // compositor over the Wayland socket. Bump the object ref so the
+            // sender closing its fd doesn't free it out from under the receiver.
+            if (src->handle) DrmPrimeRef(static_cast<DrmPrimeObj*>(src->handle));
+            break;
         default:
             // Other fd types (Pipe, EventFd, EpollFd, TimerFd, DevDsp, etc.)
             // don't have a portable snapshot refcount today.
@@ -12853,6 +12978,9 @@ static void UnixFdSnapRelease(const UnixFdSnap* snap)
             UnixSocketHandleUnref(snap->handle);
             break;
         }
+        case FdType::DrmPrime:
+            DrmPrimeUnref(static_cast<DrmPrimeObj*>(snap->handle));
+            break;
         default: break;
     }
 }
