@@ -5106,6 +5106,24 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
     // Resolve path: try as-is, then /boot/BIN/<UPPER>, then /boot/<UPPER>
     int shebangDepth = 0;
     static constexpr int MAX_SHEBANG_DEPTH = 4;
+
+    // argv/envp storage and counters. These are declared BEFORE the
+    // resolve_path label so that a shebang re-entry (goto resolve_path) does
+    // NOT re-run their initializers — the shebang handler rebuilds kArgv/argc
+    // in place ([interp, interpArg?, scriptPath, orig argv[1:]]) and that
+    // rebuild must survive the goto. Re-reading user argv on re-entry would
+    // discard the rebuild and feed the interpreter the original script's args
+    // (breaking nested shebang/makeWrapper wrappers).
+    static constexpr int MAX_EXEC_ARGS = 64;
+    static constexpr int MAX_EXEC_ENVP = 64;
+    static constexpr uint64_t MAX_STR_LEN = 4096;
+
+    const char* kArgv[MAX_EXEC_ARGS];
+    // Kernel-side string storage (simple: one big buffer)
+    static constexpr uint64_t ARG_BUF_SIZE = 16384;
+    char argBuf[ARG_BUF_SIZE];
+    uint32_t argBufPos = 0;
+    int argc = 0;
 resolve_path:
     char resolvedPath[256];
     bool found = false;
@@ -5246,19 +5264,9 @@ resolve_path:
     }
     newExePath[newExeLen] = '\0';
 
-    // --- Copy argv from user memory ---
-    static constexpr int MAX_EXEC_ARGS = 64;
-    static constexpr int MAX_EXEC_ENVP = 64;
-    static constexpr uint64_t MAX_STR_LEN = 4096;
-
-    const char* kArgv[MAX_EXEC_ARGS];
-    // Kernel-side string storage (simple: one big buffer)
-    static constexpr uint64_t ARG_BUF_SIZE = 16384;
-    char argBuf[ARG_BUF_SIZE];
-    uint32_t argBufPos = 0;
-    int argc = 0;
-
-    if (argvAddr)
+    // --- Copy argv from user memory (skip on shebang re-entry; the rebuilt
+    // kArgv/argc from the shebang handler must be preserved) ---
+    if (shebangDepth == 0 && argvAddr)
     {
         // Validate argv array is readable (at least one pointer for NULL sentinel)
         if (!UserBufferReadable(argvAddr, sizeof(char*)))
@@ -5466,11 +5474,27 @@ resolve_path:
         while (lookupPath[spi] && spi < 255) { scriptPath[spi] = lookupPath[spi]; spi++; }
         scriptPath[spi] = '\0';
 
-        // Shift existing argv[1:] to make room at the front
+        // Shift existing argv[1:] to make room at the front. The old args are
+        // pointers INTO argBuf, which we rewrite from offset 0 below — so we
+        // must value-copy them into a separate buffer first, or re-pushing them
+        // would read clobbered data (the bug that made shebang scripts lose
+        // their arguments, e.g. `bash .real hello` collapsing to `bash hello`
+        // and breaking makeWrapper nix wrappers).
+        static char oldArgBuf[ARG_BUF_SIZE];
         const char* oldArgv[MAX_EXEC_ARGS];
         int oldArgc = 0;
+        uint32_t oldArgBufPos = 0;
         for (int i = 1; i < argc && oldArgc < MAX_EXEC_ARGS - 4; i++)
-            oldArgv[oldArgc++] = kArgv[i];
+        {
+            const char* s = kArgv[i];
+            uint32_t len = 0;
+            while (s[len]) len++;
+            if (oldArgBufPos + len + 1 > ARG_BUF_SIZE) break;
+            for (uint32_t j = 0; j < len; j++) oldArgBuf[oldArgBufPos + j] = s[j];
+            oldArgBuf[oldArgBufPos + len] = '\0';
+            oldArgv[oldArgc++] = &oldArgBuf[oldArgBufPos];
+            oldArgBufPos += len + 1;
+        }
 
         // Rebuild argBuf and kArgv from scratch
         argBufPos = 0;

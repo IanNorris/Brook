@@ -1039,6 +1039,7 @@ static int ExecCommand(int argc, const char* const* argv)
         static char shebangPath[128];
         static char interpStore[4][128];
         static char interpArgStore[4][128];
+        static char scriptStore[4][128];
         StrCopy(shebangPath, resolved, sizeof(shebangPath));
 
         for (int depth = 0; depth < 4; ++depth)
@@ -1059,12 +1060,21 @@ static int ExecCommand(int argc, const char* const* argv)
             StrCopy(interpArgStore[depth], interpArg,
                     sizeof(interpArgStore[depth]));
 
+            // Preserve the script path in a STABLE per-depth buffer before we
+            // overwrite shebangPath with the interpreter below. nArgv stores a
+            // pointer to this buffer as the script argument; without this copy
+            // it would alias shebangPath and get clobbered, so the interpreter
+            // would receive its own path as the script (e.g. `bash -e bash`),
+            // producing "cannot execute binary file". This is what broke
+            // makeWrapper-style nix wrappers (es2gears, supertuxkart, …).
+            StrCopy(scriptStore[depth], shebangPath, sizeof(scriptStore[depth]));
+
             const char* nArgv[32];
             int nArgc = 0;
             nArgv[nArgc++] = interpStore[depth];
             if (interpArgStore[depth][0] && nArgc < 31)
                 nArgv[nArgc++] = interpArgStore[depth];
-            if (nArgc < 31) nArgv[nArgc++] = shebangPath;
+            if (nArgc < 31) nArgv[nArgc++] = scriptStore[depth];
             for (int i = 1; i < effArgc && nArgc < 31; ++i)
                 nArgv[nArgc++] = effArgv[i];
 
