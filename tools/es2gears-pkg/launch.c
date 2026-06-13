@@ -28,6 +28,10 @@ int main(int argc, char **argv)
     setenv("__EGL_VENDOR_LIBRARY_DIRS", MESA_EGL_VENDOR_DIR, 1);
     /* Force the virgl DRI driver (host nvidia ICD would break otherwise). */
     setenv("MESA_LOADER_DRIVER_OVERRIDE", "virtio_gpu", 1);
+    /* Diagnostics (BRO-191 bring-up): trace Wayland protocol + EGL so a stall in
+     * the first eglSwapBuffers/commit is visible on serial. Harmless to leave. */
+    setenv("WAYLAND_DEBUG", "1", 1);
+    setenv("EGL_LOG_LEVEL", "debug", 1);
 
     char *args[16];
     int n = 0;

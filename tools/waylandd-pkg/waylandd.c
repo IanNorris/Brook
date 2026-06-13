@@ -1994,8 +1994,14 @@ static void deco_mgr_get_toplevel_decoration(struct wl_client *c,
     if (s) s->deco_negotiated = 1;
     fprintf(stderr, "[waylandd] decoration get_toplevel_decoration surface=%p\n",
             (void*)s);
-    /* Default to CSD: the client opted in by binding the manager. */
-    deco_apply_mode(d, 1);
+    /* Default to SERVER_SIDE: Brook's kernel WM draws all chrome. A client that
+     * binds the decoration manager is asking us to negotiate, so our preference
+     * (server-side) is the right default. Defaulting to CSD here broke
+     * libdecor-based clients (e.g. es2gears/GL demos): libdecor would try to
+     * draw client-side decorations via a plugin it can't load on Brook and hang
+     * before ever committing a frame. Clients that genuinely want CSD still get
+     * it by explicitly calling set_mode(CLIENT_SIDE). */
+    deco_apply_mode(d, 0);
 }
 static const struct zxdg_decoration_manager_v1_interface deco_mgr_impl = {
     .destroy                = deco_mgr_destroy,
@@ -2387,12 +2393,15 @@ static void params_resource_destroy(struct wl_resource *r)
 static void dmabuf_create_params(struct wl_client *c, struct wl_resource *r,
                                  uint32_t id)
 {
-    (void)r;
     struct brook_dmabuf_params *p = calloc(1, sizeof(*p));
     if (!p) { wl_client_post_no_memory(c); return; }
     p->fd = -1;
+    /* The params object must inherit the dmabuf object's version, or methods
+     * added in later versions (create_immed, since v2) are rejected as
+     * "invalid method". */
     struct wl_resource *pr = wl_resource_create(
-        c, &zwp_linux_buffer_params_v1_interface, 1, id);
+        c, &zwp_linux_buffer_params_v1_interface,
+        wl_resource_get_version(r), id);
     if (!pr) { free(p); wl_client_post_no_memory(c); return; }
     wl_resource_set_implementation(pr, &params_impl, p, params_resource_destroy);
 }
