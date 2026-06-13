@@ -3,4 +3,4 @@
 # host blit). The smallest end-to-end check of hardware windowed GL.
 set wm
 run --once /nix/bin/waylandd
-run /nix/store/y5hp0p9zaqs7syx2ihlgz8swrr0f88ir-es2gears-brook-0.1-brook/bin/es2gears
+run /nix/store/10m0bjfv7a35sk11a1l0vb8qxndffbwh-es2gears-brook-0.1-brook/bin/es2gears
