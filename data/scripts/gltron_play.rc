@@ -1,0 +1,8 @@
+# Launch the freshly nix-installed gltron (/nix/profile/bin/gltron) and play.
+# The upstream nixpkgs gltron ELF is launched via /nix/gltron-play.sh, a bash
+# wrapper that injects Brook's virgl GL env (Mesa virtio_gpu DRI override, glvnd
+# EGL vendor dir, dummy SDL audio, writable HOME) then execs it with -s.
+# Requires the GPU compositor: boot with BROOK_GPU=gl BROOK_COMPOSITE=gpu.
+set wm
+run --once /nix/bin/waylandd
+run /nix/gltron-play.sh
