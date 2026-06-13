@@ -166,16 +166,32 @@ void KRwLockReadLock(KRwLock* rw)
         return;
     }
 
-    // Block — enqueue on reader wait list.
+    // Block — enqueue on reader wait list (once).
     self->blockedOnRwLock = rw;
     self->blockedAsWriter = false;
-    __atomic_store_n(&self->pendingWakeup, 0, __ATOMIC_RELEASE);
     Enqueue(rw->readWaitHead, rw->readWaitTail, self);
+
+    // Block in a LOOP until granted. BRO-196: SchedulerBlock can return without
+    // a grant when the thread is woken for an unrelated reason — most importantly
+    // ProcessSendSignal wakes ANY Blocked thread (pendingWakeup=1 +
+    // SchedulerUnblock) so it can take a pending signal. The waker clears
+    // blockedOnRwLock under the guard at the moment it grants us the read lock
+    // (and increments readerCount + records heldReadLock on our behalf, BRO-162),
+    // so a spurious wake leaves blockedOnRwLock == rw and we re-block instead of
+    // wrongly proceeding as a reader without the lock (which corrupts readerCount
+    // and the wait queue). Kernel rwlocks are not interruptible; a pending signal
+    // is delivered after the syscall completes. We remain enqueued across
+    // re-blocks (enqueued exactly once above; the waker dequeues us on grant).
+    for (;;)
+    {
+        __atomic_store_n(&self->pendingWakeup, 0, __ATOMIC_RELEASE);
+        RwGuardRelease(rw, flags);
+        SchedulerBlock(self);
+        flags = RwGuardAcquire(rw);
+        if (self->blockedOnRwLock != rw)   // granted (waker cleared it)
+            break;
+    }
     RwGuardRelease(rw, flags);
-    SchedulerBlock(self);
-    // Woken — the waker already incremented readerCount and recorded
-    // heldReadLock on our behalf (BRO-162); just clear the blocked marker.
-    self->blockedOnRwLock = nullptr;
 }
 
 void KRwLockReadUnlock(KRwLock* rw)
@@ -233,17 +249,31 @@ void KRwLockWriteLock(KRwLock* rw)
         return;
     }
 
-    // Block — enqueue on writer wait list.
+    // Block — enqueue on writer wait list (once).
     rw->writersWaiting++;
     self->blockedOnRwLock = rw;
     self->blockedAsWriter = true;
-    __atomic_store_n(&self->pendingWakeup, 0, __ATOMIC_RELEASE);
     Enqueue(rw->writeWaitHead, rw->writeWaitTail, self);
+
+    // Block in a LOOP until granted (BRO-196 — same rationale as KRwLockReadLock).
+    // A spurious wake (signal delivery via ProcessSendSignal) returns from
+    // SchedulerBlock without a grant; the waker clears blockedOnRwLock under the
+    // guard when it actually hands us the write lock (and sets writerActive +
+    // records heldWriteLock + decrements writersWaiting on our behalf). On a
+    // spurious wake blockedOnRwLock == rw, so we re-block rather than wrongly
+    // running as the writer. writersWaiting is incremented exactly once above and
+    // decremented by the waker on the real grant, so re-blocks don't miscount.
+    for (;;)
+    {
+        __atomic_store_n(&self->pendingWakeup, 0, __ATOMIC_RELEASE);
+        RwGuardRelease(rw, flags);
+        SchedulerBlock(self);
+        flags = RwGuardAcquire(rw);
+        if (self->blockedOnRwLock != rw)   // granted (waker cleared it)
+            break;
+    }
     RwGuardRelease(rw, flags);
-    SchedulerBlock(self);
-    // Woken — we now hold the write lock.
-    self->blockedOnRwLock = nullptr;
-    self->heldWriteLock = rw;
+    self->heldWriteLock = rw;   // already set by the waker; reasserted for clarity
 }
 
 void KRwLockWriteUnlock(KRwLock* rw)
