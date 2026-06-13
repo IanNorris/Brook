@@ -5528,7 +5528,19 @@ resolve_path:
     // threads may still be executing user code backed by the old page
     // table / file VMAs, causing use-after-free crashes (BRO-091).
     if (proc->tgid && proc->pid == proc->tgid)
+    {
         SchedulerKillThreadGroup(proc->tgid, proc);
+        // SchedulerKillThreadGroup latches tgidExiting=true on the whole group
+        // (including this surviving leader) to stillbirth any racing clone.
+        // But execve is a RE-IMAGE, not a group exit: this thread lives on as
+        // the new program. The kill is synchronous (all siblings are reaped on
+        // return) and this is now the only live thread, so clear the latch —
+        // otherwise the re-imaged program's own future threads (e.g. an SDL
+        // audio thread) are wrongly stillborn and it blocks forever waiting on
+        // a thread that never runs. (This silently broke launcher/makeWrapper
+        // style programs that exec then spawn threads.)
+        __atomic_store_n(&proc->tgidExiting, false, __ATOMIC_RELEASE);
+    }
 
     // --- Replace the process image ---
     uint64_t newStackPtr = 0;
