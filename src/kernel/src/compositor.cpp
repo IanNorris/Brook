@@ -2707,7 +2707,16 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
         }
         if (e.tex && contentDirty)
         {
-            gpu->UpdateTexture(e.tex, 0, 0, sw, sh);
+            // Hardware-GL window: present the client's dmabuf-shared render
+            // target by BLITting it (host-side) into the content texture, rather
+            // than uploading the unused VFB. Falls back to the VFB upload if the
+            // driver lacks the op or the blit fails.
+            bool presented = false;
+            if (w->externalGres && gpu->BlitExternalToTexture)
+                presented = gpu->BlitExternalToTexture(e.tex, w->externalGres,
+                                                       w->externalW, w->externalH);
+            if (!presented)
+                gpu->UpdateTexture(e.tex, 0, 0, sw, sh);
             if (isWayland) w->vfbDirty = 0;
             else if (p)    p->fbDirty = 0;
         }

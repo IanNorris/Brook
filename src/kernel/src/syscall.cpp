@@ -11303,6 +11303,24 @@ static int64_t sys_brook_wm_signal_dirty(uint64_t wmId, uint64_t, uint64_t,
     return 0;
 }
 
+// 525: WM_PRESENT_GRES(wmId, gres, w, h) — present a hardware-GL (dmabuf) frame.
+// waylandd resolves a client's dmabuf to a host virgl resource id (gres) and
+// calls this so the compositor BLITs that resource into the window's content
+// texture. The gres must be one the caller legitimately holds (it came from the
+// caller importing a PRIME fd the client sent it over the Wayland socket).
+static int64_t sys_brook_wm_present_gres(uint64_t wmId, uint64_t gres,
+                                         uint64_t w, uint64_t h,
+                                         uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    if (wmId == 0 || gres == 0) return -EINVAL;
+    return brook::WmPresentExternalById(proc, static_cast<uint32_t>(wmId),
+                                        static_cast<uint32_t>(gres),
+                                        static_cast<uint32_t>(w),
+                                        static_cast<uint32_t>(h)) ? 0 : -ENOENT;
+}
+
 // 509: WM_SET_TITLE(wmId, title*)
 static int64_t sys_brook_wm_set_title(uint64_t wmId, uint64_t titlePtr,
                                        uint64_t, uint64_t, uint64_t, uint64_t)
@@ -13586,6 +13604,7 @@ void SyscallTableInit()
     g_syscallTable[522]                  = sys_brook_wm_scanout_flip;
     g_syscallTable[523]                  = sys_brook_wm_get_windows;
     g_syscallTable[524]                  = sys_brook_wm_map_window_vfb;
+    g_syscallTable[525]                  = sys_brook_wm_present_gres;
     // Brook windowing extensions live in a high 0xB00 block, clear of the Linux
     // and Windows syscall ranges.
     g_syscallTable[0xB00]                = sys_brook_wm_set_window_properties; // WM_SET_WINDOW_PROPERTIES

@@ -58,6 +58,7 @@
 #define BROOK_SYS_WM_SET_CURSOR_VISIBLE 518
 #define BROOK_SYS_WM_SET_CURSOR_IMAGE  519
 #define BROOK_SYS_WM_GET_SCREEN_INFO  520
+#define BROOK_SYS_WM_PRESENT_GRES     525
 #define BROOK_WM_CREATE_FLAG_CSD     1u
 #define BROOK_WM_CREATE_FLAG_NO_FOCUS 2u
 
@@ -434,13 +435,49 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
     if (!s->pending_buffer) return;
 
     /* Hardware GL path: a dmabuf-backed buffer (Mesa's render target shared via
-     * zwp_linux_dmabuf_v1). Stage 2 resolves+logs the host resource id; Stage 3
-     * will blit it into the window's compositor texture. For now release it so
-     * the client keeps rendering. */
+     * zwp_linux_dmabuf_v1). Lazily create the kernel Window (sized from the
+     * dmabuf), then present the resolved host resource via WM_PRESENT_GRES so the
+     * compositor BLITs it into the window content texture (zero CPU copy). */
     if (is_dmabuf_buffer(s->pending_buffer)) {
         struct brook_dmabuf_buffer *db = wl_resource_get_user_data(s->pending_buffer);
-        fprintf(stderr, "[waylandd] commit: dmabuf %dx%d gres=%u (present: stage3 TODO)\n",
-                db ? db->width : 0, db ? db->height : 0, db ? db->gres : 0);
+        int dw = db ? db->width  : 0;
+        int dh = db ? db->height : 0;
+        int may_present = (!s->xdg_toplevel && !s->xdg_popup) || s->xdg_acked;
+        if (may_present && db && db->gres && dw > 0 && dh > 0 &&
+            (s->xdg_toplevel || s->xdg_popup)) {
+            if (s->wm_id == 0) {
+                struct brook_wm_create_out out = {0};
+                uint32_t create_flags = 0;
+                int effective_csd = s->deco_csd ||
+                                    (s->xdg_toplevel && !s->deco_negotiated);
+                if (s->xdg_popup || effective_csd)
+                    create_flags |= BROOK_WM_CREATE_FLAG_CSD;
+                if (s->xdg_popup)
+                    create_flags |= BROOK_WM_CREATE_FLAG_NO_FOCUS;
+                long rc = wm_create_window((uint32_t)dw, (uint32_t)dh,
+                                           s->title[0] ? s->title : NULL,
+                                           create_flags, &out);
+                if (rc == 0 && out.wm_id) {
+                    s->wm_id      = out.wm_id;
+                    s->vfb        = (uint32_t*)(uintptr_t)out.vfb_user;
+                    s->vfb_stride = out.vfb_stride;
+                    s->vfb_w      = (uint32_t)dw;
+                    s->vfb_h      = (uint32_t)dh;
+                    fprintf(stderr, "[waylandd] WM_CREATE_WINDOW (dmabuf) id=%u %dx%d\n",
+                            s->wm_id, dw, dh);
+                    popup_apply_position(s);
+                } else {
+                    fprintf(stderr, "[waylandd] WM_CREATE_WINDOW (dmabuf) failed rc=%ld\n", rc);
+                }
+            }
+            if (s->wm_id) {
+                long rc = syscall(BROOK_SYS_WM_PRESENT_GRES, (long)s->wm_id,
+                                  (long)db->gres, (long)dw, (long)dh);
+                if (rc != 0)
+                    fprintf(stderr, "[waylandd] WM_PRESENT_GRES id=%u gres=%u rc=%ld\n",
+                            s->wm_id, db->gres, rc);
+            }
+        }
         for (int i = 0; i < s->pending_frame_cb_count; i++) {
             wl_callback_send_done(s->pending_frame_cbs[i], g_now_ms());
             wl_resource_destroy(s->pending_frame_cbs[i]);

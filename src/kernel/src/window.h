@@ -107,6 +107,14 @@ struct Window
     uint8_t     vfbDirty;       // set by syscall on each commit; cleared after blit
     uint16_t    wmId;           // (idx + 1); 0 reserved for "invalid"
 
+    // Hardware GL (dmabuf) presentation: when a Wayland client shares a
+    // hardware-rendered buffer via zwp_linux_dmabuf_v1, waylandd resolves it to
+    // a host virgl resource id and records it here via WM_PRESENT_GRES. The
+    // compositor then BLITs this resource into the window's content texture
+    // instead of uploading the (unused) VFB. 0 = ordinary SHM/VFB window.
+    uint32_t    externalGres;   // host virgl resource id of the latest GL frame
+    uint32_t    externalW, externalH;  // its dimensions
+
     // Per-window input ring (Phase B).  When the WM routes an event
     // to this window (mouse over client area, or keyboard while focused),
     // the event is pushed here in addition to the legacy per-process queue.
@@ -314,6 +322,11 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
 
 void WmDestroyWindowById(Process* proc, uint32_t wmId);
 void WmSignalDirtyById(Process* proc, uint32_t wmId);
+// Record a hardware-GL (dmabuf) frame for a window: store the host virgl
+// resource id the compositor should present, and mark the window dirty. Returns
+// false if the window isn't found / not owned by proc.
+bool WmPresentExternalById(Process* proc, uint32_t wmId, uint32_t gres,
+                           uint32_t w, uint32_t h);
 void WmSetTitleById(Process* proc, uint32_t wmId, const char* title);
 
 // Resize an existing WM-API window's VFB to (newW × newH).  Allocates fresh

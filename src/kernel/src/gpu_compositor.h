@@ -45,6 +45,15 @@ struct GpuCompositorOps {
     void (*UpdateTexture)(GpuTexId tex, uint32_t x, uint32_t y,
                           uint32_t w, uint32_t h);
 
+    // Hardware-GL presentation: host-side BLIT an external virgl resource
+    // (`srcGres`, a client's dmabuf-shared render target, `srcW`x`srcH`) into the
+    // window content texture `dst`. Both are host resources, so the copy is
+    // host-side (zero guest bandwidth) and no guest pixel touch. Returns false if
+    // unsupported or the blit failed. Used to present unmodified-Mesa GL windows
+    // (SuperTuxKart) without a CPU readback.
+    bool (*BlitExternalToTexture)(GpuTexId dst, uint32_t srcGres,
+                                  uint32_t srcW, uint32_t srcH);
+
     // Begin a composited frame: bind + clear the scanout render-target to
     // `clearArgb` (0xAARRGGBB; alpha ignored, opaque clear).
     void (*BeginFrame)(uint32_t clearArgb);

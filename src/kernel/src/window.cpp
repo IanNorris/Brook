@@ -2318,6 +2318,19 @@ void WmSignalDirtyById(Process* proc, uint32_t wmId)
     CompositorWake();
 }
 
+bool WmPresentExternalById(Process* proc, uint32_t wmId, uint32_t gres,
+                           uint32_t w, uint32_t h)
+{
+    Window* win = WmFindWindowById(proc, wmId);
+    if (!win) return false;
+    win->externalGres = gres;
+    win->externalW = w;
+    win->externalH = h;
+    win->vfbDirty = 1;   // drive a recompose of this window's content
+    CompositorWake();
+    return true;
+}
+
 void WmSetTitleById(Process* proc, uint32_t wmId, const char* title)
 {
     Window* w = WmFindWindowById(proc, wmId);
