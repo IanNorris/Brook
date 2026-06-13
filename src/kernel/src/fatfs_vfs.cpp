@@ -1,5 +1,6 @@
 #include "fatfs_vfs.h"
 #include "vfs.h"
+#include "process.h"
 #include "fatfs_glue.h"
 #include "memory/heap.h"
 #include "serial.h"
@@ -640,4 +641,20 @@ extern "C" void FatFsDumpLockState()
     brook::SerialPrintf("  fatLock: locked=%u owner=%u waitHead=%p\n",
                         brook::g_fatLock.locked, brook::g_fatLock.ownerPid,
                         brook::g_fatLock.waitHead);
+    // BRO-196: walk the FAT-lock FIFO wait queue (pids blocked acquiring it).
+    int n = 0;
+    for (brook::Process* w = brook::g_fatLock.waitHead; w && n < 64; w = w->syncNext, ++n) {
+        if (w->magic != brook::PROCESS_MAGIC) { brook::SerialPrintf("    waiter[CORRUPT]\n"); break; }
+        brook::SerialPrintf("    fatLock waiter pid=%u state=%d syscall=%lu pendWake=%d\n",
+                            w->pid, (int)w->state, w->currentSyscallNum,
+                            __atomic_load_n(&w->pendingWakeup, __ATOMIC_RELAXED));
+    }
+}
+
+// BRO-196 diagnostic: current owner pid of g_fatLock (0 = unheld). Lets the
+// generic syscall layer detect a thread doing a blocking op while holding the
+// global FAT lock (a lock leak across a blocking wait).
+extern "C" uint32_t FatFsLockOwner()
+{
+    return brook::g_fatLock.locked ? brook::g_fatLock.ownerPid : 0;
 }

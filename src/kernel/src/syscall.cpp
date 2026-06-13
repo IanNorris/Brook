@@ -38,6 +38,7 @@
 extern "C" __attribute__((naked)) void ReturnToKernel();
 extern "C" bool MemFdHandleUserFault(uint64_t cr2, uint64_t errCode);
 extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode);
+extern "C" uint32_t FatFsLockOwner();  // BRO-196 diag (fatfs_vfs.cpp)
 
 // ---------------------------------------------------------------------------
 // UserBufferReadable — verify [addr, addr+len) is fully mapped in the
@@ -12034,6 +12035,58 @@ static void FutexFreeWaiter(FutexWaiter* w)
     g_futexWaiterPool.Free(w);
 }
 
+// BRO-196 diagnostic: a small ring buffer of recent futex ops, so the hang dump
+// can show the WAIT/WAKE timeline right before a deadlock (lost-wakeup hunt).
+struct FutexLogEntry { uint64_t uaddr; uint64_t tick; uint32_t pid; int32_t result; uint8_t op; };
+static constexpr uint32_t FUTEX_LOG_SIZE = 512;
+static FutexLogEntry g_futexLog[FUTEX_LOG_SIZE];
+static volatile uint32_t g_futexLogIdx = 0;  // monotonic; & (SIZE-1) for slot
+extern volatile uint64_t g_lapicTickCount;
+// op: 0=WAIT-enqueue 1=WAIT-return 2=WAKE 3=WAKE_OP 4=REQUEUE
+static inline void FutexLog(uint8_t op, uint64_t uaddr, uint32_t pid, int32_t result)
+{
+    uint32_t i = __atomic_fetch_add(&g_futexLogIdx, 1, __ATOMIC_RELAXED) & (FUTEX_LOG_SIZE - 1);
+    g_futexLog[i].op = op;
+    g_futexLog[i].uaddr = uaddr;
+    g_futexLog[i].pid = pid;
+    g_futexLog[i].result = result;
+    g_futexLog[i].tick = g_lapicTickCount;
+}
+
+// BRO-196 diagnostic: dump every blocked futex waiter (uaddr + owner + pid).
+// Called from SchedulerDumpHang (Ctrl+Shift+ScrollLock). Lock-free read of the
+// hash table — safe in the hang path where we can't guarantee lock state; we are
+// only reading immutable-while-blocked fields for diagnosis.
+extern "C" void FutexDumpWaiters()
+{
+    SerialPrintf("--- futex waiters ---\n");
+    uint32_t total = 0;
+    for (uint32_t b = 0; b < FUTEX_HASH_SIZE; ++b) {
+        for (FutexWaiter* w = g_futexBuckets[b]; w; w = w->next) {
+            Process* wp = w->proc;
+            uint32_t pid = (wp && wp->magic == PROCESS_MAGIC) ? wp->pid : 0xFFFFFFFFu;
+            SerialPrintf("  futex uaddr=0x%lx owner=0x%lx bitset=0x%x pid=%u\n",
+                         w->uaddr, w->owner, w->bitset, pid);
+            ++total;
+            if (total > 256) { SerialPrintf("  ...(truncated)\n"); return; }
+        }
+    }
+    SerialPrintf("  total futex waiters: %u\n", total);
+
+    // Recent futex op timeline (oldest→newest).
+    static const char* opName[] = {"WAITq", "WAITr", "WAKE ", "WAKEOP", "REQ  "};
+    SerialPrintf("--- recent futex ops (last %u) ---\n", FUTEX_LOG_SIZE);
+    uint32_t head = __atomic_load_n(&g_futexLogIdx, __ATOMIC_RELAXED);
+    for (uint32_t k = 0; k < FUTEX_LOG_SIZE; ++k) {
+        uint32_t i = (head + k) & (FUTEX_LOG_SIZE - 1);
+        const FutexLogEntry& e = g_futexLog[i];
+        if (e.uaddr == 0 && e.tick == 0) continue;
+        const char* nm = (e.op < 5) ? opName[e.op] : "?";
+        SerialPrintf("  t=%lu %s uaddr=0x%lx pid=%u res=%d\n",
+                     e.tick, nm, e.uaddr, e.pid, e.result);
+    }
+}
+
 static uint32_t FutexHash(uint64_t owner, uint64_t addr)
 {
     return static_cast<uint32_t>(((addr >> 2) ^ owner) % FUTEX_HASH_SIZE);
@@ -12070,6 +12123,8 @@ extern "C" int64_t FutexWake(uint64_t owner, uint64_t uaddr, uint32_t maxWake,
     }
 
     IrqSpinLockRelease(&g_futexLock, fxFlags);
+    { Process* cp = SchedulerCurrentProcess();
+      FutexLog(2, uaddr, cp ? cp->pid : 0, (int32_t)woken); }
     return static_cast<int64_t>(woken);
 }
 
@@ -12249,14 +12304,18 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
         // Release the futex lock (restoring interrupts) BEFORE blocking — a
         // process must never be descheduled with interrupts disabled.
         IrqSpinLockRelease(&g_futexLock, fxFlags);
+        FutexLog(0, uaddrVal, proc->pid, (int32_t)val);  // WAIT-enqueue
 
         // Block until FUTEX_WAKE removes our waiter, a signal arrives, or an
         // optional timeout expires and the scheduler wakes us.
         SchedulerBlock(proc);
 
-        if (FutexRemoveWaiter(owner, uaddrVal, proc))
+        if (FutexRemoveWaiter(owner, uaddrVal, proc)) {
+            FutexLog(1, uaddrVal, proc->pid, -1);  // WAIT-return (timeout/signal)
             return HasPendingSignals() ? -EINTR : -ETIMEDOUT;
+        }
 
+        FutexLog(1, uaddrVal, proc->pid, 0);  // WAIT-return (woken)
         return 0;
     }
 

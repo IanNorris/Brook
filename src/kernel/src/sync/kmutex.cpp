@@ -64,6 +64,13 @@ void KMutexLock(KMutex* m)
     }
 
     // Contended — add ourselves to the wait queue and block.
+    // BRO-196: detect a recursive (self) acquisition. KMutex is non-recursive,
+    // so a thread that already owns the mutex blocking on it self-deadlocks
+    // forever (it can never unlock to wake itself). Log loudly with both pids.
+    if (m->locked && m->ownerPid == self->pid) {
+        SerialPrintf("KMutex: SELF-DEADLOCK pid=%u re-locking mutex it already owns "
+                     "(mutex=%p)\n", self->pid, (void*)m);
+    }
     self->syncNext = nullptr;
     __atomic_store_n(&self->pendingWakeup, 0, __ATOMIC_RELEASE);
     if (m->waitTail)
