@@ -32,16 +32,21 @@ int main(int argc, char **argv)
     setenv("__EGL_VENDOR_LIBRARY_DIRS", MESA_EGL_VENDOR_DIR, 1);
     /* Force the virgl DRI driver (host nvidia ICD would break otherwise). */
     setenv("MESA_LOADER_DRIVER_OVERRIDE", "virtio_gpu", 1);
-    /* SDL2 (via sdl12-compat): Wayland video, no audio (Brook has no usable
-     * audio device for SDL here; dummy keeps SDL_Init from failing). */
+    /* SDL2 (via sdl12-compat): Wayland video, no audio. Brook's SDL audio path
+     * (sdl12-compat -> sdl2-compat -> SDL3 + libmikmod/SDL_sound) hangs while
+     * decoding gltron's bundled .it module, so we run gltron with -s ("Don't
+     * play sound", see below) and also pin the dummy audio driver across all
+     * three SDL ABIs as belt-and-braces. The GL render path is unaffected. */
     setenv("SDL_VIDEODRIVER", "wayland", 1);
-    setenv("SDL_AUDIODRIVER", "dummy", 1);
+    setenv("SDL_AUDIODRIVER", "dummy", 1);   /* SDL1.2 / SDL2 */
+    setenv("SDL_AUDIO_DRIVER", "dummy", 1);  /* SDL3 */
     /* gltron writes ~/.gltronrc; give it a writable HOME. */
     setenv("HOME", "/tmp", 1);
 
     char *args[16];
     int n = 0;
     args[n++] = (char *)GLTRON_REAL;
+    args[n++] = (char *)"-s";   /* disable sound entirely (avoids the hang) */
     for (int i = 1; i < argc && n < 15; ++i) args[n++] = argv[i];
     args[n] = NULL;
 

@@ -3,4 +3,4 @@
 # compositor: boot with BROOK_GPU=gl BROOK_COMPOSITE=gpu (nested-weston GL).
 set wm
 run --once /nix/bin/waylandd
-run /nix/store/5gx25psx8wg7c4l9mz2akq9y2mynzy89-gltron-brook-0.70-brook/bin/gltron
+run /nix/store/fkkxgrlf76hmaqgvx13pfzysd7wxvv3z-gltron-brook-0.70-brook/bin/gltron
