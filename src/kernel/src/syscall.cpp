@@ -6321,7 +6321,10 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         }
         uint32_t createH = rc.height ? rc.height : 1;   // PIPE_BUFFER is 1D (h=0)
         int32_t gres = ga->ResourceCreate3D(dctx->ctxId, rc.target, rc.format,
-                                            rc.bind, rc.width, createH);
+                                            rc.bind, rc.width, createH,
+                                            rc.depth, rc.array_size,
+                                            rc.last_level, rc.nr_samples,
+                                            rc.flags);
         if (gres < 0) return -ENOMEM;
         // For a buffer the "stride" is its byte length, not width*texel; for a
         // 2D texture default to width*4 bytes/texel when the client omits stride.
@@ -11513,7 +11516,10 @@ static int64_t sys_brook_gpu_resource_create(uint64_t ctx, uint64_t format,
     // driver picks the texture path (target 0 is reserved for PIPE_BUFFER).
     int32_t res = ga->ResourceCreate3D((int32_t)ctx, /*PIPE_TEXTURE_2D=*/2u,
                                        (uint32_t)format, (uint32_t)bind,
-                                       (uint32_t)w, (uint32_t)h);
+                                       (uint32_t)w, (uint32_t)h,
+                                       /*depth=*/1u, /*arraySize=*/1u,
+                                       /*lastLevel=*/0u, /*nrSamples=*/0u,
+                                       /*flags=*/0u);
     return res < 0 ? -ENOMEM : res;
 }
 

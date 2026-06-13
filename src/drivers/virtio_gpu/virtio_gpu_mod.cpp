@@ -1180,6 +1180,36 @@ static bool ResourceCreate3D(uint32_t resId, uint32_t format, uint32_t bind,
     return CmdRespOk(SubmitCommand(sizeof(*req), CMD_RESP_CAP));
 }
 
+// Full-parameter texture/3D-resource create. Unlike ResourceCreate3D (which
+// hardcodes a single-level 2-D texture for the kernel's own render targets),
+// this honours the app's pipe target, depth, array_size, last_level (mip
+// count), nr_samples and flags. last_level is essential: a mipmapped texture
+// (GL_*_MIPMAP_*) uploads to levels >0, and virglrenderer's COPY_TRANSFER3D
+// rejects (resource_contains_box) a transfer to a level the resource was not
+// created with — the bug that broke gltron's texture loads.
+static bool ResourceCreate3DEx(uint32_t resId, uint32_t target, uint32_t format,
+                               uint32_t bind, uint32_t w, uint32_t h,
+                               uint32_t depth, uint32_t arraySize,
+                               uint32_t lastLevel, uint32_t nrSamples,
+                               uint32_t flags)
+{
+    auto* req = reinterpret_cast<VirtioGpuResourceCreate3D*>(g_cmdBuf + CMD_REQ_OFF);
+    memset(req, 0, sizeof(*req));
+    req->hdr.type    = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    req->resource_id = resId;
+    req->target      = target ? target : PIPE_TEXTURE_2D;
+    req->format      = format;
+    req->bind        = bind;
+    req->width       = w;
+    req->height      = h;
+    req->depth       = depth ? depth : 1;
+    req->array_size  = arraySize ? arraySize : 1;
+    req->last_level  = lastLevel;
+    req->nr_samples  = nrSamples;
+    req->flags       = flags;
+    return CmdRespOk(SubmitCommand(sizeof(*req), CMD_RESP_CAP));
+}
+
 static bool TransferFromHost3D(uint32_t ctxId, uint32_t resId, uint32_t w, uint32_t h)
 {
     auto* req = reinterpret_cast<VirtioGpuTransferHost3D*>(g_cmdBuf + CMD_REQ_OFF);
@@ -2609,7 +2639,10 @@ static void AppCtxDestroy(int32_t ctxId)
 }
 
 static int32_t AppResourceCreate3D(int32_t ctxId, uint32_t target, uint32_t format,
-                                   uint32_t bind, uint32_t w, uint32_t h)
+                                   uint32_t bind, uint32_t w, uint32_t h,
+                                   uint32_t depth, uint32_t arraySize,
+                                   uint32_t lastLevel, uint32_t nrSamples,
+                                   uint32_t flags)
 {
     GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
     AppCtx* c = AppCtxFind(ctxId);
@@ -2626,9 +2659,13 @@ static int32_t AppResourceCreate3D(int32_t ctxId, uint32_t target, uint32_t form
     uint32_t gres = AppResGlobal((uint32_t)ctxId, localRes);
     // A PIPE_BUFFER must be created as a 1-D linear buffer (target 0), or
     // virglrenderer rejects buffer bind flags on a texture target — this is
-    // Mesa's glReadPixels staging buffer (BRO-188).
-    bool created = isBuffer ? ResourceCreateBuffer(gres, bind, w)
-                            : ResourceCreate3D(gres, format, bind, w, h);
+    // Mesa's glReadPixels staging buffer (BRO-188). A texture honours the app's
+    // full geometry (target/depth/array/mip-levels) so mipmapped and cubemap
+    // uploads land on a resource that actually has those levels/layers.
+    bool created = isBuffer
+        ? ResourceCreateBuffer(gres, bind, w)
+        : ResourceCreate3DEx(gres, target, format, bind, w, h,
+                             depth, arraySize, lastLevel, nrSamples, flags);
     if (!created) return -1;
     if (!CtxAttachResource((uint32_t)ctxId, gres)) return -1;
     return static_cast<int32_t>(gres);

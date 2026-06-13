@@ -36,7 +36,10 @@ struct GpuAppOps {
     // host-global id (>0) — the app uses this SAME id both in later ops and
     // inside the virgl command streams it submits — or <0.
     int32_t (*ResourceCreate3D)(int32_t ctxId, uint32_t target, uint32_t format,
-                                uint32_t bind, uint32_t w, uint32_t h);
+                                uint32_t bind, uint32_t w, uint32_t h,
+                                uint32_t depth, uint32_t arraySize,
+                                uint32_t lastLevel, uint32_t nrSamples,
+                                uint32_t flags);
 
     // Back a resource with guest memory at kernel-virtual `vaddr` (size `bytes`),
     // described to the host page-by-page (scatter-gather). The buffer may be a
