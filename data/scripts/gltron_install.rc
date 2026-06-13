@@ -1,0 +1,5 @@
+# Brook OS — nix-install gltron end-to-end.
+# This is the BRO-192 repro workload: nix-fetch prefetches many narinfo(s) in
+# one multithreaded curl and forks/mmaps heavily, which previously deadlocked
+# the SMP TLB shootdown path. Used to confirm the fix holds under the real load.
+run /nix/bin/nix-install gltron
