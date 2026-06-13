@@ -1129,33 +1129,42 @@ static uint32_t Ext2DirRemove(Ext2Mount* mnt, Ext2Inode* dirData,
 static uint32_t Ext2ResolveParent(Ext2Mount* mnt, const char* relPath,
                                   char* nameOut, uint32_t nameOutSize)
 {
-    // Find last slash
     const char* p = relPath;
     while (*p == '/') ++p; // skip leading slashes
+
+    // Compute the effective end of the path, ignoring any trailing slashes.
+    // POSIX treats mkdir("foo/") / rename("foo/") as operating on "foo"; without
+    // this the leaf component parses as empty and every create op on a
+    // trailing-slash path fails (BRO-195: SuperTuxKart's cache-dir mkdir loop).
+    const char* end = p;
+    while (*end) ++end;
+    while (end > p && end[-1] == '/') --end;
+
+    // Find the last slash within [p, end).
     const char* lastSlash = nullptr;
-    for (const char* q = p; *q; ++q)
+    for (const char* q = p; q < end; ++q)
         if (*q == '/') lastSlash = q;
 
     if (!lastSlash) {
-        // No slash — parent is root, name is entire path
+        // No slash — parent is root, name is the entire (trimmed) path
         uint32_t i = 0;
-        while (p[i] && i < nameOutSize - 1) { nameOut[i] = p[i]; ++i; }
+        while (p + i < end && i < nameOutSize - 1) { nameOut[i] = p[i]; ++i; }
         nameOut[i] = '\0';
         return EXT2_ROOT_INO;
     }
 
-    // Copy parent path
+    // Copy parent path (everything before the last slash)
     uint32_t parentLen = static_cast<uint32_t>(lastSlash - p);
     char parentPath[256];
     if (parentLen >= sizeof(parentPath)) return 0;
     for (uint32_t i = 0; i < parentLen; ++i) parentPath[i] = p[i];
     parentPath[parentLen] = '\0';
 
-    // Copy name (after last slash)
+    // Copy name (after last slash, up to the trimmed end)
     const char* name = lastSlash + 1;
-    while (*name == '/') ++name;
+    while (name < end && *name == '/') ++name;
     uint32_t ni = 0;
-    while (name[ni] && ni < nameOutSize - 1) { nameOut[ni] = name[ni]; ++ni; }
+    while (name + ni < end && name[ni] && ni < nameOutSize - 1) { nameOut[ni] = name[ni]; ++ni; }
     nameOut[ni] = '\0';
 
     return Ext2ResolvePath(mnt, EXT2_ROOT_INO, parentPath, 0);
