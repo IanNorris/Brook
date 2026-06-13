@@ -1,6 +1,3 @@
-# Brook OS — hardware windowed GL test: es2gears_wayland (unmodified Mesa) over
-# the zwp_linux_dmabuf_v1 path (PRIME export -> waylandd import -> WM_PRESENT_GRES
-# host blit). The smallest end-to-end check of hardware windowed GL.
 set wm
 run --once /nix/bin/waylandd
-run /nix/store/10m0bjfv7a35sk11a1l0vb8qxndffbwh-es2gears-brook-0.1-brook/bin/es2gears
+run /nix/store/gjj7w4qrnbha6d5n39r37hf0xkjrvz33-es2gears-brook-0.1-brook/bin/es2gears
