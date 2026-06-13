@@ -64,30 +64,54 @@ void KMutexLock(KMutex* m)
     }
 
     // Contended — add ourselves to the wait queue and block.
+    // BRO-196: detect a recursive (self) acquisition. KMutex is non-recursive,
+    // so a thread that already owns the mutex blocking on it self-deadlocks
+    // forever (it can never unlock to wake itself). Log loudly with both pids.
+    if (m->locked && m->ownerPid == self->pid) {
+        SerialPrintf("KMutex: SELF-DEADLOCK pid=%u re-locking mutex it already owns "
+                     "(mutex=%p)\n", self->pid, (void*)m);
+    }
+    // Enqueue ourselves once on the FIFO wait queue.
     self->syncNext = nullptr;
-    __atomic_store_n(&self->pendingWakeup, 0, __ATOMIC_RELEASE);
     if (m->waitTail)
         m->waitTail->syncNext = self;
     else
         m->waitHead = self;
     m->waitTail = self;
 
-    // Set process state to Blocked while we hold the guard, then release
-    // the guard and yield. We use SchedulerBlock which handles the
-    // cli-across-yield pattern internally, but we need to release our
-    // guard first.
-    GuardRelease(m, flags);
-
-    // SchedulerBlock sets state=Blocked and yields to another process.
-    // When we wake up (via KMutexUnlock calling SchedulerUnblock),
-    // we'll resume here with the mutex held.
+    // Block in a LOOP until KMutexUnlock grants us ownership (m->ownerPid == us).
     //
-    // IMPORTANT: SchedulerBlock checks pendingWakeup to avoid a lost-wakeup
-    // race.  If KMutexUnlock fires between GuardRelease above and the
-    // SchedulerBlock call below, it sets pendingWakeup=1 and calls
-    // SchedulerUnblock (which returns early because we're still Running).
-    // SchedulerBlock sees pendingWakeup and skips the actual block.
-    SchedulerBlock(self);
+    // BRO-196: a bare "block once, then assume we hold the lock" is WRONG.
+    // SchedulerBlock can return WITHOUT an ownership grant when the thread is
+    // woken for an unrelated reason — most importantly ProcessSendSignal wakes
+    // ANY Blocked thread (pendingWakeup=1 + SchedulerUnblock) so it can take a
+    // pending signal. A signal-woken mutex waiter would otherwise fall through
+    // and run the critical section WITHOUT the lock, while still sitting in the
+    // wait queue — corrupting the queue (observed: cyclic waiter list) and
+    // making a later KMutexUnlock transfer ownership to a thread that has moved
+    // on (lost wakeup → whole-FS deadlock). So we re-check the grant under the
+    // guard and re-block on any spurious wake. Kernel mutexes are not
+    // interruptible: the pending signal stays pending and is delivered when the
+    // syscall returns, after we have completed the critical section.
+    //
+    // The grant is published by KMutexUnlock under this same guard (it sets
+    // m->ownerPid = our pid AND dequeues us), so checking m->ownerPid == self->pid
+    // while holding the guard is race-free.
+    for (;;)
+    {
+        if (m->ownerPid == self->pid)
+        {
+            // Granted — KMutexUnlock has already dequeued us and set m->locked.
+            GuardRelease(m, flags);
+            return;
+        }
+        __atomic_store_n(&self->pendingWakeup, 0, __ATOMIC_RELEASE);
+        GuardRelease(m, flags);
+        // SchedulerBlock checks pendingWakeup to avoid a lost wakeup if
+        // KMutexUnlock fires between GuardRelease and here.
+        SchedulerBlock(self);
+        flags = GuardAcquire(m);
+    }
 }
 
 void KMutexUnlock(KMutex* m)
