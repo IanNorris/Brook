@@ -10392,18 +10392,55 @@ static int64_t sys_fallocate(uint64_t, uint64_t, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
-// sys_mincore (27) — check if pages are resident (stub: all resident)
-// ---------------------------------------------------------------------------
-
+// sys_mincore (27) — residency vector for a mapped range. Real Linux semantics:
+// returns -ENOMEM if the range contains any UNMAPPED page (no VMA), and -EFAULT
+// for a bad vector pointer; otherwise fills one byte per page with bit0 = page
+// physically resident. The "is it mapped" distinction matters: Mesa's
+// _eglPointerIsDereferenceable() probes a possibly-bogus pointer with
+// mincore(addr & ~PAGE, ...) and treats SUCCESS as "dereferenceable". The old
+// stub ignored addr and always succeeded, so Mesa judged small-integer garbage
+// (e.g. a wl_egl_window version field of 3) to be a valid pointer and
+// dereferenced it — crashing every windowed-GL client (BRO-191).
 static int64_t sys_mincore(uint64_t addr, uint64_t length, uint64_t vecAddr,
                             uint64_t, uint64_t, uint64_t)
 {
-    (void)addr;
+    if (addr & 0xFFF) return -EINVAL;        // addr must be page-aligned
     uint64_t pages = (length + 4095) / 4096;
+    if (pages == 0) return 0;
     if (!UserBufferWritable(vecAddr, pages)) return -EFAULT;
+
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    Process* mm = MemoryMapOwner(proc);
+    if (!mm) return -ESRCH;
+
+    // A page is "mapped" if it is physically present OR falls within a tracked
+    // demand-paged region (file/memfd/fb map). Anything else is unmapped.
+    auto pageMapped = [&](uint64_t va) -> bool {
+        if (VmmVirtToPhys(proc->pageTable, VirtualAddress(va))) return true;
+        for (uint32_t i = 0; i < Process::MAX_FILE_MAPS; i++) {
+            const auto& m = mm->fileMaps[i];
+            if (m.length && va >= m.vaddr && va < m.vaddr + m.length) return true;
+        }
+        for (uint32_t i = 0; i < Process::MAX_MEMFD_MAPS; i++) {
+            const auto& m = mm->memfdMaps[i];
+            if (m.length && va >= m.vaddr && va < m.vaddr + m.length) return true;
+        }
+        for (uint32_t i = 0; i < Process::MAX_FB_MAPS; i++) {
+            const auto& m = mm->fbMaps[i];
+            if (m.length && va >= m.vaddr && va < m.vaddr + m.length) return true;
+        }
+        return false;
+    };
+
     auto* vec = reinterpret_cast<uint8_t*>(vecAddr);
     for (uint64_t i = 0; i < pages; ++i)
-        vec[i] = 1; // all pages resident
+    {
+        uint64_t va = addr + i * 4096;
+        if (!pageMapped(va)) return -ENOMEM;   // unmapped page in range
+        // bit0 = physically resident (demand-paged-but-not-faulted reads 0).
+        vec[i] = VmmVirtToPhys(proc->pageTable, VirtualAddress(va)) ? 1 : 0;
+    }
     return 0;
 }
 
