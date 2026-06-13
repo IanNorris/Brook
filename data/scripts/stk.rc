@@ -1,0 +1,6 @@
+# SuperTuxKart 1.5 on Brook — windowed OpenGL via SDL2 -> virgl/dmabuf.
+# Requires the GPU compositor: boot with BROOK_GPU=gl BROOK_COMPOSITE=gpu.
+# Launched via /nix/stk-play.sh (adds Brook virgl env + OpenAL null backend).
+set wm
+run --once /nix/bin/waylandd
+run /nix/stk-play.sh
