@@ -149,6 +149,20 @@ static int run_nix_fetch_deps(const char *hash, int force) {
     return run_program(argv);
 }
 
+/* Force re-fetch of a SINGLE store path by hash (no --deps). Used to repair a
+ * specific corrupt closure dependency: nix-fetch --deps --force only repairs
+ * the TOP path (fetch_dependencies skips deps that already exist on disk), so
+ * a corrupt dep must be repaired by targeting its own hash directly. */
+static int run_nix_fetch_one(const char *hash) {
+    char *const argv[] = {
+        (char*)"/nix/bin/nix-fetch",
+        (char*)"--force",
+        (char*)hash,
+        NULL,
+    };
+    return run_program(argv);
+}
+
 static int read_full_at(int fd, void *buf, size_t len, off_t off) {
     if (lseek(fd, off, SEEK_SET) < 0) return -1;
     size_t done = 0;
@@ -894,21 +908,27 @@ static int closure_corrupt_scan(const char *top_store,
     return ncorrupt;
 }
 
-/* Verify the full closure of an installed package and force-refetch if any
- * dependency is corrupt. Returns 0 on success (clean or repaired), nonzero on
- * unrecoverable error. */
+/* Verify the full closure of an installed package and repair any corrupt
+ * dependency by force-refetching each corrupt store path individually.
+ * Returns 0 on success (clean or repaired), nonzero on unrecoverable error. */
 static int verify_and_repair_closure(const char *top_store, const char *top_hash) {
+    (void)top_hash;
     char corrupt[16][64];
     int n = closure_corrupt_scan(top_store, corrupt, 16);
     if (n <= 0) return 0;
 
-    printf("Detected %d corrupt closure path(s); repairing via force re-fetch...\n", n);
-    /* Re-fetch the entire closure with --force; nix-fetch re-downloads and
-     * re-unpacks each path, overwriting the corrupt entries. */
-    int code = run_nix_fetch_deps(top_hash, 1);
-    if (code != 0) {
-        fprintf(stderr, "Error: closure repair re-fetch failed (exit %d)\n", code);
-        return 1;
+    int to_repair = n < 16 ? n : 16;
+    printf("Detected %d corrupt closure path(s); repairing %d via force re-fetch...\n",
+           n, to_repair);
+    /* Repair each corrupt path on its own. A blanket `nix-fetch --deps --force`
+     * only repairs the TOP path -- fetch_dependencies skips on-disk deps -- so
+     * we target each corrupt hash directly (nix-fetch downloads to a temp path
+     * and atomically renames over the corrupt entry). */
+    for (int i = 0; i < to_repair; i++) {
+        int code = run_nix_fetch_one(corrupt[i]);
+        if (code != 0)
+            fprintf(stderr, "Warning: repair of %s failed (exit %d)\n",
+                    corrupt[i], code);
     }
     /* Re-scan to confirm the repair actually took. */
     n = closure_corrupt_scan(top_store, corrupt, 16);
