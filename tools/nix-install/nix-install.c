@@ -780,33 +780,185 @@ static void refresh_desktop_entries(void)
         printf("  Updated launcher: %d app(s) in %s\n", entry_count, APPS_IDX);
 }
 
+/* Read the NarSize field from a store hash's cached narinfo. Returns the
+ * declared uncompressed NAR size, or 0 if the narinfo is absent/unparseable. */
+static long narinfo_narsize(const char *hash) {
+    char p[512];
+    snprintf(p, sizeof(p), "/nix/var/cache/narinfo/%s.narinfo", hash);
+    FILE *f = fopen(p, "r");
+    if (!f) return 0;
+    long sz = 0;
+    char line[MAX_LINE];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "NarSize:", 8) == 0) {
+            sz = strtol(line + 8, NULL, 10);
+            break;
+        }
+    }
+    fclose(f);
+    return sz;
+}
+
+/* Detect the "store path is a truncated/cross-linked regular file where a
+ * package tree belongs" corruption (BRO-196: a non-exclusive ext2 write lock
+ * let concurrent allocations double-claim inodes/blocks during multithreaded
+ * fetch, leaving e.g. a libogg store path as a 4763-byte file instead of a
+ * 48176-byte directory tree). Returns 1 if the path looks corrupt or missing.
+ *
+ * A legitimate single-file store path (e.g. *.cfg, *.sh) has an on-disk size
+ * close to its narinfo NarSize, so we only flag a regular file whose size is
+ * far below NarSize (truncation). Directories and symlinks are treated as
+ * structurally OK here; without the narinfo we stay conservative and do not
+ * flag, to avoid false positives. */
+static int store_entry_corrupt(const char *store_name) {
+    char p[512];
+    snprintf(p, sizeof(p), "/nix/store/%s", store_name);
+    struct stat st;
+    if (lstat(p, &st) != 0) return 1;            /* missing entirely */
+    if (!S_ISREG(st.st_mode)) return 0;          /* directory/symlink: ok */
+
+    char hash[64];
+    store_hash_from_name(store_name, hash);
+    if (!hash[0]) return 0;
+    long narsize = narinfo_narsize(hash);
+    if (narsize <= 0) return 0;                  /* unknown — don't guess */
+    /* NAR framing adds well under 4 KiB for a single-file path, so a real
+     * single-file store path satisfies size + 4096 >= NarSize. A truncated or
+     * cross-linked file is dramatically smaller than its declared NarSize. */
+    if ((long)st.st_size + 4096 < narsize) return 1;
+    return 0;
+}
+
+/* Bounded BFS over the transitive closure (via cached narinfo References),
+ * counting corrupt store paths. The first `max_hashes` corrupt store hashes
+ * are copied into `corrupt_hashes` for targeted repair. */
+#define NIX_CLOSURE_MAX 8192
+static char g_closure_seen[NIX_CLOSURE_MAX][96];
+static int  g_closure_seen_n;
+
+static int closure_mark_seen(const char *store_name) {
+    for (int i = 0; i < g_closure_seen_n; i++)
+        if (strcmp(g_closure_seen[i], store_name) == 0) return 1;
+    if (g_closure_seen_n < NIX_CLOSURE_MAX)
+        snprintf(g_closure_seen[g_closure_seen_n++], 96, "%s", store_name);
+    return 0;
+}
+
+static int closure_corrupt_scan(const char *top_store,
+                                char corrupt_hashes[][64], int max_hashes) {
+    static char queue[NIX_CLOSURE_MAX][96];
+    int qh = 0, qt = 0;
+    g_closure_seen_n = 0;
+
+    snprintf(queue[qt++], 96, "%s", top_store);
+    closure_mark_seen(top_store);
+
+    int ncorrupt = 0;
+    while (qh < qt) {
+        char cur[96];
+        snprintf(cur, sizeof(cur), "%s", queue[qh++]);
+
+        if (store_entry_corrupt(cur)) {
+            if (ncorrupt < max_hashes) {
+                char h[64];
+                store_hash_from_name(cur, h);
+                snprintf(corrupt_hashes[ncorrupt], 64, "%s", h);
+            }
+            ncorrupt++;
+            fprintf(stderr, "nix-install: corrupt closure path: %s\n", cur);
+        }
+
+        char hash[64];
+        store_hash_from_name(cur, hash);
+        if (!hash[0]) continue;
+
+        char ni[512];
+        snprintf(ni, sizeof(ni), "/nix/var/cache/narinfo/%s.narinfo", hash);
+        FILE *f = fopen(ni, "r");
+        if (!f) continue;
+        char line[MAX_LINE];
+        while (fgets(line, sizeof(line), f)) {
+            if (strncmp(line, "References:", 11) != 0) continue;
+            char *p = line + 11;
+            char *saveptr = NULL;
+            char *tok = strtok_r(p, " \t\r\n", &saveptr);
+            while (tok) {
+                if (!closure_mark_seen(tok) && qt < NIX_CLOSURE_MAX)
+                    snprintf(queue[qt++], 96, "%s", tok);
+                tok = strtok_r(NULL, " \t\r\n", &saveptr);
+            }
+            break;
+        }
+        fclose(f);
+    }
+    return ncorrupt;
+}
+
+/* Verify the full closure of an installed package and force-refetch if any
+ * dependency is corrupt. Returns 0 on success (clean or repaired), nonzero on
+ * unrecoverable error. */
+static int verify_and_repair_closure(const char *top_store, const char *top_hash) {
+    char corrupt[16][64];
+    int n = closure_corrupt_scan(top_store, corrupt, 16);
+    if (n <= 0) return 0;
+
+    printf("Detected %d corrupt closure path(s); repairing via force re-fetch...\n", n);
+    /* Re-fetch the entire closure with --force; nix-fetch re-downloads and
+     * re-unpacks each path, overwriting the corrupt entries. */
+    int code = run_nix_fetch_deps(top_hash, 1);
+    if (code != 0) {
+        fprintf(stderr, "Error: closure repair re-fetch failed (exit %d)\n", code);
+        return 1;
+    }
+    /* Re-scan to confirm the repair actually took. */
+    n = closure_corrupt_scan(top_store, corrupt, 16);
+    if (n > 0) {
+        fprintf(stderr, "Warning: %d closure path(s) still corrupt after re-fetch "
+                        "(first: %s)\n", n, corrupt[0]);
+        return 1;
+    }
+    printf("Closure repair complete.\n");
+    return 0;
+}
+
 static int cmd_install(const char *name) {
     printf("Looking up '%s'...\n", name);
 
     char existing_store[512] = {0};
     if (find_installed(name, existing_store, sizeof(existing_store))) {
-        if (!store_path_healthy(existing_store)) {
-            char hash[64] = {0};
+        /* Extract the top-level store hash once for health checks/repair. */
+        char top_hash[64] = {0};
+        {
             const char *dash = strchr(existing_store, '-');
             if (dash) {
                 size_t hlen = dash - existing_store;
-                if (hlen < sizeof(hash)) {
-                    memcpy(hash, existing_store, hlen);
-                    hash[hlen] = '\0';
+                if (hlen < sizeof(top_hash)) {
+                    memcpy(top_hash, existing_store, hlen);
+                    top_hash[hlen] = '\0';
                 }
             }
-            if (!hash[0]) {
-                fprintf(stderr, "Error: invalid store name '%s'\n", existing_store);
-                return 1;
-            }
+        }
+        if (!top_hash[0]) {
+            fprintf(stderr, "Error: invalid store name '%s'\n", existing_store);
+            return 1;
+        }
 
+        if (!store_path_healthy(existing_store)) {
             printf("'%s' is already installed but its store path is incomplete; repairing...\n", name);
-            int code = run_nix_fetch_deps(hash, 1);
+            int code = run_nix_fetch_deps(top_hash, 1);
             if (code != 0) {
                 fprintf(stderr, "Error: nix-fetch repair failed (exit %d)\n", code);
                 return 1;
             }
         }
+
+        /* The top-package check above only validates the package's own bin/
+         * ELFs; verify the FULL closure so a corrupt dependency (BRO-196:
+         * cross-linked/truncated store path left by a pre-fix kernel) is
+         * detected and force-refetched rather than silently breaking the app
+         * at runtime with a missing .so. */
+        if (verify_and_repair_closure(existing_store, top_hash) != 0)
+            return 1;
 
         /* Already in manifest. Re-link bins in case the profile/bin
          * symlinks are missing (e.g. wiped, or earlier link step never
@@ -893,6 +1045,13 @@ static int cmd_install(const char *name) {
             return 1;
         }
     }
+
+    /* After fetch (fresh or in-store), verify the entire closure and force a
+     * targeted re-fetch if any dependency is corrupt — nix-fetch --deps can
+     * leave a truncated/cross-linked dep behind (BRO-196) that would otherwise
+     * surface as a missing .so at runtime. */
+    if (verify_and_repair_closure(pkg.store_name, hash) != 0)
+        return 1;
 
     /* Create profile directories */
     mkdir_p(PROFILE_DIR);
