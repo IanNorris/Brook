@@ -306,7 +306,19 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
     // of va_list ABI issues or format buffer corruption.
     // Every line is prefixed with [CN] so interleaved output from multiple
     // CPUs is still parseable.
-    ExcForceSerialLock();
+    // BRO-198: only a genuine KERNEL panic may ExcForceSerialLock(), which
+    // PERMANENTLY sets g_panicInProgress (silencing every later SerialPrintf for
+    // the rest of the boot) and RESETS the serial ticket lock out from under any
+    // CPU spinning in SerialLockAcquire (which can then wedge -> watchdog panic).
+    // That is correct for a kernel panic — SmpHaltAllAPs already fired and the
+    // machine is going down. But a fatal USER fault kills only the faulting
+    // process; the kernel keeps running, so it must NOT poison the global serial
+    // state. The dump below is written with ExcPutsRaw (lock-free), so it still
+    // prints; the only cost of not silencing is that another CPU's concurrent
+    // SerialPrintf may interleave into this user-crash dump (cosmetic, and the
+    // [CN] line tags already account for interleaved multi-CPU output).
+    if ((frame->cs & 3) == 0)
+        ExcForceSerialLock();
     ExcPutsRaw("\n"); ExcPutsRaw(cpuTag); ExcPutsRaw("=== EXCEPTION ===\n");
     ExcPutsRaw(cpuTag); ExcPutsRaw("Vector: ");
     {
@@ -1220,7 +1232,10 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
     // vector the bad value happens to hit, so cover all three.
     if (vector == 13 || vector == 12 || vector == 14)
     {
-        ExcForceSerialLock();
+        // BRO-198: do NOT ExcForceSerialLock() here — this is the USER-fault
+        // dump and the kernel survives the fault. Permanently silencing serial /
+        // resetting the ticket lock for a recoverable user crash is the bug.
+        // The dump uses lock-free ExcPutsRaw and prints without it.
         ExcPutsRaw("\n[FAULT] User fault vec="); ExcPutHex(vector);
         ExcPutsRaw(" — full register dump:\n");
         ExcPutsRaw("  RIP "); ExcPutHex(ef->rip); ExcPutsRaw("\n");
