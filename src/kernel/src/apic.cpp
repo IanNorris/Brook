@@ -754,34 +754,96 @@ void ApicInitReschedIpi()
 // TLB Shootdown IPI — with deadlock detection diagnostics
 // ---------------------------------------------------------------------------
 //
-// Protocol:
-//   1. Initiator modifies PTE, does local invlpg
-//   2. Initiator acquires g_tlbRequest.lock (IF=0)
-//   3. Fills targetCr3, addr (0 = full flush), sets pendingCount
-//   4. Sends TLB_SHOOTDOWN_VECTOR IPI to each target CPU
-//   5. Spins waiting for pendingCount to reach 0, with TIMEOUT
-//   6. Releases lock
+// Protocol (BRO-192: monotonic-generation, ABA-free, deadlock-free):
+//   1. Initiator modifies PTE, does local invlpg/CR3 reload.
+//   2. Initiator acquires g_tlbRequest.lock via TlbLockAcquireServicing (IF=0)
+//      — while spinning for the lock it KEEPS SERVICING the in-flight request
+//      and the PMM-drain epoch, so a CPU spinning here can never wedge them.
+//   3. Fills {targetCr3, addr, targetMask}, then publishes a fresh monotonic
+//      `generation` LAST (release). Sends TLB_SHOOTDOWN_VECTOR IPI to each target.
+//   4. Waits until every target has published g_cpuTlbAckGen[i] >= generation
+//      (with a timeout that forgives CPUs not running targetCr3).
+//   5. Releases lock.
 //
-// Handler (naked ISR on target CPU):
-//   1. Compare current CR3 with g_tlbRequest.targetCr3
-//   2. If match: invlpg(addr) or CR3 reload (addr == 0)
-//   3. Decrement pendingCount
-//   4. EOI
+// Handler (naked ISR on target CPU) and the lock-spin self-service path BOTH
+// call the single helper TlbServiceLocal(): flush as the request dictates, then
+// publish g_cpuTlbAckGen[cpu] = generation.
 //
-// The handler must NOT acquire any lock — the initiator holds the spinlock
-// and waits synchronously, so any lock attempt would deadlock.
+// Why this is ABA-free: a CPU records the *generation* it serviced, not a bit in
+// a reused bitmap. A delayed/stale service from an older generation writes a
+// SMALLER value than any newer waiter requires, so it can never falsely satisfy a
+// republished request — the freed-while-mapped hazard the old reused-slot
+// pendingCount/ackBitmap scheme exposed (a forgive-then-republish window let a
+// late acker decrement the next generation's count). Monotonicity closes it.
+//
+// Why this is deadlock-free: the old scheme spun IF=0 in TlbShootdownWait while
+// holding the lock; a sibling thread of the SAME process (currentCr3==targetCr3)
+// that was itself spinning IF=0 to acquire this lock could never service the IPI
+// and was never forgiven → circular wait. Now the lock-acquire spin services the
+// in-flight request itself, so it always acks while it waits.
+//
+// The handler must NOT acquire any lock — the initiator holds the spinlock and
+// waits synchronously, so any lock attempt would deadlock.
 
 struct TlbShootdownRequest {
     IrqSpinLock     lock;             // Must be IrqSpinLock: initiator needs IF=0 during wait
-    volatile uint64_t pendingCount;   // decremented by each responder
     uint64_t        targetCr3;        // only invalidate if CPU's CR3 matches
     uint64_t        addr;             // page VA to invalidate (0 = full flush)
-    volatile uint64_t ackBitmap;      // bit set by each CPU on ack (diagnostic)
-    volatile uint32_t unconditional;  // BRO-179: 1 = every CPU does a full CR3 reload
-                                      // regardless of targetCr3 (quarantine drain barrier)
+    volatile uint64_t targetMask;     // CPUs that must service the current generation
+    volatile uint32_t unconditional;  // 1 = every CPU does a full CR3 reload regardless
+                                      // of targetCr3 (currently unused; epoch barrier
+                                      // handles the quarantine drain instead)
+    volatile uint64_t generation;     // monotonic; published LAST under lock (release)
 };
 
 static TlbShootdownRequest g_tlbRequest;
+
+// Per-CPU: the highest shootdown generation this CPU has serviced. Monotonic —
+// this is what makes the protocol ABA-free across the single reused request slot.
+static volatile uint64_t g_cpuTlbAckGen[MAX_CPUS] = {};
+
+// Service the in-flight per-AS shootdown for THIS cpu, if it is a pending target
+// of the current generation. Shared by the IPI handler and the lock-acquire spin.
+// Idempotent and safe at IF=0: touches only this CPU's TLB plus monotonic atomics
+// and takes no lock. A torn/stale field read at a generation boundary is harmless
+// (worst case: a redundant flush or a wrong invlpg address — never a missed flush
+// the waiter observes, because the ack records the generation actually seen).
+static inline void TlbServiceLocal(uint32_t cpu)
+{
+    if (cpu >= MAX_CPUS)
+        return;
+    uint64_t gen = __atomic_load_n(&g_tlbRequest.generation, __ATOMIC_ACQUIRE);
+    if (gen == 0)
+        return;
+    if (__atomic_load_n(&g_cpuTlbAckGen[cpu], __ATOMIC_ACQUIRE) >= gen)
+        return;
+    uint64_t tmask = __atomic_load_n(&g_tlbRequest.targetMask, __ATOMIC_ACQUIRE);
+    if (!(tmask & (1ULL << cpu)))
+        return;
+
+    uint64_t myCr3;
+    __asm__ volatile("movq %%cr3, %0" : "=r"(myCr3));
+    if (__atomic_load_n(&g_tlbRequest.unconditional, __ATOMIC_ACQUIRE))
+    {
+        __asm__ volatile("movq %0, %%cr3" :: "r"(myCr3) : "memory");
+    }
+    else if ((myCr3 & ~0xFFFULL) ==
+             (__atomic_load_n(&g_tlbRequest.targetCr3, __ATOMIC_ACQUIRE) & ~0xFFFULL))
+    {
+        uint64_t addr = __atomic_load_n(&g_tlbRequest.addr, __ATOMIC_ACQUIRE);
+        if (addr != 0)
+            __asm__ volatile("invlpg (%0)" :: "r"(addr) : "memory");
+        else
+            __asm__ volatile("movq %0, %%cr3" :: "r"(myCr3) : "memory");
+    }
+    // else: not running the target AS — a context switch already reloaded CR3
+    // (full flush), so no stale entries remain; just publish the ack below.
+
+    // Publish AFTER the flush. RELEASE so the flush is globally ordered before any
+    // waiter observes the ack. Monotonic max: never regress a newer ack.
+    if (gen > __atomic_load_n(&g_cpuTlbAckGen[cpu], __ATOMIC_RELAXED))
+        __atomic_store_n(&g_cpuTlbAckGen[cpu], gen, __ATOMIC_RELEASE);
+}
 
 // Timeout for the spin-wait: ~10ms at 2.5GHz ≈ 25M iterations of pause loop.
 // Each pause is ~10-100 cycles, so 500K iterations ≈ 5-50ms.
@@ -845,40 +907,11 @@ void TlbEpochFlushLocal()
 
 extern "C" void TlbShootdownHandlerInner()
 {
-    uint64_t myCr3;
-    __asm__ volatile("movq %%cr3, %0" : "=r"(myCr3));
-
-    // BRO-179 quarantine drain barrier: when unconditional is set, EVERY CPU
-    // must do a full TLB flush (CR3 reload) regardless of which address space it
-    // is running. The batch being drained holds frames that lived in many
-    // address spaces; a targeted-CR3 flush (the else-branch below) would "forgive"
-    // any CPU not on the target and leave its stale 4KiB entries live — exactly
-    // the freed-while-mapped corruption. No forgiveness here.
-    if (__atomic_load_n(&g_tlbRequest.unconditional, __ATOMIC_ACQUIRE))
-    {
-        __asm__ volatile("movq %0, %%cr3" :: "r"(myCr3) : "memory");
-    }
-    else if ((myCr3 & ~0xFFFULL) == (g_tlbRequest.targetCr3 & ~0xFFFULL))
-    {
-        if (g_tlbRequest.addr != 0)
-        {
-            // Single-page invalidation
-            __asm__ volatile("invlpg (%0)" :: "r"(g_tlbRequest.addr) : "memory");
-        }
-        else
-        {
-            // Full flush: reload CR3
-            __asm__ volatile("movq %0, %%cr3" :: "r"(myCr3) : "memory");
-        }
-    }
-
-    // Mark this CPU as acked (diagnostic bitmap).
+    // Single source of truth for "satisfy the in-flight shootdown for this CPU",
+    // shared with the lock-acquire self-service path (TlbLockAcquireServicing).
     uint32_t cpu;
     __asm__ volatile("movl %%gs:176, %0" : "=r"(cpu));
-    if (cpu < 64)
-        __atomic_fetch_or(&g_tlbRequest.ackBitmap, 1ULL << cpu, __ATOMIC_RELAXED);
-
-    __atomic_fetch_sub(&g_tlbRequest.pendingCount, 1, __ATOMIC_ACQ_REL);
+    TlbServiceLocal(cpu);
 
     LapicWrite(LapicReg::EOI, 0);
 }
@@ -966,20 +999,22 @@ static void ApicSendTlbShootdownIpi(uint32_t targetCpuIndex)
 // Retained for future use if graceful forgiveness is insufficient.
 [[noreturn, maybe_unused]]
 static void TlbShootdownTimeoutPanic(uint32_t myCpu, uint64_t targetMask,
-                                      uint64_t ackBitmap, uint64_t targetCr3,
+                                      uint64_t gen, uint64_t targetCr3,
                                       uint64_t addr)
 {
-    uint64_t pending = __atomic_load_n(&g_tlbRequest.pendingCount, __ATOMIC_ACQUIRE);
-    uint64_t notAcked = targetMask & ~ackBitmap;
+    uint32_t cpuCount = SmpGetCpuCount();
+    uint64_t notAcked = 0;
+    for (uint32_t i = 0; i < cpuCount; i++)
+        if ((targetMask & (1ULL << i)) &&
+            __atomic_load_n(&g_cpuTlbAckGen[i], __ATOMIC_ACQUIRE) < gen)
+            notAcked |= (1ULL << i);
 
     SerialPrintf("\n!!! TLB_SHOOTDOWN: TIMEOUT — deadlock detected !!!\n");
     SerialPrintf("  initiator: CPU %u\n", myCpu);
-    SerialPrintf("  targetCr3: 0x%lx  addr: 0x%lx\n", targetCr3, addr);
-    SerialPrintf("  pendingCount: %lu\n", pending);
-    SerialPrintf("  targetMask: 0x%lx  ackBitmap: 0x%lx\n", targetMask, ackBitmap);
+    SerialPrintf("  targetCr3: 0x%lx  addr: 0x%lx  generation: %lu\n", targetCr3, addr, gen);
+    SerialPrintf("  targetMask: 0x%lx  not-acked: 0x%lx\n", targetMask, notAcked);
     SerialPrintf("  not-acked CPUs (IF=0, holding lock?):\n");
 
-    uint32_t cpuCount = SmpGetCpuCount();
     for (uint32_t i = 0; i < cpuCount; i++)
     {
         if (!(notAcked & (1ULL << i))) continue;
@@ -997,85 +1032,103 @@ static void TlbShootdownTimeoutPanic(uint32_t myCpu, uint64_t targetMask,
         }
     }
 
-    SerialPrintf("  acked CPUs:\n");
-    for (uint32_t i = 0; i < cpuCount; i++)
-    {
-        if (!(ackBitmap & (1ULL << i))) continue;
-        SerialPrintf("    CPU %u: acked OK\n", i);
-    }
-
     // Halt all APs and panic
     SerialPrintf("KERNEL PANIC: TLB shootdown deadlock\n");
     SmpHaltAllAPs();
     while (true) __asm__ volatile("hlt");
 }
 
-// Common spin-wait with timeout and graceful retry.
-// If a CPU doesn't ack within the timeout, forgive it — but ONLY if it's
-// not running the target CR3. A CPU on a different CR3 will flush its TLB
-// naturally when it switches back. A CPU on the target CR3 with stale
-// entries is dangerous (e.g., stale writable entry after CoW fork), so
-// we keep waiting for those.
-static void TlbShootdownWait(uint32_t myCpu, uint64_t targetMask,
-                              uint64_t targetCr3, uint64_t addr)
+// Self-servicing acquire for g_tlbRequest.lock. It is a ticket lock (see
+// spinlock.h); while we spin IF=0 waiting for our turn we KEEP servicing the
+// in-flight shootdown and the PMM-drain epoch for THIS cpu. That is what breaks
+// the BRO-192 same-CR3 deadlock: a sibling thread spinning here still acks the
+// current holder's request (and advances the drain epoch) instead of wedging it.
+static uint64_t TlbLockAcquireServicing(uint32_t myCpu)
 {
-    uint64_t spins = 0;
-    while (__atomic_load_n(&g_tlbRequest.pendingCount, __ATOMIC_ACQUIRE) != 0)
+    uint64_t flags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+
+    uint32_t ticket = __atomic_fetch_add(&g_tlbRequest.lock.next, 1, __ATOMIC_RELAXED);
+    while (__atomic_load_n(&g_tlbRequest.lock.serving, __ATOMIC_ACQUIRE) != ticket)
     {
+        TlbServiceLocal(myCpu);     // ack the current holder's request if targeted
+        TlbEpochFlushLocal();       // keep the PMM-drain epoch advancing too
+        __asm__ volatile("pause" ::: "memory");
+    }
+
+    if (myCpu < 64)
+    {
+        g_lockDiag[myCpu].file = __FILE__;
+        g_lockDiag[myCpu].line = __LINE__;
+        __atomic_store_n(&g_lockDiag[myCpu].held, 1u, __ATOMIC_RELEASE);
+    }
+    return flags;
+}
+
+// Spin until every target CPU has published g_cpuTlbAckGen[i] >= gen. After a
+// timeout, forgive CPUs not running targetCr3 (a context switch reloads CR3 = a
+// full flush, so they hold no stale entries); CPUs still on targetCr3 MUST ack to
+// guarantee no stale writable entry survives (critical for CoW fork). Self-service
+// in the lock-acquire spin guarantees such CPUs eventually ack, so this no longer
+// livelocks. We also advance our own drain epoch while waiting IF=0.
+static void TlbShootdownWait(uint32_t myCpu, uint64_t targetMask,
+                              uint64_t targetCr3, uint64_t addr, uint64_t gen)
+{
+    uint32_t cpuCount = SmpGetCpuCount();
+    uint64_t forgivenMask = 0;
+    uint64_t spins = 0;
+    for (;;)
+    {
+        uint64_t remaining = 0;
+        for (uint32_t i = 0; i < cpuCount; i++)
+        {
+            if (i == myCpu || !(targetMask & (1ULL << i))) continue;
+            if (forgivenMask & (1ULL << i)) continue;
+            if (__atomic_load_n(&g_cpuTlbAckGen[i], __ATOMIC_ACQUIRE) < gen)
+                remaining |= (1ULL << i);
+        }
+        if (remaining == 0)
+            return;
+
+        TlbEpochFlushLocal();
         __asm__ volatile("pause" ::: "memory");
         if (++spins > TLB_SHOOTDOWN_TIMEOUT)
         {
-            uint64_t ackBitmap = __atomic_load_n(&g_tlbRequest.ackBitmap, __ATOMIC_ACQUIRE);
-            uint64_t notAcked = targetMask & ~ackBitmap;
-
-            // Only forgive CPUs that are NOT currently running the target
-            // CR3. Those CPUs will flush their TLB on the next context
-            // switch (CR3 reload). CPUs still on the target CR3 must ack
-            // to guarantee no stale writable entries remain (critical for
-            // CoW fork correctness).
             uint32_t forgiven = 0;
             uint32_t stillWaiting = 0;
-            uint32_t cpuCount = SmpGetCpuCount();
             for (uint32_t i = 0; i < cpuCount; i++)
             {
-                if (!(notAcked & (1ULL << i))) continue;
+                if (!(remaining & (1ULL << i))) continue;
 
-                // Read the CPU's current CR3 from per-CPU data.
                 const CpuInfo* info = SmpGetCpu(i);
                 uint64_t cpuCr3 = info ? __atomic_load_n(&info->currentCr3, __ATOMIC_ACQUIRE) : 0;
                 bool onTargetCr3 = cpuCr3 && ((cpuCr3 & ~0xFFFULL) == (targetCr3 & ~0xFFFULL));
 
                 if (!onTargetCr3)
                 {
-                    __atomic_fetch_sub(&g_tlbRequest.pendingCount, 1, __ATOMIC_ACQ_REL);
-                    __atomic_fetch_or(&g_tlbRequest.ackBitmap, 1ULL << i, __ATOMIC_RELAXED);
+                    forgivenMask |= (1ULL << i);
                     forgiven++;
                 }
                 else
                 {
+                    // Re-IPI in case the original shootdown IPI was lost; the CPU's
+                    // own lock-acquire self-service will also ack it.
+                    ApicSendTlbShootdownIpi(i);
                     stillWaiting++;
                 }
             }
 
-            if (forgiven > 0 && stillWaiting == 0)
+            if (stillWaiting == 0)
             {
-                if (!g_hotLogQuiet)
+                if (forgiven > 0 && !g_hotLogQuiet)
                     SerialPrintf("TLB_SHOOTDOWN: forgave %u CPU(s) (different CR3), cr3=0x%lx addr=0x%lx\n",
                                  forgiven, targetCr3, addr);
-                break;
+                return;
             }
-            else if (forgiven > 0 || stillWaiting > 0)
-            {
-                if (!g_hotLogQuiet)
-                    SerialPrintf("TLB_SHOOTDOWN: forgave %u, waiting for %u on target CR3=0x%lx\n",
-                                 forgiven, stillWaiting, targetCr3);
-                // Reset spin counter to keep waiting for CPUs on target CR3
-                spins = 0;
-            }
-            else
-            {
-                break;
-            }
+            if (!g_hotLogQuiet)
+                SerialPrintf("TLB_SHOOTDOWN: forgave %u, waiting for %u on target CR3=0x%lx\n",
+                             forgiven, stillWaiting, targetCr3);
+            spins = 0;
         }
     }
 }
@@ -1105,15 +1158,15 @@ void TlbShootdown(uint64_t targetCr3, uint64_t virtualAddr, uint64_t cpuMask)
     if (targetMask == 0)
         return;
 
-    uint32_t targetCount = __builtin_popcountll(targetMask);
-
-    uint64_t flags = IrqSpinLockAcquire(&g_tlbRequest.lock);
+    uint64_t flags = TlbLockAcquireServicing(myCpu);
 
     g_tlbRequest.targetCr3 = targetCr3;
     g_tlbRequest.addr      = virtualAddr;
     __atomic_store_n(&g_tlbRequest.unconditional, 0u, __ATOMIC_RELAXED);
-    __atomic_store_n(&g_tlbRequest.ackBitmap, 0ULL, __ATOMIC_RELAXED);
-    __atomic_store_n(&g_tlbRequest.pendingCount, targetCount, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_tlbRequest.targetMask, targetMask, __ATOMIC_RELAXED);
+    // Publish a fresh generation LAST (ACQ_REL = full fence on x86): orders all the
+    // field stores above before any target can observe the new generation.
+    uint64_t gen = __atomic_add_fetch(&g_tlbRequest.generation, 1, __ATOMIC_ACQ_REL);
 
     // Send IPI to each target
     for (uint32_t i = 0; i < cpuCount; i++)
@@ -1122,7 +1175,7 @@ void TlbShootdown(uint64_t targetCr3, uint64_t virtualAddr, uint64_t cpuMask)
             ApicSendTlbShootdownIpi(i);
     }
 
-    TlbShootdownWait(myCpu, targetMask, targetCr3, virtualAddr);
+    TlbShootdownWait(myCpu, targetMask, targetCr3, virtualAddr, gen);
 
     IrqSpinLockRelease(&g_tlbRequest.lock, flags);
 }
@@ -1154,15 +1207,13 @@ void TlbShootdownFull(uint64_t targetCr3, uint64_t cpuMask)
     if (targetMask == 0)
         return;
 
-    uint32_t targetCount = __builtin_popcountll(targetMask);
-
-    uint64_t flags = IrqSpinLockAcquire(&g_tlbRequest.lock);
+    uint64_t flags = TlbLockAcquireServicing(myCpu);
 
     g_tlbRequest.targetCr3 = targetCr3;
     g_tlbRequest.addr      = 0;  // 0 = full flush
     __atomic_store_n(&g_tlbRequest.unconditional, 0u, __ATOMIC_RELAXED);
-    __atomic_store_n(&g_tlbRequest.ackBitmap, 0ULL, __ATOMIC_RELAXED);
-    __atomic_store_n(&g_tlbRequest.pendingCount, targetCount, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_tlbRequest.targetMask, targetMask, __ATOMIC_RELAXED);
+    uint64_t gen = __atomic_add_fetch(&g_tlbRequest.generation, 1, __ATOMIC_ACQ_REL);
 
     for (uint32_t i = 0; i < cpuCount; i++)
     {
@@ -1170,7 +1221,7 @@ void TlbShootdownFull(uint64_t targetCr3, uint64_t cpuMask)
             ApicSendTlbShootdownIpi(i);
     }
 
-    TlbShootdownWait(myCpu, targetMask, targetCr3, 0);
+    TlbShootdownWait(myCpu, targetMask, targetCr3, 0, gen);
 
     IrqSpinLockRelease(&g_tlbRequest.lock, flags);
 }
