@@ -886,6 +886,12 @@ static constexpr uint64_t TLB_SHOOTDOWN_TIMEOUT = 10000000; // ~10ms at 1GHz loo
 static volatile uint64_t g_tlbEpoch = 0;
 static volatile uint64_t g_cpuFlushedEpoch[MAX_CPUS] = {};
 
+// BRO-179: set by TlbFlushAllCpusBarrier while it is NMI-escalating a stuck CPU.
+// Referenced (RIP-relative) by the naked NMI handler in smp.cpp: when a non-panic
+// NMI lands and this is set, the handler services this CPU's epoch flush (via
+// TlbNmiFlushRecord) instead of just returning. extern "C" so the asm can name it.
+extern "C" volatile uint8_t g_tlbNmiActive = 0;
+
 // Called at a safe point (IF=1) on each CPU — currently the LAPIC timer tick.
 // Cheap no-op when this CPU is already up to date with g_tlbEpoch.
 void TlbEpochFlushLocal()
@@ -903,6 +909,33 @@ void TlbEpochFlushLocal()
     // Publish AFTER the flush. The CR3 reload is architecturally serializing, so
     // the flush is globally ordered before this release store.
     __atomic_store_n(&g_cpuFlushedEpoch[cpu], target, __ATOMIC_RELEASE);
+}
+
+// BRO-179: NMI-context epoch flush. Called ONLY from the naked NMI handler asm
+// (smp.cpp) with the CPU index derived from the IST stack RSP — NOT from %gs,
+// because an NMI can land while a user-mode GS base is loaded. This is what makes
+// the epoch barrier ACTIVE: a CPU stuck in a long IF=0 region (e.g. spinning in
+// SerialLockAcquire, which holds cli across its whole critical section and so
+// never takes the timer tick that would call TlbEpochFlushLocal) is forced by the
+// NMI to flush and publish, so it can no longer starve the PMM-drain barrier.
+//
+// NMI-safety (must hold — a fault here would prematurely unmask NMI and corrupt
+// the shared IST stack): the whole translation unit is built -mgeneral-regs-only
+// -mno-sse and the kernel is -fno-stack-protector -mno-red-zone, so this touches
+// no XMM/TLS/canary; it only does a mov cr3 and an aligned atomic store to an
+// always-mapped static array, neither of which can fault. Idempotent: re-entry or
+// a racing timer-tick flush just re-stores the same monotone `target`.
+extern "C" void TlbNmiFlushRecord(uint64_t cpuIdx)
+{
+    if (cpuIdx >= MAX_CPUS)
+        return;
+    uint64_t target = __atomic_load_n(&g_tlbEpoch, __ATOMIC_ACQUIRE);
+    if (__atomic_load_n(&g_cpuFlushedEpoch[cpuIdx], __ATOMIC_RELAXED) >= target)
+        return;
+    uint64_t cr3;
+    __asm__ volatile("movq %%cr3, %0" : "=r"(cr3));
+    __asm__ volatile("movq %0, %%cr3" :: "r"(cr3) : "memory");
+    __atomic_store_n(&g_cpuFlushedEpoch[cpuIdx], target, __ATOMIC_RELEASE);
 }
 
 extern "C" void TlbShootdownHandlerInner()
@@ -1285,36 +1318,70 @@ void TlbFlushAllCpusBarrier()
         __atomic_store_n(&g_cpuFlushedEpoch[myCpu], target, __ATOMIC_RELEASE);
 
     // Wait, holding NO lock, until every other online CPU has flushed >= target.
-    // Each reaches its LAPIC timer tick (IF=1) within a bounded time of leaving
-    // any IF=0 section and runs TlbEpochFlushLocal(). Deadlock-free: we hold no
-    // lock, so no CPU can be blocked on us.
+    // A CPU normally reaches this passively: its LAPIC timer tick (IF=1) runs
+    // TlbEpochFlushLocal() within a bounded time of leaving any IF=0 section. But
+    // a CPU stuck in a LONG IF=0 region that never calls TlbEpochFlushLocal (e.g.
+    // spinning in SerialLockAcquire, which holds cli across its whole critical
+    // section) would never flush and would starve this barrier (BRO-179 timeout
+    // panic). So after a passive grace period we ESCALATE: send a targeted NMI to
+    // each still-missing CPU. The NMI is delivered even with IF=0 and, while
+    // g_tlbNmiActive is set, the handler runs TlbNmiFlushRecord() to flush+publish
+    // for that CPU. Deadlock-free: we hold no lock, so no CPU can be blocked on us.
+    static constexpr uint32_t BARRIER_MAX_NMI_ROUNDS = 12; // ~0.5s total budget
     uint64_t spins = 0;
+    uint32_t nmiRounds = 0;
+    bool nmiArmed = false;
     for (;;)
     {
-        bool allDone = true;
+        uint64_t missing = 0;
         for (uint32_t i = 0; i < cpuCount; i++)
         {
             if (i == myCpu || !(onlineMask & (1ULL << i))) continue;
             if (__atomic_load_n(&g_cpuFlushedEpoch[i], __ATOMIC_ACQUIRE) < target)
-            {
-                allDone = false;
-                break;
-            }
+                missing |= (1ULL << i);
         }
-        if (allDone)
+        if (missing == 0)
+        {
+            if (nmiArmed)
+                __atomic_store_n(&g_tlbNmiActive, 0u, __ATOMIC_RELEASE);
             return;
+        }
 
         __asm__ volatile("pause" ::: "memory");
-        if (++spins > TLB_SHOOTDOWN_TIMEOUT * 8)  // very generous; this MUST complete
+
+        // First escalation after a short passive grace (~10ms); each subsequent
+        // NMI round waits longer (~40ms) and re-sends, to ride out a CPU briefly
+        // trapped in an SMI (which masks NMI) before declaring a genuine wedge.
+        const uint64_t limit = (nmiRounds == 0)
+                                   ? TLB_SHOOTDOWN_TIMEOUT
+                                   : (TLB_SHOOTDOWN_TIMEOUT * 4);
+        if (++spins > limit)
         {
-            uint64_t missing = 0;
-            for (uint32_t i = 0; i < cpuCount; i++)
-                if (i != myCpu && (onlineMask & (1ULL << i)) &&
-                    __atomic_load_n(&g_cpuFlushedEpoch[i], __ATOMIC_ACQUIRE) < target)
-                    missing |= (1ULL << i);
+            if (nmiRounds < BARRIER_MAX_NMI_ROUNDS)
+            {
+                // Arm the NMI epoch-service path, then poke each stuck CPU. Re-read
+                // info->online so a genuinely parked AP is never targeted (it would
+                // never ack and falsely trip the wedge panic below).
+                __atomic_store_n(&g_tlbNmiActive, 1u, __ATOMIC_RELEASE);
+                nmiArmed = true;
+                for (uint32_t i = 0; i < cpuCount; i++)
+                {
+                    if (!(missing & (1ULL << i))) continue;
+                    const CpuInfo* info = SmpGetCpu(i);
+                    if (info && info->online)
+                        ApicSendNmi(info->apicId);
+                }
+                nmiRounds++;
+                spins = 0;
+                continue;
+            }
+            // NMI escalation exhausted: a CPU is genuinely wedged (or in an
+            // unbounded SMI). Refuse to release frames; fail loud.
+            __atomic_store_n(&g_tlbNmiActive, 0u, __ATOMIC_RELEASE);
             KernelPanic("BRO-179: TLB epoch barrier timeout — online=0x%lx missing=0x%lx "
-                        "target=%lu (a CPU never flushed; refusing to release frames "
-                        "unsafely)", onlineMask, missing, target);
+                        "target=%lu (a CPU never flushed even after %u NMI rounds; "
+                        "refusing to release frames unsafely)",
+                        onlineMask, missing, target, nmiRounds);
         }
     }
 }

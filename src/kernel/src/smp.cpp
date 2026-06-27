@@ -542,6 +542,13 @@ void SmpSetCurrentCr3(uint32_t cpuIndex, uint64_t cr3)
 // the naked asm handler (RIP-relative) to convert RSP → CPU index.
 extern "C" uint64_t g_nmiStackBase = 0;
 
+// BRO-179: defined in apic.cpp. The naked NMI asm references these (RIP-relative
+// flag check + call) on its non-panic path to service the active TLB epoch
+// barrier for a CPU that is stuck in a long IF=0 region. Declared here so the
+// inline-asm symbol references resolve at link time.
+extern "C" volatile uint8_t g_tlbNmiActive;
+extern "C" void TlbNmiFlushRecord(uint64_t cpuIdx);
+
 // C recorder called from the naked NMI asm. Plain integer stores only (no locks,
 // no SSE) so it is safe to call from NMI/IST context. Bounds-checked so a wild
 // index can never fault the handler (which would nest a fault on the IST stack).
@@ -561,7 +568,13 @@ __asm__(
     ".global PanicNmiHandlerAsm\n"
     "PanicNmiHandlerAsm:\n"
     "    cmpb $0, g_panicHaltActive(%rip)\n"
-    "    je .Lnmi_return\n"
+    "    jne .Lnmi_panic\n"
+    // Not a panic NMI. Is the TLB epoch barrier escalating (BRO-179)? If so,
+    // service this CPU's epoch flush; otherwise it is a spurious NMI — return.
+    "    cmpb $0, g_tlbNmiActive(%rip)\n"
+    "    jne .Lnmi_tlb\n"
+    "    iretq\n"
+    ".Lnmi_panic:\n"
     // --- panic path: never returns, free to clobber ---
     // CPU index = (RSP - g_nmiStackBase) >> 12  (IST NMI stack is per-CPU, 4096B).
     "    movq %rsp, %rax\n"
@@ -579,7 +592,44 @@ __asm__(
     "    cli\n"
     "    hlt\n"
     "    jmp .Lnmi_spin\n"
-    ".Lnmi_return:\n"
+    ".Lnmi_tlb:\n"
+    // --- BRO-179 epoch-service path: RETURNS, so it MUST preserve the interrupted
+    // context. NMI entry saves no GPRs, so save every caller-saved reg the C call
+    // may clobber, plus rbp (used below as the stack-realign anchor). The handler
+    // does only mov cr3 + an aligned atomic store to an always-mapped array; it
+    // cannot fault, so it cannot prematurely unmask NMI / re-enter the IST stack.
+    "    push %rax\n"
+    "    push %rcx\n"
+    "    push %rdx\n"
+    "    push %rsi\n"
+    "    push %rdi\n"
+    "    push %r8\n"
+    "    push %r9\n"
+    "    push %r10\n"
+    "    push %r11\n"
+    "    push %rbp\n"
+    // cpu index = ((entry RSP) - g_nmiStackBase) >> 12; entry RSP = current + 80
+    // (10 pushes * 8). Derive from the IST RSP, NOT %gs (NMI may land on user GS).
+    "    movq %rsp, %rax\n"
+    "    addq $80, %rax\n"
+    "    subq g_nmiStackBase(%rip), %rax\n"
+    "    shrq $12, %rax\n"
+    "    movq %rax, %rdi\n"             // arg1 = cpu index
+    "    movq %rsp, %rbp\n"             // anchor original rsp
+    "    andq $-16, %rsp\n"            // 16-byte align for the SysV call
+    "    cld\n"
+    "    call TlbNmiFlushRecord\n"
+    "    movq %rbp, %rsp\n"             // restore pre-align rsp
+    "    pop %rbp\n"
+    "    pop %r11\n"
+    "    pop %r10\n"
+    "    pop %r9\n"
+    "    pop %r8\n"
+    "    pop %rdi\n"
+    "    pop %rsi\n"
+    "    pop %rdx\n"
+    "    pop %rcx\n"
+    "    pop %rax\n"
     "    iretq\n"
 );
 extern "C" void PanicNmiHandlerAsm();
