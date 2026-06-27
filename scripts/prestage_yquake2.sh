@@ -106,29 +106,20 @@ if [ -f "${EXT2_IMG}" ]; then
         chown -R 1000:100 "${EXT2_MNT}/yq2"
         echo "  /data/yq2 (HOME) created on ${EXT2_IMG}, owned uid 1000:100"
 
-        # yquake2 (and the native software port) load the shared game data from
-        # /data/games/quake2/baseq2/pak0.pak (passed via -datadir). If it's
-        # missing, yquake2 starts but finds no maps ("data didn't load"). Stage
-        # it from BROOK_Q2_PAK (or the q2demo default) if absent — same source
-        # update_ext2_disk.sh uses.
+        # yquake2 reads the game data from the SAME path the native software
+        # Quake II port uses — /data/games/quake2/baseq2/pak0.pak — via -datadir
+        # in the wrapper. So the two SHARE one copy; nothing to duplicate or
+        # symlink. Just verify it's present (it's staged by update_ext2_disk.sh);
+        # if it's missing, point the user there rather than copying it here.
         Q2_PAK_DST="${EXT2_MNT}/games/quake2/baseq2/pak0.pak"
         if [ -f "${Q2_PAK_DST}" ]; then
-            echo "  game data present: /data/games/quake2/baseq2/pak0.pak ($(du -h "${Q2_PAK_DST}" | cut -f1))"
+            echo "  game data present (shared with native Quake II): /data/games/quake2/baseq2/pak0.pak ($(du -h "${Q2_PAK_DST}" | cut -f1))"
             DATA_OK=1
         else
-            Q2_PAK_SRC="${BROOK_Q2_PAK:-${ROOT_DIR}/../q2demo/Install/Data/baseq2/pak0.pak}"
-            if [ -f "${Q2_PAK_SRC}" ]; then
-                mkdir -p "${EXT2_MNT}/games/quake2/baseq2"
-                cp "${Q2_PAK_SRC}" "${Q2_PAK_DST}"
-                chown -R 1000:100 "${EXT2_MNT}/games/quake2"
-                echo "  staged game data: ${Q2_PAK_SRC} -> /data/games/quake2/baseq2/pak0.pak"
-                DATA_OK=1
-            else
-                echo "  WARNING: /data/games/quake2/baseq2/pak0.pak is MISSING and no source" >&2
-                echo "           pak found at ${Q2_PAK_SRC}. yquake2 will start but load no" >&2
-                echo "           maps. Set BROOK_Q2_PAK=/path/to/baseq2/pak0.pak and re-run," >&2
-                echo "           or run ./scripts/update_ext2_disk.sh to stage Quake II data." >&2
-            fi
+            echo "  WARNING: /data/games/quake2/baseq2/pak0.pak is MISSING." >&2
+            echo "           yquake2 shares the native Quake II data via -datadir; stage it with:" >&2
+            echo "             ./scripts/update_ext2_disk.sh           # (BROOK_Q2_PAK=/path/to/pak0.pak to override)" >&2
+            echo "           If the native software Quake II loads on this disk, yquake2 will too." >&2
         fi
 
         sync
