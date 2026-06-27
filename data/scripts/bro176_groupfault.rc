@@ -1,0 +1,9 @@
+# bro176_groupfault.rc — BRO-176 reap-stall regression test.
+# crash_test groupfault forks a child that becomes a thread-group leader with
+# 4 live sibling threads blocked in futex waits, then the leader #PFs. The
+# parent waitpid()s the child. With the fatal-fault-group-fatal fix the child's
+# group is torn down and reaped, so the parent prints:
+#     BRO176-PARENT-REAPED-CHILD child=.. ret=.. status=..
+# Without the fix the parent's waitpid() hangs forever (reap-stall) and that
+# marker never appears.
+run /boot/BIN/CRASH_TEST groupfault

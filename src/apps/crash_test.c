@@ -3,6 +3,7 @@
  * Build: musl-gcc -static -o crash_test crash_test.c
  * Usage: crash_test <mode>
  *   null       — dereference NULL pointer (SIGSEGV / #PF)
+ *   groupfault — spawn blocked sibling threads, then leader #PFs (BRO-176)
  *   divzero    — integer divide by zero (#DE)
  *   stackoverflow — infinite recursion (stack overflow → #PF)
  *   gpf        — execute privileged instruction from userspace (#GP)
@@ -16,8 +17,82 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <unistd.h>
+#include <sys/wait.h>
 
 static volatile int g_sink;
+
+/* BRO-176 repro: a fatal user fault in a thread-group LEADER that still has
+ * live sibling threads must be group-fatal (tear the whole group down), not
+ * leave the leader a permanent zombie waiting on siblings that never exit.
+ *
+ * We fork a child that becomes a thread-group leader: it spawns N siblings that
+ * block forever in a futex wait (pthread_mutex_lock on a mutex the child holds),
+ * waits until they are all blocked, then deliberately #PFs. The PARENT waitpid()s
+ * the child. Expected with the fix: the child's whole group is torn down, the
+ * leader becomes a reapable zombie, waitpid() returns, and we print the marker
+ * below. Without the fix: asLiveThreads never drains to 0, the child-leader is
+ * never reapable, the parent's waitpid() hangs forever (reap-stall) and the
+ * marker never appears. The marker line in the serial log is the PASS signal. */
+#define GROUPFAULT_NTHREADS 4
+static pthread_mutex_t g_blockMutex = PTHREAD_MUTEX_INITIALIZER;
+static atomic_int g_blockedCount;
+
+__attribute__((noinline))
+static void *groupfault_sibling(void *arg) {
+    (void)arg;
+    atomic_fetch_add(&g_blockedCount, 1);
+    /* Blocks forever: the leader holds g_blockMutex and never releases it. */
+    pthread_mutex_lock(&g_blockMutex);
+    pthread_mutex_unlock(&g_blockMutex);
+    return NULL;
+}
+
+__attribute__((noinline))
+static void crash_groupfault(void) {
+    pid_t child = fork();
+    if (child == 0) {
+        /* CHILD: thread-group leader that will fault with live siblings. */
+        pthread_mutex_lock(&g_blockMutex);   /* held forever; siblings block */
+        pthread_t th[GROUPFAULT_NTHREADS];
+        for (int i = 0; i < GROUPFAULT_NTHREADS; i++)
+            pthread_create(&th[i], NULL, groupfault_sibling, NULL);
+
+        /* Wait until every sibling has reached its blocking mutex_lock. */
+        while (atomic_load(&g_blockedCount) < GROUPFAULT_NTHREADS) { /* spin */ }
+        /* Let the last sibling actually enter the futex wait (it bumped the
+         * counter immediately before the lock call). */
+        for (volatile uint64_t i = 0; i < 50000000ULL; i++) { /* settle */ }
+
+        printf("crash_groupfault: child %d, %d siblings blocked, leader faulting\n",
+               (int)getpid(), GROUPFAULT_NTHREADS);
+        volatile int *p = (volatile int *)0;   /* leader #PF with live siblings */
+        g_sink = *p;
+        _exit(99);   /* never reached */
+    }
+
+    /* PARENT: this returns only if the faulting child-group gets reaped. */
+    int status = 0;
+    pid_t r = waitpid(child, &status, 0);
+
+    /* Bulletproof reporting. qemu block-buffers -serial output to a file, so a
+     * single trailing line can be lost; emit a durable disk file AND a long
+     * keep-alive stream so the marker is guaranteed to flush to the host. If the
+     * reap-stall bug is present, waitpid() never returns and NONE of this runs. */
+    printf("BRO176-PARENT-REAPED-CHILD child=%d ret=%d status=0x%x\n",
+           (int)child, (int)r, status);
+    FILE *f = fopen("/data/bro176_result.txt", "w");
+    if (f) {
+        fprintf(f, "REAPED child=%d ret=%d status=0x%x\n", (int)child, (int)r, status);
+        fclose(f);
+    }
+    for (int i = 0; i < 200; i++) {
+        printf("BRO176-ALIVE-%d reaped-child=%d\n", i, (int)child);
+        for (volatile uint64_t k = 0; k < 8000000ULL; k++) { /* pace */ }
+    }
+}
 
 __attribute__((noinline))
 static void crash_null_deref(void) {
@@ -90,6 +165,7 @@ struct crash_mode {
 
 static const struct crash_mode modes[] = {
     { "null",         crash_null_deref,   "NULL pointer dereference (#PF)" },
+    { "groupfault",   crash_groupfault,   "Leader #PF with live sibling threads (BRO-176)" },
     { "divzero",      crash_div_zero,     "Integer divide by zero (#DE)" },
     { "stackoverflow",crash_stackoverflow,"Stack overflow via recursion (#PF)" },
     { "gpf",          crash_gpf,          "Privileged instruction from user (#GP)" },
