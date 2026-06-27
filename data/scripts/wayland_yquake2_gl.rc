@@ -1,0 +1,9 @@
+# Brook + Yamagi Quake II, OpenGL 1.x renderer (gl1) on the virgl GL stack.
+# Mirrors the other wayland app launch scripts (set vfb none + waylandd), then
+# runs /nix/yquake2-play.sh which injects the Brook virgl env and points basedir
+# at the shared baseq2 data. Requires the GPU compositor:
+# boot with BROOK_GPU=gl BROOK_COMPOSITE=gpu.
+set wm
+set vfb none
+run --once /nix/bin/waylandd
+run /nix/yquake2-play.sh gl1

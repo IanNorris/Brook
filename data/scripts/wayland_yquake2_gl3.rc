@@ -1,0 +1,7 @@
+# Brook + Yamagi Quake II, modern OpenGL 3.2 core renderer (gl3) on the virgl GL
+# stack — the shader pipeline. Requires the GPU compositor:
+# boot with BROOK_GPU=gl BROOK_COMPOSITE=gpu.
+set wm
+set vfb none
+run --once /nix/bin/waylandd
+run /nix/yquake2-play.sh gl3

@@ -43,15 +43,23 @@ renderer/game `.so`s) is fetched over TCP. Mesa (`mesa-26.0.6`) is already on th
 nix disk from the STK/gltron installs and is reused for the `virtio_gpu` DRI
 driver. Blocked by BRO-200 until guest DNS is fixed.
 
-### Run (needs GPU mode)
+### Run — from the desktop launcher (recommended, matches the normal flow)
 
-Boot with `BROOK_GPU=gl BROOK_COMPOSITE=gpu`, then:
+Boot your usual desktop (`wm` / `desktop`) with the GPU compositor:
 
-    --script yquake2_gl      # GL1 renderer  (data/scripts/yquake2_gl.rc)
-    --script yquake2_gl3     # GL3 renderer  (data/scripts/yquake2_gl3.rc)
+    BROOK_GPU=gl BROOK_GPU_DISPLAY=sdl BROOK_COMPOSITE=gpu ./scripts/run-qemu.sh --release --script desktop
 
-The native software Quake 2 stays available via `--script quake2`
-(`data/scripts/quake2.rc`) for a side-by-side comparison.
+then click **Quake II GL** (gl1) or **Quake II GL3** in the Apps launcher. These
+are normal launcher shortcuts (`data/shortcuts/yquake2.rc` / `yquake2_gl3.rc`)
+that `source` the Wayland launch scripts (`data/scripts/wayland_yquake2_gl.rc` /
+`wayland_yquake2_gl3.rc`) — same two-file convention as VLC/GIMP, including
+`set vfb none`. The native software **Quake II** launcher entry stays available
+for the side-by-side comparison.
+
+### Run — from a boot script (headless / scripted)
+
+    BROOK_GPU=gl BROOK_GPU_DISPLAY=sdl BROOK_COMPOSITE=gpu ./scripts/run-qemu.sh --release --script wayland_yquake2_gl
+    # or wayland_yquake2_gl3 for the shader path
 
 ### Notes / status
 

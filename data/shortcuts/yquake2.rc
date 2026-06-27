@@ -1,0 +1,3 @@
+# title: Quake II GL
+# desc: Yamagi Quake II (OpenGL gl1)
+source /boot/SCRIPTS/wayland_yquake2_gl.rc

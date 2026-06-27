@@ -1,0 +1,3 @@
+# title: Quake II GL3
+# desc: Yamagi Quake II (OpenGL gl3 shaders)
+source /boot/SCRIPTS/wayland_yquake2_gl3.rc
