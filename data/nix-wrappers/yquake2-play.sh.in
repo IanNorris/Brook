@@ -31,6 +31,14 @@ export SDL_AUDIODRIVER=dummy
 export HOME=/data/yq2
 mkdir -p /data/yq2/.yq2
 
+# Library search path for libs yquake2 dlopen()s by bare soname that aren't on
+# its rpath — notably libopenal.so.1 (OpenAL backend). @YQUAKE2_LIBDIRS@ is filled
+# in by prestage_yquake2.sh with the openal-soft lib dir (+ the renderer dir as a
+# belt-and-suspenders fallback). The GL renderers are found relative to the
+# binary (see the exec note below); the GL libs themselves are on the renderer
+# .so's own rpath (glvnd), so no extra path is needed for them.
+export LD_LIBRARY_PATH="@YQUAKE2_LIBDIRS@${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+
 # First positional arg selects the renderer (default gl1); the rest pass through.
 # `case`/`shift` are builtins — no subshell, no fork (unlike $(command -v ...)).
 RENDERER="gl1"
@@ -38,12 +46,18 @@ case "${1:-}" in
     gl1|gl3|gles3|soft) RENDERER="$1"; shift ;;
 esac
 
-# @YQUAKE2_BIN@ is replaced by the absolute store path by prestage_yquake2.sh.
+# @YQUAKE2_BIN@ is replaced by prestage_yquake2.sh with the RESOLVED real binary
+# path (lib/yquake2/quake2), NOT the bin/yquake2 symlink. yquake2 finds its
+# renderer .so's (ref_gl1.so etc.) relative to its own location, which it derives
+# from /proc/self/exe -> the process exePath. Brook reports exePath as the path
+# that was exec'd; if we exec'd the bin/ symlink, exePath would be .../bin/yquake2
+# and yquake2 would look for renderers in bin/ (where they are NOT — they live in
+# lib/yquake2/ next to the real binary), failing with "Library ref_gl1.so cannot
+# be found!". Exec'ing the real path makes binarydir = lib/yquake2/ so the
+# renderers are found.
 # -datadir points at the shared baseq2 data (yquake2 deprecates +set basedir);
-# vid_renderer selects GL vs software. al_driver is forced to a BARE soname:
-# nixpkgs bakes an absolute /nix/store/.../libopenal.so.1 into the binary's
-# default, which yquake2 rejects ("al_driver must not contain '/'"); audio is the
-# SDL dummy backend here anyway (ALSOFT_DRIVERS=null), so this just silences the
-# spurious OpenAL-init error.
+# vid_renderer selects GL vs software. al_driver is forced to a BARE soname
+# (libopenal.so.1, now on LD_LIBRARY_PATH above) instead of the absolute store
+# path nixpkgs bakes in (yquake2 rejects al_driver containing '/').
 exec @YQUAKE2_BIN@ -datadir /data/games/quake2 \
     +set al_driver libopenal.so.1 +set vid_renderer "$RENDERER" "$@"

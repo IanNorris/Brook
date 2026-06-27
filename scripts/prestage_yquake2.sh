@@ -83,12 +83,32 @@ if [ ! -f "${TEMPLATE}" ]; then
     echo "ERROR: wrapper template not found: ${TEMPLATE}" >&2
     exit 1
 fi
+
+# Resolve the REAL binary path (lib/yquake2/quake2), not the bin/yquake2 symlink:
+# yquake2 locates its renderer .so's relative to /proc/self/exe, which Brook
+# reports as the exec'd path. Exec'ing the symlink would make it look for
+# renderers in bin/ (they live in lib/yquake2/). Map the host store path back to
+# the guest /nix/store path for the wrapper.
+YQ2_REAL_HOST="$(readlink -f "${YQ2_OUT}/bin/yquake2")"          # /nix/store/<base>/lib/yquake2/quake2 (host)
+YQ2_REAL_GUEST="/nix/store/${YQ2_BASE}/${YQ2_REAL_HOST#"${YQ2_OUT}/"}"
+[ "${YQ2_REAL_GUEST}" = "/nix/store/${YQ2_BASE}/" ] && YQ2_REAL_GUEST="/nix/store/${YQ2_BASE}/lib/yquake2/quake2"
+
+# Lib dirs for bare-soname dlopen()s not on the binary's rpath: the openal-soft
+# lib (for the OpenAL backend) plus the renderer dir as a fallback. Resolve
+# openal-soft from the realised closure so we never hardcode a stale hash.
+OPENAL_OUT="$(nix-store -qR "${YQ2_OUT}" 2>/dev/null | grep -E 'openal-soft' | head -1)"
+LIBDIRS="/nix/store/${YQ2_BASE}/lib/yquake2"
+[ -n "${OPENAL_OUT}" ] && LIBDIRS="/nix/store/$(basename "${OPENAL_OUT}")/lib:${LIBDIRS}"
+
 WRAPPER_TMP="$(mktemp)"
-sed "s#@YQUAKE2_BIN@#/nix/store/${YQ2_BASE}/bin/yquake2#g" "${TEMPLATE}" > "${WRAPPER_TMP}"
+sed -e "s#@YQUAKE2_BIN@#${YQ2_REAL_GUEST}#g" \
+    -e "s#@YQUAKE2_LIBDIRS@#${LIBDIRS}#g" \
+    "${TEMPLATE}" > "${WRAPPER_TMP}"
 cp "${WRAPPER_TMP}" "${MNTDIR}/yquake2-play.sh"
 chmod 0755 "${MNTDIR}/yquake2-play.sh"
 rm -f "${WRAPPER_TMP}"
-echo "  /nix/yquake2-play.sh -> exec /nix/store/${YQ2_BASE}/bin/yquake2"
+echo "  /nix/yquake2-play.sh -> exec ${YQ2_REAL_GUEST}"
+echo "  LD_LIBRARY_PATH = ${LIBDIRS}"
 
 sync
 
