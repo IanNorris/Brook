@@ -7,6 +7,13 @@ audio backend, and a writable `HOME`, then execs the app. They are staged on the
 **nix disk** at `/nix/<name>-play.sh` (the same place `stk-play.sh` /
 `gltron-play.sh` live), not on the boot FAT disk.
 
+**Important (Brook bash quirk):** these wrappers must `exec` an **absolute store
+path** and must NOT use a `$(command -v ...)` / `` `...` `` command
+substitution. On Brook a command-substitution subshell re-execs bash and fails
+with `cannot execute binary file` (exit 126). `stk-play.sh` / `gltron-play.sh`
+hardcode the absolute path; the yquake2 wrapper is generated the same way (see
+below).
+
 ## yquake2 (Yamagi Quake II) — GL renderer for Quake 2
 
 Quake 2 already runs on Brook via the original **id software renderer**
@@ -15,9 +22,12 @@ renderers (`gl1`, `gl3`, `gles3`) plus its own software renderer, selectable at
 runtime via the `vid_renderer` cvar — so software and GL can be compared on the
 **same** game data.
 
-`yquake2-play.sh` points `basedir` at `/data/games/quake2`, which is the shared
-`baseq2/pak0.pak` the native software port already uses, so both renderers run
-identical assets. The first arg selects the renderer (`gl1` default, or
+The wrapper (`/nix/yquake2-play.sh`) is **generated** by
+`scripts/prestage_yquake2.sh` from the template
+`data/nix-wrappers/yquake2-play.sh.in`, baking in the absolute yquake2 store path
+(no command substitution). It points `basedir` at `/data/games/quake2`, the
+shared `baseq2/pak0.pak` the native software port already uses, so both renderers
+run identical assets. The first arg selects the renderer (`gl1` default, or
 `gl3` / `gles3` / `soft`).
 
 ### Install — Option A: offline pre-stage (recommended while BRO-200 is open)

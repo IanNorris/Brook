@@ -73,7 +73,24 @@ for binname in yquake2 yq2ded; do
     fi
 done
 
+# Generate /nix/yquake2-play.sh from the template, baking in the ABSOLUTE store
+# path of the binary we just staged. This mirrors how nix-install generates
+# stk-play.sh: the wrapper execs an absolute path directly. Critically it avoids
+# any $(command -v ...) command substitution, which on Brook forks a bash
+# subshell that re-execs bash and fails ("cannot execute binary file", exit 126).
+TEMPLATE="${ROOT_DIR}/data/nix-wrappers/yquake2-play.sh.in"
+if [ ! -f "${TEMPLATE}" ]; then
+    echo "ERROR: wrapper template not found: ${TEMPLATE}" >&2
+    exit 1
+fi
+WRAPPER_TMP="$(mktemp)"
+sed "s#@YQUAKE2_BIN@#/nix/store/${YQ2_BASE}/bin/yquake2#g" "${TEMPLATE}" > "${WRAPPER_TMP}"
+cp "${WRAPPER_TMP}" "${MNTDIR}/yquake2-play.sh"
+chmod 0755 "${MNTDIR}/yquake2-play.sh"
+rm -f "${WRAPPER_TMP}"
+echo "  /nix/yquake2-play.sh -> exec /nix/store/${YQ2_BASE}/bin/yquake2"
+
 sync
 echo "Done. yquake2 staged into ${DISK_IMG}."
 echo "Run it with the GPU compositor:"
-echo "  BROOK_GPU=gl BROOK_GPU_DISPLAY=sdl BROOK_COMPOSITE=gpu ./scripts/run-qemu.sh --release --script yquake2_gl"
+echo "  BROOK_GPU=gl BROOK_GPU_DISPLAY=sdl BROOK_COMPOSITE=gpu ./scripts/run-qemu.sh --release --script wayland_yquake2_gl"

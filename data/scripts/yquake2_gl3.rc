@@ -1,6 +1,0 @@
-# Launch yquake2 with the modern OpenGL 3.2 core renderer (gl3) on Brook's virgl
-# GL stack — shader pipeline, the heavier GL path. Requires the GPU compositor:
-# boot with BROOK_GPU=gl BROOK_COMPOSITE=gpu.
-set wm
-run --once /nix/bin/waylandd
-run /nix/yquake2-play.sh gl3
