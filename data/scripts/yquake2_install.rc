@@ -1,0 +1,7 @@
+# Brook OS — nix-install Yamagi Quake II (yquake2 8.60: GL1/GL3/GLES3/soft).
+# Pulls the closure (SDL2 + glvnd + game/renderer .so) to /nix over TCP. The GL
+# renderers run on Brook's virgl stack, sharing the existing baseq2 game data
+# (/data/games/quake2/baseq2/pak0.pak) with the native software Quake II port,
+# so the two can be compared on identical assets. Requires GPU mode:
+# boot with BROOK_GPU=gl BROOK_COMPOSITE=gpu.
+run /nix/bin/nix-install yquake2

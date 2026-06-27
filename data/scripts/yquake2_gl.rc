@@ -1,0 +1,8 @@
+# Launch yquake2 with the OpenGL 1.x renderer (gl1) on Brook's virgl GL stack.
+# /nix/yquake2-play.sh injects the Brook virgl env + dummy audio + writable HOME
+# and points basedir at the shared baseq2 data. Requires the GPU compositor:
+# boot with BROOK_GPU=gl BROOK_COMPOSITE=gpu. (Software Quake II stays available
+# via quake2.rc for side-by-side comparison.)
+set wm
+run --once /nix/bin/waylandd
+run /nix/yquake2-play.sh gl1
