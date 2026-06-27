@@ -20,7 +20,20 @@ runtime via the `vid_renderer` cvar — so software and GL can be compared on th
 identical assets. The first arg selects the renderer (`gl1` default, or
 `gl3` / `gles3` / `soft`).
 
-### One-time install (needs working guest networking)
+### Install — Option A: offline pre-stage (recommended while BRO-200 is open)
+
+`nix-install yquake2` currently fails at DNS resolution (BRO-200: a recent guest
+DNS regression — curl can't resolve `cache.nixos.org` for any *uncached*
+package). Until that's fixed, stage the closure directly from the host:
+
+    nix-shell --run ./scripts/prestage_yquake2.sh
+
+This realises `nixpkgs#yquake2` on the host (working DNS), fuse2fs-mounts the nix
+disk, copies only the missing closure store paths (~12 paths / ~60 MB; the rest
+is shared with the STK/gltron installs), and creates `/nix/profile/bin/yquake2`.
+No guest networking needed afterwards.
+
+### Install — Option B: in-guest nix-install (needs working guest DNS)
 
     set wm
     run /nix/bin/nix-install yquake2          # or: --script yquake2_install
@@ -28,7 +41,7 @@ identical assets. The first arg selects the renderer (`gl1` default, or
 `yquake2` 8.60 is in Brook's package index; the closure (SDL2 + glvnd + the
 renderer/game `.so`s) is fetched over TCP. Mesa (`mesa-26.0.6`) is already on the
 nix disk from the STK/gltron installs and is reused for the `virtio_gpu` DRI
-driver.
+driver. Blocked by BRO-200 until guest DNS is fixed.
 
 ### Run (needs GPU mode)
 
@@ -48,6 +61,8 @@ The native software Quake 2 stays available via `--script quake2`
 * `yquake2` dlopen()s its renderer `.so` from its own `lib/yquake2/` dir; no extra
   `LD_LIBRARY_PATH` is needed for the renderer itself, only the virgl DRI env.
 * Verified so far: `nix-install yquake2` correctly resolves `yquake2 8.60` and
-  begins fetching its closure. Completing the install + a live GL run needs a host
-  with working guest networking and a GPU render node (e.g. Khione); the agent
-  sandbox blocks the guest's outbound DNS so the download can't finish there.
+  begins fetching its closure, but the fetch fails at guest DNS resolution
+  (BRO-200, a recent regression — any uncached package is affected). The offline
+  `scripts/prestage_yquake2.sh` path works around this and has been verified to
+  stage the binary + all four renderers (`ref_gl1/gl3/gles3/soft.so`) onto the
+  nix disk. A live GL run needs a host with a GPU render node (e.g. Khione).
