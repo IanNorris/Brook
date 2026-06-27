@@ -122,9 +122,9 @@ DATA_OK=0
 if [ -f "${EXT2_IMG}" ]; then
     EXT2_MNT="$(mktemp -d)"
     if fuse2fs -o rw,fakeroot "${EXT2_IMG}" "${EXT2_MNT}" 2>/dev/null; then
-        mkdir -p "${EXT2_MNT}/yq2/.yq2"
+        mkdir -p "${EXT2_MNT}/yq2/.yq2/baseq2"
         chown -R 1000:100 "${EXT2_MNT}/yq2"
-        echo "  /data/yq2 (HOME) created on ${EXT2_IMG}, owned uid 1000:100"
+        echo "  /data/yq2 (HOME) + .yq2/baseq2 created on ${EXT2_IMG}, owned uid 1000:100"
 
         # yquake2 reads the game data from the SAME path the native software
         # Quake II port uses — /data/games/quake2/baseq2/pak0.pak — via -datadir
