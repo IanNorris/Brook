@@ -98,14 +98,41 @@ sync
 # yquake2 dies with "Couldn't create dir /data/yq2/.yq2/". Precedent: /data/tmp
 # is uid 1000:100 too. fuse2fs fakeroot lets us chown without privilege.
 EXT2_IMG="${BROOK_EXT2_DISK:-${ROOT_DIR}/brook_ext2_disk.img}"
+DATA_OK=0
 if [ -f "${EXT2_IMG}" ]; then
     EXT2_MNT="$(mktemp -d)"
     if fuse2fs -o rw,fakeroot "${EXT2_IMG}" "${EXT2_MNT}" 2>/dev/null; then
         mkdir -p "${EXT2_MNT}/yq2/.yq2"
         chown -R 1000:100 "${EXT2_MNT}/yq2"
+        echo "  /data/yq2 (HOME) created on ${EXT2_IMG}, owned uid 1000:100"
+
+        # yquake2 (and the native software port) load the shared game data from
+        # /data/games/quake2/baseq2/pak0.pak (passed via -datadir). If it's
+        # missing, yquake2 starts but finds no maps ("data didn't load"). Stage
+        # it from BROOK_Q2_PAK (or the q2demo default) if absent — same source
+        # update_ext2_disk.sh uses.
+        Q2_PAK_DST="${EXT2_MNT}/games/quake2/baseq2/pak0.pak"
+        if [ -f "${Q2_PAK_DST}" ]; then
+            echo "  game data present: /data/games/quake2/baseq2/pak0.pak ($(du -h "${Q2_PAK_DST}" | cut -f1))"
+            DATA_OK=1
+        else
+            Q2_PAK_SRC="${BROOK_Q2_PAK:-${ROOT_DIR}/../q2demo/Install/Data/baseq2/pak0.pak}"
+            if [ -f "${Q2_PAK_SRC}" ]; then
+                mkdir -p "${EXT2_MNT}/games/quake2/baseq2"
+                cp "${Q2_PAK_SRC}" "${Q2_PAK_DST}"
+                chown -R 1000:100 "${EXT2_MNT}/games/quake2"
+                echo "  staged game data: ${Q2_PAK_SRC} -> /data/games/quake2/baseq2/pak0.pak"
+                DATA_OK=1
+            else
+                echo "  WARNING: /data/games/quake2/baseq2/pak0.pak is MISSING and no source" >&2
+                echo "           pak found at ${Q2_PAK_SRC}. yquake2 will start but load no" >&2
+                echo "           maps. Set BROOK_Q2_PAK=/path/to/baseq2/pak0.pak and re-run," >&2
+                echo "           or run ./scripts/update_ext2_disk.sh to stage Quake II data." >&2
+            fi
+        fi
+
         sync
         fusermount -u "${EXT2_MNT}" 2>/dev/null || fusermount -uz "${EXT2_MNT}" 2>/dev/null || true
-        echo "  /data/yq2 (HOME) created on ${EXT2_IMG}, owned uid 1000:100"
     else
         echo "  WARNING: could not mount ${EXT2_IMG}; create /data/yq2 (uid 1000) manually." >&2
     fi
@@ -115,5 +142,6 @@ else
 fi
 
 echo "Done. yquake2 staged into ${DISK_IMG}."
+[ "${DATA_OK}" = "1" ] || echo "  (!) Game data not confirmed — see the warning above before launching."
 echo "Run it with the GPU compositor:"
 echo "  BROOK_GPU=gl BROOK_GPU_DISPLAY=sdl BROOK_COMPOSITE=gpu ./scripts/run-qemu.sh --release --script wayland_yquake2_gl"
