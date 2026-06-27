@@ -1,0 +1,9 @@
+# Brook + Yamagi Quake II, SOFTWARE renderer (ref_soft) on wayland/wl_shm.
+# Diagnostic: the soft renderer uses wl_shm (no EGL/dmabuf), so if THIS works but
+# gl1/gl3 don't, the blocker is the GL/EGL wayland path (e.g. a missing
+# zwp_linux_dmabuf_v1 global), not wayland init in general. Requires waylandd
+# (no GPU needed for soft). Boot: --script wayland_yquake2_soft.
+set wm
+set vfb none
+run --once /nix/bin/waylandd
+run --uid 1000 /nix/yquake2-play.sh soft

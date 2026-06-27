@@ -1,0 +1,3 @@
+# title: Quake II SW
+# desc: Yamagi Quake II (software renderer / wl_shm)
+source /boot/SCRIPTS/wayland_yquake2_soft.rc
