@@ -59,5 +59,12 @@ esac
 # vid_renderer selects GL vs software. al_driver is forced to a BARE soname
 # (libopenal.so.1, now on LD_LIBRARY_PATH above) instead of the absolute store
 # path nixpkgs bakes in (yquake2 rejects al_driver containing '/').
+# +set logfile 2 forces yquake2 to write a FLUSHED qconsole.log (value 2 =
+# fflush every line) under $HOME/.yq2/baseq2/. This is a diagnostic: yquake2
+# exits right after creating its wayland window and its Sys_Error message is in
+# the block-buffered serial tail that is lost when the process exits, so the
+# serial console never shows WHY. With a per-line-flushed logfile the exit
+# reason survives the crash. ext2 write-persistence on /data is verified working
+# (a plain echo>file;cat round-trips), so the log will actually contain data.
 exec @YQUAKE2_BIN@ -datadir /data/games/quake2 \
-    +set al_driver libopenal.so.1 +set vid_renderer "$RENDERER" "$@"
+    +set al_driver libopenal.so.1 +set logfile 2 +set vid_renderer "$RENDERER" "$@"
