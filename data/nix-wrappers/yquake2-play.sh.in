@@ -40,5 +40,10 @@ esac
 
 # @YQUAKE2_BIN@ is replaced by the absolute store path by prestage_yquake2.sh.
 # -datadir points at the shared baseq2 data (yquake2 deprecates +set basedir);
-# vid_renderer selects GL vs software.
-exec @YQUAKE2_BIN@ -datadir /data/games/quake2 +set vid_renderer "$RENDERER" "$@"
+# vid_renderer selects GL vs software. al_driver is forced to a BARE soname:
+# nixpkgs bakes an absolute /nix/store/.../libopenal.so.1 into the binary's
+# default, which yquake2 rejects ("al_driver must not contain '/'"); audio is the
+# SDL dummy backend here anyway (ALSOFT_DRIVERS=null), so this just silences the
+# spurious OpenAL-init error.
+exec @YQUAKE2_BIN@ -datadir /data/games/quake2 \
+    +set al_driver libopenal.so.1 +set vid_renderer "$RENDERER" "$@"
