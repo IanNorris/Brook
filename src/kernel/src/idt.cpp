@@ -617,6 +617,24 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
         ExcPutsRaw(cpuTag); ExcPutsRaw("=== KILLING PROCESS ===\n");
         --excDepthPerCpu[cpuSlot];
         __asm__ volatile("sti");
+        // BRO-176: a fatal user fault is group-fatal. In Linux a fatal SIGSEGV
+        // terminates the WHOLE thread group, not just the faulting thread. If the
+        // faulting thread is a thread-group LEADER with live sibling threads,
+        // SchedulerExitCurrentProcess alone only marks the leader Terminated and
+        // waits for the siblings to exit on their own (see scheduler.cpp). But the
+        // siblings are typically Blocked in futex waits and nothing wakes/kills
+        // them, so asLiveThreads never drains to 0, the leader is never reapable,
+        // and the group wedges as a permanent zombie -> reap-stall -> watchdog
+        // panic (the BRO-176 STK crash). Mirror exactly what sys_exit already does
+        // for a leader exiting with live peers (syscall.cpp): tear the whole group
+        // down first. SchedulerKillThreadGroup is a no-op when no siblings exist,
+        // and the interrupts-enabled (sti above) state matches sys_exit's context,
+        // which its Phase-2 quiesce-wait requires. Leader-gated: a worker-thread
+        // fault being group-fatal needs the leader parent-notify hoisted out of
+        // SchedulerExitCurrentProcess first (follow-up).
+        if (diagProc && diagProc->pid == diagProc->tgid && !diagProc->isThread)
+            brook::SchedulerKillThreadGroup(diagProc->tgid, diagProc,
+                                            -static_cast<int>(vector));
         brook::SchedulerExitCurrentProcess(-static_cast<int>(vector));
         // Never reached.
     }
