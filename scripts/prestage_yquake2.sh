@@ -91,6 +91,29 @@ rm -f "${WRAPPER_TMP}"
 echo "  /nix/yquake2-play.sh -> exec /nix/store/${YQ2_BASE}/bin/yquake2"
 
 sync
+
+# --- Create a uid-1000-owned HOME on the ext2 /data disk -----------------------
+# yquake2 runs as uid 1000 (it refuses to run as root), and the ext2 /data mount
+# enforces DAC, so HOME=/data/yq2 must already exist owned by uid 1000 — else
+# yquake2 dies with "Couldn't create dir /data/yq2/.yq2/". Precedent: /data/tmp
+# is uid 1000:100 too. fuse2fs fakeroot lets us chown without privilege.
+EXT2_IMG="${BROOK_EXT2_DISK:-${ROOT_DIR}/brook_ext2_disk.img}"
+if [ -f "${EXT2_IMG}" ]; then
+    EXT2_MNT="$(mktemp -d)"
+    if fuse2fs -o rw,fakeroot "${EXT2_IMG}" "${EXT2_MNT}" 2>/dev/null; then
+        mkdir -p "${EXT2_MNT}/yq2/.yq2"
+        chown -R 1000:100 "${EXT2_MNT}/yq2"
+        sync
+        fusermount -u "${EXT2_MNT}" 2>/dev/null || fusermount -uz "${EXT2_MNT}" 2>/dev/null || true
+        echo "  /data/yq2 (HOME) created on ${EXT2_IMG}, owned uid 1000:100"
+    else
+        echo "  WARNING: could not mount ${EXT2_IMG}; create /data/yq2 (uid 1000) manually." >&2
+    fi
+    rmdir "${EXT2_MNT}" 2>/dev/null || true
+else
+    echo "  NOTE: ext2 /data disk not found (${EXT2_IMG}); create /data/yq2 owned by uid 1000 yourself." >&2
+fi
+
 echo "Done. yquake2 staged into ${DISK_IMG}."
 echo "Run it with the GPU compositor:"
 echo "  BROOK_GPU=gl BROOK_GPU_DISPLAY=sdl BROOK_COMPOSITE=gpu ./scripts/run-qemu.sh --release --script wayland_yquake2_gl"

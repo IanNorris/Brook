@@ -13,11 +13,14 @@
 # ref_gles3.so / ref_soft.so) from its own lib dir, picked by the `vid_renderer`
 # cvar. We add the Brook virgl env (force the Mesa virtio_gpu DRI driver + glvnd
 # EGL vendor dir, matching stk-play.sh / gltron-play.sh), SDL Wayland video, a
-# dummy SDL audio backend, a writable HOME for yquake2's ~/.yq2 config, and point
-# basedir at the SHARED Quake II data the native software port already uses
-# (/data/games/quake2/baseq2/pak0.pak) so both renderers run identical assets.
+# dummy SDL audio backend, and a writable HOME for yquake2's ~/.yq2 config +
+# savegames. The game data is read-only and SHARED with the native software port
+# (/data/games/quake2/baseq2/pak0.pak), passed via -datadir.
 #
-# First arg selects the renderer (gl1 default, or gl3 / gles3 / soft).
+# IMPORTANT: these launchers run yquake2 as uid 1000 (yquake2 refuses to run as
+# root). The ext2 /data mount enforces DAC, so HOME=/data/yq2 must be a
+# uid-1000-OWNED directory — prestage_yquake2.sh creates it (like /data/tmp).
+# A root-owned HOME makes yquake2 fail with "Couldn't create dir /data/yq2/.yq2/".
 export MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu
 export LIBGL_DRIVERS_PATH=/nix/store/b793hmy0383vxaax7hiaslzmizzd3pmg-mesa-26.0.6/lib/dri
 export GBM_BACKENDS_PATH=/nix/store/b793hmy0383vxaax7hiaslzmizzd3pmg-mesa-26.0.6/lib/gbm
@@ -26,10 +29,7 @@ export SDL_VIDEODRIVER=wayland
 export ALSOFT_DRIVERS=null
 export SDL_AUDIODRIVER=dummy
 export HOME=/data/yq2
-export XDG_CONFIG_HOME=/data/yq2/.config
-export XDG_CACHE_HOME=/data/yq2/.cache
-export XDG_DATA_HOME=/data/yq2/.local/share
-mkdir -p /data/yq2/.config /data/yq2/.cache /data/yq2/.local/share
+mkdir -p /data/yq2/.yq2
 
 # First positional arg selects the renderer (default gl1); the rest pass through.
 # `case`/`shift` are builtins — no subshell, no fork (unlike $(command -v ...)).
@@ -39,5 +39,6 @@ case "${1:-}" in
 esac
 
 # @YQUAKE2_BIN@ is replaced by the absolute store path by prestage_yquake2.sh.
-# basedir points at the shared baseq2 data; vid_renderer selects GL vs software.
-exec @YQUAKE2_BIN@ +set basedir /data/games/quake2 +set vid_renderer "$RENDERER" "$@"
+# -datadir points at the shared baseq2 data (yquake2 deprecates +set basedir);
+# vid_renderer selects GL vs software.
+exec @YQUAKE2_BIN@ -datadir /data/games/quake2 +set vid_renderer "$RENDERER" "$@"

@@ -6,4 +6,4 @@
 set wm
 set vfb none
 run --once /nix/bin/waylandd
-run /nix/yquake2-play.sh gl1
+run --uid 1000 /nix/yquake2-play.sh gl1
