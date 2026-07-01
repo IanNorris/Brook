@@ -1,0 +1,5 @@
+# BRO-205: does sys_futex ever return a glibc-fatal errno (EFAULT/EINVAL) for a
+# FUTEX_WAIT on a valid word under heavy page-table churn? (Reproduces the
+# "futex facility returned an unexpected error code" abort seen under mesa
+# llvmpipe.) Watch serial for BD_FUTEX and FUTEXSTRESS: PASS/FAIL.
+run /boot/BIN/FUTEXSTRESS
