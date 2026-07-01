@@ -3426,6 +3426,10 @@ static int64_t sys_brk(uint64_t newBreak, uint64_t, uint64_t,
     Process* proc = ProcessCurrent();
     if (!proc) return -ENOMEM;
 
+    // BRO-206: back-pressure before growing/shrinking the heap (a frame
+    // producer/retirer) so heap churn cannot outrun the quarantine drain.
+    PmmThrottleForDrain();
+
     // brk(0) = query current break
     if (newBreak == 0)
     {
@@ -3505,6 +3509,11 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 
     Process* proc = ProcessCurrent();
     if (!proc) return -ENOMEM;
+
+    // BRO-206: back-pressure. A large anonymous mmap eagerly allocates its
+    // frames and a later munmap retires them all; throttling the allocator under
+    // quarantine pressure bounds the churn that feeds the drain backlog.
+    PmmThrottleForDrain();
 
     uint64_t pages = (length + 4095) / 4096;
     uint64_t vmmFlags = ProtToVmmFlags(prot);
@@ -4025,6 +4034,10 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t,
     Process* proc = ProcessCurrent();
     if (!proc) return -ESRCH;
 
+    // BRO-206: back-pressure before we retire this range's frames into the
+    // quarantine — bounds the quarantine under heavy munmap load.
+    PmmThrottleForDrain();
+
     uint64_t pages = (length + 4095) / 4096;
 
     if (addr >= 0x2d7700000000ULL && addr < 0x2d8000000000ULL) {
@@ -4174,6 +4187,9 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
 
     Process* proc = ProcessCurrent();
     if (!proc) return -ESRCH;
+
+    // BRO-206: back-pressure — mremap can free the old mapping's frames.
+    PmmThrottleForDrain();
 
     uint64_t oldPages = (old_size + 4095) / 4096;
     uint64_t newPages = (new_size + 4095) / 4096;

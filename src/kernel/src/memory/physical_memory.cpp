@@ -16,6 +16,7 @@ namespace brook {
                                 uint8_t priority);
     void SchedulerAddProcess(Process* proc);   // scheduler.h — enqueue onto ready queue
     extern "C" void SchedulerSleepMs(uint32_t ms);
+    Process* ProcessCurrent();                 // process.h — current thread or nullptr
 }
 
 // Linker-defined symbol — end of the kernel image (virtual address).
@@ -442,61 +443,82 @@ static uint64_t g_drainedTotal = 0;
 
 static void PmmDrainThread(void* /*arg*/)
 {
-    // Drain interval. The whole batch accumulated during this window is released
-    // behind ONE all-CPU TLB-epoch barrier, amortizing the system-wide flush. A
-    // per-batch barrier (draining continuously) forces every CPU to reload CR3
-    // constantly and collapses throughput at high CPU counts; ~4ms batches keep
-    // the all-CPU flush rate modest while bounding how long a freed frame waits.
+    // Idle nap between drains. When there is nothing to reclaim the thread naps
+    // this long so a freed frame waits at most ~this before its barrier. Under
+    // load the inner drain-to-empty loop below dominates and this sleep is not
+    // reached, so the interval only bounds idle latency.
     constexpr uint32_t DRAIN_INTERVAL_MS = 4;
     if (g_drainDebug)
         SerialPrintf("PMM-DRAIN: thread started\n");
     for (;;)
     {
+        // BRO-206: drain to empty. Under sustained free pressure (e.g. many CPUs
+        // in tight munmap/exit loops) the producer can retire frames far faster
+        // than one barrier per idle-nap can reclaim. The old code drained one
+        // batch then slept DRAIN_INTERVAL_MS unconditionally; combined with the
+        // drainer being schedule-starved (priority inversion — see
+        // PmmStartDrainThread) the quarantine grew unbounded to the
+        // g_totalPages/2 safety-valve panic. Issuing barriers back-to-back while
+        // work remains keeps the quarantine bounded at ~one barrier's worth of
+        // production (self-rate-matching): frames retired during a barrier land
+        // in the now-empty live list and are drained by the very next iteration.
+        for (;;)
+        {
+            // Splice out the entire accumulated batch in O(1) (descriptor-linked).
+            uint64_t f = IrqSpinLockAcquire(&g_pmmLock);
+            uint32_t head = g_quarHead;
+            uint32_t n    = g_quarCount;
+            g_quarHead = PMM_NULL_PAGE;
+            g_quarCount = 0;
+            IrqSpinLockRelease(&g_pmmLock, f);
+
+            if (head == PMM_NULL_PAGE)
+                break;  // caught up — nap until more frames are retired
+
+            // One barrier for the whole batch: every frame in `head` was freed
+            // before this point, so a single all-CPU flush since now covers all
+            // of them. MUST run with no g_pmmLock held (it busy-waits for remote
+            // CPUs).
+            TlbFlushAllCpusBarrier();
+
+            // Now safe to return the batch's frames to the allocatable pool. Walk
+            // the list (reading next BEFORE releasing, since release may let the
+            // frame be reallocated and its descriptor reused).
+            f = IrqSpinLockAcquire(&g_pmmLock);
+            uint32_t idx = head;
+            while (idx != PMM_NULL_PAGE)
+            {
+                uint32_t next = Desc(idx).next;
+                ReleaseFrameLocked(idx);
+                idx = next;
+            }
+            IrqSpinLockRelease(&g_pmmLock, f);
+
+            if (g_drainDebug)
+            {
+                g_drainCycles++;
+                g_drainedTotal += n;
+                if ((g_drainCycles & 0x3F) == 0)   // every 64 cycles
+                    SerialPrintf("PMM-DRAIN: cycles=%lu drained=%lu last=%u peak=%u\n",
+                                 g_drainCycles, g_drainedTotal, n, g_quarPeak);
+            }
+        }
+
         SchedulerSleepMs(DRAIN_INTERVAL_MS);
-
-        // Splice out the entire accumulated batch in O(1) (descriptor-linked).
-        uint64_t f = IrqSpinLockAcquire(&g_pmmLock);
-        uint32_t head = g_quarHead;
-        uint32_t n    = g_quarCount;
-        g_quarHead = PMM_NULL_PAGE;
-        g_quarCount = 0;
-        IrqSpinLockRelease(&g_pmmLock, f);
-
-        if (head == PMM_NULL_PAGE)
-            continue;
-
-        // One barrier for the whole batch: every frame in `head` was freed before
-        // this point, so a single all-CPU flush since now covers all of them.
-        // MUST run with no g_pmmLock held (it busy-waits for remote CPUs).
-        TlbFlushAllCpusBarrier();
-
-        // Now safe to return the batch's frames to the allocatable pool. Walk the
-        // list (reading next BEFORE releasing, since release may let the frame be
-        // reallocated and its descriptor reused).
-        f = IrqSpinLockAcquire(&g_pmmLock);
-        uint32_t idx = head;
-        while (idx != PMM_NULL_PAGE)
-        {
-            uint32_t next = Desc(idx).next;
-            ReleaseFrameLocked(idx);
-            idx = next;
-        }
-        IrqSpinLockRelease(&g_pmmLock, f);
-
-        if (g_drainDebug)
-        {
-            g_drainCycles++;
-            g_drainedTotal += n;
-            if ((g_drainCycles & 0x3F) == 0)   // every 64 cycles
-                SerialPrintf("PMM-DRAIN: cycles=%lu drained=%lu last=%u peak=%u\n",
-                             g_drainCycles, g_drainedTotal, n, g_quarPeak);
-        }
     }
 }
 
 void PmmStartDrainThread()
 {
-    Process* t = KernelThreadCreate("pmm_drain", PmmDrainThread, nullptr, 2);
+    // BRO-206: run the drainer at REALTIME priority (0). At NORMAL (2) it was
+    // starved under load: SchedPolicyBoostAll lifts every ready user thread to
+    // HIGH (1) each second, sitting ABOVE a NORMAL drainer, so the drainer could
+    // not run often enough and the quarantine ran away to the safety-valve
+    // panic. REALTIME is picked before all user work, is never demoted on
+    // timeslice expiry, and is not touched by SchedPolicyBoostAll (which only
+    // reshuffles the NORMAL/LOW queues) — so no priority inversion can starve it.
+    Process* t = KernelThreadCreate("pmm_drain", PmmDrainThread, nullptr,
+                                    /*priority=*/0);
     if (t)
         SchedulerAddProcess(t);   // enqueue onto the ready queue (else it never runs)
     else
@@ -507,6 +529,46 @@ void PmmStartDrainThread()
 // Host unit tests don't link the scheduler/apic; the quarantine drain is a
 // no-op (RetireFrameLocked's safety-valve releases frames immediately).
 void PmmStartDrainThread() {}
+#endif
+
+// BRO-206: producer back-pressure. The single barrier-bound drain thread cannot
+// match many CPUs freeing frames in tight loops, so under sustained pressure the
+// quarantine grows to the g_totalPages/2 safety-valve panic. Raising the drainer
+// to REALTIME (above) removes the starvation but cannot BOUND the queue — the
+// producer can always outrun one drainer. This bounds it: a frame-producing
+// syscall calls PmmThrottleForDrain() at its entry (IF=1, holding NO lock) and
+// blocks while the quarantine is over a high watermark, until the REALTIME
+// drainer brings it below a low watermark. Overshoot is bounded by (per-call
+// frees x concurrent producers), far below the panic cap.
+//
+// SAFETY: this MUST be called only from a preemptible context with interrupts
+// enabled and NO spinlock held (it sleeps). It is a heuristic gate — g_quarCount
+// is read locklessly (aligned 32-bit read is atomic on x86-64); a slightly stale
+// value only shifts the throttle point by one batch, never breaks correctness.
+#ifndef BROOK_HOST_TEST
+void PmmThrottleForDrain()
+{
+    if (!g_quarantineOn || !g_pageDescs || !g_totalPages) return;
+    if (!ProcessCurrent()) return;  // pre-scheduler / kernel ctx: never block here
+
+    const uint32_t high = static_cast<uint32_t>(g_totalPages / 8);
+    if (__atomic_load_n(&g_quarCount, __ATOMIC_RELAXED) <= high)
+        return;  // fast path: no pressure
+
+    // Over the high watermark: sleep until the drainer reclaims down to the low
+    // watermark (hysteresis avoids every producer thrash-blocking at exactly the
+    // high mark). Bounded loop so a genuinely wedged drainer still surfaces the
+    // safety-valve panic instead of hanging the producer forever.
+    const uint32_t low = static_cast<uint32_t>(g_totalPages / 16);
+    uint32_t naps = 0;
+    while (__atomic_load_n(&g_quarCount, __ATOMIC_RELAXED) > low)
+    {
+        SchedulerSleepMs(1);
+        if (++naps > 5000) break;  // ~5s: drainer wedged — let the valve fire
+    }
+}
+#else
+void PmmThrottleForDrain() {}
 #endif
 
 // Mark [physBase, physBase + pages*PAGE_SIZE) as used.
