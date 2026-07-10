@@ -56,3 +56,26 @@
     "jz 73f\n\t" \
     "swapgs\n\t" \
     "73:\n\t"
+
+// ---------------------------------------------------------------------------
+// BRO-207: normalize live RFLAGS immediately before a naked handler's IRETQ.
+// ---------------------------------------------------------------------------
+//
+// IRETQ raises #GP(0) if the CURRENT (live) RFLAGS has NT (Nested Task, bit 14)
+// set — in IA-32e mode it would attempt an unsupported nested-task return. A
+// returning interrupt handler must therefore have NT=0 in its live flags. This
+// is independent of the iret FRAME: the interrupted context's real RFLAGS is
+// restored from the frame by IRETQ, so clearing the handler's transient live
+// NT/DF/AC here never changes the resumed context's flags — it only guarantees
+// the IRETQ itself cannot fault on a stale/injected NT.
+//
+// The durable sources of a stray kernel NT are closed elsewhere (SYSCALL FMASK
+// now clears NT/AC; context_switch normalizes NT/DF/AC on resume). This macro is
+// the final belt-and-suspenders guard so no naked-handler IRETQ can ever #GP on
+// a leftover NT regardless of how it got there. DF/AC are cleared too as hygiene
+// (a resumed kernel path must not run string ops backwards / with SMAP-relevant
+// AC). Clears NT(0x4000) | DF(0x400) | AC(0x40000); leaves IF to IRETQ's frame.
+#define IRETQ_NORMALIZE_RFLAGS \
+    "pushfq\n\t" \
+    "andq $0xfffffffffffbbbff, (%%rsp)\n\t" \
+    "popfq\n\t"

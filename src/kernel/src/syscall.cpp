@@ -13059,6 +13059,10 @@ extern "C" __attribute__((naked)) void ReturnToKernel()
     __asm__ volatile(
         "mov %%gs:24, %%rbp\n\t"
         "mov %%gs:32, %%rsp\n\t"
+        // BRO-207: normalize the restored kernel RFLAGS (clear NT|DF|AC) just
+        // like context_switch — a resumed kernel continuation must not carry a
+        // stale NT (which would #GP the next naked-handler IRETQ) or DF/AC.
+        "andq $0xfffffffffffbbbff, (%%rsp)\n\t"
         "popfq\n\t"
         "pop %%r15\n\t"
         "pop %%r14\n\t"
