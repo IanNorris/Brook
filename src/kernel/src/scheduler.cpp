@@ -21,6 +21,9 @@
 // LAPIC tick counter (defined in apic.cpp, volatile because ISR-modified).
 namespace brook { extern volatile uint64_t g_lapicTickCount; }
 
+// BRO-208: futex waiter enumerator (defined in syscall.cpp) for the hang dump.
+extern "C" void FutexDumpWaiters(uint16_t tgidFilter);
+
 // Context switch — implemented in context_switch.S
 extern "C" void context_switch(brook::SavedContext* oldCtx, brook::SavedContext* newCtx,
                                 brook::FxsaveArea* oldFx, brook::FxsaveArea* newFx,
@@ -2639,6 +2642,29 @@ extern "C" void SchedulerDumpHang()
         HangPuts(" name='"); 
         for (int j = 0; j < 24 && p->name[j]; ++j) SerialPutChar(p->name[j]);
         HangPuts("'");
+        // BRO-208: block-reason analysis — for a hung/deadlocked thread, show
+        // WHERE in the kernel it blocked and WHAT on. Symbolicating savedCtx.rip
+        // reveals the blocking primitive (sys_futex / KRwLockWriteLock / pipe /
+        // sockets). pendingWakeup!=0 on a Blocked thread is the lost-wakeup
+        // fingerprint: a wake was signalled but the thread never ran.
+        {
+            // NOTE: savedCtx.rip is the shared context_switch resume stub, not a
+            // per-thread blocked PC — the schedTrace ring (site 6=BLOCK) and the
+            // futex-waiter table below are the authoritative "blocked where/on-what".
+            uint32_t pw = __atomic_load_n(&p->pendingWakeup, __ATOMIC_RELAXED);
+            if (pw) { HangPuts(" pendWake="); HangDec((int64_t)pw); }
+            if (p->wakeupTick)
+            { HangPuts(" wakeupTick=+"); HangDec((int64_t)p->wakeupTick - (int64_t)g_lapicTickCount); }
+            KRwLock* rw = p->blockedOnRwLock;
+            if (rw)
+            {
+                HangPuts(" rwlock="); HangHex((uint64_t)rw);
+                HangPuts(p->blockedAsWriter ? " asWriter" : " asReader");
+                HangPuts(" rdrs="); HangDec((int64_t)rw->readerCount);
+                HangPuts(" wrActive="); HangDec((int64_t)rw->writerActive);
+                HangPuts(" wrWaiting="); HangDec((int64_t)rw->writersWaiting);
+            }
+        }
         // For a thread, show the leader's gate so we can see a stuck reap.
         if (p->isThread && p->threadLeader && p->threadLeader->magic == PROCESS_MAGIC)
         {
@@ -2648,6 +2674,25 @@ extern "C" void SchedulerDumpHang()
             HangDec(p->threadLeader->incarnation == p->leaderIncarnation ? 1 : 0);
         }
         HangPuts("\n");
+        // BRO-208: for a Blocked thread, decode its schedTrace ring — the last 12
+        // scheduler events. STR_BLOCK(6) followed by no STR_READY_UNBLOCK(3), or a
+        // STR_BLOCK_SKIP(7)/STR_UNBLOCK_DEFER(4,5) tail, distinguishes a genuine
+        // wait from a lost/deferred wakeup.
+        if (p->state == ProcessState::Blocked)
+        {
+            HangPuts("    schedTrace(site@tick,state):");
+            uint8_t h = p->schedTraceHead;
+            for (int k = 0; k < 12; ++k)
+            {
+                uint8_t slot = (uint8_t)((h + k) % 12);
+                uint64_t e = p->schedTrace[slot];
+                if (e == 0) continue;
+                HangPuts(" ["); HangDec((int64_t)((e >> 8) & 0xFF));
+                HangPuts("@"); HangDec((int64_t)(e >> 16));
+                HangPuts(",s"); HangDec((int64_t)(e & 0xFF)); HangPuts("]");
+            }
+            HangPuts("\n");
+        }
         // BRO-176: a Terminated leader stuck with asLiveThreads>0 is the reap-stall
         // fingerprint — dump its full inc/dec history to name the unmatched op.
         if (!p->isThread && p->state == ProcessState::Terminated &&
@@ -2658,6 +2703,14 @@ extern "C" void SchedulerDumpHang()
         }
     }
     HangPuts("STATE legend: 0=Ready 1=Running 2=Blocked 3=Stopped 4=Terminated\n");
+    HangPuts("schedTrace sites: 1=ENQ 2=REM 3=RDY_UNBLK 4=DEFER_RR 5=DEFER_CPU "
+             "6=BLOCK 7=BLOCK_SKIP 8=PREEMPT 9=YIELD 10=REQ_ENQ 11=REQ_SKIP 12=RUN\n");
+    // BRO-208: cross-reference every futex waiter (uaddr/owner/pid/pendWake) so a
+    // deadlock on a user mutex/condvar is visible: a Blocked thread parked on a
+    // futex whose word no other thread will wake is the fingerprint.
+    {
+        FutexDumpWaiters(0);
+    }
     HangPuts("==================== END HANG DUMP ====================\n\n");
 }
 

@@ -11109,6 +11109,50 @@ extern "C" int64_t FutexWake(uint64_t owner, uint64_t uaddr, uint32_t maxWake,
     return static_cast<int64_t>(woken);
 }
 
+// BRO-208 hang-dump helper: enumerate every futex waiter, best-effort and
+// lock-free (like SchedulerDumpHang), so we can see which user address each
+// blocked thread is parked on and whether a wake was lost. Called from the
+// Ctrl+Shift+ScrollLock dump path; safe to read without g_futexLock because the
+// system is quiesced during a hang. Bounded output and pointer-validated.
+extern "C" void FutexDumpWaiters(uint16_t tgidFilter)
+{
+    auto puts = [](const char* s){ if (s) while (*s) SerialPutChar(*s++); };
+    auto hex  = [](uint64_t v){ SerialPutChar('0'); SerialPutChar('x');
+        for (int i = 60; i >= 0; i -= 4) SerialPutChar("0123456789abcdef"[(v >> i) & 0xF]); };
+    auto dec  = [](int64_t v){ if (v < 0){ SerialPutChar('-'); v = -v; } char b[20]; int i = 0;
+        if (!v) b[i++] = '0'; while (v){ b[i++] = (char)('0' + v % 10); v /= 10; } while (i) SerialPutChar(b[--i]); };
+
+    puts("--- futex waiters");
+    if (tgidFilter) { puts(" (owner/tgid="); dec(tgidFilter); puts(")"); }
+    puts(" ---\n");
+    uint32_t total = 0;
+    for (uint32_t b = 0; b < FUTEX_HASH_SIZE; ++b)
+    {
+        int guard = 0;
+        for (FutexWaiter* w = g_futexBuckets[b]; w && guard < 4096; w = w->next, ++guard)
+        {
+            if (tgidFilter && (uint16_t)w->owner != tgidFilter)
+                continue;
+            Process* wp = w->proc;
+            bool ok = wp && wp->magic == PROCESS_MAGIC;
+            puts("  bucket="); dec((int)b);
+            puts(" uaddr="); hex(w->uaddr);
+            puts(" owner="); dec((int64_t)w->owner);
+            puts(" bitset="); hex(w->bitset);
+            puts(" pid="); dec(ok ? wp->pid : -1);
+            if (ok)
+            {
+                puts(" state="); dec((int)wp->state);
+                puts(" pendWake="); dec((int)__atomic_load_n(&wp->pendingWakeup, __ATOMIC_RELAXED));
+                puts(" '"); for (int j = 0; j < 20 && wp->name[j]; ++j) SerialPutChar(wp->name[j]); puts("'");
+            }
+            SerialPutChar('\n');
+            ++total;
+        }
+    }
+    if (!total) puts("  (none)\n");
+}
+
 static bool FutexRemoveWaiter(uint64_t owner, uint64_t uaddr, Process* proc)
 {
     if (!proc) return false;
