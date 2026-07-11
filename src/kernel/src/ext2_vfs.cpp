@@ -2345,10 +2345,26 @@ static int Ext2FsRename(void* mountPriv, uint8_t pdrv,
     Ext2Inode newParentData;
     if (!Ext2ReadInode(mnt, newParentIno, &newParentData)) { KRwLockWriteUnlock(&g_ext2Lock); return -1; }
 
-    // POSIX rename replaces destination if it exists — remove it first
+    // POSIX rename replaces destination if it exists — remove it first.
+    // Renaming a file onto itself (same inode) is a no-op per POSIX, so skip.
     uint32_t existingIno = Ext2DirLookup(mnt, newParentIno, &newParentData, newName);
-    if (existingIno) {
+    if (existingIno && existingIno != targetIno) {
         Ext2DirRemove(mnt, &newParentData, newParentIno, newName);
+        // Free the replaced inode just like unlink does — otherwise every
+        // rename over an existing file orphans its inode + data blocks (BRO-215).
+        Ext2Inode replacedData;
+        if (Ext2ReadInode(mnt, existingIno, &replacedData)) {
+            if (replacedData.i_links_count > 0) replacedData.i_links_count--;
+            if (replacedData.i_links_count == 0) {
+                bool replacedIsDir =
+                    (replacedData.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR;
+                Ext2FreeInodeBlocks(mnt, &replacedData);
+                Ext2WriteInode(mnt, existingIno, &replacedData);
+                Ext2FreeInode(mnt, existingIno, replacedIsDir);
+            } else {
+                Ext2WriteInode(mnt, existingIno, &replacedData);
+            }
+        }
         Ext2ReadInode(mnt, newParentIno, &newParentData);
     }
 
