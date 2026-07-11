@@ -1328,6 +1328,37 @@ static bool SavedCtxLooksCorrupt(const brook::SavedContext& c)
     if (c.cr3 == 0 || (c.cr3 & 0xFFFULL) || c.cr3 >= (256ULL << 30)) return true;
     // RFLAGS reserved bit 1 is always set; the high 32 bits are always zero.
     if (!(c.rflags & 0x2ULL) || (c.rflags >> 32) != 0) return true;
+    // FS base is written to IA32_FS_BASE via wrmsr on switch; a non-canonical
+    // value #GPs. Valid values are canonical (either half) or 0 (kernel thread).
+    if (c.fsBase != 0) {
+        uint64_t top = c.fsBase >> 47;
+        if (top != 0 && top != 0x1FFFFULL) return true;
+    }
+    return false;
+}
+
+// BRO-208 diagnostic: is newProc's XSAVE area corrupt? context_switch restores
+// it with `xrstor64 (%r10)` (context_switch+0xb3), which #GPs if the XSAVE
+// header is malformed. The header sits at offset 512: XSTATE_BV (512..519),
+// XCOMP_BV (520..527), then 48 reserved bytes (528..575). For the standard
+// (non-compacted) xrstor64 Brook uses: XSTATE_BV must be a subset of XCR0,
+// XCOMP_BV must be 0, and the reserved bytes must be 0. A violation means the
+// fxsave blob was stomped — catch it before the #GP.
+static bool FxsaveHeaderLooksCorrupt(const brook::FxsaveArea& fx)
+{
+    uint32_t lo = 0, hi = 0;
+    __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+    uint64_t xcr0 = ((uint64_t)hi << 32) | lo;
+
+    const uint8_t* h = fx.data;
+    uint64_t xstate_bv, xcomp_bv;
+    __builtin_memcpy(&xstate_bv, h + 512, 8);
+    __builtin_memcpy(&xcomp_bv,  h + 520, 8);
+
+    if (xstate_bv & ~xcr0) return true;   // enabling a component XCR0 lacks
+    if (xcomp_bv != 0)     return true;   // non-compacted format required
+    for (int i = 528; i < 576; i++)
+        if (h[i] != 0) return true;       // reserved header bytes must be zero
     return false;
 }
 
@@ -1575,12 +1606,17 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
     // tell a savedCtx-only stomp (magic intact) from a broad Process-struct
     // overwrite (magic also gone).
     int pml4Bad = NewCtxPml4KernelHalfCorrupt(newProc->savedCtx.cr3);
-    if (SavedCtxLooksCorrupt(newProc->savedCtx) || pml4Bad >= 0)
+    bool ctxBad = SavedCtxLooksCorrupt(newProc->savedCtx);
+    bool fxBad  = FxsaveHeaderLooksCorrupt(newProc->fxsave);
+    bool magicBad = (newProc->magic != PROCESS_MAGIC);
+    if (ctxBad || fxBad || magicBad || pml4Bad >= 0)
     {
         const auto& c = newProc->savedCtx;
+        const char* which = magicBad ? "[magic/struct]" :
+                            pml4Bad >= 0 ? "[PML4 kernel-half mismatch]" :
+                            fxBad ? "[fxsave XSAVE header]" : "[savedCtx fields]";
         SerialPrintf("\n!!! BRO-208 CORRUPT CONTEXT (caught pre-switch) on CPU%u %s\n",
-                     cpu, pml4Bad >= 0 ? "[PML4 kernel-half mismatch]"
-                                       : "[savedCtx fields]");
+                     cpu, which);
         if (pml4Bad >= 0)
         {
             uint64_t refPhys = brook::VmmKernelCR3().pml4.raw();
@@ -1590,6 +1626,16 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
                 brook::PhysToVirt(brook::PhysicalAddress(refPhys)).raw());
             SerialPrintf("!!! PML4[%d] corrupt: new=0x%016lx ref=0x%016lx (cr3=0x%lx refcr3=0x%lx)\n",
                          pml4Bad, np[pml4Bad], rp[pml4Bad], c.cr3, refPhys);
+        }
+        if (fxBad)
+        {
+            uint32_t lo = 0, hi = 0;
+            __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+            uint64_t xstate_bv, xcomp_bv;
+            __builtin_memcpy(&xstate_bv, newProc->fxsave.data + 512, 8);
+            __builtin_memcpy(&xcomp_bv,  newProc->fxsave.data + 520, 8);
+            SerialPrintf("!!! fxsave hdr: XSTATE_BV=0x%016lx XCOMP_BV=0x%016lx XCR0=0x%08x fx@%p\n",
+                         xstate_bv, xcomp_bv, lo, (void*)newProc->fxsave.data);
         }
         SerialPrintf("!!! newProc=%p pid=%u name='%s' state=%d magic=0x%lx %s\n",
                      (void*)newProc, newProc->pid, newProc->name, (int)newProc->state,
