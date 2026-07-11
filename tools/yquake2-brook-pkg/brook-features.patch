@@ -1,0 +1,233 @@
+--- a/src/client/cl_main.c	1970-01-01 00:00:01.000000000 +0000
++++ b/src/client/cl_main.c	2026-07-11 14:19:18.082707869 +0000
+@@ -28,6 +28,11 @@
+ #include "header/client.h"
+ #include "input/header/input.h"
+ 
++/* Brook: fsync/open/close/rename for the atomic, durable config write in
++ * CL_WriteConfiguration (ext2 is not journaled). */
++#include <fcntl.h>
++#include <unistd.h>
++
+ void CL_ForwardToServer_f(void);
+ void CL_Changing_f(void);
+ void CL_Reconnect_f(void);
+@@ -44,6 +49,8 @@
+ cvar_t *cl_timeout;
+ cvar_t *cl_predict;
+ cvar_t *cl_showfps;
++/* Brook: frametime bar-graph overlay (0=off). Archived so it persists. */
++cvar_t *cl_frametimegraph;
+ cvar_t *cl_showspeed;
+ cvar_t *cl_gun;
+ cvar_t *cl_add_particles;
+@@ -535,6 +542,7 @@
+ 	cl_noskins = Cvar_Get("cl_noskins", "0", 0);
+ 	cl_predict = Cvar_Get("cl_predict", "1", 0);
+ 	cl_showfps = Cvar_Get("cl_showfps", "0", CVAR_ARCHIVE);
++	cl_frametimegraph = Cvar_Get("cl_frametimegraph", "0", CVAR_ARCHIVE);
+ 	cl_showspeed = Cvar_Get("cl_showspeed", "0", CVAR_ARCHIVE);
+ 	cl_laseralpha = Cvar_Get("cl_laseralpha", "0.3", 0);
+ 	cl_nodownload_list = Cvar_Get("cl_nodownload_list", "", CVAR_ARCHIVE);
+@@ -665,19 +673,38 @@
+ {
+ 	FILE *f;
+ 	char path[MAX_OSPATH];
++	char pathTmp[MAX_OSPATH];
++	/* Re-entrancy guard: on Brook the window-close path runs the shutdown
++	 * (Com_Quit) synchronously, so a second close/SIGTERM landing mid-write
++	 * must not re-enter and interleave/corrupt the file. */
++	static qboolean writing = false;
+ 
+ 	if (cls.state == ca_uninitialized)
+ 	{
+ 		return;
+ 	}
+ 
++	if (writing)
++	{
++		return;
++	}
++	writing = true;
++
+ 	Com_sprintf(path, sizeof(path), "%s/config.cfg", FS_Gamedir());
++	Com_sprintf(pathTmp, sizeof(pathTmp), "%s/config.cfg.tmp", FS_Gamedir());
+ 
+-	f = Q_fopen(path, "w");
++	/* Write the full config to a temp file, fsync it, then atomically rename it
++	 * over config.cfg. Brook's ext2 is not journaled and yquake2 is frequently
++	 * killed the instant its window closes, so without the fsync the freshly
++	 * written settings are lost in the block cache, and without the rename a
++	 * kill mid-write would leave a truncated config.cfg. The rename guarantees
++	 * config.cfg is always either the previous or the new complete file. */
++	f = Q_fopen(pathTmp, "w");
+ 
+ 	if (!f)
+ 	{
+ 		Com_Printf("Couldn't write config.cfg.\n");
++		writing = false;
+ 		return;
+ 	}
+ 
+@@ -688,7 +715,42 @@
+ 	fflush(f);
+ 	fclose(f);
+ 
+-	Cvar_WriteVariables(path);
++	/* Appends the archived cvars to the same temp file. */
++	Cvar_WriteVariables(pathTmp);
++
++	/* fsync the finished temp file (Cvar_WriteVariables fcloses without
++	 * syncing) so the rename can never expose unflushed data. */
++	{
++		int ffd = open(pathTmp, O_RDONLY);
++		if (ffd >= 0)
++		{
++			fsync(ffd);
++			close(ffd);
++		}
++	}
++
++	if (rename(pathTmp, path) != 0)
++	{
++		Com_Printf("Couldn't finalize config.cfg.\n");
++		writing = false;
++		return;
++	}
++
++	/* fsync the directory so the rename itself is durable on ext2. */
++	{
++		int dfd = open(FS_Gamedir(), O_RDONLY
++#ifdef O_DIRECTORY
++			| O_DIRECTORY
++#endif
++		);
++		if (dfd >= 0)
++		{
++			fsync(dfd);
++			close(dfd);
++		}
++	}
++
++	writing = false;
+ }
+ 
+ typedef struct
+--- a/src/client/cl_screen.c	1970-01-01 00:00:01.000000000 +0000
++++ b/src/client/cl_screen.c	2026-07-11 14:20:42.028166331 +0000
+@@ -65,6 +65,7 @@
+ int crosshair_width, crosshair_height;
+ 
+ extern cvar_t *cl_showfps;
++extern cvar_t *cl_frametimegraph;
+ extern cvar_t *crosshair_scale;
+ extern cvar_t *cl_showspeed;
+ extern float GetPlayerSpeed(float *, float *);
+@@ -1585,6 +1586,99 @@
+ 	}
+ }
+ 
++/*
++ * Brook frametime bar-graph overlay (cl_frametimegraph). A renderer-agnostic
++ * reimplementation of the old software-port overlay (swimp_brook.c) using
++ * yquake2's 2D Draw API, so it works identically on gl1/gl3/gles3/soft.
++ *
++ * Keeps a 256-frame ring of frame intervals and draws, in the top-right:
++ *   - a text line "FPS N  X.X ms" (mean over the ring)
++ *   - a colour-coded bar graph, full-scale 33 ms (30 Hz): bars taller and
++ *     redder as frames get slower. Colour indices are the same palette entries
++ *     the engine's own netgraph uses (0x40 neutral, 0xd0 / 0xdf red).
++ */
++#define SCR_FT_HIST 256
++void
++SCR_DrawFrametimeGraph(void)
++{
++	static int   ft_us[SCR_FT_HIST];
++	static int   ft_head = 0;
++	static long long ft_lasttime = 0;
++
++	if (!cl_frametimegraph || cl_frametimegraph->value < 1)
++	{
++		/* Keep the clock fresh so the first frame after enabling isn't a
++		 * huge spike. */
++		ft_lasttime = Sys_Microseconds();
++		return;
++	}
++
++	long long now = Sys_Microseconds();
++	if (ft_lasttime != 0)
++	{
++		int dt = (int)(now - ft_lasttime);
++		if (dt < 0) dt = 0;
++		ft_us[ft_head] = dt;
++		ft_head = (ft_head + 1) % SCR_FT_HIST;
++	}
++	ft_lasttime = now;
++
++	/* Mean frame time over the populated ring. */
++	long long sum = 0;
++	int num = 0;
++	for (int i = 0; i < SCR_FT_HIST; i++)
++	{
++		if (ft_us[i] > 0) { sum += ft_us[i]; num++; }
++	}
++	float mean_ms = num ? ((float)sum / (float)num) / 1000.0f : 0.0f;
++	int fps = (mean_ms > 0.01f) ? (int)(1000.0f / mean_ms + 0.5f) : 0;
++	if (fps > 999) fps = 999;
++
++	float scale = SCR_GetConsoleScale();
++	if (scale < 1.0f) scale = 1.0f;
++
++	/* Layout: bar graph pinned to the top-right, text above it. */
++	int barW   = (viddef.width >= 1280) ? 2 : 1;
++	int graphH = (int)(40 * scale);
++	int graphW = SCR_FT_HIST * barW;
++	int pad    = (int)(4 * scale);
++	int textH  = (int)(8 * scale);
++
++	if (viddef.width < graphW + pad * 2 || viddef.height < graphH + textH + pad * 3)
++	{
++		return; /* screen too small — skip rather than draw off-screen */
++	}
++
++	int gx = viddef.width - graphW - pad;
++	int gy = pad + textH + pad;
++
++	/* Header text. */
++	char str[32];
++	snprintf(str, sizeof(str), "FPS %d  %.1f ms", fps, mean_ms);
++	DrawStringScaled(gx, pad, str, scale);
++
++	/* Graph background. */
++	Draw_Fill(gx, gy, graphW, graphH, 8);
++
++	/* Full-scale = 33 ms (30 Hz) -> 33000 us. */
++	for (int i = 0; i < SCR_FT_HIST; i++)
++	{
++		int idx = (ft_head + i) % SCR_FT_HIST;
++		int us  = ft_us[idx];
++		if (us <= 0) continue;
++
++		int bar = (us * graphH) / 33000;
++		if (bar > graphH) bar = graphH;
++
++		int color = (us > 33000) ? 0xdf : (us > 20000) ? 0xd0 : 0x40;
++
++		Draw_Fill(gx + i * barW, gy + graphH - bar, barW, bar, color);
++	}
++
++	SCR_AddDirtyPoint(gx, pad);
++	SCR_AddDirtyPoint(gx + graphW, gy + graphH);
++}
++
+ // ----
+ /*
+  * This is called every frame, and can also be called
+@@ -1738,6 +1832,7 @@
+ 	}
+ 
+ 	SCR_Framecounter();
++	SCR_DrawFrametimeGraph();
+ 	R_EndFrame();
+ }
+ 

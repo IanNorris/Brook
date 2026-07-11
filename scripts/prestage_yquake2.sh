@@ -27,15 +27,15 @@ for tool in fuse2fs nix-build nix-store; do
     command -v "$tool" &>/dev/null || { echo "ERROR: $tool not found. Run inside nix-shell." >&2; exit 1; }
 done
 
-echo "Realising yquake2 closure on the host (substitutes from cache if needed)..."
-YQ2_OUT="$(nix-build '<nixpkgs>' -A yquake2 --no-out-link 2>/dev/null \
-            || nix build --no-link --print-out-paths nixpkgs#yquake2 | tail -1)"
+echo "Building the Brook yquake2 (stock + brook-features.patch: durable settings"
+echo "+ frametime overlay) on the host..."
+YQ2_OUT="$(nix-build "${ROOT_DIR}/tools/yquake2-brook-pkg" --no-out-link 2>/dev/null)"
 if [ -z "${YQ2_OUT}" ] || [ ! -x "${YQ2_OUT}/bin/yquake2" ]; then
-    echo "ERROR: failed to realise nixpkgs#yquake2 on the host." >&2
+    echo "ERROR: failed to build tools/yquake2-brook-pkg." >&2
     exit 1
 fi
 YQ2_BASE="$(basename "${YQ2_OUT}")"
-echo "  yquake2 -> ${YQ2_OUT}"
+echo "  yquake2(brook) -> ${YQ2_OUT}"
 
 # Realise the Brook OSS build of openal-soft. yquake2 dlopen()s libopenal.so.1
 # by bare soname; the stock closure openal has only pulse/alsa/wave backends,
