@@ -230,6 +230,11 @@ struct brook_surface {
     struct brook_surface *children;   /* linked list of child subsurfaces */
     struct brook_surface *sibling;    /* next child in parent's children list */
     struct wl_resource   *subsurface_resource; /* wl_subsurface resource if role is subsurface */
+
+    /* WM keyboard-focus latch, set/cleared from WM_EVT_FOCUS_GAINED/LOST
+     * independently of wl_keyboard existence.  Lets a late-created keyboard
+     * recover the enter that would otherwise have been dropped (BRO-210). */
+    int wm_focused;
 };
 
 static struct brook_surface *g_surfaces = NULL;
@@ -1511,6 +1516,27 @@ static void seat_get_keyboard(struct wl_client *c, struct wl_resource *r, uint32
     }
     if (wl_resource_get_version(k) >= 4)
         wl_keyboard_send_repeat_info(k, 25, 600);
+
+    /* Race recovery: the WM may already have granted keyboard focus to one of
+     * this client's surfaces (WM_EVT_FOCUS_GAINED) before the client got here
+     * and created its wl_keyboard.  In that case the one-shot enter was
+     * dropped; send it now so keys flow for the window's whole lifetime. */
+    if (sc && sc->keyboard) {
+        for (struct brook_surface *s = g_surfaces; s; s = s->next) {
+            if (!s->wm_focused || !s->resource) continue;
+            if (wl_resource_get_client(s->resource) != c) continue;
+            if (sc->kb_focus == s) break;
+            struct wl_array keys; wl_array_init(&keys);
+            wl_keyboard_send_enter(sc->keyboard, next_serial(), s->resource, &keys);
+            wl_array_release(&keys);
+            wl_keyboard_send_modifiers(sc->keyboard, next_serial(),
+                                       sc->kb_mods_depressed, 0u,
+                                       sc->kb_mods_locked, 0u);
+            sc->kb_focus = s;
+            fprintf(stderr, "[waylandd] keyboard enter (deferred) wm=%u\n", s->wm_id);
+            break;
+        }
+    }
 }
 static void seat_get_touch(struct wl_client *c, struct wl_resource *r, uint32_t id) {
     struct wl_resource *t = wl_resource_create(c, &wl_touch_interface,
@@ -1814,6 +1840,10 @@ static void pump_input_for_surface(struct brook_surface *s) {
             break;
         }
         case WM_EVT_FOCUS_GAINED: {
+            /* Remember WM focus at the surface level, independent of whether
+             * the client has created its wl_keyboard yet.  seat_get_keyboard()
+             * consults this to send a deferred enter and close the race. */
+            s->wm_focused = 1;
             if (sc && sc->keyboard && sc->kb_focus != s) {
                 struct wl_array keys; wl_array_init(&keys);
                 wl_keyboard_send_enter(sc->keyboard, next_serial(),
@@ -1830,6 +1860,7 @@ static void pump_input_for_surface(struct brook_surface *s) {
             break;
         }
         case WM_EVT_FOCUS_LOST: {
+            s->wm_focused = 0;
             if (sc && sc->keyboard && sc->kb_focus == s) {
                 wl_keyboard_send_leave(sc->keyboard, next_serial(), s->resource);
                 sc->kb_focus = NULL;
@@ -1937,8 +1968,13 @@ static void deco_mgr_get_toplevel_decoration(struct wl_client *c,
     if (s) s->deco_negotiated = 1;
     fprintf(stderr, "[waylandd] decoration get_toplevel_decoration surface=%p\n",
             (void*)s);
-    /* Default to CSD: the client opted in by binding the manager. */
-    deco_apply_mode(d, 1);
+    /* Default to SERVER-SIDE decorations per Brook's WM policy.  Clients that
+     * genuinely want CSD (e.g. GTK) explicitly request set_mode(CLIENT_SIDE);
+     * clients like SDL2 prefer SSD but only request it on their first toplevel.
+     * When SDL destroys/recreates its toplevel (GL context swap) the second one
+     * re-binds decoration but never re-requests a mode -- defaulting to CSD here
+     * left those windows chrome-less (BRO-211). */
+    deco_apply_mode(d, 0);
 }
 static const struct zxdg_decoration_manager_v1_interface deco_mgr_impl = {
     .destroy                = deco_mgr_destroy,
