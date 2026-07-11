@@ -52,9 +52,18 @@ OPENAL_OSS_BASE="$(basename "${OPENAL_OSS_OUT}")"
 echo "  openal-soft(OSS) -> ${OPENAL_OSS_OUT}"
 
 MNTDIR="$(mktemp -d)"
+# EXT2_MNT is set later when the /data image is mounted. Track it here so the
+# EXIT trap ALWAYS unmounts it — otherwise a failure between mount and the inline
+# unmount (e.g. a chown error under set -e) leaves a dangling fuse2fs mount, and
+# the next run's e2fsck refuses with "filesystem is mounted".
+EXT2_MNT=""
 cleanup() {
     fusermount -u "${MNTDIR}" 2>/dev/null || fusermount -uz "${MNTDIR}" 2>/dev/null || true
     rmdir "${MNTDIR}" 2>/dev/null || true
+    if [ -n "${EXT2_MNT}" ]; then
+        fusermount -u "${EXT2_MNT}" 2>/dev/null || fusermount -uz "${EXT2_MNT}" 2>/dev/null || true
+        rmdir "${EXT2_MNT}" 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT
 
@@ -136,13 +145,24 @@ sync
 EXT2_IMG="${BROOK_EXT2_DISK:-${ROOT_DIR}/brook_ext2_disk.img}"
 DATA_OK=0
 if [ -f "${EXT2_IMG}" ]; then
+    # Clean up any stale fuse2fs mount of this image left by a previously failed
+    # run (e.g. one that aborted between mount and unmount). e2fsck refuses to
+    # touch a mounted filesystem ("... is mounted"), so we must unmount first.
+    EXT2_IMG_REAL="$(readlink -f "${EXT2_IMG}")"
+    while IFS= read -r stale_mp; do
+        [ -n "${stale_mp}" ] || continue
+        echo "  unmounting stale fuse2fs mount at ${stale_mp}"
+        fusermount -u "${stale_mp}" 2>/dev/null || fusermount -uz "${stale_mp}" 2>/dev/null || true
+    done < <(awk -v img="${EXT2_IMG_REAL}" '$1==img {print $2}' /proc/mounts 2>/dev/null)
+
     # Repair the ext2 image before mounting. yquake2 (and other guests) write to
     # /data, and if a prior guest run left the filesystem inconsistent, fuse2fs
     # hits EUCLEAN ("Structure needs cleaning") mid-operation and flips the mount
     # read-only — so the chown below fails and HOME never becomes uid-1000-owned.
     # e2fsck -fy auto-repairs (orphaned inodes, bad counts) so the mount is clean.
-    # This is safe: the image is not mounted here yet, and prestage runs on the
-    # host against the on-disk image, not a live-booted disk.
+    # This is safe: the image is not mounted here yet (stale mounts cleaned
+    # above), and prestage runs on the host against the on-disk image, not a
+    # live-booted disk. Do NOT run this while QEMU is booted against the image.
     if command -v e2fsck >/dev/null 2>&1; then
         echo "Checking ${EXT2_IMG} (e2fsck -fy)..."
         e2fsck -fy "${EXT2_IMG}" 2>&1 | sed 's/^/  /' || \
@@ -180,6 +200,7 @@ if [ -f "${EXT2_IMG}" ]; then
         echo "  WARNING: could not mount ${EXT2_IMG}; create /data/yq2 (uid 1000) manually." >&2
     fi
     rmdir "${EXT2_MNT}" 2>/dev/null || true
+    EXT2_MNT=""   # unmounted above — clear so the EXIT trap doesn't retry
 else
     echo "  NOTE: ext2 /data disk not found (${EXT2_IMG}); create /data/yq2 owned by uid 1000 yourself." >&2
 fi
