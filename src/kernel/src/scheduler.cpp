@@ -1331,6 +1331,29 @@ static bool SavedCtxLooksCorrupt(const brook::SavedContext& c)
     return false;
 }
 
+// BRO-208 diagnostic: the RSVD-bit #PF signature (corrupt paging entry) says a
+// process's page-table frame was reused/overwritten. Every address space copies
+// the kernel-half PML4 entries (indices 256..511) verbatim from the reference
+// kernel PML4 at creation (VmmCreateUserPageTable), so they MUST stay identical.
+// If the about-to-be-loaded CR3's kernel-half PML4 entries differ from the
+// reference, the page table (or its backing frame) is corrupt — catch it BEFORE
+// `mov %rax,%cr3` switches onto it and the next kernel access takes an RSVD #PF.
+// Returns the first mismatching index (0..255 mapped to 256..511) or -1 if OK.
+static int NewCtxPml4KernelHalfCorrupt(uint64_t cr3)
+{
+    using namespace brook;
+    uint64_t refPhys = VmmKernelCR3().pml4.raw();
+    if (refPhys == 0) return -1;                 // kernel PT not ready — skip
+    if (cr3 == refPhys) return -1;               // switching to kernel CR3 itself
+    const uint64_t* newPml4 =
+        reinterpret_cast<const uint64_t*>(PhysToVirt(PhysicalAddress(cr3)).raw());
+    const uint64_t* refPml4 =
+        reinterpret_cast<const uint64_t*>(PhysToVirt(PhysicalAddress(refPhys)).raw());
+    for (int i = 256; i < 512; i++)
+        if (newPml4[i] != refPml4[i]) return i;
+    return -1;
+}
+
 // Perform a context switch from `oldProc` to `newProc`.
 // If `requeueOld` is true, the old process is re-inserted into the ready
 // queue **after** context_switch has saved its state — this prevents the
@@ -1543,17 +1566,31 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
 
     ProfilerContextSwitch(oldProc->pid, newProc->pid);
 
-    // BRO-208 diagnostic: catch a corrupted saved context BEFORE context_switch
-    // restores it and jumps to garbage. The downstream symptoms (wild #UD at
-    // g_gdtRaw+8, heap pointer in the IRET-frame SS slot) are variable and hard
-    // to attribute; catching the bad context here — while newProc->magic and the
-    // sched-trace ring are still readable — localizes the corruption. Re-check
-    // magic so we can tell a savedCtx-only stomp (magic intact) from a broad
-    // Process-struct overwrite (magic also gone).
-    if (SavedCtxLooksCorrupt(newProc->savedCtx))
+    // BRO-208 diagnostic: catch a corrupted saved context or page table BEFORE
+    // context_switch restores/loads it and faults. The downstream symptoms (wild
+    // #UD at g_gdtRaw+8, heap pointer in the IRET-frame SS slot, or an RSVD-bit
+    // #PF at context_switch+0x91 from a corrupt CR3) are variable and hard to
+    // attribute; catching it here — while newProc->magic and the sched-trace ring
+    // are still readable — localizes the corruption. Re-check magic so we can
+    // tell a savedCtx-only stomp (magic intact) from a broad Process-struct
+    // overwrite (magic also gone).
+    int pml4Bad = NewCtxPml4KernelHalfCorrupt(newProc->savedCtx.cr3);
+    if (SavedCtxLooksCorrupt(newProc->savedCtx) || pml4Bad >= 0)
     {
         const auto& c = newProc->savedCtx;
-        SerialPrintf("\n!!! BRO-208 SAVED-CTX CORRUPT (caught pre-switch) on CPU%u\n", cpu);
+        SerialPrintf("\n!!! BRO-208 CORRUPT CONTEXT (caught pre-switch) on CPU%u %s\n",
+                     cpu, pml4Bad >= 0 ? "[PML4 kernel-half mismatch]"
+                                       : "[savedCtx fields]");
+        if (pml4Bad >= 0)
+        {
+            uint64_t refPhys = brook::VmmKernelCR3().pml4.raw();
+            const uint64_t* np = reinterpret_cast<const uint64_t*>(
+                brook::PhysToVirt(brook::PhysicalAddress(c.cr3)).raw());
+            const uint64_t* rp = reinterpret_cast<const uint64_t*>(
+                brook::PhysToVirt(brook::PhysicalAddress(refPhys)).raw());
+            SerialPrintf("!!! PML4[%d] corrupt: new=0x%016lx ref=0x%016lx (cr3=0x%lx refcr3=0x%lx)\n",
+                         pml4Bad, np[pml4Bad], rp[pml4Bad], c.cr3, refPhys);
+        }
         SerialPrintf("!!! newProc=%p pid=%u name='%s' state=%d magic=0x%lx %s\n",
                      (void*)newProc, newProc->pid, newProc->name, (int)newProc->state,
                      newProc->magic,
