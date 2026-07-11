@@ -136,12 +136,28 @@ sync
 EXT2_IMG="${BROOK_EXT2_DISK:-${ROOT_DIR}/brook_ext2_disk.img}"
 DATA_OK=0
 if [ -f "${EXT2_IMG}" ]; then
+    # Repair the ext2 image before mounting. yquake2 (and other guests) write to
+    # /data, and if a prior guest run left the filesystem inconsistent, fuse2fs
+    # hits EUCLEAN ("Structure needs cleaning") mid-operation and flips the mount
+    # read-only — so the chown below fails and HOME never becomes uid-1000-owned.
+    # e2fsck -fy auto-repairs (orphaned inodes, bad counts) so the mount is clean.
+    # This is safe: the image is not mounted here yet, and prestage runs on the
+    # host against the on-disk image, not a live-booted disk.
+    if command -v e2fsck >/dev/null 2>&1; then
+        echo "Checking ${EXT2_IMG} (e2fsck -fy)..."
+        e2fsck -fy "${EXT2_IMG}" 2>&1 | sed 's/^/  /' || \
+            echo "  (e2fsck reported issues; it repairs what it can — continuing)"
+    fi
     EXT2_MNT="$(mktemp -d)"
     if fuse2fs -o rw,fakeroot "${EXT2_IMG}" "${EXT2_MNT}" 2>/dev/null; then
-        mkdir -p "${EXT2_MNT}/yq2/.yq2/baseq2"
-        chown -R 1000:100 "${EXT2_MNT}/yq2"
-        echo "  /data/yq2 (HOME) + .yq2/baseq2 created on ${EXT2_IMG}, owned uid 1000:100"
-
+        if mkdir -p "${EXT2_MNT}/yq2/.yq2/baseq2" 2>/dev/null && \
+           chown -R 1000:100 "${EXT2_MNT}/yq2" 2>/dev/null; then
+            echo "  /data/yq2 (HOME) + .yq2/baseq2 created on ${EXT2_IMG}, owned uid 1000:100"
+        else
+            echo "  ERROR: failed to create/chown /data/yq2 — the ext2 image may still be" >&2
+            echo "         corrupt (fuse2fs flipped read-only). Run: e2fsck -fy ${EXT2_IMG}" >&2
+            echo "         then re-run this script." >&2
+        fi
         # yquake2 reads the game data from the SAME path the native software
         # Quake II port uses — /data/games/quake2/baseq2/pak0.pak — via -datadir
         # in the wrapper. So the two SHARE one copy; nothing to duplicate or
