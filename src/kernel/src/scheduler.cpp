@@ -21,8 +21,9 @@
 // LAPIC tick counter (defined in apic.cpp, volatile because ISR-modified).
 namespace brook { extern volatile uint64_t g_lapicTickCount; }
 
-// BRO-208: futex waiter enumerator (defined in syscall.cpp) for the hang dump.
+// BRO-208: futex diagnostics (defined in syscall.cpp) for the hang dump.
 extern "C" void FutexDumpWaiters(uint16_t tgidFilter);
+extern "C" void FutexDumpTrace(uint16_t tgidFilter, uint32_t maxEntries);
 
 // Context switch — implemented in context_switch.S
 extern "C" void context_switch(brook::SavedContext* oldCtx, brook::SavedContext* newCtx,
@@ -2710,6 +2711,9 @@ extern "C" void SchedulerDumpHang()
     // futex whose word no other thread will wake is the fingerprint.
     {
         FutexDumpWaiters(0);
+        // BRO-208: replay the recent futex op history so a lost/misdirected WAKE
+        // or a wake-before-wait ordering bug is visible as a time-series.
+        FutexDumpTrace(0, 200);
     }
     HangPuts("==================== END HANG DUMP ====================\n\n");
 }

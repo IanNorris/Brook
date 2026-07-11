@@ -11070,6 +11070,100 @@ static void FutexFreeWaiter(FutexWaiter* w)
     g_futexWaiterPool.Free(w);
 }
 
+// BRO-208: LAPIC tick counter (defined in apic.cpp) — used by the futex trace.
+extern volatile uint64_t g_lapicTickCount;
+
+// ---------------------------------------------------------------------------
+// BRO-208: futex operation TIME-SERIES trace ring.
+// ---------------------------------------------------------------------------
+// A single global ring records every futex op (WAKE / WAKE_OP / WAIT-park /
+// WAIT-return / WAIT-EAGAIN) with a timestamp, so on a hang we can replay the
+// final WAIT/WAKE exchange per user address. This disambiguates the two hangs a
+// single SchedulerDumpHang snapshot cannot tell apart:
+//   * a genuine app wait  (nobody was ever asked to wake these waiters), vs
+//   * a misdirected/zero-effect WAKE (a wake landed on an address with 0 waiters,
+//     or a WAIT parked AFTER its wake — the classic lost-wakeup ordering bug).
+// Lock-free (atomic seq, best-effort read during a quiesced hang), like the PMM
+// free-log and the asLive ring. Toggle g_futexTraceOn to disable if the extra
+// atomic per op ever perturbs a timing-sensitive repro.
+enum FutexTraceKind : uint8_t {
+    FTK_WAKE        = 1,   // FUTEX_WAKE/WAKE_BITSET: val=maxWake, result=woken
+    FTK_WAKE_OP     = 2,   // FUTEX_WAKE_OP:          val=maxWake1, result=total woken
+    FTK_WAIT_EAGAIN = 3,   // FUTEX_WAIT: *uaddr != val, did not park (result=word)
+    FTK_WAIT_PARK   = 4,   // FUTEX_WAIT: enqueued + about to block (val=expected)
+    FTK_WAIT_WAKE   = 5,   // FUTEX_WAIT: resumed (val=selfDequeued?1:0, result=retcode)
+};
+
+struct FutexTraceEntry {
+    uint64_t seq;
+    uint64_t tick;
+    uint64_t uaddr;
+    uint16_t pid;
+    uint16_t owner;
+    uint8_t  kind;
+    int32_t  val;
+    int64_t  result;
+};
+
+static constexpr uint32_t FUTEX_TRACE_SIZE = 2048;   // power of two
+static FutexTraceEntry g_futexTrace[FUTEX_TRACE_SIZE];
+static volatile uint64_t g_futexTraceSeq = 0;
+static volatile bool g_futexTraceOn = true;
+
+static inline void FutexTrace(uint8_t kind, uint16_t owner, uint64_t uaddr,
+                              int32_t val, int64_t result)
+{
+    if (!g_futexTraceOn) return;
+    Process* p = ProcessCurrent();
+    uint64_t s = __atomic_fetch_add(&g_futexTraceSeq, 1, __ATOMIC_RELAXED);
+    FutexTraceEntry& e = g_futexTrace[s & (FUTEX_TRACE_SIZE - 1)];
+    e.seq = s;
+    e.tick = g_lapicTickCount;
+    e.uaddr = uaddr;
+    e.pid = p ? p->pid : 0;
+    e.owner = owner;
+    e.kind = kind;
+    e.val = val;
+    e.result = result;
+}
+
+// Dump the last `maxEntries` futex-trace events, optionally filtered to one
+// owner/tgid. Called from SchedulerDumpHang. Best-effort, lock-free.
+extern "C" void FutexDumpTrace(uint16_t tgidFilter, uint32_t maxEntries)
+{
+    auto puts = [](const char* s){ if (s) while (*s) SerialPutChar(*s++); };
+    auto hex  = [](uint64_t v){ SerialPutChar('0'); SerialPutChar('x');
+        for (int i = 60; i >= 0; i -= 4) SerialPutChar("0123456789abcdef"[(v >> i) & 0xF]); };
+    auto dec  = [](int64_t v){ if (v < 0){ SerialPutChar('-'); v = -v; } char b[20]; int i = 0;
+        if (!v) b[i++] = '0'; while (v){ b[i++] = (char)('0' + v % 10); v /= 10; } while (i) SerialPutChar(b[--i]); };
+    const char* kindName[6] = { "?", "WAKE    ", "WAKE_OP ", "W_EAGAIN", "W_PARK  ", "W_WAKE  " };
+
+    puts("--- futex op trace (most recent last");
+    if (tgidFilter) { puts(", owner/tgid="); dec(tgidFilter); }
+    puts(") ---\n");
+    uint64_t total = g_futexTraceSeq;
+    if (total == 0) { puts("  (empty)\n"); return; }
+    uint64_t window = (total < FUTEX_TRACE_SIZE) ? total : FUTEX_TRACE_SIZE;
+    if (maxEntries && window > maxEntries) window = maxEntries;
+    uint64_t start = total - window;
+    uint32_t shown = 0;
+    for (uint64_t s = start; s < total; ++s)
+    {
+        FutexTraceEntry& e = g_futexTrace[s & (FUTEX_TRACE_SIZE - 1)];
+        if (e.seq != s) continue;                 // overwritten mid-read; skip
+        if (tgidFilter && e.owner != tgidFilter) continue;
+        puts("  t="); dec((int64_t)e.tick);
+        puts(" pid="); dec((int64_t)e.pid);
+        puts(" "); puts(e.kind < 6 ? kindName[e.kind] : "?");
+        puts(" uaddr="); hex(e.uaddr);
+        puts(" val="); dec((int64_t)e.val);
+        puts(" result="); dec(e.result);
+        SerialPutChar('\n');
+        ++shown;
+    }
+    if (!shown) puts("  (no matching entries)\n");
+}
+
 static uint32_t FutexHash(uint64_t owner, uint64_t addr)
 {
     return static_cast<uint32_t>(((addr >> 2) ^ owner) % FUTEX_HASH_SIZE);
@@ -11225,6 +11319,7 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
             : FUTEX_BITSET_MATCH_ANY;
         if (wake_bitset == 0) return -EINVAL;
         int64_t r = FutexWake(owner, uaddrVal, maxWake, wake_bitset);
+        FutexTrace(FTK_WAKE, (uint16_t)owner, uaddrVal, (int32_t)maxWake, r);
         return r;
     }
 
@@ -11274,6 +11369,7 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
         int64_t woken = maxWake1 ? FutexWake(owner, uaddrVal, maxWake1) : 0;
         if (cmp && maxWake2)
             woken += FutexWake(owner, arg5, maxWake2);
+        FutexTrace(FTK_WAKE_OP, (uint16_t)owner, uaddrVal, (int32_t)maxWake1, woken);
         return woken;
     }
 
@@ -11296,7 +11392,9 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
 
         // Check if *uaddr == val while holding the lock
         if (__atomic_load_n(uaddr, __ATOMIC_ACQUIRE) != static_cast<uint32_t>(val)) {
+            uint32_t seen = __atomic_load_n(uaddr, __ATOMIC_ACQUIRE);
             IrqSpinLockRelease(&g_futexLock, fxFlags);
+            FutexTrace(FTK_WAIT_EAGAIN, (uint16_t)owner, uaddrVal, (int32_t)val, (int64_t)seen);
             return -EAGAIN;
         }
 
@@ -11330,19 +11428,24 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
         // process must never be descheduled with interrupts disabled.
         IrqSpinLockRelease(&g_futexLock, fxFlags);
 
+        FutexTrace(FTK_WAIT_PARK, (uint16_t)owner, uaddrVal, (int32_t)val, 0);
+
         // Block until FUTEX_WAKE removes our waiter, a signal arrives, or an
         // optional timeout expires and the scheduler wakes us.
         SchedulerBlock(proc);
 
-        if (FutexRemoveWaiter(owner, uaddrVal, proc))
+        // Determine the return code, preserving the BRO-205 spurious-wake logic,
+        // then record a single WAIT-return trace event before returning.
+        int64_t ret;
+        bool selfDequeued = FutexRemoveWaiter(owner, uaddrVal, proc);
+        if (selfDequeued)
         {
             // We dequeued our own waiter — i.e. no FUTEX_WAKE removed us; we
             // resumed via the scheduler (signal, timeout, or a SPURIOUS unblock
             // such as SchedulerBlock's pendingWakeup early-return under SMP
             // load).
             if (HasPendingSignals())
-                return -EINTR;
-
+                ret = -EINTR;
             // BRO-205: report ETIMEDOUT ONLY for a real, finite deadline that
             // has actually expired. A spurious wake on an INFINITE wait (or one
             // whose deadline hasn't arrived yet) must NOT be reported as a
@@ -11350,21 +11453,24 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
             // contended mutex (e.g. the mutex re-lock inside pthread_cond_wait)
             // and calls futex_fatal_error() -> abort ("The futex facility
             // returned an unexpected error code") on ANY return other than
-            // 0/EAGAIN/EINTR — ETIMEDOUT included. Returning ETIMEDOUT here for a
-            // spurious wake crashed every glibc app that re-locks a contended
-            // mutex after a condvar wait (yquake2/mesa llvmpipe, intermittently).
-            extern volatile uint64_t g_lapicTickCount;
-            if (deadline != ~0ULL && g_lapicTickCount >= deadline)
-                return -ETIMEDOUT;
-
+            // 0/EAGAIN/EINTR — ETIMEDOUT included.
+            else if (deadline != ~0ULL && g_lapicTickCount >= deadline)
+                ret = -ETIMEDOUT;
             // Spurious / early wake — behave like a spurious FUTEX_WAKE: return 0
             // so the caller rechecks the futex word and re-waits if needed. This
             // is always safe; correct futex users must re-test their condition
             // after any wake.
-            return 0;
+            else
+                ret = 0;
         }
-
-        return 0;
+        else
+        {
+            // A FUTEX_WAKE removed our waiter — the normal wake path.
+            ret = 0;
+        }
+        FutexTrace(FTK_WAIT_WAKE, (uint16_t)owner, uaddrVal,
+                   (int32_t)(selfDequeued ? 1 : 0), ret);
+        return ret;
     }
 
     // PI futexes (priority inheritance): stub as simple wait/wake.
