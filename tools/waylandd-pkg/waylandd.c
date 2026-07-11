@@ -1940,12 +1940,13 @@ static void pump_input_for_surface(struct brook_surface *s) {
                                            depressed, 0u, locked, 0u);
             }
 
-            /* Debug: log key events with modifier info */
-            if (e->scan == 0x2A || e->scan == 0x36 || depressed || locked)
-                fprintf(stderr, "[waylandd] KEY sc=0x%02x xkb=%u %s mods=0x%02x dep=%u lock=%u\n",
-                        e->scan, xkb_code,
-                        st == WL_KEYBOARD_KEY_STATE_PRESSED ? "DN" : "UP",
-                        e->mods, depressed, locked);
+            /* BRO-216 diag: log EVERY key (scan -> xkb keycode, state, mods) so a
+             * scrambled/inconsistent mapping is visible end-to-end. Remove once
+             * the input path is confirmed. */
+            fprintf(stderr, "[waylandd] KEY sc=0x%02x xkb=%u %s mods=0x%02x dep=%u lock=%u\n",
+                    e->scan, xkb_code,
+                    st == WL_KEYBOARD_KEY_STATE_PRESSED ? "DN" : "UP",
+                    e->mods, depressed, locked);
             sc->kb_mods_depressed = depressed;
             sc->kb_mods_locked    = locked;
             break;
