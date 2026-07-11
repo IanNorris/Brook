@@ -1298,6 +1298,39 @@ static void ReapTerminated()
     __atomic_store_n(&g_reapInProgress, 0, __ATOMIC_RELEASE);
 }
 
+// BRO-208 diagnostic: end of kernel .text (from linker.ld). A legitimate
+// saved resume-RIP is always a kernel-text address — one of the trampolines
+// (KernelThreadTrampoline / ForkChildTrampoline / ProcessTrampoline / IdleLoop)
+// or the context_switch resume stub. A value outside .text (e.g. 0x801b5008 in
+// .bss, the GDT storage) means the saved context was corrupted.
+extern "C" char __etext[];
+
+// BRO-208 diagnostic: does an incoming saved context look corrupt?  The
+// observed crashes restore a wild RIP (jump to g_gdtRaw+8 -> #UD) or push a
+// bad IRET frame (heap pointer in the SS slot) because a thread's savedCtx
+// fields were stamped with foreign bytes under heavy SMP churn.  These
+// invariants hold for EVERY legitimate context; a violation is corruption.
+static bool SavedCtxLooksCorrupt(const brook::SavedContext& c)
+{
+    constexpr uint64_t KTEXT_LO    = 0xFFFFFFFF80000000ULL;
+    const     uint64_t KTEXT_HI    = reinterpret_cast<uint64_t>(__etext);
+    constexpr uint64_t KVMALLOC_LO = 0xFFFFC00000000000ULL;         // VMALLOC_BASE
+    constexpr uint64_t KVMALLOC_HI = KVMALLOC_LO + (32ULL << 30);   // + VMALLOC_SIZE
+    auto canonKern = [](uint64_t a) -> bool { return (a >> 47) == 0x1FFFFULL; };
+
+    // Resume RIP must be real kernel code (a trampoline or the switch stub).
+    if (c.rip < KTEXT_LO || c.rip >= KTEXT_HI) return true;
+    // Kernel stack pointer must live in the guard-paged VMALLOC stack region.
+    if (!canonKern(c.rsp) || c.rsp < KVMALLOC_LO || c.rsp >= KVMALLOC_HI) return true;
+    // Frame pointer must be canonical-kernel (or zero for a fresh trampoline).
+    if (c.rbp != 0 && !canonKern(c.rbp)) return true;
+    // CR3 must be a nonzero, page-aligned physical address (< 256 GB sanity).
+    if (c.cr3 == 0 || (c.cr3 & 0xFFFULL) || c.cr3 >= (256ULL << 30)) return true;
+    // RFLAGS reserved bit 1 is always set; the high 32 bits are always zero.
+    if (!(c.rflags & 0x2ULL) || (c.rflags >> 32) != 0) return true;
+    return false;
+}
+
 // Perform a context switch from `oldProc` to `newProc`.
 // If `requeueOld` is true, the old process is re-inserted into the ready
 // queue **after** context_switch has saved its state — this prevents the
@@ -1509,6 +1542,50 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
     SmpSetCurrentCr3(cpu, newProc->savedCtx.cr3);
 
     ProfilerContextSwitch(oldProc->pid, newProc->pid);
+
+    // BRO-208 diagnostic: catch a corrupted saved context BEFORE context_switch
+    // restores it and jumps to garbage. The downstream symptoms (wild #UD at
+    // g_gdtRaw+8, heap pointer in the IRET-frame SS slot) are variable and hard
+    // to attribute; catching the bad context here — while newProc->magic and the
+    // sched-trace ring are still readable — localizes the corruption. Re-check
+    // magic so we can tell a savedCtx-only stomp (magic intact) from a broad
+    // Process-struct overwrite (magic also gone).
+    if (SavedCtxLooksCorrupt(newProc->savedCtx))
+    {
+        const auto& c = newProc->savedCtx;
+        SerialPrintf("\n!!! BRO-208 SAVED-CTX CORRUPT (caught pre-switch) on CPU%u\n", cpu);
+        SerialPrintf("!!! newProc=%p pid=%u name='%s' state=%d magic=0x%lx %s\n",
+                     (void*)newProc, newProc->pid, newProc->name, (int)newProc->state,
+                     newProc->magic,
+                     newProc->magic == PROCESS_MAGIC ? "(magic OK -> savedCtx-only stomp)"
+                                                     : "(magic BAD -> broad struct overwrite)");
+        SerialPrintf("!!!   rip=0x%lx rsp=0x%lx rbp=0x%lx rflags=0x%lx\n",
+                     c.rip, c.rsp, c.rbp, c.rflags);
+        SerialPrintf("!!!   cr3=0x%lx fsBase=0x%lx\n", c.cr3, c.fsBase);
+        SerialPrintf("!!!   r15=0x%lx r14=0x%lx r13=0x%lx r12=0x%lx rbx=0x%lx\n",
+                     c.r15, c.r14, c.r13, c.r12, c.rbx);
+        SerialPrintf("!!! oldProc=%p pid=%u name='%s' state=%d\n",
+                     (void*)oldProc, oldProc->pid, oldProc->name, (int)oldProc->state);
+        SerialPrintf("!!! ranges: VMALLOC-stacks[0x%lx,0x%lx) HEAP@0x%lx TEXT[0x%lx,0x%lx)\n",
+                     0xFFFFC00000000000ULL, 0xFFFFC00800000000ULL,
+                     0xFFFFC08000000000ULL, 0xFFFFFFFF80000000ULL,
+                     reinterpret_cast<uint64_t>(__etext));
+        // Recent scheduler ops on the corrupted process (BRO-176 trace ring):
+        // each entry packs (tick<<16 | site<<8 | state), newest at head-1.
+        SerialPrintf("!!! newProc schedTrace (head=%u, newest first):\n",
+                     newProc->schedTraceHead);
+        for (int i = 0; i < 12; ++i)
+        {
+            int idx = ((int)newProc->schedTraceHead - 1 - i + 24) % 12;
+            uint64_t e = newProc->schedTrace[idx];
+            if (!e) continue;
+            SerialPrintf("!!!   [%d] tick=%lu site=%lu state=%lu raw=0x%lx\n",
+                         i, (e >> 16), (e >> 8) & 0xFF, e & 0xFF, e);
+        }
+        SerialPrintf("!!! halting CPU%u — corrupt context caught before switch\n", cpu);
+        __asm__ volatile("cli");
+        for (;;) __asm__ volatile("hlt");
+    }
 
     context_switch(&oldProc->savedCtx, &newProc->savedCtx,
                    &oldProc->fxsave, &newProc->fxsave,

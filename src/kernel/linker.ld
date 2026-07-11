@@ -8,6 +8,9 @@ SECTIONS
     .text : {
         *(.text .text.*)
     }
+    /* End of kernel .text — used by the BRO-208 saved-context validator to
+       assert that a thread's resume RIP points at real kernel code. */
+    __etext = .;
 
     .rodata : ALIGN(4096) {
         *(.rodata .rodata.*)
