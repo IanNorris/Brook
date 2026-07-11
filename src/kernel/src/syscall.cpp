@@ -2883,7 +2883,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         int fd = FdAlloc(proc, FdType::MemFd, entry->mfd);
         if (fd < 0) return -EMFILE;
         MemFdRef(entry->mfd);
-        SerialPrintf("shm_open: '%s' fd=%d size=%llu\n", shmName, fd, entry->mfd->size);
+        DbgPrintf("shm_open: '%s' fd=%d size=%llu\n", shmName, fd, entry->mfd->size);
         return fd;
     }
 
@@ -2930,18 +2930,6 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
 
     if (!vn)
     {
-        // Diagnostic: log pak open failures
-        bool isPak = false;
-        for (const char* p = lookupPath; *p; ++p)
-            if (p[0] == 'p' && p[1] == 'a' && p[2] == 'k') { isPak = true; break; }
-        if (isPak)
-        {
-            uint32_t usedFds = 0;
-            for (uint32_t fi = 0; fi < MAX_FDS; fi++)
-                if (proc->fds[fi].type != FdType::None) usedFds++;
-            SerialPrintf("sys_open FAIL: '%s' (resolved '%s') fds=%u/%u\n",
-                         path, lookupPath, usedFds, MAX_FDS);
-        }
         return -ENOENT;
     }
 
