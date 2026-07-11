@@ -56,6 +56,7 @@
 #define BROOK_SYS_WM_SET_CURSOR_VISIBLE 518
 #define BROOK_SYS_WM_SET_CURSOR_IMAGE  519
 #define BROOK_SYS_WM_GET_SCREEN_INFO  520
+#define BROOK_SYS_WM_SET_FULLSCREEN   525
 #define BROOK_WM_CREATE_FLAG_CSD     1u
 #define BROOK_WM_CREATE_FLAG_NO_FOCUS 2u
 
@@ -137,6 +138,10 @@ static long wm_move_relative(uint32_t id, uint32_t parent_id, int32_t x, int32_t
 }
 static long wm_set_maximized(uint32_t id, int enable) {
     return syscall(BROOK_SYS_WM_SET_MAXIMIZED, (long)id, (long)enable);
+}
+/* Returns packed (outW<<32 | outH) on success, negative errno on failure. */
+static long wm_set_fullscreen(uint32_t id, int enable) {
+    return syscall(BROOK_SYS_WM_SET_FULLSCREEN, (long)id, (long)enable);
 }
 static long wm_set_minimized(uint32_t id) {
     return syscall(BROOK_SYS_WM_SET_MINIMIZED, (long)id);
@@ -829,12 +834,62 @@ static void xdg_toplevel_unset_maximized(struct wl_client *c, struct wl_resource
     fprintf(stderr, "[waylandd] xdg_toplevel.unset_maximized wm=%u rc=%ld\n",
             s->wm_id, rc);
 }
+static uint32_t next_serial(void);  /* defined below; needed by the configure helper */
+/* Send the paired configure that a fullscreen/unfullscreen transition needs:
+ * xdg_toplevel.configure carrying the target size + a states array (SDL keys on
+ * XDG_TOPLEVEL_STATE_FULLSCREEN to drop chrome and size its GL viewport to the
+ * whole screen), immediately followed by xdg_surface.configure(serial) which
+ * the client must ack before it commits the new buffer. */
+static void send_fullscreen_configure(struct brook_surface *s,
+                                      int32_t w, int32_t h, int fullscreen) {
+    if (!s->xdg_toplevel || !s->xdg_surface) return;
+    struct wl_array states;
+    wl_array_init(&states);
+    if (wl_resource_get_version(s->xdg_toplevel) >= 2) {
+        if (fullscreen) {
+            uint32_t *st = wl_array_add(&states, sizeof(uint32_t));
+            if (st) *st = XDG_TOPLEVEL_STATE_FULLSCREEN;
+        }
+        uint32_t *sa = wl_array_add(&states, sizeof(uint32_t));
+        if (sa) *sa = XDG_TOPLEVEL_STATE_ACTIVATED;
+    }
+    xdg_toplevel_send_configure(s->xdg_toplevel, w, h, &states);
+    wl_array_release(&states);
+    uint32_t serial = next_serial();
+    s->next_configure_serial = serial;
+    s->xdg_acked = 0;
+    xdg_surface_send_configure(s->xdg_surface, serial);
+    fprintf(stderr, "[waylandd] %s wm=%u → configure %dx%d serial=%u\n",
+            fullscreen ? "set_fullscreen" : "unset_fullscreen",
+            s->wm_id, w, h, serial);
+}
+
 static void xdg_toplevel_set_fullscreen(struct wl_client *c, struct wl_resource *r,
                                          struct wl_resource *output) {
-    (void)c; (void)r; (void)output;
+    (void)c; (void)output;
+    struct brook_surface *s = wl_resource_get_user_data(r);
+    if (!s || !s->wm_id) return;
+    long rc = wm_set_fullscreen(s->wm_id, 1);
+    if (rc < 0) {
+        fprintf(stderr, "[waylandd] set_fullscreen wm=%u FAILED rc=%ld\n", s->wm_id, rc);
+        return;
+    }
+    int32_t fw = (int32_t)((uint64_t)rc >> 32);
+    int32_t fh = (int32_t)((uint64_t)rc & 0xFFFFFFFFu);
+    send_fullscreen_configure(s, fw, fh, 1);
 }
 static void xdg_toplevel_unset_fullscreen(struct wl_client *c, struct wl_resource *r) {
-    (void)c; (void)r;
+    (void)c;
+    struct brook_surface *s = wl_resource_get_user_data(r);
+    if (!s || !s->wm_id) return;
+    long rc = wm_set_fullscreen(s->wm_id, 0);
+    if (rc < 0) {
+        fprintf(stderr, "[waylandd] unset_fullscreen wm=%u FAILED rc=%ld\n", s->wm_id, rc);
+        return;
+    }
+    int32_t rw = (int32_t)((uint64_t)rc >> 32);
+    int32_t rh = (int32_t)((uint64_t)rc & 0xFFFFFFFFu);
+    send_fullscreen_configure(s, rw, rh, 0);
 }
 static void xdg_toplevel_set_minimized(struct wl_client *c, struct wl_resource *r) {
     (void)c;

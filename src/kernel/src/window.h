@@ -49,6 +49,7 @@ enum class WindowState : uint8_t
 {
     Normal,
     Maximized,
+    Fullscreen,
 };
 
 struct Window
@@ -98,23 +99,29 @@ struct Window
     volatile uint32_t inputTail;
     uint32_t inputDropCount;
 
-    // Pre-maximise geometry (for restore)
+    // Pre-maximise / pre-fullscreen geometry (for restore)
     int16_t     savedX, savedY;
     uint16_t    savedW, savedH;
+    // State to restore to when leaving fullscreen (Normal or Maximized).
+    WindowState savedState;
 
     // Close-request escalation: timestamp (lapic ticks) of last close
     // request.  If the process is still alive after the grace period,
     // the compositor escalates to SIGTERM then SIGKILL.
     uint64_t    closeRequestedAt;  // 0 = no pending close
 
-    // Outer dimensions including chrome.  CSD (noChrome) windows have
-    // no kernel chrome, so outer == client.
-    uint16_t outerWidth()  const { return noChrome ? clientW : (clientW + 2 * WM_BORDER_WIDTH); }
-    uint16_t outerHeight() const { return noChrome ? clientH : (clientH + WM_TITLE_BAR_HEIGHT + 2 * WM_BORDER_WIDTH); }
+    // A fullscreen window covers the whole screen with no kernel chrome,
+    // exactly like a CSD (noChrome) window — the client fills every pixel.
+    bool chromeless() const { return noChrome || state == WindowState::Fullscreen; }
+
+    // Outer dimensions including chrome.  CSD (noChrome) and fullscreen
+    // windows have no kernel chrome, so outer == client.
+    uint16_t outerWidth()  const { return chromeless() ? clientW : (clientW + 2 * WM_BORDER_WIDTH); }
+    uint16_t outerHeight() const { return chromeless() ? clientH : (clientH + WM_TITLE_BAR_HEIGHT + 2 * WM_BORDER_WIDTH); }
 
     // Client area origin relative to outer top-left
-    int16_t clientX() const { return noChrome ? x : (x + static_cast<int16_t>(WM_BORDER_WIDTH)); }
-    int16_t clientY() const { return noChrome ? y : (y + static_cast<int16_t>(WM_TITLE_BAR_HEIGHT + WM_BORDER_WIDTH)); }
+    int16_t clientX() const { return chromeless() ? x : (x + static_cast<int16_t>(WM_BORDER_WIDTH)); }
+    int16_t clientY() const { return chromeless() ? y : (y + static_cast<int16_t>(WM_TITLE_BAR_HEIGHT + WM_BORDER_WIDTH)); }
 };
 
 // Hit-test result for mouse clicks
@@ -185,6 +192,12 @@ void WmToggleMaximize(int idx);
 
 // Set maximise state idempotently.
 void WmSetMaximized(int idx, bool enable);
+
+// Set fullscreen state idempotently. On enable the window covers the entire
+// screen (over the taskbar) with no chrome, raised and focused; on disable the
+// pre-fullscreen geometry and state are restored. Writes the resulting client
+// dimensions to *outW/*outH (the size the client should render at) when non-null.
+void WmSetFullscreen(int idx, bool enable, uint32_t* outW, uint32_t* outH);
 
 // Minimize a window (hide from desktop, show in taskbar).
 void WmMinimizeWindow(int idx);

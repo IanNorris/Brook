@@ -633,6 +633,70 @@ void WmToggleMaximize(int idx)
     WmSetMaximized(idx, w.state != WindowState::Maximized);
 }
 
+void WmSetFullscreen(int idx, bool enable, uint32_t* outW, uint32_t* outH)
+{
+    if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
+    Window& w = g_windows[idx];
+    if (!w.proc) return;
+
+    uint32_t screenW, screenH;
+    CompositorGetPhysDims(&screenW, &screenH);
+
+    bool isFullscreen = (w.state == WindowState::Fullscreen);
+    if (isFullscreen == enable)
+    {
+        // Already in the requested state — still report the current client size
+        // so waylandd can re-issue a configure if the client asked again.
+        if (outW) *outW = w.clientW;
+        if (outH) *outH = w.clientH;
+        return;
+    }
+
+    uint16_t newW, newH;
+
+    if (enable)
+    {
+        // Save the pre-fullscreen geometry AND state so unset can restore a
+        // window that was maximized before it went fullscreen. Note: when
+        // coming from Maximized the current x/y/clientW/H are the maximized
+        // geometry; that's fine — unset restores state=Maximized which the
+        // caller can re-derive, and SDL drives its own windowed size via the
+        // configure we send on unset.
+        w.savedX = w.x;
+        w.savedY = w.y;
+        w.savedW = w.clientW;
+        w.savedH = w.clientH;
+        w.savedState = w.state;
+
+        // Fullscreen: cover the ENTIRE screen (over the taskbar), no chrome.
+        w.x = 0;
+        w.y = 0;
+        w.state = WindowState::Fullscreen;
+        newW = static_cast<uint16_t>(screenW);
+        newH = static_cast<uint16_t>(screenH);
+
+        // Raise to the top and focus so the fullscreen surface owns the screen.
+        WmSetFocus(idx);
+    }
+    else
+    {
+        // Restore pre-fullscreen geometry and state.
+        w.x = w.savedX;
+        w.y = w.savedY;
+        w.state = (w.savedState == WindowState::Fullscreen)
+                      ? WindowState::Normal : w.savedState;
+        newW = w.savedW;
+        newH = w.savedH;
+    }
+
+    // Route through WmResizeWindow so the per-window VFB is reallocated and the
+    // client's resize/SIGWINCH paths fire (same as the maximize path).
+    WmResizeWindow(idx, newW, newH);
+
+    if (outW) *outW = newW;
+    if (outH) *outH = newH;
+}
+
 void WmMoveWindow(int idx, int16_t newX, int16_t newY)
 {
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
@@ -815,6 +879,7 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
 {
     if (!buf || !stride || !screenW || !screenH) return;
     if (w.noChrome) return;  // CSD: client draws its own chrome
+    if (w.state == WindowState::Fullscreen) return;  // fullscreen: no chrome at all
     if (!w.proc || !w.visible) return;  // skip destroyed/hidden windows
     int wx = w.x;
     int wy = w.y;

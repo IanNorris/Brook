@@ -10709,6 +10709,25 @@ static int64_t sys_brook_wm_set_maximized(uint64_t wmId, uint64_t enable,
     return 0;
 }
 
+// 525: WM_SET_FULLSCREEN(wmId, enable) -> packed (outW<<32 | outH) on success.
+// waylandd uses the returned client dimensions to build the xdg_toplevel
+// configure (with the FULLSCREEN state) that SDL acks and renders to.
+static int64_t sys_brook_wm_set_fullscreen(uint64_t wmId, uint64_t enable,
+                                            uint64_t, uint64_t,
+                                            uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    if (wmId == 0 || wmId > 0xFFFFu) return -EINVAL;
+
+    brook::Window* w = brook::WmFindWindowById(proc, static_cast<uint32_t>(wmId));
+    if (!w) return -EINVAL;
+
+    uint32_t outW = 0, outH = 0;
+    brook::WmSetFullscreen(static_cast<int>(wmId) - 1, enable != 0, &outW, &outH);
+    return (static_cast<int64_t>(outW) << 32) | static_cast<int64_t>(outH & 0xFFFFFFFFu);
+}
+
 // 516: WM_SET_MINIMIZED(wmId)
 static int64_t sys_brook_wm_set_minimized(uint64_t wmId, uint64_t,
                                            uint64_t, uint64_t,
@@ -12856,6 +12875,7 @@ void SyscallTableInit()
     g_syscallTable[522]                  = sys_brook_wm_scanout_flip;
     g_syscallTable[523]                  = sys_brook_wm_get_windows;
     g_syscallTable[524]                  = sys_brook_wm_map_window_vfb;
+    g_syscallTable[525]                  = sys_brook_wm_set_fullscreen;
 
     uint32_t count = 0;
     for (uint64_t i = 0; i < SYSCALL_MAX; ++i)

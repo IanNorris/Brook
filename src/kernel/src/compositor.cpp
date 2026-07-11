@@ -1460,7 +1460,9 @@ bool CompositorBeginWindowMove(int windowIdx)
 {
     if (!MouseIsAvailable()) return false;
     Window* w = WmGetWindow(windowIdx);
-    if (!w || !w->proc || w->state == WindowState::Maximized) return false;
+    if (!w || !w->proc ||
+        w->state == WindowState::Maximized ||
+        w->state == WindowState::Fullscreen) return false;
 
     int32_t mx = 0, my = 0;
     MouseGetPosition(&mx, &my);
@@ -1479,7 +1481,9 @@ bool CompositorBeginWindowResize(int windowIdx, bool left, bool right,
     if (!MouseIsAvailable()) return false;
     if (!left && !right && !top && !bottom) return false;
     Window* w = WmGetWindow(windowIdx);
-    if (!w || !w->proc || w->state == WindowState::Maximized) return false;
+    if (!w || !w->proc ||
+        w->state == WindowState::Maximized ||
+        w->state == WindowState::Fullscreen) return false;
 
     int32_t mx = 0, my = 0;
     MouseGetPosition(&mx, &my);
@@ -1675,7 +1679,8 @@ static void CompositorHandleMouseWM()
             {
                 // Start resize drag
                 Window* w = WmGetWindow(hit.windowIndex);
-                if (w && w->state != WindowState::Maximized)
+                if (w && w->state != WindowState::Maximized &&
+                    w->state != WindowState::Fullscreen)
                 {
                     bool resizeX = (hit.zone != WmHitZone::ResizeBottom);
                     bool resizeY = (hit.zone != WmHitZone::ResizeRight);
