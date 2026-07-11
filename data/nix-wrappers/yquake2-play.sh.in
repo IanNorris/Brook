@@ -26,10 +26,34 @@ export LIBGL_DRIVERS_PATH=/nix/store/b793hmy0383vxaax7hiaslzmizzd3pmg-mesa-26.0.
 export GBM_BACKENDS_PATH=/nix/store/b793hmy0383vxaax7hiaslzmizzd3pmg-mesa-26.0.6/lib/gbm
 export __EGL_VENDOR_LIBRARY_DIRS=/nix/store/b793hmy0383vxaax7hiaslzmizzd3pmg-mesa-26.0.6/share/glvnd/egl_vendor.d
 export SDL_VIDEODRIVER=wayland
-export ALSOFT_DRIVERS=null
-export SDL_AUDIODRIVER=dummy
+
+# Audio: yquake2 uses OpenAL by default (cvar s_openal 1) and dlopen()s
+# libopenal.so.1. The Brook OSS build of openal-soft (staged first on
+# LD_LIBRARY_PATH by prestage_yquake2.sh) drives Brook's /dev/dsp OSS device,
+# which is backed by the kernel audio mixer + Intel HDA driver. Hard-set
+# ALSOFT_DRIVERS=oss (exactly "oss", not appended) so openal does NOT enumerate
+# pulse/alsa/pipewire — those have no server on Brook and would block on connect
+# timeouts. ALSOFT_CONF pins the output format to 44100/int16/stereo so the
+# kernel mixer does NO resample (openal otherwise defaults to 48 kHz), and gives
+# the mixer thread a little buffering slack (periods/period_size) to ride out GL
+# frame spikes. SDL's own audio subsystem is unused in the OpenAL path.
+export ALSOFT_DRIVERS=oss
 export HOME=/data/yq2
 mkdir -p /data/yq2/.yq2
+export ALSOFT_CONF=/data/yq2/.yq2/alsoft.conf
+cat > "${ALSOFT_CONF}" <<'ALSOFT'
+# Brook OSS output — pinned so the kernel mixer does no resample.
+[general]
+drivers = oss
+frequency = 44100
+channels = stereo
+sample-type = int16
+periods = 4
+period_size = 1024
+
+[oss]
+device = /dev/dsp
+ALSOFT
 
 # Library search path for libs yquake2 dlopen()s by bare soname that aren't on
 # its rpath — notably libopenal.so.1 (OpenAL backend). @YQUAKE2_LIBDIRS@ is filled
@@ -58,7 +82,9 @@ esac
 # -datadir points at the shared baseq2 data (yquake2 deprecates +set basedir);
 # vid_renderer selects GL vs software. al_driver is forced to a BARE soname
 # (libopenal.so.1, now on LD_LIBRARY_PATH above) instead of the absolute store
-# path nixpkgs bakes in (yquake2 rejects al_driver containing '/').
+# path nixpkgs bakes in (yquake2 rejects al_driver containing '/'). s_openal 1
+# forces the OpenAL backend (the OSS path) even if a persisted config.cfg set it
+# to 0, so audio is deterministic regardless of prior settings.
 # +set logfile 2 forces yquake2 to write a FLUSHED qconsole.log (value 2 =
 # fflush every line) under $HOME/.yq2/baseq2/. This is a diagnostic: yquake2
 # exits right after creating its wayland window and its Sys_Error message is in
@@ -67,4 +93,5 @@ esac
 # reason survives the crash. ext2 write-persistence on /data is verified working
 # (a plain echo>file;cat round-trips), so the log will actually contain data.
 exec @YQUAKE2_BIN@ -datadir /data/games/quake2 \
-    +set al_driver libopenal.so.1 +set logfile 2 +set vid_renderer "$RENDERER" "$@"
+    +set al_driver libopenal.so.1 +set s_openal 1 +set logfile 2 \
+    +set vid_renderer "$RENDERER" "$@"

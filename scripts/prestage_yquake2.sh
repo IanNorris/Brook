@@ -37,6 +37,20 @@ fi
 YQ2_BASE="$(basename "${YQ2_OUT}")"
 echo "  yquake2 -> ${YQ2_OUT}"
 
+# Realise the Brook OSS build of openal-soft. yquake2 dlopen()s libopenal.so.1
+# by bare soname; the stock closure openal has only pulse/alsa/wave backends,
+# none of which exist on Brook. This build adds the OSS backend that drives
+# /dev/dsp. Its lib dir is prepended to the wrapper's LD_LIBRARY_PATH below so
+# it wins the dlopen over the stock closure openal.
+echo "Realising openal-soft (OSS backend) on the host..."
+OPENAL_OSS_OUT="$(nix-build "${ROOT_DIR}/tools/openal-soft-oss-pkg" --no-out-link 2>/dev/null)"
+if [ -z "${OPENAL_OSS_OUT}" ] || [ ! -e "${OPENAL_OSS_OUT}/lib/libopenal.so.1" ]; then
+    echo "ERROR: failed to build tools/openal-soft-oss-pkg (OSS openal)." >&2
+    exit 1
+fi
+OPENAL_OSS_BASE="$(basename "${OPENAL_OSS_OUT}")"
+echo "  openal-soft(OSS) -> ${OPENAL_OSS_OUT}"
+
 MNTDIR="$(mktemp -d)"
 cleanup() {
     fusermount -u "${MNTDIR}" 2>/dev/null || fusermount -uz "${MNTDIR}" 2>/dev/null || true
@@ -50,7 +64,9 @@ echo "Mounted ${DISK_IMG} at ${MNTDIR}"
 mkdir -p "${MNTDIR}/store" "${MNTDIR}/profile/bin"
 
 # Copy every closure path that isn't already on the disk (most are shared with
-# the existing STK/gltron installs, so this is a small delta).
+# the existing STK/gltron installs, so this is a small delta). Stage both the
+# yquake2 closure AND the OSS openal closure (the latter pulls in only a few
+# extra paths beyond what yquake2 already shares).
 ADDED=0
 while IFS= read -r p; do
     [ -n "$p" ] || continue
@@ -61,7 +77,7 @@ while IFS= read -r p; do
         ADDED=$((ADDED + 1))
         echo "  + store/${base}"
     fi
-done < <(nix-store -qR "${YQ2_OUT}")
+done < <(nix-store -qR "${YQ2_OUT}" "${OPENAL_OSS_OUT}")
 echo "Copied ${ADDED} new store path(s)."
 
 # Expose the binaries via /nix/profile/bin using the SAME relative-symlink form
@@ -93,12 +109,12 @@ YQ2_REAL_HOST="$(readlink -f "${YQ2_OUT}/bin/yquake2")"          # /nix/store/<b
 YQ2_REAL_GUEST="/nix/store/${YQ2_BASE}/${YQ2_REAL_HOST#"${YQ2_OUT}/"}"
 [ "${YQ2_REAL_GUEST}" = "/nix/store/${YQ2_BASE}/" ] && YQ2_REAL_GUEST="/nix/store/${YQ2_BASE}/lib/yquake2/quake2"
 
-# Lib dirs for bare-soname dlopen()s not on the binary's rpath: the openal-soft
-# lib (for the OpenAL backend) plus the renderer dir as a fallback. Resolve
-# openal-soft from the realised closure so we never hardcode a stale hash.
-OPENAL_OUT="$(nix-store -qR "${YQ2_OUT}" 2>/dev/null | grep -E 'openal-soft' | head -1)"
-LIBDIRS="/nix/store/${YQ2_BASE}/lib/yquake2"
-[ -n "${OPENAL_OUT}" ] && LIBDIRS="/nix/store/$(basename "${OPENAL_OUT}")/lib:${LIBDIRS}"
+# Lib dirs for bare-soname dlopen()s not on the binary's rpath. The Brook OSS
+# openal-soft MUST come first so yquake2's dlopen("libopenal.so.1") resolves to
+# it rather than the stock closure openal (pulse/alsa/wave only). Then the
+# renderer dir as a fallback. LD_LIBRARY_PATH is searched before DT_RUNPATH, so
+# prepending the OSS openal here reliably wins the resolution.
+LIBDIRS="/nix/store/${OPENAL_OSS_BASE}/lib:/nix/store/${YQ2_BASE}/lib/yquake2"
 
 WRAPPER_TMP="$(mktemp)"
 sed -e "s#@YQUAKE2_BIN@#${YQ2_REAL_GUEST}#g" \
