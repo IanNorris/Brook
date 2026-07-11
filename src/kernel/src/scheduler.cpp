@@ -1314,14 +1314,14 @@ static bool SavedCtxLooksCorrupt(const brook::SavedContext& c)
 {
     constexpr uint64_t KTEXT_LO    = 0xFFFFFFFF80000000ULL;
     const     uint64_t KTEXT_HI    = reinterpret_cast<uint64_t>(__etext);
-    constexpr uint64_t KVMALLOC_LO = 0xFFFFC00000000000ULL;         // VMALLOC_BASE
-    constexpr uint64_t KVMALLOC_HI = KVMALLOC_LO + (32ULL << 30);   // + VMALLOC_SIZE
     auto canonKern = [](uint64_t a) -> bool { return (a >> 47) == 0x1FFFFULL; };
 
     // Resume RIP must be real kernel code (a trampoline or the switch stub).
     if (c.rip < KTEXT_LO || c.rip >= KTEXT_HI) return true;
-    // Kernel stack pointer must live in the guard-paged VMALLOC stack region.
-    if (!canonKern(c.rsp) || c.rsp < KVMALLOC_LO || c.rsp >= KVMALLOC_HI) return true;
+    // Kernel stack pointer must be a canonical kernel-half address. It normally
+    // lives in the guard-paged VMALLOC region, but per-CPU idle threads use a
+    // static .bss stack (g_idleStacks), so we only assert canonical-kernel here.
+    if (!canonKern(c.rsp)) return true;
     // Frame pointer must be canonical-kernel (or zero for a fresh trampoline).
     if (c.rbp != 0 && !canonKern(c.rbp)) return true;
     // CR3 must be a nonzero, page-aligned physical address (< 256 GB sanity).
