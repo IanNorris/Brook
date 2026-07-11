@@ -240,6 +240,24 @@ struct brook_surface {
      * independently of wl_keyboard existence.  Lets a late-created keyboard
      * recover the enter that would otherwise have been dropped (BRO-210). */
     int wm_focused;
+
+    /* Client-declared opaque region (surface-local), snapshotted from the
+     * wl_region passed to wl_surface.set_opaque_region.  Pixels inside the
+     * region are forced fully opaque on blit even for ARGB8888 buffers, so a
+     * GL client whose buffer alpha is garbage (yquake2 after a resize flips the
+     * shm format to ARGB) still renders solid instead of alpha-blending the
+     * desktop through it.  Pixels outside the region keep their alpha so CSD
+     * shadow borders stay transparent (BRO-214). */
+    int      opaque_valid;    /* 1 = opaque_* bbox is meaningful */
+    int      opaque_complex;  /* region used subtract -> bbox unreliable, ignore */
+    int32_t  opaque_x0, opaque_y0, opaque_x1, opaque_y1; /* [x0,x1) x [y0,y1) */
+};
+
+/* wl_region resource user data: the bounding box of the added rects. */
+struct brook_region {
+    int     has_box;
+    int     complex;   /* subtract was used -> a single bbox can't represent it */
+    int32_t x0, y0, x1, y1;
 };
 
 static struct brook_surface *g_surfaces = NULL;
@@ -369,15 +387,31 @@ static void surface_frame(struct wl_client *c, struct wl_resource *r, uint32_t c
 }
 static void surface_set_opaque_region(struct wl_client *c, struct wl_resource *r,
                                        struct wl_resource *reg) {
-    (void)c; (void)r; (void)reg;
+    (void)c;
+    struct brook_surface *s = wl_resource_get_user_data(r);
+    if (!s) return;
+    if (!reg) {
+        /* NULL region clears the opaque region: nothing is declared opaque. */
+        s->opaque_valid = 0;
+        return;
+    }
+    struct brook_region *rg = wl_resource_get_user_data(reg);
+    if (!rg || !rg->has_box) { s->opaque_valid = 0; return; }
+    s->opaque_valid   = 1;
+    s->opaque_complex = rg->complex;
+    s->opaque_x0 = rg->x0; s->opaque_y0 = rg->y0;
+    s->opaque_x1 = rg->x1; s->opaque_y1 = rg->y1;
 }
 static void surface_set_input_region(struct wl_client *c, struct wl_resource *r,
                                       struct wl_resource *reg) {
     (void)c; (void)r; (void)reg;
 }
 
-/* Copy wl_shm buffer pixels into the per-window VFB.  Preserve ARGB alpha so
- * GTK/Qt CSD shadows stay transparent; force XRGB buffers opaque. */
+/* Copy wl_shm buffer pixels into the per-window VFB.  A pixel is forced fully
+ * opaque when the buffer has no alpha channel (XRGB) OR it lies inside the
+ * client's declared opaque region; otherwise its alpha is preserved so CSD
+ * shadows stay transparent.  Honouring the opaque region is what keeps a GL
+ * client with garbage buffer alpha (yquake2 post-resize ARGB) solid (BRO-214). */
 static void blit_to_window(struct brook_surface *s,
                            const uint8_t *src, int sw, int sh, int sstride,
                            uint32_t format) {
@@ -385,11 +419,19 @@ static void blit_to_window(struct brook_surface *s,
     int cw = sw < (int)s->vfb_w ? sw : (int)s->vfb_w;
     int ch = sh < (int)s->vfb_h ? sh : (int)s->vfb_h;
     int has_alpha = (format == WL_SHM_FORMAT_ARGB8888);
+    int use_region = has_alpha && s->opaque_valid && !s->opaque_complex;
     for (int y = 0; y < ch; y++) {
         const uint32_t *srow = (const uint32_t*)(src + (size_t)y * sstride);
         uint32_t *drow = s->vfb + (size_t)y * s->vfb_stride;
+        int row_opaque = !has_alpha ||
+            (use_region && y >= s->opaque_y0 && y < s->opaque_y1);
         for (int x = 0; x < cw; x++) {
-            drow[x] = has_alpha ? srow[x] : (0xff000000u | (srow[x] & 0x00ffffffu));
+            int opaque = row_opaque;
+            if (!opaque && use_region &&
+                x >= s->opaque_x0 && x < s->opaque_x1 &&
+                y >= s->opaque_y0 && y < s->opaque_y1)
+                opaque = 1;
+            drow[x] = opaque ? (0xff000000u | (srow[x] & 0x00ffffffu)) : srow[x];
         }
     }
 }
@@ -717,11 +759,31 @@ static void region_destroy(struct wl_client *c, struct wl_resource *r) {
 }
 static void region_add(struct wl_client *c, struct wl_resource *r,
                        int32_t x, int32_t y, int32_t w, int32_t h) {
-    (void)c; (void)r; (void)x; (void)y; (void)w; (void)h;
+    (void)c;
+    struct brook_region *rg = wl_resource_get_user_data(r);
+    if (!rg || w <= 0 || h <= 0) return;
+    int32_t x1 = x + w, y1 = y + h;
+    if (!rg->has_box) {
+        rg->x0 = x; rg->y0 = y; rg->x1 = x1; rg->y1 = y1;
+        rg->has_box = 1;
+    } else {
+        if (x  < rg->x0) rg->x0 = x;
+        if (y  < rg->y0) rg->y0 = y;
+        if (x1 > rg->x1) rg->x1 = x1;
+        if (y1 > rg->y1) rg->y1 = y1;
+    }
 }
 static void region_subtract(struct wl_client *c, struct wl_resource *r,
                             int32_t x, int32_t y, int32_t w, int32_t h) {
-    (void)c; (void)r; (void)x; (void)y; (void)w; (void)h;
+    (void)c; (void)x; (void)y; (void)w; (void)h;
+    /* A subtracted rect cannot be represented by a single bounding box, so mark
+     * the region complex: opaque-region blitting falls back to the buffer
+     * format heuristic, which conservatively keeps such areas transparent. */
+    struct brook_region *rg = wl_resource_get_user_data(r);
+    if (rg) rg->complex = 1;
+}
+static void region_free(struct wl_resource *r) {
+    free(wl_resource_get_user_data(r));
 }
 static const struct wl_region_interface region_impl = {
     .destroy  = region_destroy,
@@ -732,10 +794,12 @@ static const struct wl_region_interface region_impl = {
 static void compositor_create_region(struct wl_client *client,
                                      struct wl_resource *res,
                                      uint32_t id) {
+    struct brook_region *rg = calloc(1, sizeof(*rg));
+    if (!rg) { wl_client_post_no_memory(client); return; }
     struct wl_resource *rr = wl_resource_create(client, &wl_region_interface,
                                                  wl_resource_get_version(res), id);
-    if (!rr) { wl_client_post_no_memory(client); return; }
-    wl_resource_set_implementation(rr, &region_impl, NULL, NULL);
+    if (!rr) { free(rg); wl_client_post_no_memory(client); return; }
+    wl_resource_set_implementation(rr, &region_impl, rg, region_free);
 }
 
 static const struct wl_compositor_interface compositor_impl = {
