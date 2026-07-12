@@ -178,6 +178,7 @@ add_executable(kernel
     src/boot_logo.cpp
     src/klog.cpp
     src/smp.cpp
+    src/gs_catch.cpp
     src/ap_trampoline.S
     src/context_switch.S
     src/exception_stubs.S

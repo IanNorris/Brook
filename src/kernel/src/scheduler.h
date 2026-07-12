@@ -20,6 +20,10 @@ void SchedulerInitApIdle(uint32_t cpuIndex);
 // Set the KernelCpuEnv pointer for a CPU (for syscall stack updates).
 void SchedulerSetCpuEnv(uint32_t cpuIndex, KernelCpuEnv* env);
 
+// Get the KernelCpuEnv pointer for a CPU (BSP + APs).  GS-free — used by the
+// BRO-178 catch-at-scene guard to recover a valid kernel GS base by index.
+KernelCpuEnv* SchedulerGetCpuEnv(uint32_t cpuIndex);
+
 // Add a process to the ready queue.
 void SchedulerAddProcess(Process* proc);
 

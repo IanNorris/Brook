@@ -11,6 +11,7 @@
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "memory/heap.h"
+#include "gs_catch.h"
 
 #include <stdint.h>
 
@@ -504,8 +505,32 @@ uint32_t SmpCurrentCpuIndex()
         return 0;
     }
     uint64_t idx;
+    // BRO-178 catch-at-scene: verify the kernel GS base is active BEFORE the
+    // gs:176 read below (the exact instruction that #PFs when GS is user/0).
+    // This is the backstop that catches every caller — including the post-block
+    // resume path via ThisCpu() — and names the true caller via its return addr.
+    GS_CATCH_SCENE("SmpCurrentCpuIndex");
     __asm__ volatile("movq %%gs:176, %0" : "=r"(idx));
     return static_cast<uint32_t>(idx);
+}
+
+__attribute__((no_instrument_function))
+bool SmpResolveCpuNoGs(uint8_t* apicOut, uint32_t* idxOut, KernelCpuEnv** envOut)
+{
+    uint8_t id = ApicGetId();
+    if (apicOut) *apicOut = id;
+    for (uint32_t i = 0; i < g_cpuCount; ++i)
+    {
+        if (g_cpus[i].apicId == id)
+        {
+            if (idxOut) *idxOut = i;
+            if (envOut) *envOut = SchedulerGetCpuEnv(i);
+            return true;
+        }
+    }
+    if (idxOut) *idxOut = 0xFFFFFFFFu;
+    if (envOut) *envOut = nullptr;
+    return false;
 }
 
 void SmpEnableFastCpuIndex()

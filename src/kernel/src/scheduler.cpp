@@ -4,6 +4,7 @@
 #include "cpu.h"
 #include "smp.h"
 #include "apic.h"
+#include "gs_catch.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "memory/heap.h"
@@ -1703,6 +1704,12 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
 
     // --- We return here when another CPU (or this one) switches back to us ---
 
+    // BRO-178 catch-at-scene: this is the futex/block RESUME choke point — the
+    // scene of the crash (post-SchedulerBlock resume in a futex syscall).  Check
+    // the GS base here, BEFORE ThisCpu() reads gs:176, so an imbalance is named
+    // at the origin (site "ctxswitch-resume") rather than downstream.
+    GS_CATCH_SCENE("ctxswitch-resume");
+
     DrainPostSwitch(ThisCpu());
 }
 
@@ -2366,6 +2373,14 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
 void SchedulerSetCpuEnv(uint32_t cpuIndex, KernelCpuEnv* env)
 {
     g_perCpu[cpuIndex].cpuEnv = env;
+}
+
+__attribute__((no_instrument_function))
+KernelCpuEnv* SchedulerGetCpuEnv(uint32_t cpuIndex)
+{
+    if (cpuIndex >= SCHED_MAX_CPUS)
+        return nullptr;
+    return g_perCpu[cpuIndex].cpuEnv;
 }
 
 void SchedulerInitApIdle(uint32_t cpuIndex)

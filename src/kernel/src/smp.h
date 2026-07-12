@@ -2,6 +2,8 @@
 
 #include <stdint.h>
 
+struct KernelCpuEnv;
+
 namespace brook {
 
 // Maximum number of CPUs supported.
@@ -45,6 +47,15 @@ void SmpSetCurrentCr3(uint32_t cpuIndex, uint64_t cr3);
 // Before this is called, SmpCurrentCpuIndex falls back to the slower
 // (and migration-racy) ApicGetId-based lookup.
 void SmpEnableFastCpuIndex();
+
+// GS-free resolution of the CURRENT CPU's apicId, index, and KernelCpuEnv*.
+// Identifies the CPU via ApicGetId() (LAPIC MMIO — no gs access) and maps it
+// through the MADT CpuInfo table, so it is safe to call when the GS base is
+// bogus (user/0).  Used by the BRO-178 catch-at-scene guard to recover a valid
+// kernel GS base before any gs-relative code runs.  Returns false (and null
+// env) if the LAPIC id is not found in the table.
+__attribute__((no_instrument_function))
+bool SmpResolveCpuNoGs(uint8_t* apicOut, uint32_t* idxOut, KernelCpuEnv** envOut);
 
 // Halt all application processors via NMI broadcast.
 // Each AP's state (RIP, RSP, RBP) is captured in the NMI handler.
