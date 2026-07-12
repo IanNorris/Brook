@@ -1670,6 +1670,33 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
         for (;;) __asm__ volatile("hlt");
     }
 
+    // BRO-208 crime-scene diagnostic: double-dispatch check. If newProc is
+    // already the current process on ANOTHER CPU, we are about to run the same
+    // thread on two CPUs — they will stomp each other's kernel stack and saved
+    // context (one of the panel's leading alternatives to frame-reuse). The
+    // runningOnCpu exchange above guards the common case, but this catches a
+    // corrupted-runqueue duplicate that slipped past it. Cheap: one pass over
+    // the online CPUs, IF=0 here.
+    if (oldProc != newProc)
+    {
+        uint32_t nCpu = SmpGetCpuCount();
+        if (nCpu > SCHED_MAX_CPUS) nCpu = SCHED_MAX_CPUS;
+        for (uint32_t c = 0; c < nCpu; c++)
+        {
+            if (c == cpu) continue;
+            if (g_perCpu[c].currentProcess == newProc)
+            {
+                SerialPrintf("\n!!! BRO-208 DOUBLE-DISPATCH: pid=%u name='%s' is "
+                             "current on CPU%u AND about to run on CPU%u "
+                             "(runningOnCpu=%d)\n",
+                             newProc->pid, newProc->name, c, cpu,
+                             __atomic_load_n(&newProc->runningOnCpu, __ATOMIC_ACQUIRE));
+                __asm__ volatile("cli");
+                for (;;) __asm__ volatile("hlt");
+            }
+        }
+    }
+
     context_switch(&oldProc->savedCtx, &newProc->savedCtx,
                    &oldProc->fxsave, &newProc->fxsave,
                    &oldProc->runningOnCpu);

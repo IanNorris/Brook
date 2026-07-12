@@ -423,6 +423,7 @@ VirtualAddress VmmAllocKernelStack(uint64_t pageCount, MemTag tag, uint16_t pid)
                 uint64_t* pte = WalkToPtr(KernelPageTable, v, false);
                 if (pte && (*pte & VMM_PRESENT))
                 {
+                    PmmMarkStackFrame(PhysicalAddress(*pte & PHYS_MASK), false);
                     PmmFreePage(PhysicalAddress(*pte & PHYS_MASK));
                     *pte = 0;
                     Invlpg(v);
@@ -442,6 +443,7 @@ VirtualAddress VmmAllocKernelStack(uint64_t pageCount, MemTag tag, uint16_t pid)
                 uint64_t* pte = WalkToPtr(KernelPageTable, v, false);
                 if (pte && (*pte & VMM_PRESENT))
                 {
+                    PmmMarkStackFrame(PhysicalAddress(*pte & PHYS_MASK), false);
                     PmmFreePage(PhysicalAddress(*pte & PHYS_MASK));
                     *pte = 0;
                     Invlpg(v);
@@ -451,6 +453,11 @@ VirtualAddress VmmAllocKernelStack(uint64_t pageCount, MemTag tag, uint16_t pid)
             IrqSpinLockRelease(&g_vmmLock, vmmFlags);
             return VirtualAddress{};
         }
+
+        // BRO-208 crime-scene diagnostic: mark this frame as backing a live
+        // kernel stack. From now until VmmFreeKernelStack unmarks it, any
+        // attempt to free or re-hand-out this frame panics at the scene.
+        PmmMarkStackFrame(phys, true);
     }
 
     VmmAllocation* slot = FindFreeSlot();
@@ -468,7 +475,8 @@ VirtualAddress VmmAllocKernelStack(uint64_t pageCount, MemTag tag, uint16_t pid)
 
 void VmmFreeKernelStack(VirtualAddress virtAddr, uint64_t pageCount)
 {
-    // Free the mapped pages (guard pages have no physical backing).
+    // Free the mapped pages (guard pages have no physical backing). VmmFreePages
+    // unmarks each live-stack frame (BRO-208 diagnostic) before freeing it.
     VmmFreePages(virtAddr, pageCount);
     // The guard page virtual addresses are simply leaked from the vmalloc region.
     // This is acceptable — kernel stacks are long-lived and few in number.
@@ -553,6 +561,13 @@ void VmmFreePages(VirtualAddress virtAddr, uint64_t pageCount)
         uint64_t* pte = WalkToPtr(KernelPageTable, v, false);
         if (pte && (*pte & VMM_PRESENT))
         {
+            // BRO-208 crime-scene diagnostic: VmmFreePages is the sanctioned VMM
+            // choke point for freeing kernel-mapped frames (used by both
+            // VmmFreeKernelStack and VmmKillPid's g_vmmAllocs sweep). Unmark any
+            // live-stack frame here before PmmFreePage so the legitimate unmap
+            // path doesn't trip the guard; a frame freed by PmmKillPid's
+            // pid-tag sweep (which bypasses this path) stays guarded.
+            PmmMarkStackFrame(PhysicalAddress(*pte & PHYS_MASK), false);
             PmmFreePage(PhysicalAddress(*pte & PHYS_MASK));
             *pte = 0;
             Invlpg(v);

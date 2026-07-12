@@ -42,6 +42,20 @@ static constexpr uint64_t BITMAP_WORDS    = MAX_PHYS_PAGES / 64; // 524288 words
 static uint64_t g_bitmap[BITMAP_WORDS]; // in BSS, starts zeroed
 static uint64_t g_totalPages = 0;       // highest tracked page index
 static uint64_t g_freePages  = 0;
+
+// BRO-208 crime-scene diagnostic: one bit per physical frame, set while the
+// frame backs a LIVE kernel stack (see PmmMarkStackFrame). Accessed with atomic
+// ops so the VMM (under g_vmmLock) and the PMM (under g_pmmLock) can touch it
+// without a shared lock. In BSS, starts zeroed.
+static uint64_t g_liveStackBitmap[BITMAP_WORDS];
+
+__attribute__((unused))
+static inline bool IsLiveStackFrame(uint64_t idx)
+{
+    if (idx >= MAX_PHYS_PAGES) return false;
+    uint64_t w = __atomic_load_n(&g_liveStackBitmap[idx / 64], __ATOMIC_ACQUIRE);
+    return (w >> (idx % 64)) & 1ULL;
+}
 static uint64_t g_nextHint   = 0;       // search hint for fast sequential alloc
 
 
@@ -703,6 +717,20 @@ PhysicalAddress PmmAllocPage(MemTag tag, uint16_t pid)
             TrackAlloc(static_cast<uint32_t>(idx), tag, pid);
             IrqSpinLockRelease(&g_pmmLock, pmmFlags);
 
+            // BRO-208 crime-scene guard: never hand out a frame that is still
+            // marked as backing a live kernel stack. If this fires, a live
+            // kernel stack's frame was freed (put back in the allocator) while
+            // still mapped/in-use — the corruption source.
+#ifndef BROOK_HOST_TEST
+            if (IsLiveStackFrame(idx))
+            {
+                KernelPanic("BRO-208: PmmAllocPage handing out LIVE kernel-stack "
+                            "frame idx=%lu phys=0x%lx tag=%d pid=%u — "
+                            "freed-while-live\n",
+                            idx, idx * PAGE_SIZE, (int)tag, pid);
+            }
+#endif
+
             return PhysicalAddress(idx * PAGE_SIZE);
         }
     }
@@ -760,6 +788,21 @@ void PmmFreePage(PhysicalAddress physAddr)
 
     uint64_t idx = physAddr.raw() / PAGE_SIZE;
     if (idx >= g_totalPages) return;
+
+    // BRO-208 crime-scene guard: a frame backing a LIVE kernel stack must only
+    // be freed via VmmFreeKernelStack, which unmarks it first. If we reach here
+    // while the frame is still marked live, some OTHER path (e.g. PmmKillPid by
+    // pid-tag, or a stray free) is freeing a live kernel stack out from under a
+    // thread — the corruption source.
+#ifndef BROOK_HOST_TEST
+    if (IsLiveStackFrame(idx))
+    {
+        KernelPanic("BRO-208: PmmFreePage on LIVE kernel-stack frame idx=%lu "
+                    "phys=0x%lx pid=%u — unsanctioned free of a live stack\n",
+                    idx, physAddr.raw(),
+                    g_pageDescs ? Desc(static_cast<uint32_t>(idx)).pid : 0);
+    }
+#endif
 
     uint64_t pmmFlags = IrqSpinLockAcquire(&g_pmmLock);
 
@@ -819,6 +862,18 @@ void PmmFreePage(PhysicalAddress physAddr)
     RetireFrameLocked(static_cast<uint32_t>(idx), freedOwnerPid);
 
     IrqSpinLockRelease(&g_pmmLock, pmmFlags);
+}
+
+void PmmMarkStackFrame(PhysicalAddress physAddr, bool live)
+{
+    if (!physAddr) return;
+    uint64_t idx = physAddr.raw() / PAGE_SIZE;
+    if (idx >= MAX_PHYS_PAGES) return;
+    uint64_t mask = 1ULL << (idx % 64);
+    if (live)
+        __atomic_or_fetch(&g_liveStackBitmap[idx / 64], mask, __ATOMIC_RELEASE);
+    else
+        __atomic_and_fetch(&g_liveStackBitmap[idx / 64], ~mask, __ATOMIC_RELEASE);
 }
 
 MemTag PmmGetTag(PhysicalAddress physAddr)
@@ -1310,6 +1365,22 @@ void PmmKillPid(uint16_t pid)
     while (idx != PMM_NULL_PAGE)
     {
         uint32_t next = Desc(idx).next;
+
+        // BRO-208 crime-scene guard: PmmKillPid frees every frame on the pid's
+        // list. If a kernel-stack frame (still backing a LIVE stack) is on this
+        // list, we are about to free it out from under a running/suspended
+        // thread — the exact reuse-while-live corruption. Catch it here, naming
+        // the dying pid and the frame, before the free.
+#ifndef BROOK_HOST_TEST
+        if (IsLiveStackFrame(idx))
+        {
+            IrqSpinLockRelease(&g_pmmLock, pmmFlags);
+            KernelPanic("BRO-208: PmmKillPid(%u) freeing LIVE kernel-stack frame "
+                        "idx=%u phys=0x%lx (framePid=%u tag=%d) — reuse-while-live\n",
+                        pid, idx, static_cast<uint64_t>(idx) * PAGE_SIZE,
+                        Desc(idx).pid, (int)Desc(idx).tag);
+        }
+#endif
 
         if (Desc(idx).refCount > 1)
         {

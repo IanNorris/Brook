@@ -69,6 +69,15 @@ PhysicalAddress PmmAllocPages(uint64_t count,
 // Free a previously allocated page frame. No-op if null.
 void PmmFreePage(PhysicalAddress physAddr);
 
+// BRO-208 crime-scene diagnostic: mark/unmark a physical frame as backing a
+// LIVE kernel stack. While a frame is marked live, PmmAllocPage panics if it is
+// about to hand it out and PmmFreePage/PmmKillPid panic if any but the
+// sanctioned VmmFreeKernelStack path tries to free it — catching a
+// free-while-live / reuse-while-live at the scene instead of at the downstream
+// corruption. VmmFreeKernelStack unmarks each frame immediately before freeing
+// it, so the sanctioned free does not trip the guard.
+void PmmMarkStackFrame(PhysicalAddress physAddr, bool live);
+
 
 // Ownership: get tag and PID for a page.
 MemTag   PmmGetTag(PhysicalAddress physAddr);
