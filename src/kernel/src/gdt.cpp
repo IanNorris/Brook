@@ -46,6 +46,10 @@ static uint8_t g_dfStacks[GDT_MAX_CPUS][32768] __attribute__((aligned(16)));
 // Per-CPU NMI stacks (4KB each).
 static uint8_t g_nmiStacks[GDT_MAX_CPUS][4096] __attribute__((aligned(16)));
 
+// Per-CPU #GP fault stacks (IST3). Sized like the #DF stack so a corrupt-RSP
+// #GP has room for the full fault-tolerant serial dump + QR build.
+static uint8_t g_gpStacks[GDT_MAX_CPUS][32768] __attribute__((aligned(16)));
+
 // Expose the NMI stacks base so the panic NMI handler can derive its CPU index
 // from RSP (each CPU's NMI runs on g_nmiStacks[cpuIndex] via IST2).
 extern "C" uint64_t GdtNmiStacksBase()
@@ -98,6 +102,8 @@ void GdtInit()
     g_tssArray[0].ist[0]         = reinterpret_cast<uint64_t>(dfTop);
     void* nmiTop = static_cast<void*>(g_nmiStacks[0] + sizeof(g_nmiStacks[0]) - 16);
     g_tssArray[0].ist[1]         = reinterpret_cast<uint64_t>(nmiTop);
+    void* gpTop = static_cast<void*>(g_gpStacks[0] + sizeof(g_gpStacks[0]) - 16);
+    g_tssArray[0].ist[2]         = reinterpret_cast<uint64_t>(gpTop);  // IST3 → #GP
     g_tssArray[0].ioBitmapOffset = static_cast<uint16_t>(sizeof(Tss64));
 
     // TSS descriptor for CPU 0 starts at GDT slot 6 (byte offset 0x30).
@@ -147,6 +153,8 @@ uint16_t GdtInitAp(uint32_t cpuIndex)
     tss->ist[0]         = reinterpret_cast<uint64_t>(dfTop);
     void* nmiTop = static_cast<void*>(g_nmiStacks[cpuIndex] + sizeof(g_nmiStacks[cpuIndex]) - 16);
     tss->ist[1]         = reinterpret_cast<uint64_t>(nmiTop);
+    void* gpTop = static_cast<void*>(g_gpStacks[cpuIndex] + sizeof(g_gpStacks[cpuIndex]) - 16);
+    tss->ist[2]         = reinterpret_cast<uint64_t>(gpTop);  // IST3 → #GP
     tss->ioBitmapOffset = static_cast<uint16_t>(sizeof(Tss64));
 
     // TSS descriptor: CPU N uses GDT slots (6 + N*2) and (6 + N*2 + 1).

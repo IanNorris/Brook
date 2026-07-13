@@ -1220,19 +1220,17 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                     sysInfo.gitHash[brook::PANIC_GIT_HASH_LEN - 1] = '\0';
                 }
 
-                // Raw stack dump from exception RSP
+                // Raw stack dump from exception RSP (fault-tolerant: stops at
+                // the first unreadable byte instead of nesting a fault).
                 static brook::PanicStackDump stackDump = {};
                 {
                     stackDump.rsp = ef->rsp;
                     stackDump.length = 0;
-                    const uint8_t* rspPtr = reinterpret_cast<const uint8_t*>(ef->rsp);
                     if (ef->rsp >= 0xFFFF800000000000ULL && ef->rsp != 0)
                     {
-                        for (uint16_t i = 0; i < brook::PANIC_STACK_DUMP_BYTES; i++)
-                        {
-                            stackDump.data[i] = rspPtr[i];
-                            stackDump.length = i + 1;
-                        }
+                        size_t got = brook::PanicSafeCopy(
+                            stackDump.data, ef->rsp, brook::PANIC_STACK_DUMP_BYTES);
+                        stackDump.length = static_cast<uint16_t>(got);
                     }
                 }
 
@@ -1683,8 +1681,12 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
             ef->rdx = reinterpret_cast<uint64_t>(&sf->uc);    // arg3 = ucontext
         }
 
-        // Re-enable interrupts; the assembly stub will IRETQ back to the handler.
-        __asm__ volatile("sti");
+        // Do NOT sti here: #GP runs on a dedicated IST stack (IST_GP), which is
+        // non-reentrant. Enabling interrupts before the IRETQ would open a window
+        // where a timer preempts us ON the IST stack; a later #GP would reset RSP
+        // to the IST top and clobber this in-flight frame. The IRETQ below
+        // restores the user's RFLAGS (IF=1) anyway, so interrupts resume on the
+        // user stack a few instructions later — the explicit sti was redundant.
         return;
     }
 
@@ -2124,10 +2126,13 @@ void IdtInit(brook::Framebuffer* fb)
     SetIdtEntry( 9, reinterpret_cast<void*>(ExceptionHandler9));
     SetIdtEntry(10, reinterpret_cast<void*>(ExceptionHandler10));
     SetIdtEntry(11, reinterpret_cast<void*>(ExceptionHandler11));
-    // #SS, #GP, #PF use the normal kernel stack (ist=0) — it's safe now that
-    // we have a dedicated 32KB stack.  Only #DF needs IST1.
+    // #SS and #PF use the normal kernel stack (ist=0). #PF must NOT use IST: it
+    // is the hot COW/demand-paging path and IST stacks are non-reentrant.
+    // #GP uses IST3 — it is where corrupt-context faults land (context_switch /
+    // iretq / DrainPostSwitch, BRO-178/208) and is rare enough never to nest
+    // (its one returnable path no longer stis on the IST stack). #DF stays IST1.
     SetIdtEntry(12, reinterpret_cast<void*>(ExceptionHandler12));
-    SetIdtEntry(13, reinterpret_cast<void*>(ExceptionStub13));  // asm stub for SIGSEGV delivery
+    SetIdtEntry(13, reinterpret_cast<void*>(ExceptionStub13), IST_GP);  // #GP on IST3
     SetIdtEntry(14, reinterpret_cast<void*>(ExceptionStub14));  // asm stub for SIGSEGV delivery
     SetIdtEntry(15, reinterpret_cast<void*>(ExceptionHandler15));
     SetIdtEntry(16, reinterpret_cast<void*>(ExceptionHandler16));

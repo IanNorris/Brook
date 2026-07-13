@@ -20,6 +20,12 @@ static constexpr uint16_t GDT_STAR_USER   = 0x18;  // STAR[63:48]
 // IST slots in the TSS (1-indexed; 0 = no IST).
 static constexpr uint8_t IST_DOUBLE_FAULT = 1;  // IST1 → dedicated double-fault stack
 static constexpr uint8_t IST_NMI         = 2;  // IST2 → dedicated NMI stack
+// IST3 → dedicated #GP fault stack. #GP is where corrupt-context faults land
+// (context_switch / iretq / DrainPostSwitch, per BRO-178/208), so a trashed RSP
+// must not sink the handler. NOT used for #PF: page faults are the hot
+// COW/demand-paging path and IST stacks are non-reentrant — a nested #PF would
+// reset RSP to the IST top and clobber the first frame.
+static constexpr uint8_t IST_GP          = 3;  // IST3 → dedicated #GP fault stack
 
 struct GdtEntry {
     uint16_t limitLow;

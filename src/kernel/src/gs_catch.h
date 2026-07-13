@@ -43,7 +43,12 @@ namespace brook {
 
 // 1 = KernelPanic on the first imbalance (one clean, fully-attributed capture).
 // 0 = restore GS, record to the ring buffer, and continue (long soak).
-#define GS_CATCH_PANIC 1
+//
+// Log mode (0) is what makes the PANIC PATH itself GS-safe: the fault handler's
+// first act is SmpCurrentCpuIndex() (movq %gs:176); on a BRO-178 imbalance this
+// guard now recovers the kernel GS base and lets the handler continue to a full
+// dump + QR of the ORIGINAL fault, instead of recursively #PFing at CR2=0xB0.
+#define GS_CATCH_PANIC 0
 
 // Detect + (if imbalanced) recover + report.  `site` is a static string naming
 // the instrumentation point; `ra` is the caller's return address (pass
