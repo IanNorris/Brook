@@ -181,6 +181,7 @@ add_executable(kernel
     src/gs_catch.cpp
     src/panic_probe.cpp
     src/panic_probe.S
+    src/panic_unwind.cpp
     src/ap_trampoline.S
     src/context_switch.S
     src/exception_stubs.S

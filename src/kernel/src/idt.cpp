@@ -3,6 +3,7 @@
 #include "serial.h"
 #include "panic.h"
 #include "panic_probe.h"
+#include "panic_unwind.h"
 #include "panic_screen.h"
 #include "panic_qr.h"
 #include "process.h"
@@ -1129,18 +1130,29 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                 __asm__ volatile("movq %%cr3, %0" : "=r"(pregs.cr3));
                 __asm__ volatile("movq %%cr4, %0" : "=r"(pregs.cr4));
 
-                // Walk stack for trace
+                // Robust unwind: RBP chain (fault-tolerant) + call-site scan.
+                // Bounds from the faulting thread's kernel stack when known;
+                // safe-reads make even a corrupt RBP/RSP non-fatal.
                 brook::PanicStackTrace ptrace = {};
-                uint64_t* rbpPtr = reinterpret_cast<uint64_t*>(ef->rbp);
-                ptrace.rip[0] = ef->rip;
-                ptrace.depth = 1;
-                for (uint8_t d = 1; d < brook::PANIC_MAX_STACK_DEPTH; d++)
+                uint64_t ustkLo = 0, ustkHi = 0;
                 {
-                    uint64_t addr = reinterpret_cast<uint64_t>(rbpPtr);
-                    if (addr < 0xFFFF800000000000ULL || addr == 0) break;
-                    ptrace.rip[d] = rbpPtr[1];
-                    ptrace.depth = d + 1;
-                    rbpPtr = reinterpret_cast<uint64_t*>(rbpPtr[0]);
+                    brook::Process* sp = brook::ProcessCurrent();
+                    uint64_t spv = reinterpret_cast<uint64_t>(sp);
+                    if (spv >= 0xFFFF800000000000ULL && (spv & 0x7) == 0 &&
+                        sp->magic == brook::PROCESS_MAGIC)
+                    {
+                        ustkLo = sp->kernelStackBase;
+                        ustkHi = sp->kernelStackTop;
+                    }
+                }
+                {
+                    brook::PanicUnwindFrame uf[brook::PANIC_MAX_STACK_DEPTH];
+                    uint32_t un = brook::PanicUnwindStack(
+                        uf, brook::PANIC_MAX_STACK_DEPTH,
+                        ef->rip, ef->rbp, ef->rsp, ustkLo, ustkHi);
+                    ptrace.depth = static_cast<uint8_t>(un);
+                    for (uint32_t ui = 0; ui < un; ++ui)
+                        ptrace.rip[ui] = uf[ui].rip;
                 }
 
                 // Exception info

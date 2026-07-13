@@ -4,6 +4,8 @@
 #include "serial.h"
 #include "tty.h"
 #include "panic_qr.h"
+#include "panic_unwind.h"
+#include "panic_probe.h"
 #include "panic_screen.h"
 #include "compositor.h"
 #include "smp.h"
@@ -101,35 +103,22 @@ static void CaptureFullRegs(brook::PanicCPURegs& r)
     r.reserved = 0;
 }
 
-// ---- Stack trace capture (RBP frame walking) --------------------------------
-static void CaptureStackTrace(brook::PanicStackTrace& trace, uint64_t rbp, uint64_t rip)
+// ---- Stack trace capture (robust, fault-tolerant unwinder) ------------------
+// Confidence tier per frame, parallel to trace.rip[], consumed by the serial
+// printer so a hardware-exact RIP is distinguishable from a heuristic scan hit.
+static uint8_t g_traceConf[brook::PANIC_MAX_STACK_DEPTH];
+
+static void CaptureStackTrace(brook::PanicStackTrace& trace, uint64_t rbp,
+                              uint64_t rip, uint64_t rsp)
 {
-    constexpr uint64_t KERNEL_BASE = 0xffffffff80000000ULL;
-    constexpr uint64_t KERNEL_END  = 0xffffffffffffffffULL;
-
-    trace.depth = 0;
-
-    // Frame 0: the RIP at panic time
-    if (rip >= KERNEL_BASE && rip < KERNEL_END)
-        trace.rip[trace.depth++] = rip;
-
-    // Walk the RBP chain for caller frames
-    while (trace.depth < brook::PANIC_MAX_STACK_DEPTH && rbp != 0)
+    brook::PanicUnwindFrame frames[brook::PANIC_MAX_STACK_DEPTH];
+    uint32_t n = brook::PanicUnwindStack(frames, brook::PANIC_MAX_STACK_DEPTH,
+                                         rip, rbp, rsp, 0, 0);
+    trace.depth = static_cast<uint8_t>(n);
+    for (uint32_t i = 0; i < n; ++i)
     {
-        // Validate RBP is in kernel range and aligned
-        if (rbp < KERNEL_BASE || rbp >= KERNEL_END - 16 || (rbp & 7) != 0)
-            break;
-
-        const uint64_t* frame = reinterpret_cast<const uint64_t*>(rbp);
-        uint64_t retAddr = frame[1];
-        if (retAddr < KERNEL_BASE || retAddr >= KERNEL_END)
-            break;
-
-        trace.rip[trace.depth++] = retAddr;
-
-        uint64_t nextRbp = frame[0];
-        if (nextRbp <= rbp) break; // prevent loops (stack grows down)
-        rbp = nextRbp;
+        trace.rip[i]    = frames[i].rip;
+        g_traceConf[i]  = frames[i].confidence;
     }
 }
 
@@ -299,11 +288,11 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
     brook::PanicCPURegs fullRegs;
     CaptureFullRegs(fullRegs);
 
-    // Capture stack trace via RBP chain
+    // Capture stack trace via robust unwinder (RBP chain + call-site scan)
     brook::PanicStackTrace trace;
     uint64_t captureRbp;
     __asm__ volatile("movq %%rbp, %0" : "=r"(captureRbp));
-    CaptureStackTrace(trace, captureRbp, regs.rip);
+    CaptureStackTrace(trace, captureRbp, regs.rip, regs.rsp);
 
     // Format the message into a static buffer.
     __builtin_va_list args;
@@ -358,6 +347,13 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
         brook::SerialPuts(idxStr);
         brook::SerialPuts("] ");
         SerialPutHex64(trace.rip[i]);
+        // Confidence tier: exact RIP, validated RBP frame, or heuristic scan hit
+        switch (g_traceConf[i]) {
+            case brook::PANIC_FRAME_EXACT: brook::SerialPuts(" (exact)"); break;
+            case brook::PANIC_FRAME_RBP:   brook::SerialPuts(" (rbp)");   break;
+            case brook::PANIC_FRAME_SCAN:  brook::SerialPuts(" (scan?)"); break;
+            default: break;
+        }
         // Symbolicate
         const char* symName = nullptr;
         uint64_t symOff = 0;
@@ -518,22 +514,19 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
             sysInfo.gitBranch[brook::PANIC_GIT_BRANCH_LEN - 1] = '\0';
         }
 
-        // Capture raw stack bytes from RSP
+        // Capture raw stack bytes from RSP (fault-tolerant — stops at the first
+        // unreadable byte instead of nesting a fault on a corrupt/short stack).
         static brook::PanicStackDump stackDump = {};
         {
             stackDump.rsp = regs.rsp;
             stackDump.length = 0;
-            const uint8_t* rspPtr = reinterpret_cast<const uint8_t*>(regs.rsp);
             uint64_t rspAddr = regs.rsp;
             // Only read if RSP is in kernel-half canonical range
             if (rspAddr >= 0xFFFF800000000000ULL && rspAddr != 0)
             {
-                uint16_t maxBytes = brook::PANIC_STACK_DUMP_BYTES;
-                for (uint16_t i = 0; i < maxBytes; i++)
-                {
-                    stackDump.data[i] = rspPtr[i];
-                    stackDump.length = i + 1;
-                }
+                size_t got = brook::PanicSafeCopy(stackDump.data, rspAddr,
+                                                  brook::PANIC_STACK_DUMP_BYTES);
+                stackDump.length = static_cast<uint16_t>(got);
             }
         }
 
