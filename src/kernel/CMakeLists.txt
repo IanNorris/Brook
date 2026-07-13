@@ -179,6 +179,8 @@ add_executable(kernel
     src/klog.cpp
     src/smp.cpp
     src/gs_catch.cpp
+    src/panic_probe.cpp
+    src/panic_probe.S
     src/ap_trampoline.S
     src/context_switch.S
     src/exception_stubs.S

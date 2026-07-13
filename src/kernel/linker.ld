@@ -23,6 +23,15 @@ SECTIONS
         __stop_ksymtab = .;
     }
 
+    /* Panic-path exception table — (fault_rip, fixup_rip) pairs for the
+       fault-tolerant memory probe (panic_probe.S). Bounded by start/stop so
+       HandleExceptionFull can search it as its first action. */
+    .panic_extable : ALIGN(8) {
+        __start_panic_extable = .;
+        *(.panic_extable)
+        __stop_panic_extable = .;
+    }
+
     .data : ALIGN(4096) {
         *(.data .data.*)
     }

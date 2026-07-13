@@ -2,6 +2,7 @@
 #include "gdt.h"
 #include "serial.h"
 #include "panic.h"
+#include "panic_probe.h"
 #include "panic_screen.h"
 #include "panic_qr.h"
 #include "process.h"
@@ -807,6 +808,15 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
 {
     // The assembly stub has already done SWAPGS if needed.
     __asm__ volatile("cli");
+
+    // Layer 1 safe-read: if this fault came from a registered panic_probe
+    // instruction, redirect to its fixup and resume — do NOT treat it as a real
+    // fault. This MUST be the first action, before the COW block and the kernel
+    // panic dump, so a probe fault during crash-state capture cannot nest into
+    // the panic path. GS is already kernel-side (stub's paranoid swapgs), so the
+    // lookup is safe. (#PF/#GP both arrive here via ExceptionStub13/14.)
+    if (brook::PanicExtableFixup(&ef->rip))
+        return;
 
     // If a panic is already active, this CPU must not produce output or
     // render a panic screen — it would garble the panicking CPU's work.
