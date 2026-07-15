@@ -1,6 +1,7 @@
 #include "scheduler.h"
 #include "process.h"
 #include "panic.h"
+#include "panic_probe.h"
 #include "cpu.h"
 #include "smp.h"
 #include "apic.h"
@@ -599,11 +600,130 @@ static Process* PickNextLocked(uint32_t cpu)
     return nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// BRO-208 core-ownership / double-dispatch guard.
+// ---------------------------------------------------------------------------
+// Enforces, at every context_switch resume, that the CPU is actually running
+// the thread its per-CPU bookkeeping claims. The live #DB crash showed gs:184
+// (currentProcess) = idle2 while CPU#2 executed a USER thread's sys_futex on
+// that thread's heap kernel stack — a core-ownership violation invisible until
+// something faulted. This catches it AT the resume, names the mismatch, and
+// (crucially) is fault-tolerant: currentProcess may be a wild pointer, so its
+// magic is read through the panic-path safe-read probe (the .panic_extable
+// fixup is active in normal operation, not only during a panic).
+#ifndef BROOK_HOST_TEST
+enum CoreOwnFail : uint32_t {
+    COF_GS184_NE_PERCPU = 1,   // ProcessCurrent()(gs:184) != g_perCpu[cpu].currentProcess
+    COF_PTR_BAD         = 2,   // currentProcess not non-null/aligned/canonical-high
+    COF_MAGIC           = 4,   // currentProcess->magic != PROCESS_MAGIC (safe-read)
+    COF_OWNER           = 8,   // currentProcess->runningOnCpu != cpu
+    COF_REVMAP          = 16,  // g_perCpu[runningOnCpu].currentProcess != currentProcess
+    COF_RSP             = 32,  // live RSP not within [kernelStackBase, kernelStackTop)
+};
+
+__attribute__((noinline))
+static void CoreOwnershipPanic(uint32_t fail, uint32_t cpu, uint32_t argCpu,
+                               Process* cur, uint64_t gs184, uint64_t rsp,
+                               bool magicOk, int32_t roc, uint64_t base, uint64_t top)
+{
+    uint32_t pid = magicOk ? cur->pid : 0xFFFFFFFFu;
+    char nm[33];
+    if (magicOk) {
+        for (int i = 0; i < 32; ++i) {
+            char ch = cur->name[i];
+            if (ch == '\0') { nm[i] = '\0'; break; }
+            nm[i] = (ch >= 0x20 && ch <= 0x7e) ? ch : '?';
+            nm[i + 1] = '\0';
+        }
+        nm[32] = '\0';
+    } else { nm[0] = '?'; nm[1] = '\0'; }
+
+    KernelPanic("BRO-208 CORE-OWNERSHIP VIOLATION cpu=%u argCpu=%u fail=0x%x\n"
+                "  currentProcess=%p gs184=0x%lx pid=%u name=%s\n"
+                "  runningOnCpu=%d stack=[0x%lx,0x%lx) liveRSP=0x%lx inBounds=%d\n"
+                "  fails: %s%s%s%s%s%s",
+                cpu, argCpu, fail, cur, gs184, pid, nm,
+                roc, base, top, rsp, (base <= rsp && rsp < top) ? 1 : 0,
+                (fail & COF_GS184_NE_PERCPU) ? "GS184_NE_PERCPU " : "",
+                (fail & COF_PTR_BAD) ? "PTR_BAD " : "",
+                (fail & COF_MAGIC)   ? "MAGIC " : "",
+                (fail & COF_OWNER)   ? "OWNER " : "",
+                (fail & COF_REVMAP)  ? "REVMAP " : "",
+                (fail & COF_RSP)     ? "RSP " : "");
+}
+
+// Runs at the top of DrainPostSwitch (every resume). `cpu` is the already-
+// recovered, trusted CPU index (DrainPostSwitch re-derives it from the APIC if
+// the passed arg was corrupt). Low-overhead happy path: a few loads + compares
+// + one predicted-not-taken branch + a single safe-read of magic.
+static inline void CoreOwnershipGuard(uint32_t cpu, uint32_t argCpu)
+{
+    if (!g_schedulerRunning) return;      // armed only once the scheduler is live
+    if (cpu >= SCHED_MAX_CPUS) return;    // GS/APIC not sane — nothing to check
+
+    uint64_t rsp;
+    __asm__ volatile("movq %%rsp, %0" : "=r"(rsp));
+
+    Process* cur   = g_perCpu[cpu].currentProcess;
+    uint64_t gs184 = reinterpret_cast<uint64_t>(ProcessCurrent());
+    uint64_t curv  = reinterpret_cast<uint64_t>(cur);
+
+    // Early/idle-bootstrap: before a CPU's first real dispatch, neither the
+    // per-CPU slot nor gs:184 names a process yet. When BOTH agree on "nothing",
+    // the ownership invariant doesn't apply — skip. (A DISAGREEMENT, one null and
+    // one not, is still a real finding and falls through to COF_GS184_NE_PERCPU.)
+    if (cur == nullptr && gs184 == 0) return;
+
+    uint32_t fail  = 0;
+    bool     magicOk = false;
+    int32_t  roc  = -1;
+    uint64_t base = 0, top = 0;
+
+    // gs:184 (what the kernel THINKS it's running) must match the per-CPU slot.
+    if (gs184 && gs184 != curv) fail |= COF_GS184_NE_PERCPU;
+
+    if (!cur || (curv & 0x7) || curv < 0xFFFF800000000000ULL) {
+        fail |= COF_PTR_BAD;
+    } else {
+        // Fault-tolerant magic read: cur may be wild (canonical+aligned does not
+        // imply mapped). The .panic_extable fixup turns a fault into `false`.
+        uint64_t magic = 0;
+        if (!PanicSafeReadU64(reinterpret_cast<uint64_t>(&cur->magic), &magic)
+            || magic != PROCESS_MAGIC) {
+            fail |= COF_MAGIC;
+        } else {
+            // magic validated => this is a real, live Process object; the
+            // remaining fields are in the same allocation and safe to read.
+            magicOk = true;
+            roc  = __atomic_load_n(&cur->runningOnCpu, __ATOMIC_ACQUIRE);
+            base = cur->kernelStackBase;
+            top  = cur->kernelStackTop;
+            if (roc != static_cast<int32_t>(cpu)) {
+                // This thread thinks another CPU owns it while WE are running it.
+                fail |= COF_OWNER;
+                // If that other CPU ALSO has it as currentProcess, the same
+                // thread is genuinely dispatched on two CPUs (the double-write).
+                if (roc >= 0 && static_cast<uint32_t>(roc) < SCHED_MAX_CPUS &&
+                    reinterpret_cast<uint64_t>(g_perCpu[roc].currentProcess) == curv) {
+                    fail |= COF_REVMAP;
+                }
+            }
+            // The decisive check: are we actually ON this thread's kernel stack?
+            if (!(base <= rsp && rsp < top)) fail |= COF_RSP;
+        }
+    }
+
+    if (__builtin_expect(fail != 0, 0))
+        CoreOwnershipPanic(fail, cpu, argCpu, cur, gs184, rsp, magicOk, roc, base, top);
+}
+#endif // BROOK_HOST_TEST
+
 // Drain per-CPU bookkeeping that was set before a context_switch.
 // Must be called after every context_switch resumption point (DoSwitch,
 // ProcessTrampoline, KernelThreadTrampoline).
 static void DrainPostSwitch(uint32_t cpu)
 {
+    const uint32_t argCpu = cpu;   // preserve the (possibly corrupt) passed value
     // Defensive: a corrupt-stack panic was observed where this function was
     // entered with cpu = 0x80040f0c — the low 32 bits of context_switch's
     // .Lresume label.  Root cause: after .Lresume executes `ret`, the saved
@@ -624,6 +744,13 @@ static void DrainPostSwitch(uint32_t cpu)
                      cpu, recovered);
         cpu = (recovered < SCHED_MAX_CPUS) ? recovered : 0;
     }
+
+#ifndef BROOK_HOST_TEST
+    // BRO-208: verify this CPU actually owns the thread it thinks it's running,
+    // and that we're on that thread's kernel stack — before touching any per-CPU
+    // state. `argCpu` is the (possibly corrupt) passed value, kept for evidence.
+    CoreOwnershipGuard(cpu, argCpu);
+#endif
 
     // Mark any terminated process as safe to reap — by this point the CPU's
     // RSP is on the NEW process's kernel stack, so the old stack is unused.
