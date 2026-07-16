@@ -59,6 +59,7 @@ PKT_SYSTEM_INFO    = 0xA3000005
 PKT_STACK_DUMP     = 0xA3000006
 PKT_PROCESS_EXT    = 0xA3000007  # BRO-176 reap-gate fields, merged onto PROCESS_LIST by pid
 PKT_CPU_STATE      = 0xA3000008  # per-CPU RIP/CR3/pid
+PKT_CUSTOM_BLOB    = 0xA3000009  # generic bug-specific blob (tag + format + bytes)
 
 GPR_NAMES = [
     "RAX", "RBX", "RCX", "RDX", "RSI", "RDI",
@@ -946,6 +947,7 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
     stack_dump = None
     cpu_list = None
     proc_ext_data = None  # buffered until after the loop (may precede PROCESS_LIST)
+    custom_blobs = []     # PKT_CUSTOM_BLOB payloads (tag + format + raw bytes)
 
     while off + PacketHeader.SIZE <= len(payload):
         pkt = PacketHeader(payload, off)
@@ -976,6 +978,8 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
             sys_info = SystemInfo(pkt_data)
         elif pkt.type == PKT_STACK_DUMP:
             stack_dump = StackDump(pkt_data)
+        elif pkt.type == PKT_CUSTOM_BLOB:
+            custom_blobs.append(pkt_data)
         else:
             print(f"[warn] Unknown packet type 0x{pkt.type:08X} ({pkt.size}B)",
                   file=sys.stderr)
@@ -1005,6 +1009,57 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
                      exc_info=exc_info, proc_list=proc_list,
                      sys_info=sys_info, stack_dump=stack_dump,
                      cpu_list=cpu_list)
+        for blob in custom_blobs:
+            print_custom_blob(blob, sym)
+
+
+def print_custom_blob(blob: bytes, sym: "Symbolicator | None"):
+    """Render a PKT_CUSTOM_BLOB. Header: tag[8], format(u16), reserved(u16)."""
+    if len(blob) < 12:
+        print("[warn] custom blob too short", file=sys.stderr)
+        return
+    tag = blob[:8].split(b"\x00", 1)[0].decode("ascii", "replace")
+    (fmt, _resv) = struct.unpack_from("<HH", blob, 8)
+    body = blob[12:]
+    print(f"\n  ── Custom diagnostic: {tag} (format {fmt}) ──")
+    if tag == "BRO208" and fmt == 1:
+        _print_bro208(body, sym)
+    else:
+        print(f"    {len(body)} bytes (no renderer for {tag}/{fmt}); hex:")
+        print("    " + body.hex())
+
+
+def _sym(sym, addr):
+    if sym:
+        r = sym.resolve(addr)
+        if r:
+            return f"  {r}"
+    return ""
+
+
+def _print_bro208(body: bytes, sym):
+    # Fixed head: cr3,curProc,liveRsp,curSavedRsp,curSavedRip,curSavedCr3,
+    # curStackBase,curStackTop (8x u64), ringCount(u32), then recs.
+    head = struct.unpack_from("<8Q I", body, 0)
+    (cr3, cur, rsp, sRsp, sRip, sCr3, sBase, sTop, ringCount) = head
+    print(f"    live:   CR3=0x{cr3:016x}  currentProcess=0x{cur:016x}  liveRSP=0x{rsp:016x}")
+    print(f"    curCtx: savedRSP=0x{sRsp:016x}{_sym(sym, sRip)}")
+    print(f"            savedRIP=0x{sRip:016x}  savedCR3=0x{sCr3:016x}")
+    print(f"            stack=[0x{sBase:016x}, 0x{sTop:016x})  "
+          f"RSP_in_bounds={sBase <= rsp < sTop}")
+    inb = sBase <= rsp < sTop
+    print(f"    >>> currentProcess RSP-in-its-own-stack={sBase <= sRsp < sTop}; "
+          f"liveRSP-in-currentProcess-stack={inb}")
+    off = struct.calcsize("<8Q I")
+    reasons = {1: "DoSwitch", 2: "exit", 3: "start", 4: "apstart"}
+    print(f"    ownership ring ({ringCount} transitions, newest last):")
+    for i in range(ringCount):
+        (seq, tsc, ra, oldp, newp, rif) = struct.unpack_from("<5Q H", body, off)
+        off += struct.calcsize("<5Q H")
+        reason = reasons.get(rif & 0xff, "?")
+        iff = (rif >> 8) & 1
+        print(f"      #{seq:#x} tsc={tsc} IF={iff} {reason} "
+              f"ra=0x{ra:012x}{_sym(sym, ra)}  0x{oldp:012x} -> 0x{newp:012x}")
 
 
 def parse_serial_log(path: str) -> bytes:

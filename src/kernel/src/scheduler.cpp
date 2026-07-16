@@ -2,6 +2,7 @@
 #include "process.h"
 #include "panic.h"
 #include "panic_probe.h"
+#include "panic_qr.h"
 #include "cpu.h"
 #include "smp.h"
 #include "apic.h"
@@ -718,6 +719,70 @@ static void OwnTraceDump(uint32_t cpu)
     }
 }
 
+// BRO-208 self-contained QR blob (format 1). Packs everything the frozen-VM
+// monitor dumps gave us, so a phone-scanned QR alone pins the mechanism:
+//   - live CR3 + the currentProcess pointer + live RSP
+//   - currentProcess's full SavedContext (rsp/rip/cr3 — is idle aliased?)
+//   - the running thread inferred from live RSP (its SavedContext too)
+//   - the last OWN_RING ownership transitions for this CPU (writer RIPs)
+// All reads are plain (we're already panicking, IF=0, APs about to halt); the
+// Process* is validated before deref.
+struct __attribute__((packed)) Bro208Blob {
+    uint64_t cr3;
+    uint64_t curProc;
+    uint64_t liveRsp;
+    uint64_t curSavedRsp, curSavedRip, curSavedCr3;   // currentProcess->savedCtx
+    uint64_t curStackBase, curStackTop;
+    uint32_t ringCount;
+    // ringCount records of {seq, tsc, ra, oldProc, newProc, reason|IF<<8}
+    struct __attribute__((packed)) Rec {
+        uint64_t seq, tsc, ra, oldProc, newProc; uint16_t reasonIf;
+    } recs[OWN_RING];
+};
+
+__attribute__((noinline))
+static void EmbedBro208Blob(uint32_t cpu, Process* cur, uint64_t /*gs184*/, uint64_t liveRsp)
+{
+    static Bro208Blob blob;   // static: no stack pressure on the panic path
+    __builtin_memset(&blob, 0, sizeof(blob));
+    __asm__ volatile("movq %%cr3, %0" : "=r"(blob.cr3));
+    blob.curProc = reinterpret_cast<uint64_t>(cur);
+    blob.liveRsp = liveRsp;
+
+    uint64_t cv = reinterpret_cast<uint64_t>(cur);
+    if (cur && (cv & 7) == 0 && cv >= 0xFFFF800000000000ULL) {
+        uint64_t magic = 0;
+        if (PanicSafeReadU64(cv, &magic) && magic == PROCESS_MAGIC) {
+            blob.curSavedRsp  = cur->savedCtx.rsp;
+            blob.curSavedRip  = cur->savedCtx.rip;
+            blob.curSavedCr3  = cur->savedCtx.cr3;
+            blob.curStackBase = cur->kernelStackBase;
+            blob.curStackTop  = cur->kernelStackTop;
+        }
+    }
+
+    if (cpu < SCHED_MAX_CPUS) {
+        uint64_t head = g_ownSeq[cpu];
+        uint64_t start = (head > OWN_RING) ? (head - OWN_RING) : 0;
+        uint32_t n = 0;
+        for (uint64_t s = start + 1; s <= head && n < OWN_RING; ++s) {
+            const OwnTraceRec& r = g_ownRing[cpu][(s - 1) % OWN_RING];
+            if (r.seq != s) continue;
+            blob.recs[n].seq = r.seq; blob.recs[n].tsc = r.tsc; blob.recs[n].ra = r.ra;
+            blob.recs[n].oldProc = r.oldProc; blob.recs[n].newProc = r.newProc;
+            blob.recs[n].reasonIf = static_cast<uint16_t>(r.reason | (r.ifFlag << 8));
+            ++n;
+        }
+        blob.ringCount = n;
+    }
+
+    const char tag[8] = { 'B','R','O','2','0','8','\0','\0' };
+    uint32_t used = static_cast<uint32_t>(
+        reinterpret_cast<uint8_t*>(&blob.recs[blob.ringCount]) -
+        reinterpret_cast<uint8_t*>(&blob));
+    PanicSetCustomBlob(tag, /*format*/ 1, &blob, used);
+}
+
 __attribute__((noinline))
 static void CoreOwnershipPanic(uint32_t fail, uint32_t cpu, uint32_t argCpu,
                                Process* cur, uint64_t gs184, uint64_t rsp,
@@ -736,6 +801,10 @@ static void CoreOwnershipPanic(uint32_t fail, uint32_t cpu, uint32_t argCpu,
     } else { nm[0] = '?'; nm[1] = '\0'; }
 
     OwnTraceDump(cpu);   // replay the last N currentProcess writes → names the stale writer
+
+    // BRO-208: embed the full crime-scene into the panic QR so the capture is
+    // self-contained (no live monitor dump needed). Layout is format 1 below.
+    EmbedBro208Blob(cpu, cur, gs184, rsp);
 
     KernelPanic("BRO-208 CORE-OWNERSHIP VIOLATION cpu=%u argCpu=%u fail=0x%x\n"
                 "  currentProcess=%p gs184=0x%lx pid=%u name=%s\n"

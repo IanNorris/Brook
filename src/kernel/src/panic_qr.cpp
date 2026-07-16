@@ -18,6 +18,34 @@ extern "C" {
 
 namespace brook {
 
+// Custom diagnostic blob storage (see PanicSetCustomBlob / panic_qr.h). A bug
+// site fills this before KernelPanic; the payload builder emits it once. Static
+// so it's usable from any context with no allocation.
+static char     g_customBlobTag[8]   = {0};
+static uint16_t g_customBlobFormat   = 0;
+static uint32_t g_customBlobSize     = 0;
+static uint8_t  g_customBlobData[PANIC_CUSTOM_BLOB_MAX];
+
+void PanicSetCustomBlob(const char tag[8], uint16_t format,
+                        const void* data, uint32_t size)
+{
+    if (size > PANIC_CUSTOM_BLOB_MAX) size = PANIC_CUSTOM_BLOB_MAX;
+    for (int i = 0; i < 8; i++) g_customBlobTag[i] = tag ? tag[i] : 0;
+    g_customBlobFormat = format;
+    const uint8_t* s = static_cast<const uint8_t*>(data);
+    for (uint32_t i = 0; i < size; i++) g_customBlobData[i] = s[i];
+    g_customBlobSize = size;   // set last: a reader sees a complete blob
+}
+
+const void* PanicGetCustomBlob(char outTag[8], uint16_t* outFormat, uint32_t* outSize)
+{
+    if (g_customBlobSize == 0) return nullptr;
+    if (outTag)    for (int i = 0; i < 8; i++) outTag[i] = g_customBlobTag[i];
+    if (outFormat) *outFormat = g_customBlobFormat;
+    if (outSize)   *outSize = g_customBlobSize;
+    return g_customBlobData;
+}
+
 // Maximum Base45 chars that fit in a single QR (Version 25, Low ECC, alphanumeric)
 // Version 25 = 117 modules → very scannable at 3px/module on a 1024x768 screen.
 // Alphanumeric capacity at Low ECC: 3057 chars.
@@ -52,6 +80,11 @@ static uint32_t BuildPanicPayload(uint8_t* buf, uint32_t bufLen,
     if (cpuList) needed += sizeof(PanicPacketHeader) + 1
                          + cpuList->count * sizeof(PanicCpuEntry);
     if (stackDump) needed += sizeof(PanicPacketHeader) + 8 + 2 + stackDump->length;
+    {
+        char t[8]; uint16_t f; uint32_t bl = 0;
+        if (PanicGetCustomBlob(t, &f, &bl))
+            needed += sizeof(PanicPacketHeader) + sizeof(PanicCustomBlobHeader) + bl;
+    }
 
     if (bufLen < needed) return 0;
 
@@ -150,6 +183,27 @@ static uint32_t BuildPanicPayload(uint8_t* buf, uint32_t bufLen,
         appendRaw(&stackDump->rsp, 8);
         appendRaw(&stackDump->length, 2);
         appendRaw(stackDump->data, stackDump->length);
+    }
+
+    // Packet 7: Custom diagnostic blob (optional) — a bug site stashed this
+    // before KernelPanic (PanicSetCustomBlob). Emitted verbatim so the QR is a
+    // self-contained capture of bug-specific state (e.g. BRO-208 ownership ring).
+    {
+        char tag[8]; uint16_t fmt = 0; uint32_t blobLen = 0;
+        const void* blob = PanicGetCustomBlob(tag, &fmt, &blobLen);
+        if (blob && blobLen > 0 &&
+            off + sizeof(PanicPacketHeader) + sizeof(PanicCustomBlobHeader) + blobLen <= bufLen)
+        {
+            PanicCustomBlobHeader cbh;
+            for (int i = 0; i < 8; i++) cbh.tag[i] = tag[i];
+            cbh.format = fmt;
+            cbh.reserved = 0;
+            ph.type = QR_PACKET_TYPE_CUSTOM_BLOB;
+            ph.size = sizeof(PanicCustomBlobHeader) + blobLen;
+            appendRaw(&ph, sizeof(ph));
+            appendRaw(&cbh, sizeof(cbh));
+            appendRaw(blob, blobLen);
+        }
     }
 
     return off;
@@ -258,7 +312,7 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
                  fbWidth, fbHeight, QR_PIXELS_PER_MODULE);
 
     // Step 1: Build binary TLV payload (no header yet — added per page)
-    static uint8_t payloadBuf[4096];
+    static uint8_t payloadBuf[8192];
     uint32_t payloadLen = BuildPanicPayload(payloadBuf, sizeof(payloadBuf),
                                             regs, trace, excInfo, procList,
                                             sysInfo, stackDump, cpuList);
@@ -271,7 +325,7 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
     SerialPrintf("PANIC QR: payload %u bytes\n", payloadLen);
 
     // Step 1b: Compress with LZ4
-    static uint8_t compressedBuf[4096];
+    static uint8_t compressedBuf[8192];
     int compressedLen = LZ4_compress_default(
         reinterpret_cast<const char*>(payloadBuf),
         reinterpret_cast<char*>(compressedBuf + 4),  // leave 4 bytes for uncompressed size
@@ -303,7 +357,7 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
     // Also dump hex to serial for host-side capture (works with crash_decoder.py --hex)
     // Use compressed data with v2 header
     {
-        static uint8_t serialBuf[4096];
+        static uint8_t serialBuf[8192];
         PanicHeader hdr;
         hdr.magic     = QR_MAGIC_BYTE;
         hdr.version   = (dataToEncode == compressedBuf) ? QR_VERSION : QR_VERSION_RAW;
@@ -352,7 +406,7 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
     }
 
     // Step 3: Encode and render each page
-    static char b45Buf[4096];
+    static char b45Buf[8192];
     static uint8_t qrBuf[qrcodegen_BUFFER_LEN_MAX];
     static uint8_t tempBuf[qrcodegen_BUFFER_LEN_MAX];
 

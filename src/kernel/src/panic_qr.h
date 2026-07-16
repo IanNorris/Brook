@@ -39,6 +39,32 @@ static constexpr uint32_t QR_PACKET_TYPE_STACK_DUMP     = 0xA3000006;
 static constexpr uint32_t QR_PACKET_TYPE_PROCESS_EXT    = 0xA3000007; // BRO-176 reap gates
 static constexpr uint32_t QR_PACKET_TYPE_CPU_STATE      = 0xA3000008; // per-CPU RIP/CR3/pid
 
+// Generic custom-diagnostic blob. A bug site stashes an opaque, self-describing
+// payload (via PanicSetCustomBlob) BEFORE calling KernelPanic; the panic builder
+// appends it verbatim as a TLV. The decoder prints it by tag. This makes any bug
+// class self-contained in the QR — no live monitor dump needed. First consumer:
+// BRO-208 (ownership ring + savedCtx + CR3), tag "BRO208".
+static constexpr uint32_t QR_PACKET_TYPE_CUSTOM_BLOB    = 0xA3000009;
+
+// Custom-blob wire header (followed by `size` raw bytes). `tag` is an 8-char
+// ASCII bug id (NUL-padded); `format` is a bug-specific schema version so the
+// decoder knows how to interpret the bytes.
+struct __attribute__((packed)) PanicCustomBlobHeader {
+    char     tag[8];     // e.g. "BRO208\0\0"
+    uint16_t format;     // schema version for this tag
+    uint16_t reserved;
+    // followed by `size` bytes (size is in the outer PanicPacketHeader)
+};
+static constexpr uint32_t PANIC_CUSTOM_BLOB_MAX = 2048;  // fits one QR page
+
+// Register a custom diagnostic blob to be embedded in the next panic's QR.
+// Safe to call from any context; copies up to PANIC_CUSTOM_BLOB_MAX bytes into a
+// static buffer. Cleared implicitly by only being emitted once per panic.
+// (Declared inside the enclosing `namespace brook` — no extra nesting.)
+void PanicSetCustomBlob(const char tag[8], uint16_t format,
+                        const void* data, uint32_t size);
+const void* PanicGetCustomBlob(char outTag[8], uint16_t* outFormat, uint32_t* outSize);
+
 // Rendering constants (tuned on real hardware — Enkel required dozens of iterations)
 //
 // QR_PIXELS_PER_MODULE: 3 works well on high-DPI displays.
