@@ -99,25 +99,49 @@ Decision tree:
 
 Linux baseline: **PASS** (`key38 utf8='a'`), confirming the logic + keymap are valid.
 
-## 2. `kbdprobe` — GUI, run under waylandd
+## 2. `kbdprobe` — GUI, the exact SDL stack yquake2 uses
+
+`wl_keymap_probe` PASSing on Brook proves the kernel/waylandd/xkb keymap path is
+clean, so the dead-text gate is inside SDL3/sdl2-compat. `kbdprobe` is a minimal
+SDL2 app (linking sdl2-compat → SDL3, exactly like yquake2) that creates a
+window, calls `SDL_StartTextInput`, and logs the **ground truth**: SDL revision,
+focus events, per-key `SDL_KEYDOWN` (scancode + sym, the bindings path) and any
+`SDL_TEXTINPUT` (the console-text path). It presents a frame via a renderer so
+the surface maps; Brook's WM focuses on map, so it gets keyboard focus with no
+click.
+
+Boot it headless under the GPU compositor (output on serial):
 
 ```
-SDL_VIDEODRIVER=wayland <out>/bin/kbdprobe
+nix-shell --run ./scripts/prestage_input_probe.sh
+BROOK_GPU=gl BROOK_COMPOSITE=gpu ./scripts/run-qemu.sh --release --script wayland_kbdprobe
 ```
 
-Press `q w e r t y`, `a s d f`, etc. Reads keypresses and logs to stderr/serial.
-Esc quits.
+then type `asdf 1`, `Esc` to quit.
 
-| Observation | Meaning |
-|-------------|---------|
-| `KEYDOWN scancode=… sym=0/UNKNOWN`, **no** `TEXTINPUT` | xkb.state NULL/invalid → same root as probe 1's FAIL |
-| `KEYDOWN … sym=a(valid)` + `TEXTINPUT 'a'` | xkb works — bug is above SDL (yquake2-specific; unlikely given code) |
+| Observation | Meaning | Next |
+|-------------|---------|------|
+| `KEYDOWN sym` valid + `TEXTINPUT` present | the SDL stack delivers text fine | BRO-216 is **yquake2-specific** (its window/console handling) |
+| `KEYDOWN sym` valid + **no** `TEXTINPUT` | sdl2-compat/SDL3 text gate on Brook | `SDL_TextInputActive(focus)` / seat focus in SDL3 `keyboard_handle_key` |
+| `KEYDOWN sym==0/UNKNOWN` | xkb keysym resolution broke in SDL | would contradict `wl_keymap_probe` — unexpected |
+| no `FOCUS_GAINED` / no `KEYDOWN` | the window never mapped/focused | mapping (renderer/GL) or WM focus |
 
-## Root candidate (leading)
+## 3. `xkb_memfd_probe` — headless, fabricated keymap (legacy)
 
-Brook's `sys_mmap` memfd branch (`syscall.cpp:~3718`) is commented "MAP_SHARED —
-used by wl_shm" and lazily faults pages to the mfd's own backing regardless of
-`MAP_PRIVATE`. For a read-only mapping this is functionally OK (reads see the
-written bytes), so it may PASS — in which case the fault is the cross-process
-keymap-fd hand-off (SCM_RIGHTS) delivering an fd whose mmap doesn't reflect
-waylandd's written keymap. Probe 1 distinguishes these in one run.
+Replicates the mmap+compile with a self-fabricated keymap and memfd (does not
+touch waylandd's real keymap or the SCM_RIGHTS hand-off). Superseded by
+`wl_keymap_probe`, kept as an isolated mmap+xkb sanity check.
+
+```
+<out>/bin/xkb_memfd_probe
+```
+
+Linux baseline: **PASS** (`key38 utf8='a'`).
+
+## Status
+
+`wl_keymap_probe` **PASSED on Brook** (real 7028-byte "Brook US" keymap via
+SCM_RIGHTS, `MAP_PRIVATE` mmap, compiled `is_virtual=0`, text for all test keys)
+— the kernel + waylandd + xkb pipeline is clean. Next: `kbdprobe` to split a
+generic sdl2-compat/SDL3 text gate from a yquake2-specific issue.
+

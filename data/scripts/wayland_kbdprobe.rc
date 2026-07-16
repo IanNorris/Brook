@@ -1,0 +1,21 @@
+# Brook BRO-216 GUI keyboard/text probe: bring up waylandd, then run kbdprobe, a
+# minimal SDL2 (sdl2-compat -> SDL3, the exact yquake2 stack) app that creates a
+# window, calls SDL_StartTextInput, and logs to serial: SDL revision, focus
+# events, per-key SDL_KEYDOWN (scancode + sym, the bindings path) and any
+# SDL_TEXTINPUT (the console-text path). The WM focuses on map, so it gets
+# keyboard focus without a click; type "asdf 1" then Esc.
+#
+# Needs the GPU compositor (SDL picks the GL renderer to map the window). SDL
+# auto-detects Wayland from the default WAYLAND_DISPLAY/XDG_RUNTIME_DIR env:
+#   BROOK_GPU=gl BROOK_COMPOSITE=gpu ./scripts/run-qemu.sh --release --script wayland_kbdprobe
+# Stage first: nix-shell --run ./scripts/prestage_input_probe.sh
+#
+# Reading the serial output:
+#   KEYDOWN sym valid + TEXTINPUT present => SDL stack delivers text => BRO-216 is
+#       yquake2-specific (its window/console handling), not the SDL/Brook stack.
+#   KEYDOWN sym valid + NO TEXTINPUT      => sdl2-compat/SDL3 text gate on Brook.
+#   no FOCUS_GAINED / no KEYDOWN          => the window never mapped/focused.
+set wm
+set vfb none
+run --once /nix/bin/waylandd
+run --uid 1000 /nix/profile/bin/kbdprobe
