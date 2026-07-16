@@ -106,8 +106,11 @@ clean, so the dead-text gate is inside SDL3/sdl2-compat. `kbdprobe` is a minimal
 SDL2 app (linking sdl2-compat → SDL3, exactly like yquake2) that creates a
 window, calls `SDL_StartTextInput`, and logs the **ground truth**: SDL revision,
 focus events, per-key `SDL_KEYDOWN` (scancode + sym, the bindings path) and any
-`SDL_TEXTINPUT` (the console-text path). It presents a frame via a renderer so
-the surface maps; Brook's WM focuses on map, so it gets keyboard focus with no
+`SDL_TEXTINPUT` (the console-text path). It maps its window the SAME way
+yquake2 does — `SDL_WINDOW_OPENGL` + `SDL_GL_CreateContext` + `SDL_GL_SwapWindow`
+— because sdl2-compat does NOT support the SDL2 software paths
+(`SDL_CreateRenderer`, `SDL_GetWindowSurface`) on Wayland (they fail, the surface
+never commits a buffer, so the window never maps or gets focus). Brook's WM focuses on map, so it gets keyboard focus with no
 click.
 
 Boot it headless under the GPU compositor (output on serial):
