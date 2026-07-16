@@ -23,18 +23,24 @@ pkgs.stdenv.mkDerivation {
   version = "1.0";
   src = ./.;
   nativeBuildInputs = [ pkgs.pkg-config ];
-  buildInputs = [ pkgs.SDL2 pkgs.libxkbcommon ];
+  buildInputs = [ pkgs.SDL2 pkgs.libxkbcommon pkgs.wayland ];
   buildPhase = ''
     # GUI probe: splits "SDL2 xkb works" from "xkb.state NULL" via keypresses.
     $CC -O2 -Wall -Wextra $(pkg-config --cflags sdl2) \
       kbdprobe.c -o kbdprobe $(pkg-config --libs sdl2)
-    # Headless probe: replicates SDL2's mmap(MAP_PRIVATE, memfd)+xkb compile,
-    # runnable from a plain terminal (no GUI / no input injection).
+    # Headless probe: replicates SDL2's mmap(MAP_PRIVATE, memfd)+xkb compile
+    # with a FABRICATED keymap, runnable from a plain terminal.
     $CC -O2 -Wall -Wextra $(pkg-config --cflags xkbcommon) \
       xkb_memfd_probe.c -o xkb_memfd_probe $(pkg-config --libs xkbcommon)
+    # End-to-end probe: a raw-libwayland client that connects to waylandd,
+    # receives the REAL keymap event (real fd via SCM_RIGHTS) and runs SDL3's
+    # exact compile+text path. The decisive BRO-216 diagnostic; no SDL/GL/game.
+    $CC -O2 -Wall -Wextra $(pkg-config --cflags wayland-client xkbcommon) \
+      wl_keymap_probe.c -o wl_keymap_probe \
+      $(pkg-config --libs wayland-client xkbcommon)
   '';
   installPhase = ''
     mkdir -p $out/bin
-    cp kbdprobe xkb_memfd_probe $out/bin/
+    cp kbdprobe xkb_memfd_probe wl_keymap_probe $out/bin/
   '';
 }
