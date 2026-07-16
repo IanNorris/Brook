@@ -4,6 +4,7 @@
 #include "panic.h"
 #include "panic_probe.h"
 #include "panic_unwind.h"
+#include "display.h"
 #include "panic_screen.h"
 #include "panic_qr.h"
 #include "process.h"
@@ -1248,6 +1249,11 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                 psi.vector    = vector;
                 psi.errorCode = ef->errorCode;
                 brook::PanicScreenRender(const_cast<uint32_t*>(physFb), fbW, fbH, fbStride, &psi);
+                // Push CPU-written panic pixels to the GPU scanout (virtio-gpu
+                // needs TRANSFER_TO_HOST_2D + RESOURCE_FLUSH; polling submission
+                // is panic-safe; no-op for direct-scanout displays). Without
+                // this the panic screen never appears under a GL/virgl client.
+                brook::DisplayFlush(0, fbH);
             }
         }
 

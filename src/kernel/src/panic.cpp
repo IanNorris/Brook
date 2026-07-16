@@ -8,6 +8,7 @@
 #include "panic_probe.h"
 #include "panic_screen.h"
 #include "compositor.h"
+#include "display.h"
 #include "smp.h"
 #include "build_info.h"
 #include "ksym_addrs.h"
@@ -545,6 +546,15 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
         psi.vector    = 0;
         psi.errorCode = 0;
         brook::PanicScreenRender(const_cast<uint32_t*>(physFb), fbW, fbH, fbStride, &psi);
+        // Push the CPU-written panic pixels to the GPU scanout. On virtio-gpu the
+        // linear framebuffer is not scanned out directly — it must be
+        // TRANSFER_TO_HOST_2D + RESOURCE_FLUSH'd, or the panic screen never
+        // appears (the "QR rendered to framebuffer but nothing on screen" bug,
+        // seen when a GL/virgl client left a stale 3D frame on the scanout).
+        // virtio-gpu command submission polls the used ring (no IRQs), so this
+        // is panic-safe with interrupts off and APs halted; it is a no-op for
+        // direct-scanout (VBE/linear) displays.
+        brook::DisplayFlush(0, fbH);
     }
 
     // Spin forever (don't use hlt — it causes QEMU to exit when all CPUs halt)

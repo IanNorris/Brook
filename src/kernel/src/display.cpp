@@ -100,7 +100,8 @@ uint64_t DisplayGetFramebufferPhys()
 
 void DisplayFlush(uint32_t minY, uint32_t maxY)
 {
-    g_activeDisplay->Flush(minY, maxY);
+    if (g_activeDisplay && g_activeDisplay->Flush)
+        g_activeDisplay->Flush(minY, maxY);
 }
 
 // ---------------------------------------------------------------------------
