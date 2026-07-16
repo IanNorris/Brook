@@ -117,7 +117,7 @@ Boot it headless under the GPU compositor (output on serial):
 
 ```
 nix-shell --run ./scripts/prestage_input_probe.sh
-BROOK_GPU=gl BROOK_COMPOSITE=gpu ./scripts/run-qemu.sh --release --script wayland_kbdprobe
+BROOK_GPU=gl BROOK_GPU_DISPLAY=sdl BROOK_COMPOSITE=gpu ./scripts/run-qemu.sh --release --script wayland_kbdprobe
 ```
 
 then type `asdf 1`, `Esc` to quit.

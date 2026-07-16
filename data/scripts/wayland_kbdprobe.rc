@@ -5,9 +5,10 @@
 # SDL_TEXTINPUT (the console-text path). The WM focuses on map, so it gets
 # keyboard focus without a click; type "asdf 1" then Esc.
 #
-# Needs the GPU compositor (SDL picks the GL renderer to map the window). SDL
-# auto-detects Wayland from the default WAYLAND_DISPLAY/XDG_RUNTIME_DIR env:
-#   BROOK_GPU=gl BROOK_COMPOSITE=gpu ./scripts/run-qemu.sh --release --script wayland_kbdprobe
+# Needs the GPU compositor (SDL maps the window via GL, like yquake2). SDL
+# auto-detects Wayland from the default WAYLAND_DISPLAY/XDG_RUNTIME_DIR env.
+# BROOK_GPU_DISPLAY=sdl shows the window on the host (so you can watch focus):
+#   BROOK_GPU=gl BROOK_GPU_DISPLAY=sdl BROOK_COMPOSITE=gpu ./scripts/run-qemu.sh --release --script wayland_kbdprobe
 # Stage first: nix-shell --run ./scripts/prestage_input_probe.sh
 #
 # Reading the serial output:
