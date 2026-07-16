@@ -1024,6 +1024,8 @@ def print_custom_blob(blob: bytes, sym: "Symbolicator | None"):
     print(f"\n  ── Custom diagnostic: {tag} (format {fmt}) ──")
     if tag == "BRO208" and fmt == 1:
         _print_bro208(body, sym)
+    elif tag == "BRO208" and fmt == 2:
+        _print_bro208_v2(body, sym)
     else:
         print(f"    {len(body)} bytes (no renderer for {tag}/{fmt}); hex:")
         print("    " + body.hex())
@@ -1060,6 +1062,66 @@ def _print_bro208(body: bytes, sym):
         iff = (rif >> 8) & 1
         print(f"      #{seq:#x} tsc={tsc} IF={iff} {reason} "
               f"ra=0x{ra:012x}{_sym(sym, ra)}  0x{oldp:012x} -> 0x{newp:012x}")
+
+
+_BRO208_REASONS = {1: "DoSwitch", 2: "exit", 3: "start", 4: "apstart"}
+
+
+def _print_bro208_v2(body: bytes, sym):
+    """Format 2: fixed head + onlineMask + per-CPU sections (all online CPUs).
+
+    Header: 8xu64 {cr3,curProc,liveRsp,curSavedRsp,curSavedRip,curSavedCr3,
+    curStackBase,curStackTop}, u64 onlineMask, u8 panicCpu, u8 sectionCount,
+    u16 recordSize, u32 flags.
+    Section: u8 cpu, u8 recordCount, u16 secFlags, u64 currentProcess,
+    u64 headSeq, then recordCount x record.
+    Record (44B): u64 seq,tsc,ra,oldProc,newProc, u8 reason,ifFlag,writerCpu,rsvd.
+    """
+    hdr_fmt = "<8Q Q B B H I"
+    hsz = struct.calcsize(hdr_fmt)
+    if len(body) < hsz:
+        print(f"    [warn] format-2 blob too short ({len(body)} < {hsz})")
+        return
+    (cr3, cur, rsp, sRsp, sRip, sCr3, sBase, sTop,
+     online_mask, panic_cpu, section_count, rec_size, flags) = struct.unpack_from(hdr_fmt, body, 0)
+    inb = sBase <= rsp < sTop
+    print(f"    live:   CR3=0x{cr3:016x}  currentProcess=0x{cur:016x}  liveRSP=0x{rsp:016x}")
+    print(f"    curCtx: savedRSP=0x{sRsp:016x}{_sym(sym, sRip)}")
+    print(f"            savedRIP=0x{sRip:016x}  savedCR3=0x{sCr3:016x}")
+    print(f"            stack=[0x{sBase:016x}, 0x{sTop:016x})  RSP_in_bounds={inb}")
+    print(f"    >>> currentProcess RSP-in-its-own-stack={sBase <= sRsp < sTop}; "
+          f"liveRSP-in-currentProcess-stack={inb}")
+    online = [c for c in range(64) if online_mask & (1 << c)]
+    trunc = " TRUNCATED" if (flags & 1) else ""
+    print(f"    panicCpu={panic_cpu}  online CPUs={online}  sections={section_count}"
+          f"  recSize={rec_size}{trunc}")
+
+    off = hsz
+    sec_fmt = "<B B H Q Q"
+    ssz = struct.calcsize(sec_fmt)
+    rec_fmt = "<5Q BBBB"
+    rsz = struct.calcsize(rec_fmt)
+    for _ in range(section_count):
+        if off + ssz > len(body):
+            print("    [warn] truncated before section header")
+            break
+        (cpu, rec_count, _sflags, cur_proc, head_seq) = struct.unpack_from(sec_fmt, body, off)
+        off += ssz
+        marker = "  <== PANIC CPU" if cpu == panic_cpu else ""
+        owns = "  <== owns stale currentProcess" if cur_proc == cur and cur != 0 else ""
+        print(f"    CPU{cpu}: currentProcess=0x{cur_proc:016x} headSeq={head_seq} "
+              f"records={rec_count}{marker}{owns}")
+        for _r in range(rec_count):
+            if off + rsz > len(body):
+                print("      [warn] truncated mid-record")
+                break
+            (seq, tsc, ra, oldp, newp, reason, iff, wcpu, _rsvd) = struct.unpack_from(rec_fmt, body, off)
+            off += rsz
+            rn = _BRO208_REASONS.get(reason, "?")
+            xcpu = f" writerCpu={wcpu}" + ("!=CPU%d" % cpu if wcpu != cpu else "")
+            owns_r = "  *stale*" if newp == cur and cur != 0 else ""
+            print(f"      #{seq:#x} tsc={tsc} IF={iff} {rn}{xcpu} "
+                  f"ra=0x{ra:012x}{_sym(sym, ra)}  0x{oldp:012x} -> 0x{newp:012x}{owns_r}")
 
 
 def parse_serial_log(path: str) -> bytes:

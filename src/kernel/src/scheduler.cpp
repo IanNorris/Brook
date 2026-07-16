@@ -652,6 +652,7 @@ struct OwnTraceRec {
     uint64_t newProc;
     uint8_t  reason;
     uint8_t  ifFlag;
+    uint8_t  writerCpu;      // CPU that executed the write (≠ target cpu ⇒ cross-CPU)
 };
 
 static constexpr uint32_t OWN_RING = 16;   // per-CPU history depth
@@ -675,6 +676,10 @@ static void OwnTraceRecord(uint32_t cpu, Process* oldP, Process* newP,
     r.newProc = reinterpret_cast<uint64_t>(newP);
     r.reason  = reason;
     r.ifFlag  = static_cast<uint8_t>((fl >> 9) & 1);
+    // Record the CPU that physically executed this write. For every current
+    // caller this equals `cpu` (self-write); a mismatch on a future hit is the
+    // fingerprint of an untraced cross-CPU currentProcess write (BRO-218).
+    r.writerCpu = static_cast<uint8_t>(SmpCurrentCpuIndex() & 0xFF);
     __atomic_store_n(&r.seq, s, __ATOMIC_RELEASE);   // commit last
 }
 
@@ -724,63 +729,148 @@ static void OwnTraceDump(uint32_t cpu)
 //   - live CR3 + the currentProcess pointer + live RSP
 //   - currentProcess's full SavedContext (rsp/rip/cr3 — is idle aliased?)
 //   - the running thread inferred from live RSP (its SavedContext too)
-//   - the last OWN_RING ownership transitions for this CPU (writer RIPs)
+//   - the last few ownership transitions for EVERY online CPU (writer RIPs +
+//     writerCpu), so a stale currentProcess written by an untraced/cross-CPU
+//     path is found even when the panicking CPU's own ring is blind (BRO-218).
 // All reads are plain (we're already panicking, IF=0, APs about to halt); the
 // Process* is validated before deref.
-struct __attribute__((packed)) Bro208Blob {
-    uint64_t cr3;
-    uint64_t curProc;
-    uint64_t liveRsp;
-    uint64_t curSavedRsp, curSavedRip, curSavedCr3;   // currentProcess->savedCtx
-    uint64_t curStackBase, curStackTop;
-    uint32_t ringCount;
-    // ringCount records of {seq, tsc, ra, oldProc, newProc, reason|IF<<8}
-    struct __attribute__((packed)) Rec {
-        uint64_t seq, tsc, ra, oldProc, newProc; uint16_t reasonIf;
-    } recs[OWN_RING];
+//
+// Format 2 wire layout (little-endian, explicit widths):
+//   Header:  8×u64 {cr3,curProc,liveRsp,curSavedRsp,curSavedRip,curSavedCr3,
+//                   curStackBase,curStackTop}, u64 onlineMask,
+//            u8 panicCpu, u8 sectionCount, u16 recordSize(=44), u32 flags
+//   Section (per online CPU): u8 cpu, u8 recordCount, u16 secFlags,
+//            u64 currentProcess, u64 headSeq, then recordCount records
+//   Record (44B): u64 seq,tsc,ra,oldProc,newProc, u8 reason,ifFlag,writerCpu,rsvd
+static constexpr uint32_t BRO208_HEADER_SIZE  = 8 * 8 + 8 + 1 + 1 + 2 + 4; // 80
+static constexpr uint32_t BRO208_SECTION_SIZE = 1 + 1 + 2 + 8 + 8;         // 20
+static constexpr uint32_t BRO208_RECORD_SIZE  = 5 * 8 + 4;                 // 44
+static constexpr uint32_t BRO208_FLAG_TRUNCATED = 1u;
+
+namespace {
+struct BlobWriter {
+    uint8_t* buf;
+    uint32_t cap;
+    uint32_t off;
+    bool     overflow;
+    void u8v(uint8_t v)  { if (off + 1 > cap) { overflow = true; return; } buf[off++] = v; }
+    void u16v(uint16_t v){ u8v(v & 0xFF); u8v((v >> 8) & 0xFF); }
+    void u32v(uint32_t v){ u16v(v & 0xFFFF); u16v((v >> 16) & 0xFFFF); }
+    void u64v(uint64_t v){ u32v(v & 0xFFFFFFFFu); u32v((v >> 32) & 0xFFFFFFFFu); }
+    bool fits(uint32_t n) const { return off + n <= cap; }
 };
+}
 
 __attribute__((noinline))
 static void EmbedBro208Blob(uint32_t cpu, Process* cur, uint64_t /*gs184*/, uint64_t liveRsp)
 {
-    static Bro208Blob blob;   // static: no stack pressure on the panic path
-    __builtin_memset(&blob, 0, sizeof(blob));
-    __asm__ volatile("movq %%cr3, %0" : "=r"(blob.cr3));
-    blob.curProc = reinterpret_cast<uint64_t>(cur);
-    blob.liveRsp = liveRsp;
+    static uint8_t s_blob[PANIC_CUSTOM_BLOB_MAX];  // static: no panic-stack pressure
+    BlobWriter w{ s_blob, PANIC_CUSTOM_BLOB_MAX, 0, false };
 
+    uint64_t cr3 = 0;
+    __asm__ volatile("movq %%cr3, %0" : "=r"(cr3));
+
+    uint64_t curSavedRsp = 0, curSavedRip = 0, curSavedCr3 = 0;
+    uint64_t curStackBase = 0, curStackTop = 0;
     uint64_t cv = reinterpret_cast<uint64_t>(cur);
     if (cur && (cv & 7) == 0 && cv >= 0xFFFF800000000000ULL) {
         uint64_t magic = 0;
         if (PanicSafeReadU64(cv, &magic) && magic == PROCESS_MAGIC) {
-            blob.curSavedRsp  = cur->savedCtx.rsp;
-            blob.curSavedRip  = cur->savedCtx.rip;
-            blob.curSavedCr3  = cur->savedCtx.cr3;
-            blob.curStackBase = cur->kernelStackBase;
-            blob.curStackTop  = cur->kernelStackTop;
+            curSavedRsp  = cur->savedCtx.rsp;
+            curSavedRip  = cur->savedCtx.rip;
+            curSavedCr3  = cur->savedCtx.cr3;
+            curStackBase = cur->kernelStackBase;
+            curStackTop  = cur->kernelStackTop;
         }
     }
 
-    if (cpu < SCHED_MAX_CPUS) {
-        uint64_t head = g_ownSeq[cpu];
-        uint64_t start = (head > OWN_RING) ? (head - OWN_RING) : 0;
-        uint32_t n = 0;
-        for (uint64_t s = start + 1; s <= head && n < OWN_RING; ++s) {
-            const OwnTraceRec& r = g_ownRing[cpu][(s - 1) % OWN_RING];
-            if (r.seq != s) continue;
-            blob.recs[n].seq = r.seq; blob.recs[n].tsc = r.tsc; blob.recs[n].ra = r.ra;
-            blob.recs[n].oldProc = r.oldProc; blob.recs[n].newProc = r.newProc;
-            blob.recs[n].reasonIf = static_cast<uint16_t>(r.reason | (r.ifFlag << 8));
-            ++n;
+    // Enumerate online CPUs (idleProcess is installed once per CPU at init).
+    uint64_t onlineMask = 0;
+    uint32_t nOnline = 0;
+    for (uint32_t c = 0; c < SCHED_MAX_CPUS && c < 64; ++c) {
+        if (g_perCpu[c].idleProcess || g_perCpu[c].currentProcess ||
+            g_ownSeq[c] != 0) {
+            onlineMask |= (1ULL << c);
+            ++nOnline;
         }
-        blob.ringCount = n;
     }
+    if (nOnline == 0) nOnline = 1;   // avoid div-by-zero; still emit header
+
+    // Greedy per-CPU record quota that fits the fixed QR blob budget.
+    uint32_t avail = (PANIC_CUSTOM_BLOB_MAX > BRO208_HEADER_SIZE + nOnline * BRO208_SECTION_SIZE)
+        ? (PANIC_CUSTOM_BLOB_MAX - BRO208_HEADER_SIZE - nOnline * BRO208_SECTION_SIZE)
+        : 0;
+    uint32_t perCpu = avail / (nOnline * BRO208_RECORD_SIZE);
+    if (perCpu > OWN_RING) perCpu = OWN_RING;
+
+    uint32_t flags = 0;
+
+    // Header.
+    w.u64v(cr3);
+    w.u64v(reinterpret_cast<uint64_t>(cur));
+    w.u64v(liveRsp);
+    w.u64v(curSavedRsp);
+    w.u64v(curSavedRip);
+    w.u64v(curSavedCr3);
+    w.u64v(curStackBase);
+    w.u64v(curStackTop);
+    w.u64v(onlineMask);
+    w.u8v(static_cast<uint8_t>(cpu & 0xFF));
+    uint32_t sectionCountOff = w.off;      // backpatch after emitting sections
+    w.u8v(0);
+    w.u16v(static_cast<uint16_t>(BRO208_RECORD_SIZE));
+    uint32_t flagsOff = w.off;
+    w.u32v(0);
+
+    uint8_t sectionCount = 0;
+    for (uint32_t c = 0; c < SCHED_MAX_CPUS && c < 64; ++c) {
+        if (!(onlineMask & (1ULL << c))) continue;
+
+        uint64_t head = g_ownSeq[c];
+        uint32_t availRecs = (head > OWN_RING) ? OWN_RING : static_cast<uint32_t>(head);
+        uint32_t want = availRecs < perCpu ? availRecs : perCpu;
+        if (availRecs > want) flags |= BRO208_FLAG_TRUNCATED;
+
+        // Stop cleanly if the next full section won't fit.
+        if (!w.fits(BRO208_SECTION_SIZE + want * BRO208_RECORD_SIZE)) {
+            flags |= BRO208_FLAG_TRUNCATED;
+            break;
+        }
+
+        w.u8v(static_cast<uint8_t>(c & 0xFF));
+        uint32_t recCountOff = w.off;
+        w.u8v(0);
+        w.u16v(0);
+        w.u64v(reinterpret_cast<uint64_t>(g_perCpu[c].currentProcess));
+        w.u64v(head);
+
+        uint32_t start = (head > want) ? static_cast<uint32_t>(head - want) : 0;
+        uint8_t emitted = 0;
+        for (uint64_t s = start + 1; s <= head; ++s) {
+            const OwnTraceRec& r = g_ownRing[c][(s - 1) % OWN_RING];
+            // seqlock sandwich: reject torn / overwritten records.
+            uint64_t s1 = __atomic_load_n(&r.seq, __ATOMIC_ACQUIRE);
+            uint64_t tsc = r.tsc, ra = r.ra, op = r.oldProc, np = r.newProc;
+            uint8_t rea = r.reason, iff = r.ifFlag, wc = r.writerCpu;
+            uint64_t s2 = __atomic_load_n(&r.seq, __ATOMIC_ACQUIRE);
+            if (s1 != s || s2 != s) continue;
+            w.u64v(s); w.u64v(tsc); w.u64v(ra); w.u64v(op); w.u64v(np);
+            w.u8v(rea); w.u8v(iff); w.u8v(wc); w.u8v(0);
+            ++emitted;
+        }
+        s_blob[recCountOff] = emitted;
+        ++sectionCount;
+    }
+
+    if (w.overflow) flags |= BRO208_FLAG_TRUNCATED;
+    s_blob[sectionCountOff] = sectionCount;
+    s_blob[flagsOff + 0] = flags & 0xFF;
+    s_blob[flagsOff + 1] = (flags >> 8) & 0xFF;
+    s_blob[flagsOff + 2] = (flags >> 16) & 0xFF;
+    s_blob[flagsOff + 3] = (flags >> 24) & 0xFF;
 
     const char tag[8] = { 'B','R','O','2','0','8','\0','\0' };
-    uint32_t used = static_cast<uint32_t>(
-        reinterpret_cast<uint8_t*>(&blob.recs[blob.ringCount]) -
-        reinterpret_cast<uint8_t*>(&blob));
-    PanicSetCustomBlob(tag, /*format*/ 1, &blob, used);
+    PanicSetCustomBlob(tag, /*format*/ 2, s_blob, w.off);
 }
 
 __attribute__((noinline))
@@ -2557,9 +2647,11 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
 
     if (!first) first = g_perCpu[cpu].idleProcess;
 
-    g_perCpu[cpu].currentProcess = first;
-    if (g_perCpu[cpu].cpuEnv) { g_perCpu[cpu].cpuEnv->currentPid = first->pid; g_perCpu[cpu].cpuEnv->currentProcess = reinterpret_cast<uint64_t>(first); }
-    
+    // Route the BSP's first assignment through the traced setter (execution is
+    // local: cpu == ThisCpu()), so g_ownSeq[cpu] >= 1 from boot and the panic
+    // ownership ring is never blind for an online CPU (BRO-218).
+    SchedSetCurrent(cpu, first, OWN_START, __builtin_return_address(0));
+
     first->state = ProcessState::Running;
     __atomic_store_n(&first->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
     __atomic_or_fetch(&first->tlbCpuMask, 1ULL << cpu, __ATOMIC_RELEASE);
@@ -2624,9 +2716,10 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
 
     if (!first) first = g_perCpu[cpu].idleProcess;
 
-    g_perCpu[cpu].currentProcess = first;
-    if (g_perCpu[cpu].cpuEnv) { g_perCpu[cpu].cpuEnv->currentPid = first->pid; g_perCpu[cpu].cpuEnv->currentProcess = reinterpret_cast<uint64_t>(first); }
-    
+    // Same as the BSP path: trace the AP's first assignment (local execution)
+    // so this CPU's ownership ring is populated from boot (BRO-218).
+    SchedSetCurrent(cpu, first, OWN_APSTART, __builtin_return_address(0));
+
     first->state = ProcessState::Running;
     __atomic_store_n(&first->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
     __atomic_or_fetch(&first->tlbCpuMask, 1ULL << cpu, __ATOMIC_RELEASE);
