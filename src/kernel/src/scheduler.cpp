@@ -12,6 +12,7 @@
 #include "memory/address.h"
 #include "gdt.h"
 #include "serial.h"
+#include "ksym_addrs.h"
 #include "spinlock.h"
 #include "sched_ops.h"
 #include "profiler.h"
@@ -621,6 +622,102 @@ enum CoreOwnFail : uint32_t {
     COF_RSP             = 32,  // live RSP not within [kernelStackBase, kernelStackTop)
 };
 
+// ---------------------------------------------------------------------------
+// BRO-208 ownership-transition tracer.
+// ---------------------------------------------------------------------------
+// The guard proves a user thread runs while per-CPU "current" says idle, but the
+// exact instruction that wrote the stale idle is not visible from a single
+// snapshot (all currentProcess writes are before context_switch, so the "stale
+// re-commit" hypothesis doesn't fit — the write must come from an unexpected
+// site or ordering). This per-CPU ring records every currentProcess transition
+// with the writer's return address, so on the ownership panic we can replay the
+// last N writes for the offending CPU and name the RIP that wrote idle.
+//
+// Lock-free: single-writer per CPU (writes happen with IF=0 on the switch path),
+// the sequence number is stored LAST (release) so a reader sees a fully-written
+// record. Reason codes tag the call site.
+enum OwnReason : uint8_t {
+    OWN_DOSWITCH   = 1,   // DoSwitch published newProc before context_switch
+    OWN_EXIT       = 2,   // SchedulerExitCurrentProcess switch
+    OWN_START      = 3,   // SchedulerStart (BSP first proc)
+    OWN_APSTART    = 4,   // AP first proc
+};
+
+struct OwnTraceRec {
+    volatile uint64_t seq;   // written LAST (release); 0 = empty
+    uint64_t tsc;
+    uint64_t ra;             // writer return address (the site that set current)
+    uint64_t oldProc;
+    uint64_t newProc;
+    uint8_t  reason;
+    uint8_t  ifFlag;
+};
+
+static constexpr uint32_t OWN_RING = 16;   // per-CPU history depth
+static OwnTraceRec g_ownRing[SCHED_MAX_CPUS][OWN_RING];
+static uint64_t    g_ownSeq[SCHED_MAX_CPUS];   // per-CPU monotonic (single-writer)
+
+__attribute__((noinline, no_instrument_function))
+static void OwnTraceRecord(uint32_t cpu, Process* oldP, Process* newP,
+                           uint8_t reason, void* ra)
+{
+    if (cpu >= SCHED_MAX_CPUS) return;
+    uint64_t s = ++g_ownSeq[cpu];
+    OwnTraceRec& r = g_ownRing[cpu][(s - 1) % OWN_RING];
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    uint64_t fl;
+    __asm__ volatile("pushfq; pop %0" : "=r"(fl));
+    r.tsc     = (static_cast<uint64_t>(hi) << 32) | lo;
+    r.ra      = reinterpret_cast<uint64_t>(ra);
+    r.oldProc = reinterpret_cast<uint64_t>(oldP);
+    r.newProc = reinterpret_cast<uint64_t>(newP);
+    r.reason  = reason;
+    r.ifFlag  = static_cast<uint8_t>((fl >> 9) & 1);
+    __atomic_store_n(&r.seq, s, __ATOMIC_RELEASE);   // commit last
+}
+
+// Central choke for publishing "CPU `cpu` now runs `newP`": writes both the
+// per-CPU slot and gs:184 (cpuEnv) as a coupled set, and records the transition.
+// Callers pass __builtin_return_address(0) so the ring names the real write site.
+__attribute__((always_inline))
+static inline void SchedSetCurrent(uint32_t cpu, Process* newP,
+                                   uint8_t reason, void* ra)
+{
+    Process* oldP = g_perCpu[cpu].currentProcess;
+    g_perCpu[cpu].currentProcess = newP;
+    if (g_perCpu[cpu].cpuEnv) {
+        g_perCpu[cpu].cpuEnv->currentPid     = newP ? newP->pid : 0;
+        g_perCpu[cpu].cpuEnv->currentProcess = reinterpret_cast<uint64_t>(newP);
+    }
+    OwnTraceRecord(cpu, oldP, newP, reason, ra);
+}
+
+// Dump the last N ownership transitions for `cpu` (called from the panic).
+__attribute__((noinline))
+static void OwnTraceDump(uint32_t cpu)
+{
+    if (cpu >= SCHED_MAX_CPUS) return;
+    SerialPrintf("  --- ownership transitions cpu%u (newest last) ---\n", cpu);
+    uint64_t head = g_ownSeq[cpu];
+    uint64_t start = (head > OWN_RING) ? (head - OWN_RING) : 0;
+    for (uint64_t s = start + 1; s <= head; ++s) {
+        const OwnTraceRec& r = g_ownRing[cpu][(s - 1) % OWN_RING];
+        if (r.seq != s) continue;   // torn/empty
+        const char* rn = (r.reason == OWN_DOSWITCH) ? "DoSwitch"
+                       : (r.reason == OWN_EXIT)     ? "exit"
+                       : (r.reason == OWN_START)    ? "start"
+                       : (r.reason == OWN_APSTART)  ? "apstart" : "?";
+        const char* sym = nullptr; uint64_t off = 0;
+        brook::KsymFindByAddr(r.ra, &sym, &off);
+        SerialPrintf("   #%lu tsc=%lu IF=%u %s ra=0x%lx %s+0x%lx  %p -> %p\n",
+                     r.seq, r.tsc, r.ifFlag, rn, r.ra,
+                     sym ? sym : "?", off,
+                     reinterpret_cast<void*>(r.oldProc),
+                     reinterpret_cast<void*>(r.newProc));
+    }
+}
+
 __attribute__((noinline))
 static void CoreOwnershipPanic(uint32_t fail, uint32_t cpu, uint32_t argCpu,
                                Process* cur, uint64_t gs184, uint64_t rsp,
@@ -637,6 +734,8 @@ static void CoreOwnershipPanic(uint32_t fail, uint32_t cpu, uint32_t argCpu,
         }
         nm[32] = '\0';
     } else { nm[0] = '?'; nm[1] = '\0'; }
+
+    OwnTraceDump(cpu);   // replay the last N currentProcess writes → names the stale writer
 
     KernelPanic("BRO-208 CORE-OWNERSHIP VIOLATION cpu=%u argCpu=%u fail=0x%x\n"
                 "  currentProcess=%p gs184=0x%lx pid=%u name=%s\n"
@@ -1200,7 +1299,24 @@ void SchedulerStop(Process* proc)
 
     uint32_t cpu = ThisCpu();
     if (proc == g_perCpu[cpu].currentProcess)
+    {
         SchedulerYield();
+
+        // BRO-208 localization: SchedulerYield switched away and (later) resumed
+        // THIS thread. On resume, per-CPU "current" must name us again. If it
+        // names something else (idle, per the frozen-VM signature), the stale
+        // write already happened — catch it HERE, earlier than the timer-tick
+        // guard, and dump the ownership ring to name the writer RIP. The window
+        // this localizes to is [resume-drain .. this point].
+        uint32_t c2 = ThisCpu();
+        if (proc != g_perCpu[c2].currentProcess)
+        {
+            OwnTraceDump(c2);
+            KernelPanic("BRO-208 SchedulerBlock post-yield ownership lost: "
+                        "cpu=%u proc=%p (pid=%u) but current=%p",
+                        c2, proc, proc->pid, g_perCpu[c2].currentProcess);
+        }
+    }
 
     if (flags & 0x200)
         __asm__ volatile("sti" ::: "memory");
@@ -1651,11 +1767,7 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
         }
     }
 
-    g_perCpu[cpu].currentProcess = newProc;
-    if (g_perCpu[cpu].cpuEnv) {
-        g_perCpu[cpu].cpuEnv->currentPid = newProc->pid;
-        g_perCpu[cpu].cpuEnv->currentProcess = reinterpret_cast<uint64_t>(newProc);
-    }
+    SchedSetCurrent(cpu, newProc, OWN_DOSWITCH, __builtin_return_address(0));
     newProc->state = ProcessState::Running;
     SchedTrace(newProc, STR_RUN);
     __atomic_store_n(&newProc->runningOnCpu, static_cast<int32_t>(cpu), __ATOMIC_RELEASE);
@@ -2330,11 +2442,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     // Exiting process will never run again — clear its TLB CPU mask
     __atomic_and_fetch(&proc->tlbCpuMask, ~(1ULL << cpu), __ATOMIC_RELEASE);
 
-    g_perCpu[cpu].currentProcess = next;
-    if (g_perCpu[cpu].cpuEnv) {
-        g_perCpu[cpu].cpuEnv->currentPid = next->pid;
-        g_perCpu[cpu].cpuEnv->currentProcess = reinterpret_cast<uint64_t>(next);
-    }
+    SchedSetCurrent(cpu, next, OWN_EXIT, __builtin_return_address(0));
     next->state = ProcessState::Running;
     __atomic_store_n(&next->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
     __atomic_or_fetch(&next->tlbCpuMask, 1ULL << cpu, __ATOMIC_RELEASE);
