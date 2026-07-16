@@ -1,0 +1,12 @@
+# Brook BRO-216 keymap probe: bring up waylandd, then run wl_keymap_probe, which
+# connects to waylandd, receives the REAL keymap event (real fd via SCM_RIGHTS),
+# and runs SDL3's exact mmap(MAP_PRIVATE)+xkb compile+text path. The result
+# prints to serial: PASS => kernel/waylandd/xkb path is clean (BRO-216 is inside
+# SDL3/sdl2-compat); FAIL at a step => a kernel or waylandd keymap-fd bug there.
+#
+# Stage first with: nix-shell --run ./scripts/prestage_input_probe.sh
+# Boot headless:     ./scripts/run-qemu.sh --release --headless --script wayland_keymap_probe
+set wm
+set vfb none
+run --once /nix/bin/waylandd
+run --uid 1000 /nix/profile/bin/wl_keymap_probe

@@ -187,7 +187,13 @@ static const struct wl_registry_listener reg_listener = { reg_global, reg_remove
 
 int main(void)
 {
-    struct wl_display *dpy = wl_display_connect(NULL);
+    /* Retry the connect a few times: when launched right after waylandd from an
+     * rc, the socket may not be listening yet. Harmless on a live desktop. */
+    struct wl_display *dpy = NULL;
+    for (int i = 0; i < 50 && !dpy; i++) {
+        dpy = wl_display_connect(NULL);
+        if (!dpy) usleep(200 * 1000);
+    }
     if (!dpy) { printf("FAIL: wl_display_connect (WAYLAND_DISPLAY=%s)\n",
                         getenv("WAYLAND_DISPLAY") ? getenv("WAYLAND_DISPLAY") : "(unset)");
                 return 1; }
