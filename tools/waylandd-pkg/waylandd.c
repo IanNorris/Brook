@@ -99,6 +99,70 @@ static struct wl_display *g_display = NULL;
 static volatile sig_atomic_t g_shutdown = 0;
 static int g_commit_count = 0;
 
+/* ---------------- API-gap request tracking (P1.1) ----------------
+ * BRO-216 was a silent MISSING global. The inverse failure — advertise an
+ * interface but leave a request handler as a silent no-op — is just as costly
+ * and P0.1/P0.2 cannot see it. Two mechanisms here:
+ *
+ *   1. No-op MARKERS: every request handler that intentionally or provisionally
+ *      does nothing calls WAYLAND_INTENTIONAL_NOOP(res, "req") or
+ *      WAYLAND_UNIMPLEMENTED(res, "req"). The first time a client actually
+ *      invokes such a request we emit one WAYLAND_GAP_REQUEST line to serial —
+ *      so "the client asked and we did nothing" becomes observable, once per
+ *      unique interface.request (naturally rate-limited).
+ *   2. Protocol LOGGER (env WAYLANDD_PROTOCOL_LOG=1): records every request that
+ *      crosses the wire, proving what clients exercise. Aggregated + dumped on
+ *      SIGUSR1 / shutdown. The logger proves a request ARRIVED; the marker proves
+ *      it reached unsupported semantics — cross-reference = a silent-degradation
+ *      source. See artifacts/brook-api-gap-audit-plan.md (P1.1). */
+enum wl_gap_kind { WL_GAP_UNIMPLEMENTED = 0, WL_GAP_INTENTIONAL_NOOP = 1 };
+
+struct wl_gap_entry {
+    const char* iface;    /* interned string (wl_resource_get_class / literal) */
+    const char* req;
+    unsigned    count;
+    unsigned char kind;
+};
+static struct wl_gap_entry g_wl_gaps[128];
+static int g_wl_gap_count;
+
+static void wl_gap_hit(struct wl_resource* res, const char* req, unsigned char kind) {
+    const char* iface = res ? wl_resource_get_class(res) : "?";
+    for (int i = 0; i < g_wl_gap_count; i++) {
+        if (g_wl_gaps[i].req == req &&
+            (g_wl_gaps[i].iface == iface ||
+             (g_wl_gaps[i].iface && iface && strcmp(g_wl_gaps[i].iface, iface) == 0))) {
+            g_wl_gaps[i].count++;
+            return;   /* already reported this interface.request once */
+        }
+    }
+    if (g_wl_gap_count < (int)(sizeof(g_wl_gaps) / sizeof(g_wl_gaps[0]))) {
+        g_wl_gaps[g_wl_gap_count].iface = iface;
+        g_wl_gaps[g_wl_gap_count].req   = req;
+        g_wl_gaps[g_wl_gap_count].count = 1;
+        g_wl_gaps[g_wl_gap_count].kind  = kind;
+        g_wl_gap_count++;
+    }
+    fprintf(stderr, "WAYLAND_GAP_REQUEST interface=%s request=%s kind=%s\n",
+            iface, req,
+            kind == WL_GAP_UNIMPLEMENTED ? "unimplemented" : "intentional_noop");
+}
+
+/* res: the request's wl_resource; req: string literal of the request name. */
+#define WAYLAND_UNIMPLEMENTED(res, req)     wl_gap_hit((res), (req), WL_GAP_UNIMPLEMENTED)
+#define WAYLAND_INTENTIONAL_NOOP(res, req)  wl_gap_hit((res), (req), WL_GAP_INTENTIONAL_NOOP)
+
+/* Dump the aggregated request-gap table (marker hits). Called on SIGUSR1 and at
+ * shutdown so a headless audit run captures it on serial. */
+static void wl_gap_dump(void) {
+    fprintf(stderr, "WAYLAND_GAP_DUMP begin entries=%d\n", g_wl_gap_count);
+    for (int i = 0; i < g_wl_gap_count; i++)
+        fprintf(stderr, "WAYLAND_GAP interface=%s request=%s count=%u kind=%s\n",
+                g_wl_gaps[i].iface, g_wl_gaps[i].req, g_wl_gaps[i].count,
+                g_wl_gaps[i].kind == WL_GAP_UNIMPLEMENTED ? "unimplemented" : "intentional_noop");
+    fprintf(stderr, "WAYLAND_GAP_DUMP end\n");
+}
+
 static uint32_t g_now_ms(void) {
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
@@ -358,6 +422,27 @@ static void popup_apply_position(struct brook_surface *s) {
 }
 
 static void on_sigint(int sig) { (void)sig; g_shutdown = 1; }
+static volatile sig_atomic_t g_dump_gaps = 0;
+static void on_sigusr1(int sig) { (void)sig; g_dump_gaps = 1; }
+
+/* Protocol logger (P1.1): env-gated (WAYLANDD_PROTOCOL_LOG=1) because it fires
+ * on every request. On the first time each unique interface.request is seen it
+ * emits a WAYLAND_REQ_SEEN line, proving what clients actually exercise. */
+static const char* g_req_seen[256];
+static int g_req_seen_count;
+static void wl_protocol_logger(void* user, enum wl_protocol_logger_type type,
+                               const struct wl_protocol_logger_message* msg) {
+    (void)user;
+    if (type != WL_PROTOCOL_LOGGER_REQUEST || !msg || !msg->resource || !msg->message)
+        return;
+    const char* iface = wl_resource_get_class(msg->resource);
+    const char* req   = msg->message->name;
+    for (int i = 0; i < g_req_seen_count; i++)
+        if (g_req_seen[i] == req) return;   /* interned name; already reported */
+    if (g_req_seen_count < (int)(sizeof(g_req_seen) / sizeof(g_req_seen[0])))
+        g_req_seen[g_req_seen_count++] = req;
+    fprintf(stderr, "WAYLAND_REQ_SEEN interface=%s request=%s\n", iface, req);
+}
 
 /* ---------------- wl_surface ---------------- */
 
@@ -372,7 +457,8 @@ static void surface_attach(struct wl_client *c, struct wl_resource *r,
 }
 static void surface_damage(struct wl_client *c, struct wl_resource *r,
                            int32_t x, int32_t y, int32_t w, int32_t h) {
-    (void)c; (void)r; (void)x; (void)y; (void)w; (void)h;
+    (void)c; (void)x; (void)y; (void)w; (void)h;
+    WAYLAND_INTENTIONAL_NOOP(r, "damage");   /* we always full-repaint */
 }
 static void surface_frame(struct wl_client *c, struct wl_resource *r, uint32_t cb) {
     struct brook_surface *s = wl_resource_get_user_data(r);
@@ -405,7 +491,8 @@ static void surface_set_opaque_region(struct wl_client *c, struct wl_resource *r
 }
 static void surface_set_input_region(struct wl_client *c, struct wl_resource *r,
                                       struct wl_resource *reg) {
-    (void)c; (void)r; (void)reg;
+    (void)c; (void)reg;
+    WAYLAND_UNIMPLEMENTED(r, "set_input_region");   /* no per-surface input hit-test */
 }
 
 /* Copy wl_shm buffer pixels into the per-window VFB.  A pixel is forced fully
@@ -675,17 +762,21 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
 }
 
 static void surface_set_buffer_transform(struct wl_client *c, struct wl_resource *r, int32_t t) {
-    (void)c; (void)r; (void)t;
+    (void)c; (void)t;
+    WAYLAND_UNIMPLEMENTED(r, "set_buffer_transform");   /* no rotation/flip */
 }
 static void surface_set_buffer_scale(struct wl_client *c, struct wl_resource *r, int32_t sc) {
-    (void)c; (void)r; (void)sc;
+    (void)c; (void)sc;
+    WAYLAND_UNIMPLEMENTED(r, "set_buffer_scale");   /* HiDPI buffer scale ignored */
 }
 static void surface_damage_buffer(struct wl_client *c, struct wl_resource *r,
                                   int32_t x, int32_t y, int32_t w, int32_t h) {
-    (void)c; (void)r; (void)x; (void)y; (void)w; (void)h;
+    (void)c; (void)x; (void)y; (void)w; (void)h;
+    WAYLAND_INTENTIONAL_NOOP(r, "damage_buffer");   /* we always full-repaint */
 }
 static void surface_offset(struct wl_client *c, struct wl_resource *r, int32_t x, int32_t y) {
-    (void)c; (void)r; (void)x; (void)y;
+    (void)c; (void)x; (void)y;
+    WAYLAND_UNIMPLEMENTED(r, "offset");   /* buffer offset ignored */
 }
 
 static const struct wl_surface_interface surface_impl = {
@@ -824,7 +915,8 @@ static void xdg_toplevel_destroy_req(struct wl_client *c, struct wl_resource *r)
 }
 static void xdg_toplevel_set_parent(struct wl_client *c, struct wl_resource *r,
                                      struct wl_resource *parent) {
-    (void)c; (void)r; (void)parent;
+    (void)c; (void)parent;
+    WAYLAND_UNIMPLEMENTED(r, "set_parent");   /* no modal/parent stacking */
 }
 static void xdg_toplevel_set_title(struct wl_client *c, struct wl_resource *r,
                                     const char *title) {
@@ -837,12 +929,14 @@ static void xdg_toplevel_set_title(struct wl_client *c, struct wl_resource *r,
 }
 static void xdg_toplevel_set_app_id(struct wl_client *c, struct wl_resource *r,
                                      const char *app_id) {
-    (void)c; (void)r; (void)app_id;
+    (void)c; (void)app_id;
+    WAYLAND_INTENTIONAL_NOOP(r, "set_app_id");   /* app_id not used by our WM */
 }
 static void xdg_toplevel_show_window_menu(struct wl_client *c, struct wl_resource *r,
                                             struct wl_resource *seat, uint32_t serial,
                                             int32_t x, int32_t y) {
-    (void)c; (void)r; (void)seat; (void)serial; (void)x; (void)y;
+    (void)c; (void)seat; (void)serial; (void)x; (void)y;
+    WAYLAND_UNIMPLEMENTED(r, "show_window_menu");   /* no server window menu */
 }
 static void xdg_toplevel_move(struct wl_client *c, struct wl_resource *r,
                                struct wl_resource *seat, uint32_t serial) {
@@ -877,11 +971,13 @@ static void xdg_toplevel_resize(struct wl_client *c, struct wl_resource *r,
 }
 static void xdg_toplevel_set_max_size(struct wl_client *c, struct wl_resource *r,
                                        int32_t w, int32_t h) {
-    (void)c; (void)r; (void)w; (void)h;
+    (void)c; (void)w; (void)h;
+    WAYLAND_UNIMPLEMENTED(r, "set_max_size");   /* size constraints not enforced */
 }
 static void xdg_toplevel_set_min_size(struct wl_client *c, struct wl_resource *r,
                                        int32_t w, int32_t h) {
-    (void)c; (void)r; (void)w; (void)h;
+    (void)c; (void)w; (void)h;
+    WAYLAND_UNIMPLEMENTED(r, "set_min_size");   /* size constraints not enforced */
 }
 static void xdg_toplevel_set_maximized(struct wl_client *c, struct wl_resource *r) {
     (void)c;
@@ -1014,7 +1110,8 @@ static void xdg_popup_destroy_req(struct wl_client *c, struct wl_resource *r) {
 }
 static void xdg_popup_grab(struct wl_client *c, struct wl_resource *r,
                             struct wl_resource *seat, uint32_t serial) {
-    (void)c; (void)r; (void)seat; (void)serial;
+    (void)c; (void)seat; (void)serial;
+    WAYLAND_UNIMPLEMENTED(r, "grab");   /* no popup grab/dismiss handling */
 }
 static void xdg_popup_reposition(struct wl_client *c, struct wl_resource *r,
                                     struct wl_resource *positioner,
@@ -1073,7 +1170,8 @@ static void xdg_surface_get_popup(struct wl_client *c, struct wl_resource *r,
 static void xdg_surface_set_window_geometry(struct wl_client *c, struct wl_resource *r,
                                               int32_t x, int32_t y,
                                               int32_t w, int32_t h) {
-    (void)c; (void)r; (void)x; (void)y; (void)w; (void)h;
+    (void)c; (void)x; (void)y; (void)w; (void)h;
+    WAYLAND_UNIMPLEMENTED(r, "set_window_geometry");   /* geometry hint ignored (CSD shadows) */
 }
 static void xdg_surface_ack_configure(struct wl_client *c, struct wl_resource *r,
                                         uint32_t serial) {
@@ -1139,15 +1237,18 @@ static void positioner_set_offset(struct wl_client *c, struct wl_resource *r,
     if (p) { p->ox = x; p->oy = y; }
 }
 static void positioner_set_reactive(struct wl_client *c, struct wl_resource *r) {
-    (void)c; (void)r;
+    (void)c;
+    WAYLAND_INTENTIONAL_NOOP(r, "set_reactive");   /* popups are statically placed */
 }
 static void positioner_set_parent_size(struct wl_client *c, struct wl_resource *r,
                                          int32_t w, int32_t h) {
-    (void)c; (void)r; (void)w; (void)h;
+    (void)c; (void)w; (void)h;
+    WAYLAND_INTENTIONAL_NOOP(r, "set_parent_size");   /* static popup placement */
 }
 static void positioner_set_parent_configure(struct wl_client *c, struct wl_resource *r,
                                                uint32_t serial) {
-    (void)c; (void)r; (void)serial;
+    (void)c; (void)serial;
+    WAYLAND_INTENTIONAL_NOOP(r, "set_parent_configure");   /* static popup placement */
 }
 
 static const struct xdg_positioner_interface positioner_impl = {
@@ -1209,7 +1310,9 @@ static void wm_base_get_xdg_surface(struct wl_client *c, struct wl_resource *r,
 }
 
 static void wm_base_pong(struct wl_client *c, struct wl_resource *r, uint32_t serial) {
-    (void)c; (void)r; (void)serial;
+    (void)c; (void)serial;
+    /* We never send xdg_wm_base.ping, so a pong needs no liveness bookkeeping. */
+    WAYLAND_INTENTIONAL_NOOP(r, "pong");
 }
 
 static const struct xdg_wm_base_interface wm_base_impl = {
@@ -2120,11 +2223,15 @@ static void viewport_destroy(struct wl_client *c, struct wl_resource *r) {
 static void viewport_set_source(struct wl_client *c, struct wl_resource *r,
                                 wl_fixed_t x, wl_fixed_t y,
                                 wl_fixed_t w, wl_fixed_t h) {
-    (void)c; (void)r; (void)x; (void)y; (void)w; (void)h;
+    (void)c; (void)x; (void)y; (void)w; (void)h;
+    /* We ignore viewport crop; a client relying on it gets un-cropped output. */
+    WAYLAND_UNIMPLEMENTED(r, "set_source");
 }
 static void viewport_set_destination(struct wl_client *c, struct wl_resource *r,
                                      int32_t w, int32_t h) {
-    (void)c; (void)r; (void)w; (void)h;
+    (void)c; (void)w; (void)h;
+    /* We ignore viewport scaling; a client relying on it gets native-size output. */
+    WAYLAND_UNIMPLEMENTED(r, "set_destination");
 }
 static const struct wp_viewport_interface viewport_impl = {
     .destroy         = viewport_destroy,
@@ -2174,26 +2281,32 @@ static void ti_destroy(struct wl_client *c, struct wl_resource *r) {
     (void)c; wl_resource_destroy(r);
 }
 static void ti_enable(struct wl_client *c, struct wl_resource *r) {
-    (void)c; (void)r;
+    (void)c;
+    WAYLAND_INTENTIONAL_NOOP(r, "enable");
 }
 static void ti_disable(struct wl_client *c, struct wl_resource *r) {
-    (void)c; (void)r;
+    (void)c;
+    WAYLAND_INTENTIONAL_NOOP(r, "disable");
 }
 static void ti_set_surrounding_text(struct wl_client *c, struct wl_resource *r,
                                     const char *text, int32_t cursor, int32_t anchor) {
-    (void)c; (void)r; (void)text; (void)cursor; (void)anchor;
+    (void)c; (void)text; (void)cursor; (void)anchor;
+    WAYLAND_INTENTIONAL_NOOP(r, "set_surrounding_text");
 }
 static void ti_set_text_change_cause(struct wl_client *c, struct wl_resource *r,
                                      uint32_t cause) {
-    (void)c; (void)r; (void)cause;
+    (void)c; (void)cause;
+    WAYLAND_INTENTIONAL_NOOP(r, "set_text_change_cause");
 }
 static void ti_set_content_type(struct wl_client *c, struct wl_resource *r,
                                 uint32_t hint, uint32_t purpose) {
-    (void)c; (void)r; (void)hint; (void)purpose;
+    (void)c; (void)hint; (void)purpose;
+    WAYLAND_INTENTIONAL_NOOP(r, "set_content_type");
 }
 static void ti_set_cursor_rectangle(struct wl_client *c, struct wl_resource *r,
                                     int32_t x, int32_t y, int32_t w, int32_t h) {
-    (void)c; (void)r; (void)x; (void)y; (void)w; (void)h;
+    (void)c; (void)x; (void)y; (void)w; (void)h;
+    WAYLAND_INTENTIONAL_NOOP(r, "set_cursor_rectangle");
 }
 static void ti_commit(struct wl_client *c, struct wl_resource *r) {
     /* A v3 text_input commit must be answered with a `done` event carrying the
@@ -2267,17 +2380,21 @@ static void subsurface_set_position(struct wl_client *c, struct wl_resource *r,
 }
 static void subsurface_place_above(struct wl_client *c, struct wl_resource *r,
                                    struct wl_resource *sib) {
-    (void)c; (void)r; (void)sib;
+    (void)c; (void)sib;
+    WAYLAND_UNIMPLEMENTED(r, "place_above");   /* subsurface stacking order ignored */
 }
 static void subsurface_place_below(struct wl_client *c, struct wl_resource *r,
                                    struct wl_resource *sib) {
-    (void)c; (void)r; (void)sib;
+    (void)c; (void)sib;
+    WAYLAND_UNIMPLEMENTED(r, "place_below");   /* subsurface stacking order ignored */
 }
 static void subsurface_set_sync(struct wl_client *c, struct wl_resource *r) {
-    (void)c; (void)r;
+    (void)c;
+    WAYLAND_INTENTIONAL_NOOP(r, "set_sync");   /* subsurface commits are always applied */
 }
 static void subsurface_set_desync(struct wl_client *c, struct wl_resource *r) {
-    (void)c; (void)r;
+    (void)c;
+    WAYLAND_INTENTIONAL_NOOP(r, "set_desync");   /* subsurface commits are always applied */
 }
 static const struct wl_subsurface_interface subsurface_impl = {
     .destroy      = subsurface_destroy,
@@ -2331,21 +2448,25 @@ static void subcomp_bind(struct wl_client *client, void *data,
 /* ---------------- wl_data_device_manager (stub clipboard) ---------------- */
 static void data_offer_accept(struct wl_client *c, struct wl_resource *r,
                               uint32_t serial, const char *mt) {
-    (void)c; (void)r; (void)serial; (void)mt;
+    (void)c; (void)serial; (void)mt;
+    WAYLAND_UNIMPLEMENTED(r, "accept");   /* clipboard/DnD not implemented */
 }
 static void data_offer_receive(struct wl_client *c, struct wl_resource *r,
                                const char *mt, int32_t fd) {
-    (void)c; (void)r; (void)mt; close(fd);
+    (void)c; (void)mt; close(fd);
+    WAYLAND_UNIMPLEMENTED(r, "receive");   /* clipboard paste delivers no data */
 }
 static void data_offer_destroy(struct wl_client *c, struct wl_resource *r) {
     (void)c; wl_resource_destroy(r);
 }
 static void data_offer_finish(struct wl_client *c, struct wl_resource *r) {
-    (void)c; (void)r;
+    (void)c;
+    WAYLAND_UNIMPLEMENTED(r, "finish");   /* DnD not implemented */
 }
 static void data_offer_set_actions(struct wl_client *c, struct wl_resource *r,
                                    uint32_t da, uint32_t pa) {
-    (void)c; (void)r; (void)da; (void)pa;
+    (void)c; (void)da; (void)pa;
+    WAYLAND_UNIMPLEMENTED(r, "set_actions");   /* DnD actions not implemented */
 }
 static const struct wl_data_offer_interface data_offer_impl = {
     .accept      = data_offer_accept,
@@ -2357,14 +2478,16 @@ static const struct wl_data_offer_interface data_offer_impl = {
 
 static void data_source_offer(struct wl_client *c, struct wl_resource *r,
                               const char *mt) {
-    (void)c; (void)r; (void)mt;
+    (void)c; (void)mt;
+    WAYLAND_UNIMPLEMENTED(r, "offer");   /* clipboard/DnD source mime not tracked */
 }
 static void data_source_destroy(struct wl_client *c, struct wl_resource *r) {
     (void)c; wl_resource_destroy(r);
 }
 static void data_source_set_actions(struct wl_client *c, struct wl_resource *r,
                                     uint32_t da) {
-    (void)c; (void)r; (void)da;
+    (void)c; (void)da;
+    WAYLAND_UNIMPLEMENTED(r, "set_actions");   /* DnD actions not implemented */
 }
 static const struct wl_data_source_interface data_source_impl = {
     .offer       = data_source_offer,
@@ -2376,11 +2499,13 @@ static void data_device_start_drag(struct wl_client *c, struct wl_resource *r,
                                    struct wl_resource *src,
                                    struct wl_resource *origin,
                                    struct wl_resource *icon, uint32_t serial) {
-    (void)c; (void)r; (void)src; (void)origin; (void)icon; (void)serial;
+    (void)c; (void)src; (void)origin; (void)icon; (void)serial;
+    WAYLAND_UNIMPLEMENTED(r, "start_drag");   /* drag-and-drop not implemented */
 }
 static void data_device_set_selection(struct wl_client *c, struct wl_resource *r,
                                       struct wl_resource *src, uint32_t serial) {
-    (void)c; (void)r; (void)src; (void)serial;
+    (void)c; (void)src; (void)serial;
+    WAYLAND_UNIMPLEMENTED(r, "set_selection");   /* clipboard copy delivers no data */
 }
 static void data_device_release(struct wl_client *c, struct wl_resource *r) {
     (void)c; wl_resource_destroy(r);
@@ -2566,6 +2691,14 @@ int main(int argc, char **argv)
 
     signal(SIGINT,  on_sigint);
     signal(SIGTERM, on_sigint);
+    signal(SIGUSR1, on_sigusr1);
+
+    /* Optional full request tracing (P1.1). The no-op markers below fire without
+     * this; the logger just adds "every request seen" for deeper audits. */
+    if (getenv("WAYLANDD_PROTOCOL_LOG")) {
+        wl_display_add_protocol_logger(g_display, wl_protocol_logger, NULL);
+        fprintf(stderr, "[waylandd] protocol logger enabled\n");
+    }
 
     struct wl_event_loop *loop = wl_display_get_event_loop(g_display);
     if (!loop) return 1;
@@ -2573,6 +2706,7 @@ int main(int argc, char **argv)
     uint32_t loop_start = g_now_ms();
     for (;;) {
         if (g_shutdown) break;
+        if (g_dump_gaps) { g_dump_gaps = 0; wl_gap_dump(); }
         wl_display_flush_clients(g_display);
         for (int sub = 0; sub < 60 && !g_shutdown; ++sub) {
             pump_input_once();
@@ -2587,6 +2721,7 @@ int main(int argc, char **argv)
             break;
     }
 done:
+    wl_gap_dump();   /* final API-gap request summary for the audit */
     fprintf(stderr, "[waylandd] shutting down (commits=%d)\n", g_commit_count);
     wl_display_destroy(g_display);
     fprintf(stderr, "[waylandd] PASS\n");
