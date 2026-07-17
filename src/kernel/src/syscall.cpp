@@ -5811,6 +5811,8 @@ struct FbFixScreeninfo {
     uint16_t reserved[2];
 };
 
+static void RecordSubGap(uint64_t syscallNr, uint64_t sub, const char* name); // P1.2, defined later
+
 static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
                           uint64_t, uint64_t, uint64_t)
 {
@@ -6394,6 +6396,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     }
 
     SerialPrintf("sys_ioctl: unhandled fd=%lu cmd=0x%lx\n", fd, cmd);
+    RecordSubGap(16 /* SYS_IOCTL */, cmd, "ioctl");
     return -ENOSYS;
 }
 
@@ -7349,6 +7352,7 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
         fde->statusFlags = (fde->statusFlags & 0x3) | (static_cast<uint32_t>(arg) & ~0x3u);
         return 0;
     default:
+        RecordSubGap(72 /* SYS_FCNTL */, cmd, "fcntl");
         return 0; // Unknown command, pretend success
     }
 }
@@ -10895,6 +10899,20 @@ static void RecordSyscallGap(uint64_t num, uint8_t gapClass)
     }
 }
 
+// Sub-command / flag gaps (P1.2). Number-level counters miss partial
+// implementations: a syscall we DO handle but with an unsupported
+// ioctl/fcntl/prctl/futex sub-command or flag. This records those so the audit
+// sees, e.g., "ioctl 0x5451 unhandled, first hit by pulseaudio". Bounded fixed
+// table; overflow is counted, never allocates. Keyed by (syscall<<32 | subKey).
+struct SubGap {
+    volatile uint64_t key;    // (syscall << 32) | subcommand; 0 = empty slot
+    volatile uint64_t hits;
+    volatile int32_t  firstPid;
+    char              firstComm[16];
+};
+static SubGap g_subGaps[128];
+static volatile uint64_t g_subGapOverflow;
+
 // Dump the aggregated syscall-gap table to serial in a machine-parseable form.
 // Callable from a debug syscall / sysrq (Ctrl+F11). Zero-hit entries skipped.
 extern "C" void SyscallGapDump()
@@ -10912,6 +10930,59 @@ extern "C" void SyscallGapDump()
                      g_syscallGaps[n].gapClass == GAP_QUIET_FALLBACK ? "quiet_fallback" : "unexpected");
     }
     SerialPrintf("SYSCALL_GAP_DUMP end\n");
+    // Sub-command / flag gaps (P1.2).
+    SerialPrintf("SUBGAP_DUMP begin\n");
+    for (int i = 0; i < (int)(sizeof(g_subGaps) / sizeof(g_subGaps[0])); i++) {
+        uint64_t k = __atomic_load_n(&g_subGaps[i].key, __ATOMIC_RELAXED);
+        if (k == 0) continue;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        SerialPrintf("SUBGAP syscall=%lu sub=0x%lx hits=%lu first_pid=%d first_comm=%s\n",
+                     k >> 32, k & 0xFFFFFFFF,
+                     __atomic_load_n(&g_subGaps[i].hits, __ATOMIC_RELAXED),
+                     g_subGaps[i].firstPid,
+                     g_subGaps[i].firstComm[0] ? g_subGaps[i].firstComm : "?");
+    }
+    SerialPrintf("SUBGAP_DUMP end overflow=%lu\n",
+                 __atomic_load_n(&g_subGapOverflow, __ATOMIC_RELAXED));
+}
+
+// Sub-command / flag gaps (P1.2). Number-level counters miss partial
+// name: the multiplexer ("ioctl"/"fcntl"/"prctl"/"futex"); sub: the unsupported
+// sub-command/op/flag value; syscallNr: the containing syscall number.
+static void RecordSubGap(uint64_t syscallNr, uint64_t sub, const char* name)
+{
+    uint64_t key = (syscallNr << 32) | (sub & 0xFFFFFFFF);
+    if (key == 0) key = 0x1;   // never collide with the empty sentinel
+    // Find existing slot or claim an empty one (CAS on key).
+    for (int i = 0; i < (int)(sizeof(g_subGaps) / sizeof(g_subGaps[0])); i++) {
+        uint64_t k = __atomic_load_n(&g_subGaps[i].key, __ATOMIC_RELAXED);
+        if (k == key) {
+            __atomic_fetch_add(&g_subGaps[i].hits, 1, __ATOMIC_RELAXED);
+            return;
+        }
+        if (k == 0) {
+            uint64_t expected = 0;
+            if (__atomic_compare_exchange_n(&g_subGaps[i].key, &expected, key, false,
+                                            __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+                Process* proc = ProcessCurrent();
+                __atomic_store_n(&g_subGaps[i].hits, 1, __ATOMIC_RELAXED);
+                g_subGaps[i].firstPid = proc ? static_cast<int32_t>(proc->pid) : 0;
+                const char* nm = proc ? proc->name : "?";
+                int j = 0;
+                for (; j < 15 && nm[j]; ++j) g_subGaps[i].firstComm[j] = nm[j];
+                g_subGaps[i].firstComm[j] = '\0';
+                __atomic_thread_fence(__ATOMIC_RELEASE);
+                // First hit of a unique sub-gap: emit one line immediately.
+                SerialPrintf("SUBGAP %s syscall=%lu sub=0x%lx first_pid=%d first_comm=%s\n",
+                             name, syscallNr, sub, g_subGaps[i].firstPid, g_subGaps[i].firstComm);
+                return;
+            }
+            // Lost the race for this slot; re-scan from here.
+            i--;
+            continue;
+        }
+    }
+    __atomic_fetch_add(&g_subGapOverflow, 1, __ATOMIC_RELAXED);
 }
 
 static int64_t sys_not_implemented(uint64_t, uint64_t, uint64_t,
@@ -11006,9 +11077,10 @@ static int64_t sys_pread64(uint64_t fd, uint64_t bufAddr, uint64_t count,
 static int64_t sys_prctl(uint64_t option, uint64_t, uint64_t,
                           uint64_t, uint64_t, uint64_t)
 {
-    (void)option;
-    // Most prctl options are not relevant for Brook.
-    // Return success for harmless ones, EINVAL for unknown.
+    // Brook implements no prctl options; record which options apps actually use
+    // (P1.2 sub-gap) so the audit can see what would need real handling, while
+    // still returning success so well-behaved apps proceed.
+    RecordSubGap(157 /* SYS_PRCTL */, option, "prctl");
     return 0;
 }
 
