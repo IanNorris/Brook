@@ -19,4 +19,4 @@
 set wm
 set vfb none
 run --once /nix/bin/waylandd
-run --uid 1000 /nix/profile/bin/kbdprobe
+run --uid 1000 /nix/kbdprobe-play.sh
