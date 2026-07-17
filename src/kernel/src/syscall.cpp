@@ -478,7 +478,16 @@ static inline bool IsRequestServer(const Process* p) {
 
 // memfd constants and data — defined here so sys_read/sys_write/fstat can use them
 static constexpr uint32_t MFD_CLOEXEC       = 0x0001u;
-[[maybe_unused]] static constexpr uint32_t MFD_ALLOW_SEALING = 0x0002u;
+static constexpr uint32_t MFD_ALLOW_SEALING = 0x0002u;
+
+// F_ADD_SEALS / F_GET_SEALS bitmask (linux asm-generic fcntl).
+static constexpr uint32_t F_SEAL_SEAL         = 0x0001u;  // no more seals may be added
+static constexpr uint32_t F_SEAL_SHRINK       = 0x0002u;  // size may not shrink
+static constexpr uint32_t F_SEAL_GROW         = 0x0004u;  // size may not grow
+static constexpr uint32_t F_SEAL_WRITE        = 0x0008u;  // may not be written
+static constexpr uint32_t F_SEAL_FUTURE_WRITE = 0x0010u;  // no new writes (existing maps ok)
+static constexpr uint32_t F_SEAL_ALL =
+    F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_FUTURE_WRITE;
 
 // Sparse / lazy memfd backing.
 //
@@ -497,6 +506,7 @@ struct MemFdData {
     uint64_t  capacity;         // pageMapCount * 4096
     volatile uint32_t lock;     // spinlock protecting pageMap allocations + grow
     volatile uint32_t refCount; // +1 per fd, +1 per live mmap VMA
+    uint32_t  seals;            // F_SEAL_* bitmask (guarded by `lock`)
 };
 
 static inline void MfdLock(MemFdData* mfd)
@@ -1859,6 +1869,15 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count)
         uint64_t pos = fde->seekPos;
         uint64_t end = pos + count;
 
+        // Honor write seals: F_SEAL_WRITE forbids all writes; F_SEAL_FUTURE_WRITE
+        // forbids new write(2)s (existing mappings keep working). A zero-length
+        // write is a no-op and stays allowed. F_SEAL_GROW forbids extending EOF.
+        if (count > 0) {
+            uint32_t seals = __atomic_load_n(&mfd->seals, __ATOMIC_ACQUIRE);
+            if (seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE)) return -EPERM;
+            if ((seals & F_SEAL_GROW) && end > mfd->size)     return -EPERM;
+        }
+
         if (end > mfd->capacity) {
             if (!MemFdGrow(mfd, end)) return -ENOMEM;
         }
@@ -2862,6 +2881,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
             entry->mfd->capacity = 0;
             entry->mfd->lock = 0;
             entry->mfd->refCount = 0;
+            entry->mfd->seals = 0;   // shm objects are sealable (POSIX shm has no seal-lock default)
             entry->used = true;
         }
 
@@ -7351,9 +7371,67 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
         // Access mode bits (O_RDONLY/O_WRONLY/O_RDWR) are preserved from open.
         fde->statusFlags = (fde->statusFlags & 0x3) | (static_cast<uint32_t>(arg) & ~0x3u);
         return 0;
-    default:
+
+    // ----- memfd sealing (F_ADD_SEALS=1033, F_GET_SEALS=1034) -----
+    case 1034: /* F_GET_SEALS */ {
+        if (fde->type != FdType::MemFd || !fde->handle) return -EINVAL;
+        auto* mfd = static_cast<MemFdData*>(fde->handle);
+        MfdLock(mfd);
+        uint32_t s = mfd->seals;
+        MfdUnlock(mfd);
+        return static_cast<int64_t>(s);
+    }
+    case 1033: /* F_ADD_SEALS */ {
+        if (fde->type != FdType::MemFd || !fde->handle) return -EINVAL;
+        uint32_t add = static_cast<uint32_t>(arg);
+        if (add & ~F_SEAL_ALL) return -EINVAL;   // unknown seal bits
+        // Sealing requires the fd be writable (Linux: EPERM otherwise). Brook
+        // memfds are always opened O_RDWR, so this is informational.
+        auto* mfd = static_cast<MemFdData*>(fde->handle);
+        MfdLock(mfd);
+        int64_t ret;
+        if (mfd->seals & F_SEAL_SEAL) {
+            ret = -EPERM;                          // sealing itself is sealed
+        } else {
+            // All-or-nothing: apply every requested seal under one lock hold.
+            mfd->seals |= add;
+            ret = 0;
+        }
+        MfdUnlock(mfd);
+        return ret;
+    }
+
+    // ----- POSIX advisory record locks (F_GETLK=5, F_SETLK=6, F_SETLKW=7) -----
+    // Brook has no real per-inode range locks yet. F_GETLK is input+output: the
+    // caller passes a struct flock and expects l_type set to the conflicting
+    // lock or F_UNLCK. We report "no conflict" (single-user) but MUST write the
+    // struct — returning without writing leaves stale l_type and hangs callers
+    // (mousepad). F_SETLK/F_SETLKW grant optimistically (SUBGAP: unenforced).
+    case 5: /* F_GETLK */ {
+        // struct flock (x86-64, 32 bytes): s16 l_type; s16 l_whence; pad4;
+        // s64 l_start; s64 l_len; s32 l_pid; pad4.
+        if (!UserBufferWritable(arg, 32)) return -EFAULT;
+        auto* fl = reinterpret_cast<int16_t*>(arg);
+        fl[0] = 2;   // l_type = F_UNLCK (no conflicting lock)
+        auto* pid = reinterpret_cast<int32_t*>(arg + 24);
+        *pid = 0;    // l_pid = 0
+        RecordSubGap(72 /* SYS_FCNTL */, 5 /* F_GETLK */, "fcntl");
+        return 0;
+    }
+    case 6: /* F_SETLK */
+    case 7: /* F_SETLKW */
+        // Optimistic grant. Correct only while uncontended; real range locks
+        // are a tracked follow-up (concurrent nix/sqlite = un-defer trigger).
         RecordSubGap(72 /* SYS_FCNTL */, cmd, "fcntl");
-        return 0; // Unknown command, pretend success
+        return 0;
+
+    default:
+        // Unknown/unsupported fcntl command. Linux returns EINVAL here; that is
+        // the honest answer (glibc/musl branch on it) and lets apps fall back
+        // (e.g. OFD locks 36-38 -> POSIX locks). Recorded so the audit stays
+        // honest instead of the old silent "pretend success".
+        RecordSubGap(72 /* SYS_FCNTL */, cmd, "fcntl");
+        return -EINVAL;
     }
 }
 
@@ -8794,6 +8872,9 @@ static int64_t sys_memfd_create(uint64_t nameAddr, uint64_t flags,
     mfd->capacity     = 0;
     mfd->lock         = 0;
     mfd->refCount     = 0; // bumped by FdAlloc below
+    // Without MFD_ALLOW_SEALING a memfd starts sealed against further seals, so
+    // F_ADD_SEALS returns EPERM (Linux semantics). With it, seals start empty.
+    mfd->seals        = (flags & MFD_ALLOW_SEALING) ? 0u : F_SEAL_SEAL;
 
     int fd = FdAlloc(proc, FdType::MemFd, mfd);
     if (fd < 0) { kfree(mfd); return -EMFILE; }
@@ -9275,13 +9356,23 @@ static int64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t,
         FdEntry* fde = FdGet(proc, static_cast<int>(fd));
         if (fde && fde->type == FdType::MemFd && fde->handle) {
             auto* mfd = static_cast<MemFdData*>(fde->handle);
+            // Seal check + size mutation must be one critical section, or a
+            // concurrent F_ADD_SEALS on another CPU could be missed and we'd
+            // free pages a receiver believes are frozen (the wl_shm UAF).
+            MfdLock(mfd);
+            uint32_t seals = mfd->seals;
+            if (length < mfd->size && (seals & F_SEAL_SHRINK)) { MfdUnlock(mfd); return -EPERM; }
+            if (length > mfd->size && (seals & F_SEAL_GROW))   { MfdUnlock(mfd); return -EPERM; }
             if (length > mfd->capacity) {
-                if (!MemFdGrow(mfd, length)) return -ENOMEM;
+                if (!MemFdGrowLocked(mfd, length)) { MfdUnlock(mfd); return -ENOMEM; }
             }
             // Shrinking ftruncate: free pages past the new tail. (Growth is
             // free — pages are unbacked / read-as-zero until first access.)
+            // NOTE: this frees physical pages without invalidating other
+            // processes' PTEs mapping them — a UAF for UNSEALED memfds shrunk
+            // while mapped (tracked follow-up gap-memfd-truncate-uaf). Sealed
+            // wl_shm buffers are protected by the F_SEAL_SHRINK check above.
             if (length < mfd->size) {
-                MfdLock(mfd);
                 uint64_t firstFreeIdx = (length + 4095) / 4096;
                 for (uint64_t i = firstFreeIdx; i < mfd->pageMapCount; i++) {
                     if (mfd->pageMap[i]) {
@@ -9289,9 +9380,9 @@ static int64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t,
                         mfd->pageMap[i] = 0;
                     }
                 }
-                MfdUnlock(mfd);
             }
             mfd->size = length;
+            MfdUnlock(mfd);
             return 0;
         }
     }
