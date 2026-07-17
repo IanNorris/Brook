@@ -40,6 +40,7 @@
 #include "xdg-shell-server-protocol.h"
 #include "xdg-decoration-server-protocol.h"
 #include "viewporter-server-protocol.h"
+#include "text-input-unstable-v3-server-protocol.h"
 
 #define BROOK_SYS_WM_CREATE_WINDOW   506
 #define BROOK_SYS_WM_DESTROY_WINDOW  507
@@ -2156,6 +2157,92 @@ static void viewporter_bind(struct wl_client *client, void *data,
     fprintf(stderr, "[waylandd] wp_viewporter bind v=%u id=%u\n", version, id);
 }
 
+/* ---------------- zwp_text_input_v3 (stub for SDL3 text input) ----------------
+ * BRO-216: SDL3 (3.4.x, reached via sdl2-compat) only marks a window's text
+ * input active if Wayland_StartTextInput succeeds, and in 3.4.2 that returns
+ * FALSE unless the compositor advertises zwp_text_input_manager_v3. Without the
+ * active flag, SDL3's key-press gate never calls its xkb keysym->UTF-8 text
+ * path, so console/console-style text is dead while scancode bindings still
+ * work (fixed evdev table, no xkb). SDL derives basic Latin text from keysyms,
+ * NOT from this protocol's commit_string, so a no-op manager is sufficient:
+ * merely existing lets SDL enable text input and use the keysym path. We accept
+ * all requests as no-ops and send no events (no preedit/commit_string/enter),
+ * which is a valid "compositor has no IME" stance for a v3 text input.
+ * (Later upstream SDL made Wayland_StartTextInput always return true, removing
+ * this dependency; this stub keeps the pinned 3.4.2 build working.) */
+static void ti_destroy(struct wl_client *c, struct wl_resource *r) {
+    (void)c; wl_resource_destroy(r);
+}
+static void ti_enable(struct wl_client *c, struct wl_resource *r) {
+    (void)c; (void)r;
+}
+static void ti_disable(struct wl_client *c, struct wl_resource *r) {
+    (void)c; (void)r;
+}
+static void ti_set_surrounding_text(struct wl_client *c, struct wl_resource *r,
+                                    const char *text, int32_t cursor, int32_t anchor) {
+    (void)c; (void)r; (void)text; (void)cursor; (void)anchor;
+}
+static void ti_set_text_change_cause(struct wl_client *c, struct wl_resource *r,
+                                     uint32_t cause) {
+    (void)c; (void)r; (void)cause;
+}
+static void ti_set_content_type(struct wl_client *c, struct wl_resource *r,
+                                uint32_t hint, uint32_t purpose) {
+    (void)c; (void)r; (void)hint; (void)purpose;
+}
+static void ti_set_cursor_rectangle(struct wl_client *c, struct wl_resource *r,
+                                    int32_t x, int32_t y, int32_t w, int32_t h) {
+    (void)c; (void)r; (void)x; (void)y; (void)w; (void)h;
+}
+static void ti_commit(struct wl_client *c, struct wl_resource *r) {
+    /* A v3 text_input commit must be answered with a `done` event carrying the
+     * incremented serial, even when we contribute no preedit/commit_string, so
+     * the client's serial accounting stays consistent. No text is sent here;
+     * SDL gets Latin text from the keysym path. */
+    (void)c;
+    uint32_t serial = (uint32_t)(uintptr_t)wl_resource_get_user_data(r);
+    serial++;
+    wl_resource_set_user_data(r, (void *)(uintptr_t)serial);
+    zwp_text_input_v3_send_done(r, serial);
+}
+static const struct zwp_text_input_v3_interface ti_impl = {
+    .destroy               = ti_destroy,
+    .enable                = ti_enable,
+    .disable               = ti_disable,
+    .set_surrounding_text  = ti_set_surrounding_text,
+    .set_text_change_cause = ti_set_text_change_cause,
+    .set_content_type      = ti_set_content_type,
+    .set_cursor_rectangle  = ti_set_cursor_rectangle,
+    .commit                = ti_commit,
+};
+
+static void ti_mgr_destroy(struct wl_client *c, struct wl_resource *r) {
+    (void)c; wl_resource_destroy(r);
+}
+static void ti_mgr_get_text_input(struct wl_client *c, struct wl_resource *r,
+                                  uint32_t id, struct wl_resource *seat) {
+    (void)seat;
+    struct wl_resource *ti = wl_resource_create(c, &zwp_text_input_v3_interface,
+                                                wl_resource_get_version(r), id);
+    if (!ti) { wl_client_post_no_memory(c); return; }
+    /* user_data holds the per-text-input `done` serial counter. */
+    wl_resource_set_implementation(ti, &ti_impl, (void *)(uintptr_t)0, NULL);
+}
+static const struct zwp_text_input_manager_v3_interface ti_mgr_impl = {
+    .destroy        = ti_mgr_destroy,
+    .get_text_input = ti_mgr_get_text_input,
+};
+static void ti_mgr_bind(struct wl_client *client, void *data,
+                        uint32_t version, uint32_t id) {
+    (void)data;
+    struct wl_resource *r = wl_resource_create(client,
+        &zwp_text_input_manager_v3_interface, (int)version, id);
+    if (!r) { wl_client_post_no_memory(client); return; }
+    wl_resource_set_implementation(r, &ti_mgr_impl, NULL, NULL);
+    fprintf(stderr, "[waylandd] zwp_text_input_manager_v3 bind v=%u id=%u\n", version, id);
+}
+
 /* ---------------- wl_subcompositor ---------------- */
 static void subsurface_destroy(struct wl_client *c, struct wl_resource *r) {
     (void)c;
@@ -2397,6 +2484,7 @@ int main(int argc, char **argv)
     if (!wl_global_create(g_display, &wl_output_interface, 3, NULL, output_bind)) return 1;
     if (!wl_global_create(g_display, &zxdg_decoration_manager_v1_interface, 1, NULL, deco_mgr_bind)) return 1;
     if (!wl_global_create(g_display, &wp_viewporter_interface, 1, NULL, viewporter_bind)) return 1;
+    if (!wl_global_create(g_display, &zwp_text_input_manager_v3_interface, 1, NULL, ti_mgr_bind)) return 1;
     if (!wl_global_create(g_display, &wl_subcompositor_interface, 1, NULL, subcomp_bind)) return 1;
     if (!wl_global_create(g_display, &wl_data_device_manager_interface, 3, NULL, ddm_bind)) return 1;
     fprintf(stderr, "[waylandd] globals advertised\n");
