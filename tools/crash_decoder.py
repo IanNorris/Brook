@@ -60,6 +60,7 @@ PKT_STACK_DUMP     = 0xA3000006
 PKT_PROCESS_EXT    = 0xA3000007  # BRO-176 reap-gate fields, merged onto PROCESS_LIST by pid
 PKT_CPU_STATE      = 0xA3000008  # per-CPU RIP/CR3/pid
 PKT_CUSTOM_BLOB    = 0xA3000009  # generic bug-specific blob (tag + format + bytes)
+PKT_DEBUG_LOG      = 0xA300000A  # recent kernel-console ring lines (crash context)
 
 GPR_NAMES = [
     "RAX", "RBX", "RCX", "RDX", "RSI", "RDI",
@@ -948,6 +949,7 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
     cpu_list = None
     proc_ext_data = None  # buffered until after the loop (may precede PROCESS_LIST)
     custom_blobs = []     # PKT_CUSTOM_BLOB payloads (tag + format + raw bytes)
+    debug_log = None      # PKT_DEBUG_LOG payload (recent kernel-console lines)
 
     while off + PacketHeader.SIZE <= len(payload):
         pkt = PacketHeader(payload, off)
@@ -980,6 +982,8 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
             stack_dump = StackDump(pkt_data)
         elif pkt.type == PKT_CUSTOM_BLOB:
             custom_blobs.append(pkt_data)
+        elif pkt.type == PKT_DEBUG_LOG:
+            debug_log = pkt_data
         else:
             print(f"[warn] Unknown packet type 0x{pkt.type:08X} ({pkt.size}B)",
                   file=sys.stderr)
@@ -1011,6 +1015,23 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
                      cpu_list=cpu_list)
         for blob in custom_blobs:
             print_custom_blob(blob, sym)
+        if debug_log is not None:
+            print_debug_log(debug_log)
+
+
+def print_debug_log(blob: bytes):
+    """Render a PKT_DEBUG_LOG. Header: lineCount(u16), omittedLines(u16),
+    textLen(u32), then `textLen` bytes of newline-joined log text."""
+    if len(blob) < 8:
+        print("[warn] debug-log packet too short", file=sys.stderr)
+        return
+    line_count, omitted, text_len = struct.unpack_from("<HHI", blob, 0)
+    text = blob[8:8 + text_len].decode("utf-8", "replace")
+    print(f"\n  ── Recent kernel log ({line_count} lines"
+          + (f", {omitted} earlier omitted" if omitted else "") + ") ──")
+    for line in text.split("\n"):
+        if line:
+            print(f"    {line}")
 
 
 def print_custom_blob(blob: bytes, sym: "Symbolicator | None"):
