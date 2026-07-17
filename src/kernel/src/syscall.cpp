@@ -10855,6 +10855,65 @@ static int64_t sys_brook_wm_map_window_vfb(uint64_t wmId, uint64_t, uint64_t,
 // sys_not_implemented
 // ---------------------------------------------------------------------------
 
+// API-gap aggregation (P0.3). A dumpable, per-syscall-number record of gaps hit
+// at runtime, so a headless audit run can report EXACTLY which Linux syscalls
+// Brook returns -ENOSYS for and who first hit them. Motivated by BRO-216: silent
+// capability gaps are expensive; make them visible and diffable. SMP-safe with
+// relaxed atomics; first-comm captured once via a CAS on first_pid.
+// See artifacts/brook-api-gap-audit-plan.md (P0.3).
+enum SyscallGapClass : uint8_t {
+    GAP_UNEXPECTED      = 0,   // sys_not_implemented — a gap we didn't anticipate
+    GAP_QUIET_FALLBACK  = 1,   // sys_enosys_quiet — deliberate, app has a fallback
+};
+struct SyscallGap {
+    volatile uint64_t hits;
+    volatile int32_t  firstPid;
+    uint8_t           gapClass;
+    char              firstComm[16];
+};
+static SyscallGap g_syscallGaps[SYSCALL_MAX];
+
+static const char* SyscallName(uint64_t num);   // defined later; used by the gap dump
+
+static void RecordSyscallGap(uint64_t num, uint8_t gapClass)
+{
+    if (num >= SYSCALL_MAX) return;
+    SyscallGap& g = g_syscallGaps[num];
+    // The caller that transitions hits 0 -> 1 is the unique "first hitter" and
+    // records the metadata. (A -1 sentinel on firstPid would be wrong: the array
+    // is static zero-initialized, so firstPid starts at 0, not -1.)
+    uint64_t prev = __atomic_fetch_add(&g.hits, 1, __ATOMIC_RELAXED);
+    if (prev == 0) {
+        Process* proc = ProcessCurrent();
+        g.gapClass = gapClass;
+        g.firstPid = proc ? static_cast<int32_t>(proc->pid) : 0;
+        const char* nm = proc ? proc->name : "?";
+        int i = 0;
+        for (; i < 15 && nm[i]; ++i) g.firstComm[i] = nm[i];
+        g.firstComm[i] = '\0';
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+    }
+}
+
+// Dump the aggregated syscall-gap table to serial in a machine-parseable form.
+// Callable from a debug syscall / sysrq (Ctrl+F11). Zero-hit entries skipped.
+extern "C" void SyscallGapDump()
+{
+    SerialPrintf("SYSCALL_GAP_DUMP begin max=%lu\n", (uint64_t)SYSCALL_MAX);
+    for (uint64_t n = 0; n < SYSCALL_MAX; ++n) {
+        uint64_t hits = __atomic_load_n(&g_syscallGaps[n].hits, __ATOMIC_RELAXED);
+        if (hits == 0) continue;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);   // pair with the recorder's release
+        const char* nm = SyscallName(n);
+        SerialPrintf("SYSCALL_GAP nr=%lu name=%s hits=%lu first_pid=%d first_comm=%s class=%s\n",
+                     n, nm ? nm : "?", hits,
+                     g_syscallGaps[n].firstPid,
+                     g_syscallGaps[n].firstComm[0] ? g_syscallGaps[n].firstComm : "?",
+                     g_syscallGaps[n].gapClass == GAP_QUIET_FALLBACK ? "quiet_fallback" : "unexpected");
+    }
+    SerialPrintf("SYSCALL_GAP_DUMP end\n");
+}
+
 static int64_t sys_not_implemented(uint64_t, uint64_t, uint64_t,
                                     uint64_t, uint64_t, uint64_t)
 {
@@ -10867,6 +10926,8 @@ static int64_t sys_not_implemented(uint64_t, uint64_t, uint64_t,
     uint64_t syscallNum = 0;
     __asm__ volatile("mov %%gs:120, %0" : "=r"(syscallNum));
 
+    RecordSyscallGap(syscallNum, GAP_UNEXPECTED);
+
     if (n < 8 || (n & 0xFF) == 0)
         SerialPrintf("UNIMPL: syscall %lu from pid %u ('%s') [#%u]\n",
                      syscallNum, proc ? proc->pid : 0, proc ? proc->name : "?", n);
@@ -10875,10 +10936,15 @@ static int64_t sys_not_implemented(uint64_t, uint64_t, uint64_t,
 
 // Silent ENOSYS: for syscalls we deliberately don't implement but where
 // the userland-side fallback is well-trodden (e.g. inotify -> polling).
-// Avoids noisy UNIMPL spam during normal operation.
+// Avoids noisy UNIMPL spam during normal operation. Still recorded in the
+// gap table (tagged quiet_fallback) so a spike in a "quiet" gap — which is a
+// perf-regression signal, not just a functional one — stays visible.
 static int64_t sys_enosys_quiet(uint64_t, uint64_t, uint64_t,
                                  uint64_t, uint64_t, uint64_t)
 {
+    uint64_t syscallNum = 0;
+    __asm__ volatile("mov %%gs:120, %0" : "=r"(syscallNum));
+    RecordSyscallGap(syscallNum, GAP_QUIET_FALLBACK);
     return -ENOSYS;
 }
 

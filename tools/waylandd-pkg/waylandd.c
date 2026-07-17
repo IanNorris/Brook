@@ -2419,6 +2419,77 @@ static void ddm_bind(struct wl_client *client, void *data,
     wl_resource_set_implementation(r, &ddm_impl, NULL, NULL);
 }
 
+/* ---------------- API-gap inventory (P0.1) ----------------
+ * Records every Wayland global waylandd advertises (interface + version) and,
+ * at startup, dumps a machine-parseable inventory plus a check against a small
+ * checked-in "required" profile. Motivated by BRO-216: a missing global
+ * (zwp_text_input_manager_v3) silently disabled SDL3 text input. libwayland
+ * cannot observe a global a client wanted but we never advertised, so the only
+ * cheap defense is to publish exactly what we DO advertise and diff it against
+ * an expected set. See artifacts/brook-api-gap-audit-plan.md (P0.1/P0.2). */
+struct gap_global { const char *iface; int version; };
+static struct gap_global g_gap_globals[64];
+static int g_gap_global_count;
+
+static void gap_record_global(const char *iface, int version) {
+    if (g_gap_global_count < (int)(sizeof(g_gap_globals) / sizeof(g_gap_globals[0]))) {
+        g_gap_globals[g_gap_global_count].iface   = iface;
+        g_gap_globals[g_gap_global_count].version = version;
+        g_gap_global_count++;
+    }
+    /* One machine-parseable line per global for the P0.2 bind-diff tooling. */
+    fprintf(stderr, "WAYLAND_GLOBAL interface=%s version=%d\n", iface, version);
+}
+
+/* Wrapper around wl_global_create so every advertised global is inventoried. */
+static struct wl_global *brook_global_create(struct wl_display *display,
+                                             const struct wl_interface *iface,
+                                             int version, void *data,
+                                             wl_global_bind_func_t bind) {
+    struct wl_global *g = wl_global_create(display, iface, version, data, bind);
+    if (g) gap_record_global(iface->name, version);
+    return g;
+}
+
+/* Minimum globals+versions Brook toolkits need. A required global going missing
+ * or its version DECREASING is a regression the harness should catch. Keep this
+ * list conservative (real needs), not reference-compositor parity. */
+static const struct gap_global g_gap_required[] = {
+    { "wl_compositor",              4 },
+    { "wl_shm",                     1 },
+    { "wl_seat",                    5 },
+    { "wl_output",                  3 },
+    { "xdg_wm_base",                3 },
+    { "wl_data_device_manager",     3 },
+    { "zwp_text_input_manager_v3",  1 },
+};
+
+static void gap_dump_and_check(void) {
+    fprintf(stderr, "WAYLAND_GLOBAL_INVENTORY count=%d\n", g_gap_global_count);
+    int missing = 0;
+    for (size_t i = 0; i < sizeof(g_gap_required) / sizeof(g_gap_required[0]); i++) {
+        const struct gap_global *req = &g_gap_required[i];
+        int found_ver = -1;
+        for (int j = 0; j < g_gap_global_count; j++) {
+            if (strcmp(g_gap_globals[j].iface, req->iface) == 0) {
+                found_ver = g_gap_globals[j].version;
+                break;
+            }
+        }
+        if (found_ver < 0) {
+            fprintf(stderr, "WAYLAND_GAP MISSING interface=%s required_version=%d\n",
+                    req->iface, req->version);
+            missing++;
+        } else if (found_ver < req->version) {
+            fprintf(stderr, "WAYLAND_GAP VERSION_LOW interface=%s have=%d required=%d\n",
+                    req->iface, found_ver, req->version);
+            missing++;
+        }
+    }
+    fprintf(stderr, "WAYLAND_GAP_CHECK required=%zu missing_or_low=%d\n",
+            sizeof(g_gap_required) / sizeof(g_gap_required[0]), missing);
+}
+
 /* ---------------- main ---------------- */
 
 int main(int argc, char **argv)
@@ -2477,17 +2548,21 @@ int main(int argc, char **argv)
 
     if (wl_display_init_shm(g_display) < 0)
         fprintf(stderr, "[waylandd] WARN: wl_display_init_shm failed\n");
+    /* wl_shm is created by wl_display_init_shm (bypasses brook_global_create),
+     * so record it explicitly for the API-gap inventory (see gap_dump below). */
+    gap_record_global("wl_shm", 1);
 
-    if (!wl_global_create(g_display, &wl_compositor_interface, 4, NULL, compositor_bind)) return 1;
-    if (!wl_global_create(g_display, &xdg_wm_base_interface, 3, NULL, wm_base_bind)) return 1;
-    if (!wl_global_create(g_display, &wl_seat_interface, 5, NULL, seat_bind)) return 1;
-    if (!wl_global_create(g_display, &wl_output_interface, 3, NULL, output_bind)) return 1;
-    if (!wl_global_create(g_display, &zxdg_decoration_manager_v1_interface, 1, NULL, deco_mgr_bind)) return 1;
-    if (!wl_global_create(g_display, &wp_viewporter_interface, 1, NULL, viewporter_bind)) return 1;
-    if (!wl_global_create(g_display, &zwp_text_input_manager_v3_interface, 1, NULL, ti_mgr_bind)) return 1;
-    if (!wl_global_create(g_display, &wl_subcompositor_interface, 1, NULL, subcomp_bind)) return 1;
-    if (!wl_global_create(g_display, &wl_data_device_manager_interface, 3, NULL, ddm_bind)) return 1;
+    if (!brook_global_create(g_display, &wl_compositor_interface, 4, NULL, compositor_bind)) return 1;
+    if (!brook_global_create(g_display, &xdg_wm_base_interface, 3, NULL, wm_base_bind)) return 1;
+    if (!brook_global_create(g_display, &wl_seat_interface, 5, NULL, seat_bind)) return 1;
+    if (!brook_global_create(g_display, &wl_output_interface, 3, NULL, output_bind)) return 1;
+    if (!brook_global_create(g_display, &zxdg_decoration_manager_v1_interface, 1, NULL, deco_mgr_bind)) return 1;
+    if (!brook_global_create(g_display, &wp_viewporter_interface, 1, NULL, viewporter_bind)) return 1;
+    if (!brook_global_create(g_display, &zwp_text_input_manager_v3_interface, 1, NULL, ti_mgr_bind)) return 1;
+    if (!brook_global_create(g_display, &wl_subcompositor_interface, 1, NULL, subcomp_bind)) return 1;
+    if (!brook_global_create(g_display, &wl_data_device_manager_interface, 3, NULL, ddm_bind)) return 1;
     fprintf(stderr, "[waylandd] globals advertised\n");
+    gap_dump_and_check();
 
     signal(SIGINT,  on_sigint);
     signal(SIGTERM, on_sigint);

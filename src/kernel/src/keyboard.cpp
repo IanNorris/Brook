@@ -406,6 +406,7 @@ static constexpr uint8_t SC_SCROLL_LOCK = 0x46;
 
 extern "C" void KernelPanic(const char* fmt, ...);
 extern "C" void SchedulerDumpHang();  // BRO-176 non-destructive hang dump (scheduler.cpp)
+extern "C" void SyscallGapDump();     // P0.3 API-gap: dump syscall-gap table (syscall.cpp)
 
 // ---------------------------------------------------------------------------
 // IRQ1 interrupt handler
@@ -480,6 +481,16 @@ extern "C" void KbdIrqHandlerInner(void)
     {
         ApicSendEoi();
         SchedulerDumpHang();
+        return;
+    }
+
+    // API-gap audit (P0.3): Ctrl+F11 → dump the aggregated syscall-gap table to
+    // serial (every unimplemented/quiet-fallback syscall hit + first caller).
+    // Non-destructive; lets a headless audit run capture the report on demand.
+    if (sc == 0x57 /* F11 */ && g_ctrlHeld)
+    {
+        ApicSendEoi();
+        SyscallGapDump();
         return;
     }
 
