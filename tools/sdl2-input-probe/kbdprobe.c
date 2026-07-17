@@ -29,6 +29,42 @@
  */
 #include <SDL.h>
 #include <stdio.h>
+#include <dlfcn.h>
+
+/* Query SDL3's REAL per-window text-input state directly (bypassing
+ * sdl2-compat's global-flag wrappers) to expose the global-vs-per-window
+ * desync that fusion identified as the BRO-216 root cause. */
+static void *(*g_sdl3_GetKeyboardFocus)(void);
+static int   (*g_sdl3_TextInputActive)(void *);
+static int   (*g_sdl3_EventEnabled)(unsigned);
+static int   (*g_sdl3_StartTextInput)(void *);   /* bool SDL_StartTextInput(SDL_Window*) */
+static void *(*g_sdl3_GetWindows)(int *);         /* SDL_Window** SDL_GetWindows(int*) */
+
+static void load_sdl3_syms(void)
+{
+    void *h = dlopen("libSDL3.so.0", RTLD_NOW | RTLD_NOLOAD | RTLD_GLOBAL);
+    if (!h) h = dlopen("libSDL3.so.0", RTLD_NOW | RTLD_GLOBAL);
+    if (!h) { fprintf(stderr, "PROBE: dlopen(libSDL3.so.0) failed: %s\n", dlerror()); return; }
+    g_sdl3_GetKeyboardFocus = (void *(*)(void))dlsym(h, "SDL_GetKeyboardFocus");
+    g_sdl3_TextInputActive  = (int (*)(void *))dlsym(h, "SDL_TextInputActive");
+    g_sdl3_EventEnabled     = (int (*)(unsigned))dlsym(h, "SDL_EventEnabled");
+    g_sdl3_StartTextInput   = (int (*)(void *))dlsym(h, "SDL_StartTextInput");
+    g_sdl3_GetWindows       = (void *(*)(int *))dlsym(h, "SDL_GetWindows");
+    fprintf(stderr, "PROBE: SDL3 syms: GetKeyboardFocus=%p TextInputActive=%p EventEnabled=%p\n",
+            (void*)g_sdl3_GetKeyboardFocus, (void*)g_sdl3_TextInputActive, (void*)g_sdl3_EventEnabled);
+    fflush(stderr);
+}
+
+/* SDL_EVENT_TEXT_INPUT = 0x303 in SDL3. */
+static void report_sdl3_state(const char *when)
+{
+    void *f3 = g_sdl3_GetKeyboardFocus ? g_sdl3_GetKeyboardFocus() : (void *)-1;
+    int   a3 = (g_sdl3_TextInputActive && f3 && f3 != (void *)-1) ? g_sdl3_TextInputActive(f3) : -1;
+    int   ge = g_sdl3_EventEnabled ? g_sdl3_EventEnabled(0x303) : -1;
+    fprintf(stderr, "PROBE: [%s] SDL3 focus=%p perWindowTextActive=%d globalTextEvent=%d\n",
+            when, f3, a3, ge);
+    fflush(stderr);
+}
 
 static void report_text_input_state(const char *when)
 {
@@ -44,6 +80,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "PROBE: SDL_Init failed: %s\n", SDL_GetError());
         return 1;
     }
+    load_sdl3_syms();
     fprintf(stderr, "PROBE: video driver = %s\n", SDL_GetCurrentVideoDriver());
     fprintf(stderr, "PROBE: SDL revision = %s\n", SDL_GetRevision());
     {
@@ -93,17 +130,46 @@ int main(int argc, char **argv)
                 if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
                     fprintf(stderr, "PROBE: WINDOW FOCUS_GAINED\n");
                     report_text_input_state("focus gained");
+                    report_sdl3_state("focus gained (SDL3 view)");
+                    /* Stop->Start TOGGLE: the Stop clears sdl2-compat's global
+                     * flag so the following Start actually re-runs per-window
+                     * activation (a plain re-Start early-outs on the still-set
+                     * global flag). Fusion's decisive test for the desync. */
+                    SDL_StopTextInput();
+                    SDL_StartTextInput();
+                    report_text_input_state("after Stop->Start toggle");
+                    report_sdl3_state("after Stop->Start toggle (SDL3 view)");
+                    /* Decisive: activate text input DIRECTLY on SDL3's focus
+                     * window (bypass sdl2-compat). If this sets the per-window
+                     * flag, sdl2-compat was targeting the wrong window. */
+                    if (g_sdl3_GetWindows) {
+                        int nw = 0; void **wl = (void **)g_sdl3_GetWindows(&nw);
+                        void *f3 = g_sdl3_GetKeyboardFocus ? g_sdl3_GetKeyboardFocus() : NULL;
+                        fprintf(stderr, "PROBE: SDL3 windows=%d focus=%p:", nw, f3);
+                        if (wl) for (int i = 0; wl[i]; i++) fprintf(stderr, " %p", wl[i]);
+                        fprintf(stderr, "\n"); fflush(stderr);
+                    }
+                    if (g_sdl3_StartTextInput && g_sdl3_GetKeyboardFocus) {
+                        void *f3 = g_sdl3_GetKeyboardFocus();
+                        int rc = f3 ? g_sdl3_StartTextInput(f3) : -1;
+                        fprintf(stderr, "PROBE: direct SDL3 SDL_StartTextInput(focus=%p) -> %d\n", f3, rc);
+                        fflush(stderr);
+                        report_sdl3_state("after DIRECT SDL3 StartTextInput");
+                    }
                 } else if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
                     fprintf(stderr, "PROBE: WINDOW FOCUS_LOST\n");
                 }
                 break;
             case SDL_KEYDOWN:
                 fprintf(stderr,
-                    "PROBE KEYDOWN scancode=%d(%s) sym=%d(%s) mod=0x%x\n",
+                    "PROBE KEYDOWN scancode=%d(%s) sym=%d(%s) mod=0x%x "
+                    "focus=%p textActive=%d\n",
                     e.key.keysym.scancode,
                     SDL_GetScancodeName(e.key.keysym.scancode),
                     e.key.keysym.sym, SDL_GetKeyName(e.key.keysym.sym),
-                    e.key.keysym.mod);
+                    e.key.keysym.mod,
+                    (void *)SDL_GetKeyboardFocus(), SDL_IsTextInputActive());
+                report_sdl3_state("KEYDOWN (SDL3 view)");
                 if (e.key.keysym.sym == SDLK_ESCAPE) running = 0;
                 break;
             case SDL_TEXTINPUT:

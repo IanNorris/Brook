@@ -27,7 +27,7 @@ pkgs.stdenv.mkDerivation {
   buildPhase = ''
     # GUI probe: splits "SDL2 xkb works" from "xkb.state NULL" via keypresses.
     $CC -O2 -Wall -Wextra $(pkg-config --cflags sdl2) \
-      kbdprobe.c -o kbdprobe $(pkg-config --libs sdl2)
+      kbdprobe.c -o kbdprobe $(pkg-config --libs sdl2) -ldl
     # Headless probe: replicates SDL2's mmap(MAP_PRIVATE, memfd)+xkb compile
     # with a FABRICATED keymap, runnable from a plain terminal.
     $CC -O2 -Wall -Wextra $(pkg-config --cflags xkbcommon) \
@@ -38,9 +38,15 @@ pkgs.stdenv.mkDerivation {
     $CC -O2 -Wall -Wextra $(pkg-config --cflags wayland-client xkbcommon) \
       wl_keymap_probe.c -o wl_keymap_probe \
       $(pkg-config --libs wayland-client xkbcommon)
+    # LD_PRELOAD interposer: wraps libxkbcommon entry points SDL3 uses, logging
+    # each call+result to serial, to pin where SDL3's text path fails on Brook
+    # WITHOUT rebuilding SDL3. Forwards to the real symbols via dlsym(RTLD_NEXT).
+    $CC -O2 -Wall -Wextra -fPIC -shared $(pkg-config --cflags xkbcommon) \
+      xkbspy.c -o xkbspy.so -ldl
   '';
   installPhase = ''
-    mkdir -p $out/bin
+    mkdir -p $out/bin $out/lib
     cp kbdprobe xkb_memfd_probe wl_keymap_probe $out/bin/
+    cp xkbspy.so $out/lib/
   '';
 }
