@@ -149,8 +149,45 @@ uint32_t DebugOverlayReadFrom(uint32_t* cursor, char* out, uint32_t maxLines, ui
     return count;
 }
 
-// --- Kernel console window thread ------------------------------------------
+// Panic-safe snapshot of the last `wantLines` completed ring lines, packed into
+// `out` as NUL-terminated, newline-joined text (out is capped at outCap bytes).
+// Uses TRY-lock only: in a panic another (now-parked) CPU may hold g_ringLock
+// forever, so we must never block. Returns bytes written (0 and out="" if the
+// lock is held). Sets *outOmitted to how many older lines were dropped.
+uint32_t DebugOverlaySnapshotTail(char* out, uint32_t outCap,
+                                  uint32_t wantLines, uint32_t* outOmitted)
+{
+    if (outOmitted) *outOmitted = 0;
+    if (!out || outCap == 0) return 0;
+    out[0] = '\0';
+    if (!SpinLockTryAcquire(&g_ringLock))
+        return 0;  // ring busy — caller encodes "unavailable"
 
+    uint32_t total = g_totalLines;
+    uint32_t haveLines = (total < RING_LINES) ? total : RING_LINES;
+    uint32_t take = (wantLines < haveLines) ? wantLines : haveLines;
+    if (outOmitted && haveLines > take) *outOmitted = haveLines - take;
+
+    // Oldest of the `take` lines. Newest completed line lives at
+    // (g_writeHead - 1); the partial line at g_writeHead is intentionally
+    // excluded (may be mid-write).
+    uint32_t newest = (g_writeHead + RING_LINES - 1) % RING_LINES;
+    uint32_t pos = 0;
+    for (uint32_t i = 0; i < take; i++)
+    {
+        uint32_t ringIdx = (newest + RING_LINES - (take - 1 - i)) % RING_LINES;
+        const char* src = g_ring[ringIdx];
+        for (uint32_t j = 0; src[j] && pos + 1 < outCap; j++)
+            out[pos++] = src[j];
+        if (pos + 1 < outCap) out[pos++] = '\n';
+    }
+    out[pos] = '\0';
+
+    SpinLockRelease(&g_ringLock);
+    return pos;
+}
+
+// --- Kernel console window thread ------------------------------------------
 static constexpr uint32_t CONSOLE_W      = 800;
 static constexpr uint32_t CONSOLE_H      = 500;
 static constexpr uint32_t CONSOLE_BG     = 0x001A1A2E;  // dark blue-grey

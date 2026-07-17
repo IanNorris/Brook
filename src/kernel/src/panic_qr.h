@@ -46,6 +46,24 @@ static constexpr uint32_t QR_PACKET_TYPE_CPU_STATE      = 0xA3000008; // per-CPU
 // BRO-208 (ownership ring + savedCtx + CR3), tag "BRO208".
 static constexpr uint32_t QR_PACKET_TYPE_CUSTOM_BLOB    = 0xA3000009;
 
+// Recent kernel-log lines (from the debug_overlay ring), captured at panic time
+// to make crashes self-diagnosing. Payload: PanicDebugLogHeader then `lineCount`
+// NUL-terminated lines packed back-to-back (newline-joined text is fine too).
+static constexpr uint32_t QR_PACKET_TYPE_DEBUG_LOG      = 0xA300000A;
+
+// Debug-log capture budget. Capped so that even INCOMPRESSIBLE log text keeps the
+// whole payload within QR_MAX_PAGES. The 4-page raw budget is
+// QR_MAX_PAGES * QR_MAX_PAYLOAD_BYTES_PER_PAGE (~7968 B); the fixed packets +
+// custom blob take ~2-4 KB, so 4 KB of log text leaves margin and never forces a
+// silently-dropped tail page. Oldest lines are truncated first (count recorded).
+static constexpr uint32_t PANIC_DEBUG_LOG_LINES = 100;   // last N lines to try
+static constexpr uint32_t PANIC_DEBUG_LOG_MAX   = 4096;  // hard byte cap (raw)
+
+// Raw payload / compression scratch size. Holds the fixed packets + custom blob +
+// debug log with headroom; also used for the LZ4 scratch (LZ4 respects the passed
+// dstCapacity, so incompressible input can never overflow it).
+static constexpr uint32_t PANIC_PAYLOAD_BUF_MAX = 16384;
+
 // Custom-blob wire header (followed by `size` raw bytes). `tag` is an 8-char
 // ASCII bug id (NUL-padded); `format` is a bug-specific schema version so the
 // decoder knows how to interpret the bytes.
@@ -56,6 +74,13 @@ struct __attribute__((packed)) PanicCustomBlobHeader {
     // followed by `size` bytes (size is in the outer PanicPacketHeader)
 };
 static constexpr uint32_t PANIC_CUSTOM_BLOB_MAX = 2048;  // fits one QR page
+
+// Debug-log TLV header: followed by `textLen` bytes of newline-joined log text.
+struct __attribute__((packed)) PanicDebugLogHeader {
+    uint16_t lineCount;    // lines included
+    uint16_t omittedLines; // older lines dropped to fit the byte budget
+    uint32_t textLen;      // bytes of text that follow this header
+};
 
 // Register a custom diagnostic blob to be embedded in the next panic's QR.
 // Safe to call from any context; copies up to PANIC_CUSTOM_BLOB_MAX bytes into a
@@ -246,6 +271,14 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
                    const PanicSystemInfo* sysInfo = nullptr,
                    const PanicStackDump* stackDump = nullptr,
                    const PanicCpuList* cpuList = nullptr);
+
+// Temporal multi-page cycling. PanicRenderQR() renders page 0 and publishes a
+// document; the final panic spin loop calls PanicQrCyclePage() periodically to
+// advance to the next full-area payload page (returns false if <=1 page — the
+// caller must DisplayFlush() after a true return). PanicQrPageCount() reports
+// how many pages the current payload spans (0 if none built).
+bool    PanicQrCyclePage();
+uint8_t PanicQrPageCount();
 
 // Fill a PanicCpuList from current kernel state (per-CPU process + CR3, and the
 // NMI-captured spin RIP if available). Safe to call from the panicking CPU after

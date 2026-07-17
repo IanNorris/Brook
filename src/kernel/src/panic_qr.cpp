@@ -10,6 +10,7 @@
 #include "base45.h"
 #include "serial.h"
 #include "string.h"
+#include "debug_overlay.h"
 
 extern "C" {
 #include "qrcodegen.h"
@@ -45,6 +46,27 @@ const void* PanicGetCustomBlob(char outTag[8], uint16_t* outFormat, uint32_t* ou
     if (outSize)   *outSize = g_customBlobSize;
     return g_customBlobData;
 }
+
+// --- Temporal multi-page cycling state -------------------------------------
+// The panic path renders ONE payload QR page at a time (each fills the full
+// column, so it's large and scannable regardless of page count) and cycles
+// pages from the final panic spin loop via PanicQrCyclePage(). The document is
+// built once by PanicRenderQR(); all storage is static so it stays valid after
+// that call returns — the panic never unwinds.
+struct PanicQrDoc {
+    uint32_t* fb;
+    uint32_t  fbWidth, fbHeight, fbStride;
+    uint32_t  areaX, areaY, areaW, areaH;   // payload region (below the URL band)
+    uint32_t  px;                           // pixels/module, fixed across pages
+    uint32_t  dataLen;
+    uint32_t  maxPerPage;
+    uint8_t   pageCount;
+    uint8_t   curPage;
+    uint8_t   qrVersion;
+    bool      valid;
+};
+static PanicQrDoc g_qrDoc;
+static uint8_t    g_qrDocData[PANIC_PAYLOAD_BUF_MAX];  // owned copy of the payload
 
 // Maximum Base45 chars that fit in a single QR (Version 25, Low ECC, alphanumeric)
 // Version 25 = 117 modules → very scannable at 3px/module on a 1024x768 screen.
@@ -206,6 +228,35 @@ static uint32_t BuildPanicPayload(uint8_t* buf, uint32_t bufLen,
         }
     }
 
+    // Packet 8: Recent kernel-log lines (from the debug_overlay ring) — captured
+    // here so a crash carries its own preceding log context. Panic-safe try-lock
+    // snapshot (never blocks; a parked CPU may hold the ring lock). Oldest lines
+    // are dropped first to stay within PANIC_DEBUG_LOG_MAX; the dropped count is
+    // recorded so the decoder can show "N earlier lines omitted".
+    {
+        static char logText[PANIC_DEBUG_LOG_MAX];
+        uint32_t omitted = 0;
+        uint32_t textLen = DebugOverlaySnapshotTail(
+            logText, sizeof(logText), PANIC_DEBUG_LOG_LINES, &omitted);
+        if (textLen > 0 &&
+            off + sizeof(PanicPacketHeader) + sizeof(PanicDebugLogHeader) + textLen <= bufLen)
+        {
+            // Count lines actually packed (newline separators).
+            uint16_t lines = 0;
+            for (uint32_t i = 0; i < textLen; i++)
+                if (logText[i] == '\n') lines++;
+            PanicDebugLogHeader dlh;
+            dlh.lineCount    = lines;
+            dlh.omittedLines = static_cast<uint16_t>(omitted > 0xFFFF ? 0xFFFF : omitted);
+            dlh.textLen      = textLen;
+            ph.type = QR_PACKET_TYPE_DEBUG_LOG;
+            ph.size = sizeof(PanicDebugLogHeader) + textLen;
+            appendRaw(&ph, sizeof(ph));
+            appendRaw(&dlh, sizeof(dlh));
+            appendRaw(logText, textLen);
+        }
+    }
+
     return off;
 }
 
@@ -294,6 +345,93 @@ static void RenderQRToFramebuffer(uint32_t* fb, uint32_t fbWidth, uint32_t fbHei
     }
 }
 
+// Fill a rectangle with a solid colour (clipped to the framebuffer). Used to
+// clear the payload region before drawing a new page so the previous page can't
+// bleed through around a smaller QR.
+static void FillRect(uint32_t* fb, uint32_t fbWidth, uint32_t fbHeight,
+                     uint32_t fbStride, uint32_t x0, uint32_t y0,
+                     uint32_t w, uint32_t h, uint32_t colour)
+{
+    uint32_t strideQuads = fbStride / 4;
+    for (uint32_t y = y0; y < y0 + h && y < fbHeight; ++y)
+        for (uint32_t x = x0; x < x0 + w && x < fbWidth; ++x)
+            fb[y * strideQuads + x] = colour;
+}
+
+// Draw a row of page-indicator dots centred at the bottom of the payload area:
+// one square per page, the current page filled bright, the rest dim. The page
+// number is ALSO encoded in each QR header, so a scanner reassembles correctly
+// regardless — these dots are just a human cue that pages are cycling.
+static void RenderPageDots(const PanicQrDoc& d, uint8_t current)
+{
+    if (d.pageCount <= 1) return;
+    const uint32_t dot = 14, gap = 10;
+    uint32_t totalW = d.pageCount * dot + (d.pageCount - 1) * gap;
+    uint32_t x0 = d.areaX + (d.areaW > totalW ? (d.areaW - totalW) / 2 : 0);
+    uint32_t y0 = d.areaY + d.areaH - dot - 6;
+    for (uint8_t i = 0; i < d.pageCount; ++i)
+    {
+        uint32_t c = (i == current) ? 0x00FFFFFF : 0x00404040;
+        FillRect(d.fb, d.fbWidth, d.fbHeight, d.fbStride,
+                 x0 + i * (dot + gap), y0, dot, dot, c);
+    }
+}
+
+// Render a single payload page into the (cleared) payload region, centred, at
+// the document's fixed module size. Re-encodes Base45 + QR per call — cheap, and
+// keeps only the compact payload in static storage rather than N QR bitmaps.
+static void RenderPayloadPage(uint8_t page)
+{
+    PanicQrDoc& d = g_qrDoc;
+    if (!d.valid || page >= d.pageCount) return;
+
+    static char    b45[8192];
+    static uint8_t qr[qrcodegen_BUFFER_LEN_MAX];
+    static uint8_t tmp[qrcodegen_BUFFER_LEN_MAX];
+
+    // Clear the payload region to the panic-screen background (black); the QR's
+    // own quiet zone paints white on top.
+    FillRect(d.fb, d.fbWidth, d.fbHeight, d.fbStride,
+             d.areaX, d.areaY, d.areaW, d.areaH, 0x00000000);
+
+    uint32_t chunkStart = static_cast<uint32_t>(page) * d.maxPerPage;
+    if (chunkStart >= d.dataLen) return;
+    uint32_t chunkLen = d.dataLen - chunkStart;
+    if (chunkLen > d.maxPerPage) chunkLen = d.maxPerPage;
+
+    uint32_t bl = BuildBase45Page(b45, sizeof(b45), g_qrDocData + chunkStart,
+                                  chunkLen, page, d.pageCount, d.qrVersion);
+    if (bl == 0) return;
+    if (!qrcodegen_encodeText(b45, tmp, qr, qrcodegen_Ecc_LOW,
+                              qrcodegen_VERSION_MIN, qrcodegen_VERSION_MAX,
+                              qrcodegen_Mask_AUTO, true))
+        return;
+
+    int qrSize = qrcodegen_getSize(qr);
+    uint32_t qrPx = static_cast<uint32_t>(qrSize + 2 * QR_BORDER_WIDTH) * d.px;
+    uint32_t startX = d.areaX + (d.areaW > qrPx ? (d.areaW - qrPx) / 2 : 0);
+    uint32_t startY = d.areaY + (d.areaH > qrPx ? (d.areaH - qrPx) / 2 : 0);
+    RenderQRToFramebuffer(d.fb, d.fbWidth, d.fbHeight, d.fbStride, qr,
+                          startX, startY, d.px);
+    RenderPageDots(d, page);
+}
+
+// Advance to the next payload page and render it. Called from the final panic
+// spin loop to cycle multi-page payloads. Returns false if there's nothing to
+// cycle (<=1 page). The caller must DisplayFlush() after a true return.
+bool PanicQrCyclePage()
+{
+    if (!g_qrDoc.valid || g_qrDoc.pageCount <= 1) return false;
+    g_qrDoc.curPage = (g_qrDoc.curPage + 1) % g_qrDoc.pageCount;
+    RenderPayloadPage(g_qrDoc.curPage);
+    return true;
+}
+
+uint8_t PanicQrPageCount()
+{
+    return g_qrDoc.valid ? g_qrDoc.pageCount : 0;
+}
+
 void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
                    uint32_t fbStride, const PanicCPURegs* regs,
                    const PanicStackTrace* trace,
@@ -307,8 +445,11 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
     // are known (see below) so the codes fill the column and stay scannable.
     uint32_t QR_PIXELS_PER_MODULE = QR_PIXELS_PER_MODULE_MIN;
 
-    // Step 1: Build binary TLV payload (no header yet — added per page)
-    static uint8_t payloadBuf[8192];
+    // Step 1: Build binary TLV payload (no header yet — added per page). Sized to
+    // hold the fixed packets plus up to PANIC_DEBUG_LOG_MAX of log text; keep the
+    // compressed scratch at LZ4_compressBound so incompressible input can't
+    // overflow it.
+    static uint8_t payloadBuf[PANIC_PAYLOAD_BUF_MAX];
     uint32_t payloadLen = BuildPanicPayload(payloadBuf, sizeof(payloadBuf),
                                             regs, trace, excInfo, procList,
                                             sysInfo, stackDump, cpuList);
@@ -321,7 +462,7 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
     SerialPrintf("PANIC QR: payload %u bytes\n", payloadLen);
 
     // Step 1b: Compress with LZ4
-    static uint8_t compressedBuf[8192];
+    static uint8_t compressedBuf[PANIC_PAYLOAD_BUF_MAX];
     int compressedLen = LZ4_compress_default(
         reinterpret_cast<const char*>(payloadBuf),
         reinterpret_cast<char*>(compressedBuf + 4),  // leave 4 bytes for uncompressed size
@@ -410,9 +551,12 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
     // Width budget: the payload (the widest QR) must fit the column.
     uint32_t scaleW = payloadModules ? qrAreaW / payloadModules
                                      : QR_PIXELS_PER_MODULE_MIN;
-    // Height budget: top margin + URL band + gap + all stacked payload pages.
-    uint32_t vMarginPx = 20 + 16 + 16 * pageCount;
-    uint32_t vModules  = urlModules + pageCount * payloadModules;
+    // Height budget: top margin + URL band + gap + ONE payload page. With
+    // temporal cycling only a single payload QR is on screen at a time, so it
+    // gets the full column height regardless of pageCount — that's what keeps
+    // each page big and scannable no matter how much data we carry.
+    uint32_t vMarginPx = 20 + 16 + 24; // top + gap + dot-indicator band
+    uint32_t vModules  = urlModules + payloadModules;
     uint32_t vAvailPx  = (fbHeight > vMarginPx) ? fbHeight - vMarginPx : fbHeight;
     uint32_t scaleH    = vModules ? vAvailPx / vModules : QR_PIXELS_PER_MODULE_MIN;
 
@@ -428,7 +572,8 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
     // Step 2b: render a small STATIC "ingest URL" QR at the top of the QR column.
     // Scanning it opens the Brook panic scanner site, which then reads the dense
     // payload QR(s) below.  Kept separate so the payload stays full-density (see
-    // PANIC_INGEST_URL note in panic_qr.h).  Failure here is non-fatal.
+    // PANIC_INGEST_URL note in panic_qr.h).  Drawn ONCE; the cycler never
+    // redraws it (stable geometry aids camera autofocus). Failure is non-fatal.
     uint32_t urlBandH = 0;
     {
         static uint8_t urlQrBuf[qrcodegen_BUFFER_LEN_MAX];
@@ -449,8 +594,66 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
         }
     }
 
-    // Step 3: Encode and render each page (reusing b45Buf/qrBuf/tempBuf declared
-    // above for the module-size measurement).
+    // Step 3: dump EVERY page's Base45 to serial (the host-side decoder oracle,
+    // independent of what's on screen), then set up the cycling document and
+    // render page 0. On screen we show one full-area page at a time; the panic
+    // spin loop calls PanicQrCyclePage() to advance through the rest.
+    for (uint8_t page = 0; page < pageCount; page++)
+    {
+        uint32_t chunkStart = page * maxPerPage;
+        uint32_t chunkLen = dataLen - chunkStart;
+        if (chunkLen > maxPerPage) chunkLen = maxPerPage;
+
+        uint32_t b45Len = BuildBase45Page(b45Buf, sizeof(b45Buf),
+                                          dataToEncode + chunkStart, chunkLen,
+                                          page, pageCount, qrVersion);
+        if (b45Len == 0)
+        {
+            SerialPrintf("PANIC QR: page %u Base45 encode failed\n", page);
+            continue;
+        }
+        SerialPrintf("PANIC QR: page %u: %u bytes -> %u Base45 chars\n",
+                     page, chunkLen, b45Len);
+        SerialPuts("PANIC_B45_P");
+        {
+            char pageStr[2] = { static_cast<char>('0' + page), '\0' };
+            SerialPuts(pageStr);
+        }
+        SerialPuts(":");
+        SerialPuts(b45Buf);
+        SerialPuts("\n");
+    }
+
+    // Publish the cycling document. dataToEncode points at a function-local
+    // static (payloadBuf/compressedBuf), which outlives this call, but copy it
+    // into dedicated storage so the cycler is self-contained and unambiguous.
+    uint32_t copyLen = dataLen < sizeof(g_qrDocData) ? dataLen : sizeof(g_qrDocData);
+    for (uint32_t i = 0; i < copyLen; ++i) g_qrDocData[i] = dataToEncode[i];
+    g_qrDoc.fb         = fbBase;
+    g_qrDoc.fbWidth    = fbWidth;
+    g_qrDoc.fbHeight   = fbHeight;
+    g_qrDoc.fbStride   = fbStride;
+    g_qrDoc.areaX      = qrAreaX;
+    g_qrDoc.areaY      = urlBandH ? urlBandH : QR_START_Y;
+    g_qrDoc.areaW      = qrAreaW;
+    g_qrDoc.areaH      = (fbHeight > g_qrDoc.areaY) ? fbHeight - g_qrDoc.areaY : 0;
+    g_qrDoc.px         = QR_PIXELS_PER_MODULE;
+    g_qrDoc.dataLen    = copyLen;
+    g_qrDoc.maxPerPage = maxPerPage;
+    g_qrDoc.pageCount  = pageCount;
+    g_qrDoc.curPage    = 0;
+    g_qrDoc.qrVersion  = qrVersion;
+    g_qrDoc.valid      = true;
+
+    RenderPayloadPage(0);
+    SerialPrintf("PANIC QR: rendered page 1/%u to framebuffer (temporal cycle)\n",
+                 pageCount);
+    return;
+}
+
+#if 0  // Legacy stacked multi-page renderer — replaced by temporal cycling above.
+void PanicRenderQR_stacked_unused()
+{
     for (uint8_t page = 0; page < pageCount; page++)
     {
         uint32_t chunkStart = page * maxPerPage;
@@ -526,5 +729,6 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
 
     SerialPuts("PANIC QR: rendered to framebuffer\n");
 }
+#endif  // legacy stacked renderer
 
 } // namespace brook

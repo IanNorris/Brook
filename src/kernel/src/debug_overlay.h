@@ -26,6 +26,14 @@ uint32_t DebugOverlayTotalLines();
 // Caller manages *cursor across calls. Returns number of lines read.
 uint32_t DebugOverlayReadFrom(uint32_t* cursor, char* out, uint32_t maxLines, uint32_t lineLen);
 
+// Panic-safe snapshot of the last `wantLines` completed ring lines, packed into
+// `out` (capped at outCap) as NUL-terminated newline-joined text. Uses TRY-lock
+// only (never blocks — a parked CPU may hold the ring lock in a panic); returns
+// bytes written (0 with out="" if the lock is contended). *outOmitted receives
+// the count of older lines dropped to fit `wantLines`.
+uint32_t DebugOverlaySnapshotTail(char* out, uint32_t outCap,
+                                  uint32_t wantLines, uint32_t* outOmitted);
+
 // Spawn the kernel console WM window.
 // Must be called after CompositorInit + WmInit + SchedulerInit.
 void KernelConsoleSpawn();
