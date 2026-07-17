@@ -67,9 +67,10 @@ const void* PanicGetCustomBlob(char outTag[8], uint16_t* outFormat, uint32_t* ou
 
 // Rendering constants (tuned on real hardware — Enkel required dozens of iterations)
 //
-// QR_PIXELS_PER_MODULE: 3 works well on high-DPI displays.
-//   Use 9 for low-DPI devices like Surface Go where the camera can't resolve
-//   small modules.  The kernel auto-selects based on framebuffer resolution.
+// QR_PIXELS_PER_MODULE is chosen dynamically at render time to fill as much of
+// the QR column as fits without clipping (larger modules scan more easily / from
+// further away). QR_PIXELS_PER_MODULE_MIN/MAX bound that search. The legacy
+// fixed HIDPI/LODPI values are retained only as documentation of the old floor.
 //
 // QR_CONTRAST: reduces white from 0xFFFFFF to avoid camera bloom on screens.
 //   2 → white = 0xDDDDDD (slightly off-white, good for most screens)
@@ -80,6 +81,8 @@ const void* PanicGetCustomBlob(char outTag[8], uint16_t* outFormat, uint32_t* ou
 static constexpr uint32_t QR_PIXELS_PER_MODULE_HIDPI = 3;
 static constexpr uint32_t QR_PIXELS_PER_MODULE_LODPI = 9;
 static constexpr uint32_t QR_LODPI_THRESHOLD         = 1280; // fb width <= this uses LODPI
+static constexpr uint32_t QR_PIXELS_PER_MODULE_MIN   = 3;    // never smaller than the old HIDPI default
+static constexpr uint32_t QR_PIXELS_PER_MODULE_MAX   = 12;   // avoid modules so large the camera can't focus
 static constexpr uint32_t QR_START_X                 = 50;
 static constexpr uint32_t QR_START_Y                 = 50;
 static constexpr int      QR_BORDER_WIDTH            = 2;

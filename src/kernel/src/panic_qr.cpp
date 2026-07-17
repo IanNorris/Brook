@@ -303,13 +303,9 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
                    const PanicStackDump* stackDump,
                    const PanicCpuList* cpuList)
 {
-    // Auto-select pixels per module based on display resolution
-    // Low-DPI devices (e.g. Surface Go at 1024x768) need larger modules
-    const uint32_t QR_PIXELS_PER_MODULE = (fbWidth <= QR_LODPI_THRESHOLD)
-                                          ? QR_PIXELS_PER_MODULE_LODPI
-                                          : QR_PIXELS_PER_MODULE_HIDPI;
-    SerialPrintf("PANIC QR: %ux%u fb, using %u px/module\n",
-                 fbWidth, fbHeight, QR_PIXELS_PER_MODULE);
+    // Pixels-per-module is chosen dynamically once the QR sizes and page count
+    // are known (see below) so the codes fill the column and stay scannable.
+    uint32_t QR_PIXELS_PER_MODULE = QR_PIXELS_PER_MODULE_MIN;
 
     // Step 1: Build binary TLV payload (no header yet — added per page)
     static uint8_t payloadBuf[8192];
@@ -381,6 +377,54 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
     uint32_t qrAreaX = fbWidth * 55 / 100;
     uint32_t qrAreaW = fbWidth - qrAreaX;
 
+    // Step 2a: pick the on-screen module size dynamically. Measure the ACTUAL
+    // payload QR (page 0 is a full page = the densest) and the ingest-URL QR,
+    // then choose the largest pixels-per-module that fits BOTH the column width
+    // and the vertical budget shared by the URL band and every stacked payload
+    // page. The old fixed 3px/module left over half the column empty and was too
+    // small to scan without enlarging the window (Ian's report); this fills it.
+    static char b45Buf[8192];
+    static uint8_t qrBuf[qrcodegen_BUFFER_LEN_MAX];
+    static uint8_t tempBuf[qrcodegen_BUFFER_LEN_MAX];
+    // Use v2 (compressed) or v1 (raw) version in QR headers.
+    uint8_t qrVersion = (dataToEncode == compressedBuf) ? QR_VERSION : QR_VERSION_RAW;
+
+    uint32_t payloadModules = 117 + 2 * QR_BORDER_WIDTH; // version-25 cap (safe fallback)
+    uint32_t urlModules     = 33  + 2 * QR_BORDER_WIDTH; // ~version-4 URL QR (est fallback)
+    {
+        uint32_t c0 = dataLen; if (c0 > maxPerPage) c0 = maxPerPage;
+        uint32_t bl = BuildBase45Page(b45Buf, sizeof(b45Buf), dataToEncode, c0,
+                                      0, pageCount, qrVersion);
+        if (bl && qrcodegen_encodeText(b45Buf, tempBuf, qrBuf, qrcodegen_Ecc_LOW,
+                                       qrcodegen_VERSION_MIN, qrcodegen_VERSION_MAX,
+                                       qrcodegen_Mask_AUTO, true))
+            payloadModules = static_cast<uint32_t>(qrcodegen_getSize(qrBuf))
+                             + 2 * QR_BORDER_WIDTH;
+        if (qrcodegen_encodeText(PANIC_INGEST_URL, tempBuf, qrBuf,
+                                 qrcodegen_Ecc_MEDIUM, qrcodegen_VERSION_MIN,
+                                 qrcodegen_VERSION_MAX, qrcodegen_Mask_AUTO, true))
+            urlModules = static_cast<uint32_t>(qrcodegen_getSize(qrBuf))
+                         + 2 * QR_BORDER_WIDTH;
+    }
+
+    // Width budget: the payload (the widest QR) must fit the column.
+    uint32_t scaleW = payloadModules ? qrAreaW / payloadModules
+                                     : QR_PIXELS_PER_MODULE_MIN;
+    // Height budget: top margin + URL band + gap + all stacked payload pages.
+    uint32_t vMarginPx = 20 + 16 + 16 * pageCount;
+    uint32_t vModules  = urlModules + pageCount * payloadModules;
+    uint32_t vAvailPx  = (fbHeight > vMarginPx) ? fbHeight - vMarginPx : fbHeight;
+    uint32_t scaleH    = vModules ? vAvailPx / vModules : QR_PIXELS_PER_MODULE_MIN;
+
+    QR_PIXELS_PER_MODULE = scaleW < scaleH ? scaleW : scaleH;
+    if (QR_PIXELS_PER_MODULE < QR_PIXELS_PER_MODULE_MIN)
+        QR_PIXELS_PER_MODULE = QR_PIXELS_PER_MODULE_MIN;
+    if (QR_PIXELS_PER_MODULE > QR_PIXELS_PER_MODULE_MAX)
+        QR_PIXELS_PER_MODULE = QR_PIXELS_PER_MODULE_MAX;
+    SerialPrintf("PANIC QR: %ux%u fb, payload=%u url=%u modules, %u pages -> %u px/module\n",
+                 fbWidth, fbHeight, payloadModules, urlModules, pageCount,
+                 QR_PIXELS_PER_MODULE);
+
     // Step 2b: render a small STATIC "ingest URL" QR at the top of the QR column.
     // Scanning it opens the Brook panic scanner site, which then reads the dense
     // payload QR(s) below.  Kept separate so the payload stays full-density (see
@@ -405,14 +449,8 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
         }
     }
 
-    // Step 3: Encode and render each page
-    static char b45Buf[8192];
-    static uint8_t qrBuf[qrcodegen_BUFFER_LEN_MAX];
-    static uint8_t tempBuf[qrcodegen_BUFFER_LEN_MAX];
-
-    // Use v2 (compressed) or v1 (raw) version in QR headers
-    uint8_t qrVersion = (dataToEncode == compressedBuf) ? QR_VERSION : QR_VERSION_RAW;
-
+    // Step 3: Encode and render each page (reusing b45Buf/qrBuf/tempBuf declared
+    // above for the module-size measurement).
     for (uint8_t page = 0; page < pageCount; page++)
     {
         uint32_t chunkStart = page * maxPerPage;
