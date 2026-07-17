@@ -1,0 +1,37 @@
+{
+  "gaps": {
+    "sub:syscall=157:sub=0xf": {
+      "hits": 16,
+      "kind": "sub",
+      "sub": "0xf",
+      "syscall": 157
+    },
+    "sub:syscall=72:sub=0x6": {
+      "hits": 1,
+      "kind": "sub",
+      "sub": "0x6",
+      "syscall": 72
+    },
+    "sub:syscall=72:sub=0x7": {
+      "hits": 1,
+      "kind": "sub",
+      "sub": "0x7",
+      "syscall": 72
+    },
+    "syscall:nr=162": {
+      "class": "unexpected",
+      "hits": 1,
+      "kind": "syscall",
+      "name": "?",
+      "nr": 162
+    },
+    "syscall:nr=253": {
+      "class": "quiet_fallback",
+      "hits": 1,
+      "kind": "syscall",
+      "name": "?",
+      "nr": 253
+    }
+  },
+  "probe": "mousepad"
+}

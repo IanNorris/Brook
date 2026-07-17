@@ -37,3 +37,23 @@ watcher emits a single-line marker once the saved bytes contain the magic.
 Verified: positive PASS 3/3 (repeatable), negative self-test catches the
 regression. `/tmp` is RAM-backed on Brook, so the oracle uses an in-guest
 watcher (same VFS) rather than a post-quit disk read.
+
+## Counter tier (deterministic backbone)
+
+Each run parses the Ctrl+F11 gap dump (syscall-gap + sub-gap tables) into a set
+of normalized gap *identities* -- `(kind, number, sub)` only; hit counts,
+first_pid and first_comm are diagnostic noise that is normalized away. The run
+is diffed against a blessed baseline plus an EXPECTED_GAP allowlist:
+
+    baseline/<probe>.gaps.json       # blessed stable gap set
+    baseline/<probe>.expected_gaps   # documented known/intermittent gaps
+
+A NEW gap (present now, absent from both) FAILS the gate -- that is exactly the
+silent degradation a nixpkgs bump (moving a toolkit onto a new syscall) would
+introduce. A MISSING gap is reported but does not fail (usually an improvement).
+
+    python3 tools/p2-gate/p2gate.py --probe mousepad --bless-counters
+
+Bless refuses if any functional assertion is red (never bless a broken run).
+Intermittent-but-benign gaps (e.g. glibc's inotify->polling fallback) belong in
+the allowlist, not a single-run baseline, so they never flake the gate.

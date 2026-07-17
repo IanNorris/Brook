@@ -1,0 +1,10 @@
+# EXPECTED_GAP allowlist for the mousepad probe.
+# These gaps are known-benign and/or intermittent; they must never FAIL the
+# gate, but they remain visible in the report so a count spike is noticeable.
+# Format: EXPECTED_GAP key=<identity> reason="..."
+#
+# glibc/glib file-monitoring falls back to polling when inotify is absent.
+# Called intermittently (depends on whether the watch is set up in a given
+# run), so it cannot live in a single-run baseline without flaking the gate.
+EXPECTED_GAP key=syscall:nr=253 reason="inotify_init: glibc falls back to polling"
+EXPECTED_GAP key=syscall:nr=294 reason="inotify_init1: glib file monitor falls back to polling"

@@ -32,10 +32,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hmp import Hmp          # noqa: E402
 from serialtail import SerialTail  # noqa: E402
+import gaps as gapmod        # noqa: E402
 
 BROOK = Path(__file__).resolve().parents[2]
 RUN_QEMU = BROOK / "scripts" / "run-qemu.sh"
 SCRIPTS_DIR = BROOK / "data" / "scripts"
+GATE_DIR = Path(__file__).resolve().parent
+BASELINE_DIR = GATE_DIR / "baseline"
 
 BASE_DISKS = {
     "BROOK_DISK_IMG":  BROOK / "brook_disk.img",
@@ -304,13 +307,18 @@ def run_mousepad_probe(expect_fail=False, do_type=True, keep=False):
         except TimeoutError as e:
             res.stage("semantic-assert", False, str(e))
 
-        # gap dump (Ctrl+F11) -- captured for the counter tier, not yet asserted.
+        # gap dump (Ctrl+F11) -- the deterministic counter tier. Wait for the
+        # bounded SUBGAP_DUMP end marker rather than sleeping (serial can
+        # interleave/truncate; loop to the end sentinel).
         try:
             before = s.current_index()
             vm.hmp.sendkey("ctrl-f11")
-            time.sleep(1.0)
+            try:
+                s.wait_for(r"SUBGAP_DUMP end", timeout=15, start_index=before)
+            except TimeoutError:
+                pass
             for ln in s.snapshot()[before:]:
-                if "SUBGAP" in ln or "SYSCALL_GAP" in ln or "syscall=" in ln:
+                if "SUBGAP" in ln or "SYSCALL_GAP" in ln:
                     res.gap_lines.append(ln.strip())
         except Exception:
             pass
@@ -336,12 +344,39 @@ def main():
                          "semantic assertion to go RED)")
     ap.add_argument("--keep", action="store_true", help="keep run dir + rc")
     ap.add_argument("--json", help="write result JSON to this path")
+    ap.add_argument("--bless-counters", action="store_true",
+                    help="write the observed gap set as this probe's counter "
+                         "baseline (refuses if any functional assertion is red)")
     args = ap.parse_args()
 
     do_type = not args.negative
     res = run_mousepad_probe(do_type=do_type, keep=args.keep)
     out = res.to_dict()
     out["fingerprint"] = stack_fingerprint()
+
+    # ---- counter tier: normalize + diff gaps vs the blessed baseline ----
+    observed = gapmod.parse_gaps(res.gap_lines)
+    baseline_path = BASELINE_DIR / f"{args.probe}.gaps.json"
+    allow_path = BASELINE_DIR / f"{args.probe}.expected_gaps"
+    baseline = gapmod.load_baseline(baseline_path)
+    allowlist = gapmod.load_allowlist(allow_path)
+    counter_ok, counter_report = gapmod.compare(observed, baseline, allowlist)
+    out["counter"] = counter_report
+
+    if args.bless_counters:
+        # Refuse to bless a baseline captured from a broken run: a gap set is
+        # only trustworthy when the app actually performed its function.
+        if not res.passed:
+            print(json.dumps(out, indent=2))
+            print("\nBLESS REFUSED: functional assertions are red; fix the "
+                  "probe before blessing a counter baseline.")
+            sys.exit(1)
+        gapmod.write_baseline(baseline_path, args.probe, observed)
+        print(json.dumps(out, indent=2))
+        print(f"\nBLESSED counter baseline -> {baseline_path} "
+              f"({len(observed)} gap identities)")
+        sys.exit(0)
+
     print(json.dumps(out, indent=2))
     if args.json:
         Path(args.json).write_text(json.dumps(out, indent=2))
@@ -355,8 +390,18 @@ def main():
         print(f"\nNEGATIVE SELF-TEST: {'PASS (gate caught it)' if gate_ok else 'FAIL (gate blind!)'}")
         sys.exit(0 if gate_ok else 1)
     else:
-        print(f"\nPROBE {res.name}: {'PASS' if res.passed else 'FAIL'}")
-        sys.exit(0 if res.passed else 1)
+        # Overall gate = functional stages green AND no new counter gaps.
+        # A missing baseline is a soft warning (first run), not a failure.
+        gate_pass = res.passed and counter_ok
+        if not counter_report["have_baseline"]:
+            print("\nNOTE: no counter baseline yet -- run --bless-counters to "
+                  "establish one (counter tier not enforced this run).")
+            gate_pass = res.passed
+        elif counter_report["new_gaps"]:
+            print(f"\nNEW GAPS ({len(counter_report['new_gaps'])}): "
+                  + ", ".join(g["key"] for g in counter_report["new_gaps"]))
+        print(f"\nPROBE {res.name}: {'PASS' if gate_pass else 'FAIL'}")
+        sys.exit(0 if gate_pass else 1)
 
 
 if __name__ == "__main__":
