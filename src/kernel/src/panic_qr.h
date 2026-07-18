@@ -280,6 +280,12 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
 bool    PanicQrCyclePage();
 uint8_t PanicQrPageCount();
 
+// Shared terminal spin for panic paths: if the payload spans >1 QR page, cycle
+// the on-screen page forever (busy-poll, never returns); otherwise return so the
+// caller falls through to its own halt. Used by both KernelPanic and the
+// exception-panic path so multi-page cycling works from either.
+void    PanicQrCycleSpin();
+
 // Fill a PanicCpuList from current kernel state (per-CPU process + CR3, and the
 // NMI-captured spin RIP if available). Safe to call from the panicking CPU after
 // the APs are halted. Returns the number of entries filled.

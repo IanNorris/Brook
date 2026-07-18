@@ -12,6 +12,7 @@
 #include "string.h"
 #include "debug_overlay.h"
 #include "panic_screen.h"
+#include "display.h"
 
 extern "C" {
 #include "qrcodegen.h"
@@ -448,6 +449,38 @@ bool PanicQrCyclePage()
 uint8_t PanicQrPageCount()
 {
     return g_qrDoc.valid ? g_qrDoc.pageCount : 0;
+}
+
+// Shared terminal spin for every panic path (KernelPanic AND the idt.cpp
+// exception path). If the payload spans >1 page, busy-poll the TSC and cycle
+// the on-screen page every few seconds so a scanner can capture each one; the
+// self-contained doc holds fbHeight so we flush without the caller's scope. If
+// there's <=1 page (or no QR), returns immediately and the caller falls through
+// to its own hlt. This NEVER returns when it cycles. Busy-poll (pegs the core)
+// is the same profile as the prior pause-spin; the interrupt-woken sleep is
+// tracked in BRO-219.
+void PanicQrCycleSpin()
+{
+    if (!g_qrDoc.valid || g_qrDoc.pageCount <= 1) return;
+
+    auto rdtsc = []() -> uint64_t {
+        uint32_t lo, hi;
+        __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+        return (static_cast<uint64_t>(hi) << 32) | lo;
+    };
+    const uint64_t CYCLE_TSC = 8000000000ULL;  // ~a few seconds (uncalibrated)
+    uint32_t fbH = g_qrDoc.fbHeight;
+    uint64_t last = rdtsc();
+    for (;;)
+    {
+        if (rdtsc() - last >= CYCLE_TSC)
+        {
+            if (PanicQrCyclePage())
+                DisplayFlush(0, fbH);
+            last = rdtsc();
+        }
+        __asm__ volatile("pause");
+    }
 }
 
 void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,

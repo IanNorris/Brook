@@ -557,37 +557,11 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
         brook::DisplayFlush(0, fbH);
     }
 
-    // Multi-page QR: cycle payload pages on screen so each can be scanned. This
-    // is a BUSY poll (pegs this core — the same profile as the prior pause-spin);
-    // closing the busy wait with an interrupt-woken hlt is tracked as BRO-219,
-    // because it needs a private panic IDT + a masked fixed-vector LAPIC timer
-    // (the LAPIC timer register has no delivery-mode field, so it cannot raise an
-    // NMI). Cadence here is approximate (uncalibrated TSC) — precision is
-    // irrelevant for a human-scanned, halted machine.
-    if (physFb && fbW && fbH && brook::PanicQrPageCount() > 1)
-    {
-        auto rdtsc = []() -> uint64_t {
-            uint32_t lo, hi;
-            __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
-            return (static_cast<uint64_t>(hi) << 32) | lo;
-        };
-        // ~a few seconds per page. Uncalibrated TSC (we can't safely calibrate in
-        // a panic), so the exact interval varies with clock — that's fine for a
-        // human-scanned screen, and erring slow just leaves each page up longer.
-        // A precise cadence comes with the calibrated-timer rework in BRO-219.
-        const uint64_t CYCLE_TSC = 8000000000ULL;
-        uint64_t last = rdtsc();
-        for (;;)
-        {
-            if (rdtsc() - last >= CYCLE_TSC)
-            {
-                if (brook::PanicQrCyclePage())
-                    brook::DisplayFlush(0, fbH);
-                last = rdtsc();
-            }
-            __asm__ volatile("pause");
-        }
-    }
+    // Multi-page QR: cycle payload pages on screen so each can be scanned (shared
+    // with the exception-panic path). Returns immediately if single-page / no QR;
+    // otherwise busy-polls forever. Busy-poll pegs this core (same profile as the
+    // prior pause-spin); the interrupt-woken sleep is tracked in BRO-219.
+    brook::PanicQrCycleSpin();
 
     // Spin forever (don't use hlt — it causes QEMU to exit when all CPUs halt)
     for (;;) { __asm__ volatile("pause"); }

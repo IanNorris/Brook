@@ -1257,6 +1257,14 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
             }
         }
 
+        // Cycle multi-page QR on screen (returns at once if single-page / no QR).
+        // Placed BEFORE HandleException because on this kernel-fault path
+        // HandleExceptionFull already holds the panic-print lock, so
+        // HandleException would just re-try that lock, fail, and halt silently —
+        // never reaching its own terminal cycler call. For multi-page this never
+        // returns; for single-page it falls through to HandleException as before.
+        brook::PanicQrCycleSpin();
+
         InterruptFrame ifrm;
         ifrm.ip    = ef->rip;
         ifrm.cs    = ef->cs;
