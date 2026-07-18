@@ -97,6 +97,24 @@ static int DrawString(uint32_t* fb, uint32_t stride,
     return px;
 }
 
+// Sum the advance widths of a string (no drawing), for right-alignment.
+static int MeasureString(const char* str)
+{
+    if (!str) return 0;
+    const FontAtlas& fa = g_fontAtlas;
+    int w = 0;
+    for (const char* p = str; *p; ++p)
+    {
+        int cp = *p;
+        if (cp < static_cast<int>(fa.firstChar) ||
+            cp >= static_cast<int>(fa.firstChar + fa.glyphCount))
+            w += (fa.glyphCount > 0) ? fa.glyphs[0].advance : 8;
+        else
+            w += fa.glyphs[cp - static_cast<int>(fa.firstChar)].advance;
+    }
+    return w;
+}
+
 // Format a uint64 as "0x" + 16 hex digits into buf. Returns length.
 static int Hex64(char* buf, uint64_t val)
 {
@@ -134,10 +152,49 @@ static int DrawReg64(uint32_t* fb, uint32_t stride, uint32_t fbW, uint32_t fbH,
     return py;
 }
 
+// Draw a possibly-multi-line message, capped at maxLines. Each source '\n'
+// starts a new line at leftMargin; y advances by lineH per line actually drawn
+// (the old code advanced only one lineH regardless, so a multi-line panic
+// message overran the block below it). Returns y after the last drawn line.
+static int DrawMessageCapped(uint32_t* fb, uint32_t stride, uint32_t fbW,
+                             uint32_t fbH, int leftMargin, int y,
+                             const char* msg, uint32_t fg, int maxLines)
+{
+    if (!msg) return y;
+    const FontAtlas& fa = g_fontAtlas;
+    int x = leftMargin;
+    int lines = 1;
+    for (const char* p = msg; *p; ++p)
+    {
+        if (*p == '\n')
+        {
+            if (++lines > maxLines) break;
+            y += fa.lineHeight;
+            x = leftMargin;
+            continue;
+        }
+        x += DrawGlyph(fb, stride, fbW, fbH, x, y, *p, fg);
+    }
+    return y + fa.lineHeight;
+}
+
+// Copy a symbol name into out[], stopping at the first '(' so only the bare
+// function name is shown (the ksym table stores demangled names WITH the full
+// C++ signature, which is long and gets truncated on screen). Also trims a
+// trailing space before the '('. out is always NUL-terminated.
+static void FuncNameOnly(char* out, uint32_t outCap, const char* sym)
+{
+    uint32_t n = 0;
+    if (sym)
+        for (const char* p = sym; *p && *p != '(' && n + 1 < outCap; ++p)
+            out[n++] = *p;
+    while (n > 0 && out[n - 1] == ' ') n--;   // trim trailing space
+    out[n] = '\0';
+}
+
 void PanicScreenRender(uint32_t* fb, uint32_t fbW, uint32_t fbH,
                        uint32_t fbStride, const PanicScreenInfo* info)
-{
-    if (!fb || fbW == 0 || fbH == 0) return;
+{    if (!fb || fbW == 0 || fbH == 0) return;
 
     // fbStride comes from TtyGetFramebuffer which returns bytes — convert to pixels
     uint32_t stride = fbStride / sizeof(uint32_t);
@@ -154,28 +211,39 @@ void PanicScreenRender(uint32_t* fb, uint32_t fbW, uint32_t fbH,
     FillRect(fb, stride, fbH, 0, 0, fbW, bannerH, BG_BANNER);
     DrawString(fb, stride, fbW, fbH, 20, 8, "KERNEL PANIC", FG_WHITE);
 
-    // Build info on banner right side
+    // Build info on banner right side — right-aligned so it never runs off the
+    // edge (the old fixed x=fbW-400 truncated the branch/hash on wide builds).
     {
-        int bx = static_cast<int>(fbW) - 400;
+        char line[192];
+        uint32_t n = 0;
+        auto put = [&](const char* s) {
+            if (!s) return;
+            for (const char* p = s; *p && n + 1 < sizeof(line); ++p) line[n++] = *p;
+        };
+        put("Brook OS ");
+        put(BuildDate());
+        put(" (");
+        put(BuildGitBranch());
+        put("/");
+        put(BuildGitHash());
+        put(")");
+        line[n] = '\0';
+        int w = MeasureString(line);
+        int bx = static_cast<int>(fbW) - w - 12;
         if (bx < 200) bx = 200;
-        bx = DrawString(fb, stride, fbW, fbH, bx, 8, "Brook OS ", FG_GREY);
-        bx = DrawString(fb, stride, fbW, fbH, bx, 8, BuildDate(), FG_GREY);
-        bx = DrawString(fb, stride, fbW, fbH, bx, 8, " (", FG_GREY);
-        bx = DrawString(fb, stride, fbW, fbH, bx, 8, BuildGitBranch(), FG_GREY);
-        bx = DrawString(fb, stride, fbW, fbH, bx, 8, "/", FG_GREY);
-        bx = DrawString(fb, stride, fbW, fbH, bx, 8, BuildGitHash(), FG_GREY);
-        DrawString(fb, stride, fbW, fbH, bx, 8, ")", FG_GREY);
+        DrawString(fb, stride, fbW, fbH, bx, 8, line, FG_GREY);
     }
 
     int y = static_cast<int>(bannerH) + 8;
     int leftMargin = 20;
 
-    // 3. Error description
+    // 3. Error description (top header) — capped to 4 lines so a long multi-line
+    // panic message can't overrun the sections below it.
     if (info->message)
     {
         y += 4;
-        DrawString(fb, stride, fbW, fbH, leftMargin, y, info->message, FG_YELLOW);
-        y += lineH;
+        y = DrawMessageCapped(fb, stride, fbW, fbH, leftMargin, y,
+                              info->message, FG_YELLOW, 4);
     }
 
     // Exception description if vector is set
@@ -192,14 +260,50 @@ void PanicScreenRender(uint32_t* fb, uint32_t fbW, uint32_t fbH,
 
     y += 8; // spacing
 
-    // 4. Register dump (left column, two registers per line)
+    // 4. Stack trace (below the header) — top 20 frames, function name only
+    // (signature stripped). This is the most useful thing to eyeball, so it goes
+    // above the register dump now.
+    if (info->trace && info->trace->depth > 0)
+    {
+        DrawString(fb, stride, fbW, fbH, leftMargin, y, "Stack Trace:", FG_CYAN);
+        y += lineH;
+
+        const uint8_t maxFrames = 20;
+        for (uint8_t i = 0; i < info->trace->depth && i < maxFrames &&
+                            y + lineH < static_cast<int>(fbH) - 20; i++)
+        {
+            char prefix[8];
+            prefix[0] = ' '; prefix[1] = ' '; prefix[2] = '#';
+            prefix[3] = '0' + (i / 10);
+            prefix[4] = '0' + (i % 10);
+            prefix[5] = ' '; prefix[6] = ' '; prefix[7] = '\0';
+
+            int x = DrawString(fb, stride, fbW, fbH, leftMargin, y, prefix, FG_GREY);
+            char hex[20]; Hex64(hex, info->trace->rip[i]);
+            x = DrawString(fb, stride, fbW, fbH, x, y, hex, FG_WHITE);
+
+            const char* symName = nullptr; uint64_t symOff = 0;
+            if (KsymFindByAddr(info->trace->rip[i], &symName, &symOff))
+            {
+                char name[96];
+                FuncNameOnly(name, sizeof(name), symName);
+                x = DrawString(fb, stride, fbW, fbH, x, y, "  ", FG_GREY);
+                DrawString(fb, stride, fbW, fbH, x, y, name, FG_YELLOW);
+            }
+            y += lineH;
+        }
+    }
+
+    y += 8;
+
+    // 5. Register dump (now at the bottom of the left column, below the trace).
     if (info->regs)
     {
         const PanicCPURegs& r = *info->regs;
         DrawString(fb, stride, fbW, fbH, leftMargin, y, "Registers:", FG_CYAN);
         y += lineH;
 
-        // RIP with symbol
+        // RIP with symbol (name only)
         {
             int x = DrawString(fb, stride, fbW, fbH, leftMargin, y, "  RIP ", FG_GREY);
             char hex[20]; Hex64(hex, r.rip);
@@ -207,8 +311,10 @@ void PanicScreenRender(uint32_t* fb, uint32_t fbW, uint32_t fbH,
             const char* symName = nullptr; uint64_t symOff = 0;
             if (KsymFindByAddr(r.rip, &symName, &symOff))
             {
+                char name[96];
+                FuncNameOnly(name, sizeof(name), symName);
                 x = DrawString(fb, stride, fbW, fbH, x, y, "  ", FG_GREY);
-                x = DrawString(fb, stride, fbW, fbH, x, y, symName, FG_YELLOW);
+                x = DrawString(fb, stride, fbW, fbH, x, y, name, FG_YELLOW);
             }
             y += lineH;
         }
@@ -269,36 +375,6 @@ void PanicScreenRender(uint32_t* fb, uint32_t fbW, uint32_t fbH,
         }
     }
 
-    y += 8;
-
-    // 5. Stack trace with symbols
-    if (info->trace && info->trace->depth > 0)
-    {
-        DrawString(fb, stride, fbW, fbH, leftMargin, y, "Stack Trace:", FG_CYAN);
-        y += lineH;
-
-        for (uint8_t i = 0; i < info->trace->depth && y + lineH < static_cast<int>(fbH) - 20; i++)
-        {
-            char prefix[8];
-            prefix[0] = ' '; prefix[1] = ' '; prefix[2] = '#';
-            prefix[3] = '0' + (i / 10);
-            prefix[4] = '0' + (i % 10);
-            prefix[5] = ' '; prefix[6] = ' '; prefix[7] = '\0';
-
-            int x = DrawString(fb, stride, fbW, fbH, leftMargin, y, prefix, FG_GREY);
-            char hex[20]; Hex64(hex, info->trace->rip[i]);
-            x = DrawString(fb, stride, fbW, fbH, x, y, hex, FG_WHITE);
-
-            const char* symName = nullptr; uint64_t symOff = 0;
-            if (KsymFindByAddr(info->trace->rip[i], &symName, &symOff))
-            {
-                x = DrawString(fb, stride, fbW, fbH, x, y, "  ", FG_GREY);
-                DrawString(fb, stride, fbW, fbH, x, y, symName, FG_YELLOW);
-            }
-            y += lineH;
-        }
-    }
-
     // 6. Render QR code in the right column
     PanicRenderQR(fb, fbW, fbH, fbStride, info->regs, info->trace,
                   info->excInfo, info->procList, info->sysInfo, info->stackDump,
@@ -309,6 +385,15 @@ void PanicScreenRender(uint32_t* fb, uint32_t fbW, uint32_t fbH,
                static_cast<int>(fbH) - lineH - 8,
                "System halted. Scan QR code to decode crash data.",
                FG_GREY);
+}
+
+int PanicScreenDrawText(uint32_t* fb, uint32_t fbW, uint32_t fbH,
+                        uint32_t fbStride, int px, int py,
+                        const char* str, uint32_t colour)
+{
+    if (!fb || fbStride == 0) return px;
+    uint32_t stride = fbStride / sizeof(uint32_t);
+    return DrawString(fb, stride, fbW, fbH, px, py, str, colour);
 }
 
 } // namespace brook

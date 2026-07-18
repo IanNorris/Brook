@@ -11,6 +11,7 @@
 #include "serial.h"
 #include "string.h"
 #include "debug_overlay.h"
+#include "panic_screen.h"
 
 extern "C" {
 #include "qrcodegen.h"
@@ -71,6 +72,10 @@ struct PanicQrDoc {
 };
 static PanicQrDoc g_qrDoc;
 static uint8_t    g_qrDocData[PANIC_PAYLOAD_BUF_MAX];  // owned copy of the payload
+
+// Panic-screen background (must match BG_DARK in panic_screen.cpp) — the payload
+// region is cleared to this so the QR isn't framed by a black rectangle.
+static constexpr uint32_t PANIC_QR_BG = 0x001A0000;
 
 // Maximum Base45 chars that fit in a single QR (Version 25, Low ECC, alphanumeric)
 // Version 25 = 117 modules → very scannable at 3px/module on a 1024x768 screen.
@@ -393,10 +398,11 @@ static void RenderPayloadPage(uint8_t page)
     static uint8_t qr[qrcodegen_BUFFER_LEN_MAX];
     static uint8_t tmp[qrcodegen_BUFFER_LEN_MAX];
 
-    // Clear the payload region to the panic-screen background (black); the QR's
-    // own quiet zone paints white on top.
+    // Clear the payload region to the panic-screen background (dark red) so
+    // there's no black rectangle framing the QR — the QR's own 1-module white
+    // quiet zone provides the needed light margin against the red.
     FillRect(d.fb, d.fbWidth, d.fbHeight, d.fbStride,
-             d.areaX, d.areaY, d.areaW, d.areaH, 0x00000000);
+             d.areaX, d.areaY, d.areaW, d.areaH, PANIC_QR_BG);
 
     uint32_t chunkStart = static_cast<uint32_t>(page) * d.maxPerPage;
     if (chunkStart >= d.dataLen) return;
@@ -584,11 +590,12 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
     // Width budget: the payload (the widest QR) must fit the column.
     uint32_t scaleW = payloadModules ? qrAreaW / payloadModules
                                      : QR_PIXELS_PER_MODULE_MIN;
-    // Height budget: top margin + URL band + gap + ONE payload page. With
-    // temporal cycling only a single payload QR is on screen at a time, so it
-    // gets the full column height regardless of pageCount — that's what keeps
-    // each page big and scannable no matter how much data we carry.
-    uint32_t vMarginPx = 20 + 16 + 24; // top + gap + dot-indicator band
+    // Height budget: top margin + gap + dot band + URL label/pads. With temporal
+    // cycling only a single payload QR is on screen at a time, so it gets the
+    // full column height regardless of pageCount — that's what keeps each page
+    // big and scannable no matter how much data we carry. The URL QR + its label
+    // sit in a reserved band at the bottom (accounted for via urlModules below).
+    uint32_t vMarginPx = QR_START_Y + 16 + 24 + 24 + 16; // top+gap+dots+label+botpad
     uint32_t vModules  = urlModules + payloadModules;
     uint32_t vAvailPx  = (fbHeight > vMarginPx) ? fbHeight - vMarginPx : fbHeight;
     uint32_t scaleH    = vModules ? vAvailPx / vModules : QR_PIXELS_PER_MODULE_MIN;
@@ -602,12 +609,12 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
                  fbWidth, fbHeight, payloadModules, urlModules, pageCount,
                  QR_PIXELS_PER_MODULE);
 
-    // Step 2b: render a small STATIC "ingest URL" QR at the top of the QR column.
-    // Scanning it opens the Brook panic scanner site, which then reads the dense
-    // payload QR(s) below.  Kept separate so the payload stays full-density (see
-    // PANIC_INGEST_URL note in panic_qr.h).  Drawn ONCE; the cycler never
-    // redraws it (stable geometry aids camera autofocus). Failure is non-fatal.
-    uint32_t urlBandH = 0;
+    // Step 2b: render a small STATIC "ingest URL" QR at the BOTTOM of the QR
+    // column, with an instruction to scan it FIRST (it opens the Brook panic
+    // scanner site, which then reads the dense payload QR above). Kept separate
+    // so the payload stays full-density. Drawn ONCE; the cycler never redraws it
+    // (stable geometry aids camera autofocus). Failure is non-fatal.
+    uint32_t urlBandH = 0;   // vertical space reserved at the BOTTOM for URL + label
     {
         static uint8_t urlQrBuf[qrcodegen_BUFFER_LEN_MAX];
         static uint8_t urlTmpBuf[qrcodegen_BUFFER_LEN_MAX];
@@ -618,12 +625,21 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
         {
             int urlSize = qrcodegen_getSize(urlQrBuf);
             uint32_t urlPx = static_cast<uint32_t>(urlSize + 2 * QR_BORDER_WIDTH) * QR_PIXELS_PER_MODULE;
+            const uint32_t labelH = 24;   // instruction line above the URL QR
+            const uint32_t botPad = 16;
+            uint32_t urlY = (fbHeight > urlPx + botPad) ? fbHeight - urlPx - botPad : 0;
             uint32_t urlX = qrAreaX + (qrAreaW > urlPx ? (qrAreaW - urlPx) / 2 : 0);
-            uint32_t urlY = 20;
+            // Instruction, centred above the URL QR.
+            const char* instr = "Scan this small code FIRST, then the large one above";
+            uint32_t instrY = (urlY > labelH) ? urlY - labelH : 0;
+            PanicScreenDrawText(fbBase, fbWidth, fbHeight, fbStride,
+                                static_cast<int>(qrAreaX + 8),
+                                static_cast<int>(instrY),
+                                instr, 0x0080D0FF /* cyan */);
             RenderQRToFramebuffer(fbBase, fbWidth, fbHeight, fbStride, urlQrBuf,
                                   urlX, urlY, QR_PIXELS_PER_MODULE);
-            urlBandH = urlY + urlPx + 16;  // reserve this band; payload QRs start below
-            SerialPuts("PANIC QR: ingest URL QR rendered (" PANIC_INGEST_URL ")\n");
+            urlBandH = urlPx + botPad + labelH;  // reserve at the bottom
+            SerialPuts("PANIC QR: ingest URL QR rendered at bottom (" PANIC_INGEST_URL ")\n");
         }
     }
 
@@ -667,9 +683,14 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
     g_qrDoc.fbHeight   = fbHeight;
     g_qrDoc.fbStride   = fbStride;
     g_qrDoc.areaX      = qrAreaX;
-    g_qrDoc.areaY      = urlBandH ? urlBandH : QR_START_Y;
+    g_qrDoc.areaY      = QR_START_Y;        // payload fills from the top now
     g_qrDoc.areaW      = qrAreaW;
-    g_qrDoc.areaH      = (fbHeight > g_qrDoc.areaY) ? fbHeight - g_qrDoc.areaY : 0;
+    // Height stops above the bottom URL band (which holds the ingest-URL QR +
+    // its instruction label).
+    {
+        uint32_t bottomLimit = (fbHeight > urlBandH) ? fbHeight - urlBandH : fbHeight;
+        g_qrDoc.areaH = (bottomLimit > g_qrDoc.areaY) ? bottomLimit - g_qrDoc.areaY : 0;
+    }
     g_qrDoc.px         = QR_PIXELS_PER_MODULE;
     g_qrDoc.dataLen    = copyLen;
     g_qrDoc.maxPerPage = maxPerPage;

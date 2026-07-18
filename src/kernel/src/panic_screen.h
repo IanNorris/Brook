@@ -33,4 +33,11 @@ struct PanicScreenInfo {
 void PanicScreenRender(uint32_t* fb, uint32_t fbW, uint32_t fbH,
                        uint32_t fbStride, const PanicScreenInfo* info);
 
+// Draw a single line of text at (px, py) in the given colour (0x00RRGGBB), for
+// callers outside panic_screen.cpp (e.g. panic_qr labels the ingest-URL QR).
+// fbStride is in BYTES (as passed to PanicScreenRender). Returns x after text.
+int PanicScreenDrawText(uint32_t* fb, uint32_t fbW, uint32_t fbH,
+                        uint32_t fbStride, int px, int py,
+                        const char* str, uint32_t colour);
+
 } // namespace brook
