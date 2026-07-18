@@ -62,7 +62,11 @@ struct PanicQrDoc {
     uint32_t  maxPerPage;
     uint8_t   pageCount;
     uint8_t   curPage;
-    uint8_t   qrVersion;
+    uint8_t   qrVersion;      // PROTOCOL version (v1 raw / v2 compressed)
+    uint8_t   qrCodeVersion;  // forced qrcodegen version so every page is the
+                              // SAME physical size (module count) — a scanner
+                              // stays focused/locked across page flips instead
+                              // of refocusing on a differently-sized page.
     bool      valid;
 };
 static PanicQrDoc g_qrDoc;
@@ -402,7 +406,15 @@ static void RenderPayloadPage(uint8_t page)
     uint32_t bl = BuildBase45Page(b45, sizeof(b45), g_qrDocData + chunkStart,
                                   chunkLen, page, d.pageCount, d.qrVersion);
     if (bl == 0) return;
+    // Force every page to the document's uniform QR version so all pages render
+    // at the SAME physical size (qrcodegen auto-pads a lighter page to fill the
+    // version). Fall back to auto-version if the forced encode somehow fails
+    // (e.g. a page unexpectedly needs a higher version) so we still render.
+    uint8_t vmin = d.qrCodeVersion ? d.qrCodeVersion : qrcodegen_VERSION_MIN;
+    uint8_t vmax = d.qrCodeVersion ? d.qrCodeVersion : qrcodegen_VERSION_MAX;
     if (!qrcodegen_encodeText(b45, tmp, qr, qrcodegen_Ecc_LOW,
+                              vmin, vmax, qrcodegen_Mask_AUTO, true) &&
+        !qrcodegen_encodeText(b45, tmp, qr, qrcodegen_Ecc_LOW,
                               qrcodegen_VERSION_MIN, qrcodegen_VERSION_MAX,
                               qrcodegen_Mask_AUTO, true))
         return;
@@ -532,21 +544,42 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
 
     uint32_t payloadModules = 117 + 2 * QR_BORDER_WIDTH; // version-25 cap (safe fallback)
     uint32_t urlModules     = 33  + 2 * QR_BORDER_WIDTH; // ~version-4 URL QR (est fallback)
+    uint8_t  payloadQrVer   = 0;                         // uniform version (0 = auto)
     {
-        uint32_t c0 = dataLen; if (c0 > maxPerPage) c0 = maxPerPage;
-        uint32_t bl = BuildBase45Page(b45Buf, sizeof(b45Buf), dataToEncode, c0,
-                                      0, pageCount, qrVersion);
-        if (bl && qrcodegen_encodeText(b45Buf, tempBuf, qrBuf, qrcodegen_Ecc_LOW,
-                                       qrcodegen_VERSION_MIN, qrcodegen_VERSION_MAX,
-                                       qrcodegen_Mask_AUTO, true))
-            payloadModules = static_cast<uint32_t>(qrcodegen_getSize(qrBuf))
-                             + 2 * QR_BORDER_WIDTH;
+        // Measure EVERY page and take the max module count / version, so all
+        // pages can then be forced to that one size (uniform physical size across
+        // flips = the scanner stays locked instead of refocusing — Ian's report).
+        for (uint8_t pg = 0; pg < pageCount; pg++)
+        {
+            uint32_t cs = static_cast<uint32_t>(pg) * maxPerPage;
+            if (cs >= dataLen) break;
+            uint32_t cl = dataLen - cs; if (cl > maxPerPage) cl = maxPerPage;
+            uint32_t bl = BuildBase45Page(b45Buf, sizeof(b45Buf), dataToEncode + cs,
+                                          cl, pg, pageCount, qrVersion);
+            if (bl && qrcodegen_encodeText(b45Buf, tempBuf, qrBuf, qrcodegen_Ecc_LOW,
+                                           qrcodegen_VERSION_MIN, qrcodegen_VERSION_MAX,
+                                           qrcodegen_Mask_AUTO, true))
+            {
+                uint32_t sz = static_cast<uint32_t>(qrcodegen_getSize(qrBuf));
+                uint32_t mods = sz + 2 * QR_BORDER_WIDTH;
+                if (mods > payloadModules || payloadQrVer == 0)
+                    payloadModules = mods;
+                // qrcodegen size = 4*version + 17  =>  version = (size - 17)/4
+                uint8_t ver = static_cast<uint8_t>((sz - 17) / 4);
+                if (ver > payloadQrVer) payloadQrVer = ver;
+            }
+        }
         if (qrcodegen_encodeText(PANIC_INGEST_URL, tempBuf, qrBuf,
                                  qrcodegen_Ecc_MEDIUM, qrcodegen_VERSION_MIN,
                                  qrcodegen_VERSION_MAX, qrcodegen_Mask_AUTO, true))
             urlModules = static_cast<uint32_t>(qrcodegen_getSize(qrBuf))
                          + 2 * QR_BORDER_WIDTH;
     }
+    // payloadModules must reflect the UNIFORM (max) version so the scale math
+    // and the forced per-page render agree on one physical size.
+    if (payloadQrVer)
+        payloadModules = static_cast<uint32_t>(4 * payloadQrVer + 17)
+                         + 2 * QR_BORDER_WIDTH;
 
     // Width budget: the payload (the widest QR) must fit the column.
     uint32_t scaleW = payloadModules ? qrAreaW / payloadModules
@@ -643,6 +676,7 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
     g_qrDoc.pageCount  = pageCount;
     g_qrDoc.curPage    = 0;
     g_qrDoc.qrVersion  = qrVersion;
+    g_qrDoc.qrCodeVersion = payloadQrVer;   // uniform physical size across pages
     g_qrDoc.valid      = true;
 
     RenderPayloadPage(0);
