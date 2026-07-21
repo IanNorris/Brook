@@ -150,7 +150,15 @@ void CpuInitSyscallMsrs(uint64_t lstarEntry)
     // Clear IF (bit 9) so interrupts are disabled on entry.
     // Clear TF (bit 8) so we don't single-step the kernel entry.
     // Clear DF (bit 10) so string ops go forward.
-    WriteMsr(MSR_FMASK, (1ULL << 9) | (1ULL << 8) | (1ULL << 10));
+    // Clear NT (bit 14) and AC (bit 18) so a user thread's flags cannot leak
+    // into the kernel across SYSCALL (BRO-207). NT is the critical one: unlike
+    // interrupt/trap gates, SYSCALL does NOT auto-clear NT, so a user RFLAGS
+    // with NT=1 would run the kernel with NT set, get saved by context_switch,
+    // and eventually crash on a naked handler's IRETQ (NT=1 makes IRETQ attempt
+    // an unsupported nested-task return -> #GP(0)). AC is masked to match Linux
+    // and to keep SMAP semantics well-defined regardless of CR4.SMAP.
+    WriteMsr(MSR_FMASK,
+             (1ULL << 9) | (1ULL << 8) | (1ULL << 10) | (1ULL << 14) | (1ULL << 18));
 
     // Enable the SCE (SysCall Enable) bit in EFER.
     uint64_t efer = ReadMsr(MSR_EFER);

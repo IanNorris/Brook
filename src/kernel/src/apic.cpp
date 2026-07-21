@@ -413,6 +413,7 @@ static void LapicTimerHandler(void)
         "pop %%rbx\n\t"
         "pop %%rax\n\t"
 
+        IRETQ_NORMALIZE_RFLAGS   // BRO-207: NT must be 0 at iretq
         "iretq\n\t"
         :
         :
@@ -726,6 +727,7 @@ static void ReschedIpiHandler(void)
         "pop %%rcx\n\t"
         "pop %%rbx\n\t"
         "pop %%rax\n\t"
+        IRETQ_NORMALIZE_RFLAGS   // BRO-207: NT must be 0 at iretq
         "iretq\n\t"
         :
         :
@@ -996,6 +998,7 @@ static void TlbShootdownHandler(void)
         "pop %%rcx\n\t"
         "pop %%rbx\n\t"
         "pop %%rax\n\t"
+        IRETQ_NORMALIZE_RFLAGS   // BRO-207: NT must be 0 at iretq
         "iretq\n\t"
         :
         :

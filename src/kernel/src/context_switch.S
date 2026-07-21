@@ -97,12 +97,25 @@ context_switch:
     wrmsr
 .Lskip_fsbase:
 
-    // Restore RFLAGS — but keep IF cleared so a timer interrupt cannot
-    // fire in the middle of the register restore.  Interrupts are properly
-    // re-enabled later by iretq (preempted process) or sti (new process
-    // via ProcessTrampoline).
+    // Restore RFLAGS — but force a known-good kernel flag state. We clear IF
+    // (bit 9) so a timer interrupt cannot fire in the middle of the register
+    // restore (interrupts are re-enabled later by iretq or sti). We ALSO clear
+    // TF (bit 8), NT (bit 14), DF (bit 10) and AC (bit 18): a resumed KERNEL
+    // execution context must never carry these (BRO-207). NT is the critical one
+    // — a context whose saved RFLAGS has NT=1 (e.g. leaked from user via SYSCALL,
+    // whose FMASK historically did not clear NT) would, on resuming and later
+    // executing a naked interrupt handler's IRETQ, fault #GP(0): IRETQ with
+    // RFLAGS.NT=1 attempts an unsupported nested-task return. DF/AC are
+    // normalized for the same reason (interrupt gates do not clear them, so
+    // they can be inherited from a preempted user thread and propagate here).
+    // TF (BRO-208): a saved RFLAGS with TF=1 (corruption, or a leaked user trap
+    // flag) makes the resumed kernel thread single-step, raising a #DB on the
+    // very next instruction — observed as a #DB in ReschedIpiHandler on the futex
+    // resume path. Kernel code must never single-step, so force TF=0 here.
+    // This does NOT affect the user RFLAGS of a context returning to ring 3 —
+    // that is restored separately from the IRETQ frame, not from this popfq.
     movq 64(%rsi), %rax
-    andq $~0x200, %rax          // clear IF bit
+    andq $~0x44700, %rax        // clear IF | TF | DF | NT | AC
     pushq %rax
     popfq
 
