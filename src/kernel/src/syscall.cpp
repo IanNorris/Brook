@@ -5306,6 +5306,20 @@ resolve_path:
         __builtin_unreachable();
     }
 
+    // --- execve committed: clear the group-exit latch ---
+    // SchedulerKillThreadGroup() above latched tgidExiting=true to refuse
+    // sibling-thread births while the old thread group was being torn down
+    // (BRO-173).  Now that the new image has loaded successfully, the surviving
+    // leader is a fresh, single-threaded, very-much-alive process — the latch
+    // MUST be cleared.  Otherwise the leader's incarnation still reads
+    // tgidExiting=true, and its FIRST pthread_create (e.g. SDL2/3's audio or
+    // event thread) is stillborn forever: ProcessCreateThread marks the new
+    // thread Terminated instead of running it, glibc's start_thread then runs on
+    // a misaligned/parent stack and #GPs inside __vsnprintf_internal (movaps on a
+    // 16-byte-unaligned stack).  This is BRO-203 and is why every exec'd threaded
+    // app (yquake2, SuperTuxKart, any SDL app) crashed right after window setup.
+    __atomic_store_n(&proc->tgidExiting, false, __ATOMIC_RELEASE);
+
     for (uint32_t i = 0; i <= newExeLen; ++i)
         proc->exePath[i] = newExePath[i];
 
