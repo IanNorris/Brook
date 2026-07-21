@@ -9590,18 +9590,58 @@ static int64_t sys_fallocate(uint64_t, uint64_t, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
-// sys_mincore (27) — check if pages are resident (stub: all resident)
-// ---------------------------------------------------------------------------
-
+// sys_mincore (27) — report per-page residency for a mapped range.
+//
+// POSIX/Linux semantics that callers depend on:
+//   * addr must be page-aligned            -> else -EINVAL
+//   * the whole [addr, addr+length) range must be mapped, otherwise the call
+//     fails with -ENOMEM (it does NOT partially fill vec).
+//   * vec[i] bit0 = 1 if the page is resident in memory, 0 otherwise.
+//
+// The old stub ignored addr and reported every page resident with a success
+// return. That broke pointer-validity probes that rely on mincore failing for
+// unmapped addresses — notably Mesa's _eglPointerIsDereferenceable(), which
+// uses mincore() to decide whether a wl_egl_window begins with a wl_surface*
+// (old ABI) or an intptr_t version (new ABI). A bogus "resident" answer for the
+// null page made Mesa treat the version field as the surface pointer and crash
+// in wl_proxy_create_wrapper (BRO-204).
 static int64_t sys_mincore(uint64_t addr, uint64_t length, uint64_t vecAddr,
                             uint64_t, uint64_t, uint64_t)
 {
-    (void)addr;
+    if (addr & 0xFFFULL) return -EINVAL;      // addr must be page-aligned
+
+    brook::Process* proc = brook::ProcessCurrent();
+    if (!proc) return -ENOMEM;
+
     uint64_t pages = (length + 4095) / 4096;
+    if (pages == 0) return 0;
     if (!UserBufferWritable(vecAddr, pages)) return -EFAULT;
+
+    uint64_t end;
+    if (__builtin_add_overflow(addr, pages * 4096ULL, &end)) return -ENOMEM;
+    if (end > 0x0000800000000000ULL) return -ENOMEM;
+
+    // First pass: every page in the range must be mapped, or the whole call
+    // fails with -ENOMEM (matching Linux — vec is left untouched on failure).
+    for (uint64_t i = 0; i < pages; ++i)
+    {
+        uint64_t pg = addr + i * 4096ULL;
+        uint64_t* pte = brook::VmmGetPte(proc->pageTable, brook::VirtualAddress(pg));
+        bool present = pte && (*pte & brook::VMM_PRESENT);
+        // Lazily-backed regions (demand paging / file maps) count as mapped:
+        // fault them in (read intent) so residency reflects the real VMA, as
+        // Linux would. 0x4 = user-mode read fault.
+        if (!present && (MemFdHandleUserFault(pg, 0x4) || FileMapHandleUserFault(pg, 0x4)))
+        {
+            pte = brook::VmmGetPte(proc->pageTable, brook::VirtualAddress(pg));
+            present = pte && (*pte & brook::VMM_PRESENT);
+        }
+        if (!present) return -ENOMEM;
+    }
+
     auto* vec = reinterpret_cast<uint8_t*>(vecAddr);
     for (uint64_t i = 0; i < pages; ++i)
-        vec[i] = 1; // all pages resident
+        vec[i] = 1; // all mapped pages are treated as resident (no swap)
     return 0;
 }
 
