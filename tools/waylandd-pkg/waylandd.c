@@ -1070,7 +1070,19 @@ static void wm_base_get_xdg_surface(struct wl_client *c, struct wl_resource *r,
     if (!xs) { wl_client_post_no_memory(c); return; }
     wl_resource_set_implementation(xs, &xdg_surface_impl, s, xdg_surface_resource_destroy);
     s->xdg_surface = xs;
+
+    /* A fresh xdg_surface role on this wl_surface starts a new configure
+     * handshake: the next commit must be answered with an initial configure
+     * before the client attaches a buffer.  SDL2's Wayland backend reuses one
+     * wl_surface across window recreation (e.g. yquake2's vid restart into the
+     * ref_soft renderer): it destroys the old xdg_toplevel/xdg_surface and
+     * creates new ones on the same wl_surface.  Without clearing these sticky
+     * flags the second toplevel never receives its initial configure, so the
+     * client blocks forever waiting to commit its first frame. */
+    s->xdg_initial_commit_done = 0;
+    s->xdg_acked = 0;
 }
+
 static void wm_base_pong(struct wl_client *c, struct wl_resource *r, uint32_t serial) {
     (void)c; (void)r; (void)serial;
 }
