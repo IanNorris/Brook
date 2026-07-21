@@ -11275,7 +11275,34 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
         SchedulerBlock(proc);
 
         if (FutexRemoveWaiter(owner, uaddrVal, proc))
-            return HasPendingSignals() ? -EINTR : -ETIMEDOUT;
+        {
+            // We dequeued our own waiter — i.e. no FUTEX_WAKE removed us; we
+            // resumed via the scheduler (signal, timeout, or a SPURIOUS unblock
+            // such as SchedulerBlock's pendingWakeup early-return under SMP
+            // load).
+            if (HasPendingSignals())
+                return -EINTR;
+
+            // BRO-205: report ETIMEDOUT ONLY for a real, finite deadline that
+            // has actually expired. A spurious wake on an INFINITE wait (or one
+            // whose deadline hasn't arrived yet) must NOT be reported as a
+            // timeout: glibc's __lll_lock_wait issues an UNTIMED FUTEX_WAIT for a
+            // contended mutex (e.g. the mutex re-lock inside pthread_cond_wait)
+            // and calls futex_fatal_error() -> abort ("The futex facility
+            // returned an unexpected error code") on ANY return other than
+            // 0/EAGAIN/EINTR — ETIMEDOUT included. Returning ETIMEDOUT here for a
+            // spurious wake crashed every glibc app that re-locks a contended
+            // mutex after a condvar wait (yquake2/mesa llvmpipe, intermittently).
+            extern volatile uint64_t g_lapicTickCount;
+            if (deadline != ~0ULL && g_lapicTickCount >= deadline)
+                return -ETIMEDOUT;
+
+            // Spurious / early wake — behave like a spurious FUTEX_WAKE: return 0
+            // so the caller rechecks the futex word and re-waits if needed. This
+            // is always safe; correct futex users must re-test their condition
+            // after any wake.
+            return 0;
+        }
 
         return 0;
     }
