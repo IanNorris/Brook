@@ -121,6 +121,13 @@ uint64_t PmmGetTotalPageCount();
 // it drains them through an all-CPU TLB barrier.
 void PmmStartDrainThread();
 
+// BRO-206: producer back-pressure. Call at the entry of a frame-producing
+// syscall (mmap/munmap/brk/mremap), BEFORE taking any lock and with interrupts
+// enabled — it may sleep. Blocks the caller while the free-quarantine is over a
+// high watermark until the REALTIME drain thread reclaims below a low watermark,
+// bounding the quarantine so it can never reach the g_totalPages/2 panic.
+void PmmThrottleForDrain();
+
 // BRO-179 forensic: decode a poison qword (0xDFDF-marked) seen at a crash site
 // into the original owner PID + free-seq and dump that frame's alloc/free
 // callstack history. Returns true if the qword carried the poison marker.
