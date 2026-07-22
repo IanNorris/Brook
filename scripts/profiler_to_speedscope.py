@@ -131,8 +131,21 @@ def extract_from_disk(disk_img):
     return profile_path, ksym_path
 
 
+MODULE_BASE = 0xFFFFFFFF90000000
+KERNEL_BASE = 0xFFFFFFFF80000000
+
+
 def resolve_rip(rip, syms, sorted_addrs):
-    """Resolve RIP to nearest symbol name, or hex string."""
+    """Resolve RIP to nearest symbol name, or hex string.
+
+    Addresses in the loadable-module region (>= MODULE_BASE) and user-space
+    addresses (< KERNEL_BASE) are NOT covered by the kernel ELF symbol table;
+    label them honestly instead of mis-attributing them to the nearest kernel
+    symbol (which would report e.g. __etext+0xNNN for every module frame)."""
+    if rip >= MODULE_BASE:
+        return f"module+0x{rip - MODULE_BASE:x}"
+    if rip < KERNEL_BASE:
+        return f"user 0x{rip:x}"
     if not sorted_addrs:
         return f"0x{rip:016x}"
     lo, hi = 0, len(sorted_addrs) - 1
