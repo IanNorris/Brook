@@ -78,11 +78,18 @@ static uint8_t    g_qrDocData[PANIC_PAYLOAD_BUF_MAX];  // owned copy of the payl
 // region is cleared to this so the QR isn't framed by a black rectangle.
 static constexpr uint32_t PANIC_QR_BG = 0x001A0000;
 
-// Maximum Base45 chars that fit in a single QR (Version 25, Low ECC, alphanumeric)
-// Version 25 = 117 modules → very scannable at 3px/module on a 1024x768 screen.
-// Alphanumeric capacity at Low ECC: 3057 chars.
-// We leave headroom for the per-page PanicHeader (Base45-encoded ~12 chars).
-static constexpr uint32_t QR_MAX_ALPHANUMERIC_CHARS = 3000;
+// Target QR density: QR version 20 = 97 modules — a comfortable scan density on
+// a 1080p screen without enlarging the window.
+//
+// NOTE (bug fix): the previous value 3000 was commented "Version 25 = 117
+// modules / 3057 chars", but that capacity figure was wrong by ~8 versions.
+// 3000 alphanumeric chars at Low ECC actually needs QR *version 33* (149
+// modules), which is exactly why real panics rendered ~151 modules and were too
+// dense to scan (Ian's report). qrcodegen alphanumeric-Low capacity by version:
+//   v15=758  v18=1046  v20=1249  v22=1460  v25=1853  v33=3009
+// Fewer chars/page => lower version => fewer modules => more, less-dense pages
+// (accommodated by QR_MAX_PAGES). 1200 stays safely under the v20 cap (1249).
+static constexpr uint32_t QR_MAX_ALPHANUMERIC_CHARS = 1200;  // ~QR version 20 (97 modules)
 
 // Max binary payload bytes per page (before Base45 expansion).
 // Base45 expands 2 bytes → 3 chars, so maxBytes ≈ maxChars * 2 / 3
@@ -581,7 +588,7 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
     // Use v2 (compressed) or v1 (raw) version in QR headers.
     uint8_t qrVersion = (dataToEncode == compressedBuf) ? QR_VERSION : QR_VERSION_RAW;
 
-    uint32_t payloadModules = 117 + 2 * QR_BORDER_WIDTH; // version-25 cap (safe fallback)
+    uint32_t payloadModules = 97 + 2 * QR_BORDER_WIDTH;  // version-20 cap (safe fallback)
     uint32_t urlModules     = 33  + 2 * QR_BORDER_WIDTH; // ~version-4 URL QR (est fallback)
     uint8_t  payloadQrVer   = 0;                         // uniform version (0 = auto)
     {

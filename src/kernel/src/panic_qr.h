@@ -113,7 +113,12 @@ static constexpr uint32_t QR_START_Y                 = 50;
 static constexpr int      QR_BORDER_WIDTH            = 1;    // 1-module quiet zone (compact; Ian's request)
 static constexpr int      QR_CONTRAST                = 2;
 static constexpr bool     QR_INVERT_MODULES          = false;
-static constexpr uint8_t  QR_MAX_PAGES               = 4;
+// Max temporal pages the payload may span. Raised 4->8 alongside the lower
+// per-page density (QR_MAX_ALPHANUMERIC_CHARS ~= v20): fewer bytes/page means a
+// given payload needs more pages, and pages beyond this cap are silently dropped
+// (see PanicRenderQR pagination), so the cap must grow with the density drop.
+// Typical LZ4-compressed panic ~3.7 KB => ~5 pages at v20; 8 leaves headroom.
+static constexpr uint8_t  QR_MAX_PAGES               = 8;
 
 // Packet header
 struct __attribute__((packed)) PanicHeader {
