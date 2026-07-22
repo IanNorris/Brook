@@ -11,6 +11,7 @@
 #include "scheduler.h"
 #include "spinlock.h"
 #include "sync/futex_waiter_pool.h"
+#include "sync/kmutex.h"
 #include "string.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
@@ -916,6 +917,13 @@ static uint32_t PageCachePreload(Vnode* vn, uint64_t startPageIdx,
     return totalCached;
 }
 
+// Striped per-file-identity locks serializing on-demand mmap readahead, so
+// concurrent faulters on the same file don't each issue the same cluster read.
+// Zero-initialised KMutex == unlocked (KMutexInit just zeroes), so the static
+// BSS array needs no explicit init. Hashed by cacheId to avoid touching Vnode.
+static constexpr uint32_t RA_LOCKS = 64;
+static KMutex g_readaheadLocks[RA_LOCKS];
+
 // Demand-page a private file-backed mapping.  File VMAs own a Vnode reference,
 // so the backing remains valid even after userspace closes the original fd.
 // Uses the global page cache for sharing and 64KB read-ahead.
@@ -979,6 +987,45 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
 
         // Check page cache first (another process may have loaded this page)
         PhysicalAddress cached = PageCacheLookup(vn, filePageIdx);
+
+        // BRO q2-io: on-demand mmap cluster readahead. A dynamically-linked
+        // (glibc) app like yquake2 demand-pages large mmap'd files (its pak +
+        // shared libs) one 4KB page per fault — each a blocking single-block
+        // disk round-trip (measured ~8000 per load vs ~0 for the statically-
+        // minimal native port, the bulk of a ~30x slower load). On a miss, pull
+        // a 256KB file-aligned cluster around the fault into the page cache in
+        // one shot: PageCachePreload issues 64KB VfsReads which ext2 coalesces
+        // into a few contiguous device reads, so subsequent sequential faults
+        // hit the cache instead of the disk. Serialized per file identity
+        // (striped KMutex) so concurrent faulters don't redundantly read the
+        // same cluster; PageCacheInsert already dedups races. If the page is
+        // still not resident afterwards (sparse hole / past EOF), fall through
+        // to the single-page read below.
+        if (!cached) {
+            static constexpr uint64_t RA_WINDOW = 64;      // 256KB
+            uint64_t clusterStart = filePageIdx & ~(RA_WINDOW - 1);
+            uint64_t vmaFirstPage = m.offset / 4096;
+            if (clusterStart < vmaFirstPage) clusterStart = vmaFirstPage;
+
+            KMutex* raLock = &g_readaheadLocks[vn->cacheId & (RA_LOCKS - 1)];
+            KMutexLock(raLock);
+            // Re-check: another CPU may have filled our page while we waited.
+            cached = PageCacheLookup(vn, filePageIdx);
+            if (!cached) {
+                VnodeStat st;
+                if (VfsStat(vn, &st) == 0 && st.size > 0) {
+                    uint64_t vmaLastPage = (m.offset + m.length + 4095) / 4096;
+                    uint64_t winEnd = clusterStart + RA_WINDOW;
+                    if (winEnd > vmaLastPage) winEnd = vmaLastPage;
+                    if (winEnd > clusterStart)
+                        PageCachePreload(vn, clusterStart, st.size,
+                                         static_cast<uint32_t>(winEnd - clusterStart));
+                }
+                cached = PageCacheLookup(vn, filePageIdx);
+            }
+            KMutexUnlock(raLock);
+        }
+
         if (cached) {
             __atomic_fetch_add(&g_profCacheHit, 1, __ATOMIC_RELAXED);
             if (!VmmMapPage(proc->pageTable, VirtualAddress(pageVA), cached,
@@ -1962,6 +2009,40 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// q2-io diagnostics: read-syscall counters + periodic IOSTAT serial dump.
+// Characterises a load's read pattern (count, total bytes, size histogram) and
+// the ext2 cache/device behaviour, so we can compare yq2 vs the native port
+// without the CPU-profiler's own disk-write confound. Dumps every 25k reads.
+// ---------------------------------------------------------------------------
+extern volatile uint64_t g_lapicTickCount;
+void Ext2GetIoStats(uint64_t* hits, uint64_t* misses, uint64_t* devReads, uint64_t* devBytes);
+
+static volatile uint64_t g_sysReadCount;
+static volatile uint64_t g_sysReadBytes;
+static volatile uint64_t g_sysReadHist[7];  // <64 <256 <1K <4K <16K <64K >=64K
+
+static inline void IoStatCountRead(uint64_t count)
+{
+    uint32_t b = count < 64 ? 0 : count < 256 ? 1 : count < 1024 ? 2 :
+                 count < 4096 ? 3 : count < 16384 ? 4 : count < 65536 ? 5 : 6;
+    __atomic_fetch_add(&g_sysReadHist[b], 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_sysReadBytes, count, __ATOMIC_RELAXED);
+    uint64_t n = __atomic_add_fetch(&g_sysReadCount, 1, __ATOMIC_RELAXED);
+    if (n % 25000 == 0) {
+        uint64_t h = 0, m = 0, dr = 0, db = 0;
+        Ext2GetIoStats(&h, &m, &dr, &db);
+        SerialPrintf("IOSTAT t=%lu reads=%lu rby=%lu ext2[hit=%lu miss=%lu devrd=%lu devby=%lu] "
+                     "hist=[%lu %lu %lu %lu %lu %lu %lu]\n",
+                     (unsigned long)g_lapicTickCount, (unsigned long)n, (unsigned long)g_sysReadBytes,
+                     (unsigned long)h, (unsigned long)m, (unsigned long)dr, (unsigned long)db,
+                     (unsigned long)g_sysReadHist[0], (unsigned long)g_sysReadHist[1],
+                     (unsigned long)g_sysReadHist[2], (unsigned long)g_sysReadHist[3],
+                     (unsigned long)g_sysReadHist[4], (unsigned long)g_sysReadHist[5],
+                     (unsigned long)g_sysReadHist[6]);
+    }
+}
+
 // sys_read (0)
 // ---------------------------------------------------------------------------
 
@@ -1970,6 +2051,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
+    IoStatCountRead(count);
     // Pin the slot for the whole operation: the pipe/socket/tty/timerfd/eventfd
     // paths below block while holding fde->handle, so a bare FdGet would expose
     // a use-after-free if a sibling closes the fd (BRO-156). The guard's

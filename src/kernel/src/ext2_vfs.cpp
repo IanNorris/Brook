@@ -283,6 +283,12 @@ void Ext2ForceUnlockForPid(uint32_t pid)
 // Device I/O helpers
 // ---------------------------------------------------------------------------
 
+// Actual device (virtio) reads issued on cache miss — the blocking disk
+// round-trips that dominate an I/O-bound load. (BRO q2-io diagnostics.)
+// Defined here (before Ext2DevRead) so the read path can increment them.
+volatile uint64_t g_ext2DevReads;
+volatile uint64_t g_ext2DevBytes;
+
 // Read exactly `len` bytes from device at `byteOffset`.
 static bool Ext2DevRead(Ext2Mount* mnt, uint64_t byteOffset, void* buf, uint64_t len)
 {
@@ -292,6 +298,8 @@ static bool Ext2DevRead(Ext2Mount* mnt, uint64_t byteOffset, void* buf, uint64_t
         SerialPrintf("ext2: DevRead FAIL off=%llu len=%llu got=%d\n", byteOffset, len, r);
         return false;
     }
+    __atomic_fetch_add(&g_ext2DevReads, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_ext2DevBytes, len, __ATOMIC_RELAXED);
     return true;
 }
 
@@ -425,6 +433,17 @@ static void Ext2DirentCacheInvalidateParent(Ext2Mount* mnt, uint32_t parentIno)
 // Cache hit/miss counters (atomic, lock-free) for diagnostics.
 volatile uint64_t g_blockCacheHits;
 volatile uint64_t g_blockCacheMisses;
+
+// Expose the ext2 I/O counters to other TUs (syscall.cpp IOSTAT dump).
+// (g_ext2DevReads/g_ext2DevBytes are defined earlier, before Ext2DevRead.)
+void Ext2GetIoStats(uint64_t* hits, uint64_t* misses,
+                    uint64_t* devReads, uint64_t* devBytes)
+{
+    if (hits)     *hits     = g_blockCacheHits;
+    if (misses)   *misses   = g_blockCacheMisses;
+    if (devReads) *devReads = g_ext2DevReads;
+    if (devBytes) *devBytes = g_ext2DevBytes;
+}
 
 static inline uint32_t Ext2BlockCacheSlot(uint32_t blockNum)
 {
