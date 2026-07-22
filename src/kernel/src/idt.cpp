@@ -16,6 +16,7 @@
 #include "ksym_addrs.h"
 #include "exception_info.h"
 #include "build_info.h"
+#include "switch_txn.h"     // BRO-208: note faults taken while a switch is in flight
 #include "tty.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
@@ -819,6 +820,14 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
     // lookup is safe. (#PF/#GP both arrive here via ExceptionStub13/14.)
     if (brook::PanicExtableFixup(&ef->rip))
         return;
+
+    // BRO-208: if this fault landed while a context switch is in flight on this
+    // CPU, record it against that CPU's SwitchTxn. After the IF=0 audit, an
+    // exception/NMI is the ONLY thing that can divert a switch, so this is the
+    // decisive discriminator on a subsequent ownership-guard trip. Cheap no-op
+    // when no switch is in flight; must run before the panic-active halt below.
+    brook::Bro208NoteFaultDuringSwitch(static_cast<uint32_t>(vector),
+                                       ef->rip, ef->rflags, ef->rsp);
 
     // If a panic is already active, this CPU must not produce output or
     // render a panic screen — it would garble the panicking CPU's work.

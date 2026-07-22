@@ -22,6 +22,8 @@
 //   offset 72: cr3
 //   offset 80: fsBase
 
+#include "switch_txn.h"     // BRO-208: SwitchTxn field offsets + SWP_* phases
+
 .text
 .global context_switch
 .type context_switch, @function
@@ -30,12 +32,17 @@ context_switch:
     // RDI = old SavedContext*, RSI = new SavedContext*
     // RDX = old FxsaveArea*,  RCX = new FxsaveArea*
     // R8  = &oldProc->runningOnCpu; published as -1 only after old context is saved
+    // R9  = SwitchTxn* (BRO-208 tracer) — kept live for the whole switch.
+
+    // BRO-208: mark the switch in flight. R9 (SwitchTxn*) is untouched below.
+    movq $SWP_ENTRY, TXN_PHASE(%r9)
 
     // --- Save x87/SSE/AVX state first (before any vector clobber) ---
-    movq %rdx, %r9
+    // Stash oldFx in R10 (caller-saved, free) — R9 now holds the SwitchTxn*.
+    movq %rdx, %r10
     movl $0x7, %eax              // XCR0 mask: x87 | SSE | AVX
     xorl %edx, %edx
-    xsave64 (%r9)
+    xsave64 (%r10)
 
     // --- Save callee-saved GPRs ---
     movq %r15,  0(%rdi)
@@ -76,6 +83,7 @@ context_switch:
     // fully saved. Publishing this earlier lets another CPU schedule it from a
     // stale SavedContext while this CPU is still inside context_switch.
     movl $-1, (%r8)
+    movq $SWP_OLD_RELEASED, TXN_PHASE(%r9)
 
     // --- Restore new context ---
 
@@ -86,6 +94,7 @@ context_switch:
     je .Lsame_cr3
     movq %rax, %cr3
 .Lsame_cr3:
+    movq $SWP_CR3_DONE, TXN_PHASE(%r9)
 
     // Set FS base (IA32_FS_BASE = 0xC0000100)
     movq 80(%rsi), %rax
@@ -127,6 +136,25 @@ context_switch:
     movq 32(%rsi), %rbx
     movq 40(%rsi), %rbp
 
+    // BRO-208 self-verify — immediately before the irreversible RSP commit.
+    // Prove the restore SOURCE (RSI) and the RSP/RIP we are about to load match
+    // what C++ published for THIS switch (SwitchTxnBegin snapshot). A mismatch
+    // means we are about to resume the wrong thread; panic AT the tear with full
+    // evidence rather than tripping the ownership guard a timer-tick later.
+    // R9 = SwitchTxn* (live since entry); RSI = new SavedContext*. RAX/RCX free.
+    movq %rsi, TXN_LIVE_CTX(%r9)
+    movq 48(%rsi), %rax
+    movq %rax, TXN_OBSERVED_RSP(%r9)
+    movq 56(%rsi), %rcx
+    movq %rcx, TXN_OBSERVED_RIP(%r9)
+    cmpq TXN_EXPECTED_CTX(%r9), %rsi
+    jne .Lswitch_tear
+    cmpq TXN_EXPECTED_RSP(%r9), %rax
+    jne .Lswitch_tear
+    cmpq TXN_EXPECTED_RIP(%r9), %rcx
+    jne .Lswitch_tear
+    movq $SWP_VALIDATED, TXN_PHASE(%r9)
+
     // Restore stack pointer
     movq 48(%rsi), %rsp
 
@@ -150,6 +178,22 @@ context_switch:
 
 .Lresume:
     // Switched back to this context. C++ call frame is intact.
+    // R9 = SwitchTxn* of the switch that resumed us; mark transfer complete.
+    movq $SWP_RESUME, TXN_PHASE(%r9)
     ret
+
+    // BRO-208 tear handler — reached only when the pre-commit self-verify fails.
+    // We have NOT yet committed RSP (still on the outgoing thread's kernel stack,
+    // which is kernel-half and mapped under the just-loaded CR3), IF is about to
+    // be forced 0, and R9 still points at the SwitchTxn holding all evidence.
+.Lswitch_tear:
+    movq $SWP_TEAR, TXN_PHASE(%r9)
+    cli
+    movq %r9, %rdi              // arg0 = SwitchTxn*
+    call Bro208SwitchTearPanic  // does not return
+.Lswitch_tear_hlt:
+    cli
+    hlt
+    jmp .Lswitch_tear_hlt
 
 .size context_switch, . - context_switch

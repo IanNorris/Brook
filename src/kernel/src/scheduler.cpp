@@ -19,6 +19,7 @@
 #include "profiler.h"
 #include "device.h"
 #include "sync/krwlock.h"
+#include "switch_txn.h"
 
 #include <stdint.h>
 
@@ -32,7 +33,8 @@ extern "C" void FutexDumpTrace(uint16_t tgidFilter, uint32_t maxEntries);
 // Context switch — implemented in context_switch.S
 extern "C" void context_switch(brook::SavedContext* oldCtx, brook::SavedContext* newCtx,
                                 brook::FxsaveArea* oldFx, brook::FxsaveArea* newFx,
-                                volatile int32_t* oldRunningOnCpu);
+                                volatile int32_t* oldRunningOnCpu,
+                                brook::SwitchTxn* txn);
 
 // Futex wake — implemented in syscall.cpp, called for clear_child_tid on thread exit
 extern "C" int64_t FutexWake(uint64_t owner, uint64_t uaddr, uint32_t maxWake,
@@ -659,6 +661,40 @@ static constexpr uint32_t OWN_RING = 16;   // per-CPU history depth
 static OwnTraceRec g_ownRing[SCHED_MAX_CPUS][OWN_RING];
 static uint64_t    g_ownSeq[SCHED_MAX_CPUS];   // per-CPU monotonic (single-writer)
 
+// BRO-208 self-verifying switch transaction — one slot per CPU (single-writer
+// on the hot path). context_switch.S updates .phase / .live* in place and does
+// the pre-RSP-commit self-verify; the fields are declared in switch_txn.h with
+// offsets the asm references directly.
+brook::SwitchTxn g_switchTxn[SCHED_MAX_CPUS];
+
+// Fill the expected-* snapshot for CPU `cpu`'s upcoming switch to `newP`, and
+// return the slot to hand to context_switch (6th arg). Runs with IF=0 on the
+// switch path, immediately before context_switch. Single-writer per CPU.
+__attribute__((always_inline))
+static inline brook::SwitchTxn* SwitchTxnBegin(uint32_t cpu, Process* oldP, Process* newP)
+{
+    brook::SwitchTxn& t = g_switchTxn[cpu];
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    uint64_t fl;
+    __asm__ volatile("pushfq; pop %0" : "=r"(fl));
+    t.generation++;
+    t.phase          = SWP_PREPARED;
+    t.expectedNewCtx = reinterpret_cast<uint64_t>(&newP->savedCtx);
+    t.expectedRsp    = newP->savedCtx.rsp;
+    t.expectedRip    = newP->savedCtx.rip;
+    t.expectedCr3    = newP->savedCtx.cr3;
+    t.oldProc        = reinterpret_cast<uint64_t>(oldP);
+    t.newProc        = reinterpret_cast<uint64_t>(newP);
+    t.liveNewCtx     = 0;
+    t.observedRsp    = 0;
+    t.observedRip    = 0;
+    t.tscEntry       = (static_cast<uint64_t>(hi) << 32) | lo;
+    t.entryIf        = static_cast<uint32_t>((fl >> 9) & 1);
+    t.cpu            = cpu;
+    return &t;
+}
+
 __attribute__((noinline, no_instrument_function))
 static void OwnTraceRecord(uint32_t cpu, Process* oldP, Process* newP,
                            uint8_t reason, void* ra)
@@ -722,6 +758,125 @@ static void OwnTraceDump(uint32_t cpu)
                      reinterpret_cast<void*>(r.oldProc),
                      reinterpret_cast<void*>(r.newProc));
     }
+}
+
+// Human-readable name for a SwitchTxn.phase value.
+static const char* SwitchPhaseName(uint64_t p)
+{
+    switch (p) {
+    case SWP_IDLE:         return "IDLE";
+    case SWP_PREPARED:     return "PREPARED";
+    case SWP_ENTRY:        return "ENTRY";
+    case SWP_OLD_RELEASED: return "OLD_RELEASED";
+    case SWP_CR3_DONE:     return "CR3_DONE";
+    case SWP_VALIDATED:    return "VALIDATED";
+    case SWP_RESUME:       return "RESUME";
+    case SWP_TEAR:         return "TEAR";
+    default:               return "?";
+    }
+}
+
+// Dump the per-CPU switch transaction for every online CPU (called from the
+// BRO-208 panic paths). All reads are plain — we are already panicking.
+__attribute__((noinline))
+static void SwitchTxnDump(uint32_t focusCpu)
+{
+    uint32_t nCpu = SmpGetCpuCount();
+    if (nCpu > SCHED_MAX_CPUS) nCpu = SCHED_MAX_CPUS;
+    SerialPrintf("  --- switch transactions (BRO-208 SwitchTxn) ---\n");
+    for (uint32_t c = 0; c < nCpu; c++) {
+        const brook::SwitchTxn& t = g_switchTxn[c];
+        if (t.generation == 0 && t.phase == SWP_IDLE) continue;   // never used
+        const char* mark = (c == focusCpu) ? "*" : " ";
+        SerialPrintf("  %sCPU%u gen=%lu phase=%s(%lu) drainGen=%lu entryIF=%u\n",
+                     mark, c, t.generation, SwitchPhaseName(t.phase), t.phase,
+                     t.drainGeneration, t.entryIf);
+        SerialPrintf("      old=%p new=%p expCtx=0x%lx expRsp=0x%lx expRip=0x%lx expCr3=0x%lx\n",
+                     reinterpret_cast<void*>(t.oldProc), reinterpret_cast<void*>(t.newProc),
+                     t.expectedNewCtx, t.expectedRsp, t.expectedRip, t.expectedCr3);
+        SerialPrintf("      liveCtx=0x%lx obsRsp=0x%lx obsRip=0x%lx tscEntry=%lu\n",
+                     t.liveNewCtx, t.observedRsp, t.observedRip, t.tscEntry);
+        if (t.faultCount) {
+            const char* sym = nullptr; uint64_t off = 0;
+            brook::KsymFindByAddr(t.faultRip, &sym, &off);
+            SerialPrintf("      !! FAULT-DURING-SWITCH count=%u vec=%u rip=0x%lx %s+0x%lx "
+                         "rflags=0x%lx rsp=0x%lx\n",
+                         t.faultCount, t.faultVector, t.faultRip,
+                         sym ? sym : "?", off, t.faultRflags, t.faultRsp);
+        }
+        // Interpretation hint for the focus CPU (the one that tripped the guard).
+        if (c == focusCpu) {
+            bool drainRan = (t.drainGeneration == t.generation);
+            const char* verdict =
+                (t.phase == SWP_TEAR)               ? "restore SOURCE/values wrong (caught at commit)"
+              : (t.faultCount)                       ? "exception/NMI diverted an in-flight switch"
+              : (!drainRan && t.phase == SWP_RESUME) ? "transfer completed but DrainPostSwitch was BYPASSED (diversion)"
+              : (t.phase == SWP_RESUME && drainRan)  ? "switch + drain both completed normally for this gen"
+              : "switch left in-flight (phase < RESUME)";
+            SerialPrintf("      => %s\n", verdict);
+        }
+    }
+}
+
+// Called from context_switch.S (.Lswitch_tear) when the pre-RSP-commit
+// self-verify fails: the restore source (RSI) or the RSP/RIP about to be loaded
+// do not match what SwitchTxnBegin published. We are AT the tear — dump full
+// evidence and halt. Runs on the outgoing thread's (kernel-half) stack under the
+// newly-loaded CR3, IF=0, with GPRs partially restored; `t` (from RDI) carries
+// everything needed, so we do not rely on register state.
+extern "C" __attribute__((noinline)) void Bro208SwitchTearPanic(brook::SwitchTxn* t)
+{
+    __asm__ volatile("cli");
+    uint32_t cpu = t ? t->cpu : 0xFFFFFFFFu;
+    SerialPrintf("\n!!! BRO-208 SWITCH TEAR (caught at RSP-commit) on CPU%u\n", cpu);
+    if (t) {
+        const char* eSym = nullptr; uint64_t eOff = 0;
+        const char* oSym = nullptr; uint64_t oOff = 0;
+        brook::KsymFindByAddr(t->expectedRip, &eSym, &eOff);
+        brook::KsymFindByAddr(t->observedRip, &oSym, &oOff);
+        SerialPrintf("!!!  the switch was about to load a context that is NOT the one C++ published:\n");
+        SerialPrintf("!!!    expected newCtx=0x%lx rsp=0x%lx rip=0x%lx (%s+0x%lx)\n",
+                     t->expectedNewCtx, t->expectedRsp, t->expectedRip, eSym ? eSym : "?", eOff);
+        SerialPrintf("!!!    LIVE     newCtx=0x%lx rsp=0x%lx rip=0x%lx (%s+0x%lx)\n",
+                     t->liveNewCtx, t->observedRsp, t->observedRip, oSym ? oSym : "?", oOff);
+        const char* which =
+            (t->liveNewCtx != t->expectedNewCtx) ? "RSI (restore source) was corrupted/aliased"
+          : (t->observedRip == t->expectedRip && t->observedRsp == t->expectedRsp)
+                                                 ? "(values now match — transient?)"
+          : "newProc->savedCtx was overwritten between snapshot and commit";
+        SerialPrintf("!!!    discriminator: %s\n", which);
+        SerialPrintf("!!!    oldProc=%p newProc=%p gen=%lu faultCount=%u\n",
+                     reinterpret_cast<void*>(t->oldProc), reinterpret_cast<void*>(t->newProc),
+                     t->generation, t->faultCount);
+    }
+    if (cpu < SCHED_MAX_CPUS) {
+        SwitchTxnDump(cpu);
+        OwnTraceDump(cpu);
+    }
+    SerialPrintf("!!! halting CPU%u — switch tear caught before the wrong thread ran\n", cpu);
+    for (;;) __asm__ volatile("cli; hlt");
+}
+
+// Called from HandleExceptionFull (IF=0) so a fault/NMI taken while a switch is
+// in flight on this CPU is recorded against that CPU's SwitchTxn. After the
+// IF=0 audit this is the ONLY asynchronous vector that can divert a switch, so a
+// nonzero faultCount on a torn switch is the decisive discriminator.
+// (This TU is already inside `namespace brook`, so this defines brook::…)
+void Bro208NoteFaultDuringSwitch(uint32_t vector, uint64_t rip,
+                                 uint64_t rflags, uint64_t rsp)
+{
+    uint32_t cpu = SmpCurrentCpuIndex();
+    if (cpu >= SCHED_MAX_CPUS) return;
+    SwitchTxn& t = g_switchTxn[cpu];
+    uint64_t ph = t.phase;
+    // In-flight = past PREPARED and not yet back to RESUME. (PREPARED itself is
+    // pre-asm and cannot be interrupted mid-switch, so exclude it.)
+    if (ph < SWP_ENTRY || ph > SWP_VALIDATED) return;
+    t.faultVector = vector;
+    t.faultRip    = rip;
+    t.faultRflags = rflags;
+    t.faultRsp    = rsp;
+    t.faultCount  = t.faultCount + 1;
 }
 
 // BRO-208 self-contained QR blob (format 1). Packs everything the frozen-VM
@@ -891,6 +1046,7 @@ static void CoreOwnershipPanic(uint32_t fail, uint32_t cpu, uint32_t argCpu,
     } else { nm[0] = '?'; nm[1] = '\0'; }
 
     OwnTraceDump(cpu);   // replay the last N currentProcess writes → names the stale writer
+    SwitchTxnDump(cpu);  // BRO-208: switch-phase transaction (was it torn? drain bypassed? fault mid-switch?)
 
     // BRO-208: embed the full crime-scene into the panic QR so the capture is
     // self-contained (no live monitor dump needed). Layout is format 1 below.
@@ -1004,6 +1160,12 @@ static void DrainPostSwitch(uint32_t cpu)
     }
 
 #ifndef BROOK_HOST_TEST
+    // BRO-208: record that DrainPostSwitch ran for the switch generation on this
+    // CPU. If the ownership guard later trips with drainGeneration < generation,
+    // the normal resume path (.Lresume -> ret -> here) was BYPASSED — implicating
+    // an interrupt/exception-return diversion over a plain restore-source stomp.
+    g_switchTxn[cpu].drainGeneration = g_switchTxn[cpu].generation;
+
     // BRO-208: verify this CPU actually owns the thread it thinks it's running,
     // and that we're on that thread's kernel stack — before touching any per-CPU
     // state. `argCpu` is the (possibly corrupt) passed value, kept for evidence.
@@ -2098,7 +2260,8 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
 
     context_switch(&oldProc->savedCtx, &newProc->savedCtx,
                    &oldProc->fxsave, &newProc->fxsave,
-                   &oldProc->runningOnCpu);
+                   &oldProc->runningOnCpu,
+                   SwitchTxnBegin(cpu, oldProc, newProc));
 
     // --- We return here when another CPU (or this one) switches back to us ---
 
@@ -2629,7 +2792,8 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     ProfilerContextSwitch(proc->pid, next->pid);
     context_switch(&proc->savedCtx, &next->savedCtx,
                    &proc->fxsave, &next->fxsave,
-                   &proc->runningOnCpu);
+                   &proc->runningOnCpu,
+                   SwitchTxnBegin(cpu, proc, next));
 
     __builtin_unreachable();
 }
