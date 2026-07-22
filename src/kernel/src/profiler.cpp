@@ -438,12 +438,23 @@ struct ProfileWriter {
     uint64_t fileOff;
     uint32_t bufPos;
     uint32_t written;   // total sample lines written so far
+    bool     writeError; // set once VfsWrite short-writes (e.g. disk full)
 };
 
 static void ProfileWriterFlush(ProfileWriter& pw)
 {
     if (pw.bufPos > 0) {
-        VfsWrite(pw.file, pw.buf, pw.bufPos, &pw.fileOff);
+        int wrote = VfsWrite(pw.file, pw.buf, pw.bufPos, &pw.fileOff);
+        // A short write means the backing store rejected data — almost always a
+        // full /boot disk. Without this the profiler would silently produce a
+        // 0-byte (or truncated) PROF file yet still print "done", which is
+        // exactly what masked a full-disk condition. Warn once, loudly.
+        if (wrote != static_cast<int>(pw.bufPos) && !pw.writeError) {
+            pw.writeError = true;
+            SerialPrintf("PROFILER: WRITE FAILED (wrote %d of %u bytes) — profile "
+                         "will be truncated/empty. Is /boot full?\n",
+                         wrote, pw.bufPos);
+        }
         pw.bufPos = 0;
     }
 }
@@ -471,6 +482,7 @@ static bool ProfileWriterOpen(ProfileWriter& pw)
     pw.fileOff  = 0;
     pw.bufPos   = 0;
     pw.written  = 0;
+    pw.writeError = false;
 
     if (!pw.file) {
         SerialPrintf("PROFILER: failed to create %s\n", profPath);
