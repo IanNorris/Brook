@@ -49,6 +49,7 @@ uint32_t ModuleDiscoverAndLoad(const char* dirPath);
 struct ModuleSnapshot {
     const char* name;
     const char* version;
+    uint64_t    baseVirt;   // VMM load base (0 if inactive) — for symbolication
     uint64_t    sizeBytes;  // pageCount * 4096
     bool        active;
 };

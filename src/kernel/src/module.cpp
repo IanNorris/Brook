@@ -656,6 +656,7 @@ ModuleSnapshot ModuleSnapshotAt(uint32_t idx)
     if (!m.active || !m.info) return snap;
     snap.name = m.info->name;
     snap.version = m.info->version;
+    snap.baseVirt = m.baseVirt;
     snap.sizeBytes = m.pageCount * 4096;
     return snap;
 }

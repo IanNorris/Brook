@@ -1,0 +1,6 @@
+# Boot into Quake 2 with the sampling profiler capturing the first 15s
+# (validates deeper/user-mode stack walking + PROF_MOD module dump).
+set vfb 640x480
+set scale 1
+profile 15
+run /data/games/quake2/quake2 +set basedir /data/games/quake2 +set sw_mode 2

@@ -22,6 +22,8 @@
 #include "vfs.h"
 #include "rtc.h"
 #include "memory/heap.h"
+#include "panic_probe.h"   // PanicSafeReadU64 — fault-safe frame-pointer walk
+#include "module.h"        // ModuleSnapshot — emit module bases for symbolication
 
 // LAPIC tick counter (defined in apic.cpp).
 namespace brook { extern volatile uint64_t g_lapicTickCount; }
@@ -34,7 +36,7 @@ namespace brook {
 
 enum class ProfileEventType : uint8_t { Sample = 0, ContextSwitch = 1 };
 
-static constexpr uint32_t MAX_STACK_DEPTH = 8;
+static constexpr uint32_t MAX_STACK_DEPTH = 16;
 
 struct ProfileSample {
     ProfileEventType type;
@@ -139,26 +141,34 @@ void ProfilerSample(uint64_t interruptedRip, uint64_t interruptedCs, uint64_t in
     s.rip[0] = interruptedRip;
     uint8_t depth = 1;
 
-    // Walk frame pointer chain for kernel-mode samples only.
-    // User-mode RBP might be invalid or in a different address space.
-    if (!userMode && interruptedRbp != 0) {
+    // Walk the frame-pointer chain. Reads go through PanicSafeReadU64 so a wild
+    // or paged-out RBP can never fault the profiler ISR (its .panic_extable fixup
+    // turns a fault into a clean failure, handled at the top of HandleExceptionFull
+    // before any panic-state check). This lets us cross into user frames too: for a
+    // ring-3 sample the interrupted process's CR3 is live here, so user stack pages
+    // that are present are readable; absent pages simply truncate the walk.
+    if (interruptedRbp != 0) {
+        constexpr uint64_t KERNEL_BASE   = 0xffffffff80000000ULL;
+        constexpr uint64_t USER_CANON_MAX = 0x0000800000000000ULL; // exclusive
         uint64_t rbp = interruptedRbp;
-        // Kernel addresses are >= 0xffffffff80000000
-        constexpr uint64_t KERNEL_BASE = 0xffffffff80000000ULL;
-        constexpr uint64_t KERNEL_END  = 0xffffffffffffffffULL;
+        // A frame address is plausible if it is either a kernel-half address or a
+        // canonical low-half (user) address, and 8-byte aligned.
+        auto plausible = [](uint64_t a) -> bool {
+            if (a & 7) return false;
+            return (a >= KERNEL_BASE) || (a != 0 && a < USER_CANON_MAX);
+        };
         while (depth < MAX_STACK_DEPTH) {
-            // Validate RBP is in kernel range and aligned
-            if (rbp < KERNEL_BASE || rbp >= KERNEL_END - 16 || (rbp & 7) != 0)
-                break;
-            // RBP points to: [saved_rbp, return_addr]
-            const uint64_t* frame = reinterpret_cast<const uint64_t*>(rbp);
-            uint64_t retAddr = frame[1];
-            if (retAddr < KERNEL_BASE || retAddr >= KERNEL_END)
+            if (!plausible(rbp)) break;
+            uint64_t savedRbp = 0, retAddr = 0;
+            // frame layout: [rbp+0]=saved RBP, [rbp+8]=return address
+            if (!PanicSafeReadU64(rbp, &savedRbp)) break;
+            if (!PanicSafeReadU64(rbp + 8, &retAddr)) break;
+            // Return address must be a plausible text pointer (kernel or user).
+            if (!((retAddr >= KERNEL_BASE) || (retAddr != 0 && retAddr < USER_CANON_MAX)))
                 break;
             s.rip[depth++] = retAddr;
-            uint64_t nextRbp = frame[0];
-            if (nextRbp <= rbp) break; // stack grows down; prevent loops
-            rbp = nextRbp;
+            if (savedRbp <= rbp) break;   // stack grows down; prevent loops
+            rbp = savedRbp;
         }
     }
     s.depth = depth;
@@ -484,6 +494,28 @@ static bool ProfileWriterOpen(ProfileWriter& pw)
     p = AppendDec(hdr, p, static_cast<uint32_t>(g_profilerStartTick));
     hdr[p++] = '\n';
     ProfileWriterAppend(pw, hdr, p);
+
+    // BRO profiler: emit the module map so the host resolver can attribute
+    // module-range RIPs (kernel .mod code loaded at dynamic VMM bases) to real
+    // symbols. Format, one per active module:
+    //   PROF_MOD <baseVirt_hex> <sizeBytes_hex> <name>
+    // Emitted once, right after PROF_BEGIN, capturing modules already loaded at
+    // profile start (load/unload during a capture is rare — boot loads them all).
+    uint32_t modSlots = ModuleMaxSlots();
+    for (uint32_t i = 0; i < modSlots; i++) {
+        ModuleSnapshot ms = ModuleSnapshotAt(i);
+        if (!ms.active || !ms.name || ms.baseVirt == 0) continue;
+        char mline[128]; uint32_t mp = 0;
+        mp = AppendStr(mline, mp, "PROF_MOD ");
+        mp = AppendHex16(mline, mp, ms.baseVirt);
+        mline[mp++] = ' ';
+        mp = AppendHex16(mline, mp, ms.sizeBytes);
+        mline[mp++] = ' ';
+        for (const char* c = ms.name; *c && mp < (uint32_t)sizeof(mline) - 2; ++c)
+            mline[mp++] = *c;
+        mline[mp++] = '\n';
+        ProfileWriterAppend(pw, mline, mp);
+    }
     return true;
 }
 

@@ -134,15 +134,36 @@ def extract_from_disk(disk_img):
 MODULE_BASE = 0xFFFFFFFF90000000
 KERNEL_BASE = 0xFFFFFFFF80000000
 
+# Populated from PROF_MOD lines: list of (base, size, name), sorted by base.
+# Lets us attribute a module-region RIP to the SPECIFIC module (and offset)
+# rather than a single anonymous "module+0x..." bucket.
+_MODULES = []
+
+
+def set_modules(mods):
+    global _MODULES
+    _MODULES = sorted(mods, key=lambda m: m[0])
+
+
+def _module_for(rip):
+    for base, size, name in _MODULES:
+        if base <= rip < base + size:
+            return name, rip - base
+    return None
+
 
 def resolve_rip(rip, syms, sorted_addrs):
     """Resolve RIP to nearest symbol name, or hex string.
 
     Addresses in the loadable-module region (>= MODULE_BASE) and user-space
-    addresses (< KERNEL_BASE) are NOT covered by the kernel ELF symbol table;
-    label them honestly instead of mis-attributing them to the nearest kernel
-    symbol (which would report e.g. __etext+0xNNN for every module frame)."""
+    addresses (< KERNEL_BASE) are NOT covered by the kernel ELF symbol table.
+    Module-region RIPs are attributed to the specific module (name+offset) using
+    the PROF_MOD map when available, else a single anonymous module bucket; user
+    RIPs are labelled honestly instead of mis-attributing to a kernel symbol."""
     if rip >= MODULE_BASE:
+        hit = _module_for(rip)
+        if hit:
+            return f"{hit[0]}+0x{hit[1]:x}"
         return f"module+0x{rip - MODULE_BASE:x}"
     if rip < KERNEL_BASE:
         return f"user 0x{rip:x}"
@@ -180,6 +201,7 @@ def parse_serial_log(path):
     context_switches = []  # (tick, cpu, old_pid, new_pid)
     dropped = 0
     in_profile = False
+    modules = []  # (base, size, name) from PROF_MOD lines
 
     with open(path, 'rb') as f:
         for raw_line in f:
@@ -201,6 +223,19 @@ def parse_serial_log(path):
                 if len(parts) >= 3:
                     dropped = int(parts[2])
                 in_profile = False
+                continue
+
+            # PROF_MOD <baseVirt_hex> <sizeBytes_hex> <name>  (emitted after PROF_BEGIN)
+            if line.startswith('PROF_MOD'):
+                parts = line.split()
+                if len(parts) >= 4:
+                    try:
+                        base = int(parts[1], 16)
+                        size = int(parts[2], 16)
+                        name = parts[3]
+                        modules.append((base, size, name))
+                    except ValueError:
+                        pass
                 continue
 
             if in_profile:
@@ -226,7 +261,7 @@ def parse_serial_log(path):
                     cs_stack = [int(r, 16) for r in rip_str.split(';') if r] if rip_str else []
                     context_switches.append((tick, cpu, old_pid, new_pid, cs_stack))
 
-    return cpuCount, startTick, samples, context_switches, dropped
+    return cpuCount, startTick, samples, context_switches, dropped, modules
 
 
 def pid_label(pid):
@@ -378,14 +413,16 @@ def main():
         syms = load_symmap(symmap_path)
     sorted_addrs = sorted(syms.keys()) if syms else []
 
-    cpuCount, startTick, samples, context_switches, dropped = parse_serial_log(inpath)
+    cpuCount, startTick, samples, context_switches, dropped, modules = parse_serial_log(inpath)
+    set_modules(modules)
 
     if not samples and not context_switches:
         print("No profiler events found in log. Look for PROF_BEGIN/P/CS/PROF_END lines.")
         sys.exit(1)
 
     print(f"Parsed: {cpuCount} CPUs, {len(samples)} samples, "
-          f"{len(context_switches)} context switches, {dropped} dropped")
+          f"{len(context_switches)} context switches, {dropped} dropped, "
+          f"{len(modules)} modules")
 
     if folded:
         write_folded(outpath, samples, syms, sorted_addrs)
