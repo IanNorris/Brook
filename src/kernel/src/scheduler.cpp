@@ -2880,6 +2880,15 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
 
     if (!first) first = g_perCpu[cpu].idleProcess;
 
+    // BRO-224: from the moment we publish `first` as this CPU's currentProcess
+    // until we are actually running on `first`'s kernel stack, a LAPIC tick must
+    // not land — otherwise DrainPostSwitch's CoreOwnershipGuard sees currentProcess
+    // =first while liveRSP is still the transient AP-boot stack and trips COF_RSP.
+    // Hold IF=0 across publish + stack setup; each landing path below re-enables
+    // interrupts only once it is on the correct stack (idle: sti after movq %rsp;
+    // kernel thread: sti after movq %rsp; user: iretq restores user IF).
+    __asm__ volatile("cli");
+
     // Same as the BSP path: trace the AP's first assignment (local execution)
     // so this CPU's ownership ring is populated from boot (BRO-218).
     SchedSetCurrent(cpu, first, OWN_APSTART, __builtin_return_address(0));
@@ -2898,9 +2907,26 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     if (first == g_perCpu[cpu].idleProcess)
     {
         SerialPrintf("SCHED: CPU%u entering idle\n", cpu);
-        __asm__ volatile("sti");
-        for (;;)
-            __asm__ volatile("hlt" ::: "memory");
+        // BRO-224: run idle on ITS OWN designated stack (g_idleStacks[cpu]), not
+        // the transient AP-boot stack we happen to be called on. Previously this
+        // spun `hlt` here directly, so currentProcess=idle but RSP was the vmalloc
+        // AP-boot stack; the first LAPIC tick's DrainPostSwitch -> CoreOwnershipGuard
+        // then tripped COF_RSP (liveRSP outside idle's recorded [kernelStackBase,
+        // kernelStackTop)) and panicked as a BRO-208 core-ownership violation. Every
+        // other path enters idle via context_switch, which loads idle->savedCtx.rsp
+        // (= this same static stack); switch to it and enter IdleLoop the same way
+        // (mirrors the isKernelThread trampoline below and idle->savedCtx.rip).
+        uint64_t idleRsp = first->kernelStackTop - 16;
+        __asm__ volatile(
+            "movq %0, %%rsp\n\t"
+            "sti\n\t"
+            "call *%1\n\t"
+            "ud2\n\t"
+            :: "r"(idleRsp),
+               "r"(reinterpret_cast<uint64_t>(&IdleLoop))
+            : "memory"
+        );
+        __builtin_unreachable();
     }
 
     if (first->fsBase)
