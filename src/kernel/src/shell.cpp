@@ -139,6 +139,21 @@ const char* const g_defaultEnvp[] = {
     "SAL_LOG=+INFO.sfx.appl +ERR",
     "SDL_VIDEODRIVER=wayland",
     "SDL_AUDIODRIVER=alsa",
+    // Hardware GL via virtio-gpu/virgl. These point Mesa's loader at the
+    // deployed mesa store path so any GL app (gltron, SuperTuxKart, glxgears)
+    // gets a working EGL display REGARDLESS of how it's launched (launcher,
+    // terminal, or .rc script) — not just via the per-app play wrappers.
+    // MESA_LOADER_DRIVER_OVERRIDE forces the virtio_gpu DRI driver (correct on
+    // a virgl-only guest); it is read only by the Mesa loader, so non-GL and
+    // software-rendered apps (doom, quake2) ignore it. NB: audio-nulling
+    // (ALSOFT_DRIVERS/SDL_AUDIODRIVER=dummy) and writable HOME/XDG redirection
+    // stay in the per-app wrappers — globalising those would silence all audio
+    // and collide app state. Mesa hash matches the play wrappers; bump both if
+    // mesa is redeployed at a new store path.
+    "MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu",
+    "LIBGL_DRIVERS_PATH=/nix/store/b793hmy0383vxaax7hiaslzmizzd3pmg-mesa-26.0.6/lib/dri",
+    "GBM_BACKENDS_PATH=/nix/store/b793hmy0383vxaax7hiaslzmizzd3pmg-mesa-26.0.6/lib/gbm",
+    "__EGL_VENDOR_LIBRARY_DIRS=/nix/store/b793hmy0383vxaax7hiaslzmizzd3pmg-mesa-26.0.6/share/glvnd/egl_vendor.d",
     "XDG_CACHE_HOME=/home/.cache",
     "XDG_CONFIG_HOME=/home/.config",
     "XDG_DATA_HOME=/home/.local/share",

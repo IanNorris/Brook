@@ -29,8 +29,10 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/ioctl.h>
 #include <signal.h>
 #include <errno.h>
 #include <time.h>
@@ -40,6 +42,7 @@
 #include "xdg-shell-server-protocol.h"
 #include "xdg-decoration-server-protocol.h"
 #include "viewporter-server-protocol.h"
+#include "linux-dmabuf-unstable-v1-server-protocol.h"
 
 #define BROOK_SYS_WM_CREATE_WINDOW   506
 #define BROOK_SYS_WM_DESTROY_WINDOW  507
@@ -56,6 +59,7 @@
 #define BROOK_SYS_WM_SET_CURSOR_VISIBLE 518
 #define BROOK_SYS_WM_SET_CURSOR_IMAGE  519
 #define BROOK_SYS_WM_GET_SCREEN_INFO  520
+#define BROOK_SYS_WM_PRESENT_GRES     525
 #define BROOK_WM_CREATE_FLAG_CSD     1u
 #define BROOK_WM_CREATE_FLAG_NO_FOCUS 2u
 
@@ -173,6 +177,17 @@ struct brook_positioner {
     uint32_t anchor, gravity, constraint;
     int32_t ox, oy;
 };
+
+/* A dmabuf-backed wl_buffer: carries the geometry the client declared plus the
+ * host virgl resource id we resolved it to. Defined here (before surface_commit)
+ * so the commit handler can read its fields. */
+struct brook_dmabuf_buffer {
+    int32_t  width, height;
+    uint32_t stride, fourcc;
+    uint32_t gres;        /* resolved host virgl resource id (0 = unresolved) */
+    uint32_t bo_handle;   /* our DRM GEM alias of the imported resource */
+};
+static int is_dmabuf_buffer(struct wl_resource *buf);
 
 struct brook_surface {
     struct wl_resource *resource;
@@ -419,6 +434,60 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
     }
 
     if (!s->pending_buffer) return;
+
+    /* Hardware GL path: a dmabuf-backed buffer (Mesa's render target shared via
+     * zwp_linux_dmabuf_v1). Lazily create the kernel Window (sized from the
+     * dmabuf), then present the resolved host resource via WM_PRESENT_GRES so the
+     * compositor BLITs it into the window content texture (zero CPU copy). */
+    if (is_dmabuf_buffer(s->pending_buffer)) {
+        struct brook_dmabuf_buffer *db = wl_resource_get_user_data(s->pending_buffer);
+        int dw = db ? db->width  : 0;
+        int dh = db ? db->height : 0;
+        int may_present = (!s->xdg_toplevel && !s->xdg_popup) || s->xdg_acked;
+        if (may_present && db && db->gres && dw > 0 && dh > 0 &&
+            (s->xdg_toplevel || s->xdg_popup)) {
+            if (s->wm_id == 0) {
+                struct brook_wm_create_out out = {0};
+                uint32_t create_flags = 0;
+                int effective_csd = s->deco_csd ||
+                                    (s->xdg_toplevel && !s->deco_negotiated);
+                if (s->xdg_popup || effective_csd)
+                    create_flags |= BROOK_WM_CREATE_FLAG_CSD;
+                if (s->xdg_popup)
+                    create_flags |= BROOK_WM_CREATE_FLAG_NO_FOCUS;
+                long rc = wm_create_window((uint32_t)dw, (uint32_t)dh,
+                                           s->title[0] ? s->title : NULL,
+                                           create_flags, &out);
+                if (rc == 0 && out.wm_id) {
+                    s->wm_id      = out.wm_id;
+                    s->vfb        = (uint32_t*)(uintptr_t)out.vfb_user;
+                    s->vfb_stride = out.vfb_stride;
+                    s->vfb_w      = (uint32_t)dw;
+                    s->vfb_h      = (uint32_t)dh;
+                    fprintf(stderr, "[waylandd] WM_CREATE_WINDOW (dmabuf) id=%u %dx%d\n",
+                            s->wm_id, dw, dh);
+                    popup_apply_position(s);
+                } else {
+                    fprintf(stderr, "[waylandd] WM_CREATE_WINDOW (dmabuf) failed rc=%ld\n", rc);
+                }
+            }
+            if (s->wm_id) {
+                long rc = syscall(BROOK_SYS_WM_PRESENT_GRES, (long)s->wm_id,
+                                  (long)db->gres, (long)dw, (long)dh);
+                if (rc != 0)
+                    fprintf(stderr, "[waylandd] WM_PRESENT_GRES id=%u gres=%u rc=%ld\n",
+                            s->wm_id, db->gres, rc);
+            }
+        }
+        for (int i = 0; i < s->pending_frame_cb_count; i++) {
+            wl_callback_send_done(s->pending_frame_cbs[i], g_now_ms());
+            wl_resource_destroy(s->pending_frame_cbs[i]);
+        }
+        s->pending_frame_cb_count = 0;
+        wl_buffer_send_release(s->pending_buffer);
+        s->pending_buffer = NULL;
+        return;
+    }
 
     struct wl_shm_buffer *shm = wl_shm_buffer_get(s->pending_buffer);
     if (!shm) {
@@ -1937,8 +2006,14 @@ static void deco_mgr_get_toplevel_decoration(struct wl_client *c,
     if (s) s->deco_negotiated = 1;
     fprintf(stderr, "[waylandd] decoration get_toplevel_decoration surface=%p\n",
             (void*)s);
-    /* Default to CSD: the client opted in by binding the manager. */
-    deco_apply_mode(d, 1);
+    /* Default to SERVER_SIDE: Brook's kernel WM draws all chrome. A client that
+     * binds the decoration manager is asking us to negotiate, so our preference
+     * (server-side) is the right default. Defaulting to CSD here broke
+     * libdecor-based clients (e.g. es2gears/GL demos): libdecor would try to
+     * draw client-side decorations via a plugin it can't load on Brook and hang
+     * before ever committing a frame. Clients that genuinely want CSD still get
+     * it by explicitly calling set_mode(CLIENT_SIDE). */
+    deco_apply_mode(d, 0);
 }
 static const struct zxdg_decoration_manager_v1_interface deco_mgr_impl = {
     .destroy                = deco_mgr_destroy,
@@ -2176,6 +2251,288 @@ static void ddm_bind(struct wl_client *client, void *data,
     wl_resource_set_implementation(r, &ddm_impl, NULL, NULL);
 }
 
+/* ---------------- linux-dmabuf (hardware GL presentation) ---------------- */
+/*
+ * Mesa's Wayland EGL platform shares its hardware-rendered render target with
+ * us as a dmabuf. We advertise zwp_linux_dmabuf_v1 so Mesa uses the hardware
+ * path (not llvmpipe), import the dmabuf fd through the DRM render node to
+ * resolve it to a host virgl resource id (gres), and (Stage 3) ask the kernel
+ * to blit that gres into the window's compositor texture. For now (Stage 2) we
+ * resolve + log the gres and release the buffer, proving the import path.
+ *
+ * The DRM ioctls mirror the kernel shim (syscall.cpp DrmRenderIoctl). The kernel
+ * dispatches on ioctl type+nr only, so the _IOC size/dir bits are cosmetic.
+ */
+#define DRM_IOC(nr, sz) (( (unsigned)3u << 30) | ((unsigned)(sz) << 16) | ((unsigned)'d' << 8) | (unsigned)(nr))
+struct drm_prime_handle { uint32_t handle; uint32_t flags; int32_t fd; };
+struct drm_virtgpu_resource_info { uint32_t bo_handle, res_handle, size, blob_mem; };
+struct drm_gem_close { uint32_t handle, pad; };
+#define DRM_IOCTL_PRIME_FD_TO_HANDLE  DRM_IOC(0x2e, sizeof(struct drm_prime_handle))
+#define DRM_IOCTL_VIRTGPU_RESOURCE_INFO DRM_IOC(0x45, sizeof(struct drm_virtgpu_resource_info))
+#define DRM_IOCTL_GEM_CLOSE           DRM_IOC(0x09, sizeof(struct drm_gem_close))
+
+static int g_drm_fd = -1;   /* /dev/dri/renderD128, opened once at startup */
+
+static const struct wl_buffer_interface dmabuf_buffer_impl;
+
+/* Resolve an imported dmabuf fd to a host virgl resource id via the DRM node:
+ * PRIME_FD_TO_HANDLE (fd -> GEM bo) then RESOURCE_INFO (bo -> res_handle/gres). */
+static uint32_t dmabuf_resolve_gres(int fd, uint32_t *out_bo)
+{
+    if (g_drm_fd < 0) return 0;
+    struct drm_prime_handle ph;
+    memset(&ph, 0, sizeof(ph));
+    ph.fd = fd;
+    if (ioctl(g_drm_fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &ph) != 0) {
+        fprintf(stderr, "[waylandd] dmabuf: FD_TO_HANDLE failed: %s\n", strerror(errno));
+        return 0;
+    }
+    struct drm_virtgpu_resource_info ri;
+    memset(&ri, 0, sizeof(ri));
+    ri.bo_handle = ph.handle;
+    if (ioctl(g_drm_fd, DRM_IOCTL_VIRTGPU_RESOURCE_INFO, &ri) != 0) {
+        fprintf(stderr, "[waylandd] dmabuf: RESOURCE_INFO failed: %s\n", strerror(errno));
+        return 0;
+    }
+    if (out_bo) *out_bo = ph.handle;
+    return ri.res_handle;
+}
+
+static void dmabuf_buffer_destroy(struct wl_resource *r)
+{
+    struct brook_dmabuf_buffer *db = wl_resource_get_user_data(r);
+    if (db) {
+        if (db->bo_handle && g_drm_fd >= 0) {
+            struct drm_gem_close gc = { db->bo_handle, 0 };
+            ioctl(g_drm_fd, DRM_IOCTL_GEM_CLOSE, &gc);
+        }
+        free(db);
+    }
+}
+static void dmabuf_buffer_destroy_req(struct wl_client *c, struct wl_resource *r)
+{ (void)c; wl_resource_destroy(r); }
+static const struct wl_buffer_interface dmabuf_buffer_impl = {
+    .destroy = dmabuf_buffer_destroy_req,
+};
+
+/* True if a wl_buffer resource is one of our dmabuf buffers (vs wl_shm). */
+static int is_dmabuf_buffer(struct wl_resource *buf)
+{
+    return buf && wl_resource_instance_of(buf, &wl_buffer_interface,
+                                          &dmabuf_buffer_impl);
+}
+
+/* zwp_linux_buffer_params_v1: the client adds plane(s) then create[_immed]. We
+ * support a single-plane buffer (plane 0) — enough for Mesa's window surface. */
+struct brook_dmabuf_params {
+    int      fd;          /* plane-0 dmabuf fd (-1 = none added) */
+    uint32_t stride, offset;
+};
+
+static void params_destroy(struct wl_client *c, struct wl_resource *r)
+{ (void)c; wl_resource_destroy(r); }
+
+static void params_add(struct wl_client *c, struct wl_resource *r, int32_t fd,
+                       uint32_t plane_idx, uint32_t offset, uint32_t stride,
+                       uint32_t mod_hi, uint32_t mod_lo)
+{
+    (void)c; (void)mod_hi; (void)mod_lo;
+    struct brook_dmabuf_params *p = wl_resource_get_user_data(r);
+    if (plane_idx != 0) { if (fd >= 0) close(fd); return; }  /* single-plane only */
+    if (p->fd >= 0) close(p->fd);
+    p->fd = fd; p->stride = stride; p->offset = offset;
+}
+
+static struct wl_resource *
+params_make_buffer(struct wl_client *c, struct wl_resource *r, uint32_t id,
+                   int32_t width, int32_t height, uint32_t format)
+{
+    struct brook_dmabuf_params *p = wl_resource_get_user_data(r);
+    if (p->fd < 0) {
+        wl_resource_post_error(r, ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INCOMPLETE,
+                               "no plane added");
+        return NULL;
+    }
+    struct brook_dmabuf_buffer *db = calloc(1, sizeof(*db));
+    if (!db) { wl_client_post_no_memory(c); return NULL; }
+    db->width = width; db->height = height;
+    db->stride = p->stride; db->fourcc = format;
+    db->gres = dmabuf_resolve_gres(p->fd, &db->bo_handle);
+    close(p->fd); p->fd = -1;   /* the GEM alias now holds the reference */
+    fprintf(stderr, "[waylandd] dmabuf buffer %dx%d stride=%u fourcc=0x%x -> gres=%u\n",
+            width, height, db->stride, format, db->gres);
+
+    struct wl_resource *buf = wl_resource_create(c, &wl_buffer_interface, 1, id);
+    if (!buf) { free(db); wl_client_post_no_memory(c); return NULL; }
+    wl_resource_set_implementation(buf, &dmabuf_buffer_impl, db,
+                                   dmabuf_buffer_destroy);
+    return buf;
+}
+
+static void params_create(struct wl_client *c, struct wl_resource *r,
+                          int32_t width, int32_t height, uint32_t format,
+                          uint32_t flags)
+{
+    (void)flags;
+    struct wl_resource *buf = params_make_buffer(c, r, 0, width, height, format);
+    if (buf)
+        zwp_linux_buffer_params_v1_send_created(r, buf);
+    else
+        zwp_linux_buffer_params_v1_send_failed(r);
+}
+
+static void params_create_immed(struct wl_client *c, struct wl_resource *r,
+                                uint32_t buffer_id, int32_t width, int32_t height,
+                                uint32_t format, uint32_t flags)
+{
+    (void)flags;
+    params_make_buffer(c, r, buffer_id, width, height, format);
+}
+
+static const struct zwp_linux_buffer_params_v1_interface params_impl = {
+    .destroy      = params_destroy,
+    .add          = params_add,
+    .create       = params_create,
+    .create_immed = params_create_immed,
+};
+
+static void params_resource_destroy(struct wl_resource *r)
+{
+    struct brook_dmabuf_params *p = wl_resource_get_user_data(r);
+    if (p) { if (p->fd >= 0) close(p->fd); free(p); }
+}
+
+static void dmabuf_create_params(struct wl_client *c, struct wl_resource *r,
+                                 uint32_t id)
+{
+    struct brook_dmabuf_params *p = calloc(1, sizeof(*p));
+    if (!p) { wl_client_post_no_memory(c); return; }
+    p->fd = -1;
+    /* The params object must inherit the dmabuf object's version, or methods
+     * added in later versions (create_immed, since v2) are rejected as
+     * "invalid method". */
+    struct wl_resource *pr = wl_resource_create(
+        c, &zwp_linux_buffer_params_v1_interface,
+        wl_resource_get_version(r), id);
+    if (!pr) { free(p); wl_client_post_no_memory(c); return; }
+    wl_resource_set_implementation(pr, &params_impl, p, params_resource_destroy);
+}
+
+static void dmabuf_destroy(struct wl_client *c, struct wl_resource *r)
+{ (void)c; wl_resource_destroy(r); }
+
+/* Common B8G8R8X8/A8 formats Mesa uses for a window surface. */
+#define FMT_XRGB8888 0x34325258  /* 'XR24' */
+#define FMT_ARGB8888 0x34325241  /* 'AR24' */
+
+/* dev_t of the DRM render node, used as the dmabuf-feedback main_device.
+ * Resolved once at startup from g_drm_fd. */
+static uint64_t g_drm_dev = 0;
+
+/* Send a full dmabuf-feedback sequence (v4+). This is how Mesa's Wayland EGL
+ * platform learns *which render node* to use: without it (or wl_drm) Mesa can't
+ * find the GPU, falls back to Zink/swrast and crashes. We expose a single tranche
+ * for our render node advertising the LINEAR-modifier XR24/AR24 formats. */
+static void dmabuf_send_feedback(struct wl_resource *fb)
+{
+    /* Format table: 16-byte entries { u32 format, u32 pad, u64 modifier }. */
+    struct fmt_entry { uint32_t format; uint32_t pad; uint64_t modifier; };
+    static const struct fmt_entry table[] = {
+        { FMT_XRGB8888, 0, 0 /* LINEAR */ },
+        { FMT_ARGB8888, 0, 0 /* LINEAR */ },
+    };
+    const uint32_t n = sizeof(table) / sizeof(table[0]);
+
+    int tfd = syscall(SYS_memfd_create, "brook-dmabuf-fmt", 0u);
+    if (tfd >= 0) {
+        if (write(tfd, table, sizeof(table)) == (ssize_t)sizeof(table)) {
+            zwp_linux_dmabuf_feedback_v1_send_format_table(fb, tfd, sizeof(table));
+        }
+        /* The client dup()s the fd during the format_table event; ours can close. */
+    }
+
+    struct wl_array dev;
+    wl_array_init(&dev);
+    uint64_t *dp = wl_array_add(&dev, sizeof(uint64_t));
+    if (dp) *dp = g_drm_dev;
+    zwp_linux_dmabuf_feedback_v1_send_main_device(fb, &dev);
+
+    /* One tranche targeting the same device, all formats in the table. */
+    zwp_linux_dmabuf_feedback_v1_send_tranche_target_device(fb, &dev);
+    struct wl_array idx;
+    wl_array_init(&idx);
+    for (uint32_t i = 0; i < n; ++i) {
+        uint16_t *ip = wl_array_add(&idx, sizeof(uint16_t));
+        if (ip) *ip = (uint16_t)i;
+    }
+    zwp_linux_dmabuf_feedback_v1_send_tranche_formats(fb, &idx);
+    zwp_linux_dmabuf_feedback_v1_send_tranche_flags(fb, 0);
+    zwp_linux_dmabuf_feedback_v1_send_tranche_done(fb);
+    zwp_linux_dmabuf_feedback_v1_send_done(fb);
+
+    wl_array_release(&idx);
+    wl_array_release(&dev);
+    if (tfd >= 0) close(tfd);
+}
+
+static void feedback_destroy(struct wl_client *c, struct wl_resource *r)
+{ (void)c; wl_resource_destroy(r); }
+static const struct zwp_linux_dmabuf_feedback_v1_interface feedback_impl = {
+    .destroy = feedback_destroy,
+};
+
+static struct wl_resource *make_feedback(struct wl_client *c, struct wl_resource *r,
+                                         uint32_t id)
+{
+    struct wl_resource *fb = wl_resource_create(
+        c, &zwp_linux_dmabuf_feedback_v1_interface,
+        wl_resource_get_version(r), id);
+    if (!fb) { wl_client_post_no_memory(c); return NULL; }
+    wl_resource_set_implementation(fb, &feedback_impl, NULL, NULL);
+    dmabuf_send_feedback(fb);
+    return fb;
+}
+
+static void dmabuf_get_default_feedback(struct wl_client *c, struct wl_resource *r,
+                                        uint32_t id)
+{ make_feedback(c, r, id); }
+
+static void dmabuf_get_surface_feedback(struct wl_client *c, struct wl_resource *r,
+                                        uint32_t id, struct wl_resource *surface)
+{ (void)surface; make_feedback(c, r, id); }
+
+static const struct zwp_linux_dmabuf_v1_interface dmabuf_impl = {
+    .destroy               = dmabuf_destroy,
+    .create_params         = dmabuf_create_params,
+    .get_default_feedback  = dmabuf_get_default_feedback,
+    .get_surface_feedback  = dmabuf_get_surface_feedback,
+};
+
+static void dmabuf_bind(struct wl_client *client, void *data, uint32_t version,
+                        uint32_t id)
+{
+    (void)data;
+    /* Advertise up to v4 — v4 enables get_default_feedback, which is how Mesa's
+     * Wayland EGL platform discovers the render node (main_device). Without it
+     * Mesa can't find the GPU and falls back to Zink/swrast. */
+    uint32_t use = version < 4 ? version : 4;
+    struct wl_resource *r = wl_resource_create(
+        client, &zwp_linux_dmabuf_v1_interface, (int)use, id);
+    if (!r) { wl_client_post_no_memory(client); return; }
+    wl_resource_set_implementation(r, &dmabuf_impl, NULL, NULL);
+    /* v1/v2 advertise formats (and v3 modifiers) at bind time. v4 clients use
+     * get_default_feedback instead and ignore these, but sending them is
+     * harmless and keeps older clients working. */
+    if (use < 4) {
+        zwp_linux_dmabuf_v1_send_format(r, FMT_XRGB8888);
+        zwp_linux_dmabuf_v1_send_format(r, FMT_ARGB8888);
+        if (use >= 3) {
+            zwp_linux_dmabuf_v1_send_modifier(r, FMT_XRGB8888, 0, 0);
+            zwp_linux_dmabuf_v1_send_modifier(r, FMT_ARGB8888, 0, 0);
+        }
+    }
+}
+
 /* ---------------- main ---------------- */
 
 int main(int argc, char **argv)
@@ -2243,6 +2600,21 @@ int main(int argc, char **argv)
     if (!wl_global_create(g_display, &wp_viewporter_interface, 1, NULL, viewporter_bind)) return 1;
     if (!wl_global_create(g_display, &wl_subcompositor_interface, 1, NULL, subcomp_bind)) return 1;
     if (!wl_global_create(g_display, &wl_data_device_manager_interface, 3, NULL, ddm_bind)) return 1;
+    if (!wl_global_create(g_display, &zwp_linux_dmabuf_v1_interface, 4, NULL, dmabuf_bind)) return 1;
+    /* Open the DRM render node once for PRIME dmabuf import (hardware GL windows).
+     * Absence is non-fatal: we simply won't advertise working dmabuf import. */
+    g_drm_fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+    if (g_drm_fd < 0) {
+        fprintf(stderr, "[waylandd] dmabuf: no DRM node (%s) — GL windows will be software\n",
+                strerror(errno));
+    } else {
+        /* main_device for dmabuf feedback = the render node's dev_t, so Mesa's
+         * Wayland EGL platform knows which GPU to open. */
+        struct stat st;
+        if (fstat(g_drm_fd, &st) == 0) g_drm_dev = (uint64_t)st.st_rdev;
+        fprintf(stderr, "[waylandd] dmabuf: DRM node fd=%d dev=0x%llx\n",
+                g_drm_fd, (unsigned long long)g_drm_dev);
+    }
     fprintf(stderr, "[waylandd] globals advertised\n");
 
     signal(SIGINT,  on_sigint);

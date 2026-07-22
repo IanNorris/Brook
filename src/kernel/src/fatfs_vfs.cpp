@@ -1,5 +1,6 @@
 #include "fatfs_vfs.h"
 #include "vfs.h"
+#include "process.h"
 #include "fatfs_glue.h"
 #include "memory/heap.h"
 #include "serial.h"
@@ -19,6 +20,42 @@ namespace brook {
 // FatFS is NOT thread-safe — all FatFS calls are serialised by this lock.
 static KMutex g_fatLock;
 static bool   g_fatLockInit = false;
+
+// Linux/musl errno values used to report FatFS failures honestly. The kernel
+// has no shared errno header (syscall.cpp defines its own), so the handful we
+// need are defined locally here too. Historically the VFS ops returned a bare
+// -1 on any FatFS error; on the Linux syscall ABI musl turns that into
+// errno = 1 = EPERM ("Operation not permitted"), which is misleading — a
+// transient disk read failure during shared-library loading then surfaces as a
+// bogus permission error. Mapping FRESULT to a real errno keeps the failure
+// honest and diagnosable.
+static constexpr int FVFS_EIO    = 5;
+static constexpr int FVFS_ENOENT = 2;
+static constexpr int FVFS_EACCES = 13;
+static constexpr int FVFS_EROFS  = 30;
+static constexpr int FVFS_EINVAL = 22;
+static constexpr int FVFS_EMFILE = 24;
+
+// Map a (non-OK) FatFS result to a negative errno. FR_OK must not be passed.
+static int FrToErrno(FRESULT res)
+{
+    switch (res) {
+        case FR_NO_FILE:
+        case FR_NO_PATH:            return -FVFS_ENOENT;
+        case FR_DENIED:
+        case FR_EXIST:
+        case FR_LOCKED:             return -FVFS_EACCES;
+        case FR_WRITE_PROTECTED:    return -FVFS_EROFS;
+        case FR_INVALID_NAME:
+        case FR_INVALID_OBJECT:
+        case FR_INVALID_DRIVE:
+        case FR_INVALID_PARAMETER:  return -FVFS_EINVAL;
+        case FR_TOO_MANY_OPEN_FILES:return -FVFS_EMFILE;
+        // FR_DISK_ERR / FR_INT_ERR / FR_NOT_READY / FR_NO_FILESYSTEM /
+        // FR_TIMEOUT and anything else are low-level I/O failures.
+        default:                    return -FVFS_EIO;
+    }
+}
 
 // Gate noisy "f_open failed" messages — off by default to avoid blocking
 // serial on the ~100+ failed opens the dynamic linker generates per app.
@@ -163,14 +200,15 @@ static int FatFileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
     FIL* fil = static_cast<FIL*>(vn->priv);
     KMutexLock(&g_fatLock);
     if (f_tell(fil) != *offset) {
-        if (f_lseek(fil, static_cast<FSIZE_t>(*offset)) != FR_OK) {
+        FRESULT sres = f_lseek(fil, static_cast<FSIZE_t>(*offset));
+        if (sres != FR_OK) {
             KMutexUnlock(&g_fatLock);
-            return -1;
+            return FrToErrno(sres);
         }
     }
     UINT br = 0;
     FRESULT res = f_read(fil, buf, static_cast<UINT>(len), &br);
-    if (res != FR_OK) { KMutexUnlock(&g_fatLock); return -1; }
+    if (res != FR_OK) { KMutexUnlock(&g_fatLock); return FrToErrno(res); }
     *offset += br;
     KMutexUnlock(&g_fatLock);
     return static_cast<int>(br);
@@ -181,14 +219,15 @@ static int FatFileWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offs
     FIL* fil = static_cast<FIL*>(vn->priv);
     KMutexLock(&g_fatLock);
     if (f_tell(fil) != *offset) {
-        if (f_lseek(fil, static_cast<FSIZE_t>(*offset)) != FR_OK) {
+        FRESULT sres = f_lseek(fil, static_cast<FSIZE_t>(*offset));
+        if (sres != FR_OK) {
             KMutexUnlock(&g_fatLock);
-            return -1;
+            return FrToErrno(sres);
         }
     }
     UINT bw = 0;
     FRESULT res = f_write(fil, buf, static_cast<UINT>(len), &bw);
-    if (res != FR_OK) { KMutexUnlock(&g_fatLock); return -1; }
+    if (res != FR_OK) { KMutexUnlock(&g_fatLock); return FrToErrno(res); }
     *offset += bw;
     KMutexUnlock(&g_fatLock);
     return static_cast<int>(bw);
@@ -227,7 +266,7 @@ static void FatFileClose(Vnode* vn)
 
 static int FatFileFsync(Vnode* vn)
 {
-    if (vn->type != VnodeType::File) return -1;
+    if (vn->type != VnodeType::File) return -FVFS_EINVAL;
     FIL* fil = static_cast<FIL*>(vn->priv);
     KMutexLock(&g_fatLock);
     // f_sync flushes the file's cached window AND rewrites the directory
@@ -235,7 +274,7 @@ static int FatFileFsync(Vnode* vn)
     // valid even if the system loses power before f_close.
     FRESULT res = f_sync(fil);
     KMutexUnlock(&g_fatLock);
-    return res == FR_OK ? 0 : -1;
+    return res == FR_OK ? 0 : FrToErrno(res);
 }
 
 static int FatStat(Vnode* vn, VnodeStat* st)
@@ -602,4 +641,20 @@ extern "C" void FatFsDumpLockState()
     brook::SerialPrintf("  fatLock: locked=%u owner=%u waitHead=%p\n",
                         brook::g_fatLock.locked, brook::g_fatLock.ownerPid,
                         brook::g_fatLock.waitHead);
+    // BRO-196: walk the FAT-lock FIFO wait queue (pids blocked acquiring it).
+    int n = 0;
+    for (brook::Process* w = brook::g_fatLock.waitHead; w && n < 64; w = w->syncNext, ++n) {
+        if (w->magic != brook::PROCESS_MAGIC) { brook::SerialPrintf("    waiter[CORRUPT]\n"); break; }
+        brook::SerialPrintf("    fatLock waiter pid=%u state=%d syscall=%lu pendWake=%d\n",
+                            w->pid, (int)w->state, w->currentSyscallNum,
+                            __atomic_load_n(&w->pendingWakeup, __ATOMIC_RELAXED));
+    }
+}
+
+// BRO-196 diagnostic: current owner pid of g_fatLock (0 = unheld). Lets the
+// generic syscall layer detect a thread doing a blocking op while holding the
+// global FAT lock (a lock leak across a blocking wait).
+extern "C" uint32_t FatFsLockOwner()
+{
+    return brook::g_fatLock.locked ? brook::g_fatLock.ownerPid : 0;
 }

@@ -15,6 +15,7 @@
 #include "kprintf.h"
 #include "compositor.h"
 #include "window.h"
+#include "gpu_app.h"
 #include "ext2_vfs.h"
 #include "string.h"
 #include "spinlock.h"
@@ -1047,6 +1048,13 @@ void ProcessDestroy(Process* proc)
     {
         CompositorUnregisterProcess(proc);
         WmDestroyWindowForProcess(proc);
+        // Release the app's GPU (virgl) context, if it created one.
+        if (proc->gpuAppCtx > 0)
+        {
+            const brook::GpuAppOps* ga = brook::GpuAppGet();
+            if (ga && ga->CtxDestroy) ga->CtxDestroy(proc->gpuAppCtx);
+            proc->gpuAppCtx = 0;
+        }
     }
 
     // Threads share the page table with the leader — don't destroy it

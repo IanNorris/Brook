@@ -1,0 +1,4 @@
+# Brook OS — run real libdrm 'drmdevice' tool against /dev/dri/renderD128.
+# Tests (a) real Linux libdrm loads+runs in Brook (reachability) and (b) DRM
+# device enumeration / drmGetVersion against the GL-shim render node.
+run /nix/store/sqvm6lz2lbn43zflil7rgn9p0d86gpfd-libdrm-2.4.131-bin/bin/drmdevice

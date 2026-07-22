@@ -1,6 +1,7 @@
 #include "apic.h"
 #include "idt.h"
 #include "gs_paranoid.h"
+#include "fpu_irq.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "serial.h"
@@ -376,22 +377,31 @@ static void LapicTimerHandler(void)
 
         GS_PARANOID_ENTRY_EBX
 
-        // Stack layout after 15 pushes:
-        //   RSP+64  = interrupted RBP
-        //   RSP+120 = interrupted RIP
-        //   RSP+128 = interrupted CS
-        "movq %%rsp, %%rax\n\t"
-        "movq 120(%%rax), %%rdi\n\t"    // arg1 = interrupted RIP
-        "movq 128(%%rax), %%rsi\n\t"    // arg2 = interrupted CS
-        "movq 64(%%rax), %%rdx\n\t"     // arg3 = interrupted RBP
+        // BRO-187: preserve the interrupted thread's x87/SSE/AVX state on an
+        // aligned slot on its kernel stack before the handler clobbers vector
+        // registers. Sets r14 = original RSP (GPR base), r15 = XSAVE slot.
+        BROOK_FPU_SAVE_IRQ
+
+        // Stack layout after 15 pushes (read via r14 = saved GPR base, since
+        // RSP now points at the XSAVE slot):
+        //   r14+64  = interrupted RBP
+        //   r14+120 = interrupted RIP
+        //   r14+128 = interrupted CS
+        "movq 120(%%r14), %%rdi\n\t"    // arg1 = interrupted RIP
+        "movq 128(%%r14), %%rsi\n\t"    // arg2 = interrupted CS
+        "movq 64(%%r14), %%rdx\n\t"     // arg3 = interrupted RBP
 
         "cld\n\t"
         "call LapicTimerHandlerInner\n\t"
 
         // Validate iret frame before restoring GPRs.
-        // The frame is at RSP+120 (15 pushed regs × 8 bytes).
-        "leaq 120(%%rsp), %%rdi\n\t"
+        // The frame is at r14+120 (15 pushed regs × 8 bytes from the GPR base).
+        "leaq 120(%%r14), %%rdi\n\t"
         "call ValidateIretFrame\n\t"
+
+        // BRO-187: restore the interrupted FPU state AFTER all handler C calls
+        // (which clobber vector regs), then restore RSP to the GPR base.
+        BROOK_FPU_RESTORE_IRQ
 
         // BRO-178: paranoid swapgs restore (ebx flag) BEFORE popping GPRs.
         GS_PARANOID_EXIT_EBX

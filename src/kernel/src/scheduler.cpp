@@ -2584,6 +2584,8 @@ static void HangDec(int64_t v)
     while (i) SerialPutChar(buf[--i]);
 }
 
+extern "C" void FutexDumpWaiters();  // BRO-196 diag (syscall.cpp)
+
 extern "C" void SchedulerDumpHang()
 {
     HangPuts("\n==================== BRO176 HANG DUMP (Ctrl+F12) ====================\n");
@@ -2636,6 +2638,10 @@ extern "C" void SchedulerDumpHang()
         HangPuts(" runCpu="); HangDec(__atomic_load_n(&p->runningOnCpu, __ATOMIC_RELAXED));
         HangPuts(" incarn="); HangDec((int64_t)p->incarnation);
         HangPuts(" rip="); HangHex(p->savedCtx.rip);
+        HangPuts(" syscall="); HangDec((int64_t)p->currentSyscallNum);
+        HangPuts(" pendWake="); HangDec((int64_t)__atomic_load_n(&p->pendingWakeup, __ATOMIC_RELAXED));
+        if (p->blockedOnRwLock) { HangPuts(" rwlock="); HangHex((uint64_t)p->blockedOnRwLock); }
+        if (p->wakeupTick) { HangPuts(" wakeupTick="); HangDec((int64_t)p->wakeupTick); }
         HangPuts(" name='"); 
         for (int j = 0; j < 24 && p->name[j]; ++j) SerialPutChar(p->name[j]);
         HangPuts("'");
@@ -2658,6 +2664,10 @@ extern "C" void SchedulerDumpHang()
         }
     }
     HangPuts("STATE legend: 0=Ready 1=Running 2=Blocked 3=Stopped 4=Terminated\n");
+    FutexDumpWaiters();
+    Ext2DumpLockState();
+    FatFsDumpLockState();
+    HangPuts("now="); HangDec((int64_t)g_lapicTickCount); HangPuts("\n");
     HangPuts("==================== END HANG DUMP ====================\n\n");
 }
 

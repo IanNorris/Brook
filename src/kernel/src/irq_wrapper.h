@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gs_paranoid.h"
+#include "fpu_irq.h"
 
 // IRQ_NAKED_HANDLER(name, inner_fn)
 //
@@ -52,8 +53,13 @@
             "push %%r15\n\t" \
             /* BRO-178 paranoid swapgs by actual GS base (ebx = did-swap flag) */ \
             GS_PARANOID_ENTRY_EBX \
+            /* BRO-187: save interrupted x87/SSE/AVX state (r14=orig rsp, \
+               r15=XSAVE slot) before the handler clobbers vector registers. */ \
+            BROOK_FPU_SAVE_IRQ \
             "cld\n\t" \
             "call " #inner_fn "\n\t" \
+            /* BRO-187: restore FPU state after the handler, before swapgs. */ \
+            BROOK_FPU_RESTORE_IRQ \
             /* BRO-178 paranoid swapgs restore before popping GPRs */ \
             GS_PARANOID_EXIT_EBX \
             /* Restore GPRs */ \

@@ -2,10 +2,12 @@
 #include "gdt.h"
 #include "serial.h"
 #include "panic.h"
+#include "display.h"
 #include "panic_screen.h"
 #include "panic_qr.h"
 #include "process.h"
 #include "scheduler.h"
+#include "vfs.h"
 #include "../../shared/inc_um/crash_dump.h"
 #include "apic.h"
 #include "smp.h"
@@ -209,7 +211,97 @@ static void ExcStackWalk(uint64_t rbp, int maxFrames, const char* tag)
     ExcPutsRaw(tag); ExcPutsRaw("  --- end trace ---\n");
 }
 
+// BRO-194 forensic dump for the rare gltron AVX-memcpy crash (and any wild
+// user #PF): classify a faulting user address against every tracked mapping so
+// the next occurrence tells us immediately whether CR2 is a buffer OVERRUN just
+// past the end of a real mapping (e.g. a too-short texture/file mmap that glibc
+// memcpy ran off) or a genuinely wild pointer. Also attributes the faulting RIP
+// to its backing file via cacheId (inode — resolve with `find /store -inum N`).
+// Lock-free, allocation-free, serial-locked caller — safe in the fault path.
+// `addr` is CR2; `rip` is the faulting IP.
+static void ExcDumpUserAddrSpace(brook::Process* p, uint64_t addr, uint64_t rip,
+                                 const char* tag)
+{
+    if (!p) return;
+
+    ExcPutsRaw(tag); ExcPutsRaw("  --- BRO-194 addr-space map (CR2=");
+    ExcPutHex(addr); ExcPutsRaw(") ---\n");
+
+    // Arena classification.
+    ExcPutsRaw(tag); ExcPutsRaw("    arena: ");
+    if (addr >= p->stackBase && addr < p->stackTop)            ExcPutsRaw("STACK\n");
+    else if (addr >= p->elf.programBreakLow && addr < p->programBreak) ExcPutsRaw("HEAP/brk\n");
+    else if (addr >= brook::USER_MMAP_BASE && addr < p->mmapNext)  ExcPutsRaw("MMAP-ARENA (below high-water)\n");
+    else if (addr >= brook::USER_MMAP_BASE && addr < brook::USER_MMAP_END) ExcPutsRaw("MMAP-ARENA (ABOVE high-water — never allocated)\n");
+    else                                                       ExcPutsRaw("UNCLASSIFIED (outside heap/stack/mmap)\n");
+    ExcPutsRaw(tag); ExcPutsRaw("    brk=["); ExcPutHex(p->elf.programBreakLow);
+    ExcPutsRaw(".."); ExcPutHex(p->programBreak); ExcPutsRaw(") stack=[");
+    ExcPutHex(p->stackBase); ExcPutsRaw(".."); ExcPutHex(p->stackTop);
+    ExcPutsRaw(") mmapNext="); ExcPutHex(p->mmapNext); ExcPutsRaw("\n");
+
+    // Scan a list of {vaddr,length} mappings, tracking: a mapping containing
+    // `addr` (sanity), the nearest below (by end), the nearest above (by start),
+    // and the mapping containing `rip`.
+    uint64_t bestBelowEnd = 0;     uint64_t bestBelowStart = 0; bool haveBelow = false;
+    uint64_t bestAboveStart = ~0ULL; uint64_t bestAboveLen = 0;  bool haveAbove = false;
+    const char* containKind = nullptr; uint64_t containStart = 0, containLen = 0;
+    const char* ripKind = nullptr; uint64_t ripStart = 0; uint64_t ripInode = 0;
+
+    auto consider = [&](uint64_t vaddr, uint64_t len, const char* kind, uint64_t inode) {
+        if (vaddr == 0 || len == 0) return;
+        uint64_t end = vaddr + len;
+        if (addr >= vaddr && addr < end) { containKind = kind; containStart = vaddr; containLen = len; }
+        if (end <= addr && (!haveBelow || end > bestBelowEnd)) { haveBelow = true; bestBelowEnd = end; bestBelowStart = vaddr; }
+        if (vaddr > addr && (!haveAbove || vaddr < bestAboveStart)) { haveAbove = true; bestAboveStart = vaddr; bestAboveLen = len; }
+        if (rip >= vaddr && rip < end) { ripKind = kind; ripStart = vaddr; ripInode = inode; }
+    };
+
+    for (uint32_t i = 0; i < brook::Process::MAX_FILE_MAPS; ++i) {
+        const auto& m = p->fileMaps[i];
+        uint64_t inode = (m.vnode) ? m.vnode->cacheId : 0;
+        consider(m.vaddr, m.length, "file", inode);
+    }
+    for (uint32_t i = 0; i < brook::Process::MAX_MEMFD_MAPS; ++i)
+        consider(p->memfdMaps[i].vaddr, p->memfdMaps[i].length, "memfd", 0);
+    for (uint32_t i = 0; i < brook::Process::MAX_FB_MAPS; ++i)
+        consider(p->fbMaps[i].vaddr, p->fbMaps[i].length, "fb", 0);
+
+    if (containKind) {
+        ExcPutsRaw(tag); ExcPutsRaw("    CR2 INSIDE a tracked ");
+        ExcPutsRaw(containKind); ExcPutsRaw(" map ["); ExcPutHex(containStart);
+        ExcPutsRaw(".."); ExcPutHex(containStart + containLen);
+        ExcPutsRaw(") — demand-page/COW gap, not an overrun\n");
+    } else {
+        ExcPutsRaw(tag); ExcPutsRaw("    CR2 in a HOLE (no tracked file/memfd/fb map covers it)\n");
+    }
+    if (haveBelow) {
+        ExcPutsRaw(tag); ExcPutsRaw("    nearest map BELOW: ["); ExcPutHex(bestBelowStart);
+        ExcPutsRaw(".."); ExcPutHex(bestBelowEnd); ExcPutsRaw(")  gap CR2-end=");
+        ExcPutHex(addr - bestBelowEnd);
+        if (addr - bestBelowEnd < 0x10000)
+            ExcPutsRaw("  <<< OVERRUN-SUSPECT (CR2 just past a mapping end)");
+        ExcPutsRaw("\n");
+    }
+    if (haveAbove) {
+        ExcPutsRaw(tag); ExcPutsRaw("    nearest map ABOVE: ["); ExcPutHex(bestAboveStart);
+        ExcPutsRaw(".."); ExcPutHex(bestAboveStart + bestAboveLen);
+        ExcPutsRaw(")  gap start-CR2="); ExcPutHex(bestAboveStart - addr); ExcPutsRaw("\n");
+    }
+
+    ExcPutsRaw(tag); ExcPutsRaw("    faulting RIP="); ExcPutHex(rip);
+    if (ripKind) {
+        ExcPutsRaw(" in "); ExcPutsRaw(ripKind); ExcPutsRaw(" map @");
+        ExcPutHex(ripStart); ExcPutsRaw(" off="); ExcPutHex(rip - ripStart);
+        ExcPutsRaw(" inode="); ExcPutHex(ripInode);
+        ExcPutsRaw("\n");
+    } else {
+        ExcPutsRaw(" (not in any tracked file map)\n");
+    }
+    ExcPutsRaw(tag); ExcPutsRaw("  --- end addr-space map ---\n");
+}
+
 extern "C" int PmmDumpFreeLog(uint64_t phys);  // BRO-176 diag (physical_memory.cpp)
+
 extern "C" void PmmDescribe(uint64_t phys, uint32_t* used, uint32_t* refCount,
                             uint32_t* mapCount, uint32_t* tag, uint32_t* ownerPid);
 extern "C" void ProcessDumpFrameMappers(uint64_t targetPhys);  // BRO-179 (scheduler.cpp)
@@ -1228,6 +1320,10 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                 psi.vector    = vector;
                 psi.errorCode = ef->errorCode;
                 brook::PanicScreenRender(const_cast<uint32_t*>(physFb), fbW, fbH, fbStride, &psi);
+
+                // Present the panic screen to the actual scanout (no-op for
+                // direct-mapped FBs; virtio-gpu reverts scanout + transfers/flushes).
+                brook::DisplayPanicPresent();
             }
         }
 
@@ -1442,6 +1538,12 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
 
     uint64_t cr2 = 0;
     __asm__ volatile("movq %%cr2, %0" : "=r"(cr2));
+
+    // BRO-194: classify the faulting user address against every tracked mapping
+    // (overrun-past-a-mapping vs wild pointer) for the rare gltron AVX-memcpy
+    // crash. Runs once per fatal user fault, before signal delivery / exit.
+    if (vector == 14 && fromUser && cr2 < 0x800000000000ULL)
+        ExcDumpUserAddrSpace(proc, cr2, ef->rip, "");
 
     // BRO-176 diagnostic: on a fatal user fault, sweep the faulting process's
     // entire user page table and look up every mapped frame in the PMM free-log.

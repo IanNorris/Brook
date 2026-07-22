@@ -212,10 +212,15 @@ static void KernelConsoleThread(void* /*arg*/)
         return;
     }
 
-    // Create WM window (non-focusable — read-only log display)
-    WmCreateWindow(self, 20, 60,
+    // Create WM window (non-focusable — read-only log display). Send it to the
+    // back so it never occludes focused application windows: the kconsole thread
+    // may create this window after apps have already launched, and a passive log
+    // pane stealing the top z-order would otherwise hide them.
+    int consoleIdx = WmCreateWindow(self, 20, 60,
                    static_cast<uint16_t>(CONSOLE_W),
                    static_cast<uint16_t>(CONSOLE_H), "Kernel Console", 1, false);
+    if (consoleIdx >= 0)
+        WmSendToBack(consoleIdx);
 
     const FontAtlas& fa = g_fontAtlas;
     uint32_t lineH = static_cast<uint32_t>(fa.lineHeight);

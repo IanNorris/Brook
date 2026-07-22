@@ -57,6 +57,39 @@
 .Lpgs_noswap\@:
 .endm
 
+// BRO-187: preserve the interrupted thread's x87/SSE/AVX state across the C
+// exception handler (which is built with SSE and clobbers vector registers).
+// FPU_SAVE_TO_R15 assumes r14 already holds the FullExceptionFrame base (the
+// original RSP after GPR pushes). It reserves a 64-byte-aligned XSAVE slot on
+// the kernel stack, zeroes the XSAVE header (XSAVE does not write the reserved
+// header bytes, and XRSTOR faults if they are nonzero), XSAVEs into it, and
+// leaves RSP at the slot base (64-aligned, valid for the C call). r15 = slot;
+// both r14/r15 are callee-saved so they survive the handler call.
+.macro FPU_SAVE_TO_R15
+    subq $1152, %rsp
+    andq $-64, %rsp
+    movq %rsp, %r15
+    xorl %eax, %eax
+    movq %rax, 512(%r15)
+    movq %rax, 520(%r15)
+    movq %rax, 528(%r15)
+    movq %rax, 536(%r15)
+    movq %rax, 544(%r15)
+    movq %rax, 552(%r15)
+    movq %rax, 560(%r15)
+    movq %rax, 568(%r15)
+    movl $7, %eax
+    xorl %edx, %edx
+    xsave64 (%r15)
+.endm
+
+.macro FPU_RESTORE_FROM_R15
+    movl $7, %eax
+    xorl %edx, %edx
+    xrstor64 (%r15)
+    movq %r14, %rsp
+.endm
+
 // Macro for an exception without a CPU-pushed error code.
 .macro EXCEPTION_STUB_NOERR vector
 .global ExceptionStub\vector
@@ -86,17 +119,21 @@ ExceptionStub\vector:
         // BRO-178: paranoid swapgs by actual GS base (see gs_paranoid.h)
     GS_PARANOID_ENTRY
 
-    movq %rsp, %rdi
+    // BRO-187: r14 = FullExceptionFrame base (= current RSP). Pass it to the
+    // handler and use it both to reach the frame and to restore RSP after the
+    // FPU save/restore. r14 is callee-saved so it survives the C call.
+    movq %rsp, %r14
+    movq %r14, %rdi
     movq $\vector, %rsi
 
-    movq %rsp, %rbp
-    andq $-16, %rsp
-    subq $8, %rsp
-    push %rbp
+    // BRO-187: save x87/SSE/AVX before the SSE-using C handler clobbers it.
+    // Leaves RSP at the 64-aligned XSAVE slot (valid alignment for the call).
+    FPU_SAVE_TO_R15
 
     call HandleExceptionFull
 
-    pop %rsp
+    // BRO-187: restore FPU after the handler, then RSP = frame base (r14).
+    FPU_RESTORE_FROM_R15
     // BRO-178: paranoid swapgs restore (see gs_paranoid.h)
     GS_PARANOID_EXIT
 
@@ -150,27 +187,19 @@ ExceptionStub\vector:
         // BRO-178: paranoid swapgs by actual GS base (see gs_paranoid.h)
     GS_PARANOID_ENTRY
 
-    // RDI = pointer to FullExceptionFrame (our pushed regs + CPU frame)
-    movq %rsp, %rdi
-    // RSI = vector number
+    // BRO-187: r14 = FullExceptionFrame base; pass to handler + restore RSP.
+    movq %rsp, %r14
+    movq %r14, %rdi
     movq $\vector, %rsi
 
-    // Align stack to 16 bytes for C calling convention.
-    // We need RSP at the moment of `call` to be 0-mod-16 so the callee
-    // sees the SysV-mandated 8-mod-16. After `and $-16, %rsp` RSP is
-    // 0-mod-16; `push %rbp` would leave it at 8-mod-16, and the call's
-    // own 8-byte push would give the callee 0-mod-16 — every downstream
-    // function then gets a misaligned stack and any movaps to a local
-    // ends in #GP. Add an 8-byte pad so the saved-rsp push lands on
-    // 0-mod-16.
-    movq %rsp, %rbp
-    andq $-16, %rsp
-    subq $8, %rsp      // pad so RSP is 0-mod-16 at the `call`
-    push %rbp          // save original RSP (popped on return)
+    // BRO-187: save x87/SSE/AVX before the SSE-using C handler. Leaves RSP at
+    // the 64-aligned XSAVE slot (correct alignment for the SysV call).
+    FPU_SAVE_TO_R15
 
     call HandleExceptionFull
 
-    pop %rsp           // restore original RSP (FullExceptionFrame pointer)
+    // BRO-187: restore FPU after the handler, then RSP = frame base (r14).
+    FPU_RESTORE_FROM_R15
     // BRO-178: paranoid swapgs restore (see gs_paranoid.h)
     GS_PARANOID_EXIT
 

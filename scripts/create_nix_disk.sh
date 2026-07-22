@@ -49,6 +49,7 @@ if [ ${#PACKAGES[@]} -eq 0 ]; then
         "${ROOT_DIR}/tools/weston-presentation-shm-pkg"  # libtoytoolkit-free SHM client (no cursor → no crash)
         "${ROOT_DIR}/tools/weston-eventdemo-pkg"  # weston-eventdemo (toytoolkit pointer/keyboard event display)
         "${ROOT_DIR}/tools/weston-clickdot-pkg"  # weston-clickdot (click to draw a dot)
+        "${ROOT_DIR}/tools/es2gears-pkg"  # es2gears_wayland — hardware windowed GL (dmabuf) test
         "${ROOT_DIR}/tools/brook-cursor-theme"  # XCursor theme (so libwayland-cursor doesn't return NULL)
         "${ROOT_DIR}/tools/brook-fonts-pkg"  # DejaVu fonts + fontconfig (window_frame_create needs cairo+pango)
         "${ROOT_DIR}/tools/brook-weston-data-pkg"  # weston share/weston PNG icons (frame_create needs sign_close.png etc)

@@ -1,0 +1,3 @@
+set wm
+run --once /nix/bin/waylandd
+run /nix/store/gjj7w4qrnbha6d5n39r37hf0xkjrvz33-es2gears-brook-0.1-brook/bin/es2gears

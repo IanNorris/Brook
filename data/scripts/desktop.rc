@@ -1,3 +1,5 @@
 # Brook OS — Window Manager with app launcher
 set wm
+set vfb none
+run --once /nix/bin/waylandd
 terminal

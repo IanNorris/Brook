@@ -28,6 +28,23 @@ import glob
 
 ICON_SIZE = 24  # Target icon size in pixels
 
+# Brook-specific launch wrappers for GL games. The upstream .desktop Exec runs
+# the raw nix binary, but these games need a per-app play wrapper on the nix
+# disk that adds the writable HOME/XDG cache redirect (ext2 /data) and audio
+# settings. The global virgl GL env now lives in the kernel default env, so the
+# wrapper is only needed for those per-app concerns. Keyed on the raw Exec's
+# first token (binary basename).
+EXEC_OVERRIDE = {
+    'supertuxkart': '/nix/stk-play.sh',
+}
+
+# Games that ship NO .desktop file but have a Brook play wrapper. Each is added
+# to the launcher only if its probe binary is present in the store.
+# (Name, WrapperExec, IconFile, Categories, ProbeBinaryBasename)
+EXTRA_ENTRIES = [
+    ('GLtron', '/nix/gltron-play.sh', '', 'Game;ArcadeGame;', 'gltron'),
+]
+
 
 def parse_desktop_file(path):
     """Parse a .desktop file and return (Name, Exec, Icon, Categories) or None."""
@@ -220,8 +237,27 @@ def main():
                     icon_file = rgba_filename
                     print(f"  Icon: {icon_name} ({os.path.basename(icon_path)}) -> {rgba_filename}")
 
+        # Brook GL-game wrapper override: keep the upstream binary validation
+        # above (the real binary must exist), but launch via the play wrapper.
+        override = EXEC_OVERRIDE.get(exec_cmd.split()[0] if exec_cmd else "")
+        if override:
+            exec_cmd = override
+
         entries.append((name, exec_cmd, icon_file, categories))
         print(f"  App: {name} [{exec_cmd}]")
+
+    # Synthetic entries for games with a Brook play wrapper but no .desktop file.
+    for name, wrapper_exec, icon_file, categories, probe in EXTRA_ENTRIES:
+        if name in seen_names:
+            continue
+        found = any(os.path.isfile(sp)
+                    for sp in glob.glob(os.path.join(store_dir, '*/bin', probe)))
+        if not found:
+            print(f"  Skip extra: {name} [{probe}] — binary not found in store")
+            continue
+        seen_names.add(name)
+        entries.append((name, wrapper_exec, icon_file, categories))
+        print(f"  App (wrapper): {name} [{wrapper_exec}]")
 
     # Write manifest
     idx_path = os.path.join(output_dir, 'applications.idx')

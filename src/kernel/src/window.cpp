@@ -71,6 +71,20 @@ static void WmFillRect(uint32_t* buf, uint32_t stride,
             WmPutPixel(buf, stride, screenW, screenH, x, y, color);
 }
 
+// Linear interpolate between two 0x00RRGGBB colours by num/den (integer-only,
+// no FP — the kernel builds with -mno-sse). Used for the glassy titlebar gradient.
+static inline uint32_t WmLerpColor(uint32_t a, uint32_t b, int num, int den)
+{
+    if (den <= 0) return a;
+    int ar = (a >> 16) & 0xff, ag = (a >> 8) & 0xff, ab = a & 0xff;
+    int br = (b >> 16) & 0xff, bg = (b >> 8) & 0xff, bb = b & 0xff;
+    int r = ar + (br - ar) * num / den;
+    int g = ag + (bg - ag) * num / den;
+    int bl = ab + (bb - ab) * num / den;
+    return (static_cast<uint32_t>(r) << 16) | (static_cast<uint32_t>(g) << 8)
+         | static_cast<uint32_t>(bl);
+}
+
 // Fill a rectangle with rounded corners (radius r).
 static void WmFillRoundedRect(uint32_t* buf, uint32_t stride,
                                uint32_t screenW, uint32_t screenH,
@@ -230,6 +244,8 @@ int WmCreateWindow(Process* proc, int16_t x, int16_t y,
     w.clientH = clientH;
     w.zOrder = g_nextZOrder++;
     w.upscale = (upscale >= 1) ? upscale : 1;
+    w.opacity = 255;
+    w.blurRadius = 0;
     w.state = WindowState::Normal;
     w.focused = false;
     w.visible = true;
@@ -401,8 +417,10 @@ WmHitResult WmHitTest(int32_t mx, int32_t my)
         int relX = mx - wx;
         int relY = my - wy;
 
-        // Close button (top-right)
-        int closeBtnX = ww - static_cast<int>(WM_BORDER_WIDTH) - static_cast<int>(WM_BUTTON_WIDTH);
+        // Close button (top-right). The rectangular hot spot spans the full
+        // button cell, which bounds the slanted parallelogram (incl. its slant
+        // overhang) plus WM_BTN_RIGHT_PAD; the slanted area is fully clickable.
+        int closeBtnX = ww - static_cast<int>(WM_BORDER_WIDTH) - WM_BTN_RIGHT_PAD - static_cast<int>(WM_BUTTON_WIDTH);
         if (relY < static_cast<int>(WM_TITLE_BAR_HEIGHT) &&
             relX >= closeBtnX && relX < closeBtnX + static_cast<int>(WM_BUTTON_WIDTH))
         {
@@ -566,6 +584,23 @@ void WmSetClientSideDecoration(int idx, bool enable)
     extern void CompositorMarkDirty();
     CompositorMarkDirty();
     SerialPrintf("WM: window %d CSD=%d\n", idx, (int)enable);
+}
+
+// Set per-window display properties (opacity and/or backdrop blur radius). `mask`
+// selects which fields to apply: bit 0 = opacity, bit 1 = blurRadius. Marks the
+// compositor dirty so the change is composited next frame. The GPU DRAW path
+// reads w.opacity (and, for frosted glass, w.blurRadius).
+void WmSetWindowProperties(int idx, uint32_t mask, uint8_t opacity, uint8_t blurRadius)
+{
+    if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
+    Window& w = g_windows[idx];
+    if (!w.proc) return;
+    bool changed = false;
+    if ((mask & WM_PROP_OPACITY) && w.opacity != opacity)    { w.opacity = opacity; changed = true; }
+    if ((mask & WM_PROP_BLUR)    && w.blurRadius != blurRadius) { w.blurRadius = blurRadius; changed = true; }
+    if (!changed) return;
+    extern void CompositorMarkDirty();
+    CompositorMarkDirty();
 }
 
 uint32_t WmWindowCount()
@@ -789,7 +824,7 @@ uint32_t WmGetZOrder(int* outIndices, uint32_t maxOut)
 // ---------------------------------------------------------------------------
 
 // Draw a filled circle at (cx, cy) with given radius and color
-static void WmFillCircle(uint32_t* buf, uint32_t stride,
+[[maybe_unused]] static void WmFillCircle(uint32_t* buf, uint32_t stride,
                           uint32_t screenW, uint32_t screenH,
                           int cx, int cy, int radius, uint32_t color)
 {
@@ -806,6 +841,45 @@ static void WmFillCircle(uint32_t* buf, uint32_t stride,
             buf[py * stride + px] = color;
         }
     }
+}
+
+// Draw a caption button: a sheared parallelogram glass cell (vertical gradient)
+// with a faux-engraved bevel — a dark inner shadow along the top + left edges and
+// a light highlight along the bottom + right edges, so the button reads as carved
+// into the titlebar. The vertical sides are slanted by WM_BTN_SLANT (~20deg) for
+// character: the shape leans backward (top-right to bottom-left, "\"). Icon glyphs
+// are drawn by the caller, centred on the parallelogram.
+static void WmDrawCaptionButton(uint32_t* buf, uint32_t stride,
+                                uint32_t screenW, uint32_t screenH,
+                                int bx, int by, int bw, int bh,
+                                uint32_t top, uint32_t bot)
+{
+    int slant = WM_BTN_SLANT;
+    if (slant > bw - 2) slant = bw - 2;
+    int fillW = bw - slant;
+    int denom = (bh > 1) ? (bh - 1) : 1;
+    for (int r = 0; r < bh; ++r)
+    {
+        uint32_t rc = WmLerpColor(top, bot, r, bh - 1);
+        int lx = bx + slant * (denom - r) / denom;   // backward lean: top at bx+slant, bottom at bx
+        WmFillRect(buf, stride, screenW, screenH, lx, by + r, fillW, 1, rc);
+        // Slanted-side bevel: dark on the left edge, light on the right edge.
+        WmPutPixel(buf, stride, screenW, screenH, lx, by + r, WM_BTN_BEVEL_DARK);
+        WmPutPixel(buf, stride, screenW, screenH, lx + fillW - 1, by + r, WM_BTN_BEVEL_LIGHT);
+    }
+    // Horizontal bevel: dark top edge, light bottom edge (follow the slant).
+    WmFillRect(buf, stride, screenW, screenH, bx + slant, by, fillW, 1, WM_BTN_BEVEL_DARK);
+    WmFillRect(buf, stride, screenW, screenH, bx, by + bh - 1, fillW, 1, WM_BTN_BEVEL_LIGHT);
+}
+
+// Draw a 1px point with an engraved feel: a light highlight 1px below the dark
+// glyph pixel, so icons look carved into the glass button.
+static inline void WmEngravePixel(uint32_t* buf, uint32_t stride,
+                                  uint32_t screenW, uint32_t screenH,
+                                  int x, int y, uint32_t fg)
+{
+    WmPutPixel(buf, stride, screenW, screenH, x, y + 1, WM_BTN_BEVEL_LIGHT);
+    WmPutPixel(buf, stride, screenW, screenH, x, y, fg);
 }
 
 static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
@@ -830,37 +904,23 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     WmFillRect(buf, stride, screenW, screenH, wx + ow - WM_BORDER_WIDTH, wy, WM_BORDER_WIDTH, oh, borderCol);
     WmFillRect(buf, stride, screenW, screenH, wx, wy + oh - WM_BORDER_WIDTH, ow, WM_BORDER_WIDTH, borderCol);
 
-    // Title bar background
+    // Title bar background — glassy vertical gradient (light top → deep bottom),
+    // with a 1px sheen highlight along the very top edge. titleBg (the mid tone)
+    // is used as the anti-aliasing background for the title text + button icons.
     int titleX = wx + WM_BORDER_WIDTH;
     int titleY = wy + WM_BORDER_WIDTH;
     int titleW = ow - 2 * WM_BORDER_WIDTH;
     int titleH = WM_TITLE_BAR_HEIGHT;
-    WmFillRect(buf, stride, screenW, screenH, titleX, titleY, titleW, titleH, titleBg);
-
-    // Subtle vertical gradient on title bar (lighter at top, darker at bottom)
-    if (w.focused)
+    uint32_t gTop = w.focused ? WM_TITLE_TOP_FOCUSED : WM_TITLE_TOP_UNFOCUSED;
+    uint32_t gBot = w.focused ? WM_TITLE_BOT_FOCUSED : WM_TITLE_BOT_UNFOCUSED;
+    for (int row = 0; row < titleH; ++row)
     {
-        for (int row = 0; row < titleH && row < 6; ++row)
-        {
-            int py = titleY + row;
-            if (py < 0 || py >= static_cast<int>(screenH)) continue;
-            // Lighten top rows progressively (alpha blend white at decreasing opacity)
-            uint32_t alpha = static_cast<uint32_t>(12 - row * 2); // 12,10,8,6,4,2
-            for (int col = 0; col < titleW; ++col)
-            {
-                int px = titleX + col;
-                if (px < 0 || px >= static_cast<int>(screenW)) continue;
-                uint32_t& pixel = buf[py * stride + px];
-                uint32_t r = ((pixel >> 16) & 0xff) + alpha;
-                uint32_t g = ((pixel >> 8) & 0xff) + alpha;
-                uint32_t b = (pixel & 0xff) + alpha;
-                if (r > 255) r = 255;
-                if (g > 255) g = 255;
-                if (b > 255) b = 255;
-                pixel = (r << 16) | (g << 8) | b;
-            }
-        }
+        uint32_t rc = WmLerpColor(gTop, gBot, row, titleH - 1);
+        WmFillRect(buf, stride, screenW, screenH, titleX, titleY + row, titleW, 1, rc);
     }
+    // 1px glass sheen along the top of the titlebar.
+    WmFillRect(buf, stride, screenW, screenH, titleX, titleY, titleW, 1,
+               w.focused ? WM_TITLE_SHEEN_FOCUSED : WM_TITLE_SHEEN_UNFOCUSED);
 
     // 1px separator line between title bar and client area
     int sepY = titleY + titleH - 1;
@@ -869,70 +929,74 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
 
     // Title text — clipped to avoid overlapping chrome buttons
     int textY = titleY + (titleH - g_fontAtlas.lineHeight) / 2;
-    int titleMaxW = titleW - WM_TITLE_TEXT_PAD_X - 3 * static_cast<int>(WM_BUTTON_WIDTH) - 4;
+    int titleMaxW = titleW - WM_TITLE_TEXT_PAD_X - 3 * static_cast<int>(WM_BUTTON_WIDTH) - WM_BTN_RIGHT_PAD - 4;
     if (titleMaxW < 0) titleMaxW = 0;
     WmRenderString(buf, stride, screenW, screenH,
                    titleX + WM_TITLE_TEXT_PAD_X, textY, w.title,
                    WM_TITLE_FG, titleBg, titleMaxW);
 
-    // Close/maximize/minimize buttons — circles centered in their button cells.
-    // The circle is centered in the square WM_BUTTON_WIDTH × titleH cell.
-    // The center is offset by 0.5px due to even dimensions, so we use
-    // (btnX + width/2) which gives a consistent pixel center.
-    static constexpr int CHROME_BTN_RADIUS = 8;
-    static constexpr int ICON_HALF = 3;  // half-size of icons (6×6 total)
-    static constexpr int CLOSE_ICON_HALF = 3; // smaller × for close button
-    int btnCenterY = titleY + static_cast<int>(titleH) / 2;
+    // Close / maximize / minimize — larger rounded-rect glass buttons with a
+    // faux-engraved bevel, filling most of the titlebar height. Icons are engraved
+    // (a light highlight under the dark stroke) so they look carved into the glass.
+    int by = titleY + 4;
+    int bh = static_cast<int>(titleH) - 8;
+    if (bh < 8) bh = 8;
+    int hInset = 1;                                   // small gap inside each cell (buttons sit close)
+    int bw = static_cast<int>(WM_BUTTON_WIDTH) - 2 * hInset;
+    int iconCY = by + bh / 2;
 
-    // Close button — circular red dot with small × icon
-    int closeBtnX = wx + ow - static_cast<int>(WM_BORDER_WIDTH) - static_cast<int>(WM_BUTTON_WIDTH);
-    bool closeHover = w.focused && mouseX >= closeBtnX && mouseX < closeBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
+    auto engraveHLine = [&](int x, int y, int len, uint32_t fg) {
+        WmFillRect(buf, stride, screenW, screenH, x, y + 1, len, 1, WM_BTN_BEVEL_LIGHT);
+        WmFillRect(buf, stride, screenW, screenH, x, y, len, 1, fg);
+    };
+    auto engraveVLine = [&](int x, int y, int len, uint32_t fg) {
+        WmFillRect(buf, stride, screenW, screenH, x + 1, y, 1, len, WM_BTN_BEVEL_LIGHT);
+        WmFillRect(buf, stride, screenW, screenH, x, y, 1, len, fg);
+    };
+
+    // Close button (rightmost) — red glass, engraved ×. WM_BTN_RIGHT_PAD leaves a
+    // little breathing room between the close button and the window's right border.
+    int closeBtnX = wx + ow - static_cast<int>(WM_BORDER_WIDTH) - WM_BTN_RIGHT_PAD - static_cast<int>(WM_BUTTON_WIDTH);
+    bool closeHover = mouseX >= closeBtnX && mouseX < closeBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
                       mouseY >= titleY && mouseY < titleY + titleH;
-    uint32_t closeBg = closeHover ? 0x00CC3333 : WM_CLOSE_BTN_BG;
-    int closeCenterX = closeBtnX + static_cast<int>(WM_BUTTON_WIDTH) / 2;
-    WmFillRect(buf, stride, screenW, screenH, closeBtnX, titleY,
-               WM_BUTTON_WIDTH, titleH, titleBg);
-    WmFillCircle(buf, stride, screenW, screenH,
-                 closeCenterX, btnCenterY, CHROME_BTN_RADIUS, closeBg);
-    // Draw × with 1px diagonal lines (thinner, more delicate)
-    for (int d = -CLOSE_ICON_HALF; d <= CLOSE_ICON_HALF; d++)
+    int closeBx = closeBtnX + hInset;
+    int closeCx = closeBx + bw / 2;
+    WmDrawCaptionButton(buf, stride, screenW, screenH, closeBx, by, bw, bh,
+                        closeHover ? 0x00E05555 : (w.focused ? 0x00C83C3C : WM_CLOSE_BTN_TOP_UNF),
+                        closeHover ? 0x00B02828 : (w.focused ? 0x00982020 : WM_CLOSE_BTN_BOT_UNF));
+    static constexpr int CLOSE_HALF = 4;
+    for (int d = -CLOSE_HALF; d <= CLOSE_HALF; ++d)
     {
-        WmPutPixel(buf, stride, screenW, screenH, closeCenterX + d, btnCenterY + d, WM_TITLE_FG);
-        WmPutPixel(buf, stride, screenW, screenH, closeCenterX + d, btnCenterY - d, WM_TITLE_FG);
+        WmEngravePixel(buf, stride, screenW, screenH, closeCx + d, iconCY + d, WM_TITLE_FG);
+        WmEngravePixel(buf, stride, screenW, screenH, closeCx + d, iconCY - d, WM_TITLE_FG);
     }
 
-    // Maximize button — circular with small box icon
+    // Maximize button — glass, engraved box outline.
     int maxBtnX = closeBtnX - static_cast<int>(WM_BUTTON_WIDTH);
-    bool maxHover = w.focused && mouseX >= maxBtnX && mouseX < maxBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
+    bool maxHover = mouseX >= maxBtnX && mouseX < maxBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
                     mouseY >= titleY && mouseY < titleY + titleH;
-    uint32_t maxBg = maxHover ? 0x003A5A7A : 0x00304050;
-    int maxCenterX = maxBtnX + static_cast<int>(WM_BUTTON_WIDTH) / 2;
-    WmFillRect(buf, stride, screenW, screenH, maxBtnX, titleY,
-               WM_BUTTON_WIDTH, titleH, titleBg);
-    WmFillCircle(buf, stride, screenW, screenH,
-                 maxCenterX, btnCenterY, CHROME_BTN_RADIUS, maxBg);
-    // 6×6 box centered in the circle
-    int sqS = ICON_HALF * 2;
-    int sqX = maxCenterX - ICON_HALF;
-    int sqY = btnCenterY - ICON_HALF;
-    WmFillRect(buf, stride, screenW, screenH, sqX, sqY, sqS, 1, WM_TITLE_FG);
-    WmFillRect(buf, stride, screenW, screenH, sqX, sqY + sqS - 1, sqS, 1, WM_TITLE_FG);
-    WmFillRect(buf, stride, screenW, screenH, sqX, sqY, 1, sqS, WM_TITLE_FG);
-    WmFillRect(buf, stride, screenW, screenH, sqX + sqS - 1, sqY, 1, sqS, WM_TITLE_FG);
+    int maxBx = maxBtnX + hInset;
+    int maxCx = maxBx + bw / 2;
+    WmDrawCaptionButton(buf, stride, screenW, screenH, maxBx, by, bw, bh,
+                        maxHover ? WM_BTN_HOVER_TOP : (w.focused ? WM_BTN_TOP : WM_BTN_TOP_UNFOCUSED),
+                        maxHover ? WM_BTN_HOVER_BOT : (w.focused ? WM_BTN_BOT : WM_BTN_BOT_UNFOCUSED));
+    int boxW = 11, boxH = 9;
+    int boxX = maxCx - boxW / 2, boxY = iconCY - boxH / 2;
+    engraveHLine(boxX, boxY, boxW, WM_TITLE_FG);              // top
+    engraveHLine(boxX, boxY + boxH - 1, boxW, WM_TITLE_FG);   // bottom
+    engraveVLine(boxX, boxY, boxH, WM_TITLE_FG);             // left
+    engraveVLine(boxX + boxW - 1, boxY, boxH, WM_TITLE_FG);  // right
 
-    // Minimize button — circular with small centered dash
+    // Minimize button — glass, engraved dash near the baseline.
     int minBtnX = maxBtnX - static_cast<int>(WM_BUTTON_WIDTH);
-    bool minHover = w.focused && mouseX >= minBtnX && mouseX < minBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
+    bool minHover = mouseX >= minBtnX && mouseX < minBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
                     mouseY >= titleY && mouseY < titleY + titleH;
-    uint32_t minBg = minHover ? 0x003A5A7A : 0x00304050;
-    int minCenterX = minBtnX + static_cast<int>(WM_BUTTON_WIDTH) / 2;
-    WmFillRect(buf, stride, screenW, screenH, minBtnX, titleY,
-               WM_BUTTON_WIDTH, titleH, titleBg);
-    WmFillCircle(buf, stride, screenW, screenH,
-                 minCenterX, btnCenterY, CHROME_BTN_RADIUS, minBg);
-    // 6px horizontal dash centered vertically
-    WmFillRect(buf, stride, screenW, screenH,
-               minCenterX - ICON_HALF, btnCenterY, ICON_HALF * 2, 1, WM_TITLE_FG);
+    int minBx = minBtnX + hInset;
+    int minCx = minBx + bw / 2;
+    WmDrawCaptionButton(buf, stride, screenW, screenH, minBx, by, bw, bh,
+                        minHover ? WM_BTN_HOVER_TOP : (w.focused ? WM_BTN_TOP : WM_BTN_TOP_UNFOCUSED),
+                        minHover ? WM_BTN_HOVER_BOT : (w.focused ? WM_BTN_BOT : WM_BTN_BOT_UNFOCUSED));
+    engraveHLine(minCx - 5, iconCY + 2, 11, WM_TITLE_FG);
 }
 
 void WmRenderChrome(uint32_t* backBuffer, uint32_t stride,
@@ -1811,6 +1875,13 @@ static void LauncherGetRect(uint32_t screenW, uint32_t screenH,
     *outH = panelH;
 }
 
+void WmLauncherGetRect(uint32_t screenW, uint32_t screenH,
+                       int32_t* outX, int32_t* outY,
+                       uint32_t* outW, uint32_t* outH)
+{
+    LauncherGetRect(screenW, screenH, outX, outY, outW, outH);
+}
+
 void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
                       uint32_t screenW, uint32_t screenH,
                       int32_t mouseX, int32_t mouseY)
@@ -2245,6 +2316,19 @@ void WmSignalDirtyById(Process* proc, uint32_t wmId)
     if (!w) return;
     w->vfbDirty = 1;
     CompositorWake();
+}
+
+bool WmPresentExternalById(Process* proc, uint32_t wmId, uint32_t gres,
+                           uint32_t w, uint32_t h)
+{
+    Window* win = WmFindWindowById(proc, wmId);
+    if (!win) return false;
+    win->externalGres = gres;
+    win->externalW = w;
+    win->externalH = h;
+    win->vfbDirty = 1;   // drive a recompose of this window's content
+    CompositorWake();
+    return true;
 }
 
 void WmSetTitleById(Process* proc, uint32_t wmId, const char* title)

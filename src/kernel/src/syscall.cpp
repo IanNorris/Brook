@@ -22,6 +22,7 @@
 #include "memory/heap.h"
 #include "compositor.h"
 #include "window.h"
+#include "gpu_app.h"
 #include "terminal.h"
 #include "net.h"
 #include "rtc.h"
@@ -474,7 +475,6 @@ static inline bool IsRequestServer(const Process* p) {
     }
     return false;
 }
-
 
 // memfd constants and data — defined here so sys_read/sys_write/fstat can use them
 static constexpr uint32_t MFD_CLOEXEC       = 0x0001u;
@@ -2595,6 +2595,141 @@ static bool StrEq(const char* a, const char* b)
     return *a == *b;
 }
 
+// ---------------------------------------------------------------------------
+// DRM render-node sysfs/devfs shim (GL shim, M0 step 2)
+//
+// Minimal synthetic /dev/dri + /sys topology so the unmodified Linux libdrm
+// (drmGetDevices2) can enumerate /dev/dri/renderD128 as a PCI virtio-gpu device
+// and open it. Backed by the real per-process GPU path (GpuAppOps); no card0 /
+// KMS node. Surface determined empirically from libdrm 2.4.131 source +
+// host strace (see artifacts/gl-drm-enumeration-spike.md):
+//   - get_pci_path() falls back to the literal path if realpath() fails, so the
+//     PCI attributes are served directly at /sys/dev/char/226:128/device/* with
+//     NO symlinks — except 'subsystem', which get_subsystem_type() reads via
+//     readlink() to classify the bus (we return ".../pci" -> DRM_BUS_PCI).
+// All responses are gated on a 3D driver being present (GpuAppGet()).
+// ---------------------------------------------------------------------------
+namespace {
+struct DrmSysAttr { const char* path; const char* content; };
+static const DrmSysAttr kDrmSysAttrs[] = {
+    { "/sys/dev/char/226:128/device/uevent",
+      "DRIVER=virtio_gpu\nPCI_SLOT_NAME=0000:00:02.0\n" },
+    { "/sys/dev/char/226:128/device/vendor",           "0x1af4\n" },
+    { "/sys/dev/char/226:128/device/device",           "0x1050\n" },
+    { "/sys/dev/char/226:128/device/subsystem_vendor", "0x1af4\n" },
+    { "/sys/dev/char/226:128/device/subsystem_device", "0x1100\n" },
+    { "/sys/dev/char/226:128/device/revision",         "0x00\n" },
+    { nullptr, nullptr }
+};
+// Directories that must stat as S_IFDIR (realpath / openat / drmNodeIsDRM).
+static const char* kDrmSysDirs[] = {
+    "/sys/dev/char/226:128/device",
+    "/sys/dev/char/226:128/device/drm",
+    nullptr
+};
+// Marker handle so getdents64 / fstat recognise the /dev/dri synthetic dir fd.
+static const char g_drmDriDirTag[] = "BROOK_DRM_DRI_DIR";
+// Linux dev_t for char 226:128 (gnu_dev: minor low 8 | major<<8).
+static constexpr uint64_t DRM_RENDER_RDEV = 0xE280;
+
+static const char* DrmSysAttrContent(const char* path) {
+    for (auto* a = kDrmSysAttrs; a->path; ++a)
+        if (StrEq(path, a->path)) return a->content;
+    return nullptr;
+}
+static bool DrmSysIsDir(const char* path) {
+    for (auto** d = kDrmSysDirs; *d; ++d)
+        if (StrEq(path, *d)) return true;
+    return false;
+}
+
+// Per-fd DRM render-node state (GL shim M1). Each open("/dev/dri/renderD128")
+// gets one. Holds the app's GpuApp (virgl) context id plus a per-fd GEM-handle
+// table that translates the Linux DRM model (per-fd GEM handles, small ints)
+// to Brook's host-global virgl resource ids. This is the isolation layer the
+// architecture review called for: an app can only name resources via GEM
+// handles in ITS OWN table, never a raw host-global id, and GEM_CLOSE/teardown
+// are scoped per fd. RESOURCE_CREATE returns res_handle=gres (host id, used
+// inside virgl command streams) and bo_handle=GEM index (used in ioctls) —
+// matching the upstream virtio-gpu uABI.
+static constexpr uint32_t DRM_MAX_GEM = 256;
+struct DrmGemObj {
+    bool     used;
+    uint32_t gres;     // host-global virgl resource id (== res_handle)
+    uint32_t size;     // byte size (validate transfers)
+    uint32_t stride;
+    uint32_t width, height;
+    uint64_t backingKva;   // kernel vaddr of mappable backing (0 = not yet mapped)
+    uint32_t backingBytes; // byte size of the backing allocation
+    bool     imported;     // PRIME-imported: gres is owned by another context, so
+                           // this GEM's teardown must NOT free the host resource.
+};
+
+// A DRM PRIME dmabuf handle, modelled as an unforgeable capability: it wraps a
+// host virgl resource id (gres) plus its geometry, and is held by an fd. A
+// client exports its render-target GEM to a PRIME fd (HANDLE_TO_FD), passes the
+// fd over the Wayland socket (SCM_RIGHTS), and the compositor imports it
+// (FD_TO_HANDLE) to obtain a GEM aliasing the SAME gres. Because access is gated
+// by possession of the fd — which only the exporter can hand out — a process
+// cannot reach another process's resource by guessing a gres id. refCount tracks
+// fd references (the export fd, each SCM_RIGHTS copy in flight, each importer
+// fd); the object is freed at zero. NOTE: it deliberately does NOT own the
+// underlying gres lifetime (that stays with the exporter's GpuApp context) —
+// host-side resource refcounting across exporter death is a later hardening step.
+struct DrmPrimeObj {
+    uint32_t gres;        // shared host virgl resource id (the capability target)
+    uint32_t size;        // byte size
+    uint32_t stride;      // row stride in bytes
+    uint32_t width, height;
+    uint32_t fourcc;      // DRM fourcc format (0 if unknown)
+    int32_t  ownerCtxId;  // exporting GpuApp ctx (for validation/logging)
+    uint32_t refCount;    // fd references; freed at 0
+};
+
+static inline void DrmPrimeRef(DrmPrimeObj* p)
+{
+    if (p) __atomic_fetch_add(&p->refCount, 1, __ATOMIC_RELEASE);
+}
+static inline void DrmPrimeUnref(DrmPrimeObj* p)
+{
+    if (!p) return;
+    if (__atomic_fetch_sub(&p->refCount, 1, __ATOMIC_ACQ_REL) <= 1)
+        kfree(p);
+}
+struct DrmCtx {
+    int32_t   ctxId;   // GpuApp virgl context (0 = not yet created)
+    DrmGemObj gem[DRM_MAX_GEM];   // index i -> bo_handle (i+1); 0 is invalid
+};
+
+// Allocate a GEM handle (1-based) for a freshly created resource. Returns 0 on
+// table-full.
+static uint32_t DrmGemAlloc(DrmCtx* c, uint32_t gres, uint32_t size,
+                            uint32_t stride, uint32_t w, uint32_t h) {
+    for (uint32_t i = 0; i < DRM_MAX_GEM; ++i) {
+        if (c->gem[i].used) continue;
+        c->gem[i] = { true, gres, size, stride, w, h, 0, 0, false };
+        return i + 1;
+    }
+    return 0;
+}
+// Allocate a GEM handle aliasing an externally-owned (PRIME-imported) gres. The
+// resulting GEM is marked `imported` so teardown never frees the host resource.
+static uint32_t DrmGemAllocImported(DrmCtx* c, uint32_t gres, uint32_t size,
+                                    uint32_t stride, uint32_t w, uint32_t h) {
+    for (uint32_t i = 0; i < DRM_MAX_GEM; ++i) {
+        if (c->gem[i].used) continue;
+        c->gem[i] = { true, gres, size, stride, w, h, 0, 0, true };
+        return i + 1;
+    }
+    return 0;
+}
+static DrmGemObj* DrmGemGet(DrmCtx* c, uint32_t bo_handle) {
+    if (bo_handle == 0 || bo_handle > DRM_MAX_GEM) return nullptr;
+    DrmGemObj* g = &c->gem[bo_handle - 1];
+    return g->used ? g : nullptr;
+}
+} // namespace
+
 static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
                          uint64_t, uint64_t, uint64_t)
 {
@@ -2697,6 +2832,51 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         if (fd < 0) return -EMFILE;
         DbgPrintf("sys_open: %s → fd %d (keyboard/tty)\n", path, fd);
         return fd;
+    }
+
+    // /dev/dri/renderD128 — virtio-gpu DRM render node. A Linux-compatible
+    // render node that maps the virtio-gpu DRM uABI onto Brook's native
+    // per-process GPU path (GpuAppOps), so unmodified Mesa's virgl driver can
+    // drive it. Only the render node (no card0/KMS) is offered. Available only
+    // when a 3D driver has registered GpuAppOps. (GL shim — see
+    // artifacts/gl-drm-enumeration-spike.md.)
+    if (StrEq(path, "/dev/dri/renderD128"))
+    {
+        if (!brook::GpuAppGet()) return -ENODEV;
+        auto* dctx = static_cast<DrmCtx*>(kmalloc(sizeof(DrmCtx)));
+        if (!dctx) return -ENOMEM;
+        memset(dctx, 0, sizeof(DrmCtx));
+        int fd = FdAlloc(proc, FdType::DevDri, dctx);
+        if (fd < 0) { kfree(dctx); return -EMFILE; }
+        DbgPrintf("sys_open: /dev/dri/renderD128 → fd %d\n", fd);
+        return fd;
+    }
+
+    // /dev/dri directory — enumerable so libdrm's drmGetDevices2 can list the
+    // render node. Allocate a synthetic-directory fd (recognised by the marker
+    // handle in getdents64/fstat). Only when a 3D driver is present.
+    if (StrEq(path, "/dev/dri") && brook::GpuAppGet())
+    {
+        int fd = FdAlloc(proc, FdType::SyntheticMem,
+                         const_cast<char*>(g_drmDriDirTag));
+        if (fd < 0) return -EMFILE;
+        proc->fds[fd].seekPos = 0;
+        proc->fds[fd].dirPath[0] = '\0';
+        return fd;
+    }
+
+    // DRM sysfs attribute files (/sys/dev/char/226:128/device/{uevent,vendor,…}).
+    // Served as read-only synthetic memory files for libdrm PCI device parsing.
+    if (brook::GpuAppGet())
+    {
+        const char* drmAttr = DrmSysAttrContent(path);
+        if (drmAttr)
+        {
+            int fd = FdAlloc(proc, FdType::SyntheticMem, const_cast<char*>(drmAttr));
+            if (fd < 0) return -EMFILE;
+            proc->fds[fd].seekPos = 0;
+            return fd;
+        }
     }
 
     // /dev/null — discard writes, EOF on read
@@ -3034,6 +3214,9 @@ void FinalizeClosedFd(const FdClaimResult& c)
     if (c.type == FdType::EventFd && c.handle)
         EventFdUnref(static_cast<EventFdData*>(c.handle));
 
+    if (c.type == FdType::DrmPrime && c.handle)
+        DrmPrimeUnref(static_cast<DrmPrimeObj*>(c.handle));
+
     if (c.type == FdType::EpollFd && c.handle)
         EpollFdUnref(static_cast<EpollInstance*>(c.handle));
 
@@ -3068,6 +3251,24 @@ void FinalizeClosedFd(const FdClaimResult& c)
         // DevKlog handle is a bare uint64_t* cursor — no refcount, just free.
         // Fork deep-copies it, so each process owns its own cursor.
         kfree(c.handle);
+    }
+
+    if (c.type == FdType::DevDri && c.handle)
+    {
+        // GL shim: tear down the per-fd DRM context — destroy its GpuApp virgl
+        // context (frees host resources) and free the GEM table.
+        auto* dctx = static_cast<DrmCtx*>(c.handle);
+        const brook::GpuAppOps* ga = brook::GpuAppGet();
+        if (ga && ga->CtxDestroy && dctx->ctxId > 0)
+            ga->CtxDestroy(dctx->ctxId);
+        // Free any mappable resource backing allocated by VIRTGPU_MAP.
+        for (uint32_t i = 0; i < DRM_MAX_GEM; ++i) {
+            if (dctx->gem[i].used && dctx->gem[i].backingKva) {
+                uint64_t bpages = (dctx->gem[i].backingBytes + 4095) / 4096;
+                VmmFreePages(VirtualAddress(dctx->gem[i].backingKva), bpages);
+            }
+        }
+        kfree(dctx);
     }
 
     if (c.type == FdType::DevTty && c.handle)
@@ -3248,6 +3449,9 @@ static void FdBumpRefcount(FdEntry* fde)
         break;
     case FdType::EventFd:
         EventFdRef(static_cast<EventFdData*>(fde->handle));
+        break;
+    case FdType::DrmPrime:
+        DrmPrimeRef(static_cast<DrmPrimeObj*>(fde->handle));
         break;
     case FdType::EpollFd:
         EpollFdRef(static_cast<EpollInstance*>(fde->handle));
@@ -3656,6 +3860,43 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     // Device or file-backed mmap
     FdEntry* fde = FdGet(proc, static_cast<int>(fd));
     if (!fde) return -EBADF;
+
+    // virtio-gpu DRM render node: map a resource's guest backing (allocated by
+    // the VIRTGPU_MAP ioctl) into user space. The mmap offset encodes the GEM
+    // handle in its high 32 bits. The same physical pages are attached to the
+    // host virgl resource, so TRANSFER_FROM_HOST DMAs land in this mapping.
+    if (fde->type == FdType::DevDri)
+    {
+        auto* dctx = static_cast<DrmCtx*>(fde->handle);
+        if (!dctx) return -ENODEV;
+        uint32_t bo = static_cast<uint32_t>(offset >> 32);
+        DrmGemObj* g = DrmGemGet(dctx, bo);
+        if (!g || g->backingKva == 0) return -EINVAL;
+        uint64_t bpages = (g->backingBytes + 4095) / 4096;
+        if (pages > bpages) pages = bpages;
+        uint64_t vaddr = pickAddr();
+        if (!vaddr) return -ENOMEM;
+        for (uint64_t i = 0; i < pages; ++i)
+        {
+            PhysicalAddress phys = VmmVirtToPhys(KernelPageTable,
+                VirtualAddress(g->backingKva + i * 4096));
+            if (!phys) return -ENOMEM;
+            if (!VmmMapPage(proc->pageTable, VirtualAddress(vaddr + i * 4096),
+                            phys, VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
+                            MemTag::Device, proc->pid))
+                return -ENOMEM;
+        }
+        // Record as a device map so munmap leaves the backing pages alone
+        // (they are owned by the GEM object / virgl context, freed on close).
+        for (uint32_t i = 0; i < Process::MAX_FB_MAPS; ++i) {
+            if (proc->fbMaps[i].length == 0) {
+                proc->fbMaps[i].vaddr  = vaddr;
+                proc->fbMaps[i].length = pages * 4096;
+                break;
+            }
+        }
+        return static_cast<int64_t>(vaddr);
+    }
 
     // Framebuffer device: map physical framebuffer memory into user space
     if (fde->type == FdType::DevFramebuf)
@@ -5303,7 +5544,19 @@ resolve_path:
     // threads may still be executing user code backed by the old page
     // table / file VMAs, causing use-after-free crashes (BRO-091).
     if (proc->tgid && proc->pid == proc->tgid)
+    {
         SchedulerKillThreadGroup(proc->tgid, proc);
+        // SchedulerKillThreadGroup latches tgidExiting=true on the whole group
+        // (including this surviving leader) to stillbirth any racing clone.
+        // But execve is a RE-IMAGE, not a group exit: this thread lives on as
+        // the new program. The kill is synchronous (all siblings are reaped on
+        // return) and this is now the only live thread, so clear the latch —
+        // otherwise the re-imaged program's own future threads (e.g. an SDL
+        // audio thread) are wrongly stillborn and it blocks forever waiting on
+        // a thread that never runs. (This silently broke launcher/makeWrapper
+        // style programs that exec then spawn threads.)
+        __atomic_store_n(&proc->tgidExiting, false, __ATOMIC_RELEASE);
+    }
 
     // --- Replace the process image ---
     uint64_t newStackPtr = 0;
@@ -5823,6 +6076,482 @@ struct FbFixScreeninfo {
     uint16_t reserved[2];
 };
 
+// ---------------------------------------------------------------------------
+// virtio-gpu DRM render node (/dev/dri/renderD128) — GL shim, Milestone 0.
+//
+// Maps the Linux virtio-gpu DRM uABI onto Brook's native per-process GPU path
+// (GpuAppOps) so unmodified Mesa's virgl driver can drive it. M0 implements the
+// device-identification / capability ioctls Mesa issues during initialization
+// (VERSION, GET_CAP, VIRTGPU_GETPARAM, VIRTGPU_GET_CAPS) — verified against a
+// real virtio-gpu node via a host Mesa strace (see
+// artifacts/gl-drm-enumeration-spike.md). M1 adds the resource/submit ioctls
+// (CONTEXT_INIT, RESOURCE_CREATE, RESOURCE_INFO, TRANSFER_*, EXECBUFFER, WAIT,
+// GEM_CLOSE) over GpuAppOps, with a per-fd GEM-handle->virgl-resid table.
+//
+// ioctl command words are _IOWR('d', nr, struct): the low byte is the request
+// number (nr), the next byte is the type ('d' = 0x64); size/dir occupy the high
+// bits and are ignored here (Linux drivers dispatch on type+nr).
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr uint8_t  DRM_IOCTL_TYPE        = 'd';   // 0x64
+constexpr uint8_t  DRM_NR_VERSION        = 0x00;  // DRM_IOCTL_VERSION
+constexpr uint8_t  DRM_NR_GEM_CLOSE      = 0x09;  // DRM_IOCTL_GEM_CLOSE
+constexpr uint8_t  DRM_NR_PRIME_HANDLE_TO_FD = 0x2d;  // DRM_IOCTL_PRIME_HANDLE_TO_FD
+constexpr uint8_t  DRM_NR_PRIME_FD_TO_HANDLE = 0x2e;  // DRM_IOCTL_PRIME_FD_TO_HANDLE
+constexpr uint8_t  DRM_NR_GET_CAP        = 0x0c;  // DRM_IOCTL_GET_CAP
+constexpr uint8_t  DRM_COMMAND_BASE      = 0x40;  // driver-private ioctl base
+constexpr uint8_t  DRM_NR_VIRTGPU_MAP            = DRM_COMMAND_BASE + 0x01; // 0x41
+constexpr uint8_t  DRM_NR_VIRTGPU_EXECBUFFER     = DRM_COMMAND_BASE + 0x02; // 0x42
+constexpr uint8_t  DRM_NR_VIRTGPU_GETPARAM       = DRM_COMMAND_BASE + 0x03; // 0x43
+constexpr uint8_t  DRM_NR_VIRTGPU_RESOURCE_CREATE= DRM_COMMAND_BASE + 0x04; // 0x44
+constexpr uint8_t  DRM_NR_VIRTGPU_RESOURCE_INFO  = DRM_COMMAND_BASE + 0x05; // 0x45
+constexpr uint8_t  DRM_NR_VIRTGPU_TRANSFER_FROM_HOST = DRM_COMMAND_BASE + 0x06; // 0x46
+constexpr uint8_t  DRM_NR_VIRTGPU_TRANSFER_TO_HOST   = DRM_COMMAND_BASE + 0x07; // 0x47
+constexpr uint8_t  DRM_NR_VIRTGPU_WAIT           = DRM_COMMAND_BASE + 0x08; // 0x48
+constexpr uint8_t  DRM_NR_VIRTGPU_GET_CAPS       = DRM_COMMAND_BASE + 0x09; // 0x49
+constexpr uint8_t  DRM_NR_VIRTGPU_CONTEXT_INIT   = DRM_COMMAND_BASE + 0x0b; // 0x4b
+
+// virtio-gpu DRM driver identity (matches the upstream kernel driver).
+constexpr int32_t  VIRTGPU_DRIVER_MAJOR  = 0;
+constexpr int32_t  VIRTGPU_DRIVER_MINOR  = 1;
+constexpr int32_t  VIRTGPU_DRIVER_PATCH  = 0;
+
+// struct drm_version (64-bit layout; size_t/ptr are 8 bytes, with 4 bytes of
+// padding after the three int fields to align name_len).
+struct DrmVersion {
+    int32_t  version_major;
+    int32_t  version_minor;
+    int32_t  version_patchlevel;
+    int32_t  _pad;
+    uint64_t name_len;
+    uint64_t name;          // char*
+    uint64_t date_len;
+    uint64_t date;          // char*
+    uint64_t desc_len;
+    uint64_t desc;          // char*
+};
+
+struct DrmGetCap   { uint64_t capability; uint64_t value; };
+
+// DRM_CAP_PRIME (capability id 0x5) bits: import/export support. Mesa queries
+// this during init to decide whether dmabuf sharing is available.
+constexpr uint64_t DRM_CAP_PRIME            = 0x5;
+constexpr uint64_t DRM_PRIME_CAP_IMPORT     = 0x1;
+constexpr uint64_t DRM_PRIME_CAP_EXPORT     = 0x2;
+
+// struct drm_prime_handle — the argument to PRIME_HANDLE_TO_FD / FD_TO_HANDLE.
+struct DrmPrimeHandle {
+    uint32_t handle;   // GEM bo_handle (in for export, out for import)
+    uint32_t flags;    // DRM_CLOEXEC | DRM_RDWR (export only)
+    int32_t  fd;       // dmabuf fd (out for export, in for import)
+};
+struct DrmVirtgpuGetparam { uint64_t param; uint64_t value; }; // value = user u64*
+struct DrmVirtgpuGetCaps {
+    uint32_t cap_set_id; uint32_t cap_set_ver;
+    uint64_t addr; uint32_t size; uint32_t pad;
+};
+
+// M1 ioctl structs (virtgpu_drm.h, exact layout).
+struct DrmGemClose { uint32_t handle; uint32_t pad; };
+struct DrmVirtgpuResourceCreate {
+    uint32_t target, format, bind, width, height, depth, array_size;
+    uint32_t last_level, nr_samples, flags;
+    uint32_t bo_handle;   // in: recreate attached to this bo; out: GEM handle
+    uint32_t res_handle;  // out: host resource id
+    uint32_t size, stride;
+};
+struct DrmVirtgpuResourceInfo {
+    uint32_t bo_handle, res_handle, size, blob_mem;
+};
+struct DrmVirtgpu3dBox { uint32_t x, y, z, w, h, d; };
+struct DrmVirtgpu3dTransfer {     // to_host and from_host share this layout
+    uint32_t bo_handle;
+    DrmVirtgpu3dBox box;
+    uint32_t level, offset, stride, layer_stride;
+};
+struct DrmVirtgpuExecbuffer {
+    uint32_t flags, size;
+    uint64_t command;        // void* to virgl dwords
+    uint64_t bo_handles;     // u32* residency list
+    uint32_t num_bo_handles;
+    int32_t  fence_fd;
+    uint32_t ring_idx, syncobj_stride, num_in_syncobjs, num_out_syncobjs;
+    uint64_t in_syncobjs, out_syncobjs;
+};
+struct DrmVirtgpu3dWait { uint32_t handle, flags; };
+struct DrmVirtgpuMap { uint64_t offset; uint32_t handle, pad; };
+struct DrmVirtgpuContextSetParam { uint64_t param, value; };
+struct DrmVirtgpuContextInit {
+    uint32_t num_params, pad;
+    uint64_t ctx_set_params;  // DrmVirtgpuContextSetParam*
+};
+
+// VIRTGPU_PARAM_* (virtgpu_drm.h).
+constexpr uint64_t VIRTGPU_PARAM_3D_FEATURES        = 1;
+constexpr uint64_t VIRTGPU_PARAM_CAPSET_QUERY_FIX   = 2;
+constexpr uint64_t VIRTGPU_PARAM_RESOURCE_BLOB      = 3;
+constexpr uint64_t VIRTGPU_PARAM_HOST_VISIBLE       = 4;
+constexpr uint64_t VIRTGPU_PARAM_CROSS_DEVICE       = 5;
+constexpr uint64_t VIRTGPU_PARAM_CONTEXT_INIT       = 6;
+constexpr uint64_t VIRTGPU_PARAM_SUPPORTED_CAPSET_IDs = 7;
+constexpr uint64_t VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME  = 8;
+
+} // namespace
+
+// Copy a NUL-padded string into a user buffer following the DRM len/ptr
+// protocol: always report the true length in *outLen; copy min(provided, true)
+// bytes if the user gave a buffer. libdrm calls twice (first to learn the
+// length, then with an allocated buffer).
+static void DrmFillStr(uint64_t userPtr, uint64_t& userLen, const char* s)
+{
+    uint64_t actual = 0;
+    while (s[actual]) ++actual;
+    if (userPtr && userLen)
+    {
+        uint64_t n = userLen < actual ? userLen : actual;
+        CopyToUser(userPtr, s, n);
+    }
+    userLen = actual;
+}
+
+// Ensure a GEM-backed resource has guest backing pages attached to its host
+// virgl resource (an iov). virglrenderer requires src_res->iov != NULL for the
+// COPY_TRANSFER3D (READ_FROM_HOST) that Mesa emits for glReadPixels — and that
+// applies to the *render target* being read, not just the staging buffer, so we
+// must attach backing to every resource at creation time, not lazily at MAP
+// (Mesa never MAPs a render target). Idempotent: a second call is a no-op once
+// backingKva is set, so MAP reuses the same pages. Returns false only on OOM.
+static bool DrmEnsureBacking(DrmCtx* dctx, DrmGemObj* g)
+{
+    if (g->backingKva != 0) return true;
+    uint32_t bytes = g->backingBytes ? g->backingBytes
+                   : (g->size ? g->size
+                              : g->stride * (g->height ? g->height : 1));
+    if (bytes == 0) return false;
+    uint64_t pages = (bytes + 4095) / 4096;
+    VirtualAddress kva = VmmAllocPages(pages, VMM_WRITABLE,
+                                       MemTag::Device, KernelPid);
+    if (!kva.raw()) return false;
+    auto* zp = reinterpret_cast<volatile uint8_t*>(kva.raw());
+    for (uint64_t b = 0; b < pages * 4096; ++b) zp[b] = 0;
+    const brook::GpuAppOps* ga = brook::GpuAppGet();
+    if (ga && ga->ResourceAttachUser)
+        ga->ResourceAttachUser(dctx->ctxId, (int32_t)g->gres, kva.raw(), bytes);
+    g->backingKva = kva.raw();
+    g->backingBytes = bytes;
+    return true;
+}
+
+static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
+{
+    switch (nr)
+    {
+    case DRM_NR_VERSION:
+    {
+        if (!UserBufferReadable(arg, sizeof(DrmVersion)) ||
+            !UserBufferWritable(arg, sizeof(DrmVersion)))
+            return -EFAULT;
+        DrmVersion v;
+        for (uint64_t i = 0; i < sizeof(v); ++i)
+            reinterpret_cast<char*>(&v)[i] = reinterpret_cast<char*>(arg)[i];
+        v.version_major = VIRTGPU_DRIVER_MAJOR;
+        v.version_minor = VIRTGPU_DRIVER_MINOR;
+        v.version_patchlevel = VIRTGPU_DRIVER_PATCH;
+        DrmFillStr(v.name, v.name_len, "virtio_gpu");
+        DrmFillStr(v.date, v.date_len, "0");
+        DrmFillStr(v.desc, v.desc_len, "Brook virtio-gpu GL shim");
+        if (!CopyToUser(arg, &v, sizeof(v))) return -EFAULT;
+        return 0;
+    }
+    case DRM_NR_GET_CAP:
+    {
+        if (!UserBufferReadable(arg, sizeof(DrmGetCap)) ||
+            !UserBufferWritable(arg, sizeof(DrmGetCap)))
+            return -EFAULT;
+        DrmGetCap c = *reinterpret_cast<DrmGetCap*>(arg);
+        // Advertise PRIME import+export so Mesa enables the dmabuf sharing path
+        // (windowed GL presentation). Everything else (dumb buffers, etc.) stays
+        // unadvertised — we only support the GPU-resource dmabuf path.
+        c.value = (c.capability == DRM_CAP_PRIME)
+                ? (DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT)
+                : 0;
+        return CopyToUser(arg, &c, sizeof(c)) ? 0 : -EFAULT;
+    }
+    case DRM_NR_VIRTGPU_GETPARAM:
+    {
+        if (!UserBufferReadable(arg, sizeof(DrmVirtgpuGetparam)))
+            return -EFAULT;
+        DrmVirtgpuGetparam p = *reinterpret_cast<DrmVirtgpuGetparam*>(arg);
+        uint64_t val;
+        switch (p.param)
+        {
+        case VIRTGPU_PARAM_3D_FEATURES:       val = 1; break;
+        case VIRTGPU_PARAM_CAPSET_QUERY_FIX:  val = 1; break;
+        case VIRTGPU_PARAM_CONTEXT_INIT:      val = 1; break;
+        // capset id bitmask: VIRGL(1) | VIRGL2(2).
+        case VIRTGPU_PARAM_SUPPORTED_CAPSET_IDs: val = (1u << 1) | (1u << 2); break;
+        case VIRTGPU_PARAM_RESOURCE_BLOB:     val = 0; break;
+        case VIRTGPU_PARAM_HOST_VISIBLE:      val = 0; break;
+        case VIRTGPU_PARAM_CROSS_DEVICE:      val = 0; break;
+        case VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME: val = 0; break;
+        default: return -EINVAL;
+        }
+        if (!CopyToUser(p.value, &val, sizeof(val))) return -EFAULT;
+        return 0;
+    }
+    case DRM_NR_VIRTGPU_GET_CAPS:
+    {
+        if (!UserBufferReadable(arg, sizeof(DrmVirtgpuGetCaps)))
+            return -EFAULT;
+        DrmVirtgpuGetCaps gc = *reinterpret_cast<DrmVirtgpuGetCaps*>(arg);
+        if (gc.size == 0 || gc.size > 64u * 1024) return -EINVAL;
+        if (!UserBufferWritable(gc.addr, gc.size)) return -EFAULT;
+        // Fetch the REAL virgl capset blob from the host so Mesa binds the
+        // hardware virgl screen (instead of falling back to llvmpipe). The
+        // driver issues VIRTIO_GPU_CMD_GET_CAPSET(id, version) and copies the
+        // blob into the user buffer. Zero the tail so any bytes the host didn't
+        // supply read as 0 (Mesa reads a fixed-size union virgl_caps).
+        const brook::GpuAppOps* ga = brook::GpuAppGet();
+        if (!ga || !ga->GetCapset) return -ENODEV;
+        for (uint32_t i = 0; i < gc.size; ++i)
+            reinterpret_cast<char*>(gc.addr)[i] = 0;
+        int32_t n = ga->GetCapset(gc.cap_set_id, gc.cap_set_ver,
+                                  reinterpret_cast<void*>(gc.addr), gc.size);
+        if (n < 0) return -EINVAL;
+        return 0;
+    }
+    // --- M1: resource / submit path (per-fd GEM table -> host virgl ids) ---
+    case DRM_NR_VIRTGPU_CONTEXT_INIT:
+    {
+        // Create the per-fd virgl context. We ignore the requested capset
+        // params (only VIRGL is offered); the GpuApp driver picks VIRGL.
+        if (dctx->ctxId > 0) return 0;   // already initialised
+        const brook::GpuAppOps* ga = brook::GpuAppGet();
+        if (!ga || !ga->CtxCreate) return -ENODEV;
+        Process* proc = ProcessCurrent();
+        int32_t ctx = ga->CtxCreate(proc ? proc->pid : 0);
+        if (ctx < 0) return -ENOMEM;
+        dctx->ctxId = ctx;
+        return 0;
+    }
+    case DRM_NR_VIRTGPU_RESOURCE_CREATE:
+    {
+        if (!UserBufferReadable(arg, sizeof(DrmVirtgpuResourceCreate)) ||
+            !UserBufferWritable(arg, sizeof(DrmVirtgpuResourceCreate)))
+            return -EFAULT;
+        DrmVirtgpuResourceCreate rc = *reinterpret_cast<DrmVirtgpuResourceCreate*>(arg);
+        const brook::GpuAppOps* ga = brook::GpuAppGet();
+        if (!ga || !ga->ResourceCreate3D) return -ENODEV;
+        // Context is created lazily if the client skipped CONTEXT_INIT.
+        if (dctx->ctxId <= 0) {
+            if (!ga->CtxCreate) return -ENODEV;
+            Process* proc = ProcessCurrent();
+            int32_t ctx = ga->CtxCreate(proc ? proc->pid : 0);
+            if (ctx < 0) return -ENOMEM;
+            dctx->ctxId = ctx;
+        }
+        // target 0 = PIPE_BUFFER: a 1D linear buffer whose "width" is a byte
+        // count (e.g. glReadPixels staging), so it can far exceed the 2D texture
+        // dimension cap. Validate buffers by byte size, textures by dimension.
+        bool isBuffer = (rc.target == 0);
+        if (rc.width == 0) return -EINVAL;
+        if (isBuffer) {
+            if (rc.width > 256u * 1024 * 1024) return -EINVAL;   // 256 MB cap
+        } else if (rc.width > 16384 || rc.height > 16384) {
+            return -EINVAL;
+        }
+        uint32_t createH = rc.height ? rc.height : 1;   // PIPE_BUFFER is 1D (h=0)
+        int32_t gres = ga->ResourceCreate3D(dctx->ctxId, rc.target, rc.format,
+                                            rc.bind, rc.width, createH,
+                                            rc.depth, rc.array_size,
+                                            rc.last_level, rc.nr_samples,
+                                            rc.flags);
+        if (gres < 0) return -ENOMEM;
+        // For a buffer the "stride" is its byte length, not width*texel; for a
+        // 2D texture default to width*4 bytes/texel when the client omits stride.
+        uint32_t stride = rc.stride ? rc.stride
+                        : (isBuffer ? rc.width : rc.width * 4);
+        // Mesa allocates no guest storage for host-side textures and passes a
+        // bogus rc.size (often 1), so never honour it for a texture — compute
+        // the full row-stride*height extent. Buffers carry a real byte count.
+        uint32_t size = isBuffer ? (rc.size ? rc.size : rc.width)
+                                 : stride * createH;
+        uint32_t bo = DrmGemAlloc(dctx, (uint32_t)gres, size, stride,
+                                  rc.width, createH);
+        if (bo == 0) return -ENOMEM;   // GEM table full
+        // Attach guest backing now (not lazily at MAP): a render target read by
+        // Mesa's glReadPixels COPY_TRANSFER3D must already have an iov, or
+        // virglrenderer rejects the command (check_copy_transfer3d_handles).
+        DrmGemObj* gobj = DrmGemGet(dctx, bo);
+        if (gobj && !DrmEnsureBacking(dctx, gobj)) return -ENOMEM;
+        rc.res_handle = (uint32_t)gres;   // host id, used inside virgl streams
+        rc.bo_handle  = bo;               // per-fd GEM handle, used in ioctls
+        rc.size = size; rc.stride = stride;
+        return CopyToUser(arg, &rc, sizeof(rc)) ? 0 : -EFAULT;
+    }
+    case DRM_NR_VIRTGPU_RESOURCE_INFO:
+    {
+        if (!UserBufferReadable(arg, sizeof(DrmVirtgpuResourceInfo)) ||
+            !UserBufferWritable(arg, sizeof(DrmVirtgpuResourceInfo)))
+            return -EFAULT;
+        DrmVirtgpuResourceInfo ri = *reinterpret_cast<DrmVirtgpuResourceInfo*>(arg);
+        DrmGemObj* g = DrmGemGet(dctx, ri.bo_handle);
+        if (!g) return -ENOENT;
+        ri.res_handle = g->gres;
+        ri.size = g->size;
+        ri.blob_mem = 0;
+        return CopyToUser(arg, &ri, sizeof(ri)) ? 0 : -EFAULT;
+    }
+    case DRM_NR_VIRTGPU_TRANSFER_TO_HOST:
+    case DRM_NR_VIRTGPU_TRANSFER_FROM_HOST:
+    {
+        if (!UserBufferReadable(arg, sizeof(DrmVirtgpu3dTransfer)))
+            return -EFAULT;
+        DrmVirtgpu3dTransfer t = *reinterpret_cast<DrmVirtgpu3dTransfer*>(arg);
+        if (dctx->ctxId <= 0) return -EINVAL;
+        DrmGemObj* g = DrmGemGet(dctx, t.bo_handle);
+        if (!g) return -ENOENT;
+        const brook::GpuAppOps* ga = brook::GpuAppGet();
+        if (!ga || !ga->Transfer3D) return -ENODEV;
+        int dir = (nr == DRM_NR_VIRTGPU_TRANSFER_TO_HOST) ? 0 : 1;
+        uint32_t w = t.box.w ? t.box.w : g->width;
+        uint32_t h = t.box.h ? t.box.h : g->height;
+        uint32_t texW = g->width ? g->width : w;
+        uint32_t texH = g->height ? g->height : h;
+        int32_t r = ga->Transfer3D(dctx->ctxId, (int32_t)g->gres, dir,
+                                   t.box.x, t.box.y, w, h, texW, texH);
+        return r < 0 ? -EIO : 0;
+    }
+    case DRM_NR_VIRTGPU_EXECBUFFER:
+    {
+        if (!UserBufferReadable(arg, sizeof(DrmVirtgpuExecbuffer)))
+            return -EFAULT;
+        DrmVirtgpuExecbuffer eb = *reinterpret_cast<DrmVirtgpuExecbuffer*>(arg);
+        if (dctx->ctxId <= 0) return -EINVAL;
+        if (eb.size == 0 || (eb.size & 3) || eb.size > 1024u * 1024) return -EINVAL;
+        if (!UserBufferReadable(eb.command, eb.size)) return -EFAULT;
+        const brook::GpuAppOps* ga = brook::GpuAppGet();
+        if (!ga || !ga->Submit3D) return -ENODEV;
+        uint32_t nDw = eb.size / 4;
+        auto* cmd = static_cast<uint32_t*>(kmalloc(eb.size));
+        if (!cmd) return -ENOMEM;
+        for (uint32_t i = 0; i < nDw; ++i)
+            cmd[i] = reinterpret_cast<const uint32_t*>(eb.command)[i];
+        int32_t r = ga->Submit3D(dctx->ctxId, cmd, nDw);
+        kfree(cmd);
+        // Out-fence: Submit3D is synchronous, so by the time we return the GPU
+        // work is already complete. Mesa (FENCE_FD_OUT) expects a sync-file fd it
+        // will poll(POLLIN) on and then close. Hand back an already-signaled
+        // eventfd (counter=1) so the poll completes immediately; a bare -1 makes
+        // Mesa poll a negative fd with an infinite timeout and hang forever.
+        if (eb.flags & 0x02 /*FENCE_FD_OUT*/) {
+            int fenceFd = -1;
+            Process* fp = ProcessCurrent();
+            if (fp) {
+                auto* efd = static_cast<EventFdData*>(kmalloc(sizeof(EventFdData)));
+                if (efd) {
+                    efd->counter = 1;        // pre-signaled (work already done)
+                    efd->flags = 0;
+                    efd->refCount = 1;
+                    efd->readerWaiter = nullptr;
+                    efd->epollWaiter = nullptr;
+                    fenceFd = FdAlloc(fp, FdType::EventFd, efd);
+                    if (fenceFd < 0) kfree(efd);
+                }
+            }
+            eb.fence_fd = fenceFd;
+            CopyToUser(arg, &eb, sizeof(eb));
+        }
+        return r < 0 ? -EIO : 0;
+    }
+    case DRM_NR_VIRTGPU_WAIT:
+    {
+        // Submits are synchronous (the driver busy-polls the host), so by the
+        // time a client waits, the work is already complete.
+        return 0;
+    }
+    case DRM_NR_PRIME_HANDLE_TO_FD:
+    {
+        // Export a GEM (render target) as a PRIME dmabuf fd: a capability that
+        // wraps the GEM's host virgl resource (gres). The client passes this fd
+        // over the Wayland socket so the compositor can import + present it.
+        if (!UserBufferReadable(arg, sizeof(DrmPrimeHandle)) ||
+            !UserBufferWritable(arg, sizeof(DrmPrimeHandle)))
+            return -EFAULT;
+        DrmPrimeHandle ph = *reinterpret_cast<DrmPrimeHandle*>(arg);
+        DrmGemObj* g = DrmGemGet(dctx, ph.handle);
+        if (!g) return -ENOENT;
+        Process* proc = ProcessCurrent();
+        if (!proc) return -ESRCH;
+        auto* p = static_cast<DrmPrimeObj*>(kmalloc(sizeof(DrmPrimeObj)));
+        if (!p) return -ENOMEM;
+        p->gres       = g->gres;
+        p->size       = g->size;
+        p->stride     = g->stride;
+        p->width      = g->width;
+        p->height     = g->height;
+        p->fourcc     = 0;
+        p->ownerCtxId = dctx->ctxId;
+        p->refCount   = 1;   // held by the fd we are about to allocate
+        int fd = FdAlloc(proc, FdType::DrmPrime, p);
+        if (fd < 0) { kfree(p); return -EMFILE; }
+        ph.fd = fd;
+        return CopyToUser(arg, &ph, sizeof(ph)) ? 0 : -EFAULT;
+    }
+    case DRM_NR_PRIME_FD_TO_HANDLE:
+    {
+        // Import a PRIME dmabuf fd (received over the Wayland socket) into a GEM
+        // handle aliasing the SAME gres. Possession of the fd IS the
+        // authorization — a process cannot reach a gres it was never handed.
+        if (!UserBufferReadable(arg, sizeof(DrmPrimeHandle)) ||
+            !UserBufferWritable(arg, sizeof(DrmPrimeHandle)))
+            return -EFAULT;
+        DrmPrimeHandle ph = *reinterpret_cast<DrmPrimeHandle*>(arg);
+        Process* proc = ProcessCurrent();
+        if (!proc) return -ESRCH;
+        FdEntry* fde = FdGet(proc, ph.fd);
+        if (!fde || fde->type != FdType::DrmPrime || !fde->handle) return -EINVAL;
+        auto* p = static_cast<DrmPrimeObj*>(fde->handle);
+        uint32_t bo = DrmGemAllocImported(dctx, p->gres, p->size, p->stride,
+                                          p->width, p->height);
+        if (bo == 0) return -ENOMEM;
+        ph.handle = bo;
+        return CopyToUser(arg, &ph, sizeof(ph)) ? 0 : -EFAULT;
+    }
+    case DRM_NR_GEM_CLOSE:
+    {
+        if (!UserBufferReadable(arg, sizeof(DrmGemClose))) return -EFAULT;
+        DrmGemClose gc = *reinterpret_cast<DrmGemClose*>(arg);
+        DrmGemObj* g = DrmGemGet(dctx, gc.handle);
+        if (!g) return -ENOENT;
+        // Note: the underlying host resource is reclaimed wholesale on
+        // CtxDestroy (fd close); per-handle host free lands with MAP/blob in M1b.
+        g->used = false;
+        return 0;
+    }
+    case DRM_NR_VIRTGPU_MAP:
+    {
+        // Map-for-CPU-access (e.g. glReadPixels staging buffers). Lazily
+        // allocate guest backing for the resource and attach it to the host
+        // virgl resource, so a later TRANSFER_FROM_HOST DMAs the rendered
+        // pixels into pages that sys_mmap then maps into user space. The
+        // returned offset is a token encoding the GEM handle (see sys_mmap).
+        if (!UserBufferReadable(arg, sizeof(DrmVirtgpuMap)) ||
+            !UserBufferWritable(arg, sizeof(DrmVirtgpuMap)))
+            return -EFAULT;
+        DrmVirtgpuMap m = *reinterpret_cast<DrmVirtgpuMap*>(arg);
+        DrmGemObj* g = DrmGemGet(dctx, m.handle);
+        if (!g) return -ENOENT;
+        if (!DrmEnsureBacking(dctx, g)) return -ENOMEM;
+        m.offset = static_cast<uint64_t>(m.handle) << 32;  // decoded in sys_mmap
+        return CopyToUser(arg, &m, sizeof(m)) ? 0 : -EFAULT;
+    }
+    default:
+        return -25; // ENOTTY
+    }
+}
+
 static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
                           uint64_t, uint64_t, uint64_t)
 {
@@ -5873,6 +6602,15 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         }
         *reinterpret_cast<int*>(arg) = available;
         return 0;
+    }
+
+    if (fde->type == FdType::DevDri)
+    {
+        uint8_t type = static_cast<uint8_t>((cmd >> 8) & 0xFF);
+        uint8_t nr   = static_cast<uint8_t>(cmd & 0xFF);
+        if (type != DRM_IOCTL_TYPE) return -25; // ENOTTY
+        if (!fde->handle) return -EBADF;
+        return DrmRenderIoctl(static_cast<DrmCtx*>(fde->handle), nr, arg);
     }
 
     if (fde->type == FdType::DevFramebuf)
@@ -6515,6 +7253,45 @@ static bool BusyboxStatFallback(const char* path, VnodeStat* vs)
     return false;
 }
 
+// GL shim (M0): fill a LinuxStat for the synthetic DRM devfs/sysfs entries
+// (/dev/dri[/renderD128], /sys/dev/char/226:128/device/...). Returns true if
+// `path` is a DRM-shim entry (and fills *st), false otherwise. Gated on a 3D
+// driver being present so we never advertise an unusable node.
+static bool DrmStatFill(const char* path, LinuxStat* st)
+{
+    if (!brook::GpuAppGet()) return false;
+    if (StrEq(path, "/dev/dri/renderD128"))
+    {
+        memset(st, 0, sizeof(*st));
+        st->st_mode = 0020666; // S_IFCHR | rw-rw-rw-
+        st->st_rdev = DRM_RENDER_RDEV;
+        st->st_nlink = 1;
+        st->st_blksize = 4096;
+        return true;
+    }
+    if (StrEq(path, "/dev/dri") || DrmSysIsDir(path))
+    {
+        memset(st, 0, sizeof(*st));
+        st->st_mode = 0040755; // S_IFDIR | rwxr-xr-x
+        st->st_nlink = 1;
+        st->st_blksize = 4096;
+        return true;
+    }
+    const char* drmAttr = DrmSysAttrContent(path);
+    if (drmAttr)
+    {
+        uint64_t len = 0; while (drmAttr[len]) ++len;
+        memset(st, 0, sizeof(*st));
+        st->st_mode = 0100444; // S_IFREG | r--r--r--
+        st->st_nlink = 1;
+        st->st_size = static_cast<int64_t>(len);
+        st->st_blksize = 4096;
+        st->st_blocks = 1;
+        return true;
+    }
+    return false;
+}
+
 // Internal stat helper — takes a kernel-space path directly (no user copy).
 // statAddr is the user-space address of the stat buffer.
 static int64_t do_stat_internal(const char* path, uint64_t statAddr)
@@ -6550,6 +7327,11 @@ static int64_t do_stat_internal(const char* path, uint64_t statAddr)
         resolved[ci] = '\0';
         lookup = resolved;
     }
+
+    // GL shim (M0): stat the synthetic DRM devfs/sysfs entries so libdrm can
+    // enumerate the render node. Only when a 3D driver is present.
+    if (DrmStatFill(lookup, st))
+        return 0;
 
     VnodeStat vs{};
     if (VfsStatPath(lookup, &vs) < 0)
@@ -6615,6 +7397,11 @@ static int64_t do_lstat_internal(const char* path, uint64_t statAddr)
         resolved[ci] = '\0';
         lookup = resolved;
     }
+
+    // GL shim (M0): the synthetic DRM entries are not symlinks, so lstat
+    // returns the same as stat (lets glibc realpath() resolve the device dir).
+    if (DrmStatFill(lookup, st))
+        return 0;
 
     VnodeStat vs{};
     if (VfsLstatPath(lookup, &vs) < 0)
@@ -6710,6 +7497,18 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
         return 0;
     }
 
+    // GL shim: /dev/dri/renderD128 is a char device (libdrm fstats the open fd
+    // to recover major:minor for its sysfs lookups).
+    if (fde->type == FdType::DevDri) {
+        auto* raw = reinterpret_cast<uint8_t*>(st);
+        memset(raw, 0, sizeof(LinuxStat));
+        st->st_mode = 0020666; // S_IFCHR | rw-rw-rw-
+        st->st_rdev = DRM_RENDER_RDEV;
+        st->st_nlink = 1;
+        st->st_blksize = 4096;
+        return 0;
+    }
+
     if (fde->type == FdType::Pipe) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
         memset(raw, 0, sizeof(LinuxStat));
@@ -6721,6 +7520,13 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
     if (fde->type == FdType::SyntheticMem) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
         memset(raw, 0, sizeof(LinuxStat));
+        // GL shim: the /dev/dri synthetic directory fd reports as a directory
+        // (opendir() fstats the fd and requires S_ISDIR).
+        if (fde->handle == g_drmDriDirTag) {
+            st->st_mode = 0040755; // S_IFDIR | rwxr-xr-x
+            st->st_blksize = 4096;
+            return 0;
+        }
         st->st_mode = 0100444; // S_IFREG | r--r--r--
         if (fde->handle) {
             auto* content = static_cast<const char*>(fde->handle);
@@ -6835,8 +7641,38 @@ static int64_t sys_getdents64(uint64_t fd, uint64_t bufAddr, uint64_t count,
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
     FdEntry* fde = FdGet(proc, static_cast<int>(fd));
-    if (!fde || fde->type != FdType::Vnode || !fde->handle) return -EBADF;
+    if (!fde) return -EBADF;
 
+    // Synthetic /dev/dri directory (GL shim M0): list ".", "..", "renderD128"
+    // so libdrm's drmGetDevices2 can discover the render node.
+    if (fde->type == FdType::SyntheticMem && fde->handle == g_drmDriDirTag)
+    {
+        static const char* driEntries[] = { ".", "..", "renderD128" };
+        auto* obuf = reinterpret_cast<uint8_t*>(bufAddr);
+        uint64_t opos = 0;
+        uint32_t ck = static_cast<uint32_t>(fde->seekPos);
+        while (ck < 3)
+        {
+            const char* nm = driEntries[ck];
+            uint64_t nameLen = 0;
+            while (nm[nameLen]) ++nameLen;
+            uint64_t reclen = (19 + nameLen + 1 + 7) & ~7ULL;
+            if (opos + reclen > count) break;
+            auto* ent = reinterpret_cast<LinuxDirent64*>(obuf + opos);
+            ent->d_ino = ck + 1;
+            ent->d_off = static_cast<int64_t>(ck + 1);
+            ent->d_reclen = static_cast<uint16_t>(reclen);
+            ent->d_type = (ck < 2) ? 4 : 2; // DT_DIR for . / .. ; DT_CHR for the node
+            for (uint64_t i = 0; i < nameLen; ++i) ent->d_name[i] = nm[i];
+            for (uint64_t i = nameLen; i < reclen - 19; ++i) ent->d_name[i] = '\0';
+            opos += reclen;
+            ++ck;
+        }
+        fde->seekPos = ck;
+        return static_cast<int64_t>(opos);
+    }
+
+    if (fde->type != FdType::Vnode || !fde->handle) return -EBADF;
     auto* vn = static_cast<Vnode*>(fde->handle);
     auto* buf = reinterpret_cast<uint8_t*>(bufAddr);
     uint64_t pos = 0;
@@ -7307,44 +8143,13 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
         proc->fds[newfd].seekPos = fde->seekPos;
         proc->fds[newfd].statusFlags = fde->statusFlags;
 
-        // Bump pipe refcount
-        if (fde->type == FdType::Pipe && fde->handle)
-        {
-            auto* pipe = static_cast<PipeBuffer*>(fde->handle);
-            if (fde->flags & 1)
-                __atomic_fetch_add(&pipe->writers, 1, __ATOMIC_RELEASE);
-            else
-                __atomic_fetch_add(&pipe->readers, 1, __ATOMIC_RELEASE);
-        }
-
-        // Bump vnode refcount
-        if (fde->type == FdType::Vnode && fde->handle)
-            __atomic_fetch_add(&static_cast<Vnode*>(fde->handle)->refCount, 1, __ATOMIC_RELEASE);
-
-        // Bump socket refcount
-        if (fde->type == FdType::Socket && fde->handle)
-        {
-            int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
-            brook::SockRef(sockIdx);
-        }
-
-        // Bump memfd refcount
-        if (fde->type == FdType::MemFd && fde->handle)
-            MemFdRef(static_cast<MemFdData*>(fde->handle));
-
-        if (fde->type == FdType::EventFd && fde->handle)
-            EventFdRef(static_cast<EventFdData*>(fde->handle));
-        if (fde->type == FdType::EpollFd && fde->handle)
-            EpollFdRef(static_cast<EpollInstance*>(fde->handle));
-        if (fde->type == FdType::TimerFd && fde->handle)
-            TimerFdRef(static_cast<TimerFdData*>(fde->handle));
-
-        // Bump unix socket refcount
-        if (fde->type == FdType::UnixSocket && fde->handle)
-        {
-            auto* usd = static_cast<UnixSocketData*>(fde->handle);
-            __atomic_fetch_add(&usd->refCount, 1, __ATOMIC_RELEASE);
-        }
+        // Bump the underlying object's refcount for the new fd. Use the shared
+        // helper (same as sys_dup) rather than a hand-rolled per-type list, so
+        // every fd type — including DrmPrime — is covered. A previous hand-rolled
+        // list here omitted DrmPrime, so a libwayland F_DUPFD_CLOEXEC dup of a
+        // PRIME dmabuf fd didn't take a ref; the client closing the original then
+        // freed the shared resource out from under the dup (BRO-191).
+        FdBumpRefcount(&proc->fds[newfd]);
 
         return newfd;
     }
@@ -7965,6 +8770,18 @@ static int64_t DoReadlink(const char* path, uint64_t bufAddr, uint64_t bufsiz)
 {
     if (!path) return -EFAULT;
     if (bufsiz == 0) return -EINVAL;
+
+    // GL shim (M0): the DRM device's 'subsystem' symlink. libdrm's
+    // get_subsystem_type() readlinks this and matches the basename to classify
+    // the bus; returning ".../pci" yields DRM_BUS_PCI for the virtio-gpu node.
+    if (StrEq(path, "/sys/dev/char/226:128/device/subsystem") && brook::GpuAppGet())
+    {
+        const char* tgt = "/sys/bus/pci";
+        uint64_t slen = 0; while (tgt[slen]) ++slen;
+        if (slen > bufsiz) slen = bufsiz;
+        if (!CopyToUser(bufAddr, tgt, slen)) return -EFAULT;
+        return static_cast<int64_t>(slen);
+    }
 
     // /proc/self/exe → return the process's executable path
     auto streq = [](const char* a, const char* b) {
@@ -9571,6 +10388,13 @@ static int64_t sys_statx(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
     if (!ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
         return -ENOENT;
 
+    // GL shim (M0): synthetic DRM devfs/sysfs entries (glibc stat() may route
+    // through statx). Reuse the shared LinuxStat filler, then convert.
+    {
+        LinuxStat dst;
+        if (DrmStatFill(resolved, &dst)) { fillStatxFromLinuxStat(dst); return 0; }
+    }
+
     static constexpr uint64_t AT_SYMLINK_NOFOLLOW = 0x100;
     int ret = (flags & AT_SYMLINK_NOFOLLOW)
         ? VfsLstatPath(resolved, &st)
@@ -10557,6 +11381,24 @@ static int64_t sys_brook_wm_signal_dirty(uint64_t wmId, uint64_t, uint64_t,
     return 0;
 }
 
+// 525: WM_PRESENT_GRES(wmId, gres, w, h) — present a hardware-GL (dmabuf) frame.
+// waylandd resolves a client's dmabuf to a host virgl resource id (gres) and
+// calls this so the compositor BLITs that resource into the window's content
+// texture. The gres must be one the caller legitimately holds (it came from the
+// caller importing a PRIME fd the client sent it over the Wayland socket).
+static int64_t sys_brook_wm_present_gres(uint64_t wmId, uint64_t gres,
+                                         uint64_t w, uint64_t h,
+                                         uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    if (wmId == 0 || gres == 0) return -EINVAL;
+    return brook::WmPresentExternalById(proc, static_cast<uint32_t>(wmId),
+                                        static_cast<uint32_t>(gres),
+                                        static_cast<uint32_t>(w),
+                                        static_cast<uint32_t>(h)) ? 0 : -ENOENT;
+}
+
 // 509: WM_SET_TITLE(wmId, title*)
 static int64_t sys_brook_wm_set_title(uint64_t wmId, uint64_t titlePtr,
                                        uint64_t, uint64_t, uint64_t, uint64_t)
@@ -10652,6 +11494,161 @@ static int64_t sys_brook_wm_set_decoration_mode(uint64_t wmId, uint64_t csd,
     if (!w) return -EINVAL;
     int idx = static_cast<int>(wmId) - 1;
     brook::WmSetClientSideDecoration(idx, csd != 0);
+    return 0;
+}
+
+// 0xB00 (2816): WM_SET_WINDOW_PROPERTIES(wmId, mask, opacity, blurRadius)
+//   Set per-window display properties. `mask` selects which to apply:
+//     bit 0 (WM_PROP_OPACITY) -> opacity  (0..255, 255 = opaque)
+//     bit 1 (WM_PROP_BLUR)    -> blurRadius (0 = off)
+//   A high (0xB00) number deliberately clear of the Linux and Windows syscall
+//   ranges. Replaces the opt/gpuopacity demo hook with a real per-window API;
+//   the GPU DRAW path composites each window at its own opacity (and, for frosted
+//   glass, its blur radius). Only the owning process may set its window's props.
+static int64_t sys_brook_wm_set_window_properties(uint64_t wmId, uint64_t mask,
+                                                   uint64_t opacity, uint64_t blurRadius,
+                                                   uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    if (wmId == 0 || wmId > 0xFFFFu) return -EINVAL;
+
+    brook::Window* w = brook::WmFindWindowById(proc, static_cast<uint32_t>(wmId));
+    if (!w) return -EINVAL;
+    int idx = static_cast<int>(wmId) - 1;
+    brook::WmSetWindowProperties(idx, static_cast<uint32_t>(mask),
+                                 static_cast<uint8_t>(opacity & 0xFF),
+                                 static_cast<uint8_t>(blurRadius & 0xFF));
+    return 0;
+}
+
+// ===========================================================================
+// App-GPU syscalls (0xB10..): per-process virgl context for userspace GL-style
+// rendering. The app gets its own context + resource ids, submits virgl command
+// streams, and reads results back into its window VFB. Backed by GpuAppOps,
+// which a 3D display driver registers. All gate on the caller owning the ctx
+// (proc->gpuAppCtx). Numbers sit in the high 0xB00 block (clear of Linux/Windows).
+// ===========================================================================
+
+// 0xB10: GPU_CTX_CREATE() -> ctxId (>0), or <0. One context per process.
+static int64_t sys_brook_gpu_ctx_create(uint64_t, uint64_t, uint64_t, uint64_t,
+                                         uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    const brook::GpuAppOps* ga = brook::GpuAppGet();
+    if (!ga || !ga->CtxCreate) return -ENODEV;
+    if (proc->gpuAppCtx > 0) return proc->gpuAppCtx;   // already have one
+    int32_t ctx = ga->CtxCreate(proc->pid);
+    if (ctx < 0) return -ENOMEM;
+    proc->gpuAppCtx = ctx;
+    return ctx;
+}
+
+// 0xB11: GPU_RESOURCE_CREATE(ctx, format, bind, w, h) -> host-global resId (>0)
+// or <0. The returned id is used directly in the app's virgl streams.
+static int64_t sys_brook_gpu_resource_create(uint64_t ctx, uint64_t format,
+                                             uint64_t bind, uint64_t w, uint64_t h,
+                                             uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    const brook::GpuAppOps* ga = brook::GpuAppGet();
+    if (!ga || !ga->ResourceCreate3D) return -ENODEV;
+    if ((int32_t)ctx != proc->gpuAppCtx || proc->gpuAppCtx <= 0) return -EPERM;
+    if (w == 0 || h == 0 || w > 8192 || h > 8192) return -EINVAL;
+    // This native ABI only creates 2-D textures; pass PIPE_TEXTURE_2D (2) so the
+    // driver picks the texture path (target 0 is reserved for PIPE_BUFFER).
+    int32_t res = ga->ResourceCreate3D((int32_t)ctx, /*PIPE_TEXTURE_2D=*/2u,
+                                       (uint32_t)format, (uint32_t)bind,
+                                       (uint32_t)w, (uint32_t)h,
+                                       /*depth=*/1u, /*arraySize=*/1u,
+                                       /*lastLevel=*/0u, /*nrSamples=*/0u,
+                                       /*flags=*/0u);
+    return res < 0 ? -ENOMEM : res;
+}
+
+// 0xB12: GPU_ATTACH_WINDOW(ctx, resId, wmId) — back a resource with the caller's
+// window VFB (kernel-mapped), so host-rendered pixels land straight in the
+// window. Convenience for the common "render into my window" case.
+static int64_t sys_brook_gpu_attach_window(uint64_t ctx, uint64_t resId,
+                                           uint64_t wmId, uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    const brook::GpuAppOps* ga = brook::GpuAppGet();
+    if (!ga || !ga->ResourceAttachUser) return -ENODEV;
+    if ((int32_t)ctx != proc->gpuAppCtx || proc->gpuAppCtx <= 0) return -EPERM;
+    brook::Window* win = brook::WmFindWindowById(proc, static_cast<uint32_t>(wmId));
+    if (!win || !win->vfb || !win->vfbBytes) return -EINVAL;
+    int32_t r = ga->ResourceAttachUser((int32_t)ctx, (int32_t)resId,
+                                       reinterpret_cast<uint64_t>(win->vfb),
+                                       static_cast<uint32_t>(win->vfbBytes));
+    return r < 0 ? -EINVAL : 0;
+}
+
+// 0xB16: GPU_UPLOAD_BUFFER(ctx, srcPtr, bytes) -> host-global resId (>0) or <0.
+// Creates a vertex-buffer resource holding a copy of the app's data (e.g.
+// vertices) and pushes it to the host; the returned id is used in the app's
+// virgl SET_VERTEX_BUFFERS command.
+static int64_t sys_brook_gpu_upload_buffer(uint64_t ctx, uint64_t srcPtr,
+                                           uint64_t bytes, uint64_t,
+                                           uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    const brook::GpuAppOps* ga = brook::GpuAppGet();
+    if (!ga || !ga->BufferUpload) return -ENODEV;
+    if ((int32_t)ctx != proc->gpuAppCtx || proc->gpuAppCtx <= 0) return -EPERM;
+    if (bytes == 0 || bytes > 16u * 1024 * 1024) return -EINVAL;
+    if (!UserBufferReadable(srcPtr, bytes)) return -EFAULT;
+    int32_t r = ga->BufferUpload((int32_t)ctx,
+                                 reinterpret_cast<const void*>(srcPtr), (uint32_t)bytes);
+    return r < 0 ? -EINVAL : r;
+}
+
+// 0xB13: GPU_SUBMIT(ctx, cmdPtr, nDwords) — submit a virgl command stream.
+static int64_t sys_brook_gpu_submit(uint64_t ctx, uint64_t cmdPtr, uint64_t nDwords,
+                                    uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    const brook::GpuAppOps* ga = brook::GpuAppGet();
+    if (!ga || !ga->Submit3D) return -ENODEV;
+    if ((int32_t)ctx != proc->gpuAppCtx || proc->gpuAppCtx <= 0) return -EPERM;
+    if (nDwords == 0 || nDwords > 8192) return -EINVAL;
+    if (!UserBufferReadable(cmdPtr, nDwords * 4)) return -EFAULT;
+    int32_t r = ga->Submit3D((int32_t)ctx, reinterpret_cast<const uint32_t*>(cmdPtr),
+                             (uint32_t)nDwords);
+    return r < 0 ? -EIO : 0;
+}
+
+// 0xB14: GPU_TRANSFER(ctx, resId, dir, w, h) — dir 0=to host, 1=from host.
+static int64_t sys_brook_gpu_transfer(uint64_t ctx, uint64_t resId, uint64_t dir,
+                                      uint64_t w, uint64_t h, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    const brook::GpuAppOps* ga = brook::GpuAppGet();
+    if (!ga || !ga->Transfer3D) return -ENODEV;
+    if ((int32_t)ctx != proc->gpuAppCtx || proc->gpuAppCtx <= 0) return -EPERM;
+    if (w == 0 || h == 0 || w > 8192 || h > 8192) return -EINVAL;
+    int32_t r = ga->Transfer3D((int32_t)ctx, (int32_t)resId, (int)dir,
+                               0, 0, (uint32_t)w, (uint32_t)h, (uint32_t)w, (uint32_t)h);
+    return r < 0 ? -EIO : 0;
+}
+
+// 0xB15: GPU_CTX_DESTROY(ctx) — release the process's GPU context.
+static int64_t sys_brook_gpu_ctx_destroy(uint64_t ctx, uint64_t, uint64_t, uint64_t,
+                                         uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    const brook::GpuAppOps* ga = brook::GpuAppGet();
+    if (!ga || !ga->CtxDestroy) return -ENODEV;
+    if ((int32_t)ctx != proc->gpuAppCtx || proc->gpuAppCtx <= 0) return -EPERM;
+    ga->CtxDestroy((int32_t)ctx);
+    proc->gpuAppCtx = 0;
     return 0;
 }
 
@@ -11070,6 +12067,58 @@ static void FutexFreeWaiter(FutexWaiter* w)
     g_futexWaiterPool.Free(w);
 }
 
+// BRO-196 diagnostic: a small ring buffer of recent futex ops, so the hang dump
+// can show the WAIT/WAKE timeline right before a deadlock (lost-wakeup hunt).
+struct FutexLogEntry { uint64_t uaddr; uint64_t tick; uint32_t pid; int32_t result; uint8_t op; };
+static constexpr uint32_t FUTEX_LOG_SIZE = 512;
+static FutexLogEntry g_futexLog[FUTEX_LOG_SIZE];
+static volatile uint32_t g_futexLogIdx = 0;  // monotonic; & (SIZE-1) for slot
+extern volatile uint64_t g_lapicTickCount;
+// op: 0=WAIT-enqueue 1=WAIT-return 2=WAKE 3=WAKE_OP 4=REQUEUE
+static inline void FutexLog(uint8_t op, uint64_t uaddr, uint32_t pid, int32_t result)
+{
+    uint32_t i = __atomic_fetch_add(&g_futexLogIdx, 1, __ATOMIC_RELAXED) & (FUTEX_LOG_SIZE - 1);
+    g_futexLog[i].op = op;
+    g_futexLog[i].uaddr = uaddr;
+    g_futexLog[i].pid = pid;
+    g_futexLog[i].result = result;
+    g_futexLog[i].tick = g_lapicTickCount;
+}
+
+// BRO-196 diagnostic: dump every blocked futex waiter (uaddr + owner + pid).
+// Called from SchedulerDumpHang (Ctrl+Shift+ScrollLock). Lock-free read of the
+// hash table — safe in the hang path where we can't guarantee lock state; we are
+// only reading immutable-while-blocked fields for diagnosis.
+extern "C" void FutexDumpWaiters()
+{
+    SerialPrintf("--- futex waiters ---\n");
+    uint32_t total = 0;
+    for (uint32_t b = 0; b < FUTEX_HASH_SIZE; ++b) {
+        for (FutexWaiter* w = g_futexBuckets[b]; w; w = w->next) {
+            Process* wp = w->proc;
+            uint32_t pid = (wp && wp->magic == PROCESS_MAGIC) ? wp->pid : 0xFFFFFFFFu;
+            SerialPrintf("  futex uaddr=0x%lx owner=0x%lx bitset=0x%x pid=%u\n",
+                         w->uaddr, w->owner, w->bitset, pid);
+            ++total;
+            if (total > 256) { SerialPrintf("  ...(truncated)\n"); return; }
+        }
+    }
+    SerialPrintf("  total futex waiters: %u\n", total);
+
+    // Recent futex op timeline (oldest→newest).
+    static const char* opName[] = {"WAITq", "WAITr", "WAKE ", "WAKEOP", "REQ  "};
+    SerialPrintf("--- recent futex ops (last %u) ---\n", FUTEX_LOG_SIZE);
+    uint32_t head = __atomic_load_n(&g_futexLogIdx, __ATOMIC_RELAXED);
+    for (uint32_t k = 0; k < FUTEX_LOG_SIZE; ++k) {
+        uint32_t i = (head + k) & (FUTEX_LOG_SIZE - 1);
+        const FutexLogEntry& e = g_futexLog[i];
+        if (e.uaddr == 0 && e.tick == 0) continue;
+        const char* nm = (e.op < 5) ? opName[e.op] : "?";
+        SerialPrintf("  t=%lu %s uaddr=0x%lx pid=%u res=%d\n",
+                     e.tick, nm, e.uaddr, e.pid, e.result);
+    }
+}
+
 static uint32_t FutexHash(uint64_t owner, uint64_t addr)
 {
     return static_cast<uint32_t>(((addr >> 2) ^ owner) % FUTEX_HASH_SIZE);
@@ -11106,6 +12155,8 @@ extern "C" int64_t FutexWake(uint64_t owner, uint64_t uaddr, uint32_t maxWake,
     }
 
     IrqSpinLockRelease(&g_futexLock, fxFlags);
+    { Process* cp = SchedulerCurrentProcess();
+      FutexLog(2, uaddr, cp ? cp->pid : 0, (int32_t)woken); }
     return static_cast<int64_t>(woken);
 }
 
@@ -11285,6 +12336,7 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
         // Release the futex lock (restoring interrupts) BEFORE blocking — a
         // process must never be descheduled with interrupts disabled.
         IrqSpinLockRelease(&g_futexLock, fxFlags);
+        FutexLog(0, uaddrVal, proc->pid, (int32_t)val);  // WAIT-enqueue
 
         // Block until FUTEX_WAKE removes our waiter, a signal arrives, or an
         // optional timeout expires and the scheduler wakes us.
@@ -11320,6 +12372,7 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
             return 0;
         }
 
+        FutexLog(1, uaddrVal, proc->pid, 0);  // WAIT-return (woken)
         return 0;
     }
 
@@ -12053,6 +13106,12 @@ static bool UnixFdSnapFrom(const FdEntry* src, UnixFdSnap* out)
                 __atomic_fetch_add(&static_cast<UnixSocketData*>(src->handle)->refCount,
                                     1, __ATOMIC_RELEASE);
             break;
+        case FdType::DrmPrime:
+            // PRIME dmabuf fd: a client hands its render-target capability to the
+            // compositor over the Wayland socket. Bump the object ref so the
+            // sender closing its fd doesn't free it out from under the receiver.
+            if (src->handle) DrmPrimeRef(static_cast<DrmPrimeObj*>(src->handle));
+            break;
         default:
             // Other fd types (Pipe, EventFd, EpollFd, TimerFd, DevDsp, etc.)
             // don't have a portable snapshot refcount today.
@@ -12101,6 +13160,9 @@ static void UnixFdSnapRelease(const UnixFdSnap* snap)
             UnixSocketHandleUnref(snap->handle);
             break;
         }
+        case FdType::DrmPrime:
+            DrmPrimeUnref(static_cast<DrmPrimeObj*>(snap->handle));
+            break;
         default: break;
     }
 }
@@ -12706,6 +13768,18 @@ void SyscallTableInit()
     g_syscallTable[522]                  = sys_brook_wm_scanout_flip;
     g_syscallTable[523]                  = sys_brook_wm_get_windows;
     g_syscallTable[524]                  = sys_brook_wm_map_window_vfb;
+    g_syscallTable[525]                  = sys_brook_wm_present_gres;
+    // Brook windowing extensions live in a high 0xB00 block, clear of the Linux
+    // and Windows syscall ranges.
+    g_syscallTable[0xB00]                = sys_brook_wm_set_window_properties; // WM_SET_WINDOW_PROPERTIES
+    // App-GPU (per-process virgl) syscalls for userspace GL rendering.
+    g_syscallTable[0xB10]                = sys_brook_gpu_ctx_create;       // GPU_CTX_CREATE
+    g_syscallTable[0xB11]                = sys_brook_gpu_resource_create;  // GPU_RESOURCE_CREATE
+    g_syscallTable[0xB12]                = sys_brook_gpu_attach_window;    // GPU_ATTACH_WINDOW
+    g_syscallTable[0xB16]                = sys_brook_gpu_upload_buffer;    // GPU_UPLOAD_BUFFER
+    g_syscallTable[0xB13]                = sys_brook_gpu_submit;           // GPU_SUBMIT
+    g_syscallTable[0xB14]                = sys_brook_gpu_transfer;         // GPU_TRANSFER
+    g_syscallTable[0xB15]                = sys_brook_gpu_ctx_destroy;      // GPU_CTX_DESTROY
 
     uint32_t count = 0;
     for (uint64_t i = 0; i < SYSCALL_MAX; ++i)

@@ -1,0 +1,5 @@
+# SuperTuxKart 1.5 — jump straight into a race for a gameplay screenshot.
+# --no-start-screen skips menus; AI opponents on a fixed track/kart.
+set wm
+run --once /nix/bin/waylandd
+run /nix/stk-play.sh --no-start-screen --track=hacienda --kart=tux --numkarts=4 --laps=1

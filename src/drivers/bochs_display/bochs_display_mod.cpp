@@ -154,6 +154,7 @@ static const DisplayOps g_bochsOps = {
     BochsGetFramebuffer,
     BochsGetFramebufferPhys,
     BochsFlush,
+    nullptr,  // PanicPresent: bochs FB is directly scanned out — no-op
 };
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,2 @@
+# Brook OS — DRM render-node M0 probe (validates /dev/dri/renderD128 ioctls)
+run /bin/drmprobe
