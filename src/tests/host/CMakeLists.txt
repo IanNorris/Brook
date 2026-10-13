@@ -43,6 +43,7 @@ function(add_host_test TEST_NAME)
 endfunction()
 
 enable_testing()
+add_host_test(test_virgl_submit)
 
 add_host_test(test_tcp
     "${BROOK_ROOT}/src/kernel/src/tcp.cpp"

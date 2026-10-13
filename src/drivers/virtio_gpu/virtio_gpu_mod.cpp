@@ -26,6 +26,7 @@
 #include "mem_tag.h"
 #include "string.h"
 #include "spinlock.h"
+#include "virgl_submit.h"
 
 MODULE_IMPORT_SYMBOL(PciFindDevice);
 MODULE_IMPORT_SYMBOL(PciEnableMemSpace);
@@ -708,8 +709,14 @@ static void NotifyControlQueue()
 // response written to g_cmdBuf+CMD_RESP_OFF. Returns the response length, or 0
 // on timeout. Synchronous poll of the used ring (no IRQs) — the display path
 // runs from the compositor thread, never an ISR.
-static uint32_t SubmitCommand(uint32_t reqLen, uint32_t respCap)
+static uint64_t g_nextRenderFence = 0;
+static uint32_t SubmitCommand(uint32_t reqLen, uint32_t respCap, bool fenced = false)
 {
+    if (fenced) {
+        auto* hdr = reinterpret_cast<VirtioGpuCtrlHdr*>(g_cmdBuf + CMD_REQ_OFF);
+        hdr->flags |= 1u; // VIRTIO_GPU_FLAG_FENCE
+        hdr->fence_id = ++g_nextRenderFence;
+    }
     uint16_t head = static_cast<uint16_t>(g_availIdxShadow % g_queueSize);
     uint16_t d1   = static_cast<uint16_t>((head + 1) % g_queueSize);
 
@@ -2756,18 +2763,39 @@ static int32_t AppSubmit3D(int32_t ctxId, const uint32_t* dwords, uint32_t n)
     if (!c || !dwords || n == 0) return -1;
     // Bound the stream to the request region (last page is the response buffer).
     const uint32_t maxDw = ((CMD_PAGES - 1) * 4096 - sizeof(VirtioGpuCmdSubmit)) / 4;
-    if (n > maxDw) return -1;
+    if (!VirglStreamValid(dwords, n, maxDw)) return -1;
+    auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
+    uint32_t* dst = reinterpret_cast<uint32_t*>(g_cmdBuf + CMD_REQ_OFF + sizeof(VirtioGpuCmdSubmit));
+    for (uint32_t start = 0; start < n;) {
+        uint32_t end = VirglChunkEnd(dwords, n, start, maxDw);
+        if (end == start) return -1;
+        uint32_t count = end - start;
+        memset(sub, 0, sizeof(*sub));
+        sub->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D;
+        sub->hdr.ctx_id = (uint32_t)ctxId;
+        for (uint32_t i = 0; i < count; ++i) dst[i] = dwords[start + i];
+        sub->size = count * 4;
+        if (!CmdRespOk(SubmitCommand(sizeof(*sub) + count * 4, CMD_RESP_CAP))) {
+            SerialPrintf("virtio_gpu: AppSubmit3D FAILED ctx=%d ndw=%u offset=%u firstcmd=0x%x\n",
+                         ctxId, count, start, dwords[start]);
+            return -1;
+        }
+        start = end;
+    }
+    return 0;
+}
+
+// Reconstructed BRO-232: a fenced empty submit flushes this app's GL context.
+// QEMU defers used-ring completion until the host GPU signals the fence.
+static int32_t AppPresentBarrier(int32_t ctxId)
+{
+    GpuCmdGuard _gcg;
+    if (!AppCtxFind(ctxId)) return -1;
     auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
     memset(sub, 0, sizeof(*sub));
-    sub->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D; sub->hdr.ctx_id = (uint32_t)ctxId;
-    uint32_t* dst = reinterpret_cast<uint32_t*>(g_cmdBuf + CMD_REQ_OFF + sizeof(VirtioGpuCmdSubmit));
-    for (uint32_t i = 0; i < n; ++i) dst[i] = dwords[i];
-    sub->size = n * 4;
-    bool ok = CmdRespOk(SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP));
-    if (!ok)
-        SerialPrintf("virtio_gpu: AppSubmit3D FAILED ctx=%d ndw=%u firstcmd=0x%x(cmd=%u len=%u)\n",
-                     ctxId, n, dwords[0], dwords[0] & 0xFF, dwords[0] >> 16);
-    return ok ? 0 : -1;
+    sub->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D;
+    sub->hdr.ctx_id = (uint32_t)ctxId;
+    return CmdRespOk(SubmitCommand(sizeof(*sub), CMD_RESP_CAP, true)) ? 0 : -1;
 }
 
 static int32_t AppTransfer3D(int32_t ctxId, int32_t gres, int dir,
@@ -2796,6 +2824,7 @@ static const brook::GpuAppOps g_gpuAppOps = {
     AppSubmit3D,
     AppTransfer3D,
     GetCapsetBlob,
+    AppPresentBarrier,
 };
 
 static const brook::GpuCompositorOps g_gpuCompositorOps = {

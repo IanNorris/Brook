@@ -73,6 +73,10 @@ struct GpuAppOps {
     // of falling back to software (llvmpipe).
     int32_t (*GetCapset)(uint32_t capsetId, uint32_t version,
                          void* out, uint32_t maxBytes);
+
+    // Wait for this context's host GPU work before another context samples it.
+    // A virtqueue submission acknowledgement alone is not a render fence.
+    int32_t (*PresentBarrier)(int32_t ctxId);
 };
 
 // Register the app-GPU ops (called by the display driver once its 3D path is

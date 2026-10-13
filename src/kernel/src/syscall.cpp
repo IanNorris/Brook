@@ -1410,7 +1410,7 @@ static constexpr uint64_t SNDCTL_DSP_SPEED     = 0xC0045002; // _IOWR('P', 2, in
 static constexpr uint64_t SNDCTL_DSP_SETFMT    = 0xC0045005; // _IOWR('P', 5, int)
 static constexpr uint64_t SNDCTL_DSP_CHANNELS  = 0xC0045006; // _IOWR('P', 6, int)
 static constexpr uint64_t SNDCTL_DSP_STEREO    = 0xC0045003; // _IOWR('P', 3, int)
-static constexpr uint64_t SNDCTL_DSP_GETOSPACE = 0x800C5012; // _IOR('P', 0x12, audio_buf_info)
+static constexpr uint64_t SNDCTL_DSP_GETOSPACE = 0x8010500C; // _IOR('P', 12, audio_buf_info), 16-byte payload
 static constexpr uint64_t SNDCTL_DSP_GETCAPS   = 0x8004500F; // _IOR('P', 0x0F, int)
 static constexpr uint64_t SNDCTL_DSP_SETTRIGGER= 0x40045010; // _IOW('P', 0x10, int)
 static constexpr uint64_t SNDCTL_DSP_GETFMTS   = 0x8004500B; // _IOR('P', 0x0B, int)
@@ -2652,7 +2652,9 @@ static bool DrmSysIsDir(const char* path) {
 // are scoped per fd. RESOURCE_CREATE returns res_handle=gres (host id, used
 // inside virgl command streams) and bo_handle=GEM index (used in ioctls) —
 // matching the upstream virtio-gpu uABI.
-static constexpr uint32_t DRM_MAX_GEM = 256;
+// Mesa's GL3 streaming buffers exceed 256 live objects during first present.
+// Reconstructed BRO-227 fix (06a8d07); keep headroom for console/UI transitions.
+static constexpr uint32_t DRM_MAX_GEM = 2048;
 struct DrmGemObj {
     bool     used;
     uint32_t gres;     // host-global virgl resource id (== res_handle)
@@ -6440,18 +6442,19 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
             cmd[i] = reinterpret_cast<const uint32_t*>(eb.command)[i];
         int32_t r = ga->Submit3D(dctx->ctxId, cmd, nDw);
         kfree(cmd);
-        // Out-fence: Submit3D is synchronous, so by the time we return the GPU
-        // work is already complete. Mesa (FENCE_FD_OUT) expects a sync-file fd it
-        // will poll(POLLIN) on and then close. Hand back an already-signaled
-        // eventfd (counter=1) so the poll completes immediately; a bare -1 makes
-        // Mesa poll a negative fd with an infinite timeout and hang forever.
+        if (r < 0) return -EIO;
+        // QEMU can acknowledge SUBMIT_3D while rendering is still in flight.
+        // Complete a real fence on the app context before handing Mesa a
+        // signaled fd: the compositor samples this buffer in another context.
         if (eb.flags & 0x02 /*FENCE_FD_OUT*/) {
+            if (!ga->PresentBarrier || ga->PresentBarrier(dctx->ctxId) < 0)
+                return -EIO;
             int fenceFd = -1;
             Process* fp = ProcessCurrent();
             if (fp) {
                 auto* efd = static_cast<EventFdData*>(kmalloc(sizeof(EventFdData)));
                 if (efd) {
-                    efd->counter = 1;        // pre-signaled (work already done)
+                    efd->counter = 1;        // real host render fence completed
                     efd->flags = 0;
                     efd->refCount = 1;
                     efd->readerWaiter = nullptr;
@@ -6460,10 +6463,14 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
                     if (fenceFd < 0) kfree(efd);
                 }
             }
+            if (fenceFd < 0) return -ENOMEM;
             eb.fence_fd = fenceFd;
-            CopyToUser(arg, &eb, sizeof(eb));
+            if (!CopyToUser(arg, &eb, sizeof(eb))) {
+                CloseProcessFd(fp, fenceFd);
+                return -EFAULT;
+            }
         }
-        return r < 0 ? -EIO : 0;
+        return 0;
     }
     case DRM_NR_VIRTGPU_WAIT:
     {
