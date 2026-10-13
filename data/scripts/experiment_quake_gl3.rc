@@ -1,0 +1,6 @@
+# GL3 at a custom 1280x720 resolution through the host-backed virgl device.
+# Launch with BROOK_GPU=gl; every experiment uses fresh writable disk clones.
+set wm
+set vfb none
+run --once /nix/bin/waylandd
+run --uid 1000 /nix/bin/brook-yquake2-gl gl3 +set r_mode -1 +set r_customwidth 1280 +set r_customheight 720 +set vid_fullscreen 0 +set cl_showfps 1 +set s_musicvolume 0.5 +map base1

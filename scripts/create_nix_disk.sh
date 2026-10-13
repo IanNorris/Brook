@@ -143,11 +143,11 @@ cleanup_mount() {
 trap cleanup_mount EXIT
 
 # Use fuse2fs if available (no root needed), otherwise debugfs
-if command -v fuse2fs &>/dev/null; then
-    fuse2fs -o rw,fakeroot "${DISK_IMG}" "${MOUNT_DIR}"
+if command -v fuse2fs &>/dev/null && \
+   fuse2fs -o rw,fakeroot "${DISK_IMG}" "${MOUNT_DIR}"; then
     FUSE=1
 else
-    echo "Warning: fuse2fs not available, using debugfs (slower)"
+    echo "Warning: fuse2fs unavailable or mount denied, using debugfs (slower)"
     FUSE=0
 fi
 
@@ -268,6 +268,9 @@ if [ "${FUSE}" -eq 1 ]; then
             *-waylandd-brook-*)
                 [ -x "$p/bin/waylandd" ] && cp "$p/bin/waylandd" "${MOUNT_DIR}/bin/waylandd"
                 ;;
+            *-wayland-calc-brook-*)
+                [ -x "$p/bin/wayland-calc" ] && cp "$p/bin/wayland-calc" "${MOUNT_DIR}/bin/wayland-calc"
+                ;;
             *-gimp-*)
                 if [ -x "$p/bin/gimp" ]; then
                     ln -sf "../store/$(basename "$p")/bin/gimp" "${MOUNT_DIR}/bin/gimp"
@@ -368,6 +371,9 @@ else
         case "$base" in
             *-waylandd-brook-*)
                 [ -x "$p/bin/waylandd" ] && write_to_disk "${DISK_IMG}" "$p/bin/waylandd" "bin/waylandd"
+                ;;
+            *-wayland-calc-brook-*)
+                [ -x "$p/bin/wayland-calc" ] && write_to_disk "${DISK_IMG}" "$p/bin/wayland-calc" "bin/wayland-calc"
                 ;;
             *-gimp-*)
                 if [ -x "$p/bin/gimp" ]; then

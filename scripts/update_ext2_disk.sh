@@ -5,7 +5,8 @@
 #   scripts/update_ext2_disk.sh [--create]
 #
 # Uses fuse2fs (from e2fsprogs) to mount the image without sudo.
-# Falls back to debugfs if fuse2fs is unavailable.
+# Falls back to debugfs + mke2fs staging if FUSE is unavailable or denied.
+# Stop the VM before updating the disk, especially with the staging fallback.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,25 +30,40 @@ if [ ! -f "${DISK_IMG}" ]; then
 fi
 
 # Auto-fetch userspace binaries if missing
-if [ ! -f "${ROOT_DIR}/busybox_static" ] || [ ! -f "${ROOT_DIR}/bash_dynamic" ]; then
+if [ ! -f "${ROOT_DIR}/busybox_static" ] || [ ! -f "${ROOT_DIR}/bash_dynamic" ] || \
+   [ ! -f "${ROOT_DIR}/dynlibs/ld-musl-x86_64.so.1" ] || \
+   [ ! -f "${ROOT_DIR}/dynlibs/libreadline.so.8" ] || \
+   [ ! -f "${ROOT_DIR}/dynlibs/libhistory.so.8" ] || \
+   [ ! -f "${ROOT_DIR}/dynlibs/libncursesw.so.6" ]; then
     echo "Userspace binaries missing, running fetch_userspace.sh..."
-    "${SCRIPT_DIR}/fetch_userspace.sh" || echo "  (fetch_userspace.sh failed, continuing with what's available)"
+    "${SCRIPT_DIR}/fetch_userspace.sh"
 fi
 
 echo "Syncing to ext2 disk: ${DISK_IMG}"
 
 # --- Mount the image with fuse2fs (no sudo required) ---
 MNTDIR=$(mktemp -d)
-cleanup() { sync; fusermount -u "${MNTDIR}" 2>/dev/null || fusermount -uz "${MNTDIR}" 2>/dev/null || true; rmdir "${MNTDIR}" 2>/dev/null || true; }
+FUSE_MOUNTED=0
+STAGED_IMAGE=""
+cleanup() {
+    if [ "${FUSE_MOUNTED}" -eq 1 ]; then
+        sync
+        fusermount -u "${MNTDIR}" 2>/dev/null || fusermount -uz "${MNTDIR}" 2>/dev/null || true
+        rmdir "${MNTDIR}" 2>/dev/null || true
+    else
+        rm -rf "${MNTDIR}"
+    fi
+    [ -z "${STAGED_IMAGE}" ] || rm -f "${STAGED_IMAGE}"
+}
 trap cleanup EXIT
 
-if ! command -v fuse2fs >/dev/null 2>&1; then
-    echo "ERROR: fuse2fs not found. Add e2fsprogs-fuse2fs to shell.nix."
-    exit 1
+if command -v fuse2fs >/dev/null 2>&1 && fuse2fs -o rw,fakeroot "${DISK_IMG}" "${MNTDIR}"; then
+    FUSE_MOUNTED=1
+    echo "  mounted at ${MNTDIR}"
+else
+    echo "  FUSE unavailable or mount denied; staging via debugfs at ${MNTDIR}"
+    debugfs -R "rdump / ${MNTDIR}" "${DISK_IMG}"
 fi
-
-fuse2fs -o rw,fakeroot "${DISK_IMG}" "${MNTDIR}"
-echo "  mounted at ${MNTDIR}"
 
 # Helper: copy a file, creating parent dirs as needed
 write_file() {
@@ -104,7 +120,7 @@ fi
 [ -f "${ROOT_DIR}/doomgeneric_enkel/doomgeneric" ] && write_file "${ROOT_DIR}/doomgeneric_enkel/doomgeneric" "bin/doom"
 
 # Wallpaper
-[ -f "${ROOT_DIR}/wallpaper/wallpaper.raw" ] && write_file "${ROOT_DIR}/wallpaper/wallpaper.raw" "wallpaper.raw"
+[ -f "${ROOT_DIR}/data/wallpaper.raw" ] && write_file "${ROOT_DIR}/data/wallpaper.raw" "wallpaper.raw"
 
 # Quake 2
 Q2_BIN="${ROOT_DIR}/build/quake2/quake2"
@@ -168,11 +184,21 @@ if [ -f "${MNTDIR}/bin/busybox" ]; then
     echo "  → busybox applet symlinks created"
 fi
 
-echo "Unmounting..."
-# Explicit sync before unmount to ensure all writes are flushed
-sync
-fusermount -u "${MNTDIR}" || { echo "WARNING: fusermount failed, retrying with -z"; fusermount -uz "${MNTDIR}"; }
-rmdir "${MNTDIR}" 2>/dev/null || true
-trap - EXIT
+if [ "${FUSE_MOUNTED}" -eq 1 ]; then
+    echo "Unmounting..."
+    sync
+    fusermount -u "${MNTDIR}" || fusermount -uz "${MNTDIR}"
+    rmdir "${MNTDIR}"
+    trap - EXIT
+else
+    # Build a replacement image before swapping it in, so a failed population
+    # leaves the existing image intact. These generated disks use 4KB ext2.
+    STAGED_IMAGE=$(mktemp "${DISK_IMG}.stage-XXXXXX")
+    truncate -s "$(stat -c%s "${DISK_IMG}")" "${STAGED_IMAGE}"
+    mkfs.ext2 -q -F -b 4096 -L BROOKDISK -d "${MNTDIR}" "${STAGED_IMAGE}"
+    e2fsck -fn "${STAGED_IMAGE}"
+    mv "${STAGED_IMAGE}" "${DISK_IMG}"
+    STAGED_IMAGE=""
+fi
 
 echo "Done."

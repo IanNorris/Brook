@@ -48,6 +48,15 @@ brook_disk.img
 
 # Game data / large assets
 *.wad
+*.[pP][aA][kK]
+*.[pP][kK][zZ]
+Track*.ogg
+track*.ogg
+baseq2/
+q2ost/
+q2demo/
+setup_quake*.exe
+setup_quake*.bin
 data/wallpaper.raw
 brook_ext2_disk.img
 brook_nix_disk.img
@@ -76,6 +85,8 @@ usb_test.img
 .certs/
 
 # Test artifacts
+__pycache__/
+*.py[cod]
 crash_reports/
 *.gif
 .certs/

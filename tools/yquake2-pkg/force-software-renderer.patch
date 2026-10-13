@@ -1,0 +1,20 @@
+--- a/src/client/refresh/soft/sw_main.c	2026-07-01 11:21:12.007002345 +0000
++++ b/src/client/refresh/soft/sw_main.c	2026-07-01 11:21:12.009002381 +0000
+@@ -2012,7 +2012,7 @@
+ 		renderer = SDL_CreateRenderer(window, NULL);
+ 		SDL_SetRenderVSync(renderer, 1);
+ #else
+-		renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
++		renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE | SDL_RENDERER_PRESENTVSYNC);
+ 		if (!renderer)
+ 		{
+ 			renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE | SDL_RENDERER_PRESENTVSYNC);
+@@ -2024,7 +2024,7 @@
+ #ifdef USE_SDL3
+ 		renderer = SDL_CreateRenderer(window, NULL);
+ #else
+-		renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
++		renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+ 		if (!renderer)
+ 		{
+ 			renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);

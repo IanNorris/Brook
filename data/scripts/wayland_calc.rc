@@ -2,4 +2,4 @@
 set wm
 set vfb none
 run /nix/bin/waylandd --seconds 30
-run /nix/store/qb338djrlcqq6748kksr0d4hgm2lyzfc-wayland-calc-brook-0.1-brook/bin/wayland-calc 20
+run /nix/bin/wayland-calc 20

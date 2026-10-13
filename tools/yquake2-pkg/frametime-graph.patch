@@ -1,0 +1,149 @@
+--- a/src/client/cl_screen.c	2026-07-18 01:56:05.434412935 +0000
++++ b/src/client/cl_screen.c	2026-07-18 01:57:03.977452012 +0000
+@@ -1585,6 +1585,138 @@
+ 	}
+ }
+ 
++/*
++ * Brook-style always-on frametime bar graph.
++ *
++ * Ported from Brook's software-renderer overlay (swimp_brook.c
++ * fps_record_and_draw). yquake2 is used here as a diagnostic lever, so unlike
++ * the stock cl_showfps text this is drawn unconditionally to always surface
++ * frame pacing. It renders a "FPS NNN  MM.MMS" readout above a colour-coded
++ * frametime waveform: each bar is one frame, full-scale = 33 ms (30 Hz), green
++ * = comfortable, yellow = marginal, red = a missed 30 Hz deadline.
++ *
++ * FG_COLOR_* are Quake II palette indices (0-255); tune to taste. 0xd0 is the
++ * green used by the stock ping graph.
++ */
++#define FG_HIST        128
++#define FG_BAR_W       2
++#define FG_GRAPH_H     40
++#define FG_PAD         4
++#define FG_FULLSCALE_US 33000        /* 33 ms == 30 Hz deadline */
++#define FG_COLOR_BG    0x08          /* dark grey backing */
++#define FG_COLOR_GOOD  0xd0          /* green */
++#define FG_COLOR_WARN  0xf1          /* orange/amber */
++#define FG_COLOR_BAD   0xf3          /* red */
++
++void
++SCR_DrawFrameGraph(void)
++{
++	static long long fg_oldtime;
++	static int       fg_us[FG_HIST];
++	static int       fg_head;
++	static long long fg_win_start;
++	static int       fg_win_frames;
++	static int       fg_fps;
++	static float     fg_mean_ms;
++
++	long long now = Sys_Microseconds();
++
++	if (fg_oldtime != 0)
++	{
++		int dt = (int)(now - fg_oldtime);
++		if (dt < 0)
++		{
++			dt = 0;
++		}
++		fg_us[fg_head] = dt;
++		fg_head = (fg_head + 1) % FG_HIST;
++	}
++	fg_oldtime = now;
++
++	/* Recompute fps + mean frame time about twice a second. */
++	if (fg_win_start == 0)
++	{
++		fg_win_start = now;
++	}
++	fg_win_frames++;
++	long long win = now - fg_win_start;
++	if (win >= 500000)
++	{
++		fg_fps = (int)((long long)fg_win_frames * 1000000 / win);
++
++		long long sum = 0;
++		int n = 0;
++		for (int i = 0; i < FG_HIST; i++)
++		{
++			if (fg_us[i])
++			{
++				sum += fg_us[i];
++				n++;
++			}
++		}
++		fg_mean_ms = n ? ((float)sum / (float)n) / 1000.0f : 0.0f;
++		fg_win_frames = 0;
++		fg_win_start = now;
++	}
++
++	float scale = SCR_GetConsoleScale();
++	int textH  = (int)(8 * scale);
++	int gx     = FG_PAD;
++	int gy     = FG_PAD + textH + 2;
++	int graphW = FG_HIST * FG_BAR_W;
++
++	if ((int)viddef.width  < gx + graphW + FG_PAD ||
++	    (int)viddef.height < gy + FG_GRAPH_H + FG_PAD)
++	{
++		return;
++	}
++
++	int fps = fg_fps;
++	if (fps < 0)
++	{
++		fps = 0;
++	}
++	if (fps > 999)
++	{
++		fps = 999;
++	}
++	int ms_i = (int)fg_mean_ms;
++	int ms_d = (int)((fg_mean_ms - (float)ms_i) * 100.0f);
++	if (ms_d < 0)
++	{
++		ms_d = 0;
++	}
++	if (ms_d > 99)
++	{
++		ms_d = 99;
++	}
++
++	char str[24];
++	snprintf(str, sizeof(str), "FPS %d  %d.%02dMS", fps, ms_i, ms_d);
++	DrawStringScaled(gx, FG_PAD, str, scale);
++
++	Draw_Fill(gx, gy, graphW, FG_GRAPH_H, FG_COLOR_BG);
++
++	for (int i = 0; i < FG_HIST; i++)
++	{
++		int idx = (fg_head + i) % FG_HIST;
++		int us  = fg_us[idx];
++		int bar = (int)((long long)us * FG_GRAPH_H / FG_FULLSCALE_US);
++		if (bar > FG_GRAPH_H)
++		{
++			bar = FG_GRAPH_H;
++		}
++		int col = (us > FG_FULLSCALE_US) ? FG_COLOR_BAD :
++		          (us > 20000)           ? FG_COLOR_WARN :
++		                                   FG_COLOR_GOOD;
++		Draw_Fill(gx + i * FG_BAR_W, gy + FG_GRAPH_H - bar,
++		          FG_BAR_W, bar, col);
++	}
++
++	SCR_AddDirtyPoint(gx, FG_PAD);
++	SCR_AddDirtyPoint(gx + graphW + FG_PAD, gy + FG_GRAPH_H + FG_PAD);
++}
++
+ // ----
+ /*
+  * This is called every frame, and can also be called
+@@ -1738,6 +1870,7 @@
+ 	}
+ 
+ 	SCR_Framecounter();
++	SCR_DrawFrameGraph();
+ 	R_EndFrame();
+ }
+ 

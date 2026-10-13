@@ -28,9 +28,13 @@ if [ ! -f "${DISK_IMG}" ]; then
 fi
 
 # Auto-fetch userspace binaries if missing
-if [ ! -f "${ROOT_DIR}/busybox_static" ] || [ ! -f "${ROOT_DIR}/bash_dynamic" ]; then
+if [ ! -f "${ROOT_DIR}/busybox_static" ] || [ ! -f "${ROOT_DIR}/bash_dynamic" ] || \
+   [ ! -f "${ROOT_DIR}/dynlibs/ld-musl-x86_64.so.1" ] || \
+   [ ! -f "${ROOT_DIR}/dynlibs/libreadline.so.8" ] || \
+   [ ! -f "${ROOT_DIR}/dynlibs/libhistory.so.8" ] || \
+   [ ! -f "${ROOT_DIR}/dynlibs/libncursesw.so.6" ]; then
     echo "Userspace binaries missing, running fetch_userspace.sh..."
-    "${SCRIPT_DIR}/fetch_userspace.sh" || echo "  (fetch_userspace.sh failed, continuing with what's available)"
+    "${SCRIPT_DIR}/fetch_userspace.sh"
 fi
 
 # mcopy -o = overwrite existing files without prompting
@@ -391,6 +395,10 @@ fi
 
 # --- Wallpaper ---
 wallpaper="${ROOT_DIR}/data/wallpaper.raw"
+wallpaper_src="${ROOT_DIR}/data/wallpaper/brook-dawn.png"
+if [ -f "${wallpaper_src}" ] && { [ ! -f "${wallpaper}" ] || [ "${wallpaper_src}" -nt "${wallpaper}" ]; }; then
+    python3 "${SCRIPT_DIR}/convert_wallpaper.py" "${wallpaper_src}" "${wallpaper}"
+fi
 if [ -f "$wallpaper" ]; then
     echo "Wallpaper:"
     sync_file "$wallpaper" "WALLPAPER.RAW"

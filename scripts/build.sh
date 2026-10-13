@@ -15,7 +15,10 @@ echo "Build dir: ${BUILD_DIR}"
 if [ ! -f "${ROOT_DIR}/vendor/uefi-headers/Include/Uefi.h" ] || \
    [ ! -f "${ROOT_DIR}/src/third_party/fatfs/source/ff.c" ]; then
     echo "Initializing submodules..."
-    git -C "${ROOT_DIR}" submodule update --init --recursive
+    # Only these submodules are needed for the kernel build. Old optional
+    # NetSurf gitlinks may have no entries in .gitmodules.
+    git -C "${ROOT_DIR}" submodule update --init --recursive -- \
+        vendor/uefi-headers src/third_party/fatfs
 fi
 
 mkdir -p "${BUILD_DIR}"

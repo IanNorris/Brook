@@ -213,6 +213,54 @@ Windows requires [QEMU for Windows](https://www.qemu.org/download/#windows)
 installed and on PATH. OVMF firmware is auto-detected from the QEMU install.
 Copy `build/release/esp/` and `*.img` files from a Linux build.
 
+### Headless inspection on a Linux host
+
+For a fresh checkout, build the native apps and boot/data disks first. The
+optional Nix tools refresh expects an existing Nix disk and a working FUSE
+mount; skip it while preparing a small desktop disk:
+
+```bash
+nix-shell --run 'BROOK_SKIP_NIX_TOOLS=1 ./scripts/build_all.sh Release'
+nix-shell --run './scripts/create_nix_disk.sh 8192 bash curl.bin xz.bin cacert coreutils ./tools/waylandd-pkg ./tools/wayland-calc-pkg'
+```
+
+The ext2 data-disk updater and Nix disk creator fall back when FUSE mounts
+are denied. Stop the VM before updating or recreating its disks. The small
+Nix disk above contains the Wayland server and calculator, rather than the
+full default application collection. The calculator is installed at
+`/nix/bin/wayland-calc`, so its boot script does not depend on a store hash.
+
+Run with serial logging, localhost VNC, and a dedicated monitor socket:
+
+```bash
+nix-shell --run 'env BROOK_SKIP_UPDATE_DISK=1 BROOK_SMP=4 BROOK_USB_KBD=1 SERIAL_OPT="-serial file:/tmp/brook-serial.log" timeout 600 ./scripts/run-qemu.sh --release --headless --vnc 127.0.0.1:97 --no-audio --instance=97 --real-esp --script inspect_desktop'
+```
+
+KVM is selected automatically when `/dev/kvm` is accessible. VNC listens on
+`127.0.0.1:5997`. From another terminal, inspect or stop this VM:
+
+```bash
+python3 scripts/qemu_monitor.py --instance 97 'info status' 'info cpus'
+python3 scripts/qemu_monitor.py --instance 97 'screendump /tmp/brook-screen.ppm'
+python3 scripts/qemu_monitor.py --instance 97 'quit'
+```
+
+The screenshot uses QEMU's standard PPM format. The default headless run uses
+the CPU compositor; accelerated virgl runs additionally require the host GPU
+configuration described in `scripts/run-qemu.sh`.
+
+Fresh-checkout fixes in this workflow: initialize only required kernel
+submodules (optional NetSurf gitlinks lack URLs); fetch Bash's runtime even
+when its binary is already checked in; search the correct Nix store depth
+for the musl loader; and use FUSE-free image population when mounts are
+denied. Host-test failures now fail the full build. The optional
+`update_nix_disk.sh --tools` refresh still requires FUSE; use the small disk
+recipe above for this environment. Quake 2 data is supplied separately and
+kept out of Git. The wallpaper is generated from its tracked PNG source.
+
+For the larger app profile, isolated writable disks, game data, soundtrack,
+and Big Buck Bunny playback, see [Experiment disks](docs/experiments.md).
+
 Boot scripts in `data/scripts/` control what runs at startup:
 
 | Script | Description |

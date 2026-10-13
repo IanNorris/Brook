@@ -72,8 +72,12 @@ echo "--- Ext2 Disk Image ---"
 echo ""
 
 # 7. Update Nix tools disk (waylandd, brook-player, brook-files, etc.)
-echo "--- Nix Tools Disk ---"
-"${SCRIPT_DIR}/update_nix_disk.sh" --tools
+if [ "${BROOK_SKIP_NIX_TOOLS:-0}" = "1" ]; then
+    echo "--- Nix Tools Disk (skipped via BROOK_SKIP_NIX_TOOLS=1) ---"
+else
+    echo "--- Nix Tools Disk ---"
+    "${SCRIPT_DIR}/update_nix_disk.sh" --tools
+fi
 echo ""
 
 # 8. Run host tests
@@ -81,7 +85,7 @@ BUILD_TYPE_LOWER="$(echo "${BUILD_TYPE}" | tr '[:upper:]' '[:lower:]')"
 HOST_TEST_DIR="${ROOT_DIR}/build/${BUILD_TYPE_LOWER}/host_tests"
 if [ -d "${HOST_TEST_DIR}" ]; then
     echo "--- Host Tests ---"
-    (cd "${HOST_TEST_DIR}" && ctest --output-on-failure) || true
+    (cd "${HOST_TEST_DIR}" && ctest --output-on-failure)
     echo ""
 fi
 

@@ -97,7 +97,7 @@ fetch_libs() {
 }
 
 # musl libc
-MUSL_LIB=$(find /nix/store -maxdepth 2 -name 'ld-musl-x86_64.so.1' -path '*musl*' 2>/dev/null | head -1)
+MUSL_LIB=$(find /nix/store -maxdepth 3 -name 'ld-musl-x86_64.so.1' -path '*musl*' 2>/dev/null | head -1)
 if [ -n "$MUSL_LIB" ]; then
     MUSL_DIR=$(dirname "$MUSL_LIB")
     for f in "$MUSL_DIR"/lib*.so* "$MUSL_DIR"/ld-*.so*; do
@@ -119,6 +119,13 @@ fetch_libs "readline" "pkgsCross.musl64.readline" "lib" "*readline*musl*"
 
 # ncurses
 fetch_libs "ncurses" "pkgsCross.musl64.ncurses" "lib" "*ncurses*musl*"
+
+for lib in ld-musl-x86_64.so.1 libc.so libreadline.so.8 libhistory.so.8 libncursesw.so.6; do
+    if [ ! -f "${DYNLIBS_DIR}/${lib}" ]; then
+        echo "ERROR: Bash runtime library ${lib} was not fetched." >&2
+        exit 1
+    fi
+done
 
 echo ""
 echo "Userspace binaries:"

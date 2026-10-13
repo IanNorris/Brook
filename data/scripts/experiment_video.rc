@@ -1,0 +1,5 @@
+# Blender Foundation Big Buck Bunny, original H.264 720p source.
+set wm
+set vfb none
+run --once /nix/bin/waylandd
+run --uid 1000 /nix/profile/bin/brook-run /nix/bin/brook-player -autoexit /data/videos/big-buck-bunny-720p.mov

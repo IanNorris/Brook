@@ -47,7 +47,7 @@ pkgs.mkShellNoCC {
 
     # Font baking (build-time TTF → kernel glyph atlas)
     pkgs.hack-font
-    (pkgs.python3.withPackages (ps: [ ps.freetype-py ]))
+    (pkgs.python3.withPackages (ps: [ ps.freetype-py ps.pillow ]))
 
     # Storage image creation (build-time FAT32 ramdisk image for VFS tests)
     pkgs.mtools
