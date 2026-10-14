@@ -31,8 +31,9 @@ struct GpuCompositorOps {
     const char* name;
 
     // Create a sampler-view texture of (w,h). If `alpha` is false the texture is
-    // B8G8R8X8 (opaque, window/desktop content); if true it is B8G8R8A8 so the
-    // source alpha is honoured by an alpha-blended Blit (cursor). Backing is the
+    // B8G8R8X8 (opaque content); if true it is B8G8R8A8 so alpha is preserved
+    // for cursor/chrome and Wayland SHM content, including CSD shadows.
+    // The caller must also enable blending when drawing alpha content. Backing is the
     // w*h*4 buffer at kernel virtual address `backingVaddr` (may be physically
     // scattered, e.g. a VmmAllocPages VFB). Returns 0 on failure.
     GpuTexId (*CreateTexture)(uint32_t w, uint32_t h, uint64_t backingVaddr, bool alpha);

@@ -51,6 +51,24 @@ file browser and calculator, LibreOffice, GIMP, Mousepad, Qalculate, fonts,
 cursors, both yquake2 builds, and an OSS-enabled OpenAL library. Launchers
 receive their actual dependency paths from Nix rather than hardcoded hashes.
 
+## DOOM fixture
+
+The DOOM shortcut expects `/boot/DOOM1.WAD`. A fresh build can contain the
+engine without that data and will then exit immediately. To restore the
+original 1.9 shareware fixture from the
+[idgames archive](https://www.gamers.org/pub/idgames/idstuff/doom/):
+
+```bash
+python3 scripts/fetch_doom_shareware.py
+nix-shell --run './scripts/update_disk.sh'
+```
+
+The helper verifies pinned archive/WAD SHA-256 checksums and reads the split
+DOS installer ZIP without executing it. It writes only beneath ignored
+`build/`. `update_disk.sh` picks up that cached WAD automatically; alternatively
+set `BROOK_DOOM_WAD` to your own file. Launch a new experiment afterwards;
+already-running clones keep their existing contents. No WAD enters git.
+
 ## Run and inspect
 
 ```bash
@@ -196,3 +214,22 @@ capture matched the PS/2 baseline byte-for-byte; one Backspace then Shift+Z
 produced `abc12Z`. Raw evidence stays in ignored experiment/bridge directories.
 Existing running VMs retain their old devices and kernel; a new launch is
 required to use these changes.
+
+## Wayland GPU borders and missing DOOM data, 14 October 2026
+
+The accelerated compositor created every window-content texture as XRGB and
+always drew it without alpha blending. GTK client-side shadow/corner pixels
+therefore became a solid black rectangle. SHM Wayland textures now preserve
+ARGB and blend content alpha; texture format is re-created if the source type
+changes. Legacy framebuffers and external GL targets keep their prior opaque
+handling. Verified Mousepad's shadow area composites over underlying windows
+and wallpaper in an Intel virgl VM. This does not claim to resolve external
+GL swapchain alpha/resize issues (REC-03).
+
+DOOM's immediate exit was an explicit missing-IWAD error, not a kernel crash.
+The verified shareware fixture is staged in the ignored boot image and its
+shortcut now reaches the title/menu and a playable first level. Capture/log evidence is retained under
+`build/vm-bridge/0df06b9e8906444da02654802c8d312d/`. The release build and all
+twelve host tests pass. Video-player logs show AAC decode and `/dev/dsp` output;
+`BROOK_AUDIODEV=none` intentionally discards host playback. Use `pipewire` on a
+new user launch to listen, while keeping MCP test launches silent.

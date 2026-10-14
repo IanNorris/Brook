@@ -362,7 +362,7 @@ static int32_t   g_gpuMouseDemoX  = 0;
 static int32_t   g_gpuMouseDemoY  = 0;
 static GpuTexId  g_cursorTex      = 0;       // ARGB cursor sprite
 // Per-window-slot content texture tracking (recreated when the VFB changes).
-struct WinTexEntry { GpuTexId tex; uint32_t* vfb; uint32_t w; uint32_t h; };
+struct WinTexEntry { GpuTexId tex; uint32_t* vfb; uint32_t w; uint32_t h; bool alpha; };
 static WinTexEntry g_winTex[WM_MAX_WINDOWS] = {};
 
 bool CompositorGpuActive()
@@ -2558,7 +2558,7 @@ static void GpuDrawWindowContent(const GpuCompositorOps* gpu, const Window* w,
     if (cdx + cdw > scrW) cdw = scrW - cdx;
     if (cdy + cdh > scrH) cdh = scrH - cdy;
     if (cdw == 0 || cdh == 0) return;
-    GpuComposeLayer(gpu, e.tex, 0, 0, e.w, e.h, cdx, cdy, cdw, cdh, false, opacity);
+    GpuComposeLayer(gpu, e.tex, 0, 0, e.w, e.h, cdx, cdy, cdw, cdh, e.alpha, opacity);
 }
 
 static void EnsureDesktopTex(const GpuCompositorOps* gpu)
@@ -2728,17 +2728,23 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
         bool contentDirty = isWayland ? (w->vfbDirty != 0)
                                       : (p && p->fbDirty != 0);
 
+        // SHM Wayland buffers carry meaningful alpha (including GTK CSD
+        // shadows). waylandd forces XRGB buffers opaque before publishing.
+        // Legacy framebuffers and external GL targets retain XRGB behavior.
+        bool contentAlpha = isWayland && !w->externalGres;
+
         WinTexEntry& e = g_winTex[idx];
-        if (e.tex && (e.vfb != reinterpret_cast<uint32_t*>(vaddr) || e.w != sw || e.h != sh))
+        if (e.tex && (e.vfb != reinterpret_cast<uint32_t*>(vaddr) || e.w != sw || e.h != sh || e.alpha != contentAlpha))
         {
             gpu->DestroyTexture(e.tex);
             e.tex = 0;
         }
         if (!e.tex)
         {
-            e.tex = gpu->CreateTexture(sw, sh, vaddr, false);
+            e.tex = gpu->CreateTexture(sw, sh, vaddr, contentAlpha);
             e.vfb = reinterpret_cast<uint32_t*>(vaddr);
             e.w = sw; e.h = sh;
+            e.alpha = contentAlpha;
             contentDirty = true;   // force first upload
         }
         if (e.tex && contentDirty)

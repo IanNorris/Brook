@@ -195,14 +195,20 @@ if [ -f "$doom_bin" ]; then
     sync_file "$doom_bin" "DOOM"
 fi
 
-# --- DOOM WAD (check workspace root) ---
-for wad_path in "${ROOT_DIR}/doom1.wad" "/workspace/doom1.wad"; do
+# --- DOOM WAD (licensed fixtures stay outside git) ---
+doom_wad_found=0
+for wad_path in "${BROOK_DOOM_WAD:-${ROOT_DIR}/build/experiments/assets/doom/doom1.wad}" "${ROOT_DIR}/doom1.wad" "/workspace/doom1.wad"; do
     if [ -f "$wad_path" ]; then
         echo "DOOM WAD:"
         sync_file "$wad_path" "DOOM1.WAD"
+        doom_wad_found=1
         break
     fi
 done
+if [ "${doom_wad_found}" = "0" ] && [ -f "$doom_bin" ]; then
+    echo "DOOM fixture not supplied; fresh images cannot run the DOOM shortcut."
+    echo "Run python3 scripts/fetch_doom_shareware.py, or set BROOK_DOOM_WAD to your WAD."
+fi
 
 # --- Audio tools (wavplay, tone) ---
 audio_dir="${ROOT_DIR}/tools/wavplay"
