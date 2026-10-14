@@ -42,30 +42,26 @@ if [[ -z "$NM_BIN" ]]; then
     exit 1
 fi
 
-# Collect module files from the arguments (files or directories). With no
-# arguments, scan the conventional build output locations.
-MODULES=()
-if [[ $# -gt 0 ]]; then
-    for arg in "$@"; do
-        if [[ -d "$arg" ]]; then
-            while IFS= read -r f; do MODULES+=("$f"); done \
-                < <(find "$arg" -name '*.mod' | sort)
-        elif [[ -f "$arg" ]]; then
-            MODULES+=("$arg")
-        fi
-    done
-else
-    while IFS= read -r f; do MODULES+=("$f"); done \
-        < <(find build -path '*/kernel/drivers/*.mod' 2>/dev/null | sort)
-fi
-
-if [[ ${#MODULES[@]} -eq 0 ]]; then
-    echo "check-module-symbols: no .mod files found (modules not built yet?) — skipping"
-    exit 0
-fi
-
-KSYMTAB="$KSYMTAB" NM_BIN="$NM_BIN" python3 - "${MODULES[@]}" <<'PYEOF'
+# Let Python collect files too: Bash process substitution requires /dev/fd,
+# which is not available in the Brook guest bootstrap environment.
+KSYMTAB="$KSYMTAB" NM_BIN="$NM_BIN" python3 - "$@" <<'PYEOF'
 import os, re, subprocess, sys
+from pathlib import Path
+
+modules = []
+if len(sys.argv) > 1:
+    for arg in sys.argv[1:]:
+        path = Path(arg)
+        if path.is_dir():
+            modules.extend(str(p) for p in sorted(path.rglob("*.mod")))
+        elif path.is_file():
+            modules.append(str(path))
+else:
+    modules = sorted(str(p) for p in Path("build").rglob("*.mod")
+                     if "kernel/drivers/" in p.as_posix())
+if not modules:
+    print("check-module-symbols: no .mod files found (modules not built yet?) — skipping")
+    sys.exit(0)
 
 ksym = open(os.environ["KSYMTAB"]).read()
 nm = os.environ["NM_BIN"]
@@ -105,7 +101,7 @@ def resolvable(sym):
     return bool(base and base in exports)
 
 errors = 0
-for mod in sys.argv[1:]:
+for mod in modules:
     out = subprocess.run([nm, "-u", mod], capture_output=True, text=True)
     if out.returncode != 0:
         print(f"ERROR: {nm} failed on {mod}: {out.stderr.strip()}", file=sys.stderr)
