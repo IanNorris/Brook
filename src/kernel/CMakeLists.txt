@@ -490,6 +490,7 @@ function(add_driver_module mod_name)
         get_filename_component(src_name "${src}" NAME_WE)
         get_filename_component(src_ext  "${src}" EXT)
         set(obj "${DRIVER_OUTPUT_DIR}/${mod_name}_${src_name}.o")
+        set(depfile "${obj}.d")
 
         if("${src_ext}" STREQUAL ".c")
             set(_compiler "${CMAKE_C_COMPILER}")
@@ -507,8 +508,12 @@ function(add_driver_module mod_name)
                     ${_lang_flags}
                     ${MOD_EXTRA_FLAGS}
                     ${INCLUDE_FLAGS}
+                    -MMD -MF "${depfile}" -MT "${obj}"
                     -c "${src}" -o "${obj}"
-            DEPENDS "${src}"
+            # Custom compiler commands need explicit depfile integration;
+            # otherwise edits to included kernel/driver headers are ignored.
+            DEPFILE "${depfile}"
+            DEPENDS "${src}" "${BROOK_ROOT}/src/kernel/src/module_abi.h"
             COMMENT "Compiling module source ${src}"
             VERBATIM
         )
@@ -557,5 +562,3 @@ add_custom_target(check_module_symbols ALL
 if(BROOK_MODULE_TARGETS)
     add_dependencies(check_module_symbols ${BROOK_MODULE_TARGETS})
 endif()
-
-

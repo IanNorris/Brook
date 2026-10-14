@@ -349,12 +349,12 @@ Minimum block size: 192 bytes (OVERHEAD + ALIGN).
 | Function | Signature | Contract |
 |----------|-----------|----------|
 | `HeapInit` | `()` | Must call after VmmInit(). Maps 1MB at HEAP_VIRT_BASE. Creates one large free block. |
-| `kmalloc` | `(uint64_t size) → void*` | First-fit, 64B-aligned. Returns null on 0 or failure. Auto-expands on exhaustion (one retry). Poison-fills on alloc. Spot-checks free-poison on alloc (detects write-after-free). |
-| `kfree` | `(void* ptr)` | Validates header magic. No-op on null or already-free. Coalesces with adjacent free blocks in both directions. Poison-fills on free. |
+| `kmalloc` | `(uint64_t size) → void*` | First-fit, 64B-aligned. Returns null on 0 or failure. Auto-expands on exhaustion (one retry). Optional runtime poison-fill and free-poison spot check (default off). |
+| `kfree` | `(void* ptr)` | Validates header magic. No-op on null or already-free. Coalesces with adjacent free blocks in both directions. Poison-fills on free when enabled. |
 | `krealloc` | `(void* ptr, uint64_t newSize) → void*` | In-place if block is large enough. Otherwise alloc+copy+free. Null ptr → kmalloc. Zero size → kfree+null. |
 | `HeapFreeBytes` | `() → uint64_t` | **⚠️ BUG (BRO-076): returns inflated values due to g_freeBytes tracking drift.** |
 | `HeapCheckIntegrity` | `() → bool` | Walk all blocks, verify magic/size consistency. Holds `g_heapLock` during walk. |
-| `HeapSetPoison` | `(bool enable)` | Toggle poison fill. Disabling improves performance. |
+| `HeapSetPoison` | `(bool enable)` | Runtime alloc/free poison, default off. Enabling reseeds free blocks under the heap lock; live data is preserved. Shell/debug command: `heap poison on\|off`. |
 | `HeapGetStats` | `(HeapStats* out)` | Snapshot heap state. Takes lock internally. Thread-safe. |
 | `HeapDumpStats` | `()` | Print stats to serial. |
 

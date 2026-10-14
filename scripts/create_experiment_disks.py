@@ -126,6 +126,9 @@ def main():
         controls = data_root / "games/quake2/baseq2/brook-controls.cfg"
         shutil.copy2(ROOT / "data/config/yquake2-controls.cfg", controls)
         manifest["assets"]["brook-controls.cfg"] = digest(controls)
+        benchmark = data_root / "games/quake2/baseq2/brook-benchmark.cfg"
+        shutil.copy2(ROOT / "data/config/yquake2-benchmark.cfg", benchmark)
+        manifest["assets"]["brook-benchmark.cfg"] = digest(benchmark)
         manifest["assets"]["alsoft-oss.conf"] = digest(nix_root / "etc/alsoft-oss.conf")
         if args.q2_music:
             music = data_root / "games/quake2/baseq2/music"

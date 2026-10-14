@@ -389,3 +389,329 @@ fork preserves its borrowed PTEs and copied VMA references. Subsequent movie
 captures remained correctly rendered across repeated `xdg-screensaver` helper
 forks. Earlier corrupted captures and shutdown faults remain saved as recovery
 evidence rather than being treated as passing results.
+
+### Real-site Ladybird check (2026-10-14)
+
+Test session `eba0405cf1db4078828d7721fac86825` used a separate reflink copy
+of the prepared checkpoint, one vCPU, headless display and CPU painting.
+Google's HTTPS homepage rendered; rejecting optional cookies, typing a search,
+submitting it and following the Ladybird result all worked. Amazon UK rendered
+its homepage, search autocomplete, results for `cable`, and a product detail
+page with images. No CAPTCHA appeared during these public browsing tests.
+Sign-in, checkout and YouTube were not tested.
+
+This is a functional browsing baseline, not a smooth-browser certification.
+Loads took tens of seconds, input was delayed or partially lost during loading,
+and text/layout rendering had defects. Wheel events, Page Down and a scrollbar
+click did not visibly move the tested pages. The guest remained accessible and
+navigation recovered after a long apparent stall. Serial logs contain
+`HTMLParserEndState` timeouts; their cause and the scrolling/input path need
+investigation before attributing these limits to Ladybird or Brook.
+
+Evidence is in the ignored session artifact directory: Google results
+`e5e9325277074d3fabe1073f146afc19.png`, followed result
+`735cdcc47b9a41978edeae34e53d3745.png`, Amazon results
+`ac6e544b38a0492f9327b943f9730e55.png`, product detail
+`009d5fb6a6384e83944a22173af2b7d6.png`, and `serial.log`.
+
+### Ladybird performance investigation (2026-10-14)
+
+All measurements used isolated copies of the prepared disks, one vCPU with
+KVM confirmed by QMP, silent host audio, software display and Ladybird CPU
+painting. No user VM or host desktop was controlled. Evidence lives under
+ignored `build/experiments/results/ladybird-perf-20261014/` and the session
+artifact directories below.
+
+The deterministic workload is now saved as
+`tools/profile/browser_benchmark_server.py`. Run it on the host, then launch
+`run /nix/profile/bin/brook-ladybird http://10.0.2.2:8899/` in a QEMU
+user-network guest. It serves a small HTML page and 32 uncached 128 KiB
+resources from host loopback. `BENCH_DONE_<ms>` records the JavaScript
+transfer duration for 4 MiB; it excludes browser process startup. This is a
+network/IPC workload, not a page-rendering score or Internet speed test.
+
+| Measurement | Original kernel | Opt-in tracing kernel |
+| --- | ---: | ---: |
+| Initial local transfer, one browser | 5,824 ms | 1,720 ms |
+| Diagnostic bytes across the recorded launch window | 346,234 | 18,526 |
+| Unconditional RequestServer trace lines in that window | 5,178 | 0 |
+| Recent compositor interval p95 after that launch | 413 ms | 306 ms |
+| Recent compositor interval maximum after that launch | 2,183 ms | 1,849 ms |
+
+The first pair demonstrates an approximately 3.4x transfer improvement from
+removing unconditional RequestServer syscall/poll logging. It is one paired
+run, not a universal browsing speedup. Both launches used a five-second guest
+profile during startup; export added overhead outside the transfer interval.
+The compositor values are rolling 256-loop intervals at the query point,
+not full-run percentiles or measured display scanout intervals.
+
+Once Google was also open in the comparison VM, three unprofiled, untraced
+reloads took 4,694 / 3,488 / 3,589 ms (median 3,589 ms). QEMU consumed
+5.11 / 3.87 / 4.34 CPU seconds over 5.06 / 3.81 / 4.32 host seconds to
+observe the completion markers. These are aggregate QEMU process CPU times,
+including device threads. The additional browser and accumulated allocations
+make these different conditions from the initial pair. They show substantial
+remaining CPU work. Explicit `strace RequestServer net` still worked; one
+reload with it enabled took 4,059 ms. Tracing was disabled again afterward.
+
+The primary remaining bottleneck is the kernel heap, not exhausted RAM:
+
+- Host QMP snapshots during a new Google launch: 201/250 in `kmalloc` or
+  `WriteBlock`; 215/250 had the interrupt-enable flag clear. Of the allocator
+  snapshots, 123 landed in the first-fit block scan and 76 in the forensic
+  free-poison fill loop, confirmed against the run's ELF disassembly.
+- A separate warm local reload, without guest profiling: 52/71 snapshots in
+  allocator/poison work, 52/71 with interrupts disabled; 13/71 in block-write
+  or request-submission paths. Host snapshots avoid guest timer masking,
+  but can favor VM-exit points and introduce synchronization overhead; these
+  are corroborating observations, not precise CPU utilization fractions.
+- Heap inspection: 76,712 KiB region, 11,645 blocks (11,637 allocated),
+  72,209,408 used bytes, 4,853,120 free bytes, largest free 4,814,848 bytes,
+  poison enabled. `kmalloc` scans all blocks from the start; split and
+  coalescing paths repeatedly poison large already-free regions while holding
+  an IRQ-disabling lock. No allocator behavior or poisoning was changed here.
+- Cold launch also samples synchronous virtio block reads. Storage writes
+  remain visible in the warm reload. Prioritize allocator indexing and
+  redundant-poison elimination before tuning the browser renderer; preserve
+  free-poison/forensic checks and validate heap integrity and concurrency.
+
+The guest timer profiler has two limitations for this workload: samples can
+land just after interrupt re-enable, and its own periodic FAT writes consume
+allocator/storage time during recording. Use host sampling and unprofiled
+transfer runs to corroborate it. ELF exports previously lost all symbols when
+`llvm-cxxfilt` was missing even though `nm` worked; the converter now retains
+ELF names in that case, with a regression test.
+
+A settled local-page click was observed in 764 ms from host injection to the
+serial title marker, including bridge/QMP and 10 ms polling overhead. This
+single observation is not pure input latency or a percentile. QMP keyboard
+injection remained unreliable during the test, whereas kernel debug
+`inject combo ctrl+r` reliably reloaded the page; keep input routing separate
+from startup starvation. A later stats query reported `max_ms=4294967295`, an
+invalid extreme requiring telemetry investigation rather than interpretation
+as a real stall. Google eventually rendered its consent page in the comparison
+VM; this performance run does not certify whole-site compatibility or SMP.
+
+Baseline benchmark session: `06d9393ccf98449484204845a7396c4e`, kernel SHA256
+`2e5e3c5eafcb06273fc5642d38ff689192ef56d045e6f2b4450de686dd8d4b9f`.
+Comparison session: `15b83c6d82674d158d1ef7c434179452`, kernel SHA256
+`d113eb8dd3b4aa43d007904df5f2285db1ecf585c40ec8c66c8aff084afbd073`.
+The later source cleanup only removes empty process-name diagnostic branches;
+the final kernel was rebuilt. Build, all 12 kernel host checks, all 15 bridge
+checks and the symbol-export regression passed. Temporary VMs and the test
+HTTP server were stopped after evidence capture.
+
+### Runtime heap poison and Quake GL profiles (2026-10-14)
+
+Heap alloc/free poisoning now defaults **off**. Enable it for diagnostics with
+`heap poison on`, restore the normal setting with `heap poison off`, and
+inspect it with `heap`/`mem heap`. Both the guest shell and framed kernel TCP
+bridge accept the toggle; the bridge also accepts `heap check`. Enabling holds
+the heap lock while reseeding existing free regions, so unpoisoned old data
+is not misreported as UAF; live allocations are preserved. Forensic poison
+remains available when enabled. The standalone allocator regression boot
+explicitly reported `[PASS] heap`, including off-to-on reseeding and live-data
+preservation, followed by ordinary allocation/reallocation/integrity checks.
+
+Matched browser tests used the same kernel, prepared seed disks, one KVM vCPU,
+software display, and the same 4 MiB local workload. The poison-on run enabled
+it through the bridge before launching Ladybird; normal early boot was off in
+both runs. Each mode opened the local benchmark and then a second Ladybird
+instance on Google. Reloads explicitly focused the benchmark window and had
+no active guest profiler. An idle, separately prepared GPU VM was present in
+both verified runs; no Quake workload ran during browser measurements.
+
+| Browser measurement | Poison on | Default off |
+| --- | ---: | ---: |
+| Initial transfer duration | 2,050 ms | 1,537 ms |
+| Three reloads with only benchmark open | 1,257 / 1,202 / 1,125 ms | 1,235 / 1,163 / 1,238 ms |
+| Three reloads with Google also open | 4,000 / 3,953 / 3,797 ms | 2,708 / 1,873 / 1,509 ms |
+| Median with Google also open | 3,953 ms | 1,873 ms |
+| Google launch snapshots in free-poison fill | 88/250 | 0/250 |
+| Google launch snapshots in allocator | 121/250 | 158/250 |
+
+The loaded-browser median improved about 2.1x; the lighter reloads showed no
+clear improvement. Off-run reloads trended down, so do not treat the median as
+a universal or steady-state speedup. Free-fill work disappeared, but first-fit
+scanning still dominates: the warm off reload had 31/38 host snapshots in
+`kmalloc`, versus 32/82 allocator and 23/82 poison-fill snapshots when on.
+Both heaps passed integrity checks with approximately 11,600 live blocks.
+Captures retain the IRQ-masking/VM-exit sampling caveats from the earlier
+investigation. An initial off trial reloaded the wrong focused browser after
+opening Google; its incomplete results were discarded and retained under
+`poison-off-initial` as harness evidence. Verified results are `poison-off`
+(session `bbf54474e4254b31a0dc3fd0287ea66b`) and `poison-on`
+(`4f020eca13224af1b5ab3323dade3217`) under the ignored performance directory.
+Both use kernel SHA256
+`fa1c34f0559eaf53a73ab5fed1b7561d5f7e4bb1a5844e19eab8bf0d3cf31713`.
+
+Quake used one KVM vCPU, GL3, a confirmed **1280x720 drawable**, GPU composition,
+Intel `/dev/dri/renderD128`, and host audio `none`. Its renderer reported
+`virgl (Mesa Intel(R) UHD Graphics 630 (CML GT2))`, rather than software GL.
+Separate cold-start and settled stationary `base1` gameplay captures recorded
+five-second guest CPU/context-switch profiles plus randomized host register
+snapshots. Gameplay comparisons toggled heap poison in the same running game.
+The workload is an active rendered game scene, not a timedemo FPS benchmark.
+
+A second avoidable logging cost appeared: Quake probes up to 1,000 numbered
+pak paths in multiple search roots. Roughly 2,000 normal missing-file probes
+triggered unconditional `sys_open FAIL` serial diagnostics. Those detailed pak
+messages now require explicitly enabled file-category strace; open results and
+discovery remain unchanged. Comparing the same initial 300-snapshot launch
+window, serial printing fell from 95/300 snapshots (31.7%) to 3/300 (1.0%).
+Allocator snapshots increased from 103/300 to 155/300 as other work became
+visible. These are sampled phase observations, not a measured 32x whole-game
+loading speedup. Full time-to-playable was not benchmarked.
+
+| Quake gameplay host snapshots (250 each) | Poison off, baseline | Poison on | Off, logging fix |
+| --- | ---: | ---: | ---: |
+| GPU SubmitCommand + queue notification | 142 | 140 | 138 |
+| Allocator | 31 | 38 | 24 |
+| Poison fill | 0 | 6 | 0 |
+| HDA register reads | 14 | 18 | 24 |
+
+The GPU driver's synchronous control-queue submission/poll loop is the main
+runtime target (~55–57% of these snapshots), with allocator scanning next.
+Investigate submission counts, batching and completion waits while preserving
+fence/resource lifetime correctness. Poisoning has a much smaller visible
+runtime contribution than in the loaded browser. Silent host output still
+includes guest audio processing; HDA MMIO reads are a secondary observation,
+subject to host VM-exit sampling bias. Do not infer GPU hardware utilization
+from these guest instruction snapshots. Recent compositor interval p50/p95
+were 34/45 ms (baseline off), 37/45 ms (on), and 35/44 ms (final off), queried
+after captures. They are not application frame percentiles; invalid UINT32_MAX
+maxima occurred again in some windows and remain PERF-04.
+
+The kernel-only symbol exporter initially mislabeled loaded-driver addresses
+as huge offsets beyond `LZ4_slideInputBuffer`. Analysis reconstructed each
+module's SHF_ALLOC section layout using the loader's logged base, copied the
+unchanged module ELFs into each run, and bounded function addresses by symbol
+size. `module-host-summary.json`, SHA manifests, `module-combined.symmap` and
+regenerated `*.module.speedscope.json` preserve the corrected GPU/HDA labels.
+The first startup profile's marker also scrolled beyond the bridge's 256 KiB
+recent-log window; its complete FAT profile was recovered from the preserved
+stopped boot disk, rather than counted as missing samples.
+
+Quake baseline: `quake-baseline`, session
+`f769ce95fbd24f7489b67c6da8384db8`, kernel `fa1c34f...`; it reached its configured
+test timeout after captures. Logging-fix comparison: `quake`, session
+`69dca28ce1d546ab906aa8526bbb3a71`, kernel SHA256
+`52394eb267c36d083570eb057072dd3de2aab9aa9e452e754786f24629450914`.
+Both rendered gameplay successfully; heap checks passed and the logging-fix
+run retained poison off. Tests passed: 12 kernel host tests, 15 bridge tests,
+one profiler-symbol regression and one bare-metal allocator regression.
+Test VMs and the temporary HTTP server were stopped. Licensed game data,
+OST files, VM images, logs and captures remain outside git.
+
+
+## 14 October: bounded GPU investigation and recorded Quake demos
+
+The user extended this investigation to at most one hour and asked for recorded
+moving scenes. Runs use one KVM vCPU, Intel `/dev/dri/renderD128`, hardware
+virtio/virgl GL3, GPU composition, a 1280x720 game drawable and silent host audio
+(`BROOK_AUDIODEV=none`). Writable experiment clones and licensed recordings stay
+under ignored `build/experiments/results/gpu-short-20261014/`.
+
+The first unprofiled `+map base1` launch reached the post-refresh relative-mouse
+warning in **32.2 seconds**; a subsequent capture confirmed rendered gameplay.
+This is a map-ready marker, not instrumented first-pixel latency. Earlier startup
+profiles were intrusive and are not a trustworthy before/after loading timer.
+
+Fresh profiles lost the normal startup demo because Brook adds `+exec
+brook-controls.cfg`, and Yamagi starts its automatic `d1` loop only without late
+commands. The launcher now appends `+d1` only in that first-profile case when the
+caller supplied no late command. Explicit map/demo/connect/exec commands and
+saved preferences keep their existing behaviour. This was confirmed against the
+actual Yamagi 8.60 source and tested through the real wrapper with a fake game.
+
+For deterministic repeats, `brook-benchmark.cfg` alternates the licensed
+`demo1.dm2` and `demo2.dm2`, explicitly disconnecting at each boundary so Yamagi
+prints separate timedemo results. It contains only original commands and is now
+included in fresh experiment seeds. Use `+set timedemo 0 +exec
+brook-benchmark.cfg` for ordinary moving-scene profiling. For uncapped timing on
+a fresh guest with no Quake process already running:
+
+```sh
+python3 tools/profile/q2_demo_benchmark.py SESSION --runs 6 \
+  --output build/experiments/results/q2-demo-results.json
+```
+
+The runner launches GL3 at 720p, filters zero-frame startup reports, saves the
+kernel identity and records results without sampling or screenshots during
+timing. FPS uses the guest clock; host elapsed includes asset loading. The game
+continues running afterward. Compare equal configurations and per-demo frame
+counts, and keep timer calibration and cold/warm runs in mind.
+
+The rejected GPU experiment attached a requested render fence to the final
+nonempty command chunk instead of issuing an additional empty fenced submission.
+It retained synchronous render completion, ordering and failure propagation.
+Its callback signature temporarily required ABI 2. After comparison, both the
+original GPU API and ABI 1 were restored and every module rebuilt together.
+
+That rebuild exposed missing custom-command header dependencies: only the GPU
+module rebuilt initially, so old NIC/input/audio modules were rejected. Module
+compiles now emit/consume compiler depfiles and explicitly depend on the ABI
+header. An isolated build test verified ABI edits rebuild both modules, a
+transitive private-header edit rebuilds only the affected module, and unchanged
+builds remain clean. Every production module was rebuilt and import checks
+passed before continuing the VM comparison.
+
+
+The standalone timedemo rendered 689 frames: reference 24.9 FPS, candidate
+25.1 FPS. That difference was too small to establish an improvement. Repeated
+benchmarks used the original alternating config (688/617 frames at its explicit
+disconnect boundaries), the same rebuilt kernel, identical HUD/display/audio
+settings, and no profiler or screenshots during timing:
+
+| Recorded demo | Separate empty fence, FPS (three runs) | Fused fence, FPS (three runs) | Median comparison |
+| --- | --- | --- | --- |
+| demo1 | 25.5, 24.6, 24.4 | 24.4, 23.1, 23.2 | 24.6 → 23.2 |
+| demo2 | 23.7, 24.0, 24.1 | 23.1, 23.4, 22.9 | 24.0 → 23.1 |
+
+Total host elapsed for all six runs including loading was 209.1 seconds for
+reference versus 213.1 seconds for fusion. APIC rate adjustments occurred during
+the runs, so guest-clock FPS is not a precise wall-clock speedup measure. The
+reference reproduced the original two queue submissions within one driver call
+and held its guard continuously; the original shipping path releases/reacquires
+the guard between callbacks. This isolates fence placement but is not an exact
+copy of the old scheduling. These results do not justify retaining fusion: its
+patch is archived at `build/experiments/results/gpu-short-20261014/fused-fence-experiment.patch`;
+the original rendering path remains in the source and normal build.
+
+Moving-scene profiles were captured separately: 300 QMP CPU snapshots per run
+and 500 guest timer samples. GPU SubmitCommand/notification accounted for
+156/300 reference snapshots (52%) and 150/300 candidate snapshots (50%). These
+captures cover different points in moving playback, are biased by IRQ masking
+and VM exits, and include the profiler's own disk writes. They identify the
+synchronous queue as continuing work, rather than proving a throughput gain.
+Driver ELF copies/load addresses and bounded symbol maps were preserved.
+Candidate and reference heap integrity checks passed. No virgl command errors
+were reported in the completed comparison runs. The candidate's final capture
+fell in a black map transition; its standalone demo capture shows rendered
+scenery, and repeated timings completed both recordings.
+
+Validation passed: 12 kernel host tests, 20 bridge/launcher tests, the profiler
+symbol regression, shell syntax, module import checks and the isolated module
+dependency rebuild experiment. Socket tests require execution outside the
+socket-restricted sandbox. The prepared checkpoint's GL/software wrappers were
+refreshed as local regular files in `/nix/bin` and `/nix/profile/bin`; future
+seeds get generated wrappers from the updated Nix template. Its authored
+benchmark config was also staged locally. Backups and licensed assets remain
+in ignored build directories.
+
+
+Final production-path check: kernel SHA256
+`024d3cb478cf85e1dbc73341b5aec5ea2fa99d1b5fa69969c88271968d47412c`,
+ABI 1, original two-callback GPU submission. Session
+`cd738d89cebe471db35eba1132662bfd` launched a fresh profile with only renderer
+and early display settings, no explicit map/demo command. Automatic intro and
+`Installation` demo playback reached its gameplay marker in 37.0 seconds,
+including the intro. One capture confirmed rendered gameplay; a later capture
+showed loading at the next demo boundary. Heap
+integrity passed and QEMU reported no virgl command errors. The updated normal
+checkpoint's boot-driver copies were synchronized with the restored build.
+
+A fresh `nix-build nix/experiment-packages.nix -A profile --no-out-link` succeeded;
+its generated GL and software wrappers match the locally staged copies byte
+for byte. Final host tests passed after rollback. Experiment VMs were stopped;
+normal host launches retain silent audio unless explicitly enabled.

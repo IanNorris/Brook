@@ -482,17 +482,6 @@ struct EpollInstance {
     Process*   waiter; // process blocked in epoll_wait
 };
 
-// Helper: detect RequestServer process by name (PIDs change between boots)
-static inline bool IsRequestServer(const Process* p) {
-    if (!p || !p->name[0]) return false;
-    // Match ".RequestServer-wrapped" or "RequestServer" variants
-    const char* n = p->name;
-    for (int i = 0; n[i]; i++) {
-        if (n[i] == 'R' && n[i+1] == 'e' && n[i+2] == 'q' && n[i+3] == 'u') return true;
-    }
-    return false;
-}
-
 // memfd constants and data — defined here so sys_read/sys_write/fstat can use them
 static constexpr uint32_t MFD_CLOEXEC       = 0x0001u;
 [[maybe_unused]] static constexpr uint32_t MFD_ALLOW_SEALING = 0x0002u;
@@ -1740,14 +1729,8 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count)
                 Process* reader = pipe->readerWaiter;
                 if (reader)
                 {
-                    if (IsRequestServer(reader)) {
-                        extern volatile uint64_t g_lapicTickCount;
-                    }
                     pipe->readerWaiter = nullptr;
                     WakeProcess(reader);
-                }
-                else if (proc && IsRequestServer(proc)) {
-                    extern volatile uint64_t g_lapicTickCount;
                 }
                 PipeWakeEpoll(pipe);
                 break;  // Return partial writes immediately
@@ -3137,10 +3120,16 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
 
     if (!vn)
     {
-        // Diagnostic: log pak open failures
+        // Optional Quake pak diagnostics. Missing pak-number probes are normal
+        // discovery, not kernel errors; logging thousands of them directly to
+        // the UART made game startup spend substantial time with IRQs off.
         bool isPak = false;
-        for (const char* p = lookupPath; *p; ++p)
-            if (p[0] == 'p' && p[1] == 'a' && p[2] == 'k') { isPak = true; break; }
+        constexpr uint32_t fileTraceCategory = 1u << 1; // SC_FILE below
+        if (proc->straceEnabled &&
+            (proc->straceFilter == 0 || (proc->straceFilter & fileTraceCategory))) {
+            for (const char* p = lookupPath; *p; ++p)
+                if (p[0] == 'p' && p[1] == 'a' && p[2] == 'k') { isPak = true; break; }
+        }
         if (isPak)
         {
             uint32_t usedFds = 0;
@@ -8274,18 +8263,14 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
                timeout == static_cast<uint64_t>(0xffffffffu);
     };
 
-    // or from any process when watching inet sockets
+    // Poll diagnostics are opt-in, like the syscall trace itself. Printing
+    // each RequestServer poll directly to the UART stalls browser IPC and
+    // holds interrupts off, even when ordinary strace is disabled.
     bool logPoll = false;
-    bool hasInetSock = false;
-    {
-        for (uint64_t i = 0; i < nfds; i++) {
-            if (fds[i].fd < 0) continue;
-            FdEntry* fde = FdGet(proc, fds[i].fd);
-            if (fde && fde->type == FdType::Socket) { hasInetSock = true; break; }
-        }
-        // Always log for RequestServer to catch pipe-only polls
-        logPoll = hasInetSock || IsRequestServer(proc);
-    }
+    // SC_IO is declared with the strace dispatcher below.
+    constexpr uint32_t pollTraceCategory = 1u << 5;
+    logPoll = proc->straceEnabled && !proc->straceErrorsOnly &&
+        (proc->straceFilter == 0 || (proc->straceFilter & pollTraceCategory));
     if (logPoll) {
         extern volatile uint64_t g_lapicTickCount;
         for (uint64_t i = 0; i < nfds && i < 8; i++) {
@@ -14179,23 +14164,8 @@ int64_t SyscallDispatchInternal(uint64_t num, uint64_t a0, uint64_t a1,
         return -38; // -ENOSYS
     }
 
-    // Mini-strace for tgid 13 (RequestServer) — skip poll/ppoll (NET_DIAG covers
-    // those), mmap/mprotect/brk/sigaction/sigprocmask/rt_sigreturn (noise).
-    if (proc && IsRequestServer(proc) &&
-        num != 7 && num != 271 &&                    // poll, ppoll
-        num != 9 && num != 10 && num != 11 &&        // mmap, mprotect, munmap
-        num != 12 && num != 28 &&                    // brk, madvise
-        num != 13 && num != 14 && num != 15 &&       // sigaction, sigprocmask, sigreturn
-        num != 228 && num != 334 && num != 218)      // clock_gettime, rseq, set_tid_address
-    {
-        extern volatile uint64_t g_lapicTickCount;
-        int64_t ret = fn(a0, a1, a2, a3, a4, a5);
-        const char* nm = SyscallName(num);
-        SerialPrintf("[STRACE13] t=%lums %s(%lu, 0x%lx, 0x%lx) = %ld\n",
-                     g_lapicTickCount, nm ? nm : "?", a0, a1, a2, ret);
-        return ret;
-    }
-
+    // RequestServer uses the same explicitly enabled, filtered strace path
+    // as every other process; no process-name-specific logging here.
     return fn(a0, a1, a2, a3, a4, a5);
 }
 

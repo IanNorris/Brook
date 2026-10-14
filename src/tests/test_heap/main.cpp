@@ -8,6 +8,39 @@ TEST_MAIN("heap", {
     brook::VmmInit();
     brook::HeapInit();
 
+    // Runtime poison starts off. Enabling after frees must seed free regions
+    // without overwriting live allocations or reporting ordinary data as UAF.
+    brook::HeapStats stats;
+    brook::HeapGetStats(&stats);
+    ASSERT_TRUE(!stats.poisonEnabled);
+    auto* left = static_cast<uint8_t*>(brook::kmalloc(64));
+    auto* hole = static_cast<uint8_t*>(brook::kmalloc(64));
+    auto* right = static_cast<uint8_t*>(brook::kmalloc(64));
+    ASSERT_TRUE(left && hole && right);
+    for (int i = 0; i < 64; ++i) {
+        left[i] = 0x71; hole[i] = 0xA5; right[i] = 0x72;
+    }
+    brook::kfree(hole);
+    brook::HeapSetPoison(true);
+    brook::HeapGetStats(&stats);
+    ASSERT_TRUE(stats.poisonEnabled);
+    for (int i = 0; i < 64; ++i) {
+        ASSERT_EQ(left[i], static_cast<uint8_t>(0x71));
+        ASSERT_EQ(right[i], static_cast<uint8_t>(0x72));
+        ASSERT_EQ(hole[i], static_cast<uint8_t>(0xDF));
+    }
+    auto* seeded = static_cast<uint8_t*>(brook::kmalloc(64));
+    ASSERT_TRUE(seeded != nullptr);
+    for (int i = 0; i < 64; ++i)
+        ASSERT_EQ(seeded[i], static_cast<uint8_t>(0xCD));
+    brook::HeapSetPoison(false);
+    brook::HeapGetStats(&stats);
+    ASSERT_TRUE(!stats.poisonEnabled);
+    brook::kfree(seeded);
+    brook::kfree(left);
+    brook::kfree(right);
+    ASSERT_TRUE(brook::HeapCheckIntegrity());
+
     // --- Basic alloc/free ---
     void* a = brook::kmalloc(64);
     ASSERT_TRUE(a != nullptr);

@@ -38,8 +38,9 @@ uint64_t HeapFreeBytes();
 // Logs details of the first corrupt block to serial.
 bool HeapCheckIntegrity();
 
-// Enable/disable poison fill on alloc/free. Enabled by default.
-// Disabling improves performance for allocation-heavy workloads.
+// Enable/disable poison fill on alloc/free. Disabled by default.
+// Enabling reseeds existing free regions; live allocations are left intact.
+// The shell and debug channel accept "heap poison on|off" at runtime.
 void HeapSetPoison(bool enable);
 
 // Dump heap statistics to serial: total blocks, free/used counts, sizes.

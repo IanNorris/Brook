@@ -3299,6 +3299,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  sock            - open sockets\n"
             "  mem             - memory statistics (PMM + heap summary)\n"
             "  mem heap        - detailed heap block breakdown\n"
+            "  heap poison on|off - runtime alloc/free poison (default off)\n"
+            "  heap check      - validate heap block metadata\n"
             "  mem pids        - per-PID PMM page counts (to serial)\n"
             "  uptime          - system uptime + wall clock\n"
             "  cpus            - CPU count + SMP info\n"
@@ -3494,6 +3496,19 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         const char* h4 = " KB\n";
         for (int i = 0; h4[i]; i++) buf[p++] = h4[i];
         DebugReplySend( buf, static_cast<uint32_t>(p));
+    }
+
+    // -----------------------------------------------------------------------
+    // Runtime heap diagnostics are also available to the VM bridge.
+    // Toggle through HeapSetPoison so free-region reseeding is synchronized.
+    // -----------------------------------------------------------------------
+    else if (NetStrEq(cmd, "heap poison on") || NetStrEq(cmd, "heap poison off")) {
+        bool enable = NetStrEq(cmd, "heap poison on");
+        HeapSetPoison(enable);
+        DebugChannelSend(enable ? "heap poison: on\n" : "heap poison: off\n");
+    }
+    else if (NetStrEq(cmd, "heap check")) {
+        DebugChannelSend(HeapCheckIntegrity() ? "heap integrity: OK\n" : "heap integrity: CORRUPT\n");
     }
 
     // -----------------------------------------------------------------------

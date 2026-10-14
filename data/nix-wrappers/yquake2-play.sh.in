@@ -69,7 +69,25 @@ case "${1:-}" in
 esac
 
 if [ "$BROOK_FIRST_CONTROLS" = "1" ]; then
+    # Yamagi removes +set and its two operands before checking late commands.
+    # Our injected +exec otherwise suppresses its normal startup demo (d1).
+    # Restore that default only when the caller supplied no late command.
+    BROOK_HAS_LATE_COMMANDS=0
+    BROOK_EARLY_ARGS=0
+    for BROOK_ARG in "$@"; do
+        if [ "$BROOK_EARLY_ARGS" -gt 0 ]; then
+            BROOK_EARLY_ARGS=$((BROOK_EARLY_ARGS - 1))
+            continue
+        fi
+        case "$BROOK_ARG" in
+            +set) BROOK_EARLY_ARGS=2 ;;
+            *+*) BROOK_HAS_LATE_COMMANDS=1 ;;
+        esac
+    done
     set -- +exec brook-controls.cfg "$@"
+    if [ "$BROOK_HAS_LATE_COMMANDS" = "0" ] && [ "$BROOK_EARLY_ARGS" = "0" ]; then
+        set -- "$@" +d1
+    fi
 fi
 
 # @YQUAKE2_BIN@ is replaced by prestage_yquake2.sh with the RESOLVED real binary

@@ -234,10 +234,19 @@ def _symmap_from_elf(elf_path):
             parts = line.split(None, 2)
             if len(parts) == 3 and parts[1] in ('T', 't'):
                 lines.append(f"{parts[0]} {parts[2]}\n")
-        demangled = subprocess.run(['llvm-cxxfilt'], input=''.join(lines),
-                                   capture_output=True, text=True)
+        # Symbol addresses remain useful without a demangler. The bridge
+        # can run outside nix-shell, where nm is available but llvm-cxxfilt
+        # is not; don't discard the successfully extracted ELF symbols.
+        symbol_text = ''.join(lines)
+        try:
+            demangled = subprocess.run(['llvm-cxxfilt'], input=symbol_text,
+                                       capture_output=True, text=True)
+            if demangled.returncode == 0:
+                symbol_text = demangled.stdout
+        except FileNotFoundError:
+            pass
         tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.symmap', delete=False)
-        tmp.write(demangled.stdout if demangled.returncode == 0 else ''.join(lines))
+        tmp.write(symbol_text)
         tmp.close()
         count = len(lines)
         print(f"  Generated symmap: {count} symbols from {os.path.basename(elf_path)}")

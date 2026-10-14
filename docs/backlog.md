@@ -131,3 +131,62 @@ stayed correctly rendered across eight helper forks. This supersedes the
 initial bottom-strip/full-frame corruption diagnosis. Window-close still
 faulted a VLC worker after that fix (`2efcc298b41a4c4494a1367c2143c964`), so
 shutdown and SMP startup remain open. The prepared launcher uses one vCPU.
+
+### Browser performance follow-up
+
+14 October measurements and artifacts are recorded in
+[experiments.md](experiments.md#ladybird-performance-investigation-2026-10-14).
+Unconditional RequestServer tracing was removed; ordinary filtered strace
+remains available. The initial fixed local transfer improved from 5.824 to
+1.720 seconds, while later reloads with another browser open still took
+3.488–4.694 seconds. Keep these test conditions distinct.
+
+| ID | Investigation | Acceptance evidence |
+| --- | --- | --- |
+| PERF-01 | Replace whole-heap first-fit scans with indexed free blocks; avoid redundant poison fills on already-free split/coalesced regions while retaining forensic/UAF diagnostics | Host samples and unprofiled local workload improve; allocation/free/realloc/coalescing/expansion integrity checks and concurrency validation pass; runtime opt-in poison/forensic checks remain functional after toggles. |
+| PERF-02 | Reduce synchronous block-I/O and repeated browser cache metadata writes | Correlate write paths with caller stacks and request counts; compare cold startup and warm transfer separately after allocator work. |
+| PERF-03 | Reduce guest profiler observer overhead and account for IRQ-masked critical sections | Bounded captures do not spend substantial recording time allocating/writing their own FAT output; compare host and guest samples; preserve long-capture durability and report dropped events. |
+| PERF-04 | Diagnose invalid compositor interval maxima | Reproduce `max_ms=4294967295`, establish clock/concurrent-frame-update cause, and validate telemetry before using it for stall percentiles. |
+| PERF-05 | Compare QMP keyboard/wheel delivery with guest debug injection and native input | Exact event-sequence probe, settled-page typing/scroll tests and load-time latency measurements; distinguish routing defects from allocator-induced starvation. |
+
+
+PERF-01 update: at the user's request, heap poison is now a runtime flag off
+by default. The 14 October matched loaded-browser median fell from 3.953 to
+1.873 seconds; lighter transfers changed little. The off-to-on transition
+reseeds free regions without changing live allocations, and the allocator
+regression plus live heap checks passed. First-fit indexing remains open.
+
+PERF-06 — Quake GL3 at 720p: reduce synchronous GPU control-queue round trips
+and spin waits. Correctly resolved driver snapshots put about 55–57% in
+SubmitCommand/notification during stationary gameplay. Measure command counts
+and GPU completion timing, preserve fences/shared-buffer lifetime and test
+720p rendering plus capture correctness. Startup's extra pak-miss serial
+logging is now opt-in; its sampled serial work fell from 95/300 to 3/300.
+The bounded follow-up measured a 32.2-second map-ready launch and repeated both
+recorded demos at 720p. Fusing the fence into the final chunk did not improve
+throughput and was archived/reverted. Moving-scene snapshots still put about
+half the samples in queue submission/notification. Next work should measure
+queue/fence timing and prototype asynchronous completion with proper buffer
+ownership and a sleep-capable lock; do not yield while holding the current
+spinlock. Keep guest audio MMIO overhead as a separate follow-up.
+
+PERF-03 update: bridge profile export can lose the output marker once startup
+logs exceed its 256 KiB tail. Add persisted output-path discovery. Kernel-only
+symbolization also needs the run's archived module ELFs and load addresses;
+otherwise GPU module RIPs appear as false large-offset LZ4 frames. The current
+captures were recovered/remapped explicitly; integrate that into normal export.
+
+
+PERF-06 measurement update: repeatable `brook-benchmark.cfg` and
+`tools/profile/q2_demo_benchmark.py` now alternate the licensed demos and collect
+per-recording results without sampling/capture overhead. APIC rate adjustments
+occurred during GPU-heavy runs; corroborate guest FPS with host timing before
+claiming small wins. Investigate failing Mesa shader-cache renames separately:
+these occur during launch and may prevent useful warm-cache behaviour.
+
+RUN follow-up: QMP `system_reset` did not restart a test VM launched with the
+current `-no-reboot -no-shutdown` flags; the bridge should expose the resulting
+state and validate reset/reboot semantics. Restarting the owned QEMU process
+provided clean benchmark boots. Quake process teardown also emitted map-count
+underflow/user faults during an overlapping-process experiment; keep those
+reproductions separate from the successful single-process demo comparisons.

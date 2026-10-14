@@ -30,8 +30,9 @@ static constexpr uint8_t  POISON_ALLOC  = 0xCD;  // uninitialized alloc
 static constexpr uint32_t POISON_FREE4  = 0xDFDFDFDF;  // freed memory
 static constexpr uint16_t POISON_MARK16 = 0xDFDF;      // high 16 bits of every poison word
 
-// Global toggle — can be disabled at runtime for performance-sensitive paths.
-static volatile bool g_heapPoisonEnabled = true;
+// Runtime diagnostic toggle. Normal workloads avoid alloc/free poison fills;
+// enable explicitly with "heap poison on" when investigating memory faults.
+static volatile bool g_heapPoisonEnabled = false;
 
 // BRO-179 forensic heap poison. When ARMED (post-boot, once the per-CPU GS base
 // is valid), a freed block is filled with a pattern that keeps the 0xDFDF marker
@@ -525,7 +526,23 @@ bool HeapCheckIntegrity()
 
 void HeapSetPoison(bool enable)
 {
-    g_heapPoisonEnabled = enable;
+    uint64_t flags = IrqSpinLockAcquire(&g_heapLock);
+    if (enable && !g_heapPoisonEnabled) {
+        // Free regions created while poisoning was off contain ordinary data.
+        // Seed them before enabling allocation's poison check, without touching
+        // live allocations. Otherwise toggling on reports false UAF failures.
+        g_heapPoisonEnabled = true;
+        auto* cur = reinterpret_cast<BlockHeader*>(g_heapStart);
+        while (cur && reinterpret_cast<uint8_t*>(cur) < g_heapEnd) {
+            if (!IsValidHeader(cur)) break;
+            if (cur->free)
+                WriteBlock(reinterpret_cast<uint8_t*>(cur), cur->size, 1);
+            cur = NextBlock(cur);
+        }
+    } else {
+        g_heapPoisonEnabled = enable;
+    }
+    IrqSpinLockRelease(&g_heapLock, flags);
 }
 
 void HeapGetStats(HeapStats* out)
