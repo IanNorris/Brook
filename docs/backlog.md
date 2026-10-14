@@ -253,3 +253,11 @@ preserving the partial boundary page and fork COW owners. Standard descriptors
 now follow their actual object; Python can execute large scripts from file
 stdin without entering the REPL. These are independently validated defects;
 none alone establishes the cause of the intermittent Clang test crash.
+
+Large Bash heredocs also expose the open-unlinked-file lifetime gap: Bash
+opens its temporary script then unlinks it, but ext2 frees the inode while the
+fd still needs its contents. A Python `-` checker consequently read EOF and
+silently did nothing (previously also entering REPL due to wrong TTY metadata).
+The module validator now uses a named Python script and checks nonempty outputs.
+Implement delayed inode reclamation and add an unlinked-file stdin regression
+before relying on large heredocs in guest application scripts.
