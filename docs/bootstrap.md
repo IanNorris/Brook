@@ -97,6 +97,13 @@ cleanup. Retrying the existing clone fetched both pinned submodules and verified
 Access permission-bit evaluation and long stored directory-fd paths remain
 separate limitations; these checks validate pathname resolution and existence.
 
+CMake's child-process event loop exposed caught SIGCHLD being discarded by
+blocking pipe/tty/AF_UNIX reads. Reads now ignore only default/ignored SIGCHLD,
+preserve installed handlers and clear their wait registration on interruption.
+Epoll checks pending signals before sleeping. The five watchdog-protected
+`childsignalcheck` cases passed in Linux and Brook, including exec-child epoll
+notification, pipe/socket interruption, SA_RESTART and default-ignored SIGCHLD.
+
 Runtime evidence is retained under ignored `build/experiments/results/bootstrap-20261014/`
 and `bootstrap-compat-20261014/`, and the VM registry keeps serial logs and the
 actual booted kernel identities. Package payloads, images and logs stay out of git.

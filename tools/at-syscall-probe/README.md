@@ -99,3 +99,13 @@ existence, dangling symlinks, EMPTY_PATH/EACCESS flags, bad fds/modes/flags,
 oversize paths and strings crossing an unmapped page. Expect `ACCESSCHECK PASS
 failures=0`. Permission-bit and real-versus-effective credential evaluation
 remain unimplemented in Brook; this probe checks pathname/existence semantics.
+
+`childsignalcheck.c` must be invoked by its absolute path. Five separately
+watched child processes check SIGCHLD from an exec'd child, a signal handler
+notifying an epoll event loop through eventfd, caught signals during pipe and
+AF_UNIX reads, SA_RESTART, and default-ignored SIGCHLD during a blocking read.
+The handler also supplies read data, so delivery just before the read begins
+does not introduce a timing-dependent hang. Each case has a 15-second
+fork/waitpid/monotonic-clock watchdog; no alarm or pthread support is required.
+Expect `CHILDSIGNALCHECK PASS failures=0`. Temporary epoll_pwait masks remain
+outside this probe's scope.

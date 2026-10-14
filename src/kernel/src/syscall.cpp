@@ -411,6 +411,23 @@ static bool HasPendingSignals()
     return (proc->sigPending & ~proc->sigMask) != 0;
 }
 
+// Child exit also queues default-ignored SIGCHLD to wake wait4. Blocking
+// reads may discard that notification only when no user handler needs it.
+// In particular, libuv's exec-handshake read must preserve caught SIGCHLD
+// so its handler can notify the event loop and reap the exited child.
+static bool HasReadInterruptSignal()
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return false;
+    constexpr uint64_t childBit = 1ULL << (17 - 1);
+    if ((proc->sigPending & ~proc->sigMask & childBit) && proc->tgid < MAX_PROCESSES) {
+        uint64_t handler = g_sigHandlers[proc->tgid][17 - 1].handler;
+        if (handler == 0 || handler == 1)
+            __atomic_and_fetch(&proc->sigPending, ~childBit, __ATOMIC_RELEASE);
+    }
+    return HasPendingSignals();
+}
+
 static void WakeProcess(Process* proc)
 {
     uint64_t addr = reinterpret_cast<uint64_t>(proc);
@@ -2353,20 +2370,9 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             extern volatile uint64_t g_lapicTickCount;
             self->wakeupTick = g_lapicTickCount + 10; // recheck every ~10ms
             SchedulerBlock(self);
-            if (HasPendingSignals())
-            {
-                // SIGCHLD is harmless during pipe reads — clear it and retry.
-                // Only return EINTR for other signals.
-                uint64_t pending = self->sigPending & ~self->sigMask;
-                uint64_t sigchldBit = (1ULL << (17 - 1)); // SIGCHLD = 17
-                if ((pending & ~sigchldBit) != 0)
-                {
-                    int signo = __builtin_ctzll(pending & ~sigchldBit) + 1;
-                    SerialPrintf("PIPE_READ: pid %u '%s' interrupted by sig %d\n",
-                                 self->pid, self->name, signo);
-                    return -EINTR;
-                }
-                self->sigPending &= ~sigchldBit;
+            if (HasReadInterruptSignal()) {
+                if (pipe->readerWaiter == self) pipe->readerWaiter = nullptr;
+                return -EINTR;
             }
         }
     }
@@ -2538,14 +2544,9 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             extern volatile uint64_t g_lapicTickCount;
             self->wakeupTick = g_lapicTickCount + 10;
             SchedulerBlock(self);
-            // SIGCHLD alone shouldn't interrupt a blocking read — it's
-            // default-ignored. Retry and re-poll the pipe instead.
-            if (HasPendingSignals()) {
-                Process* p = ProcessCurrent();
-                uint64_t pending = p->sigPending & ~p->sigMask;
-                uint64_t sigchld = (1ULL << (17 - 1));
-                if ((pending & ~sigchld) != 0) return -EINTR;
-                p->sigPending &= ~sigchld;
+            if (HasReadInterruptSignal()) {
+                if (pipe->readerWaiter == self) pipe->readerWaiter = nullptr;
+                return -EINTR;
             }
         }
     }
@@ -2578,16 +2579,9 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             extern volatile uint64_t g_lapicTickCount;
             self->wakeupTick = g_lapicTickCount + 10;
             SchedulerBlock(self);
-            if (HasPendingSignals()) {
-                // SIGCHLD alone (default-ignored) shouldn't interrupt a
-                // blocking AF_UNIX read; this is the classic case that
-                // broke scm_rights_test when the client exits right after
-                // sending.
-                Process* p = ProcessCurrent();
-                uint64_t pending = p->sigPending & ~p->sigMask;
-                uint64_t sigchld = (1ULL << (17 - 1));
-                if ((pending & ~sigchld) != 0) return -EINTR;
-                p->sigPending &= ~sigchld;
+            if (HasReadInterruptSignal()) {
+                if (pipe->readerWaiter == self) pipe->readerWaiter = nullptr;
+                return -EINTR;
             }
         }
     }
@@ -9398,7 +9392,9 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
 
         proc->wakeupTick = wakeAt;
 
-        SchedulerBlock(proc);
+        // A signal may already be pending when the wait begins (including
+        // after a mask change); do not sleep before returning it to userspace.
+        if (!HasPendingSignals()) SchedulerBlock(proc);
         unregisterWaiters();
         if (HasPendingSignals()) {
             ep->waiter = nullptr;
