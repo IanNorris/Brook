@@ -49,9 +49,19 @@ export BROOK_SMP="${BROOK_SMP:-4}"
 # opt-in for USB experiments rather than overriding the launch default.
 export SERIAL_OPT="-serial file:${run_dir}/serial.log"
 instance="${BROOK_INSTANCE:-98}"
+display_args=(--headless --vnc "127.0.0.1:${instance}")
+case "${BROOK_EXPERIMENT_DISPLAY:-headless}" in
+    headless) ;;
+    native) display_args=() ;;
+    *) echo "BROOK_EXPERIMENT_DISPLAY must be headless or native" >&2; exit 2 ;;
+esac
 echo "Run: ${run_dir}"
 echo "Serial: ${run_dir}/serial.log"
-echo "VNC: 127.0.0.1:$((5900 + instance)); monitor instance: ${instance}"
+if [ "${BROOK_EXPERIMENT_DISPLAY:-headless}" = headless ]; then
+    echo "VNC: 127.0.0.1:$((5900 + instance)); monitor instance: ${instance}"
+else
+    echo "Native QEMU window; monitor instance: ${instance}"
+fi
 exec timeout "${BROOK_EXPERIMENT_TIMEOUT:-600}" "${ROOT_DIR}/scripts/run-qemu.sh" \
-    --release --headless --vnc "127.0.0.1:${instance}" --instance="${instance}" \
+    --release "${display_args[@]}" --instance="${instance}" \
     --real-esp --script "${scenario}"

@@ -1,0 +1,26 @@
+--- a/src/posix/filesystem.c
++++ b/src/posix/filesystem.c
+@@ -42,6 +42,9 @@
+ #endif
+ #include <dirent.h>
+ #include <sys/socket.h>
++#ifdef __linux__
++# include <sys/mman.h>
++#endif
+ #ifndef O_TMPFILE
+ # define O_TMPFILE 0
+ #endif
+@@ -112,6 +115,13 @@
+ int vlc_memfd (void)
+ {
+     int fd;
++#ifdef __linux__
++    fd = memfd_create("vlc", MFD_CLOEXEC);
++    if (fd != -1)
++        return fd;
++    if (errno != ENOSYS)
++        return -1;
++#endif
+ #if O_TMPFILE
+     fd = vlc_open ("/tmp", O_RDWR|O_TMPFILE, S_IRUSR|S_IWUSR);
+     if (fd != -1)

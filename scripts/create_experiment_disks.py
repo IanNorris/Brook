@@ -106,7 +106,8 @@ def main():
         shutil.copy2(ROOT / "data/asound.conf", nix_root / "etc/asound.conf")
         shutil.copy2(ROOT / "data/config/alsoft-oss.conf", nix_root / "etc/alsoft-oss.conf")
         for executable in ["waylandd", "wayland-calc", "brook-player", "brook-files",
-                           "brook-office", "brook-yquake2-gl", "brook-yquake2-soft"]:
+                           "brook-office", "brook-ladybird", "brook-vlc",
+                           "brook-yquake2-gl", "brook-yquake2-soft"]:
             source = profile / "bin" / executable
             if not source.exists():
                 raise RuntimeError(f"Profile is missing {executable}")

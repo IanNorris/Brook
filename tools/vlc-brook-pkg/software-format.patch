@@ -1,0 +1,24 @@
+diff --git a/modules/codec/avcodec/video.c b/modules/codec/avcodec/video.c
+--- a/modules/codec/avcodec/video.c
++++ b/modules/codec/avcodec/video.c
+@@ -1647,6 +1647,20 @@ static enum PixelFormat ffmpeg_GetFormat( AVCodecContext *p_context,
+         swfmt = defaultfmt;
+     }
+ 
++    /* Disabled acceleration must not negotiate opaque hardware surfaces with
++     * a software-only display before falling back to the software format. */
++    char *hw_selection = var_InheritString(p_dec, "avcodec-hw");
++    bool software_only = hw_selection && !strcmp(hw_selection, "none");
++    free(hw_selection);
++    if (software_only) {
++        if (p_sys->p_va != NULL) {
++            vlc_va_Delete(p_sys->p_va, &p_context->hwaccel_context);
++            p_sys->p_va = NULL;
++        }
++        p_sys->pix_fmt = swfmt;
++        return swfmt;
++    }
++
+     if (p_sys->pix_fmt == AV_PIX_FMT_NONE)
+         goto no_reuse;
+     /* If the format did not actually change (e.g. seeking), try to reuse the

@@ -1,0 +1,58 @@
+--- a/modules/audio_output/oss.c
++++ b/modules/audio_output/oss.c
+@@ -121,9 +121,11 @@
+             format = AFMT_FLOAT;
+             break;
+ #endif
++#ifdef AFMT_S32_NE
+         case VLC_CODEC_S32N:
+             format = AFMT_S32_NE;
+             break;
++#endif
+         case VLC_CODEC_S16N:
+             format = AFMT_S16_NE;
+             break;
+@@ -154,7 +156,9 @@
+     {
+         case AFMT_U8:     fmt->i_format = VLC_CODEC_U8;   break;
+         case AFMT_S16_NE: fmt->i_format = VLC_CODEC_S16N; break;
++#ifdef AFMT_S32_NE
+         case AFMT_S32_NE: fmt->i_format = VLC_CODEC_S32N; break;
++#endif
+ #ifdef AFMT_FLOAT
+         case AFMT_FLOAT:  fmt->i_format = VLC_CODEC_FL32; break;
+ #endif
+@@ -291,7 +295,13 @@
+     int fd = sys->fd;
+ 
+     (void) date;
++#if defined(SNDCTL_DSP_SILENCE) && defined(SNDCTL_DSP_SKIP)
+     ioctl (fd, pause ? SNDCTL_DSP_SILENCE : SNDCTL_DSP_SKIP, NULL);
++#else
++    /* OSS3 cannot pause queued audio independently of resetting the device. */
++    (void)fd;
++    (void)pause;
++#endif
+ }
+ 
+ /**
+@@ -326,6 +336,7 @@
+     if (fd == -1)
+         return -1;
+ 
++#ifdef SNDCTL_SYSINFO
+     oss_sysinfo si;
+     int n = -1;
+ 
+@@ -361,6 +372,11 @@
+ out:
+     vlc_close (fd);
+     return n;
++#else
++    aout_HotplugReport(aout, "/dev/dsp", "OSS output");
++    vlc_close(fd);
++    return 1;
++#endif
+ }
+ 
+ static int DeviceSelect (audio_output_t *aout, const char *id)

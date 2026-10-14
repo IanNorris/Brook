@@ -53,6 +53,17 @@ let
       -env:UserInstallation=file:///data/home/libreoffice \
       --nofirststartwizard --norestore --writer "$@"
     EOF
+    cat > $out/bin/brook-vlc <<'EOF'
+    #!${pkgs.bash}/bin/bash
+    export HOME=/data/home
+    export XDG_CACHE_HOME=$HOME/.cache
+    export XDG_CONFIG_HOME=$HOME/.config
+    export XDG_DATA_HOME=$HOME/.local/share
+    /nix/profile/bin/mkdir -p "$XDG_CONFIG_HOME/vlc"
+    exec /nix/profile/bin/brook-run /nix/profile/bin/vlc \
+      --no-plugins-cache --avcodec-hw=none --avcodec-threads=1 \
+      --no-qt-privacy-ask --vout=wl_shm --aout=oss --oss-audio-device=/dev/dsp "$@"
+    EOF
     chmod +x $out/bin/*
   '';
 in {
