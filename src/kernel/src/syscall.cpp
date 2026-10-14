@@ -3087,6 +3087,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     static constexpr uint64_t LINUX_O_CREAT  = 0x40;
     static constexpr uint64_t LINUX_O_TRUNC  = 0x200;
     static constexpr uint64_t LINUX_O_APPEND = 0x400;
+    static constexpr uint64_t LINUX_O_DIRECTORY = 0x10000;
     if (flags & LINUX_O_WRONLY || flags & LINUX_O_RDWR) vfsFlags |= VFS_O_WRITE;
     if (flags & LINUX_O_CREAT)  vfsFlags |= VFS_O_CREATE;
     if (flags & LINUX_O_TRUNC)  vfsFlags |= VFS_O_TRUNC;
@@ -3094,8 +3095,8 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
 
     Vnode* vn = VfsOpenMode(lookupPath, vfsFlags, static_cast<uint16_t>(mode & 07777));
 
-    // Fallback: if path starts with /lib/ or /nix/, try /boot/lib/<filename>.
-    // Our boot disk is mounted at /boot, but dynamic linkers expect /lib/.
+    // Preserve exact /boot-prefixed aliases used by legacy applications.
+    // Basename aliases are only for read-only shared-library lookup.
     if (!vn && lookupPath[0] == '/')
     {
         // Try /boot prefix first
@@ -3104,20 +3105,50 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         const char* p = lookupPath;
         while (*p && bi + 1 < sizeof(bootPath)) bootPath[bi++] = *p++;
         bootPath[bi] = '\0';
-        vn = VfsOpenMode(bootPath, vfsFlags, static_cast<uint16_t>(mode & 07777));
+        if (!*p) // Never open a silently truncated alias.
+            vn = VfsOpenMode(bootPath, vfsFlags, static_cast<uint16_t>(mode & 07777));
 
-        // If that fails, try /boot/lib/<basename> for .so files
-        if (!vn)
+        if (!vn && !(flags & (LINUX_O_DIRECTORY | LINUX_O_CREAT | LINUX_O_TRUNC | LINUX_O_APPEND)) &&
+            !(flags & 3))
         {
             const char* fname = lookupPath;
             for (p = lookupPath; *p; ++p)
                 if (*p == '/') fname = p + 1;
-
-            char libPath[256] = "/boot/lib/";
-            uint32_t li = 10;
-            while (*fname && li + 1 < sizeof(libPath)) libPath[li++] = *fname++;
-            libPath[li] = '\0';
-            vn = VfsOpenMode(libPath, vfsFlags, static_cast<uint16_t>(mode & 07777));
+            auto hasPrefix = [lookupPath](const char* prefix) {
+                const char* candidate = lookupPath;
+                while (*prefix) if (*candidate++ != *prefix++) return false;
+                return true;
+            };
+            bool libraryPrefix = hasPrefix("/lib/") || hasPrefix("/lib64/") ||
+                hasPrefix("/usr/lib/") || hasPrefix("/usr/lib64/") || hasPrefix("/nix/store/");
+            bool libraryName = false;
+            for (const char* suffix = fname; *suffix; ++suffix) {
+                if (suffix[0] == '.' && suffix[1] == 's' && suffix[2] == 'o' &&
+                    (suffix[3] == '\0' || suffix[3] == '.')) {
+                    const char* version = suffix + 3;
+                    libraryName = true;
+                    while (*version) {
+                        if (*version++ != '.' || *version < '0' || *version > '9') {
+                            libraryName = false; break;
+                        }
+                        while (*version >= '0' && *version <= '9') ++version;
+                    }
+                    break;
+                }
+            }
+            // A trailing slash has no basename. In particular, a missing Git
+            // refs directory must never become the /boot/lib directory.
+            if (libraryPrefix && *fname && libraryName) {
+                char libPath[256] = "/boot/lib/";
+                uint32_t li = 10;
+                while (*fname && li + 1 < sizeof(libPath)) libPath[li++] = *fname++;
+                libPath[li] = '\0';
+                if (!*fname) vn = VfsOpenMode(libPath, vfsFlags, 0);
+                if (vn && vn->type != VnodeType::File) {
+                    VfsClose(vn);
+                    vn = nullptr;
+                }
+            }
         }
     }
 
@@ -3144,6 +3175,13 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         return -ENOENT;
     }
 
+    uint32_t lookupLength = 0;
+    while (lookupPath[lookupLength]) ++lookupLength;
+    if (((flags & LINUX_O_DIRECTORY) ||
+         (lookupLength && lookupPath[lookupLength - 1] == '/')) && vn->type != VnodeType::Dir) {
+        VfsClose(vn);
+        return -ENOTDIR;
+    }
     int fd = FdAlloc(proc, FdType::Vnode, vn);
     if (fd < 0)
     {

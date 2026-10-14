@@ -78,6 +78,13 @@ unmapped-buffer boundaries. Brook's TCP test uses its configured NIC address;
 127/8 loopback routing is still missing. The probe uses a separate parent
 watchdog because Brook does not implement `alarm` yet.
 
+After object transfer, Git found phantom references: opening a missing refs
+directory with a trailing slash fell back to `/boot/lib/`. Basename fallback
+is now limited to read-only shared-library names under intended library/Nix
+prefixes; missing directories and unrelated names fail normally. `opencheck`
+passed in Brook, and a fresh guest `git init` plus `git fsck --full` succeeded
+without phantom references. The existing exact `/boot` aliases remain supported.
+
 Runtime evidence is retained under ignored `build/experiments/results/bootstrap-20261014/`
 and `bootstrap-compat-20261014/`, and the VM registry keeps serial logs and the
 actual booted kernel identities. Package payloads, images and logs stay out of git.

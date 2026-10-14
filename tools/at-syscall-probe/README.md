@@ -81,3 +81,12 @@ user-buffer validation does not yet consistently reject `PROT_NONE`, and its
 `alarm` syscall is unavailable. Expect `SELECTCHECK PASS failures=0`. Brook bounds
 poll/select to its 256-fd table and rounds positive waits up to milliseconds.
 Temporary pselect/ppoll signal-mask handling remains a separate task.
+
+`opencheck.c` takes an absolute writable directory and an existing regular
+library path under `/boot/lib/` (for example `/boot/lib/libdl.so.2`, when
+installed). It checks that missing Git refs directories, trailing slashes and
+unrelated file names cannot become `/boot/lib` or one of its files. It also
+checks directory/write requests cannot use library basename aliases, while
+exact `/boot` prefixes and read-only legacy/Nix library aliases still work.
+Expect `OPENCHECK PASS failures=0`. This is a Brook compatibility probe;
+ordinary Linux does not provide these boot-library aliases.
