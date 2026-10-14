@@ -204,3 +204,17 @@ mount and `fchown` is a stub; route ownership changes through VFS path/fd
 callbacks. `mkdir` also ignores its requested mode. General truncate/ftruncate
 support remains incomplete. Keep these separate from the validated file
 creation, chmod and timestamp fixes.
+
+Bootstrap Git retries also exposed ext2 rename-overwrite leaks: replacing
+`.git/config` removes its old directory entry without releasing the destination
+inode/blocks. A synced stopped disk then reports unattached old config inodes
+in `e2fsck -fn` (sizes 36/53/67/92 bytes), despite correct allocation bitmaps.
+Fix replacement accounting, same-inode rename and failure rollback, including
+open-destination semantics; verify repeated replacements followed by offline
+fsck. This is separate from the unsynced-stop corruption fixed in the bridge.
+
+The readiness probe found that `UserBufferReadable` accepts mapped `PROT_NONE`
+pages; enforce access permissions consistently in user-buffer validation and
+add protected-page probes. `alarm` (syscall 38) also returns ENOSYS; the current
+readiness probe uses a forked parent watchdog instead. Temporary pselect/ppoll
+signal masks and TCP urgent-data readiness remain compatibility follow-ups.

@@ -66,3 +66,18 @@ When run as root, a child drops its uid/gid to verify non-owner fchmod fails.
 Expect `MODECHECK PASS failures=0`. Existing SDK executables created by the old
 kernel require a targeted permission repair from their NAR executable metadata;
 changing all store files to executable would corrupt the intended modes.
+
+`selectcheck.c` requires `-pthread`. A separate parent process uses monotonic
+time, `waitpid(WNOHANG)` and `SIGKILL` as a 15-second watchdog to bound infinite
+`pselect` tests for delayed resolver-style eventfd notification, pipe data and
+TCP accept/data readiness. The optional argument is a local IPv4 address;
+default is `127.0.0.1` on Linux. In the current QEMU guest, pass its configured
+NIC address (`10.0.2.15`) to exercise Brook's supported self-address route:
+127/8 loopback routing remains unimplemented. It also checks empty/zero/finite waits,
+timeval versus small timespec fractions, fd 200, read/write result bit counts,
+exception sets, invalid fds/counts/timeouts, and fdset/poll buffers at an
+unmapped page boundary. The guard page is removed with `munmap`: Brook's
+user-buffer validation does not yet consistently reject `PROT_NONE`, and its
+`alarm` syscall is unavailable. Expect `SELECTCHECK PASS failures=0`. Brook bounds
+poll/select to its 256-fd table and rounds positive waits up to milliseconds.
+Temporary pselect/ppoll signal-mask handling remains a separate task.

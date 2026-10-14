@@ -8217,22 +8217,22 @@ struct pollfd {
 };
 
 static constexpr short POLLIN  = 0x0001;
+static constexpr short POLLPRI = 0x0002;
 static constexpr short POLLOUT = 0x0004;
 static constexpr short POLLERR = 0x0008;
 static constexpr short POLLHUP = 0x0010;
 static constexpr short POLLNVAL = 0x0020;
 
-static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout_ms,
-                         uint64_t, uint64_t, uint64_t)
+// Trusted kernel array; syscall wrappers validate/copy user memory separately.
+static int64_t PollWait(pollfd* fds, uint64_t nfds, uint64_t timeout_ms, bool selectMode = false)
 {
-    if (nfds == 0) return 0;
-    auto* fds = reinterpret_cast<pollfd*>(fdsAddr);
     Process* proc = ProcessCurrent();
     if (!proc) return -EFAULT;
-    auto isInfiniteTimeout = [](uint64_t timeout) {
-        return timeout == static_cast<uint64_t>(-1) ||
-               timeout == static_cast<uint64_t>(0xffffffffu);
-    };
+    extern volatile uint64_t g_lapicTickCount;
+    const bool infinite = timeout_ms == ~0ULL;
+    const uint64_t now = g_lapicTickCount;
+    const uint64_t deadline = infinite || timeout_ms >= ~0ULL - now
+        ? ~0ULL : now + timeout_ms;
 
     // Poll diagnostics are opt-in, like the syscall trace itself. Printing
     // each RequestServer poll directly to the UART stalls browser IPC and
@@ -8347,6 +8347,11 @@ retry_poll:
         if (fde->type == FdType::UnixSocket && fde->handle)
         {
             auto* usd = static_cast<UnixSocketData*>(fde->handle);
+            // Preserve peer-close reporting from the former post-wake scan.
+            bool peerGone = usd->state == UnixSocketData::State::Connected &&
+                ((usd->rxPipe && __atomic_load_n(&usd->rxPipe->writers, __ATOMIC_ACQUIRE) == 0) ||
+                 (usd->txPipe && __atomic_load_n(&usd->txPipe->readers, __ATOMIC_ACQUIRE) == 0));
+            if (peerGone) fds[i].revents |= POLLHUP;
             if (fds[i].events & POLLIN)
             {
                 bool readable = false;
@@ -8433,13 +8438,27 @@ retry_poll:
             continue;
         }
 
-        // Default: assume ready for whatever was asked
-        fds[i].revents = fds[i].events;
-        ready++;
+        // Ordinary synthetic descriptors are readable/writable; exceptional
+        // conditions must never be invented for select's exceptfds.
+        fds[i].revents = fds[i].events & (POLLIN | POLLOUT);
+        if (fds[i].revents) ready++;
+    }
+
+    // select maps hangup/error into requested read/write sets, never exceptfds.
+    if (selectMode) {
+        ready = 0;
+        for (uint64_t i = 0; i < nfds; ++i) {
+            short allowed = POLLNVAL;
+            if (fds[i].events & POLLIN) allowed |= POLLIN | POLLHUP | POLLERR;
+            if (fds[i].events & POLLOUT) allowed |= POLLOUT | POLLERR;
+            if (fds[i].events & POLLPRI) allowed |= POLLPRI;
+            fds[i].revents &= allowed;
+            if (fds[i].revents) ++ready;
+        }
     }
 
     // If nothing ready and timeout != 0, block and retry
-    if (ready == 0 && timeout_ms != 0)
+    if (ready == 0 && timeout_ms != 0 && (infinite || g_lapicTickCount < deadline))
     {
         // Register as waiter BEFORE re-checking data availability.
         // This closes the race where data arrives between the initial
@@ -8447,7 +8466,7 @@ retry_poll:
         Process* self = ProcessCurrent();
 
         // For pipe FDs, register as waiter on the pipe
-        uint64_t waiterCap = nfds < 64 ? nfds : 64;
+        uint64_t waiterCap = nfds;
         for (uint64_t i = 0; i < waiterCap; i++)
         {
             if (fds[i].fd < 0) continue;
@@ -8515,7 +8534,8 @@ retry_poll:
                 int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
                 if (brook::SockPollReady(sockIdx, (fds[i].events & POLLIN) != 0,
                                                   (fds[i].events & POLLOUT) != 0) ||
-                    brook::SockPollHangup(sockIdx))
+                    ((!selectMode || (fds[i].events & (POLLIN | POLLOUT))) &&
+                     brook::SockPollHangup(sockIdx)))
                 { ready++; break; }
             }
             if (fde->type == FdType::UnixSocket && fde->handle)
@@ -8545,19 +8565,11 @@ retry_poll:
 
         if (ready == 0)
         {
-            // Set timed wakeup if timeout > 0
-            if (timeout_ms > 0 && !isInfiniteTimeout(timeout_ms))
-            {
-                extern volatile uint64_t g_lapicTickCount;
-                self->wakeupTick = g_lapicTickCount + timeout_ms;
-
-            }
-            else if (isInfiniteTimeout(timeout_ms))
-            {
-                extern volatile uint64_t g_lapicTickCount;
-                self->wakeupTick = g_lapicTickCount + 50;
-            }
-            SchedulerBlock(self);
+            // Keep one absolute deadline across spurious wakes. Periodic
+            // checks also service timerfds and descriptors without wait hooks.
+            uint64_t nextCheck = g_lapicTickCount + 50;
+            self->wakeupTick = deadline < nextCheck ? deadline : nextCheck;
+            if (!HasPendingSignals()) SchedulerBlock(self);
 
             if (HasPendingSignals())
             {
@@ -8651,117 +8663,8 @@ retry_poll:
             }
         }
 
-        // Re-scan after wake — reset ready count
-        ready = 0;
-        for (uint64_t i = 0; i < nfds; i++)
-        {
-            fds[i].revents = 0;
-            if (fds[i].fd < 0) continue;
-            FdRef fde_ref(proc, fds[i].fd);  // BRO-156: pin across handle deref
-            FdEntry* fde = fde_ref.get();
-            if (!fde || fde->type == FdType::None) { fds[i].revents = POLLNVAL; ready++; continue; }
-            if (fde->type == FdType::Pipe && fde->handle)
-            {
-                auto* pb = static_cast<PipeBuffer*>(fde->handle);
-                bool isWrite = (fde->flags & 1);
-                if (!isWrite && (fds[i].events & POLLIN) && (pb->count() > 0 || pb->writers == 0))
-                { fds[i].revents |= (pb->count() > 0) ? POLLIN : POLLHUP; ready++; }
-                if (isWrite && (fds[i].events & POLLOUT) && (pb->space() > 0 || pb->readers == 0))
-                { fds[i].revents |= (pb->readers > 0) ? POLLOUT : POLLERR; ready++; }
-                continue;
-            }
-            if (fde->type == FdType::Vnode)
-            {
-                if (fds[i].events & POLLIN)  fds[i].revents |= POLLIN;
-                if (fds[i].events & POLLOUT) fds[i].revents |= POLLOUT;
-                if (fds[i].revents) ready++;
-                continue;
-            }
-            if (fde->type == FdType::DevKeyboard && (fds[i].events & POLLIN) && InputHasEvents())
-            { fds[i].revents |= POLLIN; ready++; continue; }
-            if (fde->type == FdType::DevTty && fde->handle)
-            {
-                auto* pair = static_cast<TtyDevicePair*>(fde->handle);
-                if (fds[i].events & POLLIN)
-                {
-                    auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
-                    if (rp->count() > 0 || rp->writers == 0)
-                    { fds[i].revents |= POLLIN; }
-                }
-                if (fds[i].events & POLLOUT)
-                    fds[i].revents |= POLLOUT;
-                if (fds[i].revents) ready++;
-                continue;
-            }
-            if (fde->type == FdType::Socket && fde->handle)
-            {
-                int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
-                if ((fds[i].events & POLLIN) && brook::SockPollReady(sockIdx, true, false))
-                    fds[i].revents |= POLLIN;
-                if ((fds[i].events & POLLOUT) && brook::SockPollReady(sockIdx, false, true))
-                    fds[i].revents |= POLLOUT;
-                if (brook::SockPollHangup(sockIdx))
-                    fds[i].revents |= POLLHUP;
-                if (fds[i].revents) ready++;
-                continue;
-            }
-            if (fde->type == FdType::EventFd && fde->handle)
-            {
-                auto* efd = static_cast<EventFdData*>(fde->handle);
-                if ((fds[i].events & POLLIN) &&
-                    __atomic_load_n(&efd->counter, __ATOMIC_ACQUIRE) > 0)
-                    fds[i].revents |= POLLIN;
-                if (fds[i].events & POLLOUT)
-                    fds[i].revents |= POLLOUT;
-                if (fds[i].revents) ready++;
-                continue;
-            }
-            if (fde->type == FdType::DevDsp)
-            {
-                if (fds[i].events & POLLOUT)
-                    fds[i].revents |= POLLOUT;
-                if (fds[i].revents) ready++;
-                continue;
-            }
-            if (fde->type == FdType::UnixSocket && fde->handle)
-            {
-                auto* usd = static_cast<UnixSocketData*>(fde->handle);
-                // POLLHUP is always reported (not gated by events mask) when
-                // the peer side of the socket has closed.
-                bool peerGone = false;
-                if (usd->state == UnixSocketData::State::Connected) {
-                    if (usd->rxPipe &&
-                        __atomic_load_n(&usd->rxPipe->writers, __ATOMIC_ACQUIRE) == 0)
-                        peerGone = true;
-                    if (usd->txPipe &&
-                        __atomic_load_n(&usd->txPipe->readers, __ATOMIC_ACQUIRE) == 0)
-                        peerGone = true;
-                }
-                if (peerGone) fds[i].revents |= POLLHUP;
-                if (fds[i].events & POLLIN)
-                {
-                    bool readable = false;
-                    if (usd->state == UnixSocketData::State::Listening)
-                        readable = (usd->pendingCount > 0);
-                    else if (usd->state == UnixSocketData::State::Connected && usd->rxPipe)
-                        readable = (usd->rxPipe->count() > 0 || peerGone);
-                    if (readable) fds[i].revents |= POLLIN;
-                }
-                if (fds[i].events & POLLOUT)
-                {
-                    if (usd->state == UnixSocketData::State::Connected && usd->txPipe &&
-                        (usd->txPipe->space() > 0 ||
-                         __atomic_load_n(&usd->txPipe->readers, __ATOMIC_ACQUIRE) == 0))
-                        fds[i].revents |= POLLOUT;
-                }
-                if (fds[i].revents) ready++;
-                continue;
-            }
-            // Unknown fd type: don't claim readiness
-        }
-    }
-
-    if (ready == 0 && isInfiniteTimeout(timeout_ms)) {
+        // Always use the same readiness scan before/after sleeping, including
+        // timerfds, sockets and eventfds. Expiry is checked after that scan.
         goto retry_poll;
     }
 
@@ -8781,17 +8684,54 @@ retry_poll:
     return ready;
 }
 
-// sys_ppoll (271) — redirects to poll
-static int64_t sys_ppoll(uint64_t fdsAddr, uint64_t nfds, uint64_t tspecAddr,
-                          uint64_t, uint64_t, uint64_t)
+// Parse the ABI explicitly: timeval uses microseconds, timespec nanoseconds.
+// Round positive fractions up to the scheduler's millisecond resolution.
+static int ParseWaitTimeout(uint64_t address, bool nanoseconds, uint64_t* timeoutMs)
 {
-    int timeout_ms = -1;
-    if (tspecAddr)
-    {
-        auto* ts = reinterpret_cast<const uint64_t*>(tspecAddr);
-        timeout_ms = static_cast<int>(ts[0] * 1000 + ts[1] / 1000000);
+    *timeoutMs = ~0ULL;
+    if (!address) return 0;
+    if (!UserBufferReadable(address, 2 * sizeof(int64_t))) return -EFAULT;
+    auto* value = reinterpret_cast<const int64_t*>(address);
+    int64_t sec = value[0], fraction = value[1];
+    int64_t scale = nanoseconds ? 1000000000LL : 1000000LL;
+    if (sec < 0 || fraction < 0 || fraction >= scale) return -EINVAL;
+    uint64_t unitsPerMs = static_cast<uint64_t>(scale / 1000);
+    uint64_t partial = (static_cast<uint64_t>(fraction) + unitsPerMs - 1) / unitsPerMs;
+    *timeoutMs = static_cast<uint64_t>(sec) > (~0ULL - 1 - partial) / 1000
+        ? ~0ULL - 1 : static_cast<uint64_t>(sec) * 1000 + partial;
+    return 0;
+}
+
+static int64_t PollUser(uint64_t fdsAddr, uint64_t nfds, uint64_t timeoutMs)
+{
+    if (nfds > MAX_FDS) return -EINVAL;
+    uint64_t bytes = nfds * sizeof(pollfd);
+    if (bytes && (!UserBufferReadable(fdsAddr, bytes) || !UserBufferWritable(fdsAddr, bytes)))
+        return -EFAULT;
+    pollfd fds[MAX_FDS];
+    if (bytes) memcpy(fds, reinterpret_cast<const void*>(fdsAddr), bytes);
+    int64_t result = PollWait(fds, nfds, timeoutMs);
+    if (result >= 0 && bytes) {
+        if (!UserBufferWritable(fdsAddr, bytes)) return -EFAULT;
+        auto* user = reinterpret_cast<pollfd*>(fdsAddr);
+        for (uint64_t i = 0; i < nfds; ++i) user[i].revents = fds[i].revents;
     }
-    return sys_poll(fdsAddr, nfds, static_cast<uint64_t>(timeout_ms), 0, 0, 0);
+    return result;
+}
+
+static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout,
+                       uint64_t, uint64_t, uint64_t)
+{
+    int32_t milliseconds = static_cast<int32_t>(timeout);
+    return PollUser(fdsAddr, nfds, milliseconds < 0 ? ~0ULL : static_cast<uint64_t>(milliseconds));
+}
+
+static int64_t sys_ppoll(uint64_t fdsAddr, uint64_t nfds, uint64_t tspecAddr,
+                        uint64_t, uint64_t, uint64_t)
+{
+    uint64_t timeoutMs;
+    int error = ParseWaitTimeout(tspecAddr, true, &timeoutMs);
+    return error ? error : PollUser(fdsAddr, nfds, timeoutMs);
 }
 
 // ---------------------------------------------------------------------------
@@ -10880,345 +10820,89 @@ static int64_t sys_fstatfs(uint64_t, uint64_t bufAddr, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
-// sys_select (23) — proper implementation checking pipe/device readiness
+// select/pselect share poll readiness and wait registration, including the
+// eventfd notifications used by threaded DNS resolvers.
 // ---------------------------------------------------------------------------
 
-static int64_t sys_select(uint64_t nfds, uint64_t readfdsAddr, uint64_t writefdsAddr,
-                           uint64_t exceptfdsAddr, uint64_t timeoutAddr, uint64_t)
+static int64_t SelectWait(uint64_t nfds, uint64_t readfdsAddr, uint64_t writefdsAddr,
+                          uint64_t exceptfdsAddr, uint64_t timeoutAddr, bool nanoseconds)
 {
+    if (nfds > MAX_FDS) return -EINVAL;
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
-
-    auto* rfds = readfdsAddr ? reinterpret_cast<uint64_t*>(readfdsAddr) : nullptr;
-    auto* wfds = writefdsAddr ? reinterpret_cast<uint64_t*>(writefdsAddr) : nullptr;
-
-    // Parse timeout: NULL = block forever, {0,0} = poll, else timeout
-    int64_t timeout_ms = -1; // -1 = infinite
-    if (timeoutAddr)
-    {
-        // pselect6 uses struct timespec {tv_sec, tv_nsec}
-        // select uses struct timeval {tv_sec, tv_usec}
-        // Both start with tv_sec at offset 0
-        auto* ts = reinterpret_cast<const int64_t*>(timeoutAddr);
-        int64_t sec  = ts[0];
-        int64_t nsec = ts[1]; // could be nsec (pselect) or usec (select)
-        // Heuristic: if nsec > 1000000, treat as nanoseconds
-        if (nsec > 1000000)
-            timeout_ms = sec * 1000 + nsec / 1000000;
-        else
-            timeout_ms = sec * 1000 + nsec / 1000;
-        if (timeout_ms == 0) timeout_ms = 0; // poll mode
+    constexpr uint32_t WORDS = (MAX_FDS + 63) / 64;
+    uint64_t inputs[3][WORDS] = {}, outputs[3][WORDS] = {};
+    uint64_t addresses[3] = {readfdsAddr, writefdsAddr, exceptfdsAddr};
+    uint64_t bytes = ((nfds + 63) / 64) * sizeof(uint64_t);
+    for (uint32_t set = 0; set < 3; ++set) {
+        if (!addresses[set] || !bytes) continue;
+        if (!UserBufferReadable(addresses[set], bytes) ||
+            !UserBufferWritable(addresses[set], bytes)) return -EFAULT;
+        memcpy(inputs[set], reinterpret_cast<const void*>(addresses[set]), bytes);
     }
-
-    // Clear except fds
-    if (exceptfdsAddr)
-    {
-        auto* efds = reinterpret_cast<uint64_t*>(exceptfdsAddr);
-        for (uint64_t w = 0; w < (nfds + 63) / 64; w++)
-            efds[w] = 0;
-    }
-
-    // Build result fd_sets — only mark fds that are actually ready
-    uint64_t rResult[2] = {0, 0}; // supports up to 128 fds
-    uint64_t wResult[2] = {0, 0};
-    int ready = 0;
-
-    for (uint64_t fd = 0; fd < nfds && fd < 128; fd++)
-    {
+    uint64_t timeoutMs;
+    int error = ParseWaitTimeout(timeoutAddr, nanoseconds, &timeoutMs);
+    if (error) return error;
+    if (timeoutAddr && !nanoseconds && !UserBufferWritable(timeoutAddr, 16)) return -EFAULT;
+    pollfd fds[MAX_FDS];
+    uint32_t count = 0;
+    for (uint32_t fd = 0; fd < nfds; ++fd) {
         uint64_t mask = 1ULL << (fd % 64);
-        uint64_t word = fd / 64;
-
-        bool wantRead  = rfds && (rfds[word] & mask);
-        bool wantWrite = wfds && (wfds[word] & mask);
-        if (!wantRead && !wantWrite) continue;
-
-        FdEntry* fde = FdGet(proc, static_cast<int>(fd));
-        if (!fde)
-        {
-            // Bad fd in set — EBADF per POSIX
-            continue;
-        }
-
-        // Pipe fd
-        if (fde->type == FdType::Pipe && fde->handle)
-        {
-            auto* pb = static_cast<PipeBuffer*>(fde->handle);
-            bool isWrite = (fde->flags & 1);
-            if (wantRead && !isWrite)
-            {
-                if (pb->count() > 0 || pb->writers == 0)
-                {
-                    rResult[word] |= mask;
-                    ready++;
-                }
-            }
-            if (wantWrite && isWrite)
-            {
-                if (pb->space() > 0 || pb->readers == 0)
-                {
-                    wResult[word] |= mask;
-                    ready++;
-                }
-            }
-            continue;
-        }
-
-        // DevTty fd (e.g. /dev/tty → fd 63)
-        if (fde->type == FdType::DevTty && fde->handle)
-        {
-            auto* pair = static_cast<TtyDevicePair*>(fde->handle);
-            if (wantRead)
-            {
-                auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
-                if (rp->count() > 0 || rp->writers == 0)
-                {
-                    rResult[word] |= mask;
-                    ready++;
-                }
-            }
-            if (wantWrite)
-            {
-                wResult[word] |= mask;
-                ready++;
-            }
-            continue;
-        }
-
-        // Keyboard device
-        if (fde->type == FdType::DevKeyboard)
-        {
-            if (wantRead && InputHasEvents())
-            {
-                rResult[word] |= mask;
-                ready++;
-            }
-            if (wantWrite)
-            {
-                wResult[word] |= mask;
-                ready++;
-            }
-            continue;
-        }
-
-        // Regular files, sockets — always ready
-        if (wantRead)  { rResult[word] |= mask; ready++; }
-        if (wantWrite) { wResult[word] |= mask; ready++; }
+        uint32_t word = fd / 64;
+        short events = 0;
+        if (inputs[0][word] & mask) events |= POLLIN;
+        if (inputs[1][word] & mask) events |= POLLOUT;
+        if (inputs[2][word] & mask) events |= POLLPRI;
+        if (!events) continue;
+        FdRef ref(proc, fd);
+        if (!ref.get() || ref.get()->type == FdType::None) return -EBADF;
+        fds[count++] = {static_cast<int>(fd), events, 0};
     }
-
-    // If something is ready, return immediately
-    if (ready > 0)
-    {
-        if (rfds) { rfds[0] = rResult[0]; rfds[1] = rResult[1]; }
-        if (wfds) { wfds[0] = wResult[0]; wfds[1] = wResult[1]; }
-        return ready;
+    extern volatile uint64_t g_lapicTickCount;
+    uint64_t started = g_lapicTickCount;
+    int64_t result = PollWait(fds, count, timeoutMs, true);
+    if (timeoutAddr && !nanoseconds) {
+        if (!UserBufferWritable(timeoutAddr, 16)) return -EFAULT;
+        uint64_t elapsed = g_lapicTickCount - started;
+        uint64_t remaining = elapsed < timeoutMs ? timeoutMs - elapsed : 0;
+        auto* value = reinterpret_cast<int64_t*>(timeoutAddr);
+        value[0] = static_cast<int64_t>(remaining / 1000);
+        value[1] = static_cast<int64_t>((remaining % 1000) * 1000);
     }
-
-    // Nothing ready — if timeout is 0, return 0 (poll mode)
-    if (timeout_ms == 0)
-    {
-        if (rfds) { rfds[0] = 0; rfds[1] = 0; }
-        if (wfds) { wfds[0] = 0; wfds[1] = 0; }
-        return 0;
-    }
-
-    // Block until data arrives or timeout
-    // Register as waiter on all monitored pipe fds
-    Process* self = ProcessCurrent();
-    for (uint64_t fd = 0; fd < nfds && fd < 128; fd++)
-    {
+    if (result < 0) return result;
+    int readyBits = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (fds[i].revents & POLLNVAL) return -EBADF;
+        uint32_t fd = static_cast<uint32_t>(fds[i].fd), word = fd / 64;
         uint64_t mask = 1ULL << (fd % 64);
-        uint64_t word = fd / 64;
-        bool wantRead = rfds && (rfds[word] & mask);
-        if (!wantRead) continue;
-
-        FdEntry* fde = FdGet(proc, static_cast<int>(fd));
-        if (!fde) continue;
-
-        if (fde->type == FdType::Pipe && fde->handle && !(fde->flags & 1))
-        {
-            auto* pb = static_cast<PipeBuffer*>(fde->handle);
-            pb->readerWaiter = self;
-        }
-        if (fde->type == FdType::DevKeyboard)
-            InputAddWaiter(self);
-        if (fde->type == FdType::DevTty && fde->handle)
-        {
-            auto* pair = static_cast<TtyDevicePair*>(fde->handle);
-            auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
-            rp->readerWaiter = self;
+        const short conditions[3] = {POLLIN | POLLHUP | POLLERR, POLLOUT | POLLERR, POLLPRI};
+        for (uint32_t set = 0; set < 3; ++set) {
+            if ((inputs[set][word] & mask) && (fds[i].revents & conditions[set])) {
+                outputs[set][word] |= mask;
+                ++readyBits;
+            }
         }
     }
-
-    // Re-check after registration (close race window)
-    ready = 0;
-    rResult[0] = rResult[1] = 0;
-    wResult[0] = wResult[1] = 0;
-    for (uint64_t fd = 0; fd < nfds && fd < 128; fd++)
-    {
-        uint64_t mask = 1ULL << (fd % 64);
-        uint64_t word = fd / 64;
-        bool wantRead  = rfds && (rfds[word] & mask);
-        bool wantWrite = wfds && (wfds[word] & mask);
-        if (!wantRead && !wantWrite) continue;
-
-        FdEntry* fde = FdGet(proc, static_cast<int>(fd));
-        if (!fde) continue;
-
-        if (fde->type == FdType::Pipe && fde->handle)
-        {
-            auto* pb = static_cast<PipeBuffer*>(fde->handle);
-            bool isWrite = (fde->flags & 1);
-            if (wantRead && !isWrite && (pb->count() > 0 || pb->writers == 0))
-            {
-                rResult[word] |= mask;
-                ready++;
-            }
-            if (wantWrite && isWrite && (pb->space() > 0 || pb->readers == 0))
-            {
-                wResult[word] |= mask;
-                ready++;
-            }
-        }
-        else if (fde->type == FdType::DevTty && fde->handle)
-        {
-            auto* pair = static_cast<TtyDevicePair*>(fde->handle);
-            if (wantRead)
-            {
-                auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
-                if (rp->count() > 0 || rp->writers == 0)
-                {
-                    rResult[word] |= mask;
-                    ready++;
-                }
-            }
-        }
-        else if (fde->type == FdType::DevKeyboard && wantRead && InputHasEvents())
-        {
-            rResult[word] |= mask;
-            ready++;
-        }
+    for (uint32_t set = 0; set < 3; ++set) {
+        if (!addresses[set] || !bytes) continue;
+        if (!UserBufferWritable(addresses[set], bytes)) return -EFAULT;
+        memcpy(reinterpret_cast<void*>(addresses[set]), outputs[set], bytes);
     }
-
-    if (ready > 0)
-    {
-        if (rfds) { rfds[0] = rResult[0]; rfds[1] = rResult[1]; }
-        if (wfds) { wfds[0] = wResult[0]; wfds[1] = wResult[1]; }
-        return ready;
-    }
-
-    // Block
-    SchedulerBlock(self);
-
-    // If woken by a signal (not by data arriving), return -EINTR so that
-    // SA_RESTART can re-issue the syscall after the signal handler runs.
-    // Without this, pselect returns 0 ("no fds ready") which bash/readline
-    // misinterprets as EOF, causing the terminal to exit on SIGWINCH.
-    if (HasPendingSignals())
-    {
-        // Clean up waiter registrations before returning
-        for (uint64_t fd = 0; fd < nfds && fd < 128; fd++)
-        {
-            uint64_t mask = 1ULL << (fd % 64);
-            uint64_t word = fd / 64;
-            bool wantRead = rfds && (rfds[word] & mask);
-            if (!wantRead) continue;
-            FdEntry* fde = FdGet(proc, static_cast<int>(fd));
-            if (!fde) continue;
-            if (fde->type == FdType::Pipe && fde->handle && !(fde->flags & 1))
-            {
-                auto* pb = static_cast<PipeBuffer*>(fde->handle);
-                if (pb->readerWaiter == self) pb->readerWaiter = nullptr;
-            }
-            if (fde->type == FdType::DevKeyboard)
-                InputRemoveWaiter(self);
-            if (fde->type == FdType::DevTty && fde->handle)
-            {
-                auto* pair = static_cast<TtyDevicePair*>(fde->handle);
-                auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
-                if (rp->readerWaiter == self) rp->readerWaiter = nullptr;
-            }
-        }
-        return -EINTR;
-    }
-
-    // After wakeup, do one final scan
-    ready = 0;
-    rResult[0] = rResult[1] = 0;
-    wResult[0] = wResult[1] = 0;
-    for (uint64_t fd = 0; fd < nfds && fd < 128; fd++)
-    {
-        uint64_t mask = 1ULL << (fd % 64);
-        uint64_t word = fd / 64;
-        bool wantRead  = rfds && (rfds[word] & mask);
-        bool wantWrite = wfds && (wfds[word] & mask);
-        if (!wantRead && !wantWrite) continue;
-
-        FdEntry* fde = FdGet(proc, static_cast<int>(fd));
-        if (!fde) continue;
-
-        if (fde->type == FdType::Pipe && fde->handle)
-        {
-            auto* pb = static_cast<PipeBuffer*>(fde->handle);
-            bool isWrite = (fde->flags & 1);
-            if (wantRead && !isWrite && (pb->count() > 0 || pb->writers == 0))
-            {
-                rResult[word] |= mask;
-                ready++;
-            }
-            if (wantWrite && isWrite && (pb->space() > 0 || pb->readers == 0))
-            {
-                wResult[word] |= mask;
-                ready++;
-            }
-        }
-        else if (fde->type == FdType::DevTty && fde->handle)
-        {
-            auto* pair = static_cast<TtyDevicePair*>(fde->handle);
-            if (wantRead)
-            {
-                auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
-                if (rp->count() > 0 || rp->writers == 0)
-                {
-                    rResult[word] |= mask;
-                    ready++;
-                }
-            }
-            if (wantWrite)
-            {
-                wResult[word] |= mask;
-                ready++;
-            }
-        }
-        else if (fde->type == FdType::DevKeyboard)
-        {
-            if (wantRead && InputHasEvents())
-            {
-                rResult[word] |= mask;
-                ready++;
-            }
-        }
-        else
-        {
-            // Vnode, socket etc — ready
-            if (wantRead)  { rResult[word] |= mask; ready++; }
-            if (wantWrite) { wResult[word] |= mask; ready++; }
-        }
-    }
-
-    if (rfds) { rfds[0] = rResult[0]; rfds[1] = rResult[1]; }
-    if (wfds) { wfds[0] = wResult[0]; wfds[1] = wResult[1]; }
-    return ready;
+    return readyBits;
 }
 
-// ---------------------------------------------------------------------------
-// sys_pselect6 (270) — pselect6, delegate to sys_select (ignore sigmask)
-// ---------------------------------------------------------------------------
+static int64_t sys_select(uint64_t nfds, uint64_t readfdsAddr, uint64_t writefdsAddr,
+                         uint64_t exceptfdsAddr, uint64_t timeoutAddr, uint64_t)
+{
+    return SelectWait(nfds, readfdsAddr, writefdsAddr, exceptfdsAddr, timeoutAddr, false);
+}
 
 static int64_t sys_pselect6(uint64_t nfds, uint64_t readfdsAddr, uint64_t writefdsAddr,
-                             uint64_t exceptfdsAddr, uint64_t timeoutAddr, uint64_t sigmaskAddr)
+                          uint64_t exceptfdsAddr, uint64_t timeoutAddr, uint64_t sigmaskAddr)
 {
+    // Temporary signal-mask handling remains a separate compatibility task.
     (void)sigmaskAddr;
-    return sys_select(nfds, readfdsAddr, writefdsAddr, exceptfdsAddr, timeoutAddr, 0);
+    return SelectWait(nfds, readfdsAddr, writefdsAddr, exceptfdsAddr, timeoutAddr, true);
 }
 
 // ---------------------------------------------------------------------------

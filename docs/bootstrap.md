@@ -69,6 +69,15 @@ independently `e2fsck -fn`-clean checkpoint copies; damaged disposable images
 were retained for diagnosis. The installed SDK's 1,083 executable files were
 identified from its original binary closure, rather than guessed from names.
 
+Git's threaded DNS resolver also exposed an indefinite `pselect6` wait after
+its worker wrote the eventfd notification. Select/pselect now use poll's
+readiness and waiter handling instead of treating eventfds and sockets as
+always ready. `selectcheck` passed in Linux and Brook, including delayed
+eventfd/pipe writes, TCP accept/data, timeout units, high descriptors and
+unmapped-buffer boundaries. Brook's TCP test uses its configured NIC address;
+127/8 loopback routing is still missing. The probe uses a separate parent
+watchdog because Brook does not implement `alarm` yet.
+
 Runtime evidence is retained under ignored `build/experiments/results/bootstrap-20261014/`
 and `bootstrap-compat-20261014/`, and the VM registry keeps serial logs and the
 actual booted kernel identities. Package payloads, images and logs stay out of git.
