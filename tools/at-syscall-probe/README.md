@@ -8,8 +8,23 @@ Run them inside a disposable Brook VM through `vm_guest_run`:
 - `fdstress.c`: 2,000 concurrent `F_DUPFD_CLOEXEC` operations on a shared memfd.
 - `brkcheck.c`: a sibling heap extension preserves an existing page and the
   leader observes the same break.
+- `brkshrinkcheck.c`: raw break shrink/regrowth returns zeroed full pages,
+  preserves the live partial page, and drops a fork child's COW references
+  without changing its parent's heap. It uses no allocator or stdio while
+  borrowing the break. Run alongside `brkcheck.c`; neither test establishes
+  the cause of an application heap crash.
 - `cowcheck.c`: `pipe` writes a valid post-fork COW output buffer; an explicitly
   read-only output buffer still returns `EFAULT`.
+
+`stdfdcheck.c` takes an absolute writable directory and an absolute Python
+executable. It checks regular files, closed descriptors, anonymous pipes and
+`/dev/null` reused as each of fd 0, 1 and 2: metadata follows the object, terminal
+ioctls return `ENOTTY`, and closed descriptors return `EBADF`. Python then reads
+a 40 KiB script from a regular file on stdin; exact output, exit status and empty
+stderr distinguish script execution from an accidental interactive REPL. Child
+checks have a 30-second fork/wait/monotonic-clock watchdog. Expect 20 checks and
+`STDFDCHECK PASS failures=0`. Explicitly terminal-marked shell pipes retain their
+terminal behavior; descriptor numbers alone do not identify a terminal.
 
 For `ext2check.py`, first create `/data/tmp/many` with exactly 800 files whose
 names contain 90 characters, then call guest `sync` and stop the VM. Run

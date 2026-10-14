@@ -102,6 +102,10 @@ def resolvable(sym):
 
 errors = 0
 for mod in modules:
+    if Path(mod).stat().st_size == 0:
+        print(f"ERROR: {mod} is empty — relink the module", file=sys.stderr)
+        errors += 1
+        continue
     out = subprocess.run([nm, "-u", mod], capture_output=True, text=True)
     if out.returncode != 0:
         print(f"ERROR: {nm} failed on {mod}: {out.stderr.strip()}", file=sys.stderr)
@@ -123,5 +127,5 @@ if errors:
           f"fail to load at boot", file=sys.stderr)
     sys.exit(1)
 print(f"check-module-symbols: all module imports resolve "
-      f"({len(exports)} kernel exports)")
+      f"({len(modules)} modules, {len(exports)} kernel exports)")
 PYEOF

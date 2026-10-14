@@ -1498,6 +1498,16 @@ struct FdRef
     FdEntry* get() const            { return fde; }
 };
 
+// Descriptor numbers are reusable: redirected standard streams have the
+// same metadata and terminal behavior as the object they now reference.
+static bool IsTerminalFd(const FdEntry* fde)
+{
+    return fde->type == FdType::DevKeyboard ||
+           (fde->type == FdType::Vnode && !fde->handle) ||
+           fde->type == FdType::DevTty ||
+           (fde->type == FdType::Pipe && (fde->flags & 0x04));
+}
+
 // ---------------------------------------------------------------------------
 // sys_write (1)
 // ---------------------------------------------------------------------------
@@ -3723,14 +3733,29 @@ static int64_t sys_brk(uint64_t newBreak, uint64_t, uint64_t,
         return static_cast<int64_t>(proc->programBreak);
     }
 
-    // Map any new pages needed between old and new break
+    // Keep the page containing a partial break alive. Whole pages returned
+    // by a shrink must be unmapped so subsequent growth obtains zeroed
+    // memory, rather than resurrecting the old heap contents.
     uint64_t oldPage = (proc->programBreak + 4095) & ~4095ULL;
     uint64_t newPage = (newBreak + 4095) & ~4095ULL;
 
+    if (newPage < oldPage)
+    {
+        for (uint64_t addr = newPage; addr < oldPage; addr += 4096)
+        {
+            VirtualAddress va(addr);
+            PhysicalAddress phys = VmmVirtToPhys(proc->pageTable, va);
+            if (!phys) continue;
+            VmmUnmapPage(proc->pageTable, va);
+            // A fork may still own this COW frame; release only our mapping.
+            PmmUnrefPage(phys);
+        }
+        TlbShootdownFull(proc->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
+    }
+
     for (uint64_t addr = oldPage; addr < newPage; addr += 4096)
     {
-        // Shrinking leaves pages mapped in this implementation. Reuse those
-        // pages on regrowth instead of replacing their physical frames.
+        // Never replace a live page already present in the shared heap.
         if (VmmVirtToPhys(proc->pageTable, VirtualAddress(addr))) continue;
         PhysicalAddress phys = PmmAllocPage(MemTag::User, proc->pid);
         if (!phys) return static_cast<int64_t>(proc->programBreak);
@@ -6672,8 +6697,9 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     // ioctl cmd is a 32-bit value; mask off sign-extension from syscall ABI
     uint64_t cmd = cmd_raw & 0xFFFFFFFFULL;
     Process* proc = ProcessCurrent();
-    if (!proc) return -EBADF;
-    FdEntry* fde = FdGet(proc, static_cast<int>(fd));
+    if (!proc || fd >= MAX_FDS) return -EBADF;
+    FdRef ref(proc, static_cast<int>(fd));
+    FdEntry* fde = ref.get();
     if (!fde) return -EBADF;
 
     // FIONBIO / FIONREAD are socket ioctls, but their Linux request numbers
@@ -6975,12 +7001,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     // shell sees its stdio as a TTY (for readline, job control, etc.) but
     // anonymous pipes created by pipe() — e.g. the curl | xz | nar-unpack
     // pipeline — are not TTYs and isatty() returns false on them.
-    bool isTtyFd = (fde->type == FdType::DevKeyboard) ||
-                   (fde->type == FdType::Vnode && !fde->handle) ||
-                   (fde->type == FdType::DevTty) ||
-                   (fde->type == FdType::Pipe && (fde->flags & 0x04)) ||
-                   ((fd <= 2) && fde->type != FdType::Pipe &&
-                                 fde->type != FdType::Socket);
+    bool isTtyFd = IsTerminalFd(fde);
     if (isTtyFd && cmd == 0x5401)
     {
         if (!UserBufferWritable(arg, 36)) return -EFAULT;
@@ -7589,19 +7610,21 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
 {
     auto* st = reinterpret_cast<LinuxStat*>(statAddr);
 
-    if (fd <= 2) {
+    Process* proc = ProcessCurrent();
+    if (!proc || fd >= MAX_FDS) return -EBADF;
+    FdRef ref(proc, static_cast<int>(fd));
+    FdEntry* fde = ref.get();
+    if (!fde) return -EBADF;
+
+    if (IsTerminalFd(fde)) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
         memset(raw, 0, sizeof(LinuxStat));
         st->st_mode = 0020666; // S_IFCHR | rw-rw-rw-
-        st->st_rdev = 0x8800 + fd;
+        st->st_rdev = (fde->type == FdType::Pipe || fde->type == FdType::DevTty)
+            ? 0x8800 : 0x0400;
         st->st_blksize = 4096;
         return 0;
     }
-
-    Process* proc = ProcessCurrent();
-    if (!proc) return -EBADF;
-    FdEntry* fde = FdGet(proc, static_cast<int>(fd));
-    if (!fde) return -EBADF;
 
     if (fde->type == FdType::Vnode && fde->handle) {
         auto* vn = static_cast<Vnode*>(fde->handle);

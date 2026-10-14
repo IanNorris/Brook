@@ -245,3 +245,11 @@ anonymous mmap and brk zero-fill used XMM0 without preserving it. Stack XSAVE/
 XRSTOR now protects ordinary syscall entry/return and blocking switches. Audit
 fork's inherited vector snapshot and signal ucontext FP-state restoration
 separately; the syscall guard does not implement those broader semantics.
+
+Bootstrap allocator/stdio probes also confirmed and fixed whole-page heap
+regrowth returning stale bytes after brk shrink, and fstat/ioctl classifying
+redirected fd 0–2 by number. Heap regrowth now zeroes released full pages while
+preserving the partial boundary page and fork COW owners. Standard descriptors
+now follow their actual object; Python can execute large scripts from file
+stdin without entering the REPL. These are independently validated defects;
+none alone establishes the cause of the intermittent Clang test crash.
