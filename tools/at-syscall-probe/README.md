@@ -142,3 +142,22 @@ then invoke the probe with both `/cachecheck` paths. Never modify a live VM's
 image through debugfs. The fixed kernel logs each mount's page-cache namespace;
 the high 32 bits of an ext2 cacheId are that namespace and the low 32 bits are
 the actual inode. Filesystem `stat` continues to expose the actual inode.
+
+Writable ext2 regular files currently opt out of the global mmap page cache:
+the namespace identity alone cannot keep pages coherent across writes,
+truncation or inode reuse. Demand paging and ext2's block cache remain enabled,
+but cross-process mmap-page sharing and preload read-ahead are disabled. A
+future coherent cache or mapping-local read-ahead can restore those benefits.
+Fault dumps show cacheId zero for these files, so that field cannot identify
+their backing inode; use filesystem metadata separately.
+
+`mmapmutatecheck.c` takes an absolute writable ext2 directory. It primes and
+unmaps a partial final page, appends six bytes into the old EOF padding, performs
+an in-place pwrite, replaces contents with O_TRUNC, then unlinks/recreates the
+file. Every fresh mapping must equal both pread and known expected bytes. The
+ext2 fixture must report `reused=1` to demonstrate actual inode-reuse coverage;
+the probe requires it by default. For host filesystems whose allocator chooses
+a different inode, `--allow-no-reuse` explicitly skips that assertion. Expect
+`MMAPMUTATECHECK PASS failures=0`. The probe closes/unmaps before unlink; it does
+not claim coherent updates to existing private mappings or correct lifetime
+of open-unlinked files.

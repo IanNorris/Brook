@@ -870,6 +870,9 @@ static void PageCacheInsert(Vnode* vn, uint64_t pageIdx, PhysicalAddress phys)
 static uint32_t PageCachePreload(Vnode* vn, uint64_t startPageIdx,
                                   uint64_t fileSize, uint32_t maxPages)
 {
+    // An uncached vnode must not allocate/read batches that Insert will
+    // immediately discard. Its pages are read on demand by the fault path.
+    if (!vn->cacheId) return 0;
     static constexpr uint32_t MAX_PRELOAD_PAGES = 4096; // 16MB
     static constexpr uint32_t CHUNK_PAGES = 16;         // 64KB per VfsRead
 

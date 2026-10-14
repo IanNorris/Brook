@@ -221,8 +221,11 @@ signal masks and TCP urgent-data readiness remain compatibility follow-ups.
 
 Bootstrap cache/lifetime follow-ups: ext2 mmap cache identities now include a
 unique mount namespace, fixing collisions between equal inode numbers on
-different disks. Write/truncate/unlink/inode-reuse invalidation still needs
-implementation. Open directory paths also truncate at 62 bytes, and unlink frees
+different disks. Writable ext2 regular files now bypass shared mmap caching
+after a real Git update reproduced stale source bytes. Restore cache sharing
+and read-ahead only with synchronized write/truncate/unlink/inode-reuse
+invalidation; fresh mappings now pass append, pwrite, O_TRUNC and actual inode
+reuse probes. Open directory paths also truncate at 62 bytes, and unlink frees
 storage still referenced by open vnodes. Add multi-mount mmap, long-dirfd-path
 and unlink-while-open regressions. The phantom Git references were separately
 traced to the missing-directory `/boot/lib` fallback, not proven cache aliasing.

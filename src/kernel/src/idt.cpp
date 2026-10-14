@@ -218,6 +218,7 @@ static void ExcStackWalk(uint64_t rbp, int maxFrames, const char* tag)
 // memcpy ran off) or a genuinely wild pointer. Also attributes the faulting RIP
 // to its backing file via cacheId (ext2: upper 32 bits = mount namespace,
 // lower 32 bits = inode — resolve on that mount with `find ... -inum N`).
+// cacheId zero denotes uncached files and cannot identify their backing inode.
 // Lock-free, allocation-free, serial-locked caller — safe in the fault path.
 // `addr` is CR2; `rip` is the faulting IP.
 static void ExcDumpUserAddrSpace(brook::Process* p, uint64_t addr, uint64_t rip,

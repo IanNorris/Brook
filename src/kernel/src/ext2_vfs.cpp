@@ -2057,7 +2057,8 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
     *mountPriv = mnt;
     g_ext2Mounts[pdrv] = mnt;
     mnt->skipPermChecks = false;  // Caller can override for nix mount
-    SerialPrintf("ext2: pdrv %u page-cache namespace %u\n", pdrv, mnt->cacheNamespace);
+    SerialPrintf("ext2: pdrv %u page-cache namespace %u (writable files uncached)\n",
+                 pdrv, mnt->cacheNamespace);
     DbgPrintf("ext2: mounted successfully\n");
     return true;
 }
@@ -2259,7 +2260,14 @@ static Vnode* Ext2FsOpenMode(void* mountPriv, uint8_t pdrv,
         vn->type = VnodeType::File;
         vn->priv = fp;
         vn->refCount = 1;
-        vn->cacheId = Ext2CacheId(mnt, ino);
+        // Every ext2 mount is currently writable, including /nix. The global
+        // mmap cache has no write/truncate/inode-reuse invalidation protocol,
+        // so caching these pages can return old source or library bytes.
+        // Keep demand paging and the coherent ext2 block cache, but bypass
+        // shared mmap-page caching until mutation synchronization is available.
+        // Ext2CacheId remains the namespace-safe identity for future caching;
+        // stat uses the real inode independently of this opt-out value.
+        vn->cacheId = 0;
         return vn;
     }
 

@@ -50,5 +50,10 @@ a Git object on `/data` and Python's `_ctypes` library on `/nix` both had inode
 3365. Before the fix, the library's mmap differed from `pread` at 1,736 bytes,
 including its ELF header. Mount-specific cache identities restored matching
 bytes, passed the equal-inode regression in `tools/at-syscall-probe`, and restored
-`import ctypes`. Write/truncate/inode-reuse cache invalidation remains a separate
-follow-up.
+`import ctypes`. Git subsequently updating a source file exposed stale cached
+bytes on the same mount, including six null bytes past the new EOF. Writable
+ext2 regular files therefore bypass shared mmap caching until mutation
+synchronization is implemented. The append/pwrite/O_TRUNC/inode-reuse probe
+failed four cases before this bypass and passed all cases afterward. This
+retains demand paging and ext2 block caching, but loses cross-process page
+sharing and preload read-ahead; restoring them is a performance follow-up.
