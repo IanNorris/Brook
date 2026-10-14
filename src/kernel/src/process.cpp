@@ -27,11 +27,6 @@
 
 namespace brook {
 
-// BRO-176 diagnostic: asLiveThreads inc/dec ring recorder (defined in scheduler.cpp).
-extern "C" void SchedulerRecordAsLive(void* leader, uint16_t actingPid, uint16_t leaderPid,
-                                      uint32_t leaderIncarn, uint32_t procLeaderIncarn,
-                                      int32_t result, uint8_t op);
-
 // ProcessCurrent() is now in scheduler.cpp (g_currentProcess lives there).
 
 // Helper: free a Process* and clear its magic so any stale pointer to this
@@ -976,50 +971,6 @@ void ProcessDestroy(Process* proc)
 
     bool isThread = proc->isThread;
 
-    // BRO-176: a thread being reaped releases its hold on the leader's shared
-    // address space.  Decrement the leader's live-thread count so that once the
-    // last thread is gone the leader becomes reapable and its ProcessDestroy can
-    // safely free the shared page table + user pages (no thread can still be in
-    // the pick->switch window onto this address space).  The leader is reaped
-    // last (gated on asLiveThreads==0 in ReapTerminated), so threadLeader is a
-    // valid live pointer here; guard with a magic check defensively.
-    if (isThread && !proc->isKernelThread)
-    {
-        Process* leader = proc->threadLeader;
-        bool magicOk = leader && leader->magic == PROCESS_MAGIC;
-        bool incarnOk = magicOk && leader->incarnation == proc->leaderIncarnation;
-        if (incarnOk)
-        {
-            int32_t after = __atomic_sub_fetch(&leader->asLiveThreads, 1, __ATOMIC_ACQ_REL);
-            brook::SchedulerRecordAsLive(leader, proc->pid, leader->pid,
-                                         (uint32_t)leader->incarnation,
-                                         (uint32_t)proc->leaderIncarnation, after, /*dec-applied*/1);
-            if (after < 0)
-            {
-                // Safety net: asLiveThreads must never go negative.  A negative
-                // count never equals 0, which would block the leader's reap (and
-                // thus the shared-AS free) forever.  Clamp + warn loudly so a
-                // future accounting bug surfaces as a log line, not a silent hang.
-                SerialPrintf("SCHED: BUG asLiveThreads<0 leader pid=%u (thr pid=%u) — clamping\n",
-                             leader->pid, proc->pid);
-                __atomic_store_n(&leader->asLiveThreads, 0, __ATOMIC_RELEASE);
-            }
-        }
-        else
-        {
-            // BRO-176: a SKIPPED decrement is the prime leak suspect — the matching
-            // increment bumped some leader's count that now never comes back down,
-            // wedging a Terminated leader unreapable (reap-stall hang). Record it.
-            brook::SchedulerRecordAsLive(leader, proc->pid, magicOk ? leader->pid : 0,
-                                         magicOk ? (uint32_t)leader->incarnation : 0,
-                                         (uint32_t)proc->leaderIncarnation, -1,
-                                         magicOk ? /*skip-mismatch*/2 : /*bad-leader*/3);
-        }
-        // If the leader pointer is stale or its incarnation no longer matches
-        // (struct freed+reused), this thread's increment already retired with the
-        // old leader; do nothing rather than decrement an unrelated incarnation.
-    }
-
     // Release any kernel mutexes held by this process (prevents deadlock)
     Ext2ForceUnlockForPid(proc->pid);
 
@@ -1106,6 +1057,10 @@ void ProcessDestroy(Process* proc)
             g_sigHandlers[proc->tgid][s].mask = 0;
         }
     }
+
+    // Publish the final shared-address-space release only after thread cleanup.
+    if (isThread && !proc->isKernelThread)
+        SchedulerReleaseThreadAddressSpace(proc);
 
     FreeProcessStruct(proc);
 }

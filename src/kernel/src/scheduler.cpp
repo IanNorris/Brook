@@ -594,6 +594,21 @@ static Process* PickNextLocked(uint32_t cpu)
     return nullptr;
 }
 
+// Caller holds g_allProcLock, which also protects parent lifetime.
+static void NotifyExitedParentLocked(Process* child)
+{
+    if (child->isThread || child->state != ProcessState::Terminated || !child->parentPid)
+        return;
+    for (uint32_t i = 0; i < g_processCount; ++i) {
+        Process* parent = g_allProcesses[i];
+        if (parent->pid == child->parentPid) {
+            __atomic_or_fetch(&parent->sigPending, 1ULL << (17 - 1), __ATOMIC_RELEASE);
+            __atomic_store_n(&parent->pendingWakeup, 1, __ATOMIC_RELEASE);
+            break;
+        }
+    }
+}
+
 // Drain per-CPU bookkeeping that was set before a context_switch.
 // Must be called after every context_switch resumption point (DoSwitch,
 // ProcessTrampoline, KernelThreadTrampoline).
@@ -635,7 +650,12 @@ static void DrainPostSwitch(uint32_t cpu)
         // alive via refCount until released.  Previously this deferred reapable
         // while compositorRegistered, which livelocked if the compositor never
         // unregistered the proc (BRO-175).
+        uint64_t alf = SchedLockAcquire(g_allProcLock);
         __atomic_store_n(&retired->reapable, true, __ATOMIC_RELEASE);
+        if (__atomic_load_n(&retired->asLiveThreads, __ATOMIC_ACQUIRE) == 0)
+            NotifyExitedParentLocked(retired);
+        SchedLockRelease(g_allProcLock, alf);
+        // No retired dereference after unlock: waitpid may now destroy it.
     }
 
     // Re-enqueue the process we were switched away from.
@@ -2452,6 +2472,44 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus,
 }
 
 
+
+void SchedulerReleaseThreadAddressSpace(Process* thread)
+{
+    // The count keeps the leader alive until this transition. Serialize its
+    // final decrement with waitpid's scan, and never dereference the leader
+    // after releasing this lock: another CPU may immediately reap it.
+    uint64_t alf = SchedLockAcquire(g_allProcLock);
+    Process* leader = nullptr;
+    for (uint32_t i = 0; i < g_processCount; ++i) {
+        if (g_allProcesses[i] == thread->threadLeader) {
+            leader = g_allProcesses[i];
+            break;
+        }
+    }
+    bool magicOk = leader && leader->magic == PROCESS_MAGIC;
+    bool incarnOk = magicOk && leader->incarnation == thread->leaderIncarnation;
+    if (incarnOk) {
+        int32_t after = __atomic_sub_fetch(&leader->asLiveThreads, 1, __ATOMIC_ACQ_REL);
+        SchedulerRecordAsLive(leader, thread->pid, leader->pid,
+                              leader->incarnation, thread->leaderIncarnation,
+                              after, 1 /* dec applied */);
+        if (after < 0) {
+            __atomic_store_n(&leader->asLiveThreads, 0, __ATOMIC_RELEASE);
+            after = 0;
+        }
+        if (after == 0 && __atomic_load_n(&leader->reapable, __ATOMIC_ACQUIRE)) {
+            // An earlier SIGCHLD may already have been consumed while waitpid
+            // refused the leader because this thread still held its AS. Event
+            // loops need another notification when that waitability gate opens.
+            NotifyExitedParentLocked(leader);
+        }
+    } else {
+        SchedulerRecordAsLive(leader, thread->pid, magicOk ? leader->pid : 0,
+                              magicOk ? leader->incarnation : 0,
+                              thread->leaderIncarnation, -1, magicOk ? 2 : 3);
+    }
+    SchedLockRelease(g_allProcLock, alf);
+}
 
 Process* SchedulerFindTerminatedChild(uint16_t parentPid, int64_t pid)
 {

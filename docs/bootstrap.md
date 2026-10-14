@@ -11,6 +11,70 @@ and bare-metal tests in the guest, running hosted tests in Brook, then booting
 the resulting guest-built kernel. A host-exported binary SDK supplies tools;
 that does not imply that Nix or the compiler was rebuilt inside Brook.
 
+## Next acceptance goal
+
+First resolve the common shared-library startup crash so all 13 hosted tests
+pass inside Brook, then fix ext2 open-unlinked lifetime, rename replacement
+and directory removal. Validate filesystem operations with semantic probes
+and offline fsck after a clean guest shutdown.
+
+Maintain two acceptance paths, using isolated disks and the same pinned Brook
+revision, SDK closure and VM configuration:
+
+- **Prepared image:** start with the SDK already installed, clone Brook and
+  its required submodules, build, run hosted tests and boot the guest outputs.
+- **Clean image:** start with the base Brook image and its guest installer,
+  install the same SDK through `nix-install`, then execute the same steps.
+  This tests package download and extraction as well as source compatibility;
+  it does not require building the SDK or Nix from source inside Brook.
+
+Record wall time separately for SDK installation, clone/submodules,
+configuration, compilation/linking, hosted tests and guest-built boot.
+Capture CPU samples, context-switch activity, used/free memory and available
+fault/I/O counters around the expensive stages. Record host load and VM
+settings alongside results. Keep cold and warm cache runs distinct, collect
+the baseline before optimising, and repeat the expensive stages enough to
+distinguish stable bottlenecks from run-to-run variation. Retain exit statuses,
+logs, source/toolchain identifiers, artifact hashes and synced offline-fsck
+results. Both paths must boot their own outputs and pass the guest tests to
+qualify as complete acceptance runs.
+
+### Initial measurements and compatibility progress
+
+A serial build of the 13 hosted tests in the desktop guest took 76 seconds
+including clean, compilation and linking. This is a preliminary measurement
+from the existing experimental disks, not either fresh acceptance path. A
+10-second capture retained 1,000 CPU samples and 2,466 context switches:
+133 samples were in user mode, 534 in kernel code and 333 in loaded modules.
+Compiler PID 18 accounted for 448 samples; compositor PID 12 accounted for
+336. Kernel samples include page-fault handling, allocation and virtio block
+I/O. Module addresses need module-specific symbols: the current converter's
+nearest-kernel-symbol labels for those addresses must not be used as evidence.
+The capture's memory observation was 343,613,440 bytes used out of
+8,536,883,200 bytes total. Compare a console-only configuration with this
+desktop run before attributing elapsed time solely to compilation.
+
+The native startup failure was caused by Nix library lookup substituting the
+boot disk's musl for a missing `libc.so` during linking. Exact store lookup and
+rebuilding fix that. CTest then exposed a lost SIGCHLD notification: a child
+leader could exit before its final thread was reaped, so WNOHANG returned zero
+and no new notification arrived when the leader became waitable. Releasing the
+thread's address-space hold at the end of teardown under the scheduler lock
+now notifies the parent at that transition and protects the leader pointer.
+Post-switch publication of `reapable` also notifies the parent when no threads
+remain, covering either ordering of the two waitability gates. With both
+transitions covered, ten repeated CTest mutex runs pass in 3.91 seconds without
+the event-loop stall.
+
+The subsequent one-vCPU guest run completed in 33.03 seconds with 10/13 tests
+passing. Two concurrency assertions failed (`test_krwlock`, `test_ksemaphore`)
+and `test_fd_table` reached the 30-second timeout. The semaphore case uses a
+10-microsecond sleep that Brook currently rounds to zero; the reader test has
+no explicit handoff within its short critical section. Investigate real sleep
+semantics and deterministic concurrency coverage, and profile the descriptor
+stress test before choosing a suitable acceptance timeout. All 13 host tests
+pass in 1.27 seconds. Full guest acceptance remains outstanding.
+
 ## Compatibility defects found during preparation
 
 The first real Git clone found that BusyBox fallback advertised every unknown

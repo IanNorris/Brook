@@ -115,7 +115,9 @@ library path under `/boot/lib/` (for example `/boot/lib/libdl.so.2`, when
 installed). It checks that missing Git refs directories, trailing slashes and
 unrelated file names cannot become `/boot/lib` or one of its files. It also
 checks directory/write requests cannot use library basename aliases, while
-exact `/boot` prefixes and read-only legacy/Nix library aliases still work.
+exact `/boot` prefixes and read-only legacy library aliases still work.
+Missing Nix store library paths must return ENOENT, so compiler search paths
+cannot substitute boot-disk musl for glibc or another package's contents.
 Expect `OPENCHECK PASS failures=0`. This is a Brook compatibility probe;
 ordinary Linux does not provide these boot-library aliases.
 

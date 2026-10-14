@@ -68,7 +68,7 @@ int main(int argc, char **argv)
     same_library(path, "exact /boot-prefix library compatibility is preserved");
     missing(path, O_RDONLY|O_DIRECTORY, ENOTDIR, "existing library requested as directory reports ENOTDIR");
     snprintf(path, sizeof(path), "/nix/store/__opencheck_missing_%ld/lib/%s", (long)getpid(), basename);
-    same_library(path, "Nix library basename compatibility is preserved");
+    missing(path, O_RDONLY, ENOENT, "missing Nix store library never aliases boot disk contents");
     struct stat st;
     if (stat("/boot/lib/console_history.txt", &st) == 0 && S_ISREG(st.st_mode)) {
         snprintf(path, sizeof(path), "/usr/lib/__opencheck_missing_%ld/console_history.txt", (long)getpid());

@@ -62,6 +62,16 @@ This is a successful core source-build and boot milestone; native test runtime
 compatibility remains [backlogged](../../docs/backlog.md). The compiler and
 SDK are prebuilt Linux binaries, rather than a compiler built inside Brook.
 
+The startup failure was subsequently traced to boot-library fallback supplying
+musl for missing Nix store `libc.so` paths during linking. Exact Nix path lookup
+and rebuilding remove that mixed-libc failure: the first three CTest cases pass,
+and the threaded mutex test passes all eight checks directly. A second fix
+notifies CTest when the last thread makes an exited leader waitable; the full
+suite now completes with 10/13 passing on one vCPU. Two concurrency assertions
+and a descriptor-stress timeout remain; a full guest suite pass is still
+outstanding. Existing binaries accidentally linked against musl must be
+rebuilt; changing path lookup alone cannot repair their dependencies.
+
 The local extracted outputs and SHA-256 manifest are retained under
 `build/experiments/results/bootstrap-20261014/guest-build-e4aa4c0`.
 For another verification, sync and stop the build VM before extracting

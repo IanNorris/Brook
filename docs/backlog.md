@@ -272,14 +272,20 @@ leak exhausting an 8 GiB guest; its command bridge could not provide a final
 free-memory snapshot. Test long builds and browser restarts for sustained
 reclamation, alongside the separate mmap coherency/lifetime work above.
 
-Native bootstrap runtime follow-up: all 13 hosted test executables compiled
-and linked in the guest, but all 13 segfaulted during shared-library startup
-before their assertions ran (0/13 passed, CTest exit 8, 2.81 seconds).
-The repeated fault read NULL at RIP 0x102a1048 in a mapping starting at
-0x10289000 (offset 0x18048). The same suite passes all 13 tests on the host.
-Preserve the binaries and loader diagnostics; investigate native libc++/loader
-startup and resolve the library offset before attributing this to a
-specific missing syscall. A separate user-PF diagnostic incorrectly forced
+Native bootstrap runtime follow-up: the common startup fault is traced to
+musl's `__malloc_alloc_meta+0xc8`, introduced by a missing Nix `libc.so`
+lookup aliasing the boot disk's musl. Guest linking therefore produced a
+`DT_NEEDED libc.so` alongside glibc dependencies. Nix store paths now have
+exact lookup semantics. After rebuilding, CTest passes its first three tests
+and a direct `test_kmutex` run passes all eight checks. CTest nevertheless
+stalled after threaded tests exited: its mutex-test child was terminated,
+reapable and had zero live threads, while CTest remained in epoll_pwait.
+The final thread now notifies the parent when the leader becomes waitable,
+fixing that stall. The full guest suite completes with 10/13 passing: reader
+and semaphore concurrency assertions fail on one vCPU, and descriptor stress
+hits a 30-second timeout. Fix positive sub-millisecond nanosleep rounding,
+establish deterministic reader overlap and profile descriptor stress; all 13
+guest tests passing remains an acceptance requirement. A separate user-PF diagnostic incorrectly forced
 panic serial locking, stranding UART writers and command control. Removing
 that force-lock call is validated by a reaped SIGSEGV child, subsequent fd3
 UART sentinel and healthy bridge procs/stats, including after the complete

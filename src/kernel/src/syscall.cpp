@@ -3110,9 +3110,12 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
 
     Vnode* vn = VfsOpenMode(lookupPath, vfsFlags, static_cast<uint16_t>(mode & 07777));
 
-    // Preserve exact /boot-prefixed aliases used by legacy applications.
-    // Basename aliases are only for read-only shared-library lookup.
-    if (!vn && lookupPath[0] == '/')
+    // Preserve /boot aliases for legacy applications, but Nix store paths
+    // identify exact package contents. In particular, a missing libc.so in
+    // a compiler's -L directory must not resolve to the boot disk's musl:
+    // doing so links musl into otherwise glibc-based executables.
+    bool nixStorePath = strncmp(lookupPath, "/nix/store/", 11) == 0;
+    if (!vn && lookupPath[0] == '/' && !nixStorePath)
     {
         // Try /boot prefix first
         char bootPath[256] = "/boot";
@@ -3135,7 +3138,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
                 return true;
             };
             bool libraryPrefix = hasPrefix("/lib/") || hasPrefix("/lib64/") ||
-                hasPrefix("/usr/lib/") || hasPrefix("/usr/lib64/") || hasPrefix("/nix/store/");
+                hasPrefix("/usr/lib/") || hasPrefix("/usr/lib64/");
             bool libraryName = false;
             for (const char* suffix = fname; *suffix; ++suffix) {
                 if (suffix[0] == '.' && suffix[1] == 's' && suffix[2] == 'o' &&

@@ -88,6 +88,8 @@ Process* SchedulerFindProcessByBaseName(const char* basename);
 
 // Reap (destroy) a terminated child process after wait4 collects its status.
 void SchedulerReapChild(Process* child);
+// Complete a destroyed thread's shared-AS hold and notify a now-waitable parent.
+void SchedulerReleaseThreadAddressSpace(Process* thread);
 
 // Snapshot of a process for procfs.
 struct ProcessSnapshot {
