@@ -261,3 +261,13 @@ silently did nothing (previously also entering REPL due to wrong TTY metadata).
 The module validator now uses a named Python script and checks nonempty outputs.
 Implement delayed inode reclamation and add an unlinked-file stdin regression
 before relying on large heredocs in guest application scripts.
+
+The uncached mmap path exposed process cleanup dropping file PTEs without
+releasing their physical references. Cleanup now unmaps and unreferences each
+present file page, preserving cache/fork co-owners. Guest exit and exec churn
+each faulted 128 MiB and retained only 4 KiB afterward; inherited parent pages
+remained readable after child exec/exit. The earlier long build stopped
+responding after roughly two million file page faults, consistent with the
+leak exhausting an 8 GiB guest; its command bridge could not provide a final
+free-memory snapshot. Test long builds and browser restarts for sustained
+reclamation, alongside the separate mmap coherency/lifetime work above.

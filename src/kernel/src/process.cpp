@@ -155,15 +155,21 @@ static void ProcessClearLazyMappings(Process* proc)
     for (uint32_t i = 0; i < Process::MAX_FILE_MAPS; i++) {
         auto& m = proc->fileMaps[i];
         if (m.length == 0) continue;
-        // Unmap PTEs for demand-paged file pages.  If we skip this,
-        // VmmDestroyUserPageTable → FreeTableLevel calls PmmUnrefPage on
-        // each mapped page (refcount 2→1), and then PmmKillPid sees the
-        // page as exclusive (refcount 1) and FREES it — even though the
-        // page cache still holds a reference.  That corrupts cached library
-        // data for every future process loading the same shared object.
+        // Each present file PTE owns one physical-page reference, independent
+        // of any cache or fork co-owner. Release it when removing the mapping:
+        // the later page-table walk can no longer see an unmapped leaf. In
+        // particular, uncached pages are not necessarily on the PID cleanup
+        // list (a prior shared-reference drop removes them from that list).
+        // PmmUnrefPage preserves any remaining cache/fork references and
+        // removes shared frames from PID cleanup so they cannot be freed twice.
         uint64_t pages = (m.length + 4095) / 4096;
-        for (uint64_t p = 0; p < pages; p++)
-            VmmUnmapPage(proc->pageTable, VirtualAddress(m.vaddr + p * 4096));
+        for (uint64_t p = 0; p < pages; p++) {
+            VirtualAddress va(m.vaddr + p * 4096);
+            PhysicalAddress phys = VmmVirtToPhys(proc->pageTable, va);
+            if (!phys) continue;
+            VmmUnmapPage(proc->pageTable, va);
+            PmmUnrefPage(phys);
+        }
         // Hold the fileMapLock to prevent FileMapHandleUserFault from
         // loading a stale vnode pointer while we clear and free it.
         SpinLockAcquire(&proc->fileMapLock);

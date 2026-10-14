@@ -26,6 +26,19 @@ checks have a 30-second fork/wait/monotonic-clock watchdog. Expect 20 checks and
 `STDFDCHECK PASS failures=0`. Explicitly terminal-marked shell pipes retain their
 terminal behavior; descriptor numbers alone do not identify a terminal.
 
+`mmaplifecheck.c` takes an absolute writable directory and must itself be invoked
+by its absolute path. It creates a 16 MiB readonly mapping fixture and faults
+every page in eight exit children and eight exec children, deliberately leaving
+unmapping to process teardown. In an otherwise idle Brook guest, `sysinfo`
+free-memory samples after reaper/quarantine settling must lose less than 16 MiB
+per 128 MiB phase. The old leak loses about 128 MiB per phase. It also verifies a
+parent's inherited mapping survives child exec/exit. Allow at least 512 MiB free;
+children have 30-second watchdogs. Use `--no-accounting` for a busy Linux host,
+where unrelated global memory changes make the free-memory assertion unsuitable;
+that mode still checks mapping contents and process lifecycle behavior. Expect
+`MMAPLIFECHECK PASS failures=0`; this tests page reclamation, not the cause of
+every earlier compiler fault.
+
 For `ext2check.py`, first create `/data/tmp/many` with exactly 800 files whose
 names contain 90 characters, then call guest `sync` and stop the VM. Run
 `e2fsck -fyD` on **that disposable, stopped** data disk to index the directory.
