@@ -1428,6 +1428,7 @@ static constexpr uint64_t SNDCTL_DSP_SETFMT    = 0xC0045005; // _IOWR('P', 5, in
 static constexpr uint64_t SNDCTL_DSP_CHANNELS  = 0xC0045006; // _IOWR('P', 6, int)
 static constexpr uint64_t SNDCTL_DSP_STEREO    = 0xC0045003; // _IOWR('P', 3, int)
 static constexpr uint64_t SNDCTL_DSP_GETOSPACE = 0x8010500C; // _IOR('P', 12, audio_buf_info), 16-byte payload
+static constexpr uint64_t SNDCTL_DSP_GETODELAY = 0x80045017; // queued output bytes
 static constexpr uint64_t SNDCTL_DSP_GETCAPS   = 0x8004500F; // _IOR('P', 0x0F, int)
 static constexpr uint64_t SNDCTL_DSP_SETTRIGGER= 0x40045010; // _IOW('P', 0x10, int)
 static constexpr uint64_t SNDCTL_DSP_GETFMTS   = 0x8004500B; // _IOR('P', 0x0B, int)
@@ -5725,6 +5726,15 @@ struct timeval {
 };
 
 // CLOCK_REALTIME=0  CLOCK_MONOTONIC=1  CLOCK_MONOTONIC_RAW=4  CLOCK_BOOTTIME=7
+static uint64_t ClockNowNs(uint64_t clockid)
+{
+    uint64_t ns = KvmClockAvailable() ? KvmClockReadNs()
+                                     : g_lapicTickCount * 1000000ULL;
+    if (clockid == 0)
+        return RtcNow() * 1000000000ULL + ns % 1000000000ULL;
+    return ns;
+}
+
 static int64_t sys_clock_gettime(uint64_t clockid, uint64_t tsAddr, uint64_t,
                                   uint64_t, uint64_t, uint64_t)
 {
@@ -5875,9 +5885,26 @@ static int64_t sys_nanosleep(uint64_t reqAddr, uint64_t remAddr, uint64_t,
     return 0;
 }
 
-static int64_t sys_clock_nanosleep(uint64_t, uint64_t, uint64_t reqAddr,
+static int64_t sys_clock_nanosleep(uint64_t clockid, uint64_t flags, uint64_t reqAddr,
                                     uint64_t remAddr, uint64_t, uint64_t)
 {
+    if (clockid != 0 && clockid != 1 && clockid != 7) return -EINVAL;
+    if (flags & ~1ULL) return -EINVAL;
+    if (!UserBufferReadable(reqAddr, sizeof(timespec))) return -EFAULT;
+    timespec req = *reinterpret_cast<const timespec*>(reqAddr);
+    if (req.tv_sec < 0 || req.tv_nsec < 0 || req.tv_nsec >= 1000000000LL)
+        return -EINVAL;
+    if (flags & 1) { // TIMER_ABSTIME: convert from the requested clock domain.
+        uint64_t deadline = static_cast<uint64_t>(req.tv_sec) * 1000000000ULL + req.tv_nsec;
+        uint64_t now = ClockNowNs(clockid);
+        if (deadline <= now) return 0;
+        uint64_t duration = deadline - now;
+        Process* proc = ProcessCurrent();
+        if (!proc) return -EINVAL;
+        proc->wakeupTick = g_lapicTickCount + (duration + 999999ULL) / 1000000ULL;
+        SchedulerBlock(proc);
+        return HasPendingSignals() ? -EINTR : 0;
+    }
     return sys_nanosleep(reqAddr, remAddr, 0, 0, 0, 0);
 }
 
@@ -7088,6 +7115,17 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
             return 0;
         }
 
+        // Report queued bytes in the application's negotiated PCM format.
+        if (cmd == SNDCTL_DSP_GETODELAY)
+        {
+            uint64_t frames = MIXER_RING_FRAMES - AudioMixerAvailableFrames(dsp->mixerStreamId);
+            frames += AudioGetPosition() / MIXER_FRAME_BYTES;
+            uint64_t inputFrames = (frames * dsp->sampleRate + MIXER_HW_RATE - 1) / MIXER_HW_RATE;
+            uint64_t bytes = inputFrames * dsp->channels * (dsp->bitsPerSample / 8);
+            *reinterpret_cast<int*>(arg) = static_cast<int>(bytes > 0x7fffffffULL ? 0x7fffffffULL : bytes);
+            return 0;
+        }
+
         // SNDCTL_DSP_GETOSPACE — report available buffer space
         if (cmd == SNDCTL_DSP_GETOSPACE)
         {
@@ -8100,13 +8138,12 @@ static int64_t sys_openat(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
 }
 
 // Shared helper for *at syscalls: resolves a path relative to dirfd into an
-// absolute path in 'out'. Returns true on success. If path is already absolute
-// or dirfd is AT_FDCWD, copies path verbatim.
+// absolute path in 'out'. AT_FDCWD resolves against the process cwd.
 static bool ResolveAtPath(int dirfd, const char* path, char* out, uint32_t outSize)
 {
     static constexpr int AT_FDCWD = -100;
     if (!path || !out || outSize < 2) return false;
-    if (path[0] == '/' || dirfd == AT_FDCWD) {
+    if (path[0] == '/') {
         uint32_t i = 0;
         while (path[i] && i < outSize - 1) { out[i] = path[i]; ++i; }
         out[i] = '\0';
@@ -8114,11 +8151,15 @@ static bool ResolveAtPath(int dirfd, const char* path, char* out, uint32_t outSi
     }
     Process* proc = ProcessCurrent();
     if (!proc) return false;
-    FdEntry* fde = FdGet(proc, dirfd);
-    if (!fde || fde->dirPath[0] == '\0') return false;
+    const char* prefix = proc->cwd;
+    if (dirfd != AT_FDCWD) {
+        FdEntry* fde = FdGet(proc, dirfd);
+        if (!fde || fde->dirPath[0] == '\0') return false;
+        prefix = fde->dirPath;
+    }
     uint32_t ri = 0;
-    for (uint32_t i = 0; fde->dirPath[i] && ri < outSize - 2; ++i)
-        out[ri++] = fde->dirPath[i];
+    for (uint32_t i = 0; prefix[i] && ri < outSize - 2; ++i)
+        out[ri++] = prefix[i];
     if (ri > 0 && out[ri - 1] != '/' && ri < outSize - 2)
         out[ri++] = '/';
     for (uint32_t i = 0; path[i] && ri < outSize - 1; ++i)
@@ -9965,6 +10006,9 @@ static int64_t sys_rmdir(uint64_t pathAddr, uint64_t, uint64_t,
 
 static int64_t DoUnlink(const char* path)
 {
+    char resolved[256];
+    if (!ResolveAtPath(-100, path, resolved, sizeof(resolved))) return -ENOENT;
+    path = resolved;
 
     // /dev/shm/<name> — shm_unlink: mark entry as free
     if (path[0]=='/' && path[1]=='d' && path[2]=='e' && path[3]=='v' &&
@@ -10028,6 +10072,9 @@ static int64_t sys_rename(uint64_t oldAddr, uint64_t newAddr, uint64_t,
 
 static int64_t DoMkdir(const char* path)
 {
+    char resolved[256];
+    if (!ResolveAtPath(-100, path, resolved, sizeof(resolved))) return -ENOENT;
+    path = resolved;
 
     int rc = VfsMkdir(path);
     if (rc == 0) return 0;
@@ -12246,10 +12293,7 @@ static uint64_t FutexTimeoutDeadlineMs(int op, uint64_t opVal, uint64_t timeoutA
         return g_lapicTickCount + timeoutMs;
     }
 
-    uint64_t nowMs = g_lapicTickCount;
-    if (opVal & FUTEX_CLOCK_REALTIME) {
-        nowMs = RtcNow() * 1000ULL + (g_lapicTickCount % 1000ULL);
-    }
+    uint64_t nowMs = ClockNowNs((opVal & FUTEX_CLOCK_REALTIME) ? 0 : 1) / 1000000ULL;
     if (timeoutMs <= nowMs)
         return g_lapicTickCount;
     return g_lapicTickCount + (timeoutMs - nowMs);

@@ -19,3 +19,9 @@ Boot it, run the Python probe, wait for `HTREECHECK PASS`, then stop it and run
 `e2fsck -fn IMAGE`. The guest must enumerate every entry, add and remove entries,
 clear the obsolete index flag, and persist correct inode/block/free counts.
 Never run writable filesystem tools against a live VM disk.
+
+`cwdcheck.c` verifies relative classic mkdir/unlink and mkdirat(AT_FDCWD)
+against absolute paths. It leaves three empty fixture directories.
+`clockcheck.c` checks a 20 ms absolute monotonic sleep and a 30 ms monotonic
+condition-variable timeout in a child, with a one-second parent watchdog so
+broken kernels fail instead of leaving an indefinitely sleeping probe.

@@ -42,7 +42,7 @@ let
     export XDG_CACHE_HOME=$HOME/.cache
     export XDG_CONFIG_HOME=$HOME/.config
     export XDG_DATA_HOME=$HOME/.local/share
-    /nix/profile/bin/mkdir -p "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
+    /nix/profile/bin/mkdir -p "$XDG_CACHE_HOME/Ladybird" "$XDG_CONFIG_HOME/Ladybird" "$XDG_DATA_HOME/Ladybird"
     exec /nix/profile/bin/brook-run /nix/profile/bin/Ladybird \
       --force-cpu-painting --disable-sql-database --disable-http-disk-cache "$@"
     EOF
