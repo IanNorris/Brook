@@ -34,7 +34,7 @@
 #define APPS_DIR        "/nix/share/applications"
 #define APPS_IDX        "/nix/share/applications/applications.idx"
 #define APPS_ICONS_DIR  "/nix/share/applications/icons"
-#define MAX_LINE        4096
+#define MAX_LINE        16384
 #define MAX_PACKAGES    256
 
 /* Package info from the index */
@@ -811,6 +811,12 @@ static int cmd_install(const char *name) {
         /* Already in manifest. Re-link bins in case the profile/bin
          * symlinks are missing (e.g. wiped, or earlier link step never
          * ran). This is idempotent — link_package_bins unlinks first. */
+        char hash[33];
+        store_hash_from_name(existing_store, hash);
+        if (run_nix_fetch_deps(hash, 0) != 0) {
+            fprintf(stderr, "Error: installed package closure is incomplete\n");
+            return 1;
+        }
         int linked = link_package_bins(existing_store);
         int lib_linked = link_package_libs(existing_store);
         lib_linked += link_closure_libs_from_narinfo(existing_store);
@@ -884,6 +890,10 @@ static int cmd_install(const char *name) {
         }
     } else if (in_store) {
         printf("Already in store: %s\n", pkg.store_name);
+        if (run_nix_fetch_deps(hash, 0) != 0) {
+            fprintf(stderr, "Error: store package closure is incomplete\n");
+            return 1;
+        }
     } else {
         /* Fetch package and dependencies */
         printf("Fetching %s and dependencies...\n", hash);

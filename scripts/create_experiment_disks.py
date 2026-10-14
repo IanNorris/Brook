@@ -24,6 +24,27 @@ def digest(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
+def install_package_tools(nix_root, manifest):
+    """Build current sources, rather than copying stale checked-in binaries."""
+    compiler = os.environ.get("MUSL_CC")
+    if not compiler:
+        raise RuntimeError("MUSL_CC is required; run this script inside nix-shell")
+    for name in ["nix-search", "nix-install", "nix-fetch", "nar-unpack"]:
+        target = nix_root / "bin" / name
+        run(compiler, "-static", "-O2", "-o", str(target),
+            str(ROOT / "tools" / name / (name + ".c")))
+        manifest["assets"][name] = digest(target)
+    (nix_root / "bin/nix").symlink_to("nix-install")
+    for name in ["curl", "xz", "zstd"]:
+        (nix_root / "bin" / name).symlink_to("../profile/bin/" + name)
+    (nix_root / "index").mkdir()
+    index = nix_root / "index/packages.idx"
+    shutil.copy2(ROOT / "tools/nix-index/packages.idx", index)
+    manifest["assets"]["packages.idx"] = digest(index)
+    for directory in ["var/cache/narinfo", "share/applications/icons"]:
+        (nix_root / directory).mkdir(parents=True, exist_ok=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=ROOT / "build/experiments/seeds")
@@ -80,6 +101,7 @@ def main():
                 path, str(nix_root / "store" / Path(path).name))
         run("cp", "-a", "--no-preserve=ownership", str(profile), str(nix_root / "profile"))
         (nix_root / "bin").mkdir()
+        install_package_tools(nix_root, manifest)
         (nix_root / "etc").mkdir(exist_ok=True)
         shutil.copy2(ROOT / "data/asound.conf", nix_root / "etc/asound.conf")
         shutil.copy2(ROOT / "data/config/alsoft-oss.conf", nix_root / "etc/alsoft-oss.conf")

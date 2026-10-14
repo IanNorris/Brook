@@ -102,6 +102,14 @@ static void path_join(char *out, size_t outsz, const char *dir, const char *name
 }
 
 /* Create directory and parents */
+static void make_directory(const char *path) {
+    if (mkdir(path, 0755) != 0 && errno != EEXIST)
+        die2("cannot create directory", path);
+    struct stat st;
+    if (lstat(path, &st) != 0 || !S_ISDIR(st.st_mode))
+        die2("directory path is not a directory", path);
+}
+
 static void mkdirs(const char *path) {
     char tmp[PATH_MAX_NAR];
     size_t len = strlen(path);
@@ -111,11 +119,11 @@ static void mkdirs(const char *path) {
     for (size_t i = 1; i < len; i++) {
         if (tmp[i] == '/') {
             tmp[i] = '\0';
-            mkdir(tmp, 0755);
+            make_directory(tmp);
             tmp[i] = '/';
         }
     }
-    mkdir(tmp, 0755);
+    make_directory(tmp);
 }
 
 /* Parse a node recursively */
@@ -149,7 +157,7 @@ static void parse_node(const char *path) {
         read_exact(&flen, 8);
 
         /* Open output file */
-        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC,
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW,
                        executable ? 0755 : 0644);
         if (fd < 0) die2("cannot create file", path);
 
@@ -170,7 +178,7 @@ static void parse_node(const char *path) {
             }
             remaining -= chunk;
         }
-        close(fd);
+        if (close(fd) != 0) die2("close error", path);
 
         /* Skip padding */
         size_t pad = (8 - (flen % 8)) % 8;
@@ -221,29 +229,12 @@ static void parse_node(const char *path) {
         char target[PATH_MAX_NAR];
         read_str(target, sizeof(target));
 
-        /* Reject absolute symlink targets and path traversal via ".." */
-        if (target[0] == '/') {
-            /* Absolute targets are allowed in Nix store (cross-package refs)
-             * but warn — they must point within /nix/store/ */
-        } else {
-            /* Relative target: reject if any component is ".." that could
-             * escape the destination tree */
-            const char *p = target;
-            while (*p) {
-                if (p[0] == '.' && p[1] == '.' &&
-                    (p[2] == '/' || p[2] == '\0') &&
-                    (p == target || p[-1] == '/')) {
-                    die2("symlink target contains path traversal", target);
-                }
-                while (*p && *p != '/') p++;
-                while (*p == '/') p++;
-            }
-        }
+        /* Nix archives contain relative parent references and absolute store
+         * references. Preserve the target: extraction never follows a link.
+         * Entry names, directory types and O_NOFOLLOW protect output paths. */
 
         if (symlink(target, path) != 0) {
-            /* If symlink fails, print warning but continue */
-            fprintf(stderr, "nar-unpack: warning: symlink %s -> %s: %s\n",
-                    path, target, strerror(errno));
+            die2("cannot create symlink", path);
         }
 
         expect(")");

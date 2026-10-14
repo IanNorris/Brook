@@ -36,6 +36,16 @@ let
     export XDG_DATA_DIRS=/nix/profile/share
     exec "$@"
     EOF
+    cat > $out/bin/brook-ladybird <<'EOF'
+    #!${pkgs.bash}/bin/bash
+    export HOME=/data/home
+    export XDG_CACHE_HOME=$HOME/.cache
+    export XDG_CONFIG_HOME=$HOME/.config
+    export XDG_DATA_HOME=$HOME/.local/share
+    /nix/profile/bin/mkdir -p "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
+    exec /nix/profile/bin/brook-run /nix/profile/bin/Ladybird \
+      --force-cpu-painting --disable-sql-database --disable-http-disk-cache "$@"
+    EOF
     cat > $out/bin/brook-office <<'EOF'
     #!${pkgs.bash}/bin/bash
     export HOME=/data/home
@@ -50,7 +60,7 @@ in {
   profile = pkgs.buildEnv {
     name = "brook-experiment-profile";
     paths = [
-      pkgs.bash pkgs.coreutils pkgs.curl.bin pkgs.xz.bin pkgs.cacert
+      pkgs.bash pkgs.coreutils pkgs.curl.bin pkgs.xz.bin pkgs.zstd.bin pkgs.cacert
       pkgs.python3 pkgs.ffmpeg.bin pkgs.wayland pkgs.mesa
       pkgs.libreoffice pkgs.gimp pkgs.qalculate-gtk pkgs.xfce.mousepad
       waylandd calc player files fonts cursors launchers

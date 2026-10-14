@@ -26,8 +26,10 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <signal.h>
 
-#define MAX_NARINFO  8192
+#define MAX_NARINFO  32768
+#define MAX_REFERENCES 16384
 #define MAX_PATH     4096
 #define MAX_REFS     64
 
@@ -42,6 +44,7 @@ static const char *g_narinfo_cache_dir = "/nix/var/cache/narinfo";
 static const char *g_curl_path  = NULL;
 static const char *g_cacert_path = NULL;
 static const char *g_xz_path    = NULL;
+static const char *g_zstd_path  = NULL;
 static const char *g_unpack_path = NULL;
 static int g_fetch_deps = 0;
 static int g_force_root = 0;
@@ -51,7 +54,7 @@ static int g_packages_fetched = 0; /* progress counter for large closures */
 /* Set of hashes already fetched or in-progress — prevents redundant downloads
  * when a package lists itself in its own References, or when the same dep
  * appears in multiple dependency chains. */
-#define MAX_SEEN 256
+#define MAX_SEEN 4096
 static char g_seen_hashes[MAX_SEEN][33];
 static int  g_seen_count = 0;
 
@@ -286,20 +289,25 @@ static void exec_curl(const char *url) {
      * makes "Connection: close" meaningful and the server FINs promptly.
      *
      * --connect-timeout 15: bail if TCP+TLS handshake takes > 15s.
-     * --max-time 300: bail if any single transfer takes > 5 minutes
-     *   (large packages like VLC deps can be 50-100MB).
-     * --retry 2: retry on transient network errors. */
+     * Metadata has a short wall-clock limit; streaming archives instead have
+     * a low-speed timeout so filesystem backpressure can take as long as needed.
+     * Do not retry within a stream: a retry would append another archive after
+     * partially emitted data. The caller can retry the entire temporary tree. */
+    // Streaming extraction can be limited by guest filesystem throughput.
+    // A fixed five-minute download limit aborts healthy large packages. Keep
+    // metadata bounded, but allow archive progress and bound actual stalls.
+    const char *max_time = strstr(url, ".narinfo") ? "60" : "0";
     if (g_cacert_path)
         execlp(g_curl_path, "curl", "-4", "-sSL", "--http1.1",
                "-H", "Connection: close",
-               "--connect-timeout", "15", "--max-time", "300",
-               "--retry", "2",
+               "--connect-timeout", "15", "--max-time", max_time,
+               "--speed-time", "120", "--speed-limit", "1",
                "--cacert", g_cacert_path, url, (char*)NULL);
     else
         execlp(g_curl_path, "curl", "-4", "-sSL", "--http1.1",
                "-H", "Connection: close",
-               "--connect-timeout", "15", "--max-time", "300",
-               "--retry", "2",
+               "--connect-timeout", "15", "--max-time", max_time,
+               "--speed-time", "120", "--speed-limit", "1",
                url, (char*)NULL);
     perror("execl curl");
     _exit(127);
@@ -337,7 +345,7 @@ static const char *find_binary(const char *env_var, const char *name,
 }
 
 /* Run: curl -4 -sL <url> and capture output to buffer */
-static int curl_fetch(const char *url, char *buf, size_t bufsz) {
+static int curl_fetch_once(const char *url, char *buf, size_t bufsz) {
     int pfd[2];
     long t0 = now_ms();
     if (pipe(pfd) < 0) { perror("pipe"); return -1; }
@@ -377,6 +385,18 @@ static int curl_fetch(const char *url, char *buf, size_t bufsz) {
     return (int)total;
 }
 
+/* Retry metadata using a fresh process and buffer. Retrying inside a curl
+ * stdout stream can concatenate partial responses and ignores some errors
+ * (including send failures). Archive streams never use this function. */
+static int curl_fetch(const char *url, char *buf, size_t bufsz) {
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        int result = curl_fetch_once(url, buf, bufsz);
+        if (result >= 0) return result;
+        if (attempt < 2) usleep(200000);
+    }
+    return -1;
+}
+
 /* Parse a field from narinfo text. Returns pointer into buf or NULL. */
 static char *narinfo_field(char *narinfo, const char *field, char *out, size_t outsz) {
     size_t flen = strlen(field);
@@ -391,7 +411,10 @@ static char *narinfo_field(char *narinfo, const char *field, char *out, size_t o
         char *end = strchr(p, '\n');
         if (!end) end = p + strlen(p);
         size_t len = (size_t)(end - p);
-        if (len >= outsz) len = outsz - 1;
+        if (len >= outsz) {
+            fprintf(stderr, "nix-fetch: narinfo field %s exceeds %zu bytes\n", field, outsz - 1);
+            return NULL;
+        }
         memcpy(out, p, len);
         out[len] = '\0';
         /* Strip trailing \r */
@@ -414,7 +437,18 @@ static int download_and_extract(const char *nar_url, const char *compression,
     char full_url[MAX_PATH];
     snprintf(full_url, sizeof(full_url), "%s/%s", g_cache_url, nar_url);
 
-    int use_xz = (strcmp(compression, "xz") == 0);
+    const char *decompressor = NULL;
+    if (strcmp(compression, "xz") == 0) decompressor = g_xz_path;
+    else if (strcmp(compression, "zstd") == 0) decompressor = g_zstd_path;
+    else if (strcmp(compression, "none") != 0) {
+        fprintf(stderr, "nix-fetch: unsupported compression: %s\n", compression);
+        return -1;
+    }
+    int use_xz = (strcmp(compression, "none") != 0);
+    if (use_xz && !decompressor) {
+        fprintf(stderr, "nix-fetch: %s decompressor not found\n", compression);
+        return -1;
+    }
     long t_start = now_ms();
 
     if (use_xz) {
@@ -441,7 +475,7 @@ static int download_and_extract(const char *nar_url, const char *compression,
             dup2(pipe1[0], STDIN_FILENO);
             dup2(pipe2[1], STDOUT_FILENO);
             close(pipe1[0]); close(pipe2[1]);
-            execl(g_xz_path, "xz", "-d", NULL);
+            execl(decompressor, compression, "-d", "-c", (char*)NULL);
             _exit(127);
         }
 
@@ -459,14 +493,18 @@ static int download_and_extract(const char *nar_url, const char *compression,
         close(pipe1[0]); close(pipe1[1]);
         close(pipe2[0]); close(pipe2[1]);
 
-        /* Wait in pid order — wait() (any child) was unreliable here:
-         * one of three reaps would consistently miss, leaving nar-unpack
-         * still running when we returned (✓ Installed printed BEFORE
-         * the unpack actually finished — partial-state hazard). */
+        /* Reap each specific pid, downstream first. An extraction failure
+         * must stop its producers rather than wait for curl's network timeout.
+         * Do not publish the path until all three stages have completed. */
         int curl_st = 0, xz_st = 0, unpack_st = 0;
-        waitpid(pid_curl,   &curl_st,   0); long t_curl   = now_ms() - t_start;
-        waitpid(pid_xz,     &xz_st,     0); long t_xz     = now_ms() - t_start;
         waitpid(pid_unpack, &unpack_st, 0); long t_unpack = now_ms() - t_start;
+        if (!WIFEXITED(unpack_st) || WEXITSTATUS(unpack_st) != 0) {
+            kill(pid_xz, SIGTERM);
+            kill(pid_curl, SIGTERM);
+        }
+        waitpid(pid_xz,     &xz_st,     0); long t_xz     = now_ms() - t_start;
+        if (!WIFEXITED(xz_st) || WEXITSTATUS(xz_st) != 0) kill(pid_curl, SIGTERM);
+        waitpid(pid_curl,   &curl_st,   0); long t_curl   = now_ms() - t_start;
         int curl_rc   = WIFEXITED(curl_st)   ? WEXITSTATUS(curl_st)   : -1;
         int xz_rc     = WIFEXITED(xz_st)     ? WEXITSTATUS(xz_st)     : -1;
         int unpack_rc = WIFEXITED(unpack_st) ? WEXITSTATUS(unpack_st) : -1;
@@ -505,8 +543,9 @@ static int download_and_extract(const char *nar_url, const char *compression,
 
         long t_curl = -1, t_unpack = -1;
         int curl_st = 0, unpack_st = 0;
-        waitpid(pid_curl,   &curl_st,   0); t_curl   = now_ms() - t_start;
         waitpid(pid_unpack, &unpack_st, 0); t_unpack = now_ms() - t_start;
+        if (!WIFEXITED(unpack_st) || WEXITSTATUS(unpack_st) != 0) kill(pid_curl, SIGTERM);
+        waitpid(pid_curl,   &curl_st,   0); t_curl = now_ms() - t_start;
         int curl_rc   = WIFEXITED(curl_st)   ? WEXITSTATUS(curl_st)   : -1;
         int unpack_rc = WIFEXITED(unpack_st) ? WEXITSTATUS(unpack_st) : -1;
         long t_total = now_ms() - t_start;
@@ -527,8 +566,8 @@ static int fetch_package(const char *hash, int force);
  * the inner call overwrites the outer's state, and on return the outer's
  * saved pointer references a popped stack frame. That produced wild jumps
  * (crash at RIP=0x4738ab well outside the text segment). */
-static void fetch_dependencies(const char *refs_str) {
-    char buf[4096];
+static int fetch_dependencies(const char *refs_str) {
+    char buf[MAX_REFERENCES];
     strncpy(buf, refs_str, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
 
@@ -542,7 +581,7 @@ static void fetch_dependencies(const char *refs_str) {
     {
         char prefetch_hashes[64][33];
         int prefetch_n = 0;
-        char scan_buf[4096];
+        char scan_buf[MAX_REFERENCES];
         memcpy(scan_buf, buf, sizeof(scan_buf));
         char *sp = NULL;
         char *t = strtok_r(scan_buf, " \t", &sp);
@@ -552,11 +591,7 @@ static void fetch_dependencies(const char *refs_str) {
             if (hlen == 32) {
                 char h[33]; memcpy(h, t, 32); h[32] = '\0';
                 if (!hash_is_seen(h)) {
-                    char p[MAX_PATH];
-                    snprintf(p, sizeof(p), "%s/%s", g_store_dir, t);
-                    if (access(p, F_OK) != 0) {
-                        memcpy(prefetch_hashes[prefetch_n++], h, 33);
-                    }
+                    memcpy(prefetch_hashes[prefetch_n++], h, 33);
                 }
             }
             t = strtok_r(NULL, " \t", &sp);
@@ -582,25 +617,28 @@ static void fetch_dependencies(const char *refs_str) {
                 continue;
             }
 
-            /* Also skip if the store path already exists on disk */
+            /* Existing paths still need their transitive references checked. */
             char path[MAX_PATH];
             snprintf(path, sizeof(path), "%s/%s", g_store_dir, tok);
             if (access(path, F_OK) == 0) {
                 printf("  Already on disk: %s\n", tok);
-                tok = strtok_r(NULL, " \t", &saveptr);
-                continue;
             }
 
             printf("  Fetching dependency: %s\n", tok);
-            fetch_package(ref_hash, 0);
+            if (fetch_package(ref_hash, 0) != 0) return -1;
         }
         tok = strtok_r(NULL, " \t", &saveptr);
     }
+    return 0;
 }
 
 static int fetch_package(const char *hash, int force) {
     /* Guard against self-referential packages and shared deps in parallel chains */
     if (hash_is_seen(hash)) return 0;
+    if (g_seen_count == MAX_SEEN) {
+        fprintf(stderr, "nix-fetch: closure exceeds %d store paths\n", MAX_SEEN);
+        return -1;
+    }
     hash_mark_seen(hash);
 
     char url[MAX_PATH];
@@ -635,7 +673,7 @@ static int fetch_package(const char *hash, int force) {
     (void)from_cache;
 
     char store_path[MAX_PATH], nar_url[MAX_PATH];
-    char compression[64], references[4096];
+    char compression[64], references[MAX_REFERENCES];
 
     if (!narinfo_field(narinfo, "StorePath", store_path, sizeof(store_path))) {
         fprintf(stderr, "nix-fetch: no StorePath in narinfo\n");
@@ -659,12 +697,13 @@ static int fetch_package(const char *hash, int force) {
     /* Skip if already installed.  Non-forced fetches preserve the immutable
      * store fast path; forced fetches repair a path that exists but was left
      * partial by an interrupted previous extraction. */
-    if (access(dest, F_OK) == 0) {
-        if (!force) {
+    int installed = (access(dest, F_OK) == 0);
+    if (installed) {
+        if (!force && !g_fetch_deps) {
             printf("  Already installed: %s\n", basename);
             return 0;
         }
-        printf("  Repairing existing store path: %s\n", basename);
+        if (force) printf("  Repairing existing store path: %s\n", basename);
     }
 
     printf("  Package:     %s\n", basename);
@@ -673,9 +712,11 @@ static int fetch_package(const char *hash, int force) {
     /* Fetch deps first */
     if (g_fetch_deps) {
         if (narinfo_field(narinfo, "References", references, sizeof(references))) {
-            fetch_dependencies(references);
-        }
+            if (fetch_dependencies(references) != 0) return -1;
+        } else if (strstr(narinfo, "\nReferences:") ||
+                   strncmp(narinfo, "References:", 11) == 0) return -1;
     }
+    if (installed && !force) return 0;
 
     char tmp_dest[MAX_PATH];
     char old_dest[MAX_PATH];
@@ -760,6 +801,8 @@ int main(int argc, char **argv) {
     /* Read env / find tools */
     const char *store = getenv("NIX_STORE");
     if (store) g_store_dir = store;
+    const char *cache = getenv("NIX_CACHE_URL");
+    if (cache && cache[0]) g_cache_url = cache;
 
     const char *curl_paths[] = {
         "/nix/bin/curl",   // symlink created by create_nix_disk.sh
@@ -774,6 +817,7 @@ int main(int argc, char **argv) {
         "/nix/bin/xz",     // symlink created by create_nix_disk.sh
         "/usr/bin/xz",
     };
+    const char *zstd_paths[] = { "/nix/bin/zstd", "/nix/profile/bin/zstd" };
     const char *unpack_paths[] = {
         "/nix/bin/nar-unpack",
         "/usr/bin/nar-unpack",
@@ -781,11 +825,14 @@ int main(int argc, char **argv) {
 
     static char curl_scratch[MAX_PATH];
     static char xz_scratch[MAX_PATH];
+    static char zstd_scratch[MAX_PATH];
     static char unpack_scratch[MAX_PATH];
     g_curl_path   = find_binary("CURL_PATH", "curl", curl_paths, 2,
                                 curl_scratch, sizeof(curl_scratch));
     g_xz_path     = find_binary("XZ_PATH", "xz", xz_paths, 2,
                                 xz_scratch, sizeof(xz_scratch));
+    g_zstd_path   = find_binary("ZSTD_PATH", "zstd", zstd_paths, 2,
+                                zstd_scratch, sizeof(zstd_scratch));
     g_unpack_path = find_binary("NAR_UNPACK_PATH", "nar-unpack", unpack_paths, 2,
                                 unpack_scratch, sizeof(unpack_scratch));
 
