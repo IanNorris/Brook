@@ -321,16 +321,18 @@ def guest_run(session, command, **_):
         return result
 
 
-def profile(session, action="status", duration_ms=1000, **_):
+def profile(session, action="status", duration_ms=1000, guest_timeout=8, **_):
     if action not in {"start", "stop", "status", "export"} or not 100 <= duration_ms <= 30000:
         raise ValueError("Invalid profile action/duration")
     with session_lock(session) as data:
-        if action=="start" and "RUNNING" in guest(data,"prof status").get("reply",""):
+        def query(command):
+            return guest(data, command, timeout=guest_timeout)
+        if action=="start" and "RUNNING" in query("prof status").get("reply",""):
             raise RuntimeError("A profiler capture is already recording or flushing")
         if action != "export":
             command = f"prof start {duration_ms}" if action == "start" else "prof " + action
-            return guest(data, command)
-        state = guest(data, "prof status")
+            return query(command)
+        state = query("prof status")
         if "RUNNING" in state.get("reply", ""):
             raise RuntimeError("Profiler recording/flushing: export after status reports IDLE")
         text = tail(data["serial_log"])

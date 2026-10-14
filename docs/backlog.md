@@ -284,3 +284,35 @@ panic serial locking, stranding UART writers and command control. Removing
 that force-lock call is validated by a reaped SIGSEGV child, subsequent fd3
 UART sentinel and healthy bridge procs/stats, including after the complete
 13-failure CTest run; real kernel panic handling stays unchanged.
+
+Bootstrap performance baseline follow-ups: the fresh SDK install profile
+places 77% of samples explicitly in virtio used-ring completion polling. Large
+ext2 files update a four-byte indirect pointer per data block; the block layer
+performs a synchronous sector read/write for each update. Measure metadata
+request batching/writeback and allocation zeroing separately from bulk SG
+writes, retaining synced-fsck and lifetime gates. The 500 MB LLVM library NAR
+installed successfully in 325.709 seconds, so this capture shows slow progress
+rather than a proven storage stall. Final two-path timings belong in bootstrap.md.
+
+Heap diagnostic accounting also needs correction: `mem` can print wrapped
+`heap_free` while `mem heap`'s locked block walk reports sane usage. In kfree,
+coalescing two free blocks recovers their intervening header/footer, but the
+cumulative free counter subtracts that overhead instead of adding it. Expansion
+adds the full region even when a new free block consumes overhead. Correct both
+and verify incremental accounting against the block walk across split, forward/
+backward merge and expansion; use PMM memory metrics for the current baseline.
+
+The I/O gate review found Vnode `ftruncate` currently returns success without
+changing the file. Implement real truncate semantics and test zero size, EOF,
+shrink/grow contents and accounting. The current gate uses supported `O_TRUNC`,
+asserts zero size/EOF immediately, then writes a distinct pattern; it does not
+claim to validate `ftruncate`.
+
+The fast RAM-backed I/O gate now reproduces both extraction-sized sequential
+writes and namespace-heavy small-file operations with persistence and fsck
+checks in roughly 23 seconds. The candidate on
+`experiment/ext2-indirect-batching-20261015` cuts bulk requests approximately
+10-fold but regresses small-file and fragmented phases. Profile those CPU/
+scheduling costs before merging it; preserve failure propagation and inode
+accounting checks while tuning. Resume complete two-path bootstrap acceptance
+after this prerequisite; the clean checkpoint is diagnostic, not a pass.

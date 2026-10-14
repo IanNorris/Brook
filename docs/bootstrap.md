@@ -38,6 +38,62 @@ logs, source/toolchain identifiers, artifact hashes and synced offline-fsck
 results. Both paths must boot their own outputs and pass the guest tests to
 qualify as complete acceptance runs.
 
+### Reproducing the two paths
+
+Run these host commands from the repository inside `nix-shell`, after building
+the current Release kernel and fetching its userspace dependencies. Use a full
+Git revision available on the remote; both paths must use the same revision.
+Output directories must be new. Seeds contain no Quake data.
+
+```sh
+python3 scripts/export_guest_package.py --expression tools/bootstrap-pkg \
+  --name brook-bootstrap --version 1
+python3 scripts/create_experiment_disks.py --bootstrap-mode clean \
+  --nix-gib 12 --data-gib 8 --output build/experiments/seeds/bootstrap-clean
+python3 scripts/create_experiment_disks.py --bootstrap-mode prepared \
+  --nix-gib 12 --data-gib 8 --output build/experiments/seeds/bootstrap-prepared
+revision=$(git rev-parse HEAD)
+python3 -u scripts/bootstrap_acceptance.py --mode clean \
+  --seed build/experiments/seeds/bootstrap-clean \
+  --output build/experiments/results/bootstrap-clean --revision "$revision"
+python3 -u scripts/bootstrap_acceptance.py --mode prepared \
+  --seed build/experiments/seeds/bootstrap-prepared \
+  --output build/experiments/results/bootstrap-prepared --revision "$revision"
+```
+
+The clean seed includes Bash, coreutils, curl, xz, zstd, certificates and freshly
+compiled static guest package tools. It contains no SDK. The clean harness
+asserts the actual guest store contains exactly the base closure before install,
+and that its compiler and SDK shell are absent. The prepared seed
+adds the exported SDK's exact closure. The harness starts its local HTTP binary
+cache. SDK-only files in the prepared image use the installer's 0644/0755 modes,
+rather than the host store's 0444/0555, so mode-dependent mmap cache behavior
+matches. Base transport paths keep the same host-prepared modes in both images.
+The harness runs the real guest installer, performs an HTTPS clone and pinned
+submodule update, and builds kernel/EFI/modules/bare-metal/native artifacts.
+It validates module imports and requires 13/13 CTest results twice, before and
+after a clean native rebuild with warm caches. The incremental kernel stage
+is labelled separately from a full compilation.
+
+Each new run uses eight vCPUs, eight build jobs, 8 GiB, software virtio graphics, silent audio and the
+kernel WM command listener without Wayland apps. The kernel compositor still
+runs: this is a no-Wayland baseline, not a machine with no graphics work.
+Unrelated home/data disks are omitted; USB and media fixtures are private to
+each run. Host page cache is uncontrolled. `progress.json` retains periodic memory/load
+observations; `stage-results.json` retains guest wall seconds and host marker
+times. Long stages also receive a 10-second CPU/context-switch capture; a
+capture near a stage boundary can include subsequent work. Raw profiles and
+Speedscope output reside in the VM registry. Module addresses must not be
+interpreted using the nearest kernel symbol.
+
+After guest sync and shutdown, the harness requires offline fsck on both
+disks, extracts artifacts with debugfs, hashes them, boots their kernel/EFI
+and modules in a second isolated VM, verifies the booted kernel hash and
+command replies, and reruns Git fsck and all 13 native tests under that kernel,
+then repeats synced offline fsck. Only this complete sequence
+writes `result.json` with `success: true`. Failure retains logs/disks and may
+leave the VM running for diagnosis; use its bridge session to sync and stop it.
+
 ### Initial measurements and compatibility progress
 
 A serial build of the 13 hosted tests in the desktop guest took 76 seconds
@@ -243,3 +299,21 @@ and minor. The five-check `devicecheck /data /nix` probe passes with both
 roots at inode 2 and distinct devices, and the host suite passes 13/13.
 This extends `VnodeStat` and advances the combined module ABI to **5**; use
 a matching kernel and rebuilt modules.
+
+### I/O pivot checkpoint (2026-10-15)
+
+The fresh clean-image diagnostic successfully installed all 91 SDK additions
+in 2,494 seconds and completed its HTTPS shallow clone in about 253 seconds.
+It did not finish the complete build/boot acceptance sequence. After quiescing
+writers and acknowledged sync/shutdown, the Nix disk passed offline fsck; the
+data disk reported one inode `i_blocks` mismatch for `test_vlc_panic.gif`.
+Its contents matched the pinned Git revision, but the inode reported 536
+sectors instead of 568. A virtio timeout/reset appears during checkout; an
+ignored final inode-write failure is a supported hypothesis, not an identified
+failed request. The original disk is preserved, with no automatic repair.
+
+The immediate prerequisite is the [fast I/O gate](io-benchmark.md). Both full
+prepared/clean acceptance runs remain outstanding. Historical timings above
+used one vCPU; new launch/build defaults use eight. The metadata-batching
+candidate is on an experimental branch because small-file performance still
+regresses despite much faster sequential writes.

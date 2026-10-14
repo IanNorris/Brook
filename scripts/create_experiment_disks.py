@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import tempfile
 
@@ -53,6 +54,8 @@ def main():
     parser.add_argument("--q2-music", type=Path, help="OST folder with track*.ogg")
     parser.add_argument("--nix-gib", type=int, default=32)
     parser.add_argument("--data-gib", type=int, default=16)
+    parser.add_argument("--bootstrap-mode", choices=["clean", "prepared"],
+                        help="Minimal installer image, optionally including the bootstrap SDK")
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -71,13 +74,27 @@ def main():
                 parser.error("pak0.pak has no Quake PACK header")
     if args.q2_music and not args.q2_music.is_dir():
         parser.error("Music directory does not exist")
+    if args.bootstrap_mode and (args.video or args.q2_dir or args.q2_music):
+        parser.error("Bootstrap images cannot include experiment media")
 
-    profile = Path(run("nix-build", str(ROOT / "nix/experiment-packages.nix"),
-                       "-A", "profile", "--no-out-link", capture=True))
+    if args.bootstrap_mode:
+        profile = Path(run("nix-build", str(ROOT / "tools/bootstrap-base"),
+                           "--arg", "withSdk", str(args.bootstrap_mode == "prepared").lower(),
+                           "--no-out-link", capture=True))
+    else:
+        profile = Path(run("nix-build", str(ROOT / "nix/experiment-packages.nix"),
+                           "-A", "profile", "--no-out-link", capture=True))
     closure = run("nix-store", "-qR", str(profile), capture=True).splitlines()
+    transport_closure = set()
+    if args.bootstrap_mode == "prepared":
+        base = run("nix-build", str(ROOT / "tools/bootstrap-base"),
+                   "--arg", "withSdk", "false", "--no-out-link", capture=True)
+        transport_closure = set(run("nix-store", "-qR", base, capture=True).splitlines())
     manifest = {"revision": run("git", "-C", str(ROOT), "rev-parse", "HEAD", capture=True),
                 "profile": str(profile), "closure": sorted(closure), "assets": {},
                 "q2_data_present": bool(args.q2_dir),
+                "bootstrap_mode": args.bootstrap_mode,
+                "bootstrap_sdk_modes": "guest-nar" if args.bootstrap_mode == "prepared" else None,
                 "working_tree_dirty": bool(run("git", "-C", str(ROOT), "status", "--porcelain", capture=True))}
     kernel = ROOT / "build/release/kernel/BROOK.elf"
     if kernel.is_file():
@@ -99,15 +116,27 @@ def main():
             print(f"Copying store path {index}/{len(closure)}: {Path(path).name}", flush=True)
             run("cp", "-a", "--no-preserve=ownership", "--reflink=auto",
                 path, str(nix_root / "store" / Path(path).name))
+            if args.bootstrap_mode == "prepared" and path not in transport_closure:
+                # Host stores use 0444/0555; nar-unpack currently creates
+                # 0644/0755. Match installed-SDK mmap cache behavior in both
+                # paths. Never follow symlinks back into the host store.
+                copied = nix_root / "store" / Path(path).name
+                if copied.is_symlink():
+                    continue
+                for entry in [copied, *copied.rglob("*")]:
+                    if entry.is_symlink():
+                        continue
+                    mode = entry.stat().st_mode
+                    entry.chmod(0o755 if stat.S_ISDIR(mode) or mode & 0o111 else 0o644)
         run("cp", "-a", "--no-preserve=ownership", str(profile), str(nix_root / "profile"))
         (nix_root / "bin").mkdir()
         install_package_tools(nix_root, manifest)
         (nix_root / "etc").mkdir(exist_ok=True)
         shutil.copy2(ROOT / "data/asound.conf", nix_root / "etc/asound.conf")
         shutil.copy2(ROOT / "data/config/alsoft-oss.conf", nix_root / "etc/alsoft-oss.conf")
-        for executable in ["waylandd", "wayland-calc", "brook-player", "brook-files",
+        for executable in ([] if args.bootstrap_mode else ["waylandd", "wayland-calc", "brook-player", "brook-files",
                            "brook-office", "brook-ladybird", "brook-vlc",
-                           "brook-yquake2-gl", "brook-yquake2-soft"]:
+                           "brook-yquake2-gl", "brook-yquake2-soft"]):
             source = profile / "bin" / executable
             if not source.exists():
                 raise RuntimeError(f"Profile is missing {executable}")
@@ -167,7 +196,7 @@ def main():
             image.rename(output / f"{name}.img")
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(f"Experiment disks and manifest: {output}")
-    if not args.q2_dir:
+    if not args.q2_dir and not args.bootstrap_mode:
         print("Quake 2 packages are staged; game data is not present yet.")
 
 

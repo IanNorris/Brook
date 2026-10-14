@@ -467,7 +467,7 @@ if [ -n "${BROOK_GPU:-}" ] && [ "${BROOK_GPU}" != "0" ]; then
     if [ "${BROOK_GPU_SECONDARY:-0}" = "1" ]; then
         if [ "${BROOK_GPU}" = "venus" ]; then
             GPU_OPTS="-device virtio-gpu-gl-pci,id=vgpu,blob=true,venus=true,hostmem=${BROOK_GPU_HOSTMEM:-4G}"
-            MEM_BACKEND_OPTS="-object memory-backend-memfd,id=mem1,size=8G,share=on"
+            MEM_BACKEND_OPTS="-object memory-backend-memfd,id=mem1,size=${BROOK_MEMORY:-8G},share=on"
             MACHINE_MEMBACKEND=",memory-backend=mem1"
         else
             GPU_OPTS="-device virtio-gpu-gl-pci,id=vgpu,blob=true"
@@ -477,7 +477,7 @@ if [ -n "${BROOK_GPU:-}" ] && [ "${BROOK_GPU}" != "0" ]; then
             GPU_OPTS="-vga none -device virtio-vga-gl,id=vgpu,blob=true,venus=true,hostmem=${BROOK_GPU_HOSTMEM:-4G}"
             # Host-visible blob memory needs shareable machine RAM (memfd). The
             # ,memory-backend=mem1 suffix is appended to the -machine q35 line.
-            MEM_BACKEND_OPTS="-object memory-backend-memfd,id=mem1,size=8G,share=on"
+            MEM_BACKEND_OPTS="-object memory-backend-memfd,id=mem1,size=${BROOK_MEMORY:-8G},share=on"
             MACHINE_MEMBACKEND=",memory-backend=mem1"
         elif [ "${BROOK_GPU_HOSTVIS:-0}" = "1" ]; then
             # BRO-188 / option B: virgl + host-visible blob memory. Adds the
@@ -485,7 +485,7 @@ if [ -n "${BROOK_GPU:-}" ] && [ "${BROOK_GPU}" != "0" ]; then
             # can create coherent, CPU-mappable blob staging buffers (no async
             # transfer race on readback).
             GPU_OPTS="-vga none -device virtio-vga-gl,id=vgpu,blob=true,hostmem=${BROOK_GPU_HOSTMEM:-4G}"
-            MEM_BACKEND_OPTS="-object memory-backend-memfd,id=mem1,size=8G,share=on"
+            MEM_BACKEND_OPTS="-object memory-backend-memfd,id=mem1,size=${BROOK_MEMORY:-8G},share=on"
             MACHINE_MEMBACKEND=",memory-backend=mem1"
         else
             GPU_OPTS="-vga none -device virtio-vga-gl,id=vgpu,blob=true"
@@ -516,7 +516,7 @@ if [ "${INT_DEBUG}" -eq 1 ]; then
 fi
 
 # Create USB test disk if it doesn't exist
-USB_TEST_IMG="${SCRIPT_DIR}/../usb_test.img"
+USB_TEST_IMG="${BROOK_USB_TEST_IMG:-${SCRIPT_DIR}/../usb_test.img}"
 if [ ! -f "${USB_TEST_IMG}" ]; then
     dd if=/dev/zero of="${USB_TEST_IMG}" bs=1M count=32 status=none
     echo "Created 32MB USB test disk"
@@ -545,7 +545,7 @@ fi
     -machine q35${MACHINE_MEMBACKEND:-} \
     ${KVM_FLAGS} \
     -smp "${BROOK_SMP:-8}" \
-    -m 8G \
+    -m "${BROOK_MEMORY:-8G}" \
     ${MEM_BACKEND_OPTS:-} \
     -drive if=pflash,format=raw,readonly=on,file="${OVMF_CODE}" \
     -drive if=pflash,format=raw,file="${OVMF_VARS_COPY}" \

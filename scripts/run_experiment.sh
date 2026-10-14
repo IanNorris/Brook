@@ -12,7 +12,8 @@ case "${1:-desktop}" in
         export BROOK_COMPOSITE="${BROOK_COMPOSITE:-gpu}"
         ;;
     office) scenario=experiment_office ;;
-    *) echo "Usage: $0 [desktop|video|quake-soft|quake-gl3|office]" >&2; exit 2 ;;
+    bootstrap) scenario=experiment_bootstrap ;;
+    *) echo "Usage: $0 [desktop|video|quake-soft|quake-gl3|office|bootstrap]" >&2; exit 2 ;;
 esac
 disks="${BROOK_EXPERIMENT_DISKS:-${ROOT_DIR}/build/experiments/seeds}"
 source_boot="${BROOK_DISK_IMG:-${ROOT_DIR}/brook_disk.img}"
@@ -44,7 +45,7 @@ fi
 export BROOK_DISK_IMG="${run_dir}/boot.img"
 export BROOK_VM_CLONED_DISKS=1
 export BROOK_SKIP_UPDATE_DISK=1
-export BROOK_SMP="${BROOK_SMP:-4}"
+export BROOK_SMP="${BROOK_SMP:-8}"
 # PS/2 is the default keyboard, matching 7b0e50a. Preserve explicit caller
 # opt-in for USB experiments rather than overriding the launch default.
 export SERIAL_OPT="-serial file:${run_dir}/serial.log"

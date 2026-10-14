@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""Run an isolated prepared/clean guest bootstrap and boot its exact outputs.
+
+Run inside nix-shell. Runtime disks, logs and reports must remain below build/.
+"""
+import argparse
+import functools
+import hashlib
+import http.server
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+import threading
+import time
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "tools/vm_bridge"))
+import server
+
+
+def sha(path):
+    with path.open("rb") as f:
+        return hashlib.file_digest(f, "sha256").hexdigest()
+
+
+def write(path, value):
+    path.write_text(json.dumps(value, indent=2) + "\n")
+
+
+def host_environment():
+    cpu = Path("/proc/cpuinfo").read_text()
+    model = re.search(r"^model name\s*:\s*(.+)$", cpu, re.M)
+    quota = Path("/sys/fs/cgroup/cpu.max")
+    return {"cpu_model": model[1] if model else None,
+            "cpu_count": os.cpu_count(), "affinity": sorted(os.sched_getaffinity(0)),
+            "cpu_quota": quota.read_text().strip() if quota.exists() else None,
+            "load": os.getloadavg()}
+
+
+def command(args, log=None, env=None):
+    if log:
+        with log.open("wb") as f:
+            subprocess.run(args, cwd=ROOT, env=env, check=True, stdout=f, stderr=subprocess.STDOUT)
+    else:
+        subprocess.run(args, cwd=ROOT, env=env, check=True)
+
+
+def offline_fsck(directory, prefix):
+    results = {}
+    for name in ("data", "nix"):
+        log = directory / f"{prefix}-fsck-{name}.log"
+        with log.open("wb") as f:
+            rc = subprocess.run(["e2fsck", "-fn", str(directory / f"{name}.img")],
+                                stdout=f, stderr=subprocess.STDOUT).returncode
+        results[name] = {"exit": rc, "log": str(log)}
+    if any(v["exit"] for v in results.values()):
+        raise RuntimeError(f"Offline fsck failed: {results}")
+    return results
+
+
+def launch(directory, instance, artifacts=None, cpus=8, memory="8G"):
+    env = dict(os.environ, BROOK_EXPERIMENT_RUN=str(directory),
+               BROOK_EXPERIMENT_DISKS=str(directory), BROOK_DISK_IMG=str(directory / "boot.img"),
+               BROOK_VM_BRIDGE="1", BROOK_VM_PROVENANCE="agent", BROOK_SMP=str(cpus), BROOK_MEMORY=memory,
+               BROOK_AUDIODEV="none", BROOK_GPU="0", BROOK_COMPOSITE="cpu",
+               BROOK_EXPERIMENT_DISPLAY="headless", BROOK_EXPERIMENT_TIMEOUT="14400",
+               BROOK_INSTANCE=str(instance))
+    temporary = directory / "tmp-host"
+    temporary.mkdir(exist_ok=True)
+    env["TMPDIR"] = str(temporary)
+    # Do not attach unrelated user home/data images or a writable host media tree.
+    media = directory / "media"
+    media.mkdir(exist_ok=True)
+    (media / "BROOK.MNT").write_text("/media")
+    env.update(BROOK_HOME_DISK=str(directory / "absent-home.img"),
+               BROOK_GPT_DISK=str(directory / "absent-gpt.img"),
+               BROOK_DATA_DISK=str(directory / "absent-extra-data.img"),
+               BROOK_USB_TEST_IMG=str(directory / "usb.img"),
+               BROOK_MEDIA_DIR=str(media))
+    if artifacts:
+        env["BROOK_BUILD_DIR"] = str(artifacts)
+    log = directory / "launch.log"
+    with log.open("wb") as f:
+        process = subprocess.Popen([str(ROOT / "scripts/run_experiment.sh"), "bootstrap"],
+                                   cwd=ROOT, env=env, stdout=f, stderr=subprocess.STDOUT)
+    started = time.monotonic()
+    while time.monotonic() - started < 180:
+        if process.poll() is not None:
+            raise RuntimeError(f"VM launcher exited {process.returncode}; see {log}")
+        matches = re.findall(r"Brook VM bridge session: ([0-9a-f]+)", log.read_text(errors="replace"))
+        if matches:
+            session = matches[-1]
+            data = server.load_session(session)
+            if "DEBUG_TCP: listening on port 1234" in Path(data["serial_log"]).read_text(errors="replace"):
+                try:
+                    server.guest(data, "uptime", timeout=5)
+                    return process, session, data, time.monotonic() - started
+                except (TimeoutError, OSError):
+                    pass
+        time.sleep(1)
+    raise TimeoutError(f"Guest boot deadline; see {log}")
+
+
+def guest_scripts(directory, mode, revision, cache_port, sdk, manifest):
+    build = '''set -euo pipefail
+export CMAKE_BUILD_PARALLEL_LEVEL=8
+trap 'rc=$?; echo "BOOTSTRAP_EXIT $rc"' EXIT
+stage() {
+    local name="$1"; shift
+    local started=$SECONDS
+    echo "BOOTSTRAP_BEGIN $name"
+    cat /proc/blkprobe
+    "$@"
+    cat /proc/blkprobe
+    echo "BOOTSTRAP_END $name $((SECONDS-started))"
+}
+mkdir -p /data/home /data/tmp /data/bootstrap
+cd /data/bootstrap
+clone_pinned() {
+    git clone --depth 1 --no-checkout https://github.com/IanNorris/Brook.git Brook
+    if ! git -C Brook cat-file -e REVISION; then
+        git -C Brook fetch --depth 1 origin REVISION
+    fi
+}
+stage clone clone_pinned
+cd Brook
+git checkout --detach REVISION
+test "$(git rev-parse HEAD)" = REVISION
+stage submodules git submodule update --init --depth 1 -- vendor/uefi-headers src/third_party/fatfs
+stage configure cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release -G Ninja
+stage compile cmake --build build/release --parallel 8
+stage modules ./scripts/check-module-symbols.sh build/release/kernel/drivers
+stage native-configure cmake -S src/tests/host -B build/release/host_tests -DCMAKE_CXX_COMPILER="$HOST_CXX" -DCMAKE_BUILD_TYPE=Release -DBROOK_ROOT="$PWD" -G Ninja
+stage native-compile cmake --build build/release/host_tests --parallel 8
+stage native-tests ctest --test-dir build/release/host_tests --output-on-failure --no-tests=error --timeout 180
+stage warm-native-clean cmake --build build/release/host_tests --target clean
+stage warm-native-compile cmake --build build/release/host_tests --parallel 8
+stage warm-native-tests ctest --test-dir build/release/host_tests --output-on-failure --no-tests=error --timeout 180
+stage incremental-build cmake --build build/release --parallel 8
+test -s build/release/kernel/BROOK.elf
+test -s build/release/bootloader/BOOTX64.efi
+echo "BOOTSTRAP_ARTIFACTS_OK"
+sync
+'''.replace("REVISION", shlex.quote(revision))
+    (directory / "build.sh").write_text(build)
+    start = '''set -euo pipefail
+export PATH=/nix/profile/bin:/nix/bin:/boot/BIN
+export HOME=/data/home TMPDIR=/data/tmp
+mkdir -p "$HOME" "$TMPDIR"
+trap 'rc=$?; if [ "$rc" != 0 ]; then echo "BOOTSTRAP_EXIT $rc"; fi' EXIT
+'''
+    if mode == "clean":
+        allowed = "|".join(shlex.quote(path) for path in manifest["closure"])
+        start += f'''test ! -e {shlex.quote(sdk["store_path"])}
+test ! -e /nix/profile/bin/clang
+test ! -e /nix/profile/bin/brook-bootstrap-shell
+count=0
+for path in /nix/store/*; do
+    case "$path" in
+        {allowed}) count=$((count+1)) ;;
+        *) echo "BOOTSTRAP_UNEXPECTED_STORE_PATH $path"; exit 1 ;;
+    esac
+done
+test "$count" = {len(manifest["closure"])}
+echo "BOOTSTRAP_CLEAN_STORE_OK $count"
+'''
+        start += f'''echo "BOOTSTRAP_BEGIN install"
+started=$SECONDS
+curl -fsS http://10.0.2.2:{cache_port}/brook-bootstrap.idx -o /data/bootstrap.idx
+cat /data/bootstrap.idx /nix/index/packages.idx > /data/packages.idx
+cp /data/packages.idx /nix/index/packages.idx
+NIX_CACHE_URL=http://10.0.2.2:{cache_port} /nix/bin/nix-install brook-bootstrap
+echo "BOOTSTRAP_END install $((SECONDS-started))"
+'''
+    else:
+        start += f'test -d {shlex.quote(sdk["store_path"])}\n'
+        start += 'test -x /nix/profile/bin/clang\n'
+        start += 'echo "BOOTSTRAP_PREPARED_SDK"\n'
+    start += 'exec /nix/profile/bin/brook-bootstrap-shell /boot/BUILD.SH\n'
+    (directory / "start.sh").write_text(start)
+    for source, target in [("start.sh", "START.SH"), ("build.sh", "BUILD.SH")]:
+        command(["mcopy", "-o", "-i", str(directory / "boot.img"), str(directory / source), f"::{target}"])
+
+
+def monitor(directory, session, data, deadline):
+    started = time.monotonic()
+    stages, snapshots, profiles = [], [], []
+    active = None
+    capture = None
+    captured_stages = set()
+    last_snapshot = 0
+    seen = 0
+    serial = Path(data["serial_log"])
+    while time.monotonic() - started < deadline:
+        text = serial.read_text(errors="replace")
+        markers = re.findall(r"^BOOTSTRAP_(BEGIN|END|EXIT) ([^\r\n]+)", text, re.M)
+        for kind, payload in markers[seen:]:
+            now = time.monotonic()
+            if kind == "BEGIN":
+                active = payload
+                stages.append({"name": payload, "host_start": now-started})
+                print(f"Stage {payload}", flush=True)
+            elif kind == "END":
+                name, seconds = payload.split()
+                record = next(s for s in reversed(stages) if s["name"] == name)
+                record.update(guest_seconds=int(seconds), host_end=now-started)
+                active = None
+                print(f"Completed {name}: {seconds}s", flush=True)
+            elif kind == "EXIT":
+                rc = int(payload)
+                write(directory / "stage-results.json", {"exit": rc, "stages": stages,
+                      "snapshots": snapshots, "profiles": profiles})
+                if rc:
+                    raise RuntimeError(f"Guest bootstrap exit {rc}; see {serial}")
+                if text.count("100% tests passed, 0 tests failed out of 13") != 2 or "BOOTSTRAP_ARTIFACTS_OK" not in text:
+                    raise RuntimeError("Guest success missing required test/artifact evidence")
+                return stages, snapshots, profiles
+        seen = len(markers)
+        now = time.monotonic()
+        if capture and now >= capture["finish_after"]:
+            try:
+                result = server.profile(session, action="export", guest_timeout=30)
+                profiles.append(dict(stage=capture["stage"], **result))
+                print(f"Profile {capture['stage']}: {result['sample_count']} CPU samples", flush=True)
+                capture = None
+            except RuntimeError as e:
+                if "RUNNING" not in str(e) and "recording/flushing" not in str(e):
+                    raise
+        if not capture and active in {"install", "clone", "compile", "native-compile", "native-tests", "warm-native-compile", "warm-native-tests"} and active not in captured_stages:
+            try:
+                server.profile(session, action="start", duration_ms=10000, guest_timeout=30)
+                capture = {"stage": active, "finish_after": now + 12}
+                captured_stages.add(active)
+            except (TimeoutError, OSError) as e:
+                snapshots.append({"stage": active, "profile_error": str(e)})
+                captured_stages.add(active)
+        if now - last_snapshot >= 20:
+            observation = {"stage": active, "elapsed": now-started,
+                           "host_load": os.getloadavg()}
+            for name, query in [("stats", "bridge stats"), ("memory", "mem")]:
+                try:
+                    observation[name] = server.guest(data, query, timeout=10)
+                except (TimeoutError, OSError) as e:
+                    observation[name] = {"error": str(e)}
+            snapshots.append(observation)
+            last_snapshot = now
+            write(directory / "progress.json", {"stages": stages, "snapshots": snapshots, "profiles": profiles})
+        if server.panic_state(data):
+            raise RuntimeError("Guest panic; preserve VM for diagnosis")
+        time.sleep(1)
+    raise TimeoutError("Bootstrap deadline; VM retained for diagnosis")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=["clean", "prepared"], required=True)
+    parser.add_argument("--seed", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--revision", required=True)
+    parser.add_argument("--instance", type=int, default=120)
+    parser.add_argument("--deadline", type=int, default=7200)
+    args = parser.parse_args()
+    directory = args.output.resolve()
+    if not directory.is_relative_to(ROOT / "build") or directory.exists():
+        parser.error("--output must be a new directory under build/")
+    if not re.fullmatch(r"[0-9a-f]{40}", args.revision):
+        parser.error("--revision must be a full pinned Git SHA")
+    manifest = json.loads((args.seed / "manifest.json").read_text())
+    if manifest.get("bootstrap_mode") != args.mode:
+        parser.error("Seed mode does not match acceptance mode")
+    sdk = json.loads((ROOT / "build/package-cache/brook-bootstrap.json").read_text())
+    if args.mode == "clean" and sdk["store_path"] in manifest["closure"]:
+        parser.error("Clean seed already contains the SDK")
+    if args.mode == "clean" and any((Path(manifest["profile"]) / "bin" / name).exists()
+                                     for name in ("clang", "clang++", "cmake", "brook-bootstrap-shell")):
+        parser.error("Clean seed unexpectedly contains build tools")
+    if args.mode == "prepared" and sdk["store_path"] not in manifest["closure"]:
+        parser.error("Prepared seed does not contain the exported SDK")
+    if args.mode == "prepared" and manifest.get("bootstrap_sdk_modes") != "guest-nar":
+        parser.error("Prepared SDK modes must match guest NAR extraction; recreate the seed")
+    directory.mkdir(parents=True)
+    for name in ("data", "nix"):
+        command(["cp", "--reflink=auto", "--sparse=always", str(args.seed / f"{name}.img"), str(directory / f"{name}.img")])
+    before = offline_fsck(directory, "before")
+    env = dict(os.environ, BROOK_DISK_IMG=str(directory / "boot.img"))
+    command([str(ROOT / "scripts/create_disk.sh")], directory / "boot-create.log", env)
+    command([str(ROOT / "scripts/update_disk.sh")], directory / "boot-update.log", env)
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(ROOT / "build/package-cache"))
+    cache = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=cache.serve_forever, daemon=True).start()
+    guest_scripts(directory, args.mode, args.revision, cache.server_port, sdk, manifest)
+    metadata = {"mode": args.mode, "revision": args.revision, "sdk": sdk,
+                "seed": manifest, "before_fsck": before,
+                "host_load": os.getloadavg(), "host_cpu_count": os.cpu_count(),
+                "host_affinity": sorted(os.sched_getaffinity(0)),
+                "vm": {"cpus": 1, "memory": "8G", "gpu": "software virtio", "audio": "none", "wayland": False, "kernel_compositor": True},
+                "cache_note": "Fresh guest filesystem; host page cache uncontrolled. Warm native rebuild follows cold build in same VM."}
+    metadata["host_environment"] = host_environment()
+    write(directory / "manifest.json", metadata)
+    process, session, data, boot_seconds = launch(directory, args.instance)
+    metadata.update(session=session, boot_seconds=boot_seconds)
+    metadata["qemu_argv"] = [p.decode() for p in Path(f"/proc/{data['pid']}/cmdline").read_bytes().split(b"\0") if p]
+    write(directory / "manifest.json", metadata)
+    print(f"Booted {args.mode}: {session} ({boot_seconds:.2f}s)", flush=True)
+    server.guest_run(session, "run /nix/profile/bin/bash /boot/START.SH")
+    stages, snapshots, profiles = monitor(directory, session, data, args.deadline)
+    stop = server.control(session, "stop")
+    if not stop.get("guest_sync_completed"):
+        raise RuntimeError("Guest sync was not acknowledged")
+    process.wait(timeout=30)
+    cache.shutdown()
+    after = offline_fsck(directory, "after")
+    outputs = directory / "guest-artifacts"
+    outputs.mkdir()
+    command(["debugfs", "-R", f"rdump /bootstrap/Brook/build/release {outputs}", str(directory / "data.img")], directory / "extract.log")
+    artifacts = outputs / "release"
+    required = [artifacts / "kernel/BROOK.elf", artifacts / "bootloader/BOOTX64.efi"]
+    modules = sorted((artifacts / "kernel/drivers").glob("*.mod"))
+    baremetal = sorted((artifacts / "tests").glob("*.elf"))
+    native = sorted(p for p in (artifacts / "host_tests").glob("test_*") if p.is_file() and os.access(p, os.X_OK))
+    if len(modules) != 12 or len(baremetal) != 7 or len(native) != 13 or any(not p.is_file() or not p.stat().st_size for p in required + modules + baremetal):
+        raise RuntimeError(f"Missing artifacts: modules={len(modules)} baremetal={len(baremetal)} native={len(native)}")
+    hashes = {str(p.relative_to(artifacts)): sha(p) for p in required + modules + baremetal + native}
+    write(directory / "artifact-hashes.json", hashes)
+    verification = directory / "verify-boot"
+    verification.mkdir()
+    for name in ("boot", "data", "nix"):
+        command(["cp", "--reflink=auto", "--sparse=always", str(directory / f"{name}.img"), str(verification / f"{name}.img")])
+    for module in modules:
+        command(["mcopy", "-o", "-i", str(verification / "boot.img"), str(module), f"::DRIVERS/{module.name.upper()}"])
+    command(["mcopy", "-o", "-i", str(verification / "boot.img"), str(artifacts / "kernel/ksym_addr_table.cpp"), "::KSYM_ADDR.TXT"])
+    verify_script = verification / "verify.sh"
+    verify_script.write_text('''set -euo pipefail
+trap 'rc=$?; echo "BOOTSTRAP_VERIFY_EXIT $rc"' EXIT
+cd /data/bootstrap/Brook
+git fsck --full
+ctest --test-dir build/release/host_tests --output-on-failure --no-tests=error --timeout 180
+sync
+''')
+    command(["mcopy", "-o", "-i", str(verification / "boot.img"), str(verify_script), "::VERIFY.SH"])
+    verify_process, verify_session, verify_data, verify_seconds = launch(verification, args.instance + 1, artifacts)
+    if verify_data["kernel_sha256"] != hashes["kernel/BROOK.elf"]:
+        raise RuntimeError("Verification VM did not boot the extracted guest kernel")
+    replies = {query: server.guest(verify_data, query, timeout=20) for query in ("uptime", "mem", "procs")}
+    server.guest_run(verify_session, "run /nix/profile/bin/brook-bootstrap-shell /boot/VERIFY.SH")
+    verify_started = time.monotonic()
+    verify_log = Path(verify_data["serial_log"])
+    while time.monotonic() - verify_started < 600:
+        text = verify_log.read_text(errors="replace")
+        exit_marker = re.search(r"^BOOTSTRAP_VERIFY_EXIT (\d+)", text, re.M)
+        if exit_marker:
+            if exit_marker[1] != "0" or "100% tests passed, 0 tests failed out of 13" not in text:
+                raise RuntimeError("Tests under guest-built kernel failed")
+            break
+        if server.panic_state(verify_data):
+            raise RuntimeError("Guest-built verification kernel panicked")
+        time.sleep(1)
+    else:
+        raise TimeoutError("Guest-built kernel native tests deadline")
+    replies["after_tests"] = server.guest(verify_data, "bridge stats", timeout=20)
+    verify_native_seconds = time.monotonic() - verify_started
+    verify_stop = server.control(verify_session, "stop")
+    if not verify_stop.get("guest_sync_completed"):
+        raise RuntimeError("Verification guest sync was not acknowledged")
+    verify_process.wait(timeout=30)
+    verify_fsck = offline_fsck(verification, "after")
+    metadata.update(stages=stages, snapshots=snapshots, profiles=profiles,
+                    after_fsck=after, artifact_hashes=hashes,
+                    verification={"session": verify_session, "boot_seconds": verify_seconds,
+                                  "native_test_seconds": verify_native_seconds,
+                                  "replies": replies, "fsck": verify_fsck}, success=True)
+    write(directory / "result.json", metadata)
+    print(f"PASS: {args.mode} bootstrap, repeated 13/13 tests, guest-built boot and offline fsck", flush=True)
+
+
+if __name__ == "__main__":
+    main()
