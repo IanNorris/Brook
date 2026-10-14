@@ -24,10 +24,11 @@ namespace brook {
 
 // Current module ABI version.  The loader rejects modules built against
 // a different ABI version.
-// Version 4 adds real link counts, typed removal and busy-unmount checks to VFS.
+// Version 5 adds filesystem device identity to VnodeStat.
+// Version 4 added real link counts, typed removal and busy-unmount checks to VFS.
 // Version 3 added timestamps and creation/chmod modes. Version 2 belonged to
 // an archived, incompatible GPU experiment and must never be reused.
-static constexpr uint32_t MODULE_ABI_VERSION = 4;
+static constexpr uint32_t MODULE_ABI_VERSION = 5;
 
 // Magic bytes at the start of every valid ModuleInfo.
 static constexpr uint32_t MODULE_MAGIC = 0x4B524F42; // 'BROK'

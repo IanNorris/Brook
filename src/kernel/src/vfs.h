@@ -78,6 +78,7 @@ struct VnodeStat {
     VnodeTime mtime{};
     VnodeTime ctime{};
     uint32_t nlink = 1;
+    uint64_t dev = 1;    // Linux-encoded filesystem device identity
 };
 
 // ---- VFS open flags ----

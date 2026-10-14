@@ -4,6 +4,10 @@ Build the C probes in `nix-shell` using `$MUSL_CC -static -O2` (add
 `-pthread` for `fdstress.c` and `brkcheck.c`). Keep binaries in ignored `build/`.
 Run them inside a disposable Brook VM through `vm_guest_run`:
 
+- `devicecheck.c`: takes two different mount roots (Brook: `/data /nix`;
+  Linux: `/ /proc`). Verifies device identity across stat/fstat/lstat/fstatat
+  and path/fd statx, then requires the mounts to have distinct devices. This
+  catches false coreutils input/output alias detection when inode numbers match.
 - `sleepcheck.c`: raw nanosleep waits of 0, 1, 10,000, 999,999, 1,000,001
   and 5,000,000 ns never complete early; negative seconds/nanoseconds and
   out-of-range nanoseconds return EINVAL. Expect nine checks and zero failures.

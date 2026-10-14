@@ -7349,7 +7349,7 @@ static void FillStat(LinuxStat* st, const VnodeStat& vs, const Vnode* vn = nullp
         static volatile uint64_t s_nextIno = 100;
         st->st_ino = __atomic_fetch_add(&s_nextIno, 1, __ATOMIC_RELAXED);
     }
-    st->st_dev = 1;
+    st->st_dev = vs.dev;
     st->st_nlink = vs.nlink;
     st->st_blksize = 4096;
     st->st_size = static_cast<int64_t>(vs.size);
@@ -10518,6 +10518,8 @@ static int64_t sys_statx(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
         stx->stx_gid = st.st_gid;
         stx->stx_mode = static_cast<uint16_t>(st.st_mode);
         stx->stx_ino = st.st_ino;
+        stx->stx_dev_major = static_cast<uint32_t>(((st.st_dev >> 8) & 0xfff) | ((st.st_dev >> 32) & 0xfffff000));
+        stx->stx_dev_minor = static_cast<uint32_t>((st.st_dev & 0xff) | ((st.st_dev >> 12) & 0xffffff00));
         stx->stx_size = static_cast<uint64_t>(st.st_size);
         stx->stx_blocks = static_cast<uint64_t>(st.st_blocks);
         stx->stx_atime.tv_sec = static_cast<int64_t>(st.st_atime_sec);

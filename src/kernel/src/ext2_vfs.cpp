@@ -1836,7 +1836,7 @@ static void Ext2FileClose(Vnode* vn)
     kfree(fp);
 }
 
-static void Ext2FillStat(VnodeStat* st, uint32_t ino, const Ext2Inode& data)
+static void Ext2FillStat(VnodeStat* st, Ext2Mount* mnt, uint32_t ino, const Ext2Inode& data)
 {
     st->isDir = (data.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR;
     st->isSymlink = (data.i_mode & EXT2_S_IFMT) == EXT2_S_IFLNK;
@@ -1846,6 +1846,10 @@ static void Ext2FillStat(VnodeStat* st, uint32_t ino, const Ext2Inode& data)
     st->gid = data.i_gid;
     st->mode = data.i_mode;
     st->nlink = data.i_links_count;
+    // A virtual major reserved for ext2, with a unique minor per mount.
+    // Equal inode numbers on /data and /nix must never identify the same file.
+    uint64_t minor = mnt->cacheNamespace;
+    st->dev = (254ULL << 8) | (minor & 0xff) | ((minor & ~0xffULL) << 12);
     st->atime = {data.i_atime, 0};
     st->mtime = {data.i_mtime, 0};
     st->ctime = {data.i_ctime, 0};
@@ -1859,7 +1863,7 @@ static int Ext2FileStat(Vnode* vn, VnodeStat* st)
     bool ok = Ext2ReadInode(fp->mnt, fp->inode, &data);
     KRwLockReadUnlock(&g_ext2Lock);
     if (!ok) return -5;
-    Ext2FillStat(st, fp->inode, data);
+    Ext2FillStat(st, fp->mnt, fp->inode, data);
     return 0;
 }
 
@@ -1938,7 +1942,7 @@ static int Ext2DirStat(Vnode* vn, VnodeStat* st)
     bool ok = Ext2ReadInode(dp->mnt, dp->inode, &data);
     KRwLockReadUnlock(&g_ext2Lock);
     if (!ok) return -5;
-    Ext2FillStat(st, dp->inode, data);
+    Ext2FillStat(st, dp->mnt, dp->inode, data);
     return 0;
 }
 
@@ -2510,7 +2514,7 @@ static int Ext2FsStatPath(void* mountPriv, uint8_t pdrv,
 
     KRwLockReadUnlock(&g_ext2Lock);
 
-    Ext2FillStat(st, ino, inodeData);
+    Ext2FillStat(st, mnt, ino, inodeData);
     return 0;
 }
 
@@ -2532,7 +2536,7 @@ static int Ext2FsLstatPath(void* mountPriv, uint8_t pdrv,
             return -1;
         }
         KRwLockReadUnlock(&g_ext2Lock);
-        Ext2FillStat(st, EXT2_ROOT_INO, inodeData);
+        Ext2FillStat(st, mnt, EXT2_ROOT_INO, inodeData);
         return 0;
     }
 
@@ -2553,7 +2557,7 @@ static int Ext2FsLstatPath(void* mountPriv, uint8_t pdrv,
 
     KRwLockReadUnlock(&g_ext2Lock);
 
-    Ext2FillStat(st, ino, inodeData);
+    Ext2FillStat(st, mnt, ino, inodeData);
     return 0;
 }
 

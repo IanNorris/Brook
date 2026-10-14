@@ -234,3 +234,12 @@ together. Existing open holders prevent unmount. Full concurrent mount-operation
 leases remain a separate follow-up. This gate does not claim crash atomicity
 or recovery from injected partial I/O failures; initial creation writes and
 failed rollback writes need further audit.
+
+Fresh clean-image preparation also exposed false cross-mount file identity:
+coreutils `cat` rejected `/nix/index/packages.idx` as its `/data` output because
+both files had equal inode numbers and stat hardcoded device 1. Ext2 now
+reports a unique virtual device per mount; statx reports the matching major
+and minor. The five-check `devicecheck /data /nix` probe passes with both
+roots at inode 2 and distinct devices, and the host suite passes 13/13.
+This extends `VnodeStat` and advances the combined module ABI to **5**; use
+a matching kernel and rebuilt modules.
