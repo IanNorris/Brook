@@ -44,6 +44,24 @@ pipe and full dump manifests are still outstanding.
 | RUN-01 | LibreOffice wrapper/DBus bootstrap | Real wrapper creates its runtime directory and opens Writer; investigate `/tmp`/mkdir behavior without bypassing the wrapper. |
 | RUN-02 | Player source/window geometry and audio stutter | Preserve 720p aspect ratio and verify playback under frame load; use VM-04 captures and guest timing counters to locate periodic stutter. |
 | RUN-03 | NVIDIA backend comparison and later Venus work | Compare the same controlled scenario after Intel behavior is understood; explicitly confirm hardware renderer and selected node. Venus follows GL correctness/control work. |
+| RUN-04 | Quake relative mouse input and capture (after package-install fixes) | Capture the pointer while playing in the native SDL VM window, deliver continuous relative motion without desktop-edge clipping, and release capture on an explicit escape action, focus loss or app exit. Verify aiming and menus with the user; inspect guest Wayland relative-pointer/pointer-lock support and the QEMU input path. |
+
+RUN-04 recovery check: all surviving refs were searched by commit message and
+code history for relative-pointer, pointer-constraints and SDL relative-mouse
+entry points. `5e392af` (Wayland input grabber/routing) is already an ancestor of
+main and does not implement pointer locking. No surviving Wayland protocol
+implementation for capture was found; the earlier experiment notes also list
+relative-pointer support as absent. The Quake 1 port's SDL call is a client of
+capture, rather than a compositor implementation to recover.
+
+REC-01 overnight check: stable inode reporting (`8592ff2`), trailing-slash
+resolution (`b5cb813`) and the sleeping-lock ownership/spurious-wakeup fixes
+are already merged. The rename destination-inode cleanup (`d9bbaf5`) remains
+unmerged and the corresponding orphaning code is still present. That patch
+needs same-inode/hardlink no-op, destination type/emptiness and open-file
+lifetime validation before adoption. The package-install reproduction also
+exposed separate ext2 sector-accounting and stale superblock-total defects;
+fixing those is not evidence that the rename problem is resolved.
 
 ### Bridge validation follow-up
 
@@ -72,3 +90,44 @@ the recovered probe reproduces per-window text input remaining disabled while
 physical key events are correct. REC-03 retains intermittent GL3 startup/user
 faults and UI/text corruption; one new seed run faulted at RIP=0 during graphics
 initialization and is preserved under `build/vm-bridge/651ab826f9c5497ba7e41c6eb9a69025/`.
+
+### Overnight package/runtime follow-up
+
+Ladybird installed and rendered HTTPS pages through guest `nix-install`.
+The native VLC compatibility build installed through a loopback Nix cache and
+played Big Buck Bunny at 720p with nonzero captured OSS audio on one vCPU.
+Four-vCPU startup still intermittently fails `wl_shm.create_pool` descriptor
+duplication (`7720b42496964487ac23f2225e44d2d0`), despite the separately proven
+shared fd-lock and atomic fcntl-dup fixes. Keep SMP startup under REC-03;
+one-vCPU success is not proof that concurrency is resolved. File-backed writable
+MAP_SHARED, truthful O_TMPFILE support and native ALSA remain follow-ups;
+the VLC build uses memfd and OSS explicitly. OSS3 pause drains queued audio.
+
+Corrected absolute `clock_nanosleep` and monotonic futex deadline conversion
+were required to unfreeze VLC's playback clock. That does not certify the
+intermittent Quake SDL music-tempo symptom as fixed. An OSS delay probe showed
+8192 queued bytes decreasing to 3412 after 750 ms; final drain/tail behavior and
+periodic stutter still need deeper measurement. The native-player two-second
+WAV capture contains nonzero PCM and no entirely silent waveform bins, but
+silence bins alone cannot certify smooth audio.
+
+The close-button test during concurrent Ladybird installation later triggered
+a VLC worker user page fault at RIP `0x1e45703f`, CR2 `0x35000020`; guest TCP
+stopped replying while QMP remained usable. Retain this as a shutdown/load
+case under REC-03/REC-04 (`2ffc99f1d67543a3a4f3cec2b6b6ab9c`). The successful
+playback capture does not certify clean shutdown or simultaneous workload
+stability. The stopped installer image was preserved before host repair.
+
+An alternative VLC launch with `--no-avcodec-dr` also faulted a Wayland-client
+worker on a cold checkpoint boot (`ea0840b5a30047709804b82088d6900b`). That
+setting was removed; the default helper retains the settings demonstrated in
+the successful untraced dual-app run. Video viewport/cropping polish also
+remains outstanding: a narrow noisy strip was visible at the bottom of one
+playback capture. Keep the current player as an experimental baseline.
+
+The shared memfd fork defect was subsequently reproduced and fixed: normal
+and worker-originated fork writes now remain shared, and sustained playback
+stayed correctly rendered across eight helper forks. This supersedes the
+initial bottom-strip/full-frame corruption diagnosis. Window-close still
+faulted a VLC worker after that fix (`2efcc298b41a4c4494a1367c2143c964`), so
+shutdown and SMP startup remain open. The prepared launcher uses one vCPU.

@@ -1,6 +1,7 @@
 # Rebuilding the experiment environment
 
-The current recovered base is `reconcile/gl-stack-to-main` (`e60f80c`). Late
+Recovery started from `reconcile/gl-stack-to-main` (`e60f80c`); the tested
+changes now live on local `main`. Late
 July GL3 fixes were not found in any surviving branch. The GPU-object limit,
 draw-aware submission splitting, and app-context present barrier have now
 been reconstructed from saved observations, rather than recovered as their
@@ -302,3 +303,89 @@ release passes all twelve host tests. A clean GL3 run in session
 virgl and produced a visible capture without host command-buffer errors. This
 validates one startup after the fix, rather than proving every intermittent
 graphics fault resolved. Existing running VMs retain their original driver.
+
+## Guest package installation validation (14 October)
+
+New seeds now compile `nix-fetch`, `nar-unpack`, `nix-install` and `nix-search`
+from current source, include the package index and xz/zstd decompressors, and
+create package-cache and application-index directories. Earlier experiment
+seeds omitted the installer bootstrap. Recreate seeds in a new output directory;
+existing images are not upgraded automatically.
+
+`run /nix/bin/nix-install vlc` installed the indexed VLC 3.0.23-2 closure
+(342 newly downloaded paths). `run /nix/bin/nix-install ladybird` installed
+Ladybird 2026-04-04 with 36 additional paths, including the 173 MB Qt declarative
+archive. Both installations used the guest downloader and NAR extractor.
+Ladybird rendered Example Domain and navigated from example.com to example.org
+through bridge keyboard input. `brook-ladybird` supplies a persistent `/data/home`
+and writable XDG directories with CPU painting and the currently needed database
+and HTTP disk-cache exclusions. This is a baseline browser smoke test, not a
+claim that all browser workloads work.
+
+The downloader now retains long dependency lists, tracks closures beyond 256
+paths, checks existing paths' transitive dependencies, supports zstd and valid
+relative NAR symlinks, and terminates producers when extraction fails. Archive
+transfers have a low-speed timeout instead of a five-minute wall-clock cap.
+Metadata retries start with a fresh buffer; archives do not retry within a
+partially emitted stream. `NIX_CACHE_URL` can select an experiment's local cache.
+
+Runtime checks exposed shared descriptor-lock/duplication and shared `brk`
+corruption, invalid *at syscall forwarding, COW output-buffer rejection, ext2
+sector/free-count accounting, and lost directory entries at `getdents` buffer
+boundaries. The probes in `tools/at-syscall-probe` retain these reproductions.
+The 800-entry indexed-directory mutation test now passes and its synced stopped
+image passes all five `e2fsck -fn` phases. The unmerged rename destination-inode
+patch remains a separate investigation in REC-01.
+
+Evidence is retained outside git in `build/experiments/results/`, including
+`nightly-final-kernel-tests.log`, `nightly-bridge-final-tests.log`,
+`installer-ext2-htree-clean-fsck.log`, and the installation/VM serial logs.
+The [VLC compatibility build](../tools/vlc-brook-pkg/README.md) installed through
+the guest installer and played the 720p movie with native OSS audio on one vCPU.
+Two screenshots show advancing movie frames; a silent-host WAV capture contains
+89,024 stereo frames at 44,100 Hz (2.019 s, RMS 0.0215). Keep `BROOK_SMP=1` for
+this baseline. Four-vCPU startup and shutdown during concurrent installation
+remain unstable and are retained in REC-03/REC-04. This establishes playback,
+not general application or audio-stutter stability.
+
+## Prepared browser/player checkpoint
+
+The local checkpoint `build/experiments/results/apps-ready-20261014` contains
+both guest-installed apps, the current boot shortcuts, and a fresh data disk
+with the original private Quake assets and 720p video fixture. From Brook:
+
+```sh
+nix-shell --run './scripts/run_installed_apps.sh'
+```
+
+This opens a native SDL VM window with one vCPU, silent host audio and the
+bridge enabled. Start Ladybird first, then the VLC media player shortcut, matching the verified
+dual-app launch sequence. In the
+guest terminal:
+
+```sh
+run /nix/profile/bin/brook-ladybird https://example.com
+run --uid 1000 /nix/profile/bin/brook-vlc /data/videos/big-buck-bunny-720p.mov
+```
+
+`BROOK_EXPERIMENT_DISPLAY=headless` selects VNC instead. Set `BROOK_INSTANCE`
+when another VM uses the default instance. The checkpoint is writable; stop
+its VM before launching it again. `BROOK_APPS_RUN` selects another prepared
+run. Original seeds and the installation-test images were preserved; a new
+bootstrap seed is at `build/experiments/seeds-ready-20261014`. Runtime images,
+cache exports, game data and capture artifacts remain ignored by git.
+
+For a fresh checkout, build the kernel and create seeds using the instructions
+above, install Ladybird with guest `nix-install`, and follow the VLC package
+README for its local compatibility cache. The prepared checkpoint is a local
+artifact, not a checked-in disk or a replacement for the reproducible build.
+
+The longer playback check exposed a shared-memory fork defect: the old kernel
+applied COW to memfd buffers and a fork from a worker inherited stale mapping
+records. `sharedcheck.c` first reproduced a child write remaining invisible to
+its parent, then passed ordinary and worker-thread fork cases after the fix.
+Memfd backing now belongs to its object rather than the allocating PID, and
+fork preserves its borrowed PTEs and copied VMA references. Subsequent movie
+captures remained correctly rendered across repeated `xdg-screensaver` helper
+forks. Earlier corrupted captures and shutdown faults remain saved as recovery
+evidence rather than being treated as passing results.
