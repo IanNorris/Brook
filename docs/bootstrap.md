@@ -87,6 +87,22 @@ the test workload's scheduling, not a claim that compilation or Brook as a
 whole became ten times faster. The fresh two-path bootstrap and offline-fsck
 acceptance runs remain outstanding.
 
+The first newly formatted lifetime-test disk exposed two uninitialized ext2
+cache locks. Before the fix, boot stalled in `Ext2ReadInode` with inode-cache
+ticket counters `0xb10cbef0` and `0x000bd7c0`. Explicitly initializing both
+inode and directory-entry cache locks restores fresh-disk boot; 13 host tests
+also pass. The isolated boot-stall disk checked clean before reuse.
+
+On that initially fsck-clean data disk, `filelifecheck` then reports eight
+failed checks before stopping at directory cleanup: open orphan inode reuse,
+lost original contents/link metadata, orphan writes altering a replacement,
+an unfaulted mapping reading replacement contents, overwritten-destination
+link metadata, nonempty rmdir and directory unlink. After a normal synced
+shutdown, `e2fsck -fn` exits 4 and lists unattached inodes from the 32 rename
+replacements. This is the pre-fix baseline, not a completed filesystem gate.
+The before image, serial evidence and offline check are retained under
+`build/experiments/results/ext2-lifetime-20261014`.
+
 ## Compatibility defects found during preparation
 
 The first real Git clone found that BusyBox fallback advertised every unknown

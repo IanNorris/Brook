@@ -2025,12 +2025,14 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
     }
 
     // Inode read cache: 1024 direct-mapped slots. ~256 KB per mount.
+    mnt->inodeCacheLock = SpinLock{};
     mnt->inodeCache = kmalloc(EXT2_INODE_CACHE_SIZE * sizeof(Ext2InodeCacheEntry));
     if (mnt->inodeCache) {
         memset(mnt->inodeCache, 0, EXT2_INODE_CACHE_SIZE * sizeof(Ext2InodeCacheEntry));
     }
 
     // Dirent name cache: 1024 direct-mapped slots. ~108 KB per mount.
+    mnt->direntCacheLock = SpinLock{};
     mnt->direntCache = kmalloc(EXT2_DIRENT_CACHE_SIZE * sizeof(Ext2DirentCacheEntry));
     if (mnt->direntCache) {
         memset(mnt->direntCache, 0, EXT2_DIRENT_CACHE_SIZE * sizeof(Ext2DirentCacheEntry));
