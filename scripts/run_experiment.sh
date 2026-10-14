@@ -45,7 +45,8 @@ export BROOK_DISK_IMG="${run_dir}/boot.img"
 export BROOK_VM_CLONED_DISKS=1
 export BROOK_SKIP_UPDATE_DISK=1
 export BROOK_SMP="${BROOK_SMP:-4}"
-export BROOK_USB_KBD=1
+# PS/2 is the default keyboard, matching 7b0e50a. Preserve explicit caller
+# opt-in for USB experiments rather than overriding the launch default.
 export SERIAL_OPT="-serial file:${run_dir}/serial.log"
 instance="${BROOK_INSTANCE:-98}"
 echo "Run: ${run_dir}"

@@ -1914,7 +1914,7 @@ static void XhciPushKey(uint8_t scancode, bool pressed, uint8_t modifiers)
 
     // Translate scancode → ASCII so the compositor/terminal can use it
     ev.ascii = 0;
-    if (scancode < 128) {
+    if (pressed && scancode < 128) {
         bool shifted = (modifiers & (INPUT_MOD_LSHIFT | INPUT_MOD_RSHIFT)) != 0;
         bool capsLock = false; // TODO: track caps lock state
         char c = shifted ? g_sc1ToAsciiShift[scancode] : g_sc1ToAscii[scancode];

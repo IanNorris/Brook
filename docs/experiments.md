@@ -69,6 +69,10 @@ To reuse a particular run's state, set `BROOK_EXPERIMENT_RUN` to its directory.
 To select other seeds or a monitor/VNC instance, set `BROOK_EXPERIMENT_DISKS`
 or `BROOK_INSTANCE`. Stop its VM before reusing a run directory.
 
+The default keyboard is PS/2. `BROOK_USB_KBD=1` explicitly adds a USB keyboard
+for USB testing. The experiment runner does not enable USB input automatically. Set
+`BROOK_USB_KBD=0` and `BROOK_USB_MOUSE=0` to disable inherited USB toggles.
+
 `quake-gl3` selects hardware virgl and GPU composition by default, and requests
 an actual 1280×720 drawable using `r_mode=-1`, `r_customwidth`, and
 `r_customheight`. The older software scenario's `vid_width`/`vid_height` do
@@ -170,3 +174,25 @@ timestamps, queue-depth and underrun telemetry. Waveforms and sample-arrival
 timelines can then distinguish missing guest audio from host playback delays;
 capture should also work while host playback is muted. This MCP is planned,
 not yet implemented.
+
+## Terminal input regression, 14 October 2026
+
+The old USB-default fix `7b0e50a` is already included in main; this was not a
+missing branch merge. The recovered experiment runner forced USB keyboard
+attachment back on. A native terminal doubled characters while Mousepad did
+not. Disposable-VM comparison showed `abc123` with PS/2 alone and
+`aabbcc112233` with USB enabled.
+
+The USB driver supplied ASCII on release events, and the terminal forwarded
+nonzero ASCII regardless of event type. The driver now translates characters
+only on press; the terminal also independently accepts character input only
+on press. Releases still reach raw/Wayland consumers. The runner again leaves
+USB input off by default; only an explicit value `1` enables the optional USB
+keyboard/mouse (`0` now really disables them).
+
+Rebuilt the release kernel and xHCI module, updated the boot image and passed
+all twelve host tests. With USB explicitly enabled, the `abc123` terminal
+capture matched the PS/2 baseline byte-for-byte; one Backspace then Shift+Z
+produced `abc12Z`. Raw evidence stays in ignored experiment/bridge directories.
+Existing running VMs retain their old devices and kernel; a new launch is
+required to use these changes.

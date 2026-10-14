@@ -521,6 +521,14 @@ if [ ! -f "${USB_TEST_IMG}" ]; then
     echo "Created 32MB USB test disk"
 fi
 
+USB_INPUT_OPTS=()
+if [ "${BROOK_USB_KBD:-0}" = "1" ]; then
+    USB_INPUT_OPTS+=(-device usb-kbd,bus=xhci.0)
+fi
+if [ "${BROOK_USB_MOUSE:-0}" = "1" ]; then
+    USB_INPUT_OPTS+=(-device usb-mouse,bus=xhci.0)
+fi
+
 QEMU_COMMAND=("${QEMU_BIN:-qemu-system-x86_64}")
 if [ "${VM_BRIDGE}" = "1" ]; then
     if [ -n "${VDE_SOCK}" ]; then
@@ -551,8 +559,7 @@ fi
     -device virtio-rng-pci \
     -device virtio-net-pci,netdev=net0${NIC_MAC_ARG} \
     -device qemu-xhci,id=xhci \
-    ${BROOK_USB_KBD:+-device usb-kbd,bus=xhci.0} \
-    ${BROOK_USB_MOUSE:+-device usb-mouse,bus=xhci.0} \
+    "${USB_INPUT_OPTS[@]}" \
     -drive if=none,id=usbdisk,file="${USB_TEST_IMG}",format=raw,file.locking=off \
     -device usb-storage,bus=xhci.0,drive=usbdisk \
     ${AUDIO_OPTS} \

@@ -1870,7 +1870,9 @@ static void CompositorLoopWM()
             if (!t) continue;
             if (t->child == focused->proc)
             {
-                if (ev.ascii != 0)
+                // Character input comes only from presses, even if a driver
+                // happens to include translated ASCII on a release event.
+                if (ev.type == InputEventType::KeyPress && ev.ascii != 0)
                 {
                     char ch = ev.ascii;
                     TerminalWriteInput(static_cast<int>(ti), &ch, 1);
