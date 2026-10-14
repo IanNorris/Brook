@@ -10,6 +10,7 @@
 #include "panic.h"
 #include "process.h"
 #include "exec_limits.h"
+#include "fpu_irq.h"
 #include "scheduler.h"
 #include "spinlock.h"
 #include "sync/futex_waiter_pool.h"
@@ -305,6 +306,13 @@ extern "C" __attribute__((naked, used)) void BrookSyscallDispatcher()
         "movq %%r15, %%gs:160\n\t"       // -> syscallUserR9
         "mov -48(%%rbp), %%r15\n\t"      // R10 at [rbp-48]
         "movq %%r15, %%gs:168\n\t"       // -> syscallUserR10
+        // Syscalls preserve user vector state even though the C handlers may
+        // use SSE. Reuse the IRQ stack-save convention before the first C
+        // call: R14 retains the unchanged GPR-frame base, R15 the 64-byte
+        // aligned XSAVE area. Both are callee-saved across blocking switches.
+        // At most 1215 additional bytes are reserved on the 256 KiB stack;
+        // the save area sits above the C stack and below the GPR frame.
+        BROOK_FPU_SAVE_IRQ
         "call SyscallSnapshotCurrentC\n\t"
         "mov -24(%%rbp), %%rdi\n\t"      // a0
         "mov -16(%%rbp), %%rsi\n\t"      // a1
@@ -312,19 +320,23 @@ extern "C" __attribute__((naked, used)) void BrookSyscallDispatcher()
         "mov -48(%%rbp), %%rcx\n\t"      // a3 (user R10)
         "mov -32(%%rbp), %%r8\n\t"       // a4
         "mov -40(%%rbp), %%r9\n\t"       // a5
-        "mov -88(%%rbp), %%r15\n\t"      // restore R15 from saved slot
         "sti\n\t"
         "call SyscallDispatchC\n\t"
         "cli\n\t"
         // Check for pending signals before returning to userspace.
         // Pass the saved-register frame and syscall return value.
-        "mov %%rsp, %%rdi\n\t"         // RDI = pointer to SyscallFrame
+        "mov %%r14, %%rdi\n\t"         // original SyscallFrame, above XSAVE area
         "mov %%rax, %%rsi\n\t"         // RSI = syscall result
         "call SyscallCheckSignals\n\t"  // returns new RAX
         "jmp .Lsyscall_return\n\t"
         ".Lsyscall_invalid:\n\t"
         "mov $-38, %%rax\n\t"
         ".Lsyscall_return:\n\t"
+        // XRSTOR uses EDX:EAX as its mask. Preserve the final syscall result
+        // (including rt_sigreturn's restored RAX) in a saved scratch register.
+        "mov %%rax, %%r13\n\t"
+        BROOK_FPU_RESTORE_IRQ
+        "mov %%r13, %%rax\n\t"
         "pop %%rbx\n\t"                // [16]
         "pop %%r15\n\t"                // [15]
         "pop %%r14\n\t"                // [14]

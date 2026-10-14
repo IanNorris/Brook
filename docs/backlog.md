@@ -239,3 +239,9 @@ accounting: the shared unlink path decrements a directory's link count only
 once, leaving its `.` reference allocated after removal. Test empty/nonempty
 rmdir and parent link counts with offline fsck. Access variants still do not
 evaluate requested permission bits; classic relative readlink needs a cwd audit.
+
+The bootstrap SIMD probe exposed syscall entry clobbering user XMM/YMM state:
+anonymous mmap and brk zero-fill used XMM0 without preserving it. Stack XSAVE/
+XRSTOR now protects ordinary syscall entry/return and blocking switches. Audit
+fork's inherited vector snapshot and signal ucontext FP-state restoration
+separately; the syscall guard does not implement those broader semantics.

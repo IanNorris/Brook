@@ -178,3 +178,23 @@ not establish that unsupported ftruncate can simply start failing without
 additional caller work. Validate the actual guest linker output as a nonempty,
 parseable ELF after testing the rejection; a successful linker exit alone is
 insufficient. No shared regular-file persistence is claimed by this fallback.
+
+`syscallstatecheck.c` checks all 16 XMM registers and, when CPUID/XGETBV permit,
+all 16 YMM registers across raw Linux syscall instructions. Register loads,
+syscall and stores are in a single inline-assembly block, so C calling
+conventions cannot explain a mismatch. It covers getpid, mmap zero-fill, brk
+growth/restoration, pipe write/read, clock_gettime and a short blocking
+nanosleep. Compile normally without `-mavx`; AVX instructions are explicitly
+gated. Expect `SYSCALLSTATECHECK PASS failures=0`; failures report a register
+bitmask and first differing byte. This establishes a syscall register-state
+defect, not the cause of any particular application crash. Signal-handler FP
+restoration and fork-state inheritance need separate coverage.
+
+The syscall-entry fix uses the existing IRQ XSAVE/XRSTOR convention (x87,
+SSE and AVX, mask 7). It reserves at most 1215 bytes below the unchanged saved
+GPR frame on the 256 KiB kernel stack. Callee-saved registers retain both
+frame pointers through blocking/context switches; signal-return processing
+still receives the original GPR frame, and the final RAX is preserved across
+XRSTOR's mask setup. Fresh exec and fork-child trampoline paths do not return
+through the parent's saved syscall frame. Re-run waitcheck, execcheck and
+childsignalcheck alongside the vector sentinel probe after changing this path.
