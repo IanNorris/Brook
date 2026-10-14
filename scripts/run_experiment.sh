@@ -42,6 +42,7 @@ if [ ! -f "${run_dir}/boot.img" ]; then
     cp --reflink=auto --sparse=always "${source_boot}" "${run_dir}/boot.img"
 fi
 export BROOK_DISK_IMG="${run_dir}/boot.img"
+export BROOK_VM_CLONED_DISKS=1
 export BROOK_SKIP_UPDATE_DISK=1
 export BROOK_SMP="${BROOK_SMP:-4}"
 export BROOK_USB_KBD=1

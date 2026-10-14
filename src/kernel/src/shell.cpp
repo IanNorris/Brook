@@ -1140,7 +1140,7 @@ static int ExecCommand(int argc, const char* const* argv)
             proc->fds[2].type = FdType::DevNull;
             proc->fds[2].handle = nullptr;
         }
-        return 0;
+        return proc ? static_cast<int>(proc->pid) : -1;
     }
 
     // Built-in: wait — block until all user processes finish
@@ -1665,6 +1665,17 @@ static int ReadInteractiveLine(char* buf, uint32_t maxLen)
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+int ShellLaunchCommand(const char* command)
+{
+    if (!command || StrLen(command) >= MAX_LINE) return -1;
+    char line[MAX_LINE];
+    StrCopy(line, command, sizeof(line));
+    const char* argv[MAX_ARGS];
+    int argc = ParseLine(line, argv, MAX_ARGS);
+    if (argc < 2 || !StrEq(argv[0], "run")) return -1;
+    return ExecCommand(argc, argv);
+}
 
 int ShellExecScript(const char* path)
 {

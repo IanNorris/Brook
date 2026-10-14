@@ -15,6 +15,7 @@ VDE_SOCK=""
 NIC_MAC=""
 INSTANCE=""
 NO_AUDIO=0
+VM_BRIDGE="${BROOK_VM_BRIDGE:-0}"
 REAL_ESP=0
 EXTRA_ARGS=()
 for arg in "$@"; do
@@ -46,6 +47,9 @@ for arg in "$@"; do
         --no-audio)
             NO_AUDIO=1
             ;;
+        --bridge)
+            VM_BRIDGE=1
+            ;;
         --int-debug)
             INT_DEBUG=1
             ;;
@@ -66,6 +70,10 @@ for arg in "$@"; do
             ;;
     esac
 done
+
+if [ "${VM_BRIDGE}" = "1" ]; then
+    BROOK_AUDIODEV="${BROOK_AUDIODEV:-none}"
+fi
 
 BUILD_DIR="${ROOT_DIR}/build/${BUILD_TYPE}"
 ESP_DIR="${BUILD_DIR}/esp/EFI/BOOT"
@@ -320,7 +328,7 @@ else
     if [ -n "${INSTANCE}" ]; then
         HOSTFWD_BASE=$((11237 + INSTANCE * 100))
     fi
-    NETDEV_OPT="-netdev user,id=net0,hostfwd=tcp::${HOSTFWD_BASE}-:1234"
+    NETDEV_OPT="-netdev user,id=net0,hostfwd=tcp:127.0.0.1:${HOSTFWD_BASE}-:1234"
 fi
 
 # Per-instance QEMU monitor socket and audio disable
@@ -396,8 +404,8 @@ fi
 #   BROOK_GPU=venus : as gl, plus host-visible blob memory (memfd machine RAM)
 #                     for Vulkan vkMapMemory — the Venus end-to-end target.
 #
-# Screendump still works via the QEMU monitor (egl-headless renders to an
-# offscreen scanout the monitor can capture).
+# egl-headless may not provide an HMP screendump surface. The VM bridge uses
+# guest compositor readback to capture accelerated output instead.
 MEM_BACKEND_OPTS=""
 if [ -n "${BROOK_GPU:-}" ] && [ "${BROOK_GPU}" != "0" ]; then
     GPU_RENDERNODE="${BROOK_RENDERNODE:-/dev/dri/renderD128}"
@@ -513,7 +521,18 @@ if [ ! -f "${USB_TEST_IMG}" ]; then
     echo "Created 32MB USB test disk"
 fi
 
-${QEMU_BIN:-qemu-system-x86_64} \
+QEMU_COMMAND=("${QEMU_BIN:-qemu-system-x86_64}")
+if [ "${VM_BRIDGE}" = "1" ]; then
+    if [ -n "${VDE_SOCK}" ]; then
+        echo "Bridge requires the local guest debug forward (VDE is not supported yet)." >&2
+        exit 1
+    fi
+    QEMU_COMMAND=(python3 "${ROOT_DIR}/tools/vm_bridge/launch.py"
+        --kernel "${KERNEL_ELF}" --disk "${DISK_IMG}" --debug-port "${HOSTFWD_BASE}"
+        --provenance "${BROOK_VM_PROVENANCE:-user}" --scenario "${SCRIPT_NAME:-existing-boot-script}"
+        -- "${QEMU_BIN:-qemu-system-x86_64}")
+fi
+"${QEMU_COMMAND[@]}" \
     -machine q35${MACHINE_MEMBACKEND:-} \
     ${KVM_FLAGS} \
     -smp "${BROOK_SMP:-8}" \

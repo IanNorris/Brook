@@ -20,6 +20,15 @@ volatile uint32_t* CompositorGetPhysFb(uint32_t* stride);
 // Smoothed compositor present rate (frames per second), for the taskbar readout.
 uint32_t CompositorGetFps();
 
+// Recent compositor intervals, not app render times or physical scanout fences.
+struct CompositorTiming {
+    uint32_t count, p50Ms, p90Ms, p95Ms, maxMs;
+    uint64_t tick;
+};
+CompositorTiming CompositorGetTiming();
+const uint32_t* CompositorDebugFrame(uint32_t* width, uint32_t* height,
+                                     uint32_t* stride);
+
 // Allocate a per-process virtual framebuffer of size vfbWidth × vfbHeight.
 // The process sees this as its screen. The compositor blits it 1:1 at
 // (destX, destY) on the physical framebuffer, clipping to screen bounds.

@@ -1,5 +1,8 @@
 # Surviving branch audit — 14 October 2026
 
+Follow-up investigations are now tracked in [backlog.md](backlog.md), deferred
+while VM-only MCP control is the active development focus.
+
 Remote refs were fetched before this review. `origin/main` was `76c3155`;
 the tested recovery base was `origin/reconcile/gl-stack-to-main` at `e60f80c`.
 That reconciliation preserves the hardware virgl stack, GLtron/STK launch

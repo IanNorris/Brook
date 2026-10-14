@@ -24,6 +24,7 @@
 #include "input.h"
 #include "mouse.h"
 #include "shell.h"
+#include "compositor.h"
 
 // External C functions used by debug channel
 extern "C" void MouseGetPosition(int32_t*, int32_t*);
@@ -3069,15 +3070,25 @@ void DebugChannelInit()
 
 // Thread-local override for routing DebugChannelSend responses to
 // whichever socket initiated the command (port 1234 or outbound 9999).
-static int g_debugReplySockOverride = -1;
-
-void DebugChannelSetReplySock(int sock) { g_debugReplySockOverride = sock; }
-void DebugChannelClearReplySock()       { g_debugReplySockOverride = -1; }
+static uint16_t g_debugReplySockets[65536] = {}; // socket+1, scoped by kernel-thread PID
+static int DebugReplySocket()
+{
+    Process* p=ProcessCurrent();
+    uint16_t value=p ? __atomic_load_n(&g_debugReplySockets[p->pid],__ATOMIC_ACQUIRE) : 0;
+    return value ? static_cast<int>(value)-1 : g_debugSockIdx;
+}
+void DebugChannelSetReplySock(int sock) {
+    Process* p=ProcessCurrent();
+    if(p) __atomic_store_n(&g_debugReplySockets[p->pid],static_cast<uint16_t>(sock+1),__ATOMIC_RELEASE);
+}
+void DebugChannelClearReplySock() {
+    Process* p=ProcessCurrent();
+    if(p) __atomic_store_n(&g_debugReplySockets[p->pid],static_cast<uint16_t>(0),__ATOMIC_RELEASE);
+}
 
 void DebugChannelSend(const char* msg)
 {
-    int sock = g_debugReplySockOverride >= 0 ? g_debugReplySockOverride
-                                             : g_debugSockIdx;
+    int sock = DebugReplySocket();
     if (sock < 0) return;
     uint32_t len = 0;
     while (msg[len]) len++;
@@ -3200,9 +3211,79 @@ static bool MatchLogLevel(const char* name, LogLevel* out)
     return false;
 }
 
+static int DebugReplySend(const char* data, uint32_t length)
+{
+    int sock = DebugReplySocket();
+    return sock >= 0 ? SockSend(sock, data, length) : -1;
+}
+
+// Fixed-buffer replies: no dependency on a userspace printf implementation.
+struct BridgeReply {
+    char data[768] = {}; uint32_t size = 0;
+    void text(const char* s) { while (*s && size+1 < sizeof(data)) data[size++]=*s++; }
+    void number(uint64_t v, bool hex=false) {
+        char digits[32]; uint32_t n=0;
+        do {uint32_t d=v%(hex?16:10);digits[n++]=d<10?'0'+d:'a'+d-10;v/=hex?16:10;} while(v);
+        while(n && size+1 < sizeof(data)) data[size++]=digits[--n];
+    }
+    void field(const char* name, uint64_t v) {text("\"");text(name);text("\":");number(v);}
+    void send() {data[size]=0;DebugChannelSend(data);}
+};
+
 void DebugHandleCommand(const char* cmd, uint32_t len)
 {
     (void)len;
+
+    // Request envelopes separate replies from the continuously streamed logs.
+    // Tokens are bounded decimal IDs; no recursive envelopes are accepted.
+    if (cmd[0] == '@') {
+        char token[24]; uint32_t i = 1, n = 0;
+        while (cmd[i] >= '0' && cmd[i] <= '9' && n < sizeof(token)-1)
+            token[n++] = cmd[i++];
+        token[n] = 0;
+        if (!n || cmd[i] != ' ' || cmd[i+1] == '@') return;
+        char marker[64];
+        // Token is decimal-only, so it cannot inject another protocol line.
+        uint32_t p = 0; const char* begin = "BRIDGE_BEGIN ";
+        while (*begin) marker[p++] = *begin++;
+        for (uint32_t j=0;j<n;++j) marker[p++] = token[j];
+        marker[p++]='\n';marker[p]=0;DebugChannelSend(marker);
+        DebugHandleCommand(cmd+i+1, len-i-1);
+        p=0;const char* end="BRIDGE_END ";
+        while (*end) marker[p++]=*end++;
+        for (uint32_t j=0;j<n;++j) marker[p++]=token[j];
+        marker[p++]='\n';marker[p]=0;DebugChannelSend(marker);
+        return;
+    }
+    if (NetStrEq(cmd, "bridge stats")) {
+        uint64_t total = PmmGetRamPageCount(), free = PmmGetFreePageCount();
+        uint32_t count=0,running=0;SchedulerGetProcessCounts(count,running);
+        auto t = CompositorGetTiming();
+        BridgeReply r;r.text("{");r.field("total_memory_bytes",total*4096);
+        r.text(",");r.field("free_memory_bytes",free*4096);
+        r.text(",");r.field("used_memory_bytes",(total-free)*4096);
+        r.text(",");r.field("process_count",count);
+        r.text(",");r.field("running_process_count",running);
+        r.text(",");r.field("sample_tick_ms",t.tick);
+        r.text(",\"frametimes\":{\"source\":\"compositor_interval\",");r.field("count",t.count);
+        r.text(",");r.field("p50_ms",t.p50Ms);r.text(",");r.field("p90_ms",t.p90Ms);
+        r.text(",");r.field("p95_ms",t.p95Ms);r.text(",");r.field("max_ms",t.maxMs);
+        r.text("}}\n");r.send();return;
+    }
+    if (NetStrEq(cmd, "bridge frame")) {
+        uint32_t w=0,h=0,stride=0,panicStride=0;
+        const uint32_t* frame = CompositorDebugFrame(&w,&h,&stride);
+        auto* panicFrame = CompositorGetPhysFb(&panicStride);
+        BridgeReply r;r.text("{\"address\":\"0x");r.number(reinterpret_cast<uint64_t>(frame),true);
+        r.text("\",");r.field("width",w);r.text(",");r.field("height",h);r.text(",");r.field("stride",stride);
+        r.text(",\"panic_address\":\"0x");r.number(reinterpret_cast<uint64_t>(panicFrame),true);
+        r.text("\",");r.field("panic_stride",panicStride);r.text("}\n");r.send();return;
+    }
+    if (StrStartsWith(cmd,"bridge run ")) {
+        int pid=ShellLaunchCommand(cmd+11);
+        BridgeReply r;r.text("{");r.field("pid",pid>0?pid:0);
+        r.text(",\"launched\":");r.text(pid>0?"true":"false");r.text("}\n");r.send();return;
+    }
 
     // -----------------------------------------------------------------------
     // help — list all commands
@@ -3286,7 +3367,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         buf[p++] = hex[(btns >> 4) & 0xF];
         buf[p++] = hex[btns & 0xF];
         buf[p++] = '\n';
-        SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
+        DebugReplySend( buf, static_cast<uint32_t>(p));
     }
 
     // -----------------------------------------------------------------------
@@ -3320,10 +3401,10 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
                 buf[p++] = snaps[i].name[j];
             buf[p++] = '\'';
             buf[p++] = '\n';
-            SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
+            DebugReplySend( buf, static_cast<uint32_t>(p));
         }
         const char* done = "---\n";
-        SockSend(g_debugSockIdx, done, 4);
+        DebugReplySend( done, 4);
         kfree(snaps);
     }
 
@@ -3359,7 +3440,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             if (oct > 0) buf[p++] = '.';
         }
         buf[p++] = '\n';
-        SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
+        DebugReplySend( buf, static_cast<uint32_t>(p));
     }
 
     // -----------------------------------------------------------------------
@@ -3385,7 +3466,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             for (int j = 0; rh[j]; j++) buf[p++] = rh[j];
             p += UintToStr(buf + p, s.rxCount);
             buf[p++] = '\n';
-            SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
+            DebugReplySend( buf, static_cast<uint32_t>(p));
         }
         DebugChannelSend("---\n");
     }
@@ -3411,7 +3492,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         p += UintToStr(buf + p, static_cast<uint32_t>(heapFree / 1024));
         const char* h4 = " KB\n";
         for (int i = 0; h4[i]; i++) buf[p++] = h4[i];
-        SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
+        DebugReplySend( buf, static_cast<uint32_t>(p));
     }
 
     // -----------------------------------------------------------------------
@@ -3448,7 +3529,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         const char* pn = s.poisonEnabled ? "on" : "off";
         for (int i = 0; pn[i]; i++) buf[p++] = pn[i];
         buf[p++] = '\n';
-        SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
+        DebugReplySend( buf, static_cast<uint32_t>(p));
     }
 
     // -----------------------------------------------------------------------
@@ -3486,7 +3567,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         RtcFormatTaskbar(timeBuf, RtcNowLocal(), false);
         for (int i = 0; timeBuf[i]; i++) buf[p++] = timeBuf[i];
         buf[p++] = '\n';
-        SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
+        DebugReplySend( buf, static_cast<uint32_t>(p));
     }
 
     // -----------------------------------------------------------------------
@@ -3500,7 +3581,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         for (int i = 0; h[i]; i++) buf[p++] = h[i];
         p += UintToStr(buf + p, count);
         buf[p++] = '\n';
-        SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
+        DebugReplySend( buf, static_cast<uint32_t>(p));
     }
 
     // -----------------------------------------------------------------------
@@ -3526,7 +3607,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             const char* ln = levelNames[static_cast<int>(lvl)];
             while (*ln) buf[p++] = *ln++;
             buf[p++] = '\n';
-            SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
+            DebugReplySend( buf, static_cast<uint32_t>(p));
         }
         char buf[64];
         int p = 0;
@@ -3535,7 +3616,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         const char* onoff = KLogRemoteStreamEnabled() ? "ON" : "OFF";
         while (*onoff) buf[p++] = *onoff++;
         buf[p++] = '\n';
-        SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
+        DebugReplySend( buf, static_cast<uint32_t>(p));
     }
 
     // -----------------------------------------------------------------------
@@ -3616,7 +3697,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             p += UintToStr(buf + p, durationMs);
             const char* t = " ms\n";
             for (int i = 0; t[i]; i++) buf[p++] = t[i];
-            SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
+            DebugReplySend( buf, static_cast<uint32_t>(p));
         } else {
             DebugChannelSend("OK: profiler started (indefinite)\n");
         }
@@ -3694,7 +3775,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             resp[p++] = ',';
             p += UintToStr(resp + p, y);
             resp[p++] = '\n';
-            SockSend(g_debugSockIdx, resp, static_cast<uint32_t>(p));
+            DebugReplySend( resp, static_cast<uint32_t>(p));
         }
 
         // inject move X Y — move mouse without clicking
@@ -3743,7 +3824,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             for (int i = 0; h1[i]; i++) resp[p++] = h1[i];
             p += UintToStr(resp + p, sc);
             resp[p++] = '\n';
-            SockSend(g_debugSockIdx, resp, static_cast<uint32_t>(p));
+            DebugReplySend( resp, static_cast<uint32_t>(p));
         }
 
         // inject key SCANCODE [ASCII] — press and release a key
@@ -3778,7 +3859,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             for (int i = 0; h2[i]; i++) resp[p++] = h2[i];
             p += UintToStr(resp + p, ascii);
             resp[p++] = '\n';
-            SockSend(g_debugSockIdx, resp, static_cast<uint32_t>(p));
+            DebugReplySend( resp, static_cast<uint32_t>(p));
         }
 
         // inject type TEXT — type a string (ASCII only, auto-maps to scan codes)
@@ -3851,7 +3932,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             p += UintToStr(resp + p, static_cast<uint32_t>(tlen));
             const char* h2 = " chars\n";
             for (int i = 0; h2[i]; i++) resp[p++] = h2[i];
-            SockSend(g_debugSockIdx, resp, static_cast<uint32_t>(p));
+            DebugReplySend( resp, static_cast<uint32_t>(p));
         }
 
         // inject sleep MS — pause for MS milliseconds (for automation scripts)
@@ -3933,7 +4014,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
                 int p = 0;
                 const char* h1 = "inject: combo done\n";
                 for (int j = 0; h1[j]; j++) resp[p++] = h1[j];
-                SockSend(g_debugSockIdx, resp, static_cast<uint32_t>(p));
+                DebugReplySend( resp, static_cast<uint32_t>(p));
             } else {
                 DebugChannelSend("inject combo: usage: inject combo ctrl+a\n");
             }
@@ -3987,7 +4068,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
                 for (int j = 0; f[j]; j++) buf[p++] = f[j];
             }
             buf[p++] = '\n';
-            SockSend(g_debugSockIdx, buf, static_cast<uint32_t>(p));
+            DebugReplySend( buf, static_cast<uint32_t>(p));
         }
         if (count == 0) {
             DebugChannelSend("wm: no windows\n");

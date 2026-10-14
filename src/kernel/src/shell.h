@@ -29,6 +29,10 @@ namespace brook {
 // Returns 0 on success, -1 if the file could not be opened.
 int ShellExecScript(const char* path);
 
+// Launch one command using the boot shell's environment/argument conventions.
+// The line must begin with run; returns the spawned PID or a negative error.
+int ShellLaunchCommand(const char* line);
+
 // Enter the interactive shell.  Reads from the keyboard, executes commands.
 // Never returns (runs until shutdown/reboot).
 [[noreturn]] void ShellInteractive();

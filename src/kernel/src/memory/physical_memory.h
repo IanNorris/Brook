@@ -114,6 +114,8 @@ void PmmDumpPidStats();
 // Statistics — useful for diagnostics and tests.
 uint64_t PmmGetFreePageCount();
 uint64_t PmmGetTotalPageCount();
+// RAM capacity from the boot descriptors, excluding physical holes/MMIO.
+uint64_t PmmGetRamPageCount();
 
 // BRO-179: start the quarantine drain kernel thread. Must be called once after
 // the scheduler is up (so KernelThreadCreate works). Until it runs, freed frames

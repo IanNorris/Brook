@@ -229,12 +229,46 @@ static uint32_t g_presentPeriodMs[PRESENT_STATS_WINDOW] = {};
 static uint32_t g_presentLoopMs  [PRESENT_STATS_WINDOW] = {};
 static uint32_t g_presentStatsIdx      = 0;
 static uint32_t g_presentStatsFilled   = 0;
+static SpinLock g_presentStatsLock;
+static uint64_t g_presentStatsTick = 0;
 static uint64_t g_presentLastLoopTick  = 0;
 static uint64_t g_presentLastReportTick= 0;
 // Smoothed present rate for the taskbar FPS readout. EMA over the present
 // period (frame interval), updated each presented frame; published as whole fps.
 static uint32_t g_smoothedPeriodMsX16  = 0;   // EMA of periodMs, fixed-point <<4
 static volatile uint32_t g_compositorFps = 0;
+
+CompositorTiming CompositorGetTiming()
+{
+    uint32_t periods[PRESENT_STATS_WINDOW];
+    SpinLockAcquire(&g_presentStatsLock);
+    uint32_t n = g_presentStatsFilled;
+    for (uint32_t i = 0; i < n; ++i) periods[i] = g_presentPeriodMs[i];
+    uint64_t tick = g_presentStatsTick;
+    SpinLockRelease(&g_presentStatsLock);
+    for (uint32_t i = 1; i < n; ++i) {
+        uint32_t v = periods[i], j = i;
+        while (j && periods[j-1] > v) { periods[j] = periods[j-1]; --j; }
+        periods[j] = v;
+    }
+    if (!n) return {0, 0, 0, 0, 0, tick};
+    return {n, periods[(n*50+99)/100-1], periods[(n*90+99)/100-1],
+            periods[(n*95+99)/100-1], periods[n-1], tick};
+}
+
+bool CompositorGpuActive();
+const uint32_t* CompositorDebugFrame(uint32_t* w, uint32_t* h, uint32_t* stride)
+{
+    if (CompositorGpuActive()) {
+        const GpuCompositorOps* gpu = GpuCompositorGet();
+        if (!gpu || !gpu->CaptureFull) return nullptr;
+        const uint32_t* frame = gpu->CaptureFull(w, h);
+        *stride = *w;
+        return frame;
+    }
+    *w = g_physFbWidth; *h = g_physFbHeight; *stride = g_backBufStride;
+    return g_backBuffer;
+}
 
 static void PresentStatsReport()
 {
@@ -3018,6 +3052,7 @@ static void CompositorLoop()
     uint64_t loopMs = loopEndTick - loopStartTick;
     if (periodMs > 0)
     {
+        SpinLockAcquire(&g_presentStatsLock);
         uint32_t idx = g_presentStatsIdx % PRESENT_STATS_WINDOW;
         g_presentPeriodMs[idx] = static_cast<uint32_t>(
             periodMs > 0xFFFFFFFFull ? 0xFFFFFFFFu : periodMs);
@@ -3025,6 +3060,8 @@ static void CompositorLoop()
             loopMs > 0xFFFFFFFFull ? 0xFFFFFFFFu : loopMs);
         ++g_presentStatsIdx;
         if (g_presentStatsFilled < PRESENT_STATS_WINDOW) ++g_presentStatsFilled;
+        g_presentStatsTick = loopEndTick;
+        SpinLockRelease(&g_presentStatsLock);
 
         // Update the smoothed FPS for the taskbar. EMA (1/8 weight) over the
         // frame interval; only count plausible intervals (1..1000ms) so a long

@@ -159,6 +159,9 @@ results directory. The host test report is `gl3-host-tests.log`.
 
 ## VM control MCP follow-up
 
+See [vm-control-mcp.md](vm-control-mcp.md) for the Linux plugin research and
+VM-only interface proposal, and [backlog.md](backlog.md) for acceptance criteria.
+
 Once graphics is stable, expose VM-scoped lifecycle controls, keyboard/mouse
 input, GPU readback images, serial/guest logs, and process state through MCP.
 Use selected run directories and the monitor socket so writable experiments

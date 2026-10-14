@@ -42,6 +42,7 @@ static constexpr uint64_t BITMAP_WORDS    = MAX_PHYS_PAGES / 64; // 524288 words
 static uint64_t g_bitmap[BITMAP_WORDS]; // in BSS, starts zeroed
 static uint64_t g_totalPages = 0;       // highest tracked page index
 static uint64_t g_freePages  = 0;
+static uint64_t g_ramPages = 0;
 static uint64_t g_nextHint   = 0;       // search hint for fast sequential alloc
 
 
@@ -620,6 +621,7 @@ void PmmInit(const BootProtocol* proto)
 
     g_freePages  = 0;
     g_totalPages = 0;
+    g_ramPages = 0;
     g_nextHint   = 0;
 
     // Step 2: Determine total tracked page count from the HIGHEST conventional
@@ -630,6 +632,8 @@ void PmmInit(const BootProtocol* proto)
         const MemoryDescriptor& d = proto->memoryMap[i];
         if (d.type == MemoryType::Mmio)    continue;
         if (d.type == MemoryType::Reserved) continue;
+        if (d.type != MemoryType::Framebuffer && d.type != MemoryType::Unusable)
+            g_ramPages += d.pageCount;
         uint64_t endPage = (d.physicalStart / PAGE_SIZE) + d.pageCount;
         if (endPage > g_totalPages) g_totalPages = endPage;
     }
@@ -1429,5 +1433,6 @@ void PmmDumpPidStats()
 
 uint64_t PmmGetFreePageCount()  { return g_freePages;  }
 uint64_t PmmGetTotalPageCount() { return g_totalPages; }
+uint64_t PmmGetRamPageCount() { return g_ramPages; }
 
 } // namespace brook
