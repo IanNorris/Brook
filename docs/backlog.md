@@ -202,7 +202,11 @@ app launchers and recovery commands before retiring BusyBox from existing images
 Bootstrap metadata follow-ups: the chown family still selects the first ext2
 mount and `fchown` is a stub; route ownership changes through VFS path/fd
 callbacks. `mkdir` also ignores its requested mode. General truncate/ftruncate
-support remains incomplete. Keep these separate from the validated file
+support remains incomplete. Writable regular-file MAP_SHARED mappings are now
+rejected with EOPNOTSUPP because their previous eager-copy path silently lost
+output. Implement coherent shared file pages, dirty tracking/writeback and
+real truncate semantics before enabling them; memfd/framebuffer sharing remains
+supported. Keep these separate from the validated file
 creation, chmod and timestamp fixes.
 
 Bootstrap Git retries also exposed ext2 rename-overwrite leaks: replacing

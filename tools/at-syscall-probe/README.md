@@ -161,3 +161,20 @@ a different inode, `--allow-no-reuse` explicitly skips that assertion. Expect
 `MMAPMUTATECHECK PASS failures=0`. The probe closes/unmaps before unlink; it does
 not claim coherent updates to existing private mappings or correct lifetime
 of open-unlinked files.
+
+`sharedfilecheck.c` takes an absolute writable directory. This Brook-specific
+probe expects writable regular-file MAP_SHARED (including SHARED_VALIDATE) to
+fail with EOPNOTSUPP until file writeback is implemented. It verifies private
+writable changes do not persist, private read-only mappings still read the
+file, and two shared memfd mappings still see each other's writes. The file
+is sized with write rather than regular-file ftruncate, which remains a stub.
+Expect `SHAREDFILECHECK PASS failures=0`; the rejection checks intentionally
+fail on Linux, where writable shared file mappings are supported.
+
+LLVM 18's [FileOutputBuffer implementation](https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-18.1.8/llvm/lib/Support/FileOutputBuffer.cpp)
+falls back to an in-memory buffer followed by ordinary file writes when its
+output mmap fails. Its preceding file-resize failure is fatal, so this does
+not establish that unsupported ftruncate can simply start failing without
+additional caller work. Validate the actual guest linker output as a nonempty,
+parseable ELF after testing the rejection; a successful linker exit alone is
+insufficient. No shared regular-file persistence is claimed by this fallback.

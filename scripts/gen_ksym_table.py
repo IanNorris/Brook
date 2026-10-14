@@ -27,7 +27,8 @@ def parse_nm(elf_path):
     nm = shutil.which("llvm-nm") or shutil.which("nm") or "llvm-nm"
     result = run([nm, "--defined-only", "-n", elf_path])
     if result.returncode != 0:
-        print(f"llvm-nm failed: {result.stderr}", file=sys.stderr)
+        print(f"{nm} failed with status {result.returncode}: {result.stderr}",
+              file=sys.stderr)
         sys.exit(1)
 
     func_types = set("TtWw")

@@ -4093,10 +4093,19 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     }
 #endif
 
+    // Regular files have no shared dirty-page/writeback implementation.
+    // Returning an eager private copy here falsely reports successful output
+    // to mmap-based writers (e.g. LLD) while leaving the file empty. Report
+    // the missing capability so callers can fall back to ordinary writes.
+    // MemFd and framebuffer mappings were handled above and remain supported.
+    if ((flags & MAP_SHARED) && (prot & PROT_WRITE) &&
+        fde->type == FdType::Vnode && fde->handle &&
+        static_cast<Vnode*>(fde->handle)->type == VnodeType::File)
+        return -95; // EOPNOTSUPP
+
     // Private, non-writable file mappings are demand-paged.  This avoids
     // synchronously reading large shared libraries/resources at mmap() time.
-    // Writable or shared mappings stay on the existing eager path until Brook
-    // has explicit dirty/COW/writeback semantics.
+    // Writable private and read-only shared mappings use the eager copy path.
     if ((flags & MAP_PRIVATE) && !(flags & MAP_SHARED) && !(prot & PROT_WRITE))
     {
         uint64_t vaddr = pickAddr();
