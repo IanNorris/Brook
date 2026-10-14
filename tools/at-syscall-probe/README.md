@@ -90,3 +90,12 @@ checks directory/write requests cannot use library basename aliases, while
 exact `/boot` prefixes and read-only legacy/Nix library aliases still work.
 Expect `OPENCHECK PASS failures=0`. This is a Brook compatibility probe;
 ordinary Linux does not provide these boot-library aliases.
+
+`accesscheck.c` takes an absolute writable directory (use `/data/tmp` to keep
+directory-fd paths within Brook's existing 63-byte stored-path limit). It calls
+raw `access`, `faccessat` and `faccessat2`, checking relative `.git/config` after
+`chdir`, absolute paths, directory fds with a different cwd, synthetic-file
+existence, dangling symlinks, EMPTY_PATH/EACCESS flags, bad fds/modes/flags,
+oversize paths and strings crossing an unmapped page. Expect `ACCESSCHECK PASS
+failures=0`. Permission-bit and real-versus-effective credential evaluation
+remain unimplemented in Brook; this probe checks pathname/existence semantics.

@@ -6044,33 +6044,72 @@ static int64_t sys_rt_sigtimedwait(uint64_t setAddr, uint64_t infoAddr,
 
 static bool BusyboxStatFallback(const char* path, VnodeStat* vs);
 
-static int64_t sys_access(uint64_t pathAddr, uint64_t, uint64_t,
-                           uint64_t, uint64_t, uint64_t)
+// Existence checks share pathname resolution. Permission-bit evaluation
+// (including real/effective credentials) remains an existing limitation.
+static int64_t AccessAt(int dirfd, uint64_t pathAddr, uint64_t mode, uint64_t flags)
 {
-    char pathBuf[256];
-    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
-    const char* path = pathBuf;
-
-    // Try to open the file to check existence
-    Vnode* vn = VfsOpen(path, 0);
-    if (!vn)
-    {
-        // Check synthetic files (same set as open/stat)
-        static const char* syntheticPaths[] = {
-            "/etc/passwd", "/etc/group", "/etc/shells", "/etc/hostname",
-            "/etc/nsswitch.conf", "/etc/hosts", "/etc/resolv.conf",
-            "/proc/version", nullptr
-        };
-        for (auto** sp = syntheticPaths; *sp; ++sp) {
-            if (StrEq(path, *sp)) return 0;
-        }
-        VnodeStat vs;
-        if (!BusyboxStatFallback(path, &vs))
-            return -ENOENT;
-        return 0;
+    constexpr uint64_t NOFOLLOW = 0x100, EACCESS = 0x200, EMPTY_PATH = 0x1000;
+    if ((mode & ~7ULL) || (flags & ~(NOFOLLOW | EACCESS | EMPTY_PATH))) return -EINVAL;
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+    char path[256];
+    uint32_t length = 0;
+    for (; length < sizeof(path); ++length) {
+        if (!UserBufferReadable(pathAddr + length, 1)) return -EFAULT;
+        path[length] = *reinterpret_cast<const char*>(pathAddr + length);
+        if (!path[length]) break;
     }
-    VfsClose(vn);
-    return 0;
+    if (length == sizeof(path)) return -36; // ENAMETOOLONG; never truncate
+    if (!length) {
+        if (!(flags & EMPTY_PATH)) return -ENOENT;
+        if (dirfd != -100) {
+            FdRef ref(proc, dirfd);
+            return ref.get() ? 0 : -EBADF;
+        }
+        VnodeStat st{};
+        return VfsStatPath(proc->cwd, &st) == 0 ? 0 : -ENOENT;
+    }
+    char resolved[512];
+    const char* lookup = path;
+    if (path[0] != '/') {
+        char prefix[256];
+        if (dirfd == -100) {
+            memcpy(prefix, proc->cwd, sizeof(prefix));
+            prefix[sizeof(prefix) - 1] = 0;
+        } else {
+            FdRef ref(proc, dirfd);
+            FdEntry* entry = ref.get();
+            if (!entry) return -EBADF;
+            if (entry->type != FdType::Vnode || !entry->handle ||
+                static_cast<Vnode*>(entry->handle)->type != VnodeType::Dir) return -ENOTDIR;
+            if (!entry->dirPath[0]) return -EBADF;
+            memcpy(prefix, entry->dirPath, sizeof(entry->dirPath));
+            prefix[sizeof(entry->dirPath) - 1] = 0;
+        }
+        uint32_t pos = 0;
+        while (prefix[pos]) { resolved[pos] = prefix[pos]; ++pos; }
+        if (!pos || resolved[pos-1] != '/') resolved[pos++] = '/';
+        if (pos + length >= sizeof(resolved)) return -36;
+        memcpy(resolved + pos, path, length + 1);
+        lookup = resolved;
+    }
+    VnodeStat st{};
+    int result = (flags & NOFOLLOW) ? VfsLstatPath(lookup, &st) : VfsStatPath(lookup, &st);
+    if (result == 0) return 0;
+    static const char* syntheticPaths[] = {
+        "/etc/passwd", "/etc/group", "/etc/shells", "/etc/hostname",
+        "/etc/nsswitch.conf", "/etc/hosts", "/etc/resolv.conf",
+        "/proc/version", nullptr
+    };
+    for (auto** sp = syntheticPaths; *sp; ++sp)
+        if (StrEq(lookup, *sp)) return 0;
+    return BusyboxStatFallback(lookup, &st) ? 0 : -ENOENT;
+}
+
+static int64_t sys_access(uint64_t pathAddr, uint64_t mode, uint64_t,
+                         uint64_t, uint64_t, uint64_t)
+{
+    return AccessAt(-100, pathAddr, mode, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -8930,7 +8969,9 @@ static int64_t sys_symlink(uint64_t targetAddr, uint64_t linkpathAddr, uint64_t,
     char targetBuf[256], linkBuf[256];
     if (!CopyUserCString(targetAddr, targetBuf, sizeof(targetBuf))) return -EFAULT;
     if (!CopyUserCString(linkpathAddr, linkBuf, sizeof(linkBuf))) return -EFAULT;
-    int r = VfsSymlink(targetBuf, linkBuf);
+    char resolved[512];
+    if (!ResolveAtPath(-100, linkBuf, resolved, sizeof(resolved))) return -ENOENT;
+    int r = VfsSymlink(targetBuf, resolved);
     return (r == 0) ? 0 : static_cast<int64_t>(r);
 }
 
@@ -9921,7 +9962,9 @@ static int64_t sys_rmdir(uint64_t pathAddr, uint64_t, uint64_t,
 {
     char pathBuf[256];
     if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
-    const char* path = pathBuf;
+    char resolved[512];
+    if (!ResolveAtPath(-100, pathBuf, resolved, sizeof(resolved))) return -ENOENT;
+    const char* path = resolved;
 
     if (VfsUnlink(path) == 0) return 0;
 
@@ -9985,8 +10028,11 @@ static int64_t sys_rename(uint64_t oldAddr, uint64_t newAddr, uint64_t,
     char oldBuf[256], newBuf[256];
     if (!CopyUserCString(oldAddr, oldBuf, sizeof(oldBuf))) return -EFAULT;
     if (!CopyUserCString(newAddr, newBuf, sizeof(newBuf))) return -EFAULT;
-    const char* oldPath = oldBuf;
-    const char* newPath = newBuf;
+    char oldResolved[512], newResolved[512];
+    if (!ResolveAtPath(-100, oldBuf, oldResolved, sizeof(oldResolved)) ||
+        !ResolveAtPath(-100, newBuf, newResolved, sizeof(newResolved))) return -ENOENT;
+    const char* oldPath = oldResolved;
+    const char* newPath = newResolved;
 
     if (VfsRename(oldPath, newPath) == 0) return 0;
 
@@ -11743,57 +11789,15 @@ static int64_t sys_prctl(uint64_t option, uint64_t, uint64_t,
 // ---------------------------------------------------------------------------
 
 static int64_t sys_faccessat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
-                              uint64_t, uint64_t, uint64_t)
+                            uint64_t, uint64_t, uint64_t)
 {
-    (void)dirfd; (void)mode;
-    char pathBuf[256];
-    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
-    const char* path = pathBuf;
-
-    // Resolve relative paths
-    char resolved[256];
-    const char* lookup = path;
-    if (path[0] != '/') {
-        Process* proc = ProcessCurrent();
-        uint32_t ci = 0;
-        if (proc && proc->cwd[0]) {
-            for (uint32_t j = 0; proc->cwd[j] && ci < 250; ++j)
-                resolved[ci++] = proc->cwd[j];
-            if (ci > 0 && resolved[ci - 1] != '/')
-                resolved[ci++] = '/';
-        }
-        for (uint32_t j = 0; path[j] && ci < 254; ++j)
-            resolved[ci++] = path[j];
-        resolved[ci] = '\0';
-        lookup = resolved;
-    }
-
-    Vnode* vn = VfsOpen(lookup, 0);
-    if (!vn)
-    {
-        // Check synthetic files
-        static const char* syntheticPaths[] = {
-            "/etc/passwd", "/etc/group", "/etc/shells", "/etc/hostname",
-            "/etc/nsswitch.conf", "/etc/hosts", "/etc/resolv.conf",
-            "/proc/version", nullptr
-        };
-        for (auto** sp = syntheticPaths; *sp; ++sp) {
-            if (StrEq(lookup, *sp)) return 0;
-        }
-        VnodeStat vs;
-        if (!BusyboxStatFallback(lookup, &vs))
-            return -ENOENT;
-        return 0;
-    }
-    VfsClose(vn);
-    return 0;
+    return AccessAt(static_cast<int>(dirfd), pathAddr, mode, 0);
 }
 
 static int64_t sys_faccessat2(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
-                               uint64_t flags, uint64_t, uint64_t)
+                             uint64_t flags, uint64_t, uint64_t)
 {
-    (void)flags;
-    return sys_faccessat(dirfd, pathAddr, mode, 0, 0, 0);
+    return AccessAt(static_cast<int>(dirfd), pathAddr, mode, flags);
 }
 
 // ---------------------------------------------------------------------------

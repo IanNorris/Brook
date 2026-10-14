@@ -226,3 +226,9 @@ invalidation. Open directory paths also truncate at 62 bytes, and unlink frees
 storage still referenced by open vnodes. Add multi-mount mmap, long-dirfd-path
 and unlink-while-open regressions. The phantom Git references were separately
 traced to the missing-directory `/boot/lib` fallback, not proven cache aliasing.
+
+Ext2 directory removal also needs proper empty-directory validation and link
+accounting: the shared unlink path decrements a directory's link count only
+once, leaving its `.` reference allocated after removal. Test empty/nonempty
+rmdir and parent link counts with offline fsck. Access variants still do not
+evaluate requested permission bits; classic relative readlink needs a cwd audit.

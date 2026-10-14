@@ -85,6 +85,18 @@ prefixes; missing directories and unrelated names fail normally. `opencheck`
 passed in Brook, and a fresh guest `git init` plus `git fsck --full` succeeded
 without phantom references. The existing exact `/boot` aliases remain supported.
 
+The main HTTPS clone then succeeded, but submodule update repeatedly registered
+URLs and still considered them uninitialized. Raw `access(".git/config")`
+looked up the file under `/` instead of the caller's cwd, although absolute
+reads and mmap agreed on the valid configuration. Access variants now resolve
+cwd/dirfd paths, and classic symlink/rmdir/rename use cwd too. `accesscheck`
+passed all 26 assertions in Linux and Brook, including relative rename and
+cleanup. Retrying the existing clone fetched both pinned submodules and verified
+`vendor/uefi-headers/Include/Uefi.h` and `src/third_party/fatfs/source/ff.c`.
+
+Access permission-bit evaluation and long stored directory-fd paths remain
+separate limitations; these checks validate pathname resolution and existence.
+
 Runtime evidence is retained under ignored `build/experiments/results/bootstrap-20261014/`
 and `bootstrap-compat-20261014/`, and the VM registry keeps serial logs and the
 actual booted kernel identities. Package payloads, images and logs stay out of git.
