@@ -789,8 +789,8 @@ static void TerminalThreadFn(void* arg)
             if (t->child && t->child->state == ProcessState::Terminated
                 && outPipe->writers == 0)
             {
-                SerialPrintf("TERMINAL: child exited (pid=%u status=%d), closing\n",
-                             t->child->pid, t->child->exitStatus);
+                SerialPrintf("TERMINAL: child exited (pid=%u wait_status=0x%x), closing\n",
+                             t->child->pid, t->child->waitStatus);
                 break;
             }
             continue;

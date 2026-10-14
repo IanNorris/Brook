@@ -3,11 +3,13 @@
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "syscall.h"
+#include "busybox_applets.h"
 #include "cpu.h"
 #include "gdt.h"
 #include "serial.h"
 #include "panic.h"
 #include "process.h"
+#include "exec_limits.h"
 #include "scheduler.h"
 #include "spinlock.h"
 #include "sync/futex_waiter_pool.h"
@@ -377,6 +379,7 @@ static volatile uint64_t g_profPreloadPages = 0;
 
 static constexpr int64_t ENOENT  = 2;
 static constexpr int64_t ESRCH   = 3;
+static constexpr int64_t E2BIG   = 7;
 static constexpr int64_t ECHILD  = 10;
 static constexpr int64_t EPERM   = 1;
 static constexpr int64_t EBADF   = 9;
@@ -4696,7 +4699,7 @@ static int64_t sys_exit_group(uint64_t status, uint64_t, uint64_t,
     // Kill all other threads in this thread group so they don't linger
     // and cause use-after-free on shared resources after the leader exits.
     if (proc)
-        SchedulerKillThreadGroup(proc->tgid, proc);
+        SchedulerKillThreadGroup(proc->tgid, proc, static_cast<int>(status));
 
     // Wake vfork parent if child exits without exec
     if (proc && proc->vforkParent)
@@ -5057,16 +5060,14 @@ static int64_t sys_wait4(uint64_t pidArg, uint64_t statusAddr, uint64_t options,
         if (child)
         {
             int32_t childPid = child->pid;
-            int32_t childStatus = child->exitStatus;
+            int32_t childStatus = child->waitStatus;
 
             if (statusAddr)
             {
-                // Linux wait status encoding: (status & 0xFF) << 8 for normal exit
+                // Termination paths already encode the exit cause. A normal
+                // exit code >=128 must not be mistaken for a signal number.
                 auto* wstatus = reinterpret_cast<int32_t*>(statusAddr);
-                if (childStatus >= 128) // Killed by signal
-                    *wstatus = (childStatus - 128); // Signal number in low byte
-                else
-                    *wstatus = (childStatus & 0xFF) << 8;
+                *wstatus = childStatus;
             }
 
             SchedulerReapChild(child);
@@ -5129,6 +5130,42 @@ static int64_t sys_wait4(uint64_t pidArg, uint64_t statusAddr, uint64_t options,
 // rdi = pathname, rsi = argv[], rdx = envp[]
 // This function does NOT return on success — it enters the new program.
 
+// Copy a NULL-terminated user vector without truncation. Validate pointer
+// slots and each source page before dereferencing; do not scan unchecked user
+// strings or require memory after their terminating NUL to be mapped.
+static int64_t CopyExecVector(uint64_t vectorAddr, const char** values,
+                              int maxCount, char* storage, uint32_t capacity,
+                              int& count, uint32_t& used)
+{
+    count = 0;
+    used = 0;
+    if (!vectorAddr) return 0;
+    for (;;) {
+        uint64_t slot;
+        if (__builtin_add_overflow(vectorAddr, static_cast<uint64_t>(count) * 8, &slot) ||
+            !UserBufferReadable(slot, sizeof(uint64_t))) return -EFAULT;
+        uint64_t source = *reinterpret_cast<const uint64_t*>(slot);
+        if (!source) return 0;
+        if (count == maxCount) return -E2BIG;
+        uint32_t start = used;
+        bool terminated = false;
+        while (!terminated) {
+            if (used == capacity) return -E2BIG;
+            uint32_t chunk = 4096 - (source & 4095);
+            if (chunk > capacity - used) chunk = capacity - used;
+            if (!UserBufferReadable(source, chunk)) return -EFAULT;
+            const char* bytes = reinterpret_cast<const char*>(source);
+            for (uint32_t i = 0; i < chunk; ++i) {
+                char c = bytes[i];
+                storage[used++] = c;
+                if (!c) { terminated = true; break; }
+            }
+            source += chunk;
+        }
+        values[count++] = storage + start;
+    }
+}
+
 static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAddr,
                            uint64_t, uint64_t, uint64_t)
 {
@@ -5161,16 +5198,30 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
     // rebuild must survive the goto. Re-reading user argv on re-entry would
     // discard the rebuild and feed the interpreter the original script's args
     // (breaking nested shebang/makeWrapper wrappers).
-    static constexpr int MAX_EXEC_ARGS = 64;
-    static constexpr int MAX_EXEC_ENVP = 64;
-    static constexpr uint64_t MAX_STR_LEN = 4096;
-
-    const char* kArgv[MAX_EXEC_ARGS];
-    // Kernel-side string storage (simple: one big buffer)
-    static constexpr uint64_t ARG_BUF_SIZE = 16384;
-    char argBuf[ARG_BUF_SIZE];
+    static_assert(EXEC_ARG_BYTES + EXEC_ENV_BYTES +
+                  (EXEC_MAX_ARGS + EXEC_MAX_ENV) * sizeof(char*) < KERNEL_STACK_SIZE / 2,
+                  "exec argument storage must leave room for nested kernel calls");
+    const char* kArgv[EXEC_MAX_ARGS];
+    const char* kEnvp[EXEC_MAX_ENV];
+    char argBuf[EXEC_ARG_BYTES];
+    char envBuf[EXEC_ENV_BYTES];
     uint32_t argBufPos = 0;
+    uint32_t envBufPos = 0;
     int argc = 0;
+    int envc = 0;
+    int64_t copyResult = CopyExecVector(argvAddr, kArgv, EXEC_MAX_ARGS,
+                                       argBuf, sizeof(argBuf), argc, argBufPos);
+    if (copyResult < 0) return copyResult;
+    copyResult = CopyExecVector(envpAddr, kEnvp, EXEC_MAX_ENV,
+                                envBuf, sizeof(envBuf), envc, envBufPos);
+    if (copyResult < 0) return copyResult;
+
+    // Preserve the existing empty-argv convention, using the requested path.
+    if (argc == 0) {
+        argBufPos = strlen(kPath) + 1;
+        memcpy(argBuf, kPath, argBufPos);
+        kArgv[argc++] = argBuf;
+    }
 resolve_path:
     char resolvedPath[256];
     bool found = false;
@@ -5269,7 +5320,10 @@ resolve_path:
             }
         }
 
-        if (useBusybox)
+        const char* applet = kPath;
+        for (const char* p = kPath; *p; ++p)
+            if (*p == '/') applet = p + 1;
+        if (useBusybox && BusyboxHasApplet(applet))
         {
             VnodeStat st;
             static const char* busyboxPaths[] = {
@@ -5310,98 +5364,6 @@ resolve_path:
         ++newExeLen;
     }
     newExePath[newExeLen] = '\0';
-
-    // --- Copy argv from user memory (skip on shebang re-entry; the rebuilt
-    // kArgv/argc from the shebang handler must be preserved) ---
-    if (shebangDepth == 0 && argvAddr)
-    {
-        // Validate argv array is readable (at least one pointer for NULL sentinel)
-        if (!UserBufferReadable(argvAddr, sizeof(char*)))
-            return -EFAULT;
-        auto** userArgv = reinterpret_cast<const char**>(argvAddr);
-        for (int i = 0; i < MAX_EXEC_ARGS - 1; i++)
-        {
-            // Validate next pointer slot is readable
-            if (!UserBufferReadable(argvAddr + i * sizeof(char*), sizeof(char*)))
-                break;
-            const char* arg = userArgv[i];
-            if (!arg) break;
-
-            uint32_t len = 0;
-            while (len < MAX_STR_LEN && arg[len]) len++;
-            if (len == MAX_STR_LEN)
-                SerialPrintf("sys_execve: WARNING arg[%d] truncated at %lu bytes\n",
-                             i, MAX_STR_LEN);
-            if (argBufPos + len + 1 > ARG_BUF_SIZE) {
-                SerialPrintf("sys_execve: WARNING arg buffer full (%u/%lu), "
-                             "dropping args %d+\n", argBufPos, ARG_BUF_SIZE, i);
-                break;
-            }
-
-            for (uint32_t j = 0; j < len; j++)
-                argBuf[argBufPos + j] = arg[j];
-            argBuf[argBufPos + len] = '\0';
-            kArgv[argc] = &argBuf[argBufPos];
-            argBufPos += len + 1;
-            argc++;
-        }
-        // Warn if there are more args beyond MAX_EXEC_ARGS
-        if (argc == MAX_EXEC_ARGS - 1 && userArgv[MAX_EXEC_ARGS - 1])
-            SerialPrintf("sys_execve: WARNING argc=%d hit MAX_EXEC_ARGS=%d, "
-                         "extra args dropped\n", argc, MAX_EXEC_ARGS);
-    }
-
-    // If no argv provided, use the path as argv[0]
-    if (argc == 0)
-    {
-        uint32_t len = 0;
-        while (kPath[len]) len++;
-        if (len + 1 <= ARG_BUF_SIZE)
-        {
-            for (uint32_t j = 0; j <= len; j++)
-                argBuf[j] = kPath[j];
-            kArgv[0] = argBuf;
-            argBufPos = len + 1;
-            argc = 1;
-        }
-    }
-
-    // --- Copy envp from user memory ---
-    const char* kEnvp[MAX_EXEC_ENVP];
-    int envc = 0;
-    char envBuf[ARG_BUF_SIZE];
-    uint32_t envBufPos = 0;
-
-    if (envpAddr)
-    {
-        auto** userEnvp = reinterpret_cast<const char**>(envpAddr);
-        for (int i = 0; i < MAX_EXEC_ENVP - 1; i++)
-        {
-            const char* env = userEnvp[i];
-            if (!env) break;
-
-            uint32_t len = 0;
-            while (len < MAX_STR_LEN && env[len]) len++;
-            if (len == MAX_STR_LEN)
-                SerialPrintf("sys_execve: WARNING env[%d] truncated at %lu bytes\n",
-                             i, MAX_STR_LEN);
-            if (envBufPos + len + 1 > ARG_BUF_SIZE) {
-                SerialPrintf("sys_execve: WARNING env buffer full (%u/%lu), "
-                             "dropping env vars %d+\n", envBufPos, ARG_BUF_SIZE, i);
-                break;
-            }
-
-            for (uint32_t j = 0; j < len; j++)
-                envBuf[envBufPos + j] = env[j];
-            envBuf[envBufPos + len] = '\0';
-            kEnvp[envc] = &envBuf[envBufPos];
-            envBufPos += len + 1;
-            envc++;
-        }
-        if (envc == MAX_EXEC_ENVP - 1 && userEnvp[MAX_EXEC_ENVP - 1])
-            SerialPrintf("sys_execve: WARNING envc=%d hit MAX_EXEC_ENVP=%d, "
-                         "extra env vars dropped\n", envc, MAX_EXEC_ENVP);
-    }
 
     SerialPrintf("sys_execve: envpAddr=0x%lx envc=%d argc=%d path='%s'\n",
                  envpAddr, envc, argc, lookupPath);
@@ -5481,6 +5443,13 @@ resolve_path:
         const char* line = reinterpret_cast<const char*>(elfBuf);
         const char* lineEnd = line + (elfSize < 256 ? elfSize : 256);
         const char* p = line + 2;
+        const char* terminator = p;
+        while (terminator < lineEnd && *terminator != '\n' && *terminator != '\0')
+            ++terminator;
+        if (terminator == lineEnd && elfSize >= 256) {
+            VmmFreePages(bufAddr, bufPages);
+            return -ENOEXEC; // Never execute a truncated interpreter line.
+        }
 
         while (p < lineEnd && (*p == ' ' || *p == '\t')) p++;
 
@@ -5489,8 +5458,11 @@ resolve_path:
         uint32_t interpLen = 0;
         while (p < lineEnd && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r' && *p != '\0')
         {
-            if (interpLen < sizeof(interpPath) - 1)
-                interpPath[interpLen++] = *p;
+            if (interpLen == sizeof(interpPath) - 1) {
+                VmmFreePages(bufAddr, bufPages);
+                return -E2BIG;
+            }
+            interpPath[interpLen++] = *p;
             p++;
         }
         interpPath[interpLen] = '\0';
@@ -5502,13 +5474,17 @@ resolve_path:
         uint32_t interpArgLen = 0;
         while (p < lineEnd && *p != '\n' && *p != '\r' && *p != '\0')
         {
-            if (interpArgLen < sizeof(interpArg) - 1)
-                interpArg[interpArgLen++] = *p;
+            if (interpArgLen == sizeof(interpArg) - 1) {
+                VmmFreePages(bufAddr, bufPages);
+                return -E2BIG;
+            }
+            interpArg[interpArgLen++] = *p;
             p++;
         }
         interpArg[interpArgLen] = '\0';
 
         VmmFreePages(bufAddr, bufPages);
+        if (interpLen == 0) return -ENOEXEC;
 
         SerialPrintf("sys_execve: shebang interp='%s' arg='%s' script='%s'\n",
                      interpPath, interpArg, lookupPath);
@@ -5521,50 +5497,35 @@ resolve_path:
         while (lookupPath[spi] && spi < 255) { scriptPath[spi] = lookupPath[spi]; spi++; }
         scriptPath[spi] = '\0';
 
-        // Shift existing argv[1:] to make room at the front. The old args are
-        // pointers INTO argBuf, which we rewrite from offset 0 below — so we
-        // must value-copy them into a separate buffer first, or re-pushing them
-        // would read clobbered data (the bug that made shebang scripts lose
-        // their arguments, e.g. `bash .real hello` collapsing to `bash hello`
-        // and breaking makeWrapper nix wrappers).
-        static char oldArgBuf[ARG_BUF_SIZE];
-        const char* oldArgv[MAX_EXEC_ARGS];
-        int oldArgc = 0;
-        uint32_t oldArgBufPos = 0;
-        for (int i = 1; i < argc && oldArgc < MAX_EXEC_ARGS - 4; i++)
-        {
-            const char* s = kArgv[i];
-            uint32_t len = 0;
-            while (s[len]) len++;
-            if (oldArgBufPos + len + 1 > ARG_BUF_SIZE) break;
-            for (uint32_t j = 0; j < len; j++) oldArgBuf[oldArgBufPos + j] = s[j];
-            oldArgBuf[oldArgBufPos + len] = '\0';
-            oldArgv[oldArgc++] = &oldArgBuf[oldArgBufPos];
-            oldArgBufPos += len + 1;
-        }
-
-        // Rebuild argBuf and kArgv from scratch
-        argBufPos = 0;
-        argc = 0;
-
-        auto pushArg = [&](const char* s) {
-            uint32_t len = 0;
-            while (s[len]) len++;
-            if (argBufPos + len + 1 > ARG_BUF_SIZE || argc >= MAX_EXEC_ARGS - 1) return;
-            for (uint32_t j = 0; j < len; j++) argBuf[argBufPos + j] = s[j];
-            argBuf[argBufPos + len] = '\0';
-            kArgv[argc++] = &argBuf[argBufPos];
-            argBufPos += len + 1;
+        // All argument strings are packed in argBuf. Move the old argv[1:]
+        // tail once, then adjust its pointers from the end before replacing
+        // argv[0]. No shared scratch buffer or silent loss of trailing args.
+        uint32_t oldHeadBytes = strlen(kArgv[0]) + 1;
+        uint32_t tailBytes = argBufPos - oldHeadBytes;
+        int prefixCount = interpArgLen ? 3 : 2;
+        uint32_t prefixBytes = interpLen + 1 + spi + 1 +
+                               (interpArgLen ? interpArgLen + 1 : 0);
+        if (argc - 1 + prefixCount > EXEC_MAX_ARGS ||
+            prefixBytes + tailBytes > sizeof(argBuf)) return -E2BIG;
+        memmove(argBuf + prefixBytes, argBuf + oldHeadBytes, tailBytes);
+        for (int i = argc - 1; i >= 1; --i)
+            kArgv[i + prefixCount - 1] = argBuf + prefixBytes +
+                                          (kArgv[i] - argBuf - oldHeadBytes);
+        uint32_t prefixPos = 0;
+        int prefixIndex = 0;
+        auto pushPrefix = [&](const char* s, uint32_t bytes) {
+            kArgv[prefixIndex++] = argBuf + prefixPos;
+            memcpy(argBuf + prefixPos, s, bytes);
+            prefixPos += bytes;
         };
-
-        pushArg(interpPath);
-        if (interpArgLen > 0) pushArg(interpArg);
-        pushArg(scriptPath);
-        for (int i = 0; i < oldArgc; i++) pushArg(oldArgv[i]);
+        pushPrefix(interpPath, interpLen + 1);
+        if (interpArgLen) pushPrefix(interpArg, interpArgLen + 1);
+        pushPrefix(scriptPath, spi + 1);
+        argc += prefixCount - 1;
+        argBufPos = prefixBytes + tailBytes;
 
         // Set kPath to the interpreter for path resolution
-        for (uint32_t i = 0; i <= interpLen && i < sizeof(kPath) - 1; i++)
-            kPath[i] = interpPath[i];
+        memcpy(kPath, interpPath, interpLen + 1);
 
         goto resolve_path;
     }
@@ -5576,7 +5537,7 @@ resolve_path:
     // table / file VMAs, causing use-after-free crashes (BRO-091).
     if (proc->tgid && proc->pid == proc->tgid)
     {
-        SchedulerKillThreadGroup(proc->tgid, proc);
+        SchedulerKillThreadGroup(proc->tgid, proc, 128 + 9, 9 /* SIGKILL */);
         // SchedulerKillThreadGroup latches tgidExiting=true on the whole group
         // (including this surviving leader) to stillbirth any racing clone.
         // But execve is a RE-IMAGE, not a group exit: this thread lives on as
@@ -7313,6 +7274,10 @@ static bool BusyboxStatFallback(const char* path, VnodeStat* vs)
         }
     }
     if (!isBinPath) return false;
+    const char* applet = path;
+    for (const char* p = path; *p; ++p)
+        if (*p == '/') applet = p + 1;
+    if (!BusyboxHasApplet(applet)) return false;
 
     static const char* busyboxPaths[] = {
         "/boot/BIN/busybox", "/boot/BIN/BUSYBOX",

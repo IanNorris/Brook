@@ -724,10 +724,17 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
         // which its Phase-2 quiesce-wait requires. Leader-gated: a worker-thread
         // fault being group-fatal needs the leader parent-notify hoisted out of
         // SchedulerExitCurrentProcess first (follow-up).
+        // Record a fatal signal separately from the diagnostic exception
+        // vector, so wait4 reports a crash rather than a normal exit code.
+        int faultSignal = 11; // SIGSEGV: page/protection and other user faults
+        if (vector == 0 || vector == 16 || vector == 19) faultSignal = 8; // SIGFPE
+        else if (vector == 1 || vector == 3) faultSignal = 5; // SIGTRAP
+        else if (vector == 6) faultSignal = 4; // SIGILL
+        else if (vector == 17) faultSignal = 7; // SIGBUS (alignment check)
         if (diagProc && diagProc->pid == diagProc->tgid && !diagProc->isThread)
             brook::SchedulerKillThreadGroup(diagProc->tgid, diagProc,
-                                            -static_cast<int>(vector));
-        brook::SchedulerExitCurrentProcess(-static_cast<int>(vector));
+                                            -static_cast<int>(vector), faultSignal);
+        brook::SchedulerExitCurrentProcess(-static_cast<int>(vector), faultSignal);
         // Never reached.
     }
 

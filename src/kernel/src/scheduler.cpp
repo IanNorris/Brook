@@ -913,7 +913,7 @@ void SchedulerAddProcess(Process* proc)
     if (stillborn)
     {
         proc->state = ProcessState::Terminated;
-        proc->exitStatus = 0;
+        proc->waitStatus = 0;
         __atomic_store_n(&proc->reapable, true, __ATOMIC_RELEASE);
         SerialPrintf("SCHED: thread pid=%u stillborn into exiting tgid=%u\n",
                      proc->pid, proc->tgid);
@@ -1860,7 +1860,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     SchedulerBlock(proc);
 }
 
-[[noreturn]] void SchedulerExitCurrentProcess(int status)
+[[noreturn]] void SchedulerExitCurrentProcess(int status, int terminationSignal)
 {
     uint32_t cpu = ThisCpu();
     Process* proc = g_perCpu[cpu].currentProcess;
@@ -1942,8 +1942,11 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
         proc->fbVirtualSize = 0;
     }
 
-    proc->state = ProcessState::Terminated;
-    proc->exitStatus = status;
+    proc->waitStatus = terminationSignal ? (terminationSignal & 0x7f)
+                                        : ((status & 0xff) << 8);
+    __atomic_store_n(reinterpret_cast<uint8_t*>(&proc->state),
+                     static_cast<uint8_t>(ProcessState::Terminated),
+                     __ATOMIC_RELEASE);
 
     // Wake the parent process if it's blocked (likely in wait4).
     // Also send SIGCHLD to the parent.
@@ -2322,7 +2325,8 @@ void SchedulerFreePid(uint16_t pid)
 // reaped without running.  Called by sys_exit_group before the calling thread
 // calls SchedulerExitCurrentProcess.  Threads that are currently running on
 // another CPU will be caught by the scheduler at the next timer tick.
-void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus)
+void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus,
+                              int terminationSignal)
 {
     Process* targets[MAX_PROCESSES];
     uint32_t count = 0;
@@ -2375,14 +2379,15 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus)
     // reads of heldWriteLock/blockedOnRwLock (BRO-157).  Cleanup is deferred to
     // phase 2, after each thread is confirmed quiesced.
     //
-    // Publish order matters: set exitStatus first, then store state with
+    // Publish order matters: set waitStatus first, then store state with
     // release semantics so a remote CPU that observes Terminated also observes
-    // the matching exitStatus.  state is a single aligned byte (atomic on x86);
+    // the matching waitStatus.  state is a single aligned byte (atomic on x86);
     // the release store adds the compiler/memory barrier the plain store lacked.
     for (uint32_t i = 0; i < count; ++i)
     {
         Process* p = targets[i];
-        p->exitStatus = exitStatus;
+        p->waitStatus = terminationSignal ? (terminationSignal & 0x7f)
+                                         : ((exitStatus & 0xff) << 8);
         __atomic_store_n(reinterpret_cast<uint8_t*>(&p->state),
                          static_cast<uint8_t>(ProcessState::Terminated),
                          __ATOMIC_RELEASE);

@@ -315,7 +315,9 @@ struct Process
     // empties, the leader is never reaped, and the parent's wait/fork loop
     // livelocks (the "Terminated leader keeps creating threads" symptom).
     volatile bool tgidExiting;
-    int32_t exitStatus;      // Exit status (stored when process exits, for wait4)
+    // Linux wait status: normal exit code in bits 8..15, terminating signal
+    // in bits 0..6. Store the cause explicitly; exit(128) is not a signal.
+    int32_t waitStatus;
 
     // CPU time accounting (in LAPIC ticks, ~1ms each)
     volatile uint64_t userTicks;     // Ticks spent in user mode

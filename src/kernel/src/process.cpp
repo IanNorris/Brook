@@ -3,6 +3,7 @@
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "process.h"
+#include "exec_limits.h"
 #include "scheduler.h"
 #include "syscall.h"
 #include "vfs.h"
@@ -433,12 +434,10 @@ static uint64_t SetupUserStack(Process* proc,
     }
 
     // 2. Push environment strings and record pointers
-    static constexpr int MAX_ENV = 64;
-    uint64_t envAddrs[MAX_ENV] = {};
-    if (envc > MAX_ENV)
-        SerialPrintf("SetupUserStack: WARNING envc=%d clamped to MAX_ENV=%d for pid %u\n",
-                     envc, MAX_ENV, proc->pid);
-    for (int i = 0; i < envc && i < MAX_ENV; ++i)
+    // ProcessCreate/ProcessExec validate counts and byte budgets before
+    // allocating or replacing the address space. Preserve every entry.
+    uint64_t envAddrs[EXEC_MAX_ENV] = {};
+    for (int i = 0; i < envc; ++i)
     {
         uint64_t len = 0;
         while (envp[i][len]) ++len;
@@ -446,15 +445,8 @@ static uint64_t SetupUserStack(Process* proc,
     }
 
     // 3. Push argument strings and record pointers
-    // sys_execve accepts up to 63 arguments, plus a possible interpreter arg.
-    static constexpr int MAX_SETUP_ARGS = 64;
-    uint64_t argAddrs[MAX_SETUP_ARGS] = {};
-    if (argc > MAX_SETUP_ARGS) {
-        SerialPrintf("SetupUserStack: WARNING argc=%d clamped to %d for pid %u\n",
-                     argc, MAX_SETUP_ARGS, proc->pid);
-        argc = MAX_SETUP_ARGS;
-    }
-    for (int i = 0; i < argc && i < MAX_SETUP_ARGS; ++i)
+    uint64_t argAddrs[EXEC_MAX_ARGS] = {};
+    for (int i = 0; i < argc; ++i)
     {
         uint64_t len = 0;
         while (argv[i][len]) ++len;
@@ -470,8 +462,7 @@ static uint64_t SetupUserStack(Process* proc,
     //   envp: (envc + 1) slots (including NULL terminator)
     //   argv: (argc + 1) slots (including NULL terminator)
     //   argc: 1 slot
-    int envcClamped = (envc > MAX_ENV) ? MAX_ENV : envc;
-    int totalSlots = 38 + (envcClamped + 1) + (argc + 1) + 1;
+    int totalSlots = 38 + (envc + 1) + (argc + 1) + 1;
     if (totalSlots & 1)
         pushU64(0); // padding to maintain 16-byte alignment
 
@@ -496,9 +487,9 @@ static uint64_t SetupUserStack(Process* proc,
     pushU64(proc->elf.phdrEntSize); pushU64(AT_PHENT);          // AT_PHENT
     pushU64(proc->elf.phdrVaddr); pushU64(AT_PHDR);             // AT_PHDR
 
-    // 6. Push envp array (null-terminated). envcClamped already capped to MAX_ENV.
+    // 6. Push envp array (null-terminated).
     pushU64(0); // envp[envc] = NULL
-    for (int i = envcClamped - 1; i >= 0; --i)
+    for (int i = envc - 1; i >= 0; --i)
         pushU64(envAddrs[i]);
 
     // 7. Push argv array (null-terminated)
@@ -626,6 +617,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
                        int envc, const char* const* envp,
                        const FdEntry* stdFds)
 {
+    if (!ExecArgumentsFit(argc, argv, envc, envp)) return nullptr;
     auto* proc = static_cast<Process*>(kmalloc(sizeof(Process)));
     if (!proc) return nullptr;
 
@@ -1953,6 +1945,7 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
                      uint64_t* outStackPtr)
 {
     if (!proc || proc->isKernelThread) return 0;
+    if (!ExecArgumentsFit(argc, argv, envc, envp)) return 0;
 
     // TLB shootdown replaces the previous CPU pinning workaround for BRO-133.
     // Flush stale TLB entries for the old address space on all remote CPUs
@@ -2133,11 +2126,11 @@ int ProcessSendSignal(Process* proc, int signum)
         // Running on another CPU — it may execute a few more instructions
         // before the next timer tick preempts it. This is acceptable for a
         // hobby OS; a production kernel would use an IPI to force-preempt.
-        proc->exitStatus = 128 + SIGKILL;
+        proc->waitStatus = SIGKILL;
         proc->fbVirtual = nullptr;
         proc->fbVirtualSize = 0;
-        __atomic_store_n(reinterpret_cast<volatile int*>(&proc->state),
-                         static_cast<int>(ProcessState::Terminated),
+        __atomic_store_n(reinterpret_cast<volatile uint8_t*>(&proc->state),
+                         static_cast<uint8_t>(ProcessState::Terminated),
                          __ATOMIC_RELEASE);
         // BRO-173/175: reapable is decoupled from holders; the reaper requires
         // refCount==0 before freeing, so it is safe to mark reapable here.
@@ -2216,11 +2209,11 @@ int ProcessSendSignal(Process* proc, int signum)
                                    signum == 15);
         if (sa.handler == 0 && defaultIsTerminate)
         {
-            proc->exitStatus = 128 + signum;
+            proc->waitStatus = signum;
             proc->fbVirtual = nullptr;
             proc->fbVirtualSize = 0;
-            __atomic_store_n(reinterpret_cast<volatile int*>(&proc->state),
-                             static_cast<int>(ProcessState::Terminated),
+            __atomic_store_n(reinterpret_cast<volatile uint8_t*>(&proc->state),
+                             static_cast<uint8_t>(ProcessState::Terminated),
                              __ATOMIC_RELEASE);
             // BRO-173/175: reapable decoupled from holders (reaper requires
             // refCount==0), so it is safe to mark reapable unconditionally.
@@ -2351,8 +2344,8 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
             // A fatal default signal terminates the whole thread group on
             // Linux. Killing only this thread lets sibling threads run after
             // process-wide teardown has started.
-            SchedulerKillThreadGroup(proc->tgid, proc, 128 + signum);
-            SchedulerExitCurrentProcess(128 + signum);
+            SchedulerKillThreadGroup(proc->tgid, proc, 128 + signum, signum);
+            SchedulerExitCurrentProcess(128 + signum, signum);
         case 17: // SIGCHLD — default is ignore
         case 28: // SIGWINCH — ignore
             return syscallResult;
