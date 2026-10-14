@@ -3256,6 +3256,18 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         marker[p++]='\n';marker[p]=0;DebugChannelSend(marker);
         return;
     }
+    if (NetStrEq(cmd, "bridge sync")) {
+        // Synchronous acknowledgement: a process-launch reply cannot tell
+        // the host whether filesystem metadata has actually been flushed.
+        // Quiesce writing workloads before this command and host shutdown.
+        int result = VfsSync(nullptr);
+        BridgeReply r;
+        r.text("{\"guest_sync_completed\":");
+        r.text(result == 0 ? "true" : "false");
+        // VFS sync hooks currently cannot report individual device failures.
+        r.text(",\"sync_guarantee\":\"best_effort_metadata_flush\"}\n");
+        r.send(); return;
+    }
     if (NetStrEq(cmd, "bridge stats")) {
         uint64_t total = PmmGetRamPageCount(), free = PmmGetFreePageCount();
         uint32_t count=0,running=0;SchedulerGetProcessCounts(count,running);

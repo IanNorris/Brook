@@ -3092,7 +3092,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     if (flags & LINUX_O_TRUNC)  vfsFlags |= VFS_O_TRUNC;
     if (flags & LINUX_O_APPEND) vfsFlags |= VFS_O_APPEND;
 
-    Vnode* vn = VfsOpen(lookupPath, vfsFlags);
+    Vnode* vn = VfsOpenMode(lookupPath, vfsFlags, static_cast<uint16_t>(mode & 07777));
 
     // Fallback: if path starts with /lib/ or /nix/, try /boot/lib/<filename>.
     // Our boot disk is mounted at /boot, but dynamic linkers expect /lib/.
@@ -3104,7 +3104,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         const char* p = lookupPath;
         while (*p && bi + 1 < sizeof(bootPath)) bootPath[bi++] = *p++;
         bootPath[bi] = '\0';
-        vn = VfsOpen(bootPath, vfsFlags);
+        vn = VfsOpenMode(bootPath, vfsFlags, static_cast<uint16_t>(mode & 07777));
 
         // If that fails, try /boot/lib/<basename> for .so files
         if (!vn)
@@ -3117,7 +3117,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
             uint32_t li = 10;
             while (*fname && li + 1 < sizeof(libPath)) libPath[li++] = *fname++;
             libPath[li] = '\0';
-            vn = VfsOpen(libPath, vfsFlags);
+            vn = VfsOpenMode(libPath, vfsFlags, static_cast<uint16_t>(mode & 07777));
         }
     }
 
@@ -7233,6 +7233,12 @@ static void FillStat(LinuxStat* st, const VnodeStat& vs, const Vnode* vn = nullp
     st->st_blocks = (st->st_size + 511) / 512;
     st->st_uid = vs.uid;
     st->st_gid = vs.gid;
+    st->st_atime_sec = vs.atime.sec;
+    st->st_atime_nsec = vs.atime.nsec;
+    st->st_mtime_sec = vs.mtime.sec;
+    st->st_mtime_nsec = vs.mtime.nsec;
+    st->st_ctime_sec = vs.ctime.sec;
+    st->st_ctime_nsec = vs.ctime.nsec;
 
     // Use real mode from VnodeStat if available, otherwise generate from flags
     if (vs.mode)
@@ -10187,7 +10193,7 @@ static int64_t sys_flock(uint64_t fd, uint64_t operation, uint64_t,
 
 // ---------------------------------------------------------------------------
 // sys_chmod (90) / sys_fchmod (91) / sys_fchmodat (268)
-// — apply mode changes to ext2 files
+// — dispatch mode changes through the file's actual mount
 // ---------------------------------------------------------------------------
 
 static int64_t sys_chmod(uint64_t pathAddr, uint64_t mode, uint64_t,
@@ -10195,24 +10201,39 @@ static int64_t sys_chmod(uint64_t pathAddr, uint64_t mode, uint64_t,
 {
     char pathBuf[256];
     if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
-    int rc = brook::Ext2Chmod(pathBuf, static_cast<uint16_t>(mode & 07777));
-    return (rc == -2) ? 0 : rc;
+    if (!pathBuf[0]) return -ENOENT;
+    char resolved[512];
+    if (!ResolveAtPath(-100, pathBuf, resolved, sizeof(resolved))) return -ENOENT;
+    return VfsChmodPath(resolved, static_cast<uint16_t>(mode & 07777));
 }
 
-static int64_t sys_fchmod(uint64_t, uint64_t, uint64_t,
+static int64_t sys_fchmod(uint64_t fd, uint64_t mode, uint64_t,
                            uint64_t, uint64_t, uint64_t)
 {
-    return 0; // TODO: implement via fd lookup
+    Process* proc = ProcessCurrent();
+    FdEntry* entry = proc ? FdGet(proc, static_cast<int>(fd)) : nullptr;
+    if (!entry || !entry->handle) return -EBADF;
+    if (entry->type != FdType::Vnode) return -95; // EOPNOTSUPP
+    return VfsChmod(static_cast<Vnode*>(entry->handle), static_cast<uint16_t>(mode & 07777));
 }
 
 static int64_t sys_fchmodat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
                              uint64_t, uint64_t, uint64_t)
 {
-    (void)dirfd;
     char pathBuf[256];
     if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
-    int rc = brook::Ext2Chmod(pathBuf, static_cast<uint16_t>(mode & 07777));
-    return (rc == -2) ? 0 : rc;
+    if (!pathBuf[0]) return -ENOENT;
+    if (pathBuf[0] != '/' && static_cast<int>(dirfd) != -100) {
+        Process* proc = ProcessCurrent();
+        FdEntry* entry = proc ? FdGet(proc, static_cast<int>(dirfd)) : nullptr;
+        if (!entry || !entry->handle) return -EBADF;
+        if (entry->type != FdType::Vnode ||
+            static_cast<Vnode*>(entry->handle)->type != VnodeType::Dir) return -ENOTDIR;
+    }
+    char resolved[512];
+    if (!ResolveAtPath(static_cast<int>(dirfd), pathBuf, resolved, sizeof(resolved)))
+        return -ENOENT;
+    return VfsChmodPath(resolved, static_cast<uint16_t>(mode & 07777));
 }
 
 // ---------------------------------------------------------------------------
@@ -10261,13 +10282,42 @@ static int64_t sys_fchownat(uint64_t dirfd, uint64_t pathAddr, uint64_t uid,
 }
 
 // ---------------------------------------------------------------------------
-// sys_utimensat (280) — change file timestamps (stub: succeed)
+// sys_utimensat (280) — change file timestamps
 // ---------------------------------------------------------------------------
 
-static int64_t sys_utimensat(uint64_t, uint64_t, uint64_t,
-                              uint64_t, uint64_t, uint64_t)
+static int64_t sys_utimensat(uint64_t dirfd, uint64_t pathAddr, uint64_t timesAddr,
+                              uint64_t flags, uint64_t, uint64_t)
 {
-    return 0; // no-op — we don't track file timestamps yet
+    constexpr uint64_t NOFOLLOW = 0x100;
+    constexpr uint64_t EMPTY_PATH = 0x1000;
+    if (flags & ~(NOFOLLOW | EMPTY_PATH)) return -EINVAL;
+    VnodeTime times[2] = {{0, VFS_UTIME_NOW}, {0, VFS_UTIME_NOW}};
+    if (timesAddr) {
+        struct UserTime { int64_t sec, nsec; };
+        if (!UserBufferReadable(timesAddr, 2 * sizeof(UserTime))) return -EFAULT;
+        const auto* userTimes = reinterpret_cast<const UserTime*>(timesAddr);
+        for (int i = 0; i < 2; ++i) {
+            UserTime value = userTimes[i];
+            if (value.nsec != VFS_UTIME_NOW && value.nsec != VFS_UTIME_OMIT &&
+                (value.nsec < 0 || value.nsec >= 1000000000)) return -EINVAL;
+            times[i] = {value.sec, static_cast<int32_t>(value.nsec)};
+        }
+    }
+    if (times[0].nsec == VFS_UTIME_OMIT && times[1].nsec == VFS_UTIME_OMIT) return 0;
+    char path[256] = {};
+    if (pathAddr && !CopyUserCString(pathAddr, path, sizeof(path))) return -EFAULT;
+    if (!pathAddr || (!path[0] && (flags & EMPTY_PATH))) {
+        if (flags & NOFOLLOW) return -EINVAL;
+        Process* proc = ProcessCurrent();
+        FdEntry* entry = proc ? FdGet(proc, static_cast<int>(dirfd)) : nullptr;
+        if (!entry || !entry->handle || entry->type != FdType::Vnode) return -EBADF;
+        return VfsSetTimes(static_cast<Vnode*>(entry->handle), times);
+    }
+    if (!path[0]) return -ENOENT;
+    char resolved[512];
+    if (!ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
+        return static_cast<int>(dirfd) == -100 ? -ENOENT : -EBADF;
+    return VfsSetTimesPath(resolved, times, (flags & NOFOLLOW) != 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -10421,10 +10471,7 @@ static int64_t sys_statx(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
         return 0;
     }
 
-    VnodeStat st;
-    st.size = 0;
-    st.isDir = false;
-    st.isSymlink = false;
+    VnodeStat st{};
 
     char resolved[256];
     if (!ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
@@ -10443,20 +10490,11 @@ static int64_t sys_statx(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
         : VfsStatPath(resolved, &st);
     if (ret != 0) return -ENOENT;
 
-    // Zero-fill then populate
-    auto* raw = reinterpret_cast<uint8_t*>(stx);
-    memset(raw, 0, sizeof(linux_statx));
-
-    stx->stx_mask = 0x7FF; // STATX_BASIC_STATS
-    stx->stx_blksize = 4096;
-    stx->stx_nlink = 1;
-    // Derive mode from stat info
-    uint16_t mode = st.isDir ? 0040755 : 0100644;
-    if (st.isSymlink) mode = 0120777;
-    stx->stx_mode = mode;
-    stx->stx_ino = 1; // placeholder
-    stx->stx_size = st.size;
-    stx->stx_blocks = (st.size + 511) / 512;
+    // Use the same filesystem metadata as stat/fstatat. Inventing mode0644
+    // made Git reject installed HTTPS helpers; inode1 hid file identities.
+    LinuxStat dst;
+    FillStat(&dst, st);
+    fillStatxFromLinuxStat(dst);
 
     return 0;
 }

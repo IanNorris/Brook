@@ -19,6 +19,13 @@ struct Vnode;
 struct DirEntry;
 struct VnodeStat;
 
+struct VnodeTime {
+    int64_t sec;
+    int32_t nsec;
+};
+static constexpr int32_t VFS_UTIME_NOW = 0x3fffffff;
+static constexpr int32_t VFS_UTIME_OMIT = 0x3ffffffe;
+
 // ---- Vnode operations vtable ----
 struct VnodeOps {
     // Open the vnode; flags are filesystem-defined (e.g. O_RDONLY=0, O_RDWR=2).
@@ -40,6 +47,9 @@ struct VnodeOps {
     // file so callers (e.g. the profiler) can make a long-lived file durable
     // mid-write without closing it.
     int (*fsync)  (Vnode* vn);
+    // Optional timestamp mutation; times are atime, mtime, with NOW/OMIT.
+    int (*set_times)(Vnode* vn, const VnodeTime* times) = nullptr;
+    int (*chmod)(Vnode* vn, uint16_t mode) = nullptr;
 };
 
 struct Vnode {
@@ -64,6 +74,9 @@ struct VnodeStat {
     uint16_t mode;       // Full mode (type + permissions, e.g. S_IFREG | 0644)
     bool     isDir;
     bool     isSymlink;
+    VnodeTime atime{};
+    VnodeTime mtime{};
+    VnodeTime ctime{};
 };
 
 // ---- VFS open flags ----
@@ -123,6 +136,12 @@ struct VfsFsOps {
     // for filesystems that always write synchronously.  Called from the
     // VFS sync path (sys_sync / sys_fsync / unmount).
     void (*sync)(void* mountPriv);
+    int (*set_times)(void* mountPriv, uint8_t pdrv, const char* relPath,
+                     const VnodeTime* times, bool nofollow) = nullptr;
+    Vnode* (*open_mode)(void* mountPriv, uint8_t pdrv, const char* relPath,
+                       int flags, uint16_t mode) = nullptr;
+    int (*chmod)(void* mountPriv, uint8_t pdrv, const char* relPath,
+                 uint16_t mode) = nullptr;
 };
 
 // Register a filesystem driver with the VFS.
@@ -173,6 +192,8 @@ VfsFsSnapshot VfsFsSnapshotAt(uint32_t idx);
 // Open a file or directory.  Caller owns the returned Vnode*; call VfsClose().
 // Returns nullptr on error.
 extern "C" Vnode* VfsOpen(const char* path, int flags = 0);
+// Creation mode is used only for a new inode; the filesystem applies umask.
+Vnode* VfsOpenMode(const char* path, int flags, uint16_t mode);
 
 // Read from a file vnode.  Wrapper around vn->ops->read.
 extern "C" int VfsRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset);
@@ -191,6 +212,11 @@ extern "C" int VfsStatPath(const char* path, VnodeStat* st);
 
 // Lstat by path — like VfsStatPath but does not follow the final symlink.
 extern "C" int VfsLstatPath(const char* path, VnodeStat* st);
+
+int VfsSetTimes(Vnode* vn, const VnodeTime* times);
+int VfsSetTimesPath(const char* path, const VnodeTime* times, bool nofollow);
+int VfsChmod(Vnode* vn, uint16_t mode);
+int VfsChmodPath(const char* path, uint16_t mode);
 
 // Delete a file by path.
 int VfsUnlink(const char* path);

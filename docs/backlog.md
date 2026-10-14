@@ -190,3 +190,17 @@ state and validate reset/reboot semantics. Restarting the owned QEMU process
 provided clean benchmark boots. Quake process teardown also emitted map-count
 underflow/user faults during an overlapping-process experiment; keep those
 reproductions separate from the successful single-process demo comparisons.
+## Replace BusyBox command fallbacks
+
+At the user's request, backlog removing the synthetic BusyBox applet paths and
+shipping real Linux utilities instead. The bootstrap SDK already supplies
+coreutils, GNU grep/sed and findutils. Define a minimal default closure with
+working `/bin/sh` and `/usr/bin/env`, update fresh-image provisioning and PATH
+handling, then remove the stat/exec fallback together. Check terminal scripts,
+app launchers and recovery commands before retiring BusyBox from existing images.
+
+Bootstrap metadata follow-ups: the chown family still selects the first ext2
+mount and `fchown` is a stub; route ownership changes through VFS path/fd
+callbacks. `mkdir` also ignores its requested mode. General truncate/ftruncate
+support remains incomplete. Keep these separate from the validated file
+creation, chmod and timestamp fixes.

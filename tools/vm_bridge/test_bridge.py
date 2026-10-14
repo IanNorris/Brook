@@ -25,6 +25,90 @@ class CpuSelectionTests(unittest.TestCase):
                                          {"command-line": "info registers", "cpu-index": 3})
 
 
+class ShutdownSyncTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def fixture(self, reply=None, error=None):
+        events = []
+        class FakeQMP:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def call(self, command): events.append(command)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 's').mkdir()
+            log = root / 'serial.log'
+            log.write_text('old boot\n')
+            data = {'generation': 'before', 'serial_log': str(log)}
+            @contextlib.contextmanager
+            def lock(_): yield data
+            def guest(_, command, timeout):
+                events.append(command)
+                self.assertEqual(timeout, 30)
+                if error is not None: raise error
+                return reply
+            with patch.object(server, 'REGISTRY', root), \
+                 patch.object(server, 'session_lock', lock), \
+                 patch.object(server, 'guest', guest), \
+                 patch.object(server, 'QMP', lambda _: FakeQMP()):
+                yield events, data, root
+
+    def test_stop_and_reset_wait_for_sync(self):
+        for action, qmp in [('stop', 'quit'), ('reset', 'system_reset')]:
+            with self.subTest(action=action), self.fixture({'guest_sync_completed': True}) as (events, data, root):
+                result = server.control('s', action)
+                self.assertEqual(events, ['bridge sync', qmp])
+                self.assertIs(result['guest_sync_completed'], True)
+                if action == 'reset':
+                    self.assertNotEqual(data['generation'], 'before')
+                    self.assertTrue((root / 's' / 'session.json').exists())
+
+    def test_missing_or_negative_ack_blocks_qmp(self):
+        for reply in [None, [], {}, {'launched': True}, {'guest_sync_completed': False},
+                      {'guest_sync_completed': 1}]:
+            for action in ['stop', 'reset']:
+                with self.subTest(reply=reply, action=action), self.fixture(reply) as (events, data, _):
+                    with self.assertRaisesRegex(RuntimeError, 'aborted before QMP'):
+                        server.control('s', action)
+                    self.assertEqual(events, ['bridge sync'])
+                    self.assertEqual(data['generation'], 'before')
+
+    def test_unreachable_or_panicked_guest_requires_explicit_force(self):
+        for error in [TimeoutError('unknown completion'), ConnectionError('unreachable'),
+                      RuntimeError('Guest has panicked')]:
+            for action, qmp in [('stop', 'quit'), ('reset', 'system_reset')]:
+                with self.subTest(error=error, action=action), self.fixture(error=error) as (events, _, _):
+                    with self.assertRaisesRegex(RuntimeError, 'force=true'):
+                        server.control('s', action)
+                    self.assertEqual(events, ['bridge sync'])
+                    events.clear()
+                    result = server.control('s', action, force=True)
+                    self.assertEqual(events, ['bridge sync', qmp])
+                    self.assertIs(result['guest_sync_completed'], False)
+                    self.assertIs(result['forced'], True)
+                    self.assertEqual(result['sync_error'], str(error))
+
+    def test_force_still_syncs_reachable_guest(self):
+        with self.fixture({'guest_sync_completed': True}) as (events, _, _):
+            result = server.control('s', 'stop', force=True)
+            self.assertEqual(events, ['bridge sync', 'quit'])
+            self.assertIs(result['guest_sync_completed'], True)
+
+    def test_pause_resume_do_not_require_guest(self):
+        with self.fixture(error=AssertionError('unexpected guest request')) as (events, _, _):
+            server.control('s', 'pause')
+            server.control('s', 'resume')
+            self.assertEqual(events, ['stop', 'cont'])
+
+    def test_force_is_typed_and_limited_to_shutdown(self):
+        with patch.object(server, 'session_lock') as lock:
+            for force in ['true', 1, None]:
+                with self.assertRaises(ValueError):
+                    server.call_tool('vm_control', {'session': 's', 'action': 'stop', 'force': force})
+            with self.assertRaises(ValueError):
+                server.control('s', 'pause', force=True)
+            lock.assert_not_called()
+
+
 class Contracts(unittest.TestCase):
     def test_png_pixels(self):
         png=server.png_rgb(2,1,b'\xff\0\0\0\xff\0')

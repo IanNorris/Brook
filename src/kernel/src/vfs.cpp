@@ -149,6 +149,7 @@ static MountEntry* FindMount(const char* absPath, const char** relPath)
 static int VfsLstatPathRaw(const char* path, VnodeStat* st)
 {
     if (!path || !st) return -1;
+    *st = {};
 
     const char* relPath = nullptr;
     MountEntry* mount   = FindMount(path, &relPath);
@@ -449,6 +450,11 @@ VfsFsSnapshot VfsFsSnapshotAt(uint32_t idx)
 
 Vnode* VfsOpen(const char* path, int flags)
 {
+    return VfsOpenMode(path, flags, 0666);
+}
+
+Vnode* VfsOpenMode(const char* path, int flags, uint16_t mode)
+{
     if (!path || !path[0]) return nullptr;
 
     char resolved[512];
@@ -464,8 +470,31 @@ Vnode* VfsOpen(const char* path, int flags)
         return nullptr;
     }
 
-    if (!mount->fsOps || !mount->fsOps->open) return nullptr;
+    if (!mount->fsOps) return nullptr;
+    if (mount->fsOps->open_mode)
+        return mount->fsOps->open_mode(mount->mountPriv, mount->pdrv, relPath, flags, mode);
+    if (!mount->fsOps->open) return nullptr;
     return mount->fsOps->open(mount->mountPriv, mount->pdrv, relPath, flags);
+}
+
+int VfsChmod(Vnode* vn, uint16_t mode)
+{
+    if (!vn) return -9;
+    if (!vn->ops || !vn->ops->chmod) return -95;
+    return vn->ops->chmod(vn, mode);
+}
+
+int VfsChmodPath(const char* path, uint16_t mode)
+{
+    if (!path || !path[0]) return -2;
+    char resolved[512];
+    const char* lookup = path;
+    if (VfsResolveSymlinks(path, resolved, sizeof(resolved), true)) lookup = resolved;
+    const char* relPath = nullptr;
+    MountEntry* mount = FindMount(lookup, &relPath);
+    if (!mount) return -2;
+    if (!mount->fsOps || !mount->fsOps->chmod) return -95;
+    return mount->fsOps->chmod(mount->mountPriv, mount->pdrv, relPath, mode);
 }
 
 int VfsRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
@@ -497,9 +526,10 @@ int VfsReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
 
 int VfsStat(Vnode* vn, VnodeStat* st)
 {
-    if (!vn || !vn->ops->stat) return -1;
+    if (!vn || !vn->ops->stat || !st) return -1;
+    *st = {};
     int ret = vn->ops->stat(vn, st);
-    if (ret == 0)
+    if (ret == 0 && !st->ino)
         st->ino = vn->cacheId;
     return ret;
 }
@@ -507,6 +537,7 @@ int VfsStat(Vnode* vn, VnodeStat* st)
 int VfsStatPath(const char* path, VnodeStat* st)
 {
     if (!path || !path[0] || !st) return -1;
+    *st = {};
 
     char resolved[512];
     const char* lookup = path;
@@ -524,6 +555,7 @@ int VfsStatPath(const char* path, VnodeStat* st)
 int VfsLstatPath(const char* path, VnodeStat* st)
 {
     if (!path || !st) return -1;
+    *st = {};
 
     char resolved[512];
     const char* lookup = path;
@@ -540,6 +572,27 @@ int VfsLstatPath(const char* path, VnodeStat* st)
     if (mount->fsOps->stat_path)
         return mount->fsOps->stat_path(mount->mountPriv, mount->pdrv, relPath, st);
     return -1;
+}
+
+int VfsSetTimes(Vnode* vn, const VnodeTime* times)
+{
+    if (!vn || !vn->ops || !times) return -22;
+    if (!vn->ops->set_times) return -95; // EOPNOTSUPP
+    return vn->ops->set_times(vn, times);
+}
+
+int VfsSetTimesPath(const char* path, const VnodeTime* times, bool nofollow)
+{
+    if (!path || !path[0] || !times) return -22;
+    char resolved[512];
+    const char* lookup = path;
+    if (VfsResolveSymlinks(path, resolved, sizeof(resolved), !nofollow))
+        lookup = resolved;
+    const char* relPath = nullptr;
+    MountEntry* mount = FindMount(lookup, &relPath);
+    if (!mount || !mount->fsOps) return -2;
+    if (!mount->fsOps->set_times) return -95;
+    return mount->fsOps->set_times(mount->mountPriv, mount->pdrv, relPath, times, nofollow);
 }
 
 int VfsSync(Vnode* vn)

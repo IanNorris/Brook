@@ -53,7 +53,7 @@ launcher with a named scenario, rather than accepting arbitrary host commands.
 | --- | --- |
 | `vm_sessions`, `vm_doctor` | Discover opted-in runs and inspect actual transport/guest capabilities. Select an explicit session. |
 | `vm_start` | Clone seed disks and start `desktop`, `video`, `quake-soft`, `quake-gl3` or `office`; `gpu` is `software` or `gl`. Audio defaults to `none`. |
-| `vm_control` | `pause`, `resume`, `reset`, `stop`, `takeover`, `release`, or controlled `panic`. Reset changes the generation and invalidates frames. |
+| `vm_control` | `pause`, `resume`, `reset`, `stop`, `takeover`, `release`, or controlled `panic`. Stop/reset wait for guest metadata sync; explicit `force: true` permits shutdown when sync cannot complete. Reset changes the generation and invalidates frames. |
 | `vm_observe` | Return PNG and frame ID, native geometry, crop origin and scale. Optional native `crop` and `max_width`; GPU readback plus brief VM pause. |
 | `vm_input` | Ordered key/chord/text/pointer/scroll/relative/hold/wait batches. Coordinates require the current `frame_id`; crop/scale map back to native coordinates. US ASCII text only; holds release at batch end/cancel. Observe to verify reaction. |
 | `vm_logs`, `vm_wait` | Bounded serial/QEMU byte cursors or bounded serial-substring waits. Logs survive VM exit. |
@@ -71,6 +71,21 @@ and keeps observation available. Other mutations are still explicit tools;
 takeover is not a blanket lock on reset or guest execution. A stale descriptor
 or reused QEMU PID is rejected. There is no automatic retry of ambiguous guest
 mutations and no automatic reset after panic.
+
+Stop file-writing workloads before `stop` or `reset`. Both request synchronous
+`bridge sync` and wait up to 30 seconds for its completion reply before sending
+QMP `quit` or `system_reset`. A launch acknowledgement from running a userspace
+`sync` command is insufficient. Missing replies, old kernels without this
+command, paused guests, panic and unreachable guests abort the action. Resume
+a paused guest first when possible. Explicit `force: true` allows the action
+after a failed sync attempt and returns `guest_sync_completed: false` with its
+reason; cached allocation metadata may be lost and filesystems corrupted.
+
+Successful sync returns `guest_sync_completed: true` and
+`sync_guarantee: best_effort_metadata_flush`. Current VFS hooks do not report
+individual device failures or flush physical disk caches. The guest can also
+write again between sync and QMP shutdown, so this requires quiesced writers;
+it does not provide journaled crash recovery or a power-loss guarantee.
 
 ## Crash and audio limitations
 
@@ -98,12 +113,13 @@ ignored experiment disks. They are never included in the plugin package.
 python3 -m unittest discover -s tools/vm_bridge -p "test_*.py" -v
 ```
 
-Twelve bridge contract tests cover fragmented tokenized replies, stdio MCP,
-PNG pixels, cancellation cleanup, input preflight, crop-coordinate mapping,
-reset/panic history, RAM-map selection and resume after failed memory reads.
-Two additional wrapper tests check first-run controls, renderer selection and
-saved preferences. The existing twelve host tests pass, and the changed
-kernel/boot image builds.
+The 26 host tests cover fragmented tokenized replies, stdio MCP, PNG pixels,
+cancellation cleanup, input preflight, crop-coordinate mapping, reset/panic
+history, RAM-map selection and resume after failed memory reads. Shutdown
+tests cover sync-before-QMP ordering, rejection of missing/negative replies,
+timeout/panic/unreachable handling, explicit forced shutdown reporting, and
+unchanged pause/resume behavior. Wrapper tests cover first-run controls,
+startup demos, explicit commands, renderer selection and saved preferences.
 
 Live validation on 14 October 2026 attached to a user-started CPU-rendered VM
 and an agent-started Intel virgl GL3 VM. Captured native 1920×1080 frames and

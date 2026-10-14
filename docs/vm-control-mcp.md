@@ -106,7 +106,7 @@ Names below are proposals, not currently callable tools.
 | `vm_doctor` | Reports detected versus tested capabilities, QEMU/version/render node, guest readiness, input devices, frame/audio backends and limitations. Detection alone never marks a capability verified. |
 | `vm_sessions` | Discovers feature-enabled Brook runs regardless of launcher, with generation, provenance, lifecycle ownership and control-lease state. |
 | `vm_start` | Runs a named Brook scenario on fresh writable clones; hardware profile and initial resolution are explicit; host playback defaults off. |
-| `vm_control` | Pause/resume/reset/stop the selected run; acquire/release control lease; cancel owned jobs. Reset and stop have explicit state-loss semantics. |
+| `vm_control` | Pause/resume/reset/stop the selected run; acquire/release control lease; cancel owned jobs. Stop/reset await synchronous guest metadata sync. Explicit `force: true` allows an unsynced panic/unreachable shutdown and reports `guest_sync_completed: false`. Quiesce writing workloads first. |
 | `vm_observe` | Returns an image content block plus frame ID, native/display/crop geometry, capture time, renderer identity, focus/window state when available and incremental log offsets. |
 | `vm_input` | Executes an ordered batch of typed mouse/key/text/wait actions. Returns acknowledgements, timing and optionally one final observation. Supports cancellation and held-state cleanup. |
 | `vm_logs` | Cursor-based serial/QEMU/app log reads; bounded result sizes, filters, truncation and rotation metadata. Await a match with a deadline rather than repeatedly retrieve entire logs. |

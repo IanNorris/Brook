@@ -48,3 +48,21 @@ strings crossing unmapped pages return `EFAULT`, and a NUL at the final mapped
 byte works. A temporary shebang fixture checks argument preservation and
 interpreter-expansion overflow. Expect `EXECCHECK PASS failures=0`; overflow
 tests use Brook's bounded limits and are not expected to pass on Linux.
+
+`metacheck.c` takes a writable directory and optionally an existing executable
+path (default: its own argv[0], which should be absolute). It checks path/fd/
+statx identity, permissions and timestamps; create/write/O_TRUNC/relatime
+updates; explicit `utimensat`/`futimens`, NOW/OMIT and symlink-nofollow handling.
+Ext2 timestamps have whole-second precision; explicit subsecond values round
+down. Expect `METACHECK PASS failures=0`. Files installed by an older kernel
+can legitimately retain zero on-disk timestamps: repair those with `touch`
+after booting the new kernel, rather than substituting fictional stat times.
+
+`modecheck.c` takes one or more absolute writable directories. Pass directories
+on both the data and Nix ext2 mounts to verify mount routing. It checks 0755
+creation, umask producing 0640, mode-0000 creation, preservation of an existing
+inode's mode, path/fd/cwd/dirfd chmod, followed symlinks, and error propagation.
+When run as root, a child drops its uid/gid to verify non-owner fchmod fails.
+Expect `MODECHECK PASS failures=0`. Existing SDK executables created by the old
+kernel require a targeted permission repair from their NAR executable metadata;
+changing all store files to executable would corrupt the intended modes.

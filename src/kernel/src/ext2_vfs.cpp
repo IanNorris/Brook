@@ -114,6 +114,19 @@ struct Ext2Inode {
 };
 
 static_assert(sizeof(Ext2Inode) == 128, "Ext2Inode size mismatch");
+static constexpr uint32_t EXT2_MAX_TIMESTAMP = 0xffffffffu;
+
+static uint32_t Ext2Now()
+{
+    uint64_t now = RtcNow();
+    return now > EXT2_MAX_TIMESTAMP ? EXT2_MAX_TIMESTAMP : static_cast<uint32_t>(now);
+}
+
+static void Ext2Touch(Ext2Inode* inode, bool created = false)
+{
+    inode->i_mtime = inode->i_ctime = Ext2Now();
+    if (created) inode->i_atime = inode->i_mtime;
+}
 
 struct Ext2DirEntry2 {
     uint32_t inode;
@@ -944,6 +957,7 @@ static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
     if (newEnd > ino->i_size) {
         ino->i_size = static_cast<uint32_t>(newEnd);
     }
+    if (bytesWritten) Ext2Touch(ino);
     Ext2WriteInode(mnt, inoNum, ino);
 
     return static_cast<int>(bytesWritten);
@@ -1068,6 +1082,8 @@ static bool Ext2DirAdd(Ext2Mount* mnt, uint32_t dirIno, Ext2Inode* dirData,
 
                 Ext2WriteBlock(mnt, diskBlock, blockBuf);
                 kfree(blockBuf);
+                Ext2Touch(dirData);
+                Ext2WriteInode(mnt, dirIno, dirData);
                 Ext2DirentCacheInvalidateParent(mnt, dirIno);
                 return true;
             }
@@ -1096,6 +1112,7 @@ static bool Ext2DirAdd(Ext2Mount* mnt, uint32_t dirIno, Ext2Inode* dirData,
 
     // Update directory size
     dirData->i_size = static_cast<uint32_t>(dirSize + mnt->blockSize);
+    Ext2Touch(dirData);
     Ext2WriteInode(mnt, dirIno, dirData);
     Ext2DirentCacheInvalidateParent(mnt, dirIno);
     return true;
@@ -1140,6 +1157,8 @@ static uint32_t Ext2DirRemove(Ext2Mount* mnt, Ext2Inode* dirData,
                     }
                     Ext2WriteBlock(mnt, diskBlock, blockBuf);
                     kfree(blockBuf);
+                    Ext2Touch(dirData);
+                    Ext2WriteInode(mnt, dirIno, dirData);
                     Ext2DirentCacheInvalidateParent(mnt, dirIno);
                     return removedIno;
                 }
@@ -1607,9 +1626,28 @@ static int Ext2FileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
 {
     auto* fp = static_cast<Ext2FilePriv*>(vn->priv);
     KRwLockReadLock(&g_ext2Lock);
-    int r = Ext2ReadInodeData(fp->mnt, &fp->inodeData, buf, len, *offset);
+    Ext2Inode data;
+    if (!Ext2ReadInode(fp->mnt, fp->inode, &data)) {
+        KRwLockReadUnlock(&g_ext2Lock); return -5;
+    }
+    int r = Ext2ReadInodeData(fp->mnt, &data, buf, len, *offset);
     if (r > 0) *offset += r;
     KRwLockReadUnlock(&g_ext2Lock);
+    // Relatime: avoid a metadata write for every read. Re-read under the
+    // exclusive lock so a concurrent write/utimens cannot be overwritten.
+    uint32_t now = Ext2Now();
+    if (r > 0 && data.i_atime != now &&
+        (data.i_atime <= data.i_mtime || data.i_atime <= data.i_ctime ||
+         (now > data.i_atime && now - data.i_atime >= 86400))) {
+        KRwLockWriteLock(&g_ext2Lock);
+        if (Ext2ReadInode(fp->mnt, fp->inode, &data) && data.i_atime != now &&
+            (data.i_atime <= data.i_mtime || data.i_atime <= data.i_ctime ||
+             (now > data.i_atime && now - data.i_atime >= 86400))) {
+            data.i_atime = now;
+            Ext2WriteInode(fp->mnt, fp->inode, &data);
+        }
+        KRwLockWriteUnlock(&g_ext2Lock);
+    }
     return r;
 }
 
@@ -1617,6 +1655,9 @@ static int Ext2FileWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* off
 {
     auto* fp = static_cast<Ext2FilePriv*>(vn->priv);
     KRwLockWriteLock(&g_ext2Lock);
+    if (!Ext2ReadInode(fp->mnt, fp->inode, &fp->inodeData)) {
+        KRwLockWriteUnlock(&g_ext2Lock); return -5;
+    }
     int r = Ext2WriteInodeData(fp->mnt, &fp->inodeData, fp->inode, buf, len, *offset);
     if (r > 0) *offset += r;
     KRwLockWriteUnlock(&g_ext2Lock);
@@ -1629,15 +1670,29 @@ static void Ext2FileClose(Vnode* vn)
     kfree(fp);
 }
 
+static void Ext2FillStat(VnodeStat* st, uint32_t ino, const Ext2Inode& data)
+{
+    st->isDir = (data.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR;
+    st->isSymlink = (data.i_mode & EXT2_S_IFMT) == EXT2_S_IFLNK;
+    st->size = st->isDir ? 0 : Ext2InodeSize(&data);
+    st->ino = ino;
+    st->uid = data.i_uid;
+    st->gid = data.i_gid;
+    st->mode = data.i_mode;
+    st->atime = {data.i_atime, 0};
+    st->mtime = {data.i_mtime, 0};
+    st->ctime = {data.i_ctime, 0};
+}
+
 static int Ext2FileStat(Vnode* vn, VnodeStat* st)
 {
     auto* fp = static_cast<Ext2FilePriv*>(vn->priv);
-    st->size  = Ext2InodeSize(&fp->inodeData);
-    st->isDir = false;
-    st->isSymlink = false;
-    st->uid   = fp->inodeData.i_uid;
-    st->gid   = fp->inodeData.i_gid;
-    st->mode  = fp->inodeData.i_mode;
+    Ext2Inode data;
+    KRwLockReadLock(&g_ext2Lock);
+    bool ok = Ext2ReadInode(fp->mnt, fp->inode, &data);
+    KRwLockReadUnlock(&g_ext2Lock);
+    if (!ok) return -5;
+    Ext2FillStat(st, fp->inode, data);
     return 0;
 }
 
@@ -1710,13 +1765,89 @@ static void Ext2DirClose(Vnode* vn)
 static int Ext2DirStat(Vnode* vn, VnodeStat* st)
 {
     auto* dp = static_cast<Ext2DirPriv*>(vn->priv);
-    st->size  = 0;
-    st->isDir = true;
-    st->isSymlink = false;
-    st->uid   = dp->inodeData.i_uid;
-    st->gid   = dp->inodeData.i_gid;
-    st->mode  = dp->inodeData.i_mode;
+    Ext2Inode data;
+    KRwLockReadLock(&g_ext2Lock);
+    bool ok = Ext2ReadInode(dp->mnt, dp->inode, &data);
+    KRwLockReadUnlock(&g_ext2Lock);
+    if (!ok) return -5;
+    Ext2FillStat(st, dp->inode, data);
     return 0;
+}
+
+// Caller holds g_ext2Lock for writing. Ext2's base inode stores whole seconds;
+// explicit subsecond values are rounded down to that on-disk precision.
+static int Ext2SetInodeTimes(Ext2Mount* mnt, uint32_t ino, const VnodeTime* times)
+{
+    Ext2Inode data;
+    if (!Ext2ReadInode(mnt, ino, &data)) return -5;
+    if (times[0].nsec == VFS_UTIME_OMIT && times[1].nsec == VFS_UTIME_OMIT) return 0;
+    Process* cur = ProcessCurrent();
+    if (cur && cur->euid != 0 && cur->euid != data.i_uid && !mnt->skipPermChecks) {
+        bool bothNow = times[0].nsec == VFS_UTIME_NOW && times[1].nsec == VFS_UTIME_NOW;
+        uint16_t permissions = cur->egid == data.i_gid ? (data.i_mode >> 3) : data.i_mode;
+        if (!bothNow || !(permissions & 2)) return -1; // EPERM
+    }
+    uint32_t now = Ext2Now();
+    for (int i = 0; i < 2; ++i) {
+        if (times[i].nsec != VFS_UTIME_NOW && times[i].nsec != VFS_UTIME_OMIT &&
+            (times[i].sec < 0 || times[i].sec > EXT2_MAX_TIMESTAMP ||
+             times[i].nsec < 0 || times[i].nsec >= 1000000000)) return -22;
+    }
+    if (times[0].nsec != VFS_UTIME_OMIT)
+        data.i_atime = times[0].nsec == VFS_UTIME_NOW ? now : static_cast<uint32_t>(times[0].sec);
+    if (times[1].nsec != VFS_UTIME_OMIT)
+        data.i_mtime = times[1].nsec == VFS_UTIME_NOW ? now : static_cast<uint32_t>(times[1].sec);
+    data.i_ctime = now;
+    return Ext2WriteInode(mnt, ino, &data) ? 0 : -5;
+}
+
+static int Ext2VnodeSetTimes(Vnode* vn, const VnodeTime* times)
+{
+    Ext2Mount* mnt;
+    uint32_t ino;
+    if (vn->type == VnodeType::Dir) {
+        auto* dp = static_cast<Ext2DirPriv*>(vn->priv);
+        mnt = dp->mnt; ino = dp->inode;
+    } else {
+        auto* fp = static_cast<Ext2FilePriv*>(vn->priv);
+        mnt = fp->mnt; ino = fp->inode;
+    }
+    KRwLockWriteLock(&g_ext2Lock);
+    int result = Ext2SetInodeTimes(mnt, ino, times);
+    KRwLockWriteUnlock(&g_ext2Lock);
+    return result;
+}
+
+// Caller holds the filesystem write lock.
+static int Ext2SetInodeMode(Ext2Mount* mnt, uint32_t ino, uint16_t mode)
+{
+    Ext2Inode data;
+    if (!Ext2ReadInode(mnt, ino, &data)) return -5;
+    Process* cur = ProcessCurrent();
+    if (cur && cur->euid != 0) {
+        if (cur->euid != data.i_uid) return -1;
+        if (cur->egid != data.i_gid) mode &= ~02000;
+    }
+    data.i_mode = (data.i_mode & EXT2_S_IFMT) | (mode & 07777);
+    data.i_ctime = Ext2Now();
+    return Ext2WriteInode(mnt, ino, &data) ? 0 : -5;
+}
+
+static int Ext2VnodeChmod(Vnode* vn, uint16_t mode)
+{
+    Ext2Mount* mnt;
+    uint32_t ino;
+    if (vn->type == VnodeType::Dir) {
+        auto* dp = static_cast<Ext2DirPriv*>(vn->priv);
+        mnt = dp->mnt; ino = dp->inode;
+    } else {
+        auto* fp = static_cast<Ext2FilePriv*>(vn->priv);
+        mnt = fp->mnt; ino = fp->inode;
+    }
+    KRwLockWriteLock(&g_ext2Lock);
+    int result = Ext2SetInodeMode(mnt, ino, mode);
+    KRwLockWriteUnlock(&g_ext2Lock);
+    return result;
 }
 
 static const VnodeOps g_ext2FileOps = {
@@ -1727,6 +1858,8 @@ static const VnodeOps g_ext2FileOps = {
     .close   = Ext2FileClose,
     .stat    = Ext2FileStat,
     .fsync   = nullptr,
+    .set_times = Ext2VnodeSetTimes,
+    .chmod   = Ext2VnodeChmod,
 };
 
 static const VnodeOps g_ext2DirOps = {
@@ -1737,6 +1870,8 @@ static const VnodeOps g_ext2DirOps = {
     .close   = Ext2DirClose,
     .stat    = Ext2DirStat,
     .fsync   = nullptr,
+    .set_times = Ext2VnodeSetTimes,
+    .chmod   = Ext2VnodeChmod,
 };
 
 // ---------------------------------------------------------------------------
@@ -1945,8 +2080,8 @@ static void Ext2FsSync(void* mountPriv)
     KRwLockWriteUnlock(&g_ext2Lock);
 }
 
-static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
-                         const char* relPath, int flags)
+static Vnode* Ext2FsOpenMode(void* mountPriv, uint8_t pdrv,
+                            const char* relPath, int flags, uint16_t createMode)
 {
     (void)pdrv;
     auto* mnt = static_cast<Ext2Mount*>(mountPriv);
@@ -1957,6 +2092,7 @@ static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
     // Handle root directory
     bool isRoot = (!relPath[0] || (relPath[0] == '/' && !relPath[1]));
     uint32_t ino = 0;
+    bool created = false;
     Ext2Inode inodeData;
 
     if (needsWrite) {
@@ -1999,11 +2135,12 @@ static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
         {
             Process* cur = ProcessCurrent();
             uint16_t mask = cur ? cur->umask : 022;
-            inodeData.i_mode = EXT2_S_IFREG | (0666 & ~mask);
+            inodeData.i_mode = EXT2_S_IFREG | (createMode & 07777 & ~mask);
             inodeData.i_uid = cur ? static_cast<uint16_t>(cur->euid) : 0;
             inodeData.i_gid = cur ? static_cast<uint16_t>(cur->egid) : 0;
         }
         inodeData.i_links_count = 1;
+        Ext2Touch(&inodeData, true);
         Ext2WriteInode(mnt, ino, &inodeData);
 
         // Add directory entry
@@ -2012,6 +2149,7 @@ static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
             KRwLockWriteUnlock(&g_ext2Lock);
             return nullptr;
         }
+        created = true;
     }
 
     if (!ino) {
@@ -2032,7 +2170,7 @@ static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
 
     // Permission check (skipped for root or mounts with skipPermChecks set).
     // Only applies to existing files — newly created files skip this.
-    if (!(flags & VFS_O_CREATE) || ino) {
+    if (!created) {
         Process* cur = ProcessCurrent();
         if (cur && cur->euid != 0 && !mnt->skipPermChecks) {
             uint16_t fmode = inodeData.i_mode & 07777;
@@ -2061,6 +2199,7 @@ static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
     // Truncate if requested
     if ((flags & VFS_O_TRUNC) && (inodeData.i_mode & EXT2_S_IFMT) == EXT2_S_IFREG) {
         Ext2FreeInodeBlocks(mnt, &inodeData);
+        Ext2Touch(&inodeData);
         Ext2WriteInode(mnt, ino, &inodeData);
     }
 
@@ -2110,6 +2249,11 @@ static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv,
     return nullptr;
 }
 
+static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv, const char* relPath, int flags)
+{
+    return Ext2FsOpenMode(mountPriv, pdrv, relPath, flags, 0666);
+}
+
 static int Ext2FsStatPath(void* mountPriv, uint8_t pdrv,
                           const char* relPath, VnodeStat* st)
 {
@@ -2144,14 +2288,7 @@ static int Ext2FsStatPath(void* mountPriv, uint8_t pdrv,
 
     KRwLockReadUnlock(&g_ext2Lock);
 
-    uint16_t mode = inodeData.i_mode & EXT2_S_IFMT;
-    st->isDir = (mode == EXT2_S_IFDIR);
-    st->isSymlink = false; // stat follows symlinks, so result is never a symlink
-    st->size  = st->isDir ? 0 : Ext2InodeSize(&inodeData);
-    st->ino   = static_cast<uint64_t>(ino);
-    st->uid   = inodeData.i_uid;
-    st->gid   = inodeData.i_gid;
-    st->mode  = inodeData.i_mode;
+    Ext2FillStat(st, ino, inodeData);
     return 0;
 }
 
@@ -2173,13 +2310,7 @@ static int Ext2FsLstatPath(void* mountPriv, uint8_t pdrv,
             return -1;
         }
         KRwLockReadUnlock(&g_ext2Lock);
-        st->isDir = true;
-        st->isSymlink = false;
-        st->size = 0;
-        st->ino = EXT2_ROOT_INO;
-        st->uid  = inodeData.i_uid;
-        st->gid  = inodeData.i_gid;
-        st->mode = inodeData.i_mode;
+        Ext2FillStat(st, EXT2_ROOT_INO, inodeData);
         return 0;
     }
 
@@ -2200,14 +2331,7 @@ static int Ext2FsLstatPath(void* mountPriv, uint8_t pdrv,
 
     KRwLockReadUnlock(&g_ext2Lock);
 
-    uint16_t mode = inodeData.i_mode & EXT2_S_IFMT;
-    st->isDir     = (mode == EXT2_S_IFDIR);
-    st->isSymlink = (mode == EXT2_S_IFLNK);
-    st->size      = Ext2InodeSize(&inodeData);
-    st->ino       = static_cast<uint64_t>(ino);
-    st->uid       = inodeData.i_uid;
-    st->gid       = inodeData.i_gid;
-    st->mode      = inodeData.i_mode;
+    Ext2FillStat(st, ino, inodeData);
     return 0;
 }
 
@@ -2236,6 +2360,7 @@ static int Ext2FsUnlink(void* mountPriv, uint8_t pdrv, const char* relPath)
     Ext2Inode removedData;
     if (Ext2ReadInode(mnt, removedIno, &removedData)) {
         removedData.i_links_count--;
+        removedData.i_ctime = Ext2Now();
         if (removedData.i_links_count == 0) {
             bool isDir = (removedData.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR;
             Ext2FreeInodeBlocks(mnt, &removedData);
@@ -2290,6 +2415,7 @@ static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath)
         newData.i_gid = cur ? static_cast<uint16_t>(cur->egid) : 0;
     }
     newData.i_links_count = 2; // . and parent's entry
+    Ext2Touch(&newData, true);
 
     // Allocate first data block for . and .. entries
     uint32_t dataBlock = Ext2AllocBlock(mnt);
@@ -2430,6 +2556,8 @@ static int Ext2FsRename(void* mountPriv, uint8_t pdrv,
         }
     }
 
+    targetData.i_ctime = Ext2Now();
+    Ext2WriteInode(mnt, targetIno, &targetData);
     KRwLockWriteUnlock(&g_ext2Lock);
     return 0;
 }
@@ -2482,6 +2610,7 @@ static int Ext2FsSymlink(void* mountPriv, uint8_t pdrv,
     memset(&newData, 0, sizeof(newData));
     newData.i_mode = EXT2_S_IFLNK | 0777;
     newData.i_links_count = 1;
+    Ext2Touch(&newData, true);
 
     // Fast symlink: store target directly in i_block[] if it fits (≤60 bytes)
     if (targetLen <= 60) {
@@ -2586,39 +2715,23 @@ static int Ext2FsReadlink(void* mountPriv, uint8_t pdrv,
 // Ext2Chmod / Ext2Chown — modify inode metadata
 // ---------------------------------------------------------------------------
 
-int Ext2Chmod(const char* path, uint16_t newMode)
+static int Ext2FsChmod(void* mountPriv, uint8_t pdrv, const char* relPath,
+                       uint16_t mode)
 {
-    // Find which ext2 mount this path belongs to
-    Ext2Mount* mnt = nullptr;
-    const char* relPath = nullptr;
-
-    // Try all ext2 mounts (typically "/" and "/home")
-    for (int i = 0; i < EXT2_MAX_MOUNTS; ++i) {
-        if (!g_ext2Mounts[i]) continue;
-        // Check if path starts with this mount's prefix
-        // For simplicity, use mount index 0 as root ext2
-        mnt = g_ext2Mounts[i];
-        relPath = path;
-        break;
-    }
-    if (!mnt) return -2; // -ENOENT
-
+    (void)pdrv;
+    auto* mnt = static_cast<Ext2Mount*>(mountPriv);
     KRwLockWriteLock(&g_ext2Lock);
-
-    const char* p = relPath;
-    while (*p == '/') ++p;
-    uint32_t ino = *p ? Ext2ResolvePath(mnt, EXT2_ROOT_INO, p, 0) : EXT2_ROOT_INO;
-    if (!ino) { KRwLockWriteUnlock(&g_ext2Lock); return -2; }
-
-    Ext2Inode inodeData;
-    if (!Ext2ReadInode(mnt, ino, &inodeData)) { KRwLockWriteUnlock(&g_ext2Lock); return -5; }
-
-    // Preserve type bits, replace permission bits
-    inodeData.i_mode = (inodeData.i_mode & EXT2_S_IFMT) | (newMode & 07777);
-    Ext2WriteInode(mnt, ino, &inodeData);
-
+    const char* path = relPath;
+    while (*path == '/') ++path;
+    uint32_t ino = *path ? Ext2ResolvePath(mnt, EXT2_ROOT_INO, path, 0) : EXT2_ROOT_INO;
+    int result = ino ? Ext2SetInodeMode(mnt, ino, mode) : -2;
     KRwLockWriteUnlock(&g_ext2Lock);
-    return 0;
+    return result;
+}
+
+int Ext2Chmod(const char* path, uint16_t mode)
+{
+    return VfsChmodPath(path, mode);
 }
 
 int Ext2Chown(const char* path, uint32_t uid, uint32_t gid)
@@ -2643,10 +2756,34 @@ int Ext2Chown(const char* path, uint32_t uid, uint32_t gid)
 
     if (uid != 0xFFFFFFFF) inodeData.i_uid = static_cast<uint16_t>(uid);
     if (gid != 0xFFFFFFFF) inodeData.i_gid = static_cast<uint16_t>(gid);
+    inodeData.i_ctime = Ext2Now();
     Ext2WriteInode(mnt, ino, &inodeData);
 
     KRwLockWriteUnlock(&g_ext2Lock);
     return 0;
+}
+
+static int Ext2FsSetTimes(void* mountPriv, uint8_t pdrv, const char* relPath,
+                          const VnodeTime* times, bool nofollow)
+{
+    (void)pdrv;
+    auto* mnt = static_cast<Ext2Mount*>(mountPriv);
+    KRwLockWriteLock(&g_ext2Lock);
+    const char* path = relPath;
+    while (*path == '/') ++path;
+    uint32_t ino = EXT2_ROOT_INO;
+    if (*path && nofollow) {
+        char name[256];
+        uint32_t parent = Ext2ResolveParent(mnt, path, name, sizeof(name));
+        Ext2Inode parentData;
+        ino = parent && Ext2ReadInode(mnt, parent, &parentData)
+                ? Ext2DirLookup(mnt, parent, &parentData, name) : 0;
+    } else if (*path) {
+        ino = Ext2ResolvePath(mnt, EXT2_ROOT_INO, path, 0);
+    }
+    int result = ino ? Ext2SetInodeTimes(mnt, ino, times) : -2;
+    KRwLockWriteUnlock(&g_ext2Lock);
+    return result;
 }
 
 static const VfsFsOps g_ext2FsOps = {
@@ -2661,6 +2798,9 @@ static const VfsFsOps g_ext2FsOps = {
     .symlink    = Ext2FsSymlink,
     .readlink   = Ext2FsReadlink,
     .sync       = Ext2FsSync,
+    .set_times  = Ext2FsSetTimes,
+    .open_mode  = Ext2FsOpenMode,
+    .chmod      = Ext2FsChmod,
 };
 
 // ---------------------------------------------------------------------------

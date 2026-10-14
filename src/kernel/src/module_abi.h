@@ -24,7 +24,9 @@ namespace brook {
 
 // Current module ABI version.  The loader rejects modules built against
 // a different ABI version.
-static constexpr uint32_t MODULE_ABI_VERSION = 1;
+// Version 3 extends VFS metadata/ops with timestamps and creation/chmod modes. Version 2 belonged to
+// an archived, incompatible GPU experiment and must never be reused.
+static constexpr uint32_t MODULE_ABI_VERSION = 3;
 
 // Magic bytes at the start of every valid ModuleInfo.
 static constexpr uint32_t MODULE_MAGIC = 0x4B524F42; // 'BROK'

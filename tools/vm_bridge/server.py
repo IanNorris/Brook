@@ -230,7 +230,11 @@ def start(scenario="desktop", gpu="software", **_):
             "message": "Launch continues independently; discover it with vm_sessions"}
 
 
-def control(session, action, **_):
+def control(session, action, force=False, **_):
+    if not isinstance(force, bool):
+        raise ValueError("force must be a boolean")
+    if force and action not in {"stop", "reset"}:
+        raise ValueError("force is only supported for stop/reset")
     if action in {"takeover", "release"}:
         load_session(session)
         write_json(REGISTRY / session / "control.json", {"user_takeover": action == "takeover"})
@@ -245,6 +249,25 @@ def control(session, action, **_):
         commands = {"pause": "stop", "resume": "cont", "reset": "system_reset", "stop": "quit"}
         if action not in commands:
             raise ValueError("Unknown control action")
+        sync_result = {}
+        if action in {"stop", "reset"}:
+            # Callers must quiesce writers first: the guest can write again
+            # between this acknowledgement and the following QMP command.
+            try:
+                reply = guest(data, "bridge sync", timeout=30)
+                if not isinstance(reply, dict) or reply.get("guest_sync_completed") is not True:
+                    raise RuntimeError("Guest did not acknowledge completed metadata sync")
+                sync_result = {"guest_sync_completed": True,
+                               "sync_guarantee": "best_effort_metadata_flush"}
+            except (OSError, RuntimeError, ValueError) as error:
+                if not force:
+                    raise RuntimeError(
+                        f"{action} aborted before QMP: {error}. "
+                        "For panic/unreachable guests, force=true explicitly permits "
+                        "shutdown without completed sync and possible filesystem corruption."
+                    ) from error
+                sync_result = {"guest_sync_completed": False, "forced": True,
+                               "sync_error": str(error)}
         with QMP(session) as q:
             if action == "reset":
                 # Keep earlier crash logs, but do not classify the new boot by them.
@@ -255,7 +278,7 @@ def control(session, action, **_):
             write_json(REGISTRY/session/"session.json",data)
             for name in ["last-frame.json","frame-source.json"]:
                 (REGISTRY/session/name).unlink(missing_ok=True)
-        return {"action": action, "session": session}
+        return {"action": action, "session": session, **sync_result}
 
 
 def observe(session, crop=None, max_width=None, **_):
@@ -619,7 +642,7 @@ def register(name,fn,description,props=None,required=None,readonly=False):
 register("vm_sessions",sessions,"Discover opted-in user/agent VM runs; no desktop discovery",readonly=True)
 register("vm_doctor",doctor,"VM transport and guest readiness; capabilities distinguish unsupported paths",SESSION,["session"],True)
 register("vm_start",start,"Boot a named experiment on new disk clones with playback off",{"scenario":STR,"gpu":STR})
-register("vm_control",control,"pause/resume/reset/stop or takeover/release; reset loses guest state",{**SESSION,"action":STR},["session","action"])
+register("vm_control",control,"pause/resume/reset/stop or takeover/release; stop/reset await guest sync, force explicitly allows unsynced shutdown",{**SESSION,"action":STR,"force":{"type":"boolean"}},["session","action"])
 register("vm_observe",observe,"Guest image with crop/scale coordinate metadata; briefly pauses VM; panic capture needs cached framebuffer",{**SESSION,"crop":schema({"x":INT,"y":INT,"width":INT,"height":INT},["x","y","width","height"]),"max_width":INT},["session"])
 register("vm_logs",logs,"Read bounded logs by byte cursor",{**SESSION,"source":STR,"offset":INT,"limit":INT},["session"],True)
 register("vm_stats",stats,"OS memory/process counts and recent compositor interval p50/p90/p95/max",SESSION,["session"],True)
