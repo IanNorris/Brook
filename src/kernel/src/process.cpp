@@ -1124,7 +1124,7 @@ void ProcessDestroy(Process* proc)
 // Helper: walk a 4-level page table and copy all leaf pages.
 static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                               uint16_t srcPid, uint16_t dstPid,
-                              volatile uint64_t& srcTlbCpuMask)
+                              volatile uint64_t& srcTlbCpuMask, const Process* mappings)
 {
     static constexpr uint64_t PTE_PHYS_MASK = 0x000FFFFFFFFFF000ULL;
 
@@ -1170,6 +1170,26 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
 
                     PhysicalAddress srcPhys(srcPt4[i1] & PTE_PHYS_MASK);
                     uint64_t pteFlags = srcPt4[i1] & ~PTE_PHYS_MASK;
+                    bool memfdPage = false;
+                    for (uint32_t m = 0; m < Process::MAX_MEMFD_MAPS; ++m) {
+                        const auto& map = mappings->memfdMaps[m];
+                        if (map.mfd && map.length && vaddr >= map.vaddr &&
+                            vaddr - map.vaddr < map.length) {
+                            memfdPage = true;
+                            break;
+                        }
+                    }
+                    if (memfdPage) {
+                        // Memfd VMAs borrow object-owned pages. Their copied
+                        // VMA holds an object ref; neither COW nor a per-PTE
+                        // page reference belongs here. COW disconnects parent
+                        // writes from the compositor and can retire the backing.
+                        if (!VmmMapPage(dstPt, VirtualAddress(vaddr), srcPhys,
+                                        pteFlags & ~PTE_COW_BIT, MemTag::User, dstPid))
+                            return false;
+                        sharedCount++;
+                        continue;
+                    }
                     bool wasWritable = (pteFlags & VMM_WRITABLE) != 0;
                     bool alreadyCow  = (pteFlags & PTE_COW_BIT) != 0;
                     bool privateWritable = wasWritable || alreadyCow;
@@ -1338,6 +1358,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     // Copy entire parent process struct as a starting point
     memcpy(child, parent, sizeof(Process));
     child->fdLock.next = child->fdLock.serving = 0;
+    child->fileMapLock.next = child->fileMapLock.serving = 0;
     child->magic = PROCESS_MAGIC;
     child->incarnation = NextIncarnation();
     child->leaderIncarnation = 0;   // a fork child is its own leader
@@ -1442,12 +1463,30 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
         return nullptr;
     }
 
-    // Copy writable user pages and share read-only mappings.
+    // Threads copy the address-space leader's current VMA bookkeeping, not
+    // the stale arrays/break/frontier copied when that thread was created.
+    Process* mapOwner = parent->isThread && parent->threadLeader
+                      ? parent->threadLeader : parent;
+    child->programBreak = mapOwner->programBreak;
+    child->mmapNext = mapOwner->mmapNext;
+    SpinLockAcquire(&mapOwner->fileMapLock);
+    memcpy(child->memfdMaps, mapOwner->memfdMaps, sizeof(child->memfdMaps));
+    memcpy(child->fileMaps, mapOwner->fileMaps, sizeof(child->fileMaps));
+    for (uint32_t i = 0; i < Process::MAX_MEMFD_MAPS; ++i)
+        if (child->memfdMaps[i].length && child->memfdMaps[i].mfd)
+            brook::MemFdHandleRef(child->memfdMaps[i].mfd);
+    for (uint32_t i = 0; i < Process::MAX_FILE_MAPS; ++i)
+        if (child->fileMaps[i].length && child->fileMaps[i].vnode)
+            __atomic_fetch_add(&child->fileMaps[i].vnode->refCount, 1, __ATOMIC_RELEASE);
+    SpinLockRelease(&mapOwner->fileMapLock);
+
+    // Copy writable private pages; shared memfd pages retain object backing.
     if (!ForkCopyUserPages(parent->pageTable, child->pageTable,
                            parent->pid, child->pid,
-                           *AddressSpaceTlbMaskPtr(parent)))
+                           *AddressSpaceTlbMaskPtr(parent), child))
     {
         SerialPuts("FORK: address space copy failed\n");
+        ProcessClearLazyMappings(child);
         VmmDestroyUserPageTable(child->pageTable);
         VmmFreeKernelStack(kstackAddr, KERNEL_STACK_PAGES);
         kfree(child->fds);
@@ -1525,17 +1564,6 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
             if (parent->fds[i].type == FdType::DevTty && parent->fds[i].handle)
                 child->fds[i].handle = brook::DevTtyDeepCopy(parent->fds[i].handle);
         }
-    }
-
-    for (uint32_t i = 0; i < Process::MAX_MEMFD_MAPS; i++)
-    {
-        if (child->memfdMaps[i].length != 0 && child->memfdMaps[i].mfd)
-            brook::MemFdHandleRef(child->memfdMaps[i].mfd);
-    }
-    for (uint32_t i = 0; i < Process::MAX_FILE_MAPS; i++)
-    {
-        if (child->fileMaps[i].length != 0 && child->fileMaps[i].vnode)
-            __atomic_fetch_add(&child->fileMaps[i].vnode->refCount, 1, __ATOMIC_RELEASE);
     }
 
     // Update child's TLS fsBase to point to the new address space's TLS

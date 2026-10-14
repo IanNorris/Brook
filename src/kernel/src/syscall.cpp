@@ -571,11 +571,12 @@ static bool MemFdGrow(MemFdData* mfd, uint64_t needed)
 // PhysicalAddress(0) on OOM or out-of-range. New pages are zero-filled.
 static PhysicalAddress MemFdGetOrAllocPage(MemFdData* mfd, uint64_t pageIdx, uint16_t pid)
 {
+    (void)pid; // Backing belongs to the object, which can outlive its creator.
     MfdLock(mfd);
     if (pageIdx >= mfd->pageMapCount) { MfdUnlock(mfd); return PhysicalAddress(0); }
     uint64_t raw = mfd->pageMap[pageIdx];
     if (raw == 0) {
-        PhysicalAddress phys = PmmAllocPage(MemTag::User, pid);
+        PhysicalAddress phys = PmmAllocPage(MemTag::User, 0);
         if (!phys) { MfdUnlock(mfd); return PhysicalAddress(0); }
         auto* va = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
         memset(va, 0, 4096);

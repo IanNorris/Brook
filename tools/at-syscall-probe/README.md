@@ -25,3 +25,8 @@ against absolute paths. It leaves three empty fixture directories.
 `clockcheck.c` checks a 20 ms absolute monotonic sleep and a 30 ms monotonic
 condition-variable timeout in a child, with a one-second parent watchdog so
 broken kernels fail instead of leaving an indefinitely sleeping probe.
+
+`sharedcheck.c` checks that writes through a MAP_SHARED memfd remain shared
+across both a normal fork and a fork from a thread created before the mapping.
+Compile it with `-pthread`. The child must see the leader's current VMAs, and
+neither fork may turn object-owned backing pages into private COW pages.
