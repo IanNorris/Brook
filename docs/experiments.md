@@ -290,3 +290,15 @@ int16 OpenAL configuration. Evidence is under
 `build/vm-bridge/ef8fc1e9a08c455885ca2cae39ce534b/`. Its final SDL-dummy capture
 contains 10.136 seconds of PCM over a 10.090-second host interval. Validation
 VMs were stopped; use a new launch to pick up the boot image and seed changes.
+
+The subsequent user session `347625569e0d4270bb8f522c45d1acb6` booted to a
+black GPU scanout with host `BIND_OBJECT`/illegal-command-buffer errors and a
+zero command header. The runtime DRM capability query cleared the shared GPU
+request buffer without the command lock. Both that query and the normal 2D
+framebuffer flush now take the same lock as compositor/app submissions; panic
+presentation deliberately remains lock-free after other CPUs halt. The rebuilt
+release passes all twelve host tests. A clean GL3 run in session
+`c251499b3f5749e49f9eaf5befc3d31f` reached Outer Base at 1280×720 through Intel
+virgl and produced a visible capture without host command-buffer errors. This
+validates one startup after the fix, rather than proving every intermittent
+graphics fault resolved. Existing running VMs retain their original driver.

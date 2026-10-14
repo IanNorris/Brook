@@ -869,6 +869,7 @@ static void QueryCapsets()
 static int32_t GetCapsetBlob(uint32_t capsetId, uint32_t version,
                              void* out, uint32_t maxBytes)
 {
+    GpuCmdGuard _gcg;
     if (!out || maxBytes == 0) return -1;
     memset(g_cmdBuf, 0, 4096);
     auto* req = reinterpret_cast<VirtioGpuGetCapset*>(g_cmdBuf + CMD_REQ_OFF);
@@ -1068,6 +1069,7 @@ static bool ResourceFlush(uint32_t resId, uint32_t x, uint32_t y, uint32_t w, ui
 // the synchronous controlq poll in SubmitCommand is safe.
 static void VirtioGpuFlush(uint32_t minY, uint32_t maxY)
 {
+    GpuCmdGuard _gcg;
     if (!g_fbBacking || maxY <= minY) return;
     if (maxY > g_fbH) maxY = g_fbH;
     uint32_t rows   = maxY - minY;
