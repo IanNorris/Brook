@@ -828,8 +828,9 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
         proc->fds[2].type = FdType::Vnode; // treated as serial stderr in syscall
         proc->fds[2].statusFlags = 2; // O_RDWR
     }
-    // fd 3 = debug serial (hardcoded in sys_write); reserve it
-    proc->fds[3].type = FdType::DevNull;
+    // Initially provide debug serial at fd 3. Closing/reusing the slot must
+    // obey the replacement descriptor's type, just like any other fd.
+    proc->fds[3].type = FdType::DebugSerial;
     proc->fds[3].statusFlags = 1; // O_WRONLY
 
     // Default TTY mode: canonical with echo

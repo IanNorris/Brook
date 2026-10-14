@@ -1495,10 +1495,18 @@ struct FdRef
 // pipe, eventfd, socket, memfd, unix-socket.
 static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count)
 {
-    // fd 3 = debug serial — writes directly, bypassing the async ring buffer.
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+    // Pin before inspecting the type or handle, including special devices.
+    // A closed slot must fail, and a reused slot follows its current type.
+    FdRef ref(proc, static_cast<int>(fd));
+    if (!ref) return -EBADF;
+    FdEntry* fde = ref.get();
+
+    // Debug serial writes directly, bypassing the async ring buffer.
     // Hold the serial lock across the entire write so multi-CPU output
     // doesn't interleave character-by-character.
-    if (fd == 3)
+    if (fde->type == FdType::DebugSerial)
     {
         const char* buf = reinterpret_cast<const char*>(bufAddr);
         brook::SerialLock();
@@ -1514,12 +1522,9 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count)
     // For fd 0/1/2: check if they've been redirected via dup2 first
     if (fd == 1 || fd == 2)
     {
-        Process* proc = ProcessCurrent();
-        FdEntry* fde = (proc ? FdGet(proc, static_cast<int>(fd)) : nullptr);
         // Redirected if FD entry is a pipe or other non-default type.
         // Default: Vnode with null handle = serial output
-        if (!fde || fde->type == FdType::None ||
-            (fde->type == FdType::Vnode && !fde->handle))
+        if (fde->type == FdType::Vnode && !fde->handle)
         {
             const char* buf = reinterpret_cast<const char*>(bufAddr);
             if (count > 0)
@@ -1542,20 +1547,11 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count)
         // that corrupts binary pipelines — e.g. curl | xz | nar-unpack
         // dumps the compressed NAR stream onto the serial console — and
         // makes debug output confusing. If you need pipe content in logs,
-        // explicitly tee to fd 3.)
+        // explicitly tee to the inherited debug-serial descriptor.)
     }
 
-    // File descriptor write
-    Process* proc = ProcessCurrent();
-    if (!proc) return -EBADF;
-    // Pin the slot for the whole operation: the dsp/pipe/tty/unix-socket paths
-    // below dereference fde->handle across blocking sleeps, so a bare FdGet
-    // would expose a use-after-free if a sibling closes the fd (BRO-156). The
-    // guard's destructor runs FdPut on every return path.
-    FdRef ref(proc, static_cast<int>(fd));
-    if (!ref) return -EBADF;
-    FdEntry* fde = ref.get();
-
+    // The pin above also protects handles across blocking writes; its
+    // destructor performs any deferred-close teardown on every return path.
     if (fde->type == FdType::Vnode && fde->handle)
     {
         auto* vn = static_cast<Vnode*>(fde->handle);
@@ -7601,13 +7597,15 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
     }
 
     if (fde->type == FdType::DevKeyboard || fde->type == FdType::DevNull ||
-        fde->type == FdType::DevUrandom || fde->type == FdType::DevDsp) {
+        fde->type == FdType::DevUrandom || fde->type == FdType::DevDsp ||
+        fde->type == FdType::DebugSerial) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
         memset(raw, 0, sizeof(LinuxStat));
         st->st_mode = 0020666; // S_IFCHR
         st->st_rdev = (fde->type == FdType::DevNull) ? 0x0103 :
                       (fde->type == FdType::DevUrandom) ? 0x0109 :
-                      (fde->type == FdType::DevDsp) ? 0x0E03 : 0x0400; // 14,3 = /dev/dsp
+                      (fde->type == FdType::DevDsp) ? 0x0E03 :
+                      (fde->type == FdType::DebugSerial) ? 0x0440 : 0x0400; // 4,64 = UART
         st->st_blksize = 4096;
         return 0;
     }

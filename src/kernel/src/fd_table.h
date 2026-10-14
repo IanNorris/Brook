@@ -50,6 +50,7 @@ enum class FdType : uint8_t
     DevKlog,       // /dev/klog — kernel log ring buffer reader
     DevDri,        // /dev/dri/renderD128 — virtio-gpu DRM render node (GL shim)
     DrmPrime,      // DRM PRIME dmabuf handle — a capability wrapping a shared virgl resource (gres)
+    DebugSerial,   // Direct debug UART output; initially fd 3, preserved by dup/fork
 };
 
 struct FdEntry

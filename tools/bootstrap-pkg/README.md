@@ -23,7 +23,9 @@ run /nix/profile/bin/brook-bootstrap-shell
 ```
 
 The shell supplies the unwrapped cross compiler, hosted test compiler, Python
-with freetype/Pillow, Git, CMake, Ninja, Hack font, utilities and TLS certificates.
+with freetype/Pillow, Git, CMake, Ninja, mtools, Hack font, utilities and TLS certificates.
+Mtools is required by the kernel's generated FAT test image; older SDK
+checkpoints can install it directly with `run /nix/bin/nix-install mtools`.
 Inside that shell:
 
 ```sh

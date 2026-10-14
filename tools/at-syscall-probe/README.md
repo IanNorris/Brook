@@ -109,3 +109,12 @@ does not introduce a timing-dependent hang. Each case has a 15-second
 fork/waitpid/monotonic-clock watchdog; no alarm or pthread support is required.
 Expect `CHILDSIGNALCHECK PASS failures=0`. Temporary epoll_pwait masks remain
 outside this probe's scope.
+
+`fd3check.c` must be invoked by its absolute path, with an absolute writable
+directory. Start it with Brook's inherited debug-serial fd 3. It verifies
+closed-fd errors, file reuse with binary write/writev/pwrite and persisted
+content, dup2 replacement, pipe/eventfd reuse, and a child that closes fd 3
+before exec and opens its output there. Verify both `FD3CHECK SERIAL ORIGINAL`
+and `FD3CHECK SERIAL DUPLICATE` appear in the UART log; successful write returns
+alone cannot prove serial delivery. Expect `FD3CHECK PASS failures=0`.
+`--no-serial` skips the Brook-specific inherited-device checks for host runs.

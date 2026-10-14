@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-make_fat_image.py — creates a minimal FAT16 test image and embeds it as a C++ array.
+make_fat_image.py — creates a minimal FAT test image and embeds it as a C++ array.
 
 Usage: make_fat_image.py <output.cpp> <image_size_kb>
 
@@ -19,6 +19,15 @@ import sys
 import os
 import tempfile
 
+def run_mtools(command, **kwargs):
+    result = subprocess.run(command, capture_output=True, **kwargs)
+    if result.returncode:
+        details = result.stderr.decode(errors="replace").strip()
+        raise RuntimeError(
+            f"mtools command failed ({result.returncode}): {' '.join(command)}\n{details}"
+        )
+    return result
+
 def main():
     if len(sys.argv) < 3:
         print(f"Usage: {sys.argv[0]} <output.cpp> <size_kb>", file=sys.stderr)
@@ -32,9 +41,8 @@ def main():
 
         # Create a FAT image using mformat.
         # -f <size_kb> specifies image size in kilobytes.
-        subprocess.run(
+        run_mtools(
             ["mformat", "-i", img, "-C", "-v", "BROOKVOL", "-f", str(size_kb), "::"],
-            check=True, capture_output=True
         )
 
         # mtools config: point drive B: to our image (avoids needing /etc/mtools.conf)
@@ -48,12 +56,10 @@ def main():
             src = os.path.join(tmpdir, os.path.basename(dst.replace("/", "_")))
             with open(src, "w") as f:
                 f.write(src_content)
-            subprocess.run(["mcopy", "-i", img, src, "::" + dst],
-                           check=True, capture_output=True, env=mtools_env)
+            run_mtools(["mcopy", "-i", img, src, "::" + dst], env=mtools_env)
 
         def mmkdir(path: str):
-            subprocess.run(["mmd", "-i", img, "::" + path],
-                           check=True, capture_output=True, env=mtools_env)
+            run_mtools(["mmd", "-i", img, "::" + path], env=mtools_env)
 
         mmkdir("TEST")
         mcopy("# Brook OS config\nversion=1\nserial_baud=115200\n", "BROOK.CFG")
@@ -74,7 +80,7 @@ def main():
             f.write("    " + ", ".join(f"0x{b:02X}" for b in chunk) + ",\n")
         f.write("};\n")
 
-    print(f"make_fat_image: {size_kb}KB FAT16 image → {out_cpp} ({size} bytes)")
+    print(f"make_fat_image: {size_kb}KB FAT image → {out_cpp} ({size} bytes)")
 
 if __name__ == "__main__":
     main()

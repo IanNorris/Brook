@@ -104,6 +104,20 @@ Epoll checks pending signals before sleeping. The five watchdog-protected
 `childsignalcheck` cases passed in Linux and Brook, including exec-child epoll
 notification, pipe/socket interruption, SA_RESTART and default-ignored SIGCHLD.
 
+The guest build reached compiler checks and font baking, then found mtools
+missing from the SDK. The package installer successfully installed it in the
+guest; the fresh SDK expression now includes it. The FAT-image script also
+reports the failing mtools command and stderr instead of only a subprocess
+exception. Its host verification produced the complete 368,640-byte image.
+
+Mformat then exposed fd 3 writes being unconditionally sent to UART after
+Python closed and reused that descriptor for its image file. Debug serial now
+has an explicit descriptor type; reused/duplicated descriptors follow their
+actual type. `fd3check` passed on Linux and Brook, including exact file bytes,
+pwrite/writev, pipe/eventfd and exec reuse, with both legacy serial sentinels
+confirmed in UART output. Existing enum values and descriptor layouts stay
+unchanged; driver header dependencies rebuilt the affected modules.
+
 Runtime evidence is retained under ignored `build/experiments/results/bootstrap-20261014/`
 and `bootstrap-compat-20261014/`, and the VM registry keeps serial logs and the
 actual booted kernel identities. Package payloads, images and logs stay out of git.

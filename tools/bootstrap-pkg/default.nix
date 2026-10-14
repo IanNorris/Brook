@@ -8,7 +8,7 @@ let
     paths = [
       llvm.clang-unwrapped llvm.lld nativeCC python
       pkgs.gitMinimal pkgs.cmake pkgs.ninja pkgs.bash pkgs.coreutils
-      pkgs.gnugrep pkgs.gnused pkgs.findutils pkgs.gnutar pkgs.gzip
+      pkgs.gnugrep pkgs.gnused pkgs.findutils pkgs.gnutar pkgs.gzip pkgs.mtools
       pkgs.hack-font pkgs.cacert
     ];
     ignoreCollisions = true;
