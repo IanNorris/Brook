@@ -294,6 +294,10 @@ static void TestLastAckToClosed()
 // ---------------------------------------------------------------------------
 static void TestCloseWaitAckUpdate()
 {
+    ASSERT_TRUE(TcpCanSendData(TcpState::Established));
+    ASSERT_TRUE(TcpCanSendData(TcpState::CloseWait));
+    ASSERT_TRUE(!TcpCanSendData(TcpState::Closed));
+    ASSERT_TRUE(!TcpCanSendData(TcpState::LastAck));
     Socket s = MakeEstablishedSocket();
     s.tcpState = TcpState::CloseWait;
 
@@ -305,6 +309,10 @@ static void TestCloseWaitAckUpdate()
 
     ASSERT_EQ(s.tcpState, TcpState::CloseWait);
     ASSERT_EQ(s.tcpSndUna, 1005u);
+    TcpProcessSegment(s, s.tcpRcvNxt, 0, TCP_RST, nullptr, 0);
+    ASSERT_EQ(s.tcpState, TcpState::Closed);
+    ASSERT_TRUE(s.tcpRstRecv);
+    ASSERT_TRUE(!s.connected);
     printf("  TestCloseWaitAckUpdate: OK\n");
 }
 

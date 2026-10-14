@@ -209,6 +209,12 @@ TcpAction TcpProcessSegment(Socket& s,
         break;
 
     case TcpState::CloseWait:
+        if (flags & TCP_RST) {
+            s.tcpState = TcpState::Closed;
+            s.connected = false;
+            s.tcpRstRecv = true;
+            return act;
+        }
         if (flags & TCP_ACK)
             s.tcpSndUna = ack;
         break;

@@ -2593,8 +2593,7 @@ static int TcpWaitForDataAck(Socket& s, int sockIdx,
 
         SpinLockAcquire(&s.lock);
         bool acked = TcpSeqAcked(s.tcpSndUna, seqEnd);
-        bool closed = s.tcpRstRecv || s.tcpFinRecv ||
-                      s.tcpState != TcpState::Established;
+        bool closed = s.tcpRstRecv || !TcpCanSendData(s.tcpState);
         if (acked || closed || now >= deadline) {
             SpinLockRelease(&s.lock);
             if (acked) return 0;
@@ -2634,8 +2633,8 @@ int SockSend(int sockIdx, const void* buf, uint32_t len)
 
     Socket& s = g_sockets[sockIdx];
     if (s.type != SOCK_STREAM) return -95;
-    if (s.tcpState != TcpState::Established) {
-        SerialPrintf("tcp: SockSend refused: state=%d (not Established) fd=%d\n",
+    if (!TcpCanSendData(s.tcpState)) {
+        SerialPrintf("tcp: SockSend refused: state=%d (send direction closed) fd=%d\n",
                      (int)s.tcpState, sockIdx);
         return -104; // ECONNRESET
     }
@@ -2656,14 +2655,16 @@ int SockSend(int sockIdx, const void* buf, uint32_t len)
 
         int ackStatus = TcpWaitForDataAck(s, sockIdx, seq, data + sent, chunk);
         if (ackStatus != 0)
-            return ackStatus;
+            return sent ? static_cast<int>(sent) : ackStatus;
 
         sent += chunk;
 
         // Yield after each ACKed segment to let peer responses run without spinning.
         SchedulerYield();
 
-        if (s.tcpState != TcpState::Established) return -104;
+        // An ACKed write stays successful even if the peer's response FIN
+        // arrived during the yield. Return accepted bytes on a later reset.
+        if (!TcpCanSendData(s.tcpState)) return static_cast<int>(sent);
     }
 
     return static_cast<int>(sent);

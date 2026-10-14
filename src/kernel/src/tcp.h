@@ -11,6 +11,13 @@
 
 namespace brook {
 
+// A received FIN closes only the peer's send direction. Our send direction
+// remains available until we close it or receive a reset.
+inline bool TcpCanSendData(TcpState state)
+{
+    return state == TcpState::Established || state == TcpState::CloseWait;
+}
+
 // Action the caller should take after processing a segment.
 struct TcpAction {
     bool     sendAck;        // send an ACK segment
