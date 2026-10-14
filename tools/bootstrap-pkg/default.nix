@@ -19,6 +19,9 @@ let
     export CXX=${llvm.clang-unwrapped}/bin/clang++
     export HOST_CC=${nativeCC}/bin/cc
     export HOST_CXX=${nativeCC}/bin/c++
+    # The binary wrapper's propagated build inputs do not set this outside a
+    # Nix build shell. Keep native test linking self-contained in the guest.
+    export NIX_LDFLAGS="-L${llvm.libcxx}/lib -rpath ${llvm.libcxx}/lib ''${NIX_LDFLAGS:-}"
     export HACK_FONT_TTF=${pkgs.hack-font}/share/fonts/truetype/Hack-Regular.ttf
     export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
     export GIT_SSL_CAINFO="$SSL_CERT_FILE"
