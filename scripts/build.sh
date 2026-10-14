@@ -59,16 +59,18 @@ if cmake \
     -DCMAKE_CXX_COMPILER="${HOST_COMPILER}" \
     -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
     -DBROOK_ROOT="${ROOT_DIR}" \
-    -G Ninja >/dev/null 2>&1
+    -G Ninja >"${HOST_TEST_DIR}/configure.log" 2>&1
 then
-    if cmake --build "${HOST_TEST_DIR}" >/dev/null 2>&1; then
+    if cmake --build "${HOST_TEST_DIR}" >"${HOST_TEST_DIR}/build.log" 2>&1; then
         echo "Host tests built."
         echo "  Run host-native tests with: ctest --test-dir ${HOST_TEST_DIR} --output-on-failure"
     else
-        echo "Host tests skipped (build failed — rerun with verbose to debug)."
+        echo "Host tests skipped (build failed; see ${HOST_TEST_DIR}/build.log)."
+        tail -25 "${HOST_TEST_DIR}/build.log"
     fi
 else
-    echo "Host tests skipped (configure failed — likely stale CMake cache; rm -rf ${HOST_TEST_DIR} to fix)."
+    echo "Host tests skipped (configure failed; see ${HOST_TEST_DIR}/configure.log)."
+    tail -25 "${HOST_TEST_DIR}/configure.log"
 fi
 
 echo "  Run bare-metal test ELFs with: ./scripts/run-tests.sh ${BUILD_TYPE_LOWER}"

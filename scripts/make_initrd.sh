@@ -22,7 +22,8 @@ for arg in "$@"; do
     esac
 done
 
-BUILD_DIR="${ROOT_DIR}/build/${BUILD_TYPE}"
+# Override for an extracted guest build or another isolated artifact directory.
+BUILD_DIR="${BROOK_BUILD_DIR:-${ROOT_DIR}/build/${BUILD_TYPE}}"
 ESP_DIR="${BUILD_DIR}/esp"
 INITRD_IMG="${ESP_DIR}/INITRD.IMG"
 MOD_DIR="${BUILD_DIR}/kernel/drivers"

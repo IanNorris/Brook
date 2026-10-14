@@ -273,12 +273,14 @@ free-memory snapshot. Test long builds and browser restarts for sustained
 reclamation, alongside the separate mmap coherency/lifetime work above.
 
 Native bootstrap runtime follow-up: all 13 hosted test executables compiled
-and linked in the guest, but `test_virgl_submit` faulted reading NULL in a
-shared-library mapping (RIP 0x102a1048, map 0x10289000, offset 0x18048) before
-completing. Preserve the binaries and loader diagnostics; investigate native
-libc++ startup and resolve the library offset before attributing this to a
+and linked in the guest, but all 13 segfaulted during shared-library startup
+before their assertions ran (0/13 passed, CTest exit 8, 2.81 seconds).
+The repeated fault read NULL at RIP 0x102a1048 in a mapping starting at
+0x10289000 (offset 0x18048). The same suite passes all 13 tests on the host.
+Preserve the binaries and loader diagnostics; investigate native libc++/loader
+startup and resolve the library offset before attributing this to a
 specific missing syscall. A separate user-PF diagnostic incorrectly forced
 panic serial locking, stranding UART writers and command control. Removing
 that force-lock call is validated by a reaped SIGSEGV child, subsequent fd3
-UART sentinel and healthy bridge procs/stats; real kernel panic handling stays
-unchanged.
+UART sentinel and healthy bridge procs/stats, including after the complete
+13-failure CTest run; real kernel panic handling stays unchanged.

@@ -75,7 +75,8 @@ if [ "${VM_BRIDGE}" = "1" ]; then
     BROOK_AUDIODEV="${BROOK_AUDIODEV:-none}"
 fi
 
-BUILD_DIR="${ROOT_DIR}/build/${BUILD_TYPE}"
+# Override for an extracted guest build or another isolated artifact directory.
+BUILD_DIR="${BROOK_BUILD_DIR:-${ROOT_DIR}/build/${BUILD_TYPE}}"
 ESP_DIR="${BUILD_DIR}/esp/EFI/BOOT"
 BOOTLOADER="${BUILD_DIR}/bootloader/BOOTX64.efi"
 

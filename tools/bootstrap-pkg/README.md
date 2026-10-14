@@ -24,19 +24,21 @@ run /nix/profile/bin/brook-bootstrap-shell
 
 The shell supplies the unwrapped cross compiler, hosted test compiler, Python
 with freetype/Pillow, Git, CMake, Ninja, mtools, Hack font, utilities and TLS certificates.
+Native C++ linking includes explicit libc++ library/rpath flags, since exported
+compiler wrappers do not inherit a Nix build shell's propagated flags.
 Mtools is required by the kernel's generated FAT test image; older SDK
 checkpoints can install it directly with `run /nix/bin/nix-install mtools`.
 Inside that shell:
 
 ```sh
-mkdir -p /data/bootstrap
+mkdir -p /data/home /data/tmp /data/bootstrap
 cd /data/bootstrap
 git clone --depth 1 https://github.com/IanNorris/Brook.git Brook
 cd Brook
 git submodule update --init --depth 1 -- vendor/uefi-headers src/third_party/fatfs
 export CMAKE_BUILD_PARALLEL_LEVEL=1
 ./scripts/build.sh Release
-ctest --test-dir build/release/host_tests --output-on-failure
+ctest --test-dir build/release/host_tests --output-on-failure --no-tests=error
 ```
 
 A core bootstrap requires newly generated `build/release/kernel/BROOK.elf`,
@@ -44,6 +46,40 @@ A core bootstrap requires newly generated `build/release/kernel/BROOK.elf`,
 Running host tests in Brook additionally exercises its native process/thread
 compatibility. Booting the guest-built kernel is a further verification step.
 All runtime images, package NARs, guest clones and logs stay outside git.
+
+## Verified milestone (2026-10-14)
+
+Inside Brook, an HTTPS clone of revision `e4aa4c0` and its two required
+submodules produced the kernel, EFI loader, 12 nonempty driver modules, seven
+bare-metal test ELFs and all 13 hosted test executables. The module validator
+checked all 12 modules against 96 exported symbols. The guest-built kernel,
+loader and modules then booted a separate VM with the desktop, virtio GPU,
+storage, networking and command bridge; Git ran under that kernel.
+
+The 13 hosted tests pass on the host. In Brook, all 13 currently segfault
+during shared-library startup (CTest exit 8), before their assertions run.
+This is a successful core source-build and boot milestone; native test runtime
+compatibility remains [backlogged](../../docs/backlog.md). The compiler and
+SDK are prebuilt Linux binaries, rather than a compiler built inside Brook.
+
+The local extracted outputs and SHA-256 manifest are retained under
+`build/experiments/results/bootstrap-20261014/guest-build-e4aa4c0`.
+For another verification, sync and stop the build VM before extracting
+`build/release` from its data disk. Keep the output layout (`kernel`,
+`bootloader`, `tests`) and use a separate copy of the prepared boot/data/Nix
+disks. Copy the guest-built modules into that boot disk's `DRIVERS` directory
+and its `kernel/ksym_addr_table.cpp` into `KSYM_ADDR.TXT`, as for a host build.
+Launch with both `BROOK_BUILD_DIR` pointing to the extracted build and
+`BROOK_APPS_RUN` pointing to the separate disk directory:
+
+```sh
+BROOK_BUILD_DIR="$PWD/build/experiments/results/bootstrap-20261014/guest-build-e4aa4c0" \
+BROOK_APPS_RUN="$PWD/build/experiments/results/bootstrap-guest-boot-e4aa4c0" \
+BROOK_AUDIODEV=none nix-shell --run './scripts/run_installed_apps.sh'
+```
+
+The bootstrap experiment disks include repaired interrupted-run metadata and
+are diagnostic artifacts, not replacements for the clean app checkpoint.
 
 The bootstrap investigation also reproduced a cross-mount mmap cache collision:
 a Git object on `/data` and Python's `_ctypes` library on `/nix` both had inode
