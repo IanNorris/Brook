@@ -577,6 +577,15 @@ inline bool ProcessInputPop(Process* proc, InputEvent* out)
 // Kernel thread entry point signature.
 using KernelThreadFn = void (*)(void* arg);
 
+// CLONE_FILES threads share the leader's table and must share its lock too.
+// The leader remains alive until its last address-space thread is reaped.
+inline SpinLock* ProcessFdLock(Process* proc)
+{
+    if (proc->isThread && proc->threadLeader && proc->fds == proc->threadLeader->fds)
+        return &proc->threadLeader->fdLock;
+    return &proc->fdLock;
+}
+
 // ---------------------------------------------------------------------------
 // API
 // ---------------------------------------------------------------------------

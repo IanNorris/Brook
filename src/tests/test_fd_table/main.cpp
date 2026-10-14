@@ -353,12 +353,51 @@ static void TestPinConcurrent()
                 static_cast<unsigned long long>(ROUNDS), PIN_SLOTS);
 }
 
+static std::atomic<int> duplicate_retains;
+static void DuplicateRetain(FdEntry*) { duplicate_retains.fetch_add(1); }
+
+static void TestDuplicate()
+{
+    FdEntry fds[MAX_FDS] = {};
+    SpinLock lock;
+    int source = FdTableAlloc(fds, &lock, FdType::MemFd, TokenHandle(1));
+    fds[source].dirPath[0] = '/';
+    fds[source].dirPath[1] = 'x';
+    fds[source].dirPath[2] = 0;
+    FdEntry* pinned = brook::FdTablePin(fds, &lock, source);
+    CHECK(pinned != nullptr, "duplicate source is pinned");
+    duplicate_retains.store(0);
+    std::atomic<int> errors{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 4; ++t) threads.emplace_back([&] {
+        for (int i = 0; i < 500; ++i) {
+            int fd = brook::FdTableDuplicatePinned(fds, &lock, pinned, 4, 1, DuplicateRetain);
+            if (fd < 4) { ++errors; continue; }
+            FdEntry* copy = brook::FdTablePin(fds, &lock, fd);
+            if (!copy || copy->handle != TokenHandle(1) || copy->fdFlags != 1 ||
+                copy->closing || copy->dirPath[1] != 'x') ++errors;
+            if (copy) {
+                FdClaimResult unused;
+                brook::FdTableUnpin(fds, &lock, fd, &unused);
+            }
+            FdClaimResult claimed;
+            if (!brook::FdTableClaim(fds, &lock, fd, &claimed)) ++errors;
+        }
+    });
+    for (auto& thread : threads) thread.join();
+    CHECK(errors.load() == 0, "concurrent duplicate slots preserve flags, path and handle");
+    CHECK(duplicate_retains.load() == 2000, "every published duplicate retains its handle");
+    FdClaimResult unused;
+    brook::FdTableUnpin(fds, &lock, source, &unused);
+}
+
 int main()
 {
     TestBasic();
     TestConcurrent();
     TestPinBasic();
     TestPinConcurrent();
+    TestDuplicate();
 
     if (g_failures == 0) {
         std::printf("test_fd_table: ALL PASS\n");

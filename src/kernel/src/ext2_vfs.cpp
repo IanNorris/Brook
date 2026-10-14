@@ -14,6 +14,7 @@
 #include "string.h"
 #include "sync/krwlock.h"
 #include "spinlock.h"
+#include "rtc.h"
 
 namespace brook {
 
@@ -578,7 +579,18 @@ static void Ext2Sync(Ext2Mount* mnt)
             }
         }
     }
-    if (mnt->bgdtDirty) Ext2WriteBGDT(mnt);
+    if (mnt->bgdtDirty && Ext2WriteBGDT(mnt)) {
+        // The superblock totals must agree with the group descriptors after
+        // guest allocations. Previously only the group counts were persisted.
+        uint32_t totals[2] = {};
+        for (uint32_t g = 0; g < mnt->groupCount; ++g) {
+            totals[0] += mnt->bgdt[g].bg_free_blocks_count;
+            totals[1] += mnt->bgdt[g].bg_free_inodes_count;
+        }
+        if (!Ext2DevWrite(mnt, 1024 + __builtin_offsetof(Ext2Superblock, s_free_blocks_count),
+                         totals, sizeof(totals)))
+            mnt->bgdtDirty = true;
+    }
     mnt->pendingMetaOps = 0;
 }
 
@@ -751,6 +763,7 @@ static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
         uint32_t nb = Ext2AllocBlock(mnt);
         if (!nb) return 0;
         ino->i_block[fileBlock] = nb;
+        ino->i_blocks += mnt->blockSize / 512;
         // Caller must write the inode back when its overall update is done.
         return nb;
     }
@@ -768,6 +781,7 @@ static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
             Ext2WriteBlock(mnt, nb, zb);
             kfree(zb);
             ino->i_block[12] = nb;
+            ino->i_blocks += mnt->blockSize / 512;
         }
         // Use the indirect-block read cache (fed by Ext2ReadIndPointer)
         // to avoid hitting the disk every time we extend a file in
@@ -790,6 +804,7 @@ static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
             SpinLockRelease(&mnt->indCacheLock);
         }
         Ext2DevWrite(mnt, off, &nb, 4);
+        ino->i_blocks += mnt->blockSize / 512;
         return nb;
     }
     fileBlock -= ptrsPerBlock;
@@ -805,6 +820,7 @@ static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
             Ext2WriteBlock(mnt, nb, zb);
             kfree(zb);
             ino->i_block[13] = nb;
+            ino->i_blocks += mnt->blockSize / 512;
         }
         uint32_t idx1 = fileBlock / ptrsPerBlock;
         uint32_t idx2 = fileBlock % ptrsPerBlock;
@@ -821,6 +837,7 @@ static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
             Ext2WriteBlock(mnt, indBlock, zb);
             kfree(zb);
             Ext2DevWrite(mnt, off1, &indBlock, 4);
+            ino->i_blocks += mnt->blockSize / 512;
         }
 
         uint64_t off2 = (static_cast<uint64_t>(indBlock) << mnt->blockShift) + idx2 * 4;
@@ -830,6 +847,7 @@ static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
         uint32_t nb = Ext2AllocBlock(mnt);
         if (!nb) return 0;
         Ext2DevWrite(mnt, off2, &nb, 4);
+        ino->i_blocks += mnt->blockSize / 512;
         return nb;
     }
 
@@ -925,8 +943,6 @@ static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
     uint64_t newEnd = offset + bytesWritten;
     if (newEnd > ino->i_size) {
         ino->i_size = static_cast<uint32_t>(newEnd);
-        ino->i_blocks = static_cast<uint32_t>(
-            ((newEnd + mnt->blockSize - 1) >> mnt->blockShift) * (mnt->blockSize / 512));
     }
     Ext2WriteInode(mnt, inoNum, ino);
 
@@ -989,12 +1005,26 @@ static void Ext2FreeInodeBlocks(Ext2Mount* mnt, Ext2Inode* ino)
 // ---------------------------------------------------------------------------
 
 // Add a directory entry to a directory inode.
+static bool Ext2PrepareDirectoryWrite(Ext2Mount* mnt, uint32_t dirIno, Ext2Inode* dirData)
+{
+    // Reads scan every directory block. Before a linear mutation, retire any
+    // host-created HTree index: its root/node payload is hidden by directory
+    // record lengths, and all leaf entries remain valid for linear scanning.
+    // Otherwise adding an entry to root slack destroys the still-advertised
+    // index and the next e2fsck reports a corrupt HTree root.
+    constexpr uint32_t EXT2_INDEX_FL = 0x1000;
+    if (!(dirData->i_flags & EXT2_INDEX_FL)) return true;
+    dirData->i_flags &= ~EXT2_INDEX_FL;
+    return Ext2WriteInode(mnt, dirIno, dirData);
+}
+
 static bool Ext2DirAdd(Ext2Mount* mnt, uint32_t dirIno, Ext2Inode* dirData,
                        uint32_t childIno, const char* name, uint8_t fileType)
 {
     uint32_t nameLen = 0;
     for (const char* p = name; *p; ++p) ++nameLen;
     if (nameLen == 0 || nameLen > 255) return false;
+    if (!Ext2PrepareDirectoryWrite(mnt, dirIno, dirData)) return false;
 
     // SerialPrintf("ext2: DirAdd '%s' (ino %u) into dir ino %u\n", name, childIno, dirIno);
 
@@ -1066,8 +1096,6 @@ static bool Ext2DirAdd(Ext2Mount* mnt, uint32_t dirIno, Ext2Inode* dirData,
 
     // Update directory size
     dirData->i_size = static_cast<uint32_t>(dirSize + mnt->blockSize);
-    dirData->i_blocks = static_cast<uint32_t>(
-        ((dirData->i_size + mnt->blockSize - 1) >> mnt->blockShift) * (mnt->blockSize / 512));
     Ext2WriteInode(mnt, dirIno, dirData);
     Ext2DirentCacheInvalidateParent(mnt, dirIno);
     return true;
@@ -1077,6 +1105,7 @@ static bool Ext2DirAdd(Ext2Mount* mnt, uint32_t dirIno, Ext2Inode* dirData,
 static uint32_t Ext2DirRemove(Ext2Mount* mnt, Ext2Inode* dirData,
                               uint32_t dirIno, const char* name)
 {
+    if (!Ext2PrepareDirectoryWrite(mnt, dirIno, dirData)) return 0;
     uint32_t nameLen = 0;
     for (const char* p = name; *p; ++p) ++nameLen;
 
@@ -1616,7 +1645,9 @@ static int Ext2DirReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
 {
     auto* dp = static_cast<Ext2DirPriv*>(vn->priv);
     uint64_t dirSize = Ext2InodeSize(&dp->inodeData);
-    (void)cookie;
+    // The caller only commits the cookie once a Linux dirent fits its buffer.
+    // Resume from that cookie so a buffer boundary cannot consume an entry.
+    if (cookie) dp->readOffset = *cookie;
 
     KRwLockReadLock(&g_ext2Lock);
 
@@ -1661,6 +1692,7 @@ static int Ext2DirReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
                 out->size = 0;
         }
 
+        if (cookie) *cookie = dp->readOffset;
         KRwLockReadUnlock(&g_ext2Lock);
         return 1;
     }
@@ -2207,6 +2239,9 @@ static int Ext2FsUnlink(void* mountPriv, uint8_t pdrv, const char* relPath)
         if (removedData.i_links_count == 0) {
             bool isDir = (removedData.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR;
             Ext2FreeInodeBlocks(mnt, &removedData);
+            // A freed inode with zero deletion time is inconsistent to fsck.
+            removedData.i_dtime = static_cast<uint32_t>(RtcNow());
+            if (!removedData.i_dtime) removedData.i_dtime = 1;
             Ext2WriteInode(mnt, removedIno, &removedData);
             Ext2FreeInode(mnt, removedIno, isDir);
         } else {

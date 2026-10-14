@@ -101,9 +101,9 @@ Uses `PROCESS_MAGIC` sentinel for use-after-free detection.
 
 | Function | Contract |
 |----------|----------|
-| `FdAlloc(proc, type, handle) → int` | Find first free slot, return fd index. Acquires proc->fdLock. Returns -EMFILE if full. |
-| `FdFree(proc, fd)` | Zero-fill the slot. Acquires proc->fdLock. |
-| `FdGet(proc, fd) → FdEntry*` | Bounds-check + None-check, return pointer or null. Acquires proc->fdLock for the type check. |
+| `FdAlloc(proc, type, handle) → int` | Find first free slot, return fd index. Acquires ProcessFdLock(proc). Returns -EMFILE if full. |
+| `FdFree(proc, fd)` | Zero-fill the slot. Acquires ProcessFdLock(proc). |
+| `FdGet(proc, fd) → FdEntry*` | Bounds-check + None-check, return pointer or null. Acquires ProcessFdLock(proc) for the type check. |
 | `ProcessCloseAllFds(proc)` | Close all fds (process exit). Delegates to CloseProcessFd. |
 | `ProcessCloseCloexecFds(proc)` | Close FD_CLOEXEC fds (execve). |
 
@@ -132,7 +132,7 @@ Uses `PROCESS_MAGIC` sentinel for use-after-free detection.
 
 3. **~~Self-copy in ProcessCreateThread~~** — **FIXED**: Removed no-op `g_sigHandlers` copy (thread->tgid == parent->tgid).
 
-4. **~~No lock on fd table~~**: **FIXED**: Added `SpinLock fdLock` to Process struct. `FdAlloc`, `FdFree`, and `FdGet` now acquire `proc->fdLock` to prevent races between CLONE_FILES threads sharing one fd table. `ProcessCloseAllFds` and `ProcessCloseCloexecFds` also hold the lock during iteration (releasing around individual close calls to avoid deadlock).
+4. **~~No lock on fd table~~**: **FIXED**: Added `SpinLock fdLock` to Process struct. `FdAlloc`, `FdFree`, and `FdGet` now acquire `ProcessFdLock(proc)` (the leader lock for a shared table) to prevent races between CLONE_FILES threads sharing one fd table. `ProcessCloseAllFds` and `ProcessCloseCloexecFds` also hold the lock during iteration (releasing around individual close calls to avoid deadlock).
 
 5. **~~ProcessSendSignal SIGKILL race~~** — **IMPROVED**: Now uses `__atomic_store` with RELEASE ordering for the Terminated state transition. SIGSTOP uses `SchedulerStop()` for proper ready queue removal. A small race window remains for processes Running on other CPUs (acceptable for hobby OS; production fix would need IPI).
 

@@ -92,6 +92,23 @@ static bool UserBufferWritable(uint64_t addr, uint64_t len)
         if ((!pte || !(*pte & brook::VMM_PRESENT)) &&
             (MemFdHandleUserFault(pg, 0x6) || FileMapHandleUserFault(pg, 0x6)))
             pte = brook::VmmGetPte(proc->pageTable, brook::VirtualAddress(pg));
+        // A fork-protected writable page is a valid syscall output buffer.
+        // Resolve COW before checking write permission, just as a user store
+        // would do; genuinely read-only mappings must still fail.
+        if (pte && (*pte & (brook::VMM_PRESENT | brook::VMM_USER | brook::PTE_COW_BIT)) ==
+                   (brook::VMM_PRESENT | brook::VMM_USER | brook::PTE_COW_BIT)) {
+            uint32_t owner = proc->isThread && proc->threadLeader
+                           ? proc->threadLeader->pid : proc->pid;
+            auto result = brook::VmmCowResolveWrite(proc->pageTable,
+                                                   brook::VirtualAddress(pg), owner);
+            if (result == brook::VmmCowResult::OutOfMemory) return false;
+            if (result == brook::VmmCowResult::Resolved) {
+                __asm__ volatile("invlpg (%0)" :: "r"(pg) : "memory");
+                brook::TlbShootdown(proc->pageTable.pml4.raw(), pg,
+                                   *brook::AddressSpaceTlbMaskPtr(proc));
+            }
+            pte = brook::VmmGetPte(proc->pageTable, brook::VirtualAddress(pg));
+        }
         if (!pte) return false;
         if ((*pte & (brook::VMM_PRESENT | brook::VMM_USER | brook::VMM_WRITABLE)) !=
             (brook::VMM_PRESENT | brook::VMM_USER | brook::VMM_WRITABLE))
@@ -3637,10 +3654,20 @@ static int64_t sys_brk(uint64_t newBreak, uint64_t, uint64_t,
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -ENOMEM;
+    if (proc->isThread && proc->threadLeader) proc = proc->threadLeader;
 
     // BRO-206: back-pressure before growing/shrinking the heap (a frame
     // producer/retirer) so heap churn cannot outrun the quarantine drain.
     PmmThrottleForDrain();
+
+    // The break belongs to the shared address space. A copied per-thread
+    // break remapped and zeroed live heap pages when a sibling grew it.
+    static SpinLock brkLock;
+    struct BrkGuard {
+        SpinLock* lock;
+        explicit BrkGuard(SpinLock* value) : lock(value) { SpinLockAcquire(lock); }
+        ~BrkGuard() { SpinLockRelease(lock); }
+    } guard(&brkLock);
 
     // brk(0) = query current break
     if (newBreak == 0)
@@ -3665,12 +3692,17 @@ static int64_t sys_brk(uint64_t newBreak, uint64_t, uint64_t,
 
     for (uint64_t addr = oldPage; addr < newPage; addr += 4096)
     {
+        // Shrinking leaves pages mapped in this implementation. Reuse those
+        // pages on regrowth instead of replacing their physical frames.
+        if (VmmVirtToPhys(proc->pageTable, VirtualAddress(addr))) continue;
         PhysicalAddress phys = PmmAllocPage(MemTag::User, proc->pid);
         if (!phys) return static_cast<int64_t>(proc->programBreak);
 
         if (!VmmMapPage(proc->pageTable, VirtualAddress(addr), phys,
-                        VMM_WRITABLE | VMM_USER, MemTag::User, proc->pid))
+                        VMM_WRITABLE | VMM_USER, MemTag::User, proc->pid)) {
+            PmmFreePage(phys);
             return static_cast<int64_t>(proc->programBreak);
+        }
 
         // Zero via kernel direct map (safe regardless of page permissions)
         auto* kp = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
@@ -7695,6 +7727,7 @@ static int64_t sys_getdents64(uint64_t fd, uint64_t bufAddr, uint64_t count,
 
     DirEntry de; de.name[0] = 0; de.size = 0; de.isDir = false;
     while (pos < count) {
+        uint32_t nextCookie = cookie;
         if (rootDir && cookie < rootMountCount)
         {
             if (!VfsRootMountNameAt(cookie, de.name, sizeof(de.name)))
@@ -7710,7 +7743,7 @@ static int64_t sys_getdents64(uint64_t fd, uint64_t bufAddr, uint64_t count,
             uint32_t fsCookie = rootDir ? (cookie - rootMountCount) : cookie;
             int ret = VfsReaddir(vn, &de, &fsCookie);
             if (ret <= 0) break;
-            cookie = rootDir ? (fsCookie + rootMountCount) : fsCookie;
+            nextCookie = rootDir ? (fsCookie + rootMountCount) : fsCookie;
         }
 
         uint64_t nameLen = 0;
@@ -7718,7 +7751,11 @@ static int64_t sys_getdents64(uint64_t fd, uint64_t bufAddr, uint64_t count,
 
         // d_name starts at offset 19 in LinuxDirent64
         uint64_t reclen = (19 + nameLen + 1 + 7) & ~7ULL;
-        if (pos + reclen > count) break;
+        if (pos + reclen > count) {
+            if (pos == 0) return -EINVAL;
+            break;
+        }
+        cookie = nextCookie;
 
         auto* ent = reinterpret_cast<LinuxDirent64*>(buf + pos);
         ent->d_ino = cookie + 1;
@@ -7738,6 +7775,12 @@ static int64_t sys_getdents64(uint64_t fd, uint64_t bufAddr, uint64_t count,
 
     fde->seekPos = cookie;
     return static_cast<int64_t>(pos);
+}
+
+static int64_t sys_sync(uint64_t, uint64_t, uint64_t,
+                        uint64_t, uint64_t, uint64_t)
+{
+    return VfsSync(nullptr);
 }
 
 static int64_t sys_fsync(uint64_t fd, uint64_t, uint64_t,
@@ -8136,34 +8179,12 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
     case F_DUPFD:
     case F_DUPFD_CLOEXEC:
     {
-        // Find lowest free fd >= arg
         int minFd = static_cast<int>(arg);
-        int newfd = -1;
-        for (int i = minFd; i < static_cast<int>(MAX_FDS); i++)
-        {
-            if (proc->fds[i].type == FdType::None)
-            {
-                newfd = i;
-                break;
-            }
-        }
+        if (minFd < 0 || minFd >= static_cast<int>(MAX_FDS)) return -EINVAL;
+        int newfd = FdTableDuplicatePinned(proc->fds, ProcessFdLock(proc), fde,
+                    static_cast<uint32_t>(minFd),
+                    (cmd == F_DUPFD_CLOEXEC) ? FD_CLOEXEC : 0, FdBumpRefcount);
         if (newfd < 0) return -EMFILE;
-
-        proc->fds[newfd].type = fde->type;
-        proc->fds[newfd].flags = fde->flags;
-        proc->fds[newfd].fdFlags = (cmd == F_DUPFD_CLOEXEC) ? FD_CLOEXEC : 0;
-        proc->fds[newfd].handle = fde->handle;
-        proc->fds[newfd].seekPos = fde->seekPos;
-        proc->fds[newfd].statusFlags = fde->statusFlags;
-
-        // Bump the underlying object's refcount for the new fd. Use the shared
-        // helper (same as sys_dup) rather than a hand-rolled per-type list, so
-        // every fd type — including DrmPrime — is covered. A previous hand-rolled
-        // list here omitted DrmPrime, so a libwayland F_DUPFD_CLOEXEC dup of a
-        // PRIME dmabuf fd didn't take a ref; the client closing the original then
-        // freed the shared resource out from under the dup (BRO-191).
-        FdBumpRefcount(&proc->fds[newfd]);
-
         return newfd;
     }
     case F_GETFD:
@@ -8940,12 +8961,13 @@ static int64_t sys_symlink(uint64_t targetAddr, uint64_t linkpathAddr, uint64_t,
 static int64_t sys_symlinkat(uint64_t targetAddr, uint64_t newdirfd, uint64_t linkpathAddr,
                               uint64_t, uint64_t, uint64_t)
 {
-    char linkBuf[256];
+    char targetBuf[256], linkBuf[256];
+    if (!CopyUserCString(targetAddr, targetBuf, sizeof(targetBuf))) return -EFAULT;
     if (!CopyUserCString(linkpathAddr, linkBuf, sizeof(linkBuf))) return -EFAULT;
     char resolved[256];
     if (!ResolveAtPath(static_cast<int>(newdirfd), linkBuf, resolved, sizeof(resolved)))
-        return sys_symlink(targetAddr, linkpathAddr, 0, 0, 0, 0);
-    return sys_symlink(targetAddr, reinterpret_cast<uint64_t>(resolved), 0, 0, 0, 0);
+        return -EBADF;
+    return VfsSymlink(targetBuf, resolved);
 }
 
 // ---------------------------------------------------------------------------
@@ -9941,12 +9963,8 @@ static int64_t sys_rmdir(uint64_t pathAddr, uint64_t, uint64_t,
 // sys_unlink (87) — delete a file
 // ---------------------------------------------------------------------------
 
-static int64_t sys_unlink(uint64_t pathAddr, uint64_t, uint64_t,
-                           uint64_t, uint64_t, uint64_t)
+static int64_t DoUnlink(const char* path)
 {
-    char pathBuf[256];
-    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
-    const char* path = pathBuf;
 
     // /dev/shm/<name> — shm_unlink: mark entry as free
     if (path[0]=='/' && path[1]=='d' && path[2]=='e' && path[3]=='v' &&
@@ -9968,6 +9986,14 @@ static int64_t sys_unlink(uint64_t pathAddr, uint64_t, uint64_t,
     if (VfsUnlink(bootPath) == 0) return 0;
 
     return -ENOENT;
+}
+
+static int64_t sys_unlink(uint64_t pathAddr, uint64_t, uint64_t,
+                           uint64_t, uint64_t, uint64_t)
+{
+    char pathBuf[256];
+    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
+    return DoUnlink(pathBuf);
 }
 
 // ---------------------------------------------------------------------------
@@ -10000,12 +10026,8 @@ static int64_t sys_rename(uint64_t oldAddr, uint64_t newAddr, uint64_t,
     return -ENOENT;
 }
 
-static int64_t sys_mkdir(uint64_t pathAddr, uint64_t, uint64_t,
-                          uint64_t, uint64_t, uint64_t)
+static int64_t DoMkdir(const char* path)
 {
-    char pathBuf[256];
-    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
-    const char* path = pathBuf;
 
     int rc = VfsMkdir(path);
     if (rc == 0) return 0;
@@ -10021,6 +10043,14 @@ static int64_t sys_mkdir(uint64_t pathAddr, uint64_t, uint64_t,
     return -ENOENT;
 }
 
+static int64_t sys_mkdir(uint64_t pathAddr, uint64_t, uint64_t,
+                          uint64_t, uint64_t, uint64_t)
+{
+    char pathBuf[256];
+    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
+    return DoMkdir(pathBuf);
+}
+
 // ---------------------------------------------------------------------------
 // sys_mkdirat (258) — create a directory relative to dirfd
 // ---------------------------------------------------------------------------
@@ -10033,8 +10063,9 @@ static int64_t sys_mkdirat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
     const char* path = pathBuf;
     char resolved[256];
     if (!ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
-        return sys_mkdir(pathAddr, mode, 0, 0, 0, 0);
-    return sys_mkdir(reinterpret_cast<uint64_t>(resolved), mode, 0, 0, 0, 0);
+        return -EBADF;
+    (void)mode;
+    return DoMkdir(resolved);
 }
 
 // ---------------------------------------------------------------------------
@@ -10053,8 +10084,8 @@ static int64_t sys_unlinkat(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
     const char* path = pathBuf;
     char resolved[256];
     if (!ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
-        return sys_unlink(pathAddr, 0, 0, 0, 0, 0);
-    return sys_unlink(reinterpret_cast<uint64_t>(resolved), 0, 0, 0, 0, 0);
+        return -EBADF;
+    return DoUnlink(resolved);
 }
 
 // ---------------------------------------------------------------------------
@@ -13598,6 +13629,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_FCNTL]           = sys_fcntl;
     g_syscallTable[SYS_FSYNC]           = sys_fsync;
     g_syscallTable[SYS_FDATASYNC]       = sys_fsync;
+    g_syscallTable[SYS_SYNC]            = sys_sync;
     g_syscallTable[SYS_GETCWD]          = sys_getcwd;
     g_syscallTable[SYS_GETTIMEOFDAY]    = sys_gettimeofday;
     g_syscallTable[SYS_TIME]             = sys_time;

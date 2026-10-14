@@ -55,6 +55,7 @@ static constexpr uint64_t SYS_UNAME           = 63;
 static constexpr uint64_t SYS_FCNTL           = 72;
 static constexpr uint64_t SYS_FSYNC           = 74;
 static constexpr uint64_t SYS_FDATASYNC       = 75;
+static constexpr uint64_t SYS_SYNC           = 162;
 static constexpr uint64_t SYS_GETCWD          = 79;
 static constexpr uint64_t SYS_GETTIMEOFDAY    = 96;
 static constexpr uint64_t SYS_GETUID           = 102;

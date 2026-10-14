@@ -128,8 +128,29 @@ inline int FdTableAlloc(FdEntry* fds, SpinLock* lock, FdType type, void* handle)
     return -1;
 }
 
-// Unconditionally clear a slot. Used by paths that have already taken
-// ownership of the handle (e.g. dup2 replacing a target after claiming it).
+// The caller pins source. Retain its handle before making a fully initialized
+// duplicate visible, under the same lock as allocation and close operations.
+inline int FdTableDuplicatePinned(FdEntry* fds, SpinLock* lock, const FdEntry* source,
+                                 uint32_t minimum, uint8_t fdFlags,
+                                 void (*retain)(FdEntry*))
+{
+    SpinLockAcquire(lock);
+    for (uint32_t i = minimum; i < MAX_FDS; ++i) {
+        if (fds[i].type != FdType::None) continue;
+        FdEntry copy = *source;
+        copy.pinCount = 0;
+        copy.closing = 0;
+        copy.fdFlags = fdFlags;
+        if (retain) retain(&copy);
+        fds[i] = copy;
+        SpinLockRelease(lock);
+        return static_cast<int>(i);
+    }
+    SpinLockRelease(lock);
+    return -1;
+}
+
+// Unconditionally clear a slot after the caller takes ownership of its handle.
 inline void FdTableFree(FdEntry* fds, SpinLock* lock, int fd)
 {
     if (fd < 0 || fd >= static_cast<int>(MAX_FDS)) return;

@@ -191,7 +191,7 @@ static FdEntry* AllocFdTable()
 int FdAlloc(Process* proc, FdType type, void* handle)
 {
     if (!proc || !proc->fds) return -24; // EMFILE
-    int fd = FdTableAlloc(proc->fds, &proc->fdLock, type, handle);
+    int fd = FdTableAlloc(proc->fds, ProcessFdLock(proc), type, handle);
     if (fd < 0)
     {
         SerialPrintf("FD: pid %u exhausted %u fds\n", proc->pid, MAX_FDS);
@@ -203,25 +203,25 @@ int FdAlloc(Process* proc, FdType type, void* handle)
 void FdFree(Process* proc, int fd)
 {
     if (!proc || !proc->fds) return;
-    FdTableFree(proc->fds, &proc->fdLock, fd);
+    FdTableFree(proc->fds, ProcessFdLock(proc), fd);
 }
 
 FdEntry* FdGet(Process* proc, int fd)
 {
     if (!proc || !proc->fds) return nullptr;
-    return FdTableGet(proc->fds, &proc->fdLock, fd);
+    return FdTableGet(proc->fds, ProcessFdLock(proc), fd);
 }
 
 bool FdClaim(Process* proc, int fd, FdClaimResult* out)
 {
     if (!proc || !proc->fds) return false;
-    return FdTableClaim(proc->fds, &proc->fdLock, fd, out);
+    return FdTableClaim(proc->fds, ProcessFdLock(proc), fd, out);
 }
 
 FdEntry* FdGetRef(Process* proc, int fd)
 {
     if (!proc || !proc->fds) return nullptr;
-    return FdTablePin(proc->fds, &proc->fdLock, fd);
+    return FdTablePin(proc->fds, ProcessFdLock(proc), fd);
 }
 
 void FdPut(Process* proc, int fd)
@@ -230,14 +230,14 @@ void FdPut(Process* proc, int fd)
     FdClaimResult c;
     // If this drops the last pin on a slot whose close() was deferred, the core
     // hands back the snapshot to finalize the handle outside the table lock.
-    if (FdTableUnpin(proc->fds, &proc->fdLock, fd, &c))
+    if (FdTableUnpin(proc->fds, ProcessFdLock(proc), fd, &c))
         FinalizeClosedFd(c);
 }
 
 FdCloseResult FdClose(Process* proc, int fd, FdClaimResult* out)
 {
     if (!proc || !proc->fds) return FdCloseResult::NotFound;
-    return FdTableClose(proc->fds, &proc->fdLock, fd, out);
+    return FdTableClose(proc->fds, ProcessFdLock(proc), fd, out);
 }
 
 // ---------------------------------------------------------------------------
@@ -940,35 +940,35 @@ static void CloseFdEntry(Process* proc, uint32_t i)
 void ProcessCloseCloexecFds(Process* proc)
 {
     if (!proc) return;
-    SpinLockAcquire(&proc->fdLock);
+    SpinLockAcquire(ProcessFdLock(proc));
     for (uint32_t i = 0; i < MAX_FDS; ++i)
     {
         FdEntry& fde = proc->fds[i];
         if (fde.type == FdType::None) continue;
         if (!(fde.fdFlags & 1)) continue; // not FD_CLOEXEC
-        SpinLockRelease(&proc->fdLock);
+        SpinLockRelease(ProcessFdLock(proc));
         CloseFdEntry(proc, i);
-        SpinLockAcquire(&proc->fdLock);
+        SpinLockAcquire(ProcessFdLock(proc));
     }
-    SpinLockRelease(&proc->fdLock);
+    SpinLockRelease(ProcessFdLock(proc));
 }
 
 void ProcessCloseAllFds(Process* proc)
 {
     if (!proc) return;
 
-    SpinLockAcquire(&proc->fdLock);
+    SpinLockAcquire(ProcessFdLock(proc));
     for (uint32_t i = 0; i < MAX_FDS; ++i)
     {
         FdEntry& fde = proc->fds[i];
         if (fde.type == FdType::None) continue;
-        SpinLockRelease(&proc->fdLock);
+        SpinLockRelease(ProcessFdLock(proc));
         // BRO-156: force teardown even if a killed thread left this slot pinned;
         // all sibling threads are gone by now, so no FdPut will ever drain it.
         CloseProcessFdForced(proc, static_cast<int>(i));
-        SpinLockAcquire(&proc->fdLock);
+        SpinLockAcquire(ProcessFdLock(proc));
     }
-    SpinLockRelease(&proc->fdLock);
+    SpinLockRelease(ProcessFdLock(proc));
 }
 
 void ProcessDestroy(Process* proc)
@@ -1337,6 +1337,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
 
     // Copy entire parent process struct as a starting point
     memcpy(child, parent, sizeof(Process));
+    child->fdLock.next = child->fdLock.serving = 0;
     child->magic = PROCESS_MAGIC;
     child->incarnation = NextIncarnation();
     child->leaderIncarnation = 0;   // a fork child is its own leader

@@ -2857,7 +2857,7 @@ bool SchedulerGetFdByIndex(uint16_t pid, uint32_t index, int* outFd, FdSnapshot*
         if (!p || p->pid != pid) continue;
         if (!p->fds) { SchedLockRelease(g_allProcLock, flags); return false; }
 
-        SpinLockAcquire(&p->fdLock);
+        SpinLockAcquire(ProcessFdLock(p));
         uint32_t found = 0;
         for (uint32_t fd = 0; fd < MAX_FDS; ++fd)
         {
@@ -2866,13 +2866,13 @@ bool SchedulerGetFdByIndex(uint16_t pid, uint32_t index, int* outFd, FdSnapshot*
             {
                 *outFd = static_cast<int>(fd);
                 FillFdSnapshot(outSnap, p->fds[fd]);
-                SpinLockRelease(&p->fdLock);
+                SpinLockRelease(ProcessFdLock(p));
                 SchedLockRelease(g_allProcLock, flags);
                 return true;
             }
             ++found;
         }
-        SpinLockRelease(&p->fdLock);
+        SpinLockRelease(ProcessFdLock(p));
         SchedLockRelease(g_allProcLock, flags);
         return false;
     }
@@ -2890,15 +2890,15 @@ bool SchedulerGetFdInfo(uint16_t pid, int fd, FdSnapshot* outSnap)
         if (!p || p->pid != pid) continue;
         if (!p->fds) { SchedLockRelease(g_allProcLock, flags); return false; }
 
-        SpinLockAcquire(&p->fdLock);
+        SpinLockAcquire(ProcessFdLock(p));
         if (p->fds[fd].type == FdType::None)
         {
-            SpinLockRelease(&p->fdLock);
+            SpinLockRelease(ProcessFdLock(p));
             SchedLockRelease(g_allProcLock, flags);
             return false;
         }
         FillFdSnapshot(outSnap, p->fds[fd]);
-        SpinLockRelease(&p->fdLock);
+        SpinLockRelease(ProcessFdLock(p));
         SchedLockRelease(g_allProcLock, flags);
         return true;
     }
