@@ -54,14 +54,11 @@ implementation for capture was found; the earlier experiment notes also list
 relative-pointer support as absent. The Quake 1 port's SDL call is a client of
 capture, rather than a compositor implementation to recover.
 
-REC-01 overnight check: stable inode reporting (`8592ff2`), trailing-slash
-resolution (`b5cb813`) and the sleeping-lock ownership/spurious-wakeup fixes
-are already merged. The rename destination-inode cleanup (`d9bbaf5`) remains
-unmerged and the corresponding orphaning code is still present. That patch
-needs same-inode/hardlink no-op, destination type/emptiness and open-file
-lifetime validation before adoption. The package-install reproduction also
-exposed separate ext2 sector-accounting and stale superblock-total defects;
-fixing those is not evidence that the rename problem is resolved.
+REC-01 lifetime and replacement accounting are now fixed and validated by all
+24 guest probe checks, actual inode reuse and a synced offline-fsck-clean disk
+with allocation counts restored. See [bootstrap evidence](bootstrap.md). Keep
+partial-I/O rollback, crash consistency and concurrent mount teardown leases
+as follow-ups rather than reviving the old patch wholesale.
 
 ### Bridge validation follow-up
 
@@ -209,13 +206,10 @@ real truncate semantics before enabling them; memfd/framebuffer sharing remains
 supported. Keep these separate from the validated file
 creation, chmod and timestamp fixes.
 
-Bootstrap Git retries also exposed ext2 rename-overwrite leaks: replacing
-`.git/config` removes its old directory entry without releasing the destination
-inode/blocks. A synced stopped disk then reports unattached old config inodes
-in `e2fsck -fn` (sizes 36/53/67/92 bytes), despite correct allocation bitmaps.
-Fix replacement accounting, same-inode rename and failure rollback, including
-open-destination semantics; verify repeated replacements followed by offline
-fsck. This is separate from the unsynced-stop corruption fixed in the bridge.
+Bootstrap rename-overwrite, open-unlinked lifetime and directory accounting
+now pass the expanded semantic probe and synced offline fsck. Remaining work
+is injected-I/O failure handling, rollback auditing and crash consistency;
+normal synced shutdown is not a power-loss durability guarantee.
 
 The readiness probe found that `UserBufferReadable` accepts mapped `PROT_NONE`
 pages; enforce access permissions consistently in user-buffer validation and
@@ -229,16 +223,13 @@ different disks. Writable ext2 regular files now bypass shared mmap caching
 after a real Git update reproduced stale source bytes. Restore cache sharing
 and read-ahead only with synchronized write/truncate/unlink/inode-reuse
 invalidation; fresh mappings now pass append, pwrite, O_TRUNC and actual inode
-reuse probes. Open directory paths also truncate at 62 bytes, and unlink frees
-storage still referenced by open vnodes. Add multi-mount mmap, long-dirfd-path
-and unlink-while-open regressions. The phantom Git references were separately
+reuse probes. Open directory paths still truncate at 62 bytes; add long-dirfd
+regressions. Multi-mount mmap and unlink-while-open probes now pass. The phantom Git references were separately
 traced to the missing-directory `/boot/lib` fallback, not proven cache aliasing.
 
-Ext2 directory removal also needs proper empty-directory validation and link
-accounting: the shared unlink path decrements a directory's link count only
-once, leaving its `.` reference allocated after removal. Test empty/nonempty
-rmdir and parent link counts with offline fsck. Access variants still do not
-evaluate requested permission bits; classic relative readlink needs a cwd audit.
+Ext2 directory type, emptiness and link accounting now pass with offline fsck.
+Access variants still do not evaluate requested permission bits; classic
+relative readlink needs a cwd audit.
 
 The bootstrap SIMD probe exposed syscall entry clobbering user XMM/YMM state:
 anonymous mmap and brk zero-fill used XMM0 without preserving it. Stack XSAVE/
@@ -259,8 +250,8 @@ opens its temporary script then unlinks it, but ext2 frees the inode while the
 fd still needs its contents. A Python `-` checker consequently read EOF and
 silently did nothing (previously also entering REPL due to wrong TTY metadata).
 The module validator now uses a named Python script and checks nonempty outputs.
-Implement delayed inode reclamation and add an unlinked-file stdin regression
-before relying on large heredocs in guest application scripts.
+Delayed reclamation now passes open-descriptor, fork and mapping regressions.
+Add a real large Bash heredoc/stdin regression alongside those lower-level probes.
 
 The uncached mmap path exposed process cleanup dropping file PTEs without
 releasing their physical references. Cleanup now unmaps and unreferences each

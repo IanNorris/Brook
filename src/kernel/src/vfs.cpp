@@ -359,6 +359,10 @@ bool VfsUnmount(const char* mountPoint)
         if (!g_mounts[i].used) continue;
         if (!StrEq(g_mounts[i].mountPoint, mountPoint)) continue;
 
+        if (g_mounts[i].fsOps && g_mounts[i].fsOps->can_unmount &&
+            !g_mounts[i].fsOps->can_unmount(g_mounts[i].mountPriv))
+            return false;
+
         if (g_mounts[i].fsOps && g_mounts[i].fsOps->unmount)
             g_mounts[i].fsOps->unmount(g_mounts[i].mountPriv);
 
@@ -627,6 +631,20 @@ int VfsUnlink(const char* path)
     return mount->fsOps->unlink(mount->mountPriv, mount->pdrv, relPath);
 }
 
+int VfsRemovePath(const char* path, bool directory)
+{
+    if (!path || !path[0]) return -2;
+    const char* relPath = nullptr;
+    MountEntry* mount = FindMount(path, &relPath);
+    if (!mount || !mount->fsOps) return -2;
+    if (mount->fsOps->remove_path)
+        return mount->fsOps->remove_path(mount->mountPriv, mount->pdrv, relPath, directory);
+    VnodeStat st;
+    if (VfsLstatPath(path, &st) != 0) return -2;
+    if (st.isDir != directory) return directory ? -20 : -21;
+    return VfsUnlink(path);
+}
+
 int VfsMkdir(const char* path)
 {
     if (!path || !path[0]) return -1;
@@ -643,7 +661,8 @@ int VfsRename(const char* oldPath, const char* newPath)
     const char* relNew = nullptr;
     MountEntry* mountOld = FindMount(oldPath, &relOld);
     MountEntry* mountNew = FindMount(newPath, &relNew);
-    if (!mountOld || !mountNew || mountOld != mountNew) return -1;
+    if (!mountOld || !mountNew) return -2;
+    if (mountOld != mountNew) return -18;
     if (!mountOld->fsOps || !mountOld->fsOps->rename) return -1;
     return mountOld->fsOps->rename(mountOld->mountPriv, mountOld->pdrv, relOld, relNew);
 }

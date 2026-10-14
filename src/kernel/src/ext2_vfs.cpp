@@ -264,11 +264,77 @@ struct Ext2DirentCacheEntry {
 
 static constexpr uint32_t EXT2_OPS_PER_AUTO_SYNC = 256;
 
+struct Ext2OpenInode {
+    Ext2Mount* mnt;
+    uint32_t inode;
+    uint32_t holders;
+    bool orphan;
+    Ext2OpenInode* next;
+};
+
+// Final vnode close can run in the timer's reaper. This lock protects only
+// bookkeeping; it never nests filesystem I/O, allocation or the ext2 rwlock.
+static IrqSpinLock g_ext2OpenLock;
+static Ext2OpenInode* g_ext2OpenInodes;
+
+// Called with the filesystem lock held, before publishing a vnode.
+static Ext2OpenInode* Ext2HoldInode(Ext2Mount* mnt, uint32_t inode)
+{
+    auto* candidate = static_cast<Ext2OpenInode*>(kmalloc(sizeof(Ext2OpenInode)));
+    if (!candidate) return nullptr;
+    *candidate = {mnt, inode, 1, false, nullptr};
+    uint64_t flags = IrqSpinLockAcquire(&g_ext2OpenLock);
+    for (auto* p = g_ext2OpenInodes; p; p = p->next) {
+        if (p->mnt == mnt && p->inode == inode) {
+            ++p->holders;
+            IrqSpinLockRelease(&g_ext2OpenLock, flags);
+            kfree(candidate);
+            return p;
+        }
+    }
+    candidate->next = g_ext2OpenInodes;
+    g_ext2OpenInodes = candidate;
+    IrqSpinLockRelease(&g_ext2OpenLock, flags);
+    return candidate;
+}
+
+static void Ext2ReleaseInode(Ext2OpenInode* inode)
+{
+    if (!inode) return;
+    bool dispose = false;
+    uint64_t flags = IrqSpinLockAcquire(&g_ext2OpenLock);
+    if (--inode->holders == 0 && !inode->orphan) {
+        auto** link = &g_ext2OpenInodes;
+        while (*link && *link != inode) link = &(*link)->next;
+        if (*link) *link = inode->next;
+        dispose = true;
+    }
+    // Zero-holder orphans remain queued until a filesystem writer/sync can
+    // reclaim them. Closing from an IRQ never acquires a sleeping lock.
+    IrqSpinLockRelease(&g_ext2OpenLock, flags);
+    if (dispose) kfree(inode);
+}
+
+static bool Ext2MarkOpenOrphan(Ext2Mount* mnt, uint32_t inode)
+{
+    uint64_t flags = IrqSpinLockAcquire(&g_ext2OpenLock);
+    for (auto* p = g_ext2OpenInodes; p; p = p->next) {
+        if (p->mnt == mnt && p->inode == inode) {
+            p->orphan = true;
+            IrqSpinLockRelease(&g_ext2OpenLock, flags);
+            return true;
+        }
+    }
+    IrqSpinLockRelease(&g_ext2OpenLock, flags);
+    return false;
+}
+
 // Per-open-file state
 struct Ext2FilePriv {
     Ext2Mount* mnt;
     uint32_t   inode;
     Ext2Inode  inodeData;
+    Ext2OpenInode* hold;
 };
 
 // Per-open-dir state
@@ -277,6 +343,7 @@ struct Ext2DirPriv {
     uint32_t   inode;
     Ext2Inode  inodeData;
     uint32_t   readOffset; // byte offset into directory data
+    Ext2OpenInode* hold;
 };
 
 static KRwLock g_ext2Lock;
@@ -680,6 +747,7 @@ static bool Ext2FreeBlock(Ext2Mount* mnt, uint32_t blockNum)
 
     uint8_t* bitmap = Ext2GetBlockBitmap(mnt, g);
     if (!bitmap) return false;
+    if (!(bitmap[bit / 8] & (1 << (bit % 8)))) return true;
     bitmap[bit / 8] &= ~(1 << (bit % 8));
     mnt->blockBitmapDirty[g] = true;
     mnt->bgdt[g].bg_free_blocks_count++;
@@ -745,6 +813,7 @@ static bool Ext2FreeInode(Ext2Mount* mnt, uint32_t ino, bool isDir)
 
     uint8_t* bitmap = Ext2GetInodeBitmap(mnt, g);
     if (!bitmap) return false;
+    if (!(bitmap[bit / 8] & (1 << (bit % 8)))) return true;
     bitmap[bit / 8] &= ~(1 << (bit % 8));
     mnt->inodeBitmapDirty[g] = true;
     mnt->bgdt[g].bg_free_inodes_count++;
@@ -754,6 +823,7 @@ static bool Ext2FreeInode(Ext2Mount* mnt, uint32_t ino, bool isDir)
     if (mnt->nextFreeInodeHint && bit < mnt->nextFreeInodeHint[g])
         mnt->nextFreeInodeHint[g] = bit;
     Ext2InodeCacheInvalidate(mnt, ino);
+    Ext2DirentCacheInvalidateParent(mnt, ino);
     return true;
 }
 
@@ -965,54 +1035,140 @@ static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
 }
 
 // Free all data blocks of an inode (direct + indirect).
-static void Ext2FreeInodeBlocks(Ext2Mount* mnt, Ext2Inode* ino)
+struct Ext2FreeBatch {
+    Ext2FreeBatch* next;
+    uint32_t count;
+    uint32_t blocks[256];
+};
+
+static void Ext2DisposeFreeBatch(Ext2FreeBatch* batch)
 {
-    uint32_t ptrsPerBlock = mnt->blockSize / 4;
+    while (batch) { auto* next = batch->next; kfree(batch); batch = next; }
+}
 
-    // Direct blocks
-    for (int i = 0; i < 12; ++i) {
-        if (ino->i_block[i]) { Ext2FreeBlock(mnt, ino->i_block[i]); ino->i_block[i] = 0; }
-    }
-
-    // Singly indirect
-    if (ino->i_block[12]) {
-        auto* ind = static_cast<uint32_t*>(kmalloc(mnt->blockSize));
-        if (ind) {
-            Ext2ReadBlock(mnt, ino->i_block[12], ind);
-            for (uint32_t i = 0; i < ptrsPerBlock; ++i)
-                if (ind[i]) Ext2FreeBlock(mnt, ind[i]);
-            kfree(ind);
-        }
-        Ext2FreeBlock(mnt, ino->i_block[12]);
-        ino->i_block[12] = 0;
-    }
-
-    // Doubly indirect
-    if (ino->i_block[13]) {
-        auto* dind = static_cast<uint32_t*>(kmalloc(mnt->blockSize));
-        if (dind) {
-            Ext2ReadBlock(mnt, ino->i_block[13], dind);
-            for (uint32_t i = 0; i < ptrsPerBlock; ++i) {
-                if (dind[i]) {
-                    auto* ind = static_cast<uint32_t*>(kmalloc(mnt->blockSize));
-                    if (ind) {
-                        Ext2ReadBlock(mnt, dind[i], ind);
-                        for (uint32_t j = 0; j < ptrsPerBlock; ++j)
-                            if (ind[j]) Ext2FreeBlock(mnt, ind[j]);
-                        kfree(ind);
-                    }
-                    Ext2FreeBlock(mnt, dind[i]);
-                }
+static bool Ext2CollectFreeTree(Ext2Mount* mnt, uint32_t block, unsigned depth,
+                                Ext2FreeBatch** batch)
+{
+    if (!block) return true;
+    if (block < mnt->firstDataBlock || block >= mnt->totalBlocks) return false;
+    uint32_t rel = block - mnt->firstDataBlock;
+    uint8_t* bitmap = Ext2GetBlockBitmap(mnt, rel / mnt->blocksPerGroup);
+    uint32_t bit = rel % mnt->blocksPerGroup;
+    if (!bitmap || !(bitmap[bit / 8] & (1 << (bit % 8)))) return false;
+    if (depth) {
+        auto* entries = static_cast<uint32_t*>(kmalloc(mnt->blockSize));
+        if (!entries) return false;
+        if (!Ext2ReadBlock(mnt, block, entries)) { kfree(entries); return false; }
+        for (uint32_t i = 0; i < mnt->blockSize / sizeof(uint32_t); ++i) {
+            if (!Ext2CollectFreeTree(mnt, entries[i], depth - 1, batch)) {
+                kfree(entries);
+                return false;
             }
-            kfree(dind);
         }
-        Ext2FreeBlock(mnt, ino->i_block[13]);
-        ino->i_block[13] = 0;
+        kfree(entries);
     }
+    if (!*batch || (*batch)->count == 256) {
+        auto* chunk = static_cast<Ext2FreeBatch*>(kmalloc(sizeof(Ext2FreeBatch)));
+        if (!chunk) return false;
+        chunk->next = *batch;
+        chunk->count = 0;
+        *batch = chunk;
+    }
+    (*batch)->blocks[(*batch)->count++] = block;
+    return true;
+}
 
-    // Triply indirect — not freed for now (very large files rare in hobby OS)
-    ino->i_blocks = 0;
-    ino->i_size = 0;
+static bool Ext2FreeInodeBlocks(Ext2Mount* mnt, uint32_t number, Ext2Inode* inode)
+{
+    Ext2FreeBatch* batch = nullptr;
+    // Fast symlinks store bytes, not disk block numbers, in i_block[].
+    bool fastSymlink = (inode->i_mode & EXT2_S_IFMT) == EXT2_S_IFLNK && inode->i_blocks == 0;
+    if (fastSymlink) {
+        if (Ext2InodeSize(inode) > sizeof(inode->i_block)) return false;
+    } else {
+        for (unsigned i = 0; i < 15; ++i) {
+            if (!Ext2CollectFreeTree(mnt, inode->i_block[i], i < 12 ? 0 : i - 11, &batch)) {
+                Ext2DisposeFreeBatch(batch);
+                return false;
+            }
+        }
+    }
+    // Preload the inode bitmap too: bitmap release below needs no allocation
+    // or reads. Persist detached pointers BEFORE any block becomes reusable.
+    if (!Ext2GetInodeBitmap(mnt, (number - 1) / mnt->inodesPerGroup)) {
+        Ext2DisposeFreeBatch(batch);
+        return false;
+    }
+    Ext2Inode cleared = *inode;
+    memset(cleared.i_block, 0, sizeof(cleared.i_block));
+    cleared.i_blocks = 0;
+    cleared.i_size = 0;
+    if ((cleared.i_mode & EXT2_S_IFMT) == EXT2_S_IFREG) cleared.i_dir_acl = 0;
+    if (!Ext2WriteInode(mnt, number, &cleared)) {
+        Ext2DisposeFreeBatch(batch);
+        return false;
+    }
+    *inode = cleared;
+    for (auto* chunk = batch; chunk; chunk = chunk->next)
+        for (uint32_t i = 0; i < chunk->count; ++i)
+            Ext2FreeBlock(mnt, chunk->blocks[i]);
+    Ext2DisposeFreeBatch(batch);
+    return true;
+}
+
+static bool Ext2ReclaimInode(Ext2Mount* mnt, uint32_t ino, Ext2Inode* data)
+{
+    if (!Ext2FreeInodeBlocks(mnt, ino, data)) return false;
+    data->i_dtime = Ext2Now();
+    if (!data->i_dtime) data->i_dtime = 1;
+    if (!Ext2WriteInode(mnt, ino, data)) return false;
+    return Ext2FreeInode(mnt, ino, (data->i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR);
+}
+
+// Called only at top-level filesystem write/sync boundaries, never from
+// bitmap auto-sync or an IRQ close. Each queued inode remains allocated.
+static void Ext2DrainOrphans(Ext2Mount* mnt)
+{
+    for (;;) {
+        uint64_t flags = IrqSpinLockAcquire(&g_ext2OpenLock);
+        auto** link = &g_ext2OpenInodes;
+        while (*link && !((*link)->mnt == mnt && (*link)->orphan && (*link)->holders == 0))
+            link = &(*link)->next;
+        auto* orphan = *link;
+        if (orphan) *link = orphan->next;
+        IrqSpinLockRelease(&g_ext2OpenLock, flags);
+        if (!orphan) return;
+        Ext2Inode data;
+        bool read = Ext2ReadInode(mnt, orphan->inode, &data);
+        if (read && data.i_links_count) {
+            // Namespace removal committed but its metadata write failed.
+            // The queued orphan records the intended final link count.
+            data.i_links_count = 0;
+            data.i_ctime = Ext2Now();
+            read = Ext2WriteInode(mnt, orphan->inode, &data);
+        }
+        if (!read || !Ext2ReclaimInode(mnt, orphan->inode, &data)) {
+            flags = IrqSpinLockAcquire(&g_ext2OpenLock);
+            orphan->next = g_ext2OpenInodes;
+            g_ext2OpenInodes = orphan;
+            IrqSpinLockRelease(&g_ext2OpenLock, flags);
+            SerialPrintf("ext2: failed reclaiming orphan inode %u\n", orphan->inode);
+            return;
+        }
+        kfree(orphan);
+    }
+}
+
+static int Ext2DropLink(Ext2Mount* mnt, uint32_t ino, Ext2Inode* data, bool directory)
+{
+    if (!data->i_links_count) return -5;
+    if (directory) data->i_links_count = 0; // removed parent entry and '.'
+    else --data->i_links_count;
+    data->i_ctime = Ext2Now();
+    bool deferred = !data->i_links_count && Ext2MarkOpenOrphan(mnt, ino);
+    if (!Ext2WriteInode(mnt, ino, data)) return -5;
+    if (data->i_links_count || deferred) return 0;
+    return Ext2ReclaimInode(mnt, ino, data) ? 0 : -5;
 }
 
 // ---------------------------------------------------------------------------
@@ -1034,8 +1190,9 @@ static bool Ext2PrepareDirectoryWrite(Ext2Mount* mnt, uint32_t dirIno, Ext2Inode
 }
 
 static bool Ext2DirAdd(Ext2Mount* mnt, uint32_t dirIno, Ext2Inode* dirData,
-                       uint32_t childIno, const char* name, uint8_t fileType)
+                       uint32_t childIno, const char* name, uint8_t fileType, bool* committed = nullptr)
 {
+    if (committed) *committed = false;
     uint32_t nameLen = 0;
     for (const char* p = name; *p; ++p) ++nameLen;
     if (nameLen == 0 || nameLen > 255) return false;
@@ -1055,12 +1212,12 @@ static bool Ext2DirAdd(Ext2Mount* mnt, uint32_t dirIno, Ext2Inode* dirData,
     while (off < dirSize) {
         uint32_t fileBlock = static_cast<uint32_t>(off >> mnt->blockShift);
         uint32_t diskBlock = Ext2BlockMap(mnt, dirData, fileBlock);
-        if (!diskBlock || !Ext2ReadBlock(mnt, diskBlock, blockBuf)) break;
+        if (!diskBlock || !Ext2ReadBlock(mnt, diskBlock, blockBuf)) { kfree(blockBuf); return false; }
 
         uint32_t pos = 0;
         while (pos < mnt->blockSize) {
             auto* de = reinterpret_cast<Ext2DirEntry2*>(blockBuf + pos);
-            if (!Ext2DirEntryValid(de, pos, mnt->blockSize)) break;
+            if (!Ext2DirEntryValid(de, pos, mnt->blockSize)) { kfree(blockBuf); return false; }
 
             // Calculate actual size of this entry
             uint32_t actualLen = ((8 + de->name_len + 3) / 4) * 4;
@@ -1081,12 +1238,14 @@ static bool Ext2DirAdd(Ext2Mount* mnt, uint32_t dirIno, Ext2Inode* dirData,
                 newDe->file_type = fileType;
                 for (uint32_t i = 0; i < nameLen; ++i) newDe->name[i] = name[i];
 
-                Ext2WriteBlock(mnt, diskBlock, blockBuf);
+                bool written = Ext2WriteBlock(mnt, diskBlock, blockBuf);
                 kfree(blockBuf);
+                if (!written) return false;
+                if (committed) *committed = true;
                 Ext2Touch(dirData);
-                Ext2WriteInode(mnt, dirIno, dirData);
+                bool metadataWritten = Ext2WriteInode(mnt, dirIno, dirData);
                 Ext2DirentCacheInvalidateParent(mnt, dirIno);
-                return true;
+                return metadataWritten;
             }
 
             pos += de->rec_len;
@@ -1108,21 +1267,24 @@ static bool Ext2DirAdd(Ext2Mount* mnt, uint32_t dirIno, Ext2Inode* dirData,
     newDe->file_type = fileType;
     for (uint32_t i = 0; i < nameLen; ++i) newDe->name[i] = name[i];
 
-    Ext2WriteBlock(mnt, newBlock, blockBuf);
+    bool written = Ext2WriteBlock(mnt, newBlock, blockBuf);
     kfree(blockBuf);
+    if (!written) return false;
+    if (committed) *committed = true;
 
     // Update directory size
     dirData->i_size = static_cast<uint32_t>(dirSize + mnt->blockSize);
     Ext2Touch(dirData);
-    Ext2WriteInode(mnt, dirIno, dirData);
+    bool metadataWritten = Ext2WriteInode(mnt, dirIno, dirData);
     Ext2DirentCacheInvalidateParent(mnt, dirIno);
-    return true;
+    return metadataWritten;
 }
 
 // Remove a directory entry by name. Returns the removed inode number or 0.
 static uint32_t Ext2DirRemove(Ext2Mount* mnt, Ext2Inode* dirData,
-                              uint32_t dirIno, const char* name)
+                              uint32_t dirIno, const char* name, bool* committed = nullptr)
 {
+    if (committed) *committed = false;
     if (!Ext2PrepareDirectoryWrite(mnt, dirIno, dirData)) return 0;
     uint32_t nameLen = 0;
     for (const char* p = name; *p; ++p) ++nameLen;
@@ -1156,12 +1318,14 @@ static uint32_t Ext2DirRemove(Ext2Mount* mnt, Ext2Inode* dirData,
                         // First entry in block — zero the inode
                         de->inode = 0;
                     }
-                    Ext2WriteBlock(mnt, diskBlock, blockBuf);
+                    bool written = Ext2WriteBlock(mnt, diskBlock, blockBuf);
                     kfree(blockBuf);
+                    if (!written) return 0;
+                    if (committed) *committed = true;
                     Ext2Touch(dirData);
-                    Ext2WriteInode(mnt, dirIno, dirData);
+                    bool metadataWritten = Ext2WriteInode(mnt, dirIno, dirData);
                     Ext2DirentCacheInvalidateParent(mnt, dirIno);
-                    return removedIno;
+                    return metadataWritten ? removedIno : 0;
                 }
             }
             prevDe = de;
@@ -1668,6 +1832,7 @@ static int Ext2FileWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* off
 static void Ext2FileClose(Vnode* vn)
 {
     auto* fp = static_cast<Ext2FilePriv*>(vn->priv);
+    Ext2ReleaseInode(fp->hold);
     kfree(fp);
 }
 
@@ -1680,6 +1845,7 @@ static void Ext2FillStat(VnodeStat* st, uint32_t ino, const Ext2Inode& data)
     st->uid = data.i_uid;
     st->gid = data.i_gid;
     st->mode = data.i_mode;
+    st->nlink = data.i_links_count;
     st->atime = {data.i_atime, 0};
     st->mtime = {data.i_mtime, 0};
     st->ctime = {data.i_ctime, 0};
@@ -1760,6 +1926,7 @@ static int Ext2DirReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
 static void Ext2DirClose(Vnode* vn)
 {
     auto* dp = static_cast<Ext2DirPriv*>(vn->priv);
+    Ext2ReleaseInode(dp->hold);
     kfree(dp);
 }
 
@@ -2065,11 +2232,26 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
     return true;
 }
 
+static bool Ext2FsCanUnmount(void* mountPriv)
+{
+    auto* mnt = static_cast<Ext2Mount*>(mountPriv);
+    KRwLockWriteLock(&g_ext2Lock);
+    Ext2DrainOrphans(mnt);
+    uint64_t flags = IrqSpinLockAcquire(&g_ext2OpenLock);
+    bool busy = false;
+    for (auto* p = g_ext2OpenInodes; p; p = p->next)
+        if (p->mnt == mnt) { busy = true; break; }
+    IrqSpinLockRelease(&g_ext2OpenLock, flags);
+    KRwLockWriteUnlock(&g_ext2Lock);
+    return !busy;
+}
+
 static void Ext2FsUnmount(void* mountPriv)
 {
     auto* mnt = static_cast<Ext2Mount*>(mountPriv);
     if (!mnt) return;
     // Flush any dirty metadata before releasing cache buffers.
+    Ext2DrainOrphans(mnt);
     Ext2Sync(mnt);
     if (mnt->blockBitmapCache) {
         for (uint32_t g = 0; g < mnt->groupCount; ++g)
@@ -2088,6 +2270,8 @@ static void Ext2FsUnmount(void* mountPriv)
     if (mnt->inodeCache) kfree(mnt->inodeCache);
     if (mnt->direntCache) kfree(mnt->direntCache);
     if (mnt->bgdt) kfree(mnt->bgdt);
+    for (uint32_t i = 0; i < EXT2_MAX_MOUNTS; ++i)
+        if (g_ext2Mounts[i] == mnt) g_ext2Mounts[i] = nullptr;
     kfree(mnt);
 }
 
@@ -2097,6 +2281,7 @@ static void Ext2FsSync(void* mountPriv)
     auto* mnt = static_cast<Ext2Mount*>(mountPriv);
     if (!mnt) return;
     KRwLockWriteLock(&g_ext2Lock);
+    Ext2DrainOrphans(mnt);
     Ext2Sync(mnt);
     KRwLockWriteUnlock(&g_ext2Lock);
 }
@@ -2119,6 +2304,7 @@ static Vnode* Ext2FsOpenMode(void* mountPriv, uint8_t pdrv,
     if (needsWrite) {
         // Take write lock up front — create and truncate mutate metadata.
         KRwLockWriteLock(&g_ext2Lock);
+        Ext2DrainOrphans(mnt);
     } else {
         KRwLockReadLock(&g_ext2Lock);
     }
@@ -2165,8 +2351,9 @@ static Vnode* Ext2FsOpenMode(void* mountPriv, uint8_t pdrv,
         Ext2WriteInode(mnt, ino, &inodeData);
 
         // Add directory entry
-        if (!Ext2DirAdd(mnt, parentIno, &parentData, ino, name, 1 /*EXT2_FT_REG_FILE*/)) {
-            Ext2FreeInode(mnt, ino, false);
+        bool entryCommitted;
+        if (!Ext2DirAdd(mnt, parentIno, &parentData, ino, name, 1 /*EXT2_FT_REG_FILE*/, &entryCommitted)) {
+            if (!entryCommitted) Ext2FreeInode(mnt, ino, false);
             KRwLockWriteUnlock(&g_ext2Lock);
             return nullptr;
         }
@@ -2219,28 +2406,34 @@ static Vnode* Ext2FsOpenMode(void* mountPriv, uint8_t pdrv,
 
     // Truncate if requested
     if ((flags & VFS_O_TRUNC) && (inodeData.i_mode & EXT2_S_IFMT) == EXT2_S_IFREG) {
-        Ext2FreeInodeBlocks(mnt, &inodeData);
+        if (!Ext2FreeInodeBlocks(mnt, ino, &inodeData)) {
+            Ext2WriteInode(mnt, ino, &inodeData);
+            KRwLockWriteUnlock(&g_ext2Lock);
+            return nullptr;
+        }
         Ext2Touch(&inodeData);
         Ext2WriteInode(mnt, ino, &inodeData);
     }
 
-    if (needsWrite)
-        KRwLockWriteUnlock(&g_ext2Lock);
-    else
-        KRwLockReadUnlock(&g_ext2Lock);
-
     uint16_t mode = inodeData.i_mode & EXT2_S_IFMT;
+    Ext2OpenInode* hold = nullptr;
+    if (mode == EXT2_S_IFDIR || mode == EXT2_S_IFREG)
+        hold = Ext2HoldInode(mnt, ino);
+    if (needsWrite) KRwLockWriteUnlock(&g_ext2Lock);
+    else KRwLockReadUnlock(&g_ext2Lock);
+    if (!hold) return nullptr;
 
     if (mode == EXT2_S_IFDIR) {
         auto* dp = static_cast<Ext2DirPriv*>(kmalloc(sizeof(Ext2DirPriv)));
-        if (!dp) return nullptr;
+        if (!dp) { Ext2ReleaseInode(hold); return nullptr; }
         dp->mnt = mnt;
         dp->inode = ino;
         dp->inodeData = inodeData;
         dp->readOffset = 0;
+        dp->hold = hold;
 
         auto* vn = static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
-        if (!vn) { kfree(dp); return nullptr; }
+        if (!vn) { kfree(dp); Ext2ReleaseInode(hold); return nullptr; }
         vn->ops = &g_ext2DirOps;
         vn->type = VnodeType::Dir;
         vn->priv = dp;
@@ -2251,13 +2444,14 @@ static Vnode* Ext2FsOpenMode(void* mountPriv, uint8_t pdrv,
 
     if (mode == EXT2_S_IFREG) {
         auto* fp = static_cast<Ext2FilePriv*>(kmalloc(sizeof(Ext2FilePriv)));
-        if (!fp) return nullptr;
+        if (!fp) { Ext2ReleaseInode(hold); return nullptr; }
         fp->mnt = mnt;
         fp->inode = ino;
         fp->inodeData = inodeData;
+        fp->hold = hold;
 
         auto* vn = static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
-        if (!vn) { kfree(fp); return nullptr; }
+        if (!vn) { kfree(fp); Ext2ReleaseInode(hold); return nullptr; }
         vn->ops = &g_ext2FileOps;
         vn->type = VnodeType::File;
         vn->priv = fp;
@@ -2367,43 +2561,72 @@ static int Ext2FsLstatPath(void* mountPriv, uint8_t pdrv,
 // VfsFsOps write operations
 // ---------------------------------------------------------------------------
 
-static int Ext2FsUnlink(void* mountPriv, uint8_t pdrv, const char* relPath)
+// 1 = empty, 0 = contains children, negative = read/corruption error.
+static int Ext2DirectoryEmpty(Ext2Mount* mnt, const Ext2Inode* data)
+{
+    auto* buf = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+    if (!buf) return -12;
+    for (uint64_t off = 0; off < Ext2InodeSize(data); off += mnt->blockSize) {
+        uint32_t block = Ext2BlockMap(mnt, data, off >> mnt->blockShift);
+        if (!block || !Ext2ReadBlock(mnt, block, buf)) { kfree(buf); return -5; }
+        for (uint32_t pos = 0; pos < mnt->blockSize;) {
+            auto* entry = reinterpret_cast<Ext2DirEntry2*>(buf + pos);
+            if (!Ext2DirEntryValid(entry, pos, mnt->blockSize)) { kfree(buf); return -5; }
+            bool dot = entry->name_len == 1 && entry->name[0] == '.';
+            bool dotdot = entry->name_len == 2 && entry->name[0] == '.' && entry->name[1] == '.';
+            if (entry->inode && !dot && !dotdot) { kfree(buf); return 0; }
+            pos += entry->rec_len;
+        }
+    }
+    kfree(buf);
+    return 1;
+}
+
+static int Ext2FsRemovePath(void* mountPriv, uint8_t pdrv, const char* relPath, bool removeDirectory)
 {
     (void)pdrv;
     auto* mnt = static_cast<Ext2Mount*>(mountPriv);
-
     KRwLockWriteLock(&g_ext2Lock);
-
+    Ext2DrainOrphans(mnt);
+    Ext2OpenInode* deletionHold = nullptr;
+    auto finish = [&](int result) {
+        Ext2ReleaseInode(deletionHold);
+        KRwLockWriteUnlock(&g_ext2Lock);
+        return result;
+    };
     char name[256];
     uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name));
-    if (!parentIno || !name[0]) { KRwLockWriteUnlock(&g_ext2Lock); return -1; }
-
-    Ext2Inode parentData;
-    if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KRwLockWriteUnlock(&g_ext2Lock); return -1; }
-
-    uint32_t removedIno = Ext2DirRemove(mnt, &parentData, parentIno, name);
-    if (!removedIno) { KRwLockWriteUnlock(&g_ext2Lock); return -1; }
-
-    // Decrement link count, free if zero
-    Ext2Inode removedData;
-    if (Ext2ReadInode(mnt, removedIno, &removedData)) {
-        removedData.i_links_count--;
-        removedData.i_ctime = Ext2Now();
-        if (removedData.i_links_count == 0) {
-            bool isDir = (removedData.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR;
-            Ext2FreeInodeBlocks(mnt, &removedData);
-            // A freed inode with zero deletion time is inconsistent to fsck.
-            removedData.i_dtime = static_cast<uint32_t>(RtcNow());
-            if (!removedData.i_dtime) removedData.i_dtime = 1;
-            Ext2WriteInode(mnt, removedIno, &removedData);
-            Ext2FreeInode(mnt, removedIno, isDir);
-        } else {
-            Ext2WriteInode(mnt, removedIno, &removedData);
-        }
+    if (!parentIno || !name[0]) return finish(-2);
+    if (!strcmp(name, ".") || !strcmp(name, "..")) return finish(-22);
+    Ext2Inode parent, target;
+    if (!Ext2ReadInode(mnt, parentIno, &parent)) return finish(-5);
+    uint32_t ino = Ext2DirLookup(mnt, parentIno, &parent, name);
+    if (!ino) return finish(-2);
+    if (ino == EXT2_ROOT_INO) return finish(-16);
+    if (!Ext2ReadInode(mnt, ino, &target)) return finish(-5);
+    bool directory = (target.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR;
+    if (directory != removeDirectory) return finish(removeDirectory ? -20 : -21);
+    if (directory) {
+        int empty = Ext2DirectoryEmpty(mnt, &target);
+        if (empty != 1) return finish(empty < 0 ? empty : -39);
+        if (!parent.i_links_count) return finish(-5);
     }
+    deletionHold = Ext2HoldInode(mnt, ino);
+    if (!deletionHold) return finish(-12);
+    bool entryRemoved;
+    int error = Ext2DirRemove(mnt, &parent, parentIno, name, &entryRemoved) == ino ? 0 : -5;
+    if (!entryRemoved) return finish(-5);
+    if (directory) {
+        --parent.i_links_count;
+        if (!Ext2WriteInode(mnt, parentIno, &parent)) error = -5;
+    }
+    int dropped = Ext2DropLink(mnt, ino, &target, directory);
+    return finish(error ? error : dropped);
+}
 
-    KRwLockWriteUnlock(&g_ext2Lock);
-    return 0;
+static int Ext2FsUnlink(void* mountPriv, uint8_t pdrv, const char* relPath)
+{
+    return Ext2FsRemovePath(mountPriv, pdrv, relPath, false);
 }
 
 static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath)
@@ -2414,6 +2637,7 @@ static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath)
     DbgPrintf("ext2: MKDIR '%s'\n", relPath);
 
     KRwLockWriteLock(&g_ext2Lock);
+    Ext2DrainOrphans(mnt);
 
     char name[256];
     uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name));
@@ -2490,10 +2714,12 @@ static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath)
     Ext2WriteInode(mnt, newIno, &newData);
 
     // Add entry to parent
-    if (!Ext2DirAdd(mnt, parentIno, &parentData, newIno, name, 2 /*EXT2_FT_DIR*/)) {
-        // Rollback
-        Ext2FreeBlock(mnt, dataBlock);
-        Ext2FreeInode(mnt, newIno, true);
+    bool entryCommitted;
+    if (!Ext2DirAdd(mnt, parentIno, &parentData, newIno, name, 2 /*EXT2_FT_DIR*/, &entryCommitted)) {
+        if (!entryCommitted) {
+            Ext2FreeBlock(mnt, dataBlock);
+            Ext2FreeInode(mnt, newIno, true);
+        }
         KRwLockWriteUnlock(&g_ext2Lock);
         return -1;
     }
@@ -2506,88 +2732,149 @@ static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath)
     return 0;
 }
 
+static bool Ext2DirReplace(Ext2Mount* mnt, uint32_t dirIno, Ext2Inode* directory,
+                            const char* name, uint32_t inode, uint8_t type, bool* committed = nullptr)
+{
+    if (committed) *committed = false;
+    if (!Ext2PrepareDirectoryWrite(mnt, dirIno, directory)) return false;
+    auto* buf = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+    if (!buf) return false;
+    size_t length = strlen(name);
+    for (uint64_t off = 0; off < Ext2InodeSize(directory); off += mnt->blockSize) {
+        uint32_t block = Ext2BlockMap(mnt, directory, off >> mnt->blockShift);
+        if (!block || !Ext2ReadBlock(mnt, block, buf)) break;
+        for (uint32_t pos = 0; pos < mnt->blockSize;) {
+            auto* entry = reinterpret_cast<Ext2DirEntry2*>(buf + pos);
+            if (!Ext2DirEntryValid(entry, pos, mnt->blockSize)) break;
+            if (entry->inode && entry->name_len == length && !memcmp(entry->name, name, length)) {
+                entry->inode = inode;
+                entry->file_type = type;
+                bool ok = Ext2WriteBlock(mnt, block, buf);
+                kfree(buf);
+                if (ok && committed) *committed = true;
+                Ext2DirentCacheInvalidateParent(mnt, dirIno);
+                Ext2Touch(directory);
+                return ok && Ext2WriteInode(mnt, dirIno, directory);
+            }
+            pos += entry->rec_len;
+        }
+    }
+    kfree(buf);
+    return false;
+}
+
 static int Ext2FsRename(void* mountPriv, uint8_t pdrv,
                         const char* oldRelPath, const char* newRelPath)
 {
     (void)pdrv;
     auto* mnt = static_cast<Ext2Mount*>(mountPriv);
-
     KRwLockWriteLock(&g_ext2Lock);
-
-    // Resolve old path
-    char oldName[256];
-    uint32_t oldParentIno = Ext2ResolveParent(mnt, oldRelPath, oldName, sizeof(oldName));
-    if (!oldParentIno) { KRwLockWriteUnlock(&g_ext2Lock); return -1; }
-
-    Ext2Inode oldParentData;
-    if (!Ext2ReadInode(mnt, oldParentIno, &oldParentData)) { KRwLockWriteUnlock(&g_ext2Lock); return -1; }
-
-    // Look up the inode being moved
-    uint32_t targetIno = Ext2DirLookup(mnt, oldParentIno, &oldParentData, oldName);
-    if (!targetIno) { KRwLockWriteUnlock(&g_ext2Lock); return -1; }
-
-    Ext2Inode targetData;
-    if (!Ext2ReadInode(mnt, targetIno, &targetData)) { KRwLockWriteUnlock(&g_ext2Lock); return -1; }
-
-    // Determine file type for new dir entry
-    uint8_t ft = 1; // EXT2_FT_REG_FILE
-    uint16_t mode = targetData.i_mode & EXT2_S_IFMT;
-    if (mode == EXT2_S_IFDIR) ft = 2;
-    else if (mode == EXT2_S_IFLNK) ft = 7;
-
-    // Resolve new path
-    char newName[256];
-    uint32_t newParentIno = Ext2ResolveParent(mnt, newRelPath, newName, sizeof(newName));
-    if (!newParentIno) { KRwLockWriteUnlock(&g_ext2Lock); return -1; }
-
-    Ext2Inode newParentData;
-    if (!Ext2ReadInode(mnt, newParentIno, &newParentData)) { KRwLockWriteUnlock(&g_ext2Lock); return -1; }
-
-    // POSIX rename replaces destination if it exists — remove it first
-    uint32_t existingIno = Ext2DirLookup(mnt, newParentIno, &newParentData, newName);
-    if (existingIno) {
-        Ext2DirRemove(mnt, &newParentData, newParentIno, newName);
-        Ext2ReadInode(mnt, newParentIno, &newParentData);
-    }
-
-    // Remove from old directory
-    Ext2DirRemove(mnt, &oldParentData, oldParentIno, oldName);
-
-    // Add to new directory
-    if (!Ext2DirAdd(mnt, newParentIno, &newParentData, targetIno, newName, ft)) {
-        // Try to re-add to old location on failure
-        Ext2DirAdd(mnt, oldParentIno, &oldParentData, targetIno, oldName, ft);
+    Ext2DrainOrphans(mnt);
+    Ext2OpenInode* deletionHold = nullptr;
+    auto finish = [&](int result) {
+        Ext2ReleaseInode(deletionHold);
         KRwLockWriteUnlock(&g_ext2Lock);
-        return -1;
-    }
-
-    // If moving a directory, update .. entry
-    if (mode == EXT2_S_IFDIR && oldParentIno != newParentIno) {
-        // Read first block of moved directory, update .. inode
-        auto* buf = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
-        if (buf && targetData.i_block[0]) {
-            Ext2ReadBlock(mnt, targetData.i_block[0], buf);
-            // .. is the second entry (after .)
-            auto* dot = reinterpret_cast<Ext2DirEntry2*>(buf);
-            auto* dotdot = reinterpret_cast<Ext2DirEntry2*>(buf + dot->rec_len);
-            dotdot->inode = newParentIno;
-            Ext2WriteBlock(mnt, targetData.i_block[0], buf);
-            kfree(buf);
-
-            // Update link counts
-            oldParentData.i_links_count--;
-            Ext2WriteInode(mnt, oldParentIno, &oldParentData);
-            newParentData.i_links_count++;
-            Ext2WriteInode(mnt, newParentIno, &newParentData);
-        } else if (buf) {
-            kfree(buf);
+        return result;
+    };
+    char oldName[256], newName[256];
+    uint32_t oldParent = Ext2ResolveParent(mnt, oldRelPath, oldName, sizeof(oldName));
+    uint32_t newParent = Ext2ResolveParent(mnt, newRelPath, newName, sizeof(newName));
+    if (!oldParent || !newParent) return finish(-2);
+    if (!oldName[0] || !newName[0]) return finish(-16);
+    if (!strcmp(oldName, ".") || !strcmp(oldName, "..") ||
+        !strcmp(newName, ".") || !strcmp(newName, "..")) return finish(-22);
+    Ext2Inode oldDir, newDir, target, victim;
+    if (!Ext2ReadInode(mnt, oldParent, &oldDir) || !Ext2ReadInode(mnt, newParent, &newDir))
+        return finish(-5);
+    uint32_t ino = Ext2DirLookup(mnt, oldParent, &oldDir, oldName);
+    if (!ino) return finish(-2);
+    uint32_t existing = Ext2DirLookup(mnt, newParent, &newDir, newName);
+    if (existing == ino) return finish(0);
+    if (ino == EXT2_ROOT_INO) return finish(-16);
+    if (!Ext2ReadInode(mnt, ino, &target)) return finish(-5);
+    bool directory = (target.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR;
+    uint8_t type = directory ? 2 : (target.i_mode & EXT2_S_IFMT) == EXT2_S_IFLNK ? 7 : 1;
+    bool victimDirectory = false;
+    uint8_t victimType = 1;
+    if (existing) {
+        if (!Ext2ReadInode(mnt, existing, &victim)) return finish(-5);
+        victimDirectory = (victim.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR;
+        if (directory != victimDirectory) return finish(directory ? -20 : -21);
+        victimType = victimDirectory ? 2 : (victim.i_mode & EXT2_S_IFMT) == EXT2_S_IFLNK ? 7 : 1;
+        if (victimDirectory) {
+            int empty = Ext2DirectoryEmpty(mnt, &victim);
+            if (empty != 1) return finish(empty < 0 ? empty : -39);
         }
     }
+    if (directory && oldParent != newParent) {
+        // Walk '..' before modifying anything; moving into a descendant
+        // would detach a cyclic directory tree from the filesystem root.
+        uint32_t ancestor = newParent;
+        unsigned depth = 0;
+        while (ancestor != EXT2_ROOT_INO && depth++ < 1024) {
+            if (ancestor == ino) return finish(-22);
+            Ext2Inode data;
+            if (!Ext2ReadInode(mnt, ancestor, &data)) return finish(-5);
+            ancestor = Ext2DirLookup(mnt, ancestor, &data, "..");
+            if (!ancestor) return finish(-5);
+        }
+        if (ancestor != EXT2_ROOT_INO) return finish(-40);
+    }
 
-    targetData.i_ctime = Ext2Now();
-    Ext2WriteInode(mnt, targetIno, &targetData);
-    KRwLockWriteUnlock(&g_ext2Lock);
-    return 0;
+    // Install destination first. Replacement uses the existing entry's
+    // storage, and keeps the victim inode alive until namespace changes work.
+    if (existing) {
+        deletionHold = Ext2HoldInode(mnt, existing);
+        if (!deletionHold) return finish(-12);
+    }
+    bool entryInstalled;
+    bool installed = existing ? Ext2DirReplace(mnt, newParent, &newDir, newName, ino, type, &entryInstalled)
+                              : Ext2DirAdd(mnt, newParent, &newDir, ino, newName, type, &entryInstalled);
+    auto restoreDestination = [&]() {
+        if (existing) Ext2DirReplace(mnt, newParent, &newDir, newName, existing, victimType);
+        else Ext2DirRemove(mnt, &newDir, newParent, newName);
+    };
+    if (!installed) {
+        if (entryInstalled) restoreDestination();
+        return finish(-5);
+    }
+    // Same-directory operations must use metadata after the destination edit.
+    bool entryRemoved = false;
+    if (!Ext2ReadInode(mnt, oldParent, &oldDir) ||
+        Ext2DirRemove(mnt, &oldDir, oldParent, oldName, &entryRemoved) != ino) {
+        restoreDestination();
+        if (entryRemoved) {
+            Ext2ReadInode(mnt, oldParent, &oldDir);
+            Ext2DirAdd(mnt, oldParent, &oldDir, ino, oldName, type);
+        }
+        return finish(-5);
+    }
+    // Namespace committed. Even if a later metadata write fails, complete
+    // victim accounting and retain the first error; never skip its unlink.
+    int error = 0;
+    if (directory && oldParent != newParent &&
+        !Ext2DirReplace(mnt, ino, &target, "..", newParent, 2)) error = -5;
+    if (!Ext2ReadInode(mnt, oldParent, &oldDir) || !Ext2ReadInode(mnt, newParent, &newDir)) {
+        error = -5;
+    } else {
+        if (directory && oldParent != newParent) {
+            if (!oldDir.i_links_count) error = -5;
+            else {
+                --oldDir.i_links_count;
+                ++newDir.i_links_count;
+                if (!Ext2WriteInode(mnt, oldParent, &oldDir)) error = -5;
+            }
+        }
+        if (victimDirectory) {
+            if (!newDir.i_links_count) error = -5;
+            else --newDir.i_links_count;
+        }
+        if (!Ext2WriteInode(mnt, newParent, &newDir)) error = -5;
+    }
+    target.i_ctime = Ext2Now();
+    if (!Ext2WriteInode(mnt, ino, &target)) error = -5;
+    int dropped = existing ? Ext2DropLink(mnt, existing, &victim, victimDirectory) : 0;
+    return finish(error ? error : dropped);
 }
 
 // ---------------------------------------------------------------------------
@@ -2678,11 +2965,12 @@ static int Ext2FsSymlink(void* mountPriv, uint8_t pdrv,
     Ext2WriteInode(mnt, newIno, &newData);
 
     // Add directory entry with type=7 (EXT2_FT_SYMLINK)
-    if (!Ext2DirAdd(mnt, parentIno, &parentData, newIno, name, 7)) {
+    bool entryCommitted;
+    if (!Ext2DirAdd(mnt, parentIno, &parentData, newIno, name, 7, &entryCommitted)) {
         SerialPrintf("ext2 symlink: DirAdd FAILED parent=%u name='%s' for '%s'\n",
                      parentIno, name, relPath);
-        Ext2FreeInodeBlocks(mnt, &newData);
-        Ext2FreeInode(mnt, newIno, false);
+        if (!entryCommitted && Ext2FreeInodeBlocks(mnt, newIno, &newData))
+            Ext2FreeInode(mnt, newIno, false);
         KRwLockWriteUnlock(&g_ext2Lock);
         return -28; // -ENOSPC (probably couldn't extend dir)
     }
@@ -2829,6 +3117,8 @@ static const VfsFsOps g_ext2FsOps = {
     .set_times  = Ext2FsSetTimes,
     .open_mode  = Ext2FsOpenMode,
     .chmod      = Ext2FsChmod,
+    .remove_path = Ext2FsRemovePath,
+    .can_unmount = Ext2FsCanUnmount,
 };
 
 // ---------------------------------------------------------------------------

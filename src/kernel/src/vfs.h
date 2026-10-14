@@ -77,6 +77,7 @@ struct VnodeStat {
     VnodeTime atime{};
     VnodeTime mtime{};
     VnodeTime ctime{};
+    uint32_t nlink = 1;
 };
 
 // ---- VFS open flags ----
@@ -142,6 +143,10 @@ struct VfsFsOps {
                        int flags, uint16_t mode) = nullptr;
     int (*chmod)(void* mountPriv, uint8_t pdrv, const char* relPath,
                  uint16_t mode) = nullptr;
+    // Check unlink/rmdir intent atomically with the namespace mutation.
+    int (*remove_path)(void* mountPriv, uint8_t pdrv, const char* relPath,
+                       bool directory) = nullptr;
+    bool (*can_unmount)(void* mountPriv) = nullptr;
 };
 
 // Register a filesystem driver with the VFS.
@@ -220,6 +225,7 @@ int VfsChmodPath(const char* path, uint16_t mode);
 
 // Delete a file by path.
 int VfsUnlink(const char* path);
+int VfsRemovePath(const char* path, bool directory);
 
 // Create a directory.
 int VfsMkdir(const char* path);

@@ -13,10 +13,9 @@ that does not imply that Nix or the compiler was rebuilt inside Brook.
 
 ## Next acceptance goal
 
-First resolve the common shared-library startup crash so all 13 hosted tests
-pass inside Brook, then fix ext2 open-unlinked lifetime, rename replacement
-and directory removal. Validate filesystem operations with semantic probes
-and offline fsck after a clean guest shutdown.
+The shared-library startup and native compatibility gate now passes all 13
+tests. The filesystem gate also passes the expanded guest lifetime probe and
+offline fsck after a clean shutdown. Fresh two-path acceptance remains to run.
 
 Maintain two acceptance paths, using isolated disks and the same pinned Brook
 revision, SDK closure and VM configuration:
@@ -213,3 +212,25 @@ unchanged; driver header dependencies rebuilt the affected modules.
 Runtime evidence is retained under ignored `build/experiments/results/bootstrap-20261014/`
 and `bootstrap-compat-20261014/`, and the VM registry keeps serial logs and the
 actual booted kernel identities. Package payloads, images and logs stay out of git.
+
+## Filesystem lifetime gate (2026-10-14)
+
+The final isolated guest run passed all 24 `filelifecheck` assertions, including
+actual directory inode reuse (`old=18 new=18`), independent open descriptions,
+an unfaulted mapping, a forked descriptor, open rename victims, cross-parent
+directory moves, inline/block-backed symlinks and an 8 MiB orphan grown through
+double-indirect blocks. After acknowledged guest sync and shutdown, offline
+`e2fsck -fn` exited zero: 14 files and 9,007 blocks, identical to the initial
+formatted disk. Evidence is retained in the ignored lifetime experiment and
+bridge session `787747cd981e4162bd2fd7b52938b38c`.
+
+Ext2 now tracks live inode holders, defers orphan reclamation until their last
+close, and drains that queue on sync and namespace writers. Reclamation
+preflights block trees and persists detached pointers before releasing bitmap
+allocations. Rename replacement accounts for its victim; typed removal checks
+empty directories and maintains parent links. Real link counts, typed removal
+and busy-unmount callbacks require module ABI 4; rebuild kernel and modules
+together. Existing open holders prevent unmount. Full concurrent mount-operation
+leases remain a separate follow-up. This gate does not claim crash atomicity
+or recovery from injected partial I/O failures; initial creation writes and
+failed rollback writes need further audit.

@@ -11,8 +11,11 @@ Run them inside a disposable Brook VM through `vm_guest_run`:
   descriptions after unlink, orphan writes and inode reuse, an unfaulted mmap
   surviving last-descriptor close, rename replacement and same-inode rename,
   nonempty-directory rejection, unlink/rmdir type distinctions and directory
-  link counts. It also performs 32 rename replacements. Run only on disposable
-  disks; after its sync and a clean VM shutdown, require offline fsck to pass.
+  link counts. Also checks directory cache reuse and moves, symlink storage,
+  forked descriptors and an 8 MiB orphan crossing double-indirect blocks. Pass
+  `--require-reuse` after the directory argument in Brook to require actual
+  inode reuse; omit it on Linux, whose allocator need not reuse immediately.
+  It also performs 32 rename replacements. Run only on disposable disks; after its sync and a clean VM shutdown, require offline fsck to pass.
 - `probe.c`: relative mkdir/open/symlink/readlink/unlink and invalid dirfd.
 - `fdstress.c`: 2,000 concurrent `F_DUPFD_CLOEXEC` operations on a shared memfd.
 - `brkcheck.c`: a sibling heap extension preserves an existing page and the

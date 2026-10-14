@@ -7350,7 +7350,7 @@ static void FillStat(LinuxStat* st, const VnodeStat& vs, const Vnode* vn = nullp
         st->st_ino = __atomic_fetch_add(&s_nextIno, 1, __ATOMIC_RELAXED);
     }
     st->st_dev = 1;
-    st->st_nlink = 1;
+    st->st_nlink = vs.nlink;
     st->st_blksize = 4096;
     st->st_size = static_cast<int64_t>(vs.size);
     st->st_blocks = (st->st_size + 511) / 512;
@@ -10009,39 +10009,28 @@ static int64_t sys_fchdir(uint64_t fd, uint64_t, uint64_t,
 // sys_rmdir (84) — remove an empty directory
 // ---------------------------------------------------------------------------
 
+static int64_t DoUnlink(const char* path, bool directory = false);
+
 static int64_t sys_rmdir(uint64_t pathAddr, uint64_t, uint64_t,
                           uint64_t, uint64_t, uint64_t)
 {
     char pathBuf[256];
     if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
-    char resolved[512];
-    if (!ResolveAtPath(-100, pathBuf, resolved, sizeof(resolved))) return -ENOENT;
-    const char* path = resolved;
-
-    if (VfsUnlink(path) == 0) return 0;
-
-    char bootPath[256] = "/boot";
-    uint32_t bi = 5;
-    for (const char* p = path; *p && bi + 1 < sizeof(bootPath); ++p)
-        bootPath[bi++] = *p;
-    bootPath[bi] = '\0';
-    if (VfsUnlink(bootPath) == 0) return 0;
-
-    return -ENOENT;
+    return DoUnlink(pathBuf, true);
 }
 
 // ---------------------------------------------------------------------------
 // sys_unlink (87) — delete a file
 // ---------------------------------------------------------------------------
 
-static int64_t DoUnlink(const char* path)
+static int64_t DoUnlink(const char* path, bool directory)
 {
     char resolved[256];
     if (!ResolveAtPath(-100, path, resolved, sizeof(resolved))) return -ENOENT;
     path = resolved;
 
     // /dev/shm/<name> — shm_unlink: mark entry as free
-    if (path[0]=='/' && path[1]=='d' && path[2]=='e' && path[3]=='v' &&
+    if (!directory && path[0]=='/' && path[1]=='d' && path[2]=='e' && path[3]=='v' &&
         path[4]=='/' && path[5]=='s' && path[6]=='h' && path[7]=='m' && path[8]=='/') {
         // Leave the MemFdData alive (other fds may still reference it)
         // Just make it invisible to future shm_open calls
@@ -10050,14 +10039,17 @@ static int64_t DoUnlink(const char* path)
     }
 
     // Try as-is first, then with /boot prefix
-    if (VfsUnlink(path) == 0) return 0;
+    int rc = VfsRemovePath(path, directory);
+    if (rc == 0) return 0;
+    if (rc != -1 && rc != -ENOENT) return rc;
 
     char bootPath[256] = "/boot";
     uint32_t bi = 5;
     for (const char* p = path; *p && bi + 1 < sizeof(bootPath); ++p)
         bootPath[bi++] = *p;
     bootPath[bi] = '\0';
-    if (VfsUnlink(bootPath) == 0) return 0;
+    rc = VfsRemovePath(bootPath, directory);
+    if (rc != -1) return rc;
 
     return -ENOENT;
 }
@@ -10086,7 +10078,9 @@ static int64_t sys_rename(uint64_t oldAddr, uint64_t newAddr, uint64_t,
     const char* oldPath = oldResolved;
     const char* newPath = newResolved;
 
-    if (VfsRename(oldPath, newPath) == 0) return 0;
+    int rc = VfsRename(oldPath, newPath);
+    if (rc == 0) return 0;
+    if (rc != -1 && rc != -ENOENT) return rc;
 
     // Try with /boot prefix on both
     char bootOld[256] = "/boot", bootNew[256] = "/boot";
@@ -10097,7 +10091,8 @@ static int64_t sys_rename(uint64_t oldAddr, uint64_t newAddr, uint64_t,
     for (const char* p = newPath; *p && ni + 1 < sizeof(bootNew); ++p)
         bootNew[ni++] = *p;
     bootNew[ni] = '\0';
-    if (VfsRename(bootOld, bootNew) == 0) return 0;
+    rc = VfsRename(bootOld, bootNew);
+    if (rc != -1) return rc;
 
     SerialPrintf("sys_rename FAILED: '%s' -> '%s'\n", oldPath, newPath);
     return -ENOENT;
@@ -10155,17 +10150,14 @@ static int64_t sys_mkdirat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
 static int64_t sys_unlinkat(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
                              uint64_t, uint64_t, uint64_t)
 {
-    // AT_REMOVEDIR (0x200): POSIX says unlink should fail on dirs unless
-    // this flag is set. Our VfsUnlink handles both files and directories,
-    // so we accept either mode. The underlying FS rejects non-empty dirs.
-    (void)flags;
+    if (flags & ~0x200ULL) return -EINVAL;
     char pathBuf[256];
     if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
     const char* path = pathBuf;
     char resolved[256];
     if (!ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
         return -EBADF;
-    return DoUnlink(resolved);
+    return DoUnlink(resolved, (flags & 0x200) != 0);
 }
 
 // ---------------------------------------------------------------------------
