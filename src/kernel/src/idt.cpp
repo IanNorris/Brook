@@ -1782,7 +1782,9 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
     // stray RIPs / corrupted control flow after syscalls or signal returns.
     if (vector == 14 && fromUser)
     {
-        ExcForceSerialLock();
+        // BRO-198: the kernel survives a user fault. Keep the serial ticket
+        // lock intact; panic-only force locking strands later UART writers.
+        // These raw diagnostic writes do not need the normal serial lock.
         ExcPutsRaw("\n[PF] User #PF — full register dump:\n");
         ExcPutsRaw("  RIP "); ExcPutHex(ef->rip);     ExcPutsRaw("\n");
         ExcPutsRaw("  RSP "); ExcPutHex(ef->rsp);     ExcPutsRaw("\n");

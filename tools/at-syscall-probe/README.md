@@ -226,3 +226,10 @@ still receives the original GPR frame, and the final RAX is preserved across
 XRSTOR's mask setup. Fresh exec and fork-child trampoline paths do not return
 through the parent's saved syscall frame. Re-run waitcheck, execcheck and
 childsignalcheck alongside the vector sentinel probe after changing this path.
+
+`faultisolationcheck.c` forks a child that performs a raw NULL load. The parent
+must reap SIGSEGV, then successfully emit `FAULTISOLATIONCHECK SERIAL AFTER USER
+FAULT` through Brook's inherited debug fd 3. Confirm the marker in UART logs
+and query bridge procs/stats afterward: write success alone is insufficient.
+Host runs use `--no-serial`. This verifies fatal user faults preserve the
+ordinary serial ticket lock; kernel panic/double-fault handling is unchanged.
