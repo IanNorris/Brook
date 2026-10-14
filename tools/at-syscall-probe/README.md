@@ -4,6 +4,15 @@ Build the C probes in `nix-shell` using `$MUSL_CC -static -O2` (add
 `-pthread` for `fdstress.c` and `brkcheck.c`). Keep binaries in ignored `build/`.
 Run them inside a disposable Brook VM through `vm_guest_run`:
 
+- `sleepcheck.c`: raw nanosleep waits of 0, 1, 10,000, 999,999, 1,000,001
+  and 5,000,000 ns never complete early; negative seconds/nanoseconds and
+  out-of-range nanoseconds return EINVAL. Expect nine checks and zero failures.
+- `filelifecheck.c`: takes an absolute writable directory. Checks independent
+  descriptions after unlink, orphan writes and inode reuse, an unfaulted mmap
+  surviving last-descriptor close, rename replacement and same-inode rename,
+  nonempty-directory rejection, unlink/rmdir type distinctions and directory
+  link counts. It also performs 32 rename replacements. Run only on disposable
+  disks; after its sync and a clean VM shutdown, require offline fsck to pass.
 - `probe.c`: relative mkdir/open/symlink/readlink/unlink and invalid dirfd.
 - `fdstress.c`: 2,000 concurrent `F_DUPFD_CLOEXEC` operations on a shared memfd.
 - `brkcheck.c`: a sibling heap extension preserves an existing page and the

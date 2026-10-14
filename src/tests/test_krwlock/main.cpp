@@ -8,6 +8,8 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <atomic>
+#include <sched.h>
+#include <time.h>
 
 // ---------- Minimal Process stub ----------
 namespace brook {
@@ -245,22 +247,41 @@ TEST(concurrent_readers) {
     std::atomic<int> holdCount{0};
     std::atomic<int> maxHold{0};
     pthread_t threads[N];
+    pthread_barrier_t start;
+    pthread_barrier_init(&start, nullptr, N);
 
-    struct Args { KRwLock* rw; Process* p; std::atomic<int>* hold; std::atomic<int>* maxH; };
+    struct Args { KRwLock* rw; Process* p; std::atomic<int>* hold; std::atomic<int>* maxH;
+                  pthread_barrier_t* start; };
     Args args[N];
     for (int i = 0; i < N; i++) {
         procs[i] = {.pid = (uint16_t)(i+1), .syncNext = nullptr};
-        args[i] = {&rw, &procs[i], &holdCount, &maxHold};
+        args[i] = {&rw, &procs[i], &holdCount, &maxHold, &start};
     }
 
     auto fn = [](void* arg) -> void* {
         auto* a = (Args*)arg;
         tl_currentProcess = a->p;
+        pthread_barrier_wait(a->start);
         for (int j = 0; j < 1000; j++) {
             KRwLockReadLock(a->rw);
             int h = ++(*a->hold);
             int cur = a->maxH->load();
             while (h > cur && !a->maxH->compare_exchange_weak(cur, h)) {}
+            if (j == 0) {
+                // Explicitly allow another reader to acquire while this one
+                // holds the lock, including on one CPU. A broken exclusive
+                // implementation must fail the overlap assertion, not hang.
+                timespec deadline, now;
+                clock_gettime(CLOCK_MONOTONIC, &deadline);
+                ++deadline.tv_sec;
+                while (a->maxH->load() < 2) {
+                    sched_yield();
+                    clock_gettime(CLOCK_MONOTONIC, &now);
+                    if (now.tv_sec > deadline.tv_sec ||
+                        (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))
+                        break;
+                }
+            }
             (*a->hold)--;
             KRwLockReadUnlock(a->rw);
         }
@@ -271,6 +292,7 @@ TEST(concurrent_readers) {
         pthread_create(&threads[i], nullptr, fn, &args[i]);
     for (int i = 0; i < N; i++)
         pthread_join(threads[i], nullptr);
+    pthread_barrier_destroy(&start);
 
     // Multiple readers should have been concurrent.
     ASSERT(maxHold.load() > 1);

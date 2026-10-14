@@ -5879,35 +5879,43 @@ static int64_t sys_nanosleep(uint64_t reqAddr, uint64_t remAddr, uint64_t,
                               uint64_t, uint64_t, uint64_t)
 {
     if (!UserBufferReadable(reqAddr, sizeof(timespec))) return -EFAULT;
-    auto* req = reinterpret_cast<const timespec*>(reqAddr);
+    timespec req = *reinterpret_cast<const timespec*>(reqAddr);
+    if (req.tv_sec < 0 || req.tv_nsec < 0 || req.tv_nsec >= 1000000000LL)
+        return -EINVAL;
+    uint64_t duration, deadline;
+    if (__builtin_mul_overflow(static_cast<uint64_t>(req.tv_sec), 1000000000ULL, &duration) ||
+        __builtin_add_overflow(duration, static_cast<uint64_t>(req.tv_nsec), &duration) ||
+        __builtin_add_overflow(ClockNowNs(1), duration, &deadline))
+        return -EINVAL;
 
-    uint64_t sleepMs = static_cast<uint64_t>(req->tv_sec) * 1000 +
-                       static_cast<uint64_t>(req->tv_nsec) / 1000000;
-
-    if (sleepMs > 0)
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    uint64_t now = ClockNowNs(1);
+    while (now < deadline)
     {
-        // Block the process and let the scheduler wake us up.
-        Process* proc = ProcessCurrent();
-        proc->wakeupTick = g_lapicTickCount + sleepMs;
-        SchedulerBlock(proc);
-        // When we return here, the scheduler has woken us up.
         if (HasPendingSignals())
         {
-            // Fill remainder if caller wants it
-            if (remAddr && UserBufferReadable(remAddr, sizeof(timespec)))
+            if (remAddr)
             {
+                if (!UserBufferWritable(remAddr, sizeof(timespec))) return -EFAULT;
                 auto* rem = reinterpret_cast<timespec*>(remAddr);
-                // Approximate remaining time (may be 0 if wakeup was near end)
-                uint64_t elapsed = g_lapicTickCount - (proc->wakeupTick - sleepMs);
-                uint64_t remainMs = (elapsed < sleepMs) ? (sleepMs - elapsed) : 0;
-                rem->tv_sec = static_cast<int64_t>(remainMs / 1000);
-                rem->tv_nsec = static_cast<int64_t>((remainMs % 1000) * 1000000);
+                uint64_t remaining = deadline - now;
+                rem->tv_sec = static_cast<int64_t>(remaining / 1000000000ULL);
+                rem->tv_nsec = static_cast<int64_t>(remaining % 1000000000ULL);
             }
             return -EINTR;
         }
+        // Round positive durations UP to a scheduler tick. Recheck the
+        // monotonic deadline after wakeup, since a tick can arrive early or
+        // another event can unblock this process before the sleep expires.
+        uint64_t remaining = deadline - now;
+        uint64_t ticks = remaining / 1000000ULL + (remaining % 1000000ULL != 0);
+        proc->wakeupTick = g_lapicTickCount + ticks;
+        SchedulerBlock(proc);
+        now = ClockNowNs(1);
     }
 
-    if (remAddr && UserBufferReadable(remAddr, sizeof(timespec)))
+    if (remAddr && UserBufferWritable(remAddr, sizeof(timespec)))
     {
         auto* rem = reinterpret_cast<timespec*>(remAddr);
         rem->tv_sec = 0;

@@ -66,14 +66,26 @@ remain, covering either ordering of the two waitability gates. With both
 transitions covered, ten repeated CTest mutex runs pass in 3.91 seconds without
 the event-loop stall.
 
-The subsequent one-vCPU guest run completed in 33.03 seconds with 10/13 tests
-passing. Two concurrency assertions failed (`test_krwlock`, `test_ksemaphore`)
-and `test_fd_table` reached the 30-second timeout. The semaphore case uses a
-10-microsecond sleep that Brook currently rounds to zero; the reader test has
-no explicit handoff within its short critical section. Investigate real sleep
-semantics and deterministic concurrency coverage, and profile the descriptor
-stress test before choosing a suitable acceptance timeout. All 13 host tests
-pass in 1.27 seconds. Full guest acceptance remains outstanding.
+The initial one-vCPU guest run completed with 10/13 tests passing. Positive
+sub-millisecond nanosleep now rounds up and rechecks a monotonic deadline;
+the duration/invalid-timespec guest probe passes. The reader test explicitly
+rendezvouses while holding read locks, with a bounded escape: a deliberately
+serialized implementation fails its overlap assertion without hanging.
+
+The original descriptor stress exceeded a 600-second diagnostic deadline.
+Its user samples are concentrated in the pin-user and pin-closer ticket-lock
+spin loops. Workers now rendezvous before starting, and yield outside fd-table
+operations, including while holding a descriptor pin so closers exercise
+deferred teardown. All 500 close rounds, 800 pin rounds, 16 competitors per
+round, real fd-table/ticket-lock code and ownership/UAF assertions remain.
+That is 20,800 thread creations, not just the first phase's 8,000.
+
+With these changes, all 13 guest tests pass in 63.90 seconds on one vCPU;
+descriptor stress takes 54.57 seconds. The host suite with the stronger
+concurrency coverage passes in 22.11 seconds. This improvement applies to
+the test workload's scheduling, not a claim that compilation or Brook as a
+whole became ten times faster. The fresh two-path bootstrap and offline-fsck
+acceptance runs remain outstanding.
 
 ## Compatibility defects found during preparation
 

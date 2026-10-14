@@ -281,11 +281,14 @@ and a direct `test_kmutex` run passes all eight checks. CTest nevertheless
 stalled after threaded tests exited: its mutex-test child was terminated,
 reapable and had zero live threads, while CTest remained in epoll_pwait.
 The final thread now notifies the parent when the leader becomes waitable,
-fixing that stall. The full guest suite completes with 10/13 passing: reader
-and semaphore concurrency assertions fail on one vCPU, and descriptor stress
-hits a 30-second timeout. Fix positive sub-millisecond nanosleep rounding,
-establish deterministic reader overlap and profile descriptor stress; all 13
-guest tests passing remains an acceptance requirement. A separate user-PF diagnostic incorrectly forced
+fixing that stall. Positive sub-millisecond nanosleep now rounds up and checks
+its monotonic deadline; reader overlap is explicitly coordinated and rejects
+an exclusive-lock mutant. Descriptor workers rendezvous and yield outside the
+real fd-table operations, preserving every round and assertion while avoiding
+creation-order starvation. All 13 guest tests now pass on one vCPU in 63.90
+seconds. Absolute clock_nanosleep deadline rechecks/overflow handling and
+kernel/user scheduling under oversubscribed spinlocks remain follow-ups.
+A separate user-PF diagnostic incorrectly forced
 panic serial locking, stranding UART writers and command control. Removing
 that force-lock call is validated by a reaped SIGSEGV child, subsequent fd3
 UART sentinel and healthy bridge procs/stats, including after the complete

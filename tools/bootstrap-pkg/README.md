@@ -56,20 +56,19 @@ checked all 12 modules against 96 exported symbols. The guest-built kernel,
 loader and modules then booted a separate VM with the desktop, virtio GPU,
 storage, networking and command bridge; Git ran under that kernel.
 
-The 13 hosted tests pass on the host. In Brook, all 13 currently segfault
-during shared-library startup (CTest exit 8), before their assertions run.
-This is a successful core source-build and boot milestone; native test runtime
-compatibility remains [backlogged](../../docs/backlog.md). The compiler and
+The first guest run segfaulted during shared-library startup in all 13 hosted
+tests. The fixes below now allow all 13 to pass inside Brook. The compiler and
 SDK are prebuilt Linux binaries, rather than a compiler built inside Brook.
 
 The startup failure was subsequently traced to boot-library fallback supplying
 musl for missing Nix store `libc.so` paths during linking. Exact Nix path lookup
 and rebuilding remove that mixed-libc failure: the first three CTest cases pass,
 and the threaded mutex test passes all eight checks directly. A second fix
-notifies CTest when the last thread makes an exited leader waitable; the full
-suite now completes with 10/13 passing on one vCPU. Two concurrency assertions
-and a descriptor-stress timeout remain; a full guest suite pass is still
-outstanding. Existing binaries accidentally linked against musl must be
+notifies CTest when the last thread makes an exited leader waitable. Correct
+sub-millisecond sleep semantics and explicit worker coordination then allow
+all 13 tests to pass on one vCPU in 63.90 seconds, retaining full stress counts.
+Fresh-image acceptance remains the [next goal](../../docs/bootstrap.md).
+Existing binaries accidentally linked against musl must be
 rebuilt; changing path lookup alone cannot repair their dependencies.
 
 The local extracted outputs and SHA-256 manifest are retained under
