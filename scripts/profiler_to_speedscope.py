@@ -474,14 +474,14 @@ def main():
         for i, (tick, old_pid, new_pid, cs_stack) in enumerate(events):
             # Slice weight = ticks since last switch
             w = max(tick - prev_tick, 1)
-            ss.append([[get_cs_frame(old_pid)]])
+            ss.append([get_cs_frame(old_pid)])
             weights.append(w)
             prev_tick = tick
         # Final slice to end of recording
         if samples:
             last_tick = max(s[0] for s in samples)
             w = max(last_tick - prev_tick, 1)
-            ss.append([[get_cs_frame(events[-1][2])]])
+            ss.append([get_cs_frame(events[-1][2])])
             weights.append(w)
 
         profiles.append({
@@ -546,4 +546,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

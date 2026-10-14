@@ -94,8 +94,11 @@ class QMP:
                 raise RuntimeError(response["error"].get("desc", str(response["error"])))
             return response["return"]
 
-    def hmp(self, command):
-        result = self.call("human-monitor-command", {"command-line": command})
+    def hmp(self, command, cpu=None):
+        arguments = {"command-line": command}
+        if cpu is not None:
+            arguments["cpu-index"] = cpu
+        result = self.call("human-monitor-command", arguments)
         if result.strip().startswith(("Error", "unknown command", "invalid parameter")):
             raise RuntimeError(result.strip())
         return result

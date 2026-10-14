@@ -353,9 +353,8 @@ def debug(session, action="registers", address="0x0", size=256, cpu=0, **_):
     with session_lock(session) as data, QMP(session) as q:
         if cpu not in {c["cpu-index"] for c in q.call("query-cpus-fast")}:
             raise ValueError("No such vCPU in this VM")
-        q.hmp(f"cpu {cpu}")
         if action == "registers":
-            return {"registers": q.hmp("info registers"), "cpu": cpu,
+            return {"registers": q.hmp("info registers", cpu=cpu), "cpu": cpu,
                     "context": "current vCPU; original fault registers remain in panic logs", "panic": panic_state(data)}
         running = q.call("query-status")["running"]
         if running:
@@ -368,7 +367,7 @@ def debug(session, action="registers", address="0x0", size=256, cpu=0, **_):
             else:
                 start=addr
                 while start<addr+size:
-                    translated=q.hmp(f"gva2gpa {start:#x}")
+                    translated=q.hmp(f"gva2gpa {start:#x}", cpu=cpu)
                     match=re.search(r"gpa: (0x[0-9a-f]+)",translated)
                     if not match:raise ValueError("Virtual address cannot be translated")
                     physical=int(match[1],16)
@@ -378,7 +377,7 @@ def debug(session, action="registers", address="0x0", size=256, cpu=0, **_):
                     start+=count
             path = artifact(session, ".memory")
             command = "pmemsave" if action == "physical_memory" else "memsave"
-            q.hmp(f'{command} {addr:#x} {size} "{path}"')
+            q.hmp(f'{command} {addr:#x} {size} "{path}"', cpu=cpu)
             blob = path.read_bytes()
             if len(blob) != size:
                 raise RuntimeError("Memory export incomplete")

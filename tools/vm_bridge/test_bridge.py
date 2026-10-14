@@ -16,6 +16,15 @@ import common
 import server
 
 
+class CpuSelectionTests(unittest.TestCase):
+    def test_hmp_request_carries_cpu_for_every_command(self):
+        qmp = object.__new__(common.QMP)
+        with patch.object(qmp, "call", return_value="registers") as call:
+            self.assertEqual(qmp.hmp("info registers", cpu=3), "registers")
+            call.assert_called_once_with("human-monitor-command",
+                                         {"command-line": "info registers", "cpu-index": 3})
+
+
 class Contracts(unittest.TestCase):
     def test_png_pixels(self):
         png=server.png_rgb(2,1,b'\xff\0\0\0\xff\0')
@@ -102,7 +111,7 @@ class Contracts(unittest.TestCase):
                 if name=='query-cpus-fast':return [{'cpu-index':0}]
                 if name=='query-status':return {'running':True}
                 return {}
-            def hmp(self,command):
+            def hmp(self,command,cpu=None):
                 if command=='info mtree -f':return 'FlatView #6\n AS "memory", root: system\n0000000000000000-000000000000ffff (prio 0, ram)'
                 if command.startswith('gva2gpa'):return 'unmapped'
                 return ''
