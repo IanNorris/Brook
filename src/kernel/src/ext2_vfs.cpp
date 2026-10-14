@@ -591,6 +591,10 @@ static bool Ext2WriteInode(Ext2Mount* mnt, uint32_t ino, const Ext2Inode* data)
                         << mnt->blockShift;
     uint64_t inodeOff = tableOff + static_cast<uint64_t>(index) * mnt->inodeSize;
     bool ok = Ext2DevWrite(mnt, inodeOff, data, sizeof(Ext2Inode));
+    // A recovered virtio queue may reject one request. Replaying this exact
+    // inode image is idempotent and preserves accounting already committed
+    // in indirect pages; do not reload the older inode before this retry.
+    if (!ok) ok = Ext2DevWrite(mnt, inodeOff, data, sizeof(Ext2Inode));
     if (ok) Ext2InodeCachePut(mnt, ino, data);
     return ok;
 }
@@ -836,107 +840,145 @@ static bool Ext2FreeInode(Ext2Mount* mnt, uint32_t ino, bool isDir)
 // Forward declaration: defined further down with the read path.
 static uint32_t Ext2ReadIndPointer(Ext2Mount* mnt, uint32_t indBlock, uint32_t idx);
 
-static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
-                                uint32_t inoNum, uint32_t fileBlock)
-{
-    uint32_t ptrsPerBlock = mnt->blockSize / 4;
+// One bounded data-write run owns its pending indirect pages. No shared read
+// cache sees these speculative pointers; Flush commits children before parents.
+struct Ext2IndirectWriteBatch {
+    Ext2Mount* mnt;
+    uint8_t* storage;
+    struct Page { uint32_t block = 0; bool dirty = false; } pages[3]{};
+    uint32_t count = 0;
+    explicit Ext2IndirectWriteBatch(Ext2Mount* mount, bool enabled = true) : mnt(mount),
+        storage(enabled ? static_cast<uint8_t*>(kmalloc(3 * mount->blockSize)) : nullptr) {}
+    ~Ext2IndirectWriteBatch() { kfree(storage); }
+    void Reset() { count = 0; }
+    uint32_t* Get(uint32_t block, bool fresh = false) {
+        if (!storage) return nullptr;
+        for (uint32_t i = 0; i < count; ++i)
+            if (pages[i].block == block)
+                return reinterpret_cast<uint32_t*>(storage + i * mnt->blockSize);
+        if (count == 3) return nullptr;
+        uint8_t* data = storage + count * mnt->blockSize;
+        if (fresh) memset(data, 0, mnt->blockSize);
+        else if (!Ext2ReadBlock(mnt, block, data)) return nullptr;
+        pages[count++] = {block, fresh};
+        return reinterpret_cast<uint32_t*>(data);
+    }
+    bool Set(uint32_t block, uint32_t index, uint32_t value) {
+        auto* data = Get(block);
+        if (!data) return false;
+        data[index] = value;
+        for (uint32_t i = 0; i < count; ++i)
+            if (pages[i].block == block) pages[i].dirty = true;
+        return true;
+    }
+    bool Flush() {
+        for (uint32_t i = count; i > 0; --i) {
+            auto& page = pages[i - 1];
+            if (!page.dirty) continue;
+            auto* data = storage + (i - 1) * mnt->blockSize;
+            if (!Ext2WriteBlock(mnt, page.block, data)) return false;
+            page.dirty = false;
+            // Only committed pages enter the shared read cache.
+            Ext2BlockCachePut(mnt, page.block, data);
+        }
+        return true;
+    }
+};
 
-    // Direct blocks (0..11)
+static bool Ext2InitIndirect(Ext2Mount* mnt, uint32_t block,
+                              Ext2IndirectWriteBatch* batch)
+{
+    if (batch) return batch->Get(block, true) != nullptr;
+    auto* data = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+    if (!data) return false;
+    memset(data, 0, mnt->blockSize);
+    bool ok = Ext2WriteBlock(mnt, block, data);
+    kfree(data);
+    return ok;
+}
+
+static bool Ext2GetWritePointer(Ext2Mount* mnt, uint32_t block, uint32_t index,
+                                 uint32_t* value, Ext2IndirectWriteBatch* batch)
+{
+    if (batch) {
+        auto* data = batch->Get(block);
+        if (!data) return false;
+        *value = data[index];
+        return true;
+    }
+    return Ext2DevRead(mnt, (static_cast<uint64_t>(block) << mnt->blockShift)
+                            + index * 4, value, 4);
+}
+
+static bool Ext2SetWritePointer(Ext2Mount* mnt, uint32_t block, uint32_t index,
+                                 uint32_t value, Ext2IndirectWriteBatch* batch)
+{
+    if (batch) return batch->Set(block, index, value);
+    bool ok = Ext2DevWrite(mnt, (static_cast<uint64_t>(block) << mnt->blockShift)
+                              + index * 4, &value, 4);
+    // Directory growth uses immediate I/O; invalidate both shared caches.
+    SpinLockAcquire(&mnt->indCacheLock);
+    for (uint32_t i = 0; i < Ext2Mount::IND_CACHE_SLOTS; ++i)
+        if (mnt->indCacheBlockNum[i] == block) mnt->indCacheBlockNum[i] = 0;
+    SpinLockRelease(&mnt->indCacheLock);
+    Ext2BlockCacheInvalidate(mnt, block);
+    return ok;
+}
+
+static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
+                                uint32_t inoNum, uint32_t fileBlock,
+                                Ext2IndirectWriteBatch* batch = nullptr)
+{
+    (void)inoNum;
+    uint32_t ptrsPerBlock = mnt->blockSize / 4;
     if (fileBlock < 12) {
         if (ino->i_block[fileBlock]) return ino->i_block[fileBlock];
-        uint32_t nb = Ext2AllocBlock(mnt);
-        if (!nb) return 0;
-        ino->i_block[fileBlock] = nb;
+        uint32_t block = Ext2AllocBlock(mnt);
+        if (!block) return 0;
+        ino->i_block[fileBlock] = block;
         ino->i_blocks += mnt->blockSize / 512;
-        // Caller must write the inode back when its overall update is done.
-        return nb;
+        return block;
     }
     fileBlock -= 12;
-
-    // Singly indirect
-    if (fileBlock < ptrsPerBlock) {
-        if (!ino->i_block[12]) {
-            uint32_t nb = Ext2AllocBlock(mnt);
-            if (!nb) return 0;
-            // Zero out new indirect block
-            auto* zb = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
-            if (!zb) return 0;
-            memset(zb, 0, mnt->blockSize);
-            Ext2WriteBlock(mnt, nb, zb);
-            kfree(zb);
-            ino->i_block[12] = nb;
-            ino->i_blocks += mnt->blockSize / 512;
+    uint32_t slot = fileBlock < ptrsPerBlock ? 12 : 13;
+    if (slot == 13) fileBlock -= ptrsPerBlock;
+    if (slot == 13 && fileBlock >= ptrsPerBlock * ptrsPerBlock) return 0;
+    if (!ino->i_block[slot]) {
+        uint32_t block = Ext2AllocBlock(mnt);
+        if (!block) return 0;
+        if (!Ext2InitIndirect(mnt, block, batch)) {
+            Ext2FreeBlock(mnt, block);
+            return 0;
         }
-        // Use the indirect-block read cache (fed by Ext2ReadIndPointer)
-        // to avoid hitting the disk every time we extend a file in
-        // indirect-block range.
-        uint32_t entry = Ext2ReadIndPointer(mnt, ino->i_block[12], fileBlock);
-        if (entry) return entry;
-        uint32_t nb = Ext2AllocBlock(mnt);
-        if (!nb) return 0;
-        uint64_t off = (static_cast<uint64_t>(ino->i_block[12]) << mnt->blockShift)
-                       + fileBlock * 4;
-        // Update cache if the indirect block is currently cached.
-        {
-            SpinLockAcquire(&mnt->indCacheLock);
-            for (uint32_t s = 0; s < Ext2Mount::IND_CACHE_SLOTS; ++s) {
-                if (mnt->indCacheBlockNum[s] == ino->i_block[12] && mnt->indCacheData[s]) {
-                    *reinterpret_cast<uint32_t*>(mnt->indCacheData[s] + fileBlock * 4) = nb;
-                    break;
-                }
+        ino->i_block[slot] = block;
+        ino->i_blocks += mnt->blockSize / 512;
+    }
+    uint32_t indirect = ino->i_block[slot];
+    if (slot == 13) {
+        uint32_t parentIndex = fileBlock / ptrsPerBlock;
+        uint32_t leaf = 0;
+        if (!Ext2GetWritePointer(mnt, indirect, parentIndex, &leaf, batch)) return 0;
+        if (!leaf) {
+            leaf = Ext2AllocBlock(mnt);
+            if (!leaf) return 0;
+            if (!Ext2InitIndirect(mnt, leaf, batch)) {
+                Ext2FreeBlock(mnt, leaf);
+                return 0;
             }
-            SpinLockRelease(&mnt->indCacheLock);
-        }
-        Ext2DevWrite(mnt, off, &nb, 4);
-        ino->i_blocks += mnt->blockSize / 512;
-        return nb;
-    }
-    fileBlock -= ptrsPerBlock;
-
-    // Doubly indirect
-    if (fileBlock < ptrsPerBlock * ptrsPerBlock) {
-        if (!ino->i_block[13]) {
-            uint32_t nb = Ext2AllocBlock(mnt);
-            if (!nb) return 0;
-            auto* zb = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
-            if (!zb) return 0;
-            memset(zb, 0, mnt->blockSize);
-            Ext2WriteBlock(mnt, nb, zb);
-            kfree(zb);
-            ino->i_block[13] = nb;
+            if (!Ext2SetWritePointer(mnt, indirect, parentIndex, leaf, batch)) return 0;
             ino->i_blocks += mnt->blockSize / 512;
         }
-        uint32_t idx1 = fileBlock / ptrsPerBlock;
-        uint32_t idx2 = fileBlock % ptrsPerBlock;
-
-        uint64_t off1 = (static_cast<uint64_t>(ino->i_block[13]) << mnt->blockShift) + idx1 * 4;
-        uint32_t indBlock = 0;
-        Ext2DevRead(mnt, off1, &indBlock, 4);
-        if (!indBlock) {
-            indBlock = Ext2AllocBlock(mnt);
-            if (!indBlock) return 0;
-            auto* zb = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
-            if (!zb) return 0;
-            memset(zb, 0, mnt->blockSize);
-            Ext2WriteBlock(mnt, indBlock, zb);
-            kfree(zb);
-            Ext2DevWrite(mnt, off1, &indBlock, 4);
-            ino->i_blocks += mnt->blockSize / 512;
-        }
-
-        uint64_t off2 = (static_cast<uint64_t>(indBlock) << mnt->blockShift) + idx2 * 4;
-        uint32_t entry = 0;
-        Ext2DevRead(mnt, off2, &entry, 4);
-        if (entry) return entry;
-        uint32_t nb = Ext2AllocBlock(mnt);
-        if (!nb) return 0;
-        Ext2DevWrite(mnt, off2, &nb, 4);
-        ino->i_blocks += mnt->blockSize / 512;
-        return nb;
+        indirect = leaf;
+        fileBlock %= ptrsPerBlock;
     }
-
-    // Triply indirect not implemented for writes yet
-    return 0;
+    uint32_t entry = 0;
+    if (!Ext2GetWritePointer(mnt, indirect, fileBlock, &entry, batch)) return 0;
+    if (entry) return entry;
+    uint32_t block = Ext2AllocBlock(mnt);
+    if (!block) return 0;
+    if (!Ext2SetWritePointer(mnt, indirect, fileBlock, block, batch)) return 0;
+    ino->i_blocks += mnt->blockSize / 512;
+    return block;
 }
 
 // Write `len` bytes to inode data at `offset`. Returns bytes written.
@@ -951,6 +993,11 @@ static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
 {
     auto* src = static_cast<const uint8_t*>(buf);
     uint64_t bytesWritten = 0;
+    const uint64_t directBytes = 12ULL * mnt->blockSize;
+    bool needsIndirect = offset >= directBytes || len > directBytes - offset;
+    Ext2IndirectWriteBatch batch(mnt, needsIndirect);
+    if (needsIndirect && !batch.storage) return -12;
+    bool ioFailed = false;
 
     // Cap run-coalesce length to match read path / virtio DMA buffer.
     static constexpr uint64_t MAX_RUN_BYTES = 64 * 1024;
@@ -959,10 +1006,17 @@ static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
     if (!blockBuf) return -1;
 
     while (bytesWritten < len) {
+        batch.Reset();
+        Ext2Inode beforeRun = *ino;
+        uint64_t beforeBytes = bytesWritten;
         uint32_t fileBlock = static_cast<uint32_t>((offset + bytesWritten) >> mnt->blockShift);
         uint32_t blockOff  = static_cast<uint32_t>((offset + bytesWritten) & (mnt->blockSize - 1));
-        uint32_t diskBlock = Ext2EnsureBlock(mnt, ino, inoNum, fileBlock);
-        if (!diskBlock) break;
+        uint32_t diskBlock = Ext2EnsureBlock(mnt, ino, inoNum, fileBlock, &batch);
+        if (!diskBlock) {
+            // Publish successfully initialized empty metadata too (ENOSPC).
+            if (!batch.Flush() || !Ext2WriteInode(mnt, inoNum, ino)) ioFailed = true;
+            break;
+        }
 
         uint32_t avail = mnt->blockSize - blockOff;
         uint64_t remaining = len - bytesWritten;
@@ -975,11 +1029,12 @@ static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
                 maxRun = MAX_RUN_BYTES >> mnt->blockShift;
 
             while (runBlocks < maxRun) {
-                uint32_t nextDb = Ext2EnsureBlock(mnt, ino, inoNum, fileBlock + runBlocks);
+                uint32_t nextDb = Ext2EnsureBlock(mnt, ino, inoNum, fileBlock + runBlocks, &batch);
                 if (nextDb != diskBlock + runBlocks) break;
                 ++runBlocks;
             }
 
+            if (!batch.Flush()) { *ino = beforeRun; ioFailed = true; break; }
             uint64_t runBytes = static_cast<uint64_t>(runBlocks) << mnt->blockShift;
             uint64_t runOff   = static_cast<uint64_t>(diskBlock) << mnt->blockShift;
 
@@ -996,9 +1051,10 @@ static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
             }
             SpinLockRelease(&mnt->indCacheLock);
 
-            if (!Ext2DevWrite(mnt, runOff, src + bytesWritten, runBytes)) break;
+            if (!Ext2DevWrite(mnt, runOff, src + bytesWritten, runBytes)) { ioFailed = true; break; }
             bytesWritten += runBytes;
         } else {
+            if (!batch.Flush()) { *ino = beforeRun; ioFailed = true; break; }
             // Partial block: read-modify-write via bounce buffer.
             uint64_t toCopy = remaining;
             if (toCopy > avail) toCopy = avail;
@@ -1008,29 +1064,31 @@ static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
                 Ext2BlockCacheInvalidate(mnt, diskBlock);
                 if (!Ext2DevWrite(mnt, static_cast<uint64_t>(diskBlock) << mnt->blockShift,
                                   src + bytesWritten, mnt->blockSize))
-                    break;
+                    { ioFailed = true; break; }
             } else {
-                Ext2ReadBlock(mnt, diskBlock, blockBuf);
+                if (!Ext2ReadBlock(mnt, diskBlock, blockBuf)) { ioFailed = true; break; }
                 memcpy(blockBuf + blockOff, src + bytesWritten, toCopy);
-                if (!Ext2WriteBlock(mnt, diskBlock, blockBuf)) break;
+                if (!Ext2WriteBlock(mnt, diskBlock, blockBuf)) { ioFailed = true; break; }
             }
             bytesWritten += toCopy;
+        }
+        // Commit each bounded run. On a later metadata failure, earlier
+        // returned bytes already have a persisted inode/root and size.
+        uint64_t newEnd = offset + bytesWritten;
+        if (newEnd > ino->i_size) ino->i_size = static_cast<uint32_t>(newEnd);
+        Ext2Touch(ino);
+        if (!Ext2WriteInode(mnt, inoNum, ino)) {
+            bytesWritten = beforeBytes;
+            ioFailed = true;
+            break;
         }
     }
 
     kfree(blockBuf);
 
-    // Update inode size if we extended the file, and unconditionally
-    // write the inode back so any newly-allocated i_block[] entries
-    // assigned by Ext2EnsureBlock are persisted (it no longer flushes
-    // the inode itself per allocation).
-    uint64_t newEnd = offset + bytesWritten;
-    if (newEnd > ino->i_size) {
-        ino->i_size = static_cast<uint32_t>(newEnd);
-    }
-    if (bytesWritten) Ext2Touch(ino);
-    Ext2WriteInode(mnt, inoNum, ino);
-
+    // Metadata failure must not look like short successful progress: callers
+    // could retry against an older inode count while pointers already exist.
+    if (ioFailed) return -5;
     return static_cast<int>(bytesWritten);
 }
 
