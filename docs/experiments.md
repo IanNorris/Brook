@@ -233,3 +233,60 @@ shortcut now reaches the title/menu and a playable first level. Capture/log evid
 twelve host tests pass. Video-player logs show AAC decode and `/dev/dsp` output;
 `BROOK_AUDIODEV=none` intentionally discards host playback. Use `pipewire` on a
 new user launch to listen, while keeping MCP test launches silent.
+
+## Dragging, Quake defaults, argv and audio writes, 14 October 2026
+
+Native-window testing exposed additional issues:
+
+- The compositor painted chrome before applying drag/input changes, then drew
+  GPU content using updated geometry. Input now runs before scene painting.
+  GPU compose submissions also wait for a render fence before publishing the
+  result to the host display context. Repeated VM-only drag captures retain
+  coherent decorations. Physical SDL presentation still needs human retesting.
+- Yamagi 8.60's bundled `stuff/yq2.cfg` uses ESDF, explicitly `D=+back`.
+  The recovered SDL probe reports W/A/S/D correctly (26/4/22/7 and the expected
+  key symbols). Fresh Brook profiles execute the installed WASD defaults;
+  existing `config.cfg` or `autoexec.cfg` remains authoritative. Two wrapper
+  tests check renderer/map arguments and preservation of saved preferences.
+- The GL3 scenario has 25 shell arguments, exceeding the old limit of 16.
+  The shell now accepts 32. Its wrapped exec reaches 37 arguments (38 during diagnostic setup), exposing a
+  separate initial-stack bug: a 32-pointer array was followed by an argc-sized
+  read. Stack setup now supports the exec syscall's 64-entry bound and actually
+  clamps before indexing. `/boot/SCRIPTS/ARGVCHECK.RC` forwards 41 ordered
+  arguments through Bash and verifies the terminating null pointer.
+- `/dev/dsp` previously acknowledged all bytes after the mixer silently
+  clamped an oversized write. It now returns accepted-byte counts (or EAGAIN
+  when no samples fit) and bounds blocking-space requests to ring capacity.
+  `run /boot/BIN/OSSCHECK --stream` demonstrates the old failure and the fix:
+  176,400 bytes formerly acknowledged in one call; the corrected first return
+  is 65,536 and retries deliver the full input in three calls.
+
+Guest-generated config files disappeared during first-run game-directory
+creation. The disk creator now installs OpenAL configuration at
+`/nix/etc/alsoft-oss.conf`, installs `brook-controls.cfg` alongside game data,
+and precreates the user directories. This avoids relying on runtime mkdir/
+heredoc writes for those supplied defaults; the filesystem defect itself is
+still unresolved. The OpenAL fixture pins OSS to 44,100 Hz, stereo, S16_LE.
+
+The existing KVM pvclock fix (`f56619e`) is present and enabled. A sampled
+LAPIC/compositor tick comparison measured about 1,025 ms per host second,
+not a two-times clock in that run. Silent SDL captures after the OSS fix
+produced about ten seconds of PCM in ten seconds of host monotonic time.
+This does not prove the reported intermittent fast-tempo music is fully fixed:
+SDL tests used its dummy host audio driver, and an OST-envelope comparison was
+inconclusive. Preserve the real SDL/PipeWire comparison and guest queue/sample
+telemetry investigation under RUN-02.
+
+The release build, twelve host checks and fourteen bridge/wrapper checks pass.
+The recovered probes live in `tools/sdl2-input-probe`; their old investigation
+notes are distinguished from current verification. All PCM, images, test
+runs and licensed game assets remain in ignored build directories.
+
+The selected default seed set is now `build/experiments/seeds`; previous seeds
+are preserved at `build/experiments/seeds-before-20261014-input-audio`.
+The final installed-config retry initialized GL3 at 1280×720 through Intel
+virgl, executed `brook-controls.cfg`, and read the installed 44.1 kHz/stereo/
+int16 OpenAL configuration. Evidence is under
+`build/vm-bridge/ef8fc1e9a08c455885ca2cae39ce534b/`. Its final SDL-dummy capture
+contains 10.136 seconds of PCM over a 10.090-second host interval. Validation
+VMs were stopped; use a new launch to pick up the boot image and seed changes.

@@ -2461,7 +2461,10 @@ static void CompEndFrameDraw()
         dw[n++] = 0; dw[n++] = 0; dw[n++] = 3; dw[n++] = 0;
     }
     sub->size = n * 4;
-    SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP);
+    // The display consumer is a different host GL context. Publish only after
+    // rendering completes; a plain used-ring ack is not a GPU-completion fence.
+    if (!CmdRespOk(SubmitCommand(sizeof(VirtioGpuCmdSubmit) + n * 4, CMD_RESP_CAP, true)))
+        return;
     g_drawQuadCount = 0;
     g_blurBarrierCount = 0;
     ResourceFlush(COMP_SCANOUT_RES, 0, 0, g_compScanoutW, g_compScanoutH);
@@ -2478,7 +2481,8 @@ static void CompEndFrame()
     sub->hdr.type   = VIRTIO_GPU_CMD_SUBMIT_3D;
     sub->hdr.ctx_id = COMP_CTX_ID;
     sub->size       = g_composeN * 4;
-    SubmitCommand(sizeof(VirtioGpuCmdSubmit) + g_composeN * 4, CMD_RESP_CAP);
+    if (!CmdRespOk(SubmitCommand(sizeof(VirtioGpuCmdSubmit) + g_composeN * 4, CMD_RESP_CAP, true)))
+        return;
     g_composeN = 0;
     // Present the composed scanout RT.
     ResourceFlush(COMP_SCANOUT_RES, 0, 0, g_compScanoutW, g_compScanoutH);

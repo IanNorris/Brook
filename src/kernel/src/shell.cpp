@@ -45,7 +45,8 @@ namespace brook {
 // ---------------------------------------------------------------------------
 
 static constexpr uint32_t MAX_LINE    = 256;
-static constexpr uint32_t MAX_ARGS    = 16;
+// Match run's 32-entry argv: the GL3 experiment needs 25 shell arguments.
+static constexpr uint32_t MAX_ARGS    = 32;
 
 
 // Auto-tiling grid state

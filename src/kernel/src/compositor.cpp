@@ -1274,8 +1274,13 @@ static void OverlaySetAlphaRect(int x, int y, int w, int h)
 }
 
 // WM-mode compositor loop: wallpaper → windows (z-ordered) → chrome → cursor.
+static void CompositorInputWM();
+
 static void CompositorLoopWM()
 {
+    // Apply movement/focus/resize before rendering either chrome or content.
+    // GPU composition later samples chrome using the current window geometry.
+    CompositorInputWM();
     uint64_t now = g_lapicTickCount;
     bool forceAll = (now - g_lastForceBlitTick >= FORCE_BLIT_INTERVAL_MS);
     if (forceAll) g_lastForceBlitTick = now;
@@ -1587,7 +1592,11 @@ static void CompositorLoopWM()
         }
     }
 
-    // 4. Route input events (keyboard + mouse buttons)
+}
+
+static void CompositorInputWM()
+{
+    // Route input events (keyboard + mouse buttons)
     // Must happen before mouse click handling so poll drains the virtqueue
     // and events are latched for CompositorHandleMouseWM.
     InputEvent ev;

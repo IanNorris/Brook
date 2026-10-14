@@ -57,3 +57,18 @@ in ignored `build/vm-bridge/030fc50fc5614fd28cf9bad92665e8f3/` and
 `build/experiments/results/mcp-final-validation.json`. CPU-rendered controlled
 panic capture was separately verified on session
 `e095f8182f684792aaf815cc82cc8a54`.
+
+### Native-window follow-up
+
+14 October: corrected chrome/input ordering and added GPU completion fences;
+restored first-run WASD rather than Yamagi ESDF; fixed shell argv truncation
+and initial exec-stack overflow; restored truthful OSS short writes. Installed
+OpenAL/controls fixtures avoid disappearing runtime-created config files.
+The filesystem mkdir/write defect remains REC-01/RUN-01. RUN-02 still needs a
+real SDL/PipeWire tempo comparison: silent dummy-SDL PCM timing is not proof
+that the intermittent no-pitch-change symptom is gone. KVM pvclock is active;
+no two-times clock was measured. REC-02 retains SDL3 text-input activation:
+the recovered probe reproduces per-window text input remaining disabled while
+physical key events are correct. REC-03 retains intermittent GL3 startup/user
+faults and UI/text corruption; one new seed run faulted at RIP=0 during graphics
+initialization and is preserved under `build/vm-bridge/651ab826f9c5497ba7e41c6eb9a69025/`.

@@ -1,11 +1,14 @@
 // Live ABI probe: request numbers come from the toolchain's Linux headers.
+#include <errno.h>
+#include <stdint.h>
+#include <string.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <sys/ioctl.h>
 #include <sys/soundcard.h>
 #include <unistd.h>
 
-int main(void)
+int main(int argc, char **argv)
 {
     int fd = open("/dev/dsp", O_WRONLY);
     if (fd < 0) { perror("osscheck: open"); return 1; }
@@ -29,6 +32,33 @@ int main(void)
     printf("osscheck: PASS GETOSPACE=0x%lx bytes=%d fragments=%d/%d\n",
            (unsigned long)SNDCTL_DSP_GETOSPACE, space.bytes,
            space.fragments, space.fragstotal);
+    if (argc > 1 && !strcmp(argv[1], "--stream")) {
+        // A one-second write is larger than the mixer ring. The syscall must
+        // return a short count, not acknowledge samples that it discarded.
+        static int16_t pcm[44100 * 2];
+        for (unsigned i=0; i<44100; ++i) {
+            int16_t value=(int16_t)((i % 1024) * 16 - 8192);
+            pcm[i*2]=value; pcm[i*2+1]=value;
+        }
+        size_t sent=0; unsigned calls=0, shorts=0; ssize_t first=0;
+        while (sent<sizeof(pcm)) {
+            size_t remaining=sizeof(pcm)-sent;
+            ssize_t written=write(fd, (char *)pcm+sent, remaining);
+            if (written<0 && (errno==EAGAIN || errno==EINTR)) { usleep(5000); continue; }
+            if (written<=0 || (size_t)written>remaining) {
+                perror("osscheck: stream write"); close(fd); return 1;
+            }
+            if (!calls) first=written;
+            if ((size_t)written<remaining) ++shorts;
+            ++calls; sent+=(size_t)written;
+        }
+        usleep(600000); // let the final queued fragment reach HDA before close
+        printf("osscheck: STREAM accepted=%zu first=%zd calls=%u short=%u\n", sent,first,calls,shorts);
+        if (!shorts) {
+            fprintf(stderr,"osscheck: FAIL oversized write acknowledged without backpressure\n");
+            close(fd); return 1;
+        }
+    }
     close(fd);
     return 0;
 }

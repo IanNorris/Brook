@@ -446,11 +446,14 @@ static uint64_t SetupUserStack(Process* proc,
     }
 
     // 3. Push argument strings and record pointers
-    static constexpr int MAX_SETUP_ARGS = 32;
+    // sys_execve accepts up to 63 arguments, plus a possible interpreter arg.
+    static constexpr int MAX_SETUP_ARGS = 64;
     uint64_t argAddrs[MAX_SETUP_ARGS] = {};
-    if (argc > MAX_SETUP_ARGS)
+    if (argc > MAX_SETUP_ARGS) {
         SerialPrintf("SetupUserStack: WARNING argc=%d clamped to %d for pid %u\n",
                      argc, MAX_SETUP_ARGS, proc->pid);
+        argc = MAX_SETUP_ARGS;
+    }
     for (int i = 0; i < argc && i < MAX_SETUP_ARGS; ++i)
     {
         uint64_t len = 0;

@@ -95,13 +95,15 @@ ignored experiment disks. They are never included in the plugin package.
 ## Validation
 
 ```sh
-python3 -m unittest discover -s tools/vm_bridge -p test_bridge.py -v
+python3 -m unittest discover -s tools/vm_bridge -p "test_*.py" -v
 ```
 
 Twelve bridge contract tests cover fragmented tokenized replies, stdio MCP,
 PNG pixels, cancellation cleanup, input preflight, crop-coordinate mapping,
 reset/panic history, RAM-map selection and resume after failed memory reads.
-The existing twelve host tests pass, and the changed kernel/boot image builds.
+Two additional wrapper tests check first-run controls, renderer selection and
+saved preferences. The existing twelve host tests pass, and the changed
+kernel/boot image builds.
 
 Live validation on 14 October 2026 attached to a user-started CPU-rendered VM
 and an agent-started Intel virgl GL3 VM. Captured native 1920×1080 frames and

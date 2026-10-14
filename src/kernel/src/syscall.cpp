@@ -1571,14 +1571,15 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count)
 
         // Block until mixer has enough space (avoid silent sample drops).
         // Skip blocking for O_NONBLOCK fds (games need non-blocking writes
-        // to avoid stalling their render loop — they tolerate small gaps).
+        // to avoid stalling their render loop; report partial writes faithfully).
         // Timeout after 500ms to avoid permanent hang on broken stream.
         bool isNonBlock = (fde->statusFlags & 0x800) != 0;
         if (!isNonBlock)
         {
             extern volatile uint64_t g_lapicTickCount;
             uint64_t deadline = g_lapicTickCount + 500;
-            while (AudioMixerAvailableFrames(dsp->mixerStreamId) < totalOutFrames)
+            uint32_t waitFrames = totalOutFrames < MIXER_RING_FRAMES ? totalOutFrames : MIXER_RING_FRAMES;
+            while (AudioMixerAvailableFrames(dsp->mixerStreamId) < waitFrames)
             {
                 if (g_lapicTickCount >= deadline) break;
                 Process* self = SchedulerCurrentProcess();
@@ -1662,10 +1663,15 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count)
 
         if (mixSrc && mixFrames > 0)
         {
-            AudioMixerSubmit(mixSrc, mixFrames, dsp->mixerStreamId);
+            uint32_t accepted = AudioMixerSubmit(mixSrc, mixFrames, dsp->mixerStreamId);
+            if (!accepted) return -EAGAIN;
+            uint64_t consumed = (appRate == DSP_HW_RATE || appRate == 0)
+                ? accepted : static_cast<uint64_t>(accepted - 1) * appRate / DSP_HW_RATE + 1;
+            if (consumed > totalInFrames) consumed = totalInFrames;
+            return static_cast<int64_t>(consumed * bytesPerFrame);
         }
 
-        return static_cast<int64_t>(count);
+        return 0;
     }
 
     // Write to /dev/tty (DevKeyboard) — route to serial + TTY framebuffer

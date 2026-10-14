@@ -31,7 +31,7 @@ static SpinLock g_mixerLock;
 // Multiple streams can write concurrently at different positions; we drain
 // up to the minimum write position to ensure all streams have contributed.
 
-static constexpr uint32_t MIXER_BUF_FRAMES = 16384; // ~372ms at 44100 Hz
+static constexpr uint32_t MIXER_BUF_FRAMES = MIXER_RING_FRAMES; // ~372ms at 44100 Hz
 static constexpr uint32_t MIXER_BUF_MASK   = MIXER_BUF_FRAMES - 1;
 static constexpr uint32_t MIXER_MAX_STREAMS = 8;
 
@@ -80,9 +80,9 @@ uint32_t AudioMixerAvailableFrames(uint32_t streamId)
     return available;
 }
 
-void AudioMixerSubmit(const int16_t* samples, uint32_t frameCount, uint32_t streamId)
+uint32_t AudioMixerSubmit(const int16_t* samples, uint32_t frameCount, uint32_t streamId)
 {
-    if (!g_mixerReady || !samples || frameCount == 0) return;
+    if (!g_mixerReady || !samples || frameCount == 0) return 0;
     if (streamId >= MIXER_MAX_STREAMS) streamId = 0;
 
     SpinLockAcquire(&g_mixerLock);
@@ -101,7 +101,7 @@ void AudioMixerSubmit(const int16_t* samples, uint32_t frameCount, uint32_t stre
     if (frameCount == 0)
     {
         SpinLockRelease(&g_mixerLock);
-        return;
+        return 0;
     }
 
     // Additively mix into the ring buffer
@@ -118,6 +118,7 @@ void AudioMixerSubmit(const int16_t* samples, uint32_t frameCount, uint32_t stre
         g_writeHighWater = writePos;
 
     SpinLockRelease(&g_mixerLock);
+    return frameCount;
 }
 
 // Flush accumulated mix data to hardware.

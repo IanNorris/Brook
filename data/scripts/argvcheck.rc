@@ -1,0 +1,2 @@
+# Bash, rather than the kernel shell, forwards more than 32 execve arguments.
+run /nix/profile/bin/bash /boot/SCRIPTS/argvpayload.rc

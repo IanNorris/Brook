@@ -82,6 +82,7 @@ def main():
         (nix_root / "bin").mkdir()
         (nix_root / "etc").mkdir(exist_ok=True)
         shutil.copy2(ROOT / "data/asound.conf", nix_root / "etc/asound.conf")
+        shutil.copy2(ROOT / "data/config/alsoft-oss.conf", nix_root / "etc/alsoft-oss.conf")
         for executable in ["waylandd", "wayland-calc", "brook-player", "brook-files",
                            "brook-office", "brook-yquake2-gl", "brook-yquake2-soft"]:
             source = profile / "bin" / executable
@@ -94,11 +95,15 @@ def main():
             (nix_root / "etc/ssl/certs").mkdir(parents=True)
             shutil.copy2(cert, nix_root / "etc/ssl/certs/ca-bundle.crt")
 
-        for directory in ["home", "yq2", "tmp", "videos", "games/quake2/baseq2"]:
+        for directory in ["home", "yq2/.yq2/baseq2", "yq2/.cache", "yq2/.config", "tmp", "videos", "games/quake2/baseq2"]:
             (data_root / directory).mkdir(parents=True, exist_ok=True)
         if args.q2_dir:
             shutil.copytree(args.q2_dir, data_root / "games/quake2/baseq2", dirs_exist_ok=True)
             manifest["assets"]["pak0.pak"] = digest(args.q2_dir / "pak0.pak")
+        controls = data_root / "games/quake2/baseq2/brook-controls.cfg"
+        shutil.copy2(ROOT / "data/config/yquake2-controls.cfg", controls)
+        manifest["assets"]["brook-controls.cfg"] = digest(controls)
+        manifest["assets"]["alsoft-oss.conf"] = digest(nix_root / "etc/alsoft-oss.conf")
         if args.q2_music:
             music = data_root / "games/quake2/baseq2/music"
             music.mkdir(parents=True, exist_ok=True)

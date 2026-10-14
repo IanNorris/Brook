@@ -41,21 +41,17 @@ export ALSOFT_DRIVERS=oss
 export HOME=/data/yq2
 export XDG_CACHE_HOME=/data/yq2/.cache
 export XDG_CONFIG_HOME=/data/yq2/.config
-mkdir -p /data/yq2/.yq2 /data/yq2/.cache /data/yq2/.config
-export ALSOFT_CONF=/data/yq2/.yq2/alsoft.conf
-cat > "${ALSOFT_CONF}" <<'ALSOFT'
-# Brook OSS output — pinned so the kernel mixer does no resample.
-[general]
-drivers = oss
-frequency = 44100
-channels = stereo
-sample-type = int16
-periods = 4
-period_size = 1024
+mkdir -p /data/yq2/.yq2/baseq2 /data/yq2/.cache /data/yq2/.config
 
-[oss]
-device = /dev/dsp
-ALSOFT
+# Yamagi's bundled yq2.cfg defaults to ESDF (D=back). Use WASD for a fresh
+# Brook profile, while leaving saved config/autoexec preferences authoritative.
+BROOK_FIRST_CONTROLS=0
+if [ ! -f "$HOME/.yq2/baseq2/config.cfg" ] && [ ! -f "$HOME/.yq2/baseq2/autoexec.cfg" ]; then
+    BROOK_FIRST_CONTROLS=1
+fi
+# Installed by create_experiment_disks.py; guest directory creation can lose
+# newly written files, so the mixer format must not depend on a startup heredoc.
+export ALSOFT_CONF=/nix/etc/alsoft-oss.conf
 
 # Library search path for libs yquake2 dlopen()s by bare soname that aren't on
 # its rpath — notably libopenal.so.1 (OpenAL backend). @YQUAKE2_LIBDIRS@ is filled
@@ -71,6 +67,10 @@ RENDERER="gl1"
 case "${1:-}" in
     gl1|gl3|gles3|soft) RENDERER="$1"; shift ;;
 esac
+
+if [ "$BROOK_FIRST_CONTROLS" = "1" ]; then
+    set -- +exec brook-controls.cfg "$@"
+fi
 
 # @YQUAKE2_BIN@ is replaced by prestage_yquake2.sh with the RESOLVED real binary
 # path (lib/yquake2/quake2), NOT the bin/yquake2 symlink. yquake2 finds its

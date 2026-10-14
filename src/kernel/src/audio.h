@@ -54,11 +54,13 @@ static constexpr uint32_t MIXER_HW_RATE     = 44100;
 static constexpr uint8_t  MIXER_HW_CHANNELS = 2;
 static constexpr uint8_t  MIXER_HW_BITS     = 16;
 static constexpr uint32_t MIXER_FRAME_BYTES  = MIXER_HW_CHANNELS * (MIXER_HW_BITS / 8); // 4
+static constexpr uint32_t MIXER_RING_FRAMES = 16384;
 
 // Submit pre-resampled 44100/stereo/16-bit PCM into the mix buffer.
 // Samples are added to whatever is already accumulated at that stream's position.
 // streamId identifies the /dev/dsp fd (0-7), allowing independent write cursors.
-void AudioMixerSubmit(const int16_t* samples, uint32_t frameCount, uint32_t streamId = 0);
+// Returns the number of frames actually accepted; callers must retry the rest.
+uint32_t AudioMixerSubmit(const int16_t* samples, uint32_t frameCount, uint32_t streamId = 0);
 
 // Query available space in mixer ring for a given stream (in frames).
 uint32_t AudioMixerAvailableFrames(uint32_t streamId = 0);
