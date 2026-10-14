@@ -792,7 +792,7 @@ extern "C" bool MemFdHandleUserFault(uint64_t cr2, uint64_t errCode)
 
 // ---------------------------------------------------------------------------
 // File Page Cache — global cache of clean file-backed pages.
-// Key: (Vnode*, file_page_index).  Maps to a PhysicalAddress with refcount.
+// Key: (globally unique vnode cacheId, file_page_index). Maps to a physical page.
 // Used by demand-paged MAP_PRIVATE file mappings to share identical read-only
 // pages across processes and enable 64KB read-ahead batches.
 // ---------------------------------------------------------------------------

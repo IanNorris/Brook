@@ -216,7 +216,8 @@ static void ExcStackWalk(uint64_t rbp, int maxFrames, const char* tag)
 // the next occurrence tells us immediately whether CR2 is a buffer OVERRUN just
 // past the end of a real mapping (e.g. a too-short texture/file mmap that glibc
 // memcpy ran off) or a genuinely wild pointer. Also attributes the faulting RIP
-// to its backing file via cacheId (inode — resolve with `find /store -inum N`).
+// to its backing file via cacheId (ext2: upper 32 bits = mount namespace,
+// lower 32 bits = inode — resolve on that mount with `find ... -inum N`).
 // Lock-free, allocation-free, serial-locked caller — safe in the fault path.
 // `addr` is CR2; `rip` is the faulting IP.
 static void ExcDumpUserAddrSpace(brook::Process* p, uint64_t addr, uint64_t rip,
@@ -292,7 +293,7 @@ static void ExcDumpUserAddrSpace(brook::Process* p, uint64_t addr, uint64_t rip,
     if (ripKind) {
         ExcPutsRaw(" in "); ExcPutsRaw(ripKind); ExcPutsRaw(" map @");
         ExcPutHex(ripStart); ExcPutsRaw(" off="); ExcPutHex(rip - ripStart);
-        ExcPutsRaw(" inode="); ExcPutHex(ripInode);
+        ExcPutsRaw(" cacheId="); ExcPutHex(ripInode);
         ExcPutsRaw("\n");
     } else {
         ExcPutsRaw(" (not in any tracked file map)\n");

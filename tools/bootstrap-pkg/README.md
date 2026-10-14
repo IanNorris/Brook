@@ -44,3 +44,11 @@ A core bootstrap requires newly generated `build/release/kernel/BROOK.elf`,
 Running host tests in Brook additionally exercises its native process/thread
 compatibility. Booting the guest-built kernel is a further verification step.
 All runtime images, package NARs, guest clones and logs stay outside git.
+
+The bootstrap investigation also reproduced a cross-mount mmap cache collision:
+a Git object on `/data` and Python's `_ctypes` library on `/nix` both had inode
+3365. Before the fix, the library's mmap differed from `pread` at 1,736 bytes,
+including its ELF header. Mount-specific cache identities restored matching
+bytes, passed the equal-inode regression in `tools/at-syscall-probe`, and restored
+`import ctypes`. Write/truncate/inode-reuse cache invalidation remains a separate
+follow-up.

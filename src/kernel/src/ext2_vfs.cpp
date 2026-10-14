@@ -160,6 +160,7 @@ static inline bool Ext2DirEntryValid(const Ext2DirEntry2* de, uint32_t pos,
 
 struct Ext2Mount {
     Device*  dev;
+    uint32_t cacheNamespace; // unique for this mount's lifetime, including remounts
     uint32_t blockSize;      // bytes per block
     uint32_t blockShift;     // log2(blockSize)
     uint32_t inodeSize;      // bytes per inode on disk
@@ -1882,6 +1883,15 @@ static const VnodeOps g_ext2DirOps = {
 static constexpr uint8_t EXT2_MAX_MOUNTS = 16;
 static Device* g_ext2Devices[EXT2_MAX_MOUNTS] = {};
 static Ext2Mount* g_ext2Mounts[EXT2_MAX_MOUNTS] = {};
+// The global mmap page cache outlives an individual mount. Never reuse its
+// namespace on remount; physical drive numbers and raw inode numbers alone
+// would let cached pages from another filesystem satisfy this file's faults.
+static uint64_t g_nextExt2CacheNamespace = 1;
+
+static uint64_t Ext2CacheId(const Ext2Mount* mnt, uint32_t ino)
+{
+    return (static_cast<uint64_t>(mnt->cacheNamespace) << 32) | ino;
+}
 
 static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
 {
@@ -1958,6 +1968,13 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
     auto* mnt = static_cast<Ext2Mount*>(kmalloc(sizeof(Ext2Mount)));
     if (!mnt) { kfree(bgdt); return false; }
 
+    uint64_t cacheNamespace = __atomic_fetch_add(&g_nextExt2CacheNamespace, 1, __ATOMIC_RELAXED);
+    if (cacheNamespace > 0xffffffffULL) {
+        kfree(mnt); kfree(bgdt);
+        SerialPuts("ext2: page-cache namespace exhausted\n");
+        return false;
+    }
+    mnt->cacheNamespace = static_cast<uint32_t>(cacheNamespace);
     mnt->dev            = dev;
     mnt->blockSize      = blockSize;
     mnt->blockShift     = blockShift;
@@ -2040,6 +2057,7 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
     *mountPriv = mnt;
     g_ext2Mounts[pdrv] = mnt;
     mnt->skipPermChecks = false;  // Caller can override for nix mount
+    SerialPrintf("ext2: pdrv %u page-cache namespace %u\n", pdrv, mnt->cacheNamespace);
     DbgPrintf("ext2: mounted successfully\n");
     return true;
 }
@@ -2224,7 +2242,7 @@ static Vnode* Ext2FsOpenMode(void* mountPriv, uint8_t pdrv,
         vn->type = VnodeType::Dir;
         vn->priv = dp;
         vn->refCount = 1;
-        vn->cacheId = static_cast<uint64_t>(ino);
+        vn->cacheId = Ext2CacheId(mnt, ino);
         return vn;
     }
 
@@ -2241,7 +2259,7 @@ static Vnode* Ext2FsOpenMode(void* mountPriv, uint8_t pdrv,
         vn->type = VnodeType::File;
         vn->priv = fp;
         vn->refCount = 1;
-        vn->cacheId = static_cast<uint64_t>(ino);
+        vn->cacheId = Ext2CacheId(mnt, ino);
         return vn;
     }
 

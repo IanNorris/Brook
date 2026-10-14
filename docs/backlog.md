@@ -219,10 +219,10 @@ add protected-page probes. `alarm` (syscall 38) also returns ENOSYS; the current
 readiness probe uses a forked parent watchdog instead. Temporary pselect/ppoll
 signal masks and TCP urgent-data readiness remain compatibility follow-ups.
 
-Bootstrap cache/lifetime audit: mmap's global page cache keys ext2 files by raw
-inode only, so equal inode numbers on different mounts can collide. Namespace
-cache identities by filesystem/mount and handle write/unlink/inode reuse
-invalidation. Open directory paths also truncate at 62 bytes, and unlink frees
+Bootstrap cache/lifetime follow-ups: ext2 mmap cache identities now include a
+unique mount namespace, fixing collisions between equal inode numbers on
+different disks. Write/truncate/unlink/inode-reuse invalidation still needs
+implementation. Open directory paths also truncate at 62 bytes, and unlink frees
 storage still referenced by open vnodes. Add multi-mount mmap, long-dirfd-path
 and unlink-while-open regressions. The phantom Git references were separately
 traced to the missing-directory `/boot/lib` fallback, not proven cache aliasing.

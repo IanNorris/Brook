@@ -118,3 +118,27 @@ before exec and opens its output there. Verify both `FD3CHECK SERIAL ORIGINAL`
 and `FD3CHECK SERIAL DUPLICATE` appear in the UART log; successful write returns
 alone cannot prove serial delivery. Expect `FD3CHECK PASS failures=0`.
 `--no-serial` skips the Brook-specific inherited-device checks for host runs.
+
+`mmapcachecheck.c --diagnose PATH` compares every byte of `pread` and a read-only
+private mmap of an existing file (1 byte through 64 MiB). It prints inode/size,
+FNV-1a digests, mismatch count and the first differing offset/bytes. Run it on
+a suspect library before reboot clears the global cache. It performs no writes,
+but mapping may populate that cache; keep the backing file unchanged throughout.
+
+For the namespace regression, pass two file paths on **different ext2 mounts**
+with equal inode numbers and different content at overlapping offsets. The
+probe rejects unsuitable inode/content pairs, primes the first file, verifies
+the second twice, and reopens the first to verify stable identity. Brook still
+reports zero `st_dev`, so mount separation must be established by the test setup.
+Expect `MMAPCACHECHECK PASS failures=0`. This does not test write, truncation or
+inode-reuse invalidation, which remain separate page-cache limitations.
+
+A reproducible fixture uses two new, otherwise identical disposable ext2
+images: format them with the same size/options, then use `debugfs -w` to write
+one 64 KiB payload at `/cachecheck` in each. Use distinct payloads (for example
+all `A` versus all `B`) and verify `debugfs -R 'stat /cachecheck' IMAGE` reports
+the same inode on both. Attach and mount both images in an isolated test VM,
+then invoke the probe with both `/cachecheck` paths. Never modify a live VM's
+image through debugfs. The fixed kernel logs each mount's page-cache namespace;
+the high 32 bits of an ext2 cacheId are that namespace and the low 32 bits are
+the actual inode. Filesystem `stat` continues to expose the actual inode.
