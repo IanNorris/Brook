@@ -345,15 +345,21 @@ Astra's source review identified a prerequisite to Codium's regular-file
 `MAP_SHARED`: one mutation protocol for the complete address space. A file-fault
 generation check alone cannot cover anonymous/device replacement or COW.
 
-- Serialize mmap/MAP_FIXED, munmap, mprotect, mremap, fork and teardown through an
-  address-space-owned mutation mutex. Include memfd, COW and GUI-buffer PTE
-  writers. Resolve the owner using retained leader/incarnation identity.
+- Introduce a separately referenced address-space object owning the mutation
+  mutex, generation, page table, TLB mask, mapping metadata and allocation cursors.
+  Threads retain it; fork creates independent state; exec swaps in new state.
+  Serialize mmap/MAP_FIXED, munmap, mprotect, mremap, fork, memfd, CoW and GUI
+  writers through its protocol. Process destruction can run from timer-driven
+  reaping: final teardown must use a process-context cleanup worker or a proven
+  exclusive nonblocking path, rather than acquiring a sleeping mutex in an ISR.
 - Faults snapshot and pin backing identity/range/offset/protection under that
   mutex, release it for I/O, then validate the generation before committing.
   Every speculative adjacent-page installation needs the same validation.
-- Add install-if-absent and detach-returning-old-leaf PTE operations: current
-  `VmmMapPage` overwrites a present leaf. Keep detached frames alive until remote
-  TLB acknowledgement; release final filesystem references outside mapping locks.
+- Integrate `VmmTryMapPage` and `VmmDetachPage` into the common transaction.
+  The leaf operations and CoW retirement reference now exist; legacy mapping
+  mutation paths still need coordinated ownership and generation validation.
+  Keep every detached frame alive until remote TLB acknowledgement, and release
+  final filesystem references outside mapping locks.
 - Keep lock order mutation mutex, page-table lock, then short PMM internals.
   No filesystem I/O or user-buffer access under the mutation mutex, and no TLB
   acknowledgement wait under an IRQ-disabled page-table lock.

@@ -147,20 +147,22 @@ static void largeLeafAndBorrowedFrame() {
     for(unsigned level : {2u,3u}) {
         auto pt=table();auto pdpt=PmmAllocPage(MemTag::PageTable);
         std::memset(reinterpret_cast<void*>(pdpt.raw()),0,pageSize);
-        reinterpret_cast<uint64_t*>(pt.pml4.raw())[0]=pdpt.raw()|VMM_PRESENT|VMM_USER|VMM_WRITABLE;
+        reinterpret_cast<uint64_t*>(pt.pml4.raw())[0]=pdpt.raw()|VMM_PRESENT|VMM_WRITABLE;
+        uint64_t rootEntry=reinterpret_cast<uint64_t*>(pt.pml4.raw())[0];
         PhysicalAddress pd;
         auto entries=reinterpret_cast<uint64_t*>(pdpt.raw());
         uint64_t* large;
         if(level==3)large=&entries[1]; // va=1GB
         else {
             pd=PmmAllocPage(MemTag::PageTable);std::memset(reinterpret_cast<void*>(pd.raw()),0,pageSize);
-            entries[1]=pd.raw()|VMM_PRESENT|VMM_USER|VMM_WRITABLE;
+            entries[1]=pd.raw()|VMM_PRESENT|VMM_WRITABLE;
             large=&reinterpret_cast<uint64_t*>(pd.raw())[0];
         }
         uint64_t saved=0x40000000|VMM_PRESENT|VMM_USER|VMM_WRITABLE|(1u<<7);
-        *large=saved;auto candidate=PmmAllocPage();
+        *large=saved;uint64_t directoryEntry=entries[1];auto candidate=PmmAllocPage();
         CHECK(VmmTryMapPage(pt,va,candidate,flags)==VmmMapResult::Occupied);
         CHECK(*large==saved&&!VmmDetachPage(pt,va));
+        CHECK(reinterpret_cast<uint64_t*>(pt.pml4.raw())[0]==rootEntry&&entries[1]==directoryEntry);
         CHECK(PmmGetRefCount(candidate)==1&&maps(candidate)==0);
         PmmFreePage(candidate);*large=0;VmmDestroyUserPageTable(pt);empty();
     }
@@ -173,6 +175,23 @@ static void largeLeafAndBorrowedFrame() {
     CHECK(PmmGetRefCount(backing)==1&&maps(backing)==0);
     // Borrowed mapping: simulated backing owner releases after acknowledgement.
     PmmFreePage(backing);VmmDestroyUserPageTable(pt);empty();
+}
+static void occupiedAncestors() {
+    auto pt=table();auto original=PmmAllocPage();auto candidate=PmmAllocPage();
+    CHECK(VmmTryMapPage(pt,va,original,flags)==VmmMapResult::Mapped);
+    auto* root=reinterpret_cast<uint64_t*>(pt.pml4.raw());root[0]&=~VMM_USER;
+    auto* directory=reinterpret_cast<uint64_t*>(VmmLeafPhysical(root[0]).raw());directory[1]&=~VMM_USER;
+    auto* pages=reinterpret_cast<uint64_t*>(VmmLeafPhysical(directory[1]).raw());pages[0]&=~VMM_USER;
+    const uint64_t ancestors[]={root[0],directory[1],pages[0]},saved=leaf(pt);
+    CHECK(VmmTryMapPage(pt,va,candidate,flags)==VmmMapResult::Occupied);
+    CHECK(root[0]==ancestors[0]&&directory[1]==ancestors[1]&&pages[0]==ancestors[2]&&leaf(pt)==saved);
+    // An absent sibling needs another PT. Failure must not promote any ancestor.
+    failAllocation=true;
+    CHECK(VmmTryMapPage(pt,va+0x200000,candidate,flags)==VmmMapResult::OutOfMemory);
+    CHECK(root[0]==ancestors[0]&&directory[1]==ancestors[1]&&pages[0]==ancestors[2]);
+    CHECK(VmmTryMapPage(pt,va+0x200000,candidate,flags)==VmmMapResult::Mapped);
+    CHECK((root[0]&VMM_USER)&&(directory[1]&VMM_USER)&&(pages[1]&VMM_USER));
+    VmmDestroyUserPageTable(pt);empty();
 }
 static void failureAndInPlace() {
     auto pt=table();auto candidate=PmmAllocPage();
@@ -192,7 +211,7 @@ static void failureAndInPlace() {
     VmmDestroyUserPageTable(pt);empty();
 }
 int main() {
-    competingInstallAndDetach();detachReinstall();largeLeafAndBorrowedFrame();failureAndInPlace();
+    competingInstallAndDetach();detachReinstall();largeLeafAndBorrowedFrame();occupiedAncestors();failureAndInPlace();
     cowRetirement(false);for(unsigned i=0;i<32;++i)cowRetirement(true);
     std::puts("VMM LEAF PASS install/detach races=64 concurrent-cow=32 retirement/OOM/in-place/reuse");
 }

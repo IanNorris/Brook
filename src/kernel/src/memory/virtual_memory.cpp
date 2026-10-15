@@ -330,17 +330,35 @@ VmmMapResult VmmTryMapPage(PageTable pt, VirtualAddress virtAddr,
     IrqSpinLock& lock = !pt ? g_kernelPtLock : g_userPtLock;
     uint64_t saved = IrqSpinLockAcquire(&lock);
     bool large = false;
-    uint64_t* pte = WalkToPtr(pt, virtAddr, true, flags, &large);
+    // An occupied result must not even promote ancestor USER permissions.
+    // Probe without creation before preparing any missing intermediate tables.
+    uint64_t* pte = WalkToPtr(pt, virtAddr, false, 0, &large);
+    if (large || (pte && (*pte & VMM_PRESENT))) {
+        IrqSpinLockRelease(&lock, saved);
+        return VmmMapResult::Occupied;
+    }
+    // Build missing tables without promoting existing ancestor permissions.
+    // On allocation failure, empty tables may remain owned by this page table.
+    if (!pte) pte = WalkToPtr(pt, virtAddr, true, 0);
     VmmMapResult result;
-    if (!pte) result = large ? VmmMapResult::Occupied : VmmMapResult::OutOfMemory;
-    else if (*pte & VMM_PRESENT) result = VmmMapResult::Occupied;
+    if (!pte) result = VmmMapResult::OutOfMemory;
     else {
         *pte = (physAddr.raw() & PHYS_MASK) | VMM_PRESENT
              | (flags & ~(VMM_PRESENT | PTE_TAG_MASK | PTE_COW_BIT | PTE_PID_MASK | VMM_NO_EXEC))
              | (((uint64_t)(uint8_t)tag & 0x7) << PTE_TAG_SHIFT)
              | (((uint64_t)pid & 0x3FF) << PTE_PID_SHIFT)
              | (flags & VMM_NO_EXEC);
-        if (flags & VMM_USER) PmmMapInc(physAddr);
+        if (flags & VMM_USER) {
+            PmmMapInc(physAddr);
+            // All three intermediate tables now exist. Promote only after a
+            // successful leaf install, never on Occupied or allocation failure.
+            auto* entry = reinterpret_cast<uint64_t*>(PhysToVirt(ResolvePml4(pt)).raw());
+            const uint64_t indices[] = {Pml4Index(virtAddr.raw()), PdptIndex(virtAddr.raw()), PdIndex(virtAddr.raw())};
+            for (uint64_t index : indices) {
+                entry[index] |= VMM_USER;
+                entry = reinterpret_cast<uint64_t*>(PhysToVirt(VmmLeafPhysical(entry[index])).raw());
+            }
+        }
         Invlpg(virtAddr);
         result = VmmMapResult::Mapped;
     }

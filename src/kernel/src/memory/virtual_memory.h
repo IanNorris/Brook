@@ -79,7 +79,9 @@ bool VmmMapPage(PageTable pt, VirtualAddress virtAddr, PhysicalAddress physAddr,
 
 // Publish only into an absent 4KB leaf, under the page-table lock. On Mapped,
 // the caller transfers its existing frame reference to the PTE. On every other
-// outcome it retains that reference. Present large leaves count as Occupied.
+// outcome it retains that reference. Occupied leaves/ancestors are unchanged,
+// including large leaves. Allocation failure may leave empty intermediate tables
+// owned by pt, but does not promote existing ancestor permissions.
 // Borrowed device frames remain borrowed; no physical refcount is acquired.
 enum class VmmMapResult { Mapped, Occupied, OutOfMemory, InvalidAddress };
 VmmMapResult VmmTryMapPage(PageTable pt, VirtualAddress virtAddr,

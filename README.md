@@ -73,10 +73,10 @@ the table distinguishes tested behavior from remaining limitations.
   and the actual validation evidence are recorded in
   [experiment notes](docs/experiments.md).
 - **Self-hosting:** The clean-image acceptance path installs its SDK through
-  guest `nix-install`, clones and builds Brook, passes all 13 native tests,
+  guest `nix-install`, clones and builds Brook, passes all 14 native tests,
   then boots the guest-built kernel and passes them again. Offline checks of
   both filesystems pass before and after that boot. Both clean-image and
-  prepared-SDK paths passed at revision `94121ca`; see
+  prepared-SDK paths passed at revision `bf9f82a`; see
   [bootstrap testing](docs/bootstrap.md) for the validation scope.
 - **Storage correctness and speed:** unlink-while-open, rename-overwrite,
   directory removal and inode reuse now have guest lifetime checks plus offline

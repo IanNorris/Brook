@@ -397,6 +397,19 @@ three wait probes (including two expanded runs), heap integrity, checked stop
 and all three read-only filesystem checks pass. Evidence is retained under
 ignored `build/workloads/mapping-leaf-reviewed-20261015/`.
 
+Both full bootstrap paths subsequently passed at `bf9f82a`, including all 14
+host tests twice and again under each guest-built kernel, with all twelve final
+filesystem checks clean. A followup makes occupied and failed installs preserve
+ancestor user-access permissions as well as the leaf. Its expanded test fails
+on the earlier implementation and passes the corrected code. The corrected
+kernel SHA-256 is
+`191d60cf1ee437841fa5291dee61473b59e263b80d1cdff975211cec886c404b`.
+An isolated clone of the clean prepared verification disks compiled the expanded
+test inside Brook and passed all 14 tests, cache/CoW and expanded wait stress,
+heap integrity, checked stop and all three filesystem checks. That targeted
+followup is not a second clean-image clone/install acceptance. Evidence is under
+`build/workloads/mapping-ancestor-20261015/`.
+
 This is the leaf-ownership layer of the mapping plan. Address-space mutation
 serialization and generation validation across blocking fault I/O remain open,
 as do coherent shared pages, buffered I/O visibility, dirty writeback/msync and

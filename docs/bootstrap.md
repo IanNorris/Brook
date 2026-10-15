@@ -658,3 +658,39 @@ the clean counterpart is
 The verifier matched each hash to its booted kernel. Writable regular-file
 shared mappings, browser/editor usability, recording and showcase acceptance
 remain separate requirements.
+
+
+### Matching acceptance after page-table ownership fixes (2026-10-15)
+
+Both full paths passed at `bf9f82abbbd09e99c8610277ec99a3a67b469dc0`. The suite
+now has 14 tests, including `test_vmm_leaf`, which compiles the actual VMM code
+with platform/PMM shims and checks concurrent publication, detachment and CoW
+retirement ownership. Each path passed all 14 tests twice, booted its extracted
+kernel/EFI/modules, and passed all 14 again. All four VMs stopped with checked
+synchronization and all twelve final filesystem checks returned zero. Both used
+eight vCPUs, 4 GiB RAM, isolated disk-backed images, software graphics and silent
+audio. The clean image installed its SDK through guest `nix-install`.
+
+Prepared kernel compilation took 40 seconds, native-test compilation 9 seconds,
+and warm native rebuilding 9 seconds. The clean SDK install took 46 seconds;
+its kernel build took 167 seconds while a separate 16-thread host stress test
+competed for CPU. That host test was suspended, then resumed unchanged after
+the VM finished and passed. The loaded clean run is valid correctness evidence
+but unsuitable for performance comparison. Run host contention suites separately
+from VM performance experiments. Profiling export timed out in both runs;
+completed stage/test evidence does not depend on that capture.
+
+Evidence is under ignored
+`build/experiments/results/bootstrap-{prepared,clean}-bf9f82a-disk/`, with
+`bootstrap-bf9f82a-audit.json` checking suite counts and filesystem results.
+The prepared guest-built kernel SHA-256 is
+`f8bfaff23797512bb26b3ee5fcaa3c54ab11c307aa493f30ea6028ee7de3cc17`;
+the clean counterpart is
+`a3e7011396c052af13b7d1abaa889353ad0ee7d255b5e76beb46dbf53d6a582c`.
+The verifier matched each hash to its booted kernel.
+
+A subsequent ancestor-permission correction has separate targeted guest
+acceptance: the corrected kernel booted a clone of the prepared verification
+disks, compiled its expanded VMM test inside Brook, and passed all 14 tests,
+CoW/wait stress, heap and filesystem checks. See [workload evidence](workloads.md#page-table-ownership-prerequisite-for-shared-files-15-october-2026).
+The full two-path results above remain tied to `bf9f82a`.
