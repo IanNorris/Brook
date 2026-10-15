@@ -43,7 +43,10 @@ static bool StopAfterOne(brook::Device*, void* ctx) {
 TEST_MAIN("device_registry", {
 
     // 1. Register a char device
-    brook::Device charDev = MakeDev(&g_dummyOps, "serial0", brook::DeviceType::Char);
+    // Registered descriptors must live in the kernel image or heap; the
+    // registry's defensive iterator intentionally excludes stack addresses.
+    static brook::Device charDev;
+    charDev = MakeDev(&g_dummyOps, "serial0", brook::DeviceType::Char);
     ASSERT_TRUE(brook::DeviceRegister(&charDev));
 
     // 2. Find it by name
@@ -69,7 +72,8 @@ TEST_MAIN("device_registry", {
 
     // 6. Register a block device
     auto* blkOpsAsGeneric = reinterpret_cast<const brook::DeviceOps*>(&g_blockOps);
-    brook::Device blkDev = MakeDev(blkOpsAsGeneric, "blk0", brook::DeviceType::Block);
+    static brook::Device blkDev;
+    blkDev = MakeDev(blkOpsAsGeneric, "blk0", brook::DeviceType::Block);
     ASSERT_TRUE(brook::DeviceRegister(&blkDev));
 
     // 7. Block device helpers
@@ -92,7 +96,8 @@ TEST_MAIN("device_registry", {
     ASSERT_EQ(ttyCount.count, static_cast<uint32_t>(0));
 
     // 9. DeviceIterate — early stop
-    brook::Device charDev2 = MakeDev(&g_dummyOps, "serial1", brook::DeviceType::Char);
+    static brook::Device charDev2;
+    charDev2 = MakeDev(&g_dummyOps, "serial1", brook::DeviceType::Char);
     ASSERT_TRUE(brook::DeviceRegister(&charDev2));
 
     CountCtx earlyStop = {0};
@@ -104,4 +109,3 @@ TEST_MAIN("device_registry", {
 
     brook::SerialPrintf("All device registry tests passed\n");
 })
-

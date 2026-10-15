@@ -72,6 +72,17 @@ class ShutdownSyncTests(unittest.TestCase):
                     self.assertEqual(events, ['bridge sync'])
                     self.assertEqual(data['generation'], 'before')
 
+    def test_preserves_guest_sync_guarantee(self):
+        for guarantee in ['best_effort_metadata_flush', 'checked_filesystem_and_device_flush']:
+            with self.subTest(guarantee=guarantee), self.fixture({
+                    'guest_sync_completed': True, 'sync_guarantee': guarantee}) as (events, _, _):
+                result = server.control('s', 'stop')
+                self.assertEqual(result['sync_guarantee'], guarantee)
+                self.assertEqual(events, ['bridge sync', 'quit'])
+        with self.fixture({'guest_sync_completed': True}) as (_, _, _):
+            self.assertEqual(server.control('s', 'stop')['sync_guarantee'],
+                             'best_effort_metadata_flush')
+
     def test_unreachable_or_panicked_guest_requires_explicit_force(self):
         for error in [TimeoutError('unknown completion'), ConnectionError('unreachable'),
                       RuntimeError('Guest has panicked')]:

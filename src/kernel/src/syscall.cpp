@@ -1623,6 +1623,12 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count)
         auto* vn = static_cast<Vnode*>(fde->handle);
         int64_t ret = VfsWrite(vn, reinterpret_cast<const void*>(bufAddr),
                                static_cast<uint32_t>(count), &fde->seekPos);
+        // O_SYNC includes O_DSYNC (0x1000). A stronger full-file sync is valid
+        // for either flag and must complete before reporting a durable write.
+        if (ret > 0 && (fde->statusFlags & 0x1000)) {
+            int error = VfsFsync(vn);
+            if (error) return error;
+        }
         // Note: VfsWrite already updates *offset (fde->seekPos), don't double-update
         return ret;
     }
@@ -7955,11 +7961,12 @@ static int64_t sys_fsync(uint64_t fd, uint64_t, uint64_t,
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
-    FdEntry* fde = FdGet(proc, static_cast<int>(fd));
+    FdRef ref(proc, static_cast<int>(fd));
+    FdEntry* fde = ref.get();
     if (!fde || fde->type == FdType::None) return -EBADF;
 
     if (fde->type == FdType::Vnode && fde->handle)
-        return VfsSync(static_cast<Vnode*>(fde->handle));
+        return VfsFsync(static_cast<Vnode*>(fde->handle));
 
     // Devices, sockets, pipes, memfds, and synthetic files have no persistent
     // backing store in Brook yet. Media stacks often call fdatasync() as a
@@ -10733,14 +10740,20 @@ static int64_t sys_pwrite64(uint64_t fd, uint64_t bufAddr, uint64_t count,
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
-    FdEntry* fde = FdGet(proc, static_cast<int>(fd));
+    FdRef ref(proc, static_cast<int>(fd));
+    FdEntry* fde = ref.get();
     if (!fde) return -EBADF;
     if (fde->type != FdType::Vnode || !fde->handle) return -EINVAL;
 
     auto* vn = static_cast<Vnode*>(fde->handle);
     const void* buf = reinterpret_cast<const void*>(bufAddr);
     uint64_t off = offset;
-    return VfsWrite(vn, buf, count, &off);
+    int64_t result = VfsWrite(vn, buf, count, &off);
+    if (result > 0 && (fde->statusFlags & 0x1000)) {
+        int error = VfsFsync(vn);
+        if (error) return error;
+    }
+    return result;
 }
 
 // ---------------------------------------------------------------------------

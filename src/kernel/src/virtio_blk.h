@@ -39,6 +39,8 @@ struct VirtioBlkProbeStats {
     uint64_t pathLegacy;     // waits via SubmitRequest (legacy single-request)
     uint64_t pathBatch;      // waits via WaitAllSlots (small-read batched)
     uint64_t pathSG;         // waits via SubmitScatterGatherRead (zero-copy DMA)
+    uint64_t flushSubmitted; // actual FLUSH requests submitted
+    uint64_t flushErrors;    // failed flushes, including private fault injection
 };
 void VirtioBlkGetProbe(Device* dev, VirtioBlkProbeStats& out);
 

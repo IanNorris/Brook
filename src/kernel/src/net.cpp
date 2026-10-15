@@ -3264,8 +3264,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         BridgeReply r;
         r.text("{\"guest_sync_completed\":");
         r.text(result == 0 ? "true" : "false");
-        // VFS sync hooks currently cannot report individual device failures.
-        r.text(",\"sync_guarantee\":\"best_effort_metadata_flush\"}\n");
+        r.text(",\"sync_guarantee\":\"checked_filesystem_and_device_flush\"}\n");
         r.send(); return;
     }
     if (NetStrEq(cmd, "bridge stats")) {

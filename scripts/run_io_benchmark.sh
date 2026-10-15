@@ -13,4 +13,5 @@ mkdir -p build/package-cache
 for probe in waitmaskcheck childsignalcheck selectcheck; do
     "$MUSL_CC" -O2 -Wall -Wextra -static "tools/at-syscall-probe/${probe}.c" -o "build/io-bench/${probe}"
 done
+"$MUSL_CC" -O2 -Wall -Wextra -static tools/at-syscall-probe/flushcheck.c -o build/io-bench/flushcheck
 python3 scripts/io_acceptance.py "$@"

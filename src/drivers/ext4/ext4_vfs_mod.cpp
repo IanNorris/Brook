@@ -32,6 +32,7 @@ MODULE_IMPORT_SYMBOL(kmalloc);
 MODULE_IMPORT_SYMBOL(kfree);
 MODULE_IMPORT_SYMBOL(krealloc);
 MODULE_IMPORT_SYMBOL(DeviceFind);
+MODULE_IMPORT_SYMBOL(DeviceFlush);
 MODULE_IMPORT_SYMBOL(Ext4GetDevice);
 MODULE_IMPORT_SYMBOL(SerialPrintf);
 MODULE_IMPORT_SYMBOL(SerialVPrintf);
@@ -102,7 +103,7 @@ static int brook_bdev_bread(ext4_blockdev* bdev, void* buf,
     uint64_t len = (uint64_t)blk_cnt * bsize;
 
     int ret = m->dev->ops->read(m->dev, offset, buf, len);
-    if (ret < 0) return EIO;
+    if (ret < 0 || static_cast<uint64_t>(ret) != len) return EIO;
     return 0;
 }
 
@@ -114,8 +115,10 @@ static int brook_bdev_bwrite(ext4_blockdev* bdev, const void* buf,
     uint64_t len = (uint64_t)blk_cnt * bsize;
 
     int ret = m->dev->ops->write(m->dev, offset, buf, len);
-    if (ret < 0) return EIO;
-    return 0;
+    if (ret < 0 || static_cast<uint64_t>(ret) != len) return EIO;
+    // lwext4 has no device barrier callback. Preserve its former stable-write
+    // completion semantics, including journal ordering, until it gains one.
+    return DeviceFlush(m->dev) == 0 ? 0 : EIO;
 }
 
 static int brook_bdev_close(ext4_blockdev* bdev) {
@@ -353,6 +356,12 @@ static int ext4_vn_stat(Vnode* vn, VnodeStat* st) {
     return 0;
 }
 
+static int ext4_fs_sync(void* mountPriv);
+
+static int ext4_vn_fsync(Vnode* vn) {
+    return ext4_fs_sync(static_cast<Ext4FilePriv*>(vn->priv)->mount);
+}
+
 static const VnodeOps g_ext4VnodeOps = {
     ext4_vn_open,
     ext4_vn_read,
@@ -360,6 +369,7 @@ static const VnodeOps g_ext4VnodeOps = {
     ext4_vn_readdir,
     ext4_vn_close,
     ext4_vn_stat,
+    ext4_vn_fsync,
 };
 
 // ---------------------------------------------------------------------------
@@ -478,12 +488,14 @@ static bool ext4_fs_mount(uint8_t pdrv, void** mountPriv) {
     return true;
 }
 
-static void ext4_fs_unmount(void* mountPriv) {
+static int ext4_fs_unmount(void* mountPriv) {
     auto* m = find_mount_by_priv(mountPriv);
-    if (!m || !m->mounted) return;
+    if (!m || !m->mounted) return -EINVAL;
 
-    ext4_journal_stop(m->mountPt);
-    ext4_umount(m->mountPt);
+    int error = ext4_fs_sync(m);
+    if (error) return error;
+    if (ext4_journal_stop(m->mountPt) != 0) return -EIO;
+    if (ext4_umount(m->mountPt) != 0) return -EIO;
     ext4_device_unregister(m->devName);
 
     m->mounted = false;
@@ -497,6 +509,7 @@ static void ext4_fs_unmount(void* mountPriv) {
 
     kfree(m->bdif.ph_bbuf);
     kfree(m);
+    return 0;
 }
 
 static Vnode* ext4_fs_open(void* mountPriv, uint8_t pdrv, const char* relPath, int flags) {
@@ -697,12 +710,13 @@ static int ext4_fs_readlink(void* mountPriv, uint8_t pdrv,
     return (int)outLen;
 }
 
-static void ext4_fs_sync(void* mountPriv) {
+static int ext4_fs_sync(void* mountPriv) {
     auto* m = find_mount_by_priv(mountPriv);
-    if (!m || !m->mounted) return;
+    if (!m || !m->mounted) return -EINVAL;
 
-    ext4_cache_write_back(m->mountPt, false);
-    ext4_cache_write_back(m->mountPt, true);
+    int error = ext4_cache_flush(m->mountPt);
+    int flushError = DeviceFlush(m->dev);
+    return error ? -EIO : flushError;
 }
 
 static const VfsFsOps g_ext4FsOps = {

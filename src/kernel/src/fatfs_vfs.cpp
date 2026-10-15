@@ -61,10 +61,30 @@ static int FrToErrno(FRESULT res)
 // serial on the ~100+ failed opens the dynamic linker generates per app.
 static bool g_fatfsDebug = false;
 
+struct FatOpenFile;
 struct FatFsMountData {
     FATFS fs;
     uint8_t pdrv;
+    FatOpenFile* writableFiles;
+    int deferredCloseError;
 };
+
+// FIL stays first so existing vnode/cache users can retain their FIL pointer.
+// Writable records are linked under g_fatLock until close has succeeded.
+struct FatOpenFile {
+    FIL fil;
+    FatFsMountData* mount;
+    FatOpenFile* next;
+    bool writable;
+    bool closing;
+};
+
+static void RemoveWritableFile(FatOpenFile* file)
+{
+    auto** link = &file->mount->writableFiles;
+    while (*link && *link != file) link = &(*link)->next;
+    if (*link) *link = file->next;
+}
 
 static void EnsureLock()
 {
@@ -249,13 +269,36 @@ static int FatDirReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
     return 1;
 }
 
+static FRESULT CheckedFatSync(FIL* fil, bool closing)
+{
+    // FatFS clears FA_MODIFIED even if sync_fs/CTRL_SYNC fails. Retain its
+    // pre-call flags so a retry rewrites dirty data and directory metadata.
+    BYTE flags = fil->flag;
+    FRESULT result = closing ? f_close(fil) : f_sync(fil);
+    if (result != FR_OK) fil->flag |= flags;
+    return result;
+}
+
+static void CloseFatFileLocked(FIL* fil)
+{
+    auto* file = reinterpret_cast<FatOpenFile*>(fil);
+    FRESULT result = CheckedFatSync(fil, true);
+    if (file->writable && result != FR_OK) {
+        // The vnode can disappear, but preserve failed dirty FIL state for
+        // a later checked mount sync; never silently discard its buffers.
+        file->closing = true;
+        file->mount->deferredCloseError = FrToErrno(result);
+    } else {
+        if (file->writable) RemoveWritableFile(file);
+        kfree(file);
+    }
+}
+
 static void FatFileClose(Vnode* vn)
 {
     KMutexLock(&g_fatLock);
     if (vn->type == VnodeType::File) {
-        FIL* fil = static_cast<FIL*>(vn->priv);
-        f_close(fil);
-        kfree(fil);
+        CloseFatFileLocked(static_cast<FIL*>(vn->priv));
     } else {
         DIR* dir = static_cast<DIR*>(vn->priv);
         f_closedir(dir);
@@ -272,9 +315,28 @@ static int FatFileFsync(Vnode* vn)
     // f_sync flushes the file's cached window AND rewrites the directory
     // entry (size, first cluster, timestamps) + FAT, so the on-disk file is
     // valid even if the system loses power before f_close.
-    FRESULT res = f_sync(fil);
+    FRESULT res = CheckedFatSync(fil, false);
+    int error = res == FR_OK ? FatFsFlushDrive(fil->obj.fs->pdrv) : FrToErrno(res);
     KMutexUnlock(&g_fatLock);
-    return res == FR_OK ? 0 : FrToErrno(res);
+    return error;
+}
+
+static int FatDirFsync(Vnode* vn)
+{
+    auto* dir = static_cast<DIR*>(vn->priv);
+    KMutexLock(&g_fatLock);
+    int result = FatFsFlushDrive(dir->obj.fs->pdrv);
+    KMutexUnlock(&g_fatLock);
+    return result;
+}
+
+static int FatCachedFsync(Vnode* vn)
+{
+    auto* cached = static_cast<CachedFile*>(vn->priv);
+    KMutexLock(&g_fatLock);
+    int result = FatFsFlushDrive(cached->fil->obj.fs->pdrv);
+    KMutexUnlock(&g_fatLock);
+    return result;
 }
 
 static int FatStat(Vnode* vn, VnodeStat* st)
@@ -334,7 +396,7 @@ static int CachedFileStat(Vnode* vn, VnodeStat* st)
 static const VnodeOps g_cachedFileOps = {
     .open = FatFileOpen, .read = CachedFileRead, .write = nullptr,
     .readdir = nullptr, .close = CachedFileClose, .stat = CachedFileStat,
-    .fsync = nullptr,
+    .fsync = FatCachedFsync,
 };
 
 static const VnodeOps g_fatFileOps = {
@@ -346,7 +408,7 @@ static const VnodeOps g_fatFileOps = {
 static const VnodeOps g_fatDirOps = {
     .open = FatFileOpen, .read = nullptr, .write = nullptr,
     .readdir = FatDirReaddir, .close = FatFileClose, .stat = FatStat,
-    .fsync = nullptr,
+    .fsync = FatDirFsync,
 };
 
 // ---- VfsFsOps callbacks ----
@@ -381,30 +443,69 @@ static bool FatFsMount(uint8_t pdrv, void** mountPriv)
     return true;
 }
 
-static void FatFsUnmount(void* mountPriv)
+static int FatFsSyncLocked(FatFsMountData* data)
+{
+    int result = data->deferredCloseError;
+    data->deferredCloseError = 0;
+    auto** link = &data->writableFiles;
+    while (*link) {
+        auto* file = *link;
+        FRESULT error = CheckedFatSync(&file->fil, file->closing);
+        if (error != FR_OK && !result) result = FrToErrno(error);
+        if (file->closing && error == FR_OK) {
+            *link = file->next;
+            kfree(file);
+        } else {
+            link = &file->next;
+        }
+    }
+    int error = FatFsFlushDrive(data->pdrv);
+    return result ? result : error;
+}
+
+static int FatFsSync(void* mountPriv)
 {
     auto* data = static_cast<FatFsMountData*>(mountPriv);
-    if (!data) return;
+    if (!data) return -FVFS_EINVAL;
+    KMutexLock(&g_fatLock);
+    int result = FatFsSyncLocked(data);
+    KMutexUnlock(&g_fatLock);
+    return result;
+}
+
+static int FatFsUnmount(void* mountPriv)
+{
+    auto* data = static_cast<FatFsMountData*>(mountPriv);
+    if (!data) return -FVFS_EINVAL;
 
     char fatPath[8];
     fatPath[0] = static_cast<char>('0' + data->pdrv);
     fatPath[1] = ':'; fatPath[2] = '\0';
 
     KMutexLock(&g_fatLock);
-    f_mount(nullptr, fatPath, 0);
+    int result = FatFsSyncLocked(data);
+    if (!result && data->writableFiles) result = -16; // EBUSY: live writer
+    if (!result) {
+        FRESULT error = f_mount(nullptr, fatPath, 0);
+        if (error != FR_OK) result = FrToErrno(error);
+    }
     KMutexUnlock(&g_fatLock);
-
+    if (result) return result;
     kfree(data);
+    return 0;
 }
 
-static Vnode* FatFsOpen(void* /*mountPriv*/, uint8_t pdrv,
+static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
                         const char* relPath, int flags)
 {
     char fatPath[256];
     BuildFatPath(fatPath, sizeof(fatPath), pdrv, relPath);
 
-    auto* fil = static_cast<FIL*>(kmalloc(sizeof(FIL)));
-    if (!fil) return nullptr;
+    auto* file = static_cast<FatOpenFile*>(kmalloc(sizeof(FatOpenFile)));
+    if (!file) return nullptr;
+    __builtin_memset(file, 0, sizeof(*file));
+    file->mount = static_cast<FatFsMountData*>(mountPriv);
+    auto* fil = &file->fil;
 
     BYTE mode = FA_READ;
     if (flags & VFS_O_WRITE)  mode |= FA_WRITE;
@@ -412,7 +513,7 @@ static Vnode* FatFsOpen(void* /*mountPriv*/, uint8_t pdrv,
     if (flags & VFS_O_TRUNC)  mode |= FA_CREATE_ALWAYS;
 
     // Check shared cache first (read-only opens).
-    if (!(flags & VFS_O_WRITE)) {
+    if (!(mode & (FA_WRITE | FA_CREATE_ALWAYS | FA_OPEN_ALWAYS))) {
         KMutexLock(&g_fatLock);
         CachedFile* existing = FileCacheLookup(fatPath);
         if (existing) {
@@ -450,12 +551,17 @@ static Vnode* FatFsOpen(void* /*mountPriv*/, uint8_t pdrv,
         KMutexUnlock(&g_fatLock);
     }
     if (res == FR_OK) {
+        if (mode & (FA_WRITE | FA_CREATE_ALWAYS | FA_OPEN_ALWAYS)) {
+            file->writable = true;
+            file->next = file->mount->writableFiles;
+            file->mount->writableFiles = file;
+        }
         auto* vn = static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
-        if (!vn) { f_close(fil); KMutexUnlock(&g_fatLock); kfree(fil); return nullptr; }
+        if (!vn) { CloseFatFileLocked(fil); KMutexUnlock(&g_fatLock); return nullptr; }
 
         static constexpr uint64_t CACHE_THRESHOLD = 64 * 1024;
         uint64_t fileSize = f_size(fil);
-        if (!(flags & VFS_O_WRITE) && fileSize >= CACHE_THRESHOLD) {
+        if (!file->writable && fileSize >= CACHE_THRESHOLD) {
             auto* placeholder = static_cast<CachedFile*>(kmalloc(sizeof(CachedFile)));
             if (placeholder) {
                 placeholder->fil = fil; placeholder->data = nullptr;
@@ -623,7 +729,7 @@ static const VfsFsOps g_fatFsOps = {
     .rename     = FatFsRename,
     .symlink    = nullptr,
     .readlink   = nullptr,
-    .sync       = nullptr,
+    .sync       = FatFsSync,
 };
 
 // ---- Public init ----

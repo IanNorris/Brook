@@ -11,7 +11,7 @@ static bool ProcFsMount(uint8_t /*pdrv*/, void** mountPriv)
     return true;
 }
 
-static void ProcFsUnmountCb(void* /*mountPriv*/) {}
+static int ProcFsUnmountCb(void* /*mountPriv*/) { return 0; }
 
 static Vnode* ProcFsOpenCb(void* /*mountPriv*/, uint8_t /*pdrv*/,
                            const char* relPath, int flags)

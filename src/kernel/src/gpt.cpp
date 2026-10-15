@@ -81,10 +81,16 @@ static uint32_t PartBlockSize(Device* /*dev*/)
     return 512;
 }
 
+static int PartIoctl(Device* dev, uint32_t cmd, void* /*arg*/)
+{
+    if (cmd != DEVICE_IOCTL_FLUSH) return -95;
+    return DeviceFlush(static_cast<PartitionPriv*>(dev->priv)->parent);
+}
+
 static BlockDeviceOps s_partOps = {
     .read        = PartRead,
     .write       = PartWrite,
-    .ioctl       = nullptr,
+    .ioctl       = PartIoctl,
     .close       = nullptr,
     .block_count = PartBlockCount,
     .block_size  = PartBlockSize,

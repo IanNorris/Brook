@@ -31,9 +31,10 @@ static int RamdiskWrite(Device* dev, uint64_t offset, const void* buf, uint64_t 
     return static_cast<int>(len);
 }
 
-static int RamdiskIoctl(Device* /*dev*/, uint32_t /*cmd*/, void* /*arg*/)
+static int RamdiskIoctl(Device* /*dev*/, uint32_t cmd, void* /*arg*/)
 {
-    return -1; // not implemented
+    // RAM is the backing store; writes have no separate pending cache.
+    return cmd == DEVICE_IOCTL_FLUSH ? 0 : -95;
 }
 
 static void RamdiskClose(Device* /*dev*/) {}

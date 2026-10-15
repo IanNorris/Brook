@@ -1086,12 +1086,12 @@ static Vnode* GenDiskstats()
 // the avg/path columns are convenience views of the same counters.
 static Vnode* GenBlkprobe()
 {
-    uint32_t bufSize = 1024;
+    uint32_t bufSize = 4096;
     auto* buf = static_cast<char*>(kmalloc(bufSize));
     if (!buf) return nullptr;
 
     char* p = buf;
-    p = AppendStr(p, "dev waits reqs waitNsTotal waitNsMax spinIters legacy batch sg avgReqPerWait avgWaitNs avgSpin\n");
+    p = AppendStr(p, "dev waits reqs waitNsTotal waitNsMax spinIters legacy batch sg avgReqPerWait avgWaitNs avgSpin flushSubmitted flushErrors\n");
 
     for (uint32_t i = 0; i < 16; ++i)
     {
@@ -1107,7 +1107,7 @@ static Vnode* GenBlkprobe()
         brook::VirtioBlkProbeStats ps;
         brook::VirtioBlkGetProbe(dev, ps);
 
-        if (static_cast<uint32_t>(p - buf) + 192 >= bufSize) break;
+        if (static_cast<uint32_t>(p - buf) + 384 >= bufSize) break;
 
         uint64_t avgReq  = ps.waitCount ? ps.reqSubmitted   / ps.waitCount : 0;
         uint64_t avgWait = ps.waitCount ? ps.waitNsTotal    / ps.waitCount : 0;
@@ -1124,7 +1124,9 @@ static Vnode* GenBlkprobe()
         p = AppendU64(p, ps.pathSG);         *p++ = ' ';
         p = AppendU64(p, avgReq);            *p++ = ' ';
         p = AppendU64(p, avgWait);           *p++ = ' ';
-        p = AppendU64(p, avgSpin);           *p++ = '\n';
+        p = AppendU64(p, avgSpin);           *p++ = ' ';
+        p = AppendU64(p, ps.flushSubmitted); *p++ = ' ';
+        p = AppendU64(p, ps.flushErrors);    *p++ = '\n';
     }
     *p = '\0';
     return MakeProcVnode(buf, static_cast<uint32_t>(p - buf));

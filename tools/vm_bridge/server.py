@@ -258,7 +258,8 @@ def control(session, action, force=False, **_):
                 if not isinstance(reply, dict) or reply.get("guest_sync_completed") is not True:
                     raise RuntimeError("Guest did not acknowledge completed metadata sync")
                 sync_result = {"guest_sync_completed": True,
-                               "sync_guarantee": "best_effort_metadata_flush"}
+                               "sync_guarantee": reply.get("sync_guarantee",
+                                                           "best_effort_metadata_flush")}
             except (OSError, RuntimeError, ValueError) as error:
                 if not force:
                     raise RuntimeError(

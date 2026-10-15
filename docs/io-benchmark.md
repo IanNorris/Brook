@@ -29,7 +29,8 @@ field counts file cycles, rather than individual syscalls.
 The harness synchronizes and shuts down, then requires read-only offline
 `e2fsck -fn` to pass with the files still present. A second boot checks all
 retained contents, removes the fixtures, and requires both another clean fsck
-and exactly restored free-block/free-inode counts. `--lifetime-probe` additionally
+and exactly restored free-block/free-inode counts. The boot filesystem also
+passes read-only `fsck.fat -n` after each shutdown. `--lifetime-probe` additionally
 runs the existing 24 inode-lifetime assertions, including actual inode reuse.
 Device errors, controller timeouts, missing completion markers and integrity
 failures fail the run. No filesystem repair runs automatically.
@@ -147,3 +148,55 @@ Evidence is under ignored `build/io-bench/append-cache-pages*`.
 timings are instrumented. `--wait-mask-probe` adds temporary-mask, child-signal
 and select-readiness regression probes after the filesystem workload. These
 optional probes support bootstrap diagnosis; the normal fast gate stays small.
+
+## Checked device flushing (2026-10-15)
+
+Module ABI 6 negotiates virtio FLUSH and propagates filesystem/device errors
+through fsync, fdatasync, synchronous writes, sync, unmount and the bridge.
+Rebuild the kernel and all modules together. GPT forwards flushes to its parent;
+USB storage uses SYNCHRONIZE CACHE. ext4 conservatively flushes each adapter
+write to preserve journal ordering. RAM disks have nothing pending to flush.
+
+Without negotiated FLUSH, QEMU disables backend write caching for the device
+and forces stable completion for each write. The comparison below uses the
+same source, eight vCPUs, eight workers and private disk images. The control
+changes only `BROOK_VIRTIO_BLK_FORCE_WRITETHROUGH`; both versions execute the
+checked sync paths. Times include each phase's sync:
+
+| Phase | Write-through control | Checked write caching |
+| --- | ---: | ---: |
+| 64 MiB sequential write | 6.788 s (9.43 MiB/s) | 0.305 s (209.55 MiB/s) |
+| Boundaries and fragmentation | 19.903 s | 0.832 s |
+| 512 small-file cycles | 23.073 s | 0.497 s |
+| Cleanup | 3.582 s | 0.208 s |
+| Complete gate, including two boots | 90.27 s | 21.89 s |
+
+These are representative shared-host runs, not isolated hardware benchmarks.
+Both passed byte checks, offline filesystem checks and exact allocation
+recovery. A separate disk run with injected flush failures passed in 24.41 s;
+its write phase took 0.331 s. Evidence lives under ignored
+`build/io-bench/flush-wt-disk-control`, `flush-disk-positive` and
+`flush-disk-injected-r2`.
+
+`--flush-probe` exercises successful fsync/fdatasync/O_SYNC/O_DSYNC, injects a
+FLUSH failure immediately before fsync, requires EIO and a successful retry,
+then injects another failure and requires shutdown to abort before QMP while
+the VM remains running. A checked sync retry must succeed. The next boot
+verifies every fixture byte before removing it. Both ext2 and FAT passed this
+sequence in `build/io-bench/flush-fat-ext2-injected-r3`, followed by clean FAT
+and ext2 checks and exact ext2 allocation recovery. Seven bare-metal tests, all 13 host
+tests and the bridge/injector tests also pass. The private host injector checks
+session ownership and exact ELF identity, and uses a temporary Unix GDB socket;
+it is not an exposed MCP tool. Successful QEMU shutdown alone is insufficient
+evidence because host shutdown can mask a missing guest flush.
+
+FLUSH-only failures remain retryable. Failed or short ext2 writes retain EIO
+for the mount lifetime, and FAT disk writes retain EIO until drive rebind:
+legacy metadata paths cannot prove that a failed pointer, inode or secondary
+FAT write was repaired merely because a later flush succeeded. These latches
+are conservative error reporting, not journaling or automatic repair.
+
+Mounted filesystem modules must remain loaded. The current void module-exit
+API cannot honor checked-unmount failure and then safely release module code;
+see the mounted-module unload item in [backlog.md](backlog.md). This limitation
+is separate from normal checked VFS unmount and bridge synchronization.

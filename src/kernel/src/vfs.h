@@ -101,8 +101,9 @@ struct VfsFsOps {
     // Return true on success.
     bool (*mount)(uint8_t pdrv, void** mountPriv);
 
-    // Unmount: clean up mount-private state.
-    void (*unmount)(void* mountPriv);
+    // Flush and clean up mount-private state. On error retain valid state so
+    // the mounted filesystem can retry; return 0 only after successful detach.
+    int (*unmount)(void* mountPriv);
 
     // Open a file or directory.  relPath is relative to the mount point.
     // Returns a Vnode* on success, nullptr on failure.
@@ -137,7 +138,8 @@ struct VfsFsOps {
     // Optional: flush dirty in-memory metadata to disk.  May be nullptr
     // for filesystems that always write synchronously.  Called from the
     // VFS sync path (sys_sync / sys_fsync / unmount).
-    void (*sync)(void* mountPriv);
+    // Return 0 only after filesystem buffers AND device cache are flushed.
+    int (*sync)(void* mountPriv);
     int (*set_times)(void* mountPriv, uint8_t pdrv, const char* relPath,
                      const VnodeTime* times, bool nofollow) = nullptr;
     Vnode* (*open_mode)(void* mountPriv, uint8_t pdrv, const char* relPath,
@@ -171,8 +173,8 @@ extern "C" void VfsInit();
 // Returns true on success.
 extern "C" bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv);
 
-// Unmount the filesystem at mountPoint.  The mount entry is cleared and
-// f_unmount is called.  Returns true if a matching mount was found.
+// Unmount the filesystem at mountPoint. Returns true after successful detach;
+// a busy mount or failed filesystem/device flush leaves the mount attached.
 extern "C" bool VfsUnmount(const char* mountPoint);
 
 // Enumerate root-level mount points (e.g. "boot" for /boot) so directory
@@ -243,13 +245,13 @@ int VfsReadlink(const char* path, char* buf, uint64_t bufsiz);
 // Close and free a vnode.
 extern "C" void VfsClose(Vnode* vn);
 
-// Flush pending writes on a writable file vnode.
+// Flush one vnode, or all mounted filesystems when vn is nullptr. Return the
+// first error while still attempting the other mounts.
 int VfsSync(Vnode* vn);
 
 // Flush a single open file's data + directory entry to the backing device.
-// Unlike VfsSync (per-mount), this persists the on-disk size of one file so a
-// long-lived writer survives an abrupt poweroff without an explicit close.
-// Returns 0 on success, <0 if the file's FS has no fsync hook.
+// Filesystems may synchronize the whole mount to satisfy this request.
+// Returns 0 on completed flush, negative errno on failure or unsupported sync.
 int VfsFsync(Vnode* vn);
 
 } // namespace brook

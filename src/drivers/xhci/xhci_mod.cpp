@@ -999,6 +999,8 @@ struct XhciDevice {
 
     // Mass storage state
     uint32_t mscTag;            // CBW tag counter
+    void* mscCommandBuffer;     // one persistent CBW/CSW page, serialized below
+    uint64_t mscCommandBufferPhys;
     uint64_t mscSectorCount;    // total sectors
     uint32_t mscBlockSize;      // bytes per sector (usually 512)
 
@@ -2342,17 +2344,27 @@ static constexpr uint8_t SCSI_INQUIRY          = 0x12;
 static constexpr uint8_t SCSI_READ_CAPACITY_10 = 0x25;
 static constexpr uint8_t SCSI_READ_10          = 0x28;
 static constexpr uint8_t SCSI_WRITE_10         = 0x2A;
+static constexpr uint8_t SCSI_SYNCHRONIZE_CACHE_10 = 0x35;
 
 // Execute a SCSI command via BBB protocol
+static SpinLock g_mscCommandLock;
+
 static bool XhciMscCommand(XhciController& ctrl, XhciDevice& dev,
                             const uint8_t* cdb, uint8_t cdbLen,
                             void* data, uint64_t dataPhys, uint32_t dataLen,
                             bool dataIn)
 {
-    // Allocate DMA buffer for CBW
-    uint64_t cbwPhys;
-    auto* cbw = static_cast<UsbMscCbw*>(AllocDmaBuffer(1, cbwPhys));
-    if (!cbw) return false;
+    // A BOT transaction comprises CBW, optional data, and CSW. Keep another
+    // read/write/flush from inserting commands between those phases.
+    struct CommandGuard {
+        CommandGuard() { SpinLockAcquire(&g_mscCommandLock); }
+        ~CommandGuard() { SpinLockRelease(&g_mscCommandLock); }
+    } guard;
+    if (!dev.mscCommandBuffer)
+        dev.mscCommandBuffer = AllocDmaBuffer(1, dev.mscCommandBufferPhys);
+    if (!dev.mscCommandBuffer) return false;
+    uint64_t cbwPhys = dev.mscCommandBufferPhys;
+    auto* cbw = static_cast<UsbMscCbw*>(dev.mscCommandBuffer);
 
     // Fill CBW
     memset(cbw, 0, sizeof(UsbMscCbw));
@@ -2382,9 +2394,9 @@ static bool XhciMscCommand(XhciController& ctrl, XhciDevice& dev,
     }
 
     // 3. Receive CSW via Bulk IN
-    uint64_t cswPhys;
-    auto* csw = static_cast<UsbMscCsw*>(AllocDmaBuffer(1, cswPhys));
-    if (!csw) return false;
+    uint64_t cswPhys = dev.mscCommandBufferPhys + 64;
+    auto* csw = reinterpret_cast<UsbMscCsw*>(
+        static_cast<uint8_t*>(dev.mscCommandBuffer) + 64);
 
     memset(csw, 0, sizeof(UsbMscCsw));
 
@@ -2398,7 +2410,8 @@ static bool XhciMscCommand(XhciController& ctrl, XhciDevice& dev,
         return false;
     }
 
-    if (csw->bCSWStatus != 0) {
+    if (csw->bCSWStatus != 0 || csw->dCSWTag != cbw->dCBWTag ||
+        csw->dCSWDataResidue != 0) {
         SerialPrintf("xhci: MSC command failed (status=%u residue=%u)\n",
                      csw->bCSWStatus, csw->dCSWDataResidue);
         return false;
@@ -2623,9 +2636,16 @@ static int UsbMscWrite(Device* dev, uint64_t offset, const void* buf, uint64_t l
     return static_cast<int>(totalWritten);
 }
 
-static int UsbMscIoctl(Device* /*dev*/, uint32_t /*cmd*/, void* /*arg*/)
+static int UsbMscIoctl(Device* dev, uint32_t cmd, void* /*arg*/)
 {
-    return -1;
+    if (cmd != DEVICE_IOCTL_FLUSH) return -95;
+    auto* st = static_cast<UsbMscState*>(dev->priv);
+    XhciDevice& udev = g_devices[st->devIndex];
+    // IMMED=0, LBA=0 and length=0: wait for the entire device cache.
+    uint8_t cdb[10] = {};
+    cdb[0] = SCSI_SYNCHRONIZE_CACHE_10;
+    return XhciMscCommand(*st->ctrl, udev, cdb, sizeof(cdb),
+                         nullptr, 0, 0, false) ? 0 : -5;
 }
 
 static void UsbMscClose(Device* /*dev*/) {}

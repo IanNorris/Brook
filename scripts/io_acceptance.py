@@ -34,7 +34,60 @@ def check(directory, output, tag):
             rc = subprocess.run(['e2fsck', '-fn', str(directory / f'{name}.img')], stdout=f, stderr=subprocess.STDOUT).returncode
         if rc:
             raise RuntimeError(f'{tag}: {name} fsck returned {rc}')
+    if (directory/'boot.img').exists():
+        with (output/f'{tag}-boot-fsck.log').open('wb') as f:
+            rc = subprocess.run(['fsck.fat', '-n', str(directory/'boot.img')], stdout=f, stderr=subprocess.STDOUT).returncode
+        if rc: raise RuntimeError(f'{tag}: boot FAT fsck returned {rc}')
     return allocation(directory / 'data.img')
+
+
+def wait_flush(process, serial, offset, marker, deadline):
+    expires = time.monotonic() + deadline
+    while time.monotonic() < expires:
+        text = serial.read_bytes()[offset:].decode(errors='replace')
+        if re.search(r'FLUSHCHECK FAIL|KERNEL PANIC|KERNEL FAULT', text):
+            raise RuntimeError('Flush regression: '+text[-2000:])
+        if (marker.search(text) if isinstance(marker, re.Pattern) else marker in text): return text
+        if process.poll() is not None: raise RuntimeError('VM exited during flush probe')
+        time.sleep(.1)
+    raise TimeoutError('Flush probe deadline: '+str(marker))
+
+
+def flush_probe(process, session, data, serial, artifacts, output, deadline, mount, slot):
+    import inject_flush_failure
+    path = mount+'/flush-check'
+    offset = serial.stat().st_size
+    base.server.guest_run(session, 'run /boot/BIN/FLUSHCHK create '+path)
+    wait_flush(process, serial, offset, 'FLUSHCHECK PASS path='+path, deadline)
+    offset = serial.stat().st_size
+    base.server.guest_run(session, 'run /boot/BIN/FLUSHCHK retry '+path+' --wait')
+    text = wait_flush(process, serial, offset, re.compile(r'FLUSHCHECK READY pid=\d+ path='), deadline)
+    pid = int(re.search(r'FLUSHCHECK READY pid=(\d+)', text)[1])
+    # This isolated harness attaches boot/data/nix in that exact order. Check
+    # the driver's own slot announcement rather than guessing another VM's.
+    if f'virtio-blk: virtio{slot} flush=negotiated test-budget-slot={slot}' not in serial.read_text():
+        raise RuntimeError('Unexpected data-device slot or missing negotiated FLUSH')
+    first = inject_flush_failure.inject(session, artifacts/'kernel/BROOK.elf', slot=slot, count=1)
+    base.server.guest_run(session, f'run /boot/BIN/FLUSHCHK release {pid}')
+    wait_flush(process, serial, offset, 'FLUSHCHECK PASS path='+path, deadline)
+    second = inject_flush_failure.inject(session, artifacts/'kernel/BROOK.elf', slot=slot, count=1)
+    try:
+        base.server.control(session, 'stop')
+    except RuntimeError as error:
+        if 'aborted before QMP' not in str(error): raise
+        rejected = str(error)
+    else: raise RuntimeError('Failed device flush incorrectly permitted VM shutdown')
+    if process.poll() is not None: raise RuntimeError('Negative sync acknowledgement stopped VM')
+    with inject_flush_failure.QMP(session) as qmp:
+        if qmp.call('query-status').get('running') is not True:
+            raise RuntimeError('VM did not remain running after rejected shutdown')
+    retry = base.server.guest(data, 'bridge sync', timeout=30)
+    if retry != {'guest_sync_completed': True, 'sync_guarantee': 'checked_filesystem_and_device_flush'}:
+        raise RuntimeError('Checked sync retry failed: '+str(retry))
+    result = {'fsync_injection': first, 'shutdown_injection': second,
+              'shutdown_rejected': rejected, 'sync_retry': retry}
+    base.write(output/f'flush-failure-tests-{slot}.json', result)
+    return result
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
@@ -53,6 +106,7 @@ def main():
     ap.add_argument('--wait-mask-probe', action='store_true', help='also run temporary-mask, child-signal and select regression probes')
     ap.add_argument('--profile-small', action='store_true', help='capture CPU/context switches during small-files; timings are instrumented')
     ap.add_argument('--lifetime-probe', action='store_true', help='also run the 24 inode-lifetime regression checks')
+    ap.add_argument('--flush-probe', action='store_true', help='inject device flush failures, require fsync/stop errors and retry, then verify after reboot')
     ap.add_argument('--deadline', type=int, default=180, help='seconds allowed per guest workload')
     args = ap.parse_args()
     if args.instance is None:
@@ -116,10 +170,22 @@ def main():
                 base.command(['mcopy', '-o', '-i', str(directory/'boot.img'), str(ROOT/'build/io-bench'/source), '::BIN/'+target])
         if args.mixed_append_probe:
             base.command(['mcopy', '-o', '-i', str(directory/'boot.img'), str(ROOT/'build/io-bench/mixedappendcheck'), '::BIN/MIXAPP'])
+        if args.flush_probe:
+            base.command(['mcopy', '-o', '-i', str(directory/'boot.img'), str(ROOT/'build/io-bench/flushcheck'), '::BIN/FLUSHCHK'])
         for mode in ('run', 'cleanup'):
             process, session, data, boot_seconds = base.launch(directory, args.instance, artifacts, cpus=args.cpus, memory=args.memory)
             serial = Path(data['serial_log'])
             offset = serial.stat().st_size
+            if args.flush_probe:
+                if mode == 'run':
+                    report['flush_probe'] = {
+                        mount: flush_probe(process, session, data, serial, artifacts, output, args.deadline, mount, slot)
+                        for mount, slot in [('/data', 1), ('/boot', 0)]}
+                else:
+                    for mount in ['/data', '/boot']:
+                        probe_offset = serial.stat().st_size
+                        base.server.guest_run(session, 'run /boot/BIN/FLUSHCHK cleanup '+mount+'/flush-check')
+                        wait_flush(process, serial, probe_offset, 'FLUSHCHECK CLEANUP PASS', args.deadline)
             if args.mixed_append_probe and mode == 'run':
                 base.server.guest_run(session, 'run /boot/BIN/MIXAPP /data '+args.mixed_append_probe)
                 expires = time.monotonic()+args.deadline
@@ -188,6 +254,8 @@ def main():
                     report.setdefault('guest_probes', []).append(marker)
             # Program synchronizes before PASS. Stop waits for another guest sync.
             stop = base.server.control(session, 'stop')
+            if args.flush_probe and stop.get('sync_guarantee') != 'checked_filesystem_and_device_flush':
+                raise RuntimeError('Shutdown lost checked flush guarantee')
             base.write(output/f'{mode}-stop.json', stop)
             process.wait(timeout=30); process = session = None
             final_serial = serial.read_bytes()[offset:].decode(errors='replace')

@@ -465,7 +465,7 @@ int ext4_umount(const char *mount_point)
 
 	r = ext4_fs_fini(&mp->fs);
 	if (r != EOK)
-		goto Finish;
+		return r; /* Keep the mounted filesystem usable for a sync/retry. */
 
 	mp->mounted = 0;
 
@@ -473,7 +473,6 @@ int ext4_umount(const char *mount_point)
 	ext4_bcache_fini_dynamic(mp->fs.bdev->bc);
 
 	r = ext4_block_fini(mp->fs.bdev);
-Finish:
 	mp->fs.bdev->fs = NULL;
 	return r;
 }

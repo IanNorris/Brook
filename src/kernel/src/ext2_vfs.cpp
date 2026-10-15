@@ -188,6 +188,11 @@ struct Ext2Mount {
     uint8_t** inodeBitmapCache;   // [groupCount]
     bool*     inodeBitmapDirty;   // [groupCount]
     uint32_t  pendingMetaOps;     // ops since last auto-sync
+    int       deferredSyncError;  // an automatic sync failure not yet reported
+    // A failed data/pointer/inode write may have been partially committed or
+    // ignored by a legacy caller. No retry ledger exists for those writes:
+    // retain EIO for this mount's lifetime, unlike retryable FLUSH failures.
+    int       writeError;
 
     // --- Indirect-block read cache ---
     // BlockMap() is called once per file-block during sequential reads,
@@ -411,7 +416,11 @@ static uint32_t Ext2ResolvePath(Ext2Mount* mnt, uint32_t startIno,
 static bool Ext2DevWrite(Ext2Mount* mnt, uint64_t byteOffset, const void* buf, uint64_t len)
 {
     int r = mnt->dev->ops->write(mnt->dev, byteOffset, buf, len);
-    return r == static_cast<int>(len);
+    if (r == static_cast<int>(len)) return true;
+    // All write callers hold g_ext2Lock exclusively. Successful later I/O
+    // cannot establish that an earlier failed pointer/inode write was repaired.
+    mnt->writeError = -5;
+    return false;
 }
 
 // --- Inode read cache helpers ---
@@ -654,24 +663,23 @@ static uint8_t* Ext2GetInodeBitmap(Ext2Mount* mnt, uint32_t group)
 // Flush every dirty cached bitmap + the BGDT to disk.  Called from the
 // VFS sync hook, on unmount, and after every EXT2_OPS_PER_AUTO_SYNC
 // metadata mutations as a safety net so the crash window is bounded.
-static void Ext2Sync(Ext2Mount* mnt)
+static int Ext2Sync(Ext2Mount* mnt)
 {
-    if (!mnt) return;
+    if (!mnt) return -22;
+    int result = 0;
+    bool bgdtWasDirty = mnt->bgdtDirty;
     for (uint32_t g = 0; g < mnt->groupCount; ++g) {
         if (mnt->blockBitmapCache[g] && mnt->blockBitmapDirty[g]) {
-            if (Ext2WriteBlock(mnt, mnt->bgdt[g].bg_block_bitmap,
-                               mnt->blockBitmapCache[g])) {
-                mnt->blockBitmapDirty[g] = false;
-            }
+            if (!Ext2WriteBlock(mnt, mnt->bgdt[g].bg_block_bitmap,
+                                mnt->blockBitmapCache[g])) result = -5;
         }
         if (mnt->inodeBitmapCache[g] && mnt->inodeBitmapDirty[g]) {
-            if (Ext2WriteBlock(mnt, mnt->bgdt[g].bg_inode_bitmap,
-                               mnt->inodeBitmapCache[g])) {
-                mnt->inodeBitmapDirty[g] = false;
-            }
+            if (!Ext2WriteBlock(mnt, mnt->bgdt[g].bg_inode_bitmap,
+                                mnt->inodeBitmapCache[g])) result = -5;
         }
     }
-    if (mnt->bgdtDirty && Ext2WriteBGDT(mnt)) {
+    if (bgdtWasDirty) {
+        if (!Ext2WriteBGDT(mnt)) result = -5;
         // The superblock totals must agree with the group descriptors after
         // guest allocations. Previously only the group counts were persisted.
         uint32_t totals[2] = {};
@@ -680,17 +688,30 @@ static void Ext2Sync(Ext2Mount* mnt)
             totals[1] += mnt->bgdt[g].bg_free_inodes_count;
         }
         if (!Ext2DevWrite(mnt, 1024 + __builtin_offsetof(Ext2Superblock, s_free_blocks_count),
-                         totals, sizeof(totals)))
-            mnt->bgdtDirty = true;
+                         totals, sizeof(totals))) result = -5;
     }
-    mnt->pendingMetaOps = 0;
+    int flushError = DeviceFlush(mnt->dev);
+    if (!result) result = flushError;
+    // Retain dirty metadata until the complete write+flush succeeds. A retry
+    // rewrites the same cached values even after a device flush failure.
+    mnt->bgdtDirty = result ? bgdtWasDirty : false;
+    if (!result) {
+        for (uint32_t g = 0; g < mnt->groupCount; ++g) {
+            mnt->blockBitmapDirty[g] = false;
+            mnt->inodeBitmapDirty[g] = false;
+        }
+        mnt->pendingMetaOps = 0;
+    }
+    return result;
 }
 
 // Called from each mutating op to bump the counter + trigger periodic flush.
 static inline void Ext2BumpMetaOps(Ext2Mount* mnt)
 {
-    if (++mnt->pendingMetaOps >= EXT2_OPS_PER_AUTO_SYNC)
-        Ext2Sync(mnt);
+    if (++mnt->pendingMetaOps >= EXT2_OPS_PER_AUTO_SYNC) {
+        int error = Ext2Sync(mnt);
+        if (error) mnt->deferredSyncError = error;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1361,7 +1382,7 @@ static bool Ext2ReclaimInode(Ext2Mount* mnt, uint32_t ino, Ext2Inode* data)
 
 // Called only at top-level filesystem write/sync boundaries, never from
 // bitmap auto-sync or an IRQ close. Each queued inode remains allocated.
-static void Ext2DrainOrphans(Ext2Mount* mnt)
+static int Ext2DrainOrphans(Ext2Mount* mnt)
 {
     for (;;) {
         uint64_t flags = IrqSpinLockAcquire(&g_ext2OpenLock);
@@ -1371,7 +1392,7 @@ static void Ext2DrainOrphans(Ext2Mount* mnt)
         auto* orphan = *link;
         if (orphan) *link = orphan->next;
         IrqSpinLockRelease(&g_ext2OpenLock, flags);
-        if (!orphan) return;
+        if (!orphan) return 0;
         Ext2Inode data;
         bool read = Ext2ReadInode(mnt, orphan->inode, &data);
         if (read && data.i_links_count) {
@@ -1387,7 +1408,7 @@ static void Ext2DrainOrphans(Ext2Mount* mnt)
             g_ext2OpenInodes = orphan;
             IrqSpinLockRelease(&g_ext2OpenLock, flags);
             SerialPrintf("ext2: failed reclaiming orphan inode %u\n", orphan->inode);
-            return;
+            return -5;
         }
         kfree(orphan);
     }
@@ -2256,6 +2277,16 @@ static int Ext2VnodeChmod(Vnode* vn, uint16_t mode)
     return result;
 }
 
+static int Ext2FsSync(void* mountPriv);
+
+static int Ext2VnodeFsync(Vnode* vn)
+{
+    auto* mnt = vn->type == VnodeType::Dir
+        ? static_cast<Ext2DirPriv*>(vn->priv)->mnt
+        : static_cast<Ext2FilePriv*>(vn->priv)->mnt;
+    return Ext2FsSync(mnt);
+}
+
 static const VnodeOps g_ext2FileOps = {
     .open    = Ext2FileOpen,
     .read    = Ext2FileRead,
@@ -2263,7 +2294,7 @@ static const VnodeOps g_ext2FileOps = {
     .readdir = nullptr,
     .close   = Ext2FileClose,
     .stat    = Ext2FileStat,
-    .fsync   = nullptr,
+    .fsync   = Ext2VnodeFsync,
     .set_times = Ext2VnodeSetTimes,
     .chmod   = Ext2VnodeChmod,
 };
@@ -2275,7 +2306,7 @@ static const VnodeOps g_ext2DirOps = {
     .readdir = Ext2DirReaddir,
     .close   = Ext2DirClose,
     .stat    = Ext2DirStat,
-    .fsync   = nullptr,
+    .fsync   = Ext2VnodeFsync,
     .set_times = Ext2VnodeSetTimes,
     .chmod   = Ext2VnodeChmod,
 };
@@ -2484,13 +2515,13 @@ static bool Ext2FsCanUnmount(void* mountPriv)
     return !busy;
 }
 
-static void Ext2FsUnmount(void* mountPriv)
+static int Ext2FsUnmount(void* mountPriv)
 {
     auto* mnt = static_cast<Ext2Mount*>(mountPriv);
-    if (!mnt) return;
+    if (!mnt) return -22;
     // Flush any dirty metadata before releasing cache buffers.
-    Ext2DrainOrphans(mnt);
-    Ext2Sync(mnt);
+    int error = Ext2FsSync(mnt);
+    if (error) return error;
     if (mnt->blockBitmapCache) {
         for (uint32_t g = 0; g < mnt->groupCount; ++g)
             if (mnt->blockBitmapCache[g]) kfree(mnt->blockBitmapCache[g]);
@@ -2523,17 +2554,23 @@ static void Ext2FsUnmount(void* mountPriv)
     for (uint32_t i = 0; i < EXT2_MAX_MOUNTS; ++i)
         if (g_ext2Mounts[i] == mnt) g_ext2Mounts[i] = nullptr;
     kfree(mnt);
+    return 0;
 }
 
 // VFS sync hook — flush all dirty metadata to disk.
-static void Ext2FsSync(void* mountPriv)
+static int Ext2FsSync(void* mountPriv)
 {
     auto* mnt = static_cast<Ext2Mount*>(mountPriv);
-    if (!mnt) return;
+    if (!mnt) return -22;
     KRwLockWriteLock(&g_ext2Lock);
-    Ext2DrainOrphans(mnt);
-    Ext2Sync(mnt);
+    int result = mnt->writeError ? mnt->writeError : mnt->deferredSyncError;
+    mnt->deferredSyncError = 0;
+    int orphanError = Ext2DrainOrphans(mnt);
+    int syncError = Ext2Sync(mnt);
+    if (!result) result = mnt->writeError ? mnt->writeError :
+                         (orphanError ? orphanError : syncError);
     KRwLockWriteUnlock(&g_ext2Lock);
+    return result;
 }
 
 static Vnode* Ext2FsOpenMode(void* mountPriv, uint8_t pdrv,

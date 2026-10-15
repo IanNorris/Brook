@@ -71,6 +71,14 @@ static bool StrEq(const char* a, const char* b)
 
 // ---- Public API ----
 
+int DeviceFlush(Device* dev)
+{
+    if (!dev || dev->type != DeviceType::Block) return -19; // ENODEV
+    if (!dev->ops || !dev->ops->ioctl) return -95; // EOPNOTSUPP
+    int result = dev->ops->ioctl(dev, DEVICE_IOCTL_FLUSH, nullptr);
+    return result <= 0 ? result : -5; // never mistake an invalid result for success
+}
+
 bool DeviceRegister(Device* dev)
 {
     if (!dev || !dev->name || !dev->ops)

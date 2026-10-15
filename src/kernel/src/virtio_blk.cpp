@@ -39,19 +39,31 @@ static constexpr uint16_t VIRTQ_DESC_F_WRITE = 2; // device-writable (we read fr
 // virtio-blk request types
 static constexpr uint32_t VIRTIO_BLK_T_IN  = 0; // read
 static constexpr uint32_t VIRTIO_BLK_T_OUT = 1; // write
+static constexpr uint32_t VIRTIO_BLK_T_FLUSH = 4;
+static constexpr uint32_t VIRTIO_BLK_F_FLUSH = 1u << 9;
 
 static constexpr uint8_t VIRTIO_BLK_S_OK = 0;
 
 static constexpr uint32_t VIRTIO_MAX_DEVS = 8;
+// Private fault-injection seam for disposable host-controlled tests. Never
+// changed by the guest; default zero. Each positive budget forces one flush
+// to fail before submission, leaving the next flush to perform real I/O.
+extern "C" { volatile uint32_t brook_virtio_flush_failures[VIRTIO_MAX_DEVS] = {}; }
 static constexpr uint8_t  VIRTIO_BLK_IRQ_VECTOR = 50; // preferred IDT vector
 
-// Features we actually implement. We deliberately negotiate NONE: the driver
-// uses a plain split virtqueue with direct descriptors and polls the used ring
+// Negotiate FLUSH only: every active filesystem now issues checked device
+// flushes. Keep a private build switch for testing the former stable-write
+// completion path when the host offers FLUSH but we decline it.
+// The driver uses a plain split virtqueue with direct descriptors and polls
 // for completion. In particular we must NOT accept VIRTIO_F_RING_EVENT_IDX
 // (bit 29) or VIRTIO_RING_F_INDIRECT_DESC (bit 28) — accepting a feature the
 // driver doesn't honour leaves the device's notification/interrupt suppression
 // in an undefined state. (BRO-164)
+#ifdef BROOK_VIRTIO_BLK_FORCE_WRITETHROUGH
 static constexpr uint32_t VIRTIO_BLK_SUPPORTED_FEATURES = 0;
+#else
+static constexpr uint32_t VIRTIO_BLK_SUPPORTED_FEATURES = VIRTIO_BLK_F_FLUSH;
+#endif
 
 // Completion wait budget. The primary bound is wall-clock: under heavy
 // multi-device load a legitimately-slow completion can take far longer than a
@@ -161,6 +173,9 @@ struct VirtioBlkState {
     uint16_t    usedIdxShadow;  // last consumed used ring index
 
     uint64_t    sectorCount;    // total sectors on the device
+    uint32_t    deviceSlot;
+    bool        flushOffered;
+    bool        flushNegotiated;
 
     // Per-request DMA buffers (reused; one request at a time)
     VirtioBlkReq* reqBuf;
@@ -196,6 +211,8 @@ struct VirtioBlkState {
         volatile uint64_t pathLegacy;     // legacy SubmitRequest waits
         volatile uint64_t pathBatch;      // small-read batched-slot waits
         volatile uint64_t pathSG;         // scatter-gather waits
+        volatile uint64_t flushSubmitted;
+        volatile uint64_t flushErrors;
     } probe;
 
     // Serialises concurrent requests from multiple processes.  The current
@@ -511,7 +528,7 @@ static bool SubmitRequest(VirtioBlkState& s,
     s.descTable[d0].addr  = s.reqBufPhys;
     s.descTable[d0].len   = sizeof(VirtioBlkReq);
     s.descTable[d0].flags = VIRTQ_DESC_F_NEXT;
-    s.descTable[d0].next  = d1;
+    s.descTable[d0].next  = type == VIRTIO_BLK_T_FLUSH ? d2 : d1;
 
     s.descTable[d1].addr  = dataBufPhys;
     s.descTable[d1].len   = dataLen;
@@ -1320,8 +1337,32 @@ static int VirtioBlkWrite(Device* dev, uint64_t offset, const void* buf, uint64_
 
 static int VirtioBlkIoctl(Device* dev, uint32_t cmd, void* arg)
 {
-    (void)dev; (void)cmd; (void)arg;
-    return -1;
+    (void)arg;
+    if (cmd != DEVICE_IOCTL_FLUSH) return -95;
+    auto* s = static_cast<VirtioBlkState*>(dev->priv);
+    // If FLUSH was not offered, the protocol gives no persistence guarantee.
+    if (!s->flushOffered) return -95;
+    AcquireRequestLock(*s);
+    if (!s->flushNegotiated) {
+        // Offered but unnegotiated FLUSH, without CONFIG_WCE, means writes
+        // were already stable at completion. Order after them under the guard.
+        ReleaseRequestLock(*s);
+        return 0;
+    }
+    int result = 0;
+    auto* failures = &brook_virtio_flush_failures[s->deviceSlot];
+    uint32_t budget = __atomic_load_n(failures, __ATOMIC_RELAXED);
+    if (budget) {
+        __atomic_store_n(failures, budget - 1, __ATOMIC_RELAXED);
+        SerialPrintf("virtio-blk: TEST injected flush failure on %s\n", dev->name);
+        result = -5;
+    } else {
+        ++s->probe.flushSubmitted;
+        if (!SubmitRequest(*s, VIRTIO_BLK_T_FLUSH, 0, 0, 0)) result = -5;
+    }
+    if (result) ++s->probe.flushErrors;
+    ReleaseRequestLock(*s);
+    return result;
 }
 
 static void VirtioBlkClose(Device* /*dev*/) {}
@@ -1405,6 +1446,12 @@ static Device* InitOnePciDevice(const PciDevice& pci, uint32_t slot)
     state->queueSize      = qSize;
     state->availIdxShadow = 0;
     state->usedIdxShadow  = 0;
+    state->deviceSlot = slot;
+    state->flushOffered = (features & VIRTIO_BLK_F_FLUSH) != 0;
+    state->flushNegotiated = (features & VIRTIO_BLK_SUPPORTED_FEATURES & VIRTIO_BLK_F_FLUSH) != 0;
+    SerialPrintf("virtio-blk: %s flush=%s test-budget-slot=%u (default 0)\n",
+                 g_virtioNames[slot], state->flushNegotiated ? "negotiated" :
+                 (state->flushOffered ? "writethrough" : "unsupported"), slot);
 
     if (!AllocVirtqueue(*state))
     {
@@ -1550,6 +1597,8 @@ void VirtioBlkGetProbe(Device* dev, VirtioBlkProbeStats& out)
     out.pathLegacy     = s->probe.pathLegacy;
     out.pathBatch      = s->probe.pathBatch;
     out.pathSG         = s->probe.pathSG;
+    out.flushSubmitted = s->probe.flushSubmitted;
+    out.flushErrors    = s->probe.flushErrors;
 }
 
 } // namespace brook

@@ -22,6 +22,11 @@ namespace brook {
 
 static constexpr uint8_t FATFS_MAX_DRIVES = FF_VOLUMES;
 static Device* g_fatfsDrives[FATFS_MAX_DRIVES] = {};
+// FatFS ignores some secondary-FAT/FSInfo write results. Report any such
+// failure at every checked sync until drive rebind: successful later I/O
+// cannot establish that the lost metadata was repaired. FLUSH-only failures
+// do not set this latch and remain retryable.
+static uint32_t g_fatfsWriteErrors[FATFS_MAX_DRIVES] = {};
 
 static bool KernelPtrLooksCanonical(const void* ptr)
 {
@@ -78,8 +83,18 @@ bool FatFsBindDrive(uint8_t pdrv, Device* dev)
         return false;
     }
     g_fatfsDrives[pdrv] = dev;
+    __atomic_store_n(&g_fatfsWriteErrors[pdrv], 0, __ATOMIC_RELAXED);
     SerialPrintf("FatFS: drive %u → '%s'\n", pdrv, dev->name);
     return true;
+}
+
+int FatFsFlushDrive(uint8_t pdrv)
+{
+    Device* dev = nullptr;
+    if (!FatFsDeviceReady(pdrv, &dev)) return -19;
+    int error = DeviceFlush(dev);
+    if (error) return error;
+    return __atomic_load_n(&g_fatfsWriteErrors[pdrv], __ATOMIC_RELAXED) ? -5 : 0;
 }
 
 } // namespace brook
@@ -128,6 +143,8 @@ DRESULT disk_write(BYTE pdrv, const BYTE* buff, LBA_t sector, UINT count)
     uint64_t len    = static_cast<uint64_t>(count)  * SECTOR_SIZE;
 
     int ret = dev->ops->write(dev, offset, buff, len);
+    if (ret != static_cast<int>(len))
+        __atomic_store_n(&brook::g_fatfsWriteErrors[pdrv], 1, __ATOMIC_RELAXED);
     return (ret == static_cast<int>(len)) ? RES_OK : RES_ERROR;
 }
 
@@ -139,7 +156,7 @@ DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void* buff)
     switch (cmd)
     {
     case CTRL_SYNC:
-        return RES_OK;
+        return brook::FatFsFlushDrive(pdrv) == 0 ? RES_OK : RES_ERROR;
 
     case GET_SECTOR_COUNT:
         {

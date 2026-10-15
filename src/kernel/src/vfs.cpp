@@ -363,8 +363,9 @@ bool VfsUnmount(const char* mountPoint)
             !g_mounts[i].fsOps->can_unmount(g_mounts[i].mountPriv))
             return false;
 
-        if (g_mounts[i].fsOps && g_mounts[i].fsOps->unmount)
-            g_mounts[i].fsOps->unmount(g_mounts[i].mountPriv);
+        if (g_mounts[i].fsOps && g_mounts[i].fsOps->unmount &&
+            g_mounts[i].fsOps->unmount(g_mounts[i].mountPriv) != 0)
+            return false;
 
         g_mounts[i].used = false;
         SerialPrintf("VFS: unmounted '%s'\n", mountPoint);
@@ -601,16 +602,18 @@ int VfsSetTimesPath(const char* path, const VnodeTime* times, bool nofollow)
 
 int VfsSync(Vnode* vn)
 {
-    // Best-effort flush: call each filesystem's sync hook so buffered
-    // metadata (e.g. ext2 bitmap/BGDT cache) reaches disk.  Per-vnode
-    // granularity is not tracked yet, so we sync everything.
-    (void)vn;
+    if (vn) return VfsFsync(vn);
+    // Try every mount even after a failure, but never acknowledge a failed
+    // filesystem/device flush as successful to sync(2) or the VM bridge.
+    int result = 0;
     for (uint32_t i = 0; i < VFS_MAX_MOUNTS; ++i) {
         if (!g_mounts[i].used) continue;
-        if (g_mounts[i].fsOps && g_mounts[i].fsOps->sync)
-            g_mounts[i].fsOps->sync(g_mounts[i].mountPriv);
+        if (g_mounts[i].fsOps && g_mounts[i].fsOps->sync) {
+            int error = g_mounts[i].fsOps->sync(g_mounts[i].mountPriv);
+            if (!result && error) result = error < 0 ? error : -5;
+        }
     }
-    return 0;
+    return result;
 }
 
 int VfsFsync(Vnode* vn)
@@ -618,7 +621,7 @@ int VfsFsync(Vnode* vn)
     // Per-file durability: persist this file's data + on-disk directory
     // entry (size/clusters).  Used by long-lived writers (e.g. the profiler)
     // that must survive an abrupt poweroff before an explicit close.
-    if (!vn || !vn->ops || !vn->ops->fsync) return -1;
+    if (!vn || !vn->ops || !vn->ops->fsync) return -95;
     return vn->ops->fsync(vn);
 }
 

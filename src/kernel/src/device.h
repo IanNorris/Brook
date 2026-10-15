@@ -25,6 +25,10 @@ enum class DeviceType : uint8_t {
 
 struct Device;
 
+// Complete all preceding writes through the device's volatile write cache.
+// No argument. Returns 0 only on completion, negative errno on failure.
+static constexpr uint32_t DEVICE_IOCTL_FLUSH = 0x42460001;
+
 // ---- Generic device operations ----
 struct DeviceOps {
     // Read  len bytes from device at byte offset into buf.
@@ -78,6 +82,8 @@ extern "C" Device* DeviceFind(const char* name);
 // so it is safe to use before validating a pointer recovered from another
 // subsystem's cached state.
 extern "C" bool DeviceIsRegistered(Device* dev);
+
+extern "C" int DeviceFlush(Device* dev);
 
 // Verify device registry integrity (canaries + checksum).  Returns true if OK.
 // Logs diagnostic details on corruption.  Safe to call from timer tick context.
