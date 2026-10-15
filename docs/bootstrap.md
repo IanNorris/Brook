@@ -385,3 +385,36 @@ native test runs, but failed offline checking with ten leaked ext2 blocks.
 The mixed-append cache regression and its validated fix are described in
 [io-cache-regression.md](io-cache-regression.md). Fresh prepared and clean
 acceptance remains required at one matching revision.
+
+### Worker-page ownership diagnosis (2026-10-15)
+
+The next prepared run at `95aa4f6` stalled in Git during kernel configuration.
+Git's allocator mapping at VA `0x24000000` still pointed to physical frame
+`0x16efe000`, but serial logs recorded that exact frame being freed by
+`PmmKillPid(19)` with mapCount 1. Its captured contents had subsequently become
+machine code while Git remained asleep on the former mutex at offset 0x30.
+The failed VM stopped with a checked sync acknowledgement; FAT and both ext2
+filesystems checked clean. This remains a failed build, with preserved images
+and diagnostics under `bootstrap-prepared-95aa4f6-ram`.
+
+User backing pages allocated by workers were charged to their recyclable thread
+IDs. Those mappings outlived the allocating thread, and an unrelated process
+reusing its ID could reclaim them on exit. User backing and PTE ownership now
+use the stable thread-group ID; page-table pages remain kernel-owned. This
+changes neither Process layout nor module ABI and retains the PMM diagnostics.
+
+The focused guest regression retains anonymous, mprotect, private-file and COW
+mappings after worker exit. A separate, pre-existing process reserves child IDs
+in batches and must demonstrably reuse the worker ID. The old kernel corrupted
+the anonymous, mprotect and COW contents after reuse. The fixed kernel preserved
+all bytes, with observed reuse, and passed the complete I/O gate with flush
+failure/retry, reboot verification, clean FAT/ext2 checks and exact allocation
+recovery in 27.31 seconds. All 13 host and seven bare-metal tests also passed.
+Evidence is under `build/io-bench/thread-pages-old-negative-r2` and
+`thread-pages-fixed-positive-r2`.
+
+Acceptance now rejects mapped-page leak/underflow diagnostics even if the guest
+reports build success. Profiling transport timeouts disable further profiling
+and are recorded as incomplete observations; they do not restart the VM or
+relax the required native-test, artifact, own-kernel boot or filesystem checks.
+Fresh prepared and clean acceptance runs are still required after this fix.

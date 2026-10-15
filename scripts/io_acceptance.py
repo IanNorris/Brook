@@ -107,6 +107,7 @@ def main():
     ap.add_argument('--profile-small', action='store_true', help='capture CPU/context switches during small-files; timings are instrumented')
     ap.add_argument('--lifetime-probe', action='store_true', help='also run the 24 inode-lifetime regression checks')
     ap.add_argument('--flush-probe', action='store_true', help='inject device flush failures, require fsync/stop errors and retry, then verify after reboot')
+    ap.add_argument('--thread-page-probe', action='store_true', help='retain worker mappings after thread exit and require safe PID reuse by unrelated processes')
     ap.add_argument('--deadline', type=int, default=180, help='seconds allowed per guest workload')
     args = ap.parse_args()
     if args.instance is None:
@@ -172,10 +173,24 @@ def main():
             base.command(['mcopy', '-o', '-i', str(directory/'boot.img'), str(ROOT/'build/io-bench/mixedappendcheck'), '::BIN/MIXAPP'])
         if args.flush_probe:
             base.command(['mcopy', '-o', '-i', str(directory/'boot.img'), str(ROOT/'build/io-bench/flushcheck'), '::BIN/FLUSHCHK'])
+        if args.thread_page_probe:
+            base.command(['mcopy', '-o', '-i', str(directory/'boot.img'), str(ROOT/'build/io-bench/threadpagecheck'), '::BIN/ASOWNCHK'])
         for mode in ('run', 'cleanup'):
             process, session, data, boot_seconds = base.launch(directory, args.instance, artifacts, cpus=args.cpus, memory=args.memory)
             serial = Path(data['serial_log'])
             offset = serial.stat().st_size
+            if args.thread_page_probe and mode == 'run':
+                base.server.guest_run(session, 'run /boot/BIN/ASOWNCHK /data --require-reuse')
+                expires = time.monotonic()+args.deadline
+                while time.monotonic()<expires:
+                    text = serial.read_bytes()[offset:].decode(errors='replace')
+                    if re.search(r'THREADPAGECHECK FAIL|KERNEL PANIC|KERNEL FAULT', text):
+                        raise RuntimeError('Thread-owned mappings corrupted after PID reuse')
+                    if 'THREADPAGECHECK PASS failures=0' in text: break
+                    if process.poll() is not None: raise RuntimeError('VM exited during thread page probe')
+                    time.sleep(.1)
+                else: raise TimeoutError('Thread page probe deadline')
+                report['thread_page_probe'] = 'passed with observed TID reuse'
             if args.flush_probe:
                 if mode == 'run':
                     report['flush_probe'] = {
@@ -259,7 +274,7 @@ def main():
             base.write(output/f'{mode}-stop.json', stop)
             process.wait(timeout=30); process = session = None
             final_serial = serial.read_bytes()[offset:].decode(errors='replace')
-            if re.search(r'IOBENCH FAIL|CACHECHECK FAIL|FILELIFECHECK FAIL|PANIC|KERNEL FAULT|virtio-blk.*(?:timeout|reset)', final_serial, re.I):
+            if re.search(r'IOBENCH FAIL|CACHECHECK FAIL|FILELIFECHECK FAIL|PANIC|KERNEL FAULT|BRO176-MAP(?:LEAK|UNDERFLOW)|virtio-blk.*(?:timeout|reset)', final_serial, re.I):
                 raise RuntimeError(f'{mode}: late guest failure during verification or sync')
             shutil.copy2(serial, output/f'{mode}-serial.log')
             shutil.copy2(directory/'launch.log', output/f'{mode}-host.log')

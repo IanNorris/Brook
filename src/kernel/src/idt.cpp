@@ -950,7 +950,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                 // is issued here, AFTER the lock is dropped inside the helper,
                 // because it busy-waits for remote IPI ACKs.
                 VmmCowResult cow = VmmCowResolveWrite(
-                    cowProc->pageTable, VirtualAddress(cr2cow), cowProc->pid);
+                    cowProc->pageTable, VirtualAddress(cr2cow), ProcessAddressSpacePid(cowProc));
 
                 if (cow == VmmCowResult::Resolved)
                 {

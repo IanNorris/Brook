@@ -539,6 +539,15 @@ struct Process
     volatile uint32_t inputTail;  // Read index (process/syscall)
 };
 
+// User backing pages belong to the shared address space, not the allocating
+// thread. A thread's PID can be reused while its mappings remain live; charging
+// pages to that PID lets the next process's PmmKillPid free a sibling's memory.
+// The group leader stays reserved until all address-space users have exited.
+static inline uint16_t ProcessAddressSpacePid(const Process* p)
+{
+    return p->tgid ? p->tgid : p->pid;
+}
+
 // BRO-176/SIG1: returns a pointer to the address-space TLB footprint mask for
 // `p`, which lives on the thread-group leader (threadLeader==self for a leader).
 // Use this — NOT p->tlbCpuMask — as the recipient set for every user-page TLB

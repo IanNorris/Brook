@@ -80,6 +80,11 @@ def offline_fsck(directory, prefix):
             rc = subprocess.run(["e2fsck", "-fn", str(directory / f"{name}.img")],
                                 stdout=f, stderr=subprocess.STDOUT).returncode
         results[name] = {"exit": rc, "log": str(log)}
+    log = directory / f"{prefix}-fsck-boot.log"
+    with log.open("wb") as f:
+        rc = subprocess.run(["fsck.fat", "-n", str(directory/"boot.img")],
+                            stdout=f, stderr=subprocess.STDOUT).returncode
+    results['boot'] = {'exit': rc, 'log': str(log)}
     if any(v["exit"] for v in results.values()):
         raise RuntimeError(f"Offline fsck failed: {results}")
     return results
@@ -93,7 +98,7 @@ def check_stopped_serial(data, directory):
     serial = Path(data["serial_log"])
     text = serial.read_text(errors="replace")
     shutil.copy2(serial, directory / "guest-final-serial.log")
-    if re.search(r"KERNEL PANIC|KERNEL FAULT|virtio-blk.*(?:timeout|reset)|virtio.*I/O error", text, re.I):
+    if re.search(r"KERNEL PANIC|KERNEL FAULT|BRO176-MAP(?:LEAK|UNDERFLOW)|virtio-blk.*(?:timeout|reset)|virtio.*I/O error", text, re.I):
         raise RuntimeError(f"Guest device/panic errors; see {directory / 'guest-final-serial.log'}")
 
 
@@ -250,6 +255,8 @@ def monitor(directory, session, data, deadline):
     serial = Path(data["serial_log"])
     while time.monotonic() - started < deadline:
         text = serial.read_text(errors="replace")
+        if re.search(r'BRO176-MAP(?:LEAK|UNDERFLOW)', text):
+            raise RuntimeError('Guest mapped-page accounting failure; VM retained for diagnosis')
         markers = re.findall(r"^BOOTSTRAP_(BEGIN|END|EXIT) ([^\r\n]+)", text, re.M)
         for kind, payload in markers[seen:]:
             now = time.monotonic()
@@ -379,10 +386,10 @@ def main():
             (directory / f"{name}.img").symlink_to(ram / f"{name}.img")
     for name in ("data", "nix"):
         command(["cp", "--reflink=auto", "--sparse=always", str(args.seed / f"{name}.img"), str((directory / f"{name}.img").resolve())])
-    before = offline_fsck(directory, "before")
     env = dict(os.environ, BROOK_DISK_IMG=str(directory / "boot.img"))
     command([str(ROOT / "scripts/create_disk.sh")], directory / "boot-create.log", env)
     command([str(ROOT / "scripts/update_disk.sh")], directory / "boot-update.log", env)
+    before = offline_fsck(directory, "before")
     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(ROOT / "build/package-cache"))
     cache = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=cache.serve_forever, daemon=True).start()

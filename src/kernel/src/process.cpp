@@ -311,10 +311,10 @@ static void SetupTLS(Process* proc, uint64_t stackVirtBase, uint64_t guardPages)
     for (uint64_t i = 0; i < tlsPages; i++)
     {
         VirtualAddress vaddr(tlsBase + i * 4096);
-        PhysicalAddress phys = PmmAllocPage(MemTag::User, proc->pid);
+        PhysicalAddress phys = PmmAllocPage(MemTag::User, ProcessAddressSpacePid(proc));
         if (!phys || !VmmMapPage(proc->pageTable, vaddr, phys,
                                   VMM_WRITABLE | VMM_USER,
-                                  MemTag::User, proc->pid))
+                                  MemTag::User, ProcessAddressSpacePid(proc)))
         {
             tlsOk = false;
             break;
@@ -786,10 +786,10 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     for (uint64_t i = guardPages; i < totalStackPages; i++)
     {
         VirtualAddress vaddr(stackVirtBase + i * 4096);
-        PhysicalAddress phys = PmmAllocPage(MemTag::User, proc->pid);
+        PhysicalAddress phys = PmmAllocPage(MemTag::User, ProcessAddressSpacePid(proc));
         if (!phys || !VmmMapPage(proc->pageTable, vaddr, phys,
                                   VMM_WRITABLE | VMM_USER,
-                                  MemTag::User, proc->pid))
+                                  MemTag::User, ProcessAddressSpacePid(proc)))
         {
             stackOk = false;
             break;
@@ -2004,10 +2004,10 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     for (uint64_t i = guardPages; i < totalStackPages; i++)
     {
         VirtualAddress vaddr(stackVirtBase + i * 4096);
-        PhysicalAddress phys = PmmAllocPage(MemTag::User, proc->pid);
+        PhysicalAddress phys = PmmAllocPage(MemTag::User, ProcessAddressSpacePid(proc));
         if (!phys || !VmmMapPage(proc->pageTable, vaddr, phys,
                                   VMM_WRITABLE | VMM_USER,
-                                  MemTag::User, proc->pid))
+                                  MemTag::User, ProcessAddressSpacePid(proc)))
         {
             SerialPuts("EXEC: stack allocation failed\n");
             return 0;

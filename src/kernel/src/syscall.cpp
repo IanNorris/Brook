@@ -100,8 +100,7 @@ static bool UserBufferWritable(uint64_t addr, uint64_t len)
         // would do; genuinely read-only mappings must still fail.
         if (pte && (*pte & (brook::VMM_PRESENT | brook::VMM_USER | brook::PTE_COW_BIT)) ==
                    (brook::VMM_PRESENT | brook::VMM_USER | brook::PTE_COW_BIT)) {
-            uint32_t owner = proc->isThread && proc->threadLeader
-                           ? proc->threadLeader->pid : proc->pid;
+            uint32_t owner = brook::ProcessAddressSpacePid(proc);
             auto result = brook::VmmCowResolveWrite(proc->pageTable,
                                                    brook::VirtualAddress(pg), owner);
             if (result == brook::VmmCowResult::OutOfMemory) return false;
@@ -835,7 +834,7 @@ extern "C" bool MemFdHandleUserFault(uint64_t cr2, uint64_t errCode)
         // mfd-owned pages.
         if (!VmmMapPage(proc->pageTable, VirtualAddress(pageVA), phys,
                         VMM_PRESENT | m.vmmFlags,
-                        MemTag::User, proc->pid)) {
+                        MemTag::User, ProcessAddressSpacePid(proc))) {
             return false;
         }
         return true;
@@ -1055,7 +1054,7 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
         if (cached) {
             __atomic_fetch_add(&g_profCacheHit, 1, __ATOMIC_RELAXED);
             if (!VmmMapPage(proc->pageTable, VirtualAddress(pageVA), cached,
-                            VMM_PRESENT | m.vmmFlags, MemTag::User, proc->pid)) {
+                            VMM_PRESENT | m.vmmFlags, MemTag::User, ProcessAddressSpacePid(proc))) {
                 PmmUnrefPage(cached);
                 VnodeUnref(vn);
                 if (VmmVirtToPhys(proc->pageTable, VirtualAddress(pageVA)))
@@ -1078,7 +1077,7 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
                 if (!adjPhys) continue;
                 __atomic_fetch_add(&g_profCacheHit, 1, __ATOMIC_RELAXED);
                 if (!VmmMapPage(proc->pageTable, VirtualAddress(adjVA), adjPhys,
-                                VMM_PRESENT | m.vmmFlags, MemTag::User, proc->pid)) {
+                                VMM_PRESENT | m.vmmFlags, MemTag::User, ProcessAddressSpacePid(proc))) {
                     PmmUnrefPage(adjPhys);
                 }
             }
@@ -1094,7 +1093,7 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
             SerialPrintf("[PROFILE] cache_miss #%lu cacheId=%lu page=%lu\n",
                          missN, vn->cacheId, filePageIdx);
         }
-        PhysicalAddress phys = PmmAllocPage(MemTag::User, proc->pid);
+        PhysicalAddress phys = PmmAllocPage(MemTag::User, ProcessAddressSpacePid(proc));
         if (!phys) {
             VnodeUnref(vn);
             return false;
@@ -1118,7 +1117,7 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
         PageCacheInsert(vn, filePageIdx, phys);
 
         if (!VmmMapPage(proc->pageTable, VirtualAddress(pageVA), phys,
-                        VMM_PRESENT | m.vmmFlags, MemTag::User, proc->pid)) {
+                        VMM_PRESENT | m.vmmFlags, MemTag::User, ProcessAddressSpacePid(proc))) {
             if (VmmVirtToPhys(proc->pageTable, VirtualAddress(pageVA))) {
                 PmmUnrefPage(phys);
                 VnodeUnref(vn);
@@ -3807,11 +3806,11 @@ static int64_t sys_brk(uint64_t newBreak, uint64_t, uint64_t,
     {
         // Never replace a live page already present in the shared heap.
         if (VmmVirtToPhys(proc->pageTable, VirtualAddress(addr))) continue;
-        PhysicalAddress phys = PmmAllocPage(MemTag::User, proc->pid);
+        PhysicalAddress phys = PmmAllocPage(MemTag::User, ProcessAddressSpacePid(proc));
         if (!phys) return static_cast<int64_t>(proc->programBreak);
 
         if (!VmmMapPage(proc->pageTable, VirtualAddress(addr), phys,
-                        VMM_WRITABLE | VMM_USER, MemTag::User, proc->pid)) {
+                        VMM_WRITABLE | VMM_USER, MemTag::User, ProcessAddressSpacePid(proc))) {
             PmmFreePage(phys);
             return static_cast<int64_t>(proc->programBreak);
         }
@@ -3934,10 +3933,10 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     // Helper: allocate pages at a specific address.
     auto allocAt = [&](uint64_t vaddr, MemTag tag) -> bool {
         for (uint64_t i = 0; i < pages; i++) {
-            PhysicalAddress phys = PmmAllocPage(tag, proc->pid);
+            PhysicalAddress phys = PmmAllocPage(tag, ProcessAddressSpacePid(proc));
             if (!phys) return false;
             if (!VmmMapPage(proc->pageTable, VirtualAddress(vaddr + i * 4096), phys,
-                            vmmFlags, tag, proc->pid)) {
+                            vmmFlags, tag, ProcessAddressSpacePid(proc))) {
                 PmmFreePage(phys);
                 return false;
             }
@@ -4369,7 +4368,7 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
             if (!phys)
                 continue;
             VmmUnmapPage(proc->pageTable, va);
-            VmmMapPage(proc->pageTable, va, phys, newFlags, MemTag::User, proc->pid);
+            VmmMapPage(proc->pageTable, va, phys, newFlags, MemTag::User, ProcessAddressSpacePid(proc));
             continue;
         }
 
@@ -4379,7 +4378,7 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
             if (!phys)
                 continue;
             VmmUnmapPage(proc->pageTable, va);
-            VmmMapPage(proc->pageTable, va, phys, newFlags, MemTag::User, proc->pid);
+            VmmMapPage(proc->pageTable, va, phys, newFlags, MemTag::User, ProcessAddressSpacePid(proc));
             continue;
         }
 
@@ -4393,11 +4392,11 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
             if (prot == 0)
                 continue;
 
-            PhysicalAddress newPhys = PmmAllocPage(MemTag::User, proc->pid);
+            PhysicalAddress newPhys = PmmAllocPage(MemTag::User, ProcessAddressSpacePid(proc));
             if (!newPhys) return -ENOMEM;
 
             if (!VmmMapPage(proc->pageTable, va, newPhys, newFlags,
-                            MemTag::User, proc->pid))
+                            MemTag::User, ProcessAddressSpacePid(proc)))
             {
                 PmmFreePage(newPhys);
                 return -ENOMEM;
@@ -4413,7 +4412,7 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
 
         // Remap the existing page with the new flags.
         VmmUnmapPage(proc->pageTable, va);
-        VmmMapPage(proc->pageTable, va, phys, newFlags, MemTag::User, proc->pid);
+        VmmMapPage(proc->pageTable, va, phys, newFlags, MemTag::User, ProcessAddressSpacePid(proc));
     }
 
     // Permission changes may leave stale TLB entries on remote CPUs
@@ -4654,7 +4653,7 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
             if (phys) {
                 VirtualAddress newVA(newAddr + i * 4096);
                 VmmMapPage(proc->pageTable, newVA, phys,
-                           VMM_PRESENT | m.vmmFlags, MemTag::User, proc->pid);
+                           VMM_PRESENT | m.vmmFlags, MemTag::User, ProcessAddressSpacePid(proc));
                 VmmUnmapPage(proc->pageTable, oldVA);
             }
         }

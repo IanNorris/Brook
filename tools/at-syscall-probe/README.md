@@ -262,3 +262,28 @@ FAULT` through Brook's inherited debug fd 3. Confirm the marker in UART logs
 and query bridge procs/stats afterward: write success alone is insufficient.
 Host runs use `--no-serial`. This verifies fatal user faults preserve the
 ordinary serial ticket lock; kernel panic/double-fault handling is unchanged.
+
+`threadpagecheck.c` checks that user pages outlive the thread that allocated
+them. Compile with `-pthread` (static musl is suitable), then run an absolute
+executable path with an absolute writable ext2 directory and `--require-reuse`:
+`/boot/threadpagecheck /data/tmp --require-reuse`. A worker allocates anonymous
+pages, commits PROT_NONE pages with mprotect, faults a private file mapping,
+and triggers CPU COW faults. After joining it, an independent peer created
+before those allocations forks/execs/reaps 48 children in three batches of 16.
+Each batch reserves all child PIDs behind a pipe before releasing them to exec,
+so repeated reuse of a lower free PID cannot hide the worker's TID. At least
+one child must reuse the worker's TID. All four mappings must preserve their complete byte
+patterns, and the peer must retain its original COW data. The victim never forks
+after worker allocation: doing so could share/disown its frames and conceal
+the defect. A separate parent enforces a 30-second watchdog. On Linux, omit
+`--require-reuse`, since its PID allocator need not promptly reuse the TID.
+Expect `THREADPAGECHECK PASS failures=0` plus `observed=1 required=1` on Brook.
+
+The motivating bootstrap failure preserved Git's arena VA `0x24000000`
+mapping physical frame `0x16efe000`; serial recorded that exact frame being
+freed by PmmKillPid with owner PID 19, refCount 1 and mapCount 1. Its captured
+contents subsequently contained machine code while Git remained asleep on
+the arena's futex at offset 0x30. Allocating shared-address-space backing under
+the stable thread-group ID prevents an unrelated process reusing an exited
+worker's PID from reclaiming those pages. Page-table pages remain kernel-owned;
+individual kernel stacks retain thread ownership and explicit teardown.

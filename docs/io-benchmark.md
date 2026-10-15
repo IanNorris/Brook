@@ -35,6 +35,13 @@ runs the existing 24 inode-lifetime assertions, including actual inode reuse.
 Device errors, controller timeouts, missing completion markers and integrity
 failures fail the run. No filesystem repair runs automatically.
 
+`--thread-page-probe` additionally keeps a worker's anonymous, mprotect,
+private-file and COW mappings alive after it exits, then requires a separate
+process to reuse that worker's ID without corrupting any retained bytes. All
+runs reject mapped-page leak/underflow diagnostics. See the bootstrap
+[ownership diagnosis](bootstrap.md#worker-page-ownership-diagnosis-2026-10-15)
+and `tools/at-syscall-probe/threadpagecheck.c` for the reproducer.
+
 JSON records separate work and sync times for each phase, boot durations,
 kernel identity, host CPU/load and memory/swap counters. Raw serial logs include
 `/proc/blkprobe` and disk statistics before and after phases. Images are isolated
