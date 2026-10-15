@@ -163,12 +163,6 @@ New captures use native 1920×1080 without upscaling. See
 <p align="center"><em>LibreOffice Writer 25.8.5.2 editing a document through Wayland — native 1920×1080 capture, with no automatically opened debug windows</em></p>
 
 <p align="center">
-  <a href="docs/images/brook_desktop_1080.png"><img src="docs/images/brook_desktop_1080.png" alt="Brook's clean desktop and taskbar at native 1920 by 1080" width="960"></a>
-</p>
-
-<p align="center"><em>The default desktop starts quietly; Terminal, Calculator and kernel logs are available when wanted</em></p>
-
-<p align="center">
   <a href="docs/images/brook_boot_logo_1080.png"><img src="docs/images/brook_boot_logo_1080.png" alt="Brook's new blue and teal river B mark on its actual boot progress screen" width="800"></a>
 </p>
 
