@@ -3,6 +3,7 @@
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "syscall.h"
+#include "posix_timer.h"
 #include "busybox_applets.h"
 #include "cpu.h"
 #include "gdt.h"
@@ -460,7 +461,7 @@ static bool HasPendingSignals()
 {
     Process* proc = ProcessCurrent();
     if (!proc) return false;
-    return (proc->sigPending & ~proc->sigMask) != 0;
+    return ((proc->sigPending | PosixTimerPending(proc)) & ~proc->sigMask) != 0;
 }
 
 // Child exit also queues default-ignored SIGCHLD to wake wait4. Blocking
@@ -4787,21 +4788,10 @@ static int64_t sys_exit(uint64_t status, uint64_t, uint64_t,
                   p ? p->name : "?", p ? p->pid : 0, p ? p->tgid : 0, status);
     }
 
-    // If the thread group leader calls plain sys_exit while sibling threads
-    // are still alive, treat it as exit_group. Otherwise the leader's user
-    // page table is destroyed under live threads and other threads' cached
-    // threadLeader pointers become dangling references to freed memory
-    // (later reads return heap free-poison 0xDFDF). Linux zombifies the
-    // leader instead — for our hobby OS, killing the whole group is a
-    // simpler invariant that keeps shared resources consistent.
+    // Linux sys_exit terminates only the calling thread, including the
+    // leader. SchedulerExitCurrentProcess retains shared FDs/address space
+    // while live peers exist; asLiveThreads prevents premature leader reap.
     Process* proc = ProcessCurrent();
-    if (proc && proc->pid == proc->tgid && !proc->isThread)
-    {
-        // SchedulerKillThreadGroup is a no-op if no siblings exist, so we
-        // can call it unconditionally for the leader.
-        SchedulerKillThreadGroup(proc->tgid, proc,
-                                 static_cast<int>(status));
-    }
 
     // Wake vfork parent if child exits without exec
     if (proc && proc->vforkParent)
@@ -5239,7 +5229,7 @@ static int64_t sys_wait4(uint64_t pidArg, uint64_t statusAddr, uint64_t options,
         {
             // SIGCHLD is expected during wait — clear it and retry
             // instead of returning EINTR. Only return EINTR for other signals.
-            uint64_t pending = parent->sigPending & ~parent->sigMask;
+            uint64_t pending = (parent->sigPending | PosixTimerPending(parent)) & ~parent->sigMask;
             uint64_t sigchldBit = (1ULL << (17 - 1)); // SIGCHLD = 17
             if ((pending & ~sigchldBit) != 0)
                 return -EINTR;
@@ -5993,6 +5983,53 @@ static int64_t sys_clock_nanosleep(uint64_t clockid, uint64_t flags, uint64_t re
     return sys_nanosleep(reqAddr, remAddr, 0, 0, 0, 0);
 }
 
+// POSIX timer ABI wrappers. All user memory is validated/copied outside the
+// timer lock; the implementation never follows user pointers while locked.
+static int64_t sys_timer_create(uint64_t clock, uint64_t eventAddr, uint64_t idAddr,
+                                uint64_t, uint64_t, uint64_t)
+{
+    if (!UserBufferWritable(idAddr, sizeof(int32_t))) return -EFAULT;
+    PosixSigevent event{};
+    if (eventAddr) {
+        if (!UserBufferReadable(eventAddr, sizeof(event))) return -EFAULT;
+        __builtin_memcpy(&event, reinterpret_cast<void*>(eventAddr), sizeof(event));
+    }
+    int32_t id;
+    int result = PosixTimerCreate(ProcessCurrent(), (int)clock, eventAddr ? &event : nullptr, &id);
+    if (!result) __builtin_memcpy(reinterpret_cast<void*>(idAddr), &id, sizeof(id));
+    return result;
+}
+static int64_t sys_timer_settime(uint64_t id, uint64_t flags, uint64_t valueAddr,
+                                 uint64_t oldAddr, uint64_t, uint64_t)
+{
+    PosixItimerspec value, old;
+    if (!valueAddr) return -EINVAL;
+    if (!UserBufferReadable(valueAddr, sizeof(value))) return -EFAULT;
+    __builtin_memcpy(&value, reinterpret_cast<void*>(valueAddr), sizeof(value));
+    int result = PosixTimerSet(ProcessCurrent(), (int32_t)id, (unsigned)flags, value, oldAddr ? &old : nullptr);
+    if (!result && oldAddr && !CopyToUser(oldAddr, &old, sizeof(old))) return -EFAULT;
+    return result;
+}
+static int64_t sys_timer_gettime(uint64_t id, uint64_t valueAddr, uint64_t,
+                                 uint64_t, uint64_t, uint64_t)
+{
+    PosixItimerspec value;
+    if (!UserBufferWritable(valueAddr, sizeof(value))) return -EFAULT;
+    int result = PosixTimerGet(ProcessCurrent(), (int32_t)id, &value);
+    if (!result) __builtin_memcpy(reinterpret_cast<void*>(valueAddr), &value, sizeof(value));
+    return result;
+}
+static int64_t sys_timer_getoverrun(uint64_t id, uint64_t, uint64_t,
+                                   uint64_t, uint64_t, uint64_t)
+{
+    return PosixTimerOverrun(ProcessCurrent(), (int32_t)id);
+}
+static int64_t sys_timer_delete(uint64_t id, uint64_t, uint64_t,
+                                uint64_t, uint64_t, uint64_t)
+{
+    return PosixTimerDelete(ProcessCurrent(), (int32_t)id);
+}
+
 // ---------------------------------------------------------------------------
 // sys_alarm (37) — deliver SIGALRM after seconds
 // ---------------------------------------------------------------------------
@@ -6081,55 +6118,44 @@ static int64_t sys_rt_sigtimedwait(uint64_t setAddr, uint64_t infoAddr,
     Process* proc = ProcessCurrent();
     if (!proc) return -ESRCH;
     if (sigsetsize != 8) return -EINVAL;
-    if (!setAddr || !UserBufferReadable(setAddr, sizeof(uint64_t))) return -EFAULT;
-
+    if (!UserBufferReadable(setAddr, sizeof(uint64_t))) return -EFAULT;
+    // Linux dequeues first and only then copies siginfo to the user buffer.
+    // A bad output pointer therefore consumes the selected signal.
     uint64_t waitSet = *reinterpret_cast<const uint64_t*>(setAddr);
+    waitSet &= ~((1ULL << 8) | (1ULL << 18));
     uint64_t deadline = 0;
-
-    if (timeoutAddr)
-    {
+    if (timeoutAddr) {
         if (!UserBufferReadable(timeoutAddr, sizeof(timespec))) return -EFAULT;
-        auto* ts = reinterpret_cast<const timespec*>(timeoutAddr);
-        if (ts->tv_sec < 0 || ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000LL)
-            return -EINVAL;
-
-        uint64_t timeoutMs = static_cast<uint64_t>(ts->tv_sec) * 1000ULL +
-                             (static_cast<uint64_t>(ts->tv_nsec) + 999999ULL) / 1000000ULL;
-        deadline = g_lapicTickCount + timeoutMs;
+        timespec ts = *reinterpret_cast<const timespec*>(timeoutAddr);
+        uint64_t duration;
+        if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000LL ||
+            __builtin_mul_overflow((uint64_t)ts.tv_sec, 1000000000ULL, &duration) ||
+            __builtin_add_overflow(duration, (uint64_t)ts.tv_nsec, &duration) ||
+            __builtin_add_overflow(ClockNowNs(1), duration, &deadline)) return -EINVAL;
     }
-
-    for (;;)
-    {
-        uint64_t pending = __atomic_load_n(&proc->sigPending, __ATOMIC_ACQUIRE);
+    for (;;) {
+        uint64_t pending = __atomic_load_n(&proc->sigPending, __ATOMIC_ACQUIRE) |
+                           PosixTimerPending(proc);
         uint64_t matched = pending & waitSet;
-        if (matched)
-        {
-            uint32_t signum = 1;
-            while (signum <= 64 && ((matched & (1ULL << (signum - 1))) == 0))
-                ++signum;
-            if (signum > 64) return -EAGAIN;
-
-            __atomic_and_fetch(&proc->sigPending, ~(1ULL << (signum - 1)), __ATOMIC_RELEASE);
-            if (infoAddr)
-            {
-                if (!UserBufferWritable(infoAddr, sizeof(SignalInfo))) return -EFAULT;
-                SignalInfo info{};
-                info.si_signo = static_cast<int32_t>(signum);
-                CopyToUser(infoAddr, &info, sizeof(info));
+        if (matched) {
+            int signum = __builtin_ctzll(matched) + 1;
+            SignalInfo info{};
+            if (!PosixTimerDequeue(proc, 1ULL << (signum - 1), &info)) {
+                uint64_t previous = __atomic_fetch_and(&proc->sigPending,
+                    ~(1ULL << (signum - 1)), __ATOMIC_ACQ_REL);
+                if (!(previous & (1ULL << (signum - 1)))) continue;
+                info.si_signo = signum;
             }
-            return static_cast<int64_t>(signum);
+            if (infoAddr && !CopyToUser(infoAddr, &info, sizeof(info))) return -EFAULT;
+            return signum;
         }
-
-        if (timeoutAddr)
-        {
-            if (g_lapicTickCount >= deadline) return -EAGAIN;
-            uint64_t remaining = deadline - g_lapicTickCount;
-            proc->wakeupTick = g_lapicTickCount + (remaining < 10 ? remaining : 10);
-        }
-        else
-        {
-            proc->wakeupTick = g_lapicTickCount + 100;
-        }
+        if (pending & ~proc->sigMask & ~waitSet) return -EINTR;
+        uint64_t now = ClockNowNs(1);
+        if (timeoutAddr && now >= deadline) return -EAGAIN;
+        uint64_t sleepMs = timeoutAddr ? (deadline - now) / 1000000ULL +
+            ((deadline - now) % 1000000ULL != 0) : 100;
+        if (sleepMs > 100) sleepMs = 100;
+        proc->wakeupTick = g_lapicTickCount + sleepMs;
         SchedulerBlock(proc);
     }
 }
@@ -13685,6 +13711,11 @@ void SyscallTableInit()
     g_syscallTable[SYS_EPOLL_CTL]       = sys_epoll_ctl;
     g_syscallTable[SYS_EPOLL_WAIT]      = sys_epoll_wait;
     g_syscallTable[SYS_EPOLL_PWAIT]     = sys_epoll_pwait;
+    g_syscallTable[SYS_TIMER_CREATE] = sys_timer_create;
+    g_syscallTable[SYS_TIMER_SETTIME] = sys_timer_settime;
+    g_syscallTable[SYS_TIMER_GETTIME] = sys_timer_gettime;
+    g_syscallTable[SYS_TIMER_GETOVERRUN] = sys_timer_getoverrun;
+    g_syscallTable[SYS_TIMER_DELETE] = sys_timer_delete;
     g_syscallTable[SYS_TIMERFD_CREATE]  = sys_timerfd_create;
     g_syscallTable[SYS_TIMERFD_SETTIME] = sys_timerfd_settime;
     g_syscallTable[SYS_TIMERFD_GETTIME] = sys_timerfd_gettime;
@@ -13868,6 +13899,9 @@ static const char* SyscallName(uint64_t num)
     case 115: return "getgroups"; case 116: return "setgroups";
     case 117: return "getresuid"; case 120: return "getresgid";
     case 121: return "getpgid";   case 124: return "getsid";
+    case 222: return "timer_create"; case 223: return "timer_settime";
+    case 224: return "timer_gettime"; case 225: return "timer_getoverrun";
+    case 226: return "timer_delete";
     case 128: return "rt_sigtimedwait"; case 131: return "sigaltstack"; case 130: return "rt_sigsuspend";
     case 134: return "statfs";
     case 34: return "pause"; case 37: return "alarm";

@@ -1915,13 +1915,15 @@ static void CompositorInputWM()
             }
         }
 
-        // Non-terminal window: push raw event to per-process input queue
+        // Kernel terminals consume keyboard input through their stdin pipe.
+        // They never drain the userspace window-event queue; duplicating keys
+        // there eventually fills it and logs spurious dropped-event warnings.
+        // Wayland and other userspace windows still receive both raw queues.
         if (!routed)
+        {
             ProcessInputPush(focused->proc, ev);
-
-        // Always also push to the per-window queue (key events, x/y zero).
-        // Wayland clients rely on this for keyboard delivery.
-        WmInputPush(focused, ev, 0, 0);
+            WmInputPush(focused, ev, 0, 0);
+        }
     }
 
     // 5. Handle mouse interaction (position + latched clicks)

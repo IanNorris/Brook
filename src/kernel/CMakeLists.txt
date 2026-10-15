@@ -180,6 +180,7 @@ add_executable(kernel
     src/ramdisk.cpp
     src/runtime.cpp
     src/syscall.cpp
+    src/posix_timer.cpp
     src/process.cpp
     src/scheduler.cpp
     src/compositor.cpp

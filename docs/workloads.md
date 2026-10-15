@@ -66,11 +66,54 @@ characters and failed exact-content acceptance. A shorter replacement saved
 exactly `Short.\n`, with SHA-256
 `05e7af01711bc1fd49c9bb2f92dd1b9550e7e2d3183701d0056dbf1955efee5e`,
 and the shell accepted `echo SHELL_RETURN_OK` after quitting.
-**Vim acceptance remains incomplete** until the timer path and exact long-input
-case pass. Do not count dismissing the warning as compatibility.
+That failed run is retained as the baseline. The subsequent timer fix and
+interactive acceptance are recorded below.
 
 Brook's current kernel terminal uses pipes and TTY ioctls. Full Linux PTY
 support (`/dev/ptmx`, `/dev/pts`, allocation/unlock, controlling terminal and
 hangup semantics) remains separate work. Helix and Emacs have not been tested
 in this acceptance sequence. Codium, Blender and Firefox/Chromium also remain
 outstanding.
+
+
+## Vim timer fix and interactive result
+
+The candidate kernel
+`5c1b05f58cc50439c3b0d6c7504dd39fdcd27426ed4866620c215082cb74017d`
+passed the focused ASCII editor acceptance on 2026-10-15. Vim started without
+E1286, saved the exact three-line, 132-byte input, reopened it visibly, then
+replaced it with exactly `Short.\n`. The long file's SHA-256 was
+`f5ea421c1caf7a3441c09f665bfd1eba5e6134c0454a03fe3c26ad640300d182`;
+the shorter file matched the hash above. The terminal accepted
+`echo VIM_SHELL_RETURN_OK` after quitting, and the guest returned to its
+nine-process baseline. No unused window-input queue overflow warnings appeared.
+
+[Native 1920×1080 Vim screenshot](images/brook-vim-1080.png)
+
+Brook now provides bounded POSIX timers for realtime/monotonic clocks and
+signal, no-notification and Linux thread-target notifications. Glibc implements
+Vim's thread callbacks using a targeted internal signal; preserving SI_TIMER
+and its opaque value through synchronous signal waits is required. Merely
+accepting timer_create would not run those callbacks. Timer IDs and recipient
+incarnation checks prevent stale IDs or recycled TIDs from selecting another
+recipient. Timers are removed on exec/group exit and final thread retirement.
+The old exit wrapper also treated a leader's SYS_exit as exit_group; removing
+that coercion allows surviving siblings to keep using their process's timers.
+
+`tools/at-syscall-probe/posixtimercheck.c` passed on Linux/glibc and twice inside
+Brook, including a second run after Vim. Each guest run observed target-TID
+reuse, recovered all 128 timer slots, and executed 16 actual glibc callbacks.
+The probe also covers signal metadata, independent timers sharing a signal,
+overruns, disarm/rearm, ignored signals, invalid arguments, fork/exec/exit
+cleanup and leader-thread exit with surviving siblings. See the probe README
+for ABI details and Linux reference-test quirks.
+
+All 13 host tests and seven bare-metal tests passed. C++ and Rust workloads
+passed again on this candidate. Checked shutdown and
+offline FAT/ext2 checks all passed. Evidence, hashes and the original screenshot
+are under `build/workloads/vim-timer-fixed-20261015/`.
+
+This establishes the tested ASCII editing workflow, rather than full terminal
+emulation or PTY support. CPU-only asynchronous handler delivery at interrupt
+return and timer-driven job-control signals remain unsupported; those timer
+notifications return an explicit error. The probe README records these limits.

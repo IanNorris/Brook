@@ -67,6 +67,9 @@ void SchedulerMarkStopped(Process* proc);
 // Drop an owned wait reference and notify a parent if this made it reapable.
 void SchedulerReleaseWaitReference(Process* proc);
 
+// Resolve a timer target under the process registry lock; returns only a token.
+bool SchedulerTimerTargetIncarnation(Process* owner, int32_t tid, uint64_t* incarnation);
+
 // Get the current process running on this CPU (nullptr if none).
 Process* SchedulerCurrentProcess();
 

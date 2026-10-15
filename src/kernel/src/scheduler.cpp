@@ -1,4 +1,5 @@
 #include "scheduler.h"
+#include "posix_timer.h"
 #include "process.h"
 #include "panic.h"
 #include "cpu.h"
@@ -1157,6 +1158,7 @@ void SchedulerMarkTerminated(Process* proc, int waitStatus)
     // In a self-fatal path, restoring IF before dropping our temporary hold
     // could retire this CPU forever with the hold still on its dead stack.
     SchedLockReleaseRaw(g_readyLock);
+    PosixTimersCleanup(proc, false);
     if (offCpu) FutexCancelProcess(proc);
     ProcessUnref(proc);
     if (rlf & 0x200) __asm__ volatile("sti" ::: "memory");
@@ -1657,6 +1659,11 @@ void SchedulerTimerTick(bool allowPreempt)
     // Only BSP (CPU 0) does wakeup checks, reaping, and policy ticks.
     if (cpu == 0)
     {
+        // Registry -> timer is the only nested timer lock order. Expiry
+        // publishes wake latches without acquiring readyLock or holding refs.
+        uint64_t timerFlags = SchedLockAcquire(g_allProcLock);
+        PosixTimersTickLocked(g_allProcesses, g_processCount);
+        SchedLockRelease(g_allProcLock, timerFlags);
         CheckBlockedWakeups();
 
         // Check alarm timers for all processes
@@ -2411,6 +2418,25 @@ Process* ProcessFindByPid(uint16_t pid)
     return result;
 }
 
+bool SchedulerTimerTargetIncarnation(Process* owner, int32_t tid, uint64_t* incarnation)
+{
+    bool found = false;
+    uint64_t flags = SchedLockAcquire(g_allProcLock);
+    for (uint32_t i = 0; i < g_processCount; ++i) {
+        Process* p = g_allProcesses[i];
+        if (p->pid == tid && p->tgid == owner->tgid &&
+            p->state != ProcessState::Terminated &&
+            (p->isThread ? p->leaderIncarnation : p->incarnation) ==
+            (owner->isThread ? owner->leaderIncarnation : owner->incarnation)) {
+            *incarnation = p->incarnation;
+            found = true;
+            break;
+        }
+    }
+    SchedLockRelease(g_allProcLock, flags);
+    return found;
+}
+
 int ProcessSendSignalToGroup(uint16_t pgid, int signum)
 {
     // References protect the unlocked delivery phase. Keep IF clear while
@@ -2529,6 +2555,10 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus,
     }
     SchedLockRelease(g_allProcLock, alf);
 
+    // The group-exit latch prevents concurrent timer creation from surviving
+    // this cancellation, even while the leader remains an unreaped zombie.
+    PosixTimersCleanup(caller, true);
+
     // Phase 1: mark every sibling Terminated so the remote timer tick will
     // deschedule it.  We deliberately DO NOT touch each thread's kernel-lock
     // state here: the thread may still be running on another CPU and could be
@@ -2632,6 +2662,8 @@ void SchedulerReleaseThreadAddressSpace(Process* thread)
             __atomic_store_n(&leader->asLiveThreads, 0, __ATOMIC_RELEASE);
             after = 0;
         }
+        if (after == 0 && leader->state == ProcessState::Terminated)
+            PosixTimersCleanup(leader, true);
         if (after == 0 && __atomic_load_n(&leader->reapable, __ATOMIC_ACQUIRE)) {
             // An earlier SIGCHLD may already have been consumed while waitpid
             // refused the leader because this thread still held its AS. Event

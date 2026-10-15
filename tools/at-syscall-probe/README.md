@@ -302,3 +302,48 @@ completion: no worker from the test may remain and no futex waiter may retain
 its process. A host pass validates the probe, not Brook's scheduler. The probe
 covers FD pin teardown through blocked reads, but does not prove lifetime
 safety of every raw pipe/eventfd/socket waiter pointer or address-reuse race.
+
+`posixtimercheck.c` validates Linux x86-64 POSIX timer structures against the
+build toolchain headers, then checks real signal delivery, SI_TIMER metadata,
+independent timers sharing a signal, periodic overruns, disarm/rearm, relative
+and absolute monotonic/realtime deadlines, invalid buffers/arguments, targeted
+thread delivery and TID reuse isolation, fork/exec/exit cleanup, and bounded
+resource recovery. Its final test uses libc `timer_create(SIGEV_THREAD)` and
+requires 16 actual callback executions with the original value. Build and run
+**dynamically with glibc from the same closure as Vim**, with `-pthread -lrt`;
+a musl/raw-only test does not establish glibc helper compatibility. Use an
+absolute executable path (the test re-execs itself), and pass `--require-reuse`
+on Brook to require reuse of a dead target TID. Omit that option on Linux.
+A parent enforces a 30-second watchdog. Expect `POSIXTIMERCHECK PASS failures=0`
+and `glibc_callbacks=16`, then inspect process/futex diagnostics for leftovers.
+
+The kernel timer registry is bounded at 128 timers system-wide and returns
+EAGAIN on exhaustion. It supports CLOCK_REALTIME/CLOCK_MONOTONIC and
+SIGEV_NONE/SIGEV_SIGNAL/Linux SIGEV_THREAD_ID; libc implements SIGEV_THREAD on
+top of the latter. Unsupported clocks and raw SIGEV_THREAD return EINVAL.
+Timer notification via SIGKILL, SIGCONT, SIGSTOP, SIGTSTP, SIGTTIN, or SIGTTOU
+returns EOPNOTSUPP: IRQ-return job-control signal delivery is not implemented.
+Other asynchronous handlers are delivered at syscall return, so a CPU-only
+loop without syscalls is not a conforming asynchronous-handler acceptance
+case. The blocked glibc helper receives its signal through rt_sigtimedwait.
+Deleting a timer discards its queued notification; disarming preserves one
+already queued. Like the tested Linux host, disarming clears the reported
+interval, settime resets overrun accounting, and settime ignores flag bits
+other than TIMER_ABSTIME. rt_sigtimedwait dequeues before copying siginfo, so
+an invalid output pointer consumes the selected signal and returns EFAULT.
+The probe also requires ignored timers not to interrupt nanosleep, and requires
+a surviving sibling to use/create timers after its leader calls raw SYS_exit.
+The sole Brook-specific test requirement is `--require-reuse`; without it the
+probe is intended to pass on Linux with glibc. Timers carry owner/target
+incarnation tokens and no persistent
+process references. Process layout/module ABI are unchanged. These explicit
+scope limits must not be reported as full POSIX timer or signal conformance.
+
+The host Linux SIGEV_NONE optimization can report its previous countdown after
+disarming, although the interval is cleared. Its `common_timer_get` bypasses
+the inactive-timer return for SIGEV_NONE and reads the old hrtimer expiry
+([Linux source](https://github.com/torvalds/linux/blob/v6.12/kernel/time/posix-timers.c#L600)).
+The portable probe checks interval clearing for SIGEV_NONE, and checks both
+zero interval and zero remaining time plus absence of delivery on SIGEV_SIGNAL.
+Brook returns zero remaining time for either disarmed mode; it does not emulate
+the stale-countdown optimization.

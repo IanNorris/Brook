@@ -3,6 +3,7 @@
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "process.h"
+#include "posix_timer.h"
 #include "exec_limits.h"
 #include "scheduler.h"
 #include "syscall.h"
@@ -969,6 +970,7 @@ void ProcessDestroy(Process* proc)
 {
     if (!proc) return;
 
+    PosixTimersCleanup(proc, false);
     bool isThread = proc->isThread;
 
     // Release any kernel mutexes held by this process (prevents deadlock)
@@ -1916,6 +1918,9 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     // Save the old page table and switch CR3 to the kernel's page table
     // BEFORE destroying the old one. This avoids a use-after-free: the
     // CPU's CR3 would point to a freed PML4 page otherwise.
+    // This exec is committing to replace/detach the old image. No timer
+    // may retain its old opaque user value across that replacement.
+    PosixTimersCleanup(proc, true);
     PageTable oldPt = proc->pageTable;
     PageTable kernelPt = VmmKernelCR3();
 
@@ -2284,14 +2289,19 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     // --- Signal delivery ---
     if (proc->inSignalHandler) return syscallResult;
 
-    uint64_t deliverable = proc->sigPending & ~proc->sigMask;
+    uint64_t deliverable = (proc->sigPending | PosixTimerPending(proc)) & ~proc->sigMask;
     if (deliverable == 0) return syscallResult;
 
     // Find lowest pending signal
     int signum = __builtin_ctzll(deliverable) + 1;
 
-    // Clear from pending
-    __atomic_and_fetch(&proc->sigPending, ~(1ULL << (signum - 1)), __ATOMIC_RELEASE);
+    SignalInfo signalInfo{};
+    if (!PosixTimerDequeue(proc, 1ULL << (signum - 1), &signalInfo)) {
+        uint64_t previous = __atomic_fetch_and(&proc->sigPending,
+            ~(1ULL << (signum - 1)), __ATOMIC_ACQ_REL);
+        if (!(previous & (1ULL << (signum - 1)))) return syscallResult;
+        signalInfo.si_signo = signum;
+    }
 
     uint16_t pid = proc->tgid;
     if (pid >= MAX_PROCESSES) return syscallResult;
@@ -2301,6 +2311,14 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     // SIG_DFL (0) — default action
     if (sa.handler == 0)
     {
+        // Timer-origin signals preserve pending/mask semantics until dequeue.
+        // Catchable signals other than the default-ignore set terminate by
+        // default, including the real-time range (ordinary legacy dispatch
+        // below historically omitted those defaults).
+        if (signalInfo.si_code == -2 && signum != 17 && signum != 23 && signum != 28) {
+            SchedulerKillThreadGroup(proc->tgid, proc, 128 + signum, signum);
+            SchedulerExitCurrentProcess(128 + signum, signum);
+        }
         switch (signum)
         {
         case 1:  // SIGHUP
@@ -2477,8 +2495,7 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     }
 
     // Fill siginfo
-    sf->info.si_signo = signum;
-    sf->info.si_code  = 0;      // SI_USER
+    sf->info = signalInfo;
 
     // Redirect execution to the signal handler
     frame->rcx = sa.handler;                           // RIP = handler
