@@ -47,7 +47,13 @@ static void verify(int fd,unsigned id,uint64_t size,void *buffer) {
         if(n<0&&errno==EINTR)continue;
         if(n<=0)die("readback");
         unsigned char *p=buffer;
-        for(ssize_t i=0;i<n;i++)require(p[i]==byte(id,pos+i),"content mismatch");
+        for(ssize_t i=0;i<n;i++) {
+            unsigned char expected=byte(id,pos+i);
+            if(p[i]!=expected) {
+                fprintf(stderr,"IOBENCH_MISMATCH seed=%u offset=%llu actual=%u expected=%u\n",id,(unsigned long long)(pos+i),p[i],expected);
+                require(0,"content mismatch");
+            }
+        }
         pos+=n;
     }
     char extra; require(read(fd,&extra,1)==0,"exact EOF");
@@ -78,7 +84,16 @@ static void *worker(void *arg) {
         close_file(fd);
     } else if(!strcmp(phase,"sequential-read")) {
         int fd=open_file(path,O_RDONLY);
-        verify(fd,id,(uint64_t)mib*1024*1024,buffer);close_file(fd);
+        verify(fd,id,(uint64_t)mib*1024*1024,buffer);
+        // Force the large device-read path with byte-granular boundaries.
+        // Adjacent sentinels detect DMA writes beyond the requested buffer.
+        size_t count=CHUNK+1;unsigned char *guard=malloc(count+2);
+        if(!guard)die("read guard");
+        memset(guard,0x5a,count+2);
+        require(pread(fd,guard+1,count,1)==(ssize_t)count,"large unaligned pread");
+        require(guard[0]==0x5a&&guard[count+1]==0x5a,"large read guard bytes");
+        for(size_t i=0;i<count;i++)require(guard[i+1]==byte(id,i+1),"large unaligned contents");
+        free(guard);close_file(fd);
     } else if(!strcmp(phase,"boundaries-fragmentation")) {
         int fd=open_file(path,O_RDWR);
         unsigned char patch[97],check[97];memset(patch,0xa0+id,sizeof(patch));
@@ -117,8 +132,27 @@ static void *worker(void *arg) {
                 write_all(fragmented[f],buffer,CHUNK);
             }
             verify(fragmented[f],30000+id*2+f,80*4096,buffer);
+            // Append a large chunk to an existing fragmented block tree.
+            fill(buffer,CHUNK,30000+id*2+f,80*4096);
+            write_all(fragmented[f],buffer,CHUNK);
+            verify(fragmented[f],30000+id*2+f,96*4096,buffer);
         }
         close_file(a);close_file(b);
+        // The second batching chunk contains exactly one byte.
+        snprintf(path,sizeof(path),"%s/tail",dir);
+        unsigned char *tail=malloc(CHUNK+1);if(!tail)die("tail buffer");
+        fill(tail,CHUNK+1,40000+id,0);
+        fd=open_file(path,O_RDWR|O_CREAT|O_EXCL);write_all(fd,tail,CHUNK+1);
+        verify(fd,40000+id,CHUNK+1,buffer);close_file(fd);free(tail);
+        // Grow an open orphan through double-indirect blocks with batched writes.
+        snprintf(path,sizeof(path),"%s/orphan",dir);
+        fd=open_file(path,O_RDWR|O_CREAT|O_EXCL);if(unlink(path))die("orphan unlink");
+        for(unsigned chunk=0;chunk<128;chunk++) {
+            fill(buffer,CHUNK,50000+id,(uint64_t)chunk*CHUNK);write_all(fd,buffer,CHUNK);
+        }
+        verify(fd,50000+id,128ULL*CHUNK,buffer);
+        struct stat orphan;if(fstat(fd,&orphan))die("orphan stat");
+        require(orphan.st_nlink==0,"batched orphan links");close_file(fd);
     } else if(!strcmp(phase,"small-files")) {
         for(unsigned i=0;i<files;i++) {
             unsigned seed=1000+id*files+i;fill(buffer,4096,seed,0);
@@ -148,18 +182,20 @@ static void *worker(void *arg) {
         }
         char extra;require(read(fd,&extra,1)==0,"persistent bulk EOF");close_file(fd);
         const char *names[]={"ragged","fragment-a","fragment-b"};
-        for(unsigned i=0;i<3;i++){snprintf(path,sizeof(path),"%s/%s",dir,names[i]);fd=open_file(path,O_RDONLY);verify(fd,i?30000+id*2+i-1:20000+id,i?80*4096:283688,buffer);close_file(fd);}
+        for(unsigned i=0;i<3;i++){snprintf(path,sizeof(path),"%s/%s",dir,names[i]);fd=open_file(path,O_RDONLY);verify(fd,i?30000+id*2+i-1:20000+id,i?96*4096:283688,buffer);close_file(fd);}
+        snprintf(path,sizeof(path),"%s/tail",dir);fd=open_file(path,O_RDONLY);
+        verify(fd,40000+id,CHUNK+1,buffer);close_file(fd);
         for(unsigned i=0;i<files;i+=2){snprintf(path,sizeof(path),"%s/d%04u",dir,i);fd=open_file(path,O_RDONLY);verify(fd,1000+id*files+i,4096,buffer);close_file(fd);}
     } else if(!strcmp(phase,"cleanup")) {
-        const char *fixed[]={"bulk","ragged","fragment-a","fragment-b"};
-        for(unsigned i=0;i<4;i++){snprintf(path,sizeof(path),"%s/%s",dir,fixed[i]);if(unlink(path))die("cleanup fixed");}
+        const char *fixed[]={"bulk","ragged","fragment-a","fragment-b","tail"};
+        for(unsigned i=0;i<5;i++){snprintf(path,sizeof(path),"%s/%s",dir,fixed[i]);if(unlink(path))die("cleanup fixed");}
         for(unsigned i=0;i<files;i+=2){snprintf(path,sizeof(path),"%s/d%04u",dir,i);if(unlink(path))die("cleanup small");}
         if(rmdir(dir))die("cleanup worker directory");
     }
     free(buffer);return NULL;
 }
 static void run_phase(const char *name,uint64_t bytes,unsigned operations) {
-    phase=name;counters("before");printf("IOBENCH_BEGIN %s\n",phase);
+    phase=name;counters("before");printf("IOBENCH_BEGIN %s tick_ns=%llu\n",phase,(unsigned long long)now_ns());
     pthread_t threads[MAX_WORKERS];pthread_attr_t attr;
     if(pthread_attr_init(&attr)||pthread_attr_setstacksize(&attr,1024*1024)||pthread_barrier_init(&barrier,NULL,workers+1))die("thread attributes");
     for(unsigned i=0;i<workers;i++)if(pthread_create(&threads[i],&attr,worker,(void*)(uintptr_t)i))die("pthread_create");
@@ -167,7 +203,7 @@ static void run_phase(const char *name,uint64_t bytes,unsigned operations) {
     for(unsigned i=0;i<workers;i++)if(pthread_join(threads[i],NULL))die("pthread_join");
     uint64_t work_end=now_ns();sync();uint64_t end=now_ns();
     pthread_barrier_destroy(&barrier);pthread_attr_destroy(&attr);
-    printf("IOBENCH_RESULT {\"phase\":\"%s\",\"workers\":%u,\"bytes\":%llu,\"operations\":%u,\"work_ns\":%llu,\"sync_ns\":%llu,\"total_ns\":%llu}\n",name,workers,(unsigned long long)bytes,operations,(unsigned long long)(work_end-start),(unsigned long long)(end-work_end),(unsigned long long)(end-start));
+    printf("IOBENCH_RESULT {\"phase\":\"%s\",\"workers\":%u,\"bytes\":%llu,\"operations\":%u,\"work_start_ns\":%llu,\"work_ns\":%llu,\"sync_ns\":%llu,\"total_ns\":%llu}\n",name,workers,(unsigned long long)bytes,operations,(unsigned long long)start,(unsigned long long)(work_end-start),(unsigned long long)(end-work_end),(unsigned long long)(end-start));
     counters("after");
 }
 int main(int argc,char **argv) {
@@ -179,7 +215,7 @@ int main(int argc,char **argv) {
     if(argc>4)mib=strtoul(argv[4],NULL,10);
     if(argc>5)files=strtoul(argv[5],NULL,10);
     if(!workers||workers>MAX_WORKERS||mib<8||mib>128||!files||files>1024)return 2;
-    if(!strcmp(argv[2],"cleanup")) {run_phase("persistent-verify",(uint64_t)workers*mib*1024*1024,0);run_phase("cleanup",0,workers*((files+1)/2+4));if(rmdir(root))die("cleanup root");sync();}
+    if(!strcmp(argv[2],"cleanup")) {run_phase("persistent-verify",(uint64_t)workers*mib*1024*1024,0);run_phase("cleanup",0,workers*((files+1)/2+5));if(rmdir(root))die("cleanup root");sync();}
     else if(!strcmp(argv[2],"run")) {
         if(mkdir(root,0700))die("mkdir root");
         for(unsigned i=0;i<workers;i++){char dir[200];snprintf(dir,sizeof(dir),"%s/w%u",root,i);if(mkdir(dir,0700))die("mkdir worker");}

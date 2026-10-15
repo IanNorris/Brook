@@ -143,26 +143,26 @@ mcopy_safe() {
     return $rc
 }
 
-# --- Driver modules (from most recent build) ---
-# Check release first, then debug
-for build_type in release debug; do
-    mod_dir="${ROOT_DIR}/build/${build_type}/kernel/drivers"
+# --- Driver modules and profiler symbols ---
+# Explicit artifact selection must keep disk modules/symbols matched to the
+# selected kernel (guest-built boots and isolated A/B experiments).
+if [ -n "${BROOK_BUILD_DIR:-}" ]; then
+    selected_builds=("${BROOK_BUILD_DIR}")
+else
+    selected_builds=("${ROOT_DIR}/build/release" "${ROOT_DIR}/build/debug")
+fi
+for selected_build in "${selected_builds[@]}"; do
+    mod_dir="${selected_build}/kernel/drivers"
     if [ -d "$mod_dir" ] && ls "$mod_dir"/*.mod &>/dev/null; then
-        echo "Drivers (from ${build_type} build):"
+        echo "Drivers (from ${selected_build}):"
         sync_dir_contents "$mod_dir" "DRIVERS" "*.mod"
         break
     fi
 done
-
-# --- Kernel symbol table (for profiler address resolution) ---
-# The ksym_addr_table.cpp is auto-generated during build and embeds symbol
-# addresses. Placing it on the boot disk lets the profiler_to_speedscope.py
-# script (or any host-side tool) resolve addresses without needing the full
-# ELF binary.
-for build_type in release debug; do
-    ksym_file="${ROOT_DIR}/build/${build_type}/kernel/ksym_addr_table.cpp"
+for selected_build in "${selected_builds[@]}"; do
+    ksym_file="${selected_build}/kernel/ksym_addr_table.cpp"
     if [ -f "$ksym_file" ]; then
-        echo "Kernel symbols (from ${build_type} build):"
+        echo "Kernel symbols (from ${selected_build}):"
         sync_file "$ksym_file" "KSYM_ADDR.TXT"
         break
     fi

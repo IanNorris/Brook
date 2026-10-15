@@ -10,6 +10,8 @@
 #include "device.h"
 #include "process.h"
 #include "memory/heap.h"
+#include "memory/physical_memory.h"
+#include "memory/virtual_memory.h"
 #include "serial.h"
 #include "string.h"
 #include "sync/krwlock.h"
@@ -537,7 +539,16 @@ static void Ext2BlockCachePut(Ext2Mount* mnt, uint32_t blockNum, const void* buf
     uint32_t slot = Ext2BlockCacheSlot(blockNum);
     SpinLockAcquire(&mnt->blockCacheLock);
     if (!mnt->blockCacheData[slot]) {
-        mnt->blockCacheData[slot] = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+        // Thousands of permanent cache buffers otherwise populate the first-fit
+        // heap ahead of transient filesystem allocations. Use owned physical
+        // pages for normal ext2 blocks, leaving small-object heap searches short.
+        if (mnt->blockSize <= 4096) {
+            PhysicalAddress page = PmmAllocPage(MemTag::KernelData);
+            if (page) mnt->blockCacheData[slot] =
+                reinterpret_cast<uint8_t*>(PhysToVirt(page).raw());
+        } else {
+            mnt->blockCacheData[slot] = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+        }
         if (!mnt->blockCacheData[slot]) {
             SpinLockRelease(&mnt->blockCacheLock);
             return;
@@ -939,6 +950,210 @@ static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
     return 0;
 }
 
+// Private metadata for one 64 KiB append chunk. With 1--4 KiB filesystem
+// blocks, a chunk touches at most three indirect pages (a parent and two
+// leaves, or the single-indirect page followed by a double-indirect tree).
+// The caller holds g_ext2Lock for writing throughout the transaction.
+struct Ext2AppendBatch {
+    Ext2Mount* mnt;
+    struct Page {
+        PhysicalAddress phys;
+        uint32_t block = 0;
+        bool dirty = false;
+    } pages[3];
+    PhysicalAddress tailPage;
+    uint32_t count = 0;
+    uint32_t allocated[67]; // 64 data blocks plus at most three indirect blocks
+    uint32_t allocatedCount = 0;
+    int error = -5;
+
+    explicit Ext2AppendBatch(Ext2Mount* mount) : mnt(mount) {}
+    ~Ext2AppendBatch() {
+        for (auto& page : pages) PmmFreePage(page.phys);
+        PmmFreePage(tailPage);
+    }
+    void Reset() { count = allocatedCount = 0; error = -5; }
+    uint32_t Allocate() {
+        if (allocatedCount == 67) return 0;
+        uint32_t block = Ext2AllocBlock(mnt);
+        if (!block) { error = -28; return 0; }
+        allocated[allocatedCount++] = block;
+        return block;
+    }
+    bool Rollback() {
+        // Before publishing any pointers, all these blocks remain private.
+        // Their bitmap buffers were loaded by Allocate, so freeing needs no
+        // new bitmap allocation or read.
+        bool ok = true;
+        while (allocatedCount)
+            if (!Ext2FreeBlock(mnt, allocated[--allocatedCount])) ok = false;
+        return ok;
+    }
+    uint32_t* Get(uint32_t block, bool fresh = false) {
+        for (uint32_t i = 0; i < count; ++i)
+            if (pages[i].block == block)
+                return reinterpret_cast<uint32_t*>(PhysToVirt(pages[i].phys).raw());
+        if (count == 3) return nullptr;
+        auto& page = pages[count];
+        if (!page.phys) page.phys = PmmAllocPage(MemTag::KernelData);
+        if (!page.phys) { error = -12; return nullptr; }
+        auto* data = reinterpret_cast<uint32_t*>(PhysToVirt(page.phys).raw());
+        if (fresh) memset(data, 0, mnt->blockSize);
+        else if (!Ext2ReadBlock(mnt, block, data)) return nullptr;
+        page.block = block;
+        page.dirty = fresh;
+        ++count;
+        return data;
+    }
+    void Dirty(uint32_t block) {
+        for (uint32_t i = 0; i < count; ++i)
+            if (pages[i].block == block) pages[i].dirty = true;
+    }
+    uint8_t* Tail() {
+        if (!tailPage) tailPage = PmmAllocPage(MemTag::KernelData);
+        if (!tailPage) { error = -12; return nullptr; }
+        return reinterpret_cast<uint8_t*>(PhysToVirt(tailPage).raw());
+    }
+    bool Flush() {
+        for (uint32_t i = count; i > 0; --i) {
+            auto& page = pages[i - 1];
+            if (!page.dirty) continue;
+            const void* data = reinterpret_cast<void*>(PhysToVirt(page.phys).raw());
+            // Retry the identical image after a recovered device error. Never
+            // reload older pointers/counts midway through this append.
+            if (!Ext2WriteBlock(mnt, page.block, data) &&
+                !Ext2WriteBlock(mnt, page.block, data)) return false;
+            Ext2BlockCachePut(mnt, page.block, data);
+        }
+        return true;
+    }
+};
+
+static uint32_t Ext2AppendEnsureBlock(Ext2AppendBatch& batch, Ext2Inode* ino,
+                                      uint32_t fileBlock)
+{
+    uint32_t sectors = batch.mnt->blockSize / 512;
+    if (fileBlock < 12) {
+        if (!ino->i_block[fileBlock]) {
+            uint32_t block = batch.Allocate();
+            if (!block) return 0;
+            ino->i_block[fileBlock] = block;
+            ino->i_blocks += sectors;
+        }
+        return ino->i_block[fileBlock];
+    }
+    uint32_t pointers = batch.mnt->blockSize / 4;
+    fileBlock -= 12;
+    uint32_t slot = fileBlock < pointers ? 12 : 13;
+    if (slot == 13) fileBlock -= pointers;
+    if (slot == 13 && fileBlock >= pointers * pointers) return 0;
+    if (!ino->i_block[slot]) {
+        uint32_t block = batch.Allocate();
+        if (!block || !batch.Get(block, true)) return 0;
+        ino->i_block[slot] = block;
+        ino->i_blocks += sectors;
+    }
+    uint32_t indirect = ino->i_block[slot];
+    auto* entries = batch.Get(indirect);
+    if (!entries) return 0;
+    if (slot == 13) {
+        uint32_t index = fileBlock / pointers;
+        if (!entries[index]) {
+            uint32_t block = batch.Allocate();
+            if (!block || !batch.Get(block, true)) return 0;
+            entries[index] = block;
+            batch.Dirty(indirect);
+            ino->i_blocks += sectors;
+        }
+        indirect = entries[index];
+        entries = batch.Get(indirect);
+        if (!entries) return 0;
+        fileBlock %= pointers;
+    }
+    if (!entries[fileBlock]) {
+        uint32_t block = batch.Allocate();
+        if (!block) return 0;
+        entries[fileBlock] = block;
+        batch.Dirty(indirect);
+        ino->i_blocks += sectors;
+    }
+    return entries[fileBlock];
+}
+
+// Optimize only large, aligned EOF appends. Existing small writes and
+// overwrites keep their original path and allocation behavior. Scratch frames
+// are kernel-owned and never mapped to users; they do not perturb first-fit
+// heap placement during an extraction followed by a small-file workload.
+static int Ext2AppendInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
+                               const void* buf, uint64_t len, uint64_t offset)
+{
+    Ext2AppendBatch batch(mnt);
+    auto* src = static_cast<const uint8_t*>(buf);
+    uint64_t done = 0;
+    while (done < len) {
+        batch.Reset();
+        Ext2Inode staged = *ino;
+        uint64_t chunk = len - done;
+        if (chunk > 64 * 1024) chunk = 64 * 1024;
+        uint32_t blocks = static_cast<uint32_t>((chunk + mnt->blockSize - 1)
+                                               >> mnt->blockShift);
+        uint32_t diskBlocks[64];
+        uint32_t first = static_cast<uint32_t>((offset + done) >> mnt->blockShift);
+        for (uint32_t i = 0; i < blocks; ++i) {
+            diskBlocks[i] = Ext2AppendEnsureBlock(batch, &staged, first + i);
+            if (!diskBlocks[i]) return batch.Rollback() ? batch.error : -5;
+        }
+        uint32_t fullBlocks = static_cast<uint32_t>(chunk >> mnt->blockShift);
+        for (uint32_t i = 0; i < fullBlocks;) {
+            uint32_t run = 1;
+            while (i + run < fullBlocks && diskBlocks[i + run] == diskBlocks[i] + run)
+                ++run;
+            for (uint32_t b = 0; b < run; ++b)
+                Ext2BlockCacheInvalidate(mnt, diskBlocks[i + b]);
+            SpinLockAcquire(&mnt->indCacheLock);
+            for (uint32_t s = 0; s < Ext2Mount::IND_CACHE_SLOTS; ++s) {
+                uint32_t block = mnt->indCacheBlockNum[s];
+                if (block >= diskBlocks[i] && block < diskBlocks[i] + run)
+                    mnt->indCacheBlockNum[s] = 0;
+            }
+            SpinLockRelease(&mnt->indCacheLock);
+            if (!Ext2DevWrite(mnt, static_cast<uint64_t>(diskBlocks[i]) << mnt->blockShift,
+                              src + done + (static_cast<uint64_t>(i) << mnt->blockShift),
+                              static_cast<uint64_t>(run) << mnt->blockShift)) {
+                batch.Rollback();
+                return -5;
+            }
+            i += run;
+        }
+        uint32_t tail = static_cast<uint32_t>(chunk & (mnt->blockSize - 1));
+        if (tail) {
+            uint8_t* data = batch.Tail();
+            if (!data) return batch.Rollback() ? batch.error : -5;
+            // The append starts at a block boundary; bytes beyond its final
+            // EOF are not old file contents and must not expose disk residue.
+            memset(data, 0, mnt->blockSize);
+            memcpy(data, src + done + (static_cast<uint64_t>(fullBlocks) << mnt->blockShift), tail);
+            if (!Ext2WriteBlock(mnt, diskBlocks[fullBlocks], data)) {
+                batch.Rollback();
+                return -5;
+            }
+        }
+        // Data first, then leaf-before-parent pointers, then a single inode
+        // update for the whole logical chunk, even if physically fragmented.
+        // Once metadata I/O starts, never free the new blocks on an error:
+        // some pointers may already be persisted. This is not a journal;
+        // report EIO rather than claiming success or freeing referenced data.
+        if (!batch.Flush()) return -5;
+        staged.i_size = static_cast<uint32_t>(offset + done + chunk);
+        Ext2Touch(&staged);
+        if (!Ext2WriteInode(mnt, inoNum, &staged) &&
+            !Ext2WriteInode(mnt, inoNum, &staged)) return -5;
+        *ino = staged;
+        done += chunk;
+    }
+    return static_cast<int>(done);
+}
+
 // Write `len` bytes to inode data at `offset`. Returns bytes written.
 //
 // Performance: coalesces runs of contiguous full-block writes into a
@@ -949,6 +1164,15 @@ static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
 static int Ext2WriteInodeData(Ext2Mount* mnt, Ext2Inode* ino, uint32_t inoNum,
                               const void* buf, uint64_t len, uint64_t offset)
 {
+    uint64_t pointers = mnt->blockSize / 4;
+    uint64_t doubleLimit = (12 + pointers + pointers * pointers) * mnt->blockSize;
+    if ((ino->i_mode & EXT2_S_IFMT) == EXT2_S_IFREG &&
+        mnt->blockSize <= 4096 && len >= 64 * 1024 && len <= 0x7fffffffULL &&
+        offset == ino->i_size && (offset & (mnt->blockSize - 1)) == 0 &&
+        offset <= 0xffffffffULL && len <= 0xffffffffULL - offset &&
+        offset < doubleLimit && len <= doubleLimit - offset)
+        return Ext2AppendInodeData(mnt, ino, inoNum, buf, len, offset);
+
     auto* src = static_cast<const uint8_t*>(buf);
     uint64_t bytesWritten = 0;
 
@@ -2271,6 +2495,18 @@ static void Ext2FsUnmount(void* mountPriv)
     if (mnt->inodeBitmapDirty) kfree(mnt->inodeBitmapDirty);
     if (mnt->nextFreeBlockHint) kfree(mnt->nextFreeBlockHint);
     if (mnt->nextFreeInodeHint) kfree(mnt->nextFreeInodeHint);
+    if (mnt->blockCacheData) {
+        for (uint32_t slot = 0; slot < Ext2Mount::BLOCK_CACHE_SLOTS; ++slot) {
+            auto* data = mnt->blockCacheData[slot];
+            if (!data) continue;
+            if (mnt->blockSize <= 4096)
+                PmmFreePage(VirtToPhys(VirtualAddress(reinterpret_cast<uint64_t>(data))));
+            else kfree(data);
+        }
+        kfree(mnt->blockCacheData);
+    }
+    if (mnt->blockCacheBlockNum) kfree(mnt->blockCacheBlockNum);
+    for (auto* data : mnt->indCacheData) if (data) kfree(data);
     if (mnt->inodeCache) kfree(mnt->inodeCache);
     if (mnt->direntCache) kfree(mnt->direntCache);
     if (mnt->bgdt) kfree(mnt->bgdt);

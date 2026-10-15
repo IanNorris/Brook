@@ -9,4 +9,7 @@ mkdir -p build/io-bench
 "$MUSL_CC" -O2 -Wall -Wextra -static tools/io-bench/cachecheck.c -o build/io-bench/cachecheck
 mkdir -p build/package-cache
 "$MUSL_CC" -O2 -Wall -Wextra -static tools/at-syscall-probe/filelifecheck.c -o build/package-cache/filelifecheck
+for probe in waitmaskcheck childsignalcheck selectcheck; do
+    "$MUSL_CC" -O2 -Wall -Wextra -static "tools/at-syscall-probe/${probe}.c" -o "build/io-bench/${probe}"
+done
 python3 scripts/io_acceptance.py "$@"

@@ -696,6 +696,9 @@ static int SubmitScatterGatherRead(VirtioBlkState& s, uint64_t startSector,
     // and memcpy the relevant bytes afterward.
 
     uint64_t totalBytes  = static_cast<uint64_t>(sectorCount) * 512;
+    // The DMA chain writes entire sectors. A byte-granular head/tail must
+    // use the bounded bounce-copy path rather than overwrite caller memory.
+    if ((dstOffset & 511) || copyLen < totalBytes) return -1;
     uint8_t* readDst     = dst; // start of destination for this chunk
 
     // Determine page-granularity segments.
@@ -756,6 +759,10 @@ static int SubmitScatterGatherRead(VirtioBlkState& s, uint64_t startSector,
     {
         uint64_t pageVirt = reinterpret_cast<uint64_t>(midStart) + p * 4096;
         uint64_t pagePhys = VmmVirtToPhys(KernelPageTable, VirtualAddress(pageVirt)).raw();
+        // User buffers are mapped in their process table, not KernelPageTable.
+        // As in SG writes, reject an unmapped page before notifying the device.
+        // The caller's bounce path safely copies through the active user map.
+        if (!pagePhys) return -1;
 
         s.descTable[di].addr  = pagePhys;
         s.descTable[di].len   = 4096;

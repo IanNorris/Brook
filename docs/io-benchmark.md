@@ -20,7 +20,9 @@ Each worker writes an 8 MiB file in 64 KiB chunks, crossing both direct and
 single-indirect boundaries into double-indirect blocks. Every byte is checked
 against a worker- and block-specific pattern. Other cases patch mapping
 boundaries, append, rewrite an odd-sized 283,688-byte file, interleave fragmented
-files, and perform 64 small-file cycles per worker. The namespace workload
+files, verify a 65,537-byte tail, grow an unlinked open file through double-indirect
+blocks, and perform 64 small-file cycles per worker. Large unaligned reads
+check both contents and adjacent guard bytes. The namespace workload
 includes rename over an open victim and unlink while open. Its `operations`
 field counts file cycles, rather than individual syscalls.
 
@@ -109,3 +111,39 @@ covered blocks: an unaligned 64 KiB read spans 17 blocks and cannot use the
 16-slot batch pool. The first fixed-kernel run passed the concurrent probe,
 24 lifetime assertions, reboot persistence, offline fsck and allocation
 restoration in 25.37 seconds. Full bootstrap verification is a separate gate.
+
+## Refined storage candidate (2026-10-15)
+
+The refined append path stages indirect pointers and commits the inode once per
+64 KiB logical chunk. Small writes and overwrites keep their original path.
+Ext2 cache buffers now use owned physical pages for 1–4 KiB filesystem blocks,
+keeping thousands of permanent buffers out of the first-fit heap. This removes
+the small-file regression observed with append batching alone; unmount releases
+both data and indirect cache storage. Smaller filesystem blocks still reserve
+one 4 KiB page per occupied slot.
+
+The expanded eight-worker RAM gate passed with exact allocation restoration,
+reboot persistence, concurrent pread/mmap checks, 24 lifetime assertions and
+clean offline filesystems. Representative measurements from matching private
+builds (before the subsequent scheduler and signal-wait changes):
+
+| Phase | Cache-serialized baseline | Batched append + page-backed cache |
+| --- | ---: | ---: |
+| 64 MiB sequential write | 1.411 s / 45 MiB/s | 0.181 s / 354 MiB/s |
+| 64 MiB sequential read | 1.105 s / 58 MiB/s | 0.132 s / 484 MiB/s |
+| Boundaries, fragmented writes and open-orphan growth | 1.871 s | 0.612 s |
+| 512 small-file cycles | 0.696 s | 0.579 s |
+
+The optimized complete run took 20.12 seconds including two boots. Separate
+1 KiB and 2 KiB filesystem gates passed after fixing the scatter-gather read
+fallback: unmapped destination pages must never become DMA address zero, and
+byte-granular requests must not DMA beyond their requested buffer. The new
+unaligned-read sentinel test covers the latter boundary. These runs recorded
+system-wide swap activity; RAM backing does not establish zero SSD writes.
+Evidence is under ignored `build/io-bench/append-cache-pages*`.
+
+`--block-size 1024|2048|4096` selects the ext2 fixture block size.
+`--profile-small` captures small-file CPU/context-switch activity; its phase
+timings are instrumented. `--wait-mask-probe` adds temporary-mask, child-signal
+and select-readiness regression probes after the filesystem workload. These
+optional probes support bootstrap diagnosis; the normal fast gate stays small.

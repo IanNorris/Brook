@@ -39,14 +39,18 @@ def check(directory, output, tag):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--output', type=Path, required=True)
+    ap.add_argument('--block-size', type=int, choices=[1024,2048,4096], default=4096)
     ap.add_argument('--backend', choices=['ram', 'disk'], default='ram')
     ap.add_argument('--artifacts', type=Path, default=ROOT / 'build/release')
+    ap.add_argument('--memory', choices=['2G','4G','8G'], default='2G')
     ap.add_argument('--cpus', type=int, default=8)
     ap.add_argument('--workers', type=int, default=8)
     ap.add_argument('--mib', type=int, default=8)
     ap.add_argument('--files', type=int, default=64)
     ap.add_argument('--instance', type=int, help='VNC display number; default chooses a free local port')
     ap.add_argument('--cache-probe', action='store_true', help='also run eight-process random pread/mmap integrity checks')
+    ap.add_argument('--wait-mask-probe', action='store_true', help='also run temporary-mask, child-signal and select regression probes')
+    ap.add_argument('--profile-small', action='store_true', help='capture CPU/context switches during small-files; timings are instrumented')
     ap.add_argument('--lifetime-probe', action='store_true', help='also run the 24 inode-lifetime regression checks')
     ap.add_argument('--deadline', type=int, default=180, help='seconds allowed per guest workload')
     args = ap.parse_args()
@@ -74,8 +78,8 @@ def main():
     parent = Path('/dev/shm') if args.backend == 'ram' else output
     if args.backend == 'ram' and (shutil.disk_usage(parent).free < 3*1024**3):
         raise RuntimeError('RAM filesystem needs at least 3 GiB free')
-    if args.backend == 'ram' and host_memory()['available_bytes'] < 4*1024**3:
-        raise RuntimeError('RAM-backed test needs at least 4 GiB available host memory')
+    if args.backend == 'ram' and host_memory()['available_bytes'] < (int(args.memory[:-1])+2)*1024**3:
+        raise RuntimeError('RAM-backed test needs guest capacity plus 2 GiB available host memory')
     directory = Path(tempfile.mkdtemp(prefix='brook-io-', dir=parent))
     process = session = serial = None
     success = False
@@ -91,10 +95,10 @@ def main():
             (seed / 'BROOK.MNT').write_text('/'+name)
             image = directory / f'{name}.img'
             with image.open('wb') as f: f.truncate(size*1024*1024)
-            base.command(['mkfs.ext2', '-q', '-F', '-b', '4096', '-d', str(seed), str(image)], output / f'format-{name}.log')
+            base.command(['mkfs.ext2', '-q', '-F', '-b', str(args.block_size), '-d', str(seed), str(image)], output / f'format-{name}.log')
         baseline = check(directory, output, 'initial')
         artifacts = directory / 'artifacts'
-        for subpath in ('kernel/BROOK.elf', 'bootloader/BOOTX64.efi', *[str(p.relative_to(args.artifacts)) for p in (args.artifacts/'kernel/drivers').glob('*.mod')]):
+        for subpath in ('kernel/BROOK.elf', 'kernel/ksym_addr_table.cpp', 'bootloader/BOOTX64.efi', *[str(p.relative_to(args.artifacts)) for p in (args.artifacts/'kernel/drivers').glob('*.mod')]):
             target = artifacts / subpath
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(args.artifacts/subpath, target)
@@ -106,21 +110,34 @@ def main():
             base.command(['mcopy', '-o', '-i', str(directory/'boot.img'), str(ROOT/'build/io-bench/cachecheck'), '::BIN/CACHECHK'])
         if args.lifetime_probe:
             base.command(['mcopy', '-o', '-i', str(directory/'boot.img'), str(ROOT/'build/package-cache/filelifecheck'), '::BIN/FILELIFE'])
+        if args.wait_mask_probe:
+            for source, target in [('waitmaskcheck','WAITMASK'),('childsignalcheck','CHLDSIG'),('selectcheck','SELECTCHK')]:
+                base.command(['mcopy', '-o', '-i', str(directory/'boot.img'), str(ROOT/'build/io-bench'/source), '::BIN/'+target])
         for mode in ('run', 'cleanup'):
-            process, session, data, boot_seconds = base.launch(directory, args.instance, artifacts, cpus=args.cpus, memory='2G')
+            process, session, data, boot_seconds = base.launch(directory, args.instance, artifacts, cpus=args.cpus, memory=args.memory)
             serial = Path(data['serial_log'])
             offset = serial.stat().st_size
             reply = base.server.guest_run(session, f'run /boot/BIN/IOBENCH /data/io-test {mode} {args.workers} {args.mib} {args.files}')
             base.write(output/f'{mode}-launch.json', reply)
+            small_profile_started = False
             expires = time.monotonic() + args.deadline
             while time.monotonic() < expires:
                 content = serial.read_bytes()[offset:].decode(errors='replace')
                 if 'IOBENCH FAIL' in content or re.search(r'PANIC|KERNEL FAULT|virtio-blk.*(?:timeout|reset)', content, re.I):
                     raise RuntimeError(f'{mode}: guest I/O failure; see serial log')
+                if args.profile_small and mode == 'run' and not small_profile_started and 'IOBENCH_BEGIN small-files' in content:
+                    report['small_profile_start'] = base.server.profile(session, 'start', duration_ms=3000)
+                    small_profile_started = True
                 if f'IOBENCH_PASS mode={mode}' in content: break
                 if process.poll() is not None: raise RuntimeError('VM exited during test')
                 time.sleep(.2)
             else: raise TimeoutError(f'{mode}: benchmark exceeded {args.deadline}s')
+            if small_profile_started:
+                profile_deadline = time.monotonic()+15
+                while 'RUNNING' in base.server.profile(session, 'status').get('reply', ''):
+                    if time.monotonic()>profile_deadline: raise TimeoutError('Small-file profile did not finish')
+                    time.sleep(.2)
+                report['small_profile'] = base.server.profile(session, 'export')
             if args.cache_probe and mode == 'run':
                 base.server.guest_run(session, f'run /boot/BIN/CACHECHK /data/io-test {args.workers} {args.mib}')
                 expires = time.monotonic()+args.deadline
@@ -140,6 +157,20 @@ def main():
                     if 'FILELIFECHECK PASS failures=0' in extra: break
                     time.sleep(.2)
                 else: raise TimeoutError('Inode lifetime probe deadline')
+            if args.wait_mask_probe and mode == 'cleanup':
+                for binary, marker in [('WAITMASK','WAITMASKCHECK'),('CHLDSIG','CHILDSIGNALCHECK'),('SELECTCHK','SELECTCHECK')]:
+                    probe_offset = serial.stat().st_size
+                    base.server.guest_run(session, 'run /boot/BIN/'+binary+(' 10.0.2.15' if binary == 'SELECTCHK' else ''))
+                    expires = time.monotonic()+args.deadline
+                    while time.monotonic()<expires:
+                        extra = serial.read_bytes()[probe_offset:].decode(errors='replace')
+                        if marker+' FAIL' in extra or re.search(r'KERNEL PANIC|KERNEL FAULT',extra):
+                            raise RuntimeError(marker+' guest regression')
+                        if marker+' PASS failures=0' in extra: break
+                        if process.poll() is not None: raise RuntimeError('VM exited during '+marker)
+                        time.sleep(.2)
+                    else: raise TimeoutError(marker+' deadline')
+                    report.setdefault('guest_probes', []).append(marker)
             # Program synchronizes before PASS. Stop waits for another guest sync.
             stop = base.server.control(session, 'stop')
             base.write(output/f'{mode}-stop.json', stop)
