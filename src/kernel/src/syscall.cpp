@@ -105,14 +105,25 @@ static bool UserBufferWritable(uint64_t addr, uint64_t len)
         if (pte && (*pte & (brook::VMM_PRESENT | brook::VMM_USER | brook::PTE_COW_BIT)) ==
                    (brook::VMM_PRESENT | brook::VMM_USER | brook::PTE_COW_BIT)) {
             uint32_t owner = brook::ProcessAddressSpacePid(proc);
+            // Keep displaced-frame ownership on this CPU through shootdown.
+            // There is no blocking I/O here; the CoW PTE update and shootdown
+            // already run with interrupts disabled. Restore the caller's IF
+            // without leaving a kernel-operation latch in a generic validator.
+            uint64_t cowFlags;
+            __asm__ volatile("pushfq; pop %0; cli" : "=r"(cowFlags) :: "memory");
             auto result = brook::VmmCowResolveWrite(proc->pageTable,
                                                    brook::VirtualAddress(pg), owner);
-            if (result == brook::VmmCowResult::OutOfMemory) return false;
-            if (result == brook::VmmCowResult::Resolved) {
+            if (result.result == brook::VmmCowResult::OutOfMemory) {
+                if (cowFlags & 0x200) __asm__ volatile("sti" ::: "memory");
+                return false;
+            }
+            if (result.result == brook::VmmCowResult::Resolved) {
                 __asm__ volatile("invlpg (%0)" :: "r"(pg) : "memory");
                 brook::TlbShootdown(proc->pageTable.pml4.raw(), pg,
                                    *brook::AddressSpaceTlbMaskPtr(proc));
+                if (result.retired) brook::PmmUnrefPage(result.retired);
             }
+            if (cowFlags & 0x200) __asm__ volatile("sti" ::: "memory");
             pte = brook::VmmGetPte(proc->pageTable, brook::VirtualAddress(pg));
         }
         if (!pte) return false;
@@ -921,10 +932,10 @@ extern "C" bool MemFdHandleUserFault(uint64_t cr2, uint64_t errCode)
         // every memfd VMA before destroying the page table, which clears
         // these PTEs and prevents the unref-on-destroy walk from touching
         // mfd-owned pages.
-        if (!VmmMapPage(proc->pageTable, VirtualAddress(pageVA), phys,
+        if (VmmTryMapPage(proc->pageTable, VirtualAddress(pageVA), phys,
                         VMM_PRESENT | m.vmmFlags,
-                        MemTag::User, ProcessAddressSpacePid(proc))) {
-            return false;
+                        MemTag::User, ProcessAddressSpacePid(proc)) != VmmMapResult::Mapped) {
+            return static_cast<bool>(VmmVirtToPhys(proc->pageTable, VirtualAddress(pageVA)));
         }
         return true;
     }
@@ -1152,8 +1163,8 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
         PhysicalAddress cached = PageCacheLookup(vn, filePageIdx);
         if (cached) {
             __atomic_fetch_add(&g_profCacheHit, 1, __ATOMIC_RELAXED);
-            if (!VmmMapPage(proc->pageTable, VirtualAddress(pageVA), cached,
-                            VMM_PRESENT | m.vmmFlags, MemTag::User, ProcessAddressSpacePid(proc))) {
+            if (VmmTryMapPage(proc->pageTable, VirtualAddress(pageVA), cached,
+                            VMM_PRESENT | m.vmmFlags, MemTag::User, ProcessAddressSpacePid(proc)) != VmmMapResult::Mapped) {
                 PmmUnrefPage(cached);
                 if (VmmVirtToPhys(proc->pageTable, VirtualAddress(pageVA)))
                     return true;
@@ -1174,8 +1185,8 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
                 PhysicalAddress adjPhys = PageCacheLookup(vn, adjFileIdx);
                 if (!adjPhys) continue;
                 __atomic_fetch_add(&g_profCacheHit, 1, __ATOMIC_RELAXED);
-                if (!VmmMapPage(proc->pageTable, VirtualAddress(adjVA), adjPhys,
-                                VMM_PRESENT | m.vmmFlags, MemTag::User, ProcessAddressSpacePid(proc))) {
+                if (VmmTryMapPage(proc->pageTable, VirtualAddress(adjVA), adjPhys,
+                                VMM_PRESENT | m.vmmFlags, MemTag::User, ProcessAddressSpacePid(proc)) != VmmMapResult::Mapped) {
                     PmmUnrefPage(adjPhys);
                 }
             }
@@ -1211,8 +1222,8 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
         PmmRefPage(phys);
         PageCacheInsert(vn, filePageIdx, phys);
 
-        if (!VmmMapPage(proc->pageTable, VirtualAddress(pageVA), phys,
-                        VMM_PRESENT | m.vmmFlags, MemTag::User, ProcessAddressSpacePid(proc))) {
+        if (VmmTryMapPage(proc->pageTable, VirtualAddress(pageVA), phys,
+                        VMM_PRESENT | m.vmmFlags, MemTag::User, ProcessAddressSpacePid(proc)) != VmmMapResult::Mapped) {
             if (VmmVirtToPhys(proc->pageTable, VirtualAddress(pageVA))) {
                 PmmUnrefPage(phys);
                 return true;

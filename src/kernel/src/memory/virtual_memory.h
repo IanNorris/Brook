@@ -39,7 +39,12 @@ static constexpr uint64_t VMALLOC_BASE  = 0xFFFFC00000000000ULL;
 static constexpr uint64_t VMALLOC_SIZE  = 32ULL * 1024 * 1024 * 1024; // 32GB
 
 // Direct physical map: all physical RAM mapped here by the bootloader (2MB pages).
+#ifdef BROOK_HOST_TEST
+// Hosted VMM tests use aligned host allocations as physical frames.
+static constexpr uint64_t DIRECT_MAP_BASE = 0;
+#else
 static constexpr uint64_t DIRECT_MAP_BASE = 0xFFFF800000000000ULL;
+#endif
 
 // Convert between physical and direct-map virtual addresses.
 inline VirtualAddress  PhysToVirt(PhysicalAddress phys) { return VirtualAddress(DIRECT_MAP_BASE + phys.raw()); }
@@ -71,6 +76,23 @@ void VmmInit();
 bool VmmMapPage(PageTable pt, VirtualAddress virtAddr, PhysicalAddress physAddr,
                 uint64_t flags,
                 MemTag tag = MemTag::KernelData, uint16_t pid = KernelPid);
+
+// Publish only into an absent 4KB leaf, under the page-table lock. On Mapped,
+// the caller transfers its existing frame reference to the PTE. On every other
+// outcome it retains that reference. Present large leaves count as Occupied.
+// Borrowed device frames remain borrowed; no physical refcount is acquired.
+enum class VmmMapResult { Mapped, Occupied, OutOfMemory, InvalidAddress };
+VmmMapResult VmmTryMapPage(PageTable pt, VirtualAddress virtAddr,
+                           PhysicalAddress physAddr, uint64_t flags,
+                           MemTag tag = MemTag::KernelData, uint16_t pid = KernelPid);
+
+// Atomically detach a present 4KB leaf and return its complete PTE. Its frame
+// reference (if managed by the caller) transfers to the caller WITHOUT unref.
+// Keep it until remote TLB acknowledgement, then retire it according to the
+// mapping's ownership: ordinary managed frames are unref'd, borrowed device or
+// memfd frames are not. Zero means no present 4KB leaf (large leaves untouched).
+uint64_t VmmDetachPage(PageTable pt, VirtualAddress virtAddr);
+PhysicalAddress VmmLeafPhysical(uint64_t leaf);
 
 // Unmap a single 4KB page. Issues INVLPG. No-op if not mapped.
 void VmmUnmapPage(PageTable pt, VirtualAddress virtAddr);
@@ -111,7 +133,13 @@ enum class VmmCowResult {
 // TLB shootdown — the caller must do that AFTER this returns, because the
 // shootdown busy-waits for remote IPI ACKs and g_userPtLock is held with
 // interrupts disabled (holding it across the wait would deadlock).
-VmmCowResult VmmCowResolveWrite(PageTable pt, VirtualAddress faultAddr, uint16_t pid);
+struct VmmCowResolution {
+    VmmCowResult result;
+    // Owns the displaced PTE's old reference. Only nonzero for a copied page;
+    // the caller MUST unref after its remote TLB shootdown, never before.
+    PhysicalAddress retired;
+};
+VmmCowResolution VmmCowResolveWrite(PageTable pt, VirtualAddress faultAddr, uint16_t pid);
 
 // Commit fork's COW-share of a single leaf page atomically against the COW
 // write-fault handler: downgrade the parent PTE to read-only+COW, install the

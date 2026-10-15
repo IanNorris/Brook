@@ -129,3 +129,16 @@ target_compile_options(test_ext2 PRIVATE -Wall -Wextra -Werror -O2)
 add_test(NAME test_ext2
     COMMAND test_ext2 "${BROOK_ROOT}/brook_ext2_disk.img"
 )
+
+# Actual page-table walks and ownership transitions with aligned host frames.
+# Hardware invalidation/interrupt instructions and PMM are the only shims.
+add_host_test(test_vmm_leaf
+    "${BROOK_ROOT}/src/kernel/src/memory/virtual_memory.cpp"
+)
+target_compile_options(test_vmm_leaf PRIVATE
+    -DBROOK_HOST_TEST -ffunction-sections -fdata-sections
+    "-iquote${BROOK_ROOT}/src/kernel/src"
+    "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km"
+)
+target_link_options(test_vmm_leaf PRIVATE -Wl,--gc-sections)

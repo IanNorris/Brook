@@ -367,6 +367,42 @@ via an environment-variable experiment did not resolve blank content; whether
 that build honored the variable was not established. Browser evidence is kept
 under `build/workloads/firefox-waitid-browser-20261015/`.
 
+## Page-table ownership prerequisite for shared files (15 October 2026)
+
+Fault publication now uses a non-overwriting leaf operation. Two concurrent
+faults cannot both install their candidate frames at the same virtual address;
+the loser releases its candidate reference. Both regular-file and memfd faults,
+including speculative file-cache installs, use this operation. A separate
+atomic detach operation returns the displaced PTE without releasing its frame.
+Present 1 GiB and 2 MiB leaves remain untouched by these 4 KiB operations.
+
+CoW replacement now transfers the old PTE reference to its caller rather than
+releasing it before the remote TLB acknowledgement. Both user faults and
+syscall output-buffer validation retain it through shootdown, then release it.
+The validator preserves interrupt state through that short ownership window.
+
+`test_vmm_leaf` compiles the actual VMM implementation with host physical frames
+and interrupt/invalidation shims. It checks 64 competing install/detach rounds,
+32 concurrent CoW rounds, allocation failure, in-place CoW, large-leaf rejection,
+borrowed device-frame ownership and same-address replacement while the old
+retirement is delayed. Its acknowledgement barrier proves software reference
+ownership, not hardware IPI behavior. All 14 host tests pass. The bootstrap
+harness now requires all 14 tests and artifacts; the previous 13-test bootstrap
+results above remain evidence for their pinned revisions.
+
+The reviewed guest kernel SHA-256 is
+`2f5b403db4f8a92cae87ca1a1f002ddadb4eb96fefd1d16ac7a6d94a5cdd140b`.
+Guest compatibility checks, cache/CoW stress, FAT/ext2 exit/resize stress,
+three wait probes (including two expanded runs), heap integrity, checked stop
+and all three read-only filesystem checks pass. Evidence is retained under
+ignored `build/workloads/mapping-leaf-reviewed-20261015/`.
+
+This is the leaf-ownership layer of the mapping plan. Address-space mutation
+serialization and generation validation across blocking fault I/O remain open,
+as do coherent shared pages, buffered I/O visibility, dirty writeback/msync and
+resize invalidation. Regular-file writable `MAP_SHARED` still returns
+`EOPNOTSUPP`; neither Codium nor Firefox is accepted as a usable workload.
+
 ## File resizing prerequisite
 
 The subsequent FAT/ext2 resize implementation replaces those success-only

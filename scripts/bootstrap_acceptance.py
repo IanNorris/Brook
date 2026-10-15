@@ -23,6 +23,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools/vm_bridge"))
 import server
 
+NATIVE_TEST_COUNT = 14
+NATIVE_PASS_MARKER = f"100% tests passed, 0 tests failed out of {NATIVE_TEST_COUNT}"
+
 
 def sha(path):
     with path.open("rb") as f:
@@ -228,7 +231,7 @@ echo "BOOTSTRAP_END install $((SECONDS-started))"
 
 def validate_finished_build(text):
     plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
-    if plain.count("100% tests passed, 0 tests failed out of 13") != 2 or "BOOTSTRAP_ARTIFACTS_OK" not in plain:
+    if plain.count(NATIVE_PASS_MARKER) != 2 or "BOOTSTRAP_ARTIFACTS_OK" not in plain:
         raise RuntimeError("Guest success missing required test/artifact evidence")
 
 
@@ -449,7 +452,7 @@ def finalize_acceptance(directory, args, metadata, process, session, data, stage
     modules = sorted((artifacts / "kernel/drivers").glob("*.mod"))
     baremetal = sorted((artifacts / "tests").glob("*.elf"))
     native = sorted(p for p in (artifacts / "host_tests").glob("test_*") if p.is_file() and os.access(p, os.X_OK))
-    if len(modules) != 12 or len(baremetal) != 7 or len(native) != 13 or any(not p.is_file() or not p.stat().st_size for p in required + modules + baremetal):
+    if len(modules) != 12 or len(baremetal) != 7 or len(native) != NATIVE_TEST_COUNT or any(not p.is_file() or not p.stat().st_size for p in required + modules + baremetal):
         raise RuntimeError(f"Missing artifacts: modules={len(modules)} baremetal={len(baremetal)} native={len(native)}")
     hashes = {str(p.relative_to(artifacts)): sha(p) for p in required + modules + baremetal + native}
     write(directory / "artifact-hashes.json", hashes)
@@ -491,7 +494,7 @@ sync
         text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", verify_log.read_text(errors="replace"))
         exit_marker = re.search(r"^BOOTSTRAP_VERIFY_EXIT (\d+)", text, re.M)
         if exit_marker:
-            if exit_marker[1] != "0" or "100% tests passed, 0 tests failed out of 13" not in text:
+            if exit_marker[1] != "0" or NATIVE_PASS_MARKER not in text:
                 raise RuntimeError("Tests under guest-built kernel failed")
             break
         if server.panic_state(verify_data):
@@ -527,7 +530,7 @@ sync
             (image_dir / "tmp-host").mkdir()
         shutil.rmtree(ram)
     write(directory / "result.json", metadata)
-    print(f"PASS: {args.mode} bootstrap, repeated 13/13 tests, guest-built boot and offline fsck", flush=True)
+    print(f"PASS: {args.mode} bootstrap, repeated {NATIVE_TEST_COUNT}/{NATIVE_TEST_COUNT} tests, guest-built boot and offline fsck", flush=True)
 
 
 if __name__ == "__main__":

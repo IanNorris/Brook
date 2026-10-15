@@ -73,13 +73,21 @@ static VmmAllocation* FindFreeSlot()
 static inline uint64_t ReadCR3()
 {
     uint64_t cr3;
+#ifdef BROOK_HOST_TEST
+    cr3 = 0;
+#else
     __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+#endif
     return cr3;
 }
 
 static inline void Invlpg(VirtualAddress virtAddr)
 {
+#ifdef BROOK_HOST_TEST
+    (void)virtAddr;
+#else
     __asm__ volatile("invlpg (%0)" : : "r"(virtAddr.raw()) : "memory");
+#endif
 }
 
 static inline void ZeroPage(PhysicalAddress physAddr)
@@ -146,7 +154,7 @@ static inline PhysicalAddress ResolvePml4(PageTable pt)
 }
 
 static uint64_t* WalkToPtr(PageTable pageTable, VirtualAddress virtAddr,
-                            bool create, uint64_t flags = 0)
+                            bool create, uint64_t flags = 0, bool* occupiedLarge = nullptr)
 {
     uint64_t* pml4 = reinterpret_cast<uint64_t*>(PhysToVirt(ResolvePml4(pageTable)).raw());
     uint64_t va = virtAddr.raw();
@@ -157,6 +165,13 @@ static uint64_t* WalkToPtr(PageTable pageTable, VirtualAddress virtAddr,
             ? reinterpret_cast<uint64_t*>(PhysToVirt(PhysicalAddress(pml4[Pml4Index(va)] & PHYS_MASK)).raw())
             : nullptr;
     if (!pdpt) return nullptr;
+    // A present 1GB leaf is data, never a pointer to a page directory. This
+    // walker does not split 1GB leaves; try-install reports the occupied range.
+    if ((pdpt[PdptIndex(va)] & (VMM_PRESENT | (1ULL << 7))) ==
+        (VMM_PRESENT | (1ULL << 7))) {
+        if (occupiedLarge) *occupiedLarge = true;
+        return nullptr;
+    }
 
     uint64_t* pd = create
         ? GetOrAllocEntry(pdpt, PdptIndex(va), flags)
@@ -169,6 +184,7 @@ static uint64_t* WalkToPtr(PageTable pageTable, VirtualAddress virtAddr,
     // so we can map individual pages within this range.
     if (pd[PdIndex(va)] & (1ULL << 7))
     {
+        if (occupiedLarge) { *occupiedLarge = true; return nullptr; }
         if (!create) return nullptr;
 
         uint64_t oldEntry = pd[PdIndex(va)];
@@ -304,23 +320,54 @@ bool VmmMapPage(PageTable pt, VirtualAddress virtAddr, PhysicalAddress physAddr,
     return true;
 }
 
-void VmmUnmapPage(PageTable pt, VirtualAddress virtAddr)
+VmmMapResult VmmTryMapPage(PageTable pt, VirtualAddress virtAddr,
+                           PhysicalAddress physAddr, uint64_t flags,
+                           MemTag tag, uint16_t pid)
 {
-    bool isKernel = !pt;
-    IrqSpinLock& ptLock = isKernel ? g_kernelPtLock : g_userPtLock;
-    uint64_t ptFlags = IrqSpinLockAcquire(&ptLock);
+    if (!(flags & VMM_FORCE_MAP) && virtAddr.raw() < VIRTUAL_NULL_GUARD)
+        return VmmMapResult::InvalidAddress;
+    flags &= ~VMM_FORCE_MAP;
+    IrqSpinLock& lock = !pt ? g_kernelPtLock : g_userPtLock;
+    uint64_t saved = IrqSpinLockAcquire(&lock);
+    bool large = false;
+    uint64_t* pte = WalkToPtr(pt, virtAddr, true, flags, &large);
+    VmmMapResult result;
+    if (!pte) result = large ? VmmMapResult::Occupied : VmmMapResult::OutOfMemory;
+    else if (*pte & VMM_PRESENT) result = VmmMapResult::Occupied;
+    else {
+        *pte = (physAddr.raw() & PHYS_MASK) | VMM_PRESENT
+             | (flags & ~(VMM_PRESENT | PTE_TAG_MASK | PTE_COW_BIT | PTE_PID_MASK | VMM_NO_EXEC))
+             | (((uint64_t)(uint8_t)tag & 0x7) << PTE_TAG_SHIFT)
+             | (((uint64_t)pid & 0x3FF) << PTE_PID_SHIFT)
+             | (flags & VMM_NO_EXEC);
+        if (flags & VMM_USER) PmmMapInc(physAddr);
+        Invlpg(virtAddr);
+        result = VmmMapResult::Mapped;
+    }
+    IrqSpinLockRelease(&lock, saved);
+    return result;
+}
 
-    uint64_t* pte = WalkToPtr(pt, virtAddr, /*create=*/false);
-    if (pte && (*pte & VMM_PRESENT))
-    {
-        // BRO-176 map accounting: a present USER PTE is going away.
-        if (*pte & VMM_USER)
-            PmmMapDec(PhysicalAddress(*pte & PHYS_MASK));
+PhysicalAddress VmmLeafPhysical(uint64_t leaf) { return PhysicalAddress(leaf & PHYS_MASK); }
+
+uint64_t VmmDetachPage(PageTable pt, VirtualAddress virtAddr)
+{
+    IrqSpinLock& lock = !pt ? g_kernelPtLock : g_userPtLock;
+    uint64_t saved = IrqSpinLockAcquire(&lock);
+    uint64_t* pte = WalkToPtr(pt, virtAddr, false);
+    uint64_t old = pte && (*pte & VMM_PRESENT) ? *pte : 0;
+    if (old) {
+        if (old & VMM_USER) PmmMapDec(VmmLeafPhysical(old));
         *pte = 0;
         Invlpg(virtAddr);
     }
+    IrqSpinLockRelease(&lock, saved);
+    return old;
+}
 
-    IrqSpinLockRelease(&ptLock, ptFlags);
+void VmmUnmapPage(PageTable pt, VirtualAddress virtAddr)
+{
+    (void)VmmDetachPage(pt, virtAddr);
 }
 
 VirtualAddress VmmAllocPages(uint64_t pageCount, uint64_t flags, MemTag tag, uint16_t pid)
@@ -609,8 +656,9 @@ uint16_t VmmGetPagePid(PageTable pt, VirtualAddress virtAddr)
 // BRO-176 diag: dump a physical page's ref/unref history ring (physical_memory.cpp).
 extern "C" int PmmDumpFreeLog(uint64_t phys);
 
-VmmCowResult VmmCowResolveWrite(PageTable pt, VirtualAddress faultAddr, uint16_t pid)
+VmmCowResolution VmmCowResolveWrite(PageTable pt, VirtualAddress faultAddr, uint16_t pid)
 {
+    PhysicalAddress retired;
     VirtualAddress pageAddr(faultAddr.raw() & ~(PAGE_SIZE - 1));
 
     // Hold g_userPtLock across the whole refcount-check + PTE update so this is
@@ -628,7 +676,7 @@ VmmCowResult VmmCowResolveWrite(PageTable pt, VirtualAddress faultAddr, uint16_t
     if (!pte || !(*pte & VMM_PRESENT) || !(*pte & PTE_COW_BIT))
     {
         IrqSpinLockRelease(&g_userPtLock, ptFlags);
-        return VmmCowResult::NotCow;
+        return {VmmCowResult::NotCow, {}};
     }
 
     PhysicalAddress oldPhys(*pte & PHYS_MASK);
@@ -659,7 +707,7 @@ VmmCowResult VmmCowResolveWrite(PageTable pt, VirtualAddress faultAddr, uint16_t
         if (!newPhys)
         {
             IrqSpinLockRelease(&g_userPtLock, ptFlags);
-            return VmmCowResult::OutOfMemory;
+            return {VmmCowResult::OutOfMemory, {}};
         }
 
         // BRO-179: pin the source frame across the copy. We hold g_userPtLock,
@@ -713,7 +761,7 @@ VmmCowResult VmmCowResolveWrite(PageTable pt, VirtualAddress faultAddr, uint16_t
         // we just repointed). Separate from the copy pin above. (When oldRc==0
         // there is no reference of ours to drop.)
         if (oldRc != 0)
-            PmmUnrefPage(oldPhys);
+            retired = oldPhys; // Transfer the PTE reference through shootdown.
     }
     else
     {
@@ -722,7 +770,7 @@ VmmCowResult VmmCowResolveWrite(PageTable pt, VirtualAddress faultAddr, uint16_t
     }
 
     IrqSpinLockRelease(&g_userPtLock, ptFlags);
-    return VmmCowResult::Resolved;
+    return {VmmCowResult::Resolved, retired};
 }
 
 void VmmForkCommitCowShare(uint64_t* parentLeaf, uint64_t* childLeaf,
