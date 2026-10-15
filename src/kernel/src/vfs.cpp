@@ -553,13 +553,32 @@ Vnode* VfsOpen(const char* path, int flags)
 
 Vnode* VfsOpenMode(const char* path, int flags, uint16_t mode)
 {
-    FileMutationGuard mutation((flags & VFS_O_TRUNC) != 0);
+    return VfsOpenModeChecked(path, flags, mode, nullptr);
+}
+
+Vnode* VfsOpenModeChecked(const char* path, int flags, uint16_t mode, int* error)
+{
+    if (error) *error = 0;
+    FileMutationGuard mutation((flags & (VFS_O_TRUNC | VFS_O_CREATE)) != 0);
     if (!path || !path[0]) return nullptr;
 
+    // Check the entry itself before following the final symlink: O_EXCL also
+    // rejects dangling symlinks. The namespace mutation gate spans check/create
+    // and is shared by regular creation, mkdir, symlink, rename and unlink.
     char resolved[512];
     const char* lookup = path;
-    if (VfsResolveSymlinks(path, resolved, sizeof(resolved), true))
+    const bool exclusive = (flags & (VFS_O_CREATE | VFS_O_EXCL)) ==
+                            (VFS_O_CREATE | VFS_O_EXCL);
+    if (exclusive) {
+        if (VfsResolveSymlinks(path, resolved, sizeof(resolved), false)) lookup = resolved;
+        VnodeStat stat{};
+        if (VfsLstatPathRaw(lookup, &stat) == 0) {
+            if (error) *error = -17;
+            return nullptr;
+        }
+    } else if (VfsResolveSymlinks(path, resolved, sizeof(resolved), true)) {
         lookup = resolved;
+    }
 
     const char* relPath = nullptr;
     MountEntry* mount   = FindMount(lookup, &relPath);
@@ -571,14 +590,19 @@ Vnode* VfsOpenMode(const char* path, int flags, uint16_t mode)
 
     if (!mount->fsOps) return nullptr;
     // O_TRUNC must use the same resize gate and alias invalidation as truncate.
-    int openFlags = flags & ~VFS_O_TRUNC;
+    int openFlags = flags & ~(VFS_O_TRUNC | VFS_O_EXCL);
     Vnode* vn = nullptr;
     if (mount->fsOps->open_mode)
         vn = mount->fsOps->open_mode(mount->mountPriv, mount->pdrv, relPath, openFlags, mode);
     else if (mount->fsOps->open)
         vn = mount->fsOps->open(mount->mountPriv, mount->pdrv, relPath, openFlags);
-    if (vn && (flags & VFS_O_TRUNC) && VfsTruncateLocked(vn, 0)) {
-        VfsClose(vn); return nullptr;
+    if (vn && (flags & VFS_O_TRUNC)) {
+        int result = VfsTruncateLocked(vn, 0);
+        if (result) {
+            if (error) *error = result;
+            VfsClose(vn);
+            return nullptr;
+        }
     }
     return vn;
 }
@@ -875,6 +899,7 @@ int VfsRemovePath(const char* path, bool directory)
 
 int VfsMkdir(const char* path)
 {
+    FileMutationGuard mutation;
     if (!path || !path[0]) return -1;
     const char* relPath = nullptr;
     MountEntry* mount = FindMount(path, &relPath);
@@ -899,6 +924,7 @@ int VfsRename(const char* oldPath, const char* newPath)
 
 int VfsSymlink(const char* target, const char* linkPath)
 {
+    FileMutationGuard mutation;
     if (!target || !linkPath || !target[0] || !linkPath[0]) return -22; // -EINVAL
     const char* relPath = nullptr;
     MountEntry* mount = FindMount(linkPath, &relPath);

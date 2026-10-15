@@ -694,3 +694,15 @@ acceptance: the corrected kernel booted a clone of the prepared verification
 disks, compiled its expanded VMM test inside Brook, and passed all 14 tests,
 CoW/wait stress, heap and filesystem checks. See [workload evidence](workloads.md#page-table-ownership-prerequisite-for-shared-files-15-october-2026).
 The full two-path results above remain tied to `bf9f82a`.
+
+
+### Source archive overwrite correction
+
+The ordinary-file exclusive-create fix documented in `docs/workloads.md`
+corrects a fresh-build hazard when overlaying source archives. GNU tar first
+tries O_CREAT|O_EXCL and relies on EEXIST to select overwrite behavior. Brook
+previously let that open succeed on an existing file, retaining stale trailing
+source text when the replacement was shorter. Default GNU tar overwrite now
+passes on ext2. Continue checking extracted source hashes before compiling.
+FAT timestamp/mode restoration is separate and still requires explicit tar
+metadata options; source/bootstrap workspaces should remain on ext2.

@@ -88,6 +88,7 @@ static constexpr int VFS_O_READ   = 0x00;  // Open for reading (default)
 static constexpr int VFS_O_WRITE  = 0x01;  // Open for writing
 static constexpr int VFS_O_CREATE = 0x02;  // Create file if it doesn't exist
 static constexpr int VFS_O_TRUNC  = 0x04;  // Truncate existing file
+static constexpr int VFS_O_EXCL   = 0x10;  // With CREATE, fail if the directory entry exists
 static constexpr int VFS_O_APPEND = 0x08;  // Seek to end after open
 
 // ---- Filesystem driver interface ----
@@ -207,6 +208,8 @@ extern "C" Vnode* VfsOpen(const char* path, int flags = 0);
 int VfsOpenExecutable(const char* path, Vnode** vnode, char* resolved, uint32_t size);
 // Creation mode is used only for a new inode; the filesystem applies umask.
 Vnode* VfsOpenMode(const char* path, int flags, uint16_t mode);
+// Reports exclusive-create EEXIST without changing the legacy open ABI.
+Vnode* VfsOpenModeChecked(const char* path, int flags, uint16_t mode, int* error);
 
 // Read from a file vnode.  Wrapper around vn->ops->read.
 extern "C" int VfsRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset);

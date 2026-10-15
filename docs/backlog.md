@@ -518,11 +518,19 @@ desktop-entry launching and smaller-display acceptance remain outstanding.
   proportions as an unbiased performance profile.
 
 
-## Ordinary-file exclusive creation
+## Ordinary-file exclusive creation — fixed
 
-GNU tar's create-first overwrite path exposes missing O_CREAT|O_EXCL semantics.
-On 15 October, a six-byte entry overwriting an existing 46-byte file retained
-46 bytes. Syscall tracing showed openat("item", 0x809c1) succeeding rather
-than returning EEXIST; this open does not request O_TRUNC. Implement atomic
-exclusive creation across VFS namespace mutations, including existing symlinks,
-and test concurrent creators plus actual GNU tar overwrite on FAT and ext2.
+The 15 October GNU tar overwrite bug was missing O_CREAT|O_EXCL semantics:
+openat("item", 0x809c1) incorrectly succeeded on an existing file, so tar never
+entered its overwrite path and a six-byte entry retained the old 46-byte tail.
+Ordinary VFS creation now rejects existing entries atomically, including final
+symlinks, under the namespace mutation gate. Checked EEXIST and truncate errors
+survive the legacy boot alias. Sixteen rounds of eight concurrent creators passed
+on FAT and ext2, alongside symlink and actual tar regressions; see workloads.md.
+
+FAT default GNU tar extraction still reports unsupported timestamp/mode
+restoration, including fchmodat2 (452). Data overwrite passes with explicit
+`--touch --no-same-permissions --no-same-owner`; implement truthful FAT metadata
+semantics or document filesystem-specific extraction policy separately.
+General path resolution/backend errno propagation remains limited; this fix
+is not comprehensive Linux open/pathwalk acceptance.

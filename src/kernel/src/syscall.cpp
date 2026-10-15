@@ -3468,15 +3468,19 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     static constexpr uint64_t LINUX_O_WRONLY = 1;
     static constexpr uint64_t LINUX_O_RDWR   = 2;
     static constexpr uint64_t LINUX_O_CREAT  = 0x40;
+    static constexpr uint64_t LINUX_O_EXCL   = 0x80;
     static constexpr uint64_t LINUX_O_TRUNC  = 0x200;
     static constexpr uint64_t LINUX_O_APPEND = 0x400;
     static constexpr uint64_t LINUX_O_DIRECTORY = 0x10000;
     if (flags & LINUX_O_WRONLY || flags & LINUX_O_RDWR) vfsFlags |= VFS_O_WRITE;
     if (flags & LINUX_O_CREAT)  vfsFlags |= VFS_O_CREATE;
+    if (flags & LINUX_O_EXCL)   vfsFlags |= VFS_O_EXCL;
     if (flags & LINUX_O_TRUNC)  vfsFlags |= VFS_O_TRUNC;
     if (flags & LINUX_O_APPEND) vfsFlags |= VFS_O_APPEND;
 
-    Vnode* vn = VfsOpenMode(lookupPath, vfsFlags, static_cast<uint16_t>(mode & 07777));
+    int openError = 0;
+    Vnode* vn = VfsOpenModeChecked(lookupPath, vfsFlags, static_cast<uint16_t>(mode & 07777), &openError);
+    if (!vn && openError) return openError;
 
     // Preserve /boot aliases for legacy applications, but Nix store paths
     // identify exact package contents. In particular, a missing libc.so in
@@ -3491,8 +3495,11 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         const char* p = lookupPath;
         while (*p && bi + 1 < sizeof(bootPath)) bootPath[bi++] = *p++;
         bootPath[bi] = '\0';
-        if (!*p) // Never open a silently truncated alias.
-            vn = VfsOpenMode(bootPath, vfsFlags, static_cast<uint16_t>(mode & 07777));
+        if (!*p) { // Never open a silently truncated alias.
+            vn = VfsOpenModeChecked(bootPath, vfsFlags,
+                                    static_cast<uint16_t>(mode & 07777), &openError);
+            if (!vn && openError) return openError;
+        }
 
         if (!vn && !(flags & (LINUX_O_DIRECTORY | LINUX_O_CREAT | LINUX_O_TRUNC | LINUX_O_APPEND)) &&
             !(flags & 3))

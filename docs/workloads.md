@@ -492,3 +492,37 @@ ignored: GNU tar's initial exclusive open succeeds on an existing file, so it
 never switches to its truncate/overwrite path. A six-byte entry left a 46-byte
 file. `--unlink-first` plus source hashes worked around this for the focused
 source-overlay validation; exclusive creation needs a separate filesystem fix.
+
+
+## Atomic exclusive creation and GNU tar overwrite (15 October 2026)
+
+Ordinary-file O_CREAT|O_EXCL now rejects existing directory entries with EEXIST,
+without following a final symlink or truncating content. The existing namespace
+mutation mutex covers the existence check through creation, and regular creates,
+mkdir and symlink now share that gate with rename/unlink. The checked open API
+also preserves truncate errors and errors from the legacy /boot alias; the
+original VfsOpenMode entry point remains available to existing callers.
+
+`tools/at-syscall-probe/exclusivecheck.c` passed sixteen rounds of eight
+simultaneous creators on host Linux, then in Brook on ext2 and FAT: exactly one
+creator succeeded per round and seven received EEXIST. Existing file/directory
+preservation and O_EXCL without O_CREAT passed. Ext2 additionally passed dangling
+and live final symlinks plus creation through a symlinked parent; FAT exercised
+the boot-path alias. FAT symlink behavior was not part of this probe.
+
+Kernel SHA-256
+`f78e54af993762e17111615600d00fe17efb41e4dee75c50265259bc8b600cb5`
+passed the new probe on both filesystems, all fourteen host tests, five guest
+I/O mutation gates and thirteen guest compatibility/persistence gates. Heap
+integrity was OK; checked shutdown and all three offline filesystem checks
+passed. Evidence: `build/workloads/exclusive-create-20261015/`.
+
+Actual GNU tar replaced the 46-byte fixture with exactly `short\n` (six bytes),
+SHA-256 `c962fa1be311981f0f965857e89b000707f9cea07a069d073461308f3019200f`.
+Default GNU tar passed on ext2. FAT required explicit
+`--touch --no-same-permissions --no-same-owner`: default extraction now overwrites
+the bytes correctly but reports unsupported timestamp/mode restoration. The
+successful final two-filesystem tar run took about half a second; the first
+harness wait included diagnosis/retry and is not a performance measurement.
+Generic backend errors and boolean path-resolution failures remain existing
+limitations beyond this targeted exclusive-create fix.
