@@ -4,6 +4,17 @@ Build the C probes in `nix-shell` using `$MUSL_CC -static -O2` (add
 `-pthread` for `fdstress.c` and `brkcheck.c`). Keep binaries in ignored `build/`.
 Run them inside a disposable Brook VM through `vm_guest_run`:
 
+`waitmaskcheck.c` must be invoked by absolute path. It checks raw `ppoll`,
+`pselect6` and `epoll_pwait` with SIGCHLD blocked outside each wait. A queued
+signal and a delayed exec-child exit must invoke the handler and return EINTR
+even with SA_RESTART. The monitored pipe keeps its writer open, so EOF cannot
+hide missing signal delivery. The handler checks its active mask and saved
+ucontext; the caller checks restoration after handler, timeout, readiness and
+error paths. Invalid sizes and masks crossing a truly unmapped page are checked,
+and SIGKILL/SIGSTOP must remain unblockable. Each case has a 15-second
+fork/wait/monotonic-clock watchdog. Expect 27 checks and
+`WAITMASKCHECK PASS failures=0` on Linux and Brook.
+
 - `devicecheck.c`: takes two different mount roots (Brook: `/data /nix`;
   Linux: `/ /proc`). Verifies device identity across stat/fstat/lstat/fstatat
   and path/fd statx, then requires the mounts to have distinct devices. This

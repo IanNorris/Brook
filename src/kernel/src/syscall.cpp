@@ -414,6 +414,47 @@ static constexpr int64_t ECONNREFUSED = 111;
 static constexpr int64_t ETIMEDOUT    = 110;
 static constexpr int64_t ELOOP       = 40;
 
+// Temporary masks survive the blocking C handler until signal selection on
+// syscall return. A PID can be reused after a killed waiter, so pair each slot
+// with its process incarnation. Only that process installs/consumes its slot;
+// this state is neither shared by threads nor inherited by fork/exec.
+struct WaitSignalMask {
+    uint64_t incarnation;
+    uint64_t original;
+    bool active;
+};
+static WaitSignalMask g_waitSignalMasks[MAX_PROCESSES] = {};
+
+static int InstallWaitSignalMask(uint64_t address, uint64_t size)
+{
+    if (!address) return 0;
+    if (size != sizeof(uint64_t)) return -EINVAL;
+    if (!UserBufferReadable(address, sizeof(uint64_t))) return -EFAULT;
+    Process* proc = ProcessCurrent();
+    if (!proc || proc->pid >= MAX_PROCESSES) return -ESRCH;
+    uint64_t mask = *reinterpret_cast<const uint64_t*>(address);
+    // SIGKILL and SIGSTOP cannot be blocked, including through these APIs.
+    mask &= ~((1ULL << (9 - 1)) | (1ULL << (19 - 1)));
+    auto& saved = g_waitSignalMasks[proc->pid];
+    saved.incarnation = proc->incarnation;
+    saved.original = proc->sigMask;
+    saved.active = true;
+    proc->sigMask = mask;
+    return 0;
+}
+
+// Consumed by SyscallCheckSignals before choosing a signal under the temporary
+// mask. The signal frame must restore this original mask via rt_sigreturn.
+extern "C" bool SyscallTakeWaitSignalMask(Process* proc, uint64_t* original)
+{
+    if (!proc || proc->pid >= MAX_PROCESSES) return false;
+    auto& saved = g_waitSignalMasks[proc->pid];
+    bool active = saved.active && saved.incarnation == proc->incarnation;
+    saved.active = false;
+    if (active) *original = saved.original;
+    return active;
+}
+
 // Check if the current process has deliverable signals pending.
 // Call after SchedulerBlock() returns to decide whether to return -EINTR.
 static bool HasPendingSignals()
@@ -8350,6 +8391,25 @@ static constexpr short POLLERR = 0x0008;
 static constexpr short POLLHUP = 0x0010;
 static constexpr short POLLNVAL = 0x0020;
 
+// LAPIC ticks schedule wakeups, but can drift relative to CLOCK_MONOTONIC.
+// As with nanosleep, only the monotonic deadline can expire a user timeout.
+static uint64_t WaitDeadlineNs(uint64_t timeoutMs)
+{
+    uint64_t now = ClockNowNs(1);
+    if (timeoutMs == ~0ULL || timeoutMs > (~0ULL - now) / 1000000ULL)
+        return ~0ULL;
+    return now + timeoutMs * 1000000ULL;
+}
+
+static uint64_t WaitWakeupTick(uint64_t deadlineNs, uint64_t safetyMs)
+{
+    uint64_t now = ClockNowNs(1);
+    uint64_t remaining = deadlineNs > now ? deadlineNs - now : 0;
+    uint64_t ticks = remaining / 1000000ULL + (remaining % 1000000ULL != 0);
+    if (ticks > safetyMs) ticks = safetyMs;
+    return g_lapicTickCount + ticks;
+}
+
 // Trusted kernel array; syscall wrappers validate/copy user memory separately.
 static int64_t PollWait(pollfd* fds, uint64_t nfds, uint64_t timeout_ms, bool selectMode = false)
 {
@@ -8357,9 +8417,7 @@ static int64_t PollWait(pollfd* fds, uint64_t nfds, uint64_t timeout_ms, bool se
     if (!proc) return -EFAULT;
     extern volatile uint64_t g_lapicTickCount;
     const bool infinite = timeout_ms == ~0ULL;
-    const uint64_t now = g_lapicTickCount;
-    const uint64_t deadline = infinite || timeout_ms >= ~0ULL - now
-        ? ~0ULL : now + timeout_ms;
+    const uint64_t deadline = WaitDeadlineNs(timeout_ms);
 
     // Poll diagnostics are opt-in, like the syscall trace itself. Printing
     // each RequestServer poll directly to the UART stalls browser IPC and
@@ -8585,7 +8643,7 @@ retry_poll:
     }
 
     // If nothing ready and timeout != 0, block and retry
-    if (ready == 0 && timeout_ms != 0 && (infinite || g_lapicTickCount < deadline))
+    if (ready == 0 && timeout_ms != 0 && (infinite || ClockNowNs(1) < deadline))
     {
         // Register as waiter BEFORE re-checking data availability.
         // This closes the race where data arrives between the initial
@@ -8694,9 +8752,9 @@ retry_poll:
         {
             // Keep one absolute deadline across spurious wakes. Periodic
             // checks also service timerfds and descriptors without wait hooks.
-            uint64_t nextCheck = g_lapicTickCount + 50;
-            self->wakeupTick = deadline < nextCheck ? deadline : nextCheck;
-            if (!HasPendingSignals()) SchedulerBlock(self);
+            self->wakeupTick = WaitWakeupTick(deadline, 50);
+            if (!HasPendingSignals() && (infinite || ClockNowNs(1) < deadline))
+                SchedulerBlock(self);
 
             if (HasPendingSignals())
             {
@@ -8854,10 +8912,11 @@ static int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout,
 }
 
 static int64_t sys_ppoll(uint64_t fdsAddr, uint64_t nfds, uint64_t tspecAddr,
-                        uint64_t, uint64_t, uint64_t)
+                        uint64_t sigmaskAddr, uint64_t sigsetsize, uint64_t)
 {
     uint64_t timeoutMs;
     int error = ParseWaitTimeout(tspecAddr, true, &timeoutMs);
+    if (!error) error = InstallWaitSignalMask(sigmaskAddr, sigsetsize);
     return error ? error : PollUser(fdsAddr, nfds, timeoutMs);
 }
 
@@ -9345,13 +9404,9 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
 
     // Block until something is ready (or timeout)
     extern volatile uint64_t g_lapicTickCount;
-    uint64_t startTick = g_lapicTickCount;
-    uint64_t timeoutTicks = (timeout_ms < 0)
-        ? (~(uint64_t)0)  // UINT64_MAX
-        : startTick + (uint64_t)timeout_ms;
+    uint64_t deadline = WaitDeadlineNs(timeout_ms < 0 ? ~0ULL : static_cast<uint64_t>(timeout_ms));
 
     ep->waiter = proc;
-    proc->wakeupTick = timeoutTicks;
 
     // Register proc as the epoll waiter on every watched pipe / listen
     // socket / eventfd / timerfd / TCP socket so writers/receivers can
@@ -9425,8 +9480,7 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
         // 2. User-specified timeout
         // All fd types now have direct wake wiring, so the safety poll is
         // only needed as a fallback for edge cases (e.g. closed fd race).
-        uint64_t now = g_lapicTickCount;
-        uint64_t wakeAt = timeoutTicks;
+        uint64_t wakeAt = WaitWakeupTick(deadline, 100);
 
         for (int i = 0; i < ep->count; i++) {
             int wfd = ep->entries[i].fd;
@@ -9441,16 +9495,12 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
             }
         }
 
-        // Safety poll as ultimate fallback (100ms — should rarely fire now
-        // that all fd types wake directly)
-        uint64_t safetyPoll = now + 100;
-        if (safetyPoll < wakeAt) wakeAt = safetyPoll;
-
         proc->wakeupTick = wakeAt;
 
         // A signal may already be pending when the wait begins (including
         // after a mask change); do not sleep before returning it to userspace.
-        if (!HasPendingSignals()) SchedulerBlock(proc);
+        if (!HasPendingSignals() && (timeout_ms < 0 || ClockNowNs(1) < deadline))
+            SchedulerBlock(proc);
         unregisterWaiters();
         if (HasPendingSignals()) {
             ep->waiter = nullptr;
@@ -9460,8 +9510,7 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
         n = EpollScanReady(proc, ep, kEvents, maxevents);
         if (n > 0) { ep->waiter = nullptr; return n; }
 
-        now = g_lapicTickCount;
-        if (timeout_ms >= 0 && now >= timeoutTicks) {
+        if (timeout_ms >= 0 && ClockNowNs(1) >= deadline) {
             ep->waiter = nullptr;
             return 0; // timeout
         }
@@ -9544,9 +9593,10 @@ static int64_t sys_epoll_wait(uint64_t epfd, uint64_t eventsAddr,
 
 static int64_t sys_epoll_pwait(uint64_t epfd, uint64_t eventsAddr,
                                 uint64_t maxevents, uint64_t timeout_ms,
-                                uint64_t sigmaskAddr, uint64_t)
+                                uint64_t sigmaskAddr, uint64_t sigsetsize)
 {
-    (void)sigmaskAddr; // signal mask ignored — we have no RT signals
+    int error = InstallWaitSignalMask(sigmaskAddr, sigsetsize);
+    if (error) return error;
     return sys_epoll_wait(epfd, eventsAddr, maxevents, timeout_ms, 0, 0);
 }
 
@@ -10989,11 +11039,11 @@ static int64_t SelectWait(uint64_t nfds, uint64_t readfdsAddr, uint64_t writefds
         fds[count++] = {static_cast<int>(fd), events, 0};
     }
     extern volatile uint64_t g_lapicTickCount;
-    uint64_t started = g_lapicTickCount;
+    uint64_t started = ClockNowNs(1);
     int64_t result = PollWait(fds, count, timeoutMs, true);
     if (timeoutAddr && !nanoseconds) {
         if (!UserBufferWritable(timeoutAddr, 16)) return -EFAULT;
-        uint64_t elapsed = g_lapicTickCount - started;
+        uint64_t elapsed = (ClockNowNs(1) - started) / 1000000ULL;
         uint64_t remaining = elapsed < timeoutMs ? timeoutMs - elapsed : 0;
         auto* value = reinterpret_cast<int64_t*>(timeoutAddr);
         value[0] = static_cast<int64_t>(remaining / 1000);
@@ -11030,8 +11080,15 @@ static int64_t sys_select(uint64_t nfds, uint64_t readfdsAddr, uint64_t writefds
 static int64_t sys_pselect6(uint64_t nfds, uint64_t readfdsAddr, uint64_t writefdsAddr,
                           uint64_t exceptfdsAddr, uint64_t timeoutAddr, uint64_t sigmaskAddr)
 {
-    // Temporary signal-mask handling remains a separate compatibility task.
-    (void)sigmaskAddr;
+    if (sigmaskAddr) {
+        // The sixth Linux argument points to {sigset pointer, sigset size},
+        // rather than directly to a sigset as in ppoll/epoll_pwait.
+        struct MaskArgument { uint64_t address; uint64_t size; } argument;
+        if (!UserBufferReadable(sigmaskAddr, sizeof(argument))) return -EFAULT;
+        memcpy(&argument, reinterpret_cast<const void*>(sigmaskAddr), sizeof(argument));
+        int error = InstallWaitSignalMask(argument.address, argument.size);
+        if (error) return error;
+    }
     return SelectWait(nfds, readfdsAddr, writefdsAddr, exceptfdsAddr, timeoutAddr, true);
 }
 

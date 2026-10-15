@@ -2212,10 +2212,25 @@ int ProcessSendSignal(Process* proc, int signum)
 
 using namespace brook;
 
+extern "C" bool SyscallTakeWaitSignalMask(Process* proc, uint64_t* original);
+
 extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResult)
 {
     Process* proc = ProcessCurrent();
     if (!proc || proc->isKernelThread) return syscallResult;
+
+    // ppoll/pselect6/epoll_pwait must select pending signals while their
+    // temporary mask is still installed. Every ordinary/error return restores
+    // the original mask here; a delivered handler instead saves it in its
+    // ucontext, while running with the temporary mask plus sa_mask.
+    uint64_t returnMask = proc->sigMask;
+    struct RestoreWaitMask {
+        Process* proc;
+        uint64_t mask;
+        bool active;
+        ~RestoreWaitMask() { if (active) proc->sigMask = mask; }
+    } restoreMask{proc, 0, SyscallTakeWaitSignalMask(proc, &returnMask)};
+    restoreMask.mask = returnMask;
 
     // --- Handle rt_sigreturn ---
     if (proc->sigReturnPending)
@@ -2345,7 +2360,7 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     proc->inSignalHandler = true;
 
     // Save current signal mask, then block signals specified by sa_mask + this signal
-    proc->sigSavedMask = proc->sigMask;
+    proc->sigSavedMask = returnMask;
     proc->sigMask |= sa.mask | (1ULL << (signum - 1));
     // Never block SIGKILL or SIGSTOP
     proc->sigMask &= ~((1ULL << 8) | (1ULL << 18));
@@ -2423,9 +2438,9 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     // converts the read into EINTR and the interactive shell can exit.
     //
     // SA_RESTART applies to most "slow" syscalls: read, write, open, ioctl,
-    // wait4, nanosleep, poll, pselect6, ppoll, futex, etc.
+    // wait4, nanosleep, poll, futex, etc.
     // The exceptions (never restarted) are: connect, accept, recvfrom,
-    // sendto, epoll_wait — we don't restart those.
+    // sendto, epoll_wait, epoll_pwait, pselect6 and ppoll — we don't restart those.
     //
     // We read the syscall number from the per-process snapshot rather than
     // gs:120 (per-CPU) because other processes may have overwritten gs:120
@@ -2448,8 +2463,6 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     case 61:  // wait4
     case 202: // futex
     case 230: // clock_nanosleep
-    case 270: // pselect6
-    case 271: // ppoll
         restartable = true;
         break;
     }
@@ -2484,5 +2497,7 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
         frame->rdx = reinterpret_cast<uint64_t>(&sf->uc);
     }
 
+    // The handler's mask remains active until rt_sigreturn restores returnMask.
+    restoreMask.active = false;
     return syscallResult; // RAX value (handler ignores it, saved in ucontext)
 }
