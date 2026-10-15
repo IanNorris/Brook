@@ -287,3 +287,18 @@ the arena's futex at offset 0x30. Allocating shared-address-space backing under
 the stable thread-group ID prevents an unrelated process reusing an exited
 worker's PID from reclaiming those pages. Page-table pages remain kernel-owned;
 individual kernel stacks retain thread ownership and explicit teardown.
+
+`exitgroupcheck.c` stresses exit_group against eight workers doing futex
+wait/wake (timed and untimed), nanosleep, and blocked pipe reads. Build with
+`-pthread`; run `/boot/BIN/EXITGRP [rounds]` (default 128, range 8–4096).
+Every eighth child joins its workers normally to exercise ordinary waiter
+reference removal; the remaining children exit with live workers. Each child
+must actually be reaped by waitpid with the expected exit status within five
+seconds. The parent fails rather than blocking indefinitely on a broken group.
+Unexpected futex errors fail the child. Expect `EXITGROUPCHECK PASS rounds=128`.
+
+For kernel acceptance, also inspect the process and futex diagnostics after
+completion: no worker from the test may remain and no futex waiter may retain
+its process. A host pass validates the probe, not Brook's scheduler. The probe
+covers FD pin teardown through blocked reads, but does not prove lifetime
+safety of every raw pipe/eventfd/socket waiter pointer or address-reuse race.

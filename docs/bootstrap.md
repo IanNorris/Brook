@@ -78,11 +78,20 @@ is labelled separately from a full compilation.
 `--backend ram` keeps the main boot/data/Nix payload on private host tmpfs.
 The harness budgets the exported SDK's uncompressed NAR closure (or larger
 seed allocation), another GiB for filesystem/boot/build overhead, guest memory
-and 512 MiB safety headroom. It checks space again before making independent
+and a configurable host reserve (`--host-headroom-gib`, default 4 GiB).
+Disk-backed runs also require guest capacity plus that reserve. The harness
+checks memory again before making independent
 verification images. Successful images are saved as sparse regular files at
 completion, then only the run's owned RAM directory is removed. Failed runs
 retain their images for diagnosis. Tmpfs can swap, and auxiliary firmware
 files may still use `/tmp`; this is not a zero-SSD-write guarantee.
+
+After a host OOM, prefer `--backend disk` for the larger bootstrap runs and
+run one VM at a time. Cap host builds with `CMAKE_BUILD_PARALLEL_LEVEL=4`.
+Failed RAM runs retain their images and can continue occupying RAM or swap
+after QEMU exits: preserve them as sparse regular files and remove only their
+owned runtime directory after confirming every associated VM is stopped.
+Lower the host reserve explicitly only for a host with an appropriate budget.
 
 `--resume-completed-build` only resumes host verification after a guest build
 already exited zero with both 13-test summaries and artifact markers. It does
@@ -418,3 +427,33 @@ reports build success. Profiling transport timeouts disable further profiling
 and are recorded as incomplete observations; they do not restart the VM or
 relax the required native-test, artifact, own-kernel boot or filesystem checks.
 Fresh prepared and clean acceptance runs are still required after this fix.
+
+### Thread-group exit diagnosis (2026-10-15)
+
+The prepared run at `e26f968` reached linking without mapped-page warnings,
+then stalled: the terminated `ld.lld` leader retained two blocked, reapable
+workers and an address-space live-thread count of two, with no registered
+futex waiters. The VM stopped with checked synchronization; FAT and both ext2
+checks passed. Its failed-run images and thread dump are retained under
+`bootstrap-prepared-e26f968-ram`.
+
+Group termination previously published state outside the ready-queue lock,
+allowing a concurrent block/wake/preemption transition to overwrite Terminated.
+Terminal publication and scheduler transitions now use the same lock. Futex
+waiters own process references, cancellation follows off-CPU quiescence, and
+wake/removal preserves those references through interrupt-sensitive transfer
+windows. Birth and signal/wakeup snapshots also follow the scheduler lock
+order. Process layout and the module ABI are unchanged.
+
+The old kernel timed out in round 3 of the guest `exitgroupcheck` probe. The
+candidate passed separate 128- and 512-round runs, all 13 host tests and seven
+bare-metal tests. The full I/O/durability gate passed with the longer stress
+run in 30.66 seconds. A further 128-round gate verified guest process records
+returned from 7 to 7 after worker reaping. No mapped-page or quiescence-timeout
+diagnostics appeared. Results are under `build/io-bench/exit-group-*`.
+
+These tests establish the targeted fix, not general waiter lifetime safety:
+raw pipe/eventfd/socket waiter pointer lifetime and ABA remain unverified.
+The existing emergency cleanup after an exit-group quiescence timeout also
+remains risky; both acceptance harnesses reject that warning. Fresh prepared
+and clean acceptance at one matching revision remain required.

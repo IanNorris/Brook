@@ -12063,9 +12063,15 @@ extern "C" int64_t FutexWake(uint64_t owner, uint64_t uaddr, uint32_t maxWake,
             Process* waiter = w->proc;
             *pp = w->next;
             FutexFreeWaiter(w);
-            IrqSpinLockRelease(&g_futexLock, fxFlags);
+            // Unlink transfers the node's hold to this stack. Keep IF clear
+            // until that hold is dropped: a killed caller never resumes.
+            IrqSpinLockRelease(&g_futexLock, fxFlags & ~0x200ULL);
 
             WakeProcess(waiter);
+            // The dequeued node hands its reference to this wake operation,
+            // keeping the process alive across the unlocked wakeup window.
+            SchedulerReleaseWaitReference(waiter);
+            if (fxFlags & 0x200) __asm__ volatile("sti" ::: "memory");
             woken++;
 
             fxFlags = IrqSpinLockAcquire(&g_futexLock);
@@ -12094,7 +12100,9 @@ static bool FutexRemoveWaiter(uint64_t owner, uint64_t uaddr, Process* proc)
         if (w->uaddr == uaddr && w->owner == owner && w->proc == proc) {
             *pp = w->next;
             FutexFreeWaiter(w);
-            IrqSpinLockRelease(&g_futexLock, fxFlags);
+            IrqSpinLockRelease(&g_futexLock, fxFlags & ~0x200ULL);
+            SchedulerReleaseWaitReference(proc);
+            if (fxFlags & 0x200) __asm__ volatile("sti" ::: "memory");
             return true;
         }
         pp = &(*pp)->next;
@@ -12102,6 +12110,25 @@ static bool FutexRemoveWaiter(uint64_t owner, uint64_t uaddr, Process* proc)
 
     IrqSpinLockRelease(&g_futexLock, fxFlags);
     return false;
+}
+
+// Caller owns a process reference and has observed it Terminated/off-CPU.
+// Such a syscall cannot resume to remove its own waiter. Release only nodes
+// still linked here; a concurrent wake owns any node it already dequeued.
+extern "C" void FutexCancelProcess(Process* proc)
+{
+    uint64_t flags = IrqSpinLockAcquire(&g_futexLock);
+    for (uint32_t b = 0; b < FUTEX_HASH_SIZE; ++b) {
+        FutexWaiter** pp = &g_futexBuckets[b];
+        while (*pp) {
+            FutexWaiter* w = *pp;
+            if (w->proc != proc) { pp = &w->next; continue; }
+            *pp = w->next;
+            FutexFreeWaiter(w);
+            ProcessUnref(proc); // caller's reference prevents final teardown
+        }
+    }
+    IrqSpinLockRelease(&g_futexLock, flags);
 }
 
 static uint64_t FutexTimeoutDeadlineMs(int op, uint64_t opVal, uint64_t timeoutAddr)
@@ -12244,6 +12271,7 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
             return -EINVAL;
         }
         uint32_t bucket = FutexHash(owner, uaddrVal);
+        ProcessRef(proc); // owned by linked waiter, then wake/remove/cancel
         w->next = g_futexBuckets[bucket];
         g_futexBuckets[bucket] = w;
 

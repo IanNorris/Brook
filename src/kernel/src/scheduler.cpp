@@ -29,6 +29,7 @@ extern "C" void context_switch(brook::SavedContext* oldCtx, brook::SavedContext*
 // Futex wake — implemented in syscall.cpp, called for clear_child_tid on thread exit
 extern "C" int64_t FutexWake(uint64_t owner, uint64_t uaddr, uint32_t maxWake,
                               uint32_t wake_bitset = 0xFFFFFFFFu);
+extern "C" void FutexCancelProcess(brook::Process* proc);
 
 // Ext2 lock state diagnostic — implemented in ext2_vfs.cpp
 extern "C" void Ext2DumpLockState();
@@ -618,11 +619,22 @@ static void NotifyExitedParentLocked(Process* child)
 // ProcessTrampoline, KernelThreadTrampoline).
 static void ReleaseSchedulerReference(Process* proc, bool retired)
 {
+    // Keep temporary ownership off a kernel stack that a fatal timer tick
+    // could abandon between cancellation and the final reference drop.
+    uint64_t flags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+    // A killed syscall will never return to unlink its futex waiter. The
+    // scheduler's hold protects this off-CPU process while cancellation drops
+    // any waiter-owned references. Never acquire the futex lock under the
+    // process-list lock: normal wakeup must be able to finish independently.
+    if (proc->state == ProcessState::Terminated &&
+        __atomic_load_n(&proc->runningOnCpu, __ATOMIC_ACQUIRE) == -1)
+        FutexCancelProcess(proc);
     // The scheduler's reference protects proc even if a remote kill has already
     // marked it reapable. Release under the process-list lock so notification
     // follows the final reference drop without racing waitpid/reaper teardown.
     uint64_t alf = SchedLockAcquire(g_allProcLock);
-    if (retired)
+    if (retired && proc->state == ProcessState::Terminated)
         __atomic_store_n(&proc->reapable, true, __ATOMIC_RELEASE);
     ProcessUnref(proc);
     if (proc->state == ProcessState::Terminated &&
@@ -633,6 +645,12 @@ static void ReleaseSchedulerReference(Process* proc, bool retired)
         NotifyExitedParentLocked(proc);
     SchedLockRelease(g_allProcLock, alf);
     // No proc dereference here: a waiting parent may now destroy it.
+    if (flags & 0x200) __asm__ volatile("sti" ::: "memory");
+}
+
+void SchedulerReleaseWaitReference(Process* proc)
+{
+    ReleaseSchedulerReference(proc, false);
 }
 
 static void DrainPostSwitch(uint32_t cpu)
@@ -939,6 +957,9 @@ void SchedulerAddProcess(Process* proc)
     // by magic; a dangling/invalid leader is treated as not-exiting (the normal
     // teardown paths still apply).
     bool stillborn = false;
+    // Match policy replacement's ready -> allProc order, and keep a newly
+    // runnable thread from dispatching before its leader lifetime is counted.
+    uint64_t birthFlags = SchedLockAcquire(g_readyLock);
     uint64_t alf1 = SchedLockAcquire(g_allProcLock);
     if (proc->isThread && !proc->isKernelThread)
     {
@@ -959,9 +980,7 @@ void SchedulerAddProcess(Process* proc)
     }
     else
     {
-        uint64_t rlf1 = SchedLockAcquire(g_readyLock);
         ReadyQueueInsertLocked(proc);
-        SchedLockRelease(g_readyLock, rlf1);
     }
 
     if (g_processCount < MAX_PROCESSES)
@@ -994,6 +1013,7 @@ void SchedulerAddProcess(Process* proc)
                     MAX_PROCESSES, proc->name, proc->pid);
     }
     SchedLockRelease(g_allProcLock, alf1);
+    SchedLockRelease(g_readyLock, birthFlags);
 
     DbgPrintf("SCHED: added '%s' (pid %u) to ready queue\n",
                  proc->name, proc->pid);
@@ -1063,6 +1083,21 @@ void SchedulerBlock(Process* proc)
 
     uint64_t rlf3 = SchedLockAcquire(g_readyLock);
 
+    // Terminal state is irreversible. A remote exit_group can win while this
+    // syscall is preparing to sleep; retire on our own stack-switch path,
+    // rather than reviving it as Blocked or returning to user code.
+    if (proc->state == ProcessState::Terminated)
+    {
+        SchedLockRelease(g_readyLock, rlf3);
+        if (proc == g_perCpu[ThisCpu()].currentProcess)
+        {
+            SchedulerYield();
+            KernelPanic("SCHED: terminated pid=%u resumed from block", proc->pid);
+        }
+        if (flags & 0x200) __asm__ volatile("sti" ::: "memory");
+        return;
+    }
+
     // Check for a pending wakeup that raced with us (e.g. KMutexUnlock
     // calling SchedulerUnblock before we got here).  If set, the waker
     // already transferred mutex ownership; we should NOT block.
@@ -1093,6 +1128,40 @@ void SchedulerBlock(Process* proc)
         __asm__ volatile("sti" ::: "memory");
 }
 
+void SchedulerMarkStopped(Process* proc)
+{
+    uint64_t rlf = SchedLockAcquire(g_readyLock);
+    if (proc->state != ProcessState::Terminated)
+    {
+        proc->state = ProcessState::Stopped;
+        ReadyQueueRemoveLocked(proc);
+    }
+    SchedLockRelease(g_readyLock, rlf);
+}
+
+void SchedulerMarkTerminated(Process* proc, int waitStatus)
+{
+    // Hold across off-CPU waiter cancellation, including already-reapable
+    // targets. All nonterminal state transitions use this same ready lock.
+    uint64_t rlf = SchedLockAcquire(g_readyLock);
+    ProcessRef(proc);
+    if (proc->state != ProcessState::Terminated)
+    {
+        proc->waitStatus = waitStatus;
+        __atomic_store_n(reinterpret_cast<uint8_t*>(&proc->state),
+                         static_cast<uint8_t>(ProcessState::Terminated),
+                         __ATOMIC_RELEASE);
+    }
+    ReadyQueueRemoveLocked(proc);
+    bool offCpu = __atomic_load_n(&proc->runningOnCpu, __ATOMIC_ACQUIRE) == -1;
+    // In a self-fatal path, restoring IF before dropping our temporary hold
+    // could retire this CPU forever with the hold still on its dead stack.
+    SchedLockReleaseRaw(g_readyLock);
+    if (offCpu) FutexCancelProcess(proc);
+    ProcessUnref(proc);
+    if (rlf & 0x200) __asm__ volatile("sti" ::: "memory");
+}
+
 void SchedulerStop(Process* proc)
 {
     // Like SchedulerBlock but sets Stopped instead of Blocked.
@@ -1100,10 +1169,7 @@ void SchedulerStop(Process* proc)
     uint64_t flags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
 
-    uint64_t rlf = SchedLockAcquire(g_readyLock);
-    proc->state = ProcessState::Stopped;
-    ReadyQueueRemoveLocked(proc);
-    SchedLockRelease(g_readyLock, rlf);
+    SchedulerMarkStopped(proc);
 
     uint32_t cpu = ThisCpu();
     if (proc == g_perCpu[cpu].currentProcess)
@@ -1204,14 +1270,18 @@ static void CheckBlockedWakeups()
 
         if (timedWake || pendingWake)
         {
-            if (unblockCount < MAX_PROCESSES)
+            if (unblockCount < MAX_PROCESSES) {
+                ProcessRef(p);
                 toUnblock[unblockCount++] = p;
+            }
         }
     }
     SchedLockRelease(g_allProcLock, alf3);
 
-    for (uint32_t i = 0; i < unblockCount; ++i)
+    for (uint32_t i = 0; i < unblockCount; ++i) {
         SchedulerUnblock(toUnblock[i]);
+        ReleaseSchedulerReference(toUnblock[i], false);
+    }
 }
 
 // Reap terminated processes.
@@ -1377,6 +1447,11 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
 
     uint32_t cpu = ThisCpu();
 
+    // Every runnable user-process claim is made under the ready lock. The
+    // only unlocked dispatches are this CPU's private idle fallback.
+    if (!holdingReadyLock && newProc != g_perCpu[cpu].idleProcess)
+        KernelPanic("SCHED: unlocked non-idle dispatch pid=%u", newProc->pid);
+
     // Double-schedule detection: newProc must not already be running on another CPU.
     int32_t prevCpu = __atomic_exchange_n(&newProc->runningOnCpu, (int32_t)cpu, __ATOMIC_ACQ_REL);
     if (prevCpu != -1)
@@ -1442,13 +1517,16 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
         }
 
         // If old process can still run, just continue it.
+        uint64_t restoreFlags = SchedLockAcquire(g_readyLock);
         if (oldProc->state == ProcessState::Running ||
             oldProc->state == ProcessState::Ready)
         {
             oldProc->state = ProcessState::Running;
+            SchedLockRelease(g_readyLock, restoreFlags);
             __asm__ volatile("sti");
             return;
         }
+        SchedLockRelease(g_readyLock, restoreFlags);
 
         // Old process is blocked/terminated — switch to our own idle.
         Process* idle = g_perCpu[cpu].idleProcess;
@@ -1509,8 +1587,10 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
     // livelocking the parent's wait/fork loop.  The leader hits this far more
     // often than a plain thread because of the extra SIGCHLD/reparent work that
     // widens the interrupts-enabled window.
-    if (oldProc != newProc &&
-        oldProc->state == ProcessState::Terminated &&
+    // A kill can arrive after this check but before assembly releases the
+    // old CPU. Keep a post-switch hold for every non-requeued process, so
+    // late termination still cancels waiters and publishes safe retirement.
+    if (oldProc != newProc && !requeueOld &&
         !g_perCpu[cpu].pendingRetire)
     {
         ProcessRef(oldProc);
@@ -1581,6 +1661,10 @@ void SchedulerTimerTick(bool allowPreempt)
 
         // Check alarm timers for all processes
         uint64_t now = g_lapicTickCount;
+        // Signal delivery can acquire g_readyLock. Snapshot with references
+        // rather than inverting ready->allProc lock order while delivering.
+        static Process* alarmTargets[MAX_PROCESSES]; // BSP-only, IRQs disabled
+        uint32_t alarmCount = 0;
         uint64_t alf_alarm = SchedLockAcquire(g_allProcLock);
         for (uint32_t i = 0; i < g_processCount; ++i)
         {
@@ -1589,10 +1673,16 @@ void SchedulerTimerTick(bool allowPreempt)
                 p->state != ProcessState::Terminated)
             {
                 p->alarmTick = 0; // one-shot
-                ProcessSendSignal(p, 14); // SIGALRM
+                ProcessRef(p);
+                alarmTargets[alarmCount++] = p;
             }
         }
         SchedLockRelease(g_allProcLock, alf_alarm);
+        for (uint32_t i = 0; i < alarmCount; ++i)
+        {
+            ProcessSendSignal(alarmTargets[i], 14); // SIGALRM
+            ReleaseSchedulerReference(alarmTargets[i], false);
+        }
 
         ReapTerminated();
 
@@ -1832,6 +1922,13 @@ void SchedulerTimerTick(bool allowPreempt)
 
     // Timeslice expired — notify policy, pick next, and switch.
     uint64_t rlf8 = SchedLockAcquire(g_readyLock);
+    // A remote terminal/stop publication may have won after the unlocked
+    // Running check above. Do not overwrite it with Ready below.
+    if (cur->state != ProcessState::Running)
+    {
+        SchedLockRelease(g_readyLock, rlf8);
+        return;
+    }
     g_schedOps->TimesliceExpired(g_schedState, cur->pid);
     Process* next = PickNextLocked(cpu);
 
@@ -1988,11 +2085,8 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
         proc->fbVirtualSize = 0;
     }
 
-    proc->waitStatus = terminationSignal ? (terminationSignal & 0x7f)
-                                        : ((status & 0xff) << 8);
-    __atomic_store_n(reinterpret_cast<uint8_t*>(&proc->state),
-                     static_cast<uint8_t>(ProcessState::Terminated),
-                     __ATOMIC_RELEASE);
+    SchedulerMarkTerminated(proc, terminationSignal ? (terminationSignal & 0x7f)
+                                                    : ((status & 0xff) << 8));
 
     // Wake the parent process if it's blocked (likely in wait4).
     // Also send SIGCHLD to the parent.
@@ -2103,7 +2197,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
 
     uint64_t rlf11 = SchedLockAcquire(g_readyLock);
     Process* first = PickNextLocked(cpu);
-    SchedLockRelease(g_readyLock, rlf11);
+    (void)rlf11;
 
     if (!first) first = g_perCpu[cpu].idleProcess;
 
@@ -2112,6 +2206,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     
     first->state = ProcessState::Running;
     __atomic_store_n(&first->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
+    SchedLockReleaseRaw(g_readyLock);
     __atomic_or_fetch(&first->tlbCpuMask, 1ULL << cpu, __ATOMIC_RELEASE);
     __atomic_or_fetch(AddressSpaceTlbMaskPtr(first), 1ULL << cpu, __ATOMIC_RELEASE);
     SmpSetCurrentCr3(cpu, first->savedCtx.cr3);  // keep tracking in sync (see exit path)
@@ -2170,7 +2265,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     // Try to pick a process from the global queue.
     uint64_t rlf12 = SchedLockAcquire(g_readyLock);
     Process* first = PickNextLocked(cpu);
-    SchedLockRelease(g_readyLock, rlf12);
+    (void)rlf12;
 
     if (!first) first = g_perCpu[cpu].idleProcess;
 
@@ -2179,6 +2274,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     
     first->state = ProcessState::Running;
     __atomic_store_n(&first->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
+    SchedLockReleaseRaw(g_readyLock);
     __atomic_or_fetch(&first->tlbCpuMask, 1ULL << cpu, __ATOMIC_RELEASE);
     __atomic_or_fetch(AddressSpaceTlbMaskPtr(first), 1ULL << cpu, __ATOMIC_RELEASE);
     SmpSetCurrentCr3(cpu, first->savedCtx.cr3);  // keep tracking in sync (see exit path)
@@ -2317,25 +2413,37 @@ Process* ProcessFindByPid(uint16_t pid)
 
 int ProcessSendSignalToGroup(uint16_t pgid, int signum)
 {
-    // Collect matching processes under the lock, then signal outside
+    // References protect the unlocked delivery phase. Keep IF clear while
+    // they are owned by this stack, and deliver to self only after releasing
+    // every hold: SIGSTOP may yield and SIGKILL never resumes this caller.
     Process* targets[MAX_PROCESSES];
     uint32_t count = 0;
-
+    uint64_t flags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+    Process* self = SchedulerCurrentProcess();
+    bool signalSelf = false;
     uint64_t alf = SchedLockAcquire(g_allProcLock);
     for (uint32_t i = 0; i < g_processCount; i++)
     {
         Process* p = g_allProcesses[i];
         if (p->pgid == pgid && p->state != ProcessState::Terminated)
         {
-            if (count < MAX_PROCESSES) targets[count++] = p;
+            if (count < MAX_PROCESSES) {
+                ProcessRef(p);
+                targets[count++] = p;
+            }
         }
     }
     SchedLockRelease(g_allProcLock, alf);
 
+    for (uint32_t i = 0; i < count; i++) {
+        if (targets[i] == self) signalSelf = true;
+        else ProcessSendSignal(targets[i], signum);
+        ReleaseSchedulerReference(targets[i], false);
+    }
+    if (flags & 0x200) __asm__ volatile("sti" ::: "memory");
     SerialPrintf("SIGNAL: SendToGroup pgid=%u sig=%d -> %u procs\n", pgid, signum, count);
-    for (uint32_t i = 0; i < count; i++)
-        ProcessSendSignal(targets[i], signum);
-
+    if (signalSelf) ProcessSendSignal(self, signum);
     return static_cast<int>(count);
 }
 
@@ -2435,11 +2543,8 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus,
     for (uint32_t i = 0; i < count; ++i)
     {
         Process* p = targets[i];
-        p->waitStatus = terminationSignal ? (terminationSignal & 0x7f)
-                                         : ((exitStatus & 0xff) << 8);
-        __atomic_store_n(reinterpret_cast<uint8_t*>(&p->state),
-                         static_cast<uint8_t>(ProcessState::Terminated),
-                         __ATOMIC_RELEASE);
+        SchedulerMarkTerminated(p, terminationSignal ? (terminationSignal & 0x7f)
+                                                     : ((exitStatus & 0xff) << 8));
         DbgPrintf("SCHED: exit_group killing thread pid=%u tgid=%u\n",
                   p->pid, p->tgid);
     }

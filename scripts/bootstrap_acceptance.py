@@ -98,7 +98,7 @@ def check_stopped_serial(data, directory):
     serial = Path(data["serial_log"])
     text = serial.read_text(errors="replace")
     shutil.copy2(serial, directory / "guest-final-serial.log")
-    if re.search(r"KERNEL PANIC|KERNEL FAULT|BRO176-MAP(?:LEAK|UNDERFLOW)|virtio-blk.*(?:timeout|reset)|virtio.*I/O error", text, re.I):
+    if re.search(r"KERNEL PANIC|KERNEL FAULT|BRO176-MAP(?:LEAK|UNDERFLOW)|SCHED: exit_group timeout|virtio-blk.*(?:timeout|reset)|virtio.*I/O error", text, re.I):
         raise RuntimeError(f"Guest device/panic errors; see {directory / 'guest-final-serial.log'}")
 
 
@@ -255,8 +255,8 @@ def monitor(directory, session, data, deadline):
     serial = Path(data["serial_log"])
     while time.monotonic() - started < deadline:
         text = serial.read_text(errors="replace")
-        if re.search(r'BRO176-MAP(?:LEAK|UNDERFLOW)', text):
-            raise RuntimeError('Guest mapped-page accounting failure; VM retained for diagnosis')
+        if re.search(r'BRO176-MAP(?:LEAK|UNDERFLOW)|SCHED: exit_group timeout', text):
+            raise RuntimeError('Guest mapped-page accounting or thread-quiescence failure; VM retained for diagnosis')
         markers = re.findall(r"^BOOTSTRAP_(BEGIN|END|EXIT) ([^\r\n]+)", text, re.M)
         for kind, payload in markers[seen:]:
             now = time.monotonic()
@@ -336,6 +336,8 @@ def main():
     parser.add_argument("--instance", type=int, default=120)
     parser.add_argument("--resume-completed-build", action="store_true", help="resume after a host verifier error, only with completed guest build and two passing suites")
     parser.add_argument("--memory", choices=["4G", "8G"], default="4G")
+    parser.add_argument("--host-headroom-gib", type=int, choices=[1,2,4,8], default=4,
+                        help="host memory reserve beyond guest/images; default 4 GiB")
     parser.add_argument("--backend", choices=["disk", "ram"], default="disk")
     parser.add_argument("--deadline", type=int, default=7200)
     args = parser.parse_args()
@@ -346,6 +348,7 @@ def main():
         if metadata["mode"] != args.mode or metadata["revision"] != args.revision: parser.error("Resume mode/revision mismatch")
         args.memory = metadata["vm"]["memory"]
         args.backend = metadata.get("backend", "disk")
+        args.host_headroom_gib = metadata.get("host_memory_headroom_gib", args.host_headroom_gib)
         stage_data = json.loads((directory / "stage-results.json").read_text())
         if stage_data["exit"] != 0: parser.error("Guest build did not complete successfully")
         session = metadata["session"]
@@ -373,13 +376,16 @@ def main():
         parser.error("Prepared SDK modes must match guest NAR extraction; recreate the seed")
     directory.mkdir(parents=True)
     ram = None
+    headroom = args.host_headroom_gib*1024**3
+    if memory_available() < int(args.memory[:-1])*1024**3+headroom:
+        raise RuntimeError('Insufficient available host memory for guest plus configured headroom')
     if args.backend == "ram":
         guest_capacity = int(args.memory[:-1])*1024**3
         seed_bytes = sum((args.seed / f"{name}.img").stat().st_blocks*512 for name in ("data", "nix"))
         # NAR bytes conservatively cover the SDK even for a clean seed. Reserve
         # another GiB for ext2 rounding/metadata, the boot disk and build outputs.
         image_budget = max(seed_bytes, sdk_nar_bytes(sdk["store_path"])) + 1024**3
-        required_memory = guest_capacity + image_budget + 512*1024**2
+        required_memory = guest_capacity + image_budget + headroom
         if memory_available() < required_memory or shutil.disk_usage("/dev/shm").free < image_budget:
             raise RuntimeError(f"RAM bootstrap needs {required_memory/1024**3:.2f} GiB available memory and {image_budget/1024**3:.2f} GiB free tmpfs")
         ram = Path(tempfile.mkdtemp(prefix="brook-bootstrap-", dir="/dev/shm"))
@@ -400,6 +406,7 @@ def main():
     metadata = {"mode": args.mode, "revision": args.revision, "sdk": sdk,
                 "backend": args.backend, "ram_directory": str(ram) if ram else None,
                 "initial_ram_image_budget": image_budget if ram else None,
+                "host_memory_headroom_gib": args.host_headroom_gib,
                 "seed": manifest, "before_fsck": before,
                 "host_load": os.getloadavg(), "host_cpu_count": os.cpu_count(),
                 "host_affinity": sorted(os.sched_getaffinity(0)),
@@ -452,7 +459,7 @@ def finalize_acceptance(directory, args, metadata, process, session, data, stage
         guest_capacity = int(args.memory[:-1])*1024**3
         image_bytes = sum((directory / f"{name}.img").stat().st_blocks*512 for name in ("boot", "data", "nix"))
         metadata["verification_image_bytes"] = image_bytes
-        if shutil.disk_usage(ram).free < image_bytes+512*1024**2 or memory_available() < image_bytes+guest_capacity+512*1024**2:
+        if shutil.disk_usage(ram).free < image_bytes+512*1024**2 or memory_available() < image_bytes+guest_capacity+args.host_headroom_gib*1024**3:
             raise RuntimeError("Insufficient RAM for independent verification images plus guest; originals preserved")
         (ram / "verify").mkdir()
         (ram / "verify/tmp-host").mkdir()

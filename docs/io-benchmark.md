@@ -42,6 +42,12 @@ runs reject mapped-page leak/underflow diagnostics. See the bootstrap
 [ownership diagnosis](bootstrap.md#worker-page-ownership-diagnosis-2026-10-15)
 and `tools/at-syscall-probe/threadpagecheck.c` for the reproducer.
 
+`--exit-group-probe` adds 128 rounds of concurrent futex, pipe and timer workers
+racing normal joins and group exit. An explicit count, such as
+`--exit-group-probe 512`, selects a longer run. Every child must become
+waitable within its watchdog, and the guest process count must return to its
+pre-probe baseline. Exit-group quiescence-timeout warnings fail the gate.
+
 JSON records separate work and sync times for each phase, boot durations,
 kernel identity, host CPU/load and memory/swap counters. Raw serial logs include
 `/proc/blkprobe` and disk statistics before and after phases. Images are isolated
@@ -54,6 +60,12 @@ Tmpfs can be swapped by Linux; this reduces ordinary SSD writes but does not
 promise zero SSD activity. The harness checks available memory and records
 system-wide swap counters. Default test images consume considerably less than
 their sparse logical capacity; the guest has a fresh 2 GiB data filesystem.
+Both backends reserve the guest's configured capacity plus
+`--host-headroom-gib` (default 4 GiB); RAM runs add a 1 GiB image allowance.
+The check uses available host memory, not free memory alone. It cannot predict
+unrelated applications growing afterward. Run one test VM at a time on a busy
+desktop. Failed RAM images remain allocated until they are safely archived or
+removed after the VM stops; they are not ordinary reclaimable file cache.
 
 Use the same test against disk-backed images with:
 

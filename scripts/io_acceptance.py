@@ -97,6 +97,8 @@ def main():
     ap.add_argument('--backend', choices=['ram', 'disk'], default='ram')
     ap.add_argument('--artifacts', type=Path, default=ROOT / 'build/release')
     ap.add_argument('--memory', choices=['2G','4G','8G'], default='2G')
+    ap.add_argument('--host-headroom-gib', type=int, choices=[1,2,4,8], default=4,
+                    help='host memory left available beyond guest/test images; default 4 GiB')
     ap.add_argument('--cpus', type=int, default=8)
     ap.add_argument('--workers', type=int, default=8)
     ap.add_argument('--mib', type=int, default=8)
@@ -108,6 +110,7 @@ def main():
     ap.add_argument('--lifetime-probe', action='store_true', help='also run the 24 inode-lifetime regression checks')
     ap.add_argument('--flush-probe', action='store_true', help='inject device flush failures, require fsync/stop errors and retry, then verify after reboot')
     ap.add_argument('--thread-page-probe', action='store_true', help='retain worker mappings after thread exit and require safe PID reuse by unrelated processes')
+    ap.add_argument('--exit-group-probe', nargs='?', const=128, type=int, help='race thread-group exit with sleeping/waking workers for this many rounds')
     ap.add_argument('--deadline', type=int, default=180, help='seconds allowed per guest workload')
     args = ap.parse_args()
     if args.instance is None:
@@ -130,12 +133,15 @@ def main():
         ap.error('output must be a new directory below build/')
     if args.cpus < 8 or not 1 <= args.workers <= 16 or not 8 <= args.mib <= 128 or not 1 <= args.files <= 1024:
         ap.error('need >=8 CPUs, 1..16 workers, 8..128 MiB/worker, 1..1024 files/worker')
+    if args.exit_group_probe is not None and not 8 <= args.exit_group_probe <= 1024:
+        ap.error('exit-group-probe must use 8..1024 rounds')
     output.mkdir(parents=True)
     parent = Path('/dev/shm') if args.backend == 'ram' else output
     if args.backend == 'ram' and (shutil.disk_usage(parent).free < 3*1024**3):
         raise RuntimeError('RAM filesystem needs at least 3 GiB free')
-    if args.backend == 'ram' and host_memory()['available_bytes'] < (int(args.memory[:-1])+2)*1024**3:
-        raise RuntimeError('RAM-backed test needs guest capacity plus 2 GiB available host memory')
+    required_memory = (int(args.memory[:-1])+args.host_headroom_gib+(1 if args.backend == 'ram' else 0))*1024**3
+    if host_memory()['available_bytes'] < required_memory:
+        raise RuntimeError(f'Test needs {required_memory/1024**3:.0f} GiB available host memory for guest, image allowance and configured headroom')
     directory = Path(tempfile.mkdtemp(prefix='brook-io-', dir=parent))
     process = session = serial = None
     success = False
@@ -175,10 +181,33 @@ def main():
             base.command(['mcopy', '-o', '-i', str(directory/'boot.img'), str(ROOT/'build/io-bench/flushcheck'), '::BIN/FLUSHCHK'])
         if args.thread_page_probe:
             base.command(['mcopy', '-o', '-i', str(directory/'boot.img'), str(ROOT/'build/io-bench/threadpagecheck'), '::BIN/ASOWNCHK'])
+        if args.exit_group_probe:
+            base.command(['mcopy', '-o', '-i', str(directory/'boot.img'), str(ROOT/'build/io-bench/exitgroupcheck'), '::BIN/EXITGRP'])
         for mode in ('run', 'cleanup'):
             process, session, data, boot_seconds = base.launch(directory, args.instance, artifacts, cpus=args.cpus, memory=args.memory)
             serial = Path(data['serial_log'])
             offset = serial.stat().st_size
+            if args.exit_group_probe and mode == 'run':
+                before_exit = base.server.guest(data, 'bridge stats')['process_count']
+                base.server.guest_run(session, f'run /boot/BIN/EXITGRP {args.exit_group_probe}')
+                expires = time.monotonic()+args.deadline
+                while time.monotonic()<expires:
+                    text = serial.read_bytes()[offset:].decode(errors='replace')
+                    if re.search(r'EXITGROUPCHECK FAIL|KERNEL PANIC|KERNEL FAULT', text):
+                        raise RuntimeError('Thread-group exit regression')
+                    if f'EXITGROUPCHECK PASS rounds={args.exit_group_probe}' in text: break
+                    if process.poll() is not None: raise RuntimeError('VM exited during exit-group probe')
+                    time.sleep(.1)
+                else: raise TimeoutError('Exit-group probe deadline')
+                reap_deadline = time.monotonic()+10
+                while True:
+                    after_exit = base.server.guest(data, 'bridge stats')['process_count']
+                    if after_exit <= before_exit: break
+                    if time.monotonic() >= reap_deadline:
+                        raise RuntimeError(f'Worker records leaked after exit stress: before={before_exit}, after={after_exit}')
+                    time.sleep(.1)
+                report['exit_group_probe'] = {'rounds': args.exit_group_probe, 'passed': True,
+                                              'processes_before': before_exit, 'processes_after': after_exit}
             if args.thread_page_probe and mode == 'run':
                 base.server.guest_run(session, 'run /boot/BIN/ASOWNCHK /data --require-reuse')
                 expires = time.monotonic()+args.deadline
@@ -274,7 +303,7 @@ def main():
             base.write(output/f'{mode}-stop.json', stop)
             process.wait(timeout=30); process = session = None
             final_serial = serial.read_bytes()[offset:].decode(errors='replace')
-            if re.search(r'IOBENCH FAIL|CACHECHECK FAIL|FILELIFECHECK FAIL|PANIC|KERNEL FAULT|BRO176-MAP(?:LEAK|UNDERFLOW)|virtio-blk.*(?:timeout|reset)', final_serial, re.I):
+            if re.search(r'IOBENCH FAIL|CACHECHECK FAIL|FILELIFECHECK FAIL|PANIC|KERNEL FAULT|BRO176-MAP(?:LEAK|UNDERFLOW)|SCHED: exit_group timeout|virtio-blk.*(?:timeout|reset)', final_serial, re.I):
                 raise RuntimeError(f'{mode}: late guest failure during verification or sync')
             shutil.copy2(serial, output/f'{mode}-serial.log')
             shutil.copy2(directory/'launch.log', output/f'{mode}-host.log')

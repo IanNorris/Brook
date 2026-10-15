@@ -2088,12 +2088,9 @@ int ProcessSendSignal(Process* proc, int signum)
         // Running on another CPU — it may execute a few more instructions
         // before the next timer tick preempts it. This is acceptable for a
         // hobby OS; a production kernel would use an IPI to force-preempt.
-        proc->waitStatus = SIGKILL;
         proc->fbVirtual = nullptr;
         proc->fbVirtualSize = 0;
-        __atomic_store_n(reinterpret_cast<volatile uint8_t*>(&proc->state),
-                         static_cast<uint8_t>(ProcessState::Terminated),
-                         __ATOMIC_RELEASE);
+        SchedulerMarkTerminated(proc, SIGKILL);
         // BRO-173/175: reapable is decoupled from holders; the reaper requires
         // refCount==0 before freeing, so it is safe to mark reapable here.
         __atomic_store_n(&proc->reapable, true, __ATOMIC_RELEASE);
@@ -2171,12 +2168,9 @@ int ProcessSendSignal(Process* proc, int signum)
                                    signum == 15);
         if (sa.handler == 0 && defaultIsTerminate)
         {
-            proc->waitStatus = signum;
             proc->fbVirtual = nullptr;
             proc->fbVirtualSize = 0;
-            __atomic_store_n(reinterpret_cast<volatile uint8_t*>(&proc->state),
-                             static_cast<uint8_t>(ProcessState::Terminated),
-                             __ATOMIC_RELEASE);
+            SchedulerMarkTerminated(proc, signum);
             // BRO-173/175: reapable decoupled from holders (reaper requires
             // refCount==0), so it is safe to mark reapable unconditionally.
             __atomic_store_n(&proc->reapable, true, __ATOMIC_RELEASE);
@@ -2335,7 +2329,7 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
             // this process when it sees state != Running. We can't call
             // SchedulerStop/Yield from SyscallCheckSignals because we're
             // in the syscall return path with a special stack layout.
-            proc->state = ProcessState::Stopped;
+            SchedulerMarkStopped(proc);
             return syscallResult;
         }
         default:

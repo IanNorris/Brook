@@ -60,6 +60,12 @@ void KernelThreadTrampoline();
 [[noreturn]] void SchedulerExitCurrentProcess(int status, int terminationSignal = 0);
 void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus,
                               int terminationSignal = 0);
+// Serialize terminal state publication against block/wake/dispatch transitions.
+void SchedulerMarkTerminated(Process* proc, int waitStatus);
+// Request a stop without yielding (for the syscall signal-return path).
+void SchedulerMarkStopped(Process* proc);
+// Drop an owned wait reference and notify a parent if this made it reapable.
+void SchedulerReleaseWaitReference(Process* proc);
 
 // Get the current process running on this CPU (nullptr if none).
 Process* SchedulerCurrentProcess();
