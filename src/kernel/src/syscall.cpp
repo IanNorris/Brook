@@ -20,6 +20,7 @@
 #include "sync/kmutex.h"
 #include "string.h"
 #include "memory/virtual_memory.h"
+#include "memory/mapping_transaction.h"
 #include "memory/physical_memory.h"
 #include "vfs.h"
 #include "ext2_vfs.h"
@@ -4029,79 +4030,51 @@ static int64_t sys_brk(uint64_t newBreak, uint64_t, uint64_t,
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -ENOMEM;
-    if (proc->isThread && proc->threadLeader) proc = proc->threadLeader;
+    for (;;) {
+        MappingTransaction transaction(proc, proc->addressSpace);
+        auto* space = transaction.Space();
+        PmmThrottleForDrain();
+        transaction.Lock();
+        const uint64_t previous = space->programBreak;
+        if (!newBreak || newBreak < space->programBreakLow || newBreak > space->programBreakHigh)
+            return static_cast<int64_t>(previous);
+        const uint64_t generation = space->generation;
+        const uint64_t oldPage = (previous + 4095) & ~4095ULL;
+        const uint64_t newPage = (newBreak + 4095) & ~4095ULL;
+        const uint64_t grow = newPage > oldPage ? (newPage - oldPage) / 4096 : 0;
+        const uint64_t shrink = oldPage > newPage ? (oldPage - newPage) / 4096 : 0;
+        transaction.Unlock();
 
-    // BRO-206: back-pressure before growing/shrinking the heap (a frame
-    // producer/retirer) so heap churn cannot outrun the quarantine drain.
-    PmmThrottleForDrain();
-
-    // The break belongs to the shared address space. A copied per-thread
-    // break remapped and zeroed live heap pages when a sibling grew it.
-    static SpinLock brkLock;
-    struct BrkGuard {
-        SpinLock* lock;
-        explicit BrkGuard(SpinLock* value) : lock(value) { SpinLockAcquire(lock); }
-        ~BrkGuard() { SpinLockRelease(lock); }
-    } guard(&brkLock);
-
-    // brk(0) = query current break
-    if (newBreak == 0)
-    {
-        DbgPrintf("sys_brk: query → 0x%lx\n", proc->addressSpace->programBreak);
-        return static_cast<int64_t>(proc->addressSpace->programBreak);
-    }
-
-    // Validate within program break limits
-    if (newBreak < proc->elf.programBreakLow)
-        return static_cast<int64_t>(proc->addressSpace->programBreak);
-    if (newBreak > proc->elf.programBreakHigh)
-    {
-        SerialPrintf("sys_brk: 0x%lx exceeds limit 0x%lx\n",
-                     newBreak, proc->elf.programBreakHigh);
-        return static_cast<int64_t>(proc->addressSpace->programBreak);
-    }
-
-    // Keep the page containing a partial break alive. Whole pages returned
-    // by a shrink must be unmapped so subsequent growth obtains zeroed
-    // memory, rather than resurrecting the old heap contents.
-    uint64_t oldPage = (proc->addressSpace->programBreak + 4095) & ~4095ULL;
-    uint64_t newPage = (newBreak + 4095) & ~4095ULL;
-
-    if (newPage < oldPage)
-    {
-        for (uint64_t addr = newPage; addr < oldPage; addr += 4096)
-        {
-            VirtualAddress va(addr);
-            PhysicalAddress phys = VmmVirtToPhys(proc->addressSpace->pageTable, va);
-            if (!phys) continue;
-            VmmUnmapPage(proc->addressSpace->pageTable, va);
-            // A fork may still own this COW frame; release only our mapping.
-            PmmUnrefPage(phys);
+        // All storage and zeroing precedes publication. The transaction owns
+        // candidates across allocation waits and owns rollback/retirement until
+        // stale translations have acknowledged their removal.
+        if (!transaction.Prepare(grow ? grow : shrink, grow) ||
+            !transaction.PrepareZeroed(MemTag::User, space->allocationPid)) {
+            transaction.Lock();
+            return static_cast<int64_t>(space->programBreak);
         }
-        TlbShootdownFull(proc->addressSpace->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
-    }
+        transaction.Lock();
+        if (space->generation != generation || space->programBreak != previous)
+            continue; // Discard prepared candidates unlocked, then snapshot again.
 
-    for (uint64_t addr = oldPage; addr < newPage; addr += 4096)
-    {
-        // Never replace a live page already present in the shared heap.
-        if (VmmVirtToPhys(proc->addressSpace->pageTable, VirtualAddress(addr))) continue;
-        PhysicalAddress phys = PmmAllocPage(MemTag::User, ProcessAddressSpacePid(proc));
-        if (!phys) return static_cast<int64_t>(proc->addressSpace->programBreak);
-
-        if (!VmmMapPage(proc->addressSpace->pageTable, VirtualAddress(addr), phys,
-                        VMM_WRITABLE | VMM_USER, MemTag::User, ProcessAddressSpacePid(proc))) {
-            PmmFreePage(phys);
-            return static_cast<int64_t>(proc->addressSpace->programBreak);
+        if (shrink) {
+            for (uint64_t address = newPage; address < oldPage; address += 4096)
+                if (!transaction.Detach(VirtualAddress(address)))
+                    KernelPanic("brk: retirement preflight mismatch");
         }
-
-        // Zero via kernel direct map (safe regardless of page permissions)
-        auto* kp = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
-        for (uint64_t b = 0; b < 4096; ++b) kp[b] = 0;
+        for (uint64_t i = 0; i < grow; ++i) {
+            auto result = transaction.Publish(i, VirtualAddress(oldPage + i * 4096),
+                                               VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
+                                               MemTag::User, space->allocationPid);
+            if (result != VmmMapResult::Mapped && result != VmmMapResult::Occupied) {
+                transaction.RollbackPublished();
+                return static_cast<int64_t>(previous);
+            }
+        }
+        space->programBreak = newBreak;
+        transaction.Changed(false);
+        return static_cast<int64_t>(newBreak);
     }
-
-    DbgPrintf("sys_brk: 0x%lx → 0x%lx\n", proc->addressSpace->programBreak, newBreak);
-    proc->addressSpace->programBreak = newBreak;
-    return static_cast<int64_t>(newBreak);
 }
 
 // ---------------------------------------------------------------------------

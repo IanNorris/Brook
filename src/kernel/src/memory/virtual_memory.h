@@ -97,6 +97,8 @@ VmmMapResult VmmTryMapPage(PageTable pt, VirtualAddress virtAddr,
 // mapping's ownership: ordinary managed frames are unref'd, borrowed device or
 // memfd frames are not. Zero means no present 4KB leaf (large leaves untouched).
 uint64_t VmmDetachPage(PageTable pt, VirtualAddress virtAddr);
+// Conditional detach for rollback; a replacement frame is left untouched.
+uint64_t VmmDetachPageIfMatches(PageTable pt, VirtualAddress virtAddr, PhysicalAddress expected);
 PhysicalAddress VmmLeafPhysical(uint64_t leaf);
 
 // Unmap a single 4KB page. Issues INVLPG. No-op if not mapped.

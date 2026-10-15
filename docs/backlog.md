@@ -230,6 +230,12 @@ the remaining mapping-lifetime guarantees before enabling them;
 memfd/framebuffer sharing remains supported. Keep these separate from the validated file
 creation, chmod and timestamp fixes.
 
+Candidate CMake regeneration still logs failed CMakeCache.txt temporary-file
+renames before completing through fallback. Reproduce this specific overwrite
+case and inspect its error/fallback behavior; the general semantic probe does
+not establish that every build-tool rename works. Evidence:
+`build/workloads/mapping-transaction-20261015/guest-serial.log`.
+
 Bootstrap rename-overwrite, open-unlinked lifetime and directory accounting
 now pass the expanded semantic probe and synced offline fsck. Remaining work
 is injected-I/O failure handling, rollback auditing and crash consistency;
@@ -348,7 +354,9 @@ generation check alone cannot cover anonymous/device replacement or COW.
 - The separately referenced address-space object and process-context cleanup
   worker are implemented and passed targeted host/guest lifetime acceptance.
   Threads retain it; fork creates independent state; exec swaps references.
-  Its mutex and generation are preparatory: serialize mmap/MAP_FIXED, munmap,
+  The mutex/generation now serve the first `brk` transaction consumer;
+  record/frame preparation, rollback and post-ACK retirement have targeted
+  host/guest coverage. Serialize mmap/MAP_FIXED, munmap,
   mprotect, mremap, fork, memfd, CoW and GUI writers through one protocol next.
   Keep final filesystem work outside scheduler interrupt context. Consuming
   waits now finish a finite worker cleanup batch before returning; add a

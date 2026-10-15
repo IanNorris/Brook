@@ -35,6 +35,7 @@ struct AddressSpaceState {
     FbMap fbMaps[MAX_FB_MAPS];
     CompositorVfbAllocation* fbAllocations; // legacy graphics backing owned by this AS
     AddressSpaceState* cleanupNext;
+    uint64_t programBreakLow, programBreakHigh; // bounds of this image, independent of leader exec
 };
 
 void AddressSpaceKernelInit();

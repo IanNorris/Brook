@@ -8,6 +8,9 @@
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <memory>
+#include <unordered_map>
+#include "memory/mapping_transaction.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "serial.h"
@@ -24,7 +27,15 @@ alignas(pageSize) unsigned char frames[pageCount][pageSize];
 struct Frame { unsigned refs=0, maps=0; } records[pageCount];
 std::mutex frameLock;
 std::atomic<bool> failAllocation{false};
+std::atomic<int> failFrameAfter{-1};
 std::atomic<int> heapAllocations{0};
+std::atomic<int> failHeapAfter{-1};
+std::mutex mutexRegistryGuard;
+std::unordered_map<KMutex*,std::unique_ptr<std::mutex>> mutexRegistry;
+std::mutex& hostMutex(KMutex* mutex) {
+    std::lock_guard<std::mutex> guard(mutexRegistryGuard);
+    CHECK(mutexRegistry.count(mutex));return *mutexRegistry.at(mutex);
+}
 
 size_t indexOf(PhysicalAddress p) {
     auto base=reinterpret_cast<uint64_t>(frames);
@@ -70,9 +81,20 @@ extern "C" void KernelPanic(const char* format,...) {
     va_list args;va_start(args,format);std::vfprintf(stderr,format,args);va_end(args);std::abort();
 }
 namespace brook {
-extern "C" void* kmalloc(uint64_t size) { void* p=nullptr;if(posix_memalign(&p,64,size))return nullptr;++heapAllocations;return p; }
+extern "C" void* kmalloc(uint64_t size) {
+    int countdown=failHeapAfter.load();
+    if(countdown>=0) { if(!countdown){failHeapAfter=-1;return nullptr;}--failHeapAfter; }
+    void* p=nullptr;if(posix_memalign(&p,64,size))return nullptr;++heapAllocations;return p;
+}
 extern "C" void kfree(void* p) { if(p){--heapAllocations;std::free(p);} }
-void KMutexInit(KMutex* mutex) { std::memset(mutex,0,sizeof(*mutex)); }
+void KMutexInit(KMutex* mutex) {
+    std::memset(mutex,0,sizeof(*mutex));
+    std::lock_guard<std::mutex> guard(mutexRegistryGuard);mutexRegistry[mutex]=std::make_unique<std::mutex>();
+}
+void KMutexLock(KMutex* mutex) { hostMutex(mutex).lock(); }
+void KMutexUnlock(KMutex* mutex) { hostMutex(mutex).unlock(); }
+void SchedulerKernelRegionEnter(Process* process) { ++process->kernelRegionDepth;ProcessRef(process); }
+void SchedulerKernelRegionLeave(Process* process) { CHECK(process->kernelRegionDepth);--process->kernelRegionDepth;ProcessUnref(process); }
 void SchedulerUnblock(Process* process) {
     CHECK(expectedCompletion && expectedCompletion->done);
     CHECK(process==expectedCompletion->waiter && process->refCount==1);
@@ -94,6 +116,8 @@ void VfsFileMapUnpin(Vnode*) { ++unpinnedVnodes; }
 extern "C" void VfsClose(Vnode* vn) { CHECK(!vn->refCount);++closedVnodes; }
 PhysicalAddress PmmAllocPage(MemTag,uint16_t) {
     if(failAllocation.exchange(false))return {};
+    int countdown=failFrameAfter.load();
+    if(countdown>=0) { if(!countdown){failFrameAfter=-1;return {};}--failFrameAfter; }
     std::lock_guard<std::mutex> lock(frameLock);
     for(size_t i=0;i<pageCount;++i)if(!records[i].refs) {
         CHECK(!records[i].maps);records[i].refs=1;std::memset(frames[i],0xcc,pageSize);
@@ -308,9 +332,95 @@ static void consumingWaitCleanup() {
     PmmFreePage(root.pml4);VmmHostSetKernelRoot({});empty();
     std::puts("ADDRESS SPACE WAIT PASS pin-release-before-wake/waiter-ref/finite-batch");
 }
+struct BackingRetirementWitness { AddressSpaceState* space; PhysicalAddress physical; bool released=false; };
+static void releaseTransactionBacking(void* opaque) {
+    auto* witness=static_cast<BackingRetirementWitness*>(opaque);
+    CHECK(hostMutex(&witness->space->mutation).try_lock());hostMutex(&witness->space->mutation).unlock();
+    CHECK(PmmGetRefCount(witness->physical)==1&&maps(witness->physical)==0);
+    PmmFreePage(witness->physical);witness->released=true;
+}
+static void mappingTransactions() {
+    auto root=table();VmmHostSetKernelRoot(root);
+    auto* space=AddressSpaceCreate(25);CHECK(space);Process actor{};actor.addressSpace=space;
+    auto original=PmmAllocPage();CHECK(VmmTryMapPage(space->pageTable,va,original,flags)==VmmMapResult::Mapped);
+    uint64_t generation=space->generation;
+    Gate ack;pendingAcknowledgement=&ack;
+    std::thread remover([&]{
+        MappingTransaction operation(&actor,space);CHECK(operation.Prepare(1,0));
+        operation.Lock();CHECK(operation.Detach(va));
+        CHECK(actor.kernelRegionDepth&&space->references==2);
+    });
+    ack.wait(1);
+    CHECK(!VmmVirtToPhys(space->pageTable,va)&&PmmGetRefCount(original)==1);
+    CHECK(hostMutex(&space->mutation).try_lock());hostMutex(&space->mutation).unlock();
+    CHECK(space->generation>generation);
+    auto replacement=PmmAllocPage();CHECK(replacement!=original);
+    CHECK(VmmTryMapPage(space->pageTable,va,replacement,flags)==VmmMapResult::Mapped);
+    ack.release();remover.join();pendingAcknowledgement=nullptr;
+    CHECK(!PmmGetRefCount(original)&&!actor.kernelRegionDepth&&!actor.refCount&&space->references==1);
+    CHECK(VmmVirtToPhys(space->pageTable,va)==replacement);
+    // Rollback retires only a matching published frame, leaving replacements.
+    {
+        MappingTransaction operation(&actor,space);CHECK(operation.Prepare(2,2));
+        CHECK(operation.PrepareZeroed(MemTag::User,25));operation.Lock();
+        CHECK(operation.Publish(0,va+4096,flags,MemTag::User,25)==VmmMapResult::Mapped);
+        auto zeroed=VmmVirtToPhys(space->pageTable,va+4096);
+        for(unsigned i=0;i<pageSize;++i)CHECK(reinterpret_cast<unsigned char*>(zeroed.raw())[i]==0);
+        CHECK(operation.Publish(1,va,flags,MemTag::User,25)==VmmMapResult::Occupied);
+        operation.RollbackPublished();operation.RollbackPublished();
+        CHECK(!VmmVirtToPhys(space->pageTable,va+4096));
+        CHECK(VmmVirtToPhys(space->pageTable,va)==replacement);
+    }
+    // A replacement made after publication must not be detached by rollback.
+    auto other=PmmAllocPage();PhysicalAddress previous;
+    {
+        MappingTransaction operation(&actor,space);CHECK(operation.Prepare(1,1));CHECK(operation.PrepareZeroed(MemTag::User,25));operation.Lock();
+        CHECK(operation.Publish(0,va+4096,flags,MemTag::User,25)==VmmMapResult::Mapped);
+        auto retired=VmmDetachPage(space->pageTable,va+4096);previous=VmmLeafPhysical(retired);
+        CHECK(VmmTryMapPage(space->pageTable,va+4096,other,flags)==VmmMapResult::Mapped);
+        operation.RollbackPublished();CHECK(VmmVirtToPhys(space->pageTable,va+4096)==other);
+    }
+    PmmUnrefPage(previous); // external replacement owns its retirement token.
+    for(int fail=0;fail<3;++fail) {
+        MappingTransaction operation(&actor,space);failHeapAfter=fail;
+        CHECK(!operation.Prepare(1,1,1));CHECK(VmmVirtToPhys(space->pageTable,va)==replacement);
+    }
+    {
+        MappingTransaction operation(&actor,space);CHECK(operation.Prepare(1,1));
+        failAllocation=true;CHECK(!operation.PrepareZeroed(MemTag::User,25));
+        CHECK(VmmVirtToPhys(space->pageTable,va)==replacement);
+    }
+    {
+        MappingTransaction operation(&actor,space);CHECK(operation.Prepare(3,3));
+        failFrameAfter=1;CHECK(!operation.PrepareZeroed(MemTag::User,25));
+    }
+    {
+        MappingTransaction operation(&actor,space);CHECK(operation.Prepare(2,2));
+        CHECK(operation.PrepareZeroed(MemTag::User,25));operation.Lock();
+        CHECK(operation.Publish(0,va+8192,flags,MemTag::User,25)==VmmMapResult::Mapped);
+        failAllocation=true;
+        CHECK(operation.Publish(1,va+0x40000000,flags,MemTag::User,25)==VmmMapResult::OutOfMemory);
+        operation.RollbackPublished();CHECK(!VmmVirtToPhys(space->pageTable,va+8192));
+        CHECK(!VmmVirtToPhys(space->pageTable,va+0x40000000));
+    }
+    auto borrowed=PmmAllocPage(MemTag::Device);
+    CHECK(VmmTryMapPage(space->pageTable,va+8192,borrowed,flags,MemTag::Device)==VmmMapResult::Mapped);
+    BackingRetirementWitness witness{space,borrowed};Gate backingAck;pendingAcknowledgement=&backingAck;
+    std::thread backingRemover([&]{
+        MappingTransaction operation(&actor,space);CHECK(operation.Prepare(1,0,1));operation.Lock();
+        CHECK(operation.Detach(va+8192));CHECK(operation.RetireBacking(&witness,releaseTransactionBacking));
+    });
+    backingAck.wait(1);CHECK(!witness.released&&PmmGetRefCount(borrowed)==1);
+    backingAck.release();backingRemover.join();pendingAcknowledgement=nullptr;
+    CHECK(witness.released&&!PmmGetRefCount(borrowed));
+    CHECK(!actor.kernelRegionDepth&&!actor.refCount&&space->references==1&&heapAllocations==1);
+    AddressSpaceUnref(space);CHECK(ProcessCleanupStep());
+    PmmFreePage(root.pml4);VmmHostSetKernelRoot({});empty();
+    std::puts("MAPPING TRANSACTION PASS delayed-ACK/unlocked-retirement/zero-publication/rollback/replacement/OOM");
+}
 int main() {
     competingInstallAndDetach();detachReinstall();largeLeafAndBorrowedFrame();occupiedAncestors();failureAndInPlace();
     cowRetirement(false);for(unsigned i=0;i<32;++i)cowRetirement(true);
-    addressSpaceLifetime();consumingWaitCleanup();
+    addressSpaceLifetime();consumingWaitCleanup();mappingTransactions();
     std::puts("VMM LEAF PASS install/detach races=64 concurrent-cow=32 retirement/OOM/in-place/reuse");
 }

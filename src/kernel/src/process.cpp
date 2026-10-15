@@ -720,6 +720,8 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     }
 
     proc->addressSpace->programBreak = proc->elf.programBreakLow;
+    proc->addressSpace->programBreakLow = proc->elf.programBreakLow;
+    proc->addressSpace->programBreakHigh = proc->elf.programBreakHigh;
     // Keep mmap beyond both the loaded image and its reserved brk range.
     uint64_t mmapFloor = (proc->elf.programBreakHigh + 16 * 1024 * 1024 + 4095) & ~uint64_t{4095};
     proc->addressSpace->mmapNext = mmapFloor > USER_MMAP_BASE ? mmapFloor : USER_MMAP_BASE;
@@ -1405,6 +1407,8 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     // leader may already have installed a different address space via exec.
     Process* mapOwner = parent;
     child->addressSpace->programBreak = mapOwner->addressSpace->programBreak;
+    child->addressSpace->programBreakLow = mapOwner->addressSpace->programBreakLow;
+    child->addressSpace->programBreakHigh = mapOwner->addressSpace->programBreakHigh;
     child->addressSpace->mmapNext = mapOwner->addressSpace->mmapNext;
     SpinLockAcquire(&mapOwner->addressSpace->fileMapLock);
     memcpy(child->addressSpace->memfdMaps, mapOwner->addressSpace->memfdMaps, sizeof(child->addressSpace->memfdMaps));
@@ -1905,6 +1909,8 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     }
 
     proc->addressSpace->programBreak = proc->elf.programBreakLow;
+    proc->addressSpace->programBreakLow = proc->elf.programBreakLow;
+    proc->addressSpace->programBreakHigh = proc->elf.programBreakHigh;
     // Keep mmap beyond both the loaded image and its reserved brk range.
     uint64_t mmapFloor = (proc->elf.programBreakHigh + 16 * 1024 * 1024 + 4095) & ~uint64_t{4095};
     proc->addressSpace->mmapNext = mmapFloor > USER_MMAP_BASE ? mmapFloor : USER_MMAP_BASE;

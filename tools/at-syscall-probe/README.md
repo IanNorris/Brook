@@ -603,3 +603,11 @@ fault. Kernel-buffer reads retain the direct coalesced path. Cache insertion
 allocates missing buffers outside the cache lock and disposes of unused racing
 allocations after unlocking. Invalid user-buffer recovery and concurrent VMA
 invalidation remain separate compatibility work.
+
+
+`brkexeccheck.c` is a Brook-specific nonleader-exec isolation check. Compile with
+`musl-gcc -static -O2 -pthread brkexeccheck.c -o brkexeccheck` and run it in the
+guest under a host watchdog. It checks the current detached nonleader-exec
+model, separate new-image heap growth and continued sharing by old-AS tasks;
+it does not assert Linux exec semantics. Internal pipe polls have five-second
+bounds. It passes both the pre-transaction baseline and transaction candidate.

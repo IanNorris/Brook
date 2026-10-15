@@ -526,3 +526,49 @@ successful final two-filesystem tar run took about half a second; the first
 harness wait included diagnosis/retry and is not a performance measurement.
 Generic backend errors and boolean path-resolution failures remain existing
 limitations beyond this targeted exclusive-create fix.
+
+
+## Prepared mapping transactions and heap updates (15 October 2026)
+
+`MappingTransaction` now retains the executing task's address space and a kernel
+region across preparation, commit and retirement. It allocates records and
+zeroes candidate frames before taking the AS mutation mutex. Detached leaves
+and backing callbacks remain owned until the mutex is released and remote TLB
+acknowledgements complete. Rollback conditionally detaches only the matching
+published physical frame, and is idempotent within the original lock epoch.
+Physical matching alone is not an incarnation guard against legacy writers.
+
+`brk` is the first consumer. Heap bounds live with the address space, including
+fork/exec initialization. Growth prepares zeroed pages before publication and
+rolls back partially published pages on allocation failure. Shrink retains
+removed frames through shootdown instead of releasing them first. Generation
+validation retries preparation after another participating writer changes the
+AS. Other mapping writers and faults have not yet joined this protocol; lazy
+mapping overlap and range reservations still need the common range engine.
+This does not enable regular-file MAP_SHARED or establish browser acceptance.
+
+Actual transaction/VMM host tests cover delayed acknowledgement, unlocked frame
+and backing retirement, zero-before-publication, occupied/replaced leaves,
+idempotent rollback, record/frame allocation failures and partial publication
+rollback. Scheduler cancellation is instrumented with host shims; deterministic
+real cancellation tests remain outstanding.
+
+Candidate kernel SHA-256
+`5d8b705f740e1b5f056b50b38931bbfabda6d8e1b56baf97173db02ebf0d9fff`
+passed all 14 host tests and all 14 after rebuilding the changed test sources
+inside Brook against a checked source manifest. Guest shared-heap growth,
+partial/aligned shrink/regrowth, fork isolation, graphics lifetime, expanded
+waitid, cache/CoW, five I/O gates and thirteen compatibility/persistence gates
+passed. Heap integrity was OK; checked shutdown and all three offline filesystem
+checks passed. This focused run used eight vCPUs, 4 GiB guest RAM and sparse host
+tmpfs disks; it is not a fresh two-path bootstrap acceptance run. Evidence:
+`build/workloads/mapping-transaction-20261015/`.
+
+The new `brkexeccheck` passes on both the accepted baseline and candidate. It
+checks Brook's current nonleader-exec detachment model: a new image has its own
+heap while the surviving old-AS tasks still share theirs. It is not proof of
+Linux nonleader-exec semantics or a baseline regression reproduction. A leader
+exec terminates siblings; an earlier test assuming otherwise was discarded.
+During candidate CMake regeneration, cache-file rename attempts still logged
+failure, although regeneration and the actual newly compiled tests completed.
+That remaining overwrite/fallback behavior needs a focused investigation.

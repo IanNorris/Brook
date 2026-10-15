@@ -136,6 +136,7 @@ add_test(NAME test_ext2
 add_host_test(test_vmm_leaf
     "${BROOK_ROOT}/src/kernel/src/memory/virtual_memory.cpp"
     "${BROOK_ROOT}/src/kernel/src/memory/address_space.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/mapping_transaction.cpp"
 )
 target_compile_options(test_vmm_leaf PRIVATE
     -DBROOK_HOST_TEST -ffunction-sections -fdata-sections

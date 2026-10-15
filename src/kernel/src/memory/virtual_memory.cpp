@@ -386,6 +386,21 @@ uint64_t VmmDetachPage(PageTable pt, VirtualAddress virtAddr)
     return old;
 }
 
+uint64_t VmmDetachPageIfMatches(PageTable pt, VirtualAddress virtAddr, PhysicalAddress expected)
+{
+    IrqSpinLock& lock = !pt ? g_kernelPtLock : g_userPtLock;
+    uint64_t saved = IrqSpinLockAcquire(&lock);
+    uint64_t* pte = WalkToPtr(pt, virtAddr, false);
+    uint64_t old = pte && (*pte & VMM_PRESENT) && VmmLeafPhysical(*pte) == expected ? *pte : 0;
+    if (old) {
+        if (old & VMM_USER) PmmMapDec(expected);
+        *pte = 0;
+        Invlpg(virtAddr);
+    }
+    IrqSpinLockRelease(&lock, saved);
+    return old;
+}
+
 void VmmUnmapPage(PageTable pt, VirtualAddress virtAddr)
 {
     (void)VmmDetachPage(pt, virtAddr);
