@@ -117,3 +117,37 @@ This establishes the tested ASCII editing workflow, rather than full terminal
 emulation or PTY support. CPU-only asynchronous handler delivery at interrupt
 return and timer-driven job-control signals remain unsupported; those timer
 notifications return an explicit error. The probe README records these limits.
+
+
+## Codium compatibility investigation (15 October 2026)
+
+Stock VSCodium 1.112.01907 installs through the guest package installer. Its
+193 MiB ELF exposed silent 32 MiB executable-image truncation in both shell
+launch and execve. The shared reader now reads the exact image with bounded
+512 MiB allocation and explicit errors, and the loader copies page-sized chunks
+rather than translating every byte. A 40 MiB file-backed payload passes both
+launch paths. Seven malformed ELF variants return ENOEXEC while a sibling
+heartbeat thread continues, before destructive exec replacement.
+
+Chromium's thread discovery also requires `/proc/self/task` and its directory
+link count. The new task-directory regression verifies live TIDs, single-thread
+link count, thread-self/status, foreign-thread rejection, and a held directory
+across 32 exit/reuse cycles. The guest observed a reused PID without retargeting
+the stale directory. The general stale-dirfd path-resolution case remains a
+separate followup; this test covers held vnode enumeration/stat.
+
+Codium then rejected its shared memory because independent FAT opens reported
+different inode numbers. FAT now reports device plus physical directory-entry
+identity, including cached files and stat-by-path; anonymous memfd backings get
+unique stable identities shared by dup/fork. `fileidentitycheck` passes on the
+boot FAT `/tmp` and ext2 `/data`, with 4 KiB and cached 128 KiB files, repeated
+stat/fstat/lstat/fstatat, truncate/reopen, dup/fork and distinct memfds. FAT rename
+can relocate its directory entry, and unlink/recreate can reuse it: persistent
+POSIX identity across those operations is not claimed.
+
+The latest guest kernel for the identity check is
+`35f26dcd952025262a49a954f39c82d047d2bde6fb5457eb2030fd5650cb68a0`.
+The shared-memory inode mismatch and earlier thread-discovery fatal are gone.
+Codium still hits a user-mode Chromium thread breakpoint before showing an
+editor. A successful package install or CLI launcher exit is not a working
+editor acceptance result. Inotify and netlink support are also still missing.

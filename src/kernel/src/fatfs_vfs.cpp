@@ -339,18 +339,66 @@ static int FatCachedFsync(Vnode* vn)
     return result;
 }
 
+// FAT has no persistent inode field. For a file, the physical short-name
+// directory entry is its exact identity while that entry remains allocated.
+// This survives independent opens, empty files, growth and truncation (unlike
+// the first data cluster), and uses no path hash or identity registry.
+// Rename may relocate the entry and unlink/recreate may reuse it: those are
+// explicit FAT identity limitations, not persistent POSIX inode semantics.
+// Keep cacheId == 0: stat identity must not opt FAT into the VFS page cache.
+static_assert(FF_FS_EXFAT == 0 && FF_FS_READONLY == 0,
+              "FAT stat identity requires FAT12/16/32 directory-entry metadata");
+static_assert(FF_MIN_SS == 512 && FF_MAX_SS == 512 && sizeof(LBA_t) <= 4,
+              "FAT inode encoding assumes 512-byte sectors and 32-bit LBAs");
+
+static uint64_t FatDeviceIdentity(const FATFS* fs)
+{
+    // Virtual FAT major, distinct from ext2's 254. FatFS drive numbers are
+    // unique in the mounted volume table (FF_MULTI_PARTITION is disabled).
+    return (253ULL << 8) | (uint64_t{fs->pdrv} + 1);
+}
+
+// Caller holds g_fatLock, including while inspecting the shared window base.
+static bool FatFileIdentity(const FIL* fil, VnodeStat* st)
+{
+    const FATFS* fs = fil->obj.fs;
+    if (!fs || !fil->dir_ptr || !fil->dir_sect) return false;
+    const uintptr_t entry = reinterpret_cast<uintptr_t>(fil->dir_ptr);
+    const uintptr_t window = reinterpret_cast<uintptr_t>(fs->win);
+    if (entry < window || entry - window >= FF_MAX_SS || ((entry - window) & 31))
+        return false;
+    st->ino = uint64_t{fil->dir_sect} * (FF_MAX_SS / 32) + (entry - window) / 32 + 1;
+    st->dev = FatDeviceIdentity(fs);
+    return true;
+}
+
+static bool FatDirectoryIdentity(const DIR* dir, VnodeStat* st)
+{
+    if (!dir->obj.fs) return false;
+    // Directory chains have a stable start cluster; FatFS represents the root
+    // by zero. Use a separate namespace from all possible file entry numbers.
+    st->ino = (1ULL << 62) | (uint64_t{dir->obj.sclust} + 1);
+    st->dev = FatDeviceIdentity(dir->obj.fs);
+    return true;
+}
+
 static int FatStat(Vnode* vn, VnodeStat* st)
 {
+    KMutexLock(&g_fatLock);
+    bool valid;
     if (vn->type == VnodeType::File) {
-        FIL* fil = static_cast<FIL*>(vn->priv);
-        st->size  = f_size(fil);
+        const FIL* fil = static_cast<FIL*>(vn->priv);
+        st->size = f_size(fil);
         st->isDir = false;
+        valid = FatFileIdentity(fil, st);
     } else {
-        st->size  = 0;
+        st->size = 0;
         st->isDir = true;
+        valid = FatDirectoryIdentity(static_cast<DIR*>(vn->priv), st);
     }
     st->isSymlink = false;
-    return 0;
+    KMutexUnlock(&g_fatLock);
+    return valid ? 0 : -FVFS_EIO;
 }
 
 static int CachedFileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
@@ -387,10 +435,13 @@ static void CachedFileClose(Vnode* vn)
 static int CachedFileStat(Vnode* vn, VnodeStat* st)
 {
     auto* cf = static_cast<CachedFile*>(vn->priv);
-    st->size  = cf->size;
+    KMutexLock(&g_fatLock);
+    st->size = cf->size;
     st->isDir = false;
     st->isSymlink = false;
-    return 0;
+    const bool valid = FatFileIdentity(cf->fil, st);
+    KMutexUnlock(&g_fatLock);
+    return valid ? 0 : -FVFS_EIO;
 }
 
 static const VnodeOps g_cachedFileOps = {
@@ -654,16 +705,38 @@ static int FatFsStatPath(void* /*mountPriv*/, uint8_t pdrv,
     }
 
     bool isRoot = (relPath[0] == '/' && relPath[1] == '\0') || relPath[0] == '\0';
-    if (isRoot) { st->size = 0; st->isDir = true; st->isSymlink = false; return 0; }
 
     char fatPath[256];
     BuildFatPath(fatPath, sizeof(fatPath), pdrv, relPath);
 
-    FILINFO fno;
+    FILINFO fno = {};
+    VnodeStat identity = {};
     KMutexLock(&g_fatLock);
-    FRESULT res = f_stat(fatPath, &fno);
+    FRESULT res = isRoot ? FR_OK : f_stat(fatPath, &fno);
+    bool valid = false;
+    if (res == FR_OK) {
+        if (isRoot || (fno.fattrib & AM_DIR)) {
+            DIR dir = {};
+            res = f_opendir(&dir, fatPath);
+            if (res == FR_OK) {
+                valid = FatDirectoryIdentity(&dir, &identity);
+                res = f_closedir(&dir);
+            }
+        } else {
+            // f_stat's FILINFO omits the entry location. A read-only open
+            // exposes that exact location without changing file contents;
+            // keep stat/open/close under the same namespace lock.
+            FIL fil = {};
+            res = f_open(&fil, fatPath, FA_READ);
+            if (res == FR_OK) {
+                valid = FatFileIdentity(&fil, &identity);
+                res = f_close(&fil);
+            }
+        }
+    }
     KMutexUnlock(&g_fatLock);
-    if (res != FR_OK) return -1;
+    if (res != FR_OK) return FrToErrno(res);
+    if (!valid) return -FVFS_EIO;
 
     // Recheck st after lock round-trip — catches SMP register corruption.
     stVal = reinterpret_cast<uint64_t>(st);
@@ -676,7 +749,9 @@ static int FatFsStatPath(void* /*mountPriv*/, uint8_t pdrv,
         return -1;
     }
 
-    st->isDir = (fno.fattrib & AM_DIR) != 0;
+    st->isDir = isRoot || (fno.fattrib & AM_DIR) != 0;
+    st->ino = identity.ino;
+    st->dev = identity.dev;
     st->size  = st->isDir ? 0 : fno.fsize;
     st->isSymlink = false;
     return 0;

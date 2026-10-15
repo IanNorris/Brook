@@ -201,6 +201,7 @@ add_executable(kernel
     src/context_switch.S
     src/exception_stubs.S
     src/elf_loader.cpp
+    src/exec_image.cpp
     src/vfs.cpp
     src/fatfs_vfs.cpp
     src/ext2_vfs.cpp

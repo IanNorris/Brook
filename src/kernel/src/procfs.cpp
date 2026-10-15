@@ -144,6 +144,12 @@ struct ProcPriv {
     char*    data;
     uint32_t size;
     bool     isDir;
+    uint16_t pid;
+    uint16_t tgid;
+    uint64_t incarnation;
+    uint64_t groupIncarnation;
+    bool taskRoot;
+    bool taskMember;
 };
 
 // VnodeOps for procfs files
@@ -195,10 +201,21 @@ static void ProcDirClose(Vnode* vn)
 static int ProcRootReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie);
 static int ProcPidReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie);
 static int ProcFdReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie);
-static Vnode* GenPidFdLink(uint16_t pid, int fd);
+static Vnode* GenPidFdLink(uint16_t pid, int fd, uint64_t incarnation = 0);
+static int ProcTaskReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie);
 
 static int ProcDirStat(Vnode* vn, VnodeStat* st)
 {
+    auto* pp = static_cast<ProcPriv*>(vn->priv);
+    if (pp && pp->pid)
+    {
+        ProcessSnapshot snap;
+        if (!SchedulerSnapshotProcess(pp->pid, &snap) || snap.incarnation != pp->incarnation ||
+            (pp->taskMember && snap.state == ProcessState::Terminated)) return -1;
+        st->ino = (pp->incarnation << 20) | (uint64_t{pp->pid} << 4) | (pp->taskRoot ? 2 : 1);
+        st->nlink = pp->taskRoot ? 2 + SchedulerCountTasks(pp->tgid, pp->groupIncarnation) : 2;
+    }
+    else st->nlink = 2;
     st->size = 0;
     st->isDir = true;
     return 0;
@@ -216,12 +233,17 @@ static VnodeOps g_procPidDirOps = {
     ProcFileOpen, ProcDirRead, ProcFileWrite, ProcPidReaddir, ProcDirClose, ProcDirStat, nullptr
 };
 
+static VnodeOps g_procTaskDirOps = {
+    ProcFileOpen, ProcDirRead, ProcFileWrite, ProcTaskReaddir, ProcDirClose, ProcDirStat, nullptr
+};
+
 // ---- Helper: create a procfs vnode from a buffer ----
 
 static Vnode* MakeProcVnode(char* data, uint32_t size, bool isDir = false, VnodeOps* ops = nullptr)
 {
     auto* pp = static_cast<ProcPriv*>(kmalloc(sizeof(ProcPriv)));
     if (!pp) { kfree(data); return nullptr; }
+    *pp = {};
     pp->data = data;
     pp->size = size;
     pp->isDir = isDir;
@@ -546,12 +568,12 @@ static Vnode* GenPidStat(const ProcessSnapshot& proc)
     uint32_t n = ProcFmt(buf, 512,
         "%u (%s) %c %u %u %u 0 -1 0 "
         "0 0 0 0 %lu %lu 0 0 "
-        "20 0 1 0 0 %lu %lu "
+        "20 0 %u 0 0 %lu %lu "
         "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 "
         "0 0 0 0 0 0 0 0 0 0\n",
         (uint32_t)proc.pid, proc.name, StateChar(proc.state),
         (uint32_t)proc.parentPid, (uint32_t)proc.pgid, (uint32_t)proc.sid,
-        utime, stime,
+        utime, stime, proc.threadCount,
         vsize, rss);
 
     return MakeProcVnode(buf, n);
@@ -575,16 +597,16 @@ static Vnode* GenPidStatus(const ProcessSnapshot& proc)
         "Sid:\t%u\n"
         "VmSize:\t%lu kB\n"
         "VmRSS:\t%lu kB\n"
-        "Threads:\t1\n",
+        "Threads:\t%u\n",
         proc.name,
         StateStr(proc.state), proc.name,
-        (uint32_t)proc.pid,
+        (uint32_t)proc.tgid,
         (uint32_t)proc.pid,
         (uint32_t)proc.parentPid,
         (uint32_t)proc.pgid,
         (uint32_t)proc.sid,
         vsize / 1024,
-        (proc.stackTop - proc.stackBase) / 1024);
+        (proc.stackTop - proc.stackBase) / 1024, proc.threadCount);
 
     return MakeProcVnode(buf, n);
 }
@@ -712,7 +734,14 @@ static bool IsDigit(char c) { return c >= '0' && c <= '9'; }
 static uint32_t ParseUint(const char* s, const char** end)
 {
     uint32_t val = 0;
-    while (IsDigit(*s)) { val = val * 10 + (*s - '0'); s++; }
+    while (IsDigit(*s)) {
+        if (val > (65535u - static_cast<uint32_t>(*s - '0')) / 10) {
+            while (IsDigit(*s)) ++s;
+            if (end) *end = s;
+            return 65536;
+        }
+        val = val * 10 + (*s++ - '0');
+    }
     if (end) *end = s;
     return val;
 }
@@ -731,7 +760,7 @@ static bool IsPidPath(const char* path, uint32_t* pid, const char** rest)
 // Find a process snapshot by PID
 static bool FindProcess(uint32_t pid, ProcessSnapshot* out)
 {
-    return SchedulerSnapshotProcess(static_cast<uint16_t>(pid), out);
+    return pid > 0 && pid <= 65535 && SchedulerSnapshotProcess(static_cast<uint16_t>(pid), out);
 }
 
 // ---- /proc/net/dev — network interface statistics ----
@@ -1176,211 +1205,139 @@ static bool StrEqProc(const char* a, const char* b)
     return *a == *b;
 }
 
-// ---- Public API ----
-
-void ProcFsInit()
+// Resolve dynamic aliases at lookup time. /proc/self is the thread group;
+// /proc/thread-self identifies the caller's individual task.
+static bool ResolveProcPath(const char* path, char* out, uint32_t capacity)
 {
-    SerialPuts("procfs: initialised\n");
+    if (!path) path = "";
+    while (*path == '/') ++path;
+    char* p = out;
+    const bool self = strncmp(path, "self", 4) == 0 && (!path[4] || path[4] == '/');
+    const bool threadSelf = strncmp(path, "thread-self", 11) == 0 && (!path[11] || path[11] == '/');
+    if (self || threadSelf)
+    {
+        Process* cur = SchedulerCurrentProcess();
+        if (!cur) return false;
+        p = U64ToDec(p, cur->tgid ? cur->tgid : cur->pid);
+        if (threadSelf) { p = AppendStr(p, "/task/"); p = U64ToDec(p, cur->pid); }
+        path += self ? 4 : 11;
+    }
+    while (*path) { if (p + 1 >= out + capacity) return false; *p++ = *path++; }
+    while (p > out && p[-1] == '/') --p;
+    *p = 0;
+    return true;
 }
+
+struct ProcLookup {
+    ProcessSnapshot snap;
+    const char* rest;
+    bool taskRoot, taskMember;
+};
+
+static bool LookupProcPid(const char* path, ProcLookup* result)
+{
+    *result = {};
+    uint32_t pid;
+    if (!IsPidPath(path, &pid, &result->rest) || !FindProcess(pid, &result->snap)) return false;
+    const char* rest = result->rest;
+    if (strncmp(rest, "task", 4) != 0 || (rest[4] && rest[4] != '/')) return true;
+    if (!rest[4]) { result->taskRoot = true; result->rest = ""; return true; }
+    uint32_t tid;
+    const char* suffix;
+    if (!IsPidPath(rest + 5, &tid, &suffix) || !tid || tid > 65535) return false;
+    ProcessSnapshot task;
+    if (!SchedulerSnapshotTask(result->snap.tgid, result->snap.groupIncarnation,
+                               static_cast<uint16_t>(tid), 0, &task)) return false;
+    result->snap = task; result->rest = suffix; result->taskMember = true;
+    return true;
+}
+
+static bool ProcFdNumber(const char* rest, int* fd)
+{
+    if (strncmp(rest, "fd/", 3) != 0 || !IsDigit(rest[3])) return false;
+    const char* end;
+    uint32_t value = ParseUint(rest + 3, &end);
+    if (*end || value >= MAX_FDS) return false;
+    *fd = static_cast<int>(value);
+    return true;
+}
+
+static Vnode* MakePidDirectory(const ProcLookup& path, VnodeOps* ops)
+{
+    Vnode* vn = MakeProcVnode(nullptr, 0, true, ops);
+    if (!vn) return nullptr;
+    auto* pp = static_cast<ProcPriv*>(vn->priv);
+    pp->pid = path.snap.pid; pp->tgid = path.snap.tgid;
+    pp->incarnation = path.snap.incarnation; pp->groupIncarnation = path.snap.groupIncarnation;
+    pp->taskRoot = path.taskRoot; pp->taskMember = path.taskMember;
+    return vn;
+}
+
+void ProcFsInit() { SerialPuts("procfs: initialised\n"); }
 
 Vnode* ProcFsOpen(const char* relPath, int /*flags*/)
 {
-    if (!relPath || !relPath[0]) return nullptr;
-
-    // Handle "self" → current process PID
-    char resolved[64];
-    if (relPath[0] == 's' && relPath[1] == 'e' && relPath[2] == 'l' && relPath[3] == 'f')
-    {
-        Process* cur = SchedulerCurrentProcess();
-        if (!cur) return nullptr;
-        char* p = U64ToDec(resolved, cur->pid);
-        const char* rest = relPath + 4;
-        if (*rest == '/') { while (*rest && p < resolved + 60) *p++ = *rest++; }
-        *p = '\0';
-        relPath = resolved;
-    }
-
-    // Check global files
+    char resolved[256];
+    if (!ResolveProcPath(relPath, resolved, sizeof(resolved))) return nullptr;
+    if (!resolved[0]) return ProcFsOpenDir(resolved);
     for (uint32_t i = 0; i < NUM_GLOBAL; ++i)
-    {
-        if (StrEqProc(relPath, g_globalEntries[i].name))
-            return g_globalEntries[i].gen();
-    }
-
-    // Handle "net/dev", "net/tcp", "net/udp" subdirectories
-    if (StrEqProc(relPath, "net/dev"))
-        return GenNetDev();
-    if (StrEqProc(relPath, "net/tcp"))
-        return GenNetTcp();
-    if (StrEqProc(relPath, "net/udp"))
-        return GenNetUdp();
-    if (StrEqProc(relPath, "net/sockstat"))
-        return GenNetSockstat();
-
-    // Check pid paths: "PID" (directory) or "PID/file"
-    uint32_t pid;
-    const char* rest;
-    if (IsPidPath(relPath, &pid, &rest))
-    {
-        ProcessSnapshot snap = {};
-        if (!FindProcess(pid, &snap)) return nullptr;
-
-        // "PID" with no subpath → open directory
-        if (!rest[0]) return ProcFsOpenDir(relPath);
-
-        // "PID/file"
-        for (uint32_t i = 0; i < NUM_PID_ENTRIES; ++i)
-        {
-            if (StrEqProc(rest, g_pidEntries[i].name))
-                return g_pidEntries[i].gen(snap);
-        }
-
-        // "PID/fd" → open fd directory
-        if (StrEqProc(rest, "fd"))
-            return ProcFsOpenDir(relPath);
-
-        // "PID/fd/N" → fd link
-        if (rest[0] == 'f' && rest[1] == 'd' && rest[2] == '/')
-        {
-            const char* fdStr = rest + 3;
-            int fdNum = 0;
-            while (*fdStr >= '0' && *fdStr <= '9')
-                fdNum = fdNum * 10 + (*fdStr++ - '0');
-            if (*fdStr == '\0')
-                return GenPidFdLink(static_cast<uint16_t>(pid), fdNum);
-        }
-    }
-
+        if (StrEqProc(resolved, g_globalEntries[i].name)) return g_globalEntries[i].gen();
+    if (StrEqProc(resolved, "net/dev")) return GenNetDev();
+    if (StrEqProc(resolved, "net/tcp")) return GenNetTcp();
+    if (StrEqProc(resolved, "net/udp")) return GenNetUdp();
+    if (StrEqProc(resolved, "net/sockstat")) return GenNetSockstat();
+    ProcLookup path;
+    if (!LookupProcPid(resolved, &path)) return nullptr;
+    if (!path.rest[0] || StrEqProc(path.rest, "fd")) return ProcFsOpenDir(resolved);
+    for (uint32_t i = 0; i < NUM_PID_ENTRIES; ++i)
+        if (StrEqProc(path.rest, g_pidEntries[i].name)) return g_pidEntries[i].gen(path.snap);
+    int fd;
+    if (ProcFdNumber(path.rest, &fd)) return GenPidFdLink(path.snap.pid, fd, path.snap.incarnation);
     return nullptr;
 }
 
 int ProcFsStatPath(const char* relPath, VnodeStat* st)
 {
-    if (!relPath || !relPath[0]) {
-        st->size = 0; st->isDir = true; return 0;
-    }
-
-    // Handle "self" → current process PID
-    char resolved[64];
-    if (relPath[0] == 's' && relPath[1] == 'e' && relPath[2] == 'l' && relPath[3] == 'f')
-    {
-        Process* cur = SchedulerCurrentProcess();
-        if (!cur) return -1;
-        char* p = U64ToDec(resolved, cur->pid);
-        const char* rest = relPath + 4;
-        if (*rest == '/') { while (*rest && p < resolved + 60) *p++ = *rest++; }
-        *p = '\0';
-        relPath = resolved;
-    }
-
-    // Global files
+    char resolved[256];
+    if (!ResolveProcPath(relPath, resolved, sizeof(resolved))) return -1;
+    if (!resolved[0] || StrEqProc(resolved, "net"))
+    { st->size = 0; st->isDir = true; st->nlink = 2; return 0; }
     for (uint32_t i = 0; i < NUM_GLOBAL; ++i)
+        if (StrEqProc(resolved, g_globalEntries[i].name))
+        { st->size = 0; st->isDir = false; return 0; }
+    if (StrEqProc(resolved, "net/dev") || StrEqProc(resolved, "net/tcp") ||
+        StrEqProc(resolved, "net/udp") || StrEqProc(resolved, "net/sockstat"))
+    { st->size = 0; st->isDir = false; return 0; }
+    ProcLookup path;
+    if (!LookupProcPid(resolved, &path)) return -1;
+    if (!path.rest[0] || StrEqProc(path.rest, "fd"))
     {
-        if (StrEqProc(relPath, g_globalEntries[i].name))
-        {
-            st->size = 0;  // dynamic content — size unknown
-            st->isDir = false;
-            return 0;
-        }
+        st->size = 0; st->isDir = true;
+        st->nlink = path.taskRoot ? 2 + path.snap.threadCount : 2;
+        st->ino = (path.snap.incarnation << 20) | (uint64_t{path.snap.pid} << 4) | (path.taskRoot ? 2 : 1);
+        return 0;
     }
-
-    // "net" directory and "net/dev", "net/tcp", "net/udp" files
-    if (StrEqProc(relPath, "net"))
-    {
-        st->size = 0; st->isDir = true; return 0;
-    }
-    if (StrEqProc(relPath, "net/dev") || StrEqProc(relPath, "net/tcp") ||
-        StrEqProc(relPath, "net/udp") || StrEqProc(relPath, "net/sockstat"))
-    {
-        st->size = 0; st->isDir = false; return 0;
-    }
-
-    // PID paths
-    uint32_t pid;
-    const char* rest;
-    if (IsPidPath(relPath, &pid, &rest))
-    {
-        ProcessSnapshot snap;
-        if (!FindProcess(pid, &snap)) return -1;
-
-        if (!rest[0]) {
-            st->size = 0; st->isDir = true; return 0;
-        }
-
-        for (uint32_t i = 0; i < NUM_PID_ENTRIES; ++i)
-        {
-            if (StrEqProc(rest, g_pidEntries[i].name))
-            {
-                st->size = 0;
-                st->isDir = false;
-                return 0;
-            }
-        }
-
-        // "PID/fd" → directory
-        if (StrEqProc(rest, "fd"))
-        {
-            st->size = 0; st->isDir = true; return 0;
-        }
-
-        // "PID/fd/N" → file (symlink-like)
-        if (rest[0] == 'f' && rest[1] == 'd' && rest[2] == '/')
-        {
-            const char* fdStr = rest + 3;
-            int fdNum = 0;
-            bool valid = (*fdStr >= '0' && *fdStr <= '9');
-            while (*fdStr >= '0' && *fdStr <= '9')
-                fdNum = fdNum * 10 + (*fdStr++ - '0');
-            if (valid && *fdStr == '\0')
-            {
-                FdSnapshot fdSnap;
-                if (SchedulerGetFdInfo(static_cast<uint16_t>(pid), fdNum, &fdSnap))
-                {
-                    st->size = 0; st->isDir = false; st->isSymlink = true;
-                    return 0;
-                }
-            }
-        }
-    }
-
-    return -1;  // not found
+    for (uint32_t i = 0; i < NUM_PID_ENTRIES; ++i)
+        if (StrEqProc(path.rest, g_pidEntries[i].name))
+        { st->size = 0; st->isDir = false; return 0; }
+    int fd;
+    FdSnapshot snap;
+    if (ProcFdNumber(path.rest, &fd) && SchedulerGetFdInfo(path.snap.pid, fd, &snap, path.snap.incarnation))
+    { st->size = 0; st->isDir = false; st->isSymlink = true; return 0; }
+    return -1;
 }
 
 Vnode* ProcFsOpenDir(const char* relPath)
 {
-    // Determine if this is /proc root or /proc/PID
-    uint32_t pid = 0;
-    const char* rest = nullptr;
-    bool isPidPath = relPath && relPath[0] && IsPidPath(relPath, &pid, &rest);
-
-    if (isPidPath && rest && StrEqProc(rest, "fd"))
-    {
-        // /proc/PID/fd directory
-        ProcessSnapshot snap;
-        if (!FindProcess(pid, &snap)) return nullptr;
-
-        auto* buf = static_cast<char*>(kmalloc(8));
-        if (!buf) return nullptr;
-        char* p = U64ToDec(buf, pid);
-        *p = '\0';
-        return MakeProcVnode(buf, static_cast<uint32_t>(p - buf), true, &g_procFdDirOps);
-    }
-
-    if (isPidPath && (!rest || !rest[0]))
-    {
-        // /proc/PID directory
-        ProcessSnapshot snap;
-        if (!FindProcess(pid, &snap)) return nullptr;
-
-        auto* buf = static_cast<char*>(kmalloc(8));
-        if (!buf) return nullptr;
-        char* p = U64ToDec(buf, pid);
-        *p = '\0';
-        return MakeProcVnode(buf, static_cast<uint32_t>(p - buf), true, &g_procPidDirOps);
-    }
-
-    // /proc root directory
-    return MakeProcVnode(nullptr, 0, true, &g_procRootDirOps);
+    char resolved[256];
+    if (!ResolveProcPath(relPath, resolved, sizeof(resolved))) return nullptr;
+    if (!resolved[0]) return MakeProcVnode(nullptr, 0, true, &g_procRootDirOps);
+    ProcLookup path;
+    if (!LookupProcPid(resolved, &path)) return nullptr;
+    if (path.taskRoot) return MakePidDirectory(path, &g_procTaskDirOps);
+    if (!path.rest[0]) return MakePidDirectory(path, &g_procPidDirOps);
+    if (StrEqProc(path.rest, "fd")) return MakePidDirectory(path, &g_procFdDirOps);
+    return nullptr;
 }
 
 // ---- Readdir implementations ----
@@ -1416,8 +1373,10 @@ static int ProcRootReaddir(Vnode* /*vn*/, DirEntry* out, uint32_t* cookie)
 }
 
 // /proc/PID directory: list per-process files
-static int ProcPidReaddir(Vnode* /*vn*/, DirEntry* out, uint32_t* cookie)
+static int ProcPidReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
 {
+    VnodeStat st{};
+    if (ProcDirStat(vn, &st) != 0) return 0;
     uint32_t idx = *cookie;
     if (idx < NUM_PID_ENTRIES)
     {
@@ -1428,9 +1387,10 @@ static int ProcPidReaddir(Vnode* /*vn*/, DirEntry* out, uint32_t* cookie)
         return 1;
     }
     // After regular entries, emit "fd" directory
-    if (idx == NUM_PID_ENTRIES)
+    auto* pp = static_cast<ProcPriv*>(vn->priv);
+    if (idx == NUM_PID_ENTRIES || (idx == NUM_PID_ENTRIES + 1 && !pp->taskMember))
     {
-        ProcStrCopy(out->name, "fd", sizeof(out->name));
+        ProcStrCopy(out->name, idx == NUM_PID_ENTRIES ? "fd" : "task", sizeof(out->name));
         out->size = 0;
         out->isDir = true;
         *cookie = idx + 1;
@@ -1443,16 +1403,10 @@ static int ProcPidReaddir(Vnode* /*vn*/, DirEntry* out, uint32_t* cookie)
 static int ProcFdReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
 {
     auto* pp = static_cast<ProcPriv*>(vn->priv);
-    if (!pp || !pp->data) return 0;
-
-    // Parse PID from stored data
-    uint32_t pid = 0;
-    for (const char* p = pp->data; *p >= '0' && *p <= '9'; ++p)
-        pid = pid * 10 + (*p - '0');
-
+    if (!pp || !pp->pid) return 0;
     int fdNum = 0;
     FdSnapshot snap = {};
-    if (!SchedulerGetFdByIndex(static_cast<uint16_t>(pid), *cookie, &fdNum, &snap))
+    if (!SchedulerGetFdByIndex(pp->pid, *cookie, &fdNum, &snap, pp->incarnation))
         return 0;
 
     char fdStr[12];
@@ -1465,11 +1419,32 @@ static int ProcFdReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
     return 1;
 }
 
+// A TID cursor avoids skipping stable members when an earlier task exits.
+// An open directory never switches to a newly reused TGID incarnation.
+static int ProcTaskReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
+{
+    auto* pp = static_cast<ProcPriv*>(vn->priv);
+    if (!pp) return 0;
+    if (*cookie < 2)
+    {
+        if (!SchedulerCountTasks(pp->tgid, pp->groupIncarnation)) return 0;
+        ProcStrCopy(out->name, *cookie == 0 ? "." : "..", sizeof(out->name));
+        out->size = 0; out->isDir = true; ++*cookie;
+        return 1;
+    }
+    ProcessSnapshot task;
+    if (!SchedulerSnapshotTask(pp->tgid, pp->groupIncarnation, 0, *cookie - 2, &task)) return 0;
+    char* end = U64ToDec(out->name, task.pid); *end = 0;
+    out->size = 0; out->isDir = true;
+    *cookie = uint32_t{task.pid} + 3;
+    return 1;
+}
+
 // Generate content for /proc/PID/fd/N — symlink-like target path
-static Vnode* GenPidFdLink(uint16_t pid, int fd)
+static Vnode* GenPidFdLink(uint16_t pid, int fd, uint64_t incarnation)
 {
     FdSnapshot snap = {};
-    if (!SchedulerGetFdInfo(pid, fd, &snap)) return nullptr;
+    if (!SchedulerGetFdInfo(pid, fd, &snap, incarnation)) return nullptr;
 
     char* buf = static_cast<char*>(kmalloc(128));
     if (!buf) return nullptr;

@@ -104,6 +104,10 @@ void SchedulerReleaseThreadAddressSpace(Process* thread);
 struct ProcessSnapshot {
     uint16_t pid;
     uint16_t parentPid;
+    uint16_t tgid;
+    uint64_t incarnation;
+    uint64_t groupIncarnation;
+    uint32_t threadCount;
     uint16_t pgid;
     uint16_t sid;
     ProcessState state;
@@ -124,6 +128,12 @@ uint32_t SchedulerSnapshotProcesses(ProcessSnapshot* out, uint32_t maxCount);
 
 // Snapshot a single process by PID. Returns true if found.
 bool SchedulerSnapshotProcess(uint16_t pid, ProcessSnapshot* out);
+
+// Generation-bound live group lookup; tid=0 selects the lowest live TID at
+// or above minTid. No Process pointer escapes the registry lock.
+bool SchedulerSnapshotTask(uint16_t tgid, uint64_t groupIncarnation,
+                           uint16_t tid, uint32_t minTid, ProcessSnapshot* out);
+uint32_t SchedulerCountTasks(uint16_t tgid, uint64_t groupIncarnation);
 
 // Return the PID of the Nth active process (0-indexed). Returns false if out of range.
 bool SchedulerGetPidByIndex(uint32_t index, uint16_t* outPid);
@@ -148,10 +158,10 @@ struct FdSnapshot {
 
 // Get the Nth open fd for a process. Returns the fd number in outFd, info in outSnap.
 // cookie is the iteration index (0, 1, 2, ...). Returns false when no more fds.
-bool SchedulerGetFdByIndex(uint16_t pid, uint32_t index, int* outFd, FdSnapshot* outSnap);
+bool SchedulerGetFdByIndex(uint16_t pid, uint32_t index, int* outFd, FdSnapshot* outSnap, uint64_t incarnation = 0);
 
 // Get info about a specific fd of a process. Returns false if fd not open.
-bool SchedulerGetFdInfo(uint16_t pid, int fd, FdSnapshot* outSnap);
+bool SchedulerGetFdInfo(uint16_t pid, int fd, FdSnapshot* outSnap, uint64_t incarnation = 0);
 
 // Get per-CPU tick counters for /proc/stat.
 // Writes busy and idle tick counts for CPU `cpuIndex`.

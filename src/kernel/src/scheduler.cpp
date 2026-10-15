@@ -2903,79 +2903,87 @@ extern "C" void SchedulerDumpHang()
     HangPuts("==================== END HANG DUMP ====================\n\n");
 }
 
+static uint16_t SnapshotTgid(const Process* p) { return p->tgid ? p->tgid : p->pid; }
+static uint64_t SnapshotGroup(const Process* p)
+{ return p->isThread ? p->leaderIncarnation : p->incarnation; }
+
+static uint32_t CountTasksLocked(uint16_t tgid, uint64_t generation)
+{
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < g_processCount; ++i)
+    {
+        const Process* p = g_allProcesses[i];
+        if (p && SnapshotTgid(p) == tgid && SnapshotGroup(p) == generation &&
+            p->state != ProcessState::Terminated) ++count;
+    }
+    return count;
+}
+
+static void FillProcessSnapshot(const Process* p, ProcessSnapshot* out)
+{
+    *out = {};
+    out->pid = p->pid; out->parentPid = p->parentPid;
+    out->tgid = SnapshotTgid(p); out->incarnation = p->incarnation;
+    out->groupIncarnation = SnapshotGroup(p);
+    out->threadCount = CountTasksLocked(out->tgid, out->groupIncarnation);
+    out->pgid = p->pgid; out->sid = p->sid; out->state = p->state;
+    out->runningOnCpu = p->runningOnCpu;
+    out->stackBase = p->stackBase; out->stackTop = p->stackTop;
+    out->programBreak = p->programBreak;
+    out->userTicks = p->userTicks; out->sysTicks = p->sysTicks;
+    uint32_t j = 0;
+    for (; j + 1 < sizeof(out->name) && p->name[j]; ++j) out->name[j] = p->name[j];
+    j = 0;
+    for (; j + 1 < sizeof(out->exePath) && p->exePath[j]; ++j) out->exePath[j] = p->exePath[j];
+    j = 0;
+    for (; j + 1 < sizeof(out->cwd) && p->cwd[j]; ++j) out->cwd[j] = p->cwd[j];
+}
+
 uint32_t SchedulerSnapshotProcesses(ProcessSnapshot* out, uint32_t maxCount)
 {
     uint32_t count = 0;
     uint64_t flags = SchedLockAcquire(g_allProcLock);
     for (uint32_t i = 0; i < g_processCount && count < maxCount; ++i)
-    {
-        Process* p = g_allProcesses[i];
-        if (!p) continue;
-        ProcessSnapshot& s = out[count++];
-        s.pid = p->pid;
-        s.parentPid = p->parentPid;
-        s.pgid = p->pgid;
-        s.sid = p->sid;
-        s.state = p->state;
-        s.runningOnCpu = p->runningOnCpu;
-        s.stackBase = p->stackBase;
-        s.stackTop = p->stackTop;
-        s.programBreak = p->programBreak;
-        s.userTicks = p->userTicks;
-        s.sysTicks = p->sysTicks;
-        uint32_t j = 0;
-        for (; j < 31 && p->name[j]; ++j)
-            s.name[j] = p->name[j];
-        s.name[j] = '\0';
-        // Copy exePath and cwd
-        j = 0;
-        for (; j < 255 && p->exePath[j]; ++j)
-            s.exePath[j] = p->exePath[j];
-        s.exePath[j] = '\0';
-        j = 0;
-        for (; j < 255 && p->cwd[j]; ++j)
-            s.cwd[j] = p->cwd[j];
-        s.cwd[j] = '\0';
-    }
+        if (g_allProcesses[i]) FillProcessSnapshot(g_allProcesses[i], &out[count++]);
     SchedLockRelease(g_allProcLock, flags);
     return count;
 }
 
 bool SchedulerSnapshotProcess(uint16_t pid, ProcessSnapshot* out)
 {
+    bool found = false;
     uint64_t flags = SchedLockAcquire(g_allProcLock);
+    for (uint32_t i = 0; i < g_processCount; ++i)
+        if (g_allProcesses[i] && g_allProcesses[i]->pid == pid)
+        { FillProcessSnapshot(g_allProcesses[i], out); found = true; break; }
+    SchedLockRelease(g_allProcLock, flags);
+    return found;
+}
+
+bool SchedulerSnapshotTask(uint16_t tgid, uint64_t generation,
+                           uint16_t tid, uint32_t minTid, ProcessSnapshot* out)
+{
+    uint64_t flags = SchedLockAcquire(g_allProcLock);
+    Process* selected = nullptr;
     for (uint32_t i = 0; i < g_processCount; ++i)
     {
         Process* p = g_allProcesses[i];
-        if (!p || p->pid != pid) continue;
-        out->pid = p->pid;
-        out->parentPid = p->parentPid;
-        out->pgid = p->pgid;
-        out->sid = p->sid;
-        out->state = p->state;
-        out->runningOnCpu = p->runningOnCpu;
-        out->stackBase = p->stackBase;
-        out->stackTop = p->stackTop;
-        out->programBreak = p->programBreak;
-        out->userTicks = p->userTicks;
-        out->sysTicks = p->sysTicks;
-        uint32_t j = 0;
-        for (; j < 31 && p->name[j]; ++j)
-            out->name[j] = p->name[j];
-        out->name[j] = '\0';
-        j = 0;
-        for (; j < 255 && p->exePath[j]; ++j)
-            out->exePath[j] = p->exePath[j];
-        out->exePath[j] = '\0';
-        j = 0;
-        for (; j < 255 && p->cwd[j]; ++j)
-            out->cwd[j] = p->cwd[j];
-        out->cwd[j] = '\0';
-        SchedLockRelease(g_allProcLock, flags);
-        return true;
+        if (!p || SnapshotTgid(p) != tgid || SnapshotGroup(p) != generation ||
+            p->state == ProcessState::Terminated || p->pid < minTid ||
+            (tid && p->pid != tid)) continue;
+        if (!selected || p->pid < selected->pid) selected = p;
     }
+    if (selected) FillProcessSnapshot(selected, out);
     SchedLockRelease(g_allProcLock, flags);
-    return false;
+    return selected != nullptr;
+}
+
+uint32_t SchedulerCountTasks(uint16_t tgid, uint64_t generation)
+{
+    uint64_t flags = SchedLockAcquire(g_allProcLock);
+    uint32_t count = CountTasksLocked(tgid, generation);
+    SchedLockRelease(g_allProcLock, flags);
+    return count;
 }
 
 // Return the PID of the Nth active process (0-indexed). Returns false if index is out of range.
@@ -3080,13 +3088,15 @@ static void FillFdSnapshot(FdSnapshot* out, const FdEntry& fde)
     }
 }
 
-bool SchedulerGetFdByIndex(uint16_t pid, uint32_t index, int* outFd, FdSnapshot* outSnap)
+bool SchedulerGetFdByIndex(uint16_t pid, uint32_t index, int* outFd, FdSnapshot* outSnap, uint64_t incarnation)
 {
     uint64_t flags = SchedLockAcquire(g_allProcLock);
     for (uint32_t i = 0; i < g_processCount; ++i)
     {
         Process* p = g_allProcesses[i];
         if (!p || p->pid != pid) continue;
+        if (incarnation && (p->incarnation != incarnation || p->state == ProcessState::Terminated))
+        { SchedLockRelease(g_allProcLock, flags); return false; }
         if (!p->fds) { SchedLockRelease(g_allProcLock, flags); return false; }
 
         SpinLockAcquire(ProcessFdLock(p));
@@ -3112,7 +3122,7 @@ bool SchedulerGetFdByIndex(uint16_t pid, uint32_t index, int* outFd, FdSnapshot*
     return false;
 }
 
-bool SchedulerGetFdInfo(uint16_t pid, int fd, FdSnapshot* outSnap)
+bool SchedulerGetFdInfo(uint16_t pid, int fd, FdSnapshot* outSnap, uint64_t incarnation)
 {
     if (fd < 0 || fd >= static_cast<int>(MAX_FDS)) return false;
     uint64_t flags = SchedLockAcquire(g_allProcLock);
@@ -3120,6 +3130,8 @@ bool SchedulerGetFdInfo(uint16_t pid, int fd, FdSnapshot* outSnap)
     {
         Process* p = g_allProcesses[i];
         if (!p || p->pid != pid) continue;
+        if (incarnation && (p->incarnation != incarnation || p->state == ProcessState::Terminated))
+        { SchedLockRelease(g_allProcLock, flags); return false; }
         if (!p->fds) { SchedLockRelease(g_allProcLock, flags); return false; }
 
         SpinLockAcquire(ProcessFdLock(p));

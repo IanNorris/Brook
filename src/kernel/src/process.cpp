@@ -5,6 +5,7 @@
 #include "process.h"
 #include "posix_timer.h"
 #include "exec_limits.h"
+#include "exec_image.h"
 #include "scheduler.h"
 #include "syscall.h"
 #include "vfs.h"
@@ -573,40 +574,17 @@ static uint64_t LoadInterpreter(Process* proc)
         return 0;
     }
 
-    VnodeStat st;
-    if (VfsStat(vn, &st) != 0 || st.size == 0)
-    {
-        SerialPrintf("INTERP: failed to stat '%s'\n", proc->elf.interpPath);
-        VfsClose(vn);
-        return 0;
-    }
-
-    SerialPrintf("INTERP: opened '%s' size=%lu (expected glibc-2.42-61=263056)\n",
-                 whichPath, st.size);
-
-    auto* buf = static_cast<uint8_t*>(kmalloc(st.size));
-    if (!buf)
-    {
-        SerialPrintf("INTERP: OOM for %lu bytes\n", st.size);
-        VfsClose(vn);
-        return 0;
-    }
-
-    uint64_t off = 0;
-    int rd = VfsRead(vn, buf, st.size, &off);
+    ExecutableImage image{};
+    int readResult = ReadExecutableImage(vn, &image);
     VfsClose(vn);
-
-    if (rd < 0 || static_cast<uint64_t>(rd) != st.size)
-    {
-        SerialPrintf("INTERP: read error (%d/%lu)\n", rd, st.size);
-        kfree(buf);
+    if (readResult != 0) {
+        SerialPrintf("INTERP: read error %d for '%s'\n", readResult, whichPath);
         return 0;
     }
-
-    uint64_t entry = ElfLoadAt(buf, st.size, INTERP_LOAD_BASE,
+    SerialPrintf("INTERP: opened '%s' size=%lu\n", whichPath, image.size);
+    uint64_t entry = ElfLoadAt(image.data, image.size, INTERP_LOAD_BASE,
                                proc->pageTable, proc->pid);
-
-    kfree(buf);
+    FreeExecutableImage(&image);
 
     if (!entry)
         SerialPrintf("INTERP: ElfLoadAt failed for '%s'\n", proc->elf.interpPath);
@@ -751,7 +729,9 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     }
 
     proc->programBreak = proc->elf.programBreakLow;
-    proc->mmapNext = USER_MMAP_BASE;
+    // Keep mmap beyond both the loaded image and its reserved brk range.
+    uint64_t mmapFloor = (proc->elf.programBreakHigh + 16 * 1024 * 1024 + 4095) & ~uint64_t{4095};
+    proc->mmapNext = mmapFloor > USER_MMAP_BASE ? mmapFloor : USER_MMAP_BASE;
 
     // Load dynamic linker if the ELF specifies PT_INTERP.
     uint64_t interpEntry = 0;
@@ -1982,7 +1962,9 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     }
 
     proc->programBreak = proc->elf.programBreakLow;
-    proc->mmapNext = USER_MMAP_BASE;
+    // Keep mmap beyond both the loaded image and its reserved brk range.
+    uint64_t mmapFloor = (proc->elf.programBreakHigh + 16 * 1024 * 1024 + 4095) & ~uint64_t{4095};
+    proc->mmapNext = mmapFloor > USER_MMAP_BASE ? mmapFloor : USER_MMAP_BASE;
 
     // Load dynamic linker if the ELF specifies PT_INTERP.
     uint64_t interpEntry = 0;

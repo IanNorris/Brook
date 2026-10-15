@@ -11,6 +11,7 @@
 #include "panic.h"
 #include "process.h"
 #include "exec_limits.h"
+#include "exec_image.h"
 #include "fpu_irq.h"
 #include "scheduler.h"
 #include "spinlock.h"
@@ -570,6 +571,7 @@ static constexpr uint32_t MFD_CLOEXEC       = 0x0001u;
 // MAP_SHARED mapping (handled in idt.cpp). Multiple processes sharing the
 // fd share the same physical pages, which is the wl_shm contract.
 struct MemFdData {
+    uint64_t  inode;            // stable backing-object identity, shared by dup/fork/SCM_RIGHTS
     uint64_t* pageMap;          // [pageMapCount] entries; raw PhysicalAddress.value, 0 = unbacked
     uint64_t  pageMapCount;     // number of slots; covers `capacity` bytes
     uint64_t  size;             // logical size set by ftruncate / extended on write
@@ -577,6 +579,12 @@ struct MemFdData {
     volatile uint32_t lock;     // spinlock protecting pageMap allocations + grow
     volatile uint32_t refCount; // +1 per fd, +1 per live mmap VMA
 };
+
+static uint64_t NextMemFdInode()
+{
+    static uint64_t next = 1;
+    return __atomic_fetch_add(&next, 1, __ATOMIC_RELAXED);
+}
 
 static inline void MfdLock(MemFdData* mfd)
 {
@@ -3111,6 +3119,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
             entry->name[63] = 0;
             entry->mfd = static_cast<MemFdData*>(kmalloc(sizeof(MemFdData)));
             if (!entry->mfd) return -ENOMEM;
+            entry->mfd->inode = NextMemFdInode();
             entry->mfd->pageMap = nullptr;
             entry->mfd->pageMapCount = 0;
             entry->mfd->size = 0;
@@ -5492,44 +5501,14 @@ resolve_path:
         return -ENOENT;
     }
 
-    // Stat the file to get its exact size, then read in one bulk operation.
-    VnodeStat vnSt;
-    uint64_t fileSize = 0;
-    if (VfsStat(vn, &vnSt) == 0 && vnSt.size > 0)
-        fileSize = vnSt.size;
-
-    // 32 MB accommodates most real binaries, including statically-linked
-    // Go executables which routinely run 10-20 MB.
-    constexpr uint64_t MAX_ELF_SIZE = 32 * 1024 * 1024;
-    if (fileSize > MAX_ELF_SIZE) fileSize = MAX_ELF_SIZE;
-
-    uint64_t bufPages = fileSize ? (fileSize + 4095) / 4096 : MAX_ELF_SIZE / 4096;
-    VirtualAddress bufAddr = VmmAllocPages(bufPages,
-        VMM_WRITABLE, MemTag::Heap, KernelPid);
-    if (!bufAddr)
-    {
-        VfsClose(vn);
-        return -ENOMEM;
-    }
-
-    auto* elfBuf = reinterpret_cast<uint8_t*>(bufAddr.raw());
-    uint64_t elfSize = 0;
-    uint64_t offset = 0;
-
-    if (fileSize > 0) {
-        // Single bulk read — avoids thousands of 4KB VfsRead calls
-        int ret = VfsRead(vn, elfBuf, fileSize, &offset);
-        if (ret > 0) elfSize = static_cast<uint64_t>(ret);
-    } else {
-        // Unknown size (e.g. procfs) — fall back to incremental reads
-        while (elfSize < MAX_ELF_SIZE)
-        {
-            int ret = VfsRead(vn, elfBuf + elfSize, 65536, &offset);
-            if (ret <= 0) break;
-            elfSize += static_cast<uint64_t>(ret);
-        }
-    }
+    ExecutableImage image{};
+    int readResult = ReadExecutableImage(vn, &image);
     VfsClose(vn);
+    if (readResult != 0) return readResult;
+    uint64_t bufPages = image.pages;
+    VirtualAddress bufAddr(reinterpret_cast<uint64_t>(image.data));
+    uint8_t* elfBuf = image.data;
+    uint64_t elfSize = image.size;
     DbgPrintf("sys_execve: read '%s' %lu bytes (pid %u)\n",
                  lookupPath, elfSize, proc->pid);
 
@@ -5644,6 +5623,13 @@ resolve_path:
         memcpy(kPath, interpPath, interpLen + 1);
 
         goto resolve_path;
+    }
+
+    // Reject malformed/truncated headers while the old image and siblings
+    // still exist. Allocation failures after commitment remain fatal.
+    if (!ElfValidateMainImage(elfBuf, elfSize)) {
+        VmmFreePages(bufAddr, bufPages);
+        return -ENOEXEC;
     }
 
     // --- Kill sibling threads before replacing the process image ---
@@ -7817,6 +7803,9 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
         auto* mfd = static_cast<MemFdData*>(fde->handle);
         auto* raw = reinterpret_cast<uint8_t*>(st);
         memset(raw, 0, sizeof(LinuxStat));
+        st->st_dev = 0x01000000; // anonymous shmem namespace, distinct from disk mounts
+        st->st_ino = mfd->inode;
+        st->st_nlink = 0;
         st->st_mode = 0100666; // S_IFREG | rw-rw-rw-
         st->st_size = static_cast<int64_t>(mfd->size);
         st->st_blksize = 4096;
@@ -9799,6 +9788,7 @@ static int64_t sys_memfd_create(uint64_t nameAddr, uint64_t flags,
 
     auto* mfd = static_cast<MemFdData*>(kmalloc(sizeof(MemFdData)));
     if (!mfd) return -ENOMEM;
+    mfd->inode        = NextMemFdInode();
     mfd->pageMap      = nullptr;
     mfd->pageMapCount = 0;
     mfd->size         = 0;

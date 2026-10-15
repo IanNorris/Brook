@@ -9,6 +9,7 @@
 // just enough to launch programs and inspect system state.
 
 #include "shell.h"
+#include "exec_image.h"
 #include "vfs.h"
 #include "process.h"
 #include "scheduler.h"
@@ -254,44 +255,6 @@ static void ComputeGridPosition(uint32_t index, int16_t* outX, int16_t* outY,
 // Load an ELF from VFS path into a buffer
 // ---------------------------------------------------------------------------
 
-static uint8_t* LoadElf(const char* path, uint64_t* outSize)
-{
-    Vnode* vn = VfsOpen(path, 0);
-    if (!vn) return nullptr;
-
-    constexpr uint64_t MAX_ELF_SIZE = 32 * 1024 * 1024;
-    constexpr uint64_t ELF_BUF_PAGES = MAX_ELF_SIZE / 4096;
-
-    VirtualAddress bufAddr = VmmAllocPages(ELF_BUF_PAGES,
-        VMM_WRITABLE, MemTag::Heap, KernelPid);
-    if (!bufAddr)
-    {
-        VfsClose(vn);
-        return nullptr;
-    }
-
-    auto* buf = reinterpret_cast<uint8_t*>(bufAddr.raw());
-    uint64_t size = 0;
-    uint64_t offset = 0;
-    while (size < MAX_ELF_SIZE)
-    {
-        int ret = VfsRead(vn, buf + size, 4096, &offset);
-        if (ret <= 0) break;
-        size += static_cast<uint64_t>(ret);
-    }
-    VfsClose(vn);
-
-    *outSize = size;
-    return buf;
-}
-
-static void FreeElfBuffer(uint8_t* buf)
-{
-    constexpr uint64_t MAX_ELF_SIZE = 32 * 1024 * 1024;
-    constexpr uint64_t ELF_BUF_PAGES = MAX_ELF_SIZE / 4096;
-    VmmFreePages(VirtualAddress(reinterpret_cast<uint64_t>(buf)), ELF_BUF_PAGES);
-}
-
 // ---------------------------------------------------------------------------
 // Try to resolve a binary path: check path as-is, then nix paths, then /boot/BIN/<NAME>
 // ---------------------------------------------------------------------------
@@ -428,14 +391,18 @@ static bool PeekShebang(const char* path, char* outInterp, uint32_t interpSize,
 static Process* SpawnProcess(const char* path, int argc, const char* const* argv,
                              int32_t uidOverride = -1)
 {
-    uint64_t elfSize = 0;
-    uint8_t* elfBuf = LoadElf(path, &elfSize);
-    if (!elfBuf)
+    ExecutableImage image{};
+    Vnode* vnode = VfsOpen(path, 0);
+    int readResult = vnode ? ReadExecutableImage(vnode, &image) : -2;
+    if (vnode) VfsClose(vnode);
+    if (readResult != 0)
     {
         KPrintf("shell: cannot load '%s'\n", path);
         return nullptr;
     }
 
+    uint8_t* elfBuf = image.data;
+    uint64_t elfSize = image.size;
     DbgPrintf("SHELL: loaded '%s' (%lu bytes)\n", path, elfSize);
 
     // Disable interrupts during process creation to avoid timer ISR interference
@@ -450,7 +417,7 @@ static Process* SpawnProcess(const char* path, int argc, const char* const* argv
 
     __asm__ volatile("sti");
 
-    FreeElfBuffer(elfBuf);
+    FreeExecutableImage(&image);
 
     if (!proc)
     {
