@@ -87,3 +87,25 @@ The final shipping-main run, including the optional 24-check lifetime probe,
 passed in **22.18 seconds**, restored both allocation counters exactly, and
 recorded no additional swap-out pages (`main-final-ram-8cpu`). Native validation
 passed 13/13 and bridge contracts passed 26/26. Syntax/diff checks also passed.
+
+## Concurrent page-cache regression
+
+```sh
+scripts/run_io_benchmark.sh --output build/io-bench/cache-run \
+  --cache-probe --lifetime-probe
+```
+
+The optional cache probe forks eight processes over the retained 64 MiB working
+set. It checks 16,384 randomly selected 4 KiB pages through both `pread` and
+private `mmap`, covering a set larger than the virtio and ext2 caches. This
+models concurrent compiler/shared-library demand paging, which the sequential
+read test alone did not cover. Its guest elapsed time is saved separately.
+
+An eight-job prepared bootstrap exposed Clang instruction pages containing
+zeros. Code review found an unlocked virtio cache-hit path copying a slot while
+another CPU could replace it. Cache tags and bytes now use the existing request
+guard for both fills and reads. The small-read path also limits the number of
+covered blocks: an unaligned 64 KiB read spans 17 blocks and cannot use the
+16-slot batch pool. The first fixed-kernel run passed the concurrent probe,
+24 lifetime assertions, reboot persistence, offline fsck and allocation
+restoration in 25.37 seconds. Full bootstrap verification is a separate gate.

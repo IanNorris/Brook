@@ -46,6 +46,7 @@ def main():
     ap.add_argument('--mib', type=int, default=8)
     ap.add_argument('--files', type=int, default=64)
     ap.add_argument('--instance', type=int, help='VNC display number; default chooses a free local port')
+    ap.add_argument('--cache-probe', action='store_true', help='also run eight-process random pread/mmap integrity checks')
     ap.add_argument('--lifetime-probe', action='store_true', help='also run the 24 inode-lifetime regression checks')
     ap.add_argument('--deadline', type=int, default=180, help='seconds allowed per guest workload')
     args = ap.parse_args()
@@ -101,6 +102,8 @@ def main():
         base.command([str(ROOT/'scripts/create_disk.sh')], output/'boot-create.log', env)
         base.command([str(ROOT/'scripts/update_disk.sh')], output/'boot-update.log', env)
         base.command(['mcopy', '-o', '-i', str(directory/'boot.img'), str(ROOT/'build/io-bench/io-bench'), '::BIN/IOBENCH'])
+        if args.cache_probe:
+            base.command(['mcopy', '-o', '-i', str(directory/'boot.img'), str(ROOT/'build/io-bench/cachecheck'), '::BIN/CACHECHK'])
         if args.lifetime_probe:
             base.command(['mcopy', '-o', '-i', str(directory/'boot.img'), str(ROOT/'build/package-cache/filelifecheck'), '::BIN/FILELIFE'])
         for mode in ('run', 'cleanup'):
@@ -112,12 +115,21 @@ def main():
             expires = time.monotonic() + args.deadline
             while time.monotonic() < expires:
                 content = serial.read_bytes()[offset:].decode(errors='replace')
-                if 'IOBENCH FAIL' in content or re.search(r'PANIC|virtio-blk.*(?:timeout|reset)', content, re.I):
+                if 'IOBENCH FAIL' in content or re.search(r'PANIC|KERNEL FAULT|virtio-blk.*(?:timeout|reset)', content, re.I):
                     raise RuntimeError(f'{mode}: guest I/O failure; see serial log')
                 if f'IOBENCH_PASS mode={mode}' in content: break
                 if process.poll() is not None: raise RuntimeError('VM exited during test')
                 time.sleep(.2)
             else: raise TimeoutError(f'{mode}: benchmark exceeded {args.deadline}s')
+            if args.cache_probe and mode == 'run':
+                base.server.guest_run(session, f'run /boot/BIN/CACHECHK /data/io-test {args.workers} {args.mib}')
+                expires = time.monotonic()+args.deadline
+                while time.monotonic()<expires:
+                    extra = serial.read_bytes()[offset:].decode(errors='replace')
+                    if 'CACHECHECK FAIL' in extra: raise RuntimeError('Concurrent read/mmap corruption')
+                    if 'CACHECHECK PASS' in extra: break
+                    time.sleep(.2)
+                else: raise TimeoutError('Concurrent cache probe deadline')
             if args.lifetime_probe and mode == 'cleanup':
                 base.server.guest_run(session, 'run /boot/BIN/FILELIFE /data --require-reuse')
                 expires = time.monotonic() + args.deadline
@@ -133,13 +145,17 @@ def main():
             base.write(output/f'{mode}-stop.json', stop)
             process.wait(timeout=30); process = session = None
             final_serial = serial.read_bytes()[offset:].decode(errors='replace')
-            if re.search(r'IOBENCH FAIL|FILELIFECHECK FAIL|PANIC|virtio-blk.*(?:timeout|reset)', final_serial, re.I):
+            if re.search(r'IOBENCH FAIL|CACHECHECK FAIL|FILELIFECHECK FAIL|PANIC|KERNEL FAULT|virtio-blk.*(?:timeout|reset)', final_serial, re.I):
                 raise RuntimeError(f'{mode}: late guest failure during verification or sync')
             shutil.copy2(serial, output/f'{mode}-serial.log')
             shutil.copy2(directory/'launch.log', output/f'{mode}-host.log')
             hostlog = (output/f'{mode}-host.log').read_text(errors='replace')
             if re.search(r'virtio.*(?:timeout|error)|PANIC', hostlog, re.I):
                 raise RuntimeError(f'{mode}: host device errors')
+            if args.cache_probe and mode == 'run':
+                values = re.findall(r'CACHECHECK_RESULT (\{[^\n]+\})', final_serial)
+                if len(values) != 1: raise RuntimeError('Missing cache probe timing')
+                report['cache_probe'] = json.loads(values[0])
             phases = [json.loads(m) for m in re.findall(r'IOBENCH_RESULT (\{[^\n]+\})', content)]
             if len(phases) != (4 if mode == 'run' else 2): raise RuntimeError('Missing phase results')
             counts = check(directory, output, mode)

@@ -1014,53 +1014,19 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
     // Serialise against concurrent reads/writes without masking timer IRQs
     // across device latency.
     //
-    // Optimistic fast path: try to serve entirely from cache without the lock.
-    // The cache is safe to read concurrently (direct-mapped, entries are
-    // word-aligned, and we validate blockNumber after reading data).
+    // Cache tags and their bytes must be observed under the same request
+    // guard as fill/invalidation. A concurrent replacement can otherwise
+    // copy another block (including zeros) into a file-backed user code page.
+    // Bound by covered blocks: an unaligned 64 KiB read spans 17 blocks,
+    // exceeding the sixteen request slots despite its byte length.
     bool cacheableSmallRead =
         len <= VIRTIO_SMALL_READ_LIMIT &&
         s->cacheEntries && s->cacheData &&
         endSector <= s->sectorCount &&
+        ((endSector-1)/VIRTIO_CACHE_BLOCK_SECTORS -
+         startSector/VIRTIO_CACHE_BLOCK_SECTORS + 1) <= MAX_INFLIGHT &&
         ((((endSector - 1) / VIRTIO_CACHE_BLOCK_SECTORS) + 1) *
              VIRTIO_CACHE_BLOCK_SECTORS) <= s->sectorCount;
-
-    if (cacheableSmallRead)
-    {
-        // Optimistic: try all blocks from cache without lock
-        bool allCached = true;
-        uint64_t probe = 0;
-        while (probe < len) {
-            uint64_t absolute = offset + probe;
-            uint64_t blockNumber = absolute / VIRTIO_CACHE_BLOCK_SIZE;
-            uint8_t* cacheBlock = nullptr;
-            if (!CacheLookup(*s, blockNumber, &cacheBlock)) {
-                allCached = false;
-                break;
-            }
-            probe += VIRTIO_CACHE_BLOCK_SIZE - (absolute % VIRTIO_CACHE_BLOCK_SIZE);
-        }
-
-        if (allCached) {
-            // All blocks cached — serve without lock
-            while (bytesRead < len) {
-                uint64_t absolute = offset + bytesRead;
-                uint64_t blockNumber = absolute / VIRTIO_CACHE_BLOCK_SIZE;
-                uint64_t blockOffset = absolute % VIRTIO_CACHE_BLOCK_SIZE;
-                uint8_t* cacheBlock = nullptr;
-                CacheLookup(*s, blockNumber, &cacheBlock);
-
-                uint64_t n = VIRTIO_CACHE_BLOCK_SIZE - blockOffset;
-                if (n > len - bytesRead) n = len - bytesRead;
-                memcpy(dstBytes + bytesRead, cacheBlock + blockOffset, n);
-                bytesRead += n;
-            }
-            s->readOps++;
-            s->readBytes += bytesRead;
-            return static_cast<int>(bytesRead);
-        }
-
-        // Cache miss — fall through to locked path
-    }
 
     AcquireRequestLock(*s);
 
