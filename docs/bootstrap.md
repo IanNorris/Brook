@@ -16,7 +16,7 @@ that does not imply that Nix or the compiler was rebuilt inside Brook.
 The shared-library startup and native compatibility gate now passes all 13
 tests. The filesystem gate also passes the expanded guest lifetime probe and
 offline fsck after a clean shutdown. Both the prepared-SDK and clean-image
-paths passed the full sequence at the same revision, `8042310`.
+paths passed the full sequence at the same revision, most recently `e70ff31`.
 
 Maintain two acceptance paths, using isolated disks and the same pinned Brook
 revision, SDK closure and VM configuration:
@@ -535,3 +535,40 @@ These focused results do not replace full prepared and clean bootstrap
 acceptance on the successor. Thread-directed fatal-signal group semantics,
 process-group kill selectors and operation boundaries before unrelated blocking
 waits remain follow-up work.
+
+### Matching acceptance after cooperative cancellation (2026-10-15)
+
+Both paths passed the full sequence at
+`e70ff31dc7656fb6c3ee38e7d6d6243767930628`, with eight vCPUs, 4 GiB RAM,
+disk-backed isolated images, software graphics and silent audio. Each cloned
+the pinned source, built Brook, passed all 13 hosted tests before and after a
+clean native rebuild, then booted its own extracted kernel/EFI/modules and
+passed all 13 tests a third time. Both build VMs acknowledged checked sync;
+all twelve final offline checks across the build and verification images
+returned zero. Every VM was stopped after its checks.
+
+| Guest stage | Prepared SDK | Clean image |
+|---|---:|---:|
+| SDK installation through nix-install | Already installed | 42 s |
+| HTTPS clone | 11 s | 13 s |
+| Submodule update | 19 s | 19 s |
+| Kernel/module/test build | 44 s | 39 s |
+| Native-test compilation | 12 s | 10 s |
+| Native-test run | 5 s | 5 s |
+| Warm native rebuild | 11 s | 8 s |
+| Warm native-test run | 5 s | 5 s |
+| Incremental kernel build | 2 s | 2 s |
+
+These are individual instrumented runs with uncontrolled host caches, not a
+matched speed comparison. Raw CPU/context-switch captures accompany expensive
+stages; use `scripts/bootstrap_perf_report.py` to summarize them without
+attributing unresolved module addresses to unrelated kernel symbols.
+
+Evidence is retained under
+`build/experiments/results/bootstrap-{prepared,clean}-e70ff31-disk/`.
+The prepared guest-built kernel SHA-256 is
+`36c34fdaf94b12d06e97910cec88be250fd79024ce56a1f3fd27a94f9e33b5c9`;
+the clean counterpart is
+`f3aef5bb45c7369903a009083962440098bac122a7eda7a6656985b80dad2b62`.
+Artifact hashes are checked against the booted copies, rather than claiming
+byte-identical reproducible builds between the two paths.

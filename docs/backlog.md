@@ -221,12 +221,13 @@ app launchers and recovery commands before retiring BusyBox from existing images
 
 Bootstrap metadata follow-ups: the chown family still selects the first ext2
 mount and `fchown` is a stub; route ownership changes through VFS path/fd
-callbacks. `mkdir` also ignores its requested mode. General truncate/ftruncate
-support remains incomplete. Writable regular-file MAP_SHARED mappings are now
+callbacks. `mkdir` also ignores its requested mode. FAT and ext2 now implement
+truncate/ftruncate with mapped-backing protection; ext4 resize and concurrent
+mapping mutation still need work. Writable regular-file MAP_SHARED mappings are now
 rejected with EOPNOTSUPP because their previous eager-copy path silently lost
 output. Implement coherent shared file pages, dirty tracking/writeback and
-real truncate semantics before enabling them; memfd/framebuffer sharing remains
-supported. Keep these separate from the validated file
+the remaining mapping-lifetime guarantees before enabling them;
+memfd/framebuffer sharing remains supported. Keep these separate from the validated file
 creation, chmod and timestamp fixes.
 
 Bootstrap rename-overwrite, open-unlinked lifetime and directory accounting
@@ -236,9 +237,10 @@ normal synced shutdown is not a power-loss durability guarantee.
 
 The readiness probe found that `UserBufferReadable` accepts mapped `PROT_NONE`
 pages; enforce access permissions consistently in user-buffer validation and
-add protected-page probes. `alarm` (syscall 38) also returns ENOSYS; the current
-readiness probe uses a forked parent watchdog instead. Temporary pselect/ppoll
-signal masks and TCP urgent-data readiness remain compatibility follow-ups.
+add protected-page probes. Raw `alarm` (syscall 37) is implemented; musl's `alarm` wrapper
+uses unimplemented `setitimer` (syscall 38). Keep a host or parent watchdog for
+deadlocks that prevent fatal-signal completion. Temporary pselect/ppoll signal
+mask regressions now pass; TCP urgent-data readiness remains a follow-up.
 
 Bootstrap cache/lifetime follow-ups: ext2 mmap cache identities now include a
 unique mount namespace, fixing collisions between equal inode numbers on
@@ -317,19 +319,16 @@ writes, retaining synced-fsck and lifetime gates. The 500 MB LLVM library NAR
 installed successfully in 325.709 seconds, so this capture shows slow progress
 rather than a proven storage stall. Final two-path timings belong in bootstrap.md.
 
-Heap diagnostic accounting also needs correction: `mem` can print wrapped
-`heap_free` while `mem heap`'s locked block walk reports sane usage. In kfree,
-coalescing two free blocks recovers their intervening header/footer, but the
-cumulative free counter subtracts that overhead instead of adding it. Expansion
-adds the full region even when a new free block consumes overhead. Correct both
-and verify incremental accounting against the block walk across split, forward/
-backward merge and expansion; use PMM memory metrics for the current baseline.
+Heap diagnostic accounting was corrected in `06f7db3`: coalescing recovers
+header/footer payload, and separate expansion blocks consume their own overhead.
+The integrity walk now checks the incremental free counter against actual block
+payloads. The focused filesystem-exit/truncation guest gate passed this check.
 
-The I/O gate review found Vnode `ftruncate` currently returns success without
-changing the file. Implement real truncate semantics and test zero size, EOF,
-shrink/grow contents and accounting. The current gate uses supported `O_TRUNC`,
-asserts zero size/EOF immediately, then writes a distinct pattern; it does not
-claim to validate `ftruncate`.
+The I/O gate review found success-only `ftruncate` stubs. Real FAT/ext2 resize
+landed in `9942505`, with shrink/grow zeroing, cached-descriptor and mapped-backing
+regressions in `truncatecheck`. The subsequent `e70ff31` gate passed those tests
+on FAT and 4 KiB ext2, reboot verification and clean offline filesystem checks.
+Repeat resize-specific coverage on 1/2 KiB ext2 before claiming that matrix.
 
 The fast RAM-backed I/O gate now reproduces both extraction-sized sequential
 writes and namespace-heavy small-file operations with persistence and fsck
@@ -339,6 +338,34 @@ checks in roughly 23 seconds. The candidate on
 scheduling costs before merging it; preserve failure propagation and inode
 accounting checks while tuning. Resume complete two-path bootstrap acceptance
 after this prerequisite; the clean checkpoint is diagnostic, not a pass.
+
+## Mapping lifetime before coherent shared files
+
+Astra's source review identified a prerequisite to Codium's regular-file
+`MAP_SHARED`: one mutation protocol for the complete address space. A file-fault
+generation check alone cannot cover anonymous/device replacement or COW.
+
+- Serialize mmap/MAP_FIXED, munmap, mprotect, mremap, fork and teardown through an
+  address-space-owned mutation mutex. Include memfd, COW and GUI-buffer PTE
+  writers. Resolve the owner using retained leader/incarnation identity.
+- Faults snapshot and pin backing identity/range/offset/protection under that
+  mutex, release it for I/O, then validate the generation before committing.
+  Every speculative adjacent-page installation needs the same validation.
+- Add install-if-absent and detach-returning-old-leaf PTE operations: current
+  `VmmMapPage` overwrites a present leaf. Keep detached frames alive until remote
+  TLB acknowledgement; release final filesystem references outside mapping locks.
+- Keep lock order mutation mutex, page-table lock, then short PMM internals.
+  No filesystem I/O or user-buffer access under the mutation mutex, and no TLB
+  acknowledgement wait under an IRQ-disabled page-table lock.
+- Require deterministic pause-between-snapshot-and-commit tests, simultaneous
+  same-page faults, MAP_FIXED replacement, partial splits, fork/exec, cancellation,
+  memfd remap, GUI resize and remote-TLB frame retention. A writable MAP_PRIVATE
+  upgrade must copy cached backing rather than alter another reader's page.
+
+Existing sequential mapping probes do not establish these concurrency properties.
+Coherent shared-file pages, read/write visibility, dirty writeback/msync and
+resize integration follow this prerequisite; keep unsupported mappings explicit
+until those semantics pass real workload and filesystem gates.
 
 ## Next workload and showcase sequence (15 October 2026)
 
