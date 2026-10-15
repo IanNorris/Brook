@@ -85,7 +85,10 @@ BUILD_TYPE_LOWER="$(echo "${BUILD_TYPE}" | tr '[:upper:]' '[:lower:]')"
 HOST_TEST_DIR="${ROOT_DIR}/build/${BUILD_TYPE_LOWER}/host_tests"
 if [ -d "${HOST_TEST_DIR}" ]; then
     echo "--- Host Tests ---"
-    (cd "${HOST_TEST_DIR}" && ctest --output-on-failure)
+    # The host tests are a separate CMake tree. Fail on a stale/failed rebuild
+    # instead of running executables left behind by an earlier successful build.
+    cmake --build "${HOST_TEST_DIR}" --parallel "${BROOK_BUILD_JOBS:-4}"
+    ctest --test-dir "${HOST_TEST_DIR}" --output-on-failure
     echo ""
 fi
 
