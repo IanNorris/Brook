@@ -202,6 +202,9 @@ VfsFsSnapshot VfsFsSnapshotAt(uint32_t idx);
 // Open a file or directory.  Caller owns the returned Vnode*; call VfsClose().
 // Returns nullptr on error.
 extern "C" Vnode* VfsOpen(const char* path, int flags = 0);
+// Open an executable and return the initial fully resolved pathname used for
+// the backend open. No truncation; this does not track later rename/unlink.
+int VfsOpenExecutable(const char* path, Vnode** vnode, char* resolved, uint32_t size);
 // Creation mode is used only for a new inode; the filesystem applies umask.
 Vnode* VfsOpenMode(const char* path, int flags, uint16_t mode);
 

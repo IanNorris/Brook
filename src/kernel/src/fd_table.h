@@ -151,6 +151,54 @@ inline int FdTableDuplicatePinned(FdEntry* fds, SpinLock* lock, const FdEntry* s
     return -1;
 }
 
+// Publish an already-owned descriptor. On failure ownership remains with the
+// caller. A pinned destination cannot be replaced while pins name its slot.
+inline int FdTablePublishOwned(FdEntry* fds, SpinLock* lock, const FdEntry& owned,
+                              uint32_t minimum, int replacement, FdClaimResult* retired,
+                              void (*published)(int, const FdEntry&) = nullptr)
+{
+    SpinLockAcquire(lock);
+    int target = replacement;
+    if (target < 0) {
+        for (uint32_t i = minimum; i < MAX_FDS; ++i)
+            if (fds[i].type == FdType::None) { target = static_cast<int>(i); break; }
+    }
+    if (target < 0 || target >= static_cast<int>(MAX_FDS)) {
+        SpinLockRelease(lock); return -24;
+    }
+    if (fds[target].pinCount || fds[target].closing) {
+        SpinLockRelease(lock); return -16;
+    }
+    if (retired) *retired = {fds[target].type, fds[target].handle, fds[target].flags};
+    FdEntry copy = owned;
+    copy.pinCount = 0;
+    copy.closing = 0;
+    fds[target] = copy;
+    if (published) published(target, copy);
+    SpinLockRelease(lock);
+    return target;
+}
+
+// The destination is private and initially empty. Retain each immutable copy
+// under the source lock; callers unwind any completed copies on failure.
+inline bool FdTableForkSnapshot(FdEntry* dst, FdEntry* src, SpinLock* lock,
+                                bool (*retain)(FdEntry*),
+                                void (*published)(int, const FdEntry&) = nullptr)
+{
+    SpinLockAcquire(lock);
+    for (uint32_t i = 0; i < MAX_FDS; ++i) {
+        if (src[i].type == FdType::None || src[i].closing) continue;
+        FdEntry copy = src[i];
+        copy.pinCount = 0;
+        copy.closing = 0;
+        if (!retain(&copy)) { SpinLockRelease(lock); return false; }
+        dst[i] = copy;
+        if (published) published(static_cast<int>(i), copy);
+    }
+    SpinLockRelease(lock);
+    return true;
+}
+
 // Unconditionally clear a slot after the caller takes ownership of its handle.
 inline void FdTableFree(FdEntry* fds, SpinLock* lock, int fd)
 {

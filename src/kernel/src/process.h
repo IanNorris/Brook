@@ -169,7 +169,10 @@ struct SavedContext
     // Segment bases
     uint64_t cr3;       // Page table physical address
     uint64_t fsBase;    // FS segment base (TLS)
+    uint64_t gsBase;    // User GS base; inactive MSR_KERNEL_GS_BASE in kernel
 };
+
+static_assert(__builtin_offsetof(SavedContext, gsBase) == 88, "context_switch.S GS offset");
 
 // XSAVE area for x87 + SSE + AVX state.  Brook enables CR4.OSXSAVE and
 // XCR0[2] for AVX-capable userland, so fxsave/fxrstor is not sufficient:
@@ -402,7 +405,7 @@ struct Process
      * 256 covers realistic GTK app sessions; cost is 256*32B = 8 KB
      * per process, which is negligible. */
     static constexpr uint32_t MAX_MEMFD_MAPS = 256;
-    struct MemFdMap { uint64_t vaddr; uint64_t length; uint64_t offset; uint64_t vmmFlags; void* mfd; };
+    struct MemFdMap { uint64_t vaddr; uint64_t length; uint64_t offset; uint64_t vmmFlags; void* mfd; uint32_t prot; uint32_t maxProt; };
     MemFdMap memfdMaps[MAX_MEMFD_MAPS];
 
     // File-backed mmap ranges.  These are demand-paged by the user #PF path:

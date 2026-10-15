@@ -465,6 +465,87 @@ VfsFsSnapshot VfsFsSnapshotAt(uint32_t idx)
     return snap;
 }
 
+int VfsOpenExecutable(const char* path, Vnode** vnode, char* resolved, uint32_t size)
+{
+    if (!vnode || !resolved || size < 2) return -22;
+    *vnode = nullptr;
+    resolved[0] = 0;
+    if (!path || path[0] != '/') return -2;
+    char remaining[512], current[512];
+    current[0] = '/';
+    current[1] = 0;
+    if (StrLen(path) >= sizeof(remaining)) return -36;
+    StrCopy(remaining, path, sizeof(remaining));
+    uint32_t links = 0;
+    for (;;) {
+        const char* next = remaining;
+        while (*next == '/') ++next;
+        if (!*next) break;
+        char component[256];
+        uint32_t count = 0;
+        while (*next && *next != '/') {
+            if (count + 1 >= sizeof(component)) return -36;
+            component[count++] = *next++;
+        }
+        component[count] = 0;
+        char tail[512];
+        StrCopy(tail, next, sizeof(tail));
+        if (StrEq(component, ".")) {
+            StrCopy(remaining, tail, sizeof(remaining));
+            continue;
+        }
+        if (StrEq(component, "..")) {
+            uint32_t n = StrLen(current);
+            while (n > 1 && current[n - 1] != '/') --n;
+            if (n > 1) --n;
+            current[n] = 0;
+            StrCopy(remaining, tail, sizeof(remaining));
+            continue;
+        }
+        uint32_t parentLength = StrLen(current);
+        uint32_t slash = parentLength > 1 ? 1 : 0;
+        if (parentLength + slash + count >= sizeof(current)) return -36;
+        if (slash) StrAppend(current, "/", sizeof(current));
+        StrAppend(current, component, sizeof(current));
+        VnodeStat st{};
+        if (VfsLstatPathRaw(current, &st) != 0) return -2;
+        if (st.isSymlink) {
+            if (++links > 40) return -40;
+            char target[512];
+            int bytes = VfsReadlinkRaw(current, target, sizeof(target) - 1);
+            if (bytes < 0) return bytes;
+            // readlink can truncate without a terminator; refuse ambiguity.
+            if (bytes >= static_cast<int>(sizeof(target) - 1)) return -36;
+            if (!bytes) return -2;
+            target[bytes] = 0;
+            if (static_cast<uint32_t>(bytes) + StrLen(tail) >= sizeof(remaining)) return -36;
+            StrCopy(remaining, target, sizeof(remaining));
+            StrAppend(remaining, tail, sizeof(remaining));
+            if (target[0] == '/') { current[0] = '/'; current[1] = 0; }
+            else current[parentLength] = 0;
+            continue;
+        }
+        // Resolve '..' only AFTER symlinks, and require directory traversal
+        // even when the remaining suffix consists solely of a trailing slash.
+        if (tail[0] && !st.isDir) return -20;
+        StrCopy(remaining, tail, sizeof(remaining));
+    }
+    if (StrLen(current) >= size) return -36;
+    const char* relative = nullptr;
+    MountEntry* mount = FindMount(current, &relative);
+    if (!mount || !mount->fsOps) return -2;
+    Vnode* opened = nullptr;
+    if (mount->fsOps->open_mode)
+        opened = mount->fsOps->open_mode(mount->mountPriv, mount->pdrv, relative, 0, 0666);
+    else if (mount->fsOps->open)
+        opened = mount->fsOps->open(mount->mountPriv, mount->pdrv, relative, 0);
+    if (!opened) return -2;
+    if (opened->type == VnodeType::Dir) { VfsClose(opened); return -13; }
+    StrCopy(resolved, current, size);
+    *vnode = opened;
+    return 0;
+}
+
 Vnode* VfsOpen(const char* path, int flags)
 {
     return VfsOpenMode(path, flags, 0666);

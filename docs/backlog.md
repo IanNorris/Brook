@@ -434,6 +434,12 @@ Prioritize:
 
 - Silent truncation, ignored short reads/writes, clamped counts reported as
   success, and integer-width/alignment overflow.
+- Success-only syscall stubs and untouched output parameters. Firefox exposed
+  `fallocate` returning success with a zero-length memfd, followed by
+  `getsockopt(SO_SNDBUF)` returning success without writing the capacity.
+  Inventory remaining stubs (including socket setters), implement required
+  behavior or return a supported error that lets callers choose a fallback;
+  verify actual state/output rather than only a zero return value.
 - Executable/interpreter size and mapped span, brk/mmap/stack address ranges,
   file mappings, segment counts and argument/environment buffers.
 - Processes, threads, file descriptors, futexes, waiters, timers and signal

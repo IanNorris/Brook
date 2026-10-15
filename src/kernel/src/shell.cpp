@@ -1,3 +1,4 @@
+#include "unix_lifetime_trace.h"
 // Brook kernel shell — boot script executor and interactive command line.
 //
 // Provides a simple command interpreter that can:
@@ -392,8 +393,10 @@ static Process* SpawnProcess(const char* path, int argc, const char* const* argv
                              int32_t uidOverride = -1)
 {
     ExecutableImage image{};
-    Vnode* vnode = VfsOpen(path, 0);
-    int readResult = vnode ? ReadExecutableImage(vnode, &image) : -2;
+    char executablePath[sizeof(Process::exePath)];
+    Vnode* vnode = nullptr;
+    int readResult = VfsOpenExecutable(path, &vnode, executablePath, sizeof(executablePath));
+    if (!readResult) readResult = ReadExecutableImage(vnode, &image);
     if (vnode) VfsClose(vnode);
     if (readResult != 0)
     {
@@ -426,9 +429,9 @@ static Process* SpawnProcess(const char* path, int argc, const char* const* argv
     }
 
     uint32_t ei = 0;
-    while (path[ei] && ei + 1 < sizeof(proc->exePath))
+    while (executablePath[ei] && ei + 1 < sizeof(proc->exePath))
     {
-        proc->exePath[ei] = path[ei];
+        proc->exePath[ei] = executablePath[ei];
         ++ei;
     }
     proc->exePath[ei] = '\0';
@@ -1246,6 +1249,14 @@ static int ExecCommand(int argc, const char* const* argv)
         if (secs == 0) secs = 10;  // default 10 seconds
         KPrintf("PROFILER: starting %u second capture\n", secs);
         ProfilerStart(secs * 1000);
+        return 0;
+    }
+
+    if (StrEq(cmd, "unixlife") && argc == 2) {
+        bool enabled = StrEq(argv[1], "on");
+        if (!enabled && !StrEq(argv[1], "off")) return -1;
+        UnixLifeControl(enabled);
+        KPrintf("Unix lifetime trace: %s\n", enabled ? "armed/reset" : "disabled/preserved");
         return 0;
     }
 

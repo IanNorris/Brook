@@ -546,26 +546,41 @@ static void Ext2BlockCachePut(Ext2Mount* mnt, uint32_t blockNum, const void* buf
 {
     if (!mnt->blockCacheBlockNum) return;
     uint32_t slot = Ext2BlockCacheSlot(blockNum);
+    // Allocate outside the cache lock: allocation may reclaim or synchronize
+    // memory and must never extend a cache critical section into a wait cycle.
     SpinLockAcquire(&mnt->blockCacheLock);
-    if (!mnt->blockCacheData[slot]) {
-        // Thousands of permanent cache buffers otherwise populate the first-fit
-        // heap ahead of transient filesystem allocations. Use owned physical
-        // pages for normal ext2 blocks, leaving small-object heap searches short.
+    if (mnt->blockCacheData[slot]) {
+        mnt->blockCacheBlockNum[slot] = blockNum;
+        memcpy(mnt->blockCacheData[slot], buf, mnt->blockSize);
+        SpinLockRelease(&mnt->blockCacheLock);
+        return;
+    }
+    SpinLockRelease(&mnt->blockCacheLock);
+    uint8_t* candidate = nullptr;
+    {
         if (mnt->blockSize <= 4096) {
             PhysicalAddress page = PmmAllocPage(MemTag::KernelData);
-            if (page) mnt->blockCacheData[slot] =
-                reinterpret_cast<uint8_t*>(PhysToVirt(page).raw());
+            if (page) candidate = reinterpret_cast<uint8_t*>(PhysToVirt(page).raw());
         } else {
-            mnt->blockCacheData[slot] = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
-        }
-        if (!mnt->blockCacheData[slot]) {
-            SpinLockRelease(&mnt->blockCacheLock);
-            return;
+            candidate = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
         }
     }
-    mnt->blockCacheBlockNum[slot] = blockNum;
-    memcpy(mnt->blockCacheData[slot], buf, mnt->blockSize);
+    SpinLockAcquire(&mnt->blockCacheLock);
+    // A concurrent reader may have populated the same slot while we allocated.
+    if (!mnt->blockCacheData[slot] && candidate) {
+        mnt->blockCacheData[slot] = candidate;
+        candidate = nullptr;
+    }
+    if (mnt->blockCacheData[slot]) {
+        mnt->blockCacheBlockNum[slot] = blockNum;
+        memcpy(mnt->blockCacheData[slot], buf, mnt->blockSize);
+    }
     SpinLockRelease(&mnt->blockCacheLock);
+    if (candidate) {
+        if (mnt->blockSize <= 4096)
+            PmmFreePage(VirtToPhys(VirtualAddress(reinterpret_cast<uint64_t>(candidate))));
+        else kfree(candidate);
+    }
 }
 
 // Invalidate a cached data block (e.g. after a write).
@@ -2044,6 +2059,30 @@ static int Ext2FileOpen(Vnode* vn, int flags) { (void)vn; (void)flags; return 0;
 
 static int Ext2FileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
 {
+    // User memory can fault even after syscall validation (notably a fork's
+    // read-only CoW pages). Never copy to it while holding filesystem/cache
+    // locks: a fault can wait for TLB acknowledgements from another CPU which
+    // is itself waiting for those locks with interrupts disabled.
+    if (len && reinterpret_cast<uint64_t>(buf) < 0x0000800000000000ULL) {
+        constexpr uint64_t MAX_BOUNCE = 64 * 1024;
+        uint64_t capacity = len < MAX_BOUNCE ? len : MAX_BOUNCE;
+        auto* bounce = static_cast<uint8_t*>(kmalloc(capacity));
+        if (!bounce) return -12;
+        uint64_t done = 0;
+        int error = 0;
+        while (done < len) {
+            uint64_t chunk = len - done;
+            if (chunk > capacity) chunk = capacity;
+            int n = Ext2FileRead(vn, bounce, chunk, offset);
+            if (n <= 0) { error = n; break; }
+            // The recursive kernel-buffer read has released all FS locks.
+            memcpy(static_cast<uint8_t*>(buf) + done, bounce, static_cast<uint64_t>(n));
+            done += static_cast<uint64_t>(n);
+            if (static_cast<uint64_t>(n) < chunk) break;
+        }
+        kfree(bounce);
+        return done ? static_cast<int>(done) : error;
+    }
     auto* fp = static_cast<Ext2FilePriv*>(vn->priv);
     KRwLockReadLock(&g_ext2Lock);
     Ext2Inode data;

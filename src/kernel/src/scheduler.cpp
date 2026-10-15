@@ -2304,6 +2304,8 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
 
     VmmSwitchPageTable(first->pageTable);
 
+    WriteMsr(MSR_KERNEL_GS_BASE, first->savedCtx.gsBase);
+
     if (first->fsBase)
     {
         uint32_t lo = static_cast<uint32_t>(first->fsBase);
@@ -2379,6 +2381,8 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
         for (;;)
             __asm__ volatile("hlt" ::: "memory");
     }
+
+    WriteMsr(MSR_KERNEL_GS_BASE, first->savedCtx.gsBase);
 
     if (first->fsBase)
     {

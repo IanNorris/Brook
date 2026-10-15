@@ -20,6 +20,8 @@
 #include <pthread.h>
 
 #include "fd_table.h"
+#include "unix_lifetime_trace.h"
+#include <chrono>
 
 using brook::FdEntry;
 using brook::FdType;
@@ -438,13 +440,147 @@ static void TestDuplicate()
     brook::FdTableUnpin(fds, &lock, source, &unused);
 }
 
+// Reproduce the old publish-then-retain ordering with the actual table
+// operations: a closer can consume the only reference while source is pinned.
+static void TestOldPublicationNegative()
+{
+    FdEntry fds[MAX_FDS] = {};
+    SpinLock lock;
+    int references = 1;
+    int source = FdTableAlloc(fds, &lock, FdType::UnixSocket, &references);
+    FdEntry* pinned = FdTablePin(fds, &lock, source);
+    int copy = FdTableAlloc(fds, &lock, pinned->type, pinned->handle);
+    FdClaimResult retired{};
+    CHECK(FdTableClose(fds, &lock, copy, &retired) == FdCloseResult::ClaimedNow,
+          "old negative: published duplicate can close before retain");
+    --references;
+    CHECK(references == 0 && pinned->handle == &references,
+          "old negative: source pin does not prevent unearned duplicate release");
+    FdTableUnpin(fds, &lock, source, &retired);
+    std::printf("fd ownership old negative: premature last release reproduced\n");
+}
+
+static void TestOwnedPublication()
+{
+    FdEntry fds[MAX_FDS] = {};
+    SpinLock lock;
+    int references = 1;
+    int source = FdTableAlloc(fds, &lock, FdType::UnixSocket, &references);
+    FdEntry* pinned = FdTablePin(fds, &lock, source);
+    FdEntry owned = *pinned;
+    ++references; // production prepares its owned copy before publication
+    owned.fdFlags = 1;
+    FdClaimResult retired{};
+    int target = brook::FdTablePublishOwned(fds, &lock, owned, 4, -1, &retired);
+    CHECK(target == 4 && fds[target].pinCount == 0 && fds[target].fdFlags == 1,
+          "owned publication has complete flags and independent pin state");
+    CHECK(FdTableClose(fds, &lock, target, &retired) == FdCloseResult::ClaimedNow,
+          "new duplicate can close immediately");
+    --references;
+    CHECK(references == 1, "source backing survives immediate duplicate close");
+    int other = 1;
+    target = FdTableAlloc(fds, &lock, FdType::UnixSocket, &other);
+    FdEntry* targetPin = FdTablePin(fds, &lock, target);
+    ++references;
+    CHECK(brook::FdTablePublishOwned(fds, &lock, owned, 0, target, &retired) == -16,
+          "replacement of a pinned destination returns EBUSY");
+    CHECK(targetPin->handle == &other && other == 1 && references == 2,
+          "failed replacement preserves destination and caller ownership");
+    FdTableUnpin(fds, &lock, target, &retired);
+    CHECK(brook::FdTablePublishOwned(fds, &lock, owned, 0, target, &retired) == target,
+          "unpinned destination is replaced atomically");
+    CHECK(retired.handle == &other, "replacement returns exactly the old owner");
+    --other;
+    CHECK(other == 0 && references == 2, "old owner is finalized outside table lock");
+    FdTableClose(fds, &lock, target, &retired); --references;
+    FdTableUnpin(fds, &lock, source, &retired);
+    FdTableClose(fds, &lock, source, &retired); --references;
+    CHECK(references == 0, "all owned copies balance after replacement");
+}
+
+static std::atomic<bool> snapshotInside, snapshotCloseAttempted;
+static bool RetainSnapshotForRace(FdEntry* entry)
+{
+    snapshotInside.store(true, std::memory_order_release);
+    while (!snapshotCloseAttempted.load(std::memory_order_acquire)) std::this_thread::yield();
+    auto* refs = static_cast<std::atomic<int>*>(entry->handle);
+    return refs->fetch_add(1) > 0;
+}
+static void TestForkSnapshotRace()
+{
+    FdEntry source[MAX_FDS] = {}, child[MAX_FDS] = {};
+    SpinLock lock;
+    std::atomic<int> references{1};
+    int fd = FdTableAlloc(source, &lock, FdType::UnixSocket, &references);
+    source[fd].fdFlags = 1;
+    snapshotInside.store(false); snapshotCloseAttempted.store(false);
+    std::thread closer([&] {
+        while (!snapshotInside.load(std::memory_order_acquire)) std::this_thread::yield();
+        snapshotCloseAttempted.store(true, std::memory_order_release);
+        FdClaimResult old{};
+        if (FdTableClose(source, &lock, fd, &old) == FdCloseResult::ClaimedNow)
+            static_cast<std::atomic<int>*>(old.handle)->fetch_sub(1);
+    });
+    bool copied = brook::FdTableForkSnapshot(child, source, &lock, RetainSnapshotForRace);
+    closer.join();
+    CHECK(copied && references.load() == 1, "fork retains before concurrent source close");
+    CHECK(child[fd].handle == &references && child[fd].fdFlags == 1 && !child[fd].pinCount,
+          "fork snapshot preserves exact handle and resets transient pins");
+    FdClaimResult old{};
+    FdTableClose(child, &lock, fd, &old);
+    static_cast<std::atomic<int>*>(old.handle)->fetch_sub(1);
+    CHECK(references.load() == 0, "fork child owns and releases its independent reference");
+}
+
+static void TestUnixLifeCore()
+{
+    static brook::UnixLifeCore core{};
+    using brook::UnixLifeEvent;
+    brook::UnixLifeRecord event{};
+    event.event = UnixLifeEvent::Allocate;
+    event.handle = 0x10000; event.size = 256;
+    core.Watch(event);
+    CHECK(core.records[0].sequence == 1 && core.records[0].generation == 1,
+          "watch record committed with generation");
+    event.event = UnixLifeEvent::HeapFree; event.other = 0xff00; event.size = 512;
+    core.Heap(event, true);
+    CHECK(core.records[1].handle == 0x10000 && core.records[1].previous == 1 &&
+          core.watches[0].active == 0, "coalesced range catches live watched object");
+    event.event = UnixLifeEvent::HeapAllocate;
+    core.Heap(event, false);
+    CHECK(core.records[2].generation == 1 && core.records[2].previous == 0,
+          "allocation reuse retains freed watch tombstone");
+    event.event = UnixLifeEvent::Allocate; event.handle = 0x10000; event.size = 256;
+    core.Watch(event);
+    CHECK(core.records[3].generation == 2 && core.watches[0].active == 1,
+          "address reuse receives distinct generation");
+    for (unsigned i = 1; i < 129; ++i) {
+        event.handle = 0x10000 + i * 0x1000; core.Watch(event);
+    }
+    CHECK(core.saturated == 1, "watch capacity exhaustion is counted");
+    auto begin = std::chrono::steady_clock::now();
+    for (unsigned i = 0; i < 100000; ++i) core.Event(event);
+    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - begin).count();
+    CHECK(core.overwritten == core.sequence - 4096, "ring overwrite count is exact");
+    for (uint64_t seq = core.sequence - 4095; seq <= core.sequence; ++seq)
+        CHECK(core.records[(seq - 1) % 4096].sequence == seq,
+              "ring contains complete latest committed sequence window");
+    std::printf("unix lifetime core: PASS bytes=%zu record=%zu host_event_ns=%lld\n",
+                sizeof(core), sizeof(event), static_cast<long long>(ns / 100000));
+}
+
 int main()
 {
+    TestUnixLifeCore();
     TestBasic();
     TestConcurrent();
     TestPinBasic();
     TestPinConcurrent();
     TestDuplicate();
+    TestOldPublicationNegative();
+    TestOwnedPublication();
+    TestForkSnapshotRace();
 
     if (g_failures == 0) {
         std::printf("test_fd_table: ALL PASS\n");

@@ -6,6 +6,7 @@
 #include "spinlock.h"
 #include "string.h"
 #ifndef BROOK_HOST_TEST
+#include "../unix_lifetime_trace.h"
 #include "../ksym_addrs.h"   // KsymFindByAddr for kfree-callstack symbolization
 #endif
 
@@ -179,6 +180,10 @@ static inline bool IsValidHeader(BlockHeader* h)
 
 static void WriteBlock(uint8_t* base, uint32_t size, uint32_t free)
 {
+#ifndef BROOK_HOST_TEST
+    UnixLifeHeap(base, size, free ? UnixLifeEvent::HeapWriteFree : UnixLifeEvent::HeapAllocate,
+                 reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+#endif
     auto* h   = reinterpret_cast<BlockHeader*>(base);
     h->magic  = HEADER_MAGIC;
     h->size   = size;
@@ -409,6 +414,9 @@ void kfree(void* ptr)
     uint64_t heapFlags = IrqSpinLockAcquire(&g_heapLock);
 
     BlockHeader* h = ToHeader(ptr);
+#ifndef BROOK_HOST_TEST
+    UnixLifeHeap(ptr, 0, UnixLifeEvent::HeapAttempt, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+#endif
     if (!IsValidHeader(h)) { IrqSpinLockRelease(&g_heapLock, heapFlags); return; }
     if (h->free) { IrqSpinLockRelease(&g_heapLock, heapFlags); return; }
 
@@ -424,6 +432,11 @@ void kfree(void* ptr)
         totalSize += next->size;
     }
 
+#ifndef BROOK_HOST_TEST
+    // Record the actual coalesced range before mutation. The recorder never
+    // acquires heap/FD/registry locks: only heap -> diagnostic lock exists.
+    UnixLifeHeap(h, totalSize, UnixLifeEvent::HeapFree, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+#endif
     // WriteBlock marks free=1 and poisons user data in one pass.
     WriteBlock(reinterpret_cast<uint8_t*>(h), totalSize, 1);
 
@@ -434,6 +447,10 @@ void kfree(void* ptr)
         if (IsValidHeader(prev) && prev->free)
         {
             g_freeBytes += OVERHEAD;
+#ifndef BROOK_HOST_TEST
+            UnixLifeHeap(prev, prev->size + h->size, UnixLifeEvent::HeapFree,
+                         reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+#endif
             WriteBlock(reinterpret_cast<uint8_t*>(prev), prev->size + h->size, 1);
         }
     }

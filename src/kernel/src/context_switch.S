@@ -21,6 +21,7 @@
 //   offset 64: rflags
 //   offset 72: cr3
 //   offset 80: fsBase
+//   offset 88: gsBase (user GS, inactive while kernel GS is active)
 
 .text
 .global context_switch
@@ -72,6 +73,15 @@ context_switch:
     orq  %rcx, %rdx
     movq %rdx, 80(%rdi)         // old->fsBase
 
+    // The kernel's active GS remains the CPU-local KernelCpuEnv. SWAPGS
+    // parked the interrupted thread's user GS in IA32_KERNEL_GS_BASE.
+    movl $0xC0000102, %ecx
+    rdmsr
+    movl %eax, %ecx
+    shlq $32, %rdx
+    orq %rcx, %rdx
+    movq %rdx, 88(%rdi)
+
     // --- Restore new context ---
 
     // Switch CR3 if different
@@ -91,6 +101,13 @@ context_switch:
     shrq $32, %rdx
     wrmsr
 .Lskip_fsbase:
+
+    // Always restore user GS, including zero; never migrate kernel GS.
+    movq 88(%rsi), %rax
+    movq %rax, %rdx
+    shrq $32, %rdx
+    movl $0xC0000102, %ecx
+    wrmsr
 
     // Restore RFLAGS — but force a known-good kernel flag state. We clear IF
     // (bit 9) so a timer interrupt cannot fire in the middle of the register

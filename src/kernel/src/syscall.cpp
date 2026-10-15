@@ -1,3 +1,4 @@
+#include "unix_lifetime_trace.h"
 // syscall.cpp -- SYSCALL/SYSRET dispatcher, syscall table, and user-mode entry.
 //
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
@@ -16,6 +17,7 @@
 #include "scheduler.h"
 #include "spinlock.h"
 #include "sync/futex_waiter_pool.h"
+#include "sync/kmutex.h"
 #include "string.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
@@ -462,7 +464,8 @@ static bool HasPendingSignals()
 {
     Process* proc = ProcessCurrent();
     if (!proc) return false;
-    return ((proc->sigPending | PosixTimerPending(proc)) & ~proc->sigMask) != 0;
+    return __atomic_load_n(&proc->terminalPending, __ATOMIC_ACQUIRE) ||
+           ((proc->sigPending | PosixTimerPending(proc)) & ~proc->sigMask) != 0;
 }
 
 // Child exit also queues default-ignored SIGCHLD to wake wait4. Blocking
@@ -558,7 +561,7 @@ struct EpollInstance {
 
 // memfd constants and data — defined here so sys_read/sys_write/fstat can use them
 static constexpr uint32_t MFD_CLOEXEC       = 0x0001u;
-[[maybe_unused]] static constexpr uint32_t MFD_ALLOW_SEALING = 0x0002u;
+static constexpr uint32_t MFD_ALLOW_SEALING = 0x0002u;
 
 // Sparse / lazy memfd backing.
 //
@@ -574,7 +577,7 @@ struct MemFdData {
     uint64_t  inode;            // stable backing-object identity, shared by dup/fork/SCM_RIGHTS
     uint64_t* pageMap;          // [pageMapCount] entries; raw PhysicalAddress.value, 0 = unbacked
     uint64_t  pageMapCount;     // number of slots; covers `capacity` bytes
-    uint64_t  size;             // logical size set by ftruncate / extended on write
+    uint64_t  size;             // logical size set by truncate/write/fallocate
     uint64_t  capacity;         // pageMapCount * 4096
     volatile uint32_t lock;     // spinlock protecting pageMap allocations + grow
     volatile uint32_t refCount; // +1 per fd, +1 per live mmap VMA
@@ -588,6 +591,7 @@ static uint64_t NextMemFdInode()
 
 static inline void MfdLock(MemFdData* mfd)
 {
+    if (Process* self = ProcessCurrent()) SchedulerKernelRegionEnter(self);
     while (__atomic_exchange_n(&mfd->lock, 1, __ATOMIC_ACQUIRE)) {
         __asm__ volatile("pause");
     }
@@ -595,6 +599,7 @@ static inline void MfdLock(MemFdData* mfd)
 static inline void MfdUnlock(MemFdData* mfd)
 {
     __atomic_store_n(&mfd->lock, 0, __ATOMIC_RELEASE);
+    if (Process* self = ProcessCurrent()) SchedulerKernelRegionLeave(self);
 }
 
 // Grow pageMap to cover at least `needed` bytes. Does NOT allocate any
@@ -675,6 +680,79 @@ static inline void MemFdUnref(MemFdData* mfd)
         }
         kfree(mfd);
     }
+}
+
+struct KernelOperationGuard {
+    Process* proc;
+    explicit KernelOperationGuard(Process* p) : proc(p) { if (proc) SchedulerKernelRegionEnter(proc); }
+    ~KernelOperationGuard() { if (proc) SchedulerKernelRegionLeave(proc); }
+};
+
+// Publish a complete independent descriptor while retaining object ownership
+// under fdLock, so a sibling close cannot race partially initialized flags.
+static int MemFdInstall(Process* proc, MemFdData* mfd, uint32_t flags)
+{
+    if (!proc || !proc->fds) return -EMFILE;
+    FdEntry entry{};
+    entry.type = FdType::MemFd;
+    entry.handle = mfd;
+    entry.statusFlags = flags & ~(0x80000u | 0x40u | 0x80u | 0x200u);
+    entry.fdFlags = (flags & 0x80000u) ? 1 : 0;
+    int fd = FdTableDuplicatePinned(proc->fds, ProcessFdLock(proc), &entry, 0,
+        entry.fdFlags, [](FdEntry* e) { MemFdRef(static_cast<MemFdData*>(e->handle)); });
+    return fd < 0 ? -EMFILE : fd;
+}
+
+static int64_t MemFdReadAt(MemFdData* mfd, void* buffer, uint64_t count, uint64_t* offset)
+{
+    MfdLock(mfd);
+    uint64_t pos = *offset;
+    uint64_t available = pos < mfd->size ? mfd->size - pos : 0;
+    uint64_t total = count < available ? count : available;
+    auto* dst = static_cast<uint8_t*>(buffer);
+    for (uint64_t done = 0; done < total;) {
+        uint64_t index = pos / 4096, inPage = pos & 4095;
+        uint64_t n = 4096 - inPage;
+        if (n > total - done) n = total - done;
+        uint64_t raw = index < mfd->pageMapCount ? mfd->pageMap[index] : 0;
+        if (raw) memcpy(dst + done, reinterpret_cast<void*>(PhysToVirt(PhysicalAddress(raw)).raw() + inPage), n);
+        else memset(dst + done, 0, n);
+        pos += n; done += n;
+    }
+    *offset = pos;
+    MfdUnlock(mfd);
+    return total;
+}
+
+static int64_t MemFdWriteAt(MemFdData* mfd, const void* buffer, uint64_t count,
+                            uint64_t* offset, bool append)
+{
+    if (!count) return 0;
+    MfdLock(mfd);
+    uint64_t pos = append ? mfd->size : *offset;
+    if (pos > 0x7fffffffffffffffULL || count > 0x7fffffffffffffffULL - pos) { MfdUnlock(mfd); return -EINVAL; }
+    if (!MemFdGrowLocked(mfd, pos + count)) { MfdUnlock(mfd); return -ENOMEM; }
+    auto* src = static_cast<const uint8_t*>(buffer);
+    uint64_t done = 0;
+    while (done < count) {
+        uint64_t index = pos / 4096, inPage = pos & 4095;
+        uint64_t n = 4096 - inPage;
+        if (n > count - done) n = count - done;
+        uint64_t raw = mfd->pageMap[index];
+        if (!raw) {
+            PhysicalAddress page = PmmAllocPage(MemTag::User, 0);
+            if (!page) break;
+            raw = page.raw();
+            memset(reinterpret_cast<void*>(PhysToVirt(page).raw()), 0, 4096);
+            mfd->pageMap[index] = raw;
+        }
+        memcpy(reinterpret_cast<void*>(PhysToVirt(PhysicalAddress(raw)).raw() + inPage), src + done, n);
+        pos += n; done += n;
+    }
+    if (pos > mfd->size) mfd->size = pos;
+    *offset = pos;
+    MfdUnlock(mfd);
+    return done || !count ? static_cast<int64_t>(done) : -ENOMEM;
 }
 
 static inline void VnodeRef(Vnode* vn)
@@ -816,7 +894,7 @@ void* DevTtyDeepCopy(void* handle)
 // memfd VMA and was successfully resolved (PTE installed).
 extern "C" bool MemFdHandleUserFault(uint64_t cr2, uint64_t errCode)
 {
-    (void)errCode;
+    if (errCode & 1) return false;
     Process* proc = MemoryMapOwner(ProcessCurrent());
     if (!proc) return false;
     uint64_t pageVA = cr2 & ~uint64_t{0xFFF};
@@ -826,10 +904,13 @@ extern "C" bool MemFdHandleUserFault(uint64_t cr2, uint64_t errCode)
         if (m.length == 0 || !m.mfd) continue;
         if (pageVA < m.vaddr || pageVA >= m.vaddr + m.length) continue;
 
+        if (!m.prot || ((errCode & 2) && !(m.prot & 2)) ||
+            ((errCode & 16) && !(m.prot & 4))) return false;
         auto* mfd = static_cast<MemFdData*>(m.mfd);
         uint64_t offsetInVma = pageVA - m.vaddr;
         uint64_t mfdOffset = m.offset + offsetInVma;
         uint64_t pageIdx = mfdOffset / 4096;
+        if (mfdOffset >= __atomic_load_n(&mfd->size, __ATOMIC_ACQUIRE)) return false;
 
         PhysicalAddress phys = MemFdGetOrAllocPage(mfd, pageIdx, proc->pid);
         if (!phys) return false;
@@ -1145,6 +1226,119 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
     return false;
 }
 
+// Metadata-only preflight; no references or permissions change on exhaustion.
+static bool MemFdMapsCapacity(Process* proc, uint64_t addr, uint64_t length, bool protect)
+{
+    uint64_t end = addr + length;
+    uint32_t free = 0, needed = 0;
+    for (const auto& m : proc->memfdMaps) {
+        if (!m.length) { ++free; continue; }
+        uint64_t begin = addr > m.vaddr ? addr : m.vaddr;
+        uint64_t stop = end < m.vaddr + m.length ? end : m.vaddr + m.length;
+        if (begin >= stop) continue;
+        if (protect) needed += (begin > m.vaddr) + (stop < m.vaddr + m.length);
+        else if (begin > m.vaddr && stop < m.vaddr + m.length) ++needed;
+    }
+    return needed <= free;
+}
+
+static bool MemFdMapAppend(Process* proc, const Process::MemFdMap& source,
+                            uint64_t begin, uint64_t end)
+{
+    for (auto& slot : proc->memfdMaps) {
+        if (slot.length) continue;
+        slot = source;
+        slot.vaddr = begin;
+        slot.offset += begin - source.vaddr;
+        slot.length = end - begin;
+        MemFdRef(static_cast<MemFdData*>(slot.mfd));
+        return true;
+    }
+    return false;
+}
+
+static bool MemFdMapsProtect(Process* proc, uint64_t addr, uint64_t length,
+                              uint64_t flags, uint32_t prot)
+{
+    uint64_t end = addr + length;
+    SpinLockAcquire(&proc->fileMapLock);
+    if (!MemFdMapsCapacity(proc, addr, length, true)) {
+        SpinLockRelease(&proc->fileMapLock);
+        return false;
+    }
+    for (auto& m : proc->memfdMaps) {
+        if (!m.length) continue;
+        uint64_t begin = addr > m.vaddr ? addr : m.vaddr;
+        uint64_t stop = end < m.vaddr + m.length ? end : m.vaddr + m.length;
+        if (begin >= stop) continue;
+        if (prot & ~m.maxProt) {
+            SpinLockRelease(&proc->fileMapLock);
+            return false;
+        }
+        Process::MemFdMap original = m;
+        // Keep this slot as the changed middle; side fragments retain both
+        // original permissions and their own backing-object references.
+        if (begin > original.vaddr && !MemFdMapAppend(proc, original, original.vaddr, begin)) {
+            SpinLockRelease(&proc->fileMapLock);
+            return false;
+        }
+        if (stop < original.vaddr + original.length &&
+            !MemFdMapAppend(proc, original, stop, original.vaddr + original.length)) {
+            SpinLockRelease(&proc->fileMapLock);
+            return false;
+        }
+        m.vaddr = begin;
+        m.offset = original.offset + begin - original.vaddr;
+        m.length = stop - begin;
+        m.vmmFlags = flags;
+        m.prot = prot;
+    }
+    SpinLockRelease(&proc->fileMapLock);
+    return true;
+}
+
+// Removed objects remain retained until old PTEs and remote translations are
+// gone. Returned references are consumed by the caller after its shootdown.
+struct MemFdRemovedRange { uint64_t begin, end; };
+static bool MemFdMapsRemove(Process* proc, uint64_t addr, uint64_t length,
+                            MemFdData** retired, uint32_t* retiredCount,
+                            MemFdRemovedRange* ranges, uint32_t* rangeCount)
+{
+    uint32_t count = 0;
+    *rangeCount = 0;
+    uint64_t end = addr + length;
+    SpinLockAcquire(&proc->fileMapLock);
+    if (!MemFdMapsCapacity(proc, addr, length, false)) {
+        SpinLockRelease(&proc->fileMapLock);
+        return false;
+    }
+    for (auto& m : proc->memfdMaps) {
+        if (!m.length) continue;
+        uint64_t begin = addr > m.vaddr ? addr : m.vaddr;
+        uint64_t stop = end < m.vaddr + m.length ? end : m.vaddr + m.length;
+        if (begin >= stop) continue;
+        ranges[(*rangeCount)++] = {begin, stop};
+        uint64_t oldEnd = m.vaddr + m.length;
+        if (begin == m.vaddr && stop == oldEnd) {
+            retired[count++] = static_cast<MemFdData*>(m.mfd);
+            m = {};
+        } else if (begin == m.vaddr) {
+            m.offset += stop - m.vaddr;
+            m.vaddr = stop;
+            m.length = oldEnd - stop;
+        } else {
+            if (stop < oldEnd && !MemFdMapAppend(proc, m, stop, oldEnd)) {
+                SpinLockRelease(&proc->fileMapLock);
+                return false;
+            }
+            m.length = begin - m.vaddr;
+        }
+    }
+    *retiredCount = count;
+    SpinLockRelease(&proc->fileMapLock);
+    return true;
+}
+
 static bool FileMapsApplyProtection(Process* proc, uint64_t addr, uint64_t length,
                                     uint64_t newFlags)
 {
@@ -1338,13 +1532,26 @@ static inline int UnixFdQueueCount(const UnixFdQueue* q)
     return UnixFdQueueCount(q) >= UNIX_FD_QUEUE_CAP - 1;
 }
 
+struct UnixCredentials {
+    int32_t pid;
+    uint32_t uid;
+    uint32_t gid;
+};
+static_assert(sizeof(UnixCredentials) == 12, "Linux ucred ABI");
+static UnixCredentials UnixCurrentCredentials(Process* process)
+{
+    return {static_cast<int32_t>((process->tgid ? process->tgid : process->pid)), process->euid, process->egid};
+}
+
 struct UnixPendingConn {
+    UnixCredentials clientCredentials;
     PipeBuffer* serverRx;     // server reads this (client→server data)
     PipeBuffer* serverTx;     // server writes this (server→client data)
     UnixFdQueue* serverRxFds; // server reads these fds (client→server)
     UnixFdQueue* serverTxFds; // server writes these fds (server→client)
-    Process*    clientWaiter; // client blocked until accept() completes
-    bool        accepted;
+    // Owns one server endpoint and one reference to each ancillary queue until
+    // accept transfers them, or listener teardown releases them. Registry lock
+    // serializes publication, dequeue and teardown of these slots.
     bool        used;
 };
 
@@ -1353,6 +1560,8 @@ struct UnixSocketData {
     State   state;
     bool    nonblock;
     volatile uint32_t refCount; // +1 per fd pointing at this struct
+    uint32_t socketType;       // creation type (without NONBLOCK/CLOEXEC flags)
+    UnixCredentials peerCredentials; // connection/listen snapshot; registry lock protects copies
     char    path[108];
     UnixPendingConn pending[UNIX_ACCEPT_QUEUE];
     int             pendingCount;
@@ -1371,41 +1580,102 @@ struct SockAddrUn {
     char     sun_path[108];
 };
 
+static SpinLock g_unixRegistryLock;
+// Explicitly armed with "unixlife on" after workload gates. No UART traffic.
+extern "C" { UnixLifeCore g_unixLifeTrace{}; }
+static IrqSpinLock g_unixLifeLock;
+void UnixLifeControl(bool enabled)
+{
+    uint64_t flags = IrqSpinLockAcquire(&g_unixLifeLock);
+    // Re-arm clears bounded state; readers should extract only while stopped.
+    if (enabled) memset(&g_unixLifeTrace, 0, sizeof(g_unixLifeTrace));
+    __atomic_store_n(&g_unixLifeTrace.enabled, enabled ? 1u : 0u, __ATOMIC_RELEASE);
+    IrqSpinLockRelease(&g_unixLifeLock, flags);
+}
+static void UnixLife(UnixLifeEvent event, void* handle, uint32_t previous,
+                     uint32_t next, int fd, uint64_t caller, uint64_t size = 0)
+{
+    if (!__atomic_load_n(&g_unixLifeTrace.enabled, __ATOMIC_RELAXED)) return;
+    Process* current = ProcessCurrent();
+    UnixLifeRecord record{0, reinterpret_cast<uint64_t>(handle), caller, 0, size,
+        previous, next, current ? current->pid : uint16_t{0},
+        current ? (current->tgid ? current->tgid : current->pid) : uint16_t{0},
+        fd, event, 0};
+    uint64_t flags = IrqSpinLockAcquire(&g_unixLifeLock);
+    if (g_unixLifeTrace.enabled) {
+        if (event == UnixLifeEvent::Allocate) g_unixLifeTrace.Watch(record);
+        else g_unixLifeTrace.Event(record);
+    }
+    IrqSpinLockRelease(&g_unixLifeLock, flags);
+}
+void UnixLifeHeap(void* address, uint64_t size, UnixLifeEvent event, uint64_t caller)
+{
+    if (!__atomic_load_n(&g_unixLifeTrace.enabled, __ATOMIC_RELAXED)) return;
+    Process* current = ProcessCurrent();
+    UnixLifeRecord record{0, 0, caller, reinterpret_cast<uint64_t>(address), size,
+        0, 0, current ? current->pid : uint16_t{0},
+        current ? (current->tgid ? current->tgid : current->pid) : uint16_t{0},
+        -1, event, 0};
+    uint64_t flags = IrqSpinLockAcquire(&g_unixLifeLock);
+    if (g_unixLifeTrace.enabled) g_unixLifeTrace.Heap(record, event == UnixLifeEvent::HeapFree || event == UnixLifeEvent::HeapWriteFree);
+    IrqSpinLockRelease(&g_unixLifeLock, flags);
+}
+#define UNIX_LIFE(event, object, before, after, fd) \
+    UnixLife(UnixLifeEvent::event, object, before, after, fd, \
+             reinterpret_cast<uint64_t>(__builtin_return_address(0)))
+
+void UnixLifeClaim(int fd, const FdClaimResult& claim)
+{
+    if (claim.type == FdType::UnixSocket)
+        UNIX_LIFE(Claim, claim.handle, 0, 0, fd);
+}
+
+void UnixLifePublished(int fd, const FdEntry& entry)
+{
+    if (entry.type == FdType::UnixSocket)
+        UNIX_LIFE(Publish, entry.handle, 0, 0, fd);
+}
+
 static UnixSocketData* g_unixServers[UNIX_MAX_SERVERS];
 
 static UnixSocketData* UnixFindServer(const char* path)
 {
+    SpinLockAcquire(&g_unixRegistryLock);
+    UnixSocketData* found = nullptr;
     for (int i = 0; i < UNIX_MAX_SERVERS; i++) {
-        if (!g_unixServers[i]) continue;
-        if (g_unixServers[i]->state != UnixSocketData::State::Listening) continue;
-        const char* a = g_unixServers[i]->path;
-        const char* b = path;
-        bool match = true;
-        while (*a || *b) { if (*a++ != *b++) { match = false; break; } }
-        if (match) return g_unixServers[i];
+        auto* candidate = g_unixServers[i];
+        if (!candidate || candidate->state != UnixSocketData::State::Listening) continue;
+        if (strcmp(candidate->path, path) == 0) {
+            uint32_t previous = __atomic_fetch_add(&candidate->refCount, 1, __ATOMIC_RELAXED);
+            UNIX_LIFE(RegistryPin, candidate, previous, previous + 1, -1);
+            found = candidate;
+            break;
+        }
     }
-    return nullptr;
+    SpinLockRelease(&g_unixRegistryLock);
+
+    return found;
 }
 
-static void UnixRegisterServer(UnixSocketData* usd)
+static bool UnixRegisterServer(UnixSocketData* usd)
 {
+    SpinLockAcquire(&g_unixRegistryLock);
+    int available = -1;
     for (int i = 0; i < UNIX_MAX_SERVERS; i++) {
-        if (!g_unixServers[i]) { g_unixServers[i] = usd; return; }
+        if (g_unixServers[i] == usd) { SpinLockRelease(&g_unixRegistryLock); return true; }
+        if (!g_unixServers[i]) available = i;
     }
-}
-
-static void UnixUnregisterServer(UnixSocketData* usd)
-{
-    for (int i = 0; i < UNIX_MAX_SERVERS; i++) {
-        if (g_unixServers[i] == usd) { g_unixServers[i] = nullptr; return; }
-    }
+    if (available >= 0) g_unixServers[available] = usd;
+    SpinLockRelease(&g_unixRegistryLock);
+    return available >= 0;
 }
 
 void UnixSocketHandleRef(void* handle)
 {
     if (!handle) return;
     auto* usd = static_cast<UnixSocketData*>(handle);
-    __atomic_fetch_add(&usd->refCount, 1, __ATOMIC_RELEASE);
+    uint32_t previous = __atomic_fetch_add(&usd->refCount, 1, __ATOMIC_RELEASE);
+    UNIX_LIFE(Retain, usd, previous, previous + 1, -1);
 }
 
 static void UnixFdQueueUnref(UnixFdQueue* q)
@@ -1431,47 +1701,77 @@ static inline void PipeWakeEpollRaw(PipeBuffer* pipe)
     }
 }
 
-static inline void PipeDestroyIfClosed(PipeBuffer* pipe)
+static void PipeReleaseEnd(PipeBuffer* pipe, bool writer)
 {
     if (!pipe) return;
-    if (__atomic_load_n(&pipe->readers, __ATOMIC_ACQUIRE) == 0 &&
-        __atomic_load_n(&pipe->writers, __ATOMIC_ACQUIRE) == 0)
-        PipeBufferDestroy(pipe);
+    // Finish every access before surrendering this endpoint. An opposite-end
+    // closer cannot destroy the object while we still hold its lock/reference.
+    SpinLockAcquire(&pipe->lock);
+    if (writer)
+        __atomic_fetch_sub(&pipe->writers, 1, __ATOMIC_RELEASE);
+    else
+        __atomic_fetch_sub(&pipe->readers, 1, __ATOMIC_RELEASE);
+    Process* waiter = writer ? pipe->readerWaiter : pipe->writerWaiter;
+    if (writer) pipe->readerWaiter = nullptr;
+    else pipe->writerWaiter = nullptr;
+    if (waiter) WakeProcess(waiter);
+    PipeWakeEpollRaw(pipe);
+    bool destroy = __atomic_load_n(&pipe->readers, __ATOMIC_ACQUIRE) == 0 &&
+                   __atomic_load_n(&pipe->writers, __ATOMIC_ACQUIRE) == 0;
+    SpinLockRelease(&pipe->lock);
+    if (destroy) PipeBufferDestroy(pipe);
+}
+
+static void UnixPendingRelease(const UnixPendingConn& pending)
+{
+    PipeReleaseEnd(pending.serverRx, false);
+    PipeReleaseEnd(pending.serverTx, true);
+    UnixFdQueueUnref(pending.serverRxFds);
+    UnixFdQueueUnref(pending.serverTxFds);
 }
 
 static void UnixSocketHandleUnref(void* handle)
 {
     if (!handle) return;
     auto* usd = static_cast<UnixSocketData*>(handle);
+    UnixPendingConn abandoned[UNIX_ACCEPT_QUEUE]{};
+    SpinLockAcquire(&g_unixRegistryLock);
     uint32_t prev = __atomic_fetch_sub(&usd->refCount, 1, __ATOMIC_ACQ_REL);
+    // Trace before unlocking: another release could free the object afterward.
+    UNIX_LIFE(Release, usd, prev, prev - 1, -1);
+    if (prev == 1) {
+        for (int i = 0; i < UNIX_MAX_SERVERS; ++i)
+            if (g_unixServers[i] == usd) g_unixServers[i] = nullptr;
+        for (int i = 0; i < UNIX_ACCEPT_QUEUE; ++i) {
+            abandoned[i] = usd->pending[i];
+            usd->pending[i] = {};
+        }
+        usd->pendingCount = 0;
+    }
+    SpinLockRelease(&g_unixRegistryLock);
     if (prev > 1) return;
-
-    if (usd->state == UnixSocketData::State::Listening)
-        UnixUnregisterServer(usd);
-    if (usd->rxPipe) {
-        __atomic_fetch_sub(&usd->rxPipe->readers, 1, __ATOMIC_RELEASE);
-        Process* writer = usd->rxPipe->writerWaiter;
-        if (writer) {
-            usd->rxPipe->writerWaiter = nullptr;
-            WakeProcess(writer);
-        }
-        PipeWakeEpollRaw(usd->rxPipe);
-        PipeDestroyIfClosed(usd->rxPipe);
-    }
-    if (usd->txPipe) {
-        __atomic_fetch_sub(&usd->txPipe->writers, 1, __ATOMIC_RELEASE);
-        Process* reader = usd->txPipe->readerWaiter;
-        if (reader) {
-            usd->txPipe->readerWaiter = nullptr;
-            WakeProcess(reader);
-        }
-        PipeWakeEpollRaw(usd->txPipe);
-        PipeDestroyIfClosed(usd->txPipe);
-    }
+    for (const auto& pending : abandoned)
+        if (pending.used) UnixPendingRelease(pending);
+    PipeReleaseEnd(usd->rxPipe, false);
+    PipeReleaseEnd(usd->txPipe, true);
 
     UnixFdQueueUnref(usd->incomingFds);
     UnixFdQueueUnref(usd->peerIncomingFds);
+    UNIX_LIFE(DirectFree, usd, 0, 0, -1);
     kfree(usd);
+}
+
+static int UnixInstallSocket(Process* process, UnixSocketData* socket, uint32_t flags,
+                             const char* site)
+{
+    FdEntry owned{};
+    owned.type = FdType::UnixSocket;
+    owned.handle = socket;
+    owned.statusFlags = flags & 0x800;
+    owned.fdFlags = (flags & 0x80000) ? 1 : 0;
+    (void)site;
+    int fd = FdTablePublishOwned(process->fds, ProcessFdLock(process), owned, 0, -1, nullptr, UnixLifePublished);
+    return fd;
 }
 
 // Wake any process blocked inside epoll_wait on this pipe. Called from
@@ -1568,6 +1868,48 @@ static bool IsTerminalFd(const FdEntry* fde)
 // ---------------------------------------------------------------------------
 // sys_write (1)
 // ---------------------------------------------------------------------------
+
+// Procfs fd links name capabilities; opening their printable link text is never
+// a substitute. This scope supports the current fd table only, not foreign PIDs.
+static int OpenProcMemFd(Process* proc, const char* path, uint64_t flags, bool* matched)
+{
+    *matched = false;
+    if (strncmp(path, "/proc/", 6)) return -ENOENT;
+    const char* part = path + 6;
+    bool self = false;
+    if (!strncmp(part, "self/", 5)) { self = true; part += 5; }
+    else {
+        uint64_t pid = 0;
+        if (*part < '0' || *part > '9') return -ENOENT;
+        while (*part >= '0' && *part <= '9') {
+            if (pid > 65535) { *matched = true; return -ENOENT; }
+            pid = pid * 10 + *part++ - '0';
+        }
+        if (*part++ != '/') return -ENOENT;
+        self = pid == proc->pid || pid == proc->tgid;
+    }
+    if (strncmp(part, "fd/", 3)) return -ENOENT;
+    *matched = true;
+    if (!self) return -13;
+    part += 3;
+    uint64_t number = 0;
+    if (*part < '0' || *part > '9') return -ENOENT;
+    while (*part >= '0' && *part <= '9') {
+        if (number >= MAX_FDS) return -ENOENT;
+        number = number * 10 + *part++ - '0';
+    }
+    if (*part) return -20;
+    if (number >= MAX_FDS) return -ENOENT;
+    if ((flags & 3) == 3) return -EINVAL;
+    if (flags & 0x20000) return -40; // O_NOFOLLOW on a magic symlink
+    if (flags & 0x10000) return -20; // O_DIRECTORY
+    if (flags & (0x200000 | 0x200 | 0x40 | 0x80)) return -95;
+    KernelOperationGuard operation(proc);
+    FdRef source(proc, static_cast<int>(number));
+    if (!source) return -ENOENT;
+    if (source.get()->type != FdType::MemFd || !source.get()->handle) return -95;
+    return MemFdInstall(proc, static_cast<MemFdData*>(source.get()->handle), static_cast<uint32_t>(flags));
+}
 
 // Shared write dispatch used by sys_write (user buffer) and sys_sendfile
 // (kernel bounce buffer). bufAddr is treated as a raw readable byte pointer;
@@ -1963,34 +2305,11 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count)
         return static_cast<int64_t>(written);
     }
 
-    // Write to memfd — grows backing as needed, allocates pages on demand.
-    if (fde->type == FdType::MemFd && fde->handle)
-    {
-        auto* mfd = static_cast<MemFdData*>(fde->handle);
-        if (bufAddr < 0x1000) return -EFAULT;
-        uint64_t pos = fde->seekPos;
-        uint64_t end = pos + count;
-
-        if (end > mfd->capacity) {
-            if (!MemFdGrow(mfd, end)) return -ENOMEM;
-        }
-
-        const uint8_t* src = reinterpret_cast<const uint8_t*>(bufAddr);
-        uint64_t remaining = count;
-        while (remaining) {
-            uint64_t pageIdx = pos / 4096;
-            uint64_t pageOff = pos & 0xFFF;
-            uint64_t chunk = 4096 - pageOff;
-            if (chunk > remaining) chunk = remaining;
-            PhysicalAddress phys = MemFdGetOrAllocPage(mfd, pageIdx, proc->pid);
-            if (!phys) return -ENOMEM;
-            auto* dst = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw()) + pageOff;
-            __builtin_memcpy(dst, src, chunk);
-            src += chunk; pos += chunk; remaining -= chunk;
-        }
-        fde->seekPos = pos;
-        if (pos > mfd->size) mfd->size = pos;
-        return static_cast<int64_t>(count);
+    if (fde->type == FdType::MemFd && fde->handle) {
+        if ((fde->statusFlags & 3) == 0) return -EBADF;
+        return MemFdWriteAt(static_cast<MemFdData*>(fde->handle),
+            reinterpret_cast<const void*>(bufAddr), count, &fde->seekPos,
+            (fde->statusFlags & 0x400) != 0);
     }
 
     // Write to AF_UNIX connected socket
@@ -2577,33 +2896,10 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         }
     }
 
-    // Read from memfd — sequential read; unbacked pages read as zero.
-    if (fde->type == FdType::MemFd && fde->handle)
-    {
-        auto* mfd = static_cast<MemFdData*>(fde->handle);
-        uint64_t pos = fde->seekPos;
-        if (pos >= mfd->size) return 0; // EOF
-        uint64_t avail = mfd->size - pos;
-        uint64_t copyLen = (count < avail) ? count : avail;
-
-        auto* dst = reinterpret_cast<uint8_t*>(bufAddr);
-        uint64_t remaining = copyLen;
-        while (remaining) {
-            uint64_t pageIdx = pos / 4096;
-            uint64_t pageOff = pos & 0xFFF;
-            uint64_t chunk = 4096 - pageOff;
-            if (chunk > remaining) chunk = remaining;
-            uint64_t raw = (pageIdx < mfd->pageMapCount) ? mfd->pageMap[pageIdx] : 0;
-            if (raw == 0) {
-                __builtin_memset(dst, 0, chunk);
-            } else {
-                auto* src = reinterpret_cast<const uint8_t*>(PhysToVirt(PhysicalAddress(raw)).raw()) + pageOff;
-                __builtin_memcpy(dst, src, chunk);
-            }
-            dst += chunk; pos += chunk; remaining -= chunk;
-        }
-        fde->seekPos = pos;
-        return static_cast<int64_t>(copyLen);
+    if (fde->type == FdType::MemFd && fde->handle) {
+        if ((fde->statusFlags & 3) == 1) return -EBADF;
+        return MemFdReadAt(static_cast<MemFdData*>(fde->handle),
+            reinterpret_cast<void*>(bufAddr), count, &fde->seekPos);
     }
 
     // Read from /dev/tty — reads from stdin pipe
@@ -2788,6 +3084,7 @@ static inline void DrmPrimeUnref(DrmPrimeObj* p)
         kfree(p);
 }
 struct DrmCtx {
+    volatile uint32_t refCount; // descriptor/fork ownership of the shared context
     int32_t   ctxId;   // GpuApp virgl context (0 = not yet created)
     DrmGemObj gem[DRM_MAX_GEM];   // index i -> bo_handle (i+1); 0 is invalid
 };
@@ -2879,6 +3176,10 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         }
     }
 
+    bool procFdPath = false;
+    int procFdResult = OpenProcMemFd(proc, lookupPath, flags, &procFdPath);
+    if (procFdPath) return procFdResult;
+
     // Device paths
     if (StrEq(path, "/dev/fb0"))
     {
@@ -2937,6 +3238,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         auto* dctx = static_cast<DrmCtx*>(kmalloc(sizeof(DrmCtx)));
         if (!dctx) return -ENOMEM;
         memset(dctx, 0, sizeof(DrmCtx));
+        dctx->refCount = 1;
         int fd = FdAlloc(proc, FdType::DevDri, dctx);
         if (fd < 0) { kfree(dctx); return -EMFILE; }
         DbgPrintf("sys_open: /dev/dri/renderD128 → fd %d\n", fd);
@@ -3098,12 +3400,25 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         static constexpr int SHM_MAX = 32;
         struct ShmEntry { char name[64]; MemFdData* mfd; bool used; };
         static ShmEntry s_shm[SHM_MAX];
+        static KMutex namespaceLock{};
+        struct NamespaceGuard {
+            KMutex* lock;
+            explicit NamespaceGuard(KMutex* p) : lock(p) { KMutexLock(lock); }
+            ~NamespaceGuard() { KMutexUnlock(lock); }
+        } namespaceGuard(&namespaceLock);
 
         const char* shmName = lookupPath + 9; // skip "/dev/shm/"
+        uint32_t nameLength = strlen(shmName);
+        if (!nameLength) return -EINVAL;
+        if (nameLength >= sizeof(ShmEntry::name)) return -36;
+        for (uint32_t i = 0; i < nameLength; ++i) if (shmName[i] == '/') return -EINVAL;
         static constexpr uint64_t LINUX_O_CREAT_SHM  = 0x40;
         static constexpr uint64_t LINUX_O_TRUNC_SHM  = 0x200;
         bool create = (flags & LINUX_O_CREAT_SHM) != 0;
         bool trunc  = (flags & LINUX_O_TRUNC_SHM) != 0;
+        if ((flags & 3) == 3) return -EINVAL;
+        if (trunc) return -95; // Needs mapped-object invalidation, not page freeing.
+
 
         // Find existing entry
         ShmEntry* entry = nullptr;
@@ -3115,6 +3430,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
             if (match) { entry = &s_shm[i]; break; }
         }
 
+        if (entry && create && (flags & 0x80)) return -17;
         if (!entry && !create) return -ENOENT;
 
         if (!entry) {
@@ -3124,7 +3440,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
             }
             if (!entry) return -ENOMEM;
             for (int i = 0; i < 63 && shmName[i]; i++) entry->name[i] = shmName[i];
-            entry->name[63] = 0;
+            entry->name[nameLength] = 0;
             entry->mfd = static_cast<MemFdData*>(kmalloc(sizeof(MemFdData)));
             if (!entry->mfd) return -ENOMEM;
             entry->mfd->inode = NextMemFdInode();
@@ -3133,28 +3449,14 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
             entry->mfd->size = 0;
             entry->mfd->capacity = 0;
             entry->mfd->lock = 0;
-            entry->mfd->refCount = 0;
+            // The bounded namespace owns a reference independently of open
+            // descriptors; otherwise closing the last fd leaves a dangling entry.
+            entry->mfd->refCount = 1;
             entry->used = true;
         }
 
-        if (trunc) {
-            MfdLock(entry->mfd);
-            if (entry->mfd->pageMap) {
-                for (uint64_t i = 0; i < entry->mfd->pageMapCount; i++) {
-                    if (entry->mfd->pageMap[i]) PmmFreePage(PhysicalAddress(entry->mfd->pageMap[i]));
-                }
-                kfree(entry->mfd->pageMap);
-                entry->mfd->pageMap = nullptr;
-            }
-            entry->mfd->pageMapCount = 0;
-            entry->mfd->size = 0;
-            entry->mfd->capacity = 0;
-            MfdUnlock(entry->mfd);
-        }
-
-        int fd = FdAlloc(proc, FdType::MemFd, entry->mfd);
-        if (fd < 0) return -EMFILE;
-        MemFdRef(entry->mfd);
+        int fd = MemFdInstall(proc, entry->mfd, static_cast<uint32_t>(flags));
+        if (fd < 0) return fd;
         SerialPrintf("shm_open: '%s' fd=%d size=%llu\n", shmName, fd, entry->mfd->size);
         return fd;
     }
@@ -3297,6 +3599,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
 // independent of the slot, which by now is already cleared (or about to be).
 void FinalizeClosedFd(const FdClaimResult& c)
 {
+    KernelOperationGuard operation(ProcessCurrent());
     if (c.type == FdType::Vnode && c.handle)
     {
         auto* vn = static_cast<Vnode*>(c.handle);
@@ -3307,41 +3610,7 @@ void FinalizeClosedFd(const FdClaimResult& c)
     }
 
     if (c.type == FdType::Pipe && c.handle)
-    {
-        auto* pipe = static_cast<PipeBuffer*>(c.handle);
-        // flags bit 0: 1=write end, 0=read end
-        if (c.flags & 1)
-        {
-            __atomic_fetch_sub(&pipe->writers, 1, __ATOMIC_RELEASE);
-            // Wake blocked reader so it sees EOF
-            Process* reader = pipe->readerWaiter;
-            if (reader)
-            {
-                pipe->readerWaiter = nullptr;
-                WakeProcess(reader);
-            }
-            // EOF is also readable for epoll (EPOLLHUP/EPOLLIN).
-            PipeWakeEpoll(pipe);
-        }
-        else
-        {
-            __atomic_fetch_sub(&pipe->readers, 1, __ATOMIC_RELEASE);
-            // Wake blocked writer so it sees EPIPE
-            Process* writer = pipe->writerWaiter;
-            if (writer)
-            {
-                pipe->writerWaiter = nullptr;
-                WakeProcess(writer);
-            }
-        }
-
-        // Free pipe buffer when both ends are closed
-        if (__atomic_load_n(&pipe->readers, __ATOMIC_ACQUIRE) == 0 &&
-            __atomic_load_n(&pipe->writers, __ATOMIC_ACQUIRE) == 0)
-        {
-            PipeBufferDestroy(pipe);
-        }
-    }
+        PipeReleaseEnd(static_cast<PipeBuffer*>(c.handle), (c.flags & 1) != 0);
 
     if (c.type == FdType::Socket && c.handle)
     {
@@ -3370,6 +3639,7 @@ void FinalizeClosedFd(const FdClaimResult& c)
 
     if (c.type == FdType::UnixSocket && c.handle)
     {
+        UNIX_LIFE(Finalize, c.handle, 0, 0, -1);
         UnixSocketHandleUnref(c.handle);
     }
 
@@ -3397,6 +3667,7 @@ void FinalizeClosedFd(const FdClaimResult& c)
         // GL shim: tear down the per-fd DRM context — destroy its GpuApp virgl
         // context (frees host resources) and free the GEM table.
         auto* dctx = static_cast<DrmCtx*>(c.handle);
+        if (__atomic_fetch_sub(&dctx->refCount, 1, __ATOMIC_ACQ_REL) > 1) return;
         const brook::GpuAppOps* ga = brook::GpuAppGet();
         if (ga && ga->CtxDestroy && dctx->ctxId > 0)
             ga->CtxDestroy(dctx->ctxId);
@@ -3416,30 +3687,15 @@ void FinalizeClosedFd(const FdClaimResult& c)
         // Opening /dev/tty incremented reader/writer counts on those pipes,
         // so closing must decrement them and free the pair struct.
         auto* pair = static_cast<TtyDevicePair*>(c.handle);
-        if (pair->readPipe)
-        {
-            auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
-            __atomic_fetch_sub(&rp->readers, 1, __ATOMIC_RELEASE);
-        }
-        if (pair->writePipe)
-        {
-            auto* wp = static_cast<PipeBuffer*>(pair->writePipe);
-            __atomic_fetch_sub(&wp->writers, 1, __ATOMIC_RELEASE);
-            // Wake blocked reader so it can see EOF
-            Process* reader = wp->readerWaiter;
-            if (reader)
-            {
-                wp->readerWaiter = nullptr;
-                WakeProcess(reader);
-            }
-            PipeWakeEpoll(wp);
-        }
+        PipeReleaseEnd(static_cast<PipeBuffer*>(pair->readPipe), false);
+        PipeReleaseEnd(static_cast<PipeBuffer*>(pair->writePipe), true);
         kfree(pair);
     }
 }
 
 int64_t CloseProcessFd(Process* proc, int fd)
 {
+    KernelOperationGuard operation(ProcessCurrent());
     if (!proc) return -EBADF;
     // Close the slot honouring any in-flight pin. FdClose either:
     //   * ClaimedNow — slot was unpinned; it has been cleared and we own the
@@ -3457,6 +3713,7 @@ int64_t CloseProcessFd(Process* proc, int fd)
         case FdCloseResult::NotFound:
             return -EBADF;
         case FdCloseResult::ClaimedNow:
+            UnixLifeClaim(fd, c);
             FinalizeClosedFd(c);
             return 0;
         case FdCloseResult::Deferred:
@@ -3474,10 +3731,13 @@ int64_t CloseProcessFd(Process* proc, int fd)
 // it is safe to claim-and-clear the slot unconditionally and finalize now.
 int64_t CloseProcessFdForced(Process* proc, int fd)
 {
+    KernelOperationGuard operation(ProcessCurrent());
     if (!proc) return -EBADF;
     FdClaimResult c;
-    if (FdClaim(proc, fd, &c))
+    if (FdClaim(proc, fd, &c)) {
+        UnixLifeClaim(fd, c);
         FinalizeClosedFd(c);
+    }
     return 0;
 }
 
@@ -3589,6 +3849,9 @@ static void FdBumpRefcount(FdEntry* fde)
     case FdType::EventFd:
         EventFdRef(static_cast<EventFdData*>(fde->handle));
         break;
+    case FdType::DevDri:
+        __atomic_fetch_add(&static_cast<DrmCtx*>(fde->handle)->refCount, 1, __ATOMIC_RELEASE);
+        break;
     case FdType::DrmPrime:
         DrmPrimeRef(static_cast<DrmPrimeObj*>(fde->handle));
         break;
@@ -3599,8 +3862,7 @@ static void FdBumpRefcount(FdEntry* fde)
         TimerFdRef(static_cast<TimerFdData*>(fde->handle));
         break;
     case FdType::UnixSocket: {
-        auto* usd = static_cast<UnixSocketData*>(fde->handle);
-        __atomic_fetch_add(&usd->refCount, 1, __ATOMIC_RELEASE);
+        UnixSocketHandleRef(fde->handle);
         break;
     }
     case FdType::DevDsp:
@@ -3611,96 +3873,81 @@ static void FdBumpRefcount(FdEntry* fde)
     }
 }
 
+// A successful copy owns its handle before it can become visible in any table.
+// Deep-copy-only handle types must never be published with the source pointer.
+bool FdRetainCopy(FdEntry* copy)
+{
+    if (copy->type == FdType::UnixSocket)
+        UNIX_LIFE(CopyRetain, copy->handle, 0, 0, -1);
+    if (copy->type == FdType::DevKlog && copy->handle) {
+        void* handle = DevKlogDeepCopy(copy->handle);
+        if (!handle) return false;
+        copy->handle = handle;
+    } else if (copy->type == FdType::DevTty && copy->handle) {
+        void* handle = DevTtyDeepCopy(copy->handle);
+        if (!handle) return false;
+        copy->handle = handle;
+    } else {
+        FdBumpRefcount(copy);
+    }
+    return true;
+}
+
+static int64_t DuplicateFd(Process* proc, int oldfd, int target,
+                           uint32_t minimum, uint8_t fdFlags)
+{
+    KernelOperationGuard operation(proc);
+    FdRef oldref(proc, oldfd);
+    if (!oldref) return -EBADF;
+    if (target == oldfd) return target;
+    FdEntry owned;
+    SpinLockAcquire(ProcessFdLock(proc));
+    owned = *oldref.get();
+    bool retained = FdRetainCopy(&owned);
+    SpinLockRelease(ProcessFdLock(proc));
+    if (!retained) return -ENOMEM;
+    owned.fdFlags = fdFlags;
+    FdClaimResult retired{};
+    int result = FdTablePublishOwned(proc->fds, ProcessFdLock(proc), owned,
+                                     minimum, target, &retired, UnixLifePublished);
+    if (result < 0)
+        FinalizeClosedFd({owned.type, owned.handle, owned.flags});
+    else if (retired.type != FdType::None) {
+        UnixLifeClaim(result, retired);
+        FinalizeClosedFd(retired);
+    }
+    return result;
+}
+
 static int64_t sys_dup(uint64_t oldfd, uint64_t, uint64_t,
                         uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
-    // BRO-156: pin oldfd so a sibling close() can't free old->handle while we
-    // copy it into the new slot and bump its refcount.
-    FdRef oldref(proc, static_cast<int>(oldfd));
-    if (!oldref) return -EBADF;
-    FdEntry* old = oldref.get();
-
-    // Find lowest free fd
-    int newfd = FdAlloc(proc, old->type, old->handle);
-    if (newfd < 0) return -EMFILE;
-
-    proc->fds[newfd].flags = old->flags;
-    proc->fds[newfd].seekPos = old->seekPos;
-    proc->fds[newfd].statusFlags = old->statusFlags;
-    for (int i = 0; i < 64; ++i)
-        proc->fds[newfd].dirPath[i] = old->dirPath[i];
-
-    FdBumpRefcount(&proc->fds[newfd]);
-
-    // DevKlog has no refcount — deep-copy the cursor
-    if (proc->fds[newfd].type == FdType::DevKlog && proc->fds[newfd].handle)
-        proc->fds[newfd].handle = DevKlogDeepCopy(proc->fds[newfd].handle);
-
-    // DevTty needs a deep-copied TtyDevicePair with bumped pipe refcounts
-    if (proc->fds[newfd].type == FdType::DevTty && proc->fds[newfd].handle)
-        proc->fds[newfd].handle = DevTtyDeepCopy(proc->fds[newfd].handle);
-
-    return newfd;
+    return DuplicateFd(proc, static_cast<int>(oldfd), -1, 0, 0);
 }
 
 static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd, uint64_t,
                          uint64_t, uint64_t, uint64_t)
 {
-    if (oldfd == newfd) return static_cast<int64_t>(newfd);
-
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
-    // BRO-156: pin oldfd so old->handle/fields stay valid across the copy below.
-    FdRef oldref(proc, static_cast<int>(oldfd));
-    if (!oldref) return -EBADF;
-    FdEntry* old = oldref.get();
-
-    if (newfd >= MAX_FDS) return -EBADF;
-
-    // Close newfd if currently open (sys_close is a no-op returning -EBADF for an
-    // unused slot, so the unconditional call is safe). NOTE: the install into
-    // fds[newfd] further down is not yet atomic against a concurrent allocator
-    // claiming the same slot — that residual dup2 race is tracked separately; the
-    // BRO-156 fix here is pinning oldfd so its handle can't be freed mid-copy.
-    sys_close(newfd, 0, 0, 0, 0, 0);
-
-    // Copy the FD entry
-    proc->fds[newfd].type = old->type;
-    proc->fds[newfd].flags = old->flags;
-    proc->fds[newfd].handle = old->handle;
-    proc->fds[newfd].seekPos = old->seekPos;
-    proc->fds[newfd].statusFlags = old->statusFlags;
-    for (int i = 0; i < 64; ++i)
-        proc->fds[newfd].dirPath[i] = old->dirPath[i];
-
-    FdBumpRefcount(&proc->fds[newfd]);
-
-    // DevKlog has no refcount — deep-copy the cursor
-    if (proc->fds[newfd].type == FdType::DevKlog && proc->fds[newfd].handle)
-        proc->fds[newfd].handle = DevKlogDeepCopy(proc->fds[newfd].handle);
-
-    // DevTty needs a deep-copied TtyDevicePair with bumped pipe refcounts
-    if (proc->fds[newfd].type == FdType::DevTty && proc->fds[newfd].handle)
-        proc->fds[newfd].handle = DevTtyDeepCopy(proc->fds[newfd].handle);
-
-    return static_cast<int64_t>(newfd);
+    int target = static_cast<int>(newfd);
+    if (target < 0 || target >= static_cast<int>(MAX_FDS)) return -EBADF;
+    return DuplicateFd(proc, static_cast<int>(oldfd), target, 0, 0);
 }
 
-// sys_dup3 (292) — like dup2 with flags (O_CLOEXEC)
 static int64_t sys_dup3(uint64_t oldfd, uint64_t newfd, uint64_t flags,
                          uint64_t, uint64_t, uint64_t)
 {
-    if (oldfd == newfd) return -EINVAL; // dup3 differs from dup2 here
-
-    int64_t ret = sys_dup2(oldfd, newfd, 0, 0, 0, 0);
-    if (ret >= 0 && (flags & 0x80000)) // O_CLOEXEC
-    {
-        Process* proc = ProcessCurrent();
-        if (proc) proc->fds[newfd].fdFlags = 1; // FD_CLOEXEC
-    }
-    return ret;
+    uint32_t options = static_cast<uint32_t>(flags);
+    if (options & ~0x80000u) return -EINVAL;
+    if (static_cast<int>(oldfd) == static_cast<int>(newfd)) return -EINVAL;
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+    int target = static_cast<int>(newfd);
+    if (target < 0 || target >= static_cast<int>(MAX_FDS)) return -EBADF;
+    return DuplicateFd(proc, static_cast<int>(oldfd), target, 0, options ? 1 : 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -3882,6 +4129,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 
     Process* proc = ProcessCurrent();
     if (!proc) return -ENOMEM;
+    KernelOperationGuard operation(proc);
 
     // BRO-206: back-pressure. A large anonymous mmap eagerly allocates its
     // frames and a later munmap retires them all; throttling the allocator under
@@ -4140,6 +4388,9 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     // are actually touched.
     if (fde->type == FdType::MemFd && fde->handle)
     {
+        if ((fde->statusFlags & 3) == 1) return -13;
+        if ((flags & MAP_SHARED) && (prot & PROT_WRITE) && (fde->statusFlags & 3) == 0) return -13;
+        if ((flags & MAP_PRIVATE) && (prot & PROT_WRITE)) return -95;
         auto* mfd = static_cast<MemFdData*>(fde->handle);
 
         // Grow the page index array to cover [offset, offset+length). Pages
@@ -4148,7 +4399,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         if (needed > mfd->capacity) {
             if (!MemFdGrow(mfd, needed)) return -ENOMEM;
         }
-        if (needed > mfd->size) mfd->size = needed;
+        // Mapping reserves address space, never extends the logical file size.
 
         uint64_t vaddr = pickAddr();
         if (!vaddr) return -ENOMEM;
@@ -4160,6 +4411,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         bool tracked = false;
         Process* mmOwner = MemoryMapOwner(proc);
         if (!mmOwner) return -ESRCH;
+        SpinLockAcquire(&mmOwner->fileMapLock);
         for (uint32_t i = 0; i < Process::MAX_MEMFD_MAPS; i++) {
             if (mmOwner->memfdMaps[i].length == 0) {
                 mmOwner->memfdMaps[i].vaddr  = vaddr;
@@ -4167,11 +4419,15 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                 mmOwner->memfdMaps[i].offset = offset;
                 mmOwner->memfdMaps[i].vmmFlags = vmmFlags;
                 mmOwner->memfdMaps[i].mfd    = mfd;
+                mmOwner->memfdMaps[i].prot = static_cast<uint32_t>(prot);
+                mmOwner->memfdMaps[i].maxProt = 5u |
+                    (((flags & MAP_SHARED) && (fde->statusFlags & 3) != 0) ? 2u : 0u);
                 MemFdRef(mfd);
                 tracked = true;
                 break;
             }
         }
+        SpinLockRelease(&mmOwner->fileMapLock);
         if (!tracked) {
             SerialPrintf("sys_mmap: WARNING MAX_MEMFD_MAPS (%u) exhausted for pid=%u\n",
                          Process::MAX_MEMFD_MAPS, proc->pid);
@@ -4348,13 +4604,22 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
 
     Process* proc = ProcessCurrent();
     if (!proc) return -ESRCH;
+    KernelOperationGuard operation(proc);
 
     uint64_t pages = (len + 4095) / 4096;
     uint64_t newFlags = ProtToVmmFlags(prot);
     Process* mmOwnerForProtect = MemoryMapOwner(proc);
     if (!mmOwnerForProtect) return -ESRCH;
+    for (const auto& m : mmOwnerForProtect->memfdMaps) {
+        if (m.length && addr < m.vaddr + m.length && m.vaddr < addr + pages * 4096 &&
+            (prot & ~static_cast<uint64_t>(m.maxProt))) return -13;
+    }
+    if (!MemFdMapsCapacity(mmOwnerForProtect, addr, pages * 4096, true)) return -ENOMEM;
     if (!FileMapsApplyProtection(mmOwnerForProtect, addr, pages * 4096, newFlags))
         return -ENOMEM;
+
+    if (!MemFdMapsProtect(mmOwnerForProtect, addr, pages * 4096, newFlags,
+                          static_cast<uint32_t>(prot))) return -ENOMEM;
 
     if (addr >= 0x2d7700000000ULL && addr < 0x2d8000000000ULL) {
         SerialPrintf("MPROTECT: pid=%u addr=0x%lx pages=%lu prot=0x%lx\n",
@@ -4391,11 +4656,11 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
 
         if (memfdMap)
         {
-            memfdMap->vmmFlags = newFlags;
             if (!phys)
                 continue;
             VmmUnmapPage(proc->pageTable, va);
-            VmmMapPage(proc->pageTable, va, phys, newFlags, MemTag::User, ProcessAddressSpacePid(proc));
+            if (prot != 0)
+                VmmMapPage(proc->pageTable, va, phys, newFlags, MemTag::User, ProcessAddressSpacePid(proc));
             continue;
         }
 
@@ -4461,6 +4726,7 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t,
 
     Process* proc = ProcessCurrent();
     if (!proc) return -ESRCH;
+    KernelOperationGuard operation(proc);
 
     // BRO-206: back-pressure before we retire this range's frames into the
     // quarantine — bounds the quarantine under heavy munmap load.
@@ -4474,12 +4740,15 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t,
 
     // Is this range a MemFd mmap? If so, unmap only — the physical pages
     // are kernel heap pages owned by the MemFd, not by the process.
-    bool isMemFd = false;
-    MemFdData* unmappedMfd = nullptr;
+    MemFdData* retiredMemFds[Process::MAX_MEMFD_MAPS];
+    uint32_t retiredMemFdCount = 0, memFdRangeCount = 0;
+    MemFdRemovedRange memFdRanges[Process::MAX_MEMFD_MAPS];
     Process* mmOwner = MemoryMapOwner(proc);
     if (!mmOwner) return -ESRCH;
     uint64_t unmapLen = pages * 4096;
     uint64_t unmapEnd = addr + unmapLen;
+
+    if (!MemFdMapsCapacity(mmOwner, addr, unmapLen, false)) return -ENOMEM;
 
     uint32_t neededFileMapSplits = 0;
     uint32_t freeFileMapSlots = 0;
@@ -4544,19 +4813,8 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t,
         }
     }
 
-    for (uint32_t i = 0; i < Process::MAX_MEMFD_MAPS; i++) {
-        auto& m = mmOwner->memfdMaps[i];
-        if (m.length == 0) continue;
-        if (addr >= m.vaddr && addr + length <= m.vaddr + m.length) {
-            isMemFd = true;
-            // Clear the slot if we're unmapping the whole range.
-            if (addr == m.vaddr && length == m.length) {
-                unmappedMfd = static_cast<MemFdData*>(m.mfd);
-                m.vaddr = 0; m.length = 0; m.offset = 0; m.vmmFlags = 0; m.mfd = nullptr;
-            }
-            break;
-        }
-    }
+    if (!MemFdMapsRemove(mmOwner, addr, unmapLen, retiredMemFds,
+                         &retiredMemFdCount, memFdRanges, &memFdRangeCount)) return -ENOMEM;
 
     // Is this range a /dev/fb0 mmap?  If so, unmap only — the physical
     // pages are owned by proc->fbVirtual (or the firmware FB) and
@@ -4581,6 +4839,13 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t,
         PhysicalAddress phys = VmmVirtToPhys(proc->pageTable, va);
         if (phys)
         {
+            bool isMemFd = false;
+            for (uint32_t mi = 0; mi < memFdRangeCount; ++mi) {
+                if (va.raw() >= memFdRanges[mi].begin && va.raw() < memFdRanges[mi].end) {
+                    isMemFd = true;
+                    break;
+                }
+            }
             VmmUnmapPage(proc->pageTable, va);
             if (!isMemFd && !isFbMap) PmmUnrefPage(phys);
         }
@@ -4590,7 +4855,7 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t,
     if (pages > 0)
         TlbShootdownFull(proc->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
 
-    if (unmappedMfd) MemFdUnref(unmappedMfd);
+    for (uint32_t i = 0; i < retiredMemFdCount; ++i) MemFdUnref(retiredMemFds[i]);
 
     return 0;
 }
@@ -4617,6 +4882,7 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
 
     Process* proc = ProcessCurrent();
     if (!proc) return -ESRCH;
+    KernelOperationGuard operation(proc);
 
     // BRO-206: back-pressure — mremap can free the old mapping's frames.
     PmmThrottleForDrain();
@@ -4645,6 +4911,7 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
     if (memfdMapIdx >= 0) {
         // MemFd-backed mremap: keep the mapping connected to the MemFdData.
         auto& m = mmOwner->memfdMaps[memfdMapIdx];
+        if (old_addr != m.vaddr || oldPages * 4096 != m.length) return -EINVAL;
         auto* mfd = static_cast<MemFdData*>(m.mfd);
 
         if (newPages < oldPages) {
@@ -4654,7 +4921,9 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
                 VmmUnmapPage(proc->pageTable, va);
             }
             TlbShootdownFull(proc->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
+            SpinLockAcquire(&mmOwner->fileMapLock);
             m.length = newPages * 4096;
+            SpinLockRelease(&mmOwner->fileMapLock);
             return static_cast<int64_t>(old_addr);
         }
 
@@ -4663,7 +4932,7 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
         if (neededBytes > mfd->capacity) {
             if (!MemFdGrow(mfd, neededBytes)) return -ENOMEM;
         }
-        if (neededBytes > mfd->size) mfd->size = neededBytes;
+        // Remapping changes virtual extent, not the backing file's size.
 
         if (!(flags & MREMAP_MAYMOVE)) return -ENOMEM;
 
@@ -4689,8 +4958,10 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
         TlbShootdownFull(proc->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
 
         // Update the memfdMaps entry to reflect the new address and size.
+        SpinLockAcquire(&mmOwner->fileMapLock);
         m.vaddr  = newAddr;
         m.length = newPages * 4096;
+        SpinLockRelease(&mmOwner->fileMapLock);
 
         return static_cast<int64_t>(newAddr);
     }
@@ -4760,6 +5031,8 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_siz
 // sys_arch_prctl (158) -- TLS setup
 // ---------------------------------------------------------------------------
 
+static constexpr uint64_t ARCH_SET_GS    = 0x1001;
+static constexpr uint64_t ARCH_GET_GS    = 0x1004;
 static constexpr uint64_t ARCH_SET_FS    = 0x1002;
 static constexpr uint64_t ARCH_GET_FS    = 0x1003;
 static constexpr uint64_t ARCH_CET_STATUS = 0x3001;
@@ -4769,21 +5042,32 @@ static int64_t sys_arch_prctl(uint64_t code, uint64_t addr, uint64_t,
 {
     switch (code)
     {
+    case ARCH_SET_GS:
     case ARCH_SET_FS:
     {
-        // Write FS base to MSR_FS_BASE (0xC0000100)
-        uint32_t lo = static_cast<uint32_t>(addr);
-        uint32_t hi = static_cast<uint32_t>(addr >> 32);
-        __asm__ volatile("wrmsr" : : "a"(lo), "d"(hi), "c"(0xC0000100U));
-
+        // Restrict bases to the canonical user half, even if not mapped yet.
+        // High GS would also defeat the interrupt-entry kernel GS discriminator.
+        if (addr >= 0x0000800000000000ULL) return -EPERM;
         Process* proc = ProcessCurrent();
-        if (proc)
-        {
+        if (!proc) return -EINVAL;
+        uint64_t flags;
+        __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+        if (code == ARCH_SET_GS) {
+            proc->savedCtx.gsBase = addr;
+            // Kernel GS is active here. Change only the parked user base.
+            WriteMsr(MSR_KERNEL_GS_BASE, addr);
+        } else {
             proc->fsBase = addr;
             proc->savedCtx.fsBase = addr;
+            WriteMsr(0xC0000100U, addr);
         }
-
-        DbgPrintf("arch_prctl: SET_FS 0x%lx\n", addr);
+        __asm__ volatile("push %0; popfq" :: "r"(flags) : "memory", "cc");
+        return 0;
+    }
+    case ARCH_GET_GS:
+    {
+        if (!UserBufferWritable(addr, sizeof(uint64_t))) return -EFAULT;
+        *reinterpret_cast<uint64_t*>(addr) = ReadMsr(MSR_KERNEL_GS_BASE);
         return 0;
     }
     case ARCH_GET_FS:
@@ -5500,25 +5784,16 @@ resolve_path:
         return -ENOENT;
     }
 
-    char newExePath[256];
-    uint32_t newExeLen = 0;
-    while (lookupPath[newExeLen] && newExeLen + 1 < sizeof(newExePath))
-    {
-        newExePath[newExeLen] = lookupPath[newExeLen];
-        ++newExeLen;
-    }
-    newExePath[newExeLen] = '\0';
-
+    char newExePath[sizeof(Process::exePath)];
     SerialPrintf("sys_execve: envpAddr=0x%lx envc=%d argc=%d path='%s'\n",
                  envpAddr, envc, argc, lookupPath);
 
-    // --- Load ELF from VFS ---
-    Vnode* vn = VfsOpen(lookupPath, 0);
-    if (!vn)
-    {
-        DbgPrintf("sys_execve: VfsOpen failed: %s\n", lookupPath);
-        return -ENOENT;
-    }
+    // Keep the original lookup spelling for script argv, but record the final
+    // ELF's resolved location (including a shebang interpreter's symlinks).
+    Vnode* vn = nullptr;
+    int openResult = VfsOpenExecutable(lookupPath, &vn, newExePath, sizeof(newExePath));
+    if (openResult != 0) return openResult;
+    uint32_t newExeLen = strlen(newExePath);
 
     ExecutableImage image{};
     int readResult = ReadExecutableImage(vn, &image);
@@ -5530,13 +5805,6 @@ resolve_path:
     uint64_t elfSize = image.size;
     DbgPrintf("sys_execve: read '%s' %lu bytes (pid %u)\n",
                  lookupPath, elfSize, proc->pid);
-
-    if (elfSize < 64) // Too small to be a valid ELF
-    {
-        VmmFreePages(bufAddr, bufPages);
-        DbgPrintf("sys_execve: file too small (%lu bytes)\n", elfSize);
-        return -ENOEXEC;
-    }
 
     DbgPrintf("sys_execve: loaded '%s' (%lu bytes) for pid %u\n",
               lookupPath, elfSize, proc->pid);
@@ -5644,6 +5912,13 @@ resolve_path:
         goto resolve_path;
     }
 
+    if (elfSize < 64) // Too small to be a valid ELF
+    {
+        VmmFreePages(bufAddr, bufPages);
+        DbgPrintf("sys_execve: file too small (%lu bytes)\n", elfSize);
+        return -ENOEXEC;
+    }
+
     // Reject malformed/truncated headers while the old image and siblings
     // still exist. Allocation failures after commitment remain fatal.
     if (!ElfValidateMainImage(elfBuf, elfSize)) {
@@ -5739,21 +6014,16 @@ resolve_path:
     // Load the new page table
     __asm__ volatile("mov %0, %%cr3" : : "r"(proc->pageTable.pml4.raw()) : "memory");
 
-    // Set FS base for the new TLS
-    if (proc->fsBase)
-    {
-        uint64_t lo = proc->fsBase & 0xFFFFFFFF;
-        uint64_t hi = proc->fsBase >> 32;
-        __asm__ volatile(
-            "mov $0xC0000100, %%ecx\n\t"
-            "mov %0, %%eax\n\t"
-            "mov %1, %%edx\n\t"
-            "wrmsr\n\t"
-            : : "r"(static_cast<uint32_t>(lo)),
-                "r"(static_cast<uint32_t>(hi))
-            : "ecx", "eax", "edx"
-        );
-    }
+    // Reset user segment state atomically with the live MSRs. Earlier exec
+    // work can be preempted, so write GS=0 explicitly rather than trusting a
+    // saved context which a switch may have refreshed from the old image.
+    uint64_t segmentFlags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(segmentFlags) :: "memory");
+    proc->savedCtx.fsBase = proc->fsBase;
+    proc->savedCtx.gsBase = 0;
+    WriteMsr(0xC0000100U, proc->fsBase);
+    WriteMsr(MSR_KERNEL_GS_BASE, 0);
+    __asm__ volatile("push %0; popfq" :: "r"(segmentFlags) : "memory", "cc");
 
     // Wake vfork parent — exec is complete, parent can resume
     if (proc->vforkParent)
@@ -7820,15 +8090,22 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
 
     if (fde->type == FdType::MemFd && fde->handle) {
         auto* mfd = static_cast<MemFdData*>(fde->handle);
+        MfdLock(mfd);
+        uint64_t logicalSize = mfd->size;
+        uint64_t allocatedBlocks = 0;
+        for (uint64_t index = 0; index < mfd->pageMapCount; ++index)
+            if (mfd->pageMap[index]) allocatedBlocks += 4096 / 512;
+        MfdUnlock(mfd);
+        // User-buffer writes stay outside the backing lock: they may fault.
         auto* raw = reinterpret_cast<uint8_t*>(st);
         memset(raw, 0, sizeof(LinuxStat));
         st->st_dev = 0x01000000; // anonymous shmem namespace, distinct from disk mounts
         st->st_ino = mfd->inode;
         st->st_nlink = 0;
         st->st_mode = 0100666; // S_IFREG | rw-rw-rw-
-        st->st_size = static_cast<int64_t>(mfd->size);
+        st->st_size = static_cast<int64_t>(logicalSize);
         st->st_blksize = 4096;
-        st->st_blocks  = static_cast<int64_t>((mfd->size + 511) / 512);
+        st->st_blocks  = static_cast<int64_t>(allocatedBlocks);
         return 0;
     }
 
@@ -8377,6 +8654,7 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
+    KernelOperationGuard operation(proc);
     // BRO-156: pin the slot so a sibling close() can't free it while we read or
     // mutate the FD's scalar flags (F_GETFD/F_SETFD/F_GETFL/F_SETFL) or read the
     // source slot for F_DUPFD.
@@ -8386,16 +8664,17 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
 
     switch (static_cast<int>(cmd))
     {
+    case 1033: // F_ADD_SEALS: no write/truncate/sandbox seal enforcement yet.
+    case 1034: // F_GET_SEALS: never report fictional successful sealing.
+        return -EINVAL;
     case F_DUPFD:
     case F_DUPFD_CLOEXEC:
     {
         int minFd = static_cast<int>(arg);
         if (minFd < 0 || minFd >= static_cast<int>(MAX_FDS)) return -EINVAL;
-        int newfd = FdTableDuplicatePinned(proc->fds, ProcessFdLock(proc), fde,
-                    static_cast<uint32_t>(minFd),
-                    (cmd == F_DUPFD_CLOEXEC) ? FD_CLOEXEC : 0, FdBumpRefcount);
-        if (newfd < 0) return -EMFILE;
-        return newfd;
+        return DuplicateFd(proc, static_cast<int>(fd), -1,
+                           static_cast<uint32_t>(minFd),
+                           (cmd == F_DUPFD_CLOEXEC) ? FD_CLOEXEC : 0);
     }
     case F_GETFD:
         return fde->fdFlags;
@@ -9795,8 +10074,12 @@ static int64_t sys_timerfd_gettime(uint64_t fd, uint64_t currValAddr,
 static int64_t sys_memfd_create(uint64_t nameAddr, uint64_t flags,
                                   uint64_t, uint64_t, uint64_t, uint64_t)
 {
+    flags = static_cast<uint32_t>(flags);
+    if (flags & ~(MFD_CLOEXEC | MFD_ALLOW_SEALING)) return -EINVAL;
     Process* proc = ProcessCurrent();
     if (!proc) return -EMFILE;
+
+    KernelOperationGuard operation(proc);
 
     // Name is just for debugging; we don't enforce it
     char name[64] = "<memfd>";
@@ -9815,12 +10098,8 @@ static int64_t sys_memfd_create(uint64_t nameAddr, uint64_t flags,
     mfd->lock         = 0;
     mfd->refCount     = 0; // bumped by FdAlloc below
 
-    int fd = FdAlloc(proc, FdType::MemFd, mfd);
-    if (fd < 0) { kfree(mfd); return -EMFILE; }
-    MemFdRef(mfd);
-
-    if (flags & MFD_CLOEXEC)
-        proc->fds[fd].fdFlags |= 1;
+    int fd = MemFdInstall(proc, mfd, 2u | ((flags & MFD_CLOEXEC) ? 0x80000u : 0));
+    if (fd < 0) kfree(mfd);
 
     return fd;
 }
@@ -10313,14 +10592,13 @@ static int64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t,
         return VfsTruncate(static_cast<Vnode*>(fde->handle), length);
     }
     if (fde->type == FdType::MemFd) {
+            if ((fde->statusFlags & 3) == 0) return -EINVAL;
             auto* mfd = static_cast<MemFdData*>(fde->handle);
-            if (length > mfd->capacity) {
-                if (!MemFdGrow(mfd, length)) return -ENOMEM;
-            }
+            MfdLock(mfd);
+            if (!MemFdGrowLocked(mfd, length)) { MfdUnlock(mfd); return -ENOMEM; }
             // Shrinking ftruncate: free pages past the new tail. (Growth is
             // free — pages are unbacked / read-as-zero until first access.)
             if (length < mfd->size) {
-                MfdLock(mfd);
                 uint64_t firstFreeIdx = (length + 4095) / 4096;
                 for (uint64_t i = firstFreeIdx; i < mfd->pageMapCount; i++) {
                     if (mfd->pageMap[i]) {
@@ -10328,9 +10606,9 @@ static int64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t,
                         mfd->pageMap[i] = 0;
                     }
                 }
-                MfdUnlock(mfd);
             }
             mfd->size = length;
+            MfdUnlock(mfd);
             return 0;
     }
     return -EINVAL;
@@ -10681,13 +10959,68 @@ static int64_t sys_statx(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
 }
 
 // ---------------------------------------------------------------------------
-// sys_fallocate (285) — allocate file space (stub: succeed)
+// sys_fallocate (285) — real memfd reservation, not sparse logical growth.
 // ---------------------------------------------------------------------------
 
-static int64_t sys_fallocate(uint64_t, uint64_t, uint64_t,
-                              uint64_t, uint64_t, uint64_t)
+static int64_t sys_fallocate(uint64_t fd, uint64_t mode, uint64_t offset,
+                              uint64_t length, uint64_t, uint64_t)
 {
-    return 0; // no-op for now
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+    KernelOperationGuard operation(proc);
+    FdRef descriptor(proc, static_cast<int>(fd)); // Linux fd/mode are low-32-bit ints.
+    if (!descriptor) return -EBADF;
+    FdEntry* entry = descriptor.get();
+    if ((entry->statusFlags & 3u) == 0) return -EBADF;
+    if (static_cast<int64_t>(offset) < 0 || static_cast<int64_t>(length) <= 0)
+        return -EINVAL;
+    if (offset > 0x7fffffffffffffffULL - length) return -27; // EFBIG
+    uint32_t options = static_cast<uint32_t>(mode);
+    if (options & ~1u) return -95; // EOPNOTSUPP: only KEEP_SIZE is supported.
+    if (entry->type == FdType::Pipe) return -29; // ESPIPE
+    if (entry->type == FdType::Vnode) return -95; // Backends have no reservation operation.
+    if (entry->type != FdType::MemFd || !entry->handle) return -ENODEV;
+
+    uint64_t end = offset + length;
+    if (end > 16ULL * 1024 * 1024 * 1024) return -27; // Existing memfd index limit.
+    auto* mfd = static_cast<MemFdData*>(entry->handle);
+    MfdLock(mfd);
+    if (!MemFdGrowLocked(mfd, end)) { MfdUnlock(mfd); return -ENOMEM; }
+
+    // Stage only new physical pages in a private chain. Its two temporary
+    // words are never published to the backing map or users. On OOM every
+    // staged page is freed; existing bytes, size and seek position stay intact.
+    uint64_t staged = 0;
+    uint64_t first = offset / 4096;
+    uint64_t last = (end - 1) / 4096;
+    for (uint64_t index = first; index <= last; ++index) {
+        if (mfd->pageMap[index]) continue;
+        PhysicalAddress page = PmmAllocPage(MemTag::User, 0);
+        if (!page) {
+            while (staged) {
+                auto* words = reinterpret_cast<uint64_t*>(PhysToVirt(PhysicalAddress(staged)).raw());
+                uint64_t next = words[0];
+                PmmFreePage(PhysicalAddress(staged));
+                staged = next;
+            }
+            MfdUnlock(mfd);
+            return -28; // ENOSPC: reservation could not be satisfied.
+        }
+        auto* words = reinterpret_cast<uint64_t*>(PhysToVirt(page).raw());
+        words[0] = staged;
+        words[1] = index;
+        staged = page.raw();
+    }
+    while (staged) {
+        auto* words = reinterpret_cast<uint64_t*>(PhysToVirt(PhysicalAddress(staged)).raw());
+        uint64_t next = words[0], index = words[1];
+        memset(words, 0, 4096);
+        mfd->pageMap[index] = staged;
+        staged = next;
+    }
+    if (!(options & 1u) && end > mfd->size) mfd->size = end;
+    MfdUnlock(mfd);
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -10797,6 +11130,14 @@ static int64_t sys_pwrite64(uint64_t fd, uint64_t bufAddr, uint64_t count,
     FdRef ref(proc, static_cast<int>(fd));
     FdEntry* fde = ref.get();
     if (!fde) return -EBADF;
+    if (offset > 0x7fffffffffffffffULL) return -EINVAL;
+    if (fde->type == FdType::MemFd && fde->handle) {
+        if ((fde->statusFlags & 3) == 0) return -EBADF;
+        if (count && !UserBufferReadable(bufAddr, count)) return -EFAULT;
+        return MemFdWriteAt(static_cast<MemFdData*>(fde->handle),
+            reinterpret_cast<const void*>(bufAddr), count, &offset,
+            (fde->statusFlags & 0x400) != 0);
+    }
     if (fde->type != FdType::Vnode || !fde->handle) return -EINVAL;
 
     auto* vn = static_cast<Vnode*>(fde->handle);
@@ -11983,9 +12324,17 @@ static int64_t sys_pread64(uint64_t fd, uint64_t bufAddr, uint64_t count,
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
-    FdEntry* fde = FdGet(proc, static_cast<int>(fd));
+    FdRef ref(proc, static_cast<int>(fd));
+    FdEntry* fde = ref.get();
     if (!fde) return -EBADF;
 
+    if (offset > 0x7fffffffffffffffULL) return -EINVAL;
+    if (count && !UserBufferWritable(bufAddr, count)) return -EFAULT;
+    if (fde->type == FdType::MemFd && fde->handle) {
+        if ((fde->statusFlags & 3) == 1) return -EBADF;
+        return MemFdReadAt(static_cast<MemFdData*>(fde->handle),
+            reinterpret_cast<void*>(bufAddr), count, &offset);
+    }
     if (fde->type == FdType::Vnode && fde->handle)
     {
         auto* vn = static_cast<Vnode*>(fde->handle);
@@ -12482,20 +12831,24 @@ static int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -ENOSYS;
+    KernelOperationGuard operation(proc);
 
     DbgPrintf("sys_socket: domain=%lu type=%lu proto=%lu\n", domain, type, protocol);
 
     if (domain == AF_UNIX) {
         auto* usd = static_cast<UnixSocketData*>(kmalloc(sizeof(UnixSocketData)));
         if (!usd) return -ENOMEM;
+        UnixLife(UnixLifeEvent::Allocate, usd, 0, 1, -1,
+                 reinterpret_cast<uint64_t>(__builtin_return_address(0)), sizeof(UnixSocketData));
         memset(usd, 0, sizeof(UnixSocketData));
         usd->state    = UnixSocketData::State::Unbound;
         usd->nonblock = (type & UNIX_SOCK_NONBLOCK) != 0;
         usd->refCount = 1;
+        usd->socketType = static_cast<uint32_t>(type) & 0xfu;
+        usd->peerCredentials = {0, ~uint32_t{0}, ~uint32_t{0}};
 
-        int fd = FdAlloc(proc, FdType::UnixSocket, usd);
-        if (fd < 0) { kfree(usd); return -EMFILE; }
-        if (type & UNIX_SOCK_CLOEXEC) proc->fds[fd].fdFlags |= 1;
+        int fd = UnixInstallSocket(proc, usd, static_cast<uint32_t>(type), "socket");
+        if (fd < 0) { UnixSocketHandleUnref(usd); return fd; }
         DbgPrintf("sys_socket: AF_UNIX fd=%d\n", fd);
         return fd;
     }
@@ -12546,7 +12899,9 @@ static int64_t sys_bind(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
     int fd = static_cast<int>(fdVal);
 
     // Check for AF_UNIX socket first
-    FdEntry* fde = FdGet(proc, fd);
+    KernelOperationGuard operation(proc);
+    FdRef descriptor(proc, fd);
+    FdEntry* fde = descriptor.get();
     if (fde && fde->type == FdType::UnixSocket && fde->handle) {
         auto* usd = static_cast<UnixSocketData*>(fde->handle);
         if (addrVal < 0x1000) return -EFAULT;
@@ -12556,6 +12911,7 @@ static int64_t sys_bind(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
         const char* src = ua->sun_path;
         char* dst = usd->path;
         for (int i = 0; i < 107 && src[i]; i++) dst[i] = src[i], dst[i+1] = 0;
+        UNIX_LIFE(Bind, usd, 0, 0, fd);
         SerialPrintf("sys_bind: AF_UNIX fd=%d path='%s'\n", fd, usd->path);
         return 0;
     }
@@ -12578,9 +12934,13 @@ static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
     int fd = static_cast<int>(fdVal);
 
     // AF_UNIX connect: find server, create pipe pair, enqueue, block until accepted
-    FdEntry* fde = FdGet(proc, fd);
+    KernelOperationGuard operation(proc);
+    FdRef descriptor(proc, fd);
+    FdEntry* fde = descriptor.get();
     if (fde && fde->type == FdType::UnixSocket && fde->handle) {
         auto* usd = static_cast<UnixSocketData*>(fde->handle);
+        if (usd->state == UnixSocketData::State::Connected) return -106; // EISCONN
+        if (usd->state == UnixSocketData::State::Listening) return -EINVAL;
         if (addrVal < 0x1000) return -EFAULT;
         auto* ua = reinterpret_cast<const SockAddrUn*>(addrVal);
         if (ua->sun_family != AF_UNIX) return -EINVAL;
@@ -12594,70 +12954,67 @@ static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
         // Find the listening server
         UnixSocketData* server = UnixFindServer(path);
         if (!server) return -ECONNREFUSED;
-        if (server->pendingCount >= UNIX_ACCEPT_QUEUE) return -EAGAIN;
-
-        // Create bidirectional pipe pair
-        auto* pipeCS = PipeBufferCreate(PIPE_BUF_UNIX_SIZE); // client→server
-        auto* pipeSC = PipeBufferCreate(PIPE_BUF_UNIX_SIZE); // server→client
-        auto* fdqCS  = static_cast<UnixFdQueue*>(kmalloc(sizeof(UnixFdQueue))); // fds client→server
-        auto* fdqSC  = static_cast<UnixFdQueue*>(kmalloc(sizeof(UnixFdQueue))); // fds server→client
+        struct ServerReference {
+            UnixSocketData* value;
+            ~ServerReference() { UnixSocketHandleUnref(value); }
+        } serverReference{server};
+        // The pending slot owns the server endpoints before connect returns.
+        // A successful local stream connect queues a connection; it does not
+        // wait for accept, and must survive the client closing immediately.
+        auto* pipeCS = PipeBufferCreate(PIPE_BUF_UNIX_SIZE);
+        auto* pipeSC = PipeBufferCreate(PIPE_BUF_UNIX_SIZE);
+        auto* fdqCS = static_cast<UnixFdQueue*>(kmalloc(sizeof(UnixFdQueue)));
+        auto* fdqSC = static_cast<UnixFdQueue*>(kmalloc(sizeof(UnixFdQueue)));
         if (!pipeCS || !pipeSC || !fdqCS || !fdqSC) {
             if (pipeCS) PipeBufferDestroy(pipeCS);
             if (pipeSC) PipeBufferDestroy(pipeSC);
-            if (fdqCS)  kfree(fdqCS);
-            if (fdqSC)  kfree(fdqSC);
+            if (fdqCS) kfree(fdqCS);
+            if (fdqSC) kfree(fdqSC);
             return -ENOMEM;
         }
         memset(fdqCS, 0, sizeof(UnixFdQueue));
         memset(fdqSC, 0, sizeof(UnixFdQueue));
         pipeCS->readers = 1; pipeCS->writers = 1;
         pipeSC->readers = 1; pipeSC->writers = 1;
-        fdqCS->refCount = 1; // client side will point at it as peerIncomingFds; server gets a ref in accept
-        fdqSC->refCount = 1; // server points at it as peerIncomingFds; client uses it as incomingFds
+        fdqCS->refCount = 2; // client and pending server endpoint
+        fdqSC->refCount = 2;
 
-        // Set up client side
-        usd->state   = UnixSocketData::State::Connected;
-        usd->rxPipe  = pipeSC; // client reads server→client pipe
-        usd->txPipe  = pipeCS; // client writes client→server pipe
-        usd->incomingFds     = fdqSC; // client reads fds from server→client queue
-        usd->peerIncomingFds = fdqCS; // client sends fds into client→server queue
-        for (int i = 0; i < 107 && path[i]; i++) usd->path[i] = path[i];
-
-        // Enqueue pending connection on server
+        SpinLockAcquire(&g_unixRegistryLock);
         int slot = -1;
-        for (int i = 0; i < UNIX_ACCEPT_QUEUE; i++) {
+        for (int i = 0; i < UNIX_ACCEPT_QUEUE; ++i)
             if (!server->pending[i].used) { slot = i; break; }
+        int error = usd->state == UnixSocketData::State::Connected ? -106 :
+                    usd->state == UnixSocketData::State::Listening ? -EINVAL :
+                    slot < 0 ? -EAGAIN : 0;
+        if (error) {
+            SpinLockRelease(&g_unixRegistryLock);
+            PipeBufferDestroy(pipeCS); PipeBufferDestroy(pipeSC);
+            kfree(fdqCS); kfree(fdqSC);
+            return error;
         }
-        if (slot < 0) { PipeBufferDestroy(pipeCS); PipeBufferDestroy(pipeSC); kfree(fdqCS); kfree(fdqSC); return -EAGAIN; }
+        usd->peerCredentials = server->peerCredentials;
+        usd->rxPipe = pipeSC;
+        usd->txPipe = pipeCS;
+        usd->incomingFds = fdqSC;
+        usd->peerIncomingFds = fdqCS;
+        for (int i = 0; i < 107 && path[i]; ++i) usd->path[i] = path[i];
+        usd->state = UnixSocketData::State::Connected;
 
-        server->pending[slot].serverRx     = pipeCS; // server reads what client wrote
-        server->pending[slot].serverTx     = pipeSC; // server writes what client reads
-        server->pending[slot].serverRxFds  = fdqCS;  // server drains client-sent fds
-        server->pending[slot].serverTxFds  = fdqSC;  // server posts fds for client
-        server->pending[slot].clientWaiter = proc;
-        server->pending[slot].accepted     = false;
-        server->pending[slot].used         = true;
-        server->pendingCount++;
-
-        // Wake server if it's blocked in accept
+        UnixPendingConn& pending = server->pending[slot];
+        pending.serverRx = pipeCS;
+        pending.serverTx = pipeSC;
+        pending.serverRxFds = fdqCS;
+        pending.serverTxFds = fdqSC;
+        pending.clientCredentials = UnixCurrentCredentials(proc);
+        pending.used = true;
+        ++server->pendingCount;
         if (server->acceptWaiter) {
-            Process* w = server->acceptWaiter;
+            Process* waiter = server->acceptWaiter;
             server->acceptWaiter = nullptr;
-            WakeProcess(w);
+            WakeProcess(waiter);
         }
-        // Also wake server if it's blocked in epoll_wait on this listen fd.
         UnixListenWakeEpoll(server);
-
-        // Block until accepted (or nonblock)
-        if (!usd->nonblock) {
-            for (int iter = 0; iter < 100000 && !server->pending[slot].accepted; iter++) {
-                Process* self = ProcessCurrent();
-                self->wakeupTick = g_lapicTickCount + 10;
-                SchedulerBlock(self);
-                if (HasPendingSignals()) return -EINTR;
-            }
-            if (!server->pending[slot].accepted) return -ETIMEDOUT;
-        }
+        SpinLockRelease(&g_unixRegistryLock);
 
         (void)addrLen;
         return 0;
@@ -12694,7 +13051,9 @@ static int64_t sys_sendto(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
     if (!proc) return -ENOSYS;
 
     int fd = static_cast<int>(fdVal);
-    FdEntry* fde = FdGet(proc, fd);
+    KernelOperationGuard operation(proc);
+    FdRef descriptor(proc, fd);
+    FdEntry* fde = descriptor.get();
     if (fde && fde->type == FdType::UnixSocket) {
         auto* usd = static_cast<UnixSocketData*>(fde->handle);
         bool oldNonblock = usd ? usd->nonblock : false;
@@ -12736,7 +13095,9 @@ static int64_t sys_recvfrom(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
     if (!proc) return -ENOSYS;
 
     int fd = static_cast<int>(fdVal);
-    FdEntry* fde = FdGet(proc, fd);
+    KernelOperationGuard operation(proc);
+    FdRef descriptor(proc, fd);
+    FdEntry* fde = descriptor.get();
     if (fde && fde->type == FdType::UnixSocket) {
         auto* usd = static_cast<UnixSocketData*>(fde->handle);
         bool oldNonblock = usd ? usd->nonblock : false;
@@ -12797,30 +13158,64 @@ static int64_t sys_getsockopt(uint64_t fdVal, uint64_t levelVal, uint64_t optnam
                                uint64_t optvalAddr, uint64_t optlenAddr, uint64_t)
 {
     Process* proc = ProcessCurrent();
-    if (!proc) return -ENOSYS;
-
-    int fd = static_cast<int>(fdVal);
+    if (!proc) return -EBADF;
+    KernelOperationGuard operation(proc);
+    FdRef descriptor(proc, static_cast<int>(fdVal));
+    if (!descriptor) return -EBADF;
+    FdEntry* entry = descriptor.get();
+    if (entry->type != FdType::UnixSocket && entry->type != FdType::Socket)
+        return -88; // ENOTSOCK
+    if (!entry->handle) return -EBADF;
     int level = static_cast<int>(levelVal);
-    int optname = static_cast<int>(optnameVal);
+    int option = static_cast<int>(optnameVal);
+    if (level != 1) return entry->type == FdType::UnixSocket ? -95 : -92;
+    // Linux socklen_t is 32-bit, and negative lengths are invalid.
+    if (!UserBufferReadable(optlenAddr, sizeof(uint32_t)) ||
+        !UserBufferWritable(optlenAddr, sizeof(uint32_t))) return -EFAULT;
+    uint32_t requested = *reinterpret_cast<const uint32_t*>(optlenAddr);
+    if (requested > 0x7fffffffu) return -EINVAL;
+    uint32_t valueSize = entry->type == FdType::UnixSocket && option == 17
+        ? sizeof(UnixCredentials) : sizeof(int32_t);
+    uint32_t copied = requested < valueSize ? requested : valueSize;
+    if (copied && !UserBufferWritable(optvalAddr, copied)) return -EFAULT;
 
-    // SOL_SOCKET(1), SO_ERROR(4): return pending async connect error
-    if (level == 1 && optname == 4) {
-        int sockIdx = GetSockIdx(proc, fd);
-        if (sockIdx < 0) return 0; // not a socket, just return 0
-        int err = brook::SockGetConnectError(sockIdx);
-        if (optvalAddr >= 0x1000 && optlenAddr >= 0x1000) {
-            auto* valPtr = reinterpret_cast<int*>(optvalAddr);
-            auto* lenPtr = reinterpret_cast<uint32_t*>(optlenAddr);
-            if (*lenPtr >= 4) {
-                *valPtr = err;
-                *lenPtr = 4;
-            }
+    int32_t value = 0;
+    UnixCredentials credentials{};
+    if (entry->type == FdType::UnixSocket) {
+        auto* socket = static_cast<UnixSocketData*>(entry->handle);
+        switch (option) {
+        case 17: // SO_PEERCRED (struct ucred), immutable connection identity.
+            SpinLockAcquire(&g_unixRegistryLock);
+            credentials = socket->peerCredentials;
+            SpinLockRelease(&g_unixRegistryLock);
+            break;
+        case 3: // SO_TYPE: type selected at socket/socketpair creation.
+            value = static_cast<int32_t>(socket->socketType);
+            break;
+        case 4: // SO_ERROR: Unix connect currently reports failures synchronously.
+            value = 0;
+            break;
+        case 7: // SO_SNDBUF
+        case 8: { // SO_RCVBUF
+            PipeBuffer* pipe = option == 7 ? socket->txPipe : socket->rxPipe;
+            if (!pipe || !pipe->capacity) return -ENOTCONN;
+            // Ring buffers reserve one byte to distinguish full from empty.
+            value = static_cast<int32_t>(pipe->capacity - 1);
+            break;
         }
-        extern volatile uint64_t g_lapicTickCount;
-        return 0;
+        default: return -92; // ENOPROTOOPT, never success with untouched output.
+        }
+    } else {
+        // Preserve the existing INET async-connect error implementation only.
+        if (option != 4) return -92;
+        int index = static_cast<int>(reinterpret_cast<uintptr_t>(entry->handle)) - 1;
+        value = brook::SockGetConnectError(index);
     }
-
-    return 0; // stub — pretend success for other options
+    if (copied) memcpy(reinterpret_cast<void*>(optvalAddr),
+                       valueSize == sizeof(credentials) ? static_cast<const void*>(&credentials)
+                                                        : static_cast<const void*>(&value), copied);
+    *reinterpret_cast<uint32_t*>(optlenAddr) = copied;
+    return 0;
 }
 
 static int64_t sys_getsockname(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
@@ -12906,11 +13301,20 @@ static int64_t sys_listen(uint64_t fdVal, uint64_t backlog, uint64_t,
     int fd = static_cast<int>(fdVal);
 
     // AF_UNIX: mark socket as listening and register in global table
-    FdEntry* fde = FdGet(proc, fd);
+    KernelOperationGuard operation(proc);
+    FdRef descriptor(proc, fd);
+    FdEntry* fde = descriptor.get();
     if (fde && fde->type == FdType::UnixSocket && fde->handle) {
         auto* usd = static_cast<UnixSocketData*>(fde->handle);
+        if (usd->state == UnixSocketData::State::Connected) return -EINVAL;
+        SpinLockAcquire(&g_unixRegistryLock);
+        // Linux captures listener identity on the first listen, not at accept.
+        if (usd->state != UnixSocketData::State::Listening)
+            usd->peerCredentials = UnixCurrentCredentials(proc);
         usd->state = UnixSocketData::State::Listening;
-        UnixRegisterServer(usd);
+        SpinLockRelease(&g_unixRegistryLock);
+        if (!UnixRegisterServer(usd)) return -ENOMEM;
+        UNIX_LIFE(Listen, usd, 0, 0, fd);
         SerialPrintf("sys_listen: AF_UNIX fd=%d path='%s'\n", fd, usd->path);
         return 0;
     }
@@ -12923,8 +13327,8 @@ static int64_t sys_listen(uint64_t fdVal, uint64_t backlog, uint64_t,
     return ret < 0 ? -EINVAL : 0;
 }
 
-static int64_t sys_accept(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
-                           uint64_t, uint64_t, uint64_t)
+static int64_t AcceptSocket(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
+                            uint32_t flags)
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -ENOSYS;
@@ -12932,67 +13336,72 @@ static int64_t sys_accept(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
     int fd = static_cast<int>(fdVal);
 
     // AF_UNIX accept: dequeue a pending connection
-    FdEntry* fde = FdGet(proc, fd);
+    KernelOperationGuard operation(proc);
+    FdRef descriptor(proc, fd);
+    FdEntry* fde = descriptor.get();
     if (fde && fde->type == FdType::UnixSocket && fde->handle) {
         auto* usd = static_cast<UnixSocketData*>(fde->handle);
         if (usd->state != UnixSocketData::State::Listening) return -EINVAL;
 
-        // Wait for a pending connection
+        auto* serverSock = static_cast<UnixSocketData*>(kmalloc(sizeof(UnixSocketData)));
+        if (!serverSock) return -ENOMEM;
+        UnixLife(UnixLifeEvent::Allocate, serverSock, 0, 1, -1,
+                 reinterpret_cast<uint64_t>(__builtin_return_address(0)), sizeof(UnixSocketData));
+        memset(serverSock, 0, sizeof(UnixSocketData));
+        serverSock->refCount = 1;
+        struct AcceptedAllocation {
+            UnixSocketData* socket;
+            ~AcceptedAllocation() { if (socket) UnixSocketHandleUnref(socket); }
+        } allocation{serverSock};
+
         for (;;) {
-            // Find a pending (not yet accepted) slot
+            if (__atomic_load_n(&fde->closing, __ATOMIC_ACQUIRE)) return -EBADF;
+            SpinLockAcquire(&g_unixRegistryLock);
             int slot = -1;
-            for (int i = 0; i < UNIX_ACCEPT_QUEUE; i++) {
-                if (usd->pending[i].used && !usd->pending[i].accepted) {
-                    slot = i; break;
-                }
-            }
-
+            for (int i = 0; i < UNIX_ACCEPT_QUEUE; ++i)
+                if (usd->pending[i].used) { slot = i; break; }
             if (slot >= 0) {
-                // Create a connected server-side socket
-                auto* serverSock = static_cast<UnixSocketData*>(kmalloc(sizeof(UnixSocketData)));
-                if (!serverSock) return -ENOMEM;
-                memset(serverSock, 0, sizeof(UnixSocketData));
-                serverSock->state  = UnixSocketData::State::Connected;
-                serverSock->refCount = 1;
-                serverSock->rxPipe = usd->pending[slot].serverRx;
-                serverSock->txPipe = usd->pending[slot].serverTx;
-                serverSock->incomingFds     = usd->pending[slot].serverRxFds; // fds client→server
-                serverSock->peerIncomingFds = usd->pending[slot].serverTxFds; // fds server→client
-                if (serverSock->incomingFds)
-                    __atomic_fetch_add(&serverSock->incomingFds->refCount, 1, __ATOMIC_RELEASE);
-                if (serverSock->peerIncomingFds)
-                    __atomic_fetch_add(&serverSock->peerIncomingFds->refCount, 1, __ATOMIC_RELEASE);
+                const UnixPendingConn& pending = usd->pending[slot];
+                serverSock->state = UnixSocketData::State::Connected;
+                serverSock->socketType = usd->socketType;
+                serverSock->peerCredentials = pending.clientCredentials;
+                serverSock->nonblock = (flags & UNIX_SOCK_NONBLOCK) != 0;
+                serverSock->rxPipe = pending.serverRx;
+                serverSock->txPipe = pending.serverTx;
+                serverSock->incomingFds = pending.serverRxFds;
+                serverSock->peerIncomingFds = pending.serverTxFds;
 
-                int newFd = FdAlloc(proc, FdType::UnixSocket, serverSock);
-                if (newFd < 0) { kfree(serverSock); return -EMFILE; }
-
-                // Mark accepted and wake the client
-                usd->pending[slot].accepted = true;
-                usd->pendingCount--;
-                Process* client = usd->pending[slot].clientWaiter;
-                usd->pending[slot].used = false;
-
-                if (client) {
-                    WakeProcess(client);
+                // Registry -> fd lock is safe: finalizers release fdLock before
+                // taking the registry lock, and fd retain callbacks only use
+                // atomic reference increments. Keep the pending owner intact
+                // until publication succeeds so EMFILE remains retryable.
+                int newFd = UnixInstallSocket(proc, serverSock, flags, "accept");
+                if (newFd < 0) {
+                    serverSock->rxPipe = serverSock->txPipe = nullptr;
+                    serverSock->incomingFds = serverSock->peerIncomingFds = nullptr;
+                    SpinLockRelease(&g_unixRegistryLock);
+                    return newFd;
                 }
-
-                // Zero out peer addr if requested (AF_UNIX has no meaningful peer addr)
-                if (addrVal >= 0x1000 && addrLenVal >= 0x1000) {
-                    auto* lenPtr = reinterpret_cast<uint32_t*>(addrLenVal);
-                    *lenPtr = 0;
-                }
-
+                usd->pending[slot] = {};
+                --usd->pendingCount;
+                allocation.socket = nullptr; // pending ownership transferred to fd
+                SpinLockRelease(&g_unixRegistryLock);
+                if (addrVal >= 0x1000 && addrLenVal >= 0x1000)
+                    *reinterpret_cast<uint32_t*>(addrLenVal) = 0;
                 SerialPrintf("sys_accept: AF_UNIX fd=%d -> newFd=%d\n", fd, newFd);
                 return newFd;
             }
-
-            if (usd->nonblock) return -EAGAIN;
-
-            // Block until a connection arrives
+            if (usd->nonblock) {
+                SpinLockRelease(&g_unixRegistryLock);
+                return -EAGAIN;
+            }
             usd->acceptWaiter = proc;
+            SpinLockRelease(&g_unixRegistryLock);
             proc->wakeupTick = g_lapicTickCount + 100;
             SchedulerBlock(proc);
-            usd->acceptWaiter = nullptr;
+            SpinLockAcquire(&g_unixRegistryLock);
+            if (usd->acceptWaiter == proc) usd->acceptWaiter = nullptr;
+            SpinLockRelease(&g_unixRegistryLock);
             if (HasPendingSignals()) return -EINTR;
         }
     }
@@ -13005,8 +13414,12 @@ static int64_t sys_accept(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
     if (childIdx < 0) return childIdx; // EAGAIN or error
 
     // Allocate a new fd for the accepted connection
-    int newFd = FdAlloc(proc, FdType::Socket,
-                        reinterpret_cast<void*>(static_cast<uintptr_t>(childIdx + 1)));
+    FdEntry accepted{};
+    accepted.type = FdType::Socket;
+    accepted.handle = reinterpret_cast<void*>(static_cast<uintptr_t>(childIdx + 1));
+    accepted.statusFlags = flags & UNIX_SOCK_NONBLOCK;
+    accepted.fdFlags = (flags & UNIX_SOCK_CLOEXEC) ? 1 : 0;
+    int newFd = FdTablePublishOwned(proc->fds, ProcessFdLock(proc), accepted, 0, -1, nullptr);
     if (newFd < 0) {
         brook::SockClose(childIdx);
         return -EMFILE;
@@ -13024,20 +13437,18 @@ static int64_t sys_accept(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
     return newFd;
 }
 
-// accept4 = accept with flags (SOCK_NONBLOCK, SOCK_CLOEXEC)
+static int64_t sys_accept(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
+                          uint64_t, uint64_t, uint64_t)
+{
+    return AcceptSocket(fdVal, addrVal, addrLenVal, 0);
+}
+
 static int64_t sys_accept4(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
                             uint64_t flags, uint64_t, uint64_t)
 {
-    int64_t ret = sys_accept(fdVal, addrVal, addrLenVal, 0, 0, 0);
-    if (ret < 0) return ret;
-
-    Process* proc = ProcessCurrent();
-    if (proc) {
-        int newFd = static_cast<int>(ret);
-        if (flags & UNIX_SOCK_NONBLOCK) proc->fds[newFd].statusFlags |= 0x800;
-        if (flags & UNIX_SOCK_CLOEXEC)  proc->fds[newFd].fdFlags |= 1;
-    }
-    return ret;
+    uint32_t options = static_cast<uint32_t>(flags);
+    if (options & ~(UNIX_SOCK_NONBLOCK | UNIX_SOCK_CLOEXEC)) return -EINVAL;
+    return AcceptSocket(fdVal, addrVal, addrLenVal, options);
 }
 
 static int64_t sys_socketpair(uint64_t domain, uint64_t type, uint64_t protocol,
@@ -13049,10 +13460,11 @@ static int64_t sys_socketpair(uint64_t domain, uint64_t type, uint64_t protocol,
     if (domain != 1) return -EAFNOSUPPORT;
 
     auto* sv = reinterpret_cast<int32_t*>(svAddr);
-    if (!sv) return -EFAULT;
+    if (!UserBufferWritable(svAddr, 2 * sizeof(int32_t))) return -EFAULT;
 
     Process* proc = ProcessCurrent();
     if (!proc) return -EMFILE;
+    KernelOperationGuard operation(proc);
 
     // Allocate two PipeBuffers — one for each direction
     auto* pipeAtoB = PipeBufferCreate(PIPE_BUF_UNIX_SIZE);
@@ -13065,13 +13477,17 @@ static int64_t sys_socketpair(uint64_t domain, uint64_t type, uint64_t protocol,
     if (!fdqBtoA) { kfree(fdqAtoB); PipeBufferDestroy(pipeAtoB); PipeBufferDestroy(pipeBtoA); return -ENOMEM; }
     auto* endA = static_cast<UnixSocketData*>(kmalloc(sizeof(UnixSocketData)));
     if (!endA) { kfree(fdqBtoA); kfree(fdqAtoB); PipeBufferDestroy(pipeAtoB); PipeBufferDestroy(pipeBtoA); return -ENOMEM; }
+    UnixLife(UnixLifeEvent::Allocate, endA, 0, 1, -1,
+             reinterpret_cast<uint64_t>(__builtin_return_address(0)), sizeof(UnixSocketData));
     auto* endB = static_cast<UnixSocketData*>(kmalloc(sizeof(UnixSocketData)));
-    if (!endB) { kfree(endA); kfree(fdqBtoA); kfree(fdqAtoB); PipeBufferDestroy(pipeAtoB); PipeBufferDestroy(pipeBtoA); return -ENOMEM; }
+    if (!endB) { UNIX_LIFE(DirectFree, endA, 1, 0, -1); kfree(endA); kfree(fdqBtoA); kfree(fdqAtoB); PipeBufferDestroy(pipeAtoB); PipeBufferDestroy(pipeBtoA); return -ENOMEM; }
 
     // Zero-init backing objects
     memset(fdqAtoB, 0, sizeof(UnixFdQueue));
     memset(fdqBtoA, 0, sizeof(UnixFdQueue));
     memset(endA, 0, sizeof(UnixSocketData));
+    UnixLife(UnixLifeEvent::Allocate, endB, 0, 1, -1,
+             reinterpret_cast<uint64_t>(__builtin_return_address(0)), sizeof(UnixSocketData));
     memset(endB, 0, sizeof(UnixSocketData));
 
     pipeAtoB->readers = 1;
@@ -13087,6 +13503,8 @@ static int64_t sys_socketpair(uint64_t domain, uint64_t type, uint64_t protocol,
     endA->state = UnixSocketData::State::Connected;
     endA->nonblock = nonblock;
     endA->refCount = 1;
+    endA->socketType = static_cast<uint32_t>(type) & 0xfu;
+    endA->peerCredentials = UnixCurrentCredentials(proc);
     endA->rxPipe = pipeBtoA;
     endA->txPipe = pipeAtoB;
     endA->incomingFds = fdqBtoA;
@@ -13095,25 +13513,24 @@ static int64_t sys_socketpair(uint64_t domain, uint64_t type, uint64_t protocol,
     endB->state = UnixSocketData::State::Connected;
     endB->nonblock = nonblock;
     endB->refCount = 1;
+    endB->socketType = static_cast<uint32_t>(type) & 0xfu;
+    endB->peerCredentials = endA->peerCredentials;
     endB->rxPipe = pipeAtoB;
     endB->txPipe = pipeBtoA;
     endB->incomingFds = fdqAtoB;
     endB->peerIncomingFds = fdqBtoA;
 
-    int fdA = FdAlloc(proc, FdType::UnixSocket, endA);
-    if (fdA < 0) { kfree(endA); kfree(endB); kfree(fdqAtoB); kfree(fdqBtoA); PipeBufferDestroy(pipeAtoB); PipeBufferDestroy(pipeBtoA); return -EMFILE; }
-
-    int fdB = FdAlloc(proc, FdType::UnixSocket, endB);
-    if (fdB < 0) {
-        FdFree(proc, fdA);
-        kfree(endA); kfree(endB); kfree(fdqAtoB); kfree(fdqBtoA); PipeBufferDestroy(pipeAtoB); PipeBufferDestroy(pipeBtoA);
-        return -EMFILE;
+    int fdA = UnixInstallSocket(proc, endA, static_cast<uint32_t>(type), "socketpair-a");
+    if (fdA < 0) {
+        UnixSocketHandleUnref(endA);
+        UnixSocketHandleUnref(endB);
+        return fdA;
     }
-    proc->fds[fdA].statusFlags = nonblock ? UNIX_SOCK_NONBLOCK : 0;
-    proc->fds[fdB].statusFlags = nonblock ? UNIX_SOCK_NONBLOCK : 0;
-    if (type & UNIX_SOCK_CLOEXEC) {
-        proc->fds[fdA].fdFlags |= 1;
-        proc->fds[fdB].fdFlags |= 1;
+    int fdB = UnixInstallSocket(proc, endB, static_cast<uint32_t>(type), "socketpair-b");
+    if (fdB < 0) {
+        CloseProcessFd(proc, fdA);
+        UnixSocketHandleUnref(endB);
+        return fdB;
     }
 
     sv[0] = fdA;
@@ -13160,8 +13577,7 @@ static bool UnixFdSnapFrom(const FdEntry* src, UnixFdSnap* out)
             break;
         case FdType::UnixSocket:
             if (src->handle)
-                __atomic_fetch_add(&static_cast<UnixSocketData*>(src->handle)->refCount,
-                                    1, __ATOMIC_RELEASE);
+                UnixSocketHandleRef(src->handle);
             break;
         case FdType::DrmPrime:
             // PRIME dmabuf fd: a client hands its render-target capability to the
@@ -13187,12 +13603,13 @@ static bool UnixFdSnapFrom(const FdEntry* src, UnixFdSnap* out)
 // release it (drainSnap) so we don't leak.
 static int UnixFdSnapInstall(Process* dst, const UnixFdSnap* snap)
 {
-    int fd = FdAlloc(dst, snap->type, snap->handle);
-    if (fd < 0) return -EMFILE;
-    dst->fds[fd].flags       = snap->flags;
-    dst->fds[fd].fdFlags     = snap->fdFlags;
-    dst->fds[fd].statusFlags = snap->statusFlags;
-    return fd;
+    FdEntry owned{};
+    owned.type = snap->type;
+    owned.handle = snap->handle;
+    owned.flags = snap->flags;
+    owned.fdFlags = snap->fdFlags;
+    owned.statusFlags = snap->statusFlags;
+    return FdTablePublishOwned(dst->fds, ProcessFdLock(dst), owned, 0, -1, nullptr, UnixLifePublished);
 }
 
 static void UnixFdSnapRelease(const UnixFdSnap* snap)
@@ -13254,7 +13671,9 @@ static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
     auto* msg = reinterpret_cast<LinuxMsgHdr*>(msgVal);
     if (!msg || msg->msg_iovlen == 0 || !msg->msg_iov) return -EINVAL;
 
-    FdEntry* fde = FdGet(proc, fd);
+    KernelOperationGuard operation(proc);
+    FdRef descriptor(proc, fd);
+    FdEntry* fde = descriptor.get();
     if (!fde) return -EBADF;
     if (fde->type == FdType::UnixSocket) {
 
@@ -13288,7 +13707,8 @@ static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
                             UnixFdSnapRelease(&pendingSnaps[j]);
                         return -EAGAIN;
                     }
-                    FdEntry* srcFde = FdGet(proc, fds[i]);
+                    FdRef sourceDescriptor(proc, fds[i]);
+                    FdEntry* srcFde = sourceDescriptor.get();
                     if (!srcFde || !UnixFdSnapFrom(srcFde, &pendingSnaps[pendingCount])) {
                         for (int j = 0; j < pendingCount; j++)
                             UnixFdSnapRelease(&pendingSnaps[j]);
@@ -13403,7 +13823,9 @@ static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
     auto* msg = reinterpret_cast<LinuxMsgHdr*>(msgVal);
     if (!msg || msg->msg_iovlen == 0 || !msg->msg_iov) return -EINVAL;
 
-    FdEntry* fde = FdGet(proc, fd);
+    KernelOperationGuard operation(proc);
+    FdRef descriptor(proc, fd);
+    FdEntry* fde = descriptor.get();
     if (fde && fde->type == FdType::UnixSocket) {
         auto* usd = static_cast<UnixSocketData*>(fde->handle);
 

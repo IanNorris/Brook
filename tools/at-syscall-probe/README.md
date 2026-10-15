@@ -237,7 +237,7 @@ probe expects writable regular-file MAP_SHARED (including SHARED_VALIDATE) to
 fail with EOPNOTSUPP until file writeback is implemented. It verifies private
 writable changes do not persist, private read-only mappings still read the
 file, and two shared memfd mappings still see each other's writes. The file
-is sized with write rather than regular-file ftruncate, which remains a stub.
+is sized with write; resizing is covered separately by truncatecheck.
 Expect `SHAREDFILECHECK PASS failures=0`; the rejection checks intentionally
 fail on Linux, where writable shared file mappings are supported.
 
@@ -440,3 +440,166 @@ requiring fsck; resize never intentionally frees blocks still referenced by
 successfully committed metadata. Full filesystem fault injection and all ext2
 block-size variants require actual guest/backend tests; the host ext2 structure
 tests do not exercise this implementation.
+
+`exepathcheck.c /data/EXEPATH` copies its ELF into a fixture and executes it
+through relative and absolute executable symlinks, a symlinked parent directory,
+and a symlinked script whose shebang interpreter is itself a symlink. Each child
+compares `/proc/self/exe` with the physical ELF pathname; the script case also
+checks that interpreter argv retains the script spelling. The same probe passes
+on Linux. Build it statically and run on the old kernel first: unresolved exePath
+storage should fail these comparisons, rather than merely checking exec success.
+After the fixed kernel passes, also launch through Brook's shell directly:
+`run /data/EXEPATH/bin/relative --report /data/EXEPATH/lib/payload` and
+`run /data/EXEPATH/script-link /data/EXEPATH/lib/payload`.
+This checks initial executable pathname resolution only; it does not claim
+rename/unlink tracking for `/proc/self/exe`. Brook's existing executable pathname
+storage is bounded; the executable opener rejects a resolved name that cannot
+fit instead of returning a truncated name. General VFS lookup remains separate
+from this strict executable-open resolver.
+
+`procfdcheck.c` verifies that reopening a memfd through `/proc/self/fd/N` or
+`/proc/<current-pid>/fd/N` opens its backing object with an independent offset
+and requested access mode. It checks inode/device equality, CLOEXEC, sequential
+and positional I/O, read-only write/truncate/shared-mmap/mprotect rejection,
+shared mapping coherence, close-original survival, inherited access rights
+through dup/fork, and surviving mappings after all descriptors close. It also
+checks new `/dev/shm` descriptor access modes and namespace ownership after the
+creator closes. Linux passes the same assertions. The probe does not assert
+shared OFD offsets after dup/fork or shm unlink behavior.
+
+Brook currently supports procfd reopening only for memfds in the current fd
+table; foreign-process paths and other descriptor types fail instead of opening
+synthetic link-description text. O_PATH/O_TRUNC/O_CREAT procfd modes are outside
+this scope. Memfd creation returns O_RDWR; read-only reopened mappings carry a
+maximum permission ceiling (module ABI9). Writable MAP_PRIVATE memfd requests
+remain unsupported rather than sharing writable pages silently. Concurrent VMA
+mutation, mapped memfd shrink/SIGBUS semantics, full private-copy semantics and
+real file seals remain separate work. Mapping/remapping no longer grows logical
+file size. The existing bounded shm namespace now retains its own backing
+reference and serializes publication; shm unlink/reclamation still needs work,
+and shm O_TRUNC is rejected because freeing mapped pages is unsafe.
+
+The procfd probe also changes a cold three-page memfd mapping's middle page to
+PROT_NONE/PROT_READ, checks that the outside pages retain their permissions,
+checks expected child faults inside, restores access, and unmaps all fragments.
+`--brook-capacity` additionally fills Brook's 256 memfd mapping slots and verifies
+that a two-fragment split fails without permission changes until two slots are
+available; this capacity assertion is Brook-specific and is not run on Linux.
+Partial protection/unmap metadata is split with backing references retained;
+this does not establish the separate concurrent metadata/PTE transaction protocol.
+Remapping a range spanning distinct memfd fragments is explicitly rejected.
+F_ADD_SEALS/F_GET_SEALS and unsupported memfd_create flag bits return EINVAL;
+no immutability or cross-sandbox isolation claim is made. Firefox experiments can
+use its upstream-supported MOZ_SHM_NO_SEALS=1 setting while sealing remains absent.
+
+`unixfdcheck.c` is a bounded pthread/fork socket ownership regression. Four
+threads repeatedly duplicate and close one socket endpoint, including racing
+`dup2`/`dup3` replacement of descriptor 200, while the main thread forks 24
+children which close inherited endpoints. The final original and duplicate must
+still transfer exact bytes through the peer. Build statically with `-pthread`,
+run `UNIXCHK` under a host deadline, and require `UNIXFDCHECK PASS`. The raw
+45-second alarm is advisory; it cannot recover a kernel panic or deadlock. Linux
+passes the same probe. Brook may return EBUSY when replacing a descriptor with an
+active slot pin; failure leaves both existing descriptors unchanged.
+
+The actual fd-table host tests deterministically reproduce premature last
+release using the old publish-before-retain sequence, then test owned publication,
+pinned replacement rejection and fork snapshot retention against source close.
+Unix socket creation, accept and SCM_RIGHTS installation now publish complete
+owned descriptors. Existing process strace (including errors-only mode) enables
+up to 512 `UNIXLIFE` allocation/retain/release records for diagnostic launches.
+The historical Firefox socket UAF was observed directly; its precise original
+release interleaving remains unproven until lifecycle tracing attributes it.
+Listener registry lookup now pins before dropping its lock. Concurrent pending
+accept queues and SCM_RIGHTS queue mutation/cancellation are still separate
+limitations; this checkpoint does not claim all Unix socket synchronization or
+shared OFD offset semantics are complete.
+
+Common process fd-table wrappers and finalization now enter cooperative kernel
+operation guards before touching plain fd locks or claiming resource ownership.
+This prevents fatal cancellation from abandoning the lock or a stack-owned
+retirement. The latch lasts through the syscall safe boundary; an unrelated
+blocking operation later in that syscall can therefore defer fatal delivery.
+Pending terminal cancellation is included in socket interrupt checks, but a
+complete audit of all blocking subsystems remains separate work.
+
+`fallocatecheck.c` verifies real memfd reservation: mode0 grows a 2304-byte
+cursor-sized object, stat reports physical allocation before first touch, and
+its first shared-mapping write reads back correctly. Unaligned allocation,
+KEEP_SIZE reservation beyond EOF (observable through allocated st_blocks), zero
+contents, retained existing data, unchanged file position, low32 fd ABI and
+error cases share one Linux/Brook probe. Run `FALLOC --brook` to additionally
+require EOPNOTSUPP with unchanged contents/size on FAT and ext2 regular files;
+those backends do not yet implement reservation. The default mode passes Linux.
+
+Memfd fallocate currently supports mode0 and KEEP_SIZE only. It allocates real
+zeroed physical pages under the backing lock; an allocation failure frees the
+private staged pages before returning ENOSPC and does not advance logical size.
+Index growth may remain after failed reservation. No shrinking, hole punching,
+seals, or concurrent VMA invalidation is claimed. The 16-GiB existing memfd index
+limit is enforced as EFBIG for fallocate. The old success-only syscall is detected
+by size0 after reported success; the probe exits before touching the EOF mapping.
+OOM rollback is reviewed by construction, not claimed as fault-injection tested.
+
+`socketoptcheck.c` verifies connected AF_UNIX SO_SNDBUF/SO_RCVBUF, SO_TYPE and
+SO_ERROR, all optlen truncations from zero through eight bytes with canaries,
+bad descriptors, non-sockets, unsupported levels/options, invalid pointers and
+negative lengths. Linux passes the default probe. Brook's `--brook` mode also
+fills the nonblocking socket to its reported usable capacity and requires the
+next byte to return EAGAIN; unattached buffer queries require ENOTCONN.
+
+Unix buffer results are the attached PipeBuffer capacity minus the ring's one
+reserved byte. No disconnected buffer default is invented. SO_TYPE preserves
+the creation type across accept; preexisting DGRAM/SEQPACKET byte-stream behavior
+is not fixed or endorsed by this query implementation. Unix SO_ERROR is zero
+because current connect failures are synchronous. Unknown SOL_SOCKET options
+return ENOPROTOOPT; an unsupported Unix option level returns EOPNOTSUPP, matching
+the Linux reference. Existing INET SO_ERROR is retained, without claiming other
+INET options or the separate setsockopt stub are implemented.
+
+`peercredcheck.c` checks Unix SO_PEERCRED's Linux 12-byte ucred ABI, every
+0–16-byte result length with canaries, and unconnected {0, -1, -1} identity.
+Socketpair credentials remain the creator's after fork, peer close and credential
+changes; a pair created by a pthread reports TGID. Path connections capture
+client effective UID/GID at connect and listener identity at first listen,
+including accepting through an inherited listener. Run `PEERCRED --require-root`
+to require the root-server / UID-and-GID-1000-client case; an unprivileged host
+run tests same-user connections and explicitly reports root_case=0.
+Snapshots contain values, not live Process pointers, and survive PID recycling
+without retargeting. They do not add SCM_CREDENTIALS or fix the separately
+tracked pending-connection/ancillary-queue concurrency and cancellation gaps.
+Semantics reference: https://man7.org/linux/man-pages/man7/unix.7.html#SOCKET_OPTIONS
+
+`unixpendingcheck.c` tests a stream client sending a retained memfd and closing
+before server accept, with a parent/child barrier and allocation churn. It runs
+32 rounds, checks the received file's marker and EOF, listener abandonment, and
+an `EMFILE` accept followed by retry without losing the pending connection.
+The pending slot owns its pipe ends and ancillary queues until successful accept
+transfers them or listener teardown releases them. This fixes early-close
+lifetime ownership; concurrent ancillary producers/consumers and general Unix
+socket cancellation semantics remain separate work.
+
+`gsbasecheck.c` exercises `ARCH_SET_GS`/`ARCH_GET_GS` using actual `gs:0` loads,
+four threads and 8,000 scheduling yields, thread/fork inheritance, exec reset,
+zero-base restoration, unmapped low bases, rejected high/noncanonical bases,
+and invalid output pointers. Build with `-static -O2 -pthread` and run as
+`/boot/GSCHECK` in Brook. The default probe also runs on x86-64 Linux with
+`ARCH_SET_GS` enabled. This does not enable the FSGSBASE instructions. Brook
+keeps the active kernel GS CPU-local and saves the inactive user GS per thread;
+module ABI 10 requires matching rebuilt modules.
+
+`cachecowcheck.c` warms a 1 MiB file, then runs eight rounds of four forked
+children with four threads each. Three threads read into inherited CoW buffers;
+the fourth repeatedly faults private file mappings. It checks every returned
+byte, reads spanning the 64 KiB kernel bounce limit, short reads at EOF and final
+offsets, and the parent's unchanged memory. Build with `-static -O2 -pthread`
+and run `COWCHK /data/CACHECOW.TST`. The initial core probe reproduced the old
+ext2 cache/TLB deadlock; the expanded probe passed the fixed kernel. This is a
+concurrency stress regression, not proof of every possible interleaving.
+
+Ext2 reads to user addresses now stage through at most 64 KiB of resident kernel
+memory. The filesystem read completes and releases its locks before copyout can
+fault. Kernel-buffer reads retain the direct coalesced path. Cache insertion
+allocates missing buffers outside the cache lock and disposes of unused racing
+allocations after unlocking. Invalid user-buffer recovery and concurrent VMA
+invalidation remain separate compatibility work.

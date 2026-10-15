@@ -1,3 +1,4 @@
+#include "unix_lifetime_trace.h"
 // process.cpp -- Process creation, fd table, user stack setup.
 //
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
@@ -28,6 +29,17 @@
 #include "ksym_addrs.h"
 
 namespace brook {
+
+// Copies own references before publication; implemented with fd finalizers.
+bool FdRetainCopy(FdEntry* copy);
+
+struct ProcessOperationGuard {
+    Process* process;
+    explicit ProcessOperationGuard(Process* p) : process(p) {
+        if (process) SchedulerKernelRegionEnter(process);
+    }
+    ~ProcessOperationGuard() { if (process) SchedulerKernelRegionLeave(process); }
+};
 
 // ProcessCurrent() is now in scheduler.cpp (g_currentProcess lives there).
 
@@ -203,6 +215,7 @@ static FdEntry* AllocFdTable()
 
 int FdAlloc(Process* proc, FdType type, void* handle)
 {
+    ProcessOperationGuard operation(ProcessCurrent());
     if (!proc || !proc->fds) return -24; // EMFILE
     int fd = FdTableAlloc(proc->fds, ProcessFdLock(proc), type, handle);
     if (fd < 0)
@@ -215,40 +228,48 @@ int FdAlloc(Process* proc, FdType type, void* handle)
 
 void FdFree(Process* proc, int fd)
 {
+    ProcessOperationGuard operation(ProcessCurrent());
     if (!proc || !proc->fds) return;
     FdTableFree(proc->fds, ProcessFdLock(proc), fd);
 }
 
 FdEntry* FdGet(Process* proc, int fd)
 {
+    ProcessOperationGuard operation(ProcessCurrent());
     if (!proc || !proc->fds) return nullptr;
     return FdTableGet(proc->fds, ProcessFdLock(proc), fd);
 }
 
 bool FdClaim(Process* proc, int fd, FdClaimResult* out)
 {
+    ProcessOperationGuard operation(ProcessCurrent());
     if (!proc || !proc->fds) return false;
     return FdTableClaim(proc->fds, ProcessFdLock(proc), fd, out);
 }
 
 FdEntry* FdGetRef(Process* proc, int fd)
 {
+    ProcessOperationGuard operation(ProcessCurrent());
     if (!proc || !proc->fds) return nullptr;
     return FdTablePin(proc->fds, ProcessFdLock(proc), fd);
 }
 
 void FdPut(Process* proc, int fd)
 {
+    ProcessOperationGuard operation(ProcessCurrent());
     if (!proc || !proc->fds) return;
     FdClaimResult c;
     // If this drops the last pin on a slot whose close() was deferred, the core
     // hands back the snapshot to finalize the handle outside the table lock.
-    if (FdTableUnpin(proc->fds, ProcessFdLock(proc), fd, &c))
+    if (FdTableUnpin(proc->fds, ProcessFdLock(proc), fd, &c)) {
+        UnixLifeClaim(fd, c);
         FinalizeClosedFd(c);
+    }
 }
 
 FdCloseResult FdClose(Process* proc, int fd, FdClaimResult* out)
 {
+    ProcessOperationGuard operation(ProcessCurrent());
     if (!proc || !proc->fds) return FdCloseResult::NotFound;
     return FdTableClose(proc->fds, ProcessFdLock(proc), fd, out);
 }
@@ -308,6 +329,7 @@ static uint64_t RandomU64()
 static void SetupTLS(Process* proc, uint64_t stackVirtBase, uint64_t guardPages)
 {
     proc->fsBase = 0;
+    proc->savedCtx.gsBase = 0;
     if (proc->elf.tlsTotalSize == 0) return;
 
     uint64_t tlsPages = (proc->elf.tlsTotalSize + 64 + 4095) / 4096;
@@ -923,6 +945,7 @@ static void CloseFdEntry(Process* proc, uint32_t i)
 // Close all FDs with FD_CLOEXEC set — called by ProcessExec (execve semantics).
 void ProcessCloseCloexecFds(Process* proc)
 {
+    ProcessOperationGuard operation(ProcessCurrent());
     if (!proc) return;
     SpinLockAcquire(ProcessFdLock(proc));
     for (uint32_t i = 0; i < MAX_FDS; ++i)
@@ -939,6 +962,7 @@ void ProcessCloseCloexecFds(Process* proc)
 
 void ProcessCloseAllFds(Process* proc)
 {
+    ProcessOperationGuard operation(ProcessCurrent());
     if (!proc) return;
 
     SpinLockAcquire(ProcessFdLock(proc));
@@ -1297,6 +1321,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
                      uint64_t userRsp, uint64_t userRflags)
 {
     if (!parent || parent->isKernelThread) return nullptr;
+    ProcessOperationGuard operation(parent);
 
     auto* child = static_cast<Process*>(kmalloc(sizeof(Process)));
     if (!child) return nullptr;
@@ -1448,75 +1473,17 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
         return nullptr;
     }
 
-    // Duplicate file descriptors (shallow copy — share VFS handles)
-    // fd 0/1/2 (keyboard/serial) don't need refcounting.
-    // VFS Vnodes: we don't increment refcount currently (single-owner model).
-    // This is acceptable for now — child gets independent seek positions.
-    for (uint32_t i = 0; i < MAX_FDS; i++)
-    {
-        if (parent->fds[i].type != FdType::None)
-        {
-            child->fds[i] = parent->fds[i];
-
-            // The child has no in-flight operations on its fresh table, so it
-            // must not inherit the parent's transient pin/close state (BRO-156):
-            // a slot the parent has pinned mid-read would otherwise never be
-            // finalizable in the child.
-            child->fds[i].pinCount = 0;
-            child->fds[i].closing  = 0;
-
-            // Increment pipe reader/writer counts for the child's copy
-            if (parent->fds[i].type == FdType::Pipe && parent->fds[i].handle)
-            {
-                auto* pipe = static_cast<PipeBuffer*>(parent->fds[i].handle);
-                if (parent->fds[i].flags & 1)
-                    __atomic_fetch_add(&pipe->writers, 1, __ATOMIC_RELEASE);
-                else
-                    __atomic_fetch_add(&pipe->readers, 1, __ATOMIC_RELEASE);
-            }
-
-            // Increment Vnode refcount for the child's copy
-            if (parent->fds[i].type == FdType::Vnode && parent->fds[i].handle)
-            {
-                auto* vn = static_cast<Vnode*>(parent->fds[i].handle);
-                __atomic_fetch_add(&vn->refCount, 1, __ATOMIC_RELEASE);
-            }
-
-            // Increment socket refcount for the child's copy
-            if (parent->fds[i].type == FdType::Socket && parent->fds[i].handle)
-            {
-                int sockIdx = static_cast<int>(
-                    reinterpret_cast<uintptr_t>(parent->fds[i].handle)) - 1;
-                brook::SockRef(sockIdx);
-            }
-
-            // Increment memfd refcount for the child's copy (shared buffer).
-            if (parent->fds[i].type == FdType::MemFd && parent->fds[i].handle)
-                brook::MemFdHandleRef(parent->fds[i].handle);
-
-            if (parent->fds[i].type == FdType::EventFd && parent->fds[i].handle)
-                brook::EventFdHandleRef(parent->fds[i].handle);
-            if (parent->fds[i].type == FdType::EpollFd && parent->fds[i].handle)
-                brook::EpollFdHandleRef(parent->fds[i].handle);
-            if (parent->fds[i].type == FdType::TimerFd && parent->fds[i].handle)
-                brook::TimerFdHandleRef(parent->fds[i].handle);
-
-            // Increment unix socket refcount for the child's copy
-            if (parent->fds[i].type == FdType::UnixSocket && parent->fds[i].handle)
-                UnixSocketHandleRef(parent->fds[i].handle);
-
-            // Increment DevDsp refcount for the child's copy
-            if (parent->fds[i].type == FdType::DevDsp && parent->fds[i].handle)
-                brook::DspHandleRef(parent->fds[i].handle);
-
-            // Deep-copy DevKlog cursor so parent/child have independent positions
-            if (parent->fds[i].type == FdType::DevKlog && parent->fds[i].handle)
-                child->fds[i].handle = brook::DevKlogDeepCopy(parent->fds[i].handle);
-
-            // Deep-copy DevTty pair and bump pipe refcounts for the child
-            if (parent->fds[i].type == FdType::DevTty && parent->fds[i].handle)
-                child->fds[i].handle = brook::DevTtyDeepCopy(parent->fds[i].handle);
-        }
+    // Snapshot and retain under the source fd lock. Never reread mutable
+    // parent slots after copying their handle into the child.
+    if (!FdTableForkSnapshot(child->fds, parent->fds, ProcessFdLock(parent), FdRetainCopy, UnixLifePublished)) {
+        ProcessCloseAllFds(child);
+        ProcessClearLazyMappings(child);
+        VmmDestroyUserPageTable(child->pageTable);
+        VmmFreeKernelStack(kstackAddr, KERNEL_STACK_PAGES);
+        kfree(child->fds);
+        SchedulerFreePid(child->pid);
+        FreeProcessStruct(child);
+        return nullptr;
     }
 
     // Update child's TLS fsBase to point to the new address space's TLS
