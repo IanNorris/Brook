@@ -1,4 +1,5 @@
 # title: Kernel Console
+# Requires: builtin
 # desc: Open the kernel's read-only log window
 set wm
 kconsole

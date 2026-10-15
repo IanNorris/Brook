@@ -1,4 +1,5 @@
 # title: Quake II
+# Requires: /data/games/quake2/quake2
 # desc: id Software shooter
 set vfb 640x480
 set scale 1

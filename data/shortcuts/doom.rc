@@ -1,4 +1,6 @@
 # title: DOOM
+# Requires: /boot/BIN/doom
+# Requires: /boot/DOOM1.WAD
 # desc: The classic
 set vfb 320x200
 set scale 2

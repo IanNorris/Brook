@@ -41,6 +41,7 @@
 #include <wayland-server-protocol.h>
 #include "xdg-shell-server-protocol.h"
 #include "xdg-decoration-server-protocol.h"
+#include "kde-server-decoration-server-protocol.h"
 #include "viewporter-server-protocol.h"
 #include "linux-dmabuf-unstable-v1-server-protocol.h"
 
@@ -48,6 +49,7 @@
 #define BROOK_SYS_WM_DESTROY_WINDOW  507
 #define BROOK_SYS_WM_SIGNAL_DIRTY    508
 #define BROOK_SYS_WM_SET_TITLE       509
+#define BROOK_SYS_WM_SET_APP_ID      0xB01
 #define BROOK_SYS_WM_POP_INPUT       510
 #define BROOK_SYS_WM_RESIZE_VFB      511
 #define BROOK_SYS_WM_SET_DECORATION_MODE 512
@@ -121,6 +123,9 @@ static long wm_signal_dirty(uint32_t id) {
 static long wm_set_title(uint32_t id, const char* title) {
     size_t n = title ? strlen(title) : 0;
     return syscall(BROOK_SYS_WM_SET_TITLE, (long)id, (long)title, (long)n);
+}
+static long wm_set_app_id(uint32_t id, const char* app_id) {
+    return syscall(BROOK_SYS_WM_SET_APP_ID, (long)id, (long)app_id);
 }
 static long wm_pop_input(uint32_t id, struct brook_wm_event* buf, long max) {
     return syscall(BROOK_SYS_WM_POP_INPUT, (long)id, (long)buf, max);
@@ -212,6 +217,7 @@ struct brook_surface {
 
     /* Latest set_title — copied so it survives the wayland string. */
     char title[64];
+    char app_id[128]; /* xdg identity; independent of the document/window title */
 
     /* Kernel Window backing this xdg_toplevel.  Created lazily on the
      * first real (post-ack) commit when we know the buffer size. */
@@ -222,12 +228,12 @@ struct brook_surface {
 
     /* Decoration mode requested by client.  Brook's policy is server-side
      * chrome for normal toplevels; popups are forced CSD/no-chrome.
-     * If the client never binds zxdg_toplevel_decoration_v1 before the
+     * If the client never negotiates xdg- or KDE server-decoration before the
      * first commit, we assume CSD — GTK3/4 apps draw their own header
      * bar and may not negotiate via xdg-decoration. */
     int  deco_csd;          /* 1 = client-side, 0 = server-side */
     int  deco_pending;      /* mode change requested but wm_id not yet known */
-    int  deco_negotiated;   /* 1 = client used xdg-decoration to set mode */
+    int  deco_negotiated;   /* 1 = client negotiated xdg/KDE decoration */
 
     /* Cursor surface state. When a surface is assigned as cursor via
      * wl_pointer.set_cursor, its commits upload pixels to the kernel
@@ -460,6 +466,7 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
                                            create_flags, &out);
                 if (rc == 0 && out.wm_id) {
                     s->wm_id      = out.wm_id;
+                    if (s->app_id[0]) wm_set_app_id(s->wm_id, s->app_id);
                     s->vfb        = (uint32_t*)(uintptr_t)out.vfb_user;
                     s->vfb_stride = out.vfb_stride;
                     s->vfb_w      = (uint32_t)dw;
@@ -623,6 +630,7 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
                                        &out);
             if (rc == 0 && out.wm_id) {
                 s->wm_id      = out.wm_id;
+                if (s->app_id[0]) wm_set_app_id(s->wm_id, s->app_id);
                 s->vfb        = (uint32_t*)(uintptr_t)out.vfb_user;
                 s->vfb_stride = out.vfb_stride;
                 s->vfb_w      = (uint32_t)w;
@@ -831,7 +839,11 @@ static void xdg_toplevel_set_title(struct wl_client *c, struct wl_resource *r,
 }
 static void xdg_toplevel_set_app_id(struct wl_client *c, struct wl_resource *r,
                                      const char *app_id) {
-    (void)c; (void)r; (void)app_id;
+    (void)c;
+    struct brook_surface *s = wl_resource_get_user_data(r);
+    if (!s || !app_id) return;
+    snprintf(s->app_id, sizeof(s->app_id), "%s", app_id);
+    if (s->wm_id) wm_set_app_id(s->wm_id, s->app_id);
 }
 static void xdg_toplevel_show_window_menu(struct wl_client *c, struct wl_resource *r,
                                             struct wl_resource *seat, uint32_t serial,
@@ -944,8 +956,11 @@ static void xdg_surface_get_toplevel(struct wl_client *c, struct wl_resource *r,
     if (!tr) { wl_client_post_no_memory(c); return; }
     wl_resource_set_implementation(tr, &xdg_toplevel_impl, s, xdg_toplevel_resource_destroy);
     s->xdg_toplevel = tr;
-    s->deco_csd = 0;
-    s->deco_pending = 1;
+    /* KDE decoration belongs to wl_surface and may precede its shell role. */
+    if (!s->deco_negotiated) {
+        s->deco_csd = 0;
+        s->deco_pending = 1;
+    }
     fprintf(stderr, "[waylandd] xdg_surface.get_toplevel id=%u\n", id);
     /* Tell the client this surface is on our output so GDK's
      * window_update_scale finds a monitor and doesn't fall back to a
@@ -1954,9 +1969,10 @@ static void pump_input_once(void) {
 static void deco_destroy(struct wl_client *c, struct wl_resource *r) {
     (void)c; wl_resource_destroy(r);
 }
-static void deco_apply_mode(struct wl_resource *r, int csd) {
-    struct brook_surface *s = wl_resource_get_user_data(r);
+static void surface_apply_decoration(struct brook_surface *s, int csd) {
     if (!s) return;
+    /* Popups never acquire toplevel chrome, irrespective of negotiation. */
+    csd = csd || s->xdg_popup != NULL;
     s->deco_csd = csd;
     if (s->wm_id) {
         long rc = wm_set_decoration_mode(s->wm_id, csd);
@@ -1968,8 +1984,13 @@ static void deco_apply_mode(struct wl_resource *r, int csd) {
                 csd ? "client_side" : "server_side");
         s->deco_pending = 1;
     }
+}
+static void deco_apply_mode(struct wl_resource *r, int csd) {
+    struct brook_surface *s = wl_resource_get_user_data(r);
+    if (!s) return;
+    surface_apply_decoration(s, csd);
     zxdg_toplevel_decoration_v1_send_configure(r,
-        csd ? ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE
+        s->deco_csd ? ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE
             : ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
 }
 static void deco_set_mode(struct wl_client *c, struct wl_resource *r, uint32_t mode) {
@@ -2029,6 +2050,81 @@ static void deco_mgr_bind(struct wl_client *client, void *data,
     wl_resource_set_implementation(r, &deco_mgr_impl, NULL, NULL);
     fprintf(stderr, "[waylandd] decoration manager bind v=%u id=%u\n",
             version, id);
+}
+
+/* KDE's v1 protocol is what GTK3 uses (xdg-decoration alone is insufficient).
+ * Each resource watches its wl_surface lifetime; it may safely be released
+ * after that surface, and a late request cannot dereference freed userdata. */
+struct kde_decoration {
+    struct brook_surface *surface;
+    struct wl_listener surface_destroy;
+};
+static void kde_decoration_surface_destroyed(struct wl_listener *listener, void *data) {
+    (void)data;
+    struct kde_decoration *d = wl_container_of(listener, d, surface_destroy);
+    wl_list_remove(&d->surface_destroy.link);
+    wl_list_init(&d->surface_destroy.link);
+    d->surface = NULL;
+}
+static void kde_decoration_resource_destroy(struct wl_resource *r) {
+    struct kde_decoration *d = wl_resource_get_user_data(r);
+    if (!d) return;
+    if (d->surface) wl_list_remove(&d->surface_destroy.link);
+    free(d);
+}
+static void kde_decoration_apply(struct wl_resource *r, uint32_t mode) {
+    struct kde_decoration *d = wl_resource_get_user_data(r);
+    if (!d || !d->surface) return;
+    /* NONE and CLIENT both suppress Brook chrome; their distinct protocol
+     * values remain intact in the acknowledgement. Invalid preferences use
+     * the advertised server default rather than echoing an invalid enum. */
+    if (mode > ORG_KDE_KWIN_SERVER_DECORATION_MODE_SERVER)
+        mode = ORG_KDE_KWIN_SERVER_DECORATION_MODE_SERVER;
+    if (d->surface->xdg_popup) mode = ORG_KDE_KWIN_SERVER_DECORATION_MODE_NONE;
+    d->surface->deco_negotiated = 1;
+    surface_apply_decoration(d->surface, mode != ORG_KDE_KWIN_SERVER_DECORATION_MODE_SERVER);
+    org_kde_kwin_server_decoration_send_mode(r, mode);
+}
+static void kde_decoration_request_mode(struct wl_client *c, struct wl_resource *r, uint32_t mode) {
+    (void)c;
+    fprintf(stderr, "[waylandd] KDE decoration request_mode=%u\n", mode);
+    kde_decoration_apply(r, mode);
+}
+static const struct org_kde_kwin_server_decoration_interface kde_decoration_impl = {
+    .release = deco_destroy,
+    .request_mode = kde_decoration_request_mode,
+};
+static void kde_decoration_create(struct wl_client *c, struct wl_resource *r,
+                                  uint32_t id, struct wl_resource *surface) {
+    struct brook_surface *s = surface ? wl_resource_get_user_data(surface) : NULL;
+    if (!s) {
+        wl_resource_post_error(r, WL_DISPLAY_ERROR_INVALID_OBJECT, "invalid decoration surface");
+        return;
+    }
+    struct kde_decoration *d = calloc(1, sizeof(*d));
+    if (!d) { wl_client_post_no_memory(c); return; }
+    struct wl_resource *resource = wl_resource_create(c,
+        &org_kde_kwin_server_decoration_interface, 1, id);
+    if (!resource) { free(d); wl_client_post_no_memory(c); return; }
+    d->surface = s;
+    d->surface_destroy.notify = kde_decoration_surface_destroyed;
+    wl_resource_add_destroy_listener(surface, &d->surface_destroy);
+    wl_resource_set_implementation(resource, &kde_decoration_impl, d, kde_decoration_resource_destroy);
+    kde_decoration_apply(resource, ORG_KDE_KWIN_SERVER_DECORATION_MODE_SERVER);
+}
+static const struct org_kde_kwin_server_decoration_manager_interface kde_decoration_manager_impl = {
+    .create = kde_decoration_create,
+};
+static void kde_decoration_manager_bind(struct wl_client *c, void *data,
+                                        uint32_t version, uint32_t id) {
+    (void)data; (void)version;
+    struct wl_resource *r = wl_resource_create(c,
+        &org_kde_kwin_server_decoration_manager_interface, 1, id);
+    if (!r) { wl_client_post_no_memory(c); return; }
+    wl_resource_set_implementation(r, &kde_decoration_manager_impl, NULL, NULL);
+    org_kde_kwin_server_decoration_manager_send_default_mode(r,
+        ORG_KDE_KWIN_SERVER_DECORATION_MANAGER_MODE_SERVER);
+    fprintf(stderr, "[waylandd] KDE decoration manager default=server\n");
 }
 
 /* ---------------- wp_viewporter (stub for SDL3) ---------------- */
@@ -2597,6 +2693,7 @@ int main(int argc, char **argv)
     if (!wl_global_create(g_display, &wl_seat_interface, 5, NULL, seat_bind)) return 1;
     if (!wl_global_create(g_display, &wl_output_interface, 3, NULL, output_bind)) return 1;
     if (!wl_global_create(g_display, &zxdg_decoration_manager_v1_interface, 1, NULL, deco_mgr_bind)) return 1;
+    if (!wl_global_create(g_display, &org_kde_kwin_server_decoration_manager_interface, 1, NULL, kde_decoration_manager_bind)) return 1;
     if (!wl_global_create(g_display, &wp_viewporter_interface, 1, NULL, viewporter_bind)) return 1;
     if (!wl_global_create(g_display, &wl_subcompositor_interface, 1, NULL, subcomp_bind)) return 1;
     if (!wl_global_create(g_display, &wl_data_device_manager_interface, 3, NULL, ddm_bind)) return 1;

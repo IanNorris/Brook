@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Settings
+Exec=brook-settings
+Icon=brook-settings
+Categories=Settings;DesktopSettings;
+StartupWMClass=brook-settings

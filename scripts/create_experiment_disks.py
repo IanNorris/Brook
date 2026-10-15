@@ -136,6 +136,9 @@ def main():
         run("cp", "-a", "--no-preserve=ownership", str(profile), str(nix_root / "profile"))
         (nix_root / "bin").mkdir()
         install_package_tools(nix_root, manifest)
+        if not args.bootstrap_mode:
+            run("python3", str(ROOT / "scripts/collect_desktop_entries.py"),
+                str(nix_root / "store"), str(nix_root / "share/applications"))
         (nix_root / "etc").mkdir(exist_ok=True)
         shutil.copy2(ROOT / "data/asound.conf", nix_root / "etc/asound.conf")
         shutil.copy2(ROOT / "data/config/alsoft-oss.conf", nix_root / "etc/alsoft-oss.conf")

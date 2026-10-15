@@ -347,3 +347,46 @@ The portable probe checks interval clearing for SIGEV_NONE, and checks both
 zero interval and zero remaining time plus absence of delivery on SIGEV_SIGNAL.
 Brook returns zero remaining time for either disarmed mode; it does not emulate
 the stale-countdown optimization.
+
+
+### Live task directories (`proctaskcheck.c`)
+
+Build with `cc -std=c11 -Wall -Wextra -Werror -pthread proctaskcheck.c -o proctaskcheck`.
+Run on Linux as a reference and then in Brook. The test checks the Chromium
+`fstatat(proc_fd, "self/task/", ...)` contract: `st_nlink == 2 + live threads`,
+thread appearance/disappearance, TGID-correct `self` versus `thread-self`, task
+status identity, exclusion of a foreign process, and held-directory enumeration
+and fstat across 32 subsequent process births. `observed_reuse` reports actual
+PID reuse; a run without reuse does not prove reuse isolation.
+
+Task enumeration and fstat are tied to the group/process incarnation and cannot
+retarget a reused numeric PID. **Unverified and not fixed here:** relative
+`openat`/`fstatat` through an old directory FD still use the generic saved-path
+resolver, which does not carry the vnode generation into path traversal. That
+requires a separate VFS/dirfd fix. The existing pid file generators are reused;
+this does not make their approximate memory maps a complete Linux maps view.
+The stale-directory fstat check permits Brook's existing EBADF translation of a
+failed vnode stat, as well as ENOENT/ESRCH or an unchanged original inode; it
+checks that the FD never acquires the reused process's identity.
+
+Chromium's primary implementation is
+[thread_helpers.cc](https://raw.githubusercontent.com/chromium/chromium/main/sandbox/linux/services/thread_helpers.cc).
+Brook inotify calls currently return ENOSYS; no inotify sysctl limits are exposed
+because there is no backed watch/instance/event capacity to report.
+
+
+`largepayload.c` + `largepayload.S` create a 40 MiB file-backed executable (not
+just BSS); build both together. Run it directly through the kernel shell, then
+run `largeexeccheck /path/to/largepayload` to check execve and seven malformed
+images while a live sibling remains intact. The checker needs `-pthread`.
+Payload success intentionally exits 37 after printing its checksum.
+
+`fileidentitycheck /tmp` and `fileidentitycheck /data` compare independent open
+file descriptions, path stats, cached 128 KiB files, dup/fork and distinct memfd
+objects. The directory argument must be writable; fixtures are removed. FAT
+rename/recreate persistent inode semantics are outside this probe's contract.
+
+`wmoverflowcheck [count]` is a Brook-only visual fixture creating 20 windows by
+default (2–28 allowed). It holds them for at most 300 seconds so the taskbar's
+hidden-window navigation can be clicked and observed; SIGTERM can end it early.
+It is not an automated UI acceptance test.

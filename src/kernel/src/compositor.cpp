@@ -1281,6 +1281,14 @@ static void CompositorLoopWM()
     // Apply movement/focus/resize before rendering either chrome or content.
     // GPU composition later samples chrome using the current window geometry.
     CompositorInputWM();
+    // Consume a worker-built launcher only after clicks against the old frame
+    // are handled. One snapshot then serves geometry, render and GPU compose.
+    if (WmLauncherApplyPending()) {
+        if (g_overlayBuffer)
+            OverlayClearRect(0, 0, static_cast<int>(g_physFbWidth), static_cast<int>(g_physFbHeight));
+        g_overlayLauncherShown = false;
+        CompositorMarkDirty();
+    }
     uint64_t now = g_lapicTickCount;
     bool forceAll = (now - g_lastForceBlitTick >= FORCE_BLIT_INTERVAL_MS);
     if (forceAll) g_lastForceBlitTick = now;

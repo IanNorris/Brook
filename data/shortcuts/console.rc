@@ -1,3 +1,4 @@
 # title: Console
+# Requires: /nix/bin/brook-console
 # desc: Kernel log console viewer
 source /boot/SCRIPTS/wayland_console.rc

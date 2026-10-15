@@ -1,3 +1,4 @@
 # title: LibreOffice
+# Requires: /nix/bin/brook-office
 # desc: LibreOffice Writer
 source /boot/SCRIPTS/wayland_libreoffice.rc

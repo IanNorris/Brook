@@ -425,3 +425,28 @@ fixed bound with an explicit error. Add boundary and exhaustion/recovery checks
 where failures could corrupt state or silently change results. Record remaining
 limits and make advertised capabilities agree with actual implementation.
 Do not resolve the audit by raising every constant indiscriminately.
+
+
+## Desktop settings and package discovery (requested 15 October 2026)
+
+- Show real application icons in window chrome, the launcher and an icon-based
+  taskbar, with readable hover labels and focus/minimized indicators. Preserve
+  Wayland application IDs so documents with changing titles retain the right icon.
+- Provide shared desktop themes and a Settings app with a window-chrome preview.
+  Save the selected theme as persistent user settings and restore it on boot;
+  missing or invalid settings must fall back to the default theme. Theme the
+  Brook desktop surfaces consistently; third-party toolkit themes are separate.
+- Generate the launcher from installed applications, validate executable targets,
+  and suppress unavailable custom shortcuts. Refresh safely after install/remove,
+  without doing filesystem scans in the compositor or freeing icons it is using.
+- Add a Nix-backed graphical app store: search/browse available packages, show
+  installed state, install/remove with progress and actionable errors, and launch
+  installed desktop applications. Reuse the real package installer and its
+  dependency handling. Verify large-package failure/retry, cancellation, disk
+  exhaustion, launcher updates, and persistence across reboot.
+
+Icons, theme switching/persistence, installed-profile discovery and safe live
+launcher refresh passed guest acceptance on 15 October; see
+[desktop-settings.md](desktop-settings.md). The graphical app store, runtime
+conversion of icons not preconverted by the image builder, terminal-only
+desktop-entry launching and smaller-display acceptance remain outstanding.

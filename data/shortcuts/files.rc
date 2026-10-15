@@ -1,3 +1,4 @@
 # title: Files
+# Requires: /nix/bin/brook-files
 # desc: Browse files and directories
 source /boot/SCRIPTS/wayland_files.rc

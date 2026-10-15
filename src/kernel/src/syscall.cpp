@@ -11378,6 +11378,37 @@ static int64_t sys_brook_wm_present_gres(uint64_t wmId, uint64_t gres,
                                         static_cast<uint32_t>(h)) ? 0 : -ENOENT;
 }
 
+// 0xB03: notify the desktop that installed application metadata changed.
+static int64_t sys_brook_wm_refresh_apps(uint64_t, uint64_t, uint64_t,
+                                        uint64_t, uint64_t, uint64_t)
+{
+    if (!ProcessCurrent()) return -ESRCH;
+    brook::WmRequestLauncherRefresh();
+    return 0;
+}
+
+// 0xB02: desktop theme query (op 0) or select immutable named palette (op 1).
+static int64_t sys_brook_wm_theme(uint64_t op, uint64_t theme,
+                                 uint64_t, uint64_t, uint64_t, uint64_t)
+{
+    if (!ProcessCurrent()) return -ESRCH;
+    if (op == 0) return brook::WmGetTheme();
+    if (op != 1 || theme > 0xffffffffULL) return -EINVAL;
+    return brook::WmSetTheme(static_cast<uint32_t>(theme)) ? 0 : -EINVAL;
+}
+
+// 0xB01: WM_SET_APP_ID(wmId, appId*) — metadata for an owned window.
+static int64_t sys_brook_wm_set_app_id(uint64_t wmId, uint64_t appIdPtr,
+                                      uint64_t, uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    if (!wmId || wmId > 0xffffffffULL || !appIdPtr) return -EINVAL;
+    char appId[128] = {};
+    if (!CopyUserCString(appIdPtr, appId, sizeof(appId))) return -EFAULT;
+    return brook::WmSetAppIdById(proc, static_cast<uint32_t>(wmId), appId) ? 0 : -ENOENT;
+}
+
 // 509: WM_SET_TITLE(wmId, title*)
 static int64_t sys_brook_wm_set_title(uint64_t wmId, uint64_t titlePtr,
                                        uint64_t, uint64_t, uint64_t, uint64_t)
@@ -13740,6 +13771,9 @@ void SyscallTableInit()
     // Brook windowing extensions live in a high 0xB00 block, clear of the Linux
     // and Windows syscall ranges.
     g_syscallTable[0xB00]                = sys_brook_wm_set_window_properties; // WM_SET_WINDOW_PROPERTIES
+    g_syscallTable[0xB01]                = sys_brook_wm_set_app_id;
+    g_syscallTable[0xB02]                = sys_brook_wm_theme;
+    g_syscallTable[0xB03]                = sys_brook_wm_refresh_apps;
     // App-GPU (per-process virgl) syscalls for userspace GL rendering.
     g_syscallTable[0xB10]                = sys_brook_gpu_ctx_create;       // GPU_CTX_CREATE
     g_syscallTable[0xB11]                = sys_brook_gpu_resource_create;  // GPU_RESOURCE_CREATE

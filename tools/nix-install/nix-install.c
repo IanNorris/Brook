@@ -31,6 +31,7 @@
 #define MANIFEST_PATH   "/nix/profile/manifest.tsv"
 #define PROFILE_BIN     "/nix/profile/bin"
 #define PROFILE_LIB     "/nix/profile/lib"
+#define PROFILE_APPS    "/nix/profile/share/applications"
 #define APPS_DIR        "/nix/share/applications"
 #define APPS_IDX        "/nix/share/applications/applications.idx"
 #define APPS_ICONS_DIR  "/nix/share/applications/icons"
@@ -383,6 +384,48 @@ static int remove_from_manifest(const char *name) {
  * /nix/profile/store/... and the kernel's VFS correctly reported the
  * path as non-existent, which caused execve to fall back to busybox
  * and every installed binary to exit 127. */
+static int link_package_desktops(const char *store_name) {
+    char source[1024];
+    snprintf(source,sizeof(source),"/nix/store/%s/share/applications",store_name);
+    DIR *directory=opendir(source);
+    if (!directory) return 0;
+    mkdir_p(PROFILE_APPS);
+    struct dirent *entry;int linked=0;
+    while ((entry=readdir(directory))) {
+        size_t length=strlen(entry->d_name);
+        if (length<9 || strcmp(entry->d_name+length-8,".desktop")) continue;
+        char target[1536],destination[1024];
+        snprintf(target,sizeof(target),"../../../store/%s/share/applications/%s",store_name,entry->d_name);
+        snprintf(destination,sizeof(destination),"%s/%s",PROFILE_APPS,entry->d_name);
+        char existing[1536];ssize_t n=readlink(destination,existing,sizeof(existing)-1);
+        if (n>0) { existing[n]=0;if (!strcmp(existing,target)) continue; }
+        unlink(destination);
+        if (!symlink(target,destination)) ++linked;
+    }
+    closedir(directory);return linked;
+}
+
+static int unlink_package_desktops(const char *store_name) {
+    DIR *directory=opendir(PROFILE_APPS);
+    if (!directory) return 0;
+    char absolute[1024],relative[1024];
+    snprintf(absolute,sizeof(absolute),"/nix/store/%s/",store_name);
+    snprintf(relative,sizeof(relative),"../../../store/%s/",store_name);
+    struct dirent *entry;int removed=0;
+    while ((entry=readdir(directory))) {
+        if (entry->d_name[0]=='.') continue;
+        char path[1024],target[1536];
+        snprintf(path,sizeof(path),"%s/%s",PROFILE_APPS,entry->d_name);
+        ssize_t n=readlink(path,target,sizeof(target)-1);
+        if (n<=0) continue;
+        target[n]=0;
+        if (!strncmp(target,absolute,strlen(absolute)) || !strncmp(target,relative,strlen(relative))) {
+            if (!unlink(path)) ++removed;
+        }
+    }
+    closedir(directory);return removed;
+}
+
 static int link_package_bins(const char *store_name) {
     char bin_dir[512];
     snprintf(bin_dir, sizeof(bin_dir), "/nix/store/%s/bin", store_name);
@@ -559,6 +602,9 @@ static int unlink_package_bins(const char *store_name) {
     char prefix[512];
     snprintf(prefix, sizeof(prefix), "/nix/store/%s/", store_name);
     size_t prefix_len = strlen(prefix);
+    char relative_prefix[512];
+    snprintf(relative_prefix,sizeof(relative_prefix),"../../store/%s/",store_name);
+    size_t relative_len=strlen(relative_prefix);
 
     struct dirent *ent;
     int removed = 0;
@@ -572,7 +618,8 @@ static int unlink_package_bins(const char *store_name) {
         ssize_t n = readlink(path, target, sizeof(target) - 1);
         if (n > 0) {
             target[n] = '\0';
-            if (strncmp(target, prefix, prefix_len) == 0) {
+            if (strncmp(target, prefix, prefix_len) == 0 ||
+                strncmp(target, relative_prefix, relative_len) == 0) {
                 unlink(path);
                 removed++;
             }
@@ -679,36 +726,78 @@ static int parse_desktop_entry(const char *path, char *name, size_t name_sz,
     return 0;
 }
 
+static int desktop_exec_exists(const char *command)
+{
+    char binary[1024];
+    const char *p=command;
+    while (*p==' ' || *p=='\t') ++p;
+    char quote=(*p=='"' || *p=='\'')?*p++:0;
+    size_t n=0;
+    while (*p && (quote?*p!=quote:(*p!=' ' && *p!='\t'))) {
+        if (n+1>=sizeof(binary)) return 0;
+        binary[n++]=*p++;
+    }
+    binary[n]=0;
+    if (!n) return 0;
+    struct stat st;
+    if (binary[0]=='/') {
+        if (stat(binary,&st)!=0 || !S_ISREG(st.st_mode) || access(binary,X_OK)!=0) return 0;
+        /* Removed packages remain in the store as cache/dependencies. An
+         * absolute desktop Exec must still be exposed by the active profile. */
+        if (strncmp(binary,"/nix/store/",11)==0) {
+            const char *base=strrchr(binary,'/');
+            char active[1200];struct stat exposed;
+            snprintf(active,sizeof(active),"%s/%s",PROFILE_BIN,base?base+1:binary);
+            return stat(active,&exposed)==0 && exposed.st_dev==st.st_dev && exposed.st_ino==st.st_ino;
+        }
+        return 1;
+    }
+    const char *directories[]={PROFILE_BIN,"/nix/bin"};
+    char path[1200];
+    for (size_t i=0;i<sizeof(directories)/sizeof(directories[0]);++i) {
+        snprintf(path,sizeof(path),"%s/%s",directories[i],binary);
+        if (stat(path,&st)==0 && S_ISREG(st.st_mode) && access(path,X_OK)==0) return 1;
+    }
+    return 0;
+}
+
 static void refresh_desktop_entries(void)
 {
     /* Ensure output directories exist */
     mkdir(APPS_DIR, 0755);
     mkdir(APPS_ICONS_DIR, 0755);
 
-    /* Scan nix store packages for .desktop files */
-    DIR *store = opendir("/nix/store");
-    if (!store) return;
+    /* Migrate packages installed by older tools that exported only bin/lib.
+     * Removed packages are absent from this manifest, even if cached in store. */
+    FILE *installed=fopen(MANIFEST_PATH,"r");
+    if (installed) {
+        char line[MAX_LINE];
+        while (fgets(line,sizeof(line),installed)) {
+            char *first=strchr(line,'\t'),*second=first?strchr(first+1,'\t'):NULL;
+            if (!second) continue;
+            char *store_name=second+1;
+            store_name[strcspn(store_name,"\t\r\n")]=0;
+            if (*store_name && !strchr(store_name,'/')) link_package_desktops(store_name);
+        }
+        fclose(installed);
+    }
+
+    /* The active profile is authoritative. Cached dependency/store paths are
+     * not evidence that an application is still installed. */
+    mkdir_p(PROFILE_APPS);
+    DIR *apps = opendir(PROFILE_APPS);
+    if (!apps) return;
 
     struct {
         char name[256];
         char exec_cmd[512];
         char icon_file[256];
         char categories[256];
+        char app_id[256];
     } entries[MAX_PACKAGES];
     int entry_count = 0;
     char seen_names[MAX_PACKAGES][256];
     int seen_count = 0;
-
-    struct dirent *pkg_ent;
-    while ((pkg_ent = readdir(store)) != NULL && entry_count < MAX_PACKAGES) {
-        if (pkg_ent->d_name[0] == '.') continue;
-
-        char apps_path[1024];
-        snprintf(apps_path, sizeof(apps_path),
-                 "/nix/store/%s/share/applications", pkg_ent->d_name);
-
-        DIR *apps = opendir(apps_path);
-        if (!apps) continue;
 
         struct dirent *de;
         while ((de = readdir(apps)) != NULL && entry_count < MAX_PACKAGES) {
@@ -717,7 +806,7 @@ static void refresh_desktop_entries(void)
                 continue;
 
             char desktop_path[1536];
-            snprintf(desktop_path, sizeof(desktop_path), "%s/%s", apps_path, de->d_name);
+            snprintf(desktop_path, sizeof(desktop_path), "%s/%s", PROFILE_APPS, de->d_name);
 
             char name[256], exec_cmd[512], icon[256], categories[256];
             if (parse_desktop_entry(desktop_path, name, sizeof(name),
@@ -725,6 +814,8 @@ static void refresh_desktop_entries(void)
                                     icon, sizeof(icon),
                                     categories, sizeof(categories)) != 0)
                 continue;
+
+            if (!desktop_exec_exists(exec_cmd)) continue;
 
             /* Use the deployed Brook wrapper without changing the stock closure.
              * Its XDG state lives on ext2, rather than the boot FAT filesystem. */
@@ -767,24 +858,31 @@ static void refresh_desktop_entries(void)
             snprintf(entries[entry_count].exec_cmd, 512, "%s", exec_cmd);
             snprintf(entries[entry_count].icon_file, 256, "%s", icon_file);
             snprintf(entries[entry_count].categories, 256, "%s", categories);
+            snprintf(entries[entry_count].app_id, 256, "%.*s", (int)(nlen-8), de->d_name);
             entry_count++;
         }
         closedir(apps);
-    }
-    closedir(store);
 
     /* Write applications.idx */
-    FILE *idx = fopen(APPS_IDX, "w");
+    FILE *idx = fopen(APPS_IDX ".new", "w");
     if (!idx) {
         fprintf(stderr, "Warning: could not write %s\n", APPS_IDX);
         return;
     }
     for (int i = 0; i < entry_count; i++) {
-        fprintf(idx, "%s\t%s\t%s\t%s\n",
+        fprintf(idx, "%s\t%s\t%s\t%s\t%s\n",
                 entries[i].name, entries[i].exec_cmd,
-                entries[i].icon_file, entries[i].categories);
+                entries[i].icon_file, entries[i].categories, entries[i].app_id);
     }
-    fclose(idx);
+    int published = fflush(idx)==0;
+    if (published && fsync(fileno(idx))!=0) published=0;
+    if (fclose(idx)!=0) published=0;
+    if (!published || rename(APPS_IDX ".new",APPS_IDX)!=0) {
+        fprintf(stderr,"Warning: could not publish launcher manifest: %s\n",strerror(errno));
+        unlink(APPS_IDX ".new");return;
+    }
+    /* Notification only: the compositor never scans the filesystem here. */
+    (void)syscall(0xB03L);
 
     if (entry_count > 0)
         printf("  Updated launcher: %d app(s) in %s\n", entry_count, APPS_IDX);
@@ -828,6 +926,7 @@ static int cmd_install(const char *name) {
             return 1;
         }
         int linked = link_package_bins(existing_store);
+        link_package_desktops(existing_store);
         int lib_linked = link_package_libs(existing_store);
         lib_linked += link_closure_libs_from_narinfo(existing_store);
         int rpath_linked = link_closure_libs_into_package(existing_store);
@@ -838,11 +937,7 @@ static int cmd_install(const char *name) {
             printf("  re-linked %d library file(s) in %s\n", lib_linked, PROFILE_LIB);
         if (rpath_linked > 0)
             printf("  re-linked %d runtime library file(s) beside package binaries\n", rpath_linked);
-        /* Also refresh a previously installed STK entry after deploying its wrapper. */
-        if (access("/nix/stk-play.sh", R_OK) == 0 &&
-            (strcmp(name, "supertuxkart") == 0 ||
-             strncmp(name, "supertuxkart-", 13) == 0))
-            refresh_desktop_entries();
+        refresh_desktop_entries();
         return 0;
     }
 
@@ -930,6 +1025,7 @@ static int cmd_install(const char *name) {
 
     /* Link binaries */
     int linked = link_package_bins(pkg.store_name);
+    link_package_desktops(pkg.store_name);
     int lib_linked = link_package_libs(pkg.store_name);
     lib_linked += link_closure_libs_from_narinfo(pkg.store_name);
     int rpath_linked = link_closure_libs_into_package(pkg.store_name);
@@ -979,6 +1075,7 @@ static int cmd_remove(const char *name) {
     /* Remove symlinks */
     if (store_name[0]) {
         unlink_package_bins(store_name);
+        unlink_package_desktops(store_name);
         unlink_package_libs(store_name);
     }
 

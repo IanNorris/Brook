@@ -1,3 +1,4 @@
 # title: Mousepad
+# Requires: /nix/store/n7gxslgrhr7kmwgxigsys49davanf2c6-mousepad-0.7.0/bin/mousepad
 # desc: GTK text editor
 source /boot/SCRIPTS/wayland_mousepad.rc

@@ -1,3 +1,4 @@
 # title: GIMP
+# Requires: /nix/bin/gimp
 # desc: GNU Image Manipulation Program
 source /boot/SCRIPTS/wayland_gimp.rc

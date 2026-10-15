@@ -6,6 +6,8 @@
 
 #include "window.h"
 #include "process.h"
+#include "scheduler.h"
+#include "spinlock.h"
 #include "compositor.h"
 #include "font_atlas.h"
 #include "input.h"
@@ -27,21 +29,178 @@ namespace brook {
 // State
 // ---------------------------------------------------------------------------
 
+static uint32_t g_themeId = BROOK_THEME_BROOK;
+static bool g_themeSettingsLoaded = false;
+uint32_t WmGetTheme() { return __atomic_load_n(&g_themeId, __ATOMIC_ACQUIRE); }
+const WmPalette& WmCurrentPalette() { return *brook_theme_palette(WmGetTheme()); }
+bool WmSetTheme(uint32_t theme)
+{
+    if (!brook_theme_palette(theme)) return false;
+    __atomic_store_n(&g_themeId, theme, __ATOMIC_RELEASE);
+    CompositorMarkDirty();
+    CompositorWake();
+    return true;
+}
+
+// Startup I/O runs in the shell's activation path, never during rendering.
+// Accept only a complete bounded file and an exact supported numeric ID.
+static void WmRestoreTheme()
+{
+    if (g_themeSettingsLoaded) return;
+    g_themeSettingsLoaded = true;
+    uint32_t selected = BROOK_THEME_BROOK;
+    Vnode* vn = VfsOpen("/data/home/.config/brook/settings.ini", 0);
+    if (vn)
+    {
+        char buf[513]; uint32_t done = 0; uint64_t offset = 0;
+        bool failed = false;
+        while (done < sizeof(buf))
+        {
+            int rd = VfsRead(vn, buf + done, sizeof(buf) - done, &offset);
+            if (rd < 0) { failed = true; break; }
+            if (!rd) break;
+            done += static_cast<uint32_t>(rd);
+        }
+        VfsClose(vn);
+        if (!failed && done < sizeof(buf))
+        {
+            buf[done] = 0;
+            bool desktopSection = false;
+            for (char* line = buf; *line;)
+            {
+                char* end = line; while (*end && *end != '\n') ++end;
+                bool more = *end != 0; *end = 0;
+                char* p = line; while (*p == ' ' || *p == '\t') ++p;
+                if (*p == '[')
+                {
+                    desktopSection = strncmp(p, "[Desktop]", 9) == 0;
+                    if (desktopSection) {
+                        p += 9;
+                        while (*p == ' ' || *p == '\t' || *p == '\r') ++p;
+                        desktopSection = !*p;
+                    }
+                }
+                else if (desktopSection && strncmp(p, "theme=", 6) == 0)
+                {
+                    p += 6;
+                    if (*p >= '0' && *p < '0' + BROOK_THEME_COUNT)
+                    {
+                        uint32_t value = *p++ - '0';
+                        while (*p == ' ' || *p == '\t' || *p == '\r') ++p;
+                        selected = !*p ? value : BROOK_THEME_BROOK;
+                    }
+                    else selected = BROOK_THEME_BROOK;
+                }
+                if (!more) break;
+                line = end + 1;
+            }
+        }
+    }
+    WmSetTheme(selected);
+}
+
 static Window   g_windows[WM_MAX_WINDOWS] = {};
 static bool     g_wmActive = false;
 static int      g_focusedIdx = -1;
 static uint32_t g_nextZOrder = 1;  // 0 = backmost, higher = front
 
-// App launcher state (implementation at bottom of file)
-static LauncherItem g_launcherItems[WM_LAUNCHER_MAX_ITEMS] = {};
-static uint32_t     g_launcherCount = 0;
-static bool         g_launcherOpen  = false;
-static bool         g_launcherLoaded = false;
-static uint32_t     g_launcherScroll = 0; // first visible item index
+// Immutable launcher payloads. Only refs change after publication. The single
+// maintenance worker owns building/pending/retired lifetimes; no renderer does
+// VFS I/O or frees icon memory. The compositor alone swaps an active snapshot.
+struct LauncherSnapshot {
+    LauncherItem items[WM_LAUNCHER_MAX_ITEMS];
+    uint32_t count;
+    uint32_t generation;
+    uint32_t refs;
+    uint32_t* applicationIcon;
+    uint32_t* terminalIcon;
+    uint32_t* appsIcon;
+};
+static LauncherSnapshot g_emptyLauncher = {};
+static LauncherSnapshot* g_launcherActive = &g_emptyLauncher;
+static LauncherSnapshot* g_launcherPending = nullptr;
+static LauncherSnapshot* g_launcherRetired = nullptr;
+static SpinLock g_launcherLock;
+static uint32_t g_launcherRequested = 1;
+static bool g_launcherWorkerStarted = false;
+static bool g_launcherLoaded = false;
+static bool g_launcherOpen = false;
+static uint32_t g_launcherScroll = 0;
+static void LauncherStartWorker();
+
+class LauncherReadGuard {
+    LauncherSnapshot* snapshot;
+public:
+    LauncherReadGuard() {
+        SpinLockAcquire(&g_launcherLock);
+        snapshot = g_launcherActive;
+        __atomic_fetch_add(&snapshot->refs, 1u, __ATOMIC_RELAXED);
+        SpinLockRelease(&g_launcherLock);
+    }
+    ~LauncherReadGuard() { __atomic_fetch_sub(&snapshot->refs, 1u, __ATOMIC_RELEASE); }
+    const LauncherSnapshot& get() const { return *snapshot; }
+    LauncherReadGuard(const LauncherReadGuard&) = delete;
+    LauncherReadGuard& operator=(const LauncherReadGuard&) = delete;
+};
+
+void WmRequestLauncherRefresh()
+{
+    __atomic_fetch_add(&g_launcherRequested, 1u, __ATOMIC_RELEASE);
+}
+
+bool WmLauncherApplyPending()
+{
+    SpinLockAcquire(&g_launcherLock);
+    if (!g_launcherPending || g_launcherRetired) {
+        SpinLockRelease(&g_launcherLock);
+        return false;
+    }
+    LauncherSnapshot* previous = g_launcherActive;
+    g_launcherActive = g_launcherPending;
+    g_launcherPending = nullptr;
+    if (previous != &g_emptyLauncher) g_launcherRetired = previous;
+    const uint32_t count = g_launcherActive->count;
+    const uint32_t generation = g_launcherActive->generation;
+    SpinLockRelease(&g_launcherLock);
+    g_launcherScroll = 0;
+    SerialPrintf("WM: launcher published generation=%u items=%u\n", generation, count);
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+struct WmRect
+{
+    int x, y, w, h;
+    bool contains(int px, int py) const
+    { return w > 0 && h > 0 && px >= x && py >= y && px < x + w && py < y + h; }
+};
+
+// Index 0 is close, 1 maximize/restore, 2 minimize. Rendering and input
+// intentionally use the same full-height rectangular control cells.
+static WmRect CaptionRect(const Window& w, int index)
+{
+    int width = static_cast<int>(WM_BUTTON_WIDTH);
+    if (width * 3 > w.clientW) width = w.clientW / 3;
+    return {w.x + w.outerWidth() - static_cast<int>(WM_BORDER_WIDTH) -
+            WM_BTN_RIGHT_PAD - (index + 1) * width,
+            w.y + static_cast<int>(WM_BORDER_WIDTH), width,
+            static_cast<int>(WM_TITLE_BAR_HEIGHT)};
+}
+
+static int WmTextWidth(const char* text)
+{
+    int width = 0;
+    for (; *text; ++text)
+    {
+        uint32_t code = static_cast<uint8_t>(*text);
+        if (code >= g_fontAtlas.firstChar && code < g_fontAtlas.firstChar + g_fontAtlas.glyphCount)
+            width += g_fontAtlas.glyphs[code - g_fontAtlas.firstChar].advance;
+    }
+    return width;
+}
 
 static void WmStrCopy(char* dst, const char* src, uint32_t maxLen)
 {
@@ -69,48 +228,6 @@ static void WmFillRect(uint32_t* buf, uint32_t stride,
     for (int y = y0; y < y0 + h; ++y)
         for (int x = x0; x < x0 + w; ++x)
             WmPutPixel(buf, stride, screenW, screenH, x, y, color);
-}
-
-// Linear interpolate between two 0x00RRGGBB colours by num/den (integer-only,
-// no FP — the kernel builds with -mno-sse). Used for the glassy titlebar gradient.
-static inline uint32_t WmLerpColor(uint32_t a, uint32_t b, int num, int den)
-{
-    if (den <= 0) return a;
-    int ar = (a >> 16) & 0xff, ag = (a >> 8) & 0xff, ab = a & 0xff;
-    int br = (b >> 16) & 0xff, bg = (b >> 8) & 0xff, bb = b & 0xff;
-    int r = ar + (br - ar) * num / den;
-    int g = ag + (bg - ag) * num / den;
-    int bl = ab + (bb - ab) * num / den;
-    return (static_cast<uint32_t>(r) << 16) | (static_cast<uint32_t>(g) << 8)
-         | static_cast<uint32_t>(bl);
-}
-
-// Fill a rectangle with rounded corners (radius r).
-static void WmFillRoundedRect(uint32_t* buf, uint32_t stride,
-                               uint32_t screenW, uint32_t screenH,
-                               int x0, int y0, int w, int h,
-                               int r, uint32_t color)
-{
-    int r2 = r * r;
-    for (int dy = 0; dy < h; ++dy)
-    {
-        int py = y0 + dy;
-        for (int dx = 0; dx < w; ++dx)
-        {
-            // Check if pixel is in a corner region that should be clipped
-            bool skip = false;
-            // Top-left
-            if (dx < r && dy < r && (r - dx) * (r - dx) + (r - dy) * (r - dy) > r2) skip = true;
-            // Top-right
-            if (dx >= w - r && dy < r && (dx - (w - r - 1)) * (dx - (w - r - 1)) + (r - dy) * (r - dy) > r2) skip = true;
-            // Bottom-left
-            if (dx < r && dy >= h - r && (r - dx) * (r - dx) + (dy - (h - r - 1)) * (dy - (h - r - 1)) > r2) skip = true;
-            // Bottom-right
-            if (dx >= w - r && dy >= h - r && (dx - (w - r - 1)) * (dx - (w - r - 1)) + (dy - (h - r - 1)) * (dy - (h - r - 1)) > r2) skip = true;
-            if (!skip)
-                WmPutPixel(buf, stride, screenW, screenH, x0 + dx, py, color);
-        }
-    }
 }
 
 // Render a single glyph from g_fontAtlas at (penX, penY) into buffer.
@@ -184,6 +301,106 @@ static void WmRenderString(uint32_t* buf, uint32_t stride,
     }
 }
 
+static bool WmEqualI(const char* a, const char* b)
+{
+    if (!a || !b) return false;
+    while (*a && *b)
+    {
+        char ac = *a++, bc = *b++;
+        if (ac >= 'A' && ac <= 'Z') ac += 'a' - 'A';
+        if (bc >= 'A' && bc <= 'Z') bc += 'a' - 'A';
+        if (ac != bc) return false;
+    }
+    return !*a && !*b;
+}
+
+static const char* WmBaseName(const char* path)
+{
+    const char* name = path;
+    for (; *path; ++path) if (*path == '/') name = path + 1;
+    return name;
+}
+
+static bool WmTitleHasAppName(const char* title, const char* name)
+{
+    if (!name[0]) return false;
+    for (const char* start = title; *start; ++start)
+    {
+        if (start != title && start[-1] != ' ' && start[-1] != '-') continue;
+        const char *a = start, *b = name;
+        while (*a && *b)
+        {
+            char ac = *a, bc = *b;
+            if (ac >= 'A' && ac <= 'Z') ac += 'a' - 'A';
+            if (bc >= 'A' && bc <= 'Z') bc += 'a' - 'A';
+            if (ac != bc) break;
+            ++a; ++b;
+        }
+        if (!*b && (!*a || *a == ' ' || *a == '-')) return true;
+    }
+    return false;
+}
+
+static const uint32_t* WindowIcon(const Window& w, const LauncherSnapshot& launcher)
+{
+    if (WmEqualI(w.appId, "terminal")) return launcher.terminalIcon ? launcher.terminalIcon : launcher.applicationIcon;
+    // Explicit desktop identity takes precedence over executable/name guesses.
+    for (uint32_t i = 0; i < launcher.count; ++i)
+    {
+        const LauncherItem& item = launcher.items[i];
+        if (item.valid && item.iconPixels && w.appId[0] && item.appId[0] && WmEqualI(w.appId, item.appId))
+            return item.iconPixels;
+    }
+    const char* executable = w.proc ? WmBaseName(w.proc->exePath) : "";
+    for (uint32_t i = 0; i < launcher.count; ++i)
+    {
+        const LauncherItem& item = launcher.items[i];
+        if (!item.valid || !item.iconPixels || !item.executable[0]) continue;
+        if ((w.appId[0] && WmEqualI(w.appId, item.executable)) ||
+            (executable[0] && WmEqualI(executable, item.executable))) return item.iconPixels;
+    }
+    // Legacy native windows have no app_id. Their title is only a last resort;
+    // an unknown explicit ID must not acquire another app's icon by title.
+    if (!w.appId[0])
+    {
+        if (w.proc && TerminalFindByProcess(w.proc)) return launcher.terminalIcon ? launcher.terminalIcon : launcher.applicationIcon;
+        for (uint32_t i = 0; i < launcher.count; ++i)
+            if (launcher.items[i].valid && launcher.items[i].iconPixels &&
+                WmTitleHasAppName(w.title, launcher.items[i].title)) return launcher.items[i].iconPixels;
+    }
+    return launcher.applicationIcon;
+}
+
+// Shared straight-alpha ARGB renderer. No VFS access or ownership transfer in
+// the compositor path; icons are immutable for the launcher's lifetime.
+static void WmDrawIcon(uint32_t* buf, uint32_t stride, uint32_t screenW, uint32_t screenH,
+                       int x, int y, int size, const uint32_t* pixels)
+{
+    if (pixels)
+    {
+        for (int row = 0; row < size; ++row)
+            for (int col = 0; col < size; ++col)
+            {
+                const int px = x + col, py = y + row;
+                if (px < 0 || py < 0 || px >= static_cast<int>(screenW) || py >= static_cast<int>(screenH)) continue;
+                const uint32_t src = pixels[(row * LAUNCHER_ICON_PX / size) * LAUNCHER_ICON_PX + col * LAUNCHER_ICON_PX / size];
+                const uint32_t alpha = src >> 24, inv = 255 - alpha;
+                if (!alpha) continue;
+                uint32_t& dst = buf[py * stride + px];
+                const uint32_t r = (((src >> 16) & 255) * alpha + ((dst >> 16) & 255) * inv + 127) / 255;
+                const uint32_t g = (((src >> 8) & 255) * alpha + ((dst >> 8) & 255) * inv + 127) / 255;
+                const uint32_t b = ((src & 255) * alpha + (dst & 255) * inv + 127) / 255;
+                dst = (r << 16) | (g << 8) | b;
+            }
+        return;
+    }
+    // Missing asset: a neutral application-window glyph, never a misleading
+    // letter tile or a guessed application logo.
+    WmFillRect(buf, stride, screenW, screenH, x + 2, y + 3, size - 4, size - 6, WmCurrentPalette().mutedText);
+    WmFillRect(buf, stride, screenW, screenH, x + 3, y + 7, size - 6, size - 11, WmCurrentPalette().itemHover);
+    WmFillRect(buf, stride, screenW, screenH, x + 5, y + 5, 2, 1, WmCurrentPalette().titleInactive);
+}
+
 // ---------------------------------------------------------------------------
 // API implementation
 // ---------------------------------------------------------------------------
@@ -214,6 +431,9 @@ bool WmIsActive()
 
 void WmSetActive(bool active)
 {
+    if (active) WmRestoreTheme();
+    if (active && !g_launcherLoaded) WmLauncherLoad();
+    if (active) LauncherStartWorker();
     g_wmActive = active;
     if (active)
         SerialPuts("WM: window manager mode enabled\n");
@@ -238,6 +458,7 @@ int WmCreateWindow(Process* proc, int16_t x, int16_t y,
 
     Window& w = g_windows[idx];
     w.proc = proc;
+    w.appId[0] = 0;
     w.x = x;
     w.y = y;
     w.clientW = clientW;
@@ -417,37 +638,17 @@ WmHitResult WmHitTest(int32_t mx, int32_t my)
         int relX = mx - wx;
         int relY = my - wy;
 
-        // Close button (top-right). The rectangular hot spot spans the full
-        // button cell, which bounds the slanted parallelogram (incl. its slant
-        // overhang) plus WM_BTN_RIGHT_PAD; the slanted area is fully clickable.
-        int closeBtnX = ww - static_cast<int>(WM_BORDER_WIDTH) - WM_BTN_RIGHT_PAD - static_cast<int>(WM_BUTTON_WIDTH);
-        if (relY < static_cast<int>(WM_TITLE_BAR_HEIGHT) &&
-            relX >= closeBtnX && relX < closeBtnX + static_cast<int>(WM_BUTTON_WIDTH))
+        const WmHitZone captionZones[] = {WmHitZone::CloseButton,
+            WmHitZone::MaximizeButton, WmHitZone::MinimizeButton};
+        for (int button = 0; button < 3; ++button)
         {
-            result.zone = WmHitZone::CloseButton;
-            return result;
+            if (CaptionRect(w, button).contains(mx, my))
+            {
+                result.zone = captionZones[button];
+                return result;
+            }
         }
-
-        // Maximize button (left of close)
-        int maxBtnX = closeBtnX - static_cast<int>(WM_BUTTON_WIDTH);
-        if (relY < static_cast<int>(WM_TITLE_BAR_HEIGHT) &&
-            relX >= maxBtnX && relX < maxBtnX + static_cast<int>(WM_BUTTON_WIDTH))
-        {
-            result.zone = WmHitZone::MaximizeButton;
-            return result;
-        }
-
-        // Minimize button (left of maximize)
-        int minBtnX = maxBtnX - static_cast<int>(WM_BUTTON_WIDTH);
-        if (relY < static_cast<int>(WM_TITLE_BAR_HEIGHT) &&
-            relX >= minBtnX && relX < minBtnX + static_cast<int>(WM_BUTTON_WIDTH))
-        {
-            result.zone = WmHitZone::MinimizeButton;
-            return result;
-        }
-
-        // Title bar (drag area)
-        if (relY < static_cast<int>(WM_TITLE_BAR_HEIGHT))
+        if (relY < static_cast<int>(WM_BORDER_WIDTH + WM_TITLE_BAR_HEIGHT))
         {
             result.zone = WmHitZone::TitleBar;
             return result;
@@ -823,180 +1024,71 @@ uint32_t WmGetZOrder(int* outIndices, uint32_t maxOut)
 // Chrome rendering
 // ---------------------------------------------------------------------------
 
-// Draw a filled circle at (cx, cy) with given radius and color
-[[maybe_unused]] static void WmFillCircle(uint32_t* buf, uint32_t stride,
-                          uint32_t screenW, uint32_t screenH,
-                          int cx, int cy, int radius, uint32_t color)
-{
-    int r2 = radius * radius;
-    for (int dy = -radius; dy <= radius; dy++)
-    {
-        int py = cy + dy;
-        if (py < 0 || py >= static_cast<int>(screenH)) continue;
-        for (int dx = -radius; dx <= radius; dx++)
-        {
-            if (dx * dx + dy * dy > r2) continue;
-            int px = cx + dx;
-            if (px < 0 || px >= static_cast<int>(screenW)) continue;
-            buf[py * stride + px] = color;
-        }
-    }
-}
-
-// Draw a caption button: a sheared parallelogram glass cell (vertical gradient)
-// with a faux-engraved bevel — a dark inner shadow along the top + left edges and
-// a light highlight along the bottom + right edges, so the button reads as carved
-// into the titlebar. The vertical sides are slanted by WM_BTN_SLANT (~20deg) for
-// character: the shape leans backward (top-right to bottom-left, "\"). Icon glyphs
-// are drawn by the caller, centred on the parallelogram.
-static void WmDrawCaptionButton(uint32_t* buf, uint32_t stride,
-                                uint32_t screenW, uint32_t screenH,
-                                int bx, int by, int bw, int bh,
-                                uint32_t top, uint32_t bot)
-{
-    int slant = WM_BTN_SLANT;
-    if (slant > bw - 2) slant = bw - 2;
-    int fillW = bw - slant;
-    int denom = (bh > 1) ? (bh - 1) : 1;
-    for (int r = 0; r < bh; ++r)
-    {
-        uint32_t rc = WmLerpColor(top, bot, r, bh - 1);
-        int lx = bx + slant * (denom - r) / denom;   // backward lean: top at bx+slant, bottom at bx
-        WmFillRect(buf, stride, screenW, screenH, lx, by + r, fillW, 1, rc);
-        // Slanted-side bevel: dark on the left edge, light on the right edge.
-        WmPutPixel(buf, stride, screenW, screenH, lx, by + r, WM_BTN_BEVEL_DARK);
-        WmPutPixel(buf, stride, screenW, screenH, lx + fillW - 1, by + r, WM_BTN_BEVEL_LIGHT);
-    }
-    // Horizontal bevel: dark top edge, light bottom edge (follow the slant).
-    WmFillRect(buf, stride, screenW, screenH, bx + slant, by, fillW, 1, WM_BTN_BEVEL_DARK);
-    WmFillRect(buf, stride, screenW, screenH, bx, by + bh - 1, fillW, 1, WM_BTN_BEVEL_LIGHT);
-}
-
-// Draw a 1px point with an engraved feel: a light highlight 1px below the dark
-// glyph pixel, so icons look carved into the glass button.
-static inline void WmEngravePixel(uint32_t* buf, uint32_t stride,
-                                  uint32_t screenW, uint32_t screenH,
-                                  int x, int y, uint32_t fg)
-{
-    WmPutPixel(buf, stride, screenW, screenH, x, y + 1, WM_BTN_BEVEL_LIGHT);
-    WmPutPixel(buf, stride, screenW, screenH, x, y, fg);
-}
-
 static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
                                 uint32_t screenW, uint32_t screenH,
                                 const Window& w,
                                 int32_t mouseX = -1, int32_t mouseY = -1)
 {
-    if (!buf || !stride || !screenW || !screenH) return;
-    if (w.noChrome) return;  // CSD: client draws its own chrome
-    if (!w.proc || !w.visible) return;  // skip destroyed/hidden windows
-    int wx = w.x;
-    int wy = w.y;
-    int ow = w.outerWidth();
-    int oh = w.outerHeight();
-
-    uint32_t borderCol = w.focused ? WM_BORDER_FOCUSED : WM_BORDER_UNFOCUSED;
-    uint32_t titleBg   = w.focused ? WM_TITLE_BG_FOCUSED : WM_TITLE_BG_UNFOCUSED;
-
-    // Borders
-    WmFillRect(buf, stride, screenW, screenH, wx, wy, ow, WM_BORDER_WIDTH, borderCol);
-    WmFillRect(buf, stride, screenW, screenH, wx, wy, WM_BORDER_WIDTH, oh, borderCol);
-    WmFillRect(buf, stride, screenW, screenH, wx + ow - WM_BORDER_WIDTH, wy, WM_BORDER_WIDTH, oh, borderCol);
-    WmFillRect(buf, stride, screenW, screenH, wx, wy + oh - WM_BORDER_WIDTH, ow, WM_BORDER_WIDTH, borderCol);
-
-    // Title bar background — glassy vertical gradient (light top → deep bottom),
-    // with a 1px sheen highlight along the very top edge. titleBg (the mid tone)
-    // is used as the anti-aliasing background for the title text + button icons.
-    int titleX = wx + WM_BORDER_WIDTH;
-    int titleY = wy + WM_BORDER_WIDTH;
-    int titleW = ow - 2 * WM_BORDER_WIDTH;
-    int titleH = WM_TITLE_BAR_HEIGHT;
-    uint32_t gTop = w.focused ? WM_TITLE_TOP_FOCUSED : WM_TITLE_TOP_UNFOCUSED;
-    uint32_t gBot = w.focused ? WM_TITLE_BOT_FOCUSED : WM_TITLE_BOT_UNFOCUSED;
-    for (int row = 0; row < titleH; ++row)
+    if (!buf || !stride || !screenW || !screenH || w.noChrome || !w.proc || !w.visible) return;
+    const int border = WM_BORDER_WIDTH;
+    const int ow = w.outerWidth(), oh = w.outerHeight();
+    const uint32_t edge = w.focused ? WmCurrentPalette().borderActive : WmCurrentPalette().borderInactive;
+    const uint32_t bg = w.focused ? WmCurrentPalette().titleActive : WmCurrentPalette().titleInactive;
+    const uint32_t fg = w.focused ? WmCurrentPalette().text : WmCurrentPalette().mutedText;
+    WmFillRect(buf, stride, screenW, screenH, w.x, w.y, ow, border, edge);
+    WmFillRect(buf, stride, screenW, screenH, w.x, w.y, border, oh, edge);
+    WmFillRect(buf, stride, screenW, screenH, w.x + ow - border, w.y, border, oh, edge);
+    WmFillRect(buf, stride, screenW, screenH, w.x, w.y + oh - border, ow, border, edge);
+    const int tx = w.x + border, ty = w.y + border;
+    WmFillRect(buf, stride, screenW, screenH, tx, ty, w.clientW, WM_TITLE_BAR_HEIGHT, bg);
+    LauncherReadGuard icons;
+    const int iconX = tx + 10;
+    const int textX = iconX + 20 + 8;
+    if (CaptionRect(w, 2).x - iconX >= 24)
+        WmDrawIcon(buf, stride, screenW, screenH, iconX,
+                   ty + (static_cast<int>(WM_TITLE_BAR_HEIGHT) - 20) / 2, 20, WindowIcon(w, icons.get()));
+    const int textW = CaptionRect(w, 2).x - textX - 8;
+    if (textW > 0)
+        WmRenderString(buf, stride, screenW, screenH, textX,
+            ty + (static_cast<int>(WM_TITLE_BAR_HEIGHT) - g_fontAtlas.lineHeight) / 2,
+            w.title, fg, bg, textW);
+    for (int button = 0; button < 3; ++button)
     {
-        uint32_t rc = WmLerpColor(gTop, gBot, row, titleH - 1);
-        WmFillRect(buf, stride, screenW, screenH, titleX, titleY + row, titleW, 1, rc);
+        const WmRect r = CaptionRect(w, button);
+        const bool hover = r.contains(mouseX, mouseY);
+        if (hover) WmFillRect(buf, stride, screenW, screenH, r.x, r.y, r.w, r.h,
+                             button == 0 ? WmCurrentPalette().closeHover : WmCurrentPalette().captionHover);
+        if (r.w < 14) continue;
+        const uint32_t ink = hover && button == 0 ? WmCurrentPalette().closeText :
+                             hover ? WmCurrentPalette().text : fg;
+        const int cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+        if (button == 0)
+        {
+            for (int d = -4; d <= 4; ++d)
+            {
+                WmPutPixel(buf, stride, screenW, screenH, cx + d, cy + d, ink);
+                WmPutPixel(buf, stride, screenW, screenH, cx + d, cy - d, ink);
+            }
+        }
+        else if (button == 1)
+        {
+            auto box = [&](int x, int y, int width, int height) {
+                WmFillRect(buf, stride, screenW, screenH, x, y, width, 1, ink);
+                WmFillRect(buf, stride, screenW, screenH, x, y + height - 1, width, 1, ink);
+                WmFillRect(buf, stride, screenW, screenH, x, y, 1, height, ink);
+                WmFillRect(buf, stride, screenW, screenH, x + width - 1, y, 1, height, ink);
+            };
+            if (w.state == WindowState::Maximized)
+            {
+                box(cx - 2, cy - 5, 8, 8);
+                WmFillRect(buf, stride, screenW, screenH, cx - 5, cy - 2, 8, 8,
+                           hover ? WmCurrentPalette().captionHover : bg);
+                box(cx - 5, cy - 2, 8, 8);
+            }
+            else box(cx - 5, cy - 4, 11, 9);
+        }
+        else WmFillRect(buf, stride, screenW, screenH, cx - 5, cy + 3, 11, 1, ink);
     }
-    // 1px glass sheen along the top of the titlebar.
-    WmFillRect(buf, stride, screenW, screenH, titleX, titleY, titleW, 1,
-               w.focused ? WM_TITLE_SHEEN_FOCUSED : WM_TITLE_SHEEN_UNFOCUSED);
-
-    // 1px separator line between title bar and client area
-    int sepY = titleY + titleH - 1;
-    uint32_t sepCol = w.focused ? 0x001A3A5A : 0x00303030;
-    WmFillRect(buf, stride, screenW, screenH, titleX, sepY, titleW, 1, sepCol);
-
-    // Title text — clipped to avoid overlapping chrome buttons
-    int textY = titleY + (titleH - g_fontAtlas.lineHeight) / 2;
-    int titleMaxW = titleW - WM_TITLE_TEXT_PAD_X - 3 * static_cast<int>(WM_BUTTON_WIDTH) - WM_BTN_RIGHT_PAD - 4;
-    if (titleMaxW < 0) titleMaxW = 0;
-    WmRenderString(buf, stride, screenW, screenH,
-                   titleX + WM_TITLE_TEXT_PAD_X, textY, w.title,
-                   WM_TITLE_FG, titleBg, titleMaxW);
-
-    // Close / maximize / minimize — larger rounded-rect glass buttons with a
-    // faux-engraved bevel, filling most of the titlebar height. Icons are engraved
-    // (a light highlight under the dark stroke) so they look carved into the glass.
-    int by = titleY + 4;
-    int bh = static_cast<int>(titleH) - 8;
-    if (bh < 8) bh = 8;
-    int hInset = 1;                                   // small gap inside each cell (buttons sit close)
-    int bw = static_cast<int>(WM_BUTTON_WIDTH) - 2 * hInset;
-    int iconCY = by + bh / 2;
-
-    auto engraveHLine = [&](int x, int y, int len, uint32_t fg) {
-        WmFillRect(buf, stride, screenW, screenH, x, y + 1, len, 1, WM_BTN_BEVEL_LIGHT);
-        WmFillRect(buf, stride, screenW, screenH, x, y, len, 1, fg);
-    };
-    auto engraveVLine = [&](int x, int y, int len, uint32_t fg) {
-        WmFillRect(buf, stride, screenW, screenH, x + 1, y, 1, len, WM_BTN_BEVEL_LIGHT);
-        WmFillRect(buf, stride, screenW, screenH, x, y, 1, len, fg);
-    };
-
-    // Close button (rightmost) — red glass, engraved ×. WM_BTN_RIGHT_PAD leaves a
-    // little breathing room between the close button and the window's right border.
-    int closeBtnX = wx + ow - static_cast<int>(WM_BORDER_WIDTH) - WM_BTN_RIGHT_PAD - static_cast<int>(WM_BUTTON_WIDTH);
-    bool closeHover = mouseX >= closeBtnX && mouseX < closeBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
-                      mouseY >= titleY && mouseY < titleY + titleH;
-    int closeBx = closeBtnX + hInset;
-    int closeCx = closeBx + bw / 2;
-    WmDrawCaptionButton(buf, stride, screenW, screenH, closeBx, by, bw, bh,
-                        closeHover ? 0x00E05555 : (w.focused ? 0x00C83C3C : WM_CLOSE_BTN_TOP_UNF),
-                        closeHover ? 0x00B02828 : (w.focused ? 0x00982020 : WM_CLOSE_BTN_BOT_UNF));
-    static constexpr int CLOSE_HALF = 4;
-    for (int d = -CLOSE_HALF; d <= CLOSE_HALF; ++d)
-    {
-        WmEngravePixel(buf, stride, screenW, screenH, closeCx + d, iconCY + d, WM_TITLE_FG);
-        WmEngravePixel(buf, stride, screenW, screenH, closeCx + d, iconCY - d, WM_TITLE_FG);
-    }
-
-    // Maximize button — glass, engraved box outline.
-    int maxBtnX = closeBtnX - static_cast<int>(WM_BUTTON_WIDTH);
-    bool maxHover = mouseX >= maxBtnX && mouseX < maxBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
-                    mouseY >= titleY && mouseY < titleY + titleH;
-    int maxBx = maxBtnX + hInset;
-    int maxCx = maxBx + bw / 2;
-    WmDrawCaptionButton(buf, stride, screenW, screenH, maxBx, by, bw, bh,
-                        maxHover ? WM_BTN_HOVER_TOP : (w.focused ? WM_BTN_TOP : WM_BTN_TOP_UNFOCUSED),
-                        maxHover ? WM_BTN_HOVER_BOT : (w.focused ? WM_BTN_BOT : WM_BTN_BOT_UNFOCUSED));
-    int boxW = 11, boxH = 9;
-    int boxX = maxCx - boxW / 2, boxY = iconCY - boxH / 2;
-    engraveHLine(boxX, boxY, boxW, WM_TITLE_FG);              // top
-    engraveHLine(boxX, boxY + boxH - 1, boxW, WM_TITLE_FG);   // bottom
-    engraveVLine(boxX, boxY, boxH, WM_TITLE_FG);             // left
-    engraveVLine(boxX + boxW - 1, boxY, boxH, WM_TITLE_FG);  // right
-
-    // Minimize button — glass, engraved dash near the baseline.
-    int minBtnX = maxBtnX - static_cast<int>(WM_BUTTON_WIDTH);
-    bool minHover = mouseX >= minBtnX && mouseX < minBtnX + static_cast<int>(WM_BUTTON_WIDTH) &&
-                    mouseY >= titleY && mouseY < titleY + titleH;
-    int minBx = minBtnX + hInset;
-    int minCx = minBx + bw / 2;
-    WmDrawCaptionButton(buf, stride, screenW, screenH, minBx, by, bw, bh,
-                        minHover ? WM_BTN_HOVER_TOP : (w.focused ? WM_BTN_TOP : WM_BTN_TOP_UNFOCUSED),
-                        minHover ? WM_BTN_HOVER_BOT : (w.focused ? WM_BTN_BOT : WM_BTN_BOT_UNFOCUSED));
-    engraveHLine(minCx - 5, iconCY + 2, 11, WM_TITLE_FG);
 }
 
 void WmRenderChrome(uint32_t* backBuffer, uint32_t stride,
@@ -1029,302 +1121,171 @@ void WmRenderChromeForWindow(uint32_t* backBuffer, uint32_t stride,
 // Taskbar
 // ---------------------------------------------------------------------------
 
-static constexpr uint32_t TASKBAR_SEPARATOR  = 1; // thin line between taskbar and desktop
-static constexpr uint32_t TASKBAR_NEW_BTN_W  = 28; // "+" button width
-static constexpr uint32_t TASKBAR_APPS_BTN_W = 48; // "Apps" button width
+struct TaskbarLayout
+{
+    int y, textY;
+    WmRect apps, terminal, next, clock, gpu, fps;
+    WmRect buttons[WM_MAX_WINDOWS];
+    int indices[WM_MAX_WINDOWS];
+    int count, nextIndex;
+    char clockText[32];
+};
+
+static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
+{
+    TaskbarLayout l = {};
+    l.nextIndex = -1;
+    const int sw = static_cast<int>(screenW), sh = static_cast<int>(screenH);
+    l.y = sh > static_cast<int>(WM_TASKBAR_HEIGHT) ? sh - WM_TASKBAR_HEIGHT : 0;
+    const int height = sh - l.y;
+    const int bh = height < static_cast<int>(WM_TASKBAR_BTN_HEIGHT) ? height : WM_TASKBAR_BTN_HEIGHT;
+    const int by = l.y + (height - bh) / 2;
+    l.textY = by + (bh - g_fontAtlas.lineHeight) / 2;
+    int x = WM_TASKBAR_PADDING;
+    const int appsW = 40;
+    l.apps = {x, by, appsW, bh}; x += appsW + WM_TASKBAR_PADDING;
+    l.terminal = {x, by, 40, bh}; x += 40 + WM_TASKBAR_PADDING;
+    RtcFormatTaskbar(l.clockText, RtcNow(), false);
+    int right = sw - 8;
+    // Reserve measured widgets from right to left. Keep one useful window
+    // button on small displays; diagnostics yield before the clock does.
+    auto reserve = [&](WmRect& r, int width) {
+        if (right - width - 12 < x + 80) return;
+        right -= width;
+        r = {right, by, width, bh};
+        right -= 12;
+    };
+    reserve(l.clock, WmTextWidth(l.clockText));
+    reserve(l.gpu, WmTextWidth("GPU"));
+    // Reserve the widest possible digits, independent of the live FPS count.
+    int digitW = 0;
+    for (char digit = '0'; digit <= '9'; ++digit)
+    {
+        char str[] = {digit, 0};
+        int width = WmTextWidth(str);
+        if (width > digitW) digitW = width;
+    }
+    reserve(l.fps, digitW * 3 + WmTextWidth(" FPS"));
+    int ids[WM_MAX_WINDOWS], total = 0, focused = 0;
+    for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
+    {
+        const Window& w = g_windows[i];
+        if (!w.proc || !w.visible || !w.focusable) continue;
+        if (w.focused) focused = total;
+        ids[total++] = static_cast<int>(i);
+    }
+    int available = right - x;
+    if (!total || available <= 0) return l;
+    int capacity = (available + WM_TASKBAR_PADDING) / (WM_TASKBAR_BTN_WIDTH + WM_TASKBAR_PADDING);
+    bool overflow = capacity < total;
+    if (overflow)
+    {
+        // The arrow focuses the first window on the next page. The focused
+        // window selects the page, so every hidden/minimized window remains
+        // reachable through the existing focus/restore input path.
+        int arrowW = available < 32 ? available : 32;
+        l.next = {right - arrowW, by, arrowW, bh};
+        available -= arrowW + WM_TASKBAR_PADDING;
+        capacity = (available + WM_TASKBAR_PADDING) / (WM_TASKBAR_BTN_WIDTH + WM_TASKBAR_PADDING);
+        if (capacity < 1 && available > 0) capacity = 1;
+        if (capacity < 1) { l.nextIndex = ids[(focused + 1) % total]; return l; }
+    }
+    if (capacity > total) capacity = total;
+    const int first = (focused / capacity) * capacity;
+    l.count = total - first < capacity ? total - first : capacity;
+    int width = (available - (capacity - 1) * WM_TASKBAR_PADDING) / capacity;
+    if (width > static_cast<int>(WM_TASKBAR_BTN_WIDTH)) width = WM_TASKBAR_BTN_WIDTH;
+    for (int i = 0; i < l.count; ++i)
+    {
+        l.indices[i] = ids[first + i];
+        l.buttons[i] = {x, by, width, bh};
+        x += width + WM_TASKBAR_PADDING;
+    }
+    if (overflow) l.nextIndex = ids[(first + capacity) % total];
+    return l;
+}
 
 void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
                      uint32_t screenW, uint32_t screenH,
                      uint64_t /*uptimeMs*/, int32_t mouseX, int32_t mouseY)
 {
     if (!g_wmActive || !backBuffer) return;
-
-    uint32_t tbY = screenH - WM_TASKBAR_HEIGHT;
-    bool mouseInTaskbar = (mouseY >= static_cast<int32_t>(tbY) &&
-                           mouseY < static_cast<int32_t>(screenH));
-
-    // Taskbar background with subtle top-to-bottom gradient
-    WmFillRect(backBuffer, stride, screenW, screenH,
-               0, static_cast<int>(tbY), static_cast<int>(screenW),
-               static_cast<int>(WM_TASKBAR_HEIGHT), WM_TASKBAR_BG);
-    // Lighten the top 3 rows for a raised effect
-    for (uint32_t row = 0; row < 3 && tbY + row < screenH; ++row)
+    LauncherReadGuard icons;
+    const TaskbarLayout l = GetTaskbarLayout(screenW, screenH);
+    WmFillRect(backBuffer, stride, screenW, screenH, 0, l.y, screenW,
+               screenH - l.y, WmCurrentPalette().taskbar);
+    WmFillRect(backBuffer, stride, screenW, screenH, 0, l.y, screenW, 1, WmCurrentPalette().separator);
+    auto button = [&](const WmRect& r, const char* title, bool active, bool minimized) {
+        uint32_t bg = active ? WmCurrentPalette().taskActive :
+            r.contains(mouseX, mouseY) ? WmCurrentPalette().taskHover : WmCurrentPalette().taskButton;
+        WmFillRect(backBuffer, stride, screenW, screenH, r.x, r.y, r.w, r.h, bg);
+        if (active || minimized)
+            WmFillRect(backBuffer, stride, screenW, screenH, r.x + 6, r.y + r.h - 2,
+                       r.w - 12, 2, active ? WmCurrentPalette().borderActive : WmCurrentPalette().minimized);
+        if (r.w > 12) WmRenderString(backBuffer, stride, screenW, screenH,
+            r.x + 6, l.textY, title, WmCurrentPalette().taskText, bg, r.w - 12);
+    };
+    button(l.apps, "", g_launcherOpen, false);
+    button(l.terminal, "", false, false);
+    WmDrawIcon(backBuffer, stride, screenW, screenH, l.apps.x + (l.apps.w - 24) / 2,
+               l.apps.y + (l.apps.h - 24) / 2, 24, icons.get().appsIcon);
+    WmDrawIcon(backBuffer, stride, screenW, screenH, l.terminal.x + (l.terminal.w - 24) / 2,
+               l.terminal.y + (l.terminal.h - 24) / 2, 24, icons.get().terminalIcon);
+    const char* hoverTitle = l.apps.contains(mouseX, mouseY) ? "Applications" :
+        l.terminal.contains(mouseX, mouseY) ? "New terminal" : nullptr;
+    for (int i = 0; i < l.count; ++i)
     {
-        uint32_t alpha = 8 - row * 2; // 8, 6, 4
-        uint32_t* rowPtr = backBuffer + (tbY + row) * stride;
-        for (uint32_t col = 0; col < screenW; ++col)
-        {
-            uint32_t p = rowPtr[col];
-            uint32_t r = ((p >> 16) & 0xff) + alpha;
-            uint32_t g = ((p >> 8) & 0xff) + alpha;
-            uint32_t b = (p & 0xff) + alpha;
-            if (r > 255) r = 255;
-            if (g > 255) g = 255;
-            if (b > 255) b = 255;
-            rowPtr[col] = (r << 16) | (g << 8) | b;
-        }
+        const Window& w = g_windows[l.indices[i]];
+        const WmRect& r = l.buttons[i];
+        button(r, "", w.focused && !w.minimized, w.minimized);
+        if (r.w >= 24 && r.h >= 24)
+            WmDrawIcon(backBuffer, stride, screenW, screenH, r.x + (r.w - 24) / 2,
+                       r.y + (r.h - 24) / 2, 24, WindowIcon(w, icons.get()));
+        if (r.contains(mouseX, mouseY)) hoverTitle = w.title;
     }
-
-    // Top separator line (1px highlight)
-    WmFillRect(backBuffer, stride, screenW, screenH,
-               0, static_cast<int>(tbY), static_cast<int>(screenW),
-               TASKBAR_SEPARATOR, 0x00404050);
-
-    // Collect all active windows (including minimized) for taskbar buttons
-    uint32_t btnX = WM_TASKBAR_PADDING;
-    uint32_t btnY = tbY + (WM_TASKBAR_HEIGHT - WM_TASKBAR_BTN_HEIGHT) / 2;
-    uint32_t textYOff = (WM_TASKBAR_BTN_HEIGHT - static_cast<uint32_t>(g_fontAtlas.lineHeight)) / 2;
-
-    // "Apps" launcher button
-    bool appsHover = mouseInTaskbar && mouseX >= static_cast<int32_t>(btnX) &&
-                     mouseX < static_cast<int32_t>(btnX + TASKBAR_APPS_BTN_W);
-    uint32_t appsBg = g_launcherOpen ? WM_TASKBAR_BTN_ACTIVE :
-                      appsHover ? 0x00445566 : 0x00334455;
-    WmFillRoundedRect(backBuffer, stride, screenW, screenH,
-               static_cast<int>(btnX), static_cast<int>(btnY),
-               TASKBAR_APPS_BTN_W, WM_TASKBAR_BTN_HEIGHT, 3, appsBg);
-    WmRenderString(backBuffer, stride, screenW, screenH,
-                   static_cast<int>(btnX + WM_TASKBAR_TEXT_PAD_X),
-                   static_cast<int>(btnY + textYOff),
-                   "Apps", 0x0088CCFF, appsBg);
-    btnX += TASKBAR_APPS_BTN_W + WM_TASKBAR_PADDING;
-
-    // "+" new terminal button
-    bool newHover = mouseInTaskbar && mouseX >= static_cast<int32_t>(btnX) &&
-                    mouseX < static_cast<int32_t>(btnX + TASKBAR_NEW_BTN_W);
-    uint32_t newBg = newHover ? 0x00445566 : 0x00334455;
-    WmFillRoundedRect(backBuffer, stride, screenW, screenH,
-               static_cast<int>(btnX), static_cast<int>(btnY),
-               TASKBAR_NEW_BTN_W, WM_TASKBAR_BTN_HEIGHT, 3, newBg);
-    WmRenderString(backBuffer, stride, screenW, screenH,
-                   static_cast<int>(btnX + (TASKBAR_NEW_BTN_W - 8) / 2),
-                   static_cast<int>(btnY + textYOff),
-                   "+", 0x0088CCFF, newBg);
-    btnX += TASKBAR_NEW_BTN_W + WM_TASKBAR_PADDING;
-
-    // Count active windows and compute responsive button width.
-    // Skip non-focusable windows (popups, menus, tooltips) — they're
-    // transient and shouldn't appear on the taskbar.
-    uint32_t windowCount = 0;
-    for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
+    if (l.nextIndex >= 0) {
+        button(l.next, ">", false, false);
+        if (l.next.contains(mouseX, mouseY)) hoverTitle = "More windows";
+    }
+    // Use the already-reserved tray for the hover label. Geometry stays fixed
+    // and no additional empty strip is reserved when nothing is hovered.
+    int labelX = static_cast<int>(screenW);
+    const WmRect trayRects[] = {l.fps, l.gpu, l.clock};
+    for (const auto& r : trayRects) if (r.w && r.x < labelX) labelX = r.x;
+    if (hoverTitle && labelX + 12 < static_cast<int>(screenW))
     {
-        const Window& w2 = g_windows[i];
-        if (w2.proc && w2.visible && w2.focusable) windowCount++;
+        WmRenderString(backBuffer, stride, screenW, screenH, labelX, l.textY,
+                       hoverTitle, WmCurrentPalette().text, WmCurrentPalette().taskbar, static_cast<int>(screenW) - labelX - 8);
+        return;
     }
-
-    // Available space: screen width minus fixed elements minus clock area (~100px)
-    uint32_t fixedWidth = btnX + 100 + WM_TASKBAR_PADDING * 2;
-    uint32_t availableWidth = (screenW > fixedWidth) ? screenW - fixedWidth : 0;
-    uint32_t dynBtnWidth = WM_TASKBAR_BTN_WIDTH; // default max
-    if (windowCount > 0)
-    {
-        uint32_t maxFit = availableWidth / (windowCount);
-        if (maxFit < WM_TASKBAR_BTN_WIDTH)
-            dynBtnWidth = maxFit > 40 ? maxFit - WM_TASKBAR_PADDING : 40; // min 40px
-    }
-    if (dynBtnWidth > WM_TASKBAR_BTN_WIDTH) dynBtnWidth = WM_TASKBAR_BTN_WIDTH;
-
-    for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
-    {
-        const Window& w = g_windows[i];
-        if (!w.proc || !w.visible || !w.focusable) continue;
-
-        // Button background — highlight if focused, lighten on hover
-        bool btnHover = mouseInTaskbar && mouseX >= static_cast<int32_t>(btnX) &&
-                        mouseX < static_cast<int32_t>(btnX + dynBtnWidth);
-        uint32_t btnBg = (w.focused && !w.minimized) ? WM_TASKBAR_BTN_ACTIVE :
-                         btnHover ? 0x00384858 : WM_TASKBAR_BTN_BG;
-        WmFillRoundedRect(backBuffer, stride, screenW, screenH,
-                   static_cast<int>(btnX), static_cast<int>(btnY),
-                   dynBtnWidth, WM_TASKBAR_BTN_HEIGHT, 3, btnBg);
-
-        // If minimized, draw a subtle underline indicator
-        if (w.minimized)
-        {
-            WmFillRect(backBuffer, stride, screenW, screenH,
-                       static_cast<int>(btnX + 2),
-                       static_cast<int>(btnY + WM_TASKBAR_BTN_HEIGHT - 2),
-                       dynBtnWidth - 4, 1, 0x00808080);
-        }
-
-        // Render title text — clipped to button width
-        WmRenderString(backBuffer, stride, screenW, screenH,
-                       static_cast<int>(btnX + 4),
-                       static_cast<int>(btnY + textYOff),
-                       w.title, WM_TASKBAR_BTN_FG, btnBg,
-                       static_cast<int>(dynBtnWidth - 8));
-
-        btnX += dynBtnWidth + WM_TASKBAR_PADDING;
-    }
-
-    // Real-time clock — right-aligned in taskbar
-    uint64_t now = RtcNow();
-    char clockBuf[32];
-    RtcFormatTaskbar(clockBuf, now, false); // no seconds by default
-
-    // Measure clock text width
-    const FontAtlas& fa = g_fontAtlas;
-    uint32_t clockW = 0;
-    for (const char* p = clockBuf; *p; p++)
-    {
-        int code = static_cast<int>(static_cast<uint8_t>(*p));
-        if (code >= static_cast<int>(fa.firstChar) &&
-            code < static_cast<int>(fa.firstChar + fa.glyphCount))
-            clockW += static_cast<uint32_t>(fa.glyphs[code - static_cast<int>(fa.firstChar)].advance);
-    }
-
-    uint32_t clockX = screenW - clockW - WM_TASKBAR_PADDING * 2;
-    WmRenderString(backBuffer, stride, screenW, screenH,
-                   static_cast<int>(clockX),
-                   static_cast<int>(btnY + textYOff),
-                   clockBuf, WM_TASKBAR_CLOCK_FG, WM_TASKBAR_BG);
-
-    // GPU-presentation indicator — a small "GPU" badge to the LEFT of the clock.
-    // Lit green when the virtio-gpu driver owns the active display (the takeover
-    // path is presenting frames through the host GPU); dim grey otherwise (GOP/
-    // stdvga software path). Gives an at-a-glance confirmation that accelerated
-    // presentation is live.
-    uint32_t rightX = clockX;   // left edge of the next right-aligned widget
-    {
-        const char* gpuLabel = "GPU";
-        const brook::DisplayOps* disp = brook::DisplayGetActive();
-        bool gpuActive = disp && disp->name &&
-                         disp->name[0] == 'v' &&   // "virtio-gpu"
-                         disp->name[1] == 'i' &&
-                         disp->name[2] == 'r' &&
-                         disp->name[3] == 't';
-        // Three states: cyan when host 3D (virgl) acceleration is confirmed live
-        // (GPU-clear self-test passed); green when the virtio-gpu driver owns the
-        // display (accelerated presentation, no 3D yet); muted grey on the
-        // software (GOP/stdvga) path.
-        uint32_t badgeFg = brook::DisplayIs3DActive() ? 0x0030D0FFu
-                         : gpuActive                  ? 0x0040E060u
-                         :                              0x00606070u;
-
-        uint32_t labelW = 0;
-        for (const char* p = gpuLabel; *p; p++)
-        {
-            int code = static_cast<int>(static_cast<uint8_t>(*p));
-            if (code >= static_cast<int>(fa.firstChar) &&
-                code < static_cast<int>(fa.firstChar + fa.glyphCount))
-                labelW += static_cast<uint32_t>(fa.glyphs[code - static_cast<int>(fa.firstChar)].advance);
-        }
-        // Sit just left of the clock with one padding gap.
-        uint32_t badgeX = clockX - labelW - WM_TASKBAR_PADDING * 2;
-        if (badgeX < screenW)   // guard against underflow on a very narrow screen
-            WmRenderString(backBuffer, stride, screenW, screenH,
-                           static_cast<int>(badgeX),
-                           static_cast<int>(btnY + textYOff),
-                           gpuLabel, badgeFg, WM_TASKBAR_BG);
-        rightX = badgeX;
-    }
-
-    // Compositor FPS readout — to the LEFT of the GPU badge. Smoothed present
-    // rate from CompositorGetFps(); a live indicator of compositor throughput.
-    {
-        uint32_t fps = CompositorGetFps();
-        if (fps > 999) fps = 999;
-        char fpsBuf[12];
-        // Format "NN FPS" (no libc — manual itoa).
-        int fi = 0;
-        if (fps == 0) fpsBuf[fi++] = '0';
-        else
-        {
-            char tmp[4]; int ti = 0;
-            uint32_t v = fps;
-            while (v && ti < 4) { tmp[ti++] = static_cast<char>('0' + v % 10); v /= 10; }
-            while (ti > 0) fpsBuf[fi++] = tmp[--ti];
-        }
-        fpsBuf[fi++] = ' '; fpsBuf[fi++] = 'F'; fpsBuf[fi++] = 'P'; fpsBuf[fi++] = 'S';
-        fpsBuf[fi] = '\0';
-
-        uint32_t fpsW = 0;
-        for (const char* p = fpsBuf; *p; p++)
-        {
-            int code = static_cast<int>(static_cast<uint8_t>(*p));
-            if (code >= static_cast<int>(fa.firstChar) &&
-                code < static_cast<int>(fa.firstChar + fa.glyphCount))
-                fpsW += static_cast<uint32_t>(fa.glyphs[code - static_cast<int>(fa.firstChar)].advance);
-        }
-        uint32_t fpsX = rightX - fpsW - WM_TASKBAR_PADDING * 2;
-        if (fpsX < screenW)
-            WmRenderString(backBuffer, stride, screenW, screenH,
-                           static_cast<int>(fpsX),
-                           static_cast<int>(btnY + textYOff),
-                           fpsBuf, WM_TASKBAR_CLOCK_FG, WM_TASKBAR_BG);
-    }
+    auto trayText = [&](const WmRect& r, const char* text, uint32_t fg) {
+        if (r.w > 0) WmRenderString(backBuffer, stride, screenW, screenH,
+            r.x, l.textY, text, fg, WmCurrentPalette().taskbar, r.w);
+    };
+    trayText(l.clock, l.clockText, WmCurrentPalette().secondaryText);
+    const DisplayOps* disp = DisplayGetActive();
+    bool gpuActive = disp && disp->name && strncmp(disp->name, "virt", 4) == 0;
+    trayText(l.gpu, "GPU", DisplayIs3DActive() ? WmCurrentPalette().gpu3d :
+             gpuActive ? WmCurrentPalette().gpu2d : WmCurrentPalette().gpuInactive);
+    uint32_t fps = CompositorGetFps();
+    if (fps > 999) fps = 999;
+    char text[12], digits[4]; int n = 0, count = 0;
+    do { digits[count++] = '0' + fps % 10; fps /= 10; } while (fps);
+    while (count) text[n++] = digits[--count];
+    text[n++] = ' '; text[n++] = 'F'; text[n++] = 'P'; text[n++] = 'S'; text[n] = 0;
+    trayText(l.fps, text, WmCurrentPalette().secondaryText);
 }
 
 int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
 {
-    uint32_t tbY = screenH - WM_TASKBAR_HEIGHT;
-    if (my < static_cast<int32_t>(tbY) || mx < 0 || mx >= static_cast<int32_t>(screenW))
-        return -1;
-
-    // Walk window buttons left to right
-    uint32_t btnX = WM_TASKBAR_PADDING;
-
-    // "Apps" launcher button
-    {
-        uint32_t btnY2 = tbY + (WM_TASKBAR_HEIGHT - WM_TASKBAR_BTN_HEIGHT) / 2;
-        if (mx >= static_cast<int32_t>(btnX) &&
-            mx < static_cast<int32_t>(btnX + TASKBAR_APPS_BTN_W) &&
-            my >= static_cast<int32_t>(btnY2) &&
-            my < static_cast<int32_t>(btnY2 + WM_TASKBAR_BTN_HEIGHT))
-        {
-            return -3; // special: apps launcher button
-        }
-        btnX += TASKBAR_APPS_BTN_W + WM_TASKBAR_PADDING;
-    }
-
-    // "+" new terminal button
-    {
-        uint32_t btnY2 = tbY + (WM_TASKBAR_HEIGHT - WM_TASKBAR_BTN_HEIGHT) / 2;
-        if (mx >= static_cast<int32_t>(btnX) &&
-            mx < static_cast<int32_t>(btnX + TASKBAR_NEW_BTN_W) &&
-            my >= static_cast<int32_t>(btnY2) &&
-            my < static_cast<int32_t>(btnY2 + WM_TASKBAR_BTN_HEIGHT))
-        {
-            return -2; // special: new terminal button
-        }
-        btnX += TASKBAR_NEW_BTN_W + WM_TASKBAR_PADDING;
-    }
-
-    // Compute dynamic button width (must match WmRenderTaskbar)
-    uint32_t windowCount = 0;
-    for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
-    {
-        const Window& w2 = g_windows[i];
-        if (w2.proc && w2.visible && w2.focusable) windowCount++;
-    }
-    uint32_t fixedWidth = btnX + 100 + WM_TASKBAR_PADDING * 2;
-    uint32_t availableWidth = (screenW > fixedWidth) ? screenW - fixedWidth : 0;
-    uint32_t dynBtnWidth = WM_TASKBAR_BTN_WIDTH;
-    if (windowCount > 0)
-    {
-        uint32_t maxFit = availableWidth / windowCount;
-        if (maxFit < WM_TASKBAR_BTN_WIDTH)
-            dynBtnWidth = maxFit > 40 ? maxFit - WM_TASKBAR_PADDING : 40;
-    }
-    if (dynBtnWidth > WM_TASKBAR_BTN_WIDTH) dynBtnWidth = WM_TASKBAR_BTN_WIDTH;
-
-    for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
-    {
-        const Window& w = g_windows[i];
-        if (!w.proc || !w.visible || !w.focusable) continue;
-
-        uint32_t btnY = tbY + (WM_TASKBAR_HEIGHT - WM_TASKBAR_BTN_HEIGHT) / 2;
-        if (mx >= static_cast<int32_t>(btnX) &&
-            mx < static_cast<int32_t>(btnX + dynBtnWidth) &&
-            my >= static_cast<int32_t>(btnY) &&
-            my < static_cast<int32_t>(btnY + WM_TASKBAR_BTN_HEIGHT))
-        {
-            return static_cast<int>(i);
-        }
-        btnX += dynBtnWidth + WM_TASKBAR_PADDING;
-    }
-
-    return -1; // clicked taskbar background but not a button
+    if (mx < 0 || my < 0 || mx >= static_cast<int32_t>(screenW) || my >= static_cast<int32_t>(screenH)) return -1;
+    const TaskbarLayout l = GetTaskbarLayout(screenW, screenH);
+    if (l.apps.contains(mx, my)) return -3;
+    if (l.terminal.contains(mx, my)) return -2;
+    if (l.next.contains(mx, my)) return l.nextIndex;
+    for (int i = 0; i < l.count; ++i)
+        if (l.buttons[i].contains(mx, my)) return l.indices[i];
+    return -1;
 }
 
 uint32_t WmDesktopHeight(uint32_t screenH)
@@ -1371,124 +1332,20 @@ void WmSpawnTerminal()
 // ---------------------------------------------------------------------------
 
 // Launcher visual constants
-static constexpr uint32_t LAUNCHER_ICON_SIZE    = 20;
+static constexpr uint32_t LAUNCHER_ICON_SIZE    = LAUNCHER_ICON_PX;
 static constexpr uint32_t LAUNCHER_ICON_MARGIN  = 8;
-static constexpr uint32_t LAUNCHER_ITEM_HEIGHT  = 32;
+static constexpr uint32_t LAUNCHER_ITEM_HEIGHT  = 40;
 static constexpr uint32_t LAUNCHER_ITEM_WIDTH   = 230;
 static constexpr uint32_t LAUNCHER_PADDING      = 6;
 static constexpr uint32_t LAUNCHER_MAX_ROWS     = 14; // max rows before scrolling
 static constexpr uint32_t LAUNCHER_MAX_COLS     = 3;  // max columns
-static constexpr uint32_t LAUNCHER_BG           = 0x00252535;
-static constexpr uint32_t LAUNCHER_ITEM_BG      = 0x00303045;
-static constexpr uint32_t LAUNCHER_ITEM_FG      = 0x00E0E0E0;
-static constexpr uint32_t LAUNCHER_BORDER_CLR   = 0x00505060;
-static constexpr uint32_t LAUNCHER_HEADER_FG    = 0x0090D0FF;
 
-// Assign an icon color based on the shortcut title
-static uint32_t LauncherIconColor(const char* title)
-{
-    // Known apps get distinctive colors
-    for (const char* p = title; *p; ++p)
-    {
-        char c = (*p >= 'a' && *p <= 'z') ? (*p - 32) : *p;
-        if (c == 'D') return 0x00B03030; // DOOM — dark red
-        if (c == 'Q') return 0x00806020; // Quake — brown
-        if (c == 'N') return 0x002060A0; // NetSurf — blue
-        if (c == 'T') return 0x00307030; // Terminal — green
-        if (c >= 'A') break; // use first alpha char
-    }
-    // Fallback: hash title to a muted color
-    uint32_t h = 0x811c9dc5;
-    for (const char* p = title; *p; ++p)
-        h = (h ^ static_cast<uint8_t>(*p)) * 0x01000193;
-    return 0x00404040 | ((h & 0x7F) << 16) | (((h >> 8) & 0x7F) << 8) | ((h >> 16) & 0x7F);
-}
-
-// Draw a small colored icon with first letter
-static void LauncherDrawIcon(uint32_t* backBuffer, uint32_t stride,
+static void LauncherDrawIcon(uint32_t* buf, uint32_t stride,
                              uint32_t screenW, uint32_t screenH,
-                             int32_t x, int32_t y, const LauncherItem* item)
+                             int32_t x, int32_t y, const LauncherItem* item, const LauncherSnapshot& launcher)
 {
-    // If we have a bitmap icon, blit it directly with alpha blending
-    if (item->iconPixels)
-    {
-        for (uint32_t iy = 0; iy < LAUNCHER_ICON_PX; iy++)
-        {
-            for (uint32_t ix = 0; ix < LAUNCHER_ICON_PX; ix++)
-            {
-                int32_t px = x + static_cast<int32_t>(ix);
-                int32_t py2 = y + static_cast<int32_t>(iy);
-                if (px < 0 || px >= static_cast<int32_t>(screenW) ||
-                    py2 < 0 || py2 >= static_cast<int32_t>(screenH))
-                    continue;
-
-                uint32_t sp = item->iconPixels[iy * LAUNCHER_ICON_PX + ix];
-                uint32_t a = sp >> 24;
-                if (a == 0) continue;
-
-                uint32_t dstIdx = py2 * stride + px;
-                if (a == 255)
-                {
-                    backBuffer[dstIdx] = sp & 0x00FFFFFF;
-                    continue;
-                }
-                uint32_t dp = backBuffer[dstIdx];
-                uint32_t inv = 255 - a;
-                uint32_t r = (((sp >> 16) & 0xff) * a + ((dp >> 16) & 0xff) * inv + 127) / 255;
-                uint32_t g = (((sp >> 8) & 0xff) * a + ((dp >> 8) & 0xff) * inv + 127) / 255;
-                uint32_t b = ((sp & 0xff) * a + (dp & 0xff) * inv + 127) / 255;
-                backBuffer[dstIdx] = (r << 16) | (g << 8) | b;
-            }
-        }
-        return;
-    }
-
-    // Fallback: colored rounded rectangle with letter
-    uint32_t color = item->iconColor;
-    static constexpr uint32_t ICON_RADIUS = 4; // corner radius in pixels
-    for (uint32_t iy = 0; iy < LAUNCHER_ICON_SIZE; iy++)
-    {
-        for (uint32_t ix = 0; ix < LAUNCHER_ICON_SIZE; ix++)
-        {
-            // Rounded corner check using distance from corner center
-            bool skip = false;
-            uint32_t corners[4][2] = {
-                {ICON_RADIUS, ICON_RADIUS},                                     // top-left
-                {LAUNCHER_ICON_SIZE - 1 - ICON_RADIUS, ICON_RADIUS},           // top-right
-                {ICON_RADIUS, LAUNCHER_ICON_SIZE - 1 - ICON_RADIUS},           // bottom-left
-                {LAUNCHER_ICON_SIZE - 1 - ICON_RADIUS, LAUNCHER_ICON_SIZE - 1 - ICON_RADIUS} // bottom-right
-            };
-            for (int c = 0; c < 4; ++c)
-            {
-                uint32_t cx = corners[c][0], cy = corners[c][1];
-                bool inCornerX = (c & 1) ? (ix > cx) : (ix < cx);
-                bool inCornerY = (c & 2) ? (iy > cy) : (iy < cy);
-                if (inCornerX && inCornerY)
-                {
-                    int32_t dx = static_cast<int32_t>(ix) - static_cast<int32_t>(cx);
-                    int32_t dy = static_cast<int32_t>(iy) - static_cast<int32_t>(cy);
-                    if (dx * dx + dy * dy > static_cast<int32_t>(ICON_RADIUS * ICON_RADIUS))
-                        skip = true;
-                    break;
-                }
-            }
-            if (skip) continue;
-
-            int32_t px = x + static_cast<int32_t>(ix);
-            int32_t py2 = y + static_cast<int32_t>(iy);
-            if (px >= 0 && px < static_cast<int32_t>(screenW) &&
-                py2 >= 0 && py2 < static_cast<int32_t>(screenH))
-                backBuffer[py2 * stride + px] = color;
-        }
-    }
-
-    char letter = item->title[0];
-    if (letter >= 'a' && letter <= 'z') letter -= 32;
-    char str[2] = { letter, '\0' };
-    int32_t lx = x + static_cast<int32_t>(LAUNCHER_ICON_SIZE / 2) - 4;
-    int32_t ly = y + static_cast<int32_t>(LAUNCHER_ICON_SIZE / 2) -
-                 static_cast<int32_t>(g_fontAtlas.lineHeight / 2);
-    WmRenderString(backBuffer, stride, screenW, screenH, lx, ly, str, 0x00FFFFFF, color);
+    WmDrawIcon(buf, stride, screenW, screenH, x, y, LAUNCHER_ICON_PX,
+               item->iconPixels ? item->iconPixels : launcher.applicationIcon);
 }
 
 // Parse "# title: Something" from a script file's first few lines
@@ -1534,282 +1391,349 @@ static bool ParseShortcutTitle(const char* path, char* titleOut, uint32_t titleM
     return false;
 }
 
-// Load a raw RGBA icon file for a launcher item. Looks for an icon file
-// whose name matches a lowercased/sanitized version of the item title.
+// Asset files are 24x24 straight-alpha pixels encoded as little-endian ARGB.
+static uint32_t* LoadIconFile(const char* name)
+{
+    if (!name || !name[0]) return nullptr;
+    for (const char* p = name; *p; ++p) if (*p == '/' || *p == '\\') return nullptr;
+    char path[192];
+    const char* prefix = "/nix/share/applications/icons/";
+    uint32_t n = 0;
+    while (*prefix) path[n++] = *prefix++;
+    for (; *name && n + 1 < sizeof(path); ++name) path[n++] = *name;
+    if (*name) return nullptr;
+    path[n] = 0;
+    Vnode* vn = VfsOpen(path, 0);
+    if (!vn) return nullptr;
+    auto* pixels = static_cast<uint32_t*>(kmalloc(LAUNCHER_ICON_BYTES));
+    uint64_t offset = 0;
+    if (pixels)
+    {
+        uint32_t done = 0;
+        while (done < LAUNCHER_ICON_BYTES)
+        {
+            int rd = VfsRead(vn, reinterpret_cast<uint8_t*>(pixels) + done,
+                             LAUNCHER_ICON_BYTES - done, &offset);
+            if (rd <= 0) break;
+            done += static_cast<uint32_t>(rd);
+        }
+        if (done != LAUNCHER_ICON_BYTES) { kfree(pixels); pixels = nullptr; }
+    }
+    VfsClose(vn);
+    return pixels;
+}
+
 static void LauncherLoadIcon(LauncherItem* item)
 {
-    // Build icon path: /nix/share/applications/icons/<title_lower>.rgba
-    char iconPath[192];
-    const char* prefix = "/nix/share/applications/icons/";
-    uint32_t pi = 0;
-    while (*prefix && pi < sizeof(iconPath) - 1)
-        iconPath[pi++] = *prefix++;
-
-    // Convert title to lowercase filename
-    for (uint32_t i = 0; item->title[i] && pi < sizeof(iconPath) - 6; ++i)
+    char name[64]; uint32_t n = 0;
+    for (const char* p = item->title; *p && n + 6 < sizeof(name); ++p)
     {
-        char c = item->title[i];
-        if (c >= 'A' && c <= 'Z') c += 32;
-        else if (c == ' ' || c == '/') c = '_';
-        else if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_'))
-            continue;
-        iconPath[pi++] = c;
+        char c = *p;
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        if (c == ' ') c = '_';
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-') name[n++] = c;
     }
-    iconPath[pi++] = '.';
-    iconPath[pi++] = 'r';
-    iconPath[pi++] = 'g';
-    iconPath[pi++] = 'b';
-    iconPath[pi++] = 'a';
-    iconPath[pi] = '\0';
-
-    Vnode* vn = VfsOpen(iconPath, 0);
-    if (!vn) return;
-
-    uint64_t offset = 0;
-    uint32_t* pixels = static_cast<uint32_t*>(kmalloc(LAUNCHER_ICON_BYTES));
-    if (!pixels) { VfsClose(vn); return; }
-
-    int rd = VfsRead(vn, pixels, LAUNCHER_ICON_BYTES, &offset);
-    VfsClose(vn);
-
-    if (rd == static_cast<int>(LAUNCHER_ICON_BYTES))
-    {
-        item->iconPixels = pixels;
-    }
-    else
-    {
-        kfree(pixels);
-    }
+    WmStrCopy(name + n, ".rgba", sizeof(name) - n);
+    item->iconPixels = LoadIconFile(name);
 }
 
-// Helper: case-insensitive prefix compare
-static bool StrStartsWithI(const char* str, const char* prefix)
+static bool LauncherFileExists(const char* path)
 {
-    while (*prefix)
-    {
-        char a = *str++;
-        char b = *prefix++;
-        if (a >= 'A' && a <= 'Z') a += 32;
-        if (b >= 'A' && b <= 'Z') b += 32;
-        if (a != b) return false;
-    }
-    return true;
+    VnodeStat st{};
+    return path[0] == '/' && VfsStatPath(path, &st) == 0 && !st.isDir;
 }
 
-// Load .desktop entries from the nix disk manifest.
-// Format: Name\tExec\tIconFile\tCategories\n
-static void LauncherLoadDesktopEntries()
+static bool LauncherExecutable(const char* command, char* executable, uint32_t capacity)
 {
-    Vnode* vn = VfsOpen("/nix/share/applications/applications.idx", 0);
-    if (!vn)
+    char path[256]; uint32_t n = 0;
+    while (*command == ' ' || *command == '\t') ++command;
+    char quote = (*command == '\"' || *command == '\'') ? *command++ : 0;
+    while (*command && (quote ? *command != quote : *command != ' ' && *command != '\t'))
     {
-        SerialPuts("WM: no /nix/share/applications/applications.idx\n");
-        return;
+        if (n + 1 >= sizeof(path)) return false;
+        path[n++] = *command++;
     }
+    if (!n || (quote && *command != quote)) return false;
+    path[n] = 0;
+    WmStrCopy(executable, WmBaseName(path), capacity);
+    if (path[0] == '/') {
+        if (strncmp(path, "/nix/store/", 11) != 0) return LauncherFileExists(path);
+        // Store objects survive profile removal. A desktop entry is installed
+        // only while the active profile exposes this same executable, not just
+        // another package's executable with an identical basename. stat follows
+        // profile symlinks; compare mount identity as well as the inode.
+        const char* basename = WmBaseName(path);
+        if (!*basename) return false;
+        char profile[288];
+        constexpr char prefix[] = "/nix/profile/bin/";
+        constexpr uint32_t prefixLength = sizeof(prefix) - 1;
+        WmStrCopy(profile, prefix, sizeof(profile));
+        WmStrCopy(profile + prefixLength, basename, sizeof(profile) - prefixLength);
+        VnodeStat target{}, installed{};
+        return VfsStatPath(path, &target) == 0 && !target.isDir && target.ino &&
+               VfsStatPath(profile, &installed) == 0 && !installed.isDir &&
+               target.dev == installed.dev && target.ino == installed.ino;
+    }
+    // Only a bare executable name may be searched in installed package bins.
+    for (uint32_t i = 0; i < n; ++i) if (path[i] == '/') return false;
+    const char* roots[] = {"/nix/profile/bin/", "/nix/bin/"};
+    for (const char* root : roots)
+    {
+        char resolved[288]; uint32_t p = 0;
+        while (*root) resolved[p++] = *root++;
+        WmStrCopy(resolved + p, path, sizeof(resolved) - p);
+        if (LauncherFileExists(resolved)) return true;
+    }
+    return false;
+}
 
-    // Read the manifest (limited to 8KB for now)
-    char buf[8192];
-    uint64_t offset = 0;
+static bool ShortcutRequirementsMet(const char* path)
+{
+    Vnode* vn = VfsOpen(path, 0);
+    if (!vn) return false;
+    char buf[1024]; uint64_t offset = 0;
     int rd = VfsRead(vn, buf, sizeof(buf) - 1, &offset);
     VfsClose(vn);
-    if (rd <= 0) return;
-    buf[rd] = '\0';
-
-    char* p = buf;
-    while (*p && g_launcherCount < WM_LAUNCHER_MAX_ITEMS)
+    if (rd <= 0) return false;
+    buf[rd] = 0;
+    bool declared = false;
+    for (char* line = buf; *line;)
     {
-        // Parse one line: Name\tExec\tIconFile\tCategories\n
-        char* lineEnd = p;
-        while (*lineEnd && *lineEnd != '\n') ++lineEnd;
-
-        char* name = p;
-        char* exec = nullptr;
-        char* iconFile = nullptr;
-
-        // Find tab separators
-        char* tab1 = name;
-        while (*tab1 && *tab1 != '\t' && *tab1 != '\n') ++tab1;
-        if (*tab1 == '\t') { *tab1 = '\0'; exec = tab1 + 1; }
-
-        char* tab2 = exec ? exec : tab1;
-        while (*tab2 && *tab2 != '\t' && *tab2 != '\n') ++tab2;
-        if (*tab2 == '\t') { *tab2 = '\0'; iconFile = tab2 + 1; }
-
-        char* tab3 = iconFile ? iconFile : tab2;
-        while (*tab3 && *tab3 != '\t' && *tab3 != '\n') ++tab3;
-        if (*tab3 == '\t' || *tab3 == '\n') *tab3 = '\0';
-
-        if (name[0] && exec && exec[0])
+        char* end = line;
+        while (*end && *end != '\n') ++end;
+        const bool more = *end != 0; *end = 0;
+        const char* p = line;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (*p != '#') break;
+        ++p; while (*p == ' ' || *p == '\t') ++p;
+        if (strncmp(p, "Requires:", 9) == 0)
         {
-            // Check for duplicate (same title already loaded from shortcuts)
-            bool dup = false;
-            for (uint32_t i = 0; i < g_launcherCount; ++i)
-            {
-                if (StrStartsWithI(g_launcherItems[i].title, name) &&
-                    g_launcherItems[i].title[0])
-                {
-                    // If existing shortcut doesn't have an icon, try to load one
-                    if (!g_launcherItems[i].iconPixels && iconFile && iconFile[0])
-                    {
-                        char path[192];
-                        uint32_t idx = 0;
-                        const char* pfx = "/nix/share/applications/icons/";
-                        while (*pfx && idx < sizeof(path) - 1) path[idx++] = *pfx++;
-                        uint32_t fi = 0;
-                        while (iconFile[fi] && iconFile[fi] != '\t' &&
-                               iconFile[fi] != '\n' && idx < sizeof(path) - 1)
-                            path[idx++] = iconFile[fi++];
-                        path[idx] = '\0';
+            p += 9; while (*p == ' ' || *p == '\t') ++p;
+            char dependency[256]; WmStrCopy(dependency, p, sizeof(dependency));
+            uint32_t len = strlen(dependency);
+            while (len && (dependency[len - 1] == ' ' || dependency[len - 1] == '\t' || dependency[len - 1] == '\r')) dependency[--len] = 0;
+            if (!WmEqualI(dependency, "builtin") && !LauncherFileExists(dependency)) return false;
+            declared = true;
+        }
+        if (!more) break;
+        line = end + 1;
+    }
+    return declared;
+}
 
-                        Vnode* iv = VfsOpen(path, 0);
-                        if (iv)
-                        {
-                            uint64_t ioff = 0;
-                            uint32_t* px = static_cast<uint32_t*>(kmalloc(LAUNCHER_ICON_BYTES));
-                            if (px)
-                            {
-                                int ird = VfsRead(iv, px, LAUNCHER_ICON_BYTES, &ioff);
-                                if (ird == static_cast<int>(LAUNCHER_ICON_BYTES))
-                                    g_launcherItems[i].iconPixels = px;
-                                else
-                                    kfree(px);
-                            }
-                            VfsClose(iv);
-                        }
-                    }
-                    dup = true;
-                    break;
-                }
+// A candidate is all-or-nothing: oversized/short/erroring manifests or item
+// overflow retain the published snapshot. Limits bound memory and scan work.
+static constexpr uint32_t LAUNCHER_MANIFEST_LIMIT = 64 * 1024;
+static constexpr uint32_t LAUNCHER_RECORD_LIMIT = 1024;
+
+static bool LauncherLoadDesktopEntries(LauncherSnapshot& launcher)
+{
+    const char* manifest = "/nix/share/applications/applications.idx";
+    VnodeStat st{};
+    if (VfsStatPath(manifest, &st) != 0) {
+        // ext2 currently conflates missing paths and I/O failures. A missing
+        // manifest is valid at first boot, but cannot safely replace a live
+        // menu. Removal notifications should publish an empty manifest.
+        if (!g_launcherLoaded) return true;
+        SerialPuts("WM: launcher manifest unavailable; retaining menu\n");
+        return false;
+    }
+    if (st.isDir || st.size > LAUNCHER_MANIFEST_LIMIT) {
+        SerialPuts("WM: launcher manifest exceeds 64KiB limit or is not a file; retaining menu\n");
+        return false;
+    }
+    Vnode* vn = VfsOpen(manifest, 0);
+    if (!vn) return false;
+    char* buf = static_cast<char*>(kmalloc(LAUNCHER_MANIFEST_LIMIT + 2));
+    if (!buf) { VfsClose(vn); return false; }
+    uint64_t offset = 0; uint32_t done = 0; bool ok = true;
+    while (done <= LAUNCHER_MANIFEST_LIMIT)
+    {
+        int rd = VfsRead(vn, buf + done, LAUNCHER_MANIFEST_LIMIT + 1 - done, &offset);
+        if (rd < 0) { ok = false; break; }
+        if (!rd) break;
+        done += static_cast<uint32_t>(rd);
+    }
+    VfsClose(vn);
+    if (done > LAUNCHER_MANIFEST_LIMIT || done != st.size) ok = false;
+    // Embedded NUL would silently hide records if treated as a C string.
+    for (uint32_t i = 0; i < done && ok; ++i) if (!buf[i]) ok = false;
+    buf[done] = 0;
+    for (char* line = buf; ok && *line;)
+    {
+        char* end = line; while (*end && *end != '\n') ++end;
+        const bool more = *end != 0;
+        if (end - line > LAUNCHER_RECORD_LIMIT) { ok = false; break; }
+        *end = 0;
+        if (end > line && end[-1] == '\r') end[-1] = 0;
+        if (!*line) { if (!more) break; line = end + 1; continue; }
+        char* fields[5] = {line, nullptr, nullptr, nullptr, nullptr};
+        uint32_t count = 1;
+        for (char* p = line; *p && count < 5; ++p)
+            if (*p == '\t') { *p = 0; fields[count++] = p + 1; }
+        if (count < 2 || !fields[0][0] || strlen(fields[1]) >= sizeof(LauncherItem{}.scriptPath) ||
+            (count >= 5 && strlen(fields[4]) >= sizeof(LauncherItem{}.appId))) { ok = false; break; }
+        char executable[64] = {};
+        if (LauncherExecutable(fields[1], executable, sizeof(executable)))
+        {
+            LauncherItem* item = nullptr;
+            for (uint32_t i = 0; i < launcher.count; ++i)
+                if (WmEqualI(launcher.items[i].title, fields[0])) { item = &launcher.items[i]; break; }
+            if (!item)
+            {
+                if (launcher.count == WM_LAUNCHER_MAX_ITEMS) { ok = false; break; }
+                item = &launcher.items[launcher.count++];
+                item->valid = true; item->isDesktopEntry = true;
+                WmStrCopy(item->title, fields[0], sizeof(item->title));
+                WmStrCopy(item->scriptPath, fields[1], sizeof(item->scriptPath));
             }
+            WmStrCopy(item->executable, executable, sizeof(item->executable));
+            if (count >= 5) WmStrCopy(item->appId, fields[4], sizeof(item->appId));
+            if (!item->iconPixels && count >= 3) item->iconPixels = LoadIconFile(fields[2]);
+            if (!item->iconPixels) LauncherLoadIcon(item);
+        }
+        if (!more) break;
+        line = end + 1;
+    }
+    kfree(buf);
+    if (!ok) SerialPuts("WM: launcher manifest read/record/capacity error (64KiB/1KiB/128 items); retaining menu\n");
+    return ok;
+}
 
-            if (!dup)
+static void FreeLauncherSnapshot(LauncherSnapshot* snapshot)
+{
+    if (!snapshot || snapshot == &g_emptyLauncher) return;
+    for (uint32_t i = 0; i < snapshot->count; ++i) kfree(snapshot->items[i].iconPixels);
+    kfree(snapshot->applicationIcon); kfree(snapshot->terminalIcon); kfree(snapshot->appsIcon);
+    kfree(snapshot);
+}
+
+static LauncherSnapshot* BuildLauncherSnapshot(uint32_t generation)
+{
+    auto* snapshot = static_cast<LauncherSnapshot*>(kmalloc(sizeof(LauncherSnapshot)));
+    if (!snapshot) return nullptr;
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->generation = generation;
+    snapshot->applicationIcon = LoadIconFile("application.rgba");
+    snapshot->terminalIcon = LoadIconFile("terminal.rgba");
+    snapshot->appsIcon = LoadIconFile("applications.rgba");
+    bool ok = true;
+    Vnode* dir = VfsOpen("/boot/SHORTCUTS", 0);
+    if (dir)
+    {
+        DirEntry de; uint32_t cookie = 0; int rd;
+        while ((rd = VfsReaddir(dir, &de, &cookie)) == 1)
+        {
+            if (de.isDir) continue;
+            LauncherItem item{};
+            const char* prefix = "/boot/SHORTCUTS/";
+            const uint32_t prefixLen = strlen(prefix);
+            if (prefixLen + strlen(de.name) >= sizeof(item.scriptPath)) { ok = false; break; }
+            WmStrCopy(item.scriptPath, prefix, sizeof(item.scriptPath));
+            WmStrCopy(item.scriptPath + prefixLen, de.name, sizeof(item.scriptPath) - prefixLen);
+            if (!ShortcutRequirementsMet(item.scriptPath)) continue;
+            if (snapshot->count == WM_LAUNCHER_MAX_ITEMS) { ok = false; break; }
+            if (!ParseShortcutTitle(item.scriptPath, item.title, sizeof(item.title)))
             {
-                LauncherItem& item = g_launcherItems[g_launcherCount];
-                item.iconPixels = nullptr;
-                item.isDesktopEntry = true;
-                item.valid = true;
-
-                // Copy title
                 uint32_t ti = 0;
-                while (name[ti] && ti < sizeof(item.title) - 1)
-                { item.title[ti] = name[ti]; ++ti; }
-                item.title[ti] = '\0';
+                for (uint32_t j = 0; de.name[j] && de.name[j] != '.' && ti + 1 < sizeof(item.title); ++j)
+                    item.title[ti++] = de.name[j];
+                item.title[ti] = 0;
+            }
+            item.valid = true;
+            LauncherLoadIcon(&item);
+            snapshot->items[snapshot->count++] = item;
+        }
+        if (rd < 0) ok = false;
+        VfsClose(dir);
+    }
+    else if (g_launcherLoaded) {
+        SerialPuts("WM: shortcut directory unavailable; retaining menu\n");
+        ok = false;
+    }
+    if (ok) ok = LauncherLoadDesktopEntries(*snapshot);
+    if (!ok) {
+        SerialPuts("WM: launcher rebuild failed; previous snapshot retained\n");
+        FreeLauncherSnapshot(snapshot);
+        return nullptr;
+    }
+    return snapshot;
+}
 
-                // Copy exec path
-                uint32_t ei = 0;
-                while (exec[ei] && exec[ei] != '\t' && exec[ei] != '\n' &&
-                       ei < sizeof(item.scriptPath) - 1)
-                { item.scriptPath[ei] = exec[ei]; ++ei; }
-                item.scriptPath[ei] = '\0';
-
-                item.iconColor = LauncherIconColor(item.title);
-
-                // Try to load icon
-                if (iconFile && iconFile[0])
-                {
-                    char path[192];
-                    uint32_t idx = 0;
-                    const char* pfx = "/nix/share/applications/icons/";
-                    while (*pfx && idx < sizeof(path) - 1) path[idx++] = *pfx++;
-                    uint32_t fi = 0;
-                    while (iconFile[fi] && iconFile[fi] != '\t' &&
-                           iconFile[fi] != '\n' && idx < sizeof(path) - 1)
-                        path[idx++] = iconFile[fi++];
-                    path[idx] = '\0';
-
-                    Vnode* iv = VfsOpen(path, 0);
-                    if (iv)
-                    {
-                        uint64_t ioff = 0;
-                        uint32_t* px = static_cast<uint32_t*>(kmalloc(LAUNCHER_ICON_BYTES));
-                        if (px)
-                        {
-                            int ird = VfsRead(iv, px, LAUNCHER_ICON_BYTES, &ioff);
-                            if (ird == static_cast<int>(LAUNCHER_ICON_BYTES))
-                                item.iconPixels = px;
-                            else
-                                kfree(px);
-                        }
-                        VfsClose(iv);
-                    }
-                }
-
-                SerialPrintf("WM: launcher[%u] = '%s' -> %s [desktop]%s\n",
-                             g_launcherCount, item.title, item.scriptPath,
-                             item.iconPixels ? " [icon]" : "");
-                g_launcherCount++;
+static void LauncherWorker(void*)
+{
+    uint32_t attempted = 0;
+    { LauncherReadGuard guard; attempted = guard.get().generation; }
+    for (;;)
+    {
+        LauncherSnapshot* disposable = nullptr;
+        SpinLockAcquire(&g_launcherLock);
+        if (g_launcherRetired && !__atomic_load_n(&g_launcherRetired->refs, __ATOMIC_ACQUIRE)) {
+            disposable = g_launcherRetired;
+            g_launcherRetired = nullptr;
+        }
+        const bool occupied = g_launcherPending || g_launcherRetired;
+        SpinLockRelease(&g_launcherLock);
+        FreeLauncherSnapshot(disposable);
+        const uint32_t requested = __atomic_load_n(&g_launcherRequested, __ATOMIC_ACQUIRE);
+        if (!occupied && requested != attempted)
+        {
+            LauncherSnapshot* next = BuildLauncherSnapshot(requested);
+            attempted = requested; // failure retries on the next notification/open
+            if (next)
+            {
+                SpinLockAcquire(&g_launcherLock);
+                g_launcherPending = next;
+                SpinLockRelease(&g_launcherLock);
+                CompositorWake();
             }
         }
-
-        p = (*lineEnd == '\n') ? lineEnd + 1 : lineEnd;
+        // One worker, coalesced requests, no busy waiting or retained rebuild
+        // list. A slow reader delays reclamation and subsequent builds.
+        SchedulerSleepMs(250);
     }
+}
+
+static void LauncherStartWorker()
+{
+    bool expected = false;
+    if (!__atomic_compare_exchange_n(&g_launcherWorkerStarted, &expected, true,
+                                     false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
+    Process* worker = KernelThreadCreate("launcher", LauncherWorker, nullptr, 3);
+    if (!worker) {
+        __atomic_store_n(&g_launcherWorkerStarted, false, __ATOMIC_RELEASE);
+        SerialPuts("WM: launcher worker allocation failed\n");
+        return;
+    }
+    SchedulerAddProcess(worker);
 }
 
 void WmLauncherLoad()
 {
     if (g_launcherLoaded) return;
+    const uint32_t generation = __atomic_load_n(&g_launcherRequested, __ATOMIC_ACQUIRE);
+    LauncherSnapshot* snapshot = BuildLauncherSnapshot(generation);
+    if (snapshot)
+    {
+        // Initial activation precedes rendering; later publication belongs
+        // exclusively to the compositor's frame-boundary hook.
+        SpinLockAcquire(&g_launcherLock);
+        g_launcherActive = snapshot;
+        SpinLockRelease(&g_launcherLock);
+        SerialPrintf("WM: launcher initial generation=%u items=%u\n", generation, snapshot->count);
+    }
     g_launcherLoaded = true;
-    g_launcherCount = 0;
-
-    // --- Phase 1: Load .rc shortcut scripts from /boot/SHORTCUTS/ ---
-    Vnode* dir = VfsOpen("/boot/SHORTCUTS", 0);
-    if (!dir)
-    {
-        SerialPuts("WM: no /boot/SHORTCUTS directory\n");
-    }
-    else
-    {
-        DirEntry de;
-        uint32_t cookie = 0;
-        while (VfsReaddir(dir, &de, &cookie) == 1 && g_launcherCount < WM_LAUNCHER_MAX_ITEMS)
-        {
-            if (de.isDir) continue;
-
-            LauncherItem& item = g_launcherItems[g_launcherCount];
-            item.iconPixels = nullptr;
-            item.isDesktopEntry = false;
-            uint32_t pi = 0;
-            const char* prefix = "/boot/SHORTCUTS/";
-            while (*prefix && pi < sizeof(item.scriptPath) - 1)
-                item.scriptPath[pi++] = *prefix++;
-            uint32_t ni = 0;
-            while (de.name[ni] && pi < sizeof(item.scriptPath) - 1)
-                item.scriptPath[pi++] = de.name[ni++];
-            item.scriptPath[pi] = '\0';
-
-            if (!ParseShortcutTitle(item.scriptPath, item.title, sizeof(item.title)))
-            {
-                uint32_t ti = 0;
-                for (uint32_t j = 0; de.name[j] && de.name[j] != '.' && ti < sizeof(item.title) - 1; ++j)
-                    item.title[ti++] = de.name[j];
-                item.title[ti] = '\0';
-            }
-
-            item.valid = true;
-            item.iconColor = LauncherIconColor(item.title);
-
-            // Try to load a matching icon from /nix/share/applications/icons/
-            LauncherLoadIcon(&item);
-
-            SerialPrintf("WM: launcher[%u] = '%s' -> %s%s\n",
-                         g_launcherCount, item.title, item.scriptPath,
-                         item.iconPixels ? " [icon]" : "");
-            g_launcherCount++;
-        }
-        VfsClose(dir);
-    }
-
-    // --- Phase 2: Load .desktop entries from /nix/share/applications/applications.idx ---
-    LauncherLoadDesktopEntries();
-
-    SerialPrintf("WM: loaded %u launcher items total\n", g_launcherCount);
 }
 
 void WmLauncherToggle()
 {
-    if (!g_launcherLoaded) WmLauncherLoad();
+    // Loading belongs to WmSetActive (shell context), never the input/render thread.
+    if (!g_launcherLoaded) return;
     g_launcherOpen = !g_launcherOpen;
-    if (g_launcherOpen) g_launcherScroll = 0; // reset scroll on open
+    if (g_launcherOpen) {
+        g_launcherScroll = 0;
+        WmRequestLauncherRefresh(); // also catches installs/removals outside the installer
+    }
 }
 
 bool WmLauncherVisible()
@@ -1817,120 +1741,141 @@ bool WmLauncherVisible()
     return g_launcherOpen;
 }
 
-// Compute how many columns and visible items the launcher should show
-static uint32_t LauncherColumns(uint32_t totalValid)
+struct LauncherLayout
 {
-    if (totalValid <= LAUNCHER_MAX_ROWS) return 1;
-    if (totalValid <= LAUNCHER_MAX_ROWS * 2) return 2;
-    return LAUNCHER_MAX_COLS;
+    int x, y;
+    uint32_t w, h, cols, rows, itemW, capacity;
+};
+
+static LauncherLayout GetLauncherLayout(uint32_t screenW, uint32_t screenH,
+                                        const LauncherSnapshot& launcher)
+{
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < launcher.count; ++i)
+        if (launcher.items[i].valid) ++total;
+    const uint32_t desktopH = screenH > WM_TASKBAR_HEIGHT ? screenH - WM_TASKBAR_HEIGHT : 0;
+    LauncherLayout l = {};
+    l.x = screenW > 8 ? 4 : 0;
+    const uint32_t availableW = screenW > 8 ? screenW - 8 : screenW;
+    const uint32_t availableH = desktopH > 4 ? desktopH - 4 : desktopH;
+    const uint32_t fixedH = LAUNCHER_ITEM_HEIGHT + 2 * LAUNCHER_PADDING;
+    l.rows = availableH > fixedH ? (availableH - fixedH) / (LAUNCHER_ITEM_HEIGHT + 2) : 0;
+    if (l.rows > LAUNCHER_MAX_ROWS) l.rows = LAUNCHER_MAX_ROWS;
+    l.cols = l.rows ? (total + l.rows - 1) / l.rows : 1;
+    if (!l.cols) l.cols = 1;
+    if (l.cols > LAUNCHER_MAX_COLS) l.cols = LAUNCHER_MAX_COLS;
+    uint32_t fitCols = availableW > 2 * LAUNCHER_PADDING ?
+        (availableW - 2 * LAUNCHER_PADDING) / (LAUNCHER_ITEM_WIDTH + 4) : 0;
+    if (!fitCols) fitCols = 1;
+    if (l.cols > fitCols) l.cols = fitCols;
+    l.itemW = availableW > 2 * LAUNCHER_PADDING + 4 ?
+        (availableW - 2 * LAUNCHER_PADDING) / l.cols - 4 : 0;
+    if (l.itemW > LAUNCHER_ITEM_WIDTH) l.itemW = LAUNCHER_ITEM_WIDTH;
+    uint32_t neededRows = (total + l.cols - 1) / l.cols;
+    if (l.rows > neededRows) l.rows = neededRows;
+    l.capacity = l.rows * l.cols;
+    uint32_t maxScroll = total > l.capacity ? total - l.capacity : 0;
+    if (g_launcherScroll > maxScroll) g_launcherScroll = maxScroll;
+    l.w = l.cols * (l.itemW + 4) + 2 * LAUNCHER_PADDING;
+    if (l.w > availableW) l.w = availableW;
+    l.h = fixedH + l.rows * (LAUNCHER_ITEM_HEIGHT + 2);
+    if (l.h > availableH) l.h = availableH;
+    l.y = static_cast<int>(desktopH) - static_cast<int>(l.h) - 2;
+    if (l.y < 0) l.y = 0;
+    return l;
 }
 
-static uint32_t LauncherMaxVisible(uint32_t totalValid)
+static WmRect LauncherItemRect(const LauncherLayout& l, uint32_t slot)
 {
-    return LauncherColumns(totalValid) * LAUNCHER_MAX_ROWS;
+    return {l.x + static_cast<int>(LAUNCHER_PADDING + (slot % l.cols) * (l.itemW + 4)),
+            l.y + static_cast<int>(LAUNCHER_PADDING + LAUNCHER_ITEM_HEIGHT +
+                                   (slot / l.cols) * (LAUNCHER_ITEM_HEIGHT + 2)),
+            static_cast<int>(l.itemW), static_cast<int>(LAUNCHER_ITEM_HEIGHT)};
 }
 
-void WmLauncherScroll(int delta, uint32_t /*screenW*/, uint32_t /*screenH*/)
+void WmLauncherScroll(int delta, uint32_t screenW, uint32_t screenH)
 {
     if (!g_launcherOpen) return;
-
-    // Count total valid items
-    uint32_t totalValid = 0;
-    for (uint32_t i = 0; i < g_launcherCount; i++)
-        if (g_launcherItems[i].valid) totalValid++;
-
-    uint32_t maxVisible = LauncherMaxVisible(totalValid);
-    if (totalValid <= maxVisible) return; // no scrolling needed
-
-    uint32_t maxScroll = totalValid - maxVisible;
-    // Positive delta = wheel up = show earlier items (decrease offset)
-    if (delta < 0 && g_launcherScroll < maxScroll)
-        g_launcherScroll++;
-    else if (delta > 0 && g_launcherScroll > 0)
-        g_launcherScroll--;
+    LauncherReadGuard guard;
+    const auto& launcher = guard.get();
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < launcher.count; ++i)
+        if (launcher.items[i].valid) ++total;
+    const LauncherLayout l = GetLauncherLayout(screenW, screenH, launcher);
+    if (!l.capacity || total <= l.capacity) return;
+    if (delta < 0 && g_launcherScroll < total - l.capacity) ++g_launcherScroll;
+    else if (delta > 0 && g_launcherScroll) --g_launcherScroll;
 }
 
-// Get the launcher panel geometry (anchored above the Apps button on the taskbar)
 static void LauncherGetRect(uint32_t screenW, uint32_t screenH,
                             int32_t* outX, int32_t* outY,
-                            uint32_t* outW, uint32_t* outH)
+                            uint32_t* outW, uint32_t* outH, const LauncherSnapshot& launcher)
 {
-    uint32_t totalValid = 0;
-    for (uint32_t i = 0; i < g_launcherCount; i++)
-        if (g_launcherItems[i].valid) totalValid++;
-    if (totalValid == 0) totalValid = 1;
-
-    uint32_t cols = LauncherColumns(totalValid);
-    uint32_t maxVisible = LauncherMaxVisible(totalValid);
-    uint32_t visibleItems = totalValid < maxVisible ? totalValid : maxVisible;
-    uint32_t rows = (visibleItems + cols - 1) / cols;
-
-    uint32_t headerH = LAUNCHER_ITEM_HEIGHT; // "Apps" header row
-    uint32_t panelW = cols * (LAUNCHER_ITEM_WIDTH + 4) + LAUNCHER_PADDING * 2;
-    uint32_t panelH = headerH + rows * (LAUNCHER_ITEM_HEIGHT + 2) + LAUNCHER_PADDING * 2;
-
-    *outX = static_cast<int32_t>(WM_TASKBAR_PADDING);
-    *outY = static_cast<int32_t>(screenH - WM_TASKBAR_HEIGHT - panelH - 2);
-    *outW = panelW;
-    *outH = panelH;
+    const LauncherLayout l = GetLauncherLayout(screenW, screenH, launcher);
+    *outX = l.x; *outY = l.y; *outW = l.w; *outH = l.h;
 }
 
 void WmLauncherGetRect(uint32_t screenW, uint32_t screenH,
                        int32_t* outX, int32_t* outY,
                        uint32_t* outW, uint32_t* outH)
 {
-    LauncherGetRect(screenW, screenH, outX, outY, outW, outH);
+    LauncherReadGuard guard;
+    LauncherGetRect(screenW, screenH, outX, outY, outW, outH, guard.get());
 }
 
 void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
                       uint32_t screenW, uint32_t screenH,
                       int32_t mouseX, int32_t mouseY)
 {
-    if (!g_launcherOpen || g_launcherCount == 0) return;
+    LauncherReadGuard guard;
+    const auto& launcher = guard.get();
+    if (!g_launcherOpen || launcher.count == 0) return;
 
     int32_t px, py;
     uint32_t pw, ph;
-    LauncherGetRect(screenW, screenH, &px, &py, &pw, &ph);
+    LauncherGetRect(screenW, screenH, &px, &py, &pw, &ph, launcher);
 
     // Panel background
     WmFillRect(backBuffer, stride, screenW, screenH,
-               px, py, static_cast<int>(pw), static_cast<int>(ph), LAUNCHER_BG);
+               px, py, static_cast<int>(pw), static_cast<int>(ph), WmCurrentPalette().launcher);
 
     // Border
-    WmFillRect(backBuffer, stride, screenW, screenH, px, py, static_cast<int>(pw), 1, LAUNCHER_BORDER_CLR);
-    WmFillRect(backBuffer, stride, screenW, screenH, px, py + static_cast<int32_t>(ph) - 1, static_cast<int>(pw), 1, LAUNCHER_BORDER_CLR);
-    WmFillRect(backBuffer, stride, screenW, screenH, px, py, 1, static_cast<int>(ph), LAUNCHER_BORDER_CLR);
-    WmFillRect(backBuffer, stride, screenW, screenH, px + static_cast<int32_t>(pw) - 1, py, 1, static_cast<int>(ph), LAUNCHER_BORDER_CLR);
+    WmFillRect(backBuffer, stride, screenW, screenH, px, py, static_cast<int>(pw), 1, WmCurrentPalette().launcherBorder);
+    WmFillRect(backBuffer, stride, screenW, screenH, px, py + static_cast<int32_t>(ph) - 1, static_cast<int>(pw), 1, WmCurrentPalette().launcherBorder);
+    WmFillRect(backBuffer, stride, screenW, screenH, px, py, 1, static_cast<int>(ph), WmCurrentPalette().launcherBorder);
+    WmFillRect(backBuffer, stride, screenW, screenH, px + static_cast<int32_t>(pw) - 1, py, 1, static_cast<int>(ph), WmCurrentPalette().launcherBorder);
 
-    uint32_t textYOff = (LAUNCHER_ITEM_HEIGHT - static_cast<uint32_t>(g_fontAtlas.lineHeight)) / 2;
+    int textYOff = (static_cast<int>(LAUNCHER_ITEM_HEIGHT) - g_fontAtlas.lineHeight) / 2;
+
+    // Extremely small surfaces cannot fit even the header.
+    if (ph < LAUNCHER_ITEM_HEIGHT + 2 * LAUNCHER_PADDING || pw < 2 * LAUNCHER_PADDING + 1) return;
 
     // Header: "Applications"
     int32_t iy = py + static_cast<int32_t>(LAUNCHER_PADDING);
-    WmRenderString(backBuffer, stride, screenW, screenH,
+    if (pw > 56) WmRenderString(backBuffer, stride, screenW, screenH,
                    px + static_cast<int32_t>(LAUNCHER_PADDING) + 4,
                    iy + static_cast<int32_t>(textYOff),
-                   "Applications", LAUNCHER_HEADER_FG, LAUNCHER_BG);
+                   "Applications", WmCurrentPalette().secondaryText, WmCurrentPalette().launcher, static_cast<int>(pw) - 56);
     iy += LAUNCHER_ITEM_HEIGHT;
 
     // Separator line below header
     WmFillRect(backBuffer, stride, screenW, screenH,
                px + static_cast<int32_t>(LAUNCHER_PADDING),
-               iy - 1, static_cast<int>(LAUNCHER_ITEM_WIDTH), 1, LAUNCHER_BORDER_CLR);
+               iy - 1, static_cast<int>(pw) - 2 * LAUNCHER_PADDING, 1, WmCurrentPalette().launcherBorder);
 
     // Items — render in multi-column layout based on scroll offset
     uint32_t totalValid = 0;
-    for (uint32_t i = 0; i < g_launcherCount; i++)
-        if (g_launcherItems[i].valid) totalValid++;
+    for (uint32_t i = 0; i < launcher.count; i++)
+        if (launcher.items[i].valid) totalValid++;
 
-    uint32_t cols = LauncherColumns(totalValid);
-    uint32_t maxVisible = LauncherMaxVisible(totalValid);
-    uint32_t colWidth = LAUNCHER_ITEM_WIDTH + 4;
+    const LauncherLayout layout = GetLauncherLayout(screenW, screenH, launcher);
+    uint32_t maxVisible = layout.capacity;
 
     uint32_t validIdx = 0;
     uint32_t rendered = 0;
-    for (uint32_t i = 0; i < g_launcherCount && rendered < maxVisible; i++)
+    for (uint32_t i = 0; i < launcher.count && rendered < maxVisible; i++)
     {
-        if (!g_launcherItems[i].valid) continue;
+        if (!launcher.items[i].valid) continue;
 
         // Skip items before scroll offset
         if (validIdx < g_launcherScroll)
@@ -1940,104 +1885,84 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
         }
         validIdx++;
 
-        uint32_t col = rendered % cols;
-        uint32_t row = rendered / cols;
-
-        int32_t itemX = px + static_cast<int32_t>(LAUNCHER_PADDING + col * colWidth);
-        int32_t itemY = iy + static_cast<int32_t>(row * (LAUNCHER_ITEM_HEIGHT + 2));
-
-        // Hover detection
-        bool hovered = (mouseX >= itemX &&
-                        mouseX < itemX + static_cast<int32_t>(LAUNCHER_ITEM_WIDTH) &&
-                        mouseY >= itemY &&
-                        mouseY < itemY + static_cast<int32_t>(LAUNCHER_ITEM_HEIGHT));
-        uint32_t itemBg = hovered ? 0x00404060 : LAUNCHER_ITEM_BG;
+        const WmRect item = LauncherItemRect(layout, rendered);
+        const int itemX = item.x, itemY = item.y;
+        bool hovered = item.contains(mouseX, mouseY);
+        uint32_t itemBg = hovered ? WmCurrentPalette().itemHover : WmCurrentPalette().launcher;
 
         WmFillRect(backBuffer, stride, screenW, screenH,
                    itemX, itemY,
-                   static_cast<int>(LAUNCHER_ITEM_WIDTH),
+                   static_cast<int>(layout.itemW),
                    static_cast<int>(LAUNCHER_ITEM_HEIGHT),
                    itemBg);
 
         // Draw icon
         int32_t iconX = itemX + 6;
         int32_t iconY = itemY + static_cast<int32_t>((LAUNCHER_ITEM_HEIGHT - LAUNCHER_ICON_SIZE) / 2);
-        LauncherDrawIcon(backBuffer, stride, screenW, screenH,
-                         iconX, iconY, &g_launcherItems[i]);
+        if (layout.itemW >= LAUNCHER_ICON_SIZE + 12)
+            LauncherDrawIcon(backBuffer, stride, screenW, screenH,
+                             iconX, iconY, &launcher.items[i], launcher);
 
         // Title text (offset to right of icon)
         int32_t textX = iconX + static_cast<int32_t>(LAUNCHER_ICON_SIZE) +
                         static_cast<int32_t>(LAUNCHER_ICON_MARGIN);
-        uint32_t textFg = hovered ? 0x00FFFFFF : LAUNCHER_ITEM_FG;
-        uint32_t maxTextW = LAUNCHER_ITEM_WIDTH - LAUNCHER_ICON_SIZE - LAUNCHER_ICON_MARGIN - 12;
-        WmRenderString(backBuffer, stride, screenW, screenH,
+        uint32_t textFg = hovered ? WmCurrentPalette().text : WmCurrentPalette().taskText;
+        int maxTextW = static_cast<int>(layout.itemW) - static_cast<int>(LAUNCHER_ICON_SIZE + LAUNCHER_ICON_MARGIN + 12);
+        if (maxTextW > 0) WmRenderString(backBuffer, stride, screenW, screenH,
                        textX, itemY + static_cast<int32_t>(textYOff),
-                       g_launcherItems[i].title,
+                       launcher.items[i].title,
                        textFg, itemBg, maxTextW);
 
         rendered++;
     }
 
     // Scroll indicators (arrows) if content overflows
-    if (g_launcherScroll > 0)
+    if (pw >= 48 && g_launcherScroll > 0)
     {
-        // Up arrow indicator at top-right of panel
+        // Wheel-scroll hints live in the header, clear of application labels.
         WmRenderString(backBuffer, stride, screenW, screenH,
-                       px + static_cast<int32_t>(pw) - 16,
+                       px + static_cast<int32_t>(pw) - 32,
                        py + static_cast<int32_t>(LAUNCHER_PADDING) + static_cast<int32_t>(textYOff),
-                       "^", 0x0080A0C0, LAUNCHER_BG);
+                       "^", WmCurrentPalette().secondaryText, WmCurrentPalette().launcher);
     }
-    if (g_launcherScroll + maxVisible < totalValid)
+    if (pw >= 48 && g_launcherScroll + maxVisible < totalValid)
     {
-        // Down arrow indicator at bottom-right of panel
+        // Down arrow beside the up hint.
         WmRenderString(backBuffer, stride, screenW, screenH,
                        px + static_cast<int32_t>(pw) - 16,
-                       py + static_cast<int32_t>(ph) - static_cast<int32_t>(LAUNCHER_PADDING) - g_fontAtlas.lineHeight,
-                       "v", 0x0080A0C0, LAUNCHER_BG);
+                       py + static_cast<int32_t>(LAUNCHER_PADDING) + textYOff,
+                       "v", WmCurrentPalette().secondaryText, WmCurrentPalette().launcher);
     }
 }
 
 int WmLauncherHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
 {
-    if (!g_launcherOpen || g_launcherCount == 0) return -1;
+    LauncherReadGuard guard;
+    const auto& launcher = guard.get();
+    if (!g_launcherOpen || launcher.count == 0) return -1;
 
     int32_t px, py;
     uint32_t pw, ph;
-    LauncherGetRect(screenW, screenH, &px, &py, &pw, &ph);
+    LauncherGetRect(screenW, screenH, &px, &py, &pw, &ph, launcher);
 
     // Outside panel?
     if (mx < px || mx >= px + static_cast<int32_t>(pw) ||
         my < py || my >= py + static_cast<int32_t>(ph))
         return -1;
 
-    // Skip header
-    int32_t itemStartY = py + static_cast<int32_t>(LAUNCHER_PADDING + LAUNCHER_ITEM_HEIGHT);
-
-    uint32_t totalValid = 0;
-    for (uint32_t i = 0; i < g_launcherCount; i++)
-        if (g_launcherItems[i].valid) totalValid++;
-
-    uint32_t cols = LauncherColumns(totalValid);
-    uint32_t maxVisible = LauncherMaxVisible(totalValid);
-    uint32_t colWidth = LAUNCHER_ITEM_WIDTH + 4;
+    const LauncherLayout layout = GetLauncherLayout(screenW, screenH, launcher);
+    uint32_t maxVisible = layout.capacity;
 
     // Map visual slot to actual launcher item, accounting for scroll
     uint32_t validIdx = 0;
     uint32_t slot = 0;
-    for (uint32_t i = 0; i < g_launcherCount && slot < maxVisible; i++)
+    for (uint32_t i = 0; i < launcher.count && slot < maxVisible; i++)
     {
-        if (!g_launcherItems[i].valid) continue;
+        if (!launcher.items[i].valid) continue;
         if (validIdx < g_launcherScroll) { validIdx++; continue; }
         validIdx++;
 
-        uint32_t col = slot % cols;
-        uint32_t row = slot / cols;
-
-        int32_t itemX = px + static_cast<int32_t>(LAUNCHER_PADDING + col * colWidth);
-        int32_t itemY = itemStartY + static_cast<int32_t>(row * (LAUNCHER_ITEM_HEIGHT + 2));
-
-        if (mx >= itemX && mx < itemX + static_cast<int32_t>(LAUNCHER_ITEM_WIDTH) &&
-            my >= itemY && my < itemY + static_cast<int32_t>(LAUNCHER_ITEM_HEIGHT))
+        if (LauncherItemRect(layout, slot).contains(mx, my))
         {
             return static_cast<int>(i);
         }
@@ -2049,21 +1974,29 @@ int WmLauncherHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH
 
 void WmLauncherExec(int itemIdx)
 {
-    if (itemIdx < 0 || itemIdx >= static_cast<int>(g_launcherCount)) return;
-    if (!g_launcherItems[itemIdx].valid) return;
+    char title[48], command[128];
+    bool desktop;
+    {
+        LauncherReadGuard guard;
+        const auto& launcher = guard.get();
+        if (itemIdx < 0 || itemIdx >= static_cast<int>(launcher.count) || !launcher.items[itemIdx].valid) return;
+        WmStrCopy(title, launcher.items[itemIdx].title, sizeof(title));
+        WmStrCopy(command, launcher.items[itemIdx].scriptPath, sizeof(command));
+        desktop = launcher.items[itemIdx].isDesktopEntry;
+    }
 
     SerialPrintf("WM: launching '%s' via %s%s\n",
-                 g_launcherItems[itemIdx].title,
-                 g_launcherItems[itemIdx].scriptPath,
-                 g_launcherItems[itemIdx].isDesktopEntry ? " [desktop]" : "");
+                 title,
+                 command,
+                 desktop ? " [desktop]" : "");
 
     g_launcherOpen = false;
 
-    if (g_launcherItems[itemIdx].isDesktopEntry)
+    if (desktop)
     {
         // For .desktop entries: build an inline script that launches
         // waylandd + the app in WM mode, then exec directly from memory.
-        const char* exec = g_launcherItems[itemIdx].scriptPath;
+        const char* exec = command;
         char script[512];
         uint32_t si = 0;
         const char* hdr = "set wm\nset vfb none\nrun --once /nix/bin/waylandd\nrun ";
@@ -2079,7 +2012,7 @@ void WmLauncherExec(int itemIdx)
     {
         // Traditional .rc shortcut script
         extern int ShellExecScript(const char* path);
-        ShellExecScript(g_launcherItems[itemIdx].scriptPath);
+        ShellExecScript(command);
     }
 }
 
@@ -2327,6 +2260,16 @@ bool WmPresentExternalById(Process* proc, uint32_t wmId, uint32_t gres,
     win->externalW = w;
     win->externalH = h;
     win->vfbDirty = 1;   // drive a recompose of this window's content
+    CompositorWake();
+    return true;
+}
+
+bool WmSetAppIdById(Process* proc, uint32_t wmId, const char* appId)
+{
+    Window* w = WmFindWindowById(proc, wmId);
+    if (!w || !appId) return false;
+    WmStrCopy(w->appId, appId, sizeof(w->appId));
+    CompositorMarkDirty();
     CompositorWake();
     return true;
 }

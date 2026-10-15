@@ -81,11 +81,15 @@ a paused guest first when possible. Explicit `force: true` allows the action
 after a failed sync attempt and returns `guest_sync_completed: false` with its
 reason; cached allocation metadata may be lost and filesystems corrupted.
 
-Successful sync returns `guest_sync_completed: true` and
-`sync_guarantee: best_effort_metadata_flush`. Current VFS hooks do not report
-individual device failures or flush physical disk caches. The guest can also
+Current kernels return `guest_sync_completed: true` and
+`sync_guarantee: checked_filesystem_and_device_flush` after checking filesystem
+writeback and device flush results. A failed acknowledgement aborts shutdown
+before QMP; retry only after resolving the failure. Older kernels may report
+`best_effort_metadata_flush`, which is a weaker legacy guarantee. The guest can
 write again between sync and QMP shutdown, so this requires quiesced writers;
-it does not provide journaled crash recovery or a power-loss guarantee.
+it does not provide journaled crash recovery or prove physical power-loss
+behavior. The I/O acceptance gate injects failed flushes and verifies refusal,
+retry and offline filesystem consistency.
 
 ## Crash and audio limitations
 

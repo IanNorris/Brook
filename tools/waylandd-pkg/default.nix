@@ -29,6 +29,8 @@ stdenv.mkDerivation {
     wayland-scanner private-code   $XDG_XML  xdg-shell-protocol.c
     wayland-scanner server-header  $DECO_XML xdg-decoration-server-protocol.h
     wayland-scanner private-code   $DECO_XML xdg-decoration-protocol.c
+    wayland-scanner server-header  protocols/server-decoration.xml kde-server-decoration-server-protocol.h
+    wayland-scanner private-code   protocols/server-decoration.xml kde-server-decoration-protocol.c
     wayland-scanner server-header  $VP_XML   viewporter-server-protocol.h
     wayland-scanner private-code   $VP_XML   viewporter-protocol.c
     wayland-scanner server-header  $DMABUF_XML linux-dmabuf-unstable-v1-server-protocol.h
@@ -37,7 +39,7 @@ stdenv.mkDerivation {
     $CC -O2 -Wall -Wextra \
         -I${wayland.dev}/include -I. \
         waylandd.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
-        linux-dmabuf-unstable-v1-protocol.c \
+        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c \
         -L${wayland}/lib -lwayland-server \
         -Wl,-rpath,${wayland}/lib:${stdenv.cc.libc}/lib \
         -o waylandd
@@ -46,6 +48,9 @@ stdenv.mkDerivation {
   installPhase = ''
     mkdir -p $out/bin
     install -m 755 waylandd $out/bin/waylandd
+    mkdir -p $out/share/licenses/waylandd-brook
+    install -m 644 protocols/LGPL-2.1-or-later.txt protocols/README.md \
+        $out/share/licenses/waylandd-brook/
 
     # Ensure the dynamic loader is explicit (so Brook's /lib/ld-linux
     # path doesn't matter — loader comes from the Nix store closure).

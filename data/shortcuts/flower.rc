@@ -1,3 +1,4 @@
 # title: Flower Demo
+# Requires: /nix/store/9lpb4j6syssckpmrcfs9r1awwf3dcyq4-weston-flower-bundle-15.0.0-bundle/bin/weston-flower
 # desc: Weston animated flower (Wayland)
 source /boot/SCRIPTS/wayland_flower.rc

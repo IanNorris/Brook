@@ -1,3 +1,4 @@
 # title: Terminal
+# Requires: builtin
 # desc: Command line shell
 terminal

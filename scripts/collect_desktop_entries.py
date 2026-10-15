@@ -6,7 +6,7 @@ Icon, Categories), finds matching icons from hicolor icon themes, converts
 them to Brook's raw RGBA format, and outputs:
 
   - applications.idx: text manifest (one entry per line, tab-separated)
-  - icons/<name>.rgba: raw 24x24 XRGB pixel data (no header, 24*24*4 bytes)
+  - icons/<name>.rgba: raw 24x24 little-endian ARGB (24*24*4 bytes)
 
 Usage:
     python3 collect_desktop_entries.py <nix_disk_mount> <output_dir>
@@ -24,6 +24,9 @@ import sys
 import struct
 import configparser
 import glob
+import io
+import shlex
+from pathlib import Path
 
 
 ICON_SIZE = 24  # Target icon size in pixels
@@ -75,10 +78,10 @@ def parse_desktop_file(path):
 
     # Strip field codes from Exec (%f, %F, %u, %U, etc.)
     exec_parts = []
-    for part in exec_cmd.split():
+    for part in shlex.split(exec_cmd):
         if not part.startswith('%'):
             exec_parts.append(part)
-    exec_cmd = ' '.join(exec_parts)
+    exec_cmd = shlex.join(exec_parts)
 
     return (name, exec_cmd, icon, categories)
 
@@ -92,11 +95,17 @@ def find_icon(store_root, icon_name, preferred_sizes=None):
     if not icon_name:
         return None
 
+    # Desktop files may use an absolute store path instead of a theme name.
+    if icon_name.startswith('/nix/store/'):
+        candidate = os.path.join(store_root, icon_name[len('/nix/store/'):])
+        return candidate if os.path.isfile(candidate) else None
+    icon_name = os.path.splitext(icon_name)[0] if icon_name.endswith(('.png','.svg','.xpm')) else icon_name
+
     if preferred_sizes is None:
         preferred_sizes = [24, 32, 48, 22, 16, 64, 128, 256]
 
     # Search all store paths for icon themes
-    icon_dirs = glob.glob(os.path.join(store_root, '*/share/icons/hicolor'))
+    icon_dirs = sorted(glob.glob(os.path.join(store_root, '*/share/icons/hicolor')))
 
     for size in preferred_sizes:
         size_dir = f"{size}x{size}"
@@ -107,31 +116,31 @@ def find_icon(store_root, icon_name, preferred_sizes=None):
                     os.path.join(icon_dir, size_dir, category, f"{icon_name}.svg"),
                 ]
                 for c in candidates:
-                    if os.path.isfile(c) and c.endswith('.png'):
+                    if os.path.isfile(c):
                         return c
 
     # Fallback: search pixmaps directories
     pixmap_dirs = glob.glob(os.path.join(store_root, '*/share/pixmaps'))
     for pdir in pixmap_dirs:
-        for ext in ['.png', '.xpm']:
+        for ext in ['.png', '.svg', '.xpm']:
             candidate = os.path.join(pdir, f"{icon_name}{ext}")
-            if os.path.isfile(candidate) and ext == '.png':
+            if os.path.isfile(candidate):
                 return candidate
 
     # Fallback: any size in hicolor
     for icon_dir in icon_dirs:
-        pattern = os.path.join(icon_dir, '*/apps', f"{icon_name}.png")
-        matches = glob.glob(pattern)
-        if matches:
-            return matches[0]
+        for extension in ['png','svg','xpm']:
+            matches = sorted(glob.glob(os.path.join(icon_dir, '*/apps', f"{icon_name}.{extension}")))
+            if matches:
+                return matches[0]
 
     return None
 
 
 def convert_icon_to_rgba(icon_path, output_path, size=ICON_SIZE):
-    """Convert a PNG icon to raw XRGB pixels at the target size.
+    """Convert a raster/SVG icon to raw ARGB pixels at the target size.
 
-    Output format: size*size*4 bytes, each pixel is 0x00RRGGBB (little-endian uint32).
+    Output format: size*size*4 bytes, each pixel is 0xAARRGGBB (little-endian uint32).
     No header — fixed size is known by the loader.
     """
     try:
@@ -141,8 +150,17 @@ def convert_icon_to_rgba(icon_path, output_path, size=ICON_SIZE):
         return False
 
     try:
-        img = Image.open(icon_path).convert("RGBA")
-        img = img.resize((size, size), Image.LANCZOS)
+        from PIL import ImageOps
+        if str(icon_path).lower().endswith('.svg'):
+            import cairosvg
+            source = io.BytesIO(cairosvg.svg2png(url=str(icon_path),output_width=size*4,output_height=size*4))
+        else:
+            source = icon_path
+        img = Image.open(source).convert("RGBA")
+        img = ImageOps.contain(img, (size, size), Image.Resampling.LANCZOS)
+        canvas = Image.new('RGBA',(size,size))
+        canvas.alpha_composite(img,((size-img.width)//2,(size-img.height)//2))
+        img = canvas
 
         with open(output_path, 'wb') as f:
             pixels = img.load()
@@ -176,9 +194,16 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     icons_dir = os.path.join(output_dir, 'icons')
     os.makedirs(icons_dir, exist_ok=True)
+    # Brook's own vector icons are always available, including on a sparse
+    # image with no desktop applications installed.
+    for source in sorted((Path(__file__).resolve().parent.parent/'data/icons').glob('*.svg')):
+        if not convert_icon_to_rgba(source,os.path.join(icons_dir,source.stem+'.rgba')):
+            raise RuntimeError(f'Cannot convert built-in icon {source}')
 
     # Scan for .desktop files
-    desktop_files = glob.glob(os.path.join(store_dir, '*/share/applications/*.desktop'))
+    profile_apps = Path(store_dir).parent/'profile/share/applications'
+    desktop_files = (glob.glob(str(profile_apps/'*.desktop')) if profile_apps.is_dir()
+                     else glob.glob(os.path.join(store_dir, '*/share/applications/*.desktop')))
     print(f"Found {len(desktop_files)} .desktop files")
 
     entries = []
@@ -197,7 +222,7 @@ def main():
 
         # Validate: check that the binary actually exists in the store.
         # The first token of exec_cmd is the binary path or name.
-        binary = exec_cmd.split()[0] if exec_cmd else ""
+        binary = shlex.split(exec_cmd)[0] if exec_cmd else ""
         binary_found = False
 
         if binary.startswith('/'):
@@ -207,11 +232,6 @@ def main():
             abs_check = os.path.join(store_parent, binary.lstrip('/').replace('nix/', '', 1))
             if os.path.isfile(abs_check):
                 binary_found = True
-            # Also try the raw path under store_dir
-            for sp in glob.glob(os.path.join(store_dir, '*/bin', os.path.basename(binary))):
-                if os.path.isfile(sp):
-                    binary_found = True
-                    break
         else:
             # Bare command name — search all store packages' bin/ directories
             for sp in glob.glob(os.path.join(store_dir, '*/bin', binary)):
@@ -230,7 +250,7 @@ def main():
         if icon_name:
             icon_path = find_icon(store_dir, icon_name)
             if icon_path:
-                safe_name = icon_name.replace('/', '_').replace(' ', '_')
+                safe_name = ''.join(c for c in icon_name.replace('/', '_').replace(' ', '_') if c.isascii() and (c.isalnum() or c in '-_'))
                 rgba_filename = f"{safe_name}.rgba"
                 rgba_path = os.path.join(icons_dir, rgba_filename)
                 if convert_icon_to_rgba(icon_path, rgba_path):
@@ -243,7 +263,7 @@ def main():
         if override:
             exec_cmd = override
 
-        entries.append((name, exec_cmd, icon_file, categories))
+        entries.append((name, exec_cmd, icon_file, categories, Path(df).stem))
         print(f"  App: {name} [{exec_cmd}]")
 
     # Synthetic entries for games with a Brook play wrapper but no .desktop file.
@@ -256,14 +276,14 @@ def main():
             print(f"  Skip extra: {name} [{probe}] — binary not found in store")
             continue
         seen_names.add(name)
-        entries.append((name, wrapper_exec, icon_file, categories))
+        entries.append((name, wrapper_exec, icon_file, categories, probe))
         print(f"  App (wrapper): {name} [{wrapper_exec}]")
 
     # Write manifest
     idx_path = os.path.join(output_dir, 'applications.idx')
     with open(idx_path, 'w') as f:
-        for name, exec_cmd, icon_file, categories in sorted(entries):
-            f.write(f"{name}\t{exec_cmd}\t{icon_file}\t{categories}\n")
+        for name, exec_cmd, icon_file, categories, app_id in sorted(entries):
+            f.write(f"{name}\t{exec_cmd}\t{icon_file}\t{categories}\t{app_id}\n")
 
     print(f"\nWrote {len(entries)} entries to {idx_path}")
     print(f"Icons directory: {icons_dir}")

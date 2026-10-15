@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include "../../shared/brook_theme.h"
 
 namespace brook {
 
@@ -8,7 +9,7 @@ struct Process;
 struct InputEvent;
 
 // Window manager constants
-static constexpr uint32_t WM_TITLE_BAR_HEIGHT = 30;
+static constexpr uint32_t WM_TITLE_BAR_HEIGHT = 36;
 static constexpr uint32_t WM_BORDER_WIDTH     = 2;
 static constexpr uint32_t WM_BUTTON_WIDTH     = 46;
 static constexpr uint32_t WM_RESIZE_GRAB      = 16;  // corner/edge grab zone for resize
@@ -16,59 +17,23 @@ static constexpr uint32_t WM_RESIZE_EDGE      = 6;   // edge-only grab zone (bot
 static constexpr uint32_t WM_MIN_WIDTH        = 200;
 static constexpr uint32_t WM_MIN_HEIGHT       = 100;
 static constexpr uint32_t WM_MAX_WINDOWS      = 32;
-static constexpr uint32_t WM_TASKBAR_HEIGHT   = 32;   // bottom taskbar height
+static constexpr uint32_t WM_TASKBAR_HEIGHT   = 44;   // bottom taskbar height
 
 // Chrome layout constants
-static constexpr uint32_t WM_TITLE_TEXT_PAD_X  = 8;   // left padding before title text
+static constexpr uint32_t WM_TITLE_TEXT_PAD_X  = 12;   // left padding before title text
 static constexpr uint32_t WM_BTN_ICON_SIZE     = 10;  // size of max/min button icons
 static constexpr uint32_t WM_BTN_ICON_PAD_BOT  = 6;   // minimize icon bottom offset
 
-// Window chrome colours — glassy blue (Aero-inspired). The focused titlebar is a
-// vertical gradient from WM_TITLE_TOP to WM_TITLE_BOT; WM_TITLE_BG_* is the mid
-// tone used for text anti-aliasing. The titlebar composites at ~85% opacity
-// (WM_CHROME_TITLE_ALPHA) for a hint of transparency; borders stay solid.
-// Caption buttons are rounded-rect glass cells with a faux-engraved bevel
-// (dark top/left inner edge + light bottom/right edge) and engraved glyphs.
-static constexpr uint32_t WM_TITLE_TOP_FOCUSED   = 0x007FB8EE; // glass top (bright sky)
-static constexpr uint32_t WM_TITLE_BOT_FOCUSED   = 0x001E4684; // glass bottom (deep navy)
-static constexpr uint32_t WM_TITLE_TOP_UNFOCUSED = 0x00565B68; // slate top
-static constexpr uint32_t WM_TITLE_BOT_UNFOCUSED = 0x002B2E36; // slate bottom
-static constexpr uint32_t WM_TITLE_BG_FOCUSED   = 0x00457BB9; // mid tone (text AA bg)
-static constexpr uint32_t WM_TITLE_BG_UNFOCUSED = 0x00424650; // mid tone (text AA bg)
-static constexpr uint32_t WM_TITLE_FG           = 0x00F2F6FF; // crisp near-white text
-static constexpr uint32_t WM_BORDER_FOCUSED     = 0x005E9CDC; // light blue edge
-static constexpr uint32_t WM_BORDER_UNFOCUSED   = 0x00565A66; // slate edge
-static constexpr uint32_t WM_TITLE_SHEEN_FOCUSED   = 0x00AFD6F5; // 1px top glass sheen
-static constexpr uint32_t WM_TITLE_SHEEN_UNFOCUSED = 0x00707682; // 1px top highlight
-static constexpr uint8_t  WM_CHROME_TITLE_ALPHA = 0xD8;       // ~85% opaque titlebar (glass)
-static constexpr int      WM_BTN_SLANT          = 6;         // ~15deg shear on the button's vertical sides
-static constexpr int      WM_BTN_RIGHT_PAD      = 4;         // extra gap between the close button and the right border
-// Caption button glass fill (vertical gradient) + faux-engraved bevel edges.
-static constexpr uint32_t WM_BTN_TOP            = 0x004E84C0; // button glass top
-static constexpr uint32_t WM_BTN_BOT            = 0x002B568E; // button glass bottom
-static constexpr uint32_t WM_BTN_BEVEL_DARK     = 0x00152F52; // engraved inner shadow (top/left)
-static constexpr uint32_t WM_BTN_BEVEL_LIGHT    = 0x008FC4F0; // engraved highlight (bottom/right)
-static constexpr uint32_t WM_BTN_HOVER_TOP      = 0x0072A8E0; // hover glass top
-static constexpr uint32_t WM_BTN_HOVER_BOT      = 0x003E6FB0; // hover glass bottom
-// Dimmed (slate) glass for caption buttons on UNFOCUSED windows, so the buttons
-// match the slate titlebar instead of staying bright blue. Hover still brightens.
-static constexpr uint32_t WM_BTN_TOP_UNFOCUSED  = 0x004A4F5B; // dim glass top
-static constexpr uint32_t WM_BTN_BOT_UNFOCUSED  = 0x002C303A; // dim glass bottom
-static constexpr uint32_t WM_CLOSE_BTN_BG       = 0x00C04040; // close button normal
-static constexpr uint32_t WM_CLOSE_BTN_HOVER    = 0x00E04040; // close button hover
-static constexpr uint32_t WM_CLOSE_BTN_TOP_UNF  = 0x008A5050; // dim close top (unfocused)
-static constexpr uint32_t WM_CLOSE_BTN_BOT_UNF  = 0x00683A3A; // dim close bottom (unfocused)
-static constexpr uint32_t WM_MAX_BTN_HOVER      = 0x00606060; // grey
-static constexpr uint32_t WM_TITLE_HIGHLIGHT    = 0x00FFFFFF; // 1px top highlight (subtle)
-static constexpr uint32_t WM_TASKBAR_BG         = 0x001E1E2E; // dark blue-grey
-static constexpr uint32_t WM_TASKBAR_BTN_BG     = 0x002D2D3D; // slightly lighter
-static constexpr uint32_t WM_TASKBAR_BTN_ACTIVE = 0x003B5998; // active/focused button
-static constexpr uint32_t WM_TASKBAR_BTN_FG     = 0x00D0D0D0; // button text
-static constexpr uint32_t WM_TASKBAR_CLOCK_FG   = 0x0090D0FF; // clock text (light blue)
+using WmPalette = BrookThemePalette;
+const WmPalette& WmCurrentPalette();
+bool WmSetTheme(uint32_t theme);
+uint32_t WmGetTheme();
+static constexpr uint8_t WM_CHROME_TITLE_ALPHA = 255;
+static constexpr int WM_BTN_RIGHT_PAD = 0;
 
 // Taskbar layout constants
-static constexpr uint32_t WM_TASKBAR_BTN_WIDTH  = 140; // max taskbar button width
-static constexpr uint32_t WM_TASKBAR_BTN_HEIGHT = 24;
+static constexpr uint32_t WM_TASKBAR_BTN_WIDTH  = 44; // icon button width
+static constexpr uint32_t WM_TASKBAR_BTN_HEIGHT = 32;
 static constexpr uint32_t WM_TASKBAR_PADDING    = 4;
 static constexpr uint32_t WM_TASKBAR_TEXT_PAD_X = 6;   // text offset within button
 
@@ -95,6 +60,7 @@ struct Window
     bool        noChrome;       // CSD: client draws own chrome; WM skips title/border
     bool        focusable;      // popups/tooltips stay above but don't take keyboard focus
     char        title[64];
+    char        appId[128];     // explicit xdg app_id, independent of document title
 
     // Per-window VFB (Phase A of wayland↔WM unification).  When non-null
     // the compositor blits from this buffer instead of `proc->fbVirtual`,
@@ -327,6 +293,8 @@ void WmSignalDirtyById(Process* proc, uint32_t wmId);
 // false if the window isn't found / not owned by proc.
 bool WmPresentExternalById(Process* proc, uint32_t wmId, uint32_t gres,
                            uint32_t w, uint32_t h);
+bool WmSetAppIdById(Process* proc, uint32_t wmId, const char* appId);
+
 void WmSetTitleById(Process* proc, uint32_t wmId, const char* title);
 
 // Resize an existing WM-API window's VFB to (newW × newH).  Allocates fresh
@@ -367,22 +335,28 @@ void WmPushWmEvent(Window* win, uint8_t type, int16_t x = 0, int16_t y = 0);
 // App Launcher
 // ---------------------------------------------------------------------------
 
-static constexpr uint32_t WM_LAUNCHER_MAX_ITEMS = 32;
+static constexpr uint32_t WM_LAUNCHER_MAX_ITEMS = 128;
 
 static constexpr uint32_t LAUNCHER_ICON_PX = 24;  // Icon dimensions (24x24 pixels)
 static constexpr uint32_t LAUNCHER_ICON_BYTES = LAUNCHER_ICON_PX * LAUNCHER_ICON_PX * 4;
 
 struct LauncherItem {
     char title[48];
+    char appId[128];       // desktop basename without .desktop (optional manifest field)
+    char executable[64];  // executable basename for native/older manifest matching
     char scriptPath[128];  // e.g. "/boot/SHORTCUTS/QUAKE.RC" or exec command
     uint32_t iconColor;    // Icon background color (0 = auto from title)
-    uint32_t* iconPixels;  // Raw ARGB icon data (24x24), or nullptr for letter icon
+    uint32_t* iconPixels;  // Raw ARGB icon data (24x24), or nullptr for generic application icon
     bool valid;
     bool isDesktopEntry;   // true if sourced from .desktop file (exec directly)
 };
 
 // Load shortcut files from /boot/SHORTCUTS/ directory.
 void WmLauncherLoad();
+// Notification is nonblocking; a worker rebuilds and the compositor publishes.
+void WmRequestLauncherRefresh();
+// Compositor-only: apply after input, before geometry/render for this frame.
+bool WmLauncherApplyPending();
 
 // Toggle the launcher popup open/closed.
 void WmLauncherToggle();
