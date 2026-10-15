@@ -15,7 +15,8 @@ that does not imply that Nix or the compiler was rebuilt inside Brook.
 
 The shared-library startup and native compatibility gate now passes all 13
 tests. The filesystem gate also passes the expanded guest lifetime probe and
-offline fsck after a clean shutdown. The clean-image path has passed the full sequence; the prepared-SDK path is still being validated.
+offline fsck after a clean shutdown. Both the prepared-SDK and clean-image
+paths passed the full sequence at the same revision, `8042310`.
 
 Maintain two acceptance paths, using isolated disks and the same pinned Brook
 revision, SDK closure and VM configuration:
@@ -457,3 +458,40 @@ raw pipe/eventfd/socket waiter pointer lifetime and ABA remain unverified.
 The existing emergency cleanup after an exit-group quiescence timeout also
 remains risky; both acceptance harnesses reject that warning. Fresh prepared
 and clean acceptance at one matching revision remain required.
+
+
+### Prepared acceptance after the scheduler fixes (2026-10-15)
+
+The prepared-SDK path passed the complete acceptance sequence at
+`8042310e80b2cff58fcaabf5a455b9ccadd11a34`, using eight vCPUs, 4 GiB guest
+RAM and disk-backed isolated images. The instrumented guest stages reported
+45 seconds for the kernel build, 12 seconds for native-test compilation,
+5 seconds for each of the cold and rebuilt native-test runs, and 2 seconds
+for the incremental build. These are one run's measurements, with uncontrolled
+host caches, rather than a matched performance comparison.
+
+All 13 native tests passed in both build-stage runs and again after booting
+the extracted guest-built kernel with its matching modules. Extracted artifact
+hashes were verified. FAT and both ext2 images passed offline checks after the
+build VM stopped and after the independent guest-built verification boot.
+The guest-built kernel SHA-256 was
+`25245eb675928830628d7788fb4bf439b2e1a639d9dcd615d138456f048e3728`.
+
+Evidence is retained under ignored
+`build/experiments/results/bootstrap-prepared-8042310-disk/`.
+The clean-image path then passed the same complete sequence at this revision,
+including installing the SDK through guest `nix-install` in 36 seconds. Its
+kernel build took 42 seconds, native compilation 11 seconds, both native-test
+runs 5 seconds each, and the incremental build 2 seconds. Its independent
+verification boot passed the third 13-test run, with all six final filesystem
+checks returning zero and extracted artifact hashes verified. Evidence is
+retained under `build/experiments/results/bootstrap-clean-8042310-disk/`.
+The clean run's guest-built kernel SHA-256 was
+`d6d3f882688f13deecfb9fc52e66b1584ad71c540bd856c5a5da508582ca6c01`.
+
+This completes the matching two-path bootstrap acceptance milestone. Both VMs
+were stopped after verification. These single-run timings include profiling
+and do not establish cache-controlled performance or reproducible binaries.
+Further real-workload compatibility and continuous VM recording remain separate
+work. After the host client OOM, these runs used one disk-backed VM at a time;
+the final host check showed about 14 GiB available and no remaining test VM.

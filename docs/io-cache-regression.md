@@ -35,5 +35,10 @@ Validation on 2026-10-15:
   `mixed-fixed-2k`. The first run overlapped a CPU-heavy sanitizer test; its
   elapsed time is unsuitable as a performance baseline.
 
-The prepared bootstrap still needs a fresh acceptance run. Its earlier
-successful compilation does not compensate for the failed filesystem check.
+The prepared bootstrap subsequently passed full acceptance at `8042310`,
+including both native-test runs, booting the guest-built kernel, a third native
+test run and clean offline FAT/ext2 checks after both shutdowns. Evidence is in
+`build/experiments/results/bootstrap-prepared-8042310-disk/`; the earlier failed
+images remain preserved. The matching clean-image run at `8042310` also passed
+the full sequence and all final filesystem checks, with evidence under
+`build/experiments/results/bootstrap-clean-8042310-disk/`.
