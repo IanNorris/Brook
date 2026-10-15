@@ -362,6 +362,25 @@ generation check alone cannot cover anonymous/device replacement or COW.
   memfd remap, GUI resize and remote-TLB frame retention. A writable MAP_PRIVATE
   upgrade must copy cached backing rather than alter another reader's page.
 
+The first implementation gate must exercise the same transaction across
+`process.cpp`, `syscall.cpp`, `idt.cpp`, `memory/virtual_memory.cpp`,
+`window.cpp` and `compositor.cpp`; adding a generation only to file mappings
+would leave anonymous/device replacements outside the protocol. Fork must
+initialize independent mutation state instead of copying a live mutex. Fault
+snapshots must include all range, backing, offset and protection fields, including
+speculative adjacent-page installs. Cancellation cleanup must own allocated and
+detached frames as well as the current vnode pin.
+
+Use explicit barriers after snapshot and before commit, with no mutex or
+IRQ-disabled lock held while parked. Replace that address using anonymous
+`MAP_FIXED`, unmap it, or apply `PROT_NONE`/read-only protection before releasing
+the fault; replacement bytes and permissions must survive. Also synchronize two
+faults on one absent page, replace an adjacent speculative page, and hold a
+remote translation through shootdown to verify frames cannot be recycled early.
+Follow with private cached-page writable upgrade, fork/exec, cancelled I/O,
+memfd replacement and GUI resize. Check both byte contents and balanced frame/
+backing ownership. These gates precede enabling regular-file shared writes.
+
 Existing sequential mapping probes do not establish these concurrency properties.
 Coherent shared-file pages, read/write visibility, dirty writeback/msync and
 resize integration follow this prerequisite; keep unsupported mappings explicit

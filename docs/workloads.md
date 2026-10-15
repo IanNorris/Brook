@@ -353,8 +353,10 @@ passed. Evidence is retained under ignored
 
 This is not full Linux job-control or wait compatibility: PIDFD selection and
 extended `__W*` options return `EINVAL`, and usage reports currently tracked
-leader CPU ticks rather than full thread-group accounting. Full bootstrap
-acceptance has not yet been refreshed for these candidate changes. Firefox's
+leader CPU ticks rather than full thread-group accounting. Both full bootstrap
+paths subsequently passed at `94121ca`, including a third test suite under
+each guest-built kernel and all twelve final filesystem checks. See the
+[matching acceptance](bootstrap.md#matching-acceptance-after-atomic-child-waits-2026-10-15). Firefox's
 first retry no longer emits the earlier child-wait error-38 warnings, but page
 content remains blank and child channels still fail; a usable browser is not
 yet accepted. A bounded errors-only trace also captured rejection of a

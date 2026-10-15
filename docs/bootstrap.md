@@ -614,3 +614,47 @@ the clean counterpart is
 The verifier checks these hashes against the booted kernels. Browser/editor
 usability and general writable shared-file mappings remain separate workload
 requirements.
+
+
+### Matching acceptance after atomic child waits (2026-10-15)
+
+Both full paths passed at `94121ca7aac52320ed82ef6f0400e9558837f4bd`, including
+atomic wait4/waitid event consumption, parent thread-group ownership and the
+stopped-task CPU handoff correction. Both used eight vCPUs, 4 GiB RAM,
+disk-backed isolated images, software graphics and silent audio. Each cloned
+the pinned revision through HTTPS, built Brook, passed all 13 host tests twice,
+then booted its exact extracted kernel/EFI/modules and passed all 13 again.
+All four VMs stopped with checked synchronization and all twelve final
+read-only filesystem checks returned zero. The clean image installed its SDK
+through guest `nix-install`.
+
+| Guest stage | Prepared SDK | Clean image |
+|---|---:|---:|
+| SDK installation | Already installed | 38 s |
+| HTTPS clone | 10 s | 12 s |
+| Submodule update | 21 s | 19 s |
+| Kernel/module/test build | 38 s | 38 s |
+| Native-test compilation | 8 s | 8 s |
+| Native-test run | 5 s | 5 s |
+| Warm native rebuild | 7 s | 8 s |
+| Warm native-test run | 5 s | 4 s |
+| Incremental kernel build | 0 s | 2 s |
+
+These are individual instrumented runs with uncontrolled host caches and
+whole-second guest stage timestamps; a zero means below that reporting
+resolution. They do not establish a speedup. Prepared profiling was disabled
+after an export timeout. Clean captures succeeded, but several dropped records;
+retained proportions from those captures cannot be treated as an unbiased CPU
+time breakdown. The three-second install capture retained 2,411 CPU samples
+with zero dropped records; it covers part of installation, not its full duration.
+
+Evidence is under ignored
+`build/experiments/results/bootstrap-{prepared,clean}-94121ca-disk/`, with an
+additional cross-check in `bootstrap-94121ca-audit.json`. The prepared
+guest-built kernel SHA-256 is
+`f5d582312e45ab4c3b8fd17534ecd717d1c98ef078b821222c01b2f32d623344`;
+the clean counterpart is
+`77b2938858889b96077e0bdd4e95cef09e2ef4512345d8a36b1c1ae52837370c`.
+The verifier matched each hash to its booted kernel. Writable regular-file
+shared mappings, browser/editor usability, recording and showcase acceptance
+remain separate requirements.
