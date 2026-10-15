@@ -706,3 +706,37 @@ source text when the replacement was shorter. Default GNU tar overwrite now
 passes on ext2. Continue checking extracted source hashes before compiling.
 FAT timestamp/mode restoration is separate and still requires explicit tar
 metadata options; source/bootstrap workspaces should remain on ext2.
+
+
+### Full refresh after AS lifetime and exclusive creation (3c0ea82)
+
+Both prepared-SDK and clean-image acceptance passed at pinned revision
+`3c0ea82ad98d251ba0606a7a8bfdffd97b8d5945`. Each cloned over HTTPS, initialized
+submodules, built the kernel/EFI/modules inside Brook, ran all fourteen native
+tests, rebuilt and ran all fourteen again, then booted its extracted kernel and
+matching modules and passed the suite a third time. The clean run installed
+the SDK through guest nix-install. All four VM sessions stopped with checked
+flushes; all twelve final read-only FAT/ext2 checks returned zero.
+
+| Guest-reported stage | Prepared SDK | Clean image |
+| --- | ---: | ---: |
+| SDK install | Already installed | 62 s |
+| Kernel build | 48 s | 53 s |
+| Native test build | 11 s | 13 s |
+| Warm native test rebuild | 12 s | 13 s |
+| No-change kernel build | 2 s | 2 s |
+
+These are single profiled runs with an uncontrolled host page cache, not isolated
+performance benchmarks. No host contention suite ran alongside either VM.
+The previous clean run's 167-second compile was contaminated by concurrent
+host stress and must not be used as a speedup baseline.
+
+Prepared guest kernel SHA-256:
+`96af84c79e6d7a2ed32a1f7ba96771570d189873c004563f045b089a48cf9b1e`.
+Clean guest kernel SHA-256:
+`29a88739f0f77e51a720349f33bd63132bab46bc1932fd282f097f1014b56f0f`.
+Build IDs/timestamps prevent an assumption of bit-identical binaries.
+The audit independently checked actual suite counts, exported/booted kernel
+hashes, terminal session state and filesystem results. Evidence is retained in
+`build/experiments/results/bootstrap-{prepared,clean}-3c0ea82-disk/`,
+`bootstrap-3c0ea82-audit.json` and `bootstrap-3c0ea82-perf.json`.
