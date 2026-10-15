@@ -271,7 +271,8 @@ static bool ExpandHeap(uint64_t minBytes = 0)
     }
 
     uint32_t extra = static_cast<uint32_t>(expandPages * 4096);
-    if (prev && prev->free)
+    bool merged = prev && prev->free;
+    if (merged)
     {
         WriteBlock(reinterpret_cast<uint8_t*>(prev), prev->size + extra, 1);
     }
@@ -280,7 +281,8 @@ static bool ExpandHeap(uint64_t minBytes = 0)
         WriteBlock(g_heapEnd, extra, 1);
     }
     g_heapEnd   += extra;
-    g_freeBytes += extra;
+    // A separate free block needs its own header and footer.
+    g_freeBytes += extra - (merged ? 0 : OVERHEAD);
 
     DbgPrintf("Heap: expanded by %u KB (total %lu KB)\n",
                  extra / 1024,
@@ -417,7 +419,8 @@ void kfree(void* ptr)
     uint32_t totalSize = h->size;
     if (reinterpret_cast<uint8_t*>(next) < g_heapEnd && IsValidHeader(next) && next->free)
     {
-        g_freeBytes -= OVERHEAD;
+        // Merging recovers one header/footer pair as usable free payload.
+        g_freeBytes += OVERHEAD;
         totalSize += next->size;
     }
 
@@ -430,7 +433,7 @@ void kfree(void* ptr)
         BlockHeader* prev = PrevBlock(h);
         if (IsValidHeader(prev) && prev->free)
         {
-            g_freeBytes -= OVERHEAD;
+            g_freeBytes += OVERHEAD;
             WriteBlock(reinterpret_cast<uint8_t*>(prev), prev->size + h->size, 1);
         }
     }
@@ -483,6 +486,7 @@ bool HeapCheckIntegrity()
     uint64_t heapFlags = IrqSpinLockAcquire(&g_heapLock);
 
     uint32_t blockCount = 0;
+    uint64_t freeBytes = 0;
     BlockHeader* cur = reinterpret_cast<BlockHeader*>(g_heapStart);
 
     while (reinterpret_cast<uint8_t*>(cur) < g_heapEnd)
@@ -516,10 +520,17 @@ bool HeapCheckIntegrity()
             return false;
         }
 
+        if (cur->free) freeBytes += cur->size - OVERHEAD;
         blockCount++;
         cur = NextBlock(cur);
     }
 
+    if (freeBytes != g_freeBytes) {
+        SerialPrintf("HeapCheck: free-byte accounting mismatch (counted=%lu recorded=%lu)\n",
+                     freeBytes, g_freeBytes);
+        IrqSpinLockRelease(&g_heapLock, heapFlags);
+        return false;
+    }
     IrqSpinLockRelease(&g_heapLock, heapFlags);
     return true;
 }
