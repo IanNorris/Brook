@@ -244,6 +244,7 @@ def monitor(directory, session, data, deadline):
     active = None
     capture = None
     captured_stages = set()
+    profiling_available = True
     last_snapshot = 0
     seen = 0
     serial = Path(data["serial_log"])
@@ -281,14 +282,24 @@ def monitor(directory, session, data, deadline):
             except RuntimeError as e:
                 if "RUNNING" not in str(e) and "recording/flushing" not in str(e):
                     raise
-        if not capture and active in {"install", "clone", "checkout", "submodules", "compile", "native-compile", "native-tests", "warm-native-compile", "warm-native-tests"} and active not in captured_stages:
+            except (TimeoutError, OSError) as e:
+                # Profiling is ancillary to build acceptance. The guest may
+                # still be running; do not restart it or issue another start
+                # after unknown completion of the profiling command.
+                snapshots.append({"stage": capture["stage"], "profile_error": str(e),
+                                  "profiling_disabled": True})
+                print(f"Profiling unavailable after export timeout: {e}", flush=True)
+                capture = None
+                profiling_available = False
+        if profiling_available and not capture and active in {"install", "clone", "checkout", "submodules", "compile", "native-compile", "native-tests", "warm-native-compile", "warm-native-tests"} and active not in captured_stages:
             try:
                 server.profile(session, action="start", duration_ms=3000, guest_timeout=30)
                 capture = {"stage": active, "finish_after": now + 5}
                 captured_stages.add(active)
             except (TimeoutError, OSError) as e:
-                snapshots.append({"stage": active, "profile_error": str(e)})
+                snapshots.append({"stage": active, "profile_error": str(e), "profiling_disabled": True})
                 captured_stages.add(active)
+                profiling_available = False
         if now - last_snapshot >= 20:
             observation = {"stage": active, "elapsed": now-started,
                            "host_load": os.getloadavg()}
