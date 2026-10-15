@@ -113,13 +113,24 @@ ignored experiment disks. They are never included in the plugin package.
 python3 -m unittest discover -s tools/vm_bridge -p "test_*.py" -v
 ```
 
-The 26 host tests cover fragmented tokenized replies, stdio MCP, PNG pixels,
+The 28 host tests cover fragmented tokenized replies, stdio MCP, PNG pixels,
 cancellation cleanup, input preflight, crop-coordinate mapping, reset/panic
 history, RAM-map selection and resume after failed memory reads. Shutdown
 tests cover sync-before-QMP ordering, rejection of missing/negative replies,
 timeout/panic/unreachable handling, explicit forced shutdown reporting, and
 unchanged pause/resume behavior. Wrapper tests cover first-run controls,
 startup demos, explicit commands, renderer selection and saved preferences.
+
+Clicks and double clicks now hold their mouse button for 200 ms by default.
+Brook samples button state in its compositor loop; the old 20 ms pulse could
+fall between frames and disappear at 8–13 FPS even though QMP accepted it.
+Set `hold_seconds` on `click`, `double_click` or `keypress` actions to override
+the press duration (0.01–1 s). Keyboard chords retain their 20 ms default.
+Combined explicit waits and holds are bounded to 20 seconds, and cancellation
+releases held input. The contract tests model a 100 ms guest poll and verify
+that the default click spans it while an explicitly short pulse is preserved.
+This improves input delivery; it does not certify the app's response or solve
+window ownership and close-timeout bugs.
 
 Live validation on 14 October 2026 attached to a user-started CPU-rendered VM
 and an agent-started Intel virgl GL3 VM. Captured native 1920×1080 frames and

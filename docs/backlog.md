@@ -45,6 +45,19 @@ pipe and full dump manifests are still outstanding.
 | RUN-02 | Player source/window geometry and audio stutter | Preserve 720p aspect ratio and verify playback under frame load; use VM-04 captures and guest timing counters to locate periodic stutter. |
 | RUN-03 | NVIDIA backend comparison and later Venus work | Compare the same controlled scenario after Intel behavior is understood; explicitly confirm hardware renderer and selected node. Venus follows GL correctness/control work. |
 | RUN-04 | Quake relative mouse input and capture (after package-install fixes) | Capture the pointer while playing in the native SDL VM window, deliver continuous relative motion without desktop-edge clipping, and release capture on an explicit escape action, focus loss or app exit. Verify aiming and menus with the user; inspect guest Wayland relative-pointer/pointer-lock support and the QEMU input path. |
+| RUN-05 | Wayland window-close timeout targets compositor instead of client | With Writer and Quake open, an unresponsive Quake close must terminate only Quake; keep waylandd and Writer alive. Track the actual client owner separately from the process providing the shared VFB. |
+
+Showcase session `4267280270f145d9b82dd4b6749207c5` reproduced RUN-05 on
+15 October: the Quake window was registered with `pid=7`, the shared Wayland
+server. A 300 ms mouse hold delivered its close request successfully;
+`CLOSE_REQUESTED -> xdg_toplevel.send_close` was followed by the WM's SIGTERM
+and force-kill timeout fallback. Both Writer and Quake windows were destroyed.
+The bridge remained responsive; a subsequent `procs` listed no waylandd or
+application processes, and `wm list` reported no windows. Serial evidence is
+retained under that ignored session directory. This is a window/client
+ownership failure, separate from the old short bridge mouse clicks that could
+be missed between compositor polls. Do not claim general clean app shutdown
+from a successful screenshot.
 
 RUN-04 recovery check: all surviving refs were searched by commit message and
 code history for relative-pointer, pointer-constraints and SDL relative-mouse

@@ -240,6 +240,41 @@ FlatView #7
                 server.input_actions('s',[{'type':'move','x':50,'y':25}],frame_id='f')
         self.assertEqual([e['data']['value'] for e in events],[round(500*32767/1000),round(150*32767/500)])
 
+    def test_click_spans_guest_poll_interval_and_allows_explicit_fast_pulse(self):
+        # Model a guest that samples button state at 100 ms intervals. The old
+        # 20 ms pulse vanished between polls even though QMP accepted both events.
+        clock=[0.0];edges=[]
+        class FakeQMP:
+            def __enter__(self):return self
+            def __exit__(self,*args):pass
+            def call(self,name,args=None):
+                if name=='query-qmp-schema':
+                    return [{'meta-type':'enum','members':[{'name':x} for x in ['ret','ctrl','shift']]}]
+                for event in args['events']:
+                    if event['type']=='btn':edges.append((clock[0],event['data']['down']))
+                return {}
+        @contextlib.contextmanager
+        def lock(_):yield {}
+        def sleep(seconds):clock[0]+=seconds
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);(root/'s').mkdir()
+            (root/'s'/'last-frame.json').write_text(json.dumps({'frame_id':'f','width':100,'height':50,
+                'crop_origin':[0,0],'coordinate_width':100,'coordinate_height':50}))
+            with patch.object(server,'REGISTRY',root),patch.object(server,'session_lock',lock),patch.object(server,'panic_state',return_value=False),patch.object(server,'QMP',lambda _:FakeQMP()),patch.object(server.time,'monotonic',lambda:clock[0]),patch.object(server.time,'sleep',sleep):
+                server.input_actions('s',[{'type':'click','x':50,'y':25}],frame_id='f')
+                self.assertTrue(edges[0][0] <= .1 < edges[1][0])
+                edges.clear();clock[0]=0
+                server.input_actions('s',[{'type':'click','x':50,'y':25,'hold_seconds':.03}],frame_id='f')
+                self.assertFalse(edges[0][0] <= .1 < edges[1][0])
+                self.assertAlmostEqual(edges[1][0]-edges[0][0],.03)
+
+    def test_invalid_click_hold_is_rejected_before_delivery(self):
+        with patch.object(server,'session_lock') as lock:
+            for value in [True,float('nan'),0,2]:
+                with self.subTest(value=value),self.assertRaises(ValueError):
+                    server.input_actions('s',[{'type':'click','x':1,'y':1,'hold_seconds':value}])
+            lock.assert_not_called()
+
     def test_mcp_stdio(self):
         process=subprocess.Popen([sys.executable,str(Path(server.__file__))],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
         try:

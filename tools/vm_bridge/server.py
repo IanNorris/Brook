@@ -449,8 +449,14 @@ def input_actions(session, actions, frame_id=None, _cancel=None, **_):
         if a.get("type") not in {"keypress","type","move","relative_move","click","double_click","scroll","key_down","key_up","button_down","button_up","wait"}:
             raise ValueError("Unknown action type")
         if a["type"]=="type":text_keys(a.get("text",""))
-        if set(a)-{"type","text","keys","key","button","x","y","dx","dy","seconds"}:
+        if set(a)-{"type","text","keys","key","button","x","y","dx","dy","seconds","hold_seconds"}:
             raise ValueError("Unknown action field")
+        if "hold_seconds" in a:
+            hold=a["hold_seconds"]
+            if a["type"] not in {"click","double_click","keypress"}:
+                raise ValueError("hold_seconds applies to click, double_click or keypress")
+            if isinstance(hold,bool) or not isinstance(hold,(int,float)) or not math.isfinite(hold) or not .01<=hold<=1:
+                raise ValueError("hold_seconds must be finite and between 0.01 and 1")
         if a["type"]=="keypress" and (not isinstance(a.get("keys"),list) or not 1<=len(a["keys"])<=8 or any(not isinstance(k,str) for k in a["keys"])):
             raise ValueError("keypress requires 1–8 key names")
         if a["type"] in {"key_down","key_up"} and not isinstance(a.get("key"),str):raise ValueError("Key name required")
@@ -463,6 +469,13 @@ def input_actions(session, actions, frame_id=None, _cancel=None, **_):
         if a["type"]=="relative_move" and any(abs(int(a.get(k,0)))>32767 for k in ["dx","dy"]):raise ValueError("Relative movement exceeds limit")
         if a["type"]=="wait" and not 0 <= float(a.get("seconds",0)) <= 5:raise ValueError("Wait must be 0–5 seconds")
     if sum(len(a.get("text","")) for a in actions)>512:raise ValueError("Text batch exceeds 512 characters")
+    # Mouse buttons are sampled by Brook's compositor, so a 20 ms pulse can
+    # disappear entirely at 8–13 FPS. Hold normal clicks across several frames.
+    timed=sum(float(a.get("seconds",0)) for a in actions)
+    timed+=sum(float(a.get("hold_seconds",.2 if a["type"] in {"click","double_click"} else .02)) *
+               (2 if a["type"]=="double_click" else 1)
+               for a in actions if a["type"] in {"click","double_click","keypress"})
+    if timed>20:raise ValueError("Input waits and holds exceed 20 seconds")
     with session_lock(session) as data:
         lease=REGISTRY/session/"control.json"
         if lease.exists() and json.loads(lease.read_text()).get("user_takeover"):
@@ -500,10 +513,14 @@ def input_actions(session, actions, frame_id=None, _cancel=None, **_):
             def button(b,down):
                 send([{"type":"btn","data":{"down":down,"button":b}}])
                 (held_buttons.add if down else held_buttons.discard)(b)
-            def chord(keys):
+            def hold_for(seconds):
+                end=time.monotonic()+seconds
+                while time.monotonic()<end:
+                    check_cancel();time.sleep(min(.05,max(0,end-time.monotonic())))
+            def chord(keys,hold_seconds=.02):
                 introduced=[k for k in keys if k not in held_keys]
                 for k in introduced:key(k,True)
-                time.sleep(.02)
+                hold_for(hold_seconds)
                 for k in reversed(introduced):key(k,False)
             try:
                 for a in actions:
@@ -516,7 +533,7 @@ def input_actions(session, actions, frame_id=None, _cancel=None, **_):
                               {"type":"abs","data":{"axis":"y","value":round(gy*32767/max(1,frame["coordinate_height"]-1))}}])
                     if kind in {"click","double_click"}:
                         for _i in range(2 if kind=="double_click" else 1):
-                            button(a.get("button","left"),True);time.sleep(.02);button(a.get("button","left"),False);time.sleep(.04)
+                            button(a.get("button","left"),True);hold_for(float(a.get("hold_seconds",.2)));button(a.get("button","left"),False);hold_for(.04)
                     elif kind=="scroll":
                         for direction,count in [("wheel-up" if int(a.get("dy",0))<0 else "wheel-down",abs(int(a.get("dy",0)))),
                                                 ("wheel-left" if int(a.get("dx",0))<0 else "wheel-right",abs(int(a.get("dx",0))))]:
@@ -525,7 +542,7 @@ def input_actions(session, actions, frame_id=None, _cancel=None, **_):
                     elif kind=="relative_move":
                         send([{"type":"rel","data":{"axis":"x","value":int(a.get("dx",0))}},
                               {"type":"rel","data":{"axis":"y","value":int(a.get("dy",0))}}])
-                    elif kind=="keypress":chord([keyname(k) for k in a["keys"]])
+                    elif kind=="keypress":chord([keyname(k) for k in a["keys"]],float(a.get("hold_seconds",.02)))
                     elif kind in {"key_down","key_up"}:key(keyname(a["key"]),kind=="key_down")
                     elif kind in {"button_down","button_up"}:button(a.get("button","left"),kind=="button_down")
                     elif kind=="type":
@@ -656,7 +673,8 @@ register("vm_debug",debug,"QEMU-level current registers or bounded physical/virt
 register("vm_input",input_actions,"Ordered timed key/mouse batches, ASCII-US text; all held state released at end/cancel",{**SESSION,"actions":{"type":"array","minItems":1,"maxItems":64,"items":schema({
     "type":{"type":"string","enum":["keypress","type","move","relative_move","click","double_click","scroll","key_down","key_up","button_down","button_up","wait"]},
     "x":INT,"y":INT,"dx":INT,"dy":INT,"button":{"type":"string","enum":["left","middle","right"]},
-    "key":STR,"keys":{"type":"array","items":STR},"text":STR,"seconds":NUM},["type"])},"frame_id":STR},["session","actions"])
+    "key":STR,"keys":{"type":"array","items":STR},"text":STR,"seconds":NUM,
+    "hold_seconds":{"type":"number","minimum":.01,"maximum":1,"description":"Click/double-click press duration (default0.2s); keypress override (default0.02s)"}},["type"])},"frame_id":STR},["session","actions"])
 register("vm_wait",wait,"Wait for a serial-log substring without repeatedly returning whole logs",{**SESSION,"text":STR,"timeout_s":NUM},["session","text"],True)
 register("vm_audio_capture",audio_capture,"Bounded PCM WAV capture without speaker output; no host microphone",{**SESSION,"duration_s":NUM},["session"])
 register("vm_audio_analyze",audio_analyze,"Return waveform image and metrics for a session WAV artifact",{**SESSION,"artifact_name":STR},["session","artifact_name"],True)
