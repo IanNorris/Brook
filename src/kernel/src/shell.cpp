@@ -769,9 +769,8 @@ static int ExecCommand(int argc, const char* const* argv)
             WmSetActive(true);
             g_ttyFull = false; // WM takes over the screen
 
-            // Suppress TTY framebuffer rendering — the kernel console WM window
-            // handles log display, and TTY writes would briefly flash under the
-            // compositor each frame.
+            // Suppress TTY framebuffer rendering while the desktop is active.
+            // Logs remain available over the bridge, serial and optional console.
             TtySuppressDisplay(true);
 
             if (wasActive)
@@ -793,9 +792,6 @@ static int ExecCommand(int argc, const char* const* argv)
             }
 
             KPrintf("window manager: enabled\n");
-
-            // Spawn kernel console window (shows kernel log in a WM window).
-            KernelConsoleSpawn();
 
             // Spawn TCP debug server (streams kernel log on port 1234).
             DebugTcpSpawn();
@@ -931,6 +927,17 @@ static int ExecCommand(int argc, const char* const* argv)
         {
             KPrintf("set: unknown key '%s'\n", argv[1]);
         }
+        return 0;
+    }
+
+    // Read-only kernel log window is opt-in, keeping normal desktops uncluttered.
+    if (StrEq(cmd, "kconsole"))
+    {
+        if (!WmIsActive()) {
+            KPrintf("kconsole: window manager not active (use 'set wm' first)\n");
+            return 1;
+        }
+        KernelConsoleSpawn();
         return 0;
     }
 
@@ -1519,6 +1526,8 @@ static void CmdHelp()
 {
     KPrintf("Brook shell commands:\n");
     KPrintf("  run [--as name] <prog> [args]  Launch a program\n");
+    KPrintf("  terminal           Open a Bash terminal window\n");
+    KPrintf("  kconsole           Open the kernel log window\n");
     KPrintf("  <prog> [args]      Same as 'run <prog>'\n");
     KPrintf("  wait               Wait for all processes to exit\n");
     KPrintf("  cd <path>          Change working directory\n");

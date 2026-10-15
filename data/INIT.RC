@@ -1,5 +1,3 @@
-profile 300
 set wm
 set vfb none
 run --once /nix/bin/waylandd
-terminal

@@ -15,6 +15,27 @@ broad cutout and removes the wordmark. This is a design exploration; edge
 and transparency cleanup and small-size vector work remain before it
 becomes the production logo. It is not used by the bootloader or desktop.
 
+`data/branding/brook-boot-mark.png` is the new boot-screen mark: a smooth
+blue/teal B with a broad winding river cutout on a black background. The
+transparent draft's residual speckles made it unsuitable for boot use, so
+the selected version was generated directly on black. The original logo and
+draft remain preserved. Kernel CMake invokes `scripts/bake_logo.py` to generate
+the 300×300 boot bitmap in the build directory whenever the source changes.
+
+Built-in imagegen, generation mode, no input image, opaque background:
+
+> Use case: logo-brand. Asset: Brook OS boot-screen logo on perfectly flat
+> solid black background. Draw a clean, refined flat vector-style organic
+> uppercase B symbol that suggests a winding brook. Two rounded asymmetrical
+> lobes with a wide graceful flowing black negative-space river between them.
+> Smooth saturated blue to teal gradient inside the solid silhouette, teal
+> at top and blue below. Every boundary must be crisp and smooth; river and
+> outer background must be pure black with absolutely no color fragments,
+> stray particles, tiny speckles, or decorative strokes. Symbol only. No text,
+> no white, no texture, no shadow, no glow, no bevel. Large centered symbol
+> with generous black margins. Square composition. Designed for beautiful
+> readable 200px boot logo.
+
 ## Wallpaper prompt
 
 Built-in imagegen, generation mode, no input image:

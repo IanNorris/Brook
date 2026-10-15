@@ -1,0 +1,4 @@
+# title: Kernel Console
+# desc: Open the kernel's read-only log window
+set wm
+kconsole

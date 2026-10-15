@@ -2,5 +2,4 @@
 set wm
 set vfb none
 run --once /nix/bin/waylandd
-terminal
-run /nix/bin/wayland-calc 600
+# Open Terminal with the taskbar + button, or Calculator from Apps when needed.

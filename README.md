@@ -1,17 +1,20 @@
 <p align="center">
-  <img src="docs/images/brook_logo.png" alt="Brook OS" width="600">
+  <img src="data/branding/brook-boot-mark.png" alt="Brook OS" width="200">
+
 </p>
+
+<h1 align="center">Brook OS</h1>
 
 <h3 align="center">A hobby x86-64 operating system built from scratch</h3>
 
 <p align="center">
-  UEFI · C++ · Clang/LLVM · SMP · Wayland · Networking · Nix · Runs DOOM
+  UEFI · C++ · Clang/LLVM · SMP · Wayland · OpenGL · Networking · Nix
 </p>
 
 ---
 
 <p align="center">
-  <img src="docs/images/brook_netsurf_quake2.png" alt="NetSurf web browser and Quake 2 running side by side on Brook OS" width="800">
+  <a href="docs/images/brook_netsurf_quake2.png"><img src="docs/images/brook_netsurf_quake2.png" alt="NetSurf web browser and Quake 2 running side by side on Brook OS" width="800"></a>
 </p>
 
 <p align="center"><em>NetSurf and Quake 2 running side by side — compositing WM, TCP/IP networking, HDA audio, all on a from-scratch kernel</em></p>
@@ -21,7 +24,7 @@
 Brook is a hobby operating system for x86-64, written from scratch in C++ with
 a unified Clang/LLVM toolchain. It boots via UEFI, runs on multiple CPU cores,
 has a compositing window manager with a Wayland compositor, and implements
-enough of the Linux syscall ABI (~40% of the x86-64 syscall surface) to run
+an expanding subset of the Linux syscall ABI to run
 unmodified Linux binaries — including web browsers, GTK apps, and games.
 
 This is my second OS project (the first being
@@ -31,13 +34,16 @@ modular drivers, and a codebase that's a pleasure to work in.
 
 ## Confirmed Working Software
 
-These run as unmodified Linux ELF binaries on Brook, linked against musl libc:
+Brook runs Linux ELF binaries using both musl and glibc, including Nix
+closures. Some applications use Brook compatibility builds or launchers;
+the table distinguishes tested behavior from remaining limitations.
 
 | Software | Version | Status | Notes |
 |----------|---------|--------|-------|
-| [bash](https://www.gnu.org/software/bash/) | 5.2 | ✅ Working | Interactive shell with readline, job control, scripting |
+| [bash](https://www.gnu.org/software/bash/) | 5.2 / 5.3 | ✅ Working | Bundled shell and Nix Bash closures; readline, job control and scripting |
 | [DOOM](https://github.com/ozkl/doomgeneric) | 1.9 | ✅ Working | Runs in a WM window or full-screen, with keyboard input |
-| [Quake 2](https://github.com/id-Software/Quake-2) | 3.21 | ✅ Working | Single-player + LAN deathmatch between two Brook VMs, software renderer, HDA audio, OGG music |
+| [Quake 2 / Yamagi](https://www.yamagi.org/quake2/) | 8.60 | ✅ Gameplay | Software and hardware virgl GL3 renderers, startup demo, OSS audio and OGG music; mouse capture and intermittent audio timing remain open |
+| [GLtron](https://www.gltron.org/) | 0.70 | ⚠️ Experimental | Compatibility launcher installs through guest `nix-install`; hardware virgl menu and light-cycle gameplay verified, with sound disabled |
 | [busybox](https://busybox.net/) | 1.36 | ✅ Working | ls, cat, echo, wc, head, tail, grep, and many more |
 | [TCC](https://bellard.org/tcc/) | 0.9.27 | ✅ Working | Compiles and runs C programs natively on Brook |
 | [CoreMark](https://www.eembc.org/coremark/) | 1.0 | ✅ Working | CPU benchmark, runs to completion |
@@ -45,11 +51,32 @@ These run as unmodified Linux ELF binaries on Brook, linked against musl libc:
 | [Go](https://go.dev/) runtime | 1.22 | ✅ Working | Static Go binaries (lazy PROT_NONE heap + on-demand mprotect) |
 | Nix binaries | — | ✅ Working | Stock NixOS closures fetched via `nix-install` (cowsay, coreutils, curl, …) |
 | [NetSurf](https://www.netsurf-browser.org/) | 3.11 | ✅ Working | Web browser rendering HTML/CSS via custom framebuffer surface |
-| [Ladybird](https://ladybird.dev/) | dev | ⚠️ Partial | Renders pages (example.com, IANA) via Wayland; some resource loads time out |
+| [Ladybird](https://ladybird.dev/) | 2026-04-04 | ⚠️ Experimental | HTTPS Google search and Amazon navigation verified; loading/input/scrolling performance remains limited |
 | [Qalculate!](https://qalculate.github.io/) | — | ✅ Working | GTK3 calculator via Wayland (CSD decorations) |
 | [GIMP](https://www.gimp.org/) | 2.10 | ⚠️ Partial | Launches via Wayland/GTK; plugin loading slow, UAF under investigation |
-| [LibreOffice](https://www.libreoffice.org/) | 24.8 | ⚠️ Partial | Writer launches via Wayland; slow startup, rendering works |
-| [VLC](https://www.videolan.org/vlc/) | 3.0 | ⚠️ Partial | Installs from Nix binary cache; playback under testing |
+| [LibreOffice](https://www.libreoffice.org/) | 25.8.5.2 | ⚠️ Experimental | Writer opens via Wayland and edits a real document; startup is slow and window-close behavior needs work |
+| [VLC](https://www.videolan.org/vlc/) | 3.0.23-2 | ⚠️ Experimental | Brook compatibility build installs through guest `nix-install`; 720p video and OSS audio verified; window-close/SMP stability remains under investigation |
+
+## Recent progress
+
+- **VM control bridge:** VM-only screenshots and input, guest command launches,
+  logs, CPU/context-switch profiles, OS statistics, silent-output PCM capture,
+  and bounded post-panic memory/register inspection. See the
+  [bridge tools](tools/vm_bridge/README.md).
+- **Real workloads:** Ladybird browsing, hardware GL3 Quake demos, Wayland
+  office applications, and guest-installed VLC playback. App-specific limits
+  and the actual validation evidence are recorded in
+  [experiment notes](docs/experiments.md).
+- **Self-hosting:** The clean-image acceptance path installs its SDK through
+  guest `nix-install`, clones and builds Brook, passes all 13 native tests,
+  then boots the guest-built kernel and passes them again. Offline checks of
+  both filesystems pass before and after that boot. The prepared-SDK path is
+  still being validated; see [bootstrap testing](docs/bootstrap.md).
+- **Storage correctness and speed:** unlink-while-open, rename-overwrite,
+  directory removal and inode reuse now have guest lifetime checks plus offline
+  filesystem verification. A short eight-worker RAM-backed
+  [I/O gate](docs/io-benchmark.md) combines large writes, small files,
+  reboot persistence, reclamation and timings.
 
 ## Features
 
@@ -58,7 +85,7 @@ These run as unmodified Linux ELF binaries on Brook, linked against musl libc:
 - **SMP** — symmetric multiprocessing with per-CPU run queues and load balancing
 - **MLFQ scheduler** — multi-level feedback queue loaded as a kernel module, with configurable policy
 - **Virtual memory** — 4-level paging, per-PID ownership tracking, guard pages, lazy mmap w/ PROT_NONE + on-demand mprotect (needed for Go binaries)
-- **Kernel heap** — kmalloc/kfree with slab-style allocation; kmutex, krwlock, ksemaphore
+- **Kernel heap** — first-fit kmalloc/kfree allocator with coalescing; kmutex, krwlock, ksemaphore
 - **Loadable kernel modules** — drivers compiled separately and loaded from disk at boot (Phase 1 from initrd, Phase 2 from /boot/drivers)
 - **VFS with FAT and ext2** — virtio-blk backed storage with full read/write support, metadata cache, mount points
 - **USB (xHCI)** — USB 3.0 host controller with keyboard, mouse, and mass storage support; interrupt-driven I/O
@@ -85,7 +112,7 @@ These run as unmodified Linux ELF binaries on Brook, linked against musl libc:
 - **Real Nix binaries** — cowsay, coreutils, curl, bash, etc. run unmodified
 
 ### Linux Compatibility
-- **~40% of the Linux x86-64 syscall surface** — open, read, write, mmap (lazy/PROT_NONE), mprotect, fork, execve, clone, pipe, dup/dup2/dup3, ioctl, poll, select, epoll (create/ctl/wait), socket family (bind, connect, listen, accept, send/recv, setsockopt, sendmsg/recvmsg with **SCM_RIGHTS** fd passing), futex, clock_gettime, nanosleep, rt_sigaction/rt_sigprocmask, signalfd, eventfd, timerfd, **memfd_create**, dirfd-aware *at syscalls, symlinkat/readlinkat, TCGETS2/TCSETS, and more
+- **Linux x86-64 syscall compatibility** — open, read, write, mmap (lazy/PROT_NONE), mprotect, fork, execve, clone, pipe, dup/dup2/dup3, ioctl, poll, select, epoll (create/ctl/wait), socket family (bind, connect, listen, accept, send/recv, setsockopt, sendmsg/recvmsg with **SCM_RIGHTS** fd passing), futex, clock_gettime, nanosleep, rt_sigaction/rt_sigprocmask, signalfd, eventfd, timerfd, **memfd_create**, dirfd-aware *at syscalls, symlinkat/readlinkat, TCGETS2/TCSETS, and more
 - **ELF loader** — standard Linux ELF64 with dynamic linking (musl ld.so, glibc closures from Nix)
 - **Signals** — full rt_sigaction lifecycle, SIGINT/QUIT/TSTP/CONT/KILL/PIPE/CHLD with signal-safe TTY + AF_UNIX read (SIGCHLD doesn't spuriously EINTR)
 - **IPC** — anonymous pipes, **AF_UNIX stream sockets with SCM_RIGHTS**, memfd-backed shared memory (backs `wl_shm`), full address-space cloning on fork
@@ -124,44 +151,79 @@ These run as unmodified Linux ELF binaries on Brook, linked against musl libc:
 
 ## Gallery
 
+Click any screenshot to open its original pixels. README previews are smaller
+than the captured desktop; UI text is clearest in the full-resolution image.
+New captures use native 1920×1080 without upscaling. See
+[showcase capture and demo plans](docs/showcase.md).
+
 <p align="center">
-  <img src="docs/images/brook_quake2_lan.png" alt="Two Brook VMs playing Quake 2 LAN deathmatch" width="800">
+  <a href="docs/images/brook_libreoffice_writer_1080.png"><img src="docs/images/brook_libreoffice_writer_1080.png" alt="A real document typed in LibreOffice Writer running on Brook, without debug windows" width="960"></a>
+</p>
+
+<p align="center"><em>LibreOffice Writer 25.8.5.2 editing a document through Wayland — native 1920×1080 capture, with no automatically opened debug windows</em></p>
+
+<p align="center">
+  <a href="docs/images/brook_desktop_1080.png"><img src="docs/images/brook_desktop_1080.png" alt="Brook's clean desktop and taskbar at native 1920 by 1080" width="960"></a>
+</p>
+
+<p align="center"><em>The default desktop starts quietly; Terminal, Calculator and kernel logs are available when wanted</em></p>
+
+<p align="center">
+  <a href="docs/images/brook_boot_logo_1080.png"><img src="docs/images/brook_boot_logo_1080.png" alt="Brook's new blue and teal river B mark on its actual boot progress screen" width="800"></a>
+</p>
+
+<p align="center"><em>The new Brook mark on the actual UEFI boot progress screen</em></p>
+
+<p align="center">
+  <a href="docs/images/brook_gltron_1080.png"><img src="docs/images/brook_gltron_1080.png" alt="GLtron light-cycle gameplay rendered through hardware virgl on Brook" width="960"></a>
+</p>
+
+<p align="center"><em>GLtron installed by Brook's guest package manager and rendered through hardware virgl — sound disabled by its compatibility launcher</em></p>
+
+<p align="center">
+  <a href="docs/images/brook_vlc_720p_1080.png"><img src="docs/images/brook_vlc_720p_1080.png" alt="VLC playing Big Buck Bunny at 720p on Brook's native 1080p desktop" width="960"></a>
+</p>
+
+<p align="center"><em>Guest-installed VLC playing the Blender Foundation's Big Buck Bunny at 720p; the captured desktop is native 1920×1080. This demonstrates playback, with stability limits recorded in the experiment notes.</em></p>
+
+<p align="center">
+  <a href="docs/images/brook_quake2_lan.png"><img src="docs/images/brook_quake2_lan.png" alt="Two Brook VMs playing Quake 2 LAN deathmatch" width="800"></a>
 </p>
 
 <p align="center"><em>Two Brook VMs playing Quake 2 LAN deathmatch over a VDE virtual switch — real UDP sockets, static-IP config, multi-NIC kernel routing</em></p>
 
 <p align="center">
-  <img src="docs/images/brook_wayland_qalculate.png" alt="Qalculate! running on Brook via Wayland" width="800">
+  <a href="docs/images/brook_wayland_qalculate.png"><img src="docs/images/brook_wayland_qalculate.png" alt="Qalculate! running on Brook via Wayland" width="800"></a>
 </p>
 
 <p align="center"><em>Qalculate! (GTK3) running natively via Brook's Wayland compositor with client-side decorations</em></p>
 
 <p align="center">
-  <img src="docs/images/brook_ladybird_browser.png" alt="Ladybird web browser rendering example.com on Brook" width="800">
+  <a href="docs/images/brook_ladybird_browser.png"><img src="docs/images/brook_ladybird_browser.png" alt="Ladybird web browser rendering example.com on Brook" width="800"></a>
 </p>
 
 <p align="center"><em>Ladybird web browser rendering example.com — Wayland display, DNS resolver, TCP/IP stack, all from scratch</em></p>
 
 <p align="center">
-  <img src="docs/images/brook_app_launcher.png" alt="Brook desktop with app launcher" width="800">
+  <a href="docs/images/brook_app_launcher.png"><img src="docs/images/brook_app_launcher.png" alt="Brook desktop with app launcher" width="800"></a>
 </p>
 
 <p align="center"><em>App launcher grid with desktop entry icons and taskbar</em></p>
 
 <p align="center">
-  <img src="docs/images/brook_file_browser.png" alt="Brook native file browser" width="800">
+  <a href="docs/images/brook_file_browser.png"><img src="docs/images/brook_file_browser.png" alt="Brook native file browser" width="800"></a>
 </p>
 
 <p align="center"><em>Brook-native Wayland file browser navigating the filesystem</em></p>
 
 <p align="center">
-  <img src="docs/images/brook_panic_qr.png" alt="Kernel panic with QR code" width="600">
+  <a href="docs/images/brook_panic_qr.png"><img src="docs/images/brook_panic_qr.png" alt="Kernel panic with QR code" width="600"></a>
 </p>
 
 <p align="center"><em>Kernel panic screen with scannable QR code — decoded by <a href="https://github.com/IanNorris/EnkelCrashDecoder">EnkelCrashDecoder</a> for instant stack traces</em></p>
 
 <p align="center">
-  <img src="docs/images/brook_nix_cowsay.png" alt="Nix cowsay running on Brook" width="600">
+  <a href="docs/images/brook_nix_cowsay.png"><img src="docs/images/brook_nix_cowsay.png" alt="Nix cowsay running on Brook" width="600"></a>
 </p>
 
 <p align="center"><em>cowsay fetched from the NixOS binary cache and running unmodified on Brook</em></p>

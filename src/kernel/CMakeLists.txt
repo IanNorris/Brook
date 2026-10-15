@@ -38,6 +38,19 @@ set(FAT_IMAGE_CPP  "${CMAKE_CURRENT_BINARY_DIR}/fat_test_image.cpp")
 
 find_program(PYTHON3 python3 REQUIRED)
 
+# Bake branding from the tracked source rather than a stale checked-in array.
+set(BOOT_LOGO_HEADER "${CMAKE_CURRENT_BINARY_DIR}/brook_boot_logo_data.h")
+add_custom_command(
+    OUTPUT "${BOOT_LOGO_HEADER}"
+    COMMAND ${PYTHON3} "${BROOK_ROOT}/scripts/bake_logo.py"
+            "${BROOK_ROOT}/data/branding/brook-boot-mark.png"
+            "${BOOT_LOGO_HEADER}" 300
+    DEPENDS "${BROOK_ROOT}/scripts/bake_logo.py"
+            "${BROOK_ROOT}/data/branding/brook-boot-mark.png"
+    COMMENT "Baking Brook boot logo"
+    VERBATIM
+)
+
 # Bake the font atlas at configure time so it's available immediately.
 message(STATUS "Baking font atlas: ${BROOK_FONT_TTF} @ ${BROOK_FONT_SIZE}px")
 execute_process(
@@ -145,6 +158,7 @@ endif()
 # ---------------------------------------------------------------------------
 
 add_executable(kernel
+    "${BOOT_LOGO_HEADER}"
     src/kernel.cpp
     src/cpu.cpp
     src/device.cpp

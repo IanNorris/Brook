@@ -1,6 +1,6 @@
 # Building Brook inside Brook
 
-Use an isolated, writable experiment clone with the VM bridge enabled, one vCPU,
+Use an isolated, writable experiment clone with the VM bridge enabled, eight vCPUs,
 and silent host audio. Keep the normal prepared checkpoint and source checkout
 separate from the test. The development toolchain package and installation
 commands are in [tools/bootstrap-pkg](../tools/bootstrap-pkg/README.md).
@@ -15,7 +15,7 @@ that does not imply that Nix or the compiler was rebuilt inside Brook.
 
 The shared-library startup and native compatibility gate now passes all 13
 tests. The filesystem gate also passes the expanded guest lifetime probe and
-offline fsck after a clean shutdown. Fresh two-path acceptance remains to run.
+offline fsck after a clean shutdown. The clean-image path has passed the full sequence; the prepared-SDK path is still being validated.
 
 Maintain two acceptance paths, using isolated disks and the same pinned Brook
 revision, SDK closure and VM configuration:
@@ -75,13 +75,13 @@ It validates module imports and requires 13/13 CTest results twice, before and
 after a clean native rebuild with warm caches. The incremental kernel stage
 is labelled separately from a full compilation.
 
-Each new run uses eight vCPUs, eight build jobs, 8 GiB, software virtio graphics, silent audio and the
+Each new run uses eight vCPUs, eight build jobs, 4 GiB by default, software virtio graphics, silent audio and the
 kernel WM command listener without Wayland apps. The kernel compositor still
 runs: this is a no-Wayland baseline, not a machine with no graphics work.
 Unrelated home/data disks are omitted; USB and media fixtures are private to
 each run. Host page cache is uncontrolled. `progress.json` retains periodic memory/load
 observations; `stage-results.json` retains guest wall seconds and host marker
-times. Long stages also receive a 10-second CPU/context-switch capture; a
+times. Long stages also receive a 3-second CPU/context-switch capture; a
 capture near a stage boundary can include subsequent work. Raw profiles and
 Speedscope output reside in the VM registry. Module addresses must not be
 interpreted using the nearest kernel symbol.
@@ -312,8 +312,25 @@ sectors instead of 568. A virtio timeout/reset appears during checkout; an
 ignored final inode-write failure is a supported hypothesis, not an identified
 failed request. The original disk is preserved, with no automatic repair.
 
-The immediate prerequisite is the [fast I/O gate](io-benchmark.md). Both full
-prepared/clean acceptance runs remain outstanding. Historical timings above
+The immediate prerequisite is the [fast I/O gate](io-benchmark.md). At this checkpoint, both full prepared/clean acceptance runs remained outstanding;
+the later clean-image result is recorded below. Historical timings above
 used one vCPU; new launch/build defaults use eight. The metadata-batching
 candidate is on an experimental branch because small-file performance still
 regresses despite much faster sequential writes.
+
+### Clean-image acceptance (2026-10-15)
+
+The RAM-backed clean-image run at revision `ee03703` passed the complete
+sequence with eight vCPUs and 4 GiB guest RAM. The base image contained only
+39 transport paths; guest `nix-install` added the SDK in 143 seconds. The
+HTTPS clone took 24 seconds, checkout 12 seconds, submodules 27 seconds, and
+the full kernel build 121 seconds. All 13 native tests passed both before and
+after a clean native rebuild, then passed a third time under the guest-built
+kernel. Git fsck and offline checks of both disks also passed. Peak sampled
+guest memory usage was about 775 MiB.
+
+Evidence is retained under ignored
+`build/experiments/results/bootstrap-clean-ram-20261015/`, including the
+success result, stage timings, profiles, artifact hashes and filesystem
+checks. The prepared-SDK acceptance run at the same revision is still pending;
+this result does not establish acceptance for both paths.
