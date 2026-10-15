@@ -60,6 +60,10 @@ the table distinguishes tested behavior from remaining limitations.
 
 ## Recent progress
 
+- **Desktop appearance:** application icons in window chrome, an icon taskbar,
+  and a launcher that updates after package installation/removal. Settings
+  previews and saves three desktop themes, and uses Brook's native titlebar.
+  See [desktop settings](docs/desktop-settings.md).
 - **VM control bridge:** VM-only screenshots and input, guest command launches,
   logs, CPU/context-switch profiles, OS statistics, silent-output PCM capture,
   and bounded post-panic memory/register inspection. See the
@@ -71,8 +75,9 @@ the table distinguishes tested behavior from remaining limitations.
 - **Self-hosting:** The clean-image acceptance path installs its SDK through
   guest `nix-install`, clones and builds Brook, passes all 13 native tests,
   then boots the guest-built kernel and passes them again. Offline checks of
-  both filesystems pass before and after that boot. The prepared-SDK path is
-  still being validated; see [bootstrap testing](docs/bootstrap.md).
+  both filesystems pass before and after that boot. Both clean-image and
+  prepared-SDK paths passed at revision `8042310`; see
+  [bootstrap testing](docs/bootstrap.md) for the validation scope.
 - **Storage correctness and speed:** unlink-while-open, rename-overwrite,
   directory removal and inode reuse now have guest lifetime checks plus offline
   filesystem verification. A short eight-worker RAM-backed
@@ -156,6 +161,12 @@ Click any screenshot to open its original pixels. README previews are smaller
 than the captured desktop; UI text is clearest in the full-resolution image.
 New captures use native 1920×1080 without upscaling. See
 [showcase capture and demo plans](docs/showcase.md).
+
+<p align="center">
+  <a href="docs/images/brook_settings_midnight_1080.png"><img src="docs/images/brook_settings_midnight_1080.png" alt="Brook Settings with native window chrome and the Midnight desktop theme applied" width="960"></a>
+</p>
+
+<p align="center"><em>Settings with native Brook chrome and the Midnight theme — captured at 1920×1080</em></p>
 
 <p align="center">
   <a href="docs/images/brook_libreoffice_writer_1080.png"><img src="docs/images/brook_libreoffice_writer_1080.png" alt="A real document typed in LibreOffice Writer running on Brook, without debug windows" width="960"></a>
