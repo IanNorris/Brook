@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="data/branding/brook-boot-mark.png" alt="Brook OS" width="200">
+  <img src="data/branding/brook-mark-draft.png" alt="Brook OS" width="200">
 
 </p>
 
