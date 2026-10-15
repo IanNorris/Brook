@@ -119,8 +119,8 @@ struct PerCpuSchedState {
     Process*         idleProcess;
     uint64_t         sliceStartTick;
     KernelCpuEnv*    cpuEnv;
-    Process*         pendingRequeue;   // Set before context_switch; consumed after
-    Process*         pendingRetire;    // Terminated process to mark reapable after context_switch
+    Process*         pendingRequeue;   // Owns a ProcessRef until post-switch drain
+    Process*         pendingRetire;    // Owns a ProcessRef until post-switch retirement
     volatile uint64_t busyTicks;      // ticks spent running non-idle processes
     volatile uint64_t idleTicks;      // ticks spent in idle process
 };
@@ -498,7 +498,11 @@ static void PinUserAddressSpaceToCpu(Process* proc, uint32_t cpu)
 
 static Process* PickNextLocked(uint32_t cpu)
 {
-    Process* skipped[SCHED_MAX_PIDS];
+    // Every caller holds g_readyLock with interrupts masked; no pick can run
+    // concurrently or recurse while this scratch space is in use. Keep the
+    // full PID capacity in BSS instead of consuming 8 KiB of the interrupt/
+    // scheduler stack (the former AP startup stack was only 16 KiB).
+    static Process* skipped[SCHED_MAX_PIDS];
     uint32_t skippedCount = 0;
     uint32_t tries = g_schedOps->ReadyCount(g_schedState);
 
@@ -612,6 +616,25 @@ static void NotifyExitedParentLocked(Process* child)
 // Drain per-CPU bookkeeping that was set before a context_switch.
 // Must be called after every context_switch resumption point (DoSwitch,
 // ProcessTrampoline, KernelThreadTrampoline).
+static void ReleaseSchedulerReference(Process* proc, bool retired)
+{
+    // The scheduler's reference protects proc even if a remote kill has already
+    // marked it reapable. Release under the process-list lock so notification
+    // follows the final reference drop without racing waitpid/reaper teardown.
+    uint64_t alf = SchedLockAcquire(g_allProcLock);
+    if (retired)
+        __atomic_store_n(&proc->reapable, true, __ATOMIC_RELEASE);
+    ProcessUnref(proc);
+    if (proc->state == ProcessState::Terminated &&
+        __atomic_load_n(&proc->reapable, __ATOMIC_ACQUIRE) &&
+        __atomic_load_n(&proc->runningOnCpu, __ATOMIC_ACQUIRE) == -1 &&
+        __atomic_load_n(&proc->asLiveThreads, __ATOMIC_ACQUIRE) == 0 &&
+        __atomic_load_n(&proc->refCount, __ATOMIC_ACQUIRE) == 0)
+        NotifyExitedParentLocked(proc);
+    SchedLockRelease(g_allProcLock, alf);
+    // No proc dereference here: a waiting parent may now destroy it.
+}
+
 static void DrainPostSwitch(uint32_t cpu)
 {
     // Defensive: a corrupt-stack panic was observed where this function was
@@ -650,12 +673,7 @@ static void DrainPostSwitch(uint32_t cpu)
         // alive via refCount until released.  Previously this deferred reapable
         // while compositorRegistered, which livelocked if the compositor never
         // unregistered the proc (BRO-175).
-        uint64_t alf = SchedLockAcquire(g_allProcLock);
-        __atomic_store_n(&retired->reapable, true, __ATOMIC_RELEASE);
-        if (__atomic_load_n(&retired->asLiveThreads, __ATOMIC_ACQUIRE) == 0)
-            NotifyExitedParentLocked(retired);
-        SchedLockRelease(g_allProcLock, alf);
-        // No retired dereference after unlock: waitpid may now destroy it.
+        ReleaseSchedulerReference(retired, true);
     }
 
     // Re-enqueue the process we were switched away from.
@@ -669,6 +687,7 @@ static void DrainPostSwitch(uint32_t cpu)
         else
             SchedTrace(toRequeue, STR_REQUEUE_SKIP);
         SchedLockRelease(g_readyLock, rlf);
+        ReleaseSchedulerReference(toRequeue, false);
     }
 }
 
@@ -1467,7 +1486,13 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
     __atomic_or_fetch(AddressSpaceTlbMaskPtr(newProc), 1ULL << cpu, __ATOMIC_RELEASE);
     g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
 
-    // Store requeue info in per-CPU state BEFORE context_switch.
+    // A pending slot owns a reference until DrainPostSwitch's final access.
+    // A remote kill may publish reapable as soon as assembly releases the old
+    // CPU; without this hold it could free the pointer before we drain it.
+    if (g_perCpu[cpu].pendingRequeue || g_perCpu[cpu].pendingRetire)
+        KernelPanic("SCHED: undrained post-switch ownership on CPU%u", cpu);
+    if (requeueOld)
+        ProcessRef(oldProc);
     g_perCpu[cpu].pendingRequeue = requeueOld ? oldProc : nullptr;
 
     // BRO-173/175: if we are switching away from a process that is already
@@ -1488,6 +1513,7 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
         oldProc->state == ProcessState::Terminated &&
         !g_perCpu[cpu].pendingRetire)
     {
+        ProcessRef(oldProc);
         g_perCpu[cpu].pendingRetire = oldProc;
     }
 
@@ -2024,7 +2050,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     // below is redundant but harmless.
     __asm__ volatile("cli" ::: "memory");
 
-    __atomic_store_n(&proc->runningOnCpu, (int32_t)-1, __ATOMIC_RELEASE);
+    // context_switch publishes off-CPU only after leaving this kernel stack.
     // Exiting process will never run again — clear its TLB CPU mask
     __atomic_and_fetch(&proc->tlbCpuMask, ~(1ULL << cpu), __ATOMIC_RELEASE);
 
@@ -2051,6 +2077,9 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     // Mark this terminated process for deferred reap — DrainPostSwitch on the
     // resumed process will set reapable once the context_switch is complete
     // and this kernel stack is no longer in use.
+    if (g_perCpu[cpu].pendingRequeue || g_perCpu[cpu].pendingRetire)
+        KernelPanic("SCHED: undrained exit ownership on CPU%u", cpu);
+    ProcessRef(proc);
     g_perCpu[cpu].pendingRetire = proc;
 
     // Drop g_readyLock RAW now that `next` is fully claimed and committed; IF
@@ -2466,8 +2495,9 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus,
         // BRO-173/175: drop the teardown reference taken in the snapshot.  Once
         // this falls to 0 (and the thread is Terminated, reapable, off-CPU) the
         // reaper is free to destroy it.  Our raw `targets[]` pointer must not be
-        // dereferenced after this point.
-        ProcessUnref(p);
+        // dereferenced after this point. If this is the last scheduler hold,
+        // notify after the drop so a parent's WNOHANG check can now reap it.
+        ReleaseSchedulerReference(p, false);
     }
 }
 
@@ -2520,6 +2550,8 @@ Process* SchedulerFindTerminatedChild(uint16_t parentPid, int64_t pid)
         if (p->parentPid == parentPid
             && p->state == ProcessState::Terminated
             && __atomic_load_n(&p->reapable, __ATOMIC_ACQUIRE)
+            && __atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) == -1
+            && __atomic_load_n(&p->refCount, __ATOMIC_ACQUIRE) == 0
             && !p->isThread  // Threads are not waitable children
             && (pid == -1 || pid == static_cast<int64_t>(p->pid)))
         {

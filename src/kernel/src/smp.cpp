@@ -340,9 +340,13 @@ uint32_t SmpInit()
 
         uint8_t apicId = g_cpus[i].apicId;
 
-        static constexpr uint64_t AP_STACK_PAGES = 4;
-        VirtualAddress stackBase = VmmAllocPages(AP_STACK_PAGES,
-            VMM_WRITABLE, MemTag::KernelData, KernelPid);
+        // This stack remains the AP's idle/scheduler stack after startup.
+        // Scheduler and interrupt frames can exceed the old unguarded 16 KiB;
+        // AP1 then spilled into the preceding framebuffer mapping. Match the
+        // dedicated 64 KiB idle-stack capacity and reserve unmapped guards.
+        static constexpr uint64_t AP_STACK_PAGES = 16;
+        VirtualAddress stackBase = VmmAllocKernelStack(AP_STACK_PAGES,
+            MemTag::KernelData, KernelPid);
         if (!stackBase)
         {
             KPrintf("SMP: failed to allocate stack for AP %u\n", apicId);
@@ -350,6 +354,8 @@ uint32_t SmpInit()
         }
         uint64_t stackTop = stackBase.raw() + AP_STACK_PAGES * 4096 - 16;
         g_cpus[i].kernelStack = stackTop;
+        SerialPrintf("SMP: AP %u guarded stack 0x%lx..0x%lx (%lu KiB)\n",
+                     i, stackBase.raw(), stackTop + 16, AP_STACK_PAGES * 4);
 
         for (uint32_t b = 0; b < trampolineSize; ++b)
             trampolineDst[b] = _ap_trampoline_start[b];

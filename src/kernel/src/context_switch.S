@@ -29,7 +29,7 @@
 context_switch:
     // RDI = old SavedContext*, RSI = new SavedContext*
     // RDX = old FxsaveArea*,  RCX = new FxsaveArea*
-    // R8  = &oldProc->runningOnCpu; published as -1 only after old context is saved
+    // R8  = &oldProc->runningOnCpu; released only after leaving the old stack
 
     // --- Save x87/SSE/AVX state first (before any vector clobber) ---
     movq %rdx, %r9
@@ -71,11 +71,6 @@ context_switch:
     shlq $32, %rdx
     orq  %rcx, %rdx
     movq %rdx, 80(%rdi)         // old->fsBase
-
-    // The old process is no longer running only after its register context is
-    // fully saved. Publishing this earlier lets another CPU schedule it from a
-    // stale SavedContext while this CPU is still inside context_switch.
-    movl $-1, (%r8)
 
     // --- Restore new context ---
 
@@ -129,6 +124,14 @@ context_switch:
 
     // Restore stack pointer
     movq 48(%rsi), %rsp
+
+    // Release the old process only after its context is saved AND this CPU has
+    // left its stack. In particular, the pushq/popfq above must precede this
+    // store: a remote CPU can resume the old process as soon as it observes -1
+    // and reuse that same stack slot. No old context, XSAVE area, or stack may
+    // be accessed after publication. This aligned x86 store supplies release
+    // ordering for the preceding context saves without a locked instruction.
+    movl $-1, (%r8)
 
     // Restore x87/SSE/AVX state (R10 = new FxsaveArea*)
     movl $0x7, %eax              // XCR0 mask: x87 | SSE | AVX
