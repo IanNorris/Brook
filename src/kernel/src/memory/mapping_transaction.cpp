@@ -29,6 +29,9 @@ MappingTransaction::~MappingTransaction() {
         backings_[i].release(backings_[i].pointer);
     for (uint64_t i = 0; i < freshCapacity_; ++i)
         if (fresh_[i].physical && !fresh_[i].published) PmmUnrefPage(fresh_[i].physical);
+    // Finish explicitly before leaving cancellation protection. C++ member
+    // destructors otherwise run after this body, too late to own finalizers.
+    ranges_.Finish();
     kfree(retired_); kfree(fresh_); kfree(backings_);
     AddressSpaceUnref(space_);
     SchedulerKernelRegionLeave(actor_);
@@ -80,6 +83,8 @@ void MappingTransaction::Changed(bool requiresShootdown) {
     shootdown_ |= requiresShootdown;
 }
 bool MappingTransaction::Borrowed(VirtualAddress address, uint64_t leaf) const {
+    if (const auto* range = MappingRangeFind(space_->ranges,address.raw()))
+        return range->leafOwnership == MappingLeafOwnership::Borrowed;
     if (((leaf & PTE_TAG_MASK) >> PTE_TAG_SHIFT) == static_cast<uint64_t>(MemTag::Device))
         return true;
     for (const auto& map : space_->memfdMaps)
@@ -107,7 +112,9 @@ VmmMapResult MappingTransaction::Publish(uint64_t index, VirtualAddress address,
         fresh_[index].published = true;
         fresh_[index].publishedAt = address;
         fresh_[index].publicationEpoch = lockEpoch_;
-        Changed(false);
+        // Population of a prepared leaf does not change topology/protection.
+        // In particular, it must not invalidate a fault's adjacent-page snapshot.
+        // The caller records any actual range/break metadata change separately.
     }
     return result;
 }
@@ -129,9 +136,66 @@ void MappingTransaction::RollbackPublished() {
     }
 }
 bool MappingTransaction::RetireBacking(void* backing, void (*release)(void*)) {
-    if (!locked_ || !backing || !release || backingCount_ == backingCapacity_) return false;
-    backings_[backingCount_++] = {backing, release};
+    if (!HoldBacking(backing,release)) return false;
     shootdown_ = true;
     return true;
+}
+bool MappingTransaction::HoldBacking(void* backing, void (*release)(void*)) {
+    if (!locked_ || !backing || !release || backingCount_ == backingCapacity_) return false;
+    backings_[backingCount_++] = {backing,release}; return true;
+}
+bool MappingTransaction::PrepareRanges(uint64_t nodes) {
+    if (locked_) KernelPanic("mapping: range preparation under lock");
+    return ranges_.Prepare(nodes);
+}
+bool MappingTransaction::ReplaceMapping(uint64_t begin, uint64_t end, const MappingRange* replacement) {
+    if (!locked_) KernelPanic("mapping: range replacement without lock");
+    if (!ranges_.CanReplace(space_->ranges,begin,end,replacement)) return false;
+    uint64_t detached = 0;
+    if (!VmmDetachRange(space_->pageTable,begin,end,retiredCapacity_-retiredCount_,
+                         CaptureDetachedLeaf,this,&detached)) return false;
+    if (!ranges_.Replace(space_->ranges,begin,end,replacement))
+        KernelPanic("mapping: range preflight changed under lock");
+    Changed(detached != 0); return true;
+}
+void MappingTransaction::CaptureDetachedLeaf(VirtualAddress address, uint64_t leaf, void* context) {
+    auto* operation = static_cast<MappingTransaction*>(context);
+    operation->retired_[operation->retiredCount_++] = {leaf,!operation->Borrowed(address,leaf)};
+}
+bool MappingTransaction::RangeLeafCount(uint64_t begin, uint64_t end, uint64_t& count) const {
+    if (!locked_) KernelPanic("mapping: range count without lock");
+    return VmmCountRangeLeaves(space_->pageTable,begin,end,&count);
+}
+bool MappingTransaction::InsertRange(const MappingRange& range) {
+    if (!locked_) KernelPanic("mapping: range insertion without lock");
+    if (!ranges_.Insert(space_->ranges,range)) return false;
+    Changed(false); return true;
+}
+bool MappingTransaction::ProtectRange(uint64_t begin, uint64_t end, uint32_t protection) {
+    if (!locked_) KernelPanic("mapping: range protection without lock");
+    if (!ranges_.Protect(space_->ranges,begin,end,protection)) return false;
+    Changed(); return true;
+}
+static void ReleaseMappingBacking(void* backing) { MappingBackingUnref(static_cast<MappingBacking*>(backing)); }
+bool MappingTransaction::CaptureRange(uint64_t address, uint32_t access, MappingFaultSnapshot& snapshot) {
+    if (!locked_) KernelPanic("mapping: range snapshot without lock");
+    const auto* range = MappingRangeFind(space_->ranges,address);
+    if (!range || !access || (access & ~range->protection)) return false;
+    if (range->backing) {
+        if (!HoldBacking(range->backing,ReleaseMappingBacking)) return false;
+        MappingBackingRef(range->backing);
+    }
+    snapshot = {*range,space_->identity,space_->generation}; return true;
+}
+bool MappingTransaction::ValidateRange(const MappingFaultSnapshot& snapshot, uint64_t address, uint32_t access) const {
+    if (!locked_) KernelPanic("mapping: range validation without lock");
+    if (snapshot.addressSpaceIdentity != space_->identity || snapshot.generation != space_->generation ||
+        !access || (access & ~snapshot.range.protection)) return false;
+    const auto* range = MappingRangeFind(space_->ranges,address);
+    const auto& old = snapshot.range;
+    return range && range->identity == old.identity && range->begin == old.begin && range->end == old.end &&
+           range->offset == old.offset && range->backing == old.backing &&
+           range->protection == old.protection && range->maximumProtection == old.maximumProtection &&
+           range->kind == old.kind && range->sharing == old.sharing && range->leafOwnership == old.leafOwnership;
 }
 }

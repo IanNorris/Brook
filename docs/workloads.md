@@ -572,3 +572,54 @@ exec terminates siblings; an earlier test assuming otherwise was discarded.
 During candidate CMake regeneration, cache-file rename attempts still logged
 failure, although regeneration and the actual newly compiled tests completed.
 That remaining overwrite/fallback behavior needs a focused investigation.
+
+
+## Common range model and sparse teardown foundation (16 October 2026)
+
+The memory subsystem now has a sorted range model for anonymous reservations,
+files, memfds, devices, images and stacks. A range carries identity, backing
+offset, current/maximum protections, sharing policy and explicit managed or
+borrowed leaf ownership. Descriptor references retain one existing backing pin;
+retaining a descriptor cannot enter filesystem code, and final release runs
+outside mapping locks. Split/replacement nodes are prepared before locking.
+Failed capacity, coverage or permission preflights leave the table unchanged.
+
+Transaction helpers retain immutable fault snapshots, reject changed identity,
+coverage, offset or protection, and keep the backing live through retirement.
+Ordinary page population no longer increments topology generation, allowing a
+validated fault snapshot to cover adjacent pages. Combined range removal checks
+metadata capacity and populated-leaf retirement capacity before detaching any
+leaves. Sparse range traversal examines allocated page tables, including two
+populated pages a terabyte apart, rather than every virtual page. Unsupported
+large user leaves cause a preflight failure before any retirement callback.
+
+Address-space finalization now walks populated page tables directly and queries
+range ownership, with the legacy metadata/tag fallback during migration. This
+also removes the old per-virtual-page teardown loops for sparse memfd/framebuffer
+extents. Descriptor-owned borrowed User-tagged leaves survive until their backing
+release; managed leaves drop their own references after TLB acknowledgement.
+
+This is a foundation, **not the completed common mapping protocol**. Live mmap,
+munmap, mprotect, mremap, file/memfd fault handlers, fork/CoW and GUI writers still
+need migration. Their legacy metadata remains authoritative until that switch;
+the new table is not populated by those syscalls yet. The deterministic snapshot
+tests exercise actual helper code with modeled preparation/ACK barriers, not a
+paused real filesystem fault. PROT_NONE content retention, cached/borrowed fault
+publication, syscall range semantics and complete concurrent-writer acceptance
+remain required. Regular-file MAP_SHARED stays disabled; Codium/Firefox acceptance
+is still incomplete. Sparse helper tests do not establish sparse live munmap
+performance while the syscall still uses its legacy implementation.
+
+Candidate kernel SHA-256
+`7be1659f3a38452a8055b5a6e44afe4884a986adbc1d7fed4fcfcd6ede2d4192`
+passed the host suite and all 14 tests after rebuilding the source-hashed changes
+inside Brook. New cases cover 1,000 independent page-oracle interval edits,
+allocation failure, stale primary/adjacent snapshots, delayed ACK/backing pins,
+borrowed User-tagged memfd leaves, high-PML4 teardown, a 1 TiB sparse removal and
+mixed ordinary/large-leaf failure atomicity. Existing heap, graphics, cache/CoW,
+expanded waitid, five I/O and thirteen compatibility/persistence gates passed.
+Heap integrity, checked shutdown and all three offline filesystem checks passed.
+Evidence: `build/workloads/mapping-ranges-20261016/audit.json` and adjacent logs.
+The final run used eight vCPUs and 4 GiB with disk-backed isolated clones because
+available host memory was below the RAM-disk guard. This is focused validation,
+not a fresh two-path bootstrap acceptance run or a browser performance result.

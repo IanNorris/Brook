@@ -1,4 +1,5 @@
 #pragma once
+#include "mapping_ranges.h"
 #include <stdint.h>
 #include "address.h"
 #include "spinlock.h"
@@ -36,6 +37,7 @@ struct AddressSpaceState {
     CompositorVfbAllocation* fbAllocations; // legacy graphics backing owned by this AS
     AddressSpaceState* cleanupNext;
     uint64_t programBreakLow, programBreakHigh; // bounds of this image, independent of leader exec
+    MappingRangeTable ranges; // migration target; legacy writers not switched yet
 };
 
 void AddressSpaceKernelInit();

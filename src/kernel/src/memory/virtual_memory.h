@@ -100,6 +100,16 @@ uint64_t VmmDetachPage(PageTable pt, VirtualAddress virtAddr);
 // Conditional detach for rollback; a replacement frame is left untouched.
 uint64_t VmmDetachPageIfMatches(PageTable pt, VirtualAddress virtAddr, PhysicalAddress expected);
 PhysicalAddress VmmLeafPhysical(uint64_t leaf);
+// Visit only allocated user page tables intersecting [begin,end), never each
+// virtual page of an empty reservation. Huge user leaves are unsupported and
+// cause false before any mutation. Detach preflights capacity under the same
+// PT lock as the removal, then calls retire once per leaf before clearing it.
+// retire must only store tokens/inspect locked metadata: no allocation/I/O or
+// reentry into VMM/AS locks. References are released by caller after shootdown.
+using VmmRetireLeaf = void (*)(VirtualAddress, uint64_t leaf, void* context);
+bool VmmCountRangeLeaves(PageTable pt, uint64_t begin, uint64_t end, uint64_t* count);
+bool VmmDetachRange(PageTable pt, uint64_t begin, uint64_t end, uint64_t capacity,
+                    VmmRetireLeaf retire, void* context, uint64_t* count);
 
 // Unmap a single 4KB page. Issues INVLPG. No-op if not mapped.
 void VmmUnmapPage(PageTable pt, VirtualAddress virtAddr);
@@ -206,10 +216,15 @@ uint32_t VmmCountAllocations(uint16_t filterPid = 0xFFFF);
 PageTable VmmCreateUserPageTable();
 
 // Free a per-process PML4 and all intermediate page-table pages in the
-// user-half (PML4[0..255]).  Does NOT free leaf data pages.
+// user-half (PML4[0..255]), dropping managed leaf references and map counts.
 // AS teardown preserves borrowed Device leaves: detach them without dropping
 // the kernel graphics owner's frame reference. Other callers keep legacy mode.
-void VmmDestroyUserPageTable(PageTable pt, bool preserveBorrowedDevices = false);
+// Optional ownership query runs once per populated leaf, in ascending VA order.
+// It must not allocate or perform I/O. The caller has exclusive teardown access
+// and must complete remote TLB acknowledgement before releasing any leaf refs.
+using VmmBorrowedLeafQuery = bool (*)(VirtualAddress, uint64_t leaf, void* context);
+void VmmDestroyUserPageTable(PageTable pt, bool preserveBorrowedDevices = false,
+                             VmmBorrowedLeafQuery query = nullptr, void* context = nullptr);
 
 // Get the kernel's page table.
 PageTable VmmKernelCR3();

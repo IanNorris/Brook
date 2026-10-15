@@ -184,6 +184,7 @@ add_executable(kernel
     src/process.cpp
     src/memory/address_space.cpp
     src/memory/mapping_transaction.cpp
+    src/memory/mapping_ranges.cpp
     src/scheduler.cpp
     src/compositor.cpp
     src/window.cpp

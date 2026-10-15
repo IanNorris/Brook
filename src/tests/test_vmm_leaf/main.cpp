@@ -228,6 +228,15 @@ static void largeLeafAndBorrowedFrame() {
         CHECK(*large==saved&&!VmmDetachPage(pt,va));
         CHECK(reinterpret_cast<uint64_t*>(pt.pml4.raw())[0]==rootEntry&&entries[1]==directoryEntry);
         CHECK(PmmGetRefCount(candidate)==1&&maps(candidate)==0);
+        // Preflight must encounter the later large leaf before detaching an
+        // earlier ordinary leaf, including before invoking retirement callbacks.
+        auto earlier=PmmAllocPage();const VirtualAddress early(0x200000);
+        CHECK(VmmTryMapPage(pt,early,earlier,flags)==VmmMapResult::Mapped);
+        unsigned callbacks=0;uint64_t count=0;
+        auto retire=[](VirtualAddress,uint64_t,void* context){++*static_cast<unsigned*>(context);};
+        CHECK(!VmmDetachRange(pt,early.raw(),va.raw()+pageSize,2,retire,&callbacks,&count));
+        CHECK(!callbacks&&!count&&VmmVirtToPhys(pt,early)==earlier&&maps(earlier)==1);
+        CHECK(*large==saved);
         PmmFreePage(candidate);*large=0;VmmDestroyUserPageTable(pt);empty();
     }
     auto pt=table();auto backing=PmmAllocPage(MemTag::Device);
@@ -332,9 +341,10 @@ static void consumingWaitCleanup() {
     PmmFreePage(root.pml4);VmmHostSetKernelRoot({});empty();
     std::puts("ADDRESS SPACE WAIT PASS pin-release-before-wake/waiter-ref/finite-batch");
 }
-struct BackingRetirementWitness { AddressSpaceState* space; PhysicalAddress physical; bool released=false; };
+struct BackingRetirementWitness { AddressSpaceState* space; PhysicalAddress physical; bool released=false; Process* actor=nullptr; };
 static void releaseTransactionBacking(void* opaque) {
     auto* witness=static_cast<BackingRetirementWitness*>(opaque);
+    if(witness->actor) CHECK(witness->actor->kernelRegionDepth);
     CHECK(hostMutex(&witness->space->mutation).try_lock());hostMutex(&witness->space->mutation).unlock();
     CHECK(PmmGetRefCount(witness->physical)==1&&maps(witness->physical)==0);
     PmmFreePage(witness->physical);witness->released=true;
@@ -418,9 +428,225 @@ static void mappingTransactions() {
     PmmFreePage(root.pml4);VmmHostSetKernelRoot({});empty();
     std::puts("MAPPING TRANSACTION PASS delayed-ACK/unlocked-retirement/zero-publication/rollback/replacement/OOM");
 }
+static void rangeBackingReleased(void* object) { ++*static_cast<unsigned*>(object); }
+static MappingRange rangeRecord(uint64_t begin, uint64_t end, MappingBacking* backing,
+                                uint32_t prot=3, uint32_t max=7) {
+    return {begin,end,0,0,backing,prot,max,backing?MappingKind::File:MappingKind::Anonymous,
+            MappingSharing::Private,MappingLeafOwnership::Managed};
+}
+static void rangeTableEdits() {
+    const auto initialHeap=heapAllocations.load();
+    unsigned released=0;auto* backing=MappingBackingCreate(&released,rangeBackingReleased);CHECK(backing);
+    MappingRangeTable table{};
+    auto initial=rangeRecord(0x1000,0x9000,backing);
+    { MappingRangePlan plan;CHECK(plan.Prepare(1));CHECK(plan.Insert(table,initial)); }
+    CHECK(backing->references==2);
+    auto originalId=table.head->range.identity;
+    // Insufficient split storage is a true preflight failure, including refs.
+    { MappingRangePlan plan;CHECK(plan.Prepare(1));CHECK(!plan.Replace(table,0x3000,0x5000)); }
+    CHECK(table.head->range.identity==originalId&&table.head->range.end==0x9000&&backing->references==2);
+    {
+        MappingRangePlan plan;CHECK(plan.Prepare(2));CHECK(plan.Replace(table,0x3000,0x5000));
+        CHECK(!MappingRangeFind(table,0x3000));CHECK(MappingRangeFind(table,0x5000)->offset==0x4000);
+        CHECK(backing->references==4); // original held in retirement + two sides
+    }
+    CHECK(backing->references==3);
+    auto reservation=rangeRecord(0x3000,0x5000,nullptr,0);
+    { MappingRangePlan plan;CHECK(plan.Prepare(1));CHECK(plan.Insert(table,reservation)); }
+    CHECK(MappingRangeFindGap(table,0x2000,0x2000,0x1000,0x10000)==0x9000);
+    {
+        MappingRangePlan plan;CHECK(plan.Prepare(2));
+        CHECK(plan.Protect(table,0x2000,0x6000,1));
+        CHECK(MappingRangeFind(table,0x1000)->protection==3);
+        CHECK(MappingRangeFind(table,0x2000)->protection==1);
+        CHECK(MappingRangeFind(table,0x3000)->protection==1);
+        CHECK(MappingRangeFind(table,0x5000)->offset==0x4000);
+        CHECK(MappingRangeFind(table,0x6000)->protection==3);
+    }
+    {
+        MappingRangePlan plan;CHECK(plan.Prepare(2));
+        CHECK(!plan.Protect(table,0x8000,0xa000,0)); // hole at end
+        CHECK(MappingRangeFind(table,0x8000)->protection==3);
+    }
+    for(int fail=0;fail<3;++fail) {
+        MappingRangePlan plan;failHeapAfter=fail;CHECK(!plan.Prepare(3));
+        CHECK(MappingRangeFind(table,0x3000)->protection==1);
+    }
+    { MappingRangePlan plan;CHECK(plan.Prepare(0));CHECK(plan.Replace(table,0x1000,0x9000));CHECK(!released); }
+    CHECK(!table.head&&backing->references==1&&!released);
+    MappingBackingUnref(backing);CHECK(released==1&&heapAllocations==initialHeap);
+
+    // Independent page-granularity oracle checks mixed interval edits, offsets,
+    // coverage failures and gap selection, including sparse reservations.
+    struct Page { bool present=false;uint32_t protection=0,maximum=0;uint64_t offset=0; } oracle[64];
+    uint32_t random=0x3a2f9b41;
+    auto next=[&]{random^=random<<13;random^=random>>17;random^=random<<5;return random;};
+    for(unsigned round=0;round<1000;++round) {
+        unsigned begin=next()%64,end=begin+1+next()%(64-begin),op=next()%4;
+        uint32_t protection=next()%8;bool expected=true;
+        {
+            MappingRangePlan plan;CHECK(plan.Prepare(3));
+            if(op==0||op==3) {
+                if(op==3)for(unsigned i=begin;i<end;++i)expected&=!oracle[i].present;
+                auto replacement=rangeRecord((begin+1)*pageSize,(end+1)*pageSize,nullptr,protection,protection|1);
+                replacement.offset=round*pageSize;
+                bool result=op==3?plan.Insert(table,replacement):plan.Replace(table,replacement.begin,replacement.end,&replacement);
+                CHECK(result==expected);
+                if(result)for(unsigned i=begin;i<end;++i)oracle[i]={true,protection,protection|1,(round+i-begin)*pageSize};
+            } else if(op==1) {
+                CHECK(plan.Replace(table,(begin+1)*pageSize,(end+1)*pageSize));
+                for(unsigned i=begin;i<end;++i)oracle[i]={};
+            } else {
+                for(unsigned i=begin;i<end;++i)expected&=oracle[i].present&&!(protection&~oracle[i].maximum);
+                CHECK(plan.Protect(table,(begin+1)*pageSize,(end+1)*pageSize,protection)==expected);
+                if(expected)for(unsigned i=begin;i<end;++i)oracle[i].protection=protection;
+            }
+        }
+        uint64_t previous=0;
+        for(auto* node=table.head;node;node=node->next) { CHECK(node->range.begin>=previous&&node->range.begin<node->range.end&&node->range.identity);previous=node->range.end; }
+        for(unsigned i=0;i<64;++i) {
+            auto* actual=MappingRangeFind(table,(i+1)*pageSize+13);CHECK(bool(actual)==oracle[i].present);
+            if(actual)CHECK(actual->protection==oracle[i].protection&&actual->maximumProtection==oracle[i].maximum&&
+                            actual->offset+(i+1)*pageSize-actual->begin==oracle[i].offset);
+        }
+        unsigned hint=next()%64,size=1+next()%8;uint64_t expectedGap=0;
+        for(unsigned start=hint;start+size<=64;++start) {
+            bool free=true;for(unsigned i=start;i<start+size;++i)free&=!oracle[i].present;
+            if(free){expectedGap=(start+1)*pageSize;break;}
+        }
+        CHECK(MappingRangeFindGap(table,(hint+1)*pageSize,size*pageSize,pageSize,65*pageSize)==expectedGap);
+    }
+    MappingRangeDestroy(table);CHECK(heapAllocations==initialHeap);
+    std::puts("MAPPING RANGES PASS split/offset/reservation/gaps/permissions/OOM/oracle=1000");
+}
+static void rangeSnapshotRetirement() {
+    auto root=table();VmmHostSetKernelRoot(root);auto* space=AddressSpaceCreate(29);CHECK(space);
+    Process actor{},faultActor{};actor.addressSpace=faultActor.addressSpace=space;
+    unsigned released=0;auto* backing=MappingBackingCreate(&released,rangeBackingReleased);CHECK(backing);
+    {
+        MappingTransaction operation(&actor,space);CHECK(operation.PrepareRanges(1));operation.Lock();
+        CHECK(operation.InsertRange(rangeRecord(va.raw(),va.raw()+3*pageSize,backing)));
+    }
+    MappingBackingUnref(backing);CHECK(backing->references==1);
+    auto original=PmmAllocPage();CHECK(VmmTryMapPage(space->pageTable,va,original,flags)==VmmMapResult::Mapped);
+    Gate faultPrepared,resumeFault;
+    std::thread fault([&]{
+        MappingTransaction operation(&faultActor,space);CHECK(operation.Prepare(0,0,1));operation.Lock();
+        MappingFaultSnapshot snapshot{};CHECK(operation.CaptureRange(va.raw(),1,snapshot));
+        CHECK(operation.ValidateRange(snapshot,va.raw()+pageSize,1));
+        CHECK(!operation.ValidateRange(snapshot,va.raw()+3*pageSize,1));
+        operation.Unlock();faultPrepared.park();resumeFault.park();
+        operation.Lock();CHECK(!operation.ValidateRange(snapshot,va.raw(),1));
+        CHECK(!operation.ValidateRange(snapshot,va.raw()+pageSize,1)); // speculative install also stale
+        CHECK(!released);operation.Unlock();
+    });
+    faultPrepared.wait(1);faultPrepared.release();resumeFault.wait(1);
+    Gate ack;pendingAcknowledgement=&ack;
+    std::thread replacer([&]{
+        MappingTransaction operation(&actor,space);CHECK(operation.Prepare(3,0));CHECK(operation.PrepareRanges(1));operation.Lock();
+        auto anon=rangeRecord(va.raw(),va.raw()+3*pageSize,nullptr,0);
+        CHECK(operation.ReplaceMapping(anon.begin,anon.end,&anon));
+    });
+    ack.wait(1);CHECK(!released&&PmmGetRefCount(original)==1&&backing->references==2);
+    CHECK(hostMutex(&space->mutation).try_lock());hostMutex(&space->mutation).unlock();
+    ack.release();replacer.join();pendingAcknowledgement=nullptr;
+    CHECK(!released&&backing->references==1&&!PmmGetRefCount(original));
+    resumeFault.release();fault.join();CHECK(released==1);
+    {
+        MappingTransaction operation(&actor,space);CHECK(operation.PrepareRanges(2));operation.Lock();
+        MappingFaultSnapshot inaccessible{};CHECK(!operation.CaptureRange(va.raw(),1,inaccessible));
+        CHECK(operation.ProtectRange(va.raw()+pageSize,va.raw()+2*pageSize,3));
+        MappingFaultSnapshot allowed{};CHECK(operation.CaptureRange(va.raw()+pageSize,2,allowed));
+        CHECK(operation.ValidateRange(allowed,va.raw()+pageSize,2));
+        CHECK(!operation.CaptureRange(va.raw(),1,inaccessible));
+    }
+    AddressSpaceUnref(space);CHECK(ProcessCleanupStep());PmmFreePage(root.pml4);VmmHostSetKernelRoot({});empty();
+    CHECK(!actor.kernelRegionDepth&&!faultActor.kernelRegionDepth&&heapAllocations==0);
+    std::puts("MAPPING SNAPSHOT PASS stale-primary/adjacent/backing-pin/post-ACK/reservation");
+}
+static void rangeLeafOwnership() {
+    auto root=table();VmmHostSetKernelRoot(root);auto* space=AddressSpaceCreate(30);CHECK(space);
+    Process actor{};actor.addressSpace=space;
+    auto borrowed=PmmAllocPage();BackingRetirementWitness witness{space,borrowed,false,&actor};
+    auto* backing=MappingBackingCreate(&witness,releaseTransactionBacking);CHECK(backing);
+    auto range=rangeRecord(va.raw(),va.raw()+2*pageSize,backing);
+    range.kind=MappingKind::MemFd;range.sharing=MappingSharing::Shared;range.leafOwnership=MappingLeafOwnership::Borrowed;
+    {
+        MappingTransaction operation(&actor,space);CHECK(operation.PrepareRanges(1));operation.Lock();CHECK(operation.InsertRange(range));
+    }
+    MappingBackingUnref(backing);
+    // Deliberately User-tagged: descriptor ownership must override legacy tags.
+    CHECK(VmmTryMapPage(space->pageTable,va,borrowed,flags,MemTag::User)==VmmMapResult::Mapped);
+    auto originalId=space->ranges.head->range.identity;
+    {
+        MappingTransaction operation(&actor,space);CHECK(operation.Prepare(2,0));CHECK(operation.PrepareRanges(0));operation.Lock();
+        auto anon=rangeRecord(va.raw(),va.raw()+pageSize,nullptr);
+        CHECK(!operation.ReplaceMapping(anon.begin,anon.end,&anon));
+        CHECK(VmmVirtToPhys(space->pageTable,va)==borrowed&&space->ranges.head->range.identity==originalId);
+        CHECK(backing->references==1&&!witness.released);
+    }
+    Gate ack;pendingAcknowledgement=&ack;
+    std::thread remover([&]{
+        MappingTransaction operation(&actor,space);CHECK(operation.Prepare(2,0));CHECK(operation.PrepareRanges(0));operation.Lock();
+        CHECK(operation.ReplaceMapping(range.begin,range.end));
+    });
+    ack.wait(1);CHECK(!witness.released&&PmmGetRefCount(borrowed)==1&&maps(borrowed)==0);
+    CHECK(!space->ranges.head);ack.release();remover.join();pendingAcknowledgement=nullptr;CHECK(witness.released);
+    // Last-AS teardown must also understand borrowed User leaves with no entry
+    // in any legacy memfd array, rather than destroying their owner's ref twice.
+    auto finalBorrowed=PmmAllocPage();BackingRetirementWitness finalWitness{space,finalBorrowed};
+    backing=MappingBackingCreate(&finalWitness,releaseTransactionBacking);CHECK(backing);range.backing=backing;
+    range.begin=0x700040000000ULL;range.end=range.begin+2*pageSize;
+    {
+        MappingTransaction operation(&actor,space);CHECK(operation.PrepareRanges(1));operation.Lock();CHECK(operation.InsertRange(range));
+    }
+    MappingBackingUnref(backing);
+    CHECK(VmmTryMapPage(space->pageTable,VirtualAddress(range.begin),finalBorrowed,flags)==VmmMapResult::Mapped);
+    {
+        MappingTransaction operation(&actor,space);CHECK(operation.Prepare(0,2));CHECK(operation.PrepareZeroed(MemTag::User,30));
+        CHECK(operation.PrepareRanges(1));operation.Lock();
+        CHECK(operation.InsertRange(rangeRecord(va.raw()+4*pageSize,va.raw()+6*pageSize,nullptr)));
+        MappingFaultSnapshot snapshot{};CHECK(operation.CaptureRange(va.raw()+4*pageSize,1,snapshot));
+        CHECK(operation.Publish(0,va+4*pageSize,flags,MemTag::User,30)==VmmMapResult::Mapped);
+        CHECK(operation.ValidateRange(snapshot,va.raw()+5*pageSize,1));
+        CHECK(operation.Publish(1,va+5*pageSize,flags,MemTag::User,30)==VmmMapResult::Mapped);
+        CHECK(operation.ValidateRange(snapshot,va.raw()+4*pageSize,1));
+    }
+    {
+        MappingTransaction operation(&actor,space);CHECK(operation.PrepareRanges(1));operation.Lock();
+        CHECK(operation.InsertRange(rangeRecord(0x10000000000ULL,0x20000000000ULL,nullptr,0)));
+    }
+    const uint64_t hugeBegin=0x10000000000ULL,hugeEnd=0x20000000000ULL;
+    {
+        MappingTransaction operation(&actor,space);CHECK(operation.Prepare(0,2));CHECK(operation.PrepareZeroed(MemTag::User,30));
+        CHECK(operation.PrepareRanges(0));operation.Lock();CHECK(operation.ProtectRange(hugeBegin,hugeEnd,3));
+        CHECK(operation.Publish(0,VirtualAddress(hugeBegin),flags,MemTag::User,30)==VmmMapResult::Mapped);
+        CHECK(operation.Publish(1,VirtualAddress(hugeEnd-pageSize),flags,MemTag::User,30)==VmmMapResult::Mapped);
+    }
+    {
+        MappingTransaction operation(&actor,space);CHECK(operation.Prepare(1,0));CHECK(operation.PrepareRanges(0));operation.Lock();
+        uint64_t count=0;CHECK(operation.RangeLeafCount(hugeBegin,hugeEnd,count)&&count==2);
+        auto id=MappingRangeFind(space->ranges,hugeBegin)->identity;
+        CHECK(!operation.ReplaceMapping(hugeBegin,hugeEnd));
+        CHECK(MappingRangeFind(space->ranges,hugeBegin)->identity==id);
+        CHECK(operation.RangeLeafCount(hugeBegin,hugeEnd,count)&&count==2);
+    }
+    {
+        MappingTransaction operation(&actor,space);CHECK(operation.Prepare(2,0));CHECK(operation.PrepareRanges(0));operation.Lock();
+        CHECK(operation.ReplaceMapping(hugeBegin,hugeEnd));
+        uint64_t count=99;CHECK(operation.RangeLeafCount(hugeBegin,hugeEnd,count)&&count==0);
+    }
+    {
+        MappingTransaction operation(&actor,space);CHECK(operation.PrepareRanges(1));operation.Lock();
+        CHECK(operation.InsertRange(rangeRecord(hugeBegin,hugeEnd,nullptr,0)));
+    }
+    AddressSpaceUnref(space);CHECK(ProcessCleanupStep());CHECK(finalWitness.released);
+    PmmFreePage(root.pml4);VmmHostSetKernelRoot({});empty();CHECK(heapAllocations==0);
+    std::puts("MAPPING RANGE LEAVES PASS borrowed-user/preflight-atomic/final-teardown/sparse-1TiB/population-generation");
+}
 int main() {
     competingInstallAndDetach();detachReinstall();largeLeafAndBorrowedFrame();occupiedAncestors();failureAndInPlace();
     cowRetirement(false);for(unsigned i=0;i<32;++i)cowRetirement(true);
-    addressSpaceLifetime();consumingWaitCleanup();mappingTransactions();
+    addressSpaceLifetime();consumingWaitCleanup();mappingTransactions();rangeTableEdits();rangeSnapshotRetirement();rangeLeafOwnership();
     std::puts("VMM LEAF PASS install/detach races=64 concurrent-cow=32 retirement/OOM/in-place/reuse");
 }

@@ -371,6 +371,68 @@ VmmMapResult VmmTryMapPage(PageTable pt, VirtualAddress virtAddr,
 
 PhysicalAddress VmmLeafPhysical(uint64_t leaf) { return PhysicalAddress(leaf & PHYS_MASK); }
 
+static bool WalkLeafRange(uint64_t* table, unsigned level, uint64_t base,
+                           uint64_t begin, uint64_t end, bool detach,
+                           VmmRetireLeaf retire, void* context, uint64_t& count)
+{
+    const unsigned shift = 12 + 9 * (level - 1);
+    const uint64_t size = uint64_t{1} << shift;
+    uint64_t first = begin > base ? (begin-base) >> shift : 0;
+    uint64_t last = (end-1-base) >> shift;
+    if (last > 511) last = 511;
+    for (uint64_t i = first; i <= last; ++i) {
+        uint64_t leaf = table[i];
+        if (!(leaf & VMM_PRESENT)) continue;
+        uint64_t address = base + i*size;
+        if (level > 1) {
+            if (leaf & (1ULL << 7)) return false;
+            auto* child = reinterpret_cast<uint64_t*>(PhysToVirt(VmmLeafPhysical(leaf)).raw());
+            const uint64_t low = begin > address ? begin : address;
+            const uint64_t high = end < address+size ? end : address+size;
+            if (!WalkLeafRange(child,level-1,address,low,high,detach,retire,context,count)) return false;
+        } else {
+            ++count;
+            if (detach) {
+                retire(VirtualAddress(address),leaf,context);
+                if (leaf & VMM_USER) PmmMapDec(VmmLeafPhysical(leaf));
+                table[i] = 0; Invlpg(VirtualAddress(address));
+            }
+        }
+    }
+    return true;
+}
+static bool ValidLeafRange(PageTable pt, uint64_t begin, uint64_t end) {
+    return pt && begin < end && end <= 0x0000800000000000ULL && !(begin & 4095) && !(end & 4095);
+}
+bool VmmCountRangeLeaves(PageTable pt, uint64_t begin, uint64_t end, uint64_t* count)
+{
+    if (!count || !ValidLeafRange(pt,begin,end)) return false;
+    *count = 0;
+    uint64_t irq = IrqSpinLockAcquire(&g_userPtLock);
+    auto* table = reinterpret_cast<uint64_t*>(PhysToVirt(pt.pml4).raw());
+    bool result = WalkLeafRange(table,4,0,begin,end,false,nullptr,nullptr,*count);
+    IrqSpinLockRelease(&g_userPtLock,irq);
+    return result;
+}
+bool VmmDetachRange(PageTable pt, uint64_t begin, uint64_t end, uint64_t capacity,
+                    VmmRetireLeaf retire, void* context, uint64_t* count)
+{
+    if (!retire || !count || !ValidLeafRange(pt,begin,end)) return false;
+    *count = 0;
+    uint64_t irq = IrqSpinLockAcquire(&g_userPtLock);
+    auto* table = reinterpret_cast<uint64_t*>(PhysToVirt(pt.pml4).raw());
+    uint64_t required = 0;
+    bool result = WalkLeafRange(table,4,0,begin,end,false,nullptr,nullptr,required) && required <= capacity;
+    if (result) {
+        if (!WalkLeafRange(table,4,0,begin,end,true,retire,context,*count)) {
+            SerialPuts("VMM: range walk changed under page-table lock\n");
+            __builtin_trap();
+        }
+    }
+    IrqSpinLockRelease(&g_userPtLock,irq);
+    return result;
+}
+
 uint64_t VmmDetachPage(PageTable pt, VirtualAddress virtAddr)
 {
     IrqSpinLock& lock = !pt ? g_kernelPtLock : g_userPtLock;
@@ -913,7 +975,8 @@ PageTable VmmCreateUserPageTable()
     return PageTable(pml4Phys);
 }
 
-static void FreeTableLevel(PhysicalAddress tablePhys, int level, bool preserveBorrowedDevices)
+static void FreeTableLevel(PhysicalAddress tablePhys, int level, bool preserveBorrowedDevices,
+                           uint64_t base, VmmBorrowedLeafQuery query, void* context)
 {
     uint64_t* table = reinterpret_cast<uint64_t*>(PhysToVirt(tablePhys).raw());
     if (level > 1)
@@ -922,7 +985,8 @@ static void FreeTableLevel(PhysicalAddress tablePhys, int level, bool preserveBo
         {
             if (!(table[i] & VMM_PRESENT)) continue;
             if (table[i] & (1ULL << 7)) continue; // huge page, skip
-            FreeTableLevel(PhysicalAddress(table[i] & PHYS_MASK), level - 1, preserveBorrowedDevices);
+            FreeTableLevel(PhysicalAddress(table[i] & PHYS_MASK), level - 1, preserveBorrowedDevices,
+                           base + (i << (12 + 9 * (level - 1))), query, context);
         }
     }
     else
@@ -937,16 +1001,17 @@ static void FreeTableLevel(PhysicalAddress tablePhys, int level, bool preserveBo
             // the freeing site sees mapCount==0 only when no PTE remains.
             if (table[i] & VMM_USER)
                 PmmMapDec(pagePhys);
-            const bool borrowedDevice = preserveBorrowedDevices &&
-                ((table[i] & PTE_TAG_MASK) >> PTE_TAG_SHIFT) ==
+            const bool borrowed = query ? query(VirtualAddress(base + (i << 12)),table[i],context) :
+                preserveBorrowedDevices && ((table[i] & PTE_TAG_MASK) >> PTE_TAG_SHIFT) ==
                     static_cast<uint64_t>(MemTag::Device);
-            if (!borrowedDevice) PmmUnrefPage(pagePhys);
+            if (!borrowed) PmmUnrefPage(pagePhys);
         }
     }
     PmmFreePage(tablePhys);
 }
 
-void VmmDestroyUserPageTable(PageTable pt, bool preserveBorrowedDevices)
+void VmmDestroyUserPageTable(PageTable pt, bool preserveBorrowedDevices,
+                             VmmBorrowedLeafQuery query, void* context)
 {
     if (!pt) return;
 
@@ -955,7 +1020,8 @@ void VmmDestroyUserPageTable(PageTable pt, bool preserveBorrowedDevices)
     for (uint64_t i = 0; i < 256; i++)
     {
         if (!(pml4[i] & VMM_PRESENT)) continue;
-        FreeTableLevel(PhysicalAddress(pml4[i] & PHYS_MASK), 3, preserveBorrowedDevices);
+        FreeTableLevel(PhysicalAddress(pml4[i] & PHYS_MASK), 3, preserveBorrowedDevices,
+                       i << 39, query, context);
     }
 
     PmmFreePage(pt.pml4);

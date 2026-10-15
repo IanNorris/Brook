@@ -1,5 +1,6 @@
 #include "address_space.h"
 #include "virtual_memory.h"
+#include "physical_memory.h"
 #include "heap.h"
 #include "process.h"
 #include "scheduler.h"
@@ -82,18 +83,28 @@ void ProcessDestroyAndWait(Process* process) {
     while (!__atomic_load_n(&completion.done, __ATOMIC_ACQUIRE))
         SchedulerBlock(waiter);
 }
+struct TeardownRanges { AddressSpaceState* space; const MappingRangeNode* cursor; };
+static bool BorrowedTeardownLeaf(VirtualAddress address, uint64_t leaf, void* opaque) {
+    auto& ranges = *static_cast<TeardownRanges*>(opaque);
+    while (ranges.cursor && ranges.cursor->range.end <= address.raw()) ranges.cursor = ranges.cursor->next;
+    if (ranges.cursor && ranges.cursor->range.begin <= address.raw())
+        return ranges.cursor->range.leafOwnership == MappingLeafOwnership::Borrowed;
+    // Compatibility during migration. Once the last legacy writer is removed,
+    // all ownership comes from ranges. No filesystem work occurs in this query.
+    for (const auto& map : ranges.space->memfdMaps)
+        if (map.length && map.mfd && address.raw() >= map.vaddr && address.raw()-map.vaddr < map.length) return true;
+    for (const auto& map : ranges.space->fbMaps)
+        if (map.length && address.raw() >= map.vaddr && address.raw()-map.vaddr < map.length) return true;
+    return ((leaf & PTE_TAG_MASK) >> PTE_TAG_SHIFT) == static_cast<uint64_t>(MemTag::Device);
+}
 static void DestroyAddressSpace(AddressSpaceState* space) {
     // Refcount zero: no task/fault/job can enter this page table again. No
     // sleeping mutex is required, and all filesystem finalizers run here.
     TlbShootdownFull(space->pageTable.pml4.raw(), space->tlbCpuMask);
-    // Borrowed leaves must be detached before the managed-leaf teardown walk.
-    for (const auto& map : space->memfdMaps)
-        for (uint64_t offset = 0; offset < map.length; offset += 4096)
-            VmmUnmapPage(space->pageTable, VirtualAddress(map.vaddr + offset));
-    for (const auto& map : space->fbMaps)
-        for (uint64_t offset = 0; offset < map.length; offset += 4096)
-            VmmUnmapPage(space->pageTable, VirtualAddress(map.vaddr + offset));
-    VmmDestroyUserPageTable(space->pageTable, true);
+    // Walk populated page tables, not the potentially multi-TiB virtual extents
+    // of sparse reservations. Backing descriptors stay live through this walk.
+    TeardownRanges ranges{space,space->ranges.head};
+    VmmDestroyUserPageTable(space->pageTable,true,BorrowedTeardownLeaf,&ranges);
     CompositorReleaseAddressSpaceBuffers(space);
     for (const auto& map : space->memfdMaps)
         if (map.length && map.mfd) MemFdHandleUnref(map.mfd);
@@ -103,6 +114,7 @@ static void DestroyAddressSpace(AddressSpaceState* space) {
         if (__atomic_fetch_sub(&map.vnode->refCount, 1, __ATOMIC_ACQ_REL) == 1)
             VfsClose(map.vnode);
     }
+    MappingRangeDestroy(space->ranges);
     // Never sweep by allocationPid: exec and PID reuse can own newer resources.
     kfree(space);
 }

@@ -361,6 +361,19 @@ generation check alone cannot cover anonymous/device replacement or COW.
   Keep final filesystem work outside scheduler interrupt context. Consuming
   waits now finish a finite worker cleanup batch before returning; add a
   deterministic cancellation test paused inside this cleanup wait.
+- Common range helpers now represent reservations, protections, sharing and
+  explicit leaf ownership with retained backing descriptors. Prepared split
+  plans, generation-validated snapshots, sparse removal and descriptor-aware
+  final teardown passed host/guest helper tests. Live mapping/fault/GUI writers
+  are not migrated yet; retire the legacy arrays when switching them instead
+  of keeping duplicate authoritative range tables. Add retained inaccessible
+  leaves for PROT_NONE data preservation, cached/borrowed page publication,
+  and consistent unpublished ELF/interpreter/stack/TLS range registration.
+  Keep removal proportional to populated leaves; its count must be revalidated
+  at commit because ordinary fault population does not change topology generation.
+  Use an ascending descriptor cursor for bulk retirement to avoid repeated
+  O(leaves × ranges) lookup while holding the global PT lock. Huge user leaves
+  remain unsupported by the common range-removal preflight.
 - Faults snapshot and pin backing identity/range/offset/protection under that
   mutex, release it for I/O, then validate the generation before committing.
   Every speculative adjacent-page installation needs the same validation.
