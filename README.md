@@ -289,7 +289,7 @@ full default application collection. The calculator is installed at
 Run with serial logging, localhost VNC, and a dedicated monitor socket:
 
 ```bash
-nix-shell --run 'env BROOK_SKIP_UPDATE_DISK=1 BROOK_SMP=4 BROOK_USB_KBD=1 SERIAL_OPT="-serial file:/tmp/brook-serial.log" timeout 600 ./scripts/run-qemu.sh --release --headless --vnc 127.0.0.1:97 --no-audio --instance=97 --real-esp --script inspect_desktop'
+nix-shell --run 'env BROOK_SKIP_UPDATE_DISK=1 BROOK_SMP=8 BROOK_USB_KBD=1 SERIAL_OPT="-serial file:/tmp/brook-serial.log" timeout 600 ./scripts/run-qemu.sh --release --headless --vnc 127.0.0.1:97 --no-audio --instance=97 --real-esp --script inspect_desktop'
 ```
 
 KVM is selected automatically when `/dev/kvm` is accessible. VNC listens on

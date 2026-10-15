@@ -74,5 +74,8 @@ real app audio as a separate track, then assemble warmed clips to music
 offline. For example, 120 BPM gives eight seconds per four-bar phrase in 4/4;
 a 96-second reel can use twelve phrases. Cut on phrase boundaries, hold UI
 interactions long enough to read them, and reserve fast cuts for game footage.
-Keep the chosen music outside Git unless it is an asset intended for public
-distribution. A soundtrack and final movie have not been produced yet.
+The selected soundtrack is **Brook 2000.mp3**, supplied separately: 3:09.213,
+stereo at 48 kHz. Keep that source audio outside Git. Beat markers and scene
+cuts still need to be mapped to the track; the 120 BPM example above is a
+planning example, not a measured tempo for this music. A final movie has not
+been produced yet.
