@@ -395,7 +395,6 @@ static volatile uint64_t g_profPreloadPages = 0;
 static constexpr int64_t ENOENT  = 2;
 static constexpr int64_t ESRCH   = 3;
 static constexpr int64_t E2BIG   = 7;
-static constexpr int64_t ECHILD  = 10;
 static constexpr int64_t EPERM   = 1;
 static constexpr int64_t EBADF   = 9;
 static constexpr int64_t ENOMEM  = 12;
@@ -5443,112 +5442,121 @@ static int64_t sys_clone3(uint64_t argsPtr, uint64_t size, uint64_t,
 // or a specific child PID. WNOHANG (options & 1) returns 0 if no child
 // has exited yet instead of blocking.
 
-static constexpr uint64_t WNOHANG    = 1;
-static constexpr uint64_t WUNTRACED  = 2;
-[[maybe_unused]] static constexpr uint64_t WCONTINUED = 8;
+static constexpr uint32_t WNOHANG = 1;
+static constexpr uint32_t WUNTRACED = 2;
+static constexpr uint32_t WEXITED = 4;
+static constexpr uint32_t WCONTINUED = 8;
+static constexpr uint32_t WNOWAIT = 0x01000000;
 
-static int64_t sys_wait4(uint64_t pidArg, uint64_t statusAddr, uint64_t options,
-                          uint64_t, uint64_t, uint64_t)
+struct WaitSiginfo {
+    int32_t signo, error, code, reserved;
+    int32_t pid;
+    uint32_t uid;
+    int32_t status, reserved2;
+    int64_t userTime, systemTime;
+    uint8_t padding[80];
+};
+static_assert(sizeof(WaitSiginfo) == 128, "Linux siginfo size");
+static_assert(__builtin_offsetof(WaitSiginfo, pid) == 16, "Linux SIGCHLD pid");
+static_assert(__builtin_offsetof(WaitSiginfo, status) == 24, "Linux SIGCHLD status");
+
+static void CopyWaitUsage(uint64_t address, const ChildWaitSnapshot& event)
+{
+    if (!address) return;
+    int64_t usage[18]{}; // Linux x86-64 rusage (144 bytes), tracked CPU ticks.
+    usage[0] = event.userTicks / 1000;
+    usage[1] = (event.userTicks % 1000) * 1000;
+    usage[2] = event.sysTicks / 1000;
+    usage[3] = (event.sysTicks % 1000) * 1000;
+    memcpy(reinterpret_cast<void*>(address), usage, sizeof(usage));
+}
+
+static bool ChildWaitInterrupted(Process* caller)
+{
+    if (__atomic_load_n(&caller->terminalPending, __ATOMIC_ACQUIRE)) return true;
+    uint64_t pending = (__atomic_load_n(&caller->sigPending, __ATOMIC_ACQUIRE) |
+                        PosixTimerPending(caller)) & ~caller->sigMask;
+    constexpr uint64_t childBit = 1ULL << (17 - 1);
+    if (pending & ~childBit) return true;
+    if (pending & childBit) {
+        // Default/ignored SIGCHLD is a wait wakeup. A caught SIGCHLD must reach
+        // its handler through normal syscall signal delivery instead of vanishing.
+        if (g_sigHandlers[caller->tgid][16].handler > 1) return true;
+        __atomic_fetch_and(&caller->sigPending, ~childBit, __ATOMIC_ACQ_REL);
+    }
+    return false;
+}
+
+static int WaitChildEvent(Process* caller, int selector, uint32_t id,
+                          uint32_t options, ChildWaitSnapshot* event)
+{
+    for (;;) {
+        int result = SchedulerWaitChild(caller, selector, id, options, event);
+        if (result != 0 || (options & WNOHANG)) return result;
+        if (ChildWaitInterrupted(caller)) return -EINTR;
+        // Exit publication sets pendingWakeup on every parent-group waiter;
+        // SchedulerBlock consumes it even if notification preceded the block.
+        extern volatile uint64_t g_lapicTickCount;
+        caller->wakeupTick = g_lapicTickCount + 1000;
+        SchedulerBlock(caller);
+        if (ChildWaitInterrupted(caller)) return -EINTR;
+    }
+}
+
+static int64_t sys_wait4(uint64_t pidArg, uint64_t statusAddr, uint64_t rawOptions,
+                         uint64_t usageAddr, uint64_t, uint64_t)
 {
     Process* parent = ProcessCurrent();
-    if (!parent) return -ENOSYS;
-
+    if (!parent) return -ESRCH;
+    uint32_t options = static_cast<uint32_t>(rawOptions);
+    if (options & ~(WNOHANG | WUNTRACED | WCONTINUED)) return -EINVAL;
     if (statusAddr && !UserBufferWritable(statusAddr, sizeof(int32_t))) return -EFAULT;
+    if (usageAddr && !UserBufferWritable(usageAddr, 144)) return -EFAULT;
+    int32_t pid = static_cast<int32_t>(pidArg);
+    if (pid == static_cast<int32_t>(0x80000000U)) return -ESRCH;
+    int selector = pid == -1 ? 0 : pid > 0 ? 1 : 2;
+    uint32_t id = pid == 0 ? parent->pgid : pid < -1 ? static_cast<uint32_t>(-pid) : static_cast<uint32_t>(pid);
+    ChildWaitSnapshot event{};
+    int result = WaitChildEvent(parent, selector, id, options | WEXITED, &event);
+    if (result <= 0) return result;
+    if (statusAddr) *reinterpret_cast<int32_t*>(statusAddr) = event.status;
+    CopyWaitUsage(usageAddr, event);
+    return event.pid;
+}
 
-    int64_t targetPid = static_cast<int64_t>(static_cast<int32_t>(pidArg));
-    // pid < -1 means wait for any child in process group |pid| — treat as -1
-    if (targetPid < -1) targetPid = -1;
-    // pid == 0 means wait for any child in same process group — treat as -1
-    if (targetPid == 0) targetPid = -1;
-
-    // Spin until a terminated (or stopped, if WUNTRACED) child is found
-    uint32_t retries = 0;
-    for (;;)
-    {
-        // Check for stopped children if WUNTRACED
-        if (options & WUNTRACED)
-        {
-            Process* stopped = SchedulerFindStoppedChild(parent->pid, targetPid);
-            if (stopped)
-            {
-                int32_t childPid = stopped->pid;
-                if (statusAddr)
-                {
-                    // Linux wait status for stopped: (signum << 8) | 0x7F
-                    auto* wstatus = reinterpret_cast<int32_t*>(statusAddr);
-                    *wstatus = (20 << 8) | 0x7F; // SIGTSTP (20)
-                }
-                // Mark as reported so we don't report it again
-                stopped->stopReported = true;
-                return static_cast<int64_t>(childPid);
-            }
-        }
-
-        Process* child = SchedulerFindTerminatedChild(parent->pid, targetPid);
-        if (child)
-        {
-            int32_t childPid = child->pid;
-            int32_t childStatus = child->waitStatus;
-
-            if (statusAddr)
-            {
-                // Termination paths already encode the exit cause. A normal
-                // exit code >=128 must not be mistaken for a signal number.
-                auto* wstatus = reinterpret_cast<int32_t*>(statusAddr);
-                *wstatus = childStatus;
-            }
-
-            SchedulerReapChild(child);
-            DbgPrintf("WAIT4: pid=%u reaped child=%u status=0x%x -> rip=0x%lx\n",
-                      parent->pid, childPid, childStatus, parent->syscallUserRip);
-            return static_cast<int64_t>(childPid);
-        }
-
-        // No child with matching parentPid exists at all — return ECHILD
-        // instead of blocking forever. This handles the case where a child
-        // was already destroyed (e.g. by ReapTerminated) before the parent
-        // called waitpid.
-        if (targetPid > 0)
-        {
-            if (!SchedulerChildExists(parent->pid, static_cast<uint16_t>(targetPid)))
-            {
-                SerialPrintf("WAIT4: pid=%u target=%ld child NOT FOUND in proclist — returning ECHILD\n",
-                             parent->pid, targetPid);
-                return -ECHILD;
-            }
-        }
-
-        if (options & WNOHANG)
-            return 0;
-
-        // Diagnostic: after many retries, dump the child's state
-        if (++retries == 100 && targetPid > 0)
-        {
-            SchedulerDumpChildState(parent->pid, static_cast<uint16_t>(targetPid));
-            SerialPrintf("WAIT4: pid=%u waiting for target=%ld after %u retries\n",
-                         parent->pid, targetPid, retries);
-        }
-
-        // Block until SIGCHLD arrives from child exit (scheduler.cpp delivers
-        // SIGCHLD and calls SchedulerUnblock on the parent).  The 1-second
-        // heartbeat is a safety net in case the SIGCHLD delivery races with
-        // us entering the blocked state — it was previously 5ms which burned
-        // ~800 wakeups/sec per waiting process for the 24h nix-install stall.
-        extern volatile uint64_t g_lapicTickCount;
-        parent->wakeupTick = g_lapicTickCount + 1000;
-        SchedulerBlock(parent);
-        if (HasPendingSignals())
-        {
-            // SIGCHLD is expected during wait — clear it and retry
-            // instead of returning EINTR. Only return EINTR for other signals.
-            uint64_t pending = (parent->sigPending | PosixTimerPending(parent)) & ~parent->sigMask;
-            uint64_t sigchldBit = (1ULL << (17 - 1)); // SIGCHLD = 17
-            if ((pending & ~sigchldBit) != 0)
-                return -EINTR;
-            // Only SIGCHLD pending — clear it and retry the wait loop
-            parent->sigPending &= ~sigchldBit;
-        }
+static int64_t sys_waitid(uint64_t rawSelector, uint64_t rawId, uint64_t infoAddr,
+                          uint64_t rawOptions, uint64_t usageAddr, uint64_t)
+{
+    Process* parent = ProcessCurrent();
+    if (!parent) return -ESRCH;
+    uint32_t selector = static_cast<uint32_t>(rawSelector);
+    uint32_t id = static_cast<uint32_t>(rawId);
+    uint32_t options = static_cast<uint32_t>(rawOptions);
+    if (selector > 2 || (selector == 1 && static_cast<int32_t>(id) <= 0) ||
+        (selector == 2 && static_cast<int32_t>(id) < 0) ||
+        (options & ~(WNOHANG | WUNTRACED | WEXITED | WCONTINUED | WNOWAIT)) ||
+        !(options & (WUNTRACED | WEXITED | WCONTINUED))) return -EINVAL;
+    if (infoAddr && !UserBufferWritable(infoAddr, sizeof(WaitSiginfo))) return -EFAULT;
+    if (usageAddr && !UserBufferWritable(usageAddr, 144)) return -EFAULT;
+    if (selector == 2 && !id) id = parent->pgid;
+    ChildWaitSnapshot event{};
+    int result = WaitChildEvent(parent, static_cast<int>(selector), id, options, &event);
+    if (result < 0) return result;
+    WaitSiginfo info{};
+    if (result) {
+        info.signo = 17;
+        info.code = event.code;
+        info.pid = event.pid;
+        info.uid = event.uid;
+        info.status = event.code == 1 ? (event.status >> 8) & 0xff :
+                      event.code == 5 ? (event.status >> 8) & 0xff :
+                      event.code == 6 ? 18 : event.status & 0x7f;
+        info.userTime = event.userTicks / 10; // Linux USER_HZ = 100.
+        info.systemTime = event.sysTicks / 10;
+        CopyWaitUsage(usageAddr, event);
     }
+    if (infoAddr) memcpy(reinterpret_cast<void*>(infoAddr), &info, sizeof(info));
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -14060,6 +14068,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_EXECVE]          = sys_execve;
     g_syscallTable[SYS_EXIT]            = sys_exit;
     g_syscallTable[SYS_WAIT4]           = sys_wait4;
+    g_syscallTable[SYS_WAITID]          = sys_waitid;
     g_syscallTable[SYS_UNAME]           = sys_uname;
     g_syscallTable[SYS_FCNTL]           = sys_fcntl;
     g_syscallTable[SYS_FSYNC]           = sys_fsync;
@@ -14347,7 +14356,7 @@ static uint32_t SyscallCategory(uint64_t num)
         return SC_MEM;  // mmap..mremap, madvise
     // Process
     case 56: case 57: case 58: case 59: case 60: case 61: case 62:
-    case 231: case 234: case 435:
+    case 231: case 234: case 247: case 435:
         return SC_PROC; // clone..wait4, exit_group, tgkill, clone3
     // Signal
     case 13: case 14: case 15: case 34: case 127: case 128: case 129: case 130: case 131:
@@ -14392,6 +14401,7 @@ static const char* SyscallName(uint64_t num)
     case 56: return "clone";
     case 57: return "fork";       case 58: return "vfork";
     case 59: return "execve";     case 60: return "exit";
+    case 247: return "waitid";
     case 61: return "wait4";      case 62: return "kill";
     case 63: return "uname";      case 72: return "fcntl";
     case 74: return "fsync";      case 75: return "fdatasync";
@@ -14531,6 +14541,9 @@ static int64_t SyscallDispatchTraced(uint64_t num, uint64_t a0, uint64_t a1,
     } else if (num == SYS_MMAP) {
         SerialPrintf("[strace:%u] mmap(0x%lx, %lu, 0x%lx, 0x%lx, %ld, 0x%lx)",
                      proc->pid, a0, a1, a2, a3, (int64_t)a4, a5);
+    } else if (num == SYS_WAITID) {
+        SerialPrintf("[strace:%u] waitid(%lu, %lu, 0x%lx, 0x%lx, 0x%lx)",
+                     proc->pid, a0, a1, a2, a3, a4);
     } else if (num == SYS_LSEEK) {
         SerialPrintf("[strace:%u] lseek(%lu, %ld, %lu)",
                      proc->pid, a0, (int64_t)a1, a2);

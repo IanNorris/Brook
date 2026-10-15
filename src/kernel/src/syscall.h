@@ -51,6 +51,7 @@ static constexpr uint64_t SYS_VFORK           = 58;
 static constexpr uint64_t SYS_EXECVE          = 59;
 static constexpr uint64_t SYS_EXIT            = 60;
 static constexpr uint64_t SYS_WAIT4           = 61;
+static constexpr uint64_t SYS_WAITID          = 247;
 static constexpr uint64_t SYS_UNAME           = 63;
 static constexpr uint64_t SYS_FCNTL           = 72;
 static constexpr uint64_t SYS_FSYNC           = 74;

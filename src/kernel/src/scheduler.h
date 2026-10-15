@@ -31,6 +31,7 @@ void SchedulerBlock(Process* proc);
 
 // Unblock a process — move it from Blocked back to Ready queue.
 void SchedulerUnblock(Process* proc);
+void SchedulerContinue(Process* proc);
 
 // Called from the LAPIC timer ISR on each CPU. `allowPreempt` should be true
 // only when the interrupted context was preemptible user mode; wakeups and idle
@@ -71,7 +72,7 @@ bool SchedulerKernelOperationBoundary();
 
 void SchedulerMarkTerminated(Process* proc, int waitStatus);
 // Request a stop without yielding (for the syscall signal-return path).
-void SchedulerMarkStopped(Process* proc);
+void SchedulerMarkStopped(Process* proc, int signal = 19);
 // Drop an owned wait reference and notify a parent if this made it reapable.
 void SchedulerReleaseWaitReference(Process* proc);
 // Registry-pinned lookup; caller must ProcessUnref the returned identity.
@@ -90,13 +91,18 @@ uint32_t SchedulerReadyCount();
 uint16_t SchedulerAllocPid();
 void SchedulerFreePid(uint16_t pid);
 
-// Find a terminated child of parentPid. If pid == -1, any child; otherwise
-// matches a specific child PID. Returns the child Process* or nullptr.
-Process* SchedulerFindTerminatedChild(uint16_t parentPid, int64_t pid);
-Process* SchedulerFindStoppedChild(uint16_t parentPid, int64_t pid);
-bool SchedulerChildExists(uint16_t parentPid, uint16_t childPid);
+// Snapshot a selected child event. Return 1 for an event, 0 for eligible
+// children without an event, or -ECHILD. Options use Linux W* bit values.
+// Consumption detaches a zombie atomically; destruction finishes before return.
+struct ChildWaitSnapshot {
+    int32_t pid, status, code;
+    uint32_t uid;
+    uint64_t userTicks, sysTicks;
+};
+int SchedulerWaitChild(Process* caller, int selector, uint32_t id,
+                       uint32_t options, ChildWaitSnapshot* result);
 void SchedulerDumpChildState(uint16_t parentPid, uint16_t targetPid);
-void SchedulerStop(Process* proc);
+void SchedulerStop(Process* proc, int signal = 19);
 
 // Find a non-terminated process whose name (basename, possibly suffixed
 // by SpawnProcess with `_NN`) matches the given basename.  Used by the
@@ -105,8 +111,6 @@ void SchedulerStop(Process* proc);
 // nullptr if no live match is found.
 Process* SchedulerFindProcessByBaseName(const char* basename);
 
-// Reap (destroy) a terminated child process after wait4 collects its status.
-void SchedulerReapChild(Process* child);
 // Complete a destroyed thread's shared-AS hold and notify a now-waitable parent.
 void SchedulerReleaseThreadAddressSpace(Process* thread);
 

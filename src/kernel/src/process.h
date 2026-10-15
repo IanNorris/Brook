@@ -240,7 +240,7 @@ struct Process
     uint64_t magic;
 
     uint16_t pid;
-    uint16_t parentPid;          // Parent process PID (0 if no parent)
+    uint16_t parentPid;          // Parent thread-group ID (0 if no parent)
     uint16_t pgid;               // Process group ID
     uint16_t sid;                // Session ID
     uint16_t tgid;               // Thread group ID (= leader's PID; same as PID for main thread)
@@ -508,7 +508,10 @@ struct Process
     // Fork child state: when true, the trampoline enters user mode at
     // forkReturnRip with RAX=0 (child's fork() return value).
     bool isForkChild;
-    bool stopReported;          // True after wait4 reported this process as stopped
+    bool stopReported;          // Stopped event consumed; protected by scheduler ready lock
+    bool continuedPending;     // Unconsumed SIGCONT event, same lock
+    bool resumePending;        // Deferred stop resumption until CPU ownership clears
+    uint8_t stopSignal;         // Actual signal for a stopped-child event
     // Stable copy of the user register snapshot taken at syscall entry. The
     // syscall path copies per-CPU %gs fields here before re-enabling interrupts
     // so fork/clone are not racing another syscall on the same CPU.

@@ -600,19 +600,39 @@ static Process* PickNextLocked(uint32_t cpu)
     return nullptr;
 }
 
-// Caller holds g_allProcLock, which also protects parent lifetime.
-static void NotifyExitedParentLocked(Process* child)
+// Caller holds g_allProcLock. Parent identity is the thread group, including
+// a surviving thread after its leader exited. Wake every possible waiter, but
+// enqueue a single process-directed SIGCHLD rather than one per thread.
+static void NotifyParentGroupLocked(Process* child)
 {
-    if (child->isThread || child->state != ProcessState::Terminated || !child->parentPid)
-        return;
+    if (child->isThread || !child->parentPid) return;
+    constexpr uint64_t bit = 1ULL << (17 - 1);
+    Process* recipient = nullptr;
     for (uint32_t i = 0; i < g_processCount; ++i) {
         Process* parent = g_allProcesses[i];
-        if (parent->pid == child->parentPid) {
-            __atomic_or_fetch(&parent->sigPending, 1ULL << (17 - 1), __ATOMIC_RELEASE);
-            __atomic_store_n(&parent->pendingWakeup, 1, __ATOMIC_RELEASE);
-            break;
-        }
+        if (parent->tgid != child->parentPid || parent->state == ProcessState::Terminated)
+            continue;
+        __atomic_store_n(&parent->pendingWakeup, 1, __ATOMIC_RELEASE);
+        if (!recipient || ((recipient->sigMask & bit) && !(parent->sigMask & bit)))
+            recipient = parent;
     }
+    if (recipient) __atomic_or_fetch(&recipient->sigPending, bit, __ATOMIC_RELEASE);
+}
+
+static void NotifyExitedParentLocked(Process* child)
+{
+    if (child->state == ProcessState::Terminated) NotifyParentGroupLocked(child);
+}
+
+// readyLock -> allProcLock order. Reparent only once the final live member
+// exits, including a nonleader; an exited leader alone does not orphan children.
+static void ReparentDeadGroupLocked(uint16_t tgid)
+{
+    for (uint32_t i = 0; i < g_processCount; ++i)
+        if (g_allProcesses[i]->tgid == tgid &&
+            g_allProcesses[i]->state != ProcessState::Terminated) return;
+    for (uint32_t i = 0; i < g_processCount; ++i)
+        if (g_allProcesses[i]->parentPid == tgid) g_allProcesses[i]->parentPid = 0;
 }
 
 // Drain per-CPU bookkeeping that was set before a context_switch.
@@ -1099,6 +1119,16 @@ void SchedulerBlock(Process* proc)
         return;
     }
 
+    // A remote stop can win while this syscall is preparing to block. Keep
+    // Stopped until SIGCONT instead of overwriting it with Blocked (which loses
+    // the continued event and can leave waitid(WCONTINUED) asleep forever).
+    if (proc->state == ProcessState::Stopped) {
+        SchedLockRelease(g_readyLock, rlf3);
+        if (proc == g_perCpu[ThisCpu()].currentProcess) SchedulerYield();
+        if (flags & 0x200) __asm__ volatile("sti" ::: "memory");
+        return;
+    }
+
     // Check for a pending wakeup that raced with us (e.g. KMutexUnlock
     // calling SchedulerUnblock before we got here).  If set, the waker
     // already transferred mutex ownership; we should NOT block.
@@ -1129,13 +1159,21 @@ void SchedulerBlock(Process* proc)
         __asm__ volatile("sti" ::: "memory");
 }
 
-void SchedulerMarkStopped(Process* proc)
+void SchedulerMarkStopped(Process* proc, int signal)
 {
     uint64_t rlf = SchedLockAcquire(g_readyLock);
     if (proc->state != ProcessState::Terminated && !proc->terminalPending)
     {
         proc->state = ProcessState::Stopped;
+        proc->stopSignal = static_cast<uint8_t>(signal);
+        proc->stopReported = false;
+        proc->continuedPending = false;
+        __atomic_store_n(&proc->resumePending, false, __ATOMIC_RELEASE);
+        __atomic_store_n(&proc->pendingWakeup, 0, __ATOMIC_RELEASE);
         ReadyQueueRemoveLocked(proc);
+        uint64_t alf = SchedLockAcquire(g_allProcLock);
+        NotifyParentGroupLocked(proc);
+        SchedLockRelease(g_allProcLock, alf);
     }
     SchedLockRelease(g_readyLock, rlf);
 }
@@ -1224,6 +1262,9 @@ void SchedulerMarkTerminated(Process* proc, int waitStatus)
                          __ATOMIC_RELEASE);
     }
     ReadyQueueRemoveLocked(proc);
+    uint64_t parentFlags = SchedLockAcquire(g_allProcLock);
+    ReparentDeadGroupLocked(proc->tgid);
+    SchedLockRelease(g_allProcLock, parentFlags);
     bool offCpu = __atomic_load_n(&proc->runningOnCpu, __ATOMIC_ACQUIRE) == -1;
     // In a self-fatal path, restoring IF before dropping our temporary hold
     // could retire this CPU forever with the hold still on its dead stack.
@@ -1234,14 +1275,14 @@ void SchedulerMarkTerminated(Process* proc, int waitStatus)
     if (rlf & 0x200) __asm__ volatile("sti" ::: "memory");
 }
 
-void SchedulerStop(Process* proc)
+void SchedulerStop(Process* proc, int signal)
 {
     // Like SchedulerBlock but sets Stopped instead of Blocked.
     // Used by SIGTSTP/SIGTTIN/SIGTTOU default handlers.
     uint64_t flags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
 
-    SchedulerMarkStopped(proc);
+    SchedulerMarkStopped(proc, signal);
 
     uint32_t cpu = ThisCpu();
     if (proc == g_perCpu[cpu].currentProcess)
@@ -1251,7 +1292,7 @@ void SchedulerStop(Process* proc)
         __asm__ volatile("sti" ::: "memory");
 }
 
-void SchedulerUnblock(Process* proc)
+static void SchedulerUnblockInternal(Process* proc, bool continued)
 {
     uint64_t procAddr = reinterpret_cast<uint64_t>(proc);
     if (!proc || (procAddr >> 47) != 0x1FFFFULL)
@@ -1260,6 +1301,13 @@ void SchedulerUnblock(Process* proc)
         return;
 
     uint64_t rlf4 = SchedLockAcquire(g_readyLock);
+    // Pipe/timer/lock wakeups are not SIGCONT. They must not silently resume
+    // a job-control stop; terminal cancellation may resume an operation owner.
+    if (proc->state == ProcessState::Stopped && !continued && !proc->terminalPending &&
+        !__atomic_load_n(&proc->resumePending, __ATOMIC_ACQUIRE)) {
+        SchedLockRelease(g_readyLock, rlf4);
+        return;
+    }
     // Accept Blocked or Stopped processes for unblocking/resuming
     if (proc->state != ProcessState::Blocked && proc->state != ProcessState::Stopped)
     {
@@ -1282,18 +1330,29 @@ void SchedulerUnblock(Process* proc)
         SchedLockRelease(g_readyLock, rlf4);
         return;
     }
-    if (proc->state == ProcessState::Blocked &&
-        __atomic_load_n(&proc->runningOnCpu, __ATOMIC_ACQUIRE) != -1)
+    if (continued && proc->state == ProcessState::Stopped &&
+        !__atomic_load_n(&proc->resumePending, __ATOMIC_ACQUIRE)) {
+        proc->continuedPending = true;
+        proc->stopReported = true;
+        uint64_t alf = SchedLockAcquire(g_allProcLock);
+        NotifyParentGroupLocked(proc);
+        SchedLockRelease(g_allProcLock, alf);
+    }
+    if (__atomic_load_n(&proc->runningOnCpu, __ATOMIC_ACQUIRE) != -1)
     {
-        // Process is Blocked but still mid-context-switch on another CPU.
-        // We can't insert it into the ready queue yet.  Set pendingWakeup
-        // so CheckBlockedWakeups (timer tick) will retry the unblock once
-        // the context switch completes and runningOnCpu is cleared.
-        __atomic_store_n(&proc->pendingWakeup, 1, __ATOMIC_RELEASE);
+        // Never enqueue a stack still owned by a CPU. Keep stopped tasks
+        // Stopped so their CPU completes the stop/switch-out path. A distinct
+        // token survives parent consumption of the continued event and cannot
+        // be confused with an ordinary I/O wakeup or SchedulerBlock fast path.
+        if (proc->state == ProcessState::Stopped)
+            __atomic_store_n(&proc->resumePending, true, __ATOMIC_RELEASE);
+        else
+            __atomic_store_n(&proc->pendingWakeup, 1, __ATOMIC_RELEASE);
         SchedTrace(proc, STR_UNBLOCK_DEFER_CPU);
         SchedLockRelease(g_readyLock, rlf4);
         return;
     }
+    __atomic_store_n(&proc->resumePending, false, __ATOMIC_RELEASE);
     proc->state = ProcessState::Ready;
     proc->wakeupTick = 0;
     __atomic_store_n(&proc->pendingWakeup, 0, __ATOMIC_RELEASE);
@@ -1303,6 +1362,9 @@ void SchedulerUnblock(Process* proc)
 
     KickIdleCpu();
 }
+
+void SchedulerUnblock(Process* proc) { SchedulerUnblockInternal(proc, false); }
+void SchedulerContinue(Process* proc) { SchedulerUnblockInternal(proc, true); }
 
 uint32_t SchedulerReadyCount()
 {
@@ -1333,14 +1395,16 @@ static void CheckBlockedWakeups()
     for (uint32_t i = 0; i < g_processCount; ++i)
     {
         Process* p = g_allProcesses[i];
-        if (p->state != ProcessState::Blocked) continue;
+        bool resume = p->state == ProcessState::Stopped &&
+            __atomic_load_n(&p->resumePending, __ATOMIC_ACQUIRE);
+        if (p->state != ProcessState::Blocked && !resume) continue;
         if (__atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) != -1) continue;
 
         // Timed wakeup OR deferred wakeup from SchedulerUnblock race
         bool timedWake = (p->wakeupTick != 0 && now >= p->wakeupTick);
         bool pendingWake = __atomic_load_n(&p->pendingWakeup, __ATOMIC_ACQUIRE) != 0;
 
-        if (timedWake || pendingWake)
+        if (resume || timedWake || pendingWake)
         {
             if (unblockCount < MAX_PROCESSES) {
                 ProcessRef(p);
@@ -1420,7 +1484,7 @@ static void ReapTerminated()
                 bool parentAlive = false;
                 for (uint32_t j = 0; j < g_processCount; j++)
                 {
-                    if (g_allProcesses[j]->pid == p->parentPid
+                    if (g_allProcesses[j]->tgid == p->parentPid
                         && g_allProcesses[j]->state != ProcessState::Terminated)
                     {
                         parentAlive = true;
@@ -1454,6 +1518,8 @@ static void ReapTerminated()
                 continue;
             }
 
+            // Claim sole destruction ownership before dropping the registry lock.
+            g_allProcesses[i] = g_allProcesses[--g_processCount];
             SchedLockRelease(g_allProcLock, alf);
             DbgPrintf("SCHED: reaping '%s' (pid %u) compReg=%d reapable=%d\n",
                        p->name, p->pid,
@@ -2154,17 +2220,6 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
             ProcessCloseAllFds(proc);
         }
 
-        // Reparent any children of this process to init (parentPid=0).
-        {
-            uint64_t alf = SchedLockAcquire(g_allProcLock);
-            for (uint32_t i = 0; i < g_processCount; i++)
-            {
-                if (g_allProcesses[i]->parentPid == proc->pid)
-                    g_allProcesses[i]->parentPid = 0;
-            }
-            SchedLockRelease(g_allProcLock, alf);
-        }
-
         // Signal the compositor
         if (proc->fbVfbWidth > 0)
             proc->fbExitColor = (status < 0) ? 0x00CC0000u : 0x00001A3Au;
@@ -2182,39 +2237,9 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     // In Linux, SIGCHLD is sent when the thread group leader exits, not
     // individual threads. Threads only wake their leader via futex on
     // clear_child_tid (handled above).
-    if (!proc->isThread && proc->parentPid != 0)
     {
-        // Send SIGCHLD (17) to the parent.
-        constexpr int SIGCHLD = 17;
-        uint64_t bit = 1ULL << (SIGCHLD - 1);
-
         uint64_t alf = SchedLockAcquire(g_allProcLock);
-        for (uint32_t i = 0; i < g_processCount; i++)
-        {
-            if (g_allProcesses[i]->pid == proc->parentPid)
-            {
-                Process* parent = g_allProcesses[i];
-
-                // Mutate `parent` ONLY while holding g_allProcLock. The reaper
-                // frees a Process strictly after SchedulerRemoveProcess pulls
-                // it out of g_allProcesses under this same lock, so a parent we
-                // found in the array here cannot be freed until we release —
-                // closing the use-after-free (BRO-158).
-                //
-                // We must NOT call SchedulerUnblock (which takes g_readyLock)
-                // while holding g_allProcLock: SchedulerSetPolicy establishes
-                // the g_readyLock -> g_allProcLock order, so the reverse would
-                // deadlock. Instead set pendingWakeup and let the BSP's
-                // CheckBlockedWakeups perform the unblock on the next tick. That
-                // path runs on CPU 0 right alongside ReapTerminated, so it can
-                // never race the reaper freeing the parent. SchedulerBlock also
-                // honours pendingWakeup, so a parent racing into wait4 won't
-                // miss the signal.
-                __atomic_or_fetch(&parent->sigPending, bit, __ATOMIC_RELEASE);
-                __atomic_store_n(&parent->pendingWakeup, 1, __ATOMIC_RELEASE);
-                break;
-            }
-        }
+        NotifyExitedParentLocked(proc);
         SchedLockRelease(g_allProcLock, alf);
     }
 
@@ -2781,69 +2806,64 @@ void SchedulerReleaseThreadAddressSpace(Process* thread)
     SchedLockRelease(g_allProcLock, alf);
 }
 
-Process* SchedulerFindTerminatedChild(uint16_t parentPid, int64_t pid)
+int SchedulerWaitChild(Process* caller, int selector, uint32_t id,
+                       uint32_t options, ChildWaitSnapshot* result)
 {
+    // The detached Process must not be abandoned if a remote fatal signal
+    // arrives during destruction. This region never covers the blocking wait.
+    SchedulerKernelRegionEnter(caller);
+    Process* consumed = nullptr;
+    int outcome = -10; // ECHILD
+    uint64_t rlf = SchedLockAcquire(g_readyLock);
     uint64_t alf = SchedLockAcquire(g_allProcLock);
-    for (uint32_t i = 0; i < g_processCount; i++)
-    {
+    for (uint32_t i = 0; i < g_processCount; ++i) {
         Process* p = g_allProcesses[i];
-        if (p->parentPid == parentPid
-            && p->state == ProcessState::Terminated
-            && __atomic_load_n(&p->reapable, __ATOMIC_ACQUIRE)
-            && __atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) == -1
-            && __atomic_load_n(&p->refCount, __ATOMIC_ACQUIRE) == 0
-            && !p->isThread  // Threads are not waitable children
-            && (pid == -1 || pid == static_cast<int64_t>(p->pid)))
-        {
-            // BRO-176: do not let waitpid reap a thread-group leader (which frees
-            // the shared address space in ProcessDestroy) while any thread still
-            // shares that address space — a sibling in the pick->switch window,
-            // or one running musl thread-exit cleanup, would then fault on a
-            // freed AS.  Gate on asLiveThreads, the same invariant the auto-reaper
-            // uses; the leader becomes reapable once the last thread is reaped.
-            if (__atomic_load_n(&p->asLiveThreads, __ATOMIC_ACQUIRE) != 0)
-                continue;  // skip this leader; revisit once threads drain
-            SchedLockRelease(g_allProcLock, alf);
-            return p;
+        if (p->isThread || p->parentPid != caller->tgid ||
+            (selector == 1 && p->pid != id) ||
+            (selector == 2 && p->pgid != id)) continue;
+        outcome = 0; // A matching child exists, even if not yet waitable.
+        int code = 0, status = 0;
+        bool exiting = p->state == ProcessState::Terminated;
+        if (exiting && (options & 4) &&
+            __atomic_load_n(&p->reapable, __ATOMIC_ACQUIRE) &&
+            __atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) == -1 &&
+            __atomic_load_n(&p->refCount, __ATOMIC_ACQUIRE) == 0 &&
+            __atomic_load_n(&p->asLiveThreads, __ATOMIC_ACQUIRE) == 0) {
+            status = p->waitStatus;
+            code = (status & 0x7f) ? ((status & 0x80) ? 3 : 2) : 1;
+        } else if (!exiting && (options & 2) && p->state == ProcessState::Stopped && !p->stopReported) {
+            status = (static_cast<int>(p->stopSignal) << 8) | 0x7f;
+            code = 5;
+        } else if (!exiting && (options & 8) && p->continuedPending) {
+            status = 0xffff;
+            code = 6;
         }
+        if (!code) continue;
+        *result = {p->pid, status, code, p->uid, p->userTicks, p->sysTicks};
+        if (!(options & 0x01000000)) { // WNOWAIT observes without consuming.
+            if (exiting) {
+                g_allProcesses[i] = g_allProcesses[--g_processCount];
+                consumed = p;
+            } else if (code == 5) p->stopReported = true;
+            else p->continuedPending = false;
+        }
+        outcome = 1;
+        break;
     }
     SchedLockRelease(g_allProcLock, alf);
-    return nullptr;
-}
-
-Process* SchedulerFindStoppedChild(uint16_t parentPid, int64_t pid)
-{
-    uint64_t alf = SchedLockAcquire(g_allProcLock);
-    for (uint32_t i = 0; i < g_processCount; i++)
-    {
-        Process* p = g_allProcesses[i];
-        if (p->parentPid == parentPid
-            && p->state == ProcessState::Stopped
-            && !p->stopReported
-            && (pid == -1 || pid == static_cast<int64_t>(p->pid)))
-        {
-            SchedLockRelease(g_allProcLock, alf);
-            return p;
-        }
+    SchedLockRelease(g_readyLock, rlf);
+    if (consumed) {
+        __atomic_fetch_add(&g_reapedUserTicks, consumed->userTicks, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&g_reapedSysTicks, consumed->sysTicks, __ATOMIC_RELAXED);
+        ProcessDestroy(consumed);
     }
-    SchedLockRelease(g_allProcLock, alf);
-    return nullptr;
-}
-
-bool SchedulerChildExists(uint16_t parentPid, uint16_t childPid)
-{
-    uint64_t alf = SchedLockAcquire(g_allProcLock);
-    for (uint32_t i = 0; i < g_processCount; i++)
-    {
-        Process* p = g_allProcesses[i];
-        if (p->pid == childPid && p->parentPid == parentPid && !p->isThread)
-        {
-            SchedLockRelease(g_allProcLock, alf);
-            return true;
-        }
+    SchedulerKernelRegionLeave(caller);
+    // Drop the operation latch before the syscall can enter a blocking wait.
+    if (SchedulerKernelOperationBoundary()) {
+        SchedulerYield();
+        __builtin_unreachable();
     }
-    SchedLockRelease(g_allProcLock, alf);
-    return false;
+    return outcome;
 }
 
 void SchedulerDumpChildState(uint16_t parentPid, uint16_t targetPid)
@@ -2885,15 +2905,6 @@ Process* SchedulerFindProcessByBaseName(const char* basename)
     }
     SchedLockRelease(g_allProcLock, alf);
     return nullptr;
-}
-
-void SchedulerReapChild(Process* child)
-{
-    DbgPrintf("SCHED: reaping child '%s' (pid %u)\n", child->name, child->pid);
-    // Preserve ticks from reaped processes for accurate /proc/stat accounting
-    g_reapedUserTicks += child->userTicks;
-    g_reapedSysTicks += child->sysTicks;
-    ProcessDestroy(child);
 }
 
 // BRO-176 diagnostic: NON-DESTRUCTIVE hang dump (Ctrl+F12). Walks every process

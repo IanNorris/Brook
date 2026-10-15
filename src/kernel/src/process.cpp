@@ -1337,7 +1337,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
 
     // Allocate new PID
     child->pid = SchedulerAllocPid();
-    child->parentPid = parent->pid;
+    child->parentPid = parent->tgid;
     child->pgid = parent->pgid;      // Inherit process group from parent
     child->sid = parent->sid;         // Inherit session from parent
     child->tgid = child->pid;         // Fork creates a new thread group
@@ -1396,6 +1396,10 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->pendingWakeup = 0;
 
     // Set fork-child trampoline state
+    child->stopReported = false;
+    child->continuedPending = false;
+    child->resumePending = false;
+    child->stopSignal = 0;
     child->isForkChild = true;
     child->forkReturnRip = userRip;
     child->forkReturnRsp = userRsp;
@@ -1569,6 +1573,10 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     }
     thread->threadLeader = leader;
     thread->isThread = true;
+    thread->stopReported = false;
+    thread->continuedPending = false;
+    thread->resumePending = false;
+    thread->stopSignal = 0;
     // BRO-176 diagnostic: stamp the leader's incarnation at thread-creation so
     // a cross-incarnation decrement (leader struct freed+reused under us) is
     // detectable at teardown.
@@ -2077,7 +2085,7 @@ int ProcessSendSignal(Process* proc, int signum)
     if (signum == SIGSTOP)
     {
         // Immediately stop (cannot be caught/blocked)
-        SchedulerStop(proc);
+        SchedulerStop(proc, signum);
         DbgPrintf("SIGNAL: SIGSTOP -> pid %u stopped (default)\n", proc->pid);
         return 0;
     }
@@ -2088,8 +2096,7 @@ int ProcessSendSignal(Process* proc, int signum)
     {
         if (proc->state == ProcessState::Stopped)
         {
-            proc->stopReported = false;
-            SchedulerUnblock(proc);
+            SchedulerContinue(proc);
             DbgPrintf("SIGNAL: SIGCONT -> pid %u resumed\n", proc->pid);
         }
         // Still deliver SIGCONT if a handler is registered
@@ -2107,12 +2114,8 @@ int ProcessSendSignal(Process* proc, int signum)
         {
             if (sa.handler == 1) return 0; // SIG_IGN — ignore
             // Default action: stop
-            SchedulerStop(proc);
+            SchedulerStop(proc, signum);
             DbgPrintf("SIGNAL: sig %d -> pid %u stopped (default)\n", signum, proc->pid);
-            // Wake parent for waitpid WUNTRACED
-            Process* parent = ProcessFindByPid(proc->parentPid);
-            if (parent)
-                ProcessSendSignal(parent, 17); // SIGCHLD
             return 0;
         }
     }
@@ -2323,7 +2326,7 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
             // this process when it sees state != Running. We can't call
             // SchedulerStop/Yield from SyscallCheckSignals because we're
             // in the syscall return path with a special stack layout.
-            SchedulerMarkStopped(proc);
+            SchedulerMarkStopped(proc, signum);
             return syscallResult;
         }
         default:

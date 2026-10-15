@@ -320,6 +320,51 @@ Both full bootstrap paths subsequently passed at `e5dd9aa`, including repeated
 [bootstrap acceptance](bootstrap.md#matching-acceptance-after-browser-compatibility-fixes-2026-10-15).
 The Firefox retry remains under investigation.
 
+## Child waiting and stop/resume compatibility (15 October 2026)
+
+The candidate kernel implements x86-64 `waitid` with `P_ALL`, `P_PID` and
+`P_PGID`, including nonblocking observation, `WNOWAIT`, stopped/continued events,
+actual terminating signals and the 128-byte Linux siginfo layout. `wait4` uses
+the same atomic child-event snapshot and consumption path. Child ownership is
+recorded by parent thread group, so one thread can wait for another thread's
+child even after the creating thread exits. Consuming waiters and the automatic
+reaper detach a child under the process-registry lock before destruction outside
+locks; concurrent waiters cannot both claim it.
+
+The stop/continue stress exposed two scheduler races: a pending block could
+replace `Stopped` with `Blocked`, and SIGCONT could enqueue a child whose stack
+was still owned by another CPU. Stopped tasks now retain their state through
+ordinary wakeups. An independent deferred-resume flag authorizes publication
+only after CPU ownership clears; consuming a continued event does not consume
+that scheduling permission. New stops cancel deferred resumption.
+
+The candidate kernel SHA-256 is
+`a12dd9ad285d8514beeceddb1c7756c3556539047def736f4713aa651f680c0b`.
+`waitidcheck` passed six runs of 32 competing-waiter races and 32 stop/continue
+cycles, followed by three expanded runs covering pipe/ignored-signal wakeups
+while stopped, delayed continuation and repeated SIGCONT. Other cases cover
+exit status 200, repeated peeks, invalid selectors/flags/pointers, signal death,
+thread-group parent survival, process groups, a killed blocked waiter and
+`EINTR`. The final expanded probe also passes on Linux. All 13 host tests,
+13 guest compatibility gates, cache/CoW and FAT/ext2 exit/resize stress passed.
+Heap integrity, checked shutdown and all three read-only filesystem checks
+passed. Evidence is retained under ignored
+`build/workloads/firefox-waitid-resume-20261015/`.
+
+This is not full Linux job-control or wait compatibility: PIDFD selection and
+extended `__W*` options return `EINVAL`, and usage reports currently tracked
+leader CPU ticks rather than full thread-group accounting. Full bootstrap
+acceptance has not yet been refreshed for these candidate changes. Firefox's
+first retry no longer emits the earlier child-wait error-38 warnings, but page
+content remains blank and child channels still fail; a usable browser is not
+yet accepted. A bounded errors-only trace also captured rejection of a
+2,097,160-byte writable shared mapping (`prot=3`, `flags=1`, `EOPNOTSUPP`).
+The trace does not identify that file descriptor's backing object or establish
+this as the cause of every content-process failure. Disabling the fork server
+via an environment-variable experiment did not resolve blank content; whether
+that build honored the variable was not established. Browser evidence is kept
+under `build/workloads/firefox-waitid-browser-20261015/`.
+
 ## File resizing prerequisite
 
 The subsequent FAT/ext2 resize implementation replaces those success-only

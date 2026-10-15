@@ -34,7 +34,8 @@ namespace brook {
 // ABI 8 adds cooperative cancellation state to Process and identity to KMutex.
 // ABI 9 adds current/maximum access permissions to Process::MemFdMap.
 // ABI 10 adds per-thread user GS base to SavedContext in Process.
-static constexpr uint32_t MODULE_ABI_VERSION = 10;
+// ABI 11 adds child stop/continue event state to Process.
+static constexpr uint32_t MODULE_ABI_VERSION = 11;
 
 // Magic bytes at the start of every valid ModuleInfo.
 static constexpr uint32_t MODULE_MAGIC = 0x4B524F42; // 'BROK'
