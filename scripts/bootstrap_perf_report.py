@@ -11,7 +11,7 @@ import subprocess
 def summarize_profile(record):
     path = Path(record["profile"])
     # The registry saves the exact kernel booted for this profile.
-    kernel = path.parent.parent / "kernel.elf"
+    kernel = Path(record["kernel"]) if "kernel" in record else path.parent.parent / "kernel.elf"
     output = subprocess.check_output(["nm", "-n", "-S", "-C", "--defined-only", str(kernel)], text=True)
     functions = {}
     for line in output.splitlines():
@@ -42,7 +42,9 @@ def summarize_profile(record):
                     symbols[symbol] += 1
                     continue
             kinds["unresolved_module_or_kernel"] += 1
-    return {"stage": record["stage"], "samples": sum(kinds.values()),
+    idle = sum(symbols[name] for name in ("brook::IdleLoop()", "brook::SchedulerStartAp()"))
+    busy = Counter({name: count for name,count in symbols.items() if name not in ("brook::IdleLoop()", "brook::SchedulerStartAp()")})
+    return {"idle_leaf_samples": idle, "top_non_idle_kernel_leaf_samples": busy.most_common(10), "stage": record["stage"], "samples": sum(kinds.values()),
             "sample_kinds": dict(kinds), "context_switches": switches,
             "dropped_samples": dropped, "top_kernel_leaf_samples": symbols.most_common(10),
             "pid_samples": dict(pids), "profile": str(path),
@@ -57,13 +59,15 @@ def main():
     for directory in args.results:
         final = directory / "result.json"
         data = json.loads((final if final.exists() else directory / "progress.json").read_text())
+        manual = directory / "manual-profiles.json"
+        extra_profiles = json.loads(manual.read_text()) if manual.exists() else []
         used = [s["stats"]["used_memory_bytes"] for s in data.get("snapshots", [])
                 if "used_memory_bytes" in s.get("stats", {})]
         reports.append({"directory": str(directory), "complete": data.get("success", False),
                         "mode": data.get("mode"), "revision": data.get("revision"),
                         "guest_stage_seconds": {s["name"]: s.get("guest_seconds") for s in data["stages"]},
                         "observed_used_memory_bytes": {"min": min(used), "max": max(used)} if used else None,
-                        "profiles": [summarize_profile(p) for p in data.get("profiles", []) if "profile" in p]})
+                        "profiles": [summarize_profile(p) for p in data.get("profiles", [])+extra_profiles if "profile" in p]})
     print(json.dumps(reports, indent=2))
 
 

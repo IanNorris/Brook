@@ -75,6 +75,20 @@ It validates module imports and requires 13/13 CTest results twice, before and
 after a clean native rebuild with warm caches. The incremental kernel stage
 is labelled separately from a full compilation.
 
+`--backend ram` keeps the main boot/data/Nix payload on private host tmpfs.
+The harness requires guest capacity plus 7 GiB available host memory and 8 GiB
+free tmpfs before starting; it checks space again before making independent
+verification images. Successful images are saved as sparse regular files at
+completion, then only the run's owned RAM directory is removed. Failed runs
+retain their images for diagnosis. Tmpfs can swap, and auxiliary firmware
+files may still use `/tmp`; this is not a zero-SSD-write guarantee.
+
+`--resume-completed-build` only resumes host verification after a guest build
+already exited zero with both 13-test summaries and artifact markers. It does
+not turn a failed or hung guest build into acceptance. Shutdown evidence records
+whether sync was acknowledged live or came from an already completed script
+and a normal launcher-recorded exit.
+
 Each new run uses eight vCPUs, eight build jobs, 4 GiB by default, software virtio graphics, silent audio and the
 kernel WM command listener without Wayland apps. The kernel compositor still
 runs: this is a no-Wayland baseline, not a machine with no graphics work.
@@ -334,3 +348,19 @@ Evidence is retained under ignored
 success result, stage timings, profiles, artifact hashes and filesystem
 checks. The prepared-SDK acceptance run at the same revision is still pending;
 this result does not establish acceptance for both paths.
+
+### Prepared-image wait diagnosis (2026-10-15)
+
+The same-revision prepared run completed clone, checkout and submodules, then
+stalled with Ninja in `ppoll` and its CMake child already exited and reapable.
+Ninja supplies a temporary mask to unblock SIGCHLD during this wait; Brook
+ignored that argument. A non-destructive thread dump established the blocked
+parent and exited child. Guest sync and shutdown succeeded, and both preserved
+filesystems passed offline checks. This was not a completed acceptance run.
+
+The fix implements temporary-mask delivery/restoration for ppoll, pselect6 and
+epoll_pwait, including EINTR despite SA_RESTART. Its 27 guest regression cases
+pass, as do five child-signal and 24 readiness cases. Timeout tests additionally
+exposed early expiration against LAPIC ticks; wait expiration now uses the
+monotonic clock. Full prepared/clean acceptance will be rerun at one matching
+revision with these changes.

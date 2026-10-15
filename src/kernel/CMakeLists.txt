@@ -36,13 +36,15 @@ set(BROOK_FONT_SIZE 16)
 set(FONT_ATLAS_CPP "${CMAKE_CURRENT_BINARY_DIR}/font_atlas.cpp")
 set(FAT_IMAGE_CPP  "${CMAKE_CURRENT_BINARY_DIR}/fat_test_image.cpp")
 
-find_program(PYTHON3 python3 REQUIRED)
+# Resolve against this build environment on every configure. An older cached
+# Python environment can lack Pillow after branding becomes a build input.
+find_program(BROOK_PYTHON3 python3 REQUIRED NO_CACHE)
 
 # Bake branding from the tracked source rather than a stale checked-in array.
 set(BOOT_LOGO_HEADER "${CMAKE_CURRENT_BINARY_DIR}/brook_boot_logo_data.h")
 add_custom_command(
     OUTPUT "${BOOT_LOGO_HEADER}"
-    COMMAND ${PYTHON3} "${BROOK_ROOT}/scripts/bake_logo.py"
+    COMMAND ${BROOK_PYTHON3} "${BROOK_ROOT}/scripts/bake_logo.py"
             "${BROOK_ROOT}/data/branding/brook-boot-mark.png"
             "${BOOT_LOGO_HEADER}" 300
     DEPENDS "${BROOK_ROOT}/scripts/bake_logo.py"
@@ -54,7 +56,7 @@ add_custom_command(
 # Bake the font atlas at configure time so it's available immediately.
 message(STATUS "Baking font atlas: ${BROOK_FONT_TTF} @ ${BROOK_FONT_SIZE}px")
 execute_process(
-    COMMAND ${PYTHON3}
+    COMMAND ${BROOK_PYTHON3}
             "${BROOK_ROOT}/scripts/bake_font.py"
             "${BROOK_FONT_TTF}"
             "${BROOK_FONT_SIZE}"
@@ -71,7 +73,7 @@ message(STATUS "${BAKE_OUTPUT}")
 # Also add a custom target so the atlas is re-baked if the font or script changes.
 add_custom_command(
     OUTPUT  "${FONT_ATLAS_CPP}"
-    COMMAND ${PYTHON3}
+    COMMAND ${BROOK_PYTHON3}
             "${BROOK_ROOT}/scripts/bake_font.py"
             "${BROOK_FONT_TTF}"
             "${BROOK_FONT_SIZE}"
@@ -88,7 +90,7 @@ add_custom_command(
 set(FAT_IMAGE_SIZE_KB 360)
 message(STATUS "Baking FAT test image (${FAT_IMAGE_SIZE_KB} KB)")
 execute_process(
-    COMMAND ${PYTHON3}
+    COMMAND ${BROOK_PYTHON3}
             "${BROOK_ROOT}/scripts/make_fat_image.py"
             "${FAT_IMAGE_CPP}"
             "${FAT_IMAGE_SIZE_KB}"
@@ -103,7 +105,7 @@ message(STATUS "${FAT_OUTPUT}")
 
 add_custom_command(
     OUTPUT  "${FAT_IMAGE_CPP}"
-    COMMAND ${PYTHON3}
+    COMMAND ${BROOK_PYTHON3}
             "${BROOK_ROOT}/scripts/make_fat_image.py"
             "${FAT_IMAGE_CPP}"
             "${FAT_IMAGE_SIZE_KB}"
@@ -433,7 +435,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "" FORCE)
 # Two builds are required for a complete symbol table.
 # ---------------------------------------------------------------------------
 add_custom_command(TARGET kernel POST_BUILD
-    COMMAND ${PYTHON3} "${BROOK_ROOT}/scripts/gen_ksym_table.py"
+    COMMAND ${BROOK_PYTHON3} "${BROOK_ROOT}/scripts/gen_ksym_table.py"
             "$<TARGET_FILE:kernel>" "${KSYM_TABLE_CPP}"
     COMMENT "Generating kernel symbol address table (rebuild to link it in)"
     VERBATIM
