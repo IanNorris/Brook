@@ -14,10 +14,10 @@
 ---
 
 <p align="center">
-  <a href="docs/images/brook_netsurf_quake2.png"><img src="docs/images/brook_netsurf_quake2.png" alt="NetSurf web browser and Quake 2 running side by side on Brook OS" width="800"></a>
+  <a href="docs/images/brook_quake2_gl3_demo_1080.png"><img src="docs/images/brook_quake2_gl3_demo_1080.png" alt="Quake II's Installation demo running through hardware virgl GL3 on Brook in a 1600 by 800 game window" width="960"></a>
 </p>
 
-<p align="center"><em>NetSurf and Quake 2 running side by side — compositing WM, TCP/IP networking, HDA audio, all on a from-scratch kernel</em></p>
+<p align="center"><em>Quake II's Installation demo through hardware virgl GL3 — a 1600×800 game window on Brook's native 1920×1080 desktop</em></p>
 
 ## What is Brook?
 
