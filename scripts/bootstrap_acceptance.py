@@ -33,6 +33,27 @@ def write(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
 
 
+def sdk_nar_bytes(store_path):
+    """Measure the exported SDK closure, not an unrelated fixed RAM allowance."""
+    pending = [Path(store_path).name]
+    seen = set()
+    total = 0
+    while pending:
+        name = pending.pop()
+        if name in seen: continue
+        if not re.fullmatch(r"[a-z0-9]{32}-[^/]+", name):
+            raise ValueError("Invalid SDK closure reference")
+        info = ROOT / "build/package-cache" / (name.split("-", 1)[0]+".narinfo")
+        fields = dict(line.split(": ", 1) for line in info.read_text().splitlines() if ": " in line)
+        if Path(fields["StorePath"]).name != name: raise ValueError("SDK narinfo mismatch")
+        size = int(fields["NarSize"])
+        if size < 0: raise ValueError("Invalid SDK NAR size")
+        total += size
+        seen.add(name)
+        pending.extend(fields.get("References", "").split())
+    return total
+
+
 def host_environment():
     cpu = Path("/proc/cpuinfo").read_text()
     model = re.search(r"^model name\s*:\s*(.+)$", cpu, re.M)
@@ -333,8 +354,13 @@ def main():
     ram = None
     if args.backend == "ram":
         guest_capacity = int(args.memory[:-1])*1024**3
-        if memory_available() < guest_capacity+7*1024**3 or shutil.disk_usage("/dev/shm").free < 8*1024**3:
-            raise RuntimeError("RAM bootstrap needs guest capacity plus 7 GiB available memory and 8 GiB free tmpfs")
+        seed_bytes = sum((args.seed / f"{name}.img").stat().st_blocks*512 for name in ("data", "nix"))
+        # NAR bytes conservatively cover the SDK even for a clean seed. Reserve
+        # another GiB for ext2 rounding/metadata, the boot disk and build outputs.
+        image_budget = max(seed_bytes, sdk_nar_bytes(sdk["store_path"])) + 1024**3
+        required_memory = guest_capacity + image_budget + 512*1024**2
+        if memory_available() < required_memory or shutil.disk_usage("/dev/shm").free < image_budget:
+            raise RuntimeError(f"RAM bootstrap needs {required_memory/1024**3:.2f} GiB available memory and {image_budget/1024**3:.2f} GiB free tmpfs")
         ram = Path(tempfile.mkdtemp(prefix="brook-bootstrap-", dir="/dev/shm"))
         (ram / "tmp-host").mkdir()
         (directory / "tmp-host").symlink_to(ram / "tmp-host", target_is_directory=True)
@@ -352,6 +378,7 @@ def main():
     guest_scripts(directory, args.mode, args.revision, cache.server_port, sdk, manifest)
     metadata = {"mode": args.mode, "revision": args.revision, "sdk": sdk,
                 "backend": args.backend, "ram_directory": str(ram) if ram else None,
+                "initial_ram_image_budget": image_budget if ram else None,
                 "seed": manifest, "before_fsck": before,
                 "host_load": os.getloadavg(), "host_cpu_count": os.cpu_count(),
                 "host_affinity": sorted(os.sched_getaffinity(0)),

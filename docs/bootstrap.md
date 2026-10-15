@@ -55,10 +55,10 @@ python3 scripts/create_experiment_disks.py --bootstrap-mode prepared \
 revision=$(git rev-parse HEAD)
 python3 -u scripts/bootstrap_acceptance.py --mode clean \
   --seed build/experiments/seeds/bootstrap-clean \
-  --output build/experiments/results/bootstrap-clean --revision "$revision"
+  --output build/experiments/results/bootstrap-clean --revision "$revision" --backend ram --memory 4G
 python3 -u scripts/bootstrap_acceptance.py --mode prepared \
   --seed build/experiments/seeds/bootstrap-prepared \
-  --output build/experiments/results/bootstrap-prepared --revision "$revision"
+  --output build/experiments/results/bootstrap-prepared --revision "$revision" --backend ram --memory 4G
 ```
 
 The clean seed includes Bash, coreutils, curl, xz, zstd, certificates and freshly
@@ -76,8 +76,9 @@ after a clean native rebuild with warm caches. The incremental kernel stage
 is labelled separately from a full compilation.
 
 `--backend ram` keeps the main boot/data/Nix payload on private host tmpfs.
-The harness requires guest capacity plus 7 GiB available host memory and 8 GiB
-free tmpfs before starting; it checks space again before making independent
+The harness budgets the exported SDK's uncompressed NAR closure (or larger
+seed allocation), another GiB for filesystem/boot/build overhead, guest memory
+and 512 MiB safety headroom. It checks space again before making independent
 verification images. Successful images are saved as sparse regular files at
 completion, then only the run's owned RAM directory is removed. Failed runs
 retain their images for diagnosis. Tmpfs can swap, and auxiliary firmware
@@ -364,3 +365,23 @@ pass, as do five child-signal and 24 readiness cases. Timeout tests additionally
 exposed early expiration against LAPIC ticks; wait expiration now uses the
 monotonic clock. Full prepared/clean acceptance will be rerun at one matching
 revision with these changes.
+
+### Native test iteration cost (2026-10-15)
+
+The descriptor stress test now reuses worker threads across rounds rather than
+creating and joining 20,800 threads. It keeps all 500 close-race rounds, all 800
+pin/close rounds, worker counts, random seeds and correctness assertions. Start
+and end barriers isolate each round's reset from competing workers.
+
+On the host, the descriptor target fell from about 64 seconds to 1.3 seconds;
+the complete 13-test Release suite passed in 2.49 seconds. Guest timings still
+need measurement in the next bootstrap runs. A ThreadSanitizer run was stopped
+after more than 15 minutes of CPU saturation and is incomplete, not a passing
+sanitizer result. Its instrumented ticket-spin iterations perform runtime
+synchronization work; that observation does not establish race freedom.
+
+The newer prepared-image run built the kernel in 53 seconds and passed both
+native test runs, but failed offline checking with ten leaked ext2 blocks.
+The mixed-append cache regression and its validated fix are described in
+[io-cache-regression.md](io-cache-regression.md). Fresh prepared and clean
+acceptance remains required at one matching revision.

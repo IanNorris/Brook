@@ -115,45 +115,52 @@ static std::atomic<int>  g_freed[MAX_FDS];   // per-token free count
 static std::atomic<bool> g_doubleFree{false};
 static std::atomic<int>  g_remaining{0};
 static std::atomic<uint64_t> g_totalClaims{0};
-static pthread_barrier_t g_claimStart;
+static pthread_barrier_t g_claimStart, g_claimEnd;
+static std::atomic<bool> g_claimStop{false};
 
 static void CloserWorker()
 {
-    pthread_barrier_wait(&g_claimStart);
-    while (g_remaining.load(std::memory_order_relaxed) > 0) {
-        for (uint32_t fd = 0; fd < MAX_FDS; ++fd) {
-            FdClaimResult c;
-            if (!FdTableClaim(g_fds, &g_lock, static_cast<int>(fd), &c))
-                continue;
+    for (;;) {
+        pthread_barrier_wait(&g_claimStart);
+        if (g_claimStop.load()) break;
+        while (g_remaining.load(std::memory_order_relaxed) > 0) {
+            for (uint32_t fd = 0; fd < MAX_FDS; ++fd) {
+                FdClaimResult c;
+                if (!FdTableClaim(g_fds, &g_lock, static_cast<int>(fd), &c))
+                    continue;
 
-            g_totalClaims.fetch_add(1, std::memory_order_relaxed);
-            g_remaining.fetch_sub(1, std::memory_order_relaxed);
+                g_totalClaims.fetch_add(1, std::memory_order_relaxed);
+                g_remaining.fetch_sub(1, std::memory_order_relaxed);
 
-            uint32_t tok = HandleToken(c.handle);
-            if (tok == 0 || tok > MAX_FDS) {
-                g_doubleFree.store(true);  // corrupt handle == claim torn
-                continue;
+                uint32_t tok = HandleToken(c.handle);
+                if (tok == 0 || tok > MAX_FDS) {
+                    g_doubleFree.store(true);  // corrupt handle == claim torn
+                    continue;
+                }
+                // Simulate the single-owner unref: each token must transition
+                // 0 -> 1 exactly once. A second increment means a double free.
+                int prev = g_freed[tok - 1].fetch_add(1, std::memory_order_acq_rel);
+                if (prev != 0)
+                    g_doubleFree.store(true);
             }
-            // Simulate the single-owner unref: each token must transition
-            // 0 -> 1 exactly once. A second increment means a double free.
-            int prev = g_freed[tok - 1].fetch_add(1, std::memory_order_acq_rel);
-            if (prev != 0)
-                g_doubleFree.store(true);
+            std::this_thread::yield();
         }
-        std::this_thread::yield();
+        pthread_barrier_wait(&g_claimEnd);
     }
 }
 
 static void TestConcurrent()
 {
     constexpr int      THREADS = 16;
-    // Round count kept modest: the per-round cost is dominated by 16 thread
-    // create/join cycles, so high counts made this test take 13s+ idle (and
-    // 30s+ under load, tripping CI timeouts) while adding little race coverage.
-    // ~500 rounds still drives ~128k claims; run-tsan-tests.sh is the
-    // deterministic race oracle for deeper checking.
-    constexpr uint64_t ROUNDS  = 500;
-    pthread_barrier_init(&g_claimStart, nullptr, THREADS);
+    // Keep all 500 rounds and 16 racing closers, but reuse worker threads.
+    // Start/end rendezvous isolate resets without paying 8,000 create/joins.
+    constexpr uint64_t ROUNDS = 500;
+    pthread_barrier_init(&g_claimStart, nullptr, THREADS + 1);
+    pthread_barrier_init(&g_claimEnd, nullptr, THREADS + 1);
+    g_claimStop.store(false);
+    std::vector<std::thread> workers;
+    workers.reserve(THREADS);
+    for (int t = 0; t < THREADS; ++t) workers.emplace_back(CloserWorker);
 
     uint64_t totalExpected = 0;
     for (uint64_t r = 0; r < ROUNDS; ++r) {
@@ -169,11 +176,8 @@ static void TestConcurrent()
         g_remaining.store(static_cast<int>(MAX_FDS), std::memory_order_relaxed);
         totalExpected += MAX_FDS;
 
-        std::vector<std::thread> workers;
-        workers.reserve(THREADS);
-        for (int t = 0; t < THREADS; ++t)
-            workers.emplace_back(CloserWorker);
-        for (auto& w : workers) w.join();
+        pthread_barrier_wait(&g_claimStart);
+        pthread_barrier_wait(&g_claimEnd);
 
         // Every token freed exactly once; table fully drained.
         for (uint32_t i = 0; i < MAX_FDS; ++i) {
@@ -183,6 +187,10 @@ static void TestConcurrent()
         if (g_doubleFree.load()) break;  // fail fast
     }
 
+    g_claimStop.store(true);
+    pthread_barrier_wait(&g_claimStart);
+    for (auto& w : workers) w.join();
+    pthread_barrier_destroy(&g_claimEnd);
     pthread_barrier_destroy(&g_claimStart);
     CHECK(!g_doubleFree.load(), "no slot/handle ever claimed twice (no double free)");
     CHECK(g_totalClaims.load() == totalExpected, "exactly one claim per fd per round");
@@ -280,49 +288,60 @@ static void PinFinalize(uint32_t tok)
     pin_remaining.fetch_sub(1, std::memory_order_acq_rel);
 }
 
-static pthread_barrier_t g_pinStart;
+static pthread_barrier_t g_pinStart, g_pinEnd;
+static std::atomic<bool> g_pinStop{false};
 
-static void PinUserWorker(uint32_t seed)
+static void PinUserWorker(uint32_t index)
 {
-    pthread_barrier_wait(&g_pinStart);
-    uint32_t x = seed * 2654435761u + 1;
-    while (pin_remaining.load(std::memory_order_relaxed) > 0) {
-        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
-        int fd = static_cast<int>(x % PIN_SLOTS);
-        FdEntry* e = FdTablePin(pin_fds, &pin_lock, fd);
-        if (!e) {
-            std::this_thread::yield();
-            continue;
-        }
-        // Yield with the descriptor pinned, after releasing the ticket lock.
-        // Closers can exercise deferred teardown even on a single CPU.
-        std::this_thread::yield();
-        uint32_t tok = HandleToken(e->handle);
-        // The "use" window: while pinned, the handle MUST be live.
-        for (int spin = 0; spin < 8; ++spin) {
-            if (pin_alive[tok - 1].load(std::memory_order_acquire) != 1) {
-                pin_uaf.store(true);
-                break;
+    for (uint64_t round = 0;; ++round) {
+        pthread_barrier_wait(&g_pinStart);
+        if (g_pinStop.load()) break;
+        uint32_t seed = static_cast<uint32_t>(round * 131 + index + 1);
+        uint32_t x = seed * 2654435761u + 1;
+        while (pin_remaining.load(std::memory_order_relaxed) > 0) {
+            x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+            int fd = static_cast<int>(x % PIN_SLOTS);
+            FdEntry* e = FdTablePin(pin_fds, &pin_lock, fd);
+            if (!e) {
+                std::this_thread::yield();
+                continue;
             }
+            // Yield with the descriptor pinned, after releasing the ticket lock.
+            // Closers can exercise deferred teardown even on a single CPU.
+            std::this_thread::yield();
+            uint32_t tok = HandleToken(e->handle);
+            // The "use" window: while pinned, the handle MUST be live.
+            for (int spin = 0; spin < 8; ++spin) {
+                if (pin_alive[tok - 1].load(std::memory_order_acquire) != 1) {
+                    pin_uaf.store(true);
+                    break;
+                }
+            }
+            FdClaimResult c;
+            if (FdTableUnpin(pin_fds, &pin_lock, fd, &c))
+                PinFinalize(HandleToken(c.handle));
         }
-        FdClaimResult c;
-        if (FdTableUnpin(pin_fds, &pin_lock, fd, &c))
-            PinFinalize(HandleToken(c.handle));
+        pthread_barrier_wait(&g_pinEnd);
     }
 }
 
-static void PinCloserWorker(uint32_t seed)
+static void PinCloserWorker(uint32_t index)
 {
-    pthread_barrier_wait(&g_pinStart);
-    uint32_t x = seed * 40503u + 7;
-    while (pin_remaining.load(std::memory_order_relaxed) > 0) {
-        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
-        int fd = static_cast<int>(x % PIN_SLOTS);
-        FdClaimResult c;
-        if (FdTableClose(pin_fds, &pin_lock, fd, &c) == FdCloseResult::ClaimedNow)
-            PinFinalize(HandleToken(c.handle));
-        // Deferred: the last unpin finalizes. NotFound: already gone.
-        std::this_thread::yield();
+    for (uint64_t round = 0;; ++round) {
+        pthread_barrier_wait(&g_pinStart);
+        if (g_pinStop.load()) break;
+        uint32_t seed = static_cast<uint32_t>(round * 977 + index + 1);
+        uint32_t x = seed * 40503u + 7;
+        while (pin_remaining.load(std::memory_order_relaxed) > 0) {
+            x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+            int fd = static_cast<int>(x % PIN_SLOTS);
+            FdClaimResult c;
+            if (FdTableClose(pin_fds, &pin_lock, fd, &c) == FdCloseResult::ClaimedNow)
+                PinFinalize(HandleToken(c.handle));
+            // Deferred: the last unpin finalizes. NotFound: already gone.
+            std::this_thread::yield();
+        }
+        pthread_barrier_wait(&g_pinEnd);
     }
 }
 
@@ -330,13 +349,20 @@ static void TestPinConcurrent()
 {
     constexpr int      USERS   = 12;
     constexpr int      CLOSERS = 4;
-    // See TestConcurrent: counts trimmed so the suite stays well under CI
-    // timeouts; TSan remains the deterministic race oracle.
+    // Preserve all race rounds and seeds while reusing the same competitors.
     constexpr uint64_t ROUNDS  = 800;
     // All competitors must exist before work begins. Without a rendezvous,
     // early users busy-spin until closers are created; on one CPU this also
     // delays the parent creating those closers and barely exercises races.
-    pthread_barrier_init(&g_pinStart, nullptr, USERS + CLOSERS);
+    pthread_barrier_init(&g_pinStart, nullptr, USERS + CLOSERS + 1);
+    pthread_barrier_init(&g_pinEnd, nullptr, USERS + CLOSERS + 1);
+    g_pinStop.store(false);
+    std::vector<std::thread> workers;
+    workers.reserve(USERS + CLOSERS);
+    for (int t = 0; t < USERS; ++t)
+        workers.emplace_back(PinUserWorker, static_cast<uint32_t>(t));
+    for (int t = 0; t < CLOSERS; ++t)
+        workers.emplace_back(PinCloserWorker, static_cast<uint32_t>(t));
 
     for (uint32_t i = 0; i < MAX_FDS; ++i) pin_fds[i].type = FdType::None;
 
@@ -351,13 +377,8 @@ static void TestPinConcurrent()
         }
         pin_remaining.store(PIN_SLOTS, std::memory_order_release);
 
-        std::vector<std::thread> workers;
-        workers.reserve(USERS + CLOSERS);
-        for (int t = 0; t < USERS; ++t)
-            workers.emplace_back(PinUserWorker, static_cast<uint32_t>(r * 131 + t + 1));
-        for (int t = 0; t < CLOSERS; ++t)
-            workers.emplace_back(PinCloserWorker, static_cast<uint32_t>(r * 977 + t + 1));
-        for (auto& w : workers) w.join();
+        pthread_barrier_wait(&g_pinStart);
+        pthread_barrier_wait(&g_pinEnd);
 
         for (int s = 0; s < PIN_SLOTS; ++s) {
             if (pin_finalized[s].load() != 1) pin_doubleFree.store(true);
@@ -366,6 +387,10 @@ static void TestPinConcurrent()
         if (pin_uaf.load() || pin_doubleFree.load()) break;  // fail fast
     }
 
+    g_pinStop.store(true);
+    pthread_barrier_wait(&g_pinStart);
+    for (auto& w : workers) w.join();
+    pthread_barrier_destroy(&g_pinEnd);
     pthread_barrier_destroy(&g_pinStart);
     CHECK(!pin_uaf.load(), "no pinned user ever saw a freed handle (no UAF)");
     CHECK(!pin_doubleFree.load(), "every handle finalized exactly once");
