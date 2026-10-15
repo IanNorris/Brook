@@ -7,6 +7,7 @@ cd "$ROOT_DIR"
 mkdir -p build/io-bench
 "$MUSL_CC" -O2 -Wall -Wextra -static -pthread tools/io-bench/bench.c -o build/io-bench/io-bench
 "$MUSL_CC" -O2 -Wall -Wextra -static tools/io-bench/cachecheck.c -o build/io-bench/cachecheck
+"$MUSL_CC" -O2 -Wall -Wextra -static tools/io-bench/mixedappendcheck.c -o build/io-bench/mixedappendcheck
 mkdir -p build/package-cache
 "$MUSL_CC" -O2 -Wall -Wextra -static tools/at-syscall-probe/filelifecheck.c -o build/package-cache/filelifecheck
 for probe in waitmaskcheck childsignalcheck selectcheck; do

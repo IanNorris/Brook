@@ -847,6 +847,29 @@ static bool Ext2FreeInode(Ext2Mount* mnt, uint32_t ino, bool isDir)
 // Forward declaration: defined further down with the read path.
 static uint32_t Ext2ReadIndPointer(Ext2Mount* mnt, uint32_t indBlock, uint32_t idx);
 
+// Legacy small writes and batched append/reclamation share indirect blocks
+// through two caches. The caller holds g_ext2Lock exclusively, so no reader
+// can observe the interval between the device write and the cache update.
+static bool Ext2WriteIndPointer(Ext2Mount* mnt, uint32_t block, uint32_t index,
+                                uint32_t value)
+{
+    // Batch.Get and reclamation use this full-block cache. Never leave an old
+    // pointer image there, including after a failed/partial device write.
+    Ext2BlockCacheInvalidate(mnt, block);
+    uint64_t offset = (static_cast<uint64_t>(block) << mnt->blockShift) + index * 4;
+    bool written = Ext2DevWrite(mnt, offset, &value, sizeof(value));
+    SpinLockAcquire(&mnt->indCacheLock);
+    for (uint32_t s = 0; s < Ext2Mount::IND_CACHE_SLOTS; ++s) {
+        if (mnt->indCacheBlockNum[s] != block) continue;
+        if (written && mnt->indCacheData[s])
+            *reinterpret_cast<uint32_t*>(mnt->indCacheData[s] + index * 4) = value;
+        else
+            mnt->indCacheBlockNum[s] = 0;
+    }
+    SpinLockRelease(&mnt->indCacheLock);
+    return written;
+}
+
 static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
                                 uint32_t inoNum, uint32_t fileBlock)
 {
@@ -885,20 +908,7 @@ static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
         if (entry) return entry;
         uint32_t nb = Ext2AllocBlock(mnt);
         if (!nb) return 0;
-        uint64_t off = (static_cast<uint64_t>(ino->i_block[12]) << mnt->blockShift)
-                       + fileBlock * 4;
-        // Update cache if the indirect block is currently cached.
-        {
-            SpinLockAcquire(&mnt->indCacheLock);
-            for (uint32_t s = 0; s < Ext2Mount::IND_CACHE_SLOTS; ++s) {
-                if (mnt->indCacheBlockNum[s] == ino->i_block[12] && mnt->indCacheData[s]) {
-                    *reinterpret_cast<uint32_t*>(mnt->indCacheData[s] + fileBlock * 4) = nb;
-                    break;
-                }
-            }
-            SpinLockRelease(&mnt->indCacheLock);
-        }
-        Ext2DevWrite(mnt, off, &nb, 4);
+        Ext2WriteIndPointer(mnt, ino->i_block[12], fileBlock, nb);
         ino->i_blocks += mnt->blockSize / 512;
         return nb;
     }
@@ -931,7 +941,7 @@ static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
             memset(zb, 0, mnt->blockSize);
             Ext2WriteBlock(mnt, indBlock, zb);
             kfree(zb);
-            Ext2DevWrite(mnt, off1, &indBlock, 4);
+            Ext2WriteIndPointer(mnt, ino->i_block[13], idx1, indBlock);
             ino->i_blocks += mnt->blockSize / 512;
         }
 
@@ -941,7 +951,7 @@ static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
         if (entry) return entry;
         uint32_t nb = Ext2AllocBlock(mnt);
         if (!nb) return 0;
-        Ext2DevWrite(mnt, off2, &nb, 4);
+        Ext2WriteIndPointer(mnt, indBlock, idx2, nb);
         ino->i_blocks += mnt->blockSize / 512;
         return nb;
     }

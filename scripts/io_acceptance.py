@@ -39,6 +39,7 @@ def check(directory, output, tag):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--output', type=Path, required=True)
+    ap.add_argument('--mixed-append-probe', nargs='?', const='all', default='all', choices=['all','unlink','truncate','chain'])
     ap.add_argument('--block-size', type=int, choices=[1024,2048,4096], default=4096)
     ap.add_argument('--backend', choices=['ram', 'disk'], default='ram')
     ap.add_argument('--artifacts', type=Path, default=ROOT / 'build/release')
@@ -113,10 +114,24 @@ def main():
         if args.wait_mask_probe:
             for source, target in [('waitmaskcheck','WAITMASK'),('childsignalcheck','CHLDSIG'),('selectcheck','SELECTCHK')]:
                 base.command(['mcopy', '-o', '-i', str(directory/'boot.img'), str(ROOT/'build/io-bench'/source), '::BIN/'+target])
+        if args.mixed_append_probe:
+            base.command(['mcopy', '-o', '-i', str(directory/'boot.img'), str(ROOT/'build/io-bench/mixedappendcheck'), '::BIN/MIXAPP'])
         for mode in ('run', 'cleanup'):
             process, session, data, boot_seconds = base.launch(directory, args.instance, artifacts, cpus=args.cpus, memory=args.memory)
             serial = Path(data['serial_log'])
             offset = serial.stat().st_size
+            if args.mixed_append_probe and mode == 'run':
+                base.server.guest_run(session, 'run /boot/BIN/MIXAPP /data '+args.mixed_append_probe)
+                expires = time.monotonic()+args.deadline
+                while time.monotonic()<expires:
+                    text = serial.read_bytes()[offset:].decode(errors='replace')
+                    if 'MIXAPPEND FAIL' in text or re.search(r'KERNEL PANIC|KERNEL FAULT',text):
+                        raise RuntimeError('Mixed append cache regression')
+                    if 'MIXAPPEND PASS mode=' in text: break
+                    if process.poll() is not None: raise RuntimeError('VM exited during mixed append probe')
+                    time.sleep(.2)
+                else: raise TimeoutError('Mixed append probe deadline')
+                report['mixed_append_probe'] = args.mixed_append_probe
             reply = base.server.guest_run(session, f'run /boot/BIN/IOBENCH /data/io-test {mode} {args.workers} {args.mib} {args.files}')
             base.write(output/f'{mode}-launch.json', reply)
             small_profile_started = False
