@@ -131,9 +131,11 @@ add_test(NAME test_ext2
 )
 
 # Actual page-table walks and ownership transitions with aligned host frames.
-# Hardware invalidation/interrupt instructions and PMM are the only shims.
+# Platform/PMM, heap and filesystem/scheduler finalizers are instrumented.
+# Address-space queues and page-table ownership transitions run actual code.
 add_host_test(test_vmm_leaf
     "${BROOK_ROOT}/src/kernel/src/memory/virtual_memory.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/address_space.cpp"
 )
 target_compile_options(test_vmm_leaf PRIVATE
     -DBROOK_HOST_TEST -ffunction-sections -fdata-sections

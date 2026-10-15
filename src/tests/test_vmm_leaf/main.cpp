@@ -11,6 +11,10 @@
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "serial.h"
+#include "memory/address_space.h"
+#include "process.h"
+#include "vfs.h"
+#include "panic.h"
 
 #define CHECK(c) do { if (!(c)) { std::fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#c); std::abort(); } } while (0)
 using namespace brook;
@@ -20,6 +24,8 @@ alignas(pageSize) unsigned char frames[pageCount][pageSize];
 struct Frame { unsigned refs=0, maps=0; } records[pageCount];
 std::mutex frameLock;
 std::atomic<bool> failAllocation{false};
+std::atomic<int> heapAllocations{0};
+
 size_t indexOf(PhysicalAddress p) {
     auto base=reinterpret_cast<uint64_t>(frames);
     CHECK(p.raw()>=base && p.raw()<base+sizeof(frames));
@@ -51,7 +57,41 @@ void empty() {
     for(const auto& record:records)CHECK(!record.refs&&!record.maps);
 }
 }
+namespace {
+Gate* pendingAcknowledgement=nullptr;
+int closedVnodes=0, unpinnedVnodes=0, droppedMemfds=0;
+struct BorrowedBacking { PhysicalAddress page; };
+Process* expectedDestroy = nullptr;
+ProcessCleanupCompletion* expectedCompletion = nullptr;
+AddressSpaceState* lateRetirement = nullptr;
+unsigned cleanupWakeups = 0;
+}
+extern "C" void KernelPanic(const char* format,...) {
+    va_list args;va_start(args,format);std::vfprintf(stderr,format,args);va_end(args);std::abort();
+}
 namespace brook {
+extern "C" void* kmalloc(uint64_t size) { void* p=nullptr;if(posix_memalign(&p,64,size))return nullptr;++heapAllocations;return p; }
+extern "C" void kfree(void* p) { if(p){--heapAllocations;std::free(p);} }
+void KMutexInit(KMutex* mutex) { std::memset(mutex,0,sizeof(*mutex)); }
+void SchedulerUnblock(Process* process) {
+    CHECK(expectedCompletion && expectedCompletion->done);
+    CHECK(process==expectedCompletion->waiter && process->refCount==1);
+    CHECK(unpinnedVnodes==2 && closedVnodes==2);
+    ++cleanupWakeups;
+}
+void ProcessDestroyNow(Process* process) {
+    CHECK(process==expectedDestroy);
+    AddressSpaceUnref(process->addressSpace);
+    process->addressSpace=nullptr;
+}
+void CompositorReleaseAddressSpaceBuffers(AddressSpaceState* space) {
+    CHECK(!PmmGetRefCount(space->pageTable.pml4));
+    if(lateRetirement) { auto* late=lateRetirement;lateRetirement=nullptr;AddressSpaceUnref(late); }
+}
+void TlbShootdownFull(uint64_t,uint64_t) { if(pendingAcknowledgement)pendingAcknowledgement->park(); }
+void MemFdHandleUnref(void* handle) { ++droppedMemfds;PmmFreePage(static_cast<BorrowedBacking*>(handle)->page); }
+void VfsFileMapUnpin(Vnode*) { ++unpinnedVnodes; }
+extern "C" void VfsClose(Vnode* vn) { CHECK(!vn->refCount);++closedVnodes; }
 PhysicalAddress PmmAllocPage(MemTag,uint16_t) {
     if(failAllocation.exchange(false))return {};
     std::lock_guard<std::mutex> lock(frameLock);
@@ -210,8 +250,67 @@ static void failureAndInPlace() {
     auto notCow=VmmCowResolveWrite(pt,va,9);CHECK(notCow.result==VmmCowResult::NotCow&&!notCow.retired);
     VmmDestroyUserPageTable(pt);empty();
 }
+static void addressSpaceLifetime() {
+    auto kernelRoot=table();VmmHostSetKernelRoot(kernelRoot);AddressSpaceKernelInit();
+    auto* immortal=AddressSpaceKernel();AddressSpaceRef(immortal);AddressSpaceUnref(immortal);CHECK(!ProcessCleanupStep());
+    failAllocation=true;CHECK(!AddressSpaceCreate(17)&&heapAllocations==0);
+    auto* old=AddressSpaceCreate(17);CHECK(old&&old->references==1&&old->identity&&old->generation);
+    AddressSpaceRef(old);CHECK(old->references==2);
+    auto file=PmmAllocPage(),memfd=PmmAllocPage(),framebuffer=PmmAllocPage(),window=PmmAllocPage();
+    Vnode vnode{};vnode.refCount=1;BorrowedBacking backing{memfd};
+    old->fileMaps[0]={va.raw(),4096,0,flags,&vnode};
+    old->memfdMaps[0]={va.raw()+4096,4096,0,flags,&backing,3,3};
+    old->fbMaps[0]={va.raw()+8192,4096};
+    CHECK(VmmTryMapPage(old->pageTable,va,file,flags)==VmmMapResult::Mapped);
+    CHECK(VmmTryMapPage(old->pageTable,va+4096,memfd,flags)==VmmMapResult::Mapped);
+    CHECK(VmmTryMapPage(old->pageTable,va+8192,framebuffer,flags,MemTag::Device)==VmmMapResult::Mapped);
+    // Native window/compositor aliases have no fbMaps entry but still borrow.
+    CHECK(VmmTryMapPage(old->pageTable,va+12288,window,flags,MemTag::Device)==VmmMapResult::Mapped);
+    AddressSpaceUnref(old);CHECK(old->references==1&&!ProcessCleanupStep());
+    uint64_t identity=old->identity;
+    AddressSpaceUnref(old);CHECK(PmmGetRefCount(file)==1&&heapAllocations==1);
+    Gate ack;pendingAcknowledgement=&ack;
+    std::thread cleanup([]{CHECK(ProcessCleanupStep());});ack.wait(1);
+    // Old AS is queued and still owns its pages through the acknowledgement.
+    CHECK(PmmGetRefCount(file)==1&&PmmGetRefCount(memfd)==1&&maps(framebuffer)==1);
+    auto* replacement=AddressSpaceCreate(17);CHECK(replacement&&replacement->identity!=identity);
+    auto fresh=PmmAllocPage();CHECK(VmmTryMapPage(replacement->pageTable,va,fresh,flags)==VmmMapResult::Mapped);
+    ack.release();cleanup.join();pendingAcknowledgement=nullptr;
+    CHECK(!PmmGetRefCount(file)&&!PmmGetRefCount(memfd));
+    CHECK(PmmGetRefCount(framebuffer)==1&&maps(framebuffer)==0);
+    CHECK(closedVnodes==1&&unpinnedVnodes==1&&droppedMemfds==1);
+    CHECK(VmmVirtToPhys(replacement->pageTable,va)==fresh&&PmmGetRefCount(fresh)==1);
+    CHECK(PmmGetRefCount(window)==1&&maps(window)==0);
+    CHECK(heapAllocations==1);PmmFreePage(framebuffer);PmmFreePage(window);
+    AddressSpaceUnref(replacement);CHECK(ProcessCleanupStep()&&!ProcessCleanupStep());
+    CHECK(heapAllocations==0);PmmFreePage(kernelRoot.pml4);VmmHostSetKernelRoot({});empty();
+    std::puts("ADDRESS SPACE PASS refs/identity/queued-cleanup/borrowed-backing/reused-pid/OOM");
+}
+static void consumingWaitCleanup() {
+    auto root=table();VmmHostSetKernelRoot(root);
+    auto* retiring=AddressSpaceCreate(23);lateRetirement=AddressSpaceCreate(24);
+    CHECK(retiring&&lateRetirement);
+    auto page=PmmAllocPage();Vnode vnode{};vnode.refCount=1;
+    retiring->fileMaps[0]={va.raw(),4096,0,flags,&vnode};
+    CHECK(VmmTryMapPage(retiring->pageTable,va,page,flags)==VmmMapResult::Mapped);
+    Process waiter{},child{};ProcessCleanupCompletion completion{&waiter,false};
+    child.addressSpace=retiring;child.destroyCompletion=&completion;
+    expectedDestroy=&child;expectedCompletion=&completion;
+    ProcessQueueDestroy(&child);
+    CHECK(!completion.done&&heapAllocations==2);
+    CHECK(ProcessCleanupStep());
+    CHECK(completion.done&&cleanupWakeups==1&&!waiter.refCount);
+    CHECK(!PmmGetRefCount(page)&&heapAllocations==1);
+    // Work enqueued while draining the finite retirement batch stays queued;
+    // it cannot postpone this child's consuming wait indefinitely.
+    CHECK(ProcessCleanupStep()&&!ProcessCleanupStep()&&heapAllocations==0);
+    expectedDestroy=nullptr;expectedCompletion=nullptr;
+    PmmFreePage(root.pml4);VmmHostSetKernelRoot({});empty();
+    std::puts("ADDRESS SPACE WAIT PASS pin-release-before-wake/waiter-ref/finite-batch");
+}
 int main() {
     competingInstallAndDetach();detachReinstall();largeLeafAndBorrowedFrame();occupiedAncestors();failureAndInPlace();
     cowRetirement(false);for(unsigned i=0;i<32;++i)cowRetirement(true);
+    addressSpaceLifetime();consumingWaitCleanup();
     std::puts("VMM LEAF PASS install/detach races=64 concurrent-cow=32 retirement/OOM/in-place/reuse");
 }

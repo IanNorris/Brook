@@ -345,13 +345,14 @@ Astra's source review identified a prerequisite to Codium's regular-file
 `MAP_SHARED`: one mutation protocol for the complete address space. A file-fault
 generation check alone cannot cover anonymous/device replacement or COW.
 
-- Introduce a separately referenced address-space object owning the mutation
-  mutex, generation, page table, TLB mask, mapping metadata and allocation cursors.
-  Threads retain it; fork creates independent state; exec swaps in new state.
-  Serialize mmap/MAP_FIXED, munmap, mprotect, mremap, fork, memfd, CoW and GUI
-  writers through its protocol. Process destruction can run from timer-driven
-  reaping: final teardown must use a process-context cleanup worker or a proven
-  exclusive nonblocking path, rather than acquiring a sleeping mutex in an ISR.
+- The separately referenced address-space object and process-context cleanup
+  worker are implemented and passed targeted host/guest lifetime acceptance.
+  Threads retain it; fork creates independent state; exec swaps references.
+  Its mutex and generation are preparatory: serialize mmap/MAP_FIXED, munmap,
+  mprotect, mremap, fork, memfd, CoW and GUI writers through one protocol next.
+  Keep final filesystem work outside scheduler interrupt context. Consuming
+  waits now finish a finite worker cleanup batch before returning; add a
+  deterministic cancellation test paused inside this cleanup wait.
 - Faults snapshot and pin backing identity/range/offset/protection under that
   mutex, release it for I/O, then validate the generation before committing.
   Every speculative adjacent-page installation needs the same validation.
@@ -515,3 +516,13 @@ desktop-entry launching and smaller-display acceptance remain outstanding.
   reported 12,060 dropped records; the clean run disabled further captures after
   an export timeout. Preserve exact loss accounting and avoid treating retained
   proportions as an unbiased performance profile.
+
+
+## Ordinary-file exclusive creation
+
+GNU tar's create-first overwrite path exposes missing O_CREAT|O_EXCL semantics.
+On 15 October, a six-byte entry overwriting an existing 46-byte file retained
+46 bytes. Syscall tracing showed openat("item", 0x809c1) succeeding rather
+than returning EEXIST; this open does not request O_TRUNC. Implement atomic
+exclusive creation across VFS namespace mutations, including existing symlinks,
+and test concurrent creators plus actual GNU tar overwrite on FAT and ext2.

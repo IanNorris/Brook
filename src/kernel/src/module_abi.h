@@ -35,7 +35,8 @@ namespace brook {
 // ABI 9 adds current/maximum access permissions to Process::MemFdMap.
 // ABI 10 adds per-thread user GS base to SavedContext in Process.
 // ABI 11 adds child stop/continue event state to Process.
-static constexpr uint32_t MODULE_ABI_VERSION = 11;
+// ABI 12 moves task mappings into a shared AddressSpaceState.
+static constexpr uint32_t MODULE_ABI_VERSION = 12;
 
 // Magic bytes at the start of every valid ModuleInfo.
 static constexpr uint32_t MODULE_MAGIC = 0x4B524F42; // 'BROK'

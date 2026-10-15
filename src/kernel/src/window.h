@@ -6,6 +6,7 @@
 namespace brook {
 
 struct Process;
+struct AddressSpaceState;
 struct InputEvent;
 
 // Window manager constants
@@ -69,7 +70,8 @@ struct Window
     uint32_t*   vfb;            // kernel-virtual pointer (for blit reads)
     uint32_t    vfbStride;      // pixels per row (== clientW today)
     uint64_t    vfbBytes;       // total allocation size (page-aligned)
-    void*       vfbUser;        // user-space address in proc->pageTable
+    void*       vfbUser;        // user-space address in vfbAddressSpace
+    AddressSpaceState* vfbAddressSpace; // retained original mapping identity
     uint8_t     vfbDirty;       // set by syscall on each commit; cleared after blit
     uint16_t    wmId;           // (idx + 1); 0 reserved for "invalid"
 

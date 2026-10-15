@@ -719,6 +719,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         // It returns freed frames to the allocator only after an all-CPU TLB
         // barrier, closing the freed-while-mapped cross-domain reuse window.
         brook::PmmStartDrainThread();
+        brook::ProcessStartCleanupWorker();
 
         // BRO-179 forensic: arm PID/seq-encoded heap poison now that the per-CPU
         // GS base is valid, so a kfree that corrupts a live struct stamps the

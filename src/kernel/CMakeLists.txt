@@ -182,6 +182,7 @@ add_executable(kernel
     src/syscall.cpp
     src/posix_timer.cpp
     src/process.cpp
+    src/memory/address_space.cpp
     src/scheduler.cpp
     src/compositor.cpp
     src/window.cpp

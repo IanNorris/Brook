@@ -450,3 +450,45 @@ busy. This timing stress does not prove cancellation at a particular blocked
 I/O instruction. The 1/2 KiB ext2 matrix remains a separate gate, as does the
 concurrent mapping lifecycle work above. This does not establish writable file
 mappings or successful Codium startup.
+
+
+## Address-space ownership and cleanup (15 October 2026)
+
+Threads now retain a separate address-space object containing the page table,
+TLB footprint, mapping metadata and allocation cursors. Fork creates independent
+state; exec replaces the task's reference. Final reclamation runs on a cleanup
+worker rather than in scheduler interrupt context. Consuming wait calls wait
+for the worker's finite cleanup batch, preserving immediate kill/wait/truncate
+behavior. Nonleader exec snapshots its own descriptor table before detaching.
+
+Native windows retain the original AS for buffer unmap after exec. Legacy
+compositor buffers have explicit AS ownership and enter compositor epoch
+retirement only after their leaves are removed. Forked graphics leaves retain
+managed child references without COW-downgrading borrowed parent leaves.
+The guest `src/apps/as_lifetimecheck.c` probe exercises legacy framebuffer
+resize, native window resize, inherited graphics backing and old-window
+cleanup after exec over a newly mapped address.
+
+Candidate kernel SHA-256
+`d1ca7e9d0b0f05dc4d622bb1168d31a72c77e6038ef588b8a4a84805fcce3b2e`
+passed all 14 hosted tests on the host and after rebuilding inside Brook,
+cache/CoW, expanded waitid, the graphics probe, five filesystem mutation gates
+and thirteen compatibility/persistence gates in an isolated eight-vCPU,
+4 GiB VM. Heap integrity was OK. Checked shutdown and all three offline
+filesystem checks passed. Evidence is retained under
+`build/workloads/address-space-wait-20261015/`. Source overlays were checked
+against an exact hash manifest before compiling. Use `brook-bootstrap-shell`
+for native compiler linking; plain Bash lacks its libc++ linker flags.
+
+This establishes the lifetime layer, not a common mapping mutation protocol.
+The mutex/generation fields are preparatory. Fault snapshots, anonymous/device
+replacement, protection changes, source-window reference acquisition and shared
+file writeback still need integration. General device-fork coherence and Linux
+nonleader-exec semantics are not established. Codium and Firefox acceptance
+remain incomplete; writable regular-file MAP_SHARED is still unsupported.
+
+A separate tar overwrite reproduction found ordinary-file O_CREAT|O_EXCL is
+ignored: GNU tar's initial exclusive open succeeds on an existing file, so it
+never switches to its truncate/overwrite path. A six-byte entry left a 46-byte
+file. `--unlink-first` plus source hashes worked around this for the focused
+source-overlay validation; exclusive creation needs a separate filesystem fix.

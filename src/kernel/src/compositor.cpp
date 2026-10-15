@@ -4,6 +4,8 @@
 #include "tty.h"
 #include "serial.h"
 #include "memory/virtual_memory.h"
+#include "memory/heap.h"
+#include "memory/physical_memory.h"
 #include "memory/address.h"
 #include "mouse.h"
 #include "window.h"
@@ -66,6 +68,14 @@ static uint32_t g_compositedCount = 0;
 // ProcessDestroy uses this to wait until any in-progress blit has finished.
 static volatile uint64_t g_compositorEpoch = 0;
 
+struct CompositorVfbAllocation {
+    VirtualAddress address;
+    uint64_t pages;
+    uint64_t readyEpoch;
+    CompositorVfbAllocation* next;
+};
+static CompositorVfbAllocation* g_retiredVfbs;
+
 struct DeferredPageFree {
     uint64_t virtAddr;
     uint64_t pageCount;
@@ -117,10 +127,25 @@ static void DrainDeferredPageFrees(uint64_t epoch)
             ++freeCount;
         }
     }
+    CompositorVfbAllocation* ready = nullptr;
+    auto** cursor = &g_retiredVfbs;
+    while (*cursor) {
+        auto* item = *cursor;
+        if (epoch < item->readyEpoch) { cursor = &item->next; continue; }
+        *cursor = item->next;
+        item->next = ready;
+        ready = item;
+    }
     DeferredFreeLockRelease(flags);
 
     for (uint32_t i = 0; i < freeCount; ++i)
         VmmFreePages(VirtualAddress(freeVirt[i]), freePages[i]);
+    while (ready) {
+        auto* next = ready->next;
+        VmmFreePages(ready->address, ready->pages);
+        kfree(ready);
+        ready = next;
+    }
 }
 
 void CompositorDeferFreePages(uint64_t virtAddr, uint64_t pageCount)
@@ -564,6 +589,44 @@ uint32_t CompositorGetFps()
     return __atomic_load_n(&g_compositorFps, __ATOMIC_RELAXED);
 }
 
+// Superseded buffers remain alive until their owning AS has detached all
+// borrowed leaves and completed shootdown, then until compositor readers retire.
+// This explicit ownership also survives exec and PID reuse.
+static VirtualAddress AllocateProcessVfb(Process* proc, uint64_t pages) {
+    auto* item = static_cast<CompositorVfbAllocation*>(kmalloc(sizeof(CompositorVfbAllocation)));
+    if (!item) return {};
+    VirtualAddress address = VmmAllocPages(pages, VMM_WRITABLE, MemTag::Device, proc->pid);
+    if (!address) { kfree(item); return {}; }
+    item->address = address;
+    item->pages = pages;
+    CompositorVfbAllocation* previous;
+    do {
+        previous = __atomic_load_n(&proc->addressSpace->fbAllocations, __ATOMIC_ACQUIRE);
+        item->next = previous;
+    } while (!__atomic_compare_exchange_n(&proc->addressSpace->fbAllocations, &previous, item,
+                                          false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE));
+    return address;
+}
+void CompositorReleaseAddressSpaceBuffers(AddressSpaceState* space) {
+    auto* item = __atomic_exchange_n(&space->fbAllocations,
+                                    static_cast<CompositorVfbAllocation*>(nullptr), __ATOMIC_ACQ_REL);
+    if (!item) return;
+    const uint64_t epoch = __atomic_load_n(&g_compositorEpoch, __ATOMIC_ACQUIRE) + 2;
+    auto* tail = item;
+    for (;;) {
+        tail->readyEpoch = epoch;
+        if (!tail->next) break;
+        tail = tail->next;
+    }
+    // Reuse the preallocated ownership nodes: teardown cannot fail allocation
+    // or overflow the fixed window-free queue and free a buffer mid-frame.
+    uint64_t flags = DeferredFreeLockAcquire();
+    tail->next = g_retiredVfbs;
+    g_retiredVfbs = item;
+    DeferredFreeLockRelease(flags);
+    CompositorWake();
+}
+
 bool CompositorSetupProcess(Process* proc, int16_t destX, int16_t destY,
                              uint32_t vfbWidth, uint32_t vfbHeight, uint8_t scale)
 {
@@ -586,7 +649,7 @@ bool CompositorSetupProcess(Process* proc, int16_t destX, int16_t destY,
     uint64_t fbSizeBytes = static_cast<uint64_t>(stride) * vfbHeight * 4;
     uint64_t fbPages     = (fbSizeBytes + 4095) / 4096;
 
-    VirtualAddress vfbAddr = VmmAllocPages(fbPages, VMM_WRITABLE, MemTag::Device, proc->pid);
+    VirtualAddress vfbAddr = AllocateProcessVfb(proc, fbPages);
     if (!vfbAddr)
     {
         SerialPrintf("COMPOSITOR: failed to alloc %lu pages for vfb %ux%u\n",
@@ -648,7 +711,7 @@ bool CompositorResizeVfb(Process* proc, uint32_t newWidth, uint32_t newHeight)
     uint64_t fbSizeBytes = static_cast<uint64_t>(stride) * newHeight * 4;
     uint64_t fbPages     = (fbSizeBytes + 4095) / 4096;
 
-    VirtualAddress vfbAddr = VmmAllocPages(fbPages, VMM_WRITABLE, MemTag::Device, proc->pid);
+    VirtualAddress vfbAddr = AllocateProcessVfb(proc, fbPages);
     if (!vfbAddr)
     {
         SerialPrintf("COMPOSITOR: resize failed to alloc %lu pages for vfb %ux%u\n",
@@ -670,8 +733,8 @@ bool CompositorResizeVfb(Process* proc, uint32_t newWidth, uint32_t newHeight)
     proc->fbVfbStride   = stride;
     proc->fbDirty       = 1;
 
-    // Old VFB pages are leaked until process exit (PmmKillPid reclaims them
-    // via the pid-tagged page owner).  Acceptable for rare resize events.
+    // Old VFB pages stay in the AS allocation list: existing user aliases
+    // may still refer to them after a resize.
     SerialPrintf("COMPOSITOR: proc '%s' pid %u vfb resized to %ux%u at 0x%lx\n",
                  proc->name, proc->pid, newWidth, newHeight, vfbAddr.raw());
     return true;
@@ -3276,12 +3339,12 @@ uint64_t CompositorScanoutMap(Process* proc, ScanoutMapResult* out)
     uint64_t pages = (bufSize + 4095) / 4096;
 
     // Allocate user-space virtual range from the process's mmap window.
-    uint64_t userBase = proc->mmapNext;
+    uint64_t userBase = proc->addressSpace->mmapNext;
     if (userBase + pages * 4096 > USER_MMAP_END) {
         SerialPrintf("COMPOSITOR: scanout_map: mmap window exhausted\n");
         return 0;
     }
-    proc->mmapNext = userBase + pages * 4096;
+    proc->addressSpace->mmapNext = userBase + pages * 4096;
 
     // Map each page of the kernel backbuffer into the user page table.
     VirtualAddress bbKernAddr(reinterpret_cast<uint64_t>(g_backBuffer));
@@ -3292,7 +3355,7 @@ uint64_t CompositorScanoutMap(Process* proc, ScanoutMapResult* out)
             SerialPrintf("COMPOSITOR: scanout_map: failed to get phys for page %lu\n", i);
             return 0;
         }
-        if (!VmmMapPage(proc->pageTable,
+        if (!VmmMapPage(proc->addressSpace->pageTable,
                         VirtualAddress(userBase + i * 4096),
                         phys,
                         VMM_PRESENT | VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
@@ -3398,12 +3461,12 @@ uint64_t CompositorMapWindowVfb(Process* caller, uint32_t wmId)
 
     // Allocate user-space virtual range
     uint64_t pages = (w->vfbBytes + 4095) / 4096;
-    uint64_t userBase = caller->mmapNext;
+    uint64_t userBase = caller->addressSpace->mmapNext;
     if (userBase + pages * 4096 > USER_MMAP_END) {
         SerialPrintf("COMPOSITOR: map_window_vfb: mmap window exhausted for wm=%u\n", wmId);
         return 0;
     }
-    caller->mmapNext = userBase + pages * 4096;
+    caller->addressSpace->mmapNext = userBase + pages * 4096;
 
     // Map VFB pages read-only into compositor process
     VirtualAddress vfbKernAddr(reinterpret_cast<uint64_t>(w->vfb));
@@ -3411,11 +3474,12 @@ uint64_t CompositorMapWindowVfb(Process* caller, uint32_t wmId)
         PhysicalAddress phys = VmmVirtToPhys(KernelPageTable,
                                              VirtualAddress(vfbKernAddr.raw() + i * 4096));
         if (!phys) continue;
-        VmmMapPage(caller->pageTable,
-                   VirtualAddress(userBase + i * 4096),
-                   phys,
-                   VMM_PRESENT | VMM_USER | VMM_NO_EXEC,  // read-only
-                   MemTag::Device, caller->pid);
+        PmmRefPage(phys);
+        if (!VmmMapPage(caller->addressSpace->pageTable,
+                        VirtualAddress(userBase + i * 4096), phys,
+                        VMM_PRESENT | VMM_USER | VMM_NO_EXEC,
+                        MemTag::User, caller->pid))
+            PmmUnrefPage(phys);
     }
 
     return userBase;

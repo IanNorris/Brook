@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include "memory/address.h"
+#include "memory/address_space.h"
 #include "input.h"
 #include "spinlock.h"
 #include "fd_table.h"
@@ -10,6 +11,7 @@ namespace brook {
 
 struct Vnode;
 struct KRwLock;
+void FdReleaseOwnedEntry(const FdEntry& entry);
 
 // MAX_FDS, FdType and FdEntry are defined in fd_table.h (extracted for
 // host-side unit testing — see BRO-156).
@@ -254,21 +256,12 @@ struct Process
     int32_t  runningOnCpu;   // CPU index (-1 = not running, used for double-schedule detection)
     int32_t  cpuAffinity;    // CPU affinity pin (-1 = any CPU, >=0 = pinned to that CPU)
     volatile uint64_t tlbCpuMask;  // Bitmask of CPUs that have this process's CR3 loaded in TLB
-    // BRO-176/SIG1: address-space TLB footprint, maintained ONLY on the
-    // thread-group leader (threadLeader==self).  tlbCpuMask above is PER-THREAD
-    // and undercounts the address space's real TLB footprint: a thread group
-    // shares one page table / CR3 across all its threads, which may run on
-    // different CPUs simultaneously.  A shootdown that targets only the acting
-    // thread's tlbCpuMask misses sibling-thread CPUs that have the same shared
-    // mapping cached — so a freed user frame stays live in a sibling's TLB, is
-    // reused (e.g. as a page table), and the sibling's stale write corrupts it
-    // (the SIG1 reserved-bit #PF).  asTlbCpuMask is the UNION of every sibling
-    // thread's CPU since the address space was created (monotonic until the AS
-    // is replaced at fork/exec).  ALL user-page shootdowns must target this, not
-    // tlbCpuMask.  Over-approximation is safe: the shootdown IPI handler filters
-    // by CR3 (apic.cpp), so a CPU not running this address space acks without
-    // flushing.
-    volatile uint64_t asTlbCpuMask;
+    // Address-space ownership and its monotonic TLB footprint are shared by
+    // tasks independently of group leadership. Use AddressSpaceTlbMaskPtr for
+    // user shootdowns; the per-task mask above misses sibling CPUs.
+    AddressSpaceState* addressSpace;
+    Process* destroyNext;
+    ProcessCleanupCompletion* destroyCompletion;
     // BRO-173/175: liveness refcount — counts external holders of a raw
     // Process* that could deref this struct (a CPU currently running it, a
     // SchedulerKillThreadGroup leader's snapshot, the compositor's VFB
@@ -278,18 +271,8 @@ struct Process
     // monotonic invariant: never free while any reference is outstanding.
     // ORTHOGONAL to `state` (which answers "may it run?", not "is it freeable?").
     volatile int32_t refCount;
-    // BRO-176: address-space lifetime count, maintained ONLY on the thread-group
-    // leader (pid==tgid, the owner of the shared user page table).  Counts the
-    // number of not-yet-reaped threads sharing the leader's address space.  The
-    // reaper must not reap the leader (which is what frees the shared page table
-    // and user pages in ProcessDestroy) while this is > 0 — otherwise a sibling
-    // thread still in the pick->switch window (picked Ready, runningOnCpu still
-    // -1, about to be context-switched to) would resume on a freed cr3 and #PF
-    // in user mode (the BRO-176 UAF: a Terminated-but-pick-pending sibling slips
-    // past the Phase-2 quiesce-wait because its runningOnCpu is transiently -1).
-    // Incremented when a thread is created, decremented when a thread is reaped;
-    // the leader is therefore always reaped LAST, so the shared address space
-    // outlives every thread that could still be dispatched onto it.
+    // Unreaped thread count keeps the group leader and shared FD table alive.
+    // Address-space memory has its own references, including across exec.
     volatile int32_t asLiveThreads;
     // BRO-176: a monotonically-increasing incarnation id assigned at creation,
     // NEVER reused (unlike pid or the struct pointer, both of which recycle
@@ -382,54 +365,17 @@ struct Process
     uint64_t kernelStackBase;   // Bottom of kernel stack allocation
     uint64_t kernelStackTop;    // Top of kernel stack (initial RSP0)
 
-    // Per-process page table
-    PageTable pageTable;
-
-    // ELF binary info
+    // ELF binary info is task-local; mappings and allocation cursors belong to AS.
     ElfBinary elf;
-    uint64_t  initialEntry;     // Actual entry point (interpreter entry if dynamically linked)
-
-    // Memory
-    uint64_t programBreak;      // Current brk() position
-    uint64_t mmapNext;          // Next free user-space mmap virtual address
-
-    // MemFd mmap ranges — recorded so sys_munmap can unmap without freeing
-    // the underlying kernel heap pages (the MemFd buffer). Without this,
-    // client munmap() of a shared memfd corrupts the kernel heap.
-    /* GTK/qalc-style apps that open many short-lived popup surfaces
-     * allocate a fresh wl_shm pool (i.e. a fresh memfd mmap) per
-     * submenu/popup.  16 was too small -- one Qalculate session
-     * exhausted the slots and the next mmap returned ENOMEM, which
-     * gdk-wayland reports as "mmap'ping shared memory file failed:
-     * Cannot allocate memory" before NULL-derefing the pool pointer.
-     * 256 covers realistic GTK app sessions; cost is 256*32B = 8 KB
-     * per process, which is negligible. */
-    static constexpr uint32_t MAX_MEMFD_MAPS = 256;
-    struct MemFdMap { uint64_t vaddr; uint64_t length; uint64_t offset; uint64_t vmmFlags; void* mfd; uint32_t prot; uint32_t maxProt; };
-    MemFdMap memfdMaps[MAX_MEMFD_MAPS];
-
-    // File-backed mmap ranges.  These are demand-paged by the user #PF path:
-    // each entry owns a Vnode reference independent of the fd table so close(fd)
-    // after mmap() keeps the backing object alive.
-    // VLC's no-cache plugin scan maps hundreds of shared objects during one
-    // startup, so this needs to cover more than the dynamic loader's base set.
-    static constexpr uint32_t MAX_FILE_MAPS = 4096;
-    struct FileMap { uint64_t vaddr; uint64_t length; uint64_t offset; uint64_t vmmFlags; Vnode* vnode; };
-    FileMap fileMaps[MAX_FILE_MAPS];
-    SpinLock fileMapLock;  // protects fileMaps vnode load+ref
-    // Per-thread, never inherited by fork/clone. Owns one backing pin and
-    // vnode ref until the synchronous file fault returns or off-CPU teardown.
+    uint64_t initialEntry;
+    static constexpr uint32_t MAX_MEMFD_MAPS = AddressSpaceState::MAX_MEMFD_MAPS;
+    static constexpr uint32_t MAX_FILE_MAPS = AddressSpaceState::MAX_FILE_MAPS;
+    static constexpr uint32_t MAX_FB_MAPS = AddressSpaceState::MAX_FB_MAPS;
+    using MemFdMap = AddressSpaceState::MemFdMap;
+    using FileMap = AddressSpaceState::FileMap;
+    using FbMap = AddressSpaceState::FbMap;
+    // Per-thread transient fault backing; never inherited by fork/clone.
     Vnode* activeFileFaultVnode;
-
-    // /dev/fb0 mmap ranges — recorded so sys_munmap can unmap without
-    // freeing the underlying physical pages, which are owned by
-    // proc->fbVirtual (the kernel-side compositor VFB).  Without this,
-    // a process that munmap()s its fb mapping (e.g. Q2's SWimp_SetMode
-    // when changing sw_mode) frees pages still referenced by the
-    // compositor; subsequent re-mmap returns stale/garbage pages.
-    static constexpr uint32_t MAX_FB_MAPS = 4;
-    struct FbMap { uint64_t vaddr; uint64_t length; };
-    FbMap fbMaps[MAX_FB_MAPS];
 
     // User stack
     uint64_t stackBase;         // Bottom of stack allocation (lowest address)
@@ -562,19 +508,14 @@ struct Process
 // The group leader stays reserved until all address-space users have exited.
 static inline uint16_t ProcessAddressSpacePid(const Process* p)
 {
-    return p->tgid ? p->tgid : p->pid;
+    return p->addressSpace ? p->addressSpace->allocationPid : p->pid;
 }
 
-// BRO-176/SIG1: returns a pointer to the address-space TLB footprint mask for
-// `p`, which lives on the thread-group leader (threadLeader==self for a leader).
-// Use this — NOT p->tlbCpuMask — as the recipient set for every user-page TLB
-// shootdown, so sibling-thread CPUs sharing the address space are flushed too.
-// Falls back to `p` itself when threadLeader is null (e.g. idle/kernel threads,
-// whose mask never drives a user shootdown).
+// The TLB footprint mask lives in the referenced address space, independent of thread-group
+// leadership or exec. Use it for all user-page shootdowns.
 static inline volatile uint64_t* AddressSpaceTlbMaskPtr(Process* p)
 {
-    Process* leader = p->threadLeader ? p->threadLeader : p;
-    return &leader->asTlbCpuMask;
+    return &p->addressSpace->tlbCpuMask;
 }
 
 // Push an input event to a process's per-process queue (non-blocking).

@@ -5,6 +5,7 @@
 namespace brook {
 
 struct Process;
+struct AddressSpaceState;
 
 // Initialise the compositor (caches physical FB info).
 // Must be called after TtyInit().
@@ -76,6 +77,8 @@ void CompositorWaitFrame();
 // Defer freeing compositor-read kernel pages until any in-flight frame that may
 // have snapshotted the pointer has retired.
 void CompositorDeferFreePages(uint64_t virtAddr, uint64_t pageCount);
+// Called after AS leaves are detached and their TLB shootdown acknowledged.
+void CompositorReleaseAddressSpaceBuffers(AddressSpaceState* space);
 
 // Hot-swap the physical framebuffer (called by display driver on mode change).
 // Must be called AFTER TtyRemap (uses TtyGetFramebuffer to get the new mapping).

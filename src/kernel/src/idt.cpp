@@ -232,14 +232,14 @@ static void ExcDumpUserAddrSpace(brook::Process* p, uint64_t addr, uint64_t rip,
     // Arena classification.
     ExcPutsRaw(tag); ExcPutsRaw("    arena: ");
     if (addr >= p->stackBase && addr < p->stackTop)            ExcPutsRaw("STACK\n");
-    else if (addr >= p->elf.programBreakLow && addr < p->programBreak) ExcPutsRaw("HEAP/brk\n");
-    else if (addr >= brook::USER_MMAP_BASE && addr < p->mmapNext)  ExcPutsRaw("MMAP-ARENA (below high-water)\n");
+    else if (addr >= p->elf.programBreakLow && addr < p->addressSpace->programBreak) ExcPutsRaw("HEAP/brk\n");
+    else if (addr >= brook::USER_MMAP_BASE && addr < p->addressSpace->mmapNext)  ExcPutsRaw("MMAP-ARENA (below high-water)\n");
     else if (addr >= brook::USER_MMAP_BASE && addr < brook::USER_MMAP_END) ExcPutsRaw("MMAP-ARENA (ABOVE high-water — never allocated)\n");
     else                                                       ExcPutsRaw("UNCLASSIFIED (outside heap/stack/mmap)\n");
     ExcPutsRaw(tag); ExcPutsRaw("    brk=["); ExcPutHex(p->elf.programBreakLow);
-    ExcPutsRaw(".."); ExcPutHex(p->programBreak); ExcPutsRaw(") stack=[");
+    ExcPutsRaw(".."); ExcPutHex(p->addressSpace->programBreak); ExcPutsRaw(") stack=[");
     ExcPutHex(p->stackBase); ExcPutsRaw(".."); ExcPutHex(p->stackTop);
-    ExcPutsRaw(") mmapNext="); ExcPutHex(p->mmapNext); ExcPutsRaw("\n");
+    ExcPutsRaw(") mmapNext="); ExcPutHex(p->addressSpace->mmapNext); ExcPutsRaw("\n");
 
     // Scan a list of {vaddr,length} mappings, tracking: a mapping containing
     // `addr` (sanity), the nearest below (by end), the nearest above (by start),
@@ -259,14 +259,14 @@ static void ExcDumpUserAddrSpace(brook::Process* p, uint64_t addr, uint64_t rip,
     };
 
     for (uint32_t i = 0; i < brook::Process::MAX_FILE_MAPS; ++i) {
-        const auto& m = p->fileMaps[i];
+        const auto& m = p->addressSpace->fileMaps[i];
         uint64_t inode = (m.vnode) ? m.vnode->cacheId : 0;
         consider(m.vaddr, m.length, "file", inode);
     }
     for (uint32_t i = 0; i < brook::Process::MAX_MEMFD_MAPS; ++i)
-        consider(p->memfdMaps[i].vaddr, p->memfdMaps[i].length, "memfd", 0);
+        consider(p->addressSpace->memfdMaps[i].vaddr, p->addressSpace->memfdMaps[i].length, "memfd", 0);
     for (uint32_t i = 0; i < brook::Process::MAX_FB_MAPS; ++i)
-        consider(p->fbMaps[i].vaddr, p->fbMaps[i].length, "fb", 0);
+        consider(p->addressSpace->fbMaps[i].vaddr, p->addressSpace->fbMaps[i].length, "fb", 0);
 
     if (containKind) {
         ExcPutsRaw(tag); ExcPutsRaw("    CR2 INSIDE a tracked ");
@@ -941,7 +941,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         if (pfPresent && pfWrite && isUserAddr && cowProc)
         {
             using namespace brook;
-            uint64_t* pte = VmmGetPte(cowProc->pageTable,
+            uint64_t* pte = VmmGetPte(cowProc->addressSpace->pageTable,
                                       VirtualAddress(cr2cow & ~0xFFFULL));
             if (pte && (*pte & PTE_COW_BIT))
             {
@@ -950,12 +950,12 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                 // is issued here, AFTER the lock is dropped inside the helper,
                 // because it busy-waits for remote IPI ACKs.
                 VmmCowResolution cow = VmmCowResolveWrite(
-                    cowProc->pageTable, VirtualAddress(cr2cow), ProcessAddressSpacePid(cowProc));
+                    cowProc->addressSpace->pageTable, VirtualAddress(cr2cow), ProcessAddressSpacePid(cowProc));
 
                 if (cow.result == VmmCowResult::Resolved)
                 {
                     __asm__ volatile("invlpg (%0)" :: "r"(cr2cow & ~0xFFFULL) : "memory");
-                    brook::TlbShootdown(cowProc->pageTable.pml4.raw(),
+                    brook::TlbShootdown(cowProc->addressSpace->pageTable.pml4.raw(),
                                         cr2cow & ~0xFFFULL,
                                         *brook::AddressSpaceTlbMaskPtr(cowProc));
                     if (cow.retired) PmmUnrefPage(cow.retired);
@@ -977,7 +977,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         if (pfPresent && pfWrite && isUserAddr && cowProc)
         {
             using namespace brook;
-            uint64_t* pte = VmmGetPte(cowProc->pageTable,
+            uint64_t* pte = VmmGetPte(cowProc->addressSpace->pageTable,
                                        VirtualAddress(cr2cow & ~0xFFFULL));
             if (pte && (*pte & VMM_PRESENT) && !(*pte & PTE_COW_BIT)
                 && (*pte & VMM_USER) && (*pte & VMM_WRITABLE))
@@ -993,7 +993,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
 
         // --- MemFd lazy-page-in (user faults only) ---
         // wl_shm and gdk-wayland MAP_SHARED a memfd; the mapping is recorded
-        // in proc->memfdMaps but no PTEs are installed until first access.
+        // in proc->addressSpace->memfdMaps but no PTEs are installed until first access.
         // Allocate the backing page via the mfd's index and install the PTE.
         if (fromUser && !pfPresent && isUserAddr && cowProc) {
             extern bool MemFdHandleUserFault(uint64_t, uint64_t);

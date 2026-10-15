@@ -7,6 +7,7 @@
 #include "window.h"
 #include "process.h"
 #include "scheduler.h"
+#include "apic.h"
 #include "spinlock.h"
 #include "compositor.h"
 #include "font_atlas.h"
@@ -481,6 +482,7 @@ int WmCreateWindow(Process* proc, int16_t x, int16_t y,
     w.vfbStride = 0;
     w.vfbBytes  = 0;
     w.vfbUser   = nullptr;
+    w.vfbAddressSpace = nullptr;
     w.vfbDirty  = 0;
     w.wmId      = static_cast<uint16_t>(idx + 1);
     w.inputHead = 0;
@@ -517,13 +519,16 @@ void WmDestroyWindow(int idx)
     {
         uint32_t* oldVfb = w.vfb;
         uint64_t pageCount = (w.vfbBytes + 4095) / 4096;
-        Process* p = w.proc;
-        if (p && p->pageTable && w.vfbUser)
+        AddressSpaceState* space = w.vfbAddressSpace;
+        if (space && space->pageTable && w.vfbUser)
         {
             uint64_t userBase = reinterpret_cast<uint64_t>(w.vfbUser);
             for (uint64_t i = 0; i < pageCount; ++i)
-                VmmUnmapPage(p->pageTable, VirtualAddress(userBase + i * 4096));
+                VmmUnmapPage(space->pageTable, VirtualAddress(userBase + i * 4096));
+            TlbShootdownFull(space->pageTable.pml4.raw(), space->tlbCpuMask);
         }
+        w.vfbAddressSpace = nullptr;
+        AddressSpaceUnref(space);
         w.vfb       = nullptr;
         w.vfbStride = 0;
         w.vfbBytes  = 0;
@@ -2074,7 +2079,7 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
     // Map the same physical pages into the calling process's address
     // space, user-readable.  Reuse the user-mmap window allocator
     // (mmapNext) — pick a contiguous free range.
-    uint64_t userBase = proc->mmapNext;
+    uint64_t userBase = proc->addressSpace->mmapNext;
     if (userBase + pages * 4096 > USER_MMAP_END)
     {
         SerialPrintf("WM: user mmap window exhausted for VFB\n");
@@ -2082,7 +2087,7 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
         WmDestroyWindow(idx);
         return res;
     }
-    proc->mmapNext = userBase + pages * 4096;
+    proc->addressSpace->mmapNext = userBase + pages * 4096;
 
     bool mapOk = true;
     for (uint64_t i = 0; i < pages; ++i)
@@ -2090,7 +2095,7 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
         VirtualAddress kPage(kAddr.raw() + i * 4096);
         PhysicalAddress phys = VmmVirtToPhys(KernelPageTable, kPage);
         if (!phys) { mapOk = false; break; }
-        if (!VmmMapPage(proc->pageTable, VirtualAddress(userBase + i * 4096),
+        if (!VmmMapPage(proc->addressSpace->pageTable, VirtualAddress(userBase + i * 4096),
                         phys,
                         VMM_PRESENT | VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
                         MemTag::Device, proc->pid))
@@ -2104,7 +2109,7 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
         SerialPrintf("WM: failed to map VFB into user space\n");
         // Best-effort unmap of any partial pages.
         for (uint64_t i = 0; i < pages; ++i)
-            VmmUnmapPage(proc->pageTable, VirtualAddress(userBase + i * 4096));
+            VmmUnmapPage(proc->addressSpace->pageTable, VirtualAddress(userBase + i * 4096));
         VmmFreePages(kAddr, pages);
         WmDestroyWindow(idx);
         return res;
@@ -2114,6 +2119,8 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
     w.vfbStride = stride;
     w.vfbBytes  = pages * 4096;
     w.vfbUser   = reinterpret_cast<void*>(userBase);
+    AddressSpaceRef(proc->addressSpace);
+    w.vfbAddressSpace = proc->addressSpace;
     w.vfbDirty  = 1;  // first frame
 
     SerialPrintf("WM: window %d '%s' VFB %ux%u kvfb=0x%lx user=0x%lx pid=%u\n",
@@ -2166,14 +2173,14 @@ int WmResizeVfbForProcess(Process* proc, uint32_t wmId,
     // Carve a fresh user-VA range for the new mapping (we don't try to
     // reuse the old userBase to avoid TLB races; we unmap the old one
     // afterwards).
-    uint64_t newUserBase = proc->mmapNext;
+    uint64_t newUserBase = proc->addressSpace->mmapNext;
     if (newUserBase + newPages * 4096 > USER_MMAP_END)
     {
         SerialPrintf("WM: resize_vfb wm=%u user mmap exhausted\n", wmId);
         VmmFreePages(newKAddr, newPages);
         return -12;
     }
-    proc->mmapNext = newUserBase + newPages * 4096;
+    proc->addressSpace->mmapNext = newUserBase + newPages * 4096;
 
     bool mapOk = true;
     for (uint64_t i = 0; i < newPages; ++i)
@@ -2181,7 +2188,7 @@ int WmResizeVfbForProcess(Process* proc, uint32_t wmId,
         VirtualAddress kPage(newKAddr.raw() + i * 4096);
         PhysicalAddress phys = VmmVirtToPhys(KernelPageTable, kPage);
         if (!phys) { mapOk = false; break; }
-        if (!VmmMapPage(proc->pageTable, VirtualAddress(newUserBase + i * 4096),
+        if (!VmmMapPage(proc->addressSpace->pageTable, VirtualAddress(newUserBase + i * 4096),
                         phys,
                         VMM_PRESENT | VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
                         MemTag::Device, proc->pid))
@@ -2194,7 +2201,7 @@ int WmResizeVfbForProcess(Process* proc, uint32_t wmId,
     {
         SerialPrintf("WM: resize_vfb wm=%u map failed\n", wmId);
         for (uint64_t i = 0; i < newPages; ++i)
-            VmmUnmapPage(proc->pageTable, VirtualAddress(newUserBase + i * 4096));
+            VmmUnmapPage(proc->addressSpace->pageTable, VirtualAddress(newUserBase + i * 4096));
         VmmFreePages(newKAddr, newPages);
         return -12;
     }
@@ -2204,6 +2211,7 @@ int WmResizeVfbForProcess(Process* proc, uint32_t wmId,
     uint32_t* oldKVfb       = w->vfb;
     uint64_t  oldVfbBytes   = w->vfbBytes;
     void*     oldVfbUser    = w->vfbUser;
+    AddressSpaceState* oldSpace = w->vfbAddressSpace;
     uint64_t  oldPages      = (oldVfbBytes + 4095) / 4096;
 
     // Atomically swap the kernel VFB pointer + sizes so the compositor
@@ -2213,6 +2221,8 @@ int WmResizeVfbForProcess(Process* proc, uint32_t wmId,
     w->vfbStride = newStride;
     w->vfbBytes  = roundedBytes;
     w->vfbUser   = reinterpret_cast<void*>(newUserBase);
+    AddressSpaceRef(proc->addressSpace);
+    w->vfbAddressSpace = proc->addressSpace;
     w->clientW   = newW;
     w->clientH   = newH;
     w->vfbDirty  = 1;
@@ -2221,12 +2231,14 @@ int WmResizeVfbForProcess(Process* proc, uint32_t wmId,
     // before we unmap the old user pages and free the old kernel pages.
     CompositorWaitFrame();
 
-    if (oldVfbUser && oldVfbBytes)
+    if (oldSpace && oldVfbUser && oldVfbBytes)
     {
         uint64_t oldUserBase = reinterpret_cast<uint64_t>(oldVfbUser);
         for (uint64_t i = 0; i < oldPages; ++i)
-            VmmUnmapPage(proc->pageTable, VirtualAddress(oldUserBase + i * 4096));
+            VmmUnmapPage(oldSpace->pageTable, VirtualAddress(oldUserBase + i * 4096));
+        TlbShootdownFull(oldSpace->pageTable.pml4.raw(), oldSpace->tlbCpuMask);
     }
+    AddressSpaceUnref(oldSpace);
     if (oldKVfb && oldPages)
     {
         VmmFreePages(VirtualAddress(reinterpret_cast<uint64_t>(oldKVfb)),

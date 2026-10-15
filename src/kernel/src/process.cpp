@@ -98,6 +98,8 @@ static inline void FreeProcessStruct(Process* p)
                          haveSym ? sym : "?", off);
         }
 
+        AddressSpaceUnref(p->addressSpace);
+        p->addressSpace = nullptr;
         p->magic = 0;
     }
     kfree(p);
@@ -154,49 +156,6 @@ void ProcessReleaseFileFault(Process* proc)
     if (!vn) return;
     VfsFileMapUnpin(vn);
     VnodeHandleUnref(vn);
-}
-
-static void ProcessClearLazyMappings(Process* proc)
-{
-    if (!proc) return;
-
-    for (uint32_t i = 0; i < Process::MAX_MEMFD_MAPS; i++) {
-        auto& m = proc->memfdMaps[i];
-        if (m.length == 0) continue;
-        uint64_t pages = (m.length + 4095) / 4096;
-        for (uint64_t p = 0; p < pages; p++)
-            VmmUnmapPage(proc->pageTable, VirtualAddress(m.vaddr + p * 4096));
-        if (m.mfd) brook::MemFdHandleUnref(m.mfd);
-        m.vaddr = 0; m.length = 0; m.offset = 0; m.vmmFlags = 0; m.mfd = nullptr;
-    }
-
-    for (uint32_t i = 0; i < Process::MAX_FILE_MAPS; i++) {
-        auto& m = proc->fileMaps[i];
-        if (m.length == 0) continue;
-        // Each present file PTE owns one physical-page reference, independent
-        // of any cache or fork co-owner. Release it when removing the mapping:
-        // the later page-table walk can no longer see an unmapped leaf. In
-        // particular, uncached pages are not necessarily on the PID cleanup
-        // list (a prior shared-reference drop removes them from that list).
-        // PmmUnrefPage preserves any remaining cache/fork references and
-        // removes shared frames from PID cleanup so they cannot be freed twice.
-        uint64_t pages = (m.length + 4095) / 4096;
-        for (uint64_t p = 0; p < pages; p++) {
-            VirtualAddress va(m.vaddr + p * 4096);
-            PhysicalAddress phys = VmmVirtToPhys(proc->pageTable, va);
-            if (!phys) continue;
-            VmmUnmapPage(proc->pageTable, va);
-            PmmUnrefPage(phys);
-        }
-        // Hold the fileMapLock to prevent FileMapHandleUserFault from
-        // loading a stale vnode pointer while we clear and free it.
-        SpinLockAcquire(&proc->fileMapLock);
-        Vnode* vn = m.vnode;
-        m.vnode = nullptr;
-        m.vaddr = 0; m.length = 0; m.offset = 0; m.vmmFlags = 0;
-        SpinLockRelease(&proc->fileMapLock);
-        if (vn) { VfsFileMapUnpin(vn); VnodeHandleUnref(vn); }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -336,7 +295,7 @@ static void SetupTLS(Process* proc, uint64_t stackVirtBase, uint64_t guardPages)
     uint64_t tlsBase = stackVirtBase - guardPages * 4096 - tlsPages * 4096;
 
     auto tlsToKernel = [&](uint64_t userAddr) -> uint8_t* {
-        PhysicalAddress phys = VmmVirtToPhys(proc->pageTable, VirtualAddress(userAddr));
+        PhysicalAddress phys = VmmVirtToPhys(proc->addressSpace->pageTable, VirtualAddress(userAddr));
         return phys ? reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw()) : nullptr;
     };
 
@@ -345,10 +304,11 @@ static void SetupTLS(Process* proc, uint64_t stackVirtBase, uint64_t guardPages)
     {
         VirtualAddress vaddr(tlsBase + i * 4096);
         PhysicalAddress phys = PmmAllocPage(MemTag::User, ProcessAddressSpacePid(proc));
-        if (!phys || !VmmMapPage(proc->pageTable, vaddr, phys,
+        if (!phys || !VmmMapPage(proc->addressSpace->pageTable, vaddr, phys,
                                   VMM_WRITABLE | VMM_USER,
                                   MemTag::User, ProcessAddressSpacePid(proc)))
         {
+            if (phys) PmmUnrefPage(phys);
             tlsOk = false;
             break;
         }
@@ -432,7 +392,7 @@ static uint64_t SetupUserStack(Process* proc,
 
     // Translate user vaddr to kernel-writable pointer via direct map.
     auto toKernel = [&](uint64_t userAddr) -> uint8_t* {
-        PhysicalAddress phys = VmmVirtToPhys(proc->pageTable, VirtualAddress(userAddr));
+        PhysicalAddress phys = VmmVirtToPhys(proc->addressSpace->pageTable, VirtualAddress(userAddr));
         return phys ? reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw()) : nullptr;
     };
 
@@ -614,7 +574,7 @@ static uint64_t LoadInterpreter(Process* proc)
     }
     SerialPrintf("INTERP: opened '%s' size=%lu\n", whichPath, image.size);
     uint64_t entry = ElfLoadAt(image.data, image.size, INTERP_LOAD_BASE,
-                               proc->pageTable, proc->pid);
+                               proc->addressSpace->pageTable, proc->pid);
     FreeExecutableImage(&image);
 
     if (!entry)
@@ -657,7 +617,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     proc->runningOnCpu = -1;
     proc->cpuAffinity = -1;
     proc->tlbCpuMask = 0;
-    proc->asTlbCpuMask = 0;
+
     proc->schedPriority = 2;  // SCHED_PRIORITY_NORMAL
     proc->umask = 022;         // Default umask
 
@@ -690,8 +650,8 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     proc->kernelStackTop  = kstackAddr.raw() + KERNEL_STACK_SIZE;
 
     // Create per-process page table
-    proc->pageTable = VmmCreateUserPageTable();
-    if (!proc->pageTable)
+    proc->addressSpace = AddressSpaceCreate(proc->pid);
+    if (!proc->addressSpace)
     {
         SerialPuts("PROC: page table allocation failed\n");
         VmmFreeKernelStack(kstackAddr, KERNEL_STACK_PAGES);
@@ -703,10 +663,10 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
 
     // Load ELF binary into the process's page table (no CR3 switch needed —
     // ElfLoad writes via the direct physical map).
-    if (!ElfLoad(elfData, elfSize, &proc->elf, proc->pageTable, proc->pid))
+    if (!ElfLoad(elfData, elfSize, &proc->elf, proc->addressSpace->pageTable, proc->pid))
     {
         SerialPuts("PROC: ELF load failed\n");
-        VmmDestroyUserPageTable(proc->pageTable);
+
         VmmFreeKernelStack(kstackAddr, KERNEL_STACK_PAGES);
         kfree(proc->fds);
         SchedulerFreePid(proc->pid);
@@ -716,7 +676,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
 
     // Verify page table integrity: ELF load area (PML4[0]) must have USER bit.
     {
-        auto* pml4 = reinterpret_cast<volatile uint64_t*>(PhysToVirt(proc->pageTable.pml4).raw());
+        auto* pml4 = reinterpret_cast<volatile uint64_t*>(PhysToVirt(proc->addressSpace->pageTable.pml4).raw());
         uint64_t pml4e = pml4[0]; // PML4 entry for vaddr 0x000000-0x7FFFFFFFFF
         if (pml4e && !(pml4e & 4))
             SerialPrintf("PROC: BUG: pid %u PML4[0]=0x%lx missing USER bit!\n",
@@ -759,10 +719,10 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
                      argv[0], elfSize, h, proc->elf.entryPoint);
     }
 
-    proc->programBreak = proc->elf.programBreakLow;
+    proc->addressSpace->programBreak = proc->elf.programBreakLow;
     // Keep mmap beyond both the loaded image and its reserved brk range.
     uint64_t mmapFloor = (proc->elf.programBreakHigh + 16 * 1024 * 1024 + 4095) & ~uint64_t{4095};
-    proc->mmapNext = mmapFloor > USER_MMAP_BASE ? mmapFloor : USER_MMAP_BASE;
+    proc->addressSpace->mmapNext = mmapFloor > USER_MMAP_BASE ? mmapFloor : USER_MMAP_BASE;
 
     // Load dynamic linker if the ELF specifies PT_INTERP.
     uint64_t interpEntry = 0;
@@ -774,8 +734,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
         {
             SerialPrintf("PROC: failed to load interpreter '%s'\n",
                          proc->elf.interpPath);
-            PmmKillPid(proc->pid);
-            VmmDestroyUserPageTable(proc->pageTable);
+
             VmmFreeKernelStack(VirtualAddress(proc->kernelStackBase), KERNEL_STACK_PAGES);
             kfree(proc->fds);
             SchedulerFreePid(proc->pid);
@@ -799,10 +758,11 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     {
         VirtualAddress vaddr(stackVirtBase + i * 4096);
         PhysicalAddress phys = PmmAllocPage(MemTag::User, ProcessAddressSpacePid(proc));
-        if (!phys || !VmmMapPage(proc->pageTable, vaddr, phys,
+        if (!phys || !VmmMapPage(proc->addressSpace->pageTable, vaddr, phys,
                                   VMM_WRITABLE | VMM_USER,
                                   MemTag::User, ProcessAddressSpacePid(proc)))
         {
+            if (phys) PmmUnrefPage(phys);
             stackOk = false;
             break;
         }
@@ -812,8 +772,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     if (!stackOk)
     {
         SerialPuts("PROC: stack allocation failed\n");
-        PmmKillPid(proc->pid);
-        VmmDestroyUserPageTable(proc->pageTable);
+
         VmmFreeKernelStack(VirtualAddress(proc->kernelStackBase), KERNEL_STACK_PAGES);
         kfree(proc->fds);
         SchedulerFreePid(proc->pid);
@@ -866,7 +825,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
 
     DbgPrintf("PROC: created pid=%u, entry=0x%lx, stack=0x%lx, brk=0x%lx, cr3=0x%lx\n",
                  proc->pid, proc->initialEntry, proc->stackTop,
-                 proc->programBreak, proc->pageTable.pml4.raw());
+                 proc->addressSpace->programBreak, proc->addressSpace->pageTable.pml4.raw());
 
     return proc;
 }
@@ -899,12 +858,12 @@ Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
     proc->runningOnCpu = -1;
     proc->cpuAffinity = -1;
     proc->tlbCpuMask = 0;
-    proc->asTlbCpuMask = 0;
+
     proc->isKernelThread = true;
     proc->schedPriority = priority;
 
     // Kernel threads use the kernel's page table
-    proc->pageTable = VmmKernelCR3();
+    proc->addressSpace = AddressSpaceKernel();
 
     // Allocate kernel stack with guard pages
     VirtualAddress kstackAddr = VmmAllocKernelStack(KERNEL_STACK_PAGES,
@@ -981,6 +940,11 @@ void ProcessCloseAllFds(Process* proc)
 
 void ProcessDestroy(Process* proc)
 {
+    if (proc) ProcessQueueDestroy(proc);
+}
+
+void ProcessDestroyNow(Process* proc)
+{
     if (!proc) return;
 
     PosixTimersCleanup(proc, false);
@@ -1009,10 +973,8 @@ void ProcessDestroy(Process* proc)
         proc->fds = nullptr;
     }
 
-    // Only the leader owns compositor/window state.  Do this before tearing
-    // down the user page table because per-window VFB mappings are unmapped
-    // through proc->pageTable.  The scheduler reaper can run from the LAPIC
-    // timer path, so this path must not block waiting for a compositor frame.
+    // Remove compositor/window references before retiring graphics backing.
+    // This finalizer runs on the cleanup worker, outside scheduler IRQ context.
     if (!isThread)
     {
         CompositorUnregisterProcess(proc);
@@ -1026,36 +988,13 @@ void ProcessDestroy(Process* proc)
         }
     }
 
-    // Threads share the page table with the leader — don't destroy it
-    if (!proc->isKernelThread && !isThread)
-    {
-        // Flush stale TLB entries for this address space on all remote CPUs
-        // before tearing down the page table and freeing the physical pages,
-        // so a CPU that still has this AS cached cannot read/write memory that
-        // is about to be freed (and possibly reallocated). Mirrors the exec
-        // teardown path (ProcessExec). The reaper runs on CPU0 and never has a
-        // terminated process's page table loaded, so unlike exec there is no
-        // local CR3 to switch away first.
-        TlbShootdownFull(proc->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
-
-        // Clear lazy VMAs before page-table destruction. MemFd PTEs point at
-        // memfd-owned pages, and file VMAs hold vnode references independent of
-        // the fd table.
-        ProcessClearLazyMappings(proc);
-        VmmDestroyUserPageTable(proc->pageTable);
-    }
-
-    // Only free user pages for the leader process
-    if (!isThread)
-        VmmKillPid(proc->pid);
+    // Address-space ownership, not PID-tag sweeps, retires mappings. Final
+    // AS release is queued independently and cannot touch a reused PID's pages.
 
     // Free per-process kernel stack (each thread has its own).  This must be
     // after teardown work that may still need helper calls using this proc.
     if (proc->kernelStackBase)
         VmmFreeKernelStack(VirtualAddress(proc->kernelStackBase), KERNEL_STACK_PAGES);
-
-    // Remove from scheduler tracking
-    SchedulerRemoveProcess(proc);
 
     // Clear signal handler slot so the PID can be safely reused without
     // the next process inheriting our handler pointers (which would
@@ -1073,6 +1012,9 @@ void ProcessDestroy(Process* proc)
             g_sigHandlers[proc->tgid][s].mask = 0;
         }
     }
+
+    // Release the PID only after clearing its signal slots and exact resources.
+    SchedulerRemoveProcess(proc);
 
     // Publish the final shared-address-space release only after thread cleanup.
     if (isThread && !proc->isKernelThread)
@@ -1142,7 +1084,7 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                     uint64_t pteFlags = srcPt4[i1] & ~PTE_PHYS_MASK;
                     bool memfdPage = false;
                     for (uint32_t m = 0; m < Process::MAX_MEMFD_MAPS; ++m) {
-                        const auto& map = mappings->memfdMaps[m];
+                        const auto& map = mappings->addressSpace->memfdMaps[m];
                         if (map.mfd && map.length && vaddr >= map.vaddr &&
                             vaddr - map.vaddr < map.length) {
                             memfdPage = true;
@@ -1157,6 +1099,20 @@ static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
                         if (!VmmMapPage(dstPt, VirtualAddress(vaddr), srcPhys,
                                         pteFlags & ~PTE_COW_BIT, MemTag::User, dstPid))
                             return false;
+                        sharedCount++;
+                        continue;
+                    }
+                    if (((pteFlags & PTE_TAG_MASK) >> PTE_TAG_SHIFT) ==
+                        static_cast<uint64_t>(MemTag::Device)) {
+                        // The parent borrows kernel-owned graphics backing. The
+                        // child retains its own reference; never COW-downgrade
+                        // the parent's borrowed leaf or retire the owner's ref.
+                        PmmRefPage(srcPhys);
+                        if (!VmmMapPage(dstPt, VirtualAddress(vaddr), srcPhys,
+                                        pteFlags & ~PTE_COW_BIT, MemTag::User, dstPid)) {
+                            PmmUnrefPage(srcPhys);
+                            return false;
+                        }
                         sharedCount++;
                         continue;
                     }
@@ -1328,9 +1284,11 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
 
     // Copy entire parent process struct as a starting point
     memcpy(child, parent, sizeof(Process));
+    child->addressSpace = nullptr;
+    child->destroyNext = nullptr;
+    child->destroyCompletion = nullptr;
     child->activeFileFaultVnode = nullptr;
     child->fdLock.next = child->fdLock.serving = 0;
-    child->fileMapLock.next = child->fileMapLock.serving = 0;
     child->magic = PROCESS_MAGIC;
     child->incarnation = NextIncarnation();
     child->leaderIncarnation = 0;   // a fork child is its own leader
@@ -1377,7 +1335,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->runningOnCpu = -1;
     child->cpuAffinity = -1;
     child->tlbCpuMask = 0;
-    child->asTlbCpuMask = 0;
+
     child->reapable = false;
     child->compositorRegistered = false;
     child->refCount = 0;             // BRO-173/175: fresh process holds no external refs
@@ -1432,8 +1390,8 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->kernelStackTop  = kstackAddr.raw() + KERNEL_STACK_SIZE;
 
     // Create new page table (shares kernel upper half)
-    child->pageTable = VmmCreateUserPageTable();
-    if (!child->pageTable)
+    child->addressSpace = AddressSpaceCreate(child->pid);
+    if (!child->addressSpace)
     {
         SerialPuts("FORK: page table allocation failed\n");
         VmmFreeKernelStack(kstackAddr, KERNEL_STACK_PAGES);
@@ -1443,33 +1401,31 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
         return nullptr;
     }
 
-    // Threads copy the address-space leader's current VMA bookkeeping, not
-    // the stale arrays/break/frontier copied when that thread was created.
-    Process* mapOwner = parent->isThread && parent->threadLeader
-                      ? parent->threadLeader : parent;
-    child->programBreak = mapOwner->programBreak;
-    child->mmapNext = mapOwner->mmapNext;
-    SpinLockAcquire(&mapOwner->fileMapLock);
-    memcpy(child->memfdMaps, mapOwner->memfdMaps, sizeof(child->memfdMaps));
-    memcpy(child->fileMaps, mapOwner->fileMaps, sizeof(child->fileMaps));
+    // Metadata and page tables must come from the same shared AS. The group
+    // leader may already have installed a different address space via exec.
+    Process* mapOwner = parent;
+    child->addressSpace->programBreak = mapOwner->addressSpace->programBreak;
+    child->addressSpace->mmapNext = mapOwner->addressSpace->mmapNext;
+    SpinLockAcquire(&mapOwner->addressSpace->fileMapLock);
+    memcpy(child->addressSpace->memfdMaps, mapOwner->addressSpace->memfdMaps, sizeof(child->addressSpace->memfdMaps));
+    memcpy(child->addressSpace->fileMaps, mapOwner->addressSpace->fileMaps, sizeof(child->addressSpace->fileMaps));
     for (uint32_t i = 0; i < Process::MAX_MEMFD_MAPS; ++i)
-        if (child->memfdMaps[i].length && child->memfdMaps[i].mfd)
-            brook::MemFdHandleRef(child->memfdMaps[i].mfd);
+        if (child->addressSpace->memfdMaps[i].length && child->addressSpace->memfdMaps[i].mfd)
+            brook::MemFdHandleRef(child->addressSpace->memfdMaps[i].mfd);
     for (uint32_t i = 0; i < Process::MAX_FILE_MAPS; ++i)
-        if (child->fileMaps[i].length && child->fileMaps[i].vnode) {
-            VfsFileMapClone(child->fileMaps[i].vnode);
-            __atomic_fetch_add(&child->fileMaps[i].vnode->refCount, 1, __ATOMIC_RELEASE);
+        if (child->addressSpace->fileMaps[i].length && child->addressSpace->fileMaps[i].vnode) {
+            VfsFileMapClone(child->addressSpace->fileMaps[i].vnode);
+            __atomic_fetch_add(&child->addressSpace->fileMaps[i].vnode->refCount, 1, __ATOMIC_RELEASE);
         }
-    SpinLockRelease(&mapOwner->fileMapLock);
+    SpinLockRelease(&mapOwner->addressSpace->fileMapLock);
 
     // Copy writable private pages; shared memfd pages retain object backing.
-    if (!ForkCopyUserPages(parent->pageTable, child->pageTable,
+    if (!ForkCopyUserPages(parent->addressSpace->pageTable, child->addressSpace->pageTable,
                            parent->pid, child->pid,
                            *AddressSpaceTlbMaskPtr(parent), child))
     {
         SerialPuts("FORK: address space copy failed\n");
-        ProcessClearLazyMappings(child);
-        VmmDestroyUserPageTable(child->pageTable);
+
         VmmFreeKernelStack(kstackAddr, KERNEL_STACK_PAGES);
         kfree(child->fds);
         SchedulerFreePid(child->pid);
@@ -1481,8 +1437,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     // parent slots after copying their handle into the child.
     if (!FdTableForkSnapshot(child->fds, parent->fds, ProcessFdLock(parent), FdRetainCopy, UnixLifePublished)) {
         ProcessCloseAllFds(child);
-        ProcessClearLazyMappings(child);
-        VmmDestroyUserPageTable(child->pageTable);
+
         VmmFreeKernelStack(kstackAddr, KERNEL_STACK_PAGES);
         kfree(child->fds);
         SchedulerFreePid(child->pid);
@@ -1541,6 +1496,9 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
 
     // Copy parent process struct as starting point
     memcpy(thread, parent, sizeof(Process));
+    thread->addressSpace = nullptr;
+    thread->destroyNext = nullptr;
+    thread->destroyCompletion = nullptr;
     thread->activeFileFaultVnode = nullptr;
     thread->magic = PROCESS_MAGIC;
     thread->incarnation = NextIncarnation();
@@ -1597,7 +1555,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     thread->runningOnCpu = -1;
     thread->cpuAffinity = leader->cpuAffinity;
     thread->tlbCpuMask = 0;
-    thread->asTlbCpuMask = 0;
+
     thread->reapable = false;
     thread->compositorRegistered = false;
     thread->refCount = 0;            // BRO-173/175: fresh thread holds no external refs
@@ -1660,11 +1618,8 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     thread->kernelStackTop  = kstackAddr.raw() + KERNEL_STACK_SIZE;
 
     // CLONE_VM: share the same page table — no page copy
-    thread->pageTable = parent->pageTable;
-
-    // Share the same program break, mmap state
-    thread->programBreak = parent->programBreak;
-    thread->mmapNext = parent->mmapNext;
+    thread->addressSpace = parent->addressSpace;
+    AddressSpaceRef(thread->addressSpace);
 
     // Set TLS base for this thread (musl allocates per-thread TLS)
     thread->fsBase = tlsBase;
@@ -1698,7 +1653,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     // thread before it is ever published.
     DbgPrintf("THREAD: parent pid=%u -> thread tid=%u tgid=%u pt=0x%lx\n",
               parent->pid, thread->pid, thread->tgid,
-              thread->pageTable.pml4.raw());
+              thread->addressSpace->pageTable.pml4.raw());
 
     return thread;
 }
@@ -1729,11 +1684,7 @@ uint16_t CreateRemoteThread(Process* target, uint64_t entry,
     // clobber its own argument when it pushes stack frames.
     if (argLen > stackSize / 2) return 0;
 
-    // Locate the thread-group leader — all user address-space bookkeeping
-    // (mmapNext) lives there, just like sys_mmap does.
-    Process* leader = target->threadLeader ? target->threadLeader : target;
-
-    // Reserve a VA range in the leader's mmap area.  Use a dedicated lock
+    // Reserve a VA range in the target's shared address space.  Use a dedicated lock
     // to avoid clashing with sys_mmap — overlap would be catastrophic.
     // We intentionally don't share the sys_mmap spinlock (different TU).
     static SpinLock s_remoteStackLock;
@@ -1741,13 +1692,13 @@ uint16_t CreateRemoteThread(Process* target, uint64_t entry,
     uint32_t pages = stackSize / 4096;
     {
         SpinLockAcquire(&s_remoteStackLock);
-        stackBase = leader->mmapNext;
+        stackBase = target->addressSpace->mmapNext;
         if (stackBase + stackSize > USER_MMAP_END) {
             SpinLockRelease(&s_remoteStackLock);
             SerialPrintf("CRT: out of user VA (pid %u)\n", target->pid);
             return 0;
         }
-        leader->mmapNext = stackBase + stackSize;
+        target->addressSpace->mmapNext = stackBase + stackSize;
         SpinLockRelease(&s_remoteStackLock);
     }
 
@@ -1756,11 +1707,11 @@ uint16_t CreateRemoteThread(Process* target, uint64_t entry,
     uint64_t vmmFlags = VMM_WRITABLE | VMM_USER;
     uint32_t mapped = 0;
     for (uint32_t i = 0; i < pages; ++i) {
-        PhysicalAddress phys = PmmAllocPage(MemTag::User, leader->pid);
+        PhysicalAddress phys = PmmAllocPage(MemTag::User, ProcessAddressSpacePid(target));
         if (!phys) break;
-        if (!VmmMapPage(target->pageTable,
+        if (!VmmMapPage(target->addressSpace->pageTable,
                         VirtualAddress(stackBase + i * 4096),
-                        phys, vmmFlags, MemTag::User, leader->pid)) {
+                        phys, vmmFlags, MemTag::User, ProcessAddressSpacePid(target))) {
             PmmFreePage(phys);
             break;
         }
@@ -1773,8 +1724,8 @@ uint16_t CreateRemoteThread(Process* target, uint64_t entry,
         // Partial mapping — roll back what we did and fail.
         for (uint32_t i = 0; i < mapped; ++i) {
             VirtualAddress va(stackBase + i * 4096);
-            PhysicalAddress p = VmmVirtToPhys(target->pageTable, va);
-            VmmUnmapPage(target->pageTable, va);
+            PhysicalAddress p = VmmVirtToPhys(target->addressSpace->pageTable, va);
+            VmmUnmapPage(target->addressSpace->pageTable, va);
             if (p) PmmFreePage(p);
         }
         SerialPrintf("CRT: stack alloc failed (%u/%u pages) for pid %u\n",
@@ -1801,7 +1752,7 @@ uint16_t CreateRemoteThread(Process* target, uint64_t entry,
             uint64_t pageOff = cursor & 0xFFF;
             uint32_t thisPage = 4096u - static_cast<uint32_t>(pageOff);
             if (thisPage > remaining) thisPage = remaining;
-            PhysicalAddress phys = VmmVirtToPhys(target->pageTable,
+            PhysicalAddress phys = VmmVirtToPhys(target->addressSpace->pageTable,
                                                   VirtualAddress(pageVA));
             if (!phys) {
                 SerialPrintf("CRT: arg copy hit unmapped page 0x%lx pid %u\n",
@@ -1833,8 +1784,8 @@ uint16_t CreateRemoteThread(Process* target, uint64_t entry,
         // Roll back the stack mapping.
         for (uint32_t i = 0; i < pages; ++i) {
             VirtualAddress va(stackBase + i * 4096);
-            PhysicalAddress p = VmmVirtToPhys(target->pageTable, va);
-            VmmUnmapPage(target->pageTable, va);
+            PhysicalAddress p = VmmVirtToPhys(target->addressSpace->pageTable, va);
+            VmmUnmapPage(target->addressSpace->pageTable, va);
             if (p) PmmFreePage(p);
         }
         return 0;
@@ -1888,51 +1839,54 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     if (!proc || proc->isKernelThread) return 0;
     if (!ExecArgumentsFit(argc, argv, envc, envp)) return 0;
 
-    // TLB shootdown replaces the previous CPU pinning workaround for BRO-133.
-    // Flush stale TLB entries for the old address space on all remote CPUs
-    // before we destroy the page tables and free the underlying physical pages.
-
-    // Save the old page table and switch CR3 to the kernel's page table
-    // BEFORE destroying the old one. This avoids a use-after-free: the
-    // CPU's CR3 would point to a freed PML4 page otherwise.
-    // This exec is committing to replace/detach the old image. No timer
-    // may retain its old opaque user value across that replacement.
-    PosixTimersCleanup(proc, true);
-    PageTable oldPt = proc->pageTable;
-    PageTable kernelPt = VmmKernelCR3();
-
-    // When a thread exec's, it shares the page table with the leader and
-    // other threads.  We must NOT destroy the shared PT — the group leader's
-    // reaper will do that once all threads have exited.  Instead, just detach
-    // from the thread group and create a fresh address space below.
+    ProcessOperationGuard operation(proc);
+    AddressSpaceState* replacement = AddressSpaceCreate(proc->pid);
+    if (!replacement) return 0;
     bool wasThread = proc->isThread;
-
-    // Flush TLB entries for the old address space on all remote CPUs
-    TlbShootdownFull(oldPt.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
-
-    __asm__ volatile("mov %0, %%cr3" : : "r"(kernelPt.pml4.raw()) : "memory");
-
-    // 1. Free all user-space pages and destroy old page table — but ONLY if
-    //    we are the sole owner.  Threads share the PT with the leader; if we
-    //    destroy it here, the leader (and siblings) lose their address space.
-    if (!wasThread)
-    {
-        ProcessClearLazyMappings(proc);
-        VmmDestroyUserPageTable(oldPt);
+    FdEntry* privateFds = nullptr;
+    if (wasThread) {
+        privateFds = AllocFdTable();
+        if (!privateFds || !FdTableForkSnapshot(privateFds, proc->fds,
+                ProcessFdLock(proc), FdRetainCopy, UnixLifePublished)) {
+            if (privateFds) {
+                for (uint32_t i = 0; i < MAX_FDS; ++i)
+                    if (privateFds[i].type != FdType::None) FdReleaseOwnedEntry(privateFds[i]);
+                kfree(privateFds);
+            }
+            AddressSpaceUnref(replacement);
+            return 0;
+        }
     }
-    else
-    {
-        // Detach from the thread group — this thread becomes its own leader.
+    PosixTimersCleanup(proc, true);
+    AddressSpaceState* previous = proc->addressSpace;
+    PageTable kernelPt = VmmKernelCR3();
+    __asm__ volatile("mov %0, %%cr3" : : "r"(kernelPt.pml4.raw()) : "memory");
+    proc->addressSpace = replacement;
+    proc->tlbCpuMask = 0;
+    if (wasThread) {
+        // Detach the previous shared FD ownership before becoming a leader.
+        // Drop the old group's liveness hold while its identity is still saved.
+        proc->fds = privateFds;
+        proc->fdLock.next = proc->fdLock.serving = 0;
+        SchedulerReleaseThreadAddressSpace(proc);
         proc->isThread = false;
         proc->tgid = proc->pid;
         proc->threadLeader = proc;
+        proc->leaderIncarnation = 0;
     }
-    // Old address space is gone (or detached) — reset TLB CPU mask
-    proc->tlbCpuMask = 0;
-    proc->asTlbCpuMask = 0;
-    // NOTE: PmmFreeByTag removed here. VmmDestroyUserPageTable already calls
-    // PmmUnrefPage on every leaf PTE, which correctly frees pages at refcount=0
-    // and preserves pages still referenced by the global file page cache.
+    // Stop publishing old graphics backing before its AS can be finalized.
+    proc->fbVirtual = nullptr;
+    proc->fbVirtualSize = 0;
+    proc->fbVfbWidth = 0;
+    proc->fbVfbHeight = 0;
+    proc->fbVfbStride = 0;
+    proc->fbDestX = 0;
+    proc->fbDestY = 0;
+    proc->fbScale = 0;
+    proc->fbDirty = 0;
+    proc->fbExitColor = 0;
+
+    AddressSpaceUnref(previous);
 
     // Any user-space pointers the kernel held into the old address space are
     // now stale. If we fail later in ProcessExec, SchedulerExitCurrentProcess
@@ -1943,25 +1897,17 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     proc->crashEntry = 0;
     proc->crashInProgress = false;
 
-    // 2. Create fresh page table
-    proc->pageTable = VmmCreateUserPageTable();
-    if (!proc->pageTable)
-    {
-        SerialPuts("EXEC: page table allocation failed\n");
-        return 0;
-    }
-
     // 3. Load the new ELF binary
-    if (!ElfLoad(elfData, elfSize, &proc->elf, proc->pageTable, proc->pid))
+    if (!ElfLoad(elfData, elfSize, &proc->elf, proc->addressSpace->pageTable, proc->pid))
     {
         SerialPuts("EXEC: ELF load failed\n");
         return 0;
     }
 
-    proc->programBreak = proc->elf.programBreakLow;
+    proc->addressSpace->programBreak = proc->elf.programBreakLow;
     // Keep mmap beyond both the loaded image and its reserved brk range.
     uint64_t mmapFloor = (proc->elf.programBreakHigh + 16 * 1024 * 1024 + 4095) & ~uint64_t{4095};
-    proc->mmapNext = mmapFloor > USER_MMAP_BASE ? mmapFloor : USER_MMAP_BASE;
+    proc->addressSpace->mmapNext = mmapFloor > USER_MMAP_BASE ? mmapFloor : USER_MMAP_BASE;
 
     // Load dynamic linker if the ELF specifies PT_INTERP.
     uint64_t interpEntry = 0;
@@ -1989,10 +1935,11 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     {
         VirtualAddress vaddr(stackVirtBase + i * 4096);
         PhysicalAddress phys = PmmAllocPage(MemTag::User, ProcessAddressSpacePid(proc));
-        if (!phys || !VmmMapPage(proc->pageTable, vaddr, phys,
+        if (!phys || !VmmMapPage(proc->addressSpace->pageTable, vaddr, phys,
                                   VMM_WRITABLE | VMM_USER,
                                   MemTag::User, ProcessAddressSpacePid(proc)))
         {
+            if (phys) PmmUnrefPage(phys);
             SerialPuts("EXEC: stack allocation failed\n");
             return 0;
         }
@@ -2008,18 +1955,6 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
 
     // 6. Set up TLS
     SetupTLS(proc, stackVirtBase, guardPages);
-
-    // 7. Clear framebuffer state (new program starts fresh)
-    proc->fbVirtual = nullptr;
-    proc->fbVirtualSize = 0;
-    proc->fbVfbWidth = 0;
-    proc->fbVfbHeight = 0;
-    proc->fbVfbStride = 0;
-    proc->fbDestX = 0;
-    proc->fbDestY = 0;
-    proc->fbScale = 0;
-    proc->fbDirty = 0;
-    proc->fbExitColor = 0;
 
     // 8. Close FD_CLOEXEC file descriptors — POSIX execve semantics require
     //    that any fd opened with O_CLOEXEC / FD_CLOEXEC is closed when the

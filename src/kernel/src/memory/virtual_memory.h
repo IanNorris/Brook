@@ -65,6 +65,9 @@ struct VmmAllocation
 
 // Initialise the VMM. Must be called after PmmInit().
 void VmmInit();
+#ifdef BROOK_HOST_TEST
+void VmmHostSetKernelRoot(PageTable root);
+#endif
 
 // ---------------------------------------------------------------------------
 // Page table operations — all take an explicit PageTable parameter.
@@ -202,7 +205,9 @@ PageTable VmmCreateUserPageTable();
 
 // Free a per-process PML4 and all intermediate page-table pages in the
 // user-half (PML4[0..255]).  Does NOT free leaf data pages.
-void VmmDestroyUserPageTable(PageTable pt);
+// AS teardown preserves borrowed Device leaves: detach them without dropping
+// the kernel graphics owner's frame reference. Other callers keep legacy mode.
+void VmmDestroyUserPageTable(PageTable pt, bool preserveBorrowedDevices = false);
 
 // Get the kernel's page table.
 PageTable VmmKernelCR3();

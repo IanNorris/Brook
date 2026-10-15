@@ -241,7 +241,7 @@ extern "C" void ProcessDumpFrameMappers(uint64_t targetPhys)
     {
         Process* p = g_allProcesses[pi];
         if (!p || p->magic != PROCESS_MAGIC) continue;
-        uint64_t pml4Phys = p->pageTable.pml4.raw();
+        uint64_t pml4Phys = p->addressSpace->pageTable.pml4.raw();
         if (!physOk(pml4Phys)) continue;
         const uint64_t* pml4 = tbl(pml4Phys);
 
@@ -774,6 +774,8 @@ void SchedulerInit()
     g_schedOps->Init(g_schedState);
     SerialPrintf("SCHED: loaded policy '%s'\n", g_schedOps->name);
 
+    AddressSpaceKernelInit();
+
     // Create idle process for BSP (CPU 0).
     auto* idle = static_cast<Process*>(kmalloc(sizeof(Process)));
     if (!idle) KernelPanic("SCHED: OOM allocating BSP idle process");
@@ -794,7 +796,7 @@ void SchedulerInit()
     idle->savedCtx.rip = reinterpret_cast<uint64_t>(&IdleLoop);
     idle->savedCtx.rflags = 0x202;
     idle->savedCtx.cr3 = VmmKernelCR3().pml4.raw();
-    idle->pageTable = VmmKernelCR3();
+    idle->addressSpace = AddressSpaceKernel();
 
     g_perCpu[0].idleProcess = idle;
     g_perCpu[0].currentProcess = nullptr;
@@ -942,7 +944,7 @@ void SchedulerAddProcess(Process* proc)
         proc->savedCtx.rip = reinterpret_cast<uint64_t>(&ProcessTrampoline);
 
     proc->savedCtx.rflags = 0x202;
-    proc->savedCtx.cr3 = proc->pageTable.pml4.raw();
+    proc->savedCtx.cr3 = proc->addressSpace->pageTable.pml4.raw();
     proc->savedCtx.fsBase = proc->fsBase;
 
     // Register with pid lookup and policy module.
@@ -2183,7 +2185,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
         // space is gone; if clearChildTid wasn't cleared by the exec path we'd
         // fault here. Treat an unmapped tidPtr as "nothing to do" rather than
         // panicking the kernel.
-        PhysicalAddress tidPhys = VmmVirtToPhys(proc->pageTable,
+        PhysicalAddress tidPhys = VmmVirtToPhys(proc->addressSpace->pageTable,
             VirtualAddress(proc->clearChildTid));
         if (tidPhys)
         {
@@ -2327,7 +2329,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     GdtSetTssRsp0ForCpu(cpu, first->kernelStackTop);
     SetSyscallStack(cpu, first->kernelStackTop);
 
-    VmmSwitchPageTable(first->pageTable);
+    VmmSwitchPageTable(first->addressSpace->pageTable);
 
     WriteMsr(MSR_KERNEL_GS_BASE, first->savedCtx.gsBase);
 
@@ -2397,7 +2399,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     GdtSetTssRsp0ForCpu(cpu, first->kernelStackTop);
     SetSyscallStack(cpu, first->kernelStackTop);
 
-    VmmSwitchPageTable(first->pageTable);
+    VmmSwitchPageTable(first->addressSpace->pageTable);
 
     if (first == g_perCpu[cpu].idleProcess)
     {
@@ -2463,7 +2465,7 @@ void SchedulerInitApIdle(uint32_t cpuIndex)
     idle->savedCtx.rip = reinterpret_cast<uint64_t>(&IdleLoop);
     idle->savedCtx.rflags = 0x202;
     idle->savedCtx.cr3 = VmmKernelCR3().pml4.raw();
-    idle->pageTable = VmmKernelCR3();
+    idle->addressSpace = AddressSpaceKernel();
     g_perCpu[cpuIndex].idleProcess = idle;
 }
 
@@ -2810,7 +2812,8 @@ int SchedulerWaitChild(Process* caller, int selector, uint32_t id,
                        uint32_t options, ChildWaitSnapshot* result)
 {
     // The detached Process must not be abandoned if a remote fatal signal
-    // arrives during destruction. This region never covers the blocking wait.
+    // arrives during destruction. It covers cleanup completion, but ends before
+    // the syscall's ordinary wait for a child state change.
     SchedulerKernelRegionEnter(caller);
     Process* consumed = nullptr;
     int outcome = -10; // ECHILD
@@ -2855,7 +2858,7 @@ int SchedulerWaitChild(Process* caller, int selector, uint32_t id,
     if (consumed) {
         __atomic_fetch_add(&g_reapedUserTicks, consumed->userTicks, __ATOMIC_RELAXED);
         __atomic_fetch_add(&g_reapedSysTicks, consumed->sysTicks, __ATOMIC_RELAXED);
-        ProcessDestroy(consumed);
+        ProcessDestroyAndWait(consumed);
     }
     SchedulerKernelRegionLeave(caller);
     // Drop the operation latch before the syscall can enter a blocking wait.
@@ -3043,7 +3046,7 @@ static void FillProcessSnapshot(const Process* p, ProcessSnapshot* out)
     out->pgid = p->pgid; out->sid = p->sid; out->state = p->state;
     out->runningOnCpu = p->runningOnCpu;
     out->stackBase = p->stackBase; out->stackTop = p->stackTop;
-    out->programBreak = p->programBreak;
+    out->programBreak = p->addressSpace->programBreak;
     out->userTicks = p->userTicks; out->sysTicks = p->sysTicks;
     uint32_t j = 0;
     for (; j + 1 < sizeof(out->name) && p->name[j]; ++j) out->name[j] = p->name[j];

@@ -39,6 +39,9 @@ static IrqSpinLock g_userPtLock;
 
 // The kernel's PML4 physical address, captured at init time.
 static PhysicalAddress g_kernelCR3{};
+#ifdef BROOK_HOST_TEST
+void VmmHostSetKernelRoot(PageTable root) { g_kernelCR3 = root.pml4; }
+#endif
 
 // Module-space bump allocator
 static uint64_t g_moduleNext = MODULE_BASE;
@@ -895,7 +898,7 @@ PageTable VmmCreateUserPageTable()
     return PageTable(pml4Phys);
 }
 
-static void FreeTableLevel(PhysicalAddress tablePhys, int level)
+static void FreeTableLevel(PhysicalAddress tablePhys, int level, bool preserveBorrowedDevices)
 {
     uint64_t* table = reinterpret_cast<uint64_t*>(PhysToVirt(tablePhys).raw());
     if (level > 1)
@@ -904,7 +907,7 @@ static void FreeTableLevel(PhysicalAddress tablePhys, int level)
         {
             if (!(table[i] & VMM_PRESENT)) continue;
             if (table[i] & (1ULL << 7)) continue; // huge page, skip
-            FreeTableLevel(PhysicalAddress(table[i] & PHYS_MASK), level - 1);
+            FreeTableLevel(PhysicalAddress(table[i] & PHYS_MASK), level - 1, preserveBorrowedDevices);
         }
     }
     else
@@ -919,13 +922,16 @@ static void FreeTableLevel(PhysicalAddress tablePhys, int level)
             // the freeing site sees mapCount==0 only when no PTE remains.
             if (table[i] & VMM_USER)
                 PmmMapDec(pagePhys);
-            PmmUnrefPage(pagePhys);
+            const bool borrowedDevice = preserveBorrowedDevices &&
+                ((table[i] & PTE_TAG_MASK) >> PTE_TAG_SHIFT) ==
+                    static_cast<uint64_t>(MemTag::Device);
+            if (!borrowedDevice) PmmUnrefPage(pagePhys);
         }
     }
     PmmFreePage(tablePhys);
 }
 
-void VmmDestroyUserPageTable(PageTable pt)
+void VmmDestroyUserPageTable(PageTable pt, bool preserveBorrowedDevices)
 {
     if (!pt) return;
 
@@ -934,7 +940,7 @@ void VmmDestroyUserPageTable(PageTable pt)
     for (uint64_t i = 0; i < 256; i++)
     {
         if (!(pml4[i] & VMM_PRESENT)) continue;
-        FreeTableLevel(PhysicalAddress(pml4[i] & PHYS_MASK), 3);
+        FreeTableLevel(PhysicalAddress(pml4[i] & PHYS_MASK), 3, preserveBorrowedDevices);
     }
 
     PmmFreePage(pt.pml4);

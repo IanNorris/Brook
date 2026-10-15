@@ -1352,7 +1352,7 @@ void TerminalResize(Terminal* t, uint32_t newW, uint32_t newH)
         uint64_t newPages = (newSize + 4095) / 4096;
         for (uint32_t mi = 0; mi < Process::MAX_FB_MAPS; ++mi)
         {
-            auto& m = t->child->fbMaps[mi];
+            auto& m = t->child->addressSpace->fbMaps[mi];
             if (m.length == 0) continue;
             uint64_t mapPages = m.length / 4096;
             for (uint64_t i = 0; i < mapPages; ++i)
@@ -1363,14 +1363,14 @@ void TerminalResize(Terminal* t, uint32_t newW, uint32_t newH)
                     VirtualAddress newKva(newKernVa + i * 4096);
                     PhysicalAddress np = VmmVirtToPhys(KernelPageTable, newKva);
                     if (!np) continue;
-                    VmmUnmapPage(t->child->pageTable, uva);
-                    VmmMapPage(t->child->pageTable, uva, np,
+                    VmmUnmapPage(t->child->addressSpace->pageTable, uva);
+                    VmmMapPage(t->child->addressSpace->pageTable, uva, np,
                                VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
                                MemTag::Device, t->child->pid);
                 }
                 else
                 {
-                    VmmUnmapPage(t->child->pageTable, uva);
+                    VmmUnmapPage(t->child->addressSpace->pageTable, uva);
                 }
             }
             // Truncate the recorded mapping so munmap doesn't try to
