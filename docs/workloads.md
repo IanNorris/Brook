@@ -315,8 +315,10 @@ ignored `build/workloads/cachecow-baseline-20261015/` and
 `build/workloads/firefox-cache-20261015/`. The 13 focused compatibility gates and FAT/ext2 exit/truncate gates passed,
 followed by heap integrity, checked shutdown and all three offline filesystem
 checks. After reboot, persisted fixtures and the focused gates passed again.
-The Firefox retry remains pending. Both full bootstrap paths still need a fresh
-acceptance run for the combined changes.
+Both full bootstrap paths subsequently passed at `e5dd9aa`, including repeated
+13-test suites, guest-built-kernel boots and all offline filesystem checks. See
+[bootstrap acceptance](bootstrap.md#matching-acceptance-after-browser-compatibility-fixes-2026-10-15).
+The Firefox retry remains under investigation.
 
 ## File resizing prerequisite
 

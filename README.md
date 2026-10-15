@@ -76,7 +76,7 @@ the table distinguishes tested behavior from remaining limitations.
   guest `nix-install`, clones and builds Brook, passes all 13 native tests,
   then boots the guest-built kernel and passes them again. Offline checks of
   both filesystems pass before and after that boot. Both clean-image and
-  prepared-SDK paths passed at revision `e70ff31`; see
+  prepared-SDK paths passed at revision `e5dd9aa`; see
   [bootstrap testing](docs/bootstrap.md) for the validation scope.
 - **Storage correctness and speed:** unlink-while-open, rename-overwrite,
   directory removal and inode reuse now have guest lifetime checks plus offline

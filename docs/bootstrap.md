@@ -572,3 +572,45 @@ the clean counterpart is
 `f3aef5bb45c7369903a009083962440098bac122a7eda7a6656985b80dad2b62`.
 Artifact hashes are checked against the booted copies, rather than claiming
 byte-identical reproducible builds between the two paths.
+
+
+### Matching acceptance after browser compatibility fixes (2026-10-15)
+
+Both paths passed again at `e5dd9aa862cc3542886823aec8c624bd69ef85d2`,
+including the pending Unix connection lifetime fix, memfd permissions and
+preallocation, user GS preservation, and ext2 copyout/cache-lock correction.
+The latter has a separate concurrent CoW/file-fault regression that reproduced
+the previous kernel's deadlock and passes the fixed kernel.
+
+Each acceptance run used eight vCPUs, 4 GiB RAM, isolated disk-backed images,
+software graphics and silent audio. Each passed all 13 hosted tests twice,
+then booted its own extracted kernel/EFI/modules and passed all 13 again.
+All four VMs stopped with checked sync; all twelve final offline filesystem
+checks returned zero. The clean image installed its SDK through guest Nix.
+
+| Guest stage | Prepared SDK | Clean image |
+|---|---:|---:|
+| SDK installation through nix-install | Already installed | 43 s |
+| HTTPS clone | 16 s | 11 s |
+| Submodule update | 20 s | 19 s |
+| Kernel/module/test build | 38 s | 37 s |
+| Native-test compilation | 8 s | 7 s |
+| Native-test run | 5 s | 6 s |
+| Warm native rebuild | 7 s | 7 s |
+| Warm native-test run | 5 s | 5 s |
+| Incremental kernel build | 2 s | 2 s |
+
+These are individual instrumented runs with uncontrolled host caches. They do
+not establish a speedup over earlier runs. The clean run disabled further
+profiling after an export timeout; its completed build/test timing markers
+remain available. Prepared captures also dropped records, so their retained
+sample proportions are not an unbiased CPU-time breakdown.
+
+Evidence: ignored `build/experiments/results/bootstrap-{prepared,clean}-e5dd9aa-disk/`.
+The prepared guest-built kernel SHA-256 is
+`18db398ad1b336c1114653ad9bb279223ff35a8a1dffab5ea662de5df04688de`;
+the clean counterpart is
+`42156b8d88e71fd91d3a9670d8676614722798535b7c9b3a5282fc41b10ed081`.
+The verifier checks these hashes against the booted kernels. Browser/editor
+usability and general writable shared-file mappings remain separate workload
+requirements.

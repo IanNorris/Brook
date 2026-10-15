@@ -483,3 +483,10 @@ launcher refresh passed guest acceptance on 15 October; see
 [desktop-settings.md](desktop-settings.md). The graphical app store, runtime
 conversion of icons not preconverted by the image builder, terminal-only
 desktop-entry launching and smaller-display acceptance remain outstanding.
+
+
+- Investigate profiling export timeouts and dropped records under the bootstrap
+  workload. The prepared `e5dd9aa` run retained 2,280 compile CPU samples but
+  reported 12,060 dropped records; the clean run disabled further captures after
+  an export timeout. Preserve exact loss accounting and avoid treating retained
+  proportions as an unbiased performance profile.
