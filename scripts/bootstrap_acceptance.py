@@ -279,6 +279,9 @@ def monitor(directory, session, data, deadline):
                 validate_finished_build(text)
                 return stages, snapshots, profiles
         seen = len(markers)
+        # A stopped VM with no completion marker cannot make progress. Use
+        # the registry's PID/incarnation check, not a stale state field.
+        server.load_session(session)
         now = time.monotonic()
         if capture and now >= capture["finish_after"]:
             try:

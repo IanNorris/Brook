@@ -10,7 +10,7 @@ import bootstrap_acceptance as acceptance
 
 
 class ObserverTests(unittest.TestCase):
-    def run_observer(self, failed_action, complete=True):
+    def run_observer(self, failed_action, complete=True, live_error=None):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             serial = directory/'serial.log'
@@ -39,6 +39,7 @@ class ObserverTests(unittest.TestCase):
                  patch.object(acceptance.time, 'sleep', sleep), \
                  patch.object(acceptance.server, 'profile', profile), \
                  patch.object(acceptance.server, 'guest', return_value={}), \
+                 patch.object(acceptance.server, 'load_session', return_value={}, side_effect=live_error), \
                  patch.object(acceptance.server, 'panic_state', return_value=False), \
                  contextlib.redirect_stdout(io.StringIO()):
                 result = acceptance.monitor(directory, 'fixture', {'serial_log': str(serial)}, 20)
@@ -60,6 +61,10 @@ class ObserverTests(unittest.TestCase):
     def test_profiling_failure_does_not_relax_acceptance_evidence(self):
         with self.assertRaisesRegex(RuntimeError, 'missing required test/artifact evidence'):
             self.run_observer('export', complete=False)
+
+    def test_stopped_vm_without_completion_fails_instead_of_waiting(self):
+        with self.assertRaisesRegex(RuntimeError, 'VM process is no longer running'):
+            self.run_observer('export', live_error=RuntimeError('VM process is no longer running'))
 
 
 if __name__ == '__main__':
