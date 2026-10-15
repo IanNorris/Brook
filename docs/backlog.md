@@ -386,3 +386,42 @@ map/ref ownership on import, release and process teardown after the current
 storage performance work. Local evidence is under
 `build/showcase/stk-fixed/game-ext2/`, including warning counts, all warnings,
 post-race process state, stop acknowledgement and filesystem checks.
+
+## Compatibility limits audit (requested 15 October 2026)
+
+Audit fixed limits across the kernel, drivers, userspace helpers and VM bridge
+before they become the next large-workload blocker. Codium exposed a concrete
+example: executable readers silently clipped a 193 MiB binary to 32 MiB. Earlier
+argument/environment, GPU-object and thread/resource limits show this is a
+recurring compatibility issue. This is a separate backlog investigation; the
+current Codium and showcase work continues.
+
+Inventory each limit with its source location, units, scope (per process,
+thread group, mount, device or system), allocation cost, error/overflow behavior
+and workloads likely to reach it. Distinguish required architectural/ABI bounds
+from implementation budgets and historical convenience constants. Check both
+producer and consumer sides: raising one array or counter can expose a smaller
+queue, buffer, field or address range elsewhere.
+
+Prioritize:
+
+- Silent truncation, ignored short reads/writes, clamped counts reported as
+  success, and integer-width/alignment overflow.
+- Executable/interpreter size and mapped span, brk/mmap/stack address ranges,
+  file mappings, segment counts and argument/environment buffers.
+- Processes, threads, file descriptors, futexes, waiters, timers and signal
+  queues; exhaustion, cleanup and recovery under concurrent churn.
+- Filesystem file/directory sizes, indirect blocks, paths/names, mount/open-file
+  tables, package-index and NAR/decompression buffers.
+- GPU resources, command/transfer sizes, fences and outstanding submissions;
+  display dimensions, windows, terminals and input queues.
+- Network sockets/backlogs, packet and message sizes, Unix ancillary data;
+  syscall/procfs interfaces that advertise capacities to applications.
+
+Rank findings by correctness risk and expected impact on Codium, Blender,
+Firefox/Chromium and concurrent showcase workloads. For each important bound,
+choose safe dynamic growth, a measured/configurable budget, or a justified
+fixed bound with an explicit error. Add boundary and exhaustion/recovery checks
+where failures could corrupt state or silently change results. Record remaining
+limits and make advertised capabilities agree with actual implementation.
+Do not resolve the audit by raising every constant indiscriminately.
