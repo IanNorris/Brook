@@ -151,3 +151,20 @@ The shared-memory inode mismatch and earlier thread-discovery fatal are gone.
 Codium still hits a user-mode Chromium thread breakpoint before showing an
 editor. A successful package install or CLI launcher exit is not a working
 editor acceptance result. Inotify and netlink support are also still missing.
+
+A subsequent software-rendered run with the Wayland server active, kernel
+`8729d7ee097d225dbc093f775bdacfe21104ea5b20d70b87adc731db1de5d7fe`,
+confirmed a writable regular-file `MAP_SHARED` rejection for 262,144 bytes
+at offset zero (`prot=3`, `flags=1`, `EOPNOTSUPP`). The following breakpoint
+matches Chromium's `FieldTrialAllocator` startup path. The temporary diagnostic
+was removed after collecting this evidence in bridge session
+`7a03c37188334fae92a8fa8eccfa4c4c`. A separate hardware-rendered run also
+encountered an earlier roughly 2 MiB Mesa shared-file mapping rejection.
+
+Regular-file `ftruncate` and `truncate` are currently success-only stubs; shared
+file pages, ordinary I/O coherence and dirty writeback are also missing.
+These require actual filesystem and mapping support, rather than making a
+private copy and reporting successful shared mapping. The `/dev/shm` synthetic
+namespace additionally needs proper entry references and unlink behavior before
+it can provide a reliable alternative shared-memory path. These remain open
+compatibility work; neither Codium nor Chromium is accepted yet.
