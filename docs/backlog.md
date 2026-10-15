@@ -1,5 +1,15 @@
 # Recovery and VM-control backlog
 
+## Mounted filesystem module unload
+
+Checked VFS unmount retains a mount when synchronization fails. Module unload
+still calls a void module-exit callback and then frees the module's code; the
+ext4 exit callback also bypasses VfsUnmount. Hot-unloading a mounted filesystem
+therefore cannot honor failed-unmount refusal or protect active mount callbacks.
+Keep mounted filesystem modules loaded. A future fix needs checked unload and
+mount/module lifetime ownership; normal bridge sync and VFS unmount do not
+establish hot-unload safety.
+
 Updated 14 October 2026. The next focus is the VM-control MCP; branch recovery
 investigations below are deferred. This is a local project backlog, not a set
 of externally created issues. See [branch-recovery.md](branch-recovery.md) for
@@ -329,3 +339,50 @@ checks in roughly 23 seconds. The candidate on
 scheduling costs before merging it; preserve failure propagation and inode
 accounting checks while tuning. Resume complete two-path bootstrap acceptance
 after this prerequisite; the clean checkpoint is diagnostic, not a pass.
+
+## Next workload and showcase sequence (15 October 2026)
+
+Priority is performance and bootstrap acceptance first, then real workload
+coverage, then recording and visual polish. Keep application failures and their
+reproducers alongside each experiment rather than treating launch as success.
+
+- Work with Astra on the taskbar, app launcher and window chrome: improve
+  spacing, typography, icons and visual consistency.
+- Improve file-browser icons, text readability and font rendering. Ship open
+  source fonts such as Noto Sans for Brook tools; preserve a suitable monospace
+  font for terminals and code.
+- Add a launcher/configuration flag for the guest timezone, supporting an IANA
+  zone such as Europe/London rather than hardcoding today's UTC offset as
+  permanent DST behavior.
+- Exercise Vim, Emacs or Helix in a shell with editing, saving and reopening.
+- Run Rust and C++ compile/edit/run workloads; prepare a live coding example for
+  the showcase, with actual compiler output and a running result.
+- Test VS Code or VSCodium as a usable editor, then Blender as an interactive
+  workload. Record missing syscalls, rendering/input failures and performance.
+- Prioritize a usable Firefox or Chromium browser after the preceding
+  compatibility checks, including real page navigation and interaction.
+- Implement VM-only video recording with synchronized audio, then rehearse the
+  live tour described in [showcase.md](showcase.md).
+
+
+### RUN-06 — GPU resource mapping accounting during SuperTuxKart teardown
+
+SuperTuxKart 1.5 completed a timed Lighthouse AI race on the eight-core, 4 GiB
+virgl VM `0ac11e61f9d245468d1c7a452301397b` with kernel
+`af3d143c36e7b93a1e5d0c38df466deeb46973cd94cf527538cd8971f5a97948`.
+After the game window closed, guest `procs` contained neither the main process
+nor its workers. That run did not preserve a numeric application exit code.
+Cleanup logged exactly 2,976 `BRO176-MAPLEAK` warnings followed by 2,976
+`BRO176-MAPUNDERFLOW` warnings. Sample physical pages are `0x124852000`,
+`0x15c5b9000`, and `0x126a77000`; the leak messages identify Device-tagged pages
+with mapCount=1, while subsequent decrements see mapCount=0. Current warning
+instrumentation does not print caller traces, so the responsible mapping and
+unmapping paths remain unproven.
+
+The VM remained responsive, completed guest sync, and both data and Nix disks
+passed offline `e2fsck -fn` with status 0. This does not establish correct GPU
+resource lifetime accounting. Preserve the original images/logs and investigate
+map/ref ownership on import, release and process teardown after the current
+storage performance work. Local evidence is under
+`build/showcase/stk-fixed/game-ext2/`, including warning counts, all warnings,
+post-race process state, stop acknowledgement and filesystem checks.

@@ -726,6 +726,16 @@ static void refresh_desktop_entries(void)
                                     categories, sizeof(categories)) != 0)
                 continue;
 
+            /* Use the deployed Brook wrapper without changing the stock closure.
+             * Its XDG state lives on ext2, rather than the boot FAT filesystem. */
+            if (access("/nix/stk-play.sh", R_OK) == 0 &&
+                (strcmp(exec_cmd, "supertuxkart") == 0 ||
+                 strncmp(exec_cmd, "supertuxkart ", 13) == 0)) {
+                char arguments[sizeof(exec_cmd)];
+                snprintf(arguments, sizeof(arguments), "%s", exec_cmd + 12);
+                snprintf(exec_cmd, sizeof(exec_cmd), "--uid 1000 /nix/stk-play.sh%s", arguments);
+            }
+
             /* Deduplicate by name */
             int dup = 0;
             for (int i = 0; i < seen_count; i++) {
@@ -828,6 +838,11 @@ static int cmd_install(const char *name) {
             printf("  re-linked %d library file(s) in %s\n", lib_linked, PROFILE_LIB);
         if (rpath_linked > 0)
             printf("  re-linked %d runtime library file(s) beside package binaries\n", rpath_linked);
+        /* Also refresh a previously installed STK entry after deploying its wrapper. */
+        if (access("/nix/stk-play.sh", R_OK) == 0 &&
+            (strcmp(name, "supertuxkart") == 0 ||
+             strncmp(name, "supertuxkart-", 13) == 0))
+            refresh_desktop_entries();
         return 0;
     }
 

@@ -35,7 +35,7 @@ ICON_SIZE = 24  # Target icon size in pixels
 # wrapper is only needed for those per-app concerns. Keyed on the raw Exec's
 # first token (binary basename).
 EXEC_OVERRIDE = {
-    'supertuxkart': '/nix/stk-play.sh',
+    'supertuxkart': '--uid 1000 /nix/stk-play.sh',
 }
 
 # Games that ship NO .desktop file but have a Brook play wrapper. Each is added

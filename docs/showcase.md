@@ -48,34 +48,67 @@ The bridge's GPU readback briefly pauses the VM and is useful for stills.
 Repeated readbacks are unsuitable for measuring rendering performance or
 recording a smooth video.
 
-## Proposed scene demo
+## Live one-take tour
 
-A short, scripted reel would work well: a boot logo and quiet desktop, a
-browser interaction, a Writer edit, 720p media playback, then a hardware Quake
-demo and a return to the desktop. Add SuperTuxKart and GLtron after their
-current launch/rendering paths are verified. A failing app should not be
-represented by a launcher icon or a fabricated screenshot.
+The target is a real OS demonstration in one continuous take, without edits.
+Start Brook, launch a simple text editor with comfortably readable type, and
+enter:
 
-Use the VM bridge to prepare each scene and perform repeatable input actions.
-Warm up each application before recording its clip; use readiness events or
-visible checkpoints rather than assuming it loads at a fixed time. Quake's
-recorded Installation demo gives a repeatable moving scene without requiring
-mouse capture.
+> Brook - a from scratch OS with Linux compatibility
+>
+> A quick tour. One take, no edits.
 
-For continuous capture, the promising next step is a private QEMU D-Bus
-display listener: receive VM display updates and audio directly, including
-the GPU's DMA-BUF path where available. This avoids capturing the user's
-desktop. QEMU documents both display and audio listener interfaces; choosing
-an interface does not yet implement or validate the recorder.
+Then launch progressively more demanding applications, keeping earlier apps
+running. Bring each window forward on a musical cue. Background or minimized
+launches will be needed so readiness can be established before a window's cue;
+that behavior still needs implementation and verification. The OS itself is
+the demonstration, including real input and visible application responses.
+
+Potential scenes are terminal editing and live Rust/C++ compilation, browser
+navigation, a Writer document, 720p media playback, Quake's recorded Installation
+demo, SuperTuxKart and GLtron. A full editor, Blender and Firefox/Chromium join
+the tour only after they are usable. Simultaneous-app stability, readable UI
+text, predictable focus, safe app shutdown and performance come before a final
+recording. A loading screen or launcher icon does not establish a working app.
+
+The selected soundtrack is **Brook 2000.mp3**, supplied separately: 3:09.213,
+stereo at 48 kHz. Keep the MP3 outside Git. Its beat markers and suitable scene
+cues still need measurement; no tempo has been assumed. Play and capture the
+music in synchronization with the continuous take, rather than assembling
+separate clips to disguise startup or stability issues.
+
+Use the VM bridge to rehearse repeatable actions and inspect readiness. For
+continuous recording, investigate a private QEMU D-Bus display/audio listener,
+including GPU DMA-BUF updates where available. This captures the VM directly
+and avoids the user's host desktop. QEMU documents those listener interfaces;
+the recorder has not yet been implemented or validated.
 [QEMU D-Bus display documentation](https://www.qemu.org/docs/master/interop/dbus-display.html).
 
-Record a native 1080p master with timestamps and frame-drop counters. Keep
-real app audio as a separate track, then assemble warmed clips to music
-offline. For example, 120 BPM gives eight seconds per four-bar phrase in 4/4;
-a 96-second reel can use twelve phrases. Cut on phrase boundaries, hold UI
-interactions long enough to read them, and reserve fast cuts for game footage.
-The selected soundtrack is **Brook 2000.mp3**, supplied separately: 3:09.213,
-stereo at 48 kHz. Keep that source audio outside Git. Beat markers and scene
-cuts still need to be mapped to the track; the 120 BPM example above is a
-planning example, not a measured tempo for this music. A final movie has not
-been produced yet.
+Record a native 1080p master with timestamps, audio synchronization and
+frame-drop counters. Preserve the unedited take and the action/cue log so its
+behavior can be reproduced. A final movie has not been produced yet.
+
+
+### SuperTuxKart launcher and verified run
+
+SuperTuxKart 1.5 installed through guest `nix-install` in about 119 seconds,
+including its roughly 718 MB asset package, on the validated eight-core,
+4 GiB kernel `af3d143c36e7b93a1e5d0c38df466deeb46973cd94cf527538cd8971f5a97948`.
+The native 1920×1080 capture shows an 800×600 Lighthouse AI race through virgl,
+OpenGL 4.3 and Mesa 26.0.6 on the host Intel UHD Graphics 630.
+
+The tracked `/nix/stk-play.sh` wrapper redirects HOME and all writable XDG
+state to `/data/home/supertuxkart-$UID`, on ext2. User and root launches have
+separate state directories; the Apps entry and STK scenario scripts launch as
+uid 1000. Fresh experiment images and `update_nix_disk.sh --tools` deploy the
+wrapper and `/nix/bin/brook-supertuxkart` alias. The stock STK closure is unchanged.
+Its OpenAL backend is null for silent testing. Launch manually with
+`run --uid 1000 /nix/stk-play.sh`, or add `--race-now --track=lighthouse
+--numkarts=4 --profile-time=180` for the controlled race.
+
+The first successful timed race removed every app thread, completed guest sync,
+and left both ext2 images with offline filesystem-check status 0. It also emitted
+mapping accounting warnings during teardown; [RUN-06](backlog.md#run-06--gpu-resource-mapping-accounting-during-supertuxkart-teardown)
+records the evidence. A later window-resize test produced native 1280×719 buffers
+but bridge frame requests timed out. The selected screenshot predates that resize;
+it establishes real gameplay, rather than resize or teardown stability.

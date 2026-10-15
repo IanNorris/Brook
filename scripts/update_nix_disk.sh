@@ -144,6 +144,8 @@ if [ "${UPDATE_TOOLS}" -eq 1 ]; then
     # stale /nix/bin/nix directory, which ln -sf will not replace.
     rm -rf "${MNTDIR}/bin/nix"
     ln -sfnT nix-install "${MNTDIR}/bin/nix"
+    install -m 755 "${ROOT_DIR}/data/nix-wrappers/stk-play.sh" "${MNTDIR}/stk-play.sh"
+    install -m 755 "${ROOT_DIR}/data/nix-wrappers/stk-play.sh" "${MNTDIR}/bin/brook-supertuxkart"
 
     # Bundle curl, xz binaries and CA certs from the on-disk store so
     # nix-fetch finds them at stable paths (/nix/bin/curl, /nix/bin/xz,

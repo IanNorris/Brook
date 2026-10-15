@@ -44,6 +44,7 @@ the table distinguishes tested behavior from remaining limitations.
 | [DOOM](https://github.com/ozkl/doomgeneric) | 1.9 | ✅ Working | Runs in a WM window or full-screen, with keyboard input |
 | [Quake 2 / Yamagi](https://www.yamagi.org/quake2/) | 8.60 | ✅ Gameplay | Software and hardware virgl GL3 renderers, startup demo, OSS audio and OGG music; mouse capture and intermittent audio timing remain open |
 | [GLtron](https://www.gltron.org/) | 0.70 | ⚠️ Experimental | Compatibility launcher installs through guest `nix-install`; hardware virgl menu and light-cycle gameplay verified, with sound disabled |
+| [SuperTuxKart](https://supertuxkart.net/) | 1.5 | ⚠️ Experimental | Guest package installation and virgl Lighthouse AI race verified; writable state uses ext2; GPU teardown accounting remains under investigation |
 | [busybox](https://busybox.net/) | 1.36 | ✅ Working | ls, cat, echo, wc, head, tail, grep, and many more |
 | [TCC](https://bellard.org/tcc/) | 0.9.27 | ✅ Working | Compiles and runs C programs natively on Brook |
 | [CoreMark](https://www.eembc.org/coremark/) | 1.0 | ✅ Working | CPU benchmark, runs to completion |
@@ -173,6 +174,12 @@ New captures use native 1920×1080 without upscaling. See
 </p>
 
 <p align="center"><em>GLtron installed by Brook's guest package manager and rendered through hardware virgl — sound disabled by its compatibility launcher</em></p>
+
+<p align="center">
+  <a href="docs/images/brook_supertuxkart_1080.png"><img src="docs/images/brook_supertuxkart_1080.png" alt="SuperTuxKart Lighthouse AI race with virgl rendering on Brook" width="960"></a>
+</p>
+
+<p align="center"><em>SuperTuxKart 1.5 driving the Lighthouse track after installation through Brook's guest package manager</em></p>
 
 <p align="center">
   <a href="docs/images/brook_vlc_720p_1080.png"><img src="docs/images/brook_vlc_720p_1080.png" alt="VLC playing Big Buck Bunny at 720p on Brook's native 1080p desktop" width="960"></a>

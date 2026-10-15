@@ -36,6 +36,11 @@ def install_package_tools(nix_root, manifest):
             str(ROOT / "tools" / name / (name + ".c")))
         manifest["assets"][name] = digest(target)
     (nix_root / "bin/nix").symlink_to("nix-install")
+    stk_wrapper = ROOT / "data/nix-wrappers/stk-play.sh"
+    for target in [nix_root / "stk-play.sh", nix_root / "bin/brook-supertuxkart"]:
+        shutil.copy2(stk_wrapper, target)
+        target.chmod(0o755)
+    manifest["assets"]["stk-play.sh"] = digest(stk_wrapper)
     for name in ["curl", "xz", "zstd"]:
         (nix_root / "bin" / name).symlink_to("../profile/bin/" + name)
     (nix_root / "index").mkdir()
