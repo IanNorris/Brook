@@ -29,7 +29,9 @@ namespace brook {
 // Version 4 added real link counts, typed removal and busy-unmount checks to VFS.
 // Version 3 added timestamps and creation/chmod modes. Version 2 belonged to
 // an archived, incompatible GPU experiment and must never be reused.
-static constexpr uint32_t MODULE_ABI_VERSION = 6;
+// ABI 7 appends VnodeOps::truncate and adds per-thread file-fault ownership
+// to Process; rebuild all modules against both updated layouts.
+static constexpr uint32_t MODULE_ABI_VERSION = 7;
 
 // Magic bytes at the start of every valid ModuleInfo.
 static constexpr uint32_t MODULE_MAGIC = 0x4B524F42; // 'BROK'

@@ -135,6 +135,15 @@ static inline void VnodeHandleUnref(Vnode* vn)
         VfsClose(vn);
 }
 
+void ProcessReleaseFileFault(Process* proc)
+{
+    if (!proc) return;
+    Vnode* vn = __atomic_exchange_n(&proc->activeFileFaultVnode, nullptr, __ATOMIC_ACQ_REL);
+    if (!vn) return;
+    VfsFileMapUnpin(vn);
+    VnodeHandleUnref(vn);
+}
+
 static void ProcessClearLazyMappings(Process* proc)
 {
     if (!proc) return;
@@ -174,7 +183,7 @@ static void ProcessClearLazyMappings(Process* proc)
         m.vnode = nullptr;
         m.vaddr = 0; m.length = 0; m.offset = 0; m.vmmFlags = 0;
         SpinLockRelease(&proc->fileMapLock);
-        if (vn) VnodeHandleUnref(vn);
+        if (vn) { VfsFileMapUnpin(vn); VnodeHandleUnref(vn); }
     }
 }
 
@@ -955,6 +964,8 @@ void ProcessDestroy(Process* proc)
 
     // Release any kernel mutexes held by this process (prevents deadlock)
     Ext2ForceUnlockForPid(proc->pid);
+    VfsForceUnlockForPid(proc->pid);
+    ProcessReleaseFileFault(proc);
 
     // Threads don't own FDs — the leader does. Kernel threads never had
     // an fd table allocated (proc->fds is NULL), so skip the close loop
@@ -1293,6 +1304,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
 
     // Copy entire parent process struct as a starting point
     memcpy(child, parent, sizeof(Process));
+    child->activeFileFaultVnode = nullptr;
     child->fdLock.next = child->fdLock.serving = 0;
     child->fileMapLock.next = child->fileMapLock.serving = 0;
     child->magic = PROCESS_MAGIC;
@@ -1412,8 +1424,10 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
         if (child->memfdMaps[i].length && child->memfdMaps[i].mfd)
             brook::MemFdHandleRef(child->memfdMaps[i].mfd);
     for (uint32_t i = 0; i < Process::MAX_FILE_MAPS; ++i)
-        if (child->fileMaps[i].length && child->fileMaps[i].vnode)
+        if (child->fileMaps[i].length && child->fileMaps[i].vnode) {
+            VfsFileMapClone(child->fileMaps[i].vnode);
             __atomic_fetch_add(&child->fileMaps[i].vnode->refCount, 1, __ATOMIC_RELEASE);
+        }
     SpinLockRelease(&mapOwner->fileMapLock);
 
     // Copy writable private pages; shared memfd pages retain object backing.
@@ -1553,6 +1567,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
 
     // Copy parent process struct as starting point
     memcpy(thread, parent, sizeof(Process));
+    thread->activeFileFaultVnode = nullptr;
     thread->magic = PROCESS_MAGIC;
     thread->incarnation = NextIncarnation();
     // Allocate TID (threads get unique PIDs but share tgid)

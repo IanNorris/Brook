@@ -406,6 +406,9 @@ struct Process
     struct FileMap { uint64_t vaddr; uint64_t length; uint64_t offset; uint64_t vmmFlags; Vnode* vnode; };
     FileMap fileMaps[MAX_FILE_MAPS];
     SpinLock fileMapLock;  // protects fileMaps vnode load+ref
+    // Per-thread, never inherited by fork/clone. Owns one backing pin and
+    // vnode ref until the synchronous file fault returns or off-CPU teardown.
+    Vnode* activeFileFaultVnode;
 
     // /dev/fb0 mmap ranges — recorded so sys_munmap can unmap without
     // freeing the underlying physical pages, which are owned by
@@ -708,6 +711,7 @@ void FinalizeClosedFd(const FdClaimResult& c);
 
 // Close all file descriptors for a process (called at exit time).
 // Properly handles pipe refcounting and wakes blocked readers/writers.
+void ProcessReleaseFileFault(Process* proc);
 void ProcessCloseAllFds(Process* proc);
 void ProcessCloseCloexecFds(Process* proc); // close FD_CLOEXEC fds on execve
 

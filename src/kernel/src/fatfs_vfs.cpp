@@ -66,6 +66,7 @@ struct FatFsMountData {
     FATFS fs;
     uint8_t pdrv;
     FatOpenFile* writableFiles;
+    FatOpenFile* allFiles;
     int deferredCloseError;
 };
 
@@ -75,6 +76,9 @@ struct FatOpenFile {
     FIL fil;
     FatFsMountData* mount;
     FatOpenFile* next;
+    FatOpenFile* allNext;
+    bool cacheLoading;
+    bool cacheInvalidated;
     bool writable;
     bool closing;
 };
@@ -84,6 +88,50 @@ static void RemoveWritableFile(FatOpenFile* file)
     auto** link = &file->mount->writableFiles;
     while (*link && *link != file) link = &(*link)->next;
     if (*link) *link = file->next;
+}
+
+static void RemoveAllFile(FatOpenFile* file)
+{
+    auto** link = &file->mount->allFiles;
+    while (*link && *link != file) link = &(*link)->allNext;
+    if (*link) *link = file->allNext;
+}
+
+static bool SameFatFile(const FIL* a, const FIL* b)
+{
+    return a->obj.fs == b->obj.fs && a->dir_sect == b->dir_sect && a->dir_ptr == b->dir_ptr;
+}
+
+static FRESULT CheckedFatSync(FIL* fil, bool closing);
+
+// Flush private sector windows before another FIL mutates the same allocation.
+static int PrepareFatMutation(FatOpenFile* file, bool flushSelf = true)
+{
+    for (auto* other = file->mount->allFiles; other; other = other->allNext) {
+        if (!SameFatFile(&file->fil, &other->fil)) continue;
+        if (other->cacheLoading) return -16;
+        if (other->writable && (flushSelf || other != file)) {
+            FRESULT r = CheckedFatSync(&other->fil, false);
+            if (r != FR_OK) return FrToErrno(r);
+        }
+    }
+    return 0;
+}
+
+static void PublishFatMutation(FatOpenFile* file)
+{
+    for (auto* other = file->mount->allFiles; other; other = other->allNext) {
+        if (!SameFatFile(&file->fil, &other->fil)) continue;
+        other->cacheInvalidated = true;
+        if (other == file) continue;
+        other->fil.obj.objsize = file->fil.obj.objsize;
+        other->fil.obj.sclust = file->fil.obj.sclust;
+        // Caller flushed all sector windows. Force next operation to seek and
+        // reload; logical OFD offsets belong to FdEntry, not this FIL cursor.
+        other->fil.fptr = 0;
+        other->fil.clust = 0;
+        other->fil.sect = 0;
+    }
 }
 
 static void EnsureLock()
@@ -219,6 +267,7 @@ static int FatFileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
 {
     FIL* fil = static_cast<FIL*>(vn->priv);
     KMutexLock(&g_fatLock);
+    if (*offset >= f_size(fil)) { KMutexUnlock(&g_fatLock); return 0; }
     if (f_tell(fil) != *offset) {
         FRESULT sres = f_lseek(fil, static_cast<FSIZE_t>(*offset));
         if (sres != FR_OK) {
@@ -238,6 +287,9 @@ static int FatFileWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offs
 {
     FIL* fil = static_cast<FIL*>(vn->priv);
     KMutexLock(&g_fatLock);
+    auto* file = reinterpret_cast<FatOpenFile*>(fil);
+    int ready = PrepareFatMutation(file, false);
+    if (ready) { KMutexUnlock(&g_fatLock); return ready; }
     if (f_tell(fil) != *offset) {
         FRESULT sres = f_lseek(fil, static_cast<FSIZE_t>(*offset));
         if (sres != FR_OK) {
@@ -247,6 +299,14 @@ static int FatFileWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offs
     }
     UINT bw = 0;
     FRESULT res = f_write(fil, buf, static_cast<UINT>(len), &bw);
+    // Only alias sharing requires an immediate flush. Keep the normal
+    // single-writer path buffered; open() flushes pending writers below.
+    bool aliases = false;
+    for (auto* other = file->mount->allFiles; other; other = other->allNext)
+        if (other != file && SameFatFile(fil, &other->fil)) { aliases = true; break; }
+    FRESULT sync = aliases ? CheckedFatSync(fil, false) : FR_OK;
+    PublishFatMutation(file);
+    if (res == FR_OK) res = sync;
     if (res != FR_OK) { KMutexUnlock(&g_fatLock); return FrToErrno(res); }
     *offset += bw;
     KMutexUnlock(&g_fatLock);
@@ -290,6 +350,7 @@ static void CloseFatFileLocked(FIL* fil)
         file->mount->deferredCloseError = FrToErrno(result);
     } else {
         if (file->writable) RemoveWritableFile(file);
+        RemoveAllFile(file);
         kfree(file);
     }
 }
@@ -404,13 +465,22 @@ static int FatStat(Vnode* vn, VnodeStat* st)
 static int CachedFileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
 {
     auto* cf = static_cast<CachedFile*>(vn->priv);
-    if (*offset >= cf->size) return 0;
-    uint64_t avail = cf->size - *offset;
-    if (len > avail) len = avail;
-    auto* dst = static_cast<uint8_t*>(buf);
-    auto* src = cf->data + *offset;
-    memcpy(dst, src, len);
+    KMutexLock(&g_fatLock);
+    auto* file = reinterpret_cast<FatOpenFile*>(cf->fil);
+    if (file->cacheInvalidated) {
+        if (*offset >= f_size(cf->fil)) { KMutexUnlock(&g_fatLock); return 0; }
+        FRESULT r = f_lseek(cf->fil, static_cast<FSIZE_t>(*offset));
+        UINT count = 0;
+        if (r == FR_OK) r = f_read(cf->fil, buf, static_cast<UINT>(len), &count);
+        if (r == FR_OK) *offset += count;
+        KMutexUnlock(&g_fatLock);
+        return r == FR_OK ? static_cast<int>(count) : FrToErrno(r);
+    }
+    if (*offset >= cf->size) { KMutexUnlock(&g_fatLock); return 0; }
+    if (len > cf->size - *offset) len = cf->size - *offset;
+    memcpy(buf, cf->data + *offset, len);
     *offset += len;
+    KMutexUnlock(&g_fatLock);
     return static_cast<int>(len);
 }
 
@@ -420,10 +490,9 @@ static void CachedFileClose(Vnode* vn)
     if (!cf) return;
     KMutexLock(&g_fatLock);
     int32_t refs = --cf->refCount;
-    if (refs <= 0) FileCacheRemove(cf);
+    if (refs <= 0) { FileCacheRemove(cf); CloseFatFileLocked(cf->fil); }
     KMutexUnlock(&g_fatLock);
     if (refs <= 0) {
-        if (cf->fil) f_close(cf->fil);
         if (cf->data) {
             uint64_t numPages = (cf->size + 4095) / 4096;
             VmmFreePages(VirtualAddress(reinterpret_cast<uint64_t>(cf->data)), numPages);
@@ -436,12 +505,41 @@ static int CachedFileStat(Vnode* vn, VnodeStat* st)
 {
     auto* cf = static_cast<CachedFile*>(vn->priv);
     KMutexLock(&g_fatLock);
-    st->size = cf->size;
+    st->size = f_size(cf->fil);
     st->isDir = false;
     st->isSymlink = false;
     const bool valid = FatFileIdentity(cf->fil, st);
     KMutexUnlock(&g_fatLock);
     return valid ? 0 : -FVFS_EIO;
+}
+
+static int FatFileTruncate(Vnode* vn, uint64_t size)
+{
+    if (size > 0xffffffffULL) return -27;
+    auto* file = static_cast<FatOpenFile*>(vn->priv);
+    uint8_t* zeros = static_cast<uint8_t*>(kmalloc(4096));
+    if (!zeros) return -12;
+    memset(zeros, 0, 4096);
+    KMutexLock(&g_fatLock);
+    int result = PrepareFatMutation(file);
+    FIL* fil = &file->fil;
+    if (!result) {
+        FRESULT r = f_lseek(fil, static_cast<FSIZE_t>(size < f_size(fil) ? size : f_size(fil)));
+        if (r == FR_OK && size < f_size(fil)) r = f_truncate(fil);
+        while (r == FR_OK && f_size(fil) < size) {
+            UINT count = 0;
+            UINT chunk = size - f_size(fil) > 4096 ? 4096 : size - f_size(fil);
+            r = f_write(fil, zeros, chunk, &count);
+            if (r == FR_OK && count != chunk) { result = -28; break; }
+        }
+        FRESULT sync = CheckedFatSync(fil, false);
+        PublishFatMutation(file);
+        if (!result && r != FR_OK) result = FrToErrno(r);
+        if (!result && sync != FR_OK) result = FrToErrno(sync);
+    }
+    KMutexUnlock(&g_fatLock);
+    kfree(zeros);
+    return result;
 }
 
 static const VnodeOps g_cachedFileOps = {
@@ -454,6 +552,7 @@ static const VnodeOps g_fatFileOps = {
     .open = FatFileOpen, .read = FatFileRead, .write = FatFileWrite,
     .readdir = nullptr, .close = FatFileClose, .stat = FatStat,
     .fsync = FatFileFsync,
+    .truncate = FatFileTruncate,
 };
 
 static const VnodeOps g_fatDirOps = {
@@ -505,6 +604,7 @@ static int FatFsSyncLocked(FatFsMountData* data)
         if (error != FR_OK && !result) result = FrToErrno(error);
         if (file->closing && error == FR_OK) {
             *link = file->next;
+            RemoveAllFile(file);
             kfree(file);
         } else {
             link = &file->next;
@@ -535,7 +635,7 @@ static int FatFsUnmount(void* mountPriv)
 
     KMutexLock(&g_fatLock);
     int result = FatFsSyncLocked(data);
-    if (!result && data->writableFiles) result = -16; // EBUSY: live writer
+    if (!result && data->allFiles) result = -16; // EBUSY: live FIL, including mapped readers
     if (!result) {
         FRESULT error = f_mount(nullptr, fatPath, 0);
         if (error != FR_OK) result = FrToErrno(error);
@@ -576,7 +676,7 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
             }
             if (!existing->data) {
                 KMutexLock(&g_fatLock);
-                existing->refCount--;
+                if (--existing->refCount == 0) kfree(existing);
                 KMutexUnlock(&g_fatLock);
                 return nullptr;
             }
@@ -595,6 +695,12 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
     }
 
     KMutexLock(&g_fatLock);
+    // FatFS keeps size/first-cluster metadata in each FIL. Publish pending
+    // writers before opening another FIL, then all mutations update aliases.
+    for (auto* writer = file->mount->writableFiles; writer; writer = writer->next) {
+        FRESULT sync = CheckedFatSync(&writer->fil, false);
+        if (sync != FR_OK) { KMutexUnlock(&g_fatLock); kfree(file); return nullptr; }
+    }
     FRESULT res = f_open(fil, fatPath, mode);
     if (res != FR_OK) {
         if (g_fatfsDebug)
@@ -602,6 +708,8 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
         KMutexUnlock(&g_fatLock);
     }
     if (res == FR_OK) {
+        file->allNext = file->mount->allFiles;
+        file->mount->allFiles = file;
         if (mode & (FA_WRITE | FA_CREATE_ALWAYS | FA_OPEN_ALWAYS)) {
             file->writable = true;
             file->next = file->mount->writableFiles;
@@ -613,6 +721,7 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
         static constexpr uint64_t CACHE_THRESHOLD = 64 * 1024;
         uint64_t fileSize = f_size(fil);
         if (!file->writable && fileSize >= CACHE_THRESHOLD) {
+            file->cacheLoading = true;
             auto* placeholder = static_cast<CachedFile*>(kmalloc(sizeof(CachedFile)));
             if (placeholder) {
                 placeholder->fil = fil; placeholder->data = nullptr;
@@ -627,6 +736,9 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
             KMutexUnlock(&g_fatLock);
 
             CachedFile* cf = CacheFileUnlocked(fil, fatPath);
+            KMutexLock(&g_fatLock);
+            file->cacheLoading = false;
+            KMutexUnlock(&g_fatLock);
             if (cf && placeholder) {
                 placeholder->data = cf->data;
                 placeholder->size = cf->size;
@@ -637,8 +749,13 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
                 vn->priv = placeholder; vn->refCount = 1; vn->cacheId = 0;
                 return vn;
             }
-            if (placeholder)
+            if (placeholder) {
+                KMutexLock(&g_fatLock);
+                FileCacheRemove(placeholder);
                 __atomic_store_n(&placeholder->loading, false, __ATOMIC_RELEASE);
+                if (--placeholder->refCount == 0) kfree(placeholder);
+                KMutexUnlock(&g_fatLock);
+            }
             if (cf) {
                 KMutexLock(&g_fatLock);
                 FileCacheInsert(cf);
@@ -757,11 +874,30 @@ static int FatFsStatPath(void* /*mountPriv*/, uint8_t pdrv,
     return 0;
 }
 
-static int FatFsUnlink(void* /*mountPriv*/, uint8_t pdrv, const char* relPath)
+// FatFS does not preserve unlinked or renamed open FILs (FF_FS_LOCK=0).
+// Reject moving their directory slots, including handles not mapped yet.
+static bool FatPathOpenLocked(FatFsMountData* mount, const char* path)
+{
+    FILINFO info;
+    if (f_stat(path, &info) != FR_OK) return false;
+    if (info.fattrib & AM_DIR) return mount->allFiles != nullptr;
+    FIL lookup;
+    if (f_open(&lookup, path, FA_READ) != FR_OK) return true;
+    bool busy = false;
+    for (auto* file = mount->allFiles; file; file = file->allNext)
+        if (SameFatFile(&lookup, &file->fil)) { busy = true; break; }
+    f_close(&lookup);
+    return busy;
+}
+
+static int FatFsUnlink(void* mountPriv, uint8_t pdrv, const char* relPath)
 {
     char fatPath[256];
     BuildFatPath(fatPath, sizeof(fatPath), pdrv, relPath);
     KMutexLock(&g_fatLock);
+    if (FatPathOpenLocked(static_cast<FatFsMountData*>(mountPriv), fatPath)) {
+        KMutexUnlock(&g_fatLock); return -16;
+    }
     FRESULT res = f_unlink(fatPath);
     KMutexUnlock(&g_fatLock);
     return (res == FR_OK) ? 0 : -1;
@@ -777,13 +913,17 @@ static int FatFsMkdir(void* /*mountPriv*/, uint8_t pdrv, const char* relPath)
     return (res == FR_OK || res == FR_EXIST) ? 0 : -1;
 }
 
-static int FatFsRename(void* /*mountPriv*/, uint8_t pdrv,
+static int FatFsRename(void* mountPriv, uint8_t pdrv,
                        const char* oldRelPath, const char* newRelPath)
 {
     char fatOld[256], fatNew[256];
     BuildFatPath(fatOld, sizeof(fatOld), pdrv, oldRelPath);
     BuildFatPath(fatNew, sizeof(fatNew), pdrv, newRelPath);
     KMutexLock(&g_fatLock);
+    auto* mount = static_cast<FatFsMountData*>(mountPriv);
+    if (FatPathOpenLocked(mount, fatOld) || FatPathOpenLocked(mount, fatNew)) {
+        KMutexUnlock(&g_fatLock); return -16;
+    }
     // POSIX rename atomically replaces destination; FatFS f_rename fails if
     // destination exists.  Delete the target first (ignore errors — it may
     // not exist).

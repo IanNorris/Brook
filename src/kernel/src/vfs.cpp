@@ -4,6 +4,7 @@
 #include "serial.h"
 #include "memory/virtual_memory.h"
 #include "sync/kmutex.h"
+#include "spinlock.h"
 
 // Forward-declare SchedulerYield — weak so test builds link without the scheduler.
 namespace brook { __attribute__((weak)) void SchedulerYield(); }
@@ -12,6 +13,17 @@ namespace brook {
 
 // Global lock protecting VFS mount table and filesystem operations.
 static KMutex g_vfsLock;
+
+// Namespace changes, initial mapping registration and resize are serialized.
+// Fork/split/unmap only touch the short registry spinlock below.
+static KMutex g_fileMutationLock;
+struct FileMutationGuard {
+    bool held;
+    explicit FileMutationGuard(bool needed = true) : held(needed) { if (held) KMutexLock(&g_fileMutationLock); }
+    ~FileMutationGuard() { if (held) KMutexUnlock(&g_fileMutationLock); }
+};
+static bool VfsMappedPathBusy(const char* path);
+static int VfsTruncateLocked(Vnode* vn, uint64_t size);
 
 // ---- Filesystem driver registry ----
 
@@ -460,6 +472,7 @@ Vnode* VfsOpen(const char* path, int flags)
 
 Vnode* VfsOpenMode(const char* path, int flags, uint16_t mode)
 {
+    FileMutationGuard mutation((flags & VFS_O_TRUNC) != 0);
     if (!path || !path[0]) return nullptr;
 
     char resolved[512];
@@ -476,10 +489,17 @@ Vnode* VfsOpenMode(const char* path, int flags, uint16_t mode)
     }
 
     if (!mount->fsOps) return nullptr;
+    // O_TRUNC must use the same resize gate and alias invalidation as truncate.
+    int openFlags = flags & ~VFS_O_TRUNC;
+    Vnode* vn = nullptr;
     if (mount->fsOps->open_mode)
-        return mount->fsOps->open_mode(mount->mountPriv, mount->pdrv, relPath, flags, mode);
-    if (!mount->fsOps->open) return nullptr;
-    return mount->fsOps->open(mount->mountPriv, mount->pdrv, relPath, flags);
+        vn = mount->fsOps->open_mode(mount->mountPriv, mount->pdrv, relPath, openFlags, mode);
+    else if (mount->fsOps->open)
+        vn = mount->fsOps->open(mount->mountPriv, mount->pdrv, relPath, openFlags);
+    if (vn && (flags & VFS_O_TRUNC) && VfsTruncateLocked(vn, 0)) {
+        VfsClose(vn); return nullptr;
+    }
+    return vn;
 }
 
 int VfsChmod(Vnode* vn, uint16_t mode)
@@ -521,6 +541,135 @@ int VfsWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset)
 {
     if (!vn || !vn->ops->write) return -1;
     return vn->ops->write(vn, buf, len, offset);
+}
+
+// Lazy mappings hold their vnode independently of file descriptors. Keep a
+// bounded identity registry so another open of the inode cannot resize it
+// while a fault is in flight. No filesystem I/O occurs under this spinlock.
+struct VfsMappedBacking {
+    Vnode* vnode;
+    uint64_t dev, ino;
+    uint32_t pins;
+    bool resizing;
+};
+static VfsMappedBacking g_mappedBackings[1024];
+static IrqSpinLock g_mappedBackingLock;
+
+int VfsFileMapPin(Vnode* vn)
+{
+    uint64_t irq = IrqSpinLockAcquire(&g_mappedBackingLock);
+    for (auto& entry : g_mappedBackings) {
+        if (entry.vnode == vn && entry.pins) {
+            ++entry.pins;
+            IrqSpinLockRelease(&g_mappedBackingLock, irq);
+            return 0;
+        }
+    }
+    IrqSpinLockRelease(&g_mappedBackingLock, irq);
+    FileMutationGuard mutation;
+    VnodeStat st;
+    int result = VfsStat(vn, &st);
+    if (result) return result;
+    // Namespace operations reject moving/removing a mapped FAT identity.
+    if (!st.dev || !st.ino) return -95;
+    irq = IrqSpinLockAcquire(&g_mappedBackingLock);
+    VfsMappedBacking* free = nullptr;
+    for (auto& entry : g_mappedBackings) {
+        if (!entry.vnode) { if (!free) free = &entry; continue; }
+        if (entry.dev == st.dev && entry.ino == st.ino && entry.resizing) {
+            IrqSpinLockRelease(&g_mappedBackingLock, irq);
+            return -16;
+        }
+        if (entry.vnode == vn) free = &entry;
+    }
+    if (free) {
+        if (!free->vnode) *free = {vn, st.dev, st.ino, 0, false};
+        ++free->pins;
+    }
+    IrqSpinLockRelease(&g_mappedBackingLock, irq);
+    return free ? 0 : -12;
+}
+
+// Called only when splitting/copying a mapping that already owns a pin. It
+// cannot allocate, fail, or enter filesystem code (fork holds fileMapLock).
+void VfsFileMapClone(Vnode* vn)
+{
+    uint64_t irq = IrqSpinLockAcquire(&g_mappedBackingLock);
+    for (auto& entry : g_mappedBackings)
+        if (entry.vnode == vn && entry.pins) { ++entry.pins; break; }
+    IrqSpinLockRelease(&g_mappedBackingLock, irq);
+}
+
+void VfsFileMapUnpin(Vnode* vn)
+{
+    uint64_t irq = IrqSpinLockAcquire(&g_mappedBackingLock);
+    for (auto& entry : g_mappedBackings) {
+        if (entry.vnode != vn || !entry.pins) continue;
+        if (!--entry.pins) entry = {};
+        break;
+    }
+    IrqSpinLockRelease(&g_mappedBackingLock, irq);
+}
+
+static int VfsTruncateLocked(Vnode* vn, uint64_t size)
+{
+    if (!vn) return -9;
+    if (size > 0x7fffffffffffffffULL) return -22;
+    if (vn->type == VnodeType::Dir) return -21;
+    if (!vn->ops || !vn->ops->truncate) return -95;
+    VnodeStat st;
+    int result = VfsStat(vn, &st);
+    if (result) return result;
+    uint64_t irq = IrqSpinLockAcquire(&g_mappedBackingLock);
+    VfsMappedBacking* slot = nullptr;
+    for (auto& entry : g_mappedBackings) {
+        if (!entry.vnode) { if (!slot) slot = &entry; continue; }
+        if (entry.dev == st.dev && entry.ino == st.ino) {
+            IrqSpinLockRelease(&g_mappedBackingLock, irq);
+            return -16;
+        }
+    }
+    if (slot) *slot = {vn, st.dev, st.ino, 0, true};
+    IrqSpinLockRelease(&g_mappedBackingLock, irq);
+    if (!slot) return -12;
+    result = vn->ops->truncate(vn, size);
+    irq = IrqSpinLockAcquire(&g_mappedBackingLock);
+    *slot = {};
+    IrqSpinLockRelease(&g_mappedBackingLock, irq);
+    return result;
+}
+
+int VfsTruncate(Vnode* vn, uint64_t size)
+{
+    FileMutationGuard mutation;
+    return VfsTruncateLocked(vn, size);
+}
+
+static bool VfsMappedPathBusy(const char* path)
+{
+    VnodeStat st;
+    if (VfsLstatPath(path, &st)) return false;
+    // ext2 open-inode holders preserve deleted/renamed backing. FAT has no
+    // persistent inode and must retain its physical directory entry instead.
+    if (((st.dev >> 8) & 0xfff) != 253) return false;
+    uint64_t irq = IrqSpinLockAcquire(&g_mappedBackingLock);
+    bool busy = false;
+    for (auto& entry : g_mappedBackings)
+        if (entry.vnode && entry.dev == st.dev &&
+            (st.isDir || entry.ino == st.ino)) { busy = true; break; }
+    IrqSpinLockRelease(&g_mappedBackingLock, irq);
+    return busy;
+}
+
+void VfsForceUnlockForPid(uint32_t pid)
+{
+    // ProcessDestroy runs after the victim is off CPU. Clear a reservation
+    // whose backend call could not return, then let another caller proceed.
+    if (__atomic_load_n(&g_fileMutationLock.ownerPid, __ATOMIC_ACQUIRE) != pid) return;
+    uint64_t irq = IrqSpinLockAcquire(&g_mappedBackingLock);
+    for (auto& entry : g_mappedBackings) if (entry.resizing) entry = {};
+    IrqSpinLockRelease(&g_mappedBackingLock, irq);
+    KMutexForceUnlock(&g_fileMutationLock, pid);
 }
 
 int VfsReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
@@ -627,6 +776,8 @@ int VfsFsync(Vnode* vn)
 
 int VfsUnlink(const char* path)
 {
+    FileMutationGuard mutation;
+    if (VfsMappedPathBusy(path)) return -16;
     if (!path || !path[0]) return -1;
     const char* relPath = nullptr;
     MountEntry* mount = FindMount(path, &relPath);
@@ -636,6 +787,8 @@ int VfsUnlink(const char* path)
 
 int VfsRemovePath(const char* path, bool directory)
 {
+    FileMutationGuard mutation;
+    if (VfsMappedPathBusy(path)) return -16;
     if (!path || !path[0]) return -2;
     const char* relPath = nullptr;
     MountEntry* mount = FindMount(path, &relPath);
@@ -645,7 +798,8 @@ int VfsRemovePath(const char* path, bool directory)
     VnodeStat st;
     if (VfsLstatPath(path, &st) != 0) return -2;
     if (st.isDir != directory) return directory ? -20 : -21;
-    return VfsUnlink(path);
+    if (!mount->fsOps->unlink) return -95;
+    return mount->fsOps->unlink(mount->mountPriv, mount->pdrv, relPath);
 }
 
 int VfsMkdir(const char* path)
@@ -659,6 +813,8 @@ int VfsMkdir(const char* path)
 
 int VfsRename(const char* oldPath, const char* newPath)
 {
+    FileMutationGuard mutation;
+    if (VfsMappedPathBusy(oldPath) || VfsMappedPathBusy(newPath)) return -16;
     if (!oldPath || !newPath || !oldPath[0] || !newPath[0]) return -1;
     const char* relOld = nullptr;
     const char* relNew = nullptr;

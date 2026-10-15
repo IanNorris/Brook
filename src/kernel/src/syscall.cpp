@@ -1008,8 +1008,12 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
     if (errCode & PF_PRESENT)
         return false;
 
-    Process* proc = MemoryMapOwner(ProcessCurrent());
-    if (!proc) return false;
+    Process* faultThread = ProcessCurrent();
+    Process* proc = MemoryMapOwner(faultThread);
+    if (!proc || !faultThread) return false;
+    // A thread has one synchronous fault context. Never overwrite ownership
+    // if kernel code unexpectedly tries to recurse through this handler.
+    if (__atomic_load_n(&faultThread->activeFileFaultVnode, __ATOMIC_ACQUIRE)) return false;
 
     uint64_t pageVA = cr2 & ~uint64_t{0xFFF};
 
@@ -1028,22 +1032,29 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
             SpinLockRelease(&proc->fileMapLock);
             continue;
         }
-        // Snapshot refCount before ref for diagnostics
         uint32_t preRef = __atomic_load_n(&vn->refCount, __ATOMIC_ACQUIRE);
-        VnodeRef(vn);
-        SpinLockRelease(&proc->fileMapLock);
-
-        // If VnodeRef refused (detected freed vnode), skip
         uintptr_t opsCheck = reinterpret_cast<uintptr_t>(vn->ops);
         if (opsCheck == 0xdfdfdfdfdfdfdfdfULL || preRef == 0) {
+            SpinLockRelease(&proc->fileMapLock);
             SerialPrintf("BUG: FileMapHandleUserFault got stale vnode %p "
                          "refCount_was=%u pid=%u i=%u\n",
                          vn, preRef, proc->pid, i);
             return false;
         }
+        VnodeRef(vn);
+        VfsFileMapClone(vn);
+        // Publish before releasing the mapping lock or reaching blocking I/O.
+        // Kernel execution is not timer-preemptible; teardown cannot run until
+        // this thread is off CPU. Normal return and cancellation consume the
+        // same ownership slot exactly once, including the vnode reference.
+        __atomic_store_n(&faultThread->activeFileFaultVnode, vn, __ATOMIC_RELEASE);
+        SpinLockRelease(&proc->fileMapLock);
+        struct FaultBackingPin {
+            Process* thread;
+            ~FaultBackingPin() { ProcessReleaseFileFault(thread); }
+        } backingPin{faultThread};
 
         if ((errCode & PF_WRITE) && !(m.vmmFlags & VMM_WRITABLE)) {
-            VnodeUnref(vn);
             return false;
         }
 
@@ -1051,7 +1062,6 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
         PhysicalAddress existing = VmmVirtToPhys(proc->pageTable,
                                                   VirtualAddress(pageVA));
         if (existing) {
-            VnodeUnref(vn);
             return true;
         }
 
@@ -1065,7 +1075,6 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
             if (!VmmMapPage(proc->pageTable, VirtualAddress(pageVA), cached,
                             VMM_PRESENT | m.vmmFlags, MemTag::User, ProcessAddressSpacePid(proc))) {
                 PmmUnrefPage(cached);
-                VnodeUnref(vn);
                 if (VmmVirtToPhys(proc->pageTable, VirtualAddress(pageVA)))
                     return true;
                 return false;
@@ -1090,7 +1099,6 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
                     PmmUnrefPage(adjPhys);
                 }
             }
-            VnodeUnref(vn);
             return true;
         }
 
@@ -1104,7 +1112,6 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
         }
         PhysicalAddress phys = PmmAllocPage(MemTag::User, ProcessAddressSpacePid(proc));
         if (!phys) {
-            VnodeUnref(vn);
             return false;
         }
 
@@ -1117,7 +1124,6 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
         int got = VfsRead(vn, kp, 4096, &readOff);
         if (got < 0) {
             PmmFreePage(phys);
-            VnodeUnref(vn);
             return false;
         }
 
@@ -1129,14 +1135,11 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
                         VMM_PRESENT | m.vmmFlags, MemTag::User, ProcessAddressSpacePid(proc))) {
             if (VmmVirtToPhys(proc->pageTable, VirtualAddress(pageVA))) {
                 PmmUnrefPage(phys);
-                VnodeUnref(vn);
                 return true;
             }
             PmmUnrefPage(phys);
-            VnodeUnref(vn);
             return false;
         }
-        VnodeUnref(vn);
         return true;
     }
     return false;
@@ -1176,6 +1179,7 @@ static bool FileMapsApplyProtection(Process* proc, uint64_t addr, uint64_t lengt
             dst.offset = off;
             dst.vmmFlags = flags;
             dst.vnode = vnode;
+            VfsFileMapClone(vnode);
             VnodeRef(vnode);
             return true;
         }
@@ -1253,10 +1257,13 @@ static bool FileMapsUnmapRange(Process* proc, uint64_t addr, uint64_t length)
         if (os >= oe) continue;
 
         if (os <= m.vaddr && oe >= mEnd) {
+            SpinLockAcquire(&proc->fileMapLock);
             Vnode* vn = static_cast<Vnode*>(
                 __atomic_exchange_n(reinterpret_cast<void**>(&m.vnode),
                                     nullptr, __ATOMIC_ACQ_REL));
             m.vaddr = 0; m.length = 0; m.offset = 0; m.vmmFlags = 0;
+            SpinLockRelease(&proc->fileMapLock);
+            VfsFileMapUnpin(vn);
             VnodeUnref(vn);
         } else if (os <= m.vaddr) {
             uint64_t delta = oe - m.vaddr;
@@ -1277,6 +1284,7 @@ static bool FileMapsUnmapRange(Process* proc, uint64_t addr, uint64_t length)
                 dst.offset = rightOffset;
                 dst.vmmFlags = m.vmmFlags;
                 dst.vnode = m.vnode;
+                VfsFileMapClone(dst.vnode);
                 VnodeRef(dst.vnode);
                 break;
             }
@@ -4019,7 +4027,8 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     }
 
     // Device or file-backed mmap
-    FdEntry* fde = FdGet(proc, static_cast<int>(fd));
+    FdRef mmapFdRef(proc, static_cast<int>(fd));
+    FdEntry* fde = mmapFdRef.get();
     if (!fde) return -EBADF;
 
     // virtio-gpu DRM render node: map a resource's guest backing (allocated by
@@ -4202,17 +4211,24 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     // Private, non-writable file mappings are demand-paged.  This avoids
     // synchronously reading large shared libraries/resources at mmap() time.
     // Writable private and read-only shared mappings use the eager copy path.
-    if ((flags & MAP_PRIVATE) && !(flags & MAP_SHARED) && !(prot & PROT_WRITE))
+    bool lazyFileMap = (flags & MAP_PRIVATE) && !(flags & MAP_SHARED) && !(prot & PROT_WRITE);
+    if (lazyFileMap) {
+        int pin = VfsFileMapPin(static_cast<Vnode*>(fde->handle));
+        if (pin == -95) lazyFileMap = false; // no stable inode lifetime: eager copy
+        else if (pin) return pin;
+    }
+    if (lazyFileMap && (flags & MAP_PRIVATE) && !(flags & MAP_SHARED) && !(prot & PROT_WRITE))
     {
         uint64_t vaddr = pickAddr();
-        if (!vaddr) return -ENOMEM;
+        if (!vaddr) { VfsFileMapUnpin(static_cast<Vnode*>(fde->handle)); return -ENOMEM; }
 
         auto* vn = static_cast<Vnode*>(fde->handle);
         bool tracked = false;
         Process* mmOwner = MemoryMapOwner(proc);
-        if (!mmOwner) return -ESRCH;
-        if ((flags & MAP_FIXED) && !FileMapsUnmapRange(mmOwner, vaddr, pages * 4096))
-            return -ENOMEM;
+        if (!mmOwner) { VfsFileMapUnpin(vn); return -ESRCH; }
+        if ((flags & MAP_FIXED) && !FileMapsUnmapRange(mmOwner, vaddr, pages * 4096)) {
+            VfsFileMapUnpin(vn); return -ENOMEM;
+        }
         for (uint32_t i = 0; i < Process::MAX_FILE_MAPS; i++) {
             if (mmOwner->fileMaps[i].length == 0) {
                 mmOwner->fileMaps[i].vaddr = vaddr;
@@ -4229,6 +4245,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             SerialPrintf("sys_mmap: WARNING MAX_FILE_MAPS (%u) exhausted for pid=%u, "
                          "falling back to eager read\n",
                          Process::MAX_FILE_MAPS, proc->pid);
+            VfsFileMapUnpin(vn);
             return -ENOMEM;
         }
 
@@ -4498,6 +4515,7 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t,
             m.vnode = nullptr;
             m.vaddr = 0; m.length = 0; m.offset = 0; m.vmmFlags = 0;
             SpinLockRelease(&mmOwner->fileMapLock);
+            VfsFileMapUnpin(vn);
             VnodeUnref(vn);
         } else if (overlapStart <= m.vaddr) {
             uint64_t delta = overlapEnd - m.vaddr;
@@ -4518,6 +4536,7 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t,
                 dst.offset = rightOffset;
                 dst.vmmFlags = m.vmmFlags;
                 dst.vnode = m.vnode;
+                VfsFileMapClone(dst.vnode);
                 VnodeRef(dst.vnode);
                 break;
             }
@@ -10283,10 +10302,17 @@ static int64_t sys_linkat(uint64_t olddirfd, uint64_t oldAddr,
 static int64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t,
                               uint64_t, uint64_t, uint64_t)
 {
+    if (length > 0x7fffffffffffffffULL) return -EINVAL;
     Process* proc = ProcessCurrent();
-    if (proc) {
-        FdEntry* fde = FdGet(proc, static_cast<int>(fd));
-        if (fde && fde->type == FdType::MemFd && fde->handle) {
+    if (!proc) return -EBADF;
+    FdRef ref(proc, static_cast<int>(fd));
+    if (!ref || !ref.get()->handle) return -EBADF;
+    FdEntry* fde = ref.get();
+    if (fde->type == FdType::Vnode) {
+        if ((fde->statusFlags & 3) == 0) return -EINVAL;
+        return VfsTruncate(static_cast<Vnode*>(fde->handle), length);
+    }
+    if (fde->type == FdType::MemFd) {
             auto* mfd = static_cast<MemFdData*>(fde->handle);
             if (length > mfd->capacity) {
                 if (!MemFdGrow(mfd, length)) return -ENOMEM;
@@ -10306,17 +10332,30 @@ static int64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t,
             }
             mfd->size = length;
             return 0;
-        }
     }
-    // For Vnode files and stubs, succeed silently (Nix uses this for DB journal files)
-    return 0;
+    return -EINVAL;
 }
 
 static int64_t sys_truncate(uint64_t pathAddr, uint64_t length, uint64_t,
                              uint64_t, uint64_t, uint64_t)
 {
-    (void)pathAddr; (void)length;
-    return 0; // stub
+    if (length > 0x7fffffffffffffffULL) return -EINVAL;
+    char path[256];
+    if (!CopyUserCString(pathAddr, path, sizeof(path))) return -EFAULT;
+    if (!path[0]) return -ENOENT;
+    char resolved[512];
+    if (!ResolveAtPath(-100, path, resolved, sizeof(resolved))) return -ENOENT;
+    VnodeStat st;
+    int result = VfsStatPath(resolved, &st);
+    if (result) return result < -1 ? result : -ENOENT;
+    if (st.isDir) return -21; // EISDIR
+    // Match the existing VFS open credential model. Descriptor access modes
+    // are checked above; global path permission enforcement remains separate.
+    Vnode* vn = VfsOpen(resolved, VFS_O_WRITE);
+    if (!vn) return -13;
+    result = VfsTruncate(vn, length);
+    VfsClose(vn);
+    return result;
 }
 
 // ---------------------------------------------------------------------------

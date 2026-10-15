@@ -161,10 +161,45 @@ was removed after collecting this evidence in bridge session
 `7a03c37188334fae92a8fa8eccfa4c4c`. A separate hardware-rendered run also
 encountered an earlier roughly 2 MiB Mesa shared-file mapping rejection.
 
-Regular-file `ftruncate` and `truncate` are currently success-only stubs; shared
-file pages, ordinary I/O coherence and dirty writeback are also missing.
-These require actual filesystem and mapping support, rather than making a
-private copy and reporting successful shared mapping. The `/dev/shm` synthetic
+At that point regular-file `ftruncate` and `truncate` were success-only stubs.
+Shared file pages, ordinary I/O coherence and dirty writeback also require
+actual filesystem and mapping support, rather than making a private copy and
+reporting successful shared mapping. The `/dev/shm` synthetic
 namespace additionally needs proper entry references and unlink behavior before
 it can provide a reliable alternative shared-memory path. These remain open
 compatibility work; neither Codium nor Chromium is accepted yet.
+
+## File resizing prerequisite
+
+The subsequent FAT/ext2 resize implementation replaces those success-only
+stubs. FAT growth writes zeroes and updates independently opened file handles,
+including previously cached readers. Ext2 growth is sparse; shrink detaches
+direct/indirect blocks before making allocations reusable and clears the
+retained partial block. File offsets remain unchanged. Invalid descriptors,
+negative lengths and read-only descriptors return errors.
+
+Live lazy file mappings currently make resize fail with `EBUSY`, including
+`O_TRUNC`. The registry retains backing references during faults; the guest
+probe verifies serialized rejection and recovery after unmap. Full concurrent
+fault/unmap/mprotect/MAP_FIXED ordering still needs a coordinated mapping
+lifecycle change, and cross-process resize invalidation remains unimplemented.
+FAT rename/unlink also rejects open file handles because its directory-slot identities cannot
+otherwise preserve those handles safely. Ext4 resize returns `EOPNOTSUPP`.
+These are explicit compatibility limits, not full Linux mmap/resize semantics.
+The appended VFS operation requires module ABI 7 and rebuilt driver modules.
+
+`truncatecheck` passed inside Brook on boot FAT and 4 KiB-block ext2, covering
+shrink/regrow zeroes, independent handles, cached reads, unchanged offsets,
+direct/single/double-indirect boundary markers, mapped resize rejection,
+protection splits and implicit fork-child exit cleanup. Both retained fixtures
+passed verification after reboot. The final tested kernel was
+`baf79343e5503a8b7f7442fe2e9b28b476206b5e33631178529d49fdeaad2c72`;
+checked shutdown and offline FAT/data/nix checks passed. Evidence is retained
+under `build/workloads/icons-theme-20261015/truncate-cancel-acceptance.json`.
+Faults now publish their transient backing ownership in the current thread;
+normal return and off-CPU teardown atomically release the same reference/pin.
+Sixteen kill/fault-loop rounds passed per filesystem without leaving the file
+busy. This timing stress does not prove cancellation at a particular blocked
+I/O instruction. The 1/2 KiB ext2 matrix remains a separate gate, as does the
+concurrent mapping lifecycle work above. This does not establish writable file
+mappings or successful Codium startup.

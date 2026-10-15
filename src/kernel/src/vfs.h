@@ -50,6 +50,8 @@ struct VnodeOps {
     // Optional timestamp mutation; times are atime, mtime, with NOW/OMIT.
     int (*set_times)(Vnode* vn, const VnodeTime* times) = nullptr;
     int (*chmod)(Vnode* vn, uint16_t mode) = nullptr;
+    // Resize a regular file without changing any open-file-description offset.
+    int (*truncate)(Vnode* vn, uint64_t size) = nullptr;
 };
 
 struct Vnode {
@@ -207,6 +209,11 @@ Vnode* VfsOpenMode(const char* path, int flags, uint16_t mode);
 extern "C" int VfsRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset);
 
 // Write to a file vnode.
+void VfsForceUnlockForPid(uint32_t pid);
+int VfsFileMapPin(Vnode* vn);
+void VfsFileMapClone(Vnode* vn);
+void VfsFileMapUnpin(Vnode* vn);
+extern "C" int VfsTruncate(Vnode* vn, uint64_t size);
 extern "C" int VfsWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset);
 
 // Read directory entries.  *cookie starts at 0.

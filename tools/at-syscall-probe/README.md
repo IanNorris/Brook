@@ -390,3 +390,40 @@ rename/recreate persistent inode semantics are outside this probe's contract.
 default (2–28 allowed). It holds them for at most 300 seconds so the taskbar's
 hidden-window navigation can be clicked and observed; SIGTERM can end it early.
 It is not an automated UI acceptance test.
+
+`truncatecheck PATH [--brook-gate]` checks actual regular-file resizing on the
+filesystem containing PATH: shrink, zero-filled growth (including a retained
+partial block), independent-open sizes/read caches, unchanged OFD position,
+invalid/negative/read-only/directory calls, and sparse markers around direct,
+single and double indirect boundaries for 1/2/4 KiB ext2 blocks. Run on both
+`/boot/TRUNC.TST` (FAT) and `/data/TRUNC.TST` (ext2). It retains a 131119-byte
+zero-filled fixture; after checked sync/reboot, `truncatecheck PATH --verify`
+checks persistence. The portable mode also runs on Linux. `--brook-gate` is
+explicitly Brook-specific: resize of a live lazy FileMap returns EBUSY until
+all mapping/fault pins have gone, including serialized mprotect/munmap splits
+and fork. It also runs 16 bounded kill/fault-loop rounds with readiness pipes,
+requires SIGKILL termination, and requires resize after each reap. This stress
+does not prove cancellation at a specific blocked-I/O instruction. Per-thread
+active fault ownership is consumed once by normal return or off-CPU teardown;
+fork/clone do not inherit that transient ownership.
+
+This is a tested serialized restriction, not Linux's mapped-truncate/SIGBUS
+behavior or full concurrent VMA correctness. Required next work: synchronize
+all partial unmap/protection/publication changes and fault PTE installation;
+the existing late-fault/orphan-PTE race is not fixed by the resize registry.
+Eager private copies retain their existing copied-EOF semantics.
+
+The truncate implementation appends a VnodeOps method and requires module ABI 7;
+all modules must be rebuilt, including the new per-thread Process fault slot. FAT and ext2 support resize up to 0xffffffff bytes;
+FAT growth writes zeros, ext2 grows sparsely. Ext4 returns EOPNOTSUPP: vendored
+lwext4 only shrinks, and its cached sizes/read-ahead require a separate coherence
+change before enabling resize. FAT rejects rename/unlink of open FILs (and
+conservatively directory mutation while files are open), since directory-slot
+identities and backing clusters otherwise become stale. This includes mapped
+files and handles opened before a later mmap. FAT rename crash atomicity and
+unlink-open semantics are not claimed. Ext2's existing inode holders retain
+unlinked backing. An ext2 metadata I/O error can leave detached allocations
+requiring fsck; resize never intentionally frees blocks still referenced by
+successfully committed metadata. Full filesystem fault injection and all ext2
+block-size variants require actual guest/backend tests; the host ext2 structure
+tests do not exercise this implementation.

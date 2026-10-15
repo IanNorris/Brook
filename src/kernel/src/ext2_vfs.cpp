@@ -2084,6 +2084,149 @@ static int Ext2FileWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* off
     return r;
 }
 
+// Stage indirect pointer changes before releasing any allocation. A failed
+// metadata write may leave detached blocks allocated, but never reusable blocks
+// still referenced by the inode. This filesystem has no metadata journal.
+struct Ext2TruncateEdit {
+    Ext2TruncateEdit* next;
+    uint32_t block;
+    uint32_t data[1];
+};
+
+static bool Ext2PruneTree(Ext2Mount* mnt, uint32_t* block, unsigned depth,
+                         uint64_t first, uint64_t span, uint64_t keep,
+                         Ext2FreeBatch** freed, Ext2TruncateEdit** edits)
+{
+    if (!*block || first + span <= keep) return true;
+    if (first >= keep) {
+        if (!Ext2CollectFreeTree(mnt, *block, depth, freed)) return false;
+        *block = 0;
+        return true;
+    }
+    if (!depth) return true;
+    auto* edit = static_cast<Ext2TruncateEdit*>(kmalloc(sizeof(Ext2TruncateEdit) + mnt->blockSize));
+    if (!edit) return false;
+    edit->block = *block;
+    if (!Ext2ReadBlock(mnt, *block, edit->data)) { kfree(edit); return false; }
+    uint32_t n = mnt->blockSize / 4;
+    for (uint32_t i = 0; i < n; ++i) {
+        if (!Ext2PruneTree(mnt, &edit->data[i], depth - 1,
+                          first + i * (span / n), span / n, keep, freed, edits)) {
+            kfree(edit); return false;
+        }
+    }
+    bool empty = true;
+    for (uint32_t i = 0; i < n; ++i) if (edit->data[i]) { empty = false; break; }
+    if (empty) {
+        bool ok = Ext2CollectFreeTree(mnt, *block, 0, freed);
+        if (ok) *block = 0;
+        kfree(edit);
+        return ok;
+    }
+    edit->next = *edits;
+    *edits = edit;
+    return true;
+}
+
+static bool Ext2TruncateBlock(Ext2Mount* mnt, const Ext2Inode& inode,
+                              uint64_t index, uint32_t* result)
+{
+    uint64_t span = 1;
+    unsigned slot = 0, depth = 0;
+    for (; slot < 15; ++slot) {
+        if (slot >= 12) { span *= mnt->blockSize / 4; depth = slot - 11; }
+        if (index < span) break;
+        index -= span;
+    }
+    if (slot == 15) return false;
+    uint32_t block = inode.i_block[slot];
+    while (block && depth) {
+        if (block < mnt->firstDataBlock || block >= mnt->totalBlocks) return false;
+        span /= mnt->blockSize / 4;
+        uint32_t entry = 0;
+        // Use the coherent block cache; unlike Ext2BlockMap, preserve I/O errors.
+        auto* buf = static_cast<uint32_t*>(kmalloc(mnt->blockSize));
+        if (!buf) return false;
+        bool ok = Ext2ReadBlock(mnt, block, buf);
+        if (ok) entry = buf[index / span];
+        kfree(buf);
+        if (!ok) return false;
+        block = entry; index %= span; --depth;
+    }
+    if (block && (block < mnt->firstDataBlock || block >= mnt->totalBlocks)) return false;
+    *result = block;
+    return true;
+}
+
+static int Ext2FileTruncate(Vnode* vn, uint64_t size)
+{
+    // Existing block writers use 32-bit i_size. Do not promise larger files.
+    if (size > 0xffffffffULL) return -27;
+    auto* fp = static_cast<Ext2FilePriv*>(vn->priv);
+    auto* mnt = fp->mnt;
+    KRwLockWriteLock(&g_ext2Lock);
+    Ext2Inode inode;
+    int result = -5;
+    Ext2FreeBatch* freed = nullptr;
+    Ext2TruncateEdit* edits = nullptr;
+    uint8_t* tail = nullptr;
+    do {
+        if (!Ext2ReadInode(mnt, fp->inode, &inode)) break;
+        if ((inode.i_mode & EXT2_S_IFMT) != EXT2_S_IFREG) { result = -22; break; }
+        uint64_t oldSize = Ext2InodeSize(&inode);
+        uint64_t keep = (size + mnt->blockSize - 1) / mnt->blockSize;
+        if (size < oldSize) {
+            bool ok = true;
+            uint64_t first = 0, span = 1;
+            for (unsigned i = 0; i < 15; ++i) {
+                if (i >= 12) span *= mnt->blockSize / 4;
+                if (!Ext2PruneTree(mnt, &inode.i_block[i], i < 12 ? 0 : i - 11,
+                                  first, span, keep, &freed, &edits)) { ok = false; break; }
+                first += span;
+            }
+            if (!ok) break;
+        }
+        // Clear the surviving partial block. Sparse growth must never expose
+        // bytes previously beyond EOF, including bytes discarded by shrink.
+        uint64_t boundary = size < oldSize ? size : oldSize;
+        if (boundary % mnt->blockSize) {
+            uint32_t disk = 0;
+            if (!Ext2TruncateBlock(mnt, inode, boundary / mnt->blockSize, &disk)) break;
+            if (disk) {
+                tail = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+                if (!tail) { result = -12; break; }
+                if (!Ext2ReadBlock(mnt, disk, tail)) break;
+                uint32_t off = boundary % mnt->blockSize;
+                memset(tail + off, 0, mnt->blockSize - off);
+                if (!Ext2WriteBlock(mnt, disk, tail)) break;
+            }
+        }
+        bool ok = true;
+        for (auto* edit = edits; edit; edit = edit->next)
+            if (!Ext2WriteBlock(mnt, edit->block, edit->data)) { ok = false; break; }
+        if (!ok) break;
+        uint64_t sectors = 0;
+        for (auto* batch = freed; batch; batch = batch->next)
+            sectors += uint64_t(batch->count) * (mnt->blockSize / 512);
+        if (sectors > inode.i_blocks) break;
+        inode.i_blocks -= sectors;
+        inode.i_size = static_cast<uint32_t>(size);
+        inode.i_dir_acl = 0;
+        Ext2Touch(&inode);
+        if (!Ext2WriteInode(mnt, fp->inode, &inode)) break;
+        fp->inodeData = inode;
+        result = 0;
+        for (auto* batch = freed; batch; batch = batch->next)
+            for (uint32_t i = 0; i < batch->count; ++i)
+                if (!Ext2FreeBlock(mnt, batch->blocks[i])) result = -5;
+    } while (false);
+    kfree(tail);
+    while (edits) { auto* next = edits->next; kfree(edits); edits = next; }
+    Ext2DisposeFreeBatch(freed);
+    KRwLockWriteUnlock(&g_ext2Lock);
+    return result;
+}
+
 static void Ext2FileClose(Vnode* vn)
 {
     auto* fp = static_cast<Ext2FilePriv*>(vn->priv);
@@ -2297,6 +2440,7 @@ static const VnodeOps g_ext2FileOps = {
     .fsync   = Ext2VnodeFsync,
     .set_times = Ext2VnodeSetTimes,
     .chmod   = Ext2VnodeChmod,
+    .truncate = Ext2FileTruncate,
 };
 
 static const VnodeOps g_ext2DirOps = {
