@@ -12,8 +12,10 @@ namespace brook {
 
 static inline uint64_t GuardAcquire(KMutex* m)
 {
-    uint64_t flags;
+    uint64_t flags = 0;
+#ifndef BROOK_HOST_TEST
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+#endif
     uint32_t ticket = __atomic_fetch_add(&m->guardNext, 1, __ATOMIC_RELAXED);
     while (__atomic_load_n(&m->guardServing, __ATOMIC_ACQUIRE) != ticket)
         __asm__ volatile("pause" ::: "memory");
@@ -23,8 +25,12 @@ static inline uint64_t GuardAcquire(KMutex* m)
 static inline void GuardRelease(KMutex* m, uint64_t savedFlags)
 {
     __atomic_fetch_add(&m->guardServing, 1, __ATOMIC_RELEASE);
+#ifndef BROOK_HOST_TEST
     if (savedFlags & 0x200)
         __asm__ volatile("sti" ::: "memory");
+#else
+    (void)savedFlags;
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -41,6 +47,8 @@ void KMutexInit(KMutex* m)
 {
     m->locked       = 0;
     m->ownerPid     = 0;
+    m->owner = nullptr;
+    m->ownerIncarnation = 0;
     m->waitHead     = nullptr;
     m->waitTail     = nullptr;
     m->guardNext    = 0;
@@ -51,6 +59,7 @@ void KMutexLock(KMutex* m)
 {
     Process* self = SchedulerCurrentProcess();
     if (!self) return; // Not in process context (early boot)
+    SchedulerKernelRegionEnter(self);
 
     uint64_t flags = GuardAcquire(m);
 
@@ -59,6 +68,8 @@ void KMutexLock(KMutex* m)
         // Uncontended fast path.
         m->locked   = 1;
         m->ownerPid = self->pid;
+        m->owner = self;
+        m->ownerIncarnation = self->incarnation;
         GuardRelease(m, flags);
         return;
     }
@@ -99,7 +110,7 @@ void KMutexLock(KMutex* m)
     // while holding the guard is race-free.
     for (;;)
     {
-        if (m->ownerPid == self->pid)
+        if (m->owner == self && m->ownerIncarnation == self->incarnation)
         {
             // Granted — KMutexUnlock has already dequeued us and set m->locked.
             GuardRelease(m, flags);
@@ -125,6 +136,9 @@ void KMutexUnlock(KMutex* m)
         return;
     }
 
+    Process* self = SchedulerCurrentProcess();
+    if (m->owner != self || m->ownerIncarnation != self->incarnation)
+        __builtin_trap();
     Process* waiter = m->waitHead;
     if (waiter)
     {
@@ -135,6 +149,10 @@ void KMutexUnlock(KMutex* m)
         waiter->syncNext = nullptr;
 
         m->ownerPid = waiter->pid;
+        m->owner = waiter;
+        m->ownerIncarnation = waiter->incarnation;
+        // The recipient may run and release its acquisition before Unblock.
+        ProcessRef(waiter);
         // m->locked remains 1 — ownership transferred, not released.
 
         // Signal the waiter BEFORE releasing the guard.  If the waiter
@@ -148,20 +166,25 @@ void KMutexUnlock(KMutex* m)
 
         // Wake the waiter. It will resume in KMutexLock after SchedulerBlock.
         SchedulerUnblock(waiter);
+        ProcessUnref(waiter);
     }
     else
     {
         // No waiters — release the mutex.
         m->locked   = 0;
         m->ownerPid = 0;
+        m->owner = nullptr;
+        m->ownerIncarnation = 0;
         GuardRelease(m, flags);
     }
+    SchedulerKernelRegionLeave(self);
 }
 
 bool KMutexTryLock(KMutex* m)
 {
     Process* self = SchedulerCurrentProcess();
     if (!self) return false;
+    SchedulerKernelRegionEnter(self);
 
     uint64_t flags = GuardAcquire(m);
 
@@ -169,45 +192,15 @@ bool KMutexTryLock(KMutex* m)
     {
         m->locked   = 1;
         m->ownerPid = self->pid;
+        m->owner = self;
+        m->ownerIncarnation = self->incarnation;
         GuardRelease(m, flags);
         return true;
     }
 
     GuardRelease(m, flags);
+    SchedulerKernelRegionLeave(self);
     return false;
-}
-
-void KMutexForceUnlock(KMutex* m, uint32_t pid)
-{
-    uint64_t flags = GuardAcquire(m);
-
-    if (!m->locked || m->ownerPid != pid)
-    {
-        GuardRelease(m, flags);
-        return;
-    }
-
-    // The dying process holds this mutex. Release it.
-    Process* waiter = m->waitHead;
-    if (waiter)
-    {
-        m->waitHead = waiter->syncNext;
-        if (!m->waitHead)
-            m->waitTail = nullptr;
-        waiter->syncNext = nullptr;
-        m->ownerPid = waiter->pid;
-        __atomic_store_n(&waiter->pendingWakeup, 1, __ATOMIC_RELEASE);
-        GuardRelease(m, flags);
-        SchedulerUnblock(waiter);
-    }
-    else
-    {
-        m->locked   = 0;
-        m->ownerPid = 0;
-        GuardRelease(m, flags);
-    }
-
-    SerialPrintf("KMutex: force-unlocked for dying pid %u\n", pid);
 }
 
 } // namespace brook

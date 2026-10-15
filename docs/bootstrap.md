@@ -495,3 +495,43 @@ and do not establish cache-controlled performance or reproducible binaries.
 Further real-workload compatibility and continuous VM recording remain separate
 work. After the host client OOM, these runs used one disk-backed VM at a time;
 the final host check showed about 14 GiB available and no remaining test VM.
+
+### Later compiler-exit regression (2026-10-15)
+
+A new prepared run at `9942505e4e9338704dae7c22b78a1f557dcfff03`
+completed clone, checkout, submodules and configuration, then stalled during
+compilation. The FAT mutex still named PID 16, incarnation 535, after that
+LLVM worker had been reaped. Python was blocked acquiring the same mutex;
+the CPUs were idle. This was a lock-lifetime failure, not a slow build.
+Scheduler termination could discard a sibling's kernel stack while it held
+or awaited a sleeping filesystem lock.
+
+The failed VM could not acknowledge sync and was forcibly stopped. Read-only
+offline checks passed for boot and Nix; the unsynced data image reported
+allocation-bitmap errors. Images are retained without repair under
+`build/experiments/results/bootstrap-prepared-9942505-disk/`, alongside
+`failure.json` and the final serial log. This run failed acceptance. The clean
+path was not run at that revision; the matching successful pair above applies
+only to `8042310`.
+
+The successor defers fatal cancellation while a thread holds or awaits a
+sleeping filesystem lock, retaining protection until the complete kernel
+operation unwinds. Lock acquisitions and wake handoffs pin process identities;
+group-exit timeouts retain live operations instead of force-unlocking metadata.
+Timer reaping runs only at user/idle boundaries in its own protected operation.
+Process-directed positive-PID `SIGKILL` now terminates the target thread group,
+including when sent by its leader or another worker. Process and mutex layout
+changes require rebuilt modules with ABI 8.
+
+The focused guest gate passed 16 rounds with eight I/O workers on each of FAT
+and ext2, covering `exit_group`, external SIGKILL and leader/worker self-group
+SIGKILL. Truncation gates passed on both filesystems, all four retained fixtures
+verified after reboot, and checked shutdown followed by offline FAT/data/Nix
+checks returned zero. Kernel heap integrity also passed its new free-payload
+accounting check; all 13 hosted tests passed in 1.76 seconds. Exact hashes,
+sessions and logs are retained in
+`build/workloads/icons-theme-20261015/fsexit-acceptance.json`.
+These focused results do not replace full prepared and clean bootstrap
+acceptance on the successor. Thread-directed fatal-signal group semantics,
+process-group kill selectors and operation boundaries before unrelated blocking
+waits remain follow-up work.

@@ -962,9 +962,8 @@ void ProcessDestroy(Process* proc)
     PosixTimersCleanup(proc, false);
     bool isThread = proc->isThread;
 
-    // Release any kernel mutexes held by this process (prevents deadlock)
-    Ext2ForceUnlockForPid(proc->pid);
-    VfsForceUnlockForPid(proc->pid);
+    // Filesystem operations finish cooperatively before terminal publication;
+    // there are no abandoned mutexes or backend mutations to force-release.
     ProcessReleaseFileFault(proc);
 
     // Threads don't own FDs — the leader does. Kernel threads never had
@@ -1364,6 +1363,10 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->schedPrev = nullptr;
     child->inReadyQueue = 0;
     child->wakeupTick = 0;
+    child->kernelRegionDepth = 0;
+    child->kernelOperationProtected = false;
+    child->terminalPending = false;
+    child->pendingWaitStatus = 0;
     child->syncNext = nullptr;
     child->pendingWakeup = 0;
 
@@ -1632,6 +1635,10 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     thread->schedPrev = nullptr;
     thread->inReadyQueue = 0;
     thread->wakeupTick = 0;
+    thread->kernelRegionDepth = 0;
+    thread->kernelOperationProtected = false;
+    thread->terminalPending = false;
+    thread->pendingWaitStatus = 0;
     thread->syncNext = nullptr;
     thread->pendingWakeup = 0;
     thread->vforkParent = nullptr;
@@ -2214,6 +2221,11 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
 {
     Process* proc = ProcessCurrent();
     if (!proc || proc->isKernelThread) return syscallResult;
+
+    if (SchedulerKernelOperationBoundary()) {
+        SchedulerYield();
+        __builtin_trap(); // A terminal thread must never resume.
+    }
 
     // ppoll/pselect6/epoll_pwait must select pending signals while their
     // temporary mask is still installed. Every ordinary/error return restores

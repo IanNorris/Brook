@@ -12,6 +12,8 @@ static brook::Process g_stubProcess = {};
 namespace brook {
     Process* SchedulerCurrentProcess() { return &g_stubProcess; }
     void SchedulerBlock(Process*) {}
+    void SchedulerKernelRegionEnter(Process*) {}
+    void SchedulerKernelRegionLeave(Process*) {}
     void SchedulerUnblock(Process*) {}
 
     // Procfs stubs — test_vfs doesn't test procfs.

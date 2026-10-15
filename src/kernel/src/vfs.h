@@ -208,8 +208,7 @@ Vnode* VfsOpenMode(const char* path, int flags, uint16_t mode);
 // Read from a file vnode.  Wrapper around vn->ops->read.
 extern "C" int VfsRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset);
 
-// Write to a file vnode.
-void VfsForceUnlockForPid(uint32_t pid);
+// Lazy file-mapping backing lifetime and mutation gates.
 int VfsFileMapPin(Vnode* vn);
 void VfsFileMapClone(Vnode* vn);
 void VfsFileMapUnpin(Vnode* vn);

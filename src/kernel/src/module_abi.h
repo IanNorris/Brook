@@ -31,7 +31,8 @@ namespace brook {
 // an archived, incompatible GPU experiment and must never be reused.
 // ABI 7 appends VnodeOps::truncate and adds per-thread file-fault ownership
 // to Process; rebuild all modules against both updated layouts.
-static constexpr uint32_t MODULE_ABI_VERSION = 7;
+// ABI 8 adds cooperative cancellation state to Process and identity to KMutex.
+static constexpr uint32_t MODULE_ABI_VERSION = 8;
 
 // Magic bytes at the start of every valid ModuleInfo.
 static constexpr uint32_t MODULE_MAGIC = 0x4B524F42; // 'BROK'

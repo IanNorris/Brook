@@ -3,48 +3,8 @@
 #include "scheduler.h"
 #ifndef BROOK_HOST_TEST
 #include "serial.h"
-// BRO-179: defined in process.cpp; dumps the Process free-log entry for a
-// pointer (freeing caller symbol + incarnation). Used by the UAF guard below.
-extern "C" int ProcessDumpFreeLog(void* ptr);
-
-// BRO-179: in-flight tracker for KRwLockCleanupOnExit. FreeProcessStruct
-// (process.cpp) consults this to detect a concurrent free racing the cleanup —
-// the TOCTOU that lets cleanup read heap kfree-poison out of a just-freed
-// Process struct (observed: kernel #GP, p->heldWriteLock = 0xDFDF..., magic
-// already validated). Migration-proof: slots hold the proc POINTER, not a CPU
-// id, so a thread that migrates between claim and release still releases its
-// own slot. Concurrent cleanups are bounded by CPU count, so MAX_CPUS slots
-// always suffice.
-static brook::Process* volatile g_rwCleanupInFlight[64];
-static volatile int g_rwCleanupInFlightCount = 0;
-
-static inline int RwCleanupInFlightClaim(brook::Process* p) {
-    for (uint32_t i = 0; i < 64; ++i) {
-        brook::Process* expected = nullptr;
-        if (__atomic_compare_exchange_n(&g_rwCleanupInFlight[i], &expected, p,
-                                        false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
-            __atomic_add_fetch(&g_rwCleanupInFlightCount, 1, __ATOMIC_ACQ_REL);
-            return static_cast<int>(i);
-        }
-    }
-    return -1;
-}
-static inline void RwCleanupInFlightRelease(int slot) {
-    if (slot >= 0) {
-        __atomic_store_n(&g_rwCleanupInFlight[slot], nullptr, __ATOMIC_RELEASE);
-        __atomic_sub_fetch(&g_rwCleanupInFlightCount, 1, __ATOMIC_ACQ_REL);
-    }
-}
-extern "C" int ProcessIsRwCleanupInFlight(void* p) {
-    // O(1) when nothing is in-flight (the overwhelmingly-common case).
-    if (__atomic_load_n(&g_rwCleanupInFlightCount, __ATOMIC_ACQUIRE) == 0)
-        return 0;
-    for (uint32_t i = 0; i < 64; ++i)
-        if (__atomic_load_n(&g_rwCleanupInFlight[i], __ATOMIC_ACQUIRE)
-            == reinterpret_cast<brook::Process*>(p))
-            return 1;
-    return 0;
-}
+// Kept for the process free-log diagnostic ABI. Cleanup no longer mutates locks.
+extern "C" int ProcessIsRwCleanupInFlight(void*) { return 0; }
 #endif
 
 namespace brook {
@@ -142,14 +102,14 @@ void KRwLockInit(KRwLock* rw)
 void KRwLockReadLock(KRwLock* rw)
 {
     Process* self = SchedulerCurrentProcess();
+    if (self) SchedulerKernelRegionEnter(self);
     uint64_t flags = RwGuardAcquire(rw);
 
     // Grant immediately if no writer is active and none waiting.
     if (!rw->writerActive && rw->writersWaiting == 0)
     {
         rw->readerCount++;
-        // BRO-162: record read ownership so KRwLockCleanupOnExit can drop this
-        // reference if the thread exits while holding it.
+        // Track ownership for the terminal-state invariant check.
         if (self) self->heldReadLock = rw;
         RwGuardRelease(rw, flags);
         return;
@@ -210,21 +170,27 @@ void KRwLockReadUnlock(KRwLock* rw)
         Process* writer = Dequeue(rw->writeWaitHead, rw->writeWaitTail);
         rw->writerActive = 1;
         rw->writersWaiting--;
-        // BRO-162: record ownership on the woken writer BEFORE unblock so a kill
-        // in the unblocked-but-not-yet-scheduled window is recoverable by cleanup.
+        // Record the grant before unblock; the queued acquisition remains
+        // protected and referenced until its eventual unlock.
+        ProcessRef(writer);
         writer->heldWriteLock = rw;
         writer->blockedOnRwLock = nullptr;
         __atomic_store_n(&writer->pendingWakeup, 1, __ATOMIC_RELEASE);
         RwGuardRelease(rw, flags);
         SchedulerUnblock(writer);
+        ProcessUnref(writer);
+        if (self) SchedulerKernelRegionLeave(self);
         return;
     }
 
     RwGuardRelease(rw, flags);
+    if (self) SchedulerKernelRegionLeave(self);
 }
 
 void KRwLockWriteLock(KRwLock* rw)
 {
+    Process* self = SchedulerCurrentProcess();
+    if (self) SchedulerKernelRegionEnter(self);
     uint64_t flags = RwGuardAcquire(rw);
 
     // Grant immediately if no readers and no writer active.
@@ -233,13 +199,11 @@ void KRwLockWriteLock(KRwLock* rw)
         rw->writerActive = 1;
         RwGuardRelease(rw, flags);
         // Track ownership.
-        Process* self = SchedulerCurrentProcess();
         if (self) self->heldWriteLock = rw;
         return;
     }
 
     // Must block — need a valid process context.
-    Process* self = SchedulerCurrentProcess();
     if (!self) {
         // No process context — cannot sleep.  Force-grant to avoid hang.
         // This should only happen during very early boot before any
@@ -296,9 +260,9 @@ void KRwLockWriteUnlock(KRwLock* rw)
         while (rw->readWaitHead && count < 128)
         {
             readers[count] = Dequeue(rw->readWaitHead, rw->readWaitTail);
-            // BRO-162: record the grant on the woken reader BEFORE unblocking so
-            // a kill in the unblocked-but-not-scheduled window is recoverable by
-            // KRwLockCleanupOnExit (read case) instead of leaking readerCount.
+            // Publish the read grant before waking; cancellation remains
+            // pending until this acquisition and its operation finish.
+            ProcessRef(readers[count]);
             readers[count]->heldReadLock = rw;
             readers[count]->blockedOnRwLock = nullptr;
             __atomic_store_n(&readers[count]->pendingWakeup, 1, __ATOMIC_RELEASE);
@@ -308,8 +272,11 @@ void KRwLockWriteUnlock(KRwLock* rw)
         RwGuardRelease(rw, flags);
 
         // Wake them all outside the guard.
-        for (uint32_t i = 0; i < count; ++i)
+        for (uint32_t i = 0; i < count; ++i) {
             SchedulerUnblock(readers[i]);
+            ProcessUnref(readers[i]);
+        }
+        if (self) SchedulerKernelRegionLeave(self);
         return;
     }
 
@@ -320,220 +287,31 @@ void KRwLockWriteUnlock(KRwLock* rw)
         rw->writerActive = 1;
         rw->writersWaiting--;
         // BRO-162: record ownership on the woken writer before unblock.
+        ProcessRef(writer);
         writer->heldWriteLock = rw;
         writer->blockedOnRwLock = nullptr;
         __atomic_store_n(&writer->pendingWakeup, 1, __ATOMIC_RELEASE);
         RwGuardRelease(rw, flags);
         SchedulerUnblock(writer);
+        ProcessUnref(writer);
+        if (self) SchedulerKernelRegionLeave(self);
         return;
     }
 
     RwGuardRelease(rw, flags);
+    if (self) SchedulerKernelRegionLeave(self);
 }
 
-// Remove a specific process from a singly-linked wait queue.
-static inline bool RemoveFromQueue(Process*& head, Process*& tail, Process* target)
-{
-    if (!head || !target) return false;
-    if (head == target) {
-        head = target->syncNext;
-        if (!head) tail = nullptr;
-        target->syncNext = nullptr;
-        return true;
-    }
-    for (Process* prev = head; prev->syncNext; prev = prev->syncNext) {
-        if (prev->syncNext == target) {
-            prev->syncNext = target->syncNext;
-            if (tail == target) tail = prev;
-            target->syncNext = nullptr;
-            return true;
-        }
-    }
-    return false;
-}
-
-// Called when a thread is about to exit. Releases any held write lock and
-// removes the thread from any rwlock wait queue it may be blocked on.
+// Terminal publication is forbidden while queued or holding a sleeping lock.
+// Releasing an abandoned filesystem lock could expose half-written metadata.
 void KRwLockCleanupOnExit(Process* p)
 {
-    if (!p) return;
-
-    // BRO-179: a kernel #GP was observed here with p->heldWriteLock ==
-    // 0xDFDFDFDFDFDFDFDF (heap kfree-poison): the Process struct was already
-    // kfree'd when cleanup ran (a process-lifetime UAF in the exit/reap path).
-    // Validate the struct magic before touching any lock fields. If it is
-    // poisoned/zeroed, name the teardown path that freed it (ProcessDumpFreeLog
-    // records the freeing caller + incarnation) and bail rather than
-    // dereferencing poison into a non-canonical fault.
+    if (p && (p->heldWriteLock || p->heldReadLock || p->blockedOnRwLock)) {
 #ifndef BROOK_HOST_TEST
-    if (p->magic != PROCESS_MAGIC) {
-        SerialPrintf("BRO179-RWCLEANUP-UAF: KRwLockCleanupOnExit on FREED proc=%p "
-                     "magic=0x%lx (expected 0x%lx) — Process struct already freed!\n",
-                     p, p->magic, PROCESS_MAGIC);
-        ProcessDumpFreeLog(p);
-        return;
-    }
-    // BRO-179: a LIVE process (magic intact) was observed with a poison VALUE in
-    // its heldWriteLock field (rax=0xDFDF... -> #GP at the lock acquire). That is
-    // NOT a whole-struct UAF; it is corruption of the lock-pointer field itself
-    // on an otherwise-live Process. Detect poison in each lock pointer, name the
-    // field + process identity/state, and neutralize it (treat as null) so we
-    // don't fault and the run survives to reveal the writer.
-    auto isPoison = [](void* v) {
-        uint64_t u = reinterpret_cast<uint64_t>(v);
-        return (u >> 32) == 0xDFDFDFDFULL || (u & 0xFFFFFFFFULL) == 0xDFDFDFDFULL;
-    };
-    if (isPoison(p->heldWriteLock) || isPoison(p->heldReadLock) ||
-        isPoison(p->blockedOnRwLock)) {
-        SerialPrintf("BRO179-RWLOCKFIELD-POISON: LIVE proc=%p pid=%u incarnation=%lu "
-                     "state=%d heldWriteLock=%p heldReadLock=%p blockedOnRwLock=%p "
-                     "blockedAsWriter=%d — lock-pointer field holds heap poison!\n",
-                     p, (unsigned)p->pid, p->incarnation, (int)p->state,
-                     (void*)p->heldWriteLock, (void*)p->heldReadLock,
-                     (void*)p->blockedOnRwLock, (int)p->blockedAsWriter);
-        // Re-read magic NOW: if the struct has since been poisoned/zeroed, the
-        // magic check above passed but a concurrent FreeProcessStruct(p) has
-        // freed p underneath us — a TOCTOU between the magic read and the field
-        // read (the racing free poisons the whole block, including these
-        // fields). The free-log names the racing free site.
-        SerialPrintf("  magic-now=0x%lx (expected 0x%lx) — %s\n",
-                     p->magic, PROCESS_MAGIC,
-                     p->magic == PROCESS_MAGIC ? "still live: genuine field corruption"
-                                               : "POISONED NOW: concurrent free TOCTOU");
-        ProcessDumpFreeLog(p);
-        // BRO-179: the corruption is heap free-poison (0xDFDF) written into a
-        // LIVE Process struct (magic + heldReadLock intact). Hypothesis: the
-        // kmalloc free-list contains a "free block" whose BlockHeader sits
-        // INSIDE this live allocation — WriteBlock then poison-fills its payload
-        // (starting at header+64) over our fields. Scan the whole struct for an
-        // embedded heap BlockHeader magic (0xB10CBEEF) and dump a wide window
-        // around the lock fields so we can see the header + poison extent.
-        {
-            auto* base = reinterpret_cast<volatile uint8_t*>(p);
-            // Scan every 16 bytes (heap ALIGN-compatible) across the struct for
-            // an embedded header magic; report the first few with their offset.
-            constexpr uint32_t HEAP_HDR_MAGIC = 0xB10CBEEF;
-            int found = 0;
-            for (uint32_t off = 16; off + 4 <= 0x600 && found < 4; off += 16) {
-                uint32_t m = *reinterpret_cast<volatile uint32_t*>(base + off);
-                if (m == HEAP_HDR_MAGIC) {
-                    uint32_t bsz = *reinterpret_cast<volatile uint32_t*>(base + off + 4);
-                    uint32_t bfree = *reinterpret_cast<volatile uint32_t*>(base + off + 8);
-                    SerialPrintf("  EMBEDDED-HEAP-HEADER @proc+0x%x: magic=0xB10CBEEF "
-                                 "size=%u free=%u (payload@+0x%x) — free block INSIDE "
-                                 "live Process = kmalloc free-list/overlap corruption!\n",
-                                 off, bsz, bfree, off + 64);
-                    found++;
-                }
-            }
-            if (!found)
-                SerialPrintf("  (no embedded heap header found in first 0x600 bytes)\n");
-            // Wide qword window from proc+0x100 (suspected header) to +0x178.
-            auto* q = reinterpret_cast<volatile uint64_t*>(base + 0x100);
-            for (uint32_t r = 0; r < 4; ++r)
-                SerialPrintf("  raw @proc+0x%x: %p %p %p %p\n", 0x100 + r * 32,
-                             (void*)q[r * 4 + 0], (void*)q[r * 4 + 1],
-                             (void*)q[r * 4 + 2], (void*)q[r * 4 + 3]);
-            SerialPrintf("  fields: syncNext=%p pendingWakeup=0x%x "
-                         "blockedAsWriter=%d pid=%u tgid=%u state=%d isThread=%d\n",
-                         (void*)p->syncNext, (unsigned)p->pendingWakeup,
-                         (int)p->blockedAsWriter, (unsigned)p->pid,
-                         (unsigned)p->tgid, (int)p->state, (int)p->isThread);
-        }
-        if (isPoison(p->heldWriteLock))  p->heldWriteLock  = nullptr;
-        if (isPoison(p->heldReadLock))   p->heldReadLock   = nullptr;
-        if (isPoison(p->blockedOnRwLock)) p->blockedOnRwLock = nullptr;
-        return;
-    }
-    // Mark cleanup in-flight for p across the lock-manipulation body below, so
-    // a concurrent FreeProcessStruct(p) can detect the race. Only the rare exit
-    // that actually holds/awaits a kernel rwlock needs the slot (the crash is in
-    // the heldWriteLock release path), so the overwhelmingly-common no-lock exit
-    // stays O(1) — keeping perturbation low so the Heisenbug still reproduces.
-    bool rwHasLockState = p->heldWriteLock || p->heldReadLock || p->blockedOnRwLock;
-    int rwInFlightSlot = rwHasLockState ? RwCleanupInFlightClaim(p) : -1;
+        SerialPrintf("KRwLock: terminal process still owns lock state pid=%u\n", p->pid);
 #endif
-
-    // Case 1: Thread holds a write lock — release it.
-    if (p->heldWriteLock) {
-        KRwLock* rw = p->heldWriteLock;
-        p->heldWriteLock = nullptr;
-        // Perform the same logic as KRwLockWriteUnlock.
-        uint64_t flags = RwGuardAcquire(rw);
-        rw->writerActive = 0;
-
-        // Wake all queued readers.
-        if (rw->readWaitHead) {
-            Process* readers[128];
-            uint32_t count = 0;
-            while (rw->readWaitHead && count < 128) {
-                readers[count] = Dequeue(rw->readWaitHead, rw->readWaitTail);
-                // BRO-162: record grant before unblock (see KRwLockWriteUnlock).
-                readers[count]->heldReadLock = rw;
-                readers[count]->blockedOnRwLock = nullptr;
-                __atomic_store_n(&readers[count]->pendingWakeup, 1, __ATOMIC_RELEASE);
-                count++;
-                rw->readerCount++;
-            }
-            RwGuardRelease(rw, flags);
-            for (uint32_t i = 0; i < count; ++i)
-                SchedulerUnblock(readers[i]);
-        } else if (rw->writeWaitHead) {
-            Process* writer = Dequeue(rw->writeWaitHead, rw->writeWaitTail);
-            rw->writerActive = 1;
-            rw->writersWaiting--;
-            // BRO-162: record grant before unblock.
-            writer->heldWriteLock = rw;
-            writer->blockedOnRwLock = nullptr;
-            __atomic_store_n(&writer->pendingWakeup, 1, __ATOMIC_RELEASE);
-            RwGuardRelease(rw, flags);
-            SchedulerUnblock(writer);
-        } else {
-            RwGuardRelease(rw, flags);
-        }
+        __builtin_trap();
     }
-
-    // Case 3 (BRO-162): Thread holds a read lock — drop its reference.  This
-    // covers both fully-acquired read locks and reads granted in the
-    // unblocked-but-not-yet-scheduled window (the waker recorded heldReadLock).
-    if (p->heldReadLock) {
-        KRwLock* rw = p->heldReadLock;
-        p->heldReadLock = nullptr;
-        uint64_t flags = RwGuardAcquire(rw);
-        if (rw->readerCount > 0)
-            rw->readerCount--;
-        // If we were the last reader and a writer is waiting, hand off.
-        if (rw->readerCount == 0 && rw->writeWaitHead) {
-            Process* writer = Dequeue(rw->writeWaitHead, rw->writeWaitTail);
-            rw->writerActive = 1;
-            rw->writersWaiting--;
-            writer->heldWriteLock = rw;
-            writer->blockedOnRwLock = nullptr;
-            __atomic_store_n(&writer->pendingWakeup, 1, __ATOMIC_RELEASE);
-            RwGuardRelease(rw, flags);
-            SchedulerUnblock(writer);
-        } else {
-            RwGuardRelease(rw, flags);
-        }
-    }
-
-    // Case 2: Thread is blocked waiting on a rwlock — remove from queue.
-    if (p->blockedOnRwLock) {
-        KRwLock* rw = p->blockedOnRwLock;
-        uint64_t flags = RwGuardAcquire(rw);
-        if (p->blockedAsWriter) {
-            if (RemoveFromQueue(rw->writeWaitHead, rw->writeWaitTail, p))
-                rw->writersWaiting--;
-        } else {
-            RemoveFromQueue(rw->readWaitHead, rw->readWaitTail, p);
-        }
-        RwGuardRelease(rw, flags);
-        p->blockedOnRwLock = nullptr;
-    }
-
-#ifndef BROOK_HOST_TEST
-    RwCleanupInFlightRelease(rwInFlightSlot);
-#endif
 }
 
 } // namespace brook

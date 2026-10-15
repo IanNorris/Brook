@@ -61,11 +61,21 @@ void KernelThreadTrampoline();
 void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus,
                               int terminationSignal = 0);
 // Serialize terminal state publication against block/wake/dispatch transitions.
+// Enter before taking a sleeping-lock guard; leave after releasing it. Entry
+// and fatal-state publication are serialized by readyLock, never a lock guard.
+void SchedulerKernelRegionEnter(Process* proc);
+void SchedulerKernelRegionLeave(Process* proc);
+// Only at a completed syscall/user-fault boundary, user-mode tick, or final exit.
+// Returns true if terminal delivery was committed; caller must not return to user.
+bool SchedulerKernelOperationBoundary();
+
 void SchedulerMarkTerminated(Process* proc, int waitStatus);
 // Request a stop without yielding (for the syscall signal-return path).
 void SchedulerMarkStopped(Process* proc);
 // Drop an owned wait reference and notify a parent if this made it reapable.
 void SchedulerReleaseWaitReference(Process* proc);
+// Registry-pinned lookup; caller must ProcessUnref the returned identity.
+Process* SchedulerFindProcessReference(uint16_t pid);
 
 // Resolve a timer target under the process registry lock; returns only a token.
 bool SchedulerTimerTargetIncarnation(Process* owner, int32_t tid, uint64_t* incarnation);

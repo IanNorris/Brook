@@ -661,16 +661,6 @@ static bool VfsMappedPathBusy(const char* path)
     return busy;
 }
 
-void VfsForceUnlockForPid(uint32_t pid)
-{
-    // ProcessDestroy runs after the victim is off CPU. Clear a reservation
-    // whose backend call could not return, then let another caller proceed.
-    if (__atomic_load_n(&g_fileMutationLock.ownerPid, __ATOMIC_ACQUIRE) != pid) return;
-    uint64_t irq = IrqSpinLockAcquire(&g_mappedBackingLock);
-    for (auto& entry : g_mappedBackings) if (entry.resizing) entry = {};
-    IrqSpinLockRelease(&g_mappedBackingLock, irq);
-    KMutexForceUnlock(&g_fileMutationLock, pid);
-}
 
 int VfsReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
 {

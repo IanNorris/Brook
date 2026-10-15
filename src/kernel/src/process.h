@@ -352,6 +352,14 @@ struct Process
     uint64_t schedTrace[12];
     uint8_t  schedTraceHead;
 
+    // Protected by scheduler readyLock. Sleeping filesystem locks defer fatal
+    // cancellation through the complete kernel operation, including gaps between
+    // locks (e.g. FAT cache loading). Each queued/held lock owns a Process ref.
+    uint32_t kernelRegionDepth;
+    bool kernelOperationProtected;
+    bool terminalPending;
+    int pendingWaitStatus;
+
     // Mutex wait-queue linkage (used by KMutex when process is blocked on a lock)
     Process* syncNext;          // Next process in sync wait queue (mutex/rwlock/semaphore)
     volatile uint32_t pendingWakeup; // Set by KMutexUnlock before SchedulerUnblock;

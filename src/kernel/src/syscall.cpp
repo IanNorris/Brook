@@ -11012,10 +11012,35 @@ static int64_t sys_tkill(uint64_t tid, uint64_t sig, uint64_t,
 static int64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t,
                          uint64_t, uint64_t, uint64_t)
 {
-    if (sig == 0) return 0; // Permission check only
-    Process* target = ProcessFindByPid(static_cast<uint16_t>(pid));
-    if (!target) return -ESRCH;
-    return ProcessSendSignal(target, static_cast<int>(sig));
+    // Linux pid_t is a signed 32-bit syscall argument. Do not alias a large
+    // positive PID onto an unrelated 16-bit Brook process identity.
+    int32_t requested = static_cast<int32_t>(pid);
+    if (requested <= 0) return -ENOSYS; // process-group selectors not implemented
+    if (requested > 0xffff) return -ESRCH;
+    int32_t signal = static_cast<int32_t>(sig);
+    if (signal < 0 || signal > 64) return -EINVAL;
+    Process* self = ProcessCurrent();
+    SchedulerKernelRegionEnter(self);
+    Process* target = SchedulerFindProcessReference(static_cast<uint16_t>(requested));
+    if (!target) {
+        SchedulerKernelRegionLeave(self);
+        return -ESRCH;
+    }
+    int result = 0;
+    if (signal == 9) {
+        // A process-directed fatal signal terminates every live thread. The
+        // referenced target pins the TGID lifetime while the group is latched
+        // and snapshotted; no filesystem cleanup happens under registry locks.
+        SchedulerKillThreadGroup(target->tgid, target, 128 + 9, 9);
+        result = ProcessSendSignal(target, 9);
+        if (self != target && self->tgid == target->tgid)
+            SchedulerMarkTerminated(self, 9);
+    } else if (signal) {
+        result = ProcessSendSignal(target, signal);
+    }
+    ProcessUnref(target);
+    SchedulerKernelRegionLeave(self);
+    return result;
 }
 
 // ---------------------------------------------------------------------------

@@ -7,7 +7,7 @@
 // Block/Unblock mechanism and protected by a brief internal spinlock.
 //
 // Design:
-//   - `owner` is the PID of the holding process (0 = unlocked).
+//   - `owner` is a pinned Process pointer with an incarnation token.
 //   - `waitHead/waitTail` is a singly-linked list of blocked processes.
 //   - `guard` is a spinlock protecting the mutex's internal state; it is
 //     held only for the few instructions needed to inspect/update the
@@ -27,6 +27,8 @@ struct Process;
 struct KMutex {
     volatile uint32_t locked;     // 1 = held, 0 = free
     volatile uint32_t ownerPid;   // PID of holder (0 = none)
+    Process*          owner;     // Acquisition reference pins identity through handoff.
+    uint64_t          ownerIncarnation;
     Process*          waitHead;   // First waiter (FIFO queue)
     Process*          waitTail;   // Last waiter
 
@@ -51,9 +53,5 @@ void KMutexUnlock(KMutex* m);
 // Try to acquire the mutex without blocking.
 // Returns true if acquired, false if already held.
 bool KMutexTryLock(KMutex* m);
-
-// Force-release a mutex if held by the given PID.
-// Called during process teardown to prevent deadlock.
-void KMutexForceUnlock(KMutex* m, uint32_t pid);
 
 } // namespace brook

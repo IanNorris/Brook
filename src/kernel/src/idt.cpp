@@ -1002,6 +1002,10 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
             }
             extern bool FileMapHandleUserFault(uint64_t, uint64_t);
             if (FileMapHandleUserFault(cr2cow, ef->errorCode)) {
+                if (brook::SchedulerKernelOperationBoundary()) {
+                    brook::SchedulerYield();
+                    __builtin_trap();
+                }
                 __asm__ volatile("sti");
                 return;
             }

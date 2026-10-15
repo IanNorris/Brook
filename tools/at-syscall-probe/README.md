@@ -4,6 +4,19 @@ Build the C probes in `nix-shell` using `$MUSL_CC -static -O2` (add
 `-pthread` for `fdstress.c` and `brkcheck.c`). Keep binaries in ignored `build/`.
 Run them inside a disposable Brook VM through `vm_guest_run`:
 
+`fsexitcheck.c` requires `-pthread` and an absolute fixture path. Run once on
+ext2 (`/data/FSEXIT.TST`) and once on FAT (`/boot/FSEXIT.TST`). Sixteen rounds
+cycle through `exit_group`, parent-directed `SIGKILL`, and process-directed
+`SIGKILL` from the leader and a worker, while eight threads read, stat and access
+a 131,119-byte fixture. The parent checks the exact contents
+after every group exits, forcing a new filesystem acquisition that detects
+abandoned locks. After a synced shutdown and reboot, run with the same path
+and `--verify`, then require clean offline filesystem checks. The probe uses
+the raw Linux `alarm` syscall because musl's wrapper requires `setitimer`;
+also enforce a host deadline, since a filesystem deadlock can block even fatal
+signal completion. Timing varies the exit point but does not establish that
+any particular instruction was interrupted.
+
 `waitmaskcheck.c` must be invoked by absolute path. It checks raw `ppoll`,
 `pselect6` and `epoll_pwait` with SIGCHLD blocked outside each wait. A queued
 signal and a delayed exec-child exit must invoke the handler and return EINTR

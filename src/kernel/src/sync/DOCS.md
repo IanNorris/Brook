@@ -71,6 +71,8 @@ Sleeping mutual-exclusion lock. When contended, the calling process blocks
 struct KMutex {
     volatile uint32_t locked;       // 1 = held, 0 = free
     volatile uint32_t ownerPid;     // holder's PID
+    Process*          owner;        // pinned Process identity
+    uint64_t          ownerIncarnation;
     Process*          waitHead;     // FIFO wait queue (singly-linked via Process::syncNext)
     Process*          waitTail;
     volatile uint32_t guardNext;    // internal ticket spinlock
@@ -86,7 +88,6 @@ struct KMutex {
 | `KMutexLock` | `(KMutex*)` | Fast path: if unlocked, set locked=1 + ownerPid. Slow path: enqueue on wait queue, set `pendingWakeup=0`, release guard, call `SchedulerBlock`. |
 | `KMutexUnlock` | `(KMutex*)` | If waiters: transfer ownership to first waiter (locked stays 1), set `pendingWakeup=1`, call `SchedulerUnblock`. If no waiters: set locked=0. |
 | `KMutexTryLock` | `(KMutex*) → bool` | Non-blocking attempt. Returns true if acquired. |
-| `KMutexForceUnlock` | `(KMutex*, uint32_t pid)` | Forcibly release if held by given PID. Used during process teardown. Transfers to next waiter if any. |
 
 ### Lost-Wakeup Prevention
 KMutex correctly handles the race between GuardRelease and SchedulerBlock
@@ -98,8 +99,38 @@ using `Process::pendingWakeup`:
 This prevents the scenario where Unblock fires between GuardRelease and
 SchedulerBlock and the wake is lost.
 
-### Quality Assessment
-✅ Correct and well-commented. The pendingWakeup pattern is the right approach.
+### Cooperative cancellation and lifetime
+
+KMutex and KRwLock enter a scheduler-protected region before taking their internal
+guards. Entry and terminal-state publication share `readyLock`; a kill either
+precedes entry or becomes pending. Each queued/held acquisition owns a Process
+reference. Handoffs take an additional temporary reference through the final
+`SchedulerUnblock`, because a recipient can finish before that call returns.
+KMutex checks the pinned owner pointer and incarnation, not merely a reusable PID.
+
+Unlock drops the acquisition reference but keeps the operation protected until
+syscall return, completed user file fault, a user-mode timer tick, or final exit
+cleanup. This covers state between locks, such as a FAT cache loading placeholder.
+A terminal request must not abandon a partial filesystem mutation. There is no
+force-unlock recovery; a stalled operation remains pending and group-exit timeout
+reports it without marking the live operation reapable. KRwLock exit cleanup is
+now an invariant check, not a way to release partially mutated filesystem state.
+
+Timer reaping only runs at user/idle boundaries, inside its own protected region,
+so filesystem closes cannot re-enter a lock on an interrupted kernel stack.
+Kernel-only workers need an explicit completed-operation boundary before deferred
+termination can be delivered; ordinary user return boundaries cover filesystem
+syscalls. A file-backed user-buffer fault can also arm protection inside a
+syscall that subsequently waits on a pipe, futex, or socket; such unrelated,
+unbounded waits need explicit operation-boundary review before claiming bounded
+fatal-signal latency for every syscall. KSemaphore and general VM lifecycle
+synchronization are separate work. Process-directed `kill(pid, SIGKILL)` now
+terminates the thread group; existing `tkill`/`tgkill` fatal-group semantics and
+`kill` process-group selectors remain separate compatibility work.
+
+The `test_krwlock_cleanup` host target compiles both real lock implementations. Its
+scheduler mock checks references and delayed grants; actual scheduler cancellation
+requires the guest `fsexitcheck` regression and full bootstrap acceptance.
 
 ### Callers
 KMutex is the primary sleeping lock used throughout the kernel:
@@ -138,16 +169,16 @@ struct KRwLock {
 | `KRwLockWriteUnlock` | `(KRwLock*)` | Prefer waking ALL queued readers (batch, up to 128). If no readers, wake next writer. |
 
 ### Known Issues
-- **BRO-077**: Missing `pendingWakeup` pattern — lost wakeup race between
-  GuardRelease and SchedulerBlock. Both ReadLock and WriteLock are affected.
+- Read/write waiters recheck their grant after unrelated wakes; `pendingWakeup`
+  closes the guard-release-to-block window.
 - **~~BRO-078~~**: Fixed — `KRwLockReadLock` now checks both `writerActive` and
   `writersWaiting`. Writers cannot be starved by new readers.
 - Batch reader wakeup caps at 128 (stack array). More than 128 queued readers
   would require multiple passes — currently not handled (excess readers stay queued).
-- No `ForceUnlock` equivalent for process teardown (KMutex has `KMutexForceUnlock`).
+- Cancellation is deferred until the complete filesystem operation finishes.
 
 ### Current Users
-Only used in tests (`test_krwlock`). No kernel subsystem uses KRwLock yet.
+Used by the ext2 filesystem and exercised by the real-code host harness.
 
 ---
 

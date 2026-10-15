@@ -60,10 +60,11 @@ add_host_test(test_kmutex)
 add_host_test(test_krwlock)
 add_host_test(test_ksemaphore)
 
-# Real-code harness driving the actual kernel krwlock.cpp (BRO-162). Compiles
-# the real lock implementation against shim process.h/scheduler.h, with cli/sti
-# neutralised via BROOK_HOST_TEST so the privileged guard runs in user space.
+# Real-code cooperative cancellation/lifetime harness for KMutex and KRwLock.
+# Scheduler transitions are modeled; queueing, grants and references are actual
+# kernel code. BROOK_HOST_TEST neutralises privileged guard instructions.
 add_host_test(test_krwlock_cleanup
+    "${BROOK_ROOT}/src/kernel/src/sync/kmutex.cpp"
     "${BROOK_ROOT}/src/kernel/src/sync/krwlock.cpp"
 )
 target_compile_options(test_krwlock_cleanup PRIVATE

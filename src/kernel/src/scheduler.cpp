@@ -1132,12 +1132,69 @@ void SchedulerBlock(Process* proc)
 void SchedulerMarkStopped(Process* proc)
 {
     uint64_t rlf = SchedLockAcquire(g_readyLock);
-    if (proc->state != ProcessState::Terminated)
+    if (proc->state != ProcessState::Terminated && !proc->terminalPending)
     {
         proc->state = ProcessState::Stopped;
         ReadyQueueRemoveLocked(proc);
     }
     SchedLockRelease(g_readyLock, rlf);
+}
+
+static bool KernelRegionTryEnter(Process* proc)
+{
+    uint64_t flags = SchedLockAcquire(g_readyLock);
+    if (proc->state == ProcessState::Terminated) {
+        SchedLockRelease(g_readyLock, flags);
+        return false;
+    }
+    ProcessRef(proc);
+    ++proc->kernelRegionDepth;
+    proc->kernelOperationProtected = true;
+    SchedLockRelease(g_readyLock, flags);
+    return true;
+}
+
+void SchedulerKernelRegionEnter(Process* proc)
+{
+    if (!KernelRegionTryEnter(proc)) {
+        SchedulerYield();
+        __builtin_trap();
+    }
+}
+
+void SchedulerKernelRegionLeave(Process* proc)
+{
+    uint64_t flags = SchedLockAcquire(g_readyLock);
+    if (!proc->kernelRegionDepth) __builtin_trap();
+    --proc->kernelRegionDepth;
+    // Keep the operation latch until its callers have also unwound their state.
+    ProcessUnref(proc);
+    SchedLockRelease(g_readyLock, flags);
+}
+
+bool SchedulerKernelOperationBoundary()
+{
+    Process* proc = SchedulerCurrentProcess();
+    if (!proc) return false;
+    uint64_t flags = SchedLockAcquire(g_readyLock);
+    if (proc->kernelRegionDepth) {
+        SchedLockRelease(g_readyLock, flags);
+        return false;
+    }
+    proc->kernelOperationProtected = false;
+    bool pending = proc->terminalPending;
+    int status = proc->pendingWaitStatus;
+    proc->terminalPending = false;
+    // Keep IF disabled until terminal publication: a killed current thread
+    // must not leave a temporary reference behind on a discarded kernel stack.
+    SchedLockReleaseRaw(g_readyLock);
+    if (pending) {
+        SchedulerMarkTerminated(proc, status);
+        __atomic_store_n(&proc->reapable, true, __ATOMIC_RELEASE);
+    }
+    bool terminal = proc->state == ProcessState::Terminated;
+    if (flags & 0x200) __asm__ volatile("sti" ::: "memory");
+    return terminal;
 }
 
 void SchedulerMarkTerminated(Process* proc, int waitStatus)
@@ -1146,6 +1203,19 @@ void SchedulerMarkTerminated(Process* proc, int waitStatus)
     // targets. All nonterminal state transitions use this same ready lock.
     uint64_t rlf = SchedLockAcquire(g_readyLock);
     ProcessRef(proc);
+    if (proc->state != ProcessState::Terminated &&
+        (proc->kernelRegionDepth || proc->kernelOperationProtected)) {
+        if (!proc->terminalPending) proc->pendingWaitStatus = waitStatus;
+        proc->terminalPending = true;
+        bool resume = proc->state == ProcessState::Stopped;
+        SchedLockReleaseRaw(g_readyLock);
+        // A stopped owner/waiter must be allowed to finish its operation.
+        // Ordinary blocked mutex waiters still wait for an ownership grant.
+        if (resume) SchedulerUnblock(proc);
+        ProcessUnref(proc);
+        if (rlf & 0x200) __asm__ volatile("sti" ::: "memory");
+        return;
+    }
     if (proc->state != ProcessState::Terminated)
     {
         proc->waitStatus = waitStatus;
@@ -1691,7 +1761,15 @@ void SchedulerTimerTick(bool allowPreempt)
             ReleaseSchedulerReference(alarmTargets[i], false);
         }
 
-        ReapTerminated();
+        // Destruction closes filesystem handles and may sleep. Never run it
+        // atop an interrupted kernel operation (which might own the same lock),
+        // nor on a stack already selected for asynchronous terminal retirement.
+        Process* reaper = g_perCpu[cpu].currentProcess;
+        if (reaper && (allowPreempt || reaper == g_perCpu[cpu].idleProcess) &&
+            KernelRegionTryEnter(reaper)) {
+            ReapTerminated();
+            SchedulerKernelRegionLeave(reaper);
+        }
 
         // Periodically verify device registry integrity (~every 1000 ticks ≈ 1s).
         // This catches silent BSS corruption early before it causes a #GP.
@@ -1858,6 +1936,8 @@ void SchedulerTimerTick(bool allowPreempt)
         }
         return;
     }
+
+    if (allowPreempt) SchedulerKernelOperationBoundary();
 
     // A Terminated process MUST be descheduled immediately, regardless of
     // whether the tick interrupted user or kernel mode.  exit_group /
@@ -2092,6 +2172,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
         proc->fbVirtualSize = 0;
     }
 
+    SchedulerKernelOperationBoundary(); // Exit cleanup has finished, including closes.
     SchedulerMarkTerminated(proc, terminationSignal ? (terminationSignal & 0x7f)
                                                     : ((status & 0xff) << 8));
 
@@ -2402,6 +2483,21 @@ Process* ProcessCurrent()
     return g_perCpu[ThisCpu()].currentProcess;
 }
 
+Process* SchedulerFindProcessReference(uint16_t pid)
+{
+    uint64_t flags = SchedLockAcquire(g_allProcLock);
+    Process* found = nullptr;
+    for (uint32_t i = 0; i < g_processCount; ++i) {
+        if (g_allProcesses[i]->pid == pid) {
+            found = g_allProcesses[i];
+            ProcessRef(found);
+            break;
+        }
+    }
+    SchedLockRelease(g_allProcLock, flags);
+    return found;
+}
+
 Process* ProcessFindByPid(uint16_t pid)
 {
     uint64_t alf = SchedLockAcquire(g_allProcLock);
@@ -2511,6 +2607,9 @@ void SchedulerFreePid(uint16_t pid)
 void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus,
                               int terminationSignal)
 {
+    Process* executing = SchedulerCurrentProcess();
+    // Snapshot references and cleanup work must survive cancellation too.
+    if (executing) SchedulerKernelRegionEnter(executing);
     Process* targets[MAX_PROCESSES];
     uint32_t count = 0;
 
@@ -2531,7 +2630,7 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus,
     for (uint32_t i = 0; i < g_processCount; ++i)
     {
         Process* p = g_allProcesses[i];
-        if (p && p != caller && p->tgid == tgid
+        if (p && p != caller && p != executing && p->tgid == tgid
             && p->state != ProcessState::Terminated)
         {
             if (count < MAX_PROCESSES) {
@@ -2601,7 +2700,8 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus,
         uint32_t attempts = 0;
         constexpr uint32_t MAX_ATTEMPTS = 10000000; // ~10s
         bool quiesced = true;
-        while (__atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) >= 0)
+        while (__atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) >= 0 ||
+               p->state != ProcessState::Terminated)
         {
             // Ensure interrupts are enabled so timer ticks can fire
             // and deschedule the Terminated thread on its CPU.
@@ -2611,21 +2711,19 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus,
             {
                 int cpu = __atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE);
                 SerialPrintf("SCHED: exit_group timeout waiting for pid=%u "
-                             "(stuck on cpu=%d), forcing reapable\n",
+                             "(cpu=%d), retaining pending thread\n",
                              p->pid, cpu);
                 quiesced = false;
                 break;
             }
         }
 
-        // Now that the thread is parked (or we gave up after the timeout),
-        // release any kernel rwlocks it held or was waiting on.  On the forced
-        // timeout path the thread is presumably wedged and won't make further
-        // progress, so cleaning up is still the least-bad option.
-        (void)quiesced;
-        KRwLockCleanupOnExit(p);
-
-        __atomic_store_n(&p->reapable, true, __ATOMIC_RELEASE);
+        // A pending filesystem operation still owns its queue/lock references.
+        // Timeout is diagnostic, never permission to release live filesystem state.
+        if (quiesced) {
+            KRwLockCleanupOnExit(p);
+            __atomic_store_n(&p->reapable, true, __ATOMIC_RELEASE);
+        }
 
         // BRO-173/175: drop the teardown reference taken in the snapshot.  Once
         // this falls to 0 (and the thread is Terminated, reapable, off-CPU) the
@@ -2634,6 +2732,7 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus,
         // notify after the drop so a parent's WNOHANG check can now reap it.
         ReleaseSchedulerReference(p, false);
     }
+    if (executing) SchedulerKernelRegionLeave(executing);
 }
 
 
