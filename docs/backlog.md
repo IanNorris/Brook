@@ -2,15 +2,15 @@
 
 ## Workload findings, 16 October
 
-- Chromium streaming playback: direct HTTP H.264/AAC video and nonzero audio pass,
-  but YouTube remains at media time zero. A local fragmented MP4 MediaSource
-  control reproduces a stall (four initial frames, then time zero on a fresh
-  guest; sometimes no sourceopen on later navigation). The identical fixture
-  plays on host Linux. Diagnose the blocked pipeline before treating this as
-  codec or network failure; the first YouTube media response is HTTP 200, and
-  its sampled stall is mostly idle. Guest-only Chromium diagnostic forwarding
-  is available in the isolated experiment, without using the host desktop.
-
+- Chromium suspension/resume: YouTube video and audio now pass with diagnostic
+  `--autoplay-policy=no-user-gesture-required` (854×480, 101 seconds, 3,044 decoded
+  frames and nonzero captured PCM). Default-policy MSE startup can stall in
+  `kSuspending`, and a longer YouTube pause/resume still stalls. Video-only and
+  combined audio/video MSE play under the diagnostic policy. `sys_shutdown` is
+  still a success-only stub: implement real Unix socket half/full shutdown with
+  concurrent-reader/poller wakeup and descriptor-lifetime tests, then check
+  whether it resolves media cancellation. This is a source lead, not yet a
+  proved root cause. Keep direct-file, MSE, startup and resume acceptance separate.
 - Fix kernel-symbol table generation on incremental/fresh builds: the current
   post-link generator writes addresses for the next link. Chromium's preserved
   panic labeled RIP `0xffffffff800af838` as KRwLockReadLock, while the exact

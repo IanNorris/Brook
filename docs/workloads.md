@@ -1495,3 +1495,44 @@ direct-file decode/audio path; they do not yet identify its syscall root cause.
 The initial YouTube stall profile has 781 idle samples out of 802, rather than
 sustained decoding CPU pressure. The focused rerun is preserved under ignored
 `build/workloads/chromium-mse-20261016/`.
+
+
+### Chromium YouTube video and audio: diagnostic launch (16 October)
+
+The focused retry verifies actual YouTube playback with
+`--autoplay-policy=no-user-gesture-required` added to the isolated launch. The
+same six-GiB/eight-vCPU software-rendered VM reaches 101.347 seconds, 854×480,
+readyState 4, unpaused/unmuted at volume 1, with 3,044 decoded frames. Earlier
+samples show 0.52 and 30.36 seconds; these are actual movie frames, not the
+thumbnail. A fresh browser restart with the saved cookie rejection also plays.
+The native 1920×1080 capture shows the movie in a roughly 1500×900 browser window;
+`Browser.setWindowBounds` avoids the existing maximize-placement issue.
+
+YouTube audio also works in this run. A fresh three-second silent-backend capture
+contains 135,844 stereo frames at 44,100 Hz, duration 3.080 seconds, RMS 0.0552
+and no silent plot bins. Speakers remain unused. This establishes output, not
+full audio quality or absence of intermittent stutter. The browser closes with
+exit 0, ten baseline processes and a healthy heap; checked shutdown and all
+three offline filesystem checks pass.
+
+The autoplay flag is a diagnostic workaround, not a general playback fix. Under
+the ordinary policy, the minimal MSE fixture can decode four frames and then
+stall at time zero; its saved media log stops in `kSuspending`. Under the diagnostic
+policy, video-only MSE loops past 1,400 frames and the combined H.264/AAC fixture
+plays with nonzero captured audio. A short pause/resume in that fixture passes;
+a longer YouTube pause/resume still stalls. Do not classify all MSE, audio or
+YouTube interactions as accepted from this run.
+
+Source inspection found `sys_shutdown` still returns success without performing
+socket shutdown. This is a candidate cause of media-thread cancellation hangs;
+no causal reproduction or shutdown implementation is claimed here. Implement
+and test real Unix socket half/full shutdown and wakeup semantics before removing
+the workaround or declaring suspension/resume reliable.
+
+The compatibility checkpoint is commit `56175f8`. Playback evidence and exact
+launch scripts are under ignored `build/workloads/chromium-mse-20261016/`, session
+`3a253330c455439abf69342010a3a800`, with structured `acceptance.json`, guest media
+logs, CDP state snapshots and the local fragmented-MP4 fixtures. The clean native
+screenshot is `1cbd212eb87b407cae9d668a44a877e5.png`; the final YouTube PCM capture
+is `ca59111f596b4f5c97159cc44b10a51c.wav` in that session's artifacts. No media,
+private profiles, VM disks or copyrighted Quake data are added to Git.
