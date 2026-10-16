@@ -771,6 +771,33 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         // Start the profiler kernel thread (sampling disabled until ProfilerStart).
         brook::ProfilerInit();
 
+        // The desktop's current single account shares the persistent data
+        // volume. Create its home before launcher/terminal applications start.
+        // Do not create an ephemeral replacement when that volume is absent.
+        brook::VnodeStat homeVolume{};
+        if (brook::VfsStatPath("/data", &homeVolume) == 0 && homeVolume.isDir)
+        {
+            // Match experiment-image ownership for the current desktop UID.
+            // Preserve existing home ownership; this is not account migration.
+            uint32_t homeUid = 1000, homeGid = 100;
+            const char* directories[] = {"/data/home", "/data/home/.cache",
+                "/data/home/.config", "/data/home/.local", "/data/home/.local/share"};
+            for (const char* directory : directories)
+            {
+                brook::VnodeStat st{};
+                if (brook::VfsStatPath(directory, &st) == 0 && st.isDir)
+                {
+                    if (directory == directories[0]) { homeUid = st.uid; homeGid = st.gid; }
+                    continue;
+                }
+                if (brook::VfsMkdir(directory, 0755) != 0)
+                    brook::SerialPrintf("home: cannot create %s\n", directory);
+                else if (brook::Ext2Chown(directory, homeUid, homeGid) != 0)
+                    brook::SerialPrintf("home: cannot set ownership of %s\n", directory);
+            }
+        }
+        else brook::SerialPuts("home: persistent /data volume unavailable\n");
+
         // Execute the boot script if present.
         // This may call ProfilerStart() via the "profile" command,
         // so the profiler thread must already exist.

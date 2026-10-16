@@ -55,6 +55,7 @@ struct VnodeOps {
     int (*truncate)(Vnode* vn, uint64_t size) = nullptr;
     // Borrowed stable live-inode object; caller retains vn through use.
     FileObject* (*file_object)(Vnode* vn) = nullptr;
+    int (*chown)(Vnode* vn, uint32_t uid, uint32_t gid) = nullptr;
 };
 
 struct Vnode {
@@ -163,6 +164,8 @@ struct VfsFsOps {
     int (*remove_path)(void* mountPriv, uint8_t pdrv, const char* relPath,
                        bool directory) = nullptr;
     bool (*can_unmount)(void* mountPriv) = nullptr;
+    int (*chown)(void* mountPriv, uint8_t pdrv, const char* relPath,
+                 uint32_t uid, uint32_t gid, bool nofollow) = nullptr;
 };
 
 // Register a filesystem driver with the VFS.
@@ -247,6 +250,8 @@ int VfsSetTimes(Vnode* vn, const VnodeTime* times);
 int VfsSetTimesPath(const char* path, const VnodeTime* times, bool nofollow);
 int VfsChmod(Vnode* vn, uint16_t mode);
 int VfsChmodPath(const char* path, uint16_t mode);
+int VfsChown(Vnode* vn, uint32_t uid, uint32_t gid);
+int VfsChownPath(const char* path, uint32_t uid, uint32_t gid, bool nofollow = false);
 
 // Delete a file by path.
 int VfsUnlink(const char* path);

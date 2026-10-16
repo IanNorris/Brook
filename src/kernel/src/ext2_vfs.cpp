@@ -2463,6 +2463,42 @@ static int Ext2VnodeChmod(Vnode* vn, uint16_t mode)
     return result;
 }
 
+// Caller holds the filesystem write lock. This backend currently exposes
+// 16-bit ownership; reject larger IDs rather than silently truncating them.
+static int Ext2SetInodeOwner(Ext2Mount* mnt, uint32_t ino, uint32_t uid, uint32_t gid)
+{
+    if ((uid != 0xffffffffu && uid > 65535) || (gid != 0xffffffffu && gid > 65535)) return -75;
+    Process* cur = ProcessCurrent();
+    if (cur && cur->euid != 0) return -1;
+    Ext2Inode data;
+    if (!Ext2ReadInode(mnt, ino, &data)) return -5;
+    if (uid != 0xffffffffu) data.i_uid = static_cast<uint16_t>(uid);
+    if (gid != 0xffffffffu) data.i_gid = static_cast<uint16_t>(gid);
+    if ((data.i_mode & EXT2_S_IFMT) == EXT2_S_IFREG) {
+        data.i_mode &= ~04000;
+        if (data.i_mode & 0010) data.i_mode &= ~02000;
+    }
+    data.i_ctime = Ext2Now();
+    return Ext2WriteInode(mnt, ino, &data) ? 0 : -5;
+}
+
+static int Ext2VnodeChown(Vnode* vn, uint32_t uid, uint32_t gid)
+{
+    Ext2Mount* mnt;
+    uint32_t ino;
+    if (vn->type == VnodeType::Dir) {
+        auto* dp = static_cast<Ext2DirPriv*>(vn->priv);
+        mnt = dp->mnt; ino = dp->inode;
+    } else {
+        auto* fp = static_cast<Ext2FilePriv*>(vn->priv);
+        mnt = fp->mnt; ino = fp->inode;
+    }
+    KRwLockWriteLock(&g_ext2Lock);
+    int result = Ext2SetInodeOwner(mnt, ino, uid, gid);
+    KRwLockWriteUnlock(&g_ext2Lock);
+    return result;
+}
+
 static int Ext2FsSync(void* mountPriv);
 
 static int Ext2VnodeFsync(Vnode* vn)
@@ -2489,6 +2525,7 @@ static const VnodeOps g_ext2FileOps = {
     .chmod   = Ext2VnodeChmod,
     .truncate = Ext2FileTruncate,
     .file_object = Ext2FileObject,
+    .chown   = Ext2VnodeChown,
 };
 
 static const VnodeOps g_ext2DirOps = {
@@ -2501,6 +2538,7 @@ static const VnodeOps g_ext2DirOps = {
     .fsync   = Ext2VnodeFsync,
     .set_times = Ext2VnodeSetTimes,
     .chmod   = Ext2VnodeChmod,
+    .chown   = Ext2VnodeChown,
 };
 
 // ---------------------------------------------------------------------------
@@ -3532,31 +3570,26 @@ int Ext2Chmod(const char* path, uint16_t mode)
 
 int Ext2Chown(const char* path, uint32_t uid, uint32_t gid)
 {
-    Ext2Mount* mnt = nullptr;
-    for (int i = 0; i < EXT2_MAX_MOUNTS; ++i) {
-        if (!g_ext2Mounts[i]) continue;
-        mnt = g_ext2Mounts[i];
-        break;
-    }
-    if (!mnt) return -2;
+    return VfsChownPath(path, uid, gid);
+}
 
+static int Ext2FsChown(void* mountPriv, uint8_t pdrv, const char* relPath,
+                       uint32_t uid, uint32_t gid, bool nofollow)
+{
+    (void)pdrv;
+    auto* mnt = static_cast<Ext2Mount*>(mountPriv);
     KRwLockWriteLock(&g_ext2Lock);
-
-    const char* p = path;
-    while (*p == '/') ++p;
-    uint32_t ino = *p ? Ext2ResolvePath(mnt, EXT2_ROOT_INO, p, 0) : EXT2_ROOT_INO;
-    if (!ino) { KRwLockWriteUnlock(&g_ext2Lock); return -2; }
-
-    Ext2Inode inodeData;
-    if (!Ext2ReadInode(mnt, ino, &inodeData)) { KRwLockWriteUnlock(&g_ext2Lock); return -5; }
-
-    if (uid != 0xFFFFFFFF) inodeData.i_uid = static_cast<uint16_t>(uid);
-    if (gid != 0xFFFFFFFF) inodeData.i_gid = static_cast<uint16_t>(gid);
-    inodeData.i_ctime = Ext2Now();
-    Ext2WriteInode(mnt, ino, &inodeData);
-
+    uint32_t ino = EXT2_ROOT_INO;
+    if (*relPath && nofollow) {
+        char name[256];
+        uint32_t parent = Ext2ResolveParent(mnt, relPath, name, sizeof(name));
+        Ext2Inode parentData;
+        ino = parent && Ext2ReadInode(mnt, parent, &parentData)
+            ? Ext2DirLookup(mnt, parent, &parentData, name) : 0;
+    } else if (*relPath) ino = Ext2ResolvePath(mnt, EXT2_ROOT_INO, relPath, 0);
+    int result = ino ? Ext2SetInodeOwner(mnt, ino, uid, gid) : -2;
     KRwLockWriteUnlock(&g_ext2Lock);
-    return 0;
+    return result;
 }
 
 static int Ext2FsSetTimes(void* mountPriv, uint8_t pdrv, const char* relPath,
@@ -3599,6 +3632,7 @@ static const VfsFsOps g_ext2FsOps = {
     .chmod      = Ext2FsChmod,
     .remove_path = Ext2FsRemovePath,
     .can_unmount = Ext2FsCanUnmount,
+    .chown      = Ext2FsChown,
 };
 
 // ---------------------------------------------------------------------------

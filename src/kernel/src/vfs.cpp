@@ -638,6 +638,26 @@ int VfsChmodPath(const char* path, uint16_t mode)
     return mount->fsOps->chmod(mount->mountPriv, mount->pdrv, relPath, mode);
 }
 
+int VfsChown(Vnode* vn, uint32_t uid, uint32_t gid)
+{
+    if (!vn) return -9;
+    if (!vn->ops || !vn->ops->chown) return -95;
+    return vn->ops->chown(vn, uid, gid);
+}
+
+int VfsChownPath(const char* path, uint32_t uid, uint32_t gid, bool nofollow)
+{
+    if (!path || !path[0]) return -2;
+    char resolved[512];
+    const char* lookup = path;
+    if (VfsResolveSymlinks(path, resolved, sizeof(resolved), !nofollow)) lookup = resolved;
+    const char* relPath = nullptr;
+    MountEntry* mount = FindMount(lookup, &relPath);
+    if (!mount) return -2;
+    if (!mount->fsOps || !mount->fsOps->chown) return -95;
+    return mount->fsOps->chown(mount->mountPriv, mount->pdrv, relPath, uid, gid, nofollow);
+}
+
 int VfsRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
 {
     if (!vn) return -1;

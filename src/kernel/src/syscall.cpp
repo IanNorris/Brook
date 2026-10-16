@@ -3055,7 +3055,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     {
         struct SyntheticFile { const char* path; const char* content; };
         static const SyntheticFile syntheticFiles[] = {
-            { "/etc/passwd", "root:x:0:0:root:/:/boot/BIN/BASH\n" },
+            { "/etc/passwd", "root:x:0:0:root:/data/home:/boot/BIN/BASH\n" },
             { "/etc/group",  "root:x:0:\n" },
             { "/etc/shells", "/boot/BIN/BASH\n" },
             { "/etc/hostname", "brook\n" },
@@ -9526,44 +9526,72 @@ static int64_t sys_fchmodat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
 // — apply ownership changes to ext2 files (root only)
 // ---------------------------------------------------------------------------
 
+static int64_t ChownAt(int dirfd, uint64_t pathAddr, uint32_t uid, uint32_t gid, uint64_t flags)
+{
+    constexpr uint64_t NOFOLLOW = 0x100, EMPTY_PATH = 0x1000;
+    if (flags & ~(NOFOLLOW | EMPTY_PATH)) return -EINVAL;
+    Process* proc = ProcessCurrent();
+    if (!proc || proc->euid != 0) return -EPERM;
+    char path[256];
+    if (!CopyUserCString(pathAddr, path, sizeof(path))) return -EFAULT;
+    FdRef directory(proc, dirfd);
+    if (!path[0]) {
+        if (!(flags & EMPTY_PATH)) return -ENOENT;
+        if (dirfd == -100) return VfsChownPath(proc->cwd, uid, gid);
+        if (!directory) return -EBADF;
+        if (directory->type != FdType::Vnode) return -95;
+        return VfsChown(static_cast<Vnode*>(directory->handle), uid, gid);
+    }
+    const char* lookup = path;
+    char resolved[512];
+    if (path[0] != '/') {
+        const char* prefix = proc->cwd;
+        if (dirfd != -100) {
+            if (!directory) return -EBADF;
+            if (directory->type != FdType::Vnode || !directory->handle ||
+                static_cast<Vnode*>(directory->handle)->type != VnodeType::Dir) return -ENOTDIR;
+            if (!directory->dirPath[0]) return -ENOENT;
+            prefix = directory->dirPath;
+        }
+        const uint32_t plen = strlen(prefix), length = strlen(path);
+        const bool slash = plen && prefix[plen - 1] != '/';
+        if (plen + slash + length >= sizeof(resolved)) return -36;
+        memcpy(resolved, prefix, plen);
+        uint32_t pos = plen;
+        if (slash) resolved[pos++] = '/';
+        memcpy(resolved + pos, path, length + 1);
+        lookup = resolved;
+    }
+    return VfsChownPath(lookup, uid, gid, (flags & NOFOLLOW) != 0);
+}
+
 static int64_t sys_chown(uint64_t pathAddr, uint64_t uid, uint64_t gid,
                           uint64_t, uint64_t, uint64_t)
 {
-    Process* proc = ProcessCurrent();
-    if (!proc || proc->euid != 0) return -EPERM;
-    char pathBuf[256];
-    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
-    int rc = brook::Ext2Chown(pathBuf, static_cast<uint32_t>(uid), static_cast<uint32_t>(gid));
-    return (rc == -2) ? 0 : rc;
+    return ChownAt(-100, pathAddr, static_cast<uint32_t>(uid), static_cast<uint32_t>(gid), 0);
 }
 
-static int64_t sys_fchown(uint64_t, uint64_t, uint64_t,
+static int64_t sys_fchown(uint64_t fd, uint64_t uid, uint64_t gid,
                            uint64_t, uint64_t, uint64_t)
 {
-    return 0; // TODO: implement via fd lookup
+    Process* proc = ProcessCurrent();
+    if (!proc || proc->euid != 0) return -EPERM;
+    FdRef ref(proc, static_cast<int>(fd));
+    if (!ref) return -EBADF;
+    if (ref->type != FdType::Vnode) return -95;
+    return VfsChown(static_cast<Vnode*>(ref->handle), static_cast<uint32_t>(uid), static_cast<uint32_t>(gid));
 }
 
 static int64_t sys_lchown(uint64_t pathAddr, uint64_t uid, uint64_t gid,
                            uint64_t, uint64_t, uint64_t)
 {
-    Process* proc = ProcessCurrent();
-    if (!proc || proc->euid != 0) return -EPERM;
-    char pathBuf[256];
-    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
-    int rc = brook::Ext2Chown(pathBuf, static_cast<uint32_t>(uid), static_cast<uint32_t>(gid));
-    return (rc == -2) ? 0 : rc;
+    return ChownAt(-100, pathAddr, static_cast<uint32_t>(uid), static_cast<uint32_t>(gid), 0x100);
 }
 
 static int64_t sys_fchownat(uint64_t dirfd, uint64_t pathAddr, uint64_t uid,
-                             uint64_t gid, uint64_t, uint64_t)
+                             uint64_t gid, uint64_t flags, uint64_t)
 {
-    (void)dirfd;
-    Process* proc = ProcessCurrent();
-    if (!proc || proc->euid != 0) return -EPERM;
-    char pathBuf[256];
-    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
-    int rc = brook::Ext2Chown(pathBuf, static_cast<uint32_t>(uid), static_cast<uint32_t>(gid));
-    return (rc == -2) ? 0 : rc;
+    return ChownAt(static_cast<int>(dirfd), pathAddr, static_cast<uint32_t>(uid), static_cast<uint32_t>(gid), flags);
 }
 
 // ---------------------------------------------------------------------------

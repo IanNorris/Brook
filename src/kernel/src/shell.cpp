@@ -90,7 +90,7 @@ static bool g_scriptMode = false;
 // run with a stripped-down environment and TLS / fontconfig / wayland
 // would silently break.
 const char* const g_defaultEnvp[] = {
-    "HOME=/home",
+    "HOME=/data/home",
     "PATH=/nix/profile/bin:/nix/bin:"
           "/nix/store/sm2nq18jjqp4x0sxpl6lrvwl9rx6mvj2-curl-8.19.0-bin/bin:"
           "/nix/store/2nm5c858fh52s6mhcffm07s3biaxys44-xz-5.8.3-bin/bin:"
@@ -159,9 +159,9 @@ const char* const g_defaultEnvp[] = {
     "LIBGL_DRIVERS_PATH=/nix/store/b793hmy0383vxaax7hiaslzmizzd3pmg-mesa-26.0.6/lib/dri",
     "GBM_BACKENDS_PATH=/nix/store/b793hmy0383vxaax7hiaslzmizzd3pmg-mesa-26.0.6/lib/gbm",
     "__EGL_VENDOR_LIBRARY_DIRS=/nix/store/b793hmy0383vxaax7hiaslzmizzd3pmg-mesa-26.0.6/share/glvnd/egl_vendor.d",
-    "XDG_CACHE_HOME=/home/.cache",
-    "XDG_CONFIG_HOME=/home/.config",
-    "XDG_DATA_HOME=/home/.local/share",
+    "XDG_CACHE_HOME=/data/home/.cache",
+    "XDG_CONFIG_HOME=/data/home/.config",
+    "XDG_DATA_HOME=/data/home/.local/share",
     "XDG_DATA_DIRS=/nix/store/jmp6v1wk4cwrm0m9ba8ri9ah8y4745g7-brook-fonts-0.1/share:/usr/share",
     // Python: avoid write attempts to read-only nix store, skip user site
     "PYTHONDONTWRITEBYTECODE=1",
