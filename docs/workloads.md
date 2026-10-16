@@ -1140,3 +1140,19 @@ filesystem-exit checks, private framebuffer aliases, futex/mixed-wait exit,
 fatal signal reaping and heap integrity. Checked shutdown and all three offline
 filesystem checks passed. Evidence and private captures remain ignored in
 `build/workloads/debug-tcp-final-races-20261016/audit.json`.
+
+### Export preparation for the next stock workloads
+
+`tools/workload-pkg` now has individual export expressions for Blender, GIMP,
+OpenTTD, zsh, kitty, starship and fastfetch, using the existing SDK package pin.
+For example, export OpenTTD into the private package cache with:
+
+```sh
+nix-shell --run 'python3 scripts/export_guest_package.py --expression tools/workload-pkg/openttd.nix --name brook-openttd --version 15.3'
+```
+
+Nix evaluation resolves these selectors to Blender 5.1.1, GIMP 3.0.8, OpenTTD
+15.3, zsh 5.9, kitty 0.46.2, starship 1.25.1 and fastfetch 2.62.1. This verifies
+package selection, not guest compatibility or installation of those new apps.
+The existing GIMP acceptance above remains a separate result. No default shell
+or terminal has changed; interactive acceptance is required first.
