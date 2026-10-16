@@ -195,6 +195,11 @@ struct brook_dmabuf_buffer {
 };
 static int is_dmabuf_buffer(struct wl_resource *buf);
 
+struct brook_frame_callback {
+    struct wl_resource *resource;
+    struct wl_list link;
+};
+
 struct brook_surface {
     struct wl_resource *resource;
     struct wl_resource *pending_buffer;
@@ -211,10 +216,8 @@ struct brook_surface {
     int32_t popup_x, popup_y;
     struct brook_surface *popup_parent;
 
-    /* Pending frame callbacks queued by wl_surface.frame() since the
-     * last commit. Fired with a millisecond timestamp at commit time. */
-    struct wl_resource *pending_frame_cbs[8];
-    int pending_frame_cb_count;
+    /* Requests become eligible only when their surface state is committed. */
+    struct wl_list pending_frames, committed_frames;
 
     /* Latest set_title — copied so it survives the wayland string. */
     char title[64];
@@ -367,17 +370,38 @@ static void surface_damage(struct wl_client *c, struct wl_resource *r,
                            int32_t x, int32_t y, int32_t w, int32_t h) {
     (void)c; (void)r; (void)x; (void)y; (void)w; (void)h;
 }
-static void surface_frame(struct wl_client *c, struct wl_resource *r, uint32_t cb) {
-    struct brook_surface *s = wl_resource_get_user_data(r);
-    struct wl_resource *cb_r = wl_resource_create(c, &wl_callback_interface, 1, cb);
-    if (!cb_r) return;
-    int cap = (int)(sizeof(s->pending_frame_cbs)/sizeof(s->pending_frame_cbs[0]));
-    if (s->pending_frame_cb_count < cap) {
-        s->pending_frame_cbs[s->pending_frame_cb_count++] = cb_r;
-    } else {
-        wl_callback_send_done(cb_r, g_now_ms());
-        wl_resource_destroy(cb_r);
+static void frame_callback_destroy(struct wl_resource *resource) {
+    struct brook_frame_callback *callback = wl_resource_get_user_data(resource);
+    wl_list_remove(&callback->link);
+    free(callback);
+}
+static void surface_frame(struct wl_client *c, struct wl_resource *r, uint32_t id) {
+    struct brook_surface *surface = wl_resource_get_user_data(r);
+    struct brook_frame_callback *callback = calloc(1, sizeof(*callback));
+    if (!callback) { wl_client_post_no_memory(c); return; }
+    callback->resource = wl_resource_create(c, &wl_callback_interface, 1, id);
+    if (!callback->resource) { free(callback); wl_client_post_no_memory(c); return; }
+    wl_list_insert(surface->pending_frames.prev, &callback->link);
+    wl_resource_set_implementation(callback->resource, NULL, callback, frame_callback_destroy);
+}
+static void surface_send_frame_callbacks(struct brook_surface *surface, uint32_t now) {
+    struct brook_frame_callback *callback, *next;
+    wl_list_for_each_safe(callback, next, &surface->committed_frames, link) {
+        wl_callback_send_done(callback->resource, now);
+        wl_resource_destroy(callback->resource);
     }
+}
+static struct wl_event_source *g_frame_timer;
+static int frame_clock_tick(void *unused) {
+    (void)unused;
+    uint32_t now = g_now_ms();
+    for (struct brook_surface *surface = g_surfaces; surface; surface = surface->next) {
+        struct brook_surface *root = surface;
+        while (root->subsurface_parent) root = root->subsurface_parent;
+        if (root->wm_id || surface->is_cursor) surface_send_frame_callbacks(surface, now);
+    }
+    wl_event_source_timer_update(g_frame_timer, 16);
+    return 0;
 }
 static void surface_set_opaque_region(struct wl_client *c, struct wl_resource *r,
                                        struct wl_resource *reg) {
@@ -440,6 +464,12 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
         return;
     }
 
+    /* A bufferless commit still commits frame requests. Deliver them on the
+     * shared frame clock, not synchronously from request dispatch. */
+    if (!wl_list_empty(&s->pending_frames)) {
+        wl_list_insert_list(s->committed_frames.prev, &s->pending_frames);
+        wl_list_init(&s->pending_frames);
+    }
     if (!s->pending_buffer) return;
 
     /* Hardware GL path: a dmabuf-backed buffer (Mesa's render target shared via
@@ -487,11 +517,6 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
                             s->wm_id, db->gres, rc);
             }
         }
-        for (int i = 0; i < s->pending_frame_cb_count; i++) {
-            wl_callback_send_done(s->pending_frame_cbs[i], g_now_ms());
-            wl_resource_destroy(s->pending_frame_cbs[i]);
-        }
-        s->pending_frame_cb_count = 0;
         wl_buffer_send_release(s->pending_buffer);
         s->pending_buffer = NULL;
         return;
@@ -543,12 +568,6 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
         }
         wl_buffer_send_release(s->pending_buffer);
         s->pending_buffer = NULL;
-        /* Fire frame callbacks so the client keeps sending updates */
-        for (int i = 0; i < s->pending_frame_cb_count; i++) {
-            wl_callback_send_done(s->pending_frame_cbs[i], g_now_ms());
-            wl_resource_destroy(s->pending_frame_cbs[i]);
-        }
-        s->pending_frame_cb_count = 0;
         return;
     }
 
@@ -600,13 +619,6 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
         }
         wl_buffer_send_release(s->pending_buffer);
         s->pending_buffer = NULL;
-        /* Fire frame callbacks */
-        uint32_t now = g_now_ms();
-        for (int i = 0; i < s->pending_frame_cb_count; i++) {
-            wl_callback_send_done(s->pending_frame_cbs[i], now);
-            wl_resource_destroy(s->pending_frame_cbs[i]);
-        }
-        s->pending_frame_cb_count = 0;
         return;
     }
 
@@ -689,14 +701,6 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
     wl_buffer_send_release(s->pending_buffer);
     s->pending_buffer = NULL;
 
-    /* Fire any frame callbacks queued via wl_surface.frame(). */
-    uint32_t now = g_now_ms();
-    for (int i = 0; i < s->pending_frame_cb_count; i++) {
-        wl_callback_send_done(s->pending_frame_cbs[i], now);
-        wl_resource_destroy(s->pending_frame_cbs[i]);
-        s->pending_frame_cbs[i] = NULL;
-    }
-    s->pending_frame_cb_count = 0;
 }
 
 static void surface_set_buffer_transform(struct wl_client *c, struct wl_resource *r, int32_t t) {
@@ -761,6 +765,11 @@ static void surface_destroy_userdata(struct wl_resource *r) {
         ch = next_ch;
     }
     if (s->wm_id) wm_destroy_window(s->wm_id);
+    struct brook_frame_callback *callback, *next;
+    wl_list_for_each_safe(callback, next, &s->pending_frames, link)
+        wl_resource_destroy(callback->resource);
+    wl_list_for_each_safe(callback, next, &s->committed_frames, link)
+        wl_resource_destroy(callback->resource);
     free(s);
 }
 
@@ -774,6 +783,8 @@ static void compositor_create_surface(struct wl_client *client,
     struct wl_resource *sr = wl_resource_create(client, &wl_surface_interface,
                                                 wl_resource_get_version(res), id);
     if (!sr) { free(s); wl_client_post_no_memory(client); return; }
+    wl_list_init(&s->pending_frames);
+    wl_list_init(&s->committed_frames);
     s->resource = sr;
     s->next = g_surfaces;
     g_surfaces = s;
@@ -1752,15 +1763,6 @@ static uint32_t scancode_to_xkb(uint8_t sc) {
 
 /* ---------------- input pump ---------------- */
 
-/* Find the seat client owned by the same wl_client that owns `surf`. */
-static struct brook_seat_client *seat_for_surface(struct brook_surface *surf) {
-    if (!surf || !surf->resource) return NULL;
-    struct wl_client *owner = wl_resource_get_client(surf->resource);
-    for (struct brook_seat_client *sc = g_seat_clients; sc; sc = sc->next)
-        if (sc->client == owner) return sc;
-    return NULL;
-}
-
 static void pointer_enter_if_needed(struct brook_seat_client *sc,
                                      struct brook_surface *s,
                                      int lx, int ly) {
@@ -1797,168 +1799,181 @@ static void pointer_enter_if_needed(struct brook_seat_client *sc,
     seat_apply_cursor_visibility(sc);
 }
 
-static void pump_input_for_surface(struct brook_surface *s) {
-    if (!s->wm_id) return;
-    struct brook_wm_event evs[16];
-    long n = wm_pop_input(s->wm_id, evs, 16);
-    if (n <= 0) return;
-
-    struct brook_seat_client *sc = seat_for_surface(s);
-    uint32_t now = g_now_ms();
-
-    for (long i = 0; i < n; ++i) {
-        struct brook_wm_event *e = &evs[i];
-        switch (e->type) {
-        case EVT_MOUSE_MOVE: {
-            if (!sc || !sc->pointer) break;
-            pointer_enter_if_needed(sc, s, e->x, e->y);
-            wl_pointer_send_motion(sc->pointer, now,
-                                   wl_fixed_from_int(e->x),
-                                   wl_fixed_from_int(e->y));
-            if (wl_resource_get_version(sc->pointer) >= 5)
-                wl_pointer_send_frame(sc->pointer);
+static void dispatch_surface_event(struct brook_surface *s,
+                                   struct brook_seat_client *sc,
+                                   struct brook_wm_event *e, uint32_t now) {
+    switch (e->type) {
+    case EVT_MOUSE_MOVE: {
+        if (!sc || !sc->pointer) break;
+        pointer_enter_if_needed(sc, s, e->x, e->y);
+        wl_pointer_send_motion(sc->pointer, now,
+                               wl_fixed_from_int(e->x),
+                               wl_fixed_from_int(e->y));
+        if (wl_resource_get_version(sc->pointer) >= 5)
+            wl_pointer_send_frame(sc->pointer);
+        break;
+    }
+    case EVT_MOUSE_BTN_DOWN:
+    case EVT_MOUSE_BTN_UP: {
+        if (!sc || !sc->pointer) {
+            fprintf(stderr, "[waylandd] btn wm=%u DROPPED (no seat/pointer)\n",
+                    s->wm_id);
             break;
         }
-        case EVT_MOUSE_BTN_DOWN:
-        case EVT_MOUSE_BTN_UP: {
-            if (!sc || !sc->pointer) {
-                fprintf(stderr, "[waylandd] btn wm=%u DROPPED (no seat/pointer)\n",
-                        s->wm_id);
-                break;
-            }
-            pointer_enter_if_needed(sc, s, e->x, e->y);
-            /* scan: 0=left, 1=right, 2=middle  →  BTN_LEFT 0x110, etc. */
-            uint32_t btn = 0x110 + (e->scan & 0x3);
-            uint32_t st  = (e->type == EVT_MOUSE_BTN_DOWN)
-                             ? WL_POINTER_BUTTON_STATE_PRESSED
-                             : WL_POINTER_BUTTON_STATE_RELEASED;
-            wl_pointer_send_button(sc->pointer, next_serial(), now, btn, st);
-            if (wl_resource_get_version(sc->pointer) >= 5)
-                wl_pointer_send_frame(sc->pointer);
-            fprintf(stderr, "[waylandd] btn wm=%u 0x%x %s at (%d,%d)\n",
-                    s->wm_id, btn,
-                    st == WL_POINTER_BUTTON_STATE_PRESSED ? "down" : "up",
-                    e->x, e->y);
-            break;
-        }
-        case EVT_MOUSE_SCROLL: {
-            if (!sc || !sc->pointer) break;
+        pointer_enter_if_needed(sc, s, e->x, e->y);
+        /* scan: 0=left, 1=right, 2=middle  →  BTN_LEFT 0x110, etc. */
+        uint32_t btn = 0x110 + (e->scan & 0x3);
+        uint32_t st  = (e->type == EVT_MOUSE_BTN_DOWN)
+                         ? WL_POINTER_BUTTON_STATE_PRESSED
+                         : WL_POINTER_BUTTON_STATE_RELEASED;
+        wl_pointer_send_button(sc->pointer, next_serial(), now, btn, st);
+        if (wl_resource_get_version(sc->pointer) >= 5)
+            wl_pointer_send_frame(sc->pointer);
+        fprintf(stderr, "[waylandd] btn wm=%u 0x%x %s at (%d,%d)\n",
+                s->wm_id, btn,
+                st == WL_POINTER_BUTTON_STATE_PRESSED ? "down" : "up",
+                e->x, e->y);
+        break;
+    }
+    case EVT_MOUSE_SCROLL: {
+        if (!sc || !sc->pointer) break;
             int32_t dy = (int8_t)e->scan;
+            /* Brook wheel ticks are positive upward; Wayland axis values
+             * are positive downward. */
             wl_pointer_send_axis(sc->pointer, now,
                                  WL_POINTER_AXIS_VERTICAL_SCROLL,
-                                 wl_fixed_from_int(dy * 10));
-            if (wl_resource_get_version(sc->pointer) >= 5)
-                wl_pointer_send_frame(sc->pointer);
-            break;
-        }
-        case EVT_KEY_PRESS:
-        case EVT_KEY_RELEASE: {
-            if (!sc || !sc->keyboard) break;
-            uint32_t st = (e->type == EVT_KEY_PRESS)
-                            ? WL_KEYBOARD_KEY_STATE_PRESSED
-                            : WL_KEYBOARD_KEY_STATE_RELEASED;
-
-            /* Translate kernel's modifier bitmask to xkb modifier indices.
-             * Order matches our keymap's modifier_map: Shift=0, Lock=1,
-             * Control=2, Mod1(Alt)=3. */
-            uint32_t depressed = 0;
-            uint32_t locked    = 0;
-            if (e->mods & 0x03) depressed |= (1u << 0); /* Shift */
-            if (e->mods & 0x04) depressed |= (1u << 2); /* Control */
-            if (e->mods & 0x08) depressed |= (1u << 3); /* Mod1/Alt */
-            if (e->mods & 0x10) locked    |= (1u << 1); /* Lock/Caps */
-
-            /* Send key event first — xkbcommon clients call
-             * xkb_state_update_key() which internally tracks modifier
-             * state from the keymap. */
-            uint32_t xkb_code = scancode_to_xkb(e->scan);
-            wl_keyboard_send_key(sc->keyboard, next_serial(), now,
-                                 xkb_code, st);
-
-            /* Send modifiers only when they changed — avoids double-toggle
-             * where xkb_state_update_key already updated the modifier
-             * internally and a redundant wl_keyboard.modifiers would flip
-             * it back. */
-            if (depressed != sc->kb_mods_depressed ||
-                locked    != sc->kb_mods_locked)
-            {
-                wl_keyboard_send_modifiers(sc->keyboard, next_serial(),
-                                           depressed, 0u, locked, 0u);
-            }
-
-            /* Debug: log key events with modifier info */
-            if (e->scan == 0x2A || e->scan == 0x36 || depressed || locked)
-                fprintf(stderr, "[waylandd] KEY sc=0x%02x xkb=%u %s mods=0x%02x dep=%u lock=%u\n",
-                        e->scan, xkb_code,
-                        st == WL_KEYBOARD_KEY_STATE_PRESSED ? "DN" : "UP",
-                        e->mods, depressed, locked);
-            sc->kb_mods_depressed = depressed;
-            sc->kb_mods_locked    = locked;
-            break;
-        }
-        case WM_EVT_CLOSE_REQUESTED: {
-            if (s->xdg_toplevel) {
-                fprintf(stderr, "[waylandd] CLOSE_REQUESTED → xdg_toplevel.send_close (wm=%u)\n",
-                        s->wm_id);
-                xdg_toplevel_send_close(s->xdg_toplevel);
-            }
-            break;
-        }
-        case WM_EVT_FOCUS_GAINED: {
-            if (sc && sc->keyboard && sc->kb_focus != s) {
-                struct wl_array keys; wl_array_init(&keys);
-                wl_keyboard_send_enter(sc->keyboard, next_serial(),
-                                       s->resource, &keys);
-                wl_array_release(&keys);
-                /* Send current modifier state so client starts with
-                 * correct xkb_state (protocol requires modifiers after enter). */
-                wl_keyboard_send_modifiers(sc->keyboard, next_serial(),
-                                           sc->kb_mods_depressed, 0u,
-                                           sc->kb_mods_locked, 0u);
-                sc->kb_focus = s;
-                text_input_focus(sc, s);
-                fprintf(stderr, "[waylandd] FOCUS_GAINED wm=%u\n", s->wm_id);
-            }
-            break;
-        }
-        case WM_EVT_FOCUS_LOST: {
-            if (sc && sc->keyboard && sc->kb_focus == s) {
-                wl_keyboard_send_leave(sc->keyboard, next_serial(), s->resource);
-                text_input_focus(sc, NULL);
-                sc->kb_focus = NULL;
-                fprintf(stderr, "[waylandd] FOCUS_LOST wm=%u\n", s->wm_id);
-            }
-            break;
-        }
-        case WM_EVT_RESIZED: {
-            /* The kernel WM has resized this window's chrome (drag-resize
-             * release). Tell the client via xdg_toplevel.configure with
-             * the new size — the client will allocate a fresh buffer at
-             * those dimensions, ack_configure, and commit. */
-            if (s->xdg_toplevel && s->xdg_surface) {
-                int32_t neww = e->x;
-                int32_t newh = e->y;
-                struct wl_array states; wl_array_init(&states);
-                /* Tell the client this is an active toplevel; resize is a
-                 * normal configure, not a fullscreen/maximize. */
-                if (wl_resource_get_version(s->xdg_toplevel) >= 2) {
-                    uint32_t *st = wl_array_add(&states, sizeof(uint32_t));
-                    if (st) *st = XDG_TOPLEVEL_STATE_ACTIVATED;
-                }
-                xdg_toplevel_send_configure(s->xdg_toplevel, neww, newh, &states);
-                wl_array_release(&states);
-                uint32_t serial = next_serial();
-                s->next_configure_serial = serial;
-                s->xdg_acked = 0;
-                xdg_surface_send_configure(s->xdg_surface, serial);
-                fprintf(stderr, "[waylandd] WM_EVT_RESIZED wm=%u → configure %dx%d serial=%u\n",
-                        s->wm_id, neww, newh, serial);
-            }
-            break;
-        }
-        default: break;
-        }
+                                 wl_fixed_from_int(-dy * 10));
+        if (wl_resource_get_version(sc->pointer) >= 5)
+            wl_pointer_send_frame(sc->pointer);
+        break;
     }
+    case EVT_KEY_PRESS:
+    case EVT_KEY_RELEASE: {
+        if (!sc || !sc->keyboard) break;
+        uint32_t st = (e->type == EVT_KEY_PRESS)
+                        ? WL_KEYBOARD_KEY_STATE_PRESSED
+                        : WL_KEYBOARD_KEY_STATE_RELEASED;
+
+        /* Translate kernel's modifier bitmask to xkb modifier indices.
+         * Order matches our keymap's modifier_map: Shift=0, Lock=1,
+         * Control=2, Mod1(Alt)=3. */
+        uint32_t depressed = 0;
+        uint32_t locked    = 0;
+        if (e->mods & 0x03) depressed |= (1u << 0); /* Shift */
+        if (e->mods & 0x04) depressed |= (1u << 2); /* Control */
+        if (e->mods & 0x08) depressed |= (1u << 3); /* Mod1/Alt */
+        if (e->mods & 0x10) locked    |= (1u << 1); /* Lock/Caps */
+
+        /* Send key event first — xkbcommon clients call
+         * xkb_state_update_key() which internally tracks modifier
+         * state from the keymap. */
+        uint32_t xkb_code = scancode_to_xkb(e->scan);
+        wl_keyboard_send_key(sc->keyboard, next_serial(), now,
+                             xkb_code, st);
+
+        /* Send modifiers only when they changed — avoids double-toggle
+         * where xkb_state_update_key already updated the modifier
+         * internally and a redundant wl_keyboard.modifiers would flip
+         * it back. */
+        if (depressed != sc->kb_mods_depressed ||
+            locked    != sc->kb_mods_locked)
+        {
+            wl_keyboard_send_modifiers(sc->keyboard, next_serial(),
+                                       depressed, 0u, locked, 0u);
+        }
+
+        /* Debug: log key events with modifier info */
+        if (e->scan == 0x2A || e->scan == 0x36 || depressed || locked)
+            fprintf(stderr, "[waylandd] KEY sc=0x%02x xkb=%u %s mods=0x%02x dep=%u lock=%u\n",
+                    e->scan, xkb_code,
+                    st == WL_KEYBOARD_KEY_STATE_PRESSED ? "DN" : "UP",
+                    e->mods, depressed, locked);
+        sc->kb_mods_depressed = depressed;
+        sc->kb_mods_locked    = locked;
+        break;
+    }
+    case WM_EVT_CLOSE_REQUESTED: {
+        if (s->xdg_toplevel) {
+            fprintf(stderr, "[waylandd] CLOSE_REQUESTED → xdg_toplevel.send_close (wm=%u)\n",
+                    s->wm_id);
+            xdg_toplevel_send_close(s->xdg_toplevel);
+        }
+        break;
+    }
+    case WM_EVT_FOCUS_GAINED: {
+        if (sc && sc->keyboard && sc->kb_focus != s) {
+            struct wl_array keys; wl_array_init(&keys);
+            wl_keyboard_send_enter(sc->keyboard, next_serial(),
+                                   s->resource, &keys);
+            wl_array_release(&keys);
+            /* Send current modifier state so client starts with
+             * correct xkb_state (protocol requires modifiers after enter). */
+            wl_keyboard_send_modifiers(sc->keyboard, next_serial(),
+                                       sc->kb_mods_depressed, 0u,
+                                       sc->kb_mods_locked, 0u);
+            sc->kb_focus = s;
+            text_input_focus(sc, s);
+            fprintf(stderr, "[waylandd] FOCUS_GAINED wm=%u\n", s->wm_id);
+        }
+        break;
+    }
+    case WM_EVT_FOCUS_LOST: {
+        if (sc && sc->keyboard && sc->kb_focus == s) {
+            wl_keyboard_send_leave(sc->keyboard, next_serial(), s->resource);
+            text_input_focus(sc, NULL);
+            sc->kb_focus = NULL;
+            fprintf(stderr, "[waylandd] FOCUS_LOST wm=%u\n", s->wm_id);
+        }
+        break;
+    }
+    case WM_EVT_RESIZED: {
+        /* The kernel WM has resized this window's chrome (drag-resize
+         * release). Tell the client via xdg_toplevel.configure with
+         * the new size — the client will allocate a fresh buffer at
+         * those dimensions, ack_configure, and commit. */
+        if (s->xdg_toplevel && s->xdg_surface) {
+            int32_t neww = e->x;
+            int32_t newh = e->y;
+            struct wl_array states; wl_array_init(&states);
+            /* Tell the client this is an active toplevel; resize is a
+             * normal configure, not a fullscreen/maximize. */
+            if (wl_resource_get_version(s->xdg_toplevel) >= 2) {
+                uint32_t *st = wl_array_add(&states, sizeof(uint32_t));
+                if (st) *st = XDG_TOPLEVEL_STATE_ACTIVATED;
+            }
+            xdg_toplevel_send_configure(s->xdg_toplevel, neww, newh, &states);
+            wl_array_release(&states);
+            uint32_t serial = next_serial();
+            s->next_configure_serial = serial;
+            s->xdg_acked = 0;
+            xdg_surface_send_configure(s->xdg_surface, serial);
+            fprintf(stderr, "[waylandd] WM_EVT_RESIZED wm=%u → configure %dx%d serial=%u\n",
+                    s->wm_id, neww, newh, serial);
+        }
+        break;
+    }
+    default: break;
+    }
+
+}
+static void dispatch_window_event(struct brook_surface *surface,
+                                  struct brook_wm_event *event,uint32_t now) {
+    /* Window management requests are per window. Input is per resource: GTK
+     * and application libraries can independently bind the same wl_seat. */
+    if (event->type==WM_EVT_CLOSE_REQUESTED || event->type==WM_EVT_RESIZED) {
+        dispatch_surface_event(surface,NULL,event,now);
+        return;
+    }
+    struct wl_client *owner=wl_resource_get_client(surface->resource);
+    for(struct brook_seat_client *seat=g_seat_clients;seat;seat=seat->next)
+        if(seat->client==owner)dispatch_surface_event(surface,seat,event,now);
+}
+static void pump_input_for_surface(struct brook_surface *surface) {
+    if(!surface->wm_id)return;
+    struct brook_wm_event events[16];
+    long count=wm_pop_input(surface->wm_id,events,16);
+    uint32_t now=g_now_ms();
+    for(long i=0;i<count;++i)dispatch_window_event(surface,&events[i],now);
 }
 
 static void pump_input_once(void) {
@@ -2235,6 +2250,13 @@ static void subcomp_get_subsurface(struct wl_client *c, struct wl_resource *r,
     (void)r;
     struct brook_surface *child = wl_resource_get_user_data(surface);
     struct brook_surface *par   = wl_resource_get_user_data(parent);
+    for (struct brook_surface *ancestor = par; ancestor; ancestor = ancestor->subsurface_parent) {
+        if (ancestor == child) {
+            wl_resource_post_error(r, WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE,
+                                   "subsurface parent would create a cycle");
+            return;
+        }
+    }
     struct wl_resource *ss = wl_resource_create(c, &wl_subsurface_interface,
                                                  wl_resource_get_version(r), id);
     if (!ss) { wl_client_post_no_memory(c); return; }
@@ -2729,6 +2751,9 @@ int main(int argc, char **argv)
 
     struct wl_event_loop *loop = wl_display_get_event_loop(g_display);
     if (!loop) return 1;
+    g_frame_timer = wl_event_loop_add_timer(loop, frame_clock_tick, NULL);
+    if (!g_frame_timer) return 1;
+    wl_event_source_timer_update(g_frame_timer, 16);
 
     uint32_t loop_start = g_now_ms();
     for (;;) {

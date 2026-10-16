@@ -26,6 +26,11 @@ stdenv.mkDerivation {
         text-input-test.c text-input-v3-protocol.c \
         -L${wayland}/lib -lwayland-server -o text-input-test
     ./text-input-test
+    $CC -O2 -Wall -Wextra -I${wayland.dev}/include -I. \
+        surface-frame-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c \
+        -L${wayland}/lib -lwayland-server -o surface-frame-test
+    ./surface-frame-test
   '';
 
   buildPhase = ''

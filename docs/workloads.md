@@ -1308,3 +1308,48 @@ separately; their unsynced panic left data fsck status 4 and they were not reuse
 Firefox still displayed a blank page and stale toolbar after the ownership fix.
 Wayland tracing confirms keyboard events reach the client. Rendering and input
 acceptance remain separate from this memory-lifetime correction.
+
+### Firefox rendering, input and verified HTTPS (16 October)
+
+Firefox 150.0.1 now renders the local JavaScript test and real websites on the
+software-graphics, eight-vCPU/4-GiB candidate. The compositor previously stranded
+frame requests on commits without a new buffer. Committed callbacks now run from
+a shared 16-ms frame clock, with resource-owned lists instead of a fixed eight
+callback array. This is a pacing timer, not a presentation-feedback guarantee.
+
+Firefox also binds wl_seat twice: GTK and Gecko use different bindings. Sending
+input only to the newest binding left the visible toolbar unresponsive. Focus
+and input now reach every seat binding belonging to the target client, while
+window-management actions run once. Wheel-axis direction now translates the
+kernel's positive-up convention to Wayland's positive-down convention. A real
+libwayland wire test covers commit eligibility, repeated bufferless commits,
+callback lifetime, multiple seat bindings, foreign-client isolation and axis sign.
+
+NSS/p11-kit could not find its standard trust path despite the Nix CA bundle
+being installed. The initrd now contains /etc/ssl/certs/ca-certificates.crt from
+the pinned development shell's cacert package. A missing bundle fails before
+image writes; bundle roundtrip and existing-image preservation checks pass.
+No certificate-verification bypass is used.
+
+The initial candidate browsed Google search, the Brook GitHub repository and
+its docs folder, and Amazon UK search/product pages, including images and clicks.
+No accounts, purchases or checkout were exercised. After a fresh boot with the
+final package, the local test registered one click and exact typed text/JS output;
+Google HTTPS search rendered without a manual certificate copy; wheel-down
+scrolled down; and Mousepad saved exact text without doubled input. Firefox
+quit normally with exit 0, leaving ten baseline processes. Heap integrity, page
+ownership checks, checked shutdown and all three offline filesystem checks pass.
+
+Evidence: ignored build/workloads/firefox-fresh-20261016/acceptance.json, session
+21561c0aab7c4a58a4f25eeeb1c6cee8, kernel d86f2927f0e0c192253684e8998ef1f9f4da2df2a0914a2dca458eef4ac037e4,
+Wayland package dv0li9831cwqrh9i5jaavjcmg56b49im-waylandd-brook-0.1-brook.
+The default current-apps checkpoint has not been promoted.
+
+A preceding longer Google/GitHub/Amazon session closed its window but retained
+347 workers for minutes and required guest SIGKILL. Its profile recorded 1,721
+CPU samples, 59,522 context switches and 119,835 dropped records; it is incomplete
+and cannot establish elapsed-time percentages or a complete cause. The short
+fresh-boot normal quit does not close that follow-up. Evidence remains separately
+in build/workloads/firefox-input-20261016/acceptance.json. Maximized client-side
+decoration geometry also needs polish; this pass does not establish hardware
+rendering, video playback, long-session stability or general browser compatibility.

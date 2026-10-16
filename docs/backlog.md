@@ -690,3 +690,14 @@ blindness remain; their counts cannot establish elapsed-time percentages.
 PERF-01's free-block index and allocation-size guards have shipped; the later
 file-page hash-growth and user-fault IRQ experiments were slower and remain
 unapplied. Keep those experiments separate from the accepted CR2 address fix.
+
+
+Firefox follow-ups after the rendering/input acceptance (16 October): investigate
+long-session normal shutdown retaining workers after the window closes. The
+Google/GitHub/Amazon run required guest SIGKILL; a shorter fresh-boot Google run
+quit normally. Preserve the dropped-record count when interpreting the saved
+shutdown profile. Correct maximized Firefox client-side shadow/content geometry
+(the buffer includes 52 pixels beyond the requested content dimensions). Renew
+hardware-rendering and longer browsing acceptance separately. The software
+rendering, multi-seat input and pinned initrd CA fixes are accepted as recorded
+in workloads.md; the default app checkpoint remains unchanged.

@@ -55,6 +55,7 @@ pkgs.mkShellNoCC {
     pkgs.e2fsprogs        # debugfs for ext2 disk images
     pkgs.e2fsprogs.fuse2fs # fuse2fs for mounting ext2 images without sudo
     pkgs.fuse             # fusermount for fuse2fs
+    pkgs.cacert           # standard root trust bundle in the guest initrd
   ];
 
   shellHook = ''
@@ -76,6 +77,7 @@ pkgs.mkShellNoCC {
     export OVMF_CODE="${pkgs.OVMF.fd}/FV/OVMF_CODE.fd"
     export OVMF_VARS="${pkgs.OVMF.fd}/FV/OVMF_VARS.fd"
     export HACK_FONT_TTF="${pkgs.hack-font}/share/fonts/truetype/Hack-Regular.ttf"
+    export BROOK_CA_BUNDLE="${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
 
     echo "Brook dev shell ready (Clang $(clang --version | head -1))"
   '';

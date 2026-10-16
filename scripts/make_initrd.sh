@@ -9,6 +9,7 @@
 #   scripts/make_initrd.sh [--release|--debug]
 #
 # Output: build/<type>/esp/INITRD.IMG
+# BROOK_CA_BUNDLE selects the root CA bundle (set by shell.nix).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,6 +28,14 @@ BUILD_DIR="${BROOK_BUILD_DIR:-${ROOT_DIR}/build/${BUILD_TYPE}}"
 ESP_DIR="${BUILD_DIR}/esp"
 INITRD_IMG="${ESP_DIR}/INITRD.IMG"
 MOD_DIR="${BUILD_DIR}/kernel/drivers"
+
+# NSS/p11-kit reads standard system trust paths rather than SSL_CERT_FILE.
+# Keep certificate verification usable for stock applications from a fresh boot.
+CA_BUNDLE="${BROOK_CA_BUNDLE:-${SSL_CERT_FILE:-/etc/ssl/certs/ca-certificates.crt}}"
+if [ ! -s "${CA_BUNDLE}" ] || [ ! -r "${CA_BUNDLE}" ]; then
+    echo "Missing CA bundle: ${CA_BUNDLE}; run inside nix-shell or set BROOK_CA_BUNDLE." >&2
+    exit 1
+fi
 
 # Image size in KB — enough for config + all driver modules.
 # 2880KB (2.88MB floppy) accommodates the ext4 module (~800KB debug) plus others.
@@ -89,6 +98,10 @@ echo "0-7" | mcopy -i "${INITRD_IMG}.tmp" - "::SYS/DEVICES/SYSTEM/CPU/ONLINE"
 mmd -i "${INITRD_IMG}.tmp" "::ETC" 2>/dev/null || true
 echo "0123456789abcdef0123456789abcdef" | \
     mcopy -i "${INITRD_IMG}.tmp" - "::ETC/MACHINE-ID"
+
+mmd -i "${INITRD_IMG}.tmp" "::ETC/SSL" "::ETC/SSL/CERTS"
+mcopy -i "${INITRD_IMG}.tmp" "${CA_BUNDLE}" "::ETC/SSL/CERTS/ca-certificates.crt"
+echo "  packed: /etc/ssl/certs/ca-certificates.crt"
 
 # Move into place
 mv "${INITRD_IMG}.tmp" "${INITRD_IMG}"
