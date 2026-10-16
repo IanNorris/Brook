@@ -936,3 +936,38 @@ Evidence: `build/workloads/file-page-batch-comparison-20261016.json`,
 `build/workloads/native-page-batch-profile-20261016/stack-analysis.json`.
 Full bootstrap acceptance above is at `0059ce4`; the new source still needs its
 own matching full acceptance paths.
+
+### Avoid file gates for read-only PTE checks (2026-10-16)
+
+UserMappingPageAccess previously acquired every mapped file's gate before
+reading one VMA/PTE, even for an already-present anonymous page or an immediate
+permission denial. It now performs CheckPage under AS mutation alone. The
+existing transaction still pins AS lifetime and protects cancellation. A CoW
+candidate releases the read lock, prepares retirement storage, acquires the
+original full file-gate transaction and rechecks permissions before copying.
+No file metadata is read by the AS-only check; lock order and writable slow-path
+retirement remain unchanged.
+
+The actual VMM test holds an unrelated mapped file gate and requires
+Ready/Missing/Denied checks to complete without heap allocation. It releases
+and joins its worker before asserting, so the previous implementation fails
+boundedly rather than hanging. A second test pauses before CoW's full file-gate
+acquisition, removes write permission concurrently and verifies that the write
+is denied without copying or losing the pinned frame. Existing CoW success,
+shootdown/retirement and lifetime tests remain active. The old path failed the
+new gate-independence test; the changed path passed all 19 hosted tests.
+
+The changed VM passed 176 fault-race cases, both-disk coherence and filesystem
+exit, framebuffer aliases, wait cancellation, fatal signal reaping and heap
+integrity. Checked shutdown and all offline filesystem checks passed. On the
+same pinned 18-test benchmark source, adding AS-only checks to the batching
+baseline reduced rebuilds from 30.25/27.21 to 25.13/22.72 host seconds. Native
+tests fell from 19.55/18.48 to 5.28/5.11 seconds. Both candidate rounds passed,
+then acknowledged checked shutdown and passed filesystem checks. Host cache and
+thermal state remain uncontrolled, and this is a local workload measurement.
+
+Evidence: `build/workloads/as-read-check-negative.log`,
+`build/workloads/as-read-check-build.log`,
+`build/workloads/as-read-check-races-20261016/audit.json` and
+`build/workloads/as-read-check-comparison-20261016.json`. Matching full bootstrap
+acceptance must still be rerun at the resulting source revision.

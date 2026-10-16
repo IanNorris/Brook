@@ -408,10 +408,14 @@ static UserPageAccess CheckPage(AddressSpaceState* space,uint64_t address,uint32
 UserPageAccess UserMappingPageAccess(Process* actor, AddressSpaceState* space, uint64_t address,
                                      uint32_t access, bool resolveCow) {
     if (!actor || !space || address >= 0x0000800000000000ULL) return UserPageAccess::Denied;
-    MappingTransaction operation(actor,space);if(!operation.Lock())return UserPageAccess::OutOfMemory;
+    // Pin AS lifetime and cancellation protection before a potentially
+    // blocking mutation lock. Read-only PTE/range checks need no file gates.
+    MappingTransaction operation(actor,space);
+    KMutexLock(&space->mutation);
     bool cow=false;auto status=CheckPage(space,address,access,cow);
+    KMutexUnlock(&space->mutation);
     if (!resolveCow || !cow) return status;
-    operation.Unlock();
+    // Reacquire the existing full transaction and revalidate before CoW.
     if (!operation.Prepare(1,0)) return UserPageAccess::OutOfMemory;
     if(!operation.Lock())return UserPageAccess::OutOfMemory;status=CheckPage(space,address,access,cow);
     if (!cow) return status;

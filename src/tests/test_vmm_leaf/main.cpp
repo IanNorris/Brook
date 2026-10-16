@@ -1,6 +1,7 @@
 // Real VMM walks, locks and PTE transitions; platform/PMM are instrumented.
 // A delayed acknowledgement is modeled explicitly, not a hardware TLB test.
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
@@ -59,6 +60,11 @@ struct Gate {
     void wait(unsigned n) { std::unique_lock<std::mutex> lock(mutex);cv.wait(lock,[&]{return arrived==n;}); }
     void release() { std::lock_guard<std::mutex> lock(mutex);released=true;cv.notify_all(); }
 };
+// Test-only pause before the CoW slow path acquires a file gate. The reader
+// thread opts in; mutation performed by the main thread is never intercepted.
+KMutex* pageAccessPauseMutex=nullptr;
+Gate* pageAccessPause=nullptr;
+thread_local bool pageAccessPauseOnce=false;
 PageTable table() {
     auto p=PmmAllocPage(MemTag::PageTable);CHECK(p);std::memset(reinterpret_cast<void*>(p.raw()),0,pageSize);return PageTable(p);
 }
@@ -94,7 +100,12 @@ void KMutexInit(KMutex* mutex) {
     std::memset(mutex,0,sizeof(*mutex));
     std::lock_guard<std::mutex> guard(mutexRegistryGuard);mutexRegistry[mutex]=std::make_unique<std::mutex>();
 }
-void KMutexLock(KMutex* mutex) { hostMutex(mutex).lock(); }
+void KMutexLock(KMutex* mutex) {
+    if(pageAccessPauseOnce && mutex==pageAccessPauseMutex) {
+        pageAccessPauseOnce=false;pageAccessPause->park();
+    }
+    hostMutex(mutex).lock();
+}
 void KMutexUnlock(KMutex* mutex) { hostMutex(mutex).unlock(); }
 void SchedulerKernelRegionEnter(Process* process) { ++process->kernelRegionDepth;ProcessRef(process); }
 void SchedulerKernelRegionLeave(Process* process) { CHECK(process->kernelRegionDepth);--process->kernelRegionDepth;ProcessUnref(process); }
@@ -1109,11 +1120,91 @@ static void targetFileInvalidation() {
     std::puts("FILE INVALIDATION PASS target-only/split/hidden/borrowed/offset-filter/OOM/capacity/ACK-before-unref");
 }
 
+static void pageAccessWithoutUnrelatedGate() {
+    auto root=table();VmmHostSetKernelRoot(root);AddressSpaceKernelInit();
+    auto* space=AddressSpaceCreate(46);CHECK(space);
+    Process actor{};actor.addressSpace=space;
+    FileObject unrelated{};FileObjectInit(&unrelated);unsigned released=0;
+    auto* backing=MappingBackingCreate(&released,rangeBackingReleased);CHECK(backing);
+    backing->file=&unrelated;
+    auto physical=PmmAllocPage(MemTag::User,46);CHECK(physical);
+    {
+        MappingTransaction operation(&actor,space,backing);
+        CHECK(operation.PrepareRanges(2)&&operation.Lock());
+        CHECK(operation.InsertRange(rangeRecord(va.raw(),va.raw()+2*pageSize,nullptr)));
+        CHECK(operation.InsertRange(rangeRecord(va.raw()+8*pageSize,va.raw()+9*pageSize,backing)));
+        CHECK(VmmTryMapPage(space->pageTable,va,physical,flags,MemTag::User,46)==VmmMapResult::Mapped);
+    }
+    const auto original=VmmReadLeaf(space->pageTable,va);
+    const auto generation=space->generation;
+    const auto spaceRefs=space->references;
+    std::mutex completionMutex;std::condition_variable completion;bool done=false;
+    UserPageAccess statuses[5]{};
+    KMutexLock(&unrelated.gate);
+    failHeapAfter=0;
+    std::thread reader([&] {
+        statuses[0]=UserMappingPageAccess(&actor,space,va.raw(),1,true);
+        statuses[1]=UserMappingPageAccess(&actor,space,va.raw(),2,true);
+        statuses[2]=UserMappingPageAccess(&actor,space,va.raw()+pageSize,1,true);
+        statuses[3]=UserMappingPageAccess(&actor,space,va.raw(),4,true);
+        statuses[4]=UserMappingPageAccess(&actor,space,va.raw()+4*pageSize,1,true);
+        std::lock_guard<std::mutex> lock(completionMutex);done=true;completion.notify_all();
+    });
+    bool completedWhileHeld;
+    {
+        std::unique_lock<std::mutex> lock(completionMutex);
+        completedWhileHeld=completion.wait_for(lock,std::chrono::seconds(2),[&]{return done;});
+    }
+    // Baseline full-gate code must fail boundedly: release and join BEFORE
+    // asserting, so a negative run cannot strand a worker behind this gate.
+    KMutexUnlock(&unrelated.gate);reader.join();
+    const bool noHeapAttempt=failHeapAfter==0;failHeapAfter=-1;
+    CHECK(completedWhileHeld&&noHeapAttempt);
+    CHECK(statuses[0]==UserPageAccess::Ready&&statuses[1]==UserPageAccess::Ready);
+    CHECK(statuses[2]==UserPageAccess::Missing);
+    CHECK(statuses[3]==UserPageAccess::Denied&&statuses[4]==UserPageAccess::Denied);
+    CHECK(VmmReadLeaf(space->pageTable,va)==original&&space->generation==generation);
+    CHECK(space->references==spaceRefs&&actor.kernelRegionDepth==0&&actor.refCount==0);
+
+    // Force a genuine private CoW candidate, then change its permissions in
+    // the gap before full-gate acquisition. The slow path must recheck and
+    // deny the write, without allocating/copying a replacement physical page.
+    KMutexLock(&space->mutation);cow(space->pageTable);KMutexUnlock(&space->mutation);
+    PmmRefPage(physical); // external pin forces copy if stale CoW were attempted
+    Gate beforeFullGate;pageAccessPauseMutex=&unrelated.gate;pageAccessPause=&beforeFullGate;
+    UserPageAccess result=UserPageAccess::Ready;
+    std::thread writer([&] {
+        pageAccessPauseOnce=true;
+        result=UserMappingPageAccess(&actor,space,va.raw(),2,true);
+    });
+    bool reachedSlowPath;
+    {
+        std::unique_lock<std::mutex> lock(beforeFullGate.mutex);
+        reachedSlowPath=beforeFullGate.cv.wait_for(lock,std::chrono::seconds(2),
+            [&]{return beforeFullGate.arrived==1;});
+    }
+    Process mutator{};mutator.addressSpace=space;
+    CHECK(UserMappingProtect(&mutator,space,va.raw(),pageSize,1)==0);
+    const auto protectedLeaf=VmmReadLeaf(space->pageTable,va);
+    beforeFullGate.release();writer.join();pageAccessPause=nullptr;pageAccessPauseMutex=nullptr;
+    CHECK(reachedSlowPath&&result==UserPageAccess::Denied);
+    CHECK(VmmReadLeaf(space->pageTable,va)==protectedLeaf);
+    CHECK(VmmLeafPhysical(protectedLeaf)==physical&&PmmGetRefCount(physical)==2&&maps(physical)==1);
+    CHECK(space->references==spaceRefs&&actor.kernelRegionDepth==0&&actor.refCount==0);
+    PmmUnrefPage(physical);
+    AddressSpaceUnref(space);CHECK(ProcessCleanupStep());
+    CHECK(!FileMappingRegisteredRanges(&unrelated));MappingBackingUnref(backing);CHECK(released==1);
+    FileObjectDispose(&unrelated);
+    VmmDestroyUserPageTable(root);VmmHostSetKernelRoot({});empty();CHECK(heapAllocations==0);
+    std::puts("PAGE ACCESS PASS unrelated-gate/no-allocation/read-statuses/CoW-revalidation/lifetime");
+}
+
 int main() {
     competingInstallAndDetach();detachReinstall();largeLeafAndBorrowedFrame();occupiedAncestors();failureAndInPlace();
     cowRetirement(false);for(unsigned i=0;i<32;++i)cowRetirement(true);
     addressSpaceLifetime();consumingWaitCleanup();mappingTransactions();rangeTableEdits();rangeSnapshotRetirement();rangeLeafOwnership();
     liveMappingClone();sharedMappingClone();failedCloneAcknowledgement();sparseLiveRemap();preparedThreadStack();graphicsBufferMappings();
     fileMappingRegistrations();fileMappingGateOom();targetFileInvalidation();
+    pageAccessWithoutUnrelatedGate();
     std::puts("VMM LEAF PASS install/detach races=64 concurrent-cow=32 retirement/OOM/in-place/reuse");
 }
