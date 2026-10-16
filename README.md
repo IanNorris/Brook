@@ -53,12 +53,22 @@ the table distinguishes tested behavior from remaining limitations.
 | Nix binaries | — | ✅ Working | Stock NixOS closures fetched via `nix-install` (cowsay, coreutils, curl, …) |
 | [NetSurf](https://www.netsurf-browser.org/) | 3.11 | ✅ Working | Web browser rendering HTML/CSS via custom framebuffer surface |
 | [Ladybird](https://ladybird.dev/) | 2026-04-04 | ⚠️ Experimental | HTTPS Google search and Amazon navigation verified; loading/input/scrolling performance remains limited |
+| [Firefox](https://www.mozilla.org/firefox/) | 150.0.1 | ⚠️ Experimental | Wayland browsing, JavaScript/input, Google/Amazon HTTPS and 480p YouTube video verified; audio investigation in progress |
+| [Chromium](https://www.chromium.org/) | 148.0.7778.96 | ⚠️ Experimental | Software-rendered Wayland browsing and 480p YouTube video/audio; long pause/resume and seeking verified under normal autoplay rules; browser sandbox disabled |
+| [OpenTTD](https://www.openttd.org/) | 15.3 | ⚠️ Experimental | World creation, text input, save/load verified; music-enabled exit hang under investigation |
 | [Qalculate!](https://qalculate.github.io/) | — | ✅ Working | GTK3 calculator via Wayland (CSD decorations) |
-| [GIMP](https://www.gimp.org/) | 2.10 | ⚠️ Partial | Launches via Wayland/GTK; plugin loading slow, UAF under investigation |
+| [GIMP](https://www.gimp.org/) | 3.0.8 | ⚠️ Experimental | Painting, XCF save/reopen and PNG export/import verified across reboot; optional plugin discovery still has faults |
 | [LibreOffice](https://www.libreoffice.org/) | 25.8.5.2 | ⚠️ Experimental | Writer opens via Wayland and edits a real document; startup is slow and window-close behavior needs work |
 | [VLC](https://www.videolan.org/vlc/) | 3.0.23-2 | ⚠️ Experimental | Brook compatibility build installs through guest `nix-install`; 720p video and OSS audio verified; window-close/SMP stability remains under investigation |
 
 ## Recent progress
+
+- **Modern browsers:** stock Firefox and Chromium render real HTTPS websites
+  with working input and JavaScript. Chromium now plays YouTube video and audio,
+  including long pause/resume and seeking, without an autoplay workaround.
+  Connected Unix socket shutdown, anonymous memory discard and descriptor
+  capacity fixes support these workloads. See [workload validation](docs/workloads.md)
+  for tested configurations and remaining limits. All 19 hosted test suites pass.
 
 - **Desktop appearance:** application icons in window chrome, an icon taskbar,
   and a launcher that updates after package installation/removal. Settings
@@ -135,7 +145,7 @@ the table distinguishes tested behavior from remaining limitations.
 
 ### Userspace / bundled apps
 - **Games** — DOOM (`doomgeneric`), **Quake 2** (single-player + LAN multiplayer over VDE), 2048
-- **Web browsers** — NetSurf (custom framebuffer surface), Ladybird (Wayland, experimental)
+- **Web browsers** — Firefox and Chromium (software-rendered Wayland, experimental), Ladybird (Wayland, experimental), NetSurf (custom framebuffer surface)
 - **GTK apps** — Qalculate! (calculator), Mousepad (text editor), GIMP (experimental)
 - **Shells / tools** — bash, busybox, TCC
 - **Brook-native apps** — file browser (`brook-files`), calculator, Wayland smoke tests
@@ -161,6 +171,24 @@ Click any screenshot to open its original pixels. README previews are smaller
 than the captured desktop; UI text is clearest in the full-resolution image.
 New captures use native 1920×1080 without upscaling. See
 [showcase capture and demo plans](docs/showcase.md).
+
+<p align="center">
+  <a href="docs/images/brook_chromium_youtube_1080.png"><img src="docs/images/brook_chromium_youtube_1080.png" alt="Chromium playing Big Buck Bunny on YouTube with audio on Brook's native 1920 by 1080 desktop" width="960"></a>
+</p>
+
+<p align="center"><em>Chromium playing YouTube at 480p with audio — software rendering, native 1920×1080 capture</em></p>
+
+<p align="center">
+  <a href="docs/images/brook_firefox_google_1080.png"><img src="docs/images/brook_firefox_google_1080.png" alt="Firefox rendering interactive Google HTTPS search results inside Brook" width="960"></a>
+</p>
+
+<p align="center"><em>Firefox — Google HTTPS search with working pointer and keyboard input, native 1920×1080 capture</em></p>
+
+<p align="center">
+  <a href="docs/images/brook_gimp_workflow_1080.png"><img src="docs/images/brook_gimp_workflow_1080.png" alt="GIMP 3 editing a drawing in Brook after saving and reopening it" width="960"></a>
+</p>
+
+<p align="center"><em>GIMP 3 — painting, XCF persistence and PNG export/import, captured at native 1920×1080</em></p>
 
 <p align="center">
   <a href="docs/images/brook_settings_midnight_1080.png"><img src="docs/images/brook_settings_midnight_1080.png" alt="Brook Settings with native window chrome and the Midnight desktop theme applied" width="960"></a>

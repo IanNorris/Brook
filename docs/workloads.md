@@ -1586,3 +1586,29 @@ state snapshots, completed suspension events, PCM and a native 1920×1080
 screenshot `cf5fe541b3c5468383e225117727972f.png`. The final output capture is
 `5fa7117aea4444459ebbf11050534aca.wav`. Firefox audio has not been rerun; its cubeb
 initialization failure remains the next audio investigation.
+
+### Firefox audio isolation (16 October)
+
+The isolated eight-vCPU/six-GiB candidate in
+`build/workloads/firefox-audio-20261016/` used the same kernel as the accepted
+Chromium shutdown run. Firefox 150.0.1 played a local H.264/AAC fixture, but the
+default audio IPC path failed cubeb initialization. Setting the cubeb sandbox
+preference false alone did not disable IPC: Firefox forced it back on while
+the content sandbox was enabled.
+
+A separate diagnostic profile selected ALSA and disabled content sandbox and
+audio IPC. Its stream initialized and QEMU captured nonzero 44.1-kHz stereo PCM
+without speaker output. This is **not working audio acceptance**: the three-second
+capture contained extensive silence and Firefox repeatedly reported lost frames.
+Investigate PCM position/delay reporting in the file-over-null ALSA route,
+separately from the default IPC failure. No Firefox launcher defaults changed.
+
+The script generated each complete preferences file in one write after shell
+append unexpectedly overwrote the start of an ext2 file. That corruption is
+preserved as a separate O_APPEND finding. Firefox reported normal exit, and the
+kernel heap check passed, but child tasks remained after repeated launches.
+Serial acceptance also found a virtio-blk timeout followed by a reported recovery.
+The VM was stopped with checked guest synchronization; final offline filesystem
+checks passed for FAT and both ext2 filesystems. Results and all diagnostic
+evidence are retained with the candidate. Do not promote this candidate as a
+clean acceptance image.
