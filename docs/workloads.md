@@ -1242,3 +1242,37 @@ Shell defaults have not changed. The native terminal leaves zsh's prompt-end
 marker visible; Kitty, job control and broader interactive behavior still need
 acceptance. The original failing clones and profile are retained separately,
 and their success markers after manual interruption do not count as acceptance.
+
+### Firefox and Codium rerun on 4e53a2a, 16 October
+
+Both apps were rerun with software graphics, eight vCPUs and 4 GiB RAM on the
+accepted kernel `d78482b62b04d08ae517d861515534754893323f6fa64bf2d0070a20239c613d`.
+Private image clones and fresh application profiles preserved the default app
+checkpoint. Firefox 150.0.1 installed through the guest package installer.
+
+Firefox drew tabs and the address bar, but the visible page remained blank and
+typed address-bar text did not appear, including after clicking the field. Its
+Wayland title nevertheless became `Brook JS ready — Mozilla Firefox`: that
+title is set only by JavaScript in the local test page, establishing execution
+of that script despite the unusable display. A five-second capture saved 3,922
+samples and 41,472 context switches; the busiest sampled app thread was repeatedly
+calling clock_gettime. This does not establish the rendering failure's cause or
+attribute it to writable shared-file mappings.
+
+SIGTERM did not complete Firefox teardown; SIGKILL returned the VM to its ten
+kernel/Wayland processes. Teardown emitted `BRO176-MAPLEAK` and
+`BRO176-MAPUNDERFLOW` for physical page `0x14d3a000`. The run therefore fails
+kernel memory acceptance even though heap metadata and all offline disk checks
+passed. Preserve this as a separate ownership failure, not merely blank content.
+
+Codium 1.112.01907 connected to Wayland but showed no editor and hit user-mode
+INT3 at runtime RIP `0x6efdcbd`. A second boot tested Codium alone with a fresh
+profile, avoiding the preceding Firefox memory violation. Memory-error tracing
+captured a 262,144-byte writable MAP_SHARED request returning `EOPNOTSUPP`, then
+the same breakpoint. The exact ELF has load bias `0x200000`; the INT3 instruction
+is at file VA `0x6cfdcbc`, with saved RIP immediately after it. Missing inotify,
+netlink and D-Bus/udev support also remain visible, without establishing that
+each is fatal. The clean Codium run returned to ten processes after SIGKILL,
+passed heap/page diagnostics and all offline disk checks, and stopped with a
+checked flush. Neither app is accepted as usable. Evidence, traces, profile and
+screenshots are in ignored `build/workloads/browser-rerun-20261016/result.json`.

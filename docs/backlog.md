@@ -2,6 +2,17 @@
 
 ## Workload findings, 16 October
 
+- Firefox rerun on `4e53a2a`: local page JavaScript executes (confirmed by its
+  dynamically set Wayland title), but visible content stays blank and address-bar
+  typing does not appear. Investigate display/update and input responsiveness
+  from the saved profile rather than assuming all content processes fail.
+- Firefox teardown after SIGTERM then SIGKILL emitted a mapped-page free with
+  mapCount=1 followed by a mapping-count underflow for the same physical page.
+  Reproduce and fix ownership before treating large-browser cleanup as safe.
+  Evidence: `build/workloads/browser-rerun-20261016/first-run-serial.log`.
+- Codium's clean-boot rerun still fails its 256-KiB writable file MAP_SHARED
+  request with EOPNOTSUPP and reaches the same startup INT3. Complete coherent
+  shared writes/writeback; rerunning without that feature did not yield an editor.
 - The boot filesystem's `/tmp` cannot unlink an open temporary file (EBUSY),
   which breaks stock Bash here-documents; fchmod also returns ENOTSUP there.
   The shell acceptance uses a data-backed TMPDIR. Provide suitable temporary
