@@ -20,6 +20,7 @@ std::mutex locksGuard,framesGuard;
 std::unordered_map<KMutex*,std::unique_ptr<std::mutex>> locks;
 std::unordered_map<uint64_t,unsigned> refs;
 std::atomic<unsigned> heapBlocks{0},gateAcquires{0};
+unsigned closedVnodes=0;
 std::atomic<bool> failHeap{false},failFrame{false};
 std::mutex writeHookGuard;
 std::condition_variable writeHookCv;
@@ -74,13 +75,18 @@ int truncate_backend(Vnode* vnode,uint64_t length) {
     }
     return 0;
 }
-const VnodeOps operations={nullptr,read_backend,write_backend,nullptr,nullptr,stat_backend,nullptr,nullptr,nullptr,truncate_backend};
+FileObject* object_backend(Vnode* vnode) { return &static_cast<Backend*>(vnode->priv)->object; }
+const VnodeOps operations={nullptr,read_backend,write_backend,nullptr,nullptr,stat_backend,nullptr,nullptr,nullptr,truncate_backend,object_backend};
 struct Barrier {
     std::mutex guard;std::condition_variable cv;unsigned arrived=0;
     void wait() { std::unique_lock<std::mutex> lock(guard);++arrived;cv.notify_all();cv.wait(lock,[&]{return arrived==8;}); }
 };
 }
 namespace brook {
+extern "C" void VfsClose(Vnode* vnode) {
+    CHECK(!vnode->refCount);++closedVnodes;
+    FileObjectDispose(vnode->ops->file_object(vnode));
+}
 void KMutexInit(KMutex* mutex) { std::lock_guard<std::mutex> lock(locksGuard);locks[mutex]=std::make_unique<std::mutex>(); }
 void KMutexLock(KMutex* mutex) { ++gateAcquires;std::mutex* lock;{std::lock_guard<std::mutex> held(locksGuard);lock=locks.at(mutex).get();}lock->lock(); }
 void KMutexUnlock(KMutex* mutex) { std::mutex* lock;{std::lock_guard<std::mutex> held(locksGuard);lock=locks.at(mutex).get();}lock->unlock(); }
@@ -111,10 +117,11 @@ static void WritebackPages() {
     // A resident page alone does not imply a writable shared exposure.
     CHECK(FileObjectWriteback(&backend.object,&vnode,0,~uint64_t{0})==0&&backend.writes==0);
     KMutexLock(&backend.object.gate);
-    CHECK(!FileObjectExposeWritableLocked(&backend.object,0,pages[1]));
-    CHECK(!FileObjectExposeWritableLocked(&backend.object,3,pages[0]));
-    CHECK(!FileObjectExposeWritableLocked(&backend.object,0,PhysicalAddress{}));
-    for(unsigned i=0;i<3;++i)CHECK(FileObjectExposeWritableLocked(&backend.object,i,pages[i]));
+    CHECK(!FileObjectExposeWritableLocked(&backend.object,&vnode,0,pages[1]));
+    CHECK(!FileObjectExposeWritableLocked(&backend.object,&vnode,3,pages[0]));
+    CHECK(!FileObjectExposeWritableLocked(&backend.object,&vnode,0,PhysicalAddress{}));
+    for(unsigned i=0;i<3;++i)CHECK(FileObjectExposeWritableLocked(&backend.object,&vnode,i,pages[i]));
+    CHECK(vnode.refCount==2);
     KMutexUnlock(&backend.object.gate);
     auto frameCount=refs.size();unsigned allocationCount=heapBlocks;
     CHECK(FileObjectWriteback(&backend.object,&vnode,4096,8192)==0);
@@ -164,7 +171,52 @@ static void WritebackPages() {
     CHECK(ordinaryDone&&first[0]==0xD3&&backend.bytes[0]==0xD3);
     CHECK(refs.size()==frameCount&&heapBlocks==allocationCount);
     for(auto page:pages)PmmUnrefPage(page);
+    CHECK(FileObjectWritebackAll()==0&&vnode.refCount==1&&!backend.object.writebackVnode);
     FileObjectDispose(&backend.object);CHECK(refs.empty()&&heapBlocks==0);
+}
+static void WritebackLifetime() {
+    CHECK(refs.empty()&&heapBlocks==0);
+    Backend first{},second{};FileObjectInit(&first.object);FileObjectInit(&second.object);
+    first.bytes.resize(4096,0x21);second.bytes.resize(4096,0x32);
+    Vnode a{&operations,VnodeType::File,&first,1,0},b{&operations,VnodeType::File,&second,1,0};
+    int error=0;
+    auto page=FileObjectGetPage(&first.object,&a,0,true,&error);CHECK(page&&!error);
+    auto other=FileObjectGetPage(&second.object,&b,0,true,&error);CHECK(other&&!error);
+    auto* bytes=reinterpret_cast<unsigned char*>(page.raw());bytes[0]=0x41;
+    KMutexLock(&first.object.gate);
+    CHECK(FileObjectExposeWritableLocked(&first.object,&a,0,page));
+    CHECK(FileObjectExposeWritableLocked(&first.object,&a,0,page));
+    KMutexUnlock(&first.object.gate);CHECK(a.refCount==2);
+    // Model a live/retiring registry token. The actual registry's matching
+    // counter transitions, including delayed ACK, run in test_vmm_leaf.
+    __atomic_store_n(&first.object.mappingRegistrations,1,__ATOMIC_RELEASE);
+    CHECK(FileObjectWritebackAll()==0&&a.refCount==2&&first.bytes[0]==0x41);
+    bytes[0]=0x52;
+    CHECK(FileObjectWritebackAll()==0&&a.refCount==2&&first.bytes[0]==0x52);
+    KMutexLock(&second.object.gate);
+    CHECK(FileObjectExposeWritableLocked(&second.object,&b,0,other));
+    KMutexUnlock(&second.object.gate);
+    reinterpret_cast<unsigned char*>(other.raw())[0]=0x63;
+    // A failed object must retain backing, while another still flushes and
+    // dequeues. Dropping the user descriptor leaves only the writeback pin.
+    CHECK(__atomic_fetch_sub(&a.refCount,1,__ATOMIC_ACQ_REL)==2);
+    first.failStat=true;
+    CHECK(FileObjectWritebackAll()==-5&&a.refCount==1&&first.object.writebackVnode==&a);
+    CHECK(b.refCount==1&&!second.object.writebackVnode&&second.bytes[0]==0x63);
+    first.failStat=false;first.failWrite=true;
+    CHECK(FileObjectWritebackAll()==-5&&a.refCount==1);
+    __atomic_store_n(&first.object.mappingRegistrations,0,__ATOMIC_RELEASE);
+    CHECK(FileObjectTruncateUnmapped(&first.object,&a,0)==-5&&first.bytes.size()==4096);
+    CHECK(FileObjectGetPage(&first.object,&a,0,false,&error)==page);PmmUnrefPage(page);
+    PmmUnrefPage(page);PmmUnrefPage(other);
+    failHeap=true;CHECK(FileObjectWritebackAll()==-12&&a.refCount==1);failHeap=false;
+    first.failWrite=false;unsigned closedBefore=closedVnodes;
+    CHECK(FileObjectWritebackAll()==0&&first.bytes[0]==0x52&&a.refCount==0);
+    CHECK(closedVnodes==closedBefore+1&&!first.object.writebackVnode);
+    // Last-pin close disposed first's cache; the second user still owns theirs.
+    CHECK(refs.size()==1);
+    FileObjectDispose(&second.object);CHECK(refs.empty()&&heapBlocks==0);
+    CHECK(FileObjectWritebackAll()==0);
 }
 static void BatchPages() {
     CHECK(refs.empty()&&heapBlocks==0);
@@ -296,5 +348,6 @@ int main() {
     FileObjectDispose(&backend.object);CHECK(refs.empty()&&heapBlocks==0);
     BatchPages();
     WritebackPages();
+    WritebackLifetime();
     std::puts("FILE_OBJECT PASS batch/sparse-pins/one-gate/failure-cleanup/concurrent-load/io-coherence/partial-error/truncate/zero-tail/lifetime/writeback-range/snapshot/redirty/error-retry");
 }

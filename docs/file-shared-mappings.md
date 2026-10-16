@@ -284,3 +284,53 @@ unmap/close, background and global sync integration, range-aware msync, mapped
 resize including private boundary prefixes and backend-error recovery, typed
 EOF faults, and the complete guest/race/reboot acceptance above. A host snapshot
 test does not establish real writable aliases or persistence across reboot.
+
+
+### Writeback retention and VFS sync integration (16 October)
+
+The exposure hook now retains one vnode per queued file object. A global pass
+takes temporary vnode references under a short queue spinlock, then performs I/O
+under each file gate without the queue lock. It visits a finite identity-bounded
+set, continues after individual errors, and returns the first error. Successful
+flushes release the queue's reference only when no mapping registrations remain.
+The registry maintains an atomic count including retiring/ref-zero registrations
+until their actual unlink after acknowledgement; its list/count consistency is
+checked. Read-only registrations conservatively retain the same pending object.
+Final vnode release runs outside all file/queue locks. Failed I/O retains pages
+and backing rather than silently discarding stores.
+
+VFS fsync/fdatasync now flush exposed pages before backend durability; global
+sync attempts queued writeback and every mount/device flush, preserving the first
+error. Clean objects avoid snapshot allocation and filesystem writeback. Unmapped
+truncate flushes pending exposure before cache eviction and leaves the resize
+unattempted if that writeback fails. These changes do not enable writable mappings.
+
+The actual-module host fixture verifies repeated flush/redirty while a token
+remains, one retained vnode across repeated exposure, continued flushing of a
+second object after the first fails, backing survival after user close, failed
+resize preflush, allocation failure/retry, and final-reference disposal only
+after successful flush with zero tokens. The fixture models its token; the real
+registry and delayed-ACK tests run separately in test_vmm_leaf. All 19 hosted
+tests and production kernel/driver/standalone-test builds pass.
+
+Remaining integration includes a periodic worker, msync and every writable
+publication/protection path, mapped truncate/error recovery and typed EOF faults.
+A successful host flush does not yet establish guest mapped-write durability.
+
+Before admitting shared writable aliases, also test ordinary writes that extend
+EOF after a mapped store into the old partial-page tail. Canonical gap/tail
+zeroing must prevent such bytes becoming newly valid file content on growth.
+
+
+Kernel bc125307791a3cb7961ba9ed6dabfae318f450cd84be3473d3fb5382a1948137
+passes an isolated eight-vCPU/4-GiB regression: ordinary file coherence, inode
+identity, the existing unmapped-truncate/mapped-EBUSY contract, one/four receiver
+Unix rights (512/512 each), and Firefox local rendering, one click, exact input
+and normal exit. The first identity attempt omitted its directory; after fixture
+setup was corrected, the entire strict sequence completed with exit 0. A second
+boot verified the ordinary truncate fixture. Both boots returned to ten baseline
+processes, passed heap/page checks, checked shutdown and all three offline fscks.
+Evidence: ignored build/workloads/shared-writeback-20261016/acceptance.json.
+These guest tests do not exercise queued dirty mapped pages: writable shared
+regular-file mappings are still rejected, and the exposure hook has no runtime
+caller. Both full bootstrap paths remain to be renewed.

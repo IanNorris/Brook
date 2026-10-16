@@ -796,7 +796,7 @@ int VfsSync(Vnode* vn)
     if (vn) return VfsFsync(vn);
     // Try every mount even after a failure, but never acknowledge a failed
     // filesystem/device flush as successful to sync(2) or the VM bridge.
-    int result = 0;
+    int result = FileObjectWritebackAll();
     for (uint32_t i = 0; i < VFS_MAX_MOUNTS; ++i) {
         if (!g_mounts[i].used) continue;
         if (g_mounts[i].fsOps && g_mounts[i].fsOps->sync) {
@@ -813,7 +813,12 @@ int VfsFsync(Vnode* vn)
     // entry (size/clusters).  Used by long-lived writers (e.g. the profiler)
     // that must survive an abrupt poweroff before an explicit close.
     if (!vn || !vn->ops || !vn->ops->fsync) return -95;
-    return vn->ops->fsync(vn);
+    int result=0;
+    if(vn->ops->file_object) {
+        if(auto* object=vn->ops->file_object(vn))result=FileObjectWriteback(object,vn,0,~uint64_t{0});
+    }
+    const int flush=vn->ops->fsync(vn);
+    return result?result:flush;
 }
 
 int VfsUnlink(const char* path)

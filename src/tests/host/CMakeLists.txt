@@ -176,6 +176,7 @@ target_link_options(test_pmm_refs PRIVATE -Wl,--gc-sections)
 add_host_test(test_file_object
     "${BROOK_ROOT}/src/kernel/src/memory/file_object.cpp"
 )
+set_tests_properties(test_file_object PROPERTIES TIMEOUT 30)
 target_compile_options(test_file_object PRIVATE
     -DBROOK_HOST_TEST
     "-iquote${BROOK_ROOT}/src/kernel/src"

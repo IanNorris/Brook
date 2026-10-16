@@ -31,6 +31,8 @@ void FileMappingRegister(FileMappingRegistration* registration,AddressSpaceState
     auto* file=backing->file;RequireFileGate(file,space);
     uint64_t flags=IrqSpinLockAcquire(&registryLock);
     *registration={space,file,file->mappings,space->identity};file->mappings=registration;
+    if(__atomic_add_fetch(&file->mappingRegistrations,1,__ATOMIC_RELEASE)==0)
+        KernelPanic("file mapping: token count overflow");
     IrqSpinLockRelease(&registryLock,flags);
 }
 void FileMappingRetire(FileMappingRegistration* registration) {
@@ -49,6 +51,8 @@ void FileMappingUnregister(FileMappingRegistration* registration) {
     while(*link && *link!=registration)link=&(*link)->next;
     if(!*link)KernelPanic("file mapping: registration missing");
     *link=registration->next;*registration={};
+    if(__atomic_fetch_sub(&file->mappingRegistrations,1,__ATOMIC_ACQ_REL)==0)
+        KernelPanic("file mapping: token count underflow");
     IrqSpinLockRelease(&registryLock,flags);
 }
 AddressSpaceState* FileMappingNextSpace(FileObject* file,uint64_t afterIdentity) {
@@ -68,6 +72,8 @@ AddressSpaceState* FileMappingNextSpace(FileObject* file,uint64_t afterIdentity)
 uint64_t FileMappingRegisteredRanges(FileObject* file) {
     uint64_t flags=IrqSpinLockAcquire(&registryLock),count=0;
     for(auto* token=file->mappings;token;token=token->next)++count;
+    if(count!=__atomic_load_n(&file->mappingRegistrations,__ATOMIC_ACQUIRE))
+        KernelPanic("file mapping: token count mismatch");
     IrqSpinLockRelease(&registryLock,flags);return count;
 }
 uint64_t FileMappingRetiringRanges(FileObject* file) {

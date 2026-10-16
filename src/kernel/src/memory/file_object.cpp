@@ -5,6 +5,7 @@
 #include "vfs.h"
 #include "string.h"
 #include "panic.h"
+#include "spinlock.h"
 #ifndef BROOK_HOST_TEST
 #include "process.h"
 #include "scheduler.h"
@@ -18,6 +19,14 @@ struct FileObjectPage {
     bool writeExposed;
 };
 namespace {
+IrqSpinLock writebackLock;
+FileObject* writebackObjects;
+void DropVnode(Vnode* vnode) {
+    if(!vnode)return;
+    uint32_t previous=__atomic_fetch_sub(&vnode->refCount,1,__ATOMIC_ACQ_REL);
+    if(!previous)KernelPanic("file object: vnode ref underflow");
+    if(previous==1)VfsClose(vnode);
+}
 struct Operation {
 #ifndef BROOK_HOST_TEST
     Process* actor=ProcessCurrent();
@@ -78,10 +87,12 @@ void FileObjectInit(FileObject* object) {
     object->orderId=__atomic_add_fetch(&nextIdentity,1,__ATOMIC_RELAXED);
     if(!object->orderId)KernelPanic("file object: ordering identity exhausted");
     object->mappings=nullptr;
+    object->mappingRegistrations=0;object->writebackVnode=nullptr;object->writebackNext=nullptr;
     for(auto& bucket:object->pages)bucket=nullptr;
 }
 void FileObjectDispose(FileObject* object) {
-    if(object->mappings)KernelPanic("file object: disposing mapped inode");
+    if(object->mappings || object->mappingRegistrations || object->writebackVnode)
+        KernelPanic("file object: disposing retained inode");
     for(auto& bucket:object->pages) { auto* pages=bucket;bucket=nullptr;Release(pages); }
 }
 static PhysicalAddress GetPageLocked(FileObject* object,Vnode* vnode,uint64_t index,bool load,int* error,bool* loaded) {
@@ -173,55 +184,114 @@ int FileObjectWrite(FileObject* object,Vnode* vnode,const void* buffer,uint64_t 
     }
     kfree(bounce);return done?static_cast<int>(done):result;
 }
-bool FileObjectExposeWritableLocked(FileObject* object,uint64_t index,PhysicalAddress physical) {
+bool FileObjectExposeWritableLocked(FileObject* object,Vnode* vnode,uint64_t index,PhysicalAddress physical) {
 #ifndef BROOK_HOST_TEST
     if(!object->gate.locked || object->gate.owner!=ProcessCurrent())
         KernelPanic("file object: writable publication without file gate");
 #endif
     auto* page=Find(object,index);
-    if(!page || !physical || page->physical!=physical)return false;
+    if(!page || !physical || page->physical!=physical || !vnode || vnode->type!=VnodeType::File || !vnode->ops ||
+       !vnode->ops->stat || !vnode->ops->write || !vnode->ops->file_object ||
+       vnode->ops->file_object(vnode)!=object)return false;
+    if(!object->writebackVnode) {
+        VfsRetain(vnode);
+        const uint64_t flags=IrqSpinLockAcquire(&writebackLock);
+        object->writebackVnode=vnode;object->writebackNext=writebackObjects;writebackObjects=object;
+        IrqSpinLockRelease(&writebackLock,flags);
+    }
     page->writeExposed=true;
     return true;
+}
+static int WritebackLocked(FileObject* object,Vnode* vnode,uint64_t begin,uint64_t end,uint8_t* snapshot) {
+    int result=0;
+    VnodeStat stat{};result=vnode->ops->stat(vnode,&stat);
+    if(!result)for(auto* bucket:object->pages) {
+        for(auto* page=bucket;page;page=page->next) {
+            const uint64_t offset=page->index*4096;
+            if(!page->writeExposed || offset>=stat.size || offset>=end ||
+               (offset<begin && begin-offset>=4096))continue;
+            uint64_t count=stat.size-offset;if(count>4096)count=4096;
+            memcpy(snapshot,reinterpret_cast<void*>(PhysToVirt(page->physical).raw()),count);
+            uint64_t done=0;
+            while(done<count) {
+                uint64_t position=offset+done;
+                int written=vnode->ops->write(vnode,snapshot+done,count-done,&position);
+                if(written<=0 || static_cast<uint64_t>(written)>count-done ||
+                   position!=offset+done+static_cast<uint64_t>(written)) {
+                    result=written<0?written:-5;break;
+                }
+                done+=static_cast<uint64_t>(written);
+            }
+            // Never clear exposure: a store racing this snapshot, or any
+            // later store through an alias, must be captured by a retry.
+            if(result)break;
+        }
+        if(result)break;
+    }
+    return result;
 }
 int FileObjectWriteback(FileObject* object,Vnode* vnode,uint64_t begin,uint64_t end) {
     [[maybe_unused]] Operation operation;
     if(begin>end)return -22;
     if(begin==end)return 0;
     if(!vnode || !vnode->ops || !vnode->ops->stat || !vnode->ops->write)return -95;
+    { Gate held(object);if(!object->writebackVnode)return 0; }
     // Allocate before taking the file gate. The backend never sees live mapped
     // memory: a concurrent user store can change it during filesystem I/O.
     auto* snapshot=static_cast<uint8_t*>(kmalloc(4096));if(!snapshot)return -12;
-    int result=0;
-    {
-        Gate held(object);VnodeStat stat{};result=vnode->ops->stat(vnode,&stat);
-        if(!result)for(auto* bucket:object->pages) {
-            for(auto* page=bucket;page;page=page->next) {
-                const uint64_t offset=page->index*4096;
-                if(!page->writeExposed || offset>=stat.size || offset>=end ||
-                   (offset<begin && begin-offset>=4096))continue;
-                uint64_t count=stat.size-offset;if(count>4096)count=4096;
-                memcpy(snapshot,reinterpret_cast<void*>(PhysToVirt(page->physical).raw()),count);
-                uint64_t done=0;
-                while(done<count) {
-                    uint64_t position=offset+done;
-                    int written=vnode->ops->write(vnode,snapshot+done,count-done,&position);
-                    if(written<=0 || static_cast<uint64_t>(written)>count-done ||
-                       position!=offset+done+static_cast<uint64_t>(written)) {
-                        result=written<0?written:-5;break;
-                    }
-                    done+=static_cast<uint64_t>(written);
+    int result;
+    { Gate held(object);result=WritebackLocked(object,vnode,begin,end,snapshot); }
+    kfree(snapshot);return result;
+}
+int FileObjectWritebackAll() {
+    [[maybe_unused]] Operation operation;
+    uint64_t ceiling=0;
+    uint64_t flags=IrqSpinLockAcquire(&writebackLock);
+    for(auto* object=writebackObjects;object;object=object->writebackNext)
+        if(object->orderId>ceiling)ceiling=object->orderId;
+    IrqSpinLockRelease(&writebackLock,flags);
+    if(!ceiling)return 0;
+    auto* snapshot=static_cast<uint8_t*>(kmalloc(4096));if(!snapshot)return -12;
+    int result=0;uint64_t cursor=0;
+    for(;;) {
+        FileObject* object=nullptr;Vnode* vnode=nullptr;
+        flags=IrqSpinLockAcquire(&writebackLock);
+        for(auto* candidate=writebackObjects;candidate;candidate=candidate->writebackNext)
+            if(candidate->orderId>cursor && candidate->orderId<=ceiling &&
+               (!object || candidate->orderId<object->orderId))object=candidate;
+        if(object) { vnode=object->writebackVnode;VfsRetain(vnode);cursor=object->orderId; }
+        IrqSpinLockRelease(&writebackLock,flags);
+        if(!object)break;
+        Vnode* retired=nullptr;
+        {
+            Gate held(object);
+            // Another flush may have dequeued it while our temporary vnode pin
+            // kept the object alive. Never consume a newly queued generation
+            // without first flushing it under this same gate.
+            if(object->writebackVnode) {
+                const int error=WritebackLocked(object,vnode,0,~uint64_t{0},snapshot);
+                if(!result && error)result=error;
+                if(!error && !__atomic_load_n(&object->mappingRegistrations,__ATOMIC_ACQUIRE)) {
+                    flags=IrqSpinLockAcquire(&writebackLock);
+                    auto** link=&writebackObjects;
+                    while(*link && *link!=object)link=&(*link)->writebackNext;
+                    if(!*link)KernelPanic("file object: writeback queue missing");
+                    *link=object->writebackNext;object->writebackNext=nullptr;
+                    retired=object->writebackVnode;object->writebackVnode=nullptr;
+                    IrqSpinLockRelease(&writebackLock,flags);
+                    for(auto* bucket:object->pages)for(auto* page=bucket;page;page=page->next)page->writeExposed=false;
                 }
-                // Never clear exposure: a store racing this snapshot, or any
-                // later store through an alias, must be captured by a retry.
-                if(result)break;
             }
-            if(result)break;
         }
+        DropVnode(retired);DropVnode(vnode);
     }
     kfree(snapshot);return result;
 }
 int FileObjectTruncateUnmapped(FileObject* object,Vnode* vnode,uint64_t length) {
     [[maybe_unused]] Operation operation;
+    // The caller excludes mappings and first-pin publication. Persist any
+    // pending exposure before evicting the canonical cache, even on an error.
+    int writeback=FileObjectWriteback(object,vnode,0,~uint64_t{0});if(writeback)return writeback;
     FileObjectPage* retired[64];memset(retired,0,sizeof(retired));int result;
     {
         Gate held(object);result=vnode->ops->truncate(vnode,length);
