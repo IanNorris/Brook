@@ -1173,8 +1173,24 @@ and loaded it again. Sound and music were explicitly disabled for this run.
 Both applications closed normally; checked shutdown and FAT/ext2 checks passed.
 Evidence is in ignored `build/workloads/desktop-font-workloads-20261016`.
 
-OpenTTD is not yet fully accepted: character keys reach SDL, but text events
-are absent because SDL 3.4.2 requires `zwp_text_input_v3` to activate text input.
-The save dialog also reports zero free bytes because Brook's `statfs` is a
-zero-filled stub. Scheduler watchdog messages during package decompression need
-separate investigation; both installations completed without intervention.
+OpenTTD initially lacked text events because SDL 3.4.2 requires
+`zwp_text_input_v3` to activate text input. Brook now exposes version 1 of that
+protocol with per-resource focus, buffered activation and lifetime cleanup.
+Physical keys remain on `wl_keyboard` for client XKB/compose handling; an input
+method service, preedit and on-screen keyboard are not implemented.
+
+The compositor package runs a host test against real Wayland resources and wire
+events. A second VM passed console typing and command execution, loading the
+previous saved world, and saving `Brook-input-acceptance.sav` by typed command.
+Mousepad saved exactly the 46 injected bytes, including mixed case, digits and
+punctuation, with no duplicated characters. Focus returned to OpenTTD after
+Mousepad closed. Both apps exited, heap integrity passed, checked shutdown and
+all disk checks passed. Evidence is in ignored
+`build/workloads/text-input-20261016/revised-acceptance.json`.
+
+Remaining issues: the OpenTTD save dialog reports zero free bytes because
+Brook's `statfs` is a zero-filled stub. GTK Save As absolute-path completion can
+stop accepting input when its popup appears; a control run with the original
+compositor reproduced this, while saving a simple filename worked. Scheduler
+watchdog messages during package decompression also need separate investigation;
+both installations completed without intervention.

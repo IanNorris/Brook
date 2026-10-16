@@ -1,5 +1,20 @@
 # Recovery and VM-control backlog
 
+## Workload findings, 16 October
+
+- Implement real `statfs`/`fstatfs` capacity and free-space reporting. The current
+  all-zero success stub makes OpenTTD show “0 B free” despite successful saves.
+- Investigate GTK Save As path-completion popups losing subsequent typed input.
+  Typing `/data/home/gtk-text-input.txt` stops at a directory prefix; cancelling
+  restores body typing, and a simple filename saves correctly. Reproduced with
+  both the old compositor and text-input-v3 candidate on separate private VMs.
+- Audit scheduler stall diagnostics before interpreting their “real strand”
+  claim: scanning Ready state outside the ready-queue lock, retaining a raw
+  process pointer, and comparing two samples can race with other CPUs and process
+  lifetime. Messages occurred during zstd imports in both successful clean
+  bootstrap and OpenTTD installation. Establish a coherent referenced snapshot
+  and distinguish detector races from an actual persistent scheduling fault.
+
 ## Mounted filesystem module unload
 
 Checked VFS unmount retains a mount when synchronization fails. Module unload

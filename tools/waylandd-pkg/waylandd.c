@@ -44,6 +44,7 @@
 #include "kde-server-decoration-server-protocol.h"
 #include "viewporter-server-protocol.h"
 #include "linux-dmabuf-unstable-v1-server-protocol.h"
+#include "text-input-v3-server-protocol.h"
 
 #define BROOK_SYS_WM_CREATE_WINDOW   506
 #define BROOK_SYS_WM_DESTROY_WINDOW  507
@@ -1227,6 +1228,8 @@ static struct brook_seat_client *g_seat_clients = NULL;
 static uint32_t g_serial = 1;
 static uint32_t next_serial(void) { return g_serial++; }
 
+#include "text-input-v3.h"
+
 static void seat_clients_scrub_surface(struct brook_surface *s) {
     for (struct brook_seat_client *sc = g_seat_clients; sc; sc = sc->next) {
         if (sc->entered_surface == s) {
@@ -1234,11 +1237,15 @@ static void seat_clients_scrub_surface(struct brook_surface *s) {
                 wm_set_cursor_visible(1);
             sc->entered_surface = NULL;
         }
-        if (sc->kb_focus == s)        sc->kb_focus = NULL;
+        if (sc->kb_focus == s) {
+            text_input_focus(sc, NULL);
+            sc->kb_focus = NULL;
+        }
     }
 }
 
 static void seat_remove_client(struct brook_seat_client *sc) {
+    text_input_remove_seat(sc);
     if (sc && sc->entered_surface && !sc->cursor_visible)
         wm_set_cursor_visible(1);
     struct brook_seat_client **pp = &g_seat_clients;
@@ -1909,6 +1916,7 @@ static void pump_input_for_surface(struct brook_surface *s) {
                                            sc->kb_mods_depressed, 0u,
                                            sc->kb_mods_locked, 0u);
                 sc->kb_focus = s;
+                text_input_focus(sc, s);
                 fprintf(stderr, "[waylandd] FOCUS_GAINED wm=%u\n", s->wm_id);
             }
             break;
@@ -1916,6 +1924,7 @@ static void pump_input_for_surface(struct brook_surface *s) {
         case WM_EVT_FOCUS_LOST: {
             if (sc && sc->keyboard && sc->kb_focus == s) {
                 wl_keyboard_send_leave(sc->keyboard, next_serial(), s->resource);
+                text_input_focus(sc, NULL);
                 sc->kb_focus = NULL;
                 fprintf(stderr, "[waylandd] FOCUS_LOST wm=%u\n", s->wm_id);
             }
@@ -2691,6 +2700,7 @@ int main(int argc, char **argv)
     if (!wl_global_create(g_display, &wl_compositor_interface, 4, NULL, compositor_bind)) return 1;
     if (!wl_global_create(g_display, &xdg_wm_base_interface, 3, NULL, wm_base_bind)) return 1;
     if (!wl_global_create(g_display, &wl_seat_interface, 5, NULL, seat_bind)) return 1;
+    if (!wl_global_create(g_display, &zwp_text_input_manager_v3_interface, 1, NULL, text_input_manager_bind)) return 1;
     if (!wl_global_create(g_display, &wl_output_interface, 3, NULL, output_bind)) return 1;
     if (!wl_global_create(g_display, &zxdg_decoration_manager_v1_interface, 1, NULL, deco_mgr_bind)) return 1;
     if (!wl_global_create(g_display, &org_kde_kwin_server_decoration_manager_interface, 1, NULL, kde_decoration_manager_bind)) return 1;
