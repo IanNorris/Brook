@@ -897,3 +897,42 @@ hashes, profiles and stage results remain in
 `build/experiments/results/bootstrap-prepared-0059ce4-ram/` and
 `build/experiments/results/bootstrap-clean-0059ce4-ram/`. Successful private RAM
 images were archived as sparse files and the owned tmpfs directories removed.
+
+### Batch cached file-fault neighbors under one gate (2026-10-16)
+
+A file fault previously called FileObjectGetPage separately for its primary
+page and up to 15 cache-only neighbors, handing the same shared inode mutex
+off repeatedly among compiler processes. The new FileObjectGetPages operation
+loads only the primary page and pins sparse resident neighbors under one gate
+acquisition. Each returned frame reference stays owned by a local cleanup guard
+until staged into the existing mapping transaction. File/mapping generation
+revalidation and retirement ordering remain unchanged. There is no hash-index,
+IRQ-policy or read-only AS-check optimization in this change.
+
+The actual file-object module test checks sparse neighbors, eight competing
+batches with canonical references, primary-only I/O and one gate acquisition,
+heap/frame OOM, partial-read errors, EOF/overflow and pinned frames surviving
+failed-truncate cache eviction. All 19 hosted tests passed. The isolated VM
+passed 176 fault-race cases and both-disk coherence/lifecycle checks, private
+framebuffer aliases, wait cancellation, fatal signal reaping and heap integrity.
+Checked shutdown and all three offline filesystem checks passed.
+
+Matched unprofiled rebuilds use the same pinned `507e504` guest source, seed,
+eight vCPUs, 4 GiB RAM and private host RAM disks. The unchanged kernel took
+52.36/51.78 host seconds. The batching candidate took 30.92/27.45 seconds, then
+30.25/27.21 seconds when repeated after the control with its same private
+framebuffer prelude: about 42–47% less rebuild time in the matched repeat.
+CTest runtime stayed around 17–20 seconds. All rounds passed their 18-test
+pinned suite, checked shutdown and offline filesystem checks. Host cache and
+thermal state remain uncontrolled; both variants recorded thermal throttling.
+
+A separate instrumented capture recorded file-page mutex-wait chains falling
+from 210741 to 7072, with broader mapping-gate waits now prominent. These counts
+are supporting diagnostic evidence, not a wall-time percentage: capture windows
+cover different fractions of the faster build, and dropped events changed from
+3186577 to 1594760. The speed claim uses unprofiled host elapsed time above.
+Evidence: `build/workloads/file-page-batch-comparison-20261016.json`,
+`build/workloads/file-page-batch-races-20261016/audit.json` and
+`build/workloads/native-page-batch-profile-20261016/stack-analysis.json`.
+Full bootstrap acceptance above is at `0059ce4`; the new source still needs its
+own matching full acceptance paths.

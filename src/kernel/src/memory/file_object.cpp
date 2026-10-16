@@ -83,12 +83,10 @@ void FileObjectDispose(FileObject* object) {
     if(object->mappings)KernelPanic("file object: disposing mapped inode");
     for(auto& bucket:object->pages) { auto* pages=bucket;bucket=nullptr;Release(pages); }
 }
-PhysicalAddress FileObjectGetPage(FileObject* object,Vnode* vnode,uint64_t index,bool load,int* error,bool* loaded) {
-    [[maybe_unused]] Operation operation;
+static PhysicalAddress GetPageLocked(FileObject* object,Vnode* vnode,uint64_t index,bool load,int* error,bool* loaded) {
     if(error)*error=0;
     if(loaded)*loaded=false;
     if(index>~uint64_t{0}/4096) { if(error)*error=-22;return PhysicalAddress{}; }
-    Gate held(object);
     if(auto* page=Find(object,index)) { PmmRefPage(page->physical);return page->physical; }
     if(!load)return PhysicalAddress{};
     VnodeStat stat{};int result=vnode->ops->stat(vnode,&stat);
@@ -114,6 +112,31 @@ PhysicalAddress FileObjectGetPage(FileObject* object,Vnode* vnode,uint64_t index
     // published and competing faults retain this same completed frame.
     *page={index,physical,object->pages[index%64]};object->pages[index%64]=page;
     PmmRefPage(physical);if(loaded)*loaded=true;return physical;
+}
+PhysicalAddress FileObjectGetPage(FileObject* object,Vnode* vnode,uint64_t index,bool load,int* error,bool* loaded) {
+    [[maybe_unused]] Operation operation;
+    Gate held(object);
+    return GetPageLocked(object,vnode,index,load,error,loaded);
+}
+int FileObjectGetPages(FileObject* object,Vnode* vnode,uint64_t index,uint32_t count,
+                       PhysicalAddress* pages,bool* loaded) {
+    [[maybe_unused]] Operation operation;
+    if(loaded)*loaded=false;
+    if(!pages || !count || count>FILE_OBJECT_PAGE_BATCH)return -22;
+    for(uint32_t i=0;i<count;++i)pages[i]=PhysicalAddress{};
+    constexpr uint64_t maximumIndex=~uint64_t{0}/4096;
+    if(index>maximumIndex || count-1>maximumIndex-index)return -22;
+    Gate held(object);
+    int error=0;
+    pages[0]=GetPageLocked(object,vnode,index,true,&error,loaded);
+    if(!pages[0])return error?error:-5;
+    // Neighbors are optional cache hits: never load them and do not stop at
+    // a hole. Every returned slot owns a separate caller reference.
+    for(uint32_t i=1;i<count;++i)
+        if(auto* page=Find(object,index+i)) {
+            PmmRefPage(page->physical);pages[i]=page->physical;
+        }
+    return 0;
 }
 int FileObjectRead(FileObject* object,Vnode* vnode,void* buffer,uint64_t length,uint64_t* offset) {
     [[maybe_unused]] Operation operation;

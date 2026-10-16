@@ -24,6 +24,14 @@ void FileObjectDispose(FileObject* object);
 // outside AS mutation; backend operations never recursively call the VFS layer.
 PhysicalAddress FileObjectGetPage(FileObject* object,Vnode* vnode,uint64_t index,
                                   bool load,int* error,bool* loaded = nullptr);
+// One gate acquisition: load primary if necessary, pin only resident neighbors.
+// Caller bounds count by its VMA and EOF snapshot; publication must still
+// revalidate mapping/file generations. For valid count (1..16), failure clears
+// all count slots; invalid count returns -22 without accessing the array.
+// on success each nonempty slot is an owned reference, including cache hits.
+static constexpr uint32_t FILE_OBJECT_PAGE_BATCH = 16;
+int FileObjectGetPages(FileObject* object,Vnode* vnode,uint64_t index,uint32_t count,
+                       PhysicalAddress* pages,bool* loaded = nullptr);
 int FileObjectRead(FileObject* object,Vnode* vnode,void* buffer,uint64_t length,uint64_t* offset);
 int FileObjectWrite(FileObject* object,Vnode* vnode,const void* buffer,uint64_t length,uint64_t* offset);
 // Initial integration: caller's mapping-pin gate has established no mappings.

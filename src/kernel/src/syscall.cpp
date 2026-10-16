@@ -958,7 +958,7 @@ static bool ResolveMappingFault(uint64_t address,uint64_t error) {
         const auto kind=snapshot.range.kind;
         if (kind!=MappingKind::File && kind!=MappingKind::MemFd && kind!=MappingKind::Anonymous &&
             kind!=MappingKind::Stack && kind!=MappingKind::Heap && kind!=MappingKind::Image) return false;
-        const uint64_t batch=kind==MappingKind::File?16:1;
+        const uint64_t batch=kind==MappingKind::File?FILE_OBJECT_PAGE_BATCH:1;
         operation.Unlock();
         if (!operation.Prepare(0,batch,1)) return false;
         bool cachedPrivate=false;
@@ -966,16 +966,34 @@ static bool ResolveMappingFault(uint64_t address,uint64_t error) {
         if (kind==MappingKind::File) {
             const auto* file=static_cast<FileMappingBacking*>(snapshot.range.backing->object);
             VnodeStat stat{};if (VfsStat(file->vnode,&stat)) return false;
-            for (uint64_t i=0;i<batch && page+i*4096<snapshot.range.end;++i) {
+            FileObject* object=file->vnode->ops->file_object ? file->vnode->ops->file_object(file->vnode) : nullptr;
+            if(object) {
+                // These references remain cancellation-owned until staged;
+                // all I/O and target-file locking precede AS publication.
+                struct BatchPins {
+                    PhysicalAddress pages[FILE_OBJECT_PAGE_BATCH]{};
+                    ~BatchPins() { for(auto physical:pages)if(physical)PmmUnrefPage(physical); }
+                } pins;
+                uint32_t count=0;
+                const uint64_t offset=snapshot.range.offset+page-snapshot.range.begin;
+                for(uint64_t i=0;i<batch && page+i*4096<snapshot.range.end;++i) {
+                    if(offset+i*4096>=stat.size)break;
+                    ++count;
+                }
+                if(!count)return false;
+                bool loaded=false;
+                if(FileObjectGetPages(object,file->vnode,offset/4096,count,pins.pages,&loaded))return false;
+                for(uint32_t i=0;i<count;++i)if(pins.pages[i]) {
+                    __atomic_fetch_add(i==0&&loaded?&g_profCacheMiss:&g_profCacheHit,1,__ATOMIC_RELAXED);
+                    if(!operation.StagePage(i,pins.pages[i],true))return false;
+                    pins.pages[i]=PhysicalAddress{}; // transaction owns the pin
+                }
+            } else for (uint64_t i=0;i<batch && page+i*4096<snapshot.range.end;++i) {
                 const uint64_t offset=snapshot.range.offset+(page+i*4096-snapshot.range.begin);
                 if (offset>=stat.size) { if (!i) return false; break; }
-                FileObject* object=file->vnode->ops->file_object ? file->vnode->ops->file_object(file->vnode) : nullptr;
-                int pageError=0;bool loaded=false;
-                auto physical=object ? FileObjectGetPage(object,file->vnode,offset/4096,i==0,&pageError,&loaded) :
-                    FilePageCacheLookup(file->vnode,offset/4096);
-                if(object && !physical && (!i || pageError))return false;
+                auto physical=FilePageCacheLookup(file->vnode,offset/4096);
                 if (physical) {
-                    __atomic_fetch_add(loaded?&g_profCacheMiss:&g_profCacheHit,1,__ATOMIC_RELAXED);
+                    __atomic_fetch_add(&g_profCacheHit,1,__ATOMIC_RELAXED);
                     if (!operation.StagePage(i,physical,true)) { PmmUnrefPage(physical);return false; }
                 } else if (!i) {
                     __atomic_fetch_add(&g_profCacheMiss,1,__ATOMIC_RELAXED);
