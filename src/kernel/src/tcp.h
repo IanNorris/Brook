@@ -20,6 +20,7 @@ inline bool TcpCanSendData(TcpState state)
 
 // Action the caller should take after processing a segment.
 struct TcpAction {
+    bool     sendSynAck;     // retransmit original server SYN-ACK
     bool     sendAck;        // send an ACK segment
     bool     sendRst;        // send a RST segment
     bool     enqueueData;    // data should be enqueued to RX buffer
@@ -31,6 +32,12 @@ struct TcpAction {
     uint32_t oooDataLen;       // bytes of future data to retain
     uint32_t oooSeq;           // sequence number for oooDataPtr
 };
+
+// Bound incomplete passive opens without discarding established/half-closed FDs.
+inline bool TcpPassiveOpenExpired(const Socket& socket, uint64_t now)
+{
+    return socket.tcpState == TcpState::SynRecv && now - socket.tcpLastRxTick >= 30000;
+}
 
 // Process an incoming TCP segment for a socket.
 // Updates socket state (tcpState, tcpRcvNxt, tcpSndUna, connected, tcpFinRecv).

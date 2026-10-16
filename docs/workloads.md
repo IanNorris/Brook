@@ -1109,3 +1109,34 @@ which creates its own composited window buffer. Previously it wrote a canary
 into live firmware scanout memory and could race compositor redraws. The
 corrected probe passed 512 writable aliases, descriptor close and progressive
 unmapping while checking surviving aliases.
+
+### Debug transport reconnect and log framing (2026-10-16)
+
+Compiler acceptance exposed intermittent loss of the guest debug connection.
+The debug log streamer copied 160-character ring rows into 161-byte buffers,
+then appended CRLF past their end. It now frames each row into separate storage
+and handles partial sends, including structured command replies.
+
+Passive TCP children now transfer one reference from their creator to the
+listener queue, then to the accepted caller. Queue topology has a dedicated
+guard; disposal occurs after unlocking. Initial SYN-ACK transmission and logging
+finish before publication, so the creator cannot become a blocking last closer
+in receive context. Reset/expired children are retired during accept and new
+SYN admission, preserving buffered requests when FIN precedes accept. Handshake
+handling prioritizes RST over ACK, checks the final ACK, retransmits the original
+SYN-ACK on duplicate SYN and bounds abandoned passive opens to 30 seconds.
+The old capacity-recovery path that forcibly freed live CLOSE_WAIT sockets was
+removed: peer FIN does not surrender an application's descriptor or unread data.
+General receive tuple lookup versus socket-slot reuse remains separate work.
+
+The actual TCP state machine passes 77 assertions, including new passive-open
+cases; the previous implementation fails eight assertions in the same expanded
+test. An isolated eight-core, 4-GiB VM passed 12 rounds with two queued reset
+clients, six queued buffered-request/FIN cases, 16 structured reconnects and
+40 complete 160-character kernel-ring rows. Tests synchronize on the guest's
+captured ACK rather than assuming host-forwarded connect means guest acceptance.
+The same final candidate passed 176 mapping-race cases, both disk coherence and
+filesystem-exit checks, private framebuffer aliases, futex/mixed-wait exit,
+fatal signal reaping and heap integrity. Checked shutdown and all three offline
+filesystem checks passed. Evidence and private captures remain ignored in
+`build/workloads/debug-tcp-final-races-20261016/audit.json`.

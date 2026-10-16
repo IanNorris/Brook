@@ -345,10 +345,42 @@ static void TestChecksum()
     printf("  TestChecksum: OK\n");
 }
 
+static void TestPassiveHandshake()
+{
+    auto passive=[] { Socket s=MakeEstablishedSocket();s.tcpState=TcpState::SynRecv;
+                       s.connected=false;s.tcpLastRxTick=100;return s; };
+    Socket s=passive();
+    auto action=TcpProcessSegment(s,5000,0,TCP_SYN,nullptr,0);
+    ASSERT_TRUE(action.sendSynAck);ASSERT_EQ(s.tcpState,TcpState::SynRecv);
+    ASSERT_EQ(s.tcpSndNxt,1001u);ASSERT_EQ(s.tcpRcvNxt,5001u);
+    ASSERT_EQ(s.tcpLastRxTick,100u);
+    action=TcpProcessSegment(s,4999,0,TCP_SYN,nullptr,0);ASSERT_TRUE(!action.sendSynAck);
+    action=TcpProcessSegment(s,5001,1000,TCP_ACK,nullptr,0);
+    ASSERT_EQ(s.tcpState,TcpState::SynRecv);ASSERT_TRUE(!action.justConnected);
+    s=passive();
+    action=TcpProcessSegment(s,5001,1001,TCP_RST|TCP_ACK,nullptr,0);
+    ASSERT_EQ(s.tcpState,TcpState::Closed);ASSERT_TRUE(s.tcpRstRecv&&!s.connected);
+    ASSERT_TRUE(!action.justConnected&&!action.enqueueData);
+    s=passive();const uint8_t request[]={1,2,3};
+    action=TcpProcessSegment(s,5001,1001,TCP_ACK|TCP_FIN,request,3);
+    ASSERT_TRUE(action.justConnected&&action.enqueueData&&action.sendAck);
+    ASSERT_EQ(action.dataLen,3u);ASSERT_TRUE(action.dataPtr==request);
+    ASSERT_EQ(s.tcpState,TcpState::CloseWait);ASSERT_TRUE(s.connected&&s.tcpFinRecv);
+    ASSERT_EQ(s.tcpRcvNxt,5005u);
+    s=passive();ASSERT_TRUE(!TcpPassiveOpenExpired(s,30099));
+    ASSERT_TRUE(TcpPassiveOpenExpired(s,30100));
+    s.tcpState=TcpState::Established;ASSERT_TRUE(!TcpPassiveOpenExpired(s,99999));
+    s.tcpState=TcpState::CloseWait;ASSERT_TRUE(!TcpPassiveOpenExpired(s,99999));
+    s=passive();s.tcpLastRxTick=~uint64_t{0}-100;
+    ASSERT_TRUE(TcpPassiveOpenExpired(s,30000));
+    std::puts("  TestPassiveHandshake: OK");
+}
+
 int main()
 {
     printf("=== TCP State Machine Tests ===\n");
 
+    TestPassiveHandshake();
     TestSynAck();
     TestSynRst();
     TestEstablishedReceive();

@@ -98,6 +98,9 @@ static Process* g_arpWaiter = nullptr;
 static constexpr uint32_t MAX_SOCKETS = 1024;
 static Socket g_sockets[MAX_SOCKETS];
 static bool   g_sockUsed[MAX_SOCKETS];
+// Protect listener queue topology/ownership. Never allocate, send, close, or
+// dispose while held. Queue -> child.lock is the only nested lock order.
+static IrqSpinLock g_acceptQueueLock;
 
 // IPv4 identification counter (atomic for SMP safety)
 static volatile uint16_t g_ipId = 1;
@@ -1442,63 +1445,10 @@ int SockCreate(int domain, int type, int protocol)
                  "ESTAB=%u CLOSE_WAIT=%u FIN_WAIT=%u SYN_SENT=%u UDP=%u other=%u\n",
                  MAX_SOCKETS, nEstab, nCloseWait, nFinWait, nSynSent, nUdp, nOther);
 
-    // Reap stale CloseWait sockets (peer sent FIN >30s ago, app never closed).
-    // This handles the common case where Ladybird's RequestServer holds HTTP
-    // connections that the server has closed but the app hasn't acknowledged.
-    extern volatile uint64_t g_lapicTickCount;
-    static constexpr uint64_t CLOSE_WAIT_TIMEOUT_MS = 30000; // 30 seconds
-    for (uint32_t i = 0; i < MAX_SOCKETS; i++) {
-        if (!g_sockUsed[i]) continue;
-        Socket& s = g_sockets[i];
-        if (s.type != SOCK_STREAM) continue;
-        if (s.tcpState != TcpState::CloseWait) continue;
-        if (s.tcpCloseWaitTick == 0) continue;
-        uint64_t age = g_lapicTickCount - s.tcpCloseWaitTick;
-        if (age >= CLOSE_WAIT_TIMEOUT_MS) {
-            SerialPrintf("net: reaping stale CLOSE_WAIT socket %u (pid=%u, age=%lums)\n",
-                         i, s.ownerPid, age);
-            TcpSendSegment(s, TCP_FIN | TCP_ACK, nullptr, 0, "reap-closewait");
-            if (s.tcpOooBuf) kfree(s.tcpOooBuf);
-            if (s.rxBuf) kfree(s.rxBuf);
-            memset(&g_sockets[i], 0, sizeof(Socket));
-            g_sockUsed[i] = false;
-        }
-    }
+    // A peer FIN does not abandon the application's FD or unread bytes.
+    // Never recover capacity by freeing live/refcounted CLOSE_WAIT sockets.
+    return -1;
 
-    // Retry allocation after reaping
-    for (uint32_t i = 0; i < MAX_SOCKETS; i++) {
-        if (!g_sockUsed[i]) {
-            g_sockUsed[i] = true;
-            memset(&g_sockets[i], 0, sizeof(Socket));
-            g_sockets[i].domain = domain;
-            g_sockets[i].type = type;
-            g_sockets[i].protocol = protocol ? protocol :
-                (type == SOCK_DGRAM ? IPPROTO_UDP : IPPROTO_TCP);
-            g_sockets[i].rxBuf = static_cast<uint8_t*>(kmalloc(Socket::RX_BUF_SIZE));
-            if (!g_sockets[i].rxBuf) {
-                g_sockUsed[i] = false;
-                return -1;
-            }
-            if (type == SOCK_STREAM) {
-                g_sockets[i].tcpOooBuf = static_cast<uint8_t*>(
-                    kmalloc(Socket::TCP_OOO_SLOT_COUNT * Socket::TCP_OOO_SLOT_SIZE));
-                if (!g_sockets[i].tcpOooBuf) {
-                    kfree(g_sockets[i].rxBuf);
-                    g_sockUsed[i] = false;
-                    return -1;
-                }
-            }
-            g_sockets[i].refCount = 1;
-            {
-                Process* self = ProcessCurrent();
-                g_sockets[i].ownerPid = self ? self->tgid : 0;
-            }
-            SerialPrintf("net: socket %u recovered after CLOSE_WAIT reap\n", i);
-            return static_cast<int>(i);
-        }
-    }
-
-    return -1; // truly exhausted
 }
 
 int SockBind(int sockIdx, const SockAddrIn* addr)
@@ -1630,27 +1580,24 @@ void SockClose(int sockIdx)
 
     Socket& s = g_sockets[sockIdx];
 
-    // Listening socket: close all pending connections in accept queue
-    if (s.listening)
-    {
-        for (int i = 0; i < s.acceptQueueCount; i++)
-        {
-            int childIdx = s.acceptQueue[i];
-            if (childIdx >= 0 && childIdx < static_cast<int>(MAX_SOCKETS) && g_sockUsed[childIdx])
-            {
-                Socket& child = g_sockets[childIdx];
-                if (child.tcpState == TcpState::Established ||
-                    child.tcpState == TcpState::SynRecv)
-                {
-                    TcpSendSegment(child, TCP_RST, nullptr, 0, "rst-listener");
-                }
-                if (child.tcpOooBuf) kfree(child.tcpOooBuf);
-                if (child.rxBuf) kfree(child.rxBuf);
-                memset(&g_sockets[childIdx], 0, sizeof(Socket));
-                g_sockUsed[childIdx] = false;
-            }
+    // Detach queue ownership under its guard, then close children outside it.
+    int queued[Socket::ACCEPT_QUEUE_MAX];
+    int queuedCount = 0;
+    uint64_t queueFlags = IrqSpinLockAcquire(&g_acceptQueueLock);
+    if (s.listening) {
+        s.listening = false;
+        queuedCount = s.acceptQueueCount;
+        for (int i = 0; i < queuedCount; ++i) {
+            queued[i] = s.acceptQueue[i];
+            if (queued[i] >= 0 && queued[i] < static_cast<int>(MAX_SOCKETS))
+                g_sockets[queued[i]].listenSockIdx = -1;
         }
+        s.acceptQueueCount = 0;
     }
+    IrqSpinLockRelease(&g_acceptQueueLock, queueFlags);
+    for (int i = 0; i < queuedCount; ++i)
+        if (queued[i] >= 0 && queued[i] < static_cast<int>(MAX_SOCKETS))
+            SockUnref(queued[i]); // transfer/drop the queue's original reference
 
     // TCP: graceful close — send FIN and wait for the peer to acknowledge.
     //
@@ -2194,6 +2141,46 @@ static void TcpEnqueueData(Socket& s, const void* data, uint32_t len)
     // Caller (HandleTcp) wakes pollWaiter after releasing the lock.
 }
 
+// Caller holds child.lock and the queue guard when changing queue ownership.
+static bool RetireAbandonedQueuedChild(Socket& child, uint64_t now)
+{
+    if (TcpPassiveOpenExpired(child, now)) {
+        // Prevent a late final ACK from resurrecting a detached passive open.
+        // Disposal from RX must not enter SockClose's graceful FIN wait.
+        child.tcpState = TcpState::Closed;
+        child.connected = false;
+        child.tcpRstRecv = true;
+    }
+    return child.tcpRstRecv || child.tcpState == TcpState::Closed;
+}
+
+static void PruneAcceptQueue(Socket& listener)
+{
+    int retired[Socket::ACCEPT_QUEUE_MAX];
+    int retiredCount = 0;
+    extern volatile uint64_t g_lapicTickCount;
+    uint64_t queueFlags = IrqSpinLockAcquire(&g_acceptQueueLock);
+    for (int qi = 0; listener.listening && qi < listener.acceptQueueCount;) {
+        int childIdx = listener.acceptQueue[qi];
+        bool valid = childIdx >= 0 && childIdx < static_cast<int>(MAX_SOCKETS) && g_sockUsed[childIdx];
+        bool discard = !valid;
+        if (valid) {
+            Socket& child = g_sockets[childIdx];
+            SpinLockAcquire(&child.lock);
+            discard = RetireAbandonedQueuedChild(child, g_lapicTickCount);
+            if (discard) child.listenSockIdx = -1;
+            SpinLockRelease(&child.lock);
+        }
+        if (!discard) { ++qi; continue; }
+        for (int j = qi; j < listener.acceptQueueCount - 1; ++j)
+            listener.acceptQueue[j] = listener.acceptQueue[j + 1];
+        --listener.acceptQueueCount;
+        if (valid) retired[retiredCount++] = childIdx;
+    }
+    IrqSpinLockRelease(&g_acceptQueueLock, queueFlags);
+    for (int i = 0; i < retiredCount; ++i) SockUnref(retired[i]);
+}
+
 void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
 {
     if (len < sizeof(TcpHeader)) return;
@@ -2252,7 +2239,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         s.rxPktCount++;
         {
             extern volatile uint64_t g_lapicTickCount;
-            if (dataLen > 0)
+            if (dataLen > 0 && s.tcpState != TcpState::SynRecv)
                 s.tcpLastRxTick = g_lapicTickCount;
         }
         TcpStatsRecord(/*tx=*/false, flags, dataLen);
@@ -2336,6 +2323,9 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
 
         SpinLockRelease(&s.lock);
 
+        if (act.sendSynAck)
+            TcpSendSegmentAtSeq(s, s.tcpSndIss, TCP_SYN | TCP_ACK, nullptr, 0, "synack-retry");
+
         // Delayed ACK: ACK every 2nd data segment, or immediately for
         // control events (FIN, OOO, buffer-full, connect). This halves
         // the ACK packet count for bulk downloads.
@@ -2384,12 +2374,16 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             if (!s.listening) continue;
             if (s.localPort != dstPort) continue;
 
-            // Check backlog
-            if (s.acceptQueueCount >= s.listenBacklog)
-            {
+            // Reclaim abandoned children even while accept's consumer is still
+            // closing its active FD; dead queue entries must not refuse a SYN.
+            PruneAcceptQueue(s);
+            uint64_t queueFlags = IrqSpinLockAcquire(&g_acceptQueueLock);
+            bool full = !s.listening || s.acceptQueueCount >= s.listenBacklog;
+            IrqSpinLockRelease(&g_acceptQueueLock, queueFlags);
+            if (full) {
                 SerialPrintf("net: TCP SYN dropped — accept queue full (port %u)\n",
                              ntohs(dstPort));
-                break; // send RST below
+                break;
             }
 
             // Create a new socket for this connection
@@ -2407,6 +2401,8 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             child.remotePort = srcPort;
             child.bound      = true;
             child.tcpState   = TcpState::SynRecv;
+            extern volatile uint64_t g_lapicTickCount;
+            child.tcpLastRxTick = g_lapicTickCount; // passive-open deadline origin
             child.tcpRcvNxt  = seq + 1;
             child.listenSockIdx = static_cast<int>(i);
 
@@ -2417,21 +2413,39 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             child.tcpSndNxt = child.tcpSndIss + 1; // after SYN-ACK
             child.tcpSndUna = child.tcpSndIss;
 
-            // Add to listen socket's accept queue
-            s.acceptQueue[s.acceptQueueCount++] = childIdx;
-
-            // Send SYN-ACK
-            // Temporarily set tcpSndNxt to ISS for the SYN-ACK segment
-            child.tcpSndNxt = child.tcpSndIss;
-            TcpSendSegment(child, TCP_SYN | TCP_ACK, nullptr, 0, "synack");
-            child.tcpSndNxt = child.tcpSndIss + 1; // SYN consumes one seq
+            // Send at ISS without temporarily changing the live next sequence.
+            TcpSendSegmentAtSeq(child, child.tcpSndIss, TCP_SYN | TCP_ACK, nullptr, 0, "synack");
 
             SerialPrintf("net: TCP SYN-ACK sent for port %u -> %u.%u.%u.%u:%u (childIdx=%d)\n",
                          ntohs(dstPort),
                          ip->srcIp & 0xFF, (ip->srcIp >> 8) & 0xFF,
                          (ip->srcIp >> 16) & 0xFF, (ip->srcIp >> 24) & 0xFF,
                          ntohs(srcPort), childIdx);
-            return; // handled
+            // Transfer the creator reference only after sending and logging.
+            // Once published, accept/listener close may immediately retire it;
+            // successful publication must be our last access to this child.
+            queueFlags = IrqSpinLockAcquire(&g_acceptQueueLock);
+            SpinLockAcquire(&child.lock);
+            bool publish = s.listening && s.acceptQueueCount < s.listenBacklog
+                           && !RetireAbandonedQueuedChild(child, g_lapicTickCount)
+                           && (child.tcpState == TcpState::SynRecv
+                               || child.tcpState == TcpState::Established
+                               || child.tcpState == TcpState::CloseWait);
+            if (publish) {
+                s.acceptQueue[s.acceptQueueCount++] = childIdx;
+            } else {
+                // Rejected children must not enter graceful FIN wait in RX,
+                // even if a concurrent ACK completed the handshake already.
+                child.tcpState = TcpState::Closed;
+                child.connected = false;
+                child.tcpRstRecv = true;
+                child.listenSockIdx = -1;
+            }
+            SpinLockRelease(&child.lock);
+            IrqSpinLockRelease(&g_acceptQueueLock, queueFlags);
+            if (!publish)
+                SockUnref(childIdx);
+            return; // queue owns the reference on successful publication
         }
     }
 
@@ -2893,12 +2907,14 @@ int SockListen(int sockIdx, int backlog)
     if (s.type != SOCK_STREAM) return -1;
     if (!s.bound) return -1;
 
+    uint64_t queueFlags = IrqSpinLockAcquire(&g_acceptQueueLock);
     s.listening = true;
     s.listenBacklog = (backlog > Socket::ACCEPT_QUEUE_MAX)
                         ? Socket::ACCEPT_QUEUE_MAX : (backlog < 1 ? 1 : backlog);
     s.acceptQueueCount = 0;
     s.tcpState = TcpState::Listen;
     s.listenSockIdx = -1;
+    IrqSpinLockRelease(&g_acceptQueueLock, queueFlags);
 
     SerialPrintf("net: listen sockIdx=%d port=%u backlog=%d\n",
                  sockIdx, ntohs(s.localPort), s.listenBacklog);
@@ -2923,36 +2939,49 @@ int SockAccept(int sockIdx, SockAddrIn* addr)
     {
         if (g_netIf && g_netIf->poll) g_netIf->poll(g_netIf);
 
-        // Scan accept queue for Established connections
-        for (int qi = 0; qi < s.acceptQueueCount; qi++)
-        {
+        // Queue entries own one reference until accepted or discarded.
+        // FIN after handshake is still accept-able: drain buffered bytes and
+        // report EOF normally. Reset/Closed entries cannot become Established.
+        int retired[Socket::ACCEPT_QUEUE_MAX];
+        int retiredCount = 0;
+        int accepted = -1;
+        uint64_t queueFlags = IrqSpinLockAcquire(&g_acceptQueueLock);
+        for (int qi = 0; qi < s.acceptQueueCount;) {
             int childIdx = s.acceptQueue[qi];
-            if (childIdx < 0 || childIdx >= static_cast<int>(MAX_SOCKETS)) continue;
-            Socket& child = g_sockets[childIdx];
-
-            if (child.tcpState == TcpState::Established)
-            {
-                // Remove from accept queue (shift remaining)
-                for (int j = qi; j < s.acceptQueueCount - 1; j++)
-                    s.acceptQueue[j] = s.acceptQueue[j + 1];
-                s.acceptQueueCount--;
-
-                // Fill in peer address if requested
-                if (addr)
-                {
-                    addr->sin_family = AF_INET;
-                    addr->sin_port   = child.remotePort;
-                    addr->sin_addr   = child.remoteIp;
+            bool valid = childIdx >= 0 && childIdx < static_cast<int>(MAX_SOCKETS) && g_sockUsed[childIdx];
+            bool discard = !valid;
+            bool accept = false;
+            if (valid) {
+                Socket& child = g_sockets[childIdx];
+                SpinLockAcquire(&child.lock);
+                extern volatile uint64_t g_lapicTickCount;
+                discard = RetireAbandonedQueuedChild(child, g_lapicTickCount);
+                accept = !discard && (child.tcpState == TcpState::Established ||
+                                      child.tcpState == TcpState::CloseWait);
+                if (discard || accept) {
+                    child.listenSockIdx = -1;
+                    if (accept && addr) {
+                        addr->sin_family = AF_INET;
+                        addr->sin_port = child.remotePort;
+                        addr->sin_addr = child.remoteIp;
+                    }
                 }
-
-                SerialPrintf("net: accept sockIdx=%d -> childIdx=%d remote=%u.%u.%u.%u:%u\n",
-                             sockIdx, childIdx,
-                             child.remoteIp & 0xFF, (child.remoteIp >> 8) & 0xFF,
-                             (child.remoteIp >> 16) & 0xFF, (child.remoteIp >> 24) & 0xFF,
-                             ntohs(child.remotePort));
-                return childIdx;
+                SpinLockRelease(&child.lock);
             }
+            if (!discard && !accept) { ++qi; continue; }
+            for (int j = qi; j < s.acceptQueueCount - 1; ++j)
+                s.acceptQueue[j] = s.acceptQueue[j + 1];
+            --s.acceptQueueCount;
+            if (discard) {
+                if (valid) retired[retiredCount++] = childIdx;
+                continue;
+            }
+            accepted = childIdx; // queue reference transfers to caller
+            break;
         }
+        IrqSpinLockRelease(&g_acceptQueueLock, queueFlags);
+        for (int i = 0; i < retiredCount; ++i) SockUnref(retired[i]);
+        if (accepted >= 0) return accepted;
 
         // Yield so other work can run while we wait for a SYN to land.
         SchedulerYield();
@@ -3087,13 +3116,25 @@ void DebugChannelClearReplySock() {
     if(p) __atomic_store_n(&g_debugReplySockets[p->pid],static_cast<uint16_t>(0),__ATOMIC_RELEASE);
 }
 
+static int DebugSendAll(int sock, const char* data, uint32_t length)
+{
+    uint32_t sent = 0;
+    while (sent < length) {
+        int result = SockSend(sock, data + sent, length - sent);
+        if (result <= 0) return result < 0 ? result : -104;
+        if (static_cast<uint32_t>(result) > length - sent) return -5;
+        sent += static_cast<uint32_t>(result);
+    }
+    return static_cast<int>(sent);
+}
+
 void DebugChannelSend(const char* msg)
 {
     int sock = DebugReplySocket();
     if (sock < 0) return;
     uint32_t len = 0;
     while (msg[len]) len++;
-    SockSend(sock, msg, len);
+    (void)DebugSendAll(sock, msg, len);
 }
 
 bool DebugChannelConnected()
@@ -3215,7 +3256,7 @@ static bool MatchLogLevel(const char* name, LogLevel* out)
 static int DebugReplySend(const char* data, uint32_t length)
 {
     int sock = DebugReplySocket();
-    return sock >= 0 ? SockSend(sock, data, length) : -1;
+    return sock >= 0 ? DebugSendAll(sock, data, length) : -1;
 }
 
 // Fixed-buffer replies: no dependency on a userspace printf implementation.

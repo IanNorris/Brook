@@ -31,26 +31,28 @@ TcpAction TcpProcessSegment(Socket& s,
 
     switch (s.tcpState) {
     case TcpState::SynRecv:
-        // Server side: waiting for ACK to complete 3-way handshake
-        if (flags & TCP_ACK) {
-            s.tcpSndUna = ack;
-            s.tcpState  = TcpState::Established;
-            s.connected = true;
+        // RST commonly carries ACK too: reset must win over handshake success.
+        if (flags & TCP_RST) {
+            s.tcpState = TcpState::Closed;s.connected = false;s.tcpRstRecv = true;
+        } else if (flags & TCP_SYN) {
+            // The original SYN-ACK may have been lost. Repeat the same ISS;
+            // neither retransmission consumes another sequence number.
+            if (seq + 1 == s.tcpRcvNxt) act.sendSynAck = true;
+        } else if ((flags & TCP_ACK) && ack == s.tcpSndNxt) {
+            s.tcpSndUna = ack;s.tcpState = TcpState::Established;s.connected = true;
+            act.justConnected = true;
             {
                 extern volatile uint64_t g_lapicTickCount;
                 s.tcpLastRxTick = g_lapicTickCount;
             }
-            // If data piggy-backed on the ACK, enqueue it
             if (dataLen > 0 && seq == s.tcpRcvNxt) {
-                act.enqueueData = true;
-                act.dataPtr     = data;
-                act.dataLen     = dataLen;
-                s.tcpRcvNxt += dataLen;
+                act.enqueueData = true;act.dataPtr = data;act.dataLen = dataLen;
+                s.tcpRcvNxt += dataLen;act.sendAck = true;
+            }
+            if ((flags & TCP_FIN) && seq + dataLen == s.tcpRcvNxt) {
+                ++s.tcpRcvNxt;s.tcpFinRecv = true;s.tcpState = TcpState::CloseWait;
                 act.sendAck = true;
             }
-        } else if (flags & TCP_RST) {
-            s.tcpState  = TcpState::Closed;
-            s.connected = false;
         }
         break;
 

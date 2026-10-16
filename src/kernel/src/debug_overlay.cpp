@@ -318,6 +318,17 @@ static constexpr uint16_t DEBUG_TCP_PORT = 1234;
 static constexpr uint32_t TCP_LINE_LEN   = 160;
 static constexpr uint32_t TCP_BATCH      = 32; // lines per send batch
 
+static bool DebugTcpSendAll(int socket, const char* bytes, uint32_t length)
+{
+    uint32_t sent = 0;
+    while (sent < length) {
+        int result = SockSend(socket, bytes + sent, length - sent);
+        if (result <= 0 || static_cast<uint32_t>(result) > length - sent) return false;
+        sent += static_cast<uint32_t>(result);
+    }
+    return true;
+}
+
 static void DebugTcpThread(void* /*arg*/)
 {
     // Create listen socket
@@ -367,7 +378,10 @@ static void DebugTcpThread(void* /*arg*/)
 
         // Send banner
         const char* banner = "=== Brook OS Debug Console ===\r\n";
-        SockSend(clientSock, banner, strlen(banner));
+        if (!DebugTcpSendAll(clientSock, banner, strlen(banner))) {
+            SockUnref(clientSock);
+            continue;
+        }
 
         // Stream ring buffer content AND handle incoming commands
         uint32_t cursor = 0; // start from beginning of ring
@@ -406,12 +420,14 @@ static void DebugTcpThread(void* /*arg*/)
             for (uint32_t i = 0; i < count; i++)
             {
                 uint32_t len = 0;
-                while (lineBuf[i][len]) len++;
-                // Append \r\n
-                lineBuf[i][len] = '\r';
-                lineBuf[i][len + 1] = '\n';
-                int ret = SockSend(clientSock, lineBuf[i], len + 2);
-                if (ret < 0)
+                while (len < TCP_LINE_LEN && lineBuf[i][len]) len++;
+                // Keep the ring copy width at 160, and frame into separate
+                // storage with room for both CR and LF (no trailing NUL needed).
+                char framed[TCP_LINE_LEN + 2];
+                memcpy(framed, lineBuf[i], len);
+                framed[len] = '\r';
+                framed[len + 1] = '\n';
+                if (!DebugTcpSendAll(clientSock, framed, len + 2))
                     goto client_done;
             }
 
@@ -426,7 +442,7 @@ static void DebugTcpThread(void* /*arg*/)
 
     client_done:
         SerialPuts("DEBUG_TCP: client disconnected\n");
-        SockClose(clientSock);
+        SockUnref(clientSock);
     }
 }
 
