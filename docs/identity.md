@@ -40,6 +40,19 @@ Primary implementation locations: `src/kernel/src/process.h`, `process.cpp`,
 ownership regression is `scripts/workloads/ownership.py`; persistent storage is
 checked by `scripts/workloads/home.py`. Neither test asserts full authorization.
 
+## Runtime spot check
+
+In session `5be7052708c044be92e4ede7cae33442`, a bounded Python query launched
+with `run --uid 1000` printed:
+
+```text
+IDENTITY_AUDIT 1000 1000 (0, 0, 0) 1000 (0, 0, 0) [0]
+```
+
+The fields are getuid, geteuid, getresuid, getgid, getresgid and getgroups.
+This directly confirms the contradictory query results and fixed group list;
+it is a failing identity-consistency observation, not an authorization pass.
+
 ## Delivery order and acceptance
 
 1. Fix contradictory identity queries and false-success credential operations,

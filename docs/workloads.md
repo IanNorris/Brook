@@ -1704,3 +1704,62 @@ The test commands, syscall trace, profiles and result are preserved under
 `build/workloads/codium-home-20261017/` and
 `build/workloads/codium-shm-20261017/`; sessions are
 `f8420feb131f456ea842e3316673d971` and `7ee8f37e962f4e12acdd431ec6623b1b`.
+
+
+### Blender baseline and upstream LLVM mismatch (17 October)
+
+Stock Blender 5.1.1 installed through the guest installer on eight vCPUs,
+4 GiB and software graphics. The installer completed 88 fetch pipelines in
+244,266 ms total and refreshed installed-app discovery. A 527 MB LLVM dependency
+unpacked in 41,975 ms. The ten-second installation profile contained 7,032
+samples, including 6,557 idle samples; block writes, scheduling and mapping
+operations appear in the active samples. This is not a CPU saturation finding.
+Ready-but-not-enqueued scheduler warnings occurred, but their worker trace ticks
+advanced and installation completed; persistent starvation is not established.
+
+The normal launch connected to Wayland, then reported failure to create the
+secure PulseAudio directory on `/tmp` (`EOPNOTSUPP`), a pthread mutex-unlock
+`EPERM`, and an abort. A separate `-noaudio --gpu-backend opengl` diagnostic
+reached surface configuration and EGL, then faulted inside LLVM 19 while its
+stack also contained clang 19 and LLVM 21. Blender wrote a crash report. The
+stack matches [Nixpkgs issue 508671](https://github.com/NixOS/nixpkgs/issues/508671),
+whose [upstream fix](https://github.com/NixOS/nixpkgs/pull/514285) aligns OSL's LLVM
+dependency. That package correction is the next control; this baseline does not
+prove that Brook's OpenGL implementation supports Blender.
+
+Both failed launches were cleaned up with targeted SIGKILL, returning to ten
+tasks with heap integrity OK. Checked stop and all three offline filesystem
+checks passed. No new graphics functionality was added for Blender. Evidence:
+`build/workloads/blender-20261017/result.json`, its scripts and serial logs, and
+bridge session `9631b2d812324c629e50334d55c01ce7`. Installation profile:
+`bbf3d64df5064caea3f5f983c5c08ae7`. Neither default audio nor the editor/viewport
+is accepted.
+
+
+The comparison package backports the OSL/LLVM alignment without changing the
+SDK pin: `tools/workload-pkg/blender.nix` builds OSL 1.15.3.0 against LLVM 21 and
+uses Nix's dependency replacement to propagate it into the existing Blender and
+OpenUSD outputs. The corrected `liboslexec.so.1.15` has `DT_NEEDED`
+`libLLVM.so.21.1`. This preserves the package's features; it does not add Brook
+graphics functionality. The new ELF retains an original-package reference, so
+LLVM 19 remains reachable in the store closure; absence from the whole closure
+is not asserted.
+
+The corrected package installed through the guest installer. Normal audio
+startup still aborts on PulseAudio's mutex-unlock error, even with an owned
+mode-0700 ext2 runtime directory (the secure-directory error disappears). With
+`-noaudio --gpu-backend opengl`, the previous LLVM crash did not recur: Blender
+created a maximized window, but its client remained grey with repeated
+`EGL_BAD_MATCH`. This is **not a usable editor/viewport acceptance**. The native
+close request saved a recovery file and logged `Blender quit`. A first process
+snapshot still had 13 tasks, but the app and wrapper then exited on their own
+before the later cleanup command, which returned ESRCH. The final baseline was
+ten tasks, heap integrity passed, checked stop succeeded and all three offline
+filesystem checks returned zero.
+
+Comparison package: `/nix/store/cw27qpadlzqj7xbkzyrr1q6alqrlw30s-blender-5.1.1`.
+Evidence: `build/workloads/blender-llvm-20261017/result.json`, build/export logs
+and scripts; session `5be7052708c044be92e4ede7cae33442`. The grey-window diagnostic
+capture is `artifacts/130a986ce2244525b4553a68888d9804.png` under that session.
+Audio initialization and EGL context/presentation are separate remaining bugs
+to diagnose before deciding whether missing graphics functionality is involved.

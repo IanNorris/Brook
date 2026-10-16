@@ -17,7 +17,11 @@
   of disabling the watchdog or describing window disappearance as clean exit.
 - Bridge captures occasionally show a partially painted launcher/window even
   when subsequent frames are complete. Verify capture reads a completed front
-  frame or synchronizes publication before adding VM recording; do not upscale
+  frame or synchronizes publication before adding VM recording. Source audit
+  confirms `CompositorDebugFrame` returns the CPU backbuffer and the bridge pauses
+  QEMU later, allowing capture midway through the same mutable frame. Publish
+  an immutable completed-frame snapshot through a compositor request, including
+  GPU readback at the frame boundary; do not upscale
   or touch up incomplete frames as evidence of correct rendering.
 
 - OpenTTD 15.3 hung during the user's confirmed in-game exit, with music
