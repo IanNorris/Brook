@@ -53,9 +53,9 @@ the table distinguishes tested behavior from remaining limitations.
 | Nix binaries | — | ✅ Working | Stock NixOS closures fetched via `nix-install` (cowsay, coreutils, curl, …) |
 | [NetSurf](https://www.netsurf-browser.org/) | 3.11 | ✅ Working | Web browser rendering HTML/CSS via custom framebuffer surface |
 | [Ladybird](https://ladybird.dev/) | 2026-04-04 | ⚠️ Experimental | HTTPS Google search and Amazon navigation verified; loading/input/scrolling performance remains limited |
-| [Firefox](https://www.mozilla.org/firefox/) | 150.0.1 | ⚠️ Experimental | Wayland browsing, JavaScript/input, Google/Amazon HTTPS and 480p YouTube video verified; audio investigation in progress |
+| [Firefox](https://www.mozilla.org/firefox/) | 150.0.1 | ⚠️ Experimental | Wayland browsing, JavaScript/input, Google/Amazon HTTPS and 480p YouTube video verified; audio and normal-quit investigation in progress |
 | [Chromium](https://www.chromium.org/) | 148.0.7778.96 | ⚠️ Experimental | Software-rendered Wayland browsing and 480p YouTube video/audio; long pause/resume and seeking verified under normal autoplay rules; browser sandbox disabled |
-| [OpenTTD](https://www.openttd.org/) | 15.3 | ⚠️ Experimental | World creation, text input, save/load verified; music-enabled exit hang under investigation |
+| [OpenTTD](https://www.openttd.org/) | 15.3 | ⚠️ Experimental | World creation, text input, save/load verified; music and two bounded exit tests pass; longer-session exit testing remains |
 | [Qalculate!](https://qalculate.github.io/) | — | ✅ Working | GTK3 calculator via Wayland (CSD decorations) |
 | [GIMP](https://www.gimp.org/) | 3.0.8 | ⚠️ Experimental | Painting, XCF save/reopen and PNG export/import verified across reboot; optional plugin discovery still has faults |
 | [LibreOffice](https://www.libreoffice.org/) | 25.8.5.2 | ⚠️ Experimental | Writer opens via Wayland and edits a real document; startup is slow and window-close behavior needs work |
@@ -68,7 +68,7 @@ the table distinguishes tested behavior from remaining limitations.
   including long pause/resume and seeking, without an autoplay workaround.
   Connected Unix socket shutdown, anonymous memory discard and descriptor
   capacity fixes support these workloads. See [workload validation](docs/workloads.md)
-  for tested configurations and remaining limits. All 19 hosted test suites pass.
+  for tested configurations and remaining limits. All 20 hosted test suites pass.
 
 - **Desktop appearance:** application icons in window chrome, an icon taskbar,
   and a launcher that updates after package installation/removal. Settings

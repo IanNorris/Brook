@@ -38,4 +38,21 @@ class DesktopEntriesTest(unittest.TestCase):
             for builtin in ('applications','application','terminal'):
                 self.assertEqual((output/'icons'/f'{builtin}.rgba').stat().st_size,2304)
 
+    def test_browser_wrapper_requires_installed_binary_and_deployed_wrapper(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);store=root/'store';package=store/'browser'
+            (package/'bin').mkdir(parents=True)
+            (package/'bin/chromium').write_text('#!/bin/sh\n')
+            apps=root/'profile/share/applications';apps.mkdir(parents=True)
+            (apps/'chromium.desktop').write_text('[Desktop Entry]\nName=Chromium\nExec=chromium --incognito %U\n')
+            output=root/'applications'
+            def collect_manifest():
+                with patch('sys.argv',['collect',str(store),str(output)]),contextlib.redirect_stdout(io.StringIO()):collect.main()
+                return (output/'applications.idx').read_text()
+            self.assertIn('Chromium\tchromium --incognito\t',collect_manifest())
+            (root/'bin').mkdir();(root/'bin/brook-chromium').write_text('#!/bin/sh\n')
+            self.assertIn('Chromium\t/nix/bin/brook-chromium --incognito\t',collect_manifest())
+            (package/'bin/chromium').unlink()
+            self.assertEqual(collect_manifest(),'')
+
 if __name__=='__main__':unittest.main()

@@ -5,6 +5,7 @@
 // blitting client areas to draw the window decorations.
 
 #include "window.h"
+#include "launcher_command.h"
 #include "process.h"
 #include "scheduler.h"
 #include "apic.h"
@@ -1476,6 +1477,8 @@ static bool LauncherFileExists(const char* path)
 
 static bool LauncherExecutable(const char* command, char* executable, uint32_t capacity)
 {
+    command = LauncherExecutableStart(command);
+    if (!command) return false;
     char path[256]; uint32_t n = 0;
     while (*command == ' ' || *command == '\t') ++command;
     char quote = (*command == '\"' || *command == '\'') ? *command++ : 0;

@@ -1612,3 +1612,63 @@ The VM was stopped with checked guest synchronization; final offline filesystem
 checks passed for FAT and both ext2 filesystems. Results and all diagnostic
 evidence are retained with the candidate. Do not promote this candidate as a
 clean acceptance image.
+
+
+### Desktop launch, persistent home and idle audio (16–17 October)
+
+The desktop now defaults to `/data/home`, with XDG configuration, cache and
+data directories on the persistent ext2 volume. Boot creates missing directories
+without replacing existing ownership. This remains a shared experimental desktop
+identity, not complete account isolation: the shell is root and Firefox uses the
+existing UID 1000 compatibility override. Account work requires the ownership and
+permission audit recorded in the backlog.
+
+A fresh volume exposed an ownership bug: `Ext2Chown` selected the first ext2
+mount and ownership syscalls concealed missing-path errors. Ownership now routes
+through VFS mount lookup; descriptor operations target the retained inode,
+including unlinked files. Symlink and directory-relative variants are handled
+separately. Unsupported filesystems and write failures return errors; this ext2
+backend rejects IDs above 65535 rather than truncating them. The guest ownership
+probe passed across `/data` and `/nix`, including set-ID clearing and errors.
+Root and UID 1000 each wrote, fsynced and reopened 90,112 bytes in HOME; both
+verified the same contents after a complete VM restart.
+
+Installed browser entries now use deployed compatibility wrappers after checking
+that the actual package exists. Chromium needs its explicit experimental
+`--no-sandbox` software-Wayland setup and an ext2 temporary directory. Firefox
+needs the compatibility UID, persistent profile and shared-memory setup. New
+Firefox profiles receive first-run preferences once; saved preferences are not
+overwritten. The native launcher now validates the executable after its supported
+`--uid` prefix. A hosted regression brings the total to 20 passing suites; the
+two desktop-discovery tests pass as well. The launcher uses the current B mark.
+
+On eight vCPUs and 4 GiB with software rendering, GIMP 3.0.8 launched from its
+generic installed desktop entry on the fresh-home reboot and quit normally. Its
+configuration was written to the persistent home. The VM returned to ten tasks,
+heap integrity passed, shutdown completed a checked device flush, and all three
+offline filesystem checks passed. Session: `a7472453b2af4093bd56cc440f0b6b85`;
+native 1920×1080 screenshot: `artifacts/a2235dec2c2a42b1814458a9d3f49d60.png`
+under that session's bridge directory.
+
+The HDA service now stops and clears cyclic DMA after its queue drains, even
+when no writer makes another call. Bounded PCM tests captured nonzero audio,
+inactive output during an open-descriptor idle interval, resumed audio, and
+inactive output after a finite writer was killed and reaped. OpenTTD passed
+both a main-menu exit and a generated-world confirmation exit with music: each
+returned to ten tasks and inactive audio; heap and offline filesystem checks
+passed. These bounded passes do not isolate the cause of the user's earlier
+exit hang. Audio evidence session: `35fb828c92274a6f877edb6c7d288eb8`; OpenTTD
+evidence session: `0162d1da84bf451f81fa5efef6495010`.
+
+Firefox's fresh-profile menu launch rendered Example Domain, and an earlier
+launch rendered interactive Google HTTPS results. **Normal quit still fails:**
+the window closes but its tasks linger until the shutdown watchdog deliberately
+crashes the process. Glean reports shutdown before initialization. Eventual
+process cleanup is not a clean-exit pass. Audio IPC and direct-ALSA pacing also
+remain open. The successful home/ownership checks do not accept Firefox shutdown.
+Fresh-profile session: `3d845022e27540de8093243756fd608b`.
+
+Build and diagnostic evidence is in
+`build/workloads/desktop-regressions-final-20261016/` (ignored). The tested kernel
+SHA-256 is `a9323368a99d45876327183c2dcf51d00b18baf9fa8ee5aa14645de9b01222c9`.
+Kernel and all staged modules were matched after the VFS callback change.

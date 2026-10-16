@@ -318,6 +318,11 @@ EOF
     fi
 fi
 
+# Keep compatibility launchers current even on an index-only refresh.
+for browser in brook-chromium brook-firefox; do
+    install -m 755 "${ROOT_DIR}/data/nix-wrappers/${browser}" "${MNTDIR}/bin/${browser}"
+done
+
 # Collect .desktop entries and icons from installed packages (always runs)
 if [ -d "${MNTDIR}/store" ]; then
     echo "Collecting .desktop entries and icons..."

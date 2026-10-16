@@ -1,0 +1,24 @@
+#!/nix/profile/bin/bash
+# Keep the tested Wayland/shared-memory setup and persistent profile together.
+set -eu
+export HOME=/data/home
+export XDG_CONFIG_HOME=$HOME/.config XDG_CACHE_HOME=$HOME/.cache
+export XDG_DATA_HOME=$HOME/.local/share
+export TMPDIR=$XDG_CACHE_HOME/firefox/tmp
+export MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland MOZ_SHM_NO_SEALS=1
+mkdir -p "$HOME/.mozilla/brook" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$TMPDIR"
+# Provision only a new profile; never overwrite a user's saved preferences.
+# These are the same first-run settings used in browser acceptance.
+if [ ! -e "$HOME/.mozilla/brook/prefs.js" ] && [ ! -e "$HOME/.mozilla/brook/user.js" ]; then
+  cat > "$HOME/.mozilla/brook/user.js" <<'EOF'
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.startup.page", 0);
+user_pref("browser.newtabpage.enabled", false);
+user_pref("startup.homepage_welcome_url", "");
+user_pref("datareporting.policy.dataSubmissionPolicyBypassNotification", true);
+user_pref("browser.sessionstore.resume_from_crash", false);
+EOF
+fi
+exec /nix/profile/bin/brook-run /nix/profile/bin/firefox \
+  --no-remote --profile "$HOME/.mozilla/brook" "$@"

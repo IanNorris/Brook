@@ -2,16 +2,85 @@
 
 ## Workload findings, 16 October
 
+
+### Native desktop user run
+
+
+- Firefox's new-profile menu launch now opens with the compatibility UID and
+  tested first-run/Wayland/ext2-temp setup. A fresh run rendered HTTPS and input,
+  but normal window close hung until the browser's shutdown watchdog fired.
+  Serial output includes `glean_core: Shutdown called before Glean is initialized.
+  Waiting.` and `RunWatchdog`, followed by a user-mode intentional crash and a
+  crash-handler fault. It eventually returned to ten tasks without kernel page
+  ownership warnings. Keep this as failed normal-quit acceptance; capture the
+  blocked shutdown phase and investigate Glean/profile initialization instead
+  of disabling the watchdog or describing window disappearance as clean exit.
+- Bridge captures occasionally show a partially painted launcher/window even
+  when subsequent frames are complete. Verify capture reads a completed front
+  frame or synchronizes publication before adding VM recording; do not upscale
+  or touch up incomplete frames as evidence of correct rendering.
+
+- OpenTTD 15.3 hung during the user's confirmed in-game exit, with music
+  continuing until SIGKILL. On the revised persistent-home/idle-DMA build, both
+  menu exit and confirmed in-game exit with music enabled returned to ten tasks
+  and inactive audio. Keep longer-session reruns and any recurrence capture open;
+  the two changes have not been isolated as the cause of the original hang.
+- Browser launcher entries must use the same tested compatibility configuration
+  as command-driven acceptance. The user-run Chromium entry exited with a root
+  sandbox error; Firefox faulted during generic startup instead of loading.
+- Add launch feedback: an immediate pending taskbar item and animated busy cursor,
+  correlated with process/application identity; resolve it on first mapped window,
+  launch failure, process exit or a bounded timeout. Preserve normal cursor input
+  and report failures visibly rather than leaving a permanent spinner.
+- Add persisted desktop scale (start with 100/150/200 percent). Scale native
+  taskbar, chrome, launcher, fonts, icons and hit targets together; coordinate
+  Wayland output scale and buffer geometry for applications. Test at 1080p and
+  4K, including multi-window input and settings preview.
+- Establish persistent single-account HOME/XDG and matching passwd identity,
+  then audit access/open/stat/chmod/chown, supplementary groups, UID changes,
+  fork/exec credentials, runtime directories and saved settings before implementing
+  login/accounts. Several identity syscalls still stub success; a UID field alone
+  must not be described as user isolation. Avoid migrating/deleting existing home
+  files without preserving their data and ownership.
+
+- O_APPEND on ext2: a shell `printf ... >> user.js` overwrote the first bytes
+  instead of appending during Firefox audio setup. Preserve the corrupted
+  profile as evidence and test append semantics through separate opens, dup and
+  concurrent writers. Ext2's open callback currently ignores flags and VfsWrite
+  does not receive the descriptor's append bit. Keep profile generation as one
+  complete write during audio diagnosis; do not call the append behavior fixed.
+
+- Evaluate LZ4-backed storage as a measured experiment, starting with immutable
+  Nix-store content rather than changing writable ext2 semantics. Compare cold
+  app loads, bytes read, CPU decompression/copy costs, peak memory and random-read
+  latency against an uncompressed baseline, on both RAM-backed host disks and
+  ordinary storage. Identify metadata/redundant-copy costs separately. Define
+  independently decodable block indexing, corruption/error handling and cache
+  ownership before broad deployment; writable compression needs separate
+  allocation, crash-consistency and interoperability design.
+- Plan pageable-memory reclaim: existing VM/page-fault infrastructure needs an
+  eviction policy and backing ownership before swap. Investigate compressed
+  anonymous-page storage first, then disk-backed swap with compression as useful.
+  Cover pinned/device/shared pages, fork/CoW, concurrent faults, process exit,
+  bounded compression memory and allocation-free low-memory I/O paths. Measure
+  reclaim CPU cost and application latency; avoid treating larger memory limits
+  as a substitute for a pressure/reclaim policy.
+
 - Extend shutdown beyond connected Unix sockets: Internet sockets and unbound/
   listening Unix sockets currently return EOPNOTSUPP. Connected Unix shutdown,
   EOF/readiness, blocked-operation wakeups and lifetime semantics now pass the
   Linux/guest regression. Chromium MSE and YouTube startup, long pause/resume,
   seeking and audio pass with normal autoplay rules. Keep longer sessions,
   hardware rendering and sandbox support as separate acceptance work.
-- Firefox audio remains open: video playback passed, but the last audio run
-  failed cubeb initialization. Chromium's ALSA-to-OSS output now works, including
-  after suspension/resume. Investigate Firefox's backend/runtime configuration
-  next; do not classify the earlier Firefox audio test as passing.
+- Firefox audio remains open: default audio IPC fails cubeb initialization.
+  An isolated profile selecting ALSA and disabling content sandbox/audio IPC
+  produces nonzero PCM, but has severe silence and lost-frame warnings. The
+  current file-over-null ALSA route reports zero delay, so investigate actual
+  device timing as well as the separate IPC failure. This is diagnostic evidence,
+  not accepted playback or a shipped configuration. Repeated normal browser
+  quits also left child tasks behind; preserve that cleanup failure and the
+  recovered virtio-blk timeout from this run before reusing any candidate.
+  Chromium's previously accepted ALSA-to-OSS output works after pause/resume.
 - Fix kernel-symbol table generation on incremental/fresh builds: the current
   post-link generator writes addresses for the next link. Chromium's preserved
   panic labeled RIP `0xffffffff800af838` as KRwLockReadLock, while the exact

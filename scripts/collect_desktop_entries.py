@@ -198,9 +198,9 @@ def main():
     # image with no desktop applications installed.
     root = Path(__file__).resolve().parent.parent
     for source in sorted((root/'data/icons').glob('*.svg')):
-        # Use the same transparent Brook mark as the README for the launcher.
+        # Use the current B mark, matching the boot screen.
         # Keep the existing output name consumed by the native window manager.
-        asset = root/'data/branding/brook-mark-draft.png' if source.stem == 'applications' else source
+        asset = root/'data/branding/brook-boot-mark.png' if source.stem == 'applications' else source
         if not convert_icon_to_rgba(asset,os.path.join(icons_dir,source.stem+'.rgba')):
             raise RuntimeError(f'Cannot convert built-in icon {asset}')
 
@@ -266,6 +266,16 @@ def main():
         override = EXEC_OVERRIDE.get(exec_cmd.split()[0] if exec_cmd else "")
         if override:
             exec_cmd = override
+
+        # Only installed browsers with a deployed compatibility wrapper get
+        # redirected; the raw executable validation above remains required.
+        if binary in ('chromium', 'firefox'):
+            wrapper = 'brook-' + binary
+            if (Path(store_dir).parent/'bin'/wrapper).is_file():
+                arguments = shlex.split(exec_cmd)[1:]
+                exec_cmd = shlex.join(['/nix/bin/' + wrapper, *arguments])
+                if binary == 'firefox':
+                    exec_cmd = '--uid 1000 ' + exec_cmd
 
         entries.append((name, exec_cmd, icon_file, categories, Path(df).stem))
         print(f"  App: {name} [{exec_cmd}]")
