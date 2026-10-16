@@ -47,6 +47,7 @@ static long wait_call(int api, int fd, int ep, int timeout_ms,
                       const void *mask, size_t size, int bad_argument) {
     struct timespec timeout = {timeout_ms / 1000, (timeout_ms % 1000) * 1000000L};
     struct timespec *tp = timeout_ms < 0 ? NULL : &timeout;
+    if (api == 3) return syscall(SYS_rt_sigsuspend, mask, size);
     if (api == 0) {
         struct pollfd p = {.fd = fd, .events = POLLIN};
         return syscall(SYS_ppoll, &p, bad_argument ? UINT64_MAX : 1, tp, mask, size);
@@ -102,7 +103,11 @@ static int run_case(const char *self, int api, int which) {
     else if (which == 4) { mask = guard + page_size - 4; expected = -1; expected_errno = EFAULT; }
     else if (which == 5) { bad_argument = 1; expected = -1; expected_errno = api == 2 ? EBADF : EINVAL; }
     else if (which == 6) { if (write(pipefd[1], "R", 1) != 1) fail("ready pipe"); expected = 1; }
-    else if (which == 7) { mask = NULL; size = 123; } /* NULL mask ignores size. */
+    else if (which == 7) {
+        mask = NULL;
+        if (api == 3) { expected = -1; expected_errno = EFAULT; }
+        else size = 123; /* Poll waits ignore size with a NULL mask. */
+    }
     else if (which == 8) { expected = -1; expected_errno = EFAULT; }
     errno = 0;
     uint64_t start = now_ms();
@@ -139,14 +144,17 @@ static int run_case(const char *self, int api, int which) {
 
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--child")) { usleep(50000); _exit(23); }
-    if (argc != 1 || argv[0][0] != '/') { fprintf(stderr, "invoke by absolute path\n"); return 2; }
-    const char *apis[] = {"ppoll", "pselect6", "epoll_pwait"};
+    int delivery_only = argc == 2 && !strcmp(argv[1], "--sigsuspend-delivery");
+    if ((argc != 1 && !delivery_only) || argv[0][0] != '/') { fprintf(stderr, "invoke by absolute path\n"); return 2; }
+    const char *apis[] = {"ppoll", "pselect6", "epoll_pwait", "sigsuspend"};
     const char *cases[] = {"queued SIGCHLD + SA_RESTART", "console exec child SIGCHLD",
         "timeout restores mask", "invalid sigset size", "mask crosses unmapped page",
         "invalid wait argument restores mask", "ready fd restores mask",
-        "NULL mask ignores size", "post-install error restores mask"};
+        "NULL mask handling", "post-install error restores mask"};
     int failures = 0;
-    for (int api = 0; api < 3; ++api) for (int which = 0; which < 9; ++which) {
+    for (int api = 0; api < 4; ++api) for (int which = 0; which < 9; ++which) {
+        if (delivery_only && (api != 3 || which > 1)) continue;
+        if (api == 3 && (which == 2 || which == 5 || which == 6 || which == 8)) continue;
         fflush(NULL);
         pid_t worker = fork();
         if (worker < 0) fail("watchdog fork");

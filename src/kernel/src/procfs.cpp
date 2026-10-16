@@ -346,7 +346,7 @@ static Vnode* GenMeminfo()
     auto* buf = static_cast<char*>(kmalloc(1024));
     if (!buf) return nullptr;
 
-    uint64_t totalPages = PmmGetTotalPageCount();
+    uint64_t totalPages = PmmGetRamPageCount();
     uint64_t freePages  = PmmGetFreePageCount();
     uint64_t totalKB = totalPages * 4;  // 4KB pages
     uint64_t freeKB  = freePages * 4;

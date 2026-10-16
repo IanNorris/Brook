@@ -1194,3 +1194,51 @@ stop accepting input when its popup appears; a control run with the original
 compositor reproduced this, while saving a simple filename worked. Scheduler
 watchdog messages during package decompression also need separate investigation;
 both installations completed without intervention.
+
+### Stock shell tools and compatibility fixes, 16 October
+
+Stock zsh 5.9, fastfetch 2.62.1 and starship 1.25.1 installed through the guest
+package installer. The initial run exposed two kernel defects:
+
+- `sigsuspend` restored the caller's blocked-signal mask before signal delivery.
+  Zsh repeatedly returned from the wait without running its SIGCHLD handler,
+  leaving exited pipeline children unreaped. It now uses the same temporary-mask
+  return path as ppoll/pselect/epoll_pwait, preserving the original mask in the
+  handler's ucontext. The old kernel fails both queued-signal and child-exit
+  delivery checks; the fixed kernel passes all 32 wait-mask cases.
+- Ext2 stored a 60-byte symlink target in the 60-byte inline area, leaving no
+  terminator space. Zsh's relative profile link hits this exact boundary, and
+  offline fsck rejected it. Targets of 60 bytes now use a data block. Six target
+  lengths around the boundary pass exact size/readlink checks, survive reboot,
+  and pass offline fsck; the old-kernel control produces an invalid 60-byte link.
+
+Fastfetch also revealed inflated RAM reporting: sysinfo and `/proc/meminfo`
+used the highest tracked physical page, including address holes. They now use
+the existing RAM-page count. Fastfetch JSON reports 4,237,357,056 total bytes,
+matching the VM bridge, and the new `/etc/os-release` identifies Brook.
+
+`scripts/workloads/shell.sh` checks zsh arrays, globbing, file read/write and a
+multi-process pipeline; fastfetch text/JSON output; starship prompt generation
+and generated zsh integration syntax. Stage it as `/boot/SHELLACC.SH` and
+`data/fastfetch/brook.ascii` as `/boot/BROOK.ASC`. It uses a data-backed temporary
+directory because open-file unlink under the boot filesystem's `/tmp` still
+fails. Require `SHELL_WORKLOAD_EXIT_0` with no manual intervention.
+
+An eight-core, 4-GiB VM passed the script before and after reboot. Interactive
+zsh accepted commands in the native terminal, sourced starship's generated
+integration, displayed its prompt, and ran fastfetch with the Brook ASCII mark.
+All nested shells exited normally, heap integrity passed, both shutdowns used
+checked flushes, and FAT/data/nix checks passed after each run. Evidence remains
+in ignored `build/workloads/shell-fixed-20261016/acceptance.json`.
+
+The same frozen kernel passed the short eight-worker RAM-backed I/O gate in
+21.77 host seconds, including random pread/mmap, inode-lifetime, mixed append,
+the expanded wait-mask/child-signal/select probes, reboot verification and exact
+free-block/inode recovery. Evidence is in ignored
+`build/io-bench/shell-fixed-d78482b6-ram/result.json`. These are RAM-backed
+stability/iteration timings, not SSD throughput measurements.
+
+Shell defaults have not changed. The native terminal leaves zsh's prompt-end
+marker visible; Kitty, job control and broader interactive behavior still need
+acceptance. The original failing clones and profile are retained separately,
+and their success markers after manual interruption do not count as acceptance.

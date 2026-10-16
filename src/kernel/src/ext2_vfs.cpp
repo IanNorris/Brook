@@ -3406,8 +3406,9 @@ static int Ext2FsSymlink(void* mountPriv, uint8_t pdrv,
     newData.i_links_count = 1;
     Ext2Touch(&newData, true);
 
-    // Fast symlink: store target directly in i_block[] if it fits (≤60 bytes)
-    if (targetLen <= 60) {
+    // Inline targets need a trailing NUL inside the 60-byte i_block area.
+    // A 60-byte target must use a data block, as required by e2fsck/Linux.
+    if (targetLen < sizeof(newData.i_block)) {
         auto* dst = reinterpret_cast<char*>(newData.i_block);
         memcpy(dst, target, targetLen);
         newData.i_size = targetLen;

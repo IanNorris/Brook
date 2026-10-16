@@ -2882,6 +2882,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
             { "/etc/group",  "root:x:0:\n" },
             { "/etc/shells", "/boot/BIN/BASH\n" },
             { "/etc/hostname", "brook\n" },
+            { "/etc/os-release", "NAME=Brook\nID=brook\nPRETTY_NAME=Brook\n" },
             { "/etc/nsswitch.conf", "passwd: files\ngroup: files\nhosts: files dns\n" },
             { "/etc/hosts", "127.0.0.1 localhost\n" },
             { "/proc/version", "Linux version 6.1.0-brook (brook@brook) (gcc 14.2) #1 SMP\n" },
@@ -5137,12 +5138,8 @@ static int64_t sys_rt_sigsuspend(uint64_t maskAddr, uint64_t sigsetsize, uint64_
     if (!proc) return -ESRCH;
     if (sigsetsize != 8) return -EINVAL;
     if (!maskAddr) return -EFAULT;
-
-    uint64_t newMask = *reinterpret_cast<const uint64_t*>(maskAddr);
-
-    // Save current mask and replace with new one
-    proc->sigSavedMask = proc->sigMask;
-    proc->sigMask = newMask;
+    int error = InstallWaitSignalMask(maskAddr, sigsetsize);
+    if (error) return error;
 
     // Block until a signal that isn't blocked is pending
     while (!HasPendingSignals())
@@ -5151,8 +5148,9 @@ static int64_t sys_rt_sigsuspend(uint64_t maskAddr, uint64_t sigsetsize, uint64_
         SchedulerBlock(proc);
     }
 
-    // Restore original mask (signal handler will save/restore it too)
-    proc->sigMask = proc->sigSavedMask;
+    // Select and deliver the signal under the temporary mask. The shared
+    // syscall-return path saves the original mask in the handler's ucontext;
+    // restoring it here can block SIGCHLD again before its handler runs.
     return -EINTR;
 }
 
@@ -8984,7 +8982,7 @@ static int64_t sys_sysinfo(uint64_t infoAddr, uint64_t, uint64_t,
     extern volatile uint64_t g_lapicTickCount;
     info->uptime = static_cast<int64_t>(g_lapicTickCount / 1000);
 
-    uint64_t totalPages = PmmGetTotalPageCount();
+    uint64_t totalPages = PmmGetRamPageCount();
     uint64_t freePages  = PmmGetFreePageCount();
     info->totalram = totalPages * 4096;
     info->freeram  = freePages  * 4096;

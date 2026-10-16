@@ -2,6 +2,17 @@
 
 ## Workload findings, 16 October
 
+- The boot filesystem's `/tmp` cannot unlink an open temporary file (EBUSY),
+  which breaks stock Bash here-documents; fchmod also returns ENOTSUP there.
+  The shell acceptance uses a data-backed TMPDIR. Provide suitable temporary
+  storage or complete open-unlink semantics before changing shell defaults.
+- Generic `stat` currently estimates allocated blocks from logical size. It
+  reports nonzero blocks for inline symlinks; expose filesystem allocation data
+  before relying on this field for sparse files or disk-usage tooling.
+- Native terminal rendering leaves zsh's prompt-end marker visible between
+  commands. Verify cursor/erase behavior and terminal capabilities before making
+  zsh/starship the default. Kitty, job control and broader interactive use remain
+  separate acceptance work.
 - Implement real `statfs`/`fstatfs` capacity and free-space reporting. The current
   all-zero success stub makes OpenTTD show “0 B free” despite successful saves.
 - Investigate GTK Save As path-completion popups losing subsequent typed input.

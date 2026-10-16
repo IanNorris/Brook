@@ -18,15 +18,22 @@ signal completion. Timing varies the exit point but does not establish that
 any particular instruction was interrupted.
 
 `waitmaskcheck.c` must be invoked by absolute path. It checks raw `ppoll`,
-`pselect6` and `epoll_pwait` with SIGCHLD blocked outside each wait. A queued
+`pselect6`, `epoll_pwait` and `sigsuspend` with SIGCHLD blocked outside each wait. A queued
 signal and a delayed exec-child exit must invoke the handler and return EINTR
 even with SA_RESTART. The monitored pipe keeps its writer open, so EOF cannot
 hide missing signal delivery. The handler checks its active mask and saved
 ucontext; the caller checks restoration after handler, timeout, readiness and
 error paths. Invalid sizes and masks crossing a truly unmapped page are checked,
 and SIGKILL/SIGSTOP must remain unblockable. Each case has a 15-second
-fork/wait/monotonic-clock watchdog. Expect 27 checks and
+fork/wait/monotonic-clock watchdog. Expect 32 checks and
 `WAITMASKCHECK PASS failures=0` on Linux and Brook.
+
+`symlinkcheck.c DIRECTORY` creates or reopens links with target lengths around
+the ext2 inline boundary. It checks exact lstat size, readlink bytes without a
+copied terminator. Inspect the inodes offline to require data-block storage for
+targets of 60 bytes or more (Brook's generic stat block count is estimated). Keep
+the links through checked shutdown and offline fsck, then run again after boot
+to check persistence. Expect six checks and `SYMLINKCHECK PASS failures=0`.
 
 - `devicecheck.c`: takes two different mount roots (Brook: `/data /nix`;
   Linux: `/ /proc`). Verifies device identity across stat/fstat/lstat/fstatat

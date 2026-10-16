@@ -1810,7 +1810,7 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
         __builtin_trap(); // A terminal thread must never resume.
     }
 
-    // ppoll/pselect6/epoll_pwait must select pending signals while their
+    // ppoll/pselect6/epoll_pwait/sigsuspend must select pending signals while their
     // temporary mask is still installed. Every ordinary/error return restores
     // the original mask here; a delivered handler instead saves it in its
     // ucontext, while running with the temporary mask plus sa_mask.
