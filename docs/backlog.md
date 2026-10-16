@@ -168,6 +168,7 @@ remains available. The initial fixed local transfer improved from 5.824 to
 | PERF-03 | Reduce guest profiler observer overhead and account for IRQ-masked critical sections | Bounded captures do not spend substantial recording time allocating/writing their own FAT output; compare host and guest samples; preserve long-capture durability and report dropped events. |
 | PERF-04 | Diagnose invalid compositor interval maxima | Reproduce `max_ms=4294967295`, establish clock/concurrent-frame-update cause, and validate telemetry before using it for stall percentiles. |
 | PERF-05 | Compare QMP keyboard/wheel delivery with guest debug injection and native input | Exact event-sequence probe, settled-page typing/scroll tests and load-time latency measurements; distinguish routing defects from allocator-induced starvation. |
+| PERF-07 | Reduce shared-inode mapping-gate contention during compiler startup and user-buffer checks | Corrected outgoing-stack profiles identify waits in FileObjectGetPage and FileMappingGateSet. Isolate batched primary/cache-neighbor lookup from AS-only read checks; preserve canonical pins, mutation ordering and generation validation; compare matched rebuilds plus race/coherence/cancellation gates. |
 
 
 PERF-01 update: at the user's request, heap poison is now a runtime flag off
@@ -638,3 +639,12 @@ brush editing, XCF save/reopen, PNG export/import, normal quit, and reboot
 persistence. Next: optional-plugin file-mapping write faults during discovery;
 separate zombie address-space retirement from wait metadata to reduce transient
 memory pressure. Mainline full bootstrap pair must be rerun on this checkpoint.
+
+Profiler follow-up (16 October): owned-stack walking is fixed and verified on
+real compiler stacks; see [bootstrap.md](bootstrap.md#recover-compiler-profiler-call-chains-2026-10-16).
+The recorded context-switch chains expose file/mapping mutex waits previously
+hidden behind truncated DoSwitch frames. Dropped events and IRQ-masked timer
+blindness remain; their counts cannot establish elapsed-time percentages.
+PERF-01's free-block index and allocation-size guards have shipped; the later
+file-page hash-growth and user-fault IRQ experiments were slower and remain
+unapplied. Keep those experiments separate from the accepted CR2 address fix.

@@ -16,9 +16,8 @@ that does not imply that Nix or the compiler was rebuilt inside Brook.
 The shared-library startup and native compatibility gate now contains 19
 tests. The filesystem gate also passes the expanded guest lifetime probe and
 offline fsck after a clean shutdown. Both the prepared-SDK and clean-image
-paths passed the full sequence at the same revision, most recently `507e504`
-with the then-current 18-test suite. The added profiler stack-walker test still
-needs both full acceptance paths at its new revision.
+paths passed the full sequence at the same revision, most recently `0059ce4`
+with the current 19-test suite, including the profiler stack-walker test.
 
 Maintain two acceptance paths, using isolated disks and the same pinned Brook
 revision, SDK closure and VM configuration:
@@ -863,3 +862,38 @@ Matching frozen symbols, raw/Speedscope profiles, register snapshots and the
 stack aggregation are retained under the ignored directories
 `build/workloads/debug-tcp-final-production-20261016/artifacts` and
 `build/workloads/native-fixed-walker-profile-20261016`.
+
+### Matching 19-test acceptance with the repaired bridge (2026-10-16)
+
+Both RAM-backed paths passed at `0059ce4295a517425ea9faff7c7aa802c20c5c10`,
+with eight vCPUs, 4 GiB guest RAM, software graphics and silent audio. Each path
+cloned that pushed revision, fetched the two required submodules and built the
+kernel, EFI loader, 12 modules and seven bare-metal tests. Each passed all 19
+native tests, cleaned/rebuilt them and passed again. Each then booted its own
+extracted kernel/modules and passed all 19 tests a third time plus Git fsck.
+
+| Stage, guest seconds | Prepared SDK | Clean image |
+| --- | ---: | ---: |
+| SDK install via nix-install | Already installed | 277 |
+| Clone | 26 | 31 |
+| Full compilation | 197 | 201 |
+| Native compilation | 53 | 53 |
+| Native tests | 21 | 19 |
+| Warm native compilation | 53 | 54 |
+| Warm native tests | 18 | 16 |
+| Incremental build | 5 | 5 |
+
+Host-observed test time under each extracted kernel was 22.13 and 21.46 seconds.
+These acceptance runs collect short diagnostic profiles around expensive
+stages; they are not uninstrumented optimization benchmarks. Stage metadata
+retains both guest markers and host observer times, which can differ when
+profile export temporarily delays observation.
+
+All four VM shutdowns acknowledged a fresh checked filesystem/device flush.
+FAT and both ext2 disks passed offline checking after each build and each
+verification boot. This supersedes the earlier bootstrap runs that needed
+manual recovery after losing the debug connection. Evidence, exact artifact
+hashes, profiles and stage results remain in
+`build/experiments/results/bootstrap-prepared-0059ce4-ram/` and
+`build/experiments/results/bootstrap-clean-0059ce4-ram/`. Successful private RAM
+images were archived as sparse files and the owned tmpfs directories removed.
