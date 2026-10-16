@@ -16,7 +16,7 @@ that does not imply that Nix or the compiler was rebuilt inside Brook.
 The shared-library startup and native compatibility gate now contains 19
 tests. The filesystem gate also passes the expanded guest lifetime probe and
 offline fsck after a clean shutdown. Both the prepared-SDK and clean-image
-paths passed the full sequence at the same revision, most recently `0059ce4`
+paths passed the full sequence at the same revision, most recently `5a363c6`
 with the current 19-test suite, including the profiler stack-walker test.
 
 Maintain two acceptance paths, using isolated disks and the same pinned Brook
@@ -971,3 +971,39 @@ Evidence: `build/workloads/as-read-check-negative.log`,
 `build/workloads/as-read-check-races-20261016/audit.json` and
 `build/workloads/as-read-check-comparison-20261016.json`. Matching full bootstrap
 acceptance must still be rerun at the resulting source revision.
+
+### Matching acceptance after both locking improvements (2026-10-16)
+
+Both full paths passed at `5a363c637f7f5f12a85a22ece8100e743370f823` with the
+same SDK, seed types, eight vCPUs, 4 GiB RAM and RAM-backed payload. Each passed
+all 19 native tests twice, then booted its own extracted kernel/modules and
+passed all 19 again plus Git fsck. All four shutdowns acknowledged fresh checked
+filesystem/device flushes; every offline FAT/ext2 check passed.
+
+| Stage, guest seconds | Prepared before | Prepared after | Clean before | Clean after |
+| --- | ---: | ---: | ---: | ---: |
+| SDK install | Installed | Installed | 277 | 260 |
+| Full compilation | 197 | 69 | 201 | 67 |
+| Native compilation | 53 | 22 | 53 | 21 |
+| Native tests | 21 | 6 | 19 | 6 |
+| Warm native compilation | 53 | 20 | 54 | 21 |
+| Warm native tests | 18 | 6 | 16 | 7 |
+| Incremental build | 5 | 3 | 5 | 3 |
+
+Host-observed verification tests under the extracted kernels took 9.11 and
+8.20 seconds. The larger compile improvement is consistent across these two
+paths; installation improved much less and remains a separate target. These
+acceptance runs collect short profiles; use the unprofiled isolated comparisons
+above for the individual optimization measurements. Cache/thermal state is
+uncontrolled. Evidence: `build/experiments/results/bootstrap-prepared-5a363c6-ram/`
+and `build/experiments/results/bootstrap-clean-5a363c6-ram/`.
+
+The short eight-worker I/O acceptance also passed on this kernel in 22.39 host
+seconds, including both VM boots, mixed append/unlink/truncate, boundary and
+fragmentation checks, 512 small files, 64 MiB sequential writes/reads and reboot
+verification, eight-process random read/mmap integrity, inode lifetime and
+signal-mask/select probes. Cleanup restored exact initial free block/inode
+counts; checked shutdowns and all offline filesystem checks passed. Guest-clock
+phase timings were 0.117 seconds for the 64-MiB write, 0.303 for the read and
+0.501 for small files. This is host-RAM-backed I/O, not physical SSD throughput.
+Evidence: `build/io-bench/accepted-5a363c6-ram/result.json`.
