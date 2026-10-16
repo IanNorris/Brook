@@ -740,3 +740,92 @@ The audit independently checked actual suite counts, exported/booted kernel
 hashes, terminal session state and filesystem results. Evidence is retained in
 `build/experiments/results/bootstrap-{prepared,clean}-3c0ea82-disk/`,
 `bootstrap-3c0ea82-audit.json` and `bootstrap-3c0ea82-perf.json`.
+
+
+### Expanded-suite bootstrap acceptance (2026-10-16)
+
+Pinned revision `507e504aa7c848555f3b6946fa63545386c7ed96` passes the prepared
+path with eight vCPUs, 4 GiB and RAM-backed disks. The guest built kernel, EFI,
+12 modules and seven standalone binaries, passed all 18 native tests twice,
+and completed the incremental build. Extracted artifacts then booted independently
+and passed all 18 tests a third time in 22.4 host seconds. Every initial and
+verification offline filesystem check returned zero; final images were archived
+to disk and temporary RAM images removed.
+
+The original observer still expected 14 tests and rejected the larger successful
+report. Correction `1d95d71` requires 18 reports and its five observer unit tests
+pass; the supported resume path finalized the already-completed build without
+rerunning it. The original VM's debug TCP channel rejected shutdown connections.
+Its script had already completed its final successful `sync` before EXIT 0, so
+QEMU was quit gracefully using that evidence; this was not a fresh bridge sync
+acknowledgement. `transport-shutdown-note.json` records the distinction. The
+verification VM acknowledged normal checked bridge sync before shutdown.
+
+Compile took 207 guest seconds (207.6 host), native compile 52 seconds, warm native
+compile 50 seconds, native suites 20/19 seconds and incremental build four seconds.
+An earlier `3c0ea82` disk-backed run recorded 48/11/12/10/5/2 seconds respectively.
+Code, backend and host-cache differences prevent an isolated comparison, but the
+slower build merits further profiling before making these tests routine. Samples
+and source review identify file-page work inside IF-disabled page faults; a scoped
+user-fault interruptibility experiment is being validated separately.
+
+The matching clean-image path also passes at the same pinned revision. It proved
+the SDK absent before installing it through `nix-install` (277 guest seconds),
+then completed kernel compile (207 seconds), native compile (53), both 18-test
+suites (18/19), warm rebuild (52), and incremental rebuild (four). Extracted guest
+artifacts booted independently and passed all 18 tests in 23.2 host seconds. All
+initial and verification filesystem checks returned zero. The original run
+required the same documented post-final-sync transport shutdown recovery; its
+verification VM acknowledged a normal checked bridge flush. Both completed
+results archive their images to disk and remove temporary RAM images.
+
+Evidence: `build/experiments/results/bootstrap-{prepared,clean}-507e504-ram/result.json`,
+artifact hashes, stage results, original/verification serial logs and fsck reports.
+
+### Isolated user-page-fault interruptibility experiment (2026-10-16)
+
+Two native clean/rebuild/test rounds used identical prepared `507e504` images,
+guest source and SDK, eight vCPUs, 4 GiB and private host RAM disks. The baseline
+kernel (`737efba7`) rebuilt in 52.31/50.70 host seconds; the scoped user-fault
+IRQ candidate (`5969f234`) took 63.28/62.08 seconds. Suites passed all 18 tests
+in both rounds (baseline 18.72/15.81 seconds, candidate 16.74/18.90). Both VMs
+acknowledged checked device flushes and passed all three offline filesystem
+checks. No bridge/profile queries ran during timed stages; host page cache was
+not controlled. The candidate is held out of main: these runs establish no
+throughput improvement. Its separate safety gates passed 44 actual mapping
+races with SIGSEGV address checks, both-disk coherence and filesystem-exit
+checks, 32 futex-exit rounds, 32 mixed-wait exit rounds and fatal fault reaping.
+
+Evidence: `build/workloads/pf-irq-native-comparison-20261016.json`, the two
+`pf-irq-native-{baseline,candidate}-20261016/result.json` files and
+`pf-irq-races-20261016/safety-results.json`. The unapplied experiment remains
+in `build/workloads/user-pf-irq-experiment.patch`; it is not a production fix.
+
+### File-page index experiment and control (2026-10-16)
+
+A separate best-effort growing hash kept inline buckets for small files,
+rehashing canonical page nodes as residency increased. Its actual-module test
+loaded 4,096 pages through eight concurrent callers, measured 12,189 chain
+visits over one complete lookup sweep, and passed allocation-failure recovery,
+ordinary-I/O overlays, failed-truncate invalidation and exact reference recovery.
+The combined candidate with the CR2 address correction passed the real-guest
+race/lifecycle gates described in [workloads.md](workloads.md).
+
+That did not translate into faster native rebuilds: the combined candidate took
+71.94/70.97 seconds (18-test suites 19.64/15.80). An original-kernel control
+afterward took 54.26 seconds (suite 14.49), close to the earlier baseline. Host
+telemetry during that control recorded a 100°C CPU peak and 179 additional
+package throttle events; these shared-host conditions limit comparisons but
+do not establish the cause of the source-dependent difference. The index is
+held out of main pending an isolated CR2-only control and CPU/context-switch
+profiles. It must not be presented as an end-to-end performance improvement.
+
+Raw evidence: `build/workloads/file-index-native-comparison-20261016.json`,
+`native-baseline-control-20261016/host-telemetry.json`, and the unapplied
+`growing-file-index-experiment.patch` beside those result directories.
+
+The subsequent isolated CR2-only kernel (`f9d01a13`) rebuilt in 53.87 seconds
+and passed all 18 native tests in 18.82 seconds, followed by checked flush and
+zero-error filesystem checks. That matches the original-kernel control closely;
+the growing index remains an unapplied experiment. Evidence:
+`build/workloads/fault-address-native-20261016/result.json`.
