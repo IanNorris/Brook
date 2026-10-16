@@ -128,7 +128,12 @@
 - Audit memfd shrinking independently: `ftruncate` currently frees tail backing
   pages without invalidating live borrowed mappings. This is a separate source
   finding; the reproduced Firefox teardown free came from descriptor close.
-- Codium's clean-boot rerun still fails its 256-KiB writable file MAP_SHARED
+- Codium follow-up (17 October): removing `--disable-dev-shm-usage` gets past
+  its field-trial allocation breakpoint using the supported `/dev/shm` backend.
+  It still starts helpers without an editor window; a ten-second profile is
+  about 99% idle. Diagnose the startup/IPC wait next. Both control boots passed
+  cleanup, heap and offline disk checks; no regular-file MAP_SHARED enabled.
+- Codium's earlier clean-boot rerun fails its 256-KiB writable file MAP_SHARED
   request with EOPNOTSUPP and reaches the same startup INT3. Complete coherent
   shared writes/writeback; rerunning without that feature did not yield an editor.
 - The boot filesystem's `/tmp` cannot unlink an open temporary file (EBUSY),

@@ -1672,3 +1672,35 @@ Build and diagnostic evidence is in
 `build/workloads/desktop-regressions-final-20261016/` (ignored). The tested kernel
 SHA-256 is `a9323368a99d45876327183c2dcf51d00b18baf9fa8ee5aa14645de9b01222c9`.
 Kernel and all staged modules were matched after the VFS callback change.
+
+
+### Codium shared-memory control (17 October)
+
+VSCodium 1.112.01907 was rerun alone on the persistent-home kernel above, with
+eight vCPUs, 4 GiB and software Wayland graphics. Putting `TMPDIR` on ext2
+while retaining `--disable-dev-shm-usage` reproduced the exact breakpoint at
+runtime RIP `0x6efdcbd`. Disassembly of the installed ELF ties its caller to a
+failed `0x40000` allocation and the `FieldTrialAllocator` string. This identifies
+the field-trial allocation path more specifically than the earlier nearby mmap
+error alone. Chromium's [field-trial source](https://raw.githubusercontent.com/chromium/chromium/main/base/metrics/field_trial.cc)
+also uses a 256 KiB shared-memory allocator and fatal allocation handling.
+
+A second isolated boot removed only `--disable-dev-shm-usage` and used a fresh
+profile. The breakpoint did not recur, and additional GPU/utility helpers
+started. Brook implements `/dev/shm` files with its in-memory shared backend.
+Chromium's [temporary-directory selection](https://raw.githubusercontent.com/chromium/chromium/main/base/files/file_util_posix.cc)
+uses `/dev/shm` unless the disabling flag forces the temporary directory.
+**Codium is still not accepted:** no editor window appeared before targeted
+cleanup, roughly three minutes into the run. An 8,005-sample ten-second profile
+contained 7,893 idle samples; the stall is not established as CPU-bound. Guest
+used memory was about 1.66 GB. A bounded two-second syscall trace captured
+clock, poll, futex and epoll waits; it does not establish the remaining cause.
+
+Both runs returned to ten tasks after targeted SIGKILL, passed heap integrity,
+stopped with checked filesystem/device flushes and passed all three offline
+filesystem checks. No writable regular-file MAP_SHARED support was enabled.
+Do not add `--disable-dev-shm-usage` back to the next Codium control command.
+The test commands, syscall trace, profiles and result are preserved under
+`build/workloads/codium-home-20261017/` and
+`build/workloads/codium-shm-20261017/`; sessions are
+`f8420feb131f456ea842e3316673d971` and `7ee8f37e962f4e12acdd431ec6623b1b`.
