@@ -9,7 +9,8 @@ struct FileMappingRegistration;
 // Embedded in a filesystem's retained live-inode object, shared across opens.
 // Every caller must retain its vnode/inode through the operation. This avoids
 // a vnode -> object -> vnode ownership cycle and inode-reuse cache identities.
-// No mapped writable pages/writeback yet: ordinary writes are write-through.
+// Ordinary writes are write-through. Writable mappings remain disabled while
+// resize coordination and writeback lifetime/sync integration are incomplete.
 struct FileObject {
     KMutex gate;
     uint64_t generation,orderId;
@@ -34,6 +35,15 @@ int FileObjectGetPages(FileObject* object,Vnode* vnode,uint64_t index,uint32_t c
                        PhysicalAddress* pages,bool* loaded = nullptr);
 int FileObjectRead(FileObject* object,Vnode* vnode,void* buffer,uint64_t length,uint64_t* offset);
 int FileObjectWrite(FileObject* object,Vnode* vnode,const void* buffer,uint64_t length,uint64_t* offset);
+// Publication hook: caller owns the file gate and retains its vnode. Mark only
+// the canonical frame that will be exposed, before making any writable alias.
+// Exposure is conservative and survives every flush (aliases can redirty it).
+bool FileObjectExposeWritableLocked(FileObject* object,uint64_t index,PhysicalAddress physical);
+// Flush exposed resident pages intersecting [begin,end), clipped to current EOF.
+// Uses bounded snapshots, retries short progress, preserves exposure on errors
+// and success. Does not itself flush the backend device or enable MAP_SHARED.
+// Caller retains vnode; no AS/PT lock or user buffer may span this operation.
+int FileObjectWriteback(FileObject* object,Vnode* vnode,uint64_t begin,uint64_t end);
 // Initial integration: caller's mapping-pin gate has established no mappings.
 // Coordinated mapped resize/invalidation must replace that restriction later.
 int FileObjectTruncateUnmapped(FileObject* object,Vnode* vnode,uint64_t length);

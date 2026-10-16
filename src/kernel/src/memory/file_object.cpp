@@ -15,6 +15,7 @@ struct FileObjectPage {
     uint64_t index;
     PhysicalAddress physical;
     FileObjectPage* next;
+    bool writeExposed;
 };
 namespace {
 struct Operation {
@@ -110,7 +111,7 @@ static PhysicalAddress GetPageLocked(FileObject* object,Vnode* vnode,uint64_t in
     }
     // Loading is serialized by this inode's gate; no partially read page is
     // published and competing faults retain this same completed frame.
-    *page={index,physical,object->pages[index%64]};object->pages[index%64]=page;
+    *page={index,physical,object->pages[index%64],false};object->pages[index%64]=page;
     PmmRefPage(physical);if(loaded)*loaded=true;return physical;
 }
 PhysicalAddress FileObjectGetPage(FileObject* object,Vnode* vnode,uint64_t index,bool load,int* error,bool* loaded) {
@@ -171,6 +172,53 @@ int FileObjectWrite(FileObject* object,Vnode* vnode,const void* buffer,uint64_t 
         done+=static_cast<uint64_t>(result);if(static_cast<uint64_t>(result)<count)break;
     }
     kfree(bounce);return done?static_cast<int>(done):result;
+}
+bool FileObjectExposeWritableLocked(FileObject* object,uint64_t index,PhysicalAddress physical) {
+#ifndef BROOK_HOST_TEST
+    if(!object->gate.locked || object->gate.owner!=ProcessCurrent())
+        KernelPanic("file object: writable publication without file gate");
+#endif
+    auto* page=Find(object,index);
+    if(!page || !physical || page->physical!=physical)return false;
+    page->writeExposed=true;
+    return true;
+}
+int FileObjectWriteback(FileObject* object,Vnode* vnode,uint64_t begin,uint64_t end) {
+    [[maybe_unused]] Operation operation;
+    if(begin>end)return -22;
+    if(begin==end)return 0;
+    if(!vnode || !vnode->ops || !vnode->ops->stat || !vnode->ops->write)return -95;
+    // Allocate before taking the file gate. The backend never sees live mapped
+    // memory: a concurrent user store can change it during filesystem I/O.
+    auto* snapshot=static_cast<uint8_t*>(kmalloc(4096));if(!snapshot)return -12;
+    int result=0;
+    {
+        Gate held(object);VnodeStat stat{};result=vnode->ops->stat(vnode,&stat);
+        if(!result)for(auto* bucket:object->pages) {
+            for(auto* page=bucket;page;page=page->next) {
+                const uint64_t offset=page->index*4096;
+                if(!page->writeExposed || offset>=stat.size || offset>=end ||
+                   (offset<begin && begin-offset>=4096))continue;
+                uint64_t count=stat.size-offset;if(count>4096)count=4096;
+                memcpy(snapshot,reinterpret_cast<void*>(PhysToVirt(page->physical).raw()),count);
+                uint64_t done=0;
+                while(done<count) {
+                    uint64_t position=offset+done;
+                    int written=vnode->ops->write(vnode,snapshot+done,count-done,&position);
+                    if(written<=0 || static_cast<uint64_t>(written)>count-done ||
+                       position!=offset+done+static_cast<uint64_t>(written)) {
+                        result=written<0?written:-5;break;
+                    }
+                    done+=static_cast<uint64_t>(written);
+                }
+                // Never clear exposure: a store racing this snapshot, or any
+                // later store through an alias, must be captured by a retry.
+                if(result)break;
+            }
+            if(result)break;
+        }
+    }
+    kfree(snapshot);return result;
 }
 int FileObjectTruncateUnmapped(FileObject* object,Vnode* vnode,uint64_t length) {
     [[maybe_unused]] Operation operation;

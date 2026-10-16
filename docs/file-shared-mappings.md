@@ -253,3 +253,34 @@ seventeen-test hosted suite and production kernel/standalone-test builds pass
 truncate consumer yet. It does not implement boundary-page reconciliation,
 backend-error size recovery, typed EOF faults or dirty writeback, and neither
 mapped truncate nor writable regular-file MAP_SHARED is enabled by this pass.
+
+
+### Resident writeback primitive verified on the host (16 October)
+
+FileObject now has a gate-owned writable-exposure hook that checks the exact
+canonical frame, and a range-aware writeback primitive. Exposure stays marked
+after both success and failure: an alias can store during the snapshot or after
+a completed flush. The primitive uses a bounded 4-KiB snapshot rather than
+passing live mapped memory to the filesystem, retries short writes, rejects
+zero/invalid progress, propagates backend errors, and clips writes to current
+EOF. It flushes complete valid prefixes of intersecting exposed pages, never
+the mapped tail past EOF. The file gate serializes snapshots against ordinary
+write-through operations. No AS or page-table lock spans filesystem I/O.
+
+Actual-module hosted tests cover clean/noncanonical exclusion, selected ranges,
+empty/invalid ranges, allocation/stat/write errors, retry after partial progress,
+zero progress, unchanged cache ownership, partial EOF, a store injected after
+snapshot creation, and an ordinary write blocked behind a paused flush. That
+write's final value survives in both the canonical page and backend. All 19
+hosted tests pass, as do the production kernel/driver and standalone-test builds.
+Evidence: ignored build/workloads/shared-writeback-host-final.log and
+build/workloads/shared-writeback-kernel.log. The initial host configuration used
+the unwrapped compiler and failed to link; the verified run uses HOST_CXX.
+
+This is an inactive foundation: no production caller marks pages writable or
+invokes mapped writeback yet, and writable regular-file MAP_SHARED remains
+rejected. Still required before enabling it: dirty backing retention after final
+unmap/close, background and global sync integration, range-aware msync, mapped
+resize including private boundary prefixes and backend-error recovery, typed
+EOF faults, and the complete guest/race/reboot acceptance above. A host snapshot
+test does not establish real writable aliases or persistence across reboot.

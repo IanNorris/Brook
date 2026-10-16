@@ -21,11 +21,17 @@ std::unordered_map<KMutex*,std::unique_ptr<std::mutex>> locks;
 std::unordered_map<uint64_t,unsigned> refs;
 std::atomic<unsigned> heapBlocks{0},gateAcquires{0};
 std::atomic<bool> failHeap{false},failFrame{false};
+std::mutex writeHookGuard;
+std::condition_variable writeHookCv;
+bool writeHookEntered=false,writeHookReleased=false;
 struct Backend {
     FileObject object;
     std::vector<unsigned char> bytes;
     unsigned reads=0;
-    bool failRead=false,failWrite=false,failTruncate=false,failAfterTruncate=false;
+    unsigned writes=0,errorAtWrite=0,zeroAtWrite=0;
+    bool failRead=false,failWrite=false,failTruncate=false,failAfterTruncate=false,failStat=false;
+    unsigned char* redirty=nullptr;
+    bool blockWrite=false;
     unsigned writeLimit=~0u,readLimit=~0u,zeroAtRead=0,errorAtRead=0;
 };
 int read_backend(Vnode* vnode,void* buffer,uint64_t length,uint64_t* offset) {
@@ -38,12 +44,26 @@ int read_backend(Vnode* vnode,void* buffer,uint64_t length,uint64_t* offset) {
     std::memcpy(buffer,backend->bytes.data()+*offset,count);*offset+=count;return static_cast<int>(count);
 }
 int write_backend(Vnode* vnode,const void* buffer,uint64_t length,uint64_t* offset) {
-    auto* backend=static_cast<Backend*>(vnode->priv);if(backend->failWrite)return -5;
+    auto* backend=static_cast<Backend*>(vnode->priv);++backend->writes;
+    if(backend->failWrite || backend->writes==backend->errorAtWrite)return -5;
+    if(backend->writes==backend->zeroAtWrite)return 0;
+    if(backend->redirty) {
+        CHECK(buffer!=backend->redirty);
+        *backend->redirty=0xB9;backend->redirty=nullptr;
+    }
+    if(backend->blockWrite) {
+        std::unique_lock<std::mutex> held(writeHookGuard);
+        writeHookEntered=true;writeHookCv.notify_all();
+        writeHookCv.wait(held,[]{return writeHookReleased;});
+    }
     if(length>backend->writeLimit)length=backend->writeLimit;
     if(*offset+length>backend->bytes.size())backend->bytes.resize(*offset+length);
     std::memcpy(backend->bytes.data()+*offset,buffer,length);*offset+=length;return static_cast<int>(length);
 }
-int stat_backend(Vnode* vnode,VnodeStat* stat) { stat->size=static_cast<Backend*>(vnode->priv)->bytes.size();return 0; }
+int stat_backend(Vnode* vnode,VnodeStat* stat) {
+    auto* backend=static_cast<Backend*>(vnode->priv);if(backend->failStat)return -5;
+    stat->size=backend->bytes.size();return 0;
+}
 int truncate_backend(Vnode* vnode,uint64_t length) {
     auto* backend=static_cast<Backend*>(vnode->priv);if(backend->failTruncate)return -5;
     backend->bytes.resize(length);
@@ -75,6 +95,77 @@ void PmmRefPage(PhysicalAddress page) { std::lock_guard<std::mutex> lock(framesG
 void PmmUnrefPage(PhysicalAddress page) { std::lock_guard<std::mutex> lock(framesGuard);CHECK(refs.at(page.raw())>0);if(!--refs.at(page.raw())){refs.erase(page.raw());std::free(reinterpret_cast<void*>(page.raw()));} }
 }
 extern "C" __attribute__((noreturn)) void KernelPanic(const char*,...) { std::abort(); }
+static void WritebackPages() {
+    CHECK(refs.empty()&&heapBlocks==0);
+    Backend backend{};FileObjectInit(&backend.object);backend.bytes.resize(8192+37,0x31);
+    Vnode vnode{&operations,VnodeType::File,&backend,1,0};
+    PhysicalAddress pages[3];int error=0;
+    for(unsigned i=0;i<3;++i) {
+        pages[i]=FileObjectGetPage(&backend.object,&vnode,i,true,&error);
+        CHECK(pages[i]&&error==0);
+    }
+    auto* first=reinterpret_cast<unsigned char*>(pages[0].raw());
+    auto* second=reinterpret_cast<unsigned char*>(pages[1].raw());
+    auto* last=reinterpret_cast<unsigned char*>(pages[2].raw());
+    first[0]=0x71;second[0]=0x72;last[36]=0x73;last[37]=0x74;
+    // A resident page alone does not imply a writable shared exposure.
+    CHECK(FileObjectWriteback(&backend.object,&vnode,0,~uint64_t{0})==0&&backend.writes==0);
+    KMutexLock(&backend.object.gate);
+    CHECK(!FileObjectExposeWritableLocked(&backend.object,0,pages[1]));
+    CHECK(!FileObjectExposeWritableLocked(&backend.object,3,pages[0]));
+    CHECK(!FileObjectExposeWritableLocked(&backend.object,0,PhysicalAddress{}));
+    for(unsigned i=0;i<3;++i)CHECK(FileObjectExposeWritableLocked(&backend.object,i,pages[i]));
+    KMutexUnlock(&backend.object.gate);
+    auto frameCount=refs.size();unsigned allocationCount=heapBlocks;
+    CHECK(FileObjectWriteback(&backend.object,&vnode,4096,8192)==0);
+    CHECK(backend.writes==1&&backend.bytes[0]==0x31&&backend.bytes[4096]==0x72&&backend.bytes[8192+36]==0x31);
+    unsigned before=backend.writes;
+    CHECK(FileObjectWriteback(&backend.object,&vnode,8192,8192)==0&&backend.writes==before);
+    CHECK(FileObjectWriteback(&backend.object,&vnode,8193,8192)==-22&&backend.writes==before);
+    failHeap=true;CHECK(FileObjectWriteback(&backend.object,&vnode,0,4096)==-12);failHeap=false;
+    backend.failStat=true;CHECK(FileObjectWriteback(&backend.object,&vnode,0,4096)==-5);backend.failStat=false;
+    CHECK(backend.writes==before);
+    // Preserve the exposed page after an error following partial progress.
+    backend.writeLimit=1024;backend.errorAtWrite=backend.writes+2;
+    CHECK(FileObjectWriteback(&backend.object,&vnode,0,4096)==-5);
+    CHECK(backend.bytes[0]==0x71);
+    first[1500]=0x81;backend.errorAtWrite=0;
+    CHECK(FileObjectWriteback(&backend.object,&vnode,0,4096)==0&&backend.bytes[1500]==0x81);
+    backend.zeroAtWrite=backend.writes+1;
+    CHECK(FileObjectWriteback(&backend.object,&vnode,0,4096)==-5);backend.zeroAtWrite=0;
+    // A mapped store during backend I/O must not be lost by clearing dirty
+    // state on completion. This deterministic hook runs after the snapshot.
+    first[0]=0xA8;backend.redirty=first;
+    CHECK(FileObjectWriteback(&backend.object,&vnode,0,4096)==0);
+    CHECK(first[0]==0xB9&&backend.bytes[0]==0xA8);
+    CHECK(FileObjectWriteback(&backend.object,&vnode,0,4096)==0&&backend.bytes[0]==0xB9);
+    // EOF-tail writes never extend the file, even when the mapping modified
+    // bytes past EOF inside the final resident page.
+    CHECK(FileObjectWriteback(&backend.object,&vnode,8192,~uint64_t{0})==0);
+    CHECK(backend.bytes.size()==8192+37&&backend.bytes.back()==0x73);
+    first[0]=0xC2;
+    CHECK(FileObjectWriteback(&backend.object,&vnode,1,2)==0&&backend.bytes[0]==0xC2);
+    // A concurrent ordinary pwrite must not be overwritten by an older flush
+    // snapshot. Hold the actual backend callback and wait until pwrite reaches
+    // the gate; it can complete only after the snapshot has been written.
+    backend.blockWrite=true;std::atomic<bool> ordinaryDone{false};
+    std::thread flusher([&]{CHECK(FileObjectWriteback(&backend.object,&vnode,0,4096)==0);});
+    {std::unique_lock<std::mutex> held(writeHookGuard);writeHookCv.wait(held,[]{return writeHookEntered;});}
+    unsigned gateBefore=gateAcquires;
+    std::thread ordinary([&] {
+        unsigned char value=0xD3;uint64_t offset=0;
+        CHECK(FileObjectWrite(&backend.object,&vnode,&value,1,&offset)==1);
+        ordinaryDone=true;
+    });
+    while(gateAcquires==gateBefore)std::this_thread::yield();
+    CHECK(!ordinaryDone);
+    {std::lock_guard<std::mutex> held(writeHookGuard);writeHookReleased=true;writeHookCv.notify_all();}
+    flusher.join();ordinary.join();
+    CHECK(ordinaryDone&&first[0]==0xD3&&backend.bytes[0]==0xD3);
+    CHECK(refs.size()==frameCount&&heapBlocks==allocationCount);
+    for(auto page:pages)PmmUnrefPage(page);
+    FileObjectDispose(&backend.object);CHECK(refs.empty()&&heapBlocks==0);
+}
 static void BatchPages() {
     CHECK(refs.empty()&&heapBlocks==0);
     Backend backend{};FileObjectInit(&backend.object);backend.bytes.resize(16*4096,0x57);
@@ -204,5 +295,6 @@ int main() {
     CHECK(*reinterpret_cast<unsigned char*>(retry.raw())==0);PmmUnrefPage(retry);
     FileObjectDispose(&backend.object);CHECK(refs.empty()&&heapBlocks==0);
     BatchPages();
-    std::puts("FILE_OBJECT PASS batch/sparse-pins/one-gate/failure-cleanup/ concurrent-load/io-coherence/partial-error/truncate/zero-tail/lifetime");
+    WritebackPages();
+    std::puts("FILE_OBJECT PASS batch/sparse-pins/one-gate/failure-cleanup/concurrent-load/io-coherence/partial-error/truncate/zero-tail/lifetime/writeback-range/snapshot/redirty/error-retry");
 }
