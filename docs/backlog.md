@@ -6,10 +6,15 @@
   dynamically set Wayland title), but visible content stays blank and address-bar
   typing does not appear. Investigate display/update and input responsiveness
   from the saved profile rather than assuming all content processes fail.
-- Firefox teardown after SIGTERM then SIGKILL emitted a mapped-page free with
-  mapCount=1 followed by a mapping-count underflow for the same physical page.
-  Reproduce and fix ownership before treating large-browser cleanup as safe.
-  Evidence: `build/workloads/browser-rerun-20261016/first-run-serial.log`.
+- Firefox teardown ownership correction: a small concurrent SCM_RIGHTS test
+  reproduced duplicate descriptor installation (577 from 512 sends) and the
+  mapped memfd free. Coupling rights and bytes under the pipe lock passes the
+  exact-count regression and two Firefox teardown cycles without warnings.
+  See the latest Unix ownership section in `workloads.md`; browser display and
+  interactive acceptance are still open.
+- Audit memfd shrinking independently: `ftruncate` currently frees tail backing
+  pages without invalidating live borrowed mappings. This is a separate source
+  finding; the reproduced Firefox teardown free came from descriptor close.
 - Codium's clean-boot rerun still fails its 256-KiB writable file MAP_SHARED
   request with EOPNOTSUPP and reaches the same startup INT3. Complete coherent
   shared writes/writeback; rerunning without that feature did not yield an editor.

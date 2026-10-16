@@ -1065,10 +1065,70 @@ static void UnixFdSnapRelease(const UnixFdSnap* snap);
 // Shared between sender (enqueue) and receiver (dequeue).
 struct UnixFdQueue {
     UnixFdSnap   msgs[UNIX_FD_QUEUE_CAP];
+    uint64_t offsets[UNIX_FD_QUEUE_CAP];
+    uint64_t written, read;
     volatile int head;
     volatile int tail;
     volatile uint32_t refCount; // one ref per UnixSocketData pointing at us
 };
+
+// The direction's pipe lock protects BOTH bytes and descriptor ownership.
+// Publishing descriptors separately lets a receiver steal them before their
+// bytes arrive; unsynchronized receivers can also install the same ref twice.
+static int64_t UnixStreamTryWrite(PipeBuffer* pipe, UnixFdQueue* queue,
+                                  const char* bytes, uint64_t length,
+                                  const UnixFdSnap* descriptors=nullptr, int count=0) {
+    SpinLockAcquire(&pipe->lock);
+    int64_t result=-EAGAIN;
+    if (!pipe->readers) result=-EPIPE;
+    else if (pipe->space() &&
+             (!count || (queue && (queue->head-queue->tail+UNIX_FD_QUEUE_CAP)%UNIX_FD_QUEUE_CAP+count<UNIX_FD_QUEUE_CAP))) {
+        uint32_t n=pipe->space();if (length<n)n=static_cast<uint32_t>(length);
+        if (n) {
+            for(int i=0;i<count;++i) {
+                queue->msgs[queue->head]=descriptors[i];
+                queue->offsets[queue->head]=queue->written;
+                queue->head=(queue->head+1)%UNIX_FD_QUEUE_CAP;
+            }
+            uint32_t first=pipe->capacity-pipe->head;if(first>n)first=n;
+            memcpy(pipe->data+pipe->head,bytes,first);
+            if(n>first)memcpy(pipe->data,bytes+first,n-first);
+            pipe->head=(pipe->head+n)%pipe->capacity;
+            if(queue)queue->written+=n;
+        }
+        result=n;
+    }
+    SpinLockRelease(&pipe->lock);return result;
+}
+static uint32_t UnixStreamTryRead(PipeBuffer* pipe, UnixFdQueue* queue,
+                                  char* bytes, uint64_t length,
+                                  UnixFdSnap* descriptors, int& count) {
+    count=0;SpinLockAcquire(&pipe->lock);
+    uint32_t n=pipe->count();if(length<n)n=static_cast<uint32_t>(length);
+    if(queue && n) {
+        // Stop before the next distinct descriptor group. A one-byte receive
+        // must never collect rights attached to a later byte in the stream.
+        bool first=true;uint64_t offset=0;
+        for(int i=queue->tail;i!=queue->head;i=(i+1)%UNIX_FD_QUEUE_CAP) {
+            uint64_t at=queue->offsets[i];
+            if(first) {offset=at;first=false;}
+            else if(at!=offset) {
+                if(at<queue->read+n)n=static_cast<uint32_t>(at-queue->read);
+                break;
+            }
+        }
+        while(queue->tail!=queue->head && queue->offsets[queue->tail]<queue->read+n) {
+            descriptors[count++]=queue->msgs[queue->tail];
+            queue->tail=(queue->tail+1)%UNIX_FD_QUEUE_CAP;
+        }
+        queue->read+=n;
+    }
+    uint32_t first=pipe->capacity-pipe->tail;if(first>n)first=n;
+    if(n)memcpy(bytes,pipe->data+pipe->tail,first);
+    if(n>first)memcpy(bytes+first,pipe->data,n-first);
+    pipe->tail=(pipe->tail+n)%pipe->capacity;
+    SpinLockRelease(&pipe->lock);return n;
+}
 
 static inline int UnixFdQueueCount(const UnixFdQueue* q)
 {
@@ -1398,6 +1458,55 @@ struct FdRef
     FdEntry* operator->() const     { return fde; }
     FdEntry* get() const            { return fde; }
 };
+
+static int64_t UnixSocketWriteSome(UnixSocketData* socket,bool nonblock,
+                                   const char* bytes,uint64_t length,
+                                   const UnixFdSnap* descriptors=nullptr,int count=0) {
+    if(socket->state!=UnixSocketData::State::Connected || !socket->txPipe)return -ENOTCONN;
+    if(!length)return 0;
+    auto* pipe=socket->txPipe;
+    for(;;) {
+        auto result=UnixStreamTryWrite(pipe,socket->peerIncomingFds,bytes,length,descriptors,count);
+        if(result!=-EAGAIN) {
+            if(result>0) {
+                if(auto* reader=pipe->readerWaiter) {pipe->readerWaiter=nullptr;WakeProcess(reader);}
+                PipeWakeEpoll(pipe);
+            }
+            return result;
+        }
+        if(nonblock || socket->nonblock)return -EAGAIN;
+        auto* self=ProcessCurrent();pipe->writerWaiter=self;
+        extern volatile uint64_t g_lapicTickCount;
+        self->wakeupTick=g_lapicTickCount+10;SchedulerBlock(self);
+        if(HasPendingSignals()) {
+            if(pipe->writerWaiter==self)pipe->writerWaiter=nullptr;
+            return -EINTR;
+        }
+    }
+}
+static int64_t UnixSocketReadSome(UnixSocketData* socket,bool nonblock,
+                                  char* bytes,uint64_t length,UnixFdSnap* descriptors,int& count) {
+    count=0;
+    if(socket->state!=UnixSocketData::State::Connected || !socket->rxPipe)return -ENOTCONN;
+    if(!length)return 0;
+    auto* pipe=socket->rxPipe;
+    for(;;) {
+        auto n=UnixStreamTryRead(pipe,socket->incomingFds,bytes,length,descriptors,count);
+        if(n) {
+            if(auto* writer=pipe->writerWaiter) {pipe->writerWaiter=nullptr;WakeProcess(writer);}
+            PipeWakeEpoll(pipe);return n;
+        }
+        if(!__atomic_load_n(&pipe->writers,__ATOMIC_ACQUIRE))return 0;
+        if(nonblock || socket->nonblock)return -EAGAIN;
+        auto* self=ProcessCurrent();pipe->readerWaiter=self;
+        extern volatile uint64_t g_lapicTickCount;
+        self->wakeupTick=g_lapicTickCount+10;SchedulerBlock(self);
+        if(HasReadInterruptSignal()) {
+            if(pipe->readerWaiter==self)pipe->readerWaiter=nullptr;
+            return -EINTR;
+        }
+    }
+}
 
 // Descriptor numbers are reusable: redirected standard streams have the
 // same metadata and terminal behavior as the object they now reference.
@@ -1856,50 +1965,11 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count)
             (fde->statusFlags & 0x400) != 0);
     }
 
-    // Write to AF_UNIX connected socket
-    if (fde->type == FdType::UnixSocket && fde->handle)
-    {
-        auto* usd = static_cast<UnixSocketData*>(fde->handle);
-        if (usd->state != UnixSocketData::State::Connected || !usd->txPipe)
-            return -ENOTCONN;
-        auto* pipe = usd->txPipe;
-        const char* src = reinterpret_cast<const char*>(bufAddr);
-        bool nonblock = usd->nonblock || (fde->statusFlags & 0x800);
-        uint64_t written = 0;
-
-        while (written < count) {
-            if (__atomic_load_n(&pipe->readers, __ATOMIC_ACQUIRE) == 0)
-                return written > 0 ? static_cast<int64_t>(written) : -EPIPE;
-            uint32_t chunk = pipe->write(src + written, static_cast<uint32_t>(count - written));
-            written += chunk;
-            if (written > 0) {
-                Process* reader = pipe->readerWaiter;
-                if (reader) {
-                    pipe->readerWaiter = nullptr;
-                    WakeProcess(reader);
-                }
-                PipeWakeEpoll(pipe);
-                break;
-            }
-            if (nonblock) return -EAGAIN;
-            Process* self = ProcessCurrent();
-            pipe->writerWaiter = self;
-            // Re-check after registering waiter
-            chunk = pipe->write(src + written, static_cast<uint32_t>(count - written));
-            if (chunk > 0) {
-                pipe->writerWaiter = nullptr;
-                written += chunk;
-                Process* reader = pipe->readerWaiter;
-                if (reader) { pipe->readerWaiter = nullptr; WakeProcess(reader); }
-                PipeWakeEpoll(pipe);
-                break;
-            }
-            extern volatile uint64_t g_lapicTickCount;
-            self->wakeupTick = g_lapicTickCount + 10;
-            SchedulerBlock(self);
-            if (HasPendingSignals()) return written > 0 ? static_cast<int64_t>(written) : -EINTR;
-        }
-        return static_cast<int64_t>(written);
+    // Write to AF_UNIX connected socket.
+    if (fde->type == FdType::UnixSocket && fde->handle) {
+        auto* socket=static_cast<UnixSocketData*>(fde->handle);
+        return UnixSocketWriteSome(socket,(fde->statusFlags&0x800)!=0,
+            reinterpret_cast<const char*>(bufAddr),count);
     }
 
     // No fd-type handler above matched — unknown/unsupported descriptor.
@@ -2475,39 +2545,14 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         }
     }
 
-    // Read from AF_UNIX connected socket
-    if (fde->type == FdType::UnixSocket && fde->handle)
-    {
-        auto* usd = static_cast<UnixSocketData*>(fde->handle);
-        if (usd->state != UnixSocketData::State::Connected || !usd->rxPipe)
-            return -ENOTCONN;
-        auto* pipe = usd->rxPipe;
-        auto* dst  = reinterpret_cast<char*>(bufAddr);
-        bool nonblock = usd->nonblock || (fde->statusFlags & 0x800);
-
-        for (;;) {
-            uint32_t got = pipe->read(dst, static_cast<uint32_t>(count));
-            if (got > 0) {
-                Process* writer = pipe->writerWaiter;
-                if (writer) {
-                    pipe->writerWaiter = nullptr;
-                    WakeProcess(writer);
-                }
-                PipeWakeEpoll(pipe);
-                return static_cast<int64_t>(got);
-            }
-            if (__atomic_load_n(&pipe->writers, __ATOMIC_ACQUIRE) == 0) return 0; // EOF
-            if (nonblock) return -EAGAIN;
-            Process* self = ProcessCurrent();
-            pipe->readerWaiter = self;
-            extern volatile uint64_t g_lapicTickCount;
-            self->wakeupTick = g_lapicTickCount + 10;
-            SchedulerBlock(self);
-            if (HasReadInterruptSignal()) {
-                if (pipe->readerWaiter == self) pipe->readerWaiter = nullptr;
-                return -EINTR;
-            }
-        }
+    // A plain read consumes (and closes) ancillary rights accompanying bytes.
+    if (fde->type == FdType::UnixSocket && fde->handle) {
+        auto* socket=static_cast<UnixSocketData*>(fde->handle);
+        UnixFdSnap descriptors[UNIX_FD_QUEUE_CAP];int received=0;
+        auto result=UnixSocketReadSome(socket,(fde->statusFlags&0x800)!=0,
+            reinterpret_cast<char*>(bufAddr),count,descriptors,received);
+        for(int i=0;i<received;++i)UnixFdSnapRelease(&descriptors[i]);
+        return result;
     }
 
     return -EBADF;
@@ -12401,15 +12446,16 @@ struct LinuxMMsgHdr {
 static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
                             uint64_t, uint64_t, uint64_t)
 {
-    (void)flagsVal;
     Process* proc = ProcessCurrent();
     if (!proc) return -ENOSYS;
 
     int fd = static_cast<int>(fdVal);
     if (msgVal < 0x1000) return -EFAULT;
 
+    if (!UserBufferReadable(msgVal,sizeof(LinuxMsgHdr))) return -EFAULT;
     auto* msg = reinterpret_cast<LinuxMsgHdr*>(msgVal);
-    if (!msg || msg->msg_iovlen == 0 || !msg->msg_iov) return -EINVAL;
+    if (!msg->msg_iovlen || msg->msg_iovlen>1024 || !msg->msg_iov) return -EINVAL;
+    if (!UserBufferReadable(reinterpret_cast<uint64_t>(msg->msg_iov),msg->msg_iovlen*sizeof(*msg->msg_iov))) return -EFAULT;
 
     KernelOperationGuard operation(proc);
     FdRef descriptor(proc, fd);
@@ -12427,7 +12473,7 @@ static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
 
     if (msg->msg_control && msg->msg_controllen >= sizeof(CmsgHdr)) {
         uint64_t ctlAddr = reinterpret_cast<uint64_t>(msg->msg_control);
-        if (ctlAddr < 0x1000) return -EFAULT;
+        if (!UserBufferReadable(ctlAddr,msg->msg_controllen)) return -EFAULT;
 
         uint64_t off = 0;
         while (off + sizeof(CmsgHdr) <= msg->msg_controllen) {
@@ -12442,10 +12488,10 @@ static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
                     reinterpret_cast<uint64_t>(cm) + sizeof(CmsgHdr));
 
                 for (uint64_t i = 0; i < nFds; i++) {
-                    if (pendingCount >= UNIX_FD_QUEUE_CAP) {
+                    if (pendingCount >= UNIX_FD_QUEUE_CAP-1) {
                         for (int j = 0; j < pendingCount; j++)
                             UnixFdSnapRelease(&pendingSnaps[j]);
-                        return -EAGAIN;
+                        return -90; // EMSGSIZE: this group can never fit.
                     }
                     FdRef sourceDescriptor(proc, fds[i]);
                     FdEntry* srcFde = sourceDescriptor.get();
@@ -12464,47 +12510,24 @@ static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
         }
     }
 
-    // Now enqueue the snapshots on the peer's incoming queue. If the queue
-    // is full, fail — don't partial-send cmsg.
-    if (pendingCount > 0) {
-        UnixFdQueue* q = usd->peerIncomingFds;
-        if (!q) {
-            for (int j = 0; j < pendingCount; j++) UnixFdSnapRelease(&pendingSnaps[j]);
-            return -ENOTCONN;
+    // Commit the rights with the first actual payload byte. Failed writes own
+    // no published snapshots, so there is no rollback racing a receiver.
+    int64_t total=0;
+    for(uint64_t i=0;i<msg->msg_iovlen;++i) {
+        auto& iov=msg->msg_iov[i];if(!iov.iov_len)continue;
+        if(!UserBufferReadable(reinterpret_cast<uint64_t>(iov.iov_base),iov.iov_len)) {
+            for(int j=0;j<pendingCount;++j)UnixFdSnapRelease(&pendingSnaps[j]);
+            return total?total:-EFAULT;
         }
-        if (UnixFdQueueCount(q) + pendingCount >= UNIX_FD_QUEUE_CAP) {
-            for (int j = 0; j < pendingCount; j++) UnixFdSnapRelease(&pendingSnaps[j]);
-            return -EAGAIN;
-        }
-        for (int j = 0; j < pendingCount; j++) {
-            q->msgs[q->head] = pendingSnaps[j];
-            q->head = (q->head + 1) % UNIX_FD_QUEUE_CAP;
+        auto n=UnixSocketWriteSome(usd,(flagsVal&0x40)||(fde->statusFlags&0x800),
+            static_cast<const char*>(iov.iov_base),iov.iov_len,pendingSnaps,pendingCount);
+        if(n>0) {pendingCount=0;total+=n;}
+        if(n<0 || static_cast<uint64_t>(n)<iov.iov_len) {
+            for(int j=0;j<pendingCount;++j)UnixFdSnapRelease(&pendingSnaps[j]);
+            return total?total:n;
         }
     }
-
-    // Write the iov payload. If we enqueued fds but the payload write fails,
-    // drain the snaps back out so we don't leak/strand them. Linux actually
-    // delivers cmsg with the first data byte; we approximate by requiring at
-    // least one payload byte alongside any fds — Wayland always sends both.
-    int64_t total = 0;
-    for (uint64_t i = 0; i < msg->msg_iovlen; i++) {
-        void* base = msg->msg_iov[i].iov_base;
-        uint64_t len = msg->msg_iov[i].iov_len;
-        if (!base || len == 0) continue;
-        int64_t ret = sys_write(fd, reinterpret_cast<uint64_t>(base), len, 0, 0, 0);
-        if (ret < 0) {
-            // If nothing was sent at all and we'd pushed fds, back them out.
-            if (total == 0 && pendingCount > 0) {
-                UnixFdQueue* q = usd->peerIncomingFds;
-                for (int j = 0; j < pendingCount; j++) {
-                    q->head = (q->head - 1 + UNIX_FD_QUEUE_CAP) % UNIX_FD_QUEUE_CAP;
-                    UnixFdSnapRelease(&q->msgs[q->head]);
-                }
-            }
-            return (total > 0) ? total : ret;
-        }
-        total += ret;
-    }
+    for(int j=0;j<pendingCount;++j)UnixFdSnapRelease(&pendingSnaps[j]);
     return total;
     }
 
@@ -12560,8 +12583,10 @@ static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
     int fd = static_cast<int>(fdVal);
     if (msgVal < 0x1000) return -EFAULT;
 
+    if (!UserBufferWritable(msgVal,sizeof(LinuxMsgHdr))) return -EFAULT;
     auto* msg = reinterpret_cast<LinuxMsgHdr*>(msgVal);
-    if (!msg || msg->msg_iovlen == 0 || !msg->msg_iov) return -EINVAL;
+    if (!msg->msg_iovlen || msg->msg_iovlen>1024 || !msg->msg_iov) return -EINVAL;
+    if (!UserBufferReadable(reinterpret_cast<uint64_t>(msg->msg_iov),msg->msg_iovlen*sizeof(*msg->msg_iov))) return -EFAULT;
 
     KernelOperationGuard operation(proc);
     FdRef descriptor(proc, fd);
@@ -12569,117 +12594,46 @@ static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
     if (fde && fde->type == FdType::UnixSocket) {
         auto* usd = static_cast<UnixSocketData*>(fde->handle);
 
-        // Honor MSG_DONTWAIT: if no data is ready and no cmsg fds queued,
-        // return EAGAIN immediately instead of blocking in sys_read.
-        if (dontwait && usd->state == UnixSocketData::State::Connected && usd->rxPipe) {
-            uint32_t avail = usd->rxPipe->count();
-            int ctlN = usd->incomingFds ? UnixFdQueueCount(usd->incomingFds) : 0;
-            bool writersGone = (__atomic_load_n(&usd->rxPipe->writers, __ATOMIC_ACQUIRE) == 0);
-            if (avail == 0 && ctlN == 0 && !writersGone) {
-                msg->msg_controllen = 0;
-                msg->msg_flags = 0;
-                return -EAGAIN;
+        if(flagsVal&~(0x40ULL|0x40000000ULL))return -95;
+        if(msg->msg_controllen && !UserBufferWritable(reinterpret_cast<uint64_t>(msg->msg_control),msg->msg_controllen))return -EFAULT;
+        const uint64_t capacity=msg->msg_controllen;
+        UnixFdSnap descriptors[UNIX_FD_QUEUE_CAP];int received=0;
+        int64_t total=0;
+        for(uint64_t i=0;i<msg->msg_iovlen;++i) {
+            auto& iov=msg->msg_iov[i];if(!iov.iov_len)continue;
+            if(!UserBufferWritable(reinterpret_cast<uint64_t>(iov.iov_base),iov.iov_len)) {
+                for(int j=0;j<received;++j)UnixFdSnapRelease(&descriptors[j]);
+                return total?total:-EFAULT;
             }
+            int count=0;
+            auto n=UnixSocketReadSome(usd,dontwait || total>0 || (fde->statusFlags&0x800),
+                static_cast<char*>(iov.iov_base),iov.iov_len,descriptors,count);
+            received=count;
+            if(n<0 && !total)return n;
+            if(n>0)total+=n;
+            if(n<=0 || static_cast<uint64_t>(n)<iov.iov_len || received)break;
         }
-
-        // Temporarily enable nonblock for the per-iov reads so even if the
-        // first iov drains the pipe, a second iov doesn't block waiting for
-        // bytes the peer hasn't sent yet (Wayland sends full messages at once).
-        bool savedNonblock = usd->nonblock;
-        if (dontwait) usd->nonblock = true;
-
-        int64_t total = 0;
-        for (uint64_t i = 0; i < msg->msg_iovlen; i++) {
-            void* base = msg->msg_iov[i].iov_base;
-            uint64_t len = msg->msg_iov[i].iov_len;
-            if (!base || len == 0) continue;
-            int64_t ret = sys_read(fd, reinterpret_cast<uint64_t>(base), len, 0, 0, 0);
-            if (ret < 0) {
-                if (dontwait) usd->nonblock = savedNonblock;
-                if (ret == -EAGAIN && total > 0) return total;
-                return (total > 0) ? total : ret;
-            }
-            if (ret == 0) break;
-            total += ret;
-            // Partial read on an iov means pipe is now drained; don't spin
-            // into the next iov expecting more.
-            if ((uint64_t)ret < len) break;
-        }
-
-        if (dontwait) usd->nonblock = savedNonblock;
-
-        // Drain any pending SCM_RIGHTS fds from our incoming queue into the
-        // caller's cmsg buffer. We only deliver fds when we also delivered
-        // at least one data byte — Wayland's preferred semantics and what
-        // libc callers expect.
-        msg->msg_flags = 0;
-        uint64_t wroteCtl = 0;
-
-        // Debug: check if fds are pending but conditions prevent delivery
-        if (usd->incomingFds && UnixFdQueueCount(usd->incomingFds) > 0) {
-            if (total <= 0)
-                brook::SerialPrintf("recvmsg: %d fd(s) pending but total=%ld (no data) pid=%d\n",
-                          UnixFdQueueCount(usd->incomingFds), (long)total, proc->pid);
-            else if (!msg->msg_control)
-                brook::SerialPrintf("recvmsg: %d fd(s) pending but msg_control=NULL pid=%d\n",
-                          UnixFdQueueCount(usd->incomingFds), proc->pid);
-            else if (msg->msg_controllen < sizeof(CmsgHdr))
-                brook::SerialPrintf("recvmsg: %d fd(s) pending but controllen=%lu < %lu pid=%d\n",
-                          UnixFdQueueCount(usd->incomingFds),
-                          msg->msg_controllen, sizeof(CmsgHdr), proc->pid);
-        }
-
-        if (total > 0 && usd->incomingFds &&
-            msg->msg_control && msg->msg_controllen >= sizeof(CmsgHdr))
-        {
-            uint64_t ctlAddr = reinterpret_cast<uint64_t>(msg->msg_control);
-            if (ctlAddr >= 0x1000) {
-                UnixFdQueue* q = usd->incomingFds;
-                uint64_t cap   = msg->msg_controllen;
-                uint64_t off   = 0;
-
-                int n = UnixFdQueueCount(q);
-                if (n > 0) {
-                    // One SCM_RIGHTS cmsg can hold multiple fds back-to-back.
-                    uint64_t fdsMax = (cap - sizeof(CmsgHdr)) / sizeof(int);
-                    int installed = 0;
-                    int wantFds   = n;
-                    if ((uint64_t)wantFds > fdsMax) {
-                        wantFds = static_cast<int>(fdsMax);
-                        msg->msg_flags |= 0x8; // MSG_CTRUNC
-                    }
-                    if (wantFds > 0) {
-                        auto* cm = reinterpret_cast<CmsgHdr*>(ctlAddr + off);
-                        auto* fdSlot = reinterpret_cast<int*>(
-                            reinterpret_cast<uint64_t>(cm) + sizeof(CmsgHdr));
-
-                        for (int j = 0; j < wantFds; j++) {
-                            UnixFdSnap snap = q->msgs[q->tail];
-                            q->tail = (q->tail + 1) % UNIX_FD_QUEUE_CAP;
-
-                            int newFd = UnixFdSnapInstall(proc, &snap);
-                            if (newFd < 0) {
-                                // Out of fds — put it back at the tail head-side
-                                // (we already advanced tail; rewind one slot).
-                                q->tail = (q->tail - 1 + UNIX_FD_QUEUE_CAP) % UNIX_FD_QUEUE_CAP;
-                                q->msgs[q->tail] = snap;
-                                break;
-                            }
-                            fdSlot[installed++] = newFd;
-                        }
-
-                        if (installed > 0) {
-                            cm->cmsg_len   = sizeof(CmsgHdr) + installed * sizeof(int);
-                            cm->cmsg_level = SOL_SOCKET;
-                            cm->cmsg_type  = SCM_RIGHTS;
-                            wroteCtl = CmsgAlign(cm->cmsg_len);
-                        }
-                    }
+        msg->msg_flags=0;msg->msg_controllen=0;
+        uint64_t maxFds=capacity>=sizeof(CmsgHdr)?(capacity-sizeof(CmsgHdr))/sizeof(int):0;
+        int installed=0;
+        for(int i=0;i<received;++i) {
+            if(static_cast<uint64_t>(installed)<maxFds) {
+                descriptors[i].fdFlags=(flagsVal&0x40000000ULL)?1:0;
+                int installedFd=UnixFdSnapInstall(proc,&descriptors[i]);
+                if(installedFd>=0) {
+                    auto* slots=reinterpret_cast<int*>(reinterpret_cast<uint64_t>(msg->msg_control)+sizeof(CmsgHdr));
+                    slots[installed++]=installedFd;continue;
                 }
             }
+            msg->msg_flags|=0x8;UnixFdSnapRelease(&descriptors[i]);
         }
-
-        msg->msg_controllen = wroteCtl;
+        if(installed) {
+            auto* header=static_cast<CmsgHdr*>(msg->msg_control);
+            header->cmsg_len=sizeof(CmsgHdr)+installed*sizeof(int);
+            header->cmsg_level=SOL_SOCKET;header->cmsg_type=SCM_RIGHTS;
+            uint64_t used=CmsgAlign(header->cmsg_len);
+            msg->msg_controllen=used<capacity?used:capacity;
+        }
         return total;
     }
 

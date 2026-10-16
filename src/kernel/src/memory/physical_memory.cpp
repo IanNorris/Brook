@@ -804,6 +804,8 @@ void PmmFreePage(PhysicalAddress physAddr)
     {
         PageDescriptor& d = Desc(static_cast<uint32_t>(idx));
         freedOwnerPid = d.pid;
+        if (__atomic_load_n(&d.mapCount, __ATOMIC_RELAXED))
+            SerialPrintf("PMM: mapped final free caller=%p\n", __builtin_return_address(0));
         MapLeakCheckLocked(static_cast<uint32_t>(idx), "PmmFreePage");
         // BRO-179: log frees of ALL tags (not just User) so the trail shows
         // kernel-domain (Heap/PageTable/KData) frees too — the cross-domain

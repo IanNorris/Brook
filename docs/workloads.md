@@ -1276,3 +1276,35 @@ each is fatal. The clean Codium run returned to ten processes after SIGKILL,
 passed heap/page diagnostics and all offline disk checks, and stopped with a
 checked flush. Neither app is accepted as usable. Evidence, traces, profile and
 screenshots are in ignored `build/workloads/browser-rerun-20261016/result.json`.
+
+### Unix descriptor ownership exposed by Firefox teardown (16 October)
+
+A small `unixrightscheck.c` reproduces the Firefox teardown memory warning
+without the browser: one sender passes 512 references to a mapped memfd while
+four receiver threads receive and close them. Linux receives exactly 512.
+The old Brook kernel installed 577 descriptors, then freed the still-mapped
+memfd and reported a mapping-count underflow. The prior-profile Firefox control
+also reproduced a teardown panic; the first erroneous free came from descriptor
+close, rather than memfd truncation.
+
+The direction's pipe lock now protects byte publication/consumption and the
+associated descriptor queue together. Rights are published with their first
+actual byte, transferred once, and kept behind their stream position. A failed
+write no longer rolls back references that a receiver may already have consumed.
+Plain reads and truncated control buffers close discarded rights; received
+CLOEXEC follows MSG_CMSG_CLOEXEC. `sendmsg` stops after a partial iovec write.
+The existing ancillary queue remains bounded to 63 descriptors per group;
+unsupported Unix `recvmsg` flags return EOPNOTSUPP.
+
+Kernel `d86f2927f0e0c192253684e8998ef1f9f4da2df2a0914a2dca458eef4ac037e4`
+passes the one-receiver test and repeated four-receiver tests (512/512 each),
+all 19 hosted tests, and two Firefox launch/TERM/KILL cleanup cycles. Each cycle
+returned to the ten-process baseline with no page ownership warnings. Checked
+shutdown and offline FAT/data/Nix checks all pass. Evidence is under
+`build/workloads/firefox-rights-fixed-20261016/`, session
+`ba9e465c97074bdc83dfb9e4815f462d`. The failed diagnostic disks are preserved
+separately; their unsynced panic left data fsck status 4 and they were not reused.
+
+Firefox still displayed a blank page and stale toolbar after the ownership fix.
+Wayland tracing confirms keyboard events reach the client. Rendering and input
+acceptance remain separate from this memory-lifetime correction.

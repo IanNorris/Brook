@@ -4,6 +4,13 @@ Build the C probes in `nix-shell` using `$MUSL_CC -static -O2` (add
 `-pthread` for `fdstress.c` and `brkcheck.c`). Keep binaries in ignored `build/`.
 Run them inside a disposable Brook VM through `vm_guest_run`:
 
+`unixrightscheck.c` requires `-pthread`. The default uses one receiver;
+`--concurrent` uses four. One sender transfers 512 references to a mapped memfd.
+Every one-byte receive must carry exactly one descriptor, every received handle
+must read the marker, and total bytes and handles must both equal 512. Run both
+modes and require no kernel page-ownership warnings after cleanup. This catches
+duplicate installation and rights delivered with the wrong stream bytes.
+
 `fsexitcheck.c` requires `-pthread` and an absolute fixture path. Run once on
 ext2 (`/data/FSEXIT.TST`) and once on FAT (`/boot/FSEXIT.TST`). Sixteen rounds
 cycle through `exit_group`, parent-directed `SIGKILL`, and process-directed
