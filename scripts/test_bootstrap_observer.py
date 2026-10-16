@@ -26,7 +26,7 @@ class ObserverTests(unittest.TestCase):
                 if clock[0] == 8:
                     with serial.open('a') as log:
                         log.write('BOOTSTRAP_END compile 2\n')
-                        log.write('100% tests passed, 0 tests failed out of 13\n' * (2 if complete else 1))
+                        log.write((acceptance.NATIVE_PASS_MARKER + '\n') * (2 if complete else 1))
                         log.write('BOOTSTRAP_ARTIFACTS_OK\nBOOTSTRAP_EXIT 0\n')
 
             def profile(_session, action, **_):
@@ -61,6 +61,11 @@ class ObserverTests(unittest.TestCase):
     def test_profiling_failure_does_not_relax_acceptance_evidence(self):
         with self.assertRaisesRegex(RuntimeError, 'missing required test/artifact evidence'):
             self.run_observer('export', complete=False)
+
+    def test_old_suite_count_is_not_current_acceptance(self):
+        old = f"100% tests passed, 0 tests failed out of {acceptance.NATIVE_TEST_COUNT - 1}\n"
+        with self.assertRaisesRegex(RuntimeError, 'missing required test/artifact evidence'):
+            acceptance.validate_finished_build(old * 2 + 'BOOTSTRAP_ARTIFACTS_OK\n')
 
     def test_stopped_vm_without_completion_fails_instead_of_waiting(self):
         with self.assertRaisesRegex(RuntimeError, 'VM process is no longer running'):

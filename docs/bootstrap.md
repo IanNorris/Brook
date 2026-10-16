@@ -72,7 +72,7 @@ rather than the host store's 0444/0555, so mode-dependent mmap cache behavior
 matches. Base transport paths keep the same host-prepared modes in both images.
 The harness runs the real guest installer, performs an HTTPS clone and pinned
 submodule update, and builds kernel/EFI/modules/bare-metal/native artifacts.
-It validates module imports and requires 13/13 CTest results twice, before and
+It validates module imports and requires 18/18 CTest results twice, before and
 after a clean native rebuild with warm caches. The incremental kernel stage
 is labelled separately from a full compilation.
 
