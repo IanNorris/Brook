@@ -777,3 +777,14 @@ static musl with `-O2 -Wall -Wextra -Werror`; expect
 `FDCAPACITYCHECK PASS descriptors=512 poll=512 epoll=512 high_fd=900`.
 This checks capacity and descriptor lifecycle, not whether a browser leaks
 descriptors over time.
+
+`shutdowncheck.c` requires `-pthread`. It compares connected AF_UNIX stream
+shutdown with Linux: buffered bytes and SCM_RIGHTS survive shutdown until read,
+SHUT_WR preserves reverse traffic, SHUT_RD rejects peer writes, and poll/epoll
+report readable EOF and RDHUP without a premature HUP on half-close. Eight rounds
+wake four blocked readers plus poll/epoll waiters, and four blocked writers on a
+full queue; SIGPIPE delivery and MSG_NOSIGNAL suppression are checked. One case closes the pinned writing descriptor before shutting down
+through a duplicate. Require `SHUTDOWNCHECK PASS checks=722 rounds=8`, then normal
+browser cleanup, heap integrity and clean offline filesystem checks. A 60-second
+alarm bounds the probe. Internet sockets and unbound/listening Unix shutdown
+remain outside Brook's connected-stream subset and return EOPNOTSUPP.

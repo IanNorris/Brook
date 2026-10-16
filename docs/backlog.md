@@ -2,15 +2,16 @@
 
 ## Workload findings, 16 October
 
-- Chromium suspension/resume: YouTube video and audio now pass with diagnostic
-  `--autoplay-policy=no-user-gesture-required` (854×480, 101 seconds, 3,044 decoded
-  frames and nonzero captured PCM). Default-policy MSE startup can stall in
-  `kSuspending`, and a longer YouTube pause/resume still stalls. Video-only and
-  combined audio/video MSE play under the diagnostic policy. `sys_shutdown` is
-  still a success-only stub: implement real Unix socket half/full shutdown with
-  concurrent-reader/poller wakeup and descriptor-lifetime tests, then check
-  whether it resolves media cancellation. This is a source lead, not yet a
-  proved root cause. Keep direct-file, MSE, startup and resume acceptance separate.
+- Extend shutdown beyond connected Unix sockets: Internet sockets and unbound/
+  listening Unix sockets currently return EOPNOTSUPP. Connected Unix shutdown,
+  EOF/readiness, blocked-operation wakeups and lifetime semantics now pass the
+  Linux/guest regression. Chromium MSE and YouTube startup, long pause/resume,
+  seeking and audio pass with normal autoplay rules. Keep longer sessions,
+  hardware rendering and sandbox support as separate acceptance work.
+- Firefox audio remains open: video playback passed, but the last audio run
+  failed cubeb initialization. Chromium's ALSA-to-OSS output now works, including
+  after suspension/resume. Investigate Firefox's backend/runtime configuration
+  next; do not classify the earlier Firefox audio test as passing.
 - Fix kernel-symbol table generation on incremental/fresh builds: the current
   post-link generator writes addresses for the next link. Chromium's preserved
   panic labeled RIP `0xffffffff800af838` as KRwLockReadLock, while the exact

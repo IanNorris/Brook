@@ -1536,3 +1536,53 @@ logs, CDP state snapshots and the local fragmented-MP4 fixtures. The clean nativ
 screenshot is `1cbd212eb87b407cae9d668a44a877e5.png`; the final YouTube PCM capture
 is `ca59111f596b4f5c97159cc44b10a51c.wav` in that session's artifacts. No media,
 private profiles, VM disks or copyrighted Quake data are added to Git.
+
+
+### Unix shutdown and normal-policy Chromium playback (16 October)
+
+Connected AF_UNIX `shutdown()` now changes stream direction state instead of
+returning success without doing anything. Shutdown is separate from pipe
+ownership: descriptors, blocked operations and ancillary queues keep their
+references until actual close. SHUT_WR rejects further sends, allows the peer to
+drain queued bytes/SCM_RIGHTS and then read EOF, and preserves reverse traffic.
+SHUT_RD wakes local readers and rejects peer sends, retaining already queued
+bytes for reads as Linux does. Repeated shutdown through duplicate descriptors
+does not decrement ownership counts. Poll and epoll share the same EOF, RDHUP,
+HUP and writable-error readiness rules; half-close does not falsely signal full
+hangup. SIGPIPE and MSG_NOSIGNAL follow write/send behavior. The send path's
+MSG_DONTWAIT no longer temporarily changes a shared socket's nonblocking state.
+Internet sockets and unbound/listening Unix sockets remain unsupported and
+return EOPNOTSUPP, rather than reporting a fictional successful shutdown.
+
+`shutdowncheck` passes 722 checks on Linux and Brook. Eight rounds exercise four
+blocked readers plus poll/epoll waiters, and four blocked writers with a full
+queue; the close race shuts down via an alias after closing the descriptor still
+pinned by writers. Buffered rights survive shutdown and are delivered once.
+Explicit SIGPIPE delivery and MSG_NOSIGNAL suppression are checked. The existing
+browser prerequisite suite also passes: descriptor capacity, anonymous discard,
+automatic credentials, named SHM, eventfd, exec identity, permissions, readlink,
+file coherence and concurrent SCM_RIGHTS. All 19 hosted suites pass.
+
+With the same software-rendered six-GiB/eight-vCPU setup, Chromium now plays the
+small H.264/AAC MediaSource fixture under normal autoplay rules. A user gesture
+starts playback after autoplay is denied; frame counts advance instead of
+freezing at four frames. The media log records completed `kSuspended` and
+`kResuming` transitions. A 35-second pause resumes to more than 2,700 decoded
+frames, with nonzero PCM output. The diagnostic autoplay flag is no longer
+needed for this workflow.
+
+YouTube also passes a normal-policy launch, optional-cookie rejection, explicit
+play, a 35-second pause/resume, and seeking to 120 seconds. Recorded playback
+advances to 147.822 seconds at 854×480, readyState 4, unpaused/unmuted at volume 1,
+with 3,365 decoded frames. A three-second output capture contains 132,661 stereo
+frames at 44,100 Hz, RMS 0.0693, with no silent plot bins. This establishes output,
+not complete stutter-free audio quality. No host speaker playback is required.
+The browser exits normally with status 0, returns to ten baseline processes and
+passes heap integrity. Checked shutdown and offline FAT/ext2 checks are clean.
+
+Evidence is under ignored `build/workloads/chromium-shutdown-20261016/`, playback
+session `cede96356ecc43d8908bc5da341dc848`. It includes structured acceptance,
+state snapshots, completed suspension events, PCM and a native 1920×1080
+screenshot `cf5fe541b3c5468383e225117727972f.png`. The final output capture is
+`5fa7117aea4444459ebbf11050534aca.wav`. Firefox audio has not been rerun; its cubeb
+initialization failure remains the next audio investigation.

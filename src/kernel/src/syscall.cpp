@@ -1106,7 +1106,8 @@ static int64_t UnixStreamTryWrite(PipeBuffer* pipe, UnixFdQueue* queue,
     const bool credentialRoom = !queue || merge ||
         (queue->credentialHead + 1) % UNIX_FD_QUEUE_CAP != queue->credentialTail;
     int64_t result=-EAGAIN;
-    if (!pipe->readers) result=-EPIPE;
+    if (!pipe->readers || pipe->unixReadShutdown || pipe->unixWriteShutdown) result=-EPIPE;
+    else if (!length) result=0;
     else if (pipe->space() && credentialRoom &&
              (!count || (queue && (queue->head-queue->tail+UNIX_FD_QUEUE_CAP)%UNIX_FD_QUEUE_CAP+count<UNIX_FD_QUEUE_CAP))) {
         uint32_t n=pipe->space();if (length<n)n=static_cast<uint32_t>(length);
@@ -1422,6 +1423,41 @@ static inline void PipeWakeEpoll(PipeBuffer* pipe)
     SpinLockAcquire(&pipe->lock);PipeWakeEpollRaw(pipe);SpinLockRelease(&pipe->lock);
 }
 
+static void UnixShutdownDirection(PipeBuffer* pipe, bool writer)
+{
+    SpinLockAcquire(&pipe->lock);
+    if (writer) __atomic_store_n(&pipe->unixWriteShutdown,true,__ATOMIC_RELEASE);
+    else __atomic_store_n(&pipe->unixReadShutdown,true,__ATOMIC_RELEASE);
+    // Wake both local and peer operations, including the thread which is
+    // cancelling a blocked receive. References remain until actual close.
+    auto* reader=pipe->readerWaiter;pipe->readerWaiter=nullptr;
+    auto* waitingWriter=pipe->writerWaiter;pipe->writerWaiter=nullptr;
+    if(reader) WakeProcess(reader);
+    if(waitingWriter) WakeProcess(waitingWriter);
+    PipeWakeEpollRaw(pipe);
+    SpinLockRelease(&pipe->lock);
+}
+
+// Linux poll/epoll bits share these values. Closed directions remain ready:
+// reads return EOF after queued bytes; writes fail immediately with EPIPE.
+static uint32_t UnixSocketReady(UnixSocketData* socket,uint32_t events)
+{
+    if(socket->state==UnixSocketData::State::Listening)
+        return (events&1) && socket->pendingCount ? 1 : 0;
+    if(socket->state!=UnixSocketData::State::Connected || !socket->rxPipe || !socket->txPipe)return 0;
+    auto* rx=socket->rxPipe;auto* tx=socket->txPipe;
+    SpinLockAcquire(&rx->lock);
+    bool readClosed=rx->unixReadShutdown || rx->unixWriteShutdown || !rx->writers;
+    bool readable=rx->count() || readClosed;
+    SpinLockRelease(&rx->lock);
+    SpinLockAcquire(&tx->lock);
+    bool writeClosed=tx->unixReadShutdown || tx->unixWriteShutdown || !tx->readers;
+    bool writable=tx->space() || writeClosed;
+    SpinLockRelease(&tx->lock);
+    return ((events&1)&&readable?1u:0u) | ((events&4)&&writable?4u:0u) |
+        ((events&0x2000)&&readClosed?0x2000u:0u) | (readClosed&&writeClosed?0x10u:0u);
+}
+
 // Same for a listening AF_UNIX socket: wake epoll waiter when a new
 // connection is posted to the pending queue.
 static inline void UnixListenWakeEpoll(UnixSocketData* usd)
@@ -1492,13 +1528,13 @@ struct FdRef
 
 static int64_t UnixSocketWriteSome(UnixSocketData* socket,bool nonblock,
                                    const char* bytes,uint64_t length,
-                                   const UnixFdSnap* descriptors=nullptr,int count=0) {
+                                   const UnixFdSnap* descriptors=nullptr,int count=0,bool noSignal=false) {
     if(socket->state!=UnixSocketData::State::Connected || !socket->txPipe)return -ENOTCONN;
-    if(!length)return 0;
     auto* pipe=socket->txPipe;
     for(;;) {
         auto result=UnixStreamTryWrite(pipe,socket->peerIncomingFds,bytes,length,descriptors,count);
         if(result!=-EAGAIN) {
+            if(result==-EPIPE && !noSignal)ProcessSendSignal(ProcessCurrent(),13);
             if(result>0) {
                 if(auto* reader=pipe->readerWaiter) {pipe->readerWaiter=nullptr;WakeProcess(reader);}
                 PipeWakeEpoll(pipe);
@@ -1528,7 +1564,9 @@ static int64_t UnixSocketReadSome(UnixSocketData* socket,bool nonblock,
             if(auto* writer=pipe->writerWaiter) {pipe->writerWaiter=nullptr;WakeProcess(writer);}
             PipeWakeEpoll(pipe);return n;
         }
-        if(!__atomic_load_n(&pipe->writers,__ATOMIC_ACQUIRE))return 0;
+        if(!__atomic_load_n(&pipe->writers,__ATOMIC_ACQUIRE) ||
+           __atomic_load_n(&pipe->unixReadShutdown,__ATOMIC_ACQUIRE) ||
+           __atomic_load_n(&pipe->unixWriteShutdown,__ATOMIC_ACQUIRE))return 0;
         if(nonblock || socket->nonblock)return -EAGAIN;
         auto* self=ProcessCurrent();pipe->readerWaiter=self;
         extern volatile uint64_t g_lapicTickCount;
@@ -7720,29 +7758,7 @@ retry_poll:
         if (fde->type == FdType::UnixSocket && fde->handle)
         {
             auto* usd = static_cast<UnixSocketData*>(fde->handle);
-            // Preserve peer-close reporting from the former post-wake scan.
-            bool peerGone = usd->state == UnixSocketData::State::Connected &&
-                ((usd->rxPipe && __atomic_load_n(&usd->rxPipe->writers, __ATOMIC_ACQUIRE) == 0) ||
-                 (usd->txPipe && __atomic_load_n(&usd->txPipe->readers, __ATOMIC_ACQUIRE) == 0));
-            if (peerGone) fds[i].revents |= POLLHUP;
-            if (fds[i].events & POLLIN)
-            {
-                bool readable = false;
-                if (usd->state == UnixSocketData::State::Listening)
-                    readable = (usd->pendingCount > 0);
-                else if (usd->state == UnixSocketData::State::Connected && usd->rxPipe)
-                    readable = (usd->rxPipe->count() > 0 ||
-                                __atomic_load_n(&usd->rxPipe->writers, __ATOMIC_ACQUIRE) == 0);
-                if (readable) fds[i].revents |= POLLIN;
-            }
-            if (fds[i].events & POLLOUT)
-            {
-                bool writable = false;
-                if (usd->state == UnixSocketData::State::Connected && usd->txPipe)
-                    writable = (usd->txPipe->space() > 0 ||
-                                __atomic_load_n(&usd->txPipe->readers, __ATOMIC_ACQUIRE) == 0);
-                if (writable) fds[i].revents |= POLLOUT;
-            }
+            fds[i].revents=static_cast<short>(UnixSocketReady(usd,static_cast<uint16_t>(fds[i].events)));
             if (fds[i].revents) ready++;
             continue;
         }
@@ -8353,21 +8369,8 @@ static uint32_t EpollFdReady(Process* proc, int fd, uint32_t events)
         if (brook::SockPollHangup(si))
             ready |= EPOLLHUP | EPOLLRDHUP;
     }
-    // Unix sockets: detect peer closure for EPOLLHUP.
-    bool unixPeerGone = false;
-    if (fde->type == FdType::UnixSocket && fde->handle) {
-        auto* usd = static_cast<UnixSocketData*>(fde->handle);
-        if (usd->state == UnixSocketData::State::Connected) {
-            if (usd->rxPipe &&
-                __atomic_load_n(&usd->rxPipe->writers, __ATOMIC_ACQUIRE) == 0)
-                unixPeerGone = true;
-            if (usd->txPipe &&
-                __atomic_load_n(&usd->txPipe->readers, __ATOMIC_ACQUIRE) == 0)
-                unixPeerGone = true;
-        }
-        if (unixPeerGone)
-            ready |= EPOLLHUP;
-    }
+    if (fde->type == FdType::UnixSocket && fde->handle)
+        return UnixSocketReady(static_cast<UnixSocketData*>(fde->handle),events);
 
     if (events & EPOLLIN) {
         bool readable = false;
@@ -8392,13 +8395,6 @@ static uint32_t EpollFdReady(Process* proc, int fd, uint32_t events)
             auto* pair = static_cast<TtyDevicePair*>(fde->handle);
             auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
             readable = (rp->count() > 0 || rp->writers == 0);
-        } else if (fde->type == FdType::UnixSocket && fde->handle) {
-            auto* usd = static_cast<UnixSocketData*>(fde->handle);
-            if (usd->state == UnixSocketData::State::Listening) {
-                readable = (usd->pendingCount > 0);
-            } else if (usd->state == UnixSocketData::State::Connected && usd->rxPipe) {
-                readable = (usd->rxPipe->count() > 0 || unixPeerGone);
-            }
         }
         if (readable) ready |= EPOLLIN;
     }
@@ -8422,11 +8418,6 @@ static uint32_t EpollFdReady(Process* proc, int fd, uint32_t events)
             writable = true;
         } else if (fde->type == FdType::MemFd) {
             writable = true;
-        } else if (fde->type == FdType::UnixSocket && fde->handle) {
-            auto* usd = static_cast<UnixSocketData*>(fde->handle);
-            if (usd->state == UnixSocketData::State::Connected && usd->txPipe)
-                writable = (__atomic_load_n(&usd->txPipe->readers, __ATOMIC_ACQUIRE) > 0 &&
-                            usd->txPipe->space() > 0);
         }
         if (writable) ready |= EPOLLOUT;
     }
@@ -8591,7 +8582,7 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
                 uint32_t events = ep->entries[i].events;
                 if ((events & EPOLLIN) && usd->state == UnixSocketData::State::Listening) {
                     usd->epollWaiter = proc;
-                } else if ((events & EPOLLIN) &&
+                } else if ((events & (EPOLLIN | EPOLLRDHUP)) &&
                            usd->state == UnixSocketData::State::Connected && usd->rxPipe) {
                     usd->rxPipe->epollWaiter = proc;
                 }
@@ -11900,13 +11891,9 @@ static int64_t sys_sendto(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
     FdEntry* fde = descriptor.get();
     if (fde && fde->type == FdType::UnixSocket) {
         auto* usd = static_cast<UnixSocketData*>(fde->handle);
-        bool oldNonblock = usd ? usd->nonblock : false;
-        if (usd && (flagsVal & 0x40)) // MSG_DONTWAIT
-            usd->nonblock = true;
-        int64_t ret = sys_write(fdVal, bufVal, lenVal, 0, 0, 0);
-        if (usd)
-            usd->nonblock = oldNonblock;
-        return ret;
+        if(lenVal && !UserBufferReadable(bufVal,lenVal))return -EFAULT;
+        return UnixSocketWriteSome(usd,(flagsVal&0x40)||(fde->statusFlags&0x800),
+            reinterpret_cast<const char*>(bufVal),lenVal,nullptr,0,(flagsVal&0x4000)!=0);
     }
 
     int sockIdx = GetSockIdx(proc, fd);
@@ -12147,10 +12134,24 @@ static int64_t sys_getpeername(uint64_t fdVal, uint64_t addrVal, uint64_t addrLe
     return -ENOTCONN;
 }
 
-static int64_t sys_shutdown(uint64_t, uint64_t, uint64_t,
+static int64_t sys_shutdown(uint64_t fdVal, uint64_t howVal, uint64_t,
                              uint64_t, uint64_t, uint64_t)
 {
-    return 0; // stub
+    Process* proc=ProcessCurrent();if(!proc)return -EBADF;
+    KernelOperationGuard operation(proc);
+    FdRef fd(proc,static_cast<int>(fdVal));if(!fd)return -EBADF;
+    if(fd->type!=FdType::UnixSocket && fd->type!=FdType::Socket)return -88; // ENOTSOCK
+    const int how=static_cast<int>(howVal);if(how<0 || how>2)return -EINVAL;
+    // Internet socket shutdown needs a separate TCP/UDP state transition.
+    if(fd->type!=FdType::UnixSocket)return -95; // EOPNOTSUPP
+    auto* socket=static_cast<UnixSocketData*>(fd->handle);
+    // Unbound/listening Unix shutdown also has Linux semantics, but is outside
+    // this connected-stream implementation. Do not silently claim success.
+    if(!socket || socket->state!=UnixSocketData::State::Connected || !socket->rxPipe || !socket->txPipe)
+        return -95; // EOPNOTSUPP
+    if(how==0 || how==2)UnixShutdownDirection(socket->rxPipe,false);
+    if(how==1 || how==2)UnixShutdownDirection(socket->txPipe,true);
+    return 0;
 }
 
 static int64_t sys_listen(uint64_t fdVal, uint64_t backlog, uint64_t,
@@ -12540,6 +12541,9 @@ static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
     if (fde->type == FdType::UnixSocket) {
 
     auto* usd = static_cast<UnixSocketData*>(fde->handle);
+    auto writable=UnixSocketWriteSome(usd,true,nullptr,0,nullptr,0,(flagsVal&0x4000)!=0);
+    if(writable<0)return writable;
+
 
     // Parse SCM_RIGHTS cmsg (if any) BEFORE writing payload. If cmsg parsing
     // fails (bad pointer, wrong type, fd full) we refuse the whole sendmsg
@@ -12602,7 +12606,7 @@ static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
             return total?total:-EFAULT;
         }
         auto n=UnixSocketWriteSome(usd,(flagsVal&0x40)||(fde->statusFlags&0x800),
-            static_cast<const char*>(iov.iov_base),iov.iov_len,pendingSnaps,pendingCount);
+            static_cast<const char*>(iov.iov_base),iov.iov_len,pendingSnaps,pendingCount,(flagsVal&0x4000)!=0);
         if(n>0) {pendingCount=0;total+=n;}
         if(n<0 || static_cast<uint64_t>(n)<iov.iov_len) {
             for(int j=0;j<pendingCount;++j)UnixFdSnapRelease(&pendingSnaps[j]);

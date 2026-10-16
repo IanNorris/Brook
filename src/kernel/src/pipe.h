@@ -25,6 +25,12 @@ struct PipeBuffer
     volatile uint32_t readers = 0;   // Number of FDs open for reading
     volatile uint32_t writers = 0;   // Number of FDs open for writing
 
+    // AF_UNIX direction shutdown, independent of endpoint ownership. Protected
+    // by lock for mutation; readiness paths take atomic snapshots. Ordinary
+    // pipes leave these false. Shutdown must never release a live pipe's refs.
+    bool unixReadShutdown = false;
+    bool unixWriteShutdown = false;
+
     // Waiter processes (set before blocking, cleared on wake)
     Process* volatile readerWaiter = nullptr;
     Process* volatile writerWaiter = nullptr;
